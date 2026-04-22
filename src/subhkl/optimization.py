@@ -798,11 +798,11 @@ class VectorizedObjective:
         # For the final output, assign each peak to the zone equator that caught it best
         best_zone_idx = jnp.argmax(kernel, axis=2)
         best_zone_int = jnp.take(self.theo_zones.T, best_zone_idx, axis=0)
-        dummy_scale = jnp.zeros((q_sample.shape[0], q_sample.shape[2])) 
 
-        dist_min = jnp.min(jnp.abs(cos_sim), axis=2)
-
-        return loss, dist_min, best_zone_int, dummy_scale
+        active_zones_mask = zone_densities > 3.0
+        num_active_zones = jnp.sum(active_zones_mask, axis=1) # Shape: (S,)
+        
+        return loss, -jnp.max(kernel, axis=2), best_zone_int, num_active_zones
 
     @partial(jax.jit, static_argnames="self")
     def get_results(self, x):
@@ -1656,7 +1656,7 @@ class FindUB:
             print("--- Refined Detector Geometry ---")
             print(f"Max Center Translation: {max_drift:.3f} mm")
 
-        loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
+        loss_score, dist_min, hkl, lamb_active_zones = objective.get_results(x_batch)
         dist_min_final = np.array(dist_min[0])
 
         mask = dist_min_final < 0.15
@@ -1665,6 +1665,10 @@ class FindUB:
         hkl_final = np.array(hkl[0])
         hkl_final[~mask] = 0
 
-        print(f"Final Solution indexed {num_indexed}/{num_obs} peaks.")
+        if objective_mode == "great_circle":
+            zones_aligned = int(np.array(lamb_active_zones_out[0]))
+            print(f"Final Solution indexed {num_indexed}/{num_obs} peaks across {zones_aligned} distinct Zone Axes.")
+        else:
+            print(f"Final Solution indexed {num_indexed}/{num_obs} peaks.")
 
-        return num_indexed, hkl_final, np.array(lamb[0]), np.array(U)
+        return num_indexed, hkl_final, np.array(lamb_active_zones[0]), np.array(U)
