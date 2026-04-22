@@ -1432,7 +1432,6 @@ def run_zone_axis_search(
     print(f"Loading empirical rays from {peaks_h5_filename}...")
 
     with h5py.File(peaks_h5_filename, "r") as f_peaks:
-        peaks_xyz = f_peaks["peaks/xyz"][()]
         peaks_intensity = f_peaks["peaks/intensity"][()]
 
         # CRITICAL: image_index maps 1:1 to the N_banks dimension of R_stack in merged.h5
@@ -1440,6 +1439,36 @@ def run_zone_axis_search(
             group_indices = f_peaks["peaks/image_index"][()]
         else:
             group_indices = f_peaks["peaks/run_index"][()]
+
+        # --- Reconstruct Geometry from Pixels if XYZ is missing ---
+        if "peaks/xyz" in f_peaks:
+            peaks_xyz = f_peaks["peaks/xyz"][()]
+        elif "peaks/pixel_r" in f_peaks and "peaks/pixel_c" in f_peaks:
+            print("Reconstructing physical geometry from pixels for Zone Axis Search...")
+            from subhkl.config import beamlines
+            from subhkl.instrument.detector import Detector
+
+            pixel_r = f_peaks["peaks/pixel_r"][()]
+            pixel_c = f_peaks["peaks/pixel_c"][()]
+            peaks_xyz = np.zeros((len(pixel_r), 3))
+
+            for g_idx in np.unique(group_indices):
+                if g_idx >= len(file_bank_ids):
+                    continue  # Skip processing for runs beyond the num_runs limit
+
+                mask = group_indices == g_idx
+                phys_bank = file_bank_ids[int(g_idx)]
+
+                try:
+                    det_config = beamlines[instrument][str(int(phys_bank))]
+                    det = Detector(det_config)
+                    peaks_xyz[mask] = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
+                except KeyError as e:
+                    print(f"Warning: Could not rebuild geometry for bank {phys_bank}: {e}")
+        else:
+            raise ValueError(
+                "ERROR: Finder file must contain either peaks/xyz or peaks/pixel_r and peaks/pixel_c."
+            )
 
         if "beam/ki_vec" in f_peaks:
             ki_vec = f_peaks["beam/ki_vec"][()]
