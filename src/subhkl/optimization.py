@@ -1666,7 +1666,7 @@ class FindUB:
         hkl_final[~mask] = 0
 
         if objective_mode == "great_circle":
-            zones_aligned = int(np.array(lamb_active_zones_out[0]))
+            zones_aligned = int(np.array(lamb_active_zones[0]))
             print(f"Final Solution indexed {num_indexed}/{num_obs} peaks across {zones_aligned} distinct Zone Axes.")
         else:
             print(f"Final Solution indexed {num_indexed}/{num_obs} peaks.")
