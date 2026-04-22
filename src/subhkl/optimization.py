@@ -781,9 +781,8 @@ class VectorizedObjective:
         # Total density per equator
         zone_densities = jnp.sum(kernel, axis=1) # Shape: (S, N_calc)
 
-        # --- THE QUARTIC LOSS ---
-        # Maximizing the 4th moment strongly forces sparsity (spikiness)
-        loss = -jnp.mean(zone_densities ** 4, axis=1) 
+        # quadratic loss
+        loss = -jnp.mean(zone_densities ** 2, axis=1) 
 
         best_zone_idx = jnp.argmax(kernel, axis=2)
         best_zone_int = jnp.take(self.theo_zones.T, best_zone_idx, axis=0)
