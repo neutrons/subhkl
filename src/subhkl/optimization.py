@@ -1566,6 +1566,16 @@ class FindUB:
         )
 
         print("Polishing solution with BFGS refinement...")
+
+        # --- THE OBJECTIVE SWAP ---
+        if objective_mode == "great_circle":
+            print("Switching objective from Great Circle to Laue for exact discrete integer polish...")
+            objective.mode = "laue"
+
+            # We MUST recalculate the initial loss for BFGS under the Laue objective!
+            best_overall_loss = float(objective(jnp.array(best_overall_member)[None, :])[0])
+        # --------------------------
+
         from scipy.optimize import minimize as scipy_minimize
 
         res_ref = scipy_minimize(
