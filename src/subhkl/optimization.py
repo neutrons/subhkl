@@ -1656,7 +1656,7 @@ class FindUB:
             print("--- Refined Detector Geometry ---")
             print(f"Max Center Translation: {max_drift:.3f} mm")
 
-        loss_score, dist_min, hkl, lamb = objective.get_results(x_batch, objective_mode)
+        loss_score, dist_min, hkl, lamb = objective.get_results(x_batch, objective.mode)
         dist_min_final = np.array(dist_min[0])
 
         mask = dist_min_final < 0.15
