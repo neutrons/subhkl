@@ -765,50 +765,43 @@ class VectorizedObjective:
         loss = jnp.mean(dist_min, axis=1)
         return loss, dist_min, best_hkl.transpose((0, 2, 1)), best_lamb
 
-    # Real-space zone axis indexer
     def great_circle_soft_jax(self, u_mat, A_mat, q_lab_sample, kappa=50.0):
         """
-        Evaluates the alignment of empirical Bragg peaks against the equators
-        of theoretical Zone Axes using a continuous Bingham-style kernel.
+        Evaluates the alignment of empirical Bragg peaks against theoretical 
+        Zone Axes using the Hough Variance (Density) Loss to prevent spiderweb degeneracy.
         """
-        # 1. Normalize empirical Bragg peaks (scattering vectors)
+        # 1. Normalize vectors
         q_norms = jnp.linalg.norm(q_lab_sample, axis=1, keepdims=True)
-        q_sample = q_lab_sample / jnp.where(q_norms == 0, 1.0, q_norms)  # (S, 3, N_obs)
+        q_sample = q_lab_sample / jnp.where(q_norms == 0, 1.0, q_norms) 
 
-        # 2. Calculate theoretical zones in sample frame: r_sample = U * A * [u,v,w]
-        # A_mat is (S, 3, 3). theo_zones is (3, N_calc).
-        r_cryst = jnp.matmul(A_mat, self.theo_zones)  # (S, 3, N_calc)
-        r_sample_unnorm = jnp.matmul(u_mat, r_cryst)  # (S, 3, N_calc)
+        r_cryst = jnp.matmul(A_mat, self.theo_zones) 
+        r_sample_unnorm = jnp.matmul(u_mat, r_cryst)
 
-        # 3. Normalize theoretical zones
         r_norms = jnp.linalg.norm(r_sample_unnorm, axis=1, keepdims=True)
-        r_sample = r_sample_unnorm / jnp.where(
-            r_norms == 0, 1.0, r_norms
-        )  # (S, 3, N_calc)
+        r_sample = r_sample_unnorm / jnp.where(r_norms == 0, 1.0, r_norms) 
 
-        # 4. Cosine similarity (dot product): q_sample^T @ r_sample
-        # q_sample.T is (S, N_obs, 3), r_sample is (S, 3, N_calc) -> Result is (S, N_obs, N_calc)
-        cos_sim = jnp.matmul(q_sample.transpose((0, 2, 1)), r_sample)
+        # 2. Cosine similarity
+        cos_sim = jnp.matmul(q_sample.transpose((0, 2, 1)), r_sample) 
 
-        # 5. Bingham Kernel (Gaussian trough at 90 degrees / Cosine = 0)
-        kernel = -kappa * (cos_sim**2)
+        # 3. Bingham Kernel (Gaussian at 90 degrees)
+        # Returns 1.0 if perfectly orthogonal, decays to 0.0 as it deviates
+        kernel = jnp.exp(-kappa * (cos_sim ** 2)) # Shape: (S, N_obs, N_calc)
 
-        # 6. SoftAssign: For each empirical peak, find the closest zone equator
-        peak_scores = jax.scipy.special.logsumexp(kernel, axis=2)  # (S, N_obs)
+        # 4. Calculate the total density of peaks on each theoretical equator
+        zone_densities = jnp.sum(kernel, axis=1) # Shape: (S, N_calc)
 
-        # 7. Global Loss (Minimize to maximize the scores)
-        loss = -jnp.mean(peak_scores, axis=1)  # (S,)
+        # 5. Maximize the "spikiness" of the densities
+        # The true U matrix aligns many peaks onto a few principal equators, causing massive spikes.
+        # Maximizing the sum of squares perfectly captures this variance.
+        loss = -jnp.mean(zone_densities ** 2, axis=1) # Shape: (S,)
 
-        # Instead of returning [h,k,l], we return the best matching [u,v,w] theoretical zone
-        best_zone_idx = jnp.argmax(kernel, axis=2)  # (S, N_obs)
-        best_zone_int = jnp.take(
-            self.theo_zones.T, best_zone_idx, axis=0
-        )  # (S, N_obs, 3)
+        # For the final output, assign each peak to the zone equator that caught it best
+        best_zone_idx = jnp.argmax(kernel, axis=2)
+        best_zone_int = jnp.take(self.theo_zones.T, best_zone_idx, axis=0)
+        dummy_scale = jnp.zeros((q_sample.shape[0], q_sample.shape[2])) 
 
-        # Scale (lambda) isn't used in this geometry, return zeros
-        dummy_scale = jnp.zeros_like(peak_scores)
-
-        return loss, -peak_scores, best_zone_int, dummy_scale
+        # Return the negative kernel max as the "distance" metric for the BFGS thresholding
+        return loss, -jnp.max(kernel, axis=2), best_zone_int, dummy_scale
 
     @partial(jax.jit, static_argnames="self")
     def get_results(self, x):
