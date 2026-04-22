@@ -2,12 +2,11 @@ import os
 import warnings
 from functools import partial
 
-
 import jax
 import jax.numpy as jnp
 import jax.lax as lax
 import jax.scipy.linalg as jscipy_linalg
-from evosax.algorithms import CMA_ES, PSO, DifferentialEvolution
+from evosax.algorithms import CMA_ES, PSO, DifferentialEvolution, GuidedES
 
 import numpy as np
 import h5py
@@ -224,7 +223,14 @@ class VectorizedObjective:
         freeze_orientation=False,
         fixed_rot_params=None,
         num_candidates=None,
+        mode="laue",
+        zone_S_min=1.0,
+        zone_S_max=50.0,
     ):
+        self.mode = mode
+        self.S_min = zone_S_min
+        self.S_max = zone_S_max
+
         self.B = jnp.array(B)
         self.kf_ki_dir_init = jnp.array(kf_ki_dir)
         if self.kf_ki_dir_init.ndim == 2 and self.kf_ki_dir_init.shape[0] != 3:
@@ -578,10 +584,6 @@ class VectorizedObjective:
                 motor_idx = self.motor_map[i]
                 direction = self.gonio_axes[i][0:3]
 
-                # Add the motor offset to the specific axis angle here ---
-                # offsets_total is (S, M) -> offsets_total[:, motor_idx] is (S,)
-                # gonio_angles is (N, P) -> gonio_angles[i, :] is (P,)
-                # Reshape and broadcast to (S, P)
                 current_axis_angle = (
                     self.gonio_angles[i, :][None, :]
                     + offsets_total[:, motor_idx][:, None]
@@ -755,13 +757,92 @@ class VectorizedObjective:
         loss = jnp.mean(dist_min, axis=1)
         return loss, dist_min, best_hkl.transpose((0, 2, 1)), best_lamb
 
+    # Real-space zone axis indexer
+    def zone_axis_dynamic_soft_jax(self, ub_mat, A_mat, e_lab_sample):
+        """
+        Direct space analogue to Laue indexer. Sweeps scaling factor (physical length)
+        to lock onto integer zone axis coordinates [uvw].
+        """
+        # A_mat is expected to be (S, 3, 3)
+        ua_mat = jnp.matmul(ub_mat, A_mat)
+        ua_inv = jnp.linalg.inv(ua_mat)
+
+        # Unscaled fractional zone axis direction
+        v = jnp.matmul(ua_inv, e_lab_sample)
+
+        # Grid of physical lengths (e.g. 1 to 50 Angstroms)
+        S_grid = jnp.linspace(self.S_min, self.S_max, self.num_candidates)
+
+        S_pop, _, N = v.shape
+        initial_carry = (
+            jnp.inf * jnp.ones((S_pop, N)),
+            jnp.zeros((S_pop, 3, N), dtype=jnp.int32),
+            jnp.zeros((S_pop, N)),
+        )
+
+        def scan_body(carry, i):
+            curr_min, curr_best_uvw, curr_best_S = carry
+
+            S_cand = S_grid[i]
+            uvw_float = v * S_cand
+
+            u = uvw_float[:, 0, :]
+            v_idx = uvw_float[:, 1, :]
+            w = uvw_float[:, 2, :]
+
+            # Handle centering
+            u_p = (
+                self.M_prim[0, 0] * u
+                + self.M_prim[0, 1] * v_idx
+                + self.M_prim[0, 2] * w
+            )
+            v_p = (
+                self.M_prim[1, 0] * u
+                + self.M_prim[1, 1] * v_idx
+                + self.M_prim[1, 2] * w
+            )
+            w_p = (
+                self.M_prim[2, 0] * u
+                + self.M_prim[2, 1] * v_idx
+                + self.M_prim[2, 2] * w
+            )
+
+            # Continuous Trigonometric Loss
+            du = jnp.sin(jnp.pi * u_p)
+            dv = jnp.sin(jnp.pi * v_p)
+            dw = jnp.sin(jnp.pi * w_p)
+            dist = jnp.sqrt(du**2 + dv**2 + dw**2) / jnp.pi
+
+            # Exact physical length calculation
+            uvw_int = jnp.round(uvw_float).astype(jnp.int32)
+            A_uvw = jnp.matmul(
+                A_mat, uvw_int.astype(jnp.float32)
+            )  # (S, 3, 3) @ (S, 3, N) -> (S, 3, N)
+            S_opt = jnp.linalg.norm(A_uvw, axis=1)
+
+            # State Update
+            update_mask = dist < curr_min
+            new_min = jnp.where(update_mask, dist, curr_min)
+            new_best_uvw = jnp.where(update_mask[:, None, :], uvw_int, curr_best_uvw)
+            new_best_S = jnp.where(update_mask, S_opt, curr_best_S)
+
+            return (new_min, new_best_uvw, new_best_S), None
+
+        final_carry, _ = lax.scan(
+            scan_body, initial_carry, jnp.arange(self.num_candidates)
+        )
+        dist_min, best_uvw, best_S = final_carry
+
+        loss = jnp.mean(dist_min, axis=1)
+        return loss, dist_min, best_uvw.transpose((0, 2, 1)), best_S
+
     @partial(jax.jit, static_argnames="self")
     def get_results(self, x):
         original_S = x.shape[0]
         pad_size = max(0, 2 - original_S)
         x_pad = jnp.pad(x, ((0, pad_size), (0, 0)), mode="edge") if pad_size > 0 else x
 
-        UB, _, sample_total, ki_vec, _, R, dyn_centers, dyn_uhats, dyn_vhats = (
+        UB, B, sample_total, ki_vec, _, R, dyn_centers, dyn_uhats, dyn_vhats = (
             self._get_physical_params_jax(x_pad)
         )
 
@@ -839,11 +920,25 @@ class VectorizedObjective:
         else:
             kf_ki_vec = q_lab
 
-        res = self.indexer_dynamic_soft_jax(
-            UB,
-            kf_ki_vec,
-            k_sq_override=k_sq_dyn,
-        )
+        # --- ROUTING LOGIC (LAUE vs ZONE AXIS) ---
+        if self.mode == "zone_axis":
+            # Compute Direct Space Basis Matrix (A) from Reciprocal Matrix (B)
+            # A = (B^-1)^T. If B is batched (S,3,3) we swap the inner dimensions.
+            if B.ndim == 2:
+                B_batch = B[None, ...].repeat(x_pad.shape[0], axis=0)
+            else:
+                B_batch = B
+            A = jnp.linalg.inv(B_batch).transpose((0, 2, 1))
+
+            # Since the user input kf_lab_fixed_vectors are the normalized zone axes,
+            # they correctly populate kf_ki_vec here.
+            res = self.zone_axis_dynamic_soft_jax(UB, A, kf_ki_vec)
+        else:
+            res = self.indexer_dynamic_soft_jax(
+                UB,
+                kf_ki_vec,
+                k_sq_override=k_sq_dyn,
+            )
 
         return jax.tree.map(
             lambda arr: (
@@ -1118,6 +1213,9 @@ class FindUB:
         detector_trans_bound_meters: float = 0.005,
         detector_rot_bound_deg: float = 1.0,
         freeze_orientation: bool = False,
+        objective_mode: str = "laue",
+        zone_S_min: float = 1.0,
+        zone_S_max: float = 50.0,
         **kwargs,
     ):
         if goniometer_axes is None and self.goniometer_axes is not None:
@@ -1262,6 +1360,9 @@ class FindUB:
             detector_rot_bound_deg=detector_rot_bound_deg,
             freeze_orientation=freeze_orientation,
             fixed_rot_params=self.fixed_rot_params,
+            mode=objective_mode,
+            zone_S_min=zone_S_min,
+            zone_S_max=zone_S_max,
         )
 
         num_dims = 0 if freeze_orientation else 3
@@ -1348,6 +1449,11 @@ class FindUB:
         elif strategy_name.lower() == "cma_es":
             strategy = CMA_ES(solution=sample_solution, population_size=population_size)
             strategy_type = "distribution_based"
+        elif strategy_name.lower() == "guided_es":
+            strategy = GuidedES(
+                solution=sample_solution, population_size=population_size
+            )
+            strategy_type = "distribution_based"
         else:
             raise ValueError(f"Unknown strategy: {strategy_name}")
 
@@ -1414,6 +1520,23 @@ class FindUB:
 
         def step_single_run(rng, state):
             rng, rng_ask, rng_tell = jax.random.split(rng, 3)
+
+            if strategy_name.lower() == "guided_es":
+                # Ensure the mean respects your clipping logic before evaluating gradient
+                if freeze_orientation:
+                    mean_valid = jnp.clip(state.mean, 0.0, 1.0)
+                else:
+                    mean_valid = jnp.concatenate(
+                        [state.mean[:3], jnp.clip(state.mean[3:], 0.0, 1.0)]
+                    )
+
+                # Compute gradient (matches your existing BFGS logic)
+                grad_fn = jax.grad(lambda x_flat: objective(x_flat[None, :])[0])
+                g = grad_fn(mean_valid)
+
+                # Feed the gradient into the GuidedES state
+                state = state.replace(grad=g)
+
             x, state_ask = strategy.ask(rng_ask, state, es_params)
             if freeze_orientation:
                 x_valid = jnp.clip(x, 0.0, 1.0)

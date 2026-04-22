@@ -91,6 +91,7 @@ def run_index(
     batch_size: int | None = None,
     input_data: dict | None = None,
     num_candidates: int | None = None,
+    mode: str | None = "laue",
 ):
     input_data = input_data or {}
 
@@ -514,6 +515,7 @@ def run_index(
         detector_rot_bound_deg=detector_rot_bound_deg,
         freeze_orientation=freeze_orientation,
         num_candidates=num_candidates,
+        objective_mode=mode,
     )
 
     print(f"\nOptimization complete. Best solution indexed {num} peaks.")
@@ -1444,7 +1446,9 @@ def run_zone_axis_search(
         if "peaks/xyz" in f_peaks:
             peaks_xyz = f_peaks["peaks/xyz"][()]
         elif "peaks/pixel_r" in f_peaks and "peaks/pixel_c" in f_peaks:
-            print("Reconstructing physical geometry from pixels for Zone Axis Search...")
+            print(
+                "Reconstructing physical geometry from pixels for Zone Axis Search..."
+            )
             from subhkl.config import beamlines
             from subhkl.instrument.detector import Detector
 
@@ -1464,7 +1468,9 @@ def run_zone_axis_search(
                     det = Detector(det_config)
                     peaks_xyz[mask] = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
                 except KeyError as e:
-                    print(f"Warning: Could not rebuild geometry for bank {phys_bank}: {e}")
+                    print(
+                        f"Warning: Could not rebuild geometry for bank {phys_bank}: {e}"
+                    )
         else:
             raise ValueError(
                 "ERROR: Finder file must contain either peaks/xyz or peaks/pixel_r and peaks/pixel_c."
