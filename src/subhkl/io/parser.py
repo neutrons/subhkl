@@ -248,7 +248,7 @@ def indexer(
     ] = None,
     mode: Annotated[
         str,
-        typer.Option(help="Minimization objective: 'laue' or 'zona_axis'"),
+        typer.Option(help="Minimization objective: 'laue' or 'zone_axis'"),
     ] = "laue",
 ) -> None:
     # 1. Safely Parse Comma-Separated Strings into Python Lists
@@ -319,6 +319,7 @@ def indexer(
         bootstrap_filename=bootstrap_filename,
         batch_size=batch_size,
         num_candidates=num_candidates,
+        mode=mode,
     )
 
 
