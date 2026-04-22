@@ -800,8 +800,9 @@ class VectorizedObjective:
         best_zone_int = jnp.take(self.theo_zones.T, best_zone_idx, axis=0)
         dummy_scale = jnp.zeros((q_sample.shape[0], q_sample.shape[2])) 
 
-        # Return the negative kernel max as the "distance" metric for the BFGS thresholding
-        return loss, -jnp.max(kernel, axis=2), best_zone_int, dummy_scale
+        dist_min = jnp.min(jnp.abs(cos_sim), axis=2)
+
+        return loss, dist_min, best_zone_int, dummy_scale
 
     @partial(jax.jit, static_argnames="self")
     def get_results(self, x):
