@@ -250,6 +250,8 @@ def indexer(
         str,
         typer.Option(help="Minimization objective: 'laue' or 'zone_axis'"),
     ] = "laue",
+    max_uvw: Annotated[int, typer.Option(help="Maximum zone axis index (uvw)")] = 2,
+    kappa: Annotated[float, typer.Option(help="Loss stiffness")] = 50,
 ) -> None:
     # 1. Safely Parse Comma-Separated Strings into Python Lists
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
@@ -320,6 +322,8 @@ def indexer(
         batch_size=batch_size,
         num_candidates=num_candidates,
         mode=mode,
+        max_uvw=max_uvw,
+        kappa=kappa,
     )
 
 

@@ -224,12 +224,11 @@ class VectorizedObjective:
         fixed_rot_params=None,
         num_candidates=None,
         mode="laue",
-        zone_S_min=1.0,
-        zone_S_max=50.0,
+        max_uvw=2,
+        kappa=50.0,
     ):
         self.mode = mode
-        self.S_min = zone_S_min
-        self.S_max = zone_S_max
+        self.kappa = kappa
 
         self.B = jnp.array(B)
         self.kf_ki_dir_init = jnp.array(kf_ki_dir)
@@ -468,6 +467,15 @@ class VectorizedObjective:
             )
         else:  # Default to P
             self.M_prim = jnp.eye(3)
+
+        if self.mode == "great_circle":
+            u_vals = jnp.arange(-max_uvw, max_uvw + 1)
+            u, v, w = jnp.meshgrid(u_vals, u_vals, u_vals, indexing="ij")
+            zones = jnp.stack([u.flatten(), v.flatten(), w.flatten()], axis=0)
+
+            # Filter out [0, 0, 0]
+            mask = ~((zones[0] == 0) & (zones[1] == 0) & (zones[2] == 0))
+            self.theo_zones = zones[:, mask].astype(jnp.float32)
 
     def orientation_U_jax(self, param):
         U = jax.vmap(rotation_matrix_from_rodrigues_jax)(param)
@@ -758,83 +766,49 @@ class VectorizedObjective:
         return loss, dist_min, best_hkl.transpose((0, 2, 1)), best_lamb
 
     # Real-space zone axis indexer
-    def zone_axis_dynamic_soft_jax(self, ub_mat, A_mat, e_lab_sample):
+    def great_circle_soft_jax(self, u_mat, A_mat, q_lab_sample, kappa=50.0):
         """
-        Direct space analogue to Laue indexer. Sweeps scaling factor (physical length)
-        to lock onto integer zone axis coordinates [uvw].
+        Evaluates the alignment of empirical Bragg peaks against the equators
+        of theoretical Zone Axes using a continuous Bingham-style kernel.
         """
-        # A_mat is expected to be (S, 3, 3)
-        ua_mat = jnp.matmul(ub_mat, A_mat)
-        ua_inv = jnp.linalg.inv(ua_mat)
+        # 1. Normalize empirical Bragg peaks (scattering vectors)
+        q_norms = jnp.linalg.norm(q_lab_sample, axis=1, keepdims=True)
+        q_sample = q_lab_sample / jnp.where(q_norms == 0, 1.0, q_norms)  # (S, 3, N_obs)
 
-        # Unscaled fractional zone axis direction
-        v = jnp.matmul(ua_inv, e_lab_sample)
+        # 2. Calculate theoretical zones in sample frame: r_sample = U * A * [u,v,w]
+        # A_mat is (S, 3, 3). theo_zones is (3, N_calc).
+        r_cryst = jnp.matmul(A_mat, self.theo_zones)  # (S, 3, N_calc)
+        r_sample_unnorm = jnp.matmul(u_mat, r_cryst)  # (S, 3, N_calc)
 
-        # Grid of physical lengths (e.g. 1 to 50 Angstroms)
-        S_grid = jnp.linspace(self.S_min, self.S_max, self.num_candidates)
+        # 3. Normalize theoretical zones
+        r_norms = jnp.linalg.norm(r_sample_unnorm, axis=1, keepdims=True)
+        r_sample = r_sample_unnorm / jnp.where(
+            r_norms == 0, 1.0, r_norms
+        )  # (S, 3, N_calc)
 
-        S_pop, _, N = v.shape
-        initial_carry = (
-            jnp.inf * jnp.ones((S_pop, N)),
-            jnp.zeros((S_pop, 3, N), dtype=jnp.int32),
-            jnp.zeros((S_pop, N)),
-        )
+        # 4. Cosine similarity (dot product): q_sample^T @ r_sample
+        # q_sample.T is (S, N_obs, 3), r_sample is (S, 3, N_calc) -> Result is (S, N_obs, N_calc)
+        cos_sim = jnp.matmul(q_sample.transpose((0, 2, 1)), r_sample)
 
-        def scan_body(carry, i):
-            curr_min, curr_best_uvw, curr_best_S = carry
+        # 5. Bingham Kernel (Gaussian trough at 90 degrees / Cosine = 0)
+        kernel = -kappa * (cos_sim**2)
 
-            S_cand = S_grid[i]
-            uvw_float = v * S_cand
+        # 6. SoftAssign: For each empirical peak, find the closest zone equator
+        peak_scores = jax.scipy.special.logsumexp(kernel, axis=2)  # (S, N_obs)
 
-            u = uvw_float[:, 0, :]
-            v_idx = uvw_float[:, 1, :]
-            w = uvw_float[:, 2, :]
+        # 7. Global Loss (Minimize to maximize the scores)
+        loss = -jnp.mean(peak_scores, axis=1)  # (S,)
 
-            # Handle centering
-            u_p = (
-                self.M_prim[0, 0] * u
-                + self.M_prim[0, 1] * v_idx
-                + self.M_prim[0, 2] * w
-            )
-            v_p = (
-                self.M_prim[1, 0] * u
-                + self.M_prim[1, 1] * v_idx
-                + self.M_prim[1, 2] * w
-            )
-            w_p = (
-                self.M_prim[2, 0] * u
-                + self.M_prim[2, 1] * v_idx
-                + self.M_prim[2, 2] * w
-            )
+        # Instead of returning [h,k,l], we return the best matching [u,v,w] theoretical zone
+        best_zone_idx = jnp.argmax(kernel, axis=2)  # (S, N_obs)
+        best_zone_int = jnp.take(
+            self.theo_zones.T, best_zone_idx, axis=0
+        )  # (S, N_obs, 3)
 
-            # Continuous Trigonometric Loss
-            du = jnp.sin(jnp.pi * u_p)
-            dv = jnp.sin(jnp.pi * v_p)
-            dw = jnp.sin(jnp.pi * w_p)
-            dist = jnp.sqrt(du**2 + dv**2 + dw**2) / jnp.pi
+        # Scale (lambda) isn't used in this geometry, return zeros
+        dummy_scale = jnp.zeros_like(peak_scores)
 
-            # Exact physical length calculation
-            uvw_int = jnp.round(uvw_float).astype(jnp.int32)
-            A_uvw = jnp.matmul(
-                A_mat, uvw_int.astype(jnp.float32)
-            )  # (S, 3, 3) @ (S, 3, N) -> (S, 3, N)
-            S_opt = jnp.linalg.norm(A_uvw, axis=1)
-
-            # State Update
-            update_mask = dist < curr_min
-            new_min = jnp.where(update_mask, dist, curr_min)
-            new_best_uvw = jnp.where(update_mask[:, None, :], uvw_int, curr_best_uvw)
-            new_best_S = jnp.where(update_mask, S_opt, curr_best_S)
-
-            return (new_min, new_best_uvw, new_best_S), None
-
-        final_carry, _ = lax.scan(
-            scan_body, initial_carry, jnp.arange(self.num_candidates)
-        )
-        dist_min, best_uvw, best_S = final_carry
-
-        loss = jnp.mean(dist_min, axis=1)
-        return loss, dist_min, best_uvw.transpose((0, 2, 1)), best_S
+        return loss, -peak_scores, best_zone_int, dummy_scale
 
     @partial(jax.jit, static_argnames="self")
     def get_results(self, x):
@@ -921,18 +895,25 @@ class VectorizedObjective:
             kf_ki_vec = q_lab
 
         # --- ROUTING LOGIC (LAUE vs ZONE AXIS) ---
-        if self.mode == "zone_axis":
+        if self.mode == "great_circle":
+            # Extract U matrix from the current batch
+            if self.freeze_orientation:
+                rot_params = self.fixed_rot_params[None, :].repeat(
+                    x_pad.shape[0], axis=0
+                )
+            else:
+                rot_params = x_pad[:, :3]
+            U_mat = self.orientation_U_jax(rot_params)
+
             # Compute Direct Space Basis Matrix (A) from Reciprocal Matrix (B)
-            # A = (B^-1)^T. If B is batched (S,3,3) we swap the inner dimensions.
             if B.ndim == 2:
                 B_batch = B[None, ...].repeat(x_pad.shape[0], axis=0)
             else:
                 B_batch = B
             A = jnp.linalg.inv(B_batch).transpose((0, 2, 1))
 
-            # Since the user input kf_lab_fixed_vectors are the normalized zone axes,
-            # they correctly populate kf_ki_vec here.
-            res = self.zone_axis_dynamic_soft_jax(UB, A, kf_ki_vec)
+            # kf_ki_vec are the empirical Bragg peaks rotated back to the sample frame
+            res = self.great_circle_soft_jax(U_mat, A, kf_ki_vec, kappa=self.kappa)
         else:
             res = self.indexer_dynamic_soft_jax(
                 UB,
@@ -1214,8 +1195,8 @@ class FindUB:
         detector_rot_bound_deg: float = 1.0,
         freeze_orientation: bool = False,
         objective_mode: str = "laue",
-        zone_S_min: float = 1.0,
-        zone_S_max: float = 50.0,
+        max_uvw: int = 2,
+        kappa: float = 50.0,
         **kwargs,
     ):
         if goniometer_axes is None and self.goniometer_axes is not None:
@@ -1361,8 +1342,8 @@ class FindUB:
             freeze_orientation=freeze_orientation,
             fixed_rot_params=self.fixed_rot_params,
             mode=objective_mode,
-            zone_S_min=zone_S_min,
-            zone_S_max=zone_S_max,
+            max_uvw=max_uvw,
+            kappa=kappa,
         )
 
         num_dims = 0 if freeze_orientation else 3

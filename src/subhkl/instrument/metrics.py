@@ -5,7 +5,6 @@ Provides functions to compute and return angular/distance errors from indexed pe
 
 import h5py
 import numpy as np
-import scipy.spatial
 
 from subhkl.config import beamlines
 from subhkl.instrument.detector import Detector
@@ -166,13 +165,13 @@ def compute_metrics(
             ub_helper.alpha = f["sample/alpha"][()]
             ub_helper.beta = f["sample/beta"][()]
             ub_helper.gamma = f["sample/gamma"][()]
-            
+
             # Reciprocal space matrix
             B_mat = ub_helper.reciprocal_lattice_B()
-            
+
             # Real space matrix A = (B^-1)^T
-            A_mat = np.linalg.inv(B_mat).T 
-            
+            A_mat = np.linalg.inv(B_mat).T
+
             U = f["sample/U"][()] if "sample/U" in f else np.eye(3)
             sample_offset = (
                 f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
@@ -212,7 +211,9 @@ def compute_metrics(
         # TWO FILE COMPARISON (Omitting for brevity, remains unchanged...)
         # ==========================================
         if file2 is not None:
-            return {"error_message": "Two-file metric comparison is not yet supported for zone axes."}
+            return {
+                "error_message": "Two-file metric comparison is not yet supported for zone axes."
+            }
 
         # ==========================================
         # SINGLE FILE METRICS
@@ -223,10 +224,14 @@ def compute_metrics(
                     matched_h = f["zones/u"][()]
                     matched_k = f["zones/v"][()]
                     matched_l = f["zones/w"][()]
-                    matched_lam = f["zones/S"][()] # Scale factor, unused in metrics but needed for API
+                    matched_lam = f["zones/S"][
+                        ()
+                    ]  # Scale factor, unused in metrics but needed for API
                 else:
                     if "peaks/h" not in f:
-                        return {"error_message": "No peaks/h or zones/u dataset found in file"}
+                        return {
+                            "error_message": "No peaks/h or zones/u dataset found in file"
+                        }
                     matched_h = f["peaks/h"][()]
                     matched_k = f["peaks/k"][()]
                     matched_l = f["peaks/l"][()]
@@ -235,15 +240,19 @@ def compute_metrics(
                 # For zone axes, the input data wasn't detector pixels, it was the lab vectors.
                 # If they were stored during FindUB, they should be in 'peaks/xyz' or 'zones/xyz_lab'
                 if is_zone_axis_mode and "zones/e_lab" in f:
-                     matched_xyz = f["zones/e_lab"][()]
-                     matched_run = f["zones/run_index"][()] if "zones/run_index" in f else np.zeros(len(matched_h))
+                    matched_xyz = f["zones/e_lab"][()]
+                    matched_run = (
+                        f["zones/run_index"][()]
+                        if "zones/run_index" in f
+                        else np.zeros(len(matched_h))
+                    )
                 else:
                     xyz, r_idx = extract_xyz_from_file(file1, instrument)
                     if xyz is None:
                         return {"error_message": "Could not extract XYZ coordinates."}
                     matched_xyz = xyz
                     matched_run = r_idx
-                    
+
                 matched_R = _get_safe_R_stack(R_file, matched_run, len(matched_h))
 
         h = np.array(matched_h)
@@ -296,10 +305,11 @@ def compute_metrics(
                 RUA = np.matmul(R_all, UA)
             else:
                 RUA = R_all @ UA
-                
+
             from subhkl.instrument.physics import calculate_zone_axis_error
+
             d_err, ang_err = calculate_zone_axis_error(xyz_det, h, k, l, RUA)
-            
+
         else:
             # For Bragg Peaks, construct the Reciprocal Space RUB matrix
             UB = U @ B_mat
@@ -341,5 +351,6 @@ def compute_metrics(
 
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         return {"error_message": f"Exception during metrics computation: {e!s}"}

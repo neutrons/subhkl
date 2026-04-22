@@ -92,6 +92,8 @@ def run_index(
     input_data: dict | None = None,
     num_candidates: int | None = None,
     mode: str | None = "laue",
+    max_uvw: int = 2,
+    kappa: float = 50.0,
 ):
     input_data = input_data or {}
 
@@ -516,6 +518,8 @@ def run_index(
         freeze_orientation=freeze_orientation,
         num_candidates=num_candidates,
         objective_mode=mode,
+        max_uvw=max_uvw,
+        kappa=kappa,
     )
 
     print(f"\nOptimization complete. Best solution indexed {num} peaks.")

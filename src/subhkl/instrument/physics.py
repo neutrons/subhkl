@@ -186,6 +186,7 @@ def calculate_angular_error(
 
     return d_err, ang_err
 
+
 def calculate_zone_axis_error(e_lab_obs, u, v, w, RUA):
     """
     Computes the true angular error between empirical zone axes and theoretical zone axes.
@@ -199,7 +200,7 @@ def calculate_zone_axis_error(e_lab_obs, u, v, w, RUA):
 
     # 2. Map theoretical zones into the lab frame: r_lab = R * U * A * [u,v,w]
     # RUA shape is (N, 3, 3), uvw is (N, 3)
-    r_lab_calc = np.einsum('nij,nj->ni', RUA, uvw)
+    r_lab_calc = np.einsum("nij,nj->ni", RUA, uvw)
 
     # 3. Normalize theoretical vectors
     norms = np.linalg.norm(r_lab_calc, axis=1, keepdims=True)
