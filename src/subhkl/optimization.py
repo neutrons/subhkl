@@ -766,11 +766,6 @@ class VectorizedObjective:
         return loss, dist_min, best_hkl.transpose((0, 2, 1)), best_lamb
 
     def great_circle_soft_jax(self, u_mat, A_mat, q_lab_sample, kappa=50.0):
-        """
-        Evaluates the alignment of empirical Bragg peaks against theoretical 
-        Zone Axes using the Hough Variance (Density) Loss to prevent spiderweb degeneracy.
-        """
-        # 1. Normalize vectors
         q_norms = jnp.linalg.norm(q_lab_sample, axis=1, keepdims=True)
         q_sample = q_lab_sample / jnp.where(q_norms == 0, 1.0, q_norms) 
 
@@ -780,28 +775,25 @@ class VectorizedObjective:
         r_norms = jnp.linalg.norm(r_sample_unnorm, axis=1, keepdims=True)
         r_sample = r_sample_unnorm / jnp.where(r_norms == 0, 1.0, r_norms) 
 
-        # 2. Cosine similarity
         cos_sim = jnp.matmul(q_sample.transpose((0, 2, 1)), r_sample) 
+        kernel = jnp.exp(-kappa * (cos_sim ** 2)) 
 
-        # 3. Bingham Kernel (Gaussian at 90 degrees)
-        # Returns 1.0 if perfectly orthogonal, decays to 0.0 as it deviates
-        kernel = jnp.exp(-kappa * (cos_sim ** 2)) # Shape: (S, N_obs, N_calc)
-
-        # 4. Calculate the total density of peaks on each theoretical equator
+        # Total density per equator
         zone_densities = jnp.sum(kernel, axis=1) # Shape: (S, N_calc)
 
-        # 5. Maximize the "spikiness" of the densities
-        # The true U matrix aligns many peaks onto a few principal equators, causing massive spikes.
-        # Maximizing the sum of squares perfectly captures this variance.
-        loss = -jnp.mean(zone_densities ** 2, axis=1) # Shape: (S,)
+        # --- THE QUARTIC LOSS ---
+        # Maximizing the 4th moment strongly forces sparsity (spikiness)
+        loss = -jnp.mean(zone_densities ** 4, axis=1) 
 
-        # For the final output, assign each peak to the zone equator that caught it best
         best_zone_idx = jnp.argmax(kernel, axis=2)
         best_zone_int = jnp.take(self.theo_zones.T, best_zone_idx, axis=0)
 
-        active_zones_mask = zone_densities > 3.0
-        num_active_zones = jnp.sum(active_zones_mask, axis=1) # Shape: (S,)
-        
+        # --- RELATIVE ZONE COUNTER ---
+        # A zone is only "active" if its density is at least 15% of the peak density
+        max_density = jnp.max(zone_densities, axis=1, keepdims=True)
+        active_zones_mask = zone_densities > (max_density * 0.15)
+        num_active_zones = jnp.sum(active_zones_mask, axis=1) 
+
         return loss, -jnp.max(kernel, axis=2), best_zone_int, num_active_zones
 
     @partial(jax.jit, static_argnames="self")
