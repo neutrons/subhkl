@@ -187,27 +187,30 @@ def calculate_angular_error(
     return d_err, ang_err
 
 
-def calculate_great_circle_error(q_lab_obs, u, v, w, RUA):
+def calculate_great_circle_error(xyz_det, u, v, w, RUA, sample_offset=np.zeros(3), ki_vec=np.array([0.0, 0.0, 1.0])):
     """
     Computes error between empirical Bragg peaks and assigned Zone Axes.
-    Perfect alignment means they are exactly 90 degrees apart (dot = 0).
     """
+    # 1. Convert detector hit coords to scattering vectors (q_lab)
+    kf = xyz_det - sample_offset[None, :]
+    kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
+    q_lab_obs = kf - ki_vec[None, :]
+    
+    # Normalize scattering vectors
+    q_norms = np.linalg.norm(q_lab_obs, axis=1, keepdims=True)
+    q_lab_obs = q_lab_obs / np.where(q_norms == 0, 1.0, q_norms)
+
+    # 2. Map theoretical zones into the lab frame
     uvw = np.stack([u, v, w], axis=1)
     r_lab_calc = np.einsum('nij,nj->ni', RUA, uvw)
     
-    # Normalize theoretical zones
     norms = np.linalg.norm(r_lab_calc, axis=1, keepdims=True)
     r_lab_calc = r_lab_calc / np.where(norms == 0, 1.0, norms)
     
-    # Normalize empirical Bragg peaks
-    q_norms = np.linalg.norm(q_lab_obs, axis=1, keepdims=True)
-    q_lab_obs = q_lab_obs / np.where(q_norms == 0, 1.0, q_norms)
-    
-    # Compute absolute dot product (head-tail symmetry)
+    # 3. Compute Angle
     dot_products = np.sum(r_lab_calc * q_lab_obs, axis=1)
     dot_products = np.clip(np.abs(dot_products), 0.0, 1.0) 
     
-    # Deviation from 90 degrees is arcsin(dot)
     ang_err = np.rad2deg(np.arcsin(dot_products))
     d_err = np.zeros_like(ang_err)
     

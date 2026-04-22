@@ -308,7 +308,8 @@ def compute_metrics(
 
             from subhkl.instrument.physics import calculate_great_circle_error
 
-            d_err, ang_err = calculate_great_circle_error(xyz_det, h, k, l, RUA)
+            d_err, ang_err = calculate_great_circle_error(xyz_det, h, k, l, RUA,
+                sample_offset=sample_offset, ki_vec=ki_vec)
 
         else:
             # For Bragg Peaks, construct the Reciprocal Space RUB matrix
