@@ -306,9 +306,9 @@ def compute_metrics(
             else:
                 RUA = R_all @ UA
 
-            from subhkl.instrument.physics import calculate_zone_axis_error
+            from subhkl.instrument.physics import calculate_great_circle_error
 
-            d_err, ang_err = calculate_zone_axis_error(xyz_det, h, k, l, RUA)
+            d_err, ang_err = calculate_great_circle_error(xyz_det, h, k, l, RUA)
 
         else:
             # For Bragg Peaks, construct the Reciprocal Space RUB matrix
