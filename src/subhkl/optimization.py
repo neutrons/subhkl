@@ -795,8 +795,8 @@ class VectorizedObjective:
 
         return loss, -jnp.max(kernel, axis=2), best_zone_int, num_active_zones
 
-    @partial(jax.jit, static_argnames="self")
-    def get_results(self, x):
+    @partial(jax.jit, static_argnames=("self", "mode"))
+    def get_results(self, x, mode):
         original_S = x.shape[0]
         pad_size = max(0, 2 - original_S)
         x_pad = jnp.pad(x, ((0, pad_size), (0, 0)), mode="edge") if pad_size > 0 else x
@@ -880,7 +880,7 @@ class VectorizedObjective:
             kf_ki_vec = q_lab
 
         # --- ROUTING LOGIC (LAUE vs ZONE AXIS) ---
-        if self.mode == "great_circle":
+        if mode == "great_circle":
             # Extract U matrix from the current batch
             if self.freeze_orientation:
                 rot_params = self.fixed_rot_params[None, :].repeat(
@@ -1374,7 +1374,7 @@ class FindUB:
             rot_params = self.fixed_rot_params if freeze_orientation else np.zeros(3)
             U = objective.orientation_U_jax(rot_params[None])[0]
 
-            loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
+            loss_score, dist_min, hkl, lamb = objective.get_results(x_batch, objective_mode)
             dist_min_final = np.array(dist_min[0])
             mask = dist_min_final < 0.15
             num_indexed = int(np.sum(mask))
@@ -1656,7 +1656,7 @@ class FindUB:
             print("--- Refined Detector Geometry ---")
             print(f"Max Center Translation: {max_drift:.3f} mm")
 
-        loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
+        loss_score, dist_min, hkl, lamb = objective.get_results(x_batch, objective_mode)
         dist_min_final = np.array(dist_min[0])
 
         mask = dist_min_final < 0.15
