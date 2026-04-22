@@ -1566,14 +1566,13 @@ class FindUB:
 
         print("Polishing solution with BFGS refinement...")
 
-        # --- THE OBJECTIVE SWAP ---
+        # objective swap
         if objective_mode == "great_circle":
             print("Switching objective from Great Circle to Laue for exact discrete integer polish...")
             objective.mode = "laue"
 
             # We MUST recalculate the initial loss for BFGS under the Laue objective!
             best_overall_loss = float(objective(jnp.array(best_overall_member)[None, :])[0])
-        # --------------------------
 
         from scipy.optimize import minimize as scipy_minimize
 
@@ -1657,7 +1656,7 @@ class FindUB:
             print("--- Refined Detector Geometry ---")
             print(f"Max Center Translation: {max_drift:.3f} mm")
 
-        loss_score, dist_min, hkl, lamb_active_zones = objective.get_results(x_batch)
+        loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
         dist_min_final = np.array(dist_min[0])
 
         mask = dist_min_final < 0.15
@@ -1666,12 +1665,6 @@ class FindUB:
         hkl_final = np.array(hkl[0])
         hkl_final[~mask] = 0
 
-        if objective.mode == "great_circle":
-            zones_aligned = int(np.array(lamb_active_zones[0]))
-            lamb = np.zeros((hkl_final.shape[0],))
-            print(f"Final Solution indexed {num_indexed}/{num_obs} peaks across {zones_aligned} distinct Zone Axes.")
-        else:
-            lamb = np.array(lamb_active_zones[0])
-            print(f"Final Solution indexed {num_indexed}/{num_obs} peaks.")
+        print(f"Final Solution indexed {num_indexed}/{num_obs} peaks.")
 
-        return num_indexed, hkl_final, lamb, np.array(U)
+        return num_indexed, hkl_final, np.array(lamb[0]), np.array(U)
