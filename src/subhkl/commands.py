@@ -491,7 +491,7 @@ def run_index(
             freeze_orientation=freeze_orientation,
         )
 
-    num, hkl_uvw, lambda_S, U = opt.minimize(
+    num, hkl, lam, U = opt.minimize(
         strategy_name=strategy_name,
         population_size=population_size,
         num_generations=gens,
@@ -595,16 +595,10 @@ def run_index(
         if opt.run_indices is not None:
             safe_write(f, "peaks/run_index", opt.run_indices)
 
-        if mode == "laue":
-            f["peaks/h"] = hkl_uvw[:, 0]
-            f["peaks/k"] = hkl_uvw[:, 1]
-            f["peaks/l"] = hkl_uvw[:, 2]
-            f["peaks/lambda"] = lambda_S
-        else:
-            f["zones/u"] = hkl_uvw[:, 0]
-            f["zones/v"] = hkl_uvw[:, 1]
-            f["zones/w"] = hkl_uvw[:, 2]
-            f["zones/S"] = lambda_S
+        f["peaks/h"] = hkl[:, 0]
+        f["peaks/k"] = hkl[:, 1]
+        f["peaks/l"] = hkl[:, 2]
+        f["peaks/lambda"] = lam
 
         if opt.x is not None and opt.x.size > 0:
             f["optimization/best_params"] = opt.x
