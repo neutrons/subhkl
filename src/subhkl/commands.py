@@ -595,7 +595,7 @@ def run_index(
         if opt.run_indices is not None:
             safe_write(f, "peaks/run_index", opt.run_indices)
 
-        if mode != "zone_axis":
+        if mode == "laue":
             f["peaks/h"] = hkl_uvw[:, 0]
             f["peaks/k"] = hkl_uvw[:, 1]
             f["peaks/l"] = hkl_uvw[:, 2]
