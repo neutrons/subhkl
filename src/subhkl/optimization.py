@@ -915,7 +915,7 @@ class VectorizedObjective:
 
     @partial(jax.jit, static_argnames="self")
     def __call__(self, x):
-        score, _, _, _ = self.get_results(x)
+        score, _, _, _ = self.get_results(x, self.mode)
         return score
 
 
