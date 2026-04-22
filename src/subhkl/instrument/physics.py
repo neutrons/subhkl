@@ -185,3 +185,39 @@ def calculate_angular_error(
     d_err = np.abs(d_obs - d_calc)
 
     return d_err, ang_err
+
+def calculate_zone_axis_error(e_lab_obs, u, v, w, RUA):
+    """
+    Computes the true angular error between empirical zone axes and theoretical zone axes.
+
+    e_lab_obs: (N, 3) empirical normalized lab vectors from Hough transform
+    u, v, w: (N,) integer zone axis indices
+    RUA: (N, 3, 3) the batched real-space mapping matrix (R * U * A)
+    """
+    # 1. Construct the integer zone vectors
+    uvw = np.stack([u, v, w], axis=1)
+
+    # 2. Map theoretical zones into the lab frame: r_lab = R * U * A * [u,v,w]
+    # RUA shape is (N, 3, 3), uvw is (N, 3)
+    r_lab_calc = np.einsum('nij,nj->ni', RUA, uvw)
+
+    # 3. Normalize theoretical vectors
+    norms = np.linalg.norm(r_lab_calc, axis=1, keepdims=True)
+    r_lab_calc = r_lab_calc / np.where(norms == 0, 1.0, norms)
+
+    # 4. Normalize empirical vectors (just in case)
+    e_norms = np.linalg.norm(e_lab_obs, axis=1, keepdims=True)
+    e_lab_obs = e_lab_obs / np.where(e_norms == 0, 1.0, e_norms)
+
+    # 5. Compute Angle (Using dot product, ensuring we handle head-tail symmetry)
+    dot_products = np.sum(r_lab_calc * e_lab_obs, axis=1)
+    # Zone axes have head-tail symmetry, so we take the absolute value of the dot product
+    dot_products = np.clip(np.abs(dot_products), 0.0, 1.0)
+
+    ang_err = np.rad2deg(np.arccos(dot_products))
+
+    # Zone axes don't have a "d-spacing error" like Bragg peaks do (since scale S was just an optimizer trick),
+    # so we return zeros for d_err to maintain API compatibility.
+    d_err = np.zeros_like(ang_err)
+
+    return d_err, ang_err
