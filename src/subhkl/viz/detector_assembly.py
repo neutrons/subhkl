@@ -318,7 +318,7 @@ def plot_unrolled_detector(
                 else:
                     paths = cs.get_paths()
                 
-                for path in collection.get_paths():
+                for path in paths:
                     v = path.vertices
                     if len(v) == 0: continue
                     
