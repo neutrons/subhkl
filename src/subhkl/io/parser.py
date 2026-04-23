@@ -674,7 +674,7 @@ def sparse_hough_cmd(
     nexus: Annotated[
         str, typer.Option(help="Original NeXus file to rebuild physical geometry from pixels.")
     ],
-    dict_size: Annotated[
+    max_dict_size: Annotated[
         int, typer.Option(help="Number of basis functions (zone axes) in the spherical dictionary.")
     ] = 2000,
     kappa: Annotated[
@@ -702,7 +702,7 @@ def sparse_hough_cmd(
         output_h5_filename=output_h5_filename,
         instrument_name=instrument,
         original_nexus_filename=nexus,
-        dict_size=dict_size,
+        max_dict_size=max_dict_size,
         kappa=kappa,
         alpha=alpha,
         max_uvw=max_uvw,

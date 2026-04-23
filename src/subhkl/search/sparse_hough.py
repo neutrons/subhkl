@@ -37,7 +37,6 @@ def get_data_driven_dictionary(q_lab_obs, max_pairs=20000):
     
     return final_dict
 
-@partial(jit, static_argnames=["kappa"])
 def build_hough_dictionary(q_lab_obs, dict_zones, kappa=50.0):
     q_norms = jnp.linalg.norm(q_lab_obs, axis=1, keepdims=True)
     q_lab = q_lab_obs / jnp.where(q_norms == 0, 1.0, q_norms)
@@ -95,9 +94,9 @@ def solve_sparse_hough_tuned_jax(q_lab_obs, dict_zones, kappa, candidate_alphas,
     return all_c[best_idx], bics[best_idx], candidate_alphas[best_idx]
 
 class SparseHoughIndexer:
-    def __init__(self, dict_size=2000, kappa=50.0, alpha=None, bg_val=0.1, auto_tune=True,
+    def __init__(self, max_dict_size=20000, kappa=50.0, alpha=None, bg_val=0.1, auto_tune=True,
                  candidate_alphas=None):
-        self.dict_size = dict_size
+        self.max_dict_size = dict_size
         self.kappa = kappa
         self.alpha = alpha
         self.bg_val = bg_val

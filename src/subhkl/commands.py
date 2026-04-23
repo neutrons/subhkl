@@ -1385,7 +1385,7 @@ def run_sparse_hough(
     output_h5_filename: str,
     instrument_name: str | None = None,
     original_nexus_filename: str | None = None,
-    dict_size: int = 2000,
+    max_dict_size: int = 2000,
     kappa: float = 50.0,
     alpha: float = None,
     max_uvw: int = 1,
