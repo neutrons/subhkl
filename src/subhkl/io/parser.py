@@ -660,13 +660,19 @@ def zone_axis_search(
         batch_size=batch_size,
     )
 
-@app.command()
-def sparse_hough_search(
+@app.command(name="sparse-hough")
+def sparse_hough_cmd(
     finder_file: Annotated[
         str, typer.Argument(help="Input HDF5 file containing found peaks.")
     ],
     output_h5_filename: Annotated[
         str, typer.Argument(help="Output HDF5 file containing the initial U-matrix.")
+    ],
+    instrument: Annotated[
+        str, typer.Option(help="Instrument name to rebuild physical geometry from pixels.")
+    ],
+    nexus: Annotated[
+        str, typer.Option(help="Original NeXus file to rebuild physical geometry from pixels.")
     ],
     dict_size: Annotated[
         int, typer.Option(help="Number of basis functions (zone axes) in the spherical dictionary.")
@@ -683,17 +689,20 @@ def sparse_hough_search(
 ):
     """
     Algebraic Orientation Bootstrapper using L1-Regularized Sparse Basis Pursuit.
-    
-    This command calculates the initial macroscopic orientation matrix (U) without 
+
+    This command calculates the initial macroscopic orientation matrix (U) without
     global optimization or meta-heuristics:
-    1. A Semi-Smooth Newton solver identifies the true laboratory zone axes.
-    2. Davenport's q-method extracts the exact macroscopic U-matrix algebraically.
-    3. The resulting U-matrix is exported alongside the raw geometry for downstream polishing.
+    1. Converts detector pixels to physical lab coordinates using instrument geometry.
+    2. A Semi-Smooth Newton solver identifies the true laboratory zone axes.
+    3. Davenport's q-method extracts the exact macroscopic U-matrix algebraically.
+    4. The resulting U-matrix is exported alongside the raw geometry for downstream polishing.
     """
-    
+
     run_sparse_hough(
         finder_file=finder_file,
         output_h5_filename=output_h5_filename,
+        instrument_name=instrument,
+        original_nexus_filename=nexus,
         dict_size=dict_size,
         kappa=kappa,
         alpha=alpha,
