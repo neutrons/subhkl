@@ -705,3 +705,6 @@ def sparse_hough_cmd(
         max_uvw=max_uvw,
         create_visualizations=create_visualizations,
     )
+
+if __name__ == "__main__":
+    app()
