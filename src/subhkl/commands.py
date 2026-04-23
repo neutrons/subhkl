@@ -1525,8 +1525,8 @@ def run_sparse_hough(
 
             run_tasks.append((out_name, run_peaks, data["images"], data["detectors"], instrument_name, empirical_zones))
 
-       import multiprocessing
-       import concurrent.futures
+        import multiprocessing
+        import concurrent.futures
 
         max_workers = min(os.cpu_count() or 4, len(run_tasks))
         ctx = multiprocessing.get_context("spawn")
