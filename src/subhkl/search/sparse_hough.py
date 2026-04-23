@@ -102,7 +102,6 @@ class SparseHoughIndexer:
         self.alpha = alpha
         self.bg_val = bg_val
         self.auto_tune = auto_tune
-        self.dict_zones = get_fibonacci_hemisphere(self.dict_size)
 
         if candidate_alphas is None:
             # A broad sweep of Z-scores from very loose (2.0) to extremely strict (50.0)
