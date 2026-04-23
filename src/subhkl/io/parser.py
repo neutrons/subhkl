@@ -674,12 +674,9 @@ def sparse_hough_cmd(
     nexus: Annotated[
         str, typer.Option(help="Original NeXus file to rebuild physical geometry from pixels.")
     ],
-    max_dict_size: Annotated[
-        int, typer.Option(help="Number of basis functions (zone axes) in the spherical dictionary.")
-    ] = 2000,
-    kappa: Annotated[
-        float, typer.Option(help="Bingham kernel concentration (sharpness of equators).")
-    ] = 50.0,
+    tolerance_deg: Annotated[
+        float, typer.Option(help="Angular tolerance for detecting great circles, in degree.")
+    ] = 0.15,
     max_uvw: Annotated[
         int, typer.Option(help="Maximum uvw index for theoretical triad matching.")
     ] = 1,
@@ -696,8 +693,7 @@ def sparse_hough_cmd(
         output_h5_filename=output_h5_filename,
         instrument_name=instrument,
         original_nexus_filename=nexus,
-        max_dict_size=max_dict_size,
-        kappa=kappa,
+        tolerance_deg=tolerance_deg,
         max_uvw=max_uvw,
         create_visualizations=create_visualizations,
     )

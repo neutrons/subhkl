@@ -1385,8 +1385,7 @@ def run_sparse_hough(
     output_h5_filename: str,
     instrument_name: str | None = None,
     original_nexus_filename: str | None = None,
-    max_dict_size: int = 2000,
-    kappa: float = 50.0,
+    tolerance_deg: float = 0.15,
     max_uvw: int = 1,
     create_visualizations: bool = False, # <--- NEW ARGUMENT
 ):
@@ -1452,7 +1451,7 @@ def run_sparse_hough(
     print(f"  > Loaded {len(q_lab_obs)} empirical peaks.")
 
     print("\n[2/3] Sparse Basis Pursuit (L1-Regularized SSN)")
-    indexer = SparseHoughIndexer(max_dict_size=max_dict_size, kappa=kappa)
+    indexer = SparseHoughIndexer(tolerance_deg)
     empirical_zones, activation_weights = indexer.find_active_zones(q_lab_obs)
 
     print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.")

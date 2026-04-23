@@ -285,7 +285,7 @@ def plot_unrolled_detector(
             )
 
     # ==========================================
-    # PLOTTING THE GREAT CIRCLES (ZONE AXES)
+    # plotting zone axes (conic sections)
     # ==========================================
     if zone_axes is not None:
         added_za_label = False
