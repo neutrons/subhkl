@@ -28,16 +28,19 @@ def davenport_q_method(V_obs, W_theo):
 
 def align_empirical_zones(e_lab_obs, B_mat, max_uvw=6, angle_tol=1.5):
     """
-    Ultra-Fast Branch & Bound Vectorized Matcher. 
-    Bypasses combinatorics by dynamically shrinking the search radius.
+    Hypothesis Consensus (RANSAC) Triad Matcher.
+    Immunized against accidental isometries by evaluating global consensus 
+    across all extracted empirical axes.
     """
-    N_use = min(4, len(e_lab_obs))
+    N_emp = len(e_lab_obs)
+    N_use = min(3, N_emp) # We only need 3 axes to generate a Hypothesis U-Matrix
+    
     if N_use < 3:
         raise ValueError("Need at least 3 empirical zone axes to lock 3D orientation.")
     
     e_use = e_lab_obs[:N_use]
 
-    # 1. Generate the theoretical zones
+    # 1. Generate Theoretical Dictionary
     print(f"  > Generating Theoretical Dictionary (max_uvw={max_uvw})...")
     u_vals = np.arange(-max_uvw, max_uvw + 1)
     u, v, w = np.meshgrid(u_vals, u_vals, u_vals, indexing="ij")
@@ -45,7 +48,7 @@ def align_empirical_zones(e_lab_obs, B_mat, max_uvw=6, angle_tol=1.5):
     mask = ~((zones[0] == 0) & (zones[1] == 0) & (zones[2] == 0))
     theo_zones = zones[:, mask].astype(np.float32).T 
 
-    # 2. Map theoretical zones into real space: r = (B^-1)^T * z
+    # 2. Map theoretical zones into real-space Cartesian frame
     A_mat = np.linalg.inv(B_mat).T
     r_theo = (A_mat @ theo_zones.T).T
     r_norms = np.linalg.norm(r_theo, axis=1, keepdims=True)
@@ -54,104 +57,83 @@ def align_empirical_zones(e_lab_obs, B_mat, max_uvw=6, angle_tol=1.5):
 
     print(f"  > Compiled {N_theo} theoretical axes. Building Hash Table...")
 
-    # 3. Precompute the FULL N x N theoretical angle lookup table
+    # 3. Precompute Angle Tables
     theo_dots = np.clip(np.abs(r_theo_norm @ r_theo_norm.T), 0.0, 1.0)
     theo_angles = np.rad2deg(np.arccos(theo_dots))
 
-    # 4. Extract target empirical angles
     emp_dots = np.clip(np.abs(e_use @ e_use.T), 0.0, 1.0)
     emp_angles = np.rad2deg(np.arccos(emp_dots))
 
     req_12 = emp_angles[0, 1]
     req_13 = emp_angles[0, 2]
     req_23 = emp_angles[1, 2]
-    
-    if N_use == 4:
-        req_14 = emp_angles[0, 3]
-        req_24 = emp_angles[1, 3]
-        req_34 = emp_angles[2, 3]
 
-    print(f"  > Executing Branch & Bound Edge Match (tol={angle_tol} deg)...")
+    print(f"  > Executing Hypothesis Generation (tol={angle_tol} deg)...")
 
-    # The Baseline Edge: Extract all pairs matching E1-E2
+    # 4. Generate Candidate Triads (The Hypotheses)
     valid_a, valid_b = np.where(np.abs(theo_angles - req_12) < angle_tol)
     valid_mask = valid_a != valid_b
     valid_a = valid_a[valid_mask]
     valid_b = valid_b[valid_mask]
 
-    # Sort the baseline pairs by their exactness so the best candidates are tested first
-    err_12 = np.abs(theo_angles[valid_a, valid_b] - req_12)
-    sort_idx = np.argsort(err_12)
-    valid_a = valid_a[sort_idx]
-    valid_b = valid_b[sort_idx]
-    err_12 = err_12[sort_idx]
-
-    best_error = angle_tol
-    best_indices = None
-
-    for a, b, e12 in zip(valid_a, valid_b, err_12):
-        # Branch & Bound Cutoff: We can never beat the current best error!
-        if e12 >= best_error:
-            break
-            
+    candidates = []
+    for a, b in zip(valid_a, valid_b):
         err_13_all = np.abs(theo_angles[a, :] - req_13)
         err_23_all = np.abs(theo_angles[b, :] - req_23)
         
-        # Dynamically restrict valid C candidates using the shrinking best_error
-        valid_c = np.where((err_13_all < best_error) & (err_23_all < best_error))[0]
+        valid_c = np.where((err_13_all < angle_tol) & (err_23_all < angle_tol))[0]
         
         for c in valid_c:
             if c == a or c == b: continue
-            
-            e13 = err_13_all[c]
-            e23 = err_23_all[c]
-            current_max = max(e12, e13, e23)
-            
-            if current_max >= best_error:
-                continue
-                
-            if N_use == 3:
-                # We found a new best Triad! Shrink the bounds.
-                best_error = current_max
-                best_indices = [a, b, c]
-            else:
-                err_14_all = np.abs(theo_angles[a, :] - req_14)
-                err_24_all = np.abs(theo_angles[b, :] - req_24)
-                err_34_all = np.abs(theo_angles[c, :] - req_34)
-                
-                valid_d = np.where((err_14_all < best_error) & 
-                                   (err_24_all < best_error) & 
-                                   (err_34_all < best_error))[0]
-                                   
-                for d in valid_d:
-                    if d in (a, b, c): continue
-                    
-                    e14 = err_14_all[d]
-                    e24 = err_24_all[d]
-                    e34 = err_34_all[d]
-                    
-                    tetrad_max = max(current_max, e14, e24, e34)
-                    
-                    if tetrad_max < best_error:
-                        # We found a new best Tetrad! Shrink the bounds.
-                        best_error = tetrad_max
-                        best_indices = [a, b, c, d]
+            # Score triad by maximum internal error
+            max_err = max(np.abs(theo_angles[a,b]-req_12), err_13_all[c], err_23_all[c])
+            candidates.append((max_err, a, b, c))
 
-    if best_indices is None:
-        raise ValueError(f"Could not find a theoretical triad matching within {angle_tol} deg.")
+    if not candidates:
+        raise ValueError(f"No theoretical triads match the primary empirical angles within {angle_tol} deg.")
 
-    print(f"  > Match Found! Max Angle Error: {best_error:.3f} deg")
-
-    # 5. Evaluate Davenport just ONCE on the absolute best geometric match
-    best_match = r_theo_norm[best_indices]
-    best_U = None
-    best_score = -np.inf
+    # Sort candidates by internal geometric tightness, take the top 100 for verification
+    candidates.sort(key=lambda x: x[0])
+    candidates = candidates[:100]
     
-    for signs in itertools.product([1, -1], repeat=N_use):
-        r_flipped = best_match * np.array(signs)[:, None]
-        U, score = davenport_q_method(e_use, r_flipped)
-        if score > best_score:
-            best_score = score
-            best_U = U
+    print(f"  > Found {len(candidates)} plausible isometries. Evaluating Global Consensus...")
 
+    best_U = None
+    best_inliers = -1
+    best_residual = np.inf
+
+    # 5. Global Consensus Verification
+    for max_err, a, b, c in candidates:
+        candidate_vectors = r_theo_norm[[a, b, c]]
+        
+        # Test all head-tail sign combinations for Laue symmetry
+        for signs in itertools.product([1, -1], repeat=3):
+            r_flipped = candidate_vectors * np.array(signs)[:, None]
+            U, _ = davenport_q_method(e_use, r_flipped)
+            
+            # --- THE CONSENSUS CHECK ---
+            # Project ALL theoretical axes into the lab frame using this U-matrix
+            r_lab = (U @ r_theo.T).T
+            r_lab_norm = r_lab / np.linalg.norm(r_lab, axis=1, keepdims=True)
+            
+            # Check how many of the FULL set of 15 empirical axes align with any theoretical axis
+            dots = np.clip(np.abs(e_lab_obs @ r_lab_norm.T), 0.0, 1.0)
+            max_dots = np.max(dots, axis=1) # Best match for each empirical axis
+            angles = np.rad2deg(np.arccos(max_dots))
+            
+            inliers = np.sum(angles < angle_tol)
+            
+            if inliers > 0:
+                residual = np.mean(angles[angles < angle_tol])
+            else:
+                residual = 999.0
+                
+            # Keep the U-Matrix that explains the most axes with the tightest fit
+            if inliers > best_inliers or (inliers == best_inliers and residual < best_residual):
+                best_inliers = inliers
+                best_residual = residual
+                best_U = U
+
+    print(f"  > Consensus Achieved! U-Matrix explains {best_inliers}/{N_emp} axes (Mean Error: {best_residual:.3f} deg)")
+    
     return best_U
