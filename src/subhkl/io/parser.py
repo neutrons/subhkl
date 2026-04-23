@@ -677,6 +677,9 @@ def sparse_hough_cmd(
     tolerance_deg: Annotated[
         float, typer.Option(help="Angular tolerance for detecting great circles, in degree.")
     ] = 0.15,
+    max_axes: Annotated[
+        int, typer.Option(help="Maximum number of zone axes to consider.")
+    ] = 15,
     max_uvw: Annotated[
         int, typer.Option(help="Maximum uvw index for theoretical triad matching.")
     ] = 1,
@@ -695,6 +698,7 @@ def sparse_hough_cmd(
         original_nexus_filename=nexus,
         tolerance_deg=tolerance_deg,
         max_uvw=max_uvw,
+        max_axes=max_axes,
         create_visualizations=create_visualizations,
     )
 

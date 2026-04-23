@@ -1386,6 +1386,7 @@ def run_sparse_hough(
     instrument_name: str | None = None,
     original_nexus_filename: str | None = None,
     tolerance_deg: float = 0.15,
+    max_axes: int = 15,
     max_uvw: int = 1,
     create_visualizations: bool = False, # <--- NEW ARGUMENT
 ):
@@ -1452,7 +1453,7 @@ def run_sparse_hough(
 
     print("\n[2/3] Sparse Basis Pursuit (L1-Regularized SSN)")
     indexer = SparseHoughIndexer(tolerance_deg)
-    empirical_zones, activation_weights = indexer.find_active_zones(q_lab_obs)
+    empirical_zones, activation_weights = indexer.find_active_zones(q_lab_obs, max_axes=max_axes)
 
     print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.")
     for i, (zone, weight) in enumerate(zip(empirical_zones, activation_weights)):
