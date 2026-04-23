@@ -109,7 +109,7 @@ class SparseHoughIndexer:
 
         if candidate_alphas is None:
             # A broad sweep of Z-scores from very loose (2.0) to extremely strict (50.0)
-            self.candidate_alphas = jnp.array([2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0], dtype=jnp.float32)
+            self.candidate_alphas = jnp.array([2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0, 200.0], dtype=jnp.float32)
         else:
             self.candidate_alphas = candidate_alphas
         
