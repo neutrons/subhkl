@@ -116,5 +116,6 @@ class SparseHoughIndexer:
         final_zones = np.array(final_zones)
         final_scores = np.array(final_scores)
 
+        # The greedy sequence is not strictly monotonic in density!
         order = np.argsort(final_scores)[::-1]
         return final_zones[order], final_scores[order]

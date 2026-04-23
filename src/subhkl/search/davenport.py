@@ -3,9 +3,7 @@ import itertools
 from scipy.spatial.transform import Rotation
 
 def davenport_q_method(V_obs, W_theo):
-    """
-    Solves Wahba's problem using Davenport's q-method.
-    """
+    """Solves Wahba's problem using Davenport's q-method."""
     B = np.zeros((3, 3))
     for v, w in zip(V_obs, W_theo):
         B += np.outer(v, w)
@@ -28,101 +26,127 @@ def davenport_q_method(V_obs, W_theo):
     
     return U, eigenvalues[max_idx]
 
-def align_empirical_zones(e_lab_obs, B_mat, max_uvw=3, angle_tol=2.0):
+def align_empirical_zones(e_lab_obs, B_mat, max_uvw=6, angle_tol=1.5):
     """
-    Accelerated DFS Triad Matcher. Prunes combinations using pairwise angle constraints.
+    Ultra-Fast Branch & Bound Vectorized Matcher. 
+    Bypasses combinatorics by dynamically shrinking the search radius.
     """
+    N_use = min(4, len(e_lab_obs))
+    if N_use < 3:
+        raise ValueError("Need at least 3 empirical zone axes to lock 3D orientation.")
+    
+    e_use = e_lab_obs[:N_use]
+
     # 1. Generate the theoretical zones
+    print(f"  > Generating Theoretical Dictionary (max_uvw={max_uvw})...")
     u_vals = np.arange(-max_uvw, max_uvw + 1)
     u, v, w = np.meshgrid(u_vals, u_vals, u_vals, indexing="ij")
     zones = np.stack([u.flatten(), v.flatten(), w.flatten()], axis=0)
     mask = ~((zones[0] == 0) & (zones[1] == 0) & (zones[2] == 0))
-    theo_zones = zones[:, mask].astype(np.float32).T  # (N_calc, 3)
+    theo_zones = zones[:, mask].astype(np.float32).T 
 
-    # 2. Map theoretical zones into real space: A = (B^-1)^T
+    # 2. Map theoretical zones into real space: r = (B^-1)^T * z
     A_mat = np.linalg.inv(B_mat).T
     r_theo = (A_mat @ theo_zones.T).T
     r_norms = np.linalg.norm(r_theo, axis=1, keepdims=True)
     r_theo_norm = r_theo / r_norms
     N_theo = len(r_theo_norm)
 
-    # 3. Take the strongest empirical axes
-    N_use = min(4, len(e_lab_obs))
-    if N_use < 2:
-        raise ValueError("Need at least 2 empirical zone axes to lock 3D orientation.")
-    
-    e_use = e_lab_obs[:N_use]
+    print(f"  > Compiled {N_theo} theoretical axes. Building Hash Table...")
 
-    # Precompute Empirical Pairwise Angles (Abs dot for head-tail symmetry)
-    emp_dots = np.clip(np.abs(e_use @ e_use.T), 0.0, 1.0)
-    emp_angles = np.rad2deg(np.arccos(emp_dots))
-
-    # Precompute Theoretical Pairwise Angles to enable instant lookup
+    # 3. Precompute the FULL N x N theoretical angle lookup table
     theo_dots = np.clip(np.abs(r_theo_norm @ r_theo_norm.T), 0.0, 1.0)
     theo_angles = np.rad2deg(np.arccos(theo_dots))
 
-    best_match_indices = None
-    best_error = np.inf
+    # 4. Extract target empirical angles
+    emp_dots = np.clip(np.abs(e_use @ e_use.T), 0.0, 1.0)
+    emp_angles = np.rad2deg(np.arccos(emp_dots))
 
-    # --- DEPTH-FIRST SEARCH (DFS) ALGORITHM ---
-    def dfs(current_depth, current_assignment):
-        nonlocal best_match_indices, best_error
+    req_12 = emp_angles[0, 1]
+    req_13 = emp_angles[0, 2]
+    req_23 = emp_angles[1, 2]
+    
+    if N_use == 4:
+        req_14 = emp_angles[0, 3]
+        req_24 = emp_angles[1, 3]
+        req_34 = emp_angles[2, 3]
+
+    print(f"  > Executing Branch & Bound Edge Match (tol={angle_tol} deg)...")
+
+    # The Baseline Edge: Extract all pairs matching E1-E2
+    valid_a, valid_b = np.where(np.abs(theo_angles - req_12) < angle_tol)
+    valid_mask = valid_a != valid_b
+    valid_a = valid_a[valid_mask]
+    valid_b = valid_b[valid_mask]
+
+    # Sort the baseline pairs by their exactness so the best candidates are tested first
+    err_12 = np.abs(theo_angles[valid_a, valid_b] - req_12)
+    sort_idx = np.argsort(err_12)
+    valid_a = valid_a[sort_idx]
+    valid_b = valid_b[sort_idx]
+    err_12 = err_12[sort_idx]
+
+    best_error = angle_tol
+    best_indices = None
+
+    for a, b, e12 in zip(valid_a, valid_b, err_12):
+        # Branch & Bound Cutoff: We can never beat the current best error!
+        if e12 >= best_error:
+            break
+            
+        err_13_all = np.abs(theo_angles[a, :] - req_13)
+        err_23_all = np.abs(theo_angles[b, :] - req_23)
         
-        # Base Case: We successfully assigned a theoretical axis to every empirical axis
-        if current_depth == N_use:
-            # Re-verify the maximum error of the completed set
-            max_err = 0.0
-            for i in range(N_use):
-                for j in range(i+1, N_use):
-                    r_i, r_j = current_assignment[i], current_assignment[j]
-                    err = np.abs(emp_angles[i, j] - theo_angles[r_i, r_j])
-                    max_err = max(max_err, err)
+        # Dynamically restrict valid C candidates using the shrinking best_error
+        valid_c = np.where((err_13_all < best_error) & (err_23_all < best_error))[0]
+        
+        for c in valid_c:
+            if c == a or c == b: continue
             
-            if max_err < best_error:
-                best_error = max_err
-                best_match_indices = list(current_assignment)
-            return
-
-        # Recursive Step: Find candidates for the next empirical axis
-        for r_cand in range(N_theo):
-            # To avoid degenerate combinations, ensure we don't pick the exact same physical axis twice
-            if r_cand in current_assignment:
+            e13 = err_13_all[c]
+            e23 = err_23_all[c]
+            current_max = max(e12, e13, e23)
+            
+            if current_max >= best_error:
                 continue
-
-            # Verify this candidate against ALL previously assigned axes
-            is_valid = True
-            for prev_depth, r_prev in enumerate(current_assignment):
-                required_angle = emp_angles[prev_depth, current_depth]
-                actual_angle = theo_angles[r_prev, r_cand]
                 
-                # If the candidate violates the angle constraint, prune the entire branch instantly
-                if np.abs(required_angle - actual_angle) > angle_tol:
-                    is_valid = False
-                    break
-            
-            # If the candidate survived all cross-checks, descend into the next depth
-            if is_valid:
-                current_assignment.append(r_cand)
-                dfs(current_depth + 1, current_assignment)
-                current_assignment.pop() # Backtrack
+            if N_use == 3:
+                # We found a new best Triad! Shrink the bounds.
+                best_error = current_max
+                best_indices = [a, b, c]
+            else:
+                err_14_all = np.abs(theo_angles[a, :] - req_14)
+                err_24_all = np.abs(theo_angles[b, :] - req_24)
+                err_34_all = np.abs(theo_angles[c, :] - req_34)
+                
+                valid_d = np.where((err_14_all < best_error) & 
+                                   (err_24_all < best_error) & 
+                                   (err_34_all < best_error))[0]
+                                   
+                for d in valid_d:
+                    if d in (a, b, c): continue
+                    
+                    e14 = err_14_all[d]
+                    e24 = err_24_all[d]
+                    e34 = err_34_all[d]
+                    
+                    tetrad_max = max(current_max, e14, e24, e34)
+                    
+                    if tetrad_max < best_error:
+                        # We found a new best Tetrad! Shrink the bounds.
+                        best_error = tetrad_max
+                        best_indices = [a, b, c, d]
 
-    # Kick off the search (Starting at depth 0 with an empty assignment)
-    print(f"  > Starting accelerated DFS Triad Match (max_uvw={max_uvw}, N_theo={N_theo})...")
-    dfs(0, [])
+    if best_indices is None:
+        raise ValueError(f"Could not find a theoretical triad matching within {angle_tol} deg.")
 
-    if best_match_indices is None:
-        raise ValueError(f"Could not find a theoretical triad matching the empirical angles within {angle_tol} deg.")
+    print(f"  > Match Found! Max Angle Error: {best_error:.3f} deg")
 
-    print(f"  > Triad Match Found! Max Angle Error: {best_error:.3f} deg")
-
-    # Extract the matched theoretical vectors
-    best_match = r_theo_norm[best_match_indices]
-
-    # --- DAVENPORT SOLVER (Sign Permutations) ---
+    # 5. Evaluate Davenport just ONCE on the absolute best geometric match
+    best_match = r_theo_norm[best_indices]
     best_U = None
     best_score = -np.inf
     
-    # Test all 2^N sign combinations to establish the right-handed frame
     for signs in itertools.product([1, -1], repeat=N_use):
         r_flipped = best_match * np.array(signs)[:, None]
         U, score = davenport_q_method(e_use, r_flipped)
