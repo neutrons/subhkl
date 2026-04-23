@@ -1388,7 +1388,7 @@ def run_sparse_hough(
     tolerance_deg: float = 0.15,
     max_axes: int = 15,
     max_uvw: int = 1,
-    create_visualizations: bool = False, # <--- NEW ARGUMENT
+    create_visualizations: bool = False,
 ):
     from subhkl.optimization import FindUB
     from subhkl.search.sparse_hough import SparseHoughIndexer
@@ -1422,6 +1422,15 @@ def run_sparse_hough(
         img_indices = f["peaks/image_index"][()]
         run_indices = f["peaks/run_index"][()] if "peaks/run_index" in f else img_indices
 
+        # Extract Goniometer Rotations to map everything to the Sample Frame
+        if "goniometer/R" in f:
+            R_all = f["goniometer/R"][()]
+            # Map each peak to its specific rotation matrix based on its image index
+            r_gonio_obs = R_all[img_indices.astype(int)]
+        else:
+            print("  > Warning: No goniometer/R found in finder file. Assuming static rotation (Identity).")
+            r_gonio_obs = np.tile(np.eye(3), (len(pixel_r), 1, 1))
+
         if "bank" in f:
             bank_array = f["bank"][()]
         elif "bank_ids" in f and "peaks/image_index" in f:
@@ -1451,15 +1460,23 @@ def run_sparse_hough(
 
     print(f"  > Loaded {len(q_lab_obs)} empirical peaks.")
 
-    print("\n[2/3] Sparse Basis Pursuit (L1-Regularized SSN)")
-    indexer = SparseHoughIndexer(tolerance_deg)
-    empirical_zones, activation_weights = indexer.find_active_zones(q_lab_obs, max_axes=max_axes)
+    # --- THE SAMPLE FRAME MAPPING ---
+    print("  > Mapping peaks from Lab Frame to Sample Frame via R^T...")
+    # Fast vectorized application of R^T using einsum ('nji' transposes the last two axes of the 3D matrix array)
+    q_sample_obs = np.einsum('nji,ni->nj', r_gonio_obs, q_lab_obs)
+
+    print("\n[2/3] Sparse Basis Pursuit (Density-Driven Set Cover)")
+    indexer = SparseHoughIndexer(tolerance_deg=tolerance_deg)
+    
+    # We now feed the stationary, integrated sample-frame peaks to the indexer
+    empirical_zones, activation_weights = indexer.find_active_zones(q_sample_obs, max_axes=max_axes)
 
     print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.")
     for i, (zone, weight) in enumerate(zip(empirical_zones, activation_weights)):
         print(f"    Zone {i+1}: [{zone[0]:.3f}, {zone[1]:.3f}, {zone[2]:.3f}] (Weight: {weight:.2f})")
 
     print("\n[3/3] Eigenvalue Solution (Wahba's Problem)")
+    # The output U-matrix is now guaranteed to be the mathematically pure U_sample!
     U0_matrix = align_empirical_zones(empirical_zones, B_mat, max_uvw=max_uvw)
     print("  > Macroscopic U-Matrix successfully extracted.")
 
@@ -1473,7 +1490,7 @@ def run_sparse_hough(
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
         f.create_dataset("peaks/xyz", data=xyz_out)
-        f.create_dataset("sample/U", data=U0_matrix)
+        f.create_dataset("sample/U", data=U0_matrix) # This is now officially U_sample
         f.create_dataset("sample/B", data=B_mat)
 
     print("Export complete. File is ready for discrete Laue polishing.")
@@ -1487,6 +1504,9 @@ def run_sparse_hough(
         import concurrent.futures
         from tqdm import tqdm
         from collections import defaultdict
+        
+        # We must import these locally so the parallel executor can see them
+        from subhkl.viz.detector_assembly import RunPeaks, _render_run_unrolled_plot
 
         print("\n[4/4] Rendering Detector Plots (Parallel)...")
         peaks_obj = Peaks(original_nexus_filename, instrument_name)
@@ -1532,13 +1552,19 @@ def run_sparse_hough(
                 ki_vec=ub_helper.ki_vec,
             )
 
+            # --- PLOT FRAME MAPPING ---
+            # To plot the lines correctly, we must map the discovered Sample-Frame 
+            # zone axes back into the physical Lab Frame for this specific goniometer rotation.
+            R_run = r_gonio_obs[mask[0]]
+            lab_zones_for_plot = (R_run @ empirical_zones.T).T
+
             run_tasks.append((
                 out_name,
                 run_peaks,
                 data["images"],
                 data["detectors"],
                 instrument_name,
-                empirical_zones
+                lab_zones_for_plot
             ))
 
         if max_workers := min(os.cpu_count() or 4, len(run_tasks)):
