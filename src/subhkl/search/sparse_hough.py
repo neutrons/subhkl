@@ -115,5 +115,6 @@ class SparseHoughIndexer:
             
         final_zones = np.array(final_zones)
         final_scores = np.array(final_scores)
-        
-        return final_zones, final_scores
+
+        order = np.argsort(final_scores)[::-1]
+        return final_zones[order], final_scores[order]
