@@ -1353,16 +1353,24 @@ def run_merge_images(
     print(f"Successfully created {output_filename} with unit cell info embedded.")
 
 def _render_run_unrolled_plot(args):
-    out_name, run_peaks, images, detectors, instrument, zone_axes = args
+    """Standalone plotting function for generating unrolled plots per run."""
+    # We unpack 6 arguments here to include zone_axes
+    out_name, peaks, images, detectors, instrument, zone_axes = args
+
+    import matplotlib.pyplot as plt
     from subhkl.viz.detector_assembly import plot_unrolled_detector
 
+    # Force non-interactive backend for thread safety
+    if plt.get_backend().lower() != "agg":
+        plt.switch_backend("Agg")
+
     plot_unrolled_detector(
-        peaks=run_peaks,
-        images=images,
-        detectors=detectors,
+        peaks,
+        images,
+        detectors,
         zone_axes=zone_axes,
         out_name=out_name,
-        instrument=instrument,
+        instrument=instrument
     )
     return out_name
 
@@ -1474,72 +1482,79 @@ def run_sparse_hough(
     # PHASE 4: PARALLEL VISUALIZATION (PER RUN)
     # ==========================================
     if create_visualizations:
+        import os
+        import multiprocessing
+        import concurrent.futures
+        from tqdm import tqdm
+        from collections import defaultdict
+
         print("\n[4/4] Rendering Detector Plots (Parallel)...")
         peaks_obj = Peaks(original_nexus_filename, instrument_name)
         
-        # 1. Map runs to their images and detectors using the PHYSICAL BANK ID as the universal key
-        runs_plot_data = {}
+        runs_plot_data = defaultdict(lambda: {"images": {}, "detectors": {}})
+        
         for img_key, image_raw in peaks_obj.image.ims.items():
             run_id = peaks_obj.get_run_id(img_key)
             det = peaks_obj.get_detector_by_img(img_key)
             
-            # The universal key to bind everything together
-            phys_bank = int(peaks_obj.image.bank_mapping.get(img_key, img_key))
-            
-            if run_id not in runs_plot_data:
-                runs_plot_data[run_id] = {"images": {}, "detectors": {}}
+            # To ensure dict keys perfectly match img_indices elements for `plot_unrolled_detector`
+            try:
+                match_key = int(img_key)
+            except ValueError:
+                match_key = img_key
                 
-            runs_plot_data[run_id]["images"][phys_bank] = image_raw
-            runs_plot_data[run_id]["detectors"][phys_bank] = det
+            runs_plot_data[run_id]["images"][match_key] = np.nan_to_num(image_raw, nan=0.0, posinf=0.0, neginf=0.0)
+            runs_plot_data[run_id]["detectors"][match_key] = det
 
-        unique_runs = np.unique(run_indices)
         run_tasks = []
-        import os
         base_dir = os.path.dirname(output_h5_filename) or "."
 
-        for r_id in unique_runs:
-            if r_id not in runs_plot_data:
-                continue
-                
-            data = runs_plot_data[r_id]
-            mask = np.where(run_indices == r_id)[0]
+        for r_id, data in runs_plot_data.items():
+            mask = [i for i, run in enumerate(run_indices) if run == r_id]
             if len(mask) == 0: continue
             
             try:
-                first_img_key = list(peaks_obj.image.ims.keys())[0]
-                image_label = peaks_obj.get_image_label(first_img_key)
+                # Use the exact first matching peak's index to get the label
+                image_label = peaks_obj.get_image_label(img_indices[mask[0]])
             except Exception:
                 image_label = f"run_{int(r_id)}"
-               
+                
             out_name = os.path.join(base_dir, f"{image_label}-sparse_hough.png")
             
-            # 2. Inject the peaks using the exact same physical bank key
             run_peaks = RunPeaks(
-                image_index=bank_array[mask].astype(int).tolist(),
-                peak_rows=pixel_r[mask].tolist(),
-                peak_cols=pixel_c[mask].tolist(),
-                var_u=None,
+                image_index=[img_indices[i] for i in mask],
+                peak_rows=[pixel_r[i] for i in mask],
+                peak_cols=[pixel_c[i] for i in mask],
+                var_u=None,  # Skips drawing ellipses
+                var_v=None,
+                cov_uv=None,
                 sample_offset=ub_helper.sample_offset,
                 ki_vec=ub_helper.ki_vec,
             )
 
-            run_tasks.append((out_name, run_peaks, data["images"], data["detectors"], instrument_name, empirical_zones))
+            run_tasks.append((
+                out_name,
+                run_peaks,
+                data["images"],
+                data["detectors"],
+                instrument_name,
+                empirical_zones
+            ))
 
-        import multiprocessing
-        import concurrent.futures
-
-        max_workers = min(os.cpu_count() or 4, len(run_tasks))
-        ctx = multiprocessing.get_context("spawn")
-        
-        with concurrent.futures.ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
-            futures = {executor.submit(_render_run_unrolled_plot, t): t[0] for t in run_tasks}
-           
-            from tqdm import tqdm
-            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Rendering Zone Axes"):
-                try:
-                    out_name = future.result()
-                    tqdm.write(f"Saved: {out_name}")
-                except Exception as e:
-                    print(f"Visualization failed: {e}")
-                    import traceback
-                    traceback.print_exc()
+        if max_workers := min(os.cpu_count() or 4, len(run_tasks)):
+            ctx = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
+                futures = {executor.submit(_render_run_unrolled_plot, t): t[0] for t in run_tasks}
+                
+                for future in tqdm(
+                    concurrent.futures.as_completed(futures), 
+                    total=len(futures), 
+                    desc="Rendering Detector Plots"
+                ):
+                    try:
+                        out_name = future.result()
+                        tqdm.write(f"Saved: {out_name}")
+                    except Exception:
+                        import traceback
+                        print(f"Visualization failed:")
+                        traceback.print_exc()
