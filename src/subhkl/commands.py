@@ -1516,7 +1516,7 @@ def run_sparse_hough(
                 ki_vec=ub_helper.ki_vec,
             )
 
-            run_tasks.append((out_name, run_peaks, peaks_obj.image.im, detectors, instrument_name, empirical_zones))
+            run_tasks.append((out_name, run_peaks, peaks_obj.image.ims, detectors, instrument_name, empirical_zones))
 
         max_workers = min(os.cpu_count() or 4, len(run_tasks))
         import multiprocessing
