@@ -60,25 +60,81 @@ def solve_sparse_hough_jax(q_lab_obs, dict_zones, kappa, alpha, bg_val):
     
     return c_sparse
 
+@jit
+def solve_sparse_hough_tuned_jax(q_lab_obs, dict_zones, kappa, candidate_alphas, bg_val):
+    N_obs = q_lab_obs.shape[0]
+    N_dict = dict_zones.shape[0]
+
+    A_mat = build_hough_dictionary(q_lab_obs, dict_zones, kappa=kappa)
+    y_target = jnp.ones(N_obs, dtype=jnp.float32)
+    bg_flat = jnp.full(N_obs, bg_val, dtype=jnp.float32)
+    c_warm = jnp.zeros(N_dict, dtype=jnp.float32)
+
+    def evaluate_alpha(alpha_val):
+        alpha_vec = jnp.full(N_dict, alpha_val, dtype=jnp.float32)
+        c_sparse = solve_ssn_unified(
+            A_mat, y_target, bg_flat, alpha_vec,
+            loss_type=0, c_warm=c_warm, max_iter=50
+        )
+
+        # 1. Number of parameters (Active Zone Axes)
+        active_mask = c_sparse > 1e-4
+        k_active = jnp.sum(active_mask)
+
+        # 2. Negative Log Likelihood (Gaussian/OLS)
+        u = A_mat @ c_sparse + bg_flat
+        nll = 0.5 * jnp.sum((u - y_target) ** 2)
+
+        # 3. Calculate BIC (Heavily penalize finding absolutely zero axes)
+        bic = jnp.where(k_active == 0, 1e9, k_active * jnp.log(N_obs) + 2.0 * nll)
+
+        return bic, c_sparse
+
+    # Vectorize the solver across all candidate alphas in parallel
+    bics, all_c = vmap(evaluate_alpha)(candidate_alphas)
+
+    # Select the alpha that yielded the lowest BIC
+    best_idx = jnp.argmin(bics)
+    return all_c[best_idx], bics[best_idx], candidate_alphas[best_idx]
+
 class SparseHoughIndexer:
-    def __init__(self, dict_size=2000, kappa=50.0, alpha=5.0, bg_val=0.1):
+    def __init__(self, dict_size=2000, kappa=50.0, alpha=5.0, bg_val=0.1, auto_tune=True,
+                 candidate_alphas=None):
         self.dict_size = dict_size
         self.kappa = kappa
         self.alpha = alpha
         self.bg_val = bg_val
+        self.auto_tune = auto_tune
         self.dict_zones = get_fibonacci_hemisphere(self.dict_size)
+
+        if candidate_alphas is None:
+            # A broad sweep of Z-scores from very loose (2.0) to extremely strict (50.0)
+            self.candidate_alphas = jnp.array([2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0], dtype=jnp.float32)
+        else:
+            self.candidate_alphas = candidate_alphas
         
     def find_active_zones(self, q_lab_obs):
         """
         Returns the absolute lab-frame coordinates of the true crystal zone axes.
         """
-        c_sparse = solve_sparse_hough_jax(
-            jnp.array(q_lab_obs, dtype=jnp.float32), 
-            self.dict_zones, 
-            self.kappa, 
-            self.alpha, 
-            self.bg_val
-        )
+        if self.auto_tune:
+            print(f"  > Auto-tuning Alpha across {self.candidate_alphas.tolist()}...")
+            c_sparse, best_bic, best_alpha = solve_sparse_hough_tuned_jax(
+                jnp.array(q_lab_obs, dtype=jnp.float32), 
+                self.dict_zones, 
+                self.kappa, 
+                self.candidate_alphas,
+                self.bg_val
+            )
+            print(f"  > Optimal Alpha selected: {best_alpha:.1f} (BIC: {best_bic:.1f})")
+        else:
+            c_sparse = solve_sparse_hough_jax(
+                jnp.array(q_lab_obs, dtype=jnp.float32), 
+                self.dict_zones, 
+                self.kappa, 
+                self.alpha, 
+                self.bg_val
+            )
         
         # Extract the surviving dictionary elements
         c_sparse_cpu = np.array(c_sparse)
