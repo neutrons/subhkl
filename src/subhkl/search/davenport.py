@@ -3,29 +3,11 @@ import itertools
 import jax
 import jax.numpy as jnp
 from jax import jit
-from functools import partial
 from scipy.spatial.transform import Rotation
 
 @jit
-def compute_theo_angles_jax(r_theo_norm_j):
-    theo_dots = jnp.clip(jnp.abs(r_theo_norm_j @ r_theo_norm_j.T), 0.0, 1.0)
-    return jnp.rad2deg(jnp.arccos(theo_dots))
-
-@jit
-def evaluate_triad_chunk_jax(theo_angles_j, va, vb, req_13, req_23, angle_tol):
-    m13 = jnp.abs(theo_angles_j[va, :] - req_13) < angle_tol
-    m23 = jnp.abs(theo_angles_j[vb, :] - req_23) < angle_tol
-    return m13 & m23
-
-@jit
-def evaluate_tetrad_chunk_jax(theo_angles_j, va, vb, vc, req_14, req_24, req_34, angle_tol):
-    m14 = jnp.abs(theo_angles_j[va, :] - req_14) < angle_tol
-    m24 = jnp.abs(theo_angles_j[vb, :] - req_24) < angle_tol
-    m34 = jnp.abs(theo_angles_j[vc, :] - req_34) < angle_tol
-    return m14 & m24 & m34
-
-@jit
 def jax_davenport_consensus(e_use, e_lab_obs, r_hyp_batch, r_theo_norm, angle_tol):
+    """Batched Wahba's Problem and RANSAC Evaluator executing strictly on GPU"""
     B = jnp.einsum('ax,nay->nxy', e_use, r_hyp_batch)
     S = B + jnp.transpose(B, (0, 2, 1))
     sigma = jnp.trace(B, axis1=1, axis2=2)
@@ -76,45 +58,8 @@ def jax_davenport_consensus(e_use, e_lab_obs, r_hyp_batch, r_theo_norm, angle_to
     
     return U_batch, inliers, residuals
 
-# --- The GPU Native Hardware Loop ---
-@partial(jit, static_argnames=['angle_tol'])
-def batched_davenport_scan(e_use, e_lab_obs, W_padded, r_theo_norm, angle_tol):
-    """Executes the entire Wahba/Consensus pipeline locally on the GPU via lax.scan"""
-    def scan_body(carry, W_chunk):
-        best_inliers, best_residual, best_U = carry
-        
-        U_batch, inliers, residuals = jax_davenport_consensus(
-            e_use, e_lab_obs, W_chunk, r_theo_norm, angle_tol
-        )
-        
-        score = inliers - (residuals / 1000.0)
-        best_idx = jnp.argmax(score)
-        
-        c_inliers = inliers[best_idx]
-        c_residual = residuals[best_idx]
-        c_U = U_batch[best_idx]
-        
-        is_better = (c_inliers > best_inliers) | ((c_inliers == best_inliers) & (c_residual < best_residual))
-        
-        new_inliers = jnp.where(is_better, c_inliers, best_inliers)
-        new_residual = jnp.where(is_better, c_residual, best_residual)
-        new_U = jnp.where(is_better, c_U, best_U)
-        
-        return (new_inliers, new_residual, new_U), None
-        
-    init_carry = (-1, jnp.inf, jnp.eye(3))
-    final_carry, _ = jax.lax.scan(scan_body, init_carry, W_padded)
-    return final_carry
 
-
-def align_empirical_zones(
-    e_lab_obs, 
-    B_mat, 
-    max_uvw=10, 
-    angle_tol=1.5, 
-    hyp_batch_size=50000, 
-    eval_batch_size=5000
-):
+def align_empirical_zones(e_lab_obs, B_mat, max_uvw=10, angle_tol=1.5):
     N_emp = len(e_lab_obs)
     N_use = min(4, N_emp)
     
@@ -135,9 +80,9 @@ def align_empirical_zones(
     r_norms = np.linalg.norm(r_theo, axis=1, keepdims=True)
     r_theo_norm = r_theo / r_norms
 
-    r_theo_norm_j = jnp.array(r_theo_norm, dtype=jnp.float32)
-    theo_angles_j = compute_theo_angles_jax(r_theo_norm_j)
-    theo_angles = np.array(theo_angles_j) 
+    # Instantly compute the angle matrix natively in CPU RAM
+    theo_dots = np.clip(np.abs(r_theo_norm @ r_theo_norm.T), 0.0, 1.0)
+    theo_angles = np.rad2deg(np.arccos(theo_dots))
 
     emp_dots = np.clip(np.abs(e_use @ e_use.T), 0.0, 1.0)
     emp_angles = np.rad2deg(np.arccos(emp_dots))
@@ -145,30 +90,27 @@ def align_empirical_zones(
     req_12, req_13, req_23 = emp_angles[0, 1], emp_angles[0, 2], emp_angles[1, 2]
     req_14, req_24, req_34 = emp_angles[0, 3], emp_angles[1, 3], emp_angles[2, 3]
 
-    print(f"  > Executing Over-Constrained Tetrad Search (tol={angle_tol} deg)...")
+    print(f"  > Executing Pre-Computed Adjacency Search (tol={angle_tol} deg)...")
+    
+    # Pre-Compute 85MB Boolean Adjacency Masks (Pure NumPy C-Speed)
+    M12 = np.abs(theo_angles - req_12) < angle_tol
+    M13 = np.abs(theo_angles - req_13) < angle_tol
+    M23 = np.abs(theo_angles - req_23) < angle_tol
 
-    valid_a, valid_b = np.where(np.abs(theo_angles - req_12) < angle_tol)
+    valid_a, valid_b = np.where(M12)
     valid_mask = valid_a != valid_b
     valid_a, valid_b = valid_a[valid_mask], valid_b[valid_mask]
 
     a_cand_triad, b_cand_triad, c_cand_triad = [], [], []
+    chunk_size = 25000 # Safely slices 230MB chunks in RAM
     
-    # Step 2: Triad Generation 
-    for i in range(0, len(valid_a), hyp_batch_size):
-        va_chunk = valid_a[i:i+hyp_batch_size]
-        vb_chunk = valid_b[i:i+hyp_batch_size]
-        actual_size = len(va_chunk)
+    for i in range(0, len(valid_a), chunk_size):
+        va = valid_a[i:i+chunk_size]
+        vb = valid_b[i:i+chunk_size]
         
-        if actual_size < hyp_batch_size:
-            va_chunk = np.pad(va_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
-            vb_chunk = np.pad(vb_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
-            
-        mask_chunk = evaluate_triad_chunk_jax(theo_angles_j, jnp.array(va_chunk), jnp.array(vb_chunk), req_13, req_23, angle_tol)
-        
-        # --- THE FIX: Execute 'where' on the GPU BEFORE transferring to CPU ---
-        p_idx_j, c_idx_j = jnp.where(mask_chunk[:actual_size])
-        p_idx = np.array(p_idx_j)  # Now we only transfer a tiny 1D array of integers!
-        c_idx = np.array(c_idx_j)
+        # Slicing pre-computed masks natively avoids all compilation overhead
+        valid_c_mask = M13[va, :] & M23[vb, :]
+        p_idx, c_idx = np.where(valid_c_mask)
         
         if len(p_idx) > 0:
             global_p_idx = p_idx + i
@@ -188,26 +130,20 @@ def align_empirical_zones(
     b_cand_triad = b_cand_triad[triplet_mask]
     c_cand_triad = c_cand_triad[triplet_mask]
 
+    # Pre-Compute Tetrad Masks
+    M14 = np.abs(theo_angles - req_14) < angle_tol
+    M24 = np.abs(theo_angles - req_24) < angle_tol
+    M34 = np.abs(theo_angles - req_34) < angle_tol
+    
     a_cand_list, b_cand_list, c_cand_list, d_cand_list = [], [], [], []
-
-    # Step 3: Tetrad Generation
-    for i in range(0, len(a_cand_triad), hyp_batch_size):
-        va_chunk = a_cand_triad[i:i+hyp_batch_size]
-        vb_chunk = b_cand_triad[i:i+hyp_batch_size]
-        vc_chunk = c_cand_triad[i:i+hyp_batch_size]
-        actual_size = len(va_chunk)
+    
+    for i in range(0, len(a_cand_triad), chunk_size):
+        va = a_cand_triad[i:i+chunk_size]
+        vb = b_cand_triad[i:i+chunk_size]
+        vc = c_cand_triad[i:i+chunk_size]
         
-        if actual_size < hyp_batch_size:
-            va_chunk = np.pad(va_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
-            vb_chunk = np.pad(vb_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
-            vc_chunk = np.pad(vc_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
-            
-        mask_chunk = evaluate_tetrad_chunk_jax(theo_angles_j, jnp.array(va_chunk), jnp.array(vb_chunk), jnp.array(vc_chunk), req_14, req_24, req_34, angle_tol)
-        
-        # --- THE FIX: GPU extraction ---
-        p_idx_j, d_idx_j = jnp.where(mask_chunk[:actual_size])
-        p_idx = np.array(p_idx_j)
-        d_idx = np.array(d_idx_j)
+        valid_d_mask = M14[va, :] & M24[vb, :] & M34[vc, :]
+        p_idx, d_idx = np.where(valid_d_mask)
         
         if len(p_idx) > 0:
             global_p_idx = p_idx + i
@@ -246,26 +182,46 @@ def align_empirical_zones(
     W_batch = (r_cand[:, None, :, :] * signs[None, :, :, None]).reshape(-1, 4, 3)
     N_hyp = W_batch.shape[0]
     
-    # Pad W_batch to guarantee exact block sizes for lax.scan
-    remainder = N_hyp % eval_batch_size
-    if remainder != 0:
-        pad_size = eval_batch_size - remainder
-        W_batch = np.pad(W_batch, ((0, pad_size), (0, 0), (0, 0)), mode='constant')
-        
-    W_padded = W_batch.reshape(-1, eval_batch_size, 4, 3)
-    
-    print(f"  > Found {len(a_cand)} pristine geometric tetrads. Launching lax.scan across {N_hyp} U-Matrices...")
+    print(f"  > Found {len(a_cand)} pristine geometric tetrads. Dispatching {N_hyp} U-Matrices to GPU...")
 
+    # Upload static geometry to GPU once
     e_use_j = jnp.array(e_use, dtype=jnp.float32)
     e_lab_obs_j = jnp.array(e_lab_obs, dtype=jnp.float32)
-    W_padded_j = jnp.array(W_padded, dtype=jnp.float32)
+    r_theo_norm_j = jnp.array(r_theo_norm, dtype=jnp.float32)
 
-    # Step 4: The fully encapsulated GPU Evaluation
-    final_carry = batched_davenport_scan(e_use_j, e_lab_obs_j, W_padded_j, r_theo_norm_j, angle_tol)
+    best_U = None
+    best_inliers = -1
+    best_residual = np.inf
     
-    best_inliers = int(final_carry[0])
-    best_residual = float(final_carry[1])
-    best_U = np.array(final_carry[2])
+    eval_batch_size = 8000
+    
+    for i in range(0, N_hyp, eval_batch_size):
+        W_chunk = W_batch[i:i+eval_batch_size]
+        actual_size = len(W_chunk)
+        
+        # Static shape padding guarantees XLA compiles exactly ONCE.
+        if actual_size < eval_batch_size:
+            W_chunk = np.pad(W_chunk, ((0, eval_batch_size - actual_size), (0,0), (0,0)), constant_values=0)
+            
+        U_out, inliers_out, residuals_out = jax_davenport_consensus(
+            e_use_j, e_lab_obs_j, jnp.array(W_chunk, dtype=jnp.float32), r_theo_norm_j, angle_tol
+        )
+        
+        # Strip padding and evaluate
+        inliers_out = np.array(inliers_out[:actual_size])
+        residuals_out = np.array(residuals_out[:actual_size])
+        U_out = np.array(U_out[:actual_size])
+        
+        score = inliers_out - (residuals_out / 1000.0) 
+        best_in_chunk = np.argmax(score)
+        
+        if inliers_out[best_in_chunk] > best_inliers or (
+            inliers_out[best_in_chunk] == best_inliers and 
+            residuals_out[best_in_chunk] < best_residual
+        ):
+            best_inliers = inliers_out[best_in_chunk]
+            best_residual = residuals_out[best_in_chunk]
+            best_U = U_out[best_in_chunk]
 
     if best_inliers < 4:
         raise ValueError(f"Consensus failed. Best U-matrix only explained {best_inliers} axes.")
