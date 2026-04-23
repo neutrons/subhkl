@@ -1497,12 +1497,6 @@ def run_sparse_hough(
                 try:
                     det = Detector(beamlines[instrument_name][str(phys_bank)])
                     detectors[img_key] = det
-                    try:
-                        # Use whichever API matches your Peaks implementation
-                        img_data = peaks_obj.get_image_data(img_key) if hasattr(peaks_obj, "get_image_data") else peaks_obj.get_image(img_key)
-                        images[img_key] = img_data
-                    except Exception:
-                        images[img_key] = np.zeros((det.n, det.m)) # Fallback blank grid
                 except Exception as e:
                     print(f"Warning: Could not build detector for bank {phys_bank}: {e}")
 
@@ -1522,7 +1516,7 @@ def run_sparse_hough(
                 ki_vec=ub_helper.ki_vec,
             )
 
-            run_tasks.append((out_name, run_peaks, images, detectors, instrument_name, empirical_zones))
+            run_tasks.append((out_name, run_peaks, peaks_obj.image.im, detectors, instrument_name, empirical_zones))
 
         max_workers = min(os.cpu_count() or 4, len(run_tasks))
         import multiprocessing
