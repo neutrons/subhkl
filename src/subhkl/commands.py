@@ -1352,6 +1352,27 @@ def run_merge_images(
 
     print(f"Successfully created {output_filename} with unit cell info embedded.")
 
+--- MODULE LEVEL WORKER FOR MULTIPROCESSING ---
+def _render_run_unrolled_plot(args):
+    out_name, run_peaks, images, detectors, instrument, zone_axes = args
+    from subhkl.viz.detector_assembly import plot_unrolled_detector
+
+    plot_unrolled_detector(
+        peaks=run_peaks,
+        images=images,
+        detectors=detectors,
+        zone_axes=zone_axes,
+        out_name=out_name,
+        instrument=instrument,
+    )
+    return out_name
+
+class RunPeaks:
+    """Mock object to satisfy the unrolled detector visualizer API."""
+    def __init__(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
 def run_sparse_hough(
     finder_file: str,
     output_h5_filename: str,
@@ -1361,25 +1382,17 @@ def run_sparse_hough(
     kappa: float = 50.0,
     alpha: float = 5.0,
     max_uvw: int = 1,
+    create_visualizations: bool = False, # <--- NEW ARGUMENT
 ):
-    from scipy.spatial.transform import Rotation
-
     from subhkl.optimization import FindUB
     from subhkl.search.sparse_hough import SparseHoughIndexer
-    from subhkl.search.davenport import align_empirical_zones
-    from subhkl.integration.api import Peaks
+    from subhkl.io.loader import Peaks
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
+    from subhkl.search.davenport import davenport_q_method, align_empirical_zones
 
-    """
-    Executes the Algebraic Orientation Bootstrapper (Steps 1-3):
-    1. Initialize Reciprocal Space (including pixel-to-lab conversion)
-    2. L1-Regularized Sparse Basis Pursuit (Zone Axis Isolation)
-    3. Davenport q-method (Macroscopic U-Matrix Extraction)
-    """
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
 
-    # 1. Load basic geometry and metadata
     ub_helper = FindUB()
     with h5py.File(finder_file, "r") as f:
         ub_helper.a = f["sample/a"][()] if "sample/a" in f else None
@@ -1393,52 +1406,39 @@ def run_sparse_hough(
         ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
 
         if "peaks/pixel_r" not in f or "peaks/pixel_c" not in f:
-            raise ValueError(
-                "ERROR: Input file does not contain peaks/pixel_r and peaks/pixel_c. "
-                "Cannot perform physically sound indexing."
-            )
+            raise ValueError("ERROR: Input file missing pixel_r/pixel_c. Cannot perform indexing.")
 
         if not instrument_name or not original_nexus_filename:
-            raise ValueError(
-                "ERROR: Finder file contains pixels. You must provide --instrument "
-                "and --nexus to rebuild geometry."
-            )
+            raise ValueError("ERROR: Finder file contains pixels. You must provide --instrument and --nexus.")
 
         pixel_r = f["peaks/pixel_r"][()]
         pixel_c = f["peaks/pixel_c"][()]
+        img_indices = f["peaks/image_index"][()]
+        run_indices = f["peaks/run_index"][()] if "peaks/run_index" in f else img_indices
 
         if "bank" in f:
             bank_array = f["bank"][()]
-        elif "peaks/bank" in f:
-            bank_array = f["peaks/bank"][()]
         elif "bank_ids" in f and "peaks/image_index" in f:
             b_ids = f["bank_ids"][()]
-            img_idx = f["peaks/image_index"][()]
-            bank_array = np.array([b_ids[int(idx)] for idx in img_idx])
+            bank_array = np.array([b_ids[int(idx)] for idx in img_indices])
         else:
-            bank_array = f["peaks/image_index"][()]
+            bank_array = img_indices
 
     B_mat = ub_helper.reciprocal_lattice_B()
 
-    # 2. Reconstruct physical geometry from pixels
     print("  > Reconstructing physical geometry from pixels...")
     xyz_out = np.zeros((len(pixel_r), 3))
 
     for phys_bank in np.unique(bank_array):
         mask = bank_array == phys_bank
-        if not np.any(mask):
-            continue
-
+        if not np.any(mask): continue
         try:
             det_config = beamlines[instrument_name][str(int(phys_bank))]
             det = Detector(det_config)
-            xyz_p = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
-            xyz_out[mask] = xyz_p
-
+            xyz_out[mask] = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
         except KeyError as e:
             print(f"Warning: Could not rebuild geometry for bank {phys_bank}: {e}")
 
-    # Convert hit coordinates to scattering vectors (kf - ki)
     kf = xyz_out - ub_helper.sample_offset[None, :]
     kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
     q_lab_obs = kf - ub_helper.ki_vec[None, :]
@@ -1460,25 +1460,81 @@ def run_sparse_hough(
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
         with h5py.File(finder_file, "r") as f_in:
-            keys_to_copy = [
-                "sample/a", "sample/b", "sample/c",
-                "sample/alpha", "sample/beta", "sample/gamma",
-                "sample/space_group", "sample/offset",
-                "instrument/wavelength", "beam/ki_vec",
-                "peaks/run_index", "peaks/image_index",
-                "bank", "bank_ids",
-                "peaks/pixel_r", "peaks/pixel_c",
-                "goniometer/R", "goniometer/axes", "goniometer/angles", "goniometer/names"
-            ]
-
-            for key in keys_to_copy:
+            for key in ["sample/a", "sample/b", "sample/c", "sample/alpha", "sample/beta", "sample/gamma",
+                        "sample/space_group", "sample/offset", "instrument/wavelength", "beam/ki_vec",
+                        "peaks/run_index", "peaks/image_index", "bank", "bank_ids", "peaks/pixel_r", "peaks/pixel_c",
+                        "goniometer/R", "goniometer/axes", "goniometer/angles", "goniometer/names"]:
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
-
-        # Save the reconstructed XYZ lab coordinates
         f.create_dataset("peaks/xyz", data=xyz_out)
-
-        # Inject the algebraically solved U matrix
         f.create_dataset("sample/U", data=U0_matrix)
 
-    print("Export complete. File is ready for discrete Laue polishing via 'index' command.")
+    print("Export complete. File is ready for discrete Laue polishing.")
+
+    # ==========================================
+    # PHASE 4: PARALLEL VISUALIZATION (PER RUN)
+    # ==========================================
+    if create_visualizations:
+        print("\n[4/4] Rendering Detector Plots (Parallel)...")
+        peaks_obj = Peaks(original_nexus_filename, instrument_name)
+        unique_runs = np.unique(run_indices)
+
+        run_tasks = []
+        base_dir = os.path.dirname(output_h5_filename) or "."
+
+        for r_id in unique_runs:
+            mask = np.where(run_indices == r_id)[0]
+            if len(mask) == 0: continue
+
+            run_img_indices = np.unique(img_indices[mask])
+            images, detectors = {}, {}
+
+            for img_idx in run_img_indices:
+                img_key = int(img_idx)
+                b_mask = np.where(img_indices == img_idx)[0]
+                phys_bank = int(bank_array[b_mask[0]]) if len(b_mask) > 0 else img_key
+
+                try:
+                    det = Detector(beamlines[instrument_name][str(phys_bank)])
+                    detectors[img_key] = det
+                    try:
+                        # Use whichever API matches your Peaks implementation
+                        img_data = peaks_obj.get_image_data(img_key) if hasattr(peaks_obj, "get_image_data") else peaks_obj.get_image(img_key)
+                        images[img_key] = img_data
+                    except Exception:
+                        images[img_key] = np.zeros((det.n, det.m)) # Fallback blank grid
+                except Exception as e:
+                    print(f"Warning: Could not build detector for bank {phys_bank}: {e}")
+
+            try:
+                image_label = peaks_obj.get_image_label(int(run_img_indices[0]))
+            except Exception:
+                image_label = f"run_{int(r_id)}"
+
+            out_name = os.path.join(base_dir, f"{image_label}-sparse_hough.png")
+
+            run_peaks = RunPeaks(
+                image_index=img_indices[mask].tolist(),
+                peak_rows=pixel_r[mask].tolist(),
+                peak_cols=pixel_c[mask].tolist(),
+                var_u=None, # None triggers simple dots instead of ellipsoids
+                sample_offset=ub_helper.sample_offset,
+                ki_vec=ub_helper.ki_vec,
+            )
+
+            run_tasks.append((out_name, run_peaks, images, detectors, instrument_name, empirical_zones))
+
+        max_workers = min(os.cpu_count() or 4, len(run_tasks))
+        ctx = multiprocessing.get_context("spawn")
+
+        with concurrent.futures.ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
+            futures = {executor.submit(_render_run_unrolled_plot, t): t[0] for t in run_tasks}
+
+            for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Rendering Zone Axes"):
+                try:
+                    out_name = future.result()
+                    tqdm.write(f"Saved: {out_name}")
+                except Exception as e:
+                    print(f"Visualization failed: {e}")
+                    import traceback
+                    traceback.print_exc()

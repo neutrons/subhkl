@@ -8,12 +8,14 @@ def plot_unrolled_detector(
     images,
     detectors,
     finder_peaks=None,
+    zone_axes=None,  # <--- Great Circle zone axes
     out_name="unrolled_detector_peaks.png",
     instrument=None,
 ):
     fig, ax = plt.subplots(figsize=(16, 6))
 
     sample_offset = getattr(peaks, "sample_offset", np.zeros(3))
+    ki_vec = getattr(peaks, "ki_vec", np.array([0.0, 0.0, 1.0]))
 
     R_stack = getattr(peaks, "R", None)
     if R_stack is not None:
@@ -55,7 +57,6 @@ def plot_unrolled_detector(
 
         X, Y, Z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
 
-        # Strictly use absolute room frame roty
         roty = np.rad2deg(np.arctan2(X, Z))
 
         if np.ptp(roty) > 180:
@@ -106,7 +107,7 @@ def plot_unrolled_detector(
         return r_out
 
     # ==========================================
-    # PLOTTING
+    # PLOTTING IMAGES
     # ==========================================
     global_vmax = 1
     if images:
@@ -114,7 +115,6 @@ def plot_unrolled_detector(
     global_norm = colors.LogNorm(vmin=1, vmax=global_vmax + 1)
     mesh_handle = None
 
-    # 1. Plot the Images
     for img_key, img in images.items():
         det = detectors.get(img_key)
         if det is None:
@@ -139,7 +139,9 @@ def plot_unrolled_detector(
         if mesh_handle is None:
             mesh_handle = mesh
 
-    # 2. Plot Finder Peaks
+    # ==========================================
+    # PLOTTING FINDER PEAKS
+    # ==========================================
     if finder_peaks is not None:
         added_finder_label = False
         for img_key, coords in finder_peaks.items():
@@ -180,7 +182,9 @@ def plot_unrolled_detector(
             )
             added_finder_label = True
 
-    # 3. Plot the Projected 3D Ellipsoids
+    # ==========================================
+    # PLOTTING 3D ELLIPSOIDS / TENSORS
+    # ==========================================
     if (
         getattr(peaks, "var_u", None) is not None
         and getattr(peaks, "peak_rows", None) is not None
@@ -233,7 +237,9 @@ def plot_unrolled_detector(
             ax.plot(e_roty, e_Y, color="red", lw=0.25, alpha=0.8, label=label)
             added_ellipse_label = True
 
-    # 4. Plot the peak centers
+    # ==========================================
+    # PLOTTING PEAK CENTERS
+    # ==========================================
     if (
         getattr(peaks, "peak_rows", None) is not None
         and getattr(peaks, "peak_cols", None) is not None
@@ -279,9 +285,62 @@ def plot_unrolled_detector(
             )
 
     # ==========================================
+    # PLOTTING THE GREAT CIRCLES (ZONE AXES)
+    # ==========================================
+    if zone_axes is not None:
+        added_za_label = False
+        colors_list = plt.cm.tab10(np.linspace(0, 1, len(zone_axes)))
+        
+        for z_idx, za in enumerate(zone_axes):
+            za = za / np.linalg.norm(za)
+            rhs = np.dot(ki_vec, za)
+            label = f"Zone Axis {z_idx+1}"
+            
+            for img_key, det in detectors.items():
+                if img_key not in images:
+                    continue
+                s_lab = get_s_lab_for_image(img_key)
+                
+                c_grid = np.linspace(0, det.m, 50)
+                r_grid = np.linspace(0, det.n, 50)
+                cc, rr = np.meshgrid(c_grid, r_grid)
+                
+                xyz = det.pixel_to_lab(rr, cc) - s_lab
+                norms = np.linalg.norm(xyz, axis=-1, keepdims=True)
+                kf_grid = xyz / np.where(norms == 0, 1.0, norms)
+                
+                field = np.sum(kf_grid * za, axis=-1) - rhs
+                
+                cs = plt.contour(cc, rr, field, levels=[0], alpha=0.0) 
+                
+                for collection in cs.collections:
+                    for path in collection.get_paths():
+                        v = path.vertices
+                        if len(v) == 0: continue
+                        
+                        line_xyz = det.pixel_to_lab(v[:, 1], v[:, 0]) - s_lab
+                        l_X, l_Y, l_Z = line_xyz[:, 0], line_xyz[:, 1], line_xyz[:, 2]
+                        l_roty = np.rad2deg(np.arctan2(l_X, l_Z))
+                        
+                        if img_key in wrapped_panels:
+                            l_roty = np.where(l_roty < 0, l_roty + 360, l_roty)
+                            
+                        diffs = np.abs(np.diff(l_roty))
+                        split_indices = np.where(diffs > 180)[0] + 1
+                        
+                        roty_splits = np.split(l_roty, split_indices)
+                        Y_splits = np.split(l_Y, split_indices)
+                        
+                        for split_r, split_y in zip(roty_splits, Y_splits):
+                            if len(split_r) > 1:
+                                ax.plot(compress_roty(split_r), split_y, 
+                                        color=colors_list[z_idx], lw=1.5, alpha=0.8,
+                                        label=label if not added_za_label else "")
+                                added_za_label = True
+
+    # ==========================================
     # FORMATTING & GAPS VISUALIZATION
     # ==========================================
-
     if merged:
         global_min = merged[0][0]
         global_max = merged[-1][1]

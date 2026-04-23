@@ -660,6 +660,12 @@ def zone_axis_search(
         batch_size=batch_size,
     )
 
+import typer
+from typing_extensions import Annotated
+from subhkl.commands import run_sparse_hough
+
+# ... (assuming 'app' is defined)
+
 @app.command(name="sparse-hough")
 def sparse_hough_cmd(
     finder_file: Annotated[
@@ -686,16 +692,12 @@ def sparse_hough_cmd(
     max_uvw: Annotated[
         int, typer.Option(help="Maximum uvw index for theoretical triad matching.")
     ] = 1,
+    create_visualizations: Annotated[
+        bool, typer.Option("--create-visualizations", help="Plot unrolled detector images with projected Great Circles.")
+    ] = False,
 ):
     """
     Algebraic Orientation Bootstrapper using L1-Regularized Sparse Basis Pursuit.
-
-    This command calculates the initial macroscopic orientation matrix (U) without
-    global optimization or meta-heuristics:
-    1. Converts detector pixels to physical lab coordinates using instrument geometry.
-    2. A Semi-Smooth Newton solver identifies the true laboratory zone axes.
-    3. Davenport's q-method extracts the exact macroscopic U-matrix algebraically.
-    4. The resulting U-matrix is exported alongside the raw geometry for downstream polishing.
     """
 
     run_sparse_hough(
@@ -707,7 +709,5 @@ def sparse_hough_cmd(
         kappa=kappa,
         alpha=alpha,
         max_uvw=max_uvw,
+        create_visualizations=create_visualizations,
     )
-
-if __name__ == "__main__":
-    app()
