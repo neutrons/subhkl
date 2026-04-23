@@ -312,31 +312,35 @@ def plot_unrolled_detector(
                 field = np.sum(kf_grid * za, axis=-1) - rhs
                 
                 cs = plt.contour(cc, rr, field, levels=[0], alpha=0.0) 
+
+                if hasattr(cs, "collections"):
+                    paths = [path for col in cs.collections for path in col.get_paths()]
+                else:
+                    paths = cs.get_paths()
                 
-                for collection in cs.collections:
-                    for path in collection.get_paths():
-                        v = path.vertices
-                        if len(v) == 0: continue
+                for path in collection.get_paths():
+                    v = path.vertices
+                    if len(v) == 0: continue
+                    
+                    line_xyz = det.pixel_to_lab(v[:, 1], v[:, 0]) - s_lab
+                    l_X, l_Y, l_Z = line_xyz[:, 0], line_xyz[:, 1], line_xyz[:, 2]
+                    l_roty = np.rad2deg(np.arctan2(l_X, l_Z))
+                    
+                    if img_key in wrapped_panels:
+                        l_roty = np.where(l_roty < 0, l_roty + 360, l_roty)
                         
-                        line_xyz = det.pixel_to_lab(v[:, 1], v[:, 0]) - s_lab
-                        l_X, l_Y, l_Z = line_xyz[:, 0], line_xyz[:, 1], line_xyz[:, 2]
-                        l_roty = np.rad2deg(np.arctan2(l_X, l_Z))
-                        
-                        if img_key in wrapped_panels:
-                            l_roty = np.where(l_roty < 0, l_roty + 360, l_roty)
-                            
-                        diffs = np.abs(np.diff(l_roty))
-                        split_indices = np.where(diffs > 180)[0] + 1
-                        
-                        roty_splits = np.split(l_roty, split_indices)
-                        Y_splits = np.split(l_Y, split_indices)
-                        
-                        for split_r, split_y in zip(roty_splits, Y_splits):
-                            if len(split_r) > 1:
-                                ax.plot(compress_roty(split_r), split_y, 
-                                        color=colors_list[z_idx], lw=1.5, alpha=0.8,
-                                        label=label if not added_za_label else "")
-                                added_za_label = True
+                    diffs = np.abs(np.diff(l_roty))
+                    split_indices = np.where(diffs > 180)[0] + 1
+                    
+                    roty_splits = np.split(l_roty, split_indices)
+                    Y_splits = np.split(l_Y, split_indices)
+                    
+                    for split_r, split_y in zip(roty_splits, Y_splits):
+                        if len(split_r) > 1:
+                            ax.plot(compress_roty(split_r), split_y, 
+                                    color=colors_list[z_idx], lw=1.5, alpha=0.8,
+                                    label=label if not added_za_label else "")
+                            added_za_label = True
 
     # ==========================================
     # FORMATTING & GAPS VISUALIZATION
@@ -366,7 +370,7 @@ def plot_unrolled_detector(
             valid_ticks = np.array(valid_ticks)
             tick_pos = compress_roty(valid_ticks)
             ax.set_xticks(tick_pos)
-            ax.set_xticklabels([f"{int(t) % 360}$^\circ$" for t in valid_ticks])
+            ax.set_xticklabels([rf"{int(t) % 360}$^\circ$" for t in valid_ticks])
 
     if gaps:
         ax.spines["bottom"].set_visible(False)
