@@ -680,6 +680,9 @@ def sparse_hough_cmd(
     kappa: Annotated[
         float, typer.Option(help="Bingham kernel concentration (sharpness of equators).")
     ] = 50.0,
+    max_uvw: Annotated[
+        int, typer.Option(help="Maximum uvw index for theoretical triad matching.")
+    ] = 1,
     create_visualizations: Annotated[
         bool, typer.Option("--create-visualizations", help="Plot unrolled detector images with projected Great Circles.")
     ] = False,
@@ -695,6 +698,7 @@ def sparse_hough_cmd(
         original_nexus_filename=nexus,
         max_dict_size=max_dict_size,
         kappa=kappa,
+        max_uvw=max_uvw,
         create_visualizations=create_visualizations,
     )
 
