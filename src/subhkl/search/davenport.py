@@ -7,20 +7,26 @@ from scipy.spatial.transform import Rotation
 
 @jit
 def compute_theo_angles_jax(r_theo_norm_j):
-    """Calculates the 9000x9000 pairwise angle matrix instantly on GPU."""
     theo_dots = jnp.clip(jnp.abs(r_theo_norm_j @ r_theo_norm_j.T), 0.0, 1.0)
     return jnp.rad2deg(jnp.arccos(theo_dots))
 
 @jit
 def evaluate_triad_chunk_jax(theo_angles_j, va, vb, req_13, req_23, angle_tol):
-    """Evaluates millions of geometric triad hypotheses in batched GPU chunks."""
     m13 = jnp.abs(theo_angles_j[va, :] - req_13) < angle_tol
     m23 = jnp.abs(theo_angles_j[vb, :] - req_23) < angle_tol
     return m13 & m23
 
 @jit
+def evaluate_tetrad_chunk_jax(theo_angles_j, va, vb, vc, req_14, req_24, req_34, angle_tol):
+    """Finds the 4th axis matching the required angles to the first 3 axes."""
+    m14 = jnp.abs(theo_angles_j[va, :] - req_14) < angle_tol
+    m24 = jnp.abs(theo_angles_j[vb, :] - req_24) < angle_tol
+    m34 = jnp.abs(theo_angles_j[vc, :] - req_34) < angle_tol
+    return m14 & m24 & m34
+
+@jit
 def jax_davenport_consensus(e_use, e_lab_obs, r_hyp_batch, r_theo_norm, angle_tol):
-    """Pure JAX Batched Davenport Solver + Global Consensus Evaluator."""
+    # e_use is now (4, 3) instead of (3, 3). The tensor contraction handles this automatically!
     B = jnp.einsum('ax,nay->nxy', e_use, r_hyp_batch)
     S = B + jnp.transpose(B, (0, 2, 1))
     sigma = jnp.trace(B, axis1=1, axis2=2)
@@ -81,10 +87,10 @@ def align_empirical_zones(
     eval_batch_size=5000
 ):
     N_emp = len(e_lab_obs)
-    N_use = min(3, N_emp)
+    N_use = min(4, N_emp)
     
-    if N_use < 3:
-        raise ValueError("Need at least 3 empirical zone axes to lock 3D orientation.")
+    if N_use < 4:
+        raise ValueError("Need at least 4 empirical zone axes to lock the Tetrad orientation.")
     
     e_use = e_lab_obs[:N_use]
 
@@ -103,77 +109,104 @@ def align_empirical_zones(
 
     print(f"  > Compiled {N_theo} theoretical axes. Moving to GPU...")
 
-    # Instantly compute the angle matrix on GPU
     r_theo_norm_j = jnp.array(r_theo_norm, dtype=jnp.float32)
     theo_angles_j = compute_theo_angles_jax(r_theo_norm_j)
-    theo_angles = np.array(theo_angles_j) # Pull back to CPU just for the baseline np.where
+    theo_angles = np.array(theo_angles_j) 
 
     emp_dots = np.clip(np.abs(e_use @ e_use.T), 0.0, 1.0)
     emp_angles = np.rad2deg(np.arccos(emp_dots))
 
+    # We now require 6 angles to over-constrain the geometry!
     req_12, req_13, req_23 = emp_angles[0, 1], emp_angles[0, 2], emp_angles[1, 2]
+    req_14, req_24, req_34 = emp_angles[0, 3], emp_angles[1, 3], emp_angles[2, 3]
 
-    print(f"  > Executing JAX-Accelerated Hypothesis Generation (tol={angle_tol} deg)...")
+    print(f"  > Executing Over-Constrained Tetrad Search (tol={angle_tol} deg)...")
 
-    # Baseline extraction (CPU is fine for a single 1D filter)
+    # Step 1: Baseline Edge
     valid_a, valid_b = np.where(np.abs(theo_angles - req_12) < angle_tol)
     valid_mask = valid_a != valid_b
     valid_a, valid_b = valid_a[valid_mask], valid_b[valid_mask]
 
-    a_cand_list, b_cand_list, c_cand_list = [], [], []
+    a_cand_triad, b_cand_triad, c_cand_triad = [], [], []
     
-    # ---------------------------------------------------------
-    # HYPOTHESIS BATCHING
-    # Pushes the 3D matching boolean logic entirely to the GPU
-    # ---------------------------------------------------------
+    # Step 2: Triad Generation
     for i in range(0, len(valid_a), hyp_batch_size):
         va_chunk = jnp.array(valid_a[i:i+hyp_batch_size])
         vb_chunk = jnp.array(valid_b[i:i+hyp_batch_size])
         
-        # JAX computes the massive boolean array
         mask_chunk = evaluate_triad_chunk_jax(theo_angles_j, va_chunk, vb_chunk, req_13, req_23, angle_tol)
-        
-        # Pull the tiny boolean result back to CPU to extract dynamic indices
         mask_chunk_cpu = np.array(mask_chunk)
         p_idx, c_idx = np.where(mask_chunk_cpu)
         
         if len(p_idx) > 0:
             global_p_idx = p_idx + i
-            a_cand_list.append(valid_a[global_p_idx])
-            b_cand_list.append(valid_b[global_p_idx])
-            c_cand_list.append(c_idx)
+            a_cand_triad.append(valid_a[global_p_idx])
+            b_cand_triad.append(valid_b[global_p_idx])
+            c_cand_triad.append(c_idx)
+
+    if not a_cand_triad:
+        raise ValueError(f"No theoretical triads match within {angle_tol} deg.")
+
+    a_cand_triad = np.concatenate(a_cand_triad)
+    b_cand_triad = np.concatenate(b_cand_triad)
+    c_cand_triad = np.concatenate(c_cand_triad)
+
+    triplet_mask = (c_cand_triad != a_cand_triad) & (c_cand_triad != b_cand_triad)
+    a_cand_triad = a_cand_triad[triplet_mask]
+    b_cand_triad = b_cand_triad[triplet_mask]
+    c_cand_triad = c_cand_triad[triplet_mask]
+
+    a_cand_list, b_cand_list, c_cand_list, d_cand_list = [], [], [], []
+
+    # Step 3: Tetrad Generation
+    for i in range(0, len(a_cand_triad), hyp_batch_size):
+        va_chunk = jnp.array(a_cand_triad[i:i+hyp_batch_size])
+        vb_chunk = jnp.array(b_cand_triad[i:i+hyp_batch_size])
+        vc_chunk = jnp.array(c_cand_triad[i:i+hyp_batch_size])
+        
+        mask_chunk = evaluate_tetrad_chunk_jax(theo_angles_j, va_chunk, vb_chunk, vc_chunk, req_14, req_24, req_34, angle_tol)
+        mask_chunk_cpu = np.array(mask_chunk)
+        p_idx, d_idx = np.where(mask_chunk_cpu)
+        
+        if len(p_idx) > 0:
+            global_p_idx = p_idx + i
+            a_cand_list.append(a_cand_triad[global_p_idx])
+            b_cand_list.append(b_cand_triad[global_p_idx])
+            c_cand_list.append(c_cand_triad[global_p_idx])
+            d_cand_list.append(d_idx)
 
     if not a_cand_list:
-        raise ValueError(f"No theoretical triads match the primary empirical angles within {angle_tol} deg.")
+        raise ValueError(f"No theoretical tetrads match the 6 empirical angles within {angle_tol} deg.")
 
     a_cand = np.concatenate(a_cand_list)
     b_cand = np.concatenate(b_cand_list)
     c_cand = np.concatenate(c_cand_list)
+    d_cand = np.concatenate(d_cand_list)
 
-    # Filter degenerates
-    triplet_mask = (c_cand != a_cand) & (c_cand != b_cand)
-    a_cand, b_cand, c_cand = a_cand[triplet_mask], b_cand[triplet_mask], c_cand[triplet_mask]
+    tetrad_mask = (d_cand != a_cand) & (d_cand != b_cand) & (d_cand != c_cand)
+    a_cand, b_cand, c_cand, d_cand = a_cand[tetrad_mask], b_cand[tetrad_mask], c_cand[tetrad_mask], d_cand[tetrad_mask]
 
-    if len(a_cand) == 0:
-        raise ValueError(f"No theoretical triads match the primary empirical angles within {angle_tol} deg.")
-
-    # Sort by tightness and take top N
     err12 = np.abs(theo_angles[a_cand, b_cand] - req_12)
     err13 = np.abs(theo_angles[a_cand, c_cand] - req_13)
     err23 = np.abs(theo_angles[b_cand, c_cand] - req_23)
-    max_errs = np.maximum(err12, np.maximum(err13, err23))
+    err14 = np.abs(theo_angles[a_cand, d_cand] - req_14)
+    err24 = np.abs(theo_angles[b_cand, d_cand] - req_24)
+    err34 = np.abs(theo_angles[c_cand, d_cand] - req_34)
+    
+    max_errs = np.maximum.reduce([err12, err13, err23, err14, err24, err34])
 
-    max_candidates = 2000
+    # We cap at 1000 candidates because 1000 * 16 permutations = 16,000 U-Matrices
+    max_candidates = 1000
     sort_idx = np.argsort(max_errs)[:max_candidates]
-    a_cand, b_cand, c_cand = a_cand[sort_idx], b_cand[sort_idx], c_cand[sort_idx]
+    a_cand, b_cand, c_cand, d_cand = a_cand[sort_idx], b_cand[sort_idx], c_cand[sort_idx], d_cand[sort_idx]
     
-    r_cand = r_theo_norm[np.column_stack([a_cand, b_cand, c_cand])]
-    signs = np.array(list(itertools.product([1, -1], repeat=3)))
+    r_cand = r_theo_norm[np.column_stack([a_cand, b_cand, c_cand, d_cand])]
+    signs = np.array(list(itertools.product([1, -1], repeat=4)))
     
-    W_batch = (r_cand[:, None, :, :] * signs[None, :, :, None]).reshape(-1, 3, 3)
+    W_batch = (r_cand[:, None, :, :] * signs[None, :, :, None]).reshape(-1, 4, 3)
     N_hyp = W_batch.shape[0]
     
-    print(f"  > Found {len(a_cand)} geometric triads. Dispatching {N_hyp} U-Matrices to GPU...")
+    print(f"  > Found {len(a_cand)} pristine geometric tetrads. Dispatching {N_hyp} U-Matrices to GPU...")
 
     e_use_j = jnp.array(e_use, dtype=jnp.float32)
     e_lab_obs_j = jnp.array(e_lab_obs, dtype=jnp.float32)
@@ -182,10 +215,6 @@ def align_empirical_zones(
     best_inliers = -1
     best_residual = np.inf
     
-    # ---------------------------------------------------------
-    # EVALUATION BATCHING
-    # Pushes the Davenport eigenvalue solver and global consensus to the GPU
-    # ---------------------------------------------------------
     for i in range(0, N_hyp, eval_batch_size):
         W_chunk = jnp.array(W_batch[i:i+eval_batch_size], dtype=jnp.float32)
         
@@ -208,7 +237,7 @@ def align_empirical_zones(
             best_residual = residuals_out[best_in_chunk]
             best_U = U_out[best_in_chunk]
 
-    if best_inliers < 3:
+    if best_inliers < 4:
         raise ValueError(f"Consensus failed. Best U-matrix only explained {best_inliers} axes.")
 
     print(f"  > Consensus Achieved! U-Matrix explains {best_inliers}/{N_emp} axes (Mean Error: {best_residual:.3f} deg)")
