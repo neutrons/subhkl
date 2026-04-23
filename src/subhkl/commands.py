@@ -1366,6 +1366,7 @@ def run_sparse_hough(
 
     from subhkl.optimization import FindUB
     from subhkl.search.sparse_hough import SparseHoughIndexer
+    from subhkl.search.davenport import align_empirical_zones
     from subhkl.integration.api import Peaks
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
