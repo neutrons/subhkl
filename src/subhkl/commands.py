@@ -1509,7 +1509,8 @@ def run_sparse_hough(
                 image_label = peaks_obj.get_image_label(first_img_key)
             except Exception:
                 image_label = f"run_{int(r_id)}"
-                
+               
+            import os
             out_name = os.path.join(base_dir, f"{image_label}-sparse_hough.png")
             
             # 2. Inject the peaks using the exact same physical bank key
@@ -1523,6 +1524,9 @@ def run_sparse_hough(
             )
 
             run_tasks.append((out_name, run_peaks, data["images"], data["detectors"], instrument_name, empirical_zones))
+
+       import multiprocessing
+       import concurrent.futures
 
         max_workers = min(os.cpu_count() or 4, len(run_tasks))
         ctx = multiprocessing.get_context("spawn")
