@@ -1386,6 +1386,7 @@ def run_sparse_hough(
     instrument_name: str | None = None,
     original_nexus_filename: str | None = None,
     tolerance_deg: float = 0.15,
+    angle_tol: float = 1.5,
     max_axes: int = 15,
     max_uvw: int = 1,
     create_visualizations: bool = False,
@@ -1395,7 +1396,7 @@ def run_sparse_hough(
     from subhkl.integration.api import Peaks
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
-    from subhkl.search.davenport import davenport_q_method, align_empirical_zones
+    from subhkl.search.davenport import align_empirical_zones
 
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
 
@@ -1477,7 +1478,7 @@ def run_sparse_hough(
 
     print("\n[3/3] Eigenvalue Solution (Wahba's Problem)")
     # The output U-matrix is now guaranteed to be the mathematically pure U_sample!
-    U0_matrix = align_empirical_zones(empirical_zones, B_mat, max_uvw=max_uvw)
+    U0_matrix = align_empirical_zones(empirical_zones, B_mat, max_uvw=max_uvw, angle_tol=angle_tol)
     print("  > Macroscopic U-Matrix successfully extracted.")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")

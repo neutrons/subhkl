@@ -683,6 +683,9 @@ def sparse_hough_cmd(
     max_uvw: Annotated[
         int, typer.Option(help="Maximum uvw index for theoretical triad matching.")
     ] = 1,
+    angle_tol: Annotated[
+        flot, typer.Option(help="Tolerance for the graph matching between theoretical and empirical zone axes."),
+    ) = 1.5,
     create_visualizations: Annotated[
         bool, typer.Option("--create-visualizations", help="Plot unrolled detector images with projected Great Circles.")
     ] = False,
@@ -697,6 +700,7 @@ def sparse_hough_cmd(
         instrument_name=instrument,
         original_nexus_filename=nexus,
         tolerance_deg=tolerance_deg,
+        angle_tol=angle_tol,
         max_uvw=max_uvw,
         max_axes=max_axes,
         create_visualizations=create_visualizations,
