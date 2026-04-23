@@ -8,7 +8,7 @@ def plot_unrolled_detector(
     images,
     detectors,
     finder_peaks=None,
-    zone_axes=None,  # <--- Great Circle zone axes
+    zone_axes=None,
     out_name="unrolled_detector_peaks.png",
     instrument=None,
 ):
@@ -290,57 +290,64 @@ def plot_unrolled_detector(
     if zone_axes is not None:
         added_za_label = False
         colors_list = plt.cm.tab10(np.linspace(0, 1, len(zone_axes)))
-        
+
+        # Use a dummy figure so pixel contours do not pollute the main plot's Y-axis
+        fig_dummy, ax_dummy = plt.subplots()
+
         for z_idx, za in enumerate(zone_axes):
             za = za / np.linalg.norm(za)
             rhs = np.dot(ki_vec, za)
             label = f"Zone Axis {z_idx+1}"
-            
+
             for img_key, det in detectors.items():
                 if img_key not in images:
                     continue
                 s_lab = get_s_lab_for_image(img_key)
-                
+
                 c_grid = np.linspace(0, det.m, 50)
                 r_grid = np.linspace(0, det.n, 50)
                 cc, rr = np.meshgrid(c_grid, r_grid)
-                
                 xyz = det.pixel_to_lab(rr, cc) - s_lab
                 norms = np.linalg.norm(xyz, axis=-1, keepdims=True)
                 kf_grid = xyz / np.where(norms == 0, 1.0, norms)
-                
+
                 field = np.sum(kf_grid * za, axis=-1) - rhs
-                
-                cs = plt.contour(cc, rr, field, levels=[0], alpha=0.0) 
+
+                # Plot to the DUMMY axis, entirely protecting the main `ax`
+                cs = ax_dummy.contour(cc, rr, field, levels=[0]) 
 
                 if hasattr(cs, "collections"):
                     paths = [path for col in cs.collections for path in col.get_paths()]
                 else:
                     paths = cs.get_paths()
-                
+
                 for path in paths:
                     v = path.vertices
                     if len(v) == 0: continue
-                    
+
                     line_xyz = det.pixel_to_lab(v[:, 1], v[:, 0]) - s_lab
                     l_X, l_Y, l_Z = line_xyz[:, 0], line_xyz[:, 1], line_xyz[:, 2]
                     l_roty = np.rad2deg(np.arctan2(l_X, l_Z))
-                    
+
                     if img_key in wrapped_panels:
                         l_roty = np.where(l_roty < 0, l_roty + 360, l_roty)
-                        
+
                     diffs = np.abs(np.diff(l_roty))
                     split_indices = np.where(diffs > 180)[0] + 1
-                    
+
                     roty_splits = np.split(l_roty, split_indices)
                     Y_splits = np.split(l_Y, split_indices)
-                    
+
                     for split_r, split_y in zip(roty_splits, Y_splits):
                         if len(split_r) > 1:
                             ax.plot(compress_roty(split_r), split_y, 
                                     color=colors_list[z_idx], lw=1.5, alpha=0.8,
                                     label=label if not added_za_label else "")
                             added_za_label = True
+
+                ax_dummy.clear() # Clear state for the next panel iteration
+
+        plt.close(fig_dummy) # Destroy the dummy figure to free memory
 
     # ==========================================
     # FORMATTING & GAPS VISUALIZATION
