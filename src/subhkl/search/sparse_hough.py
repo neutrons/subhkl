@@ -18,7 +18,6 @@ def get_fibonacci_hemisphere(samples=2000):
     z = jnp.sin(theta) * radius
     return jnp.stack([x, y, z], axis=1)
 
-@partial(jit, static_argnames=["kappa"])
 def build_hough_dictionary(q_lab_obs, dict_zones, kappa=50.0):
     """
     Builds the 'A' matrix. 
