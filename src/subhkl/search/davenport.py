@@ -153,22 +153,22 @@ def align_empirical_zones(
 
     a_cand_triad, b_cand_triad, c_cand_triad = [], [], []
     
-    # Step 2: Triad Generation (Static Shape Padding)
+    # Step 2: Triad Generation 
     for i in range(0, len(valid_a), hyp_batch_size):
         va_chunk = valid_a[i:i+hyp_batch_size]
         vb_chunk = valid_b[i:i+hyp_batch_size]
         actual_size = len(va_chunk)
         
-        # Prevent JAX re-compilation on the final loop
         if actual_size < hyp_batch_size:
             va_chunk = np.pad(va_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
             vb_chunk = np.pad(vb_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
             
         mask_chunk = evaluate_triad_chunk_jax(theo_angles_j, jnp.array(va_chunk), jnp.array(vb_chunk), req_13, req_23, angle_tol)
         
-        # Slice back to the actual length before processing
-        mask_chunk_cpu = np.array(mask_chunk[:actual_size])
-        p_idx, c_idx = np.where(mask_chunk_cpu)
+        # --- THE FIX: Execute 'where' on the GPU BEFORE transferring to CPU ---
+        p_idx_j, c_idx_j = jnp.where(mask_chunk[:actual_size])
+        p_idx = np.array(p_idx_j)  # Now we only transfer a tiny 1D array of integers!
+        c_idx = np.array(c_idx_j)
         
         if len(p_idx) > 0:
             global_p_idx = p_idx + i
@@ -190,7 +190,7 @@ def align_empirical_zones(
 
     a_cand_list, b_cand_list, c_cand_list, d_cand_list = [], [], [], []
 
-    # Step 3: Tetrad Generation (Static Shape Padding)
+    # Step 3: Tetrad Generation
     for i in range(0, len(a_cand_triad), hyp_batch_size):
         va_chunk = a_cand_triad[i:i+hyp_batch_size]
         vb_chunk = b_cand_triad[i:i+hyp_batch_size]
@@ -204,8 +204,10 @@ def align_empirical_zones(
             
         mask_chunk = evaluate_tetrad_chunk_jax(theo_angles_j, jnp.array(va_chunk), jnp.array(vb_chunk), jnp.array(vc_chunk), req_14, req_24, req_34, angle_tol)
         
-        mask_chunk_cpu = np.array(mask_chunk[:actual_size])
-        p_idx, d_idx = np.where(mask_chunk_cpu)
+        # --- THE FIX: GPU extraction ---
+        p_idx_j, d_idx_j = jnp.where(mask_chunk[:actual_size])
+        p_idx = np.array(p_idx_j)
+        d_idx = np.array(d_idx_j)
         
         if len(p_idx) > 0:
             global_p_idx = p_idx + i
