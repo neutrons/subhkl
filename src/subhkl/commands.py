@@ -1053,14 +1053,14 @@ def run_rbf_integrator(
 
     result = integrate_peaks_rbf_ssn(
         peak_dict=peak_dict,
-        peaks_obj=peaks,  # Pass the full Peaks object
+        peaks_obj=peaks,
         alpha=alpha,
         sigmas=sigma_list,
         gamma=gamma,
         nominal_sigma=nominal_sigma,
         max_peaks=max_peaks,
         show_progress=show_progress,
-        all_R=all_R,  # Pass rotation and offset downstream
+        all_R=all_R,
         sample_offset=sample_offset,
         anisotropic=anisotropic,
         fit_mosaicity=fit_mosaicity,
@@ -1476,57 +1476,60 @@ def run_sparse_hough(
     if create_visualizations:
         print("\n[4/4] Rendering Detector Plots (Parallel)...")
         peaks_obj = Peaks(original_nexus_filename, instrument_name)
-        unique_runs = np.unique(run_indices)
+        
+        # 1. Map runs to their images and detectors using the PHYSICAL BANK ID as the universal key
+        runs_plot_data = {}
+        for img_key, image_raw in peaks_obj.image.ims.items():
+            run_id = peaks_obj.get_run_id(img_key)
+            det = peaks_obj.get_detector_by_img(img_key)
+            
+            # The universal key to bind everything together
+            phys_bank = int(peaks_obj.image.bank_mapping.get(img_key, img_key))
+            
+            if run_id not in runs_plot_data:
+                runs_plot_data[run_id] = {"images": {}, "detectors": {}}
+                
+            runs_plot_data[run_id]["images"][phys_bank] = image_raw
+            runs_plot_data[run_id]["detectors"][phys_bank] = det
 
+        unique_runs = np.unique(run_indices)
         run_tasks = []
-        import os
         base_dir = os.path.dirname(output_h5_filename) or "."
 
         for r_id in unique_runs:
+            if r_id not in runs_plot_data:
+                continue
+                
+            data = runs_plot_data[r_id]
             mask = np.where(run_indices == r_id)[0]
             if len(mask) == 0: continue
-
-            run_img_indices = np.unique(img_indices[mask])
-            images, detectors = {}, {}
-
-            for img_idx in run_img_indices:
-                img_key = int(img_idx)
-                b_mask = np.where(img_indices == img_idx)[0]
-                phys_bank = int(bank_array[b_mask[0]]) if len(b_mask) > 0 else img_key
-
-                try:
-                    det = Detector(beamlines[instrument_name][str(phys_bank)])
-                    detectors[img_key] = det
-                except Exception as e:
-                    print(f"Warning: Could not build detector for bank {phys_bank}: {e}")
-
+            
             try:
-                image_label = peaks_obj.get_image_label(int(run_img_indices[0]))
+                first_img_key = list(peaks_obj.image.ims.keys())[0]
+                image_label = peaks_obj.get_image_label(first_img_key)
             except Exception:
                 image_label = f"run_{int(r_id)}"
-
+                
             out_name = os.path.join(base_dir, f"{image_label}-sparse_hough.png")
-
+            
+            # 2. Inject the peaks using the exact same physical bank key
             run_peaks = RunPeaks(
-                image_index=img_indices[mask].tolist(),
+                image_index=bank_array[mask].astype(int).tolist(),
                 peak_rows=pixel_r[mask].tolist(),
                 peak_cols=pixel_c[mask].tolist(),
-                var_u=None, # None triggers simple dots instead of ellipsoids
+                var_u=None,
                 sample_offset=ub_helper.sample_offset,
                 ki_vec=ub_helper.ki_vec,
             )
 
-            run_tasks.append((out_name, run_peaks, peaks_obj.image.ims, detectors, instrument_name, empirical_zones))
+            run_tasks.append((out_name, run_peaks, data["images"], data["detectors"], instrument_name, empirical_zones))
 
         max_workers = min(os.cpu_count() or 4, len(run_tasks))
-        import multiprocessing
-        import concurrent.futures
         ctx = multiprocessing.get_context("spawn")
-
+        
         with concurrent.futures.ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
             futures = {executor.submit(_render_run_unrolled_plot, t): t[0] for t in run_tasks}
-
-            from tqdm import tqdm
+            
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Rendering Zone Axes"):
                 try:
                     out_name = future.result()
