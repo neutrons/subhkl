@@ -1352,20 +1352,6 @@ def run_merge_images(
 
     print(f"Successfully created {output_filename} with unit cell info embedded.")
 
-import h5py
-import numpy as np
-from scipy.spatial.transform import Rotation
-
-from subhkl.optimization import FindUB
-from subhkl.search.sparse_hough import SparseHoughIndexer
-from subhkl.io.loader import Peaks
-from subhkl.config import beamlines
-from subhkl.instrument.detector import Detector
-
-# Assuming davenport_q_method and align_empirical_zones are imported
-# from subhkl.search.davenport import davenport_q_method, align_empirical_zones
-
-
 def run_sparse_hough(
     finder_file: str,
     output_h5_filename: str,
@@ -1380,7 +1366,7 @@ def run_sparse_hough(
 
     from subhkl.optimization import FindUB
     from subhkl.search.sparse_hough import SparseHoughIndexer
-    from subhkl.io.loader import Peaks
+    from subhkl.instrument.api import Peaks
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
 
