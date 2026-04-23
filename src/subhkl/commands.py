@@ -1494,6 +1494,7 @@ def run_sparse_hough(
 
         unique_runs = np.unique(run_indices)
         run_tasks = []
+        import os
         base_dir = os.path.dirname(output_h5_filename) or "."
 
         for r_id in unique_runs:
@@ -1510,7 +1511,6 @@ def run_sparse_hough(
             except Exception:
                 image_label = f"run_{int(r_id)}"
                
-            import os
             out_name = os.path.join(base_dir, f"{image_label}-sparse_hough.png")
             
             # 2. Inject the peaks using the exact same physical bank key
