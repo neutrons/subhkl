@@ -14,7 +14,7 @@ from subhkl.commands import (
     run_mtz_exporter,
     run_reduce,
     run_merge_images,
-    run_zone_axis_search,
+    run_sparse_hough,
 )
 
 
@@ -660,6 +660,45 @@ def zone_axis_search(
         batch_size=batch_size,
     )
 
+@app.command()
+def sparse_hough_search(
+    finder_file: Annotated[
+        str, typer.Argument(help="Input HDF5 file containing found peaks.")
+    ],
+    output_h5_filename: Annotated[
+        str, typer.Argument(help="Output HDF5 file containing the initial U-matrix.")
+    ],
+    dict_size: Annotated[
+        int, typer.Option(help="Number of basis functions (zone axes) in the spherical dictionary.")
+    ] = 2000,
+    kappa: Annotated[
+        float, typer.Option(help="Bingham kernel concentration (sharpness of equators).")
+    ] = 50.0,
+    alpha: Annotated[
+        float, typer.Option(help="L1 Sparsity penalty (Z-score threshold for SSN solver).")
+    ] = 5.0,
+    max_uvw: Annotated[
+        int, typer.Option(help="Maximum uvw index for theoretical triad matching.")
+    ] = 1,
+):
+    """
+    Algebraic Orientation Bootstrapper using L1-Regularized Sparse Basis Pursuit.
+    
+    This command calculates the initial macroscopic orientation matrix (U) without 
+    global optimization or meta-heuristics:
+    1. A Semi-Smooth Newton solver identifies the true laboratory zone axes.
+    2. Davenport's q-method extracts the exact macroscopic U-matrix algebraically.
+    3. The resulting U-matrix is exported alongside the raw geometry for downstream polishing.
+    """
+    
+    run_sparse_hough(
+        finder_file=finder_file,
+        output_h5_filename=output_h5_filename,
+        dict_size=dict_size,
+        kappa=kappa,
+        alpha=alpha,
+        max_uvw=max_uvw,
+    )
 
 if __name__ == "__main__":
     app()

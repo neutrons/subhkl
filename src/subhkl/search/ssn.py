@@ -1,0 +1,134 @@
+"""
+Semi-Smooth Newton (SSN) Solver for L1-Regularized Sparse Recovery.
+Shared engine for Peak Integration and Sparse Hough Zone Axis Indexing.
+"""
+import jax
+import jax.numpy as jnp
+from jax import lax, jit
+from functools import partial
+
+@partial(jit, static_argnames=["max_iter", "loss_type", "force_target"])
+def solve_ssn_unified(
+    A, y, bg_flat, alpha_vec, loss_type, c_warm, max_iter=20, force_target=False
+):
+    N_peaks = A.shape[1]
+    N_params = N_peaks
+    q_init = c_warm.astype(jnp.float32)
+
+    bg_med = jnp.maximum(jnp.median(bg_flat), 1e-3).astype(jnp.float32)
+
+    def get_loss_grad_hess(c):
+        u = A @ c + bg_flat
+
+        if loss_type == 1:
+            u_safe = jnp.maximum(u, 1e-6)
+            nll = jnp.sum(u_safe - y * jnp.log(u_safe))
+            grad = A.T @ (1.0 - y / u_safe)
+            W_diag = 1.0 / jnp.maximum(u_safe, 1e-3)
+            hess = A.T @ (W_diag[:, None] * A)
+        else:
+            nll = 0.5 * jnp.sum((u - y) ** 2)
+            grad = A.T @ (u - y)
+            hess = A.T @ A
+
+        return nll, grad, hess
+
+    def cond_fn(state):
+        step, _, _, dq_norm = state
+        return (step < max_iter) & (dq_norm > 1e-3)
+
+    def body_fn(state):
+        step, q, c, _ = state
+        nll, grad, hess = get_loss_grad_hess(c)
+
+        L = jnp.max(jnp.diag(hess)) + 1e-4
+        tau = 1.0 / L
+
+        var_c = jnp.where(loss_type == 1, tau, bg_med * tau)
+        tau_alpha = alpha_vec * jnp.sqrt(var_c)
+
+        Gq = (q - c) / tau + grad
+
+        D = (q > tau_alpha).astype(jnp.float32)
+        DP_mat = jnp.diag(D)
+        I = jnp.eye(N_params, dtype=jnp.float32)
+
+        DG = (I - DP_mat) / tau + hess @ DP_mat + 1e-4 * I
+        dq = jnp.linalg.solve(DG, -Gq).astype(jnp.float32)
+
+        def bt_cond(bt_state):
+            bt_i, step_size, _, _, j_test, j_curr = bt_state
+            is_valid = jnp.isfinite(j_test)
+            return (bt_i < 8) & ((j_test > j_curr) | ~is_valid)
+
+        def bt_body(bt_state):
+            bt_i, step_size, _, _, _, j_curr = bt_state
+            step_size = jnp.float32(step_size * 0.5)
+
+            q_test = (q + step_size * dq).astype(jnp.float32)
+            c_test = jnp.maximum(0.0, q_test - tau_alpha).astype(jnp.float32)
+
+            j_test, _, _ = get_loss_grad_hess(c_test)
+            reg_penalty = jnp.sum((tau_alpha / tau) * c_test)
+            return (bt_i + 1, step_size, q_test, c_test, j_test + reg_penalty, j_curr)
+
+        q_test = (q + dq).astype(jnp.float32)
+        c_test = jnp.maximum(0.0, q_test - tau_alpha).astype(jnp.float32)
+        j_test, _, _ = get_loss_grad_hess(c_test)
+
+        reg_penalty = jnp.sum((tau_alpha / tau) * c_test)
+        obj_val = nll + jnp.sum((tau_alpha / tau) * c)
+
+        bt_init = (0, jnp.float32(1.0), q_test, c_test, j_test + reg_penalty, obj_val)
+        bt_final = lax.while_loop(bt_cond, bt_body, bt_init)
+        _, _, q_final, c_final, _, _ = bt_final
+
+        return (
+            step + 1,
+            q_final.astype(jnp.float32),
+            c_final.astype(jnp.float32),
+            jnp.linalg.norm(dq).astype(jnp.float32),
+        )
+
+    init_state = (0, q_init.astype(jnp.float32), c_warm.astype(jnp.float32), jnp.float32(1e9))
+    final_state = lax.while_loop(cond_fn, body_fn, init_state)
+    _, _, c_l1, _ = final_state
+
+    # DEBIASING PHASE
+    active_mask = c_l1 > 1e-5
+    if force_target:
+        active_mask = active_mask.at[0].set(True)
+
+    def debias_cond(state):
+        step, _, actual_step_norm = state
+        return (step < 100) & (actual_step_norm > 1e-4)
+
+    def debias_body(state):
+        step, c, _ = state
+        _, grad, hess = get_loss_grad_hess(c)
+
+        H_diag = jnp.diag(hess)
+        eta = 1.0 / jnp.maximum(H_diag, 1e-6)
+
+        I = jnp.eye(N_params, dtype=jnp.float32)
+        D_mat = jnp.diag(active_mask.astype(jnp.float32))
+
+        F_c = (1.0 - active_mask) * c + active_mask * (eta * grad)
+        DG = (I - D_mat) + (eta[:, None] * hess) @ D_mat + 1e-4 * I
+
+        dc = jnp.linalg.solve(DG, -F_c).astype(jnp.float32)
+
+        tau_debias = jnp.where(loss_type == 1, jnp.float32(0.8), jnp.float32(1.0))
+
+        c_new_raw = c + tau_debias * dc * active_mask
+        c_new = jnp.maximum(0.0, c_new_raw) * active_mask
+
+        actual_step = c_new - c
+        return (step + 1, c_new.astype(jnp.float32), jnp.linalg.norm(actual_step).astype(jnp.float32))
+
+    debias_state = lax.while_loop(
+        debias_cond, debias_body, (0, c_l1.astype(jnp.float32), jnp.float32(1e9))
+    )
+    _, c_final, _ = debias_state
+
+    return c_final.astype(jnp.float32)
