@@ -96,7 +96,7 @@ def solve_sparse_hough_tuned_jax(q_lab_obs, dict_zones, kappa, candidate_alphas,
 class SparseHoughIndexer:
     def __init__(self, max_dict_size=20000, kappa=50.0, alpha=None, bg_val=0.1, auto_tune=True,
                  candidate_alphas=None):
-        self.max_dict_size = dict_size
+        self.max_dict_size = max_dict_size
         self.kappa = kappa
         self.alpha = alpha
         self.bg_val = bg_val
