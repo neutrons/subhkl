@@ -1479,6 +1479,7 @@ def run_sparse_hough(
         unique_runs = np.unique(run_indices)
 
         run_tasks = []
+        import os
         base_dir = os.path.dirname(output_h5_filename) or "."
 
         for r_id in unique_runs:
