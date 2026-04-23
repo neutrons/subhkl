@@ -98,7 +98,7 @@ def solve_sparse_hough_tuned_jax(q_lab_obs, dict_zones, kappa, candidate_alphas,
     return all_c[best_idx], bics[best_idx], candidate_alphas[best_idx]
 
 class SparseHoughIndexer:
-    def __init__(self, dict_size=2000, kappa=50.0, alpha=5.0, bg_val=0.1, auto_tune=True,
+    def __init__(self, dict_size=2000, kappa=50.0, alpha=None, bg_val=0.1, auto_tune=True,
                  candidate_alphas=None):
         self.dict_size = dict_size
         self.kappa = kappa
@@ -111,7 +111,7 @@ class SparseHoughIndexer:
             # A broad sweep of Z-scores from very loose (2.0) to extremely strict (50.0)
             self.candidate_alphas = jnp.array([2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 50.0, 100.0, 200.0], dtype=jnp.float32)
         else:
-            self.candidate_alphas = candidate_alphas
+            self.candidate_alphas = jnp.array(candidate_alphas)
         
     def find_active_zones(self, q_lab_obs):
         """

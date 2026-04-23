@@ -1454,9 +1454,10 @@ def run_sparse_hough(
     print(f"  > Loaded {len(q_lab_obs)} empirical peaks.")
 
     print("\n[2/3] Sparse Basis Pursuit (L1-Regularized SSN)")
+    alpha_list = [float(k.strip()) for k in candidate_alphas.split(",")]
     indexer = SparseHoughIndexer(dict_size=dict_size, kappa=kappa,
-                                 alpha=alpha, auto_tune=alpha is not None,
-                                 candidate_alphas=candidate_alphas)
+                                 alpha=alpha, auto_tune=alpha is None,
+                                 candidate_alphas=alpha_list)
     empirical_zones, activation_weights = indexer.find_active_zones(q_lab_obs)
 
     print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.")
