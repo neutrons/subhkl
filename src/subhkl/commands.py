@@ -1352,43 +1352,116 @@ def run_merge_images(
 
     print(f"Successfully created {output_filename} with unit cell info embedded.")
 
+import h5py
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+from subhkl.optimization import FindUB
+from subhkl.search.sparse_hough import SparseHoughIndexer
+from subhkl.io.loader import Peaks
+from subhkl.config import beamlines
+from subhkl.instrument.detector import Detector
+
+# Assuming davenport_q_method and align_empirical_zones are imported
+# from subhkl.search.davenport import davenport_q_method, align_empirical_zones
+
+
 def run_sparse_hough(
     finder_file: str,
     output_h5_filename: str,
+    instrument_name: str | None = None,
+    original_nexus_filename: str | None = None,
     dict_size: int = 2000,
     kappa: float = 50.0,
     alpha: float = 5.0,
     max_uvw: int = 1,
 ):
-    from subhkl.optimization import FindUB
-    from subhkl.instrument.detector import scattering_vector_from_angles
-    from subhkl.search.sparse_hough import SparseHoughIndexer 
-    from subhkl.search.davenport import align_empirical_zones
+    from scipy.spatial.transform import Rotation
 
+    from subhkl.optimization import FindUB
+    from subhkl.search.sparse_hough import SparseHoughIndexer
+    from subhkl.io.loader import Peaks
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
 
     """
     Executes the Algebraic Orientation Bootstrapper (Steps 1-3):
-    1. Initialize Reciprocal Space
+    1. Initialize Reciprocal Space (including pixel-to-lab conversion)
     2. L1-Regularized Sparse Basis Pursuit (Zone Axis Isolation)
     3. Davenport q-method (Macroscopic U-Matrix Extraction)
     """
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
-    ub_helper = FindUB(finder_file)
+
+    # 1. Load basic geometry and metadata
+    ub_helper = FindUB()
+    with h5py.File(finder_file, "r") as f:
+        ub_helper.a = f["sample/a"][()] if "sample/a" in f else None
+        ub_helper.b = f["sample/b"][()] if "sample/b" in f else None
+        ub_helper.c = f["sample/c"][()] if "sample/c" in f else None
+        ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else None
+        ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
+        ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
+
+        ub_helper.sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
+        ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
+
+        if "peaks/pixel_r" not in f or "peaks/pixel_c" not in f:
+            raise ValueError(
+                "ERROR: Input file does not contain peaks/pixel_r and peaks/pixel_c. "
+                "Cannot perform physically sound indexing."
+            )
+
+        if not instrument_name or not original_nexus_filename:
+            raise ValueError(
+                "ERROR: Finder file contains pixels. You must provide --instrument "
+                "and --nexus to rebuild geometry."
+            )
+
+        pixel_r = f["peaks/pixel_r"][()]
+        pixel_c = f["peaks/pixel_c"][()]
+
+        if "bank" in f:
+            bank_array = f["bank"][()]
+        elif "peaks/bank" in f:
+            bank_array = f["peaks/bank"][()]
+        elif "bank_ids" in f and "peaks/image_index" in f:
+            b_ids = f["bank_ids"][()]
+            img_idx = f["peaks/image_index"][()]
+            bank_array = np.array([b_ids[int(idx)] for idx in img_idx])
+        else:
+            bank_array = f["peaks/image_index"][()]
+
     B_mat = ub_helper.reciprocal_lattice_B()
-    
-    # Calculate nominal scattering vectors
-    if ub_helper.peak_xyz is not None and len(ub_helper.two_theta) == 0:
-        q_norms = np.linalg.norm(ub_helper.peak_xyz, axis=1, keepdims=True)
-        q_lab_obs = ub_helper.peak_xyz / np.where(q_norms == 0, 1.0, q_norms)
-    else:
-        q_lab_obs = scattering_vector_from_angles(ub_helper.two_theta, ub_helper.az_phi).T
+
+    # 2. Reconstruct physical geometry from pixels
+    print("  > Reconstructing physical geometry from pixels...")
+    xyz_out = np.zeros((len(pixel_r), 3))
+
+    for phys_bank in np.unique(bank_array):
+        mask = bank_array == phys_bank
+        if not np.any(mask):
+            continue
+
+        try:
+            det_config = beamlines[instrument_name][str(int(phys_bank))]
+            det = Detector(det_config)
+            xyz_p = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
+            xyz_out[mask] = xyz_p
+
+        except KeyError as e:
+            print(f"Warning: Could not rebuild geometry for bank {phys_bank}: {e}")
+
+    # Convert hit coordinates to scattering vectors (kf - ki)
+    kf = xyz_out - ub_helper.sample_offset[None, :]
+    kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
+    q_lab_obs = kf - ub_helper.ki_vec[None, :]
 
     print(f"  > Loaded {len(q_lab_obs)} empirical peaks.")
 
     print("\n[2/3] Sparse Basis Pursuit (L1-Regularized SSN)")
     indexer = SparseHoughIndexer(dict_size=dict_size, kappa=kappa, alpha=alpha)
     empirical_zones, activation_weights = indexer.find_active_zones(q_lab_obs)
-    
+
     print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.")
     for i, (zone, weight) in enumerate(zip(empirical_zones, activation_weights)):
         print(f"    Zone {i+1}: [{zone[0]:.3f}, {zone[1]:.3f}, {zone[2]:.3f}] (Weight: {weight:.2f})")
@@ -1400,23 +1473,25 @@ def run_sparse_hough(
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
         with h5py.File(finder_file, "r") as f_in:
-            # Copy all experimental metadata needed for downstream refinement
             keys_to_copy = [
-                "sample/a", "sample/b", "sample/c", 
-                "sample/alpha", "sample/beta", "sample/gamma", 
+                "sample/a", "sample/b", "sample/c",
+                "sample/alpha", "sample/beta", "sample/gamma",
                 "sample/space_group", "sample/offset",
                 "instrument/wavelength", "beam/ki_vec",
-                "peaks/two_theta", "peaks/azimuthal",
-                "peaks/run_index", "peaks/image_index", "peaks/xyz",
-                "bank", "bank_ids", 
+                "peaks/run_index", "peaks/image_index",
+                "bank", "bank_ids",
+                "peaks/pixel_r", "peaks/pixel_c",
                 "goniometer/R", "goniometer/axes", "goniometer/angles", "goniometer/names"
             ]
-            
+
             for key in keys_to_copy:
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
-                    
+
+        # Save the reconstructed XYZ lab coordinates
+        f.create_dataset("peaks/xyz", data=xyz_out)
+
         # Inject the algebraically solved U matrix
         f.create_dataset("sample/U", data=U0_matrix)
-        
-    print("Export complete. File is ready for discrete Laue polishing.")
+
+    print("Export complete. File is ready for discrete Laue polishing via 'index' command.")
