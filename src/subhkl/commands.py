@@ -1352,7 +1352,6 @@ def run_merge_images(
 
     print(f"Successfully created {output_filename} with unit cell info embedded.")
 
---- MODULE LEVEL WORKER FOR MULTIPROCESSING ---
 def _render_run_unrolled_plot(args):
     out_name, run_peaks, images, detectors, instrument, zone_axes = args
     from subhkl.viz.detector_assembly import plot_unrolled_detector
