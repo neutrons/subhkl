@@ -1387,9 +1387,7 @@ def run_sparse_hough(
     original_nexus_filename: str | None = None,
     max_dict_size: int = 2000,
     kappa: float = 50.0,
-    alpha: float = None,
     max_uvw: int = 1,
-    candidate_alphas: str = None,
     create_visualizations: bool = False, # <--- NEW ARGUMENT
 ):
     from subhkl.optimization import FindUB
@@ -1454,10 +1452,7 @@ def run_sparse_hough(
     print(f"  > Loaded {len(q_lab_obs)} empirical peaks.")
 
     print("\n[2/3] Sparse Basis Pursuit (L1-Regularized SSN)")
-    alpha_list = [float(k.strip()) for k in candidate_alphas.split(",")]
-    indexer = SparseHoughIndexer(max_dict_size=max_dict_size, kappa=kappa,
-                                 alpha=alpha, auto_tune=alpha is None,
-                                 candidate_alphas=alpha_list)
+    indexer = SparseHoughIndexer(max_dict_size=max_dict_size, kappa=kappa)
     empirical_zones, activation_weights = indexer.find_active_zones(q_lab_obs)
 
     print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.")

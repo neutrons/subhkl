@@ -680,15 +680,6 @@ def sparse_hough_cmd(
     kappa: Annotated[
         float, typer.Option(help="Bingham kernel concentration (sharpness of equators).")
     ] = 50.0,
-    alpha: Annotated[
-        float | None, typer.Option(help="L1 Sparsity penalty (Z-score threshold for SSN solver).")
-    ] = None, 
-    max_uvw: Annotated[
-        int, typer.Option(help="Maximum uvw index for theoretical triad matching.")
-    ] = 1,
-    candidate_alphas: Annotated[
-        str, typer.Option(help="Candidate SNR thresholds alpha for auto-tuning")
-    ] = "2.0,5.0,10.0,15.0,20.0,30.0,50.0,100.0",
     create_visualizations: Annotated[
         bool, typer.Option("--create-visualizations", help="Plot unrolled detector images with projected Great Circles.")
     ] = False,
@@ -704,9 +695,6 @@ def sparse_hough_cmd(
         original_nexus_filename=nexus,
         max_dict_size=max_dict_size,
         kappa=kappa,
-        alpha=alpha,
-        max_uvw=max_uvw,
-        candidate_alphas=candidate_alphas,
         create_visualizations=create_visualizations,
     )
 
