@@ -660,12 +660,6 @@ def zone_axis_search(
         batch_size=batch_size,
     )
 
-import typer
-from typing_extensions import Annotated
-from subhkl.commands import run_sparse_hough
-
-# ... (assuming 'app' is defined)
-
 @app.command(name="sparse-hough")
 def sparse_hough_cmd(
     finder_file: Annotated[
