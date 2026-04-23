@@ -1505,9 +1505,6 @@ def run_sparse_hough(
         from tqdm import tqdm
         from collections import defaultdict
         
-        # We must import these locally so the parallel executor can see them
-        from subhkl.viz.detector_assembly import RunPeaks, _render_run_unrolled_plot
-
         print("\n[4/4] Rendering Detector Plots (Parallel)...")
         peaks_obj = Peaks(original_nexus_filename, instrument_name)
         
