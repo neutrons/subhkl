@@ -1533,7 +1533,8 @@ def run_sparse_hough(
         
         with concurrent.futures.ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
             futures = {executor.submit(_render_run_unrolled_plot, t): t[0] for t in run_tasks}
-            
+           
+            import tqdm
             for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Rendering Zone Axes"):
                 try:
                     out_name = future.result()
