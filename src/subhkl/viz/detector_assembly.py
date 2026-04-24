@@ -404,6 +404,16 @@ def plot_unrolled_detector(
             # THE Y-PRUNING FIX: Completely drop hubs outside the viewing pane!
             if scaled_Y < (det_y_min - y_margin) or scaled_Y > (det_y_max + y_margin):
                 continue
+
+            # THE X-PRUNING FIX: Completely drop hubs that land in the physical gaps!
+            in_gap = False
+            for g_start, g_end in gaps:
+                # 1-degree buffer so we don't clip hubs perfectly on the panel edges
+                if (g_start + 1.0) < roty < (g_end - 1.0):
+                    in_gap = True
+                    break
+            if in_gap:
+                continue
             
             n_rotys.append(roty)
             n_Ys.append(scaled_Y)
