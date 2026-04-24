@@ -6,9 +6,29 @@ from jax import jit
 from scipy.spatial.transform import Rotation
 
 @jit
-def jax_davenport_consensus(e_use, e_lab_obs, r_hyp_batch, r_theo_norm, angle_tol):
-    """Batched Wahba's Problem and RANSAC Evaluator executing strictly on GPU"""
-    B = jnp.einsum('ax,nay->nxy', e_use, r_hyp_batch)
+def compute_theo_angles_jax(r_theo_norm_j):
+    theo_dots = jnp.clip(jnp.abs(r_theo_norm_j @ r_theo_norm_j.T), 0.0, 1.0)
+    return jnp.rad2deg(jnp.arccos(theo_dots))
+
+@jit
+def evaluate_triad_chunk_jax(theo_angles_j, va, vb, req_13, req_23, angle_tol):
+    m13 = jnp.abs(theo_angles_j[va, :] - req_13) < angle_tol
+    m23 = jnp.abs(theo_angles_j[vb, :] - req_23) < angle_tol
+    return m13 & m23
+
+@jit
+def evaluate_tetrad_chunk_jax(theo_angles_j, va, vb, vc, req_14, req_24, req_34, angle_tol):
+    m14 = jnp.abs(theo_angles_j[va, :] - req_14) < angle_tol
+    m24 = jnp.abs(theo_angles_j[vb, :] - req_24) < angle_tol
+    m34 = jnp.abs(theo_angles_j[vc, :] - req_34) < angle_tol
+    return m14 & m24 & m34
+
+@jit
+def jax_davenport_consensus(e_use_nodes, e_emp_zones, r_hyp_nodes_batch, r_theo_zones, angle_tol):
+    """
+    Solves Wahba using Virtual Nodes, but evaluates Consensus using Zone Axes.
+    """
+    B = jnp.einsum('ax,nay->nxy', e_use_nodes, r_hyp_nodes_batch)
     S = B + jnp.transpose(B, (0, 2, 1))
     sigma = jnp.trace(B, axis1=1, axis2=2)
     
@@ -47,8 +67,9 @@ def jax_davenport_consensus(e_use, e_lab_obs, r_hyp_batch, r_theo_norm, angle_to
         jnp.stack([U20, U21, U22], axis=1)
     ], axis=1)
     
-    r_lab_batch = jnp.matmul(U_batch, r_theo_norm.T)
-    dots = jnp.einsum('ei,nit->net', e_lab_obs, r_lab_batch)
+    # Project all 9,000 theoretical ZONE AXES to score against the 15 empirical ZONE AXES
+    r_lab_batch = jnp.matmul(U_batch, r_theo_zones.T)
+    dots = jnp.einsum('ei,nit->net', e_emp_zones, r_lab_batch)
     
     max_dots = jnp.max(jnp.clip(jnp.abs(dots), 0.0, 1.0), axis=2)
     angles = jnp.rad2deg(jnp.arccos(max_dots))
@@ -59,30 +80,55 @@ def jax_davenport_consensus(e_use, e_lab_obs, r_hyp_batch, r_theo_norm, angle_to
     return U_batch, inliers, residuals
 
 
-def align_empirical_zones(e_lab_obs, B_mat, max_uvw=10, angle_tol=1.5):
-    N_emp = len(e_lab_obs)
-    N_use = min(4, N_emp)
+def align_virtual_nodes(
+    e_nodes, 
+    e_zones, 
+    B_mat, 
+    max_hkl=2, 
+    max_uvw=10, 
+    angle_tol=1.5, 
+    hyp_batch_size=10000, 
+    eval_batch_size=5000
+):
+    N_emp_nodes = len(e_nodes)
+    N_use = min(4, N_emp_nodes)
+    N_emp_zones = len(e_zones)
     
     if N_use < 4:
-        raise ValueError("Need at least 4 empirical zone axes to lock the Tetrad orientation.")
+        raise ValueError("Need at least 4 empirical virtual nodes to lock the Tetrad orientation.")
     
-    e_use = e_lab_obs[:N_use]
+    e_use = e_nodes[:N_use]
 
-    print(f"  > Generating Theoretical Dictionary (max_uvw={max_uvw})...")
+    # --- 1. The Hash Table Dictionary (Virtual Nodes via B Matrix) ---
+    print(f"  > Generating Theoretical Nodes (max_hkl={max_hkl})...")
+    h_vals = np.arange(-max_hkl, max_hkl + 1)
+    h, k, l = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
+    hkl = np.stack([h.flatten(), k.flatten(), l.flatten()], axis=0)
+    mask_hkl = ~((hkl[0] == 0) & (hkl[1] == 0) & (hkl[2] == 0))
+    theo_hkl = hkl[:, mask_hkl].astype(np.float32).T 
+
+    r_theo_nodes = (B_mat @ theo_hkl.T).T
+    r_nodes_norm = r_theo_nodes / np.linalg.norm(r_theo_nodes, axis=1, keepdims=True)
+    N_nodes = len(r_nodes_norm)
+
+    # --- 2. The Consensus Dictionary (Zone Axes via B^-T Matrix) ---
+    print(f"  > Generating Theoretical Zones for Consensus (max_uvw={max_uvw})...")
     u_vals = np.arange(-max_uvw, max_uvw + 1)
     u, v, w = np.meshgrid(u_vals, u_vals, u_vals, indexing="ij")
-    zones = np.stack([u.flatten(), v.flatten(), w.flatten()], axis=0)
-    mask = ~((zones[0] == 0) & (zones[1] == 0) & (zones[2] == 0))
-    theo_zones = zones[:, mask].astype(np.float32).T 
+    uvw = np.stack([u.flatten(), v.flatten(), w.flatten()], axis=0)
+    mask_uvw = ~((uvw[0] == 0) & (uvw[1] == 0) & (uvw[2] == 0))
+    theo_uvw = uvw[:, mask_uvw].astype(np.float32).T 
 
     A_mat = np.linalg.inv(B_mat).T
-    r_theo = (A_mat @ theo_zones.T).T
-    r_norms = np.linalg.norm(r_theo, axis=1, keepdims=True)
-    r_theo_norm = r_theo / r_norms
+    r_theo_zones = (A_mat @ theo_uvw.T).T
+    r_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
+    N_zones = len(r_zones_norm)
 
-    # Instantly compute the angle matrix natively in CPU RAM
-    theo_dots = np.clip(np.abs(r_theo_norm @ r_theo_norm.T), 0.0, 1.0)
-    theo_angles = np.rad2deg(np.arccos(theo_dots))
+    print(f"  > Compiled {N_nodes} Hash Nodes and {N_zones} Consensus Zones. Moving to GPU...")
+
+    r_nodes_norm_j = jnp.array(r_nodes_norm, dtype=jnp.float32)
+    theo_angles_j = compute_theo_angles_jax(r_nodes_norm_j)
+    theo_angles = np.array(theo_angles_j) 
 
     emp_dots = np.clip(np.abs(e_use @ e_use.T), 0.0, 1.0)
     emp_angles = np.rad2deg(np.arccos(emp_dots))
@@ -90,27 +136,27 @@ def align_empirical_zones(e_lab_obs, B_mat, max_uvw=10, angle_tol=1.5):
     req_12, req_13, req_23 = emp_angles[0, 1], emp_angles[0, 2], emp_angles[1, 2]
     req_14, req_24, req_34 = emp_angles[0, 3], emp_angles[1, 3], emp_angles[2, 3]
 
-    print(f"  > Executing Pre-Computed Adjacency Search (tol={angle_tol} deg)...")
-    
-    # Pre-Compute 85MB Boolean Adjacency Masks (Pure NumPy C-Speed)
-    M12 = np.abs(theo_angles - req_12) < angle_tol
-    M13 = np.abs(theo_angles - req_13) < angle_tol
-    M23 = np.abs(theo_angles - req_23) < angle_tol
+    print(f"  > Executing Primitive Tetrad Search (tol={angle_tol} deg)...")
 
-    valid_a, valid_b = np.where(M12)
+    valid_a, valid_b = np.where(np.abs(theo_angles - req_12) < angle_tol)
     valid_mask = valid_a != valid_b
     valid_a, valid_b = valid_a[valid_mask], valid_b[valid_mask]
 
     a_cand_triad, b_cand_triad, c_cand_triad = [], [], []
-    chunk_size = 25000 # Safely slices 230MB chunks in RAM
     
-    for i in range(0, len(valid_a), chunk_size):
-        va = valid_a[i:i+chunk_size]
-        vb = valid_b[i:i+chunk_size]
+    for i in range(0, len(valid_a), hyp_batch_size):
+        va_chunk = valid_a[i:i+hyp_batch_size]
+        vb_chunk = valid_b[i:i+hyp_batch_size]
+        actual_size = len(va_chunk)
         
-        # Slicing pre-computed masks natively avoids all compilation overhead
-        valid_c_mask = M13[va, :] & M23[vb, :]
-        p_idx, c_idx = np.where(valid_c_mask)
+        if actual_size < hyp_batch_size:
+            va_chunk = np.pad(va_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
+            vb_chunk = np.pad(vb_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
+            
+        mask_chunk = evaluate_triad_chunk_jax(theo_angles_j, jnp.array(va_chunk), jnp.array(vb_chunk), req_13, req_23, angle_tol)
+        
+        p_idx_j, c_idx_j = jnp.where(mask_chunk[:actual_size])
+        p_idx, c_idx = np.array(p_idx_j), np.array(c_idx_j)
         
         if len(p_idx) > 0:
             global_p_idx = p_idx + i
@@ -119,31 +165,32 @@ def align_empirical_zones(e_lab_obs, B_mat, max_uvw=10, angle_tol=1.5):
             c_cand_triad.append(c_idx)
 
     if not a_cand_triad:
-        raise ValueError(f"No theoretical triads match within {angle_tol} deg.")
+        raise ValueError(f"No theoretical primitive triads match within {angle_tol} deg.")
 
     a_cand_triad = np.concatenate(a_cand_triad)
     b_cand_triad = np.concatenate(b_cand_triad)
     c_cand_triad = np.concatenate(c_cand_triad)
 
     triplet_mask = (c_cand_triad != a_cand_triad) & (c_cand_triad != b_cand_triad)
-    a_cand_triad = a_cand_triad[triplet_mask]
-    b_cand_triad = b_cand_triad[triplet_mask]
-    c_cand_triad = c_cand_triad[triplet_mask]
+    a_cand_triad, b_cand_triad, c_cand_triad = a_cand_triad[triplet_mask], b_cand_triad[triplet_mask], c_cand_triad[triplet_mask]
 
-    # Pre-Compute Tetrad Masks
-    M14 = np.abs(theo_angles - req_14) < angle_tol
-    M24 = np.abs(theo_angles - req_24) < angle_tol
-    M34 = np.abs(theo_angles - req_34) < angle_tol
-    
     a_cand_list, b_cand_list, c_cand_list, d_cand_list = [], [], [], []
-    
-    for i in range(0, len(a_cand_triad), chunk_size):
-        va = a_cand_triad[i:i+chunk_size]
-        vb = b_cand_triad[i:i+chunk_size]
-        vc = c_cand_triad[i:i+chunk_size]
+
+    for i in range(0, len(a_cand_triad), hyp_batch_size):
+        va_chunk = a_cand_triad[i:i+hyp_batch_size]
+        vb_chunk = b_cand_triad[i:i+hyp_batch_size]
+        vc_chunk = c_cand_triad[i:i+hyp_batch_size]
+        actual_size = len(va_chunk)
         
-        valid_d_mask = M14[va, :] & M24[vb, :] & M34[vc, :]
-        p_idx, d_idx = np.where(valid_d_mask)
+        if actual_size < hyp_batch_size:
+            va_chunk = np.pad(va_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
+            vb_chunk = np.pad(vb_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
+            vc_chunk = np.pad(vc_chunk, (0, hyp_batch_size - actual_size), constant_values=0)
+            
+        mask_chunk = evaluate_tetrad_chunk_jax(theo_angles_j, jnp.array(va_chunk), jnp.array(vb_chunk), jnp.array(vc_chunk), req_14, req_24, req_34, angle_tol)
+        
+        p_idx_j, d_idx_j = jnp.where(mask_chunk[:actual_size])
+        p_idx, d_idx = np.array(p_idx_j), np.array(d_idx_j)
         
         if len(p_idx) > 0:
             global_p_idx = p_idx + i
@@ -153,7 +200,7 @@ def align_empirical_zones(e_lab_obs, B_mat, max_uvw=10, angle_tol=1.5):
             d_cand_list.append(d_idx)
 
     if not a_cand_list:
-        raise ValueError(f"No theoretical tetrads match the 6 empirical angles within {angle_tol} deg.")
+        raise ValueError(f"No theoretical primitive tetrads match the 6 empirical angles within {angle_tol} deg.")
 
     a_cand = np.concatenate(a_cand_list)
     b_cand = np.concatenate(b_cand_list)
@@ -176,7 +223,8 @@ def align_empirical_zones(e_lab_obs, B_mat, max_uvw=10, angle_tol=1.5):
     sort_idx = np.argsort(max_errs)[:max_candidates]
     a_cand, b_cand, c_cand, d_cand = a_cand[sort_idx], b_cand[sort_idx], c_cand[sort_idx], d_cand[sort_idx]
     
-    r_cand = r_theo_norm[np.column_stack([a_cand, b_cand, c_cand, d_cand])]
+    # Extract the physical (x, y, z) vectors of the valid primitive nodes
+    r_cand = r_nodes_norm[np.column_stack([a_cand, b_cand, c_cand, d_cand])]
     signs = np.array(list(itertools.product([1, -1], repeat=4)))
     
     W_batch = (r_cand[:, None, :, :] * signs[None, :, :, None]).reshape(-1, 4, 3)
@@ -184,30 +232,26 @@ def align_empirical_zones(e_lab_obs, B_mat, max_uvw=10, angle_tol=1.5):
     
     print(f"  > Found {len(a_cand)} pristine geometric tetrads. Dispatching {N_hyp} U-Matrices to GPU...")
 
-    # Upload static geometry to GPU once
-    e_use_j = jnp.array(e_use, dtype=jnp.float32)
-    e_lab_obs_j = jnp.array(e_lab_obs, dtype=jnp.float32)
-    r_theo_norm_j = jnp.array(r_theo_norm, dtype=jnp.float32)
+    e_use_nodes_j = jnp.array(e_use, dtype=jnp.float32)
+    e_emp_zones_j = jnp.array(e_zones, dtype=jnp.float32)
+    r_zones_norm_j = jnp.array(r_zones_norm, dtype=jnp.float32)
 
     best_U = None
     best_inliers = -1
     best_residual = np.inf
     
-    eval_batch_size = 8000
-    
     for i in range(0, N_hyp, eval_batch_size):
         W_chunk = W_batch[i:i+eval_batch_size]
         actual_size = len(W_chunk)
         
-        # Static shape padding guarantees XLA compiles exactly ONCE.
         if actual_size < eval_batch_size:
             W_chunk = np.pad(W_chunk, ((0, eval_batch_size - actual_size), (0,0), (0,0)), constant_values=0)
             
+        # Consensus Evaluator crosses the Dual-Space domains
         U_out, inliers_out, residuals_out = jax_davenport_consensus(
-            e_use_j, e_lab_obs_j, jnp.array(W_chunk, dtype=jnp.float32), r_theo_norm_j, angle_tol
+            e_use_nodes_j, e_emp_zones_j, jnp.array(W_chunk, dtype=jnp.float32), r_zones_norm_j, angle_tol
         )
         
-        # Strip padding and evaluate
         inliers_out = np.array(inliers_out[:actual_size])
         residuals_out = np.array(residuals_out[:actual_size])
         U_out = np.array(U_out[:actual_size])
@@ -226,6 +270,6 @@ def align_empirical_zones(e_lab_obs, B_mat, max_uvw=10, angle_tol=1.5):
     if best_inliers < 4:
         raise ValueError(f"Consensus failed. Best U-matrix only explained {best_inliers} axes.")
 
-    print(f"  > Consensus Achieved! U-Matrix explains {best_inliers}/{N_emp} axes (Mean Error: {best_residual:.3f} deg)")
+    print(f"  > Consensus Achieved! U-Matrix explains {best_inliers}/{N_emp_zones} axes (Mean Error: {best_residual:.3f} deg)")
     
     return best_U

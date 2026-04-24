@@ -1476,9 +1476,36 @@ def run_sparse_hough(
     for i, (zone, weight) in enumerate(zip(empirical_zones, activation_weights)):
         print(f"    Zone {i+1}: [{zone[0]:.3f}, {zone[1]:.3f}, {zone[2]:.3f}] (Weight: {weight:.2f})")
 
-    print("\n[3/3] Eigenvalue Solution (Wahba's Problem)")
-    # The output U-matrix is now guaranteed to be the mathematically pure U_sample!
-    U0_matrix = align_empirical_zones(empirical_zones, B_mat, max_uvw=max_uvw, angle_tol=angle_tol)
+    print("\n[3/3] Eigenvalue Solution (Dual-Space Virtual Node Matching)")
+    from subhkl.search.davenport import align_virtual_nodes
+    import itertools
+
+    # Generate Virtual Nodes (Intersections of top Laue cones)
+    # We take the top 6 densest zones, which will yield 15 mathematical intersections
+    top_zones = empirical_zones[:6] 
+    e_nodes = []
+
+    for z1, z2 in itertools.combinations(top_zones, 2):
+        cross = np.cross(z1, z2)
+        norm = np.linalg.norm(cross)
+
+        # 0.05 enforces that the intersecting zones must be at least ~3 degrees apart,
+        # preventing mathematical instability from nearly parallel cones.
+        if norm > 0.05: 
+            e_nodes.append(cross / norm)
+
+    e_nodes = np.array(e_nodes)
+    print(f"  > Generated {len(e_nodes)} Virtual Nodes from the top {len(top_zones)} empirical zones.")
+
+    # The solver matches the Virtual Nodes but scores against the Empirical Zones!
+    U0_matrix = align_virtual_nodes(
+        e_nodes, 
+        empirical_zones, 
+        B_mat, 
+        max_hkl=2,        # Tiny 124-element Node Dictionary 
+        max_uvw=max_uvw,  # Massive 9,260-element Zone Dictionary for consensus scoring
+        angle_tol=angle_tol
+    )
     print("  > Macroscopic U-Matrix successfully extracted.")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
