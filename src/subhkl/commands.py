@@ -1396,7 +1396,6 @@ def run_sparse_hough(
     from subhkl.integration.api import Peaks
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
-    from subhkl.search.davenport import align_empirical_zones
 
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
 
