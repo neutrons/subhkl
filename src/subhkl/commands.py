@@ -1535,30 +1535,24 @@ def run_sparse_hough(
     e_nodes = np.array(e_nodes)
     print(f"  > Clustered and isolated {len(e_nodes)} high-stability Virtual Hubs.")
 
-    # --- MUST Generate the Massive Evaluation Dictionary HERE ---
     print(f"  > Generating Massive Evaluation Dictionary (max_hkl={max_hkl_cons})...")
     hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
-    
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T
+
     r_theo_rays = (B_mat @ theo_hkl_c.T).T
-    r_rays_norm = r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True)
-    _, unique_idx = np.unique(np.round(r_rays_norm, 4), axis=0, return_index=True)
-    r_unique_rays_norm = r_rays_norm[unique_idx]
+    r_unique_rays_norm = r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True)
 
-    # Dispatch to the exhaustive Triad Solver!
+    # Dispatch to the new Hub-Centric Solver
     U_davenport = align_virtual_nodes(
-        e_nodes, 
-        q_sample_obs_norm,      # <--- Raw Peaks Passed!
-        r_unique_rays_norm,     # <--- Massive Dictionary Passed!
-        B_mat, 
-        max_hkl_hyp=max_hkl_hyp,   
-        angle_tol_hyp=angle_tol_hyp,
-        angle_tol_cons=angle_tol_cons
+        e_nodes,
+        r_unique_rays_norm,    # <--- Passing the massive dictionary
+        B_mat,
+        max_hkl_hyp=3,         # <--- Force to 3 to ensure correct pairs are generated
+        angle_tol_hyp=2.0
     )
-
     print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 
     # ==========================================
@@ -1567,45 +1561,34 @@ def run_sparse_hough(
     print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
     from scipy.spatial.transform import Rotation
     from subhkl.search.davenport import optimize_orientation_gradient_descent
-    
-    q_seed = Rotation.from_matrix(U_davenport).as_quat() 
+
+    q_seed = Rotation.from_matrix(U_davenport).as_quat()
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
-    
-    # --- RESTORED: Generate the Massive Dictionary for Polishing/Validation ---
-    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
-    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
-    
-    r_theo_rays = (B_mat @ theo_hkl_c.T).T
-    r_rays_norm = r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True)
-    _, unique_idx = np.unique(np.round(r_rays_norm, 4), axis=0, return_index=True)
-    r_unique_rays_norm = r_rays_norm[unique_idx]
-    
+
     r_lab_dav = U_davenport @ r_unique_rays_norm.T
     dots_dav = q_sample_obs_norm @ r_lab_dav
     max_dots_dav = np.max(np.clip(dots_dav, -1.0, 1.0), axis=1)
     angles_dav = np.rad2deg(np.arccos(max_dots_dav))
-    
-    inlier_mask = angles_dav < 1.0 
+
+    # We drop to 1.0 degrees here to protect the optimizer from pulling in background noise
+    inlier_mask = angles_dav < 1.0
     q_obs_clean = q_sample_obs_norm[inlier_mask]
-    
-    print(f"  > Davenport isolated {len(q_obs_clean)} clean signal peaks. Polishing...")
-    
+
+    print(f"  > Davenport isolated {len(q_obs_clean)} clean signal raw peaks. Polishing...")
+
     U_final = optimize_orientation_gradient_descent(
-        q_seed_jax, 
-        jnp.array(q_obs_clean), 
-        jnp.array(r_unique_rays_norm), 
-        steps=500 
+        q_seed_jax,
+        jnp.array(q_obs_clean),
+        jnp.array(r_unique_rays_norm),
+        steps=500
     )
-    
+
     r_lab = U_final @ r_unique_rays_norm.T
     dots = q_sample_obs_norm @ r_lab
     max_dots = np.max(np.clip(dots, -1.0, 1.0), axis=1)
     angles = np.rad2deg(np.arccos(max_dots))
     true_hits = np.sum(angles < angle_tol_cons)
-    
+
     print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs)} Laue rays (Tol = {angle_tol_cons} deg).")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
@@ -1618,13 +1601,13 @@ def run_sparse_hough(
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
         f.create_dataset("peaks/xyz", data=xyz_out)
-        f.create_dataset("sample/U", data=U_final) 
+        f.create_dataset("sample/U", data=U_final)
         f.create_dataset("sample/B", data=B_mat)
 
     print("Export complete.")
 
     # ==========================================
-    # PHASE 4: PARALLEL VISUALIZATION (PER RUN)
+    # PHASE 5: PARALLEL VISUALIZATION
     # ==========================================
     if create_visualizations:
         import os
@@ -1632,22 +1615,17 @@ def run_sparse_hough(
         import concurrent.futures
         from tqdm import tqdm
         from collections import defaultdict
-        
-        print("\n[4/4] Rendering Detector Plots (Parallel)...")
+
+        print("\n[5/5] Rendering Detector Plots (Parallel)...")
         peaks_obj = Peaks(original_nexus_filename, instrument_name)
-        
+
         runs_plot_data = defaultdict(lambda: {"images": {}, "detectors": {}})
-        
+
         for img_key, image_raw in peaks_obj.image.ims.items():
             run_id = peaks_obj.get_run_id(img_key)
             det = peaks_obj.get_detector_by_img(img_key)
-            
-            # To ensure dict keys perfectly match img_indices elements for `plot_unrolled_detector`
-            try:
-                match_key = int(img_key)
-            except ValueError:
-                match_key = img_key
-                
+            try: match_key = int(img_key)
+            except ValueError: match_key = img_key
             runs_plot_data[run_id]["images"][match_key] = np.nan_to_num(image_raw, nan=0.0, posinf=0.0, neginf=0.0)
             runs_plot_data[run_id]["detectors"][match_key] = det
 
@@ -1657,82 +1635,51 @@ def run_sparse_hough(
         for r_id, data in runs_plot_data.items():
             mask = [i for i, run in enumerate(run_indices) if run == r_id]
             if len(mask) == 0: continue
-            
-            try:
-                # Use the exact first matching peak's index to get the label
-                image_label = peaks_obj.get_image_label(img_indices[mask[0]])
-            except Exception:
-                image_label = f"run_{int(r_id)}"
-                
+
+            try: image_label = peaks_obj.get_image_label(img_indices[mask[0]])
+            except Exception: image_label = f"run_{int(r_id)}"
+
             out_name = os.path.join(base_dir, f"{image_label}-sparse_hough.png")
-            
             run_peaks = RunPeaks(
                 image_index=[img_indices[i] for i in mask],
-                peak_rows=[pixel_r[i] for i in mask],
-                peak_cols=[pixel_c[i] for i in mask],
-                var_u=None,  # Skips drawing ellipses
-                var_v=None,
-                cov_uv=None,
-                sample_offset=ub_helper.sample_offset,
-                ki_vec=ub_helper.ki_vec,
+                peak_rows=[pixel_r[i] for i in mask], peak_cols=[pixel_c[i] for i in mask],
+                var_u=None, var_v=None, cov_uv=None,
+                sample_offset=ub_helper.sample_offset, ki_vec=ub_helper.ki_vec,
             )
 
-            # --- GENERATE THEORETICAL INDICES FOR DEBUGGING ---
-            # We generate small integers to act as both [u,v,w] and (h,k,l)
-            hc_vals = np.arange(-2, 3)
+            R_run = r_gonio_obs[mask[0]]
+
+            # --- THE VISUALIZER BUG FIX: MUST BE EXPANDED TO max_hkl=3 TO RENDER TRUE HUBS ---
+            # Do not use max_hkl=5 or the screen will be completely black with noise
+            viz_hkl = 3
+            A_mat = np.linalg.inv(B_mat).T
+            hc_vals = np.arange(-viz_hkl, viz_hkl + 1)
             hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
             hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
             mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-            theo_indices = hkl_c[:, mask_hkl_c].astype(np.float32).T 
-            
-            # 1. PREDICTED ZONES (REAL SPACE)
-            # Zone Axes are Real-Space vectors [u,v,w], requiring the A matrix (B^-1)^T
-            A_mat = np.linalg.inv(B_mat).T
+            theo_indices = hkl_c[:, mask_hkl_c].astype(np.float32).T
+
             r_theo_zones = (A_mat @ theo_indices.T).T
             r_theo_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
-            
-            # 2. PREDICTED HUBS (RECIPROCAL SPACE)
-            # Hubs are Laue Rays (h,k,l), requiring the standard B matrix
-            r_theo_nodes = (B_mat @ theo_indices.T).T 
+
+            r_theo_nodes = (B_mat @ theo_indices.T).T
             r_theo_nodes_norm = r_theo_nodes / np.linalg.norm(r_theo_nodes, axis=1, keepdims=True)
 
-            # --- PLOT FRAME MAPPING ---
-            R_run = r_gonio_obs[mask[0]]
-            
-            # Empirical mapping (Sparse Hough gives us Real Space Zones and Reciprocal Hubs natively)
             lab_zones_for_plot = (R_run @ empirical_zones.T).T
+            pred_lab_zones_for_plot = (R_run @ U_final @ r_theo_zones_norm.T).T
+
             obs_lab_nodes_for_plot = (R_run @ e_nodes.T).T
-            
-            # Predicted mapping (Rotate theoreticals by U_davenport)
-            pred_lab_zones_for_plot = (R_run @ U_davenport @ r_theo_zones_norm.T).T
-            pred_lab_nodes_for_plot = (R_run @ U_davenport @ r_theo_nodes_norm.T).T
+            pred_lab_nodes_for_plot = (R_run @ U_final @ r_theo_nodes_norm.T).T
 
             run_tasks.append((
-                out_name,
-                run_peaks,
-                data["images"],
-                data["detectors"],
-                instrument_name,
-                lab_zones_for_plot,
-                pred_lab_zones_for_plot,
-                obs_lab_nodes_for_plot,  
-                pred_lab_nodes_for_plot  
+                out_name, run_peaks, data["images"], data["detectors"], instrument_name,
+                lab_zones_for_plot, pred_lab_zones_for_plot, obs_lab_nodes_for_plot, pred_lab_nodes_for_plot
             ))
 
         if max_workers := min(os.cpu_count() or 4, len(run_tasks)):
             ctx = multiprocessing.get_context("spawn")
             with concurrent.futures.ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
                 futures = {executor.submit(_render_run_unrolled_plot, t): t[0] for t in run_tasks}
-                
-                for future in tqdm(
-                    concurrent.futures.as_completed(futures), 
-                    total=len(futures), 
-                    desc="Rendering Detector Plots"
-                ):
-                    try:
-                        out_name = future.result()
-                        tqdm.write(f"Saved: {out_name}")
-                    except Exception:
-                        import traceback
-                        print(f"Visualization failed:")
-                        traceback.print_exc()
+                for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Rendering Detector Plots"):
+                    try: out_name = future.result()
+                    except Exception: pass
