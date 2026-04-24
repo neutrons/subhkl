@@ -103,7 +103,7 @@ def align_virtual_nodes(
     best_residual = np.inf
     
     e_nodes_j = jnp.array(e_nodes, dtype=jnp.float32)
-    e_weights_j = jnp.array(e_weights, dtype=jnp.float32)[:, None] 
+    e_weights_j = jnp.array(e_weights, dtype=jnp.float32)
     r_eval_j = jnp.array(r_eval_rays_norm, dtype=jnp.float32) 
     
     search_tol = 1.5 
