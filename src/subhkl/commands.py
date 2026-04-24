@@ -1653,26 +1653,27 @@ def run_sparse_hough(
 
             R_run = r_gonio_obs[mask[0]]
 
-            viz_hkl = 1 # adjust to plot more zone axes
+            # --- ZONE AXES (Dashed Lines): Keep viz_hkl low to prevent CPU melting! ---
+            viz_hkl = 1 
             A_mat = np.linalg.inv(B_mat).T
             hc_vals = np.arange(-viz_hkl, viz_hkl + 1)
             hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
             hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
             mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-            theo_indices = hkl_c[:, mask_hkl_c].astype(np.float32).T
-
+            theo_indices = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+            
             r_theo_zones = (A_mat @ theo_indices.T).T
             r_theo_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
 
-            r_theo_nodes = (B_mat @ theo_indices.T).T
-            r_theo_nodes_norm = r_theo_nodes / np.linalg.norm(r_theo_nodes, axis=1, keepdims=True)
-
             lab_zones_for_plot = (R_run @ empirical_zones.T).T
             pred_lab_zones_for_plot = (R_run @ U_final @ r_theo_zones_norm.T).T
-
+            
+            # --- VIRTUAL HUBS (Crosses): Use the MASSIVE Dictionary so we see the true matches! ---
             obs_lab_nodes_for_plot = (R_run @ e_nodes.T).T
-            pred_lab_nodes_for_plot = (R_run @ U_final @ r_theo_nodes_norm.T).T
-
+            
+            # THE FIX: Feed the full 1,154 theoretical Laue rays to the cross generator
+            pred_lab_nodes_for_plot = (R_run @ U_final @ r_unique_rays_norm.T).T
+            
             run_tasks.append((
                 out_name, run_peaks, data["images"], data["detectors"], instrument_name,
                 lab_zones_for_plot, pred_lab_zones_for_plot, obs_lab_nodes_for_plot, pred_lab_nodes_for_plot
