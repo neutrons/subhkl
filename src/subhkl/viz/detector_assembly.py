@@ -10,6 +10,8 @@ def plot_unrolled_detector(
     finder_peaks=None,
     zone_axes=None,
     predicted_zone_axes=None,
+    observed_nodes=None,
+    predicted_nodes=None,
     out_name="unrolled_detector_peaks.png",
     instrument=None,
 ):
@@ -355,6 +357,49 @@ def plot_unrolled_detector(
                     ax_dummy.clear()
 
         plt.close(fig_dummy)
+
+    # ==========================================
+    # PLOTTING VIRTUAL HUBS (NODAL POINTS)
+    # ==========================================
+    def add_nodes_to_plot(nodes, marker, facecolor, edgecolor, label, size, zorder):
+        if nodes is None or len(nodes) == 0: 
+            return
+            
+        n_rotys, n_Ys = [], []
+        for v in nodes:
+            v = v / np.linalg.norm(v)
+            X, Y, Z = v[0], v[1], v[2]
+            
+            # Map unit vector direction to cylindrical projection
+            roty = np.rad2deg(np.arctan2(X, Z))
+            if len(wrapped_panels) > 0 and roty < 0:
+                roty += 360
+            
+            # Scale the Y component out to the physical detector radius
+            r_xz = np.sqrt(X**2 + Z**2)
+            if r_xz > 1e-6:
+                scaled_Y = Y * (mean_radius / r_xz)
+            else:
+                scaled_Y = 0.0 # Pointing straight up/down the cylinder axis
+            
+            n_rotys.append(roty)
+            n_Ys.append(scaled_Y)
+            
+        ax.scatter(
+            compress_roty(np.array(n_rotys)), 
+            np.array(n_Ys),
+            marker=marker, 
+            facecolors=facecolor, 
+            edgecolors=edgecolor,
+            s=size, 
+            linewidths=1.0, 
+            label=label, 
+            zorder=zorder
+        )
+
+    # Plot the Hubs on top of everything else
+    add_nodes_to_plot(observed_nodes, marker='D', facecolor='cyan', edgecolor='black', label='Observed Hubs', size=60, zorder=6)
+    add_nodes_to_plot(predicted_nodes, marker='X', facecolor='magenta', edgecolor='white', label='Predicted Hubs', size=80, zorder=7)
 
     # ==========================================
     # FORMATTING & GAPS VISUALIZATION

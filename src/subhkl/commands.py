@@ -1355,12 +1355,11 @@ def run_merge_images(
 
 def _render_run_unrolled_plot(args):
     """Standalone plotting function for generating unrolled plots per run."""
-    out_name, peaks, images, detectors, instrument, zone_axes, pred_zone_axes = args
+    out_name, peaks, images, detectors, instrument, zone_axes, pred_zone_axes, obs_nodes, pred_nodes = args
 
     import matplotlib.pyplot as plt
     from subhkl.viz.detector_assembly import plot_unrolled_detector
 
-    # Force non-interactive backend for thread safety
     if plt.get_backend().lower() != "agg":
         plt.switch_backend("Agg")
 
@@ -1370,6 +1369,8 @@ def _render_run_unrolled_plot(args):
         detectors,
         zone_axes=zone_axes,
         predicted_zone_axes=pred_zone_axes,
+        observed_nodes=obs_nodes,
+        predicted_nodes=pred_nodes,
         out_name=out_name,
         instrument=instrument
     )
@@ -1679,7 +1680,6 @@ def run_sparse_hough(
             lab_zones_for_plot = (R_run @ empirical_zones.T).T
 
             # --- GENERATE PREDICTED ZONES FOR DEBUGGING ---
-            # Create a small subset of major predicted zone axes (e.g. max_hkl=2)
             hc_vals = np.arange(-2, 3)
             hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
             hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
@@ -1689,8 +1689,19 @@ def run_sparse_hough(
             r_theo_zones = (B_mat @ theo_hkl_zones.T).T
             r_theo_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
             
-            # Map theoretical zones back to the lab frame using U_davenport (or U_final)
+            # --- GENERATE THEORETICAL NODES FOR DEBUGGING ---
+            # Using max_hkl=2 since that is what Davenport aligns against
+            r_theo_nodes = (B_mat @ theo_hkl_zones.T).T 
+            r_theo_nodes_norm = r_theo_nodes / np.linalg.norm(r_theo_nodes, axis=1, keepdims=True)
+
+            # --- PLOT FRAME MAPPING ---
+            R_run = r_gonio_obs[mask[0]]
+            lab_zones_for_plot = (R_run @ empirical_zones.T).T
             pred_lab_zones_for_plot = (R_run @ U_davenport @ r_theo_zones_norm.T).T
+            
+            # Map the nodal points to Lab Frame
+            obs_lab_nodes_for_plot = (R_run @ e_nodes.T).T
+            pred_lab_nodes_for_plot = (R_run @ U_davenport @ r_theo_nodes_norm.T).T
 
             run_tasks.append((
                 out_name,
@@ -1699,7 +1710,9 @@ def run_sparse_hough(
                 data["detectors"],
                 instrument_name,
                 lab_zones_for_plot,
-                pred_lab_zones_for_plot
+                pred_lab_zones_for_plot,
+                obs_lab_nodes_for_plot,
+                pred_lab_nodes_for_plot
             ))
 
         if max_workers := min(os.cpu_count() or 4, len(run_tasks)):
