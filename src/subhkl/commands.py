@@ -1477,51 +1477,64 @@ def run_sparse_hough(
     print("\n[3/3] Eigenvalue Solution (Dual-Space Virtual Node Matching)")
     from subhkl.search.davenport import align_virtual_nodes
     import itertools
+    from scipy.spatial import ConvexHull, cKDTree
     
-    # 1. Generate all possible intersections from the extracted zones
+    # 1. Generate Virtual Nodes (Intersections)
     raw_nodes = []
     for z1, z2 in itertools.combinations(empirical_zones, 2):
         cross = np.cross(z1, z2)
         norm = np.linalg.norm(cross)
-        if norm > 0.05: 
+        if norm > 0.05:  # Reject dead-center core noise
             raw_nodes.append(cross / norm)
             
-    # 2. Cluster the intersections to find the Topological Hubs
-    merged_nodes = []
-    node_weights = []
-    for n in raw_nodes:
-        is_new = True
-        for i, mn in enumerate(merged_nodes):
-            if np.abs(np.dot(n, mn)) > np.cos(np.deg2rad(1.5)):
-                node_weights[i] += 1
-                is_new = False
-                break
-        if is_new:
-            merged_nodes.append(n)
-            node_weights.append(1)
+    raw_nodes = np.array(raw_nodes)
+    
+    # 2. Symmetrize to create a closed spherical point cloud
+    sym_nodes = np.vstack([raw_nodes, -raw_nodes])
             
-    merged_nodes = np.array(merged_nodes)
-    node_weights = np.array(node_weights)
+    # 3. Initial spatial deduplication (Qhull crashes on perfectly overlapping points)
+    tree = cKDTree(sym_nodes)
+    pairs = tree.query_pairs(r=0.01) # ~0.5 degree distance
+    keep = np.ones(len(sym_nodes), dtype=bool)
+    for i, j in pairs:
+        if keep[i]: 
+            keep[j] = False
+    unique_nodes = sym_nodes[keep]
     
-    order = np.argsort(node_weights)[::-1]
-    e_nodes = merged_nodes[order][:8] 
+    print(f"  > Wrapping {len(unique_nodes)} unique intersections in a Convex Hull...")
     
-    print(f"  > Distilled {len(raw_nodes)} raw intersections into {len(e_nodes)} fundamental Virtual Nodes.")
+    # 4. Compute the Spherical Convex Hull
+    hull = ConvexHull(unique_nodes)
+    
+    # 5. The Sliver Filter: Score vertices by the total area of their connected faces
+    vertex_scores = np.zeros(len(unique_nodes))
+    for simplex in hull.simplices:
+        # simplex contains the 3 indices of the vertices making up the triangular face
+        a, b, c = unique_nodes[simplex]
+        # Area of a 3D triangle = 0.5 * || (b-a) x (c-a) ||
+        face_area = 0.5 * np.linalg.norm(np.cross(b - a, c - a))
+        vertex_scores[simplex] += face_area
+        
+    # 6. Extract the fundamental Hubs (Top 8 vertices by structural area)
+    order = np.argsort(vertex_scores)[::-1]
+    e_nodes = unique_nodes[order][:8]
+    
+    print(f"  > Convex Hull filter isolated {len(e_nodes)} pristine Virtual Hubs.")
 
-    # 3. NORMALIZE RAW PEAKS - Critical to prevent JAX dot product explosions!
+    # 7. Normalize raw peaks to prevent JAX dot product explosions
     q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
 
-    # 4. The solver matches the Hubs but scores against the RAW EMPIRICAL PEAKS!
+    # 8. Dispatch to Davenport Solver
     U0_matrix = align_virtual_nodes(
         e_nodes, 
         q_sample_obs_norm, 
         B_mat, 
-        max_hkl_hyp=2,        # 124 Nodes for fast hypothesis generation
-        max_hkl_cons=5,       # 1330 Peaks for rigorous validation
-        angle_tol_hyp=angle_tol,
-        angle_tol_cons=1.0    # 1.0 degree strict peak matching
+        max_hkl_hyp=max_hkl_hyp,       
+        max_hkl_cons=max_hkl_cons,      
+        angle_tol_hyp=angle_tol_hyp,
+        angle_tol_cons=angle_tol_cons    
     )
-    print("  > Macroscopic U-Matrix successfully extracted.") 
+    print("  > Macroscopic U-Matrix successfully extracted.")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
