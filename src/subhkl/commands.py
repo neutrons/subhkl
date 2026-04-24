@@ -1462,8 +1462,7 @@ def run_sparse_hough(
 
     # --- THE SAMPLE FRAME MAPPING ---
     print("  > Mapping peaks from Lab Frame to Sample Frame via R^T...")
-    # Fast vectorized application of R^T using einsum ('nji' transposes the last two axes of the 3D matrix array)
-    q_sample_obs = np.einsum('nji,ni->nj', r_gonio_obs, q_lab_obs)
+    q_sample_obs = np.einsum('nij,ni->nj', r_gonio_obs, q_lab_obs)
 
     print("\n[2/3] Sparse Basis Pursuit (Density-Driven Set Cover)")
     indexer = SparseHoughIndexer(tolerance_deg=tolerance_deg)
