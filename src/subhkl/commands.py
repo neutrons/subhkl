@@ -1487,89 +1487,62 @@ def run_sparse_hough(
     for z1, z2 in itertools.combinations(empirical_zones, 2):
         cross = np.cross(z1, z2)
         norm = np.linalg.norm(cross)
-        if norm > 0.05:  # Reject dead-center core noise
+        if norm > 0.05: 
             raw_nodes.append(cross / norm)
             
     raw_nodes = np.array(raw_nodes)
-    
-    # 2. Symmetrize to create a closed spherical point cloud
     sym_nodes = np.vstack([raw_nodes, -raw_nodes])
             
-    # 3. Initial spatial deduplication (Qhull crashes on perfectly overlapping points)
     tree = cKDTree(sym_nodes)
-    pairs = tree.query_pairs(r=0.01) # ~0.5 degree distance
+    pairs = tree.query_pairs(r=0.01) 
     keep = np.ones(len(sym_nodes), dtype=bool)
     for i, j in pairs:
-        if keep[i]: 
-            keep[j] = False
+        if keep[i]: keep[j] = False
     unique_nodes = sym_nodes[keep]
     
     print(f"  > Wrapping {len(unique_nodes)} unique intersections in a Convex Hull...")
-    
-    # 4. Compute the Spherical Convex Hull
     hull = ConvexHull(unique_nodes)
     
-    # 5. The Sliver Filter: Score vertices by the total area of their connected faces
     vertex_scores = np.zeros(len(unique_nodes))
     for simplex in hull.simplices:
-        # simplex contains the 3 indices of the vertices making up the triangular face
         a, b, c = unique_nodes[simplex]
-        # Area of a 3D triangle = 0.5 * || (b-a) x (c-a) ||
         face_area = 0.5 * np.linalg.norm(np.cross(b - a, c - a))
         vertex_scores[simplex] += face_area
         
-    # 6. Extract the fundamental Hubs (Top 8 vertices by structural area)
     order = np.argsort(vertex_scores)[::-1]
     e_nodes = unique_nodes[order][:8]
-    
     print(f"  > Convex Hull filter isolated {len(e_nodes)} pristine Virtual Hubs.")
 
-    # 7. Normalize raw peaks to prevent JAX dot product explosions
-    q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
-
-    # 8. Dispatch to Davenport Solver (Global Valley Selection)
+    # Davenport strictly uses the RAW Unnormalized Peaks (True 1/d spacing)
     U_davenport = align_virtual_nodes(
         e_nodes, 
-        q_sample_obs_norm, 
+        q_sample_obs,  # Unnormalized!
         B_mat, 
         max_hkl_hyp=max_hkl_hyp,       
-        max_hkl_cons=max_hkl_cons,      
         angle_tol_hyp=angle_tol_hyp,
-        angle_tol_cons=angle_tol_cons    
+        frac_tol_cons=0.15 # Strict fractional limit
     )
     
-    print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
+    print("\n[4/4] Continuous Fractional Polish (Gradient Descent)")
     from scipy.spatial.transform import Rotation
     from subhkl.search.davenport import optimize_orientation_gradient_descent
-    import jax.numpy as jnp
     
-    # 1. Convert the Davenport U-Matrix into the initial Quaternion Seed
-    q_seed = Rotation.from_matrix(U_davenport).as_quat() # Format: [x, y, z, w]
-    # JAX expects [w, x, y, z], so we roll it
+    q_seed = Rotation.from_matrix(U_davenport).as_quat() 
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
+    B_inv_j = jnp.array(np.linalg.inv(B_mat), dtype=jnp.float32)
     
-    # 2. Generate the Theoretical Nodes for the Voronoi Cells
-    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
-    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
-    r_theo_peaks = (B_mat @ theo_hkl_c.T).T
-    r_theo_norm = r_theo_peaks / np.linalg.norm(r_theo_peaks, axis=1, keepdims=True)
-    
-    # 3. Unleash Gradient Descent!
+    # Unleash Gradient Descent!
     U_final = optimize_orientation_gradient_descent(
         q_seed_jax, 
-        jnp.array(q_sample_obs_norm), 
-        jnp.array(r_theo_norm), 
-        steps=200
+        jnp.array(q_sample_obs), # Unnormalized!
+        B_inv_j, 
+        steps=300
     )
     
-    # 4. Ultimate Fractional Validation (The True Bragg Constraint)
+    # Ultimate Fractional Validation
     h_calc = np.linalg.inv(B_mat) @ U_final.T @ q_sample_obs.T
     fractional_error = np.abs(np.round(h_calc) - h_calc)
     
-    # If the maximum deviation from an integer is less than 0.15, the peak is a true hit
     true_hits = np.sum(np.max(fractional_error, axis=0) < 0.15)
     
     print(f"  > Final Matrix perfectly indexed {true_hits}/{len(q_sample_obs)} physical Bragg Peaks.")
