@@ -608,8 +608,8 @@ def sparse_hough_cmd(
     max_hkl_cons: int = typer.Option(
         5, help="Max HKL for the Global Peak Consensus validation dictionary."
     ),
-    max_uvw: int = typer.Option(
-        10, help="Max UVW for generating theoretical Zone Axes."
+    steps: int = typer.Option(
+        300, help="Maximum number of steps for the optimization",
     ),
     create_visualizations: bool = typer.Option(
         False, "--create-visualizations", help="Generate unrolled detector plots."
@@ -631,7 +631,7 @@ def sparse_hough_cmd(
         max_axes=max_axes,
         max_hkl_hyp=max_hkl_hyp,
         max_hkl_cons=max_hkl_cons,
-        max_uvw=max_uvw,
+        steps=steps,
         create_visualizations=create_visualizations,
     )
 

@@ -1392,7 +1392,7 @@ def run_sparse_hough(
     max_axes: int = 15,
     max_hkl_hyp: int = 3,
     max_hkl_cons: int = 6,
-    max_uvw: int = 10,
+    steps: int = 300,
     create_visualizations: bool = False,
 ):
     from subhkl.optimization import FindUB
@@ -1551,7 +1551,7 @@ def run_sparse_hough(
         q_seed_jax, 
         jnp.array(q_sample_obs_norm), 
         jnp.array(r_unique_rays_norm), 
-        steps=300
+        steps=steps
     )
     
     # Ultimate Angular Validation
