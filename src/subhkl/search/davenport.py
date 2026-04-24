@@ -75,8 +75,8 @@ def jax_davenport_consensus(e_use_nodes, q_sample_obs_norm, r_hyp_nodes_batch, r
     max_dots = jnp.max(jnp.clip(dots, -1.0, 1.0), axis=2) 
     angles = jnp.rad2deg(jnp.arccos(max_dots))
     
-    # axis=0 sums across N_peaks, returning a score array of shape (Batch,)
-    inliers = jnp.sum(angles < angle_tol_cons, axis=0)
+    # axis=0 sums across N_peaks
+    inliers = jnp.sum(angles < angle_tol_cons, axis=1)
     residuals = jnp.sum(jnp.where(angles < angle_tol_cons, angles, 0.0), axis=0) / jnp.maximum(inliers, 1)
     
     return U_batch, inliers, residuals
