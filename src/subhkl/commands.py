@@ -1600,7 +1600,7 @@ def run_sparse_hough(
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
         f.create_dataset("peaks/xyz", data=xyz_out)
-        f.create_dataset("sample/U", data=U0_matrix) # This is now officially U_sample
+        f.create_dataset("sample/U", data=U_final) # This is now officially U_sample
         f.create_dataset("sample/B", data=B_mat)
 
     print("Export complete. File is ready for discrete Laue polishing.")
