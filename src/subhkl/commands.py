@@ -1386,9 +1386,12 @@ def run_sparse_hough(
     instrument_name: str | None = None,
     original_nexus_filename: str | None = None,
     tolerance_deg: float = 0.15,
-    angle_tol: float = 1.5,
+    angle_tol_hyp: float = 1.5,
+    angle_tol_cons: float = 0.4,
     max_axes: int = 15,
-    max_uvw: int = 1,
+    max_hkl_hyp: int = 3,
+    max_hkl_cons: int = 6,
+    max_uvw: int = 10,
     create_visualizations: bool = False,
 ):
     from subhkl.optimization import FindUB
@@ -1397,7 +1400,7 @@ def run_sparse_hough(
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
 
-    print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
+    print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
 
     ub_helper = FindUB()
     with h5py.File(finder_file, "r") as f:
@@ -1464,7 +1467,7 @@ def run_sparse_hough(
     print("  > Mapping peaks from Lab Frame to Sample Frame via R^T...")
     q_sample_obs = np.einsum('nij,ni->nj', r_gonio_obs, q_lab_obs)
 
-    print("\n[2/3] Sparse Basis Pursuit (Density-Driven Set Cover)")
+    print("\n[2/4] Sparse Basis Pursuit (Density-Driven Set Cover)")
     indexer = SparseHoughIndexer(tolerance_deg=tolerance_deg)
     
     # We now feed the stationary, integrated sample-frame peaks to the indexer
@@ -1474,7 +1477,7 @@ def run_sparse_hough(
     for i, (zone, weight) in enumerate(zip(empirical_zones, activation_weights)):
         print(f"    Zone {i+1}: [{zone[0]:.3f}, {zone[1]:.3f}, {zone[2]:.3f}] (Weight: {weight:.2f})")
 
-    print("\n[3/3] Eigenvalue Solution (Dual-Space Virtual Node Matching)")
+    print("\n[3/4] Global Combinatorial Search (Davenport)")
     from subhkl.search.davenport import align_virtual_nodes
     import itertools
     from scipy.spatial import ConvexHull, cKDTree
@@ -1524,8 +1527,8 @@ def run_sparse_hough(
     # 7. Normalize raw peaks to prevent JAX dot product explosions
     q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
 
-    # 8. Dispatch to Davenport Solver
-    U0_matrix = align_virtual_nodes(
+    # 8. Dispatch to Davenport Solver (Global Valley Selection)
+    U_davenport = align_virtual_nodes(
         e_nodes, 
         q_sample_obs_norm, 
         B_mat, 
@@ -1534,7 +1537,57 @@ def run_sparse_hough(
         angle_tol_hyp=angle_tol_hyp,
         angle_tol_cons=angle_tol_cons    
     )
+    
+    print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
+    from scipy.spatial.transform import Rotation
+    from subhkl.search.davenport import optimize_orientation_gradient_descent
+    
+    # 1. Convert the Davenport U-Matrix into the initial Quaternion Seed
+    q_seed = Rotation.from_matrix(U_davenport).as_quat() # Format: [x, y, z, w]
+    # JAX expects [w, x, y, z], so we roll it
+    q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
+    
+    # 2. Generate the Theoretical Nodes for the Voronoi Cells
+    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
+    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+    r_theo_peaks = (B_mat @ theo_hkl_c.T).T
+    r_theo_norm = r_theo_peaks / np.linalg.norm(r_theo_peaks, axis=1, keepdims=True)
+    
+    # 3. Unleash Gradient Descent!
+    U_final = optimize_orientation_gradient_descent(
+        q_seed_jax, 
+        jnp.array(q_sample_obs_norm), 
+        jnp.array(r_theo_norm), 
+        steps=200
+    )
+    
+    # 4. Ultimate Fractional Validation (The True Bragg Constraint)
+    h_calc = np.linalg.inv(B_mat) @ U_final.T @ q_sample_obs.T
+    fractional_error = np.abs(np.round(h_calc) - h_calc)
+    
+    # If the maximum deviation from an integer is less than 0.15, the peak is a true hit
+    true_hits = np.sum(np.max(fractional_error, axis=0) < 0.15)
+    
+    print(f"  > Final Matrix perfectly indexed {true_hits}/{len(q_sample_obs)} physical Bragg Peaks.")
     print("  > Macroscopic U-Matrix successfully extracted.")
+
+    print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
+    with h5py.File(output_h5_filename, "w") as f:
+        with h5py.File(finder_file, "r") as f_in:
+            for key in ["sample/a", "sample/b", "sample/c", "sample/alpha", "sample/beta", "sample/gamma",
+                        "sample/space_group", "sample/offset", "instrument/wavelength", "beam/ki_vec",
+                        "peaks/run_index", "peaks/image_index", "bank", "bank_ids", "peaks/pixel_r", "peaks/pixel_c",
+                        "goniometer/R", "goniometer/axes", "goniometer/angles", "goniometer/names"]:
+                if key in f_in:
+                    f.create_dataset(key, data=f_in[key][()])
+        f.create_dataset("peaks/xyz", data=xyz_out)
+        f.create_dataset("sample/U", data=U_final) # This is now officially U_sample
+        f.create_dataset("sample/B", data=B_mat)
+
+    print("Export complete. File is ready for discrete Laue polishing.")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:

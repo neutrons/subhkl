@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 from jax import jit
 from scipy.spatial.transform import Rotation
+import optax
 
 @jit
 def compute_theo_angles_jax(r_theo_norm_j):
@@ -266,3 +267,71 @@ def align_virtual_nodes(
     print(f"  > Consensus Achieved! U-Matrix mathematically perfectly explains {best_inliers}/{N_emp_peaks} raw peaks (Mean Error: {best_residual:.3f} deg)")
     
     return best_U
+
+@jit
+def quaternion_to_rotation_matrix(q):
+    """Converts a quaternion [w, x, y, z] to a 3x3 Rotation Matrix."""
+    q = q / jnp.linalg.norm(q) # Enforce unit quaternion
+    w, x, y, z = q[0], q[1], q[2], q[3]
+
+    return jnp.array([
+        [1 - 2*(y**2 + z**2),   2*(x*y - z*w),       2*(x*z + y*w)],
+        [2*(x*y + z*w),         1 - 2*(x**2 + z**2), 2*(y*z - x*w)],
+        [2*(x*z - y*w),         2*(y*z + x*w),       1 - 2*(x**2 + y**2)]
+    ])
+
+@jit
+def voronoi_loss(q, q_obs_norm, r_theo_norm, temperature=0.01):
+    """
+    The Continuous Spherical Voronoi Objective Function.
+    Evaluates the total topological error of the quaternion q.
+    """
+    U = quaternion_to_rotation_matrix(q)
+
+    # Map theoretical nodes to the lab frame: (N_theo, 3)
+    r_lab = jnp.matmul(r_theo_norm, U.T)
+
+    # Compute all pairwise dot products (cosine similarities)
+    # Shape: (N_obs, N_theo)
+    sim_matrix = jnp.matmul(q_obs_norm, r_lab.T)
+
+    # Apply LogSumExp to smoothly approximate the distance to the Nearest Neighbor
+    # This melts the Voronoi boundaries, allowing gradients to flow everywhere.
+    soft_max_sims = temperature * jax.scipy.special.logsumexp(sim_matrix / temperature, axis=1)
+
+    # We want to MAXIMIZE similarity, so the loss is the NEGATIVE sum
+    return -jnp.sum(soft_max_sims)
+
+
+def optimize_orientation_gradient_descent(q_init, q_obs_norm, r_theo_norm, steps=500):
+    """
+    Minimizes the Voronoi Loss using Adam (Gradient Descent).
+    """
+    # 1. Initialize optimizer (Adam is excellent for smooth gradient fields)
+    optimizer = optax.adam(learning_rate=0.05)
+    opt_state = optimizer.init(q_init)
+
+    # 2. Compile the gradient function
+    # value_and_grad returns both the Loss value and dLoss/dq
+    loss_fn = jax.jit(jax.value_and_grad(voronoi_loss))
+
+    q_current = q_init
+
+    print("  > Launching Continuous Voronoi Gradient Descent...")
+
+    # 3. The Optimization Loop (compiles down to native GPU loop via lax.fori_loop if desired)
+    for step in range(steps):
+        loss_val, grads = loss_fn(q_current, q_obs_norm, r_theo_norm, temperature=0.02)
+
+        # Apply gradients to update the quaternion
+        updates, opt_state = optimizer.update(grads, opt_state)
+        q_current = optax.apply_updates(q_current, updates)
+
+        if step % 100 == 0:
+            print(f"    Step {step:03d} | Voronoi Loss: {loss_val:.3f}")
+
+    # Normalize final quaternion and extract exact U-Matrix
+    q_final = q_current / jnp.linalg.norm(q_current)
+    U_optimal = quaternion_to_rotation_matrix(q_final)
+
+    return U_optimal
