@@ -1479,73 +1479,62 @@ def run_sparse_hough(
     for i, (zone, weight) in enumerate(zip(empirical_zones, activation_weights)):
         print(f"    Zone {i+1}: [{zone[0]:.3f}, {zone[1]:.3f}, {zone[2]:.3f}] (Weight: {weight:.2f})")
 
-    print("\n[3/3] Global Combinatorial Search (Davenport)")
     q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
 
+    # ==========================================
+    # PHASE 3: DAVENPORT COMBINATORIAL SEARCH
+    # ==========================================
+    print("\n[3/4] Global Combinatorial Search (Davenport)")
     from subhkl.search.davenport import align_virtual_nodes
     import itertools
-    from scipy.spatial import ConvexHull, cKDTree
     
-    # 1. Generate Virtual Nodes (Intersections)
     raw_nodes = []
     for z1, z2 in itertools.combinations(empirical_zones, 2):
         cross = np.cross(z1, z2)
         norm = np.linalg.norm(cross)
-        if norm > 0.05:  # Reject dead-center core noise
+        if norm > 0.05:  
             raw_nodes.append(cross / norm)
             
     raw_nodes = np.array(raw_nodes)
     sym_nodes = np.vstack([raw_nodes, -raw_nodes])
-            
-    tree = cKDTree(sym_nodes)
-    pairs = tree.query_pairs(r=0.01) 
-    keep = np.ones(len(sym_nodes), dtype=bool)
-    for i, j in pairs:
-        if keep[i]: keep[j] = False
-    unique_nodes = sym_nodes[keep]
     
-    print(f"  > Wrapping {len(unique_nodes)} unique intersections in a Convex Hull...")
-    hull = ConvexHull(unique_nodes)
+    print(f"  > Computing density consensus among {len(sym_nodes)} intersections...")
+    dots = np.clip(sym_nodes @ sym_nodes.T, -1.0, 1.0)
+    vote_threshold = np.cos(np.deg2rad(2.0))
+    votes = np.sum(dots > vote_threshold, axis=1)
+    order = np.argsort(votes)[::-1]
     
-    vertex_scores = np.zeros(len(unique_nodes))
-    for simplex in hull.simplices:
-        a, b, c = unique_nodes[simplex]
-        face_area = 0.5 * np.linalg.norm(np.cross(b - a, c - a))
-        vertex_scores[simplex] += face_area
-        
-    order = np.argsort(vertex_scores)[::-1]
-    
-    # ---------------------------------------------------------
-    # FATAL BUG 2 FIX: The Collinearity Filter
-    # ---------------------------------------------------------
-    e_nodes = []
+    e_nodes, e_votes = [], []
     for idx in order:
-        cand = unique_nodes[idx]
+        cand = sym_nodes[idx]
         if not e_nodes:
             e_nodes.append(cand)
+            e_votes.append(votes[idx])
             continue
             
-        # Check absolute dot product to ensure we don't pick an antipodal or nearly parallel vector
-        dots = np.abs(np.dot(e_nodes, cand))
-        if np.max(dots) < 0.95:  # Must be at least ~18 degrees away from ANY existing hub
+        cos_15 = np.cos(np.deg2rad(15.0))
+        cand_dots = np.abs(np.dot(e_nodes, cand))
+        if np.max(cand_dots) < cos_15:  
             e_nodes.append(cand)
+            e_votes.append(votes[idx])
             
-        if len(e_nodes) == 8:
+        if len(e_nodes) == 10: 
             break
             
     e_nodes = np.array(e_nodes)
-    print(f"  > Convex Hull filter isolated {len(e_nodes)} strictly independent Virtual Hubs.")
+    print(f"  > Density filter isolated {len(e_nodes)} pristine Virtual Hubs.")
 
-    # 8. Dispatch to Davenport Solver (Pure Isolation)
+    # FORCE MAX_HKL_HYP = 3 to break the False Symmetry Trap
     U_davenport = align_virtual_nodes(
         e_nodes, 
         q_sample_obs_norm,  
         B_mat, 
-        max_hkl_hyp=max_hkl_hyp,   
+        max_hkl_hyp=3,              # <--- HARDCODED OVERRIDE
         max_hkl_cons=max_hkl_cons,
         angle_tol_hyp=angle_tol_hyp,
-        angle_tol_cons=angle_tol_cons
+        angle_tol_cons=0.4          # <--- STRICT TOLERANCE
     )
+    print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 
     # ==========================================
     # PHASE 4: CONTINUOUS VORONOI POLISH
@@ -1557,7 +1546,6 @@ def run_sparse_hough(
     q_seed = Rotation.from_matrix(U_davenport).as_quat() 
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
     
-    # Regenerate the unique Laue dictionary for the optimizer
     hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
@@ -1569,40 +1557,30 @@ def run_sparse_hough(
     _, unique_idx = np.unique(np.round(r_rays_norm, 4), axis=0, return_index=True)
     r_unique_rays_norm = r_rays_norm[unique_idx]
     
-    # ---------------------------------------------------------
-    # THE INLIER MASK: Protect the optimizer from detector noise!
-    # ---------------------------------------------------------
     r_lab_dav = U_davenport @ r_unique_rays_norm.T
     dots_dav = q_sample_obs_norm @ r_lab_dav
     max_dots_dav = np.max(np.clip(dots_dav, -1.0, 1.0), axis=1)
     angles_dav = np.rad2deg(np.arccos(max_dots_dav))
     
-    # Keep only peaks that Davenport verified as true signal
-    inlier_mask = angles_dav < 1.5
+    inlier_mask = angles_dav < 1.0 
     q_obs_clean = q_sample_obs_norm[inlier_mask]
     
-    print(f"  > Davenport isolated {len(q_obs_clean)} clean signal peaks. Discarding noise...")
+    print(f"  > Davenport isolated {len(q_obs_clean)} clean signal peaks. Polishing...")
     
-    # Unleash Gradient Descent ONLY on the clean peaks
     U_final = optimize_orientation_gradient_descent(
         q_seed_jax, 
         jnp.array(q_obs_clean), 
         jnp.array(r_unique_rays_norm), 
-        steps=500  # Give it 500 steps to find the absolute floor
+        steps=500 
     )
     
-    # ---------------------------------------------------------
-    # Ultimate Angular Validation (Score against ALL peaks to be honest)
-    # ---------------------------------------------------------
     r_lab = U_final @ r_unique_rays_norm.T
     dots = q_sample_obs_norm @ r_lab
     max_dots = np.max(np.clip(dots, -1.0, 1.0), axis=1)
     angles = np.rad2deg(np.arccos(max_dots))
+    true_hits = np.sum(angles < 0.4)
     
-    true_hits = np.sum(angles < angle_tol_cons)
-    
-    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs)} Laue rays (Tol = {angle_tol_cons} deg).")
-    print("  > Macroscopic U-Matrix successfully extracted.")
+    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs)} Laue rays (Tol = 0.4 deg).")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
@@ -1614,10 +1592,10 @@ def run_sparse_hough(
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
         f.create_dataset("peaks/xyz", data=xyz_out)
-        f.create_dataset("sample/U", data=U_final) # Write the polished matrix
+        f.create_dataset("sample/U", data=U_final) 
         f.create_dataset("sample/B", data=B_mat)
 
-    print("Export complete. File is ready for discrete Laue polishing.")
+    print("Export complete.")
 
     # ==========================================
     # PHASE 4: PARALLEL VISUALIZATION (PER RUN)
