@@ -275,7 +275,7 @@ def align_virtual_nodes(
     return best_U
 
 # -------------------------------------------------------------
-# CONTINUOUS VORONOI OPTIMIZER (LAUE RAY VERSION)
+# CONTINUOUS VORONOI OPTIMIZER (HARD ASSIGNMENT)
 # -------------------------------------------------------------
 
 @jit
@@ -290,40 +290,41 @@ def quaternion_to_rotation_matrix(q):
     ])
 
 @jit
-def voronoi_ray_loss(q, q_obs_norm, r_unique_rays_norm, temperature=0.01):
+def voronoi_ray_loss(q, q_obs_norm, r_unique_rays_norm):
     """
-    The Spherical Voronoi / Cosine Similarity Penalty.
-    Pulls empirical rays toward the nearest valid Laue ray.
+    Hard Voronoi Penalty.
+    Calculates the exact distance to the single closest theoretical ray.
     """
     U = quaternion_to_rotation_matrix(q)
     
-    # Apply U to map theoretical rays to sample frame
+    # Map theoretical rays to sample frame
     r_lab = jnp.matmul(r_unique_rays_norm, U.T)
     
-    # Calculate pairwise dot products
+    # Calculate all pairwise cosine similarities
     sim_matrix = jnp.matmul(q_obs_norm, r_lab.T)
     
-    # LogSumExp smoothly finds the closest Laue Ray (Voronoi cell)
-    soft_max_sims = temperature * jax.scipy.special.logsumexp(sim_matrix / temperature, axis=1)
+    # Hard assignment: Find the absolute maximum dot product for each peak
+    max_sims = jnp.max(sim_matrix, axis=1)
     
-    # We want to maximize similarity, so we minimize the negative sum
-    return -jnp.sum(soft_max_sims)
+    # We want to maximize the similarity (drive it to 1.0)
+    return -jnp.sum(max_sims)
 
 def optimize_orientation_gradient_descent(q_init, q_obs_norm, r_unique_rays_norm, steps=300):
     """
-    Polishes the Davenport seed by sliding the peaks into the deepest Voronoi cell centers.
+    Polishes the Davenport seed by sliding the peaks to the exact center of their Voronoi cells.
     """
-    optimizer = optax.adam(learning_rate=0.02)
+    # A slightly lower learning rate since we have hard, exact gradients now
+    optimizer = optax.adam(learning_rate=0.005) 
     opt_state = optimizer.init(q_init)
     
     loss_fn = jax.jit(jax.value_and_grad(voronoi_ray_loss))
     
     q_current = q_init
     
-    print("  > Launching Continuous Voronoi Gradient Descent...")
+    print("  > Launching Hard Voronoi Gradient Descent...")
     
     for step in range(steps):
-        loss_val, grads = loss_fn(q_current, q_obs_norm, r_unique_rays_norm, temperature=0.02)
+        loss_val, grads = loss_fn(q_current, q_obs_norm, r_unique_rays_norm)
         updates, opt_state = optimizer.update(grads, opt_state)
         q_current = optax.apply_updates(q_current, updates)
         
