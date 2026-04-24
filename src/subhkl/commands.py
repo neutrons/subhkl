@@ -1529,7 +1529,6 @@ def run_sparse_hough(
         B_mat, 
         max_hkl_hyp=max_hkl_hyp,
         angle_tol_hyp=angle_tol_hyp,
-        angle_tol_cons=angle_tol_cons,
     )
     print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 
