@@ -1,5 +1,6 @@
 import h5py
 import numpy as np
+import jax.numpy as jnp
 
 # NOTE(Vivek): deprecate and use Goniometer class to handler rotation calc
 from subhkl.instrument.goniometer import (
