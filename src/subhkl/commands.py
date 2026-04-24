@@ -1551,13 +1551,11 @@ def run_sparse_hough(
 
     U_davenport = align_virtual_nodes(
         e_nodes, 
-        e_weights,              # <--- Passing the weights!
-        q_sample_obs_norm,      
+        e_weights,              
         r_unique_rays_norm,     
         B_mat, 
-        max_hkl_hyp=max_hkl_hyp,   # <--- Keep using the CLI variable
-        angle_tol_hyp=angle_tol_hyp,
-        angle_tol_cons=angle_tol_cons
+        max_hkl_hyp=2,          
+        angle_tol_hyp=angle_tol_hyp
     )
     print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 
