@@ -1673,28 +1673,34 @@ def run_sparse_hough(
                 ki_vec=ub_helper.ki_vec,
             )
 
-            # --- GENERATE PREDICTED ZONES FOR DEBUGGING ---
+            # --- GENERATE THEORETICAL INDICES FOR DEBUGGING ---
+            # We generate small integers to act as both [u,v,w] and (h,k,l)
             hc_vals = np.arange(-2, 3)
             hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
             hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
             mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-            theo_hkl_zones = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+            theo_indices = hkl_c[:, mask_hkl_c].astype(np.float32).T 
             
-            r_theo_zones = (B_mat @ theo_hkl_zones.T).T
+            # 1. PREDICTED ZONES (REAL SPACE)
+            # Zone Axes are Real-Space vectors [u,v,w], requiring the A matrix (B^-1)^T
+            A_mat = np.linalg.inv(B_mat).T
+            r_theo_zones = (A_mat @ theo_indices.T).T
             r_theo_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
             
-            # --- GENERATE THEORETICAL NODES FOR DEBUGGING ---
-            # Using max_hkl=2 since that is what Davenport aligns against
-            r_theo_nodes = (B_mat @ theo_hkl_zones.T).T 
+            # 2. PREDICTED HUBS (RECIPROCAL SPACE)
+            # Hubs are Laue Rays (h,k,l), requiring the standard B matrix
+            r_theo_nodes = (B_mat @ theo_indices.T).T 
             r_theo_nodes_norm = r_theo_nodes / np.linalg.norm(r_theo_nodes, axis=1, keepdims=True)
 
             # --- PLOT FRAME MAPPING ---
             R_run = r_gonio_obs[mask[0]]
-            lab_zones_for_plot = (R_run @ empirical_zones.T).T
-            pred_lab_zones_for_plot = (R_run @ U_davenport @ r_theo_zones_norm.T).T
             
-            # Map the nodal points to Lab Frame
+            # Empirical mapping (Sparse Hough gives us Real Space Zones and Reciprocal Hubs natively)
+            lab_zones_for_plot = (R_run @ empirical_zones.T).T
             obs_lab_nodes_for_plot = (R_run @ e_nodes.T).T
+            
+            # Predicted mapping (Rotate theoreticals by U_davenport)
+            pred_lab_zones_for_plot = (R_run @ U_davenport @ r_theo_zones_norm.T).T
             pred_lab_nodes_for_plot = (R_run @ U_davenport @ r_theo_nodes_norm.T).T
 
             run_tasks.append((
@@ -1705,8 +1711,8 @@ def run_sparse_hough(
                 instrument_name,
                 lab_zones_for_plot,
                 pred_lab_zones_for_plot,
-                obs_lab_nodes_for_plot,
-                pred_lab_nodes_for_plot
+                obs_lab_nodes_for_plot,  
+                pred_lab_nodes_for_plot  
             ))
 
         if max_workers := min(os.cpu_count() or 4, len(run_tasks)):
