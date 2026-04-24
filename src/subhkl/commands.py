@@ -1477,34 +1477,51 @@ def run_sparse_hough(
     print("\n[3/3] Eigenvalue Solution (Dual-Space Virtual Node Matching)")
     from subhkl.search.davenport import align_virtual_nodes
     import itertools
-
-    # Generate Virtual Nodes (Intersections of top Laue cones)
-    # We take the top 6 densest zones, which will yield 15 mathematical intersections
-    top_zones = empirical_zones[:6] 
-    e_nodes = []
-
-    for z1, z2 in itertools.combinations(top_zones, 2):
+    
+    # 1. Generate all possible intersections from the extracted zones
+    raw_nodes = []
+    for z1, z2 in itertools.combinations(empirical_zones, 2):
         cross = np.cross(z1, z2)
         norm = np.linalg.norm(cross)
-
-        # 0.05 enforces that the intersecting zones must be at least ~3 degrees apart,
-        # preventing mathematical instability from nearly parallel cones.
         if norm > 0.05: 
-            e_nodes.append(cross / norm)
+            raw_nodes.append(cross / norm)
+            
+    # 2. Cluster the intersections to find the Topological Hubs
+    merged_nodes = []
+    node_weights = []
+    for n in raw_nodes:
+        is_new = True
+        for i, mn in enumerate(merged_nodes):
+            if np.abs(np.dot(n, mn)) > np.cos(np.deg2rad(1.5)):
+                node_weights[i] += 1
+                is_new = False
+                break
+        if is_new:
+            merged_nodes.append(n)
+            node_weights.append(1)
+            
+    merged_nodes = np.array(merged_nodes)
+    node_weights = np.array(node_weights)
+    
+    order = np.argsort(node_weights)[::-1]
+    e_nodes = merged_nodes[order][:8] 
+    
+    print(f"  > Distilled {len(raw_nodes)} raw intersections into {len(e_nodes)} fundamental Virtual Nodes.")
 
-    e_nodes = np.array(e_nodes)
-    print(f"  > Generated {len(e_nodes)} Virtual Nodes from the top {len(top_zones)} empirical zones.")
+    # 3. NORMALIZE RAW PEAKS - Critical to prevent JAX dot product explosions!
+    q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
 
-    # The solver matches the Virtual Nodes but scores against the Empirical Zones!
+    # 4. The solver matches the Hubs but scores against the RAW EMPIRICAL PEAKS!
     U0_matrix = align_virtual_nodes(
         e_nodes, 
-        empirical_zones, 
+        q_sample_obs_norm, 
         B_mat, 
-        max_hkl=2,        # Tiny 124-element Node Dictionary 
-        max_uvw=max_uvw,  # Massive 9,260-element Zone Dictionary for consensus scoring
-        angle_tol=angle_tol
+        max_hkl_hyp=2,        # 124 Nodes for fast hypothesis generation
+        max_hkl_cons=5,       # 1330 Peaks for rigorous validation
+        angle_tol_hyp=angle_tol,
+        angle_tol_cons=1.0    # 1.0 degree strict peak matching
     )
-    print("  > Macroscopic U-Matrix successfully extracted.")
+    print("  > Macroscopic U-Matrix successfully extracted.") 
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
