@@ -9,7 +9,7 @@ def align_virtual_nodes(
     e_nodes, 
     B_mat, 
     max_hkl_hyp=2, 
-    max_hkl_eval=4,
+    max_hkl_cons=5,
     angle_tol_hyp=1.5
 ):
     """
@@ -28,8 +28,8 @@ def align_virtual_nodes(
     print(f"  > Generating Theoretical Hubs for Hypotheses (max_hkl={max_hkl_hyp})...")
     r_nodes_hyp = gen_hubs(max_hkl_hyp)
     
-    print(f"  > Generating Theoretical Hubs for Evaluation (max_hkl={max_hkl_eval})...")
-    r_nodes_eval = gen_hubs(max_hkl_eval)
+    print(f"  > Generating Theoretical Hubs for Evaluation (max_hkl={max_hkl_cons})...")
+    r_nodes_eval = gen_hubs(max_hkl_cons)
     
     print(f"  > Executing Pairwise Triad Generation...")
     
@@ -108,12 +108,10 @@ def align_virtual_nodes(
         dots = jnp.einsum('nr,kmr->knm', e_nodes_j, r_samp)
         
         max_dots = jnp.max(jnp.abs(dots), axis=2)
-        max_dots = jnp.clip(max_dots, -1.0, 1.0) # Prevents 1.00001 overflow
+        max_dots = jnp.clip(max_dots, -1.0, 1.0) 
         angles = jnp.rad2deg(jnp.arccos(max_dots))
         
-        # Count strictly bound inliers
         inliers = jnp.sum(angles < tol_deg, axis=1)
-        # Tie-breaker: Minimize the mean residual of the inliers
         residuals = jnp.sum(jnp.where(angles < tol_deg, angles, 0.0), axis=1) / jnp.maximum(inliers, 1)
         return inliers, residuals
         
@@ -129,7 +127,6 @@ def align_virtual_nodes(
         chunk = jnp.array(U_batch[i:i+chunk_size], dtype=jnp.float32)
         inliers, residuals = evaluate_triads_hard(chunk, e_nodes_j, r_eval_j, angle_tol_hyp)
         
-        # We want the matrix with the HIGHEST inliers and the LOWEST residual
         score = inliers - (residuals / 1000.0)
         max_idx = jnp.argmax(score)
         

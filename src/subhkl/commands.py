@@ -1535,15 +1535,14 @@ def run_sparse_hough(
     e_nodes = np.array(e_nodes)
     print(f"  > Clustered and isolated {len(e_nodes)} high-stability Virtual Hubs.")
 
-    # Dispatch to Triad Solver!
+    # Dispatch to Triad Solver using the CLI variables
     U_davenport = align_virtual_nodes(
         e_nodes, 
         B_mat, 
-        max_hkl_hyp=2,   
-        max_hkl_eval=4,
+        max_hkl_hyp=max_hkl_hyp,   
+        max_hkl_cons=max_hkl_cons,
         angle_tol_hyp=angle_tol_hyp
     )
-    
     print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 
     # ==========================================
@@ -1555,6 +1554,18 @@ def run_sparse_hough(
     
     q_seed = Rotation.from_matrix(U_davenport).as_quat() 
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
+    
+    # --- RESTORED: Generate the Massive Dictionary for Polishing/Validation ---
+    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
+    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+    
+    r_theo_rays = (B_mat @ theo_hkl_c.T).T
+    r_rays_norm = r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True)
+    _, unique_idx = np.unique(np.round(r_rays_norm, 4), axis=0, return_index=True)
+    r_unique_rays_norm = r_rays_norm[unique_idx]
     
     r_lab_dav = U_davenport @ r_unique_rays_norm.T
     dots_dav = q_sample_obs_norm @ r_lab_dav
