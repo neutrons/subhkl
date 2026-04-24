@@ -293,7 +293,7 @@ def plot_unrolled_detector(
         axis_collections.append((zone_axes, "Hough Zone", "-", 0.6, plt.cm.tab20))
     if predicted_zone_axes is not None:
         # Predicted gets bright contrasting colors, dashed lines, full opacity
-        axis_collections.append((predicted_zone_axes, "Pred Zone", "..", 1.0, plt.cm.Set1))
+        axis_collections.append((predicted_zone_axes, "Pred Zone", ".-", 1.0, plt.cm.Set1))
 
     if axis_collections:
         fig_dummy, ax_dummy = plt.subplots()
