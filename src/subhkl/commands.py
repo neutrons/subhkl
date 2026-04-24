@@ -1655,7 +1655,7 @@ def run_sparse_hough(
 
             R_run = r_gonio_obs[mask[0]]
 
-            viz_hkl = max_hkl_hyp
+            viz_hkl = 1 # adjust to plot more zone axes
             A_mat = np.linalg.inv(B_mat).T
             hc_vals = np.arange(-viz_hkl, viz_hkl + 1)
             hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
