@@ -405,8 +405,8 @@ def plot_unrolled_detector(
     det_y_min, det_y_max = ax.get_ylim()
 
     # Plot the Hubs (Sizes halved to 30 and 40)
-    add_nodes_to_plot(observed_nodes, marker='D', facecolor='cyan', edgecolor='black', label='Observed Hubs', size=30, zorder=6)
-    add_nodes_to_plot(predicted_nodes, marker='X', facecolor='magenta', edgecolor='white', label='Predicted Hubs', size=40, zorder=7)
+    add_nodes_to_plot(observed_nodes, marker='D', facecolor='cyan', edgecolor='black', label='Observed Hubs', size=15, zorder=6)
+    add_nodes_to_plot(predicted_nodes, marker='X', facecolor='magenta', edgecolor='white', label='Predicted Hubs', size=20, zorder=7)
 
     # Force the Y bounds back so extreme vertical nodes don't blow up the plot
     ax.set_ylim(det_y_min, det_y_max)

@@ -31,10 +31,11 @@ def jax_davenport_consensus(e_use_nodes, q_sample_obs_norm, r_hyp_nodes_batch, r
     S = B + jnp.transpose(B, (0, 2, 1))
     sigma = jnp.trace(B, axis1=1, axis2=2)
     
+    # THE CHIRALITY FIX: Must be v x w (Reference x Observed) to yield U, not U^-1
     Z = jnp.column_stack([
-        B[:, 1, 2] - B[:, 2, 1], 
-        B[:, 2, 0] - B[:, 0, 2], 
-        B[:, 0, 1] - B[:, 1, 0]
+        B[:, 2, 1] - B[:, 1, 2], 
+        B[:, 0, 2] - B[:, 2, 0], 
+        B[:, 1, 0] - B[:, 0, 1]
     ])
     
     K = jnp.zeros((B.shape[0], 4, 4))
@@ -66,16 +67,16 @@ def jax_davenport_consensus(e_use_nodes, q_sample_obs_norm, r_hyp_nodes_batch, r
         jnp.stack([U20, U21, U22], axis=1)
     ], axis=1)
     
+    # Map theoretical rays to sample frame
     r_lab_batch = jnp.matmul(U_batch, r_theo_rays_norm.T)
     
-    # dots shape: (N_peaks, Batch, N_theo_rays)
+    # Cosine similarity against normalized empirical rays
     dots = jnp.einsum('ei,nit->net', q_sample_obs_norm, r_lab_batch)
     
-    # max_dots shape: (N_peaks, Batch)
+    # Forward-scattering Laue: strict directional match
     max_dots = jnp.max(jnp.clip(dots, -1.0, 1.0), axis=2) 
     angles = jnp.rad2deg(jnp.arccos(max_dots))
     
-    # axis=0 sums across N_peaks
     inliers = jnp.sum(angles < angle_tol_cons, axis=1)
     residuals = jnp.sum(jnp.where(angles < angle_tol_cons, angles, 0.0), axis=1) / jnp.maximum(inliers, 1)
     
