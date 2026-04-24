@@ -1570,7 +1570,7 @@ def run_sparse_hough(
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
     
     # --- THE POLISHER UPGRADE: Build a MASSIVE dictionary to capture all 540 raw peaks! ---
-    hkl_polish = 5 
+    hkl_polish =  8
     print(f"  > Generating Dense Polishing Dictionary (max_hkl={hkl_polish})...")
     hc_vals = np.arange(-hkl_polish, hkl_polish + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
@@ -1671,7 +1671,7 @@ def run_sparse_hough(
             R_run = r_gonio_obs[mask[0]]
 
             # --- ZONE AXES (Dashed Lines): Keep viz_hkl low to prevent CPU melting! ---
-            viz_hkl = 1 
+            viz_hkl = 2
             A_mat = np.linalg.inv(B_mat).T
             hc_vals = np.arange(-viz_hkl, viz_hkl + 1)
             hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
