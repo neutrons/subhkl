@@ -1514,39 +1514,56 @@ def run_sparse_hough(
     e_nodes = unique_nodes[order][:8]
     print(f"  > Convex Hull filter isolated {len(e_nodes)} pristine Virtual Hubs.")
 
-    # Davenport strictly uses the RAW Unnormalized Peaks (True 1/d spacing)
+    # LAUE REQUIREMENT: Must strictly use Normalized Rays on the Unit Sphere
+    q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
+
     U_davenport = align_virtual_nodes(
         e_nodes, 
-        q_sample_obs,  # Unnormalized!
+        q_sample_obs_norm,  
         B_mat, 
-        max_hkl_hyp=max_hkl_hyp,       
+        max_hkl_hyp=max_hkl_hyp,   
+        max_hkl_cons=max_hkl_cons,
         angle_tol_hyp=angle_tol_hyp,
-        frac_tol_cons=0.15 # Strict fractional limit
+        angle_tol_cons=angle_tol_cons # Relaxed to 1.0 or 1.5 deg
     )
     
-    print("\n[4/4] Continuous Fractional Polish (Gradient Descent)")
+    print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
     from scipy.spatial.transform import Rotation
     from subhkl.search.davenport import optimize_orientation_gradient_descent
     
     q_seed = Rotation.from_matrix(U_davenport).as_quat() 
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
-    B_inv_j = jnp.array(np.linalg.inv(B_mat), dtype=jnp.float32)
+    
+    # We must generate the same unique Laue dictionary for the optimizer
+    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
+    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+    
+    r_theo_rays = (B_mat @ theo_hkl_c.T).T
+    r_rays_norm = r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True)
+    _, unique_idx = np.unique(np.round(r_rays_norm, 4), axis=0, return_index=True)
+    r_unique_rays_norm = r_rays_norm[unique_idx]
     
     # Unleash Gradient Descent!
     U_final = optimize_orientation_gradient_descent(
         q_seed_jax, 
-        jnp.array(q_sample_obs), # Unnormalized!
-        B_inv_j, 
+        jnp.array(q_sample_obs_norm), 
+        jnp.array(r_unique_rays_norm), 
         steps=300
     )
     
-    # Ultimate Fractional Validation
-    h_calc = np.linalg.inv(B_mat) @ U_final.T @ q_sample_obs.T
-    fractional_error = np.abs(np.round(h_calc) - h_calc)
+    # Ultimate Angular Validation
+    r_lab = U_final @ r_unique_rays_norm.T
+    dots = q_sample_obs_norm @ r_lab
+    max_dots = np.max(np.clip(dots, -1.0, 1.0), axis=1)
+    angles = np.rad2deg(np.arccos(max_dots))
     
-    true_hits = np.sum(np.max(fractional_error, axis=0) < 0.15)
+    # A true hit in uncalibrated Laue is generally < 1.0 degrees
+    true_hits = np.sum(angles < angle_tol_cons)
     
-    print(f"  > Final Matrix perfectly indexed {true_hits}/{len(q_sample_obs)} physical Bragg Peaks.")
+    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs)} Laue rays (Tol = {angle_tol_cons} deg).")
     print("  > Macroscopic U-Matrix successfully extracted.")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")

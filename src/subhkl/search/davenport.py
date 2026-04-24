@@ -25,8 +25,8 @@ def evaluate_tetrad_chunk_jax(theo_angles_j, va, vb, vc, req_14, req_24, req_34,
     return m14 & m24 & m34
 
 @jit
-def jax_davenport_consensus(e_use_nodes, q_sample_obs_raw, r_hyp_nodes_batch, B_inv, frac_tol):
-    """Evaluates Consensus directly in Fractional HKL space (No Dictionaries required!)"""
+def jax_davenport_consensus(e_use_nodes, q_sample_obs_norm, r_hyp_nodes_batch, r_theo_rays_norm, angle_tol_cons):
+    """Evaluates Consensus using pure Laue Ray Directions."""
     B = jnp.einsum('ax,nay->nxy', e_use_nodes, r_hyp_nodes_batch)
     S = B + jnp.transpose(B, (0, 2, 1))
     sigma = jnp.trace(B, axis1=1, axis2=2)
@@ -66,35 +66,35 @@ def jax_davenport_consensus(e_use_nodes, q_sample_obs_raw, r_hyp_nodes_batch, B_
         jnp.stack([U20, U21, U22], axis=1)
     ], axis=1)
     
-    # --- METRIC UPGRADE: Project Raw Peaks into Fractional HKL ---
-    # q_crystal = U^T * q_raw 
-    q_cryst = jnp.einsum('ni,bij->bnj', q_sample_obs_raw, U_batch)
-    # h_calc = B_inv * q_crystal
-    h_calc = jnp.einsum('bnj,kj->bnk', q_cryst, B_inv)
+    # Map theoretical rays to sample frame
+    r_lab_batch = jnp.matmul(U_batch, r_theo_rays_norm.T)
+    # Cosine similarity against normalized empirical rays
+    dots = jnp.einsum('ei,nit->net', q_sample_obs_norm, r_lab_batch)
     
-    # Calculate fractional deviation from nearest integer
-    frac_err = jnp.abs(jnp.round(h_calc) - h_calc)
-    max_frac_err = jnp.max(frac_err, axis=2) 
+    # Forward-scattering Laue: strict directional match (no abs())
+    max_dots = jnp.max(jnp.clip(dots, -1.0, 1.0), axis=2) 
+    angles = jnp.rad2deg(jnp.arccos(max_dots))
     
-    inliers = jnp.sum(max_frac_err < frac_tol, axis=1)
-    residuals = jnp.sum(jnp.where(max_frac_err < frac_tol, max_frac_err, 0.0), axis=1) / jnp.maximum(inliers, 1)
+    inliers = jnp.sum(angles < angle_tol_cons, axis=1)
+    residuals = jnp.sum(jnp.where(angles < angle_tol_cons, angles, 0.0), axis=1) / jnp.maximum(inliers, 1)
     
     return U_batch, inliers, residuals
 
 
 def align_virtual_nodes(
     e_nodes, 
-    q_sample_obs_raw, 
+    q_sample_obs_norm, 
     B_mat, 
     max_hkl_hyp=2, 
+    max_hkl_cons=5,
     angle_tol_hyp=1.5, 
-    frac_tol_cons=0.15, 
+    angle_tol_cons=1.0, 
     hyp_batch_size=10000, 
     eval_batch_size=500
 ):
     N_emp_nodes = len(e_nodes)
     N_use = min(4, N_emp_nodes)
-    N_emp_peaks = len(q_sample_obs_raw)
+    N_emp_peaks = len(q_sample_obs_norm)
     
     if N_use < 4:
         raise ValueError("Need at least 4 empirical virtual nodes to lock orientation.")
@@ -110,6 +110,23 @@ def align_virtual_nodes(
 
     r_theo_nodes = (B_mat @ theo_hkl.T).T
     r_nodes_norm = r_theo_nodes / np.linalg.norm(r_theo_nodes, axis=1, keepdims=True)
+
+    print(f"  > Generating Unique Laue Rays for Consensus (max_hkl={max_hkl_cons})...")
+    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
+    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+    
+    # Convert to physical rays and normalize
+    r_theo_rays = (B_mat @ theo_hkl_c.T).T
+    r_rays_norm = r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True)
+    
+    # Filter Harmonics: Remove redundant rays pointing in the exact same direction
+    _, unique_idx = np.unique(np.round(r_rays_norm, 4), axis=0, return_index=True)
+    r_unique_rays_norm = r_rays_norm[unique_idx]
+    
+    print(f"  > Compiled {len(r_nodes_norm)} Hash Nodes and {len(r_unique_rays_norm)} Unique Physical Rays. Moving to GPU...")
 
     r_nodes_norm_j = jnp.array(r_nodes_norm, dtype=jnp.float32)
     theo_angles_j = compute_theo_angles_jax(r_nodes_norm_j)
@@ -217,8 +234,8 @@ def align_virtual_nodes(
     print(f"  > Found {len(a_cand)} pristine geometric tetrads. Dispatching {N_hyp} U-Matrices to GPU...")
 
     e_use_nodes_j = jnp.array(e_use, dtype=jnp.float32)
-    q_sample_obs_raw_j = jnp.array(q_sample_obs_raw, dtype=jnp.float32)
-    B_inv_j = jnp.array(np.linalg.inv(B_mat), dtype=jnp.float32)
+    q_sample_obs_norm_j = jnp.array(q_sample_obs_norm, dtype=jnp.float32)
+    r_unique_rays_norm_j = jnp.array(r_unique_rays_norm, dtype=jnp.float32)
 
     best_U = None
     best_inliers = -1
@@ -232,7 +249,7 @@ def align_virtual_nodes(
             W_chunk = np.pad(W_chunk, ((0, eval_batch_size - actual_size), (0,0), (0,0)), constant_values=0)
             
         U_out, inliers_out, residuals_out = jax_davenport_consensus(
-            e_use_nodes_j, q_sample_obs_raw_j, jnp.array(W_chunk, dtype=jnp.float32), B_inv_j, frac_tol_cons
+            e_use_nodes_j, q_sample_obs_norm_j, jnp.array(W_chunk, dtype=jnp.float32), r_unique_rays_norm_j, angle_tol_cons
         )
         
         inliers_out = np.array(inliers_out[:actual_size])
@@ -253,12 +270,12 @@ def align_virtual_nodes(
     if best_inliers < 10:
         raise ValueError(f"Consensus failed. Best U-matrix only explained {best_inliers} empirical peaks.")
 
-    print(f"  > Consensus Achieved! U-Matrix maps {best_inliers}/{N_emp_peaks} raw peaks to exact integer HKLs (Mean Frac Error: {best_residual:.3f})")
+    print(f"  > Consensus Achieved! U-Matrix directionally maps {best_inliers}/{N_emp_peaks} raw peaks to Laue rays (Mean Angle Error: {best_residual:.3f} deg)")
     
     return best_U
 
 # -------------------------------------------------------------
-# CONTINUOUS METRIC OPTIMIZER
+# CONTINUOUS VORONOI OPTIMIZER (LAUE RAY VERSION)
 # -------------------------------------------------------------
 
 @jit
@@ -273,43 +290,45 @@ def quaternion_to_rotation_matrix(q):
     ])
 
 @jit
-def fractional_loss(q, q_obs_raw, B_inv):
+def voronoi_ray_loss(q, q_obs_norm, r_unique_rays_norm, temperature=0.01):
     """
-    The Fourier / Sine-Squared Penalty Function.
-    Maps every raw peak to fractional HKL and penalizes deviation from integers.
+    The Spherical Voronoi / Cosine Similarity Penalty.
+    Pulls empirical rays toward the nearest valid Laue ray.
     """
     U = quaternion_to_rotation_matrix(q)
     
-    # Map from Lab/Sample to Crystal: U^T * q_obs
-    q_cryst = jnp.matmul(q_obs_raw, U) 
-    # Map to Fractional HKL: B_inv * q_cryst
-    h_calc = jnp.matmul(q_cryst, B_inv.T) 
+    # Apply U to map theoretical rays to sample frame
+    r_lab = jnp.matmul(r_unique_rays_norm, U.T)
     
-    # Sine squared penalty is perfectly 0 at integers, and 1 at half-integers
-    penalty = jnp.sin(jnp.pi * h_calc)**2
+    # Calculate pairwise dot products
+    sim_matrix = jnp.matmul(q_obs_norm, r_lab.T)
     
-    return jnp.sum(penalty)
+    # LogSumExp smoothly finds the closest Laue Ray (Voronoi cell)
+    soft_max_sims = temperature * jax.scipy.special.logsumexp(sim_matrix / temperature, axis=1)
+    
+    # We want to maximize similarity, so we minimize the negative sum
+    return -jnp.sum(soft_max_sims)
 
-def optimize_orientation_gradient_descent(q_init, q_obs_raw, B_inv, steps=300):
+def optimize_orientation_gradient_descent(q_init, q_obs_norm, r_unique_rays_norm, steps=300):
     """
-    Polishes the Davenport seed by sliding the Fractional HKLs exactly onto the integer grid.
+    Polishes the Davenport seed by sliding the peaks into the deepest Voronoi cell centers.
     """
-    optimizer = optax.adam(learning_rate=0.01)
+    optimizer = optax.adam(learning_rate=0.02)
     opt_state = optimizer.init(q_init)
     
-    loss_fn = jax.jit(jax.value_and_grad(fractional_loss))
+    loss_fn = jax.jit(jax.value_and_grad(voronoi_ray_loss))
     
     q_current = q_init
     
-    print("  > Launching Continuous Fractional Gradient Descent...")
+    print("  > Launching Continuous Voronoi Gradient Descent...")
     
     for step in range(steps):
-        loss_val, grads = loss_fn(q_current, q_obs_raw, B_inv)
+        loss_val, grads = loss_fn(q_current, q_obs_norm, r_unique_rays_norm, temperature=0.02)
         updates, opt_state = optimizer.update(grads, opt_state)
         q_current = optax.apply_updates(q_current, updates)
         
         if step % 100 == 0:
-            print(f"    Step {step:03d} | Fourier Loss: {loss_val:.3f}")
+            print(f"    Step {step:03d} | Voronoi Loss: {loss_val:.3f}")
             
     q_final = q_current / jnp.linalg.norm(q_current)
     U_optimal = quaternion_to_rotation_matrix(q_final)
