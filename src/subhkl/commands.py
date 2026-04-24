@@ -1541,6 +1541,7 @@ def run_sparse_hough(
     print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
     from scipy.spatial.transform import Rotation
     from subhkl.search.davenport import optimize_orientation_gradient_descent
+    import jax.numpy as jnp
     
     # 1. Convert the Davenport U-Matrix into the initial Quaternion Seed
     q_seed = Rotation.from_matrix(U_davenport).as_quat() # Format: [x, y, z, w]
