@@ -1534,7 +1534,7 @@ def run_sparse_hough(
     q_seed = Rotation.from_matrix(U_davenport).as_quat() 
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
     
-    # We must generate the same unique Laue dictionary for the optimizer
+    # Generate the unique Laue dictionary
     hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
@@ -1546,26 +1546,41 @@ def run_sparse_hough(
     _, unique_idx = np.unique(np.round(r_rays_norm, 4), axis=0, return_index=True)
     r_unique_rays_norm = r_rays_norm[unique_idx]
     
-    # Unleash Gradient Descent!
+    # ---------------------------------------------------------
+    # THE INLIER MASK: Protect the optimizer from noise!
+    # ---------------------------------------------------------
+    r_lab_dav = U_davenport @ r_unique_rays_norm.T
+    dots_dav = q_sample_obs_norm @ r_lab_dav
+    max_dots_dav = np.max(np.clip(dots_dav, -1.0, 1.0), axis=1)
+    angles_dav = np.rad2deg(np.arccos(max_dots_dav))
+    
+    # Keep only peaks that Davenport placed within a reasonable physical distance
+    inlier_mask = angles_dav < 1.5
+    q_obs_clean = q_sample_obs_norm[inlier_mask]
+    
+    print(f"  > Davenport isolated {len(q_obs_clean)} clean signal peaks. Discarding noise...")
+    
+    # Unleash Gradient Descent ONLY on the clean peaks
     U_final = optimize_orientation_gradient_descent(
         q_seed_jax, 
-        jnp.array(q_sample_obs_norm), 
+        jnp.array(q_obs_clean), 
         jnp.array(r_unique_rays_norm), 
-        steps=steps
+        steps=300
     )
     
-    # Ultimate Angular Validation
+    # ---------------------------------------------------------
+    # Ultimate Angular Validation (Score against all peaks to be honest)
+    # ---------------------------------------------------------
     r_lab = U_final @ r_unique_rays_norm.T
     dots = q_sample_obs_norm @ r_lab
     max_dots = np.max(np.clip(dots, -1.0, 1.0), axis=1)
     angles = np.rad2deg(np.arccos(max_dots))
     
-    # A true hit in uncalibrated Laue is generally < 1.0 degrees
     true_hits = np.sum(angles < angle_tol_cons)
     
     print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs)} Laue rays (Tol = {angle_tol_cons} deg).")
     print("  > Macroscopic U-Matrix successfully extracted.")
-
+    
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
         with h5py.File(finder_file, "r") as f_in:
@@ -1576,7 +1591,7 @@ def run_sparse_hough(
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
         f.create_dataset("peaks/xyz", data=xyz_out)
-        f.create_dataset("sample/U", data=U_final) # This is now officially U_sample
+        f.create_dataset("sample/U", data=U_final) 
         f.create_dataset("sample/B", data=B_mat)
 
     print("Export complete. File is ready for discrete Laue polishing.")
