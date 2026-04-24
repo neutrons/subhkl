@@ -1565,7 +1565,7 @@ def run_sparse_hough(
         q_seed_jax, 
         jnp.array(q_obs_clean), 
         jnp.array(r_unique_rays_norm), 
-        steps=300
+        steps=steps
     )
     
     # ---------------------------------------------------------

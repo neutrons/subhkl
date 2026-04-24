@@ -311,27 +311,38 @@ def voronoi_ray_loss(q, q_obs_norm, r_unique_rays_norm):
 
 def optimize_orientation_gradient_descent(q_init, q_obs_norm, r_unique_rays_norm, steps=300):
     """
-    Polishes the Davenport seed by sliding the peaks to the exact center of their Voronoi cells.
+    Polishes the Davenport seed using micro-steps and tracks the absolute lowest error state.
     """
-    # A slightly lower learning rate since we have hard, exact gradients now
-    optimizer = optax.adam(learning_rate=0.005) 
+    # Drop the learning rate by 10x! We are doing microscopic fine-tuning now.
+    optimizer = optax.adam(learning_rate=0.0005)
     opt_state = optimizer.init(q_init)
-    
+
     loss_fn = jax.jit(jax.value_and_grad(voronoi_ray_loss))
-    
+
     q_current = q_init
-    
-    print("  > Launching Hard Voronoi Gradient Descent...")
-    
+
+    # --- BEST STATE TRACKERS ---
+    best_q = q_init
+    best_loss = jnp.inf
+
+    print("  > Launching Hard Voronoi Gradient Descent (Micro-stepping)...")
+
     for step in range(steps):
         loss_val, grads = loss_fn(q_current, q_obs_norm, r_unique_rays_norm)
+
+        # Save the quaternion if this is the deepest point in the crater
+        if loss_val < best_loss:
+            best_loss = loss_val
+            best_q = q_current
+
         updates, opt_state = optimizer.update(grads, opt_state)
         q_current = optax.apply_updates(q_current, updates)
-        
+
         if step % 100 == 0:
             print(f"    Step {step:03d} | Voronoi Loss: {loss_val:.3f}")
-            
-    q_final = q_current / jnp.linalg.norm(q_current)
+
+    # Always return the absolute best matrix found during the loop
+    q_final = best_q / jnp.linalg.norm(best_q)
     U_optimal = quaternion_to_rotation_matrix(q_final)
-    
+
     return U_optimal
