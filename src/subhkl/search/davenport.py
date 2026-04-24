@@ -7,12 +7,12 @@ import optax
 
 def align_virtual_nodes(
     e_nodes, 
-    e_weights,           # <--- NEW: Accepts empirical weights
+    e_weights,           
     q_sample_obs_norm,   
     r_eval_rays_norm,    
     B_mat, 
-    max_hkl_hyp=2, 
-    angle_tol_hyp=1.5,
+    max_hkl_hyp=3,       # <--- Default expanded for higher-order hubs
+    angle_tol_hyp=2.5,
     angle_tol_cons=0.4
 ):
     print(f"  > Generating Theoretical Hubs for Hypotheses (max_hkl={max_hkl_hyp})...")
@@ -24,7 +24,7 @@ def align_virtual_nodes(
     r_nodes_hyp = (B_mat @ theo_hkl.T).T
     r_nodes_hyp /= np.linalg.norm(r_nodes_hyp, axis=1, keepdims=True)
     
-    print(f"  > Executing Weight-Prioritized Pairwise Triad Generation...")
+    print(f"  > Executing Weight-Prioritized Symmetric Triad Generation...")
     
     emp_dots = np.clip(np.abs(e_nodes @ e_nodes.T), 0.0, 1.0)
     theo_dots = np.clip(np.abs(r_nodes_hyp @ r_nodes_hyp.T), 0.0, 1.0)
@@ -35,7 +35,7 @@ def align_virtual_nodes(
     emp_pair_angles = np.rad2deg(np.arccos(emp_dots[emp_i, emp_j]))
     theo_pair_angles = np.rad2deg(np.arccos(theo_dots[theo_i, theo_j]))
     
-    # --- WEIGHT SORTING ---
+    # Weight Sorting
     emp_pair_weights = e_weights[emp_i] * e_weights[emp_j]
     pair_order = np.argsort(emp_pair_weights)[::-1]
     
@@ -45,7 +45,7 @@ def align_virtual_nodes(
     theo_pair_angles = theo_pair_angles[stable_theo]
     
     U_hypotheses = []
-    MAX_HYPOTHESES = 150000 # Memory safety cap
+    MAX_HYPOTHESES = 150000 
     
     for idx in pair_order:
         e_angle = emp_pair_angles[idx]
@@ -55,11 +55,8 @@ def align_virtual_nodes(
         if len(matches) == 0: continue
         
         e1, e2 = e_nodes[emp_i[idx]], e_nodes[emp_j[idx]]
-        v1 = e1
-        v2 = e2 - np.dot(e1, e2) * e1
-        v2 /= np.linalg.norm(v2)
-        v3 = np.cross(v1, v2)
-        V = np.column_stack([v1, v2, v3]) 
+        e3 = np.cross(e1, e2)
+        emp_vecs = np.array([e1, e2, e3])
         
         t1_match = r_nodes_hyp[theo_i[matches]]
         t2_match = r_nodes_hyp[theo_j[matches]]
@@ -70,17 +67,17 @@ def align_virtual_nodes(
             t1, t2 = t1_match[m], t2_match[m]
             
             for s1, s2 in signs:
-                w1 = s1 * t1
-                w2_raw = s2 * t2
-                w2 = w2_raw - np.dot(w1, w2_raw) * w1; w2 /= np.linalg.norm(w2)
+                # -----------------------------------------------------
+                # THE PHYSICS FIX: Symmetric Kabsch Alignment (Scipy)
+                # -----------------------------------------------------
+                w1, w2 = s1 * t1, s2 * t2
                 w3 = np.cross(w1, w2)
-                U_hypotheses.append(V @ np.column_stack([w1, w2, w3]).T)
+                rot, _ = Rotation.align_vectors(emp_vecs, np.array([w1, w2, w3]))
+                U_hypotheses.append(rot.as_matrix())
                 
-                w1_f = s1 * t2
-                w2_f_raw = s2 * t1
-                w2_f = w2_f_raw - np.dot(w1_f, w2_f_raw) * w1_f; w2_f /= np.linalg.norm(w2_f)
-                w3_f = np.cross(w1_f, w2_f)
-                U_hypotheses.append(V @ np.column_stack([w1_f, w2_f, w3_f]).T)
+                w3_f = np.cross(w2, w1)
+                rot_f, _ = Rotation.align_vectors(emp_vecs, np.array([w2, w1, w3_f]))
+                U_hypotheses.append(rot_f.as_matrix())
                 
         if len(U_hypotheses) > MAX_HYPOTHESES:
             print(f"  > Safety limit reached ({MAX_HYPOTHESES}). Halting generator.")
@@ -112,9 +109,14 @@ def align_virtual_nodes(
     q_obs_j = jnp.array(q_sample_obs_norm, dtype=jnp.float32)
     r_eval_j = jnp.array(r_eval_rays_norm, dtype=jnp.float32) 
     
+    # -----------------------------------------------------
+    # THE FUNNEL FIX: Widen the capture radius to 1.5 deg!
+    # -----------------------------------------------------
+    search_tol = 1.5 
+    
     for i in range(0, len(U_batch), chunk_size):
         chunk = jnp.array(U_batch[i:i+chunk_size], dtype=jnp.float32)
-        inliers, residuals = evaluate_peaks_hard(chunk, q_obs_j, r_eval_j, angle_tol_cons)
+        inliers, residuals = evaluate_peaks_hard(chunk, q_obs_j, r_eval_j, search_tol)
         
         score = inliers - (residuals / 1000.0)
         max_idx = jnp.argmax(score)
@@ -124,7 +126,7 @@ def align_virtual_nodes(
             best_residual = residuals[max_idx]
             best_U = U_batch[i + int(max_idx)]
 
-    print(f"  > Global Consensus Achieved! Best Matrix mapped {best_inliers}/{len(q_sample_obs_norm)} RAW PEAKS (Mean Error: {best_residual:.3f} deg).")
+    print(f"  > Global Consensus Achieved! Best Matrix safely mapped {best_inliers}/{len(q_sample_obs_norm)} RAW PEAKS inside {search_tol} deg.")
     return best_U
 
 # -------------------------------------------------------------
