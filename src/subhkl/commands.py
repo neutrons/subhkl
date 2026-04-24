@@ -1527,12 +1527,16 @@ def run_sparse_hough(
             e_nodes.append(cand)
             e_weights.append(clustered_weights[cand_idx])
             continue
-        if np.max(np.abs(np.dot(e_nodes, cand))) < np.cos(np.deg2rad(15.0)):  
+            
+        # Dropped to 5.0 degrees to preserve tight topological clusters
+        if np.max(np.abs(np.dot(e_nodes, cand))) < np.cos(np.deg2rad(5.0)):  
             e_nodes.append(cand)
             e_weights.append(clustered_weights[cand_idx])
-        if len(e_nodes) == 10: break
+            
+        # REMOVED: The 10 node cap. All hubs are now evaluated!
             
     e_nodes = np.array(e_nodes)
+    e_weights = np.array(e_weights)
     print(f"  > Clustered and isolated {len(e_nodes)} high-stability Virtual Hubs.")
 
     print(f"  > Generating Massive Evaluation Dictionary (max_hkl={max_hkl_cons})...")
@@ -1540,18 +1544,20 @@ def run_sparse_hough(
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T
-
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+    
     r_theo_rays = (B_mat @ theo_hkl_c.T).T
     r_unique_rays_norm = r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True)
 
-    # Dispatch to the new Hub-Centric Solver
     U_davenport = align_virtual_nodes(
-        e_nodes,
-        r_unique_rays_norm,
-        B_mat,
-        max_hkl_hyp=max_hkl_hyp,
+        e_nodes, 
+        e_weights,              # <--- Passing the weights!
+        q_sample_obs_norm,      
+        r_unique_rays_norm,     
+        B_mat, 
+        max_hkl_hyp=max_hkl_hyp,   # <--- Keep using the CLI variable
         angle_tol_hyp=angle_tol_hyp,
+        angle_tol_cons=angle_tol_cons
     )
     print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 

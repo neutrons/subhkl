@@ -7,10 +7,13 @@ import optax
 
 def align_virtual_nodes(
     e_nodes, 
-    r_eval_rays_norm,    # <--- The Massive Evaluation Dictionary
+    e_weights,           # <--- NEW: Accepts empirical weights
+    q_sample_obs_norm,   
+    r_eval_rays_norm,    
     B_mat, 
-    max_hkl_hyp=3,       # <--- Expanded to catch true higher-order hubs
-    angle_tol_hyp=2.0    # <--- Safe capture radius for permutations
+    max_hkl_hyp=2, 
+    angle_tol_hyp=1.5,
+    angle_tol_cons=0.4
 ):
     print(f"  > Generating Theoretical Hubs for Hypotheses (max_hkl={max_hkl_hyp})...")
     h_vals = np.arange(-max_hkl_hyp, max_hkl_hyp + 1)
@@ -21,9 +24,8 @@ def align_virtual_nodes(
     r_nodes_hyp = (B_mat @ theo_hkl.T).T
     r_nodes_hyp /= np.linalg.norm(r_nodes_hyp, axis=1, keepdims=True)
     
-    print(f"  > Executing Exhaustive Pairwise Triad Generation...")
+    print(f"  > Executing Weight-Prioritized Pairwise Triad Generation...")
     
-    # Strictly positive angles (Laue geometry is unpolarized lines)
     emp_dots = np.clip(np.abs(e_nodes @ e_nodes.T), 0.0, 1.0)
     theo_dots = np.clip(np.abs(r_nodes_hyp @ r_nodes_hyp.T), 0.0, 1.0)
     
@@ -33,21 +35,25 @@ def align_virtual_nodes(
     emp_pair_angles = np.rad2deg(np.arccos(emp_dots[emp_i, emp_j]))
     theo_pair_angles = np.rad2deg(np.arccos(theo_dots[theo_i, theo_j]))
     
-    # Filter highly stable theoretical pairs (angles between 20 and 90 deg)
+    # --- WEIGHT SORTING ---
+    emp_pair_weights = e_weights[emp_i] * e_weights[emp_j]
+    pair_order = np.argsort(emp_pair_weights)[::-1]
+    
     stable_theo = theo_pair_angles > 20.0
     theo_i = theo_i[stable_theo]
     theo_j = theo_j[stable_theo]
     theo_pair_angles = theo_pair_angles[stable_theo]
     
     U_hypotheses = []
+    MAX_HYPOTHESES = 150000 # Memory safety cap
     
-    for idx, e_angle in enumerate(emp_pair_angles):
-        if e_angle < 20.0: continue 
+    for idx in pair_order:
+        e_angle = emp_pair_angles[idx]
+        if e_angle < 20.0 or e_angle > 160.0: continue 
         
         matches = np.where(np.abs(theo_pair_angles - e_angle) < angle_tol_hyp)[0]
         if len(matches) == 0: continue
         
-        # Build the Empirical Triad (Sample Frame)
         e1, e2 = e_nodes[emp_i[idx]], e_nodes[emp_j[idx]]
         v1 = e1
         v2 = e2 - np.dot(e1, e2) * e1
@@ -58,65 +64,57 @@ def align_virtual_nodes(
         t1_match = r_nodes_hyp[theo_i[matches]]
         t2_match = r_nodes_hyp[theo_j[matches]]
         
-        # The 8 Exhaustive Orthogonal Permutations
         signs = [(1,1), (1,-1), (-1,1), (-1,-1)]
         
         for m in range(len(matches)):
             t1, t2 = t1_match[m], t2_match[m]
             
             for s1, s2 in signs:
-                # Order 1
                 w1 = s1 * t1
                 w2_raw = s2 * t2
-                w2 = w2_raw - np.dot(w1, w2_raw) * w1
-                w2 /= np.linalg.norm(w2)
+                w2 = w2_raw - np.dot(w1, w2_raw) * w1; w2 /= np.linalg.norm(w2)
                 w3 = np.cross(w1, w2)
                 U_hypotheses.append(V @ np.column_stack([w1, w2, w3]).T)
                 
-                # Order 2 (Swapped)
                 w1_f = s1 * t2
                 w2_f_raw = s2 * t1
-                w2_f = w2_f_raw - np.dot(w1_f, w2_f_raw) * w1_f
-                w2_f /= np.linalg.norm(w2_f)
+                w2_f = w2_f_raw - np.dot(w1_f, w2_f_raw) * w1_f; w2_f /= np.linalg.norm(w2_f)
                 w3_f = np.cross(w1_f, w2_f)
                 U_hypotheses.append(V @ np.column_stack([w1_f, w2_f, w3_f]).T)
+                
+        if len(U_hypotheses) > MAX_HYPOTHESES:
+            print(f"  > Safety limit reached ({MAX_HYPOTHESES}). Halting generator.")
+            break
 
     if len(U_hypotheses) == 0:
-        raise ValueError("No matching Triads found.")
+        raise ValueError("No matching Triads found. Relax angle_tol_hyp.")
         
     U_batch = np.array(U_hypotheses)
-    print(f"  > Generated {len(U_batch)} orientation hypotheses. Scoring against the {len(e_nodes)} Empirical Hubs...")
+    print(f"  > Generated {len(U_batch)} hypotheses. Scoring against RAW PEAKS...")
 
-    # SCORES U-MATRIX EXCLUSIVELY AGAINST THE 10 PRISTINE HUBS
     @jit
-    def evaluate_hubs_hard(U_batch_j, e_nodes_j, r_eval_j, tol_deg):
-        # Map Massive Crystal Dictionary -> Sample Frame
+    def evaluate_peaks_hard(U_batch_j, q_obs_j, r_eval_j, tol_deg):
         r_samp = jnp.einsum('krc,mc->kmr', U_batch_j, r_eval_j)
+        dots = jnp.einsum('pr,kmr->kpm', q_obs_j, r_samp)
         
-        # Calculate angle to the 10 empirical hubs
-        dots = jnp.einsum('nr,kmr->knm', e_nodes_j, r_samp)
         max_dots = jnp.max(jnp.abs(dots), axis=2)
         angles = jnp.rad2deg(jnp.arccos(jnp.clip(max_dots, 0.0, 1.0)))
         
-        # How many of the 10 empirical hubs are perfectly explained?
         inliers = jnp.sum(angles < tol_deg, axis=1)
         residuals = jnp.sum(jnp.where(angles < tol_deg, angles, 0.0), axis=1) / jnp.maximum(inliers, 1)
         return inliers, residuals
         
-    chunk_size = 50000 # Memory is safe here because N is only 10!
+    chunk_size = 1000 
     best_U = None
     best_inliers = -1
     best_residual = np.inf
     
-    e_nodes_j = jnp.array(e_nodes, dtype=jnp.float32)
+    q_obs_j = jnp.array(q_sample_obs_norm, dtype=jnp.float32)
     r_eval_j = jnp.array(r_eval_rays_norm, dtype=jnp.float32) 
-    
-    # Very strict tolerance to prevent false symmetries locking on
-    eval_tol = 1.5 
     
     for i in range(0, len(U_batch), chunk_size):
         chunk = jnp.array(U_batch[i:i+chunk_size], dtype=jnp.float32)
-        inliers, residuals = evaluate_hubs_hard(chunk, e_nodes_j, r_eval_j, eval_tol)
+        inliers, residuals = evaluate_peaks_hard(chunk, q_obs_j, r_eval_j, angle_tol_cons)
         
         score = inliers - (residuals / 1000.0)
         max_idx = jnp.argmax(score)
@@ -126,8 +124,9 @@ def align_virtual_nodes(
             best_residual = residuals[max_idx]
             best_U = U_batch[i + int(max_idx)]
 
-    print(f"  > Global Consensus Achieved! Best Matrix safely mapped {best_inliers}/{len(e_nodes)} HUBS (Mean Error: {best_residual:.3f} deg).")
+    print(f"  > Global Consensus Achieved! Best Matrix mapped {best_inliers}/{len(q_sample_obs_norm)} RAW PEAKS (Mean Error: {best_residual:.3f} deg).")
     return best_U
+
 # -------------------------------------------------------------
 # CONTINUOUS VORONOI OPTIMIZER (HARD ASSIGNMENT)
 # -------------------------------------------------------------
