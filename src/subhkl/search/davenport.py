@@ -66,20 +66,20 @@ def jax_davenport_consensus(e_use_nodes, q_sample_obs_norm, r_hyp_nodes_batch, r
         jnp.stack([U20, U21, U22], axis=1)
     ], axis=1)
     
-    # Map theoretical rays to sample frame
     r_lab_batch = jnp.matmul(U_batch, r_theo_rays_norm.T)
-    # Cosine similarity against normalized empirical rays
+    
+    # dots shape: (N_peaks, Batch, N_theo_rays)
     dots = jnp.einsum('ei,nit->net', q_sample_obs_norm, r_lab_batch)
     
-    # Forward-scattering Laue: strict directional match (no abs())
+    # max_dots shape: (N_peaks, Batch)
     max_dots = jnp.max(jnp.clip(dots, -1.0, 1.0), axis=2) 
     angles = jnp.rad2deg(jnp.arccos(max_dots))
     
-    inliers = jnp.sum(angles < angle_tol_cons, axis=1)
-    residuals = jnp.sum(jnp.where(angles < angle_tol_cons, angles, 0.0), axis=1) / jnp.maximum(inliers, 1)
+    # axis=0 sums across N_peaks, returning a score array of shape (Batch,)
+    inliers = jnp.sum(angles < angle_tol_cons, axis=0)
+    residuals = jnp.sum(jnp.where(angles < angle_tol_cons, angles, 0.0), axis=0) / jnp.maximum(inliers, 1)
     
     return U_batch, inliers, residuals
-
 
 def align_virtual_nodes(
     e_nodes, 
