@@ -294,7 +294,6 @@ def plot_unrolled_detector(
     if zone_axes is not None:
         axis_collections.append((zone_axes, "Hough Zone", "-", 1.5, 'r'))
     if predicted_zone_axes is not None:
-        # Predicted gets bright contrasting colors, dashed lines, full opacity
         axis_collections.append((predicted_zone_axes, "Pred Zone", ":", 0.5, 'b'))
 
     if axis_collections:
@@ -313,6 +312,21 @@ def plot_unrolled_detector(
                         continue
                     s_lab = get_s_lab_for_image(img_key)
 
+                    # --- FAST PASS: Check if the plane intersects the panel at all ---
+                    # We check the 4 corners of the detector panel. If the field has the 
+                    # same sign on all 4 corners, the plane completely misses the panel!
+                    corner_rr = np.array([[0, det.n], [0, det.n]])
+                    corner_cc = np.array([[0, 0], [det.m, det.m]])
+                    xyz_corners = det.pixel_to_lab(corner_rr, corner_cc) - s_lab
+                    c_norms = np.linalg.norm(xyz_corners, axis=-1, keepdims=True)
+                    kf_corners = xyz_corners / np.where(c_norms == 0, 1.0, c_norms)
+                    field_corners = np.sum(kf_corners * za, axis=-1) - rhs
+                    
+                    # If all corners are positive or all negative, skip the heavy contour!
+                    if np.all(field_corners > 0.0) or np.all(field_corners < 0.0):
+                        continue 
+                        
+                    # --- If it intersects, proceed with the full high-res contour ---
                     c_grid = np.linspace(0, det.m, 50)
                     r_grid = np.linspace(0, det.n, 50)
                     cc, rr = np.meshgrid(c_grid, r_grid)
@@ -361,16 +375,17 @@ def plot_unrolled_detector(
     # ==========================================
     # PLOTTING VIRTUAL HUBS (NODAL POINTS)
     # ==========================================
+    # Capture the physical panel bounds and add a 10% safety margin
+    det_y_min, det_y_max = ax.get_ylim()
+    y_margin = (det_y_max - det_y_min) * 0.1
+
     def add_nodes_to_plot(nodes, marker, facecolor, edgecolor, label, size, zorder):
         if nodes is None or len(nodes) == 0: 
             return
             
         n_rotys, n_Ys = [], []
         for v in nodes:
-            # v is the normalized scattering vector (q_hat) in the Lab Frame
             q_hat = v / np.linalg.norm(v)
-            
-            # THE PHYSICS FIX: Reflect incident beam across the Bragg plane normal
             kf = ki_vec - 2.0 * np.dot(ki_vec, q_hat) * q_hat
             kf = kf / np.linalg.norm(kf)
             
@@ -385,30 +400,32 @@ def plot_unrolled_detector(
                 scaled_Y = Y * (mean_radius / r_xz)
             else:
                 scaled_Y = 0.0 
+                
+            # THE Y-PRUNING FIX: Completely drop hubs outside the viewing pane!
+            if scaled_Y < (det_y_min - y_margin) or scaled_Y > (det_y_max + y_margin):
+                continue
             
             n_rotys.append(roty)
             n_Ys.append(scaled_Y)
             
-        ax.scatter(
-            compress_roty(np.array(n_rotys)), 
-            np.array(n_Ys),
-            marker=marker, 
-            facecolors=facecolor, 
-            edgecolors=edgecolor,
-            s=size, 
-            linewidths=0.5, 
-            label=label, 
-            zorder=zorder
-        )
+        if n_rotys:  # Only scatter if there are points left to plot
+            ax.scatter(
+                compress_roty(np.array(n_rotys)), 
+                np.array(n_Ys),
+                marker=marker, 
+                facecolors=facecolor, 
+                edgecolors=edgecolor,
+                s=size, 
+                linewidths=0.5, 
+                label=label, 
+                zorder=zorder
+            )
 
-    # Lock the plot scale to the physical panels
-    det_y_min, det_y_max = ax.get_ylim()
-
-    # Plot the Hubs (Sizes halved to 30 and 40)
+    # Plot the Hubs
     add_nodes_to_plot(observed_nodes, marker='D', facecolor='cyan', edgecolor='black', label='Observed Hubs', size=15, zorder=6)
     add_nodes_to_plot(predicted_nodes, marker='X', facecolor='magenta', edgecolor='white', label='Predicted Hubs', size=20, zorder=7)
 
-    # Force the Y bounds back so extreme vertical nodes don't blow up the plot
+    # Force the Y bounds back just to be safe
     ax.set_ylim(det_y_min, det_y_max)
 
     # ==========================================
