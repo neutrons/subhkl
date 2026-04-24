@@ -290,17 +290,16 @@ def plot_unrolled_detector(
     # ==========================================
     axis_collections = []
     if zone_axes is not None:
-        axis_collections.append((zone_axes, "Hough Zone", "-", 0.6, plt.cm.tab20))
+        axis_collections.append((zone_axes, "Hough Zone", "-", 1.5, 'r'))
     if predicted_zone_axes is not None:
         # Predicted gets bright contrasting colors, dashed lines, full opacity
-        axis_collections.append((predicted_zone_axes, "Pred Zone", "-.", 1.0, plt.cm.Set1))
+        axis_collections.append((predicted_zone_axes, "Pred Zone", ":", 0.5, 'b'))
 
     if axis_collections:
         fig_dummy, ax_dummy = plt.subplots()
 
-        for (z_axes, label_prefix, l_style, l_alpha, cmap) in axis_collections:
+        for (z_axes, label_prefix, l_style, l_width, l_color) in axis_collections:
             added_za_label = False
-            colors_list = cmap(np.linspace(0, 1, max(10, len(z_axes))))
 
             for z_idx, za in enumerate(z_axes):
                 za = za / np.linalg.norm(za)
@@ -348,8 +347,8 @@ def plot_unrolled_detector(
                         for split_r, split_y in zip(roty_splits, Y_splits):
                             if len(split_r) > 1:
                                 ax.plot(compress_roty(split_r), split_y, 
-                                        color=colors_list[z_idx % len(colors_list)], 
-                                        lw=1.5, ls=l_style, alpha=l_alpha,
+                                        color=l_color,
+                                        lw=l_width, ls=l_style,
                                         label=label if not added_za_label else "")
                                 added_za_label = True
 
