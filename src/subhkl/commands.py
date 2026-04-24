@@ -1590,21 +1590,6 @@ def run_sparse_hough(
 
     print("Export complete. File is ready for discrete Laue polishing.")
 
-    print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
-    with h5py.File(output_h5_filename, "w") as f:
-        with h5py.File(finder_file, "r") as f_in:
-            for key in ["sample/a", "sample/b", "sample/c", "sample/alpha", "sample/beta", "sample/gamma",
-                        "sample/space_group", "sample/offset", "instrument/wavelength", "beam/ki_vec",
-                        "peaks/run_index", "peaks/image_index", "bank", "bank_ids", "peaks/pixel_r", "peaks/pixel_c",
-                        "goniometer/R", "goniometer/axes", "goniometer/angles", "goniometer/names"]:
-                if key in f_in:
-                    f.create_dataset(key, data=f_in[key][()])
-        f.create_dataset("peaks/xyz", data=xyz_out)
-        f.create_dataset("sample/U", data=U_final) # This is now officially U_sample
-        f.create_dataset("sample/B", data=B_mat)
-
-    print("Export complete. File is ready for discrete Laue polishing.")
-
     # ==========================================
     # PHASE 4: PARALLEL VISUALIZATION (PER RUN)
     # ==========================================
