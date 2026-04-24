@@ -1487,61 +1487,56 @@ def run_sparse_hough(
     print("\n[3/4] Global Combinatorial Search (Davenport)")
     from subhkl.search.davenport import align_virtual_nodes
     import itertools
+    from scipy.spatial import cKDTree
     
-    raw_nodes = []
+    print(f"  > Calculating weighted intersections of {len(empirical_zones)} zone axes...")
+    
+    raw_nodes, weights = [], []
     for z1, z2 in itertools.combinations(empirical_zones, 2):
         cross = np.cross(z1, z2)
-        norm = np.linalg.norm(cross)
-        if norm > 0.05:  
-            raw_nodes.append(cross / norm)
+        sin_theta = np.linalg.norm(cross)
+        if sin_theta > 0.3:  
+            raw_nodes.append(cross / sin_theta)
+            weights.append(sin_theta)
             
-    raw_nodes = np.array(raw_nodes)
+    raw_nodes, weights = np.array(raw_nodes), np.array(weights)
     sym_nodes = np.vstack([raw_nodes, -raw_nodes])
+    sym_weights = np.concatenate([weights, weights])
     
-    print(f"  > Computing density consensus among {len(sym_nodes)} intersections...")
-    dots = np.clip(sym_nodes @ sym_nodes.T, -1.0, 1.0)
-    vote_threshold = np.cos(np.deg2rad(2.0))
-    votes = np.sum(dots > vote_threshold, axis=1)
-    order = np.argsort(votes)[::-1]
+    tree = cKDTree(sym_nodes)
+    clusters = tree.query_ball_point(sym_nodes, r=np.deg2rad(2.0))
     
-    e_nodes, e_votes = [], []
-    for idx in order:
-        cand = sym_nodes[idx]
+    clustered_nodes, clustered_weights = [], []
+    processed = set()
+    for i, neighbors in enumerate(clusters):
+        if i in processed: continue
+        cluster_pts, cluster_wts = sym_nodes[neighbors], sym_weights[neighbors]
+        center = np.average(cluster_pts, axis=0, weights=cluster_wts)
+        clustered_nodes.append(center / np.linalg.norm(center))
+        clustered_weights.append(np.sum(cluster_wts))
+        processed.update(neighbors)
+        
+    clustered_nodes, clustered_weights = np.array(clustered_nodes), np.array(clustered_weights)
+    order = np.argsort(clustered_weights)[::-1]
+    sorted_nodes = clustered_nodes[order]
+    
+    e_nodes, e_weights = [], []
+    for cand_idx in range(len(sorted_nodes)):
+        cand = sorted_nodes[cand_idx]
         if not e_nodes:
             e_nodes.append(cand)
-            e_votes.append(votes[idx])
+            e_weights.append(clustered_weights[cand_idx])
             continue
-            
-        cos_15 = np.cos(np.deg2rad(15.0))
-        cand_dots = np.abs(np.dot(e_nodes, cand))
-        if np.max(cand_dots) < cos_15:  
+        if np.max(np.abs(np.dot(e_nodes, cand))) < np.cos(np.deg2rad(15.0)):  
             e_nodes.append(cand)
-            e_votes.append(votes[idx])
-            
-        if len(e_nodes) == 10: 
-            break
+            e_weights.append(clustered_weights[cand_idx])
+        if len(e_nodes) == 10: break
             
     e_nodes = np.array(e_nodes)
-    print(f"  > Density filter isolated {len(e_nodes)} pristine Virtual Hubs.")
+    print(f"  > Clustered and isolated {len(e_nodes)} high-stability Virtual Hubs.")
 
-    U_davenport = align_virtual_nodes(
-        e_nodes, 
-        B_mat, 
-        max_hkl_hyp=max_hkl_hyp,
-        angle_tol_hyp=angle_tol_hyp,
-    )
-    print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
-
-    # ==========================================
-    # PHASE 4: CONTINUOUS VORONOI POLISH
-    # ==========================================
-    print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
-    from scipy.spatial.transform import Rotation
-    from subhkl.search.davenport import optimize_orientation_gradient_descent
-    
-    q_seed = Rotation.from_matrix(U_davenport).as_quat() 
-    q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
-    
+    # --- NEW: Generate the Massive Evaluation Dictionary HERE ---
+    print(f"  > Generating Massive Evaluation Dictionary (max_hkl={max_hkl_cons})...")
     hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
@@ -1552,6 +1547,25 @@ def run_sparse_hough(
     r_rays_norm = r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True)
     _, unique_idx = np.unique(np.round(r_rays_norm, 4), axis=0, return_index=True)
     r_unique_rays_norm = r_rays_norm[unique_idx]
+
+    # Dispatch to Soft Assignment Triad Solver!
+    U_davenport = align_virtual_nodes(
+        e_nodes, 
+        r_unique_rays_norm, # <--- Passing the massive dictionary
+        B_mat, 
+        max_hkl_hyp=max_hkl_hyp,   
+        angle_tol_hyp=angle_tol_hyp
+    )
+
+    # ==========================================
+    # PHASE 4: CONTINUOUS VORONOI POLISH
+    # ==========================================
+    print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
+    from scipy.spatial.transform import Rotation
+    from subhkl.search.davenport import optimize_orientation_gradient_descent
+    
+    q_seed = Rotation.from_matrix(U_davenport).as_quat() 
+    q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
     
     r_lab_dav = U_davenport @ r_unique_rays_norm.T
     dots_dav = q_sample_obs_norm @ r_lab_dav
@@ -1574,9 +1588,9 @@ def run_sparse_hough(
     dots = q_sample_obs_norm @ r_lab
     max_dots = np.max(np.clip(dots, -1.0, 1.0), axis=1)
     angles = np.rad2deg(np.arccos(max_dots))
-    true_hits = np.sum(angles < 0.4)
+    true_hits = np.sum(angles < angle_tol_cons)
     
-    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs)} Laue rays (Tol = 0.4 deg).")
+    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs)} Laue rays (Tol = {angle_tol_cons} deg).")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
