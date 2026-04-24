@@ -1673,12 +1673,6 @@ def run_sparse_hough(
                 ki_vec=ub_helper.ki_vec,
             )
 
-            # --- PLOT FRAME MAPPING ---
-            # To plot the lines correctly, we must map the discovered Sample-Frame 
-            # zone axes back into the physical Lab Frame for this specific goniometer rotation.
-            R_run = r_gonio_obs[mask[0]]
-            lab_zones_for_plot = (R_run @ empirical_zones.T).T
-
             # --- GENERATE PREDICTED ZONES FOR DEBUGGING ---
             hc_vals = np.arange(-2, 3)
             hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
