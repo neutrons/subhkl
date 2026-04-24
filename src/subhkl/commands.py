@@ -1524,15 +1524,13 @@ def run_sparse_hough(
     e_nodes = np.array(e_nodes)
     print(f"  > Density filter isolated {len(e_nodes)} pristine Virtual Hubs.")
 
-    # FORCE MAX_HKL_HYP = 3 to break the False Symmetry Trap
     U_davenport = align_virtual_nodes(
         e_nodes, 
-        q_sample_obs_norm,  
         B_mat, 
-        max_hkl_hyp=3,              # <--- HARDCODED OVERRIDE
+        max_hkl_hyp=max_hkl_hyp,
         max_hkl_cons=max_hkl_cons,
         angle_tol_hyp=angle_tol_hyp,
-        angle_tol_cons=0.4          # <--- STRICT TOLERANCE
+        angle_tol_cons=angle_tol_cons,
     )
     print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 
