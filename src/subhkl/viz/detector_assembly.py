@@ -367,20 +367,24 @@ def plot_unrolled_detector(
             
         n_rotys, n_Ys = [], []
         for v in nodes:
-            v = v / np.linalg.norm(v)
-            X, Y, Z = v[0], v[1], v[2]
+            # v is the normalized scattering vector (q_hat) in the Lab Frame
+            q_hat = v / np.linalg.norm(v)
             
-            # Map unit vector direction to cylindrical projection
+            # THE PHYSICS FIX: Reflect incident beam across the Bragg plane normal
+            kf = ki_vec - 2.0 * np.dot(ki_vec, q_hat) * q_hat
+            kf = kf / np.linalg.norm(kf)
+            
+            X, Y, Z = kf[0], kf[1], kf[2]
+            
             roty = np.rad2deg(np.arctan2(X, Z))
             if len(wrapped_panels) > 0 and roty < 0:
                 roty += 360
             
-            # Scale the Y component out to the physical detector radius
             r_xz = np.sqrt(X**2 + Z**2)
             if r_xz > 1e-6:
                 scaled_Y = Y * (mean_radius / r_xz)
             else:
-                scaled_Y = 0.0 # Pointing straight up/down the cylinder axis
+                scaled_Y = 0.0 
             
             n_rotys.append(roty)
             n_Ys.append(scaled_Y)
@@ -392,16 +396,17 @@ def plot_unrolled_detector(
             facecolors=facecolor, 
             edgecolors=edgecolor,
             s=size, 
-            linewidths=1.0, 
+            linewidths=0.5, 
             label=label, 
             zorder=zorder
         )
 
+    # Lock the plot scale to the physical panels
     det_y_min, det_y_max = ax.get_ylim()
 
-    # Plot the Hubs on top of everything else
-    add_nodes_to_plot(observed_nodes, marker='D', facecolor='cyan', edgecolor='black', label='Observed Hubs', size=60, zorder=6)
-    add_nodes_to_plot(predicted_nodes, marker='X', facecolor='magenta', edgecolor='white', label='Predicted Hubs', size=80, zorder=7)
+    # Plot the Hubs (Sizes halved to 30 and 40)
+    add_nodes_to_plot(observed_nodes, marker='D', facecolor='cyan', edgecolor='black', label='Observed Hubs', size=30, zorder=6)
+    add_nodes_to_plot(predicted_nodes, marker='X', facecolor='magenta', edgecolor='white', label='Predicted Hubs', size=40, zorder=7)
 
     # Force the Y bounds back so extreme vertical nodes don't blow up the plot
     ax.set_ylim(det_y_min, det_y_max)
