@@ -1355,8 +1355,7 @@ def run_merge_images(
 
 def _render_run_unrolled_plot(args):
     """Standalone plotting function for generating unrolled plots per run."""
-    # We unpack 6 arguments here to include zone_axes
-    out_name, peaks, images, detectors, instrument, zone_axes = args
+    out_name, peaks, images, detectors, instrument, zone_axes, pred_zone_axes = args
 
     import matplotlib.pyplot as plt
     from subhkl.viz.detector_assembly import plot_unrolled_detector
@@ -1370,6 +1369,7 @@ def _render_run_unrolled_plot(args):
         images,
         detectors,
         zone_axes=zone_axes,
+        predicted_zone_axes=pred_zone_axes,
         out_name=out_name,
         instrument=instrument
     )
@@ -1678,13 +1678,28 @@ def run_sparse_hough(
             R_run = r_gonio_obs[mask[0]]
             lab_zones_for_plot = (R_run @ empirical_zones.T).T
 
+            # --- GENERATE PREDICTED ZONES FOR DEBUGGING ---
+            # Create a small subset of major predicted zone axes (e.g. max_hkl=2)
+            hc_vals = np.arange(-2, 3)
+            hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+            hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+            mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+            theo_hkl_zones = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+            
+            r_theo_zones = (B_mat @ theo_hkl_zones.T).T
+            r_theo_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
+            
+            # Map theoretical zones back to the lab frame using U_davenport (or U_final)
+            pred_lab_zones_for_plot = (R_run @ U_davenport @ r_theo_zones_norm.T).T
+
             run_tasks.append((
                 out_name,
                 run_peaks,
                 data["images"],
                 data["detectors"],
                 instrument_name,
-                lab_zones_for_plot
+                lab_zones_for_plot,
+                pred_lab_zones_for_plot
             ))
 
         if max_workers := min(os.cpu_count() or 4, len(run_tasks)):

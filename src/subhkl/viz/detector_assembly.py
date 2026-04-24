@@ -9,6 +9,7 @@ def plot_unrolled_detector(
     detectors,
     finder_peaks=None,
     zone_axes=None,
+    predicted_zone_axes=None,
     out_name="unrolled_detector_peaks.png",
     instrument=None,
 ):
@@ -285,69 +286,76 @@ def plot_unrolled_detector(
             )
 
     # ==========================================
-    # plotting zone axes (conic sections)
+    # DUAL ZONE AXIS PLOTTING (CONIC SECTIONS)
     # ==========================================
+    axis_collections = []
     if zone_axes is not None:
-        added_za_label = False
-        colors_list = plt.cm.tab10(np.linspace(0, 1, len(zone_axes)))
+        axis_collections.append((zone_axes, "Hough Zone", "-", 0.6, plt.cm.tab20))
+    if predicted_zone_axes is not None:
+        # Predicted gets bright contrasting colors, dashed lines, full opacity
+        axis_collections.append((predicted_zone_axes, "Pred Zone", "--", 1.0, plt.cm.Set1))
 
-        # Use a dummy figure so pixel contours do not pollute the main plot's Y-axis
+    if axis_collections:
         fig_dummy, ax_dummy = plt.subplots()
 
-        for z_idx, za in enumerate(zone_axes):
-            za = za / np.linalg.norm(za)
-            rhs = np.dot(ki_vec, za)
-            label = f"Zone Axis {z_idx+1}"
+        for (z_axes, label_prefix, l_style, l_alpha, cmap) in axis_collections:
+            added_za_label = False
+            colors_list = cmap(np.linspace(0, 1, max(10, len(z_axes))))
 
-            for img_key, det in detectors.items():
-                if img_key not in images:
-                    continue
-                s_lab = get_s_lab_for_image(img_key)
+            for z_idx, za in enumerate(z_axes):
+                za = za / np.linalg.norm(za)
+                rhs = np.dot(ki_vec, za)
+                label = f"{label_prefix} {z_idx+1}"
 
-                c_grid = np.linspace(0, det.m, 50)
-                r_grid = np.linspace(0, det.n, 50)
-                cc, rr = np.meshgrid(c_grid, r_grid)
-                xyz = det.pixel_to_lab(rr, cc) - s_lab
-                norms = np.linalg.norm(xyz, axis=-1, keepdims=True)
-                kf_grid = xyz / np.where(norms == 0, 1.0, norms)
+                for img_key, det in detectors.items():
+                    if img_key not in images:
+                        continue
+                    s_lab = get_s_lab_for_image(img_key)
 
-                field = np.sum(kf_grid * za, axis=-1) - rhs
+                    c_grid = np.linspace(0, det.m, 50)
+                    r_grid = np.linspace(0, det.n, 50)
+                    cc, rr = np.meshgrid(c_grid, r_grid)
+                    xyz = det.pixel_to_lab(rr, cc) - s_lab
+                    norms = np.linalg.norm(xyz, axis=-1, keepdims=True)
+                    kf_grid = xyz / np.where(norms == 0, 1.0, norms)
 
-                # Plot to the DUMMY axis, entirely protecting the main `ax`
-                cs = ax_dummy.contour(cc, rr, field, levels=[0]) 
+                    field = np.sum(kf_grid * za, axis=-1) - rhs
 
-                if hasattr(cs, "collections"):
-                    paths = [path for col in cs.collections for path in col.get_paths()]
-                else:
-                    paths = cs.get_paths()
+                    cs = ax_dummy.contour(cc, rr, field, levels=[0]) 
 
-                for path in paths:
-                    v = path.vertices
-                    if len(v) == 0: continue
+                    if hasattr(cs, "collections"):
+                        paths = [path for col in cs.collections for path in col.get_paths()]
+                    else:
+                        paths = cs.get_paths()
 
-                    line_xyz = det.pixel_to_lab(v[:, 1], v[:, 0]) - s_lab
-                    l_X, l_Y, l_Z = line_xyz[:, 0], line_xyz[:, 1], line_xyz[:, 2]
-                    l_roty = np.rad2deg(np.arctan2(l_X, l_Z))
+                    for path in paths:
+                        v = path.vertices
+                        if len(v) == 0: continue
 
-                    if img_key in wrapped_panels:
-                        l_roty = np.where(l_roty < 0, l_roty + 360, l_roty)
+                        line_xyz = det.pixel_to_lab(v[:, 1], v[:, 0]) - s_lab
+                        l_X, l_Y, l_Z = line_xyz[:, 0], line_xyz[:, 1], line_xyz[:, 2]
+                        l_roty = np.rad2deg(np.arctan2(l_X, l_Z))
 
-                    diffs = np.abs(np.diff(l_roty))
-                    split_indices = np.where(diffs > 180)[0] + 1
+                        if img_key in wrapped_panels:
+                            l_roty = np.where(l_roty < 0, l_roty + 360, l_roty)
 
-                    roty_splits = np.split(l_roty, split_indices)
-                    Y_splits = np.split(l_Y, split_indices)
+                        diffs = np.abs(np.diff(l_roty))
+                        split_indices = np.where(diffs > 180)[0] + 1
 
-                    for split_r, split_y in zip(roty_splits, Y_splits):
-                        if len(split_r) > 1:
-                            ax.plot(compress_roty(split_r), split_y, 
-                                    color=colors_list[z_idx], lw=1.5, alpha=0.8,
-                                    label=label if not added_za_label else "")
-                            added_za_label = True
+                        roty_splits = np.split(l_roty, split_indices)
+                        Y_splits = np.split(l_Y, split_indices)
 
-                ax_dummy.clear() # Clear state for the next panel iteration
+                        for split_r, split_y in zip(roty_splits, Y_splits):
+                            if len(split_r) > 1:
+                                ax.plot(compress_roty(split_r), split_y, 
+                                        color=colors_list[z_idx % len(colors_list)], 
+                                        lw=1.5, ls=l_style, alpha=l_alpha,
+                                        label=label if not added_za_label else "")
+                                added_za_label = True
 
-        plt.close(fig_dummy) # Destroy the dummy figure to free memory
+                    ax_dummy.clear()
+
+        plt.close(fig_dummy)
 
     # ==========================================
     # FORMATTING & GAPS VISUALIZATION
