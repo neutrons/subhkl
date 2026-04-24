@@ -1548,10 +1548,10 @@ def run_sparse_hough(
     # Dispatch to the new Hub-Centric Solver
     U_davenport = align_virtual_nodes(
         e_nodes,
-        r_unique_rays_norm,    # <--- Passing the massive dictionary
+        r_unique_rays_norm,
         B_mat,
-        max_hkl_hyp=3,         # <--- Force to 3 to ensure correct pairs are generated
-        angle_tol_hyp=2.0
+        max_hkl_hyp=max_hkl_hyp,
+        angle_tol_hyp=angle_tol_hyp,
     )
     print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 
@@ -1649,9 +1649,7 @@ def run_sparse_hough(
 
             R_run = r_gonio_obs[mask[0]]
 
-            # --- THE VISUALIZER BUG FIX: MUST BE EXPANDED TO max_hkl=3 TO RENDER TRUE HUBS ---
-            # Do not use max_hkl=5 or the screen will be completely black with noise
-            viz_hkl = 3
+            viz_hkl = max_hkl_hyp
             A_mat = np.linalg.inv(B_mat).T
             hc_vals = np.arange(-viz_hkl, viz_hkl + 1)
             hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
