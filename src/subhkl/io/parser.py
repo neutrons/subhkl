@@ -576,123 +576,49 @@ def merge_images(
         print(str(e))
         raise typer.Exit(code=1)
 
-
-@app.command()
-def zone_axis_search(
-    merged_h5_filename: str,
-    peaks_h5_filename: str,
-    instrument: str,
-    output_h5_filename: str,
-    d_min: float = 1.0,
-    space_group: Annotated[
-        str,
-        typer.Option(help="(Optional) Space group for zone-axis search"),
-    ] = None,
-    vector_tolerance: Annotated[
-        float,
-        typer.Option(
-            help="Angular capture radius in degrees for the objective function."
-        ),
-    ] = 0.15,
-    border_frac: Annotated[
-        float, typer.Option(help="Fraction of image to crop at the border.")
-    ] = 0.1,
-    min_intensity: Annotated[
-        float, typer.Option(help="Minimum peak amplitude.")
-    ] = 50.0,
-    hough_grid_resolution: Annotated[
-        int, typer.Option(help="Lambert grid resolution.")
-    ] = 1024,
-    n_hough: Annotated[
-        int, typer.Option(help="Maximum number of empirical zone axes.")
-    ] = 15,
-    davenport_angle_tol: Annotated[
-        float, typer.Option(help="Graph search angle tolerance in degrees.")
-    ] = 0.5,
-    top_k_rays: Annotated[
-        int, typer.Option(help="Max rays per image to feed the Hough Transform.")
-    ] = 15,
-    max_uvw: Annotated[
-        int, typer.Option(help="Maximum uvw index for zone axis search")
-    ] = 25,
-    L_max: Annotated[
-        float,
-        typer.Option(
-            help="Maximum real-space vector length for theoretical zone axes (Angstroms)."
-        ),
-    ] = 250.0,
-    top_k: Annotated[
-        int, typer.Option(help="Maximum number of reciprocal grid points to consider.")
-    ] = 1000,
-    num_runs: Annotated[
-        int, typer.Option(help="Number of goniometer runs to use. Set to 0 to use all.")
-    ] = 0,
-    output_hough: Annotated[
-        str | None, typer.Option(help="Diagnostic hough transform image filename.")
-    ] = None,
-    batch_size: Annotated[
-        int, typer.Option(help="Batch size for validation loop")
-    ] = 1024,
-):
-    """
-    Global Zone-Axis Search to find the macroscopic crystal orientation (U matrix).
-    Outputs an HDF5 file that can be passed directly to 'indexer --bootstrap'.
-    """
-    run_zone_axis_search(
-        merged_h5_filename=merged_h5_filename,
-        peaks_h5_filename=peaks_h5_filename,
-        instrument=instrument,
-        output_h5_filename=output_h5_filename,
-        space_group=space_group,
-        d_min=d_min,
-        vector_tolerance=vector_tolerance,
-        border_frac=border_frac,
-        min_intensity=min_intensity,
-        hough_grid_resolution=hough_grid_resolution,
-        n_hough=n_hough,
-        davenport_angle_tol=davenport_angle_tol,
-        top_k_rays=top_k_rays,
-        max_uvw=max_uvw,
-        L_max=L_max,
-        top_k=top_k,
-        num_runs=num_runs,
-        output_hough=output_hough,
-        batch_size=batch_size,
-    )
-
 @app.command(name="sparse-hough")
 def sparse_hough_cmd(
-    finder_file: Annotated[
-        str, typer.Argument(help="Input HDF5 file containing found peaks.")
-    ],
-    output_h5_filename: Annotated[
-        str, typer.Argument(help="Output HDF5 file containing the initial U-matrix.")
-    ],
-    instrument: Annotated[
-        str, typer.Option(help="Instrument name to rebuild physical geometry from pixels.")
-    ],
-    nexus: Annotated[
-        str, typer.Option(help="Original NeXus file to rebuild physical geometry from pixels.")
-    ],
-    tolerance_deg: Annotated[
-        float, typer.Option(help="Angular tolerance for detecting great circles, in degree.")
-    ] = 0.15,
-    max_axes: Annotated[
-        int, typer.Option(help="Maximum number of zone axes to consider.")
-    ] = 15,
-    max_uvw: Annotated[
-        int, typer.Option(help="Maximum uvw index for theoretical triad matching.")
-    ] = 1,
-    angle_tol: Annotated[
-        float, typer.Option(help="Tolerance for the graph matching between theoretical and empirical zone axes.")
-    ] = 1.5,
-    create_visualizations: Annotated[
-        bool, typer.Option("--create-visualizations", help="Plot unrolled detector images with projected Great Circles.")
-    ] = False,
+    finder_file: str = typer.Argument(
+        ..., help="Path to the output peaks HDF5 file from the finder."
+    ),
+    output_h5_filename: str = typer.Argument(
+        ..., help="Path to save the extracted initial UB matrix."
+    ),
+    instrument: str = typer.Option(
+        None, "--instrument", help="Name of the instrument (e.g., MANDI, IMAGINE, CG4D)."
+    ),
+    nexus: str = typer.Option(
+        None, "--nexus", help="Path to the original Nexus file for geometry reconstruction."
+    ),
+    tolerance_deg: float = typer.Option(
+        0.15, help="Density-Driven Set Cover angular tolerance for Laue cones (deg)."
+    ),
+    angle_tol_hyp: float = typer.Option(
+        1.5, help="Tolerance for internal angle matching of Virtual Hubs (deg)."
+    ),
+    angle_tol_cons: float = typer.Option(
+        0.4, help="Strict capture tolerance for final Bragg peak validation (deg)."
+    ),
+    max_axes: int = typer.Option(
+        15, help="Maximum number of dense Laue cones to extract."
+    ),
+    max_hkl_hyp: int = typer.Option(
+        2, help="Max HKL for generating the Virtual Node hypothesis dictionary."
+    ),
+    max_hkl_cons: int = typer.Option(
+        5, help="Max HKL for the Global Peak Consensus validation dictionary."
+    ),
+    max_uvw: int = typer.Option(
+        10, help="Max UVW for generating theoretical Zone Axes."
+    ),
+    create_visualizations: bool = typer.Option(
+        False, "--create-visualizations", help="Generate unrolled detector plots."
+    ),
 ):
     """
-    Algebraic Orientation Bootstrapper using L1-Regularized Sparse Basis Pursuit.
+    Algebraic Orientation Bootstrapper using L1-Regularized Sparse Basis Pursuit and Dual-Space Voronoi Polish.
     """
+    from subhkl.commands import run_sparse_hough
 
     run_sparse_hough(
         finder_file=finder_file,
@@ -700,9 +626,12 @@ def sparse_hough_cmd(
         instrument_name=instrument,
         original_nexus_filename=nexus,
         tolerance_deg=tolerance_deg,
-        angle_tol=angle_tol,
-        max_uvw=max_uvw,
+        angle_tol_hyp=angle_tol_hyp,
+        angle_tol_cons=angle_tol_cons,
         max_axes=max_axes,
+        max_hkl_hyp=max_hkl_hyp,
+        max_hkl_cons=max_hkl_cons,
+        max_uvw=max_uvw,
         create_visualizations=create_visualizations,
     )
 
