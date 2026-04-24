@@ -1528,7 +1528,6 @@ def run_sparse_hough(
         e_nodes, 
         B_mat, 
         max_hkl_hyp=max_hkl_hyp,
-        max_hkl_cons=max_hkl_cons,
         angle_tol_hyp=angle_tol_hyp,
         angle_tol_cons=angle_tol_cons,
     )
