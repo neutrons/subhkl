@@ -1565,35 +1565,52 @@ def run_sparse_hough(
     print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
     from scipy.spatial.transform import Rotation
     from subhkl.search.davenport import optimize_orientation_gradient_descent
-
-    q_seed = Rotation.from_matrix(U_davenport).as_quat()
+    
+    q_seed = Rotation.from_matrix(U_davenport).as_quat() 
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
-
-    r_lab_dav = U_davenport @ r_unique_rays_norm.T
+    
+    # --- THE POLISHER UPGRADE: Build a MASSIVE dictionary to capture all 540 raw peaks! ---
+    hkl_polish = 5 
+    print(f"  > Generating Dense Polishing Dictionary (max_hkl={hkl_polish})...")
+    hc_vals = np.arange(-hkl_polish, hkl_polish + 1)
+    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+    
+    r_theo_rays_polish = (B_mat @ theo_hkl_c.T).T
+    r_rays_norm_polish = r_theo_rays_polish / np.linalg.norm(r_theo_rays_polish, axis=1, keepdims=True)
+    _, unique_idx = np.unique(np.round(r_rays_norm_polish, 4), axis=0, return_index=True)
+    r_polish_rays_norm = r_rays_norm_polish[unique_idx]
+    
+    # 1. Filter the raw peaks that fall near our newly dense dictionary
+    r_lab_dav = U_davenport @ r_polish_rays_norm.T
     dots_dav = q_sample_obs_norm @ r_lab_dav
     max_dots_dav = np.max(np.clip(dots_dav, -1.0, 1.0), axis=1)
     angles_dav = np.rad2deg(np.arccos(max_dots_dav))
-
-    # We drop to 1.0 degrees here to protect the optimizer from pulling in background noise
-    inlier_mask = angles_dav < 1.0
+    
+    # 2.0 degrees capture radius to ensure we grab the high-order peaks before polishing
+    inlier_mask = angles_dav < 2.0 
     q_obs_clean = q_sample_obs_norm[inlier_mask]
-
-    print(f"  > Davenport isolated {len(q_obs_clean)} clean signal raw peaks. Polishing...")
-
+    
+    print(f"  > Davenport captured {len(q_obs_clean)} raw peaks in its gravity well. Polishing...")
+    
+    # 2. Execute Gradient Descent
     U_final = optimize_orientation_gradient_descent(
-        q_seed_jax,
-        jnp.array(q_obs_clean),
-        jnp.array(r_unique_rays_norm),
-        steps=500
+        q_seed_jax, 
+        jnp.array(q_obs_clean), 
+        jnp.array(r_polish_rays_norm), 
+        steps=steps
     )
-
-    r_lab = U_final @ r_unique_rays_norm.T
+    
+    # 3. Final Validation Count
+    r_lab = U_final @ r_polish_rays_norm.T
     dots = q_sample_obs_norm @ r_lab
     max_dots = np.max(np.clip(dots, -1.0, 1.0), axis=1)
     angles = np.rad2deg(np.arccos(max_dots))
-    true_hits = np.sum(angles < angle_tol_cons)
-
-    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs)} Laue rays (Tol = {angle_tol_cons} deg).")
+    true_hits = np.sum(angles < 0.4)
+    
+    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs_norm)} Laue rays (Tol = 0.4 deg).")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
@@ -1605,7 +1622,7 @@ def run_sparse_hough(
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
         f.create_dataset("peaks/xyz", data=xyz_out)
-        f.create_dataset("sample/U", data=U_final)
+        f.create_dataset("sample/U", data=U_final) 
         f.create_dataset("sample/B", data=B_mat)
 
     print("Export complete.")
