@@ -1551,12 +1551,12 @@ def run_sparse_hough(
     # Dispatch to Triad Solver using the CLI variables
     U_davenport = align_virtual_nodes(
         e_nodes, 
+        B_mat, 
         q_sample_obs_norm,
         r_unique_rays_norm,
-        B_mat, 
         max_hkl_hyp=max_hkl_hyp,   
-        angle_tol_hyp=angle_tol_hyp,
-        angle_tol_cons=angle_tol_cons
+        max_hkl_cons=max_hkl_cons,
+        angle_tol_hyp=angle_tol_hyp
     )
     print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 
