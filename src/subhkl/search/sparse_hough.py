@@ -271,9 +271,12 @@ class AzimuthalJAXHough:
         from subhkl.search.sparse_hough import GlobalZoneAxisSniper
         from scipy.ndimage import maximum_filter
         
-        # We use the narrowest width as the normalization reference for the Besov weights
-        ref_sig = float(self.candidate_sigmas[0])
-        sniper = GlobalZoneAxisSniper(loss="poisson", gamma=1.0, ref_sigma=ref_sig)
+        # 1. The Scout gets a WIDE net to guarantee topological closure
+        self.sigma = np.sin(np.deg2rad(3.0)) 
+        
+        # 2. The Besov Dictionary uses the sharpest physical width (1.5 deg) as its reference
+        ref_sig = np.sin(np.deg2rad(1.5))
+        sniper = GlobalZoneAxisSniper(loss="poisson", gamma=2.0, ref_sigma=ref_sig)
         
         grid_flat_raw = jnp.array(grid_raw).flatten()
         bg_flat = sniper._compute_background(grid_raw, filter_size=31).flatten()
@@ -281,18 +284,50 @@ class AzimuthalJAXHough:
         grid_signal_base = jnp.maximum(jnp.array(grid_raw) - bg_flat.reshape(self.N_theta, self.N_phi), 0.0)
         
         H_np = np.array(self.transform(grid_signal_base))
-        local_max = (H_np == maximum_filter(H_np, size=11))
-        valid_peaks = local_max & (H_np > np.max(H_np) * 0.05)
-        t_coords, p_coords = np.where(valid_peaks)
         
-        intensities = H_np[t_coords, p_coords]
+        # 3. THE BOUNDARY FIX: 'wrap' allows the XZ plane to connect across the Phi boundary!
+        local_max = (H_np == maximum_filter(H_np, size=15, mode=('reflect', 'wrap')))
+        valid_peaks = local_max & (H_np > np.max(H_np) * 0.05)
+        t_coords_all, p_coords_all = np.where(valid_peaks)
+        
+        intensities = H_np[t_coords_all, p_coords_all]
         order = np.argsort(intensities)[::-1]
-        t_coords = t_coords[order][:40] 
-        p_coords = p_coords[order][:40]
+        t_coords_all = t_coords_all[order]
+        p_coords_all = p_coords_all[order]
+        
+        print(f"  > Scout identified {len(t_coords_all)} raw hubs. Applying Physical NMS...")
+        
+        # 4. THE DEGENERACY FIX: Physical 3D Non-Maximum Suppression
+        t_coords = []
+        p_coords = []
+        kept_normals = []
+        
+        for t, p in zip(t_coords_all, p_coords_all):
+            z_vec = np.array([
+                np.sin(float(self.thetas[t])) * np.cos(float(self.phis[p])),
+                np.sin(float(self.thetas[t])) * np.sin(float(self.phis[p])),
+                np.cos(float(self.thetas[t]))
+            ])
+            
+            if not kept_normals:
+                t_coords.append(t)
+                p_coords.append(p)
+                kept_normals.append(z_vec)
+                continue
+                
+            # Check physical Cartesian angle against all accepted hubs
+            dots = np.abs(np.dot(kept_normals, z_vec))
+            if np.max(dots) < np.cos(np.deg2rad(3.5)): # Must be > 3.5 deg apart
+                t_coords.append(t)
+                p_coords.append(p)
+                kept_normals.append(z_vec)
+                
+            if len(t_coords) == 40:
+                break
+                
+        print(f"  > Kept {len(t_coords)} spatially unique hubs. Generating Multi-Scale dictionary...")
         
         dictionary_params = []
-        
-        print(f"  > Scout identified {len(t_coords)} spatial hubs. Generating Multi-Scale frame...")
         
         for t, p in zip(t_coords, p_coords):
             Theta = float(self.thetas[t])
@@ -326,10 +361,11 @@ class AzimuthalJAXHough:
             else:
                 vc_x, vc_y, vc_z, kappa = 1.0, 0.0, 0.0, 0.0
                 
-            # MULTI-SCALE DICTIONARY: Append a candidate for every possible physical width!
-            for sig in self.candidate_sigmas:
+            # Populate dictionary with candidate widths!
+            for sig in [1.5, 2.0, 2.5, 3.0, 4.0, 5.0]:
                 c_init = float(H_np[t, p] / self.N_phi)
-                dictionary_params.append([c_init, z_x, z_y, z_z, float(sig), vc_x, vc_y, vc_z, kappa])
+                sig_rad = np.sin(np.deg2rad(sig))
+                dictionary_params.append([c_init, z_x, z_y, z_z, float(sig_rad), vc_x, vc_y, vc_z, kappa])
             
         print(f"  > Executing Joint Poisson Basis Pursuit on {len(dictionary_params)} multi-scale vectors...")
         p_guess = jnp.array(dictionary_params)
@@ -350,8 +386,6 @@ class AzimuthalJAXHough:
         final_zones = active_candidates[:, 1:4]
         final_weights = np.array(c_sparse[survivors])
         
-        # There might be multiple valid scales surviving for the SAME normal vector. 
-        # We find unique spatial normals to hand to the Combinatorial Davenport solver.
         unique_zones, unique_indices = np.unique(np.round(final_zones, 4), axis=0, return_index=True)
         unique_weights = final_weights[unique_indices]
         
