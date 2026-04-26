@@ -1355,7 +1355,7 @@ def run_merge_images(
 
 def _render_run_unrolled_plot(args):
     """Standalone plotting function for generating unrolled plots per run."""
-    out_name, peaks, images, detectors, instrument, zone_axes, pred_zone_axes, obs_nodes, pred_nodes = args
+    out_name, peaks, images, detectors, instrument, zone_axes, pred_zone_axes = args
 
     import matplotlib.pyplot as plt
     from subhkl.viz.detector_assembly import plot_unrolled_detector
@@ -1369,8 +1369,6 @@ def _render_run_unrolled_plot(args):
         detectors,
         zone_axes=zone_axes,
         predicted_zone_axes=pred_zone_axes,
-        observed_nodes=obs_nodes,
-        predicted_nodes=pred_nodes,
         out_name=out_name,
         instrument=instrument
     )
@@ -1671,4 +1669,9 @@ def run_sparse_hough(
                         out_name = future.result()
                         print(f"Saved: {out_name}")
                     except Exception:
-                        pass
+                        import traceback
+
+                        print(f"Visualization failed for {out_name}:")
+                        traceback.print_exc()
+
+
