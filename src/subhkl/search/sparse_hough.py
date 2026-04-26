@@ -246,6 +246,7 @@ class AzimuthalJAXHough:
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
+            c_init_new = max_val / self.N_phi
            
             # warm-start solver
             new_cand = [z_x, z_y, z_z, float(self.sigma)]
