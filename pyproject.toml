@@ -14,6 +14,7 @@ dependencies = [
     "gemmi>=0.7.3",
     "tdqm>=0.0.1",
     "scipy>=1.17.1",
+    "s2fft",
     "optax",
 ]
 license = { text = "GPL3.0" }

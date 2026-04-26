@@ -1397,8 +1397,6 @@ def run_sparse_hough(
     create_visualizations: bool = False,
 ):
     from subhkl.optimization import FindUB
-    from subhkl.search.sparse_hough import SparseHoughIndexer
-    from subhkl.integration.api import Peaks
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
 
@@ -1416,70 +1414,96 @@ def run_sparse_hough(
         ub_helper.sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
         ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
 
-        if "peaks/pixel_r" not in f or "peaks/pixel_c" not in f:
-            raise ValueError("ERROR: Input file missing pixel_r/pixel_c. Cannot perform indexing.")
-
-        if not instrument_name or not original_nexus_filename:
-            raise ValueError("ERROR: Finder file contains pixels. You must provide --instrument and --nexus.")
-
         pixel_r = f["peaks/pixel_r"][()]
         pixel_c = f["peaks/pixel_c"][()]
         img_indices = f["peaks/image_index"][()]
         run_indices = f["peaks/run_index"][()] if "peaks/run_index" in f else img_indices
 
-        # Extract Goniometer Rotations to map everything to the Sample Frame
         if "goniometer/R" in f:
             R_all = f["goniometer/R"][()]
-            # Map each peak to its specific rotation matrix based on its image index
             r_gonio_obs = R_all[img_indices.astype(int)]
         else:
-            print("  > Warning: No goniometer/R found in finder file. Assuming static rotation (Identity).")
             r_gonio_obs = np.tile(np.eye(3), (len(pixel_r), 1, 1))
 
-        if "bank" in f:
-            bank_array = f["bank"][()]
+        if "bank" in f: bank_array = f["bank"][()]
         elif "bank_ids" in f and "peaks/image_index" in f:
             b_ids = f["bank_ids"][()]
             bank_array = np.array([b_ids[int(idx)] for idx in img_indices])
-        else:
-            bank_array = img_indices
+        else: bank_array = img_indices
 
     B_mat = ub_helper.reciprocal_lattice_B()
 
-    print("  > Reconstructing physical geometry from pixels...")
+    print("  > Reconstructing sparse geometry for downstream polishing...")
     xyz_out = np.zeros((len(pixel_r), 3))
-
     for phys_bank in np.unique(bank_array):
         mask = bank_array == phys_bank
         if not np.any(mask): continue
-        try:
-            det_config = beamlines[instrument_name][str(int(phys_bank))]
-            det = Detector(det_config)
-            xyz_out[mask] = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
-        except KeyError as e:
-            print(f"Warning: Could not rebuild geometry for bank {phys_bank}: {e}")
+        det_config = beamlines[instrument_name][str(int(phys_bank))]
+        det = Detector(det_config)
+        xyz_out[mask] = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
 
     kf = xyz_out - ub_helper.sample_offset[None, :]
     kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
     q_lab_obs = kf - ub_helper.ki_vec[None, :]
-
-    print(f"  > Loaded {len(q_lab_obs)} empirical peaks.")
-
-    # --- THE SAMPLE FRAME MAPPING ---
-    print("  > Mapping peaks from Lab Frame to Sample Frame via R^T...")
     q_sample_obs = np.einsum('nij,ni->nj', r_gonio_obs, q_lab_obs)
+    q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
 
+    # ==========================================
+    # PHASE 2: CONTINUOUS SPHERICAL HOUGH
+    # ==========================================
     print("\n[2/4] Sparse Basis Pursuit (Density-Driven Set Cover)")
-    indexer = SparseHoughIndexer(tolerance_deg=tolerance_deg)
-    
-    # We now feed the stationary, integrated sample-frame peaks to the indexer
-    empirical_zones, activation_weights = indexer.find_active_zones(q_sample_obs, max_axes=max_axes)
+    try:
+        import s2fft
+        from subhkl.search.sparse_hough import ContinuousSphericalHough
+        from subhkl.integration.api import Peaks
+
+        print("  > Loading raw continuous intensity via Peaks object...")
+        peaks_obj = Peaks(original_nexus_filename, instrument_name)
+
+        L_max = 128
+        hough_indexer = ContinuousSphericalHough(L_max=L_max)
+        global_grid = np.zeros((L_max, 2 * L_max - 1), dtype=np.float32)
+
+        R_all_images = peaks_obj.goniometer.rotation
+        stride = 4 # Downsample grid lookup for blazing speed
+
+        for img_key, raw_image in peaks_obj.image.ims.items():
+            det = peaks_obj.get_detector_by_img(img_key)
+            run_id = peaks_obj.get_run_id(img_key)
+
+            intensity = raw_image[::stride, ::stride].flatten()
+            valid = intensity > 50.0  # Strip pure vacuum background
+            if not np.any(valid): continue
+
+            intensity = intensity[valid]
+            row_grid, col_grid = np.indices((det.n, det.m))
+            row_grid = row_grid[::stride, ::stride].flatten()[valid]
+            col_grid = col_grid[::stride, ::stride].flatten()[valid]
+
+            xyz = det.pixel_to_lab(row_grid, col_grid) - ub_helper.sample_offset
+            norms = np.linalg.norm(xyz, axis=-1, keepdims=True)
+            kf = xyz / np.where(norms == 0, 1.0, norms)
+            q_lab = kf - ub_helper.ki_vec
+
+            # Project into Sample Frame
+            R_mat = R_all_images[run_id]
+            q_sample = np.einsum('ij,nj->ni', R_mat.T, q_lab)
+
+            grid_chunk = hough_indexer.accumulate_to_grid(q_sample, intensity)
+            global_grid += grid_chunk
+
+        print(f"  > Executing O(N^2 log^2 N) Spherical Radon Transform on {len(peaks_obj.image.ims)} panels...")
+        empirical_zones, activation_weights = hough_indexer.find_active_zones(global_grid, max_axes=max_axes)
+
+    except ImportError:
+        print("  > [WARNING] 's2fft' module not found! Falling back to Point-Cloud Set Cover.")
+        from subhkl.search.sparse_hough import SparseHoughIndexer
+        indexer = SparseHoughIndexer(tolerance_deg=tolerance_deg)
+        empirical_zones, activation_weights = indexer.find_active_zones(q_sample_obs, max_axes=max_axes)
 
     print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.")
     for i, (zone, weight) in enumerate(zip(empirical_zones, activation_weights)):
-        print(f"    Zone {i+1}: [{zone[0]:.3f}, {zone[1]:.3f}, {zone[2]:.3f}] (Weight: {weight:.2f})")
-
-    q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
+        print(f"    Zone {i+1}: [{zone[0]:.3f}, {zone[1]:.3f}, {zone[2]:.3f}] (Mass: {weight:.2f})")
 
     # ==========================================
     # PHASE 3: DAVENPORT COMBINATORIAL SEARCH
