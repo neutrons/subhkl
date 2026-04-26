@@ -404,19 +404,19 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
 
             def run_opt(operand):
                 p, a_mask = operand
-
-                # --- THE REFACTOR: Engine handles the SSN projection and cleanup! ---
+                
+                # The engine handles basis construction!
                 A_masked = self._build_basis_matrix(x_grid, p) * a_mask
                 
-                c_sparse_stat = self.solve_ssn_step(
-                    patch_stat.flatten(), 
-                    patch_bg.flatten(), 
-                    A_masked, 
-                    p, 
-                    alpha_override=alpha_z_score
+                # The engine handles BIC Auto-Tuning internally!
+                c_sparse_stat = self.tune_and_solve(
+                    patch_stat.flatten(),
+                    patch_bg.flatten(),
+                    A_masked,
+                    p
                 )
-                
-                c_sparse_norm = c_sparse_stat * a_mask
+
+                c_sparse_norm = c_sparse_stat * a_mask  
                 return jnp.stack([c_sparse_norm, p[:, 1], p[:, 2], p[:, 3]], axis=1)
 
             def skip_opt(operand):
@@ -455,30 +455,18 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
             augmented_dict = jnp.vstack([final_params, macro_atom])
             aug_mask = jnp.append(active_mask, num_active > 1)
 
-            c_warm_raw, r_aug, col_aug, sigma_aug = (
-                augmented_dict.T
-            )  # [photons/Pixel^2], [Pixel^0.5], [Pixel^0.5], [Pixel^0.5]
-
-            def eval_one_aug(ri, ci_col, si):
-                return self._rbf_basis(
-                    x_grid, jnp.array([ri, ci_col]), si
-                ).flatten()  # [Pixel]
-
-            A_aug = vmap(eval_one_aug)(r_aug, col_aug, sigma_aug).T  # [Pixel]
+            A_aug = self._build_basis_matrix(x_grid, augmented_dict)
             A_aug_masked = A_aug * aug_mask
 
-            (jnp.pi / 2.0) * (sigma_aug**2)  # [Pixel]
-            weights_aug = (sigma_aug / self.ref_sigma) ** self.gamma  # [-]
-            alpha_vec_stat_aug = alpha_z_score * weights_aug  # [Pixel]
-
-            c_sparse_stat_aug = solve_ssn_unified(
-                A_aug_masked,
+            c_sparse_stat_aug = self.tune_and_solve(
                 patch_stat.flatten(),
                 patch_bg.flatten(),
-                alpha_vec_stat_aug,
-                loss_code,
-                c_warm_raw,
-            )  # [photons/Pixel^2]
+                A_aug_masked,
+                augmented_dict
+            )
+
+            # Re-extract the spatial columns for the return stack
+            _, r_aug, col_aug, sigma_aug = augmented_dict.T
 
             return jnp.stack(
                 [c_sparse_stat_aug * aug_mask, r_aug, col_aug, sigma_aug], axis=1
@@ -572,64 +560,6 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
             print(f"  > Deviance/DoF: {dev_per_dof:.4f} {target_str}")
 
         return {"nll": nll_total, "bic": bic_total, "deviance_nu": dev_per_dof}
-
-    @partial(jit, static_argnames=["self", "H", "W", "max_peaks_local", "loss_code"])
-    def _solve_and_tune_patch(
-        self, patch_stat, patch_bg, candidate_alphas, H, W, max_peaks_local, loss_code
-    ):
-        """
-        Sweeps through candidate alphas for a given patch, solves the SSN,
-        calculates the local BIC, and returns the parameters from the best alpha.
-        """
-
-        # 1. Define a function to evaluate a single alpha
-        def evaluate_alpha(alpha_val):
-            # Run the existing dense solver for this specific alpha
-            params_out = self._solve_dense(
-                patch_stat,
-                patch_bg,
-                alpha_val,
-                H,
-                W,
-                max_peaks_local,
-                loss_code,
-                do_merge=True,
-            )
-
-            # Extract active parameters
-            c_out = params_out[:, 0]
-            active_mask = c_out > 1e-9
-            k_active = jnp.sum(active_mask)
-
-            # Predict the reconstruction
-            yy, xx = jnp.indices((H, W))
-            x_grid = jnp.array([yy, xx])
-            recon = self._predict_batch_physical(params_out, x_grid, active_mask)
-            recon_total = jnp.maximum(recon + patch_bg, 1e-9)
-
-            # Calculate Local NLL and BIC
-            if loss_code == 1:  # Poisson
-                nll = jnp.sum(
-                    recon_total - jax.scipy.special.xlogy(patch_stat, recon_total)
-                )
-            else:  # Gaussian
-                nll = 0.5 * jnp.sum((recon_total - patch_stat) ** 2)
-
-            n_pix = H * W
-            n_params = k_active * 4
-            # If no peaks are found, penalize heavily so we prefer alphas that find real signals
-            bic = jnp.where(k_active == 0, 1e9, n_params * jnp.log(n_pix) + 2 * nll)
-
-            return bic, params_out
-
-        # 2. Vectorize the evaluation over all candidate alphas
-        bics, all_params = vmap(evaluate_alpha)(candidate_alphas)
-
-        # 3. Find the index of the lowest BIC
-        best_idx = jnp.argmin(bics)
-
-        # 4. Return the parameters associated with the lowest BIC
-        return all_params[best_idx]
 
     def find_peaks_batch(self, images_batch):
         """
@@ -841,39 +771,22 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
 
             return vmap(slice_one)(b_idx, r_start, c_start)
 
-        if self.auto_tune_alpha:
-            if self.show_steps:
-                print(f"  > Auto-Tuning Alpha across {self.candidate_alphas.tolist()}")
-            # Use the tuning solver
-            sniper_solver = jit(
-                vmap(
-                    lambda ws, wb: self._solve_and_tune_patch(
-                        ws,
-                        wb,
-                        self.candidate_alphas,
-                        P_EXT,
-                        P_EXT,
-                        self.max_local_peaks,
-                        loss_code_sniper,
-                    )
+
+        # Use standard solver with fixed alpha
+        sniper_solver = jit(
+            vmap(
+                lambda ws, wb: self._solve_dense(
+                    ws,
+                    wb,
+                    self.alpha,
+                    P_EXT,
+                    P_EXT,
+                    self.max_local_peaks,
+                    loss_code_sniper,
+                    do_merge=True,
                 )
             )
-        else:
-            # Use standard solver with fixed alpha
-            sniper_solver = jit(
-                vmap(
-                    lambda ws, wb: self._solve_dense(
-                        ws,
-                        wb,
-                        self.alpha,
-                        P_EXT,
-                        P_EXT,
-                        self.max_local_peaks,
-                        loss_code_sniper,
-                        True,
-                    )
-                )
-            )
+        )
 
         refined_peaks_by_bank = [[] for _ in range(B)]
 
@@ -1367,17 +1280,14 @@ class SparseLaueIntegrator(SparseRBFPeakFinder):
                 weight = (effective_sigma / self.ref_sigma) ** self.gamma
                 alpha_vec_joint = jnp.full(K_NEIGHBORS, alpha_z_score * weight)
 
-                c_warm_joint = jnp.zeros(K_NEIGHBORS, dtype=jnp.float32)
+                cand_params = jnp.stack([c_warm_joint, local_rs, local_cs, jnp.full(K_NEIGHBORS, effective_sigma)], axis=1)
 
-                c_ssn = solve_ssn_unified(
-                    A_k_masked,
+                c_ssn = self.solve_ssn_step(
                     patch.flatten(),
                     patch_bg.flatten(),
-                    alpha_vec_joint,
-                    loss_code,
-                    c_warm_joint,
-                    20,
-                    force_target=False,
+                    A_k_masked,
+                    cand_params,
+                    alpha_override=alpha_z_score # Override to bypass tuning during final integration
                 )
 
                 surviving_mask_strict = c_ssn > 1e-9
