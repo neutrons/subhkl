@@ -226,118 +226,97 @@ class AzimuthalJAXHough:
         carry = (I_fft, self.thetas, self.sin_theta, self.cos_theta, self.cos_dphi, self.sigma)
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
-
     def find_active_zones(self, grid_raw, max_axes=15):
-        print("  > Executing Windowed Poisson OMP (Partial Arc Extraction)...")
+        print("  > Executing Joint Dictionary Basis Pursuit (Von Mises Torus)...")
         from subhkl.search.sparse_hough import GlobalZoneAxisSniper
+        from scipy.ndimage import maximum_filter
         
-        # Lower alpha slightly, because partial arcs contain fewer total photons!
+        # 1. 1.5 degrees is the optimal width to prevent XZ crosstalk!
+        self.sigma = np.sin(np.deg2rad(1.5))
         sniper = GlobalZoneAxisSniper(loss="poisson", ref_sigma=self.sigma, candidate_alphas=[5.0, 10.0, 20.0, 30.0, 50.0])
         
         grid_flat_raw = jnp.array(grid_raw).flatten()
         bg_flat = sniper._compute_background(grid_raw, filter_size=31).flatten()
         grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
-
         grid_signal_base = jnp.maximum(jnp.array(grid_raw) - bg_flat.reshape(self.N_theta, self.N_phi), 0.0)
-        current_signal_grid = grid_signal_base
         
-        active_candidates = []
-        c_active = []
+        # 2. ONE Global Hough Transform to build the Dictionary!
+        H_np = np.array(self.transform(grid_signal_base))
         
-        for step in range(max_axes * 2):
-            H = self.transform(current_signal_grid)
-            H_np = np.array(H)
-            
-            max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
-            max_val = float(H_np[max_idx])
-            
-            t_idx, p_idx = max_idx
-            Theta = float(self.thetas[t_idx])
-            Phi = float(self.phis[p_idx])
+        # Extract top 40 Local Maxima to form the candidate dictionary
+        local_max = (H_np == maximum_filter(H_np, size=11))
+        
+        # Mask out completely empty noise regions (must be > 5% of global max)
+        valid_peaks = local_max & (H_np > np.max(H_np) * 0.05)
+        t_coords, p_coords = np.where(valid_peaks)
+        
+        # Sort by initial Hough intensity
+        intensities = H_np[t_coords, p_coords]
+        order = np.argsort(intensities)[::-1]
+        t_coords = t_coords[order][:40] 
+        p_coords = p_coords[order][:40]
+        
+        dictionary_params = []
+        
+        print(f"  > Scout identified {len(t_coords)} dictionary candidates. Calculating Arc Windows...")
+        
+        for t, p in zip(t_coords, p_coords):
+            Theta = float(self.thetas[t])
+            Phi = float(self.phis[p])
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
-
-            # ==========================================
-            # DYNAMIC ARC EXTRACTION (Mean Resultant)
-            # ==========================================
-            dots_z = np.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
-            ribbon_mask = dots_z < np.sin(np.deg2rad(5.0))
-            I_ribbon = current_signal_grid * ribbon_mask
             
+            # DYNAMIC ARC EXTRACTION (Von Mises)
+            dots_z = np.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
+            ribbon_mask = dots_z < np.sin(np.deg2rad(3.0))
+            I_ribbon = grid_signal_base * ribbon_mask
             sum_I = np.sum(I_ribbon)
+            
             if sum_I > 0:
-                # 3D Center of Mass of the photons
                 mu_x = np.sum(I_ribbon * self.Q_x) / sum_I
                 mu_y = np.sum(I_ribbon * self.Q_y) / sum_I
                 mu_z = np.sum(I_ribbon * self.Q_z) / sum_I
-                
-                # Mean Resultant Length (0.0 = Uniform Ring, 1.0 = Point Source)
                 R_len = np.sqrt(mu_x**2 + mu_y**2 + mu_z**2)
                 
-                # Project the Center of Mass exactly onto the Great Circle plane
                 dot_mu_z = mu_x*z_x + mu_y*z_y + mu_z*z_z
                 vc_x = mu_x - dot_mu_z * z_x
                 vc_y = mu_y - dot_mu_z * z_y
                 vc_z = mu_z - dot_mu_z * z_z
-                
                 norm_vc = np.sqrt(vc_x**2 + vc_y**2 + vc_z**2)
+                
                 if norm_vc > 0:
                     vc_x, vc_y, vc_z = vc_x/norm_vc, vc_y/norm_vc, vc_z/norm_vc
                 else:
                     vc_x, vc_y, vc_z = 1.0, 0.0, 0.0
                     
-                # Map Circular Variance to Von Mises Concentration
-                if R_len < 0.1:
-                    kappa = 0.0 # Force full circle if highly distributed
-                else:
-                    # Approximation: kappa ~ R / (1 - R). Capped at 20.0 to prevent it from becoming a tiny dot
-                    kappa = min(20.0, R_len / (1.0 - min(R_len, 0.99)))
+                kappa = 0.0 if R_len < 0.1 else min(20.0, R_len / (1.0 - min(R_len, 0.99)))
             else:
-                vc_x, vc_y, vc_z = 1.0, 0.0, 0.0
-                kappa = 0.0
-
-            # Append the 4 new arc parameters to the candidate vector!
-            c_init_new = max_val / self.N_phi
-            new_cand = [z_x, z_y, z_z, float(self.sigma), vc_x, vc_y, vc_z, kappa]
-            p_guess_list = []
-            
-            for i in range(len(active_candidates)):
-                p_guess_list.append([float(c_active[i])] + active_candidates[i])
-            p_guess_list.append([c_init_new] + new_cand)
-
-            p_guess = jnp.array(p_guess_list)
-            test_candidates = active_candidates + [new_cand]
-            
-            A_mat = sniper._build_basis_matrix(grid_coords, p_guess)
-            c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_raw, bg_flat, A_mat, p_guess) 
-            
-            survivors = c_sparse > 1e-3
-            
-            if not survivors[-1]:
-                print(f"    [Step {step+1:02d}] Rejected | SNR fell below noise floor.")
-                break
+                vc_x, vc_y, vc_z, kappa = 1.0, 0.0, 0.0, 0.0
                 
-            print(f"    [Step {step+1:02d}] Kept | R_len: {R_len:.2f} (\u03ba={kappa:.1f}) | Alpha: {best_alpha:4.1f} | Dev/Nu: {dev:.3f}")
+            # Initial guess for amplitude is the Hough average
+            c_init = float(H_np[t, p] / self.N_phi)
+            dictionary_params.append([c_init, z_x, z_y, z_z, float(self.sigma), vc_x, vc_y, vc_z, kappa])
             
-            active_candidates = [test_candidates[i] for i in range(len(test_candidates)) if survivors[i]]
-            c_active = c_sparse[survivors]
-            
-            p_surv = jnp.array([[c_active[i]] + active_candidates[i] for i in range(len(active_candidates))])
-            A_surv = sniper._build_basis_matrix(grid_coords, p_surv)
-            recon_signal = A_surv @ c_active
-            
-            current_signal_grid = jnp.maximum(grid_signal_base - recon_signal.reshape(self.N_theta, self.N_phi), 0.0)
-
-        if not active_candidates:
-            print("  > Scout hit the noise floor instantly. No candidates found.")
+        # 3. JOINT BASIS PURSUIT: Evaluate the entire dictionary simultaneously!
+        print("  > Executing Joint Poisson Basis Pursuit on entire dictionary...")
+        p_guess = jnp.array(dictionary_params)
+        A_mat = sniper._build_basis_matrix(grid_coords, p_guess)
+        
+        c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_raw, bg_flat, A_mat, p_guess)
+        
+        survivors = c_sparse > 1e-3
+        n_survivors = int(np.sum(survivors))
+        
+        print(f"  > Convergence | Alpha: {best_alpha:4.1f} | BIC: {bic:.2e} | Dev/Nu: {dev:.3f}")
+        print(f"  > L1 Penalty eliminated {len(dictionary_params) - n_survivors} ghost lines. Kept {n_survivors} true axes.")
+        
+        if n_survivors == 0:
             return np.empty((0,3)), np.empty(0)
-
-        print(f"  > OMP extracted {len(active_candidates)} joint-optimized zone axes.")
-
-        # The final zones matrix is still just the normal vectors!
-        final_zones = np.array([cand[:3] for cand in active_candidates])
-        final_weights = np.array(c_active)
+            
+        active_candidates = np.array(dictionary_params)[survivors]
+        final_zones = active_candidates[:, 1:4]
+        final_weights = np.array(c_sparse[survivors])
         
         order = np.argsort(final_weights)[::-1]
         return final_zones[order][:max_axes], final_weights[order][:max_axes]
