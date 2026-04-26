@@ -120,80 +120,102 @@ class SparseHoughIndexer:
         order = np.argsort(final_scores)[::-1]
         return final_zones[order], final_scores[order]
 
-import jax
-import jax.numpy as jnp
-import s2fft
-import numpy as np
-
-class ContinuousSphericalHough:
-    def __init__(self, L_max=128):
-        """
-        L_max controls the angular resolution. 
-        L_max=128 gives roughly ~1.4 degree resolution.
-        """
-        self.L = L_max
+class AzimuthalJAXHough:
+    """
+    Pure JAX 1D-FFT based Spherical Radon Transform equivalent.
+    Achieves O(N_theta^2 * N_phi * log(N_phi)) via Azimuthal Convolution.
+    Zero external C++ dependencies required.
+    """
+    def __init__(self, N_theta=256, N_phi=512, sigma_deg=0.75):
+        self.N_theta = N_theta
+        self.N_phi = N_phi
+        self.sigma = np.sin(np.deg2rad(sigma_deg))
         
-        # Precompute the Spherical Radon Transform operator: 2*pi*P_l(0)
-        # P_l(0) is only non-zero for even L.
-        self.srt_operator = np.zeros(self.L)
-        for l in range(0, self.L, 2):
-            # Legendre polynomial at x=0 formula for even l
-            val = ((-1)**(l//2)) * np.math.factorial(l) / ((2**l) * (np.math.factorial(l//2)**2))
-            self.srt_operator[l] = 2 * jnp.pi * val
-            
-        self.srt_operator = jnp.array(self.srt_operator)
-
-    def accumulate_panels_to_grid(self, images_dict, detectors_dict, sample_offset):
-        """
-        Resamples raw detector panels onto a regular Equiangular/MW grid required by s2fft.
-        """
-        # Create an empty Equiangular grid (McEwen-Wiaux sampling)
-        # Shape is (L, 2*L-1)
-        grid = jnp.zeros((self.L, 2 * self.L - 1))
+        # Symmetrical Grid definitions
+        self.thetas = jnp.linspace(0, jnp.pi, N_theta)
+        self.phis = jnp.linspace(0, 2 * jnp.pi, N_phi, endpoint=False)
         
-        for img_key, raw_image in images_dict.items():
-            det = detectors_dict[img_key]
-            
-            # 1. Get pixel coordinates
-            row_grid, col_grid = np.indices((det.n, det.m))
-            xyz = det.pixel_to_lab(row_grid, col_grid) - sample_offset
-            
-            # 2. Normalize to unit vectors
-            norms = np.linalg.norm(xyz, axis=-1, keepdims=True)
-            kf = xyz / np.where(norms == 0, 1.0, norms)
-            
-            # 3. Convert to Spherical Angles (Theta, Phi)
-            theta = np.arccos(kf[..., 2])
-            phi = np.arctan2(kf[..., 1], kf[..., 0])
-            phi = np.mod(phi, 2 * np.pi)
-            
-            # 4. Map angles to s2fft Grid Indices
-            # Theta maps to [0, L-1], Phi maps to [0, 2L-2]
-            theta_idx = jnp.clip(jnp.round((theta / jnp.pi) * (self.L - 1)), 0, self.L - 1).astype(jnp.int32)
-            phi_idx = jnp.clip(jnp.round((phi / (2 * jnp.pi)) * (2 * self.L - 2)), 0, 2 * self.L - 2).astype(jnp.int32)
-            
-            # 5. Scatter Add intensities into the global grid
-            # (In reality, use jax.lax.scatter_add for JIT compilation)
-            flat_idx = theta_idx * (2 * self.L - 1) + phi_idx
-            flat_grid = grid.flatten()
-            flat_grid = flat_grid.at[flat_idx.flatten()].add(raw_image.flatten())
-            grid = flat_grid.reshape((self.L, 2 * self.L - 1))
-            
+        self.sin_theta = jnp.sin(self.thetas)
+        self.cos_theta = jnp.cos(self.thetas)
+        self.cos_dphi = jnp.cos(self.phis)
+
+    def accumulate_to_grid(self, q_sample_vectors, intensities):
+        norms = np.linalg.norm(q_sample_vectors, axis=1, keepdims=True)
+        q = np.where(norms == 0, 1.0, q_sample_vectors / norms)
+
+        theta = np.arccos(np.clip(q[:, 2], -1.0, 1.0))
+        phi = np.arctan2(q[:, 1], q[:, 0])
+        phi = np.mod(phi, 2 * np.pi)
+
+        t_idx = np.clip(np.round((theta / np.pi) * (self.N_theta - 1)), 0, self.N_theta - 1).astype(np.int32)
+        p_idx = np.clip(np.round((phi / (2 * np.pi)) * self.N_phi), 0, self.N_phi - 1).astype(np.int32)
+
+        grid = np.zeros((self.N_theta, self.N_phi), dtype=np.float32)
+        np.add.at(grid, (t_idx, p_idx), intensities)
         return grid
 
-    @jax.jit
-    def spherical_radon_transform(self, intensity_grid):
+    @staticmethod
+    @jit
+    def _hough_scan_step(carry, Theta_k):
+        I_fft, thetas, sin_t, cos_t, cos_dphi, sigma = carry
+        
+        sin_T = jnp.sin(Theta_k)
+        cos_T = jnp.cos(Theta_k)
+        
+        # x_ik(dphi) = cos(theta_i)cos(Theta_k) + sin(theta_i)sin(Theta_k)cos(dphi)
+        x_ik = cos_t[:, None] * cos_T + (sin_t[:, None] * sin_T) * cos_dphi[None, :]
+        
+        # Gaussian kernel for Great Circle (we want x_ik ~ 0)
+        W_ik = jnp.exp(-(x_ik**2) / (2 * sigma**2))
+        
+        # Real-FFT of the Kernel
+        W_fft = jnp.fft.rfft(W_ik, axis=1)
+        
+        # Cross-correlation in Fourier space (Summing over theta_i)
+        sum_fft = jnp.sum(I_fft * jnp.conj(W_fft), axis=0)
+        
+        # Inverse Real-FFT to extract the spatial scores
+        score_row = jnp.fft.irfft(sum_fft, n=cos_dphi.shape[0])
+        
+        return carry, score_row
+
+    def transform(self, grid):
         """
-        The O(N^2 log^2 N) Continuous Hough Transform.
+        Executes the 1D FFT convolutions using lax.scan for optimal VRAM usage.
         """
-        # 1. Forward Spherical Harmonic Transform
-        # Output flm shape: (L, 2L-1)
-        flm = s2fft.forward(intensity_grid, L=self.L)
+        I_fft = jnp.fft.rfft(grid, axis=1)
+        carry = (I_fft, self.thetas, self.sin_theta, self.cos_theta, self.cos_dphi, self.sigma)
+        _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
+        return hough_space
+
+    def find_active_zones(self, grid, max_axes=15, peak_neighborhood=5):
+        print("  > Executing Pure JAX 1D-FFT Azimuthal Convolution...")
+        H = np.array(self.transform(jnp.array(grid)))
         
-        # 2. Apply SRT Operator (Multiply every m-mode by the l-th scalar)
-        srt_flm = jax.vmap(lambda l: flm[l, :] * self.srt_operator[l])(jnp.arange(self.L))
-        
-        # 3. Inverse Transform to get the Hough Space
-        hough_space = s2fft.inverse(srt_flm, L=self.L)
-        
-        return jnp.abs(hough_space) # Absolute value to handle floating point ringing
+        zones, weights = [], []
+
+        for _ in range(max_axes):
+            max_idx = np.unravel_index(np.argmax(H), H.shape)
+            max_val = H[max_idx]
+
+            if max_val == 0: break
+
+            t_idx, p_idx = max_idx
+            Theta = self.thetas[t_idx]
+            Phi = self.phis[p_idx]
+
+            z_x = np.sin(Theta) * np.cos(Phi)
+            z_y = np.sin(Theta) * np.sin(Phi)
+            z_z = np.cos(Theta)
+
+            zones.append(np.array([z_x, z_y, z_z]))
+            weights.append(float(max_val))
+
+            # Erase local neighborhood across the grid
+            t_min = max(0, t_idx - peak_neighborhood)
+            t_max = min(self.N_theta, t_idx + peak_neighborhood + 1)
+            for t in range(t_min, t_max):
+                for p in range(p_idx - peak_neighborhood, p_idx + peak_neighborhood + 1):
+                    H[t, p % self.N_phi] = 0.0
+
+        return np.array(zones), np.array(weights)

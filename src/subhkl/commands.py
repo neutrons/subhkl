@@ -1448,62 +1448,105 @@ def run_sparse_hough(
     q_sample_obs = np.einsum('nij,ni->nj', r_gonio_obs, q_lab_obs)
     q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
 
-    # ==========================================
-    # PHASE 2: CONTINUOUS SPHERICAL HOUGH
-    # ==========================================
-    print("\n[2/4] Sparse Basis Pursuit (Density-Driven Set Cover)")
-    try:
-        import s2fft
-        from subhkl.search.sparse_hough import ContinuousSphericalHough
-        from subhkl.integration.api import Peaks
+    class AzimuthalJAXHough:
+    """
+    Pure JAX 1D-FFT based Spherical Radon Transform equivalent.
+    Achieves O(N_theta^2 * N_phi * log(N_phi)) via Azimuthal Convolution.
+    Zero external C++ dependencies required.
+    """
+    def __init__(self, N_theta=256, N_phi=512, sigma_deg=0.75):
+        self.N_theta = N_theta
+        self.N_phi = N_phi
+        self.sigma = np.sin(np.deg2rad(sigma_deg))
+        
+        # Symmetrical Grid definitions
+        self.thetas = jnp.linspace(0, jnp.pi, N_theta)
+        self.phis = jnp.linspace(0, 2 * jnp.pi, N_phi, endpoint=False)
+        
+        self.sin_theta = jnp.sin(self.thetas)
+        self.cos_theta = jnp.cos(self.thetas)
+        self.cos_dphi = jnp.cos(self.phis)
 
-        print("  > Loading raw continuous intensity via Peaks object...")
-        peaks_obj = Peaks(original_nexus_filename, instrument_name)
+    def accumulate_to_grid(self, q_sample_vectors, intensities):
+        norms = np.linalg.norm(q_sample_vectors, axis=1, keepdims=True)
+        q = np.where(norms == 0, 1.0, q_sample_vectors / norms)
 
-        L_max = 128
-        hough_indexer = ContinuousSphericalHough(L_max=L_max)
-        global_grid = np.zeros((L_max, 2 * L_max - 1), dtype=np.float32)
+        theta = np.arccos(np.clip(q[:, 2], -1.0, 1.0))
+        phi = np.arctan2(q[:, 1], q[:, 0])
+        phi = np.mod(phi, 2 * np.pi)
 
-        R_all_images = peaks_obj.goniometer.rotation
-        stride = 4 # Downsample grid lookup for blazing speed
+        t_idx = np.clip(np.round((theta / np.pi) * (self.N_theta - 1)), 0, self.N_theta - 1).astype(np.int32)
+        p_idx = np.clip(np.round((phi / (2 * np.pi)) * self.N_phi), 0, self.N_phi - 1).astype(np.int32)
 
-        for img_key, raw_image in peaks_obj.image.ims.items():
-            det = peaks_obj.get_detector_by_img(img_key)
-            run_id = peaks_obj.get_run_id(img_key)
+        grid = np.zeros((self.N_theta, self.N_phi), dtype=np.float32)
+        np.add.at(grid, (t_idx, p_idx), intensities)
+        return grid
 
-            intensity = raw_image[::stride, ::stride].flatten()
-            valid = intensity > 50.0  # Strip pure vacuum background
-            if not np.any(valid): continue
+    @staticmethod
+    @jit
+    def _hough_scan_step(carry, Theta_k):
+        I_fft, thetas, sin_t, cos_t, cos_dphi, sigma = carry
+        
+        sin_T = jnp.sin(Theta_k)
+        cos_T = jnp.cos(Theta_k)
+        
+        # x_ik(dphi) = cos(theta_i)cos(Theta_k) + sin(theta_i)sin(Theta_k)cos(dphi)
+        x_ik = cos_t[:, None] * cos_T + (sin_t[:, None] * sin_T) * cos_dphi[None, :]
+        
+        # Gaussian kernel for Great Circle (we want x_ik ~ 0)
+        W_ik = jnp.exp(-(x_ik**2) / (2 * sigma**2))
+        
+        # Real-FFT of the Kernel
+        W_fft = jnp.fft.rfft(W_ik, axis=1)
+        
+        # Cross-correlation in Fourier space (Summing over theta_i)
+        sum_fft = jnp.sum(I_fft * jnp.conj(W_fft), axis=0)
+        
+        # Inverse Real-FFT to extract the spatial scores
+        score_row = jnp.fft.irfft(sum_fft, n=cos_dphi.shape[0])
+        
+        return carry, score_row
 
-            intensity = intensity[valid]
-            row_grid, col_grid = np.indices((det.n, det.m))
-            row_grid = row_grid[::stride, ::stride].flatten()[valid]
-            col_grid = col_grid[::stride, ::stride].flatten()[valid]
+    def transform(self, grid):
+        """
+        Executes the 1D FFT convolutions using lax.scan for optimal VRAM usage.
+        """
+        I_fft = jnp.fft.rfft(grid, axis=1)
+        carry = (I_fft, self.thetas, self.sin_theta, self.cos_theta, self.cos_dphi, self.sigma)
+        _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
+        return hough_space
 
-            xyz = det.pixel_to_lab(row_grid, col_grid) - ub_helper.sample_offset
-            norms = np.linalg.norm(xyz, axis=-1, keepdims=True)
-            kf = xyz / np.where(norms == 0, 1.0, norms)
-            q_lab = kf - ub_helper.ki_vec
+    def find_active_zones(self, grid, max_axes=15, peak_neighborhood=5):
+        print("  > Executing Pure JAX 1D-FFT Azimuthal Convolution...")
+        H = np.array(self.transform(jnp.array(grid)))
+        
+        zones, weights = [], []
 
-            # Project into Sample Frame
-            R_mat = R_all_images[run_id]
-            q_sample = np.einsum('ij,nj->ni', R_mat.T, q_lab)
+        for _ in range(max_axes):
+            max_idx = np.unravel_index(np.argmax(H), H.shape)
+            max_val = H[max_idx]
 
-            grid_chunk = hough_indexer.accumulate_to_grid(q_sample, intensity)
-            global_grid += grid_chunk
+            if max_val == 0: break
 
-        print(f"  > Executing O(N^2 log^2 N) Spherical Radon Transform on {len(peaks_obj.image.ims)} panels...")
-        empirical_zones, activation_weights = hough_indexer.find_active_zones(global_grid, max_axes=max_axes)
+            t_idx, p_idx = max_idx
+            Theta = self.thetas[t_idx]
+            Phi = self.phis[p_idx]
 
-    except ImportError:
-        print("  > [WARNING] 's2fft' module not found! Falling back to Point-Cloud Set Cover.")
-        from subhkl.search.sparse_hough import SparseHoughIndexer
-        indexer = SparseHoughIndexer(tolerance_deg=tolerance_deg)
-        empirical_zones, activation_weights = indexer.find_active_zones(q_sample_obs, max_axes=max_axes)
+            z_x = np.sin(Theta) * np.cos(Phi)
+            z_y = np.sin(Theta) * np.sin(Phi)
+            z_z = np.cos(Theta)
 
-    print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.")
-    for i, (zone, weight) in enumerate(zip(empirical_zones, activation_weights)):
-        print(f"    Zone {i+1}: [{zone[0]:.3f}, {zone[1]:.3f}, {zone[2]:.3f}] (Mass: {weight:.2f})")
+            zones.append(np.array([z_x, z_y, z_z]))
+            weights.append(float(max_val))
+
+            # Erase local neighborhood across the grid
+            t_min = max(0, t_idx - peak_neighborhood)
+            t_max = min(self.N_theta, t_idx + peak_neighborhood + 1)
+            for t in range(t_min, t_max):
+                for p in range(p_idx - peak_neighborhood, p_idx + peak_neighborhood + 1):
+                    H[t, p % self.N_phi] = 0.0
+
+        return np.array(zones), np.array(weights)
 
     # ==========================================
     # PHASE 3: DAVENPORT COMBINATORIAL SEARCH
