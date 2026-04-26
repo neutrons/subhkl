@@ -1495,82 +1495,41 @@ def run_sparse_hough(
     empirical_zones, activation_weights = hough_indexer.find_active_zones(global_grid, max_axes=max_axes)
 
     # ==========================================
-    # PHASE 3: DAVENPORT COMBINATORIAL SEARCH
+    # PHASE 3: DAVENPORT COMBINATORIAL SEARCH (REAL-SPACE DUALITY)
     # ==========================================
-    print("\n[3/4] Global Combinatorial Search (Davenport)")
+    print("\n[3/4] Global Combinatorial Search (Real-Space Duality)")
     from subhkl.search.davenport import align_virtual_nodes
-    import itertools
-    from scipy.spatial import cKDTree
-    
-    print(f"  > Calculating weighted intersections of {len(empirical_zones)} zone axes...")
-    
-    raw_nodes, weights = [], []
-    for z1, z2 in itertools.combinations(empirical_zones, 2):
-        cross = np.cross(z1, z2)
-        sin_theta = np.linalg.norm(cross)
-        if sin_theta > 0.3:  
-            raw_nodes.append(cross / sin_theta)
-            weights.append(sin_theta)
-            
-    raw_nodes, weights = np.array(raw_nodes), np.array(weights)
-    sym_nodes = np.vstack([raw_nodes, -raw_nodes])
-    sym_weights = np.concatenate([weights, weights])
-    
-    tree = cKDTree(sym_nodes)
-    clusters = tree.query_ball_point(sym_nodes, r=np.deg2rad(2.0))
-    
-    clustered_nodes, clustered_weights = [], []
-    processed = set()
-    for i, neighbors in enumerate(clusters):
-        if i in processed: continue
-        cluster_pts, cluster_wts = sym_nodes[neighbors], sym_weights[neighbors]
-        center = np.average(cluster_pts, axis=0, weights=cluster_wts)
-        clustered_nodes.append(center / np.linalg.norm(center))
-        clustered_weights.append(np.sum(cluster_wts))
-        processed.update(neighbors)
-        
-    clustered_nodes, clustered_weights = np.array(clustered_nodes), np.array(clustered_weights)
-    order = np.argsort(clustered_weights)[::-1]
-    sorted_nodes = clustered_nodes[order]
-    
-    e_nodes, e_weights = [], []
-    for cand_idx in range(len(sorted_nodes)):
-        cand = sorted_nodes[cand_idx]
-        if not e_nodes:
-            e_nodes.append(cand)
-            e_weights.append(clustered_weights[cand_idx])
-            continue
-            
-        # Dropped to 5.0 degrees to preserve tight topological clusters
-        if np.max(np.abs(np.dot(e_nodes, cand))) < np.cos(np.deg2rad(5.0)):  
-            e_nodes.append(cand)
-            e_weights.append(clustered_weights[cand_idx])
-            
-        # REMOVED: The 10 node cap. All hubs are now evaluated!
-            
-    e_nodes = np.array(e_nodes)
-    e_weights = np.array(e_weights)
-    print(f"  > Clustered and isolated {len(e_nodes)} high-stability Virtual Hubs.")
 
-    print(f"  > Generating Massive Evaluation Dictionary (max_hkl={max_hkl_cons})...")
+    # 1. The axes themselves (their normal vectors) ARE the fundamental features!
+    e_nodes = empirical_zones
+    e_weights = activation_weights
+
+    # 2. The theoretical counterparts to Zone Axis Normals are the REAL-SPACE lattice directions.
+    # Reciprocal vectors q = B * h. Real vectors z = A * u, where A = inv(B).T
+    A_mat = np.linalg.inv(B_mat).T
+
+    print(f"  > Generating Massive Evaluation Dictionary (max_uvw={max_hkl_cons})...")
     hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
-    
-    r_theo_rays = (B_mat @ theo_hkl_c.T).T
-    r_unique_rays_norm = r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True)
+    theo_uvw_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
 
+    r_theo_zones = (A_mat @ theo_uvw_c.T).T
+    r_unique_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
+
+    print(f"  > Bypassing nodal intersections. Aligning {len(e_nodes)} macroscopic Zone Axes directly.")
+
+    # 3. Pass A_mat instead of B_mat so Davenport generates Real-Space triads!
     U_davenport = align_virtual_nodes(
         e_nodes, 
         e_weights,              
-        r_unique_rays_norm,     
-        B_mat, 
-        max_hkl_hyp=max_hkl_hyp,
+        r_unique_zones_norm,     
+        A_mat,
+        max_hkl_hyp=max_hkl_hyp,          
         angle_tol_hyp=angle_tol_hyp
     )
-    print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
+    print("  > Macroscopic U-Matrix successfully extracted via Zone Axis Davenport.")
 
     # ==========================================
     # PHASE 4: CONTINUOUS VORONOI POLISH
