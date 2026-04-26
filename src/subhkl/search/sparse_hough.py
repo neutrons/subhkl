@@ -288,8 +288,8 @@ class AzimuthalJAXHough:
         params_guess = jnp.array(candidates)
         A_mat_joint = sniper._build_basis_matrix(grid_coords, params_guess)
         
-        c_sparse_joint = sniper.tune_and_solve(grid_flat_raw, bg_flat, A_mat_joint, params_guess)
-        
+        c_sparse_joint, final_alpha, final_bic, final_dev = sniper.tune_and_solve(grid_flat_raw, bg_flat, A_mat_joint, params_guess) 
+
         survivors = c_sparse_joint > 1e-3
         final_zones = np.array(params_guess[survivors, 1:4])
         final_weights = np.array(c_sparse_joint[survivors])
