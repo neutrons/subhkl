@@ -127,15 +127,17 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
     """
     Global Specialization: 1D Gaussian Great Circles in Spherical Angular Space.
     """
-    def __init__(self, alpha=15.0, gamma=1.0, loss="gaussian", ref_sigma=0.75):
+    def __init__(self, alpha=50.0, gamma=1.0, loss="poisson", ref_sigma=0.75):
+        # THE FIX: High Alpha and Strict Poisson Loss
         super().__init__(alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma)
 
-    def _compute_background(self, grid, filter_size=15):
+    def _compute_background(self, grid, filter_size=31):
         """1D Azimuthal blur: TDS background is low-frequency along the Phi axis."""
         import jax.scipy.signal
         window = jnp.ones((1, filter_size)) / filter_size
+        # The background is computed directly on the massive spherical grid
         bg = jax.scipy.signal.correlate2d(grid, window, mode='same')
-        return jnp.maximum(bg, 1e-3)
+        return jnp.maximum(bg, 1.0)
 
     def _build_basis_matrix(self, grid_coords, params):
         """Constructs the dense matrix of overlapping Great Circles."""
