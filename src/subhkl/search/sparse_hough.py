@@ -127,11 +127,11 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
     """
     Global Specialization: 1D Gaussian Great Circles in Spherical Angular Space.
     """
-    def __init__(self, alpha=50.0, gamma=1.0, loss="poisson", ref_sigma=0.75, 
+    def __init__(self, alpha=5.0, gamma=1.0, loss="gaussian", ref_sigma=0.75, 
                  auto_tune_alpha=True, candidate_alphas=None):
         
-        # We sweep from 15 to 100 to handle varying dataset sizes
-        default_alphas = candidate_alphas or [15.0, 25.0, 50.0, 75.0, 100.0]
+        # THE FIX: Lower S/N sweep (3 to 15) and Gaussian Loss for "Sparse Necklaces"
+        default_alphas = candidate_alphas or [3.0, 5.0, 7.5, 10.0, 15.0]
         
         super().__init__(
             alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma, 
@@ -222,8 +222,8 @@ class AzimuthalJAXHough:
     def find_active_zones(self, grid, max_axes=15):
         print("  > Executing Physics-Informed V-Cycle (Scout + Auto-Tuned Sniper)...")
         
-        # Instantiate the Sniper with Auto-Tuning enabled
-        sniper = GlobalZoneAxisSniper(loss="poisson", ref_sigma=self.sigma)
+        # Instantiate Sniper with Gaussian loss
+        sniper = GlobalZoneAxisSniper(loss="gaussian", ref_sigma=self.sigma)
         
         grid_flat = jnp.array(grid).flatten()
         bg_flat = sniper._compute_background(grid, filter_size=31).flatten()
@@ -232,7 +232,6 @@ class AzimuthalJAXHough:
         current_grid = jnp.array(grid)
         candidates = []
         
-        # 1. THE SCOUT: Greedy Matching Pursuit
         for step in range(max_axes * 2):  
             H = self.transform(current_grid)
             H_np = np.array(H)
@@ -247,10 +246,10 @@ class AzimuthalJAXHough:
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
             
-            # THE CRITICAL FIX: Initialize amplitude to max_val!
-            cand_params = jnp.array([[max_val, z_x, z_y, z_z, self.sigma]])
+            # THE SCALING FIX: Initialize amplitude as Average Per-Pixel Flux!
+            c_init = max_val / self.N_phi 
+            cand_params = jnp.array([[c_init, z_x, z_y, z_z, self.sigma]])
             
-            # Evaluate using the Auto-Tuner
             A_mat = sniper._build_basis_matrix(grid_coords, cand_params)
             c_sparse = sniper.tune_and_solve(grid_flat, bg_flat, A_mat, cand_params)
             
@@ -271,7 +270,6 @@ class AzimuthalJAXHough:
 
         print(f"  > Scout extracted {len(candidates)} valid lines. Resolving crosstalk...")
 
-        # 2. THE SNIPER: Joint Auto-Tuned SSN 
         params_guess = jnp.array(candidates)
         A_mat_joint = sniper._build_basis_matrix(grid_coords, params_guess)
         
@@ -283,4 +281,3 @@ class AzimuthalJAXHough:
         
         order = np.argsort(final_weights)[::-1]
         return final_zones[order][:max_axes], final_weights[order][:max_axes]
-
