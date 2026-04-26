@@ -1280,6 +1280,7 @@ class SparseLaueIntegrator(SparseRBFPeakFinder):
                 weight = (effective_sigma / self.ref_sigma) ** self.gamma
                 alpha_vec_joint = jnp.full(K_NEIGHBORS, alpha_z_score * weight)
 
+                c_warm_joint = jnp.zeros(K_NEIGHBORS, dtype=jnp.float32)
                 cand_params = jnp.stack([c_warm_joint, local_rs, local_cs, jnp.full(K_NEIGHBORS, effective_sigma)], axis=1)
 
                 c_ssn = self.solve_ssn_step(
