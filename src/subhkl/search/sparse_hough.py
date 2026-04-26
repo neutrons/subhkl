@@ -153,7 +153,7 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
 
         return vmap(eval_great_circle)(z_x, z_y, z_z, sigmas).T
 
-@partial(jit, static_argnames=['self'])
+    @partial(jit, static_argnames=['self'])
     def solve_aggregated_poisson(self, data_flat, bg_flat, A_matrix, params_guess):
         # 1. Project into Macroscopic Hough Space!
         y_agg = A_matrix.T @ data_flat
