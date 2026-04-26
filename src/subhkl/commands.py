@@ -1463,7 +1463,7 @@ def run_sparse_hough(
     global_grid = np.zeros((N_theta, N_phi), dtype=np.float32)
 
     R_all_images = peaks_obj.goniometer.rotation
-    stride = 4 # Downsample for blazing speed
+    stride = 1 # Downsample for blazing speed
 
     for img_key, raw_image in peaks_obj.image.ims.items():
         det = peaks_obj.get_detector_by_img(img_key)
