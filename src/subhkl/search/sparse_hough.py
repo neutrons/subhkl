@@ -246,6 +246,10 @@ class AzimuthalJAXHough:
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
+
+            H_np = np.array(H)
+            max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
+            max_val = float(H_np[max_idx])
             c_init_new = max_val / self.N_phi
            
             # warm-start solver
