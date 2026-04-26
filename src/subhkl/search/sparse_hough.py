@@ -126,9 +126,10 @@ class SparseHoughIndexer:
         return final_zones[order], final_scores[order]
 
 class GlobalZoneAxisSniper(SparseBasisPursuit):
-    def __init__(self, alpha=30.0, gamma=1.0, loss="poisson", ref_sigma=0.026, 
+    def __init__(self, alpha=30.0, gamma=2.0, loss="poisson", ref_sigma=0.026, 
                  auto_tune_alpha=True, candidate_alphas=None):
         
+        # The ultimate Poisson sweep: from ultra-weak C2 lines to massive primary axes
         default_alphas = candidate_alphas or [5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0]
         
         super().__init__(
@@ -156,11 +157,7 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
             width_mask = jnp.exp(-(dots_z**2) / (2 * sig**2))
             
             # 2. Arc Length Window (Von Mises Azimuthal Distribution)
-            # dots_v is the cosine of the angle along the arc from the center point vc
             dots_v = Q_x * vcx + Q_y * vcy + Q_z * vcz
-            
-            # If kappa == 0, exp(0) == 1.0 (Full 360-degree Circle)
-            # If kappa > 0, it decays rapidly away from the arc center!
             arc_mask = jnp.exp(kappa * (dots_v - 1.0))
             
             return width_mask * arc_mask
@@ -169,12 +166,14 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
 
     @partial(jax.jit, static_argnames=['self'])
     def tune_and_solve(self, data_flat, bg_flat, A_matrix, params_guess):
-        # Explicitly grab sigma from index 4 to calculate the Besov Space Weight!
+        # 1. EXTRACT SIGMA FROM INDEX 4
         sigmas = params_guess[:, 4]
+        
+        # 2. CALCULATE BESOV SCALE WEIGHTS
         weights = (sigmas / self.ref_sigma) ** self.gamma
         
         def evaluate_alpha(alpha_val):
-            # The penalty scales with the physical width of the Great Circle
+            # Apply the Besov tax to the L1 threshold
             alpha_vec = alpha_val * weights
             
             from subhkl.search.ssn import solve_ssn_unified
@@ -188,19 +187,18 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
             
             # Poisson Deviance
             term = jax.scipy.special.xlogy(data_flat, data_flat / recon_total) - (data_flat - recon_total)
-            dev = 2 * jnp.sum(term)
+            dev_total = 2 * jnp.sum(term)
             
-            # BIC Calculation
+            # Proper Dev/Nu calculation for physical logging
             n_pix = data_flat.size
             n_params = k_active * params_guess.shape[1]
-
-            bic = jnp.where(k_active == 0, 1e9, n_params * jnp.log(n_pix) + dev)
-
             dof = jnp.maximum(n_pix - n_params, 1)
-            dev_nu = dev / dof
+            dev_nu = dev_total / dof
+            
+            bic = jnp.where(k_active == 0, 1e9, n_params * jnp.log(n_pix) + dev_total)
             
             return bic, c_sparse, dev_nu
-
+            
         bics, all_c_sparse, devs = jax.vmap(evaluate_alpha)(jnp.array(self.candidate_alphas))
         best_idx = jnp.argmin(bics)
         
