@@ -135,16 +135,22 @@ def solve_ssn_unified(
 
 class SparseBasisPursuit:
     """
-    The Unified SSN Engine.
-    Fits arbitrary geometric basis functions to noisy data using L1-regularized
-    Sparse Semi-Newton (SSN) optimization.
+    The Unified SSN Engine. 
+    Now features a Universal BIC Auto-Tuner for unsupervised sparsity tuning!
     """
-    def __init__(self, alpha, gamma, loss="poisson", ref_sigma=1.0):
+    def __init__(self, alpha=15.0, gamma=2.0, loss="poisson", ref_sigma=1.0, 
+                 auto_tune_alpha=False, candidate_alphas=None):
         self.alpha = alpha
         self.gamma = gamma
         self.loss = loss
         self.ref_sigma = ref_sigma
         self.loss_code = 1 if loss == "poisson" else 0
+        
+        self.auto_tune_alpha = auto_tune_alpha
+        if candidate_alphas is None:
+            self.candidate_alphas = jnp.array([10.0, 15.0, 20.0, 30.0, 50.0])
+        else:
+            self.candidate_alphas = jnp.array(candidate_alphas)
 
     def _compute_background(self, data, filter_size):
         raise NotImplementedError("Child class must define morphology dimensionality.")
@@ -156,21 +162,44 @@ class SparseBasisPursuit:
     def solve_ssn_step(self, data_flat, bg_flat, A_matrix, params_guess, alpha_override=None):
         c_init = params_guess[:, 0]
         sigmas = params_guess[:, -1]
-
-        # Besov Weighting: Penalize excessively wide features
+        
         weights = (sigmas / self.ref_sigma) ** self.gamma
-
         alpha_val = alpha_override if alpha_override is not None else self.alpha
         alpha_vec = alpha_val * weights
-
-        c_sparse = solve_ssn_unified(
-            A_matrix,
-            data_flat,
-            bg_flat,
-            alpha_vec,
-            self.loss_code,
-            c_init,
-            max_iter=20,
-            force_target=False
+        
+        return solve_ssn_unified(
+            A_matrix, data_flat, bg_flat, alpha_vec, 
+            self.loss_code, c_init, max_iter=20, force_target=False
         )
-        return c_sparse
+
+    @partial(jit, static_argnames=['self'])
+    def tune_and_solve(self, data_flat, bg_flat, A_matrix, params_guess):
+        """
+        Sweeps candidate alphas, evaluates the SSN step, and returns 
+        the solution that minimizes the Bayesian Information Criterion (BIC).
+        """
+        if not self.auto_tune_alpha:
+            return self.solve_ssn_step(data_flat, bg_flat, A_matrix, params_guess)
+
+        def evaluate_alpha(alpha_val):
+            c_sparse = self.solve_ssn_step(data_flat, bg_flat, A_matrix, params_guess, alpha_override=alpha_val)
+            k_active = jnp.sum(c_sparse > 1e-9)
+
+            recon = A_matrix @ c_sparse
+            recon_total = jnp.maximum(recon + bg_flat, 1e-9)
+
+            if self.loss_code == 1: # Poisson
+                nll = jnp.sum(recon_total - jax.scipy.special.xlogy(data_flat, recon_total))
+            else: # Gaussian
+                nll = 0.5 * jnp.sum((recon_total - data_flat)**2)
+
+            n_pix = data_flat.size
+            n_params = k_active * params_guess.shape[1]
+            
+            # Heavy penalty if no signal is found to prevent picking alpha that destroys all data
+            bic = jnp.where(k_active == 0, 1e9, n_params * jnp.log(n_pix) + 2 * nll)
+            return bic, c_sparse
+
+        bics, all_c_sparse = vmap(evaluate_alpha)(self.candidate_alphas)
+        best_idx = jnp.argmin(bics)
+        return all_c_sparse[best_idx]

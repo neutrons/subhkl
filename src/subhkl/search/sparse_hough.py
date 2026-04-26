@@ -127,20 +127,24 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
     """
     Global Specialization: 1D Gaussian Great Circles in Spherical Angular Space.
     """
-    def __init__(self, alpha=50.0, gamma=1.0, loss="poisson", ref_sigma=0.75):
-        # THE FIX: High Alpha and Strict Poisson Loss
-        super().__init__(alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma)
+    def __init__(self, alpha=50.0, gamma=1.0, loss="poisson", ref_sigma=0.75, 
+                 auto_tune_alpha=True, candidate_alphas=None):
+        
+        # We sweep from 15 to 100 to handle varying dataset sizes
+        default_alphas = candidate_alphas or [15.0, 25.0, 50.0, 75.0, 100.0]
+        
+        super().__init__(
+            alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma, 
+            auto_tune_alpha=auto_tune_alpha, candidate_alphas=default_alphas
+        )
 
     def _compute_background(self, grid, filter_size=31):
-        """1D Azimuthal blur: TDS background is low-frequency along the Phi axis."""
         import jax.scipy.signal
         window = jnp.ones((1, filter_size)) / filter_size
-        # The background is computed directly on the massive spherical grid
         bg = jax.scipy.signal.correlate2d(grid, window, mode='same')
         return jnp.maximum(bg, 1.0)
 
     def _build_basis_matrix(self, grid_coords, params):
-        """Constructs the dense matrix of overlapping Great Circles."""
         Q_x, Q_y, Q_z = grid_coords
         z_x = params[:, 1]
         z_y = params[:, 2]
@@ -216,12 +220,10 @@ class AzimuthalJAXHough:
         return hough_space
 
     def find_active_zones(self, grid, max_axes=15):
-        print("  > Executing Physics-Informed V-Cycle (Scout + Sniper)...")
+        print("  > Executing Physics-Informed V-Cycle (Scout + Auto-Tuned Sniper)...")
         
-        from subhkl.search.sparse_hough import GlobalZoneAxisSniper
-        
-        # Instantiate the Sniper to act as the statistical Gatekeeper
-        sniper = GlobalZoneAxisSniper(alpha=50.0, gamma=1.0, loss="poisson", ref_sigma=self.sigma)
+        # Instantiate the Sniper with Auto-Tuning enabled
+        sniper = GlobalZoneAxisSniper(loss="poisson", ref_sigma=self.sigma)
         
         grid_flat = jnp.array(grid).flatten()
         bg_flat = sniper._compute_background(grid, filter_size=31).flatten()
@@ -231,34 +233,33 @@ class AzimuthalJAXHough:
         candidates = []
         
         # 1. THE SCOUT: Greedy Matching Pursuit
-        for step in range(max_axes * 2):  # Search deeper to find all valid lines
+        for step in range(max_axes * 2):  
             H = self.transform(current_grid)
             H_np = np.array(H)
             
             max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
-            t_idx, p_idx = max_idx
+            max_val = float(H_np[max_idx])
             
+            t_idx, p_idx = max_idx
             Theta = float(self.thetas[t_idx])
             Phi = float(self.phis[p_idx])
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
             
-            # Wrap the candidate in the parameter format [c_init, z_x, z_y, z_z, sigma]
-            cand_params = jnp.array([[1.0, z_x, z_y, z_z, self.sigma]])
+            # THE CRITICAL FIX: Initialize amplitude to max_val!
+            cand_params = jnp.array([[max_val, z_x, z_y, z_z, self.sigma]])
             
-            # THE GATEKEEPER: Run SSN on this single candidate against the ORIGINAL grid
+            # Evaluate using the Auto-Tuner
             A_mat = sniper._build_basis_matrix(grid_coords, cand_params)
-            c_sparse = sniper.solve_ssn_step(grid_flat, bg_flat, A_mat, cand_params)
+            c_sparse = sniper.tune_and_solve(grid_flat, bg_flat, A_mat, cand_params)
             
             if float(c_sparse[0]) <= 1e-3:
-                # The strongest remaining topological feature failed the statistical noise test.
-                # We have officially hit the noise floor!
                 break
                 
             candidates.append([float(c_sparse[0]), z_x, z_y, z_z, self.sigma])
             
-            # Soft Residual Masking: Erase from the *working* grid to find the next line
+            # Soft Residual Masking
             dots = jnp.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
             mask_sigma = self.sigma * 2.0 
             mask = 1.0 - jnp.exp(-(dots**2) / (2 * mask_sigma**2))
@@ -268,16 +269,14 @@ class AzimuthalJAXHough:
             print("  > Scout hit the noise floor instantly. No candidates found.")
             return np.empty((0,3)), np.empty(0)
 
-        print(f"  > Scout extracted {len(candidates)} valid lines before hitting the noise floor.")
-        print("  > Engaging Global SSN Sniper for Joint Optimization...")
+        print(f"  > Scout extracted {len(candidates)} valid lines. Resolving crosstalk...")
 
-        # 2. THE SNIPER: Joint SSN to resolve intersections and crosstalk
+        # 2. THE SNIPER: Joint Auto-Tuned SSN 
         params_guess = jnp.array(candidates)
         A_mat_joint = sniper._build_basis_matrix(grid_coords, params_guess)
         
-        c_sparse_joint = sniper.solve_ssn_step(grid_flat, bg_flat, A_mat_joint, params_guess)
+        c_sparse_joint = sniper.tune_and_solve(grid_flat, bg_flat, A_mat_joint, params_guess)
         
-        # 3. Extract the undisputed survivors
         survivors = c_sparse_joint > 1e-3
         final_zones = np.array(params_guess[survivors, 1:4])
         final_weights = np.array(c_sparse_joint[survivors])
