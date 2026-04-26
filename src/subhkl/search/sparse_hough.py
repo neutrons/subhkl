@@ -246,16 +246,20 @@ class AzimuthalJAXHough:
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
-            
+           
+            # warm-start solver
             new_cand = [z_x, z_y, z_z, float(self.sigma)]
+            p_guess_list = []
+            for i in range(len(active_candidates)):
+                p_guess_list.append([float(c_active[i])] + active_candidates[i])
+            p_guess_list.append([c_init_new] + new_cand)
+
+            p_guess = jnp.array(p_guess_list)
             test_candidates = active_candidates + [new_cand]
             
-            # 3. JOINT SNIPER: Evaluate ALL active lines simultaneously against the RAW grid.
-            # THE FIX: Initialize c=0.0. The SSN will safely climb to the exact amplitude.
-            p_guess = jnp.array([[0.0] + cand for cand in test_candidates])
-            
+            # 3. JOINT SNIPER: Evaluate ALL active lines simultaneously
             A_mat = sniper._build_basis_matrix(grid_coords, p_guess)
-            c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_raw, bg_flat, A_mat, p_guess)
+            c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_raw, bg_flat, A_mat, p_guess) 
             
             survivors = c_sparse > 1e-3
             
