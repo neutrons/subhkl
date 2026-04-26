@@ -165,12 +165,12 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
         c_init = params_guess[:, 0]
         alpha_vec = self.alpha * jnp.ones_like(c_init)
 
-        # We invoke the exact same SSN engine, operating on the KxK macroscopic space!
         from subhkl.search.ssn import solve_ssn_unified
+
+        # Pass loss_code 1 (Poisson)
         c_sparse = solve_ssn_unified(
             M_overlap, y_agg, bg_agg, alpha_vec,
-            loss_type=1, # 1 = Poisson
-            c_init=c_init, max_iter=20, force_target=False
+            1, c_init, max_iter=20, force_target=False
         )
 
         # Compute Macroscopic Deviance
