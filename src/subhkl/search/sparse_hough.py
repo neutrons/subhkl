@@ -131,7 +131,7 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
                  auto_tune_alpha=True, candidate_alphas=None):
         
         # S/N sweep and Gaussian Loss for "Sparse Necklaces"
-        default_alphas = candidate_alphas or [10.0, 15.0,30.0,45.0,50.0,75.0]
+        default_alphas = candidate_alphas or [2.0, 3.0, 5.0, 7.5, 10.0]
         
         super().__init__(
             alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma, 
@@ -217,44 +217,45 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid_raw, grid_bg, max_axes=15):
-        print("  > Executing Joint Orthogonal Matching Pursuit (OMP)...")
+    def find_active_zones(self, grid_signal, max_axes=15):
+        print("  > Executing Joint Orthogonal Matching Pursuit (OMP) on Pure Signal...")
         from subhkl.search.sparse_hough import GlobalZoneAxisSniper
         
-        # Use Gaussian loss to handle the "Sparse Necklace" variance safely
+        # Gaussian loss evaluating directly on the pre-filtered pure signal
         sniper = GlobalZoneAxisSniper(loss="gaussian", ref_sigma=self.sigma)
         
-        # 1. Prepare the static geometry and true backgrounds
-        azimuthal_bg = sniper._compute_background(grid_bg, filter_size=31)
-        grid_flat_raw = jnp.array(grid_raw).flatten()
-        bg_flat = azimuthal_bg.flatten()
+        grid_flat_signal = jnp.array(grid_signal).flatten()
+        
+        # The background has already been perfectly zeroed out by the morphological filter
+        bg_flat = jnp.zeros_like(grid_flat_signal)
         grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
 
-        # The base signal we will carve the Gaussians out of
-        grid_signal_base = jnp.maximum(jnp.array(grid_raw) - azimuthal_bg, 0.0)
+        grid_signal_base = jnp.array(grid_signal)
         current_signal_grid = grid_signal_base
         
-        active_candidates = []  # Stores [zx, zy, zz, sigma]
+        active_candidates = []
+        c_active = []
         
         for step in range(max_axes * 2):
-            # 2. SCOUT: Find the strongest topological line in the remaining residual
             H = self.transform(current_signal_grid)
-            t_idx, p_idx = np.unravel_index(np.argmax(np.array(H)), H.shape)
+            H_np = np.array(H)
             
+            max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
+            max_val = float(H_np[max_idx])
+            
+            t_idx, p_idx = max_idx
             Theta = float(self.thetas[t_idx])
             Phi = float(self.phis[p_idx])
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
 
-            H_np = np.array(H)
-            max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
-            max_val = float(H_np[max_idx])
             c_init_new = max_val / self.N_phi
            
-            # warm-start solver
+            # Warm-start solver: persist the exact solved amplitudes of the existing lines
             new_cand = [z_x, z_y, z_z, float(self.sigma)]
             p_guess_list = []
+            
             for i in range(len(active_candidates)):
                 p_guess_list.append([float(c_active[i])] + active_candidates[i])
             p_guess_list.append([c_init_new] + new_cand)
@@ -262,26 +263,21 @@ class AzimuthalJAXHough:
             p_guess = jnp.array(p_guess_list)
             test_candidates = active_candidates + [new_cand]
             
-            # 3. JOINT SNIPER: Evaluate ALL active lines simultaneously
             A_mat = sniper._build_basis_matrix(grid_coords, p_guess)
-            c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_raw, bg_flat, A_mat, p_guess) 
+            c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_signal, bg_flat, A_mat, p_guess) 
             
             survivors = c_sparse > 1e-3
             
             if not survivors[-1]:
-                # The newest candidate failed the S/N test. We hit the noise floor!
                 print(f"    [Step {step+1:02d}] Rejected | SNR fell below noise floor.")
                 break
                 
             print(f"    [Step {step+1:02d}] Kept | Alpha: {best_alpha:4.1f} | BIC: {bic:.2e} | Dev/Nu: {dev:.3f}")
             
-            # Keep only the mathematically sound lines
             active_candidates = [test_candidates[i] for i in range(len(test_candidates)) if survivors[i]]
             c_active = c_sparse[survivors]
             
-            # 4. TRUE RESIDUAL MASKING
-            # Reconstruct the exact modeled photon flux and subtract it from the base signal.
-            # This perfectly preserves the shared photon energy at the crossing nodes!
+            # TRUE RESIDUAL MASKING
             p_surv = jnp.array([[c_active[i]] + active_candidates[i] for i in range(len(active_candidates))])
             A_surv = sniper._build_basis_matrix(grid_coords, p_surv)
             recon_signal = A_surv @ c_active
