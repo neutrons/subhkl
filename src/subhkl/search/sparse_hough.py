@@ -158,16 +158,15 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
         return vmap(eval_great_circle)(z_x, z_y, z_z, sigmas).T
 
 class AzimuthalJAXHough:
-    """
-    Pure JAX 1D-FFT based Spherical Radon Transform.
-    Now equipped with Real-Space Sequential Set Cover to prevent starburst clustering.
-    """
-    def __init__(self, N_theta=256, N_phi=512, sigma_deg=0.75):
+    def __init__(self, N_theta=256, N_phi=512, sigma_deg=3.0):
         self.N_theta = N_theta
         self.N_phi = N_phi
         self.sigma = np.sin(np.deg2rad(sigma_deg))
         
-        # Symmetrical Grid definitions
+        # A grid of physical widths to test (e.g., 1.5 to 5.0 degrees)
+        sigmas_deg = np.array([1.5, 2.0, 2.5, 3.0, 4.0, 5.0])
+        self.candidate_sigmas = jnp.array(np.sin(np.deg2rad(sigmas_deg)))
+        
         self.thetas = jnp.linspace(0, jnp.pi, N_theta)
         self.phis = jnp.linspace(0, 2 * jnp.pi, N_phi, endpoint=False)
         
@@ -175,7 +174,6 @@ class AzimuthalJAXHough:
         self.cos_theta = jnp.cos(self.thetas)
         self.cos_dphi = jnp.cos(self.phis)
 
-        # Precompute real-space unit vectors for ultra-fast grid masking
         THETA, PHI = jnp.meshgrid(self.thetas, self.phis, indexing='ij')
         self.Q_x = jnp.sin(THETA) * jnp.cos(PHI)
         self.Q_y = jnp.sin(THETA) * jnp.sin(PHI)
@@ -222,7 +220,7 @@ class AzimuthalJAXHough:
     def find_active_zones(self, grid, max_axes=15):
         print("  > Executing Physics-Informed V-Cycle (Scout + Auto-Tuned Sniper)...")
         
-        # Instantiate Sniper with Gaussian loss
+        from subhkl.search.sparse_hough import GlobalZoneAxisSniper
         sniper = GlobalZoneAxisSniper(loss="gaussian", ref_sigma=self.sigma)
         
         grid_flat = jnp.array(grid).flatten()
@@ -231,6 +229,22 @@ class AzimuthalJAXHough:
 
         current_grid = jnp.array(grid)
         candidates = []
+
+        # ==========================================
+        # THE WIDTH SWEEPER
+        # ==========================================
+        @jax.jit
+        def test_candidate_widths(c_init_val, zx, zy, zz):
+            def eval_sig(sig):
+                p = jnp.array([[c_init_val, zx, zy, zz, sig]])
+                A = sniper._build_basis_matrix(grid_coords, p)
+                # Engine applies Besov weight: (sig / ref_sigma)^gamma
+                c_sparse = sniper.tune_and_solve(grid_flat, bg_flat, A, p)
+                return c_sparse[0]
+                
+            c_vals = jax.vmap(eval_sig)(self.candidate_sigmas)
+            best_idx = jnp.argmax(c_vals)
+            return c_vals[best_idx], self.candidate_sigmas[best_idx]
         
         for step in range(max_axes * 2):  
             H = self.transform(current_grid)
@@ -246,21 +260,19 @@ class AzimuthalJAXHough:
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
             
-            # THE SCALING FIX: Initialize amplitude as Average Per-Pixel Flux!
             c_init = max_val / self.N_phi 
-            cand_params = jnp.array([[c_init, z_x, z_y, z_z, self.sigma]])
             
-            A_mat = sniper._build_basis_matrix(grid_coords, cand_params)
-            c_sparse = sniper.tune_and_solve(grid_flat, bg_flat, A_mat, cand_params)
+            # Use the JIT sweeper to find the optimal physical width!
+            best_c, best_sig = test_candidate_widths(c_init, z_x, z_y, z_z)
             
-            if float(c_sparse[0]) <= 1e-3:
+            if float(best_c) <= 1e-3:
                 break
                 
-            candidates.append([float(c_sparse[0]), z_x, z_y, z_z, self.sigma])
+            candidates.append([float(best_c), z_x, z_y, z_z, float(best_sig)])
             
-            # Soft Residual Masking
+            # Use the optimized width to cleanly erase the line
             dots = jnp.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
-            mask_sigma = self.sigma * 2.0 
+            mask_sigma = best_sig * 2.0 
             mask = 1.0 - jnp.exp(-(dots**2) / (2 * mask_sigma**2))
             current_grid = current_grid * mask
 
@@ -281,3 +293,4 @@ class AzimuthalJAXHough:
         
         order = np.argsort(final_weights)[::-1]
         return final_zones[order][:max_axes], final_weights[order][:max_axes]
+
