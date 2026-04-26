@@ -124,15 +124,12 @@ class SparseHoughIndexer:
         return final_zones[order], final_scores[order]
 
 class GlobalZoneAxisSniper(SparseBasisPursuit):
-    """
-    Global Specialization: 1D Gaussian Great Circles in Spherical Angular Space.
-    """
-    def __init__(self, alpha=5.0, gamma=1.0, loss="gaussian", ref_sigma=0.75, 
+    def __init__(self, alpha=1000.0, gamma=1.0, loss="gaussian", ref_sigma=0.75, 
                  auto_tune_alpha=True, candidate_alphas=None):
         
-        # THE FIX: Alpha sweep scaled perfectly for a [0, 1] normalized grid!
-        default_alphas = candidate_alphas or [0.1, 0.5, 1.0, 2.5, 5.0] 
-
+        # THE FIX: Alpha is literally the "Total Photon Threshold" for a Zone Axis to survive!
+        default_alphas = candidate_alphas or [500.0, 1000.0, 2500.0, 5000.0, 10000.0]
+        
         super().__init__(
             alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma, 
             auto_tune_alpha=auto_tune_alpha, candidate_alphas=default_alphas
@@ -140,7 +137,6 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
 
     def _compute_background(self, grid, filter_size=31):
         from subhkl.search.sparse_rbf import jax_median_2d
-        # A Median filter hugs the TDS without absorbing the sparse Bragg peaks!
         bg = jax_median_2d(grid, window_size=filter_size)
         return jnp.maximum(bg, 1.0)
 
@@ -218,23 +214,17 @@ class AzimuthalJAXHough:
         return hough_space
 
     def find_active_zones(self, grid_signal, max_axes=15):
-        print("  > Executing Normalized Orthogonal Matching Pursuit (OMP)...")
+        print("  > Executing Physical Orthogonal Matching Pursuit (OMP)...")
         from subhkl.search.sparse_hough import GlobalZoneAxisSniper
         
-        # Normalize the grid so alpha can safely threshold the noise!
-        grid_max = np.max(grid_signal)
-        if grid_max == 0:
-            return np.empty((0,3)), np.empty(0)
-            
-        grid_signal_norm = grid_signal / grid_max
-        
+        # No normalization! We operate on exact physical photon counts.
         sniper = GlobalZoneAxisSniper(loss="gaussian", ref_sigma=self.sigma)
         
-        grid_flat_signal = jnp.array(grid_signal_norm).flatten()
+        grid_flat_signal = jnp.array(grid_signal).flatten()
         bg_flat = jnp.zeros_like(grid_flat_signal)
         grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
 
-        grid_signal_base = jnp.array(grid_signal_norm)
+        grid_signal_base = jnp.array(grid_signal)
         current_signal_grid = grid_signal_base
         
         active_candidates = []
@@ -269,13 +259,14 @@ class AzimuthalJAXHough:
             A_mat = sniper._build_basis_matrix(grid_coords, p_guess)
             c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_signal, bg_flat, A_mat, p_guess) 
             
-            survivors = c_sparse > 1e-3
+            # THE FIX: Require at least 0.1 average photons per pixel to survive!
+            survivors = c_sparse > 0.1
             
             if not survivors[-1]:
                 print(f"    [Step {step+1:02d}] Rejected | SNR fell below noise floor.")
                 break
                 
-            print(f"    [Step {step+1:02d}] Kept | Alpha: {best_alpha:4.1f} | BIC: {bic:.2e} | MSE: {dev:.6f}")
+            print(f"    [Step {step+1:02d}] Kept | Photon Penalty (\u03b1): {best_alpha:5.0f} | BIC: {bic:.2e} | MSE: {dev:.3f}")
             
             active_candidates = [test_candidates[i] for i in range(len(test_candidates)) if survivors[i]]
             c_active = c_sparse[survivors]
@@ -293,10 +284,7 @@ class AzimuthalJAXHough:
         print(f"  > OMP extracted {len(active_candidates)} joint-optimized zone axes.")
 
         final_zones = np.array([cand[:3] for cand in active_candidates])
-        
-        # Multiply the normalized weights back to true physical photon counts
-        final_weights = np.array(c_active) * grid_max
+        final_weights = np.array(c_active)
         
         order = np.argsort(final_weights)[::-1]
         return final_zones[order][:max_axes], final_weights[order][:max_axes]
-
