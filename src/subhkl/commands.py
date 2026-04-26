@@ -1470,7 +1470,7 @@ def run_sparse_hough(
         run_id = peaks_obj.get_run_id(img_key)
         
         raw_down = jnp.array(raw_image[::stride, ::stride], dtype=jnp.float32)
-        
+        valid = raw_down > 0.0
         if not np.any(valid): continue
 
         row_grid, col_grid = np.indices((det.n, det.m))
