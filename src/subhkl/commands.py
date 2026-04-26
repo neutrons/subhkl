@@ -1465,6 +1465,8 @@ def run_sparse_hough(
     R_all_images = peaks_obj.goniometer.rotation
     stride = 1 
 
+    global_grid_raw = np.zeros((N_theta, N_phi), dtype=np.float32)
+
     for img_key, raw_image in peaks_obj.image.ims.items():
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = peaks_obj.get_run_id(img_key)
