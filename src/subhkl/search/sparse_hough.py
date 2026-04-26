@@ -129,8 +129,7 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
     def __init__(self, alpha=1000.0, gamma=1.0, loss="gaussian", ref_sigma=0.75, 
                  auto_tune_alpha=True, candidate_alphas=None):
         
-        # THE FIX: Alpha is literally the "Total Photon Threshold" for a Zone Axis to survive!
-        default_alphas = candidate_alphas or [500.0, 1000.0, 2500.0, 5000.0, 10000.0]
+        default_alphas = [5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0]
         
         super().__init__(
             alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma, 
