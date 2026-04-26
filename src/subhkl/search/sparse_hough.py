@@ -5,6 +5,8 @@ import numpy as np
 
 from subhkl.search.ssn import SparseBasisPursuit
 
+from functools import partial
+
 def get_data_driven_dictionary(q_lab_obs):
     """
     The Support Vector Dictionary.
