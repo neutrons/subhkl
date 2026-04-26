@@ -215,57 +215,72 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid, max_axes=15, num_candidates=50):
-        print("  > Executing Continuous 1D-FFT Scout Phase...")
-        H = self.transform(jnp.array(grid))
-        H_np = np.array(H)
+    def find_active_zones(self, grid, max_axes=15):
+        print("  > Executing Physics-Informed V-Cycle (Scout + Sniper)...")
         
+        from subhkl.search.sparse_hough import GlobalZoneAxisSniper
+        
+        # Instantiate the Sniper to act as the statistical Gatekeeper
+        sniper = GlobalZoneAxisSniper(alpha=50.0, gamma=1.0, loss="poisson", ref_sigma=self.sigma)
+        
+        grid_flat = jnp.array(grid).flatten()
+        bg_flat = sniper._compute_background(grid, filter_size=31).flatten()
+        grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
+
+        current_grid = jnp.array(grid)
         candidates = []
-        temp_H = H_np.copy()
         
-        # 1. The Scout: Extract raw local maxima sequentially
-        for _ in range(num_candidates):
-            max_idx = np.unravel_index(np.argmax(temp_H), temp_H.shape)
-            max_val = temp_H[max_idx]
-            if max_val < 1e-3: break
+        # 1. THE SCOUT: Greedy Matching Pursuit
+        for step in range(max_axes * 2):  # Search deeper to find all valid lines
+            H = self.transform(current_grid)
+            H_np = np.array(H)
             
+            max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
             t_idx, p_idx = max_idx
+            
             Theta = float(self.thetas[t_idx])
             Phi = float(self.phis[p_idx])
-            
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
             
-            candidates.append([max_val, z_x, z_y, z_z, self.sigma])
+            # Wrap the candidate in the parameter format [c_init, z_x, z_y, z_z, sigma]
+            cand_params = jnp.array([[1.0, z_x, z_y, z_z, self.sigma]])
             
-            # Wipe local neighborhood to find independent lines
-            t_min = max(0, t_idx - 5)
-            t_max = min(self.N_theta, t_idx + 6)
-            for t in range(t_min, t_max):
-                for p in range(p_idx - 5, p_idx + 6):
-                    temp_H[t, p % self.N_phi] = 0.0
+            # THE GATEKEEPER: Run SSN on this single candidate against the ORIGINAL grid
+            A_mat = sniper._build_basis_matrix(grid_coords, cand_params)
+            c_sparse = sniper.solve_ssn_step(grid_flat, bg_flat, A_mat, cand_params)
+            
+            if float(c_sparse[0]) <= 1e-3:
+                # The strongest remaining topological feature failed the statistical noise test.
+                # We have officially hit the noise floor!
+                break
+                
+            candidates.append([float(c_sparse[0]), z_x, z_y, z_z, self.sigma])
+            
+            # Soft Residual Masking: Erase from the *working* grid to find the next line
+            dots = jnp.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
+            mask_sigma = self.sigma * 2.0 
+            mask = 1.0 - jnp.exp(-(dots**2) / (2 * mask_sigma**2))
+            current_grid = current_grid * mask
 
         if not candidates:
+            print("  > Scout hit the noise floor instantly. No candidates found.")
             return np.empty((0,3)), np.empty(0)
 
-        # 2. The Sniper: Unified SSN Optimization
-        print(f"  > Scout found {len(candidates)} candidates. Engaging Global SSN Sniper...")
-        sniper = GlobalZoneAxisSniper(alpha=15.0, gamma=1.0, loss="gaussian", ref_sigma=self.sigma)
+        print(f"  > Scout extracted {len(candidates)} valid lines before hitting the noise floor.")
+        print("  > Engaging Global SSN Sniper for Joint Optimization...")
+
+        # 2. THE SNIPER: Joint SSN to resolve intersections and crosstalk
+        params_guess = jnp.array(candidates)
+        A_mat_joint = sniper._build_basis_matrix(grid_coords, params_guess)
         
-        grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
-        params_guess = jnp.array(candidates) # Format: [c, z_x, z_y, z_z, sigma]
+        c_sparse_joint = sniper.solve_ssn_step(grid_flat, bg_flat, A_mat_joint, params_guess)
         
-        A_mat = sniper._build_basis_matrix(grid_coords, params_guess)
-        bg_flat = sniper._compute_background(grid, filter_size=31).flatten()
-        
-        # The SSN Engine simultaneously evaluates all candidates and zeros out crosstalk
-        c_sparse = sniper.solve_ssn_step(jnp.array(grid).flatten(), bg_flat, A_mat, params_guess)
-        
-        # 3. Extract the mathematically robust survivors
-        survivors = c_sparse > 1e-3
+        # 3. Extract the undisputed survivors
+        survivors = c_sparse_joint > 1e-3
         final_zones = np.array(params_guess[survivors, 1:4])
-        final_weights = np.array(c_sparse[survivors])
+        final_weights = np.array(c_sparse_joint[survivors])
         
         order = np.argsort(final_weights)[::-1]
         return final_zones[order][:max_axes], final_weights[order][:max_axes]
