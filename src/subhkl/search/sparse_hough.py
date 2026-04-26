@@ -130,9 +130,9 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
     def __init__(self, alpha=5.0, gamma=1.0, loss="gaussian", ref_sigma=0.75, 
                  auto_tune_alpha=True, candidate_alphas=None):
         
-        # S/N sweep and Gaussian Loss for "Sparse Necklaces"
-        default_alphas = candidate_alphas or [2.0, 3.0, 5.0, 7.5, 10.0]
-        
+        # THE FIX: Alpha sweep scaled perfectly for a [0, 1] normalized grid!
+        default_alphas = candidate_alphas or [0.1, 0.5, 1.0, 2.5, 5.0] 
+
         super().__init__(
             alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma, 
             auto_tune_alpha=auto_tune_alpha, candidate_alphas=default_alphas
@@ -218,19 +218,23 @@ class AzimuthalJAXHough:
         return hough_space
 
     def find_active_zones(self, grid_signal, max_axes=15):
-        print("  > Executing Joint Orthogonal Matching Pursuit (OMP) on Pure Signal...")
+        print("  > Executing Normalized Orthogonal Matching Pursuit (OMP)...")
         from subhkl.search.sparse_hough import GlobalZoneAxisSniper
         
-        # Gaussian loss evaluating directly on the pre-filtered pure signal
+        # Normalize the grid so alpha can safely threshold the noise!
+        grid_max = np.max(grid_signal)
+        if grid_max == 0:
+            return np.empty((0,3)), np.empty(0)
+            
+        grid_signal_norm = grid_signal / grid_max
+        
         sniper = GlobalZoneAxisSniper(loss="gaussian", ref_sigma=self.sigma)
         
-        grid_flat_signal = jnp.array(grid_signal).flatten()
-        
-        # The background has already been perfectly zeroed out by the morphological filter
+        grid_flat_signal = jnp.array(grid_signal_norm).flatten()
         bg_flat = jnp.zeros_like(grid_flat_signal)
         grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
 
-        grid_signal_base = jnp.array(grid_signal)
+        grid_signal_base = jnp.array(grid_signal_norm)
         current_signal_grid = grid_signal_base
         
         active_candidates = []
@@ -252,7 +256,6 @@ class AzimuthalJAXHough:
 
             c_init_new = max_val / self.N_phi
            
-            # Warm-start solver: persist the exact solved amplitudes of the existing lines
             new_cand = [z_x, z_y, z_z, float(self.sigma)]
             p_guess_list = []
             
@@ -272,12 +275,11 @@ class AzimuthalJAXHough:
                 print(f"    [Step {step+1:02d}] Rejected | SNR fell below noise floor.")
                 break
                 
-            print(f"    [Step {step+1:02d}] Kept | Alpha: {best_alpha:4.1f} | BIC: {bic:.2e} | Dev/Nu: {dev:.3f}")
+            print(f"    [Step {step+1:02d}] Kept | Alpha: {best_alpha:4.1f} | BIC: {bic:.2e} | MSE: {dev:.6f}")
             
             active_candidates = [test_candidates[i] for i in range(len(test_candidates)) if survivors[i]]
             c_active = c_sparse[survivors]
             
-            # TRUE RESIDUAL MASKING
             p_surv = jnp.array([[c_active[i]] + active_candidates[i] for i in range(len(active_candidates))])
             A_surv = sniper._build_basis_matrix(grid_coords, p_surv)
             recon_signal = A_surv @ c_active
@@ -291,7 +293,9 @@ class AzimuthalJAXHough:
         print(f"  > OMP extracted {len(active_candidates)} joint-optimized zone axes.")
 
         final_zones = np.array([cand[:3] for cand in active_candidates])
-        final_weights = np.array(c_active)
+        
+        # Multiply the normalized weights back to true physical photon counts
+        final_weights = np.array(c_active) * grid_max
         
         order = np.argsort(final_weights)[::-1]
         return final_zones[order][:max_axes], final_weights[order][:max_axes]

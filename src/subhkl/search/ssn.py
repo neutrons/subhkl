@@ -227,7 +227,8 @@ class SparseBasisPursuit:
             else: # Gaussian
                 diff = recon_total - data_flat
                 nll = 0.5 * jnp.sum(diff**2)
-                dev = jnp.sum((diff**2) / recon_total)
+                # THE FIX: True Mean Squared Error for pure continuous signals
+                dev = jnp.sum(diff**2) / n_pix
 
             n_pix = data_flat.size
             n_params = k_active * params_guess.shape[1]
