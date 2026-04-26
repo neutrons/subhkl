@@ -1469,10 +1469,12 @@ def run_sparse_hough(
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = peaks_obj.get_run_id(img_key)
         
-        raw_down = jnp.array(raw_image[::stride, ::stride], dtype=jnp.float32)
-        valid = raw_down > 0.0
+        # Flatten the raw intensity first so the boolean mask is strictly 1D
+        intensity_raw = np.array(raw_image[::stride, ::stride]).flatten()
+        valid = intensity_raw > 0.0
         if not np.any(valid): continue
 
+        # Now [valid] flawlessly masks the 1D flattened grids
         row_grid, col_grid = np.indices((det.n, det.m))
         row_grid = row_grid[::stride, ::stride].flatten()[valid]
         col_grid = col_grid[::stride, ::stride].flatten()[valid]
@@ -1485,9 +1487,9 @@ def run_sparse_hough(
         R_mat = R_all_images[run_id]
         q_sample = np.einsum('ij,nj->ni', R_mat.T, q_lab)
 
-        grid_chunk_raw = hough_indexer.accumulate_to_grid(q_sample, raw_down[valid])
+        grid_chunk_raw = hough_indexer.accumulate_to_grid(q_sample, intensity_raw[valid])
         global_grid_raw += grid_chunk_raw
-        
+
     print(f"  > Processing continuous topological projection of {len(peaks_obj.image.ims)} panels...")
     
     empirical_zones, activation_weights = hough_indexer.find_active_zones(global_grid_raw, max_axes=max_axes)
