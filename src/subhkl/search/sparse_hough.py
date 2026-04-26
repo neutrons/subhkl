@@ -153,6 +153,32 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
 
         return vmap(eval_great_circle)(z_x, z_y, z_z, sigmas).T
 
+@partial(jit, static_argnames=['self'])
+    def solve_aggregated_poisson(self, data_flat, bg_flat, A_matrix, params_guess):
+        # 1. Project into Macroscopic Hough Space!
+        y_agg = A_matrix.T @ data_flat
+        bg_agg = A_matrix.T @ bg_flat
+        M_overlap = A_matrix.T @ A_matrix
+
+        c_init = params_guess[:, 0]
+        alpha_vec = self.alpha * jnp.ones_like(c_init)
+
+        # We invoke the exact same SSN engine, operating on the KxK macroscopic space!
+        from subhkl.search.ssn import solve_ssn_unified
+        c_sparse = solve_ssn_unified(
+            M_overlap, y_agg, bg_agg, alpha_vec,
+            loss_type=1, # 1 = Poisson
+            c_init=c_init, max_iter=20, force_target=False
+        )
+
+        # Compute Macroscopic Deviance
+        U_agg = M_overlap @ c_sparse + bg_agg
+        U_safe = jnp.maximum(U_agg, 1e-9)
+        term = jax.scipy.special.xlogy(y_agg, y_agg / U_safe) - (y_agg - U_safe)
+        dev = 2 * jnp.sum(term)
+
+        return c_sparse, dev
+
 class AzimuthalJAXHough:
     def __init__(self, N_theta=256, N_phi=512, sigma_deg=3.0):
         self.N_theta = N_theta
@@ -213,18 +239,18 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid_signal, max_axes=15):
-        print("  > Executing Physical Orthogonal Matching Pursuit (OMP)...")
+    def find_active_zones(self, grid_raw, max_axes=15):
+        print("  > Executing Macroscopic Poisson OMP...")
         from subhkl.search.sparse_hough import GlobalZoneAxisSniper
         
-        # No normalization! We operate on exact physical photon counts.
-        sniper = GlobalZoneAxisSniper(loss="gaussian", ref_sigma=self.sigma)
+        # A single, stable sparsity threshold handles everything under Poisson statistics
+        sniper = GlobalZoneAxisSniper(alpha=15.0)
         
-        grid_flat_signal = jnp.array(grid_signal).flatten()
-        bg_flat = jnp.zeros_like(grid_flat_signal)
+        grid_flat_raw = jnp.array(grid_raw).flatten()
+        bg_flat = sniper._compute_background(grid_raw, filter_size=31).flatten()
         grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
 
-        grid_signal_base = jnp.array(grid_signal)
+        grid_signal_base = jnp.maximum(jnp.array(grid_raw) - bg_flat.reshape(self.N_theta, self.N_phi), 0.0)
         current_signal_grid = grid_signal_base
         
         active_candidates = []
@@ -257,16 +283,17 @@ class AzimuthalJAXHough:
             test_candidates = active_candidates + [new_cand]
             
             A_mat = sniper._build_basis_matrix(grid_coords, p_guess)
-            c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_signal, bg_flat, A_mat, p_guess) 
             
-            # THE FIX: Require at least 0.1 average photons per pixel to survive!
-            survivors = c_sparse > 0.1
+            # THE MAGICAL SOLVER: Macroscopic Poisson!
+            c_sparse, dev = sniper.solve_aggregated_poisson(grid_flat_raw, bg_flat, A_mat, p_guess) 
+            
+            survivors = c_sparse > 1e-3
             
             if not survivors[-1]:
                 print(f"    [Step {step+1:02d}] Rejected | SNR fell below noise floor.")
                 break
                 
-            print(f"    [Step {step+1:02d}] Kept | Photon Penalty (\u03b1): {best_alpha:5.0f} | BIC: {bic:.2e} | MSE: {dev:.3f}")
+            print(f"    [Step {step+1:02d}] Kept | Macroscopic Deviance: {dev:.3f}")
             
             active_candidates = [test_candidates[i] for i in range(len(test_candidates)) if survivors[i]]
             c_active = c_sparse[survivors]
@@ -288,3 +315,4 @@ class AzimuthalJAXHough:
         
         order = np.argsort(final_weights)[::-1]
         return final_zones[order][:max_axes], final_weights[order][:max_axes]
+

@@ -1462,29 +1462,15 @@ def run_sparse_hough(
     N_theta, N_phi = 512, 1024
     hough_indexer = AzimuthalJAXHough(N_theta=N_theta, N_phi=N_phi, sigma_deg=3.0)
     
-    # We only need one grid now: The Pure Signal Grid
-    global_grid_signal = np.zeros((N_theta, N_phi), dtype=np.float32)
-
     R_all_images = peaks_obj.goniometer.rotation
     stride = 1 
-
-    # JIT-compile the extraction of PURE SIGNAL (Raw - Background)
-    @jax.jit
-    def extract_pure_signal(img_down):
-        med = jax_median_2d(img_down, window_size=7)
-        blur = jax_gaussian_blur_2d(med)
-        bg = jnp.maximum(blur, 1.0)
-        return jnp.maximum(img_down - bg, 0.0)
 
     for img_key, raw_image in peaks_obj.image.ims.items():
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = peaks_obj.get_run_id(img_key)
         
         raw_down = jnp.array(raw_image[::stride, ::stride], dtype=jnp.float32)
-        signal_down = extract_pure_signal(raw_down)
         
-        intensity_signal = np.array(signal_down).flatten()
-        valid = intensity_signal > 1.0  # Only process actual signal photons!
         if not np.any(valid): continue
 
         row_grid, col_grid = np.indices((det.n, det.m))
@@ -1499,12 +1485,12 @@ def run_sparse_hough(
         R_mat = R_all_images[run_id]
         q_sample = np.einsum('ij,nj->ni', R_mat.T, q_lab)
 
-        grid_chunk_signal = hough_indexer.accumulate_to_grid(q_sample, intensity_signal[valid])
-        global_grid_signal += grid_chunk_signal
+        grid_chunk_raw = hough_indexer.accumulate_to_grid(q_sample, raw_down[valid])
+        global_grid_raw += grid_chunk_raw
         
     print(f"  > Processing continuous topological projection of {len(peaks_obj.image.ims)} panels...")
     
-    empirical_zones, activation_weights = hough_indexer.find_active_zones(global_grid_signal, max_axes=max_axes)
+    empirical_zones, activation_weights = hough_indexer.find_active_zones(global_grid_raw, max_axes=max_axes)
 
     # ==========================================
     # PHASE 3: DAVENPORT COMBINATORIAL SEARCH (REAL-SPACE DUALITY)
