@@ -193,7 +193,9 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
             # BIC Calculation
             n_pix = data_flat.size
             n_params = k_active * params_guess.shape[1]
-           
+
+            bic = jnp.where(k_active == 0, 1e9, n_params * jnp.log(n_pix) + dev)
+
             dof = jnp.maximum(n_pix - n_params, 1)
             dev_nu = dev / dof
             
