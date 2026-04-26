@@ -123,9 +123,8 @@ class SparseHoughIndexer:
 
 class AzimuthalJAXHough:
     """
-    Pure JAX 1D-FFT based Spherical Radon Transform equivalent.
-    Achieves O(N_theta^2 * N_phi * log(N_phi)) via Azimuthal Convolution.
-    Zero external C++ dependencies required.
+    Pure JAX 1D-FFT based Spherical Radon Transform.
+    Now equipped with Real-Space Sequential Set Cover to prevent starburst clustering.
     """
     def __init__(self, N_theta=256, N_phi=512, sigma_deg=0.75):
         self.N_theta = N_theta
@@ -139,6 +138,12 @@ class AzimuthalJAXHough:
         self.sin_theta = jnp.sin(self.thetas)
         self.cos_theta = jnp.cos(self.thetas)
         self.cos_dphi = jnp.cos(self.phis)
+
+        # Precompute real-space unit vectors for ultra-fast grid masking
+        THETA, PHI = jnp.meshgrid(self.thetas, self.phis, indexing='ij')
+        self.Q_x = jnp.sin(THETA) * jnp.cos(PHI)
+        self.Q_y = jnp.sin(THETA) * jnp.sin(PHI)
+        self.Q_z = jnp.cos(THETA)
 
     def accumulate_to_grid(self, q_sample_vectors, intensities):
         norms = np.linalg.norm(q_sample_vectors, axis=1, keepdims=True)
@@ -163,60 +168,63 @@ class AzimuthalJAXHough:
         sin_T = jnp.sin(Theta_k)
         cos_T = jnp.cos(Theta_k)
         
-        # x_ik(dphi) = cos(theta_i)cos(Theta_k) + sin(theta_i)sin(Theta_k)cos(dphi)
         x_ik = cos_t[:, None] * cos_T + (sin_t[:, None] * sin_T) * cos_dphi[None, :]
-        
-        # Gaussian kernel for Great Circle (we want x_ik ~ 0)
         W_ik = jnp.exp(-(x_ik**2) / (2 * sigma**2))
         
-        # Real-FFT of the Kernel
         W_fft = jnp.fft.rfft(W_ik, axis=1)
-        
-        # Cross-correlation in Fourier space (Summing over theta_i)
         sum_fft = jnp.sum(I_fft * jnp.conj(W_fft), axis=0)
-        
-        # Inverse Real-FFT to extract the spatial scores
         score_row = jnp.fft.irfft(sum_fft, n=cos_dphi.shape[0])
         
         return carry, score_row
 
     def transform(self, grid):
-        """
-        Executes the 1D FFT convolutions using lax.scan for optimal VRAM usage.
-        """
         I_fft = jnp.fft.rfft(grid, axis=1)
         carry = (I_fft, self.thetas, self.sin_theta, self.cos_theta, self.cos_dphi, self.sigma)
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid, max_axes=15, peak_neighborhood=5):
-        print("  > Executing Pure JAX 1D-FFT Azimuthal Convolution...")
-        H = np.array(self.transform(jnp.array(grid)))
-        
+    def find_active_zones(self, grid, max_axes=15, mask_tol_deg=1.5):
+        """
+        Extracts zones by finding the global maximum, then erasing that physical 
+        stripe from the real-space grid to prevent starburst convergence.
+        """
+        print("  > Executing Sequential 1D-FFT Set Cover...")
         zones, weights = [], []
+        current_grid = jnp.array(grid)
+        
+        mask_tol = np.sin(np.deg2rad(mask_tol_deg))
 
-        for _ in range(max_axes):
-            max_idx = np.unravel_index(np.argmax(H), H.shape)
-            max_val = H[max_idx]
+        for step in range(max_axes):
+            # 1. Transform the current grid state
+            H = self.transform(current_grid)
+            H_np = np.array(H)
+            
+            # 2. Extract the undisputed global winner
+            max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
+            max_val = H_np[max_idx]
 
-            if max_val == 0: break
+            # Terminate if we've exhausted the signal
+            if max_val < 1e-3: 
+                break
 
             t_idx, p_idx = max_idx
-            Theta = self.thetas[t_idx]
-            Phi = self.phis[p_idx]
+            Theta = float(self.thetas[t_idx])
+            Phi = float(self.phis[p_idx])
 
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
-
-            zones.append(np.array([z_x, z_y, z_z]))
+            
+            Z_vec = np.array([z_x, z_y, z_z])
+            zones.append(Z_vec)
             weights.append(float(max_val))
 
-            # Erase local neighborhood across the grid
-            t_min = max(0, t_idx - peak_neighborhood)
-            t_max = min(self.N_theta, t_idx + peak_neighborhood + 1)
-            for t in range(t_min, t_max):
-                for p in range(p_idx - peak_neighborhood, p_idx + peak_neighborhood + 1):
-                    H[t, p % self.N_phi] = 0.0
+            # 3. REAL-SPACE MASKING: Erase the captured line from the physical grid!
+            # Calculate distance from every grid pixel to the newly discovered zone axis
+            dots = jnp.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
+            
+            # Keep only the pixels that are OUTSIDE the tolerance band
+            mask = (dots > mask_tol).astype(jnp.float32)
+            current_grid = current_grid * mask
 
         return np.array(zones), np.array(weights)
