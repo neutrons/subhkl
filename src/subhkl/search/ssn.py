@@ -211,6 +211,8 @@ class SparseBasisPursuit:
             recon = A_matrix @ c_sparse
             recon_total = jnp.maximum(recon + bg_flat, 1e-9)
 
+            n_pix = data_flat.size
+
             if self.loss_code == 1: # Poisson
                 nll = jnp.sum(recon_total - jax.scipy.special.xlogy(data_flat, recon_total))
                 term = jax.scipy.special.xlogy(data_flat, data_flat / recon_total) - (data_flat - recon_total)
@@ -230,7 +232,6 @@ class SparseBasisPursuit:
                 # THE FIX: True Mean Squared Error for pure continuous signals
                 dev = jnp.sum(diff**2) / n_pix
 
-            n_pix = data_flat.size
             n_params = k_active * params_guess.shape[1]
             dof = jnp.maximum(n_pix - n_params, 1)
             dev_nu = dev / dof
