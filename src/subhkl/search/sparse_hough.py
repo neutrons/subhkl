@@ -241,16 +241,14 @@ class AzimuthalJAXHough:
             def eval_sig(sig):
                 p = jnp.array([[c_init_val, zx, zy, zz, sig]])
                 A = sniper._build_basis_matrix(grid_coords, p)
-                # THE SNIPER: Evaluates the raw photons against the modeled background
-                c_sparse = sniper.tune_and_solve(grid_flat_raw, bg_flat, A, p)
-                return c_sparse[0]
+                c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_raw, bg_flat, A, p)
+                return c_sparse[0], best_alpha, bic, dev
                 
-            c_vals = jax.vmap(eval_sig)(self.candidate_sigmas)
+            c_vals, alphas, bics, devs = jax.vmap(eval_sig)(self.candidate_sigmas)
             best_idx = jnp.argmax(c_vals)
-            return c_vals[best_idx], self.candidate_sigmas[best_idx]
+            return c_vals[best_idx], self.candidate_sigmas[best_idx], alphas[best_idx], bics[best_idx], devs[best_idx]
         
         for step in range(max_axes * 2):  
-            # The FFT looks ONLY at the signal grid!
             H = self.transform(current_signal_grid)
             H_np = np.array(H)
             
@@ -265,14 +263,16 @@ class AzimuthalJAXHough:
             z_z = np.cos(Theta)
             
             c_init = max_val / self.N_phi 
-            best_c, best_sig = test_candidate_widths(c_init, z_x, z_y, z_z)
+            best_c, best_sig, chosen_alpha, bic, dev = test_candidate_widths(c_init, z_x, z_y, z_z)
             
             if float(best_c) <= 1e-3:
+                print(f"    [Step {step+1:02d}] Rejected | SNR fell below noise floor.")
                 break
                 
+            print(f"    [Step {step+1:02d}] Kept | Width: {np.degrees(np.arcsin(best_sig)):.1f} deg | Alpha: {chosen_alpha:4.1f} | BIC: {bic:.2e} | Dev/Nu: {dev:.3f}")
+            
             candidates.append([float(best_c), z_x, z_y, z_z, float(best_sig)])
             
-            # Mask out the signal grid to find the next independent line
             dots = jnp.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
             mask_sigma = best_sig * 2.0 
             mask = 1.0 - jnp.exp(-(dots**2) / (2 * mask_sigma**2))

@@ -176,10 +176,11 @@ class SparseBasisPursuit:
     def tune_and_solve(self, data_flat, bg_flat, A_matrix, params_guess):
         """
         Sweeps candidate alphas, evaluates the SSN step, and returns 
-        the solution that minimizes the Bayesian Information Criterion (BIC).
+        the solution that minimizes the BIC, alongside logging metrics.
         """
         if not self.auto_tune_alpha:
-            return self.solve_ssn_step(data_flat, bg_flat, A_matrix, params_guess)
+            c = self.solve_ssn_step(data_flat, bg_flat, A_matrix, params_guess)
+            return c, self.alpha, 0.0, 0.0
 
         def evaluate_alpha(alpha_val):
             c_sparse = self.solve_ssn_step(data_flat, bg_flat, A_matrix, params_guess, alpha_override=alpha_val)
@@ -190,16 +191,22 @@ class SparseBasisPursuit:
 
             if self.loss_code == 1: # Poisson
                 nll = jnp.sum(recon_total - jax.scipy.special.xlogy(data_flat, recon_total))
+                term = jax.scipy.special.xlogy(data_flat, data_flat / recon_total) - (data_flat - recon_total)
+                dev = 2 * jnp.sum(term)
             else: # Gaussian
-                nll = 0.5 * jnp.sum((recon_total - data_flat)**2)
+                diff = recon_total - data_flat
+                nll = 0.5 * jnp.sum(diff**2)
+                dev = jnp.sum((diff**2) / recon_total)
 
             n_pix = data_flat.size
             n_params = k_active * params_guess.shape[1]
+            dof = jnp.maximum(n_pix - n_params, 1)
+            dev_nu = dev / dof
             
-            # Heavy penalty if no signal is found to prevent picking alpha that destroys all data
             bic = jnp.where(k_active == 0, 1e9, n_params * jnp.log(n_pix) + 2 * nll)
-            return bic, c_sparse
+            return bic, c_sparse, dev_nu
 
-        bics, all_c_sparse = vmap(evaluate_alpha)(self.candidate_alphas)
+        bics, all_c_sparse, devs = vmap(evaluate_alpha)(self.candidate_alphas)
         best_idx = jnp.argmin(bics)
-        return all_c_sparse[best_idx]
+        
+        return all_c_sparse[best_idx], self.candidate_alphas[best_idx], bics[best_idx], devs[best_idx]
