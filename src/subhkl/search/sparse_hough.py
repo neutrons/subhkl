@@ -143,16 +143,29 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
 
     def _build_basis_matrix(self, grid_coords, params):
         Q_x, Q_y, Q_z = grid_coords
-        z_x = params[:, 1]
-        z_y = params[:, 2]
-        z_z = params[:, 3]
+        
+        # Unpack the 8 geometric parameters
+        z_x, z_y, z_z = params[:, 1], params[:, 2], params[:, 3]
         sigmas = params[:, 4]
+        vc_x, vc_y, vc_z = params[:, 5], params[:, 6], params[:, 7]
+        kappas = params[:, 8]
 
-        def eval_great_circle(zx, zy, zz, sig):
-            dots = jnp.abs(Q_x * zx + Q_y * zy + Q_z * zz)
-            return jnp.exp(-(dots**2) / (2 * sig**2))
+        def eval_windowed_circle(zx, zy, zz, sig, vcx, vcy, vcz, kappa):
+            # 1. Great Circle Width (Gaussian Cross-Section)
+            dots_z = jnp.abs(Q_x * zx + Q_y * zy + Q_z * zz)
+            width_mask = jnp.exp(-(dots_z**2) / (2 * sig**2))
+            
+            # 2. Arc Length Window (Von Mises Azimuthal Distribution)
+            # dots_v is the cosine of the angle along the arc from the center point vc
+            dots_v = Q_x * vcx + Q_y * vcy + Q_z * vcz
+            
+            # If kappa == 0, exp(0) == 1.0 (Full 360-degree Circle)
+            # If kappa > 0, it decays rapidly away from the arc center!
+            arc_mask = jnp.exp(kappa * (dots_v - 1.0))
+            
+            return width_mask * arc_mask
 
-        return vmap(eval_great_circle)(z_x, z_y, z_z, sigmas).T
+        return jax.vmap(eval_windowed_circle)(z_x, z_y, z_z, sigmas, vc_x, vc_y, vc_z, kappas).T
 
 class AzimuthalJAXHough:
     def __init__(self, N_theta=256, N_phi=512, sigma_deg=3.0):
@@ -215,12 +228,12 @@ class AzimuthalJAXHough:
         return hough_space
 
     def find_active_zones(self, grid_raw, max_axes=15):
-        print("  > Executing Pixel-Wise Poisson OMP...")
+        print("  > Executing Windowed Poisson OMP (Partial Arc Extraction)...")
         from subhkl.search.sparse_hough import GlobalZoneAxisSniper
         
-        sniper = GlobalZoneAxisSniper(loss="poisson", ref_sigma=self.sigma)
+        # Lower alpha slightly, because partial arcs contain fewer total photons!
+        sniper = GlobalZoneAxisSniper(loss="poisson", ref_sigma=self.sigma, candidate_alphas=[5.0, 10.0, 20.0, 30.0, 50.0])
         
-        # 1. Provide the RAW photons and the median BACKGROUND
         grid_flat_raw = jnp.array(grid_raw).flatten()
         bg_flat = sniper._compute_background(grid_raw, filter_size=31).flatten()
         grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
@@ -245,9 +258,48 @@ class AzimuthalJAXHough:
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
 
+            # ==========================================
+            # DYNAMIC ARC EXTRACTION (Mean Resultant)
+            # ==========================================
+            dots_z = np.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
+            ribbon_mask = dots_z < np.sin(np.deg2rad(5.0))
+            I_ribbon = current_signal_grid * ribbon_mask
+            
+            sum_I = np.sum(I_ribbon)
+            if sum_I > 0:
+                # 3D Center of Mass of the photons
+                mu_x = np.sum(I_ribbon * self.Q_x) / sum_I
+                mu_y = np.sum(I_ribbon * self.Q_y) / sum_I
+                mu_z = np.sum(I_ribbon * self.Q_z) / sum_I
+                
+                # Mean Resultant Length (0.0 = Uniform Ring, 1.0 = Point Source)
+                R_len = np.sqrt(mu_x**2 + mu_y**2 + mu_z**2)
+                
+                # Project the Center of Mass exactly onto the Great Circle plane
+                dot_mu_z = mu_x*z_x + mu_y*z_y + mu_z*z_z
+                vc_x = mu_x - dot_mu_z * z_x
+                vc_y = mu_y - dot_mu_z * z_y
+                vc_z = mu_z - dot_mu_z * z_z
+                
+                norm_vc = np.sqrt(vc_x**2 + vc_y**2 + vc_z**2)
+                if norm_vc > 0:
+                    vc_x, vc_y, vc_z = vc_x/norm_vc, vc_y/norm_vc, vc_z/norm_vc
+                else:
+                    vc_x, vc_y, vc_z = 1.0, 0.0, 0.0
+                    
+                # Map Circular Variance to Von Mises Concentration
+                if R_len < 0.1:
+                    kappa = 0.0 # Force full circle if highly distributed
+                else:
+                    # Approximation: kappa ~ R / (1 - R). Capped at 20.0 to prevent it from becoming a tiny dot
+                    kappa = min(20.0, R_len / (1.0 - min(R_len, 0.99)))
+            else:
+                vc_x, vc_y, vc_z = 1.0, 0.0, 0.0
+                kappa = 0.0
+
+            # Append the 4 new arc parameters to the candidate vector!
             c_init_new = max_val / self.N_phi
-           
-            new_cand = [z_x, z_y, z_z, float(self.sigma)]
+            new_cand = [z_x, z_y, z_z, float(self.sigma), vc_x, vc_y, vc_z, kappa]
             p_guess_list = []
             
             for i in range(len(active_candidates)):
@@ -258,8 +310,6 @@ class AzimuthalJAXHough:
             test_candidates = active_candidates + [new_cand]
             
             A_mat = sniper._build_basis_matrix(grid_coords, p_guess)
-            
-            # THE TRUE SOLVER: Evaluates full pixel-wise probability over 500k pixels!
             c_sparse, best_alpha, bic, dev = sniper.tune_and_solve(grid_flat_raw, bg_flat, A_mat, p_guess) 
             
             survivors = c_sparse > 1e-3
@@ -268,7 +318,7 @@ class AzimuthalJAXHough:
                 print(f"    [Step {step+1:02d}] Rejected | SNR fell below noise floor.")
                 break
                 
-            print(f"    [Step {step+1:02d}] Kept | Alpha: {best_alpha:4.1f} | BIC: {bic:.2e} | Dev/Nu: {dev:.3f}")
+            print(f"    [Step {step+1:02d}] Kept | R_len: {R_len:.2f} (\u03ba={kappa:.1f}) | Alpha: {best_alpha:4.1f} | Dev/Nu: {dev:.3f}")
             
             active_candidates = [test_candidates[i] for i in range(len(test_candidates)) if survivors[i]]
             c_active = c_sparse[survivors]
@@ -285,6 +335,7 @@ class AzimuthalJAXHough:
 
         print(f"  > OMP extracted {len(active_candidates)} joint-optimized zone axes.")
 
+        # The final zones matrix is still just the normal vectors!
         final_zones = np.array([cand[:3] for cand in active_candidates])
         final_weights = np.array(c_active)
         
