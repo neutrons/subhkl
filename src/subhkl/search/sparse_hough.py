@@ -183,27 +183,22 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid, max_axes=15, mask_tol_deg=1.5):
+    def find_active_zones(self, grid, max_axes=15):
         """
-        Extracts zones by finding the global maximum, then erasing that physical 
-        stripe from the real-space grid to prevent starburst convergence.
+        Extracts zones sequentially using Soft Residual Pursuit.
         """
-        print("  > Executing Sequential 1D-FFT Set Cover...")
+        print("  > Executing Continuous 1D-FFT Residual Pursuit...")
         zones, weights = [], []
         current_grid = jnp.array(grid)
         
-        mask_tol = np.sin(np.deg2rad(mask_tol_deg))
-
         for step in range(max_axes):
-            # 1. Transform the current grid state
             H = self.transform(current_grid)
             H_np = np.array(H)
             
-            # 2. Extract the undisputed global winner
             max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
-            max_val = H_np[max_idx]
+            max_val = float(H_np[max_idx])
 
-            # Terminate if we've exhausted the signal
+            # Terminate if the residual signal flattens out
             if max_val < 1e-3: 
                 break
 
@@ -215,16 +210,18 @@ class AzimuthalJAXHough:
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
             
-            Z_vec = np.array([z_x, z_y, z_z])
-            zones.append(Z_vec)
-            weights.append(float(max_val))
+            zones.append(np.array([z_x, z_y, z_z]))
+            weights.append(max_val)
 
-            # 3. REAL-SPACE MASKING: Erase the captured line from the physical grid!
-            # Calculate distance from every grid pixel to the newly discovered zone axis
+            # --- THE SPARSE RBF RESIDUAL STRATEGY ---
             dots = jnp.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
             
-            # Keep only the pixels that are OUTSIDE the tolerance band
-            mask = (dots > mask_tol).astype(jnp.float32)
+            # Soft multiplicative mask: suppresses the ridge but preserves intersections
+            # We use 2.0 * sigma to ensure the wide tails of the line are subtracted
+            mask_sigma = self.sigma * 2.0 
+            mask = 1.0 - jnp.exp(-(dots**2) / (2 * mask_sigma**2))
+            
             current_grid = current_grid * mask
 
         return np.array(zones), np.array(weights)
+

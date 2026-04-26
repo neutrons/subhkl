@@ -1458,23 +1458,31 @@ def run_sparse_hough(
     print("  > Loading raw continuous intensity via Peaks object...")
     peaks_obj = Peaks(original_nexus_filename, instrument_name)
     
-    # Instantiate the pure JAX solver
     N_theta, N_phi = 256, 512
     hough_indexer = AzimuthalJAXHough(N_theta=N_theta, N_phi=N_phi)
     global_grid = np.zeros((N_theta, N_phi), dtype=np.float32)
 
     R_all_images = peaks_obj.goniometer.rotation
-    stride = 4 # Downsample grid lookup for blazing speed
+    stride = 4 # Downsample for blazing speed
 
     for img_key, raw_image in peaks_obj.image.ims.items():
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = peaks_obj.get_run_id(img_key)
         
         intensity = raw_image[::stride, ::stride].flatten()
-        valid = intensity > 50.0  # Strip pure vacuum background
+        
+        # 1. Local background subtraction
+        bg_med = np.median(intensity)
+        sig_I = np.maximum(intensity - bg_med, 0.0)
+        
+        # 2. Dynamic Range Compression (Crucial for Topological integrals)
+        sig_I = np.sqrt(sig_I)
+        
+        valid = sig_I > 1.0  # Strip pure vacuum noise
         if not np.any(valid): continue
 
-        intensity = intensity[valid]
+        intensity_compressed = sig_I[valid]
+        
         row_grid, col_grid = np.indices((det.n, det.m))
         row_grid = row_grid[::stride, ::stride].flatten()[valid]
         col_grid = col_grid[::stride, ::stride].flatten()[valid]
@@ -1484,19 +1492,16 @@ def run_sparse_hough(
         kf = xyz / np.where(norms == 0, 1.0, norms)
         q_lab = kf - ub_helper.ki_vec
 
-        # Project into Sample Frame
         R_mat = R_all_images[run_id]
         q_sample = np.einsum('ij,nj->ni', R_mat.T, q_lab)
 
-        grid_chunk = hough_indexer.accumulate_to_grid(q_sample, intensity)
+        grid_chunk = hough_indexer.accumulate_to_grid(q_sample, intensity_compressed)
         global_grid += grid_chunk
         
     print(f"  > Processing continuous topological projection of {len(peaks_obj.image.ims)} panels...")
     empirical_zones, activation_weights = hough_indexer.find_active_zones(global_grid, max_axes=max_axes)
 
-    print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.")
-    for i, (zone, weight) in enumerate(zip(empirical_zones, activation_weights)):
-        print(f"    Zone {i+1}: [{zone[0]:.3f}, {zone[1]:.3f}, {zone[2]:.3f}] (Mass: {weight:.2f})")
+    print(f"  > Isolated {len(empirical_zones)} principal zone axes from background noise.") 
 
     # ==========================================
     # PHASE 3: DAVENPORT COMBINATORIAL SEARCH
