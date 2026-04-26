@@ -217,29 +217,32 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid, max_axes=15):
+    def find_active_zones(self, grid_raw, grid_bg, max_axes=15):
         print("  > Executing Physics-Informed V-Cycle (Scout + Auto-Tuned Sniper)...")
         
         from subhkl.search.sparse_hough import GlobalZoneAxisSniper
-        sniper = GlobalZoneAxisSniper(loss="gaussian", ref_sigma=self.sigma)
+        sniper = GlobalZoneAxisSniper(loss="poisson", ref_sigma=self.sigma)
         
-        grid_flat = jnp.array(grid).flatten()
-        bg_flat = sniper._compute_background(grid, filter_size=31).flatten()
+        # Combine 2D projected BG with 1D azimuthal smoothing to model all noise sources
+        azimuthal_bg = sniper._compute_background(grid_bg, filter_size=31)
+        
+        grid_flat_raw = jnp.array(grid_raw).flatten()
+        bg_flat = azimuthal_bg.flatten()
         grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
 
-        current_grid = jnp.array(grid)
+        # THE SCOUT'S TARGET: The pure, high-contrast signal
+        grid_signal = jnp.maximum(jnp.array(grid_raw) - azimuthal_bg, 0.0)
+        current_signal_grid = grid_signal
+        
         candidates = []
 
-        # ==========================================
-        # THE WIDTH SWEEPER
-        # ==========================================
         @jax.jit
         def test_candidate_widths(c_init_val, zx, zy, zz):
             def eval_sig(sig):
                 p = jnp.array([[c_init_val, zx, zy, zz, sig]])
                 A = sniper._build_basis_matrix(grid_coords, p)
-                # Engine applies Besov weight: (sig / ref_sigma)^gamma
-                c_sparse = sniper.tune_and_solve(grid_flat, bg_flat, A, p)
+                # THE SNIPER: Evaluates the raw photons against the modeled background
+                c_sparse = sniper.tune_and_solve(grid_flat_raw, bg_flat, A, p)
                 return c_sparse[0]
                 
             c_vals = jax.vmap(eval_sig)(self.candidate_sigmas)
@@ -247,7 +250,8 @@ class AzimuthalJAXHough:
             return c_vals[best_idx], self.candidate_sigmas[best_idx]
         
         for step in range(max_axes * 2):  
-            H = self.transform(current_grid)
+            # The FFT looks ONLY at the signal grid!
+            H = self.transform(current_signal_grid)
             H_np = np.array(H)
             
             max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
@@ -261,8 +265,6 @@ class AzimuthalJAXHough:
             z_z = np.cos(Theta)
             
             c_init = max_val / self.N_phi 
-            
-            # Use the JIT sweeper to find the optimal physical width!
             best_c, best_sig = test_candidate_widths(c_init, z_x, z_y, z_z)
             
             if float(best_c) <= 1e-3:
@@ -270,11 +272,11 @@ class AzimuthalJAXHough:
                 
             candidates.append([float(best_c), z_x, z_y, z_z, float(best_sig)])
             
-            # Use the optimized width to cleanly erase the line
+            # Mask out the signal grid to find the next independent line
             dots = jnp.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
             mask_sigma = best_sig * 2.0 
             mask = 1.0 - jnp.exp(-(dots**2) / (2 * mask_sigma**2))
-            current_grid = current_grid * mask
+            current_signal_grid = current_signal_grid * mask
 
         if not candidates:
             print("  > Scout hit the noise floor instantly. No candidates found.")
@@ -282,10 +284,11 @@ class AzimuthalJAXHough:
 
         print(f"  > Scout extracted {len(candidates)} valid lines. Resolving crosstalk...")
 
+        # The Joint Sniper acts on the Raw Grid
         params_guess = jnp.array(candidates)
         A_mat_joint = sniper._build_basis_matrix(grid_coords, params_guess)
         
-        c_sparse_joint = sniper.tune_and_solve(grid_flat, bg_flat, A_mat_joint, params_guess)
+        c_sparse_joint = sniper.tune_and_solve(grid_flat_raw, bg_flat, A_mat_joint, params_guess)
         
         survivors = c_sparse_joint > 1e-3
         final_zones = np.array(params_guess[survivors, 1:4])
@@ -293,4 +296,3 @@ class AzimuthalJAXHough:
         
         order = np.argsort(final_weights)[::-1]
         return final_zones[order][:max_axes], final_weights[order][:max_axes]
-
