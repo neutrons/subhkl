@@ -19,6 +19,9 @@ dependencies = [
 ]
 license = { text = "GPL3.0" }
 
+[tool.uv.sources]
+s2fft = { git = "https://github.com/astro-informatics/s2fft" }
+
 [build-system]
 requires = [
   "setuptools",
