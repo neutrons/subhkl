@@ -221,7 +221,7 @@ class AzimuthalJAXHough:
         print("  > Executing Physics-Informed V-Cycle (Scout + Auto-Tuned Sniper)...")
         
         from subhkl.search.sparse_hough import GlobalZoneAxisSniper
-        sniper = GlobalZoneAxisSniper(loss="gaussian", ref_sigma=self.sigma)
+        sniper = GlobalZoneAxisSniper(loss="huber", ref_sigma=self.sigma)
         
         # Combine 2D projected BG with 1D azimuthal smoothing to model all noise sources
         azimuthal_bg = sniper._compute_background(grid_bg, filter_size=31)

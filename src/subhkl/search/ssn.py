@@ -20,13 +20,30 @@ def solve_ssn_unified(
     def get_loss_grad_hess(c):
         u = A @ c + bg_flat
 
-        if loss_type == 1:
+        if loss_type == 1: # Poisson
             u_safe = jnp.maximum(u, 1e-6)
             nll = jnp.sum(u_safe - y * jnp.log(u_safe))
             grad = A.T @ (1.0 - y / u_safe)
             W_diag = 1.0 / jnp.maximum(u_safe, 1e-3)
             hess = A.T @ (W_diag[:, None] * A)
-        else:
+            
+        elif loss_type == 2: # Huber
+            # Threshold (delta) is 3 standard deviations of the background
+            delta = 3.0 * jnp.sqrt(bg_med)
+            e = u - y
+            abs_e = jnp.abs(e)
+            is_inlier = abs_e <= delta
+            
+            # Loss: 0.5 * e^2 for inliers, delta * |e| - 0.5 * delta^2 for outliers
+            nll = jnp.sum(jnp.where(is_inlier, 0.5 * e**2, delta * abs_e - 0.5 * delta**2))
+            
+            # IRLS Weights for gradient and Hessian
+            W_diag = jnp.where(is_inlier, 1.0, delta / jnp.maximum(abs_e, 1e-6))
+            
+            grad = A.T @ (W_diag * e)
+            hess = A.T @ (W_diag[:, None] * A)
+            
+        else: # Gaussian (MSE)
             nll = 0.5 * jnp.sum((u - y) ** 2)
             grad = A.T @ (u - y)
             hess = A.T @ A
@@ -144,7 +161,12 @@ class SparseBasisPursuit:
         self.gamma = gamma
         self.loss = loss
         self.ref_sigma = ref_sigma
-        self.loss_code = 1 if loss == "poisson" else 0
+        if loss == "poisson":
+            self.loss_code = 1
+        elif loss == "huber":
+            self.loss_code = 2
+        else:
+            self.loss_code = 0
         
         self.auto_tune_alpha = auto_tune_alpha
         if candidate_alphas is None:
@@ -193,6 +215,15 @@ class SparseBasisPursuit:
                 nll = jnp.sum(recon_total - jax.scipy.special.xlogy(data_flat, recon_total))
                 term = jax.scipy.special.xlogy(data_flat, data_flat / recon_total) - (data_flat - recon_total)
                 dev = 2 * jnp.sum(term)
+            elif self.loss_code == 2: # Huber
+                delta = 3.0 * jnp.sqrt(jnp.maximum(jnp.median(bg_flat), 1e-3))
+                e = recon_total - data_flat
+                abs_e = jnp.abs(e)
+                nll = jnp.sum(jnp.where(abs_e <= delta, 0.5 * e**2, delta * abs_e - 0.5 * delta**2))
+                
+                # Effective Deviance for Huber
+                W_diag = jnp.where(abs_e <= delta, 1.0, delta / jnp.maximum(abs_e, 1e-6))
+                dev = jnp.sum(W_diag * (e**2) / recon_total)
             else: # Gaussian
                 diff = recon_total - data_flat
                 nll = 0.5 * jnp.sum(diff**2)
