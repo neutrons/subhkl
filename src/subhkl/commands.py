@@ -1656,16 +1656,10 @@ def run_sparse_hough(
 
             lab_zones_for_plot = (R_run @ empirical_zones.T).T
             pred_lab_zones_for_plot = (R_run @ U_final @ r_theo_zones_norm.T).T
-            
-            # --- VIRTUAL HUBS (Crosses): Use the MASSIVE Dictionary so we see the true matches! ---
-            obs_lab_nodes_for_plot = (R_run @ e_nodes.T).T
-            
-            # THE FIX: Feed the full 1,154 theoretical Laue rays to the cross generator
-            pred_lab_nodes_for_plot = (R_run @ U_final @ r_unique_rays_norm.T).T
-            
+
             run_tasks.append((
                 out_name, run_peaks, data["images"], data["detectors"], instrument_name,
-                lab_zones_for_plot, pred_lab_zones_for_plot, obs_lab_nodes_for_plot, pred_lab_nodes_for_plot
+                lab_zones_for_plot, pred_lab_zones_for_plot,
             ))
 
         if max_workers := min(os.cpu_count() or 4, len(run_tasks)):
