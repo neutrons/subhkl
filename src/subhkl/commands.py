@@ -1385,7 +1385,7 @@ def run_sparse_hough(
     output_h5_filename: str,
     instrument_name: str | None = None,
     original_nexus_filename: str | None = None,
-    tolerance_deg: float = 0.15,
+    tolerance_deg: float = 3.0,
     angle_tol_hyp: float = 1.5,
     angle_tol_cons: float = 0.4,
     max_axes: int = 15,
@@ -1457,7 +1457,7 @@ def run_sparse_hough(
     peaks_obj = Peaks(original_nexus_filename, instrument_name)
     
     N_theta, N_phi = 256, 512
-    hough_indexer = AzimuthalJAXHough(N_theta=N_theta, N_phi=N_phi)
+    hough_indexer = AzimuthalJAXHough(N_theta=N_theta, N_phi=N_phi, sigma_deg=tolerance_deg)
     global_grid = np.zeros((N_theta, N_phi), dtype=np.float32)
 
     R_all_images = peaks_obj.goniometer.rotation

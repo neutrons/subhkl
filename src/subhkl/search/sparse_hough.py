@@ -130,8 +130,8 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
     def __init__(self, alpha=5.0, gamma=1.0, loss="gaussian", ref_sigma=0.75, 
                  auto_tune_alpha=True, candidate_alphas=None):
         
-        # THE FIX: Lower S/N sweep (3 to 15) and Gaussian Loss for "Sparse Necklaces"
-        default_alphas = candidate_alphas or [3.0, 5.0, 7.5, 10.0, 15.0]
+        # S/N sweep and Gaussian Loss for "Sparse Necklaces"
+        default_alphas = candidate_alphas or [10.0, 15.0,30.0,45.0,50.0,75.0]
         
         super().__init__(
             alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma, 
