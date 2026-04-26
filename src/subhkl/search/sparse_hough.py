@@ -293,6 +293,7 @@ class AzimuthalJAXHough:
         survivors = c_sparse_joint > 1e-3
         final_zones = np.array(params_guess[survivors, 1:4])
         final_weights = np.array(c_sparse_joint[survivors])
-        
+       
+        print(f"  > Joint Sniper Convergence | Alpha: {final_alpha:.1f} | BIC: {final_bic:.2e} | Dev/Nu: {final_dev:.3f}")
         order = np.argsort(final_weights)[::-1]
         return final_zones[order][:max_axes], final_weights[order][:max_axes]
