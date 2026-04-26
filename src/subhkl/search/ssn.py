@@ -4,7 +4,7 @@ Shared engine for Peak Integration and Sparse Hough Zone Axis Indexing.
 """
 import jax
 import jax.numpy as jnp
-from jax import lax, jit
+from jax import lax, jit, vmap
 from functools import partial
 
 @partial(jit, static_argnames=["max_iter", "loss_type", "force_target"])
