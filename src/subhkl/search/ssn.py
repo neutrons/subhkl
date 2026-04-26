@@ -132,3 +132,45 @@ def solve_ssn_unified(
     _, c_final, _ = debias_state
 
     return c_final.astype(jnp.float32)
+
+class SparseBasisPursuit:
+    """
+    The Unified SSN Engine.
+    Fits arbitrary geometric basis functions to noisy data using L1-regularized
+    Sparse Semi-Newton (SSN) optimization.
+    """
+    def __init__(self, alpha, gamma, loss="poisson", ref_sigma=1.0):
+        self.alpha = alpha
+        self.gamma = gamma
+        self.loss = loss
+        self.ref_sigma = ref_sigma
+        self.loss_code = 1 if loss == "poisson" else 0
+
+    def _compute_background(self, data, filter_size):
+        raise NotImplementedError("Child class must define morphology dimensionality.")
+
+    def _build_basis_matrix(self, x_grid, params):
+        raise NotImplementedError("Child class must define the geometric basis.")
+
+    @partial(jit, static_argnames=['self'])
+    def solve_ssn_step(self, data_flat, bg_flat, A_matrix, params_guess, alpha_override=None):
+        c_init = params_guess[:, 0]
+        sigmas = params_guess[:, -1]
+
+        # Besov Weighting: Penalize excessively wide features
+        weights = (sigmas / self.ref_sigma) ** self.gamma
+
+        alpha_val = alpha_override if alpha_override is not None else self.alpha
+        alpha_vec = alpha_val * weights
+
+        c_sparse = solve_ssn_unified(
+            A_matrix,
+            data_flat,
+            bg_flat,
+            alpha_vec,
+            self.loss_code,
+            c_init,
+            max_iter=20,
+            force_target=False
+        )
+        return c_sparse

@@ -3,6 +3,8 @@ import jax.numpy as jnp
 from jax import jit
 import numpy as np
 
+from subhkl.search.ssn import SparseBasisPursuit
+
 def get_data_driven_dictionary(q_lab_obs):
     """
     The Support Vector Dictionary.
@@ -121,6 +123,34 @@ class SparseHoughIndexer:
         order = np.argsort(final_scores)[::-1]
         return final_zones[order], final_scores[order]
 
+class GlobalZoneAxisSniper(SparseBasisPursuit):
+    """
+    Global Specialization: 1D Gaussian Great Circles in Spherical Angular Space.
+    """
+    def __init__(self, alpha=15.0, gamma=1.0, loss="gaussian", ref_sigma=0.75):
+        super().__init__(alpha=alpha, gamma=gamma, loss=loss, ref_sigma=ref_sigma)
+
+    def _compute_background(self, grid, filter_size=15):
+        """1D Azimuthal blur: TDS background is low-frequency along the Phi axis."""
+        import jax.scipy.signal
+        window = jnp.ones((1, filter_size)) / filter_size
+        bg = jax.scipy.signal.correlate2d(grid, window, mode='same')
+        return jnp.maximum(bg, 1e-3)
+
+    def _build_basis_matrix(self, grid_coords, params):
+        """Constructs the dense matrix of overlapping Great Circles."""
+        Q_x, Q_y, Q_z = grid_coords
+        z_x = params[:, 1]
+        z_y = params[:, 2]
+        z_z = params[:, 3]
+        sigmas = params[:, 4]
+
+        def eval_great_circle(zx, zy, zz, sig):
+            dots = jnp.abs(Q_x * zx + Q_y * zy + Q_z * zz)
+            return jnp.exp(-(dots**2) / (2 * sig**2))
+
+        return vmap(eval_great_circle)(z_x, z_y, z_z, sigmas).T
+
 class AzimuthalJAXHough:
     """
     Pure JAX 1D-FFT based Spherical Radon Transform.
@@ -183,45 +213,58 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid, max_axes=15):
-        """
-        Extracts zones sequentially using Soft Residual Pursuit.
-        """
-        print("  > Executing Continuous 1D-FFT Residual Pursuit...")
-        zones, weights = [], []
-        current_grid = jnp.array(grid)
+    def find_active_zones(self, grid, max_axes=15, num_candidates=50):
+        print("  > Executing Continuous 1D-FFT Scout Phase...")
+        H = self.transform(jnp.array(grid))
+        H_np = np.array(H)
         
-        for step in range(max_axes):
-            H = self.transform(current_grid)
-            H_np = np.array(H)
+        candidates = []
+        temp_H = H_np.copy()
+        
+        # 1. The Scout: Extract raw local maxima sequentially
+        for _ in range(num_candidates):
+            max_idx = np.unravel_index(np.argmax(temp_H), temp_H.shape)
+            max_val = temp_H[max_idx]
+            if max_val < 1e-3: break
             
-            max_idx = np.unravel_index(np.argmax(H_np), H_np.shape)
-            max_val = float(H_np[max_idx])
-
-            # Terminate if the residual signal flattens out
-            if max_val < 1e-3: 
-                break
-
             t_idx, p_idx = max_idx
             Theta = float(self.thetas[t_idx])
             Phi = float(self.phis[p_idx])
-
+            
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
             
-            zones.append(np.array([z_x, z_y, z_z]))
-            weights.append(max_val)
-
-            # --- THE SPARSE RBF RESIDUAL STRATEGY ---
-            dots = jnp.abs(self.Q_x * z_x + self.Q_y * z_y + self.Q_z * z_z)
+            candidates.append([max_val, z_x, z_y, z_z, self.sigma])
             
-            # Soft multiplicative mask: suppresses the ridge but preserves intersections
-            # We use 2.0 * sigma to ensure the wide tails of the line are subtracted
-            mask_sigma = self.sigma * 2.0 
-            mask = 1.0 - jnp.exp(-(dots**2) / (2 * mask_sigma**2))
-            
-            current_grid = current_grid * mask
+            # Wipe local neighborhood to find independent lines
+            t_min = max(0, t_idx - 5)
+            t_max = min(self.N_theta, t_idx + 6)
+            for t in range(t_min, t_max):
+                for p in range(p_idx - 5, p_idx + 6):
+                    temp_H[t, p % self.N_phi] = 0.0
 
-        return np.array(zones), np.array(weights)
+        if not candidates:
+            return np.empty((0,3)), np.empty(0)
+
+        # 2. The Sniper: Unified SSN Optimization
+        print(f"  > Scout found {len(candidates)} candidates. Engaging Global SSN Sniper...")
+        sniper = GlobalZoneAxisSniper(alpha=15.0, gamma=1.0, loss="gaussian", ref_sigma=self.sigma)
+        
+        grid_coords = (self.Q_x.flatten(), self.Q_y.flatten(), self.Q_z.flatten())
+        params_guess = jnp.array(candidates) # Format: [c, z_x, z_y, z_z, sigma]
+        
+        A_mat = sniper._build_basis_matrix(grid_coords, params_guess)
+        bg_flat = sniper._compute_background(grid, filter_size=31).flatten()
+        
+        # The SSN Engine simultaneously evaluates all candidates and zeros out crosstalk
+        c_sparse = sniper.solve_ssn_step(jnp.array(grid).flatten(), bg_flat, A_mat, params_guess)
+        
+        # 3. Extract the mathematically robust survivors
+        survivors = c_sparse > 1e-3
+        final_zones = np.array(params_guess[survivors, 1:4])
+        final_weights = np.array(c_sparse[survivors])
+        
+        order = np.argsort(final_weights)[::-1]
+        return final_zones[order][:max_axes], final_weights[order][:max_axes]
 

@@ -12,7 +12,7 @@ import jax.scipy.optimize
 import jax.scipy.signal
 import scipy
 
-from subhkl.search.ssn import solve_ssn_unified
+from subhkl.search.ssn import solve_ssn_unified, SparseBasisPursuit
 
 from dataclasses import dataclass
 
@@ -88,7 +88,7 @@ def compute_bg_batch(imgs, filter_size):
     return lax.map(process_one, imgs)  # [photons/Pixel]
 
 
-class SparseRBFPeakFinder:
+class SparseRBFPeakFinder(SparseBasisPursuit):
     """
     Hierarchical Sparse RBF Peak Finder with Symmetric V-Cycle Basis Pursuit.
 
@@ -114,6 +114,8 @@ class SparseRBFPeakFinder:
         auto_tune_alpha: bool = False,
         candidate_alphas: list = None,
     ):
+        super().__init__(alpha=alpha, gamma=gamma, loss=loss, ref_sigma=1.0)
+
         self.alpha = alpha  # [-]
         self.gamma = gamma  # [-]
         self.ref_sigma = 1.0  # [Pixel^0.5]
@@ -139,6 +141,23 @@ class SparseRBFPeakFinder:
         self.candidate_alphas = jnp.array(
             candidate_alphas or [10.0, 15.0, 20.0, 25.0, 30.0], dtype=jnp.float32
         )
+
+    def _compute_background(self, patch, filter_size):
+        # 2D Morphological Background
+        med = jax_median_2d(patch, filter_size)
+        blur = jax_gaussian_blur_2d(med)
+        return jnp.maximum(blur, 1e-3)
+
+    def _build_basis_matrix(self, x_grid, params):
+        # params: [c_init, r, col, sigma]
+        r = params[:, 1]
+        col = params[:, 2]
+        sigma = params[:, 3]
+
+        def eval_one(ri, ci, si):
+            return self._rbf_basis(x_grid, jnp.array([ri, ci]), si).flatten()
+
+        return vmap(eval_one)(r, col, sigma).T
 
     @staticmethod
     def _rbf_basis(
@@ -386,35 +405,19 @@ class SparseRBFPeakFinder:
             def run_opt(operand):
                 p, a_mask = operand
 
-                c_init = p[:, 0]  # [photons/Pixel^2]
-                r = p[:, 1]  # [Pixel^0.5]
-                col = p[:, 2]  # [Pixel^0.5]
-                sigma = p[:, 3]  # [Pixel^0.5]
-
-                def eval_one(ri, ci_col, si):
-                    return self._rbf_basis(
-                        x_grid, jnp.array([ri, ci_col]), si
-                    ).flatten()  # [Pixel]
-
-                A = vmap(eval_one)(r, col, sigma).T  # [Pixel]
-                A_masked = A * a_mask
-
-                weights = (sigma / self.ref_sigma) ** self.gamma  # [-]
-                alpha_vec_stat = alpha_z_score * weights  # [Pixel]
-
-                c_phys_masked = c_init * a_mask  # [photons/Pixel^2]
-
-                c_sparse_stat = solve_ssn_unified(
-                    A_masked,
-                    patch_stat.flatten(),
-                    patch_bg.flatten(),
-                    alpha_vec_stat,
-                    loss_code,
-                    c_phys_masked,
-                )  # [photons/Pixel^2]
-
-                c_sparse_norm = c_sparse_stat * a_mask  # [photons/Pixel^2]
-                return jnp.stack([c_sparse_norm, r, col, sigma], axis=1)
+                # --- THE REFACTOR: Engine handles the SSN projection and cleanup! ---
+                A_masked = self._build_basis_matrix(x_grid, p) * a_mask
+                
+                c_sparse_stat = self.solve_ssn_step(
+                    patch_stat.flatten(), 
+                    patch_bg.flatten(), 
+                    A_masked, 
+                    p, 
+                    alpha_override=alpha_z_score
+                )
+                
+                c_sparse_norm = c_sparse_stat * a_mask
+                return jnp.stack([c_sparse_norm, p[:, 1], p[:, 2], p[:, 3]], axis=1)
 
             def skip_opt(operand):
                 p, _ = operand
