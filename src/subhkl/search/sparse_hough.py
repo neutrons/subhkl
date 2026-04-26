@@ -193,10 +193,12 @@ class GlobalZoneAxisSniper(SparseBasisPursuit):
             # BIC Calculation
             n_pix = data_flat.size
             n_params = k_active * params_guess.shape[1]
-            bic = jnp.where(k_active == 0, 1e9, n_params * jnp.log(n_pix) + dev)
+           
+            dof = jnp.maximum(n_pix - n_params, 1)
+            dev_nu = dev / dof
             
-            return bic, c_sparse, dev
-            
+            return bic, c_sparse, dev_nu
+
         bics, all_c_sparse, devs = jax.vmap(evaluate_alpha)(jnp.array(self.candidate_alphas))
         best_idx = jnp.argmin(bics)
         
