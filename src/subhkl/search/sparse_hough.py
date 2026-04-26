@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from jax import jit
+from jax import jit, vmap
 import numpy as np
 
 from subhkl.search.ssn import SparseBasisPursuit
