@@ -1393,6 +1393,13 @@ def run_sparse_hough(
     max_hkl_cons: int = 6,
     steps: int = 300,
     create_visualizations: bool = False,
+    sparse_rbf_alpha: float = 0.1,
+    sparse_rbf_gamma: float = 2.0,
+    sparse_rbf_loss: str = "gaussian",
+    sparse_rbf_min_sigma: float = 1.0,
+    sparse_rbf_max_sigma: float = 5.0,
+    sparse_rbf_auto_tune_alpha: bool = True,
+    sparse_rbf_candidate_alphas: str = "0.05,0.1,0.15,0.2,0.3,0.5",
 ):
     from subhkl.optimization import FindUB
     from subhkl.config import beamlines
@@ -1493,8 +1500,23 @@ def run_sparse_hough(
         global_grid_raw += grid_chunk_raw
 
     print(f"  > Processing continuous topological projection of {len(peaks_obj.image.ims)} panels...")
-    
-    empirical_zones, activation_weights = hough_indexer.find_active_zones(global_grid_raw, max_axes=max_axes)
+
+    # Parse the candidate alphas for the Auto-Tuner
+    alpha_list = None
+    if sparse_rbf_candidate_alphas:
+        alpha_list = [float(k.strip()) for k in sparse_rbf_candidate_alphas.split(",")]
+
+    empirical_zones, activation_weights = hough_indexer.find_active_zones(
+        global_grid_raw, 
+        max_axes=max_axes,
+        alpha=sparse_rbf_alpha,
+        gamma=sparse_rbf_gamma,
+        loss=sparse_rbf_loss,
+        min_sigma=sparse_rbf_min_sigma,
+        max_sigma=sparse_rbf_max_sigma,
+        auto_tune_alpha=sparse_rbf_auto_tune_alpha,
+        candidate_alphas=alpha_list
+    )
 
     # ==========================================
     # PHASE 3: DAVENPORT COMBINATORIAL SEARCH (REAL-SPACE DUALITY)

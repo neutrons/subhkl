@@ -576,7 +576,7 @@ def merge_images(
         print(str(e))
         raise typer.Exit(code=1)
 
-@app.command(name="sparse-hough")
+@app.command("sparse-hough")
 def sparse_hough_cmd(
     finder_file: str = typer.Argument(
         ..., help="Path to the output peaks HDF5 file from the finder."
@@ -614,9 +614,31 @@ def sparse_hough_cmd(
     create_visualizations: bool = typer.Option(
         False, "--create-visualizations", help="Generate unrolled detector plots."
     ),
+    sparse_rbf_alpha: float = typer.Option(
+        0.1, help="Base alpha threshold for the Sparse RBF solver on the Hessian grid."
+    ),
+    sparse_rbf_gamma: float = typer.Option(
+        2.0, help="Besov space width penalty (gamma) for scale restriction."
+    ),
+    sparse_rbf_loss: str = typer.Option(
+        "gaussian", help="Loss function for the RBF solver (should be gaussian for Hessian hubs)."
+    ),
+    sparse_rbf_min_sigma: float = typer.Option(
+        1.0, help="Minimum spatial scale for 0D hub extraction."
+    ),
+    sparse_rbf_max_sigma: float = typer.Option(
+        5.0, help="Maximum spatial scale for 0D hub extraction."
+    ),
+    sparse_rbf_auto_tune_alpha: bool = typer.Option(
+        True, help="Enable auto-tuning for the alpha parameter."
+    ),
+    sparse_rbf_candidate_alphas: str = typer.Option(
+        "0.05,0.1,0.15,0.2,0.3,0.5", help="Comma-separated candidate alphas for tuning."
+    ),
 ):
     """
-    Algebraic Orientation Bootstrapper using L1-Regularized Sparse Basis Pursuit and Dual-Space Voronoi Polish.
+    Extracts the initial UB matrix using the Sparse Spherical Hough Transform and
+    Topological Hessian Filtering.
     """
     from subhkl.commands import run_sparse_hough
 
@@ -633,6 +655,13 @@ def sparse_hough_cmd(
         max_hkl_cons=max_hkl_cons,
         steps=steps,
         create_visualizations=create_visualizations,
+        sparse_rbf_alpha=sparse_rbf_alpha,
+        sparse_rbf_gamma=sparse_rbf_gamma,
+        sparse_rbf_loss=sparse_rbf_loss,
+        sparse_rbf_min_sigma=sparse_rbf_min_sigma,
+        sparse_rbf_max_sigma=sparse_rbf_max_sigma,
+        sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
+        sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
     )
 
 if __name__ == "__main__":

@@ -186,14 +186,17 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid_raw, max_axes=15):
+    def find_active_zones(self, grid_raw, max_axes=15, alpha=0.1, gamma=2.0, loss="gaussian", 
+                          min_sigma=1.0, max_sigma=5.0, auto_tune_alpha=True, candidate_alphas=None):
+        
         print("  > Projecting Raw Photons into Continuous Azimuthal Hough Space...")
         H_raw = self.transform(jnp.array(grid_raw))
         
         print("  > Applying JAX Hessian Topological Filter (Starburst Annihilation)...")
+        from subhkl.search.sparse_hough import apply_hessian_starburst_filter
         H_filtered = apply_hessian_starburst_filter(H_raw)
         
-        # We must normalize the filtered grid so the RBF alpha threshold is stable
+        # Normalize the Hessian space to [0.0, 1.0] so the fractional alpha sweep works perfectly!
         H_max = jnp.max(H_filtered)
         if H_max > 0:
             H_filtered = H_filtered / H_max
@@ -201,17 +204,18 @@ class AzimuthalJAXHough:
         print("  > Engaging 2D Sparse RBF Peak Finder on Hessian Hubs...")
         from subhkl.search.sparse_rbf import SparseRBFPeakFinder
         
-        # We can use pure Gaussian MSE loss now, because the Hessian filter 
-        # completely zeroed out the background and the Starburst arms!
+        # The solver is now fully dynamically controlled by the CLI!
         peak_finder = SparseRBFPeakFinder(
-            alpha=2.0,           # Threshold out the background noise
-            loss="gaussian",     # Clean MSE fit on the isolated 0D hubs
-            min_sigma=1.0, 
-            max_sigma=5.0, 
+            alpha=alpha,
+            gamma=gamma,
+            loss=loss,
+            min_sigma=min_sigma, 
+            max_sigma=max_sigma, 
+            auto_tune_alpha=auto_tune_alpha,
+            candidate_alphas=candidate_alphas,
             show_steps=False
         )
         
-        # Pass the topologically purified grid directly into the RBF solver
         peaks = peak_finder.find_peaks_batch(H_filtered[None, :, :])[0]
         
         if len(peaks) == 0:
@@ -227,8 +231,8 @@ class AzimuthalJAXHough:
         weights = []
         
         for p in top_peaks:
-            # Revert the normalized intensity back to a physical scale proxy
             intensity, r, c, sig = p
+            # Scale the solver's [0, 1] weight back to a physical scale proxy for Davenport
             physical_weight = float(intensity * H_max)
             
             Theta = float(r / (self.N_theta - 1) * np.pi)
