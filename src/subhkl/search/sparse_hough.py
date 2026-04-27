@@ -186,7 +186,7 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid_raw, max_axes=15, alpha=1000.0, gamma=2.0, loss="poisson", 
+    def find_active_zones(self, grid_raw, max_axes=15, alpha=0.1, gamma=2.0, loss="gaussian", 
                           min_sigma=1.0, max_sigma=5.0, auto_tune_alpha=True, candidate_alphas=None):
         
         print("  > Projecting Raw Photons into Continuous Azimuthal Hough Space...")
@@ -196,20 +196,24 @@ class AzimuthalJAXHough:
         from subhkl.search.sparse_hough import apply_hessian_starburst_filter
         H_filtered = apply_hessian_starburst_filter(H_raw)
         
-        # H_filtered now contains pure, physically-scaled photons.
+        # RESTORE NORMALIZATION: Scale the topological map to [0, 1]
+        H_max = jnp.max(H_filtered)
+        if H_max > 0:
+            H_filtered = H_filtered / H_max
             
         print("  > Engaging 2D Sparse RBF Peak Finder on Hessian Hubs...")
         from subhkl.search.sparse_rbf import SparseRBFPeakFinder
         
+        # Force Gaussian loss, as the data is now a smooth mathematical feature map
         peak_finder = SparseRBFPeakFinder(
             alpha=alpha,
             gamma=gamma,
-            loss=loss,
+            loss="gaussian", 
             min_sigma=min_sigma, 
             max_sigma=max_sigma, 
             auto_tune_alpha=auto_tune_alpha,
             candidate_alphas=candidate_alphas,
-            show_steps=True
+            show_steps=False
         )
         
         peaks = peak_finder.find_peaks_batch(H_filtered[None, :, :])[0]
@@ -229,8 +233,8 @@ class AzimuthalJAXHough:
         for p in top_peaks:
             intensity, r, c, sig = p
             
-            # The intensity is already on the correct physical scale!
-            physical_weight = float(intensity)
+            # The top_peaks intensity is [0, 1]. Multiply by H_max to restore topological rank.
+            physical_weight = float(intensity * H_max)
             
             Theta = float(r / (self.N_theta - 1) * np.pi)
             Phi = float(c / self.N_phi * 2 * np.pi)
@@ -246,24 +250,23 @@ class AzimuthalJAXHough:
 
 @jax.jit
 def apply_hessian_starburst_filter(H_grid):
-    from subhkl.search.sparse_rbf import jax_gaussian_blur_2d, jax_median_2d
+    from subhkl.search.sparse_rbf import jax_gaussian_blur_2d
     
-    # 1. Isolate the pure signal from the massive TDS background FIRST
-    bg = jax_median_2d(H_grid, window_size=31)
-    H_signal = jnp.maximum(H_grid - bg, 0.0)
+    # 1. Smooth heavily (sigma=3.0) to mathematically destroy 1-pixel pepper noise
+    H_smooth = jax_gaussian_blur_2d(H_grid, sigma=3.0)
     
-    # 2. Smooth strictly for calculating stable spatial derivatives
-    H_smooth = jax_gaussian_blur_2d(H_signal, sigma=2.0)
+    # 2. Compute spatial gradients
     dy, dx = jnp.gradient(H_smooth)
     dyy, dyx = jnp.gradient(dy)
     dxy, dxx = jnp.gradient(dx)
     
+    # 3. Hessian Determinant & Trace
     det = (dxx * dyy) - (dxy ** 2)
     trace = dxx + dyy
     
-    # 3. Topological condition: Must be a peak (Trace < 0, Det > 0)
-    # We add a strict threshold (H_signal > 1.0) so we don't evaluate 0.0 noise ripples!
-    valid_hubs = (trace < 0) & (det > 1e-6) & (H_signal > 1.0)
+    # 4. The Pure Topological Feature Map
+    # Trace < 0 ensures we are on a convex peak.
+    # jnp.sqrt restores the linear amplitude scaling of the original data!
+    topo_intensity = jnp.where((trace < 0) & (det > 0), jnp.sqrt(det), 0.0)
     
-    # 4. Return the background-subtracted pure signal
-    return jnp.where(valid_hubs, H_signal, 0.0)
+    return topo_intensity
