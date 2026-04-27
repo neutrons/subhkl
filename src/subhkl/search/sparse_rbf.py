@@ -409,7 +409,7 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
                 A_masked = self._build_basis_matrix(x_grid, p) * a_mask
                 
                 # The engine handles BIC Auto-Tuning internally!
-                c_sparse_stat = self.tune_and_solve(
+                c_sparse_stat, _, _, _ = self.tune_and_solve(
                     patch_stat.flatten(),
                     patch_bg.flatten(),
                     A_masked,
@@ -458,7 +458,7 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
             A_aug = self._build_basis_matrix(x_grid, augmented_dict)
             A_aug_masked = A_aug * aug_mask
 
-            c_sparse_stat_aug = self.tune_and_solve(
+            c_sparse_stat_aug, _, _, _ = self.tune_and_solve(
                 patch_stat.flatten(),
                 patch_bg.flatten(),
                 A_aug_masked,
