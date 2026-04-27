@@ -226,7 +226,9 @@ class AzimuthalJAXHough:
         
         order = np.argsort(peaks[:, 0])[::-1]
         top_peaks = peaks[order][:max_axes]
-        
+       
+        plot_hough_diagnostic(H_filtered, top_peaks, self.N_theta, self.N_phi)
+
         zones = []
         weights = []
         
@@ -257,7 +259,7 @@ def apply_hessian_starburst_filter(H_grid):
     pad_w = 15
     H_pad_phi = jnp.pad(H_grid, ((0, 0), (pad_w, pad_w)), mode='wrap')
     H_padded = jnp.pad(H_pad_phi, ((pad_w, pad_w), (0, 0)), mode='edge')
-    H_smooth = jax_gaussian_blur_2d(H_padded, sigma=3.0)
+    H_smooth = jax_gaussian_blur_2d(H_padded, sigma=0.5)
 
     # --- 1. Compute Raw Image Gradients ---
     dy_raw, dx_raw = jnp.gradient(H_smooth)
@@ -283,6 +285,52 @@ def apply_hessian_starburst_filter(H_grid):
     det = (dxx * dyy) - (dxy ** 2)
     trace = dxx + dyy
 
-    topo_intensity = jnp.where((trace < 0) & (det > 0), jnp.sqrt(det), 0.0)
+    topo_intensity = jnp.where((trace < 0) & (det > 0), H_smooth * jnp.sqrt(det), 0.0)
 
     return topo_intensity[pad_w:-pad_w, pad_w:-pad_w]
+
+def plot_hough_diagnostic(H_grid, top_peaks, N_theta, N_phi, out_name="hough_diagnostic.png"):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import LogNorm
+
+    fig, ax = plt.subplots(figsize=(16, 8))
+
+    # We plot the grid using the physical angle domains: Phi [0, 360], Theta [0, 180]
+    # Because row 0 is Theta=0, we invert the Y-axis extent so 0 is at the top.
+    im = ax.imshow(
+        np.array(H_grid),
+        cmap='viridis',
+        aspect='auto',
+        extent=[0, 360, 180, 0],
+        #norm=LogNorm(vmin=np.max(H_grid)*1e-3 + 1e-9, vmax=np.max(H_grid))
+    )
+    plt.colorbar(im, ax=ax, label="Hessian Topological Intensity")
+
+    if top_peaks is not None and len(top_peaks) > 0:
+        # top_peaks has shape (N, 4) -> [intensity, r_idx, c_idx, sigma]
+        r_indices = top_peaks[:, 1]
+        c_indices = top_peaks[:, 2]
+
+        # Convert sub-pixel array indices back to physical degrees for the plot
+        phi_deg = (c_indices / N_phi) * 360.0
+        theta_deg = (r_indices / (N_theta - 1)) * 180.0
+
+        ax.scatter(
+            phi_deg,
+            theta_deg,
+            facecolors='none',
+            edgecolors='red',
+            s=80,
+            linewidths=1.5,
+            label="Extracted RBF Peaks"
+        )
+        ax.legend(loc="upper right")
+
+    ax.set_xlabel("Azimuth (Phi) [degrees]")
+    ax.set_ylabel("Polar Angle (Theta) [degrees]")
+    ax.set_title(f"Spherical Hough Space ({N_theta}x{N_phi})")
+
+    plt.savefig(out_name, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  > Saved Hough diagnostic image to: {out_name}")
