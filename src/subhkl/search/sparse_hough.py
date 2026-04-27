@@ -186,31 +186,21 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid_raw, grid_geom, max_axes=15, alpha=0.1, gamma=2.0, loss="gaussian", 
+    def find_active_zones(self, grid_raw, max_axes=15, alpha=0.1, gamma=2.0, loss="gaussian", 
                           min_sigma=1.0, max_sigma=5.0, auto_tune_alpha=True, candidate_alphas=None):
         
         print("  > Projecting Raw Photons into Continuous Azimuthal Hough Space...")
         H_raw = self.transform(jnp.array(grid_raw))
         
-        print("  > Projecting Geometric Detector Mask to map spatial artifacts...")
-        H_geom = self.transform(jnp.array(grid_geom))
-        
-        print("  > Executing Hough Space Flat-Field Normalization...")
-        # Divide by the exposed arc length to get Mean Intensity per Pixel.
-        # The jnp.maximum(..., 1.0) mathematically prevents division by zero for 
-        # Great Circles that completely missed the active detector arrays.
-        H_norm = H_raw / jnp.maximum(H_geom, 1.0)
-        
         print("  > Applying JAX Hessian Topological Filter (Starburst Annihilation)...")
         from subhkl.search.sparse_hough import apply_hessian_starburst_filter
+        H_filtered = apply_hessian_starburst_filter(H_raw)
         
-        # The Hessian now evaluates the true, unadulterated mean scattering intensity!
-        H_filtered = apply_hessian_starburst_filter(H_norm)
-        
+        # RESTORE NORMALIZATION: Scale the topological map to [0, 1]
         H_max = jnp.max(H_filtered)
         if H_max > 0:
             H_filtered = H_filtered / H_max
-
+            
         print("  > Engaging 2D Sparse RBF Peak Finder on Hessian Hubs...")
         from subhkl.search.sparse_rbf import SparseRBFPeakFinder
         

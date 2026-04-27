@@ -1473,22 +1473,22 @@ def run_sparse_hough(
     stride = 1 
 
     global_grid_raw = np.zeros((N_theta, N_phi), dtype=np.float32)
-    global_grid_geom = np.zeros((N_theta, N_phi), dtype=np.float32) # NEW: The Exposure Map
 
     for img_key, raw_image in peaks_obj.image.ims.items():
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = peaks_obj.get_run_id(img_key)
         
+        # Flatten the raw intensity first so the boolean mask is strictly 1D
         intensity_raw = np.array(raw_image[::stride, ::stride]).flatten()
         valid = intensity_raw > 0.0
         if not np.any(valid): continue
 
+        # Now [valid] flawlessly masks the 1D flattened grids
         row_grid, col_grid = np.indices((det.n, det.m))
-        row_grid_clean = row_grid[::stride, ::stride].flatten()[valid]
-        col_grid_clean = col_grid[::stride, ::stride].flatten()[valid]
-        intensity_clean = intensity_raw[valid]
+        row_grid = row_grid[::stride, ::stride].flatten()[valid]
+        col_grid = col_grid[::stride, ::stride].flatten()[valid]
 
-        xyz = det.pixel_to_lab(row_grid_clean, col_grid_clean) - ub_helper.sample_offset
+        xyz = det.pixel_to_lab(row_grid, col_grid) - ub_helper.sample_offset
         norms = np.linalg.norm(xyz, axis=-1, keepdims=True)
         kf = xyz / np.where(norms == 0, 1.0, norms)
         q_lab = kf - ub_helper.ki_vec
@@ -1496,13 +1496,8 @@ def run_sparse_hough(
         R_mat = R_all_images[run_id]
         q_sample = np.einsum('ij,nj->ni', R_mat.T, q_lab)
 
-        # Accumulate the true intensity
-        grid_chunk_raw = hough_indexer.accumulate_to_grid(q_sample, intensity_clean)
+        grid_chunk_raw = hough_indexer.accumulate_to_grid(q_sample, intensity_raw[valid])
         global_grid_raw += grid_chunk_raw
-        
-        # NEW: Accumulate a 1.0 for every active pixel to build the physical topology map
-        grid_chunk_geom = hough_indexer.accumulate_to_grid(q_sample, np.ones_like(intensity_clean))
-        global_grid_geom += grid_chunk_geom
 
     print(f"  > Processing continuous topological projection of {len(peaks_obj.image.ims)} panels...")
 
@@ -1512,8 +1507,7 @@ def run_sparse_hough(
         alpha_list = [float(k.strip()) for k in sparse_rbf_candidate_alphas.split(",")]
 
     empirical_zones, activation_weights = hough_indexer.find_active_zones(
-        global_grid_raw,
-        global_grid_geom,
+        global_grid_raw, 
         max_axes=max_axes,
         alpha=sparse_rbf_alpha,
         gamma=sparse_rbf_gamma,
