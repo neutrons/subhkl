@@ -92,7 +92,7 @@ def align_virtual_nodes(
         angles = jnp.rad2deg(jnp.arccos(jnp.clip(max_dots, 0.0, 1.0)))
         
         inliers = angles < tol_deg
-        # SCORING FIX: Maximize the SUM OF THE WEIGHTS of the correctly mapped hubs
+        # Maximize the SUM OF THE WEIGHTS of the correctly mapped hubs
         scores = jnp.sum(inliers * e_weights_j, axis=1)
         residuals = jnp.sum(jnp.where(inliers, angles, 0.0), axis=1) / jnp.maximum(jnp.sum(inliers, axis=1), 1)
         return scores, residuals, jnp.sum(inliers, axis=1)
@@ -105,8 +105,8 @@ def align_virtual_nodes(
     
     e_nodes_j = jnp.array(e_nodes, dtype=jnp.float32)
     e_weights_j = jnp.array(e_weights, dtype=jnp.float32)
-    r_eval_j = jnp.array(r_eval_rays_norm, dtype=jnp.float32) 
-    
+    r_eval_j = jnp.array(r_eval_zones_norm, dtype=jnp.float32)
+
     search_tol = 1.5 
     
     for i in range(0, len(U_batch), chunk_size):
