@@ -1399,7 +1399,7 @@ def run_sparse_hough(
     sparse_rbf_min_sigma: float = 1.0,
     sparse_rbf_max_sigma: float = 5.0,
     sparse_rbf_auto_tune_alpha: bool = True,
-    sparse_rbf_candidate_alphas: str = "0.05,0.1,0.15,0.2,0.3,0.5",
+    sparse_rbf_candidate_alphas: str = "0.05, 0.1, 0.2",
 ):
     from subhkl.optimization import FindUB
     from subhkl.config import beamlines
