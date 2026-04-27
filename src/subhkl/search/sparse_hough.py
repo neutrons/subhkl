@@ -232,20 +232,21 @@ class AzimuthalJAXHough:
         
         for p in top_peaks:
             intensity, r, c, sig = p
-            
-            # The top_peaks intensity is [0, 1]. Multiply by H_max to restore topological rank.
             physical_weight = float(intensity * H_max)
-            
-            Theta = float(r / (self.N_theta - 1) * np.pi)
-            Phi = float(c / self.N_phi * 2 * np.pi)
-            
+
+            # Interpolate using the true physical axes of the Hough space!
+            Theta = float(np.interp(r, np.arange(self.N_theta), self.thetas))
+
+            # We handle Phi with wrapping in case the sub-pixel center pushed it slightly out of bounds
+            Phi = float(np.interp(c % self.N_phi, np.arange(self.N_phi), self.phis))
+
             z_x = np.sin(Theta) * np.cos(Phi)
             z_y = np.sin(Theta) * np.sin(Phi)
             z_z = np.cos(Theta)
-            
+
             zones.append([z_x, z_y, z_z])
             weights.append(physical_weight)
-            
+
         return np.array(zones), np.array(weights)
 
 @jax.jit
