@@ -235,7 +235,7 @@ class AzimuthalJAXHough:
             physical_weight = float(intensity * H_max)
 
             # Interpolate using the true physical axes of the Hough space!
-            Theta = float(np.interp(r, np.arange(self.N_theta), self.thetas))
+            Theta_hough = float(np.interp(r, np.arange(self.N_theta), self.thetas))
 
             # Convert from Detector Space (2θ) to Reciprocal Space (θ)
             Theta_true = Theta_hough / 2.0
