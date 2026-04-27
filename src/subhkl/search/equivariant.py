@@ -3,6 +3,10 @@ import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 
+# THE FIX: A gradient-safe norm for JAX Autodiff
+def safe_norm(x, axis=None, keepdims=False, eps=1e-8):
+    return jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=keepdims) + eps)
+
 class EGNNLayer(nn.Module):
     hidden_dim: int
 
@@ -24,8 +28,8 @@ class EGNNLayer(nn.Module):
         
         x_new = x + jax.ops.segment_sum(coord_update, receivers, x.shape[0])
 
-        norms = jnp.maximum(jnp.linalg.norm(x_new, axis=-1, keepdims=True), 1e-8)
-        x_new = x_new / norms
+        # Safely normalize the coordinates to the unit sphere
+        x_new = x_new / safe_norm(x_new, axis=-1, keepdims=True)
 
         m_i = jax.ops.segment_sum(m_ij, receivers, h.shape[0])
         h_input = jnp.concatenate([h, m_i], axis=-1)
@@ -38,7 +42,7 @@ class EGNNLayer(nn.Module):
 class EquivariantIndexer(nn.Module):
     hidden_dim: int = 64
     num_layers: int = 3
-    k_neighbors: int = 20  # NEW: Enforce local geometric message passing
+    k_neighbors: int = 20
 
     @nn.compact
     def __call__(self, q_vectors, intensities):
@@ -47,23 +51,17 @@ class EquivariantIndexer(nn.Module):
         h = nn.Dense(self.hidden_dim)(intensities[:, None])
         x = q_vectors
         
-        # ---------------------------------------------------------
-        # K-Nearest Neighbors Graph (Static Trace via NumPy)
-        # ---------------------------------------------------------
         x_np = np.array(q_vectors)
         k = min(self.k_neighbors, N - 1)
         
-        # Compute pairwise distance matrix
         diff = x_np[:, None, :] - x_np[None, :, :]
         dist = np.sum(diff**2, axis=-1)
         
-        # Extract top k nearest neighbors for each node
         idx = np.argsort(dist, axis=1)[:, 1:k+1] 
         senders = np.repeat(np.arange(N), k)
         receivers = idx.flatten()
         
         edge_indices = jnp.array(np.stack([senders, receivers]))
-        # ---------------------------------------------------------
 
         for _ in range(self.num_layers):
             x, h = EGNNLayer(self.hidden_dim)(x, h, edge_indices)
@@ -74,9 +72,10 @@ class EquivariantIndexer(nn.Module):
         v1 = jnp.sum(x * frame_weights[0], axis=0)
         v2 = jnp.sum(x * frame_weights[1], axis=0)
         
-        v1 = v1 / jnp.maximum(jnp.linalg.norm(v1), 1e-8)
+        # Safely execute Gram-Schmidt Orthogonalization
+        v1 = v1 / safe_norm(v1)
         v2 = v2 - jnp.dot(v1, v2) * v1
-        v2 = v2 / jnp.maximum(jnp.linalg.norm(v2), 1e-8)
+        v2 = v2 / safe_norm(v2)
         v3 = jnp.cross(v1, v2)
         
         U_pred = jnp.stack([v1, v2, v3], axis=1)
