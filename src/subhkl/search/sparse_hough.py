@@ -246,10 +246,14 @@ class AzimuthalJAXHough:
 
 @jax.jit
 def apply_hessian_starburst_filter(H_grid):
-    from subhkl.search.sparse_rbf import jax_gaussian_blur_2d
+    from subhkl.search.sparse_rbf import jax_gaussian_blur_2d, jax_median_2d
     
-    # Smooth strictly for calculating stable spatial derivatives
-    H_smooth = jax_gaussian_blur_2d(H_grid, sigma=2.0)
+    # 1. Isolate the pure signal from the massive TDS background FIRST
+    bg = jax_median_2d(H_grid, window_size=31)
+    H_signal = jnp.maximum(H_grid - bg, 0.0)
+    
+    # 2. Smooth strictly for calculating stable spatial derivatives
+    H_smooth = jax_gaussian_blur_2d(H_signal, sigma=2.0)
     dy, dx = jnp.gradient(H_smooth)
     dyy, dyx = jnp.gradient(dy)
     dxy, dxx = jnp.gradient(dx)
@@ -257,9 +261,9 @@ def apply_hessian_starburst_filter(H_grid):
     det = (dxx * dyy) - (dxy ** 2)
     trace = dxx + dyy
     
-    # 1. Topological condition: Must be a peak (Trace < 0, Det > 0)
-    valid_hubs = (trace < 0) & (det > 0.0)
+    # 3. Topological condition: Must be a peak (Trace < 0, Det > 0)
+    # We add a strict threshold (H_signal > 1.0) so we don't evaluate 0.0 noise ripples!
+    valid_hubs = (trace < 0) & (det > 1e-6) & (H_signal > 1.0)
     
-    # THE FIX: Return the UNALTERED RAW PHOTONS in the valid regions!
-    # This perfectly preserves the Poisson statistical scale.
-    return jnp.where(valid_hubs, H_grid, 0.0)
+    # 4. Return the background-subtracted pure signal
+    return jnp.where(valid_hubs, H_signal, 0.0)
