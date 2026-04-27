@@ -186,7 +186,7 @@ class AzimuthalJAXHough:
         _, hough_space = jax.lax.scan(self._hough_scan_step, carry, self.thetas)
         return hough_space
 
-    def find_active_zones(self, grid_raw, max_axes=15, alpha=0.1, gamma=2.0, loss="gaussian", 
+    def find_active_zones(self, grid_raw, max_axes=15, alpha=1000.0, gamma=2.0, loss="poisson", 
                           min_sigma=1.0, max_sigma=5.0, auto_tune_alpha=True, candidate_alphas=None):
         
         print("  > Projecting Raw Photons into Continuous Azimuthal Hough Space...")
@@ -196,15 +196,11 @@ class AzimuthalJAXHough:
         from subhkl.search.sparse_hough import apply_hessian_starburst_filter
         H_filtered = apply_hessian_starburst_filter(H_raw)
         
-        # Normalize the Hessian space to [0.0, 1.0] so the fractional alpha sweep works perfectly!
-        H_max = jnp.max(H_filtered)
-        if H_max > 0:
-            H_filtered = H_filtered / H_max
+        # H_filtered now contains pure, physically-scaled photons.
             
         print("  > Engaging 2D Sparse RBF Peak Finder on Hessian Hubs...")
         from subhkl.search.sparse_rbf import SparseRBFPeakFinder
         
-        # The solver is now fully dynamically controlled by the CLI!
         peak_finder = SparseRBFPeakFinder(
             alpha=alpha,
             gamma=gamma,
@@ -232,8 +228,9 @@ class AzimuthalJAXHough:
         
         for p in top_peaks:
             intensity, r, c, sig = p
-            # Scale the solver's [0, 1] weight back to a physical scale proxy for Davenport
-            physical_weight = float(intensity * H_max)
+            
+            # The intensity is already on the correct physical scale!
+            physical_weight = float(intensity)
             
             Theta = float(r / (self.N_theta - 1) * np.pi)
             Phi = float(c / self.N_phi * 2 * np.pi)
@@ -250,23 +247,19 @@ class AzimuthalJAXHough:
 @jax.jit
 def apply_hessian_starburst_filter(H_grid):
     from subhkl.search.sparse_rbf import jax_gaussian_blur_2d
-
-    # 1. Smooth the grid to make the sine waves differentiable
+    
+    # Smooth strictly for calculating stable spatial derivatives
     H_smooth = jax_gaussian_blur_2d(H_grid, sigma=2.0)
-
-    # 2. Compute second-order spatial gradients
     dy, dx = jnp.gradient(H_smooth)
     dyy, dyx = jnp.gradient(dy)
     dxy, dxx = jnp.gradient(dx)
-
-    # 3. The Topological Discriminators
+    
     det = (dxx * dyy) - (dxy ** 2)
     trace = dxx + dyy
-
-    # 4. Isolate the Hubs:
-    # A true intersection peak must curve downwards in all directions (Trace < 0)
-    # and must NOT be a 1D line (Determinant > 0).
-    valid_hubs = (trace < 0) & (det > 0)
-
-    # Multiply by the raw intensity to preserve the physical hierarchy of the peaks!
-    return jnp.where(valid_hubs, det * H_smooth, 0.0)
+    
+    # 1. Topological condition: Must be a peak (Trace < 0, Det > 0)
+    valid_hubs = (trace < 0) & (det > 0.0)
+    
+    # THE FIX: Return the UNALTERED RAW PHOTONS in the valid regions!
+    # This perfectly preserves the Poisson statistical scale.
+    return jnp.where(valid_hubs, H_grid, 0.0)

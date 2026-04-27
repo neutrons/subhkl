@@ -667,7 +667,7 @@ def run_finder(
     sparse_rbf_tile_cols: int = 2,
     sparse_rbf_loss: str = "gaussian",
     sparse_rbf_auto_tune_alpha: bool = False,
-    sparse_rbf_candidate_alphas: str = "3.0,5.0,10.0,15.0,20.0,25.0,30",
+    sparse_rbf_candidate_alphas = "500,1000,2500,5000,10000",
     max_workers: int = 16,
 ):
     print(f"Creating peaks from {filename} for instrument {instrument}")

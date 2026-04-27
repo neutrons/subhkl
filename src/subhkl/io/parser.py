@@ -633,7 +633,7 @@ def sparse_hough_cmd(
         True, help="Enable auto-tuning for the alpha parameter."
     ),
     sparse_rbf_candidate_alphas: str = typer.Option(
-        "0.05,0.1,0.15,0.2,0.3,0.5", help="Comma-separated candidate alphas for tuning."
+        "500,1000,2500,5000,10000", help="Comma-separated candidate alphas for tuning."
     ),
 ):
     """
