@@ -49,36 +49,39 @@ class EquivariantIndexer(nn.Module):
     def __call__(self, q_vectors, intensities):
         N = q_vectors.shape[0]
         
-        # Initialize node features (h) with intensities, mapped to hidden dim
+        # Initialize node features
         h = nn.Dense(self.hidden_dim)(intensities[:, None])
         x = q_vectors
         
-        # Build a fully connected graph for the zone axes
-        idx = jnp.arange(N)
-        senders, receivers = jnp.meshgrid(idx, idx)
-        edge_indices = jnp.stack([senders.flatten(), receivers.flatten()])
+        # ---------------------------------------------------------
+        # THE FIX: Use standard NumPy to build the static graph.
+        # This forces the shape to become concrete during JIT tracing.
+        # ---------------------------------------------------------
+        import numpy as np
+        idx = np.arange(N)
+        senders, receivers = np.meshgrid(idx, idx)
+        edge_indices_np = np.stack([senders.flatten(), receivers.flatten()])
         
-        # Remove self-loops
-        mask = edge_indices[0] != edge_indices[1]
-        edge_indices = edge_indices[:, mask]
+        # NumPy resolves the boolean mask instantly
+        mask = edge_indices_np[0] != edge_indices_np[1]
+        
+        # Wrap the concrete, static-shaped array back into JAX!
+        edge_indices = jnp.array(edge_indices_np[:, mask])
+        # ---------------------------------------------------------
 
         # Pass through EGNN layers
         for _ in range(self.num_layers):
             x, h = EGNNLayer(self.hidden_dim)(x, h, edge_indices)
 
         # --- THE SO(3) OUTPUT POOLING ---
-        # Pool the invariant features to get a global graph embedding
         h_global = jnp.mean(h, axis=0)
         
-        # Use the global embedding to weight the final 3D coordinates, 
-        # projecting the point cloud down to exactly 2 orthogonal L=1 vectors.
-        # (2 vectors perfectly define a 3D rotation frame).
         frame_weights = nn.Dense(2)(h_global) 
         
         v1 = jnp.sum(x * frame_weights[0], axis=0)
         v2 = jnp.sum(x * frame_weights[1], axis=0)
         
-        # Gram-Schmidt Orthogonalization to ensure a pure Rotation Matrix
+        # Gram-Schmidt Orthogonalization
         v1 = v1 / jnp.linalg.norm(v1)
         v2 = v2 - jnp.dot(v1, v2) * v1
         v2 = v2 / jnp.linalg.norm(v2)
