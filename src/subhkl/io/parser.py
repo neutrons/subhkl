@@ -621,7 +621,7 @@ def sparse_hough_cmd(
         2.0, help="Besov space width penalty (gamma) for scale restriction."
     ),
     sparse_rbf_loss: str = typer.Option(
-        "gaussian", help="Loss function for the RBF solver (should be gaussian for Hessian hubs)."
+        "poisson", help="Loss function for the RBF solver (should be gaussian for Hessian hubs)."
     ),
     sparse_rbf_min_sigma: float = typer.Option(
         1.0, help="Minimum spatial scale for 0D hub extraction."

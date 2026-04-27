@@ -665,7 +665,7 @@ def run_finder(
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,
-    sparse_rbf_loss: str = "gaussian",
+    sparse_rbf_loss: str = "poisson",
     sparse_rbf_auto_tune_alpha: bool = False,
     sparse_rbf_candidate_alphas = "500,1000,2500,5000,10000",
     max_workers: int = 16,
