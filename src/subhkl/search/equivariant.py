@@ -3,8 +3,8 @@ import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 
-# THE FIX: A gradient-safe norm for JAX Autodiff
-def safe_norm(x, axis=None, keepdims=False, eps=1e-8):
+# FIX 1: Bump eps to 1e-5 to survive float32 underflow
+def safe_norm(x, axis=None, keepdims=False, eps=1e-5):
     return jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=keepdims) + eps)
 
 class EGNNLayer(nn.Module):
@@ -27,8 +27,6 @@ class EGNNLayer(nn.Module):
         coord_update = x_diff * coord_weight
         
         x_new = x + jax.ops.segment_sum(coord_update, receivers, x.shape[0])
-
-        # Safely normalize the coordinates to the unit sphere
         x_new = x_new / safe_norm(x_new, axis=-1, keepdims=True)
 
         m_i = jax.ops.segment_sum(m_ij, receivers, h.shape[0])
@@ -66,11 +64,15 @@ class EquivariantIndexer(nn.Module):
         for _ in range(self.num_layers):
             x, h = EGNNLayer(self.hidden_dim)(x, h, edge_indices)
 
-        h_global = jnp.mean(h, axis=0)
-        frame_weights = nn.Dense(2)(h_global) 
+        # ---------------------------------------------------------
+        # FIX 2: Attention-Based Equivariant Pooling
+        # ---------------------------------------------------------
+        # Predict a distinct weight for every single node (shape: N, 2)
+        node_weights = nn.Dense(2)(h) 
         
-        v1 = jnp.sum(x * frame_weights[0], axis=0)
-        v2 = jnp.sum(x * frame_weights[1], axis=0)
+        # Sum the vectors using their INDIVIDUAL attention weights
+        v1 = jnp.sum(x * node_weights[:, 0:1], axis=0)
+        v2 = jnp.sum(x * node_weights[:, 1:2], axis=0)
         
         # Safely execute Gram-Schmidt Orthogonalization
         v1 = v1 / safe_norm(v1)
