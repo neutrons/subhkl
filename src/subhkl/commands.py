@@ -1535,25 +1535,23 @@ def run_sparse_hough(
     print(f"  > Generating Massive Evaluation Dictionary (max_uvw={max_hkl_cons})...")
     hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_uvw_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+    uvw_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    mask_uvw_c = ~((uvw_c[0] == 0) & (uvw_c[1] == 0) & (uvw_c[2] == 0))
+    theo_uvw_c = uvw_c[:, mask_uvw_c].astype(np.float32).T 
 
+    A_mat = np.linalg.inv(B_mat).T
     r_theo_zones = (A_mat @ theo_uvw_c.T).T
     r_unique_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
 
-    print(f"  > Bypassing nodal intersections. Aligning {len(e_nodes)} macroscopic Zone Axes directly.")
-
-    # 3. Pass A_mat instead of B_mat so Davenport generates Real-Space triads!
     U_davenport = align_virtual_nodes(
         e_nodes, 
         e_weights,              
-        r_unique_zones_norm,     
-        A_mat,
-        max_hkl_hyp=max_hkl_hyp,          
+        r_unique_zones_norm,    # Real Space evaluation hubs
+        A_mat,                  # Direct lattice matrix
+        max_hkl_hyp=max_hkl_hyp,
         angle_tol_hyp=angle_tol_hyp
     )
-    print("  > Macroscopic U-Matrix successfully extracted via Zone Axis Davenport.")
+    print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
 
     # ==========================================
     # PHASE 4: CONTINUOUS VORONOI POLISH

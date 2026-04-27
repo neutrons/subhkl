@@ -8,20 +8,21 @@ import optax
 def align_virtual_nodes(
     e_nodes, 
     e_weights,           
-    r_eval_rays_norm,    
-    B_mat, 
-    max_hkl_hyp=2,       # <--- 2 keeps pair generation lightning fast
+    r_eval_zones_norm,   # <--- Pass Real Space zones here
+    A_mat,               # <--- Use the direct lattice matrix
+    max_hkl_hyp=2,       
     angle_tol_hyp=2.5
 ):
-    print(f"  > Generating Theoretical Hubs for Hypotheses (max_hkl={max_hkl_hyp})...")
+    print(f"  > Generating Theoretical Hubs for Hypotheses (max_uvw={max_hkl_hyp})...")
     h_vals = np.arange(-max_hkl_hyp, max_hkl_hyp + 1)
     h, k, l = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
-    hkl = np.stack([h.flatten(), k.flatten(), l.flatten()], axis=0)
-    mask_hkl = ~((hkl[0] == 0) & (hkl[1] == 0) & (hkl[2] == 0))
-    theo_hkl = hkl[:, mask_hkl].astype(np.float32).T 
-    r_nodes_hyp = (B_mat @ theo_hkl.T).T
-    r_nodes_hyp /= np.linalg.norm(r_nodes_hyp, axis=1, keepdims=True)
+    uvw = np.stack([h.flatten(), k.flatten(), l.flatten()], axis=0)
+    mask_uvw = ~((uvw[0] == 0) & (uvw[1] == 0) & (uvw[2] == 0))
+    theo_uvw = uvw[:, mask_uvw].astype(np.float32).T 
     
+    r_nodes_hyp = (A_mat @ theo_uvw.T).T
+    r_nodes_hyp /= np.linalg.norm(r_nodes_hyp, axis=1, keepdims=True)    
+
     print(f"  > Executing Weight-Prioritized Symmetric Triad Generation...")
     
     emp_dots = np.clip(np.abs(e_nodes @ e_nodes.T), 0.0, 1.0)
