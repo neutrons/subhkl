@@ -47,7 +47,7 @@ def jax_median_2d(img, window_size):
     return jnp.median(patches[0], axis=0)  # [photons/Pixel]
 
 
-@jit
+@partial(jit, static_argnames=['sigma'])
 def jax_gaussian_blur_2d(img, sigma=3.0):
     """
     Args:
