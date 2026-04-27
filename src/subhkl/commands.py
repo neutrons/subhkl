@@ -1639,7 +1639,7 @@ def run_sparse_hough(
         import concurrent.futures
         from tqdm import tqdm
         from collections import defaultdict
-        from subhkl.integration.api import Peaks, RunPeaks
+        from subhkl.integration.api import Peaks
 
         print("\n[5/5] Rendering Detector Plots (Parallel)...")
         peaks_obj = Peaks(original_nexus_filename, instrument_name)
