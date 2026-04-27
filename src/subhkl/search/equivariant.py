@@ -19,15 +19,11 @@ class EGNNLayer(nn.Module):
         m_ij = nn.Dense(self.hidden_dim)(m_ij)
 
         coord_weight = nn.Dense(1, use_bias=False)(m_ij)
-        
-        # FIX 1: Bound the spatial update magnitude to prevent violent explosions
         coord_weight = jnp.tanh(coord_weight) * 0.1
         coord_update = x_diff * coord_weight
         
         x_new = x + jax.ops.segment_sum(coord_update, receivers, x.shape[0])
 
-        # FIX 2: Project coordinates back to the unit sphere (Directions only!)
-        # The jnp.maximum prevents division by zero if a vector collapses.
         norms = jnp.maximum(jnp.linalg.norm(x_new, axis=-1, keepdims=True), 1e-8)
         x_new = x_new / norms
 
@@ -42,6 +38,7 @@ class EGNNLayer(nn.Module):
 class EquivariantIndexer(nn.Module):
     hidden_dim: int = 64
     num_layers: int = 3
+    k_neighbors: int = 20  # NEW: Enforce local geometric message passing
 
     @nn.compact
     def __call__(self, q_vectors, intensities):
@@ -50,13 +47,23 @@ class EquivariantIndexer(nn.Module):
         h = nn.Dense(self.hidden_dim)(intensities[:, None])
         x = q_vectors
         
-        # Use standard NumPy to bypass the JIT dynamic shape error
-        idx = np.arange(N)
-        senders, receivers = np.meshgrid(idx, idx)
-        edge_indices_np = np.stack([senders.flatten(), receivers.flatten()])
+        # ---------------------------------------------------------
+        # K-Nearest Neighbors Graph (Static Trace via NumPy)
+        # ---------------------------------------------------------
+        x_np = np.array(q_vectors)
+        k = min(self.k_neighbors, N - 1)
         
-        mask = edge_indices_np[0] != edge_indices_np[1]
-        edge_indices = jnp.array(edge_indices_np[:, mask])
+        # Compute pairwise distance matrix
+        diff = x_np[:, None, :] - x_np[None, :, :]
+        dist = np.sum(diff**2, axis=-1)
+        
+        # Extract top k nearest neighbors for each node
+        idx = np.argsort(dist, axis=1)[:, 1:k+1] 
+        senders = np.repeat(np.arange(N), k)
+        receivers = idx.flatten()
+        
+        edge_indices = jnp.array(np.stack([senders, receivers]))
+        # ---------------------------------------------------------
 
         for _ in range(self.num_layers):
             x, h = EGNNLayer(self.hidden_dim)(x, h, edge_indices)
@@ -67,7 +74,6 @@ class EquivariantIndexer(nn.Module):
         v1 = jnp.sum(x * frame_weights[0], axis=0)
         v2 = jnp.sum(x * frame_weights[1], axis=0)
         
-        # FIX 3: Safe Gram-Schmidt Orthogonalization
         v1 = v1 / jnp.maximum(jnp.linalg.norm(v1), 1e-8)
         v2 = v2 - jnp.dot(v1, v2) * v1
         v2 = v2 / jnp.maximum(jnp.linalg.norm(v2), 1e-8)

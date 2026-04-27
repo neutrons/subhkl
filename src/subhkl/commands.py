@@ -1379,6 +1379,7 @@ class RunPeaks:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
+
 def run_sparse_hough(
     finder_file: str,
     output_h5_filename: str,
@@ -1392,13 +1393,10 @@ def run_sparse_hough(
     max_hkl_cons: int = 6,
     steps: int = 300,
     create_visualizations: bool = False,
-    sparse_rbf_alpha: float = 0.1,
-    sparse_rbf_gamma: float = 2.0,
-    sparse_rbf_loss: str = "gaussian",
-    sparse_rbf_min_sigma: float = 1.0,
-    sparse_rbf_max_sigma: float = 5.0,
-    sparse_rbf_auto_tune_alpha: bool = True,
-    sparse_rbf_candidate_alphas: str = "0.05, 0.1, 0.2",
+    # Kept for signature compatibility, though unused internally now
+    sparse_rbf_alpha: float = 0.1, sparse_rbf_gamma: float = 2.0, sparse_rbf_loss: str = "gaussian",
+    sparse_rbf_min_sigma: float = 1.0, sparse_rbf_max_sigma: float = 5.0,
+    sparse_rbf_auto_tune_alpha: bool = True, sparse_rbf_candidate_alphas: str = "0.05, 0.1, 0.2",
 ):
     from subhkl.optimization import FindUB
     from subhkl.config import beamlines
@@ -1425,6 +1423,9 @@ def run_sparse_hough(
         img_indices = f["peaks/image_index"][()]
         run_indices = f["peaks/run_index"][()] if "peaks/run_index" in f else img_indices
 
+        # Grab integrated intensities if they exist, otherwise default to 1.0
+        peak_intensities = f["peaks/intensity"][()] if "peaks/intensity" in f else np.ones(len(pixel_r))
+
         if "goniometer/R" in f:
             R_all = f["goniometer/R"][()]
             r_gonio_obs = R_all[img_indices.astype(int)]
@@ -1439,7 +1440,7 @@ def run_sparse_hough(
 
     B_mat = ub_helper.reciprocal_lattice_B()
 
-    print("  > Reconstructing sparse geometry for downstream polishing...")
+    print("  > Reconstructing sparse geometry for downstream indexing...")
     xyz_out = np.zeros((len(pixel_r), 3))
     for phys_bank in np.unique(bank_array):
         mask = bank_array == phys_bank
@@ -1452,68 +1453,55 @@ def run_sparse_hough(
     kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
     q_lab_obs = kf - ub_helper.ki_vec[None, :]
     q_sample_obs = np.einsum('nij,ni->nj', r_gonio_obs, q_lab_obs)
+
+    # The pure geometric vectors
     q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
 
-    # ==========================================
-    # PHASE 2: SPARSE AZIMUTHAL HOUGH (THE CURE)
-    # ==========================================
-    print("\n[2/4] Sparse Basis Pursuit (Discrete Peak-Driven Set Cover)")
-    from subhkl.search.sparse_hough import AzimuthalJAXHough
-    
-    N_theta, N_phi = 512, 1024
-    hough_indexer = AzimuthalJAXHough(N_theta=N_theta, N_phi=N_phi, sigma_deg=tolerance_deg)
-    
-    print(f"  > Projecting {len(q_sample_obs_norm)} isolated Bragg peaks into the Spherical Grid...")
-    
-    global_grid_raw = hough_indexer.accumulate_to_grid(q_sample_obs_norm, np.ones(len(q_sample_obs_norm)))
-    
-    alpha_list = None
-    if sparse_rbf_candidate_alphas:
-        alpha_list = [float(k.strip()) for k in sparse_rbf_candidate_alphas.split(",")]
+    # Principled Normalization (Log Dampening)
+    log_weights = np.log1p(peak_intensities)
+    w_min, w_max = np.min(log_weights), np.max(log_weights)
+    if w_max > w_min:
+        normalized_weights = (log_weights - w_min) / (w_max - w_min) * 0.9 + 0.1
+    else:
+        normalized_weights = np.ones_like(log_weights)
 
-    empirical_zones, activation_weights = hough_indexer.find_active_zones(
-        global_grid_raw, 
-        max_axes=max_axes,
-        alpha=sparse_rbf_alpha,
-        gamma=sparse_rbf_gamma,
-        loss=sparse_rbf_loss,
-        min_sigma=sparse_rbf_min_sigma,
-        max_sigma=sparse_rbf_max_sigma,
-        auto_tune_alpha=sparse_rbf_auto_tune_alpha,
-        candidate_alphas=alpha_list
-    )
+    # ==========================================
+    # PHASE 2: DIRECT DICTIONARY GENERATION
+    # ==========================================
+    print("\n[2/4] Generating Theoretical Reciprocal Dictionary")
+    import jax
+    import jax.numpy as jnp
+
+    # We now evaluate against theoretical HKL (Reciprocal Space) instead of UVW
+    print(f"  > Expanding HKL permutations (max_hkl={max_hkl_cons})...")
+    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
+    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T
+
+    # q = B * h
+    r_theo_rays = (B_mat @ theo_hkl_c.T).T
+    r_unique_rays_norm = jnp.array(r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True))
+    print(f"  > Generated {len(r_unique_rays_norm)} theoretical Bragg vectors for alignment.")
 
     # ==========================================
     # PHASE 3: EQUIVARIANT MACHINE LEARNING SEARCH
     # ==========================================
-    print("\n[3/4] SE(3) Equivariant Neural Network (Self-Supervised Alignment)")
-    import jax
-    import jax.numpy as jnp
+    print("\n[3/4] SE(3) Equivariant Neural Network (Direct Point Cloud Alignment)")
     import optax
     from subhkl.search.equivariant import EquivariantIndexer
 
-    e_nodes = jnp.array(empirical_zones)
-    e_weights = jnp.array(activation_weights)
+    e_nodes = jnp.array(q_sample_obs_norm)
+    e_weights = jnp.array(normalized_weights)
 
-    A_mat = np.linalg.inv(B_mat).T
-
-    print(f"  > Generating Theoretical Evaluation Dictionary (max_uvw={max_hkl_cons})...")
-    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
-    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-    uvw_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    mask_uvw_c = ~((uvw_c[0] == 0) & (uvw_c[1] == 0) & (uvw_c[2] == 0))
-    theo_uvw_c = uvw_c[:, mask_uvw_c].astype(np.float32).T 
-
-    r_theo_zones = (A_mat @ theo_uvw_c.T).T
-    r_unique_zones_norm = jnp.array(r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True))
-
-    print("  > Initializing EGNN architecture and Adam optimizer...")
-    model = EquivariantIndexer(hidden_dim=64, num_layers=3)
+    print("  > Initializing EGNN architecture (k-NN) and Adam optimizer...")
+    model = EquivariantIndexer(hidden_dim=64, num_layers=3, k_neighbors=20)
     rng = jax.random.PRNGKey(42)
     params = model.init(rng, e_nodes, e_weights)
-    
-    egnn_steps = 200
-    schedule = optax.cosine_decay_schedule(init_value=0.005, decay_steps=egnn_steps)
+
+    egnn_steps = 300
+    schedule = optax.cosine_decay_schedule(init_value=0.01, decay_steps=egnn_steps)
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adam(learning_rate=schedule)
@@ -1523,10 +1511,17 @@ def run_sparse_hough(
     @jax.jit
     def loss_fn(params):
         U_pred = model.apply(params, e_nodes, e_weights)
-        r_lab_pred = jnp.dot(r_unique_zones_norm, U_pred.T)
-        dots = jnp.dot(e_nodes, r_lab_pred.T)
+
+        # Rotate the theoretical Bragg dictionary into the predicted Lab frame
+        q_lab_pred = jnp.dot(r_unique_rays_norm, U_pred.T)
+
+        # Evaluate dot products between empirical peaks and predicted peaks
+        dots = jnp.dot(e_nodes, q_lab_pred.T)
+
+        # Find closest match. Absolute value accounts for Friedel Symmetry (+q = -q)
         best_matches = jnp.max(jnp.abs(dots), axis=1)
-        # Minimize negative sum = Maximize alignment
+
+        # Maximize geometric overlap (Loss becomes highly negative)
         loss = -jnp.sum(best_matches * e_weights) / jnp.sum(e_weights)
         return loss, U_pred
 
@@ -1537,16 +1532,16 @@ def run_sparse_hough(
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss, U_pred
 
-    print("  > Training EGNN to extract global U-matrix consensus...")
+    print(f"  > Training EGNN across {len(e_nodes)} Bragg peaks...")
     best_loss = 0.0
     best_U = np.eye(3)
-    
+
     for i in range(egnn_steps):
         params, opt_state, loss_val, U_pred = train_step(params, opt_state)
         if loss_val < best_loss:
             best_loss = loss_val
             best_U = np.array(U_pred)
-            
+
         if (i + 1) % 50 == 0:
             print(f"    Step {i+1:03d}/{egnn_steps} | Alignment Loss: {loss_val:.4f}")
 
@@ -1559,46 +1554,46 @@ def run_sparse_hough(
     print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
     from scipy.spatial.transform import Rotation
     from subhkl.search.davenport import optimize_orientation_gradient_descent
-    
-    q_seed = Rotation.from_matrix(U_davenport).as_quat() 
+
+    q_seed = Rotation.from_matrix(U_davenport).as_quat()
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
-    
+
     hkl_polish =  8
     print(f"  > Generating Dense Polishing Dictionary (max_hkl={hkl_polish})...")
     hc_vals = np.arange(-hkl_polish, hkl_polish + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
-    
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T
+
     r_theo_rays_polish = (B_mat @ theo_hkl_c.T).T
     r_rays_norm_polish = r_theo_rays_polish / np.linalg.norm(r_theo_rays_polish, axis=1, keepdims=True)
     _, unique_idx = np.unique(np.round(r_rays_norm_polish, 4), axis=0, return_index=True)
     r_polish_rays_norm = r_rays_norm_polish[unique_idx]
-    
+
     r_lab_dav = U_davenport @ r_polish_rays_norm.T
     dots_dav = q_sample_obs_norm @ r_lab_dav
     max_dots_dav = np.max(np.clip(dots_dav, -1.0, 1.0), axis=1)
     angles_dav = np.rad2deg(np.arccos(max_dots_dav))
-    
-    inlier_mask = angles_dav < 2.0 
+
+    inlier_mask = angles_dav < 2.0
     q_obs_clean = q_sample_obs_norm[inlier_mask]
-    
+
     print(f"  > EGNN captured {len(q_obs_clean)} raw peaks in its gravity well. Polishing...")
-    
+
     U_final = optimize_orientation_gradient_descent(
-        q_seed_jax, 
-        jnp.array(q_obs_clean), 
-        jnp.array(r_polish_rays_norm), 
+        q_seed_jax,
+        jnp.array(q_obs_clean),
+        jnp.array(r_polish_rays_norm),
         steps=steps
     )
-    
+
     r_lab = U_final @ r_polish_rays_norm.T
     dots = q_sample_obs_norm @ r_lab
     max_dots = np.max(np.clip(dots, -1.0, 1.0), axis=1)
     angles = np.rad2deg(np.arccos(max_dots))
     true_hits = np.sum(angles < 0.4)
-    
+
     print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs_norm)} Laue rays (Tol = 0.4 deg).")
 
     print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
@@ -1611,7 +1606,7 @@ def run_sparse_hough(
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
         f.create_dataset("peaks/xyz", data=xyz_out)
-        f.create_dataset("sample/U", data=U_final) 
+        f.create_dataset("sample/U", data=U_final)
         f.create_dataset("sample/B", data=B_mat)
 
     print("Export complete.")
@@ -1625,8 +1620,7 @@ def run_sparse_hough(
         import concurrent.futures
         from tqdm import tqdm
         from collections import defaultdict
-        
-        # Ensure these are imported exactly as they exist in your codebase
+
         from subhkl.integration.api import Peaks
 
         print("\n[5/5] Rendering Detector Plots (Parallel)...")
@@ -1645,6 +1639,18 @@ def run_sparse_hough(
         run_tasks = []
         base_dir = os.path.dirname(output_h5_filename) or "."
 
+        # We no longer extract Empirical Zones, so we generate the Theoretical Predicted Zones for the plot
+        viz_hkl = 2
+        A_mat = np.linalg.inv(B_mat).T
+        hc_vals = np.arange(-viz_hkl, viz_hkl + 1)
+        hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+        hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+        mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+        theo_indices = hkl_c[:, mask_hkl_c].astype(np.float32).T
+
+        r_theo_zones = (A_mat @ theo_indices.T).T
+        r_theo_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
+
         for r_id, data in runs_plot_data.items():
             mask = [i for i, run in enumerate(run_indices) if run == r_id]
             if len(mask) == 0: continue
@@ -1652,7 +1658,7 @@ def run_sparse_hough(
             try: image_label = peaks_obj.get_image_label(img_indices[mask[0]])
             except Exception: image_label = f"run_{int(r_id)}"
 
-            out_name = os.path.join(base_dir, f"{image_label}-sparse_hough.png")
+            out_name = os.path.join(base_dir, f"{image_label}-direct_egnn.png")
             run_peaks = RunPeaks(
                 image_index=[img_indices[i] for i in mask],
                 peak_rows=[pixel_r[i] for i in mask], peak_cols=[pixel_c[i] for i in mask],
@@ -1662,20 +1668,11 @@ def run_sparse_hough(
 
             R_run = r_gonio_obs[mask[0]]
 
-            # --- ZONE AXES (Dashed Lines): Keep viz_hkl low to prevent CPU melting! ---
-            viz_hkl = 2
-            A_mat = np.linalg.inv(B_mat).T
-            hc_vals = np.arange(-viz_hkl, viz_hkl + 1)
-            hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-            hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-            mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-            theo_indices = hkl_c[:, mask_hkl_c].astype(np.float32).T 
-            
-            r_theo_zones = (A_mat @ theo_indices.T).T
-            r_theo_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
-
-            lab_zones_for_plot = (R_run @ empirical_zones.T).T
+            # Draw the purely predicted zones to visually confirm the U-matrix fit
             pred_lab_zones_for_plot = (R_run @ U_final @ r_theo_zones_norm.T).T
+
+            # Pass an empty array for the "empirical lines" since we don't extract lines anymore
+            lab_zones_for_plot = np.empty((0, 3))
 
             run_tasks.append((
                 out_name, run_peaks, data["images"], data["detectors"], instrument_name,
