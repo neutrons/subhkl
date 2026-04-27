@@ -1379,7 +1379,6 @@ class RunPeaks:
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
             setattr(self, k, v)
-
 def run_sparse_hough(
     finder_file: str,
     output_h5_filename: str,
@@ -1513,26 +1512,21 @@ def run_sparse_hough(
     rng = jax.random.PRNGKey(42)
     params = model.init(rng, e_nodes, e_weights)
     
-    # Cosine scheduling helps the network settle into the exact U-matrix minimum
-    schedule = optax.cosine_decay_schedule(init_value=0.05, decay_steps=200)
-    optimizer = optax.adam(learning_rate=schedule)
+    egnn_steps = 200
+    schedule = optax.cosine_decay_schedule(init_value=0.005, decay_steps=egnn_steps)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=schedule)
+    )
     opt_state = optimizer.init(params)
 
     @jax.jit
     def loss_fn(params):
         U_pred = model.apply(params, e_nodes, e_weights)
-        
-        # Rotate the theoretical dictionary into the predicted Lab frame
         r_lab_pred = jnp.dot(r_unique_zones_norm, U_pred.T)
-        
-        # Compute cosine similarity between Empirical (N, 3) and Predicted (M, 3)
         dots = jnp.dot(e_nodes, r_lab_pred.T)
-        
-        # Find the absolute best matching theoretical zone for each empirical zone
         best_matches = jnp.max(jnp.abs(dots), axis=1)
-        
-        # We want to maximize alignment (dot products approaching 1.0)
-        # We compute the weighted negative sum to act as our minimization objective
+        # Minimize negative sum = Maximize alignment
         loss = -jnp.sum(best_matches * e_weights) / jnp.sum(e_weights)
         return loss, U_pred
 
@@ -1544,14 +1538,11 @@ def run_sparse_hough(
         return params, opt_state, loss, U_pred
 
     print("  > Training EGNN to extract global U-matrix consensus...")
-    egnn_steps = 200
     best_loss = 0.0
     best_U = np.eye(3)
     
     for i in range(egnn_steps):
         params, opt_state, loss_val, U_pred = train_step(params, opt_state)
-        
-        # Keep track of the mathematically tightest orientation
         if loss_val < best_loss:
             best_loss = loss_val
             best_U = np.array(U_pred)
@@ -1572,7 +1563,6 @@ def run_sparse_hough(
     q_seed = Rotation.from_matrix(U_davenport).as_quat() 
     q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
     
-    # --- THE POLISHER UPGRADE: Build a MASSIVE dictionary to capture all 540 raw peaks! ---
     hkl_polish =  8
     print(f"  > Generating Dense Polishing Dictionary (max_hkl={hkl_polish})...")
     hc_vals = np.arange(-hkl_polish, hkl_polish + 1)
@@ -1586,19 +1576,16 @@ def run_sparse_hough(
     _, unique_idx = np.unique(np.round(r_rays_norm_polish, 4), axis=0, return_index=True)
     r_polish_rays_norm = r_rays_norm_polish[unique_idx]
     
-    # 1. Filter the raw peaks that fall near our newly dense dictionary
     r_lab_dav = U_davenport @ r_polish_rays_norm.T
     dots_dav = q_sample_obs_norm @ r_lab_dav
     max_dots_dav = np.max(np.clip(dots_dav, -1.0, 1.0), axis=1)
     angles_dav = np.rad2deg(np.arccos(max_dots_dav))
     
-    # 2.0 degrees capture radius to ensure we grab the high-order peaks before polishing
     inlier_mask = angles_dav < 2.0 
     q_obs_clean = q_sample_obs_norm[inlier_mask]
     
     print(f"  > EGNN captured {len(q_obs_clean)} raw peaks in its gravity well. Polishing...")
     
-    # 2. Execute Gradient Descent
     U_final = optimize_orientation_gradient_descent(
         q_seed_jax, 
         jnp.array(q_obs_clean), 
@@ -1606,7 +1593,6 @@ def run_sparse_hough(
         steps=steps
     )
     
-    # 3. Final Validation Count
     r_lab = U_final @ r_polish_rays_norm.T
     dots = q_sample_obs_norm @ r_lab
     max_dots = np.max(np.clip(dots, -1.0, 1.0), axis=1)
@@ -1639,6 +1625,8 @@ def run_sparse_hough(
         import concurrent.futures
         from tqdm import tqdm
         from collections import defaultdict
+        
+        # Ensure these are imported exactly as they exist in your codebase
         from subhkl.integration.api import Peaks
 
         print("\n[5/5] Rendering Detector Plots (Parallel)...")
@@ -1651,3 +1639,58 @@ def run_sparse_hough(
             det = peaks_obj.get_detector_by_img(img_key)
             try: match_key = int(img_key)
             except ValueError: match_key = img_key
+            runs_plot_data[run_id]["images"][match_key] = np.nan_to_num(image_raw, nan=0.0, posinf=0.0, neginf=0.0)
+            runs_plot_data[run_id]["detectors"][match_key] = det
+
+        run_tasks = []
+        base_dir = os.path.dirname(output_h5_filename) or "."
+
+        for r_id, data in runs_plot_data.items():
+            mask = [i for i, run in enumerate(run_indices) if run == r_id]
+            if len(mask) == 0: continue
+
+            try: image_label = peaks_obj.get_image_label(img_indices[mask[0]])
+            except Exception: image_label = f"run_{int(r_id)}"
+
+            out_name = os.path.join(base_dir, f"{image_label}-sparse_hough.png")
+            run_peaks = RunPeaks(
+                image_index=[img_indices[i] for i in mask],
+                peak_rows=[pixel_r[i] for i in mask], peak_cols=[pixel_c[i] for i in mask],
+                var_u=None, var_v=None, cov_uv=None,
+                sample_offset=ub_helper.sample_offset, ki_vec=ub_helper.ki_vec,
+            )
+
+            R_run = r_gonio_obs[mask[0]]
+
+            # --- ZONE AXES (Dashed Lines): Keep viz_hkl low to prevent CPU melting! ---
+            viz_hkl = 2
+            A_mat = np.linalg.inv(B_mat).T
+            hc_vals = np.arange(-viz_hkl, viz_hkl + 1)
+            hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+            hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+            mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+            theo_indices = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+            
+            r_theo_zones = (A_mat @ theo_indices.T).T
+            r_theo_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
+
+            lab_zones_for_plot = (R_run @ empirical_zones.T).T
+            pred_lab_zones_for_plot = (R_run @ U_final @ r_theo_zones_norm.T).T
+
+            run_tasks.append((
+                out_name, run_peaks, data["images"], data["detectors"], instrument_name,
+                lab_zones_for_plot, pred_lab_zones_for_plot,
+            ))
+
+        if max_workers := min(os.cpu_count() or 4, len(run_tasks)):
+            ctx = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
+                futures = {executor.submit(_render_run_unrolled_plot, t): t[0] for t in run_tasks}
+                for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Rendering Detector Plots"):
+                    try:
+                        out_name = future.result()
+                        print(f"Saved: {out_name}")
+                    except Exception:
+                        import traceback
+                        print(f"Visualization failed for {out_name}:")
+                        traceback.print_exc()
