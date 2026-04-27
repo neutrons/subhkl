@@ -7,32 +7,30 @@ class EGNNLayer(nn.Module):
 
     @nn.compact
     def __call__(self, x, h, edge_indices):
-        # x: Equivariant 3D coordinates (Zone Axes) -> Shape (N, 3)
-        # h: Invariant node features (e.g., peak intensities) -> Shape (N, hidden_dim)
-        # edge_indices: (2, num_edges) defining the fully connected graph
+        # x: Equivariant 3D coordinates -> Shape (N, 3)
+        # h: Invariant node features -> Shape (N, hidden_dim)
+        # edge_indices: (2, num_edges)
         
         senders, receivers = edge_indices
 
-        # 1. Compute relative vectors and invariant distances
+        # 1. Compute relative vectors (Target Node - Source Node)
         # x_diff is EQUIVARIANT. sq_dist is INVARIANT.
-        x_diff = x[senders] - x[receivers]
+        x_diff = x[receivers] - x[senders]
         sq_dist = jnp.sum(x_diff ** 2, axis=-1, keepdims=True)
 
         # 2. Invariant Message Passing (The MLP only sees scalars!)
-        # Concat: Sender feature, Receiver feature, and the Invariant Distance
-        m_input = jnp.concatenate([h[senders], h[receivers], sq_dist], axis=-1)
+        m_input = jnp.concatenate([h[receivers], h[senders], sq_dist], axis=-1)
         m_ij = nn.Dense(self.hidden_dim)(m_input)
         m_ij = nn.silu(m_ij)
         m_ij = nn.Dense(self.hidden_dim)(m_ij)
 
         # 3. Equivariant Coordinate Update (The Magic)
-        # We compute a scalar weight for the vector x_diff. 
-        # A scalar multiplied by a vector remains a perfectly equivariant vector!
         coord_weight = nn.Dense(1, use_bias=False)(m_ij)
         coord_update = x_diff * coord_weight
         
-        # Sum the vector messages to update the 3D node positions
-        x_new = x.at[senders].add(jax.ops.segment_sum(coord_update, senders, x.shape[0]))
+        # THE FIX: segment_sum reduces the 210 edge messages down to 15 node updates.
+        # Since the shape is now (N, 3), we add it directly to x!
+        x_new = x + jax.ops.segment_sum(coord_update, receivers, x.shape[0])
 
         # 4. Invariant Feature Update
         m_i = jax.ops.segment_sum(m_ij, receivers, h.shape[0])
