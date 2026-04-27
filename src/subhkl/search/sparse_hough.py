@@ -237,13 +237,16 @@ class AzimuthalJAXHough:
             # Interpolate using the true physical axes of the Hough space!
             Theta = float(np.interp(r, np.arange(self.N_theta), self.thetas))
 
-            # We handle Phi with wrapping in case the sub-pixel center pushed it slightly out of bounds
+            # Convert from Detector Space (2θ) to Reciprocal Space (θ)
+            Theta_true = Theta_hough / 2.0
+
             Phi = float(np.interp(c % self.N_phi, np.arange(self.N_phi), self.phis))
-
-            z_x = np.sin(Theta) * np.cos(Phi)
-            z_y = np.sin(Theta) * np.sin(Phi)
-            z_z = np.cos(Theta)
-
+            
+            # 3. Build the Cartesian normal using the true Bragg geometry
+            z_x = np.sin(Theta_true) * np.cos(Phi)
+            z_y = np.sin(Theta_true) * np.sin(Phi)
+            z_z = np.cos(Theta_true)
+            
             zones.append([z_x, z_y, z_z])
             weights.append(physical_weight)
 
