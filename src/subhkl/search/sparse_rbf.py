@@ -48,14 +48,14 @@ def jax_median_2d(img, window_size):
 
 
 @jit
-def jax_gaussian_blur_2d(img):
+def jax_gaussian_blur_2d(img, sigma=3.0):
     """
     Args:
         img: [photons/Pixel]
+        sigma: [Pixel^0.5]
     Returns:
         [photons/Pixel]
     """
-    sigma = 3.0  # [Pixel^0.5]
     radius = int(4.0 * sigma + 0.5)  # [Pixel^0.5]
     x = jnp.arange(-radius, radius + 1)  # [Pixel^0.5]
     k_1d = jnp.exp(-0.5 * (x / sigma) ** 2)  # [-]
