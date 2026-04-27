@@ -591,7 +591,7 @@ def sparse_hough_cmd(
         None, "--nexus", help="Path to the original Nexus file for geometry reconstruction."
     ),
     tolerance_deg: float = typer.Option(
-        3.0, help="Angular tolerance for Laue cones (deg)."
+        0.1, help="Angular tolerance in Hough transform (deg)."
     ),
     angle_tol_hyp: float = typer.Option(
         1.5, help="Tolerance for internal angle matching of Virtual Hubs (deg)."

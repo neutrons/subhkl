@@ -1385,7 +1385,7 @@ def run_sparse_hough(
     output_h5_filename: str,
     instrument_name: str | None = None,
     original_nexus_filename: str | None = None,
-    tolerance_deg: float = 3.0,
+    tolerance_deg: float = 0.1,
     angle_tol_hyp: float = 1.5,
     angle_tol_cons: float = 0.4,
     max_axes: int = 15,
@@ -1460,7 +1460,7 @@ def run_sparse_hough(
     from subhkl.search.sparse_hough import AzimuthalJAXHough
     
     N_theta, N_phi = 512, 1024
-    hough_indexer = AzimuthalJAXHough(N_theta=N_theta, N_phi=N_phi, sigma_deg=3.0)
+    hough_indexer = AzimuthalJAXHough(N_theta=N_theta, N_phi=N_phi, sigma_deg=tolerance_deg)
     
     print(f"  > Projecting {len(q_sample_obs_norm)} isolated Bragg peaks into the Spherical Grid...")
     
