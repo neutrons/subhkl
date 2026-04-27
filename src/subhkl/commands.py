@@ -1421,7 +1421,6 @@ def run_sparse_hough(
 
         pixel_r = f["peaks/pixel_r"][()]
         pixel_c = f["peaks/pixel_c"][()]
-        peak_intensity = f["peaks/intensity"][()]
         img_indices = f["peaks/image_index"][()]
         run_indices = f["peaks/run_index"][()] if "peaks/run_index" in f else img_indices
 
@@ -1467,7 +1466,7 @@ def run_sparse_hough(
     
     # THE FIX: We map ONLY the true, isolated Bragg peaks. 
     # By assigning a weight of 1.0 to each peak, the background, TDS, and panel edges vanish!
-    global_grid_raw = hough_indexer.accumulate_to_grid(q_sample_obs_norm, peak_intensity)
+    global_grid_raw = hough_indexer.accumulate_to_grid(q_sample_obs_norm, np.ones(len(q_sample_obs_norm)))
     
     # Parse the candidate alphas for the Auto-Tuner
     alpha_list = None
