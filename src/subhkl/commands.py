@@ -1454,53 +1454,20 @@ def run_sparse_hough(
     q_sample_obs_norm = q_sample_obs / np.linalg.norm(q_sample_obs, axis=1, keepdims=True)
 
     # ==========================================
-    # PHASE 2: CONTINUOUS AZIMUTHAL HOUGH
+    # PHASE 2: SPARSE AZIMUTHAL HOUGH (THE CURE)
     # ==========================================
-    print("\n[2/4] Sparse Basis Pursuit (Density-Driven Set Cover)")
+    print("\n[2/4] Sparse Basis Pursuit (Discrete Peak-Driven Set Cover)")
     from subhkl.search.sparse_hough import AzimuthalJAXHough
-    from subhkl.search.sparse_rbf import jax_median_2d, jax_gaussian_blur_2d
-    from subhkl.integration.api import Peaks
-    import jax
-    import jax.numpy as jnp
-
-    print("  > Loading raw continuous intensity via Peaks object...")
-    peaks_obj = Peaks(original_nexus_filename, instrument_name)
     
     N_theta, N_phi = 512, 1024
     hough_indexer = AzimuthalJAXHough(N_theta=N_theta, N_phi=N_phi, sigma_deg=3.0)
     
-    R_all_images = peaks_obj.goniometer.rotation
-    stride = 1 
-
-    global_grid_raw = np.zeros((N_theta, N_phi), dtype=np.float32)
-
-    for img_key, raw_image in peaks_obj.image.ims.items():
-        det = peaks_obj.get_detector_by_img(img_key)
-        run_id = peaks_obj.get_run_id(img_key)
-        
-        # Flatten the raw intensity first so the boolean mask is strictly 1D
-        intensity_raw = np.array(raw_image[::stride, ::stride]).flatten()
-        valid = intensity_raw > 0.0
-        if not np.any(valid): continue
-
-        # Now [valid] flawlessly masks the 1D flattened grids
-        row_grid, col_grid = np.indices((det.n, det.m))
-        row_grid = row_grid[::stride, ::stride].flatten()[valid]
-        col_grid = col_grid[::stride, ::stride].flatten()[valid]
-
-        xyz = det.pixel_to_lab(row_grid, col_grid) - ub_helper.sample_offset
-        norms = np.linalg.norm(xyz, axis=-1, keepdims=True)
-        kf = xyz / np.where(norms == 0, 1.0, norms)
-        q_lab = kf - ub_helper.ki_vec
-
-        R_mat = R_all_images[run_id]
-        q_sample = np.einsum('ij,nj->ni', R_mat.T, q_lab)
-
-        grid_chunk_raw = hough_indexer.accumulate_to_grid(q_sample, intensity_raw[valid])
-        global_grid_raw += grid_chunk_raw
-
-    print(f"  > Processing continuous topological projection of {len(peaks_obj.image.ims)} panels...")
-
+    print(f"  > Projecting {len(q_sample_obs_norm)} isolated Bragg peaks into the Spherical Grid...")
+    
+    # THE FIX: We map ONLY the true, isolated Bragg peaks. 
+    # By assigning a weight of 1.0 to each peak, the background, TDS, and panel edges vanish!
+    global_grid_raw = hough_indexer.accumulate_to_grid(q_sample_obs_norm, np.ones(len(q_sample_obs_norm)))
+    
     # Parse the candidate alphas for the Auto-Tuner
     alpha_list = None
     if sparse_rbf_candidate_alphas:
