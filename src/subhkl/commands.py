@@ -1404,6 +1404,8 @@ def run_sparse_hough(
     from subhkl.optimization import FindUB
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
+    import h5py
+    import numpy as np
 
     print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
 
@@ -1464,11 +1466,8 @@ def run_sparse_hough(
     
     print(f"  > Projecting {len(q_sample_obs_norm)} isolated Bragg peaks into the Spherical Grid...")
     
-    # THE FIX: We map ONLY the true, isolated Bragg peaks. 
-    # By assigning a weight of 1.0 to each peak, the background, TDS, and panel edges vanish!
     global_grid_raw = hough_indexer.accumulate_to_grid(q_sample_obs_norm, np.ones(len(q_sample_obs_norm)))
     
-    # Parse the candidate alphas for the Auto-Tuner
     alpha_list = None
     if sparse_rbf_candidate_alphas:
         alpha_list = [float(k.strip()) for k in sparse_rbf_candidate_alphas.split(",")]
@@ -1486,39 +1485,82 @@ def run_sparse_hough(
     )
 
     # ==========================================
-    # PHASE 3: DAVENPORT COMBINATORIAL SEARCH (REAL-SPACE DUALITY)
+    # PHASE 3: EQUIVARIANT MACHINE LEARNING SEARCH
     # ==========================================
-    print("\n[3/4] Global Combinatorial Search (Real-Space Duality)")
-    from subhkl.search.davenport import align_virtual_nodes
+    print("\n[3/4] SE(3) Equivariant Neural Network (Self-Supervised Alignment)")
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from subhkl.search.equivariant import EquivariantIndexer
 
-    # 1. The axes themselves (their normal vectors) ARE the fundamental features!
-    e_nodes = empirical_zones
-    e_weights = activation_weights
+    e_nodes = jnp.array(empirical_zones)
+    e_weights = jnp.array(activation_weights)
 
-    # 2. The theoretical counterparts to Zone Axis Normals are the REAL-SPACE lattice directions.
-    # Reciprocal vectors q = B * h. Real vectors z = A * u, where A = inv(B).T
     A_mat = np.linalg.inv(B_mat).T
 
-    print(f"  > Generating Massive Evaluation Dictionary (max_uvw={max_hkl_cons})...")
+    print(f"  > Generating Theoretical Evaluation Dictionary (max_uvw={max_hkl_cons})...")
     hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
     uvw_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
     mask_uvw_c = ~((uvw_c[0] == 0) & (uvw_c[1] == 0) & (uvw_c[2] == 0))
     theo_uvw_c = uvw_c[:, mask_uvw_c].astype(np.float32).T 
 
-    A_mat = np.linalg.inv(B_mat).T
     r_theo_zones = (A_mat @ theo_uvw_c.T).T
-    r_unique_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
+    r_unique_zones_norm = jnp.array(r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True))
 
-    U_davenport = align_virtual_nodes(
-        e_nodes, 
-        e_weights,              
-        r_unique_zones_norm,    # Real Space evaluation hubs
-        A_mat,                  # Direct lattice matrix
-        max_hkl_hyp=max_hkl_hyp,
-        angle_tol_hyp=angle_tol_hyp
-    )
-    print("  > Macroscopic U-Matrix successfully extracted via Davenport.")
+    print("  > Initializing EGNN architecture and Adam optimizer...")
+    model = EquivariantIndexer(hidden_dim=64, num_layers=3)
+    rng = jax.random.PRNGKey(42)
+    params = model.init(rng, e_nodes, e_weights)
+    
+    # Cosine scheduling helps the network settle into the exact U-matrix minimum
+    schedule = optax.cosine_decay_schedule(init_value=0.05, decay_steps=200)
+    optimizer = optax.adam(learning_rate=schedule)
+    opt_state = optimizer.init(params)
+
+    @jax.jit
+    def loss_fn(params):
+        U_pred = model.apply(params, e_nodes, e_weights)
+        
+        # Rotate the theoretical dictionary into the predicted Lab frame
+        r_lab_pred = jnp.dot(r_unique_zones_norm, U_pred.T)
+        
+        # Compute cosine similarity between Empirical (N, 3) and Predicted (M, 3)
+        dots = jnp.dot(e_nodes, r_lab_pred.T)
+        
+        # Find the absolute best matching theoretical zone for each empirical zone
+        best_matches = jnp.max(jnp.abs(dots), axis=1)
+        
+        # We want to maximize alignment (dot products approaching 1.0)
+        # We compute the weighted negative sum to act as our minimization objective
+        loss = -jnp.sum(best_matches * e_weights) / jnp.sum(e_weights)
+        return loss, U_pred
+
+    @jax.jit
+    def train_step(params, opt_state):
+        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss, U_pred
+
+    print("  > Training EGNN to extract global U-matrix consensus...")
+    egnn_steps = 200
+    best_loss = 0.0
+    best_U = np.eye(3)
+    
+    for i in range(egnn_steps):
+        params, opt_state, loss_val, U_pred = train_step(params, opt_state)
+        
+        # Keep track of the mathematically tightest orientation
+        if loss_val < best_loss:
+            best_loss = loss_val
+            best_U = np.array(U_pred)
+            
+        if (i + 1) % 50 == 0:
+            print(f"    Step {i+1:03d}/{egnn_steps} | Alignment Loss: {loss_val:.4f}")
+
+    U_davenport = best_U
+    print(f"  > Macroscopic U-Matrix successfully extracted via EGNN (Final Loss: {best_loss:.4f}).")
 
     # ==========================================
     # PHASE 4: CONTINUOUS VORONOI POLISH
@@ -1554,7 +1596,7 @@ def run_sparse_hough(
     inlier_mask = angles_dav < 2.0 
     q_obs_clean = q_sample_obs_norm[inlier_mask]
     
-    print(f"  > Davenport captured {len(q_obs_clean)} raw peaks in its gravity well. Polishing...")
+    print(f"  > EGNN captured {len(q_obs_clean)} raw peaks in its gravity well. Polishing...")
     
     # 2. Execute Gradient Descent
     U_final = optimize_orientation_gradient_descent(
@@ -1597,6 +1639,7 @@ def run_sparse_hough(
         import concurrent.futures
         from tqdm import tqdm
         from collections import defaultdict
+        from subhkl.integration.api import Peaks, RunPeaks
 
         print("\n[5/5] Rendering Detector Plots (Parallel)...")
         peaks_obj = Peaks(original_nexus_filename, instrument_name)
@@ -1608,61 +1651,3 @@ def run_sparse_hough(
             det = peaks_obj.get_detector_by_img(img_key)
             try: match_key = int(img_key)
             except ValueError: match_key = img_key
-            runs_plot_data[run_id]["images"][match_key] = np.nan_to_num(image_raw, nan=0.0, posinf=0.0, neginf=0.0)
-            runs_plot_data[run_id]["detectors"][match_key] = det
-
-        run_tasks = []
-        base_dir = os.path.dirname(output_h5_filename) or "."
-
-        for r_id, data in runs_plot_data.items():
-            mask = [i for i, run in enumerate(run_indices) if run == r_id]
-            if len(mask) == 0: continue
-
-            try: image_label = peaks_obj.get_image_label(img_indices[mask[0]])
-            except Exception: image_label = f"run_{int(r_id)}"
-
-            out_name = os.path.join(base_dir, f"{image_label}-sparse_hough.png")
-            run_peaks = RunPeaks(
-                image_index=[img_indices[i] for i in mask],
-                peak_rows=[pixel_r[i] for i in mask], peak_cols=[pixel_c[i] for i in mask],
-                var_u=None, var_v=None, cov_uv=None,
-                sample_offset=ub_helper.sample_offset, ki_vec=ub_helper.ki_vec,
-            )
-
-            R_run = r_gonio_obs[mask[0]]
-
-            # --- ZONE AXES (Dashed Lines): Keep viz_hkl low to prevent CPU melting! ---
-            viz_hkl = 2
-            A_mat = np.linalg.inv(B_mat).T
-            hc_vals = np.arange(-viz_hkl, viz_hkl + 1)
-            hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-            hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-            mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-            theo_indices = hkl_c[:, mask_hkl_c].astype(np.float32).T 
-            
-            r_theo_zones = (A_mat @ theo_indices.T).T
-            r_theo_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
-
-            lab_zones_for_plot = (R_run @ empirical_zones.T).T
-            pred_lab_zones_for_plot = (R_run @ U_final @ r_theo_zones_norm.T).T
-
-            run_tasks.append((
-                out_name, run_peaks, data["images"], data["detectors"], instrument_name,
-                lab_zones_for_plot, pred_lab_zones_for_plot,
-            ))
-
-        if max_workers := min(os.cpu_count() or 4, len(run_tasks)):
-            ctx = multiprocessing.get_context("spawn")
-            with concurrent.futures.ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
-                futures = {executor.submit(_render_run_unrolled_plot, t): t[0] for t in run_tasks}
-                for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Rendering Detector Plots"):
-                    try:
-                        out_name = future.result()
-                        print(f"Saved: {out_name}")
-                    except Exception:
-                        import traceback
-
-                        print(f"Visualization failed for {out_name}:")
-                        traceback.print_exc()
-
-
