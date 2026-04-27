@@ -233,16 +233,14 @@ class AzimuthalJAXHough:
         for p in top_peaks:
             intensity, r, c, sig = p
             physical_weight = float(intensity * H_max)
-
-            # Interpolate using the true physical axes of the Hough space!
-            Theta_hough = float(np.interp(r, np.arange(self.N_theta), self.thetas))
-
-            # Convert from Detector Space (2θ) to Reciprocal Space (θ)
-            Theta_true = Theta_hough / 2.0
-
+            
+            # 1. Interpolate the true polar angle. 
+            # This ALREADY fixes the 2x bug by respecting the true grid bounds!
+            Theta_true = float(np.interp(r, np.arange(self.N_theta), self.thetas))
+            
+            # 2. DO NOT DIVIDE BY 2.0! The reciprocal geometry is naturally perfect.
             Phi = float(np.interp(c % self.N_phi, np.arange(self.N_phi), self.phis))
             
-            # 3. Build the Cartesian normal using the true Bragg geometry
             z_x = np.sin(Theta_true) * np.cos(Phi)
             z_y = np.sin(Theta_true) * np.sin(Phi)
             z_z = np.cos(Theta_true)
