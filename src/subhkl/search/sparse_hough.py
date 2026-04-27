@@ -252,21 +252,28 @@ class AzimuthalJAXHough:
 def apply_hessian_starburst_filter(H_grid):
     from subhkl.search.sparse_rbf import jax_gaussian_blur_2d
     
-    # 1. Smooth heavily (sigma=3.0) to mathematically destroy 1-pixel pepper noise
-    H_smooth = jax_gaussian_blur_2d(H_grid, sigma=3.0)
+    pad_w = 15
     
-    # 2. Compute spatial gradients
+    # 1. AZIMUTHAL WRAPPING: Wrap Phi (axis 1) so the X-Z plane connects perfectly!
+    H_pad_phi = jnp.pad(H_grid, ((0, 0), (pad_w, pad_w)), mode='wrap')
+    
+    # 2. POLAR EDGE PADDING: Pad Theta (axis 0) with 'edge' to prevent vertical derivative artifacts.
+    # (We use 'edge' because crossing the North/South pole flips the azimuth, which is too complex for a simple wrap).
+    H_padded = jnp.pad(H_pad_phi, ((pad_w, pad_w), (0, 0)), mode='edge')
+    
+    # 3. Blur the padded, continuous spherical grid
+    H_smooth = jax_gaussian_blur_2d(H_padded, sigma=3.0)
+    
+    # 4. Compute unbroken spatial gradients across the X-Z boundary
     dy, dx = jnp.gradient(H_smooth)
     dyy, dyx = jnp.gradient(dy)
     dxy, dxx = jnp.gradient(dx)
     
-    # 3. Hessian Determinant & Trace
     det = (dxx * dyy) - (dxy ** 2)
     trace = dxx + dyy
     
-    # 4. The Pure Topological Feature Map
-    # Trace < 0 ensures we are on a convex peak.
-    # jnp.sqrt restores the linear amplitude scaling of the original data!
+    # 5. The Pure Topological Feature Map
     topo_intensity = jnp.where((trace < 0) & (det > 0), jnp.sqrt(det), 0.0)
     
-    return topo_intensity
+    # 6. Slice the padding completely off to return to the exact original grid shape!
+    return topo_intensity[pad_w:-pad_w, pad_w:-pad_w]
