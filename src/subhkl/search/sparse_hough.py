@@ -209,7 +209,7 @@ class AzimuthalJAXHough:
             max_sigma=max_sigma, 
             auto_tune_alpha=auto_tune_alpha,
             candidate_alphas=candidate_alphas,
-            show_steps=False
+            show_steps=True
         )
         
         peaks = peak_finder.find_peaks_batch(H_filtered[None, :, :])[0]
