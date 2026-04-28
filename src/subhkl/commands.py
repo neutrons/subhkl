@@ -1585,69 +1585,6 @@ def run_sparse_hough(
     print(f"  > Macroscopic U-Matrix successfully extracted (Final Distance: {best_loss:.4f}).")
 
     # ==========================================
-    # PHASE 3: EQUIVARIANT MACHINE LEARNING SEARCH
-    # ==========================================
-    print("\n[3/4] SE(3) Equivariant Neural Network (Direct Point Cloud Alignment)")
-    import optax
-    from subhkl.search.equivariant import EquivariantIndexer
-
-    e_nodes = jnp.array(q_sample_obs_norm)
-    e_weights = jnp.array(normalized_weights)
-
-    print("  > Initializing EGNN architecture (k-NN) and Adam optimizer...")
-    model = EquivariantIndexer(hidden_dim=64, num_layers=3, k_neighbors=20)
-    rng = jax.random.PRNGKey(42)
-    params = model.init(rng, e_nodes, e_weights)
-
-    egnn_steps = 300
-    schedule = optax.cosine_decay_schedule(init_value=0.01, decay_steps=egnn_steps)
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=schedule)
-    )
-    opt_state = optimizer.init(params)
-
-    @jax.jit
-    def loss_fn(params):
-        U_pred = model.apply(params, e_nodes, e_weights)
-
-        # Rotate the theoretical Bragg dictionary into the predicted Lab frame
-        q_lab_pred = jnp.dot(r_unique_rays_norm, U_pred.T)
-
-        # Evaluate dot products between empirical peaks and predicted peaks
-        dots = jnp.dot(e_nodes, q_lab_pred.T)
-
-        # Find closest match. Absolute value accounts for Friedel Symmetry (+q = -q)
-        best_matches = jnp.max(jnp.abs(dots), axis=1)
-
-        # Maximize geometric overlap (Loss becomes highly negative)
-        loss = -jnp.sum(best_matches * e_weights) / jnp.sum(e_weights)
-        return loss, U_pred
-
-    @jax.jit
-    def train_step(params, opt_state):
-        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, loss, U_pred
-
-    print(f"  > Training EGNN across {len(e_nodes)} Bragg peaks...")
-    best_loss = 0.0
-    best_U = np.eye(3)
-
-    for i in range(egnn_steps):
-        params, opt_state, loss_val, U_pred = train_step(params, opt_state)
-        if loss_val < best_loss:
-            best_loss = loss_val
-            best_U = np.array(U_pred)
-
-        if (i + 1) % 50 == 0:
-            print(f"    Step {i+1:03d}/{egnn_steps} | Alignment Loss: {loss_val:.4f}")
-
-    U_davenport = best_U
-    print(f"  > Macroscopic U-Matrix successfully extracted via EGNN (Final Loss: {best_loss:.4f}).")
-
-    # ==========================================
     # PHASE 4: CONTINUOUS VORONOI POLISH
     # ==========================================
     print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
