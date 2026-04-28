@@ -16,6 +16,8 @@ dependencies = [
     "tdqm>=0.0.1",
     "scipy>=1.17.1",
     "optax",
+    "jraph",
+    "e3nn-jax",
 ]
 
 license = { text = "GPL3.0" }
