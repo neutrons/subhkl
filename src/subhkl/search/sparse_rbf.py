@@ -12,7 +12,7 @@ import jax.scipy.optimize
 import jax.scipy.signal
 import scipy
 
-from subhkl.search.ssn import solve_ssn_unified, SparseBasisPursuit
+from subhkl.search.ssn import SparseBasisPursuit
 
 from dataclasses import dataclass
 
@@ -47,7 +47,7 @@ def jax_median_2d(img, window_size):
     return jnp.median(patches[0], axis=0)  # [photons/Pixel]
 
 
-@partial(jit, static_argnames=['sigma'])
+@partial(jit, static_argnames=["sigma"])
 def jax_gaussian_blur_2d(img, sigma=3.0):
     """
     Args:
@@ -404,19 +404,16 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
 
             def run_opt(operand):
                 p, a_mask = operand
-                
+
                 # The engine handles basis construction!
                 A_masked = self._build_basis_matrix(x_grid, p) * a_mask
-                
+
                 # The engine handles BIC Auto-Tuning internally!
                 c_sparse_stat, _, _, _ = self.tune_and_solve(
-                    patch_stat.flatten(),
-                    patch_bg.flatten(),
-                    A_masked,
-                    p
+                    patch_stat.flatten(), patch_bg.flatten(), A_masked, p
                 )
 
-                c_sparse_norm = c_sparse_stat * a_mask  
+                c_sparse_norm = c_sparse_stat * a_mask
                 return jnp.stack([c_sparse_norm, p[:, 1], p[:, 2], p[:, 3]], axis=1)
 
             def skip_opt(operand):
@@ -459,10 +456,7 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
             A_aug_masked = A_aug * aug_mask
 
             c_sparse_stat_aug, _, _, _ = self.tune_and_solve(
-                patch_stat.flatten(),
-                patch_bg.flatten(),
-                A_aug_masked,
-                augmented_dict
+                patch_stat.flatten(), patch_bg.flatten(), A_aug_masked, augmented_dict
             )
 
             # Re-extract the spatial columns for the return stack
@@ -770,7 +764,6 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
                 return lax.dynamic_slice(img[bi], (ri, ci), (P_EXT, P_EXT))
 
             return vmap(slice_one)(b_idx, r_start, c_start)
-
 
         # Use standard solver with fixed alpha
         sniper_solver = jit(
@@ -1128,7 +1121,6 @@ class SparseLaueIntegrator(SparseRBFPeakFinder):
         (float(P), float(P), self.min_sigma, self.max_sigma)  # [Pixel^0.5]
         yy, xx = jnp.indices((P, P))  # [Pixel^0.5]
         x_grid = jnp.array([yy, xx])  # [Pixel^0.5]
-        loss_code = 1 if self.loss == "poisson" else 0
 
         @jit
         def extract_patches(img_src, bg_src, f_idx, r_idx, c_idx):
@@ -1277,18 +1269,24 @@ class SparseLaueIntegrator(SparseRBFPeakFinder):
                         jnp.maximum(peak_var_u * peak_var_v - peak_cov_uv**2, 1e-6)
                     )
                 )
-                weight = (effective_sigma / self.ref_sigma) ** self.gamma
-                alpha_vec_joint = jnp.full(K_NEIGHBORS, alpha_z_score * weight)
 
                 c_warm_joint = jnp.zeros(K_NEIGHBORS, dtype=jnp.float32)
-                cand_params = jnp.stack([c_warm_joint, local_rs, local_cs, jnp.full(K_NEIGHBORS, effective_sigma)], axis=1)
+                cand_params = jnp.stack(
+                    [
+                        c_warm_joint,
+                        local_rs,
+                        local_cs,
+                        jnp.full(K_NEIGHBORS, effective_sigma),
+                    ],
+                    axis=1,
+                )
 
                 c_ssn = self.solve_ssn_step(
                     patch.flatten(),
                     patch_bg.flatten(),
                     A_k_masked,
                     cand_params,
-                    alpha_override=alpha_z_score # Override to bypass tuning during final integration
+                    alpha_override=alpha_z_score,  # Override to bypass tuning during final integration
                 )
 
                 surviving_mask_strict = c_ssn > 1e-9

@@ -17,6 +17,7 @@ dependencies = [
     "scipy>=1.17.1",
     "optax",
 ]
+
 license = { text = "GPL3.0" }
 
 [build-system]

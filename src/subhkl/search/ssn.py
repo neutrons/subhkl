@@ -2,10 +2,12 @@
 Semi-Smooth Newton (SSN) Solver for L1-Regularized Sparse Recovery.
 Shared engine for Peak Integration and Sparse Hough Zone Axis Indexing.
 """
+
 import jax
 import jax.numpy as jnp
 from jax import lax, jit, vmap
 from functools import partial
+
 
 @partial(jit, static_argnames=["max_iter", "loss_type", "force_target"])
 def solve_ssn_unified(
@@ -20,30 +22,32 @@ def solve_ssn_unified(
     def get_loss_grad_hess(c):
         u = A @ c + bg_flat
 
-        if loss_type == 1: # Poisson
+        if loss_type == 1:  # Poisson
             u_safe = jnp.maximum(u, 1e-6)
             nll = jnp.sum(u_safe - y * jnp.log(u_safe))
             grad = A.T @ (1.0 - y / u_safe)
             W_diag = 1.0 / jnp.maximum(u_safe, 1e-3)
             hess = A.T @ (W_diag[:, None] * A)
-            
-        elif loss_type == 2: # Huber
+
+        elif loss_type == 2:  # Huber
             # Threshold (delta) is 3 standard deviations of the background
             delta = 3.0 * jnp.sqrt(bg_med)
             e = u - y
             abs_e = jnp.abs(e)
             is_inlier = abs_e <= delta
-            
+
             # Loss: 0.5 * e^2 for inliers, delta * |e| - 0.5 * delta^2 for outliers
-            nll = jnp.sum(jnp.where(is_inlier, 0.5 * e**2, delta * abs_e - 0.5 * delta**2))
-            
+            nll = jnp.sum(
+                jnp.where(is_inlier, 0.5 * e**2, delta * abs_e - 0.5 * delta**2)
+            )
+
             # IRLS Weights for gradient and Hessian
             W_diag = jnp.where(is_inlier, 1.0, delta / jnp.maximum(abs_e, 1e-6))
             
             grad = A.T @ (W_diag * e)
             hess = A.T @ (W_diag[:, None] * A)
-            
-        else: # Gaussian (MSE)
+
+        else:  # Gaussian (MSE)
             nll = 0.5 * jnp.sum((u - y) ** 2)
             grad = A.T @ (u - y)
             hess = A.T @ A
@@ -107,7 +111,12 @@ def solve_ssn_unified(
             jnp.linalg.norm(dq).astype(jnp.float32),
         )
 
-    init_state = (0, q_init.astype(jnp.float32), c_warm.astype(jnp.float32), jnp.float32(1e9))
+    init_state = (
+        0,
+        q_init.astype(jnp.float32),
+        c_warm.astype(jnp.float32),
+        jnp.float32(1e9),
+    )
     final_state = lax.while_loop(cond_fn, body_fn, init_state)
     _, _, c_l1, _ = final_state
 
@@ -141,7 +150,11 @@ def solve_ssn_unified(
         c_new = jnp.maximum(0.0, c_new_raw) * active_mask
 
         actual_step = c_new - c
-        return (step + 1, c_new.astype(jnp.float32), jnp.linalg.norm(actual_step).astype(jnp.float32))
+        return (
+            step + 1,
+            c_new.astype(jnp.float32),
+            jnp.linalg.norm(actual_step).astype(jnp.float32),
+        )
 
     debias_state = lax.while_loop(
         debias_cond, debias_body, (0, c_l1.astype(jnp.float32), jnp.float32(1e9))
@@ -150,13 +163,22 @@ def solve_ssn_unified(
 
     return c_final.astype(jnp.float32)
 
+
 class SparseBasisPursuit:
     """
-    The Unified SSN Engine. 
+    The Unified SSN Engine.
     Now features a Universal BIC Auto-Tuner for unsupervised sparsity tuning!
     """
-    def __init__(self, alpha=15.0, gamma=2.0, loss="poisson", ref_sigma=1.0, 
-                 auto_tune_alpha=False, candidate_alphas=None):
+
+    def __init__(
+        self,
+        alpha=15.0,
+        gamma=2.0,
+        loss="poisson",
+        ref_sigma=1.0,
+        auto_tune_alpha=False,
+        candidate_alphas=None,
+    ):
         self.alpha = alpha
         self.gamma = gamma
         self.loss = loss
@@ -167,7 +189,7 @@ class SparseBasisPursuit:
             self.loss_code = 2
         else:
             self.loss_code = 0
-        
+
         self.auto_tune_alpha = auto_tune_alpha
         if candidate_alphas is None:
             self.candidate_alphas = jnp.array([10.0, 15.0, 20.0, 30.0, 50.0])
@@ -180,24 +202,32 @@ class SparseBasisPursuit:
     def _build_basis_matrix(self, x_grid, params):
         raise NotImplementedError("Child class must define the geometric basis.")
 
-    @partial(jit, static_argnames=['self'])
-    def solve_ssn_step(self, data_flat, bg_flat, A_matrix, params_guess, alpha_override=None):
+    @partial(jit, static_argnames=["self"])
+    def solve_ssn_step(
+        self, data_flat, bg_flat, A_matrix, params_guess, alpha_override=None
+    ):
         c_init = params_guess[:, 0]
         sigmas = params_guess[:, -1]
-        
+
         weights = (sigmas / self.ref_sigma) ** self.gamma
         alpha_val = alpha_override if alpha_override is not None else self.alpha
         alpha_vec = alpha_val * weights
-        
+
         return solve_ssn_unified(
-            A_matrix, data_flat, bg_flat, alpha_vec, 
-            self.loss_code, c_init, max_iter=20, force_target=False
+            A_matrix,
+            data_flat,
+            bg_flat,
+            alpha_vec,
+            self.loss_code,
+            c_init,
+            max_iter=20,
+            force_target=False,
         )
 
-    @partial(jit, static_argnames=['self'])
+    @partial(jit, static_argnames=["self"])
     def tune_and_solve(self, data_flat, bg_flat, A_matrix, params_guess):
         """
-        Sweeps candidate alphas, evaluates the SSN step, and returns 
+        Sweeps candidate alphas, evaluates the SSN step, and returns
         the solution that minimizes the BIC, alongside logging metrics.
         """
         if not self.auto_tune_alpha:
@@ -205,7 +235,9 @@ class SparseBasisPursuit:
             return c, self.alpha, 0.0, 0.0
 
         def evaluate_alpha(alpha_val):
-            c_sparse = self.solve_ssn_step(data_flat, bg_flat, A_matrix, params_guess, alpha_override=alpha_val)
+            c_sparse = self.solve_ssn_step(
+                data_flat, bg_flat, A_matrix, params_guess, alpha_override=alpha_val
+            )
             k_active = jnp.sum(c_sparse > 1e-9)
 
             recon = A_matrix @ c_sparse
@@ -213,20 +245,30 @@ class SparseBasisPursuit:
 
             n_pix = data_flat.size
 
-            if self.loss_code == 1: # Poisson
-                nll = jnp.sum(recon_total - jax.scipy.special.xlogy(data_flat, recon_total))
-                term = jax.scipy.special.xlogy(data_flat, data_flat / recon_total) - (data_flat - recon_total)
+            if self.loss_code == 1:  # Poisson
+                nll = jnp.sum(
+                    recon_total - jax.scipy.special.xlogy(data_flat, recon_total)
+                )
+                term = jax.scipy.special.xlogy(data_flat, data_flat / recon_total) - (
+                    data_flat - recon_total
+                )
                 dev = 2 * jnp.sum(term)
-            elif self.loss_code == 2: # Huber
+            elif self.loss_code == 2:  # Huber
                 delta = 3.0 * jnp.sqrt(jnp.maximum(jnp.median(bg_flat), 1e-3))
                 e = recon_total - data_flat
                 abs_e = jnp.abs(e)
-                nll = jnp.sum(jnp.where(abs_e <= delta, 0.5 * e**2, delta * abs_e - 0.5 * delta**2))
-                
+                nll = jnp.sum(
+                    jnp.where(
+                        abs_e <= delta, 0.5 * e**2, delta * abs_e - 0.5 * delta**2
+                    )
+                )
+
                 # Effective Deviance for Huber
-                W_diag = jnp.where(abs_e <= delta, 1.0, delta / jnp.maximum(abs_e, 1e-6))
+                W_diag = jnp.where(
+                    abs_e <= delta, 1.0, delta / jnp.maximum(abs_e, 1e-6)
+                )
                 dev = jnp.sum(W_diag * (e**2) / recon_total)
-            else: # Gaussian
+            else:  # Gaussian
                 diff = recon_total - data_flat
                 nll = 0.5 * jnp.sum(diff**2)
                 # THE FIX: True Mean Squared Error for pure continuous signals
@@ -235,11 +277,16 @@ class SparseBasisPursuit:
             n_params = k_active * params_guess.shape[1]
             dof = jnp.maximum(n_pix - n_params, 1)
             dev_nu = dev / dof
-            
+
             bic = jnp.where(k_active == 0, 1e9, n_params * jnp.log(n_pix) + 2 * nll)
             return bic, c_sparse, dev_nu
 
         bics, all_c_sparse, devs = vmap(evaluate_alpha)(self.candidate_alphas)
         best_idx = jnp.argmin(bics)
-        
-        return all_c_sparse[best_idx], self.candidate_alphas[best_idx], bics[best_idx], devs[best_idx]
+
+        return (
+            all_c_sparse[best_idx],
+            self.candidate_alphas[best_idx],
+            bics[best_idx],
+            devs[best_idx],
+        )
