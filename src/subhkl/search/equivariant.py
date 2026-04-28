@@ -2,120 +2,98 @@ import jax
 import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
+import jraph
+import e3nn_jax as e3nn
 
-class SO3_EGNNLayer(nn.Module):
-    hidden_dim: int
-
-    @nn.compact
-    def __call__(self, x, h, edge_indices):
-        senders, receivers = edge_indices
-
-        # ==========================================
-        # 1. The SO(3) Invariant Scalars
-        # ==========================================
-        # Instead of relative Euclidean distance, we compute the pure inner product space.
-        # This anchors the physics to the Direct Beam (Origin) preserving d-spacing magnitudes!
-        norm_sq_i = jnp.sum(x[receivers] ** 2, axis=-1, keepdims=True)
-        norm_sq_j = jnp.sum(x[senders] ** 2, axis=-1, keepdims=True)
-        dot_ij = jnp.sum(x[receivers] * x[senders], axis=-1, keepdims=True)
-
-        # 2. Invariant Message Passing
-        m_input = jnp.concatenate([
-            h[receivers], 
-            h[senders], 
-            norm_sq_i, 
-            norm_sq_j, 
-            dot_ij
-        ], axis=-1)
-        
-        m_ij = nn.Dense(self.hidden_dim)(m_input)
-        m_ij = nn.silu(m_ij)
-        m_ij = nn.Dense(self.hidden_dim)(m_ij)
-
-        # ==========================================
-        # 3. The SO(3) Equivariant Coordinate Update
-        # ==========================================
-        # Absolute positions are valid equivariant vectors in SO(3). 
-        # We predict independent scalars to weight x_i and x_j directly.
-        weight_i = nn.Dense(1, use_bias=False)(m_ij)
-        weight_j = nn.Dense(1, use_bias=False)(m_ij)
-        
-        # Apply tanh to prevent exploding spatial coordinates
-        weight_i = jnp.tanh(weight_i) * 0.1
-        weight_j = jnp.tanh(weight_j) * 0.1
-        
-        # The physical update: Node A is pulled by Node B, but also scales itself
-        coord_update = (x[receivers] * weight_i) + (x[senders] * weight_j)
-        
-        # Sum the vector messages
-        x_new = x + jax.ops.segment_sum(coord_update, receivers, x.shape[0])
-        
-        # Note: We intentionally DO NOT project back to the unit sphere here. 
-        # In reciprocal space, |q| represents the scattering resolution (1/d). 
-        # We must allow the vectors to stretch and breathe to retain their physics.
-
-        # 4. Invariant Feature Update
-        m_i = jax.ops.segment_sum(m_ij, receivers, h.shape[0])
-        h_input = jnp.concatenate([h, m_i], axis=-1)
-        h_new = nn.Dense(self.hidden_dim)(h_input)
-        h_new = nn.silu(h_new)
-        h_new = nn.Dense(self.hidden_dim)(h_new) + h
-
-        return x_new, h_new
+def build_laue_graph(q_vectors_norm, k_neighbors=20):
+    """
+    Constructs a strict SO(3) k-NN graph. 
+    Crucially, edge features are the absolute positions of the sender nodes,
+    locking the entire graph physically to the Ewald sphere origin.
+    """
+    N = q_vectors_norm.shape[0]
+    
+    # 1. Compute distances for k-NN
+    x_np = np.array(q_vectors_norm)
+    diff = x_np[:, None, :] - x_np[None, :, :]
+    dist = np.sum(diff**2, axis=-1)
+    
+    # 2. Extract k-nearest neighbors
+    k = min(k_neighbors, N - 1)
+    idx = np.argsort(dist, axis=1)[:, 1:k+1] 
+    
+    senders = np.repeat(np.arange(N), k)
+    receivers = idx.flatten()
+    
+    # 3. Build pristine jraph object
+    return jraph.GraphsTuple(
+        nodes=jnp.array(q_vectors_norm),           # (N, 3) 
+        edges=jnp.array(q_vectors_norm[senders]),  # (E, 3) Absolute sender positions
+        receivers=jnp.array(receivers),
+        senders=jnp.array(senders),
+        n_node=jnp.array([N]),
+        n_edge=jnp.array([len(senders)]),
+        globals=None
+    )
 
 
-class EquivariantIndexer(nn.Module):
-    hidden_dim: int = 64
+class E3NN_Indexer(nn.Module):
+    # The hidden state lives in an abstract space of Scalars (0e), Vectors (1o), and Tensors (2e)
+    hidden_irreps: e3nn.Irreps = e3nn.Irreps("16x0e + 16x1o + 16x2e")
     num_layers: int = 3
-    k_neighbors: int = 20
 
     @nn.compact
-    def __call__(self, q_vectors, intensities):
-        N = q_vectors.shape[0]
+    def __call__(self, graph: jraph.GraphsTuple, intensities: jnp.ndarray):
+        # 1. Lift spatial coordinates into Spherical Harmonics
+        # We explicitly tag the inputs as 3D vectors ("1o")
+        node_vecs = e3nn.IrrepsArray("1o", graph.nodes)
+        edge_vecs = e3nn.IrrepsArray("1o", graph.edges)
         
-        # Initialize node features
-        h = nn.Dense(self.hidden_dim)(intensities[:, None])
-        x = q_vectors
+        # Lift into Y_l^m lobes up to l=2
+        node_sh = e3nn.spherical_harmonics("0e + 1o + 2e", node_vecs, normalize=True)
+        edge_sh = e3nn.spherical_harmonics("0e + 1o + 2e", edge_vecs, normalize=True)
         
-        # ---------------------------------------------------------
-        # K-Nearest Neighbors Graph (Static Trace via NumPy)
-        # ---------------------------------------------------------
-        x_np = np.array(q_vectors)
-        k = min(self.k_neighbors, N - 1)
-        
-        diff = x_np[:, None, :] - x_np[None, :, :]
-        dist = np.sum(diff**2, axis=-1)
-        
-        idx = np.argsort(dist, axis=1)[:, 1:k+1] 
-        senders = np.repeat(np.arange(N), k)
-        receivers = idx.flatten()
-        
-        edge_indices = jnp.array(np.stack([senders, receivers]))
+        # Initialize node features: Intensities (0e) + Angular Lobes
+        h_init = e3nn.IrrepsArray("1x0e", intensities[:, None])
+        nodes = e3nn.Linear(self.hidden_irreps)(e3nn.tensor_product(h_init, node_sh))
 
-        # Pass through SO(3) EGNN layers
+        # 2. Define the e3nn Message Passing Layer
+        def update_edge_fn(edges, senders, receivers, globals_):
+            # Analytically multiply sender shapes with edge shapes using Clebsch-Gordan coefficients
+            tp = e3nn.tensor_product(senders, edge_sh)
+            return e3nn.Linear(self.hidden_irreps)(tp)
+
+        def update_node_fn(nodes, senders, receivers, globals_):
+            # Update the node by mixing its current state with incoming messages
+            tp = e3nn.tensor_product(nodes, receivers)
+            return e3nn.Linear(self.hidden_irreps)(tp)
+
+        # 3. Execute Graph Network
+        gn = jraph.GraphNetwork(
+            update_edge_fn=update_edge_fn,
+            update_node_fn=update_node_fn
+        )
+        
         for _ in range(self.num_layers):
-            x, h = SO3_EGNNLayer(self.hidden_dim)(x, h, edge_indices)
+            graph = graph._replace(nodes=nodes)
+            graph = gn(graph)
+            nodes = graph.nodes
 
-        # ==========================================
-        # THE FIX: Manifest Covariance Extraction
-        # ==========================================
-        # Predict strictly positive attention weights for every Bragg peak
-        weights = jax.nn.softplus(nn.Dense(1)(h)) + 1e-4 
+        # 4. Invariant Readout (0e)
+        # We force the network to collapse all vectors/tensors, leaving ONLY rotationally invariant scalars!
+        invariant_scalars = e3nn.Linear("1x0e")(nodes).array
+        weights = jax.nn.softplus(invariant_scalars) + 1e-4
+
+        # 5. Manifest Covariance Extraction (Solving the Friedel Trap)
+        x = graph.nodes # (N, 3) raw directions
         
-        # Construct the 3x3 Weighted Covariance Tensor (Outer Product).
-        # Squaring the vectors inherently solves the Friedel pair (+q, -q) cancellation.
-        # x is (N, 3), x.T is (3, N). The result is strictly a 3x3 orientation matrix.
+        # Outer product weighted by the network's invariant predictions
         M = jnp.dot(x.T, x * weights)
+        M = M + jnp.diag(jnp.array([1e-5, 2e-5, 3e-5])) # Break degeneracy
         
-        # Break eigenvalue degeneracy with micro-noise to guarantee stable JAX SVD gradients
-        M = M + jnp.diag(jnp.array([1e-5, 2e-5, 3e-5]))
-        
-        # Extract Principal Axes mathematically
         U, S, Vh = jnp.linalg.svd(M)
         
-        # SVD inherently returns orthogonal unit vectors. 
-        # We must verify the handedness (determinant) to ensure it is a valid SO(3) spatial rotation, 
-        # rather than a mirror reflection.
+        # Enforce positive determinant for SO(3)
         det = jnp.linalg.det(U)
         U_pred = jnp.where(det < 0, U.at[:, 2].multiply(-1), U)
         

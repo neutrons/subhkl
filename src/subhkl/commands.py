@@ -1461,113 +1461,27 @@ def run_egnn(
         normalized_weights = np.ones_like(log_weights)
 
     # ==========================================
-    # PHASE 2 & 3: EGNN WITH GAUSSIAN ANNEALING
+    # PHASE 3: e3nn-jax SO(3) COVARIANCE NETWORK
     # ==========================================
-    print("\n[2/4] Initializing SE(3) EGNN with Gaussian Annealing Loss")
+    print(f"\n[3/3] Training e3nn-jax SO(3) Network (N={len(q_sample_obs_norm)} Laue rays)...")
     from subhkl.optimization import get_lattice_system
     import jax
     import jax.numpy as jnp
     import optax
-    from subhkl.search.equivariant import EquivariantIndexer
+    from subhkl.search.equivariant import build_laue_graph, E3NN_Indexer
 
-    # EGNN Input: Normalized Directions (Equivariance stability)
-    e_nodes = jnp.array(q_sample_obs_norm)
-    e_weights = jnp.array(normalized_weights)
-
-    # 1. Setup the Primitive Matrix (M_prim) based on Space Group
-    _, _, centering = get_lattice_system(
-        ub_helper.a, ub_helper.b, ub_helper.c, 
-        ub_helper.alpha, ub_helper.beta, ub_helper.gamma, 
-        ub_helper.space_group
-    )
+    # 1. Build the jraph structure strictly from NORMALIZED Laue rays
+    # The network reads geometry solely from angular spherical harmonics.
+    graph = build_laue_graph(q_sample_obs_norm, k_neighbors=20)
+    intensities = jnp.array(normalized_weights)
     
-    if centering == "I": M_prim = jnp.array([[0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
-    elif centering == "F": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5]])
-    elif centering == "C": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.0, 1.0]])
-    elif centering == "A": M_prim = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.0, 0.5, -0.5]])
-    elif centering == "B": M_prim = jnp.array([[0.5, 0.0, 0.5], [0.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
-    elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
-    else: M_prim = jnp.eye(3)
-
-    # 2. Setup Continuous Wavelength Search Grid
-    wavelengths = np.array(ub_helper.wavelength)
-    wl_min, wl_max = wavelengths[0], wavelengths[1]
-    num_candidates = 64
-    lam_grid = jnp.logspace(jnp.log10(wl_min), jnp.log10(wl_max), num_candidates)
-    
-    # 3. Pre-compute Constants
-    B_inv = jnp.linalg.inv(B_mat)
+    # We keep the UN-NORMALIZED vectors to evaluate the physical fractional loss
     q_sample_unnorm = jnp.array(q_sample_obs).T
 
-    print("  > Initializing EGNN architecture (k-NN) and Adam optimizer...")
-    model = EquivariantIndexer(hidden_dim=64, num_layers=3, k_neighbors=20)
-    rng = jax.random.PRNGKey(42)
-    params = model.init(rng, e_nodes, e_weights)
-    
-    egnn_steps = 300
-    schedule = optax.cosine_decay_schedule(init_value=0.01, decay_steps=egnn_steps)
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=schedule)
-    )
-    opt_state = optimizer.init(params)
-
-    @jax.jit
-    def loss_fn(params, sigma):
-        U_pred = model.apply(params, e_nodes, e_weights)
-        
-        UB_inv = jnp.matmul(B_inv, U_pred.T)
-        v = jnp.matmul(UB_inv, q_sample_unnorm)
-        
-        hkl_float = v[None, :, :] / lam_grid[:, None, None]
-        
-        h = hkl_float[:, 0, :]
-        k = hkl_float[:, 1, :]
-        l = hkl_float[:, 2, :]
-        
-        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
-        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
-        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
-        
-        # Calculate strict fractional deviation from the nearest integer
-        dh = h_p - jnp.round(h_p)
-        dk = k_p - jnp.round(k_p)
-        dl = l_p - jnp.round(l_p)
-        
-        dist_sq = dh**2 + dk**2 + dl**2
-        
-        # THE MAGIC: Gaussian Annealing Loss (1 - Gaussian)
-        gaussian_loss = 1.0 - jnp.exp(-dist_sq / (2.0 * sigma**2))
-        
-        min_loss = jnp.min(gaussian_loss, axis=0)
-        loss = jnp.sum(min_loss * e_weights) / jnp.sum(e_weights)
-        
-        return loss, U_pred
-
-    @jax.jit
-    def train_step(params, opt_state, sigma):
-        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, sigma)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, loss, U_pred
-
-    # ==========================================
-    # PHASE 3: EGNN WITH GAUSSIAN ANNEALING
-    # ==========================================
-    print(f"\n[3/3] Training EGNN via Gaussian Annealing (N={len(e_nodes)} peaks)...")
-    from subhkl.optimization import get_lattice_system
-    import jax
-    import jax.numpy as jnp
-    import optax
-    from subhkl.search.equivariant import EquivariantIndexer
-
-    e_nodes = jnp.array(q_sample_obs_norm)
-    e_weights = jnp.array(normalized_weights)
-
+    # 2. Lattice System & Continuous Wavelength Sweep Grid
     _, _, centering = get_lattice_system(
         ub_helper.a, ub_helper.b, ub_helper.c, 
-        ub_helper.alpha, ub_helper.beta, ub_helper.gamma, 
-        ub_helper.space_group
+        ub_helper.alpha, ub_helper.beta, ub_helper.gamma, ub_helper.space_group
     )
     
     if centering == "I": M_prim = jnp.array([[0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
@@ -1580,28 +1494,27 @@ def run_egnn(
 
     wavelengths = np.array(ub_helper.wavelength)
     wl_min, wl_max = wavelengths[0], wavelengths[1]
-    num_candidates = 64
-    lam_grid = jnp.logspace(jnp.log10(wl_min), jnp.log10(wl_max), num_candidates)
-    
+    lam_grid = jnp.logspace(jnp.log10(wl_min), jnp.log10(wl_max), 64)
     B_inv = jnp.linalg.inv(B_mat)
-    q_sample_unnorm = jnp.array(q_sample_obs).T
 
-    model = EquivariantIndexer(hidden_dim=64, num_layers=3, k_neighbors=20)
+    # 3. Model Initialization
+    model = E3NN_Indexer(num_layers=3)
     rng = jax.random.PRNGKey(42)
-    params = model.init(rng, e_nodes, e_weights)
+    params = model.init(rng, graph, intensities)
     
-    # Map the CLI 'steps' argument to the EGNN
     egnn_steps = steps 
-    schedule = optax.cosine_decay_schedule(init_value=0.01, decay_steps=egnn_steps)
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=schedule)
+        optax.adam(learning_rate=optax.cosine_decay_schedule(0.01, egnn_steps))
     )
     opt_state = optimizer.init(params)
 
+    # 4. JIT-Compiled Training Step
     @jax.jit
     def loss_fn(params, sigma):
-        U_pred = model.apply(params, e_nodes, e_weights)
+        U_pred = model.apply(params, graph, intensities)
+        
+        # Transform un-normalized lab vectors via the predicted crystal frame
         UB_inv = jnp.matmul(B_inv, U_pred.T)
         v = jnp.matmul(UB_inv, q_sample_unnorm)
         
@@ -1612,15 +1525,17 @@ def run_egnn(
         k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
         l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
         
+        # Calculate strict fractional deviation
         dh = h_p - jnp.round(h_p)
         dk = k_p - jnp.round(k_p)
         dl = l_p - jnp.round(l_p)
         dist_sq = dh**2 + dk**2 + dl**2
         
+        # Continuous Gaussian Annealing evaluates ALL harmonics implicitly
         gaussian_loss = 1.0 - jnp.exp(-dist_sq / (2.0 * sigma**2))
         min_loss = jnp.min(gaussian_loss, axis=0)
         
-        loss = jnp.sum(min_loss * e_weights) / jnp.sum(e_weights)
+        loss = jnp.sum(min_loss * intensities) / jnp.sum(intensities)
         return loss, U_pred
 
     @jax.jit
@@ -1630,6 +1545,7 @@ def run_egnn(
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss, U_pred
 
+    # 5. Annealing Execution
     sigma_start = 0.50
     sigma_end = egnn_sigma_end
     
@@ -1643,7 +1559,7 @@ def run_egnn(
             print(f"    Step {i+1:05d}/{egnn_steps} | Sigma: {current_sigma:.4f} | Fractional Error: {true_dist:.4f}")
 
     U_final = np.array(U_pred)
-    print("  > Macroscopic U-Matrix successfully extracted via Annealing.")
+    print("  > Macroscopic U-Matrix successfully extracted via e3nn-jax SVD.")
 
     # ==========================================
     # FINAL VALIDATION (Replaces Phase 4)
