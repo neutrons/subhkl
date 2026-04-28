@@ -24,10 +24,8 @@ class EGNNLayer(nn.Module):
         
         x_new = x + jax.ops.segment_sum(coord_update, receivers, x.shape[0])
         
-        # STRICT SPHERICAL PROJECTION: Prevent points from shrinking
-        x_new = x_new + jnp.array([1e-6, 0.0, 0.0]) # Micro-drift prevents dead zero
-        x_norms = jnp.sqrt(jnp.maximum(jnp.sum(x_new**2, axis=-1, keepdims=True), 1e-12))
-        x_new = x_new / x_norms
+        # Stable spherical projection to prevent floating point overflow
+        x_new = x_new / jnp.sqrt(jnp.sum(x_new**2, axis=-1, keepdims=True) + 1e-6)
 
         m_i = jax.ops.segment_sum(m_ij, receivers, h.shape[0])
         h_input = jnp.concatenate([h, m_i], axis=-1)
@@ -64,27 +62,25 @@ class EquivariantIndexer(nn.Module):
         for _ in range(self.num_layers):
             x, h = EGNNLayer(self.hidden_dim)(x, h, edge_indices)
 
-        node_weights = nn.Dense(2)(h) 
-        
-        v1 = jnp.sum(x * node_weights[:, 0:1], axis=0)
-        v2 = jnp.sum(x * node_weights[:, 1:2], axis=0)
-        
         # ==========================================
-        # THE FIX: Prevent Trivial Zero Collapse
+        # THE FIX: Manifest Covariance Extraction
         # ==========================================
-        # Inject an orthogonal seed. If the network outputs 0, U becomes Identity.
-        v1 = v1 + jnp.array([1e-6, 0.0, 0.0])
-        v2 = v2 + jnp.array([0.0, 1e-6, 0.0])
+        # Predict strictly positive attention weights for the tensor
+        weights = jax.nn.softplus(nn.Dense(1)(h)) + 1e-4 
         
-        # Strict Gram-Schmidt with hard minimum bounds
-        v1_norm = jnp.sqrt(jnp.maximum(jnp.sum(v1**2), 1e-12))
-        b1 = v1 / v1_norm
+        # Construct the 3x3 Weighted Covariance Matrix (Outer Product).
+        # x is (N, 3), x.T is (3, N). The result is strictly a 3x3 matrix.
+        M = jnp.dot(x.T, x * weights)
         
-        v2_ortho = v2 - jnp.dot(v2, b1) * b1
-        v2_norm = jnp.sqrt(jnp.maximum(jnp.sum(v2_ortho**2), 1e-12))
-        b2 = v2_ortho / v2_norm
+        # Break eigenvalue degeneracy with micro-noise to guarantee stable SVD gradients
+        M = M + jnp.diag(jnp.array([1e-5, 2e-5, 3e-5]))
         
-        b3 = jnp.cross(b1, b2)
+        # Extract Principal Axes mathematically
+        U, S, Vh = jnp.linalg.svd(M)
         
-        U_pred = jnp.stack([b1, b2, b3], axis=1)
+        # SVD inherently returns orthogonal unit vectors. 
+        # We just verify the handedness to ensure it is a valid SO(3) rotation.
+        det = jnp.linalg.det(U)
+        U_pred = jnp.where(det < 0, U.at[:, 2].multiply(-1), U)
+        
         return U_pred
