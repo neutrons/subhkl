@@ -1470,9 +1470,9 @@ def run_sparse_hough(
         normalized_weights = np.ones_like(log_weights)
 
     # ==========================================
-    # PHASE 2 & 3: SE(3) EGNN WITH LAUE SIN^2 LOSS
+    # PHASE 2 & 3: EGNN WITH GAUSSIAN ANNEALING
     # ==========================================
-    print("\n[2/4] Initializing SE(3) EGNN for Direct Fractional Indexing")
+    print("\n[2/4] Initializing SE(3) EGNN with Gaussian Annealing Loss")
     from subhkl.optimization import get_lattice_system
     import jax
     import jax.numpy as jnp
@@ -1506,8 +1506,7 @@ def run_sparse_hough(
     
     # 3. Pre-compute Constants
     B_inv = jnp.linalg.inv(B_mat)
-    # Loss Function Input: True Physical Momentum Vectors (Un-normalized)
-    q_sample_unnorm = jnp.array(q_sample_obs).T  # Shape: (3, N)
+    q_sample_unnorm = jnp.array(q_sample_obs).T
 
     print("  > Initializing EGNN architecture (k-NN) and Adam optimizer...")
     model = EquivariantIndexer(hidden_dim=64, num_layers=3, k_neighbors=20)
@@ -1523,66 +1522,67 @@ def run_sparse_hough(
     opt_state = optimizer.init(params)
 
     @jax.jit
-    def loss_fn(params):
+    def loss_fn(params, sigma):
         U_pred = model.apply(params, e_nodes, e_weights)
         
-        # U_pred is a rotation matrix, so U^T = U^-1
-        # UB_inv = B^-1 * U^T
         UB_inv = jnp.matmul(B_inv, U_pred.T)
-        
-        # Map physical momentum transfer directly to fractional HKL space
-        # v shape: (3, N)
         v = jnp.matmul(UB_inv, q_sample_unnorm)
         
-        # Scale by lambda grid. hkl_float shape: (64, 3, N)
         hkl_float = v[None, :, :] / lam_grid[:, None, None]
         
         h = hkl_float[:, 0, :]
         k = hkl_float[:, 1, :]
         l = hkl_float[:, 2, :]
         
-        # Transform to primitive cell
         h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
         k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
         l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
         
-        # Continuous fractional sin^2 loss
-        dh = jnp.sin(jnp.pi * h_p)
-        dk = jnp.sin(jnp.pi * k_p)
-        dl = jnp.sin(jnp.pi * l_p)
-        dist = jnp.sqrt(dh**2 + dk**2 + dl**2) / jnp.pi
+        # Calculate strict fractional deviation from the nearest integer
+        dh = h_p - jnp.round(h_p)
+        dk = k_p - jnp.round(k_p)
+        dl = l_p - jnp.round(l_p)
         
-        # Find the lambda that perfectly hits an integer HKL node -> min distance
-        min_dist = jnp.min(dist, axis=0)
+        dist_sq = dh**2 + dk**2 + dl**2
         
-        # Minimize the weighted mean distance across all peaks
-        loss = jnp.sum(min_dist * e_weights) / jnp.sum(e_weights)
+        # THE MAGIC: Gaussian Annealing Loss (1 - Gaussian)
+        gaussian_loss = 1.0 - jnp.exp(-dist_sq / (2.0 * sigma**2))
+        
+        min_loss = jnp.min(gaussian_loss, axis=0)
+        loss = jnp.sum(min_loss * e_weights) / jnp.sum(e_weights)
         
         return loss, U_pred
 
     @jax.jit
-    def train_step(params, opt_state):
-        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    def train_step(params, opt_state, sigma):
+        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, sigma)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss, U_pred
 
-    print(f"\n[3/4] Training EGNN via Continuous Fractional Loss (N={len(e_nodes)} peaks)...")
+    print(f"\n[3/4] Training EGNN via Gaussian Annealing (N={len(e_nodes)} peaks)...")
     best_loss = jnp.inf
     best_U = np.eye(3)
     
+    # Annealing Schedule Bounds
+    sigma_start = 0.50
+    sigma_end = 0.02
+    
     for i in range(egnn_steps):
-        params, opt_state, loss_val, U_pred = train_step(params, opt_state)
+        # Exponentially decay sigma over the training run
+        current_sigma = sigma_start * (sigma_end / sigma_start) ** (i / egnn_steps)
+        
+        params, opt_state, loss_val, U_pred = train_step(params, opt_state, current_sigma)
         
         if loss_val < best_loss:
             best_loss = loss_val
             best_U = np.array(U_pred)
             
         if (i + 1) % 50 == 0:
-            print(f"    Step {i+1:03d}/{egnn_steps} | Mean Fractional Error: {loss_val:.4f}")
+            print(f"    Step {i+1:03d}/{egnn_steps} | Sigma: {current_sigma:.4f} | Fractional Loss: {loss_val:.4f}")
 
     U_davenport = best_U
-    print(f"  > Macroscopic U-Matrix successfully extracted (Final Distance: {best_loss:.4f}).")
+    print(f"  > Macroscopic U-Matrix successfully extracted (Final Gaussian Loss: {best_loss:.4f}).")
 
     # ==========================================
     # PHASE 4: CONTINUOUS VORONOI POLISH
