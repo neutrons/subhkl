@@ -1583,7 +1583,7 @@ def run_egnn(
     # A fractional error of 0.15 represents an excellent topological fit 
     # roughly equivalent to a tight reciprocal angular tolerance.
     true_hits = np.sum(best_dist < 0.15)
-    print(f"  > Final Matrix correctly indexed {true_hits}/{len(e_nodes)} Bragg peaks (Fractional Tol = 0.15).")
+    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs_norm)} Bragg peaks (Fractional Tol = 0.15).")
 
     print(f"\nSaving final U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
