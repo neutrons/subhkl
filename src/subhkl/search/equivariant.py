@@ -45,6 +45,12 @@ class E3NN_Indexer(nn.Module):
 
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple, intensities: jnp.ndarray):
+        
+        # ==========================================
+        # THE FIX: Save the original raw 3D vectors before the graph overwrites them
+        # ==========================================
+        original_q = graph.nodes 
+
         # 1. Lift spatial coordinates into Spherical Harmonics
         node_vecs = e3nn.IrrepsArray("1o", graph.nodes)
         edge_vecs = e3nn.IrrepsArray("1o", graph.edges)
@@ -53,19 +59,15 @@ class E3NN_Indexer(nn.Module):
         edge_sh = e3nn.spherical_harmonics("0e + 1o + 2e", edge_vecs, normalize=True)
         
         h_init = e3nn.IrrepsArray("1x0e", intensities[:, None])
-        
-        # FIX 1: Use e3nn.flax.Linear
         nodes = e3nn.flax.Linear(self.hidden_irreps)(e3nn.tensor_product(h_init, node_sh))
 
         # 2. Define the e3nn Message Passing Layer
         def update_edge_fn(edges, senders, receivers, globals_):
             tp = e3nn.tensor_product(senders, edge_sh)
-            # FIX 2: Use e3nn.flax.Linear
             return e3nn.flax.Linear(self.hidden_irreps)(tp)
 
         def update_node_fn(nodes, senders, receivers, globals_):
             tp = e3nn.tensor_product(nodes, receivers)
-            # FIX 3: Use e3nn.flax.Linear
             return e3nn.flax.Linear(self.hidden_irreps)(tp)
 
         # 3. Execute Graph Network
@@ -80,12 +82,14 @@ class E3NN_Indexer(nn.Module):
             nodes = graph.nodes
 
         # 4. Invariant Readout (0e)
-        # FIX 4: Use e3nn.flax.Linear
         invariant_scalars = e3nn.flax.Linear("1x0e")(nodes).array
         weights = jax.nn.softplus(invariant_scalars) + 1e-4
 
         # 5. Manifest Covariance Extraction
-        x = graph.nodes 
+        # ==========================================
+        # THE FIX: Use the original 3D Laue rays for the Outer Product
+        # ==========================================
+        x = original_q 
         
         M = jnp.dot(x.T, x * weights)
         M = M + jnp.diag(jnp.array([1e-5, 2e-5, 3e-5])) 
