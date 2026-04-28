@@ -14,7 +14,7 @@ from subhkl.commands import (
     run_mtz_exporter,
     run_reduce,
     run_merge_images,
-    run_sparse_hough,
+    run_egnn,
 )
 
 
@@ -604,8 +604,6 @@ def cmd_egnn(
     Extracts the initial UB matrix using the Sparse Spherical Hough Transform and
     Topological Hessian Filtering.
     """
-    from subhkl.commands import run_egnn
-
     run_egnn(
         finder_file=finder_file,
         output_h5_filename=output_h5_filename,
