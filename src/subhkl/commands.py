@@ -1561,28 +1561,25 @@ def run_sparse_hough(
         return params, opt_state, loss, U_pred
 
     print(f"\n[3/4] Training EGNN via Gaussian Annealing (N={len(e_nodes)} peaks)...")
-    best_loss = jnp.inf
-    best_U = np.eye(3)
     
-    # Annealing Schedule Bounds
     sigma_start = 0.50
     sigma_end = 0.02
     
     for i in range(egnn_steps):
-        # Exponentially decay sigma over the training run
         current_sigma = sigma_start * (sigma_end / sigma_start) ** (i / egnn_steps)
-        
         params, opt_state, loss_val, U_pred = train_step(params, opt_state, current_sigma)
-        
-        if loss_val < best_loss:
-            best_loss = loss_val
-            best_U = np.array(U_pred)
             
         if (i + 1) % 50 == 0:
-            print(f"    Step {i+1:03d}/{egnn_steps} | Sigma: {current_sigma:.4f} | Fractional Loss: {loss_val:.4f}")
+            # Let's print the actual fractional distance for our own sanity!
+            # Since Loss = 1 - exp(-d^2 / 2s^2), we can back-calculate d:
+            # d = sqrt(-2 * s^2 * ln(1 - Loss))
+            safe_loss = jnp.clip(loss_val, 0.0, 0.9999)
+            true_dist = jnp.sqrt(-2.0 * current_sigma**2 * jnp.log(1.0 - safe_loss))
+            print(f"    Step {i+1:03d}/{egnn_steps} | Sigma: {current_sigma:.4f} | Fractional Error: {true_dist:.4f}")
 
-    U_davenport = best_U
-    print(f"  > Macroscopic U-Matrix successfully extracted (Final Gaussian Loss: {best_loss:.4f}).")
+    # Always use the matrix from the final microscopic polishing step
+    U_davenport = np.array(U_pred)
+    print(f"  > Macroscopic U-Matrix successfully extracted via Annealing.")
 
     # ==========================================
     # PHASE 4: CONTINUOUS VORONOI POLISH
