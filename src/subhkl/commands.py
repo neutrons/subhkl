@@ -1380,23 +1380,14 @@ class RunPeaks:
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-def run_sparse_hough(
+def run_egnn(
     finder_file: str,
     output_h5_filename: str,
     instrument_name: str | None = None,
     original_nexus_filename: str | None = None,
-    tolerance_deg: float = 0.1,
-    angle_tol_hyp: float = 1.5,
-    angle_tol_cons: float = 0.4,
-    max_axes: int = 15,
-    max_hkl_hyp: int = 3,
-    max_hkl_cons: int = 6,
-    steps: int = 300,
+    steps: int = 3000,  # Now drives the EGNN Annealing steps
     create_visualizations: bool = False,
-    # Kept for signature compatibility, though unused internally now
-    sparse_rbf_alpha: float = 0.1, sparse_rbf_gamma: float = 2.0, sparse_rbf_loss: str = "gaussian",
-    sparse_rbf_min_sigma: float = 1.0, sparse_rbf_max_sigma: float = 5.0,
-    sparse_rbf_auto_tune_alpha: bool = True, sparse_rbf_candidate_alphas: str = "0.05, 0.1, 0.2",
+    egnn_sigma_end: float = 0.005,
 ):
     from subhkl.optimization import FindUB
     from subhkl.config import beamlines
@@ -1560,76 +1551,125 @@ def run_sparse_hough(
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss, U_pred
 
-    print(f"\n[3/4] Training EGNN via Gaussian Annealing (N={len(e_nodes)} peaks)...")
+    # ==========================================
+    # PHASE 3: EGNN WITH GAUSSIAN ANNEALING
+    # ==========================================
+    print(f"\n[3/3] Training EGNN via Gaussian Annealing (N={len(e_nodes)} peaks)...")
+    from subhkl.optimization import get_lattice_system
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from subhkl.search.equivariant import EquivariantIndexer
+
+    e_nodes = jnp.array(q_sample_obs_norm)
+    e_weights = jnp.array(normalized_weights)
+
+    _, _, centering = get_lattice_system(
+        ub_helper.a, ub_helper.b, ub_helper.c, 
+        ub_helper.alpha, ub_helper.beta, ub_helper.gamma, 
+        ub_helper.space_group
+    )
     
+    if centering == "I": M_prim = jnp.array([[0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
+    elif centering == "F": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5]])
+    elif centering == "C": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.0, 1.0]])
+    elif centering == "A": M_prim = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.0, 0.5, -0.5]])
+    elif centering == "B": M_prim = jnp.array([[0.5, 0.0, 0.5], [0.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
+    elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
+    else: M_prim = jnp.eye(3)
+
+    wavelengths = np.array(ub_helper.wavelength)
+    wl_min, wl_max = wavelengths[0], wavelengths[1]
+    num_candidates = 64
+    lam_grid = jnp.logspace(jnp.log10(wl_min), jnp.log10(wl_max), num_candidates)
+    
+    B_inv = jnp.linalg.inv(B_mat)
+    q_sample_unnorm = jnp.array(q_sample_obs).T
+
+    model = EquivariantIndexer(hidden_dim=64, num_layers=3, k_neighbors=20)
+    rng = jax.random.PRNGKey(42)
+    params = model.init(rng, e_nodes, e_weights)
+    
+    # Map the CLI 'steps' argument to the EGNN
+    egnn_steps = steps 
+    schedule = optax.cosine_decay_schedule(init_value=0.01, decay_steps=egnn_steps)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=schedule)
+    )
+    opt_state = optimizer.init(params)
+
+    @jax.jit
+    def loss_fn(params, sigma):
+        U_pred = model.apply(params, e_nodes, e_weights)
+        UB_inv = jnp.matmul(B_inv, U_pred.T)
+        v = jnp.matmul(UB_inv, q_sample_unnorm)
+        
+        hkl_float = v[None, :, :] / lam_grid[:, None, None]
+        h, k, l = hkl_float[:, 0, :], hkl_float[:, 1, :], hkl_float[:, 2, :]
+        
+        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
+        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
+        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
+        
+        dh = h_p - jnp.round(h_p)
+        dk = k_p - jnp.round(k_p)
+        dl = l_p - jnp.round(l_p)
+        dist_sq = dh**2 + dk**2 + dl**2
+        
+        gaussian_loss = 1.0 - jnp.exp(-dist_sq / (2.0 * sigma**2))
+        min_loss = jnp.min(gaussian_loss, axis=0)
+        
+        loss = jnp.sum(min_loss * e_weights) / jnp.sum(e_weights)
+        return loss, U_pred
+
+    @jax.jit
+    def train_step(params, opt_state, sigma):
+        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, sigma)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss, U_pred
+
     sigma_start = 0.50
-    sigma_end = 0.02
+    sigma_end = egnn_sigma_end
     
     for i in range(egnn_steps):
         current_sigma = sigma_start * (sigma_end / sigma_start) ** (i / egnn_steps)
         params, opt_state, loss_val, U_pred = train_step(params, opt_state, current_sigma)
             
-        if (i + 1) % 50 == 0:
-            # Let's print the actual fractional distance for our own sanity!
-            # Since Loss = 1 - exp(-d^2 / 2s^2), we can back-calculate d:
-            # d = sqrt(-2 * s^2 * ln(1 - Loss))
+        if (i + 1) % max(1, egnn_steps // 20) == 0 or i == egnn_steps - 1:
             safe_loss = jnp.clip(loss_val, 0.0, 0.9999)
             true_dist = jnp.sqrt(-2.0 * current_sigma**2 * jnp.log(1.0 - safe_loss))
-            print(f"    Step {i+1:03d}/{egnn_steps} | Sigma: {current_sigma:.4f} | Fractional Error: {true_dist:.4f}")
+            print(f"    Step {i+1:05d}/{egnn_steps} | Sigma: {current_sigma:.4f} | Fractional Error: {true_dist:.4f}")
 
-    # Always use the matrix from the final microscopic polishing step
-    U_davenport = np.array(U_pred)
-    print(f"  > Macroscopic U-Matrix successfully extracted via Annealing.")
+    U_final = np.array(U_pred)
+    print("  > Macroscopic U-Matrix successfully extracted via Annealing.")
 
     # ==========================================
-    # PHASE 4: CONTINUOUS VORONOI POLISH
+    # FINAL VALIDATION (Replaces Phase 4)
     # ==========================================
-    print("\n[4/4] Continuous Voronoi Polish (Gradient Descent)")
-    from scipy.spatial.transform import Rotation
-    from subhkl.search.davenport import optimize_orientation_gradient_descent
+    # Validate the final matrix natively using the continuous fractional distance
+    # This correctly catches high-order peaks that were ignored by max_hkl bounds
+    UB_inv_final = np.linalg.inv(B_mat) @ U_final.T
+    v_final = UB_inv_final @ np.array(q_sample_unnorm)
+    hkl_float_final = v_final[np.newaxis, :, :] / np.array(lam_grid)[:, np.newaxis, np.newaxis]
+    
+    h_f, k_f, l_f = hkl_float_final[:, 0, :], hkl_float_final[:, 1, :], hkl_float_final[:, 2, :]
+    M_prim_np = np.array(M_prim)
+    
+    h_p_f = M_prim_np[0, 0]*h_f + M_prim_np[0, 1]*k_f + M_prim_np[0, 2]*l_f
+    k_p_f = M_prim_np[1, 0]*h_f + M_prim_np[1, 1]*k_f + M_prim_np[1, 2]*l_f
+    l_p_f = M_prim_np[2, 0]*h_f + M_prim_np[2, 1]*k_f + M_prim_np[2, 2]*l_f
+    
+    dist_final = np.sqrt((h_p_f - np.round(h_p_f))**2 + (k_p_f - np.round(k_p_f))**2 + (l_p_f - np.round(l_p_f))**2)
+    best_dist = np.min(dist_final, axis=0)
+    
+    # A fractional error of 0.15 represents an excellent topological fit 
+    # roughly equivalent to a tight reciprocal angular tolerance.
+    true_hits = np.sum(best_dist < 0.15)
+    print(f"  > Final Matrix correctly indexed {true_hits}/{len(e_nodes)} Bragg peaks (Fractional Tol = 0.15).")
 
-    q_seed = Rotation.from_matrix(U_davenport).as_quat()
-    q_seed_jax = jnp.array([q_seed[3], q_seed[0], q_seed[1], q_seed[2]])
-
-    hkl_polish =  8
-    print(f"  > Generating Dense Polishing Dictionary (max_hkl={hkl_polish})...")
-    hc_vals = np.arange(-hkl_polish, hkl_polish + 1)
-    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T
-
-    r_theo_rays_polish = (B_mat @ theo_hkl_c.T).T
-    r_rays_norm_polish = r_theo_rays_polish / np.linalg.norm(r_theo_rays_polish, axis=1, keepdims=True)
-    _, unique_idx = np.unique(np.round(r_rays_norm_polish, 4), axis=0, return_index=True)
-    r_polish_rays_norm = r_rays_norm_polish[unique_idx]
-
-    r_lab_dav = U_davenport @ r_polish_rays_norm.T
-    dots_dav = q_sample_obs_norm @ r_lab_dav
-    max_dots_dav = np.max(np.clip(dots_dav, -1.0, 1.0), axis=1)
-    angles_dav = np.rad2deg(np.arccos(max_dots_dav))
-
-    inlier_mask = angles_dav < 2.0
-    q_obs_clean = q_sample_obs_norm[inlier_mask]
-
-    print(f"  > EGNN captured {len(q_obs_clean)} raw peaks in its gravity well. Polishing...")
-
-    U_final = optimize_orientation_gradient_descent(
-        q_seed_jax,
-        jnp.array(q_obs_clean),
-        jnp.array(r_polish_rays_norm),
-        steps=steps
-    )
-
-    r_lab = U_final @ r_polish_rays_norm.T
-    dots = q_sample_obs_norm @ r_lab
-    max_dots = np.max(np.clip(dots, -1.0, 1.0), axis=1)
-    angles = np.rad2deg(np.arccos(max_dots))
-    true_hits = np.sum(angles < 0.4)
-
-    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs_norm)} Laue rays (Tol = 0.4 deg).")
-
-    print(f"\nSaving initial U-matrix and experimental geometry to: {output_h5_filename}")
+    print(f"\nSaving final U-matrix and experimental geometry to: {output_h5_filename}")
     with h5py.File(output_h5_filename, "w") as f:
         with h5py.File(finder_file, "r") as f_in:
             for key in ["sample/a", "sample/b", "sample/c", "sample/alpha", "sample/beta", "sample/gamma",
@@ -1639,7 +1679,7 @@ def run_sparse_hough(
                 if key in f_in:
                     f.create_dataset(key, data=f_in[key][()])
         f.create_dataset("peaks/xyz", data=xyz_out)
-        f.create_dataset("sample/U", data=U_final)
+        f.create_dataset("sample/U", data=U_final) 
         f.create_dataset("sample/B", data=B_mat)
 
     print("Export complete.")

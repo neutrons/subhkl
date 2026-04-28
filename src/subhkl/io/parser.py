@@ -576,8 +576,8 @@ def merge_images(
         print(str(e))
         raise typer.Exit(code=1)
 
-@app.command("sparse-hough")
-def sparse_hough_cmd(
+@app.command("egnn")
+def cmd_egnn(
     finder_file: str = typer.Argument(
         ..., help="Path to the output peaks HDF5 file from the finder."
     ),
@@ -590,78 +590,29 @@ def sparse_hough_cmd(
     nexus: str = typer.Option(
         None, "--nexus", help="Path to the original Nexus file for geometry reconstruction."
     ),
-    tolerance_deg: float = typer.Option(
-        0.1, help="Angular tolerance in Hough transform (deg)."
-    ),
-    angle_tol_hyp: float = typer.Option(
-        1.5, help="Tolerance for internal angle matching of Virtual Hubs (deg)."
-    ),
-    angle_tol_cons: float = typer.Option(
-        0.4, help="Strict capture tolerance for final Bragg peak validation (deg)."
-    ),
-    max_axes: int = typer.Option(
-        15, help="Maximum number of dense Laue cones to extract."
-    ),
-    max_hkl_hyp: int = typer.Option(
-        2, help="Max HKL for generating the Virtual Node hypothesis dictionary."
-    ),
-    max_hkl_cons: int = typer.Option(
-        5, help="Max HKL for the Global Peak Consensus validation dictionary."
-    ),
     steps: int = typer.Option(
         300, help="Maximum number of steps for the optimization",
     ),
     create_visualizations: bool = typer.Option(
         False, "--create-visualizations", help="Generate unrolled detector plots."
     ),
-    sparse_rbf_alpha: float = typer.Option(
-        0.1, help="Base alpha threshold for the Sparse RBF solver on the Hessian grid."
-    ),
-    sparse_rbf_gamma: float = typer.Option(
-        2.0, help="Besov space width penalty (gamma) for scale restriction."
-    ),
-    sparse_rbf_loss: str = typer.Option(
-        "gaussian", help="Loss function for the RBF solver (should be gaussian for Hessian hubs)."
-    ),
-    sparse_rbf_min_sigma: float = typer.Option(
-        1.0, help="Minimum spatial scale for 0D hub extraction."
-    ),
-    sparse_rbf_max_sigma: float = typer.Option(
-        5.0, help="Maximum spatial scale for 0D hub extraction."
-    ),
-    sparse_rbf_auto_tune_alpha: bool = typer.Option(
-        True, help="Enable auto-tuning for the alpha parameter."
-    ),
-    sparse_rbf_candidate_alphas: str = typer.Option(
-        "0.05, 0.1, 0.2", help="Comma-separated candidate alphas for tuning."
-    ),
+    egnn_sigma_end: float = typer.Option(
+        0.005, help="Target hkl deviation from integer",
+    )
 ):
     """
     Extracts the initial UB matrix using the Sparse Spherical Hough Transform and
     Topological Hessian Filtering.
     """
-    from subhkl.commands import run_sparse_hough
+    from subhkl.commands import run_egnn
 
-    run_sparse_hough(
+    run_egnn(
         finder_file=finder_file,
         output_h5_filename=output_h5_filename,
         instrument_name=instrument,
         original_nexus_filename=nexus,
-        tolerance_deg=tolerance_deg,
-        angle_tol_hyp=angle_tol_hyp,
-        angle_tol_cons=angle_tol_cons,
-        max_axes=max_axes,
-        max_hkl_hyp=max_hkl_hyp,
-        max_hkl_cons=max_hkl_cons,
         steps=steps,
         create_visualizations=create_visualizations,
-        sparse_rbf_alpha=sparse_rbf_alpha,
-        sparse_rbf_gamma=sparse_rbf_gamma,
-        sparse_rbf_loss=sparse_rbf_loss,
-        sparse_rbf_min_sigma=sparse_rbf_min_sigma,
-        sparse_rbf_max_sigma=sparse_rbf_max_sigma,
-        sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
-        sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
     )
 
 if __name__ == "__main__":
