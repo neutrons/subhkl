@@ -1571,7 +1571,21 @@ def run_egnn(
     lam_grid = np.logspace(np.log10(wavelengths[0]), np.log10(wavelengths[1]), 64)
     hkl_float_final = v_final[np.newaxis, :, :] / lam_grid[:, np.newaxis, np.newaxis]
     
-    # ... (M_prim transformations remain the same) ...
+    # Setup the Primitive Matrix (M_prim) based on Space Group
+    _, _, centering = get_lattice_system(
+        ub_helper.a, ub_helper.b, ub_helper.c,
+        ub_helper.alpha, ub_helper.beta, ub_helper.gamma,
+        ub_helper.space_group
+    )
+
+    if centering == "I": M_prim = jnp.array([[0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
+    elif centering == "F": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5]])
+    elif centering == "C": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.0, 1.0]])
+    elif centering == "A": M_prim = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.0, 0.5, -0.5]])
+    elif centering == "B": M_prim = jnp.array([[0.5, 0.0, 0.5], [0.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
+    elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
+    else: M_prim = jnp.eye(3)
+
     h_f, k_f, l_f = hkl_float_final[:, 0, :], hkl_float_final[:, 1, :], hkl_float_final[:, 2, :]
     M_prim_np = np.array(M_prim) # Assumes M_prim was defined earlier in your script
     
