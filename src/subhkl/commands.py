@@ -1420,6 +1420,7 @@ def run_sparse_hough(
 
         sg = f["sample/space_group"]
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
+        ub_helper.wavelength = f["instrument/wavelength"]
 
         pixel_r = f["peaks/pixel_r"][()]
         pixel_c = f["peaks/pixel_c"][()]
