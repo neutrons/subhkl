@@ -1480,16 +1480,20 @@ def run_egnn(
     graph = build_laue_graph(q_sample_obs_norm, k_neighbors=20)
     intensities = jnp.array(normalized_weights)
     
-    # 2. Generate Theoretical Zone Axes (The Sinkhorn Target Distribution)
-    print(f"  > Generating Theoretical Target Distribution (max_uvw={max_hkl_cons})...")
+    # 2. Generate Theoretical Target Distribution (The Sinkhorn Target Distribution)
+    print(f"  > Generating Theoretical Reciprocal Targets (max_hkl={max_hkl_cons})...")
     hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
     hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-    uvw_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    mask_uvw_c = ~((uvw_c[0] == 0) & (uvw_c[1] == 0) & (uvw_c[2] == 0))
-    theo_uvw_c = uvw_c[:, mask_uvw_c].astype(np.float32).T 
+    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    
+    # Remove the (0,0,0) origin
+    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
 
-    A_mat = np.linalg.inv(B_mat).T
-    r_theo_zones = (A_mat @ theo_uvw_c.T).T
+    # Use B_mat to generate Reciprocal Space Momentum Vectors (q_theo)
+    r_theo_zones = (B_mat @ theo_hkl_c.T).T
+    
+    # Normalize to project onto the SO(3) unit sphere
     r_unique_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
     theoretical_zones = jnp.array(r_unique_zones_norm)
 
