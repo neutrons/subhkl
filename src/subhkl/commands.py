@@ -1466,24 +1466,119 @@ def run_sparse_hough(
         normalized_weights = np.ones_like(log_weights)
 
     # ==========================================
-    # PHASE 2: DIRECT DICTIONARY GENERATION
+    # PHASE 2 & 3: SE(3) EGNN WITH LAUE SIN^2 LOSS
     # ==========================================
-    print("\n[2/4] Generating Theoretical Reciprocal Dictionary")
+    print("\n[2/4] Initializing SE(3) EGNN for Direct Fractional Indexing")
+    from subhkl.optimization import get_lattice_system
     import jax
     import jax.numpy as jnp
+    import optax
+    from subhkl.search.equivariant import EquivariantIndexer
 
-    # We now evaluate against theoretical HKL (Reciprocal Space) instead of UVW
-    print(f"  > Expanding HKL permutations (max_hkl={max_hkl_cons})...")
-    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
-    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T
+    # EGNN Input: Normalized Directions (Equivariance stability)
+    e_nodes = jnp.array(q_sample_obs_norm)
+    e_weights = jnp.array(normalized_weights)
 
-    # q = B * h
-    r_theo_rays = (B_mat @ theo_hkl_c.T).T
-    r_unique_rays_norm = jnp.array(r_theo_rays / np.linalg.norm(r_theo_rays, axis=1, keepdims=True))
-    print(f"  > Generated {len(r_unique_rays_norm)} theoretical Bragg vectors for alignment.")
+    # 1. Setup the Primitive Matrix (M_prim) based on Space Group
+    _, _, centering = get_lattice_system(
+        ub_helper.a, ub_helper.b, ub_helper.c, 
+        ub_helper.alpha, ub_helper.beta, ub_helper.gamma, 
+        ub_helper.space_group
+    )
+    
+    if centering == "I": M_prim = jnp.array([[0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
+    elif centering == "F": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5]])
+    elif centering == "C": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.0, 1.0]])
+    elif centering == "A": M_prim = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.0, 0.5, -0.5]])
+    elif centering == "B": M_prim = jnp.array([[0.5, 0.0, 0.5], [0.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
+    elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
+    else: M_prim = jnp.eye(3)
+
+    # 2. Setup Continuous Wavelength Search Grid
+    wavelengths = np.array(ub_helper.wavelength)
+    wl_min, wl_max = wavelengths[0], wavelengths[1]
+    num_candidates = 64
+    lam_grid = jnp.logspace(jnp.log10(wl_min), jnp.log10(wl_max), num_candidates)
+    
+    # 3. Pre-compute Constants
+    B_inv = jnp.linalg.inv(B_mat)
+    # Loss Function Input: True Physical Momentum Vectors (Un-normalized)
+    q_sample_unnorm = jnp.array(q_sample_obs).T  # Shape: (3, N)
+
+    print("  > Initializing EGNN architecture (k-NN) and Adam optimizer...")
+    model = EquivariantIndexer(hidden_dim=64, num_layers=3, k_neighbors=20)
+    rng = jax.random.PRNGKey(42)
+    params = model.init(rng, e_nodes, e_weights)
+    
+    egnn_steps = 300
+    schedule = optax.cosine_decay_schedule(init_value=0.01, decay_steps=egnn_steps)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=schedule)
+    )
+    opt_state = optimizer.init(params)
+
+    @jax.jit
+    def loss_fn(params):
+        U_pred = model.apply(params, e_nodes, e_weights)
+        
+        # U_pred is a rotation matrix, so U^T = U^-1
+        # UB_inv = B^-1 * U^T
+        UB_inv = jnp.matmul(B_inv, U_pred.T)
+        
+        # Map physical momentum transfer directly to fractional HKL space
+        # v shape: (3, N)
+        v = jnp.matmul(UB_inv, q_sample_unnorm)
+        
+        # Scale by lambda grid. hkl_float shape: (64, 3, N)
+        hkl_float = v[None, :, :] / lam_grid[:, None, None]
+        
+        h = hkl_float[:, 0, :]
+        k = hkl_float[:, 1, :]
+        l = hkl_float[:, 2, :]
+        
+        # Transform to primitive cell
+        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
+        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
+        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
+        
+        # Continuous fractional sin^2 loss
+        dh = jnp.sin(jnp.pi * h_p)
+        dk = jnp.sin(jnp.pi * k_p)
+        dl = jnp.sin(jnp.pi * l_p)
+        dist = jnp.sqrt(dh**2 + dk**2 + dl**2) / jnp.pi
+        
+        # Find the lambda that perfectly hits an integer HKL node -> min distance
+        min_dist = jnp.min(dist, axis=0)
+        
+        # Minimize the weighted mean distance across all peaks
+        loss = jnp.sum(min_dist * e_weights) / jnp.sum(e_weights)
+        
+        return loss, U_pred
+
+    @jax.jit
+    def train_step(params, opt_state):
+        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, loss, U_pred
+
+    print(f"\n[3/4] Training EGNN via Continuous Fractional Loss (N={len(e_nodes)} peaks)...")
+    best_loss = jnp.inf
+    best_U = np.eye(3)
+    
+    for i in range(egnn_steps):
+        params, opt_state, loss_val, U_pred = train_step(params, opt_state)
+        
+        if loss_val < best_loss:
+            best_loss = loss_val
+            best_U = np.array(U_pred)
+            
+        if (i + 1) % 50 == 0:
+            print(f"    Step {i+1:03d}/{egnn_steps} | Mean Fractional Error: {loss_val:.4f}")
+
+    U_davenport = best_U
+    print(f"  > Macroscopic U-Matrix successfully extracted (Final Distance: {best_loss:.4f}).")
 
     # ==========================================
     # PHASE 3: EQUIVARIANT MACHINE LEARNING SEARCH
