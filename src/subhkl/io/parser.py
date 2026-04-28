@@ -598,7 +598,7 @@ def cmd_egnn(
     ),
     egnn_sigma_end: float = typer.Option(
         0.005, help="Target hkl deviation from integer",
-    )
+    ),
     max_hkl_cons: int = typer.Option(
         2, help="Maximum hkl",
     ),
