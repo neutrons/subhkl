@@ -599,6 +599,9 @@ def cmd_egnn(
     egnn_sigma_end: float = typer.Option(
         0.005, help="Target hkl deviation from integer",
     )
+    max_hkl_cons: int = typer.Option(
+        2, help="Maximum hkl",
+    ),
 ):
     """
     Extracts the initial UB matrix using the Sparse Spherical Hough Transform and
@@ -610,6 +613,7 @@ def cmd_egnn(
         instrument_name=instrument,
         original_nexus_filename=nexus,
         steps=steps,
+        max_hkl_cons=max_hkl_cons,
         egnn_sigma_end=egnn_sigma_end,
         create_visualizations=create_visualizations,
     )

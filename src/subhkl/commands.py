@@ -1388,6 +1388,7 @@ def run_egnn(
     steps: int = 3000,  # Now drives the EGNN Annealing steps
     create_visualizations: bool = False,
     egnn_sigma_end: float = 0.005,
+    max_hkl_cons: int = 2,
 ):
     from subhkl.optimization import FindUB
     from subhkl.config import beamlines
