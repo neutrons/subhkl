@@ -1418,7 +1418,7 @@ def run_sparse_hough(
         ub_helper.sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
         ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
 
-        sg = data["sample/space_group"]
+        sg = f["sample/space_group"]
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
 
         pixel_r = f["peaks/pixel_r"][()]
