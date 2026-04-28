@@ -6,29 +6,19 @@ import jraph
 import e3nn_jax as e3nn
 
 def build_laue_graph(q_vectors_norm, k_neighbors=20):
-    """
-    Constructs a strict SO(3) k-NN graph. 
-    Crucially, edge features are the absolute positions of the sender nodes,
-    locking the entire graph physically to the Ewald sphere origin.
-    """
+    # (Remains exactly the same as before)
     N = q_vectors_norm.shape[0]
-    
-    # 1. Compute distances for k-NN
     x_np = np.array(q_vectors_norm)
     diff = x_np[:, None, :] - x_np[None, :, :]
     dist = np.sum(diff**2, axis=-1)
-    
-    # 2. Extract k-nearest neighbors
     k = min(k_neighbors, N - 1)
     idx = np.argsort(dist, axis=1)[:, 1:k+1] 
-    
     senders = np.repeat(np.arange(N), k)
     receivers = idx.flatten()
     
-    # 3. Build pristine jraph object
     return jraph.GraphsTuple(
-        nodes=jnp.array(q_vectors_norm),           # (N, 3) 
-        edges=jnp.array(q_vectors_norm[senders]),  # (E, 3) Absolute sender positions
+        nodes=jnp.array(q_vectors_norm),           
+        edges=jnp.array(q_vectors_norm[senders]),  
         receivers=jnp.array(receivers),
         senders=jnp.array(senders),
         n_node=jnp.array([N]),
@@ -36,22 +26,14 @@ def build_laue_graph(q_vectors_norm, k_neighbors=20):
         globals=None
     )
 
-
-
 class E3NN_Indexer(nn.Module):
-    # The hidden state lives in an abstract space of Scalars (0e), Vectors (1o), and Tensors (2e)
+    # We still use a mix of scalars, vectors, and tensors in the hidden layers
     hidden_irreps: e3nn.Irreps = e3nn.Irreps("16x0e + 16x1o + 16x2e")
     num_layers: int = 3
 
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple, intensities: jnp.ndarray):
-        
-        # ==========================================
-        # THE FIX: Save the original raw 3D vectors before the graph overwrites them
-        # ==========================================
-        original_q = graph.nodes 
-
-        # 1. Lift spatial coordinates into Spherical Harmonics
+        # 1. Lift spatial coordinates
         node_vecs = e3nn.IrrepsArray("1o", graph.nodes)
         edge_vecs = e3nn.IrrepsArray("1o", graph.edges)
         
@@ -61,7 +43,7 @@ class E3NN_Indexer(nn.Module):
         h_init = e3nn.IrrepsArray("1x0e", intensities[:, None])
         nodes = e3nn.flax.Linear(self.hidden_irreps)(e3nn.tensor_product(h_init, node_sh))
 
-        # 2. Define the e3nn Message Passing Layer
+        # 2. Message Passing
         def update_edge_fn(edges, senders, receivers, globals_):
             tp = e3nn.tensor_product(senders, edge_sh)
             return e3nn.flax.Linear(self.hidden_irreps)(tp)
@@ -70,7 +52,6 @@ class E3NN_Indexer(nn.Module):
             tp = e3nn.tensor_product(nodes, receivers)
             return e3nn.flax.Linear(self.hidden_irreps)(tp)
 
-        # 3. Execute Graph Network
         gn = jraph.GraphNetwork(
             update_edge_fn=update_edge_fn,
             update_node_fn=update_node_fn
@@ -81,22 +62,25 @@ class E3NN_Indexer(nn.Module):
             graph = gn(graph)
             nodes = graph.nodes
 
-        # 4. Invariant Readout (0e)
-        invariant_scalars = e3nn.flax.Linear("1x0e")(nodes).array
-        weights = jax.nn.softplus(invariant_scalars) + 1e-4
+        # ==========================================
+        # THE FIX: Direct Equivariant Frame Regression
+        # ==========================================
+        # Instead of 1x0e scalars for SVD, we ask the network to output two 3D vectors!
+        # Because of e3nn math, these vectors will rotate perfectly with the input graph.
+        node_vectors = e3nn.flax.Linear("2x1o")(nodes).array  # Shape: (N, 2, 3)
 
-        # 5. Manifest Covariance Extraction
-        # ==========================================
-        # THE FIX: Use the original 3D Laue rays for the Outer Product
-        # ==========================================
-        x = original_q 
+        # Global Average Pooling: The whole crystal votes on the lattice orientation
+        global_vectors = jnp.mean(node_vectors, axis=0)       # Shape: (2, 3)
         
-        M = jnp.dot(x.T, x * weights)
-        M = M + jnp.diag(jnp.array([1e-5, 2e-5, 3e-5])) 
-        
-        U, S, Vh = jnp.linalg.svd(M)
-        
-        det = jnp.linalg.det(U)
-        U_pred = jnp.where(det < 0, U.at[:, 2].multiply(-1), U)
+        v1 = global_vectors[0]
+        v2 = global_vectors[1]
+
+        # Gram-Schmidt Orthogonalization to guarantee a rigid 3x3 SO(3) matrix
+        b1 = v1 / (jnp.linalg.norm(v1) + 1e-6)
+        b2 = v2 - jnp.dot(b1, v2) * b1
+        b2 = b2 / (jnp.linalg.norm(b2) + 1e-6)
+        b3 = jnp.cross(b1, b2)
+
+        U_pred = jnp.stack([b1, b2, b3], axis=-1)
         
         return U_pred
