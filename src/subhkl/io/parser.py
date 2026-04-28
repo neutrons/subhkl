@@ -610,6 +610,7 @@ def cmd_egnn(
         instrument_name=instrument,
         original_nexus_filename=nexus,
         steps=steps,
+        egnn_sigma_end=egnn_sigma_end,
         create_visualizations=create_visualizations,
     )
 
