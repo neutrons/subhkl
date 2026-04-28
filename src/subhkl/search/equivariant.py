@@ -3,10 +3,6 @@ import jax.numpy as jnp
 import flax.linen as nn
 import numpy as np
 
-# FIX 1: Bump eps to 1e-5 to survive float32 underflow
-def safe_norm(x, axis=None, keepdims=False, eps=1e-5):
-    return jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=keepdims) + eps)
-
 class EGNNLayer(nn.Module):
     hidden_dim: int
 
@@ -27,7 +23,11 @@ class EGNNLayer(nn.Module):
         coord_update = x_diff * coord_weight
         
         x_new = x + jax.ops.segment_sum(coord_update, receivers, x.shape[0])
-        x_new = x_new / safe_norm(x_new, axis=-1, keepdims=True)
+        
+        # STRICT SPHERICAL PROJECTION: Prevent points from shrinking
+        x_new = x_new + jnp.array([1e-6, 0.0, 0.0]) # Micro-drift prevents dead zero
+        x_norms = jnp.sqrt(jnp.maximum(jnp.sum(x_new**2, axis=-1, keepdims=True), 1e-12))
+        x_new = x_new / x_norms
 
         m_i = jax.ops.segment_sum(m_ij, receivers, h.shape[0])
         h_input = jnp.concatenate([h, m_i], axis=-1)
@@ -64,21 +64,27 @@ class EquivariantIndexer(nn.Module):
         for _ in range(self.num_layers):
             x, h = EGNNLayer(self.hidden_dim)(x, h, edge_indices)
 
-        # ---------------------------------------------------------
-        # FIX 2: Attention-Based Equivariant Pooling
-        # ---------------------------------------------------------
-        # Predict a distinct weight for every single node (shape: N, 2)
         node_weights = nn.Dense(2)(h) 
         
-        # Sum the vectors using their INDIVIDUAL attention weights
         v1 = jnp.sum(x * node_weights[:, 0:1], axis=0)
         v2 = jnp.sum(x * node_weights[:, 1:2], axis=0)
         
-        # Safely execute Gram-Schmidt Orthogonalization
-        v1 = v1 / safe_norm(v1)
-        v2 = v2 - jnp.dot(v1, v2) * v1
-        v2 = v2 / safe_norm(v2)
-        v3 = jnp.cross(v1, v2)
+        # ==========================================
+        # THE FIX: Prevent Trivial Zero Collapse
+        # ==========================================
+        # Inject an orthogonal seed. If the network outputs 0, U becomes Identity.
+        v1 = v1 + jnp.array([1e-6, 0.0, 0.0])
+        v2 = v2 + jnp.array([0.0, 1e-6, 0.0])
         
-        U_pred = jnp.stack([v1, v2, v3], axis=1)
+        # Strict Gram-Schmidt with hard minimum bounds
+        v1_norm = jnp.sqrt(jnp.maximum(jnp.sum(v1**2), 1e-12))
+        b1 = v1 / v1_norm
+        
+        v2_ortho = v2 - jnp.dot(v2, b1) * b1
+        v2_norm = jnp.sqrt(jnp.maximum(jnp.sum(v2_ortho**2), 1e-12))
+        b2 = v2_ortho / v2_norm
+        
+        b3 = jnp.cross(b1, b2)
+        
+        U_pred = jnp.stack([b1, b2, b3], axis=1)
         return U_pred
