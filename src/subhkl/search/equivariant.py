@@ -37,6 +37,7 @@ def build_laue_graph(q_vectors_norm, k_neighbors=20):
     )
 
 
+
 class E3NN_Indexer(nn.Module):
     # The hidden state lives in an abstract space of Scalars (0e), Vectors (1o), and Tensors (2e)
     hidden_irreps: e3nn.Irreps = e3nn.Irreps("16x0e + 16x1o + 16x2e")
@@ -45,28 +46,27 @@ class E3NN_Indexer(nn.Module):
     @nn.compact
     def __call__(self, graph: jraph.GraphsTuple, intensities: jnp.ndarray):
         # 1. Lift spatial coordinates into Spherical Harmonics
-        # We explicitly tag the inputs as 3D vectors ("1o")
         node_vecs = e3nn.IrrepsArray("1o", graph.nodes)
         edge_vecs = e3nn.IrrepsArray("1o", graph.edges)
         
-        # Lift into Y_l^m lobes up to l=2
         node_sh = e3nn.spherical_harmonics("0e + 1o + 2e", node_vecs, normalize=True)
         edge_sh = e3nn.spherical_harmonics("0e + 1o + 2e", edge_vecs, normalize=True)
         
-        # Initialize node features: Intensities (0e) + Angular Lobes
         h_init = e3nn.IrrepsArray("1x0e", intensities[:, None])
-        nodes = e3nn.Linear(self.hidden_irreps)(e3nn.tensor_product(h_init, node_sh))
+        
+        # FIX 1: Use e3nn.flax.Linear
+        nodes = e3nn.flax.Linear(self.hidden_irreps)(e3nn.tensor_product(h_init, node_sh))
 
         # 2. Define the e3nn Message Passing Layer
         def update_edge_fn(edges, senders, receivers, globals_):
-            # Analytically multiply sender shapes with edge shapes using Clebsch-Gordan coefficients
             tp = e3nn.tensor_product(senders, edge_sh)
-            return e3nn.Linear(self.hidden_irreps)(tp)
+            # FIX 2: Use e3nn.flax.Linear
+            return e3nn.flax.Linear(self.hidden_irreps)(tp)
 
         def update_node_fn(nodes, senders, receivers, globals_):
-            # Update the node by mixing its current state with incoming messages
             tp = e3nn.tensor_product(nodes, receivers)
-            return e3nn.Linear(self.hidden_irreps)(tp)
+            # FIX 3: Use e3nn.flax.Linear
+            return e3nn.flax.Linear(self.hidden_irreps)(tp)
 
         # 3. Execute Graph Network
         gn = jraph.GraphNetwork(
@@ -80,20 +80,18 @@ class E3NN_Indexer(nn.Module):
             nodes = graph.nodes
 
         # 4. Invariant Readout (0e)
-        # We force the network to collapse all vectors/tensors, leaving ONLY rotationally invariant scalars!
-        invariant_scalars = e3nn.Linear("1x0e")(nodes).array
+        # FIX 4: Use e3nn.flax.Linear
+        invariant_scalars = e3nn.flax.Linear("1x0e")(nodes).array
         weights = jax.nn.softplus(invariant_scalars) + 1e-4
 
-        # 5. Manifest Covariance Extraction (Solving the Friedel Trap)
-        x = graph.nodes # (N, 3) raw directions
+        # 5. Manifest Covariance Extraction
+        x = graph.nodes 
         
-        # Outer product weighted by the network's invariant predictions
         M = jnp.dot(x.T, x * weights)
-        M = M + jnp.diag(jnp.array([1e-5, 2e-5, 3e-5])) # Break degeneracy
+        M = M + jnp.diag(jnp.array([1e-5, 2e-5, 3e-5])) 
         
         U, S, Vh = jnp.linalg.svd(M)
         
-        # Enforce positive determinant for SO(3)
         det = jnp.linalg.det(U)
         U_pred = jnp.where(det < 0, U.at[:, 2].multiply(-1), U)
         
