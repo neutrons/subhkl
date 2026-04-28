@@ -18,6 +18,7 @@ dependencies = [
     "optax",
     "jraph",
     "e3nn-jax",
+    "ott-jax",
 ]
 
 license = { text = "GPL3.0" }
