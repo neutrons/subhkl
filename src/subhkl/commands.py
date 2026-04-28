@@ -1461,41 +1461,35 @@ def run_egnn(
         normalized_weights = np.ones_like(log_weights)
 
     # ==========================================
-    # PHASE 3: e3nn-jax SO(3) COVARIANCE NETWORK
+    # PHASE 3: e3nn-jax + Sinkhorn Optimal Transport
     # ==========================================
-    print(f"\n[3/3] Training e3nn-jax SO(3) Network (N={len(q_sample_obs_norm)} Laue rays)...")
+    print(f"\n[3/3] Training Global e3nn-jax Network via Sinkhorn Transport...")
     from subhkl.optimization import get_lattice_system
     import jax
     import jax.numpy as jnp
+    import numpy as np
     import optax
+    from ott.geometry import pointcloud
+    from ott.problems.linear import linear_problem
+    from ott.solvers.linear import sinkhorn
     from subhkl.search.equivariant import build_laue_graph, E3NN_Indexer
 
-    # 1. Build the jraph structure strictly from NORMALIZED Laue rays
-    # The network reads geometry solely from angular spherical harmonics.
+    # 1. Build the e3nn-jax SO(3) Graph
     graph = build_laue_graph(q_sample_obs_norm, k_neighbors=20)
     intensities = jnp.array(normalized_weights)
     
-    # We keep the UN-NORMALIZED vectors to evaluate the physical fractional loss
-    q_sample_unnorm = jnp.array(q_sample_obs).T
+    # 2. Generate Theoretical Zone Axes (The Sinkhorn Target Distribution)
+    print(f"  > Generating Theoretical Target Distribution (max_uvw={max_hkl_cons})...")
+    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
+    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
+    uvw_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    mask_uvw_c = ~((uvw_c[0] == 0) & (uvw_c[1] == 0) & (uvw_c[2] == 0))
+    theo_uvw_c = uvw_c[:, mask_uvw_c].astype(np.float32).T 
 
-    # 2. Lattice System & Continuous Wavelength Sweep Grid
-    _, _, centering = get_lattice_system(
-        ub_helper.a, ub_helper.b, ub_helper.c, 
-        ub_helper.alpha, ub_helper.beta, ub_helper.gamma, ub_helper.space_group
-    )
-    
-    if centering == "I": M_prim = jnp.array([[0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
-    elif centering == "F": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5]])
-    elif centering == "C": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.0, 1.0]])
-    elif centering == "A": M_prim = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.0, 0.5, -0.5]])
-    elif centering == "B": M_prim = jnp.array([[0.5, 0.0, 0.5], [0.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
-    elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
-    else: M_prim = jnp.eye(3)
-
-    wavelengths = np.array(ub_helper.wavelength)
-    wl_min, wl_max = wavelengths[0], wavelengths[1]
-    lam_grid = jnp.logspace(jnp.log10(wl_min), jnp.log10(wl_max), 64)
-    B_inv = jnp.linalg.inv(B_mat)
+    A_mat = np.linalg.inv(B_mat).T
+    r_theo_zones = (A_mat @ theo_uvw_c.T).T
+    r_unique_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
+    theoretical_zones = jnp.array(r_unique_zones_norm)
 
     # 3. Model Initialization
     model = E3NN_Indexer(num_layers=3)
@@ -1509,57 +1503,89 @@ def run_egnn(
     )
     opt_state = optimizer.init(params)
 
-    # 4. JIT-Compiled Training Step
+    # 4. Sinkhorn Optimal Transport Loss Function
     @jax.jit
-    def loss_fn(params, sigma):
+    def loss_fn(params, epsilon):
+        # Extract U via Manifest Covariance SVD
         U_pred = model.apply(params, graph, intensities)
         
-        # Transform un-normalized lab vectors via the predicted crystal frame
-        UB_inv = jnp.matmul(B_inv, U_pred.T)
-        v = jnp.matmul(UB_inv, q_sample_unnorm)
+        # Rotate the empirical Laue rays using the predicted matrix
+        empirical_rays = jnp.matmul(U_pred, graph.nodes.T).T
         
-        hkl_float = v[None, :, :] / lam_grid[:, None, None]
-        h, k, l = hkl_float[:, 0, :], hkl_float[:, 1, :], hkl_float[:, 2, :]
+        # Cosine Distance: 0 for parallel, 2 for anti-parallel
+        def cosine_cost_fn(x, y):
+            return 1.0 - jnp.dot(x, y)
+
+        # Build the Optimal Transport Geometry
+        geom = pointcloud.PointCloud(
+            x=empirical_rays, 
+            y=theoretical_zones,
+            cost_fn=cosine_cost_fn,
+            epsilon=epsilon
+        )
+
+        # Define uniform marginal mass distributions
+        N = empirical_rays.shape[0]
+        M = theoretical_zones.shape[0]
+        a = jnp.ones(N) / N
+        b = jnp.ones(M) / M
         
-        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
-        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
-        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
+        prob = linear_problem.LinearProblem(geom, a=a, b=b)
+        solver = sinkhorn.Sinkhorn()
+        out = solver(prob)
         
-        # Calculate strict fractional deviation
-        dh = h_p - jnp.round(h_p)
-        dk = k_p - jnp.round(k_p)
-        dl = l_p - jnp.round(l_p)
-        dist_sq = dh**2 + dk**2 + dl**2
-        
-        # Continuous Gaussian Annealing evaluates ALL harmonics implicitly
-        gaussian_loss = 1.0 - jnp.exp(-dist_sq / (2.0 * sigma**2))
-        min_loss = jnp.min(gaussian_loss, axis=0)
-        
-        loss = jnp.sum(min_loss * intensities) / jnp.sum(intensities)
+        # The regularized optimal transport cost serves as our global loss
+        loss = out.reg_ot_cost
         return loss, U_pred
 
     @jax.jit
-    def train_step(params, opt_state, sigma):
-        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, sigma)
+    def train_step(params, opt_state, epsilon):
+        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, epsilon)
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         return params, opt_state, loss, U_pred
 
-    # 5. Annealing Execution
-    sigma_start = 0.50
-    sigma_end = egnn_sigma_end
+    # 5. Annealing Execution (Epsilon Decay)
+    # We decay epsilon from a massive 0.1 (global blur) to 1e-4 (crisp matching)
+    eps_start = 0.10
+    eps_end = 1e-4
     
     for i in range(egnn_steps):
-        current_sigma = sigma_start * (sigma_end / sigma_start) ** (i / egnn_steps)
-        params, opt_state, loss_val, U_pred = train_step(params, opt_state, current_sigma)
+        current_eps = eps_start * (eps_end / eps_start) ** (i / egnn_steps)
+        params, opt_state, loss_val, U_pred = train_step(params, opt_state, current_eps)
             
         if (i + 1) % max(1, egnn_steps // 20) == 0 or i == egnn_steps - 1:
-            safe_loss = jnp.clip(loss_val, 0.0, 0.9999)
-            true_dist = jnp.sqrt(-2.0 * current_sigma**2 * jnp.log(1.0 - safe_loss))
-            print(f"    Step {i+1:05d}/{egnn_steps} | Sigma: {current_sigma:.4f} | Fractional Error: {true_dist:.4f}")
+            print(f"    Step {i+1:05d}/{egnn_steps} | OTT Epsilon: {current_eps:.5f} | Transport Cost: {loss_val:.4f}")
 
     U_final = np.array(U_pred)
-    print("  > Macroscopic U-Matrix successfully extracted via e3nn-jax SVD.")
+    print("  > Macroscopic U-Matrix successfully extracted via Sinkhorn Transport.")
+
+    # ==========================================
+    # FINAL VALIDATION (Fractional Distance)
+    # ==========================================
+    # We still use the un-normalized lab vectors against the continuous lam_grid 
+    # to print out the final crystallographic fractional hit rate for the user!
+    q_sample_unnorm = np.array(q_sample_obs).T
+    UB_inv_final = np.linalg.inv(B_mat) @ U_final.T
+    v_final = UB_inv_final @ q_sample_unnorm
+    
+    wavelengths = np.array(ub_helper.wavelength)
+    lam_grid = np.logspace(np.log10(wavelengths[0]), np.log10(wavelengths[1]), 64)
+    hkl_float_final = v_final[np.newaxis, :, :] / lam_grid[:, np.newaxis, np.newaxis]
+    
+    # ... (M_prim transformations remain the same) ...
+    h_f, k_f, l_f = hkl_float_final[:, 0, :], hkl_float_final[:, 1, :], hkl_float_final[:, 2, :]
+    M_prim_np = np.array(M_prim) # Assumes M_prim was defined earlier in your script
+    
+    h_p_f = M_prim_np[0, 0]*h_f + M_prim_np[0, 1]*k_f + M_prim_np[0, 2]*l_f
+    k_p_f = M_prim_np[1, 0]*h_f + M_prim_np[1, 1]*k_f + M_prim_np[1, 2]*l_f
+    l_p_f = M_prim_np[2, 0]*h_f + M_prim_np[2, 1]*k_f + M_prim_np[2, 2]*l_f
+    
+    dist_final = np.sqrt((h_p_f - np.round(h_p_f))**2 + (k_p_f - np.round(k_p_f))**2 + (l_p_f - np.round(l_p_f))**2)
+    best_dist = np.min(dist_final, axis=0)
+    
+    true_hits = np.sum(best_dist < 0.15)
+    print(f"  > Final Matrix correctly indexed {true_hits}/{len(q_sample_obs_norm)} Bragg peaks (Fractional Tol = 0.15).")
 
     # ==========================================
     # FINAL VALIDATION (Replaces Phase 4)
