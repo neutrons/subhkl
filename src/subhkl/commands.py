@@ -1464,6 +1464,7 @@ def run_egnn(
     # ==========================================
     # PHASE 3: e3nn-jax + Sinkhorn Optimal Transport
     # ==========================================
+    from ott.geometry import pointcloud, costs
     print(f"\n[3/3] Training Global e3nn-jax Network via Sinkhorn Transport...")
     from subhkl.optimization import get_lattice_system
     import jax
@@ -1505,6 +1506,7 @@ def run_egnn(
     opt_state = optimizer.init(params)
 
     # 4. Sinkhorn Optimal Transport Loss Function
+    # 4. Sinkhorn Optimal Transport Loss Function
     @jax.jit
     def loss_fn(params, epsilon):
         # Extract U via Manifest Covariance SVD
@@ -1513,15 +1515,11 @@ def run_egnn(
         # Rotate the empirical Laue rays using the predicted matrix
         empirical_rays = jnp.matmul(U_pred, graph.nodes.T).T
         
-        # Cosine Distance: 0 for parallel, 2 for anti-parallel
-        def cosine_cost_fn(x, y):
-            return 1.0 - jnp.dot(x, y)
-
-        # Build the Optimal Transport Geometry
+        # Build the Optimal Transport Geometry using the built-in OTT Cosine cost
         geom = pointcloud.PointCloud(
             x=empirical_rays, 
             y=theoretical_zones,
-            cost_fn=cosine_cost_fn,
+            cost_fn=costs.Cosine(),  # <--- THE FIX
             epsilon=epsilon
         )
 
@@ -1535,7 +1533,6 @@ def run_egnn(
         solver = sinkhorn.Sinkhorn()
         out = solver(prob)
         
-        # The regularized optimal transport cost serves as our global loss
         loss = out.reg_ot_cost
         return loss, U_pred
 
