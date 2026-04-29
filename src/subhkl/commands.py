@@ -1508,6 +1508,45 @@ def run_egnn(
     # Random uniform initialization across the 6D space
     swarm_params = jax.random.normal(rng, (J, 6)) 
 
+    # 4. Define the Robust Periodic Loss for a single particle
+    def single_particle_loss(params):
+        U_pred = compute_U(params)
+        
+        UB_inv = jnp.matmul(B_inv, U_pred.T)
+        v = jnp.matmul(UB_inv, q_sample_unnorm)
+        
+        hkl_float = v[None, :, :] / lam_grid[:, None, None]
+        h, k, l = hkl_float[:, 0, :], hkl_float[:, 1, :], hkl_float[:, 2, :]
+        
+        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
+        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
+        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
+        
+        # No rounding! jnp.sin(pi*x)^2 / pi^2 perfectly mimics fractional distance 
+        # near integers but maintains global, trap-free differentiability.
+        dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
+        
+        # Pick the best integer assignment across all lam_grid harmonics
+        best_dist_sq = jnp.min(dist_sq, axis=0)
+        
+        # Tighten Geman-McClure to c=0.05
+        c = 0.05
+        robust_penalty = best_dist_sq / (best_dist_sq + c**2)
+        
+        loss = jnp.sum(robust_penalty * intensities) / jnp.sum(intensities)
+        return loss, U_pred
+
+    # 5. VMAP the loss to run all 1,024 particles in parallel
+    swarm_loss_fn = jax.vmap(single_particle_loss)
+
+    # Setup Optimizer
+    egnn_steps = steps 
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=optax.cosine_decay_schedule(0.1, egnn_steps))
+    )
+    opt_state = optimizer.init(swarm_params)
+
     # ==========================================
     # DYNAMIC SO(3) PRIOR SCORE
     # ==========================================
