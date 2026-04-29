@@ -1500,10 +1500,6 @@ def run_egnn(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    J_indep = 16384
-    rng = jax.random.PRNGKey(42)
-    swarm_params = jax.random.normal(rng, (J_indep, 6)) 
-
     def single_particle_loss(params, current_c):
         U_pred = compute_U(params)
         UB_inv = jnp.matmul(B_inv, U_pred.T)
@@ -1522,46 +1518,82 @@ def run_egnn(
         loss = jnp.sum(robust_penalty * intensities) / jnp.sum(intensities)
         return loss, U_pred
 
+
+    J_total = 131072      # Total swarm size you want
+    J_batch = 16384       # Maximum particles your H100 can compile at once
+    num_batches = J_total // J_batch
+    
+    print(f"\n[3A/3] Deploying Massive Independent Swarm (J={J_total}) in {num_batches} batches...")
+    
+    # Compile the training step for the batch size
     single_grad_fn = jax.value_and_grad(single_particle_loss, has_aux=True)
     swarm_grad_fn = jax.vmap(single_grad_fn, in_axes=(0, None))
 
-    steps_phase1 = 1000
+    steps_phase1 = 2000 # Increased steps for narrower loss landscape
+    
+    # Define the optimizer (but do not init it yet!)
     opt_1 = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=optax.cosine_decay_schedule(0.1, steps_phase1))
+        optax.adam(learning_rate=optax.cosine_decay_schedule(0.05, steps_phase1))
     )
-    opt_state_1 = opt_1.init(swarm_params)
 
     @jax.jit
     def train_step_indep(params, opt_state, current_c):
         (individual_losses, U_preds), individual_grads = swarm_grad_fn(params, current_c)
-        mean_grads = individual_grads / J_indep
+        mean_grads = individual_grads / J_batch
         updates, opt_state = opt_1.update(mean_grads, opt_state, params)
         params = optax.apply_updates(params, updates)
-        return params, opt_state, jnp.mean(individual_losses), U_preds, individual_losses
+        return params, opt_state, jnp.mean(individual_losses), individual_losses
 
-    c_start, c_end = 0.25, 0.12
-    for i in range(steps_phase1):
-        progress = i / steps_phase1
-        current_c = c_start * (c_end / c_start) ** progress
-        swarm_params, opt_state_1, mean_loss, U_preds, indep_losses = train_step_indep(
-            swarm_params, opt_state_1, current_c
-        )
-        if (i + 1) % 100 == 0:
-            best_loss = jnp.min(indep_losses)
-            print(f"    Step {i+1:04d}/{steps_phase1} | Swarm Mean: {mean_loss:.4f} | Best: {best_loss:.4f} | c: {current_c:.3f}")
-
-
-    # ==========================================
-    # PHASE 3B: Loss-Weighted EnSF Collapse
-    # ==========================================
-    J_ensf = 1024
-    print(f"\n[3B/3] Pruning to Top {J_ensf} particles and applying Loss-Weighted Gravity...")
+    c_start, c_end = 0.25, 0.05
+    rng = jax.random.PRNGKey(42)
     
-    # 1. Prune the swarm to the best J_ensf particles
+    # Storage for the final results of all batches
+    all_final_params = []
+    all_final_losses = []
+
+    for b in range(num_batches):
+        print(f"\n  -> Processing Batch {b+1}/{num_batches}...")
+        
+        # 1. Spawn a fresh batch of particles
+        rng, subkey = jax.random.split(rng)
+        batch_params = jax.random.normal(subkey, (J_batch, 6)) 
+        
+        # 2. Initialize a fresh optimizer state for this batch
+        opt_state_1 = opt_1.init(batch_params)
+        
+        for i in range(steps_phase1):
+            progress = i / steps_phase1
+            current_c = c_start * (c_end / c_start) ** progress
+            
+            batch_params, opt_state_1, mean_loss, batch_losses = train_step_indep(
+                batch_params, opt_state_1, current_c
+            )
+            
+            if (i + 1) % (steps_phase1 // 5) == 0:
+                best_loss = jnp.min(batch_losses)
+                print(f"      Step {i+1:04d}/{steps_phase1} | Batch Mean: {mean_loss:.4f} | Best: {best_loss:.4f} | c: {current_c:.3f}")
+        
+        # 3. Store the final relaxed state of this batch
+        all_final_params.append(batch_params)
+        all_final_losses.append(batch_losses)
+
+    # ==========================================
+    # POOL AND PRUNE FOR PHASE 3B
+    # ==========================================
+    # Combine all 131,072 particles back into a single unified array
+    swarm_params = jnp.concatenate(all_final_params, axis=0)
+    indep_losses = jnp.concatenate(all_final_losses, axis=0)
+
+    J_ensf = 1024
+    print(f"\n[3B/3] Pooling {J_total} particles and pruning to Top {J_ensf} for Gravity Collapse...")
+    
+    # Find the global best 1024 particles out of the massive pool
     sort_indices = jnp.argsort(indep_losses)
     top_indices = sort_indices[:J_ensf]
+    
     ensf_params = swarm_params[top_indices]
+    ensf_losses = indep_losses[top_indices]
 
     # 2. Define Loss-Weighted KDE Gravity
     @jax.jit
