@@ -1462,16 +1462,15 @@ def run_egnn(
         normalized_weights = np.ones_like(log_weights)
 
     # ==========================================
-    # PHASE 3: Robust Ensemble Swarm Optimization
+    # PHASE 3: Hyper-Optimized Independent Swarm
     # ==========================================
-    print(f"\n[3/3] Deploying Robust Ensemble Swarm (J=1024) across SO(3)...")
+    print(f"\n[3/3] Deploying Independent Swarm (J=16384) across SO(3)...")
     from subhkl.optimization import get_lattice_system
     import jax
     import jax.numpy as jnp
     import numpy as np
     import optax
 
-    # 1. Setup Data
     q_sample_unnorm = jnp.array(q_sample_obs).T
     intensities = jnp.array(normalized_weights)
     
@@ -1492,7 +1491,6 @@ def run_egnn(
     lam_grid = jnp.logspace(jnp.log10(wavelengths[0]), jnp.log10(wavelengths[1]), 64)
     B_inv = jnp.linalg.inv(B_mat)
 
-    # 2. 6D Continuous Rotation Definition
     def compute_U(rot_6d):
         a1 = rot_6d[:3]
         a2 = rot_6d[3:]
@@ -1502,14 +1500,13 @@ def run_egnn(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    # 3. Initialize Swarm (J = 1024 particles)
-    J = 1024
+    # 1. Initialize Massive Swarm
+    J = 16384
     rng = jax.random.PRNGKey(42)
-    # Random uniform initialization across the 6D space
     swarm_params = jax.random.normal(rng, (J, 6)) 
 
-    # 4. Define the Robust Periodic Loss for a single particle
-    def single_particle_loss(params):
+    # 2. Single Particle Loss
+    def single_particle_loss(params, current_c):
         U_pred = compute_U(params)
         
         UB_inv = jnp.matmul(B_inv, U_pred.T)
@@ -1522,24 +1519,22 @@ def run_egnn(
         k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
         l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
         
-        # No rounding! jnp.sin(pi*x)^2 / pi^2 perfectly mimics fractional distance 
-        # near integers but maintains global, trap-free differentiability.
         dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
-        
-        # Pick the best integer assignment across all lam_grid harmonics
         best_dist_sq = jnp.min(dist_sq, axis=0)
         
-        # Tighten Geman-McClure to c=0.05
-        c = 0.05
-        robust_penalty = best_dist_sq / (best_dist_sq + c**2)
-        
+        robust_penalty = best_dist_sq / (best_dist_sq + current_c**2)
         loss = jnp.sum(robust_penalty * intensities) / jnp.sum(intensities)
         return loss, U_pred
 
-    # 5. VMAP the loss to run all 1,024 particles in parallel
-    swarm_loss_fn = jax.vmap(single_particle_loss)
+    # ==========================================
+    # THE TRICK: Vmap the Gradient, not the Loss
+    # ==========================================
+    # Compile value_and_grad for exactly ONE particle
+    single_grad_fn = jax.value_and_grad(single_particle_loss, has_aux=True)
+    
+    # Vmap the gradient calculator across all 16,384 particles
+    swarm_grad_fn = jax.vmap(single_grad_fn, in_axes=(0, None))
 
-    # Setup Optimizer
     egnn_steps = steps 
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
@@ -1548,34 +1543,39 @@ def run_egnn(
     opt_state = optimizer.init(swarm_params)
 
     @jax.jit
-    def train_step(swarm_params, opt_state):
-        # value_and_grad over the sum of all losses allows parallel gradient descent
-        def total_loss(p):
-            losses, Us = swarm_loss_fn(p)
-            return jnp.mean(losses), Us
-            
-        (mean_loss, U_preds), grads = jax.value_and_grad(total_loss, has_aux=True)(swarm_params)
-        updates, opt_state = optimizer.update(grads, opt_state, swarm_params)
+    def train_step(swarm_params, opt_state, current_c):
+        # Calculate gradients for all particles in parallel (Lightning fast compile)
+        (individual_losses, U_preds), individual_grads = swarm_grad_fn(swarm_params, current_c)
+        
+        # Mathematically, the gradient of the Mean Loss is just the individual gradients divided by J
+        mean_grads = individual_grads / J
+        
+        updates, opt_state = optimizer.update(mean_grads, opt_state, swarm_params)
         swarm_params = optax.apply_updates(swarm_params, updates)
         
-        # We also return the raw array of losses to find the global winner
-        individual_losses, _ = swarm_loss_fn(swarm_params)
-        return swarm_params, opt_state, mean_loss, U_preds, individual_losses
+        return swarm_params, opt_state, jnp.mean(individual_losses), U_preds, individual_losses
 
-    # 6. Execute Swarm Optimization
+    # 3. Execution Loop with Simple C-Annealing
+    c_start = 0.25
+    c_end = 0.12
+    
     for i in range(egnn_steps):
-        swarm_params, opt_state, mean_loss, U_preds, individual_losses = train_step(swarm_params, opt_state)
+        progress = i / egnn_steps
+        current_c = c_start * (c_end / c_start) ** progress
+        
+        swarm_params, opt_state, mean_loss, U_preds, individual_losses = train_step(
+            swarm_params, opt_state, current_c
+        )
             
         if (i + 1) % max(1, egnn_steps // 20) == 0 or i == egnn_steps - 1:
             best_particle_idx = jnp.argmin(individual_losses)
             best_loss = individual_losses[best_particle_idx]
-            print(f"    Step {i+1:05d}/{egnn_steps} | Swarm Mean Loss: {mean_loss:.4f} | Best Particle Loss: {best_loss:.4f}")
+            print(f"    Step {i+1:05d}/{egnn_steps} | Swarm Mean: {mean_loss:.4f} | Best Particle: {best_loss:.4f} | c: {current_c:.3f}")
 
-    # Extract the absolute best matrix from the swarm
     best_particle_idx = jnp.argmin(individual_losses)
     U_final = np.array(U_preds[best_particle_idx])
     
-    print("  > Macroscopic U-Matrix successfully extracted via Robust Ensemble Swarm.")
+    print("  > Macroscopic U-Matrix successfully extracted via Independent Brute-Force Swarm.")
 
     # ==========================================
     # FINAL VALIDATION (Fractional Distance)
