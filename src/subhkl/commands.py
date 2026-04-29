@@ -1462,9 +1462,9 @@ def run_egnn(
         normalized_weights = np.ones_like(log_weights)
 
     # ==========================================
-    # PHASE 3: Hyper-Optimized Independent Swarm
+    # PHASE 3A: Independent Brute-Force Search
     # ==========================================
-    print(f"\n[3/3] Deploying Independent Swarm (J=16384) across SO(3)...")
+    print(f"\n[3A/3] Deploying Independent Swarm (J=16384) for Global Search...")
     from subhkl.optimization import get_lattice_system
     import jax
     import jax.numpy as jnp
@@ -1500,21 +1500,17 @@ def run_egnn(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    # 1. Initialize Massive Swarm
-    J = 16384
+    J_indep = 16384
     rng = jax.random.PRNGKey(42)
-    swarm_params = jax.random.normal(rng, (J, 6)) 
+    swarm_params = jax.random.normal(rng, (J_indep, 6)) 
 
-    # 2. Single Particle Loss
     def single_particle_loss(params, current_c):
         U_pred = compute_U(params)
-        
         UB_inv = jnp.matmul(B_inv, U_pred.T)
         v = jnp.matmul(UB_inv, q_sample_unnorm)
         
         hkl_float = v[None, :, :] / lam_grid[:, None, None]
         h, k, l = hkl_float[:, 0, :], hkl_float[:, 1, :], hkl_float[:, 2, :]
-        
         h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
         k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
         l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
@@ -1526,56 +1522,108 @@ def run_egnn(
         loss = jnp.sum(robust_penalty * intensities) / jnp.sum(intensities)
         return loss, U_pred
 
-    # ==========================================
-    # THE TRICK: Vmap the Gradient, not the Loss
-    # ==========================================
-    # Compile value_and_grad for exactly ONE particle
     single_grad_fn = jax.value_and_grad(single_particle_loss, has_aux=True)
-    
-    # Vmap the gradient calculator across all 16,384 particles
     swarm_grad_fn = jax.vmap(single_grad_fn, in_axes=(0, None))
 
-    egnn_steps = steps 
-    optimizer = optax.chain(
+    steps_phase1 = 1000
+    opt_1 = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=optax.cosine_decay_schedule(0.1, egnn_steps))
+        optax.adam(learning_rate=optax.cosine_decay_schedule(0.1, steps_phase1))
     )
-    opt_state = optimizer.init(swarm_params)
+    opt_state_1 = opt_1.init(swarm_params)
 
     @jax.jit
-    def train_step(swarm_params, opt_state, current_c):
-        # Calculate gradients for all particles in parallel (Lightning fast compile)
-        (individual_losses, U_preds), individual_grads = swarm_grad_fn(swarm_params, current_c)
-        
-        # Mathematically, the gradient of the Mean Loss is just the individual gradients divided by J
-        mean_grads = individual_grads / J
-        
-        updates, opt_state = optimizer.update(mean_grads, opt_state, swarm_params)
-        swarm_params = optax.apply_updates(swarm_params, updates)
-        
-        return swarm_params, opt_state, jnp.mean(individual_losses), U_preds, individual_losses
+    def train_step_indep(params, opt_state, current_c):
+        (individual_losses, U_preds), individual_grads = swarm_grad_fn(params, current_c)
+        mean_grads = individual_grads / J_indep
+        updates, opt_state = opt_1.update(mean_grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, jnp.mean(individual_losses), U_preds, individual_losses
 
-    # 3. Execution Loop with Simple C-Annealing
-    c_start = 0.25
-    c_end = 0.12
-    
-    for i in range(egnn_steps):
-        progress = i / egnn_steps
+    c_start, c_end = 0.25, 0.12
+    for i in range(steps_phase1):
+        progress = i / steps_phase1
         current_c = c_start * (c_end / c_start) ** progress
-        
-        swarm_params, opt_state, mean_loss, U_preds, individual_losses = train_step(
-            swarm_params, opt_state, current_c
+        swarm_params, opt_state_1, mean_loss, U_preds, indep_losses = train_step_indep(
+            swarm_params, opt_state_1, current_c
         )
-            
-        if (i + 1) % max(1, egnn_steps // 20) == 0 or i == egnn_steps - 1:
-            best_particle_idx = jnp.argmin(individual_losses)
-            best_loss = individual_losses[best_particle_idx]
-            print(f"    Step {i+1:05d}/{egnn_steps} | Swarm Mean: {mean_loss:.4f} | Best Particle: {best_loss:.4f} | c: {current_c:.3f}")
+        if (i + 1) % 100 == 0:
+            best_loss = jnp.min(indep_losses)
+            print(f"    Step {i+1:04d}/{steps_phase1} | Swarm Mean: {mean_loss:.4f} | Best: {best_loss:.4f} | c: {current_c:.3f}")
 
-    best_particle_idx = jnp.argmin(individual_losses)
+
+    # ==========================================
+    # PHASE 3B: Loss-Weighted EnSF Collapse
+    # ==========================================
+    J_ensf = 1024
+    print(f"\n[3B/3] Pruning to Top {J_ensf} particles and applying Loss-Weighted Gravity...")
+    
+    # 1. Prune the swarm to the best J_ensf particles
+    sort_indices = jnp.argsort(indep_losses)
+    top_indices = sort_indices[:J_ensf]
+    ensf_params = swarm_params[top_indices]
+
+    # 2. Define Loss-Weighted KDE Gravity
+    @jax.jit
+    def single_loss_weighted_vmf(single_params, U_swarm, losses_swarm, current_sigma, gamma):
+        U_single = compute_U(single_params)
+        sq_chordal_dists = jnp.sum((U_swarm - U_single)**2, axis=(-2, -1))
+        
+        # Meritocratic Gravity: Penalty based on distance AND target loss
+        logits = -sq_chordal_dists / (2.0 * current_sigma**2) - (gamma * losses_swarm)
+        return jax.scipy.special.logsumexp(logits)
+
+    prior_score_fn = jax.grad(single_loss_weighted_vmf, argnums=0)
+    vmap_prior = jax.vmap(prior_score_fn, in_axes=(0, None, None, None, None))
+
+    # We need a vmapped version of the raw loss to use inside the EnSF train_step
+    ensf_loss_fn = jax.vmap(single_particle_loss, in_axes=(0, None))
+
+    steps_phase2 = 300
+    opt_2 = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=optax.cosine_decay_schedule(0.01, steps_phase2))
+    )
+    opt_state_2 = opt_2.init(ensf_params)
+
+    @jax.jit
+    def train_step_ensf(params, opt_state, current_c, current_sigma, gamma, current_lambda):
+        def total_loss(p):
+            losses, Us = ensf_loss_fn(p, current_c)
+            return jnp.mean(losses), (Us, losses)
+            
+        (mean_loss, (U_preds, individual_losses)), raw_grads = jax.value_and_grad(
+            total_loss, has_aux=True
+        )(params)
+        
+        # Calculate Loss-Weighted Gravity
+        prior_scores = vmap_prior(params, U_preds, individual_losses, current_sigma, gamma)
+        
+        # Subtract gravity to move UP the density gradient
+        total_grads = raw_grads - (current_lambda * prior_scores)
+        
+        updates, opt_state = opt_2.update(total_grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, mean_loss, U_preds, individual_losses
+
+    # Gravity Hyperparameters
+    ensf_sigma = 0.10      # Tight chordal radius
+    ensf_gamma = 15.0      # Punish high-loss particles massively
+    ensf_lambda = 0.5      # Strength of the gravitational pull
+
+    for i in range(steps_phase2):
+        ensf_params, opt_state_2, mean_loss, U_preds, ensf_losses = train_step_ensf(
+            ensf_params, opt_state_2, current_c=c_end, current_sigma=ensf_sigma, 
+            gamma=ensf_gamma, current_lambda=ensf_lambda
+        )
+        if (i + 1) % 50 == 0:
+            best_loss = jnp.min(ensf_losses)
+            print(f"    Step {i+1:03d}/{steps_phase2} | Swarm Mean: {mean_loss:.4f} | Best: {best_loss:.4f}")
+
+    best_particle_idx = jnp.argmin(ensf_losses)
     U_final = np.array(U_preds[best_particle_idx])
     
-    print("  > Macroscopic U-Matrix successfully extracted via Independent Brute-Force Swarm.")
+    print("  > Macroscopic U-Matrix successfully extracted via Two-Stage Search.")
 
     # ==========================================
     # FINAL VALIDATION (Fractional Distance)
