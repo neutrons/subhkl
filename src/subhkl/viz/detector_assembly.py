@@ -375,6 +375,10 @@ def plot_unrolled_detector(
     # ==========================================
     # PLOTTING VIRTUAL HUBS (NODAL POINTS)
     # ==========================================
+
+    # Remove default 5% padding BEFORE capturing limits
+    ax.margins(0, 0)
+
     # Capture the physical panel bounds and add a 10% safety margin
     det_y_min, det_y_max = ax.get_ylim()
     y_margin = (det_y_max - det_y_min) * 0.1
@@ -553,7 +557,6 @@ def plot_unrolled_detector(
             clip_on=False,
         )
 
-    ax.margins(0, 0)
     ax.set_xlim(c_min, c_max)
 
     aspect_ratio = 180.0 / (np.pi * mean_radius)
