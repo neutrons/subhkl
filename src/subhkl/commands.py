@@ -1608,7 +1608,7 @@ def run_egnn(
 
     # Gravity Hyperparameters
     ensf_sigma = 0.10      # Tight chordal radius
-    ensf_gamma = 15.0      # Punish high-loss particles massively
+    ensf_gamma = 1000.0      # Punish high-loss particles massively
     ensf_lambda = 0.5      # Strength of the gravitational pull
 
     for i in range(steps_phase2):
@@ -1620,10 +1620,84 @@ def run_egnn(
             best_loss = jnp.min(ensf_losses)
             print(f"    Step {i+1:03d}/{steps_phase2} | Swarm Mean: {mean_loss:.4f} | Best: {best_loss:.4f}")
 
-    best_particle_idx = jnp.argmin(ensf_losses)
-    U_final = np.array(U_preds[best_particle_idx])
+    # ==========================================
+    # PHASE 4: Localized Differentiable Extraction
+    # ==========================================
+    print(f"\n[4/4] Extracting differentiable modes via Meritocratic Mean-Shift...")
     
-    print("  > Macroscopic U-Matrix successfully extracted via Two-Stage Search.")
+    # 1. Compute the final 3x3 matrices from the EnSF swarm
+    U_final_swarm = jax.vmap(compute_U)(ensf_params)
+    n_grains = 5  # Set how many orientations/twins you want to extract
+
+    # 2. Heuristic Initialization: Find distinct, low-loss seeds
+    def get_initial_seeds(U_swarm, losses, n):
+        seeds = []
+        first_idx = jnp.argmin(losses)
+        seeds.append(U_swarm[first_idx])
+        
+        penalty_scale = 10.0
+        for _ in range(1, n):
+            curr_seeds = jnp.stack(seeds)
+            dists = jnp.sum((U_swarm[:, None, :, :] - curr_seeds[None, :, :, :])**2, axis=(-2, -1))
+            min_dists = jnp.min(dists, axis=1)
+            
+            scores = losses - penalty_scale * min_dists
+            next_idx = jnp.argmin(scores)
+            seeds.append(U_swarm[next_idx])
+            
+        return jnp.stack(seeds)
+
+    initial_centers = jax.lax.stop_gradient(
+        get_initial_seeds(U_final_swarm, ensf_losses, n_grains)
+    )
+
+    # 3. Differentiable SO(3) Projection
+    @jax.vmap
+    def project_so3(M):
+        U_svd, _, Vh_svd = jnp.linalg.svd(M)
+        det = jnp.linalg.det(jnp.matmul(U_svd, Vh_svd))
+        correction = jnp.diag(jnp.array([1.0, 1.0, det]))
+        return jnp.matmul(U_svd, jnp.matmul(correction, Vh_svd))
+
+    # 4. Meritocratic Mean-Shift Step
+    @jax.jit
+    def extract_modes_step(centers, U_swarm, losses, tau_dist=0.01, gamma=100.0):
+        # Shape: (1024, N)
+        dists = jnp.sum((U_swarm[:, None, :, :] - centers[None, :, :, :])**2, axis=(-2, -1))
+        
+        # THE FIX: Softmax over particles (axis=0), heavily punishing distance and loss
+        logits = -dists / tau_dist - gamma * losses[:, None]
+        weights = jax.nn.softmax(logits, axis=0)
+        
+        # Weighted average of matrices for each center
+        M_avg = jnp.sum(weights[:, :, None, None] * U_swarm[:, None, :, :], axis=0)
+        new_centers = project_so3(M_avg)
+        return new_centers
+
+    # 5. Execute Extraction
+    mode_centers = initial_centers
+    for _ in range(10):
+        mode_centers = extract_modes_step(mode_centers, U_final_swarm, ensf_losses)
+
+    # 6. Calculate Relative Phase Fractions
+    # Now we post-process to see how many particles actually belong to each extracted grain
+    final_dists = jnp.sum((U_final_swarm[:, None, :, :] - mode_centers[None, :, :, :])**2, axis=(-2, -1))
+    best_center_idx = jnp.argmin(final_dists, axis=1)
+    min_dists = jnp.min(final_dists, axis=1)
+    
+    # Only count particles that are physically close to a mode (chordal dist < 0.1)
+    valid_mask = min_dists < 0.1
+    valid_assignments = jnp.where(valid_mask, best_center_idx, n_grains) # assign noise to a dummy bin
+    
+    cluster_counts = jnp.bincount(valid_assignments, length=n_grains+1)[:-1]
+    total_valid = jnp.sum(cluster_counts)
+    phase_fractions = cluster_counts / (total_valid + 1e-6)
+
+    for g in range(n_grains):
+        print(f"  > Grain {g+1}: Relative Phase Fraction = {phase_fractions[g]:.1%}")
+
+    kmeans_centers = mode_centers
+    U_final = kmeans_centers[0]
 
     # ==========================================
     # FINAL VALIDATION (Fractional Distance)
