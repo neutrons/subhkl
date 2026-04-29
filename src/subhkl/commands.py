@@ -1572,27 +1572,8 @@ def run_egnn(
             best_loss = individual_losses[best_particle_idx]
             print(f"    Step {i+1:05d}/{egnn_steps} | Swarm Mean: {mean_loss:.4f} | Best Particle: {best_loss:.4f} | c: {current_c:.3f}")
 
-    # ==========================================
-    # DIFFERENTIABLE ENSEMBLE COLLAPSE
-    # ==========================================
-    # 1. Calculate Softmax Weights based on final individual losses
-    tau = 0.01  # Low temperature mimics argmin but keeps gradients alive
-    weights = jax.nn.softmax(-individual_losses / tau)
-    
-    # 2. Compute the weighted average matrix
-    # U_preds shape: (16384, 3, 3) -> weights shape: (16384, 1, 1)
-    U_avg = jnp.sum(weights[:, None, None] * U_preds, axis=0)
-    
-    # 3. Project back to SO(3) differentiably using SVD
-    # The closest orthogonal matrix to any matrix M is U * V^T
-    U_svd, _, V_svd = jnp.linalg.svd(U_avg)
-    
-    # Ensure it's a true rotation (det = +1), not a reflection
-    det = jnp.linalg.det(jnp.matmul(U_svd, V_svd))
-    correction = jnp.diag(jnp.array([1.0, 1.0, det]))
-    
-    # This U_final is fully differentiable with respect to the initial detector intensities!
-    U_final = jnp.matmul(U_svd, jnp.matmul(correction, V_svd))
+    best_particle_idx = jnp.argmin(individual_losses)
+    U_final = np.array(U_preds[best_particle_idx])
     
     print("  > Macroscopic U-Matrix successfully extracted via Independent Brute-Force Swarm.")
 
