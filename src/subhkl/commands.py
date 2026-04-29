@@ -1542,7 +1542,7 @@ def run_egnn(
         
         return loss, U_pred
 
-    J_total = 131072      # Total swarm size you want
+    J_total = 16384      # Total swarm size you want
     J_batch = 16384       # Maximum particles your H100 can compile at once
     num_batches = J_total // J_batch
     
@@ -1634,7 +1634,7 @@ def run_egnn(
     # We need a vmapped version of the raw loss to use inside the EnSF train_step
     ensf_loss_fn = jax.vmap(single_particle_loss, in_axes=(0, None))
 
-    steps_phase2 = 300
+    steps_phase2 = 5000
     opt_2 = optax.chain(
         optax.clip_by_global_norm(1.0),
         optax.adam(learning_rate=optax.cosine_decay_schedule(0.01, steps_phase2))
