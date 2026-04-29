@@ -1508,86 +1508,24 @@ def run_egnn(
     # Random uniform initialization across the 6D space
     swarm_params = jax.random.normal(rng, (J, 6)) 
 
-    # 4. Define the Robust Periodic Loss for a single particle
-    def single_particle_loss(params):
-        U_pred = compute_U(params)
-        
-        UB_inv = jnp.matmul(B_inv, U_pred.T)
-        v = jnp.matmul(UB_inv, q_sample_unnorm)
-        
-        hkl_float = v[None, :, :] / lam_grid[:, None, None]
-        h, k, l = hkl_float[:, 0, :], hkl_float[:, 1, :], hkl_float[:, 2, :]
-        
-        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
-        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
-        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
-        
-        # No rounding! jnp.sin(pi*x)^2 / pi^2 perfectly mimics fractional distance 
-        # near integers but maintains global, trap-free differentiability.
-        dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
-        
-        # Pick the best integer assignment across all lam_grid harmonics
-        best_dist_sq = jnp.min(dist_sq, axis=0)
-        
-        # Tighten Geman-McClure to c=0.05
-        c = 0.05
-        robust_penalty = best_dist_sq / (best_dist_sq + c**2)
-        
-        loss = jnp.sum(robust_penalty * intensities) / jnp.sum(intensities)
-        return loss, U_pred
-
-    # 5. VMAP the loss to run all 1,024 particles in parallel
-    swarm_loss_fn = jax.vmap(single_particle_loss)
-
-    # Setup Optimizer
-    egnn_steps = steps 
-    optimizer = optax.chain(
-        optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=optax.cosine_decay_schedule(0.1, egnn_steps))
-    )
-    opt_state = optimizer.init(swarm_params)
-
-    # Hyperparameters for the EnSF Prior Score
-    # sigma controls the radius of the gravitational pull (bandwidth)
-    # lambda_prior controls how strongly the swarm collapses vs trusting the raw data
-    prior_sigma = 0.20 
-    lambda_prior = 0.05 
-
-    # Hyperparameters for the SO(3) vMF Prior Score
-    # sigma now represents chordal distance in 3x3 matrix space
-    prior_sigma = 0.10 
-    lambda_prior = 0.05 
-
+    # ==========================================
+    # DYNAMIC SO(3) PRIOR SCORE
+    # ==========================================
     @jax.jit
-    def single_vmf_log_density(single_params, U_swarm):
-        """
-        Calculates the von Mises-Fisher log-density of a single particle
-        relative to the rest of the swarm, evaluated purely on the SO(3) manifold.
-        """
-        # 1. Map the 6D params to the SO(3) manifold
+    def single_vmf_log_density(single_params, U_swarm, current_sigma):
+        """Calculates vMF density on SO(3) with an annealing kernel radius."""
         U_single = compute_U(single_params)
-        
-        # 2. Calculate the squared Chordal (Frobenius) distance between matrices
-        # U_single is (3, 3), U_swarm is (1024, 3, 3)
         sq_chordal_dists = jnp.sum((U_swarm - U_single)**2, axis=(-2, -1))
         
-        # 3. Calculate vMF mixture logits
-        logits = -sq_chordal_dists / (2.0 * prior_sigma**2)
-        
-        # 4. Use LogSumExp for numerical stability of the log-density
+        logits = -sq_chordal_dists / (2.0 * current_sigma**2)
         log_density = jax.scipy.special.logsumexp(logits)
         return log_density
 
-    # The EnSF Score is literally the gradient of the log-density!
-    # jax.grad handles the SO(3) -> Lie Algebra -> 6D mapping perfectly.
     single_prior_score_fn = jax.grad(single_vmf_log_density, argnums=0)
-    
-    # Vmap over the swarm
-    vmap_prior_score = jax.vmap(single_prior_score_fn, in_axes=(0, None))
+    vmap_prior_score = jax.vmap(single_prior_score_fn, in_axes=(0, None, None))
 
     @jax.jit
-    def train_step(swarm_params, opt_state):
-        # 1. Wrapper to return a scalar loss for JAX
+    def train_step(swarm_params, opt_state, current_sigma, current_lambda):
         def total_loss(p):
             losses, Us = swarm_loss_fn(p)
             return jnp.mean(losses), (Us, losses)
@@ -1596,29 +1534,42 @@ def run_egnn(
             total_loss, has_aux=True
         )(swarm_params)
         
-        # 2. Get the Ensemble Prior Score using the 3x3 matrices!
-        # JAX autodiff handles the conversion back to 6D gradients.
-        prior_scores = vmap_prior_score(swarm_params, U_preds)
+        # Calculate dynamic prior score
+        prior_scores = vmap_prior_score(swarm_params, U_preds, current_sigma)
         
-        # 3. The EnSF Gradient Modification (Minimize Loss, Maximize Density)
-        total_grads = raw_grads - (lambda_prior * prior_scores)
+        # Modify gradient (minimize loss, maximize prior density)
+        total_grads = raw_grads - (current_lambda * prior_scores)
         
-        # 4. Apply updates
         updates, opt_state = optimizer.update(total_grads, opt_state, swarm_params)
         swarm_params = optax.apply_updates(swarm_params, updates)
         
-        return swarm_params, opt_state, mean_loss, U_preds, individual_losses 
+        return swarm_params, opt_state, mean_loss, U_preds, individual_losses
 
-    # 6. Execute Swarm Optimization
+    # ==========================================
+    # 6. Execute Swarm Optimization with Annealing
+    # ==========================================
+    sigma_start = 1.0  # Broad global gravity
+    sigma_end = 0.05   # Tight sub-pixel clustering
+    lambda_start = 1.0 # Strong swarm collapse
+    lambda_end = 0.0   # Pure data refinement
+    
     for i in range(egnn_steps):
-        swarm_params, opt_state, mean_loss, U_preds, individual_losses = train_step(swarm_params, opt_state)
+        progress = i / egnn_steps
+        
+        # Exponential decay for sigma
+        current_sigma = sigma_start * (sigma_end / sigma_start) ** progress
+        # Linear decay for lambda (damping function v(tau) from paper Eq 12)
+        current_lambda = lambda_start * (1.0 - progress) + lambda_end * progress
+        
+        swarm_params, opt_state, mean_loss, U_preds, individual_losses = train_step(
+            swarm_params, opt_state, current_sigma, current_lambda
+        )
             
         if (i + 1) % max(1, egnn_steps // 20) == 0 or i == egnn_steps - 1:
             best_particle_idx = jnp.argmin(individual_losses)
             best_loss = individual_losses[best_particle_idx]
             print(f"    Step {i+1:05d}/{egnn_steps} | Swarm Mean Loss: {mean_loss:.4f} | Best Particle Loss: {best_loss:.4f}")
 
-    # Extract the absolute best matrix from the swarm
     best_particle_idx = jnp.argmin(individual_losses)
     U_final = np.array(U_preds[best_particle_idx])
     
