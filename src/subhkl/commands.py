@@ -1605,18 +1605,21 @@ def run_egnn(
     # POOL AND PRUNE FOR PHASE 3B
     # ==========================================
     # Combine all 131,072 particles back into a single unified array
-    swarm_params = jnp.concatenate(all_final_params, axis=0)
-    indep_losses = jnp.concatenate(all_final_losses, axis=0)
+    #swarm_params = jnp.concatenate(all_final_params, axis=0)
+    #indep_losses = jnp.concatenate(all_final_losses, axis=0)
+#
+#    J_ensf = 1024
+#    print(f"\n[3B/3] Pooling {J_total} particles and pruning to Top {J_ensf} for Gravity Collapse...")
+#    
+#    # Find the global best 1024 particles out of the massive pool
+#    sort_indices = jnp.argsort(indep_losses)
+#    top_indices = sort_indices[:J_ensf]
+#    
+#    ensf_params = swarm_params[top_indices]
+#    ensf_losses = indep_losses[top_indices]
 
-    J_ensf = 1024
-    print(f"\n[3B/3] Pooling {J_total} particles and pruning to Top {J_ensf} for Gravity Collapse...")
-    
-    # Find the global best 1024 particles out of the massive pool
-    sort_indices = jnp.argsort(indep_losses)
-    top_indices = sort_indices[:J_ensf]
-    
-    ensf_params = swarm_params[top_indices]
-    ensf_losses = indep_losses[top_indices]
+    ensf_params = swarm_params
+    ensf_losses = indep_losses
 
     # 2. Define Loss-Weighted KDE Gravity
     @jax.jit
