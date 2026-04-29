@@ -63,17 +63,18 @@ class E3NN_Indexer(nn.Module):
             nodes = graph.nodes
 
         # ==========================================
-        # THE FIX: Direct Equivariant Frame Regression
+        # Direct Equivariant Frame Regression
         # ==========================================
-        # Instead of 1x0e scalars for SVD, we ask the network to output two 3D vectors!
-        # Because of e3nn math, these vectors will rotate perfectly with the input graph.
-        node_vectors = e3nn.flax.Linear("2x1o")(nodes).array  # Shape: (N, 2, 3)
+
+        # e3nn flattens "2x1o" into shape (N, 6). 
+        # We MUST reshape it to (N, 2, 3) before grabbing the vectors!
+        node_vectors = e3nn.flax.Linear("2x1o")(nodes).array.reshape(-1, 2, 3)
 
         # Global Average Pooling: The whole crystal votes on the lattice orientation
-        global_vectors = jnp.mean(node_vectors, axis=0)       # Shape: (2, 3)
+        global_vectors = jnp.mean(node_vectors, axis=0)  # Now correctly shape (2, 3)
         
-        v1 = global_vectors[0]
-        v2 = global_vectors[1]
+        v1 = global_vectors[0]  # Shape (3,)
+        v2 = global_vectors[1]  # Shape (3,)
 
         # Gram-Schmidt Orthogonalization to guarantee a rigid 3x3 SO(3) matrix
         b1 = v1 / (jnp.linalg.norm(v1) + 1e-6)
@@ -82,5 +83,5 @@ class E3NN_Indexer(nn.Module):
         b3 = jnp.cross(b1, b2)
 
         U_pred = jnp.stack([b1, b2, b3], axis=-1)
-        
+
         return U_pred
