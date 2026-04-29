@@ -1565,7 +1565,7 @@ def run_egnn(
     print(f"\n[3A/3] Deploying Massive Independent Swarm (J={J_total}) in {num_batches} batches...")
     
     # Compile the training step for the batch size
-    single_grad_fn = jax.value_and_grad(single_particle_loss, has_aux=True)
+    single_grad_fn = jax.value_and_grad(globally_differentiable_loss, has_aux=True)
     swarm_grad_fn = jax.vmap(single_grad_fn, in_axes=(0, None))
 
     steps_phase1 = 2000 # Increased steps for narrower loss landscape
@@ -1651,7 +1651,7 @@ def run_egnn(
     vmap_prior = jax.vmap(prior_score_fn, in_axes=(0, None, None, None, None))
 
     # We need a vmapped version of the raw loss to use inside the EnSF train_step
-    ensf_loss_fn = jax.vmap(single_particle_loss, in_axes=(0, None))
+    ensf_loss_fn = jax.vmap(globally_differentiable_loss, in_axes=(0, None))
 
     steps_phase2 = 5000
     opt_2 = optax.chain(
