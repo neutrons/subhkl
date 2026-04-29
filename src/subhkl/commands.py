@@ -1464,7 +1464,6 @@ def run_egnn(
     # ==========================================
     # PHASE 3A: Independent Brute-Force Search
     # ==========================================
-    print(f"\n[3A/3] Deploying Independent Swarm (J=16384) for Global Search...")
     from subhkl.optimization import get_lattice_system
     import jax
     import jax.numpy as jnp
@@ -1502,22 +1501,46 @@ def run_egnn(
 
     def single_particle_loss(params, current_c):
         U_pred = compute_U(params)
+        
         UB_inv = jnp.matmul(B_inv, U_pred.T)
         v = jnp.matmul(UB_inv, q_sample_unnorm)
         
-        hkl_float = v[None, :, :] / lam_grid[:, None, None]
-        h, k, l = hkl_float[:, 0, :], hkl_float[:, 1, :], hkl_float[:, 2, :]
+        # 1. COARSE ASSIGNMENT: Use the grid strictly to find the nearest integer neighborhood
+        hkl_float_coarse = v[None, :, :] / lam_grid[:, None, None]
+        hkl_int_coarse = jnp.round(hkl_float_coarse)
+        
+        # Fast naive distance to find the best grid index
+        diff_sq = jnp.sum((hkl_float_coarse - hkl_int_coarse)**2, axis=1)
+        best_grid_idx = jnp.argmin(diff_sq, axis=0)
+        best_lam_coarse = lam_grid[best_grid_idx]
+        
+        # 2. TARGET LOCK: Extract the nearest integer and STOP GRADIENTS
+        hkl_int = jnp.round(v / best_lam_coarse[None, :])
+        hkl_int_fixed = jax.lax.stop_gradient(hkl_int)
+        
+        # 3. ANALYTICAL PROJECTION: Calculate the exact continuous lambda
+        # Minimizes || v/lambda - hkl_int ||^2 geometrically
+        num = jnp.sum(v**2, axis=0)
+        den = jnp.sum(v * hkl_int_fixed, axis=0) + 1e-9
+        lam_opt = jnp.clip(num / den, lam_grid[0], lam_grid[-1])
+        
+        # 4. EXACT FRACTIONAL COORDINATES: Smooth and fully differentiable!
+        hkl_float_exact = v / lam_opt[None, :]
+        h = hkl_float_exact[0, :]
+        k = hkl_float_exact[1, :]
+        l = hkl_float_exact[2, :]
+        
+        # 5. CENTERING & LOSS
         h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
         k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
         l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
         
         dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
-        best_dist_sq = jnp.min(dist_sq, axis=0)
         
-        robust_penalty = best_dist_sq / (best_dist_sq + current_c**2)
+        robust_penalty = dist_sq / (dist_sq + current_c**2)
         loss = jnp.sum(robust_penalty * intensities) / jnp.sum(intensities)
+        
         return loss, U_pred
-
 
     J_total = 131072      # Total swarm size you want
     J_batch = 16384       # Maximum particles your H100 can compile at once
