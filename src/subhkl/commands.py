@@ -1553,8 +1553,8 @@ def run_egnn(
     lambda_start = 1.0 # Strong swarm collapse
     lambda_end = 0.0   # Pure data refinement
     
-    for i in range(egnn_steps):
-        progress = i / egnn_steps
+    for i in range(steps):
+        progress = i / steps
         
         # Exponential decay for sigma
         current_sigma = sigma_start * (sigma_end / sigma_start) ** progress
@@ -1565,10 +1565,10 @@ def run_egnn(
             swarm_params, opt_state, current_sigma, current_lambda
         )
             
-        if (i + 1) % max(1, egnn_steps // 20) == 0 or i == egnn_steps - 1:
+        if (i + 1) % max(1, steps // 20) == 0 or i == steps - 1:
             best_particle_idx = jnp.argmin(individual_losses)
             best_loss = individual_losses[best_particle_idx]
-            print(f"    Step {i+1:05d}/{egnn_steps} | Swarm Mean Loss: {mean_loss:.4f} | Best Particle Loss: {best_loss:.4f}")
+            print(f"    Step {i+1:05d}/{steps} | Swarm Mean Loss: {mean_loss:.4f} | Best Particle Loss: {best_loss:.4f}")
 
     best_particle_idx = jnp.argmin(individual_losses)
     U_final = np.array(U_preds[best_particle_idx])
