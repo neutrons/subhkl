@@ -1462,105 +1462,120 @@ def run_egnn(
         normalized_weights = np.ones_like(log_weights)
 
     # ==========================================
-    # PHASE 3: e3nn-jax + Sinkhorn Optimal Transport
+    # PHASE 3: Robust Ensemble Swarm Optimization
     # ==========================================
-    from ott.geometry import pointcloud, costs
-    print(f"\n[3/3] Training Global e3nn-jax Network via Sinkhorn Transport...")
+    print(f"\n[3/3] Deploying Robust Ensemble Swarm (J=1024) across SO(3)...")
     from subhkl.optimization import get_lattice_system
     import jax
     import jax.numpy as jnp
     import numpy as np
     import optax
-    from ott.geometry import pointcloud
-    from ott.problems.linear import linear_problem
-    from ott.solvers.linear import sinkhorn
-    from subhkl.search.equivariant import build_laue_graph, E3NN_Indexer
 
-    # 1. Build the e3nn-jax SO(3) Graph
-    graph = build_laue_graph(q_sample_obs_norm, k_neighbors=20)
+    # 1. Setup Data
+    q_sample_unnorm = jnp.array(q_sample_obs).T
     intensities = jnp.array(normalized_weights)
     
-    # 2. Generate Theoretical Target Distribution (The Sinkhorn Target Distribution)
-    print(f"  > Generating Theoretical Reciprocal Targets (max_hkl={max_hkl_cons})...")
-    hc_vals = np.arange(-max_hkl_cons, max_hkl_cons + 1)
-    hc, kc, lc = np.meshgrid(hc_vals, hc_vals, hc_vals, indexing="ij")
-    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    _, _, centering = get_lattice_system(
+        ub_helper.a, ub_helper.b, ub_helper.c, 
+        ub_helper.alpha, ub_helper.beta, ub_helper.gamma, ub_helper.space_group
+    )
     
-    # Remove the (0,0,0) origin
-    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl_c = hkl_c[:, mask_hkl_c].astype(np.float32).T 
+    if centering == "I": M_prim = jnp.array([[0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
+    elif centering == "F": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5]])
+    elif centering == "C": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.0, 1.0]])
+    elif centering == "A": M_prim = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.0, 0.5, -0.5]])
+    elif centering == "B": M_prim = jnp.array([[0.5, 0.0, 0.5], [0.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
+    elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
+    else: M_prim = jnp.eye(3)
 
-    # Use B_mat to generate Reciprocal Space Momentum Vectors (q_theo)
-    r_theo_zones = (B_mat @ theo_hkl_c.T).T
-    
-    # Normalize to project onto the SO(3) unit sphere
-    r_unique_zones_norm = r_theo_zones / np.linalg.norm(r_theo_zones, axis=1, keepdims=True)
-    theoretical_zones = jnp.array(r_unique_zones_norm)
+    wavelengths = np.array(ub_helper.wavelength)
+    lam_grid = jnp.logspace(jnp.log10(wavelengths[0]), jnp.log10(wavelengths[1]), 64)
+    B_inv = jnp.linalg.inv(B_mat)
 
-    # 3. Model Initialization
-    model = E3NN_Indexer(num_layers=3)
+    # 2. 6D Continuous Rotation Definition
+    def compute_U(rot_6d):
+        a1 = rot_6d[:3]
+        a2 = rot_6d[3:]
+        b1 = a1 / (jnp.linalg.norm(a1) + 1e-6)
+        b2 = a2 - jnp.dot(b1, a2) * b1
+        b2 = b2 / (jnp.linalg.norm(b2) + 1e-6)
+        b3 = jnp.cross(b1, b2)
+        return jnp.stack([b1, b2, b3], axis=-1)
+
+    # 3. Initialize Swarm (J = 1024 particles)
+    J = 1024
     rng = jax.random.PRNGKey(42)
-    params = model.init(rng, graph, intensities)
-    
+    # Random uniform initialization across the 6D space
+    swarm_params = jax.random.normal(rng, (J, 6)) 
+
+    # 4. Define the Robust Periodic Loss for a single particle
+    def single_particle_loss(params):
+        U_pred = compute_U(params)
+        
+        UB_inv = jnp.matmul(B_inv, U_pred.T)
+        v = jnp.matmul(UB_inv, q_sample_unnorm)
+        
+        hkl_float = v[None, :, :] / lam_grid[:, None, None]
+        h, k, l = hkl_float[:, 0, :], hkl_float[:, 1, :], hkl_float[:, 2, :]
+        
+        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
+        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
+        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
+        
+        # No rounding! jnp.sin(pi*x)^2 / pi^2 perfectly mimics fractional distance 
+        # near integers but maintains global, trap-free differentiability.
+        dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
+        
+        # Pick the best integer assignment across all lam_grid harmonics
+        best_dist_sq = jnp.min(dist_sq, axis=0)
+        
+        # Tighten Geman-McClure to c=0.05
+        c = 0.05
+        robust_penalty = best_dist_sq / (best_dist_sq + c**2)
+        
+        loss = jnp.sum(robust_penalty * intensities) / jnp.sum(intensities)
+        return loss, U_pred
+
+    # 5. VMAP the loss to run all 1,024 particles in parallel
+    swarm_loss_fn = jax.vmap(single_particle_loss)
+
+    # Setup Optimizer
     egnn_steps = steps 
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),
-        optax.adam(learning_rate=optax.cosine_decay_schedule(0.01, egnn_steps))
+        optax.adam(learning_rate=optax.cosine_decay_schedule(0.1, egnn_steps))
     )
-    opt_state = optimizer.init(params)
-
-    # 4. Sinkhorn Optimal Transport Loss Function
-    # 4. Sinkhorn Optimal Transport Loss Function
-    @jax.jit
-    def loss_fn(params, epsilon):
-        # Extract U via Manifest Covariance SVD
-        U_pred = model.apply(params, graph, intensities)
-        
-        # Rotate the empirical Laue rays using the predicted matrix
-        empirical_rays = jnp.matmul(U_pred, graph.nodes.T).T
-        
-        # Build the Optimal Transport Geometry using the built-in OTT Cosine cost
-        geom = pointcloud.PointCloud(
-            x=empirical_rays, 
-            y=theoretical_zones,
-            cost_fn=costs.Cosine(),  # <--- THE FIX
-            epsilon=epsilon
-        )
-
-        # Define uniform marginal mass distributions
-        N = empirical_rays.shape[0]
-        M = theoretical_zones.shape[0]
-        a = jnp.ones(N) / N
-        b = jnp.ones(M) / M
-        
-        prob = linear_problem.LinearProblem(geom, a=a, b=b)
-        solver = sinkhorn.Sinkhorn()
-        out = solver(prob)
-        
-        loss = out.reg_ot_cost
-        return loss, U_pred
+    opt_state = optimizer.init(swarm_params)
 
     @jax.jit
-    def train_step(params, opt_state, epsilon):
-        (loss, U_pred), grads = jax.value_and_grad(loss_fn, has_aux=True)(params, epsilon)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, loss, U_pred
+    def train_step(swarm_params, opt_state):
+        # value_and_grad over the sum of all losses allows parallel gradient descent
+        def total_loss(p):
+            losses, Us = swarm_loss_fn(p)
+            return jnp.mean(losses), Us
+            
+        (mean_loss, U_preds), grads = jax.value_and_grad(total_loss, has_aux=True)(swarm_params)
+        updates, opt_state = optimizer.update(grads, opt_state, swarm_params)
+        swarm_params = optax.apply_updates(swarm_params, updates)
+        
+        # We also return the raw array of losses to find the global winner
+        individual_losses, _ = swarm_loss_fn(swarm_params)
+        return swarm_params, opt_state, mean_loss, U_preds, individual_losses
 
-    # 5. Annealing Execution (Epsilon Decay)
-    # We decay epsilon from a massive 0.1 (global blur) to 1e-4 (crisp matching)
-    eps_start = 0.10
-    eps_end = 1e-4
-    
+    # 6. Execute Swarm Optimization
     for i in range(egnn_steps):
-        current_eps = eps_start * (eps_end / eps_start) ** (i / egnn_steps)
-        params, opt_state, loss_val, U_pred = train_step(params, opt_state, current_eps)
+        swarm_params, opt_state, mean_loss, U_preds, individual_losses = train_step(swarm_params, opt_state)
             
         if (i + 1) % max(1, egnn_steps // 20) == 0 or i == egnn_steps - 1:
-            print(f"    Step {i+1:05d}/{egnn_steps} | OTT Epsilon: {current_eps:.5f} | Transport Cost: {loss_val:.4f}")
+            best_particle_idx = jnp.argmin(individual_losses)
+            best_loss = individual_losses[best_particle_idx]
+            print(f"    Step {i+1:05d}/{egnn_steps} | Swarm Mean Loss: {mean_loss:.4f} | Best Particle Loss: {best_loss:.4f}")
 
-    U_final = np.array(U_pred)
-    print("  > Macroscopic U-Matrix successfully extracted via Sinkhorn Transport.")
+    # Extract the absolute best matrix from the swarm
+    best_particle_idx = jnp.argmin(individual_losses)
+    U_final = np.array(U_preds[best_particle_idx])
+    
+    print("  > Macroscopic U-Matrix successfully extracted via Robust Ensemble Swarm.")
 
     # ==========================================
     # FINAL VALIDATION (Fractional Distance)
