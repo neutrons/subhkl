@@ -1547,20 +1547,67 @@ def run_egnn(
     )
     opt_state = optimizer.init(swarm_params)
 
+    # Hyperparameters for the EnSF Prior Score
+    # sigma controls the radius of the gravitational pull (bandwidth)
+    # lambda_prior controls how strongly the swarm collapses vs trusting the raw data
+    prior_sigma = 0.20 
+    lambda_prior = 0.05 
+
+    # Hyperparameters for the SO(3) vMF Prior Score
+    # sigma now represents chordal distance in 3x3 matrix space
+    prior_sigma = 0.10 
+    lambda_prior = 0.05 
+
+    @jax.jit
+    def single_vmf_log_density(single_params, U_swarm):
+        """
+        Calculates the von Mises-Fisher log-density of a single particle
+        relative to the rest of the swarm, evaluated purely on the SO(3) manifold.
+        """
+        # 1. Map the 6D params to the SO(3) manifold
+        U_single = compute_U(single_params)
+        
+        # 2. Calculate the squared Chordal (Frobenius) distance between matrices
+        # U_single is (3, 3), U_swarm is (1024, 3, 3)
+        sq_chordal_dists = jnp.sum((U_swarm - U_single)**2, axis=(-2, -1))
+        
+        # 3. Calculate vMF mixture logits
+        logits = -sq_chordal_dists / (2.0 * prior_sigma**2)
+        
+        # 4. Use LogSumExp for numerical stability of the log-density
+        log_density = jax.scipy.special.logsumexp(logits)
+        return log_density
+
+    # The EnSF Score is literally the gradient of the log-density!
+    # jax.grad handles the SO(3) -> Lie Algebra -> 6D mapping perfectly.
+    single_prior_score_fn = jax.grad(single_vmf_log_density, argnums=0)
+    
+    # Vmap over the swarm
+    vmap_prior_score = jax.vmap(single_prior_score_fn, in_axes=(0, None))
+
     @jax.jit
     def train_step(swarm_params, opt_state):
-        # value_and_grad over the sum of all losses allows parallel gradient descent
+        # 1. Wrapper to return a scalar loss for JAX
         def total_loss(p):
             losses, Us = swarm_loss_fn(p)
-            return jnp.mean(losses), Us
+            return jnp.mean(losses), (Us, losses)
             
-        (mean_loss, U_preds), grads = jax.value_and_grad(total_loss, has_aux=True)(swarm_params)
-        updates, opt_state = optimizer.update(grads, opt_state, swarm_params)
+        (mean_loss, (U_preds, individual_losses)), raw_grads = jax.value_and_grad(
+            total_loss, has_aux=True
+        )(swarm_params)
+        
+        # 2. Get the Ensemble Prior Score using the 3x3 matrices!
+        # JAX autodiff handles the conversion back to 6D gradients.
+        prior_scores = vmap_prior_score(swarm_params, U_preds)
+        
+        # 3. The EnSF Gradient Modification (Minimize Loss, Maximize Density)
+        total_grads = raw_grads - (lambda_prior * prior_scores)
+        
+        # 4. Apply updates
+        updates, opt_state = optimizer.update(total_grads, opt_state, swarm_params)
         swarm_params = optax.apply_updates(swarm_params, updates)
         
-        # We also return the raw array of losses to find the global winner
-        individual_losses, _ = swarm_loss_fn(swarm_params)
-        return swarm_params, opt_state, mean_loss, U_preds, individual_losses
+        return swarm_params, opt_state, mean_loss, U_preds, individual_losses 
 
     # 6. Execute Swarm Optimization
     for i in range(egnn_steps):
