@@ -1499,46 +1499,62 @@ def run_egnn(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    def single_particle_loss(params, current_c):
+    import itertools
+    # Generate the 27 local offsets: (-1,0,1) for h, k, l
+    local_offsets = jnp.array(list(itertools.product([-1, 0, 1], repeat=3)), dtype=jnp.float32).T 
+    # Shape of local_offsets: (3, 27)
+
+    def globally_differentiable_loss(params, current_c, tau=0.1):
         U_pred = compute_U(params)
-        
         UB_inv = jnp.matmul(B_inv, U_pred.T)
-        v = jnp.matmul(UB_inv, q_sample_unnorm)
+        v = jnp.matmul(UB_inv, q_sample_unnorm) # Shape: (3, N)
         
-        # 1. COARSE ASSIGNMENT: Use the grid strictly to find the nearest integer neighborhood
+        # 1. COARSE ANCHOR (Stop Gradients here, it just centers our neighborhood)
         hkl_float_coarse = v[None, :, :] / lam_grid[:, None, None]
         hkl_int_coarse = jnp.round(hkl_float_coarse)
-        
-        # Fast naive distance to find the best grid index
         diff_sq = jnp.sum((hkl_float_coarse - hkl_int_coarse)**2, axis=1)
-        best_grid_idx = jnp.argmin(diff_sq, axis=0)
-        best_lam_coarse = lam_grid[best_grid_idx]
+        best_lam_coarse = lam_grid[jnp.argmin(diff_sq, axis=0)]
+        anchor_hkl = jax.lax.stop_gradient(jnp.round(v / best_lam_coarse[None, :]))
         
-        # 2. TARGET LOCK: Extract the nearest integer and STOP GRADIENTS
-        hkl_int = jnp.round(v / best_lam_coarse[None, :])
-        hkl_int_fixed = jax.lax.stop_gradient(hkl_int)
+        # 2. GENERATE THE 27 NEIGHBORHOOD CANDIDATES
+        # Expand dims to add offsets to every peak. 
+        # anchor is (3, N) -> (3, N, 1). offsets is (3, 27) -> (3, 1, 27)
+        # candidates shape: (3, N_peaks, 27_neighbors)
+        candidates = anchor_hkl[:, :, None] + local_offsets[:, None, :]
         
-        # 3. ANALYTICAL PROJECTION: Calculate the exact continuous lambda
-        # Minimizes || v/lambda - hkl_int ||^2 geometrically
-        num = jnp.sum(v**2, axis=0)
-        den = jnp.sum(v * hkl_int_fixed, axis=0) + 1e-9
-        lam_opt = jnp.clip(num / den, lam_grid[0], lam_grid[-1])
+        # 3. ANALYTICAL PROJECTION FOR ALL 27 CANDIDATES
+        # v is (3, N). We need it to be (3, N, 1) to broadcast with the 27 candidates
+        v_exp = v[:, :, None] 
         
-        # 4. EXACT FRACTIONAL COORDINATES: Smooth and fully differentiable!
-        hkl_float_exact = v / lam_opt[None, :]
-        h = hkl_float_exact[0, :]
-        k = hkl_float_exact[1, :]
-        l = hkl_float_exact[2, :]
+        num = jnp.sum(v_exp**2, axis=0) # (N, 1)
+        den = jnp.sum(v_exp * candidates, axis=0) + 1e-9 # (N, 27)
+        lam_opt = jnp.clip(num / den, lam_grid[0], lam_grid[-1]) # (N, 27)
         
-        # 5. CENTERING & LOSS
+        # 4. EXACT FRACTIONAL COORDINATES FOR ALL 27 CANDIDATES
+        hkl_float_exact = v_exp / lam_opt[None, :, :] # (3, N, 27)
+        
+        h = hkl_float_exact[0, :, :]
+        k = hkl_float_exact[1, :, :]
+        l = hkl_float_exact[2, :, :]
+        
         h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
         k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
         l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
         
+        # Calculate raw trigonometric distance for all 27 neighbors
         dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
+        robust_penalties = dist_sq / (dist_sq + current_c**2) # (N, 27)
         
-        robust_penalty = dist_sq / (dist_sq + current_c**2)
-        loss = jnp.sum(robust_penalty * intensities) / jnp.sum(intensities)
+        # 5. THE SOFTMAX BLEND (Differentiable Expected Loss)
+        # Calculate how close the projected point actually is to the integer candidate
+        # The closer it is, the higher the softmax weight
+        assignment_logits = -dist_sq / tau
+        weights = jax.nn.softmax(assignment_logits, axis=-1) # (N, 27)
+        
+        # The expected penalty for a peak is the weighted sum of its 27 neighbor penalties
+        expected_peak_penalties = jnp.sum(weights * robust_penalties, axis=-1) # (N,)
+        
+        loss = jnp.sum(expected_peak_penalties * intensities) / jnp.sum(intensities)
         
         return loss, U_pred
 
