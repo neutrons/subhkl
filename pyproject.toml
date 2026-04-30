@@ -89,6 +89,7 @@ ignore = ["E741"]
 
 [dependency-groups]
 dev = [
+    "ipykernel>=7.2.0",
     "pyright>=1.1.408",
     "pytest>=8.0.2",
     "pytest-cov>=4.1.0",
