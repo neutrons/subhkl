@@ -15,7 +15,7 @@ from subhkl.commands import (
     run_reduce,
     run_merge_images,
     run_egnn,
-    run_core_filter
+    run_score_filter
 )
 
 
