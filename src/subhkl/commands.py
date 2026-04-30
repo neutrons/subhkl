@@ -1975,23 +1975,28 @@ def run_score_filter(
     # EVENT-MODE DATA ASSIMILATION LOGIC
     # ==========================================
     if event_nexus_filename:
-            print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
-            
-            all_q_lab = []
-            all_times = []
-            all_banks = []       # NEW
-            all_pixels_r = []    # NEW
-            all_pixels_c = []    # NEW
-            
-            with h5py.File(event_nexus_filename, 'r') as f:
-                entry = f['entry']
-                for key in entry.keys():
-                    if key.endswith('_events'):
-                        bank_str = key.replace('bank', '').replace('_events', '')
-                        bank_id = int(bank_str) # Keep as integer for dictionary matching
+        print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
+        import re
+        
+        all_q_lab = []
+        all_times = []
+        all_banks = []       # NEW
+        all_pixels_r = []    # NEW
+        all_pixels_c = []    # NEW
+        
+        with h5py.File(event_nexus_filename, 'r') as f:
+            entry = f['entry']
+            for key in entry.keys():
+                if key.endswith('_events'):
+                    match = re.match(r"bank(\d+)_events", key)
+                    
+                    if match:
+                        bank_id = int(match.group(1))
+                        bank_str = str(bank_id)
                         folder = f'/entry/{key}'
-                        
+
                         event_id = f[folder+'/event_id'][:]
+                        event_index = f[folder+'/event_index'][:]
                         event_index = f[folder+'/event_index'][:]
                         event_time_offset = f[folder+'/event_time_offset'][:]
                         event_time_zero = f[folder+'/event_time_zero'][:]
@@ -2031,19 +2036,19 @@ def run_score_filter(
                             all_pixels_r.append(pixel_r)
                             all_pixels_c.append(pixel_c)
 
-            # Flatten and sort events temporally
-            all_q_lab = np.vstack(all_q_lab)
-            all_times = np.concatenate(all_times)
-            all_banks = np.concatenate(all_banks)
-            all_pixels_r = np.concatenate(all_pixels_r)
-            all_pixels_c = np.concatenate(all_pixels_c)
-            
-            sort_idx = np.argsort(all_times)
-            all_q_lab = all_q_lab[sort_idx]
-            all_times = all_times[sort_idx]
-            all_banks = all_banks[sort_idx]
-            all_pixels_r = all_pixels_r[sort_idx]
-            all_pixels_c = all_pixels_c[sort_idx]
+        # Flatten and sort events temporally
+        all_q_lab = np.vstack(all_q_lab)
+        all_times = np.concatenate(all_times)
+        all_banks = np.concatenate(all_banks)
+        all_pixels_r = np.concatenate(all_pixels_r)
+        all_pixels_c = np.concatenate(all_pixels_c)
+        
+        sort_idx = np.argsort(all_times)
+        all_q_lab = all_q_lab[sort_idx]
+        all_times = all_times[sort_idx]
+        all_banks = all_banks[sort_idx]
+        all_pixels_r = all_pixels_r[sort_idx]
+        all_pixels_c = all_pixels_c[sort_idx]
 
     # Core JAX Functions
     def compute_U(rot_6d):
