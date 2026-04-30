@@ -1975,66 +1975,75 @@ def run_score_filter(
     # EVENT-MODE DATA ASSIMILATION LOGIC
     # ==========================================
     if event_nexus_filename:
-        print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
-
-        all_q_lab = []
-        all_times = []
-
-        with h5py.File(event_nexus_filename, 'r') as f:
-            entry = f['entry']
-            for key in entry.keys():
-                if key.endswith('_events'):
-                    bank_id = key.replace('bank', '').replace('_events', '')
-                    folder = f'/entry/{key}'
-
-                    event_id = f[folder+'/event_id'][:]
-                    event_index = f[folder+'/event_index'][:]
-                    event_time_offset = f[folder+'/event_time_offset'][:]
-                    event_time_zero = f[folder+'/event_time_zero'][:]
-
-                    # Unfold Time
-                    counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
-                    pulse_times_broadcast = np.repeat(event_time_zero, counts_per_pulse)
-                    absolute_time = pulse_times_broadcast + (event_time_offset * 1e-6)
-                    
-                    if instrument_name in beamlines and bank_id in beamlines[instrument_name]:
-                        from subhkl.config import reduction_settings
+            print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
+            
+            all_q_lab = []
+            all_times = []
+            all_banks = []       # NEW
+            all_pixels_r = []    # NEW
+            all_pixels_c = []    # NEW
+            
+            with h5py.File(event_nexus_filename, 'r') as f:
+                entry = f['entry']
+                for key in entry.keys():
+                    if key.endswith('_events'):
+                        bank_str = key.replace('bank', '').replace('_events', '')
+                        bank_id = int(bank_str) # Keep as integer for dictionary matching
+                        folder = f'/entry/{key}'
                         
-                        det_config = beamlines[instrument_name][bank_id]
-                        det = Detector(det_config)
-                        settings = reduction_settings.get(instrument_name, {})
+                        event_id = f[folder+'/event_id'][:]
+                        event_index = f[folder+'/event_index'][:]
+                        event_time_offset = f[folder+'/event_time_offset'][:]
+                        event_time_zero = f[folder+'/event_time_zero'][:]
                         
-                        # 1. Apply bank-specific event ID offset
-                        offset = det_config.get("offset", 0)
-                        local_id = event_id - offset
+                        counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
+                        pulse_times_broadcast = np.repeat(event_time_zero, counts_per_pulse)
+                        absolute_time = pulse_times_broadcast + (event_time_offset * 1e-6)
                         
-                        # 2. Map 1D index to 2D pixels using instrument serialization
-                        if settings.get("YAxisIsFastVaryingIndex"):
-                            pixel_c = local_id // det.n
-                            pixel_r = local_id % det.n
-                        else:
-                            pixel_c = local_id % det.m
-                            pixel_r = local_id // det.m
-                        
-                        # 3. Project to Physical Lab Frame
-                        xyz = det.pixel_to_lab(pixel_r, pixel_c)
-                        
-                        kf = xyz - ub_helper.sample_offset[None, :]
-                        kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
-                        q_lab = kf - ub_helper.ki_vec[None, :]
-                        
-                        all_q_lab.append(q_lab)
-                        all_times.append(absolute_time)
+                        if instrument_name in beamlines and bank_str in beamlines[instrument_name]:
+                            from subhkl.config import reduction_settings
+                            
+                            det_config = beamlines[instrument_name][bank_str]
+                            det = Detector(det_config)
+                            settings = reduction_settings.get(instrument_name, {})
+                            
+                            offset = det_config.get("offset", 0)
+                            local_id = event_id - offset
+                            
+                            if settings.get("YAxisIsFastVaryingIndex"):
+                                pixel_c = local_id // det.n
+                                pixel_r = local_id % det.n
+                            else:
+                                pixel_c = local_id % det.m
+                                pixel_r = local_id // det.m
+                            
+                            xyz = det.pixel_to_lab(pixel_r, pixel_c)
+                            
+                            kf = xyz - ub_helper.sample_offset[None, :]
+                            kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
+                            q_lab = kf - ub_helper.ki_vec[None, :]
+                            
+                            all_q_lab.append(q_lab)
+                            all_times.append(absolute_time)
+                            
+                            # NEW: Track the pixel hits
+                            all_banks.append(np.full(len(absolute_time), bank_id))
+                            all_pixels_r.append(pixel_r)
+                            all_pixels_c.append(pixel_c)
 
-        # Flatten and sort events temporally
-        all_q_lab = np.vstack(all_q_lab)
-        all_times = np.concatenate(all_times)
-
-        sort_idx = np.argsort(all_times)
-        all_q_lab = all_q_lab[sort_idx]
-        all_times = all_times[sort_idx]
-
-        print(f"  > Loaded and time-sorted {len(all_times)} total neutron events.")
+            # Flatten and sort events temporally
+            all_q_lab = np.vstack(all_q_lab)
+            all_times = np.concatenate(all_times)
+            all_banks = np.concatenate(all_banks)
+            all_pixels_r = np.concatenate(all_pixels_r)
+            all_pixels_c = np.concatenate(all_pixels_c)
+            
+            sort_idx = np.argsort(all_times)
+            all_q_lab = all_q_lab[sort_idx]
+            all_times = all_times[sort_idx]
+            all_banks = all_banks[sort_idx]
+            all_pixels_r = all_pixels_r[sort_idx]
+            all_pixels_c = all_pixels_c[sort_idx]
 
     # Core JAX Functions
     def compute_U(rot_6d):
@@ -2152,21 +2161,33 @@ def run_score_filter(
                     ensf_params, opt_state, 0.05, 0.10, 1000.0, 0.8, q_window
                 )
 
-            # Extract current mode (Differentiable Mean-Shift)
-            best_idx = jnp.argmin(losses)
+            # Extract current mode
+            best_idx = int(jnp.argmin(losses))
             tracking_history.append((all_times[end_idx], np.array(U_preds[best_idx])))
-
+            
             if start_idx % (step_size_events * 5) == 0:
                 print(f"    Assimilation Time {all_times[end_idx]:.2f}s | Current Swarm Loss: {mean_loss:.4f}")
 
             # 3. TRIGGER CALLBACK
             if streaming_callback is not None:
+                # To prevent double-counting in the sliding window, we only pass 
+                # the step_size_events that are entirely new to this frame.
+                new_start = 0 if start_idx == 0 else end_idx - step_size_events
+                
+                new_events = {
+                    "banks": all_banks[new_start:end_idx],
+                    "pixel_r": all_pixels_r[new_start:end_idx],
+                    "pixel_c": all_pixels_c[new_start:end_idx]
+                }
+                
                 streaming_callback(
                     time=float(all_times[end_idx]),
                     U_preds=np.array(U_preds),
                     losses=np.array(losses),
                     mean_loss=float(mean_loss),
-                    best_idx=best_idx
+                    best_idx=best_idx,
+                    neutron_count=end_idx,
+                    new_events=new_events
                 )
 
         print(f"\n[4/4] Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
