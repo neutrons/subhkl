@@ -1995,21 +1995,33 @@ def run_score_filter(
                     counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
                     pulse_times_broadcast = np.repeat(event_time_zero, counts_per_pulse)
                     absolute_time = pulse_times_broadcast + (event_time_offset * 1e-6)
-
-                    # Map to spatial detector pixels
-                    # Note: Assumes 256x256 detector panel. Update based on specific instrument serialization
-                    pixel_c = event_id % 256
-                    pixel_r = (event_id // 256) % 256
-
+                    
                     if instrument_name in beamlines and bank_id in beamlines[instrument_name]:
+                        from subhkl.config import reduction_settings
+                        
                         det_config = beamlines[instrument_name][bank_id]
                         det = Detector(det_config)
+                        settings = reduction_settings.get(instrument_name, {})
+                        
+                        # 1. Apply bank-specific event ID offset
+                        offset = det_config.get("offset", 0)
+                        local_id = event_id - offset
+                        
+                        # 2. Map 1D index to 2D pixels using instrument serialization
+                        if settings.get("YAxisIsFastVaryingIndex"):
+                            pixel_c = local_id // det.n
+                            pixel_r = local_id % det.n
+                        else:
+                            pixel_c = local_id % det.m
+                            pixel_r = local_id // det.m
+                        
+                        # 3. Project to Physical Lab Frame
                         xyz = det.pixel_to_lab(pixel_r, pixel_c)
-
+                        
                         kf = xyz - ub_helper.sample_offset[None, :]
                         kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
                         q_lab = kf - ub_helper.ki_vec[None, :]
-
+                        
                         all_q_lab.append(q_lab)
                         all_times.append(absolute_time)
 
