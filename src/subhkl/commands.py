@@ -1917,3 +1917,234 @@ def run_egnn(
                         import traceback
                         print(f"Visualization failed for {out_name}:")
                         traceback.print_exc()
+
+def run_score_filter(
+    finder_file: str,
+    output_h5_filename: str,
+    instrument_name: str | None = None,
+    event_nexus_filename: str | None = None,
+    steps: int = 3000,
+):
+    from subhkl.optimization import FindUB, get_lattice_system
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    import h5py
+    import numpy as np
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
+
+    ub_helper = FindUB()
+    with h5py.File(finder_file, "r") as f:
+        ub_helper.a = f["sample/a"][()] if "sample/a" in f else None
+        ub_helper.b = f["sample/b"][()] if "sample/b" in f else None
+        ub_helper.c = f["sample/c"][()] if "sample/c" in f else None
+        ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else None
+        ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
+        ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
+
+        ub_helper.sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
+        ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
+
+        sg = f["sample/space_group"][()]
+        ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
+        ub_helper.wavelength = f["instrument/wavelength"][()]
+
+    B_mat = ub_helper.reciprocal_lattice_B()
+    B_inv = jnp.linalg.inv(B_mat)
+    wavelengths = np.array(ub_helper.wavelength)
+    lam_grid = jnp.logspace(jnp.log10(wavelengths[0]), jnp.log10(wavelengths[1]), 64)
+
+    _, _, centering = get_lattice_system(
+        ub_helper.a, ub_helper.b, ub_helper.c,
+        ub_helper.alpha, ub_helper.beta, ub_helper.gamma, ub_helper.space_group
+    )
+
+    if centering == "I": M_prim = jnp.array([[0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
+    elif centering == "F": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5]])
+    elif centering == "C": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.0, 1.0]])
+    elif centering == "A": M_prim = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.0, 0.5, -0.5]])
+    elif centering == "B": M_prim = jnp.array([[0.5, 0.0, 0.5], [0.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
+    elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
+    else: M_prim = jnp.eye(3)
+
+    # ==========================================
+    # EVENT-MODE DATA ASSIMILATION LOGIC
+    # ==========================================
+    if event_nexus_filename:
+        print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
+
+        all_q_lab = []
+        all_times = []
+
+        with h5py.File(event_nexus_filename, 'r') as f:
+            entry = f['entry']
+            for key in entry.keys():
+                if key.endswith('_events'):
+                    bank_id = key.replace('bank', '').replace('_events', '')
+                    folder = f'/entry/{key}'
+
+                    event_id = f[folder+'/event_id'][:]
+                    event_index = f[folder+'/event_index'][:]
+                    event_time_offset = f[folder+'/event_time_offset'][:]
+                    event_time_zero = f[folder+'/event_time_zero'][:]
+
+                    # Unfold Time
+                    counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
+                    pulse_times_broadcast = np.repeat(event_time_zero, counts_per_pulse)
+                    absolute_time = pulse_times_broadcast + (event_time_offset * 1e-6)
+
+                    # Map to spatial detector pixels
+                    # Note: Assumes 256x256 detector panel. Update based on specific instrument serialization
+                    pixel_c = event_id % 256
+                    pixel_r = (event_id // 256) % 256
+
+                    if instrument_name in beamlines and bank_id in beamlines[instrument_name]:
+                        det_config = beamlines[instrument_name][bank_id]
+                        det = Detector(det_config)
+                        xyz = det.pixel_to_lab(pixel_r, pixel_c)
+
+                        kf = xyz - ub_helper.sample_offset[None, :]
+                        kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
+                        q_lab = kf - ub_helper.ki_vec[None, :]
+
+                        all_q_lab.append(q_lab)
+                        all_times.append(absolute_time)
+
+        # Flatten and sort events temporally
+        all_q_lab = np.vstack(all_q_lab)
+        all_times = np.concatenate(all_times)
+
+        sort_idx = np.argsort(all_times)
+        all_q_lab = all_q_lab[sort_idx]
+        all_times = all_times[sort_idx]
+
+        print(f"  > Loaded and time-sorted {len(all_times)} total neutron events.")
+
+    # Core JAX Functions
+    def compute_U(rot_6d):
+        a1 = rot_6d[:3]
+        a2 = rot_6d[3:]
+        b1 = a1 / (jnp.linalg.norm(a1) + 1e-6)
+        b2 = a2 - jnp.dot(b1, a2) * b1
+        b2 = b2 / (jnp.linalg.norm(b2) + 1e-6)
+        b3 = jnp.cross(b1, b2)
+        return jnp.stack([b1, b2, b3], axis=-1)
+
+    def single_particle_loss(params, current_c, q_batch_unnorm):
+        U_pred = compute_U(params)
+        UB_inv = jnp.matmul(B_inv, U_pred.T)
+        v = jnp.matmul(UB_inv, q_batch_unnorm)
+
+        hkl_float_coarse = v[None, :, :] / lam_grid[:, None, None]
+        hkl_int_coarse = jnp.round(hkl_float_coarse)
+        diff_sq = jnp.sum((hkl_float_coarse - hkl_int_coarse)**2, axis=1)
+        best_grid_idx = jnp.argmin(diff_sq, axis=0)
+        best_lam_coarse = lam_grid[best_grid_idx]
+
+        hkl_int = jnp.round(v / best_lam_coarse[None, :])
+        hkl_int_fixed = jax.lax.stop_gradient(hkl_int)
+
+        num = jnp.sum(v**2, axis=0)
+        den = jnp.sum(v * hkl_int_fixed, axis=0) + 1e-9
+        lam_opt = jnp.clip(num / den, lam_grid[0], lam_grid[-1])
+
+        hkl_float_exact = v / lam_opt[None, :]
+        h, k, l = hkl_float_exact[0, :], hkl_float_exact[1, :], hkl_float_exact[2, :]
+
+        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
+        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
+        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
+
+        dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
+
+        robust_penalty = dist_sq / (dist_sq + current_c**2)
+        # In event mode, all events have equal weight (no integrated intensity)
+        loss = jnp.mean(robust_penalty)
+
+        return loss, U_pred
+
+    # ==========================================
+    # PHASE 3: STREAMING EnSF LOOP
+    # ==========================================
+    if event_nexus_filename:
+        print("\n[3/4] Executing Streaming Forecast-Analysis Cycle...")
+
+        # Initial Swarm (Could be smaller for fast lock-in)
+        J_ensf = 1024
+        rng = jax.random.PRNGKey(42)
+        ensf_params = jax.random.normal(rng, (J_ensf, 6))
+
+        @jax.jit
+        def single_loss_weighted_vmf(single_params, U_swarm, losses_swarm, current_sigma, gamma):
+            U_single = compute_U(single_params)
+            sq_chordal_dists = jnp.sum((U_swarm - U_single)**2, axis=(-2, -1))
+            logits = -sq_chordal_dists / (2.0 * current_sigma**2) - (gamma * losses_swarm)
+            return jax.scipy.special.logsumexp(logits)
+
+        prior_score_fn = jax.grad(single_loss_weighted_vmf, argnums=0)
+        vmap_prior = jax.vmap(prior_score_fn, in_axes=(0, None, None, None, None))
+        ensf_loss_fn = jax.vmap(single_particle_loss, in_axes=(0, None, None))
+
+        opt_ensf = optax.adam(0.02)
+        opt_state = opt_ensf.init(ensf_params)
+
+        @jax.jit
+        def train_step_streaming(params, opt_state, current_c, current_sigma, gamma, current_lambda, q_batch):
+            def total_loss(p):
+                losses, Us = ensf_loss_fn(p, current_c, q_batch)
+                return jnp.mean(losses), (Us, losses)
+
+            (mean_loss, (U_preds, individual_losses)), raw_grads = jax.value_and_grad(
+                total_loss, has_aux=True
+            )(params)
+
+            prior_scores = vmap_prior(params, U_preds, individual_losses, current_sigma, gamma)
+            total_grads = raw_grads - (current_lambda * prior_scores)
+
+            updates, opt_state = opt_ensf.update(total_grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            return params, opt_state, mean_loss, U_preds, individual_losses
+
+        # Sliding Window Setup
+        window_size_events = 25000  # Number of neutrons per assimilation step
+        step_size_events = 10000    # Sliding overlap
+
+        tracking_history = []
+
+        # Fast Initial Lock-in (Phase 3A behavior on first window)
+        q_init = jnp.array(all_q_lab[:window_size_events]).T
+        for _ in range(500):
+            ensf_params, opt_state, mean_loss, U_preds, losses = train_step_streaming(
+                ensf_params, opt_state, 0.15, 0.10, 1000.0, 0.0, q_init # No gravity, independent search
+            )
+
+        print("  > Initial global orientation locked. Beginning sliding window tracker.")
+
+        # The Streaming Loop
+        for start_idx in range(0, len(all_q_lab) - window_size_events, step_size_events):
+            end_idx = start_idx + window_size_events
+            q_window = jnp.array(all_q_lab[start_idx:end_idx]).T
+
+            # 1. FORECAST (Diffusion)
+            rng, subkey = jax.random.split(rng)
+            diffusion_noise = jax.random.normal(subkey, ensf_params.shape) * 0.05
+            ensf_params = ensf_params + diffusion_noise
+
+            # 2. ANALYSIS (EnSF Gravity Collapse)
+            for _ in range(20): # Very fast update!
+                ensf_params, opt_state, mean_loss, U_preds, losses = train_step_streaming(
+                    ensf_params, opt_state, 0.05, 0.10, 1000.0, 0.8, q_window
+                )
+
+            # Extract current mode (Differentiable Mean-Shift)
+            best_idx = jnp.argmin(losses)
+            tracking_history.append((all_times[end_idx], np.array(U_preds[best_idx])))
+
+            if start_idx % (step_size_events * 5) == 0:
+                print(f"    Assimilation Time {all_times[end_idx]:.2f}s | Current Swarm Loss: {mean_loss:.4f}")
+
+        print(f"\n[4/4] Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
+        U_final = tracking_history[-1][1] # Use the final matrix for downstream saves
