@@ -1918,6 +1918,69 @@ def run_egnn(
                         print(f"Visualization failed for {out_name}:")
                         traceback.print_exc()
 
+def _process_single_bank(args):
+    """Parallel worker to parse and project a single detector bank."""
+    import h5py, numpy as np, re
+    from subhkl.instrument.detector import Detector
+    from subhkl.config import beamlines, reduction_settings
+
+    nexus_filename, key, instrument_name, sample_offset, ki_vec = args
+
+    with h5py.File(nexus_filename, 'r') as f:
+        match = re.match(r"bank(\d+)_events", key)
+        if not match: return None
+        bank_id = int(match.group(1))
+        bank_str = str(bank_id)
+
+        folder = f'/entry/{key}'
+        if folder+'/event_id' not in f: return None
+
+        event_id = f[folder+'/event_id'][:]
+        event_index = f[folder+'/event_index'][:]
+        event_time_offset = f[folder+'/event_time_offset'][:]
+        event_time_zero = f[folder+'/event_time_zero'][:]
+
+    if len(event_id) == 0: return None
+
+    # Fast Unfold
+    counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
+    absolute_time = np.repeat(event_time_zero, counts_per_pulse) + (event_time_offset * 1e-6)
+
+    # Map Pixels
+    det_config = beamlines[instrument_name][bank_str]
+    det = Detector(det_config)
+    settings = reduction_settings.get(instrument_name, {})
+
+    offset = det_config.get("offset", 0)
+    local_id = event_id - offset
+
+    if settings.get("YAxisIsFastVaryingIndex"):
+        pixel_c = local_id // det.n
+        pixel_r = local_id % det.n
+    else:
+        pixel_c = local_id % det.m
+        pixel_r = local_id // det.m
+
+    # Fast Geometry Projection
+    xyz = det.pixel_to_lab(pixel_r, pixel_c)
+    kf = xyz - sample_offset[None, :]
+
+    # Vectorized Norm
+    kf_norm = np.sqrt(np.sum(kf**2, axis=1, keepdims=True))
+    kf /= np.where(kf_norm == 0, 1.0, kf_norm)
+
+    q_lab = kf - ki_vec[None, :]
+    banks = np.full(len(absolute_time), bank_id, dtype=np.int16)
+
+    # Cast arrays to smaller memory footprints for massive global sorting!
+    return (
+        q_lab.astype(np.float32),
+        absolute_time,
+        banks,
+        pixel_r.astype(np.int16),
+        pixel_c.astype(np.int16)
+    )
+
 def run_score_filter(
     finder_file: str,
     output_h5_filename: str,
@@ -1976,67 +2039,30 @@ def run_score_filter(
     # ==========================================
     if event_nexus_filename:
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
-        import re
-        
-        all_q_lab = []
-        all_times = []
-        all_banks = []       # NEW
-        all_pixels_r = []    # NEW
-        all_pixels_c = []    # NEW
-        
+        import multiprocessing
+        import concurrent.futures
+
         with h5py.File(event_nexus_filename, 'r') as f:
-            entry = f['entry']
-            for key in entry.keys():
-                if key.endswith('_events'):
-                    match = re.match(r"bank(\d+)_events", key)
-                    
-                    if match:
-                        bank_id = int(match.group(1))
-                        bank_str = str(bank_id)
-                        folder = f'/entry/{key}'
+            keys = list(f['entry'].keys())
 
-                        event_id = f[folder+'/event_id'][:]
-                        event_index = f[folder+'/event_index'][:]
-                        event_index = f[folder+'/event_index'][:]
-                        event_time_offset = f[folder+'/event_time_offset'][:]
-                        event_time_zero = f[folder+'/event_time_zero'][:]
-                        
-                        counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
-                        pulse_times_broadcast = np.repeat(event_time_zero, counts_per_pulse)
-                        absolute_time = pulse_times_broadcast + (event_time_offset * 1e-6)
-                        
-                        if instrument_name in beamlines and bank_str in beamlines[instrument_name]:
-                            from subhkl.config import reduction_settings
-                            
-                            det_config = beamlines[instrument_name][bank_str]
-                            det = Detector(det_config)
-                            settings = reduction_settings.get(instrument_name, {})
-                            
-                            offset = det_config.get("offset", 0)
-                            local_id = event_id - offset
-                            
-                            if settings.get("YAxisIsFastVaryingIndex"):
-                                pixel_c = local_id // det.n
-                                pixel_r = local_id % det.n
-                            else:
-                                pixel_c = local_id % det.m
-                                pixel_r = local_id // det.m
-                            
-                            xyz = det.pixel_to_lab(pixel_r, pixel_c)
-                            
-                            kf = xyz - ub_helper.sample_offset[None, :]
-                            kf = kf / np.linalg.norm(kf, axis=1, keepdims=True)
-                            q_lab = kf - ub_helper.ki_vec[None, :]
-                            
-                            all_q_lab.append(q_lab)
-                            all_times.append(absolute_time)
-                            
-                            # NEW: Track the pixel hits
-                            all_banks.append(np.full(len(absolute_time), bank_id))
-                            all_pixels_r.append(pixel_r)
-                            all_pixels_c.append(pixel_c)
+        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec) 
+                     for k in keys if k.endswith('_events')]
 
-        # Flatten and sort events temporally
+        print(f"  > Dispatching {len(args_list)} banks to parallel workers...")
+        all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
+
+        # Launch physical CPU cores to parse HDF5 in parallel
+        with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
+            for result in executor.map(_process_single_bank, args_list):
+                if result is not None:
+                    q, t, b, pr, pc = result
+                    all_q_lab.append(q)
+                    all_times.append(t)
+                    all_banks.append(b)
+                    all_pixels_r.append(pr)
+                    all_pixels_c.append(pc)
+
+        print("  > Aggregating and time-sorting global event stream...")
         all_q_lab = np.vstack(all_q_lab)
         all_times = np.concatenate(all_times)
         all_banks = np.concatenate(all_banks)
@@ -2049,6 +2075,8 @@ def run_score_filter(
         all_banks = all_banks[sort_idx]
         all_pixels_r = all_pixels_r[sort_idx]
         all_pixels_c = all_pixels_c[sort_idx]
+        
+        print(f"  > Ready! Processed {len(all_times):,} total neutron events.")
 
     # Core JAX Functions
     def compute_U(rot_6d):
