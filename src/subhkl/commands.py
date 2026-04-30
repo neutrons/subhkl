@@ -1924,6 +1924,7 @@ def run_score_filter(
     instrument_name: str | None = None,
     event_nexus_filename: str | None = None,
     steps: int = 3000,
+    streaming_callback = None,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     from subhkl.config import beamlines
@@ -2157,6 +2158,16 @@ def run_score_filter(
 
             if start_idx % (step_size_events * 5) == 0:
                 print(f"    Assimilation Time {all_times[end_idx]:.2f}s | Current Swarm Loss: {mean_loss:.4f}")
+
+            # 3. TRIGGER CALLBACK
+            if streaming_callback is not None:
+                streaming_callback(
+                    time=float(all_times[end_idx]),
+                    U_preds=np.array(U_preds),
+                    losses=np.array(losses),
+                    mean_loss=float(mean_loss),
+                    best_idx=best_idx
+                )
 
         print(f"\n[4/4] Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
         U_final = tracking_history[-1][1] # Use the final matrix for downstream saves
