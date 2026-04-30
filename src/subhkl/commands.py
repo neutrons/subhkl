@@ -2178,6 +2178,11 @@ def run_score_filter(
 
         print("  > Initial global orientation locked. Beginning sliding window tracker.")
 
+        # Initialize memory variables before the loop
+        smoothed_losses = None
+        alpha = 0.1  # Memory factor: 10% new batch data, 90% historical data. 
+                     # Decrease this to make the tracking "stickier".
+
         # The Streaming Loop
         for start_idx in range(0, len(all_q_lab) - window_size_events, step_size_events):
             end_idx = start_idx + window_size_events
@@ -2194,8 +2199,17 @@ def run_score_filter(
                     ensf_params, opt_state, 0.05, 0.10, 1000.0, 0.8, q_window
                 )
 
-            # Extract current mode
-            best_idx = int(jnp.argmin(losses))
+            # ==========================================
+            # APPLY EMA MEMORY FOR CONVERGENCE
+            # ==========================================
+            if smoothed_losses is None:
+                smoothed_losses = losses
+            else:
+                smoothed_losses = (1.0 - alpha) * smoothed_losses + alpha * losses
+
+            # Extract current mode based on the SMOOTHED losses
+            best_idx = int(jnp.argmin(smoothed_losses))
+            
             tracking_history.append((all_times[end_idx], np.array(U_preds[best_idx])))
             
             if start_idx % (step_size_events * 5) == 0:
@@ -2216,9 +2230,9 @@ def run_score_filter(
                 streaming_callback(
                     time=float(all_times[end_idx]),
                     U_preds=np.array(U_preds),
-                    losses=np.array(losses),
+                    losses=np.array(losses),          # Pass the raw batch losses to the callback
                     mean_loss=float(mean_loss),
-                    best_idx=best_idx,
+                    best_idx=best_idx,                # This now points to the historically stable mode!
                     neutron_count=end_idx,
                     new_events=new_events
                 )
