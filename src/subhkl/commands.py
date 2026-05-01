@@ -1989,6 +1989,7 @@ def run_score_filter(
     steps: int = 3000,
     streaming_callback = None,
     alpha = 0.01,
+    J = 1024,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     from subhkl.config import beamlines
@@ -2129,7 +2130,7 @@ def run_score_filter(
         print("\n[3/4] Executing Streaming Forecast-Analysis Cycle...")
 
         # Initial Swarm (Could be smaller for fast lock-in)
-        J_ensf = 1024
+        J_ensf = J
         rng = jax.random.PRNGKey(42)
         ensf_params = jax.random.normal(rng, (J_ensf, 6))
 
