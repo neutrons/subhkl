@@ -1571,7 +1571,7 @@ class FindUB:
                     
                     # 3. Fire the arrays back to the Notebook!
                     jax.debug.callback(
-                        callback,
+                        callback_handler,
                         UB_swarm, B_swarm, sample_swarm, ki_swarm, R_swarm,
                         best_c, best_u, best_v,
                         jnp.min(state_tell.best_fitness),
