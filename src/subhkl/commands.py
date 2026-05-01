@@ -1988,6 +1988,7 @@ def run_score_filter(
     event_nexus_filename: str | None = None,
     steps: int = 3000,
     streaming_callback = None,
+    alpha = 0.01,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     from subhkl.config import beamlines
@@ -2180,8 +2181,6 @@ def run_score_filter(
 
         # Initialize memory variables before the loop
         smoothed_losses = None
-        alpha = 0.1  # Memory factor: 10% new batch data, 90% historical data. 
-                     # Decrease this to make the tracking "stickier".
 
         # The Streaming Loop
         for start_idx in range(0, len(all_q_lab) - window_size_events, step_size_events):
