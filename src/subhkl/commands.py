@@ -1989,7 +1989,9 @@ def run_score_filter(
     steps: int = 3000,
     streaming_callback = None,
     alpha = 0.01,
-    J = 1024,
+    J: int = 1024,
+    n_lamb: int = 64,
+    c: float = 0.15,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     from subhkl.config import beamlines
@@ -2021,7 +2023,7 @@ def run_score_filter(
     B_mat = ub_helper.reciprocal_lattice_B()
     B_inv = jnp.linalg.inv(B_mat)
     wavelengths = np.array(ub_helper.wavelength)
-    lam_grid = jnp.logspace(jnp.log10(wavelengths[0]), jnp.log10(wavelengths[1]), 64)
+    lam_grid = jnp.logspace(jnp.log10(wavelengths[0]), jnp.log10(wavelengths[1]), n_lamb)
 
     _, _, centering = get_lattice_system(
         ub_helper.a, ub_helper.b, ub_helper.c,
@@ -2175,7 +2177,7 @@ def run_score_filter(
         q_init = jnp.array(all_q_lab[:window_size_events]).T
         for _ in range(500):
             ensf_params, opt_state, mean_loss, U_preds, losses = train_step_streaming(
-                ensf_params, opt_state, 0.15, 0.10, 1000.0, 0.0, q_init # No gravity, independent search
+                ensf_params, opt_state, c, 0.10, 1000.0, 0.0, q_init # No gravity, independent search
             )
 
         print("  > Initial global orientation locked. Beginning sliding window tracker.")
