@@ -2042,6 +2042,8 @@ def run_score_filter(
     J: int = 1024,
     n_lamb: int = 64,
     c: float = 0.15,
+    window_size_events:int = 25000,
+    step_size_events: int = 10000,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     from subhkl.config import beamlines
@@ -2218,9 +2220,6 @@ def run_score_filter(
             return params, opt_state, mean_loss, U_preds, individual_losses
 
         # Sliding Window Setup
-        window_size_events = 25000  # Number of neutrons per assimilation step
-        step_size_events = 10000    # Sliding overlap
-
         tracking_history = []
 
         # Fast Initial Lock-in (Phase 3A behavior on first window)
