@@ -94,7 +94,7 @@ def run_index(
     input_data: dict | None = None,
     num_candidates: int | None = None,
     mode: str | None = "laue",
-    callback: callable | None = None,
+    callback = None,
 ):
     input_data = input_data or {}
 
