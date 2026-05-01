@@ -492,6 +492,17 @@ def run_index(
             freeze_orientation=freeze_orientation,
         )
 
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+
+    detectors_dict = {}
+    for bank_str, det_config in beamlines[instrument_name].items():
+        if bank_str.isdigit():
+            detectors_dict[int(bank_str)] = Detector(det_config)
+
+    # 2. Get your images dictionary
+    images_dict = peaks_obj.image.ims
+
     num, hkl_uvw, lambda_S, U = opt.minimize(
         strategy_name=strategy_name,
         population_size=population_size,
@@ -520,6 +531,8 @@ def run_index(
         num_candidates=num_candidates,
         objective_mode=mode,
         callback_handler=callback_handler,
+        detectors_dict=detectors_dict,
+        images_dict=images_dict
     )
 
     print(f"\nOptimization complete. Best solution indexed {num} peaks.")

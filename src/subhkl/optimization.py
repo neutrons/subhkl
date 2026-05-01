@@ -1366,6 +1366,13 @@ class FindUB:
             zone_S_max=zone_S_max,
         )
 
+        # ==========================================
+        # INITIALIZE RERUN CALLBACK
+        # ==========================================
+        # Extract the dictionaries passed from run_index
+        detectors_dict = kwargs.get("detectors_dict", None)
+        images_dict = kwargs.get("images_dict", None)
+
         num_dims = 0 if freeze_orientation else 3
         if refine_lattice:
             num_dims += num_lattice_params
@@ -1553,14 +1560,25 @@ class FindUB:
             if callback_handler is not None:
                 # We pass the full swarm (x_valid), the current best fitness, and the generation index.
                 # ordered=True ensures it executes synchronously in the exact step sequence.
-                jax.debug.callback(
-                    callback_handler,
-                    x_valid,
-                    state_tell.best_member,
-                    jnp.min(state_tell.best_fitness),
-                    current_gen,
-                    ordered=True
-                )
+
+                def call_rerun(_):
+                    # 1. Decode the entire swarm to get the cloud positions
+                    (UB_swarm, B_swarm, sample_swarm, ki_swarm, _, R_swarm, _, _, _) = objective._get_physical_params_jax(x_valid)
+                    
+                    # 2. Decode ONLY the best particle to get the exact detector geometry
+                    (_, _, _, _, _, _, best_c, best_u, best_v) = objective._get_physical_params_jax(state_tell.best_member[None, :])
+                    
+                    # 3. Fire the arrays back to the Notebook!
+                    jax.debug.callback(
+                        callback_handler,
+                        UB_swarm, B_swarm, sample_swarm, ki_swarm, R_swarm,
+                        best_c, best_u, best_v,
+                        jnp.min(state_tell.best_fitness),
+                        current_gen,
+                        ordered=True
+                    )
+                    
+                jax.lax.cond(current_gen % 5 == 0, call_rerun, lambda _: None, None)
 
             return rng, state_tell, metrics
 
