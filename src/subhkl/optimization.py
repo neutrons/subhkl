@@ -1556,6 +1556,7 @@ class FindUB:
                 jax.debug.callback(
                     callback_handler,
                     x_valid,
+                    state_tell.best_member,
                     jnp.min(state_tell.best_fitness),
                     current_gen,
                     ordered=True
