@@ -1414,25 +1414,75 @@ def run_egnn(
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
         ub_helper.wavelength = f["instrument/wavelength"][()]
 
-        pixel_r = f["peaks/pixel_r"][()]
-        pixel_c = f["peaks/pixel_c"][()]
-        img_indices = f["peaks/image_index"][()]
-        run_indices = f["peaks/run_index"][()] if "peaks/run_index" in f else img_indices
+        # ---------------------------------------------------------
+        # NEW: LOAD RAW PIXELS INSTEAD OF PRE-FOUND PEAKS
+        # ---------------------------------------------------------
+        from subhkl.integration.api import Peaks
+        print(f"  > Bypassing peak list. Extracting raw pixels from: {original_nexus_filename}")
+        
+        peaks_obj = Peaks(original_nexus_filename, instrument_name)
+        images_dict = peaks_obj.image.ims
 
-        # Grab integrated intensities if they exist, otherwise default to 1.0
-        peak_intensities = f["peaks/intensity"][()] if "peaks/intensity" in f else np.ones(len(pixel_r))
+        pixel_r_list, pixel_c_list, bank_list, intensity_list, img_idx_list = [], [], [], [], []
 
+        for logical_key, img_data in images_dict.items():
+            # 1. Map logical index to physical bank ID
+            bank_id = peaks_obj.image.bank_mapping.get(logical_key, logical_key)
+            bank_id = int(bank_id)
+
+            # 2. Extract all pixels with at least 1 count (include the noise!)
+            mask = img_data > 0
+            if not np.any(mask): 
+                continue
+
+            # 3. Get exact pixel coordinates
+            cols, rows = np.meshgrid(np.arange(img_data.shape[1]), np.arange(img_data.shape[0]))
+            active_r = rows[mask]
+            active_c = cols[mask]
+            active_intensities = img_data[mask]
+
+            pixel_r_list.append(active_r)
+            pixel_c_list.append(active_c)
+            intensity_list.append(active_intensities)
+            bank_list.append(np.full(len(active_r), bank_id))
+            img_idx_list.append(np.full(len(active_r), logical_key))
+
+        # Concatenate all active pixels across the entire detector array
+        pixel_r = np.concatenate(pixel_r_list)
+        pixel_c = np.concatenate(pixel_c_list)
+        peak_intensities = np.concatenate(intensity_list)
+        bank_array = np.concatenate(bank_list)
+        img_indices = np.concatenate(img_idx_list)
+        
+        # We need the Goniometer rotations for these specific images
         if "goniometer/R" in f:
             R_all = f["goniometer/R"][()]
+            # Ensure img_indices are integers to use as array indices
             r_gonio_obs = R_all[img_indices.astype(int)]
         else:
             r_gonio_obs = np.tile(np.eye(3), (len(pixel_r), 1, 1))
 
-        if "bank" in f: bank_array = f["bank"][()]
-        elif "bank_ids" in f and "peaks/image_index" in f:
-            b_ids = f["bank_ids"][()]
-            bank_array = np.array([b_ids[int(idx)] for idx in img_indices])
-        else: bank_array = img_indices
+        # ---------------------------------------------------------
+        # VRAM PROTECTION: RANDOM SUBSAMPLING
+        # ---------------------------------------------------------
+        total_pixels = len(pixel_r)
+        max_pixels_for_vram = 50000 # Adjust based on your GPU memory limits
+        
+        if total_pixels > max_pixels_for_vram:
+            print(f"  > WARNING: Found {total_pixels:,} active pixels. Randomly subsampling to {max_pixels_for_vram:,} to prevent GPU OOM.")
+            # We use random choice to perfectly preserve the ratio of signal-to-noise
+            np.random.seed(42)
+            sub_idx = np.random.choice(total_pixels, max_pixels_for_vram, replace=False)
+            
+            pixel_r = pixel_r[sub_idx]
+            pixel_c = pixel_c[sub_idx]
+            peak_intensities = peak_intensities[sub_idx]
+            bank_array = bank_array[sub_idx]
+            r_gonio_obs = r_gonio_obs[sub_idx]
+            # (If you need img_indices later, subsample it here too)
+        else:
+            print(f"  > Found {total_pixels:,} active pixels. Fitting in VRAM natively.")
+        # ---------------------------------------------------------
 
     B_mat = ub_helper.reciprocal_lattice_B()
 
