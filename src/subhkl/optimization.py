@@ -1216,6 +1216,7 @@ class FindUB:
         objective_mode: str = "laue",
         zone_S_min: float = 1.0,
         zone_S_max: float = 50.0,
+        callback_handler = None
         **kwargs,
     ):
         if goniometer_axes is None and self.goniometer_axes is not None:
@@ -1518,7 +1519,7 @@ class FindUB:
                     )
             return state
 
-        def step_single_run(rng, state):
+        def step_single_run(rng, state, current_gen):
             rng, rng_ask, rng_tell = jax.random.split(rng, 3)
 
             if strategy_name.lower() == "guided_es":
@@ -1548,10 +1549,22 @@ class FindUB:
             state_tell, metrics = strategy.tell(
                 rng_tell, x_valid, objective(x_valid), state_ask, es_params
             )
+
+            if callback_handler is not None:
+                # We pass the full swarm (x_valid), the current best fitness, and the generation index.
+                # ordered=True ensures it executes synchronously in the exact step sequence.
+                jax.debug.callback(
+                    callback_handler,
+                    x_valid,
+                    jnp.min(state_tell.best_fitness),
+                    current_gen,
+                    ordered=True
+                )
+
             return rng, state_tell, metrics
 
         init_batch_jit = jax.jit(jax.vmap(init_single_run, in_axes=(0, None)))
-        step_batch_jit = jax.jit(jax.vmap(step_single_run, in_axes=(0, 0)))
+        step_batch_jit = jax.jit(jax.vmap(step_single_run, in_axes=(0, 0, None)))
 
         exec_batch_size = batch_size if batch_size is not None else n_runs
         seeds = jnp.arange(seed, seed + n_runs)
@@ -1577,7 +1590,7 @@ class FindUB:
             current_gen_best = np.inf
             for b_i in range(len(batch_keys_list)):
                 batch_keys_list[b_i], batch_states_list[b_i], _ = step_batch_jit(
-                    batch_keys_list[b_i], batch_states_list[b_i]
+                    batch_keys_list[b_i], batch_states_list[b_i], gen
                 )
                 current_gen_best = min(
                     current_gen_best, jnp.min(batch_states_list[b_i].best_fitness)
