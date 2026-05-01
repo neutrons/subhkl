@@ -1216,7 +1216,7 @@ class FindUB:
         objective_mode: str = "laue",
         zone_S_min: float = 1.0,
         zone_S_max: float = 50.0,
-        callback_handler = None
+        callback_handler = None,
         **kwargs,
     ):
         if goniometer_axes is None and self.goniometer_axes is not None:
