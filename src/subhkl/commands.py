@@ -530,7 +530,7 @@ def run_index(
         freeze_orientation=freeze_orientation,
         num_candidates=num_candidates,
         objective_mode=mode,
-        callback_handler=callback_handler,
+        callback_handler=callback,
         detectors_dict=detectors_dict,
         images_dict=images_dict
     )
