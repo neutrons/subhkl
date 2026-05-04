@@ -2290,78 +2290,22 @@ def run_score_filter(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    def single_particle_loss(params, current_c, q_batch_unnorm):
+    def moire_loss(params, q_batch_unnorm, frequency_scale=1.0):
         U_pred = compute_U(params)
         UB_inv = jnp.matmul(B_inv, U_pred.T)
         
-        # Shape: (3, N)
-        v = jnp.matmul(UB_inv, q_batch_unnorm)
-
-        # 1. Unroll components for XLA fusion
-        v_h = v[0, :]
-        v_k = v[1, :]
-        v_l = v[2, :]
-
-        N_pts = v.shape[1]
+        # v is the fractional coordinate (h, k, l)
+        v = jnp.matmul(UB_inv, q_batch_unnorm) 
         
-        # We track the minimum distance and the best lambda
-        initial_carry = (
-            jnp.inf * jnp.ones(N_pts),          # curr_min_diff_sq
-            jnp.zeros(N_pts, dtype=jnp.float32) # curr_best_lamb
-        )
-
-        # 2. Sequential scan over lam_grid to avoid the massive VRAM tensor explosion
-        def scan_body(carry, i):
-            curr_min, curr_best_lamb = carry
-            lamda_cand = lam_grid[i]
-
-            h_float = v_h / lamda_cand
-            k_float = v_k / lamda_cand
-            l_float = v_l / lamda_cand
-
-            diff_sq = (jnp.sin(jnp.pi * h_float)**2 + jnp.sin(jnp.pi * k_float)**2 + jnp.sin(jnp.pi * l_float)**2)
-
-            update_mask = diff_sq < curr_min
-            new_min = jnp.where(update_mask, diff_sq, curr_min)
-            new_best_lamb = jnp.where(update_mask, lamda_cand, curr_best_lamb)
-
-            return (new_min, new_best_lamb), None
-
-        # Execute the scan loop (JAX will perfectly fuse this on the GPU)
-        (_, best_lam_coarse), _ = jax.lax.scan(scan_body, initial_carry, jnp.arange(len(lam_grid)))
-
-        # 3. TARGET LOCK: Extract nearest integer and STOP GRADIENTS
-        hkl_int = jnp.round(v / best_lam_coarse[None, :])
-        hkl_int_fixed = jax.lax.stop_gradient(hkl_int)
-
-        # 4. ANALYTICAL PROJECTION
-        num = jnp.sum(v**2, axis=0)
-        den = jnp.sum(v * hkl_int_fixed, axis=0) + 1e-9
-        lam_opt = jnp.clip(num / den, lam_grid[0], lam_grid[-1])
-
-        # 5. EXACT FRACTIONAL COORDINATES
-        hkl_float_exact = v / lam_opt[None, :]
-        h = hkl_float_exact[0, :]
-        k = hkl_float_exact[1, :]
-        l = hkl_float_exact[2, :]
-
-        # 6. CENTERING & LOSS
-        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
-        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
-        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
-
-        dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
-
-        robust_penalty = dist_sq / (dist_sq + current_c**2)
-
-        h_i, k_i, l_i = hkl_int_fixed[0, :], hkl_int_fixed[1, :], hkl_int_fixed[2, :]
-        is_zero_hkl = (jnp.abs(h_i) + jnp.abs(k_i) + jnp.abs(l_i)) < 0.5
-
-        # Force any pixel mapped to the direct beam to have the MAXIMUM possible penalty (1.0)
-        robust_penalty = jnp.where(is_zero_hkl, 1.0, robust_penalty)
-
-        loss = jnp.mean(robust_penalty)
-
+        # Evaluate on a continuous periodic basis. 
+        # Maximize the cosine (minimize the negative)
+        # The sum across the 3 dimensions creates a 3D interference pattern
+        interference = jnp.cos(2.0 * jnp.pi * v[0] * frequency_scale) + \
+                       jnp.cos(2.0 * jnp.pi * v[1] * frequency_scale) + \
+                       jnp.cos(2.0 * jnp.pi * v[2] * frequency_scale)
+                       
+        # Normalize and invert for loss
+        loss = 1.0 - jnp.mean(interference) / 3.0
         return loss, U_pred
 
     # ==========================================
@@ -2392,7 +2336,7 @@ def run_score_filter(
 
         prior_score_fn = jax.grad(single_loss_weighted_vmf, argnums=0)
         vmap_prior = jax.vmap(prior_score_fn, in_axes=(0, None, None, None, None))
-        ensf_loss_fn = jax.vmap(single_particle_loss, in_axes=(0, None, None))
+        ensf_loss_fn = jax.vmap(moire_loss, in_axes=(0, None, None))
 
         opt_ensf = optax.adam(learning_rate)
         opt_state = opt_ensf.init(ensf_params)
