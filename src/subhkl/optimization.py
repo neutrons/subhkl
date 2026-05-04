@@ -231,7 +231,6 @@ class VectorizedObjective:
         if self.no_index:
             self.hkl_fixed = jnp.array(hkl_fixed)      # Shape: (3, N)
             self.lambda_fixed = jnp.array(lambda_fixed) # Shape: (N,)
->>>>>>> refinement
 
         self.B = jnp.array(B)
         self.kf_ki_dir_init = jnp.array(kf_ki_dir)
