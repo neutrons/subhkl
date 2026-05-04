@@ -642,9 +642,7 @@ class VectorizedObjective:
             )
             S, M = offsets_total.shape[0], self.gonio_angles.shape[1]
             R = jnp.eye(3)[None, None, ...].repeat(S, axis=0).repeat(M, axis=1)
-=======
             R_list = []
->>>>>>> refinement
             deg2rad = jnp.pi / 180.0
 
             for i in range(self.num_gonio_axes):
