@@ -2285,9 +2285,7 @@ def run_score_filter(
         N_pts = v.shape[1]
         
         # We track the minimum distance and the best lambda
-        initial_carry = (
-            jnp.zeros(N_pts),          # curr_min_diff_sq
-        )
+        initial_carry = jnp.zeros(N_pts)
 
         # 2. Sequential scan over lam_grid to avoid the massive VRAM tensor explosion
         def scan_body(carry, i):
