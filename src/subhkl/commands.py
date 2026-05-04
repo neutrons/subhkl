@@ -2286,8 +2286,7 @@ def run_score_filter(
         
         # We track the minimum distance and the best lambda
         initial_carry = (
-            jnp.inf * jnp.ones(N_pts),          # curr_min_diff_sq
-            jnp.zeros(N_pts, dtype=jnp.float32) # curr_best_lamb
+            jnp.zeros(N_pts),          # curr_min_diff_sq
         )
 
         # 2. Sequential scan over lam_grid to avoid the massive VRAM tensor explosion
@@ -2299,16 +2298,14 @@ def run_score_filter(
             k_float = v_k / lamda_cand
             l_float = v_l / lamda_cand
 
-            diff_sq = (jnp.sin(jnp.pi * h_float)**2 + jnp.sin(jnp.pi * k_float)**2 + jnp.sin(jnp.pi * l_float)**2)
+            mean = lambda_cand * jnp.cos(jnp.pi * (h_float + k_float + l_float)) / n_lamb
 
-            update_mask = diff_sq < curr_min
-            new_min = jnp.where(update_mask, diff_sq, curr_min)
-            new_best_lamb = jnp.where(update_mask, lamda_cand, curr_best_lamb)
+            new_best_lamb = curr_best_lamb + mean
 
-            return (new_min, new_best_lamb), None
+            return new_best_lamb, None
 
         # Execute the scan loop (JAX will perfectly fuse this on the GPU)
-        (_, best_lam_coarse), _ = jax.lax.scan(scan_body, initial_carry, jnp.arange(len(lam_grid)))
+        best_lam_coarse = jax.lax.scan(scan_body, initial_carry, jnp.arange(len(lam_grid)))
 
         # 3. TARGET LOCK: Extract nearest integer and STOP GRADIENTS
         hkl_int = jnp.round(v / best_lam_coarse[None, :])
