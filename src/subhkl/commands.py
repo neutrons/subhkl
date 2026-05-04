@@ -2290,7 +2290,8 @@ def run_score_filter(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    def moire_loss(params, q_batch_unnorm, frequency_scale=1.0):
+    # Swap the order of frequency_scale and q_batch_unnorm
+    def moire_loss(params, frequency_scale, q_batch_unnorm):
         U_pred = compute_U(params)
         UB_inv = jnp.matmul(B_inv, U_pred.T)
         
@@ -2299,7 +2300,6 @@ def run_score_filter(
         
         # Evaluate on a continuous periodic basis. 
         # Maximize the cosine (minimize the negative)
-        # The sum across the 3 dimensions creates a 3D interference pattern
         interference = jnp.cos(2.0 * jnp.pi * v[0] * frequency_scale) + \
                        jnp.cos(2.0 * jnp.pi * v[1] * frequency_scale) + \
                        jnp.cos(2.0 * jnp.pi * v[2] * frequency_scale)
