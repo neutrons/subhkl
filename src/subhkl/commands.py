@@ -2303,7 +2303,7 @@ def run_score_filter(
             return new_best_lamb, None
 
         # Execute the scan loop (JAX will perfectly fuse this on the GPU)
-        best_lam_coarse, _ = jax.lax.scan(scan_body, initial_carry, jnp.arange(len(lam_grid)))
+        best_lam_coarse = jax.lax.scan(scan_body, initial_carry, jnp.arange(len(lam_grid)))
 
         # 3. TARGET LOCK: Extract nearest integer and STOP GRADIENTS
         hkl_int = jnp.round(v / best_lam_coarse[None, :])
