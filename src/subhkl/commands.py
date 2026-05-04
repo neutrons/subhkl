@@ -2335,7 +2335,7 @@ def run_score_filter(
         robust_penalty = dist_sq / (dist_sq + current_c**2)
 
         h_i, k_i, l_i = hkl_int_fixed[0, :], hkl_int_fixed[1, :], hkl_int_fixed[2, :]
-        is_zero_hkl = (jnp.abs(h_i) + jnp.abs(k_i) + jnp.abs(l_i)) == 0
+        is_zero_hkl = (jnp.abs(h_i) + jnp.abs(k_i) + jnp.abs(l_i)) < 0.5
 
         # Force any pixel mapped to the direct beam to have the MAXIMUM possible penalty (1.0)
         robust_penalty = jnp.where(is_zero_hkl, 1.0, robust_penalty)
