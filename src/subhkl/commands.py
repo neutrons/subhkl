@@ -2150,6 +2150,7 @@ def run_score_filter(
     step_size_events: int = 10000,
     seed_file: str | None = None,
     learning_rate: float = 0.02,
+    eta: float = 0.05,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     from subhkl.config import beamlines
@@ -2371,7 +2372,7 @@ def run_score_filter(
 
             # 1. FORECAST (Diffusion)
             rng, subkey = jax.random.split(rng)
-            diffusion_noise = jax.random.normal(subkey, ensf_params.shape) * 0.05
+            diffusion_noise = jax.random.normal(subkey, ensf_params.shape) * eta
             ensf_params = ensf_params + diffusion_noise
 
             # 2. ANALYSIS (EnSF Gravity Collapse)
