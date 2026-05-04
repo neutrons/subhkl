@@ -2291,7 +2291,7 @@ def run_score_filter(
 
         # 2. Sequential scan over lam_grid to avoid the massive VRAM tensor explosion
         def scan_body(carry, i):
-            curr_min, curr_best_lamb = carry
+            curr_best_lamb = carry
             lamda_cand = lam_grid[i]
 
             h_float = v_h / lamda_cand
