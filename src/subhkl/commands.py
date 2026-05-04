@@ -1702,13 +1702,19 @@ def run_egnn(
             return new_min, None
             
         min_dist_sq, _ = jax.lax.scan(scan_body, initial_min_dist_sq, jnp.arange(M_theos))
+
+        # ==========================================
+        # 6. RBF SCORE (Gaussian Kernel)
+        # ==========================================
+        # current_c acts as the standard deviation (sigma) of the Gaussian capture radius (in Radians)
+        # We REWARD neutrons that land close to a theoretical ray.
+        rbf_score = jnp.exp(-min_dist_sq / (2.0 * current_c**2))
         
-        # 6. Robust Loss (Geman-McClure)
-        # min_dist_sq is the squared chordal distance (~radians^2)
-        # current_c now acts EXACTLY as the capture radius in Radians!
-        robust_penalty = min_dist_sq / (min_dist_sq + current_c**2)
+        # Background neutrons have score ~ 0.0. Bragg neutrons have score ~ 1.0.
+        # We want to maximize the score (minimize negative mean).
+        # We use 1.0 - mean so the loss remains positive and bounded [0.0, 1.0]
+        loss = 1.0 - jnp.mean(rbf_score)
         
-        loss = jnp.mean(robust_penalty)
         return loss, U_pred
 
     J_total = 16384      # Total swarm size you want
