@@ -2298,7 +2298,7 @@ def run_score_filter(
             k_float = v_k / lamda_cand
             l_float = v_l / lamda_cand
 
-            mean = lamda_cand * jnp.cos(jnp.pi * (h_float + k_float + l_float)) / n_lamb
+            mean = lambda_cand * jnp.cos(jnp.pi * (h_float + k_float + l_float)) / n_lamb
 
             new_best_lamb = curr_best_lamb + mean
 
