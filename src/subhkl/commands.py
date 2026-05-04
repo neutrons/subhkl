@@ -1613,10 +1613,42 @@ def run_egnn(
     elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
     else: M_prim = jnp.eye(3)
 
-    wavelengths = np.array(ub_helper.wavelength)
-    lam_grid = jnp.logspace(jnp.log10(wavelengths[0]), jnp.log10(wavelengths[1]), 64)
-    B_inv = jnp.linalg.inv(B_mat)
+    # ==========================================
+    # FORWARD-MAPPING STATIC HKL GRID
+    # ==========================================
+    print("  > Pre-computing Forward-Mapping HKL Grid...")
+    h_max = 6
+    h_vals = np.arange(-h_max, h_max + 1)
+    hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
+    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    
+    # Physically exclude the (0,0,0) direct beam
+    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+    theo_hkl = hkl_c[:, mask_hkl_c]
+    
+    # Apply Primitive Centering Mask
+    M_prim_np = np.array(M_prim)
+    h_p = M_prim_np[0, 0]*theo_hkl[0] + M_prim_np[0, 1]*theo_hkl[1] + M_prim_np[0, 2]*theo_hkl[2]
+    k_p = M_prim_np[1, 0]*theo_hkl[0] + M_prim_np[1, 1]*theo_hkl[1] + M_prim_np[1, 2]*theo_hkl[2]
+    l_p = M_prim_np[2, 0]*theo_hkl[0] + M_prim_np[2, 1]*theo_hkl[1] + M_prim_np[2, 2]*theo_hkl[2]
+    
+    is_valid = (np.abs(h_p - np.round(h_p)) < 1e-4) & \
+               (np.abs(k_p - np.round(k_p)) < 1e-4) & \
+               (np.abs(l_p - np.round(l_p)) < 1e-4)
+    theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
+    
+    # Pre-calculate sample frame reciprocal vectors
+    h_sample = B_mat @ theo_hkl
+    h_norm_sq = np.sum(h_sample**2, axis=0)
+    
+    # Convert to JAX arrays for the GPU
+    h_sample_jax = jnp.array(h_sample)
+    h_norm_sq_jax = jnp.array(h_norm_sq)
+    ki_jax = jnp.array(ub_helper.ki_vec)
+    wl_min = float(ub_helper.wavelength[0])
+    wl_max = float(ub_helper.wavelength[1])
 
+    # Core JAX Functions
     def compute_U(rot_6d):
         a1 = rot_6d[:3]
         a2 = rot_6d[3:]
@@ -1628,73 +1660,55 @@ def run_egnn(
 
     def single_particle_loss(params, current_c, q_batch_unnorm):
         U_pred = compute_U(params)
-        UB_inv = jnp.matmul(B_inv, U_pred.T)
         
-        # Shape: (3, N)
-        v = jnp.matmul(UB_inv, q_batch_unnorm)
-
-        # 1. Unroll components for XLA fusion
-        v_h = v[0, :]
-        v_k = v[1, :]
-        v_l = v[2, :]
-
-        N_pts = v.shape[1]
+        # 1. Normalize experimental neutron events
+        # q_batch_unnorm shape: (3, N_events)
+        q_exp_norm = jnp.linalg.norm(q_batch_unnorm, axis=0, keepdims=True)
+        q_exp_hat = q_batch_unnorm / (q_exp_norm + 1e-9)
         
-        # We track the minimum distance and the best lambda
-        initial_carry = (
-            jnp.inf * jnp.ones(N_pts),          # curr_min_diff_sq
-            jnp.zeros(N_pts, dtype=jnp.float32) # curr_best_lamb
-        )
-
-        # 2. Sequential scan over lam_grid to avoid the massive VRAM tensor explosion
-        def scan_body(carry, i):
-            curr_min, curr_best_lamb = carry
-            lamda_cand = lam_grid[i]
-
-            h_float = v_h / lamda_cand
-            k_float = v_k / lamda_cand
-            l_float = v_l / lamda_cand
-
-            h_int = jnp.round(h_float)
-            k_int = jnp.round(k_float)
-            l_int = jnp.round(l_float)
-
-            diff_sq = (h_float - h_int)**2 + (k_float - k_int)**2 + (l_float - l_int)**2
-
-            update_mask = diff_sq < curr_min
-            new_min = jnp.where(update_mask, diff_sq, curr_min)
-            new_best_lamb = jnp.where(update_mask, lamda_cand, curr_best_lamb)
-
-            return (new_min, new_best_lamb), None
-
-        # Execute the scan loop (JAX will perfectly fuse this on the GPU)
-        (_, best_lam_coarse), _ = jax.lax.scan(scan_body, initial_carry, jnp.arange(len(lam_grid)))
-
-        # 3. TARGET LOCK: Extract nearest integer and STOP GRADIENTS
-        hkl_int = jnp.round(v / best_lam_coarse[None, :])
-        hkl_int_fixed = jax.lax.stop_gradient(hkl_int)
-
-        # 4. ANALYTICAL PROJECTION
-        num = jnp.sum(v**2, axis=0)
-        den = jnp.sum(v * hkl_int_fixed, axis=0) + 1e-9
-        lam_opt = jnp.clip(num / den, lam_grid[0], lam_grid[-1])
-
-        # 5. EXACT FRACTIONAL COORDINATES
-        hkl_float_exact = v / lam_opt[None, :]
-        h = hkl_float_exact[0, :]
-        k = hkl_float_exact[1, :]
-        l = hkl_float_exact[2, :]
-
-        # 6. CENTERING & LOSS
-        h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
-        k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
-        l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
-
-        dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
-
-        robust_penalty = dist_sq / (dist_sq + current_c**2)
+        # 2. Rotate theoretical sample rays to the lab frame
+        # h_sample_jax shape: (3, M_theos)
+        h_lab = jnp.matmul(U_pred, h_sample_jax)
+        
+        # 3. Calculate physical Laue wavelength filter
+        # Only evaluate spots that mathematically fall within the instrument's bandwidth
+        lam_req = -2.0 * jnp.sum(ki_jax[:, None] * h_lab, axis=0) / h_norm_sq_jax
+        valid_lam = (lam_req >= wl_min) & (lam_req <= wl_max)
+        
+        # 4. Predicted momentum transfer directions
+        q_theo_hat = h_lab / jnp.sqrt(h_norm_sq_jax[None, :])
+        
+        # 5. Memory-Safe Distance Scan
+        N_pts = q_exp_hat.shape[1]
+        M_theos = q_theo_hat.shape[1]
+        
+        q_exp_x, q_exp_y, q_exp_z = q_exp_hat[0], q_exp_hat[1], q_exp_hat[2]
+        q_theo_x, q_theo_y, q_theo_z = q_theo_hat[0], q_theo_hat[1], q_theo_hat[2]
+        
+        initial_min_dist_sq = jnp.inf * jnp.ones(N_pts)
+        
+        def scan_body(carry_min_dist_sq, m):
+            dx = q_exp_x - q_theo_x[m]
+            dy = q_exp_y - q_theo_y[m]
+            dz = q_exp_z - q_theo_z[m]
+            
+            # Squared Chordal Distance
+            dist_sq = dx**2 + dy**2 + dz**2
+            
+            # Force distance to infinity if the required wavelength is out of bounds
+            dist_sq = jnp.where(valid_lam[m], dist_sq, jnp.inf)
+            
+            new_min = jnp.minimum(carry_min_dist_sq, dist_sq)
+            return new_min, None
+            
+        min_dist_sq, _ = jax.lax.scan(scan_body, initial_min_dist_sq, jnp.arange(M_theos))
+        
+        # 6. Robust Loss (Geman-McClure)
+        # min_dist_sq is the squared chordal distance (~radians^2)
+        # current_c now acts EXACTLY as the capture radius in Radians!
+        robust_penalty = min_dist_sq / (min_dist_sq + current_c**2)
+        
         loss = jnp.mean(robust_penalty)
-
         return loss, U_pred
 
     J_total = 16384      # Total swarm size you want
