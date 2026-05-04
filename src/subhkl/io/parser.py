@@ -650,9 +650,6 @@ def cmd_score_filter(
     instrument: str = typer.Option(
         None, "--instrument", help="Name of the instrument (e.g., MANDI, IMAGINE, CG4D)."
     ),
-    steps: int = typer.Option(
-        300, help="Maximum number of steps for the optimization",
-    ),
 ):
     """
     Extracts the initial UB matrix using the Sparse Spherical Hough Transform and
@@ -663,7 +660,6 @@ def cmd_score_filter(
         output_h5_filename=output_h5_filename,
         instrument_name=instrument,
         event_nexus_filename=event_nexus_filename,
-        steps=steps,
     )
 
 if __name__ == "__main__":

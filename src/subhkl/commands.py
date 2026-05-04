@@ -2141,7 +2141,6 @@ def run_score_filter(
     output_h5_filename: str,
     instrument_name: str | None = None,
     event_nexus_filename: str | None = None,
-    steps: int = 3000,
     streaming_callback = None,
     alpha = 0.01,
     J: int = 1024,
