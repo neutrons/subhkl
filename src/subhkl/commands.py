@@ -2355,12 +2355,12 @@ def run_score_filter(
 
         # Fast Initial Lock-in (Phase 3A behavior on first window)
         q_init = jnp.array(all_q_lab[:window_size_events]).T
-        for _ in range(500):
-            ensf_params, opt_state, mean_loss, U_preds, losses = train_step_streaming(
-                ensf_params, opt_state, c, 0.10, 1000.0, 0.0, q_init # No gravity, independent search
-            )
-
-        print("  > Initial global orientation locked. Beginning sliding window tracker.")
+#        for _ in range(500):
+#            ensf_params, opt_state, mean_loss, U_preds, losses = train_step_streaming(
+#                ensf_params, opt_state, c, 0.10, 1000.0, 0.0, q_init # No gravity, independent search
+#            )
+#
+#        print("  > Initial global orientation locked. Beginning sliding window tracker.")
 
         # Initialize memory variables before the loop
         smoothed_losses = None
