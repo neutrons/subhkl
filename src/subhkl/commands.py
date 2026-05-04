@@ -2299,11 +2299,7 @@ def run_score_filter(
             k_float = v_k / lamda_cand
             l_float = v_l / lamda_cand
 
-            h_int = jnp.round(h_float)
-            k_int = jnp.round(k_float)
-            l_int = jnp.round(l_float)
-
-            diff_sq = (h_float - h_int)**2 + (k_float - k_int)**2 + (l_float - l_int)**2
+            diff_sq = (jnp.sin(jnp.pi * h_float)**2 + jnp.sin(jnp.pi * k_float)**2 + jnp.sin(jnp.pi * l_float)**2)
 
             update_mask = diff_sq < curr_min
             new_min = jnp.where(update_mask, diff_sq, curr_min)
