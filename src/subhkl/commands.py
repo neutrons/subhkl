@@ -2151,6 +2151,9 @@ def run_score_filter(
     seed_file: str | None = None,
     learning_rate: float = 0.02,
     eta: float = 0.05,
+    sigma: float = 0.1,
+    gamma: float = 1000.0,
+    lamb: float = 0.8,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     from subhkl.config import beamlines
@@ -2378,7 +2381,7 @@ def run_score_filter(
             # 2. ANALYSIS (EnSF Gravity Collapse)
             for _ in range(20): # Very fast update!
                 ensf_params, opt_state, mean_loss, U_preds, losses = train_step_streaming(
-                    ensf_params, opt_state, 0.05, 0.10, 1000.0, 0.8, q_window
+                    ensf_params, opt_state, c, sigma, gamma, lamb, q_window
                 )
 
             # ==========================================
