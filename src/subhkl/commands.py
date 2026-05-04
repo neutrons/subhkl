@@ -2148,6 +2148,7 @@ def run_score_filter(
     c: float = 0.15,
     window_size_events:int = 25000,
     step_size_events: int = 10000,
+    seed_file: str | None = None,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     from subhkl.config import beamlines
@@ -2157,6 +2158,22 @@ def run_score_filter(
     import jax
     import jax.numpy as jnp
     import optax
+
+    # ==========================================
+    # LOAD GOLDEN SEED (If provided)
+    # ==========================================
+    true_6d_params = None
+    if seed_file is not None:
+        print(f"\n[DEBUG] Loading Golden Seed from: {seed_file}")
+        with h5py.File(seed_file, "r") as f:
+            if "sample/U" in f:
+                U_true = f["sample/U"][()]
+                # Map 3x3 Matrix to 6D continuous representation (first two columns)
+                true_6d_params = np.concatenate([U_true[:, 0], U_true[:, 1]])
+                true_6d_params = jnp.array(true_6d_params, dtype=jnp.float32)
+                print("  > Seed successfully loaded and converted to 6D.")
+            else:
+                print("  > WARNING: 'sample/U' not found in seed file.")
 
     print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
 
@@ -2291,6 +2308,14 @@ def run_score_filter(
         J_ensf = J
         rng = jax.random.PRNGKey(42)
         ensf_params = jax.random.normal(rng, (J_ensf, 6))
+
+        # ==========================================
+        # INJECT THE SEED
+        # ==========================================
+        if true_6d_params is not None:
+            # Overwrite Particle 0 with the Golden Seed
+            ensf_params = ensf_params.at[0].set(true_6d_params)
+            print("  > Golden Seed injected into EnSF Swarm Particle 0")
 
         @jax.jit
         def single_loss_weighted_vmf(single_params, U_swarm, losses_swarm, current_sigma, gamma):
