@@ -2149,6 +2149,7 @@ def run_score_filter(
     window_size_events:int = 25000,
     step_size_events: int = 10000,
     seed_file: str | None = None,
+    learning_rate: float = 0.02,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     from subhkl.config import beamlines
@@ -2328,7 +2329,7 @@ def run_score_filter(
         vmap_prior = jax.vmap(prior_score_fn, in_axes=(0, None, None, None, None))
         ensf_loss_fn = jax.vmap(single_particle_loss, in_axes=(0, None, None))
 
-        opt_ensf = optax.adam(0.02)
+        opt_ensf = optax.adam(learning_rate)
         opt_state = opt_ensf.init(ensf_params)
 
         @jax.jit
