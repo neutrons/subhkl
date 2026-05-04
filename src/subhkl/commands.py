@@ -1626,47 +1626,75 @@ def run_egnn(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    def single_particle_loss(params, current_c):
+    def single_particle_loss(params, current_c, q_batch_unnorm):
         U_pred = compute_U(params)
-        
         UB_inv = jnp.matmul(B_inv, U_pred.T)
-        v = jnp.matmul(UB_inv, q_sample_unnorm)
         
-        # 1. COARSE ASSIGNMENT: Use the grid strictly to find the nearest integer neighborhood
-        hkl_float_coarse = v[None, :, :] / lam_grid[:, None, None]
-        hkl_int_coarse = jnp.round(hkl_float_coarse)
+        # Shape: (3, N)
+        v = jnp.matmul(UB_inv, q_batch_unnorm)
+
+        # 1. Unroll components for XLA fusion
+        v_h = v[0, :]
+        v_k = v[1, :]
+        v_l = v[2, :]
+
+        N_pts = v.shape[1]
         
-        # Fast naive distance to find the best grid index
-        diff_sq = jnp.sum((hkl_float_coarse - hkl_int_coarse)**2, axis=1)
-        best_grid_idx = jnp.argmin(diff_sq, axis=0)
-        best_lam_coarse = lam_grid[best_grid_idx]
-        
-        # 2. TARGET LOCK: Extract the nearest integer and STOP GRADIENTS
+        # We track the minimum distance and the best lambda
+        initial_carry = (
+            jnp.inf * jnp.ones(N_pts),          # curr_min_diff_sq
+            jnp.zeros(N_pts, dtype=jnp.float32) # curr_best_lamb
+        )
+
+        # 2. Sequential scan over lam_grid to avoid the massive VRAM tensor explosion
+        def scan_body(carry, i):
+            curr_min, curr_best_lamb = carry
+            lamda_cand = lam_grid[i]
+
+            h_float = v_h / lamda_cand
+            k_float = v_k / lamda_cand
+            l_float = v_l / lamda_cand
+
+            h_int = jnp.round(h_float)
+            k_int = jnp.round(k_float)
+            l_int = jnp.round(l_float)
+
+            diff_sq = (h_float - h_int)**2 + (k_float - k_int)**2 + (l_float - l_int)**2
+
+            update_mask = diff_sq < curr_min
+            new_min = jnp.where(update_mask, diff_sq, curr_min)
+            new_best_lamb = jnp.where(update_mask, lamda_cand, curr_best_lamb)
+
+            return (new_min, new_best_lamb), None
+
+        # Execute the scan loop (JAX will perfectly fuse this on the GPU)
+        (_, best_lam_coarse), _ = jax.lax.scan(scan_body, initial_carry, jnp.arange(len(lam_grid)))
+
+        # 3. TARGET LOCK: Extract nearest integer and STOP GRADIENTS
         hkl_int = jnp.round(v / best_lam_coarse[None, :])
         hkl_int_fixed = jax.lax.stop_gradient(hkl_int)
-        
-        # 3. ANALYTICAL PROJECTION: Calculate the exact continuous lambda
-        # Minimizes || v/lambda - hkl_int ||^2 geometrically
+
+        # 4. ANALYTICAL PROJECTION
         num = jnp.sum(v**2, axis=0)
         den = jnp.sum(v * hkl_int_fixed, axis=0) + 1e-9
         lam_opt = jnp.clip(num / den, lam_grid[0], lam_grid[-1])
-        
-        # 4. EXACT FRACTIONAL COORDINATES: Smooth and fully differentiable!
+
+        # 5. EXACT FRACTIONAL COORDINATES
         hkl_float_exact = v / lam_opt[None, :]
         h = hkl_float_exact[0, :]
         k = hkl_float_exact[1, :]
         l = hkl_float_exact[2, :]
-        
-        # 5. CENTERING & LOSS
+
+        # 6. CENTERING & LOSS
         h_p = M_prim[0, 0]*h + M_prim[0, 1]*k + M_prim[0, 2]*l
         k_p = M_prim[1, 0]*h + M_prim[1, 1]*k + M_prim[1, 2]*l
         l_p = M_prim[2, 0]*h + M_prim[2, 1]*k + M_prim[2, 2]*l
-        
+
         dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
-        
+
         robust_penalty = dist_sq / (dist_sq + current_c**2)
-        loss = jnp.sum(robust_penalty * intensities) / jnp.sum(intensities)
-        
+        loss = jnp.mean(robust_penalty)
+
         return loss, U_pred
 
     J_total = 16384      # Total swarm size you want
