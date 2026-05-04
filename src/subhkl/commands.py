@@ -2328,6 +2328,12 @@ def run_score_filter(
         dist_sq = (jnp.sin(jnp.pi * h_p)**2 + jnp.sin(jnp.pi * k_p)**2 + jnp.sin(jnp.pi * l_p)**2) / (jnp.pi**2)
 
         robust_penalty = dist_sq / (dist_sq + current_c**2)
+
+        is_zero_hkl = (jnp.abs(h_p) + jnp.abs(k_p) + jnp.abs(l_p)) == 0
+
+        # Force any pixel mapped to the direct beam to have the MAXIMUM possible penalty (1.0)
+        robust_penalty = jnp.where(is_zero_hkl, 1.0, robust_penalty)
+
         loss = jnp.mean(robust_penalty)
 
         return loss, U_pred
