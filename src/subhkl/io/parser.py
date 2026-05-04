@@ -1,5 +1,7 @@
 # src/subhkl/io/command_line_parser.py
 from typing import Annotated
+from typing import Optional
+
 import typer
 import h5py
 import os
@@ -91,7 +93,6 @@ def finder(
     sparse_rbf_gamma: float = 1.0,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,
-    sparse_rbf_max_peaks: int = 500,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_loss: Annotated[
         str, typer.Option(help="Likelihood for peak finder.")
@@ -137,7 +138,6 @@ def finder(
         sparse_rbf_gamma=sparse_rbf_gamma,
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
-        sparse_rbf_max_peaks=sparse_rbf_max_peaks,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
         sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
@@ -198,12 +198,12 @@ def indexer(
         str | None, typer.Option("--refine-goniometer-axes")
     ] = None,
     goniometer_bound_deg: Annotated[
-        float, typer.Option("--goniometer-bound-deg")
-    ] = 5.0,
-    refine_sample: Annotated[bool, typer.Option("--refine-sample")] = False,
-    sample_bound_meters: Annotated[
-        float, typer.Option("--sample-bound-meters")
-    ] = 0.005,
+        str, typer.Option("--goniometer-bound-deg", help="Comma-separated bounds per axis or a single float")
+    ] = "5.0",
+    refine_goniometer_trans: Annotated[bool, typer.Option("--refine-goniometer-trans")] = False,
+    goniometer_trans_bound_meters: Annotated[
+        str, typer.Option("--goniometer-trans-bound-meters", help="Comma-separated translation bounds per axis (meters) or a single float")
+    ] = "0.005",
     refine_beam: Annotated[bool, typer.Option("--refine-beam")] = False,
     beam_bound_deg: Annotated[float, typer.Option("--beam-bound-deg")] = 1.0,
     refine_detector: Annotated[bool, typer.Option("--refine-detector")] = False,
@@ -217,7 +217,7 @@ def indexer(
         str,
         typer.Option(
             "--detector-modes",
-            help="Comma-separated list of refinement modes (e.g. radial,global_rot,independent)",
+            help="Comma-separated list of refinement modes (e.g. radial,global_rot,area,independent,axial_stretch)",
         ),
     ] = "independent",
     detector_trans_bound_meters: Annotated[
@@ -235,7 +235,17 @@ def indexer(
             "--detector-global-rot-axis",
             help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",
         ),
-    ] = "0,1,0",
+    ] = None,
+    cylinder_axis: Annotated[
+        str,
+        typer.Option(
+            "--cylinder-axis",
+            help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",
+        ),
+    ] = None,
+    detector_area_bound_frac: Annotated[
+        float, typer.Option("--detector-area-bound-frac")
+    ] = 0.05,
     detector_global_trans_bound_meters: Annotated[
         float, typer.Option("--detector-global-trans-bound-meters")
     ] = 0.01,
@@ -247,10 +257,7 @@ def indexer(
     num_candidates: Annotated[
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
-    mode: Annotated[
-        str,
-        typer.Option(help="Minimization objective: 'laue' or 'zone_axis'"),
-    ] = "laue",
+    index: Annotated[Optional[bool], typer.Option("--index/--no-index")] = None,
 ) -> None:
     # 1. Safely Parse Comma-Separated Strings into Python Lists
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
@@ -258,6 +265,16 @@ def indexer(
         [x.strip() for x in refine_goniometer_axes.split(",")]
         if refine_goniometer_axes
         else None
+    )
+    gonio_bounds_parsed = (
+        [float(x.strip()) for x in goniometer_bound_deg.split(",")]
+        if goniometer_bound_deg
+        else [5.0]
+    )
+    gonio_trans_bounds_parsed = (
+        [float(x.strip()) for x in goniometer_trans_bound_meters.split(",")]
+        if goniometer_trans_bound_meters
+        else [0.005]
     )
     det_banks_parsed = (
         [int(x.strip()) for x in refine_detector_banks.split(",")]
@@ -272,7 +289,12 @@ def indexer(
     global_rot_axis_parsed = (
         [float(x.strip()) for x in detector_global_rot_axis.split(",")]
         if detector_global_rot_axis
-        else [0.0, 1.0, 0.0]
+        else None
+    )
+    cylinder_axis = (
+        [float(x.strip()) for x in cylinder_axis.split(",")]
+        if cylinder_axis
+        else None
     )
 
     # 2. Hand off to Core Logic
@@ -303,9 +325,9 @@ def indexer(
         lattice_bound_frac=lattice_bound_frac,
         refine_goniometer=refine_goniometer,
         refine_goniometer_axes=gonio_axes_parsed,
-        goniometer_bound_deg=goniometer_bound_deg,
-        refine_sample=refine_sample,
-        sample_bound_meters=sample_bound_meters,
+        goniometer_bound_deg=gonio_bounds_parsed,
+        refine_goniometer_trans=refine_goniometer_trans,
+        goniometer_trans_bound_meters=gonio_trans_bounds_parsed,
         refine_beam=refine_beam,
         beam_bound_deg=beam_bound_deg,
         refine_detector=refine_detector,
@@ -317,10 +339,12 @@ def indexer(
         detector_global_rot_axis=global_rot_axis_parsed,
         detector_global_trans_bound_meters=detector_global_trans_bound_meters,
         detector_radial_bound_frac=detector_radial_bound_frac,
+        detector_area_bound_frac=detector_area_bound_frac,
+        cylinder_axis=cylinder_axis,
         bootstrap_filename=bootstrap_filename,
         batch_size=batch_size,
         num_candidates=num_candidates,
-        mode=mode,
+        no_index = not index if index is not None else None,
     )
 
 
@@ -356,12 +380,6 @@ def rbf_integrator(
             help="Whether to fit the mosaicity separately from sample dimensions to explain peak shape. Only use in non-spherical detector geometries."
         ),
     ] = False,
-    max_peaks: Annotated[
-        int,
-        typer.Option(
-            "--max-peaks", help="Maximum peaks per panel (used for JAX matrix padding)"
-        ),
-    ] = 500,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.0,
@@ -387,7 +405,6 @@ def rbf_integrator(
         nominal_sigma=nominal_sigma,
         anisotropic=anisotropic,
         fit_mosaicity=fit_mosaicity,
-        max_peaks=max_peaks,
         rel_border_width=rel_border_width,
         show_progress=show_progress,
         create_visualizations=create_visualizations,

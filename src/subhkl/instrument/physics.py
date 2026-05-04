@@ -43,6 +43,8 @@ def predict_reflections_on_panel(
     sample_offset=None,
     ki_vec=None,
     R_all=None,
+    gonio_axes=None,
+    gonio_angles=None,
 ):
     """
     Predict reflection positions on a specific detector panel.
@@ -56,7 +58,6 @@ def predict_reflections_on_panel(
     hkl = np.stack([h, k, l], axis=0)  # (3, M)
 
     # 1. Transform Miller indices to absolute Lab frame Q-vectors
-    # RUB is strictly (3, 3). hkl is (3, M). Result Q is (3, M)
     q_lab = RUB @ hkl
     Q_vec = 2 * np.pi * q_lab  # (3, M)
 
@@ -71,12 +72,8 @@ def predict_reflections_on_panel(
 
     if not np.any(mask_wl):
         return (
-            np.array([]),
-            np.array([]),
-            np.array([]),
-            np.array([]),
-            np.array([]),
-            np.array([]),
+            np.array([]), np.array([]), np.array([]),
+            np.array([]), np.array([]), np.array([])
         )
 
     lamda_v = lamda[mask_wl]
@@ -89,25 +86,35 @@ def predict_reflections_on_panel(
     kf_dir = kf_vec / np.linalg.norm(kf_vec, axis=0, keepdims=True)  # (3, M_v)
 
     # 4. Resolve the True Sample Ray Origin (s_lab)
-    s = sample_offset if sample_offset is not None else np.zeros(3)
-    if R_all is not None:
-        # R_all is strictly (3, 3) for this panel
-        s_lab = R_all @ s
+    if gonio_axes is not None and gonio_angles is not None:
+        from subhkl.instrument.goniometer import sample_to_lab
+        offsets = sample_offset
+        if offsets is not None and offsets.ndim == 1:
+            offsets_full = np.zeros((len(gonio_axes), 3))
+            offsets_full[-1] = offsets
+        elif offsets is None:
+            offsets_full = np.zeros((len(gonio_axes), 3))
+        else:
+            offsets_full = offsets
+            
+        # Real-space kinematic chain
+        s_lab = sample_to_lab(np.array([0.0, 0.0, 0.0]), gonio_axes, gonio_angles, offsets_full)
     else:
-        s_lab = s
+        # Legacy fallback
+        s = sample_offset if sample_offset is not None else np.zeros(3)
+        if R_all is not None:
+            s_lab = R_all @ s
+        else:
+            s_lab = s
 
     # 5. Intersect with Panel
     mask_panel, row, col = detector.reflections_mask(
         kf_dir[0], kf_dir[1], kf_dir[2], sample_offset=s_lab
     )
 
-    # Return strictly the peaks that fall within the physical detector boundary
     return (
-        row[mask_panel],
-        col[mask_panel],
-        h_v[mask_panel],
-        k_v[mask_panel],
-        l_v[mask_panel],
+        row[mask_panel], col[mask_panel],
+        h_v[mask_panel], k_v[mask_panel], l_v[mask_panel],
         lamda_v[mask_panel],
     )
 
@@ -122,10 +129,13 @@ def calculate_angular_error(
     sample_offset: npt.NDArray = None,
     ki_vec: npt.NDArray = None,
     R_all: npt.NDArray = None,
+    gonio_axes: npt.NDArray = None,
+    gonio_angles: npt.NDArray = None,
 ):
     """
     Calculate D-spacing and Angular errors for observed peaks vs predicted geometry.
     Uses the RUB matrix (R @ U @ B) for all coordinate transformations.
+    gonio_angles is expected to be shape (N_peaks, N_axes).
     """
     if sample_offset is None:
         sample_offset = np.zeros(3)
@@ -137,8 +147,44 @@ def calculate_angular_error(
     q_calc_norm = q_lab_calc / np.linalg.norm(q_lab_calc, axis=1, keepdims=True)
 
     # 2. Calculate Q_obs (Lab Frame) from Detector Pixel Position
-    # v = Pixel_Position - Sample_Position
-    if R_all is not None:
+    if gonio_axes is not None and gonio_angles is not None:
+        offsets = sample_offset
+        if offsets.ndim == 1:
+            offsets_full = np.zeros((len(gonio_axes), 3))
+            offsets_full[-1] = offsets
+        else:
+            offsets_full = offsets
+            
+        # Initialize Sample origin for all N peaks
+        s_lab = np.zeros((len(xyz_det), 3))
+        deg2rad = np.pi / 180.0
+        
+        # Ensure angles broadcast properly if a 1D array was passed
+        angles = np.tile(gonio_angles, (len(xyz_det), 1)) if gonio_angles.ndim == 1 else gonio_angles
+            
+        for i in reversed(range(len(gonio_axes))):
+            direction = gonio_axes[i][:3]
+            direction = direction / np.linalg.norm(direction)
+            theta = gonio_axes[i][3] * angles[:, i] * deg2rad # (N_peaks,)
+            
+            K = np.array([
+                [0, -direction[2], direction[1]],
+                [direction[2], 0, -direction[0]],
+                [-direction[1], direction[0], 0]
+            ])
+            
+            # Vectorized Rodrigues construction
+            sin_t = np.sin(theta)[:, None, None]
+            cos_t = np.cos(theta)[:, None, None]
+            K_sq = K @ K
+            R_i = np.eye(3)[None, :, :] + sin_t * K[None, :, :] + (1 - cos_t) * K_sq[None, :, :]
+            
+            # Rotate local coordinates and add the specific axis translation
+            s_lab = np.einsum("nij,nj->ni", R_i, s_lab) + offsets_full[i]
+            
+        v = xyz_det - s_lab
+    elif R_all is not None:
+        # Legacy static fallback
         if R_all.ndim == 3:
             s_lab = np.einsum("nij,j->ni", R_all, sample_offset)
         else:
@@ -146,6 +192,7 @@ def calculate_angular_error(
         v = xyz_det - s_lab
     else:
         v = xyz_det - sample_offset
+    # ------------------------------------------------------
 
     dist = np.linalg.norm(v, axis=1, keepdims=True)
     kf_dir = v / dist  # Unit vector pointing from sample to pixel
@@ -159,24 +206,17 @@ def calculate_angular_error(
     # Q_obs direction
     with np.errstate(divide="ignore", invalid="ignore"):
         q_obs_norm = delta_k / two_sin_theta[:, None]
-        # Handle 0-degree scattering where direction is undefined
         q_obs_norm = np.nan_to_num(q_obs_norm, nan=0.0)
 
     # 3. Angular Error (Angle between Q_calc direction and Q_obs direction)
     dot = np.sum(q_obs_norm * q_calc_norm, axis=1)
     dot = np.clip(dot, -1.0, 1.0)
     ang_err = np.rad2deg(np.arccos(dot))
-    # If q_obs_norm was zeroed out (0-degree scattering), arccos(0) = 90 deg.
-    # This is a reasonable penalty for a 0-degree observation matching a finite Q prediction.
 
     # 4. D-Spacing Error
-    # d_obs = lambda / 2sin(theta)
     with np.errstate(divide="ignore", invalid="ignore"):
         d_obs = np.divide(lam, two_sin_theta)
 
-    # d_calc = 1 / |RUB * hkl|
-    # Since R and U are rotations (unitary), they preserve length.
-    # |R * U * B * h| == |B * h| == 1/d
     q_lab_mag = np.linalg.norm(q_lab_calc, axis=1)
 
     with np.errstate(divide="ignore", invalid="ignore"):

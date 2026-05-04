@@ -194,6 +194,8 @@ class Peaks:
         R_all=None,
         max_workers: int = None,
         show_progress: bool = False,
+        gonio_axes=None,
+        gonio_angles=None,
     ) -> dict:
         peak_dict = {}
         tasks = orchestrator.prepare_predict_tasks(
@@ -213,6 +215,8 @@ class Peaks:
             sample_offset=sample_offset,
             ki_vec=ki_vec,
             R_all=R_all,
+            gonio_axes=gonio_axes,
+            gonio_angles=gonio_angles
         )
 
         ctx = multiprocessing.get_context("spawn")

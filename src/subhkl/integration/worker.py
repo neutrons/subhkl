@@ -284,45 +284,25 @@ def predict_single_bank(
     bank_id,
     det_config,
     unit_cell_params,
-    RUB_stack,
+    RUB_bank,
     wavelength_min,
     wavelength_max,
     sample_offset,
     ki_vec,
-    R_all_stack=None,
-    img_index=0,
+    R_bank=None,
+    gonio_axes=None,
+    gonio_angles=None,
 ):
     """
     Worker function for predicting peaks on a single detector bank.
     Generates HKLs locally (lazy generation) to reduce IPC overhead.
     """
-    # 1. Generate Reflections locally
-
     a, b, c, alpha, beta, gamma, space_group, d_min = unit_cell_params
+    from subhkl.core.crystallography import generate_reflections
     h, k, l = generate_reflections(a, b, c, alpha, beta, gamma, space_group, d_min)
 
-    # Extract the exact rotation matrix for this specific exposure/panel
-    # Note: img_index is the index into the R stack
-    if RUB_stack.ndim == 3:
-        single_RUB = (
-            RUB_stack[img_index] if img_index < len(RUB_stack) else RUB_stack[0]
-        )
-    else:
-        single_RUB = RUB_stack
-
-    if R_all_stack is not None:
-        if R_all_stack.ndim == 3:
-            single_R = (
-                R_all_stack[img_index]
-                if img_index < len(R_all_stack)
-                else R_all_stack[0]
-            )
-        else:
-            single_R = R_all_stack
-    else:
-        single_R = None
-
     from subhkl.instrument.detector import Detector
+    from subhkl.instrument.physics import predict_reflections_on_panel
 
     det = Detector(det_config)
 
@@ -331,17 +311,18 @@ def predict_single_bank(
         h=h,
         k=k,
         l=l,
-        RUB=single_RUB,
+        RUB=RUB_bank,
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
         sample_offset=sample_offset,
         ki_vec=ki_vec,
-        R_all=single_R,
+        R_all=R_bank,
+        gonio_axes=gonio_axes,
+        gonio_angles=gonio_angles,
     )
     if len(row) > 0:
         return bank_id, [row, col, h_f, k_f, l_f, wl_f]
     return img_key, None
-
 
 def integrate_single_bank(
     bank_id,

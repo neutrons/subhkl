@@ -42,7 +42,6 @@ from dataclasses import dataclass, field
 from typing import Union, List
 from subhkl.config import reduction_settings
 
-
 def get_rotation_data_from_nexus(filename, instrument):
     settings = reduction_settings[instrument]
     axes, angles, names = [], [], []
@@ -70,44 +69,84 @@ def get_rotation_data_from_nexus(filename, instrument):
 
     return axes, angles, names
 
-
 def calc_goniometer_rotation_matrix(axes, angles):
     """
-    Calculate the goniometer rotation matrix.
-
-    Parameters
-    ----------
-    axes : list[list[float]]
-        Parallel list of axes corresponding to the angles; each list is packed
-        as in Mantid `SetGoniometer`.
-    angles : list[float]
-        List of the angles in degrees (in the same order as Mantid
-        `SetGoniometer`)
-
-    Returns
-    -------
-    matrix : 3x3 numpy array
-        The goniometer rotation matrix
+    Computes the cumulative rotation matrix R for reciprocal space transformations.
+    (Translations are ignored in momentum space).
     """
-    matrix = np.eye(3)
+    R_cum = np.eye(3)
+    deg2rad = np.pi / 180.0
 
-    for angle_deg, axis_spec in zip(angles, axes):
-        # Make rotation vector by combining angle and spec
-        sign = axis_spec[3]
-        direction = np.array(axis_spec[:3], dtype=float)
-        # FIX: Normalize axis direction to prevent scaling the angle
-        norm = np.linalg.norm(direction)
-        if norm > 1e-12:
-            direction /= norm
-        rot_vec = sign * angle_deg * direction
+    for i in range(len(axes)):
+        direction = axes[i][:3]
+        direction = direction / np.linalg.norm(direction)
+        theta = axes[i][3] * angles[i] * deg2rad
 
-        # Multiply rotation matrix on the right to achieve the ordering
-        # used by Mantid `SetGoniometer`
-        axis_matrix = Rotation.from_rotvec(rot_vec, degrees=True).as_matrix()
-        matrix = matrix @ axis_matrix
+        K = np.array([
+            [0, -direction[2], direction[1]],
+            [direction[2], 0, -direction[0]],
+            [-direction[1], direction[0], 0]
+        ])
+        R_i = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
+        R_cum = R_cum @ R_i
 
-    return matrix
+    return R_cum
 
+def sample_to_lab(p_sample, axes, angles, offsets):
+    """
+    Convert a point from the Sample frame to the Lab frame.
+    axes: (N, 4) array [x, y, z, sign]
+    angles: (N,) array of angles in degrees
+    offsets: (N, 3) array of translation offsets applied AFTER each rotation
+    """
+    p = np.array(p_sample)
+    num_axes = len(axes)
+    deg2rad = np.pi / 180.0
+
+    # Traverse from innermost (Sample, index N-1) to outermost (Lab, index 0)
+    for i in reversed(range(num_axes)):
+        direction = axes[i][:3]
+        direction = direction / np.linalg.norm(direction)
+        theta = axes[i][3] * angles[i] * deg2rad
+
+        # Build standard Rodrigues rotation matrix
+        K = np.array([
+            [0, -direction[2], direction[1]],
+            [direction[2], 0, -direction[0]],
+            [-direction[1], direction[0], 0]
+        ])
+        R_i = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
+
+        # Apply transformation: Rotate local, then translate
+        p = R_i @ p + offsets[i]
+
+    return p
+
+def lab_to_sample(p_lab, axes, angles, offsets):
+    """
+    Convert a point from the Lab frame back to the Sample frame.
+    """
+    p = np.array(p_lab)
+    num_axes = len(axes)
+    deg2rad = np.pi / 180.0
+
+    # Traverse from outermost (Lab, index 0) to innermost (Sample, index N-1)
+    for i in range(num_axes):
+        direction = axes[i][:3]
+        direction = direction / np.linalg.norm(direction)
+        theta = axes[i][3] * angles[i] * deg2rad
+
+        K = np.array([
+            [0, -direction[2], direction[1]],
+            [direction[2], 0, -direction[0]],
+            [-direction[1], direction[0], 0]
+        ])
+        R_i = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
+
+        # Apply inverse transformation: subtract translation, then reverse rotation
+        p = R_i.T @ (p - offsets[i])
+
+    return p
 
 @dataclass
 class Goniometer:

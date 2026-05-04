@@ -105,7 +105,6 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
         gamma: float = 2.0,
         min_sigma: float = 0.5,
         max_sigma: float = 8.0,
-        max_peaks: int = 500,
         chunk_size: int = 128,
         loss: str = "gaussian",
         border_width: int = 0,
@@ -121,7 +120,6 @@ class SparseRBFPeakFinder(SparseBasisPursuit):
         self.ref_sigma = 1.0  # [Pixel^0.5]
         self.min_sigma = min_sigma  # [Pixel^0.5]
         self.max_sigma = max_sigma  # [Pixel^0.5]
-        self.max_peaks = max_peaks  # [-]
         self.chunk_size = chunk_size  # [-]
         self.loss = loss  # [-]
         self.border_width = border_width  # [Pixel^0.5]
@@ -895,10 +893,10 @@ def build_3d_cov(params):
 
 @partial(jit, static_argnames=["patch_size", "fit_mosaicity"])
 def global_shape_objective(
-    params, patches, bgs, drs, dcs, P_mats, distances, patch_size, fit_mosaicity
+    params, patches, bgs, drs, dcs, P_mats, distances, R_mats, patch_size, fit_mosaicity
 ):
     # 1. Build the crystal shape tensor
-    Sigma_shape = build_3d_cov(params[:6])
+    Sigma_shape_sample = build_3d_cov(params[:6])
 
     # 2. Handle the optional Mosaicity Tensor
     if fit_mosaicity:
@@ -908,42 +906,48 @@ def global_shape_objective(
         # If disabled, the tensor is perfectly zeroed out.
         Sigma_eta_base = jnp.zeros((3, 3))
 
-    yy, xx = jnp.indices((patch_size, patch_size))
+    def fit_one_peak(patch, bg, dr, dc, P_true, D_i, R_gonio):
+        # 3. Rotate Crystal Shape to the Lab Frame
+        Sigma_shape_lab = R_gonio @ Sigma_shape_sample @ R_gonio.T
 
-    def fit_one_peak(patch, bg, dr, dc, P_true, D_i):
-        # 3. Add the tensors. If fit_mosaicity is False, D_i * 0 = 0.
-        Sigma_total_3D = Sigma_shape + (D_i**2) * Sigma_eta_base
+        # 4. Add the tensors. If fit_mosaicity is False, D_i * 0 = 0.
+        Sigma_total_3D = Sigma_shape_lab + (D_i**2) * Sigma_eta_base
 
-        # 4. Exact 2D Projection and Pixel Conversion
+        # 5. Exact 2D Projection and Pixel Conversion
         Sigma_2D_physical = P_true @ Sigma_total_3D @ P_true.T
         Sigma_2D = Sigma_2D_physical / (1.0**2)  # assuming 1.0mm pitch in P_true
 
-        det_sigma = jnp.maximum(
-            Sigma_2D[0, 0] * Sigma_2D[1, 1] - Sigma_2D[0, 1] ** 2, 1e-6
-        )
-        a = Sigma_2D[1, 1] / det_sigma
-        b = -Sigma_2D[0, 1] / det_sigma
-        c = Sigma_2D[0, 0] / det_sigma
+        var_r = jnp.maximum(Sigma_2D[0, 0], 1e-6)
+        var_c = jnp.maximum(Sigma_2D[1, 1], 1e-6)
+        
+        max_cov = jnp.sqrt(var_r * var_c) * 0.999
+        cov_rc = jnp.clip(Sigma_2D[0, 1], -max_cov, max_cov)
 
-        dr_grid = yy - dr
-        dc_grid = xx - dc
+        det_sigma = var_r * var_c - cov_rc**2
+        
+        a = var_c / det_sigma
+        b = -cov_rc / det_sigma
+        c = var_r / det_sigma
+
+        dr_grid = dr
+        dc_grid = dc
 
         template = jnp.exp(
             -0.5 * (a * dc_grid**2 + 2.0 * b * dr_grid * dc_grid + c * dr_grid**2)
         )
 
         y_sub = patch - bg
+
+        # Calculate the exact least-squares amplitude
         amp = jnp.sum(y_sub * template) / jnp.maximum(
             jnp.sum(template * template), 1e-6
         )
-        amp = jnp.maximum(amp, 0.0)
 
         residual = y_sub - amp * template
         return jnp.sum(residual**2)
 
-    mses = vmap(fit_one_peak)(patches, bgs, drs, dcs, P_mats, distances)
+    mses = vmap(fit_one_peak)(patches, bgs, drs, dcs, P_mats, distances, R_mats)
     return jnp.mean(mses)
-
 
 # Bind the val_and_grad wrapper to recognize the new static argument
 val_and_grad_fn = jit(
@@ -951,9 +955,8 @@ val_and_grad_fn = jit(
     static_argnames=["patch_size", "fit_mosaicity"],
 )
 
-
 def optimize_global_crystal(
-    patches, bgs, drs, dcs, P_mats, distances, fit_mosaicity=False
+    patches, bgs, drs, dcs, P_mats, distances, R_mats, fit_mosaicity=False
 ):
     # 1. Dynamically size the optimizer state based on the configuration
     if fit_mosaicity:
@@ -975,14 +978,39 @@ def optimize_global_crystal(
             dcs,
             P_mats,
             distances,
+            R_mats,
             patches.shape[-1],
             fit_mosaicity=fit_mosaicity,
         )
         grad_opt = np.array(grad_phys, dtype=np.float64) * scales
         return np.array(val, dtype=np.float64), grad_opt
 
+    bounds = [(None, None)] * (7 if fit_mosaicity else 6)
+
+    # 1. Physical bounds (in METERS). 3.0 mm = 0.003 meters.
+    max_radius_meters = 0.003 
+
+    # 2. Diagonals (Indices 0, 2, 5) -> Must be positive, capped at max radius
+    for idx in [0, 2, 5]:
+        bounds[idx] = (1e-6, max_radius_meters / scales[idx])
+
+    # 3. Off-diagonals (Indices 1, 3, 4) -> Symmetric bounds to prevent extreme skew
+    for idx in [1, 3, 4]:
+        bounds[idx] = (-max_radius_meters / scales[idx], max_radius_meters / scales[idx])
+
+    # 4. Mosaicity bound (if active, e.g., max 10 mrad = 0.010 rad)
+    if fit_mosaicity:
+        bounds[6] = (1e-6, 0.010 / scales[6])
+
     x0_opt = x0_phys / scales
-    res = scipy.optimize.minimize(scipy_objective, x0_opt, method="L-BFGS-B", jac=True)
+    res = scipy.optimize.minimize(
+        scipy_objective, 
+        x0_opt, 
+        method="L-BFGS-B", 
+        jac=True, 
+        bounds=bounds,
+        options={"maxiter": 250, "disp": False}
+    )
 
     x_final_phys = res.x * scales
     print(f"  > Global Optimization Complete. (Final MSE: {res.fun:.2f})")
@@ -1427,7 +1455,6 @@ def integrate_peaks_rbf_ssn(
     sigmas: List[float],
     alpha: float,
     gamma: float,
-    max_peaks: int,
     show_progress: bool,
     all_R: np.ndarray = None,
     sample_offset: np.ndarray = None,
@@ -1440,6 +1467,8 @@ def integrate_peaks_rbf_ssn(
     create_visualizations: bool = False,
     file_prefix: str = None,
     max_workers: int = None,
+    gonio_axes: np.ndarray = None,
+    gonio_angles: np.ndarray = None,
 ):
     """
     Args:
@@ -1467,12 +1496,52 @@ def integrate_peaks_rbf_ssn(
     if ki_vec is None:
         ki_vec = np.array([0, 0, 1.0])
 
-    len(peaks_obj.image.ims)
+    img_keys_ordered = sorted(peak_dict.keys())
+    total_images = len(img_keys_ordered)
 
-    def get_R_for_img(img_key_str):
-        if all_R is None:
-            return None
-        return all_R[int(img_key_str)]
+    def get_safe_R(img_key, seq_idx):
+        run_id = peaks_obj.image.get_run_id(img_key)
+        if all_R is not None:
+            if all_R.ndim == 3:
+                # Safely handle uncompressed (per-image) vs compressed (per-run) arrays
+                if len(all_R) == total_images:
+                    return all_R[seq_idx]
+                else:
+                    return all_R[run_id] if run_id < len(all_R) else all_R[0]
+            return all_R
+        return np.eye(3)
+
+    from subhkl.instrument.goniometer import sample_to_lab
+
+    def get_s_lab_for_img(img_key_str, run_id, R_val):
+        # 1. Use exact dynamic kinematics if available
+        if gonio_axes is not None and gonio_angles is not None:
+            # --- FIX: Robust shape checking for multi-axis extraction ---
+            if gonio_angles.ndim == 2:
+                num_axes = len(gonio_axes)
+                if gonio_angles.shape[1] == num_axes:
+                    ang = gonio_angles[run_id, :] if run_id < gonio_angles.shape[0] else gonio_angles[0, :]
+                else:
+                    ang = gonio_angles[:, run_id] if run_id < gonio_angles.shape[1] else gonio_angles[:, 0]
+            else:
+                ang = gonio_angles
+            # ------------------------------------------------------------
+            
+            # Map legacy 1D offset into the full multi-axis array
+            offsets = sample_offset
+            if offsets is not None and offsets.ndim == 1:
+                offsets_full = np.zeros((len(gonio_axes), 3))
+                offsets_full[-1] = offsets
+            elif offsets is None:
+                offsets_full = np.zeros((len(gonio_axes), 3))
+            else:
+                offsets_full = offsets
+
+            return sample_to_lab(np.array([0.0, 0.0, 0.0]), gonio_axes, ang, offsets_full)
+        
+        # 2. Legacy fallback using securely passed R_val
+        s_off = sample_offset if sample_offset is not None and sample_offset.ndim == 1 else (sample_offset[-1] if sample_offset is not None else np.zeros(3))
+        return R_val @ s_off if R_val is not None else s_off
 
     integrator = SparseLaueIntegrator(
         alpha=alpha,
@@ -1499,11 +1568,10 @@ def integrate_peaks_rbf_ssn(
     meta_harmonics = []
 
     frame_counter = 0
-    img_keys_ordered = sorted(peak_dict.keys())
 
-    for img_key in tqdm(
+    for seq_idx, img_key in enumerate(tqdm(
         img_keys_ordered, disable=not show_progress, desc="Batching Images"
-    ):
+    )):
         p_data = peak_dict[img_key]
         i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr = p_data
 
@@ -1544,12 +1612,8 @@ def integrate_peaks_rbf_ssn(
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = peaks_obj.image.get_run_id(img_key)
 
-        current_R_val = get_R_for_img(img_key)
-        s_lab = (
-            current_R_val @ sample_offset
-            if current_R_val is not None
-            else sample_offset
-        )
+        current_R = get_safe_R(img_key, seq_idx)
+        s_lab = get_s_lab_for_img(img_key, run_id, current_R)
 
         batch_rs = np.array([i_arr[d["rep_idx"]] for d in keep_data])
         batch_cs = np.array([j_arr[d["rep_idx"]] for d in keep_data])
@@ -1594,13 +1658,14 @@ def integrate_peaks_rbf_ssn(
     bw = max(border_width, 5)
 
     all_P_mats = []
+    all_R_mats = []
     all_distances = []
 
     for idx, img_key in enumerate(meta_keys):
         det = peaks_obj.get_detector_by_img(img_key)
         run_id = frames[idx]
-        current_R = get_R_for_img(img_key)
-        s_lab = current_R @ sample_offset if current_R is not None else sample_offset
+        current_R = get_safe_R(img_key, idx)
+        s_lab = get_s_lab_for_img(img_key, run_id, current_R)
 
         pixel_xyz = det.pixel_to_lab(all_rs[idx], all_cs[idx])
         k_f = pixel_xyz - s_lab
@@ -1615,7 +1680,8 @@ def integrate_peaks_rbf_ssn(
 
         # The Central Projection Skew Matrix
         cos_alpha = np.dot(k_f_hat, n_det_hat)
-        cos_alpha = np.sign(cos_alpha) * max(abs(cos_alpha), 0.01)
+        ca_sign = 1.0 if cos_alpha >= 0 else -1.0
+        cos_alpha = ca_sign * max(abs(cos_alpha), 0.01)
         Skew = np.eye(3) - np.outer(k_f_hat, n_det_hat) / cos_alpha
 
         # Pixel Pitch Scaling Matrix
@@ -1626,49 +1692,63 @@ def integrate_peaks_rbf_ssn(
         # The Ultimate Projection Matrix
         P_final = S_pix @ P_ortho @ Skew
         all_P_mats.append(P_final)
+        all_R_mats.append(current_R if current_R is not None else np.eye(3))
 
     all_P_mats = np.array(all_P_mats)
+    all_R_mats = np.array(all_R_mats)
     all_distances = np.array(all_distances)
 
-    # 2. Identify the Top 500 strongest peaks (Proxy)
-    P_proxy = 3
-    pad_images = np.pad(
-        images_batch, ((0, 0), (P_proxy, P_proxy), (P_proxy, P_proxy)), mode="reflect"
-    )
-    proxy_intensities = []
-    for f, r, c in zip(frames, all_rs, all_cs):
-        ri, ci = int(round(r)) + P_proxy, int(round(c)) + P_proxy
-        proxy_intensities.append(
-            np.sum(pad_images[f, ri - 1 : ri + 2, ci - 1 : ci + 2])
-        )
-
-    top_indices = np.argsort(proxy_intensities)[-500:]
-
-    # 3. Extract exact patches
+    # ==========================================
+    # 2. Extract exact patches for global optimization
+    # ==========================================
     opt_P = 15
     opt_half = opt_P // 2
-    opt_patches, opt_bgs, opt_drs, opt_dcs, opt_Pmats, opt_dists = (
-        [],
-        [],
-        [],
-        [],
-        [],
-        [],
-    )
-    for idx in top_indices:
-        f, r, c = frames[idx], all_rs[idx], all_cs[idx]
-        ri, ci = int(round(r)), int(round(c))
+    opt_patches, opt_bgs, opt_drs, opt_dcs = [], [], [], []
+    opt_Pmats, opt_dists, opt_Rmats = [], [], []
 
-        if bw < ri < H - bw and bw < ci < W - bw:
-            patch = images_batch[
-                f, ri - opt_half : ri + opt_half + 1, ci - opt_half : ci + opt_half + 1
-            ]
-            opt_patches.append(patch)
-            opt_bgs.append(np.median(patch))
-            opt_drs.append(r - (ri - opt_half))
-            opt_dcs.append(c - (ci - opt_half))
-            opt_Pmats.append(all_P_mats[idx])
-            opt_dists.append(all_distances[idx])
+    if show_progress:
+        print(f"  > 3D Tensor Optimization: Using ALL {len(frames)} peaks.")
+
+    # Pad images once for the exact patch extraction
+    pad_images = np.pad(
+        images_batch, ((0, 0), (opt_P, opt_P), (opt_P, opt_P)), mode="reflect"
+    )
+
+    for idx in range(len(frames)):
+        f, r, c = frames[idx], all_rs[idx], all_cs[idx]
+        
+        # Boundary safety check (matches your H, W constraints)
+        if not (bw < int(round(r)) < H - bw and bw < int(round(c)) < W - bw):
+            continue
+
+        opt_Pmats.append(all_P_mats[idx])
+        opt_dists.append(all_distances[idx])
+        opt_Rmats.append(all_R_mats[idx])
+
+        ri, ci = int(round(r)) + opt_P, int(round(c)) + opt_P
+        
+        # Bounding box bounds
+        r_min, r_max = ri - opt_half, ri + opt_half + 1
+        c_min, c_max = ci - opt_half, ci + opt_half + 1
+
+        patch = pad_images[f, r_min:r_max, c_min:c_max].astype(np.float32)
+
+        # Local background estimation (edges of the 15x15 patch)
+        bg_mask = np.ones_like(patch, dtype=bool)
+        bg_mask[2:-2, 2:-2] = False
+        bg = np.median(patch[bg_mask])
+
+        opt_patches.append(patch)
+        opt_bgs.append(bg)
+
+        # Sub-pixel grid shifts
+        rr, cc = np.meshgrid(
+            np.arange(r_min, r_max) - opt_P,
+            np.arange(c_min, c_max) - opt_P,
+            indexing="ij",
+        )
+        opt_drs.append(rr - r)
+        opt_dcs.append(cc - c)
 
     # We require at least 15 valid peaks to mathematically constrain a 6-parameter 3D tensor
     MIN_PEAKS_FOR_GLOBAL_FIT = 15
@@ -1688,7 +1768,9 @@ def integrate_peaks_rbf_ssn(
         all_var_v = np.full(len(all_rs), integrator.nominal_sigma**2, dtype=np.float32)
         all_cov_uv = np.zeros(len(all_rs), dtype=np.float32)
     else:
+        # ==========================================
         # 4. Run the Global Optimizer
+        # ==========================================
         res_x = optimize_global_crystal(
             jnp.array(opt_patches),
             jnp.array(opt_bgs),
@@ -1696,6 +1778,7 @@ def integrate_peaks_rbf_ssn(
             jnp.array(opt_dcs),
             jnp.array(opt_Pmats),
             jnp.array(opt_dists),
+            jnp.array(opt_Rmats),
             fit_mosaicity=fit_mosaicity,
         )
 
@@ -1708,16 +1791,17 @@ def integrate_peaks_rbf_ssn(
             Sigma_eta_jnp = jnp.zeros((3, 3))
 
         @jit
-        def project_all_shapes(P_mats, dists):
-            def project_one(P, D_i):
-                Sigma_total = Sigma_shape_jnp + (D_i**2) * Sigma_eta_jnp
-                # P is already scaled by S_pix, so output is perfectly in Pixels^2
+        def project_all_shapes(P_mats, dists, R_mats):
+            def project_one(P, D_i, R_gonio):
+                # Rotate to Lab Frame before projecting
+                Sigma_shape_lab = R_gonio @ Sigma_shape_jnp @ R_gonio.T
+                Sigma_total = Sigma_shape_lab + (D_i**2) * Sigma_eta_jnp
                 return P @ Sigma_total @ P.T
 
-            return vmap(project_one)(P_mats, dists)
+            return vmap(project_one)(P_mats, dists, R_mats)
 
         all_Sigma_2D = project_all_shapes(
-            jnp.array(all_P_mats), jnp.array(all_distances)
+            jnp.array(all_P_mats), jnp.array(all_distances), jnp.array(all_R_mats)
         )
 
         all_var_u = np.array(all_Sigma_2D[:, 0, 0])
@@ -1764,12 +1848,9 @@ def integrate_peaks_rbf_ssn(
         H, W = image_raw.shape
         bw = border_width
 
-        current_R_val = get_R_for_img(img_key)
-        s_lab = (
-            current_R_val @ sample_offset
-            if current_R_val is not None
-            else sample_offset
-        )
+        seq_idx = img_keys_ordered.index(img_key)
+        current_R = get_safe_R(img_key, seq_idx)
+        s_lab = get_s_lab_for_img(img_key, run_id, current_R)
 
         img_rs = [all_rs[idx] for idx in indices]
         img_cs = [all_cs[idx] for idx in indices]
