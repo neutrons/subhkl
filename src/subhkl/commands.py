@@ -2318,6 +2318,15 @@ def run_score_filter(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
+    # ==========================================
+    # PRE-COMPUTE JAX CONSTANTS FOR LAUE FILTER
+    # ==========================================
+    ki_jax = jnp.array(ub_helper.ki_vec)
+    wl_min = float(ub_helper.wavelength[0])
+    wl_max = float(ub_helper.wavelength[1])
+    # Precompute squared norms of theoretical HKLs for fast wavelength projection
+    h_norm_sq_jax = jnp.sum(h_sample_jax**2, axis=0) 
+
     def ipp_mle_loss(params, beta_bg, sigma_rad, q_batch_unnorm):
         U_pred = compute_U(params)
         
@@ -2329,21 +2338,40 @@ def run_score_filter(
         h_lab = jnp.matmul(U_pred, h_sample_jax)
         q_theo_hat = h_lab / (jnp.linalg.norm(h_lab, axis=0, keepdims=True) + 1e-9)
         
-        # 3. Pairwise Cosine Distance
+        # ==========================================
+        # 3. THE LAUE GHOST FILTER
+        # ==========================================
+        # Calculate the required wavelength for every theoretical ray at this orientation
+        lam_req = -2.0 * jnp.sum(ki_jax[:, None] * h_lab, axis=0) / (h_norm_sq_jax + 1e-9)
+        valid_lam = (lam_req >= wl_min) & (lam_req <= wl_max)
+        
+        # 4. Pairwise Cosine Distance
         cos_theta = jnp.matmul(q_exp_hat.T, q_theo_hat)
         cos_theta = jnp.clip(cos_theta, -1.0 + 1e-7, 1.0 - 1e-7)
         
-        # 4. Theoretical Bragg Intensity (Von Mises-Fisher)
+        # 5. Stabilized Theoretical Bragg Intensity
         kappa = 1.0 / (sigma_rad**2)
-        I_bragg_matrix = jnp.exp(kappa * (cos_theta - 1.0))
         
-        # 5. Total Intensity Field at each experimental event
+        # If a ray is physically impossible, apply a massive penalty to its exponent so exp() -> 0.0
+        ghost_penalty = jnp.where(valid_lam, 0.0, -1e4)
+        
+        # Shape: (N_events, M_theos)
+        log_I_bragg = kappa * (cos_theta - 1.0) + ghost_penalty
+        I_bragg_matrix = jnp.exp(log_I_bragg)
+        
+        # 6. Total Intensity Field at each experimental event
         I_total = beta_bg + jnp.sum(I_bragg_matrix, axis=1)
         
-        # 6. IPP Maximum Likelihood (Minimize Negative Log-Likelihood)
+        # 7. IPP Maximum Likelihood (Minimize Negative Log-Likelihood)
         loss = -jnp.mean(jnp.log(I_total))
         
-        return loss, U_pred
+        # ==========================================
+        # 8. GRADIENT NORMALIZATION
+        # ==========================================
+        # Divide by kappa to prevent the chain rule from exploding the Adam gradients!
+        normalized_loss = loss / kappa
+        
+        return normalized_loss, U_pred
 
     # ==========================================
     # PHASE 3: STREAMING EnSF LOOP
