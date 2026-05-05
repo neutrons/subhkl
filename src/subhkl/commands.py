@@ -2290,22 +2290,33 @@ def run_score_filter(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    # Swap the order of frequency_scale and q_batch_unnorm
-    def moire_loss(params, frequency_scale, q_batch_unnorm):
+    def spherical_moire_loss(params, omega, q_exp_hat):
+        # q_exp_hat is already normalized (3, N_events)
         U_pred = compute_U(params)
-        UB_inv = jnp.matmul(B_inv, U_pred.T)
         
-        # v is the fractional coordinate (h, k, l)
-        v = jnp.matmul(UB_inv, q_batch_unnorm) 
+        # h_sample_jax are the pre-computed theoretical integer rays (3, M_theos)
+        h_lab = jnp.matmul(U_pred, h_sample_jax)
+        q_theo_hat = h_lab / jnp.linalg.norm(h_lab, axis=0, keepdims=True)
         
-        # Evaluate on a continuous periodic basis. 
-        # Maximize the cosine (minimize the negative)
-        interference = jnp.cos(2.0 * jnp.pi * v[0] * frequency_scale) + \
-                       jnp.cos(2.0 * jnp.pi * v[1] * frequency_scale) + \
-                       jnp.cos(2.0 * jnp.pi * v[2] * frequency_scale)
-                       
-        # Normalize and invert for loss
-        loss = 1.0 - jnp.mean(interference) / 3.0
+        # Calculate pairwise dot products (Cosine of angle)
+        # Shape: (N_events, M_theos)
+        cos_theta = jnp.matmul(q_exp_hat.T, q_theo_hat)
+        
+        # Clip for numerical stability
+        cos_theta = jnp.clip(cos_theta, -1.0, 1.0)
+        theta = jnp.arccos(cos_theta)
+        
+        # Evaluate Moiré interference on the tangent planes
+        # Maximize the sum of cosines
+        interference = jnp.cos(omega * theta)
+        
+        # LogSumExp (Softmax) to smoothly select the nearest theoretical ray for each event
+        # The temperature (tau) controls how softly it blends overlapping tangent planes
+        tau = 0.05
+        max_interference = jax.scipy.special.logsumexp(interference / tau, axis=1) * tau
+        
+        # Final normalized loss
+        loss = 1.0 - jnp.mean(max_interference)
         return loss, U_pred
 
     # ==========================================
