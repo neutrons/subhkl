@@ -2275,7 +2275,7 @@ def run_ekf_tracker(
         all_pixels_r = all_pixels_r[sort_idx]
         all_pixels_c = all_pixels_c[sort_idx]
 
-    # ==========================================
+        # ==========================================
     # CORE JAX FUNCTIONS
     # ==========================================
     def compute_U(rot_6d):
@@ -2287,25 +2287,30 @@ def run_ekf_tracker(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    def scalar_ipp_loss(mu_params, beta_bg, sigma_rad, q_batch_unnorm):
-        """Returns PURE SCALAR loss for exact Hessian computation."""
+    def per_event_log_likelihood(mu_params, beta_bg, sigma_rad, q_exp_single_hat):
+        """Returns the negative log-likelihood for a SINGLE neutron event."""
         U_pred = compute_U(mu_params)
-
-        q_exp_norm = jnp.linalg.norm(q_batch_unnorm, axis=0, keepdims=True)
-        q_exp_hat = q_batch_unnorm / (q_exp_norm + 1e-9)
-
+        
+        # Project theoretical rays
         h_lab = jnp.matmul(U_pred, h_sample_jax)
         q_theo_hat = h_lab / (jnp.linalg.norm(h_lab, axis=0, keepdims=True) + 1e-9)
-
-        cos_theta = jnp.matmul(q_exp_hat.T, q_theo_hat)
-
+        
+        # Cosine Distance against all theoretical rays for this ONE event
+        cos_theta = jnp.dot(q_theo_hat.T, q_exp_single_hat)
+        cos_theta = jnp.clip(cos_theta, -1.0 + 1e-7, 1.0 - 1e-7)
+        
+        # Theoretical Bragg Intensity
         kappa = 1.0 / (sigma_rad**2)
-        I_bragg_matrix = jnp.exp(kappa * (cos_theta - 1.0))
+        I_bragg = jnp.exp(kappa * (cos_theta - 1.0))
+        
+        I_total = beta_bg + jnp.sum(I_bragg)
+        
+        return -jnp.log(I_total)
 
-        I_total = beta_bg + jnp.sum(I_bragg_matrix, axis=1)
-
-        # We DO NOT normalize by kappa here, because we want the true Fisher Information Hessian
-        return -jnp.mean(jnp.log(I_total))
+    # VMAP the gradient function so we get a gradient vector for EACH event in the batch
+    # in_axes=(None, None, None, 1) means we map over the 1st axis (columns) of q_batch
+    batch_grad_fn = jax.vmap(jax.grad(per_event_log_likelihood), in_axes=(None, None, None, 1))
+    batch_loss_fn = jax.vmap(per_event_log_likelihood, in_axes=(None, None, None, 1))
 
     # ==========================================
     # PHASE 3: CONTINUOUS EKF TRACKING LOOP
@@ -2313,34 +2318,44 @@ def run_ekf_tracker(
     if event_nexus_filename:
         print("\n[3/4] Executing Continuous EKF Tracking...")
 
-        # Initialize State (mu) and Covariance (P)
         mu_current = mu_0
-        P_current = jnp.eye(6) * 1e-3  # Initial tight covariance from Golden Seed
+        P_current = jnp.eye(6) * 1e-3  
 
         @jax.jit
         def ekf_update_step(mu, P, current_beta, current_sigma, current_Q, q_batch):
-            # 1. FORECAST (Diffusion)
+            # 1. Normalize experimental neutron events
+            q_exp_norm = jnp.linalg.norm(q_batch, axis=0, keepdims=True)
+            q_exp_hat = q_batch / (q_exp_norm + 1e-9)
+
+            # 2. FORECAST (Diffusion)
             P_prior = P + current_Q * jnp.eye(6)
-
-            # 2. EVALUATE MOMENTS
-            # Get Loss, Exact Gradient (Drift), and Exact Hessian (Fisher Information Matrix)
-            loss_val, g = jax.value_and_grad(scalar_ipp_loss)(mu, current_beta, current_sigma, q_batch)
-            H = jax.hessian(scalar_ipp_loss)(mu, current_beta, current_sigma, q_batch)
-
-            # Regularize Hessian slightly to guarantee positive-definite inversion
-            H_reg = H + jnp.eye(6) * 1e-6
-
-            # 3. ANALYSIS (Information Filter Collapse)
+            
+            # 3. EVALUATE MOMENTS via EMPIRICAL FISHER INFORMATION
+            # G is the matrix of per-event gradients. Shape: (N_events, 6)
+            G = batch_grad_fn(mu, current_beta, current_sigma, q_exp_hat)
+            
+            # The Mean Gradient (g)
+            g = jnp.mean(G, axis=0)
+            
+            # The Fisher Information Matrix (Outer product approximation of the Hessian)
+            # Shape: (6, 6). This is strictly Positive Semi-Definite!
+            H_FIM = jnp.matmul(G.T, G) / G.shape[0]
+            
+            # Regularize slightly to guarantee positive-definite inversion
+            H_reg = H_FIM + jnp.eye(6) * 1e-6
+            
+            # 4. ANALYSIS (Information Filter Collapse)
             Lambda_prior = jnp.linalg.inv(P_prior)
             Lambda_post = Lambda_prior + H_reg
             P_post = jnp.linalg.inv(Lambda_post)
-
-            # 4. MEAN UPDATE (Optimal Newton Step)
+            
+            # 5. MEAN UPDATE (Optimal Newton Step)
             mu_post = mu - jnp.matmul(P_post, g)
-
-            # Generate U_pred for callback logging
+            
+            # Calculate total loss for logging
+            loss_val = jnp.mean(batch_loss_fn(mu_post, current_beta, current_sigma, q_exp_hat))
             U_post = compute_U(mu_post)
-
+            
             return mu_post, P_post, loss_val, U_post
 
         tracking_history = []
