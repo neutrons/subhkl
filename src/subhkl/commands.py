@@ -2156,70 +2156,49 @@ def _process_single_bank(args):
         pixel_c.astype(np.int16)
     )
 
-def run_score_filter(
+def run_ekf_tracker(
     finder_file: str,
     output_h5_filename: str,
     instrument_name: str | None = None,
     event_nexus_filename: str | None = None,
     streaming_callback = None,
-    alpha = 0.01,
-    J: int = 1024,
-    beta: float = 0.05,       # NEW: Background Poisson Noise Rate (SNR control)
-    sigma: float = 0.03,      # NEW: Width of Bragg peaks in radians (~1.7 degrees)
+    beta: float = 0.05,       # Background Poisson Noise Rate
+    sigma: float = 0.03,      # Width of Bragg peaks in radians
+    Q_noise: float = 1e-5,    # NEW: Process Noise Variance (Diffusion rate per step)
     window_size_events:int = 25000,
     step_size_events: int = 10000,
     seed_file: str | None = None,
-    learning_rate: float = 0.02,
-    eta: float = 0.05,
-    gamma: float = 1000.0,
-    lamb: float = 0.8,
 ):
     from subhkl.optimization import FindUB, get_lattice_system
-    from subhkl.config import beamlines
-    from subhkl.instrument.detector import Detector
     import h5py
     import numpy as np
     import jax
     import jax.numpy as jnp
-    import optax
 
     # ==========================================
-    # LOAD GOLDEN SEED (If provided)
+    # LOAD GOLDEN SEED (Required for EKF Initialization)
     # ==========================================
-    true_6d_params = None
-    if seed_file is not None:
-        print(f"\n[DEBUG] Loading Golden Seed from: {seed_file}")
-        with h5py.File(seed_file, "r") as f:
-            if "sample/U" in f:
-                U_true = f["sample/U"][()]
-                # Map 3x3 Matrix to 6D continuous representation (first two columns)
-                true_6d_params = np.concatenate([U_true[:, 0], U_true[:, 1]])
-                true_6d_params = jnp.array(true_6d_params, dtype=jnp.float32)
-                print("  > Seed successfully loaded and converted to 6D.")
-            else:
-                print("  > WARNING: 'sample/U' not found in seed file.")
+    if seed_file is None:
+        raise ValueError("EKF Tracker strictly requires a seed_file to initialize the Taylor expansion.")
+
+    print(f"\n[DEBUG] Loading Golden Seed from: {seed_file}")
+    with h5py.File(seed_file, "r") as f:
+        U_true = f["sample/U"][()]
+        mu_0 = np.concatenate([U_true[:, 0], U_true[:, 1]])
+        mu_0 = jnp.array(mu_0, dtype=jnp.float32)
 
     print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
 
     ub_helper = FindUB()
     with h5py.File(finder_file, "r") as f:
-        ub_helper.a = f["sample/a"][()] if "sample/a" in f else None
-        ub_helper.b = f["sample/b"][()] if "sample/b" in f else None
-        ub_helper.c = f["sample/c"][()] if "sample/c" in f else None
-        ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else None
-        ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
-        ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
-
+        ub_helper.a, ub_helper.b, ub_helper.c = f["sample/a"][()], f["sample/b"][()], f["sample/c"][()]
+        ub_helper.alpha, ub_helper.beta, ub_helper.gamma = f["sample/alpha"][()], f["sample/beta"][()], f["sample/gamma"][()]
         ub_helper.sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
         ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
-
         sg = f["sample/space_group"][()]
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
-        ub_helper.wavelength = f["instrument/wavelength"][()]
 
     B_mat = ub_helper.reciprocal_lattice_B()
-    B_inv = jnp.linalg.inv(B_mat)
-
     _, _, centering = get_lattice_system(
         ub_helper.a, ub_helper.b, ub_helper.c,
         ub_helper.alpha, ub_helper.beta, ub_helper.gamma, ub_helper.space_group
@@ -2236,31 +2215,26 @@ def run_score_filter(
     # ==========================================
     # PRE-COMPUTE THEORETICAL HKL GRID
     # ==========================================
-    print("  > Pre-computing Forward-Mapping HKL Grid for IPP Maximum Likelihood...")
-    h_max = 6 
+    print("  > Pre-computing Forward-Mapping HKL Grid for EKF IPP Maximum Likelihood...")
+    h_max = 6
     h_vals = np.arange(-h_max, h_max + 1)
     hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    
-    # Exclude the (0,0,0) direct beam
+
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
     theo_hkl = hkl_c[:, mask_hkl_c]
-    
-    # Apply Primitive Centering Mask to drop systematic absences
+
     M_prim_np = np.array(M_prim)
     h_p = M_prim_np[0, 0]*theo_hkl[0] + M_prim_np[0, 1]*theo_hkl[1] + M_prim_np[0, 2]*theo_hkl[2]
     k_p = M_prim_np[1, 0]*theo_hkl[0] + M_prim_np[1, 1]*theo_hkl[1] + M_prim_np[1, 2]*theo_hkl[2]
     l_p = M_prim_np[2, 0]*theo_hkl[0] + M_prim_np[2, 1]*theo_hkl[1] + M_prim_np[2, 2]*theo_hkl[2]
-    
+
     is_valid = (np.abs(h_p - np.round(h_p)) < 1e-4) & \
                (np.abs(k_p - np.round(k_p)) < 1e-4) & \
                (np.abs(l_p - np.round(l_p)) < 1e-4)
     theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
-    
-    h_sample = B_mat @ theo_hkl
-    
-    # Convert to JAX array for the GPU. Shape: (3, M_theos)
-    h_sample_jax = jnp.array(h_sample)
+
+    h_sample_jax = jnp.array(B_mat @ theo_hkl)
     print(f"  > Generated {h_sample_jax.shape[1]} valid theoretical Bragg rays.")
 
     # ==========================================
@@ -2274,12 +2248,10 @@ def run_score_filter(
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
 
-        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec) 
+        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec)
                      for k in keys if k.endswith('_events')]
 
-        print(f"  > Dispatching {len(args_list)} banks to parallel workers...")
         all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
-
         with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
             for result in executor.map(_process_single_bank, args_list):
                 if result is not None:
@@ -2290,21 +2262,18 @@ def run_score_filter(
                     all_pixels_r.append(pr)
                     all_pixels_c.append(pc)
 
-        print("  > Aggregating and time-sorting global event stream...")
         all_q_lab = np.vstack(all_q_lab)
         all_times = np.concatenate(all_times)
         all_banks = np.concatenate(all_banks)
         all_pixels_r = np.concatenate(all_pixels_r)
         all_pixels_c = np.concatenate(all_pixels_c)
-        
+
         sort_idx = np.argsort(all_times)
         all_q_lab = all_q_lab[sort_idx]
         all_times = all_times[sort_idx]
         all_banks = all_banks[sort_idx]
         all_pixels_r = all_pixels_r[sort_idx]
         all_pixels_c = all_pixels_c[sort_idx]
-        
-        print(f"  > Ready! Processed {len(all_times):,} total neutron events.")
 
     # ==========================================
     # CORE JAX FUNCTIONS
@@ -2318,111 +2287,80 @@ def run_score_filter(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    def ipp_mle_loss(params, beta_bg, sigma_rad, q_batch_unnorm):
-        U_pred = compute_U(params)
-        
-        # 1. Normalize experimental neutron events
+    def scalar_ipp_loss(mu_params, beta_bg, sigma_rad, q_batch_unnorm):
+        """Returns PURE SCALAR loss for exact Hessian computation."""
+        U_pred = compute_U(mu_params)
+
         q_exp_norm = jnp.linalg.norm(q_batch_unnorm, axis=0, keepdims=True)
         q_exp_hat = q_batch_unnorm / (q_exp_norm + 1e-9)
-        
-        # 2. Project theoretical rays (h_sample_jax is already pre-filtered!)
+
         h_lab = jnp.matmul(U_pred, h_sample_jax)
         q_theo_hat = h_lab / (jnp.linalg.norm(h_lab, axis=0, keepdims=True) + 1e-9)
-        
-        # 3. Pairwise Cosine Distance
+
         cos_theta = jnp.matmul(q_exp_hat.T, q_theo_hat)
-        
-        # 4. Theoretical Bragg Intensity (Von Mises-Fisher)
-        # Note: No arccos() needed! We use cos_theta directly, which is infinitely smooth.
+
         kappa = 1.0 / (sigma_rad**2)
         I_bragg_matrix = jnp.exp(kappa * (cos_theta - 1.0))
-        
-        # 5. Total Intensity Field at each experimental event
+
         I_total = beta_bg + jnp.sum(I_bragg_matrix, axis=1)
-        
-        # 6. IPP Maximum Likelihood (Minimize Negative Log-Likelihood)
-        loss = -jnp.mean(jnp.log(I_total))
-        
-        return loss, U_pred
+
+        # We DO NOT normalize by kappa here, because we want the true Fisher Information Hessian
+        return -jnp.mean(jnp.log(I_total))
 
     # ==========================================
-    # PHASE 3: STREAMING EnSF LOOP
+    # PHASE 3: CONTINUOUS EKF TRACKING LOOP
     # ==========================================
     if event_nexus_filename:
-        print("\n[3/4] Executing Streaming Forecast-Analysis Cycle...")
+        print("\n[3/4] Executing Continuous EKF Tracking...")
 
-        J_ensf = J
-        rng = jax.random.PRNGKey(42)
-        ensf_params = jax.random.normal(rng, (J_ensf, 6))
-
-        # INJECT THE SEED
-        if true_6d_params is not None:
-            ensf_params = ensf_params.at[0].set(true_6d_params)
-            print("  > Golden Seed injected into EnSF Swarm Particle 0")
+        # Initialize State (mu) and Covariance (P)
+        mu_current = mu_0
+        P_current = jnp.eye(6) * 1e-3  # Initial tight covariance from Golden Seed
 
         @jax.jit
-        def single_loss_weighted_vmf(single_params, U_swarm, losses_swarm, prior_sigma, prior_gamma):
-            U_single = compute_U(single_params)
-            sq_chordal_dists = jnp.sum((U_swarm - U_single)**2, axis=(-2, -1))
-            logits = -sq_chordal_dists / (2.0 * prior_sigma**2) - (prior_gamma * losses_swarm)
-            return jax.scipy.special.logsumexp(logits)
+        def ekf_update_step(mu, P, current_beta, current_sigma, current_Q, q_batch):
+            # 1. FORECAST (Diffusion)
+            P_prior = P + current_Q * jnp.eye(6)
 
-        prior_score_fn = jax.grad(single_loss_weighted_vmf, argnums=0)
-        vmap_prior = jax.vmap(prior_score_fn, in_axes=(0, None, None, None, None))
-        ensf_loss_fn = jax.vmap(ipp_mle_loss, in_axes=(0, None, None, None))
+            # 2. EVALUATE MOMENTS
+            # Get Loss, Exact Gradient (Drift), and Exact Hessian (Fisher Information Matrix)
+            loss_val, g = jax.value_and_grad(scalar_ipp_loss)(mu, current_beta, current_sigma, q_batch)
+            H = jax.hessian(scalar_ipp_loss)(mu, current_beta, current_sigma, q_batch)
 
-        opt_ensf = optax.adam(learning_rate)
-        opt_state = opt_ensf.init(ensf_params)
+            # Regularize Hessian slightly to guarantee positive-definite inversion
+            H_reg = H + jnp.eye(6) * 1e-6
 
-        @jax.jit
-        def train_step_streaming(params, opt_state, current_beta, current_sigma, current_lamb, q_batch):
-            def total_loss(p):
-                losses, Us = ensf_loss_fn(p, current_beta, current_sigma, q_batch)
-                return jnp.mean(losses), (Us, losses)
+            # 3. ANALYSIS (Information Filter Collapse)
+            Lambda_prior = jnp.linalg.inv(P_prior)
+            Lambda_post = Lambda_prior + H_reg
+            P_post = jnp.linalg.inv(Lambda_post)
 
-            (mean_loss, (U_preds, individual_losses)), raw_grads = jax.value_and_grad(
-                total_loss, has_aux=True
-            )(params)
+            # 4. MEAN UPDATE (Optimal Newton Step)
+            mu_post = mu - jnp.matmul(P_post, g)
 
-            # Prior Gravity constraints
-            prior_scores = vmap_prior(params, U_preds, individual_losses, 0.1, gamma)
-            total_grads = raw_grads - (current_lamb * prior_scores)
+            # Generate U_pred for callback logging
+            U_post = compute_U(mu_post)
 
-            updates, opt_state = opt_ensf.update(total_grads, opt_state, params)
-            params = optax.apply_updates(params, updates)
-            return params, opt_state, mean_loss, U_preds, individual_losses
+            return mu_post, P_post, loss_val, U_post
 
         tracking_history = []
-        smoothed_losses = None
 
-        # The Streaming Loop
+        # The Deterministic Tracking Loop
         for start_idx in range(0, len(all_q_lab) - window_size_events, step_size_events):
             end_idx = start_idx + window_size_events
             q_window = jnp.array(all_q_lab[start_idx:end_idx]).T
 
-            # 1. FORECAST (Diffusion)
-            rng, subkey = jax.random.split(rng)
-            diffusion_noise = jax.random.normal(subkey, ensf_params.shape) * eta
-            ensf_params = ensf_params + diffusion_noise
+            # Single deterministic analytic update step! No swarm loop needed.
+            mu_current, P_current, current_loss, U_current = ekf_update_step(
+                mu_current, P_current, beta, sigma, Q_noise, q_window
+            )
 
-            # 2. ANALYSIS (EnSF Gravity Collapse)
-            for _ in range(20): 
-                # Note: passing beta and sigma here directly from the function args!
-                ensf_params, opt_state, mean_loss, U_preds, losses = train_step_streaming(
-                    ensf_params, opt_state, beta, sigma, lamb, q_window
-                )
+            tracking_history.append((all_times[end_idx], np.array(U_current)))
 
-            # 3. APPLY EMA MEMORY FOR CONVERGENCE
-            if smoothed_losses is None:
-                smoothed_losses = losses
-            else:
-                smoothed_losses = (1.0 - alpha) * smoothed_losses + alpha * losses
-
-            best_idx = int(jnp.argmin(smoothed_losses))
-            tracking_history.append((all_times[end_idx], np.array(U_preds[best_idx])))
-            
             if start_idx % (step_size_events * 5) == 0:
-                print(f"    Assimilation Time {all_times[end_idx]:.2f}s | Current Swarm Loss: {mean_loss:.4f}")
+                # EKF trace gives us the scalar uncertainty magnitude
+                uncertainty = float(jnp.trace(P_current))
+                print(f"    Time {all_times[end_idx]:.2f}s | IPP Loss: {current_loss:.4f} | Uncertainty Trace: {uncertainty:.2e}")
 
             # 4. TRIGGER CALLBACK
             if streaming_callback is not None:
@@ -2432,13 +2370,13 @@ def run_score_filter(
                     "pixel_r": all_pixels_r[new_start:end_idx],
                     "pixel_c": all_pixels_c[new_start:end_idx]
                 }
-                
+
                 streaming_callback(
                     time=float(all_times[end_idx]),
-                    U_preds=np.array(U_preds),
-                    losses=np.array(losses), 
-                    mean_loss=float(mean_loss),
-                    best_idx=best_idx, 
+                    U_preds=np.array([U_current]),  # Wrap in array to match old callback format
+                    losses=np.array([current_loss]),
+                    mean_loss=float(current_loss),
+                    best_idx=0,
                     neutron_count=end_idx,
                     new_events=new_events
                 )

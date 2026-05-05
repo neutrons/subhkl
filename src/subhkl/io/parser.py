@@ -17,7 +17,7 @@ from subhkl.commands import (
     run_reduce,
     run_merge_images,
     run_egnn,
-    run_score_filter
+    run_ekf_tracker,
 )
 
 
@@ -636,8 +636,8 @@ def cmd_egnn(
         create_visualizations=create_visualizations,
     )
 
-@app.command("score-filter")
-def cmd_score_filter(
+@app.command("ekf-tracker")
+def cmd_ekf_tracker(
     finder_file: str = typer.Argument(
         ..., help="Path to the output peaks HDF5 file from the finder."
     ),
@@ -655,11 +655,12 @@ def cmd_score_filter(
     Extracts the initial UB matrix using the Sparse Spherical Hough Transform and
     Topological Hessian Filtering.
     """
-    run_score_filter(
+    run_ekf_tracker(
         finder_file=finder_file,
         output_h5_filename=output_h5_filename,
         instrument_name=instrument,
         event_nexus_filename=event_nexus_filename,
+
     )
 
 if __name__ == "__main__":
