@@ -2322,35 +2322,34 @@ def run_score_filter(
         b3 = jnp.cross(b1, b2)
         return jnp.stack([b1, b2, b3], axis=-1)
 
-    def spherical_moire_loss(params, omega, q_exp_hat):
-        # q_exp_hat is already normalized (3, N_events)
+    def heavy_tail_loss(params, c_rad, q_exp_hat):
         U_pred = compute_U(params)
         
-        # h_sample_jax are the pre-computed theoretical integer rays (3, M_theos)
         h_lab = jnp.matmul(U_pred, h_sample_jax)
         
-        # SAFEGUARD 1: Add 1e-9 to prevent division by zero in the gradient of the norm
+        # Safe normalization
         q_theo_hat = h_lab / (jnp.linalg.norm(h_lab, axis=0, keepdims=True) + 1e-9)
         
-        # Calculate pairwise dot products (Cosine of angle)
-        # Shape: (N_events, M_theos)
+        # Calculate pairwise theta
         cos_theta = jnp.matmul(q_exp_hat.T, q_theo_hat)
-        
-        # SAFEGUARD 2: Clip strictly inside the boundary to prevent NaN gradients from arccos(1.0)
         cos_theta = jnp.clip(cos_theta, -1.0 + 1e-7, 1.0 - 1e-7)
         theta = jnp.arccos(cos_theta)
         
-        # Evaluate Moiré interference on the tangent planes
-        # Maximize the sum of cosines
-        interference = jnp.cos(omega * theta)
+        # ==========================================
+        # 1. CAUCHY (LORENTZIAN) KERNEL
+        # ==========================================
+        # No ripples, no negative bounds, infinite gradient reach.
+        # c_rad is the capture radius in Radians.
+        similarity = (c_rad**2) / (theta**2 + c_rad**2)
         
-        # LogSumExp (Softmax) to smoothly select the nearest theoretical ray for each event
-        # The temperature (tau) controls how softly it blends overlapping tangent planes
-        tau = 0.05
-        max_interference = jax.scipy.special.logsumexp(interference / tau, axis=1) * tau
+        # ==========================================
+        # 2. HARD MAXIMUM
+        # ==========================================
+        # Prevents density accumulation. Each event only scores against its SINGLE closest theoretical ray.
+        max_sim = jnp.max(similarity, axis=1)
         
-        # Final normalized loss
-        loss = 1.0 - jnp.mean(max_interference)
+        # 3. Final loss (bounded [0.0, 1.0])
+        loss = 1.0 - jnp.mean(max_sim)
         return loss, U_pred
 
     # ==========================================
@@ -2381,7 +2380,7 @@ def run_score_filter(
 
         prior_score_fn = jax.grad(single_loss_weighted_vmf, argnums=0)
         vmap_prior = jax.vmap(prior_score_fn, in_axes=(0, None, None, None, None))
-        ensf_loss_fn = jax.vmap(spherical_moire_loss, in_axes=(0, None, None))
+        ensf_loss_fn = jax.vmap(heavy_tail_loss, in_axes=(0, None, None))
 
         opt_ensf = optax.adam(learning_rate)
         opt_state = opt_ensf.init(ensf_params)
