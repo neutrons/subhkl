@@ -2328,14 +2328,16 @@ def run_score_filter(
         
         # h_sample_jax are the pre-computed theoretical integer rays (3, M_theos)
         h_lab = jnp.matmul(U_pred, h_sample_jax)
-        q_theo_hat = h_lab / jnp.linalg.norm(h_lab, axis=0, keepdims=True)
+        
+        # SAFEGUARD 1: Add 1e-9 to prevent division by zero in the gradient of the norm
+        q_theo_hat = h_lab / (jnp.linalg.norm(h_lab, axis=0, keepdims=True) + 1e-9)
         
         # Calculate pairwise dot products (Cosine of angle)
         # Shape: (N_events, M_theos)
         cos_theta = jnp.matmul(q_exp_hat.T, q_theo_hat)
         
-        # Clip for numerical stability
-        cos_theta = jnp.clip(cos_theta, -1.0, 1.0)
+        # SAFEGUARD 2: Clip strictly inside the boundary to prevent NaN gradients from arccos(1.0)
+        cos_theta = jnp.clip(cos_theta, -1.0 + 1e-7, 1.0 - 1e-7)
         theta = jnp.arccos(cos_theta)
         
         # Evaluate Moiré interference on the tangent planes
