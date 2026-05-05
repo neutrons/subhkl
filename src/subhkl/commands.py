@@ -2347,7 +2347,7 @@ def run_score_filter(
 
         prior_score_fn = jax.grad(single_loss_weighted_vmf, argnums=0)
         vmap_prior = jax.vmap(prior_score_fn, in_axes=(0, None, None, None, None))
-        ensf_loss_fn = jax.vmap(moire_loss, in_axes=(0, None, None))
+        ensf_loss_fn = jax.vmap(spherical_moire_loss, in_axes=(0, None, None))
 
         opt_ensf = optax.adam(learning_rate)
         opt_state = opt_ensf.init(ensf_params)
