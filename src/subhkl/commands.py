@@ -2237,6 +2237,38 @@ def run_score_filter(
     else: M_prim = jnp.eye(3)
 
     # ==========================================
+    # PRE-COMPUTE THEORETICAL HKL GRID (h_sample_jax)
+    # ==========================================
+    print("  > Pre-computing Forward-Mapping HKL Grid for Spherical Moiré...")
+    h_max = 5  # Adjust this based on your expected resolution limit
+    h_vals = np.arange(-h_max, h_max + 1)
+    hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
+    hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
+    
+    # Physically exclude the (0,0,0) direct beam
+    mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
+    theo_hkl = hkl_c[:, mask_hkl_c]
+    
+    # Apply Primitive Centering Mask to drop systematic absences
+    M_prim_np = np.array(M_prim)
+    h_p = M_prim_np[0, 0]*theo_hkl[0] + M_prim_np[0, 1]*theo_hkl[1] + M_prim_np[0, 2]*theo_hkl[2]
+    k_p = M_prim_np[1, 0]*theo_hkl[0] + M_prim_np[1, 1]*theo_hkl[1] + M_prim_np[1, 2]*theo_hkl[2]
+    l_p = M_prim_np[2, 0]*theo_hkl[0] + M_prim_np[2, 1]*theo_hkl[1] + M_prim_np[2, 2]*theo_hkl[2]
+    
+    is_valid = (np.abs(h_p - np.round(h_p)) < 1e-4) & \
+               (np.abs(k_p - np.round(k_p)) < 1e-4) & \
+               (np.abs(l_p - np.round(l_p)) < 1e-4)
+    theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
+    
+    # Pre-calculate sample frame reciprocal vectors
+    h_sample = B_mat @ theo_hkl
+    
+    # Convert to a JAX array for the GPU
+    # Shape: (3, M_theos)
+    h_sample_jax = jnp.array(h_sample)
+    print(f"  > Generated {h_sample_jax.shape[1]} valid theoretical Bragg rays.")
+
+    # ==========================================
     # EVENT-MODE DATA ASSIMILATION LOGIC
     # ==========================================
     if event_nexus_filename:
