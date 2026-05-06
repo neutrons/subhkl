@@ -2455,10 +2455,10 @@ def run_bingham_tracker(
 
                 streaming_callback(
                     time=float(t_state),
-                    U_preds=np.array([U_current_np]), # Packaged as list to match legacy API
-                    losses=np.array([chunk_loss_np]),
-                    mean_loss=chunk_loss_np,
-                    best_idx=0,
+                    U_preds=U_ensemble_curr,
+                    losses=loss_ensemble,
+                    mean_loss=np.mean(loss_ensemble),
+                    best_idx=best_idx,
                     neutron_count=end_idx,
                     new_events=new_events
                 )
