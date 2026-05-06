@@ -2155,7 +2155,6 @@ def _process_single_bank(args):
         pixel_r.astype(np.int16),
         pixel_c.astype(np.int16)
     )
-
 def run_bingham_tracker(
     finder_file: str,
     output_h5_filename: str,
@@ -2246,7 +2245,7 @@ def run_bingham_tracker(
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
         import multiprocessing
         import concurrent.futures
-        
+
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
 
@@ -2331,7 +2330,13 @@ def run_bingham_tracker(
             cos_theta = jnp.dot(q_exp, h_lab) # (N_peaks,)
             
             I_bragg = jnp.exp((1.0 / sigma**2) * (cos_theta - 1.0))
-            w = I_bragg / (beta + jnp.sum(I_bragg)) # Softmax with background
+            
+            # Calculate Total Intensity and Natural Loss (NLL)
+            I_total = beta + jnp.sum(I_bragg)
+            event_nll = -jnp.log(I_total)
+            
+            # Unnormalized weights strictly preserve multiplicative conjugacy
+            w = I_bragg 
             
             # 4. Construct rank-1 scattering signal F
             weighted_h = jnp.sum(w * q_theo_sample_jax, axis=1) # (3,)
@@ -2344,14 +2349,14 @@ def run_bingham_tracker(
             # Regularize: prevent eigenvalues from blowing up arbitrarily large
             A_new = A_new - (jnp.trace(A_new) / 4.0) * jnp.eye(4)
             
-            return (A_new, t_curr), U
+            return (A_new, t_curr), (U, event_nll)
 
-        (A_final, t_final), U_traj = jax.lax.scan(
+        (A_final, t_final), (U_traj, nll_traj) = jax.lax.scan(
             scan_fn, 
             (A_carry, t_carry), 
             (q_seq, t_seq)
         )
-        return A_final, t_final, U_traj
+        return A_final, t_final, U_traj, nll_traj
 
     # ==========================================
     # PHASE 3: CONTINUOUS TRACKING LOOP
@@ -2365,7 +2370,7 @@ def run_bingham_tracker(
             A_state = np.array(compute_A_from_C(C_init))
         else:
             # Uniform prior with tiny symmetry breaking to prevent 'eigh' instability
-            A_state = np.eye(4) * np.array([1e-4, -1e-4, 0.0, 0.0])
+            A_state = np.eye(4) + np.array([1e-4, -1e-4, 0.0, 0.0])
             
         t_state = all_times[0] if len(all_times) > 0 else 0.0
         tracking_history = []
@@ -2383,14 +2388,15 @@ def run_bingham_tracker(
             t_seq = all_times_jax[start_idx:end_idx] # (N,)
 
             # Execute chronologically correct, continuous-time JAX scan
-            A_state, t_state, U_traj = process_chunk(A_state, t_state, q_seq, t_seq)
+            A_state, t_state, U_traj, nll_traj = process_chunk(A_state, t_state, q_seq, t_seq)
             
             # Extract the final U matrix for this window segment
             U_current = np.array(U_traj[-1])
+            chunk_mean_loss = float(jnp.mean(nll_traj))
             tracking_history.append((float(t_state), U_current))
             
             if start_idx % (step_size_events * 5) == 0:
-                print(f"    Time {t_state:.2f}s | State Matrix Trace: {float(jnp.trace(A_state)):.2f}")
+                print(f"    Time {t_state:.2f}s | State Matrix Trace: {float(jnp.trace(A_state)):.2f} | Mean NLL: {chunk_mean_loss:.4f}")
 
             # TRIGGER CALLBACK
             if streaming_callback is not None:
@@ -2405,8 +2411,8 @@ def run_bingham_tracker(
                 streaming_callback(
                     time=float(t_state),
                     U_preds=np.array([U_current]), # Packaged as list to match legacy API
-                    losses=np.array([0.0]),        # Tracked intrinsically by A matrix shape now
-                    mean_loss=0.0,
+                    losses=np.array([chunk_mean_loss]), 
+                    mean_loss=chunk_mean_loss,
                     best_idx=0, 
                     neutron_count=end_idx,
                     new_events=new_events
