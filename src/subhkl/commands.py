@@ -2156,36 +2156,26 @@ def _process_single_bank(args):
         pixel_c.astype(np.int16)
     )
 
-def run_ekf_tracker(
+def run_gmphd_tracker(
     finder_file: str,
     output_h5_filename: str,
     instrument_name: str | None = None,
     event_nexus_filename: str | None = None,
     streaming_callback = None,
-    beta: float = 0.05,       # Background Poisson Noise Rate
-    sigma: float = 0.03,      # Width of Bragg peaks in radians
-    Q_noise: float = 1e-5,    # NEW: Process Noise Variance (Diffusion rate per step)
+    beta: float = 0.05,            # Background Poisson Noise Rate
+    sigma: float = 0.03,           # Width of Bragg peaks in radians
+    Q_noise: float = 1e-5,         # Process Noise Variance (Diffusion)
     window_size_events:int = 25000,
     step_size_events: int = 10000,
-    seed_file: str | None = None,
+    n_initial_hypotheses: int = 128, # Number of global starting grid points
+    prune_threshold: float = 1e-4,   # Death threshold for invalid aliases
+    max_components: int = 20,        # Maximum surviving components to track
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     import h5py
     import numpy as np
     import jax
     import jax.numpy as jnp
-
-    # ==========================================
-    # LOAD GOLDEN SEED (Required for EKF Initialization)
-    # ==========================================
-    if seed_file is None:
-        raise ValueError("EKF Tracker strictly requires a seed_file to initialize the Taylor expansion.")
-
-    print(f"\n[DEBUG] Loading Golden Seed from: {seed_file}")
-    with h5py.File(seed_file, "r") as f:
-        U_true = f["sample/U"][()]
-        mu_0 = np.concatenate([U_true[:, 0], U_true[:, 1]])
-        mu_0 = jnp.array(mu_0, dtype=jnp.float32)
 
     print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
 
@@ -2215,7 +2205,7 @@ def run_ekf_tracker(
     # ==========================================
     # PRE-COMPUTE THEORETICAL HKL GRID
     # ==========================================
-    print("  > Pre-computing Forward-Mapping HKL Grid for EKF IPP Maximum Likelihood...")
+    print("  > Pre-computing Forward-Mapping HKL Grid for EGM-PHD Tracking...")
     h_max = 6
     h_vals = np.arange(-h_max, h_max + 1)
     hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
@@ -2275,7 +2265,7 @@ def run_ekf_tracker(
         all_pixels_r = all_pixels_r[sort_idx]
         all_pixels_c = all_pixels_c[sort_idx]
 
-        # ==========================================
+    # ==========================================
     # CORE JAX FUNCTIONS
     # ==========================================
     def compute_U(rot_6d):
@@ -2290,94 +2280,119 @@ def run_ekf_tracker(
     def per_event_log_likelihood(mu_params, beta_bg, sigma_rad, q_exp_single_hat):
         """Returns the negative log-likelihood for a SINGLE neutron event."""
         U_pred = compute_U(mu_params)
-        
-        # Project theoretical rays
+
         h_lab = jnp.matmul(U_pred, h_sample_jax)
         q_theo_hat = h_lab / (jnp.linalg.norm(h_lab, axis=0, keepdims=True) + 1e-9)
-        
-        # Cosine Distance against all theoretical rays for this ONE event
+
         cos_theta = jnp.dot(q_theo_hat.T, q_exp_single_hat)
         cos_theta = jnp.clip(cos_theta, -1.0 + 1e-7, 1.0 - 1e-7)
-        
-        # Theoretical Bragg Intensity
+
         kappa = 1.0 / (sigma_rad**2)
         I_bragg = jnp.exp(kappa * (cos_theta - 1.0))
-        
+
         I_total = beta_bg + jnp.sum(I_bragg)
-        
         return -jnp.log(I_total)
 
-    # VMAP the gradient function so we get a gradient vector for EACH event in the batch
-    # in_axes=(None, None, None, 1) means we map over the 1st axis (columns) of q_batch
     batch_grad_fn = jax.vmap(jax.grad(per_event_log_likelihood), in_axes=(None, None, None, 1))
     batch_loss_fn = jax.vmap(per_event_log_likelihood, in_axes=(None, None, None, 1))
 
+    @jax.jit
+    def single_ekf_update(mu, P, current_beta, current_sigma, current_Q, q_batch_hat):
+        P_prior = P + current_Q * jnp.eye(6)
+
+        # Empirical Fisher Information Matrix (PSD Gauss-Newton)
+        G = batch_grad_fn(mu, current_beta, current_sigma, q_batch_hat)
+        g = jnp.mean(G, axis=0)
+        H_FIM = jnp.matmul(G.T, G) / G.shape[0]
+        H_reg = H_FIM + jnp.eye(6) * 1e-6
+
+        # Information Filter Collapse
+        Lambda_prior = jnp.linalg.inv(P_prior)
+        Lambda_post = Lambda_prior + H_reg
+        P_post = jnp.linalg.inv(Lambda_post)
+
+        # Newton Step
+        mu_post = mu - jnp.matmul(P_post, g)
+
+        loss_val = jnp.mean(batch_loss_fn(mu_post, current_beta, current_sigma, q_batch_hat))
+        U_post = compute_U(mu_post)
+        return mu_post, P_post, loss_val, U_post
+
+    # Vectorize the EKF update to run across the entire GM-PHD ensemble simultaneously
+    ensemble_ekf_update = jax.vmap(single_ekf_update, in_axes=(0, 0, None, None, None, None))
+
     # ==========================================
-    # PHASE 3: CONTINUOUS EKF TRACKING LOOP
+    # PHASE 3: CONTINUOUS EGM-PHD TRACKING LOOP
     # ==========================================
     if event_nexus_filename:
-        print("\n[3/4] Executing Continuous EKF Tracking...")
+        print(f"\n[3/4] Executing Global EGM-PHD Tracking ({n_initial_hypotheses} Hypotheses)...")
 
-        mu_current = mu_0
-        P_current = jnp.eye(6) * 1e-3  
-
-        @jax.jit
-        def ekf_update_step(mu, P, current_beta, current_sigma, current_Q, q_batch):
-            # 1. Normalize experimental neutron events
-            q_exp_norm = jnp.linalg.norm(q_batch, axis=0, keepdims=True)
-            q_exp_hat = q_batch / (q_exp_norm + 1e-9)
-
-            # 2. FORECAST (Diffusion)
-            P_prior = P + current_Q * jnp.eye(6)
-            
-            # 3. EVALUATE MOMENTS via EMPIRICAL FISHER INFORMATION
-            # G is the matrix of per-event gradients. Shape: (N_events, 6)
-            G = batch_grad_fn(mu, current_beta, current_sigma, q_exp_hat)
-            
-            # The Mean Gradient (g)
-            g = jnp.mean(G, axis=0)
-            
-            # The Fisher Information Matrix (Outer product approximation of the Hessian)
-            # Shape: (6, 6). This is strictly Positive Semi-Definite!
-            H_FIM = jnp.matmul(G.T, G) / G.shape[0]
-            
-            # Regularize slightly to guarantee positive-definite inversion
-            H_reg = H_FIM + jnp.eye(6) * 1e-6
-            
-            # 4. ANALYSIS (Information Filter Collapse)
-            Lambda_prior = jnp.linalg.inv(P_prior)
-            Lambda_post = Lambda_prior + H_reg
-            P_post = jnp.linalg.inv(Lambda_post)
-            
-            # 5. MEAN UPDATE (Optimal Newton Step)
-            mu_post = mu - jnp.matmul(P_post, g)
-            
-            # Calculate total loss for logging
-            loss_val = jnp.mean(batch_loss_fn(mu_post, current_beta, current_sigma, q_exp_hat))
-            U_post = compute_U(mu_post)
-            
-            return mu_post, P_post, loss_val, U_post
+        # 1. Global Initialization (Birth Model)
+        rng = jax.random.PRNGKey(42)
+        # Initialize a wide grid using random 6D parameters spanning the manifold
+        mu_ensemble = jax.random.normal(rng, (n_initial_hypotheses, 6)) * 2.0
+        # Wide initial covariances to promote capture
+        P_ensemble = jnp.tile(jnp.eye(6) * 1.0, (n_initial_hypotheses, 1, 1))
+        # Equal initial weights
+        weights = jnp.ones(n_initial_hypotheses) / n_initial_hypotheses
 
         tracking_history = []
 
-        # The Deterministic Tracking Loop
         for start_idx in range(0, len(all_q_lab) - window_size_events, step_size_events):
             end_idx = start_idx + window_size_events
             q_window = jnp.array(all_q_lab[start_idx:end_idx]).T
 
-            # Single deterministic analytic update step! No swarm loop needed.
-            mu_current, P_current, current_loss, U_current = ekf_update_step(
-                mu_current, P_current, beta, sigma, Q_noise, q_window
+            # Normalize batch once for the whole ensemble
+            q_exp_norm = jnp.linalg.norm(q_window, axis=0, keepdims=True)
+            q_exp_hat = q_window / (q_exp_norm + 1e-9)
+
+            # 2. VMAP EKF UPDATE
+            mu_ensemble, P_ensemble, loss_vals, U_preds = ensemble_ekf_update(
+                mu_ensemble, P_ensemble, beta, sigma, Q_noise, q_exp_hat
             )
+
+            # 3. GM-PHD WEIGHT UPDATE (Poisson Likelihood)
+            # Transform Negative Log-Likelihood into a Likelihood probability weight
+            likelihoods = jnp.exp(-loss_vals)
+            weights = weights * likelihoods
+
+            # Normalize to prevent underflow
+            weights = weights / (jnp.sum(weights) + 1e-12)
+
+            # 4. GM-PHD PRUNING (Death Process)
+            # Drop components whose intensity has decayed below the threshold
+            valid_mask = weights > prune_threshold
+
+            # Extract surviving components (converting back to JAX arrays after masking)
+            mu_ensemble = jnp.array(mu_ensemble[valid_mask])
+            P_ensemble = jnp.array(P_ensemble[valid_mask])
+            weights = jnp.array(weights[valid_mask])
+            U_preds = jnp.array(U_preds[valid_mask])
+            loss_vals = jnp.array(loss_vals[valid_mask])
+
+            # Ensure we don't track an expanding universe of duplicates
+            if len(weights) > max_components:
+                top_indices = jnp.argsort(weights)[-max_components:]
+                mu_ensemble = mu_ensemble[top_indices]
+                P_ensemble = P_ensemble[top_indices]
+                weights = weights[top_indices]
+                U_preds = U_preds[top_indices]
+                loss_vals = loss_vals[top_indices]
+
+            # Re-normalize after pruning
+            weights = weights / (jnp.sum(weights) + 1e-12)
+
+            # 5. STATE EXTRACTION
+            best_idx = int(jnp.argmax(weights))
+            U_current = U_preds[best_idx]
+            current_loss = float(loss_vals[best_idx])
 
             tracking_history.append((all_times[end_idx], np.array(U_current)))
 
             if start_idx % (step_size_events * 5) == 0:
-                # EKF trace gives us the scalar uncertainty magnitude
-                uncertainty = float(jnp.trace(P_current))
-                print(f"    Time {all_times[end_idx]:.2f}s | IPP Loss: {current_loss:.4f} | Uncertainty Trace: {uncertainty:.2e}")
+                print(f"    Time {all_times[end_idx]:.2f}s | Surviving Hypotheses: {len(weights)} | Best IPP Loss: {current_loss:.4f}")
 
-            # 4. TRIGGER CALLBACK
+            # 6. TRIGGER CALLBACK
             if streaming_callback is not None:
                 new_start = 0 if start_idx == 0 else end_idx - step_size_events
                 new_events = {
@@ -2388,13 +2403,17 @@ def run_ekf_tracker(
 
                 streaming_callback(
                     time=float(all_times[end_idx]),
-                    U_preds=np.array([U_current]),  # Wrap in array to match old callback format
-                    losses=np.array([current_loss]),
-                    mean_loss=float(current_loss),
-                    best_idx=0,
+                    U_preds=np.array(U_preds),
+                    losses=np.array(loss_vals),
+                    mean_loss=current_loss,
+                    best_idx=best_idx,
                     neutron_count=end_idx,
                     new_events=new_events
                 )
 
-        print(f"\n[4/4] Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
+            # Auto-termination condition: If all hypotheses die, raise a specific error
+            if len(weights) == 0:
+                raise RuntimeError("GM-PHD Filter Collapse: All hypotheses pruned. Consider increasing initial hypothesis count, widening initial covariance, or adjusting beta/sigma.")
+
+        print(f"\n[4/4] Global Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
         U_final = tracking_history[-1][1]

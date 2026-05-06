@@ -636,8 +636,8 @@ def cmd_egnn(
         create_visualizations=create_visualizations,
     )
 
-@app.command("ekf-tracker")
-def cmd_ekf_tracker(
+@app.command("gmphd-tracker")
+def run_gmphd_tracker(
     finder_file: str = typer.Argument(
         ..., help="Path to the output peaks HDF5 file from the finder."
     ),
@@ -655,7 +655,7 @@ def cmd_ekf_tracker(
     Extracts the initial UB matrix using the Sparse Spherical Hough Transform and
     Topological Hessian Filtering.
     """
-    run_ekf_tracker(
+    run_gmphd_tracker(
         finder_file=finder_file,
         output_h5_filename=output_h5_filename,
         instrument_name=instrument,
