@@ -2162,7 +2162,8 @@ def run_bingham_tracker(
     instrument_name: str | None = None,
     event_nexus_filename: str | None = None,
     streaming_callback = None,
-    sigma_q: float = 0.05,         # Width of Bragg peaks in reciprocal space (A^-1)
+    sigma_q_start: float = 1.0,    # Annealing High Temperature (A^-1)
+    sigma_q_end: float = 0.05,     # Annealing Low Temperature / Physical Width (A^-1)
     lambda_min: float = 1.0,       # Minimum instrument wavelength (Angstroms)
     lambda_max: float = 10.0,      # Maximum instrument wavelength (Angstroms)
     lambda_steepness: float = 5.0, # Sharpness of the bandpass logistic window
@@ -2187,7 +2188,7 @@ def run_bingham_tracker(
         ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else None
         ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
         ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
-        
+
         ub_helper.sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
         ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
         sg = f["sample/space_group"][()]
@@ -2216,33 +2217,33 @@ def run_bingham_tracker(
     # PRE-COMPUTE THEORETICAL HKL GRID
     # ==========================================
     print("  > Pre-computing Forward-Mapping HKL Grid for Continuous Tracking...")
-    h_max = 6 
+    h_max = 6
     h_vals = np.arange(-h_max, h_max + 1)
     hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    
+
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
     theo_hkl = hkl_c[:, mask_hkl_c]
-    
+
     M_prim_np = np.array(M_prim)
     h_p = M_prim_np[0, 0]*theo_hkl[0] + M_prim_np[0, 1]*theo_hkl[1] + M_prim_np[0, 2]*theo_hkl[2]
     k_p = M_prim_np[1, 0]*theo_hkl[0] + M_prim_np[1, 1]*theo_hkl[1] + M_prim_np[1, 2]*theo_hkl[2]
     l_p = M_prim_np[2, 0]*theo_hkl[0] + M_prim_np[2, 1]*theo_hkl[1] + M_prim_np[2, 2]*theo_hkl[2]
-    
+
     is_valid = (np.abs(h_p - np.round(h_p)) < 1e-4) & \
                (np.abs(k_p - np.round(k_p)) < 1e-4) & \
                (np.abs(l_p - np.round(l_p)) < 1e-4)
     theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
-    
+
     # Calculate exact unit vectors in the Sample Frame
     h_sample = B_mat @ theo_hkl
     h_sample_norms = np.linalg.norm(h_sample, axis=0)
     q_mags_np = 2.0 * np.pi * h_sample_norms
     q_theo_sample_np = h_sample / (h_sample_norms + 1e-9)
-    
+
     q_theo_sample_jax = jnp.array(q_theo_sample_np)
     q_mags_jax = jnp.array(q_mags_np)
-    
+
     # Store incident beam vector globally for JAX jitted scope
     ki_vec_jax = jnp.array(ub_helper.ki_vec)
     ki_vec_jax = ki_vec_jax / (jnp.linalg.norm(ki_vec_jax) + 1e-9)
@@ -2255,11 +2256,11 @@ def run_bingham_tracker(
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
         import multiprocessing
         import concurrent.futures
-        
+
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
 
-        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec) 
+        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec)
                      for k in keys if k.endswith('_events')]
 
         all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
@@ -2278,7 +2279,7 @@ def run_bingham_tracker(
         all_banks = np.concatenate(all_banks)
         all_pixels_r = np.concatenate(all_pixels_r)
         all_pixels_c = np.concatenate(all_pixels_c)
-        
+
         sort_idx = np.argsort(all_times)
         all_q_lab = all_q_lab[sort_idx]
         all_times = all_times[sort_idx]
@@ -2290,34 +2291,7 @@ def run_bingham_tracker(
     # CORE JAX FUNCTIONS FOR BINGHAM TRACKER
     # ==========================================
     @jax.jit
-    def quaternion_to_rotation_matrix(r):
-        w, x, y, z = r[0], r[1], r[2], r[3]
-        return jnp.array([
-            [w*w+x*x-y*y-z*z, 2*(x*y-w*z),     2*(x*z+w*y)],
-            [2*(x*y+w*z),     w*w-x*x+y*y-z*z, 2*(y*z-w*x)],
-            [2*(x*z-w*y),     2*(y*z+w*x),     w*w-x*x-y*y+z*z]
-        ])
-
-    @jax.jit
-    def compute_A_from_C(C):
-        """Map 3x3 Concentration Matrix to 4x4 Bingham Matrix linearly."""
-        trC = jnp.trace(C)
-        z = jnp.array([C[2, 1] - C[1, 2],
-                       C[0, 2] - C[2, 0],
-                       C[1, 0] - C[0, 1]])
-        
-        A00 = jnp.array([[trC]])
-        A01 = z[None, :] 
-        A10 = z[:, None] 
-        A11 = C + C.T - trC * jnp.eye(3)
-        
-        return jnp.concatenate([
-            jnp.concatenate([A00, A01], axis=1),
-            jnp.concatenate([A10, A11], axis=1)
-        ], axis=0)
-
-    @jax.jit
-    def process_chunk(A_prev, t_prev, q_batch, t_batch):
+    def process_chunk(A_prev, t_prev, q_batch, t_batch, current_sigma_q):
         """
         Batched SDE integration. Processes an entire block of events via vmap.
         dA(t) = -Gamma A(t) dt + sum(A_F)
@@ -2325,56 +2299,56 @@ def run_bingham_tracker(
         # 1. Time delta for process noise (from end of last batch to end of this batch)
         t_curr = t_batch[-1]
         dt = jnp.maximum(0.0, t_curr - t_prev)
-        
+
         # 2. Process Noise (Rotational Diffusion over time delta)
         A_diffused = A_prev * jnp.exp(-gamma_diffusion * dt)
-        
+
         # 3. Extract best orientation (Mode of Bingham) to use for data association
         vals, vecs = jnp.linalg.eigh(A_diffused)
         r = vecs[:, -1] # Eigenvector of largest eigenvalue
         U = quaternion_to_rotation_matrix(r)
-        
+
         # 4. Vectorized Weighted Additive Update
         def single_event_update(q_exp):
             h_lab = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_lab) # (N_peaks,)
-            
+
             # Wavelength prior calculation
             # For elastic scattering, q_exp dot ki_vec = -sin(theta_exp)
             q_dot_ki = jnp.dot(q_exp, ki_vec_jax)
             lambda_j = -(4.0 * jnp.pi / (q_mags_jax + 1e-9)) * q_dot_ki
-            
+
             # Logistic window for bandpass (P(lambda))
             p_lambda = jax.nn.sigmoid(lambda_steepness * (lambda_j - lambda_min)) * \
                        jax.nn.sigmoid(lambda_steepness * (lambda_max - lambda_j))
-            
-            # Precision based on theoretical Q magnitude
-            kappa_j = (q_mags_jax ** 2) / (sigma_q ** 2)
-            
+
+            # Precision based on theoretical Q magnitude and Annealed Capture Radius
+            kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
+
             # Effective weight combines precision and wavelength prior
             effective_weight = p_lambda * kappa_j
-            
+
             # Individual peak log-likelihoods
             peak_log_lik = effective_weight * (cos_theta_err - 1.0)
-            
+
             # Additive rank-1 scattering signal F
             weighted_h = jnp.sum(effective_weight * q_theo_sample_jax, axis=1) # (3,)
             F = jnp.outer(q_exp, weighted_h)
-            
+
             # NLL is strictly the negative sum of individual peak log likelihoods
             event_nll = -jnp.sum(peak_log_lik)
-            
+
             return compute_A_from_C(F), event_nll
 
         # VMAP across all events in the current block simultaneously
         A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch)
-        
+
         # 5. Integrate Measurement Updates
         A_new = A_diffused + jnp.sum(A_F_batch, axis=0)
-        
+
         # Regularize: prevent eigenvalues from blowing up arbitrarily large
         A_new = A_new - (jnp.trace(A_new) / 4.0) * jnp.eye(4)
-        
+
         return A_new, t_curr, U, jnp.mean(nll_batch)
 
     # ==========================================
@@ -2390,34 +2364,43 @@ def run_bingham_tracker(
         else:
             # Uniform prior with tiny symmetry breaking to prevent 'eigh' instability
             A_state = np.eye(4) + np.array([1e-4, -1e-4, 0.0, 0.0])
-            
+
         t_state = all_times[0] if len(all_times) > 0 else 0.0
         tracking_history = []
-        
+
         # Push to GPU to eliminate H2D transfers in the loop
         all_q_lab_jax = jax.device_put(all_q_lab)
         all_times_jax = jax.device_put(all_times)
 
+        total_events = len(all_q_lab)
+
         # Process as a continuous stream (contiguous chunks, no overlapping windows)
-        for start_idx in range(0, len(all_q_lab), batch_size_events):
-            end_idx = min(start_idx + batch_size_events, len(all_q_lab))
+        for start_idx in range(0, total_events, batch_size_events):
+            end_idx = min(start_idx + batch_size_events, total_events)
             if end_idx - start_idx < 100: # Skip tiny tail ends to prevent vmap artifacts
                 break
-            
+
+            # Calculate current annealed temperature (sigma_q)
+            progress = start_idx / total_events
+            # Exponential decay is generally smoother for SA, but linear works well too.
+            current_sigma_q = sigma_q_start * np.exp(-progress * np.log(sigma_q_start / sigma_q_end))
+
             # Extract sequence data
             q_batch = all_q_lab_jax[start_idx:end_idx] # (Batch, 3)
             q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
             t_batch = all_times_jax[start_idx:end_idx] # (Batch,)
 
             # Execute massively parallel chunk integration
-            A_state, t_state, U_current, chunk_mean_loss = process_chunk(A_state, t_state, q_batch, t_batch)
-            
+            A_state, t_state, U_current, chunk_mean_loss = process_chunk(
+                A_state, t_state, q_batch, t_batch, current_sigma_q
+            )
+
             U_current_np = np.array(U_current)
             chunk_loss_np = float(chunk_mean_loss)
             tracking_history.append((float(t_state), U_current_np))
-            
+
             if start_idx % (batch_size_events * 5) == 0:
-                print(f"    Time {t_state:.2f}s | State Matrix Trace: {float(jnp.trace(A_state)):.2f} | Mean NLL: {chunk_loss_np:.4f}")
+                print(f"    Time {t_state:.2f}s | Sigma_Q: {current_sigma_q:.3f} | Trace: {float(jnp.trace(A_state)):.2f} | Mean NLL: {chunk_loss_np:.4f}")
 
             # TRIGGER CALLBACK
             if streaming_callback is not None:
@@ -2426,13 +2409,13 @@ def run_bingham_tracker(
                     "pixel_r": all_pixels_r[start_idx:end_idx],
                     "pixel_c": all_pixels_c[start_idx:end_idx]
                 }
-                
+
                 streaming_callback(
                     time=float(t_state),
                     U_preds=np.array([U_current_np]), # Packaged as list to match legacy API
-                    losses=np.array([chunk_loss_np]), 
+                    losses=np.array([chunk_loss_np]),
                     mean_loss=chunk_loss_np,
-                    best_idx=0, 
+                    best_idx=0,
                     neutron_count=end_idx,
                     new_events=new_events
                 )
