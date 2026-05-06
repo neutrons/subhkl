@@ -2162,7 +2162,6 @@ def run_bingham_tracker(
     instrument_name: str | None = None,
     event_nexus_filename: str | None = None,
     streaming_callback = None,
-    beta: float = 0.05,            # Background Poisson Noise Rate
     sigma: float = 0.03,           # Width of Bragg peaks in radians
     gamma_diffusion: float = 0.01, # Process Noise / Relaxation Rate (1/s)
     kappa_init: float = 1000.0,    # Confidence in initial U seed
@@ -2185,7 +2184,7 @@ def run_bingham_tracker(
         ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else None
         ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
         ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
-        
+
         ub_helper.sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
         ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
         sg = f["sample/space_group"][()]
@@ -2214,24 +2213,24 @@ def run_bingham_tracker(
     # PRE-COMPUTE THEORETICAL HKL GRID
     # ==========================================
     print("  > Pre-computing Forward-Mapping HKL Grid for Continuous Tracking...")
-    h_max = 6 
+    h_max = 6
     h_vals = np.arange(-h_max, h_max + 1)
     hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-    
+
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
     theo_hkl = hkl_c[:, mask_hkl_c]
-    
+
     M_prim_np = np.array(M_prim)
     h_p = M_prim_np[0, 0]*theo_hkl[0] + M_prim_np[0, 1]*theo_hkl[1] + M_prim_np[0, 2]*theo_hkl[2]
     k_p = M_prim_np[1, 0]*theo_hkl[0] + M_prim_np[1, 1]*theo_hkl[1] + M_prim_np[1, 2]*theo_hkl[2]
     l_p = M_prim_np[2, 0]*theo_hkl[0] + M_prim_np[2, 1]*theo_hkl[1] + M_prim_np[2, 2]*theo_hkl[2]
-    
+
     is_valid = (np.abs(h_p - np.round(h_p)) < 1e-4) & \
                (np.abs(k_p - np.round(k_p)) < 1e-4) & \
                (np.abs(l_p - np.round(l_p)) < 1e-4)
     theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
-    
+
     # Calculate exact unit vectors in the Sample Frame
     h_sample = B_mat @ theo_hkl
     q_theo_sample_np = h_sample / (np.linalg.norm(h_sample, axis=0, keepdims=True) + 1e-9)
@@ -2249,7 +2248,7 @@ def run_bingham_tracker(
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
 
-        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec) 
+        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec)
                      for k in keys if k.endswith('_events')]
 
         all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
@@ -2268,7 +2267,7 @@ def run_bingham_tracker(
         all_banks = np.concatenate(all_banks)
         all_pixels_r = np.concatenate(all_pixels_r)
         all_pixels_c = np.concatenate(all_pixels_c)
-        
+
         sort_idx = np.argsort(all_times)
         all_q_lab = all_q_lab[sort_idx]
         all_times = all_times[sort_idx]
@@ -2295,12 +2294,12 @@ def run_bingham_tracker(
         z = jnp.array([C[2, 1] - C[1, 2],
                        C[0, 2] - C[2, 0],
                        C[1, 0] - C[0, 1]])
-        
+
         A00 = jnp.array([[trC]])
-        A01 = z[None, :] 
-        A10 = z[:, None] 
+        A01 = z[None, :]
+        A10 = z[:, None]
         A11 = C + C.T - trC * jnp.eye(3)
-        
+
         return jnp.concatenate([
             jnp.concatenate([A00, A01], axis=1),
             jnp.concatenate([A10, A11], axis=1)
@@ -2315,43 +2314,44 @@ def run_bingham_tracker(
         # 1. Time delta for process noise (from end of last batch to end of this batch)
         t_curr = t_batch[-1]
         dt = jnp.maximum(0.0, t_curr - t_prev)
-        
+
         # 2. Process Noise (Rotational Diffusion over time delta)
         A_diffused = A_prev * jnp.exp(-gamma_diffusion * dt)
-        
+
         # 3. Extract best orientation (Mode of Bingham) to use for the batch
         vals, vecs = jnp.linalg.eigh(A_diffused)
         r = vecs[:, -1] # Eigenvector of largest eigenvalue
         U = quaternion_to_rotation_matrix(r)
-        
+
         # 4. Vectorized Peak Assignment and Update Construction
         def single_event_update(q_exp):
             h_lab = jnp.matmul(U, q_theo_sample_jax)
             cos_theta = jnp.dot(q_exp, h_lab) # (N_peaks,)
-            
-            I_bragg = jnp.exp((1.0 / sigma**2) * (cos_theta - 1.0))
-            
-            # Calculate Natural Loss (NLL)
-            event_nll = -jnp.log(beta + jnp.sum(I_bragg))
-            
+
+            # Individual peak log-likelihoods
+            peak_log_lik = (1.0 / sigma**2) * (cos_theta - 1.0)
+
+            # NLL is strictly the negative sum of individual peak log likelihoods
+            event_nll = -jnp.sum(peak_log_lik)
+
             # Unnormalized weights strictly preserve multiplicative conjugacy
-            w = I_bragg 
-            
+            w = jnp.exp(peak_log_lik)
+
             # Construct rank-1 scattering signal F
             weighted_h = jnp.sum(w * q_theo_sample_jax, axis=1) # (3,)
             F = jnp.outer(q_exp, weighted_h)
-            
+
             return compute_A_from_C(F), event_nll
 
         # VMAP across all events in the current block simultaneously
         A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch)
-        
+
         # 5. Integrate Measurement Updates
         A_new = A_diffused + (1.0 / sigma**2) * jnp.sum(A_F_batch, axis=0)
-        
+
         # Regularize: prevent eigenvalues from blowing up arbitrarily large
         A_new = A_new - (jnp.trace(A_new) / 4.0) * jnp.eye(4)
-        
+
         return A_new, t_curr, U, jnp.mean(nll_batch)
 
     # ==========================================
@@ -2367,10 +2367,10 @@ def run_bingham_tracker(
         else:
             # Uniform prior with tiny symmetry breaking to prevent 'eigh' instability
             A_state = np.eye(4) + np.array([1e-4, -1e-4, 0.0, 0.0])
-            
+
         t_state = all_times[0] if len(all_times) > 0 else 0.0
         tracking_history = []
-        
+
         # Push to GPU to eliminate H2D transfers in the loop
         all_q_lab_jax = jax.device_put(all_q_lab)
         all_times_jax = jax.device_put(all_times)
@@ -2380,7 +2380,7 @@ def run_bingham_tracker(
             end_idx = min(start_idx + batch_size_events, len(all_q_lab))
             if end_idx - start_idx < 100: # Skip tiny tail ends to prevent vmap artifacts
                 break
-            
+
             # Extract sequence data
             q_batch = all_q_lab_jax[start_idx:end_idx] # (Batch, 3)
             q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
@@ -2388,11 +2388,11 @@ def run_bingham_tracker(
 
             # Execute massively parallel chunk integration
             A_state, t_state, U_current, chunk_mean_loss = process_chunk(A_state, t_state, q_batch, t_batch)
-            
+
             U_current_np = np.array(U_current)
             chunk_loss_np = float(chunk_mean_loss)
             tracking_history.append((float(t_state), U_current_np))
-            
+
             if start_idx % (batch_size_events * 5) == 0:
                 print(f"    Time {t_state:.2f}s | State Matrix Trace: {float(jnp.trace(A_state)):.2f} | Mean NLL: {chunk_loss_np:.4f}")
 
@@ -2403,13 +2403,13 @@ def run_bingham_tracker(
                     "pixel_r": all_pixels_r[start_idx:end_idx],
                     "pixel_c": all_pixels_c[start_idx:end_idx]
                 }
-                
+
                 streaming_callback(
                     time=float(t_state),
                     U_preds=np.array([U_current_np]), # Packaged as list to match legacy API
-                    losses=np.array([chunk_loss_np]), 
+                    losses=np.array([chunk_loss_np]),
                     mean_loss=chunk_loss_np,
-                    best_idx=0, 
+                    best_idx=0,
                     neutron_count=end_idx,
                     new_events=new_events
                 )
