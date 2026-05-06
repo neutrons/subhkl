@@ -2156,7 +2156,7 @@ def _process_single_bank(args):
         pixel_c.astype(np.int16)
     )
 
-def run_gmphd_tracker(
+def run_bingham_tracker(
     finder_file: str,
     output_h5_filename: str,
     instrument_name: str | None = None,
@@ -2164,12 +2164,10 @@ def run_gmphd_tracker(
     streaming_callback = None,
     beta: float = 0.05,            # Background Poisson Noise Rate
     sigma: float = 0.03,           # Width of Bragg peaks in radians
-    Q_noise: float = 1e-5,         # Process Noise Variance (Diffusion)
+    gamma_diffusion: float = 0.01, # Process Noise / Relaxation Rate (1/s)
+    kappa_init: float = 1000.0,    # Confidence in initial U seed
     window_size_events:int = 25000,
     step_size_events: int = 10000,
-    n_initial_hypotheses: int = 128, # Number of global starting grid points
-    prune_threshold: float = 1e-4,   # Death threshold for invalid aliases
-    max_components: int = 20,        # Maximum surviving components to track
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     import h5py
@@ -2180,6 +2178,7 @@ def run_gmphd_tracker(
     print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
 
     ub_helper = FindUB()
+    U_init = None
     with h5py.File(finder_file, "r") as f:
         ub_helper.a = f["sample/a"][()] if "sample/a" in f else None
         ub_helper.b = f["sample/b"][()] if "sample/b" in f else None
@@ -2192,6 +2191,11 @@ def run_gmphd_tracker(
         ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
         sg = f["sample/space_group"][()]
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
+
+        # Attempt to load seed orientation
+        if "sample/U" in f:
+            U_init = f["sample/U"][()]
+            print("  > Discovered seed U matrix in finder file. Will initialize Bingham Prior.")
 
     B_mat = ub_helper.reciprocal_lattice_B()
     _, _, centering = get_lattice_system(
@@ -2210,7 +2214,7 @@ def run_gmphd_tracker(
     # ==========================================
     # PRE-COMPUTE THEORETICAL HKL GRID
     # ==========================================
-    print("  > Pre-computing Forward-Mapping HKL Grid for EGM-PHD Tracking...")
+    print("  > Pre-computing Forward-Mapping HKL Grid for Continuous Tracking...")
     h_max = 6 
     h_vals = np.arange(-h_max, h_max + 1)
     hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
@@ -2229,8 +2233,11 @@ def run_gmphd_tracker(
                (np.abs(l_p - np.round(l_p)) < 1e-4)
     theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
     
-    h_sample_jax = jnp.array(B_mat @ theo_hkl)
-    print(f"  > Generated {h_sample_jax.shape[1]} valid theoretical Bragg rays.")
+    # Calculate exact unit vectors in the Sample Frame
+    h_sample = B_mat @ theo_hkl
+    q_theo_sample_np = h_sample / (np.linalg.norm(h_sample, axis=0, keepdims=True) + 1e-9)
+    q_theo_sample_jax = jnp.array(q_theo_sample_np)
+    print(f"  > Generated {q_theo_sample_jax.shape[1]} valid theoretical Bragg directions.")
 
     # ==========================================
     # EVENT-MODE DATA ASSIMILATION LOGIC
@@ -2239,11 +2246,13 @@ def run_gmphd_tracker(
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
         import multiprocessing
         import concurrent.futures
+        
+        # NOTE: Assumes _process_single_bank is imported or exists in this module scope
+        from subhkl.integration.worker import _process_single_bank
 
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
 
-        # Assumes _process_single_bank is defined in the module
         args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec) 
                      for k in keys if k.endswith('_events')]
 
@@ -2272,139 +2281,121 @@ def run_gmphd_tracker(
         all_pixels_c = all_pixels_c[sort_idx]
 
     # ==========================================
-    # CORE JAX FUNCTIONS
+    # CORE JAX FUNCTIONS FOR BINGHAM TRACKER
     # ==========================================
-    def compute_U(rot_6d):
-        a1 = rot_6d[:3]
-        a2 = rot_6d[3:]
-        b1 = a1 / (jnp.linalg.norm(a1) + 1e-6)
-        b2 = a2 - jnp.dot(b1, a2) * b1
-        b2 = b2 / (jnp.linalg.norm(b2) + 1e-6)
-        b3 = jnp.cross(b1, b2)
-        return jnp.stack([b1, b2, b3], axis=-1)
-
-    def per_event_log_likelihood(mu_params, beta_bg, sigma_rad, q_exp_single_hat):
-        """Negative IPP log-likelihood for ONE experimental event."""
-        U_pred = compute_U(mu_params)
-        h_lab = jnp.matmul(U_pred, h_sample_jax)
-        q_theo_hat = h_lab / (jnp.linalg.norm(h_lab, axis=0, keepdims=True) + 1e-9)
-        
-        cos_theta = jnp.dot(q_theo_hat.T, q_exp_single_hat)
-        cos_theta = jnp.clip(cos_theta, -1.0 + 1e-7, 1.0 - 1e-7)
-        
-        kappa = 1.0 / (sigma_rad**2)
-        I_bragg = jnp.exp(kappa * (cos_theta - 1.0))
-        
-        I_total = beta_bg + jnp.sum(I_bragg)
-        return -jnp.log(I_total)
-
-    # VMAP OVER EVENTS (Axis 1 of q_batch_hat)
-    batch_grad_fn = jax.vmap(jax.grad(per_event_log_likelihood), in_axes=(None, None, None, 1))
-    batch_loss_fn = jax.vmap(per_event_log_likelihood, in_axes=(None, None, None, 1))
+    @jax.jit
+    def quaternion_to_rotation_matrix(r):
+        w, x, y, z = r[0], r[1], r[2], r[3]
+        return jnp.array([
+            [w*w+x*x-y*y-z*z, 2*(x*y-w*z),     2*(x*z+w*y)],
+            [2*(x*y+w*z),     w*w-x*x+y*y-z*z, 2*(y*z-w*x)],
+            [2*(x*z-w*y),     2*(y*z+w*x),     w*w-x*x-y*y+z*z]
+        ])
 
     @jax.jit
-    def ensemble_ekf_update_transposed(mu_ensemble, P_ensemble, current_beta, current_sigma, current_Q, q_batch_hat):
-        """
-        Executes the exact Gaussian-Newton EKF over an ensemble of hypotheses.
-        Transposed architecture: jax.lax.scan iterates over the hypotheses (small K).
-        Inside the scan, jax.vmap executes matrix ops across ALL events (massive N) simultaneously.
-        """
-        def scan_fn(carry, hypothesis_data):
-            mu, P = hypothesis_data
-            
-            # 1. Forecast (Diffusion)
-            P_prior = P + current_Q * jnp.eye(6)
-            
-            # 2. VMAP the gradient across ALL events for this SINGLE hypothesis
-            # G is shape (N_events, 6)
-            G = batch_grad_fn(mu, current_beta, current_sigma, q_batch_hat)
-            
-            # 3. Compute Mean Gradient and Empirical Fisher Information Matrix
-            g = jnp.mean(G, axis=0)
-            H_FIM = jnp.matmul(G.T, G) / G.shape[0]
-            H_reg = H_FIM + jnp.eye(6) * 1e-6
-            
-            # 4. Collapse and Update (Information Filter)
-            Lambda_prior = jnp.linalg.inv(P_prior)
-            Lambda_post = Lambda_prior + H_reg
-            P_post = jnp.linalg.inv(Lambda_post)
-            mu_post = mu - jnp.matmul(P_post, g)
-            
-            # 5. Compute mean loss and updated orientation
-            loss_vals = batch_loss_fn(mu_post, current_beta, current_sigma, q_batch_hat)
-            mean_loss = jnp.mean(loss_vals)
-            U_post = compute_U(mu_post)
-            
-            return None, (mu_post, P_post, mean_loss, U_post)
+    def compute_A_from_C(C):
+        """Map 3x3 Concentration Matrix to 4x4 Bingham Matrix linearly."""
+        trC = jnp.trace(C)
+        z = jnp.array([C[2, 1] - C[1, 2],
+                       C[0, 2] - C[2, 0],
+                       C[1, 0] - C[0, 1]])
+        
+        A00 = jnp.array([[trC]])
+        A01 = z[None, :] 
+        A10 = z[:, None] 
+        A11 = C + C.T - trC * jnp.eye(3)
+        
+        return jnp.concatenate([
+            jnp.concatenate([A00, A01], axis=1),
+            jnp.concatenate([A10, A11], axis=1)
+        ], axis=0)
 
-        _, (mu_new, P_new, loss_new, U_new) = jax.lax.scan(
+    @jax.jit
+    def process_chunk(A_carry, t_carry, q_seq, t_seq):
+        """
+        Continuous formulation: jax.lax.scan processes events chronologically.
+        The SDE is: dA(t) = -Gamma A(t) dt + 1/sigma^2 A_F dN(t)
+        """
+        def scan_fn(carry, event_data):
+            A, t_prev = carry
+            q_exp, t_curr = event_data
+            
+            # 1. Process Noise (Rotational Diffusion over time delta)
+            dt = jnp.maximum(0.0, t_curr - t_prev)
+            A_diffused = A * jnp.exp(-gamma_diffusion * dt)
+            
+            # 2. Extract best orientation (Mode of Bingham distribution)
+            vals, vecs = jnp.linalg.eigh(A_diffused)
+            r = vecs[:, -1] # Eigenvector of largest eigenvalue
+            U = quaternion_to_rotation_matrix(r)
+            
+            # 3. Peak Assignment Probabilities
+            h_lab = jnp.matmul(U, q_theo_sample_jax)
+            cos_theta = jnp.dot(q_exp, h_lab) # (N_peaks,)
+            
+            I_bragg = jnp.exp((1.0 / sigma**2) * (cos_theta - 1.0))
+            w = I_bragg / (beta + jnp.sum(I_bragg)) # Softmax with background
+            
+            # 4. Construct rank-1 scattering signal F
+            weighted_h = jnp.sum(w * q_theo_sample_jax, axis=1) # (3,)
+            F = jnp.outer(q_exp, weighted_h)
+            
+            # 5. Measurement Update 
+            A_F = compute_A_from_C(F)
+            A_new = A_diffused + (1.0 / sigma**2) * A_F
+            
+            # Regularize: prevent eigenvalues from blowing up arbitrarily large
+            A_new = A_new - (jnp.trace(A_new) / 4.0) * jnp.eye(4)
+            
+            return (A_new, t_curr), U
+
+        (A_final, t_final), U_traj = jax.lax.scan(
             scan_fn, 
-            None, 
-            (mu_ensemble, P_ensemble)
+            (A_carry, t_carry), 
+            (q_seq, t_seq)
         )
-        return mu_new, P_new, loss_new, U_new
+        return A_final, t_final, U_traj
 
     # ==========================================
-    # PHASE 3: CONTINUOUS EGM-PHD TRACKING LOOP
+    # PHASE 3: CONTINUOUS TRACKING LOOP
     # ==========================================
     if event_nexus_filename:
-        print(f"\n[3/4] Executing Global EGM-PHD Tracking ({n_initial_hypotheses} Hypotheses)...")
+        print(f"\n[3/4] Executing Continuous Bingham Tracking...")
 
-        # 1. Global Initialization (Birth Model)
-        rng = jax.random.PRNGKey(42)
-        mu_ensemble = jax.random.normal(rng, (n_initial_hypotheses, 6)) * 2.0
-        P_ensemble = jnp.tile(jnp.eye(6) * 1.0, (n_initial_hypotheses, 1, 1))
-        weights = jnp.ones(n_initial_hypotheses) / n_initial_hypotheses
-
+        # Initialize State Matrix A
+        if U_init is not None:
+            C_init = kappa_init * U_init
+            A_state = np.array(compute_A_from_C(C_init))
+        else:
+            # Uniform prior with tiny symmetry breaking to prevent 'eigh' instability
+            A_state = np.eye(4) * np.array([1e-4, -1e-4, 0.0, 0.0])
+            
+        t_state = all_times[0] if len(all_times) > 0 else 0.0
         tracking_history = []
         
-        # PRE-LOAD ENTIRE DATASET TO GPU (Eliminates H2D sync bottlenecks)
+        # Push to GPU to eliminate H2D transfers in the loop
         all_q_lab_jax = jax.device_put(all_q_lab)
+        all_times_jax = jax.device_put(all_times)
 
         for start_idx in range(0, len(all_q_lab) - window_size_events, step_size_events):
             end_idx = start_idx + window_size_events
-            q_window = all_q_lab_jax[start_idx:end_idx].T
-
-            # Normalize
-            q_exp_norm = jnp.linalg.norm(q_window, axis=0, keepdims=True)
-            q_exp_hat = q_window / (q_exp_norm + 1e-9)
-
-            # 2. TRANSPOSED EKF UPDATE (Asynchronous GPU Dispatch)
-            mu_ensemble, P_ensemble, loss_vals, U_preds = ensemble_ekf_update_transposed(
-                mu_ensemble, P_ensemble, beta, sigma, Q_noise, q_exp_hat
-            )
-
-            # 3. GM-PHD WEIGHT UPDATE (Poisson Likelihood)
-            likelihoods = jnp.exp(-loss_vals)
-            weights = weights * likelihoods
-            weights = weights / (jnp.sum(weights) + 1e-12)
-
-            # 4. STATIC SHAPE PRUNING (Zero-Recompilation Guarantee)
-            weights = jnp.where(weights > prune_threshold, weights, 0.0)
-
-            # Force shape to static bounds using jax.lax.top_k
-            if len(weights) > max_components:
-                weights, top_indices = jax.lax.top_k(weights, max_components)
-                mu_ensemble = mu_ensemble[top_indices]
-                P_ensemble = P_ensemble[top_indices]
-                U_preds = U_preds[top_indices]
-                loss_vals = loss_vals[top_indices]
-                
-            weights = weights / (jnp.sum(weights) + 1e-12)
-
-            # 5. ASYNCHRONOUS STATE EXTRACTION (Fast path, no blocking)
-            best_idx = jnp.argmax(weights)
-            U_current = U_preds[best_idx]
-            current_loss = loss_vals[best_idx]
             
-            tracking_history.append((all_times[end_idx], U_current))
+            # Extract sequence data
+            q_seq = all_q_lab_jax[start_idx:end_idx] # (N, 3)
+            q_seq = q_seq / (jnp.linalg.norm(q_seq, axis=1, keepdims=True) + 1e-9)
+            t_seq = all_times_jax[start_idx:end_idx] # (N,)
+
+            # Execute chronologically correct, continuous-time JAX scan
+            A_state, t_state, U_traj = process_chunk(A_state, t_state, q_seq, t_seq)
             
-            # Print state every 5 steps (triggers minor D2H sync, negligible penalty)
+            # Extract the final U matrix for this window segment
+            U_current = np.array(U_traj[-1])
+            tracking_history.append((float(t_state), U_current))
+            
             if start_idx % (step_size_events * 5) == 0:
-                active_count = int(jnp.sum(weights > 0))
-                print(f"    Time {all_times[end_idx]:.2f}s | Active Hypotheses: {active_count} | Best IPP Loss: {float(current_loss):.4f}")
+                print(f"    Time {t_state:.2f}s | State Matrix Trace: {float(jnp.trace(A_state)):.2f}")
 
-            # 6. TRIGGER CALLBACK
+            # TRIGGER CALLBACK
             if streaming_callback is not None:
                 new_start = 0 if start_idx == 0 else end_idx - step_size_events
                 
@@ -2415,17 +2406,14 @@ def run_gmphd_tracker(
                 }
                 
                 streaming_callback(
-                    time=float(all_times[end_idx]),
-                    U_preds=np.array(U_preds),
-                    losses=np.array(loss_vals), 
-                    mean_loss=float(current_loss),
-                    best_idx=int(best_idx), 
+                    time=float(t_state),
+                    U_preds=np.array([U_current]), # Packaged as list to match legacy API
+                    losses=np.array([0.0]),        # Tracked intrinsically by A matrix shape now
+                    mean_loss=0.0,
+                    best_idx=0, 
                     neutron_count=end_idx,
                     new_events=new_events
                 )
-
-            if len(weights) == 0 or jnp.sum(weights) == 0:
-                raise RuntimeError("GM-PHD Filter Collapse: All hypotheses pruned.")
 
         print(f"\n[4/4] Global Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
         return tracking_history[-1][1]
