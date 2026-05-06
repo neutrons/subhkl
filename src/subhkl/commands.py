@@ -2434,7 +2434,7 @@ def run_bingham_tracker(
             best_gap = float(eigen_gaps[best_idx])
             best_loss = float(loss_ensemble[best_idx])
 
-            tracking_history.append((float(t_state), U_best))
+            tracking_history.append((t_state, U_best))
 
             if start_idx % (batch_size_events * 5) == 0:
                 print(f"    Time {t_state:.2f}s | Best Tracker: {best_idx:03d} | Eigen-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
