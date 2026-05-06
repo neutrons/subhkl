@@ -2299,22 +2299,49 @@ def run_gmphd_tracker(
     @jax.jit
     def single_ekf_update(mu, P, current_beta, current_sigma, current_Q, q_batch_hat):
         P_prior = P + current_Q * jnp.eye(6)
+        
+        # ---------------------------------------------------------
+        # MEMORY-EFFICIENT FISHER INFORMATION ACCUMULATION
+        # ---------------------------------------------------------
+        def scan_fn(carry, q_single_hat):
+            sum_g, sum_H, sum_loss = carry
+            
+            # Compute gradient and loss for just ONE event
+            loss_single, g_single = jax.value_and_grad(per_event_log_likelihood)(
+                mu, current_beta, current_sigma, q_single_hat
+            )
+            
+            # Accumulate running totals
+            sum_g = sum_g + g_single
+            sum_H = sum_H + jnp.outer(g_single, g_single)
+            sum_loss = sum_loss + loss_single
+            
+            return (sum_g, sum_H, sum_loss), None
 
-        # Empirical Fisher Information Matrix (PSD Gauss-Newton)
-        G = batch_grad_fn(mu, current_beta, current_sigma, q_batch_hat)
-        g = jnp.mean(G, axis=0)
-        H_FIM = jnp.matmul(G.T, G) / G.shape[0]
+        # Initialize running totals: zeros for grad, Hessian, and loss
+        init_carry = (jnp.zeros(6), jnp.zeros((6, 6)), 0.0)
+        
+        # JAX Scan loop (q_batch_hat is transposed to shape (N, 3) to iterate over events)
+        (total_g, total_H, total_loss), _ = jax.lax.scan(scan_fn, init_carry, q_batch_hat.T)
+        
+        N_events = q_batch_hat.shape[1]
+        
+        # Average the accumulations
+        g = total_g / N_events
+        H_FIM = total_H / N_events
+        loss_val = total_loss / N_events
+        # ---------------------------------------------------------
+
         H_reg = H_FIM + jnp.eye(6) * 1e-6
-
+        
         # Information Filter Collapse
         Lambda_prior = jnp.linalg.inv(P_prior)
         Lambda_post = Lambda_prior + H_reg
         P_post = jnp.linalg.inv(Lambda_post)
-
+        
         # Newton Step
         mu_post = mu - jnp.matmul(P_post, g)
-
-        loss_val = jnp.mean(batch_loss_fn(mu_post, current_beta, current_sigma, q_batch_hat))
+        
         U_post = compute_U(mu_post)
         return mu_post, P_post, loss_val, U_post
 
