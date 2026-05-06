@@ -2162,7 +2162,8 @@ def run_bingham_tracker(
     instrument_name: str | None = None,
     event_nexus_filename: str | None = None,
     streaming_callback = None,
-    sigma_q: float = 0.05,         # Physical Width of Bragg peaks in reciprocal space (A^-1)
+    sigma_q_start: float = 1.0,    # Annealing High Temperature (A^-1)
+    sigma_q_end: float = 0.05,     # Annealing Low Temperature / Physical Width (A^-1)
     lambda_min: float = 1.0,       # Minimum instrument wavelength (Angstroms)
     lambda_max: float = 10.0,      # Maximum instrument wavelength (Angstroms)
     lambda_steepness: float = 5.0, # Sharpness of the bandpass logistic window
@@ -2256,6 +2257,7 @@ def run_bingham_tracker(
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
         import multiprocessing
         import concurrent.futures
+        from subhkl.integration.worker import _process_single_bank
 
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
@@ -2318,7 +2320,7 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_prev, t_prev, q_batch, t_batch):
+    def process_chunk(A_prev, t_prev, q_batch, t_batch, current_sigma_q):
         """
         Batched SDE integration. Processes an entire block of events via vmap.
         dA(t) = -Gamma A(t) dt + sum(A_F)
@@ -2343,26 +2345,31 @@ def run_bingham_tracker(
             h_lab = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_lab) # (N_peaks,)
 
-            # Wavelength prior calculation
-            # For elastic scattering, q_exp dot ki_vec = -sin(theta_exp)
-            q_dot_ki = jnp.dot(q_exp, ki_vec_jax)
-            lambda_j = -(4.0 * jnp.pi / (q_mags_jax + 1e-9)) * q_dot_ki
+            # Wavelength prior evaluated conditionally on theoretical U.
+            # This completely breaks Friedel symmetry! A peak's Friedel mate will
+            # produce an exactly negative wavelength and be annihilated.
+            q_dot_ki_theo = jnp.dot(ki_vec_jax, h_lab)
+            lambda_j = -(4.0 * jnp.pi / (q_mags_jax + 1e-9)) * q_dot_ki_theo
 
             # Logistic window for bandpass (P(lambda))
             p_lambda = jax.nn.sigmoid(lambda_steepness * (lambda_j - lambda_min)) * \
                        jax.nn.sigmoid(lambda_steepness * (lambda_max - lambda_j))
 
-            # Precision based on theoretical Q magnitude and sharp Capture Radius
-            kappa_j = (q_mags_jax ** 2) / (sigma_q ** 2)
+            # Formally additive log prior
+            log_prior = jnp.log(p_lambda + 1e-12)
 
-            # Effective weight combines precision and wavelength prior
-            effective_weight = p_lambda * kappa_j
+            # Precision based on theoretical Q magnitude and Annealed Capture Radius
+            kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
 
-            # Individual peak log-likelihoods
-            peak_log_lik = effective_weight * (cos_theta_err - 1.0)
+            # Individual peak log-likelihoods = Geometric Likelihood + Wavelength Prior
+            peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_prior
+
+            # Extract weights (w_j = P(lambda) * exp(kappa * error))
+            w = jnp.exp(peak_log_lik)
 
             # Additive rank-1 scattering signal F
-            weighted_h = jnp.sum(effective_weight * q_theo_sample_jax, axis=1) # (3,)
+            # Weighted by precision kappa_j to properly scale information matrix
+            weighted_h = jnp.sum((w * kappa_j) * q_theo_sample_jax, axis=1) # (3,)
             F = jnp.outer(q_exp, weighted_h)
 
             # NLL is strictly the negative sum of individual peak log likelihoods
@@ -2382,10 +2389,11 @@ def run_bingham_tracker(
         return A_new, t_curr, U, jnp.mean(nll_batch), eigen_gap
 
     # Wrap the entire SDE step to run over the whole ensemble in parallel!
+    # Fix: Use out_axes to prevent JAX from stacking the shared t_curr output into an array
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, None, None, None),
+            in_axes=(0, None, None, None, None),
             out_axes=(0, None, 0, 0, 0)
         )
     )
@@ -2424,14 +2432,19 @@ def run_bingham_tracker(
             if end_idx - start_idx < 100: # Skip tiny tail ends to prevent vmap artifacts
                 break
 
+            # Calculate current annealed temperature (sigma_q)
+            progress = start_idx / total_events
+            # Exponential decay schedule for Simulated Annealing
+            current_sigma_q = sigma_q_start * np.exp(-progress * np.log(sigma_q_start / sigma_q_end))
+
             # Extract sequence data
             q_batch = all_q_lab_jax[start_idx:end_idx] # (Batch, 3)
             q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
             t_batch = all_times_jax[start_idx:end_idx] # (Batch,)
 
-            # Execute massively parallel chunk integration across ALL 128 hypotheses
+            # Execute massively parallel chunk integration across ALL hypotheses
             A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps = ensemble_process_chunk(
-                A_ensemble_state, t_state, q_batch, t_batch
+                A_ensemble_state, t_state, q_batch, t_batch, current_sigma_q
             )
 
             # Find the global optimum by isolating the tracker with the highest Eigen-Gap!
@@ -2440,10 +2453,10 @@ def run_bingham_tracker(
             best_gap = float(eigen_gaps[best_idx])
             best_loss = float(loss_ensemble[best_idx])
 
-            tracking_history.append((t_state, U_best))
+            tracking_history.append((float(t_state), U_best))
 
             if start_idx % (batch_size_events * 5) == 0:
-                print(f"    Time {t_state:.2f}s | Best Tracker: {best_idx:03d} | Eigen-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
+                print(f"    Time {t_state:.2f}s | Sigma_Q: {current_sigma_q:.3f} | Best Tracker: {best_idx:03d} | Eigen-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
 
             # TRIGGER CALLBACK
             if streaming_callback is not None:
@@ -2455,9 +2468,9 @@ def run_bingham_tracker(
 
                 streaming_callback(
                     time=float(t_state),
-                    U_preds=[U_best],
-                    losses=[best_loss],
-                    mean_loss=np.mean(loss_ensemble),
+                    U_preds=np.array([U_best]), # Packaged as list to match legacy API
+                    losses=np.array([best_loss]),
+                    mean_loss=best_loss,
                     best_idx=0,
                     neutron_count=end_idx,
                     new_events=new_events
