@@ -2162,14 +2162,14 @@ def run_bingham_tracker(
     instrument_name: str | None = None,
     event_nexus_filename: str | None = None,
     streaming_callback = None,
-    sigma_q_start: float = 1.0,    # Annealing High Temperature (A^-1)
-    sigma_q_end: float = 0.05,     # Annealing Low Temperature / Physical Width (A^-1)
+    sigma_q: float = 0.05,         # Physical Width of Bragg peaks in reciprocal space (A^-1)
     lambda_min: float = 1.0,       # Minimum instrument wavelength (Angstroms)
     lambda_max: float = 10.0,      # Maximum instrument wavelength (Angstroms)
     lambda_steepness: float = 5.0, # Sharpness of the bandpass logistic window
     gamma_diffusion: float = 0.01, # Process Noise / Relaxation Rate (1/s)
     kappa_init: float = 1000.0,    # Confidence in initial U seed
-    batch_size_events: int = 10000 # Number of events processed in parallel per SDE step
+    batch_size_events: int = 10000,# Number of events processed in parallel per SDE step
+    n_ensemble: int = 128          # Number of simultaneous global trackers
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     import h5py
@@ -2318,7 +2318,7 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_prev, t_prev, q_batch, t_batch, current_sigma_q):
+    def process_chunk(A_prev, t_prev, q_batch, t_batch):
         """
         Batched SDE integration. Processes an entire block of events via vmap.
         dA(t) = -Gamma A(t) dt + sum(A_F)
@@ -2335,6 +2335,9 @@ def run_bingham_tracker(
         r = vecs[:, -1] # Eigenvector of largest eigenvalue
         U = quaternion_to_rotation_matrix(r)
 
+        # Calculate Eigen-Gap for Signal-to-Noise quantification
+        eigen_gap = vals[-1] - vals[-2]
+
         # 4. Vectorized Weighted Additive Update
         def single_event_update(q_exp):
             h_lab = jnp.matmul(U, q_theo_sample_jax)
@@ -2349,8 +2352,8 @@ def run_bingham_tracker(
             p_lambda = jax.nn.sigmoid(lambda_steepness * (lambda_j - lambda_min)) * \
                        jax.nn.sigmoid(lambda_steepness * (lambda_max - lambda_j))
 
-            # Precision based on theoretical Q magnitude and Annealed Capture Radius
-            kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
+            # Precision based on theoretical Q magnitude and sharp Capture Radius
+            kappa_j = (q_mags_jax ** 2) / (sigma_q ** 2)
 
             # Effective weight combines precision and wavelength prior
             effective_weight = p_lambda * kappa_j
@@ -2376,21 +2379,29 @@ def run_bingham_tracker(
         # Regularize: prevent eigenvalues from blowing up arbitrarily large
         A_new = A_new - (jnp.trace(A_new) / 4.0) * jnp.eye(4)
 
-        return A_new, t_curr, U, jnp.mean(nll_batch)
+        return A_new, t_curr, U, jnp.mean(nll_batch), eigen_gap
+
+    # Wrap the entire SDE step to run over the whole ensemble in parallel!
+    ensemble_process_chunk = jax.jit(jax.vmap(process_chunk, in_axes=(0, None, None, None)))
 
     # ==========================================
     # PHASE 3: CONTINUOUS TRACKING LOOP
     # ==========================================
     if event_nexus_filename:
-        print(f"\n[3/4] Executing Continuous Bingham Tracking (Batched, {batch_size_events} events/step)...")
+        print(f"\n[3/4] Executing Ensemble Bingham Tracking ({n_ensemble} simultaneous trackers)...")
 
-        # Initialize State Matrix A
+        # Initialize State Matrix A (Shape: [n_ensemble, 4, 4])
+        rng = jax.random.PRNGKey(42)
+        r_random = jax.random.normal(rng, (n_ensemble, 4))
+        r_random = r_random / jnp.linalg.norm(r_random, axis=1, keepdims=True)
+        U_ensemble = jax.vmap(quaternion_to_rotation_matrix)(r_random)
+        C_ensemble = kappa_init * U_ensemble
+        A_ensemble_state = jax.vmap(compute_A_from_C)(C_ensemble)
+
+        # If a seed U was provided, plant it directly into tracker index 0
         if U_init is not None:
-            C_init = kappa_init * U_init
-            A_state = np.array(compute_A_from_C(C_init))
-        else:
-            # Uniform prior with tiny symmetry breaking to prevent 'eigh' instability
-            A_state = np.eye(4) + np.array([1e-4, -1e-4, 0.0, 0.0])
+            A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
+            A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
 
         t_state = all_times[0] if len(all_times) > 0 else 0.0
         tracking_history = []
@@ -2407,27 +2418,26 @@ def run_bingham_tracker(
             if end_idx - start_idx < 100: # Skip tiny tail ends to prevent vmap artifacts
                 break
 
-            # Calculate current annealed temperature (sigma_q)
-            progress = start_idx / total_events
-            # Exponential decay is generally smoother for SA, but linear works well too.
-            current_sigma_q = sigma_q_start * np.exp(-progress * np.log(sigma_q_start / sigma_q_end))
-
             # Extract sequence data
             q_batch = all_q_lab_jax[start_idx:end_idx] # (Batch, 3)
             q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
             t_batch = all_times_jax[start_idx:end_idx] # (Batch,)
 
-            # Execute massively parallel chunk integration
-            A_state, t_state, U_current, chunk_mean_loss = process_chunk(
-                A_state, t_state, q_batch, t_batch, current_sigma_q
+            # Execute massively parallel chunk integration across ALL 128 hypotheses
+            A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps = ensemble_process_chunk(
+                A_ensemble_state, t_state, q_batch, t_batch
             )
 
-            U_current_np = np.array(U_current)
-            chunk_loss_np = float(chunk_mean_loss)
-            tracking_history.append((float(t_state), U_current_np))
+            # Find the global optimum by isolating the tracker with the highest Eigen-Gap!
+            best_idx = int(jnp.argmax(eigen_gaps))
+            U_best = np.array(U_ensemble_curr[best_idx])
+            best_gap = float(eigen_gaps[best_idx])
+            best_loss = float(loss_ensemble[best_idx])
+
+            tracking_history.append((float(t_state), U_best))
 
             if start_idx % (batch_size_events * 5) == 0:
-                print(f"    Time {t_state:.2f}s | Sigma_Q: {current_sigma_q:.3f} | Trace: {float(jnp.trace(A_state)):.2f} | Mean NLL: {chunk_loss_np:.4f}")
+                print(f"    Time {t_state:.2f}s | Best Tracker: {best_idx:03d} | Eigen-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
 
             # TRIGGER CALLBACK
             if streaming_callback is not None:
