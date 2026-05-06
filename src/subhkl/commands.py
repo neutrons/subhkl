@@ -2247,9 +2247,6 @@ def run_bingham_tracker(
         import multiprocessing
         import concurrent.futures
         
-        # NOTE: Assumes _process_single_bank is imported or exists in this module scope
-        from subhkl.integration.worker import _process_single_bank
-
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
 
