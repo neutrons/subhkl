@@ -2356,84 +2356,82 @@ def run_gmphd_tracker(
 
         # 1. Global Initialization (Birth Model)
         rng = jax.random.PRNGKey(42)
-        # Initialize a wide grid using random 6D parameters spanning the manifold
         mu_ensemble = jax.random.normal(rng, (n_initial_hypotheses, 6)) * 2.0
-        # Wide initial covariances to promote capture
         P_ensemble = jnp.tile(jnp.eye(6) * 1.0, (n_initial_hypotheses, 1, 1))
-        # Equal initial weights
         weights = jnp.ones(n_initial_hypotheses) / n_initial_hypotheses
 
         tracking_history = []
+        
+        # PRE-LOAD ENTIRE DATASET TO THE GPU ONCE TO PREVENT H2D LOOP TRANSFER
+        all_q_lab_jax = jax.device_put(all_q_lab)
 
         for start_idx in range(0, len(all_q_lab) - window_size_events, step_size_events):
             end_idx = start_idx + window_size_events
-            q_window = jnp.array(all_q_lab[start_idx:end_idx]).T
+            q_window = all_q_lab_jax[start_idx:end_idx].T
 
-            # Normalize batch once for the whole ensemble
             q_exp_norm = jnp.linalg.norm(q_window, axis=0, keepdims=True)
             q_exp_hat = q_window / (q_exp_norm + 1e-9)
 
-            # 2. VMAP EKF UPDATE
+            # 2. VMAP EKF UPDATE (Asynchronous GPU Dispatch)
             mu_ensemble, P_ensemble, loss_vals, U_preds = ensemble_ekf_update(
                 mu_ensemble, P_ensemble, beta, sigma, Q_noise, q_exp_hat
             )
 
-            # 3. GM-PHD WEIGHT UPDATE (Poisson Likelihood)
-            # Transform Negative Log-Likelihood into a Likelihood probability weight
+            # 3. GM-PHD WEIGHT UPDATE
             likelihoods = jnp.exp(-loss_vals)
             weights = weights * likelihoods
-
-            # Normalize to prevent underflow
             weights = weights / (jnp.sum(weights) + 1e-12)
 
-            # 4. GM-PHD PRUNING (Death Process)
-            # Drop components whose intensity has decayed below the threshold
-            valid_mask = weights > prune_threshold
+            # ---------------------------------------------------------
+            # 4. STATIC SHAPE PRUNING (Zero-Recompilation Guarantee)
+            # ---------------------------------------------------------
+            # Instead of deleting elements, set dead hypothesis weights to exactly 0.0
+            weights = jnp.where(weights > prune_threshold, weights, 0.0)
 
-            # Extract surviving components (converting back to JAX arrays after masking)
-            mu_ensemble = jnp.array(mu_ensemble[valid_mask])
-            P_ensemble = jnp.array(P_ensemble[valid_mask])
-            weights = jnp.array(weights[valid_mask])
-            U_preds = jnp.array(U_preds[valid_mask])
-            loss_vals = jnp.array(loss_vals[valid_mask])
-
-            # Ensure we don't track an expanding universe of duplicates
+            # Force the ensemble to EXACTLY `max_components` length after the very first frame.
+            # This locks the tensor shapes to (max_components, ...) forever. 1 Compile, 0 Recompiles.
             if len(weights) > max_components:
-                top_indices = jnp.argsort(weights)[-max_components:]
+                weights, top_indices = jax.lax.top_k(weights, max_components)
                 mu_ensemble = mu_ensemble[top_indices]
                 P_ensemble = P_ensemble[top_indices]
-                weights = weights[top_indices]
                 U_preds = U_preds[top_indices]
                 loss_vals = loss_vals[top_indices]
-
-            # Re-normalize after pruning
+                
             weights = weights / (jnp.sum(weights) + 1e-12)
 
-            # 5. STATE EXTRACTION
-            best_idx = int(jnp.argmax(weights))
+            # ---------------------------------------------------------
+            # 5. ASYNCHRONOUS STATE EXTRACTION
+            # ---------------------------------------------------------
+            # Do NOT use int() or float() here. Let the Python loop run freely!
+            best_idx = jnp.argmax(weights)
             U_current = U_preds[best_idx]
-            current_loss = float(loss_vals[best_idx])
-
-            tracking_history.append((all_times[end_idx], np.array(U_current)))
-
+            current_loss = loss_vals[best_idx]
+            
+            # Appending a JAX future to a python list is completely fine and non-blocking
+            tracking_history.append((all_times[end_idx], U_current))
+            
+            # Only trigger a D2H blocking sync when we absolutely need to print
             if start_idx % (step_size_events * 5) == 0:
-                print(f"    Time {all_times[end_idx]:.2f}s | Surviving Hypotheses: {len(weights)} | Best IPP Loss: {current_loss:.4f}")
+                active_count = int(jnp.sum(weights > 0))
+                print(f"    Time {all_times[end_idx]:.2f}s | Active Hypotheses: {active_count} | Best IPP Loss: {float(current_loss):.4f}")
 
             # 6. TRIGGER CALLBACK
             if streaming_callback is not None:
                 new_start = 0 if start_idx == 0 else end_idx - step_size_events
+                
+                # NOTE: We keep new_events in NumPy (from the host memory slice) because it's mostly for UI logic
                 new_events = {
                     "banks": all_banks[new_start:end_idx],
                     "pixel_r": all_pixels_r[new_start:end_idx],
                     "pixel_c": all_pixels_c[new_start:end_idx]
                 }
-
+                
                 streaming_callback(
                     time=float(all_times[end_idx]),
-                    U_preds=np.array(U_preds),
-                    losses=np.array(loss_vals),
-                    mean_loss=current_loss,
-                    best_idx=best_idx,
+                    U_preds=np.array(U_preds),     # This will trigger a D2H sync, which is fine for the UI update rate
+                    losses=np.array(loss_vals), 
+                    mean_loss=float(current_loss),
+                    best_idx=int(best_idx), 
                     neutron_count=end_idx,
                     new_events=new_events
                 )
