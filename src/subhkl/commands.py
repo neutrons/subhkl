@@ -2181,8 +2181,13 @@ def run_gmphd_tracker(
 
     ub_helper = FindUB()
     with h5py.File(finder_file, "r") as f:
-        ub_helper.a, ub_helper.b, ub_helper.c = f["sample/a"][()], f["sample/b"][()], f["sample/c"][()]
-        ub_helper.alpha, ub_helper.beta, ub_helper.gamma = f["sample/alpha"][()], f["sample/beta"][()], f["sample/gamma"][()]
+        ub_helper.a = f["sample/a"][()] if "sample/a" in f else None
+        ub_helper.b = f["sample/b"][()] if "sample/b" in f else None
+        ub_helper.c = f["sample/c"][()] if "sample/c" in f else None
+        ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else None
+        ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
+        ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
+        
         ub_helper.sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
         ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
         sg = f["sample/space_group"][()]
@@ -2206,24 +2211,24 @@ def run_gmphd_tracker(
     # PRE-COMPUTE THEORETICAL HKL GRID
     # ==========================================
     print("  > Pre-computing Forward-Mapping HKL Grid for EGM-PHD Tracking...")
-    h_max = 6
+    h_max = 6 
     h_vals = np.arange(-h_max, h_max + 1)
     hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-
+    
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
     theo_hkl = hkl_c[:, mask_hkl_c]
-
+    
     M_prim_np = np.array(M_prim)
     h_p = M_prim_np[0, 0]*theo_hkl[0] + M_prim_np[0, 1]*theo_hkl[1] + M_prim_np[0, 2]*theo_hkl[2]
     k_p = M_prim_np[1, 0]*theo_hkl[0] + M_prim_np[1, 1]*theo_hkl[1] + M_prim_np[1, 2]*theo_hkl[2]
     l_p = M_prim_np[2, 0]*theo_hkl[0] + M_prim_np[2, 1]*theo_hkl[1] + M_prim_np[2, 2]*theo_hkl[2]
-
+    
     is_valid = (np.abs(h_p - np.round(h_p)) < 1e-4) & \
                (np.abs(k_p - np.round(k_p)) < 1e-4) & \
                (np.abs(l_p - np.round(l_p)) < 1e-4)
     theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
-
+    
     h_sample_jax = jnp.array(B_mat @ theo_hkl)
     print(f"  > Generated {h_sample_jax.shape[1]} valid theoretical Bragg rays.")
 
@@ -2238,7 +2243,8 @@ def run_gmphd_tracker(
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
 
-        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec)
+        # Assumes _process_single_bank is defined in the module
+        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec) 
                      for k in keys if k.endswith('_events')]
 
         all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
@@ -2257,7 +2263,7 @@ def run_gmphd_tracker(
         all_banks = np.concatenate(all_banks)
         all_pixels_r = np.concatenate(all_pixels_r)
         all_pixels_c = np.concatenate(all_pixels_c)
-
+        
         sort_idx = np.argsort(all_times)
         all_q_lab = all_q_lab[sort_idx]
         all_times = all_times[sort_idx]
@@ -2278,75 +2284,65 @@ def run_gmphd_tracker(
         return jnp.stack([b1, b2, b3], axis=-1)
 
     def per_event_log_likelihood(mu_params, beta_bg, sigma_rad, q_exp_single_hat):
-        """Returns the negative log-likelihood for a SINGLE neutron event."""
+        """Negative IPP log-likelihood for ONE experimental event."""
         U_pred = compute_U(mu_params)
-
         h_lab = jnp.matmul(U_pred, h_sample_jax)
         q_theo_hat = h_lab / (jnp.linalg.norm(h_lab, axis=0, keepdims=True) + 1e-9)
-
+        
         cos_theta = jnp.dot(q_theo_hat.T, q_exp_single_hat)
         cos_theta = jnp.clip(cos_theta, -1.0 + 1e-7, 1.0 - 1e-7)
-
+        
         kappa = 1.0 / (sigma_rad**2)
         I_bragg = jnp.exp(kappa * (cos_theta - 1.0))
-
+        
         I_total = beta_bg + jnp.sum(I_bragg)
         return -jnp.log(I_total)
 
+    # VMAP OVER EVENTS (Axis 1 of q_batch_hat)
     batch_grad_fn = jax.vmap(jax.grad(per_event_log_likelihood), in_axes=(None, None, None, 1))
     batch_loss_fn = jax.vmap(per_event_log_likelihood, in_axes=(None, None, None, 1))
 
     @jax.jit
-    def single_ekf_update(mu, P, current_beta, current_sigma, current_Q, q_batch_hat):
-        P_prior = P + current_Q * jnp.eye(6)
-        
-        # ---------------------------------------------------------
-        # MEMORY-EFFICIENT FISHER INFORMATION ACCUMULATION
-        # ---------------------------------------------------------
-        def scan_fn(carry, q_single_hat):
-            sum_g, sum_H, sum_loss = carry
+    def ensemble_ekf_update_transposed(mu_ensemble, P_ensemble, current_beta, current_sigma, current_Q, q_batch_hat):
+        """
+        Executes the exact Gaussian-Newton EKF over an ensemble of hypotheses.
+        Transposed architecture: jax.lax.scan iterates over the hypotheses (small K).
+        Inside the scan, jax.vmap executes matrix ops across ALL events (massive N) simultaneously.
+        """
+        def scan_fn(carry, hypothesis_data):
+            mu, P = hypothesis_data
             
-            # Compute gradient and loss for just ONE event
-            loss_single, g_single = jax.value_and_grad(per_event_log_likelihood)(
-                mu, current_beta, current_sigma, q_single_hat
-            )
+            # 1. Forecast (Diffusion)
+            P_prior = P + current_Q * jnp.eye(6)
             
-            # Accumulate running totals
-            sum_g = sum_g + g_single
-            sum_H = sum_H + jnp.outer(g_single, g_single)
-            sum_loss = sum_loss + loss_single
+            # 2. VMAP the gradient across ALL events for this SINGLE hypothesis
+            # G is shape (N_events, 6)
+            G = batch_grad_fn(mu, current_beta, current_sigma, q_batch_hat)
             
-            return (sum_g, sum_H, sum_loss), None
+            # 3. Compute Mean Gradient and Empirical Fisher Information Matrix
+            g = jnp.mean(G, axis=0)
+            H_FIM = jnp.matmul(G.T, G) / G.shape[0]
+            H_reg = H_FIM + jnp.eye(6) * 1e-6
+            
+            # 4. Collapse and Update (Information Filter)
+            Lambda_prior = jnp.linalg.inv(P_prior)
+            Lambda_post = Lambda_prior + H_reg
+            P_post = jnp.linalg.inv(Lambda_post)
+            mu_post = mu - jnp.matmul(P_post, g)
+            
+            # 5. Compute mean loss and updated orientation
+            loss_vals = batch_loss_fn(mu_post, current_beta, current_sigma, q_batch_hat)
+            mean_loss = jnp.mean(loss_vals)
+            U_post = compute_U(mu_post)
+            
+            return None, (mu_post, P_post, mean_loss, U_post)
 
-        # Initialize running totals: zeros for grad, Hessian, and loss
-        init_carry = (jnp.zeros(6), jnp.zeros((6, 6)), 0.0)
-        
-        # JAX Scan loop (q_batch_hat is transposed to shape (N, 3) to iterate over events)
-        (total_g, total_H, total_loss), _ = jax.lax.scan(scan_fn, init_carry, q_batch_hat.T)
-        
-        N_events = q_batch_hat.shape[1]
-        
-        # Average the accumulations
-        g = total_g / N_events
-        H_FIM = total_H / N_events
-        loss_val = total_loss / N_events
-        # ---------------------------------------------------------
-
-        H_reg = H_FIM + jnp.eye(6) * 1e-6
-        
-        # Information Filter Collapse
-        Lambda_prior = jnp.linalg.inv(P_prior)
-        Lambda_post = Lambda_prior + H_reg
-        P_post = jnp.linalg.inv(Lambda_post)
-        
-        # Newton Step
-        mu_post = mu - jnp.matmul(P_post, g)
-        
-        U_post = compute_U(mu_post)
-        return mu_post, P_post, loss_val, U_post
-
-    # Vectorize the EKF update to run across the entire GM-PHD ensemble simultaneously
-    ensemble_ekf_update = jax.vmap(single_ekf_update, in_axes=(0, 0, None, None, None, None))
+        _, (mu_new, P_new, loss_new, U_new) = jax.lax.scan(
+            scan_fn, 
+            None, 
+            (mu_ensemble, P_ensemble)
+        )
+        return mu_new, P_new, loss_new, U_new
 
     # ==========================================
     # PHASE 3: CONTINUOUS EGM-PHD TRACKING LOOP
@@ -2362,34 +2358,31 @@ def run_gmphd_tracker(
 
         tracking_history = []
         
-        # PRE-LOAD ENTIRE DATASET TO THE GPU ONCE TO PREVENT H2D LOOP TRANSFER
+        # PRE-LOAD ENTIRE DATASET TO GPU (Eliminates H2D sync bottlenecks)
         all_q_lab_jax = jax.device_put(all_q_lab)
 
         for start_idx in range(0, len(all_q_lab) - window_size_events, step_size_events):
             end_idx = start_idx + window_size_events
             q_window = all_q_lab_jax[start_idx:end_idx].T
 
+            # Normalize
             q_exp_norm = jnp.linalg.norm(q_window, axis=0, keepdims=True)
             q_exp_hat = q_window / (q_exp_norm + 1e-9)
 
-            # 2. VMAP EKF UPDATE (Asynchronous GPU Dispatch)
-            mu_ensemble, P_ensemble, loss_vals, U_preds = ensemble_ekf_update(
+            # 2. TRANSPOSED EKF UPDATE (Asynchronous GPU Dispatch)
+            mu_ensemble, P_ensemble, loss_vals, U_preds = ensemble_ekf_update_transposed(
                 mu_ensemble, P_ensemble, beta, sigma, Q_noise, q_exp_hat
             )
 
-            # 3. GM-PHD WEIGHT UPDATE
+            # 3. GM-PHD WEIGHT UPDATE (Poisson Likelihood)
             likelihoods = jnp.exp(-loss_vals)
             weights = weights * likelihoods
             weights = weights / (jnp.sum(weights) + 1e-12)
 
-            # ---------------------------------------------------------
             # 4. STATIC SHAPE PRUNING (Zero-Recompilation Guarantee)
-            # ---------------------------------------------------------
-            # Instead of deleting elements, set dead hypothesis weights to exactly 0.0
             weights = jnp.where(weights > prune_threshold, weights, 0.0)
 
-            # Force the ensemble to EXACTLY `max_components` length after the very first frame.
-            # This locks the tensor shapes to (max_components, ...) forever. 1 Compile, 0 Recompiles.
+            # Force shape to static bounds using jax.lax.top_k
             if len(weights) > max_components:
                 weights, top_indices = jax.lax.top_k(weights, max_components)
                 mu_ensemble = mu_ensemble[top_indices]
@@ -2399,18 +2392,14 @@ def run_gmphd_tracker(
                 
             weights = weights / (jnp.sum(weights) + 1e-12)
 
-            # ---------------------------------------------------------
-            # 5. ASYNCHRONOUS STATE EXTRACTION
-            # ---------------------------------------------------------
-            # Do NOT use int() or float() here. Let the Python loop run freely!
+            # 5. ASYNCHRONOUS STATE EXTRACTION (Fast path, no blocking)
             best_idx = jnp.argmax(weights)
             U_current = U_preds[best_idx]
             current_loss = loss_vals[best_idx]
             
-            # Appending a JAX future to a python list is completely fine and non-blocking
             tracking_history.append((all_times[end_idx], U_current))
             
-            # Only trigger a D2H blocking sync when we absolutely need to print
+            # Print state every 5 steps (triggers minor D2H sync, negligible penalty)
             if start_idx % (step_size_events * 5) == 0:
                 active_count = int(jnp.sum(weights > 0))
                 print(f"    Time {all_times[end_idx]:.2f}s | Active Hypotheses: {active_count} | Best IPP Loss: {float(current_loss):.4f}")
@@ -2419,7 +2408,6 @@ def run_gmphd_tracker(
             if streaming_callback is not None:
                 new_start = 0 if start_idx == 0 else end_idx - step_size_events
                 
-                # NOTE: We keep new_events in NumPy (from the host memory slice) because it's mostly for UI logic
                 new_events = {
                     "banks": all_banks[new_start:end_idx],
                     "pixel_r": all_pixels_r[new_start:end_idx],
@@ -2428,7 +2416,7 @@ def run_gmphd_tracker(
                 
                 streaming_callback(
                     time=float(all_times[end_idx]),
-                    U_preds=np.array(U_preds),     # This will trigger a D2H sync, which is fine for the UI update rate
+                    U_preds=np.array(U_preds),
                     losses=np.array(loss_vals), 
                     mean_loss=float(current_loss),
                     best_idx=int(best_idx), 
@@ -2436,9 +2424,8 @@ def run_gmphd_tracker(
                     new_events=new_events
                 )
 
-            # Auto-termination condition: If all hypotheses die, raise a specific error
-            if len(weights) == 0:
-                raise RuntimeError("GM-PHD Filter Collapse: All hypotheses pruned. Consider increasing initial hypothesis count, widening initial covariance, or adjusting beta/sigma.")
+            if len(weights) == 0 or jnp.sum(weights) == 0:
+                raise RuntimeError("GM-PHD Filter Collapse: All hypotheses pruned.")
 
         print(f"\n[4/4] Global Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
-        U_final = tracking_history[-1][1]
+        return tracking_history[-1][1]
