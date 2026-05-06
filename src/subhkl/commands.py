@@ -2291,6 +2291,33 @@ def run_bingham_tracker(
     # CORE JAX FUNCTIONS FOR BINGHAM TRACKER
     # ==========================================
     @jax.jit
+    def quaternion_to_rotation_matrix(r):
+        w, x, y, z = r[0], r[1], r[2], r[3]
+        return jnp.array([
+            [w*w+x*x-y*y-z*z, 2*(x*y-w*z),     2*(x*z+w*y)],
+            [2*(x*y+w*z),     w*w-x*x+y*y-z*z, 2*(y*z-w*x)],
+            [2*(x*z-w*y),     2*(y*z+w*x),     w*w-x*x-y*y+z*z]
+        ])
+
+    @jax.jit
+    def compute_A_from_C(C):
+        """Map 3x3 Concentration Matrix to 4x4 Bingham Matrix linearly."""
+        trC = jnp.trace(C)
+        z = jnp.array([C[2, 1] - C[1, 2],
+                       C[0, 2] - C[2, 0],
+                       C[1, 0] - C[0, 1]])
+
+        A00 = jnp.array([[trC]])
+        A01 = z[None, :]
+        A10 = z[:, None]
+        A11 = C + C.T - trC * jnp.eye(3)
+
+        return jnp.concatenate([
+            jnp.concatenate([A00, A01], axis=1),
+            jnp.concatenate([A10, A11], axis=1)
+        ], axis=0)
+
+    @jax.jit
     def process_chunk(A_prev, t_prev, q_batch, t_batch, current_sigma_q):
         """
         Batched SDE integration. Processes an entire block of events via vmap.
