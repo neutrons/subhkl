@@ -2382,7 +2382,13 @@ def run_bingham_tracker(
         return A_new, t_curr, U, jnp.mean(nll_batch), eigen_gap
 
     # Wrap the entire SDE step to run over the whole ensemble in parallel!
-    ensemble_process_chunk = jax.jit(jax.vmap(process_chunk, in_axes=(0, None, None, None)))
+    ensemble_process_chunk = jax.jit(
+        jax.vmap(
+            process_chunk,
+            in_axes=(0, None, None, None),
+            out_axes=(0, None, 0, 0, 0)
+        )
+    )
 
     # ==========================================
     # PHASE 3: CONTINUOUS TRACKING LOOP
