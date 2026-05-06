@@ -2155,6 +2155,7 @@ def _process_single_bank(args):
         pixel_r.astype(np.int16),
         pixel_c.astype(np.int16)
     )
+
 def run_bingham_tracker(
     finder_file: str,
     output_h5_filename: str,
@@ -2165,8 +2166,7 @@ def run_bingham_tracker(
     sigma: float = 0.03,           # Width of Bragg peaks in radians
     gamma_diffusion: float = 0.01, # Process Noise / Relaxation Rate (1/s)
     kappa_init: float = 1000.0,    # Confidence in initial U seed
-    window_size_events:int = 25000,
-    step_size_events: int = 10000,
+    batch_size_events: int = 10000 # Number of events processed in parallel per SDE step
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     import h5py
@@ -2307,62 +2307,58 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_carry, t_carry, q_seq, t_seq):
+    def process_chunk(A_prev, t_prev, q_batch, t_batch):
         """
-        Continuous formulation: jax.lax.scan processes events chronologically.
-        The SDE is: dA(t) = -Gamma A(t) dt + 1/sigma^2 A_F dN(t)
+        Batched SDE integration. Processes an entire block of events via vmap.
+        dA(t) = -Gamma A(t) dt + 1/sigma^2 sum(A_F)
         """
-        def scan_fn(carry, event_data):
-            A, t_prev = carry
-            q_exp, t_curr = event_data
-            
-            # 1. Process Noise (Rotational Diffusion over time delta)
-            dt = jnp.maximum(0.0, t_curr - t_prev)
-            A_diffused = A * jnp.exp(-gamma_diffusion * dt)
-            
-            # 2. Extract best orientation (Mode of Bingham distribution)
-            vals, vecs = jnp.linalg.eigh(A_diffused)
-            r = vecs[:, -1] # Eigenvector of largest eigenvalue
-            U = quaternion_to_rotation_matrix(r)
-            
-            # 3. Peak Assignment Probabilities
+        # 1. Time delta for process noise (from end of last batch to end of this batch)
+        t_curr = t_batch[-1]
+        dt = jnp.maximum(0.0, t_curr - t_prev)
+        
+        # 2. Process Noise (Rotational Diffusion over time delta)
+        A_diffused = A_prev * jnp.exp(-gamma_diffusion * dt)
+        
+        # 3. Extract best orientation (Mode of Bingham) to use for the batch
+        vals, vecs = jnp.linalg.eigh(A_diffused)
+        r = vecs[:, -1] # Eigenvector of largest eigenvalue
+        U = quaternion_to_rotation_matrix(r)
+        
+        # 4. Vectorized Peak Assignment and Update Construction
+        def single_event_update(q_exp):
             h_lab = jnp.matmul(U, q_theo_sample_jax)
             cos_theta = jnp.dot(q_exp, h_lab) # (N_peaks,)
             
             I_bragg = jnp.exp((1.0 / sigma**2) * (cos_theta - 1.0))
             
-            # Calculate Total Intensity and Natural Loss (NLL)
-            I_total = beta + jnp.sum(I_bragg)
-            event_nll = -jnp.log(I_total)
+            # Calculate Natural Loss (NLL)
+            event_nll = -jnp.log(beta + jnp.sum(I_bragg))
             
             # Unnormalized weights strictly preserve multiplicative conjugacy
             w = I_bragg 
             
-            # 4. Construct rank-1 scattering signal F
+            # Construct rank-1 scattering signal F
             weighted_h = jnp.sum(w * q_theo_sample_jax, axis=1) # (3,)
             F = jnp.outer(q_exp, weighted_h)
             
-            # 5. Measurement Update 
-            A_F = compute_A_from_C(F)
-            A_new = A_diffused + (1.0 / sigma**2) * A_F
-            
-            # Regularize: prevent eigenvalues from blowing up arbitrarily large
-            A_new = A_new - (jnp.trace(A_new) / 4.0) * jnp.eye(4)
-            
-            return (A_new, t_curr), (U, event_nll)
+            return compute_A_from_C(F), event_nll
 
-        (A_final, t_final), (U_traj, nll_traj) = jax.lax.scan(
-            scan_fn, 
-            (A_carry, t_carry), 
-            (q_seq, t_seq)
-        )
-        return A_final, t_final, U_traj, nll_traj
+        # VMAP across all events in the current block simultaneously
+        A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch)
+        
+        # 5. Integrate Measurement Updates
+        A_new = A_diffused + (1.0 / sigma**2) * jnp.sum(A_F_batch, axis=0)
+        
+        # Regularize: prevent eigenvalues from blowing up arbitrarily large
+        A_new = A_new - (jnp.trace(A_new) / 4.0) * jnp.eye(4)
+        
+        return A_new, t_curr, U, jnp.mean(nll_batch)
 
     # ==========================================
     # PHASE 3: CONTINUOUS TRACKING LOOP
     # ==========================================
     if event_nexus_filename:
-        print(f"\n[3/4] Executing Continuous Bingham Tracking...")
+        print(f"\n[3/4] Executing Continuous Bingham Tracking (Batched, {batch_size_events} events/step)...")
 
         # Initialize State Matrix A
         if U_init is not None:
@@ -2379,40 +2375,40 @@ def run_bingham_tracker(
         all_q_lab_jax = jax.device_put(all_q_lab)
         all_times_jax = jax.device_put(all_times)
 
-        for start_idx in range(0, len(all_q_lab) - window_size_events, step_size_events):
-            end_idx = start_idx + window_size_events
+        # Process as a continuous stream (contiguous chunks, no overlapping windows)
+        for start_idx in range(0, len(all_q_lab), batch_size_events):
+            end_idx = min(start_idx + batch_size_events, len(all_q_lab))
+            if end_idx - start_idx < 100: # Skip tiny tail ends to prevent vmap artifacts
+                break
             
             # Extract sequence data
-            q_seq = all_q_lab_jax[start_idx:end_idx] # (N, 3)
-            q_seq = q_seq / (jnp.linalg.norm(q_seq, axis=1, keepdims=True) + 1e-9)
-            t_seq = all_times_jax[start_idx:end_idx] # (N,)
+            q_batch = all_q_lab_jax[start_idx:end_idx] # (Batch, 3)
+            q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
+            t_batch = all_times_jax[start_idx:end_idx] # (Batch,)
 
-            # Execute chronologically correct, continuous-time JAX scan
-            A_state, t_state, U_traj, nll_traj = process_chunk(A_state, t_state, q_seq, t_seq)
+            # Execute massively parallel chunk integration
+            A_state, t_state, U_current, chunk_mean_loss = process_chunk(A_state, t_state, q_batch, t_batch)
             
-            # Extract the final U matrix for this window segment
-            U_current = np.array(U_traj[-1])
-            chunk_mean_loss = float(jnp.mean(nll_traj))
-            tracking_history.append((float(t_state), U_current))
+            U_current_np = np.array(U_current)
+            chunk_loss_np = float(chunk_mean_loss)
+            tracking_history.append((float(t_state), U_current_np))
             
-            if start_idx % (step_size_events * 5) == 0:
-                print(f"    Time {t_state:.2f}s | State Matrix Trace: {float(jnp.trace(A_state)):.2f} | Mean NLL: {chunk_mean_loss:.4f}")
+            if start_idx % (batch_size_events * 5) == 0:
+                print(f"    Time {t_state:.2f}s | State Matrix Trace: {float(jnp.trace(A_state)):.2f} | Mean NLL: {chunk_loss_np:.4f}")
 
             # TRIGGER CALLBACK
             if streaming_callback is not None:
-                new_start = 0 if start_idx == 0 else end_idx - step_size_events
-                
                 new_events = {
-                    "banks": all_banks[new_start:end_idx],
-                    "pixel_r": all_pixels_r[new_start:end_idx],
-                    "pixel_c": all_pixels_c[new_start:end_idx]
+                    "banks": all_banks[start_idx:end_idx],
+                    "pixel_r": all_pixels_r[start_idx:end_idx],
+                    "pixel_c": all_pixels_c[start_idx:end_idx]
                 }
                 
                 streaming_callback(
                     time=float(t_state),
-                    U_preds=np.array([U_current]), # Packaged as list to match legacy API
-                    losses=np.array([chunk_mean_loss]), 
-                    mean_loss=chunk_mean_loss,
+                    U_preds=np.array([U_current_np]), # Packaged as list to match legacy API
+                    losses=np.array([chunk_loss_np]), 
+                    mean_loss=chunk_loss_np,
                     best_idx=0, 
                     neutron_count=end_idx,
                     new_events=new_events
