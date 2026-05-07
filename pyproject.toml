@@ -18,7 +18,7 @@ dependencies = [
     "optax",
     "jraph",
     "e3nn-jax",
-    "ott-jax",
+    "tensorflow-probability[jax]",
 ]
 
 license = { text = "GPL3.0" }
