@@ -146,7 +146,7 @@ class TestBinghamTracker(unittest.TestCase):
             f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
             f["sample/U"] = U_seed
 
-        sim_data = self.generate_poissonian_events(U_true, num_events=200000, duration=5.0)
+        sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0)
         
         mock_executor_instance = mock_executor_class.return_value
         mock_executor_instance.__enter__.return_value.map.return_value = [sim_data]
