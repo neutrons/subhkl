@@ -7,7 +7,7 @@ import itertools
 from unittest.mock import patch
 from scipy.spatial.transform import Rotation
 
-from subhkl.bingham_tracker import run_bingham_tracker
+from subhkl.commands import run_bingham_tracker
 
 def get_cubic_symmetries():
     """Generates the 24 valid rotation matrices for a Cubic point group."""
