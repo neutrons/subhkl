@@ -2156,26 +2156,26 @@ def _process_single_bank(args):
         pixel_c.astype(np.int16)
     )
 
-def run_spectral_tracker(
+def run_bingham_tracker(
     finder_file: str,
     output_h5_filename: str,
     instrument_name: str | None = None,
     event_nexus_filename: str | None = None,
     streaming_callback = None,
-    sigma_q: float = 0.05,         # Physical Width of Bragg peaks in reciprocal space (A^-1)
-    lambda_alpha: float = 0.5,     # Exponential Prior Rate (strength of forward-scattering preference)
-    gamma_diffusion: float = 0.001,# Process Noise / Rotational Relaxation Rate (1/s)
-    l_max: int = 4,                # Maximum Angular Momentum Resolution for the Spectral Filter
-    batch_size_events: int = 10000 # Number of events processed per chunk
+    sigma_q_start: float = 1.0,
+    sigma_q_min: float = 0.05,
+    annealing_rate: float = 0.5,   # Live physical annealing decay rate (1/s)
+    lambda_alpha: float = 0.5,
+    gamma_diffusion: float = 1.0,  # EWMA Learning Rate / Relaxation Window (1/s)
+    kappa_init: float = 100.0,     # Initial Seed Confidence
+    batch_size_events: int = 10000,
+    n_ensemble: int = 1
 ):
     from subhkl.optimization import FindUB, get_lattice_system
     import h5py
     import numpy as np
     import jax
     import jax.numpy as jnp
-    import jax.scipy.special as jsp
-    import e3nn_jax as e3nn
-    import tensorflow_probability.substrates.jax as tfp
 
     print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
 
@@ -2196,7 +2196,7 @@ def run_spectral_tracker(
 
         if "sample/U" in f:
             U_init = f["sample/U"][()]
-            print("  > Discovered seed U matrix. Will initialize L=1 spectral expectation.")
+            print("  > Discovered seed U matrix in finder file. Will initialize Bingham Prior.")
 
     B_mat = ub_helper.reciprocal_lattice_B()
     _, _, centering = get_lattice_system(
@@ -2212,7 +2212,7 @@ def run_spectral_tracker(
     elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
     else: M_prim = jnp.eye(3)
 
-    print(f"  > Pre-computing Forward-Mapping HKL Grid (Spectral Resolution L_max={l_max})...")
+    print("  > Pre-computing Forward-Mapping HKL Grid for Continuous Tracking...")
     h_max = 6
     h_vals = np.arange(-h_max, h_max + 1)
     hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
@@ -2241,19 +2241,12 @@ def run_spectral_tracker(
 
     ki_vec_jax = jnp.array(ub_helper.ki_vec)
     ki_vec_jax = ki_vec_jax / (jnp.linalg.norm(ki_vec_jax) + 1e-9)
+    print(f"  > Generated {q_theo_sample_jax.shape[1]} valid theoretical Bragg directions.")
 
-    # Pre-compute Theoretical Spherical Harmonics for the crystal grid!
-    # This saves evaluating them 10,000 times inside the event loop.
-    print("  > Pre-computing Theoretical Spherical Harmonics (Y_q)...")
-    Y_q_precomputed = []
-    for l in range(l_max + 1):
-        irreps_l = e3nn.Irreps(f"{l}e")
-        Y_q_l = e3nn.spherical_harmonics(irreps_l, q_theo_sample_jax.T, normalize=True).array
-        Y_q_precomputed.append(Y_q_l)
-    Y_q_precomputed = tuple(Y_q_precomputed)
-
-    # e3nn coordinate mapping P_mat: (x,y,z) -> (y,z,x)
-    P_mat = jnp.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
+    lambda_max_jax = 4.0 * jnp.pi / (q_mags_jax + 1e-9)
+    alpha_safe = jnp.maximum(lambda_alpha, 1e-6)
+    Z_j_jax = (2.0 / alpha_safe) * jnp.sinh(alpha_safe * lambda_max_jax)
+    log_Z_j_jax = jnp.log(Z_j_jax + 1e-12)
 
     if event_nexus_filename:
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
@@ -2290,122 +2283,115 @@ def run_spectral_tracker(
         all_pixels_r = all_pixels_r[sort_idx]
         all_pixels_c = all_pixels_c[sort_idx]
 
-    # ==========================================
-    # CORE JAX FUNCTIONS FOR SPECTRAL FILTERING
-    # ==========================================
-
-    # Precompute Clebsch-Gordan coefficients for the tensor contraction
-    CG_DICT = {}
-    for l1 in range(l_max + 1):
-        for l2 in range(l_max + 1):
-            for l in range(l_max + 1):
-                if abs(l1 - l2) <= l <= l1 + l2:
-                    CG_DICT[(l1, l2, l)] = e3nn.clebsch_gordan(l1, l2, l)
-
-    def multiply_so3_wigner(C, M):
-        """Convolves prior C with measurement M using Clebsch-Gordan tensor products."""
-        C_new = []
-        for l in range(l_max + 1):
-            C_l_new = jnp.zeros((2*l+1, 2*l+1))
-            for l1 in range(l_max + 1):
-                for l2 in range(l_max + 1):
-                    if abs(l1 - l2) <= l <= l1 + l2:
-                        cg = CG_DICT[(l1, l2, l)]
-                        term = jnp.einsum('ik, jl, ijm, kln -> mn', C[l1], M[l2], cg, cg)
-                        C_l_new += term
-            C_new.append(C_l_new)
-        return tuple(C_new)
-
-    def diffuse_so3(C, dt):
-        """Applies exact diagonalized rotational diffusion on the manifold."""
-        C_diff = []
-        for l in range(l_max + 1):
-            decay = jnp.exp(-gamma_diffusion * l * (l + 1) * dt)
-            C_diff.append(C[l] * decay)
-        return tuple(C_diff)
-
-    def get_measurement_M(q_exp):
-        """Executes the Gridless Rank-1 Miracle to generate Wigner coefficients M."""
-        kappa = (q_mags_jax ** 2) / (sigma_q ** 2)
-        P_val = lambda_alpha * 4.0 * jnp.pi / (q_mags_jax + 1e-9)
-
-        # Exact Rank-1 vector construction
-        v_exp = kappa[:, None] * q_exp[None, :] - P_val[:, None] * ki_vec_jax[None, :]
-        eta = jnp.linalg.norm(v_exp, axis=1) + 1e-12
-        v_exp_hat = v_exp / eta[:, None]
-
-        # Stable Log-likelihood derivation preventing overflow
-        log_Z = P_val - jnp.log(lambda_alpha) + jnp.log(1.0 - jnp.exp(-2.0 * P_val) + 1e-12)
-        E = -kappa - log_Z + eta
-
-        M = []
-        for l in range(l_max + 1):
-            # Analytically lift using Modified Spherical Bessel
-            bessel_ive = tfp.math.bessel_ive(l + 0.5, eta)
-            w_bessel = jnp.sqrt(jnp.pi / (2.0 * eta)) * bessel_ive
-
-            # e3nn spherical harmonics natively subsume the 4pi factor
-            W = w_bessel * jnp.exp(E)
-
-            irreps_l = e3nn.Irreps(f"{l}e")
-            Y_v = e3nn.spherical_harmonics(irreps_l, v_exp_hat, normalize=True).array
-
-            # Fetch globally pre-computed theoretical spherical harmonics
-            Y_q = Y_q_precomputed[l]
-
-            M_l = jnp.einsum('j, jm, jn -> mn', W, Y_v, Y_q)
-            M.append(M_l)
-
-        return tuple(M)
+    @jax.jit
+    def quaternion_to_rotation_matrix(r):
+        w, x, y, z = r[0], r[1], r[2], r[3]
+        return jnp.array([
+            [w*w+x*x-y*y-z*z, 2*(x*y-w*z),     2*(x*z+w*y)],
+            [2*(x*y+w*z),     w*w-x*x+y*y-z*z, 2*(y*z-w*x)],
+            [2*(x*z-w*y),     2*(y*z+w*x),     w*w-x*x-y*y+z*z]
+        ])
 
     @jax.jit
-    def process_chunk(C_prev, t_prev, q_batch, t_batch):
-        """Processes a chunk of neutrons chronologically via JAX scan."""
+    def compute_A_from_C(C):
+        trC = jnp.trace(C)
+        z = jnp.array([C[2, 1] - C[1, 2],
+                       C[0, 2] - C[2, 0],
+                       C[1, 0] - C[0, 1]])
 
-        # MASSIVELY PARALLEL PRE-COMPUTATION
-        # Hoist the heavy math (Bessels & Spherical Harmonics) completely out of the sequential scan!
-        M_batch = jax.vmap(get_measurement_M)(q_batch)
+        A00 = jnp.array([[trC]])
+        A01 = z[None, :]
+        A10 = z[:, None]
+        A11 = C + C.T - trC * jnp.eye(3)
 
-        def scan_body(carry, event_data):
-            C_curr, t_curr = carry
-            M_evt, t_evt = event_data
-            dt = jnp.maximum(0.0, t_evt - t_curr)
+        return jnp.concatenate([
+            jnp.concatenate([A00, A01], axis=1),
+            jnp.concatenate([A10, A11], axis=1)
+        ], axis=0)
 
-            # 1. Diffuse density over physical elapsed time
-            C_diff = diffuse_so3(C_curr, dt)
+    @jax.jit
+    def process_chunk(A_prev, t_prev, q_batch, t_batch, current_sigma_q):
+        t_curr = t_batch[-1]
+        dt = jnp.maximum(0.0, t_curr - t_prev)
 
-            # 2. Exact Bayesian Update via Tensor Contraction (M_evt is already computed!)
-            C_new = multiply_so3_wigner(C_diff, M_evt)
+        # Exponentially Weighted Moving Average (EWMA) Decay
+        decay = jnp.exp(-gamma_diffusion * dt)
+        A_diffused = A_prev * decay
 
-            # 3. Enforce Mass Conservation (C^0_00 = 1)
-            norm = C_new[0][0, 0] + 1e-12
-            C_norm = tuple(c / norm for c in C_new)
+        vals, vecs = jnp.linalg.eigh(A_prev)
+        r = vecs[:, -1]
+        U = quaternion_to_rotation_matrix(r)
 
-            # The Marginal Event NLL is identically extracted from M^0_00!
-            event_nll = -jnp.log(M_evt[0][0, 0] + 1e-12)
+        def single_event_update(q_exp):
+            h_lab = jnp.matmul(U, q_theo_sample_jax)
+            cos_theta_err = jnp.dot(q_exp, h_lab)
 
-            return (C_norm, t_evt), event_nll
+            q_dot_ki_theo = jnp.dot(ki_vec_jax, h_lab)
+            lambda_j = -(4.0 * jnp.pi / (q_mags_jax + 1e-9)) * q_dot_ki_theo
 
-        (C_final, t_final), nlls = jax.lax.scan(scan_body, (C_prev, t_prev), (M_batch, t_batch))
-        return C_final, t_final, jnp.mean(nlls)
+            log_prior = lambda_alpha * lambda_j - log_Z_j_jax
+            kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
+            peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_prior
 
-    # ==========================================
-    # PHASE 3: CONTINUOUS TRACKING LOOP
-    # ==========================================
+            bg_log_lik = jnp.array([-5.0])
+            log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, bg_log_lik))
+            w = jnp.exp(peak_log_lik - log_Z)
+
+            weighted_h_geom = jnp.sum((w * kappa_j) * q_theo_sample_jax, axis=1)
+            F_geom = jnp.outer(q_exp, weighted_h_geom)
+
+            prior_scalar = lambda_alpha * (4.0 * jnp.pi / (q_mags_jax + 1e-9))
+            weighted_h_prior = jnp.sum((w * prior_scalar) * q_theo_sample_jax, axis=1)
+            F_prior = -jnp.outer(ki_vec_jax, weighted_h_prior)
+
+            F_total = F_geom + F_prior
+
+            event_nll = -log_Z
+            return compute_A_from_C(F_total), event_nll
+
+        A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch)
+
+        # Calculate the EXPECTED sufficient statistic matrix per event
+        F_mean = jnp.mean(A_F_batch, axis=0)
+        F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
+
+        # True Stationary Fokker-Planck Equilibrium Balance
+        # Incorporating the physical neutron hit rate (dN/dt)
+        neutron_rate = q_batch.shape[0] / (dt + 1e-9)
+        steady_state_scale = neutron_rate / jnp.maximum(gamma_diffusion, 1e-6)
+
+        A_new = A_diffused + F_mean * steady_state_scale * (1.0 - decay)
+
+        vals_new = jnp.linalg.eigvalsh(A_new)
+        gap_new = vals_new[-1] - vals_new[-2]
+
+        # Normalizing the gap relative to its dynamic equilibrium scale
+        norm_gap = gap_new / jnp.maximum(steady_state_scale, 1e-9)
+
+        return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap
+
+    ensemble_process_chunk = jax.jit(
+        jax.vmap(
+            process_chunk,
+            in_axes=(0, None, None, None, None),
+            out_axes=(0, None, 0, 0, 0)
+        )
+    )
+
     if event_nexus_filename:
-        print(f"\n[3/4] Executing Fokker-Planck Spectral Tracking...")
+        print(f"\n[3/4] Executing Ensemble Bingham Tracking ({n_ensemble} simultaneous trackers)...")
 
-        # Initialize State Tensor C (l_max arrays)
-        C_state = [jnp.zeros((2*l+1, 2*l+1)) for l in range(l_max + 1)]
-        C_state[0] = jnp.array([[1.0]])
+        rng = jax.random.PRNGKey(42)
+        r_random = jax.random.normal(rng, (n_ensemble, 4))
+        r_random = r_random / jnp.linalg.norm(r_random, axis=1, keepdims=True)
+        U_ensemble = jax.vmap(quaternion_to_rotation_matrix)(r_random)
 
-        # If seed U is provided, directly initialize the L=1 tracking expectation!
+        C_ensemble = kappa_init * U_ensemble
+        A_ensemble_state = jax.vmap(compute_A_from_C)(C_ensemble)
+
         if U_init is not None:
-            # P_mat handles e3nn Cartesian conventions
-            U_mapped = P_mat @ jnp.array(U_init) @ P_mat.T
-            C_state[1] = 0.99 * U_mapped # 0.99 grants sharp inertia while preventing boundary instability
-
-        C_state = tuple(C_state)
+            A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
+            A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
 
         t_state = all_times[0] if len(all_times) > 0 else 0.0
         tracking_history = []
@@ -2417,25 +2403,31 @@ def run_spectral_tracker(
 
         for start_idx in range(0, total_events, batch_size_events):
             end_idx = min(start_idx + batch_size_events, total_events)
+            if end_idx - start_idx < 100:
+                break
+
+            # True Live Streaming Annealing: Decays exponentially with physical time!
+            current_sigma_q = max(sigma_q_min, sigma_q_start * np.exp(-annealing_rate * t_state))
 
             q_batch = all_q_lab_jax[start_idx:end_idx]
             q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
             t_batch = all_times_jax[start_idx:end_idx]
 
-            C_state, t_state, mean_loss = process_chunk(C_state, t_state, q_batch, t_batch)
+            A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps = ensemble_process_chunk(
+                A_ensemble_state, t_state, q_batch, t_batch, current_sigma_q
+            )
 
-            # Extract U_best strictly from the L=1 Expecation Value using Orthogonal SVD
-            C1_xyz = P_mat.T @ C_state[1] @ P_mat
-            U_svd, _, Vh_svd = jnp.linalg.svd(C1_xyz)
-            # Guarantee Right-Handed Coordinate Rotation (Det = +1)
-            U_best = U_svd @ jnp.diag(jnp.array([1.0, 1.0, jnp.linalg.det(U_svd @ Vh_svd)])) @ Vh_svd
+            # Pick the tracker that best explains the data (Lowest Negative Log-Likelihood)
+            best_idx = int(jnp.argmin(loss_ensemble))
 
-            U_best_np = np.array(U_best)
-            mean_loss_np = float(mean_loss)
-            tracking_history.append((float(t_state), U_best_np))
+            U_best = np.array(U_ensemble_curr[best_idx])
+            best_gap = float(eigen_gaps[best_idx])
+            best_loss = float(loss_ensemble[best_idx])
 
-            if start_idx % (batch_size_events * 2) == 0:
-                print(f"    Time {t_state:.2f}s | Mean NLL: {mean_loss_np:.4f}")
+            tracking_history.append((float(t_state), U_best))
+
+            if start_idx % (batch_size_events * 5) == 0:
+                print(f"    Time {t_state:.2f}s | Sigma_Q: {current_sigma_q:.3f} | Best Tracker: {best_idx:03d} | Norm-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
 
             if streaming_callback is not None:
                 new_events = {
@@ -2446,12 +2438,13 @@ def run_spectral_tracker(
 
                 streaming_callback(
                     time=float(t_state),
-                    U_preds=np.array([U_best_np]),
-                    losses=np.array([mean_loss_np]),
-                    mean_loss=mean_loss_np,
+                    U_preds=np.array([U_best]),
+                    losses=np.array([best_loss]),
+                    mean_loss=best_loss,
                     best_idx=0,
                     neutron_count=end_idx,
-                    new_events=new_events
+                    new_events=new_events,
+                    eigengap=best_gap  # Passes the normalized gap out to the tester/UI correctly
                 )
 
         print(f"\n[4/4] Global Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
