@@ -2242,6 +2242,16 @@ def run_spectral_tracker(
     ki_vec_jax = jnp.array(ub_helper.ki_vec)
     ki_vec_jax = ki_vec_jax / (jnp.linalg.norm(ki_vec_jax) + 1e-9)
 
+    # Pre-compute Theoretical Spherical Harmonics for the crystal grid!
+    # This saves evaluating them 10,000 times inside the event loop.
+    print("  > Pre-computing Theoretical Spherical Harmonics (Y_q)...")
+    Y_q_precomputed = []
+    for l in range(l_max + 1):
+        irreps_l = e3nn.Irreps(f"{l}e")
+        Y_q_l = e3nn.spherical_harmonics(irreps_l, q_theo_sample_jax.T, normalize=True).array
+        Y_q_precomputed.append(Y_q_l)
+    Y_q_precomputed = tuple(Y_q_precomputed)
+
     # e3nn coordinate mapping P_mat: (x,y,z) -> (y,z,x)
     P_mat = jnp.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]])
 
@@ -2339,7 +2349,9 @@ def run_spectral_tracker(
 
             irreps_l = e3nn.Irreps(f"{l}e")
             Y_v = e3nn.spherical_harmonics(irreps_l, v_exp_hat, normalize=True).array
-            Y_q = e3nn.spherical_harmonics(irreps_l, q_theo_sample_jax.T, normalize=True).array
+
+            # Fetch globally pre-computed theoretical spherical harmonics
+            Y_q = Y_q_precomputed[l]
 
             M_l = jnp.einsum('j, jm, jn -> mn', W, Y_v, Y_q)
             M.append(M_l)
@@ -2349,30 +2361,32 @@ def run_spectral_tracker(
     @jax.jit
     def process_chunk(C_prev, t_prev, q_batch, t_batch):
         """Processes a chunk of neutrons chronologically via JAX scan."""
+
+        # MASSIVELY PARALLEL PRE-COMPUTATION
+        # Hoist the heavy math (Bessels & Spherical Harmonics) completely out of the sequential scan!
+        M_batch = jax.vmap(get_measurement_M)(q_batch)
+
         def scan_body(carry, event_data):
             C_curr, t_curr = carry
-            q_exp, t_evt = event_data
+            M_evt, t_evt = event_data
             dt = jnp.maximum(0.0, t_evt - t_curr)
 
             # 1. Diffuse density over physical elapsed time
             C_diff = diffuse_so3(C_curr, dt)
 
-            # 2. Get Gridless Measurement M
-            M = get_measurement_M(q_exp)
+            # 2. Exact Bayesian Update via Tensor Contraction (M_evt is already computed!)
+            C_new = multiply_so3_wigner(C_diff, M_evt)
 
-            # 3. Exact Bayesian Update via Tensor Contraction
-            C_new = multiply_so3_wigner(C_diff, M)
-
-            # 4. Enforce Mass Conservation (C^0_00 = 1)
+            # 3. Enforce Mass Conservation (C^0_00 = 1)
             norm = C_new[0][0, 0] + 1e-12
             C_norm = tuple(c / norm for c in C_new)
 
             # The Marginal Event NLL is identically extracted from M^0_00!
-            event_nll = -jnp.log(M[0][0, 0] + 1e-12)
+            event_nll = -jnp.log(M_evt[0][0, 0] + 1e-12)
 
             return (C_norm, t_evt), event_nll
 
-        (C_final, t_final), nlls = jax.lax.scan(scan_body, (C_prev, t_prev), (q_batch, t_batch))
+        (C_final, t_final), nlls = jax.lax.scan(scan_body, (C_prev, t_prev), (M_batch, t_batch))
         return C_final, t_final, jnp.mean(nlls)
 
     # ==========================================
