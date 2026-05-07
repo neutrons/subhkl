@@ -105,7 +105,7 @@ class TestBinghamTracker(unittest.TestCase):
             f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
             f["sample/U"] = U_seed
 
-        sim_data = self.generate_poissonian_events(U_true, num_events=200000, duration=5.0)
+        sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0)
         
         mock_executor_instance = mock_executor_class.return_value
         mock_executor_instance.__enter__.return_value.map.return_value = [sim_data]
@@ -134,7 +134,7 @@ class TestBinghamTracker(unittest.TestCase):
 
     @patch('concurrent.futures.ProcessPoolExecutor')
     def test_global_aliasing(self, mock_executor_class):
-        print(f"\n{'='*60}\nExecuting Regression: GLOBAL ALIASING (Seed Err: 30.0°, Ens: 128)\n{'='*60}")
+        print(f"\n{'='*60}\nExecuting Regression: GLOBAL ALIASING (Seed Err: 30.0°, Ens: 256)\n{'='*60}")
         
         U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
         U_seed = Rotation.from_euler('y', 15.0, degrees=True).as_matrix()
@@ -166,7 +166,7 @@ class TestBinghamTracker(unittest.TestCase):
             gamma_diffusion=1.0,
             kappa_init=100.0,
             batch_size_events=10000, 
-            n_ensemble=128, 
+            n_ensemble=256, 
             streaming_callback=streaming_callback
         )
         
