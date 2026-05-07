@@ -1898,7 +1898,7 @@ def run_egnn(
         # Shape: (1024, N)
         dists = jnp.sum((U_swarm[:, None, :, :] - centers[None, :, :, :])**2, axis=(-2, -1))
         
-        # THE FIX: Softmax over particles (axis=0), heavily punishing distance and loss
+        # Softmax over particles (axis=0), heavily punishing distance and loss
         logits = -dists / tau_dist - gamma * losses[:, None]
         weights = jax.nn.softmax(logits, axis=0)
         
@@ -2339,7 +2339,7 @@ def run_spectral_tracker(
 
             irreps_l = e3nn.Irreps(f"{l}e")
             Y_v = e3nn.spherical_harmonics(irreps_l, v_exp_hat, normalize=True).array
-            Y_q = e3nn.spherical_harmonics(irreps_l, q_theo_sample_jax, normalize=True).array
+            Y_q = e3nn.spherical_harmonics(irreps_l, q_theo_sample_jax.T, normalize=True).array
 
             M_l = jnp.einsum('j, jm, jn -> mn', W, Y_v, Y_q)
             M.append(M_l)
