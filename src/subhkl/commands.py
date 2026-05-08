@@ -2238,11 +2238,13 @@ def run_bingham_tracker(
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
         bg_log_lik_scalar = expected_noise_ll
 
-        def single_event_update(q_exp):
-            h_lab = jnp.matmul(U, q_theo_sample_jax)
-            cos_theta_err = jnp.dot(q_exp, h_lab)
+        def single_event_update(q_exp, ki_exp):
+            # U maps Crystal to Sample
+            h_sample = jnp.matmul(U, q_theo_sample_jax)
+            cos_theta_err = jnp.dot(q_exp, h_sample)
 
-            q_dot_ki_theo = jnp.dot(ki_vec_jax, h_lab)
+            # Prior uses instantaneous beam angle in the sample frame!
+            q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
             lambda_j = -(4.0 * jnp.pi / (q_mags_jax + 1e-9)) * q_dot_ki_theo
 
             log_prior = lambda_alpha * lambda_j - log_Z_j_jax
@@ -2257,14 +2259,15 @@ def run_bingham_tracker(
 
             prior_scalar = lambda_alpha * (4.0 * jnp.pi / (q_mags_jax + 1e-9))
             weighted_h_prior = jnp.sum((w * prior_scalar) * q_theo_sample_jax, axis=1)
-            F_prior = -jnp.outer(ki_vec_jax, weighted_h_prior)
+
+            # Prior forcing uses the instantaneous beam
+            F_prior = -jnp.outer(ki_exp, weighted_h_prior)
 
             F_total = F_geom + F_prior
             event_nll = -log_Z
-            
             return compute_A_from_C(F_total), event_nll
 
-        A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch)
+        A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
 
         F_mean = jnp.mean(A_F_batch, axis=0)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
@@ -2283,7 +2286,7 @@ def run_bingham_tracker(
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, None, None, None, None),
+            in_axes=(0, None, 0, 0, None, None), # Note the two 0's for q_batch and ki_batch!
             out_axes=(0, None, 0, 0, 0)
         )
     )
@@ -2309,8 +2312,10 @@ def run_bingham_tracker(
     # ==============================================================
     # --- NEW: BATCH CONSUMPTION LOOP ---
     # ==============================================================
+    # In your batch consumption loop:
     for batch_data in event_batches:
-        q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, cumulative_count = batch_data
+        # Unpack the new ki_sample array
+        q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
         
         if t_start is None and len(t_batch_np) > 0:
             t_state = t_batch_np[0]
@@ -2323,8 +2328,12 @@ def run_bingham_tracker(
         q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
         t_batch = jax.device_put(t_batch_np)
 
+        ki_batch = jax.device_put(ki_sample_np)
+        ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
+
+        # Pass it to the engine
         A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps = ensemble_process_chunk(
-            A_ensemble_state, t_state, q_batch, t_batch, current_sigma_q
+            A_ensemble_state, t_state, q_batch, ki_batch, t_batch, current_sigma_q
         )
 
         best_idx = int(jnp.argmin(loss_ensemble))

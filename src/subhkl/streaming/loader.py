@@ -64,6 +64,9 @@ def _process_single_bank(args):
         from scipy.spatial.transform import Rotation
         s_lab_dynamic = np.zeros((num_events, 3), dtype=np.float32)
         
+        # Track the accumulated rotation matrix for the sample frame
+        R_total = Rotation.identity(num_events)
+        
         for i in range(len(gonio_axes) - 1, -1, -1):
             axis = gonio_axes[i][:3]
             direction_mult = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
@@ -72,19 +75,21 @@ def _process_single_bank(args):
             if axis_norm > 0:
                 axis = axis / axis_norm
                 
-            # Apply the zero-point offset to the interpolated angle
             axis_offset = gonio_offsets[i] if gonio_offsets is not None else 0.0
             theta_rad = np.radians((interpolated_angles[i, :] + axis_offset) * direction_mult)
             
             rotvecs = theta_rad[:, None] * axis[None, :]
-            
             R_i = Rotation.from_rotvec(rotvecs)
+            
+            # Accumulate the rotation: R_total = R_i * R_total
+            R_total = R_i * R_total
+            
             s_lab_dynamic = R_i.apply(s_lab_dynamic)
             
             if gonio_translations is not None:
                 s_lab_dynamic += gonio_translations[i][:3]
                 
-        kf = xyz - s_lab_dynamic
+        kf_lab = xyz - s_lab_dynamic
     else:
         interpolated_angles = np.zeros((num_axes, num_events), dtype=np.float32)
         s_lab_static = gonio_translations[-1][:3] if gonio_translations is not None else np.zeros(3)
@@ -95,16 +100,26 @@ def _process_single_bank(args):
     kf /= np.where(kf_norm == 0, 1.0, kf_norm)
 
     q_lab = kf - ki_vec[None, :]
+
+    if gonio_axes is not None:
+        R_inv = R_total.inv()
+        q_sample = R_inv.apply(q_lab)
+        ki_sample = R_inv.apply(np.tile(ki_vec, (num_events, 1)))
+    else:
+        q_sample = q_lab
+        ki_sample = np.tile(ki_vec, (num_events, 1))
+
     banks = np.full(num_events, bank_id, dtype=np.int16)
 
     return (
-        q_lab.astype(np.float32),
+        q_sample.astype(np.float32),
         absolute_time,
         banks,
         pixel_r.astype(np.int16),
         pixel_c.astype(np.int16),
-        interpolated_angles.T.astype(np.float32),  # Transpose to (N_events, N_axes)
-        s_lab_dynamic                              # Shape (N_events, 3)
+        interpolated_angles.T.astype(np.float32),
+        s_lab_dynamic,
+        ki_sample.astype(np.float32)
     )
 
 class EventStreamLoader:
@@ -171,13 +186,14 @@ class EventStreamLoader:
         ]
 
         all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
-        all_angles, all_slab = [], [] # <-- NEW
+        all_angles, all_slab = [], []
+        all_ki_sample = []
         
         print(f"  > Extracting and projecting {len(keys)} detector banks via Multiprocessing...")
         with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
             for result in executor.map(_process_single_bank, args_list):
                 if result is not None:
-                    q, t, b, pr, pc, ang, slab = result
+                    q, t, b, pr, pc, ang, slab, ki_s = result
                     all_q_lab.append(q)
                     all_times.append(t)
                     all_banks.append(b)
@@ -185,6 +201,7 @@ class EventStreamLoader:
                     all_pixels_c.append(pc)
                     all_angles.append(ang)
                     all_slab.append(slab)
+                    all_ki_sample.append(ki_s)
 
         if not all_q_lab:
             self.total_events = 0
@@ -197,6 +214,7 @@ class EventStreamLoader:
         all_pixels_c = np.concatenate(all_pixels_c)
         all_angles = np.vstack(all_angles)
         all_slab = np.vstack(all_slab)
+        all_ki_sample = np.vstack(all_ki_sample)
 
         print("  > Performing global chronological sort...")
         sort_idx = np.argsort(all_times)
@@ -206,8 +224,9 @@ class EventStreamLoader:
         self.all_banks = all_banks[sort_idx]
         self.all_pixels_r = all_pixels_r[sort_idx]
         self.all_pixels_c = all_pixels_c[sort_idx]
-        self.all_angles = all_angles[sort_idx] # <-- SORT
-        self.all_slab = all_slab[sort_idx]     # <-- SORT
+        self.all_angles = all_angles[sort_idx]
+        self.all_slab = all_slab[sort_idx]
+        self.all_ki_sample = all_ki_sample[sort_idx]
 
         self.total_events = len(self.all_q_lab)
         print(f"  > EventStreamLoader Ready. Cached {self.total_events:,} events.")
@@ -229,5 +248,6 @@ class EventStreamLoader:
                 self.all_pixels_c[start_idx:end_idx],
                 self.all_angles[start_idx:end_idx],
                 self.all_slab[start_idx:end_idx],
+                self.all_ki_sample[start_idx:end_idx],
                 end_idx
             )
