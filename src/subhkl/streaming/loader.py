@@ -47,6 +47,8 @@ def _process_single_bank(args):
         pixel_r = local_id // det.m
 
     xyz = det.pixel_to_lab(pixel_r, pixel_c)
+    num_events = len(absolute_time)
+    num_axes = len(gonio_axes) if gonio_axes is not None else 1
 
     if gonio_axes is not None and gonio_continuous_logs is not None:
         interpolated_angles = np.zeros((num_axes, num_events), dtype=np.float32)
