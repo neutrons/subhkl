@@ -9,7 +9,7 @@ from subhkl.config import beamlines, reduction_settings
 
 def _process_single_bank(args):
     """Parallel worker to parse and project a single detector bank."""
-    nexus_filename, key, instrument_name, ki_vec, gonio_axes, gonio_continuous_logs, gonio_translations = args
+    nexus_filename, key, instrument_name, ki_vec, gonio_axes, gonio_continuous_logs, gonio_translations, gonio_offsets = args
 
     with h5py.File(nexus_filename, 'r') as f:
         match = re.match(r"bank(\d+)_events", key)
@@ -177,7 +177,7 @@ class EventStreamLoader:
         with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
             for result in executor.map(_process_single_bank, args_list):
                 if result is not None:
-                    q, t, b, pr, pc, ang, slab = result # <-- UNPACK
+                    q, t, b, pr, pc, ang, slab = result
                     all_q_lab.append(q)
                     all_times.append(t)
                     all_banks.append(b)
