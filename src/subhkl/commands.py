@@ -2260,7 +2260,6 @@ def run_bingham_tracker(
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
         import multiprocessing
         import concurrent.futures
-        from subhkl.integration.worker import _process_single_bank
 
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
