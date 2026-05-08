@@ -2098,8 +2098,9 @@ def _process_single_bank(args):
     import h5py, numpy as np, re
     from subhkl.instrument.detector import Detector
     from subhkl.config import beamlines, reduction_settings
+    from subhkl.instrument.goniometer import sample_to_lab
 
-    nexus_filename, key, instrument_name, sample_offset, ki_vec = args
+    nexus_filename, key, instrument_name, ki_vec, gonio_axes, gonio_angles, gonio_times, gonio_translations = args
 
     with h5py.File(nexus_filename, 'r') as f:
         match = re.match(r"bank(\d+)_events", key)
@@ -2136,9 +2137,31 @@ def _process_single_bank(args):
         pixel_c = local_id % det.m
         pixel_r = local_id // det.m
 
-    # Fast Geometry Projection
+    # dynamic continous geometry projection
     xyz = det.pixel_to_lab(pixel_r, pixel_c)
-    kf = xyz - sample_offset[None, :]
+
+    if gonio_axes is not None and gonio_angles is not None and gonio_times is not None:
+        # 1. Interpolate angles for every event time
+        # gonio_angles shape: (N_axes, N_timepoints)
+        num_events = len(absolute_time)
+        interpolated_angles = np.zeros((len(gonio_axes), num_events))
+
+        for i in range(len(gonio_axes)):
+            # Linearly interpolate the angles using the absolute timestamps
+            interpolated_angles[i, :] = np.interp(absolute_time, gonio_times, gonio_angles[i, :])
+
+        # 2. Vectorized kinematics computation
+        s_lab_dynamic = sample_to_lab(
+            np.zeros((num_events, 3)),
+            gonio_axes,
+            interpolated_angles,
+            gonio_translations
+        )
+        kf = xyz - s_lab_dynamic
+    else:
+        # Legacy fallback
+        s_lab_static = gonio_translations[-1] if gonio_translations is not None else np.zeros(3)
+        kf = xyz - s_lab_static[None, :]
 
     # Vectorized Norm
     kf_norm = np.sqrt(np.sum(kf**2, axis=1, keepdims=True))
@@ -2147,7 +2170,6 @@ def _process_single_bank(args):
     q_lab = kf - ki_vec[None, :]
     banks = np.full(len(absolute_time), bank_id, dtype=np.int16)
 
-    # Cast arrays to smaller memory footprints for massive global sorting!
     return (
         q_lab.astype(np.float32),
         absolute_time,
@@ -2192,8 +2214,21 @@ def run_bingham_tracker(
         ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
         ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
 
-        ub_helper.sample_offset = f["sample/offset"][()] if "sample/offset" in f else np.zeros(3)
         ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
+
+        # We need the full rotation array and timelines if they exist
+        gonio_axes = f["goniometer/axes"][()] if "goniometer/axes" in f else None
+        gonio_angles = f["goniometer/angles"][()] if "goniometer/angles" in f else None
+
+        # Load translations, ensuring it's a 2D array matching the axes
+        raw_trans = f["goniometer/translations"][()] if "goniometer/translations" in f else np.zeros(3)
+        if raw_trans.ndim == 1:
+            num_axes = len(gonio_axes) if gonio_axes is not None else 1
+            ub_helper.sample_offset = np.zeros((num_axes, 3))
+            ub_helper.sample_offset[-1] = raw_trans
+        else:
+            ub_helper.sample_offset = raw_trans
+
         sg = f["sample/space_group"][()]
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
 
@@ -2267,11 +2302,42 @@ def run_bingham_tracker(
         import multiprocessing
         import concurrent.futures
 
+        # Extract absolute log timestamps from the Nexus file
+        gonio_times = None
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
 
-        args_list = [(event_nexus_filename, k, instrument_name, ub_helper.sample_offset, ub_helper.ki_vec)
-                     for k in keys if k.endswith('_events')]
+            # If we have dynamic angles, we must extract the matching timeline
+            if gonio_angles is not None and gonio_angles.ndim == 2:
+                # We need the times associated with the angle logs. 
+                # This depends on where the log is stored. Usually /entry/DASlogs/omega/time
+                # Here is a generic extraction attempting to find the main gonio axis timeline
+                try:
+                    # Look for the first valid log to extract the timestamp array
+                    log_keys = list(f['entry/DASlogs'].keys())
+                    for lk in log_keys:
+                        if 'value' in f[f'entry/DASlogs/{lk}'] and 'time' in f[f'entry/DASlogs/{lk}']:
+                            # Times are usually seconds since epoch, or relative to a start time
+                            gonio_times = f[f'entry/DASlogs/{lk}/time'][:]
+                            break
+                except Exception as e:
+                    print(f"Warning: Could not extract goniometer timelines: {e}. Falling back to static offsets.")
+                    gonio_angles = None
+                    gonio_times = None
+
+        args_list = [
+            (
+                event_nexus_filename, 
+                k, 
+                instrument_name, 
+                ub_helper.ki_vec,
+                gonio_axes,
+                gonio_angles,
+                gonio_times,
+                ub_helper.sample_offset
+            )
+            for k in keys if k.endswith('_events')
+        ]
 
         all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
         with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
