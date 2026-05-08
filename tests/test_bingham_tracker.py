@@ -122,7 +122,7 @@ class TestBinghamTracker(unittest.TestCase):
             sigma_q_min=0.05,    
             annealing_rate=1.0,  # Rapid decay for 5-second simulated run
             lambda_alpha=0.5,
-            gamma_diffusion=1.0,
+            gamma_diffusion=1000.0,
             kappa_init=100.0,
             batch_size_events=10000, 
             n_ensemble=1, 
