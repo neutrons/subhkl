@@ -38,7 +38,7 @@ class TestBinghamTracker(unittest.TestCase):
     def tearDown(self):
         self.test_dir.cleanup()
 
-    def generate_poissonian_events(self, U_true, num_events=200000, duration=5.0, sigma_q=0.05):
+    def generate_poissonian_events(self, U_true, num_events=1000000, duration=5.0, sigma_q=0.05, bg_fraction=0.0):
         B_mat = np.array([
             [2*np.pi/10.0, 0, 0],
             [0, 2*np.pi/10.0, 0],
@@ -64,9 +64,13 @@ class TestBinghamTracker(unittest.TestCase):
         valid_norms = q_norms[valid_mask]
         num_valid = valid_q_hat.shape[1]
 
-        peak_indices = np.random.choice(num_valid, size=num_events)
+        num_bg = int(num_events * bg_fraction)
+        num_sig = num_events - num_bg
+
+        peak_indices = np.random.choice(num_valid, size=num_sig)
         
         q_exp_list = []
+        # 1. Generate Physical Signal Events
         for idx in peak_indices:
             q_hat_lab = U_true @ valid_q_hat[:, idx]
             angular_std = sigma_q / valid_norms[idx]
@@ -75,12 +79,24 @@ class TestBinghamTracker(unittest.TestCase):
             q_exp /= np.linalg.norm(q_exp)
             q_exp_list.append(q_exp)
 
+        # 2. Generate Uniform Background Noise Events
+        if num_bg > 0:
+            bg_vecs = np.random.normal(0, 1, (num_bg, 3))
+            bg_vecs /= np.linalg.norm(bg_vecs, axis=1, keepdims=True)
+            q_exp_list.extend(bg_vecs)
+
+        q_lab = np.array(q_exp_list)
+
+        # Shuffle to mix background and signal evenly across time
+        shuffle_idx = np.random.permutation(num_events)
+        q_lab = q_lab[shuffle_idx]
+
         times = np.sort(np.random.uniform(0, duration, num_events)) 
         banks = np.ones(num_events, dtype=int)
         pixels_r = np.zeros(num_events, dtype=int)
         pixels_c = np.zeros(num_events, dtype=int)
 
-        return np.array(q_exp_list), times, banks, pixels_r, pixels_c
+        return q_lab, times, banks, pixels_r, pixels_c
 
     def _evaluate_cubic_symmetric_error(self, U_true, U_pred):
         min_err_deg = 180.0
@@ -90,6 +106,7 @@ class TestBinghamTracker(unittest.TestCase):
             err_deg = np.degrees(np.arccos((trace_val - 1.0) / 2.0))
             min_err_deg = min(min_err_deg, err_deg)
         return min_err_deg
+
 
     @patch('concurrent.futures.ProcessPoolExecutor')
     def test_local_capture(self, mock_executor_class):
@@ -172,6 +189,48 @@ class TestBinghamTracker(unittest.TestCase):
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
         self.assertLess(final_err, 2.0, f"Global Aliasing failed to escape trap: Final Error {final_err:.2f}° >= 2.0°")
+
+    @patch('concurrent.futures.ProcessPoolExecutor')
+    def test_background_robustness(self, mock_executor_class):
+        print(f"\n{'='*60}\nExecuting Regression: BACKGROUND ROBUSTNESS (80% Noise, Seed Err: 5.0°)\n{'='*60}")
+        
+        U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
+        U_seed = Rotation.from_euler('y', 40.0, degrees=True).as_matrix()
+        
+        with h5py.File(self.finder_file, "w") as f:
+            f["sample/a"], f["sample/b"], f["sample/c"] = 10.0, 10.0, 10.0
+            f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = 90.0, 90.0, 90.0
+            f["sample/space_group"] = b"P 1"
+            f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+            f["sample/U"] = U_seed
+
+        # Generates a massive 80% uniform random spherical noise!
+        sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, bg_fraction=0.8)
+        
+        mock_executor_instance = mock_executor_class.return_value
+        mock_executor_instance.__enter__.return_value.map.return_value = [sim_data]
+        
+        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, eigengap=0.0):
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[0])
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={eigengap:.2f}")
+
+        final_U = run_bingham_tracker(
+            finder_file=self.finder_file,
+            output_h5_filename=self.output_file,
+            event_nexus_filename=self.nexus_file,
+            sigma_q_start=1.0,   
+            sigma_q_min=0.05,    
+            annealing_rate=1.0,
+            lambda_alpha=0.0,
+            gamma_diffusion=1000.0,
+            kappa_init=100.0,
+            batch_size_events=10000, 
+            n_ensemble=1,        # Local test with background 
+            streaming_callback=streaming_callback
+        )
+        
+        final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
+        self.assertLess(final_err, 2.0, f"Background test failed: Tracker derailed by noise (Final Error {final_err:.2f}° >= 2.0°)")
 
 if __name__ == '__main__':
     unittest.main()

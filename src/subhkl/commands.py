@@ -2164,11 +2164,10 @@ def run_bingham_tracker(
     streaming_callback = None,
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
-    annealing_rate: float = 0.5,   # Live physical annealing decay rate (1/s)
+    annealing_rate: float = 0.5,
     lambda_alpha: float = 0.5,
-    gamma_diffusion: float = 1.0,  # EWMA Learning Rate / Relaxation Window (1/s)
-    kappa_init: float = 100.0,     # Initial Seed Confidence
-    peak_sigma: float = 3.0,       # Auto-tuning N-sigma geometric background cutoff!
+    gamma_diffusion: float = 1.0,
+    kappa_init: float = 100.0,
     batch_size_events: int = 10000,
     n_ensemble: int = 1
 ):
@@ -2177,6 +2176,7 @@ def run_bingham_tracker(
     import numpy as np
     import jax
     import jax.numpy as jnp
+    import scipy.special
 
     print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
 
@@ -2252,19 +2252,13 @@ def run_bingham_tracker(
     log_Z_j_jax = -jnp.log(alpha_safe) + x_jax + jnp.log(-jnp.expm1(-2.0 * x_jax))
 
     # ==========================================
-    # PRE-CALCULATING DYNAMIC BACKGROUND BOUNDS
+    # EXACT SPHERICAL NOISE FLOOR CALCULATION
     # ==========================================
-    mean_prior_baseline = float(jnp.mean(-log_Z_j_jax))
-
-    def calc_bg_nll(sigma_val):
-        kappa = (q_mags_np ** 2) / (sigma_val ** 2)
-        log_vmf_norm = np.log(kappa / (2.0 * np.pi)) - np.log(-np.expm1(-2.0 * kappa))
-        mean_vmf = float(np.mean(log_vmf_norm))
-        return -(mean_vmf + mean_prior_baseline - 0.5 * (peak_sigma ** 2))
-
-    nll_start = calc_bg_nll(sigma_q_start)
-    nll_end = calc_bg_nll(sigma_q_min)
-    print(f"  > Auto-tuned Background NLL bounds: {nll_start:.2f} (blur) -> {nll_end:.2f} (sharp) [Cutoff: {peak_sigma} sigma]")
+    # The mathematically exact expected log-likelihood of a completely uniform random noise
+    # neutron evaluated across the entire theoretical reciprocal lattice.
+    log_Z_np = np.array(log_Z_j_jax)
+    expected_noise_ll = float(np.log(1.0 / (4.0 * np.pi)) + scipy.special.logsumexp(-log_Z_np))
+    print(f"  > Exact Spherical Background Noise Floor (Log-Likelihood): {expected_noise_ll:.2f}")
 
     if event_nexus_filename:
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
@@ -2346,8 +2340,9 @@ def run_bingham_tracker(
 
         # Exact mathematically stable log-normalization of the vMF distribution
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
-        mean_peak_center_ll = jnp.mean(log_vmf_norm - log_Z_j_jax)
-        bg_log_lik_scalar = mean_peak_center_ll - 0.5 * (peak_sigma ** 2)
+
+        # The mathematically true, universally constant noise floor
+        bg_log_lik_scalar = expected_noise_ll
 
         def single_event_update(q_exp):
             h_lab = jnp.matmul(U, q_theo_sample_jax)
@@ -2359,7 +2354,7 @@ def run_bingham_tracker(
             log_prior = lambda_alpha * lambda_j - log_Z_j_jax
             peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + log_prior
 
-            # Using the exact dynamically-tuned threshold
+            # Use the mathematically exact baseline
             bg_log_lik = jnp.array([bg_log_lik_scalar])
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, bg_log_lik))
             w = jnp.exp(peak_log_lik - log_Z)
