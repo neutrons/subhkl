@@ -6,11 +6,9 @@ import concurrent.futures
 
 from subhkl.instrument.detector import Detector
 from subhkl.config import beamlines, reduction_settings
-from subhkl.instrument.goniometer import sample_to_lab
 
 def _process_single_bank(args):
     """Parallel worker to parse and project a single detector bank."""
-    # --- UPDATED UNPACKING ---
     nexus_filename, key, instrument_name, ki_vec, gonio_axes, gonio_continuous_logs, gonio_translations = args
 
     with h5py.File(nexus_filename, 'r') as f:
@@ -29,9 +27,11 @@ def _process_single_bank(args):
 
     if len(event_id) == 0: return None
 
+    # Fast Unfold
     counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
     absolute_time = np.repeat(event_time_zero, counts_per_pulse) + (event_time_offset * 1e-6)
 
+    # Map Pixels
     det_config = beamlines[instrument_name][bank_str]
     det = Detector(det_config)
     settings = reduction_settings.get(instrument_name, {})
@@ -48,25 +48,43 @@ def _process_single_bank(args):
 
     xyz = det.pixel_to_lab(pixel_r, pixel_c)
 
-    # --- NEW: Independent log interpolation per axis ---
     if gonio_axes is not None and gonio_continuous_logs is not None:
         num_events = len(absolute_time)
         interpolated_angles = np.zeros((len(gonio_axes), num_events))
         
         for i in range(len(gonio_axes)):
             g_times, g_vals = gonio_continuous_logs[i]
-            # If the motor was static, it might only have 1 logged value
             if len(g_times) <= 1:
                 interpolated_angles[i, :] = g_vals[0] if len(g_vals) > 0 else 0.0
             else:
                 interpolated_angles[i, :] = np.interp(absolute_time, g_times, g_vals)
             
-        s_lab_dynamic = sample_to_lab(
-            np.zeros((num_events, 3)), 
-            gonio_axes, 
-            interpolated_angles, 
-            gonio_translations
-        )
+        # ==============================================================
+        # --- FAST VECTORIZED KINEMATICS (SciPy C-Backend) ---
+        # ==============================================================
+        from scipy.spatial.transform import Rotation
+        
+        s_lab_dynamic = np.zeros((num_events, 3), dtype=np.float32)
+        
+        # Apply kinematic chain in reverse (Sample -> Base)
+        for i in range(len(gonio_axes) - 1, -1, -1):
+            axis = gonio_axes[i]
+            axis_norm = np.linalg.norm(axis)
+            if axis_norm > 0:
+                axis = axis / axis_norm
+                
+            # Create (N, 3) rotation vectors for all neutrons simultaneously
+            theta_rad = np.radians(interpolated_angles[i, :])
+            rotvecs = theta_rad[:, None] * axis[None, :]
+            
+            # C-optimized massive batch rotation
+            R_i = Rotation.from_rotvec(rotvecs)
+            s_lab_dynamic = R_i.apply(s_lab_dynamic)
+            
+            if gonio_translations is not None:
+                s_lab_dynamic += gonio_translations[i]
+        # ==============================================================
+        
         kf = xyz - s_lab_dynamic
     else:
         s_lab_static = gonio_translations[-1] if gonio_translations is not None else np.zeros(3)
