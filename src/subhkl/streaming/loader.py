@@ -51,9 +51,10 @@ def _process_single_bank(args):
     num_axes = len(gonio_axes) if gonio_axes is not None else 1
 
     if gonio_axes is not None and gonio_continuous_logs is not None:
-        interpolated_angles = np.zeros((num_axes, num_events), dtype=np.float32)
+        num_events = len(absolute_time)
+        interpolated_angles = np.zeros((len(gonio_axes), num_events), dtype=np.float32)
         
-        for i in range(num_axes):
+        for i in range(len(gonio_axes)):
             g_times, g_vals = gonio_continuous_logs[i]
             if len(g_times) <= 1:
                 interpolated_angles[i, :] = g_vals[0] if len(g_vals) > 0 else 0.0
@@ -63,15 +64,18 @@ def _process_single_bank(args):
         from scipy.spatial.transform import Rotation
         s_lab_dynamic = np.zeros((num_events, 3), dtype=np.float32)
         
-        for i in range(num_axes - 1, -1, -1):
+        for i in range(len(gonio_axes) - 1, -1, -1):
             axis = gonio_axes[i][:3]
-            direction_multiplier = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
+            direction_mult = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
             
             axis_norm = np.linalg.norm(axis)
             if axis_norm > 0:
                 axis = axis / axis_norm
                 
-            theta_rad = np.radians(interpolated_angles[i, :] * direction_multiplier)
+            # Apply the zero-point offset to the interpolated angle
+            axis_offset = gonio_offsets[i] if gonio_offsets is not None else 0.0
+            theta_rad = np.radians((interpolated_angles[i, :] + axis_offset) * direction_mult)
+            
             rotvecs = theta_rad[:, None] * axis[None, :]
             
             R_i = Rotation.from_rotvec(rotvecs)
@@ -115,7 +119,8 @@ class EventStreamLoader:
         ki_vec: np.ndarray,
         sample_offset: np.ndarray,
         gonio_axes=None,
-        gonio_names=None, # <-- Changed to accept NAMES instead of discrete angles
+        gonio_names=None,
+        gonio_offsets=None,
     ):
         self.event_nexus_filename = event_nexus_filename
         self.instrument_name = instrument_name
@@ -123,6 +128,7 @@ class EventStreamLoader:
         self.sample_offset = sample_offset
         self.gonio_axes = gonio_axes
         self.gonio_names = gonio_names
+        self.gonio_offsets = gonio_offsets
         
         print(f"  > Initializing Event Stream Loader from: {event_nexus_filename}")
         self._load_and_sort_events()
@@ -157,8 +163,9 @@ class EventStreamLoader:
                 self.instrument_name, 
                 self.ki_vec, 
                 self.gonio_axes, 
-                gonio_continuous_logs, # <-- Pass the full tuples
-                self.sample_offset
+                gonio_continuous_logs,
+                self.sample_offset,
+                self.gonio_offsets
             )
             for k in keys
         ]
