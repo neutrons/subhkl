@@ -2246,8 +2246,13 @@ def run_bingham_tracker(
 
     lambda_max_jax = 4.0 * jnp.pi / (q_mags_jax + 1e-9)
     alpha_safe = jnp.maximum(lambda_alpha, 1e-6)
-    Z_j_jax = (2.0 / alpha_safe) * jnp.sinh(alpha_safe * lambda_max_jax)
-    log_Z_j_jax = jnp.log(Z_j_jax + 1e-12)
+
+    # --- NUMERICALLY STABLE LOG-NORMALIZATION ---
+    # Float32 overflows sinh(x) at x > 89. For real-world large unit cells,
+    # lambda_max easily hits ~200+, instantly causing infs in linear space.
+    # Identity: log( (2/alpha) * sinh(x) ) = -log(alpha) + x + log(1 - exp(-2x))
+    x_jax = alpha_safe * lambda_max_jax
+    log_Z_j_jax = -jnp.log(alpha_safe) + x_jax + jnp.log(-jnp.expm1(-2.0 * x_jax))
 
     # ==========================================
     # AUTO-TUNING BACKGROUND THRESHOLD
