@@ -49,10 +49,9 @@ def _process_single_bank(args):
     xyz = det.pixel_to_lab(pixel_r, pixel_c)
 
     if gonio_axes is not None and gonio_continuous_logs is not None:
-        num_events = len(absolute_time)
-        interpolated_angles = np.zeros((len(gonio_axes), num_events))
+        interpolated_angles = np.zeros((num_axes, num_events), dtype=np.float32)
         
-        for i in range(len(gonio_axes)):
+        for i in range(num_axes):
             g_times, g_vals = gonio_continuous_logs[i]
             if len(g_times) <= 1:
                 interpolated_angles[i, :] = g_vals[0] if len(g_vals) > 0 else 0.0
@@ -60,49 +59,46 @@ def _process_single_bank(args):
                 interpolated_angles[i, :] = np.interp(absolute_time, g_times, g_vals)
             
         from scipy.spatial.transform import Rotation
-       
-        from scipy.spatial.transform import Rotation
-        
         s_lab_dynamic = np.zeros((num_events, 3), dtype=np.float32)
         
-        # Apply kinematic chain in reverse (Sample -> Base)
-        for i in range(len(gonio_axes) - 1, -1, -1):
+        for i in range(num_axes - 1, -1, -1):
             axis = gonio_axes[i][:3]
-            
             direction_multiplier = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
             
             axis_norm = np.linalg.norm(axis)
             if axis_norm > 0:
                 axis = axis / axis_norm
                 
-            # Multiply the angle by the direction flag before converting to radians
             theta_rad = np.radians(interpolated_angles[i, :] * direction_multiplier)
             rotvecs = theta_rad[:, None] * axis[None, :]
             
-            # C-optimized massive batch rotation
             R_i = Rotation.from_rotvec(rotvecs)
             s_lab_dynamic = R_i.apply(s_lab_dynamic)
             
             if gonio_translations is not None:
                 s_lab_dynamic += gonio_translations[i][:3]
-
+                
         kf = xyz - s_lab_dynamic
     else:
-        s_lab_static = gonio_translations[-1] if gonio_translations is not None else np.zeros(3)
-        kf = xyz - s_lab_static[None, :]
+        interpolated_angles = np.zeros((num_axes, num_events), dtype=np.float32)
+        s_lab_static = gonio_translations[-1][:3] if gonio_translations is not None else np.zeros(3)
+        s_lab_dynamic = np.tile(s_lab_static, (num_events, 1)).astype(np.float32)
+        kf = xyz - s_lab_dynamic
 
     kf_norm = np.sqrt(np.sum(kf**2, axis=1, keepdims=True))
     kf /= np.where(kf_norm == 0, 1.0, kf_norm)
 
     q_lab = kf - ki_vec[None, :]
-    banks = np.full(len(absolute_time), bank_id, dtype=np.int16)
+    banks = np.full(num_events, bank_id, dtype=np.int16)
 
     return (
         q_lab.astype(np.float32),
         absolute_time,
         banks,
         pixel_r.astype(np.int16),
-        pixel_c.astype(np.int16)
+        pixel_c.astype(np.int16),
+        interpolated_angles.T.astype(np.float32),  # Transpose to (N_events, N_axes)
+        s_lab_dynamic                              # Shape (N_events, 3)
     )
 
 class EventStreamLoader:
@@ -166,17 +162,20 @@ class EventStreamLoader:
         ]
 
         all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
+        all_angles, all_slab = [], [] # <-- NEW
         
         print(f"  > Extracting and projecting {len(keys)} detector banks via Multiprocessing...")
         with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
             for result in executor.map(_process_single_bank, args_list):
                 if result is not None:
-                    q, t, b, pr, pc = result
+                    q, t, b, pr, pc, ang, slab = result # <-- UNPACK
                     all_q_lab.append(q)
                     all_times.append(t)
                     all_banks.append(b)
                     all_pixels_r.append(pr)
                     all_pixels_c.append(pc)
+                    all_angles.append(ang)
+                    all_slab.append(slab)
 
         if not all_q_lab:
             self.total_events = 0
@@ -187,6 +186,8 @@ class EventStreamLoader:
         all_banks = np.concatenate(all_banks)
         all_pixels_r = np.concatenate(all_pixels_r)
         all_pixels_c = np.concatenate(all_pixels_c)
+        all_angles = np.vstack(all_angles)
+        all_slab = np.vstack(all_slab)
 
         print("  > Performing global chronological sort...")
         sort_idx = np.argsort(all_times)
@@ -196,15 +197,13 @@ class EventStreamLoader:
         self.all_banks = all_banks[sort_idx]
         self.all_pixels_r = all_pixels_r[sort_idx]
         self.all_pixels_c = all_pixels_c[sort_idx]
+        self.all_angles = all_angles[sort_idx] # <-- SORT
+        self.all_slab = all_slab[sort_idx]     # <-- SORT
 
         self.total_events = len(self.all_q_lab)
-        print(f"  > EventStreamLoader Ready. Cached {self.total_events:,} chronologically sorted events.")
+        print(f"  > EventStreamLoader Ready. Cached {self.total_events:,} events.")
 
     def get_batches(self, batch_size_events: int = 10000):
-        """
-        Yields lightweight slices of the pre-loaded, pre-sorted memory arrays.
-        Can be called indefinitely without triggering disk I/O.
-        """
         if self.total_events == 0:
             return
 
@@ -219,5 +218,7 @@ class EventStreamLoader:
                 self.all_banks[start_idx:end_idx],
                 self.all_pixels_r[start_idx:end_idx],
                 self.all_pixels_c[start_idx:end_idx],
+                self.all_angles[start_idx:end_idx],
+                self.all_slab[start_idx:end_idx],
                 end_idx
             )

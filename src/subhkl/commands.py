@@ -2310,7 +2310,7 @@ def run_bingham_tracker(
     # --- NEW: BATCH CONSUMPTION LOOP ---
     # ==============================================================
     for batch_data in event_batches:
-        q_batch_np, t_batch_np, banks_np, pr_np, pc_np, cumulative_count = batch_data
+        q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, cumulative_count = batch_data
         
         if t_start is None and len(t_batch_np) > 0:
             t_state = t_batch_np[0]
@@ -2341,7 +2341,9 @@ def run_bingham_tracker(
             new_events = {
                 "banks": banks_np,
                 "pixel_r": pr_np,
-                "pixel_c": pc_np
+                "pixel_c": pc_np,
+                "angles": angles_np, # Shape: (batch_size, num_axes)
+                "s_lab": slab_np     # Shape: (batch_size, 3)
             }
 
             streaming_callback(
