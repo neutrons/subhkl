@@ -10,7 +10,8 @@ from subhkl.instrument.goniometer import sample_to_lab
 
 def _process_single_bank(args):
     """Parallel worker to parse and project a single detector bank."""
-    nexus_filename, key, instrument_name, ki_vec, gonio_axes, gonio_angles, gonio_times, gonio_translations = args
+    # --- UPDATED UNPACKING ---
+    nexus_filename, key, instrument_name, ki_vec, gonio_axes, gonio_continuous_logs, gonio_translations = args
 
     with h5py.File(nexus_filename, 'r') as f:
         match = re.match(r"bank(\d+)_events", key)
@@ -28,11 +29,9 @@ def _process_single_bank(args):
 
     if len(event_id) == 0: return None
 
-    # Fast Unfold
     counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
     absolute_time = np.repeat(event_time_zero, counts_per_pulse) + (event_time_offset * 1e-6)
 
-    # Map Pixels
     det_config = beamlines[instrument_name][bank_str]
     det = Detector(det_config)
     settings = reduction_settings.get(instrument_name, {})
@@ -49,12 +48,18 @@ def _process_single_bank(args):
 
     xyz = det.pixel_to_lab(pixel_r, pixel_c)
 
-    if gonio_axes is not None and gonio_angles is not None and gonio_times is not None:
+    # --- NEW: Independent log interpolation per axis ---
+    if gonio_axes is not None and gonio_continuous_logs is not None:
         num_events = len(absolute_time)
         interpolated_angles = np.zeros((len(gonio_axes), num_events))
         
         for i in range(len(gonio_axes)):
-            interpolated_angles[i, :] = np.interp(absolute_time, gonio_times, gonio_angles[i, :])
+            g_times, g_vals = gonio_continuous_logs[i]
+            # If the motor was static, it might only have 1 logged value
+            if len(g_times) <= 1:
+                interpolated_angles[i, :] = g_vals[0] if len(g_vals) > 0 else 0.0
+            else:
+                interpolated_angles[i, :] = np.interp(absolute_time, g_times, g_vals)
             
         s_lab_dynamic = sample_to_lab(
             np.zeros((num_events, 3)), 
@@ -81,7 +86,6 @@ def _process_single_bank(args):
         pixel_c.astype(np.int16)
     )
 
-
 class EventStreamLoader:
     """
     Stateful event loader. Performs heavy I/O, kinematic projection, and global 
@@ -94,34 +98,40 @@ class EventStreamLoader:
         ki_vec: np.ndarray,
         sample_offset: np.ndarray,
         gonio_axes=None,
-        gonio_angles=None,
+        gonio_names=None, # <-- Changed to accept NAMES instead of discrete angles
     ):
         self.event_nexus_filename = event_nexus_filename
         self.instrument_name = instrument_name
         self.ki_vec = ki_vec
         self.sample_offset = sample_offset
         self.gonio_axes = gonio_axes
-        self.gonio_angles = gonio_angles
+        self.gonio_names = gonio_names
         
         print(f"  > Initializing Event Stream Loader from: {event_nexus_filename}")
         self._load_and_sort_events()
 
     def _load_and_sort_events(self):
-        gonio_times = None
+        # --- NEW: Extract the true continuous NeXus logs ---
+        gonio_continuous_logs = []
         with h5py.File(self.event_nexus_filename, 'r') as f:
             keys = [k for k in f['entry'].keys() if k.endswith('_events')]
             
-            if self.gonio_angles is not None and self.gonio_angles.ndim == 2:
-                try:
-                    log_keys = list(f['entry/DASlogs'].keys())
-                    for lk in log_keys:
-                        if 'value' in f[f'entry/DASlogs/{lk}'] and 'time' in f[f'entry/DASlogs/{lk}']:
-                            gonio_times = f[f'entry/DASlogs/{lk}/time'][:]
-                            break
-                except Exception as e:
-                    print(f"Warning: Could not extract goniometer timelines: {e}. Falling back to static offsets.")
-                    self.gonio_angles = None
-                    gonio_times = None
+            if self.gonio_names is not None and self.gonio_axes is not None:
+                for name in self.gonio_names:
+                    try:
+                        log_path = f'entry/DASlogs/{name}'
+                        if log_path in f and 'time' in f[log_path] and 'value' in f[log_path]:
+                            t = f[f'{log_path}/time'][:]
+                            v = f[f'{log_path}/value'][:]
+                            gonio_continuous_logs.append((t, v))
+                        else:
+                            # Fallback for missing logs
+                            gonio_continuous_logs.append((np.array([0.0]), np.array([0.0])))
+                    except Exception as e:
+                        print(f"Warning: Failed to load continuous log for {name}: {e}")
+                        gonio_continuous_logs.append((np.array([0.0]), np.array([0.0])))
+            else:
+                gonio_continuous_logs = None
 
         args_list = [
             (
@@ -130,8 +140,7 @@ class EventStreamLoader:
                 self.instrument_name, 
                 self.ki_vec, 
                 self.gonio_axes, 
-                self.gonio_angles, 
-                gonio_times, 
+                gonio_continuous_logs, # <-- Pass the full tuples
                 self.sample_offset
             )
             for k in keys
