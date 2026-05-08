@@ -2248,23 +2248,29 @@ def run_bingham_tracker(
     alpha_safe = jnp.maximum(lambda_alpha, 1e-6)
 
     # --- NUMERICALLY STABLE LOG-NORMALIZATION ---
-    # Float32 overflows sinh(x) at x > 89. For real-world large unit cells,
-    # lambda_max easily hits ~200+, instantly causing infs in linear space.
-    # Identity: log( (2/alpha) * sinh(x) ) = -log(alpha) + x + log(1 - exp(-2x))
     x_jax = alpha_safe * lambda_max_jax
     log_Z_j_jax = -jnp.log(alpha_safe) + x_jax + jnp.log(-jnp.expm1(-2.0 * x_jax))
 
     # ==========================================
-    # AUTO-TUNING BACKGROUND THRESHOLD
+    # PRE-CALCULATING DYNAMIC BACKGROUND BOUNDS
     # ==========================================
-    mean_prior_baseline = jnp.mean(-log_Z_j_jax)
-    bg_log_lik_scalar = mean_prior_baseline - 0.5 * (peak_sigma ** 2)
-    print(f"  > Auto-tuned Background Log-Likelihood: {bg_log_lik_scalar:.2f} (Cutoff: {peak_sigma} sigma)")
+    mean_prior_baseline = float(jnp.mean(-log_Z_j_jax))
+
+    def calc_bg_nll(sigma_val):
+        kappa = (q_mags_np ** 2) / (sigma_val ** 2)
+        log_vmf_norm = np.log(kappa / (2.0 * np.pi)) - np.log(-np.expm1(-2.0 * kappa))
+        mean_vmf = float(np.mean(log_vmf_norm))
+        return -(mean_vmf + mean_prior_baseline - 0.5 * (peak_sigma ** 2))
+
+    nll_start = calc_bg_nll(sigma_q_start)
+    nll_end = calc_bg_nll(sigma_q_min)
+    print(f"  > Auto-tuned Background NLL bounds: {nll_start:.2f} (blur) -> {nll_end:.2f} (sharp) [Cutoff: {peak_sigma} sigma]")
 
     if event_nexus_filename:
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
         import multiprocessing
         import concurrent.futures
+        from subhkl.integration.worker import _process_single_bank
 
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
@@ -2335,6 +2341,15 @@ def run_bingham_tracker(
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
 
+        # --- DYNAMIC BACKGROUND TUNING ---
+        kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
+        kappa_safe = jnp.clip(kappa_j, 1e-6, 1e6) # Prevent underflow/overflow
+
+        # Exact mathematically stable log-normalization of the vMF distribution
+        log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
+        mean_peak_center_ll = jnp.mean(log_vmf_norm - log_Z_j_jax)
+        bg_log_lik_scalar = mean_peak_center_ll - 0.5 * (peak_sigma ** 2)
+
         def single_event_update(q_exp):
             h_lab = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_lab)
@@ -2343,15 +2358,14 @@ def run_bingham_tracker(
             lambda_j = -(4.0 * jnp.pi / (q_mags_jax + 1e-9)) * q_dot_ki_theo
 
             log_prior = lambda_alpha * lambda_j - log_Z_j_jax
-            kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
-            peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_prior
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + log_prior
 
-            # Using the auto-tuned constant scalar!
+            # Using the exact dynamically-tuned threshold
             bg_log_lik = jnp.array([bg_log_lik_scalar])
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, bg_log_lik))
             w = jnp.exp(peak_log_lik - log_Z)
 
-            weighted_h_geom = jnp.sum((w * kappa_j) * q_theo_sample_jax, axis=1)
+            weighted_h_geom = jnp.sum((w * kappa_safe) * q_theo_sample_jax, axis=1)
             F_geom = jnp.outer(q_exp, weighted_h_geom)
 
             prior_scalar = lambda_alpha * (4.0 * jnp.pi / (q_mags_jax + 1e-9))
@@ -2404,6 +2418,11 @@ def run_bingham_tracker(
             A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
 
         t_state = all_times[0] if len(all_times) > 0 else 0.0
+
+        # --- ZERO-BASED ANNEALING CLOCK ---
+        # Prevents SDE from instantly flatlining to 0.05 on real experimental timestamps
+        t_start = t_state
+
         tracking_history = []
 
         all_q_lab_jax = jax.device_put(all_q_lab)
@@ -2416,8 +2435,9 @@ def run_bingham_tracker(
             if end_idx - start_idx < 100:
                 break
 
-            # True Live Streaming Annealing: Decays exponentially with physical time!
-            current_sigma_q = max(sigma_q_min, sigma_q_start * np.exp(-annealing_rate * t_state))
+            # Using Relative Time for accurate global-search blurring
+            t_relative = max(0.0, float(t_state - t_start))
+            current_sigma_q = max(sigma_q_min, sigma_q_start * np.exp(-annealing_rate * t_relative))
 
             q_batch = all_q_lab_jax[start_idx:end_idx]
             q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
