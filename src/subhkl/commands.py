@@ -2164,11 +2164,12 @@ def run_bingham_tracker(
     streaming_callback = None,
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
-    annealing_rate: float = 0.5,   # Live physical annealing decay rate (1/s)
+    annealing_rate: float = 0.5,
     lambda_alpha: float = 0.5,
-    gamma_diffusion: float = 1.0,  # EWMA Learning Rate / Relaxation Window (1/s)
-    kappa_init: float = 100.0,     # Initial Seed Confidence
-    peak_sigma: float = 3.0,       # Auto-tuning N-sigma geometric background cutoff!
+    gamma_diffusion: float = 1.0,
+    max_inertia: float = 2500.0,   # Caps the max effective neutrons in the EWMA window
+    kappa_init: float = 100.0,
+    peak_sigma: float = 3.0,
     batch_size_events: int = 10000,
     n_ensemble: int = 1
 ):
@@ -2342,9 +2343,8 @@ def run_bingham_tracker(
 
         # --- DYNAMIC BACKGROUND TUNING ---
         kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
-        kappa_safe = jnp.clip(kappa_j, 1e-6, 1e6) # Prevent underflow/overflow
+        kappa_safe = jnp.clip(kappa_j, 1e-6, 1e6)
 
-        # Exact mathematically stable log-normalization of the vMF distribution
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
         mean_peak_center_ll = jnp.mean(log_vmf_norm - log_Z_j_jax)
         bg_log_lik_scalar = mean_peak_center_ll - 0.5 * (peak_sigma ** 2)
@@ -2359,7 +2359,6 @@ def run_bingham_tracker(
             log_prior = lambda_alpha * lambda_j - log_Z_j_jax
             peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + log_prior
 
-            # Using the exact dynamically-tuned threshold
             bg_log_lik = jnp.array([bg_log_lik_scalar])
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, bg_log_lik))
             w = jnp.exp(peak_log_lik - log_Z)
@@ -2383,6 +2382,10 @@ def run_bingham_tracker(
 
         neutron_rate = q_batch.shape[0] / (dt + 1e-9)
         steady_state_scale = neutron_rate / jnp.maximum(gamma_diffusion, 1e-6)
+
+        # --- INERTIA CAPPING ---
+        # Prevent ultra-bright beams from inducing infinite tracking inertia
+        steady_state_scale = jnp.minimum(steady_state_scale, max_inertia)
 
         A_new = A_diffused + F_mean * steady_state_scale * (1.0 - decay)
 
@@ -2418,10 +2421,7 @@ def run_bingham_tracker(
 
         t_state = all_times[0] if len(all_times) > 0 else 0.0
 
-        # --- ZERO-BASED ANNEALING CLOCK ---
-        # Prevents SDE from instantly flatlining to 0.05 on real experimental timestamps
         t_start = t_state
-
         tracking_history = []
 
         all_q_lab_jax = jax.device_put(all_q_lab)
@@ -2434,7 +2434,6 @@ def run_bingham_tracker(
             if end_idx - start_idx < 100:
                 break
 
-            # Using Relative Time for accurate global-search blurring
             t_relative = max(0.0, float(t_state - t_start))
             current_sigma_q = max(sigma_q_min, sigma_q_start * np.exp(-annealing_rate * t_relative))
 
