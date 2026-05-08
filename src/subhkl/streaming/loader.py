@@ -59,22 +59,24 @@ def _process_single_bank(args):
             else:
                 interpolated_angles[i, :] = np.interp(absolute_time, g_times, g_vals)
             
-        # ==============================================================
-        # --- FAST VECTORIZED KINEMATICS (SciPy C-Backend) ---
-        # ==============================================================
+        from scipy.spatial.transform import Rotation
+       
         from scipy.spatial.transform import Rotation
         
         s_lab_dynamic = np.zeros((num_events, 3), dtype=np.float32)
         
         # Apply kinematic chain in reverse (Sample -> Base)
         for i in range(len(gonio_axes) - 1, -1, -1):
-            axis = gonio_axes[i]
+            axis = gonio_axes[i][:3]
+            
+            direction_multiplier = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
+            
             axis_norm = np.linalg.norm(axis)
             if axis_norm > 0:
                 axis = axis / axis_norm
                 
-            # Create (N, 3) rotation vectors for all neutrons simultaneously
-            theta_rad = np.radians(interpolated_angles[i, :])
+            # Multiply the angle by the direction flag before converting to radians
+            theta_rad = np.radians(interpolated_angles[i, :] * direction_multiplier)
             rotvecs = theta_rad[:, None] * axis[None, :]
             
             # C-optimized massive batch rotation
@@ -82,9 +84,8 @@ def _process_single_bank(args):
             s_lab_dynamic = R_i.apply(s_lab_dynamic)
             
             if gonio_translations is not None:
-                s_lab_dynamic += gonio_translations[i]
-        # ==============================================================
-        
+                s_lab_dynamic += gonio_translations[i][:3]
+
         kf = xyz - s_lab_dynamic
     else:
         s_lab_static = gonio_translations[-1] if gonio_translations is not None else np.zeros(3)
