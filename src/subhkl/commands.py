@@ -2165,9 +2165,10 @@ def run_bingham_tracker(
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
     annealing_rate: float = 0.5,   # Live physical annealing decay rate (1/s)
-    lambda_alpha: float = 0,       # Exponential wavelength prior
+    lambda_alpha: float = 0.5,
     gamma_diffusion: float = 1.0,  # EWMA Learning Rate / Relaxation Window (1/s)
     kappa_init: float = 100.0,     # Initial Seed Confidence
+    peak_sigma: float = 3.0,       # Auto-tuning N-sigma geometric background cutoff!
     batch_size_events: int = 10000,
     n_ensemble: int = 1
 ):
@@ -2248,10 +2249,18 @@ def run_bingham_tracker(
     Z_j_jax = (2.0 / alpha_safe) * jnp.sinh(alpha_safe * lambda_max_jax)
     log_Z_j_jax = jnp.log(Z_j_jax + 1e-12)
 
+    # ==========================================
+    # AUTO-TUNING BACKGROUND THRESHOLD
+    # ==========================================
+    mean_prior_baseline = jnp.mean(-log_Z_j_jax)
+    bg_log_lik_scalar = mean_prior_baseline - 0.5 * (peak_sigma ** 2)
+    print(f"  > Auto-tuned Background Log-Likelihood: {bg_log_lik_scalar:.2f} (Cutoff: {peak_sigma} sigma)")
+
     if event_nexus_filename:
         print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
         import multiprocessing
         import concurrent.futures
+        from subhkl.integration.worker import _process_single_bank
 
         with h5py.File(event_nexus_filename, 'r') as f:
             keys = list(f['entry'].keys())
@@ -2333,7 +2342,8 @@ def run_bingham_tracker(
             kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
             peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_prior
 
-            bg_log_lik = jnp.array([-5.0])
+            # Using the auto-tuned constant scalar!
+            bg_log_lik = jnp.array([bg_log_lik_scalar])
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, bg_log_lik))
             w = jnp.exp(peak_log_lik - log_Z)
 
@@ -2351,12 +2361,9 @@ def run_bingham_tracker(
 
         A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch)
 
-        # Calculate the EXPECTED sufficient statistic matrix per event
         F_mean = jnp.mean(A_F_batch, axis=0)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
 
-        # True Stationary Fokker-Planck Equilibrium Balance
-        # Incorporating the physical neutron hit rate (dN/dt)
         neutron_rate = q_batch.shape[0] / (dt + 1e-9)
         steady_state_scale = neutron_rate / jnp.maximum(gamma_diffusion, 1e-6)
 
@@ -2365,7 +2372,6 @@ def run_bingham_tracker(
         vals_new = jnp.linalg.eigvalsh(A_new)
         gap_new = vals_new[-1] - vals_new[-2]
 
-        # Normalizing the gap relative to its dynamic equilibrium scale
         norm_gap = gap_new / jnp.maximum(steady_state_scale, 1e-9)
 
         return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap
@@ -2417,7 +2423,6 @@ def run_bingham_tracker(
                 A_ensemble_state, t_state, q_batch, t_batch, current_sigma_q
             )
 
-            # Pick the tracker that best explains the data (Lowest Negative Log-Likelihood)
             best_idx = int(jnp.argmin(loss_ensemble))
 
             U_best = np.array(U_ensemble_curr[best_idx])
@@ -2444,7 +2449,7 @@ def run_bingham_tracker(
                     best_idx=0,
                     neutron_count=end_idx,
                     new_events=new_events,
-                    eigengap=best_gap  # Passes the normalized gap out to the tester/UI correctly
+                    eigengap=best_gap
                 )
 
         print(f"\n[4/4] Global Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
