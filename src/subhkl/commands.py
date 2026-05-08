@@ -2165,7 +2165,7 @@ def run_bingham_tracker(
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
     annealing_rate: float = 0.5,   # Live physical annealing decay rate (1/s)
-    lambda_alpha: float = 0.5,
+    lambda_alpha: float = 0,       # Exponential wavelength prior
     gamma_diffusion: float = 1.0,  # EWMA Learning Rate / Relaxation Window (1/s)
     kappa_init: float = 100.0,     # Initial Seed Confidence
     batch_size_events: int = 10000,
