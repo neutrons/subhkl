@@ -2093,104 +2093,17 @@ def run_egnn(
                         print(f"Visualization failed for {out_name}:")
                         traceback.print_exc()
 
-def _process_single_bank(args):
-    """Parallel worker to parse and project a single detector bank."""
-    import h5py, numpy as np, re
-    from subhkl.instrument.detector import Detector
-    from subhkl.config import beamlines, reduction_settings
-    from subhkl.instrument.goniometer import sample_to_lab
-
-    nexus_filename, key, instrument_name, ki_vec, gonio_axes, gonio_angles, gonio_times, gonio_translations = args
-
-    with h5py.File(nexus_filename, 'r') as f:
-        match = re.match(r"bank(\d+)_events", key)
-        if not match: return None
-        bank_id = int(match.group(1))
-        bank_str = str(bank_id)
-
-        folder = f'/entry/{key}'
-        if folder+'/event_id' not in f: return None
-
-        event_id = f[folder+'/event_id'][:]
-        event_index = f[folder+'/event_index'][:]
-        event_time_offset = f[folder+'/event_time_offset'][:]
-        event_time_zero = f[folder+'/event_time_zero'][:]
-
-    if len(event_id) == 0: return None
-
-    # Fast Unfold
-    counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
-    absolute_time = np.repeat(event_time_zero, counts_per_pulse) + (event_time_offset * 1e-6)
-
-    # Map Pixels
-    det_config = beamlines[instrument_name][bank_str]
-    det = Detector(det_config)
-    settings = reduction_settings.get(instrument_name, {})
-
-    offset = det_config.get("offset", 0)
-    local_id = event_id - offset
-
-    if settings.get("YAxisIsFastVaryingIndex"):
-        pixel_c = local_id // det.n
-        pixel_r = local_id % det.n
-    else:
-        pixel_c = local_id % det.m
-        pixel_r = local_id // det.m
-
-    # dynamic continous geometry projection
-    xyz = det.pixel_to_lab(pixel_r, pixel_c)
-
-    if gonio_axes is not None and gonio_angles is not None and gonio_times is not None:
-        # 1. Interpolate angles for every event time
-        # gonio_angles shape: (N_axes, N_timepoints)
-        num_events = len(absolute_time)
-        interpolated_angles = np.zeros((len(gonio_axes), num_events))
-
-        for i in range(len(gonio_axes)):
-            # Linearly interpolate the angles using the absolute timestamps
-            interpolated_angles[i, :] = np.interp(absolute_time, gonio_times, gonio_angles[i, :])
-
-        # 2. Vectorized kinematics computation
-        s_lab_dynamic = sample_to_lab(
-            np.zeros((num_events, 3)),
-            gonio_axes,
-            interpolated_angles,
-            gonio_translations
-        )
-        kf = xyz - s_lab_dynamic
-    else:
-        # Legacy fallback
-        s_lab_static = gonio_translations[-1] if gonio_translations is not None else np.zeros(3)
-        kf = xyz - s_lab_static[None, :]
-
-    # Vectorized Norm
-    kf_norm = np.sqrt(np.sum(kf**2, axis=1, keepdims=True))
-    kf /= np.where(kf_norm == 0, 1.0, kf_norm)
-
-    q_lab = kf - ki_vec[None, :]
-    banks = np.full(len(absolute_time), bank_id, dtype=np.int16)
-
-    return (
-        q_lab.astype(np.float32),
-        absolute_time,
-        banks,
-        pixel_r.astype(np.int16),
-        pixel_c.astype(np.int16)
-    )
-
 def run_bingham_tracker(
     finder_file: str,
-    output_h5_filename: str,
+    event_batches,  # <-- NEW: The generator injected from the outside
     instrument_name: str | None = None,
-    event_nexus_filename: str | None = None,
-    streaming_callback = None,
+    streaming_callback=None,
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
     annealing_rate: float = 0.5,
     lambda_alpha: float = 0.5,
     gamma_diffusion: float = 1.0,
     kappa_init: float = 100.0,
-    batch_size_events: int = 10000,
     n_ensemble: int = 1
 ):
     apply_detector_calibration(finder_file, instrument_name)
@@ -2202,7 +2115,7 @@ def run_bingham_tracker(
     import jax.numpy as jnp
     import scipy.special
 
-    print(f"\n[1/4] Initializing Reciprocal Space from: {finder_file}")
+    print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
 
     ub_helper = FindUB()
     U_init = None
@@ -2213,22 +2126,7 @@ def run_bingham_tracker(
         ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else None
         ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
         ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
-
-        ub_helper.ki_vec = f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
-
-        # We need the full rotation array and timelines if they exist
-        gonio_axes = f["goniometer/axes"][()] if "goniometer/axes" in f else None
-        gonio_angles = f["goniometer/angles"][()] if "goniometer/angles" in f else None
-
-        # Load translations, ensuring it's a 2D array matching the axes
-        raw_trans = f["goniometer/translations"][()] if "goniometer/translations" in f else np.zeros(3)
-        if raw_trans.ndim == 1:
-            num_axes = len(gonio_axes) if gonio_axes is not None else 1
-            ub_helper.sample_offset = np.zeros((num_axes, 3))
-            ub_helper.sample_offset[-1] = raw_trans
-        else:
-            ub_helper.sample_offset = raw_trans
-
+        
         sg = f["sample/space_group"][()]
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
 
@@ -2277,8 +2175,10 @@ def run_bingham_tracker(
     q_theo_sample_jax = jnp.array(q_theo_sample_np)
     q_mags_jax = jnp.array(q_mags_np)
 
+    ub_helper.ki_vec = np.array([0.0, 0.0, 1.0]) # Default assumption if loader passed explicitly
     ki_vec_jax = jnp.array(ub_helper.ki_vec)
     ki_vec_jax = ki_vec_jax / (jnp.linalg.norm(ki_vec_jax) + 1e-9)
+    
     print(f"  > Generated {q_theo_sample_jax.shape[1]} valid theoretical Bragg directions.")
 
     lambda_max_jax = 4.0 * jnp.pi / (q_mags_jax + 1e-9)
@@ -2288,80 +2188,9 @@ def run_bingham_tracker(
     x_jax = alpha_safe * lambda_max_jax
     log_Z_j_jax = -jnp.log(alpha_safe) + x_jax + jnp.log(-jnp.expm1(-2.0 * x_jax))
 
-    # ==========================================
-    # EXACT SPHERICAL NOISE FLOOR CALCULATION
-    # ==========================================
-    # The mathematically exact expected log-likelihood of a completely uniform random noise
-    # neutron evaluated across the entire theoretical reciprocal lattice.
     log_Z_np = np.array(log_Z_j_jax)
     expected_noise_ll = float(np.log(1.0 / (4.0 * np.pi)) + scipy.special.logsumexp(-log_Z_np))
     print(f"  > Exact Spherical Background Noise Floor (Log-Likelihood): {expected_noise_ll:.2f}")
-
-    if event_nexus_filename:
-        print(f"\n[2/4] Loading Event-Mode Data from: {event_nexus_filename}")
-        import multiprocessing
-        import concurrent.futures
-
-        # Extract absolute log timestamps from the Nexus file
-        gonio_times = None
-        with h5py.File(event_nexus_filename, 'r') as f:
-            keys = list(f['entry'].keys())
-
-            # If we have dynamic angles, we must extract the matching timeline
-            if gonio_angles is not None and gonio_angles.ndim == 2:
-                # We need the times associated with the angle logs. 
-                # This depends on where the log is stored. Usually /entry/DASlogs/omega/time
-                # Here is a generic extraction attempting to find the main gonio axis timeline
-                try:
-                    # Look for the first valid log to extract the timestamp array
-                    log_keys = list(f['entry/DASlogs'].keys())
-                    for lk in log_keys:
-                        if 'value' in f[f'entry/DASlogs/{lk}'] and 'time' in f[f'entry/DASlogs/{lk}']:
-                            # Times are usually seconds since epoch, or relative to a start time
-                            gonio_times = f[f'entry/DASlogs/{lk}/time'][:]
-                            break
-                except Exception as e:
-                    print(f"Warning: Could not extract goniometer timelines: {e}. Falling back to static offsets.")
-                    gonio_angles = None
-                    gonio_times = None
-
-        args_list = [
-            (
-                event_nexus_filename, 
-                k, 
-                instrument_name, 
-                ub_helper.ki_vec,
-                gonio_axes,
-                gonio_angles,
-                gonio_times,
-                ub_helper.sample_offset
-            )
-            for k in keys if k.endswith('_events')
-        ]
-
-        all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
-        with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
-            for result in executor.map(_process_single_bank, args_list):
-                if result is not None:
-                    q, t, b, pr, pc = result
-                    all_q_lab.append(q)
-                    all_times.append(t)
-                    all_banks.append(b)
-                    all_pixels_r.append(pr)
-                    all_pixels_c.append(pc)
-
-        all_q_lab = np.vstack(all_q_lab)
-        all_times = np.concatenate(all_times)
-        all_banks = np.concatenate(all_banks)
-        all_pixels_r = np.concatenate(all_pixels_r)
-        all_pixels_c = np.concatenate(all_pixels_c)
-
-        sort_idx = np.argsort(all_times)
-        all_q_lab = all_q_lab[sort_idx]
-        all_times = all_times[sort_idx]
-        all_banks = all_banks[sort_idx]
-        all_pixels_r = all_pixels_r[sort_idx]
-        all_pixels_c = all_pixels_c[sort_idx]
 
     @jax.jit
     def quaternion_to_rotation_matrix(r):
@@ -2404,12 +2233,9 @@ def run_bingham_tracker(
 
         # --- DYNAMIC BACKGROUND TUNING ---
         kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
-        kappa_safe = jnp.clip(kappa_j, 1e-6, 1e6) # Prevent underflow/overflow
+        kappa_safe = jnp.clip(kappa_j, 1e-6, 1e6) 
 
-        # Exact mathematically stable log-normalization of the vMF distribution
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
-
-        # The mathematically true, universally constant noise floor
         bg_log_lik_scalar = expected_noise_ll
 
         def single_event_update(q_exp):
@@ -2422,7 +2248,6 @@ def run_bingham_tracker(
             log_prior = lambda_alpha * lambda_j - log_Z_j_jax
             peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + log_prior
 
-            # Use the mathematically exact baseline
             bg_log_lik = jnp.array([bg_log_lik_scalar])
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, bg_log_lik))
             w = jnp.exp(peak_log_lik - log_Z)
@@ -2435,8 +2260,8 @@ def run_bingham_tracker(
             F_prior = -jnp.outer(ki_vec_jax, weighted_h_prior)
 
             F_total = F_geom + F_prior
-
             event_nll = -log_Z
+            
             return compute_A_from_C(F_total), event_nll
 
         A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch)
@@ -2451,7 +2276,6 @@ def run_bingham_tracker(
 
         vals_new = jnp.linalg.eigvalsh(A_new)
         gap_new = vals_new[-1] - vals_new[-2]
-
         norm_gap = gap_new / jnp.maximum(steady_state_scale, 1e-9)
 
         return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap
@@ -2464,79 +2288,76 @@ def run_bingham_tracker(
         )
     )
 
-    if event_nexus_filename:
-        print(f"\n[3/4] Executing Ensemble Bingham Tracking ({n_ensemble} simultaneous trackers)...")
+    print(f"\n[2/3] Executing Ensemble Bingham Tracking ({n_ensemble} simultaneous trackers)...")
 
-        rng = jax.random.PRNGKey(42)
-        r_random = jax.random.normal(rng, (n_ensemble, 4))
-        r_random = r_random / jnp.linalg.norm(r_random, axis=1, keepdims=True)
-        U_ensemble = jax.vmap(quaternion_to_rotation_matrix)(r_random)
+    rng = jax.random.PRNGKey(42)
+    r_random = jax.random.normal(rng, (n_ensemble, 4))
+    r_random = r_random / jnp.linalg.norm(r_random, axis=1, keepdims=True)
+    U_ensemble = jax.vmap(quaternion_to_rotation_matrix)(r_random)
 
-        C_ensemble = kappa_init * U_ensemble
-        A_ensemble_state = jax.vmap(compute_A_from_C)(C_ensemble)
+    C_ensemble = kappa_init * U_ensemble
+    A_ensemble_state = jax.vmap(compute_A_from_C)(C_ensemble)
 
-        if U_init is not None:
-            A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
-            A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
+    if U_init is not None:
+        A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
+        A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
 
-        t_state = all_times[0] if len(all_times) > 0 else 0.0
+    tracking_history = []
+    t_start = None
+    t_state = 0.0
 
-        # --- ZERO-BASED ANNEALING CLOCK ---
-        # Prevents SDE from instantly flatlining to 0.05 on real experimental timestamps
-        t_start = t_state
+    # ==============================================================
+    # --- NEW: BATCH CONSUMPTION LOOP ---
+    # ==============================================================
+    for batch_data in event_batches:
+        q_batch_np, t_batch_np, banks_np, pr_np, pc_np, cumulative_count = batch_data
+        
+        if t_start is None and len(t_batch_np) > 0:
+            t_state = t_batch_np[0]
+            t_start = t_state
 
-        tracking_history = []
+        t_relative = max(0.0, float(t_state - t_start))
+        current_sigma_q = max(sigma_q_min, sigma_q_start * np.exp(-annealing_rate * t_relative))
 
-        all_q_lab_jax = jax.device_put(all_q_lab)
-        all_times_jax = jax.device_put(all_times)
+        q_batch = jax.device_put(q_batch_np)
+        q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
+        t_batch = jax.device_put(t_batch_np)
 
-        total_events = len(all_q_lab)
+        A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps = ensemble_process_chunk(
+            A_ensemble_state, t_state, q_batch, t_batch, current_sigma_q
+        )
 
-        for start_idx in range(0, total_events, batch_size_events):
-            end_idx = min(start_idx + batch_size_events, total_events)
-            if end_idx - start_idx < 100:
-                break
+        best_idx = int(jnp.argmin(loss_ensemble))
+        U_best = np.array(U_ensemble_curr[best_idx])
+        best_gap = float(eigen_gaps[best_idx])
+        best_loss = float(loss_ensemble[best_idx])
 
-            # Using Relative Time for accurate global-search blurring
-            t_relative = max(0.0, float(t_state - t_start))
-            current_sigma_q = max(sigma_q_min, sigma_q_start * np.exp(-annealing_rate * t_relative))
+        tracking_history.append((float(t_state), U_best))
 
-            q_batch = all_q_lab_jax[start_idx:end_idx]
-            q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
-            t_batch = all_times_jax[start_idx:end_idx]
+        if cumulative_count % 50000 < len(t_batch_np):
+            print(f"    Time {t_state:.2f}s | Sigma_Q: {current_sigma_q:.3f} | Best Tracker: {best_idx:03d} | Norm-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
 
-            A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps = ensemble_process_chunk(
-                A_ensemble_state, t_state, q_batch, t_batch, current_sigma_q
+        if streaming_callback is not None:
+            new_events = {
+                "banks": banks_np,
+                "pixel_r": pr_np,
+                "pixel_c": pc_np
+            }
+
+            streaming_callback(
+                time=float(t_state),
+                U_preds=np.array(U_ensemble_curr),
+                losses=np.array(loss_ensemble),
+                mean_loss=best_loss,
+                best_idx=best_idx,
+                neutron_count=cumulative_count,
+                new_events=new_events,
+                eigengap=best_gap
             )
 
-            best_idx = int(jnp.argmin(loss_ensemble))
+    if not tracking_history:
+        print("\n[3/3] Tracking complete. No events were processed.")
+        return None
 
-            U_best = np.array(U_ensemble_curr[best_idx])
-            best_gap = float(eigen_gaps[best_idx])
-            best_loss = float(loss_ensemble[best_idx])
-
-            tracking_history.append((float(t_state), U_best))
-
-            if start_idx % (batch_size_events * 5) == 0:
-                print(f"    Time {t_state:.2f}s | Sigma_Q: {current_sigma_q:.3f} | Best Tracker: {best_idx:03d} | Norm-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
-
-            if streaming_callback is not None:
-                new_events = {
-                    "banks": all_banks[start_idx:end_idx],
-                    "pixel_r": all_pixels_r[start_idx:end_idx],
-                    "pixel_c": all_pixels_c[start_idx:end_idx]
-                }
-
-                streaming_callback(
-                    time=float(t_state),
-                    U_preds=np.array(U_ensemble_curr),
-                    losses=np.array(loss_ensemble),
-                    mean_loss=best_loss,
-                    best_idx=best_idx,
-                    neutron_count=end_idx,
-                    new_events=new_events,
-                    eigengap=best_gap
-                )
-
-        print(f"\n[4/4] Global Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
-        return tracking_history[-1][1]
+    print(f"\n[3/3] Global Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
+    return tracking_history[-1][1]
