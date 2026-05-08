@@ -2171,6 +2171,8 @@ def run_bingham_tracker(
     batch_size_events: int = 10000,
     n_ensemble: int = 1
 ):
+    apply_detector_calibration(finder_file, instrument_name)
+
     from subhkl.optimization import FindUB, get_lattice_system
     import h5py
     import numpy as np
@@ -2198,8 +2200,6 @@ def run_bingham_tracker(
         if "sample/U" in f:
             U_init = f["sample/U"][()]
             print("  > Discovered seed U matrix in finder file. Will initialize Bingham Prior.")
-
-    apply_detector_calibration(finder_file, instrument_name)
 
     B_mat = ub_helper.reciprocal_lattice_B()
     _, _, centering = get_lattice_system(
