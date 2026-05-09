@@ -17,7 +17,6 @@ from subhkl.commands import (
     run_reduce,
     run_merge_images,
     run_egnn,
-    run_ekf_tracker,
 )
 
 
@@ -634,33 +633,6 @@ def cmd_egnn(
         max_hkl_cons=max_hkl_cons,
         egnn_sigma_end=egnn_sigma_end,
         create_visualizations=create_visualizations,
-    )
-
-@app.command("gmphd-tracker")
-def run_gmphd_tracker(
-    finder_file: str = typer.Argument(
-        ..., help="Path to the output peaks HDF5 file from the finder."
-    ),
-    output_h5_filename: str = typer.Argument(
-        ..., help="Path to save the extracted initial UB matrix."
-    ),
-    event_nexus_filename: str = typer.Option(
-        None, "--nexus", help="Path to the original Nexus file containing scattering events."
-    ),
-    instrument: str = typer.Option(
-        None, "--instrument", help="Name of the instrument (e.g., MANDI, IMAGINE, CG4D)."
-    ),
-):
-    """
-    Extracts the initial UB matrix using the Sparse Spherical Hough Transform and
-    Topological Hessian Filtering.
-    """
-    run_gmphd_tracker(
-        finder_file=finder_file,
-        output_h5_filename=output_h5_filename,
-        instrument_name=instrument,
-        event_nexus_filename=event_nexus_filename,
-
     )
 
 if __name__ == "__main__":
