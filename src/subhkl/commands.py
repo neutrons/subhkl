@@ -2219,7 +2219,7 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_prev, t_prev, q_batch, t_batch, current_sigma_q):
+    def process_chunk(A_prev, t_prev, q_batch, ki_batch, t_batch, current_sigma_q):
         t_curr = t_batch[-1]
         dt = jnp.maximum(0.0, t_curr - t_prev)
 
