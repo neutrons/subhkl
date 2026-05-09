@@ -2286,7 +2286,7 @@ def run_bingham_tracker(
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, None, 0, 0, None, None), # Note the two 0's for q_batch and ki_batch!
+            in_axes=(0, None, None, None, None, None),
             out_axes=(0, None, 0, 0, 0)
         )
     )
