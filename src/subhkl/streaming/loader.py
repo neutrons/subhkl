@@ -94,12 +94,12 @@ def _process_single_bank(args):
         interpolated_angles = np.zeros((num_axes, num_events), dtype=np.float32)
         s_lab_static = gonio_translations[-1][:3] if gonio_translations is not None else np.zeros(3)
         s_lab_dynamic = np.tile(s_lab_static, (num_events, 1)).astype(np.float32)
-        kf = xyz - s_lab_dynamic
+        kf_lab = xyz - s_lab_dynamic
 
-    kf_norm = np.sqrt(np.sum(kf**2, axis=1, keepdims=True))
-    kf /= np.where(kf_norm == 0, 1.0, kf_norm)
+    kf_norm = np.sqrt(np.sum(kf_lab**2, axis=1, keepdims=True))
+    kf_lab /= np.where(kf_norm == 0, 1.0, kf_norm)
 
-    q_lab = kf - ki_vec[None, :]
+    q_lab = kf_lab - ki_vec[None, :]
 
     if gonio_axes is not None:
         R_inv = R_total.inv()
