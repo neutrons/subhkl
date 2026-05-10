@@ -197,14 +197,14 @@ def prepare_predict_tasks(
     beta: float,
     gamma: float,
     d_min: float,
-    UB: np.ndarray,      # <-- Changed from RUB
+    UB: np.ndarray,
     space_group: str = "P 1",
     sample_offset: Optional[np.ndarray] = None,
     ki_vec: Optional[np.ndarray] = None,
     R_all: Optional[np.ndarray] = None,
     gonio_axes: Optional[Any] = None,
     gonio_angles: Optional[np.ndarray] = None,
-    gonio_offsets: Optional[np.ndarray] = None, # <-- NEW
+    gonio_offsets: Optional[np.ndarray] = None,
 ) -> List[Tuple[Any, ...]]:
     bank_mapping = image_data.bank_mapping
     tasks = []

@@ -606,7 +606,7 @@ class VectorizedObjective:
         R_cum = None
         sample_origin_lab = jnp.zeros((x.shape[0], 1, 3))
 
-        if self.refine_goniometer or self.gonio_axes is not None:
+        if self.gonio_axes is not None:
             if self.refine_goniometer:
                 gonio_norm = jnp.full((x.shape[0], self.num_motors), 0.5)
                 if self.num_active_gonio > 0:
@@ -627,34 +627,16 @@ class VectorizedObjective:
             for i in range(self.num_gonio_axes):
                 motor_idx = self.motor_map[i]
                 direction = self.gonio_axes[i][0:3]
+                
+                # Extract direction multiplier to maintain geometry parity
+                direction_mult = self.gonio_axes[i][3] if len(self.gonio_axes[i]) > 3 else 1.0
 
                 current_axis_angle = (
                     self.gonio_angles[i, :][None, :]
                     + offsets_total[:, motor_idx][:, None]
                 )
 
-                theta = self.gonio_axes[i][3] * current_axis_angle * deg2rad
-                Ri = rotation_matrix_from_axis_angle_jax(direction, theta)
-                R = jnp.matmul(R, Ri)
-        elif self.gonio_axes is not None:
-            offsets_total = self.gonio_nominal_offsets[None, :].repeat(
-                x.shape[0], axis=0
-            )
-            S, M = offsets_total.shape[0], self.gonio_angles.shape[1]
-            R = jnp.eye(3)[None, None, ...].repeat(S, axis=0).repeat(M, axis=1)
-            R_list = []
-            deg2rad = jnp.pi / 180.0
-
-            for i in range(self.num_gonio_axes):
-                motor_idx = self.motor_map[i]
-                direction = self.gonio_axes[i][0:3]
-
-                current_axis_angle = (
-                    self.gonio_angles[i, :][None, :]
-                    + offsets_total[:, motor_idx][:, None]
-                )
-
-                theta = self.gonio_axes[i][3] * current_axis_angle * deg2rad
+                theta = direction_mult * current_axis_angle * deg2rad
                 Ri = rotation_matrix_from_axis_angle_jax(direction, theta)
                 R_list.append(Ri)
 
@@ -665,7 +647,8 @@ class VectorizedObjective:
             sample_origin_lab = jnp.zeros((S, M, 3))
             for i in reversed(range(self.num_gonio_axes)):
                 t_i = t_axes[:, i, :][:, None, :]
-                sample_origin_lab = jnp.einsum('smij,smj->smi', R_list[i], sample_origin_lab) + t_i
+                # --- NEW KINEMATICS: Translate in local frame, THEN Rotate ---
+                sample_origin_lab = jnp.einsum('smij,smj->smi', R_list[i], sample_origin_lab + t_i)
         else:
             sample_origin_lab = t_axes[:, 0, :][:, None, :]
 
@@ -1193,8 +1176,8 @@ class FindUB:
                 else np.array([0.0, 0.0, 1.0])
             )
             b_gonio_offsets = None
-            if "optimization/goniometer_offsets" in f:
-                off_data = f["optimization/goniometer_offsets"]
+            if "goniometer/offsets" in f:
+                off_data = f["goniometer/offsets"]
                 if isinstance(off_data, h5py.Group):
                     b_gonio_offsets = {k: off_data[k][()] for k in off_data.keys()}
                 else:

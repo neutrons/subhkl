@@ -384,7 +384,7 @@ def run_index(
 
     if bootstrap_filename:
         with h5py.File(bootstrap_filename, "r") as b_f:
-            off_data = b_f.get("goniometer/offsets") or b_f.get("optimization/goniometer_offsets")
+            off_data = b_f.get("goniometer/offsets")
             if off_data is not None:
                 if isinstance(off_data, h5py.Group):
                     opt.goniometer_offsets = {
@@ -918,7 +918,7 @@ def run_peak_predictor(
         B = f_idx["sample/B"][()]
 
         gonio_offsets = None
-        off_data = f_idx.get("goniometer/offsets") or f_idx.get("optimization/goniometer_offsets")
+        off_data = f_idx.get("goniometer/offsets")
         gonio_names = f_idx["goniometer/names"][()] if "goniometer/names" in f_idx else None
 
         if gonio_names is not None:
@@ -953,7 +953,7 @@ def run_peak_predictor(
 
     results_map = peaks.predict_peaks(
         a, b, c, alpha, beta, gamma, d_min,
-        RUB=UB, # <-- NOTE: We pass pure UB now!
+        UB=UB,
         space_group=space_group,
         sample_offset=sample_offset,
         ki_vec=ki_vec,
