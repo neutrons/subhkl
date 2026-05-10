@@ -218,7 +218,7 @@ class Peaks:
             R_all=R_all,
             gonio_axes=gonio_axes,
             gonio_angles=gonio_angles,
-            gonio_offsets=gonio_offset,
+            gonio_offsets=gonio_offsets,
         )
 
         ctx = multiprocessing.get_context("spawn")
