@@ -92,25 +92,32 @@ def calc_goniometer_rotation_matrix(axes, angles):
 
     return R_cum
 
-import numpy as np
-
-def sample_to_lab(p_sample, axes, angles, offsets, zero_offsets=None):
+def sample_to_lab(p_sample, axes, angles, offsets, zero_offsets=None, is_vector=False):
     """
-    Convert a point from the Sample frame to the Lab frame.
+    Convert points or vectors from the Sample frame to the Lab frame.
     
-    axes: (N, 4) array [x, y, z, direction_multiplier]
-    angles: (N,) array of raw encoder angles in degrees
-    offsets: (N, 3) array of translation lever arms (applied BEFORE rotation)
-    zero_offsets: (N,) array of zero-point angle calibrations in degrees
+    p_sample: (3,) or (N, 3) array of coordinates or vectors.
+    axes: (M, 4) array [x, y, z, direction_multiplier].
+    angles: (M,) or (M, N) array of raw encoder angles in degrees.
+    offsets: (M, 3) array of translation lever arms.
+    zero_offsets: (M,) array of zero-point angle calibrations in degrees.
+    is_vector: If True, skips translations (used for directional rays like Q or ki).
     """
-    p = np.array(p_sample)
+    p = np.array(p_sample, dtype=np.float32)
     num_axes = len(axes)
-    deg2rad = np.pi / 180.0
     
     if zero_offsets is None:
         zero_offsets = np.zeros(num_axes)
-
-    # Traverse from innermost (Sample, index N-1) to outermost (Lab, index 0)
+        
+    angles = np.array(angles)
+    is_batched_p = p.ndim == 2
+    is_batched_a = angles.ndim == 2
+    
+    # Broadcast points to match the number of temporal angles if necessary
+    if is_batched_a and not is_batched_p:
+        p = np.tile(p, (angles.shape[1], 1))
+        
+    # Traverse from innermost (Sample, index M-1) to outermost (Lab, index 0)
     for i in reversed(range(num_axes)):
         direction = axes[i][:3]
         direction_mult = axes[i][3] if len(axes[i]) > 3 else 1.0
@@ -119,36 +126,41 @@ def sample_to_lab(p_sample, axes, angles, offsets, zero_offsets=None):
         if axis_norm > 0:
             direction = direction / axis_norm
             
-        # Apply the zero-point offset to the raw encoder angle
         true_angle = angles[i] + zero_offsets[i]
-        theta = direction_mult * true_angle * deg2rad
-
-        # Build standard Rodrigues rotation matrix
-        K = np.array([
-            [0, -direction[2], direction[1]],
-            [direction[2], 0, -direction[0]],
-            [-direction[1], direction[0], 0]
-        ])
-        R_i = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
-
-        # NEW KINEMATICS: Translate in the local frame (lever arm), THEN Rotate
-        p = R_i @ (p + offsets[i])
+        theta_rad = np.radians(true_angle * direction_mult)
+        
+        # Build SciPy Rotation (handles both scalar and N-dimensional arrays natively)
+        if np.isscalar(theta_rad) or theta_rad.ndim == 0:
+            R_i = Rotation.from_rotvec(theta_rad * direction)
+        else:
+            rotvecs = theta_rad[:, None] * direction[None, :]
+            R_i = Rotation.from_rotvec(rotvecs)
+            
+        # Translate in the local frame (lever arm), THEN Rotate
+        if not is_vector:
+            p = p + offsets[i][:3]
+        p = R_i.apply(p)
 
     return p
 
-
-def lab_to_sample(p_lab, axes, angles, offsets, zero_offsets=None):
+def lab_to_sample(p_lab, axes, angles, offsets, zero_offsets=None, is_vector=False):
     """
-    Convert a point from the Lab frame back to the Sample frame.
+    Convert points or vectors from the Lab frame back to the Sample frame.
     """
-    p = np.array(p_lab)
+    p = np.array(p_lab, dtype=np.float32)
     num_axes = len(axes)
-    deg2rad = np.pi / 180.0
     
     if zero_offsets is None:
         zero_offsets = np.zeros(num_axes)
-
-    # Traverse from outermost (Lab, index 0) to innermost (Sample, index N-1)
+        
+    angles = np.array(angles)
+    is_batched_p = p.ndim == 2
+    is_batched_a = angles.ndim == 2
+    
+    if is_batched_a and not is_batched_p:
+        p = np.tile(p, (angles.shape[1], 1))
+        
+    # Traverse from outermost (Lab, index 0) to innermost (Sample, index M-1)
     for i in range(num_axes):
         direction = axes[i][:3]
         direction_mult = axes[i][3] if len(axes[i]) > 3 else 1.0
@@ -158,17 +170,18 @@ def lab_to_sample(p_lab, axes, angles, offsets, zero_offsets=None):
             direction = direction / axis_norm
             
         true_angle = angles[i] + zero_offsets[i]
-        theta = direction_mult * true_angle * deg2rad
-
-        K = np.array([
-            [0, -direction[2], direction[1]],
-            [direction[2], 0, -direction[0]],
-            [-direction[1], direction[0], 0]
-        ])
-        R_i = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
-
+        theta_rad = np.radians(true_angle * direction_mult)
+        
+        if np.isscalar(theta_rad) or theta_rad.ndim == 0:
+            R_i = Rotation.from_rotvec(theta_rad * direction)
+        else:
+            rotvecs = theta_rad[:, None] * direction[None, :]
+            R_i = Rotation.from_rotvec(rotvecs)
+            
         # INVERSE KINEMATICS: Reverse Rotate, THEN subtract local translation
-        p = (R_i.T @ p) - offsets[i]
+        p = R_i.inv().apply(p)
+        if not is_vector:
+            p = p - offsets[i][:3]
 
     return p
 
