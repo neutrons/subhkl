@@ -37,7 +37,7 @@ def predict_reflections_on_panel(
     h,
     k,
     l,
-    RUB,
+    UB,
     wavelength_min,
     wavelength_max,
     sample_offset=None,
@@ -45,12 +45,12 @@ def predict_reflections_on_panel(
     R_all=None,
     gonio_axes=None,
     gonio_angles=None,
-    gonio_offsets=None,
+    gonio_offsets=None,   # <-- NEW
 ):
     """
     Predict reflection positions on a specific detector panel.
-    Expects RUB to be a SINGLE (3,3) matrix for this specific panel's exposure.
-    Expects h, k, l to be 1D arrays of length M (the theoretical reflection pool).
+    Expects UB to map the crystal to the sample frame.
+    Expects h, k, l to be 1D arrays of length M.
     """
     if ki_vec is None:
         ki_vec = np.array([0.0, 0.0, 1.0])
@@ -58,14 +58,52 @@ def predict_reflections_on_panel(
     ki_hat = ki_vec / np.linalg.norm(ki_vec)
     hkl = np.stack([h, k, l], axis=0)  # (3, M)
 
-    # 1. Transform Miller indices to absolute Lab frame Q-vectors
-    q_lab = RUB @ hkl
-    Q_vec = 2 * np.pi * q_lab  # (3, M)
+    # 1. Transform Miller indices to Sample frame Q-vectors
+    q_sample = UB @ hkl  # (3, M)
 
+    # 2. Transform Sample frame Q-vectors to absolute Lab frame Q-vectors
+    if gonio_axes is not None and gonio_angles is not None:
+        from subhkl.instrument.goniometer import sample_to_lab
+        offsets = sample_offset
+        if offsets is not None and offsets.ndim == 1:
+            offsets_full = np.zeros((len(gonio_axes), 3))
+            offsets_full[-1] = offsets
+        elif offsets is None:
+            offsets_full = np.zeros((len(gonio_axes), 3))
+        else:
+            offsets_full = offsets
+
+        # Lab frame Q-vectors (is_vector=True skips translations)
+        q_lab_T = sample_to_lab(
+            q_sample.T, 
+            gonio_axes, 
+            gonio_angles, 
+            offsets_full, 
+            zero_offsets=gonio_offsets, 
+            is_vector=True
+        )
+        q_lab = q_lab_T.T
+        
+        # True Sample Ray Origin (is_vector=False applies translations)
+        s_lab = sample_to_lab(
+            np.array([0.0, 0.0, 0.0]), 
+            gonio_axes, 
+            gonio_angles, 
+            offsets_full, 
+            zero_offsets=gonio_offsets,
+            is_vector=False
+        )
+    else:
+        # Legacy fallback
+        s = sample_offset if sample_offset is not None else np.zeros(3)
+        s_lab = R_all @ s if R_all is not None else s
+        q_lab = R_all @ q_sample if R_all is not None else q_sample
+
+    Q_vec = 2 * np.pi * q_lab  # (3, M)
     Q_sq = np.sum(Q_vec**2, axis=0)  # (M,)
     Q_dot_ki = np.sum(Q_vec * ki_hat[:, None], axis=0)  # (M,)
 
-    # 2. Solve Laue Condition for Wavelength
+    # 3. Solve Laue Condition for Wavelength
     with np.errstate(divide="ignore", invalid="ignore"):
         lamda = -4 * np.pi * Q_dot_ki / Q_sq  # (M,)
 
@@ -81,38 +119,10 @@ def predict_reflections_on_panel(
     Q_vec_v = Q_vec[:, mask_wl]
     h_v, k_v, l_v = h[mask_wl], k[mask_wl], l[mask_wl]
 
-
-    # 3. Calculate Final Scattered Ray Direction (kf)
+    # 4. Calculate Final Scattered Ray Direction (kf)
     k_mag = 2 * np.pi / lamda_v
     kf_vec = Q_vec_v + k_mag * ki_hat[:, None]  # (3, M_v)
     kf_dir = kf_vec / np.linalg.norm(kf_vec, axis=0, keepdims=True)  # (3, M_v)
-
-    # 4. Resolve the True Sample Ray Origin (s_lab)
-    if gonio_axes is not None and gonio_angles is not None:
-        from subhkl.instrument.goniometer import sample_to_lab
-        offsets = sample_offset
-        if offsets is not None and offsets.ndim == 1:
-            offsets_full = np.zeros((len(gonio_axes), 3))
-            offsets_full[-1] = offsets
-        elif offsets is None:
-            offsets_full = np.zeros((len(gonio_axes), 3))
-        else:
-            offsets_full = offsets
-
-        s_lab = sample_to_lab(
-            np.array([0.0, 0.0, 0.0]), 
-            gonio_axes, 
-            gonio_angles, 
-            offsets_full, 
-            zero_offsets=gonio_offsets
-        )
-    else:
-        # Legacy fallback
-        s = sample_offset if sample_offset is not None else np.zeros(3)
-        if R_all is not None:
-            s_lab = R_all @ s
-        else:
-            s_lab = s
 
     # 5. Intersect with Panel
     mask_panel, row, col = detector.reflections_mask(
@@ -124,9 +134,6 @@ def predict_reflections_on_panel(
         h_v[mask_panel], k_v[mask_panel], l_v[mask_panel],
         lamda_v[mask_panel],
     )
-
-
-    from subhkl.instrument.goniometer import sample_to_lab
 
 def calculate_angular_error(
     xyz_det: npt.NDArray,

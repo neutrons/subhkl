@@ -196,6 +196,7 @@ class Peaks:
         show_progress: bool = False,
         gonio_axes=None,
         gonio_angles=None,
+        gonio_offsets=None,
     ) -> dict:
         peak_dict = {}
         tasks = orchestrator.prepare_predict_tasks(
@@ -216,7 +217,8 @@ class Peaks:
             ki_vec=ki_vec,
             R_all=R_all,
             gonio_axes=gonio_axes,
-            gonio_angles=gonio_angles
+            gonio_angles=gonio_angles,
+            gonio_offsets=gonio_offset,
         )
 
         ctx = multiprocessing.get_context("spawn")

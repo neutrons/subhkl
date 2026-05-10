@@ -284,7 +284,7 @@ def predict_single_bank(
     bank_id,
     det_config,
     unit_cell_params,
-    RUB_bank,
+    UB,
     wavelength_min,
     wavelength_max,
     sample_offset,
@@ -292,6 +292,7 @@ def predict_single_bank(
     R_bank=None,
     gonio_axes=None,
     gonio_angles=None,
+    gonio_offsets=None,   # <-- NEW
 ):
     """
     Worker function for predicting peaks on a single detector bank.
@@ -311,7 +312,7 @@ def predict_single_bank(
         h=h,
         k=k,
         l=l,
-        RUB=RUB_bank,
+        UB=UB,             # <-- Pass UB
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
         sample_offset=sample_offset,
@@ -319,10 +320,11 @@ def predict_single_bank(
         R_all=R_bank,
         gonio_axes=gonio_axes,
         gonio_angles=gonio_angles,
+        gonio_offsets=gonio_offsets, # <-- Pass Down
     )
     if len(row) > 0:
         return bank_id, [row, col, h_f, k_f, l_f, wl_f]
-    return img_key, None
+    return img_key, None 
 
 def integrate_single_bank(
     bank_id,

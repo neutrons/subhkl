@@ -197,13 +197,14 @@ def prepare_predict_tasks(
     beta: float,
     gamma: float,
     d_min: float,
-    RUB: np.ndarray,
+    UB: np.ndarray,      # <-- Changed from RUB
     space_group: str = "P 1",
     sample_offset: Optional[np.ndarray] = None,
     ki_vec: Optional[np.ndarray] = None,
     R_all: Optional[np.ndarray] = None,
     gonio_axes: Optional[Any] = None,
     gonio_angles: Optional[np.ndarray] = None,
+    gonio_offsets: Optional[np.ndarray] = None, # <-- NEW
 ) -> List[Tuple[Any, ...]]:
     bank_mapping = image_data.bank_mapping
     tasks = []
@@ -221,19 +222,9 @@ def prepare_predict_tasks(
         bank_id = bank_mapping.get(img_key, img_key)
         det_config = beamlines[instrument][str(int(bank_id))]
 
-        # Correctly identify the physical frame index
         run_id = image_data.get_run_id(img_key)
 
-        # 1. Extract single RUB
-        if RUB.ndim == 3:
-            if len(RUB) == total_images:
-                RUB_bank = RUB[img_index]
-            else:
-                RUB_bank = RUB[run_id] if run_id < len(RUB) else RUB[0]
-        else:
-            RUB_bank = RUB
-
-        # 2. Extract single R matrix
+        # 1. Extract single R matrix (Legacy Fallback)
         R_bank = None
         if R_all is not None:
             if R_all.ndim == 3:
@@ -244,19 +235,17 @@ def prepare_predict_tasks(
             else:
                 R_bank = R_all
 
-        # 3. Extract single goniometer angle state
+        # 2. Extract single goniometer angle state
         angles_bank = None
         if gonio_angles is not None:
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes) if gonio_axes is not None else 1
                 if gonio_angles.shape[1] == num_axes:
-                    # Shape is (N, N_axes)
                     if gonio_angles.shape[0] == total_images:
                         angles_bank = gonio_angles[img_index, :]
                     else:
                         angles_bank = gonio_angles[run_id, :] if run_id < gonio_angles.shape[0] else gonio_angles[0, :]
                 else:
-                    # Shape is (N_axes, N)
                     if gonio_angles.shape[1] == total_images:
                         angles_bank = gonio_angles[:, img_index]
                     else:
@@ -270,14 +259,15 @@ def prepare_predict_tasks(
                 bank_id,
                 det_config,
                 unit_cell_params,
-                RUB_bank,         # <-- Extracted single matrix
+                UB,               # <-- Pass constant UB!
                 wavelength_min,
                 wavelength_max,
                 sample_offset,
                 ki_vec,
-                R_bank,           # <-- Extracted single matrix
+                R_bank,
                 gonio_axes,
-                angles_bank,      # <-- Extracted single angle array
+                angles_bank,
+                gonio_offsets,    # <-- NEW
             )
         )
     return tasks
