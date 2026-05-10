@@ -6,6 +6,7 @@ import concurrent.futures
 
 from subhkl.instrument.detector import Detector
 from subhkl.config import beamlines, reduction_settings
+from subhkl.instrument.goniometer import sample_to_lab, lab_to_sample
 
 def _process_single_bank(args):
     """Parallel worker to parse and project a single detector bank."""
@@ -27,11 +28,9 @@ def _process_single_bank(args):
 
     if len(event_id) == 0: return None
 
-    # Fast Unfold
     counts_per_pulse = np.diff(np.append(event_index, len(event_time_offset))).astype(int)
     absolute_time = np.repeat(event_time_zero, counts_per_pulse) + (event_time_offset * 1e-6)
 
-    # Map Pixels
     det_config = beamlines[instrument_name][bank_str]
     det = Detector(det_config)
     settings = reduction_settings.get(instrument_name, {})
@@ -51,44 +50,22 @@ def _process_single_bank(args):
     num_axes = len(gonio_axes) if gonio_axes is not None else 1
 
     if gonio_axes is not None and gonio_continuous_logs is not None:
-        num_events = len(absolute_time)
-        interpolated_angles = np.zeros((len(gonio_axes), num_events), dtype=np.float32)
+        interpolated_angles = np.zeros((num_axes, num_events), dtype=np.float32)
         
-        for i in range(len(gonio_axes)):
+        for i in range(num_axes):
             g_times, g_vals = gonio_continuous_logs[i]
             if len(g_times) <= 1:
                 interpolated_angles[i, :] = g_vals[0] if len(g_vals) > 0 else 0.0
             else:
                 interpolated_angles[i, :] = np.interp(absolute_time, g_times, g_vals)
-            
-        from scipy.spatial.transform import Rotation
-        s_lab_dynamic = np.zeros((num_events, 3), dtype=np.float32)
-        
-        # Track the accumulated rotation matrix for the sample frame
-        R_total = Rotation.identity(num_events)
-        
-        for i in range(len(gonio_axes) - 1, -1, -1):
-            axis = gonio_axes[i][:3]
-            direction_mult = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
-            
-            axis_norm = np.linalg.norm(axis)
-            if axis_norm > 0:
-                axis = axis / axis_norm
-                
-            axis_offset = gonio_offsets[i] if gonio_offsets is not None else 0.0
-            theta_rad = np.radians((interpolated_angles[i, :] + axis_offset) * direction_mult)
-            
-            rotvecs = theta_rad[:, None] * axis[None, :]
-            R_i = Rotation.from_rotvec(rotvecs)
-            
-            # Accumulate the rotation: R_total = R_i * R_total
-            R_total = R_i * R_total
-            
-            s_lab_dynamic = R_i.apply(s_lab_dynamic)
-            
-            if gonio_translations is not None:
-                s_lab_dynamic += gonio_translations[i][:3]
-                
+
+        s_lab_dynamic = sample_to_lab(
+            np.zeros((num_events, 3)), 
+            gonio_axes, 
+            interpolated_angles, 
+            gonio_translations, 
+            zero_offsets=gonio_offsets
+        )
         kf_lab = xyz - s_lab_dynamic
     else:
         interpolated_angles = np.zeros((num_axes, num_events), dtype=np.float32)
@@ -98,13 +75,16 @@ def _process_single_bank(args):
 
     kf_norm = np.sqrt(np.sum(kf_lab**2, axis=1, keepdims=True))
     kf_lab /= np.where(kf_norm == 0, 1.0, kf_norm)
-
     q_lab = kf_lab - ki_vec[None, :]
 
     if gonio_axes is not None:
-        R_inv = R_total.inv()
-        q_sample = R_inv.apply(q_lab)
-        ki_sample = R_inv.apply(np.tile(ki_vec, (num_events, 1)))
+        # Pass is_vector=True so translations are ignored for directional momentum rays!
+        q_sample = lab_to_sample(
+            q_lab, gonio_axes, interpolated_angles, gonio_translations, gonio_offsets, is_vector=True
+        )
+        ki_sample = lab_to_sample(
+            np.tile(ki_vec, (num_events, 1)), gonio_axes, interpolated_angles, gonio_translations, gonio_offsets, is_vector=True
+        )
     else:
         q_sample = q_lab
         ki_sample = np.tile(ki_vec, (num_events, 1))
@@ -112,21 +92,17 @@ def _process_single_bank(args):
     banks = np.full(num_events, bank_id, dtype=np.int16)
 
     return (
-        q_sample.astype(np.float32),
+        q_sample.astype(np.float32), 
         absolute_time,
         banks,
         pixel_r.astype(np.int16),
         pixel_c.astype(np.int16),
         interpolated_angles.T.astype(np.float32),
         s_lab_dynamic,
-        ki_sample.astype(np.float32)
+        ki_sample.astype(np.float32) 
     )
 
 class EventStreamLoader:
-    """
-    Stateful event loader. Performs heavy I/O, kinematic projection, and global 
-    chronological sorting exactly once during instantiation.
-    """
     def __init__(
         self,
         event_nexus_filename: str,
@@ -149,7 +125,6 @@ class EventStreamLoader:
         self._load_and_sort_events()
 
     def _load_and_sort_events(self):
-        # --- NEW: Extract the true continuous NeXus logs ---
         gonio_continuous_logs = []
         with h5py.File(self.event_nexus_filename, 'r') as f:
             keys = [k for k in f['entry'].keys() if k.endswith('_events')]
@@ -163,10 +138,8 @@ class EventStreamLoader:
                             v = f[f'{log_path}/value'][:]
                             gonio_continuous_logs.append((t, v))
                         else:
-                            # Fallback for missing logs
                             gonio_continuous_logs.append((np.array([0.0]), np.array([0.0])))
                     except Exception as e:
-                        print(f"Warning: Failed to load continuous log for {name}: {e}")
                         gonio_continuous_logs.append((np.array([0.0]), np.array([0.0])))
             else:
                 gonio_continuous_logs = None
@@ -178,7 +151,7 @@ class EventStreamLoader:
                 self.instrument_name, 
                 self.ki_vec, 
                 self.gonio_axes, 
-                gonio_continuous_logs,
+                gonio_continuous_logs, 
                 self.sample_offset,
                 self.gonio_offsets
             )
@@ -186,8 +159,7 @@ class EventStreamLoader:
         ]
 
         all_q_lab, all_times, all_banks, all_pixels_r, all_pixels_c = [], [], [], [], []
-        all_angles, all_slab = [], []
-        all_ki_sample = []
+        all_angles, all_slab, all_ki_sample = [], [], []
         
         print(f"  > Extracting and projecting {len(keys)} detector banks via Multiprocessing...")
         with concurrent.futures.ProcessPoolExecutor(max_workers=multiprocessing.cpu_count()) as executor:
