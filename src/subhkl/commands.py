@@ -646,16 +646,10 @@ def run_index(
         if opt.run_indices is not None:
             safe_write(f, "peaks/run_index", opt.run_indices)
 
-        if mode != "zone_axis":
-            f["peaks/h"] = hkl_uvw[:, 0]
-            f["peaks/k"] = hkl_uvw[:, 1]
-            f["peaks/l"] = hkl_uvw[:, 2]
-            f["peaks/lambda"] = lambda_S
-        else:
-            f["zones/u"] = hkl_uvw[:, 0]
-            f["zones/v"] = hkl_uvw[:, 1]
-            f["zones/w"] = hkl_uvw[:, 2]
-            f["zones/S"] = lambda_S
+        f["peaks/h"] = hkl_uvw[:, 0]
+        f["peaks/k"] = hkl_uvw[:, 1]
+        f["peaks/l"] = hkl_uvw[:, 2]
+        f["peaks/lambda"] = lambda_S
 
         if opt.x is not None and opt.x.size > 0:
             f["optimization/best_params"] = opt.x
