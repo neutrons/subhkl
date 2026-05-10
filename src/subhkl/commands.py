@@ -911,21 +911,28 @@ def run_peak_predictor(
             space_group = f_idx["sample/space_group"][()].decode("utf-8")
 
         wavelength = f_idx["instrument/wavelength"][()]
-        if wavel_min:
-            wavelength[0] = wavel_min
-        if wavel_max:
-            wavelength[1] = wavel_max
+        if wavel_min: wavelength[0] = wavel_min
+        if wavel_max: wavelength[1] = wavel_max
 
         U = f_idx["sample/U"][()]
         B = f_idx["sample/B"][()]
 
-        offsets = None
+        gonio_offsets = None
         off_data = f_idx.get("goniometer/offsets") or f_idx.get("optimization/goniometer_offsets")
+        gonio_names = f_idx["goniometer/names"][()] if "goniometer/names" in f_idx else None
+
+        if gonio_names is not None:
+            gonio_names = [n.decode('utf-8') if isinstance(n, bytes) else str(n) for n in gonio_names]
+
         if off_data is not None:
-            if isinstance(off_data, h5py.Group):
-                offsets = {k: off_data[k][()] for k in off_data.keys()}
+            gonio_offsets = np.zeros(len(gonio_names) if gonio_names else 1, dtype=np.float32)
+            if isinstance(off_data, h5py.Group) and gonio_names is not None:
+                for i, name in enumerate(gonio_names):
+                    if name in off_data:
+                        gonio_offsets[i] = float(off_data[name][()])
             else:
-                offsets = off_data[()]
+                raw_offs = off_data[()]
+                gonio_offsets[:len(raw_offs)] = raw_offs
 
         if "goniometer/translations" in f_idx:
             sample_offset = f_idx["goniometer/translations"][()]
@@ -933,81 +940,30 @@ def run_peak_predictor(
             sample_offset = np.zeros(3)
 
         gonio_axes = f_idx["goniometer/axes"][()] if "goniometer/axes" in f_idx else None
+        ki_vec = f_idx["beam/ki_vec"][()] if "beam/ki_vec" in f_idx else np.array([0.0, 0.0, 1.0])
 
-        ki_vec = (
-            f_idx["beam/ki_vec"][()]
-            if "beam/ki_vec" in f_idx
-            else np.array([0.0, 0.0, 1.0])
-        )
+    peaks = Peaks(filename, instrument, wavelength_min=wavelength[0], wavelength_max=wavelength[1])
+    print(f"Predicting peaks for {len(peaks.image.ims)} images using solution from {indexed_hdf5_filename}")
 
-    peaks = Peaks(
-        filename, instrument, wavelength_min=wavelength[0], wavelength_max=wavelength[1]
-    )
-    print(
-        f"Predicting peaks for {len(peaks.image.ims)} images using solution from {indexed_hdf5_filename}"
-    )
+    if gonio_offsets is not None:
+        print(f"Applying refined goniometer offsets from indexer: {gonio_offsets}")
 
-    all_R = peaks.goniometer.rotation
-
-    if offsets is not None:
-        from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
-
-        print(f"Applying refined goniometer offsets from indexer: {offsets}")
-        if (
-            peaks.goniometer.angles_raw is not None
-            and peaks.goniometer.axes_raw is not None
-        ):
-            # --- SAFE NAMED MAPPING ---
-            if isinstance(offsets, dict) and peaks.goniometer.names_raw is not None:
-                mapped_offsets = np.array(
-                    [offsets.get(name, 0.0) for name in peaks.goniometer.names_raw]
-                )
-            else:
-                # Legacy array fallback
-                motor_map = []
-                if peaks.goniometer.names_raw is not None:
-                    unique_motors = []
-                    for name in peaks.goniometer.names_raw:
-                        if name not in unique_motors:
-                            unique_motors.append(name)
-                        motor_map.append(unique_motors.index(name))
-                else:
-                    motor_map = list(range(len(peaks.goniometer.axes_raw)))
-                mapped_offsets = np.array(
-                    [offsets[motor_map[i]] for i in range(len(motor_map))]
-                )
-
-            angles_refined = peaks.goniometer.angles_raw + mapped_offsets[None, :]
-
-            all_R = np.stack(
-                [
-                    calc_goniometer_rotation_matrix(peaks.goniometer.axes_raw, ang)
-                    for ang in angles_refined
-                ]
-            )
-
+    # Pass the Base UB matrix. The predictor will apply dynamic R_gonio internally!
     UB = U @ B
-    if all_R.ndim == 3:
-        RUB = np.matmul(all_R, UB)
-    else:
-        RUB = all_R @ UB
 
     results_map = peaks.predict_peaks(
-        a,
-        b,
-        c,
-        alpha,
-        beta,
-        gamma,
-        d_min,
-        RUB=RUB,
+        a, b, c, alpha, beta, gamma, d_min,
+        RUB=UB, # <-- NOTE: We pass pure UB now!
         space_group=space_group,
         sample_offset=sample_offset,
         ki_vec=ki_vec,
         max_workers=max_workers,
-        R_all=all_R,
-        gonio_axes=gonio_axes,
-        gonio_angles=angles_refined,
+
+        # --- NEW GROUND TRUTH DELEGATION ---
+        R_all=None, # Force dynamic evaluation
+        gonio_axes=peaks.goniometer.axes_raw,
+        gonio_angles=peaks.goniometer.angles_raw,
+        gonio_offsets=gonio_offsets # Pass the pure zero-points
     )
 
     print(f"Saving predictions to {integration_peaks_filename}")
@@ -1017,46 +973,34 @@ def run_peak_predictor(
         f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = alpha, beta, gamma
 
         sorted_keys = sorted(peaks.image.ims.keys())
-        bank_ids = np.array(
-            [peaks.image.bank_mapping.get(k, k) for k in sorted_keys], dtype=np.int32
-        )
+        bank_ids = np.array([peaks.image.bank_mapping.get(k, k) for k in sorted_keys], dtype=np.int32)
         f.create_dataset("bank_ids", data=bank_ids)
 
         f["sample/space_group"] = space_group
         f["sample/U"], f["sample/B"] = U, B
         f["instrument/wavelength"] = wavelength
-        f["goniometer/R"] = all_R
+        f["beam/ki_vec"] = ki_vec
 
-        try:
-            goniometer_angles_to_save = angles_refined
-        except NameError:
-            goniometer_angles_to_save = peaks.goniometer.angles_raw
-
-        f["goniometer/angles"] = goniometer_angles_to_save
+        # --- SAVE RAW UNCORRECTED METADATA ---
+        f["goniometer/angles"] = peaks.goniometer.angles_raw
         f["goniometer/axes"] = peaks.goniometer.axes_raw
+        f["goniometer/translations"] = sample_offset
+        if gonio_offsets is not None:
+            f["goniometer/offsets"] = gonio_offsets
+
         if peaks.goniometer.names_raw:
             dt = h5py.string_dtype(encoding="utf-8")
-            f.create_dataset(
-                "goniometer/names", data=peaks.goniometer.names_raw, dtype=dt
-            )
-
-        f["goniometer/translations"] = sample_offset
-        f["beam/ki_vec"] = ki_vec
+            f.create_dataset("goniometer/names", data=peaks.goniometer.names_raw, dtype=dt)
 
         for img_key, (i, j, h, k, l, wl) in results_map.items():
             grp = f.create_group(f"banks/{img_key}")
-            grp.create_dataset("i", data=i)
-            grp.create_dataset("j", data=j)
-            grp.create_dataset("h", data=h)
-            grp.create_dataset("k", data=k)
-            grp.create_dataset("l", data=l)
+            grp.create_dataset("i", data=i), grp.create_dataset("j", data=j)
+            grp.create_dataset("h", data=h), grp.create_dataset("k", data=k), grp.create_dataset("l", data=l)
             grp.create_dataset("wavelength", data=wl)
 
-        # Forward the calibration group to the prediction file
         with h5py.File(indexed_hdf5_filename, "r") as f_in:
             if "detector_calibration" in f_in:
                 f_in.copy("detector_calibration", f)
-
 
 def run_rbf_integrator(
     filename: str,
@@ -1082,45 +1026,27 @@ def run_rbf_integrator(
 
     sigma_list = [float(k.strip()) for k in sigmas.split(",")]
     print(f"Starting Dense Sparse RBF Integration on {filename}")
-    print(
-        f"Parameters: Alpha={alpha}, Gamma={gamma}, Sigma={sigma_list}"
-    )
+    print(f"Parameters: Alpha={alpha}, Gamma={gamma}, Sigma={sigma_list}")
 
     peak_dict = {}
 
     with h5py.File(integration_peaks_filename, "r") as f:
-        if "sample/U" in f:
-            f["sample/U"][()]
-        if "sample/B" in f:
-            f["sample/B"][()]
-        if "goniometer/R" in f:
-            all_R = f["goniometer/R"][()]
-        if "goniometer/angles" in f:
-            angles_stack = f["goniometer/angles"][()]
-
-        if "goniometer/translations" in f:
-            sample_offset = f["goniometer/translations"][()]
-        else:
-            sample_offset = np.zeros(3)
-
+        angles_stack = f["goniometer/angles"][()] if "goniometer/angles" in f else None
+        sample_offset = f["goniometer/translations"][()] if "goniometer/translations" in f else np.zeros(3)
         gonio_axes = f["goniometer/axes"][()] if "goniometer/axes" in f else None
+
+        gonio_offsets = f["goniometer/offsets"][()] if "goniometer/offsets" in f else None
 
         for key in f["banks"].keys():
             img_idx = int(key)
             grp = f[f"banks/{key}"]
             peak_dict[img_idx] = [
-                grp["i"][()],
-                grp["j"][()],
-                grp["h"][()],
-                grp["k"][()],
-                grp["l"][()],
-                grp["wavelength"][()],
+                grp["i"][()], grp["j"][()], grp["h"][()],
+                grp["k"][()], grp["l"][()], grp["wavelength"][()]
             ]
 
     peaks = Peaks(filename, instrument)
 
-    if all_R is None:
-        all_R = peaks.goniometer.rotation
     if angles_stack is None:
         angles_stack = peaks.goniometer.angles_raw
 
@@ -1135,7 +1061,7 @@ def run_rbf_integrator(
         gamma=gamma,
         nominal_sigma=nominal_sigma,
         show_progress=show_progress,
-        all_R=all_R,
+        all_R=None,
         sample_offset=sample_offset,
         anisotropic=anisotropic,
         fit_mosaicity=fit_mosaicity,
@@ -1145,47 +1071,32 @@ def run_rbf_integrator(
         file_prefix=filename,
         max_workers=max_workers,
         gonio_axes=gonio_axes,
-        gonio_angles=angles_stack
+        gonio_angles=angles_stack,
+        gonio_offsets=gonio_offsets
     )
 
     print(f"Saving RBF integrated peaks to {output_filename}")
     with h5py.File(output_filename, "w") as f:
-        f["peaks/h"] = result.h
-        f["peaks/k"] = result.k
-        f["peaks/l"] = result.l
+        f["peaks/h"], f["peaks/k"], f["peaks/l"] = result.h, result.k, result.l
         f["peaks/lambda"] = result.wavelength
-        f["peaks/intensity"] = result.intensity
-        f["peaks/sigma"] = result.sigma  # SVD-stabilized Fisher Info UQ
-        f["peaks/two_theta"] = result.tt
-        f["peaks/azimuthal"] = result.az
-        f["peaks/bank"] = result.bank
-        f["peaks/run_index"] = result.run_id
+        f["peaks/intensity"], f["peaks/sigma"] = result.intensity, result.sigma
+        f["peaks/two_theta"], f["peaks/azimuthal"] = result.tt, result.az
+        f["peaks/bank"], f["peaks/run_index"] = result.bank, result.run_id
 
-        # Copy full metadata context from predictor output
+        # Copy metadata
         copy_keys = [
-            "sample/a",
-            "sample/b",
-            "sample/c",
-            "sample/alpha",
-            "sample/beta",
-            "sample/gamma",
-            "sample/space_group",
-            "sample/U",
-            "sample/B",
-            "goniometer/translations",
-            "beam/ki_vec",
-            "instrument/wavelength",
+            "sample/a", "sample/b", "sample/c",
+            "sample/alpha", "sample/beta", "sample/gamma",
+            "sample/space_group", "sample/U", "sample/B",
+            "goniometer/translations", "goniometer/offsets", # <-- INCLUDED
+            "beam/ki_vec", "instrument/wavelength",
         ]
 
         with h5py.File(integration_peaks_filename, "r") as f_in:
             for key in copy_keys:
-                if key in f_in:
-                    f_in.copy(f_in[key], f, key)
-
+                if key in f_in: f_in.copy(f_in[key], f, key)
             for k in ["goniometer/axes", "goniometer/names"]:
-                if k in f_in:
-                    f_in.copy(f_in[k], f, k)
-
+                if k in f_in: f_in.copy(f_in[k], f, k)
 
 def run_integrator(
     filename: str,
