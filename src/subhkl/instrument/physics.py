@@ -126,11 +126,13 @@ def predict_reflections_on_panel(
     )
 
 
+    from subhkl.instrument.goniometer import sample_to_lab
+
 def calculate_angular_error(
     xyz_det: npt.NDArray,
     h: npt.NDArray,
     k: npt.NDArray,
-    l: npt.NDArray,  # noqa: E741
+    l: npt.NDArray,
     lam: npt.NDArray,
     RUB: npt.NDArray,
     sample_offset: npt.NDArray = None,
@@ -138,22 +140,16 @@ def calculate_angular_error(
     R_all: npt.NDArray = None,
     gonio_axes: npt.NDArray = None,
     gonio_angles: npt.NDArray = None,
+    gonio_offsets: npt.NDArray = None, 
 ):
-    """
-    Calculate D-spacing and Angular errors for observed peaks vs predicted geometry.
-    Uses the RUB matrix (R @ U @ B) for all coordinate transformations.
-    gonio_angles is expected to be shape (N_peaks, N_axes).
-    """
     if sample_offset is None:
         sample_offset = np.zeros(3)
     if ki_vec is None:
         ki_vec = np.array([0.0, 0.0, 1.0])
 
-    # 1. Calculate Q_calc (Lab Frame)
     q_lab_calc = get_q_lab(h, k, l, RUB)
     q_calc_norm = q_lab_calc / np.linalg.norm(q_lab_calc, axis=1, keepdims=True)
 
-    # 2. Calculate Q_obs (Lab Frame) from Detector Pixel Position
     if gonio_axes is not None and gonio_angles is not None:
         offsets = sample_offset
         if offsets.ndim == 1:
@@ -161,35 +157,18 @@ def calculate_angular_error(
             offsets_full[-1] = offsets
         else:
             offsets_full = offsets
-
-        s_lab = np.zeros((len(xyz_det), 3))
-        deg2rad = np.pi / 180.0
-
+            
+        # Ensure angles broadcast properly if a 1D array was passed
         angles = np.tile(gonio_angles, (len(xyz_det), 1)) if gonio_angles.ndim == 1 else gonio_angles
 
-        for i in reversed(range(len(gonio_axes))):
-            direction = gonio_axes[i][:3]
-            direction_mult = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
-            direction = direction / np.linalg.norm(direction)
-
-            # Apply zero point to true angle
-            axis_offset = gonio_offsets[i] if gonio_offsets is not None else 0.0
-            true_angle = angles[:, i] + axis_offset
-            theta = direction_mult * true_angle * deg2rad 
-
-            K = np.array([
-                [0, -direction[2], direction[1]],
-                [direction[2], 0, -direction[0]],
-                [-direction[1], direction[0], 0]
-            ])
-
-            sin_t = np.sin(theta)[:, None, None]
-            cos_t = np.cos(theta)[:, None, None]
-            K_sq = K @ K
-            R_i = np.eye(3)[None, :, :] + sin_t * K[None, :, :] + (1 - cos_t) * K_sq[None, :, :]
-
-            s_lab = np.einsum("nij,nj->ni", R_i, s_lab + offsets_full[i])
-
+        # Note: angles is shape (N_peaks, N_axes). sample_to_lab expects (N_axes, N_peaks), so we transpose it.
+        s_lab = sample_to_lab(
+            np.zeros((len(xyz_det), 3)), 
+            gonio_axes, 
+            angles.T, 
+            offsets_full, 
+            zero_offsets=gonio_offsets
+        )
         v = xyz_det - s_lab
     elif R_all is not None:
         # Legacy static fallback
@@ -200,7 +179,6 @@ def calculate_angular_error(
         v = xyz_det - s_lab
     else:
         v = xyz_det - sample_offset
-    # ------------------------------------------------------
 
     dist = np.linalg.norm(v, axis=1, keepdims=True)
     kf_dir = v / dist  # Unit vector pointing from sample to pixel
