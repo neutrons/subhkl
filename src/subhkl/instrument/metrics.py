@@ -158,7 +158,6 @@ def extract_xyz_from_file(file_path, instrument=None):
 
     return None, None
 
-
 def compute_metrics(
     file1: str,
     file2: str | None = None,
@@ -191,6 +190,22 @@ def compute_metrics(
 
             gonio_axes = f["goniometer/axes"][()] if "goniometer/axes" in f else None
             gonio_angles = f["goniometer/angles"][()] if "goniometer/angles" in f else None
+
+            gonio_offsets = None
+            off_data = f.get("goniometer/offsets")
+            if off_data is not None:
+                gonio_names = f["goniometer/names"][()] if "goniometer/names" in f else None
+                if gonio_names is not None:
+                    gonio_names = [n.decode('utf-8') if isinstance(n, bytes) else str(n) for n in gonio_names]
+                if isinstance(off_data, h5py.Group) and gonio_names is not None:
+                    gonio_offsets = np.zeros(len(gonio_names), dtype=np.float32)
+                    for i, name in enumerate(gonio_names):
+                        if name in off_data:
+                            gonio_offsets[i] = float(off_data[name][()])
+                else:
+                    raw_offs = off_data[()]
+                    gonio_offsets = np.zeros(len(raw_offs), dtype=np.float32)
+                    gonio_offsets[:len(raw_offs)] = raw_offs
 
             if ki_vec_override is not None:
                 ki_vec = ki_vec_override
@@ -233,31 +248,18 @@ def compute_metrics(
         # ==========================================
         else:
             with h5py.File(file1, "r") as f:
-                if is_zone_axis_mode:
-                    matched_h = f["zones/u"][()]
-                    matched_k = f["zones/v"][()]
-                    matched_l = f["zones/w"][()]
-                    matched_lam = f["zones/S"][()] # Scale factor, unused in metrics but needed for API
-                else:
-                    if "peaks/h" not in f:
-                        return {"error_message": "No peaks/h or zones/u dataset found in file"}
-                    matched_h = f["peaks/h"][()]
-                    matched_k = f["peaks/k"][()]
-                    matched_l = f["peaks/l"][()]
-                    matched_lam = f["peaks/lambda"][()]
+                if "peaks/h" not in f:
+                    return {"error_message": "No peaks/h or zones/u dataset found in file"}
+                matched_h = f["peaks/h"][()]
+                matched_k = f["peaks/k"][()]
+                matched_l = f["peaks/l"][()]
+                matched_lam = f["peaks/lambda"][()]
 
-                # For zone axes, the input data wasn't detector pixels, it was the lab vectors.
-                # If they were stored during FindUB, they should be in 'peaks/xyz' or 'zones/xyz_lab'
-                if is_zone_axis_mode and "zones/e_lab" in f:
-                     matched_xyz = f["zones/e_lab"][()]
-                     matched_run = f["zones/run_index"][()] if "zones/run_index" in f else np.zeros(len(matched_h))
-                else:
-                    xyz, r_idx = extract_xyz_from_file(file1, instrument)
-                    if xyz is None:
-                        return {"error_message": "Could not extract XYZ coordinates."}
-                    matched_xyz = xyz
-                    matched_run = r_idx
-                    
+                xyz, r_idx = extract_xyz_from_file(file1, instrument)
+                if xyz is None:
+                    return {"error_message": "Could not extract XYZ coordinates."}
+                matched_xyz = xyz
+                matched_run = r_idx
                 matched_R = _get_safe_R_stack(R_file, matched_run, len(matched_h))
 
         h = np.array(matched_h)
@@ -303,32 +305,12 @@ def compute_metrics(
             run_index = run_index[d_mask]
             d_filter_message = f"Filtered to {len(h)} peaks with d >= {d_min} A."
 
-        if is_zone_axis_mode:
-            # For Zone Axes, construct the Real Space RUA matrix
-            UA = U @ A_mat
-            if R_all.ndim == 3:
-                RUA = np.matmul(R_all, UA)
-            else:
-                RUA = R_all @ UA
-                
-            from subhkl.instrument.physics import calculate_zone_axis_error
-            d_err, ang_err = calculate_zone_axis_error(xyz_det, h, k, l, RUA)
-            
-        else:
-            # For Bragg Peaks, construct the Reciprocal Space RUB matrix
-            UB = U @ B_mat
-            if R_all.ndim == 3:
-                RUB = np.matmul(R_all, UB)
-            else:
-                RUB = R_all @ UB
-
+        UB = U @ B_mat
         if gonio_angles is not None:
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes) if gonio_axes is not None else 1
-                # Check if the array is oriented as (N_runs, N_axes)
                 if gonio_angles.shape[1] == num_axes:
                     gonio_angles_mapped = gonio_angles[run_index, :]
-                # Otherwise, it must be (N_axes, N_runs)
                 else:
                     gonio_angles_mapped = gonio_angles[:, run_index].T
             else:
@@ -337,9 +319,12 @@ def compute_metrics(
             gonio_angles_mapped = None
 
         d_err, ang_err = calculate_angular_error(
-            xyz_det, h, k, l, lam, RUB, sample_offset, ki_vec, R_all,
+            xyz_det, h, k, l, lam, 
+            UB,
+            sample_offset, ki_vec, R_all,
             gonio_axes=gonio_axes,
-            gonio_angles=gonio_angles_mapped
+            gonio_angles=gonio_angles_mapped,
+            gonio_offsets=gonio_offsets # <-- Pass Down
         )
 
         result = {

@@ -141,21 +141,22 @@ def calculate_angular_error(
     k: npt.NDArray,
     l: npt.NDArray,
     lam: npt.NDArray,
-    RUB: npt.NDArray,
+    UB: npt.NDArray,            # <-- Changed from RUB
     sample_offset: npt.NDArray = None,
     ki_vec: npt.NDArray = None,
     R_all: npt.NDArray = None,
     gonio_axes: npt.NDArray = None,
     gonio_angles: npt.NDArray = None,
-    gonio_offsets: npt.NDArray = None, 
+    gonio_offsets: npt.NDArray = None, # <-- NEW
 ):
     if sample_offset is None:
         sample_offset = np.zeros(3)
     if ki_vec is None:
         ki_vec = np.array([0.0, 0.0, 1.0])
 
-    q_lab_calc = get_q_lab(h, k, l, RUB)
-    q_calc_norm = q_lab_calc / np.linalg.norm(q_lab_calc, axis=1, keepdims=True)
+    # 1. Transform Miller indices to pristine Sample frame Q-vectors
+    hkl = np.stack([h, k, l], axis=0)
+    q_sample_calc = (UB @ hkl).T  # Shape: (N, 3)
 
     if gonio_axes is not None and gonio_angles is not None:
         offsets = sample_offset
@@ -165,31 +166,49 @@ def calculate_angular_error(
         else:
             offsets_full = offsets
             
-        # Ensure angles broadcast properly if a 1D array was passed
         angles = np.tile(gonio_angles, (len(xyz_det), 1)) if gonio_angles.ndim == 1 else gonio_angles
 
-        # Note: angles is shape (N_peaks, N_axes). sample_to_lab expects (N_axes, N_peaks), so we transpose it.
+        from subhkl.instrument.goniometer import sample_to_lab
+        
+        # Q-vectors only rotate (is_vector=True bypasses translations)
+        q_lab_calc = sample_to_lab(
+            q_sample_calc, 
+            gonio_axes, 
+            angles.T, 
+            offsets_full, 
+            zero_offsets=gonio_offsets,
+            is_vector=True
+        )
+
+        # Sample origin translates and rotates (is_vector=False applies translations)
         s_lab = sample_to_lab(
             np.zeros((len(xyz_det), 3)), 
             gonio_axes, 
             angles.T, 
             offsets_full, 
-            zero_offsets=gonio_offsets
+            zero_offsets=gonio_offsets,
+            is_vector=False
         )
+        
         v = xyz_det - s_lab
     elif R_all is not None:
         # Legacy static fallback
         if R_all.ndim == 3:
+            q_lab_calc = np.einsum("nij,nj->ni", R_all, q_sample_calc)
             s_lab = np.einsum("nij,j->ni", R_all, sample_offset)
         else:
+            q_lab_calc = q_sample_calc @ R_all.T
             s_lab = R_all @ sample_offset
         v = xyz_det - s_lab
     else:
+        q_lab_calc = q_sample_calc
         v = xyz_det - sample_offset
+
+    # Normalize Q for angular comparison
+    q_calc_norm = q_lab_calc / np.linalg.norm(q_lab_calc, axis=1, keepdims=True)
 
     dist = np.linalg.norm(v, axis=1, keepdims=True)
     kf_dir = v / dist  # Unit vector pointing from sample to pixel
-
     ki_dir = ki_vec / np.linalg.norm(ki_vec)
 
     # Scattering vector direction matches delta_k = kf - ki
@@ -211,11 +230,9 @@ def calculate_angular_error(
         d_obs = np.divide(lam, two_sin_theta)
 
     q_lab_mag = np.linalg.norm(q_lab_calc, axis=1)
-
     with np.errstate(divide="ignore", invalid="ignore"):
         d_calc = np.divide(1.0, q_lab_mag)
 
     d_err = np.abs(d_obs - d_calc)
 
     return d_err, ang_err
-
