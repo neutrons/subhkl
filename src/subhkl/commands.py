@@ -2072,13 +2072,10 @@ def run_bingham_tracker(
                (np.abs(l_p - np.round(l_p)) < 1e-4)
     theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
 
-    h_sample = B_mat @ theo_hkl
-    h_sample_norms = np.linalg.norm(h_sample, axis=0)
-    q_mags_np = 2.0 * np.pi * h_sample_norms
-    q_theo_sample_np = h_sample / (h_sample_norms + 1e-9)
-
-    q_theo_sample_jax = jnp.array(q_theo_sample_np)
-    q_mags_jax = jnp.array(q_mags_np)
+    # Ensure theoretical vectors are perfect unit directions for the Bingham cos(theta) loss
+    q_theo_cryst = jnp.array(B_mat @ theo_hkl)
+    q_mags_jax = jnp.linalg.norm(q_theo_cryst, axis=0)
+    q_theo_sample_jax = q_theo_cryst / jnp.where(q_mags_jax == 0, 1.0, q_mags_jax)
 
     ub_helper.ki_vec = np.array([0.0, 0.0, 1.0]) # Default assumption if loader passed explicitly
     ki_vec_jax = jnp.array(ub_helper.ki_vec)
@@ -2144,13 +2141,15 @@ def run_bingham_tracker(
         bg_log_lik_scalar = expected_noise_ll
 
         def single_event_update(q_exp, ki_exp):
-            # U maps Crystal to Sample
+            # Target U aligns Theo -> Sample Frame
             h_sample = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_sample)
 
-            # Prior uses instantaneous beam angle in the sample frame!
+            # Prior uses instantaneous beam vector in the Sample Frame
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
-            lambda_j = -(4.0 * jnp.pi / (q_mags_jax + 1e-9)) * q_dot_ki_theo
+            
+            # lambda = -2 * (q_hat . ki_hat) / |q_cryst|
+            lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
 
             log_prior = lambda_alpha * lambda_j - log_Z_j_jax
             peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + log_prior
@@ -2162,14 +2161,13 @@ def run_bingham_tracker(
             weighted_h_geom = jnp.sum((w * kappa_safe) * q_theo_sample_jax, axis=1)
             F_geom = jnp.outer(q_exp, weighted_h_geom)
 
-            prior_scalar = lambda_alpha * (4.0 * jnp.pi / (q_mags_jax + 1e-9))
+            prior_scalar = lambda_alpha * (2.0 / (q_mags_jax + 1e-9))
             weighted_h_prior = jnp.sum((w * prior_scalar) * q_theo_sample_jax, axis=1)
-
-            # Prior forcing uses the instantaneous beam
             F_prior = -jnp.outer(ki_exp, weighted_h_prior)
 
             F_total = F_geom + F_prior
             event_nll = -log_Z
+            
             return compute_A_from_C(F_total), event_nll
 
         A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
