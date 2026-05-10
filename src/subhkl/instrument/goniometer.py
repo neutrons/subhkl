@@ -92,22 +92,36 @@ def calc_goniometer_rotation_matrix(axes, angles):
 
     return R_cum
 
-def sample_to_lab(p_sample, axes, angles, offsets):
+import numpy as np
+
+def sample_to_lab(p_sample, axes, angles, offsets, zero_offsets=None):
     """
     Convert a point from the Sample frame to the Lab frame.
-    axes: (N, 4) array [x, y, z, sign]
-    angles: (N,) array of angles in degrees
-    offsets: (N, 3) array of translation offsets applied AFTER each rotation
+    
+    axes: (N, 4) array [x, y, z, direction_multiplier]
+    angles: (N,) array of raw encoder angles in degrees
+    offsets: (N, 3) array of translation lever arms (applied BEFORE rotation)
+    zero_offsets: (N,) array of zero-point angle calibrations in degrees
     """
     p = np.array(p_sample)
     num_axes = len(axes)
     deg2rad = np.pi / 180.0
+    
+    if zero_offsets is None:
+        zero_offsets = np.zeros(num_axes)
 
     # Traverse from innermost (Sample, index N-1) to outermost (Lab, index 0)
     for i in reversed(range(num_axes)):
         direction = axes[i][:3]
-        direction = direction / np.linalg.norm(direction)
-        theta = axes[i][3] * angles[i] * deg2rad
+        direction_mult = axes[i][3] if len(axes[i]) > 3 else 1.0
+        
+        axis_norm = np.linalg.norm(direction)
+        if axis_norm > 0:
+            direction = direction / axis_norm
+            
+        # Apply the zero-point offset to the raw encoder angle
+        true_angle = angles[i] + zero_offsets[i]
+        theta = direction_mult * true_angle * deg2rad
 
         # Build standard Rodrigues rotation matrix
         K = np.array([
@@ -117,24 +131,34 @@ def sample_to_lab(p_sample, axes, angles, offsets):
         ])
         R_i = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
 
-        # Apply transformation: Rotate local, then translate
-        p = R_i @ p + offsets[i]
+        # NEW KINEMATICS: Translate in the local frame (lever arm), THEN Rotate
+        p = R_i @ (p + offsets[i])
 
     return p
 
-def lab_to_sample(p_lab, axes, angles, offsets):
+
+def lab_to_sample(p_lab, axes, angles, offsets, zero_offsets=None):
     """
     Convert a point from the Lab frame back to the Sample frame.
     """
     p = np.array(p_lab)
     num_axes = len(axes)
     deg2rad = np.pi / 180.0
+    
+    if zero_offsets is None:
+        zero_offsets = np.zeros(num_axes)
 
     # Traverse from outermost (Lab, index 0) to innermost (Sample, index N-1)
     for i in range(num_axes):
         direction = axes[i][:3]
-        direction = direction / np.linalg.norm(direction)
-        theta = axes[i][3] * angles[i] * deg2rad
+        direction_mult = axes[i][3] if len(axes[i]) > 3 else 1.0
+        
+        axis_norm = np.linalg.norm(direction)
+        if axis_norm > 0:
+            direction = direction / axis_norm
+            
+        true_angle = angles[i] + zero_offsets[i]
+        theta = direction_mult * true_angle * deg2rad
 
         K = np.array([
             [0, -direction[2], direction[1]],
@@ -143,8 +167,8 @@ def lab_to_sample(p_lab, axes, angles, offsets):
         ])
         R_i = np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
 
-        # Apply inverse transformation: subtract translation, then reverse rotation
-        p = R_i.T @ (p - offsets[i])
+        # INVERSE KINEMATICS: Reverse Rotate, THEN subtract local translation
+        p = (R_i.T @ p) - offsets[i]
 
     return p
 

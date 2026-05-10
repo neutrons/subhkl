@@ -1469,6 +1469,7 @@ def integrate_peaks_rbf_ssn(
     max_workers: int = None,
     gonio_axes: np.ndarray = None,
     gonio_angles: np.ndarray = None,
+    gonio_offsets: np.ndarray = None,
 ):
     """
     Args:
@@ -1516,7 +1517,6 @@ def integrate_peaks_rbf_ssn(
     def get_s_lab_for_img(img_key_str, run_id, R_val):
         # 1. Use exact dynamic kinematics if available
         if gonio_axes is not None and gonio_angles is not None:
-            # --- FIX: Robust shape checking for multi-axis extraction ---
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes)
                 if gonio_angles.shape[1] == num_axes:
@@ -1525,9 +1525,7 @@ def integrate_peaks_rbf_ssn(
                     ang = gonio_angles[:, run_id] if run_id < gonio_angles.shape[1] else gonio_angles[:, 0]
             else:
                 ang = gonio_angles
-            # ------------------------------------------------------------
-            
-            # Map legacy 1D offset into the full multi-axis array
+
             offsets = sample_offset
             if offsets is not None and offsets.ndim == 1:
                 offsets_full = np.zeros((len(gonio_axes), 3))
@@ -1537,9 +1535,15 @@ def integrate_peaks_rbf_ssn(
             else:
                 offsets_full = offsets
 
-            return sample_to_lab(np.array([0.0, 0.0, 0.0]), gonio_axes, ang, offsets_full)
-        
-        # 2. Legacy fallback using securely passed R_val
+            return sample_to_lab(
+                np.array([0.0, 0.0, 0.0]), 
+                gonio_axes, 
+                ang, 
+                offsets_full,
+                zero_offsets=gonio_offsets
+            )
+
+        # 2. Legacy fallback
         s_off = sample_offset if sample_offset is not None and sample_offset.ndim == 1 else (sample_offset[-1] if sample_offset is not None else np.zeros(3))
         return R_val @ s_off if R_val is not None else s_off
 

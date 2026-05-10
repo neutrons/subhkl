@@ -45,6 +45,7 @@ def predict_reflections_on_panel(
     R_all=None,
     gonio_axes=None,
     gonio_angles=None,
+    gonio_offsets=None,
 ):
     """
     Predict reflection positions on a specific detector panel.
@@ -80,6 +81,7 @@ def predict_reflections_on_panel(
     Q_vec_v = Q_vec[:, mask_wl]
     h_v, k_v, l_v = h[mask_wl], k[mask_wl], l[mask_wl]
 
+
     # 3. Calculate Final Scattered Ray Direction (kf)
     k_mag = 2 * np.pi / lamda_v
     kf_vec = Q_vec_v + k_mag * ki_hat[:, None]  # (3, M_v)
@@ -96,9 +98,14 @@ def predict_reflections_on_panel(
             offsets_full = np.zeros((len(gonio_axes), 3))
         else:
             offsets_full = offsets
-            
-        # Real-space kinematic chain
-        s_lab = sample_to_lab(np.array([0.0, 0.0, 0.0]), gonio_axes, gonio_angles, offsets_full)
+
+        s_lab = sample_to_lab(
+            np.array([0.0, 0.0, 0.0]), 
+            gonio_axes, 
+            gonio_angles, 
+            offsets_full, 
+            zero_offsets=gonio_offsets
+        )
     else:
         # Legacy fallback
         s = sample_offset if sample_offset is not None else np.zeros(3)
@@ -154,34 +161,35 @@ def calculate_angular_error(
             offsets_full[-1] = offsets
         else:
             offsets_full = offsets
-            
-        # Initialize Sample origin for all N peaks
+
         s_lab = np.zeros((len(xyz_det), 3))
         deg2rad = np.pi / 180.0
-        
-        # Ensure angles broadcast properly if a 1D array was passed
+
         angles = np.tile(gonio_angles, (len(xyz_det), 1)) if gonio_angles.ndim == 1 else gonio_angles
-            
+
         for i in reversed(range(len(gonio_axes))):
             direction = gonio_axes[i][:3]
+            direction_mult = gonio_axes[i][3] if len(gonio_axes[i]) > 3 else 1.0
             direction = direction / np.linalg.norm(direction)
-            theta = gonio_axes[i][3] * angles[:, i] * deg2rad # (N_peaks,)
-            
+
+            # Apply zero point to true angle
+            axis_offset = gonio_offsets[i] if gonio_offsets is not None else 0.0
+            true_angle = angles[:, i] + axis_offset
+            theta = direction_mult * true_angle * deg2rad 
+
             K = np.array([
                 [0, -direction[2], direction[1]],
                 [direction[2], 0, -direction[0]],
                 [-direction[1], direction[0], 0]
             ])
-            
-            # Vectorized Rodrigues construction
+
             sin_t = np.sin(theta)[:, None, None]
             cos_t = np.cos(theta)[:, None, None]
             K_sq = K @ K
             R_i = np.eye(3)[None, :, :] + sin_t * K[None, :, :] + (1 - cos_t) * K_sq[None, :, :]
-            
-            # Rotate local coordinates and add the specific axis translation
-            s_lab = np.einsum("nij,nj->ni", R_i, s_lab) + offsets_full[i]
-            
+
+            s_lab = np.einsum("nij,nj->ni", R_i, s_lab + offsets_full[i])
+
         v = xyz_det - s_lab
     elif R_all is not None:
         # Legacy static fallback
