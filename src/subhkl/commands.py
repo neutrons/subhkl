@@ -1409,6 +1409,9 @@ def run_bingham_tracker(
         else:
             wl_bounds = np.array([0.5, 10.0])  # Safe fallback
 
+        wl_min_jax = float(wl_bounds[0])
+        wl_max_jax = float(wl_bounds[1])
+
     B_mat = ub_helper.reciprocal_lattice_B()
     _, _, centering = get_lattice_system(
         ub_helper.a, ub_helper.b, ub_helper.c,
