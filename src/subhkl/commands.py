@@ -1508,6 +1508,9 @@ def run_bingham_tracker(
         dt_decay_capped = jnp.minimum(dt_decay, min_dt)
         dt_rate = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
 
+        decay = jnp.exp(-current_gamma * dt_decay_capped)
+        A_diffused = A_prev * decay
+
         vals, vecs = jnp.linalg.eigh(A_prev)
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
