@@ -1372,6 +1372,7 @@ def run_bingham_tracker(
     annealing_rate: float = 0.5,
     lambda_alpha: float = 0.5,
     gamma_diffusion: float = 1.0,
+    k_target: float = 5.0,
     kappa_init: float = 100.0,
     h_max: int = 6,
     n_ensemble: int = 1
@@ -1544,10 +1545,10 @@ def run_bingham_tracker(
 
             F_total = F_geom + F_prior
             event_nll = -log_Z
-            
-            return compute_A_from_C(F_total), event_nll
 
-        A_F_batch, nll_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
+            return compute_A_from_C(F_total), event_nll, w
+
+        A_F_batch, nll_batch, w_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
 
         F_mean = jnp.mean(A_F_batch, axis=0)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
@@ -1561,7 +1562,12 @@ def run_bingham_tracker(
         gap_new = vals_new[-1] - vals_new[-2]
         norm_gap = gap_new / jnp.maximum(steady_state_scale, 1e-9)
 
-        return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap
+        signal_count = jnp.sum(w_batch)
+        bg_count = q_batch.shape[0] - signal_count
+        sig_rate = signal_count / (dt + 1e-9)
+        bg_rate = bg_count / (dt + 1e-9)
+
+        return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
@@ -1589,14 +1595,13 @@ def run_bingham_tracker(
     t_start = None
     t_state = 0.0
 
-    # ==============================================================
-    # --- NEW: BATCH CONSUMPTION LOOP ---
-    # ==============================================================
-    # In your batch consumption loop:
+    # Set a target SNR requirement (e.g., 5-sigma lock)
+    k_target = 5.0
+    dynamic_gamma = gamma_diffusion  # Starting value
+
     for batch_data in event_batches:
-        # Unpack the new ki_sample array
         q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
-        
+
         if t_start is None and len(t_batch_np) > 0:
             t_state = t_batch_np[0]
             t_start = t_state
@@ -1611,8 +1616,7 @@ def run_bingham_tracker(
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
-        # Pass it to the engine
-        A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps = ensemble_process_chunk(
+        A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates = ensemble_process_chunk(
             A_ensemble_state, t_state, q_batch, ki_batch, t_batch, current_sigma_q
         )
 
@@ -1623,8 +1627,24 @@ def run_bingham_tracker(
 
         tracking_history.append((float(t_state), U_best))
 
+        current_sig_rate = float(sig_rates[best_idx])
+        current_bg_rate = float(bg_rates[best_idx])
+        
+        # Prevent division by zero if background is completely dead
+        safe_bg = max(current_bg_rate, 1.0) 
+        
+        # Calculate the theoretical optimal gamma for this exact moment in the beam
+        ideal_gamma = (current_sig_rate ** 2) / ((k_target ** 2) * safe_bg)
+        
+        # Clamp it to sane physics limits (e.g. remember between 0.1s and 100s)
+        ideal_gamma = np.clip(ideal_gamma, 0.01, 10.0)
+        
+        # Smoothly drift the actual diffusion rate towards the ideal target
+        # (Alpha = 0.05 gives it about 20 batches of inertia so it doesn't violently spike)
+        dynamic_gamma = 0.95 * dynamic_gamma + 0.05 * ideal_gamma
+
         if cumulative_count % 50000 < len(t_batch_np):
-            print(f"    Time {t_state:.2f}s | Sigma_Q: {current_sigma_q:.5f} | Best Tracker: {best_idx:03d} | Norm-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
+            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Auto-Gamma: {dynamic_gamma:.3f} | Norm-Gap: {best_gap:8.2f}")
 
         if streaming_callback is not None:
             new_events = {
