@@ -1641,7 +1641,7 @@ def run_bingham_tracker(
         dynamic_gamma = (1.0 - gamma_ema_alpha) * dynamic_gamma + gamma_ema_alpha * ideal_gamma
 
         if cumulative_count % 50000 < len(t_batch_np):
-            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Auto-Gamma: {dynamic_gamma:.3f} | Norm-Gap: {best_gap:8.2f}")
+            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Auto-Gamma: {dynamic_gamma:.5f} | Norm-Gap: {best_gap:8.2f}")
 
         if streaming_callback is not None:
             new_events = {
