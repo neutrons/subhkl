@@ -1375,6 +1375,7 @@ def run_bingham_tracker(
     gamma_ema_alpha: float = 0.05,
     k_target: float = 5.0,
     kappa_init: float = 100.0,
+    min_dt: float = 2.0,  # pause the accumulation if min_dt has elapsed between events
     h_max: int = 6,
     n_ensemble: int = 1
 ):
@@ -1497,15 +1498,23 @@ def run_bingham_tracker(
     @jax.jit
     def process_chunk(A_prev, t_prev, q_batch, ki_batch, t_batch, current_sigma_q, current_gamma):
         t_curr = t_batch[-1]
-        dt = jnp.maximum(0.0, t_curr - t_prev)
 
-        # Exponentially Weighted Moving Average (EWMA) Decay
-        decay = jnp.exp(-current_gamma * dt)
-        A_diffused = A_prev * decay
+        # 1. SDE Decay Time
+        dt_decay = jnp.maximum(0.0, t_curr - t_prev)
+
+        # Cap the blind diffusion at 2.0 seconds. If the beam is off
+        # for 5 minutes, the SDE effectively "pauses" its memory instead of
+        # decaying to absolute zero.
+        dt_decay_capped = jnp.minimum(dt_decay, min_dt)
+        dt_rate = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
 
         vals, vecs = jnp.linalg.eigh(A_prev)
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
+
+        # Steady state scale must use the true instantaneous neutron flux!
+        neutron_rate = q_batch.shape[0] / dt_rate
+        steady_state_scale = neutron_rate / jnp.maximum(current_gamma, 1e-6)
 
         # --- DYNAMIC BACKGROUND TUNING ---
         kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
@@ -1553,20 +1562,18 @@ def run_bingham_tracker(
 
         F_mean = jnp.mean(A_F_batch, axis=0)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
-
-        neutron_rate = q_batch.shape[0] / (dt + 1e-9)
-        steady_state_scale = neutron_rate / jnp.maximum(current_gamma, 1e-6)
-
         A_new = A_diffused + F_mean * steady_state_scale * (1.0 - decay)
 
         vals_new = jnp.linalg.eigvalsh(A_new)
         gap_new = vals_new[-1] - vals_new[-2]
         norm_gap = gap_new / jnp.maximum(steady_state_scale, 1e-9)
 
+        # Rates calculated using the true beam density
         signal_count = jnp.sum(w_batch)
         bg_count = q_batch.shape[0] - signal_count
-        sig_rate = signal_count / (dt + 1e-9)
-        bg_rate = bg_count / (dt + 1e-9)
+
+        sig_rate = signal_count / dt_rate
+        bg_rate = bg_count / dt_rate
 
         return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate
 
