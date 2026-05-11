@@ -1597,7 +1597,6 @@ def run_bingham_tracker(
     t_state = 0.0
 
     # Set a target SNR requirement (e.g., 5-sigma lock)
-    k_target = 5.0
     dynamic_gamma = gamma_diffusion  # Starting value
 
     for batch_data in event_batches:
