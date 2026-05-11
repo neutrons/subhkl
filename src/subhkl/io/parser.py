@@ -16,7 +16,6 @@ from subhkl.commands import (
     run_mtz_exporter,
     run_reduce,
     run_merge_images,
-    run_egnn,
 )
 
 
@@ -592,48 +591,6 @@ def merge_images(
     except ValueError as e:
         print(str(e))
         raise typer.Exit(code=1)
-
-@app.command("egnn")
-def cmd_egnn(
-    finder_file: str = typer.Argument(
-        ..., help="Path to the output peaks HDF5 file from the finder."
-    ),
-    output_h5_filename: str = typer.Argument(
-        ..., help="Path to save the extracted initial UB matrix."
-    ),
-    instrument: str = typer.Option(
-        None, "--instrument", help="Name of the instrument (e.g., MANDI, IMAGINE, CG4D)."
-    ),
-    nexus: str = typer.Option(
-        None, "--nexus", help="Path to the original Nexus file for geometry reconstruction."
-    ),
-    steps: int = typer.Option(
-        300, help="Maximum number of steps for the optimization",
-    ),
-    create_visualizations: bool = typer.Option(
-        False, "--create-visualizations", help="Generate unrolled detector plots."
-    ),
-    egnn_sigma_end: float = typer.Option(
-        0.005, help="Target hkl deviation from integer",
-    ),
-    max_hkl_cons: int = typer.Option(
-        2, help="Maximum hkl",
-    ),
-):
-    """
-    Extracts the initial UB matrix using the Sparse Spherical Hough Transform and
-    Topological Hessian Filtering.
-    """
-    run_egnn(
-        finder_file=finder_file,
-        output_h5_filename=output_h5_filename,
-        instrument_name=instrument,
-        original_nexus_filename=nexus,
-        steps=steps,
-        max_hkl_cons=max_hkl_cons,
-        egnn_sigma_end=egnn_sigma_end,
-        create_visualizations=create_visualizations,
-    )
 
 if __name__ == "__main__":
     app()
