@@ -1610,6 +1610,8 @@ def run_bingham_tracker(
     # Set a target SNR requirement (e.g., 5-sigma lock)
     dynamic_gamma = gamma_diffusion  # Starting value
 
+    effective_annealing_time = 0.0
+
     for batch_data in event_batches:
         q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
 
@@ -1617,8 +1619,16 @@ def run_bingham_tracker(
             t_state = t_batch_np[0]
             t_start = t_state
 
-        t_relative = max(0.0, float(t_state - t_start))
-        current_sigma_q = max(sigma_q_min, sigma_q_start * np.exp(-annealing_rate * t_relative))
+        dt_wall = float(t_batch_np[-1] - t_state)
+
+        # If the gap between batches (or spanning the batch) exceeds min_dt, the shield is active
+        is_paused = bool(dt_wall > min_dt)
+
+        # Only advance the learning clock by the un-paused amount of time
+        effective_annealing_time += min(dt_wall, min_dt)
+
+        # Calculate sigma_q using the effective learning time
+        current_sigma_q = max(sigma_q_min, sigma_q_start * np.exp(-annealing_rate * effective_annealing_time))
 
         q_batch = jax.device_put(q_batch_np)
         q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
@@ -1674,6 +1684,7 @@ def run_bingham_tracker(
                 "bg_rate": current_bg_rate,
                 "gamma": float(dynamic_gamma),
                 "sigma_q": current_sigma_q
+                "is_paused": is_paused,
             }
 
             streaming_callback(
