@@ -2247,7 +2247,7 @@ def run_bingham_tracker(
         tracking_history.append((float(t_state), U_best))
 
         if cumulative_count % 50000 < len(t_batch_np):
-            print(f"    Time {t_state:.2f}s | Sigma_Q: {current_sigma_q:.3f} | Best Tracker: {best_idx:03d} | Norm-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
+            print(f"    Time {t_state:.2f}s | Sigma_Q: {current_sigma_q:.5f} | Best Tracker: {best_idx:03d} | Norm-Gap: {best_gap:8.2f} | Mean NLL: {best_loss:.4f}")
 
         if streaming_callback is not None:
             new_events = {
