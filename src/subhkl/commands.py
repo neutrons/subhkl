@@ -1372,7 +1372,8 @@ def run_bingham_tracker(
     annealing_rate: float = 0.5,
     lambda_alpha: float = 0.5,
     gamma_diffusion: float = 1.0, # starting value for gamma
-    gamma_ema_alpha: float = 0.05,
+    alpha_attack = 1e-5,   # Massive inertia against sudden DAQ bursts
+    alpha_release = 0.05,  # Agile reaction to beam drops / shutter closures
     k_target: float = 5.0,
     kappa_init: float = 100.0,
     min_dt: float = 2.0,  # pause the accumulation if min_dt has elapsed between events
@@ -1645,10 +1646,14 @@ def run_bingham_tracker(
         
         # Calculate the theoretical optimal gamma for this exact moment in the beam
         ideal_gamma = (current_sig_rate ** 2) / ((k_target ** 2) * safe_bg)
-        
-        # Smoothly drift the actual diffusion rate towards the ideal target
-        # using the tunable Exponential Moving Average (EMA) alpha
-        dynamic_gamma = (1.0 - gamma_ema_alpha) * dynamic_gamma + gamma_ema_alpha * ideal_gamma
+
+        # Choose alpha based on the direction of the gamma shift
+        if ideal_gamma > dynamic_gamma:
+            current_alpha = alpha_attack
+        else:
+            current_alpha = alpha_release
+
+        dynamic_gamma = (1.0 - current_alpha) * dynamic_gamma + current_alpha * ideal_gamma
 
         if cumulative_count % 50000 < len(t_batch_np):
             print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Auto-Gamma: {dynamic_gamma:.5f} | Norm-Gap: {best_gap:8.2f}")
