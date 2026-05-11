@@ -1494,12 +1494,12 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_prev, t_prev, q_batch, ki_batch, t_batch, current_sigma_q):
+    def process_chunk(A_prev, t_prev, q_batch, ki_batch, t_batch, current_sigma_q, current_gamma):
         t_curr = t_batch[-1]
         dt = jnp.maximum(0.0, t_curr - t_prev)
 
         # Exponentially Weighted Moving Average (EWMA) Decay
-        decay = jnp.exp(-dynamic_gamma * dt)
+        decay = jnp.exp(-current_gamma * dt)
         A_diffused = A_prev * decay
 
         vals, vecs = jnp.linalg.eigh(A_prev)
@@ -1554,7 +1554,7 @@ def run_bingham_tracker(
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
 
         neutron_rate = q_batch.shape[0] / (dt + 1e-9)
-        steady_state_scale = neutron_rate / jnp.maximum(dynamic_gamma, 1e-6)
+        steady_state_scale = neutron_rate / jnp.maximum(current_gamma, 1e-6)
 
         A_new = A_diffused + F_mean * steady_state_scale * (1.0 - decay)
 
@@ -1572,8 +1572,8 @@ def run_bingham_tracker(
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, None, None, None, None, None),
-            out_axes=(0, None, 0, 0, 0)
+            in_axes=(0, None, None, None, None, None, None),
+            out_axes=(0, None, 0, 0, 0, 0, 0)
         )
     )
 
@@ -1617,7 +1617,7 @@ def run_bingham_tracker(
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
         A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates = ensemble_process_chunk(
-            A_ensemble_state, t_state, q_batch, ki_batch, t_batch, current_sigma_q
+            A_ensemble_state, t_state, q_batch, ki_batch, t_batch, current_sigma_q, dynamic_gamma
         )
 
         best_idx = int(jnp.argmin(loss_ensemble))
@@ -1655,6 +1655,15 @@ def run_bingham_tracker(
                 "s_lab": slab_np     # Shape: (batch_size, 3)
             }
 
+            metrics_dict = {
+                "mean_loss": best_loss,
+                "eigengap": best_gap,
+                "sig_rate": current_sig_rate,
+                "bg_rate": current_bg_rate,
+                "gamma": float(dynamic_gamma),
+                "sigma_q": current_sigma_q
+            }
+
             streaming_callback(
                 time=float(t_state),
                 U_preds=np.array(U_ensemble_curr),
@@ -1663,7 +1672,7 @@ def run_bingham_tracker(
                 best_idx=best_idx,
                 neutron_count=cumulative_count,
                 new_events=new_events,
-                eigengap=best_gap
+                metrics=metrics_dict,
             )
 
     if not tracking_history:
