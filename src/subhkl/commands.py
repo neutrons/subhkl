@@ -1683,7 +1683,7 @@ def run_bingham_tracker(
                 "sig_rate": current_sig_rate,
                 "bg_rate": current_bg_rate,
                 "gamma": float(dynamic_gamma),
-                "sigma_q": current_sigma_q
+                "sigma_q": current_sigma_q,
                 "is_paused": is_paused,
             }
 
