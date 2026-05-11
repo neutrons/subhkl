@@ -2009,6 +2009,7 @@ def run_bingham_tracker(
     lambda_alpha: float = 0.5,
     gamma_diffusion: float = 1.0,
     kappa_init: float = 100.0,
+    h_max: int = 6,
     n_ensemble: int = 1
 ):
     apply_detector_calibration(finder_file, instrument_name)
@@ -2054,7 +2055,6 @@ def run_bingham_tracker(
     else: M_prim = jnp.eye(3)
 
     print("  > Pre-computing Forward-Mapping HKL Grid for Continuous Tracking...")
-    h_max = 6
     h_vals = np.arange(-h_max, h_max + 1)
     hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)

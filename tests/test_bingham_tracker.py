@@ -4,7 +4,6 @@ import os
 import h5py
 import numpy as np
 import itertools
-from unittest.mock import patch
 from scipy.spatial.transform import Rotation
 
 from subhkl.commands import run_bingham_tracker
@@ -26,12 +25,7 @@ class TestBinghamTracker(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.TemporaryDirectory()
         self.finder_file = os.path.join(self.test_dir.name, "mock_finder.h5")
-        self.nexus_file = os.path.join(self.test_dir.name, "mock_nexus.h5")
-        self.output_file = os.path.join(self.test_dir.name, "output.h5")
         
-        with h5py.File(self.nexus_file, "w") as f:
-            f.create_group("entry/bank1_events")
-            
         # Ensure deterministic testing environment
         np.random.seed(42)
 
@@ -57,7 +51,9 @@ class TestBinghamTracker(unittest.TestCase):
         q_theo_hat = q_theo / q_norms
 
         kinematic_proj = ki_vec.T @ (U_true @ q_theo_hat)
-        wavelengths = -(4 * np.pi / q_norms) * kinematic_proj
+        
+        # True Laue equation (2.0 instead of 4*pi) to match new tracker physics
+        wavelengths = -(2.0 / q_norms) * kinematic_proj
 
         valid_mask = (wavelengths > 0.5) & (wavelengths < 10.0)
         valid_q_hat = q_theo_hat[:, valid_mask]
@@ -98,6 +94,27 @@ class TestBinghamTracker(unittest.TestCase):
 
         return q_lab, times, banks, pixels_r, pixels_c
 
+    def get_fake_batches(self, sim_data, batch_size=10000):
+        """Yields streaming tuples exactly matching the EventStreamLoader signature."""
+        q_lab, times, banks, pixels_r, pixels_c = sim_data
+        num_events = len(times)
+        
+        for start_idx in range(0, num_events, batch_size):
+            end_idx = min(start_idx + batch_size, num_events)
+            N = end_idx - start_idx
+            
+            yield (
+                q_lab[start_idx:end_idx].astype(np.float32),
+                times[start_idx:end_idx].astype(np.float32),
+                banks[start_idx:end_idx].astype(np.int16),
+                pixels_r[start_idx:end_idx].astype(np.int16),
+                pixels_c[start_idx:end_idx].astype(np.int16),
+                np.zeros((N, 1), dtype=np.float32),  # angles
+                np.zeros((N, 3), dtype=np.float32),  # s_lab
+                np.tile([0.0, 0.0, 1.0], (N, 1)).astype(np.float32), # ki_sample
+                end_idx # cumulative count
+            )
+
     def _evaluate_cubic_symmetric_error(self, U_true, U_pred):
         min_err_deg = 180.0
         for sym in get_cubic_symmetries():
@@ -108,8 +125,7 @@ class TestBinghamTracker(unittest.TestCase):
         return min_err_deg
 
 
-    @patch('concurrent.futures.ProcessPoolExecutor')
-    def test_local_capture(self, mock_executor_class):
+    def test_local_capture(self):
         print(f"\n{'='*60}\nExecuting Regression: LOCAL CAPTURE (Seed Err: 5.0°)\n{'='*60}")
         
         U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
@@ -123,9 +139,7 @@ class TestBinghamTracker(unittest.TestCase):
             f["sample/U"] = U_seed
 
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0)
-        
-        mock_executor_instance = mock_executor_class.return_value
-        mock_executor_instance.__enter__.return_value.map.return_value = [sim_data]
+        event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
         def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, eigengap=0.0):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[0])
@@ -133,15 +147,13 @@ class TestBinghamTracker(unittest.TestCase):
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
-            output_h5_filename=self.output_file,
-            event_nexus_filename=self.nexus_file,
+            event_batches=event_stream,
             sigma_q_start=1.0,   
-            sigma_q_min=0.05,    
+            sigma_q_min=0.002,   
             annealing_rate=1.0,  # Rapid decay for 5-second simulated run
             lambda_alpha=0.5,
             gamma_diffusion=1000.0,
             kappa_init=100.0,
-            batch_size_events=10000, 
             n_ensemble=1, 
             streaming_callback=streaming_callback
         )
@@ -149,8 +161,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
         self.assertLess(final_err, 2.0, f"Local Capture failed to converge: Final Error {final_err:.2f}° >= 2.0°")
 
-    @patch('concurrent.futures.ProcessPoolExecutor')
-    def test_global_aliasing(self, mock_executor_class):
+    def test_global_aliasing(self):
         print(f"\n{'='*60}\nExecuting Regression: GLOBAL ALIASING (Seed Err: 30.0°, Ens: 256)\n{'='*60}")
         
         U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
@@ -164,9 +175,7 @@ class TestBinghamTracker(unittest.TestCase):
             f["sample/U"] = U_seed
 
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0)
-        
-        mock_executor_instance = mock_executor_class.return_value
-        mock_executor_instance.__enter__.return_value.map.return_value = [sim_data]
+        event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
         def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, eigengap=0.0):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[0])
@@ -174,15 +183,13 @@ class TestBinghamTracker(unittest.TestCase):
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
-            output_h5_filename=self.output_file,
-            event_nexus_filename=self.nexus_file,
+            event_batches=event_stream,
             sigma_q_start=1.0,   
-            sigma_q_min=0.05,    
+            sigma_q_min=0.002,   
             annealing_rate=1.0,
             lambda_alpha=0.5,
             gamma_diffusion=1.0,
             kappa_init=100.0,
-            batch_size_events=10000, 
             n_ensemble=256, 
             streaming_callback=streaming_callback
         )
@@ -190,8 +197,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
         self.assertLess(final_err, 2.0, f"Global Aliasing failed to escape trap: Final Error {final_err:.2f}° >= 2.0°")
 
-    @patch('concurrent.futures.ProcessPoolExecutor')
-    def test_background_robustness(self, mock_executor_class):
+    def test_background_robustness(self):
         print(f"\n{'='*60}\nExecuting Regression: BACKGROUND ROBUSTNESS (80% Noise, Seed Err: 5.0°)\n{'='*60}")
         
         U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
@@ -206,9 +212,7 @@ class TestBinghamTracker(unittest.TestCase):
 
         # Generates a massive 80% uniform random spherical noise!
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, bg_fraction=0.8)
-        
-        mock_executor_instance = mock_executor_class.return_value
-        mock_executor_instance.__enter__.return_value.map.return_value = [sim_data]
+        event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
         def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, eigengap=0.0):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[0])
@@ -216,15 +220,13 @@ class TestBinghamTracker(unittest.TestCase):
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
-            output_h5_filename=self.output_file,
-            event_nexus_filename=self.nexus_file,
+            event_batches=event_stream,
             sigma_q_start=1.0,   
-            sigma_q_min=0.05,    
+            sigma_q_min=0.002,   
             annealing_rate=1.0,
             lambda_alpha=0.0,
             gamma_diffusion=1000.0,
             kappa_init=100.0,
-            batch_size_events=10000, 
             n_ensemble=1,        # Local test with background 
             streaming_callback=streaming_callback
         )
