@@ -1404,6 +1404,11 @@ def run_bingham_tracker(
             U_init = f["sample/U"][()]
             print("  > Discovered seed U matrix in finder file. Will initialize Bingham Prior.")
 
+        if "instrument/wavelength" in f:
+            wl_bounds = f["instrument/wavelength"][()]
+        else:
+            wl_bounds = np.array([0.5, 10.0])  # Safe fallback
+
     B_mat = ub_helper.reciprocal_lattice_B()
     _, _, centering = get_lattice_system(
         ub_helper.a, ub_helper.b, ub_helper.c,
@@ -1511,11 +1516,16 @@ def run_bingham_tracker(
 
             # Prior uses instantaneous beam vector in the Sample Frame
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
-            
+
             # lambda = -2 * (q_hat . ki_hat) / |q_cryst|
             lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
 
-            log_prior = lambda_alpha * lambda_j - log_Z_j_jax
+            valid_wl_mask = (lambda_j >= wl_min_jax) & (lambda_j <= wl_max_jax)
+            wl_penalty = jnp.where(valid_wl_mask, 0.0, -1e9)
+
+            # Apply the penalty so impossible reflections get 0 probability
+            log_prior = lambda_alpha * lambda_j - log_Z_j_jax + wl_penalty
+
             peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + log_prior
 
             bg_log_lik = jnp.array([bg_log_lik_scalar])
