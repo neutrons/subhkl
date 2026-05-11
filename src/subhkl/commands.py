@@ -1371,7 +1371,7 @@ def run_bingham_tracker(
     sigma_q_min: float = 0.05,
     annealing_rate: float = 0.5,
     lambda_alpha: float = 0.5,
-    gamma_diffusion: float = 1.0,
+    gamma_diffusion: float = 1.0, # starting value for gamma
     k_target: float = 5.0,
     kappa_init: float = 100.0,
     h_max: int = 6,
@@ -1499,7 +1499,7 @@ def run_bingham_tracker(
         dt = jnp.maximum(0.0, t_curr - t_prev)
 
         # Exponentially Weighted Moving Average (EWMA) Decay
-        decay = jnp.exp(-gamma_diffusion * dt)
+        decay = jnp.exp(-dynamic_gamma * dt)
         A_diffused = A_prev * decay
 
         vals, vecs = jnp.linalg.eigh(A_prev)
@@ -1554,7 +1554,7 @@ def run_bingham_tracker(
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
 
         neutron_rate = q_batch.shape[0] / (dt + 1e-9)
-        steady_state_scale = neutron_rate / jnp.maximum(gamma_diffusion, 1e-6)
+        steady_state_scale = neutron_rate / jnp.maximum(dynamic_gamma, 1e-6)
 
         A_new = A_diffused + F_mean * steady_state_scale * (1.0 - decay)
 
