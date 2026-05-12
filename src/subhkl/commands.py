@@ -1364,21 +1364,22 @@ class RunPeaks:
 
 def run_bingham_tracker(
     finder_file: str,
-    event_batches,  # <-- NEW: The generator injected from the outside
+    event_batches,  
     instrument_name: str | None = None,
     streaming_callback=None,
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
     annealing_rate: float = 0.5,
     lambda_alpha: float = 0.5,
-    gamma_diffusion: float = 1.0, # starting value for gamma
-    alpha_attack = 1e-5,   # Massive inertia against sudden DAQ bursts
-    alpha_release = 0.05,  # Agile reaction to beam drops / shutter closures
+    gamma_diffusion: float = 1.0, 
+    alpha_attack = 1e-5,   
+    alpha_release = 0.05,  
     k_target: float = 5.0,
     kappa_init: float = 100.0,
-    min_dt: float = 2.0,  # pause the accumulation if min_dt has elapsed between events
+    min_dt: float = 2.0,  
     h_max: int = 6,
-    n_ensemble: int = 1
+    n_ensemble: int = 1,
+    nominal_beam_flux: float = 1_000.0,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1500,15 +1501,10 @@ def run_bingham_tracker(
     def process_chunk(A_prev, t_prev, q_batch, ki_batch, t_batch, current_sigma_q, current_gamma):
         t_curr = t_batch[-1]
 
-        # 1. SDE Decay Time
+        # 1. SDE Decay Time (Maintains physical wall-clock drift and Shutter Shield)
         dt_decay = jnp.maximum(0.0, t_curr - t_prev)
-
-        # Cap the blind diffusion at 2.0 seconds. If the beam is off
-        # for 5 minutes, the SDE effectively "pauses" its memory instead of
-        # decaying to absolute zero.
         dt_decay_capped = jnp.minimum(dt_decay, min_dt)
-        dt_rate = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
-
+        
         decay = jnp.exp(-current_gamma * dt_decay_capped)
         A_diffused = A_prev * decay
 
@@ -1516,7 +1512,12 @@ def run_bingham_tracker(
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
 
-        # Steady state scale must use the true instantaneous neutron flux!
+        # By imposing a constant nominal flux, we completely neutralize
+        # DAQ timestamp bunching. Time units become pure neutron counts.
+        dt_rate = jnp.maximum(1e-9, q_batch.shape[0] / nominal_beam_flux)
+
+        # The steady_state_scale and F_mean updates are now mathematically
+        # insulated from localized DAQ jitter. neutron_rate evaluates gracefully.
         neutron_rate = q_batch.shape[0] / dt_rate
         steady_state_scale = neutron_rate / jnp.maximum(current_gamma, 1e-6)
 
