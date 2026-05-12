@@ -1370,7 +1370,7 @@ def run_bingham_tracker(
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
     annealing_rate: float = 0.5,
-    lambda_alpha: float = 0.5,
+    lambda_alpha: float = 0.0,
     gamma_event: float = 1e-5,   # Determines the memory window (e.g. 1e-5 = 100,000 neutrons)
     gamma_step: float = 100.0,   # Determines uncertainty injection per radian of motor movement
     kappa_init: float = 100.0,
