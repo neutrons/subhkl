@@ -203,13 +203,16 @@ class EventStreamLoader:
         self.total_events = len(self.all_q_lab)
         print(f"  > EventStreamLoader Ready. Cached {self.total_events:,} events.")
 
-    def get_batches(self, batch_size_events: int = 10000):
+    # Add min_batch_size parameter
+    def get_batches(self, batch_size_events: int = 10000, min_batch_size: int = 1):
         if self.total_events == 0:
             return
 
         for start_idx in range(0, self.total_events, batch_size_events):
             end_idx = min(start_idx + batch_size_events, self.total_events)
-            if end_idx - start_idx < 100:
+            
+            # Use the parameter instead of the hardcoded 100
+            if end_idx - start_idx < min_batch_size:
                 break
                 
             yield (

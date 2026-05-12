@@ -263,7 +263,7 @@ class TestBinghamTracker(unittest.TestCase):
             f["sample/U"] = U_seed
 
         # Generates a massive 80% uniform random spherical noise!
-        sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, bg_fraction=0.8)
+        sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, bg_fraction=0.95)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
         def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
