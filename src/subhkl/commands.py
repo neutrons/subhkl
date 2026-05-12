@@ -1370,7 +1370,6 @@ def run_bingham_tracker(
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
     annealing_rate: float = 0.5,
-    lambda_alpha: float = 0.0,
     gamma_event: float = 1e-5,   # Determines the memory window (e.g. 1e-5 = 100,000 neutrons)
     gamma_step: float = 100.0,   # Determines uncertainty injection per radian of motor movement
     kappa_init: float = 100.0,
@@ -1457,14 +1456,9 @@ def run_bingham_tracker(
     print(f"  > Generated {q_theo_sample_jax.shape[1]} valid theoretical Bragg directions.")
 
     lambda_max_jax = 4.0 * jnp.pi / (q_mags_jax + 1e-9)
-    alpha_safe = jnp.maximum(lambda_alpha, 1e-6)
 
     # --- NUMERICALLY STABLE LOG-NORMALIZATION ---
-    x_jax = alpha_safe * lambda_max_jax
-    log_Z_j_jax = -jnp.log(alpha_safe) + x_jax + jnp.log(-jnp.expm1(-2.0 * x_jax))
-
-    log_Z_np = np.array(log_Z_j_jax)
-    expected_noise_ll = float(np.log(1.0 / (4.0 * np.pi)) + scipy.special.logsumexp(-log_Z_np))
+    expected_noise_ll = float(np.log(1.0 / (4.0 * np.pi)))
     print(f"  > Exact Spherical Background Noise Floor (Log-Likelihood): {expected_noise_ll:.2f}")
 
     @jax.jit
@@ -1538,7 +1532,7 @@ def run_bingham_tracker(
             wl_penalty = jnp.where(valid_wl_mask, 0.0, -1e9)
 
             # Apply the penalty so impossible reflections get 0 probability
-            log_prior = lambda_alpha * lambda_j - log_Z_j_jax + wl_penalty
+            log_prior = wl_penalty
 
             peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + log_prior
 
@@ -1549,8 +1543,7 @@ def run_bingham_tracker(
             weighted_h_geom = jnp.sum((w * kappa_safe) * q_theo_sample_jax, axis=1)
             F_geom = jnp.outer(q_exp, weighted_h_geom)
 
-            prior_scalar = lambda_alpha * (2.0 / (q_mags_jax + 1e-9))
-            weighted_h_prior = jnp.sum((w * prior_scalar) * q_theo_sample_jax, axis=1)
+            weighted_h_prior = jnp.sum(w * q_theo_sample_jax, axis=1)
             F_prior = -jnp.outer(ki_exp, weighted_h_prior)
 
             F_total = F_geom + F_prior
