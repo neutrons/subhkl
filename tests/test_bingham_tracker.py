@@ -124,7 +124,6 @@ class TestBinghamTracker(unittest.TestCase):
             min_err_deg = min(min_err_deg, err_deg)
         return min_err_deg
 
-
     def test_local_capture(self):
         print(f"\n{'='*60}\nExecuting Regression: LOCAL CAPTURE (Seed Err: 5.0°)\n{'='*60}")
         
@@ -142,17 +141,18 @@ class TestBinghamTracker(unittest.TestCase):
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
         def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
-            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[0])
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             sigma_q_start=1.0,   
-            sigma_q_min=0.002,   
-            annealing_rate=1.0,  # Rapid decay for 5-second simulated run
+            sigma_q_min=0.02,    # Match simulated peak width closer
+            annealing_rate=1.0,  
             lambda_alpha=0.5,
-            gamma_diffusion=1000.0,
+            gamma_event=1e-4,    # Fast learning rate for clean local capture
+            gamma_step=100.0,
             kappa_init=100.0,
             n_ensemble=1, 
             streaming_callback=streaming_callback
@@ -162,7 +162,7 @@ class TestBinghamTracker(unittest.TestCase):
         self.assertLess(final_err, 2.0, f"Local Capture failed to converge: Final Error {final_err:.2f}° >= 2.0°")
 
     def test_global_aliasing(self):
-        print(f"\n{'='*60}\nExecuting Regression: GLOBAL ALIASING (Seed Err: 30.0°, Ens: 256)\n{'='*60}")
+        print(f"\n{'='*60}\nExecuting Regression: GLOBAL ALIASING (Seed Err: 30.0°, Ens: 128)\n{'='*60}")
         
         U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
         U_seed = Rotation.from_euler('y', 15.0, degrees=True).as_matrix()
@@ -178,17 +178,18 @@ class TestBinghamTracker(unittest.TestCase):
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
         def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
-            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[0])
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             sigma_q_start=1.0,   
-            sigma_q_min=0.002,   
-            annealing_rate=1.0,
+            sigma_q_min=0.05,    # Keep capture funnel wide enough for physical peaks!
+            annealing_rate=0.5,  # Slower annealing to let the ensemble explore
             lambda_alpha=0.5,
-            gamma_diffusion=1.0,
+            gamma_event=1e-4,    # Fast learning rate to let the ensemble collapse and move!
+            gamma_step=100.0,
             kappa_init=100.0,
             n_ensemble=128, 
             streaming_callback=streaming_callback
@@ -215,19 +216,20 @@ class TestBinghamTracker(unittest.TestCase):
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
         def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
-            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[0])
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             sigma_q_start=1.0,   
-            sigma_q_min=0.002,   
-            annealing_rate=1.0,
+            sigma_q_min=0.05,    # Don't starve SDE by shrinking smaller than physics
+            annealing_rate=0.5,
             lambda_alpha=0.0,
-            gamma_diffusion=1000.0,
+            gamma_event=1e-4,    # Agile enough to rotate 5 degrees in 5 seconds
+            gamma_step=100.0,
             kappa_init=100.0,
-            n_ensemble=1,        # Local test with background 
+            n_ensemble=1,        
             streaming_callback=streaming_callback
         )
         
