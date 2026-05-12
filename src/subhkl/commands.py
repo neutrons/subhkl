@@ -1498,15 +1498,27 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_prev, t_prev, q_batch, ki_batch, t_batch, current_sigma_q, current_gamma):
+    def process_chunk(A_prev, t_prev, q_batch, ki_batch, t_batch, current_sigma_q, omega_speed):
         t_curr = t_batch[-1]
+        num_events = q_batch.shape[0]
 
-        # 1. SDE Decay Time (Maintains physical wall-clock drift and Shutter Shield)
-        dt_decay = jnp.maximum(0.0, t_curr - t_prev)
-        dt_decay_capped = jnp.minimum(dt_decay, min_dt)
+        # 1. Event-Driven Decay (Information Replacement)
+        # e.g., gamma_event = 1e-6 (We lose 1/e of our memory every 1 million neutrons)
+        decay_event = jnp.exp(-gamma_event * num_events)
+
+        # 2. Time-Driven Decay (Kinematic Uncertainty)
+        # If omega_speed is 0 (stationary), this decay is 1.0 (no time-loss).
+        # If omega_speed > 0, it widens the prior purely based on motor movement!
+        dt_wall = jnp.maximum(0.0, t_curr - t_prev)
+        # We still cap this at 2.0s so a shutter closure doesn't wipe the memory
+        dt_wall_capped = jnp.minimum(dt_wall, 2.0) 
         
-        decay = jnp.exp(-current_gamma * dt_decay_capped)
-        A_diffused = A_prev * decay
+        gamma_kinematic = omega_speed * rotation_fudge_factor
+        decay_time = jnp.exp(-gamma_kinematic * dt_wall_capped)
+
+        # 3. Total SDE Decay
+        decay_total = decay_event * decay_time
+        A_diffused = A_prev * decay_total
 
         vals, vecs = jnp.linalg.eigh(A_prev)
         r = vecs[:, -1]
