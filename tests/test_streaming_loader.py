@@ -139,16 +139,170 @@ class TestEventStreamLoader(unittest.TestCase):
             atol=1e-6, 
             err_msg="ki_sample did not properly rotate from the Lab frame into the Sample frame."
         )
-        
+
         # 3. Verify q_sample norm consistency 
-        # (q is a directional momentum vector, its length must remain invariant under rotation)
+        # (q = kf - ki, so its length is 2*sin(theta), not 1.0!)
+        # A pure rotation from Lab to Sample MUST preserve this exact length.
+        
+        # We can grab the original q_lab from the loader's internal cache
+        q_norm_lab = np.linalg.norm(loader.all_q_lab[0])
         q_norm_sample = np.linalg.norm(q_sample[0])
+        
         self.assertAlmostEqual(
-            q_norm_sample, 1.0, places=5,
-            msg="The q_sample momentum vector was corrupted during the frame transformation."
+            q_norm_sample, q_norm_lab, places=5,
+            msg="The q_sample momentum vector length was altered during the frame transformation!"
         )
         
         print("  -> Success: EventStreamLoader correctly interpolated logs and mapped vectors into the rotating Sample Frame.")
+
+    def test_pixel_geometry_mapping(self):
+        print(f"\n{'='*60}\nExecuting Regression: PIXEL GEOMETRY MAPPING & KINEMATICS\n{'='*60}")
+        
+        self.instrument = "MANDI"
+        available_banks = list(beamlines.get(self.instrument, {}).keys())
+        if not available_banks:
+            self.skipTest("No banks found for MANDI.")
+            
+        bank_str = available_banks[0]
+        bank_id = int(bank_str)
+        
+        # 1. Fetch the actual physical wiring config for this bank
+        from subhkl.config import reduction_settings
+        from subhkl.instrument.detector import Detector
+        
+        det_config = beamlines[self.instrument][bank_str]
+        settings = reduction_settings.get(self.instrument, {})
+        
+        offset = det_config.get("offset", 0)
+        det_n = det_config.get("n", 256)
+        det_m = det_config.get("m", 256)
+        
+        # 2. Pick an arbitrary pixel in the middle of the detector panel
+        target_local_id = (det_n * det_m) // 2 + 42
+        target_event_id = target_local_id + offset
+        
+        # 3. Calculate expected discrete pixel coordinates
+        if settings.get("YAxisIsFastVaryingIndex"):
+            expected_c = target_local_id // det_n
+            expected_r = target_local_id % det_n
+        else:
+            expected_c = target_local_id % det_m
+            expected_r = target_local_id // det_m
+
+        # 4. Inject this specific Event ID into the Mock NeXus File
+        with h5py.File(self.nexus_file, 'w') as f:
+            entry = f.create_group('entry')
+            bA = entry.create_group(f'bank{bank_id}_events')
+            bA.create_dataset('event_id', data=np.array([target_event_id]))
+            bA.create_dataset('event_index', data=np.array([0]))
+            bA.create_dataset('event_time_offset', data=np.array([0.0]))
+            bA.create_dataset('event_time_zero', data=np.array([5.0]))
+            
+        loader = EventStreamLoader(
+            event_nexus_filename=self.nexus_file,
+            instrument_name=self.instrument,
+            ki_vec=np.array([0.0, 0.0, 1.0]),
+            sample_offset=np.zeros((1, 3))
+        )
+        
+        batches = list(loader.get_batches(10000, min_batch_size=1))
+        self.assertEqual(len(batches), 1, "Loader failed to yield the event batch.")
+        
+        q_sample, _, _, pr, pc, _, _, _, _ = batches[0]
+        
+        # 5. Verify the Unpacking Geometry (Parser Check)
+        self.assertEqual(pr[0], expected_r, f"Pixel Row mapping failed. Expected {expected_r}, got {pr[0]}.")
+        self.assertEqual(pc[0], expected_c, f"Pixel Column mapping failed. Expected {expected_c}, got {pc[0]}.")
+        
+        # 6. Verify the Final Conversion to Sample Coordinates (Physics Check)
+        # Create a true Detector object to find the physical XYZ coordinates of this pixel
+        det = Detector(det_config)
+        expected_xyz = det.pixel_to_lab(expected_r, expected_c)
+        
+        # Manually compute the kinematic projection:
+        # Since sample_offset is 0, kf is just the normalized XYZ vector
+        expected_kf_lab = expected_xyz / np.linalg.norm(expected_xyz)
+        
+        # q = kf - ki
+        expected_q_lab = expected_kf_lab - np.array([0.0, 0.0, 1.0])
+        
+        # Since we did not provide a goniometer sequence for this test, 
+        # the Lab frame and Sample frame are identical.
+        expected_q_sample = expected_q_lab
+        
+        np.testing.assert_allclose(
+            q_sample[0], 
+            expected_q_sample, 
+            atol=1e-5,
+            err_msg="The final q_sample vector does not match the forward kinematics of the expected pixel!"
+        )
+        
+        print(f"  -> Success: Perfectly mapped Event ID {target_event_id} to (Row: {expected_r}, Col: {expected_c}) and verified its 3D momentum vector.")
+
+    def test_multi_axis_kinematic_chain(self):
+        print(f"\n{'='*60}\nExecuting Regression: MULTI-AXIS KINEMATIC CHAIN\n{'='*60}")
+        
+        self.instrument = "MANDI"
+        available_banks = list(beamlines.get(self.instrument, {}).keys())
+        if not available_banks:
+            self.skipTest("No banks found for MANDI.")
+        bank_id = int(available_banks[0])
+        
+        with h5py.File(self.nexus_file, 'w') as f:
+            entry = f.create_group('entry')
+            
+            # 1. Inject a single event at absolute time = 5.0 seconds
+            bA = entry.create_group(f'bank{bank_id}_events')
+            bA.create_dataset('event_id', data=np.array([1000]))
+            bA.create_dataset('event_index', data=np.array([0]))
+            bA.create_dataset('event_time_offset', data=np.array([0.0]))
+            bA.create_dataset('event_time_zero', data=np.array([5.0]))
+            
+            # 2. Inject TWO mocked Goniometer Logs
+            # Motor 1 (Omega): 90 degrees
+            omega = entry.create_group('DASlogs/omega')
+            omega.create_dataset('time', data=np.array([0.0, 10.0]))
+            omega.create_dataset('value', data=np.array([90.0, 90.0]))
+            
+            # Motor 2 (Phi): 90 degrees
+            phi = entry.create_group('DASlogs/phi')
+            phi.create_dataset('time', data=np.array([0.0, 10.0]))
+            phi.create_dataset('value', data=np.array([90.0, 90.0]))
+   
+        loader = EventStreamLoader(
+            event_nexus_filename=self.nexus_file,
+            instrument_name=self.instrument,
+            ki_vec=np.array([0.0, 0.0, 1.0]),         # Beam travels down Lab Z
+            
+            # --- FIX: Match the number of offsets to the number of axes (2) ---
+            sample_offset=np.zeros((2, 3)), 
+            
+            # Define the kinematic hierarchy: Omega (outer) -> Phi (inner)
+            gonio_axes=np.array([[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]), 
+            gonio_names=['omega', 'phi']
+        ) 
+
+        batches = list(loader.get_batches(10000, min_batch_size=1))
+        self.assertEqual(len(batches), 1, "Loader failed to yield the event batch.")
+        
+        q_sample, times, banks, pr, pc, angles, slab, ki_sample, count = batches[0]
+        
+        # 1. Verify multi-axis interpolation
+        self.assertAlmostEqual(angles[0, 0], 90.0, msg="Omega angle interpolation failed.")
+        self.assertAlmostEqual(angles[0, 1], 90.0, msg="Phi angle interpolation failed.")
+        
+        # 2. Verify Kinematic Chain Ordering
+        # Lab Z (0, 0, 1) -> Inverse Omega (-90Y) = (-1, 0, 0) -> Inverse Phi (-90Z) = (0, 1, 0)
+        expected_ki_sample = np.array([0.0, 1.0, 0.0])
+        
+        np.testing.assert_allclose(
+            ki_sample[0], 
+            expected_ki_sample, 
+            atol=1e-5, 
+            err_msg="Kinematic chain failed! The rotation matrices were likely multiplied in the wrong order."
+        )
+        
+        print("  -> Success: Multi-axis kinematic chain correctly nested and inverted rotations.")
 
 if __name__ == '__main__':
     unittest.main()
