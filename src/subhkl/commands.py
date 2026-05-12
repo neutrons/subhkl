@@ -1371,15 +1371,12 @@ def run_bingham_tracker(
     sigma_q_min: float = 0.05,
     annealing_rate: float = 0.5,
     lambda_alpha: float = 0.5,
-    gamma_diffusion: float = 1.0, 
-    alpha_attack = 1e-5,   
-    alpha_release = 0.05,  
-    k_target: float = 5.0,
+    gamma_event: float = 1e-5,   # Determines the memory window (e.g. 1e-5 = 100,000 neutrons)
+    gamma_step: float = 100.0,   # Determines uncertainty injection per radian of motor movement
     kappa_init: float = 100.0,
     min_dt: float = 2.0,  
     h_max: int = 6,
     n_ensemble: int = 1,
-    nominal_beam_flux: float = 1_000.0,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1498,40 +1495,27 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_prev, t_prev, q_batch, ki_batch, t_batch, current_sigma_q, omega_speed):
+    def process_chunk(A_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
 
         # 1. Event-Driven Decay (Information Replacement)
-        # e.g., gamma_event = 1e-6 (We lose 1/e of our memory every 1 million neutrons)
         decay_event = jnp.exp(-gamma_event * num_events)
 
-        # 2. Time-Driven Decay (Kinematic Uncertainty)
-        # If omega_speed is 0 (stationary), this decay is 1.0 (no time-loss).
-        # If omega_speed > 0, it widens the prior purely based on motor movement!
-        dt_wall = jnp.maximum(0.0, t_curr - t_prev)
-        # We still cap this at 2.0s so a shutter closure doesn't wipe the memory
-        dt_wall_capped = jnp.minimum(dt_wall, 2.0) 
-        
-        gamma_kinematic = omega_speed * rotation_fudge_factor
-        decay_time = jnp.exp(-gamma_kinematic * dt_wall_capped)
+        # 2. Discrete Step Decay (Motor Backlash / Settling Uncertainty)
+        decay_step = jnp.exp(-gamma_step * delta_angle)
 
         # 3. Total SDE Decay
-        decay_total = decay_event * decay_time
+        decay_total = decay_event * decay_step
         A_diffused = A_prev * decay_total
 
-        vals, vecs = jnp.linalg.eigh(A_prev)
+        # Compute U from the diffused prior
+        vals, vecs = jnp.linalg.eigh(A_diffused)
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
 
-        # By imposing a constant nominal flux, we completely neutralize
-        # DAQ timestamp bunching. Time units become pure neutron counts.
-        dt_rate = jnp.maximum(1e-9, q_batch.shape[0] / nominal_beam_flux)
-
-        # The steady_state_scale and F_mean updates are now mathematically
-        # insulated from localized DAQ jitter. neutron_rate evaluates gracefully.
-        neutron_rate = q_batch.shape[0] / dt_rate
-        steady_state_scale = neutron_rate / jnp.maximum(current_gamma, 1e-6)
+        # In pure event-space, the steady state is 1 / gamma_event
+        steady_state_scale = 1.0 / jnp.maximum(gamma_event, 1e-9)
 
         # --- DYNAMIC BACKGROUND TUNING ---
         kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
@@ -1579,25 +1563,28 @@ def run_bingham_tracker(
 
         F_mean = jnp.mean(A_F_batch, axis=0)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
-        A_new = A_diffused + F_mean * steady_state_scale * (1.0 - decay)
+        
+        # SDE update leveraging the steady-state scale
+        A_new = A_diffused + F_mean * steady_state_scale * (1.0 - decay_total)
 
         vals_new = jnp.linalg.eigvalsh(A_new)
         gap_new = vals_new[-1] - vals_new[-2]
         norm_gap = gap_new / jnp.maximum(steady_state_scale, 1e-9)
 
-        # Rates calculated using the true beam density
+        # Rates calculated for telemetry visualization purely in Hz based on chunk time
+        dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         signal_count = jnp.sum(w_batch)
-        bg_count = q_batch.shape[0] - signal_count
+        bg_count = num_events - signal_count
 
-        sig_rate = signal_count / dt_rate
-        bg_rate = bg_count / dt_rate
+        sig_rate = signal_count / dt_chunk
+        bg_rate = bg_count / dt_chunk
 
         return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, None, None, None, None, None, None),
+            in_axes=(0, None, None, None, None, None), # A_prev sweeps, everything else broadcasts
             out_axes=(0, None, 0, 0, 0, 0, 0)
         )
     )
@@ -1620,10 +1607,8 @@ def run_bingham_tracker(
     t_start = None
     t_state = 0.0
 
-    # Set a target SNR requirement (e.g., 5-sigma lock)
-    dynamic_gamma = gamma_diffusion  # Starting value
-
     effective_annealing_time = 0.0
+    angles_prev = None
 
     for batch_data in event_batches:
         q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
@@ -1633,6 +1618,14 @@ def run_bingham_tracker(
             t_start = t_state
 
         dt_wall = float(t_batch_np[-1] - t_state)
+
+        # Track Goniometer changes for discrete step-decay!
+        angles_curr = angles_np[-1]
+        if angles_prev is None:
+            delta_angle = 0.0
+        else:
+            delta_angle = float(np.linalg.norm(angles_curr - angles_prev))
+        angles_prev = angles_curr
 
         # If the gap between batches (or spanning the batch) exceeds min_dt, the shield is active
         is_paused = bool(dt_wall > min_dt)
@@ -1651,7 +1644,7 @@ def run_bingham_tracker(
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
         A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates = ensemble_process_chunk(
-            A_ensemble_state, t_state, q_batch, ki_batch, t_batch, current_sigma_q, dynamic_gamma
+            A_ensemble_state, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
         )
 
         best_idx = int(jnp.argmin(loss_ensemble))
@@ -1664,22 +1657,8 @@ def run_bingham_tracker(
         current_sig_rate = float(sig_rates[best_idx])
         current_bg_rate = float(bg_rates[best_idx])
         
-        # Prevent division by zero if background is completely dead
-        safe_bg = max(current_bg_rate, 1.0) 
-        
-        # Calculate the theoretical optimal gamma for this exact moment in the beam
-        ideal_gamma = (current_sig_rate ** 2) / ((k_target ** 2) * safe_bg)
-
-        # Choose alpha based on the direction of the gamma shift
-        if ideal_gamma > dynamic_gamma:
-            current_alpha = alpha_attack
-        else:
-            current_alpha = alpha_release
-
-        dynamic_gamma = (1.0 - current_alpha) * dynamic_gamma + current_alpha * ideal_gamma
-
         if cumulative_count % 50000 < len(t_batch_np):
-            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Auto-Gamma: {dynamic_gamma:.5f} | Norm-Gap: {best_gap:8.2f}")
+            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Step-Rot: {delta_angle:.4f} rad | Norm-Gap: {best_gap:8.2f}")
 
         if streaming_callback is not None:
             new_events = {
@@ -1695,7 +1674,7 @@ def run_bingham_tracker(
                 "eigengap": best_gap,
                 "sig_rate": current_sig_rate,
                 "bg_rate": current_bg_rate,
-                "gamma": float(dynamic_gamma),
+                "gamma": gamma_event, # Passed statically to not break the UI dashboard
                 "sigma_q": current_sigma_q,
                 "is_paused": is_paused,
             }
