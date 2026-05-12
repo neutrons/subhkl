@@ -1374,7 +1374,6 @@ def run_bingham_tracker(
     gamma_event: float = 1e-5,   # Determines the memory window (e.g. 1e-5 = 100,000 neutrons)
     gamma_step: float = 100.0,   # Determines uncertainty injection per radian of motor movement
     kappa_init: float = 100.0,
-    min_dt: float = 2.0,  
     h_max: int = 6,
     n_ensemble: int = 1,
 ):
@@ -1628,14 +1627,11 @@ def run_bingham_tracker(
             delta_angle = float(np.linalg.norm(angles_curr - angles_prev))
         angles_prev = angles_curr
 
-        # If the gap between batches (or spanning the batch) exceeds min_dt, the shield is active
-        is_paused = bool(dt_wall > min_dt)
-
-        # Only advance the learning clock by the un-paused amount of time
-        effective_annealing_time += min(dt_wall, min_dt)
-
-        # Calculate sigma_q using the effective learning time
-        current_sigma_q = max(sigma_q_min, sigma_q_start * np.exp(-annealing_rate * effective_annealing_time))
+        # Calculate sigma_q using the cumulative neutron count
+        current_sigma_q = max(
+            sigma_q_min, 
+            sigma_q_start * np.exp(-annealing_rate * cumulative_count)
+        )
 
         q_batch = jax.device_put(q_batch_np)
         q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
@@ -1677,7 +1673,6 @@ def run_bingham_tracker(
                 "bg_rate": current_bg_rate,
                 "gamma": gamma_event, # Passed statically to not break the UI dashboard
                 "sigma_q": current_sigma_q,
-                "is_paused": is_paused,
             }
 
             streaming_callback(
