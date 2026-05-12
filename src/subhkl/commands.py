@@ -1596,11 +1596,12 @@ def run_bingham_tracker(
     r_random = r_random / jnp.linalg.norm(r_random, axis=1, keepdims=True)
     U_ensemble = jax.vmap(quaternion_to_rotation_matrix)(r_random)
 
-    C_ensemble = kappa_init * U_ensemble
+    steady_state_scale_init = 1.0 / max(gamma_event, 1e-12)
+    C_ensemble = kappa_init * steady_state_scale_init * U_ensemble
     A_ensemble_state = jax.vmap(compute_A_from_C)(C_ensemble)
 
     if U_init is not None:
-        A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
+        A_seed = compute_A_from_C(kappa_init * steady_state_scale_init * jnp.array(U_init))
         A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
 
     tracking_history = []
