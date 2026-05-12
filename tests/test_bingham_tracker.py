@@ -32,7 +32,7 @@ class TestBinghamTracker(unittest.TestCase):
     def tearDown(self):
         self.test_dir.cleanup()
 
-    def generate_poissonian_events(self, U_true, num_events=1000000, duration=5.0, sigma_q=0.05, bg_fraction=0.0):
+    def generate_poissonian_events(self, U_true, num_events=1000000, duration=5.0, sigma_q=0.05, bg_fraction=0.0, b_factor=0.0):
         B_mat = np.array([
             [2*np.pi/10.0, 0, 0],
             [0, 2*np.pi/10.0, 0],
@@ -63,7 +63,18 @@ class TestBinghamTracker(unittest.TestCase):
         num_bg = int(num_events * bg_fraction)
         num_sig = num_events - num_bg
 
-        peak_indices = np.random.choice(num_valid, size=num_sig)
+        # ==========================================================
+        # --- THE WILSON PRIOR (Intensity Decay) ---
+        # ==========================================================
+        if b_factor > 0.0:
+            # I(q) ~ exp(-B * |q|^2)
+            # This makes low-q peaks overwhelmingly more frequent
+            intensities = np.exp(-b_factor * (valid_norms**2))
+            p_dist = intensities / np.sum(intensities)
+        else:
+            p_dist = None # Uniform distribution for old tests
+
+        peak_indices = np.random.choice(num_valid, size=num_sig, p=p_dist)
         
         q_exp_list = []
         # 1. Generate Physical Signal Events
@@ -93,6 +104,46 @@ class TestBinghamTracker(unittest.TestCase):
         pixels_c = np.zeros(num_events, dtype=int)
 
         return q_lab, times, banks, pixels_r, pixels_c
+
+    def test_wilson_intensity_modulation(self):
+        print(f"\n{'='*60}\nExecuting Regression: WILSON INTENSITY MODULATION (Low-Q Preference)\n{'='*60}")
+
+        U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
+        U_seed = Rotation.from_euler('y', 40.0, degrees=True).as_matrix()
+
+        with h5py.File(self.finder_file, "w") as f:
+            f["sample/a"], f["sample/b"], f["sample/c"] = 10.0, 10.0, 10.0
+            f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = 90.0, 90.0, 90.0
+            f["sample/space_group"] = b"P 1"
+            f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+            f["sample/U"] = U_seed
+
+        # b_factor=0.5 causes extreme exponential decay of intensity at high-q
+        sim_data = self.generate_poissonian_events(
+            U_true, num_events=1000000, duration=5.0, b_factor=0.5
+        )
+        event_stream = self.get_fake_batches(sim_data, batch_size=10000)
+
+        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
+
+        final_U = run_bingham_tracker(
+            finder_file=self.finder_file,
+            event_batches=event_stream,
+            sigma_q_start=1.0,
+            sigma_q_min=0.02,
+            annealing_rate=1.0,
+            lambda_alpha=0.5,
+            gamma_event=1e-4,
+            gamma_step=100.0,
+            kappa_init=100.0,
+            n_ensemble=1,
+            streaming_callback=streaming_callback
+        )
+
+        final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
+        self.assertLess(final_err, 2.0, f"Wilson Modulation failed to converge: Final Error {final_err:.2f}° >= 2.0°")
 
     def get_fake_batches(self, sim_data, batch_size=10000):
         """Yields streaming tuples exactly matching the EventStreamLoader signature."""
