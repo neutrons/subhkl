@@ -1379,8 +1379,6 @@ def run_bingham_tracker(
     d_min: float = 2.0,
     d_max: float = 8.0,
     bg_ema_weight: float = 0.99,
-    wl_min: float = None,
-    wl_max: float = None,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1409,21 +1407,6 @@ def run_bingham_tracker(
         if "sample/U" in f:
             U_init = f["sample/U"][()]
             print("  > Discovered seed U matrix in finder file. Will initialize Bingham Prior.")
-
-        if "instrument/wavelength" in f:
-            wl_bounds = f["instrument/wavelength"][()]
-        else:
-            wl_bounds = np.array([0.5, 10.0])  # Safe fallback
-
-        if wl_min is not None:
-            wl_min_jax = float(wl_min)
-        else:
-            wl_min_jax = float(wl_bounds[0])
-
-        if wl_max is not None:
-            wl_max_jax = float(wl_max)
-        else:
-            wl_max_jax = float(wl_bounds[1])
 
     B_mat = ub_helper.reciprocal_lattice_B()
     _, _, centering = get_lattice_system(
@@ -1513,7 +1496,7 @@ def run_bingham_tracker(
         ], axis=0)
 
     jax.jit
-    def process_chunk(A_prev, bg_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
+    def process_chunk(A_prev, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
 
@@ -1547,19 +1530,22 @@ def run_bingham_tracker(
         bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
         bg_log_pdf_flat = jnp.log(bg_pdf)
 
+        # --- 1D EMPIRICAL SIGNAL SPECTRUM (100 Bins: 0 to 10 A) ---
+        wl_pdf = wl_hist_prev / jnp.sum(wl_hist_prev)
+        wl_log_pdf = jnp.log(wl_pdf)
+
         def single_event_update(q_exp, ki_exp):
             h_sample = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_sample)
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
             
-            # --- 1. LAUE KINEMATICS ---
+            # Look up the learned probability of this wavelength!
             lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
-            valid_wl_mask = (lambda_j >= wl_min_jax) & (lambda_j <= wl_max_jax)
-            wl_penalty = jnp.where(valid_wl_mask, 0.0, -1e9)
+            wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, 99)
+            learned_wl_prior = wl_log_pdf[wl_idx]
 
-            # --- 2. PURE GEOMETRIC LIKELIHOOD ---
-            # (Lorentz Prior removed! No more beamstop black holes.)
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty
+            # The peak likelihood is now entirely data-driven!
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + learned_wl_prior
 
             # --- 3. BACKGROUND PHYSICS (2D EMPIRICAL KDE) ---
             u_exp = q_exp[2]
@@ -1590,11 +1576,30 @@ def run_bingham_tracker(
             weighted_h_geom = jnp.sum(w * q_theo_sample_jax, axis=1) * kappa_safe
             F_total = jnp.outer(q_exp, weighted_h_geom) 
 
-            return compute_A_from_C(F_total), -log_Z, w_sum
+            return compute_A_from_C(F_total), -log_Z, w_sum, w
 
         # Evaluate the physical data
-        A_F_batch, nll_batch, w_sum_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
+        A_F_batch, nll_batch, w_sum_batch, w_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
         signal_count = jnp.sum(w_sum_batch)
+
+        # 1. Identify which peak claimed which neutron (argmax)
+        winning_peak_indices = jnp.argmax(w_batch, axis=1)
+
+        # 2. Filter only the confident signals (e.g., probability > 0.5)
+        is_signal = jnp.max(w_batch, axis=1) > 0.5
+
+        # 3. Get the theoretical wavelength of those winning peaks
+        winning_lambdas = jax.vmap(lambda q, ki: -(2.0 / (q_mags_jax + 1e-9)) * jnp.dot(ki, jnp.matmul(U, q_theo_sample_jax)))(q_batch, ki_batch)
+        actual_winning_lambdas = winning_lambdas[jnp.arange(num_events), winning_peak_indices]
+
+        # 4. Bin them into the 0-10 A grid
+        wl_idx_batch = jnp.clip(jnp.floor(actual_winning_lambdas * 10.0).astype(jnp.int32), 0, 99)
+
+        # Only bin the ones that were actually signal!
+        raw_wl_hist = jnp.bincount(jnp.where(is_signal, wl_idx_batch, 100), length=101)[:100]
+
+        # 5. Update the EMA
+        wl_hist_new = bg_ema_weight * wl_hist_prev + (1.0 - bg_ema_weight) * raw_wl_hist + 1e-3
 
         decay_event = jnp.exp(-gamma_event * num_events)
         decay_step = jnp.exp(-gamma_step * delta_angle)
@@ -1614,13 +1619,13 @@ def run_bingham_tracker(
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
-        return A_new, bg_hist_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
+        return A_new, bg_hist_new, wl_hist_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, 0, None, None, None, None, None), 
-            out_axes=(0, 0, None, 0, 0, 0, 0, 0, 0) # 9 outputs mapped!
+            in_axes=(0, 0, 0, None, None, None, None, None),
+            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0) # 9 outputs mapped!
         )
     )
 
@@ -1640,6 +1645,9 @@ def run_bingham_tracker(
         A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
 
     bg_hist_ensemble = jnp.ones((n_ensemble, 4096)) * 1.0
+
+    # 100 bins spanning 0.0 to 10.0 Angstroms. Start with a uniform 1.0 floor.
+    wl_hist_ensemble = jnp.ones((n_ensemble, 100)) * 1.0
 
     tracking_history = []
     t_start = None
@@ -1678,8 +1686,8 @@ def run_bingham_tracker(
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
-        A_ensemble_state, bg_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
-            A_ensemble_state, bg_hist_ensemble, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
+        A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
+            A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
         )
 
         best_idx = int(jnp.argmin(loss_ensemble))
