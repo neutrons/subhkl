@@ -1589,13 +1589,13 @@ def run_bingham_tracker(
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
-        return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate
+        return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, None, None, None, None, None), # A_prev sweeps, everything else broadcasts
-            out_axes=(0, None, 0, 0, 0, 0, 0)
+            in_axes=(0, None, None, None, None, None),
+            out_axes=(0, None, 0, 0, 0, 0, 0, 0)
         )
     )
 
@@ -1651,7 +1651,7 @@ def run_bingham_tracker(
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
-        A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates = ensemble_process_chunk(
+        A_ensemble_state, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
             A_ensemble_state, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
         )
 
@@ -1696,6 +1696,18 @@ def run_bingham_tracker(
                 new_events=new_events,
                 metrics=metrics_dict,
             )
+
+        if cumulative_count % 50000 < len(t_batch_np):
+            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Step-Rot: {delta_angle:.4f} rad | Norm-Gap: {best_gap:8.2f}")
+            
+            # --- LIVE HISTOGRAM VERIFICATION ---
+            bg_profile = np.array(bg_pdfs[best_idx])
+            peak_idx = np.argmax(bg_profile)
+            
+            # Compress 128 bins into 64 terminal characters
+            chars = "  ▂▃▄▅▆▇█"
+            spark = "".join([chars[min(8, int((v / np.max(bg_profile)) * 8))] for v in bg_profile[::2]])
+            print(f"    [Histogram] Peak Bin: {peak_idx}/127 | Density: |{spark}|")
 
     if not tracking_history:
         print("\n[3/3] Tracking complete. No events were processed.")
