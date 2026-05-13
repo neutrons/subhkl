@@ -1377,6 +1377,7 @@ def run_bingham_tracker(
     n_ensemble: int = 1,
     b_factor: float = 0.0,
     d_min: float = 2.0,
+    d_max: float = 8.0,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1449,8 +1450,12 @@ def run_bingham_tracker(
     q_theo_cryst = np.array(B_mat @ theo_hkl)
     q_mags_np = np.linalg.norm(q_theo_cryst, axis=0)
 
-    q_max_tracking = 1/d_min
-    res_mask = q_mags_np < q_max_tracking
+    q_min_tracking = 1.0 / d_max
+    q_max_tracking = 1/max(d_min, 1e-6)
+
+    # Strictly bound the tracking grid to the healthy mid-Q range
+    res_mask = (q_mags_np < q_max_tracking) & (q_mags_np > q_min_tracking)
+    
     q_theo_cryst = q_theo_cryst[:, res_mask]
     q_mags_np = q_mags_np[res_mask]
     
