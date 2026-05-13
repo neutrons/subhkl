@@ -1378,6 +1378,7 @@ def run_bingham_tracker(
     b_factor: float = 0.0,
     d_min: float = 2.0,
     d_max: float = 8.0,
+    bg_ema_weight: float = 0.99,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1528,15 +1529,14 @@ def run_bingham_tracker(
         flat_idx_batch = u_idx_batch * 64 + v_idx_batch
         raw_hist = jnp.bincount(flat_idx_batch, length=4096)
 
-        # Exponential Moving Average (100-batch memory)
-        bg_hist_new = 0.99 * bg_hist_prev + 0.01 * raw_hist 
-        smoothed_hist = bg_hist_new + 1.0 # Minimal Laplace smoothing for sharp drop-offs!
+        # --- THE CONFIGURABLE EMA ---
+        bg_hist_new = bg_ema_weight * bg_hist_prev + (1.0 - bg_ema_weight) * raw_hist 
+        smoothed_hist = bg_hist_new + 1.0 
         
         # Normalize to 2D Solid Angle PDF
         d_omega = (2.0 / 64.0) * (2.0 * jnp.pi / 64.0)
         bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
         bg_log_pdf_flat = jnp.log(bg_pdf)
-        # ====================================================================
 
         def single_event_update(q_exp, ki_exp):
             h_sample = jnp.matmul(U, q_theo_sample_jax)
@@ -1602,15 +1602,13 @@ def run_bingham_tracker(
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
-        return A_new, bg_hist_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate
+        return A_new, bg_hist_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            # Added a '0' for bg_hist_prev
             in_axes=(0, 0, None, None, None, None, None), 
-            # Added a '0' for bg_hist_new
-            out_axes=(0, 0, None, 0, 0, 0, 0, 0) 
+            out_axes=(0, 0, None, 0, 0, 0, 0, 0, 0) # 9 outputs mapped!
         )
     )
 
@@ -1668,7 +1666,7 @@ def run_bingham_tracker(
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
-        A_ensemble_state, bg_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates = ensemble_process_chunk(
+        A_ensemble_state, bg_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
             A_ensemble_state, bg_hist_ensemble, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
         )
 
@@ -1701,6 +1699,7 @@ def run_bingham_tracker(
                 "bg_rate": current_bg_rate,
                 "gamma": gamma_event, # Passed statically to not break the UI dashboard
                 "sigma_q": current_sigma_q,
+                "bg_pdf": np.array(bg_pdfs[best_idx]).reshape((64, 64))
             }
 
             streaming_callback(
