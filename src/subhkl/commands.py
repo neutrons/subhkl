@@ -1538,7 +1538,8 @@ def run_bingham_tracker(
         bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
         bg_log_pdf_flat = jnp.log(bg_pdf)
 
-        h_sample = jnp.matmul(U, q_theo_sample_jax)
+        def single_event_update(q_exp, ki_exp):
+            h_sample = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_sample)
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
             
