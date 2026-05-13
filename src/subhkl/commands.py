@@ -1502,7 +1502,7 @@ def run_bingham_tracker(
             jnp.concatenate([A10, A11], axis=1)
         ], axis=0)
 
-    @jax.jit
+    jax.jit
     def process_chunk(A_prev, bg_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
@@ -1515,20 +1515,27 @@ def run_bingham_tracker(
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
 
         # ====================================================================
-        # --- THE EMA ACCUMULATING HISTOGRAM ---
-        x_batch = jnp.sum(q_batch * ki_batch, axis=1) 
-        bin_indices = jnp.clip(jnp.floor((x_batch + 1.0) * 127.99).astype(jnp.int32), 0, 127)
-        raw_hist = jnp.bincount(bin_indices, length=128)
+        # --- 2D SPHERICAL EMPIRICAL BACKGROUND (64 x 64 Bins) ---
+        # 1. Polar coordinate (Z-axis scattering depth, range [-1, 1])
+        u_batch = q_batch[:, 2] 
+        # 2. Azimuthal coordinate (XY plane rotation, range [-pi, pi])
+        v_batch = jnp.arctan2(q_batch[:, 1], q_batch[:, 0]) 
 
-        # EMA Math: 99% Memory, 1% New Data. 
-        # This gives the KDE a stable rolling memory of ~100 batches (1 Million events)
-        bg_hist_new = 0.99 * bg_hist_prev + 0.01 * raw_hist 
+        # Map to 64x64 Grid
+        u_idx_batch = jnp.clip(jnp.floor((u_batch + 1.0) * 31.999).astype(jnp.int32), 0, 63)
+        v_idx_batch = jnp.clip(jnp.floor((v_batch + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
         
-        # Normalize to probability
-        dz = 1.0 / 128.0
-        d_omega = 2.0 * jnp.pi * dz
-        bg_pdf = bg_hist_new / (jnp.sum(bg_hist_new) * d_omega)
-        bg_log_pdf = jnp.log(bg_pdf)
+        flat_idx_batch = u_idx_batch * 64 + v_idx_batch
+        raw_hist = jnp.bincount(flat_idx_batch, length=4096)
+
+        # Exponential Moving Average (100-batch memory)
+        bg_hist_new = 0.99 * bg_hist_prev + 0.01 * raw_hist 
+        smoothed_hist = bg_hist_new + 1.0 # Minimal Laplace smoothing for sharp drop-offs!
+        
+        # Normalize to 2D Solid Angle PDF
+        d_omega = (2.0 / 64.0) * (2.0 * jnp.pi / 64.0)
+        bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
+        bg_log_pdf_flat = jnp.log(bg_pdf)
         # ====================================================================
 
         def single_event_update(q_exp, ki_exp):
@@ -1542,24 +1549,28 @@ def run_bingham_tracker(
 
             peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty
 
-            x_exp = jnp.dot(q_exp, ki_exp)
-            idx = jnp.clip(jnp.floor((x_exp + 1.0) * 127.99).astype(jnp.int32), 0, 127)
-            dynamic_bg_log_lik = jnp.array([bg_log_pdf[idx]])
+            # --- DYNAMIC BACKGROUND LOOKUP (2D) ---
+            u_exp = q_exp[2]
+            v_exp = jnp.arctan2(q_exp[1], q_exp[0])
+            u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 31.999).astype(jnp.int32), 0, 63)
+            v_idx_exp = jnp.clip(jnp.floor((v_exp + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
+            
+            dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
 
-            # Evaluate where the THEORETICAL peak is pointing.
-            # If the peak is pointing into the empty panel gap, penalize it!
-            x_theo = jnp.dot(h_sample, ki_exp)
-            idx_theo = jnp.clip(jnp.floor((x_theo + 1.0) * 127.99).astype(jnp.int32), 0, 127)
+            # --- THE 2D PANEL MASK PENALTY ---
+            # Evaluates the exact 2D trajectory of every theoretical peak!
+            u_theo = h_sample[2, :]
+            v_theo = jnp.arctan2(h_sample[1, :], h_sample[0, :])
             
-            # The density at the theoretical location. If this is very low, 
-            # the peak is pointing at empty air. We subtract a tunable penalty.
-            # bg_pdf is the raw density (not log). We use it to create a smooth drop-off.
-            # The + 1e-4 prevents log(0) if a bin ever fully empties.
-            panel_mask_penalty = jnp.log(bg_pdf[idx_theo] + 1e-4)
+            u_idx_theo = jnp.clip(jnp.floor((u_theo + 1.0) * 31.999).astype(jnp.int32), 0, 63)
+            v_idx_theo = jnp.clip(jnp.floor((v_theo + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
+            flat_idx_theo = u_idx_theo * 64 + v_idx_theo
             
-            # Apply the penalty to the peak's log-likelihood
+            # Massive negative penalty if the peak drifts into an empty panel gap!
+            panel_mask_penalty = jnp.log(jnp.exp(bg_log_pdf_flat[flat_idx_theo]) + 1e-4)
             peak_log_lik = peak_log_lik + panel_mask_penalty
 
+            # Evaluate Softmax with the panel mask active
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
             w = jnp.exp(peak_log_lik - log_Z)
             w_sum = jnp.sum(w) 
@@ -1569,6 +1580,7 @@ def run_bingham_tracker(
 
             return compute_A_from_C(F_total), -log_Z, w_sum
 
+        # Evaluate the physical data
         A_F_batch, nll_batch, w_sum_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
         signal_count = jnp.sum(w_sum_batch)
 
@@ -1590,8 +1602,7 @@ def run_bingham_tracker(
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
-        # Return bg_hist_new!
-        return A_new, bg_hist_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
+        return A_new, bg_hist_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
@@ -1599,7 +1610,7 @@ def run_bingham_tracker(
             # Added a '0' for bg_hist_prev
             in_axes=(0, 0, None, None, None, None, None), 
             # Added a '0' for bg_hist_new
-            out_axes=(0, 0, None, 0, 0, 0, 0, 0, 0) 
+            out_axes=(0, 0, None, 0, 0, 0, 0, 0) 
         )
     )
 
@@ -1618,7 +1629,7 @@ def run_bingham_tracker(
         A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
         A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
 
-    bg_hist_ensemble = jnp.ones((n_ensemble, 128)) * 10.0
+    bg_hist_ensemble = jnp.ones((n_ensemble, 4096)) * 1.0
 
     tracking_history = []
     t_start = None
@@ -1657,7 +1668,7 @@ def run_bingham_tracker(
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
-        A_ensemble_state, bg_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
+        A_ensemble_state, bg_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates = ensemble_process_chunk(
             A_ensemble_state, bg_hist_ensemble, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
         )
 
@@ -1702,18 +1713,6 @@ def run_bingham_tracker(
                 new_events=new_events,
                 metrics=metrics_dict,
             )
-
-        if cumulative_count % 50000 < len(t_batch_np):
-            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Step-Rot: {delta_angle:.4f} rad | Norm-Gap: {best_gap:8.2f}")
-            
-            # --- LIVE HISTOGRAM VERIFICATION ---
-            bg_profile = np.array(bg_pdfs[best_idx])
-            peak_idx = np.argmax(bg_profile)
-            
-            # Compress 128 bins into 64 terminal characters
-            chars = "  ▂▃▄▅▆▇█"
-            spark = "".join([chars[min(8, int((v / np.max(bg_profile)) * 8))] for v in bg_profile[::2]])
-            print(f"    [Histogram] Peak Bin: {peak_idx}/127 | Density: |{spark}|")
 
     if not tracking_history:
         print("\n[3/3] Tracking complete. No events were processed.")
