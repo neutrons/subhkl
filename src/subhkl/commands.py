@@ -1379,6 +1379,8 @@ def run_bingham_tracker(
     d_min: float = 2.0,
     d_max: float = 8.0,
     bg_ema_weight: float = 0.99,
+    wl_min: float = None,
+    wl_max: float = None,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1413,8 +1415,15 @@ def run_bingham_tracker(
         else:
             wl_bounds = np.array([0.5, 10.0])  # Safe fallback
 
-        wl_min_jax = float(wl_bounds[0])
-        wl_max_jax = float(wl_bounds[1])
+        if wl_min is not None:
+            wl_min_jax = float(wl_min)
+        else:
+            wl_min_jax = float(wl_bounds[0])
+
+        if wl_max is not None:
+            wl_max_jax = float(wl_max)
+        else:
+            wl_max_jax = float(wl_bounds[1])
 
     B_mat = ub_helper.reciprocal_lattice_B()
     _, _, centering = get_lattice_system(
