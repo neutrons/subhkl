@@ -1375,6 +1375,7 @@ def run_bingham_tracker(
     kappa_init: float = 100.0,
     h_max: int = 6,
     n_ensemble: int = 1,
+    b_factor: float = 0.0,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1519,10 +1520,11 @@ def run_bingham_tracker(
             valid_wl_mask = (lambda_j >= wl_min_jax) & (lambda_j <= wl_max_jax)
             wl_penalty = jnp.where(valid_wl_mask, 0.0, -1e9)
 
-            # --- 3. BAYESIAN MIXTURE BALANCING ---
-            # Subtract log_N_peaks to prevent the sum of 100,000 peak tails 
-            # from artificially overpowering the background floor!
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty - log_N_peaks
+            # Add a tunable B-factor (e.g., b_factor = 0.5)
+            wilson_prior = -b_factor * (q_mags_jax ** 2)
+            
+            # Add it directly to the likelihood
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty + wilson_prior - log_N_peaks
 
             # --- 4. SOFTMAX SYMMETRY ---
             bg_log_lik = jnp.array([bg_log_lik_scalar])
