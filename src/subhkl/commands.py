@@ -1546,6 +1546,20 @@ def run_bingham_tracker(
             idx = jnp.clip(jnp.floor((x_exp + 1.0) * 127.99).astype(jnp.int32), 0, 127)
             dynamic_bg_log_lik = jnp.array([bg_log_pdf[idx]])
 
+            # Evaluate where the THEORETICAL peak is pointing.
+            # If the peak is pointing into the empty panel gap, penalize it!
+            x_theo = jnp.dot(h_sample, ki_exp)
+            idx_theo = jnp.clip(jnp.floor((x_theo + 1.0) * 127.99).astype(jnp.int32), 0, 127)
+            
+            # The density at the theoretical location. If this is very low, 
+            # the peak is pointing at empty air. We subtract a tunable penalty.
+            # bg_pdf is the raw density (not log). We use it to create a smooth drop-off.
+            # The + 1e-4 prevents log(0) if a bin ever fully empties.
+            panel_mask_penalty = jnp.log(bg_pdf[idx_theo] + 1e-4)
+            
+            # Apply the penalty to the peak's log-likelihood
+            peak_log_lik = peak_log_lik + panel_mask_penalty
+
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
             w = jnp.exp(peak_log_lik - log_Z)
             w_sum = jnp.sum(w) 
