@@ -1378,7 +1378,6 @@ def run_bingham_tracker(
     b_factor: float = 0.0,
     d_min: float = 2.0,
     d_max: float = 8.0,
-    flux_steepness: float = 1.0,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1519,41 +1518,50 @@ def run_bingham_tracker(
         
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
         bg_log_lik_scalar = float(np.log(1.0 / (4.0 * np.pi))) 
+        
+        # --- ON-THE-FLY EMPIRICAL BACKGROUND ESTIMATION ---
+        # 1. Calculate the spatial projection (scattering angle) of every live neutron
+        x_batch = jnp.sum(q_batch * ki_batch, axis=1) # Shape: (num_events,)
+
+        # 2. Build a JIT-compiled 1D empirical density histogram (128 spatial bins)
+        bin_indices = jnp.clip(jnp.floor((x_batch + 1.0) * 64.0).astype(jnp.int32), 0, 127)
+        raw_hist = jnp.bincount(bin_indices, length=128)
+
+        # 3. Apply Laplace smoothing (adds a base uniform floor so no bin is -infinity)
+        smoothed_hist = raw_hist + 10.0
+
+        # 4. Normalize to true spatial probability density (probability per solid angle)
+        dz = 2.0 / 128.0
+        d_omega = 2.0 * jnp.pi * dz
+        bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
+        bg_log_pdf = jnp.log(bg_pdf)
 
         def single_event_update(q_exp, ki_exp):
             h_sample = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_sample)
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
-            
+
             # --- 1. LAUE KINEMATICS ---
             lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
             valid_wl_mask = (lambda_j >= wl_min_jax) & (lambda_j <= wl_max_jax)
             wl_penalty = jnp.where(valid_wl_mask, 0.0, -1e9)
 
-            # --- 2. THE LAUE LORENTZ PRIOR ---
-            # Accounts for the massive flux asymmetry at forward-scattering angles
-            lorentz_factor = 4.0 * (lambda_j ** 2) / (q_mags_jax ** 2 + 1e-9)
-            
-            # Taking the log converts the intensity multiplier into a Bayesian probability weight
-            lorentz_prior = jnp.log(lorentz_factor + 1e-9)
+            # --- 2. PURE GEOMETRIC LIKELIHOOD ---
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty
 
-            # --- 3. THE NON-LINEAR FLUX PRIOR ---
-            # Implements a tunable exponential decay tail towards high lambda
-            flux_prior = -flux_steepness * (lambda_j ** 2)
+            # --- 3. DYNAMIC BACKGROUND LOOKUP ---
+            # Lookup the EXACT measured noise density at this specific neutron's location
+            x_exp = jnp.dot(q_exp, ki_exp)
+            idx = jnp.clip(jnp.floor((x_exp + 1.0) * 64.0).astype(jnp.int32), 0, 127)
+            dynamic_bg_log_lik = jnp.array([bg_log_pdf[idx]])
 
-            # --- 4. ASYMMETRIC LIKELIHOOD ---
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty + lorentz_prior + flux_prior
-
-            # --- 4. SOFTMAX SYMMETRY ---
-            bg_log_lik = jnp.array([bg_log_lik_scalar])
-            log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, bg_log_lik))
-            
+            # --- 4. PERFECT SOFTMAX SYMMETRY ---
+            log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
             w = jnp.exp(peak_log_lik - log_Z)
-            w_sum = jnp.sum(w) 
+            w_sum = jnp.sum(w)
 
-            # --- 5. UNIFORM GEOMETRIC FORCING ---
             weighted_h_geom = jnp.sum(w * q_theo_sample_jax, axis=1) * kappa_safe
-            F_total = jnp.outer(q_exp, weighted_h_geom) 
+            F_total = jnp.outer(q_exp, weighted_h_geom)
 
             return compute_A_from_C(F_total), -log_Z, w_sum
 
