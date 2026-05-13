@@ -1524,14 +1524,20 @@ def run_bingham_tracker(
             cos_theta_err = jnp.dot(q_exp, h_sample)
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
             
-            # --- 2. LAUE KINEMATICS ---
+            # --- 1. LAUE KINEMATICS ---
             lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
             valid_wl_mask = (lambda_j >= wl_min_jax) & (lambda_j <= wl_max_jax)
             wl_penalty = jnp.where(valid_wl_mask, 0.0, -1e9)
 
-            # --- 3. UNPENALIZED LIKELIHOOD ---
-            # No log_N_peaks division! True hits breach the noise floor easily.
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty
+            # --- 2. THE LAUE LORENTZ PRIOR ---
+            # Accounts for the massive flux asymmetry at forward-scattering angles
+            lorentz_factor = 4.0 * (lambda_j ** 2) / (q_mags_jax ** 2 + 1e-9)
+            
+            # Taking the log converts the intensity multiplier into a Bayesian probability weight
+            lorentz_prior = jnp.log(lorentz_factor + 1e-9)
+
+            # --- 3. ASYMMETRIC LIKELIHOOD ---
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty + lorentz_prior
 
             # --- 4. SOFTMAX SYMMETRY ---
             bg_log_lik = jnp.array([bg_log_lik_scalar])
