@@ -1719,7 +1719,8 @@ def run_bingham_tracker(
                 "bg_rate": current_bg_rate,
                 "gamma": gamma_event, # Passed statically to not break the UI dashboard
                 "sigma_q": current_sigma_q,
-                "bg_pdf": np.array(bg_pdfs[best_idx]).reshape((64, 64))
+                "bg_pdf": np.array(bg_pdfs[best_idx]).reshape((64, 64)),
+                "wl_hist": np.array(wl_hist_ensemble[best_idx]),
             }
 
             streaming_callback(
