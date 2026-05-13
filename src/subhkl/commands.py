@@ -1376,6 +1376,7 @@ def run_bingham_tracker(
     h_max: int = 6,
     n_ensemble: int = 1,
     b_factor: float = 0.0,
+    d_min: float = 2.0,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1445,10 +1446,18 @@ def run_bingham_tracker(
                (np.abs(l_p - np.round(l_p)) < 1e-4)
     theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
 
-    # Ensure theoretical vectors are perfect unit directions for the Bingham cos(theta) loss
-    q_theo_cryst = jnp.array(B_mat @ theo_hkl)
-    q_mags_jax = jnp.linalg.norm(q_theo_cryst, axis=0)
-    q_theo_sample_jax = q_theo_cryst / jnp.where(q_mags_jax == 0, 1.0, q_mags_jax)
+    q_theo_cryst = np.array(B_mat @ theo_hkl)
+    q_mags_np = np.linalg.norm(q_theo_cryst, axis=0)
+
+    q_max_tracking = 1/d_min
+    res_mask = q_mags_np < q_max_tracking
+    q_theo_cryst = q_theo_cryst[:, res_mask]
+    q_mags_np = q_mags_np[res_mask]
+    
+    # Now push the filtered arrays to JAX
+    q_theo_cryst_jax = jnp.array(q_theo_cryst)
+    q_mags_jax = jnp.array(q_mags_np)
+    q_theo_sample_jax = q_theo_cryst_jax / jnp.where(q_mags_jax == 0, 1.0, q_mags_jax)
 
     ub_helper.ki_vec = np.array([0.0, 0.0, 1.0]) # Default assumption if loader passed explicitly
     ki_vec_jax = jnp.array(ub_helper.ki_vec)
