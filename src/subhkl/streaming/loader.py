@@ -189,16 +189,33 @@ class EventStreamLoader:
         all_ki_sample = np.vstack(all_ki_sample)
 
         print("  > Performing global chronological sort...")
-        sort_idx = np.argsort(all_times)
         
-        self.all_q_lab = all_q_lab[sort_idx]
-        self.all_times = all_times[sort_idx]
-        self.all_banks = all_banks[sort_idx]
-        self.all_pixels_r = all_pixels_r[sort_idx]
-        self.all_pixels_c = all_pixels_c[sort_idx]
-        self.all_angles = all_angles[sort_idx]
-        self.all_slab = all_slab[sort_idx]
-        self.all_ki_sample = all_ki_sample[sort_idx]
+        # 1. Use 'stable' (Timsort) instead of the default quicksort. 
+        # Since 'all_times' is a concatenation of mostly sorted sub-arrays, this is much faster.
+        sort_idx = np.argsort(all_times, kind='stable')
+        
+        # 2. Parallelize the memory-intensive reordering step.
+        # NumPy releases the GIL for array indexing, so ThreadPoolExecutor works perfectly.
+        def apply_sort(arr):
+            return arr[sort_idx]
+
+        arrays_to_sort = [
+            all_q_lab, all_times, all_banks, all_pixels_r, 
+            all_pixels_c, all_angles, all_slab, all_ki_sample
+        ]
+
+        print("  > Applying sorted indices to arrays...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(arrays_to_sort)) as executor:
+            (
+                self.all_q_lab, 
+                self.all_times, 
+                self.all_banks, 
+                self.all_pixels_r, 
+                self.all_pixels_c, 
+                self.all_angles, 
+                self.all_slab, 
+                self.all_ki_sample
+            ) = list(executor.map(apply_sort, arrays_to_sort))
 
         self.total_events = len(self.all_q_lab)
         print(f"  > EventStreamLoader Ready. Cached {self.total_events:,} events.")
