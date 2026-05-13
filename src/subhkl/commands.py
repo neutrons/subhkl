@@ -1520,18 +1520,16 @@ def run_bingham_tracker(
         bg_log_lik_scalar = float(np.log(1.0 / (4.0 * np.pi))) 
         
         # --- ON-THE-FLY EMPIRICAL BACKGROUND ESTIMATION ---
-        # 1. Calculate the spatial projection (scattering angle) of every live neutron
-        x_batch = jnp.sum(q_batch * ki_batch, axis=1) # Shape: (num_events,)
+        x_batch = jnp.sum(q_batch * ki_batch, axis=1) 
 
-        # 2. Build a JIT-compiled 1D empirical density histogram (128 spatial bins)
-        bin_indices = jnp.clip(jnp.floor((x_batch + 1.0) * 64.0).astype(jnp.int32), 0, 127)
+        # Map domain [-1.0, 0.0] completely across 128 bins.
+        # Forward scattering (x=0) is exactly Bin 127.
+        bin_indices = jnp.clip(jnp.floor((x_batch + 1.0) * 127.99).astype(jnp.int32), 0, 127)
+        
         raw_hist = jnp.bincount(bin_indices, length=128)
-
-        # 3. Apply Laplace smoothing (adds a base uniform floor so no bin is -infinity)
-        smoothed_hist = raw_hist + 10.0
-
-        # 4. Normalize to true spatial probability density (probability per solid angle)
-        dz = 2.0 / 128.0
+        smoothed_hist = raw_hist + 10.0 
+        
+        dz = 1.0 / 128.0 # Domain size is now 1.0, not 2.0
         d_omega = 2.0 * jnp.pi * dz
         bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
         bg_log_pdf = jnp.log(bg_pdf)
