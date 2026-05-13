@@ -1736,9 +1736,12 @@ def run_bingham_tracker(
             A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
         )
 
-        # broadcast best histogram
-        best_idx = jnp.argmin(loss_ensemble)
-        wl_hist_ensemble = jnp.broadcast_to(wl_hist_ensemble[best_idx], wl_hist_ensemble.shape)
+        # Convert NLL losses to probability weights
+        ensemble_weights = jax.nn.softmax(-loss_ensemble)
+
+        # Take a weighted average of the histograms
+        wl_hist_weighted = jnp.sum(wl_hist_ensemble * ensemble_weights[:, None], axis=0)
+        wl_hist_ensemble = jnp.broadcast_to(wl_hist_weighted, wl_hist_ensemble.shape)
 
         best_idx = int(jnp.argmin(loss_ensemble))
         U_best = np.array(U_ensemble_curr[best_idx])
