@@ -1383,6 +1383,7 @@ def run_bingham_tracker(
     wl_min_tracking: float = 0.0,
     wl_max_tracking: float = 12.0,
     max_rate_hz: float = 100000.0,
+    max_gpu_batch_size: int = 2048,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1588,35 +1589,37 @@ def run_bingham_tracker(
 
             weighted_h_geom = jnp.sum(w * q_theo_sample_jax, axis=1) * kappa_safe
             F_total = jnp.outer(q_exp, weighted_h_geom) 
+       
+            best_idx = jnp.argmax(w)
+            is_signal = w[best_idx] > 0.5
+            actual_winning_lambda = lambda_j[best_idx]
 
-            return compute_A_from_C(F_total), -log_Z, w_sum, w
+            return compute_A_from_C(F_total), -log_Z, w_sum, is_signal, actual_winning_lambda
 
-        # Evaluate the physical data
-        A_F_batch, nll_batch, w_sum_batch, w_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
+        def single_event_wrapper(event_data):
+            q_exp, ki_exp = event_data
+            return single_event_update(q_exp, ki_exp)
+
+        A_F_batch, nll_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch = jax.lax.map(
+            single_event_wrapper, 
+            (q_batch, ki_batch), 
+            batch_size=max_gpu_batch_size,
+        )
+        
         signal_count = jnp.sum(w_sum_batch)
 
-        # 1. Identify which peak claimed which neutron (argmax)
-        winning_peak_indices = jnp.argmax(w_batch, axis=1)
-
-        # 2. Filter only the confident signals (e.g., probability > 0.5)
-        is_signal = jnp.max(w_batch, axis=1) > 0.5
-
-        # 3. Get the theoretical wavelength of those winning peaks
-        winning_lambdas = jax.vmap(lambda q, ki: -(2.0 / (q_mags_jax + 1e-9)) * jnp.dot(ki, jnp.matmul(U, q_theo_sample_jax)))(q_batch, ki_batch)
-        actual_winning_lambdas = winning_lambdas[jnp.arange(num_events), winning_peak_indices]
-
-        # Bin them into the grid
-        wl_idx_batch = jnp.floor(actual_winning_lambdas * 10.0).astype(jnp.int32)
+        # Bin them into the grid directly from the mapped arrays!
+        wl_idx_batch = jnp.floor(actual_lambdas_batch * 10.0).astype(jnp.int32)
 
         # STRICT EXCLUSION MASK: Must be a confident signal AND physically possible
-        valid_bin_mask = is_signal & (actual_winning_lambdas > 0.0) & (actual_winning_lambdas < wl_max_jax)
+        valid_bin_mask = is_signal_batch & (actual_lambdas_batch > 0.0) & (actual_lambdas_batch < wl_max_jax)
 
         # Dump invalid wavelengths into an unused n+1 bin, then slice it off!
         raw_wl_hist = jnp.bincount(
             jnp.where(valid_bin_mask, wl_idx_batch, num_bins_jax), 
             length=num_bins_jax + 1
         )[:num_bins_jax]
-        
+
         wl_hist_new = bg_ema_weight * wl_hist_prev + (1.0 - bg_ema_weight) * raw_wl_hist + 1e-3
 
         decay_event = jnp.exp(-gamma_event * num_events)
