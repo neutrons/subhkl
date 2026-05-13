@@ -1492,84 +1492,70 @@ def run_bingham_tracker(
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
 
-        # 1. Event-Driven Decay (Information Replacement)
-        decay_event = jnp.exp(-gamma_event * num_events)
-
-        # 2. Discrete Step Decay (Motor Backlash / Settling Uncertainty)
-        decay_step = jnp.exp(-gamma_step * delta_angle)
-
-        # 3. Total SDE Decay
-        decay_total = decay_event * decay_step
-        A_diffused = A_prev * decay_total
-
-        # Compute U from the diffused prior
-        vals, vecs = jnp.linalg.eigh(A_diffused)
+        vals, vecs = jnp.linalg.eigh(A_prev)
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
 
-        # In pure event-space, the steady state is 1 / gamma_event
         steady_state_scale = 1.0 / jnp.maximum(gamma_event, 1e-9)
 
-        # --- DYNAMIC BACKGROUND TUNING ---
         kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
         kappa_safe = jnp.clip(kappa_j, 1e-6, 1e6) 
 
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
-        bg_log_lik_scalar = expected_noise_ll
+        bg_log_lik_scalar = float(np.log(1.0 / (4.0 * np.pi))) # Pure spherical floor
 
         def single_event_update(q_exp, ki_exp):
-            # Target U aligns Theo -> Sample Frame
             h_sample = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_sample)
-
-            # Prior uses instantaneous beam vector in the Sample Frame
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
-
-            # lambda = -2 * (q_hat . ki_hat) / |q_cryst|
+            
+            # --- 1. THE LAUE KINEMATICS ---
             lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
 
+            # --- 2. HARD BOUNDARY (NO SOFT PRIOR) ---
             valid_wl_mask = (lambda_j >= wl_min_jax) & (lambda_j <= wl_max_jax)
             wl_penalty = jnp.where(valid_wl_mask, 0.0, -1e9)
 
-            # Apply the penalty so impossible reflections get 0 probability
-            log_prior = wl_penalty
+            # Likelihood is purely geometric distance + hard bounds
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty
 
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + log_prior
-
+            # --- 3. SOFTMAX SYMMETRY ---
             bg_log_lik = jnp.array([bg_log_lik_scalar])
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, bg_log_lik))
+            
             w = jnp.exp(peak_log_lik - log_Z)
+            w_sum = jnp.sum(w) 
 
+            # --- 4. PURE GEOMETRIC FORCING ---
             weighted_h_geom = jnp.sum((w * kappa_safe) * q_theo_sample_jax, axis=1)
-            F_geom = jnp.outer(q_exp, weighted_h_geom)
+            F_total = jnp.outer(q_exp, weighted_h_geom) # F_prior is entirely removed!
 
-            weighted_h_prior = jnp.sum(w * q_theo_sample_jax, axis=1)
-            F_prior = -jnp.outer(ki_exp, weighted_h_prior)
+            return compute_A_from_C(F_total), -log_Z, w_sum
 
-            F_total = F_geom + F_prior
-            event_nll = -log_Z
+        # Evaluate the physical data
+        A_F_batch, nll_batch, w_sum_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
+        signal_count = jnp.sum(w_sum_batch)
 
-            return compute_A_from_C(F_total), event_nll, w
+        # Decay is driven by the physical beam clock (num_events)
+        decay_event = jnp.exp(-gamma_event * num_events)
+        decay_step = jnp.exp(-gamma_step * delta_angle)
+        decay_total = decay_event * decay_step
+        
+        A_diffused = A_prev * decay_total
 
-        A_F_batch, nll_batch, w_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
-
-        F_mean = jnp.mean(A_F_batch, axis=0)
+        # Forcing is averaged over the beam chunk
+        F_mean = jnp.sum(A_F_batch, axis=0) / jnp.maximum(num_events, 1e-9)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
         
-        # SDE update leveraging the steady-state scale
         A_new = A_diffused + F_mean * steady_state_scale * (1.0 - decay_total)
 
         vals_new = jnp.linalg.eigvalsh(A_new)
         gap_new = vals_new[-1] - vals_new[-2]
         norm_gap = gap_new / jnp.maximum(steady_state_scale, 1e-9)
 
-        # Rates calculated for telemetry visualization purely in Hz based on chunk time
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
-        signal_count = jnp.sum(w_batch)
-        bg_count = num_events - signal_count
-
         sig_rate = signal_count / dt_chunk
-        bg_rate = bg_count / dt_chunk
+        bg_rate = (num_events - signal_count) / dt_chunk
 
         return A_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate
 
