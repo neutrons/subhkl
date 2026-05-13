@@ -1378,6 +1378,7 @@ def run_bingham_tracker(
     b_factor: float = 0.0,
     d_min: float = 2.0,
     d_max: float = 8.0,
+    flux_steepness: float = 1.0,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1536,8 +1537,12 @@ def run_bingham_tracker(
             # Taking the log converts the intensity multiplier into a Bayesian probability weight
             lorentz_prior = jnp.log(lorentz_factor + 1e-9)
 
-            # --- 3. ASYMMETRIC LIKELIHOOD ---
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty + lorentz_prior
+            # --- 3. THE NON-LINEAR FLUX PRIOR ---
+            # Implements a tunable exponential decay tail towards high lambda
+            flux_prior = -flux_steepness * (lambda_j ** 2)
+
+            # --- 4. ASYMMETRIC LIKELIHOOD ---
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty + lorentz_prior + flux_prior
 
             # --- 4. SOFTMAX SYMMETRY ---
             bg_log_lik = jnp.array([bg_log_lik_scalar])
