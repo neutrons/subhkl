@@ -1684,7 +1684,7 @@ def run_bingham_tracker(
     t_state = 0.0
 
     # Initialize the decoupled annealing clock!
-    effective_annealing_time = 0.0
+    effective_annealing_count = 0.0
     angles_prev = None
 
     for batch_data in event_batches:
