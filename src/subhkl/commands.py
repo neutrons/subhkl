@@ -1381,6 +1381,7 @@ def run_bingham_tracker(
     bg_ema_weight: float = 0.99,
     wl_min_tracking: float = 0.0,
     wl_max_tracking: float = 12.0,
+    max_rate_hz: float = 100000.0,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1625,8 +1626,20 @@ def run_bingham_tracker(
 
         F_mean = jnp.sum(A_F_batch, axis=0) / jnp.maximum(num_events, 1e-9)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
+       
+        # THE HARDWARE ANOMALY GATE
+        dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
+        total_rate = num_events / dt_chunk
         
-        A_new = A_diffused + F_mean * (1.0 - decay_total)
+        # If the rate is physically impossible, it's a DAQ glitch/flash.
+        is_valid_batch = total_rate < max_rate_hz
+
+        # Conditionally update the state. If invalid, keep the previous state!
+        A_updated = A_diffused + F_mean * (1.0 - decay_total)
+        A_new = jnp.where(is_valid_batch, A_updated, A_prev)
+        
+        bg_hist_out = jnp.where(is_valid_batch, bg_hist_new, bg_hist_prev)
+        wl_hist_out = jnp.where(is_valid_batch, wl_hist_new, wl_hist_prev)
 
         vals_new = jnp.linalg.eigvalsh(A_new)
         norm_gap = vals_new[-1] - vals_new[-2]
