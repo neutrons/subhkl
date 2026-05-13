@@ -1506,34 +1506,27 @@ def run_bingham_tracker(
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
 
-        steady_state_scale = 1.0 / jnp.maximum(gamma_event, 1e-9)
-
-        kappa_j = (q_mags_jax ** 2) / (current_sigma_q ** 2)
-        kappa_safe = jnp.clip(kappa_j, 1e-6, 1e6) 
-
+        # --- 1. GLOBAL ANGULAR TOLERANCE ---
+        # current_sigma_q is now a strict angular width in radians!
+        # (e.g. 0.05 rad = ~2.8 degrees of tracking tolerance)
+        kappa_safe = jnp.clip(1.0 / (current_sigma_q ** 2), 1e-6, 1e6) 
+        
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
-        bg_log_lik_scalar = float(np.log(1.0 / (4.0 * np.pi))) # Pure spherical floor
-
-        # (Outside the function, right below the bg_log_lik_scalar)
-        log_N_peaks = jnp.log(q_theo_sample_jax.shape[1])
+        bg_log_lik_scalar = float(np.log(1.0 / (4.0 * np.pi))) 
 
         def single_event_update(q_exp, ki_exp):
             h_sample = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_sample)
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
             
-            # --- 1. THE LAUE KINEMATICS ---
+            # --- 2. LAUE KINEMATICS ---
             lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
-
-            # --- 2. HARD BOUNDARY (NO SOFT PRIOR) ---
             valid_wl_mask = (lambda_j >= wl_min_jax) & (lambda_j <= wl_max_jax)
             wl_penalty = jnp.where(valid_wl_mask, 0.0, -1e9)
 
-            # Add a tunable B-factor (e.g., b_factor = 0.5)
-            wilson_prior = -b_factor * (q_mags_jax ** 2)
-            
-            # Add it directly to the likelihood
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty + wilson_prior - log_N_peaks
+            # --- 3. UNPENALIZED LIKELIHOOD ---
+            # No log_N_peaks division! True hits breach the noise floor easily.
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty
 
             # --- 4. SOFTMAX SYMMETRY ---
             bg_log_lik = jnp.array([bg_log_lik_scalar])
@@ -1542,8 +1535,8 @@ def run_bingham_tracker(
             w = jnp.exp(peak_log_lik - log_Z)
             w_sum = jnp.sum(w) 
 
-            # --- 5. PURE GEOMETRIC FORCING ---
-            weighted_h_geom = jnp.sum((w * kappa_safe) * q_theo_sample_jax, axis=1)
+            # --- 5. UNIFORM GEOMETRIC FORCING ---
+            weighted_h_geom = jnp.sum(w * q_theo_sample_jax, axis=1) * kappa_safe
             F_total = jnp.outer(q_exp, weighted_h_geom) 
 
             return compute_A_from_C(F_total), -log_Z, w_sum
@@ -1552,22 +1545,21 @@ def run_bingham_tracker(
         A_F_batch, nll_batch, w_sum_batch = jax.vmap(single_event_update)(q_batch, ki_batch)
         signal_count = jnp.sum(w_sum_batch)
 
-        # Decay is driven by the physical beam clock (num_events)
+        # --- 6. TRUE EXPONENTIAL MOVING AVERAGE ---
         decay_event = jnp.exp(-gamma_event * num_events)
         decay_step = jnp.exp(-gamma_step * delta_angle)
         decay_total = decay_event * decay_step
         
         A_diffused = A_prev * decay_total
 
-        # Forcing is averaged over the beam chunk
         F_mean = jnp.sum(A_F_batch, axis=0) / jnp.maximum(num_events, 1e-9)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
         
-        A_new = A_diffused + F_mean * steady_state_scale * (1.0 - decay_total)
+        # Matrix strictly bounded to float32 physical precision limits!
+        A_new = A_diffused + F_mean * (1.0 - decay_total)
 
         vals_new = jnp.linalg.eigvalsh(A_new)
-        gap_new = vals_new[-1] - vals_new[-2]
-        norm_gap = gap_new / jnp.maximum(steady_state_scale, 1e-9)
+        norm_gap = vals_new[-1] - vals_new[-2]
 
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         sig_rate = signal_count / dt_chunk
@@ -1590,12 +1582,12 @@ def run_bingham_tracker(
     r_random = r_random / jnp.linalg.norm(r_random, axis=1, keepdims=True)
     U_ensemble = jax.vmap(quaternion_to_rotation_matrix)(r_random)
 
-    steady_state_scale_init = 1.0 / max(gamma_event, 1e-12)
-    C_ensemble = kappa_init * steady_state_scale_init * U_ensemble
+    # Find this block and remove steady_state_scale_init!
+    C_ensemble = kappa_init * U_ensemble
     A_ensemble_state = jax.vmap(compute_A_from_C)(C_ensemble)
 
     if U_init is not None:
-        A_seed = compute_A_from_C(kappa_init * steady_state_scale_init * jnp.array(U_init))
+        A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
         A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
 
     tracking_history = []
