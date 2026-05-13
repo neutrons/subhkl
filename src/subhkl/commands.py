@@ -1523,7 +1523,7 @@ def run_bingham_tracker(
         v_batch = jnp.arctan2(q_batch[:, 1], q_batch[:, 0]) 
 
         # Map to 64x64 Grid
-        u_idx_batch = jnp.clip(jnp.floor((u_batch + 1.0) * 31.999).astype(jnp.int32), 0, 63)
+        u_idx_batch = jnp.clip(jnp.floor((u_batch + 1.0) * 63.999).astype(jnp.int32), 0, 63)
         v_idx_batch = jnp.clip(jnp.floor((v_batch + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
         
         flat_idx_batch = u_idx_batch * 64 + v_idx_batch
@@ -1561,10 +1561,23 @@ def run_bingham_tracker(
             # No penalties are applied to theoretical peaks at the edges.
             u_exp = q_exp[2]
             v_exp = jnp.arctan2(q_exp[1], q_exp[0])
-            u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 31.999).astype(jnp.int32), 0, 63)
+            u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 63.999).astype(jnp.int32), 0, 63)
             v_idx_exp = jnp.clip(jnp.floor((v_exp + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
             
             dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
+
+            # --- THE 2D PANEL MASK PENALTY ---
+            # Evaluates the exact 2D trajectory of every theoretical peak!
+            u_theo = h_sample[2, :]
+            v_theo = jnp.arctan2(h_sample[1, :], h_sample[0, :])
+            
+            u_idx_theo = jnp.clip(jnp.floor((u_theo + 1.0) * 63.999).astype(jnp.int32), 0, 63)
+            v_idx_theo = jnp.clip(jnp.floor((v_theo + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
+            flat_idx_theo = u_idx_theo * 64 + v_idx_theo
+            
+            # Massive negative penalty if the peak drifts into an empty panel gap!
+            panel_mask_penalty = jnp.log(jnp.exp(bg_log_pdf_flat[flat_idx_theo]) + 1e-4)
+            peak_log_lik = peak_log_lik + panel_mask_penalty
 
             # --- 4. PERFECT SOFTMAX SYMMETRY ---
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
