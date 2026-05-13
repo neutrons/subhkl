@@ -1683,6 +1683,7 @@ def run_bingham_tracker(
     t_start = None
     t_state = 0.0
 
+    # Initialize the decoupled annealing clock!
     effective_annealing_time = 0.0
     angles_prev = None
 
@@ -1702,6 +1703,21 @@ def run_bingham_tracker(
         else:
             delta_angle = float(np.linalg.norm(angles_curr - angles_prev))
         angles_prev = angles_curr
+
+        # Calculate the batch rate to control the annealing schedule
+        num_events = len(q_batch_np)
+        dt_chunk_py = max(1e-4, float(t_batch_np[-1] - t_batch_np[0]))
+        total_rate_py = num_events / dt_chunk_py
+        
+        # Only advance the annealing clock if it's a valid physical batch!
+        if total_rate_py < max_rate_hz:
+            effective_annealing_count += num_events
+
+        # Calculate sigma_q using the FROZEN effective count, not the raw cumulative count
+        current_sigma_q = max(
+            sigma_q_min, 
+            sigma_q_start * np.exp(-annealing_rate * effective_annealing_count)
+        )
 
         # Calculate sigma_q using the cumulative neutron count
         current_sigma_q = max(
