@@ -1504,6 +1504,9 @@ def run_bingham_tracker(
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
         bg_log_lik_scalar = float(np.log(1.0 / (4.0 * np.pi))) # Pure spherical floor
 
+        # (Outside the function, right below the bg_log_lik_scalar)
+        log_N_peaks = jnp.log(q_theo_sample_jax.shape[1])
+
         def single_event_update(q_exp, ki_exp):
             h_sample = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_sample)
@@ -1516,19 +1519,21 @@ def run_bingham_tracker(
             valid_wl_mask = (lambda_j >= wl_min_jax) & (lambda_j <= wl_max_jax)
             wl_penalty = jnp.where(valid_wl_mask, 0.0, -1e9)
 
-            # Likelihood is purely geometric distance + hard bounds
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty
+            # --- 3. BAYESIAN MIXTURE BALANCING ---
+            # Subtract log_N_peaks to prevent the sum of 100,000 peak tails 
+            # from artificially overpowering the background floor!
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + wl_penalty - log_N_peaks
 
-            # --- 3. SOFTMAX SYMMETRY ---
+            # --- 4. SOFTMAX SYMMETRY ---
             bg_log_lik = jnp.array([bg_log_lik_scalar])
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, bg_log_lik))
             
             w = jnp.exp(peak_log_lik - log_Z)
             w_sum = jnp.sum(w) 
 
-            # --- 4. PURE GEOMETRIC FORCING ---
+            # --- 5. PURE GEOMETRIC FORCING ---
             weighted_h_geom = jnp.sum((w * kappa_safe) * q_theo_sample_jax, axis=1)
-            F_total = jnp.outer(q_exp, weighted_h_geom) # F_prior is entirely removed!
+            F_total = jnp.outer(q_exp, weighted_h_geom) 
 
             return compute_A_from_C(F_total), -log_Z, w_sum
 
