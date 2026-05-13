@@ -1566,18 +1566,24 @@ def run_bingham_tracker(
             
             dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
 
-            # --- THE 2D PANEL MASK PENALTY ---
-            # Evaluates the exact 2D trajectory of every theoretical peak!
+            # =================================================================
+            # --- 3b. THE FLAT PLATEAU PANEL MASK ---
             u_theo = h_sample[2, :]
             v_theo = jnp.arctan2(h_sample[1, :], h_sample[0, :])
             
+            # Using the corrected 63.999 multiplier!
             u_idx_theo = jnp.clip(jnp.floor((u_theo + 1.0) * 63.999).astype(jnp.int32), 0, 63)
             v_idx_theo = jnp.clip(jnp.floor((v_theo + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
             flat_idx_theo = u_idx_theo * 64 + v_idx_theo
             
-            # Massive negative penalty if the peak drifts into an empty panel gap!
-            panel_mask_penalty = jnp.log(jnp.exp(bg_log_pdf_flat[flat_idx_theo]) + 1e-4)
+            # THE FIX: Clip the raw histogram counts to a maximum of 1.0.
+            # Normal pixel (count > 1) -> log(1.0) = 0.0 (No penalty, flat plateau)
+            # Void pixel (count 1e-3) -> log(1e-3) = -6.9 (Sheer cliff penalty)
+            mask_value = jnp.clip(smoothed_hist[flat_idx_theo], 1e-3, 1.0)
+            panel_mask_penalty = jnp.log(mask_value)
+            
             peak_log_lik = peak_log_lik + panel_mask_penalty
+            # =================================================================
 
             # --- 4. PERFECT SOFTMAX SYMMETRY ---
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
