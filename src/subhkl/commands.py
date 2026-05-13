@@ -1379,6 +1379,8 @@ def run_bingham_tracker(
     d_min: float = 2.0,
     d_max: float = 8.0,
     bg_ema_weight: float = 0.99,
+    wl_min_tracking: float = 0.0,
+    wl_max_tracking: float = 12.0,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1530,7 +1532,11 @@ def run_bingham_tracker(
         bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
         bg_log_pdf_flat = jnp.log(bg_pdf)
 
-        # --- 1D EMPIRICAL SIGNAL SPECTRUM (100 Bins: 0 to 10 A) ---
+        # Pass the dynamic limits into JAX
+        wl_max_jax = float(wl_max_tracking)
+        num_bins_jax = int(num_wl_bins)
+
+        # --- 1D EMPIRICAL SIGNAL SPECTRUM ---
         wl_pdf = wl_hist_prev / jnp.sum(wl_hist_prev)
         wl_log_pdf = jnp.log(wl_pdf)
 
@@ -1541,11 +1547,16 @@ def run_bingham_tracker(
             
             # Look up the learned probability of this wavelength!
             lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
-            wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, 99)
+
+            valid_wl = (lambda_j > 0.0) & (lambda_j < wl_max_jax)
+            safety_penalty = jnp.where(valid_wl, 0.0, -1e9)
+
+            # Safe lookup for the learned prior
+            wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
             learned_wl_prior = wl_log_pdf[wl_idx]
 
-            # The peak likelihood is now entirely data-driven!
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + learned_wl_prior
+            # The peak likelihood is entirely data-driven
+            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + learned_wl_prior + safety_penalty
 
             # --- 3. BACKGROUND PHYSICS (2D EMPIRICAL KDE) ---
             u_exp = q_exp[2]
@@ -1592,13 +1603,18 @@ def run_bingham_tracker(
         winning_lambdas = jax.vmap(lambda q, ki: -(2.0 / (q_mags_jax + 1e-9)) * jnp.dot(ki, jnp.matmul(U, q_theo_sample_jax)))(q_batch, ki_batch)
         actual_winning_lambdas = winning_lambdas[jnp.arange(num_events), winning_peak_indices]
 
-        # 4. Bin them into the 0-10 A grid
-        wl_idx_batch = jnp.clip(jnp.floor(actual_winning_lambdas * 10.0).astype(jnp.int32), 0, 99)
+        # Bin them into the grid
+        wl_idx_batch = jnp.floor(actual_winning_lambdas * 10.0).astype(jnp.int32)
 
-        # Only bin the ones that were actually signal!
-        raw_wl_hist = jnp.bincount(jnp.where(is_signal, wl_idx_batch, 100), length=101)[:100]
+        # STRICT EXCLUSION MASK: Must be a confident signal AND physically possible
+        valid_bin_mask = is_signal & (actual_winning_lambdas > 0.0) & (actual_winning_lambdas < wl_max_jax)
 
-        # 5. Update the EMA
+        # Dump invalid wavelengths into an unused n+1 bin, then slice it off!
+        raw_wl_hist = jnp.bincount(
+            jnp.where(valid_bin_mask, wl_idx_batch, num_bins_jax), 
+            length=num_bins_jax + 1
+        )[:num_bins_jax]
+        
         wl_hist_new = bg_ema_weight * wl_hist_prev + (1.0 - bg_ema_weight) * raw_wl_hist + 1e-3
 
         decay_event = jnp.exp(-gamma_event * num_events)
@@ -1646,8 +1662,9 @@ def run_bingham_tracker(
 
     bg_hist_ensemble = jnp.ones((n_ensemble, 4096)) * 1.0
 
-    # 100 bins spanning 0.0 to 10.0 Angstroms. Start with a uniform 1.0 floor.
-    wl_hist_ensemble = jnp.ones((n_ensemble, 100)) * 1.0
+    # Dynamically scale bins (10 bins per Angstrom)
+    num_wl_bins = int(wl_max_tracking * 10.0)
+    wl_hist_ensemble = jnp.ones((n_ensemble, num_wl_bins)) * 1.0
 
     tracking_history = []
     t_start = None
@@ -1721,6 +1738,7 @@ def run_bingham_tracker(
                 "sigma_q": current_sigma_q,
                 "bg_pdf": np.array(bg_pdfs[best_idx]).reshape((64, 64)),
                 "wl_hist": np.array(wl_hist_ensemble[best_idx]),
+                "wl_max": wl_max_tracking,
             }
 
             streaming_callback(
