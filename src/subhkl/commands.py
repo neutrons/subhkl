@@ -1382,7 +1382,7 @@ def run_bingham_tracker(
     signal_ema_weight: float = 0.05,
     wl_min_tracking: float = 0.0,
     wl_max_tracking: float = 12.0,
-    max_rate_hz: float = 100000.0,
+    max_rate_hz: float = np.inf, # FIXED: Opened gate for physical beamline
     max_gpu_batch_size: int = 2048,
 ):
     apply_detector_calibration(finder_file, instrument_name)
