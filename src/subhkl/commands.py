@@ -1500,7 +1500,7 @@ def run_bingham_tracker(
             jnp.concatenate([A10, A11], axis=1)
         ], axis=0)
 
-    jax.jit
+    @jax.jit
     def process_chunk(A_prev, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
@@ -1508,6 +1508,9 @@ def run_bingham_tracker(
         vals, vecs = jnp.linalg.eigh(A_prev)
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
+        
+        # CAPTURE PRIOR PRECISION FOR THE KALMAN GAIN
+        norm_gap_prev = jnp.maximum(vals[-1] - vals[-2], 1e-3)
 
         kappa_safe = jnp.clip(1.0 / (current_sigma_q ** 2), 1e-6, 1e6) 
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
@@ -1604,14 +1607,25 @@ def run_bingham_tracker(
         # ====================================================================
         # THE LIE-BINGHAM MEKF HYBRID UPDATE
         
-        # 1. Extract the physical torque directly from the top row of the A matrix!
+        # 1. Extract the raw torque and base weight
         torque_mean = F_mean_A[0, 1:4]
+        base_weight = F_mean_A[0, 0]
         
-        # 2. Map torque to a physical angle (damped by the MEKF gain)
-        angle = jnp.linalg.norm(torque_mean) * mekf_gain
-        axis = torque_mean / (jnp.linalg.norm(torque_mean) + 1e-9)
+        # 2. Extract the TRUE geometric angle (independent of kappa & signal fraction)
+        norm_torque = jnp.linalg.norm(torque_mean)
+        true_angle = jnp.where(norm_torque > 1e-12, jnp.arctan2(norm_torque, base_weight), 0.0)
+        axis = jnp.where(norm_torque > 1e-12, torque_mean / norm_torque, jnp.array([1.0, 0.0, 0.0]))
         
-        # 3. Create the exact Spin(3) quaternion rotation for the A matrix
+        # 3. The True MEKF Kalman Gain (Precision-weighted update)
+        # Prior precision is the inertia of the A matrix. Measurement precision is the new signal.
+        prior_precision = norm_gap_prev * decay_total
+        meas_precision = jnp.maximum(base_weight * (1.0 - decay_total), 0.0)
+        adaptive_gain = meas_precision / (prior_precision + meas_precision + 1e-9)
+        
+        # Damp the step size by the Kalman gain (and the manual user gain)
+        angle = true_angle * adaptive_gain * mekf_gain
+        
+        # 4. Create the exact Spin(3) quaternion rotation for the A matrix
         q_w = jnp.cos(angle / 2.0)
         q_xyz = jnp.sin(angle / 2.0) * axis
         q_omega = jnp.array([q_w, q_xyz[0], q_xyz[1], q_xyz[2]])
@@ -1624,17 +1638,14 @@ def run_bingham_tracker(
             [ qz, -qy,  qx,  qw]
         ])
 
-        # 4. For telemetry/e3nn integration, we can also expose the 3x3 SO(3) matrix:
-        # R_mekf = e3nn.axis_angle_to_matrix(axis, angle) 
-
         # 5. Rotate the global belief state (Breaking Tensor Inertia)
         A_rotated = jnp.matmul(Q_rot, jnp.matmul(A_diffused, Q_rot.T))
         
         # 6. Add back the symmetric geometric covariance (zeroing the torque to prevent double-counting)
         A_F_sym = F_mean_A.at[0, 1:4].set(0.0).at[1:4, 0].set(0.0)
         A_updated = A_rotated + A_F_sym * (1.0 - decay_total)
-        # ====================================================================
-        
+        # ====================================================================        
+
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         total_rate = num_events / dt_chunk
         
