@@ -1500,17 +1500,42 @@ def run_bingham_tracker(
             jnp.concatenate([A10, A11], axis=1)
         ], axis=0)
 
-    jax.jit
+    @jax.jit
     def process_chunk(A_prev, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
 
         vals, vecs = jnp.linalg.eigh(A_prev)
-        r = vecs[:, -1]
-        U = quaternion_to_rotation_matrix(r)
+        v4_mode = vecs[:, 3]
 
+        # ====================================================================
+        # 1. GENERATE THE S3 SIGMA POINTS (Unscented Transform)
+        
+        # Calculate Bingham principal uncertainties in the tangent space
+        delta = jnp.maximum(vals[3] - vals[:3], 1e-3)
+        
+        # UT scaling factor (sqrt(3) is standard for 3-DOF distributions)
+        spread_factor = jnp.sqrt(3.0)
+        angles = spread_factor / jnp.sqrt(delta)
+        
+        # Generate 7 mutually orthogonal unit quaternions
+        q_sigma = jnp.zeros((7, 4))
+        q_sigma = q_sigma.at[0].set(v4_mode)
+        for i in range(3):
+            q_sigma = q_sigma.at[1 + 2*i].set(jnp.cos(angles[i]) * v4_mode + jnp.sin(angles[i]) * vecs[:, i])
+            q_sigma = q_sigma.at[2 + 2*i].set(jnp.cos(angles[i]) * v4_mode - jnp.sin(angles[i]) * vecs[:, i])
+            
+        U_sigma = jax.vmap(quaternion_to_rotation_matrix)(q_sigma)
+        
+        # Calculate UT Weights (Center gets 1/3, the 6 edge points split the rest)
+        w_0 = 1.0 / 3.0
+        w_i = (1.0 - w_0) / 6.0
+        ut_weights = jnp.array([w_0, w_i, w_i, w_i, w_i, w_i, w_i])
+        
+        # Revert kappa_safe to its sharp, exact physical value
         kappa_safe = jnp.clip(1.0 / (current_sigma_q ** 2), 1e-6, 1e6) 
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
+        # ==================================================================== 
 
         # ====================================================================
         # --- 2D SPHERICAL EMPIRICAL BACKGROUND (64 x 64 Bins) ---
@@ -1544,44 +1569,51 @@ def run_bingham_tracker(
         wl_log_pdf = jnp.log(wl_pdf)
 
         def single_event_update(q_exp, ki_exp):
-            h_sample = jnp.matmul(U, q_theo_sample_jax)
-            cos_theta_err = jnp.dot(q_exp, h_sample)
-            q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
             
-            # Look up the learned probability of this wavelength!
-            lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
+            # We abstract the physics into a closure that takes a specific U_matrix
+            def evaluate_physics_for_U(U_cand):
+                h_sample = jnp.matmul(U_cand, q_theo_sample_jax)
+                cos_theta_err = jnp.dot(q_exp, h_sample)
+                q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
+                
+                lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
+                valid_wl = (lambda_j > 0.0) & (lambda_j < wl_max_jax)
+                safety_penalty = jnp.where(valid_wl, 0.0, -1e9)
+                wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
+                learned_wl_prior = wl_log_pdf[wl_idx]
 
-            valid_wl = (lambda_j > 0.0) & (lambda_j < wl_max_jax)
-            safety_penalty = jnp.where(valid_wl, 0.0, -1e9)
+                peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + learned_wl_prior + safety_penalty
 
-            # Safe lookup for the learned prior
-            wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
-            learned_wl_prior = wl_log_pdf[wl_idx]
+                u_exp = q_exp[2]
+                v_exp = jnp.arctan2(q_exp[1], q_exp[0])
+                u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 63.999).astype(jnp.int32), 0, 63)
+                v_idx_exp = jnp.clip(jnp.floor((v_exp + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
+                dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
 
-            # The peak likelihood is entirely data-driven
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + learned_wl_prior + safety_penalty
+                log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
+                w = jnp.exp(peak_log_lik - log_Z)
+                w_sum = jnp.sum(w) 
 
-            # --- 3. BACKGROUND PHYSICS (2D EMPIRICAL KDE) ---
-            u_exp = q_exp[2]
-            v_exp = jnp.arctan2(q_exp[1], q_exp[0])
-            u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 63.999).astype(jnp.int32), 0, 63)
-            v_idx_exp = jnp.clip(jnp.floor((v_exp + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
+                weighted_h_geom = jnp.sum(w * q_theo_sample_jax, axis=1) * kappa_safe
+                F_total = jnp.outer(q_exp, weighted_h_geom) 
+                
+                best_idx = jnp.argmax(w)
+                is_signal = w[best_idx] > 0.5
+                actual_winning_lambda = lambda_j[best_idx]
+                
+                return compute_A_from_C(F_total), -log_Z, w_sum, is_signal, actual_winning_lambda
             
-            dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
-
-            # --- 4. PERFECT SOFTMAX SYMMETRY ---
-            log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
-            w = jnp.exp(peak_log_lik - log_Z)
-            w_sum = jnp.sum(w) 
-
-            weighted_h_geom = jnp.sum(w * q_theo_sample_jax, axis=1) * kappa_safe
-            F_total = jnp.outer(q_exp, weighted_h_geom) 
-       
-            best_idx = jnp.argmax(w)
-            is_signal = w[best_idx] > 0.5
-            actual_winning_lambda = lambda_j[best_idx]
-
-            return compute_A_from_C(F_total), -log_Z, w_sum, is_signal, actual_winning_lambda
+            # =================================================================
+            # VMAP the exact physics across the 7 boundaries of the uncertainty
+            F_sig, nll_sig, w_sum_sig, is_sig, lam_sig = jax.vmap(evaluate_physics_for_U)(U_sigma)
+            
+            # Compute the statistically rigorous Expected Value
+            F_expected = jnp.sum(F_sig * ut_weights[:, None, None], axis=0)
+            nll_expected = jnp.sum(nll_sig * ut_weights)
+            
+            # We preserve the discrete attributes (is_signal, wavelength) from the Mode (Index 0)
+            return F_expected, nll_expected, w_sum_sig[0], is_sig[0], lam_sig[0]
+            # =================================================================
 
         def single_event_wrapper(event_data):
             q_exp, ki_exp = event_data
@@ -1639,7 +1671,7 @@ def run_bingham_tracker(
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
-        return A_new, bg_hist_new, wl_hist_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
+        return A_new, bg_hist_new, wl_hist_new, t_curr, U_sigma[0], jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
