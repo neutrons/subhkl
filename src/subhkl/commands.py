@@ -1379,7 +1379,7 @@ def run_bingham_tracker(
     d_min: float = 2.0,
     d_max: float = 8.0,
     bg_ema_weight: float = 0.99,
-    signal_ema_weight: float = 0.05,
+    loss_ema_weight: float = 0.05,
     wl_min_tracking: float = 0.0,
     wl_max_tracking: float = 12.0,
     max_rate_hz: float = np.inf, # FIXED: Opened gate for physical beamline
@@ -1678,8 +1678,8 @@ def run_bingham_tracker(
     effective_annealing_count = 0.0
     angles_prev = None
 
-    smoothed_signal_ensemble = None
-    
+    smoothed_loss_ensemble = None
+
     for batch_data in event_batches:
         q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
 
@@ -1729,28 +1729,26 @@ def run_bingham_tracker(
             A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
         )
 
-        # --- THE DECOUPLED EVALUATOR: MAXIMIZE SIGNAL YIELD ---
-        sig_rate_np = np.array(sig_rates)
+        loss_ensemble_np = np.array(loss_ensemble)
         
-        if smoothed_signal_ensemble is None:
-            smoothed_signal_ensemble = sig_rate_np
+        if smoothed_loss_ensemble is None:
+            smoothed_loss_ensemble = loss_ensemble_np
         else:
-            smoothed_signal_ensemble = (1.0 - signal_ema_weight) * smoothed_signal_ensemble + signal_ema_weight * sig_rate_np
+            smoothed_loss_ensemble = (1.0 - loss_ema_weight) * smoothed_loss_ensemble + loss_ema_weight * loss_ensemble_np
 
-        # SELECT THE WINNER THAT HARVESTS THE MOST TRUE PEAKS
-        best_idx = int(np.argmax(smoothed_signal_ensemble))
+        # Select the winner based on the SMOOTHED history, not the instantaneous noise!
+        best_idx = int(np.argmin(smoothed_loss_ensemble))
 
-        # Convert the Signal Yield to Softmax weights for the Histogram Averaging
-        # (We multiply by a temperature factor to make the differences pop)
-        ensemble_weights = jax.nn.softmax(smoothed_signal_ensemble * 0.1)
+        # Convert NLL losses to probability weights
+        ensemble_weights = jax.nn.softmax(-loss_ensemble)
 
-        # Take a weighted average of the histograms (or stick to the hard broadcast)
+        # Take a weighted average of the histograms
         wl_hist_weighted = jnp.sum(wl_hist_ensemble * ensemble_weights[:, None], axis=0)
         wl_hist_ensemble = jnp.broadcast_to(wl_hist_weighted, wl_hist_ensemble.shape)
-        
+
         U_best = np.array(U_ensemble_curr[best_idx])
         best_gap = float(eigen_gaps[best_idx])
-        best_loss = float(np.array(loss_ensemble)[best_idx]) # Still log it for telemetry 
+        best_loss = float(loss_ensemble[best_idx])
 
         tracking_history.append((float(t_state), U_best))
 
