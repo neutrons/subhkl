@@ -1659,18 +1659,24 @@ def run_bingham_tracker(
         
         A_diffused = A_prev * decay_total
 
-        F_mean = jnp.sum(A_F_batch, axis=0) / jnp.maximum(num_events, 1e-9)
-        F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
-       
+        # ====================================================================
+        # THE FIX: EXTENSIVE BAYESIAN ACCUMULATION
+        # Sum the F matrices to capture the total physical torque of the batch
+        F_sum_A = jnp.sum(A_F_batch, axis=0) 
+        
+        # Keep the matrix mathematically well-conditioned on the S3 manifold
+        F_sum_A = F_sum_A - (jnp.trace(F_sum_A) / 4.0) * jnp.eye(4)
+        
+        # Directly add the batch information to the diffused prior
+        A_updated = A_diffused + F_sum_A 
+        # ====================================================================
+
         # THE HARDWARE ANOMALY GATE
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         total_rate = num_events / dt_chunk
-        
+
         # If the rate is physically impossible, it's a DAQ glitch/flash.
         is_valid_batch = total_rate < max_rate_hz
-
-        # Conditionally update the state. If invalid, keep the previous state!
-        A_updated = A_diffused + F_mean * (1.0 - decay_total)
         A_new = jnp.where(is_valid_batch, A_updated, A_prev)
         
         bg_hist_out = jnp.where(is_valid_batch, bg_hist_new, bg_hist_prev)
