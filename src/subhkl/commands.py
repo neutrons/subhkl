@@ -1381,7 +1381,7 @@ def run_bingham_tracker(
     signal_ema_weight: float = 0.05,
     wl_min_tracking: float = 0.0,
     wl_max_tracking: float = 12.0,
-    max_rate_hz: float = 150000.0, # FIXED: Opened gate for physical beamline
+    max_rate_hz: float = np.inf, # FIXED: Opened gate for physical beamline
     max_gpu_batch_size: int = 2048,
     mekf_gain: float = 1.0,        # NEW: The Lie-Algebraic torque step size
 ):
