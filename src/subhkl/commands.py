@@ -1607,11 +1607,23 @@ def run_bingham_tracker(
             # VMAP the exact physics across the 7 boundaries of the uncertainty
             F_sig, nll_sig, w_sum_sig, is_sig, lam_sig = jax.vmap(evaluate_physics_for_U)(U_sigma)
             
-            # Compute the statistically rigorous Expected Value
-            F_expected = jnp.sum(F_sig * ut_weights[:, None, None], axis=0)
-            nll_expected = jnp.sum(nll_sig * ut_weights)
+            # 1. The Geometric Mean Bug Fix: Use LogSumExp to sum probabilities!
+            log_ut_weights = jnp.log(ut_weights)
+            log_marginal_lik = jax.scipy.special.logsumexp(-nll_sig + log_ut_weights)
             
-            # We preserve the discrete attributes (is_signal, wavelength) from the Mode (Index 0)
+            # This is the true Expected NLL. The True Tracker will now dominate the ensemble.
+            nll_expected = -log_marginal_lik 
+            
+            # 2. Calculate the Posterior Weights of the 7 Sigma Points
+            # (Which of the 7 points actually found the Ewald sphere?)
+            post_weights = jnp.exp(-nll_sig + log_ut_weights - log_marginal_lik)
+            
+            # 3. Build the Expected F Matrix using the POSTERIOR weights!
+            # If the Mode hits the peak, it gets 1.0 weight. If an edge point hits, IT gets 1.0 weight.
+            # Signal is never diluted by the void.
+            F_expected = jnp.sum(F_sig * post_weights[:, None, None], axis=0)
+            
+            # We preserve the discrete telemetry from the Mode (Index 0)
             return F_expected, nll_expected, w_sum_sig[0], is_sig[0], lam_sig[0]
             # =================================================================
 
