@@ -1507,189 +1507,113 @@ def run_bingham_tracker(
 
         vals, vecs = jnp.linalg.eigh(A_prev)
         v4_mode = vecs[:, 3]
+        U = quaternion_to_rotation_matrix(v4_mode)
 
-        # ====================================================================
-        # 1. GENERATE THE S3 SIGMA POINTS (Unscented Transform)
-        
-        # Calculate Bingham principal uncertainties in the tangent space
-        delta = jnp.maximum(vals[3] - vals[:3], 1e-3)
-        
-        # UT scaling factor (sqrt(3) is standard for 3-DOF distributions)
-        spread_factor = jnp.sqrt(3.0)
-        angles = spread_factor / jnp.sqrt(delta)
-        
-        # Generate 7 mutually orthogonal unit quaternions
-        q_sigma = jnp.zeros((7, 4))
-        q_sigma = q_sigma.at[0].set(v4_mode)
-        for i in range(3):
-            q_sigma = q_sigma.at[1 + 2*i].set(jnp.cos(angles[i]) * v4_mode + jnp.sin(angles[i]) * vecs[:, i])
-            q_sigma = q_sigma.at[2 + 2*i].set(jnp.cos(angles[i]) * v4_mode - jnp.sin(angles[i]) * vecs[:, i])
-            
-        U_sigma = jax.vmap(quaternion_to_rotation_matrix)(q_sigma)
-        
-        # Calculate UT Weights (Center gets 1/3, the 6 edge points split the rest)
-        w_0 = 1.0 / 3.0
-        w_i = (1.0 - w_0) / 6.0
-        ut_weights = jnp.array([w_0, w_i, w_i, w_i, w_i, w_i, w_i])
-        
-        # Revert kappa_safe to its sharp, exact physical value
         kappa_safe = jnp.clip(1.0 / (current_sigma_q ** 2), 1e-6, 1e6) 
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
-        # ==================================================================== 
 
-        # ====================================================================
-        # --- 2D SPHERICAL EMPIRICAL BACKGROUND (64 x 64 Bins) ---
-        # 1. Polar coordinate (Z-axis scattering depth, range [-1, 1])
-        u_batch = q_batch[:, 2] 
-        # 2. Azimuthal coordinate (XY plane rotation, range [-pi, pi])
-        v_batch = jnp.arctan2(q_batch[:, 1], q_batch[:, 0]) 
-
-        # Map to 64x64 Grid
-        u_idx_batch = jnp.clip(jnp.floor((u_batch + 1.0) * 63.999).astype(jnp.int32), 0, 63)
-        v_idx_batch = jnp.clip(jnp.floor((v_batch + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
-        
-        flat_idx_batch = u_idx_batch * 64 + v_idx_batch
-        raw_hist = jnp.bincount(flat_idx_batch, length=4096)
-
-        # --- THE CONFIGURABLE EMA ---
-        bg_hist_new = bg_ema_weight * bg_hist_prev + (1.0 - bg_ema_weight) * raw_hist 
-        smoothed_hist = bg_hist_new + 1.0 
-        
-        # Normalize to 2D Solid Angle PDF
-        d_omega = (2.0 / 64.0) * (2.0 * jnp.pi / 64.0)
-        bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
-        bg_log_pdf_flat = jnp.log(bg_pdf)
-
-        # Pass the dynamic limits into JAX
         wl_max_jax = float(wl_max_tracking)
         num_bins_jax = int(num_wl_bins)
-
-        # --- 1D EMPIRICAL SIGNAL SPECTRUM ---
         wl_pdf = wl_hist_prev / jnp.sum(wl_hist_prev)
         wl_log_pdf = jnp.log(wl_pdf)
 
-        def single_event_update(q_exp, ki_exp):
-            
-            # We abstract the physics into a closure that takes a specific U_matrix
-            def evaluate_physics_for_U(U_cand):
-                h_sample = jnp.matmul(U_cand, q_theo_sample_jax)
-                cos_theta_err = jnp.dot(q_exp, h_sample)
-                q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
-                
-                lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
-                valid_wl = (lambda_j > 0.0) & (lambda_j < wl_max_jax)
-                safety_penalty = jnp.where(valid_wl, 0.0, -1e9)
-                wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
-                learned_wl_prior = wl_log_pdf[wl_idx]
-
-                peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + learned_wl_prior + safety_penalty
-
-                u_exp = q_exp[2]
-                v_exp = jnp.arctan2(q_exp[1], q_exp[0])
-                u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 63.999).astype(jnp.int32), 0, 63)
-                v_idx_exp = jnp.clip(jnp.floor((v_exp + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
-                dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
-
-                log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
-                w = jnp.exp(peak_log_lik - log_Z)
-                w_sum = jnp.sum(w) 
-
-                weighted_h_geom = jnp.sum(w * q_theo_sample_jax, axis=1) * kappa_safe
-                F_total = jnp.outer(q_exp, weighted_h_geom) 
-                
-                best_idx = jnp.argmax(w)
-                is_signal = w[best_idx] > 0.5
-                actual_winning_lambda = lambda_j[best_idx]
-                
-                return compute_A_from_C(F_total), -log_Z, w_sum, is_signal, actual_winning_lambda
-            
-            # =================================================================
-            # VMAP the exact physics across the 7 boundaries of the uncertainty
-            F_sig, nll_sig, w_sum_sig, is_sig, lam_sig = jax.vmap(evaluate_physics_for_U)(U_sigma)
-            
-            # 1. The Geometric Mean Bug Fix: Use LogSumExp to sum probabilities!
-            log_ut_weights = jnp.log(ut_weights)
-            log_marginal_lik = jax.scipy.special.logsumexp(-nll_sig + log_ut_weights)
-            
-            # This is the true Expected NLL. The True Tracker will now dominate the ensemble.
-            nll_expected = -log_marginal_lik 
-            
-            # 2. Calculate the Posterior Weights of the 7 Sigma Points
-            # (Which of the 7 points actually found the Ewald sphere?)
-            post_weights = jnp.exp(-nll_sig + log_ut_weights - log_marginal_lik)
-            
-            # 3. Build the Expected F Matrix using the POSTERIOR weights!
-            # If the Mode hits the peak, it gets 1.0 weight. If an edge point hits, IT gets 1.0 weight.
-            # Signal is never diluted by the void.
-            F_expected = jnp.sum(F_sig * post_weights[:, None, None], axis=0)
-            
-            # We preserve the discrete telemetry from the Mode (Index 0)
-            return F_expected, nll_expected, w_sum_sig[0], is_sig[0], lam_sig[0]
-            # =================================================================
-
-        def single_event_wrapper(event_data):
-            q_exp, ki_exp = event_data
-            return single_event_update(q_exp, ki_exp)
-
-        A_F_batch, nll_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch = jax.lax.map(
-            single_event_wrapper, 
-            (q_batch, ki_batch), 
-            batch_size=max_gpu_batch_size,
-        )
+        # --- 2D SPHERICAL EMPIRICAL BACKGROUND ---
+        u_batch = q_batch[:, 2] 
+        v_batch = jnp.arctan2(q_batch[:, 1], q_batch[:, 0]) 
+        u_idx_batch = jnp.clip(jnp.floor((u_batch + 1.0) * 63.999).astype(jnp.int32), 0, 63)
+        v_idx_batch = jnp.clip(jnp.floor((v_batch + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
+        flat_idx_batch = u_idx_batch * 64 + v_idx_batch
+        raw_hist = jnp.bincount(flat_idx_batch, length=4096)
         
-        signal_count = jnp.sum(w_sum_batch)
+        bg_hist_new = bg_ema_weight * bg_hist_prev + (1.0 - bg_ema_weight) * raw_hist 
+        smoothed_hist = bg_hist_new + 1.0 
+        d_omega = (2.0 / 64.0) * (2.0 * jnp.pi / 64.0)
+        bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
+        bg_log_pdf_flat = jnp.log(bg_pdf)
+        
+        dynamic_bg_log_lik = bg_log_pdf_flat[flat_idx_batch] # Shape: (N_batch,)
 
-        # Bin them into the grid directly from the mapped arrays!
+        # ====================================================================
+        # THE DENSE EUCLIDEAN KERNEL
+        
+        # 1. Rotate all peaks: Shape (3, N_peaks)
+        h_sample = jnp.matmul(U, q_theo_sample_jax) 
+        
+        # 2. Compute ALL angular distances simultaneously! Shape (N_batch, N_peaks)
+        # This 10,000 x 500 matrix takes ~20MB of VRAM. Effortless for JAX.
+        cos_theta_err = jnp.dot(q_batch, h_sample) 
+        
+        # 3. The Kinematic Ewald Mask (Evaluated per-peak using the batch's average ki)
+        q_dot_ki_theo = jnp.dot(ki_batch[0], h_sample) 
+        lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
+        valid_wl = (lambda_j > 0.0) & (lambda_j < wl_max_jax)
+        safety_penalty = jnp.where(valid_wl, 0.0, -1e9)
+        wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
+        learned_wl_prior = wl_log_pdf[wl_idx] # Shape: (N_peaks,)
+        
+        # 4. Construct the Bayesian Log-Likelihood Matrix
+        peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + learned_wl_prior + safety_penalty
+        
+        # 5. Softmax Assignment (Append Background as the N+1 column)
+        peak_and_bg = jnp.concatenate([peak_log_lik, dynamic_bg_log_lik[:, None]], axis=1)
+        log_Z = jax.scipy.special.logsumexp(peak_and_bg, axis=1) # Shape: (N_batch,)
+        
+        # Extract weights for the peaks only
+        w = jnp.exp(peak_log_lik - log_Z[:, None]) # Shape: (N_batch, N_peaks)
+        signal_count = jnp.sum(w)
+        
+        # 6. EXACT F-MATRIX ACCUMULATION (No loops required!)
+        # Multiply weights by theoretical vectors -> (N_batch, 3)
+        weighted_h_geom = jnp.matmul(w, h_sample.T) * kappa_safe 
+        
+        # Outer product of actual experimental vectors with theoretical vectors
+        # This mathematically calculates F_sum for the entire batch instantly!
+        F_sum_batch = jnp.matmul(q_batch.T, weighted_h_geom) # Shape: (3, 3)
+        
+        # 7. Telemetry Extraction
+        best_peak_idx = jnp.argmax(w, axis=1)
+        best_w = jnp.max(w, axis=1)
+        is_signal_batch = best_w > 0.5
+        actual_lambdas_batch = lambda_j[best_peak_idx]
+        mean_nll = jnp.mean(-log_Z)
+        # ====================================================================
+
+        # STRICT EXCLUSION MASK for Wavelength Histogram
         wl_idx_batch = jnp.floor(actual_lambdas_batch * 10.0).astype(jnp.int32)
-
-        # STRICT EXCLUSION MASK: Must be a confident signal AND physically possible
         valid_bin_mask = is_signal_batch & (actual_lambdas_batch > 0.0) & (actual_lambdas_batch < wl_max_jax)
-
-        # Dump invalid wavelengths into an unused n+1 bin, then slice it off!
         raw_wl_hist = jnp.bincount(
             jnp.where(valid_bin_mask, wl_idx_batch, num_bins_jax), 
             length=num_bins_jax + 1
         )[:num_bins_jax]
-
         wl_hist_new = bg_ema_weight * wl_hist_prev + (1.0 - bg_ema_weight) * raw_wl_hist + 1e-3
 
+        # EXTENSIVE ACCUMULATION (Thermodynamic Update)
         decay_event = jnp.exp(-gamma_event * num_events)
         decay_step = jnp.exp(-gamma_step * delta_angle)
         decay_total = decay_event * decay_step
         
         A_diffused = A_prev * decay_total
-
-        # ====================================================================
-        # THE FIX: EXTENSIVE BAYESIAN ACCUMULATION
-        # Sum the F matrices to capture the total physical torque of the batch
-        F_sum_A = jnp.sum(A_F_batch, axis=0) 
+        A_F_sum = compute_A_from_C(F_sum_batch)
+        A_F_sum = A_F_sum - (jnp.trace(A_F_sum) / 4.0) * jnp.eye(4)
         
-        # Keep the matrix mathematically well-conditioned on the S3 manifold
-        F_sum_A = F_sum_A - (jnp.trace(F_sum_A) / 4.0) * jnp.eye(4)
-        
-        # Directly add the batch information to the diffused prior
-        A_updated = A_diffused + F_sum_A 
-        # ====================================================================
+        A_updated = A_diffused + A_F_sum 
 
-        # THE HARDWARE ANOMALY GATE
+        # Hardware Anomaly Gate
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         total_rate = num_events / dt_chunk
-
-        # If the rate is physically impossible, it's a DAQ glitch/flash.
         is_valid_batch = total_rate < max_rate_hz
-        A_new = jnp.where(is_valid_batch, A_updated, A_prev)
         
+        A_new = jnp.where(is_valid_batch, A_updated, A_prev)
         bg_hist_out = jnp.where(is_valid_batch, bg_hist_new, bg_hist_prev)
         wl_hist_out = jnp.where(is_valid_batch, wl_hist_new, wl_hist_prev)
 
         vals_new = jnp.linalg.eigvalsh(A_new)
         norm_gap = vals_new[-1] - vals_new[-2]
 
-        dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
-        return A_new, bg_hist_new, wl_hist_new, t_curr, U_sigma[0], jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
+        return A_new, bg_hist_out, wl_hist_out, t_curr, U, mean_nll, norm_gap, sig_rate, bg_rate, bg_pdf
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
