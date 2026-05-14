@@ -1500,7 +1500,7 @@ def run_bingham_tracker(
             jnp.concatenate([A10, A11], axis=1)
         ], axis=0)
 
-    jax.jit
+    @jax.jit
     def process_chunk(A_prev, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
@@ -1509,8 +1509,22 @@ def run_bingham_tracker(
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
 
-        kappa_safe = jnp.clip(1.0 / (current_sigma_q ** 2), 1e-6, 1e6) 
+        # ====================================================================
+        # THE VARIANCE CONVOLUTION (DYNAMIC CAPTURE RADIUS)
+        
+        # 1. Capture the prior precision (Inertia) of this specific ensemble member
+        norm_gap_prev = jnp.maximum(vals[-1] - vals[-2], 1e-3)
+        
+        # 2. Convert inertia to angular variance in the local tangent space
+        sigma_tracker = 1.0 / jnp.sqrt(norm_gap_prev)
+        
+        # 3. Convolve the physical measurement variance with the tracker's uncertainty
+        sigma_eff = jnp.sqrt(current_sigma_q**2 + sigma_tracker**2)
+        
+        # 4. Compute the dynamic precision for the Bayesian Softmax
+        kappa_safe = jnp.clip(1.0 / (sigma_eff ** 2), 1e-6, 1e6) 
         log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
+        # ====================================================================
 
         # ====================================================================
         # --- 2D SPHERICAL EMPIRICAL BACKGROUND (64 x 64 Bins) ---
