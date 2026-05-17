@@ -32,11 +32,12 @@ class TestBinghamTracker(unittest.TestCase):
     def tearDown(self):
         self.test_dir.cleanup()
 
-    def generate_poissonian_events(self, U_true, num_events=1000000, duration=5.0, sigma_q=0.05, bg_fraction=0.0, b_factor=0.0):
+    def generate_poissonian_events(self, U_true, num_events=1000000, duration=5.0, sigma_q=0.008, bg_fraction=0.0, b_factor=0.0):
+        # Busing-Levy convention (1/d) to match the tracker's geometry exactly
         B_mat = np.array([
-            [2*np.pi/10.0, 0, 0],
-            [0, 2*np.pi/10.0, 0],
-            [0, 0, 2*np.pi/10.0]
+            [1.0/10.0, 0, 0],
+            [0, 1.0/10.0, 0],
+            [0, 0, 1.0/10.0]
         ])
         ki_vec = np.array([0.0, 0.0, 1.0])
 
@@ -52,7 +53,7 @@ class TestBinghamTracker(unittest.TestCase):
 
         kinematic_proj = ki_vec.T @ (U_true @ q_theo_hat)
         
-        # True Laue equation (2.0 instead of 4*pi) to match new tracker physics
+        # True kinematics in Busing-Levy space
         wavelengths = -(2.0 / q_norms) * kinematic_proj
 
         valid_mask = (wavelengths > 0.5) & (wavelengths < 10.0)
@@ -67,12 +68,12 @@ class TestBinghamTracker(unittest.TestCase):
         # --- THE WILSON PRIOR (Intensity Decay) ---
         # ==========================================================
         if b_factor > 0.0:
-            # I(q) ~ exp(-B * |q|^2)
-            # This makes low-q peaks overwhelmingly more frequent
-            intensities = np.exp(-b_factor * (valid_norms**2))
+            # Scale b_factor so the exponential drop is identical to the old 2*pi space
+            # (2 * pi)^2 approx 39.47
+            intensities = np.exp(-(b_factor * 39.47) * (valid_norms**2))
             p_dist = intensities / np.sum(intensities)
         else:
-            p_dist = None # Uniform distribution for old tests
+            p_dist = None 
 
         peak_indices = np.random.choice(num_valid, size=num_sig, p=p_dist)
         
@@ -80,7 +81,12 @@ class TestBinghamTracker(unittest.TestCase):
         # 1. Generate Physical Signal Events
         for idx in peak_indices:
             q_hat_lab = U_true @ valid_q_hat[:, idx]
+            
+            # Since q_norms is now 2*pi smaller, sigma_q must also be smaller 
+            # to maintain the exact same angular variance as the previous tests.
+            # 0.05 / (2*pi) approx 0.008
             angular_std = sigma_q / valid_norms[idx]
+            
             noise_vec = np.random.normal(0, angular_std, 3)
             q_exp = q_hat_lab + noise_vec
             q_exp /= np.linalg.norm(q_exp)
