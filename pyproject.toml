@@ -33,6 +33,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 # JAX with CUDA 12 support (NVIDIA GPUs)
+[project.optional-dependencies]
 cuda12 = [
   "jax[cuda12]",
 ]
