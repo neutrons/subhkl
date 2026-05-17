@@ -245,7 +245,7 @@ class TestBinghamTracker(unittest.TestCase):
             gamma_event=1e-4,    # Fast learning rate to let the ensemble collapse and move!
             gamma_step=100.0,
             kappa_init=100.0,
-            n_ensemble=128, 
+            n_ensemble=256, 
             streaming_callback=streaming_callback
         )
         

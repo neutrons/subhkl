@@ -1364,7 +1364,7 @@ class RunPeaks:
 
 def run_bingham_tracker(
     finder_file: str,
-    event_batches,  
+    event_batches,
     instrument_name: str | None = None,
     streaming_callback=None,
     sigma_q_start: float = 1.0,
@@ -1405,7 +1405,7 @@ def run_bingham_tracker(
         ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else None
         ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
         ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
-        
+
         sg = f["sample/space_group"][()]
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
 
@@ -1453,10 +1453,10 @@ def run_bingham_tracker(
 
     # Strictly bound the tracking grid to the healthy mid-Q range
     res_mask = (q_mags_np < q_max_tracking) & (q_mags_np > q_min_tracking)
-    
+
     q_theo_cryst = q_theo_cryst[:, res_mask]
     q_mags_np = q_mags_np[res_mask]
-    
+
     # Now push the filtered arrays to JAX
     q_theo_cryst_jax = jnp.array(q_theo_cryst)
     q_mags_jax = jnp.array(q_mags_np)
@@ -1465,7 +1465,7 @@ def run_bingham_tracker(
     ub_helper.ki_vec = np.array([0.0, 0.0, 1.0]) # Default assumption if loader passed explicitly
     ki_vec_jax = jnp.array(ub_helper.ki_vec)
     ki_vec_jax = ki_vec_jax / (jnp.linalg.norm(ki_vec_jax) + 1e-9)
-    
+
     print(f"  > Generated {q_theo_sample_jax.shape[1]} valid theoretical Bragg directions.")
 
     lambda_max_jax = 4.0 * jnp.pi / (q_mags_jax + 1e-9)
@@ -1500,7 +1500,7 @@ def run_bingham_tracker(
             jnp.concatenate([A10, A11], axis=1)
         ], axis=0)
 
-    jax.jit
+    @jax.jit
     def process_chunk(A_prev, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
@@ -1509,27 +1509,36 @@ def run_bingham_tracker(
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
 
-        kappa_safe = jnp.clip(1.0 / (current_sigma_q ** 2), 1e-6, 1e6) 
-        log_vmf_norm = jnp.log(kappa_safe / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_safe))
+        # ====================================================================
+        # THE LEVER ARM EFFECT: Dynamic Peak-Specific Precision
+        # ====================================================================
+        # Normalize the q-magnitudes so the average peak matches the global current_sigma_q scale.
+        # This preserves the SDE tracking inertia while correctly making high-Q peaks sharper.
+        q_mean = jnp.mean(q_mags_jax)
+        q_norm = q_mags_jax / q_mean
+        
+        kappa_j = jnp.clip((q_norm ** 2) / (current_sigma_q ** 2), 1e-6, 1e6) 
+        log_vmf_norm_j = jnp.log(kappa_j / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_j))
+        # ====================================================================
 
         # ====================================================================
         # --- 2D SPHERICAL EMPIRICAL BACKGROUND (64 x 64 Bins) ---
         # 1. Polar coordinate (Z-axis scattering depth, range [-1, 1])
-        u_batch = q_batch[:, 2] 
+        u_batch = q_batch[:, 2]
         # 2. Azimuthal coordinate (XY plane rotation, range [-pi, pi])
-        v_batch = jnp.arctan2(q_batch[:, 1], q_batch[:, 0]) 
+        v_batch = jnp.arctan2(q_batch[:, 1], q_batch[:, 0])
 
         # Map to 64x64 Grid
         u_idx_batch = jnp.clip(jnp.floor((u_batch + 1.0) * 63.999).astype(jnp.int32), 0, 63)
         v_idx_batch = jnp.clip(jnp.floor((v_batch + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
-        
+
         flat_idx_batch = u_idx_batch * 64 + v_idx_batch
         raw_hist = jnp.bincount(flat_idx_batch, length=4096)
 
         # --- THE CONFIGURABLE EMA ---
-        bg_hist_new = bg_ema_weight * bg_hist_prev + (1.0 - bg_ema_weight) * raw_hist 
-        smoothed_hist = bg_hist_new + 1.0 
-        
+        bg_hist_new = bg_ema_weight * bg_hist_prev + (1.0 - bg_ema_weight) * raw_hist
+        smoothed_hist = bg_hist_new + 1.0
+
         # Normalize to 2D Solid Angle PDF
         d_omega = (2.0 / 64.0) * (2.0 * jnp.pi / 64.0)
         bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
@@ -1547,7 +1556,7 @@ def run_bingham_tracker(
             h_sample = jnp.matmul(U, q_theo_sample_jax)
             cos_theta_err = jnp.dot(q_exp, h_sample)
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
-            
+
             # Look up the learned probability of this wavelength!
             lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
 
@@ -1558,25 +1567,26 @@ def run_bingham_tracker(
             wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
             learned_wl_prior = wl_log_pdf[wl_idx]
 
-            # The peak likelihood is entirely data-driven
-            peak_log_lik = kappa_safe * (cos_theta_err - 1.0) + log_vmf_norm + learned_wl_prior + safety_penalty
+            # The peak likelihood is now intrinsically scaled by its |q| Lever Arm!
+            peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_vmf_norm_j + learned_wl_prior + safety_penalty
 
             # --- 3. BACKGROUND PHYSICS (2D EMPIRICAL KDE) ---
             u_exp = q_exp[2]
             v_exp = jnp.arctan2(q_exp[1], q_exp[0])
             u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 63.999).astype(jnp.int32), 0, 63)
             v_idx_exp = jnp.clip(jnp.floor((v_exp + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
-            
+
             dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
 
             # --- 4. PERFECT SOFTMAX SYMMETRY ---
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
             w = jnp.exp(peak_log_lik - log_Z)
-            w_sum = jnp.sum(w) 
+            w_sum = jnp.sum(w)
 
-            weighted_h_geom = jnp.sum(w * q_theo_sample_jax, axis=1) * kappa_safe
-            F_total = jnp.outer(q_exp, weighted_h_geom) 
-       
+            # Multiply the Softmax weights by the exact precision of that peak
+            weighted_h_geom = jnp.sum((w * kappa_j) * q_theo_sample_jax, axis=1)
+            F_total = jnp.outer(q_exp, weighted_h_geom)
+
             best_idx = jnp.argmax(w)
             is_signal = w[best_idx] > 0.5
             actual_winning_lambda = lambda_j[best_idx]
@@ -1588,11 +1598,11 @@ def run_bingham_tracker(
             return single_event_update(q_exp, ki_exp)
 
         A_F_batch, nll_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch = jax.lax.map(
-            single_event_wrapper, 
-            (q_batch, ki_batch), 
+            single_event_wrapper,
+            (q_batch, ki_batch),
             batch_size=max_gpu_batch_size,
         )
-        
+
         signal_count = jnp.sum(w_sum_batch)
 
         # Bin them into the grid directly from the mapped arrays!
@@ -1603,7 +1613,7 @@ def run_bingham_tracker(
 
         # Dump invalid wavelengths into an unused n+1 bin, then slice it off!
         raw_wl_hist = jnp.bincount(
-            jnp.where(valid_bin_mask, wl_idx_batch, num_bins_jax), 
+            jnp.where(valid_bin_mask, wl_idx_batch, num_bins_jax),
             length=num_bins_jax + 1
         )[:num_bins_jax]
 
@@ -1612,23 +1622,23 @@ def run_bingham_tracker(
         decay_event = jnp.exp(-gamma_event * num_events)
         decay_step = jnp.exp(-gamma_step * delta_angle)
         decay_total = decay_event * decay_step
-        
+
         A_diffused = A_prev * decay_total
 
         F_mean = jnp.sum(A_F_batch, axis=0) / jnp.maximum(num_events, 1e-9)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
-       
+
         # THE HARDWARE ANOMALY GATE
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         total_rate = num_events / dt_chunk
-        
+
         # If the rate is physically impossible, it's a DAQ glitch/flash.
         is_valid_batch = total_rate < max_rate_hz
 
         # Conditionally update the state. If invalid, keep the previous state!
         A_updated = A_diffused + F_mean * (1.0 - decay_total)
         A_new = jnp.where(is_valid_batch, A_updated, A_prev)
-        
+
         bg_hist_out = jnp.where(is_valid_batch, bg_hist_new, bg_hist_prev)
         wl_hist_out = jnp.where(is_valid_batch, wl_hist_new, wl_hist_prev)
 
@@ -1639,7 +1649,7 @@ def run_bingham_tracker(
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
-        return A_new, bg_hist_new, wl_hist_new, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
+        return A_new, bg_hist_out, wl_hist_out, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
@@ -1701,20 +1711,20 @@ def run_bingham_tracker(
         num_events = len(q_batch_np)
         dt_chunk_py = max(1e-4, float(t_batch_np[-1] - t_batch_np[0]))
         total_rate_py = num_events / dt_chunk_py
-        
+
         # Only advance the annealing clock if it's a valid physical batch!
         if total_rate_py < max_rate_hz:
             effective_annealing_count += num_events
 
         # Calculate sigma_q using the FROZEN effective count, not the raw cumulative count
         current_sigma_q = max(
-            sigma_q_min, 
+            sigma_q_min,
             sigma_q_start * np.exp(-annealing_rate * effective_annealing_count)
         )
 
         # Calculate sigma_q using the cumulative neutron count
         current_sigma_q = max(
-            sigma_q_min, 
+            sigma_q_min,
             sigma_q_start * np.exp(-annealing_rate * cumulative_count)
         )
 
@@ -1730,7 +1740,7 @@ def run_bingham_tracker(
         )
 
         loss_ensemble_np = np.array(loss_ensemble)
-        
+
         if smoothed_loss_ensemble is None:
             smoothed_loss_ensemble = loss_ensemble_np
         else:
@@ -1754,7 +1764,7 @@ def run_bingham_tracker(
 
         current_sig_rate = float(sig_rates[best_idx])
         current_bg_rate = float(bg_rates[best_idx])
-        
+
         if cumulative_count % 50000 < len(t_batch_np):
             print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Step-Rot: {delta_angle:.4f} rad | Norm-Gap: {best_gap:8.2f}")
 
