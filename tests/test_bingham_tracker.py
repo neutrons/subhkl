@@ -142,7 +142,7 @@ class TestBinghamTracker(unittest.TestCase):
             annealing_rate=3e-4,
             gamma_event=1e-4,
             gamma_step=100.0,
-            kappa_init=100.0,
+            kappa_init=1.0,
             n_ensemble=1,
             streaming_callback=streaming_callback
         )
@@ -208,7 +208,7 @@ class TestBinghamTracker(unittest.TestCase):
             annealing_rate=3e-6,
             gamma_event=1e-4,    # Fast learning rate for clean local capture
             gamma_step=100.0,
-            kappa_init=100.0,
+            kappa_init=1.0,
             n_ensemble=1, 
             streaming_callback=streaming_callback
         )
@@ -244,7 +244,7 @@ class TestBinghamTracker(unittest.TestCase):
             annealing_rate=3e-6,
             gamma_event=1e-4,    # Fast learning rate to let the ensemble collapse and move!
             gamma_step=100.0,
-            kappa_init=100.0,
+            kappa_init=1.0,
             n_ensemble=256, 
             streaming_callback=streaming_callback
         )
@@ -281,7 +281,7 @@ class TestBinghamTracker(unittest.TestCase):
             annealing_rate=3e-4,
             gamma_event=1e-4,    # Agile enough to rotate 5 degrees in 5 seconds
             gamma_step=100.0,
-            kappa_init=100.0,
+            kappa_init=1.0,
             n_ensemble=1,        
             streaming_callback=streaming_callback
         )

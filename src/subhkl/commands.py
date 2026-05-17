@@ -1501,7 +1501,7 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_prev, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
+    def process_chunk(A_prev, A_seed, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
 
@@ -1636,7 +1636,8 @@ def run_bingham_tracker(
         is_valid_batch = total_rate < max_rate_hz
 
         # Conditionally update the state. If invalid, keep the previous state!
-        A_updated = A_diffused + F_mean * (1.0 - decay_total)
+        # The (F_mean + A_seed) blend ensures the matrix never drops below the initial indexing confidence.
+        A_updated = A_diffused + (F_mean + A_seed) * (1.0 - decay_total)
         A_new = jnp.where(is_valid_batch, A_updated, A_prev)
 
         bg_hist_out = jnp.where(is_valid_batch, bg_hist_new, bg_hist_prev)
@@ -1654,8 +1655,9 @@ def run_bingham_tracker(
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, 0, 0, None, None, None, None, None),
-            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0) # 9 outputs mapped!
+            # Added axis 0 for A_seed
+            in_axes=(0, 0, 0, 0, None, None, None, None, None),
+            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0) 
         )
     )
 
@@ -1673,6 +1675,7 @@ def run_bingham_tracker(
     if U_init is not None:
         A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
         A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
+        A_ensemble_state_seeds = jnp.array(A_ensemble_state)
 
     bg_hist_ensemble = jnp.ones((n_ensemble, 4096)) * 1.0
 
@@ -1736,7 +1739,7 @@ def run_bingham_tracker(
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
         A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
-            A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
+            A_ensemble_state, A_ensemble_state_seeds, bg_hist_ensemble, wl_hist_ensemble, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
         )
 
         loss_ensemble_np = np.array(loss_ensemble)
