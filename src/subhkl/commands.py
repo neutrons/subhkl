@@ -1541,6 +1541,7 @@ def run_bingham_tracker(
         q_mean = jnp.mean(q_mags_jax)
         q_norm = q_mags_jax / q_mean
         kappa_j = jnp.clip((q_norm ** 2) / (current_sigma_q ** 2), 1e-6, 1e6) 
+        
         # ====================================================================
         # THE SPECTRAL E-STEP (Native Extensive Scaling)
         # ====================================================================
@@ -1554,14 +1555,43 @@ def run_bingham_tracker(
         wl_pdf_spectral = wl_hist_prev / jnp.sum(wl_hist_prev)
         peak_weights_spectral = jnp.exp(jnp.log(wl_pdf_spectral)[wl_idx_theo] + safety_penalty_theo)
         
-        Y_theo = e3nn.spherical_harmonics(sh_irreps, mu_theo, normalize=True).array
-        
-        # Multiply the kinematic weights by the exact spatial Lever Arm (kappa_j)
         extensive_peak_weights = peak_weights_spectral * kappa_j
         
-        # The dot product is now rigorously the Native Extensive Q_long(U)!
-        spectral_nll = -jnp.sum(jnp.dot(Y_theo, C_exp) * extensive_peak_weights)
-        # ====================================================================o
+        Y_theo = e3nn.spherical_harmonics(sh_irreps, mu_theo, normalize=True).array
+        
+        # --------------------------------------------------------------------
+        # EXACT CONVOLUTION (Spectral-Galerkin Interaction)
+        # --------------------------------------------------------------------
+        # To compute the exact interaction energy without a spatial grid, we 
+        # couple the theoretical structure (Y_theo) and the experimental 
+        # vacuum wave (C_exp) in the spectral domain.
+        #
+        # TODO: Try the Gridless Dirac Point Evaluation next. By treating the 
+        # Bingham particle as a Dirac delta at U, this tensor product algebraic 
+        # collapse allows O(1) point-evaluation: 
+        # jnp.sum(jnp.dot(Y_theo, C_exp) * extensive_peak_weights)
+        # (If that formulation fails to stabilize, we will implement a fast 
+        # SO(3) FFT (SOFT) over a coarse grid later).
+        # --------------------------------------------------------------------
+        
+        # We perform the exact l-by-l block spherical tensor contraction.
+        # By the rotation properties of spherical harmonics, evaluating the 
+        # continuous SO(3) cross-correlation exactly at coordinate U is algebraically 
+        # identical to contracting the unrotated vacuum wave C_exp with the rotated 
+        # structural harmonics Y_theo.
+        spectral_nll_sum = 0.0
+        idx = 0
+        for l in range(L_max + 1):
+            dim = 2 * l + 1
+            Y_theo_l = Y_theo[:, idx:idx+dim]
+            C_exp_l = C_exp[idx:idx+dim]
+            
+            # The l-degree term of the correlation evaluated at orientation U
+            spectral_nll_sum += jnp.sum(jnp.dot(Y_theo_l, C_exp_l) * extensive_peak_weights)
+            idx += dim
+            
+        spectral_nll = -spectral_nll_sum
+        # ====================================================================
 
         # ====================================================================
         # THE LEVER ARM EFFECT & ANALYTICAL EWALD SPLIT
