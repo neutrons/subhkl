@@ -1787,9 +1787,24 @@ def run_bingham_tracker(
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
         # --------------------------------------------------------------------
-        # SOC: Adaptive Tau based on running background flux
+        # SOC: Data-Driven Intensive Scaling via the Background Field
         # --------------------------------------------------------------------
-        current_tau = gamma_c * jnp.sqrt(ema_bg_rate + 1.0)
+        # The 2D background histogram natively maps the instrument's geometry.
+        # Count how many of the 4096 spatial bins are actively receiving neutrons.
+        # (Using bg_hist_ensemble[0] since the background is shared/identical across the ensemble)
+        active_bins = jnp.sum(bg_hist_ensemble[0] > 1e-3)
+        
+        # Calculate the fraction of the scattering sphere currently covered by detectors
+        coverage_fraction = jnp.maximum(active_bins / 4096.0, 1e-4) # Prevent div-by-zero
+        
+        # The Intensive Background Rate (Hz per full-sphere equivalent)
+        intensive_bg_rate = ema_bg_rate / coverage_fraction
+
+        # Adaptive Tau based purely on the spatial density of the noise
+        current_tau = gamma_c * jnp.sqrt(intensive_bg_rate + 1.0)
+        
+        # Thermodynamic ceiling to prevent the wave from boiling flat during extreme anomalies
+        #current_tau = jnp.minimum(current_tau, 2.0)
 
         A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eshort_ensemble, spectral_losses, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
             A_ensemble_state, A_ensemble_state_seeds, bg_hist_ensemble, wl_hist_ensemble,
