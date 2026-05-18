@@ -1384,6 +1384,8 @@ def run_bingham_tracker(
     wl_max_tracking: float = 12.0,
     max_rate_hz: float = np.inf, # FIXED: Opened gate for physical beamline
     max_gpu_batch_size: int = 2048,
+    L_max = 8,
+    spectral_tau = 0.05,
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1393,6 +1395,31 @@ def run_bingham_tracker(
     import jax
     import jax.numpy as jnp
     import scipy.special
+
+    import e3nn_jax as e3nn
+    
+    irreps_str = " + ".join([f"{l}e" if l % 2 == 0 else f"{l}o" for l in range(L_max + 1)])
+    sh_irreps = e3nn.Irreps(irreps_str)
+
+    # ====================================================================
+    # THE SO(3) HEAT KERNEL
+    # ====================================================================
+    # Build the exact analytical attenuation vector for the Wigner-D irreps.
+    # Each degree 'l' has (2l + 1) coefficients.
+    hk_coeffs = []
+    for l in range(L_max + 1):
+        attenuation = np.exp(-spectral_tau * l * (l + 1))
+        hk_coeffs.extend([attenuation] * (2 * l + 1))
+    
+    heat_kernel_jax = jnp.array(hk_coeffs)
+    
+    @jax.jit
+    def compute_C_exp(q_batch):
+        # 1. Convert discrete neutrons to continuous spherical waves
+        Y_exp = e3nn.spherical_harmonics(sh_irreps, q_batch, normalize=True).array
+        
+        # 2. Sum the batch (N) AND apply the Heat Kernel diffusion
+        return jnp.sum(Y_exp, axis=0) * heat_kernel_jax
 
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
 
@@ -1501,7 +1528,7 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_prev, A_seed, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle):
+    def process_chunk(A_prev, A_seed, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, C_exp, current_sigma_q, delta_angle):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
 
@@ -1509,16 +1536,43 @@ def run_bingham_tracker(
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
 
-        # ====================================================================
-        # THE LEVER ARM EFFECT: Dynamic Peak-Specific Precision
-        # ====================================================================
-        # Normalize the q-magnitudes so the average peak matches the global current_sigma_q scale.
-        # This preserves the SDE tracking inertia while correctly making high-Q peaks sharper.
+        mu_theo = jnp.matmul(U, q_theo_sample_jax).T 
+
         q_mean = jnp.mean(q_mags_jax)
         q_norm = q_mags_jax / q_mean
-        
         kappa_j = jnp.clip((q_norm ** 2) / (current_sigma_q ** 2), 1e-6, 1e6) 
+        # ====================================================================
+        # THE SPECTRAL E-STEP (Native Extensive Scaling)
+        # ====================================================================
+        q_dot_ki_theo = jnp.dot(mu_theo, ki_batch[0])
+        lambda_theo = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
+        
+        valid_wl_theo = (lambda_theo > 0.0) & (lambda_theo < float(wl_max_tracking))
+        safety_penalty_theo = jnp.where(valid_wl_theo, 0.0, -1e9)
+        wl_idx_theo = jnp.clip(jnp.floor(lambda_theo * 10.0).astype(jnp.int32), 0, int(num_wl_bins) - 1)
+        
+        wl_pdf_spectral = wl_hist_prev / jnp.sum(wl_hist_prev)
+        peak_weights_spectral = jnp.exp(jnp.log(wl_pdf_spectral)[wl_idx_theo] + safety_penalty_theo)
+        
+        Y_theo = e3nn.spherical_harmonics(sh_irreps, mu_theo, normalize=True).array
+        
+        # Multiply the kinematic weights by the exact spatial Lever Arm (kappa_j)
+        extensive_peak_weights = peak_weights_spectral * kappa_j
+        
+        # The dot product is now rigorously the Native Extensive Q_long(U)!
+        spectral_nll = -jnp.sum(jnp.dot(Y_theo, C_exp) * extensive_peak_weights)
+        # ====================================================================o
+
+        # ====================================================================
+        # THE LEVER ARM EFFECT & ANALYTICAL EWALD SPLIT
+        # ====================================================================
+        
+        # 1. True Precision (Real Space)
         log_vmf_norm_j = jnp.log(kappa_j / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_j))
+        
+        # 2. Heat-Attenuated Precision (Fourier Space Equivalent)
+        kappa_tilde = kappa_j / (1.0 + 2.0 * spectral_tau * kappa_j)
+        log_vmf_norm_tilde = jnp.log(kappa_tilde / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_tilde))
         # ====================================================================
 
         # ====================================================================
@@ -1557,20 +1611,19 @@ def run_bingham_tracker(
             cos_theta_err = jnp.dot(q_exp, h_sample)
             q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
 
-            # Look up the learned probability of this wavelength!
             lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
-
             valid_wl = (lambda_j > 0.0) & (lambda_j < wl_max_jax)
             safety_penalty = jnp.where(valid_wl, 0.0, -1e9)
 
-            # Safe lookup for the learned prior
             wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
             learned_wl_prior = wl_log_pdf[wl_idx]
 
-            # The peak likelihood is now intrinsically scaled by its |q| Lever Arm!
+            # Evaluate Exact M-Step
             peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_vmf_norm_j + learned_wl_prior + safety_penalty
+            
+            # Evaluate Smoothed E-Step Equivalent
+            peak_log_lik_tilde = kappa_tilde * (cos_theta_err - 1.0) + log_vmf_norm_tilde + learned_wl_prior + safety_penalty
 
-            # --- 3. BACKGROUND PHYSICS (2D EMPIRICAL KDE) ---
             u_exp = q_exp[2]
             v_exp = jnp.arctan2(q_exp[1], q_exp[0])
             u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 63.999).astype(jnp.int32), 0, 63)
@@ -1578,12 +1631,17 @@ def run_bingham_tracker(
 
             dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
 
-            # --- 4. PERFECT SOFTMAX SYMMETRY ---
+            # --- THE ANALYTICAL EWALD SUBTRACTION ---
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
+            log_Z_tilde = jax.scipy.special.logsumexp(jnp.append(peak_log_lik_tilde, dynamic_bg_log_lik))
+            
+            # E_short = E_total - E_long = (-log_Z) - (-log_Z_tilde)
+            # Enforce Ewald short-range constraint (must be <= 0)
+            e_short_event = jnp.minimum(0.0, log_Z_tilde - log_Z)
+
             w = jnp.exp(peak_log_lik - log_Z)
             w_sum = jnp.sum(w)
 
-            # Multiply the Softmax weights by the exact precision of that peak
             weighted_h_geom = jnp.sum((w * kappa_j) * q_theo_sample_jax, axis=1)
             F_total = jnp.outer(q_exp, weighted_h_geom)
 
@@ -1591,16 +1649,14 @@ def run_bingham_tracker(
             is_signal = w[best_idx] > 0.5
             actual_winning_lambda = lambda_j[best_idx]
 
-            return compute_A_from_C(F_total), -log_Z, w_sum, is_signal, actual_winning_lambda
+            return compute_A_from_C(F_total), -log_Z, e_short_event, w_sum, is_signal, actual_winning_lambda
 
         def single_event_wrapper(event_data):
             q_exp, ki_exp = event_data
             return single_event_update(q_exp, ki_exp)
 
-        A_F_batch, nll_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch = jax.lax.map(
-            single_event_wrapper,
-            (q_batch, ki_batch),
-            batch_size=max_gpu_batch_size,
+        A_F_batch, nll_batch, e_short_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch = jax.lax.map(
+            single_event_wrapper, (q_batch, ki_batch), batch_size=max_gpu_batch_size,
         )
 
         signal_count = jnp.sum(w_sum_batch)
@@ -1650,14 +1706,14 @@ def run_bingham_tracker(
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
-        return A_new, bg_hist_out, wl_hist_out, t_curr, U, jnp.mean(nll_batch), norm_gap, sig_rate, bg_rate, bg_pdf
+        return A_new, bg_hist_out, wl_hist_out, t_curr, U, jnp.mean(nll_batch), jnp.mean(e_short_batch), spectral_nll, norm_gap, sig_rate, bg_rate, bg_pdf
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            # Added axis 0 for A_seed
-            in_axes=(0, 0, 0, 0, None, None, None, None, None),
-            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0) 
+            in_axes=(0, 0, 0, 0, None, None, None, None, None, None),
+            # Added one extra '0' for the newly returned spectral_nll array
+            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0, 0, 0) 
         )
     )
 
@@ -1691,7 +1747,8 @@ def run_bingham_tracker(
     effective_annealing_count = 0.0
     angles_prev = None
 
-    smoothed_loss_ensemble = None
+    smoothed_spectral_ensemble = None
+    smoothed_eshort_ensemble = None
 
     for batch_data in event_batches:
         q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
@@ -1738,19 +1795,38 @@ def run_bingham_tracker(
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
-        A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
-            A_ensemble_state, A_ensemble_state_seeds, bg_hist_ensemble, wl_hist_ensemble, q_batch, ki_batch, t_batch, current_sigma_q, delta_angle
+        # Compute the experimental wave ONCE per batch on the GPU
+        C_exp = compute_C_exp(q_batch) 
+        
+        # Extract both loss arrays
+        A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eshort_ensemble, spectral_losses, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
+            A_ensemble_state, A_ensemble_state_seeds, bg_hist_ensemble, wl_hist_ensemble, q_batch, ki_batch, t_batch, C_exp, current_sigma_q, delta_angle
         )
 
+        # 1. Extract and smooth both loss arrays
         loss_ensemble_np = np.array(loss_ensemble)
+        spectral_losses_np = np.array(spectral_losses)
 
-        if smoothed_loss_ensemble is None:
-            smoothed_loss_ensemble = loss_ensemble_np
+        # Extract and smooth the new short-range residual
+        eshort_ensemble_np = np.array(eshort_ensemble)
+        if smoothed_eshort_ensemble is None:
+            smoothed_eshort_ensemble = eshort_ensemble_np
+            smoothed_spectral_ensemble = spectral_losses_np
         else:
-            smoothed_loss_ensemble = (1.0 - loss_ema_weight) * smoothed_loss_ensemble + loss_ema_weight * loss_ensemble_np
+            smoothed_eshort_ensemble = (1.0 - loss_ema_weight) * smoothed_eshort_ensemble + loss_ema_weight * eshort_ensemble_np
+            smoothed_spectral_ensemble = (1.0 - loss_ema_weight) * smoothed_spectral_ensemble + loss_ema_weight * spectral_losses_np
 
-        # Select the winner based on the SMOOTHED history, not the instantaneous noise!
-        best_idx = int(np.argmin(smoothed_loss_ensemble))
+        # ====================================================================
+        # THE EXACT ANALYTICAL EWALD ADDITION
+        # ====================================================================
+        # The Dual-Kappa subtraction analytically annihilated all background Monte Carlo variance.
+        # The E_short residual is a pure, noiseless signal. We can safely add it to the Spectral wave.
+        
+        unified_ewald_energy = smoothed_spectral_ensemble + smoothed_eshort_ensemble
+        
+        # The gradient organically hands off from the e3nn Fourier space to the JAX Real space.
+        best_idx = int(np.argmin(unified_ewald_energy))
+        # ====================================================================
 
         # Convert NLL losses to probability weights
         ensemble_weights = jax.nn.softmax(-loss_ensemble)
