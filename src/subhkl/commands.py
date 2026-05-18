@@ -1732,7 +1732,8 @@ def run_bingham_tracker(
     if U_init is not None:
         A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
         A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
-        A_ensemble_state_seeds = jnp.array(A_ensemble_state)
+
+    A_ensemble_state_seeds = jnp.array(A_ensemble_state)
 
     bg_hist_ensemble = jnp.ones((n_ensemble, 4096)) * 1.0
 
