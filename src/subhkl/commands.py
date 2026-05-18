@@ -1803,12 +1803,10 @@ def run_bingham_tracker(
             A_ensemble_state, A_ensemble_state_seeds, bg_hist_ensemble, wl_hist_ensemble, q_batch, ki_batch, t_batch, C_exp, current_sigma_q, delta_angle
         )
 
-        # 1. Extract and smooth both loss arrays
-        loss_ensemble_np = np.array(loss_ensemble)
+        # Extract and smooth the active Ewald tracking arrays
         spectral_losses_np = np.array(spectral_losses)
-
-        # Extract and smooth the new short-range residual
         eshort_ensemble_np = np.array(eshort_ensemble)
+
         if smoothed_eshort_ensemble is None:
             smoothed_eshort_ensemble = eshort_ensemble_np
             smoothed_spectral_ensemble = spectral_losses_np
@@ -1819,12 +1817,7 @@ def run_bingham_tracker(
         # ====================================================================
         # THE EXACT ANALYTICAL EWALD ADDITION
         # ====================================================================
-        # The Dual-Kappa subtraction analytically annihilated all background Monte Carlo variance.
-        # The E_short residual is a pure, noiseless signal. We can safely add it to the Spectral wave.
-        
         unified_ewald_energy = smoothed_spectral_ensemble + smoothed_eshort_ensemble
-        
-        # The gradient organically hands off from the e3nn Fourier space to the JAX Real space.
         best_idx = int(np.argmin(unified_ewald_energy))
         # ====================================================================
 
