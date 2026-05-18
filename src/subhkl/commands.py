@@ -1858,6 +1858,7 @@ def run_bingham_tracker(
                 "bg_pdf": np.array(bg_pdfs[best_idx]).reshape((64, 64)),
                 "wl_hist": np.array(wl_hist_ensemble[best_idx]),
                 "wl_max": wl_max_tracking,
+                "tau": float(current_tau),
             }
 
             streaming_callback(

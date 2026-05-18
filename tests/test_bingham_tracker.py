@@ -329,5 +329,102 @@ class TestBinghamTracker(unittest.TestCase):
         
         self.assertLess(final_err, 31.0, f"Spectral E-Step failed to select Tracker 0. Error {final_err:.2f}°")
 
+    def test_soc_background_flash(self):
+        print(f"\n{'='*60}\nExecuting Regression: SELF-ORGANIZED CRITICALITY (Dynamic Flash)\n{'='*60}")
+        
+        U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
+        U_seed = Rotation.from_euler('y', 40.0, degrees=True).as_matrix()
+
+        with h5py.File(self.finder_file, "w") as f:
+            f["sample/a"], f["sample/b"], f["sample/c"] = 10.0, 10.0, 10.0
+            f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = 90.0, 90.0, 90.0
+            f["sample/space_group"] = b"P 1"
+            f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+            f["sample/U"] = U_seed
+
+        # --- GENERATE A MULTI-PHASE DYNAMIC EVENT STREAM ---
+        # Phase 1: Calm Approach (1.5s, 20% Noise)
+        data_p1 = self.generate_poissonian_events(U_true, num_events=300000, duration=1.5, bg_fraction=0.20)
+        
+        # Phase 2: The Flash (2.0s, 98% Noise - Would shatter a static tracker)
+        data_p2 = self.generate_poissonian_events(U_true, num_events=400000, duration=2.0, bg_fraction=0.98)
+        
+        # Phase 3: Recovery (1.5s, 20% Noise)
+        data_p3 = self.generate_poissonian_events(U_true, num_events=300000, duration=1.5, bg_fraction=0.20)
+
+        # Concatenate the streams and shift times to be continuous
+        q_lab = np.concatenate([data_p1[0], data_p2[0], data_p3[0]])
+        
+        times_p2 = data_p2[1] + data_p1[1][-1]
+        times_p3 = data_p3[1] + times_p2[-1]
+        times = np.concatenate([data_p1[1], times_p2, times_p3])
+        
+        banks = np.concatenate([data_p1[2], data_p2[2], data_p3[2]])
+        pixels_r = np.concatenate([data_p1[3], data_p2[3], data_p3[3]])
+        pixels_c = np.concatenate([data_p1[4], data_p2[4], data_p3[4]])
+        
+        sim_data_flash = (q_lab, times, banks, pixels_r, pixels_c)
+        event_stream = self.get_fake_batches(sim_data_flash, batch_size=10000)
+
+        # Telemetry storage for assertions
+        recorded_taus = []
+        recorded_errors = []
+
+        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
+            current_tau = metrics.get('tau', 0.0) # Ensure "tau": float(current_tau) is in metrics_dict!
+            
+            recorded_taus.append((time, current_tau))
+            recorded_errors.append((time, err))
+            
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Tau={current_tau:.4f}")
+
+        final_U = run_bingham_tracker(
+            finder_file=self.finder_file,
+            event_batches=event_stream,
+            sigma_q_start=1.0,
+            sigma_q_min=0.05,
+            annealing_rate=3e-4,
+            gamma_step=100.0,
+            gamma_event=1e-4, # Prevent infinite inertia
+            kappa_init=1.0,
+            n_ensemble=1,
+            streaming_callback=streaming_callback,
+            gamma_c=1e-4,     # Enable SOC
+            bg_ema_weight=0.85  # <--- Decrease thermal inertia for rapid recovery!
+        )
+
+        # --- THERMODYNAMIC ASSERTIONS ---
+        times_arr = np.array([t[0] for t in recorded_taus])
+        taus_arr = np.array([t[1] for t in recorded_taus])
+        errs_arr = np.array([e[1] for e in recorded_errors])
+
+        # Extract phase slices
+        phase1_mask = times_arr <= 1.5
+        phase2_mask = (times_arr > 1.5) & (times_arr <= 3.5)
+        phase3_mask = times_arr > 3.5
+
+        tau_p1_mean = np.mean(taus_arr[phase1_mask][-5:]) # End of P1
+        tau_p2_peak = np.max(taus_arr[phase2_mask])       # Peak of Flash
+        tau_p3_mean = np.mean(taus_arr[phase3_mask][-5:]) # End of P3
+
+        max_err_during_flash = np.max(errs_arr[phase2_mask])
+        final_err = errs_arr[-1]
+
+        # 1. Did the tracker heat up to survive the flash?
+        self.assertGreater(tau_p2_peak, tau_p1_mean * 1.3,
+                           f"SOC Failure: Tau did not surge during flash. P1: {tau_p1_mean:.4f}, Flash Peak: {tau_p2_peak:.4f}")
+
+        # 2. Did the tracker cool down after the flash?
+        self.assertLess(tau_p3_mean, tau_p2_peak * 0.8, 
+                        f"SOC Failure: Tau did not cool down after flash. Flash Peak: {tau_p2_peak:.4f}, P3: {tau_p3_mean:.4f}")
+
+        # 3. Did the tracker maintain topological lock during the flash? (Didn't shatter)
+        self.assertLess(max_err_during_flash, 15.0, 
+                        f"Tracking Failure: The flash shattered the tracker (Max Error {max_err_during_flash:.2f}° >= 15.0°)")
+
+        # 4. Did it recover absolute precision?
+        self.assertLess(final_err, 2.0, 
+                        f"Tracking Failure: Failed to regain precision after flash (Final Error {final_err:.2f}° >= 2.0°)")
 if __name__ == '__main__':
     unittest.main()
