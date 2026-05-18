@@ -1370,8 +1370,7 @@ def run_bingham_tracker(
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
     annealing_rate: float = 0.5,
-    gamma_event: float = 1e-5,   # Determines the memory window (e.g. 1e-5 = 100,000 neutrons)
-    gamma_step: float = 100.0,   # Determines uncertainty injection per radian of motor movement
+    gamma_step: float = 100.0,   # Kinematic Annihilation: Decay per radian of motor movement
     kappa_init: float = 100.0,
     h_max: int = 6,
     n_ensemble: int = 1,
@@ -1382,10 +1381,11 @@ def run_bingham_tracker(
     loss_ema_weight: float = 0.05,
     wl_min_tracking: float = 0.0,
     wl_max_tracking: float = 12.0,
-    max_rate_hz: float = np.inf, # FIXED: Opened gate for physical beamline
+    max_rate_hz: float = np.inf,
     max_gpu_batch_size: int = 2048,
     L_max = 8,
-    spectral_tau = 0.05,
+    gamma_event: float = 1e-5,   # The baseline Epsilon drift (e.g. 1e-5 = memory of 100k events)
+    gamma_c = 0.005,             # Critical Diffusion Gain for Self-Organized Criticality
 ):
     apply_detector_calibration(finder_file, instrument_name)
 
@@ -1397,29 +1397,41 @@ def run_bingham_tracker(
     import scipy.special
 
     import e3nn_jax as e3nn
-    
+
     irreps_str = " + ".join([f"{l}e" if l % 2 == 0 else f"{l}o" for l in range(L_max + 1)])
     sh_irreps = e3nn.Irreps(irreps_str)
 
     # ====================================================================
-    # THE SO(3) HEAT KERNEL
+    # GLOBAL CONTINUOUS VACUUM INITIALIZATION
     # ====================================================================
-    # Build the exact analytical attenuation vector for the Wigner-D irreps.
-    # Each degree 'l' has (2l + 1) coefficients.
-    hk_coeffs = []
+    num_coeffs = sum(2 * l + 1 for l in range(L_max + 1))
+    C_spectral_state = jnp.zeros(num_coeffs)
+
+    laplacian_eigenvalues = []
     for l in range(L_max + 1):
-        attenuation = np.exp(-spectral_tau * l * (l + 1))
-        hk_coeffs.extend([attenuation] * (2 * l + 1))
-    
-    heat_kernel_jax = jnp.array(hk_coeffs)
-    
+        laplacian_eigenvalues.extend([l * (l + 1)] * (2 * l + 1))
+    laplacian_jax = jnp.array(laplacian_eigenvalues)
+
     @jax.jit
-    def compute_C_exp(q_batch):
-        # 1. Convert discrete neutrons to continuous spherical waves
-        Y_exp = e3nn.spherical_harmonics(sh_irreps, q_batch, normalize=True).array
-        
-        # 2. Sum the batch (N) AND apply the Heat Kernel diffusion
-        return jnp.sum(Y_exp, axis=0) * heat_kernel_jax
+    def evolve_vacuum_sde(C_prev, q_batch, lambda_short_scalar, dt, tau):
+        """
+        Gridless Spectral-Galerkin update using the KS Continuous Sink.
+        """
+        # --- TERM 2: Low-Frequency Ewald Pull ---
+        Y_exp_batch = e3nn.spherical_harmonics(sh_irreps, q_batch, normalize=True).array
+        ewald_pull = jnp.sum(Y_exp_batch, axis=0) / jnp.maximum(dt, 1e-9)
+
+        # --- TERM 3: The KS Scalar Sink (Uniform Drain) ---
+        ks_sink = lambda_short_scalar * C_prev
+
+        # Explicit update: Add the pull, subtract the sink
+        C_explicit = C_prev + (ewald_pull * dt) - (ks_sink * dt)
+
+        # --- TERM 1: Diagonal Heat Decay (Implicit Fokker-Planck) ---
+        implicit_denom = 1.0 + (lambda_short_scalar * dt) + (tau * laplacian_jax * dt)
+        C_new = C_explicit / implicit_denom
+
+        return C_new
 
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
 
@@ -1478,26 +1490,20 @@ def run_bingham_tracker(
     q_min_tracking = 1.0 / d_max
     q_max_tracking = 1/max(d_min, 1e-6)
 
-    # Strictly bound the tracking grid to the healthy mid-Q range
     res_mask = (q_mags_np < q_max_tracking) & (q_mags_np > q_min_tracking)
-
     q_theo_cryst = q_theo_cryst[:, res_mask]
     q_mags_np = q_mags_np[res_mask]
 
-    # Now push the filtered arrays to JAX
     q_theo_cryst_jax = jnp.array(q_theo_cryst)
     q_mags_jax = jnp.array(q_mags_np)
     q_theo_sample_jax = q_theo_cryst_jax / jnp.where(q_mags_jax == 0, 1.0, q_mags_jax)
 
-    ub_helper.ki_vec = np.array([0.0, 0.0, 1.0]) # Default assumption if loader passed explicitly
+    ub_helper.ki_vec = np.array([0.0, 0.0, 1.0])
     ki_vec_jax = jnp.array(ub_helper.ki_vec)
     ki_vec_jax = ki_vec_jax / (jnp.linalg.norm(ki_vec_jax) + 1e-9)
 
-    print(f"  > Generated {q_theo_sample_jax.shape[1]} valid theoretical Bragg directions.")
-
     lambda_max_jax = 4.0 * jnp.pi / (q_mags_jax + 1e-9)
 
-    # --- NUMERICALLY STABLE LOG-NORMALIZATION ---
     expected_noise_ll = float(np.log(1.0 / (4.0 * np.pi)))
     print(f"  > Exact Spherical Background Noise Floor (Log-Likelihood): {expected_noise_ll:.2f}")
 
@@ -1528,7 +1534,7 @@ def run_bingham_tracker(
         ], axis=0)
 
     @jax.jit
-    def process_chunk(A_prev, A_seed, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, C_exp, current_sigma_q, delta_angle):
+    def process_chunk(A_prev, A_seed, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, C_spectral_in, current_sigma_q, delta_angle, current_tau, gamma_event):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
 
@@ -1536,29 +1542,25 @@ def run_bingham_tracker(
         r = vecs[:, -1]
         U = quaternion_to_rotation_matrix(r)
 
-        mu_theo = jnp.matmul(U, q_theo_sample_jax).T 
+        mu_theo = jnp.matmul(U, q_theo_sample_jax).T
 
         q_mean = jnp.mean(q_mags_jax)
         q_norm = q_mags_jax / q_mean
-        kappa_j = jnp.clip((q_norm ** 2) / (current_sigma_q ** 2), 1e-6, 1e6) 
-        
-        # ====================================================================
-        # THE SPECTRAL E-STEP (Native Extensive Scaling)
-        # ====================================================================
+        kappa_j = jnp.clip((q_norm ** 2) / (current_sigma_q ** 2), 1e-6, 1e6)
+
         q_dot_ki_theo = jnp.dot(mu_theo, ki_batch[0])
         lambda_theo = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
-        
+
         valid_wl_theo = (lambda_theo > 0.0) & (lambda_theo < float(wl_max_tracking))
         safety_penalty_theo = jnp.where(valid_wl_theo, 0.0, -1e9)
         wl_idx_theo = jnp.clip(jnp.floor(lambda_theo * 10.0).astype(jnp.int32), 0, int(num_wl_bins) - 1)
-        
+
         wl_pdf_spectral = wl_hist_prev / jnp.sum(wl_hist_prev)
         peak_weights_spectral = jnp.exp(jnp.log(wl_pdf_spectral)[wl_idx_theo] + safety_penalty_theo)
-        
+
         extensive_peak_weights = peak_weights_spectral * kappa_j
-        
         Y_theo = e3nn.spherical_harmonics(sh_irreps, mu_theo, normalize=True).array
-        
+
         # --------------------------------------------------------------------
         # EXACT CONVOLUTION (Spectral-Galerkin Interaction)
         # --------------------------------------------------------------------
@@ -1579,60 +1581,45 @@ def run_bingham_tracker(
         # continuous SO(3) cross-correlation exactly at coordinate U is algebraically 
         # identical to contracting the unrotated vacuum wave C_exp with the rotated 
         # structural harmonics Y_theo.
+
+
         spectral_nll_sum = 0.0
         idx = 0
         for l in range(L_max + 1):
             dim = 2 * l + 1
             Y_theo_l = Y_theo[:, idx:idx+dim]
-            C_exp_l = C_exp[idx:idx+dim]
-            
-            # The l-degree term of the correlation evaluated at orientation U
+            C_exp_l = C_spectral_in[idx:idx+dim]
+
             spectral_nll_sum += jnp.sum(jnp.dot(Y_theo_l, C_exp_l) * extensive_peak_weights)
             idx += dim
-            
+
         spectral_nll = -spectral_nll_sum
-        # ====================================================================
 
-        # ====================================================================
-        # THE LEVER ARM EFFECT & ANALYTICAL EWALD SPLIT
-        # ====================================================================
-        
-        # 1. True Precision (Real Space)
         log_vmf_norm_j = jnp.log(kappa_j / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_j))
-        
-        # 2. Heat-Attenuated Precision (Fourier Space Equivalent)
-        kappa_tilde = kappa_j / (1.0 + 2.0 * spectral_tau * kappa_j)
-        log_vmf_norm_tilde = jnp.log(kappa_tilde / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_tilde))
-        # ====================================================================
 
-        # ====================================================================
-        # --- 2D SPHERICAL EMPIRICAL BACKGROUND (64 x 64 Bins) ---
-        # 1. Polar coordinate (Z-axis scattering depth, range [-1, 1])
+        # Use dynamic SOC Tau for heat attenuation
+        kappa_tilde = kappa_j / (1.0 + 2.0 * current_tau * kappa_j)
+        log_vmf_norm_tilde = jnp.log(kappa_tilde / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_tilde))
+
         u_batch = q_batch[:, 2]
-        # 2. Azimuthal coordinate (XY plane rotation, range [-pi, pi])
         v_batch = jnp.arctan2(q_batch[:, 1], q_batch[:, 0])
 
-        # Map to 64x64 Grid
         u_idx_batch = jnp.clip(jnp.floor((u_batch + 1.0) * 63.999).astype(jnp.int32), 0, 63)
         v_idx_batch = jnp.clip(jnp.floor((v_batch + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
 
         flat_idx_batch = u_idx_batch * 64 + v_idx_batch
         raw_hist = jnp.bincount(flat_idx_batch, length=4096)
 
-        # --- THE CONFIGURABLE EMA ---
         bg_hist_new = bg_ema_weight * bg_hist_prev + (1.0 - bg_ema_weight) * raw_hist
         smoothed_hist = bg_hist_new + 1.0
 
-        # Normalize to 2D Solid Angle PDF
         d_omega = (2.0 / 64.0) * (2.0 * jnp.pi / 64.0)
         bg_pdf = smoothed_hist / (jnp.sum(smoothed_hist) * d_omega)
         bg_log_pdf_flat = jnp.log(bg_pdf)
 
-        # Pass the dynamic limits into JAX
         wl_max_jax = float(wl_max_tracking)
         num_bins_jax = int(num_wl_bins)
 
-        # --- 1D EMPIRICAL SIGNAL SPECTRUM ---
         wl_pdf = wl_hist_prev / jnp.sum(wl_hist_prev)
         wl_log_pdf = jnp.log(wl_pdf)
 
@@ -1648,10 +1635,7 @@ def run_bingham_tracker(
             wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
             learned_wl_prior = wl_log_pdf[wl_idx]
 
-            # Evaluate Exact M-Step
             peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_vmf_norm_j + learned_wl_prior + safety_penalty
-            
-            # Evaluate Smoothed E-Step Equivalent
             peak_log_lik_tilde = kappa_tilde * (cos_theta_err - 1.0) + log_vmf_norm_tilde + learned_wl_prior + safety_penalty
 
             u_exp = q_exp[2]
@@ -1661,13 +1645,12 @@ def run_bingham_tracker(
 
             dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
 
-            # --- THE ANALYTICAL EWALD SUBTRACTION ---
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
             log_Z_tilde = jax.scipy.special.logsumexp(jnp.append(peak_log_lik_tilde, dynamic_bg_log_lik))
-            
-            # E_short = E_total - E_long = (-log_Z) - (-log_Z_tilde)
-            # Enforce Ewald short-range constraint (must be <= 0)
-            e_short_event = jnp.minimum(0.0, log_Z_tilde - log_Z)
+
+            # --- UNCLIPPED RESIDUAL ---
+            # Native statistical mechanics: retains repulsive noise bumps in the Free Energy
+            e_short_event = log_Z_tilde - log_Z
 
             w = jnp.exp(peak_log_lik - log_Z)
             w_sum = jnp.sum(w)
@@ -1691,13 +1674,9 @@ def run_bingham_tracker(
 
         signal_count = jnp.sum(w_sum_batch)
 
-        # Bin them into the grid directly from the mapped arrays!
         wl_idx_batch = jnp.floor(actual_lambdas_batch * 10.0).astype(jnp.int32)
-
-        # STRICT EXCLUSION MASK: Must be a confident signal AND physically possible
         valid_bin_mask = is_signal_batch & (actual_lambdas_batch > 0.0) & (actual_lambdas_batch < wl_max_jax)
 
-        # Dump invalid wavelengths into an unused n+1 bin, then slice it off!
         raw_wl_hist = jnp.bincount(
             jnp.where(valid_bin_mask, wl_idx_batch, num_bins_jax),
             length=num_bins_jax + 1
@@ -1705,25 +1684,20 @@ def run_bingham_tracker(
 
         wl_hist_new = bg_ema_weight * wl_hist_prev + (1.0 - bg_ema_weight) * raw_wl_hist + 1e-3
 
-        decay_event = jnp.exp(-gamma_event * num_events)
-        decay_step = jnp.exp(-gamma_step * delta_angle)
-        decay_total = decay_event * decay_step
-
+        # The exact implementation of Gamma*(t) = alpha * w(t) + epsilon
+        decay_total = jnp.exp(-(gamma_step * delta_angle + gamma_event * num_events))
+        
         A_diffused = A_prev * decay_total
 
         F_mean = jnp.sum(A_F_batch, axis=0) / jnp.maximum(num_events, 1e-9)
         F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
 
-        # THE HARDWARE ANOMALY GATE
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         total_rate = num_events / dt_chunk
-
-        # If the rate is physically impossible, it's a DAQ glitch/flash.
         is_valid_batch = total_rate < max_rate_hz
 
-        # Conditionally update the state. If invalid, keep the previous state!
-        # The (F_mean + A_seed) blend ensures the matrix never drops below the initial indexing confidence.
         A_updated = A_diffused + (F_mean + A_seed) * (1.0 - decay_total)
+
         A_new = jnp.where(is_valid_batch, A_updated, A_prev)
 
         bg_hist_out = jnp.where(is_valid_batch, bg_hist_new, bg_hist_prev)
@@ -1732,7 +1706,6 @@ def run_bingham_tracker(
         vals_new = jnp.linalg.eigvalsh(A_new)
         norm_gap = vals_new[-1] - vals_new[-2]
 
-        dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
@@ -1741,9 +1714,8 @@ def run_bingham_tracker(
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, 0, 0, 0, None, None, None, None, None, None),
-            # Added one extra '0' for the newly returned spectral_nll array
-            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0, 0, 0) 
+            in_axes=(0, 0, 0, 0, None, None, None, None, None, None, None, None),
+            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0, 0, 0)
         )
     )
 
@@ -1754,7 +1726,6 @@ def run_bingham_tracker(
     r_random = r_random / jnp.linalg.norm(r_random, axis=1, keepdims=True)
     U_ensemble = jax.vmap(quaternion_to_rotation_matrix)(r_random)
 
-    # Find this block and remove steady_state_scale_init!
     C_ensemble = kappa_init * U_ensemble
     A_ensemble_state = jax.vmap(compute_A_from_C)(C_ensemble)
 
@@ -1765,7 +1736,6 @@ def run_bingham_tracker(
 
     bg_hist_ensemble = jnp.ones((n_ensemble, 4096)) * 1.0
 
-    # Dynamically scale bins (10 bins per Angstrom)
     num_wl_bins = int(wl_max_tracking * 10.0)
     wl_hist_ensemble = jnp.ones((n_ensemble, num_wl_bins)) * 1.0
 
@@ -1773,12 +1743,12 @@ def run_bingham_tracker(
     t_start = None
     t_state = 0.0
 
-    # Initialize the decoupled annealing clock!
     effective_annealing_count = 0.0
     angles_prev = None
 
     smoothed_spectral_ensemble = None
     smoothed_eshort_ensemble = None
+    ema_bg_rate = 1.0
 
     for batch_data in event_batches:
         q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
@@ -1789,7 +1759,6 @@ def run_bingham_tracker(
 
         dt_wall = float(t_batch_np[-1] - t_state)
 
-        # Track Goniometer changes for discrete step-decay!
         angles_curr = angles_np[-1]
         if angles_prev is None:
             delta_angle = 0.0
@@ -1797,25 +1766,16 @@ def run_bingham_tracker(
             delta_angle = float(np.linalg.norm(angles_curr - angles_prev))
         angles_prev = angles_curr
 
-        # Calculate the batch rate to control the annealing schedule
         num_events = len(q_batch_np)
         dt_chunk_py = max(1e-4, float(t_batch_np[-1] - t_batch_np[0]))
         total_rate_py = num_events / dt_chunk_py
 
-        # Only advance the annealing clock if it's a valid physical batch!
         if total_rate_py < max_rate_hz:
             effective_annealing_count += num_events
 
-        # Calculate sigma_q using the FROZEN effective count, not the raw cumulative count
         current_sigma_q = max(
             sigma_q_min,
             sigma_q_start * np.exp(-annealing_rate * effective_annealing_count)
-        )
-
-        # Calculate sigma_q using the cumulative neutron count
-        current_sigma_q = max(
-            sigma_q_min,
-            sigma_q_start * np.exp(-annealing_rate * cumulative_count)
         )
 
         q_batch = jax.device_put(q_batch_np)
@@ -1825,15 +1785,32 @@ def run_bingham_tracker(
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
-        # Compute the experimental wave ONCE per batch on the GPU
-        C_exp = compute_C_exp(q_batch) 
-        
-        # Extract both loss arrays
+        # --------------------------------------------------------------------
+        # SOC: Adaptive Tau based on running background flux
+        # --------------------------------------------------------------------
+        current_tau = gamma_c * jnp.sqrt(ema_bg_rate + 1.0)
+
         A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eshort_ensemble, spectral_losses, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
-            A_ensemble_state, A_ensemble_state_seeds, bg_hist_ensemble, wl_hist_ensemble, q_batch, ki_batch, t_batch, C_exp, current_sigma_q, delta_angle
+            A_ensemble_state, A_ensemble_state_seeds, bg_hist_ensemble, wl_hist_ensemble,
+            q_batch, ki_batch, t_batch, C_spectral_state, current_sigma_q, delta_angle, current_tau, gamma_event
         )
 
-        # Extract and smooth the active Ewald tracking arrays
+        # Update EMA background rate for next cycle's Tau
+        current_mean_bg = float(np.mean(bg_rates))
+        ema_bg_rate = bg_ema_weight * ema_bg_rate + (1.0 - bg_ema_weight) * current_mean_bg
+
+        # --------------------------------------------------------------------
+        # The KS Scalar Sink: Sum total signal extraction across the ensemble
+        # --------------------------------------------------------------------
+        total_lambda_short = jnp.sum(sig_rates)
+
+        # --------------------------------------------------------------------
+        # Evolve the Continuous Vacuum Field
+        # --------------------------------------------------------------------
+        C_spectral_state = evolve_vacuum_sde(
+            C_spectral_state, q_batch, total_lambda_short, dt_chunk_py, current_tau
+        )
+
         spectral_losses_np = np.array(spectral_losses)
         eshort_ensemble_np = np.array(eshort_ensemble)
 
@@ -1844,17 +1821,10 @@ def run_bingham_tracker(
             smoothed_eshort_ensemble = (1.0 - loss_ema_weight) * smoothed_eshort_ensemble + loss_ema_weight * eshort_ensemble_np
             smoothed_spectral_ensemble = (1.0 - loss_ema_weight) * smoothed_spectral_ensemble + loss_ema_weight * spectral_losses_np
 
-        # ====================================================================
-        # THE EXACT ANALYTICAL EWALD ADDITION
-        # ====================================================================
         unified_ewald_energy = smoothed_spectral_ensemble + smoothed_eshort_ensemble
         best_idx = int(np.argmin(unified_ewald_energy))
-        # ====================================================================
 
-        # Convert NLL losses to probability weights
         ensemble_weights = jax.nn.softmax(-loss_ensemble)
-
-        # Take a weighted average of the histograms
         wl_hist_weighted = jnp.sum(wl_hist_ensemble * ensemble_weights[:, None], axis=0)
         wl_hist_ensemble = jnp.broadcast_to(wl_hist_weighted, wl_hist_ensemble.shape)
 
@@ -1868,15 +1838,15 @@ def run_bingham_tracker(
         current_bg_rate = float(bg_rates[best_idx])
 
         if cumulative_count % 50000 < len(t_batch_np):
-            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Step-Rot: {delta_angle:.4f} rad | Norm-Gap: {best_gap:8.2f}")
+            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Step-Rot: {delta_angle:.4f} rad | Norm-Gap: {best_gap:8.2f} | Tau: {float(current_tau):.4f}")
 
         if streaming_callback is not None:
             new_events = {
                 "banks": banks_np,
                 "pixel_r": pr_np,
                 "pixel_c": pc_np,
-                "angles": angles_np, # Shape: (batch_size, num_axes)
-                "s_lab": slab_np     # Shape: (batch_size, 3)
+                "angles": angles_np,
+                "s_lab": slab_np
             }
 
             metrics_dict = {
@@ -1884,7 +1854,6 @@ def run_bingham_tracker(
                 "eigengap": best_gap,
                 "sig_rate": current_sig_rate,
                 "bg_rate": current_bg_rate,
-                "gamma": gamma_event, # Passed statically to not break the UI dashboard
                 "sigma_q": current_sigma_q,
                 "bg_pdf": np.array(bg_pdfs[best_idx]).reshape((64, 64)),
                 "wl_hist": np.array(wl_hist_ensemble[best_idx]),

@@ -111,45 +111,6 @@ class TestBinghamTracker(unittest.TestCase):
 
         return q_lab, times, banks, pixels_r, pixels_c
 
-    def test_wilson_intensity_modulation(self):
-        print(f"\n{'='*60}\nExecuting Regression: WILSON INTENSITY MODULATION (Low-Q Preference)\n{'='*60}")
-
-        U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
-        U_seed = Rotation.from_euler('y', 40.0, degrees=True).as_matrix()
-
-        with h5py.File(self.finder_file, "w") as f:
-            f["sample/a"], f["sample/b"], f["sample/c"] = 10.0, 10.0, 10.0
-            f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = 90.0, 90.0, 90.0
-            f["sample/space_group"] = b"P 1"
-            f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
-            f["sample/U"] = U_seed
-
-        # b_factor=0.5 causes extreme exponential decay of intensity at high-q
-        sim_data = self.generate_poissonian_events(
-            U_true, num_events=1000000, duration=5.0, b_factor=0.5
-        )
-        event_stream = self.get_fake_batches(sim_data, batch_size=10000)
-
-        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
-            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
-            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
-
-        final_U = run_bingham_tracker(
-            finder_file=self.finder_file,
-            event_batches=event_stream,
-            sigma_q_start=1.0,
-            sigma_q_min=0.02,
-            annealing_rate=3e-4,
-            gamma_event=1e-4,
-            gamma_step=100.0,
-            kappa_init=1.0,
-            n_ensemble=1,
-            streaming_callback=streaming_callback
-        )
-
-        final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
-        self.assertLess(final_err, 2.0, f"Wilson Modulation failed to converge: Final Error {final_err:.2f}° >= 2.0°")
-
     def get_fake_batches(self, sim_data, batch_size=10000):
         """Yields streaming tuples exactly matching the EventStreamLoader signature."""
         q_lab, times, banks, pixels_r, pixels_c = sim_data
@@ -180,6 +141,43 @@ class TestBinghamTracker(unittest.TestCase):
             min_err_deg = min(min_err_deg, err_deg)
         return min_err_deg
 
+    def test_wilson_intensity_modulation(self):
+        print(f"\n{'='*60}\nExecuting Regression: WILSON INTENSITY MODULATION (Low-Q Preference)\n{'='*60}")
+
+        U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
+        U_seed = Rotation.from_euler('y', 40.0, degrees=True).as_matrix()
+
+        with h5py.File(self.finder_file, "w") as f:
+            f["sample/a"], f["sample/b"], f["sample/c"] = 10.0, 10.0, 10.0
+            f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = 90.0, 90.0, 90.0
+            f["sample/space_group"] = b"P 1"
+            f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+            f["sample/U"] = U_seed
+
+        sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, b_factor=0.5)
+        event_stream = self.get_fake_batches(sim_data, batch_size=10000)
+
+        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
+
+        final_U = run_bingham_tracker(
+            finder_file=self.finder_file,
+            event_batches=event_stream,
+            sigma_q_start=1.0,
+            sigma_q_min=0.02,
+            annealing_rate=3e-4,
+            gamma_step=100.0,
+            kappa_init=1.0,
+            n_ensemble=1,
+            streaming_callback=streaming_callback,
+            gamma_event=1e-4,
+            gamma_c=0.05  # bg=0.0 -> Tau = 0.05 * sqrt(1) = 0.05
+        )
+
+        final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
+        self.assertLess(final_err, 2.0, f"Wilson Modulation failed to converge: Final Error {final_err:.2f}° >= 2.0°")
+
     def test_local_capture(self):
         print(f"\n{'='*60}\nExecuting Regression: LOCAL CAPTURE (Seed Err: 5.0°)\n{'='*60}")
         
@@ -204,13 +202,14 @@ class TestBinghamTracker(unittest.TestCase):
             finder_file=self.finder_file,
             event_batches=event_stream,
             sigma_q_start=1.0,   
-            sigma_q_min=0.02,    # Match simulated peak width closer
+            sigma_q_min=0.02,    
             annealing_rate=3e-6,
-            gamma_event=1e-4,    # Fast learning rate for clean local capture
             gamma_step=100.0,
             kappa_init=1.0,
             n_ensemble=1, 
-            streaming_callback=streaming_callback
+            streaming_callback=streaming_callback,
+            gamma_event=1e-4,
+            gamma_c=0.05  # bg=0.0 -> Tau = 0.05 * sqrt(1) = 0.05
         )
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
@@ -240,14 +239,15 @@ class TestBinghamTracker(unittest.TestCase):
             finder_file=self.finder_file,
             event_batches=event_stream,
             sigma_q_start=1.0,   
-            sigma_q_min=0.05,    # Keep capture funnel wide enough for physical peaks!
+            sigma_q_min=0.05,    
             annealing_rate=3e-4,
-            gamma_event=1e-4,    # Fast learning rate to let the ensemble collapse and move!
             gamma_step=100.0,
             kappa_init=1.0,
             n_ensemble=256, 
             streaming_callback=streaming_callback,
             L_max=8,
+            gamma_event=1e-4,
+            gamma_c=0.05
         )
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
@@ -278,13 +278,14 @@ class TestBinghamTracker(unittest.TestCase):
             finder_file=self.finder_file,
             event_batches=event_stream,
             sigma_q_start=1.0,   
-            sigma_q_min=0.05,    # Don't starve SDE by shrinking smaller than physics
+            sigma_q_min=0.05,    
             annealing_rate=3e-4,
-            gamma_event=1e-4,    # Agile enough to rotate 5 degrees in 5 seconds
             gamma_step=100.0,
             kappa_init=1.0,
             n_ensemble=1,        
-            streaming_callback=streaming_callback
+            streaming_callback=streaming_callback,
+            gamma_event=1e-4,
+            gamma_c=1e-4  # bg=160kHz -> Tau = 1e-4 * sqrt(160000) = 0.04
         )
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
@@ -310,25 +311,22 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Spectral-NLL={mean_loss:.2f}")
 
-        # The funnel is 0.005. The 128 random trackers will ALL be completely blind.
-        # The Local M-Step F_mean will be 0. They will sit perfectly still at their random seeds.
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             sigma_q_start=0.005,  # Razor thin!
             sigma_q_min=0.005,
             annealing_rate=0.0,   # No annealing needed
-            gamma_event=0.0,      # Disable SDE diffusion
             gamma_step=0.0,
             kappa_init=100.0,
             n_ensemble=128,
             streaming_callback=streaming_callback,
+            gamma_event=0.0, # disable SDE diffusion
+            gamma_c=0.05  # bg=0.0 -> Tau = 0.05 * sqrt(1) = 0.05
         )
 
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
         
-        # With Spectral NLL selecting the winner, the ensemble confidently picks Tracker 0, 
-        # which is exactly 30 degrees away. Without it, it picks at random (~60+ deg).
         self.assertLess(final_err, 31.0, f"Spectral E-Step failed to select Tracker 0. Error {final_err:.2f}°")
 
 if __name__ == '__main__':
