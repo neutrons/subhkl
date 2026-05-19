@@ -1562,37 +1562,17 @@ def run_bingham_tracker(
         Y_theo = e3nn.spherical_harmonics(sh_irreps, mu_theo, normalize=True).array
 
         # --------------------------------------------------------------------
-        # EXACT CONVOLUTION (Spectral-Galerkin Interaction)
+        # EXACT CONVOLUTION (Gridless Dirac Point Evaluation)
         # --------------------------------------------------------------------
-        # To compute the exact interaction energy without a spatial grid, we 
-        # couple the theoretical structure (Y_theo) and the experimental 
-        # vacuum wave (C_exp) in the spectral domain.
-        #
-        # TODO: Try the Gridless Dirac Point Evaluation next. By treating the 
-        # Bingham particle as a Dirac delta at U, this tensor product algebraic 
-        # collapse allows O(1) point-evaluation: 
-        # jnp.sum(jnp.dot(Y_theo, C_exp) * extensive_peak_weights)
-        # (If that formulation fails to stabilize, we will implement a fast 
-        # SO(3) FFT (SOFT) over a coarse grid later).
-        # --------------------------------------------------------------------
+        # By treating the Bingham tracking particle as a Dirac delta at orientation U,
+        # the infinite-dimensional spatial integral collapses into O(1) point-evaluation.
+        # We simply evaluate the spatial amplitude of the continuous vacuum wave 
+        # exactly at the rotated coordinates of the theoretical Bragg peaks.
         
-        # We perform the exact l-by-l block spherical tensor contraction.
-        # By the rotation properties of spherical harmonics, evaluating the 
-        # continuous SO(3) cross-correlation exactly at coordinate U is algebraically 
-        # identical to contracting the unrotated vacuum wave C_exp with the rotated 
-        # structural harmonics Y_theo.
-
-
-        spectral_nll_sum = 0.0
-        idx = 0
-        for l in range(L_max + 1):
-            dim = 2 * l + 1
-            Y_theo_l = Y_theo[:, idx:idx+dim]
-            C_exp_l = C_spectral_in[idx:idx+dim]
-
-            spectral_nll_sum += jnp.sum(jnp.dot(Y_theo_l, C_exp_l) * extensive_peak_weights)
-            idx += dim
-
+        # A single BLAS batched matrix-vector product replaces the unrolled L-loop,
+        # preventing JAX from fragmenting the VRAM graph across 1024 trackers.
+        spectral_nll_sum = jnp.sum(jnp.dot(Y_theo, C_spectral_in) * extensive_peak_weights)
+        
         spectral_nll = -spectral_nll_sum
 
         log_vmf_norm_j = jnp.log(kappa_j / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_j))
