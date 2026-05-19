@@ -1737,6 +1737,7 @@ def run_bingham_tracker(
 
     smoothed_spectral_ensemble = None
     smoothed_eshort_ensemble = None
+    smoothed_loss_ensemble = None
     ema_bg_rate = 1.0
 
     for batch_data in event_batches:
@@ -1820,16 +1821,20 @@ def run_bingham_tracker(
 
         spectral_losses_np = np.array(spectral_losses)
         eshort_ensemble_np = np.array(eshort_ensemble)
+        loss_ensemble_np = np.array(loss_ensemble)
 
         if smoothed_eshort_ensemble is None:
             smoothed_eshort_ensemble = eshort_ensemble_np
             smoothed_spectral_ensemble = spectral_losses_np
+            smoothed_loss_ensemble = loss_ensemble_np
         else:
             smoothed_eshort_ensemble = (1.0 - loss_ema_weight) * smoothed_eshort_ensemble + loss_ema_weight * eshort_ensemble_np
             smoothed_spectral_ensemble = (1.0 - loss_ema_weight) * smoothed_spectral_ensemble + loss_ema_weight * spectral_losses_np
+            smoothed_loss_ensemble = (1.0 - loss_ema_weight) * smoothed_loss_ensemble + loss_ema_weight * loss_ensemble_np
 
-        unified_ewald_energy = smoothed_spectral_ensemble + smoothed_eshort_ensemble
-        best_idx = int(np.argmin(unified_ewald_energy))
+        # The LogSumExp (-loss_ensemble) is identically the Log-Partition Function.
+        # It natively and perfectly balances Potential Energy and Shannon Entropy.
+        best_idx = int(np.argmin(smoothed_loss_ensemble))
 
         ensemble_weights = jax.nn.softmax(-loss_ensemble)
         wl_hist_weighted = jnp.sum(wl_hist_ensemble * ensemble_weights[:, None], axis=0)

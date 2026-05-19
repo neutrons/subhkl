@@ -426,5 +426,54 @@ class TestBinghamTracker(unittest.TestCase):
         # 4. Did it recover absolute precision?
         self.assertLess(final_err, 2.0, 
                         f"Tracking Failure: Failed to regain precision after flash (Final Error {final_err:.2f}° >= 2.0°)")
+
+    def test_thermodynamic_entropy_stabilization(self):
+        print(f"\n{'='*60}\nExecuting Regression: THERMODYNAMIC ENTROPY STABILIZATION\n{'='*60}")
+        
+        U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
+        U_seed = Rotation.from_euler('y', 40.0, degrees=True).as_matrix()
+        
+        with h5py.File(self.finder_file, "w") as f:
+            f["sample/a"], f["sample/b"], f["sample/c"] = 10.0, 10.0, 10.0
+            f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = 90.0, 90.0, 90.0
+            f["sample/space_group"] = b"P 1"
+            f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+            f["sample/U"] = U_seed
+
+        # Simulate the "4-panel" scenario: Moderate background, but plenty of time to overfit.
+        sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, bg_fraction=0.98)
+        event_stream = self.get_fake_batches(sim_data, batch_size=10000)
+        
+        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
+            
+            # If you added entropy to your metrics_dict, we can print it for telemetry!
+            entropy = metrics.get('entropy', 0.0) 
+            
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Best-Idx={best_idx:3d} | Sym-Err={err:6.2f}° | Free-Energy={mean_loss:.2f} | Entropy={entropy:.2f}")
+
+        final_U = run_bingham_tracker(
+            finder_file=self.finder_file,
+            event_batches=event_stream,
+            sigma_q_start=1.0,   
+            sigma_q_min=0.05,    
+            annealing_rate=3e-4,
+            gamma_step=100.0,
+            kappa_init=1.0,
+            # MASSIVE ENSEMBLE: 63 trackers will actively hunt for narrow noise traps to trick the argmin
+            n_ensemble=64,       
+            streaming_callback=streaming_callback,
+            gamma_event=1e-4,
+            gamma_c=0.05
+        )
+        
+        final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
+        
+        self.assertLess(
+            final_err, 
+            2.0, 
+            f"Thermodynamic Collapse: The tracker overfit to a noise trap. (Final Error {final_err:.2f}° >= 2.0°)"
+        )
+
 if __name__ == '__main__':
     unittest.main()
