@@ -1821,15 +1821,18 @@ def run_bingham_tracker(
         ema_bg_rate = bg_ema_weight * ema_bg_rate + (1.0 - bg_ema_weight) * current_mean_bg
 
         # --------------------------------------------------------------------
-        # The KS Scalar Sink: Sum total signal extraction across the ensemble
+        # The KS Scalar Sink: Bayesian Expected Rate
         # --------------------------------------------------------------------
-        total_lambda_short = jnp.sum(sig_rates)
+        # The 256 trackers are independent hypotheses. We must drain the vacuum
+        # using the expected value of the signal rate across the ensemble.
+        ensemble_weights = jax.nn.softmax(-loss_ensemble)
+        expected_lambda_short = jnp.sum(sig_rates * ensemble_weights)
 
         # --------------------------------------------------------------------
-        # Evolve the Continuous Vacuum Field
+        # Evolve the Continuous Vacuum Field (Instantaneous Unitarity)
         # --------------------------------------------------------------------
         C_spectral_state = evolve_vacuum_sde(
-            C_spectral_state, q_batch, total_lambda_short, dt_chunk_py, current_tau
+            C_spectral_state, q_batch, expected_lambda_short, dt_chunk_py, current_tau
         )
 
         spectral_losses_np = np.array(spectral_losses)
