@@ -1684,24 +1684,28 @@ def run_bingham_tracker(
 
         wl_hist_new = bg_ema_weight * wl_hist_prev + (1.0 - bg_ema_weight) * raw_wl_hist + 1e-3
 
-        # The exact implementation of Gamma*(t) = alpha * w(t) + epsilon
+        # --- 1. Event-Unit Clock (Survives DAQ Artifacts) ---
+        # By using num_events, a 250k event burst safely steps the decay forward 
+        # instead of treating it as dt=0 and turning the matrix to concrete.
         decay_total = jnp.exp(-(gamma_step * delta_angle + gamma_event * num_events))
-        
-        A_diffused = A_prev * decay_total
 
-        # --- THE INTENSIVE SIGNAL FORCE ---
-        # Calculate the geometric precision of the *signal*, ignoring background volume.
-        # jnp.maximum(signal_count, 1.0) guarantees that if the batch is 100% noise, 
-        # F_pure safely evaluates to near-zero and the tracker correctly decays.
-        F_pure = jnp.sum(A_F_batch, axis=0) / jnp.maximum(signal_count, 1.0)
+        # --- 2. Intensive Signal Target (Survives 50 Panels) ---
+        # Extract the pure geometric force of the batch.
+        F_pure = jnp.sum(A_F_batch, axis=0)
         F_pure = F_pure - (jnp.trace(F_pure) / 4.0) * jnp.eye(4)
+
+        # Normalize STRICTLY by the signal count, not the total background volume!
+        # This prevents the 50-panel background from diluting the structural force to zero.
+        # We multiply by kappa_init to restore the physical magnitude of the target state.
+        safe_sig_count = jnp.maximum(signal_count, 1.0)
+        F_target = F_pure / safe_sig_count
 
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         total_rate = num_events / dt_chunk
         is_valid_batch = total_rate < max_rate_hz
 
-        # Update using the pure thermodynamic target
-        A_updated = A_diffused + (F_pure + A_seed) * (1.0 - decay_total)
+        # --- 3. Equilibrium Update ---
+        A_updated = (A_prev * decay_total) + (F_target + A_seed) * (1.0 - decay_total)
 
         A_new = jnp.where(is_valid_batch, A_updated, A_prev)
 
