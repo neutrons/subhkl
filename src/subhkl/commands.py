@@ -1619,15 +1619,21 @@ def run_bingham_tracker(
             wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
             learned_wl_prior = wl_log_pdf[wl_idx]
 
-            peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_vmf_norm_j + learned_wl_prior + safety_penalty
-            peak_log_lik_tilde = kappa_tilde * (cos_theta_err - 1.0) + log_vmf_norm_tilde + learned_wl_prior + safety_penalty
+            # --- 1. MIXTURE & DIMENSIONAL NORMALIZATION ---
+            num_peaks = float(q_theo_sample_jax.shape[1])
+            bg_wl_prior = jnp.log(1.0 / float(num_bins_jax))
+
+            # Subtract jnp.log(num_peaks) so the spatial mixture correctly integrates to 1.0
+            peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_vmf_norm_j + learned_wl_prior + safety_penalty - jnp.log(num_peaks)
+            peak_log_lik_tilde = kappa_tilde * (cos_theta_err - 1.0) + log_vmf_norm_tilde + learned_wl_prior + safety_penalty - jnp.log(num_peaks)
 
             u_exp = q_exp[2]
             v_exp = jnp.arctan2(q_exp[1], q_exp[0])
             u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 63.999).astype(jnp.int32), 0, 63)
             v_idx_exp = jnp.clip(jnp.floor((v_exp + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
 
-            dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp]])
+            # Add bg_wl_prior so background has BOTH spatial and wavelength densities
+            dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp] + bg_wl_prior])
 
             log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
             log_Z_tilde = jax.scipy.special.logsumexp(jnp.append(peak_log_lik_tilde, dynamic_bg_log_lik))
