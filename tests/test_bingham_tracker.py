@@ -166,12 +166,10 @@ class TestBinghamTracker(unittest.TestCase):
             event_batches=event_stream,
             sigma_q_start=1.0,
             sigma_q_min=0.02,
-            annealing_rate=3e-4,
             gamma_step=100.0,
             kappa_init=1.0,
             n_ensemble=1,
             streaming_callback=streaming_callback,
-            gamma_event=1e-4,
             gamma_c=0.05  # bg=0.0 -> Tau = 0.05 * sqrt(1) = 0.05
         )
 
@@ -203,12 +201,10 @@ class TestBinghamTracker(unittest.TestCase):
             event_batches=event_stream,
             sigma_q_start=1.0,   
             sigma_q_min=0.02,    
-            annealing_rate=3e-6,
             gamma_step=100.0,
             kappa_init=1.0,
             n_ensemble=1, 
             streaming_callback=streaming_callback,
-            gamma_event=1e-4,
             gamma_c=0.05  # bg=0.0 -> Tau = 0.05 * sqrt(1) = 0.05
         )
         
@@ -240,13 +236,11 @@ class TestBinghamTracker(unittest.TestCase):
             event_batches=event_stream,
             sigma_q_start=1.0,   
             sigma_q_min=0.05,    
-            annealing_rate=3e-4,
             gamma_step=100.0,
             kappa_init=1.0,
             n_ensemble=256, 
             streaming_callback=streaming_callback,
             L_max=8,
-            gamma_event=1e-4,
             gamma_c=0.05
         )
         
@@ -279,12 +273,10 @@ class TestBinghamTracker(unittest.TestCase):
             event_batches=event_stream,
             sigma_q_start=1.0,   
             sigma_q_min=0.05,    
-            annealing_rate=3e-4,
             gamma_step=100.0,
             kappa_init=1.0,
             n_ensemble=1,        
             streaming_callback=streaming_callback,
-            gamma_event=1e-4,
             gamma_c=1e-4  # bg=160kHz -> Tau = 1e-4 * sqrt(160000) = 0.04
         )
         
@@ -318,10 +310,10 @@ class TestBinghamTracker(unittest.TestCase):
             sigma_q_min=0.005,
             annealing_rate=0.0,   # No annealing needed
             gamma_step=0.0,
+            gamma_time=0.0, # disable SDE diffusion
             kappa_init=100.0,
             n_ensemble=128,
             streaming_callback=streaming_callback,
-            gamma_event=0.0, # disable SDE diffusion
             gamma_c=0.05  # bg=0.0 -> Tau = 0.05 * sqrt(1) = 0.05
         )
 
@@ -384,9 +376,7 @@ class TestBinghamTracker(unittest.TestCase):
             event_batches=event_stream,
             sigma_q_start=1.0,
             sigma_q_min=0.05,
-            annealing_rate=3e-4,
             gamma_step=100.0,
-            gamma_event=1e-4, # Prevent infinite inertia
             kappa_init=1.0,
             n_ensemble=1,
             streaming_callback=streaming_callback,
@@ -457,13 +447,11 @@ class TestBinghamTracker(unittest.TestCase):
             event_batches=event_stream,
             sigma_q_start=1.0,   
             sigma_q_min=0.05,    
-            annealing_rate=3e-4,
             gamma_step=100.0,
             kappa_init=1.0,
             # MASSIVE ENSEMBLE: 63 trackers will actively hunt for narrow noise traps to trick the argmin
             n_ensemble=64,       
             streaming_callback=streaming_callback,
-            gamma_event=1e-4,
             gamma_c=0.05
         )
         

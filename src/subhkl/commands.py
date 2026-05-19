@@ -1384,7 +1384,8 @@ def run_bingham_tracker(
     max_rate_hz: float = np.inf,
     max_gpu_batch_size: int = 2048,
     L_max = 8,
-    gamma_event: float = 1e-5,   # The baseline Epsilon drift (e.g. 1e-5 = memory of 100k events)
+    gamma_time: float = 1.0,   # The baseline Epsilon drift
+    gamma_sig: float = 1e-4,
     gamma_c = 0.005,             # Critical Diffusion Gain for Self-Organized Criticality
 ):
     apply_detector_calibration(finder_file, instrument_name)
@@ -1536,7 +1537,7 @@ def run_bingham_tracker(
     Y_theo_cryst_jax = e3nn.spherical_harmonics(sh_irreps, q_theo_sample_jax.T, normalize=True).array
 
     @jax.jit
-    def process_chunk(A_prev, A_seed, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, C_spectral_in, current_sigma_q, delta_angle, current_tau, gamma_event):
+    def process_chunk(A_prev, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, C_spectral_in, current_sigma_q, delta_angle, current_tau, gamma_time, gamma_sig):
         t_curr = t_batch[-1]
         num_events = q_batch.shape[0]
 
@@ -1674,24 +1675,25 @@ def run_bingham_tracker(
 
         wl_hist_new = bg_ema_weight * wl_hist_prev + (1.0 - bg_ema_weight) * raw_wl_hist + 1e-3
 
-        # The exact implementation of Gamma*(t) = alpha * w(t) + epsilon
-        decay_total = jnp.exp(-(gamma_step * delta_angle + gamma_event * num_events))
+        # --- 2. SIGNAL-DRIVEN SDE KINEMATICS ---
+        dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
+        Gamma_batch = gamma_step * delta_angle + gamma_time * dt_chunk + gamma_sig * signal_count
+        decay_total = jnp.exp(-Gamma_batch)
         
         A_diffused = A_prev * decay_total
 
-        # --- THE INTENSIVE SIGNAL FORCE ---
-        # Calculate the geometric precision of the *signal*, ignoring background volume.
-        # jnp.maximum(signal_count, 1.0) guarantees that if the batch is 100% noise, 
-        # F_pure safely evaluates to near-zero and the tracker correctly decays.
-        F_pure = jnp.sum(A_F_batch, axis=0) / jnp.maximum(signal_count, 1.0)
+        F_pure = jnp.sum(A_F_batch, axis=0)
         F_pure = F_pure - (jnp.trace(F_pure) / 4.0) * jnp.eye(4)
+        
+        # Floor at 1.0 prevents microscopic noise from exploding the target
+        F_target = F_pure / jnp.maximum(signal_count, 1.0)
 
-        dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         total_rate = num_events / dt_chunk
         is_valid_batch = total_rate < max_rate_hz
 
-        # Update using the pure thermodynamic target
-        A_updated = A_diffused + (F_pure + A_seed) * (1.0 - decay_total)
+        # --- 3. Equilibrium Update ---
+        # A_seed is mathematically removed! This severs the rubber band trap.
+        A_updated = A_diffused + F_target * (1.0 - decay_total)
 
         A_new = jnp.where(is_valid_batch, A_updated, A_prev)
 
@@ -1709,7 +1711,7 @@ def run_bingham_tracker(
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
-            in_axes=(0, 0, 0, 0, None, None, None, None, None, None, None, None),
+            in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None),
             out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0, 0, 0)
         )
     )
@@ -1803,8 +1805,8 @@ def run_bingham_tracker(
         #current_tau = jnp.minimum(current_tau, 2.0)
 
         A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eshort_ensemble, spectral_losses, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
-            A_ensemble_state, A_ensemble_state_seeds, bg_hist_ensemble, wl_hist_ensemble,
-            q_batch, ki_batch, t_batch, C_spectral_state, current_sigma_q, delta_angle, current_tau, gamma_event
+            A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble,
+            q_batch, ki_batch, t_batch, C_spectral_state, current_sigma_q, delta_angle, current_tau, gamma_time, gamma_sig
         )
 
         # Update EMA background rate for next cycle's Tau
