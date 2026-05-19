@@ -1563,20 +1563,21 @@ def run_bingham_tracker(
         extensive_peak_weights = peak_weights_spectral * kappa_j
 
         # --------------------------------------------------------------------
-        # EXACT CONVOLUTION (Wigner-D Crystal Frame Inversion)
+        # EXACT CONVOLUTION & INTENSIVE NORMALIZATION
         # --------------------------------------------------------------------
-        # Instead of rotating thousands of coordinates and expanding massive 
-        # polynomials for every tracker, we rotate the 289 vacuum coefficients 
-        # backward into the local crystal frame using the inverse Wigner-D matrix.
-        
         C_vac_ir = e3nn.IrrepsArray(sh_irreps, C_spectral_in)
         C_cryst = C_vac_ir.transform_by_matrix(U.T).array
         
-        # Evaluate the continuous vacuum amplitude via a single O(1) dot product
-        # against the globally pre-computed crystal harmonics.
-        spectral_nll_sum = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_cryst) * extensive_peak_weights)
+        # 1. Normalize the continuous vacuum wave into a true Probability Density
+        vacuum_mass = jnp.maximum(C_spectral_in[0] * jnp.sqrt(4.0 * jnp.pi), 1e-9)
+        C_cryst_pdf = C_cryst / vacuum_mass
         
-        spectral_nll = -spectral_nll_sum
+        # 2. Evaluate the expected spatial density at the theoretical peaks
+        normalized_peak_weights = peak_weights_spectral / jnp.maximum(jnp.sum(peak_weights_spectral), 1e-9)
+        expected_density = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_cryst_pdf) * normalized_peak_weights)
+        
+        # 3. Convert continuous density into an exact Log-Likelihood
+        spectral_nll = -jnp.log(jnp.maximum(expected_density, 1e-9))
 
         log_vmf_norm_j = jnp.log(kappa_j / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_j))
 
