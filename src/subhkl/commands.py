@@ -1415,22 +1415,22 @@ def run_bingham_tracker(
     @jax.jit
     def evolve_vacuum_sde(C_prev, q_batch, lambda_short_scalar, dt, tau):
         """
-        Gridless Spectral-Galerkin update using the KS Continuous Sink.
+        Gridless Spectral-Galerkin update using fully Implicit sinks and diffusion.
         """
-        # --- TERM 2: Low-Frequency Ewald Pull ---
+        # --- TERM 2: Low-Frequency Ewald Pull (Explicit Observation) ---
         Y_exp_batch = e3nn.spherical_harmonics(sh_irreps, q_batch, normalize=True).array
-        ewald_pull = jnp.sum(Y_exp_batch, axis=0) / jnp.maximum(dt, 1e-9)
+        
+        # ewald_pull * dt is algebraically just the sum of the incoming discrete events
+        batch_sum = jnp.sum(Y_exp_batch, axis=0) 
+        C_explicit = C_prev + batch_sum
 
-        # --- TERM 3: The KS Scalar Sink (Uniform Drain) ---
-        ks_sink = lambda_short_scalar * C_prev
-
-        # Explicit update: Add the pull, subtract the sink
-        C_explicit = C_prev + (ewald_pull * dt) - (ks_sink * dt)
-
-        # --- TERM 1: Diagonal Heat Decay (Implicit Fokker-Planck) ---
+        # --- TERM 1 & 3: Diagonal Heat Decay & KS Scalar Sink (Implicit) ---
+        # By evaluating both the sink and the diffusion implicitly (at t + dt),
+        # we guarantee unconditional stability regardless of how massive the neutron flux spikes.
         implicit_denom = 1.0 + (lambda_short_scalar * dt) + (tau * laplacian_jax * dt)
+        
         C_new = C_explicit / implicit_denom
-
+        
         return C_new
 
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
