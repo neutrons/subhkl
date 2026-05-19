@@ -1533,6 +1533,8 @@ def run_bingham_tracker(
             jnp.concatenate([A10, A11], axis=1)
         ], axis=0)
 
+    Y_theo_cryst_jax = e3nn.spherical_harmonics(sh_irreps, q_theo_sample_jax.T, normalize=True).array
+
     @jax.jit
     def process_chunk(A_prev, A_seed, bg_hist_prev, wl_hist_prev, q_batch, ki_batch, t_batch, C_spectral_in, current_sigma_q, delta_angle, current_tau, gamma_event):
         t_curr = t_batch[-1]
@@ -1559,19 +1561,20 @@ def run_bingham_tracker(
         peak_weights_spectral = jnp.exp(jnp.log(wl_pdf_spectral)[wl_idx_theo] + safety_penalty_theo)
 
         extensive_peak_weights = peak_weights_spectral * kappa_j
-        Y_theo = e3nn.spherical_harmonics(sh_irreps, mu_theo, normalize=True).array
 
         # --------------------------------------------------------------------
-        # EXACT CONVOLUTION (Gridless Dirac Point Evaluation)
+        # EXACT CONVOLUTION (Wigner-D Crystal Frame Inversion)
         # --------------------------------------------------------------------
-        # By treating the Bingham tracking particle as a Dirac delta at orientation U,
-        # the infinite-dimensional spatial integral collapses into O(1) point-evaluation.
-        # We simply evaluate the spatial amplitude of the continuous vacuum wave 
-        # exactly at the rotated coordinates of the theoretical Bragg peaks.
+        # Instead of rotating thousands of coordinates and expanding massive 
+        # polynomials for every tracker, we rotate the 289 vacuum coefficients 
+        # backward into the local crystal frame using the inverse Wigner-D matrix.
         
-        # A single BLAS batched matrix-vector product replaces the unrolled L-loop,
-        # preventing JAX from fragmenting the VRAM graph across 1024 trackers.
-        spectral_nll_sum = jnp.sum(jnp.dot(Y_theo, C_spectral_in) * extensive_peak_weights)
+        C_vac_ir = e3nn.IrrepsArray(sh_irreps, C_spectral_in)
+        C_cryst = C_vac_ir.transform_by_matrix(U.T).array
+        
+        # Evaluate the continuous vacuum amplitude via a single O(1) dot product
+        # against the globally pre-computed crystal harmonics.
+        spectral_nll_sum = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_cryst) * extensive_peak_weights)
         
         spectral_nll = -spectral_nll_sum
 
