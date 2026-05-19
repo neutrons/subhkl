@@ -1672,14 +1672,19 @@ def run_bingham_tracker(
         
         A_diffused = A_prev * decay_total
 
-        F_mean = jnp.sum(A_F_batch, axis=0) / jnp.maximum(num_events, 1e-9)
-        F_mean = F_mean - (jnp.trace(F_mean) / 4.0) * jnp.eye(4)
+        # --- THE INTENSIVE SIGNAL FORCE ---
+        # Calculate the geometric precision of the *signal*, ignoring background volume.
+        # jnp.maximum(signal_count, 1.0) guarantees that if the batch is 100% noise, 
+        # F_pure safely evaluates to near-zero and the tracker correctly decays.
+        F_pure = jnp.sum(A_F_batch, axis=0) / jnp.maximum(signal_count, 1.0)
+        F_pure = F_pure - (jnp.trace(F_pure) / 4.0) * jnp.eye(4)
 
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         total_rate = num_events / dt_chunk
         is_valid_batch = total_rate < max_rate_hz
 
-        A_updated = A_diffused + (F_mean + A_seed) * (1.0 - decay_total)
+        # Update using the pure thermodynamic target
+        A_updated = A_diffused + (F_pure + A_seed) * (1.0 - decay_total)
 
         A_new = jnp.where(is_valid_batch, A_updated, A_prev)
 
