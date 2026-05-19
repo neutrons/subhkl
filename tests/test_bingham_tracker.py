@@ -311,6 +311,7 @@ class TestBinghamTracker(unittest.TestCase):
             annealing_rate=0.0,   # No annealing needed
             gamma_step=0.0,
             gamma_time=0.0, # disable SDE diffusion
+            gamma_sig=0.0,
             kappa_init=100.0,
             n_ensemble=128,
             streaming_callback=streaming_callback,
