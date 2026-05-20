@@ -1653,26 +1653,32 @@ def run_bingham_tracker(
             # Native statistical mechanics: retains repulsive noise bumps in the Free Energy
             e_short_event = log_Z_tilde - log_Z
 
-            w = jnp.exp(peak_log_lik - log_Z)
-            w_sum = jnp.sum(w)
+            w_peaks = jnp.exp(peak_log_lik - log_Z)
+            w_bg = jnp.exp(dynamic_bg_log_lik[0] - log_Z)
+            
+            # EXACT SHANNON ENTROPY OF THE MIXTURE (H = - sum p log p)
+            h_event = -jnp.sum(w_peaks * jnp.log(jnp.maximum(w_peaks, 1e-12))) - w_bg * jnp.log(jnp.maximum(w_bg, 1e-12))
 
-            weighted_h_geom = jnp.sum((w * kappa_j) * q_theo_sample_jax, axis=1)
+            w_sum = jnp.sum(w_peaks)
+
+            weighted_h_geom = jnp.sum((w_peaks * kappa_j) * q_theo_sample_jax, axis=1)
             F_total = jnp.outer(q_exp, weighted_h_geom)
 
-            best_idx = jnp.argmax(w)
-            is_signal = w[best_idx] > 0.5
+            best_idx = jnp.argmax(w_peaks)
+            is_signal = w_peaks[best_idx] > 0.5
             actual_winning_lambda = lambda_j[best_idx]
 
-            return compute_A_from_C(F_total), -log_Z, e_short_event, w_sum, is_signal, actual_winning_lambda
+            return compute_A_from_C(F_total), -log_Z, e_short_event, w_sum, is_signal, actual_winning_lambda, h_event
 
         def single_event_wrapper(event_data):
             q_exp, ki_exp = event_data
             return single_event_update(q_exp, ki_exp)
 
-        A_F_batch, nll_batch, e_short_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch = jax.lax.map(
+        A_F_batch, nll_batch, e_short_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch, h_batch = jax.lax.map(
             single_event_wrapper, (q_batch, ki_batch), batch_size=max_gpu_batch_size,
         )
 
+        entropy_mean = jnp.mean(h_batch)
         signal_count = jnp.sum(w_sum_batch)
 
         wl_idx_batch = jnp.floor(actual_lambdas_batch * 10.0).astype(jnp.int32)
@@ -1716,13 +1722,13 @@ def run_bingham_tracker(
         sig_rate = signal_count / dt_chunk
         bg_rate = (num_events - signal_count) / dt_chunk
 
-        return A_new, bg_hist_out, wl_hist_out, t_curr, U, jnp.mean(nll_batch), jnp.mean(e_short_batch), spectral_nll, norm_gap, sig_rate, bg_rate, bg_pdf
+        return A_new, bg_hist_out, wl_hist_out, t_curr, U, jnp.mean(nll_batch), jnp.mean(e_short_batch), spectral_nll, norm_gap, sig_rate, bg_rate, bg_pdf, entropy_mean
 
     ensemble_process_chunk = jax.jit(
         jax.vmap(
             process_chunk,
             in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None),
-            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0, 0, 0)
+            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         )
     )
 
@@ -1814,7 +1820,7 @@ def run_bingham_tracker(
         # Thermodynamic ceiling to prevent the wave from boiling flat during extreme anomalies
         #current_tau = jnp.minimum(current_tau, 2.0)
 
-        A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eshort_ensemble, spectral_losses, eigen_gaps, sig_rates, bg_rates, bg_pdfs = ensemble_process_chunk(
+        A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eshort_ensemble, spectral_losses, eigen_gaps, sig_rates, bg_rates, bg_pdfs, entropy_means = ensemble_process_chunk(
             A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble,
             q_batch, ki_batch, t_batch, C_spectral_state, current_sigma_q, delta_angle, current_tau, gamma_time, gamma_sig
         )
@@ -1841,15 +1847,18 @@ def run_bingham_tracker(
         spectral_losses_np = np.array(spectral_losses)
         eshort_ensemble_np = np.array(eshort_ensemble)
         loss_ensemble_np = np.array(loss_ensemble)
+        entropy_ensemble_np = np.array(entropy_means)
 
         if smoothed_eshort_ensemble is None:
             smoothed_eshort_ensemble = eshort_ensemble_np
             smoothed_spectral_ensemble = spectral_losses_np
             smoothed_loss_ensemble = loss_ensemble_np
+            smoothed_entropy_ensemble = entropy_ensemble_np
         else:
             smoothed_eshort_ensemble = (1.0 - loss_ema_weight) * smoothed_eshort_ensemble + loss_ema_weight * eshort_ensemble_np
             smoothed_spectral_ensemble = (1.0 - loss_ema_weight) * smoothed_spectral_ensemble + loss_ema_weight * spectral_losses_np
             smoothed_loss_ensemble = (1.0 - loss_ema_weight) * smoothed_loss_ensemble + loss_ema_weight * loss_ensemble_np
+            smoothed_entropy_ensemble = (1.0 - loss_ema_weight) * smoothed_entropy_ensemble + loss_ema_weight * entropy_ensemble_np
 
         # Intensive Spectral Basin (Macro) + Log-Partition Function (Micro)
         unified_free_energy = smoothed_spectral_ensemble + smoothed_eshort_ensemble
@@ -1884,6 +1893,7 @@ def run_bingham_tracker(
             metrics_dict = {
                 "loss": best_loss,
                 "spectral_nll": best_spectral_nll,
+                "entropy": float(smoothed_entropy_ensemble[best_idx]),
                 "eigengap": best_gap,
                 "sig_rate": current_sig_rate,
                 "bg_rate": current_bg_rate,

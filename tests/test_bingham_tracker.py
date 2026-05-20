@@ -301,7 +301,7 @@ class TestBinghamTracker(unittest.TestCase):
 
         def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
-            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Loss={metrics['loss']:.2f} | Spectral-NLL={metrics['spectral_nll']:.2f}")
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Loss={metrics['loss']:.2f} | Spectral-NLL={metrics['spectral_nll']:.2f} | Entropy={metrics['entropy']:.2f}")
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
@@ -370,7 +370,7 @@ class TestBinghamTracker(unittest.TestCase):
             recorded_taus.append((time, current_tau))
             recorded_errors.append((time, err))
             
-            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Tau={current_tau:.4f}")
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Tau={current_tau:.4f} | Entropy={metrics['entropy']:.2f}")
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
