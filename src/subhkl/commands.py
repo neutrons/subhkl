@@ -1876,7 +1876,7 @@ def run_bingham_tracker(
 
         U_best = np.array(U_ensemble_curr[best_idx])
         best_gap = float(eigen_gaps[best_idx])
-        best_loss = float(loss_ensemble[best_idx])
+        best_loss = float(smoothed_loss_ensemble[best_idx])
         best_spectral_nll = float(spectral_losses[best_idx])
 
         print(f"Tracker 0: loss={smoothed_loss_ensemble[0]:.2f} spectral_nll={spectral_losses[0]:.2f} entropy={smoothed_entropy_ensemble[0]:.2f} jensen={jensen_bound[0]:.2f}")
@@ -1901,7 +1901,7 @@ def run_bingham_tracker(
             metrics_dict = {
                 "loss": best_loss,
                 "spectral_nll": best_spectral_nll,
-                "jensen_bound": jensen_bound,
+                "jensen_bound": float(jensen_bound[best_idx]),
                 "entropy": float(smoothed_entropy_ensemble[best_idx]),
                 "eigengap": best_gap,
                 "sig_rate": current_sig_rate,
