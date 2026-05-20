@@ -1570,15 +1570,25 @@ def run_bingham_tracker(
         C_cryst = C_vac_ir.transform_by_matrix(U.T).array
         
         # 1. Normalize the continuous vacuum wave into a true Probability Density
-        vacuum_mass = jnp.maximum(C_spectral_in[0] * jnp.sqrt(4.0 * jnp.pi), 1e-9)
-        C_cryst_pdf = C_cryst / vacuum_mass
+        # In e3nn_jax, Y_00 = 1, so the field natively integrates to 4*pi*C_0.
+        # The 1e-9 clip is strictly to prevent the t=0 division by zero!
+        C_0 = jnp.maximum(C_spectral_in[0], 1e-9)
+        C_cryst_pdf = C_cryst / (C_0 * 4.0 * jnp.pi)
         
-        # 2. Evaluate the expected spatial density at the theoretical peaks
-        normalized_peak_weights = peak_weights_spectral / jnp.maximum(jnp.sum(peak_weights_spectral), 1e-9)
-        expected_density = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_cryst_pdf) * normalized_peak_weights)
+        # WE DO NOT APPLY ADDITIONAL EWALD KERNEL.
+        # The truncation at L_max=8 is already a perfect low-pass filter!
+        
+        # 2. Evaluate the linear expectation of the density at the structural peaks
+        # We DO NOT divide by the active sum. We want the total combinatorial mass of the crystal!
+        signal_density = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_cryst_pdf) * peak_weights_spectral)
         
         # 3. Convert continuous density into an exact Log-Likelihood
-        spectral_nll = -jnp.log(jnp.maximum(expected_density, 1e-9))
+        bg_floor = 1.0 / (4.0 * jnp.pi)
+        
+        # UNCLIPPED TOPOGRAPHY: We allow signal_density to swing negative in Gibbs troughs!
+        # The physical background floor lifts it positive, safely preserving the uphill gradient.
+        safe_density = jnp.maximum(signal_density + bg_floor, 1e-9)
+        spectral_nll = -jnp.log(safe_density)
 
         log_vmf_norm_j = jnp.log(kappa_j / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_j))
 
@@ -1842,7 +1852,7 @@ def run_bingham_tracker(
             smoothed_loss_ensemble = (1.0 - loss_ema_weight) * smoothed_loss_ensemble + loss_ema_weight * loss_ensemble_np
 
         # Intensive Spectral Basin (Macro) + Log-Partition Function (Micro)
-        unified_free_energy = smoothed_spectral_ensemble + smoothed_loss_ensemble
+        unified_free_energy = smoothed_spectral_ensemble + smoothed_eshort_ensemble
         best_idx = int(np.argmin(unified_free_energy))
 
         ensemble_weights = jax.nn.softmax(-loss_ensemble)
@@ -1852,6 +1862,7 @@ def run_bingham_tracker(
         U_best = np.array(U_ensemble_curr[best_idx])
         best_gap = float(eigen_gaps[best_idx])
         best_loss = float(loss_ensemble[best_idx])
+        best_spectral_nll = float(spectral_losses[best_idx])
 
         tracking_history.append((float(t_state), U_best))
 
@@ -1871,7 +1882,8 @@ def run_bingham_tracker(
             }
 
             metrics_dict = {
-                "mean_loss": best_loss,
+                "loss": best_loss,
+                "spectral_nll": best_spectral_nll,
                 "eigengap": best_gap,
                 "sig_rate": current_sig_rate,
                 "bg_rate": current_bg_rate,
@@ -1886,7 +1898,6 @@ def run_bingham_tracker(
                 time=float(t_state),
                 U_preds=np.array(U_ensemble_curr),
                 losses=np.array(loss_ensemble),
-                mean_loss=best_loss,
                 best_idx=best_idx,
                 neutron_count=cumulative_count,
                 new_events=new_events,

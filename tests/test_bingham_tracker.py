@@ -157,7 +157,7 @@ class TestBinghamTracker(unittest.TestCase):
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, b_factor=0.5)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
 
-        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+        def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
@@ -192,7 +192,7 @@ class TestBinghamTracker(unittest.TestCase):
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
-        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+        def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
@@ -227,7 +227,7 @@ class TestBinghamTracker(unittest.TestCase):
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
-        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+        def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
@@ -264,7 +264,7 @@ class TestBinghamTracker(unittest.TestCase):
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, bg_fraction=0.80)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
-        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+        def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
@@ -299,9 +299,9 @@ class TestBinghamTracker(unittest.TestCase):
         sim_data = self.generate_poissonian_events(U_true, num_events=200000, duration=1.0)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
 
-        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+        def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
-            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Spectral-NLL={mean_loss:.2f}")
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Loss={metrics['loss']:.2f} | Spectral-NLL={metrics['spectral_nll']:.2f}")
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
@@ -315,7 +315,7 @@ class TestBinghamTracker(unittest.TestCase):
             kappa_init=100.0,
             n_ensemble=128,
             streaming_callback=streaming_callback,
-            gamma_c=0.05  # bg=0.0 -> Tau = 0.05 * sqrt(1) = 0.05
+            gamma_c=0.0,  # tau = 0 for this unit test to cancel short-range contribution
         )
 
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
@@ -363,7 +363,7 @@ class TestBinghamTracker(unittest.TestCase):
         recorded_taus = []
         recorded_errors = []
 
-        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+        def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             current_tau = metrics.get('tau', 0.0) # Ensure "tau": float(current_tau) is in metrics_dict!
             
@@ -435,13 +435,13 @@ class TestBinghamTracker(unittest.TestCase):
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, bg_fraction=0.98)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
         
-        def streaming_callback(time, U_preds, losses, mean_loss, best_idx, neutron_count, new_events, metrics):
+        def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             
             # If you added entropy to your metrics_dict, we can print it for telemetry!
             entropy = metrics.get('entropy', 0.0) 
             
-            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Best-Idx={best_idx:3d} | Sym-Err={err:6.2f}° | Free-Energy={mean_loss:.2f} | Entropy={entropy:.2f}")
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Best-Idx={best_idx:3d} | Sym-Err={err:6.2f}° | Free-Energy={metrics['loss']:.2f} | Entropy={entropy:.2f}")
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
