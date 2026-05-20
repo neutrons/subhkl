@@ -1668,13 +1668,13 @@ def run_bingham_tracker(
             is_signal = w_peaks[best_idx] > 0.5
             actual_winning_lambda = lambda_j[best_idx]
 
-            return compute_A_from_C(F_total), -log_Z, e_short_event, w_sum, is_signal, actual_winning_lambda, h_event
+            return F_total, -log_Z, e_short_event, w_sum, is_signal, actual_winning_lambda, h_event
 
         def single_event_wrapper(event_data):
             q_exp, ki_exp = event_data
             return single_event_update(q_exp, ki_exp)
 
-        A_F_batch, nll_batch, e_short_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch, h_batch = jax.lax.map(
+        K_batch, nll_batch, e_short_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch, h_batch = jax.lax.map(
             single_event_wrapper, (q_batch, ki_batch), batch_size=max_gpu_batch_size,
         )
 
@@ -1698,17 +1698,19 @@ def run_bingham_tracker(
         
         A_diffused = A_prev * decay_total
 
-        F_pure = jnp.sum(A_F_batch, axis=0)
-        F_pure = F_pure - (jnp.trace(F_pure) / 4.0) * jnp.eye(4)
-        
-        # Floor at 1.0 prevents microscopic noise from exploding the target
-        F_target = F_pure / jnp.maximum(signal_count, 1.0)
+        # 1. Sum the holonomic force matrices in raw 3x3 space
+        K_pure = jnp.sum(K_batch, axis=0)
+        K_target = K_pure / jnp.maximum(signal_count, 1.0)
+
+        # 2. Map to 4x4 quaternion space EXACTLY ONCE per chunk
+        # Because our linear isomorphism natively guarantees Tr(A) = 0 for any 
+        # arbitrary matrix K, the old trace-centering lines are completely obsolete!
+        F_target = compute_A_from_C(K_target)
 
         total_rate = num_events / dt_chunk
         is_valid_batch = total_rate < max_rate_hz
 
-        # --- 3. Equilibrium Update ---
-        # A_seed is mathematically removed! This severs the rubber band trap.
+        # 3. Equilibrium Update
         A_updated = A_diffused + F_target * (1.0 - decay_total)
 
         A_new = jnp.where(is_valid_batch, A_updated, A_prev)
@@ -1861,8 +1863,12 @@ def run_bingham_tracker(
             smoothed_entropy_ensemble = (1.0 - loss_ema_weight) * smoothed_entropy_ensemble + loss_ema_weight * entropy_ensemble_np
 
         # Intensive Spectral Basin (Macro) + Log-Partition Function (Micro)
-        unified_free_energy = smoothed_spectral_ensemble + smoothed_eshort_ensemble
-        best_idx = int(np.argmin(unified_free_energy))
+        jensen_bound = smoothed_spectral_ensemble + smoothed_eshort_ensemble
+
+        # While the jensen_bound E[-ln Z] is perfect for macro-scale SDE drift,
+        # the exact log-partition function (smoothed_loss_ensemble) is the
+        # supreme authority for resolving microscopic ties at full resolution.
+        best_idx = int(np.argmin(smoothed_loss_ensemble))
 
         ensemble_weights = jax.nn.softmax(-loss_ensemble)
         wl_hist_weighted = jnp.sum(wl_hist_ensemble * ensemble_weights[:, None], axis=0)
@@ -1872,6 +1878,8 @@ def run_bingham_tracker(
         best_gap = float(eigen_gaps[best_idx])
         best_loss = float(loss_ensemble[best_idx])
         best_spectral_nll = float(spectral_losses[best_idx])
+
+        print(f"Tracker 0: loss={smoothed_loss_ensemble[0]:.2f} spectral_nll={spectral_losses[0]:.2f} entropy={smoothed_entropy_ensemble[0]:.2f} jensen={jensen_bound[0]:.2f}")
 
         tracking_history.append((float(t_state), U_best))
 
@@ -1893,6 +1901,7 @@ def run_bingham_tracker(
             metrics_dict = {
                 "loss": best_loss,
                 "spectral_nll": best_spectral_nll,
+                "jensen_bound": jensen_bound,
                 "entropy": float(smoothed_entropy_ensemble[best_idx]),
                 "eigengap": best_gap,
                 "sig_rate": current_sig_rate,
