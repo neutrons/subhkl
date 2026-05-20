@@ -1630,56 +1630,50 @@ def run_bingham_tracker(
             wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
             learned_wl_prior = wl_log_pdf[wl_idx]
 
-            # --- 1. MIXTURE & DIMENSIONAL NORMALIZATION ---
-            num_peaks = float(q_theo_sample_jax.shape[1])
+            # --- 1. ANALYTICAL BACKGROUND FLOOR REALIGNMENT ---
             bg_wl_prior = jnp.log(1.0 / float(num_bins_jax))
 
-            # Subtract jnp.log(num_peaks) so the spatial mixture correctly integrates to 1.0
-            peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_vmf_norm_j + learned_wl_prior + safety_penalty - jnp.log(num_peaks)
-            peak_log_lik_tilde = kappa_tilde * (cos_theta_err - 1.0) + log_vmf_norm_tilde + learned_wl_prior + safety_penalty - jnp.log(num_peaks)
+            # Raw structural log-likelihoods over the lattice
+            peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_vmf_norm_j + learned_wl_prior + safety_penalty
+            peak_log_lik_tilde = kappa_tilde * (cos_theta_err - 1.0) + log_vmf_norm_tilde + learned_wl_prior + safety_penalty
 
-            u_exp = q_exp[2]
-            v_exp = jnp.arctan2(q_exp[1], q_exp[0])
-            u_idx_exp = jnp.clip(jnp.floor((u_exp + 1.0) * 63.999).astype(jnp.int32), 0, 63)
-            v_idx_exp = jnp.clip(jnp.floor((v_exp + jnp.pi) / (2.0 * jnp.pi) * 63.999).astype(jnp.int32), 0, 63)
+            # Hard-EM Viterbi Limit isolates the single best structural peak
+            best_peak_idx = jnp.argmax(peak_log_lik)
+            log_P_struct = peak_log_lik[best_peak_idx]
+            log_P_struct_tilde = peak_log_lik_tilde[best_peak_idx]
 
-            # Add bg_wl_prior so background has BOTH spatial and wavelength densities
-            dynamic_bg_log_lik = jnp.array([bg_log_pdf_flat[u_idx_exp * 64 + v_idx_exp] + bg_wl_prior])
+            # EXACT PHYSICAL GEOMETRY: Replace the noisy un-smoothed histogram with the 
+            # exact, analytical spherical noise floor floor = ln(1 / 4*pi)
+            analytical_bg_floor = float(np.log(1.0 / (4.0 * np.pi)))
+            dynamic_bg_log_lik = analytical_bg_floor + bg_wl_prior
 
-            log_Z = jax.scipy.special.logsumexp(jnp.append(peak_log_lik, dynamic_bg_log_lik))
-            log_Z_tilde = jax.scipy.special.logsumexp(jnp.append(peak_log_lik_tilde, dynamic_bg_log_lik))
+            # 2-Class Partition Function using the clean analytical floor
+            log_Z = jnp.logaddexp(log_P_struct, dynamic_bg_log_lik)
+            log_Z_tilde = jnp.logaddexp(log_P_struct_tilde, dynamic_bg_log_lik)
 
-            # --- UNCLIPPED RESIDUAL ---
-            # Native statistical mechanics: retains repulsive noise bumps in the Free Energy
-            e_short_event = log_Z_tilde - log_Z
+            # --- 2. TENSOR FORCE UPDATE ---
+            w_struct = jnp.exp(log_P_struct - log_Z)
 
-            w_peaks = jnp.exp(peak_log_lik - log_Z)
-            w_bg = jnp.exp(dynamic_bg_log_lik[0] - log_Z)
-            
-            # EXACT SHANNON ENTROPY OF THE MIXTURE (H = - sum p log p)
-            h_event = -jnp.sum(w_peaks * jnp.log(jnp.maximum(w_peaks, 1e-12))) - w_bg * jnp.log(jnp.maximum(w_bg, 1e-12))
-
-            w_sum = jnp.sum(w_peaks)
-
-            weighted_h_geom = jnp.sum((w_peaks * kappa_j) * q_theo_sample_jax, axis=1)
+            weighted_h_geom = (w_struct * kappa_j[best_peak_idx]) * q_theo_sample_jax[:, best_peak_idx]
             F_total = jnp.outer(q_exp, weighted_h_geom)
 
-            best_idx = jnp.argmax(w_peaks)
-            is_signal = w_peaks[best_idx] > 0.5
-            actual_winning_lambda = lambda_j[best_idx]
+            is_signal = w_struct > 0.5
+            actual_winning_lambda = lambda_j[best_peak_idx]
 
-            return F_total, -log_Z, e_short_event, w_sum, is_signal, actual_winning_lambda, h_event
+            h_event = -w_struct * jnp.log(jnp.maximum(w_struct, 1e-12)) - jnp.exp(dynamic_bg_log_lik - log_Z) * jnp.log(jnp.maximum(jnp.exp(dynamic_bg_log_lik - log_Z), 1e-12))
+
+            return F_total, -log_Z, log_Z_tilde - log_Z, w_struct, is_signal, actual_winning_lambda, h_event
 
         def single_event_wrapper(event_data):
             q_exp, ki_exp = event_data
             return single_event_update(q_exp, ki_exp)
 
-        K_batch, nll_batch, e_short_batch, w_sum_batch, is_signal_batch, actual_lambdas_batch, h_batch = jax.lax.map(
+        K_batch, nll_batch, e_short_batch, w_struct_batch, is_signal_batch, actual_lambdas_batch, h_batch = jax.lax.map(
             single_event_wrapper, (q_batch, ki_batch), batch_size=max_gpu_batch_size,
         )
 
         entropy_mean = jnp.mean(h_batch)
-        signal_count = jnp.sum(w_sum_batch)
+        signal_count = jnp.sum(w_struct_batch)
 
         wl_idx_batch = jnp.floor(actual_lambdas_batch * 10.0).astype(jnp.int32)
         valid_bin_mask = is_signal_batch & (actual_lambdas_batch > 0.0) & (actual_lambdas_batch < wl_max_jax)

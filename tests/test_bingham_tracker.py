@@ -432,30 +432,32 @@ class TestBinghamTracker(unittest.TestCase):
             f["sample/U"] = U_seed
 
         # Simulate the "4-panel" scenario: Moderate background, but plenty of time to overfit.
-        sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, bg_fraction=0.98)
-        event_stream = self.get_fake_batches(sim_data, batch_size=10000)
+        sim_data = self.generate_poissonian_events(U_true, num_events=10000000, duration=5.0, bg_fraction=0.98)
+        event_stream = self.get_fake_batches(sim_data, batch_size=100000)
         
         def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             
             # If you added entropy to your metrics_dict, we can print it for telemetry!
             entropy = metrics.get('entropy', 0.0) 
-            
-            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Best-Idx={best_idx:3d} | Sym-Err={err:6.2f}° | Free-Energy={metrics['loss']:.2f} | Entropy={entropy:.2f}")
+           
+            print("Tracker 0 Error", self._evaluate_cubic_symmetric_error(U_true, U_preds[0]))
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Best-Idx={best_idx:3d} | Sym-Err={err:6.2f}° | Free-Energy={metrics['loss']:.2f} | Entropy={entropy:.2f} | Jensen={metrics['jensen_bound']:.2f}")
 
         final_U = run_bingham_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
-            sigma_q_start=1.0,   
-            sigma_q_min=0.05,    
+            sigma_q_start=0.15,    # Open the capture funnel wide at t=0 so trackers can see the peak through the noise
+            sigma_q_min=0.02,      # Tighten smoothly to the physical simulation limits
+            annealing_rate=0.5,    # Smooth time-driven cooling funnel
             gamma_step=100.0,
             kappa_init=1.0,
-            # MASSIVE ENSEMBLE: 63 trackers will actively hunt for narrow noise traps to trick the argmin
             n_ensemble=64,       
             streaming_callback=streaming_callback,
-            gamma_c=0.05
-        )
-        
+            gamma_c=0.05,
+            loss_ema_weight=0.05,
+        ) 
+
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
         
         self.assertLess(
