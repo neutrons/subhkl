@@ -1369,7 +1369,7 @@ def run_bingham_tracker(
     streaming_callback=None,
     sigma_q_start: float = 1.0,
     sigma_q_min: float = 0.05,
-    annealing_rate: float = 0.5,
+    annealing_rate: float = 5.0,
     gamma_step: float = 100.0,   # Kinematic Annihilation: Decay per radian of motor movement
     kappa_init: float = 100.0,
     h_max: int = 6,
@@ -1741,7 +1741,7 @@ def run_bingham_tracker(
     t_start = None
     t_state = 0.0
 
-    effective_annealing_count = 0.0
+    effective_annealing_time = 0.0
     angles_prev = None
 
     smoothed_spectral_ensemble = None
@@ -1770,11 +1770,11 @@ def run_bingham_tracker(
         total_rate_py = num_events / dt_chunk_py
 
         if total_rate_py < max_rate_hz:
-            effective_annealing_count += num_events
+            effective_annealing_time += dt_chunk_py
 
         current_sigma_q = max(
             sigma_q_min,
-            sigma_q_start * np.exp(-annealing_rate * effective_annealing_count)
+            sigma_q_start * np.exp(-annealing_rate * effective_annealing_time)
         )
 
         q_batch = jax.device_put(q_batch_np)
