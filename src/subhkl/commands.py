@@ -1841,7 +1841,8 @@ def run_bingham_tracker(
             smoothed_spectral_ensemble = (1.0 - loss_ema_weight) * smoothed_spectral_ensemble + loss_ema_weight * spectral_losses_np
             smoothed_loss_ensemble = (1.0 - loss_ema_weight) * smoothed_loss_ensemble + loss_ema_weight * loss_ensemble_np
 
-        unified_free_energy = smoothed_spectral_ensemble + smoothed_eshort_ensemble
+        # Intensive Spectral Basin (Macro) + Log-Partition Function (Micro)
+        unified_free_energy = smoothed_spectral_ensemble + smoothed_loss_ensemble
         best_idx = int(np.argmin(unified_free_energy))
 
         ensemble_weights = jax.nn.softmax(-loss_ensemble)
