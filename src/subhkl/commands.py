@@ -1570,7 +1570,10 @@ def run_bingham_tracker(
         C_0 = jnp.maximum(C_spectral_in[0], 1e-9)
         C_cryst_pdf = C_cryst / (C_0 * 4.0 * jnp.pi)
 
-        signal_density = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_cryst_pdf) * peak_weights_spectral)
+        # EXACT HOLONOMIC FORMULATION: Divide by global num_peaks to reward trackers 
+        # that align MORE peaks, while maintaining an O(1) intensive scale!
+        num_peaks = float(q_theo_sample_jax.shape[1])
+        signal_density = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_cryst_pdf) * peak_weights_spectral) / num_peaks
 
         # Precompute batch harmonics to avoid duplicate execution within the map loop
         Y_exp_batch = e3nn.spherical_harmonics(sh_irreps, q_batch, normalize=True).array
@@ -1583,7 +1586,8 @@ def run_bingham_tracker(
         bg_density_peaks = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_bg_smoothed) * peak_weights_spectral) / (4.0 * jnp.pi)
 
         # 3. Convert continuous density into an exact Log-Likelihood
-        safe_density = jnp.maximum(signal_density + jnp.maximum(bg_density_peaks, 1e-6), 1e-9)
+        bg_floor = 1.0 / (4.0 * jnp.pi)
+        safe_density = jnp.maximum(signal_density + bg_floor, 1e-9)
         spectral_nll = -jnp.log(safe_density)
 
         log_vmf_norm_j = jnp.log(kappa_j / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_j))
@@ -1836,7 +1840,7 @@ def run_bingham_tracker(
             smoothed_entropy_ensemble = (1.0 - loss_ema_weight) * smoothed_entropy_ensemble + loss_ema_weight * entropy_ensemble_np
 
         jensen_bound = smoothed_spectral_ensemble + smoothed_eshort_ensemble
-        best_idx = int(np.argmin(smoothed_loss_ensemble))
+        best_idx = int(np.argmin(jensen_bound))
 
         ensemble_weights = jax.nn.softmax(-loss_ensemble)
         wl_hist_weighted = jnp.sum(wl_hist_ensemble * ensemble_weights[:, None], axis=0)
