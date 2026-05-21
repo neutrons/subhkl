@@ -466,5 +466,77 @@ class TestBinghamTracker(unittest.TestCase):
             f"Thermodynamic Collapse: The tracker overfit to a noise trap. (Final Error {final_err:.2f}° >= 2.0°)"
         )
 
+    def test_resolution_dependent_narrowing(self):
+        print(f"\n{'='*60}\nExecuting Regression: RESOLUTION-DEPENDENT NARROWING (Lever Arm)\n{'='*60}")
+        
+        # Set true orientation and seed with a localized perturbation (approx 2 degrees off)
+        U_true = Rotation.from_euler('xyz', [15.0, 25.0, 35.0], degrees=True).as_matrix()
+        U_seed = Rotation.from_euler('xyz', [16.5, 23.8, 36.2], degrees=True).as_matrix()
+        
+        with h5py.File(self.finder_file, "w") as f:
+            f["sample/a"], f["sample/b"], f["sample/c"] = 8.0, 8.0, 8.0
+            f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = 90.0, 90.0, 90.0
+            f["sample/space_group"] = b"P 1"
+            f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+            f["sample/U"] = U_seed
+
+        # Generate a dataset extending deep into the high-Q shell (d_min = 1.5 Angstroms)
+        # Outer reflections are synthesized with tightly constrained angular variance
+        sim_data = self.generate_poissonian_events(
+            U_true, num_events=200000, duration=1.0, sigma_q=0.008, bg_fraction=0.50
+        )
+        event_stream = self.get_fake_batches(sim_data, batch_size=20000)
+
+        recorded_gaps = []
+        recorded_errors = []
+
+        def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
+            recorded_gaps.append(metrics['eigengap'])
+            recorded_errors.append(err)
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Eigengap={metrics['eigengap']:.2f}")
+
+        final_U = run_bingham_tracker(
+            finder_file=self.finder_file,
+            event_batches=event_stream,
+            sigma_q_start=0.20,       # Start near the Nyquist limits
+            sigma_q_min=0.02,        # Cool down tightly to resolve fine structural features
+            annealing_rate=1.0,      # Smooth physical time cooling funnel
+            gamma_step=50.0,
+            kappa_init=5.0,
+            n_ensemble=1,            # Single tracker is sufficient to test local convergence
+            d_min=1.5,               # Open up the high-resolution shell to activate the high-Q lever arm
+            d_max=8.0,
+            streaming_callback=streaming_callback,
+            gamma_c=0.01
+        )
+
+        final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
+        
+        # --- VERIFICATION ASSERTIONS ---
+        
+        # 1. Physical Convergence: Ensure the tracker uses the high-Q precision 
+        # to achieve ultra-sharp, sub-degree crystalline lock
+        self.assertLess(
+            final_err, 
+            0.5, 
+            f"Lever arm refinement failed to achieve sub-degree precision. Final Error: {final_err:.2f}°"
+        )
+        
+        # 2. Curvature Acceleration: Verify that the structural orientation matrix curvature 
+        # (eigengap) increases by at least a factor of 3 as high-Q reflections lock in
+        self.assertGreater(
+            recorded_gaps[-1], 
+            recorded_gaps[0] * 3.0, 
+            f"Thermodynamic Failure: Eigengap curvature did not accelerate. Initial: {recorded_gaps[0]:.2f}, Final: {recorded_gaps[-1]:.2f}"
+        )
+
+        # 3. Monotonic Refinement: Ensure the residual error actively decreases from the seed state
+        self.assertLess(
+            recorded_errors[-1], 
+            recorded_errors[0], 
+            f"Kinematic Failure: Crystalline funnel did not actively refine the seed error."
+        )
+
 if __name__ == '__main__':
     unittest.main()

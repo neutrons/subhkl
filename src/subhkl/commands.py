@@ -1851,8 +1851,6 @@ def run_bingham_tracker(
         best_loss = float(smoothed_loss_ensemble[best_idx])
         best_spectral_nll = float(spectral_losses[best_idx])
 
-        print(f"Tracker 0: loss={smoothed_loss_ensemble[0]:.2f} spectral_nll={spectral_losses[0]:.2f} entropy={smoothed_entropy_ensemble[0]:.2f} jensen={jensen_bound[0]:.2f}")
-
         tracking_history.append((float(t_state), U_best))
 
         current_sig_rate = float(sig_rates[best_idx])
