@@ -449,7 +449,7 @@ class TestBinghamTracker(unittest.TestCase):
             event_batches=event_stream,
             sigma_q_start=0.15,    # Open the capture funnel wide at t=0 so trackers can see the peak through the noise
             sigma_q_min=0.02,      # Tighten smoothly to the physical simulation limits
-            annealing_rate=0.5,    # Smooth time-driven cooling funnel
+            annealing_rate=5,    # Smooth time-driven cooling funnel
             gamma_step=100.0,
             kappa_init=1.0,
             n_ensemble=64,       

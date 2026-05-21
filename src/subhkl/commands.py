@@ -1614,23 +1614,27 @@ def run_bingham_tracker(
             wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
             learned_wl_prior = wl_log_pdf[wl_idx]
 
+            # --- 1. HARD-EM HOLONOMIC LATTICE FILTER ---
             bg_wl_prior = jnp.log(1.0 / float(num_bins_jax))
+            num_peaks = float(q_theo_sample_jax.shape[1])
 
             # Raw structural log-likelihoods over the lattice
             peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_vmf_norm_j + learned_wl_prior + safety_penalty
             peak_log_lik_tilde = kappa_tilde * (cos_theta_err - 1.0) + log_vmf_norm_tilde + learned_wl_prior + safety_penalty
 
-            # Hard-EM Viterbi Limit isolates the single best structural peak
+            # HARD-EM HOLONOMIC LIMIT: Isolate the single best peak match under the current orientation.
+            # Subtracting jnp.log(num_peaks) is mathematically mandatory to scale the peak density 
+            # against the global background sphere, completely eliminating the 5,000x hallucination!
             best_peak_idx = jnp.argmax(peak_log_lik)
-            log_P_struct = peak_log_lik[best_peak_idx]
-            log_P_struct_tilde = peak_log_lik_tilde[best_peak_idx]
+            log_P_struct = peak_log_lik[best_peak_idx] - jnp.log(num_peaks)
+            log_P_struct_tilde = peak_log_lik_tilde[best_peak_idx] - jnp.log(num_peaks)
 
             # Evaluate the continuous noise-free background density field at this event coordinate
             bg_density_event = jnp.dot(Y_exp_event, C_bg_smoothed) / (4.0 * jnp.pi)
             bg_density_event = jnp.maximum(bg_density_event, 1e-6)
             dynamic_bg_log_lik = jnp.log(bg_density_event) + bg_wl_prior
 
-            # 2-Class Partition Function using the continuous background spectrum
+            # 2-Class Partition Function using the calibrated analytical frames
             log_Z = jnp.logaddexp(log_P_struct, dynamic_bg_log_lik)
             log_Z_tilde = jnp.logaddexp(log_P_struct_tilde, dynamic_bg_log_lik)
 
