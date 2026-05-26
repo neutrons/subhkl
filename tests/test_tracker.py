@@ -5,8 +5,11 @@ import h5py
 import numpy as np
 import itertools
 from scipy.spatial.transform import Rotation
+import scipy.spatial.transform
 
-from subhkl.commands import run_bingham_tracker
+from subhkl.commands import run_spectral_holonomic_tracker
+
+import pytest
 
 def get_cubic_symmetries():
     """Generates the 24 valid rotation matrices for a Cubic point group."""
@@ -161,14 +164,11 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
-        final_U = run_bingham_tracker(
+        final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
             sigma_q_start=1.0,
             sigma_q_min=0.02,
-            gamma_step=100.0,
-            kappa_init=1.0,
-            n_ensemble=1,
             streaming_callback=streaming_callback,
             gamma_c=0.05  # bg=0.0 -> Tau = 0.05 * sqrt(1) = 0.05
         )
@@ -196,16 +196,12 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
-        final_U = run_bingham_tracker(
+        final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
-            sigma_q_start=1.0,   
-            sigma_q_min=0.02,    
-            gamma_step=100.0,
-            kappa_init=1.0,
-            n_ensemble=1, 
             streaming_callback=streaming_callback,
-            gamma_c=0.05  # bg=0.0 -> Tau = 0.05 * sqrt(1) = 0.05
+            gamma_c=0.05,
+            L_max=16,
         )
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
@@ -231,17 +227,13 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
-        final_U = run_bingham_tracker(
+        final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
-            sigma_q_start=1.0,   
-            sigma_q_min=0.05,    
-            gamma_step=100.0,
-            kappa_init=1.0,
-            n_ensemble=256, 
+            gamma_time=0.0,
             streaming_callback=streaming_callback,
-            L_max=8,
-            gamma_c=0.05
+            gamma_c=0.05,
+            L_max=16,
         )
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
@@ -268,14 +260,9 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
 
-        final_U = run_bingham_tracker(
+        final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
-            sigma_q_start=1.0,   
-            sigma_q_min=0.05,    
-            gamma_step=100.0,
-            kappa_init=1.0,
-            n_ensemble=1,        
             streaming_callback=streaming_callback,
             gamma_c=1e-4  # bg=160kHz -> Tau = 1e-4 * sqrt(160000) = 0.04
         )
@@ -303,17 +290,12 @@ class TestBinghamTracker(unittest.TestCase):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Loss={metrics['loss']:.2f} | Spectral-NLL={metrics['spectral_nll']:.2f} | Entropy={metrics['entropy']:.2f}")
 
-        final_U = run_bingham_tracker(
+        final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
-            sigma_q_start=0.005,  # Razor thin!
-            sigma_q_min=0.005,
             annealing_rate=0.0,   # No annealing needed
-            gamma_step=0.0,
             gamma_time=0.0, # disable SDE diffusion
             gamma_sig=0.0,
-            kappa_init=100.0,
-            n_ensemble=128,
             streaming_callback=streaming_callback,
             gamma_c=0.0,  # tau = 0 for this unit test to cancel short-range contribution
         )
@@ -372,14 +354,9 @@ class TestBinghamTracker(unittest.TestCase):
             
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Tau={current_tau:.4f} | Entropy={metrics['entropy']:.2f}")
 
-        final_U = run_bingham_tracker(
+        final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
-            sigma_q_start=1.0,
-            sigma_q_min=0.05,
-            gamma_step=100.0,
-            kappa_init=1.0,
-            n_ensemble=1,
             streaming_callback=streaming_callback,
             gamma_c=1e-4,     # Enable SOC
             bg_ema_weight=0.85  # <--- Decrease thermal inertia for rapid recovery!
@@ -444,15 +421,10 @@ class TestBinghamTracker(unittest.TestCase):
             print("Tracker 0 Error", self._evaluate_cubic_symmetric_error(U_true, U_preds[0]))
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Best-Idx={best_idx:3d} | Sym-Err={err:6.2f}° | Free-Energy={metrics['loss']:.2f} | Entropy={entropy:.2f} | Jensen={metrics['jensen_bound']:.2f}")
 
-        final_U = run_bingham_tracker(
+        final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
-            sigma_q_start=0.15,    # Open the capture funnel wide at t=0 so trackers can see the peak through the noise
-            sigma_q_min=0.02,      # Tighten smoothly to the physical simulation limits
             annealing_rate=5,    # Smooth time-driven cooling funnel
-            gamma_step=100.0,
-            kappa_init=1.0,
-            n_ensemble=64,       
             streaming_callback=streaming_callback,
             gamma_c=0.05,
             loss_ema_weight=0.05,
@@ -496,15 +468,10 @@ class TestBinghamTracker(unittest.TestCase):
             recorded_errors.append(err)
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Eigengap={metrics['eigengap']:.2f}")
 
-        final_U = run_bingham_tracker(
+        final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
-            sigma_q_start=0.20,       # Start near the Nyquist limits
-            sigma_q_min=0.02,        # Cool down tightly to resolve fine structural features
             annealing_rate=1.0,      # Smooth physical time cooling funnel
-            gamma_step=50.0,
-            kappa_init=5.0,
-            n_ensemble=1,            # Single tracker is sufficient to test local convergence
             d_min=1.5,               # Open up the high-resolution shell to activate the high-Q lever arm
             d_max=8.0,
             streaming_callback=streaming_callback,
@@ -536,6 +503,68 @@ class TestBinghamTracker(unittest.TestCase):
             recorded_errors[-1], 
             recorded_errors[0], 
             f"Kinematic Failure: Crystalline funnel did not actively refine the seed error."
+        )
+
+class TestTrackerInitialization:
+    @pytest.fixture
+    def mock_reciprocal_h5(self, tmp_path):
+        """ Generates a valid test fixture file containing a known crystal sample layout. """
+        h5_path = tmp_path / "mock_finder.h5"
+        
+        # Generate a deterministic orientation matrix with a known 5.0 degree error offset
+        rot_true = scipy.spatial.transform.Rotation.from_euler('xyz', [10.0, 20.0, 30.0], degrees=True)
+        rot_error = scipy.spatial.transform.Rotation.from_euler('x', [5.0], degrees=True)
+        rot_seed = rot_true * rot_error
+        
+        import h5py
+        with h5py.File(h5_path, "w") as f:
+            f.create_dataset("sample/a", data=5.43)
+            f.create_dataset("sample/b", data=5.43)
+            f.create_dataset("sample/c", data=5.43)
+            f.create_dataset("sample/alpha", data=90.0)
+            f.create_dataset("sample/beta", data=90.0)
+            f.create_dataset("sample/gamma", data=90.0)
+            f.create_dataset("sample/space_group", data=b"F m -3 m")
+            f.create_dataset("sample/U", data=rot_seed.as_matrix())
+            
+        return str(h5_path), rot_seed.as_matrix(), rot_true.as_matrix()
+
+    def test_local_capture_initialization_gauge(self, mock_reciprocal_h5):
+        """
+        Verifies that the tracking prior correctly imports the initial seed 
+        without introducing any stride, layout, or transposition offsets.
+        """
+        h5_file, U_seed, _ = mock_reciprocal_h5
+        
+        # Mock an empty single-step batch array to isolate the initialization block
+        mock_batch = [
+            (
+                np.zeros((0, 3), dtype=np.float32),  # q_batch
+                np.array([0.0]),                      # t_batch
+                None, None, None, None, None,
+                np.array([[0.0, 0.0, 1.0]]),         # ki_sample
+                None
+            )
+        ]
+        
+        # Execute tracking graph up to the end of the entry sequence
+        final_U = run_spectral_holonomic_tracker(
+            finder_file=h5_file,
+            event_batches=mock_batch,
+            L_max=8,
+            sigma_q_start=0.01  # Sharp spike initialization
+        )
+        
+        # Calculate angular trace metric between the seed and extracted tracking frame
+        trace_val = np.clip((np.trace(final_U.T @ U_seed) - 1.0) / 2.0, -1.0, 1.0)
+        angular_error_deg = np.degrees(np.arccos(trace_val))
+        
+        print(f"\n[Validation Test] Extracted Angle Error to Seed Matrix: {angular_error_deg:.6f}°")
+        
+        # Assert that the extracted frame matches the injected seed matrix with machine precision
+        assert angular_error_deg < 1e-4, (
+            f"Gauge error detected! The tracker scrambled the input matrix at startup. "
+            f"Expected initial error offset: 0.00°, got {angular_error_deg:.4f}°"
         )
 
 if __name__ == '__main__':

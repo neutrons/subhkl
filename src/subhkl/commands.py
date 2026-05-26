@@ -1362,540 +1362,340 @@ class RunPeaks:
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-def run_bingham_tracker(
+import os
+import h5py
+import numpy as np
+import jax
+import jax.numpy as jnp
+import scipy.special
+import e3nn_jax as e3nn
+
+@jax.jit(static_argnames=['L_max'])
+def compute_legendre_window_weights(q_mags, wl_min, wl_max, L_max):
+    M = q_mags.shape[0]
+    x_max = jnp.clip(-0.5 * q_mags * wl_min, -1.0, 1.0)
+    x_min = jnp.clip(-0.5 * q_mags * wl_max, -1.0, 1.0)
+
+    P_min = [jnp.ones(M), x_min]
+    P_max = [jnp.ones(M), x_max]
+
+    for l in range(1, L_max + 1):
+        P_next_min = ((2 * l + 1) * x_min * P_min[-1] - l * P_min[-2]) / (l + 1)
+        P_next_max = ((2 * l + 1) * x_max * P_max[-1] - l * P_max[-2]) / (l + 1)
+        P_min.append(P_next_min)
+        P_max.append(P_next_max)
+
+    w_list = [0.5 * (x_max - x_min)]
+    for l in range(1, L_max + 1):
+        int_max = (P_max[l+1] - P_max[l-1]) / (2 * l + 1)
+        int_min = (P_min[l+1] - P_min[l-1]) / (2 * l + 1)
+        w_l = 0.5 * (2 * l + 1) * (int_max - int_min)
+        w_list.append(w_l)
+
+    return jnp.stack(w_list, axis=0)
+
+def run_spectral_holonomic_tracker(
     finder_file: str,
     event_batches,
     instrument_name: str | None = None,
     streaming_callback=None,
-    sigma_q_start: float = 1.0,
-    sigma_q_min: float = 0.05,
-    annealing_rate: float = 5.0,
-    gamma_step: float = 100.0,   # Kinematic Annihilation: Decay per radian of motor movement
-    kappa_init: float = 100.0,
+    sigma_q_start: float = 0.15,
+    annealing_rate: float = 1.0,
+    gamma_step: float = 100.0,
     h_max: int = 6,
-    n_ensemble: int = 1,
-    b_factor: float = 0.0,
     d_min: float = 2.0,
     d_max: float = 8.0,
     bg_ema_weight: float = 0.99,
     loss_ema_weight: float = 0.05,
-    wl_min_tracking: float = 0.0,
+    wl_min_tracking: float = 0.5,
     wl_max_tracking: float = 12.0,
     max_rate_hz: float = np.inf,
     max_gpu_batch_size: int = 2048,
-    L_max = 8,
-    gamma_time: float = 1.0,   # The baseline Epsilon drift
+    L_max: int = 8,
+    gamma_time: float = 1.0,
     gamma_sig: float = 1e-4,
-    gamma_c = 0.005,             # Critical Diffusion Gain for Self-Organized Criticality
+    gamma_c: float = 0.005,
 ):
-    apply_detector_calibration(finder_file, instrument_name)
-
-    from subhkl.optimization import FindUB, get_lattice_system
-    import h5py
-    import numpy as np
-    import jax
-    import jax.numpy as jnp
-    import scipy.special
-
-    import e3nn_jax as e3nn
+    from subhkl.optimization import FindUB
 
     irreps_str = " + ".join([f"{l}e" if l % 2 == 0 else f"{l}o" for l in range(L_max + 1)])
     sh_irreps = e3nn.Irreps(irreps_str)
 
-    # ====================================================================
-    # GLOBAL CONTINUOUS VACUUM INITIALIZATION
-    # ====================================================================
-    num_coeffs = sum(2 * l + 1 for l in range(L_max + 1))
-    C_spectral_state = jnp.zeros(num_coeffs)
-
-    laplacian_eigenvalues = []
+    block_slices = []
+    wigner_slices = []
+    sh_idx = 0
+    wig_idx = 0
     for l in range(L_max + 1):
-        laplacian_eigenvalues.extend([l * (l + 1)] * (2 * l + 1))
-    laplacian_jax = jnp.array(laplacian_eigenvalues)
+        dim = 2 * l + 1
+        block_slices.append(slice(sh_idx, sh_idx + dim))
+        wigner_slices.append(slice(wig_idx, wig_idx + (dim * dim)))
+        sh_idx += dim
+        wig_idx += dim * dim
 
-    @jax.jit
-    def evolve_vacuum_sde(C_prev, q_batch, lambda_short_scalar, dt, tau):
-        """
-        Gridless Spectral-Galerkin update using fully Implicit sinks and diffusion.
-        """
-        # --- TERM 2: Low-Frequency Ewald Pull (Explicit Observation) ---
-        Y_exp_batch = e3nn.spherical_harmonics(sh_irreps, q_batch, normalize=True).array
-
-        # ewald_pull * dt is algebraically just the sum of the incoming discrete events
-        batch_sum = jnp.sum(Y_exp_batch, axis=0)
-        C_explicit = C_prev + batch_sum
-
-        # --- TERM 1 & 3: Diagonal Heat Decay & KS Scalar Sink (Implicit) ---
-        implicit_denom = 1.0 + (lambda_short_scalar * dt) + (tau * laplacian_jax * dt)
-        C_new = C_explicit / implicit_denom
-
-        return C_new
+    num_wigner_coeffs_active = sum((2 * l + 1) ** 2 for l in range(1, L_max + 1))
 
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
-
     ub_helper = FindUB()
     U_init = None
     with h5py.File(finder_file, "r") as f:
-        ub_helper.a = f["sample/a"][()] if "sample/a" in f else None
-        ub_helper.b = f["sample/b"][()] if "sample/b" in f else None
-        ub_helper.c = f["sample/c"][()] if "sample/c" in f else None
-        ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else None
-        ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else None
-        ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else None
-
-        sg = f["sample/space_group"][()]
+        ub_helper.a = f["sample/a"][()] if "sample/a" in f else 10.0
+        ub_helper.b = f["sample/b"][()] if "sample/b" in f else 10.0
+        ub_helper.c = f["sample/c"][()] if "sample/c" in f else 10.0
+        ub_helper.alpha = f["sample/alpha"][()] if "sample/alpha" in f else 90.0
+        ub_helper.beta = f["sample/beta"][()] if "sample/beta" in f else 90.0
+        ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else 90.0
+        sg = f["sample/space_group"][()] if "sample/space_group" in f else b"P 1"
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
 
-        if "sample/U" in f:
-            U_init = f["sample/U"][()]
-            print("  > Discovered seed U matrix in finder file. Will initialize Bingham Prior.")
+        for key in ["sample/U_init", "sample/initial_U", "sample/U_seed", "orientation/U", "sample/U"]:
+            if key in f:
+                U_init = f[key][()]
+                break
 
     B_mat = ub_helper.reciprocal_lattice_B()
-    _, _, centering = get_lattice_system(
-        ub_helper.a, ub_helper.b, ub_helper.c,
-        ub_helper.alpha, ub_helper.beta, ub_helper.gamma, ub_helper.space_group
-    )
-
-    if centering == "I": M_prim = jnp.array([[0.5, 0.5, -0.5], [-0.5, 0.5, 0.5], [0.5, -0.5, 0.5]])
-    elif centering == "F": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.0, 0.5, 0.5], [0.5, 0.0, 0.5]])
-    elif centering == "C": M_prim = jnp.array([[0.5, 0.5, 0.0], [0.5, -0.5, 0.0], [0.0, 0.0, 1.0]])
-    elif centering == "A": M_prim = jnp.array([[1.0, 0.0, 0.0], [0.0, 0.5, 0.5], [0.0, 0.5, -0.5]])
-    elif centering == "B": M_prim = jnp.array([[0.5, 0.0, 0.5], [0.0, 1.0, 0.0], [0.5, 0.0, -0.5]])
-    elif centering == "R": M_prim = jnp.array([[2/3, 1/3, 1/3], [-1/3, 1/3, 1/3], [-1/3, -2/3, 1/3]])
-    else: M_prim = jnp.eye(3)
-
-    print("  > Pre-computing Forward-Mapping HKL Grid for Continuous Tracking...")
     h_vals = np.arange(-h_max, h_max + 1)
     hc, kc, lc = np.meshgrid(h_vals, h_vals, h_vals, indexing="ij")
     hkl_c = np.stack([hc.flatten(), kc.flatten(), lc.flatten()], axis=0)
-
     mask_hkl_c = ~((hkl_c[0] == 0) & (hkl_c[1] == 0) & (hkl_c[2] == 0))
-    theo_hkl = hkl_c[:, mask_hkl_c]
-
-    M_prim_np = np.array(M_prim)
-    h_p = M_prim_np[0, 0]*theo_hkl[0] + M_prim_np[0, 1]*theo_hkl[1] + M_prim_np[0, 2]*theo_hkl[2]
-    k_p = M_prim_np[1, 0]*theo_hkl[0] + M_prim_np[1, 1]*theo_hkl[1] + M_prim_np[1, 2]*theo_hkl[2]
-    l_p = M_prim_np[2, 0]*theo_hkl[0] + M_prim_np[2, 1]*theo_hkl[1] + M_prim_np[2, 2]*theo_hkl[2]
-
-    is_valid = (np.abs(h_p - np.round(h_p)) < 1e-4) & \
-               (np.abs(k_p - np.round(k_p)) < 1e-4) & \
-               (np.abs(l_p - np.round(l_p)) < 1e-4)
-    theo_hkl = theo_hkl[:, is_valid].astype(np.float32)
+    theo_hkl = hkl_c[:, mask_hkl_c].astype(np.float32)
 
     q_theo_cryst = np.array(B_mat @ theo_hkl)
     q_mags_np = np.linalg.norm(q_theo_cryst, axis=0)
-
-    q_min_tracking = 1.0 / d_max
-    q_max_tracking = 1/max(d_min, 1e-6)
-
-    res_mask = (q_mags_np < q_max_tracking) & (q_mags_np > q_min_tracking)
+    res_mask = (q_mags_np < (1.0 / d_min)) & (q_mags_np > (1.0 / d_max))
     q_theo_cryst = q_theo_cryst[:, res_mask]
-    q_mags_np = q_mags_np[res_mask]
-
-    q_theo_cryst_jax = jnp.array(q_theo_cryst)
-    q_mags_jax = jnp.array(q_mags_np)
-    q_theo_sample_jax = q_theo_cryst_jax / jnp.where(q_mags_jax == 0, 1.0, q_mags_jax)
-
-    ub_helper.ki_vec = np.array([0.0, 0.0, 1.0])
-    ki_vec_jax = jnp.array(ub_helper.ki_vec)
-    ki_vec_jax = ki_vec_jax / (jnp.linalg.norm(ki_vec_jax) + 1e-9)
-
-    lambda_max_jax = 4.0 * jnp.pi / (q_mags_jax + 1e-9)
-
-    expected_noise_ll = float(np.log(1.0 / (4.0 * np.pi)))
-    print(f"  > Exact Spherical Background Noise Floor (Log-Likelihood): {expected_noise_ll:.2f}")
-
-    @jax.jit
-    def quaternion_to_rotation_matrix(r):
-        w, x, y, z = r[0], r[1], r[2], r[3]
-        return jnp.array([
-            [w*w+x*x-y*y-z*z, 2*(x*y-w*z),     2*(x*z+w*y)],
-            [2*(x*y+w*z),     w*w-x*x+y*y-z*z, 2*(y*z-w*x)],
-            [2*(x*z-w*y),     2*(y*z+w*x),     w*w-x*x-y*y+z*z]
-        ])
-
-    @jax.jit
-    def compute_A_from_C(C):
-        trC = jnp.trace(C)
-        z = jnp.array([C[2, 1] - C[1, 2],
-                       C[0, 2] - C[2, 0],
-                       C[1, 0] - C[0, 1]])
-
-        A00 = jnp.array([[trC]])
-        A01 = z[None, :]
-        A10 = z[:, None]
-        A11 = C + C.T - trC * jnp.eye(3)
-
-        return jnp.concatenate([
-            jnp.concatenate([A00, A01], axis=1),
-            jnp.concatenate([A10, A11], axis=1)
-        ], axis=0)
+    q_mags_jax = jnp.array(q_mags_np[res_mask])
+    q_theo_sample_jax = jnp.array(q_theo_cryst / np.where(q_mags_np[res_mask] == 0, 1.0, q_mags_np[res_mask]))
+    num_peaks = float(q_theo_sample_jax.shape[1])
 
     Y_theo_cryst_jax = e3nn.spherical_harmonics(sh_irreps, q_theo_sample_jax.T, normalize=True).array
-
-    @jax.jit
-    def process_chunk(A_prev, bg_spec_prev, wl_hist_prev, q_batch, ki_batch, t_batch, C_spectral_in, current_sigma_q, delta_angle, current_tau, gamma_time, gamma_sig):
-        t_curr = t_batch[-1]
-        num_events = q_batch.shape[0]
-
-        vals, vecs = jnp.linalg.eigh(A_prev)
-        r = vecs[:, -1]
-        U = quaternion_to_rotation_matrix(r)
-
-        mu_theo = jnp.matmul(U, q_theo_sample_jax).T
-
-        q_mean = jnp.mean(q_mags_jax)
-        q_norm = q_mags_jax / q_mean
-        kappa_j = jnp.clip((q_norm ** 2) / (current_sigma_q ** 2), 1e-6, 1e6)
-
-        q_dot_ki_theo = jnp.dot(mu_theo, ki_batch[0])
-        lambda_theo = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
-
-        valid_wl_theo = (lambda_theo > 0.0) & (lambda_theo < float(wl_max_tracking))
-        safety_penalty_theo = jnp.where(valid_wl_theo, 0.0, -1e9)
-        wl_idx_theo = jnp.clip(jnp.floor(lambda_theo * 10.0).astype(jnp.int32), 0, int(num_wl_bins) - 1)
-
-        wl_pdf_spectral = wl_hist_prev / jnp.sum(wl_hist_prev)
-        peak_weights_spectral = jnp.exp(jnp.log(wl_pdf_spectral)[wl_idx_theo] + safety_penalty_theo)
-
-        extensive_peak_weights = peak_weights_spectral * kappa_j
-
-        # --------------------------------------------------------------------
-        # EXACT CONVOLUTION & INTENSIVE NORMALIZATION
-        # --------------------------------------------------------------------
-        C_vac_ir = e3nn.IrrepsArray(sh_irreps, C_spectral_in)
-        C_cryst = C_vac_ir.transform_by_matrix(U.T).array
-
-        # 1. Normalize the continuous vacuum wave into a true Probability Density
-        C_0 = jnp.maximum(C_spectral_in[0], 1e-9)
-        C_cryst_pdf = C_cryst / (C_0 * 4.0 * jnp.pi)
-
-        # EXACT HOLONOMIC FORMULATION: Divide by global num_peaks to reward trackers 
-        # that align MORE peaks, while maintaining an O(1) intensive scale!
-        num_peaks = float(q_theo_sample_jax.shape[1])
-        signal_density = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_cryst_pdf) * peak_weights_spectral) / num_peaks
-
-        # Precompute batch harmonics to avoid duplicate execution within the map loop
-        Y_exp_batch = e3nn.spherical_harmonics(sh_irreps, q_batch, normalize=True).array
-
-        # 2. Method A Low-Pass Filter: Smooth background spectrum using a Gaussian kernel
-        bg_kernel = jnp.exp(-laplacian_jax / (2.0 * 2.0))
-        C_bg_smoothed = bg_spec_prev * bg_kernel
-
-        # Continuous, gridless background evaluation at the theoretical peaks
-        bg_density_peaks = jnp.sum(jnp.dot(Y_theo_cryst_jax, C_bg_smoothed) * peak_weights_spectral) / (4.0 * jnp.pi)
-
-        # 3. Convert continuous density into an exact Log-Likelihood
-        bg_floor = 1.0 / (4.0 * jnp.pi)
-        safe_density = jnp.maximum(signal_density + bg_floor, 1e-9)
-        spectral_nll = -jnp.log(safe_density)
-
-        log_vmf_norm_j = jnp.log(kappa_j / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_j))
-
-        # Use dynamic SOC Tau for heat attenuation
-        kappa_tilde = kappa_j / (1.0 + 2.0 * current_tau * kappa_j)
-        log_vmf_norm_tilde = jnp.log(kappa_tilde / (2.0 * jnp.pi)) - jnp.log(-jnp.expm1(-2.0 * kappa_tilde))
-
-        # Background spectrum updates cleanly via explicit observation batch mean
-        C_bg_batch_mean = jnp.mean(Y_exp_batch, axis=0)
-        C_bg_new = bg_ema_weight * bg_spec_prev + (1.0 - bg_ema_weight) * C_bg_batch_mean
-
-        wl_max_jax = float(wl_max_tracking)
-        num_bins_jax = int(num_wl_bins)
-
-        wl_pdf = wl_hist_prev / jnp.sum(wl_hist_prev)
-        wl_log_pdf = jnp.log(wl_pdf)
-
-        def single_event_update(q_exp, ki_exp, Y_exp_event):
-            h_sample = jnp.matmul(U, q_theo_sample_jax)
-            cos_theta_err = jnp.dot(q_exp, h_sample)
-            q_dot_ki_theo = jnp.dot(ki_exp, h_sample)
-
-            lambda_j = -(2.0 / (q_mags_jax + 1e-9)) * q_dot_ki_theo
-            valid_wl = (lambda_j > 0.0) & (lambda_j < wl_max_jax)
-            safety_penalty = jnp.where(valid_wl, 0.0, -1e9)
-
-            wl_idx = jnp.clip(jnp.floor(lambda_j * 10.0).astype(jnp.int32), 0, num_bins_jax - 1)
-            learned_wl_prior = wl_log_pdf[wl_idx]
-
-            # --- 1. HARD-EM HOLONOMIC LATTICE FILTER ---
-            bg_wl_prior = jnp.log(1.0 / float(num_bins_jax))
-            num_peaks = float(q_theo_sample_jax.shape[1])
-
-            # Raw structural log-likelihoods over the lattice
-            peak_log_lik = kappa_j * (cos_theta_err - 1.0) + log_vmf_norm_j + learned_wl_prior + safety_penalty
-            peak_log_lik_tilde = kappa_tilde * (cos_theta_err - 1.0) + log_vmf_norm_tilde + learned_wl_prior + safety_penalty
-
-            # HARD-EM HOLONOMIC LIMIT: Isolate the single best peak match under the current orientation.
-            # Subtracting jnp.log(num_peaks) is mathematically mandatory to scale the peak density 
-            # against the global background sphere, completely eliminating the 5,000x hallucination!
-            best_peak_idx = jnp.argmax(peak_log_lik)
-            log_P_struct = peak_log_lik[best_peak_idx] - jnp.log(num_peaks)
-            log_P_struct_tilde = peak_log_lik_tilde[best_peak_idx] - jnp.log(num_peaks)
-
-            # Evaluate the continuous noise-free background density field at this event coordinate
-            bg_density_event = jnp.dot(Y_exp_event, C_bg_smoothed) / (4.0 * jnp.pi)
-            bg_density_event = jnp.maximum(bg_density_event, 1e-6)
-            dynamic_bg_log_lik = jnp.log(bg_density_event) + bg_wl_prior
-
-            # 2-Class Partition Function using the calibrated analytical frames
-            log_Z = jnp.logaddexp(log_P_struct, dynamic_bg_log_lik)
-            log_Z_tilde = jnp.logaddexp(log_P_struct_tilde, dynamic_bg_log_lik)
-
-            # --- TENSOR FORCE UPDATE ---
-            w_struct = jnp.exp(log_P_struct - log_Z)
-
-            weighted_h_geom = (w_struct * kappa_j[best_peak_idx]) * q_theo_sample_jax[:, best_peak_idx]
-            F_total = jnp.outer(q_exp, weighted_h_geom)
-
-            is_signal = w_struct > 0.5
-            actual_winning_lambda = lambda_j[best_peak_idx]
-
-            h_event = -w_struct * jnp.log(jnp.maximum(w_struct, 1e-12)) - jnp.exp(dynamic_bg_log_lik - log_Z) * jnp.log(jnp.maximum(jnp.exp(dynamic_bg_log_lik - log_Z), 1e-12))
-
-            return F_total, -log_Z, log_Z_tilde - log_Z, w_struct, is_signal, actual_winning_lambda, h_event
-
-        def single_event_wrapper(event_data):
-            q_exp, ki_exp, Y_exp_event = event_data
-            return single_event_update(q_exp, ki_exp, Y_exp_event)
-
-        K_batch, nll_batch, e_short_batch, w_struct_batch, is_signal_batch, actual_lambdas_batch, h_batch = jax.lax.map(
-            single_event_wrapper, (q_batch, ki_batch, Y_exp_batch), batch_size=max_gpu_batch_size,
-        )
-
-        entropy_mean = jnp.mean(h_batch)
-        signal_count = jnp.sum(w_struct_batch)
-
-        wl_idx_batch = jnp.floor(actual_lambdas_batch * 10.0).astype(jnp.int32)
-        valid_bin_mask = is_signal_batch & (actual_lambdas_batch > 0.0) & (actual_lambdas_batch < wl_max_jax)
-
-        raw_wl_hist = jnp.bincount(
-            jnp.where(valid_bin_mask, wl_idx_batch, num_bins_jax),
-            length=num_bins_jax + 1
-        )[:num_bins_jax]
-
-        wl_hist_new = bg_ema_weight * wl_hist_prev + (1.0 - bg_ema_weight) * raw_wl_hist + 1e-3
-
-        # --- SIGNAL-DRIVEN SDE KINEMATICS ---
-        dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
-        Gamma_batch = gamma_step * delta_angle + gamma_time * dt_chunk + gamma_sig * signal_count
-        decay_total = jnp.exp(-Gamma_batch)
-
-        A_diffused = A_prev * decay_total
-
-        # Sum the holonomic force matrices in raw 3x3 space
-        K_pure = jnp.sum(K_batch, axis=0)
-        K_target = K_pure / jnp.maximum(signal_count, 1.0)
-
-        # Map to 4x4 quaternion space EXACTLY ONCE per chunk
-        F_target = compute_A_from_C(K_target)
-
-        total_rate = num_events / dt_chunk
-        is_valid_batch = total_rate < max_rate_hz
-
-        # Equilibrium Update
-        A_updated = A_diffused + F_target * (1.0 - decay_total)
-
-        A_new = jnp.where(is_valid_batch, A_updated, A_prev)
-
-        C_bg_out = jnp.where(is_valid_batch, C_bg_new, bg_spec_prev)
-        wl_hist_out = jnp.where(is_valid_batch, wl_hist_new, wl_hist_prev)
-
-        vals_new = jnp.linalg.eigvalsh(A_new)
-        norm_gap = vals_new[-1] - vals_new[-2]
-
-        sig_rate = signal_count / dt_chunk
-        bg_rate = (num_events - signal_count) / dt_chunk
-
-        # Track the effective solid angle directly from the smoothed background spectrum via Plancherel
-        omega_eff = (4.0 * jnp.pi) / jnp.maximum(jnp.sum(jnp.square(C_bg_smoothed)), 1e-9)
-
-        return A_new, C_bg_out, wl_hist_out, t_curr, U, jnp.mean(nll_batch), jnp.mean(e_short_batch), spectral_nll, norm_gap, sig_rate, bg_rate, omega_eff, entropy_mean
-
-    ensemble_process_chunk = jax.jit(
-        jax.vmap(
-            process_chunk,
-            in_axes=(0, 0, 0, None, None, None, None, None, None, None, None, None),
-            out_axes=(0, 0, 0, None, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        )
-    )
-
-    print(f"\n[2/3] Executing Ensemble Bingham Tracking ({n_ensemble} simultaneous trackers)...")
-
-    rng = jax.random.PRNGKey(42)
-    r_random = jax.random.normal(rng, (n_ensemble, 4))
-    r_random = r_random / jnp.linalg.norm(r_random, axis=1, keepdims=True)
-    U_ensemble = jax.vmap(quaternion_to_rotation_matrix)(r_random)
-
-    C_ensemble = kappa_init * U_ensemble
-    A_ensemble_state = jax.vmap(compute_A_from_C)(C_ensemble)
+    w_l_j = compute_legendre_window_weights(q_mags_jax, wl_min_tracking, wl_max_tracking, L_max)
 
     if U_init is not None:
-        A_seed = compute_A_from_C(kappa_init * jnp.array(U_init))
-        A_ensemble_state = A_ensemble_state.at[0].set(A_seed)
+        U_init_jax = jnp.array(U_init)
+        c_init_list = []
+        for l in range(1, L_max + 1):
+            irrep = e3nn.Irrep(f"{l}e" if l % 2 == 0 else f"{l}o")
+            D_l = irrep.D_from_matrix(U_init_jax)
+            blur = jnp.exp(-l * (l + 1) * (sigma_q_start ** 2) / 2.0)
+            c_init_list.append((blur * D_l).flatten())
+        C_spectral_active = jnp.concatenate(c_init_list)
 
-    A_ensemble_state_seeds = jnp.array(A_ensemble_state)
+        epsilon_sample = 0.05
+        perturb_vectors = jnp.array([
+            [epsilon_sample, 0.0, 0.0], [-epsilon_sample, 0.0, 0.0],
+            [0.0, epsilon_sample, 0.0], [0.0, -epsilon_sample, 0.0],
+            [0.0, 0.0, epsilon_sample], [0.0, 0.0, -epsilon_sample]
+        ])
 
-    # Initialize background spectrum with the isotropic uniform floor (first coeff = 1.0, rest = 0.0)
-    bg_spec_init = jnp.zeros(num_coeffs).at[0].set(1.0)
-    bg_hist_ensemble = jnp.broadcast_to(bg_spec_init, (n_ensemble, num_coeffs))
+        def compute_perturbed_coefficients(omega):
+            theta = jnp.linalg.norm(omega)
+            safe_theta = jnp.where(theta < 1e-12, 1.0, theta)
+            axis = omega / safe_theta
+            K = jnp.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
+            R_perturb = jnp.eye(3) + jnp.sin(theta) * K + (1.0 - jnp.cos(theta)) * jnp.matmul(K, K)
+            R_perturb = jnp.where(theta < 1e-12, jnp.eye(3), R_perturb)
 
-    num_wl_bins = int(wl_max_tracking * 10.0)
-    wl_hist_ensemble = jnp.ones((n_ensemble, num_wl_bins)) * 1.0
+            U_pert = jnp.matmul(R_perturb, U_init_jax)
+            pert_list = []
+            for l in range(1, L_max + 1):
+                irrep = e3nn.Irrep(f"{l}e" if l % 2 == 0 else f"{l}o")
+                pert_list.append(irrep.D_from_matrix(U_pert).flatten())
+            return jnp.concatenate(pert_list)
 
-    tracking_history = []
-    t_start = None
-    t_state = 0.0
+        samples_matrix = jax.vmap(compute_perturbed_coefficients)(perturb_vectors)
+        centered_samples = samples_matrix - jnp.mean(samples_matrix, axis=0)
 
-    effective_annealing_time = 0.0
-    angles_prev = None
+        # INCREASED INITIAL VARIANCE BOUNDARY
+        P_spectral_full = jnp.matmul(centered_samples.T, centered_samples) / 5.0
+        P_spectral_full = P_spectral_full + 1e-2 * jnp.eye(num_wigner_coeffs_active)
+    else:
+        C_spectral_active = jnp.zeros(num_wigner_coeffs_active)
+        P_spectral_full = jnp.eye(num_wigner_coeffs_active) * 0.1
 
-    smoothed_spectral_ensemble = None
-    smoothed_eshort_ensemble = None
-    smoothed_loss_ensemble = None
-    ema_bg_rate = 1.0
+    sigma_measurement_noise = 0.5
 
-    for batch_data in event_batches:
-        q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
+    lap_diagonal_active = []
+    for l in range(1, L_max + 1):
+        lap_diagonal_active.extend([l * (l + 1)] * ((2 * l + 1) ** 2))
+    lap_diagonal_active = jnp.array(lap_diagonal_active)
 
-        if t_start is None and len(t_batch_np) > 0:
-            t_state = t_batch_np[0]
-            t_start = t_state
+    @jax.jit
+    def polar_extract_l1(c_l1_flat):
+        E_D1 = c_l1_flat.reshape((3, 3))
+        V, _, Wt = jnp.linalg.svd(E_D1)
+        return jnp.matmul(V, Wt)
 
-        dt_wall = float(t_batch_np[-1] - t_state)
+    def predict_multi_moment_observations(C_block_flat, T_vector, G_matrix, dim):
+        C_mat = C_block_flat.reshape((dim, dim))
+        z_1st = jnp.matmul(C_mat, T_vector)
+        z_2nd = jnp.matmul(C_mat, jnp.matmul(G_matrix, C_mat.T)).flatten()
+        return jnp.concatenate([z_1st, z_2nd])
 
-        angles_curr = angles_np[-1]
-        if angles_prev is None:
-            delta_angle = 0.0
-        else:
-            delta_angle = float(np.linalg.norm(angles_curr - angles_prev))
-        angles_prev = angles_curr
+    @jax.jit(static_argnames=['L_max'])
+    def evolve_full_covariance_kalman(C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt, tau, ewald_window, process_q_scale, L_max):
 
-        num_events = len(q_batch_np)
-        dt_chunk_py = max(1e-4, float(t_batch_np[-1] - t_batch_np[0]))
-        total_rate_py = num_events / dt_chunk_py
+        # GUARD: Prevent total coefficient collapse using a decay floor
+        raw_decay = jnp.exp(-tau * lap_diagonal_active * dt)
+        decay_vec = jnp.maximum(raw_decay, 0.999)
 
-        if total_rate_py < max_rate_hz:
-            effective_annealing_time += dt_chunk_py
+        C_state = C_prev * decay_vec
+        P_state = decay_vec[:, None] * P_prev * decay_vec[None, :]
 
-        current_sigma_q = max(
-            sigma_q_min,
-            sigma_q_start * np.exp(-annealing_rate * effective_annealing_time)
+        # DYNAMIC PROCESS NOISE INFLATION (Prevents P from vanishing)
+        P_state = P_state + jnp.eye(num_wigner_coeffs_active) * (process_q_scale * dt)
+
+        total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
+        state_offset = 0
+
+        for l in range(1, L_max + 1):
+            dim = 2 * l + 1
+            dim2 = dim * dim
+            state_slice = slice(state_offset, state_offset + dim2)
+
+            if l % 2 == 0:
+                Y_cryst_l = Y_theo_cryst_jax[:, block_slices[l]]
+                Y_lab_l = Y_events_lab[:, block_slices[l]]
+                T_template_l = jnp.sum(Y_cryst_l * ewald_window[:, None], axis=0) / total_window_mass
+                G_l = jnp.matmul(Y_cryst_l.T * ewald_window, Y_cryst_l) / total_window_mass
+
+                z_1st_data = Y_lab_sum[block_slices[l]] / num_events
+                A_lab_data = jnp.matmul(Y_lab_l.T, Y_lab_l) / num_events
+                z_data_unified = jnp.concatenate([z_1st_data, A_lab_data.flatten()])
+
+                C_l_curr = C_state[state_slice]
+                z_pred_unified = predict_multi_moment_observations(C_l_curr, T_template_l, G_l, dim)
+                H_l = jax.jacobian(predict_multi_moment_observations, argnums=0)(C_l_curr, T_template_l, G_l, dim)
+
+                c_pred_mat = C_l_curr.reshape((dim, dim))
+                A_pred_mat = jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T))
+
+                # NORMALIZED MEASUREMENT NOISE
+                sigma_l = (sigma_measurement_noise * (l * (l + 1) + 1.0)) / num_events + 1e-4
+                R_1st = sigma_l * (A_pred_mat + 1e-3 * jnp.eye(dim))
+                field_intensity = jnp.maximum(jnp.sum(jnp.square(C_l_curr)), 1e-3)
+
+                # Scale up 2nd-moment noise to prevent high-frequency overfitting
+                R_2nd = (sigma_l * 500.0 * field_intensity) * jnp.eye(dim2)
+
+                R_l = jnp.zeros((dim + dim2, dim + dim2))
+                R_l = R_l.at[0:dim, 0:dim].set(R_1st)
+                R_l = R_l.at[dim:, dim:].set(R_2nd)
+
+                P_slice = P_state[:, state_slice]
+                P_block = P_state[state_slice, state_slice]
+
+                S_l = jnp.matmul(H_l, jnp.matmul(P_block, H_l.T)) + R_l
+                S_l = S_l + 1e-4 * jnp.eye(S_l.shape[0])
+
+                K_global = jnp.matmul(P_slice, jnp.matmul(H_l.T, jnp.linalg.inv(S_l)))
+
+                Innovation_l = z_data_unified - z_pred_unified
+                C_state = C_state + has_events * jnp.matmul(K_global, Innovation_l)
+
+                # STABILIZED COVARIANCE REDUCTION
+                # Scale Kalman reduction by observation confidence
+                alpha_k = jnp.clip(1.0 - (1.0 / jnp.sqrt(num_events + 1.0)), 0.1, 1.0)
+                P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_l, P_slice.T))
+                P_state = 0.5 * (P_state + P_state.T)
+
+            state_offset += dim2
+
+        return C_state, P_state
+
+    @jax.jit(static_argnames=['L_max'])
+    def process_chunk_field_kalman(C_prev, P_prev, q_batch, ki_batch, t_batch, L_max):
+        dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
+        total_rate = q_batch.shape[0] / dt_chunk
+
+        actual_events = q_batch.shape[0]
+        has_events = jnp.where(actual_events > 0, 1.0, 0.0)
+        num_events = jnp.maximum(float(actual_events), 1.0)
+
+        C_full = jnp.concatenate([jnp.array([1.0]), C_prev])
+        Y_beam = e3nn.spherical_harmonics(sh_irreps, ki_batch[0], normalize=True).array
+
+        ewald_window_list = []
+        for l in range(L_max + 1):
+            dim = 2 * l + 1
+            c_l = C_full[wigner_slices[l]].reshape((dim, dim))
+            Y_beam_l = Y_beam[block_slices[l]]
+            Y_theo_l = Y_theo_cryst_jax[:, block_slices[l]]
+
+            inter_n = jnp.matmul(Y_beam_l, c_l)
+            p_j_l = jnp.matmul(Y_theo_l, inter_n)
+            ewald_window_list.append((w_l_j[l] / (2 * l + 1)) * p_j_l)
+
+        ewald_window = jnp.sum(jnp.stack(ewald_window_list), axis=0)
+        ewald_window = jnp.clip(ewald_window, 0.0, 1.0)
+
+        Y_events_lab = e3nn.spherical_harmonics(sh_irreps, q_batch, normalize=True).array
+        Y_lab_sum = jnp.sum(Y_events_lab, axis=0)
+
+        # Dynamic Process Noise tied to intensive flux
+        process_q_scale = 0.01 * (num_events / 1000.0)
+
+        mean_field_variance = jnp.maximum(1e-6, jnp.trace(P_prev) / num_wigner_coeffs_active)
+        current_tau = gamma_c * jnp.sqrt(mean_field_variance * 1000.0 + 1.0)
+
+        C_new, P_new = evolve_full_covariance_kalman(
+            C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt_chunk, current_tau, ewald_window, process_q_scale, L_max
         )
 
+        U_map = polar_extract_l1(C_new[0:9])
+
+        signal_mass = jnp.sum(jnp.square(C_new[0:9]))
+        intensive_signal_fraction = jnp.clip(signal_mass / 3.0, 0.0, 1.0)
+        sig_rate = intensive_signal_fraction * total_rate
+        bg_rate = jnp.maximum(total_rate - sig_rate, 0.0)
+        omega_eff = (4.0 * jnp.pi) * (jnp.sum(ewald_window) / num_peaks)
+        spectral_nll = -jnp.log(jnp.maximum(signal_mass + (1.0 / (4.0 * jnp.pi)), 1e-9))
+
+        return C_new, P_new, U_map, spectral_nll, sig_rate, bg_rate, omega_eff
+
+    print(f"\n[2/3] Executing Field Tracker Pipeline ({num_wigner_coeffs_active} Continuous Spectral Modes)...")
+    tracking_history = []
+    ema_bg_rate = 1.0
+    cumulative_count = 0
+
+    for batch_data in event_batches:
+        q_batch_np, t_batch_np, _, _, _, _, _, ki_sample_np, _ = batch_data
+        cumulative_count += len(q_batch_np)
+        if len(t_batch_np) == 0: continue
+
+        t_state = float(t_batch_np[-1])
         q_batch = jax.device_put(q_batch_np)
         q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
         t_batch = jax.device_put(t_batch_np)
-
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
-        # --------------------------------------------------------------------
-        # SOC: Data-Driven Intensive Scaling via the Background Field
-        # --------------------------------------------------------------------
-        # Extract active spatial coefficient mass natively from the background spectrum
-        active_bins = jnp.sum(jnp.abs(bg_hist_ensemble[0]) > 1e-3)
-        coverage_fraction = jnp.maximum(active_bins / float(num_coeffs), 1e-4)
-        intensive_bg_rate = ema_bg_rate / coverage_fraction
-
-        # Adaptive Tau based purely on the spatial density of the noise field
-        current_tau = gamma_c * jnp.sqrt(intensive_bg_rate + 1.0)
-
-        A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble, t_state, U_ensemble_curr, loss_ensemble, eshort_ensemble, spectral_losses, eigen_gaps, sig_rates, bg_rates, omega_effs, entropy_means = ensemble_process_chunk(
-            A_ensemble_state, bg_hist_ensemble, wl_hist_ensemble,
-            q_batch, ki_batch, t_batch, C_spectral_state, current_sigma_q, delta_angle, current_tau, gamma_time, gamma_sig
+        C_spectral_active, P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate, omega_eff = process_chunk_field_kalman(
+            C_spectral_active, P_spectral_full, q_batch, ki_batch, t_batch, L_max
         )
 
-        # Update EMA background rate for next cycle's Tau
-        current_mean_bg = float(np.mean(bg_rates))
-        ema_bg_rate = bg_ema_weight * ema_bg_rate + (1.0 - bg_ema_weight) * current_mean_bg
-
-        # --------------------------------------------------------------------
-        # The KS Scalar Sink: Bayesian Expected Rate
-        # --------------------------------------------------------------------
-        ensemble_weights = jax.nn.softmax(-loss_ensemble)
-        expected_lambda_short = jnp.sum(sig_rates * ensemble_weights)
-
-        # --------------------------------------------------------------------
-        # Evolve the Continuous Vacuum Field (Instantaneous Unitarity)
-        # --------------------------------------------------------------------
-        C_spectral_state = evolve_vacuum_sde(
-            C_spectral_state, q_batch, expected_lambda_short, dt_chunk_py, current_tau
-        )
-
-        spectral_losses_np = np.array(spectral_losses)
-        eshort_ensemble_np = np.array(eshort_ensemble)
-        loss_ensemble_np = np.array(loss_ensemble)
-        entropy_ensemble_np = np.array(entropy_means)
-
-        if smoothed_eshort_ensemble is None:
-            smoothed_eshort_ensemble = eshort_ensemble_np
-            smoothed_spectral_ensemble = spectral_losses_np
-            smoothed_loss_ensemble = loss_ensemble_np
-            smoothed_entropy_ensemble = entropy_ensemble_np
-        else:
-            smoothed_eshort_ensemble = (1.0 - loss_ema_weight) * smoothed_eshort_ensemble + loss_ema_weight * eshort_ensemble_np
-            smoothed_spectral_ensemble = (1.0 - loss_ema_weight) * smoothed_spectral_ensemble + loss_ema_weight * spectral_losses_np
-            smoothed_loss_ensemble = (1.0 - loss_ema_weight) * smoothed_loss_ensemble + loss_ema_weight * loss_ensemble_np
-            smoothed_entropy_ensemble = (1.0 - loss_ema_weight) * smoothed_entropy_ensemble + loss_ema_weight * entropy_ensemble_np
-
-        jensen_bound = smoothed_spectral_ensemble + smoothed_eshort_ensemble
-        best_idx = int(np.argmin(jensen_bound))
-
-        ensemble_weights = jax.nn.softmax(-loss_ensemble)
-        wl_hist_weighted = jnp.sum(wl_hist_ensemble * ensemble_weights[:, None], axis=0)
-        wl_hist_ensemble = jnp.broadcast_to(wl_hist_weighted, wl_hist_ensemble.shape)
-
-        U_best = np.array(U_ensemble_curr[best_idx])
-        best_gap = float(eigen_gaps[best_idx])
-        best_loss = float(smoothed_loss_ensemble[best_idx])
-        best_spectral_nll = float(spectral_losses[best_idx])
-
-        tracking_history.append((float(t_state), U_best))
-
-        current_sig_rate = float(sig_rates[best_idx])
-        current_bg_rate = float(bg_rates[best_idx])
+        ema_bg_rate = bg_ema_weight * ema_bg_rate + (1.0 - bg_ema_weight) * float(bg_rate)
+        U_best = np.array(U_curr)
+        tracking_history.append((t_state, U_best))
+        norm_gap_metric = float(jnp.sum(jnp.square(C_spectral_active[0:9])))
 
         if cumulative_count % 50000 < len(t_batch_np):
-            print(f"    Time {t_state:.2f}s | Sig/Bg: {current_sig_rate:.0f}/{current_bg_rate:.0f} Hz | Step-Rot: {delta_angle:.4f} rad | Norm-Gap: {best_gap:8.2f} | Tau: {float(current_tau):.4f}")
+            print(f"    Time {t_state:.2f}s | Sig/Bg: {float(sig_rate):.0f}/{float(bg_rate):.0f} Hz | Coherent-Mass: {norm_gap_metric:8.2f} | Active-Solid-Angle: {float(omega_eff):.4f} sr")
 
         if streaming_callback is not None:
-            new_events = {
-                "banks": banks_np,
-                "pixel_r": pr_np,
-                "pixel_c": pc_np,
-                "angles": angles_np,
-                "s_lab": slab_np
-            }
-
-            metrics_dict = {
-                "loss": best_loss,
-                "spectral_nll": best_spectral_nll,
-                "jensen_bound": float(jensen_bound[best_idx]),
-                "entropy": float(smoothed_entropy_ensemble[best_idx]),
-                "eigengap": best_gap,
-                "sig_rate": current_sig_rate,
-                "bg_rate": current_bg_rate,
-                "sigma_q": current_sigma_q,
-                "omega_eff": float(omega_effs[best_idx]), # Export streaming effective solid angle metric
-                "wl_hist": np.array(wl_hist_ensemble[best_idx]),
-                "wl_max": wl_max_tracking,
-                "tau": float(current_tau),
-            }
-
             streaming_callback(
-                time=float(t_state),
-                U_preds=np.array(U_ensemble_curr),
-                losses=np.array(loss_ensemble),
-                best_idx=best_idx,
-                neutron_count=cumulative_count,
-                new_events=new_events,
-                metrics=metrics_dict,
+                time=t_state, U_preds=np.expand_dims(U_best, axis=0),
+                losses=np.array([float(spectral_nll)]), best_idx=0,
+                neutron_count=cumulative_count, new_events={},
+                metrics={"loss": float(spectral_nll), "eigengap": norm_gap_metric, "sig_rate": float(sig_rate), "bg_rate": float(bg_rate), "omega_eff": float(omega_eff)}
             )
 
-    if not tracking_history:
-        print("\n[3/3] Tracking complete. No events were processed.")
-        return None
+    print(f"\n[3/3] Global Tracking complete. Saving continuous Wigner-D state dataset.")
+    with h5py.File(finder_file, "a") as f:
+        if "tracking" in f: del f["tracking"]
+        group = f.create_group("tracking")
+        C_final_export = np.concatenate([np.array([1.0]), np.array(C_spectral_active)])
+        group.create_dataset("wigner_coefficients", data=C_final_export)
+        group.create_dataset("final_u_matrix", data=np.array(tracking_history[-1][1]))
+        group.create_dataset("timestamps", data=np.array([h[0] for h in tracking_history]))
 
-    print(f"\n[3/3] Global Tracking complete. Extracted {len(tracking_history)} continuous U-matrices.")
     return tracking_history[-1][1]
