@@ -1375,24 +1375,25 @@ def compute_legendre_window_weights(q_mags, wl_min, wl_max, L_max):
     M = q_mags.shape[0]
     x_max = jnp.clip(-0.5 * q_mags * wl_min, -1.0, 1.0)
     x_min = jnp.clip(-0.5 * q_mags * wl_max, -1.0, 1.0)
-
+    
     P_min = [jnp.ones(M), x_min]
     P_max = [jnp.ones(M), x_max]
-
+    
     for l in range(1, L_max + 1):
         P_next_min = ((2 * l + 1) * x_min * P_min[-1] - l * P_min[-2]) / (l + 1)
         P_next_max = ((2 * l + 1) * x_max * P_max[-1] - l * P_max[-2]) / (l + 1)
         P_min.append(P_next_min)
         P_max.append(P_next_max)
-
+        
     w_list = [0.5 * (x_max - x_min)]
     for l in range(1, L_max + 1):
         int_max = (P_max[l+1] - P_max[l-1]) / (2 * l + 1)
         int_min = (P_min[l+1] - P_min[l-1]) / (2 * l + 1)
         w_l = 0.5 * (2 * l + 1) * (int_max - int_min)
         w_list.append(w_l)
-
+        
     return jnp.stack(w_list, axis=0)
+
 
 def run_spectral_holonomic_tracker(
     finder_file: str,
@@ -1415,12 +1416,21 @@ def run_spectral_holonomic_tracker(
     gamma_time: float = 1.0,
     gamma_sig: float = 1e-4,
     gamma_c: float = 0.005,
+    # Exposed Physical Hyperparameters
+    init_tangent_blur: float = 0.05,
+    prior_ridge: float = 1e-2,
+    meas_noise_1st: float = 0.5,
+    meas_weight_2nd: float = 500.0,
+    ridge_inflation: float = 1e-4,
 ):
     from subhkl.optimization import FindUB
-
+    
+    # --------------------------------------------------------------------
+    # 1. Full Fourier Space Layout Setup
+    # --------------------------------------------------------------------
     irreps_str = " + ".join([f"{l}e" if l % 2 == 0 else f"{l}o" for l in range(L_max + 1)])
     sh_irreps = e3nn.Irreps(irreps_str)
-
+    
     block_slices = []
     wigner_slices = []
     sh_idx = 0
@@ -1434,6 +1444,9 @@ def run_spectral_holonomic_tracker(
 
     num_wigner_coeffs_active = sum((2 * l + 1) ** 2 for l in range(1, L_max + 1))
 
+    # --------------------------------------------------------------------
+    # 2. Reciprocal Space Geometry Setup
+    # --------------------------------------------------------------------
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
     ub_helper = FindUB()
     U_init = None
@@ -1446,7 +1459,7 @@ def run_spectral_holonomic_tracker(
         ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else 90.0
         sg = f["sample/space_group"][()] if "sample/space_group" in f else b"P 1"
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
-
+        
         for key in ["sample/U_init", "sample/initial_U", "sample/U_seed", "orientation/U", "sample/U"]:
             if key in f:
                 U_init = f[key][()]
@@ -1462,6 +1475,7 @@ def run_spectral_holonomic_tracker(
     q_theo_cryst = np.array(B_mat @ theo_hkl)
     q_mags_np = np.linalg.norm(q_theo_cryst, axis=0)
     res_mask = (q_mags_np < (1.0 / d_min)) & (q_mags_np > (1.0 / d_max))
+    
     q_theo_cryst = q_theo_cryst[:, res_mask]
     q_mags_jax = jnp.array(q_mags_np[res_mask])
     q_theo_sample_jax = jnp.array(q_theo_cryst / np.where(q_mags_np[res_mask] == 0, 1.0, q_mags_np[res_mask]))
@@ -1470,8 +1484,12 @@ def run_spectral_holonomic_tracker(
     Y_theo_cryst_jax = e3nn.spherical_harmonics(sh_irreps, q_theo_sample_jax.T, normalize=True).array
     w_l_j = compute_legendre_window_weights(q_mags_jax, wl_min_tracking, wl_max_tracking, L_max)
 
+    # --------------------------------------------------------------------
+    # 3. Vector State & Geometry-Coupled Covariance Initialization
+    # --------------------------------------------------------------------
     if U_init is not None:
         U_init_jax = jnp.array(U_init)
+        
         c_init_list = []
         for l in range(1, L_max + 1):
             irrep = e3nn.Irrep(f"{l}e" if l % 2 == 0 else f"{l}o")
@@ -1479,14 +1497,13 @@ def run_spectral_holonomic_tracker(
             blur = jnp.exp(-l * (l + 1) * (sigma_q_start ** 2) / 2.0)
             c_init_list.append((blur * D_l).flatten())
         C_spectral_active = jnp.concatenate(c_init_list)
-
-        epsilon_sample = 0.05
+        
         perturb_vectors = jnp.array([
-            [epsilon_sample, 0.0, 0.0], [-epsilon_sample, 0.0, 0.0],
-            [0.0, epsilon_sample, 0.0], [0.0, -epsilon_sample, 0.0],
-            [0.0, 0.0, epsilon_sample], [0.0, 0.0, -epsilon_sample]
+            [init_tangent_blur, 0.0, 0.0], [-init_tangent_blur, 0.0, 0.0],
+            [0.0, init_tangent_blur, 0.0], [0.0, -init_tangent_blur, 0.0],
+            [0.0, 0.0, init_tangent_blur], [0.0, 0.0, -init_tangent_blur]
         ])
-
+        
         def compute_perturbed_coefficients(omega):
             theta = jnp.linalg.norm(omega)
             safe_theta = jnp.where(theta < 1e-12, 1.0, theta)
@@ -1494,31 +1511,32 @@ def run_spectral_holonomic_tracker(
             K = jnp.array([[0.0, -axis[2], axis[1]], [axis[2], 0.0, -axis[0]], [-axis[1], axis[0], 0.0]])
             R_perturb = jnp.eye(3) + jnp.sin(theta) * K + (1.0 - jnp.cos(theta)) * jnp.matmul(K, K)
             R_perturb = jnp.where(theta < 1e-12, jnp.eye(3), R_perturb)
-
+            
             U_pert = jnp.matmul(R_perturb, U_init_jax)
             pert_list = []
             for l in range(1, L_max + 1):
                 irrep = e3nn.Irrep(f"{l}e" if l % 2 == 0 else f"{l}o")
                 pert_list.append(irrep.D_from_matrix(U_pert).flatten())
             return jnp.concatenate(pert_list)
-
+            
         samples_matrix = jax.vmap(compute_perturbed_coefficients)(perturb_vectors)
         centered_samples = samples_matrix - jnp.mean(samples_matrix, axis=0)
-
-        # INCREASED INITIAL VARIANCE BOUNDARY
-        P_spectral_full = jnp.matmul(centered_samples.T, centered_samples) / 5.0
-        P_spectral_full = P_spectral_full + 1e-2 * jnp.eye(num_wigner_coeffs_active)
+        
+        num_samples = float(perturb_vectors.shape[0])
+        P_spectral_full = jnp.matmul(centered_samples.T, centered_samples) / (num_samples - 1.0)
+        P_spectral_full = P_spectral_full + prior_ridge * jnp.eye(num_wigner_coeffs_active)
     else:
         C_spectral_active = jnp.zeros(num_wigner_coeffs_active)
         P_spectral_full = jnp.eye(num_wigner_coeffs_active) * 0.1
-
-    sigma_measurement_noise = 0.5
-
+        
     lap_diagonal_active = []
     for l in range(1, L_max + 1):
         lap_diagonal_active.extend([l * (l + 1)] * ((2 * l + 1) ** 2))
     lap_diagonal_active = jnp.array(lap_diagonal_active)
 
+    # --------------------------------------------------------------------
+    # 4. JIT-Compiled Functional Auto-Jacobian Sequential Engine
+    # --------------------------------------------------------------------
     @jax.jit
     def polar_extract_l1(c_l1_flat):
         E_D1 = c_l1_flat.reshape((3, 3))
@@ -1533,71 +1551,60 @@ def run_spectral_holonomic_tracker(
 
     @jax.jit(static_argnames=['L_max'])
     def evolve_full_covariance_kalman(C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt, tau, ewald_window, process_q_scale, L_max):
-
-        # GUARD: Prevent total coefficient collapse using a decay floor
-        raw_decay = jnp.exp(-tau * lap_diagonal_active * dt)
-        decay_vec = jnp.maximum(raw_decay, 0.999)
-
+        decay_vec = jnp.maximum(jnp.exp(-tau * lap_diagonal_active * dt), 0.999) 
         C_state = C_prev * decay_vec
         P_state = decay_vec[:, None] * P_prev * decay_vec[None, :]
-
-        # DYNAMIC PROCESS NOISE INFLATION (Prevents P from vanishing)
         P_state = P_state + jnp.eye(num_wigner_coeffs_active) * (process_q_scale * dt)
 
         total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
         state_offset = 0
-
+        
         for l in range(1, L_max + 1):
             dim = 2 * l + 1
             dim2 = dim * dim
             state_slice = slice(state_offset, state_offset + dim2)
-
+            
             if l % 2 == 0:
                 Y_cryst_l = Y_theo_cryst_jax[:, block_slices[l]]
                 Y_lab_l = Y_events_lab[:, block_slices[l]]
                 T_template_l = jnp.sum(Y_cryst_l * ewald_window[:, None], axis=0) / total_window_mass
                 G_l = jnp.matmul(Y_cryst_l.T * ewald_window, Y_cryst_l) / total_window_mass
-
+                
                 z_1st_data = Y_lab_sum[block_slices[l]] / num_events
                 A_lab_data = jnp.matmul(Y_lab_l.T, Y_lab_l) / num_events
                 z_data_unified = jnp.concatenate([z_1st_data, A_lab_data.flatten()])
-
+                
                 C_l_curr = C_state[state_slice]
                 z_pred_unified = predict_multi_moment_observations(C_l_curr, T_template_l, G_l, dim)
                 H_l = jax.jacobian(predict_multi_moment_observations, argnums=0)(C_l_curr, T_template_l, G_l, dim)
-
+                
                 c_pred_mat = C_l_curr.reshape((dim, dim))
                 A_pred_mat = jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T))
-
-                # NORMALIZED MEASUREMENT NOISE
-                sigma_l = (sigma_measurement_noise * (l * (l + 1) + 1.0)) / num_events + 1e-4
+                
+                sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / num_events + ridge_inflation
                 R_1st = sigma_l * (A_pred_mat + 1e-3 * jnp.eye(dim))
                 field_intensity = jnp.maximum(jnp.sum(jnp.square(C_l_curr)), 1e-3)
-
-                # Scale up 2nd-moment noise to prevent high-frequency overfitting
-                R_2nd = (sigma_l * 500.0 * field_intensity) * jnp.eye(dim2)
-
+                R_2nd = (sigma_l * meas_weight_2nd * field_intensity) * jnp.eye(dim2) 
+                
                 R_l = jnp.zeros((dim + dim2, dim + dim2))
                 R_l = R_l.at[0:dim, 0:dim].set(R_1st)
                 R_l = R_l.at[dim:, dim:].set(R_2nd)
-
+                
                 P_slice = P_state[:, state_slice]
                 P_block = P_state[state_slice, state_slice]
-
+                
                 S_l = jnp.matmul(H_l, jnp.matmul(P_block, H_l.T)) + R_l
-                S_l = S_l + 1e-4 * jnp.eye(S_l.shape[0])
-
+                S_l = S_l + ridge_inflation * jnp.eye(S_l.shape[0])
+                
                 K_global = jnp.matmul(P_slice, jnp.matmul(H_l.T, jnp.linalg.inv(S_l)))
-
+                
                 Innovation_l = z_data_unified - z_pred_unified
                 C_state = C_state + has_events * jnp.matmul(K_global, Innovation_l)
-
-                # STABILIZED COVARIANCE REDUCTION
-                # Scale Kalman reduction by observation confidence
+                
                 alpha_k = jnp.clip(1.0 - (1.0 / jnp.sqrt(num_events + 1.0)), 0.1, 1.0)
                 P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_l, P_slice.T))
                 P_state = 0.5 * (P_state + P_state.T)
-
+                
             state_offset += dim2
 
         return C_state, P_state
@@ -1606,43 +1613,41 @@ def run_spectral_holonomic_tracker(
     def process_chunk_field_kalman(C_prev, P_prev, q_batch, ki_batch, t_batch, L_max):
         dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
         total_rate = q_batch.shape[0] / dt_chunk
-
+        
         actual_events = q_batch.shape[0]
         has_events = jnp.where(actual_events > 0, 1.0, 0.0)
         num_events = jnp.maximum(float(actual_events), 1.0)
-
+        
         C_full = jnp.concatenate([jnp.array([1.0]), C_prev])
         Y_beam = e3nn.spherical_harmonics(sh_irreps, ki_batch[0], normalize=True).array
-
+        
         ewald_window_list = []
         for l in range(L_max + 1):
             dim = 2 * l + 1
             c_l = C_full[wigner_slices[l]].reshape((dim, dim))
             Y_beam_l = Y_beam[block_slices[l]]
             Y_theo_l = Y_theo_cryst_jax[:, block_slices[l]]
-
+            
             inter_n = jnp.matmul(Y_beam_l, c_l)
             p_j_l = jnp.matmul(Y_theo_l, inter_n)
             ewald_window_list.append((w_l_j[l] / (2 * l + 1)) * p_j_l)
-
+            
         ewald_window = jnp.sum(jnp.stack(ewald_window_list), axis=0)
         ewald_window = jnp.clip(ewald_window, 0.0, 1.0)
-
+        
         Y_events_lab = e3nn.spherical_harmonics(sh_irreps, q_batch, normalize=True).array
         Y_lab_sum = jnp.sum(Y_events_lab, axis=0)
 
-        # Dynamic Process Noise tied to intensive flux
         process_q_scale = 0.01 * (num_events / 1000.0)
-
         mean_field_variance = jnp.maximum(1e-6, jnp.trace(P_prev) / num_wigner_coeffs_active)
         current_tau = gamma_c * jnp.sqrt(mean_field_variance * 1000.0 + 1.0)
 
         C_new, P_new = evolve_full_covariance_kalman(
             C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt_chunk, current_tau, ewald_window, process_q_scale, L_max
         )
-
+        
         U_map = polar_extract_l1(C_new[0:9])
-
+        
         signal_mass = jnp.sum(jnp.square(C_new[0:9]))
         intensive_signal_fraction = jnp.clip(signal_mass / 3.0, 0.0, 1.0)
         sig_rate = intensive_signal_fraction * total_rate
@@ -1652,16 +1657,18 @@ def run_spectral_holonomic_tracker(
 
         return C_new, P_new, U_map, spectral_nll, sig_rate, bg_rate, omega_eff
 
+    # --------------------------------------------------------------------
+    # 5. Real-Time Streaming Driver Loop
+    # --------------------------------------------------------------------
     print(f"\n[2/3] Executing Field Tracker Pipeline ({num_wigner_coeffs_active} Continuous Spectral Modes)...")
     tracking_history = []
     ema_bg_rate = 1.0
-    cumulative_count = 0
 
     for batch_data in event_batches:
-        q_batch_np, t_batch_np, _, _, _, _, _, ki_sample_np, _ = batch_data
-        cumulative_count += len(q_batch_np)
+        # Unpack the full tuple structurally layout matching the older version
+        q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
         if len(t_batch_np) == 0: continue
-
+            
         t_state = float(t_batch_np[-1])
         q_batch = jax.device_put(q_batch_np)
         q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
@@ -1682,11 +1689,29 @@ def run_spectral_holonomic_tracker(
             print(f"    Time {t_state:.2f}s | Sig/Bg: {float(sig_rate):.0f}/{float(bg_rate):.0f} Hz | Coherent-Mass: {norm_gap_metric:8.2f} | Active-Solid-Angle: {float(omega_eff):.4f} sr")
 
         if streaming_callback is not None:
+            # Construct the structural event tracking map dictionary exactly like the old variant
+            new_events = {
+                "banks": banks_np,
+                "pixel_r": pr_np,
+                "pixel_c": pc_np,
+                "angles": angles_np,
+                "s_lab": slab_np
+            }
+
             streaming_callback(
-                time=t_state, U_preds=np.expand_dims(U_best, axis=0),
-                losses=np.array([float(spectral_nll)]), best_idx=0,
-                neutron_count=cumulative_count, new_events={},
-                metrics={"loss": float(spectral_nll), "eigengap": norm_gap_metric, "sig_rate": float(sig_rate), "bg_rate": float(bg_rate), "omega_eff": float(omega_eff)}
+                time=t_state, 
+                U_preds=np.expand_dims(U_best, axis=0),
+                losses=np.array([float(spectral_nll)]), 
+                best_idx=0,
+                neutron_count=cumulative_count, 
+                new_events=new_events,  # Forwarded to the callback
+                metrics={
+                    "loss": float(spectral_nll), 
+                    "eigengap": norm_gap_metric, 
+                    "sig_rate": float(sig_rate), 
+                    "bg_rate": float(bg_rate), 
+                    "omega_eff": float(omega_eff)
+                }
             )
 
     print(f"\n[3/3] Global Tracking complete. Saving continuous Wigner-D state dataset.")
@@ -1697,5 +1722,5 @@ def run_spectral_holonomic_tracker(
         group.create_dataset("wigner_coefficients", data=C_final_export)
         group.create_dataset("final_u_matrix", data=np.array(tracking_history[-1][1]))
         group.create_dataset("timestamps", data=np.array([h[0] for h in tracking_history]))
-
+        
     return tracking_history[-1][1]
