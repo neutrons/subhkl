@@ -1494,8 +1494,7 @@ def run_spectral_holonomic_tracker(
         for l in range(1, L_max + 1):
             irrep = e3nn.Irrep(f"{l}e" if l % 2 == 0 else f"{l}o")
             D_l = irrep.D_from_matrix(U_init_jax)
-            blur = jnp.exp(-l * (l + 1) * (sigma_q_start ** 2) / 2.0)
-            c_init_list.append((blur * D_l).flatten())
+            c_init_list.append(D_l.flatten())
         C_spectral_active = jnp.concatenate(c_init_list)
 
         perturb_vectors = jnp.array([
@@ -1529,15 +1528,13 @@ def run_spectral_holonomic_tracker(
         C_spectral_active = jnp.zeros(num_wigner_coeffs_active)
         P_spectral_full = jnp.eye(num_wigner_coeffs_active) * 0.1
 
-    sigma_measurement_noise = 0.5
-
     lap_diagonal_active = []
     for l in range(1, L_max + 1):
         lap_diagonal_active.extend([l * (l + 1)] * ((2 * l + 1) ** 2))
     lap_diagonal_active = jnp.array(lap_diagonal_active)
 
     # --------------------------------------------------------------------
-    # 4. JIT-Compiled Mixture-Aware Sequential Engine
+    # 4. JIT-Compiled Mixture-Aware Forward Observers
     # --------------------------------------------------------------------
     @jax.jit
     def polar_extract_l1(c_l1_flat):
@@ -1545,20 +1542,26 @@ def run_spectral_holonomic_tracker(
         V, _, Wt = jnp.linalg.svd(E_D1)
         return jnp.matmul(V, Wt)
 
-    def predict_multi_moment_observations(C_block_flat, T_vector, G_matrix, dim, rho):
-        """ Mixture Model: Blends clean structural predictions with a uniform pedestal. """
+    def predict_even_modes(C_block_flat, T_vector, G_matrix, dim, rho):
         C_mat = C_block_flat.reshape((dim, dim))
         z_1st = rho * jnp.matmul(C_mat, T_vector)
-
         A_sig = jnp.matmul(C_mat, jnp.matmul(G_matrix, C_mat.T))
-        A_bg = jnp.eye(dim)
-        z_2nd = (rho * A_sig + (1.0 - rho) * A_bg).flatten()
+        z_2nd = (rho * A_sig + (1.0 - rho) * jnp.eye(dim)).flatten()
         return jnp.concatenate([z_1st, z_2nd])
+
+    def predict_odd_modes(C_block_flat, G_matrix, dim, rho):
+        """ Hard-EM Omission: Predicts only the second-moment autocorrelation tensor. """
+        C_mat = C_block_flat.reshape((dim, dim))
+        A_sig = jnp.matmul(C_mat, jnp.matmul(G_matrix, C_mat.T))
+        z_2nd = (rho * A_sig + (1.0 - rho) * jnp.eye(dim)).flatten()
+        return z_2nd
 
     @jax.jit(static_argnames=['L_max'])
     def evolve_full_covariance_kalman(C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt, tau, ewald_window, process_q_scale, L_max):
-        decay_vec = jnp.maximum(jnp.exp(-tau * lap_diagonal_active * dt), 0.999)
-        C_state = C_prev * decay_vec
+        C_state = C_prev
+
+        raw_decay = jnp.exp(-tau * lap_diagonal_active * dt)
+        decay_vec = jnp.maximum(raw_decay, 0.999)
         P_state = decay_vec[:, None] * P_prev * decay_vec[None, :]
         P_state = P_state + jnp.eye(num_wigner_coeffs_active) * (process_q_scale * dt)
 
@@ -1570,35 +1573,36 @@ def run_spectral_holonomic_tracker(
             dim2 = dim * dim
             state_slice = slice(state_offset, state_offset + dim2)
 
+            # Universal second-moment tracking across all blocks
+            Y_lab_l = Y_events_lab[:, block_slices[l]]
+            A_lab_data = jnp.matmul(Y_lab_l.T, Y_lab_l) / num_events
+
+            Y_cryst_l = Y_theo_cryst_jax[:, block_slices[l]]
+            G_l = jnp.matmul(Y_cryst_l.T * ewald_window, Y_cryst_l) / total_window_mass
+
+            # Deviatoric Contrast Estimation
+            A_lab_dev = A_lab_data - jnp.eye(dim)
+            c_pred_mat_init = C_state[state_slice].reshape((dim, dim))
+            A_pred_sig_init = jnp.matmul(c_pred_mat_init, jnp.matmul(G_l, c_pred_mat_init.T))
+            A_pred_dev_init = A_pred_sig_init - jnp.eye(dim)
+
+            norm_lab = jnp.sum(jnp.square(A_lab_dev))
+            norm_pred = jnp.maximum(jnp.sum(jnp.square(A_pred_dev_init)), 1e-4)
+            rho_l = jnp.clip(jnp.sqrt(norm_lab / norm_pred), 0.02, 1.0)
+
+            C_l_curr = C_state[state_slice]
+
+            # --- ASYMMETRIC DIMENSIONAL BRANCHING ---
             if l % 2 == 0:
-                Y_cryst_l = Y_theo_cryst_jax[:, block_slices[l]]
-                Y_lab_l = Y_events_lab[:, block_slices[l]]
-                T_template_l = jnp.sum(Y_cryst_l * ewald_window[:, None], axis=0) / total_window_mass
-                G_l = jnp.matmul(Y_cryst_l.T * ewald_window, Y_cryst_l) / total_window_mass
-
                 z_1st_data = Y_lab_sum[block_slices[l]] / num_events
-                A_lab_data = jnp.matmul(Y_lab_l.T, Y_lab_l) / num_events
                 z_data_unified = jnp.concatenate([z_1st_data, A_lab_data.flatten()])
+                T_template_l = jnp.sum(Y_cryst_l * ewald_window[:, None], axis=0) / total_window_mass
 
-                # --- ANISOTROPIC DEVIATORIC CONTRAST ESTIMATION ---
-                A_lab_dev = A_lab_data - jnp.eye(dim)
-                c_pred_mat_init = C_state[state_slice].reshape((dim, dim))
-                A_pred_sig_init = jnp.matmul(c_pred_mat_init, jnp.matmul(G_l, c_pred_mat_init.T))
-                A_pred_dev_init = A_pred_sig_init - jnp.eye(dim)
-
-                norm_lab = jnp.sum(jnp.square(A_lab_dev))
-                norm_pred = jnp.maximum(jnp.sum(jnp.square(A_pred_dev_init)), 1e-4)
-
-                # Numerator is sensitive to anisotropy, bypassing the trace constant identity
-                rho_l = jnp.clip(jnp.sqrt(norm_lab / norm_pred), 0.02, 1.0)
-
-                C_l_curr = C_state[state_slice]
-                z_pred_unified = predict_multi_moment_observations(C_l_curr, T_template_l, G_l, dim, rho_l)
-                H_l = jax.jacobian(predict_multi_moment_observations, argnums=0)(C_l_curr, T_template_l, G_l, dim, rho_l)
+                z_pred_unified = predict_even_modes(C_l_curr, T_template_l, G_l, dim, rho_l)
+                H_l = jax.jacobian(predict_even_modes, argnums=0)(C_l_curr, T_template_l, G_l, dim, rho_l)
 
                 c_pred_mat = C_l_curr.reshape((dim, dim))
                 A_pred_mat = rho_l * jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T)) + (1.0 - rho_l) * jnp.eye(dim)
-
                 sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / num_events + ridge_inflation
                 R_1st = sigma_l * (A_pred_mat + 1e-3 * jnp.eye(dim))
                 field_intensity = jnp.maximum(jnp.sum(jnp.square(C_l_curr)), 1e-3)
@@ -1607,23 +1611,45 @@ def run_spectral_holonomic_tracker(
                 R_l = jnp.zeros((dim + dim2, dim + dim2))
                 R_l = R_l.at[0:dim, 0:dim].set(R_1st)
                 R_l = R_l.at[dim:, dim:].set(R_2nd)
+            else:
+                # Omit first moments entirely; target data is only the dense autocorrelation field
+                z_data_unified = A_lab_data.flatten()
 
-                P_slice = P_state[:, state_slice]
-                P_block = P_state[state_slice, state_slice]
+                z_pred_unified = predict_odd_modes(C_l_curr, G_l, dim, rho_l)
+                H_l = jax.jacobian(predict_odd_modes, argnums=0)(C_l_curr, G_l, dim, rho_l)
 
-                S_l = jnp.matmul(H_l, jnp.matmul(P_block, H_l.T)) + R_l
-                S_l = S_l + ridge_inflation * jnp.eye(S_l.shape[0])
+                c_pred_mat = C_l_curr.reshape((dim, dim))
+                A_pred_mat = rho_l * jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T)) + (1.0 - rho_l) * jnp.eye(dim)
+                sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / num_events + ridge_inflation
+                field_intensity = jnp.maximum(jnp.sum(jnp.square(C_l_curr)), 1e-3)
+                R_l = (sigma_l * meas_weight_2nd * field_intensity) * jnp.eye(dim2)
 
-                K_global = jnp.matmul(P_slice, jnp.matmul(H_l.T, jnp.linalg.inv(S_l)))
+            P_slice = P_state[:, state_slice]
+            P_block = P_state[state_slice, state_slice]
 
-                Innovation_l = z_data_unified - z_pred_unified
-                C_state = C_state + has_events * jnp.matmul(K_global, Innovation_l)
+            S_l = jnp.matmul(H_l, jnp.matmul(P_block, H_l.T)) + R_l
+            S_l = S_l + ridge_inflation * jnp.eye(S_l.shape[0])
 
-                alpha_k = jnp.clip(1.0 - (1.0 / jnp.sqrt(num_events + 1.0)), 0.1, 1.0)
-                P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_l, P_slice.T))
-                P_state = 0.5 * (P_state + P_state.T)
+            K_global = jnp.matmul(P_slice, jnp.matmul(H_l.T, jnp.linalg.inv(S_l)))
+
+            Innovation_l = z_data_unified - z_pred_unified
+            C_state = C_state + has_events * jnp.matmul(K_global, Innovation_l)
+
+            P_state = P_state - has_events * jnp.matmul(K_global, jnp.matmul(H_l, P_slice.T))
+            P_state = 0.5 * (P_state + P_state.T)
 
             state_offset += dim2
+
+        # Soft Frobenius Regularization Window
+        C_normed_parts = []
+        c_idx = 0
+        for l in range(1, L_max + 1):
+            dim2_l = (2 * l + 1) ** 2
+            C_l = C_state[c_idx : c_idx + dim2_l]
+            scale_factor = jnp.sqrt(float(2 * l + 1) / jnp.maximum(jnp.sum(jnp.square(C_l)), 1e-6))
+            C_normed_parts.append(C_l * scale_factor)
+            c_idx += dim2_l
+        C_state = jnp.concatenate(C_normed_parts)
 
         return C_state, P_state
 
