@@ -1534,7 +1534,7 @@ def run_spectral_holonomic_tracker(
     lap_diagonal_active = jnp.array(lap_diagonal_active)
 
     # --------------------------------------------------------------------
-    # 4. JIT-Compiled Mixture-Aware Forward Observers
+    # 4. JIT-Compiled Mixture-Aware Full-Spectrum Engine
     # --------------------------------------------------------------------
     @jax.jit
     def polar_extract_l1(c_l1_flat):
@@ -1550,7 +1550,6 @@ def run_spectral_holonomic_tracker(
         return jnp.concatenate([z_1st, z_2nd])
 
     def predict_odd_modes(C_block_flat, G_matrix, dim, rho):
-        """ Hard-EM Omission: Predicts only the second-moment autocorrelation tensor. """
         C_mat = C_block_flat.reshape((dim, dim))
         A_sig = jnp.matmul(C_mat, jnp.matmul(G_matrix, C_mat.T))
         z_2nd = (rho * A_sig + (1.0 - rho) * jnp.eye(dim)).flatten()
@@ -1573,14 +1572,12 @@ def run_spectral_holonomic_tracker(
             dim2 = dim * dim
             state_slice = slice(state_offset, state_offset + dim2)
 
-            # Universal second-moment tracking across all blocks
             Y_lab_l = Y_events_lab[:, block_slices[l]]
             A_lab_data = jnp.matmul(Y_lab_l.T, Y_lab_l) / num_events
 
             Y_cryst_l = Y_theo_cryst_jax[:, block_slices[l]]
             G_l = jnp.matmul(Y_cryst_l.T * ewald_window, Y_cryst_l) / total_window_mass
 
-            # Deviatoric Contrast Estimation
             A_lab_dev = A_lab_data - jnp.eye(dim)
             c_pred_mat_init = C_state[state_slice].reshape((dim, dim))
             A_pred_sig_init = jnp.matmul(c_pred_mat_init, jnp.matmul(G_l, c_pred_mat_init.T))
@@ -1592,7 +1589,6 @@ def run_spectral_holonomic_tracker(
 
             C_l_curr = C_state[state_slice]
 
-            # --- ASYMMETRIC DIMENSIONAL BRANCHING ---
             if l % 2 == 0:
                 z_1st_data = Y_lab_sum[block_slices[l]] / num_events
                 z_data_unified = jnp.concatenate([z_1st_data, A_lab_data.flatten()])
@@ -1612,7 +1608,6 @@ def run_spectral_holonomic_tracker(
                 R_l = R_l.at[0:dim, 0:dim].set(R_1st)
                 R_l = R_l.at[dim:, dim:].set(R_2nd)
             else:
-                # Omit first moments entirely; target data is only the dense autocorrelation field
                 z_data_unified = A_lab_data.flatten()
 
                 z_pred_unified = predict_odd_modes(C_l_curr, G_l, dim, rho_l)
@@ -1640,16 +1635,33 @@ def run_spectral_holonomic_tracker(
 
             state_offset += dim2
 
-        # Soft Frobenius Regularization Window
-        C_normed_parts = []
+        # --------------------------------------------------------------------
+        # THE L=0 COUPLING SPRING: Structural Scale Propagation
+        # Maps the extracted l=1 norm back to a global variance parameter,
+        # scaling all l>0 block sizes according to mass conservation laws.
+        # --------------------------------------------------------------------
+        U_map = polar_extract_l1(C_state[0:9])
+
+        # Calculate the group-theoretic angular variance from the l=1 block
+        norm_l1 = jnp.maximum(jnp.linalg.norm(C_state[0:9]), 1e-6)
+        ratio = jnp.clip(norm_l1 / jnp.sqrt(3.0), 1e-6, 1.0)
+        sigma_sq = jnp.maximum(0.0, -jnp.log(ratio))
+
+        C_reg_parts = []
         c_idx = 0
         for l in range(1, L_max + 1):
             dim2_l = (2 * l + 1) ** 2
-            C_l = C_state[c_idx : c_idx + dim2_l]
-            scale_factor = jnp.sqrt(float(2 * l + 1) / jnp.maximum(jnp.sum(jnp.square(C_l)), 1e-6))
-            C_normed_parts.append(C_l * scale_factor)
+
+            irrep = e3nn.Irrep(f"{l}e" if l % 2 == 0 else f"{l}o")
+            D_l_target = irrep.D_from_matrix(U_map).flatten()
+
+            # The mass-conservation scaling spine propagates through all levels
+            target_norm = jnp.sqrt(float(2 * l + 1)) * jnp.exp(-0.5 * l * (l + 1) * sigma_sq)
+
+            C_reg_parts.append(target_norm * (D_l_target / jnp.sqrt(float(2 * l + 1))))
             c_idx += dim2_l
-        C_state = jnp.concatenate(C_normed_parts)
+
+        C_state = jnp.concatenate(C_reg_parts)
 
         return C_state, P_state
 
