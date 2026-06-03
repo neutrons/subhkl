@@ -1408,6 +1408,7 @@ def run_spectral_holonomic_tracker(
     d_max: float = 8.0,
     bg_ema_weight: float = 0.99,
     loss_ema_weight: float = 0.05,
+    formatted_output: bool = True,
     wl_min_tracking: float = 0.5,
     wl_max_tracking: float = 12.0,
     max_rate_hz: float = np.inf,
@@ -1542,18 +1543,52 @@ def run_spectral_holonomic_tracker(
         V, _, Wt = jnp.linalg.svd(E_D1)
         return jnp.matmul(V, Wt)
 
-    def predict_even_modes(C_block_flat, T_vector, G_matrix, dim, rho):
+    def predict_intensive_even_modes(C_block_flat, T_vector, G_matrix, dim, rho, bg_norm):
         C_mat = C_block_flat.reshape((dim, dim))
-        z_1st = rho * jnp.matmul(C_mat, T_vector)
         A_sig = jnp.matmul(C_mat, jnp.matmul(G_matrix, C_mat.T))
-        z_2nd = (rho * A_sig + (1.0 - rho) * jnp.eye(dim)).flatten()
+        tr_sig = jnp.maximum(jnp.trace(A_sig), 1e-6)
+
+        C_mat_norm = C_mat / jnp.sqrt(tr_sig / float(dim))
+        z_1st = rho * jnp.matmul(C_mat_norm, T_vector) / jnp.sqrt(float(dim))
+
+        A_sig_norm = A_sig / tr_sig
+        z_2nd = (rho * A_sig_norm + (1.0 - rho) * bg_norm).flatten()
         return jnp.concatenate([z_1st, z_2nd])
 
-    def predict_odd_modes(C_block_flat, G_matrix, dim, rho):
+    def predict_intensive_odd_modes(C_block_flat, G_matrix, dim, rho, bg_norm):
         C_mat = C_block_flat.reshape((dim, dim))
         A_sig = jnp.matmul(C_mat, jnp.matmul(G_matrix, C_mat.T))
-        z_2nd = (rho * A_sig + (1.0 - rho) * jnp.eye(dim)).flatten()
+        tr_sig = jnp.maximum(jnp.trace(A_sig), 1e-6)
+
+        A_sig_norm = A_sig / tr_sig
+        z_2nd = (rho * A_sig_norm + (1.0 - rho) * bg_norm).flatten()
         return z_2nd
+
+    @jax.jit(static_argnames=['L_max'])
+    def holonomic_absolute_constraints(C_state, L_max):
+        """
+        Non-Redundant Absolute Manifold Constraint.
+        Constraints diagonal elements directly to 1.0, closing the gauge nullspace.
+        """
+        constraints = []
+        c_idx = 0
+        for l in range(1, L_max + 1):
+            dim = 2 * l + 1
+            dim2 = dim * dim
+            C_l = C_state[c_idx : c_idx + dim2].reshape((dim, dim))
+
+            V = jnp.matmul(C_l, C_l.T)
+            iu = jnp.triu_indices(dim, k=1)
+            off_diag = V[iu]
+
+            # ABSOLUTE ANCHOR: Direct penalty against unit value
+            diag_violation = jnp.diagonal(V) - 1.0
+
+            constraints.append(off_diag)
+            constraints.append(diag_violation)
+            c_idx += dim2
+
+        return jnp.concatenate(constraints)
 
     @jax.jit(static_argnames=['L_max'])
     def evolve_full_covariance_kalman(C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt, tau, ewald_window, process_q_scale, L_max):
@@ -1574,50 +1609,58 @@ def run_spectral_holonomic_tracker(
 
             Y_lab_l = Y_events_lab[:, block_slices[l]]
             A_lab_data = jnp.matmul(Y_lab_l.T, Y_lab_l) / num_events
+            A_lab_norm = A_lab_data / float(dim)
 
             Y_cryst_l = Y_theo_cryst_jax[:, block_slices[l]]
             G_l = jnp.matmul(Y_cryst_l.T * ewald_window, Y_cryst_l) / total_window_mass
+            T_template_l = jnp.sum(Y_cryst_l * ewald_window[:, None], axis=0) / total_window_mass
 
-            A_lab_dev = A_lab_data - jnp.eye(dim)
-            c_pred_mat_init = C_state[state_slice].reshape((dim, dim))
-            A_pred_sig_init = jnp.matmul(c_pred_mat_init, jnp.matmul(G_l, c_pred_mat_init.T))
-            A_pred_dev_init = A_pred_sig_init - jnp.eye(dim)
+            bg_norm = jnp.eye(dim) / float(dim)
+
+            A_lab_dev = A_lab_norm - bg_norm
+            G_norm = G_l / jnp.maximum(jnp.trace(G_l), 1e-6)
+            G_dev = G_norm - bg_norm
 
             norm_lab = jnp.sum(jnp.square(A_lab_dev))
-            norm_pred = jnp.maximum(jnp.sum(jnp.square(A_pred_dev_init)), 1e-4)
-            rho_l = jnp.clip(jnp.sqrt(norm_lab / norm_pred), 0.02, 1.0)
+            norm_G = jnp.maximum(jnp.sum(jnp.square(G_dev)), 1e-4)
+            rho_l = jnp.clip(jnp.sqrt(norm_lab / norm_G), 0.02, 1.0)
 
             C_l_curr = C_state[state_slice]
 
             if l % 2 == 0:
-                z_1st_data = Y_lab_sum[block_slices[l]] / num_events
-                z_data_unified = jnp.concatenate([z_1st_data, A_lab_data.flatten()])
-                T_template_l = jnp.sum(Y_cryst_l * ewald_window[:, None], axis=0) / total_window_mass
+                z_1st_norm = (Y_lab_sum[block_slices[l]] / num_events) / jnp.sqrt(float(dim))
+                z_data_unified = jnp.concatenate([z_1st_norm, A_lab_norm.flatten()])
 
-                z_pred_unified = predict_even_modes(C_l_curr, T_template_l, G_l, dim, rho_l)
-                H_l = jax.jacobian(predict_even_modes, argnums=0)(C_l_curr, T_template_l, G_l, dim, rho_l)
+                def predict_even(C_flat, T_temp, G_mat, d, r, bg_p):
+                    return predict_intensive_even_modes(C_flat, T_temp, G_mat, d, r, bg_p)
+
+                z_pred_unified = predict_even(C_l_curr, T_template_l, G_l, dim, rho_l, bg_norm)
+                H_l = jax.jacobian(predict_even, argnums=0)(C_l_curr, T_template_l, G_l, dim, rho_l, bg_norm)
 
                 c_pred_mat = C_l_curr.reshape((dim, dim))
-                A_pred_mat = rho_l * jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T)) + (1.0 - rho_l) * jnp.eye(dim)
-                sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / num_events + ridge_inflation
+                A_pred_mat = rho_l * (jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T)) / jnp.maximum(jnp.trace(jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T))), 1e-6)) + (1.0 - rho_l) * bg_norm
+                sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim)) + ridge_inflation
                 R_1st = sigma_l * (A_pred_mat + 1e-3 * jnp.eye(dim))
-                field_intensity = jnp.maximum(jnp.sum(jnp.square(C_l_curr)), 1e-3)
-                R_2nd = (sigma_l * meas_weight_2nd * field_intensity) * jnp.eye(dim2)
+
+                weight_2nd = 1.0 if l <= 2 else meas_weight_2nd
+                R_2nd = (sigma_l * weight_2nd / float(dim)) * jnp.eye(dim2)
 
                 R_l = jnp.zeros((dim + dim2, dim + dim2))
                 R_l = R_l.at[0:dim, 0:dim].set(R_1st)
                 R_l = R_l.at[dim:, dim:].set(R_2nd)
             else:
-                z_data_unified = A_lab_data.flatten()
+                z_data_unified = A_lab_norm.flatten()
 
-                z_pred_unified = predict_odd_modes(C_l_curr, G_l, dim, rho_l)
-                H_l = jax.jacobian(predict_odd_modes, argnums=0)(C_l_curr, G_l, dim, rho_l)
+                def predict_odd(C_flat, G_mat, d, r, bg_p):
+                    return predict_intensive_odd_modes(C_flat, G_mat, d, r, bg_p)
+
+                z_pred_unified = predict_odd(C_l_curr, G_l, dim, rho_l, bg_norm)
+                H_l = jax.jacobian(predict_odd, argnums=0)(C_l_curr, G_l, dim, rho_l, bg_norm)
 
                 c_pred_mat = C_l_curr.reshape((dim, dim))
-                A_pred_mat = rho_l * jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T)) + (1.0 - rho_l) * jnp.eye(dim)
-                sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / num_events + ridge_inflation
-                field_intensity = jnp.maximum(jnp.sum(jnp.square(C_l_curr)), 1e-3)
-                R_l = (sigma_l * meas_weight_2nd * field_intensity) * jnp.eye(dim2)
+                A_pred_mat = rho_l * (jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T)) / jnp.maximum(jnp.trace(jnp.matmul(c_pred_mat, jnp.matmul(G_l, c_pred_mat.T))), 1e-6)) + (1.0 - rho_l) * bg_norm
+                sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim)) + ridge_inflation
+                R_l = (sigma_l * meas_weight_2nd / float(dim)) * jnp.eye(dim2)
 
             P_slice = P_state[:, state_slice]
             P_block = P_state[state_slice, state_slice]
@@ -1629,39 +1672,25 @@ def run_spectral_holonomic_tracker(
 
             Innovation_l = z_data_unified - z_pred_unified
             C_state = C_state + has_events * jnp.matmul(K_global, Innovation_l)
-
             P_state = P_state - has_events * jnp.matmul(K_global, jnp.matmul(H_l, P_slice.T))
             P_state = 0.5 * (P_state + P_state.T)
 
             state_offset += dim2
 
-        # --------------------------------------------------------------------
-        # THE L=0 COUPLING SPRING: Structural Scale Propagation
-        # Maps the extracted l=1 norm back to a global variance parameter,
-        # scaling all l>0 block sizes according to mass conservation laws.
-        # --------------------------------------------------------------------
-        U_map = polar_extract_l1(C_state[0:9])
+        # ====================================================================
+        # ABSOLUTE LAGRANGE COVARIANCE PROJECTION (Locks out the nullspace)
+        # ====================================================================
+        psi = holonomic_absolute_constraints(C_state, L_max)
+        A_mat = jax.jacobian(holonomic_absolute_constraints, argnums=0)(C_state, L_max)
 
-        # Calculate the group-theoretic angular variance from the l=1 block
-        norm_l1 = jnp.maximum(jnp.linalg.norm(C_state[0:9]), 1e-6)
-        ratio = jnp.clip(norm_l1 / jnp.sqrt(3.0), 1e-6, 1.0)
-        sigma_sq = jnp.maximum(0.0, -jnp.log(ratio))
+        S_c = jnp.matmul(A_mat, jnp.matmul(P_state, A_mat.T))
+        S_c = S_c + ridge_inflation * jnp.eye(S_c.shape[0])
 
-        C_reg_parts = []
-        c_idx = 0
-        for l in range(1, L_max + 1):
-            dim2_l = (2 * l + 1) ** 2
+        K_c = jnp.matmul(P_state, jnp.matmul(A_mat.T, jnp.linalg.inv(S_c)))
 
-            irrep = e3nn.Irrep(f"{l}e" if l % 2 == 0 else f"{l}o")
-            D_l_target = irrep.D_from_matrix(U_map).flatten()
-
-            # The mass-conservation scaling spine propagates through all levels
-            target_norm = jnp.sqrt(float(2 * l + 1)) * jnp.exp(-0.5 * l * (l + 1) * sigma_sq)
-
-            C_reg_parts.append(target_norm * (D_l_target / jnp.sqrt(float(2 * l + 1))))
-            c_idx += dim2_l
-
-        C_state = jnp.concatenate(C_reg_parts)
+        C_state = C_state - jnp.matmul(K_c, psi)
+        P_state = P_state - jnp.matmul(K_c, jnp.matmul(A_mat, P_state))
+        P_state = 0.5 * (P_state + P_state.T)
 
         return C_state, P_state
 

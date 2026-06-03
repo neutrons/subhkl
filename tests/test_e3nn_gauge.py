@@ -1,3 +1,4 @@
+import unittest
 import pytest
 import numpy as np
 import jax
@@ -66,3 +67,108 @@ def test_legendre_contraction_gauge():
         
         assert np.isclose(scaled_contraction, analytical_legendre, atol=1e-5), \
             f"Legendre contraction gauge error at l={l}. Expected {analytical_legendre}, got {scaled_contraction}"
+
+class TestE3nnNormalizationInvariants(unittest.TestCase):
+    def setUp(self):
+        # Configure a standard tracking setup up to L_max = 4
+        self.L_max = 4
+        self.irreps_str = " + ".join([f"{l}e" if l % 2 == 0 else f"{l}o" for l in range(self.L_max + 1)])
+        self.sh_irreps = e3nn.Irreps(self.irreps_str)
+
+        # Build block slices to isolate specific level headers
+        self.block_slices = []
+        sh_idx = 0
+        for l in range(self.L_max + 1):
+            dim = 2 * l + 1
+            self.block_slices.append(slice(sh_idx, sh_idx + dim))
+            sh_idx += dim
+
+        # Generate random laboratory coordinate events (simulating a neutron batch)
+        np.random.seed(42)
+        num_events = 500
+        vecs = np.random.normal(size=(num_events, 3))
+        self.q_batch = jnp.array(vecs / np.linalg.norm(vecs, axis=1, keepdims=True))
+
+    def test_spherical_harmonics_addition_theorem(self):
+        """
+        Verifies that e3nn's default spherical harmonics satisfy component normalization,
+        meaning the sum of squares over all m channels for any l is identically 1.0.
+        """
+        # Compute the full harmonic grid array
+        Y_events_lab = e3nn.spherical_harmonics(self.sh_irreps, self.q_batch, normalize=True).array
+
+        for l in range(1, self.L_max + 1):
+            Y_l = Y_events_lab[:, self.block_slices[l]]
+
+            # The sum of squares over the m channels for each individual event
+            sum_of_squares = jnp.sum(jnp.square(Y_l), axis=1)
+
+            # Assert that every single event has an absolute norm of exactly 1.0
+            np.testing.assert_allclose(
+                sum_of_squares,
+                1.0,
+                atol=1e-5,
+                err_msg=f"Component normalization failed at level l={l}. Sum of squares is not 1.0."
+            )
+
+    def test_empirical_autocorrelation_trace_invariant(self):
+        """
+        Verifies that the trace of the empirical 2nd-moment matrix (A_lab_data)
+        is strictly equal to 1.0 across all levels due to component normalization.
+        """
+        Y_events_lab = e3nn.spherical_harmonics(self.sh_irreps, self.q_batch, normalize=True).array
+        num_events = float(self.q_batch.shape[0])
+
+        for l in range(1, self.L_max + 1):
+            Y_l = Y_events_lab[:, self.block_slices[l]]
+
+            # Compute empirical autocorrelation matrix: A = (Y^T @ Y) / N
+            A_lab_data = jnp.matmul(Y_l.T, Y_l) / num_events
+
+            # Extract its algebraic trace
+            matrix_trace = jnp.trace(A_lab_data)
+
+            self.assertAlmostEqual(
+                float(matrix_trace),
+                1.0,
+                places=5,
+                msg=f"Trace of A_lab_data at l={l} is {matrix_trace}, expected exactly 1.0."
+            )
+
+    def test_traceless_innovation_under_mixture_model(self):
+        """
+        Verifies that blending the background pedestal as (I / dim) forces
+        the Kalman filter innovation profile to remain perfectly traceless.
+        """
+        Y_events_lab = e3nn.spherical_harmonics(self.sh_irreps, self.q_batch, normalize=True).array
+        num_events = float(self.q_batch.shape[0])
+
+        for l in range(1, self.L_max + 1):
+            dim = 2 * l + 1
+            Y_l = Y_events_lab[:, self.block_slices[l]]
+            A_lab_data = jnp.matmul(Y_l.T, Y_l) / num_events
+
+            # Simulate an arbitrary predicted signal matrix (orthogonal Wigner structure)
+            # and a random environmental mixture ratio rho
+            A_pred_sig = jnp.eye(dim)  # Ideal fully aligned signal matrix
+            rho_l = 0.20               # 80% Background Noise environment
+
+            # Mass-Conserving Background Pedestal
+            bg_pedestal = jnp.eye(dim) / float(dim)
+
+            # Compute mixture prediction: Z_pred_2nd = rho * A_sig + (1 - rho) * Bg
+            A_pred_mat = rho_l * A_pred_sig + (1.0 - rho_l) * bg_pedestal
+
+            # Extract Innovation matrix: Error = A_data - A_pred
+            innovation_matrix = A_lab_data - A_pred_mat
+            innovation_trace = jnp.trace(innovation_matrix)
+
+            self.assertAlmostEqual(
+                float(innovation_trace),
+                0.0,
+                places=5,
+                msg=f"Innovation matrix is not traceless at l={l}. Trace = {innovation_trace}"
+            )
+
+if __name__ == '__main__':
+    unittest.main()
