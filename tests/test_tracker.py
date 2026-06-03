@@ -234,6 +234,10 @@ class TestBinghamTracker(unittest.TestCase):
             streaming_callback=streaming_callback,
             gamma_c=0.05,
             L_max=16,
+            init_tangent_blur = 0.55,
+            prior_ridge = 0.5,
+            meas_weight_2nd = 2000.0,
+            ridge_inflation = 1e-4,
         )
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
@@ -264,7 +268,8 @@ class TestBinghamTracker(unittest.TestCase):
             finder_file=self.finder_file,
             event_batches=event_stream,
             streaming_callback=streaming_callback,
-            gamma_c=1e-4  # bg=160kHz -> Tau = 1e-4 * sqrt(160000) = 0.04
+            gamma_c=1e-4, # bg=160kHz -> Tau = 1e-4 * sqrt(160000) = 0.04
+            L_max=16,
         )
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
