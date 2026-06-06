@@ -1463,8 +1463,15 @@ def extract_orientation_from_l1(M_l1, U_warm_start):
         A = jnp.matmul(grad_U, U_curr.T)
         omega = 0.5 * (A - A.T)
 
-        R = jnp.eye(3) - 0.20 * omega
+        # Inside extract_orientation_from_l1 -> refinement_step
+        R = jnp.eye(3) - 0.25 * omega
         V, _, Wt = jnp.linalg.svd(R @ U_curr)
+        
+        # --- FIX: Prevent reflection steps during gradient descent ---
+        det = jnp.linalg.det(jnp.matmul(V, Wt))
+        Wt = jax.lax.cond(det < 0.0, lambda w: w.at[-1, :].multiply(-1.0), lambda w: w, Wt)
+        # -------------------------------------------------------------
+        
         return jnp.matmul(V, Wt), None
 
     U_final, _ = jax.lax.scan(refinement_step, U_warm_start, None, length=50)
@@ -1586,18 +1593,31 @@ def evolve_full_covariance_kalman(
     P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_global, P_state))
     P_state = 0.5 * (P_state + P_state.T)
 
-    # HARMONIC MANIFOLD SYNCHRONIZATION: Pins the decoupled moments to a single coherent rotation matrix
-    C_real_1 = C_state[0:9].reshape((3, 3))
-    U_map = extract_orientation_from_l1(C_real_1, U_warm_start)
+    # BLOCK-BY-BLOCK PROCRUSTES SVD RETRACTION
+    curr_idx = 0
+    for b in range(1, num_blocks):
+        dim_b = block_dims_static[b]
+        block_len = dim_b * dim_b
+        block_vals = C_state[curr_idx : curr_idx + block_len]
 
-    D_full_new = e3x.so3.rotations.wigner_d(U_map, max_degree=L_max, cartesian_order=False)
-    c_pinned_list = []
-    for L in range(1, num_blocks):
-        start = L**2
-        end = (L+1)**2
-        c_pinned_list.append(D_full_new[start:end, start:end].flatten())
+        block_mat = block_vals.reshape((dim_b, dim_b))
+        V, _, Wt = jnp.linalg.svd(block_mat, full_matrices=False)
 
-    C_state = jnp.concatenate(c_pinned_list)
+        # --- FIX: Enforce SO(N) constraint by checking the determinant ---
+        det = jnp.linalg.det(jnp.matmul(V, Wt))
+        Wt = jax.lax.cond(
+            det < 0.0,
+            lambda w: w.at[-1, :].multiply(-1.0),
+            lambda w: w,
+            Wt
+        )
+        # -----------------------------------------------------------------
+
+        orthogonal_mat = jnp.matmul(V, Wt)
+        C_state = C_state.at[curr_idx : curr_idx + block_len].set(orthogonal_mat.flatten())
+        curr_idx += block_len
+
+
     return C_state, P_state
 
 
