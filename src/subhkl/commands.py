@@ -1471,8 +1471,8 @@ def extract_orientation_from_l1(M_l1):
     return U_final
 
 
-def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks, block_dims_static, cg_tables):
-    """ TRUE LINEAR FORWARD MODEL: Linearly projects uncoupled moments via Clebsch-Gordan tables. """
+def predict_single_shell(C_flat, T_vector, G_matrix, l, dim_l, num_blocks, block_dims_static, cg_tables):
+    """ UNIFIED FORWARD MODEL: Universally projects both 1st-moment vectors and 2nd-moment correlations. """
     C_l_mat = jnp.zeros((dim_l, dim_l))
     curr_idx = 0
     for b in range(1, num_blocks):
@@ -1503,34 +1503,12 @@ def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks
     return jnp.concatenate([z_1st, A_dev_pred.flatten()])
 
 
-def predict_single_shell_odd_linear(C_flat, G_matrix, l, dim_l, num_blocks, block_dims_static, cg_tables):
-    """ TRUE LINEAR FORWARD MODEL: Linearly projects uncoupled moments via Clebsch-Gordan tables. """
-    A_sig = jnp.zeros((dim_l, dim_l))
-    curr_idx_B = 0
-    max_L = min(2 * l + 1, num_blocks)
-    for L in range(max_L):
-        dim_L = 2 * L + 1
-        cg_L = cg_tables[L]
-        G_N = jnp.einsum('ijk,ij->k', cg_L, G_matrix)
-
-        if L == 0:
-            A_sig += cg_L[:, :, 0] * G_N[0]
-        else:
-            C_L_mat = C_flat[curr_idx_B : curr_idx_B + dim_L * dim_L].reshape((dim_L, dim_L))
-            C_M = jnp.matmul(C_L_mat, G_N)
-            A_sig += jnp.einsum('ijm,m->ij', cg_L, C_M)
-            curr_idx_B += dim_L * dim_L
-
-    A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
-    return A_dev_pred.flatten()
-
-
 @partial(jax.jit, static_argnames=['L_max', 'num_blocks'])
 def evolve_full_covariance_kalman(
     C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt, tau, ewald_window, process_q_scale,
     Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_tables_pytree
 ):
-    """ Real-valued mass-conserving linear moment loop operating without complex coordinate transformations. """
+    """ Real-valued mass-conserving linear moment loop operating with unified odd/even observation rows. """
     block_dims_static = [1] + [int(2 * b + 1) for b in range(1, num_blocks)]
     num_state_coeffs = sum(block_dims_static[b]**2 for b in range(1, num_blocks))
 
@@ -1566,10 +1544,10 @@ def evolve_full_covariance_kalman(
         A_lab_dev = A_lab_norm - jnp.eye(dim_l) / float(dim_l)
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
 
-        if l % 2 == 0:
-            z_1st_norm = Y_lab_sum[so3_slices[l]] / num_events
-            z_data_list.append(z_1st_norm)
-            R_diag_list.append(jnp.full(dim_l, sigma_l))
+        # ASYMMETRIC SELECTION FIXED: Universally append 1st-order vector profiles for ALL shells
+        z_1st_norm = Y_lab_sum[so3_slices[l]] / num_events
+        z_data_list.append(z_1st_norm)
+        R_diag_list.append(jnp.full(dim_l, sigma_l))
 
         z_data_list.append(A_lab_dev.flatten())
         R_diag_list.append(jnp.full(dim_l2, sigma_l * meas_weight_2nd / float(dim_l)))
@@ -1586,16 +1564,10 @@ def evolve_full_covariance_kalman(
         G_norm = G_l * (4.0 * jnp.pi / float(dim_l))
         T_template_l = jnp.sum(Y_cryst_l * ewald_window[:, None], axis=0) / total_window_mass
 
-        if l % 2 == 0:
-            def _local_even(C_f, T_t=T_template_l, G_m=G_norm, l_v=l, d_l=dim_l, l_cg=cg_tables_pytree[l-1]):
-                return predict_single_shell_linear(C_f, T_t, G_m, l_v, d_l, num_blocks, block_dims_static, l_cg)
-            preds_list.append(_local_even(C_state))
-            H_global_list.append(jax.jacobian(_local_even)(C_state))
-        else:
-            def _local_odd(C_f, G_m=G_norm, l_v=l, d_l=dim_l, l_cg=cg_tables_pytree[l-1]):
-                return predict_single_shell_odd_linear(C_f, G_m, l_v, d_l, num_blocks, block_dims_static, l_cg)
-            preds_list.append(_local_odd(C_state))
-            H_global_list.append(jax.jacobian(_local_odd)(C_state))
+        def _local_shell(C_f, T_t=T_template_l, G_m=G_norm, l_v=l, d_l=dim_l, l_cg=cg_tables_pytree[l-1]):
+            return predict_single_shell(C_f, T_t, G_m, l_v, d_l, num_blocks, block_dims_static, l_cg)
+        preds_list.append(_local_shell(C_state))
+        H_global_list.append(jax.jacobian(_local_shell)(C_state))
 
     z_pred_unified = jnp.concatenate(preds_list)
     H_global = jnp.concatenate(H_global_list, axis=0)
@@ -1608,7 +1580,7 @@ def evolve_full_covariance_kalman(
     P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_global, P_state))
     P_state = 0.5 * (P_state + P_state.T)
 
-    # BLOCK-BY-BLOCK PROCRUSTES SVD RETRACTION: Preserves memory layout continuity cleanly
+    # BLOCK-BY-BLOCK PROCRUSTES SVD RETRACTION: Maintains unitary constraints across the timeline
     curr_idx = 0
     for b in range(1, num_blocks):
         dim_b = block_dims_static[b]
@@ -1686,8 +1658,16 @@ def process_chunk_field_kalman(
         Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_tables_pytree
     )
 
-    # Outer-track manifold mapping extracts current orientation matrix safely outside the filter update
-    C_real_1 = C_new[0:9].reshape((3, 3))
+    # Outer-track projection mapping extracts orientation matrix via the now active fundamental vector channel
+    C_real_1 = jnp.zeros((3, 3))
+    curr_idx_ext = 0
+    for b in range(1, num_blocks):
+        dim_b = block_dims_static[b]
+        if b == 1:
+            C_real_1 = C_new[curr_idx_ext : curr_idx_ext + 9].reshape((3, 3))
+            break
+        curr_idx_ext += dim_b * dim_b
+
     U_map = extract_orientation_from_l1(C_real_1)
 
     dim_b1 = block_dims_static[1]
