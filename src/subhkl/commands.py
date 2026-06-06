@@ -1578,7 +1578,7 @@ def evolve_full_covariance_kalman(
     R_diag = jnp.concatenate(R_diag_list)
 
     preds_list = []
-    H_list = []
+    H_global_list = []
     for l in range(1, L_max + 1):
         dim_l = 2 * l + 1
         Y_cryst_l = Y_theo_cryst_jax[:, so3_slices[l]]
@@ -1590,15 +1590,15 @@ def evolve_full_covariance_kalman(
             def _local_even(C_f, T_t=T_template_l, G_m=G_norm, l_v=l, d_l=dim_l, l_cg=cg_tables_pytree[l-1]):
                 return predict_single_shell_linear(C_f, T_t, G_m, l_v, d_l, num_blocks, block_dims_static, l_cg)
             preds_list.append(_local_even(C_state))
-            H_list.append(jax.jacobian(_local_even)(C_state))
+            H_global_list.append(jax.jacobian(_local_even)(C_state))
         else:
             def _local_odd(C_f, G_m=G_norm, l_v=l, d_l=dim_l, l_cg=cg_tables_pytree[l-1]):
                 return predict_single_shell_odd_linear(C_f, G_m, l_v, d_l, num_blocks, block_dims_static, l_cg)
             preds_list.append(_local_odd(C_state))
-            H_list.append(jax.jacobian(_local_odd)(C_state))
+            H_global_list.append(jax.jacobian(_local_odd)(C_state))
 
     z_pred_unified = jnp.concatenate(preds_list)
-    H_global = jnp.concatenate(H_list, axis=0)
+    H_global = jnp.concatenate(H_global_list, axis=0)
 
     S_l = jnp.matmul(H_global, jnp.matmul(P_state, H_global.T)) + jnp.diag(R_diag) + ridge_inflation * jnp.eye(H_global.shape[0])
     K_global = jnp.matmul(P_state, jnp.matmul(H_global.T, jnp.linalg.pinv(S_l, rcond=1e-4)))
@@ -1608,18 +1608,20 @@ def evolve_full_covariance_kalman(
     P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_global, P_state))
     P_state = 0.5 * (P_state + P_state.T)
 
-    # COHERENT MANIFOLD SYNCHRONIZATION: Pins linear fields exactly to physical group paths
-    C_real_1 = C_state[0:9].reshape((3, 3))
-    U_map = extract_orientation_from_l1(C_real_1)
+    # BLOCK-BY-BLOCK PROCRUSTES SVD RETRACTION: Preserves memory layout continuity cleanly
+    curr_idx = 0
+    for b in range(1, num_blocks):
+        dim_b = block_dims_static[b]
+        block_len = dim_b * dim_b
+        block_vals = C_state[curr_idx : curr_idx + block_len]
 
-    D_full_new = e3x.so3.rotations.wigner_d(U_map, max_degree=L_max, cartesian_order=False)
-    c_pinned_list = []
-    for L in range(1, num_blocks):
-        start = L**2
-        end = (L+1)**2
-        c_pinned_list.append(D_full_new[start:end, start:end].flatten())
+        block_mat = block_vals.reshape((dim_b, dim_b))
+        V, _, Wt = jnp.linalg.svd(block_mat, full_matrices=False)
+        orthogonal_mat = jnp.matmul(V, Wt)
 
-    C_state = jnp.concatenate(c_pinned_list)
+        C_state = C_state.at[curr_idx : curr_idx + block_len].set(orthogonal_mat.flatten())
+        curr_idx += block_len
+
     return C_state, P_state
 
 
@@ -1650,7 +1652,6 @@ def process_chunk_field_kalman(
     Y_beam = e3x.so3.irreps.spherical_harmonics(ki_batch[0], max_degree=L_max, cartesian_order=False, normalization='orthonormal')
     ewald_window_list = []
 
-    # UNROLLED Python indexing loop completely eliminates array slices and tracker leaks
     curr_idx = 0
     for l in range(L_max + 1):
         dim = 2 * l + 1
@@ -1685,6 +1686,7 @@ def process_chunk_field_kalman(
         Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_tables_pytree
     )
 
+    # Outer-track manifold mapping extracts current orientation matrix safely outside the filter update
     C_real_1 = C_new[0:9].reshape((3, 3))
     U_map = extract_orientation_from_l1(C_real_1)
 
