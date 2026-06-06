@@ -1372,6 +1372,24 @@ import jax.scipy.linalg
 import e3nn_jax as e3nn
 import sympy
 from sympy.physics.wigner import clebsch_gordan as sympy_cg
+from functools import partial
+
+def real_to_complex_sh_matrix(l):
+    """ Host-side matrix construction prevents abstract tracing errors and matches the complex phase basis. """
+    dim = int(2 * l + 1)
+    U = np.zeros((dim, dim), dtype=np.complex64)
+    for m in range(-l, l + 1):
+        idx_r = m + l
+        if m == 0:
+            U[idx_r, l] = 1.0
+        elif m > 0:
+            U[idx_r, l + m] = (-1.0)**m / np.sqrt(2.0)
+            U[idx_r, l - m] = 1.0 / np.sqrt(2.0)
+        else:
+            U[idx_r, l + abs(m)] = -1j * (-1.0)**abs(m) / np.sqrt(2.0)
+            U[idx_r, l - abs(m)] = 1j / np.sqrt(2.0)
+    return jnp.array(U)
+
 
 def matrix_to_quaternion(R):
     """ Converts a 3x3 rotation matrix to a normalized quaternion (r, x, y, z). """
@@ -1531,17 +1549,13 @@ def predict_single_shell_quadratic(C_flat, T_vector, G_matrix, l, dim_l, rho, bg
         C_imag = C_imag.at[b, :dim_b, :dim_b].set(C_flat[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
         curr_idx += dim_b * dim_b
 
-    # 1. Extract Real and Imaginary components of the complex Wigner operator
-    D_l_real_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) + \
+    D_l_real_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) - \
                     jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
-                    
-    D_l_imag_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l) - \
-                    jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_imag, cg_l)
 
-    # 2. Assemble the full complex operator matrix
+    D_l_imag_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_imag, cg_l) + \
+                    jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l)
+
     D_l_complex = D_l_real_part + 1j * D_l_imag_part
-
-    # 3. CORRECTED BASIS CHANGE: Map complex operators directly to e3nn real space (U D U^dagger)
     D_l_real = jnp.real(C_l @ D_l_complex @ C_l.conj().T)
 
     A_sig = jnp.matmul(D_l_real, jnp.matmul(G_matrix, D_l_real.T))
@@ -1569,17 +1583,13 @@ def predict_single_shell_odd(C_flat, G_matrix, l, dim_l, rho, bg_norm, num_block
         C_imag = C_imag.at[b, :dim_b, :dim_b].set(C_flat[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
         curr_idx += dim_b * dim_b
 
-    # 1. Extract Real and Imaginary components of the complex Wigner operator
-    D_l_real_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) + \
+    D_l_real_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) - \
                     jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
-                    
-    D_l_imag_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l) - \
-                    jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_imag, cg_l)
 
-    # 2. Assemble the full complex operator matrix
+    D_l_imag_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_imag, cg_l) + \
+                    jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l)
+
     D_l_complex = D_l_real_part + 1j * D_l_imag_part
-
-    # 3. CORRECTED BASIS CHANGE: Map complex operators directly to e3nn real space (U D U^dagger)
     D_l_real = jnp.real(C_l @ D_l_complex @ C_l.conj().T)
 
     A_sig = jnp.matmul(D_l_real, jnp.matmul(G_matrix, D_l_real.T))
@@ -1613,7 +1623,7 @@ def holonomic_su2_unitary_constraints(C_real_tensor, C_imag_tensor, num_blocks, 
     return jnp.concatenate(constraints)
 
 
-@jax.jit(static_argnames=['L_max', 'num_blocks'])
+@partial(jax.jit, static_argnames=['L_max', 'num_blocks'])
 def evolve_full_covariance_kalman(
     C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt, tau, ewald_window, process_q_scale,
     Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_device_tensor, C_l_list
@@ -1736,7 +1746,7 @@ def evolve_full_covariance_kalman(
     return C_state, P_state
 
 
-@jax.jit(static_argnames=['L_max', 'num_blocks'])
+@partial(jax.jit, static_argnames=['L_max', 'num_blocks'])
 def process_chunk_field_kalman(
     C_prev, P_prev, q_batch, ki_batch, t_batch,
     Y_theo_cryst_jax, w_l_j, num_peaks,
@@ -1793,17 +1803,16 @@ def process_chunk_field_kalman(
             ewald_window_list.append((w_l_j[0] / 1.0) * p_j_0)
         else:
             cg_l = jax.lax.stop_gradient(cg_device_tensor[:, :, l, :max_dim_j, :max_dim_j, :dim])
-            
-            # --- FULL TENSOR PRODUCT RECONSTRUCTION (REAL + IMAG) ---
-            A_sig_l_real_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) + \
-                                jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
-                                
-            A_sig_l_imag_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l) - \
-                                jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_imag, cg_l)
 
-            A_sig_l_complex = A_sig_l_real_part + 1j * A_sig_l_imag_part
+            D_l_real_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) - \
+                            jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
 
-            # --- CORRECTED BASIS CHANGE (U D U^dagger) ---
+            D_l_imag_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_imag, cg_l) + \
+                            jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l)
+
+            A_sig_l_complex = D_l_real_part + 1j * D_l_imag_part
+
+            # CORRECTED BASIS ALIGNMENT MATCH: Synchronized completely with predict routines
             A_sig_l = jnp.real(C_l_list[l] @ A_sig_l_complex @ C_l_list[l].conj().T)
 
             Y_beam_l = Y_beam[so3_slices[l]]
@@ -1838,25 +1847,6 @@ def process_chunk_field_kalman(
 
     return C_new, P_new, U_map, spectral_nll, sig_rate, bg_rate, omega_eff
 
-
-def real_to_complex_sh_matrix(l):
-    """
-    FIXED TRACER GAUGE: Host-side array generation prevents TracerBoolConversionError
-    and establishes exact change-of-basis maps linking real and complex fields.
-    """
-    dim = int(2 * l + 1)
-    U = np.zeros((dim, dim), dtype=np.complex64)
-    for m in range(-l, l + 1):
-        idx_r = m + l
-        if m == 0:
-            U[idx_r, l] = 1.0
-        elif m > 0:
-            U[idx_r, l + m] = (-1.0)**m / np.sqrt(2.0)
-            U[idx_r, l - m] = 1.0 / np.sqrt(2.0)
-        else:
-            U[idx_r, l + abs(m)] = -1j * (-1.0)**abs(m) / np.sqrt(2.0)
-            U[idx_r, l - abs(m)] = 1j / np.sqrt(2.0)
-    return jnp.array(U)
 
 def run_spectral_holonomic_tracker(
     finder_file: str,
@@ -1915,7 +1905,6 @@ def run_spectral_holonomic_tracker(
 
     cg_device_tensor = jnp.array(cg_big_tensor)
 
-    # Static parsing of real-to-complex transformations inside unrolled JIT pass-through structure
     C_l_list = [jnp.array(real_to_complex_sh_matrix(l)) for l in range(L_max + 1)]
 
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
@@ -2046,3 +2035,4 @@ def run_spectral_holonomic_tracker(
         group.create_dataset("timestamps", data=np.array([h[0] for h in tracking_history]))
 
     return tracking_history[-1][1]
+
