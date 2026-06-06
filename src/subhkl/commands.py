@@ -1612,32 +1612,6 @@ def predict_single_shell_odd(C_flat, G_matrix, l, dim_l, rho, bg_norm, num_block
     tr_sig = jnp.maximum(jnp.trace(A_sig), 1e-6)
     return (rho * A_sig / tr_sig + (1.0 - rho) * bg_norm).flatten()
 
-def holonomic_su2_unitary_constraints(C_real_tensor, C_imag_tensor, num_blocks, block_dims_static, L_max):
-    """ Enforces complex unitary invariants over dynamic unrolled matrix blocks. """
-    constraints = []
-
-    R_12 = C_real_tensor[1, :2, :2]
-    I_12 = C_imag_tensor[1, :2, :2]
-
-    for b in range(1, num_blocks):
-        dim = block_dims_static[b]
-        C_real = C_real_tensor[b, :dim, :dim]
-        C_imag = C_imag_tensor[b, :dim, :dim]
-
-        V_real = jnp.matmul(C_real, C_real.T) + jnp.matmul(C_imag, C_imag.T)
-        V_imag = jnp.matmul(C_imag, C_real.T) - jnp.matmul(C_real, C_imag.T)
-
-        iu = jnp.triu_indices(dim, k=1)
-        constraints.append(V_real[iu])
-        constraints.append(V_imag[iu])
-        constraints.append(jnp.diagonal(V_real) - 1.0)
-
-        if b > 1:
-            phase_lock = jnp.sum(C_real[:2, :2] * I_12 - C_imag[:2, :2] * R_12)
-            constraints.append(jnp.array([phase_lock]))
-
-    return jnp.concatenate(constraints)
-
 
 @partial(jax.jit, static_argnames=['L_max', 'num_blocks'])
 def evolve_full_covariance_kalman(
@@ -1729,7 +1703,7 @@ def evolve_full_covariance_kalman(
         P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_l, P_state))
         P_state = 0.5 * (P_state + P_state.T)
 
-    # --- ANCHOR CONSTRAINTS: Restoring geometric mass retractions pins unobserved null space paths ---
+    # GEOMETRIC PROJECTION PASS: Pin coefficients to the complex single-crystal sphere
     curr_idx = 0
     for b in range(1, num_blocks):
         dim_b = block_dims_static[b]
@@ -1832,8 +1806,10 @@ def process_chunk_field_kalman(
 
     U_map = extract_phase_invariant_matrix(C_new[0:8])
 
-    l1_start = 2 * (block_dims_static[1]**2)
-    signal_mass = jnp.sum(jnp.square(C_new[l1_start : l1_start + 9]))
+    j1_start = 2 * (block_dims_static[1]**2)
+    j1_len = 2 * (block_dims_static[2]**2)
+    signal_mass = jnp.sum(jnp.square(C_new[j1_start : j1_start + j1_len]))
+
     intensive_signal_fraction = jnp.clip(signal_mass / 3.0, 0.0, 1.0)
     sig_rate = intensive_signal_fraction * total_rate
     bg_rate = jnp.maximum(total_rate - sig_rate, 0.0)
