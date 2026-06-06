@@ -1604,71 +1604,71 @@ def evolve_full_covariance_kalman(
     block_dims_static = [1] + [int(2 * (twice_j / 2.0) + 1) for twice_j in range(1, num_blocks)]
     max_dim_j = max(block_dims_static)
     num_state_coeffs = 2 * sum(block_dims_static[b]**2 for b in range(1, num_blocks))
-
+    
     lap_diagonal_active = []
     for twice_j in range(1, num_blocks):
         j = twice_j / 2.0
         dim = int(2 * j + 1)
         lap_diagonal_active.extend([j * (j + 1)] * (2 * dim * dim))
     lap_diagonal_active = jnp.array(lap_diagonal_active)
-
+    
     raw_decay = jnp.exp(-tau * lap_diagonal_active * dt)
     decay_vec = jnp.maximum(raw_decay, 0.999)
-
+    
     C_state = decay_vec * C_prev
     P_state = decay_vec[:, None] * P_prev * decay_vec[None, :]
     P_state = P_state + jnp.eye(num_state_coeffs) * (process_q_scale * dt)
 
     total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
-
+    
     so3_slices = []
     sh_idx = 0
     for l in range(L_max + 1):
         dim = 2 * l + 1
         so3_slices.append(slice(sh_idx, sh_idx + dim))
         sh_idx += dim
-
-    # --- LOOP INTEGRATED WITH INTERMEDIATE GEOMETRIC PROJECTIONS ---
+    
+    # --- CLEAN SEQUENTIAL MEASUREMENT LOOP (NO INNER COVARIANCE SQUASHING) ---
     for l in range(1, L_max + 1):
         dim_l = 2 * l + 1
         dim_l2 = dim_l * dim_l
         cg_l = jax.lax.stop_gradient(cg_device_tensor[:, :, l, :max_dim_j, :max_dim_j, :dim_l])
-
+        
         Y_lab_l = Y_events_lab[:, so3_slices[l]]
         A_lab_data = jnp.matmul(Y_lab_l.T, Y_lab_l) / num_events
         A_lab_norm = A_lab_data / float(dim_l)
-
+        
         Y_cryst_l = Y_theo_cryst_jax[:, so3_slices[l]]
         G_l = jnp.matmul(Y_cryst_l.T * ewald_window, Y_cryst_l) / total_window_mass
         T_template_l = jnp.sum(Y_cryst_l * ewald_window[:, None], axis=0) / total_window_mass
-
+        
         bg_norm = jnp.eye(dim_l) / float(dim_l)
         A_lab_dev = A_lab_norm - bg_norm
         G_norm = G_l / jnp.maximum(jnp.trace(G_l), 1e-6)
         G_dev = G_norm - bg_norm
-
+        
         norm_lab = jnp.sum(jnp.square(A_lab_dev))
         norm_pred = jnp.maximum(jnp.sum(jnp.square(G_dev)), 1e-4)
         rho_l = jnp.clip(jnp.sqrt(norm_lab / norm_pred), 0.02, 1.0)
-
+        
         if l % 2 == 0:
             z_1st_norm = (Y_lab_sum[so3_slices[l]] / num_events) / jnp.sqrt(float(dim_l))
             z_data_unified = jnp.concatenate([z_1st_norm, A_lab_norm.flatten()])
-
+            
             def _predict_even_local(C_f):
                 return predict_single_shell_quadratic(C_f, T_template_l, G_l, l, dim_l, rho_l, bg_norm, num_blocks, block_dims_static, max_dim_j, cg_l)
-
+                
             z_pred_unified = _predict_even_local(C_state)
             H_l = jax.jacobian(_predict_even_local)(C_state)
         else:
             z_data_unified = A_lab_norm.flatten()
-
+            
             def _predict_odd_local(C_f):
                 return predict_single_shell_odd(C_f, G_l, l, dim_l, rho_l, bg_norm, num_blocks, block_dims_static, max_dim_j, cg_l)
-
+                
             z_pred_unified = _predict_odd_local(C_state)
             H_l = jax.jacobian(_predict_odd_local)(C_state)
-
+        
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
         if l % 2 == 0:
             A_pred_mat = z_pred_unified[dim_l:].reshape((dim_l, dim_l))
@@ -1677,47 +1677,46 @@ def evolve_full_covariance_kalman(
             R_l = jnp.zeros((dim_l + dim_l2, dim_l + dim_l2)).at[0:dim_l, 0:dim_l].set(R_1st).at[dim_l:, dim_l:].set(R_2nd)
         else:
             R_l = (sigma_l * meas_weight_2nd / float(dim_l)) * jnp.eye(dim_l2)
-
+        
         S_l = jnp.matmul(H_l, jnp.matmul(P_state, H_l.T)) + R_l + ridge_inflation * jnp.eye(H_l.shape[0])
         K_global = jnp.matmul(P_state, jnp.matmul(H_l.T, jnp.linalg.pinv(S_l, rcond=1e-4)))
-
+        
         C_state = C_state + has_events * K_global @ (z_data_unified - z_pred_unified)
         alpha_k = jnp.clip(1.0 - (1.0 / jnp.sqrt(num_events + 1.0)), 0.1, 1.0)
         P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_l, P_state))
         P_state = 0.5 * (P_state + P_state.T)
 
-        # Immediate inline projection prevents inter-shell linearization failures
-        C_real_tensor = jnp.zeros((num_blocks, max_dim_j, max_dim_j))
-        C_imag_tensor = jnp.zeros((num_blocks, max_dim_j, max_dim_j))
-        C_real_tensor = C_real_tensor.at[0, 0, 0].set(1.0)
+    # --- APPLY HOLONOMIC MANIFOLD PROJECTION EXACTLY ONCE AT THE END OF THE PASS ---
+    C_real_tensor = jnp.zeros((num_blocks, max_dim_j, max_dim_j))
+    C_imag_tensor = jnp.zeros((num_blocks, max_dim_j, max_dim_j))
+    C_real_tensor = C_real_tensor.at[0, 0, 0].set(1.0)
+    
+    curr_idx = 0
+    for b in range(1, num_blocks):
+        dim_b = block_dims_static[b]
+        C_real_tensor = C_real_tensor.at[b, :dim_b, :dim_b].set(C_state[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
+        curr_idx += dim_b * dim_b
+        C_imag_tensor = C_imag_tensor.at[b, :dim_b, :dim_b].set(C_state[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
+        curr_idx += dim_b * dim_b
 
-        curr_idx = 0
-        for b in range(1, num_blocks):
-            dim_b = block_dims_static[b]
-            C_real_tensor = C_real_tensor.at[b, :dim_b, :dim_b].set(C_state[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
-            curr_idx += dim_b * dim_b
-            C_imag_tensor = C_imag_tensor.at[b, :dim_b, :dim_b].set(C_state[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
-            curr_idx += dim_b * dim_b
-
-        psi = holonomic_su2_unitary_constraints(C_real_tensor, C_imag_tensor, num_blocks, block_dims_static, L_max)
-        A_real, A_imag = jax.jacobian(holonomic_su2_unitary_constraints, argnums=(0, 1))(C_real_tensor, C_imag_tensor, num_blocks, block_dims_static, L_max)
-
-        A_mat_list = []
-        for b in range(1, num_blocks):
-            dim_b = block_dims_static[b]
-            A_mat_list.append(A_real[:, b, :dim_b, :dim_b].reshape((A_real.shape[0], dim_b * dim_b)))
-            A_mat_list.append(A_imag[:, b, :dim_b, :dim_b].reshape((A_imag.shape[0], dim_b * dim_b)))
-        A_mat = jnp.concatenate(A_mat_list, axis=1)
-
-        S_c = jnp.matmul(A_mat, jnp.matmul(P_state, A_mat.T)) + ridge_inflation * jnp.eye(A_mat.shape[0])
-        K_c = jnp.matmul(P_state, jnp.matmul(A_mat.T, jnp.linalg.pinv(S_c, rcond=1e-4)))
-
-        C_state = C_state - K_c @ psi
-        P_state = P_state - jnp.matmul(K_c, jnp.matmul(A_mat, P_state))
-        P_state = 0.5 * (P_state + P_state.T)
+    psi = holonomic_su2_unitary_constraints(C_real_tensor, C_imag_tensor, num_blocks, block_dims_static, L_max)
+    A_real, A_imag = jax.jacobian(holonomic_su2_unitary_constraints, argnums=(0, 1))(C_real_tensor, C_imag_tensor, num_blocks, block_dims_static, L_max)
+    
+    A_mat_list = []
+    for b in range(1, num_blocks):
+        dim_b = block_dims_static[b]
+        A_mat_list.append(A_real[:, b, :dim_b, :dim_b].reshape((A_real.shape[0], dim_b * dim_b)))
+        A_mat_list.append(A_imag[:, b, :dim_b, :dim_b].reshape((A_imag.shape[0], dim_b * dim_b)))
+    A_mat = jnp.concatenate(A_mat_list, axis=1)
+    
+    S_c = jnp.matmul(A_mat, jnp.matmul(P_state, A_mat.T)) + ridge_inflation * jnp.eye(A_mat.shape[0])
+    K_c = jnp.matmul(P_state, jnp.matmul(A_mat.T, jnp.linalg.pinv(S_c, rcond=1e-4)))
+    
+    C_state = C_state - K_c @ psi
+    P_state = P_state - jnp.matmul(K_c, jnp.matmul(A_mat, P_state))
+    P_state = 0.5 * (P_state + P_state.T)
 
     return C_state, P_state
-
 
 @jax.jit(static_argnames=['L_max', 'num_blocks'])
 def process_chunk_field_kalman(
