@@ -1531,11 +1531,18 @@ def predict_single_shell_quadratic(C_flat, T_vector, G_matrix, l, dim_l, rho, bg
         C_imag = C_imag.at[b, :dim_b, :dim_b].set(C_flat[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
         curr_idx += dim_b * dim_b
 
-    D_l_complex = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) + \
-                  jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
+    # 1. Extract Real and Imaginary components of the complex Wigner operator
+    D_l_real_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) + \
+                    jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
+                    
+    D_l_imag_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l) - \
+                    jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_imag, cg_l)
 
-    # Unitary transform from complex spherical harmonics basis into the real e3nn basis
-    D_l_real = jnp.real(C_l.conj().T @ D_l_complex @ C_l)
+    # 2. Assemble the full complex operator matrix
+    D_l_complex = D_l_real_part + 1j * D_l_imag_part
+
+    # 3. CORRECTED BASIS CHANGE: Map complex operators directly to e3nn real space (U D U^dagger)
+    D_l_real = jnp.real(C_l @ D_l_complex @ C_l.conj().T)
 
     A_sig = jnp.matmul(D_l_real, jnp.matmul(G_matrix, D_l_real.T))
     tr_sig = jnp.maximum(jnp.trace(A_sig), 1e-6)
@@ -1562,16 +1569,22 @@ def predict_single_shell_odd(C_flat, G_matrix, l, dim_l, rho, bg_norm, num_block
         C_imag = C_imag.at[b, :dim_b, :dim_b].set(C_flat[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
         curr_idx += dim_b * dim_b
 
-    D_l_complex = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) + \
-                  jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
+    # 1. Extract Real and Imaginary components of the complex Wigner operator
+    D_l_real_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) + \
+                    jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
+                    
+    D_l_imag_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l) - \
+                    jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_imag, cg_l)
 
-    # Unitary transform from complex spherical harmonics basis into the real e3nn basis
-    D_l_real = jnp.real(C_l.conj().T @ D_l_complex @ C_l)
+    # 2. Assemble the full complex operator matrix
+    D_l_complex = D_l_real_part + 1j * D_l_imag_part
+
+    # 3. CORRECTED BASIS CHANGE: Map complex operators directly to e3nn real space (U D U^dagger)
+    D_l_real = jnp.real(C_l @ D_l_complex @ C_l.conj().T)
 
     A_sig = jnp.matmul(D_l_real, jnp.matmul(G_matrix, D_l_real.T))
     tr_sig = jnp.maximum(jnp.trace(A_sig), 1e-6)
     return (rho * A_sig / tr_sig + (1.0 - rho) * bg_norm).flatten()
-
 
 def holonomic_su2_unitary_constraints(C_real_tensor, C_imag_tensor, num_blocks, block_dims_static, L_max):
     """ Enforces complex unitary invariants over dynamic unrolled matrix blocks. """
