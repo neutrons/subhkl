@@ -1449,8 +1449,8 @@ def matrix_to_quaternion(R):
 
 @jax.jit
 def extract_orientation_from_l1(M_l1):
-    """ 
-    E3X VECTOR MANIFOLD PASS: Extracts pristine orientation matrices directly matching 
+    """
+    E3X VECTOR MANIFOLD PASS: Extracts pristine orientation matrices directly matching
     the fundamental real vector components from the L=1 shell slice.
     """
     def refinement_step(U_curr, _):
@@ -1458,16 +1458,16 @@ def extract_orientation_from_l1(M_l1):
             D_full = e3x.so3.rotations.wigner_d(U_trial, max_degree=1, cartesian_order=False)
             D_l1 = D_full[1:4, 1:4]
             return jnp.sum(jnp.square(D_l1 - M_l1))
-            
+
         grad_U = jax.grad(projection_loss)(U_curr)
         A = jnp.matmul(grad_U, U_curr.T)
         omega = 0.5 * (A - A.T)
-        
-        R = jnp.eye(3) - 0.15 * omega
+
+        R = jnp.eye(3) - 0.25 * omega
         V, _, Wt = jnp.linalg.svd(R @ U_curr)
         return jnp.matmul(V, Wt), None
 
-    U_final, _ = jax.lax.scan(refinement_step, jnp.eye(3), None, length=30)
+    U_final, _ = jax.lax.scan(refinement_step, jnp.eye(3), None, length=50)
     return U_final
 
 
@@ -1482,7 +1482,7 @@ def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks
             break
         curr_idx += dim_b * dim_b
     z_1st = jnp.matmul(C_l_mat, T_vector)
-    
+
     A_sig = jnp.zeros((dim_l, dim_l))
     curr_idx_B = 0
     max_L = min(2 * l + 1, num_blocks)
@@ -1490,7 +1490,7 @@ def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks
         dim_L = 2 * L + 1
         cg_L = cg_tables[L]
         G_N = jnp.einsum('ijk,ij->k', cg_L, G_matrix)
-        
+
         if L == 0:
             A_sig += cg_L[:, :, 0] * G_N[0]
         else:
@@ -1498,7 +1498,7 @@ def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks
             C_M = jnp.matmul(C_L_mat, G_N)
             A_sig += jnp.einsum('ijm,m->ij', cg_L, C_M)
             curr_idx_B += dim_L * dim_L
-            
+
     A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
     return jnp.concatenate([z_1st, A_dev_pred.flatten()])
 
@@ -1512,7 +1512,7 @@ def predict_single_shell_odd_linear(C_flat, G_matrix, l, dim_l, num_blocks, bloc
         dim_L = 2 * L + 1
         cg_L = cg_tables[L]
         G_N = jnp.einsum('ijk,ij->k', cg_L, G_matrix)
-        
+
         if L == 0:
             A_sig += cg_L[:, :, 0] * G_N[0]
         else:
@@ -1520,7 +1520,7 @@ def predict_single_shell_odd_linear(C_flat, G_matrix, l, dim_l, num_blocks, bloc
             C_M = jnp.matmul(C_L_mat, G_N)
             A_sig += jnp.einsum('ijm,m->ij', cg_L, C_M)
             curr_idx_B += dim_L * dim_L
-            
+
     A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
     return A_dev_pred.flatten()
 
@@ -1530,53 +1530,53 @@ def evolve_full_covariance_kalman(
     C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt, tau, ewald_window, process_q_scale,
     Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_tables_pytree
 ):
-    """ Globally convex Kalman pass tracking decoupled linear spectral channels. """
+    """ Real-valued mass-conserving linear moment loop operating without complex coordinate transformations. """
     block_dims_static = [1] + [int(2 * b + 1) for b in range(1, num_blocks)]
     num_state_coeffs = sum(block_dims_static[b]**2 for b in range(1, num_blocks))
-    
+
     lap_diagonal_active = []
     for b in range(1, num_blocks):
         dim = block_dims_static[b]
         lap_diagonal_active.extend([b * (b + 1)] * (dim * dim))
     lap_diagonal_active = jnp.array(lap_diagonal_active)
-    
+
     raw_decay = jnp.exp(-tau * lap_diagonal_active * dt)
     decay_vec = jnp.maximum(raw_decay, 0.999)
-    
+
     C_state = decay_vec * C_prev
     P_state = decay_vec[:, None] * P_prev * decay_vec[None, :]
     P_state = P_state + jnp.eye(num_state_coeffs) * (process_q_scale * dt)
 
     total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
-    
+
     so3_slices = []
     for l in range(L_max + 1):
         so3_slices.append(slice(l**2, (l+1)**2))
-        
+
     z_data_list = []
     R_diag_list = []
     for l in range(1, L_max + 1):
         dim_l = 2 * l + 1
         dim_l2 = dim_l * dim_l
-        
+
         Y_lab_l = Y_events_lab[:, so3_slices[l]]
         A_lab_data = jnp.matmul(Y_lab_l.T, Y_lab_l) / num_events
         A_lab_norm = A_lab_data * (4.0 * jnp.pi / float(dim_l))
-        
+
         A_lab_dev = A_lab_norm - jnp.eye(dim_l) / float(dim_l)
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
-        
+
         if l % 2 == 0:
             z_1st_norm = Y_lab_sum[so3_slices[l]] / num_events
             z_data_list.append(z_1st_norm)
             R_diag_list.append(jnp.full(dim_l, sigma_l))
-            
+
         z_data_list.append(A_lab_dev.flatten())
         R_diag_list.append(jnp.full(dim_l2, sigma_l * meas_weight_2nd / float(dim_l)))
-        
+
     z_data = jnp.concatenate(z_data_list)
     R_diag = jnp.concatenate(R_diag_list)
-    
+
     preds_list = []
     H_list = []
     for l in range(1, L_max + 1):
@@ -1585,7 +1585,7 @@ def evolve_full_covariance_kalman(
         G_l = jnp.matmul(Y_cryst_l.T * ewald_window, Y_cryst_l) / total_window_mass
         G_norm = G_l * (4.0 * jnp.pi / float(dim_l))
         T_template_l = jnp.sum(Y_cryst_l * ewald_window[:, None], axis=0) / total_window_mass
-        
+
         if l % 2 == 0:
             def _local_even(C_f, T_t=T_template_l, G_m=G_norm, l_v=l, d_l=dim_l, l_cg=cg_tables_pytree[l-1]):
                 return predict_single_shell_linear(C_f, T_t, G_m, l_v, d_l, num_blocks, block_dims_static, l_cg)
@@ -1596,13 +1596,13 @@ def evolve_full_covariance_kalman(
                 return predict_single_shell_odd_linear(C_f, G_m, l_v, d_l, num_blocks, block_dims_static, l_cg)
             preds_list.append(_local_odd(C_state))
             H_list.append(jax.jacobian(_local_odd)(C_state))
-            
+
     z_pred_unified = jnp.concatenate(preds_list)
     H_global = jnp.concatenate(H_list, axis=0)
-    
+
     S_l = jnp.matmul(H_global, jnp.matmul(P_state, H_global.T)) + jnp.diag(R_diag) + ridge_inflation * jnp.eye(H_global.shape[0])
     K_global = jnp.matmul(P_state, jnp.matmul(H_global.T, jnp.linalg.pinv(S_l, rcond=1e-4)))
-    
+
     C_state = C_state + has_events * K_global @ (z_data - z_pred_unified)
     alpha_k = jnp.clip(1.0 - (1.0 / jnp.sqrt(num_events + 1.0)), 0.1, 1.0)
     P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_global, P_state))
@@ -1611,35 +1611,35 @@ def evolve_full_covariance_kalman(
     # COHERENT MANIFOLD SYNCHRONIZATION: Pins linear fields exactly to physical group paths
     C_real_1 = C_state[0:9].reshape((3, 3))
     U_map = extract_orientation_from_l1(C_real_1)
-    
+
     D_full_new = e3x.so3.rotations.wigner_d(U_map, max_degree=L_max, cartesian_order=False)
     c_pinned_list = []
     for L in range(1, num_blocks):
         start = L**2
         end = (L+1)**2
         c_pinned_list.append(D_full_new[start:end, start:end].flatten())
-        
+
     C_state = jnp.concatenate(c_pinned_list)
     return C_state, P_state
 
 
 @partial(jax.jit, static_argnames=['L_max', 'num_blocks'])
 def process_chunk_field_kalman(
-    C_prev, P_prev, q_batch, ki_batch, t_batch, 
-    Y_theo_cryst_jax, w_l_j, num_peaks, 
+    C_prev, P_prev, q_batch, ki_batch, t_batch,
+    Y_theo_cryst_jax, w_l_j, num_peaks,
     meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max,
     num_blocks, cg_tables_pytree
 ):
     dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
     total_rate = q_batch.shape[0] / dt_chunk
-    
+
     actual_events = q_batch.shape[0]
     has_events = jnp.where(actual_events > 0, 1.0, 0.0)
     num_events = jnp.maximum(float(actual_events), 1.0)
-    
+
     block_dims_static = [1] + [int(2 * b + 1) for b in range(1, num_blocks)]
     num_state_coeffs = sum(block_dims_static[b]**2 for b in range(1, num_blocks))
-    
+
     so3_slices = []
     for l in range(L_max + 1):
         so3_slices.append(slice(l**2, (l+1)**2))
@@ -1649,6 +1649,9 @@ def process_chunk_field_kalman(
 
     Y_beam = e3x.so3.irreps.spherical_harmonics(ki_batch[0], max_degree=L_max, cartesian_order=False, normalization='orthonormal')
     ewald_window_list = []
+
+    # UNROLLED Python indexing loop completely eliminates array slices and tracker leaks
+    curr_idx = 0
     for l in range(L_max + 1):
         dim = 2 * l + 1
         if l == 0:
@@ -1659,25 +1662,21 @@ def process_chunk_field_kalman(
             ewald_window_list.append((w_l_j[0] / 1.0) * p_j_0)
         else:
             C_real_space = jnp.zeros((dim, dim))
-            curr_idx = 0
-            for b in range(1, num_blocks):
-                dim_b = block_dims_static[b]
-                if b == l:
-                    C_real_space = C_prev[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b))
-                    break
-                curr_idx += dim_b * dim_b
-                
+            if l < num_blocks:
+                C_real_space = C_prev[curr_idx : curr_idx + dim * dim].reshape((dim, dim))
+                curr_idx += dim * dim
+
             Y_beam_l = Y_beam[so3_slices[l]]
             Y_theo_l = Y_theo_cryst_jax[:, so3_slices[l]]
-            
+
             inter_n = jnp.matmul(Y_beam_l, C_real_space)
             p_j_l = jnp.matmul(Y_theo_l, inter_n)
             ewald_window_list.append((w_l_j[l] / float(dim)) * p_j_l)
-            
+
     ewald_window = jnp.sum(jnp.stack(ewald_window_list), axis=0)
     ewald_window = jnp.clip(ewald_window, 0.0, 1.0)
 
-    process_q_scale = 0.01 * (num_events / 1000.0)
+    process_q_scale = 0.002
     mean_field_variance = jnp.maximum(1e-6, jnp.trace(P_prev) / num_state_coeffs)
     current_tau = gamma_c * jnp.sqrt(mean_field_variance * 1000.0 + 1.0)
 
@@ -1685,13 +1684,13 @@ def process_chunk_field_kalman(
         C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt_chunk, current_tau, ewald_window, process_q_scale,
         Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_tables_pytree
     )
-    
+
     C_real_1 = C_new[0:9].reshape((3, 3))
     U_map = extract_orientation_from_l1(C_real_1)
-    
+
     dim_b1 = block_dims_static[1]
     signal_mass = jnp.sum(jnp.square(C_new[0 : dim_b1 * dim_b1]))
-    
+
     intensive_signal_fraction = jnp.clip(signal_mass / 3.0, 0.0, 1.0)
     sig_rate = intensive_signal_fraction * total_rate
     bg_rate = jnp.maximum(total_rate - sig_rate, 0.0)
@@ -1728,18 +1727,18 @@ def run_spectral_holonomic_tracker(
     ridge_inflation: float = 1e-4,
 ):
     from subhkl.optimization import FindUB
-    
+
     if J_max is None:
         J_max = float(L_max)
 
     num_blocks = int(J_max) + 1
     block_dims_static = [1] + [int(2 * b + 1) for b in range(1, num_blocks)]
-    
+
     state_idx = 0
     for b in range(1, num_blocks):
         dim = block_dims_static[b]
         state_idx += dim * dim
-        
+
     num_state_coeffs = state_idx
 
     print(f"[0/3] Packing Clebsch-Gordan Linearization Tables (L_max={L_max})...")
@@ -1750,7 +1749,7 @@ def run_spectral_holonomic_tracker(
             cg_val = e3x.so3.irreps.clebsch_gordan_for_degrees(l, l, L, cartesian_order=False)
             l_tables.append(jnp.array(cg_val))
         cg_tables_pytree.append(l_tables)
-    
+
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
     ub_helper = FindUB()
     U_init = None
@@ -1763,7 +1762,7 @@ def run_spectral_holonomic_tracker(
         ub_helper.gamma = f["sample/gamma"][()] if "sample/gamma" in f else 90.0
         sg = f["sample/space_group"][()] if "sample/space_group" in f else b"P 1"
         ub_helper.space_group = sg.decode("utf-8") if isinstance(sg, bytes) else str(sg)
-        
+
         for key in ["sample/U_init", "sample/initial_U", "sample/U_seed", "orientation/U", "sample/U"]:
             if key in f:
                 U_init = f[key][()]
@@ -1779,7 +1778,7 @@ def run_spectral_holonomic_tracker(
     q_theo_cryst = np.array(B_mat @ theo_hkl)
     q_mags_np = np.linalg.norm(q_theo_cryst, axis=0)
     res_mask = (q_mags_np < (1.0 / d_min)) & (q_mags_np > (1.0 / d_max))
-    
+
     q_theo_cryst = q_theo_cryst[:, res_mask]
     q_mags_jax = jnp.array(q_mags_np[res_mask])
     q_theo_sample_jax = jnp.array(q_theo_cryst / np.where(q_mags_np[res_mask] == 0, 1.0, q_mags_np[res_mask]))
@@ -1795,7 +1794,7 @@ def run_spectral_holonomic_tracker(
     if U_init is not None:
         U_init_jax = jnp.array(U_init)
         D_full = e3x.so3.rotations.wigner_d(U_init_jax, max_degree=L_max, cartesian_order=False)
-        
+
         c_init_list = []
         for b in range(1, num_blocks):
             l = b
@@ -1803,7 +1802,7 @@ def run_spectral_holonomic_tracker(
             end = (l+1)**2
             block_l = D_full[start:end, start:end]
             c_init_list.append(block_l.flatten())
-            
+
         C_spectral_active = jnp.concatenate(c_init_list)
         P_spectral_full = jnp.eye(num_state_coeffs) * prior_ridge
     else:
@@ -1821,7 +1820,7 @@ def run_spectral_holonomic_tracker(
     for batch_data in event_batches:
         q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
         if len(t_batch_np) == 0: continue
-            
+
         t_state = float(t_batch_np[-1])
         q_batch = jax.device_put(q_batch_np)
         q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
@@ -1830,7 +1829,7 @@ def run_spectral_holonomic_tracker(
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
         C_spectral_active, P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate, omega_eff = process_chunk_field_kalman(
-            C_spectral_active, P_spectral_full, q_batch, ki_batch, t_batch, 
+            C_spectral_active, P_spectral_full, q_batch, ki_batch, t_batch,
             Y_theo_cryst_jax, w_l_j, num_peaks,
             meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max,
             num_blocks, cg_tables_pytree
@@ -1839,7 +1838,7 @@ def run_spectral_holonomic_tracker(
         ema_bg_rate = bg_ema_weight * ema_bg_rate + (1.0 - bg_ema_weight) * float(bg_rate)
         U_best = np.array(U_curr)
         tracking_history.append((t_state, U_best))
-        
+
         dim_b1 = block_dims_static[1]
         norm_gap_metric = float(jnp.sum(jnp.square(C_spectral_active[0 : dim_b1 * dim_b1])))
 
@@ -1857,7 +1856,7 @@ def run_spectral_holonomic_tracker(
                 losses=np.array([float(spectral_nll)]), best_idx=0,
                 neutron_count=cumulative_count, new_events=new_events,
                 metrics={
-                    "loss": float(spectral_nll), "eigengap": norm_gap_metric, 
+                    "loss": float(spectral_nll), "eigengap": norm_gap_metric,
                     "sig_rate": float(sig_rate), "bg_rate": float(bg_rate), "omega_eff": float(omega_eff)
                 }
             )
@@ -1870,5 +1869,5 @@ def run_spectral_holonomic_tracker(
         group.create_dataset("wigner_coefficients", data=C_final_export)
         group.create_dataset("final_u_matrix", data=tracking_history[-1][1])
         group.create_dataset("timestamps", data=np.array([h[0] for h in tracking_history]))
-        
+
     return tracking_history[-1][1]
