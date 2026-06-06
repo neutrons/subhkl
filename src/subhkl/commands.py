@@ -1416,6 +1416,7 @@ def compute_legendre_window_weights(q_mags, wl_min, wl_max, L_max):
 
     return jnp.stack(w_list, axis=0)
 
+
 def matrix_to_quaternion(R):
     """ Converts a 3x3 rotation matrix to a normalized quaternion (r, x, y, z). """
     t = jnp.trace(R)
@@ -1472,7 +1473,7 @@ def extract_orientation_from_l2(M_l2):
 
 
 def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks, block_dims_static):
-    """ DIRECT REAL PREDICTION: Maps real state blocks linearly onto observation vectors. """
+    """ DIRECT REAL PREDICTION: Maps real state blocks quadratically onto correlation tensors. """
     C_real_space = jnp.zeros((dim_l, dim_l))
 
     curr_idx = 0
@@ -1483,7 +1484,8 @@ def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks
             break
         curr_idx += dim_b * dim_b
 
-    A_sig = jnp.matmul(C_real_space, G_matrix)
+    # FIXED PHYSICS MODEL: Two-sided conjugation matches 3D spatial rotation invariants
+    A_sig = jnp.matmul(C_real_space, jnp.matmul(G_matrix, C_real_space.T))
     A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
 
     z_1st = jnp.matmul(C_real_space, T_vector) / jnp.sqrt(float(dim_l))
@@ -1491,7 +1493,7 @@ def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks
 
 
 def predict_single_shell_odd_linear(C_flat, G_matrix, l, dim_l, num_blocks, block_dims_static):
-    """ DIRECT REAL PREDICTION: Maps real state blocks linearly onto observation vectors. """
+    """ DIRECT REAL PREDICTION: Maps real state blocks quadratically onto correlation tensors. """
     C_real_space = jnp.zeros((dim_l, dim_l))
 
     curr_idx = 0
@@ -1502,7 +1504,8 @@ def predict_single_shell_odd_linear(C_flat, G_matrix, l, dim_l, num_blocks, bloc
             break
         curr_idx += dim_b * dim_b
 
-    A_sig = jnp.matmul(C_real_space, G_matrix)
+    # FIXED PHYSICS MODEL: Two-sided conjugation matches 3D spatial rotation invariants
+    A_sig = jnp.matmul(C_real_space, jnp.matmul(G_matrix, C_real_space.T))
     A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
     return A_dev_pred.flatten()
 
