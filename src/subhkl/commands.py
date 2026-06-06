@@ -1793,11 +1793,18 @@ def process_chunk_field_kalman(
             ewald_window_list.append((w_l_j[0] / 1.0) * p_j_0)
         else:
             cg_l = jax.lax.stop_gradient(cg_device_tensor[:, :, l, :max_dim_j, :max_dim_j, :dim])
-            A_sig_l_complex = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) + \
-                              jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
+            
+            # --- FULL TENSOR PRODUCT RECONSTRUCTION (REAL + IMAG) ---
+            A_sig_l_real_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_real, cg_l) + \
+                                jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_imag, cg_l)
+                                
+            A_sig_l_imag_part = jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l) - \
+                                jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_real, C_imag, cg_l)
 
-            # Map operator to real basis for accurate Ewald integration matching e3nn lab data
-            A_sig_l = jnp.real(C_l_list[l].conj().T @ A_sig_l_complex @ C_l_list[l])
+            A_sig_l_complex = A_sig_l_real_part + 1j * A_sig_l_imag_part
+
+            # --- CORRECTED BASIS CHANGE (U D U^dagger) ---
+            A_sig_l = jnp.real(C_l_list[l] @ A_sig_l_complex @ C_l_list[l].conj().T)
 
             Y_beam_l = Y_beam[so3_slices[l]]
             Y_theo_l = Y_theo_cryst_jax[:, so3_slices[l]]
