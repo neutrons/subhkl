@@ -1390,6 +1390,23 @@ import sympy
 from sympy.physics.wigner import clebsch_gordan as sympy_cg
 from functools import partial
 
+def real_to_complex_sh_matrix(l):
+    """ Host-side matrix construction prevents abstract tracing errors and matches the complex phase basis. """
+    dim = int(2 * l + 1)
+    U = np.zeros((dim, dim), dtype=np.complex64)
+    for m in range(-l, l + 1):
+        idx_r = m + l
+        if m == 0:
+            U[idx_r, l] = 1.0
+        elif m > 0:
+            U[idx_r, l + m] = (-1.0)**m / np.sqrt(2.0)
+            U[idx_r, l - m] = 1.0 / np.sqrt(2.0)
+        else:
+            U[idx_r, l + abs(m)] = -1j * (-1.0)**abs(m) / np.sqrt(2.0)
+            U[idx_r, l - abs(m)] = 1j / np.sqrt(2.0)
+    return jnp.array(U)
+
+
 def matrix_to_quaternion(R):
     """ Converts a 3x3 rotation matrix to a normalized quaternion (r, x, y, z). """
     t = jnp.trace(R)
@@ -1712,8 +1729,17 @@ def evolve_full_covariance_kalman(
         P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_l, P_state))
         P_state = 0.5 * (P_state + P_state.T)
 
-    # EXPERIMENT: Explicit holonomic constraints update pass completely bypassed
-    # to evaluate whether the continuous dynamics naturally support mass stability.
+    # --- ANCHOR CONSTRAINTS: Restoring geometric mass retractions pins unobserved null space paths ---
+    curr_idx = 0
+    for b in range(1, num_blocks):
+        dim_b = block_dims_static[b]
+        block_len = 2 * dim_b * dim_b
+        block_vals = C_state[curr_idx : curr_idx + block_len]
+        current_norm = jnp.sqrt(jnp.sum(jnp.square(block_vals)))
+        target_norm = jnp.sqrt(float(dim_b))
+        C_state = C_state.at[curr_idx : curr_idx + block_len].set(block_vals * (target_norm / (current_norm + 1e-9)))
+        curr_idx += block_len
+
     return C_state, P_state
 
 
@@ -1873,7 +1899,6 @@ def run_spectral_holonomic_tracker(
                     cg_big_tensor[b1, b2, l_val, :d1, :d2, :d3] = cg_matrix
 
     cg_device_tensor = jnp.array(cg_big_tensor)
-
     C_l_list = [jnp.array(real_to_complex_sh_matrix(l)) for l in range(L_max + 1)]
 
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
