@@ -17,7 +17,7 @@ dependencies = [
     "scipy>=1.17.1",
     "optax",
     "jraph",
-    "e3nn-jax",
+    "e3x",
     "tfp-nightly[jax]",
 ]
 

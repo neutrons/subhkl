@@ -1385,27 +1385,36 @@ import jax
 import jax.numpy as jnp
 import scipy.special
 import jax.scipy.linalg
-import e3nn_jax as e3nn
+import e3x
 import sympy
 from sympy.physics.wigner import clebsch_gordan as sympy_cg
 from functools import partial
 
-def real_to_complex_sh_matrix(l):
-    """ Host-side matrix construction prevents abstract tracing errors and matches the complex phase basis. """
-    dim = int(2 * l + 1)
-    U = np.zeros((dim, dim), dtype=np.complex64)
-    for m in range(-l, l + 1):
-        idx_r = m + l
-        if m == 0:
-            U[idx_r, l] = 1.0
-        elif m > 0:
-            U[idx_r, l + m] = (-1.0)**m / np.sqrt(2.0)
-            U[idx_r, l - m] = 1.0 / np.sqrt(2.0)
-        else:
-            U[idx_r, l + abs(m)] = -1j * (-1.0)**abs(m) / np.sqrt(2.0)
-            U[idx_r, l - abs(m)] = 1j / np.sqrt(2.0)
-    return jnp.array(U)
 
+@jax.jit(static_argnames=['L_max'])
+def compute_legendre_window_weights(q_mags, wl_min, wl_max, L_max):
+    """ Computes Legendre polynomial window parameters over reciprocal shell intervals. """
+    M = q_mags.shape[0]
+    x_max = jnp.clip(-0.5 * q_mags * wl_min, -1.0, 1.0)
+    x_min = jnp.clip(-0.5 * q_mags * wl_max, -1.0, 1.0)
+
+    P_min = [jnp.ones(M), x_min]
+    P_max = [jnp.ones(M), x_max]
+
+    for l in range(1, L_max + 1):
+        P_next_min = ((2 * l + 1) * x_min * P_min[-1] - l * P_min[-2]) / (l + 1)
+        P_next_max = ((2 * l + 1) * x_max * P_max[-1] - l * P_max[-2]) / (l + 1)
+        P_min.append(P_next_min)
+        P_max.append(P_next_max)
+
+    w_list = [0.5 * (x_max - x_min)]
+    for l in range(1, L_max + 1):
+        int_max = (P_max[l+1] - P_max[l-1]) / (2 * l + 1)
+        int_min = (P_min[l+1] - P_min[l-1]) / (2 * l + 1)
+        w_l = 0.5 * (2 * l + 1) * (int_max - int_min)
+        w_list.append(w_l)
+
+    return jnp.stack(w_list, axis=0)
 
 def matrix_to_quaternion(R):
     """ Converts a 3x3 rotation matrix to a normalized quaternion (r, x, y, z). """
@@ -1438,71 +1447,17 @@ def matrix_to_quaternion(R):
     return q / (jnp.linalg.norm(q) + 1e-9)
 
 
-def compute_wigner_D_matrix(j, r, x, y, z):
-    """ Generates an exact (2j+1)x(2j+1) complex Wigner D-matrix algebraically. """
-    dim = int(2 * j + 1)
-    D = np.zeros((dim, dim), dtype=np.complex128)
-    m_vals = np.arange(-j, j + 1)
-
-    a = complex(r, x)
-    b = complex(y, z)
-    a_conj = a.conjugate()
-    b_conj = b.conjugate()
-
-    for idx1, m1 in enumerate(m_vals):
-        pre_m1_fact = scipy.special.factorial(j + m1) * scipy.special.factorial(j - m1)
-        for idx2, m2 in enumerate(m_vals):
-            pre_m2_fact = scipy.special.factorial(j + m2) * scipy.special.factorial(j - m2)
-            prefactor = np.sqrt(pre_m1_fact * pre_m2_fact)
-
-            k_start = int(max(0, m1 - m2))
-            k_end = int(min(j + m1, j - m2))
-
-            element_sum = 0.0 + 0.0j
-            for k in range(k_start, k_end + 1):
-                denom = (scipy.special.factorial(k) * scipy.special.factorial(j + m1 - k) * scipy.special.factorial(j - m2 - k) * scipy.special.factorial(k + m2 - m1))
-                term = prefactor / denom
-                term *= (a ** (j + m1 - k)) * (a_conj ** (j - m2 - k)) * (b ** k) * ((-b_conj) ** (k + m2 - m1))
-                element_sum += term
-
-            D[idx1, idx2] = element_sum
-    return D
-
-
-@jax.jit(static_argnames=['L_max'])
-def compute_legendre_window_weights(q_mags, wl_min, wl_max, L_max):
-    """ Computes Legendre polynomial window parameters over reciprocal shell intervals. """
-    M = q_mags.shape[0]
-    x_max = jnp.clip(-0.5 * q_mags * wl_min, -1.0, 1.0)
-    x_min = jnp.clip(-0.5 * q_mags * wl_max, -1.0, 1.0)
-
-    P_min = [jnp.ones(M), x_min]
-    P_max = [jnp.ones(M), x_max]
-
-    for l in range(1, L_max + 1):
-        P_next_min = ((2 * l + 1) * x_min * P_min[-1] - l * P_min[-2]) / (l + 1)
-        P_next_max = ((2 * l + 1) * x_max * P_max[-1] - l * P_max[-2]) / (l + 1)
-        P_min.append(P_next_min)
-        P_max.append(P_next_max)
-
-    w_list = [0.5 * (x_max - x_min)]
-    for l in range(1, L_max + 1):
-        int_max = (P_max[l+1] - P_max[l-1]) / (2 * l + 1)
-        int_min = (P_min[l+1] - P_min[l-1]) / (2 * l + 1)
-        w_l = 0.5 * (2 * l + 1) * (int_max - int_min)
-        w_list.append(w_l)
-
-    return jnp.stack(w_list, axis=0)
-
-
 @jax.jit
 def extract_orientation_from_l2(M_l2):
-    """ Continuous Lie algebra descent engine: Extracts crystalline SO(3) matrix fields. """
-    irrep_l2 = e3nn.Irrep("2e")
-
+    """
+    E3X DIRECT MANIFOLD PASS: Extracts orientation matrices directly matching
+    the native, un-scrambled real Wigner components from the quadrupole shell.
+    """
     def refinement_step(U_curr, _):
         def projection_loss(U_trial):
-            return jnp.sum(jnp.square(irrep_l2.D_from_matrix(U_trial) - M_l2))
+            D_full = e3x.so3.rotations.wigner_d(U_trial, max_degree=2, cartesian_order=False)
+            D_l2 = D_full[4:9, 4:9]
+            return jnp.sum(jnp.square(D_l2 - M_l2))
 
         grad_U = jax.grad(projection_loss)(U_curr)
         A = jnp.matmul(grad_U, U_curr.T)
@@ -1517,21 +1472,16 @@ def extract_orientation_from_l2(M_l2):
 
 
 def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks, block_dims_static):
-    """ MANIFESTLY LINEAR MODEL: Maps ODF moments directly onto observation tensors. """
-    C_real = jnp.zeros((dim_l, dim_l))
-    C_imag = jnp.zeros((dim_l, dim_l))
+    """ DIRECT REAL PREDICTION: Maps real state blocks linearly onto observation vectors. """
+    C_real_space = jnp.zeros((dim_l, dim_l))
 
     curr_idx = 0
     for b in range(1, num_blocks):
         dim_b = block_dims_static[b]
         if int(b) == int(l):
-            C_real = C_flat[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b))
-            C_imag = C_flat[curr_idx + dim_b * dim_b : curr_idx + 2 * dim_b * dim_b].reshape((dim_b, dim_b))
+            C_real_space = C_flat[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b))
             break
-        curr_idx += 2 * dim_b * dim_b
-
-    U_sh = real_to_complex_sh_matrix(l)
-    C_real_space = jnp.real(U_sh @ (C_real + 1j * C_imag) @ U_sh.conj().T)
+        curr_idx += dim_b * dim_b
 
     A_sig = jnp.matmul(C_real_space, G_matrix)
     A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
@@ -1541,21 +1491,16 @@ def predict_single_shell_linear(C_flat, T_vector, G_matrix, l, dim_l, num_blocks
 
 
 def predict_single_shell_odd_linear(C_flat, G_matrix, l, dim_l, num_blocks, block_dims_static):
-    """ MANIFESTLY LINEAR MODEL: Maps ODF moments directly onto observation tensors. """
-    C_real = jnp.zeros((dim_l, dim_l))
-    C_imag = jnp.zeros((dim_l, dim_l))
+    """ DIRECT REAL PREDICTION: Maps real state blocks linearly onto observation vectors. """
+    C_real_space = jnp.zeros((dim_l, dim_l))
 
     curr_idx = 0
     for b in range(1, num_blocks):
         dim_b = block_dims_static[b]
         if int(b) == int(l):
-            C_real = C_flat[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b))
-            C_imag = C_flat[curr_idx + dim_b * dim_b : curr_idx + 2 * dim_b * dim_b].reshape((dim_b, dim_b))
+            C_real_space = C_flat[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b))
             break
-        curr_idx += 2 * dim_b * dim_b
-
-    U_sh = real_to_complex_sh_matrix(l)
-    C_real_space = jnp.real(U_sh @ (C_real + 1j * C_imag) @ U_sh.conj().T)
+        curr_idx += dim_b * dim_b
 
     A_sig = jnp.matmul(C_real_space, G_matrix)
     A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
@@ -1567,14 +1512,14 @@ def evolve_full_covariance_kalman(
     C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt, tau, ewald_window, process_q_scale,
     Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks
 ):
-    """ Strictly linear mass-conserving filter loop operating entirely on flat moment spaces. """
+    """ Mass-conserving linear moment loop executing entirely within real-valued spaces. """
     block_dims_static = [1] + [int(2 * b + 1) for b in range(1, num_blocks)]
-    num_state_coeffs = 2 * sum(block_dims_static[b]**2 for b in range(1, num_blocks))
+    num_state_coeffs = sum(block_dims_static[b]**2 for b in range(1, num_blocks))
 
     lap_diagonal_active = []
     for b in range(1, num_blocks):
         dim = block_dims_static[b]
-        lap_diagonal_active.extend([b * (b + 1)] * (2 * dim * dim))
+        lap_diagonal_active.extend([b * (b + 1)] * (dim * dim))
     lap_diagonal_active = jnp.array(lap_diagonal_active)
 
     raw_decay = jnp.exp(-tau * lap_diagonal_active * dt)
@@ -1587,11 +1532,8 @@ def evolve_full_covariance_kalman(
     total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
 
     so3_slices = []
-    sh_idx = 0
     for l in range(L_max + 1):
-        dim = 2 * l + 1
-        so3_slices.append(slice(sh_idx, sh_idx + dim))
-        sh_idx += dim
+        so3_slices.append(slice(l**2, (l+1)**2))
 
     z_data_list = []
     R_diag_list = []
@@ -1648,11 +1590,10 @@ def evolve_full_covariance_kalman(
     P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_global, P_state))
     P_state = 0.5 * (P_state + P_state.T)
 
-    # NATURALLY BOUNDED MASS SHELL: Reclaims scale parameters safely on the unit sphere
     curr_idx = 0
     for b in range(1, num_blocks):
         dim_b = block_dims_static[b]
-        block_len = 2 * dim_b * dim_b
+        block_len = dim_b * dim_b
         block_vals = C_state[curr_idx : curr_idx + block_len]
         current_norm = jnp.sqrt(jnp.sum(jnp.square(block_vals)))
         target_norm = jnp.sqrt(float(dim_b))
@@ -1677,22 +1618,16 @@ def process_chunk_field_kalman(
     num_events = jnp.maximum(float(actual_events), 1.0)
 
     block_dims_static = [1] + [int(2 * b + 1) for b in range(1, num_blocks)]
-    num_state_coeffs = 2 * sum(block_dims_static[b]**2 for b in range(1, num_blocks))
-
-    C_full_str = " + ".join([f"{li}e" if li % 2 == 0 else f"{li}o" for li in range(L_max + 1)])
-    sh_irreps_so3 = e3nn.Irreps(C_full_str)
+    num_state_coeffs = sum(block_dims_static[b]**2 for b in range(1, num_blocks))
 
     so3_slices = []
-    sh_idx = 0
     for l in range(L_max + 1):
-        dim = 2 * l + 1
-        so3_slices.append(slice(sh_idx, sh_idx + dim))
-        sh_idx += dim
+        so3_slices.append(slice(l**2, (l+1)**2))
 
-    Y_events_lab = e3nn.spherical_harmonics(sh_irreps_so3, q_batch, normalize=True).array
+    Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
     Y_lab_sum = jnp.sum(Y_events_lab, axis=0)
 
-    Y_beam = e3nn.spherical_harmonics(sh_irreps_so3, ki_batch[0], normalize=True).array
+    Y_beam = e3x.so3.irreps.spherical_harmonics(ki_batch[0], max_degree=L_max, cartesian_order=False, normalization='orthonormal')
     ewald_window_list = []
     for l in range(L_max + 1):
         dim = 2 * l + 1
@@ -1703,20 +1638,14 @@ def process_chunk_field_kalman(
             p_j_0 = jnp.matmul(Y_theo_0, Y_beam_0)
             ewald_window_list.append((w_l_j[0] / 1.0) * p_j_0)
         else:
-            C_real_l = jnp.zeros((dim, dim))
-            C_imag_l = jnp.zeros((dim, dim))
-
+            C_real_space = jnp.zeros((dim, dim))
             curr_idx = 0
             for b in range(1, num_blocks):
                 dim_b = block_dims_static[b]
                 if int(b) == int(l):
-                    C_real_l = C_prev[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b))
-                    C_imag_l = C_prev[curr_idx + dim_b * dim_b : curr_idx + 2 * dim_b * dim_b].reshape((dim_b, dim_b))
+                    C_real_space = C_prev[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b))
                     break
-                curr_idx += 2 * dim_b * dim_b
-
-            U_sh = real_to_complex_sh_matrix(l)
-            C_real_space = jnp.real(U_sh @ (C_real_l + 1j * C_imag_l) @ U_sh.conj().T)
+                curr_idx += dim_b * dim_b
 
             Y_beam_l = Y_beam[so3_slices[l]]
             Y_theo_l = Y_theo_cryst_jax[:, so3_slices[l]]
@@ -1737,28 +1666,19 @@ def process_chunk_field_kalman(
         Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks
     )
 
-    # Extract orientation matrix cleanly from the linear l=2 quadrupole moment matrix canvas
     C_real_2 = jnp.zeros((5, 5))
-    C_imag_2 = jnp.zeros((5, 5))
     curr_idx = 0
     for b in range(1, num_blocks):
         dim_b = block_dims_static[b]
-        if int(b) == 2:  # b = 2 -> l=2 quadrupole shell
+        if int(b) == 2:
             C_real_2 = C_new[curr_idx : curr_idx + 25].reshape((5, 5))
-            C_imag_2 = C_new[curr_idx + 25 : curr_idx + 50].reshape((5, 5))
             break
-        curr_idx += 2 * dim_b * dim_b
+        curr_idx += dim_b * dim_b
 
-    U_sh_2 = real_to_complex_sh_matrix(2)
-    M_l2_tracked = jnp.real(U_sh_2 @ (C_real_2 + 1j * C_imag_2) @ U_sh_2.conj().T)
-    U_map = extract_orientation_from_l2(M_l2_tracked)
+    U_map = extract_orientation_from_l2(C_real_2)
 
-    # Track signal mass robustly across chunk updates
-    curr_idx_m = 0
-    for b in range(1, 1):
-        curr_idx_m += 2 * (block_dims_static[b]**2)
     dim_b1 = block_dims_static[1]
-    signal_mass = jnp.sum(jnp.square(C_new[curr_idx_m : curr_idx_m + 2 * dim_b1 * dim_b1]))
+    signal_mass = jnp.sum(jnp.square(C_new[0 : dim_b1 * dim_b1]))
 
     intensive_signal_fraction = jnp.clip(signal_mass / 3.0, 0.0, 1.0)
     sig_rate = intensive_signal_fraction * total_rate
@@ -1790,14 +1710,13 @@ def run_spectral_holonomic_tracker(
     gamma_sig: float = 1e-4,
     gamma_c: float = 0.005,
     init_tangent_blur: float = 0.05,
-    prior_ridge: float = 1.0,        # OPTIMIZED: High prior uncertainty accelerates parameter updates
+    prior_ridge: float = 1.0,
     meas_noise_1st: float = 0.5,
-    meas_weight_2nd: float = 1.0,     # OPTIMIZED: Unit weight locks onto structural intensities directly
+    meas_weight_2nd: float = 1.0,
     ridge_inflation: float = 1e-4,
 ):
     from subhkl.optimization import FindUB
 
-    # FIXED RANGE: In the linear moments model, blocks track shell numbers l exactly up to L_max
     if J_max is None:
         J_max = float(L_max)
 
@@ -1805,15 +1724,13 @@ def run_spectral_holonomic_tracker(
     block_dims_static = [1] + [int(2 * b + 1) for b in range(1, num_blocks)]
 
     state_idx = 0
-    block_slices = []
     for b in range(1, num_blocks):
         dim = block_dims_static[b]
-        block_slices.append(slice(state_idx, state_idx + 2 * dim * dim))
-        state_idx += 2 * dim * dim
+        state_idx += dim * dim
 
     num_state_coeffs = state_idx
 
-    print(f"[0/3] Packing Linear Peter-Weyl Moment Channels (L_max={L_max})...")
+    print(f"[0/3] Packing Linear Peter-Weyl Moment Channels via E3X (L_max={L_max})...")
 
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
     ub_helper = FindUB()
@@ -1849,31 +1766,24 @@ def run_spectral_holonomic_tracker(
     q_theo_sample_jax = jnp.array(q_theo_cryst / np.where(q_mags_np[res_mask] == 0, 1.0, q_mags_np[res_mask]))
     num_peaks = float(q_theo_sample_jax.shape[1])
 
-    C_full_str = " + ".join([f"{l}e" if l % 2 == 0 else f"{l}o" for l in range(L_max + 1)])
-    sh_irreps_so3 = e3nn.Irreps(C_full_str)
-
     so3_slices = []
-    sh_idx = 0
     for l in range(L_max + 1):
-        dim = 2 * l + 1
-        so3_slices.append(slice(sh_idx, sh_idx + dim))
-        sh_idx += dim
+        so3_slices.append(slice(l**2, (l+1)**2))
 
-    Y_theo_cryst_jax = e3nn.spherical_harmonics(sh_irreps_so3, q_theo_sample_jax.T, normalize=True).array
+    Y_theo_cryst_jax = e3x.so3.irreps.spherical_harmonics(q_theo_sample_jax.T, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
     w_l_j = compute_legendre_window_weights(q_mags_jax, wl_min_tracking, wl_max_tracking, L_max)
 
     if U_init is not None:
         U_init_jax = jnp.array(U_init)
-        q_init = matrix_to_quaternion(U_init_jax)
-        r_i, x_i, y_i, z_i = q_init[0], q_init[1], q_init[2], q_init[3]
+        D_full = e3x.so3.rotations.wigner_d(U_init_jax, max_degree=L_max, cartesian_order=False)
 
         c_init_list = []
         for b in range(1, num_blocks):
-            # Form standard Wigner arrays directly for linear initialization mappings
-            dim = block_dims_static[b]
-            D_j = compute_wigner_D_matrix(float(b), r_i, x_i, y_i, z_i)
-            c_init_list.append(np.real(D_j).flatten())
-            c_init_list.append(np.imag(D_j).flatten())
+            l = b
+            start = l**2
+            end = (l+1)**2
+            block_l = D_full[start:end, start:end]
+            c_init_list.append(block_l.flatten())
 
         C_spectral_active = jnp.concatenate(c_init_list)
         P_spectral_full = jnp.eye(num_state_coeffs) * prior_ridge
@@ -1882,7 +1792,6 @@ def run_spectral_holonomic_tracker(
         for b in range(1, num_blocks):
             dim = block_dims_static[b]
             c_init_list.append(np.eye(dim).flatten())
-            c_init_list.append(np.zeros((dim, dim)).flatten())
         C_spectral_active = jnp.concatenate(c_init_list)
         P_spectral_full = jnp.eye(num_state_coeffs) * 0.1
 
@@ -1912,11 +1821,8 @@ def run_spectral_holonomic_tracker(
         U_best = np.array(U_curr)
         tracking_history.append((t_state, U_best))
 
-        curr_idx_m = 0
-        for b in range(1, 1):
-            curr_idx_m += 2 * (block_dims_static[b]**2)
         dim_b1 = block_dims_static[1]
-        norm_gap_metric = float(jnp.sum(jnp.square(C_spectral_active[curr_idx_m : curr_idx_m + 2 * dim_b1 * dim_b1])))
+        norm_gap_metric = float(jnp.sum(jnp.square(C_spectral_active[0 : dim_b1 * dim_b1])))
 
         if cumulative_count % 50000 < len(t_batch_np):
             print(f"    Time {t_state:.2f}s | Sig/Bg: {float(sig_rate):.0f}/{float(bg_rate):.0f} Hz | Coherent-Mass: {norm_gap_metric:8.2f} | Active-Solid-Angle: {float(omega_eff):.4f} sr")
