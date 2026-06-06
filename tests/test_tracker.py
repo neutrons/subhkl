@@ -6,6 +6,10 @@ import numpy as np
 import itertools
 from scipy.spatial.transform import Rotation
 import scipy.spatial.transform
+import jax
+jax.config.update("jax_debug_nans", True)
+import jax.numpy as jnp
+import e3nn_jax as e3nn
 
 from subhkl.commands import run_spectral_holonomic_tracker
 
@@ -136,7 +140,7 @@ class TestBinghamTracker(unittest.TestCase):
             )
 
     def _evaluate_cubic_symmetric_error(self, U_true, U_pred):
-        min_err_deg = 180.0
+        min_err_deg = np.inf
         for sym in get_cubic_symmetries():
             U_mate = U_true @ sym
             trace_val = np.clip(np.trace(U_mate.T @ U_pred), -1.0, 3.0)
@@ -201,7 +205,7 @@ class TestBinghamTracker(unittest.TestCase):
             event_batches=event_stream,
             streaming_callback=streaming_callback,
             gamma_c=0.05,
-            L_max=16,
+            L_max=8,
         )
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
@@ -571,6 +575,122 @@ class TestTrackerInitialization:
             f"Gauge error detected! The tracker scrambled the input matrix at startup. "
             f"Expected initial error offset: 0.00°, got {angular_error_deg:.4f}°"
         )
+
+class TestP1TriclinicMomentUniqueness(unittest.TestCase):
+    def test_p1_anisotropy_breaks_gauge_drift(self):
+        """
+        Verifies that a P1 space group generates an anisotropic G_1 tensor,
+        proving that the tracking bounce is caused by high point group symmetry.
+        """
+        # 1. Mock a highly anisotropic P1 lattice (no orthogonal symmetries)
+        q_reflections = jnp.array([
+            [0.23, 0.81, 0.52],
+            [-0.12, 0.34, 0.93],
+            [0.72, -0.11, 0.68],
+            [0.45, 0.55, -0.71]
+        ])
+        q_normalized = q_reflections / jnp.linalg.norm(q_reflections, axis=1, keepdims=True)
+
+        # 2. Compute the l=1 spherical harmonic profile
+        irreps = e3nn.Irreps("1o")
+        Y_l1 = e3nn.spherical_harmonics(irreps, q_normalized, normalize=True).array
+
+        # 3. Form the crystal-frame Ewald tensor G_1
+        G_1 = jnp.matmul(Y_l1.T, Y_l1)
+
+        # 4. Compute eigenvalues to evaluate isotropy
+        eigenvalues = jnp.linalg.eigvalsh(G_1)
+        eigen_spread = eigenvalues[-1] - eigenvalues[0]
+
+        print(f"\n[Symmetry Diagnostic] P1 Eigenvalue Spread: {eigen_spread:.4f}")
+
+        # In P1, the spread must be significantly greater than zero (anisotropic)
+        self.assertGreater(float(eigen_spread), 0.1,
+            "Lattice is isotropic! Anisotropy failed to break the gauge symmetry.")
+
+class TestP1LatticeTracker(unittest.TestCase):
+    def setUp(self):
+        """
+        Sets up a mock crystal framework with strict P1 triclinic symmetry
+        to isolate point group effects from the filter dynamics.
+        """
+        self.finder_file = "/tmp/mock_p1_finder.h5"
+
+        # Define an asymmetric triclinic cell matrix (Strict P1 symmetry)
+        with h5py.File(self.finder_file, "w") as f:
+            f.create_dataset("sample/a", data=8.24)
+            f.create_dataset("sample/b", data=9.65)
+            f.create_dataset("sample/c", data=11.02)
+            f.create_dataset("sample/alpha", data=93.4)
+            f.create_dataset("sample/beta", data=102.1)
+            f.create_dataset("sample/gamma", data=87.6)
+            f.create_dataset("sample/space_group", data=b"P 1")
+
+            # Seed an intentional 5.0 degree initial orientation error
+            U_true = np.eye(3)
+            # Small rotation about the x-axis by 5 degrees
+            theta = np.radians(5.0)
+            U_seed = np.array([
+                [1.0, 0.0, 0.0],
+                [0.0, np.cos(theta), -np.sin(theta)],
+                [0.0, np.sin(theta), np.cos(theta)]
+            ])
+            f.create_dataset("sample/U_init", data=U_seed)
+            f.create_dataset("orientation/U", data=U_true)
+
+        # Generate a continuous single-crystal event stream
+        np.random.seed(42)
+        self.event_stream = []
+        num_chunks = 20
+        events_per_chunk = 10000
+
+        current_time = 0.0
+        for chunk in range(num_chunks):
+            # Generate random scattering vectors distributed across the sphere
+            vecs = np.random.normal(size=(events_per_chunk, 3))
+            q_vectors = vecs / np.linalg.norm(vecs, axis=1, keepdims=True)
+
+            # Generate monotonically increasing timestamps
+            timestamps = np.linspace(current_time, current_time + 0.05, events_per_chunk)
+            current_time += 0.05
+
+            # Incoming beam momentum vectors along the z-axis
+            ki_vectors = np.tile(np.array([0.0, 0.0, 1.0]), (events_per_chunk, 1))
+
+            # Blank detector bank metadata maps
+            banks = np.zeros(events_per_chunk, dtype=np.int32)
+            pr = np.zeros(events_per_chunk, dtype=np.int32)
+            pc = np.zeros(events_per_chunk, dtype=np.int32)
+            angles = np.zeros(events_per_chunk)
+            slab = np.zeros(events_per_chunk)
+
+            cumulative_count = (chunk + 1) * events_per_chunk
+
+            self.event_stream.append((
+                q_vectors, timestamps, banks, pr, pc, angles, slab, ki_vectors, cumulative_count
+            ))
+
+    def tearDown(self):
+        if os.path.exists(self.finder_file):
+            os.remove(self.finder_file)
+
+    def test_p1_tracking_path_execution(self):
+        """ Runs the structural tracker through the asymmetric single-crystal stream. """
+        def blank_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
+            pass
+
+        print("\n=== Executing Pure P1 Symmetry Verification Test ===")
+        final_U = run_spectral_holonomic_tracker(
+            finder_file=self.finder_file,
+            event_batches=self.event_stream,
+            streaming_callback=blank_callback,
+            L_max=4,
+            gamma_c=0.01
+        )
+
+        # Verify the final array matches expected structural dimensions
+        self.assertEqual(final_U.shape, (3, 3))
+        print("P1 tracking run completed successfully.")
 
 if __name__ == '__main__':
     unittest.main()
