@@ -1362,18 +1362,6 @@ class RunPeaks:
         for k, v in kwargs.items():
             setattr(self, k, v)
 
-import os
-import h5py
-import numpy as np
-import jax
-import jax.numpy as jnp
-import scipy.special
-import jax.scipy.linalg
-import e3nn_jax as e3nn
-import sympy
-from sympy.physics.wigner import clebsch_gordan as sympy_cg
-from functools import partial
-
 def real_to_complex_sh_matrix(l):
     """ Host-side matrix construction prevents abstract tracing errors and matches the complex phase basis. """
     dim = int(2 * l + 1)
@@ -1390,6 +1378,17 @@ def real_to_complex_sh_matrix(l):
             U[idx_r, l - abs(m)] = 1j / np.sqrt(2.0)
     return jnp.array(U)
 
+import os
+import h5py
+import numpy as np
+import jax
+import jax.numpy as jnp
+import scipy.special
+import jax.scipy.linalg
+import e3nn_jax as e3nn
+import sympy
+from sympy.physics.wigner import clebsch_gordan as sympy_cg
+from functools import partial
 
 def matrix_to_quaternion(R):
     """ Converts a 3x3 rotation matrix to a normalized quaternion (r, x, y, z). """
@@ -1713,36 +1712,8 @@ def evolve_full_covariance_kalman(
         P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_l, P_state))
         P_state = 0.5 * (P_state + P_state.T)
 
-    # --- SINGLE GLOBAL MANIFOLD CONSTRAINTS AFTER FULL LOOP PASSTHROUGH ---
-    C_real_tensor = jnp.zeros((num_blocks, max_dim_j, max_dim_j))
-    C_imag_tensor = jnp.zeros((num_blocks, max_dim_j, max_dim_j))
-    C_real_tensor = C_real_tensor.at[0, 0, 0].set(1.0)
-
-    curr_idx = 0
-    for b in range(1, num_blocks):
-        dim_b = block_dims_static[b]
-        C_real_tensor = C_real_tensor.at[b, :dim_b, :dim_b].set(C_state[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
-        curr_idx += dim_b * dim_b
-        C_imag_tensor = C_imag_tensor.at[b, :dim_b, :dim_b].set(C_state[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b)))
-        curr_idx += dim_b * dim_b
-
-    psi = holonomic_su2_unitary_constraints(C_real_tensor, C_imag_tensor, num_blocks, block_dims_static, L_max)
-    A_real, A_imag = jax.jacobian(holonomic_su2_unitary_constraints, argnums=(0, 1))(C_real_tensor, C_imag_tensor, num_blocks, block_dims_static, L_max)
-
-    A_mat_list = []
-    for b in range(1, num_blocks):
-        dim_b = block_dims_static[b]
-        A_mat_list.append(A_real[:, b, :dim_b, :dim_b].reshape((A_real.shape[0], dim_b * dim_b)))
-        A_mat_list.append(A_imag[:, b, :dim_b, :dim_b].reshape((A_imag.shape[0], dim_b * dim_b)))
-    A_mat = jnp.concatenate(A_mat_list, axis=1)
-
-    S_c = jnp.matmul(A_mat, jnp.matmul(P_state, A_mat.T)) + ridge_inflation * jnp.eye(A_mat.shape[0])
-    K_c = jnp.matmul(P_state, jnp.matmul(A_mat.T, jnp.linalg.pinv(S_c, rcond=1e-4)))
-
-    C_state = C_state - K_c @ psi
-    P_state = P_state - jnp.matmul(K_c, jnp.matmul(A_mat, P_state))
-    P_state = 0.5 * (P_state + P_state.T)
-
+    # EXPERIMENT: Explicit holonomic constraints update pass completely bypassed
+    # to evaluate whether the continuous dynamics naturally support mass stability.
     return C_state, P_state
 
 
@@ -1811,8 +1782,6 @@ def process_chunk_field_kalman(
                             jnp.einsum('xyijm,xia,yjb,xyabk->mk', cg_l, C_imag, C_real, cg_l)
 
             A_sig_l_complex = D_l_real_part + 1j * D_l_imag_part
-
-            # CORRECTED BASIS ALIGNMENT MATCH: Synchronized completely with predict routines
             A_sig_l = jnp.real(C_l_list[l] @ A_sig_l_complex @ C_l_list[l].conj().T)
 
             Y_beam_l = Y_beam[so3_slices[l]]
@@ -2035,4 +2004,3 @@ def run_spectral_holonomic_tracker(
         group.create_dataset("timestamps", data=np.array([h[0] for h in tracking_history]))
 
     return tracking_history[-1][1]
-
