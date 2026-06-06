@@ -1448,10 +1448,10 @@ def matrix_to_quaternion(R):
 
 
 @jax.jit
-def extract_orientation_from_l1(M_l1, U_warm_start):
+def extract_orientation_from_l1(M_l1):
     """
-    WARM-STARTED MANIFOLD PASS: Initializes the gradient descent pass using the
-    previous batch's orientation matrix to ensure smooth convergence tracking.
+    E3X VECTOR MANIFOLD PASS: Extracts pristine orientation matrices directly matching
+    the fundamental real vector components from the L=1 shell slice.
     """
     def refinement_step(U_curr, _):
         def projection_loss(U_trial):
@@ -1463,27 +1463,28 @@ def extract_orientation_from_l1(M_l1, U_warm_start):
         A = jnp.matmul(grad_U, U_curr.T)
         omega = 0.5 * (A - A.T)
 
-        R = jnp.eye(3) - 0.20 * omega
+        R = jnp.eye(3) - 0.25 * omega
         V, _, Wt = jnp.linalg.svd(R @ U_curr)
         return jnp.matmul(V, Wt), None
 
-    U_final, _ = jax.lax.scan(refinement_step, U_warm_start, None, length=50)
+    U_final, _ = jax.lax.scan(refinement_step, jnp.eye(3), None, length=50)
     return U_final
 
 
 def predict_single_shell(C_flat, T_vector, G_matrix, l, dim_l, num_blocks, block_dims_static, cg_tables):
-    """ ABSOLUTE LINEAR MODEL: Reconstructs shell fields using absolute moment lookups. """
+    """ UNIFIED FORWARD MODEL: Universally projects both 1st-moment vectors and 2nd-moment correlations. """
     C_l_mat = jnp.zeros((dim_l, dim_l))
-    lookup_idx = 0
+    curr_idx = 0
     for b in range(1, num_blocks):
         dim_b = block_dims_static[b]
         if b == l:
-            C_l_mat = C_flat[lookup_idx : lookup_idx + dim_b * dim_b].reshape((dim_b, dim_b))
+            C_l_mat = C_flat[curr_idx : curr_idx + dim_b * dim_b].reshape((dim_b, dim_b))
             break
-        lookup_idx += dim_b * dim_b
+        curr_idx += dim_b * dim_b
     z_1st = jnp.matmul(C_l_mat, T_vector)
 
     A_sig = jnp.zeros((dim_l, dim_l))
+    curr_idx_B = 0
     max_L = min(2 * l + 1, num_blocks)
     for L in range(max_L):
         dim_L = 2 * L + 1
@@ -1493,18 +1494,10 @@ def predict_single_shell(C_flat, T_vector, G_matrix, l, dim_l, num_blocks, block
         if L == 0:
             A_sig += cg_L[:, :, 0] * G_N[0]
         else:
-            # FIXED INDEXING: Computes the absolute global offset for each target moment block L
-            C_L_mat = jnp.zeros((dim_L, dim_L))
-            lookup_idx_B = 0
-            for b in range(1, num_blocks):
-                dim_b = block_dims_static[b]
-                if b == L:
-                    C_L_mat = C_flat[lookup_idx_B : lookup_idx_B + dim_b * dim_b].reshape((dim_b, dim_b))
-                    break
-                lookup_idx_B += dim_b * dim_b
-
+            C_L_mat = C_flat[curr_idx_B : curr_idx_B + dim_L * dim_L].reshape((dim_L, dim_L))
             C_M = jnp.matmul(C_L_mat, G_N)
             A_sig += jnp.einsum('ijm,m->ij', cg_L, C_M)
+            curr_idx_B += dim_L * dim_L
 
     A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
     return jnp.concatenate([z_1st, A_dev_pred.flatten()])
@@ -1513,7 +1506,7 @@ def predict_single_shell(C_flat, T_vector, G_matrix, l, dim_l, num_blocks, block
 @partial(jax.jit, static_argnames=['L_max', 'num_blocks'])
 def evolve_full_covariance_kalman(
     C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt, tau, ewald_window, process_q_scale,
-    Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_tables_pytree, U_warm_start
+    Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_tables_pytree
 ):
     """ Real-valued mass-conserving linear moment loop operating with unified odd/even observation rows. """
     block_dims_static = [1] + [int(2 * b + 1) for b in range(1, num_blocks)]
@@ -1551,6 +1544,7 @@ def evolve_full_covariance_kalman(
         A_lab_dev = A_lab_norm - jnp.eye(dim_l) / float(dim_l)
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
 
+        # ASYMMETRIC SELECTION FIXED: Universally append 1st-order vector profiles for ALL shells
         z_1st_norm = Y_lab_sum[so3_slices[l]] / num_events
         z_data_list.append(z_1st_norm)
         R_diag_list.append(jnp.full(dim_l, sigma_l))
@@ -1586,18 +1580,20 @@ def evolve_full_covariance_kalman(
     P_state = P_state - has_events * alpha_k * jnp.matmul(K_global, jnp.matmul(H_global, P_state))
     P_state = 0.5 * (P_state + P_state.T)
 
-    # HARMONIC MANIFOLD SYNCHRONIZATION: Pins the decoupled moments to a single coherent rotation matrix
-    C_real_1 = C_state[0:9].reshape((3, 3))
-    U_map = extract_orientation_from_l1(C_real_1, U_warm_start)
+    # BLOCK-BY-BLOCK PROCRUSTES SVD RETRACTION: Maintains unitary constraints across the timeline
+    curr_idx = 0
+    for b in range(1, num_blocks):
+        dim_b = block_dims_static[b]
+        block_len = dim_b * dim_b
+        block_vals = C_state[curr_idx : curr_idx + block_len]
 
-    D_full_new = e3x.so3.rotations.wigner_d(U_map, max_degree=L_max, cartesian_order=False)
-    c_pinned_list = []
-    for L in range(1, num_blocks):
-        start = L**2
-        end = (L+1)**2
-        c_pinned_list.append(D_full_new[start:end, start:end].flatten())
+        block_mat = block_vals.reshape((dim_b, dim_b))
+        V, _, Wt = jnp.linalg.svd(block_mat, full_matrices=False)
+        orthogonal_mat = jnp.matmul(V, Wt)
 
-    C_state = jnp.concatenate(c_pinned_list)
+        C_state = C_state.at[curr_idx : curr_idx + block_len].set(orthogonal_mat.flatten())
+        curr_idx += block_len
+
     return C_state, P_state
 
 
@@ -1606,7 +1602,7 @@ def process_chunk_field_kalman(
     C_prev, P_prev, q_batch, ki_batch, t_batch,
     Y_theo_cryst_jax, w_l_j, num_peaks,
     meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max,
-    num_blocks, cg_tables_pytree, U_warm_start
+    num_blocks, cg_tables_pytree
 ):
     dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
     total_rate = q_batch.shape[0] / dt_chunk
@@ -1653,17 +1649,26 @@ def process_chunk_field_kalman(
     ewald_window = jnp.sum(jnp.stack(ewald_window_list), axis=0)
     ewald_window = jnp.clip(ewald_window, 0.0, 1.0)
 
-    process_q_scale = 0.0005  # HIGH CONVERGENCE: Calibrates system response across event batches
+    process_q_scale = 0.002
     mean_field_variance = jnp.maximum(1e-6, jnp.trace(P_prev) / num_state_coeffs)
     current_tau = gamma_c * jnp.sqrt(mean_field_variance * 1000.0 + 1.0)
 
     C_new, P_new = evolve_full_covariance_kalman(
         C_prev, P_prev, Y_lab_sum, Y_events_lab, num_events, has_events, dt_chunk, current_tau, ewald_window, process_q_scale,
-        Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_tables_pytree, U_warm_start
+        Y_theo_cryst_jax, meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, num_blocks, cg_tables_pytree
     )
 
-    C_real_1 = C_new[0:9].reshape((3, 3))
-    U_map = extract_orientation_from_l1(C_real_1, U_warm_start)
+    # Outer-track projection mapping extracts orientation matrix via the now active fundamental vector channel
+    C_real_1 = jnp.zeros((3, 3))
+    curr_idx_ext = 0
+    for b in range(1, num_blocks):
+        dim_b = block_dims_static[b]
+        if b == 1:
+            C_real_1 = C_new[curr_idx_ext : curr_idx_ext + 9].reshape((3, 3))
+            break
+        curr_idx_ext += dim_b * dim_b
+
+    U_map = extract_orientation_from_l1(C_real_1)
 
     dim_b1 = block_dims_static[1]
     signal_mass = jnp.sum(jnp.square(C_new[0 : dim_b1 * dim_b1]))
@@ -1698,9 +1703,9 @@ def run_spectral_holonomic_tracker(
     gamma_sig: float = 1e-4,
     gamma_c: float = 0.005,
     init_tangent_blur: float = 0.05,
-    prior_ridge: float = 0.5,
+    prior_ridge: float = 1.0,
     meas_noise_1st: float = 0.5,
-    meas_weight_2nd: float = 10.0,  # HIGH CONVERGENCE: Smooths out high-order structural fluctuations
+    meas_weight_2nd: float = 1.0,
     ridge_inflation: float = 1e-4,
 ):
     from subhkl.optimization import FindUB
@@ -1770,7 +1775,6 @@ def run_spectral_holonomic_tracker(
 
     if U_init is not None:
         U_init_jax = jnp.array(U_init)
-        U_curr = U_init_jax
         D_full = e3x.so3.rotations.wigner_d(U_init_jax, max_degree=L_max, cartesian_order=False)
 
         c_init_list = []
@@ -1784,7 +1788,6 @@ def run_spectral_holonomic_tracker(
         C_spectral_active = jnp.concatenate(c_init_list)
         P_spectral_full = jnp.eye(num_state_coeffs) * prior_ridge
     else:
-        U_curr = jnp.eye(3)
         c_init_list = []
         for b in range(1, num_blocks):
             dim = block_dims_static[b]
@@ -1807,12 +1810,11 @@ def run_spectral_holonomic_tracker(
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
-        # FIXED WARM START: Threads the current orientation matrix from batch to batch
         C_spectral_active, P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate, omega_eff = process_chunk_field_kalman(
             C_spectral_active, P_spectral_full, q_batch, ki_batch, t_batch,
             Y_theo_cryst_jax, w_l_j, num_peaks,
             meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max,
-            num_blocks, cg_tables_pytree, U_curr
+            num_blocks, cg_tables_pytree
         )
 
         ema_bg_rate = bg_ema_weight * ema_bg_rate + (1.0 - bg_ema_weight) * float(bg_rate)
