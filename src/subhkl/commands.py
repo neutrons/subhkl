@@ -1443,7 +1443,6 @@ def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max
 
     rotated_beam = jnp.matmul(D_full_prev.T, Y_beam)
 
-    # FIXED: Accumulating in-place eliminates large padding allocations entirely
     ewald_window = jnp.zeros(Y_theo_cryst_jax.shape[0])
     for l in range(L_max + 1):
         dim_l = 2 * l + 1
@@ -1463,9 +1462,10 @@ def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max
 
 
 def predict_all_shells_pure_tangent(omega, U_base, G_all, T_all, L_max):
-    """ LOW-DIMENSIONAL FORWARD PASS: Slices fixed-size small parameter matrices safely via static loops. """
+    """ LOW-DIMENSIONAL FORWARD PASS: Reconstructs predicted vectors cleanly under a 3D tangent. """
     R_perturb = vector_to_rotation_matrix(omega)
-    U_curr = jnp.matmul(R_perturb, U_base)
+    # FIXED GEOMETRY: Right multiplication applies perturbations directly within the crystal body frame
+    U_curr = jnp.matmul(U_base, R_perturb)
     D_full = e3x.so3.rotations.wigner_d(U_curr, max_degree=L_max, cartesian_order=False)
 
     preds = []
@@ -1493,11 +1493,10 @@ def kalman_subspace_update(
     P_prev, Y_events_lab, Y_lab_all_sum, G_all, T_all, U_base,
     process_q_scale, dt, ridge_inflation, meas_noise_1st, meas_weight_2nd, num_events, L_max
 ):
-    """ AUTO-DIFF KERNEL: Computes derivatives efficiently over an isolated 3D parameter tape. """
+    """ AUTO-DIFF KERNEL: Updates tangent parameters cleanly using exact forward differentiation. """
     omega_state = jnp.zeros(3)
     P_state = P_prev + jnp.eye(3) * (process_q_scale * dt)
 
-    # Monolithic observation parsing executed inside JIT to eliminate host roundtrips
     A_lab_all = jnp.matmul(Y_events_lab.T, Y_events_lab) / num_events
 
     z_data_list = []
@@ -1521,7 +1520,6 @@ def kalman_subspace_update(
     z_data = jnp.concatenate(z_data_list)
     R_diag = jnp.concatenate(R_diag_list)
 
-    # FIXED: jacfwd uses exact directional derivatives, bypassing reverse tape allocations
     z_pred = predict_all_shells_pure_tangent(omega_state, U_base, G_all, T_all, L_max)
     H_global = jax.jacfwd(predict_all_shells_pure_tangent)(omega_state, U_base, G_all, T_all, L_max)
 
@@ -1532,7 +1530,8 @@ def kalman_subspace_update(
     P_new = P_state - jnp.matmul(K_gain, jnp.matmul(H_global, P_state))
     P_new = 0.5 * (P_new + P_new.T)
 
-    U_new = jnp.matmul(vector_to_rotation_matrix(omega_update), U_base)
+    # FIXED GEOMETRY: Right multiplication applies updates natively within the body frame
+    U_new = jnp.matmul(U_base, vector_to_rotation_matrix(omega_update))
     V, _, Wt = jnp.linalg.svd(U_new, full_matrices=False)
     U_final = jnp.matmul(V, Wt)
 
@@ -1547,18 +1546,17 @@ def process_chunk_field_kalman(
     Y_theo_cryst_jax, w_l_j, num_peaks,
     meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max, U_base
 ):
-    dt_chunk = float(jnp.maximum(1e-4, t_batch[-1] - t_batch[0]))
+    dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
     total_rate = q_batch.shape[0] / dt_chunk
 
     actual_events = q_batch.shape[0]
-    has_events = 1.0 if actual_events > 0 else 0.0
-    num_events = float(max(actual_events, 1))
+    num_events = jnp.maximum(float(actual_events), 1.0)
 
     G_all, T_all = precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max)
     Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
     Y_lab_all_sum = jnp.sum(Y_events_lab, axis=0)
 
-    process_q_scale = 0.001
+    process_q_scale = 1e-7
 
     U_new, P_new = kalman_subspace_update(
         P_prev, Y_events_lab, Y_lab_all_sum, G_all, T_all, U_base,
@@ -1601,7 +1599,7 @@ def run_spectral_holonomic_tracker(
     gamma_sig: float = 1e-4,
     gamma_c: float = 0.005,
     init_tangent_blur: float = 0.05,
-    prior_ridge: float = 0.05,
+    prior_ridge: float = 0.15,
     meas_noise_1st: float = 0.5,
     meas_weight_2nd: float = 1.0,
     ridge_inflation: float = 1e-4,
@@ -1645,11 +1643,11 @@ def run_spectral_holonomic_tracker(
 
     Y_theo_cryst_jax = e3x.so3.irreps.spherical_harmonics(q_theo_sample_jax.T, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
 
-    M_peaks = q_mags_jax.shape[0]
-    x_max = jnp.clip(-0.5 * q_mags_jax * wl_min_tracking, -1.0, 1.0)
-    x_min = jnp.clip(-0.5 * q_mags_jax * wl_max_tracking, -1.0, 1.0)
-    P_min = [jnp.ones(M_peaks), x_min]
-    P_max = [jnp.ones(M_peaks), x_max]
+    M_peaks = q_mags_np[res_mask].shape[0]
+    x_max = np.clip(-0.5 * q_mags_np[res_mask] * wl_min_tracking, -1.0, 1.0)
+    x_min = np.clip(-0.5 * q_mags_np[res_mask] * wl_max_tracking, -1.0, 1.0)
+    P_min = [np.ones(M_peaks), x_min]
+    P_max = [np.ones(M_peaks), x_max]
 
     for l_idx in range(1, L_max + 1):
         P_min.append(((2 * l_idx + 1) * x_min * P_min[-1] - l_idx * P_min[-2]) / (l_idx + 1))
@@ -1658,7 +1656,7 @@ def run_spectral_holonomic_tracker(
     w_l_j_list = [0.5 * (x_max - x_min)]
     for l_idx in range(1, L_max + 1):
         w_l_j_list.append(0.5 * (P_max[l_idx+1] - P_max[l_idx-1] - (P_min[l_idx+1] - P_min[l_idx-1])))
-    w_l_j = jnp.stack(w_l_j_list, axis=0)
+    w_l_j = jnp.array(np.stack(w_l_j_list, axis=0))
 
     if U_init is not None:
         U_curr = jnp.array(U_init)
@@ -1692,7 +1690,7 @@ def run_spectral_holonomic_tracker(
         U_best = np.array(U_curr)
         tracking_history.append((t_state, U_best))
 
-        norm_gap_metric = float(jnp.trace(P_spectral_full))
+        norm_gap_metric = float(jnp.sum(jnp.square(U_curr)))
 
         if cumulative_count % 50000 < len(t_batch_np):
             print(f"    Time {t_state:.2f}s | Sig/Bg: {float(sig_rate):.0f}/{float(bg_rate):.0f} Hz | Coherent-Mass: {norm_gap_metric:8.2f} | Active-Solid-Angle: {float(omega_eff):.4f} sr")
