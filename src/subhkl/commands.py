@@ -1436,8 +1436,7 @@ def vector_to_rotation_matrix(omega):
 
 
 @partial(jax.jit, static_argnames=['L_max'])
-def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max):
-    """ FORWARD MATRIX REDUCTION: Evaluates global structural metrics away from the diff tape. """
+def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max, empirical_weights):
     D_full_prev = e3x.so3.rotations.wigner_d(U_base, max_degree=L_max, cartesian_order=False)
     Y_beam = e3x.so3.irreps.spherical_harmonics(ki_batch[0], max_degree=L_max, cartesian_order=False, normalization='orthonormal')
 
@@ -1452,7 +1451,9 @@ def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max
         p_l = jnp.matmul(Y_cryst_l, rotated_beam[start:end])
         ewald_window += (w_l_j[l] / float(dim_l)) * p_l
 
-    ewald_window = jnp.clip(ewald_window, 0.0, 1.0)
+    # NEW: Modulate the uniform window by the dynamically estimated peak intensities
+    ewald_window = jnp.clip(ewald_window, 0.0, 1.0) * empirical_weights
+    
     total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
 
     G_all = jnp.matmul(Y_theo_cryst_jax.T, Y_theo_cryst_jax * ewald_window[:, None]) / total_window_mass
@@ -1475,17 +1476,12 @@ def predict_all_shells_pure_tangent(omega, U_base, G_all, T_all, L_max):
         D_l = D_full[start:end, start:end]
 
         G_norm = G_all[start:end, start:end] * (4.0 * jnp.pi / float(dim_l))
-        T_template_l = T_all[start:end]
 
         A_sig = jnp.matmul(D_l, jnp.matmul(G_norm, D_l.T))
         A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
-        z_1st = jnp.matmul(D_l, T_template_l)
-
-        preds.append(z_1st)
         preds.append(A_dev_pred.flatten())
 
     return jnp.concatenate(preds)
-
 
 @partial(jax.jit, static_argnames=['L_max'])
 def kalman_subspace_update(
@@ -1509,10 +1505,6 @@ def kalman_subspace_update(
         A_lab_dev = A_lab_norm - jnp.eye(dim_l) / float(dim_l)
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
 
-        z_1st_norm = Y_lab_all_sum[start:end] / num_events
-        z_data_list.append(z_1st_norm)
-        R_diag_list.append(jnp.full(dim_l, sigma_l))
-
         z_data_list.append(A_lab_dev.flatten())
         R_diag_list.append(jnp.full(dim_l * dim_l, sigma_l * meas_weight_2nd / float(dim_l)))
 
@@ -1531,13 +1523,8 @@ def kalman_subspace_update(
 
     # FIXED DUALITY: Negative step vector aligns updates properly with the crystal reference frame
     U_new = jnp.matmul(U_base, vector_to_rotation_matrix(-omega_update))
-    V, _, Wt = jnp.linalg.svd(U_new, full_matrices=False)
-    U_final = jnp.matmul(V, Wt)
 
-    det = jnp.linalg.det(U_final)
-    U_final = jax.lax.cond(det < 0.0, lambda u: jnp.matmul(V.at[:, -1].multiply(-1.0), Wt), lambda u: u, U_final)
-
-    return U_final, P_new
+    return U_new, P_new
 
 
 def process_chunk_field_kalman(
@@ -1551,9 +1538,22 @@ def process_chunk_field_kalman(
     actual_events = q_batch.shape[0]
     num_events = jnp.maximum(float(actual_events), 1.0)
 
-    G_all, T_all = precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max)
     Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
     Y_lab_all_sum = jnp.sum(Y_events_lab, axis=0)
+
+    # NEW: Dynamically estimate structure factors via SH cross-correlation
+    # 1. Rotate theoretical peaks into the current lab frame
+    D_full_base = e3x.so3.rotations.wigner_d(U_base, max_degree=L_max, cartesian_order=False)
+    Y_theo_lab = jnp.matmul(Y_theo_cryst_jax, D_full_base.T)
+    
+    # 2. Dot product between the total data field and each theoretical peak location
+    peak_correlations = jnp.matmul(Y_theo_lab, Y_lab_all_sum)
+    
+    # 3. Rectify to prevent negative weights from SH ringing, add tiny baseline to prevent zeros
+    empirical_weights = jnp.maximum(peak_correlations, 0.0) + 0.01
+
+    # PASS the new weights into the precompute function
+    G_all, T_all = precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max, empirical_weights)
 
     process_q_scale = 1e-7
 
