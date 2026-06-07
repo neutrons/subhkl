@@ -1464,7 +1464,6 @@ def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max
 def predict_all_shells_pure_tangent(omega, U_base, G_all, T_all, L_max):
     """ LOW-DIMENSIONAL FORWARD PASS: Reconstructs predicted vectors cleanly under a 3D tangent. """
     R_perturb = vector_to_rotation_matrix(omega)
-    # FIXED GEOMETRY: Right multiplication applies perturbations directly within the crystal body frame
     U_curr = jnp.matmul(U_base, R_perturb)
     D_full = e3x.so3.rotations.wigner_d(U_curr, max_degree=L_max, cartesian_order=False)
 
@@ -1530,8 +1529,8 @@ def kalman_subspace_update(
     P_new = P_state - jnp.matmul(K_gain, jnp.matmul(H_global, P_state))
     P_new = 0.5 * (P_new + P_new.T)
 
-    # FIXED GEOMETRY: Right multiplication applies updates natively within the body frame
-    U_new = jnp.matmul(U_base, vector_to_rotation_matrix(omega_update))
+    # FIXED DUALITY: Negative step vector aligns updates properly with the crystal reference frame
+    U_new = jnp.matmul(U_base, vector_to_rotation_matrix(-omega_update))
     V, _, Wt = jnp.linalg.svd(U_new, full_matrices=False)
     U_final = jnp.matmul(V, Wt)
 
