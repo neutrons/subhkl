@@ -2,6 +2,7 @@ import h5py
 import numpy as np
 
 # NOTE(Vivek): deprecate and use Goniometer class to handler rotation calc
+from subhkl.core.crystallography import Lattice
 from subhkl.instrument.goniometer import (
     get_rotation_data_from_nexus,
 )
@@ -1477,10 +1478,7 @@ def run_zone_axis_search(
     settings = reduction_settings[instrument]
     wavelength_min, wavelength_max = settings.get("Wavelength")
 
-    ub_helper = FindUB()
-    ub_helper.a, ub_helper.b, ub_helper.c = a, b, c
-    ub_helper.alpha, ub_helper.beta, ub_helper.gamma = alpha, beta, gamma
-    B_mat = ub_helper.reciprocal_lattice_B()
+    B_mat = Lattice(a, b, c, alpha, beta, gamma).get_b_matrix()
 
     print("\n--- HOUGH PRIOR GENERATION ---")
     prior_engine = HoughPrior(

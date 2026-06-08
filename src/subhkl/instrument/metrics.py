@@ -8,9 +8,9 @@ import numpy as np
 import scipy.spatial
 
 from subhkl.config import beamlines
+from subhkl.core.crystallography import Lattice
 from subhkl.instrument.detector import Detector
 from subhkl.instrument.physics import calculate_angular_error
-from subhkl.optimization import FindUB
 
 
 def _get_safe_R_stack(R_file_in, run_indices_in, target_len):
@@ -169,14 +169,15 @@ def compute_metrics(
 ) -> dict:
     try:
         with h5py.File(file1, "r") as f:
-            ub_helper = FindUB()
-            ub_helper.a = f["sample/a"][()]
-            ub_helper.b = f["sample/b"][()]
-            ub_helper.c = f["sample/c"][()]
-            ub_helper.alpha = f["sample/alpha"][()]
-            ub_helper.beta = f["sample/beta"][()]
-            ub_helper.gamma = f["sample/gamma"][()]
-            B_mat = ub_helper.reciprocal_lattice_B()
+            a = f["sample/a"][()]
+            b = f["sample/b"][()]
+            c = f["sample/c"][()]
+            alpha = f["sample/alpha"][()]
+            beta = f["sample/beta"][()]
+            gamma = f["sample/gamma"][()]
+            lattice = Lattice(a, b, c, alpha, beta, gamma)
+            B_mat = lattice.get_b_matrix()
+
             U = f["sample/U"][()] if "sample/U" in f else np.eye(3)
             if "goniometer/translations" in f:
                 sample_offset = f["goniometer/translations"][()]
