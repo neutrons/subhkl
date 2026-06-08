@@ -1522,7 +1522,7 @@ def kalman_subspace_update(
     P_new = 0.5 * (P_new + P_new.T)
 
     # FIXED DUALITY: Negative step vector aligns updates properly with the crystal reference frame
-    U_new = jnp.matmul(U_base, vector_to_rotation_matrix(-omega_update))
+    U_new = jnp.matmul(U_base, vector_to_rotation_matrix(omega_update))
 
     return U_new, P_new
 
