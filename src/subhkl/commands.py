@@ -1412,6 +1412,7 @@ import jax.numpy as jnp
 import scipy.special
 import jax.scipy.linalg
 import e3x
+import gemmi
 from functools import partial
 
 def skew_symmetric(v):
@@ -1436,7 +1437,8 @@ def vector_to_rotation_matrix(omega):
 
 
 @partial(jax.jit, static_argnames=['L_max'])
-def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max, empirical_weights):
+def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max, I_weights_jax):
+    """ FORWARD MATRIX REDUCTION: Evaluates global structural metrics using physical structure factors. """
     D_full_prev = e3x.so3.rotations.wigner_d(U_base, max_degree=L_max, cartesian_order=False)
     Y_beam = e3x.so3.irreps.spherical_harmonics(ki_batch[0], max_degree=L_max, cartesian_order=False, normalization='orthonormal')
 
@@ -1451,16 +1453,14 @@ def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max
         p_l = jnp.matmul(Y_cryst_l, rotated_beam[start:end])
         ewald_window += (w_l_j[l] / float(dim_l)) * p_l
 
-    # NEW: Modulate the uniform window by the dynamically estimated peak intensities
-    ewald_window = jnp.clip(ewald_window, 0.0, 1.0) * empirical_weights
-    
+    # NATIVE INTENSITY MODULATION: Multiply window by the true structure factors
+    ewald_window = jnp.clip(ewald_window, 0.0, 1.0) * I_weights_jax
     total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
 
     G_all = jnp.matmul(Y_theo_cryst_jax.T, Y_theo_cryst_jax * ewald_window[:, None]) / total_window_mass
     T_all = jnp.sum(Y_theo_cryst_jax * ewald_window[:, None], axis=0) / total_window_mass
 
     return G_all, T_all
-
 
 def predict_all_shells_pure_tangent(omega, U_base, G_all, T_all, L_max):
     """ LOW-DIMENSIONAL FORWARD PASS: Reconstructs predicted vectors cleanly under a 3D tangent. """
@@ -1526,10 +1526,9 @@ def kalman_subspace_update(
 
     return U_new, P_new
 
-
 def process_chunk_field_kalman(
     P_prev, q_batch, ki_batch, t_batch,
-    Y_theo_cryst_jax, w_l_j, num_peaks,
+    Y_theo_cryst_jax, w_l_j, I_weights_jax, num_peaks,
     meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max, U_base
 ):
     dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
@@ -1541,7 +1540,6 @@ def process_chunk_field_kalman(
     Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
     Y_lab_all_sum = jnp.sum(Y_events_lab, axis=0)
 
-    # NEW: Dynamically estimate structure factors via SH cross-correlation
     # 1. Rotate theoretical peaks into the current lab frame
     D_full_base = e3x.so3.rotations.wigner_d(U_base, max_degree=L_max, cartesian_order=False)
     Y_theo_lab = jnp.matmul(Y_theo_cryst_jax, D_full_base.T)
@@ -1552,8 +1550,8 @@ def process_chunk_field_kalman(
     # 3. Rectify to prevent negative weights from SH ringing, add tiny baseline to prevent zeros
     empirical_weights = jnp.maximum(peak_correlations, 0.0) + 0.01
 
-    # PASS the new weights into the precompute function
-    G_all, T_all = precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max, empirical_weights)
+    G_all, T_all = precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max, I_weights_jax)
+    Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
 
     process_q_scale = 1e-7
 
@@ -1580,6 +1578,7 @@ def process_chunk_field_kalman(
 def run_spectral_holonomic_tracker(
     finder_file: str,
     event_batches,
+    structure_factors: gemmi.Mtz = None,
     instrument_name: str | None = None,
     streaming_callback=None,
     sigma_q_start: float = 0.15,
@@ -1643,6 +1642,51 @@ def run_spectral_holonomic_tracker(
     Y_theo_cryst_jax = e3x.so3.irreps.spherical_harmonics(q_theo_sample_jax.T, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
 
     M_peaks = q_mags_np[res_mask].shape[0]
+    I_weights = np.ones(M_peaks, dtype=np.float32)
+
+    if structure_factors is not None:
+        print("[*] Gemmi Structure Factors provided. Mapping physical intensities to Ewald model...")
+
+        # Locate Intensity (I) or Amplitude (F) columns
+        h_col = structure_factors.column_with_label('H') or structure_factors.columns[0]
+        k_col = structure_factors.column_with_label('K') or structure_factors.columns[1]
+        l_col = structure_factors.column_with_label('L') or structure_factors.columns[2]
+
+        i_col = next((c for c in structure_factors.columns if c.type == 'J' or c.label == 'I'), None)
+
+        # Fallback to Amplitude if Intensity isn't explicitly provided
+        if i_col is None:
+            i_col = next((c for c in structure_factors.columns if c.type == 'F' or c.label == 'F'), None)
+
+        if i_col is not None:
+            h_arr, k_arr, l_arr, i_arr = np.array(h_col.array), np.array(k_col.array), np.array(l_col.array), np.array(i_col.array)
+
+            # Convert Amplitude to Intensity if necessary
+            if i_col.type == 'F':
+                i_arr = i_arr ** 2
+
+            hkl_to_intensity = {(int(h), int(k), int(l)): val for h, k, l, val in zip(h_arr, k_arr, l_arr, i_arr)}
+
+            valid_theo_hkl = theo_hkl[:, res_mask]
+            for idx in range(M_peaks):
+                h, k, l = int(valid_theo_hkl[0, idx]), int(valid_theo_hkl[1, idx]), int(valid_theo_hkl[2, idx])
+
+                # Check for exact match or Friedel opposite
+                if (h, k, l) in hkl_to_intensity:
+                    I_weights[idx] = hkl_to_intensity[(h, k, l)]
+                elif (-h, -k, -l) in hkl_to_intensity:
+                    I_weights[idx] = hkl_to_intensity[(-h, -k, -l)]
+                else:
+                    I_weights[idx] = 0.01  # Small floor for unmeasured peaks
+
+            # Normalize to preserve overall scaling
+            if np.sum(I_weights) > 0:
+                I_weights /= np.mean(I_weights)
+        else:
+            print("    Warning: Could not find Intensity (type J) or Amplitude (type F) column in MTZ. Defaulting to uniform.")
+
+    I_weights_jax = jax.device_put(I_weights)
+
     x_max = np.clip(-0.5 * q_mags_np[res_mask] * wl_min_tracking, -1.0, 1.0)
     x_min = np.clip(-0.5 * q_mags_np[res_mask] * wl_max_tracking, -1.0, 1.0)
     P_min = [np.ones(M_peaks), x_min]
@@ -1681,7 +1725,7 @@ def run_spectral_holonomic_tracker(
 
         P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate, omega_eff = process_chunk_field_kalman(
             P_spectral_full, q_batch, ki_batch, t_batch,
-            Y_theo_cryst_jax, w_l_j, num_peaks,
+            Y_theo_cryst_jax, w_l_j, I_weights_jax, num_peaks,
             meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max, U_curr
         )
 

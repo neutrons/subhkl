@@ -15,6 +15,7 @@ from subhkl.commands import run_spectral_holonomic_tracker
 
 import pytest
 
+
 def get_cubic_symmetries():
     """Generates the 24 valid rotation matrices for a Cubic point group."""
     syms = []
@@ -38,6 +39,28 @@ class TestBinghamTracker(unittest.TestCase):
 
     def tearDown(self):
         self.test_dir.cleanup()
+
+    def create_mock_mtz(self, hkl_array, intensities):
+        """ Wraps exact test-generated intensities into a valid Gemmi object. """
+        import gemmi
+        mtz = gemmi.Mtz()
+        mtz.cell = gemmi.UnitCell(10.0, 10.0, 10.0, 90.0, 90.0, 90.0)
+        mtz.spacegroup = gemmi.SpaceGroup('P 1')
+        mtz.add_dataset('mock')
+
+        mtz.add_column('H', type='H')
+        mtz.add_column('K', type='H')
+        mtz.add_column('L', type='H')
+        mtz.add_column('I', type='J')
+
+        data = np.zeros((hkl_array.shape[1], 4), dtype=np.float32)
+        data[:, 0] = hkl_array[0, :]
+        data[:, 1] = hkl_array[1, :]
+        data[:, 2] = hkl_array[2, :]
+        data[:, 3] = intensities
+        mtz.set_data(data)
+
+        return mtz
 
     def generate_poissonian_events(self, U_true, num_events=1000000, duration=5.0, sigma_q=0.008, bg_fraction=0.0, b_factor=0.0):
         # Busing-Levy convention (1/d) to match the tracker's geometry exactly
@@ -66,6 +89,7 @@ class TestBinghamTracker(unittest.TestCase):
         valid_mask = (wavelengths > 0.5) & (wavelengths < 10.0)
         valid_q_hat = q_theo_hat[:, valid_mask]
         valid_norms = q_norms[valid_mask]
+        valid_hkl = hkl[:, valid_mask] # <--- Capture valid indices
         num_valid = valid_q_hat.shape[1]
 
         num_bg = int(num_events * bg_fraction)
@@ -75,15 +99,14 @@ class TestBinghamTracker(unittest.TestCase):
         # --- THE WILSON PRIOR (Intensity Decay) ---
         # ==========================================================
         if b_factor > 0.0:
-            # Scale b_factor so the exponential drop is identical to the old 2*pi space
-            # (2 * pi)^2 approx 39.47
-            intensities = np.exp(-(b_factor * 39.47) * (valid_norms**2))
-            p_dist = intensities / np.sum(intensities)
+            raw_intensities = np.exp(-(b_factor * 39.47) * (valid_norms**2))
+            p_dist = raw_intensities / np.sum(raw_intensities)
         else:
-            p_dist = None 
+            raw_intensities = np.ones_like(valid_norms)
+            p_dist = None
 
         peak_indices = np.random.choice(num_valid, size=num_sig, p=p_dist)
-        
+
         q_exp_list = []
         # 1. Generate Physical Signal Events
         for idx in peak_indices:
@@ -116,13 +139,13 @@ class TestBinghamTracker(unittest.TestCase):
         pixels_r = np.zeros(num_events, dtype=int)
         pixels_c = np.zeros(num_events, dtype=int)
 
-        return q_lab, times, banks, pixels_r, pixels_c
+        return q_lab, times, banks, pixels_r, pixels_c, valid_hkl, raw_intensities
 
     def get_fake_batches(self, sim_data, batch_size=10000):
         """Yields streaming tuples exactly matching the EventStreamLoader signature."""
-        q_lab, times, banks, pixels_r, pixels_c = sim_data
+        q_lab, times, banks, pixels_r, pixels_c = sim_data[:5] # <--- Slice here to prevent unpacking errors
         num_events = len(times)
-        
+
         for start_idx in range(0, num_events, batch_size):
             end_idx = min(start_idx + batch_size, num_events)
             N = end_idx - start_idx
@@ -164,6 +187,10 @@ class TestBinghamTracker(unittest.TestCase):
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, b_factor=0.5)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
 
+        valid_hkl = sim_data[5]
+        intensities = sim_data[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
+
         def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
@@ -171,6 +198,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
+            structure_factors=mock_mtz,
             sigma_q_start=1.0,
             sigma_q_min=0.02,
             streaming_callback=streaming_callback,
@@ -195,6 +223,10 @@ class TestBinghamTracker(unittest.TestCase):
 
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
+
+        valid_hkl = sim_data[5]
+        intensities = sim_data[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
         
         def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
@@ -203,6 +235,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
+            structure_factors=mock_mtz,
             streaming_callback=streaming_callback,
             gamma_c=0.05,
             L_max=8,
