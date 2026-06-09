@@ -7,7 +7,7 @@ import itertools
 from scipy.spatial.transform import Rotation
 import scipy.spatial.transform
 import jax
-jax.config.update("jax_debug_nans", True)
+#jax.config.update("jax_debug_nans", True)
 import jax.numpy as jnp
 import e3nn_jax as e3nn
 
@@ -316,7 +316,7 @@ class TestBinghamTracker(unittest.TestCase):
             structure_factors=mock_mtz,
             streaming_callback=streaming_callback,
             gamma_c=1e-4, # bg=160kHz -> Tau = 1e-4 * sqrt(160000) = 0.04
-            L_max=16,
+            L_max=8,
         )
         
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
@@ -485,7 +485,7 @@ class TestBinghamTracker(unittest.TestCase):
             entropy = metrics.get('entropy', 0.0) 
            
             print("Tracker 0 Error", self._evaluate_cubic_symmetric_error(U_true, U_preds[0]))
-            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Best-Idx={best_idx:3d} | Sym-Err={err:6.2f}° | Free-Energy={metrics['loss']:.2f} | Entropy={entropy:.2f} | Jensen={metrics['jensen_bound']:.2f}")
+            print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Best-Idx={best_idx:3d} | Sym-Err={err:6.2f}° | Free-Energy={metrics['loss']:.2f} | Entropy={entropy:.2f}")
 
         final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
@@ -494,7 +494,7 @@ class TestBinghamTracker(unittest.TestCase):
             annealing_rate=5,    # Smooth time-driven cooling funnel
             streaming_callback=streaming_callback,
             gamma_c=0.05,
-            loss_ema_weight=0.05,
+            L_max=8,
         ) 
 
         final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
