@@ -1436,31 +1436,6 @@ def vector_to_rotation_matrix(omega):
     return jax.lax.cond(theta < 1e-5, small_theta, large_theta)
 
 
-@partial(jax.jit, static_argnames=['L_max'])
-def precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max, I_weights_jax):
-    """ FORWARD MATRIX REDUCTION: Evaluates global structural metrics using physical structure factors. """
-    D_full_prev = e3x.so3.rotations.wigner_d(U_base, max_degree=L_max, cartesian_order=False)
-    Y_beam = e3x.so3.irreps.spherical_harmonics(ki_batch[0], max_degree=L_max, cartesian_order=False, normalization='orthonormal')
-
-    rotated_beam = jnp.matmul(D_full_prev.T, Y_beam)
-
-    ewald_window = jnp.zeros(Y_theo_cryst_jax.shape[0])
-    for l in range(L_max + 1):
-        dim_l = 2 * l + 1
-        start = l**2
-        end = (l+1)**2
-        Y_cryst_l = Y_theo_cryst_jax[:, start:end]
-        p_l = jnp.matmul(Y_cryst_l, rotated_beam[start:end])
-        ewald_window += (w_l_j[l] / float(dim_l)) * p_l
-
-    # NATIVE INTENSITY MODULATION: Multiply window by the true structure factors
-    ewald_window = jnp.clip(ewald_window, 0.0, 1.0) * I_weights_jax
-    total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
-
-    G_all = jnp.matmul(Y_theo_cryst_jax.T, Y_theo_cryst_jax * ewald_window[:, None]) / total_window_mass
-    T_all = jnp.sum(Y_theo_cryst_jax * ewald_window[:, None], axis=0) / total_window_mass
-
-    return G_all, T_all
 
 def predict_all_shells_pure_tangent(omega, U_base, G_all, T_all, L_max):
     """ LOW-DIMENSIONAL FORWARD PASS: Reconstructs predicted vectors cleanly under a 3D tangent. """
@@ -1483,9 +1458,60 @@ def predict_all_shells_pure_tangent(omega, U_base, G_all, T_all, L_max):
 
     return jnp.concatenate(preds)
 
+def predict_all_shells_q_space(omega, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max):
+    """ ZERO-WIGNER FORWARD MODEL: Evaluates exact analytical SH features by rotating the underlying vectors. """
+    R_perturb = vector_to_rotation_matrix(omega)
+    U_curr = jnp.matmul(U_base, R_perturb)
+    
+    # 1. Rotate the theoretical peak vectors directly into the lab frame
+    q_lab = jnp.matmul(U_curr, q_theo_sample_jax).T # Shape: (M_peaks, 3)
+    
+    # 2. Evaluate Spherical Harmonics directly on the rotated vectors
+    Y_lab = e3x.so3.irreps.spherical_harmonics(
+        q_lab, max_degree=L_max, cartesian_order=False, normalization='orthonormal'
+    )
+    
+    # 3. Dynamic Ewald Window evaluated strictly in the lab frame
+    Y_beam = e3x.so3.irreps.spherical_harmonics(
+        ki_batch[0], max_degree=L_max, cartesian_order=False, normalization='orthonormal'
+    )
+    
+    ewald_window = jnp.zeros(Y_lab.shape[0])
+    for l in range(L_max + 1):
+        dim_l = 2 * l + 1
+        start = l**2
+        end = (l+1)**2
+        # Lab-frame dot product is mathematically invariant to the crystal-frame equivalent
+        p_l = jnp.matmul(Y_lab[:, start:end], Y_beam[start:end])
+        ewald_window += (w_l_j[l] / float(dim_l)) * p_l
+        
+    ewald_window = jnp.clip(ewald_window, 0.0, 1.0) * I_weights_jax
+    total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
+    
+    preds = []
+    for l in range(1, L_max + 1):
+        dim_l = 2 * l + 1
+        start = l**2
+        end = (l+1)**2
+        
+        Y_l = Y_lab[:, start:end]
+        
+        # 1st order feature mean (Replaces T_all)
+        z_1st = jnp.sum(Y_l * ewald_window[:, None], axis=0) / total_window_mass
+        
+        # 2nd order feature covariance (Replaces G_all and D * G * D^T)
+        A_sig = jnp.matmul(Y_l.T, Y_l * ewald_window[:, None]) / total_window_mass
+        A_sig = A_sig * (4.0 * jnp.pi / float(dim_l))
+        A_dev = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
+        
+        preds.append(z_1st)
+        preds.append(A_dev.flatten())
+        
+    return jnp.concatenate(preds)
+
 @partial(jax.jit, static_argnames=['L_max'])
 def kalman_subspace_update(
-    P_prev, Y_events_lab, Y_lab_all_sum, G_all, T_all, U_base,
+    P_prev, Y_events_lab, Y_lab_all_sum, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, U_base,
     process_q_scale, dt, ridge_inflation, meas_noise_1st, meas_weight_2nd, num_events, L_max
 ):
     """ AUTO-DIFF KERNEL: Updates tangent parameters cleanly using exact forward differentiation. """
@@ -1505,32 +1531,43 @@ def kalman_subspace_update(
         A_lab_dev = A_lab_norm - jnp.eye(dim_l) / float(dim_l)
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
 
+        z_1st_norm = Y_lab_all_sum[start:end] / num_events
+        z_data_list.append(z_1st_norm)
+        R_diag_list.append(jnp.full(dim_l, sigma_l))
+
         z_data_list.append(A_lab_dev.flatten())
         R_diag_list.append(jnp.full(dim_l * dim_l, sigma_l * meas_weight_2nd / float(dim_l)))
 
     z_data = jnp.concatenate(z_data_list)
     R_diag = jnp.concatenate(R_diag_list)
 
-    z_pred = predict_all_shells_pure_tangent(omega_state, U_base, G_all, T_all, L_max)
-    H_global = jax.jacfwd(predict_all_shells_pure_tangent)(omega_state, U_base, G_all, T_all, L_max)
+    # EXACT AUTO-DIFF: JAX instantly unrolls the polynomial derivatives of the vectors. 
+    z_pred = predict_all_shells_q_space(omega_state, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max)
+    H_global = jax.jacfwd(predict_all_shells_q_space)(omega_state, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max)
 
-    S_mat = H_global @ P_state @ H_global.T + jnp.diag(R_diag) + ridge_inflation * jnp.eye(H_global.shape[0])
-    K_gain = P_state @ H_global.T @ jnp.linalg.pinv(S_mat, rcond=1e-4)
+    # --- WOODBURY INVERSION ---
+    R_eff_inv = 1.0 / (R_diag + ridge_inflation)
+    Ht_Rinv = H_global.T * R_eff_inv[None, :]
+    
+    P_inv = jnp.linalg.pinv(P_state + jnp.eye(3) * 1e-9)
+    information_matrix = P_inv + jnp.matmul(Ht_Rinv, H_global)
+    K_gain = jnp.matmul(jnp.linalg.pinv(information_matrix), Ht_Rinv)
 
-    omega_update = K_gain @ (z_data - z_pred)
-    P_new = P_state - jnp.matmul(K_gain, jnp.matmul(H_global, P_state))
+    omega_update = jnp.matmul(K_gain, (z_data - z_pred))
+    
+    P_new = jnp.linalg.pinv(information_matrix)
     P_new = 0.5 * (P_new + P_new.T)
 
-    # FIXED DUALITY: Negative step vector aligns updates properly with the crystal reference frame
     U_new = jnp.matmul(U_base, vector_to_rotation_matrix(omega_update))
 
     return U_new, P_new
 
 def process_chunk_field_kalman(
     P_prev, q_batch, ki_batch, t_batch,
-    Y_theo_cryst_jax, w_l_j, I_weights_jax, num_peaks,
+    q_theo_sample_jax, w_l_j, I_weights_jax,
     meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max, U_base
 ):
+
     dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
     total_rate = q_batch.shape[0] / dt_chunk
 
@@ -1540,23 +1577,12 @@ def process_chunk_field_kalman(
     Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
     Y_lab_all_sum = jnp.sum(Y_events_lab, axis=0)
 
-    # 1. Rotate theoretical peaks into the current lab frame
-    D_full_base = e3x.so3.rotations.wigner_d(U_base, max_degree=L_max, cartesian_order=False)
-    Y_theo_lab = jnp.matmul(Y_theo_cryst_jax, D_full_base.T)
-    
-    # 2. Dot product between the total data field and each theoretical peak location
-    peak_correlations = jnp.matmul(Y_theo_lab, Y_lab_all_sum)
-    
-    # 3. Rectify to prevent negative weights from SH ringing, add tiny baseline to prevent zeros
-    empirical_weights = jnp.maximum(peak_correlations, 0.0) + 0.01
-
-    G_all, T_all = precompute_shell_structures(U_base, Y_theo_cryst_jax, w_l_j, ki_batch, L_max, I_weights_jax)
     Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
 
     process_q_scale = 1e-7
 
     U_new, P_new = kalman_subspace_update(
-        P_prev, Y_events_lab, Y_lab_all_sum, G_all, T_all, U_base,
+        P_prev, Y_events_lab, Y_lab_all_sum, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, U_base,
         process_q_scale, dt_chunk, ridge_inflation, meas_noise_1st, meas_weight_2nd, num_events, L_max
     )
 
@@ -1605,6 +1631,7 @@ def run_spectral_holonomic_tracker(
     from subhkl.optimization import FindUB
 
     print(f"[0/3] Preparing Monolithic Lie Algebra Tangent Workspace (SO(3) Dimension=3)...")
+
     print(f"\n[1/3] Initializing Reciprocal Space from: {finder_file}")
     ub_helper = FindUB()
     U_init = None
@@ -1638,8 +1665,6 @@ def run_spectral_holonomic_tracker(
     q_mags_jax = jnp.array(q_mags_np[res_mask])
     q_theo_sample_jax = jnp.array(q_theo_cryst / np.where(q_mags_np[res_mask] == 0, 1.0, q_mags_np[res_mask]))
     num_peaks = float(q_theo_sample_jax.shape[1])
-
-    Y_theo_cryst_jax = e3x.so3.irreps.spherical_harmonics(q_theo_sample_jax.T, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
 
     M_peaks = q_mags_np[res_mask].shape[0]
     I_weights = np.ones(M_peaks, dtype=np.float32)
@@ -1712,6 +1737,8 @@ def run_spectral_holonomic_tracker(
     tracking_history = []
     ema_bg_rate = 1.0
 
+    import time
+
     for batch_data in event_batches:
         q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
         if len(t_batch_np) == 0: continue
@@ -1723,11 +1750,16 @@ def run_spectral_holonomic_tracker(
         ki_batch = jax.device_put(ki_sample_np)
         ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
 
+        t0 = time.time()
+
         P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate, omega_eff = process_chunk_field_kalman(
             P_spectral_full, q_batch, ki_batch, t_batch,
-            Y_theo_cryst_jax, w_l_j, I_weights_jax, num_peaks,
+            q_theo_sample_jax, w_l_j, I_weights_jax,
             meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max, U_curr
         )
+
+        # Force JAX to wait for execution to finish before stopping the timer
+        U_curr.block_until_ready() 
 
         ema_bg_rate = bg_ema_weight * ema_bg_rate + (1.0 - bg_ema_weight) * float(bg_rate)
         U_best = np.array(U_curr)

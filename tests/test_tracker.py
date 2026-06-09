@@ -259,6 +259,10 @@ class TestBinghamTracker(unittest.TestCase):
 
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
+
+        valid_hkl = sim_data[5]
+        intensities = sim_data[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
         
         def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
@@ -267,6 +271,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
+            structure_factors=mock_mtz,
             gamma_time=0.0,
             streaming_callback=streaming_callback,
             gamma_c=0.05,
@@ -296,7 +301,11 @@ class TestBinghamTracker(unittest.TestCase):
         # Generates a massive 80% uniform random spherical noise!
         sim_data = self.generate_poissonian_events(U_true, num_events=1000000, duration=5.0, bg_fraction=0.80)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
-        
+
+        valid_hkl = sim_data[5]
+        intensities = sim_data[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
+
         def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
@@ -304,6 +313,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
+            structure_factors=mock_mtz,
             streaming_callback=streaming_callback,
             gamma_c=1e-4, # bg=160kHz -> Tau = 1e-4 * sqrt(160000) = 0.04
             L_max=16,
@@ -328,6 +338,10 @@ class TestBinghamTracker(unittest.TestCase):
         sim_data = self.generate_poissonian_events(U_true, num_events=200000, duration=1.0)
         event_stream = self.get_fake_batches(sim_data, batch_size=10000)
 
+        valid_hkl = sim_data[5]
+        intensities = sim_data[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
+
         def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
             print(f"  -> [t={time:4.2f}s | {neutron_count:6d} evts] Sym-Err={err:6.2f}° | Loss={metrics['loss']:.2f} | Spectral-NLL={metrics['spectral_nll']:.2f} | Entropy={metrics['entropy']:.2f}")
@@ -335,6 +349,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
+            structure_factors=mock_mtz,
             annealing_rate=0.0,   # No annealing needed
             gamma_time=0.0, # disable SDE diffusion
             gamma_sig=0.0,
@@ -383,6 +398,10 @@ class TestBinghamTracker(unittest.TestCase):
         sim_data_flash = (q_lab, times, banks, pixels_r, pixels_c)
         event_stream = self.get_fake_batches(sim_data_flash, batch_size=10000)
 
+        valid_hkl = sim_data[5]
+        intensities = sim_data[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
+
         # Telemetry storage for assertions
         recorded_taus = []
         recorded_errors = []
@@ -399,6 +418,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
+            structure_factors=mock_mtz,
             streaming_callback=streaming_callback,
             gamma_c=1e-4,     # Enable SOC
             bg_ema_weight=0.85  # <--- Decrease thermal inertia for rapid recovery!
@@ -453,6 +473,10 @@ class TestBinghamTracker(unittest.TestCase):
         # Simulate the "4-panel" scenario: Moderate background, but plenty of time to overfit.
         sim_data = self.generate_poissonian_events(U_true, num_events=10000000, duration=5.0, bg_fraction=0.98)
         event_stream = self.get_fake_batches(sim_data, batch_size=100000)
+
+        valid_hkl = sim_data[5]
+        intensities = sim_data[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
         
         def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
             err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
@@ -466,6 +490,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
+            structure_factors=mock_mtz,
             annealing_rate=5,    # Smooth time-driven cooling funnel
             streaming_callback=streaming_callback,
             gamma_c=0.05,
@@ -501,6 +526,10 @@ class TestBinghamTracker(unittest.TestCase):
         )
         event_stream = self.get_fake_batches(sim_data, batch_size=20000)
 
+        valid_hkl = sim_data[5]
+        intensities = sim_data[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
+
         recorded_gaps = []
         recorded_errors = []
 
@@ -513,6 +542,7 @@ class TestBinghamTracker(unittest.TestCase):
         final_U = run_spectral_holonomic_tracker(
             finder_file=self.finder_file,
             event_batches=event_stream,
+            structure_factors=mock_mtz,
             annealing_rate=1.0,      # Smooth physical time cooling funnel
             d_min=1.5,               # Open up the high-resolution shell to activate the high-Q lever arm
             d_max=8.0,
