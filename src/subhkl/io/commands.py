@@ -7,7 +7,7 @@ from subhkl.instrument.goniometer import (
     get_rotation_data_from_nexus,
 )
 from subhkl.integration import Peaks
-from subhkl.optimization import FindUB
+from subhkl.optimization import FindUB, VectorizedObjective
 from subhkl.io.export import ImageStackMerger, MTZExporter
 
 from typing import List
@@ -1432,7 +1432,6 @@ def run_zone_axis_search(
     import numpy as np
     import jax.numpy as jnp
     from subhkl.config import reduction_settings
-    from subhkl.optimization import FindUB, VectorizedObjective
     from subhkl.search.prior import HoughPrior
 
     print(f"Loading data from {merged_h5_filename}...")
