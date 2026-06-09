@@ -9,7 +9,12 @@ import jax.numpy as jnp
 import jax.scipy.linalg as jsl
 
 from subhkl.core.spacegroup import is_systematically_absent
-from subhkl.core._crystallography_utils import LATTICE_CONFIG, LATTICE_CONSTRAINTS, SG_SYSTEM_MAP, LatticeSystem
+from subhkl.core._crystallography_utils import (
+    LATTICE_CONFIG,
+    LATTICE_CONSTRAINTS,
+    SG_SYSTEM_MAP,
+    LatticeSystem,
+)
 
 
 def cartesian_matrix_metric_tensor(a, b, c, alpha, beta, gamma):
@@ -276,4 +281,3 @@ class Lattice:
                 return Lattice(*lattice_cell, system=expected), num_params
             case _:
                 raise ValueError(f"Unknown return type: {return_type}")
-
