@@ -385,7 +385,6 @@ class TestBinghamTracker(unittest.TestCase):
             event_batches=event_stream,
             structure_factors=mock_mtz,
             streaming_callback=streaming_callback,
-            bg_ema_weight=0.85  # <--- Decrease thermal inertia for rapid recovery!
         )
 
         # --- SURVIVAL ASSERTIONS ---
