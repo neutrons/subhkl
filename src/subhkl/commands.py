@@ -1624,7 +1624,6 @@ def run_spectral_holonomic_tracker(
     h_max: int = 6,
     d_min: float = 2.0,
     d_max: float = 8.0,
-    bg_ema_weight: float = 0.99,
     wl_min_tracking: float = 0.5,
     wl_max_tracking: float = 12.0,
     L_max: int = 8,
@@ -1743,7 +1742,6 @@ def run_spectral_holonomic_tracker(
 
     # initialize the history with the starting state
     tracking_history = [(0.0, np.array(U_curr))]
-    ema_bg_rate = 1.0
 
     import time
 
@@ -1777,7 +1775,6 @@ def run_spectral_holonomic_tracker(
         # Force JAX to wait for execution to finish before stopping the timer
         U_curr.block_until_ready() 
 
-        ema_bg_rate = bg_ema_weight * ema_bg_rate + (1.0 - bg_ema_weight) * float(bg_rate)
         U_best = np.array(U_curr)
         tracking_history.append((t_state, U_best))
 
