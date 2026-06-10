@@ -522,6 +522,98 @@ class TestBinghamTracker(unittest.TestCase):
             f"Kinematic Failure: Crystalline funnel did not actively refine the seed error."
         )
 
+    def generate_anisotropic_background(self, num_bg, duration=5.0,
+                                        axis=np.array([0.0, 0.0, 1.0]),
+                                        spread=0.35):
+        """
+        Structured (non-isotropic) background concentrated around `axis`
+        (default: the incident beam, +z). Models forward/air scatter and the
+        incoherent beamstop halo. Unlike a uniform sphere, this has real
+        l=1/l=2 content that survives the deviatoric SH projection.
+
+        Returns (q_dirs (N,3) float32, times (N,) float32).
+        """
+        axis = axis / np.linalg.norm(axis)
+        vecs = axis[None, :] + np.random.normal(0.0, spread, size=(num_bg, 3))
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        times = np.sort(np.random.uniform(0.0, duration, num_bg))
+        return vecs.astype(np.float32), times.astype(np.float32)
+
+
+    def test_anisotropic_background_rejection(self):
+        print(f"\n{'='*60}\nExecuting Regression: ANISOTROPIC (STRUCTURED) BACKGROUND\n{'='*60}")
+
+        U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
+        U_seed = Rotation.from_euler('y', 40.0, degrees=True).as_matrix()
+
+        with h5py.File(self.finder_file, "w") as f:
+            f["sample/a"], f["sample/b"], f["sample/c"] = 10.0, 10.0, 10.0
+            f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = 90.0, 90.0, 90.0
+            f["sample/space_group"] = b"P 1"
+            f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+            f["sample/U"] = U_seed
+
+        duration = 5.0
+        n_sig = 400_000
+        n_bg = 600_000  # 60% STRUCTURED background (much milder than the 98% isotropic tests)
+
+        # Pure signal events at U_true (reuse the validated generator, no internal bg).
+        sig = self.generate_poissonian_events(
+            U_true, num_events=n_sig, duration=duration, bg_fraction=0.0
+        )
+        sig_q, sig_t = sig[0], sig[1]
+        valid_hkl, intensities = sig[5], sig[6]
+
+        # Forward-scatter lobe along the beam (+z). Try axis=normalize([0,0.3,1]) or a
+        # second lobe to make it harder; even this single lobe should bias the estimate.
+        bg_q, bg_t = self.generate_anisotropic_background(
+            n_bg, duration=duration, axis=np.array([0.0, 0.0, 1.0]), spread=0.2
+        )
+
+        # Merge and re-sort chronologically -- mirrors the loader's global time sort,
+        # so every batch sees a realistic signal/background mix rather than blocks.
+        q_lab = np.concatenate([sig_q, bg_q], axis=0)
+        times = np.concatenate([sig_t, bg_t])
+        order = np.argsort(times, kind="stable")
+        q_lab, times = q_lab[order], times[order]
+
+        N = len(times)
+        sim_data = (
+            q_lab,
+            times,
+            np.ones(N, dtype=int),    # banks
+            np.zeros(N, dtype=int),   # pixels_r
+            np.zeros(N, dtype=int),   # pixels_c
+        )
+
+        event_stream = self.get_fake_batches(sim_data, batch_size=10_000)
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
+
+        errs = []
+
+        def streaming_callback(time, U_preds, losses, best_idx, neutron_count, new_events, metrics):
+            err = self._evaluate_cubic_symmetric_error(U_true, U_preds[best_idx])
+            errs.append(err)
+            print(f"  -> [t={time:4.2f}s | {neutron_count:7d} evts] "
+                  f"Sym-Err={err:6.2f}° | Norm-Gap={metrics['eigengap']:.2f}")
+
+        final_U = run_spectral_holonomic_tracker(
+            finder_file=self.finder_file,
+            event_batches=event_stream,
+            structure_factors=mock_mtz,
+            streaming_callback=streaming_callback,
+            L_max=8,
+        )
+
+        final_err = self._evaluate_cubic_symmetric_error(U_true, final_U)
+
+        self.assertLess(
+            final_err, 2.0,
+            f"Structured-background rejection failed: a beam-aligned scatter lobe "
+            f"biased the orientation (Final Error {final_err:.2f}° >= 2.0°). "
+            f"Isotropic-background tests miss this because a uniform sphere cancels "
+            f"in the deviatoric SH moment; a forward lobe does not."
+        )
 class TestTrackerInitialization:
     @pytest.fixture
     def mock_reciprocal_h5(self, tmp_path):
