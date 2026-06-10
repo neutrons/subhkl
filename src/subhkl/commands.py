@@ -1560,12 +1560,13 @@ def kalman_subspace_update(
 
     U_new = jnp.matmul(U_base, vector_to_rotation_matrix(omega_update))
 
-    return U_new, P_new
+    return U_new, P_new, z_pred, z_data
 
 def process_chunk_field_kalman(
     P_prev, q_batch, ki_batch, t_batch,
     q_theo_sample_jax, w_l_j, I_weights_jax,
-    meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max, U_base
+    meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_base,
+    current_q_scale
 ):
 
     dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
@@ -1579,26 +1580,36 @@ def process_chunk_field_kalman(
 
     Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
 
-    process_q_scale = 1e-7
-
-    U_new, P_new = kalman_subspace_update(
+    U_new, P_new, z_pred, z_data = kalman_subspace_update(
         P_prev, Y_events_lab, Y_lab_all_sum, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, U_base,
-        process_q_scale, dt_chunk, ridge_inflation, meas_noise_1st, meas_weight_2nd, num_events, L_max
+        current_q_scale, dt_chunk, ridge_inflation, meas_noise_1st, meas_weight_2nd, num_events, L_max
     )
 
     U_final = U_new if actual_events > 0 else U_base
     P_final = P_new if actual_events > 0 else (P_prev + jnp.eye(3) * (process_q_scale * dt_chunk))
 
-    D_full_new = e3x.so3.rotations.wigner_d(U_final, max_degree=2, cartesian_order=False)
-    signal_mass = jnp.sum(jnp.square(D_full_new[1:4, 1:4]))
+    # 1. Extract the 1st-order (l=1) template block from the forward model
+    # We only care about the 3 vector components of the l=1 shell
+    z_pred_l1 = z_pred[0:3] 
 
-    intensive_signal_fraction = jnp.clip(signal_mass / 3.0, 0.0, 1.0)
+    # 2. Extract the actual data's l=1 block
+    z_data_l1 = z_data[0:3]
+
+    # 3. Calculate the projection (cosine similarity) of the data onto the template
+    # If the data perfectly matches the template, the dot product is maximized.
+    # We normalize by the expected theoretical mass.
+    norm_pred = jnp.sum(jnp.square(z_pred_l1)) + 1e-9
+    signal_mass = jnp.sum(z_data_l1 * z_pred_l1) / norm_pred
+
+    intensive_signal_fraction = jnp.clip(signal_mass, 0.0, 1.0)
     sig_rate = intensive_signal_fraction * total_rate
     bg_rate = jnp.maximum(total_rate - sig_rate, 0.0)
-    omega_eff = 1.6009
-    spectral_nll = -jnp.log(jnp.maximum(signal_mass + (1.0 / (4.0 * jnp.pi)), 1e-9))
 
-    return P_final, U_final, spectral_nll, sig_rate, bg_rate, omega_eff
+    # The spectral NLL can be tracked via the magnitude of the innovation residual
+    innovation = z_data - z_pred
+    spectral_nll = 0.5 * jnp.sum(jnp.square(innovation))
+
+    return P_final, U_final, spectral_nll, sig_rate, bg_rate
 
 
 def run_spectral_holonomic_tracker(
@@ -1607,22 +1618,16 @@ def run_spectral_holonomic_tracker(
     structure_factors: gemmi.Mtz = None,
     instrument_name: str | None = None,
     streaming_callback=None,
-    sigma_q_start: float = 0.15,
+    process_q_scale_start: float = 1e-3,
+    process_q_scale_end: float = 1e-7,
     annealing_rate: float = 1.0,
-    gamma_step: float = 100.0,
     h_max: int = 6,
     d_min: float = 2.0,
     d_max: float = 8.0,
     bg_ema_weight: float = 0.99,
-    loss_weight_ema: float = 0.05,
     wl_min_tracking: float = 0.5,
     wl_max_tracking: float = 12.0,
-    J_max: float = None,
     L_max: int = 8,
-    gamma_time: float = 1.0,
-    gamma_sig: float = 1e-4,
-    gamma_c: float = 0.005,
-    init_tangent_blur: float = 0.05,
     prior_ridge: float = 0.15,
     meas_noise_1st: float = 0.5,
     meas_weight_2nd: float = 1.0,
@@ -1734,7 +1739,10 @@ def run_spectral_holonomic_tracker(
     P_spectral_full = jnp.eye(3) * prior_ridge
 
     print(f"\n[2/3] Executing Field Tracker Pipeline (3 Local Subspace Rotational Degrees Active)...")
-    tracking_history = []
+
+
+    # initialize the history with the starting state
+    tracking_history = [(0.0, np.array(U_curr))]
     ema_bg_rate = 1.0
 
     import time
@@ -1752,10 +1760,18 @@ def run_spectral_holonomic_tracker(
 
         t0 = time.time()
 
-        P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate, omega_eff = process_chunk_field_kalman(
+        # Calculate the fraction of total expected time/events (0.0 to 1.0)
+        # If duration isn't explicitly known, you can use the annealing_rate parameter
+        progress_fraction = min(t_state / (5.0 * annealing_rate), 1.0)
+
+        # Exponential decay from start to end
+        current_q_scale = process_q_scale_start * (process_q_scale_end / process_q_scale_start) ** progress_fraction
+
+        P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate = process_chunk_field_kalman(
             P_spectral_full, q_batch, ki_batch, t_batch,
             q_theo_sample_jax, w_l_j, I_weights_jax,
-            meas_noise_1st, meas_weight_2nd, ridge_inflation, gamma_c, L_max, U_curr
+            meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_curr,
+            current_q_scale
         )
 
         # Force JAX to wait for execution to finish before stopping the timer
@@ -1765,10 +1781,10 @@ def run_spectral_holonomic_tracker(
         U_best = np.array(U_curr)
         tracking_history.append((t_state, U_best))
 
-        norm_gap_metric = float(jnp.sum(jnp.square(U_curr)))
+        norm_gap_metric = float(jnp.trace(jnp.linalg.pinv(P_spectral_full)))
 
         if cumulative_count % 50000 < len(t_batch_np):
-            print(f"    Time {t_state:.2f}s | Sig/Bg: {float(sig_rate):.0f}/{float(bg_rate):.0f} Hz | Coherent-Mass: {norm_gap_metric:8.2f} | Active-Solid-Angle: {float(omega_eff):.4f} sr")
+            print(f"    Time {t_state:.2f}s | Sig/Bg: {float(sig_rate):.0f}/{float(bg_rate):.0f} Hz | Coherent-Mass: {norm_gap_metric:8.2f}")
 
         if streaming_callback is not None:
             new_events = {
@@ -1782,7 +1798,7 @@ def run_spectral_holonomic_tracker(
                 neutron_count=cumulative_count, new_events=new_events,
                 metrics={
                     "loss": float(spectral_nll), "eigengap": norm_gap_metric,
-                    "sig_rate": float(sig_rate), "bg_rate": float(bg_rate), "omega_eff": float(omega_eff)
+                    "sig_rate": float(sig_rate), "bg_rate": float(bg_rate),
                 }
             )
 
