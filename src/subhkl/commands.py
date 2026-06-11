@@ -1414,6 +1414,7 @@ import jax.scipy.linalg
 import e3x
 import gemmi
 from functools import partial
+from subhkl.instrument.goniometer import lab_to_sample
 
 def skew_symmetric(v):
     """ Computes the 3x3 skew-symmetric matrix cross-product operator. """

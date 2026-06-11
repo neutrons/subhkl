@@ -9,7 +9,8 @@ import scipy.spatial.transform
 import jax
 import jax.numpy as jnp
 
-from subhkl.commands import run_spectral_holonomic_tracker
+from subhkl.commands import run_spectral_holonomic_tracker, _sample_to_lab_matrix
+from subhkl.instrument.goniometer import lab_to_sample
 
 import pytest
 import e3x
@@ -729,6 +730,153 @@ class TestBinghamTracker(unittest.TestCase):
             f"populate only the covered cap; the missing detector acceptance mask is "
             f"an uncorrected anisotropic window on S^2."
         )
+
+    def test_sample_lab_transform_roundtrip(self):
+        """
+        DECISIVE check: the tracker's sample->lab matrix must invert the loader's
+        lab_to_sample for finite multi-axis angles AND non-zero offsets. Convention
+        -agnostic -- both sides use the same goniometer module, so this asserts they
+        are mutually inverse, which is exactly what the coverage path relies on
+        (q_lab = R_batch @ q_sample). Deterministic, fast, no Kalman filter.
+        """
+        print(f"\n{'='*60}\nUnit: SAMPLE<->LAB ROUND-TRIP (finite angles + offsets)\n{'='*60}")
+        rng = np.random.default_rng(0)
+
+        cases = [
+            # (axes (na,3),                         angles (na,),          offsets (na,) | None)
+            (np.array([[0.0, 1.0, 0.0]]),           np.array([30.0]),      None),
+            (np.array([[0.0, 1.0, 0.0]]),           np.array([30.0]),      np.array([5.0])),
+            (np.array([[0.0, 1.0, 0.0],
+                       [1.0, 0.0, 0.0]]),           np.array([25.0, 15.0]), np.array([3.0, -2.0])),
+            (np.array([[0.0, 1.0, 0.0],
+                       [1.0, 0.0, 0.0],
+                       [0.0, 0.0, 1.0]]),           np.array([40.0, -20.0, 10.0]),
+                                                    np.array([1.0, 2.0, -3.0])),
+        ]
+
+        for axes, ang, offsets in cases:
+            na = len(axes)
+            # R = sample->lab at this constant setting, as the tracker builds it.
+            R = np.asarray(_sample_to_lab_matrix(axes, ang, offsets), dtype=float)
+
+            # 1) Proper rotation.
+            np.testing.assert_allclose(R @ R.T, np.eye(3), atol=1e-4,
+                err_msg=f"R not orthonormal for axes={axes.tolist()} ang={ang.tolist()}")
+            self.assertAlmostEqual(float(np.linalg.det(R)), 1.0, places=4,
+                msg=f"det(R) != +1 for ang={ang.tolist()} offsets={offsets}")
+
+            # 2) R inverts the loader's lab_to_sample on independent probe vectors.
+            v_lab = rng.normal(size=(64, 3))
+            v_lab /= np.linalg.norm(v_lab, axis=1, keepdims=True)
+            ang_full = np.tile(ang.reshape(na, 1), (1, v_lab.shape[0]))      # (na, N)
+            v_sample = np.asarray(
+                lab_to_sample(v_lab, axes, ang_full, None, offsets, is_vector=True))
+            v_lab_rec = (R @ v_sample.T).T
+
+            np.testing.assert_allclose(
+                v_lab_rec, v_lab, atol=1e-4,
+                err_msg=("tracker R_batch does not invert loader lab_to_sample for "
+                         f"finite angles/offsets (axes={axes.tolist()}, ang={ang.tolist()}, "
+                         f"offsets={offsets}). Coverage map would land in the wrong "
+                         "lab region."))
+
+            print(f"  ok: na={na} ang={ang.tolist()} offsets={offsets} "
+                  f"-> max round-trip err {np.max(np.abs(v_lab_rec - v_lab)):.2e}")
+
+    def test_goniometer_finite_setting(self):
+        """
+        Integration: run the tracker with the transform path ACTIVE (finite, non-
+        trivial multi-axis goniometer setting + offsets) and confirm it recovers the
+        sample-frame U_true and stays stable.
+     
+        Faithful construction (matches the loader exactly):
+          * The crystal's lab orientation under setting R is U_eff = R @ U_true, so
+            events are generated at U_eff (correct diffracting set for the fixed beam).
+          * The loader de-rotates: q_sample = lab_to_sample(q_lab) = U_true @ q_theo,
+            and the beam in the sample frame is ki_sample = lab_to_sample([0,0,1]).
+          * The tracker therefore must recover U_true (NOT U_eff).
+     
+        NOTE ON SCOPE: at full coverage the visibility gate is inert, so this does not
+        test masking correctness -- it verifies the active R_batch path is plumbed,
+        the _sample_to_lab_matrix runtime self-check passes for the real setting, and
+        the loader<->tracker frame contract is self-consistent. Masking correctness is
+        the deterministic round-trip test above, plus the optional heavier test.
+        """
+        print(f"\n{'='*60}\nIntegration: FINITE GONIOMETER SETTING (+offsets)\n{'='*60}")
+     
+        axes = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])   # two-axis goniometer
+        ang = np.array([20.0, -12.0])                          # finite, non-trivial
+        offs = np.array([5.0, -3.0])                           # finite offsets
+        na = len(axes)
+     
+        U_true = Rotation.from_euler("y", 45.0, degrees=True).as_matrix()
+        U_seed = Rotation.from_euler("y", 40.0, degrees=True).as_matrix()   # 5 deg off
+     
+        # sample->lab for this setting, built from the trusted loader transform.
+        R = np.asarray(_sample_to_lab_matrix(axes, ang, offs), dtype=float)
+        U_eff = R @ U_true
+     
+        # Sanity: the setting is genuinely non-trivial (so this isn't the static case).
+        self.assertGreater(self._evaluate_cubic_symmetric_error(U_true, U_eff), 5.0,
+            "goniometer setting is too close to identity to be a meaningful test")
+     
+        # Generate at U_eff -> correct lab diffracting set for the fixed beam [0,0,1].
+        sim = self.generate_poissonian_events(U_eff, num_events=1_000_000,
+                                              duration=5.0, bg_fraction=0.0)
+        q_lab, t = sim[0], sim[1]
+        valid_hkl, intensities = sim[5], sim[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
+     
+        # De-rotate to the sample frame exactly as the loader does.
+        N = len(t)
+        ang_full = np.tile(ang.reshape(na, 1), (1, N))                    # (na, N)
+        q_sample = np.asarray(
+            lab_to_sample(q_lab, axes, ang_full, None, offs, is_vector=True))
+        ki_sample = np.asarray(
+            lab_to_sample(np.tile([0.0, 0.0, 1.0], (N, 1)), axes, ang_full,
+                          None, offs, is_vector=True))
+        angles_col = np.tile(ang.reshape(1, na), (N, 1))                  # (N, na)
+     
+        def emit(batch=10000):
+            order = np.argsort(t, kind="stable")
+            qs, ts, ac, ks = q_sample[order], t[order], angles_col[order], ki_sample[order]
+            for s in range(0, N, batch):
+                e = min(s + batch, N)
+                n = e - s
+                yield (
+                    qs[s:e].astype(np.float32),
+                    ts[s:e].astype(np.float32),
+                    np.ones(n, dtype=np.int16),
+                    np.zeros(n, dtype=np.int16),
+                    np.zeros(n, dtype=np.int16),
+                    ac[s:e].astype(np.float32),          # angles (n, na)  <-- the point
+                    np.zeros((n, 3), dtype=np.float32),  # s_lab
+                    ks[s:e].astype(np.float32),          # ki_sample (de-rotated beam)
+                    e,
+                )
+     
+        with h5py.File(self.finder_file, "w") as f:
+            f["sample/a"], f["sample/b"], f["sample/c"] = 10.0, 10.0, 10.0
+            f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = 90.0, 90.0, 90.0
+            f["sample/space_group"] = b"P 1"
+            f["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+            f["sample/U"] = U_seed
+     
+        final_U = run_spectral_holonomic_tracker(
+            finder_file=self.finder_file,
+            event_batches=emit(),
+            structure_factors=mock_mtz,
+            gonio_axes=axes,            # turns the transform path ON
+            gonio_offsets=offs,
+            L_max=8,
+        )
+     
+        err = self._evaluate_cubic_symmetric_error(U_true, final_U)
+        print(f"  recovered sample-frame U: Sym-Err = {err:.3f} deg "
+              f"(U_eff was {self._evaluate_cubic_symmetric_error(U_true, U_eff):.1f} deg from U_true)")
+        self.assertLess(err, 2.0,
+            f"Finite-setting recovery failed: {err:.2f} deg >= 2.0. The tracker did "
+            f"not recover the sample-frame U_true with the goniometer path active.")
 
 class TestTrackerInitialization:
     @pytest.fixture
