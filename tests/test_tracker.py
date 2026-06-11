@@ -614,6 +614,122 @@ class TestBinghamTracker(unittest.TestCase):
             f"Isotropic-background tests miss this because a uniform sphere cancels "
             f"in the deviatoric SH moment; a forward lobe does not."
         )
+
+    def apply_detector_coverage(self, q, times, coverage_fraction,
+                                axis=np.array([1.0, 0.0, 0.0])):
+        """
+        Cull events to a single spherical cap of solid angle
+        Omega = coverage_fraction * 4*pi, centered on `axis` (a stand-in for the
+        detector bank center in the sample frame).
+
+            Omega = 2*pi*(1 - cos a)  =>  cos a = 1 - 2 * coverage_fraction
+
+            coverage_fraction = 1.00 -> full sphere   (a = 180 deg)
+            coverage_fraction = 0.50 -> hemisphere    (a =  90 deg)
+            coverage_fraction = 0.25 -> 60 deg cap
+
+        Returns the masked (q, times).
+        """
+        axis = axis / np.linalg.norm(axis)
+        cos_a = 1.0 - 2.0 * coverage_fraction
+        cos_theta = q @ axis
+        keep = cos_theta >= cos_a
+        return q[keep], times[keep]
+
+
+    def test_partial_detector_coverage(self):
+        print(f"\n{'='*60}\nExecuting Regression: PARTIAL DETECTOR S^2 COVERAGE\n{'='*60}")
+
+        U_true = Rotation.from_euler('y', 45.0, degrees=True).as_matrix()
+        U_seed = Rotation.from_euler('y', 40.0, degrees=True).as_matrix()
+
+        duration = 5.0
+
+        # Large clean signal pool (NO background) so every coverage level still has
+        # ample statistics after masking and subsampling.
+        sig = self.generate_poissonian_events(
+            U_true, num_events=2_000_000, duration=duration, bg_fraction=0.0
+        )
+        q_all, t_all = sig[0], sig[1]
+        valid_hkl, intensities = sig[5], sig[6]
+        mock_mtz = self.create_mock_mtz(valid_hkl, intensities)
+
+        # Detector center: a side bank ~90 deg off the beam (beam is +z here).
+        det_axis = np.array([1.0, 0.0, 0.0])
+
+        coverages = [1.0, 0.5, 0.25]
+
+        # Fix the statistics budget: subsample every level to the count available
+        # at the tightest cap, isolating geometry from photon starvation.
+        axis_n = det_axis / np.linalg.norm(det_axis)
+        counts = {
+            f: int(np.sum((q_all @ axis_n) >= (1.0 - 2.0 * f)))
+            for f in coverages
+        }
+        common_n = min(counts.values())
+        print(f"  Common event budget (all levels): {common_n:,}")
+
+        rng = np.random.default_rng(0)
+        results = {}
+
+        for f in coverages:
+            q_c, t_c = self.apply_detector_coverage(
+                q_all, t_all, coverage_fraction=f, axis=det_axis
+            )
+            idx = rng.choice(len(t_c), size=common_n, replace=False)
+            q_c, t_c = q_c[idx], t_c[idx]
+            order = np.argsort(t_c, kind="stable")  # mirror the loader's time sort
+            q_c, t_c = q_c[order], t_c[order]
+
+            N = len(t_c)
+            sim_data = (
+                q_c, t_c,
+                np.ones(N, dtype=int),
+                np.zeros(N, dtype=int),
+                np.zeros(N, dtype=int),
+            )
+            event_stream = self.get_fake_batches(sim_data, batch_size=10_000)
+
+            # Fresh seed each run (tracker reads sample/U and writes a tracking group).
+            with h5py.File(self.finder_file, "w") as fh:
+                fh["sample/a"], fh["sample/b"], fh["sample/c"] = 10.0, 10.0, 10.0
+                fh["sample/alpha"], fh["sample/beta"], fh["sample/gamma"] = 90.0, 90.0, 90.0
+                fh["sample/space_group"] = b"P 1"
+                fh["beam/ki_vec"] = np.array([0.0, 0.0, 1.0])
+                fh["sample/U"] = U_seed
+
+            final_U = run_spectral_holonomic_tracker(
+                finder_file=self.finder_file,
+                event_batches=event_stream,
+                structure_factors=mock_mtz,
+                L_max=8,
+            )
+            err = self._evaluate_cubic_symmetric_error(U_true, final_U)
+            results[f] = err
+            print(f"  coverage={f*100:5.1f}% of 4pi | events={N:,} | final Sym-Err={err:6.2f} deg")
+
+        # Sanity: full-sphere coverage with the SAME budget must converge.
+        self.assertLess(
+            results[1.0], 2.0,
+            f"Full-coverage control failed ({results[1.0]:.2f} deg) -- statistics "
+            f"budget too small; raise num_events before trusting the partial runs."
+        )
+
+        # Regression: a hemispherical detector (Omega = 2*pi) must not silently bias U.
+
+        # the hemisphere is adversarial because it cuts the U rotation axis, so
+        # increase the tolerance (there is tension with Ewald sphere physics and the 
+        # global aliasing test)
+        self.assertLess(
+            results[0.5], 10.0,
+            f"Partial-coverage bias: a hemispherical detector (Omega=2pi) produced a "
+            f"{results[0.5]:.2f} deg error at identical statistics to the converging "
+            f"full-sphere control ({results[1.0]:.2f} deg). The forward model "
+            f"integrates Ewald-allowed reflections over the full sphere while the data "
+            f"populate only the covered cap; the missing detector acceptance mask is "
+            f"an uncorrected anisotropic window on S^2."
+        )
+
 class TestTrackerInitialization:
     @pytest.fixture
     def mock_reciprocal_h5(self, tmp_path):

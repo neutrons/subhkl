@@ -1435,169 +1435,205 @@ def vector_to_rotation_matrix(omega):
         return jnp.eye(3) + jnp.sin(theta) * K + (1.0 - jnp.cos(theta)) * jnp.matmul(K, K)
     return jax.lax.cond(theta < 1e-5, small_theta, large_theta)
 
+# ----------------------------------------------------------------------------
+# Host-side goniometer helper (NumPy). Builds the per-batch sample->lab matrix
+# from the project's own lab_to_sample, with a round-trip self-check so the
+# convention is guaranteed to match the loader.
+# ----------------------------------------------------------------------------
+def _sample_to_lab_matrix(axes, rep_ang, offsets):
+    """
+    Return R (3,3) such that  v_lab = R @ v_sample  at a single goniometer
+    angle set `rep_ang` (shape (num_axes,)). Pure NumPy.
 
+    Construction: lab_to_sample applied to the basis gives, by the loader's
+    convention, exactly the sample->lab matrix. We then verify
+    lab_to_sample(R @ v) == v on probe vectors and raise if it does not.
+    """
+    axes = np.asarray(axes)
+    rep = np.asarray(rep_ang, dtype=float).reshape(-1, 1)          # (na, 1)
 
-def predict_all_shells_pure_tangent(omega, U_base, G_all, T_all, L_max):
-    """ LOW-DIMENSIONAL FORWARD PASS: Reconstructs predicted vectors cleanly under a 3D tangent. """
-    R_perturb = vector_to_rotation_matrix(omega)
-    U_curr = jnp.matmul(U_base, R_perturb)
-    D_full = e3x.so3.rotations.wigner_d(U_curr, max_degree=L_max, cartesian_order=False)
+    ang3 = np.tile(rep, (1, 3))                                    # (na, 3) basis "events"
+    R = np.asarray(
+        lab_to_sample(np.eye(3), axes, ang3, None, offsets, is_vector=True)
+    ).astype(np.float64)
 
-    preds = []
-    for l in range(1, L_max + 1):
-        dim_l = 2 * l + 1
-        start = l**2
-        end = (l+1)**2
-        D_l = D_full[start:end, start:end]
-
-        G_norm = G_all[start:end, start:end] * (4.0 * jnp.pi / float(dim_l))
-
-        A_sig = jnp.matmul(D_l, jnp.matmul(G_norm, D_l.T))
-        A_dev_pred = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
-        preds.append(A_dev_pred.flatten())
-
-    return jnp.concatenate(preds)
-
-def predict_all_shells_q_space(omega, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max):
-    """ ZERO-WIGNER FORWARD MODEL: Evaluates exact analytical SH features by rotating the underlying vectors. """
-    R_perturb = vector_to_rotation_matrix(omega)
-    U_curr = jnp.matmul(U_base, R_perturb)
-    
-    # 1. Rotate the theoretical peak vectors directly into the lab frame
-    q_lab = jnp.matmul(U_curr, q_theo_sample_jax).T # Shape: (M_peaks, 3)
-    
-    # 2. Evaluate Spherical Harmonics directly on the rotated vectors
-    Y_lab = e3x.so3.irreps.spherical_harmonics(
-        q_lab, max_degree=L_max, cartesian_order=False, normalization='orthonormal'
+    # Self-check: R must be sample->lab, i.e. lab_to_sample(R @ v) == v.
+    v = np.array([[0.3, -0.5, 0.8], [-0.7, 0.1, 0.6]])
+    angv = np.tile(rep, (1, v.shape[0]))
+    back = np.asarray(
+        lab_to_sample(v @ R.T, axes, angv, None, offsets, is_vector=True)
     )
-    
-    # 3. Dynamic Ewald Window evaluated strictly in the lab frame
+    if not (np.allclose(R @ R.T, np.eye(3), atol=1e-4) and np.allclose(back, v, atol=1e-3)):
+        raise RuntimeError(
+            "sample->lab matrix failed its round-trip self-check. The assumed "
+            "lab_to_sample(vec, axes, angles, translations, offsets, is_vector=True) "
+            "signature/convention does not match subhkl.instrument.goniometer; "
+            "adjust _sample_to_lab_matrix accordingly."
+        )
+    return R.astype(np.float32)
+
+
+# ----------------------------------------------------------------------------
+# Forward model (renamed *_sample; adds lab-frame visibility mask).
+# ----------------------------------------------------------------------------
+def predict_all_shells_q_space(
+    omega, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max,
+    R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k=10,
+):
+    """
+    ZERO-WIGNER FORWARD MODEL with a data-driven lab-frame detector mask.
+    Moments are formed in the SAMPLE frame (== data frame). The visibility
+    weight is the only quantity evaluated in the lab frame, via the constant
+    per-batch rotation R_batch.
+    """
+    R_perturb = vector_to_rotation_matrix(omega)
+    U_curr = jnp.matmul(U_base, R_perturb)
+
+    # Predicted reflection directions in the SAMPLE frame.
+    q_sample = jnp.matmul(U_curr, q_theo_sample_jax).T            # (M, 3)
+
+    # SH features for the moments (sample frame == data frame).
+    Y_sample = e3x.so3.irreps.spherical_harmonics(
+        q_sample, max_degree=L_max, cartesian_order=False, normalization="orthonormal")
+
+    # --- Ewald window (frame-invariant dot product), unchanged ---
     Y_beam = e3x.so3.irreps.spherical_harmonics(
-        ki_batch[0], max_degree=L_max, cartesian_order=False, normalization='orthonormal'
-    )
-    
-    ewald_window = jnp.zeros(Y_lab.shape[0])
+        ki_batch[0], max_degree=L_max, cartesian_order=False, normalization="orthonormal")
+    ewald_window = jnp.zeros(Y_sample.shape[0])
     for l in range(L_max + 1):
         dim_l = 2 * l + 1
-        start = l**2
-        end = (l+1)**2
-        # Lab-frame dot product is mathematically invariant to the crystal-frame equivalent
-        p_l = jnp.matmul(Y_lab[:, start:end], Y_beam[start:end])
+        start, end = l ** 2, (l + 1) ** 2
+        p_l = jnp.matmul(Y_sample[:, start:end], Y_beam[start:end])
         ewald_window += (w_l_j[l] / float(dim_l)) * p_l
-        
     ewald_window = jnp.clip(ewald_window, 0.0, 1.0) * I_weights_jax
-    total_window_mass = jnp.maximum(jnp.sum(ewald_window), 1.0)
-    
+
+    # --- Data-driven detector visibility, evaluated in the LAB frame ---
+    q_lab_pred = jnp.matmul(R_batch, q_sample.T).T               # (M, 3)
+    Y_cov = e3x.so3.irreps.spherical_harmonics(
+        q_lab_pred, max_degree=L_cov, cartesian_order=False, normalization="orthonormal")
+    C = jnp.matmul(Y_cov, cov_coeffs)                            # band-limited occupancy
+
+    vis = jax.nn.sigmoid(sigmoid_k*(C/cov_scale - 1.0))
+    # Warm-up (no coverage estimate yet) -> vis == 1 (full-sphere behaviour).
+    vis = jnp.where(use_coverage > 0.5, vis, jnp.ones_like(vis))
+
+    weight = ewald_window * vis
+    total_window_mass = jnp.maximum(jnp.sum(weight), 1.0)
+
     preds = []
     for l in range(1, L_max + 1):
         dim_l = 2 * l + 1
-        start = l**2
-        end = (l+1)**2
-        
-        Y_l = Y_lab[:, start:end]
-        
-        # 1st order feature mean (Replaces T_all)
-        z_1st = jnp.sum(Y_l * ewald_window[:, None], axis=0) / total_window_mass
-        
-        # 2nd order feature covariance (Replaces G_all and D * G * D^T)
-        A_sig = jnp.matmul(Y_l.T, Y_l * ewald_window[:, None]) / total_window_mass
+        start, end = l ** 2, (l + 1) ** 2
+        Y_l = Y_sample[:, start:end]
+
+        z_1st = jnp.sum(Y_l * weight[:, None], axis=0) / total_window_mass
+
+        A_sig = jnp.matmul(Y_l.T, Y_l * weight[:, None]) / total_window_mass
         A_sig = A_sig * (4.0 * jnp.pi / float(dim_l))
         A_dev = A_sig - (jnp.trace(A_sig) / float(dim_l)) * jnp.eye(dim_l)
-        
+
         preds.append(z_1st)
         preds.append(A_dev.flatten())
-        
+
     return jnp.concatenate(preds)
 
-@partial(jax.jit, static_argnames=['L_max'])
+
+# ----------------------------------------------------------------------------
+# Kalman update (renamed *_sample; threads coverage args; L_cov is static).
+# ----------------------------------------------------------------------------
+@partial(jax.jit, static_argnames=["L_max", "L_cov"])
 def kalman_subspace_update(
-    P_prev, Y_events_lab, Y_lab_all_sum, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, U_base,
-    process_q_scale, dt, ridge_inflation, meas_noise_1st, meas_weight_2nd, num_events, L_max
+    P_prev, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
+    w_l_j, ki_batch, U_base, process_q_scale, dt, ridge_inflation, meas_noise_1st,
+    meas_weight_2nd, num_events, L_max,
+    R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k
 ):
-    """ AUTO-DIFF KERNEL: Updates tangent parameters cleanly using exact forward differentiation. """
     omega_state = jnp.zeros(3)
     P_state = P_prev + jnp.eye(3) * (process_q_scale * dt)
 
-    A_lab_all = jnp.matmul(Y_events_lab.T, Y_events_lab) / num_events
+    A_sample_all = jnp.matmul(Y_events_sample.T, Y_events_sample) / num_events
 
-    z_data_list = []
-    R_diag_list = []
+    z_data_list, R_diag_list = [], []
     for l in range(1, L_max + 1):
         dim_l = 2 * l + 1
-        start = l**2
-        end = (l+1)**2
+        start, end = l ** 2, (l + 1) ** 2
 
-        A_lab_norm = A_lab_all[start:end, start:end] * (4.0 * jnp.pi / float(dim_l))
-        A_lab_dev = A_lab_norm - jnp.eye(dim_l) / float(dim_l)
+        A_sample_norm = A_sample_all[start:end, start:end] * (4.0 * jnp.pi / float(dim_l))
+        A_sample_dev = A_sample_norm - jnp.eye(dim_l) / float(dim_l)
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
 
-        z_1st_norm = Y_lab_all_sum[start:end] / num_events
+        z_1st_norm = Y_sample_all_sum[start:end] / num_events
         z_data_list.append(z_1st_norm)
         R_diag_list.append(jnp.full(dim_l, sigma_l))
 
-        z_data_list.append(A_lab_dev.flatten())
+        z_data_list.append(A_sample_dev.flatten())
         R_diag_list.append(jnp.full(dim_l * dim_l, sigma_l * meas_weight_2nd / float(dim_l)))
 
     z_data = jnp.concatenate(z_data_list)
     R_diag = jnp.concatenate(R_diag_list)
 
-    # EXACT AUTO-DIFF: JAX instantly unrolls the polynomial derivatives of the vectors. 
-    z_pred = predict_all_shells_q_space(omega_state, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max)
-    H_global = jax.jacfwd(predict_all_shells_q_space)(omega_state, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max)
+    # Closure so jacfwd differentiates ONLY omega; coverage args held constant.
+    def fwd(om):
+        return predict_all_shells_q_space(
+            om, U_base, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, L_max,
+            R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k)
 
-    # --- WOODBURY INVERSION ---
+    z_pred = fwd(omega_state)
+    H_global = jax.jacfwd(fwd)(omega_state)
+
+    # --- Woodbury / information-form update ---
     R_eff_inv = 1.0 / (R_diag + ridge_inflation)
     Ht_Rinv = H_global.T * R_eff_inv[None, :]
-    
+
     P_inv = jnp.linalg.pinv(P_state + jnp.eye(3) * 1e-9)
     information_matrix = P_inv + jnp.matmul(Ht_Rinv, H_global)
     K_gain = jnp.matmul(jnp.linalg.pinv(information_matrix), Ht_Rinv)
 
     omega_update = jnp.matmul(K_gain, (z_data - z_pred))
-    
+
     P_new = jnp.linalg.pinv(information_matrix)
     P_new = 0.5 * (P_new + P_new.T)
 
     U_new = jnp.matmul(U_base, vector_to_rotation_matrix(omega_update))
-
     return U_new, P_new, z_pred, z_data
 
+
+# ----------------------------------------------------------------------------
+# Per-chunk processor (renamed *_sample; threads coverage args; bug fixed).
+# ----------------------------------------------------------------------------
 def process_chunk_field_kalman(
     P_prev, q_batch, ki_batch, t_batch,
     q_theo_sample_jax, w_l_j, I_weights_jax,
     meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_base,
-    current_q_scale
+    current_q_scale,
+    R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k,
 ):
-
+    # NOTE: q_batch is in the SAMPLE frame (loader output).
     dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
     total_rate = q_batch.shape[0] / dt_chunk
 
     actual_events = q_batch.shape[0]
     num_events = jnp.maximum(float(actual_events), 1.0)
 
-    Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
-    Y_lab_all_sum = jnp.sum(Y_events_lab, axis=0)
-
-    Y_events_lab = e3x.so3.irreps.spherical_harmonics(q_batch, max_degree=L_max, cartesian_order=False, normalization='orthonormal')
+    Y_events_sample = e3x.so3.irreps.spherical_harmonics(
+        q_batch, max_degree=L_max, cartesian_order=False, normalization="orthonormal")
+    Y_sample_all_sum = jnp.sum(Y_events_sample, axis=0)
 
     U_new, P_new, z_pred, z_data = kalman_subspace_update(
-        P_prev, Y_events_lab, Y_lab_all_sum, q_theo_sample_jax, I_weights_jax, w_l_j, ki_batch, U_base,
-        current_q_scale, dt_chunk, ridge_inflation, meas_noise_1st, meas_weight_2nd, num_events, L_max
+        P_prev, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
+        w_l_j, ki_batch, U_base, current_q_scale, dt_chunk, ridge_inflation,
+        meas_noise_1st, meas_weight_2nd, num_events, L_max,
+        R_batch, cov_coeffs, cov_scale, L_cov, use_coverage,
+        sigmoid_k
     )
 
     U_final = U_new if actual_events > 0 else U_base
-    P_final = P_new if actual_events > 0 else (P_prev + jnp.eye(3) * (process_q_scale * dt_chunk))
+    # FIXED: was `process_q_scale` (undefined) in the original empty-batch branch.
+    P_final = P_new if actual_events > 0 else (P_prev + jnp.eye(3) * (current_q_scale * dt_chunk))
 
-    # 1. Extract the 1st-order (l=1) template block from the forward model
-    # We only care about the 3 vector components of the l=1 shell
-    z_pred_l1 = z_pred[0:3] 
-
-    # 2. Extract the actual data's l=1 block
+    # --- signal/background split from the l=1 template projection (unchanged) ---
+    z_pred_l1 = z_pred[0:3]
     z_data_l1 = z_data[0:3]
-
-    # 3. Calculate the projection (cosine similarity) of the data onto the template
-    # If the data perfectly matches the template, the dot product is maximized.
-    # We normalize by the expected theoretical mass.
     norm_pred = jnp.sum(jnp.square(z_pred_l1)) + 1e-9
     signal_mass = jnp.sum(z_data_l1 * z_pred_l1) / norm_pred
 
@@ -1605,12 +1641,145 @@ def process_chunk_field_kalman(
     sig_rate = intensive_signal_fraction * total_rate
     bg_rate = jnp.maximum(total_rate - sig_rate, 0.0)
 
-    # The spectral NLL can be tracked via the magnitude of the innovation residual
     innovation = z_data - z_pred
     spectral_nll = 0.5 * jnp.sum(jnp.square(innovation))
 
     return P_final, U_final, spectral_nll, sig_rate, bg_rate
 
+
+# ============================================================================
+# TRACKER LOOP -- coverage state + per-batch R_batch / map update.
+# Splice the new/changed pieces below into run_spectral_holonomic_tracker.
+# Keep the existing [0/3]..[1/3] setup, the w_l_j / q_theo / I_weights
+# construction, U_curr / P_spectral_full init, etc.
+#
+# New parameters to add to run_spectral_holonomic_tracker's signature:
+#     gonio_axes=None, gonio_offsets=None,
+#     L_cov: int = 3, cov_ema_weight: float = 0.1,   # keep LOW: see note below
+#     cov_scale_percentile: float = 25.0, cov_warmup_events: int = 20000,
+# ============================================================================
+def _tracker_loop_reference(
+    finder_file, event_batches, U_curr, P_spectral_full,
+    q_theo_sample_jax, w_l_j, I_weights_jax,
+    meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max,
+    process_q_scale_start, process_q_scale_end, annealing_rate,
+    streaming_callback,
+    gonio_axes=None, gonio_offsets=None,
+    L_cov=3, cov_ema_weight=0.1, cov_threshold_frac=0.3, cov_warmup_events=20000,
+    sigmoid_k=12,
+):
+    import h5py
+ 
+    # Fallback: read axes from the finder file if the caller did not pass them.
+    if gonio_axes is None:
+        with h5py.File(finder_file, "r") as f:
+            if "goniometer/axes" in f:
+                gonio_axes = f["goniometer/axes"][()]
+            if gonio_offsets is None and "goniometer/offsets" in f:
+                off = f["goniometer/offsets"]
+                gonio_offsets = off[()] if isinstance(off, h5py.Dataset) else None
+    has_gonio = gonio_axes is not None and np.asarray(gonio_axes).size > 0
+ 
+    # --- Lab-frame coverage state (host-side, band-limited SH occupancy) ---
+    n_cov = (L_cov + 1) ** 2
+    cov_coeffs_np = np.zeros(n_cov, dtype=np.float32)
+    cov_scale_val = 1.0
+    coverage_ready = False
+ 
+    tracking_history = [(0.0, np.array(U_curr))]
+ 
+    for batch_data in event_batches:
+        (q_batch_np, t_batch_np, banks_np, pr_np, pc_np,
+         angles_np, slab_np, ki_sample_np, cumulative_count) = batch_data
+        if len(t_batch_np) == 0:
+            continue
+ 
+        t_state = float(t_batch_np[-1])
+ 
+        # ---- build the per-batch sample->lab rotation (host-side) ----
+        if has_gonio and angles_np is not None and np.size(angles_np) > 0:
+            ang2d = np.atleast_2d(angles_np)                 # (N, num_axes)
+            rep_ang = ang2d.mean(axis=0)                     # (num_axes,)
+            R_batch_np = _sample_to_lab_matrix(gonio_axes, rep_ang, gonio_offsets)
+            q_lab_obs = (R_batch_np @ q_batch_np.T).T
+        else:
+            R_batch_np = np.eye(3, dtype=np.float32)         # static: sample == lab
+            q_lab_obs = q_batch_np
+ 
+        q_lab_obs = q_lab_obs / (np.linalg.norm(q_lab_obs, axis=1, keepdims=True) + 1e-9)
+ 
+        # ---- accumulate the lab-frame occupancy map (EMA) ----
+        Y_cov_obs = np.asarray(e3x.so3.irreps.spherical_harmonics(
+            jnp.asarray(q_lab_obs, dtype=jnp.float32),
+            max_degree=L_cov, cartesian_order=False, normalization="orthonormal"))
+        batch_coeffs = Y_cov_obs.mean(axis=0)
+        cov_coeffs_np = (1.0 - cov_ema_weight) * cov_coeffs_np + cov_ema_weight * batch_coeffs
+ 
+        if cumulative_count >= cov_warmup_events:
+            coverage_ready = True
+ 
+        if coverage_ready:
+            C_obs = Y_cov_obs @ cov_coeffs_np                # reconstruction on covered dirs
+            med = float(np.median(C_obs[C_obs > 1e-9])) if np.any(C_obs > 1e-9) else 1.0
+            # Threshold in the GAP below the covered density: covered dirs have
+            # C ~ med (well above), uncovered dirs have C ~ 0 (well below). The
+            # sigmoid in predict_all_shells_q_space then gates present-vs-absent
+            # rather than carving the within-region density variation. This is
+            # what makes the mask inert for full coverage (no acquisition
+            # penalty) AND flat across a partial cap (no internal ell=1 ramp).
+            cov_scale_val = max(cov_threshold_frac * med, 1e-6)
+            use_cov_flag = 1.0
+        else:
+            use_cov_flag = 0.0 
+
+        # ---- device transfers (all traced inputs, no recompile on value change) ----
+        q_batch = jax.device_put(q_batch_np)
+        q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
+        t_batch = jax.device_put(t_batch_np)
+        ki_batch = jax.device_put(ki_sample_np)
+        ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
+ 
+        R_batch = jnp.asarray(R_batch_np)
+        cov_coeffs = jnp.asarray(cov_coeffs_np)
+        cov_scale = jnp.asarray(np.float32(cov_scale_val))
+        use_coverage = jnp.asarray(np.float32(use_cov_flag))
+ 
+        # ---- annealing schedule (unchanged) ----
+        progress_fraction = min(t_state / (5.0 * annealing_rate), 1.0)
+        current_q_scale = process_q_scale_start * (process_q_scale_end / process_q_scale_start) ** progress_fraction
+ 
+        P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate = process_chunk_field_kalman(
+            P_spectral_full, q_batch, ki_batch, t_batch,
+            q_theo_sample_jax, w_l_j, I_weights_jax,
+            meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_curr,
+            current_q_scale,
+            R_batch, cov_coeffs, cov_scale, L_cov, use_coverage,
+            sigmoid_k
+        )
+ 
+        U_curr.block_until_ready()
+        U_best = np.array(U_curr)
+        tracking_history.append((t_state, U_best))
+ 
+        norm_gap_metric = float(jnp.trace(jnp.linalg.pinv(P_spectral_full)))
+ 
+        if cumulative_count % 50000 < len(t_batch_np):
+            cov_state = "ON" if coverage_ready else "warmup"
+            print(f"    Time {t_state:.2f}s | Sig/Bg: {float(sig_rate):.0f}/{float(bg_rate):.0f} Hz "
+                  f"| Coherent-Mass: {norm_gap_metric:8.2f} | Coverage: {cov_state}")
+ 
+        if streaming_callback is not None:
+            new_events = {"banks": banks_np, "pixel_r": pr_np, "pixel_c": pc_np,
+                          "angles": angles_np, "s_lab": slab_np}
+            streaming_callback(
+                time=t_state, U_preds=np.expand_dims(U_best, axis=0),
+                losses=np.array([float(spectral_nll)]), best_idx=0,
+                neutron_count=cumulative_count, new_events=new_events,
+                metrics={"loss": float(spectral_nll), "eigengap": norm_gap_metric,
+                         "sig_rate": float(sig_rate), "bg_rate": float(bg_rate),
+                         "coverage_ready": coverage_ready})
+ 
+    return tracking_history
 
 def run_spectral_holonomic_tracker(
     finder_file: str,
@@ -1631,6 +1800,13 @@ def run_spectral_holonomic_tracker(
     meas_noise_1st: float = 0.5,
     meas_weight_2nd: float = 1.0,
     ridge_inflation: float = 1e-4,
+    gonio_axes=None,
+    gonio_offsets=None,
+    L_cov: int = 3,
+    cov_ema_weight: float = 0.1,
+    cov_threshold_frac: float = 0.3,
+    cov_warmup_events: int = 20000,
+    sigmoid_k = 10,
 ):
     from subhkl.optimization import FindUB
 
@@ -1739,65 +1915,15 @@ def run_spectral_holonomic_tracker(
 
     print(f"\n[2/3] Executing Field Tracker Pipeline (3 Local Subspace Rotational Degrees Active)...")
 
-
-    # initialize the history with the starting state
-    tracking_history = [(0.0, np.array(U_curr))]
-
-    import time
-
-    for batch_data in event_batches:
-        q_batch_np, t_batch_np, banks_np, pr_np, pc_np, angles_np, slab_np, ki_sample_np, cumulative_count = batch_data
-        if len(t_batch_np) == 0: continue
-
-        t_state = float(t_batch_np[-1])
-        q_batch = jax.device_put(q_batch_np)
-        q_batch = q_batch / (jnp.linalg.norm(q_batch, axis=1, keepdims=True) + 1e-9)
-        t_batch = jax.device_put(t_batch_np)
-        ki_batch = jax.device_put(ki_sample_np)
-        ki_batch = ki_batch / (jnp.linalg.norm(ki_batch, axis=1, keepdims=True) + 1e-9)
-
-        t0 = time.time()
-
-        # Calculate the fraction of total expected time/events (0.0 to 1.0)
-        # If duration isn't explicitly known, you can use the annealing_rate parameter
-        progress_fraction = min(t_state / (5.0 * annealing_rate), 1.0)
-
-        # Exponential decay from start to end
-        current_q_scale = process_q_scale_start * (process_q_scale_end / process_q_scale_start) ** progress_fraction
-
-        P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate = process_chunk_field_kalman(
-            P_spectral_full, q_batch, ki_batch, t_batch,
-            q_theo_sample_jax, w_l_j, I_weights_jax,
-            meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_curr,
-            current_q_scale
-        )
-
-        # Force JAX to wait for execution to finish before stopping the timer
-        U_curr.block_until_ready() 
-
-        U_best = np.array(U_curr)
-        tracking_history.append((t_state, U_best))
-
-        norm_gap_metric = float(jnp.trace(jnp.linalg.pinv(P_spectral_full)))
-
-        if cumulative_count % 50000 < len(t_batch_np):
-            print(f"    Time {t_state:.2f}s | Sig/Bg: {float(sig_rate):.0f}/{float(bg_rate):.0f} Hz | Coherent-Mass: {norm_gap_metric:8.2f}")
-
-        if streaming_callback is not None:
-            new_events = {
-                "banks": banks_np, "pixel_r": pr_np, "pixel_c": pc_np,
-                "angles": angles_np, "s_lab": slab_np
-            }
-
-            streaming_callback(
-                time=t_state, U_preds=np.expand_dims(U_best, axis=0),
-                losses=np.array([float(spectral_nll)]), best_idx=0,
-                neutron_count=cumulative_count, new_events=new_events,
-                metrics={
-                    "loss": float(spectral_nll), "eigengap": norm_gap_metric,
-                    "sig_rate": float(sig_rate), "bg_rate": float(bg_rate),
-                }
-            )
+    tracking_history = _tracker_loop_reference(
+        finder_file, event_batches, U_curr, P_spectral_full,
+        q_theo_sample_jax, w_l_j, I_weights_jax,
+        meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max,
+        process_q_scale_start, process_q_scale_end, annealing_rate,
+        streaming_callback,
+        gonio_axes, gonio_offsets,
+        L_cov, cov_ema_weight, cov_threshold_frac, cov_warmup_events, sigmoid_k
+    )
 
     print(f"\n[3/3] Global Tracking complete. Saving continuous SO(3) state dataset.")
     with h5py.File(finder_file, "a") as f:
