@@ -1543,15 +1543,15 @@ def predict_all_shells_q_space(
 # ----------------------------------------------------------------------------
 @partial(jax.jit, static_argnames=["L_max", "L_cov"])
 def kalman_subspace_update(
-    P_prev, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
+    P_prev, A_sample_all, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
     w_l_j, ki_batch, U_base, process_q_scale, dt, ridge_inflation, meas_noise_1st,
-    meas_weight_2nd, num_events, L_max,
+    meas_weight_2nd, num_events, L_max, low_l_damp,
     R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k
 ):
+    """Consumes precomputed WEIGHTED sufficient statistics (A_lab_all,
+    Y_lab_all_sum) and an effective (gated) event count."""
     omega_state = jnp.zeros(3)
     P_state = P_prev + jnp.eye(3) * (process_q_scale * dt)
-
-    A_sample_all = jnp.matmul(Y_events_sample.T, Y_events_sample) / num_events
 
     z_data_list, R_diag_list = [], []
     for l in range(1, L_max + 1):
@@ -1561,6 +1561,10 @@ def kalman_subspace_update(
         A_sample_norm = A_sample_all[start:end, start:end] * (4.0 * jnp.pi / float(dim_l))
         A_sample_dev = A_sample_norm - jnp.eye(dim_l) / float(dim_l)
         sigma_l = (meas_noise_1st * (l * (l + 1) + 1.0)) / (num_events * float(dim_l)) + ridge_inflation
+
+        # Suppress the dipole shell (lobe lives here; centrosymmetric signal does not).
+        if l == 1:
+            sigma_l = sigma_l * low_l_damp
 
         z_1st_norm = Y_sample_all_sum[start:end] / num_events
         z_data_list.append(z_1st_norm)
@@ -1607,6 +1611,7 @@ def process_chunk_field_kalman(
     meas_noise_1st, meas_weight_2nd, ridge_inflation, L_max, U_base,
     current_q_scale,
     R_batch, cov_coeffs, cov_scale, L_cov, use_coverage, sigmoid_k,
+    cos_gate=0.99, gate_temp=0.003, low_l_damp=1e6,
 ):
     # NOTE: q_batch is in the SAMPLE frame (loader output).
     dt_chunk = jnp.maximum(1e-4, t_batch[-1] - t_batch[0])
@@ -1617,28 +1622,36 @@ def process_chunk_field_kalman(
 
     Y_events_sample = e3x.so3.irreps.spherical_harmonics(
         q_batch, max_degree=L_max, cartesian_order=False, normalization="orthonormal")
-    Y_sample_all_sum = jnp.sum(Y_events_sample, axis=0)
+
+    # --- event-level signal gate -------------------------------------------------
+    # Soft proximity of each (unit) event direction to the nearest predicted
+    # Bragg direction. Discrimination scales with how sparsely the active
+    # reflections tile the sphere -- best with the correct narrow bandpass.
+    q_pred = U_base @ q_theo_sample_jax            # (3, M); columns are unit vectors
+    cos_sim = q_batch @ q_pred                     # (N, M)
+    nn_cos = jnp.max(cos_sim, axis=1)              # (N,)
+    w = jax.nn.sigmoid((nn_cos - cos_gate) / gate_temp)  # (N,) in [0, 1]
+ 
+    # WEIGHTED sufficient statistics (background suppressed in the moment itself).
+    eff_count = jnp.maximum(jnp.sum(w), 1.0)
+    Y_w = Y_events_sample * w[:, None]
+    Y_sample_all_sum = jnp.sum(Y_w, axis=0)
+    A_sample_all = jnp.matmul(Y_w.T, Y_events_sample) / eff_count   # sum_i w_i Y_i Y_i^T / sum_i w_i
 
     U_new, P_new, z_pred, z_data = kalman_subspace_update(
-        P_prev, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
+        P_prev, A_sample_all, Y_events_sample, Y_sample_all_sum, q_theo_sample_jax, I_weights_jax,
         w_l_j, ki_batch, U_base, current_q_scale, dt_chunk, ridge_inflation,
-        meas_noise_1st, meas_weight_2nd, num_events, L_max,
+        meas_noise_1st, meas_weight_2nd, num_events, L_max, low_l_damp,
         R_batch, cov_coeffs, cov_scale, L_cov, use_coverage,
         sigmoid_k
     )
 
     U_final = U_new if actual_events > 0 else U_base
-    # FIXED: was `process_q_scale` (undefined) in the original empty-batch branch.
     P_final = P_new if actual_events > 0 else (P_prev + jnp.eye(3) * (current_q_scale * dt_chunk))
 
-    # --- signal/background split from the l=1 template projection (unchanged) ---
-    z_pred_l1 = z_pred[0:3]
-    z_data_l1 = z_data[0:3]
-    norm_pred = jnp.sum(jnp.square(z_pred_l1)) + 1e-9
-    signal_mass = jnp.sum(z_data_l1 * z_pred_l1) / norm_pred
-
-    intensive_signal_fraction = jnp.clip(signal_mass, 0.0, 1.0)
-    sig_rate = intensive_signal_fraction * total_rate
+    # A MEANINGFUL signal/background readout: the fraction the gate accepted.
+    accepted = float(jnp.sum(w))
+    sig_rate = (accepted / max(actual_events, 1)) * total_rate
     bg_rate = jnp.maximum(total_rate - sig_rate, 0.0)
 
     innovation = z_data - z_pred
@@ -1665,8 +1678,8 @@ def _tracker_loop_reference(
     process_q_scale_start, process_q_scale_end, annealing_rate,
     streaming_callback,
     gonio_axes=None, gonio_offsets=None,
-    L_cov=3, cov_ema_weight=0.1, cov_threshold_frac=0.3, cov_warmup_events=20000,
-    sigmoid_k=12,
+    L_cov: int = 3, cov_ema_weight=0.1, cov_threshold_frac=0.3, cov_warmup_events=20000, sigmoid_k=12,
+    q_scale_floor: float = 1e-5,
 ):
     import h5py
  
@@ -1681,7 +1694,7 @@ def _tracker_loop_reference(
     has_gonio = gonio_axes is not None and np.asarray(gonio_axes).size > 0
  
     # --- Lab-frame coverage state (host-side, band-limited SH occupancy) ---
-    n_cov = (L_cov + 1) ** 2
+    n_cov = (L_cov + 1) * (L_cov + 1)
     cov_coeffs_np = np.zeros(n_cov, dtype=np.float32)
     cov_scale_val = 1.0
     coverage_ready = False
@@ -1747,7 +1760,8 @@ def _tracker_loop_reference(
         # ---- annealing schedule (unchanged) ----
         progress_fraction = min(t_state / (5.0 * annealing_rate), 1.0)
         current_q_scale = process_q_scale_start * (process_q_scale_end / process_q_scale_start) ** progress_fraction
- 
+        current_q_scale = max(current_q_scale, q_scale_floor)
+
         P_spectral_full, U_curr, spectral_nll, sig_rate, bg_rate = process_chunk_field_kalman(
             P_spectral_full, q_batch, ki_batch, t_batch,
             q_theo_sample_jax, w_l_j, I_weights_jax,
@@ -1789,6 +1803,7 @@ def run_spectral_holonomic_tracker(
     streaming_callback=None,
     process_q_scale_start: float = 1e-3,
     process_q_scale_end: float = 1e-7,
+    q_scale_floor: float = 1e-5,
     annealing_rate: float = 1.0,
     h_max: int = 6,
     d_min: float = 2.0,
@@ -1922,7 +1937,8 @@ def run_spectral_holonomic_tracker(
         process_q_scale_start, process_q_scale_end, annealing_rate,
         streaming_callback,
         gonio_axes, gonio_offsets,
-        L_cov, cov_ema_weight, cov_threshold_frac, cov_warmup_events, sigmoid_k
+        L_cov, cov_ema_weight, cov_threshold_frac, cov_warmup_events, sigmoid_k,
+        q_scale_floor
     )
 
     print(f"\n[3/3] Global Tracking complete. Saving continuous SO(3) state dataset.")
