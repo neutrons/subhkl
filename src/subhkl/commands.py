@@ -1432,7 +1432,7 @@ def run_zone_axis_search(
     import numpy as np
     import jax.numpy as jnp
     from subhkl.config import reduction_settings
-    from subhkl.optimization import FindUB, VectorizedObjective
+    from subhkl.optimization import VectorizedObjective
     from subhkl.search.prior import HoughPrior
 
     print(f"Loading data from {merged_h5_filename}...")

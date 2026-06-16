@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 
+
 def rotation_from_axis_angle(axis, angle_rad):
     u = axis / jnp.linalg.norm(axis)
     ux, uy, uz = u
