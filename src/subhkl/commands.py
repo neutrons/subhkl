@@ -360,7 +360,7 @@ def run_index(
                 "ERROR: Input file does not contain peaks/pixel_r and peaks/pixel_c. Cannot perform physically sound indexing."
             )
 
-    if "peaks/image_index" in input_data:
+    if "peaks/run_index" not in input_data and "peaks/image_index" in input_data:
         input_data["peaks/run_index"] = input_data["peaks/image_index"]
 
     # --- INJECT SECOND PHASE OF BOOTSTRAP PHYSICS ---
