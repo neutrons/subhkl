@@ -31,10 +31,11 @@ def plot_error_histograms(result: dict, out_name: str = "metrics_histograms.png"
     plt.close(fig)
 
 
-def plot_per_run_histograms(
+def plot_per_frame_histograms(
     result: dict, out_name: str = "metrics_histograms_per_run.png"
 ) -> None:
-    """Plot one row of d_err/ang_err histograms per run/frame from a
+    """Plot one row of d_err/ang_err histograms per rotation frame (grouping
+    together peaks from all detector panels in that frame) from a
     compute_metrics(..., return_per_peak=True) result."""
     per_peak = result.get("per_peak")
     if per_peak is None:
@@ -42,32 +43,32 @@ def plot_per_run_histograms(
             "result has no 'per_peak' data; call compute_metrics(..., return_per_peak=True)"
         )
 
-    run_index = np.asarray(per_peak["run_index"])
+    frame_index = np.asarray(per_peak["frame_index"])
     d_err = np.asarray(per_peak["d_err"])
     ang_err = np.asarray(per_peak["ang_err"])
 
-    runs = sorted(np.unique(run_index))
-    n_runs = len(runs)
+    frames = sorted(np.unique(frame_index))
+    n_frames = len(frames)
 
     d_bins = np.histogram_bin_edges(d_err, bins=30)
     ang_bins = np.histogram_bin_edges(ang_err, bins=30)
 
     fig, axes = plt.subplots(
-        n_runs, 2, figsize=(10, max(2.2 * n_runs, 3)), squeeze=False
+        n_frames, 2, figsize=(10, max(2.2 * n_frames, 3)), squeeze=False
     )
 
-    for row, run in enumerate(runs):
-        mask = run_index == run
+    for row, frame in enumerate(frames):
+        mask = frame_index == frame
         ax_d, ax_ang = axes[row]
 
         ax_d.hist(d_err[mask], bins=d_bins, color="tab:blue", edgecolor="black")
         ax_ang.hist(ang_err[mask], bins=ang_bins, color="tab:orange", edgecolor="black")
 
-        ax_d.set_ylabel(f"run {run}\ncount")
+        ax_d.set_ylabel(f"frame {frame}\ncount")
         if row == 0:
             ax_d.set_title("d_err")
             ax_ang.set_title("ang_err")
-        if row == n_runs - 1:
+        if row == n_frames - 1:
             ax_d.set_xlabel("d spacing error")
             ax_ang.set_xlabel("angular error (deg)")
 

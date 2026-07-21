@@ -44,7 +44,19 @@ def resolve_indices(f_handle):
 
 
 def extract_xyz_from_file(file_path, instrument=None):
-    """Safely extracts physical XYZ lab coordinates from a file by dynamically converting pixels, applying calibrations if present."""
+    """Safely extracts physical XYZ lab coordinates from a file by dynamically converting pixels, applying calibrations if present.
+
+    Returns (xyz, slot_index, panel_index, frame_index):
+      - slot_index: the per-peak index used internally to align with per-slot
+        arrays like goniometer/angles and goniometer/R. For Predictor "banks"
+        output this is a composite frame+panel slot, not a true frame number.
+      - panel_index: the physical detector bank/panel each peak was recorded on.
+      - frame_index: the true rotation/goniometer-setting each peak belongs to.
+        For Predictor "banks" output (which only stores a composite slot index)
+        this is reconstructed by grouping slots that share an identical
+        goniometer/angles row, since those rows are tiled per-panel from a
+        single frame's angles at acquisition time.
+    """
     with h5py.File(file_path, "r") as f:
         run_idx = resolve_indices(f)
 
@@ -79,7 +91,7 @@ def extract_xyz_from_file(file_path, instrument=None):
                 print(
                     "Warning: Instrument not provided. Cannot compute physical coordinates from pixels."
                 )
-                return None, None
+                return None, None, None, None
 
             pixel_r = f["peaks/pixel_r"][()]
             pixel_c = f["peaks/pixel_c"][()]
@@ -89,6 +101,13 @@ def extract_xyz_from_file(file_path, instrument=None):
                 run_idx = np.zeros(len(xyz))
             if bank_array is None:
                 bank_array = run_idx
+
+            if "peaks/run_index" in f:
+                frame_idx = f["peaks/run_index"][()]
+            elif "peaks/image_index" in f:
+                frame_idx = f["peaks/image_index"][()]
+            else:
+                frame_idx = run_idx
 
             for phys_bank in np.unique(bank_array):
                 bank_str = f"bank_{int(phys_bank)}"
@@ -112,7 +131,7 @@ def extract_xyz_from_file(file_path, instrument=None):
                 except KeyError:
                     pass
 
-            return xyz, run_idx
+            return xyz, run_idx, bank_array, frame_idx
 
         # 2. Bank/Pixel format (Predictor output)
         if "banks" in f:
@@ -120,10 +139,30 @@ def extract_xyz_from_file(file_path, instrument=None):
                 print(
                     "Warning: Instrument not provided. Cannot compute physical coordinates from prediction pixels."
                 )
-                return None, None
+                return None, None, None, None
 
-            xyz_list, run_list = [], []
+            xyz_list, run_list, panel_list, frame_list = [], [], [], []
             bank_ids = f["bank_ids"][()] if "bank_ids" in f else None
+
+            # goniometer/angles has one row per banks/<key> slot (tiled across
+            # panels within a frame when the file was written), so slots that
+            # share an identical angle row belong to the same true frame.
+            gonio_angles_all = (
+                f["goniometer/angles"][()] if "goniometer/angles" in f else None
+            )
+            frame_by_slot = {}
+            if gonio_angles_all is not None:
+                seen_rows = {}
+                for key_str in sorted(f["banks"].keys(), key=int):
+                    key = int(key_str)
+                    row_bytes = (
+                        gonio_angles_all[key].tobytes()
+                        if key < len(gonio_angles_all)
+                        else None
+                    )
+                    if row_bytes not in seen_rows:
+                        seen_rows[row_bytes] = len(seen_rows)
+                    frame_by_slot[key] = seen_rows[row_bytes]
 
             for img_key_str in f["banks"].keys():
                 img_idx = int(img_key_str)
@@ -150,13 +189,22 @@ def extract_xyz_from_file(file_path, instrument=None):
 
                     xyz_list.append(xyz)
                     run_list.extend([img_idx] * len(xyz))
+                    panel_list.extend([int(phys_bank)] * len(xyz))
+                    frame_list.extend(
+                        [frame_by_slot.get(img_idx, img_idx)] * len(xyz)
+                    )
                 except KeyError:
                     continue
 
             if xyz_list:
-                return np.vstack(xyz_list), np.array(run_list)
+                return (
+                    np.vstack(xyz_list),
+                    np.array(run_list),
+                    np.array(panel_list),
+                    np.array(frame_list),
+                )
 
-    return None, None
+    return None, None, None, None
 
 
 def compute_metrics(
@@ -232,7 +280,9 @@ def compute_metrics(
             matched_xyz,
             matched_R,
             matched_run,
-        ) = [], [], [], [], [], [], []
+            matched_frame,
+            matched_panel,
+        ) = [], [], [], [], [], [], [], [], []
 
         # ==========================================
         # TWO FILE COMPARISON
@@ -243,8 +293,8 @@ def compute_metrics(
                     "error_message": "ERROR: --instrument required for matching when not found in file attributes."
                 }
 
-            xyz_1, run_1 = extract_xyz_from_file(file1, instrument)
-            xyz_2, run_2 = extract_xyz_from_file(file2, instrument)
+            xyz_1, run_1, panel_1, frame_1 = extract_xyz_from_file(file1, instrument)
+            xyz_2, run_2, panel_2, frame_2 = extract_xyz_from_file(file2, instrument)
 
             if xyz_1 is None or xyz_2 is None:
                 return {
@@ -283,6 +333,8 @@ def compute_metrics(
                             matched_lam.extend(lam_p[idxs[valid]])
                             matched_xyz.extend(xyz_2_run[valid])
                             matched_run.extend([img_idx] * num_valid)
+                            matched_frame.extend(frame_1[mask_1][idxs[valid]])
+                            matched_panel.extend(panel_1[mask_1][idxs[valid]])
                             matched_R.extend(
                                 _get_safe_R_stack(
                                     R_file, [img_idx] * num_valid, num_valid
@@ -316,6 +368,8 @@ def compute_metrics(
                             matched_lam.extend(lam_p[mask_1][idxs[valid]])
                             matched_xyz.extend(xyz_2_run[valid])
                             matched_run.extend([r] * num_valid)
+                            matched_frame.extend(frame_1[mask_1][idxs[valid]])
+                            matched_panel.extend(panel_1[mask_1][idxs[valid]])
                             matched_R.extend(
                                 _get_safe_R_stack(R_file, [r] * num_valid, num_valid)
                             )
@@ -332,12 +386,16 @@ def compute_metrics(
                 matched_l = f["peaks/l"][()]
                 matched_lam = f["peaks/lambda"][()]
 
-                xyz, r_idx = extract_xyz_from_file(file1, instrument)
+                xyz, r_idx, panel_idx, frame_idx = extract_xyz_from_file(
+                    file1, instrument
+                )
                 if xyz is None:
                     return {"error_message": "Could not extract XYZ coordinates."}
 
                 matched_xyz = xyz
                 matched_run = r_idx
+                matched_frame = frame_idx
+                matched_panel = panel_idx
                 matched_R = _get_safe_R_stack(R_file, matched_run, len(matched_h))
 
         h = np.array(matched_h)
@@ -347,6 +405,8 @@ def compute_metrics(
         xyz_det = np.array(matched_xyz)
         R_all = np.array(matched_R)
         run_index = np.array(matched_run)
+        frame_index = np.array(matched_frame)
+        panel_index = np.array(matched_panel)
 
         mask = (h != 0) | (k != 0) | (l != 0)
         if np.sum(mask) == 0:
@@ -365,6 +425,8 @@ def compute_metrics(
         xyz_det = xyz_det[mask]
         R_all = R_all[mask]
         run_index = run_index[mask]
+        frame_index = frame_index[mask]
+        panel_index = panel_index[mask]
 
         d_filter_message = None
         if d_min is not None:
@@ -381,6 +443,8 @@ def compute_metrics(
             xyz_det = xyz_det[d_mask]
             R_all = R_all[d_mask]
             run_index = run_index[d_mask]
+            frame_index = frame_index[d_mask]
+            panel_index = panel_index[d_mask]
             d_filter_message = f"Filtered to {len(h)} peaks with d >= {d_min} A."
 
         UB = U @ B_mat
@@ -425,20 +489,25 @@ def compute_metrics(
             result["filter_message"] = d_filter_message
 
         if per_run:
-            unique_runs = sorted(np.unique(run_index))
+            unique_frames = sorted(np.unique(frame_index))
             run_errors = []
-            for r in unique_runs:
-                r_mask = run_index == r
-                if np.sum(r_mask) > 0:
+            for fr in unique_frames:
+                fr_mask = frame_index == fr
+                if np.sum(fr_mask) > 0:
                     run_errors.append(
-                        (int(r), float(np.median(ang_err[r_mask])), int(np.sum(r_mask)))
+                        (
+                            int(fr),
+                            float(np.median(ang_err[fr_mask])),
+                            int(np.sum(fr_mask)),
+                        )
                     )
             run_errors.sort(key=lambda x: x[1], reverse=True)
             result["per_run_errors"] = run_errors
 
         if return_per_peak:
             result["per_peak"] = {
-                "run_index": run_index,
+                "frame_index": frame_index,
+                "panel_index": panel_index,
                 "h": h,
                 "k": k,
                 "l": l,
@@ -456,8 +525,8 @@ def compute_metrics(
 
 
 def write_per_peak_csv(result: dict, output_path: str) -> None:
-    """Write the per-peak run_index/h/k/l/d_err/ang_err arrays from a
-    compute_metrics(..., return_per_peak=True) result to a CSV file."""
+    """Write the per-peak frame_index/panel_index/h/k/l/d_err/ang_err arrays
+    from a compute_metrics(..., return_per_peak=True) result to a CSV file."""
     per_peak = result.get("per_peak")
     if per_peak is None:
         raise ValueError(
@@ -466,7 +535,7 @@ def write_per_peak_csv(result: dict, output_path: str) -> None:
 
     import csv
 
-    fields = ["run_index", "h", "k", "l", "d_err", "ang_err"]
+    fields = ["frame_index", "panel_index", "h", "k", "l", "d_err", "ang_err"]
     columns = [per_peak[field] for field in fields]
 
     with open(output_path, "w", newline="") as fh:

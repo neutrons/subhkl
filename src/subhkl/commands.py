@@ -886,12 +886,12 @@ def run_metrics(
         f"{result['median_ang_err']:.5f} {result['mean_ang_err']:.5f} {result['max_ang_err']:.5f}"
     )
 
-    # Print per-run metrics if requested
+    # Print per-frame metrics if requested
     if per_run and "per_run_errors" in result:
-        print("\nPER-RUN MEDIAN ANGULAR ERROR (deg) - Sorted by error:")
+        print("\nPER-FRAME MEDIAN ANGULAR ERROR (deg) - Sorted by error:")
         for r, err, count in result["per_run_errors"]:
             status = "BAD" if err > 1.0 else "OK"
-            print(f"  Run {r:4d}: {err:6.3f} ({count:4d} peaks) [{status}]")
+            print(f"  Frame {r:4d}: {err:6.3f} ({count:4d} peaks) [{status}]")
 
     if csv_output is not None:
         write_per_peak_csv(result, csv_output)
@@ -902,7 +902,7 @@ def run_metrics(
 
         from subhkl.viz.metrics_plots import (
             plot_error_histograms,
-            plot_per_run_histograms,
+            plot_per_frame_histograms,
         )
 
         plot_error_histograms(result, plot_output)
@@ -911,8 +911,8 @@ def run_metrics(
         if per_run:
             root, ext = os.path.splitext(plot_output)
             per_run_plot_output = f"{root}_per_run{ext}"
-            plot_per_run_histograms(result, per_run_plot_output)
-            print(f"Wrote per-run error histograms to {per_run_plot_output}")
+            plot_per_frame_histograms(result, per_run_plot_output)
+            print(f"Wrote per-frame error histograms to {per_run_plot_output}")
 
 
 def run_peak_predictor(
