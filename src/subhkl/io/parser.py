@@ -457,21 +457,31 @@ def metrics(
             "--ki-vec", help="Override incident beam vector (e.g., '0,0,1' or '0,0,-1')"
         ),
     ] = None,
-    csv_output: Annotated[
-        str | None,
+    csv: Annotated[
+        bool,
         typer.Option(
             "--csv",
-            help="Write per-peak run_index/h/k/l/d_err/ang_err values to this CSV file.",
+            help="Write per-peak run_index/h/k/l/d_err/ang_err values to a CSV file "
+            "(default: metrics.csv, override with --csv-path).",
         ),
-    ] = None,
-    plot_output: Annotated[
+    ] = False,
+    csv_path: Annotated[
         str | None,
+        typer.Option("--csv-path", help="Custom path for --csv output."),
+    ] = None,
+    plot: Annotated[
+        bool,
         typer.Option(
             "--plot",
-            help="Save d_err/ang_err distribution histograms to this image file. "
-            "If --per-run is also set, an additional '<name>_per_run<ext>' image "
-            "with one row of histograms per run/frame is saved.",
+            help="Save d_err/ang_err distribution histograms to an image file "
+            "(default: metrics.png, override with --plot-path). If --per-run is "
+            "also set, an additional '<name>_per_run<ext>' image with one row of "
+            "histograms per run/frame is saved.",
         ),
+    ] = False,
+    plot_path: Annotated[
+        str | None,
+        typer.Option("--plot-path", help="Custom path for --plot output."),
     ] = None,
 ):
     """
@@ -479,6 +489,9 @@ def metrics(
     Compares HKL accuracy internally (file1), or spatial matching between file1 (predicted) and file2 (observed).
     """
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
+
+    csv_output = csv_path if csv_path is not None else ("metrics.csv" if csv else None)
+    plot_output = plot_path if plot_path is not None else ("metrics.png" if plot else None)
 
     run_metrics(
         file1=file1,
