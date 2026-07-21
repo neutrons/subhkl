@@ -856,6 +856,7 @@ def run_metrics(
     ki_vec: List[float] | np.ndarray = None,
     csv_output: str | None = None,
     plot_output: str | None = None,
+    plot_bins: int | None = None,
 ):
     from subhkl.instrument.metrics import compute_metrics, write_per_peak_csv
 
@@ -905,13 +906,15 @@ def run_metrics(
             plot_per_frame_histograms,
         )
 
-        plot_error_histograms(result, plot_output)
+        plot_kwargs = {} if plot_bins is None else {"bins": plot_bins}
+
+        plot_error_histograms(result, plot_output, **plot_kwargs)
         print(f"Wrote error histograms to {plot_output}")
 
         if per_run:
             root, ext = os.path.splitext(plot_output)
             per_run_plot_output = f"{root}_per_run{ext}"
-            plot_per_frame_histograms(result, per_run_plot_output)
+            plot_per_frame_histograms(result, per_run_plot_output, **plot_kwargs)
             print(f"Wrote per-frame error histograms to {per_run_plot_output}")
 
 

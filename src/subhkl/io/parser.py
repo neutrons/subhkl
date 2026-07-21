@@ -483,6 +483,14 @@ def metrics(
         str | None,
         typer.Option("--plot-path", help="Custom path for --plot output."),
     ] = None,
+    bins: Annotated[
+        int | None,
+        typer.Option(
+            "--bins",
+            help="Number of histogram bins for --plot (default: 50 for the "
+            "overall histogram, 30 for the --per-run per-frame histogram).",
+        ),
+    ] = None,
 ):
     """
     CLI command to compute and display indexing quality metrics.
@@ -502,6 +510,7 @@ def metrics(
         ki_vec=ki_vec_parsed,
         csv_output=csv_output,
         plot_output=plot_output,
+        plot_bins=bins,
     )
 
 
