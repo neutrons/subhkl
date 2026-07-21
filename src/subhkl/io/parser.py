@@ -457,6 +457,22 @@ def metrics(
             "--ki-vec", help="Override incident beam vector (e.g., '0,0,1' or '0,0,-1')"
         ),
     ] = None,
+    csv_output: Annotated[
+        str | None,
+        typer.Option(
+            "--csv",
+            help="Write per-peak run_index/h/k/l/d_err/ang_err values to this CSV file.",
+        ),
+    ] = None,
+    plot_output: Annotated[
+        str | None,
+        typer.Option(
+            "--plot",
+            help="Save d_err/ang_err distribution histograms to this image file. "
+            "If --per-run is also set, an additional '<name>_per_run<ext>' image "
+            "with one row of histograms per run/frame is saved.",
+        ),
+    ] = None,
 ):
     """
     CLI command to compute and display indexing quality metrics.
@@ -471,6 +487,8 @@ def metrics(
         d_min=d_min,
         per_run=per_run,
         ki_vec=ki_vec_parsed,
+        csv_output=csv_output,
+        plot_output=plot_output,
     )
 
 

@@ -166,6 +166,7 @@ def compute_metrics(
     d_min: float | None = None,
     per_run: bool = False,
     ki_vec_override: np.ndarray | None = None,
+    return_per_peak: bool = False,
 ) -> dict:
     try:
         with h5py.File(file1, "r") as f:
@@ -435,6 +436,16 @@ def compute_metrics(
             run_errors.sort(key=lambda x: x[1], reverse=True)
             result["per_run_errors"] = run_errors
 
+        if return_per_peak:
+            result["per_peak"] = {
+                "run_index": run_index,
+                "h": h,
+                "k": k,
+                "l": l,
+                "d_err": d_err,
+                "ang_err": ang_err,
+            }
+
         return result
 
     except Exception as e:
@@ -442,3 +453,23 @@ def compute_metrics(
 
         traceback.print_exc()
         return {"error_message": f"Exception during metrics computation: {e!s}"}
+
+
+def write_per_peak_csv(result: dict, output_path: str) -> None:
+    """Write the per-peak run_index/h/k/l/d_err/ang_err arrays from a
+    compute_metrics(..., return_per_peak=True) result to a CSV file."""
+    per_peak = result.get("per_peak")
+    if per_peak is None:
+        raise ValueError(
+            "result has no 'per_peak' data; call compute_metrics(..., return_per_peak=True)"
+        )
+
+    import csv
+
+    fields = ["run_index", "h", "k", "l", "d_err", "ang_err"]
+    columns = [per_peak[field] for field in fields]
+
+    with open(output_path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(fields)
+        writer.writerows(zip(*columns))

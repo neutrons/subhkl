@@ -854,8 +854,10 @@ def run_metrics(
     d_min: float | None = None,
     per_run: bool = False,
     ki_vec: List[float] | np.ndarray = None,
+    csv_output: str | None = None,
+    plot_output: str | None = None,
 ):
-    from subhkl.instrument.metrics import compute_metrics
+    from subhkl.instrument.metrics import compute_metrics, write_per_peak_csv
 
     # No need to call apply_detector_calibration here because metrics.py
     # dynamically shifts coordinates using the detector_calibration group.
@@ -866,6 +868,7 @@ def run_metrics(
         d_min=d_min,
         per_run=per_run,
         ki_vec_override=ki_vec,
+        return_per_peak=csv_output is not None or plot_output is not None,
     )
 
     if "error_message" in result:
@@ -889,6 +892,27 @@ def run_metrics(
         for r, err, count in result["per_run_errors"]:
             status = "BAD" if err > 1.0 else "OK"
             print(f"  Run {r:4d}: {err:6.3f} ({count:4d} peaks) [{status}]")
+
+    if csv_output is not None:
+        write_per_peak_csv(result, csv_output)
+        print(f"Wrote per-peak errors to {csv_output}")
+
+    if plot_output is not None:
+        import os
+
+        from subhkl.viz.metrics_plots import (
+            plot_error_histograms,
+            plot_per_run_histograms,
+        )
+
+        plot_error_histograms(result, plot_output)
+        print(f"Wrote error histograms to {plot_output}")
+
+        if per_run:
+            root, ext = os.path.splitext(plot_output)
+            per_run_plot_output = f"{root}_per_run{ext}"
+            plot_per_run_histograms(result, per_run_plot_output)
+            print(f"Wrote per-run error histograms to {per_run_plot_output}")
 
 
 def run_peak_predictor(
