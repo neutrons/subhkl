@@ -49,16 +49,25 @@ def _maybe_export_dials(
     """
     if not enabled:
         return
+    # Importing our own module is safe without DIALS (dxtbx is imported lazily);
+    # the toolkit is only pulled in inside hdf5_to_dials.
     from subhkl.io.dials_export import dials_output_paths, hdf5_to_dials
 
     expt_path, refl_path = dials_output_paths(name_base, prefix)
-    hdf5_to_dials(
-        read_path,
-        expt_path,
-        refl_path,
-        instrument=instrument,
-        image_source=image_source,
-    )
+    try:
+        hdf5_to_dials(
+            read_path,
+            expt_path,
+            refl_path,
+            instrument=instrument,
+            image_source=image_source,
+        )
+    except ImportError as exc:
+        # DIALS/dxtbx is not installed. The program's native output above has
+        # already been written, so warn about the --dials step only rather than
+        # failing the whole command with a traceback.
+        typer.echo(f"Skipping --dials export: {exc}", err=True)
+        return
     print(f"Wrote DIALS ExperimentList to {expt_path}")
     print(f"Wrote DIALS reflection_table to {refl_path}")
 
