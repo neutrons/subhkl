@@ -31,6 +31,26 @@ _DIALS_PREFIX_HELP = (
     "Output stem for the --dials files (default: the program's output filename "
     "with its extension replaced by .expt/.refl)."
 )
+_DIALS_POLY_HELP = (
+    "Export a Laue PolychromaticBeam instead of the default monochromatic beam. "
+    "More faithful to the physics, but standard DIALS tools (dials.show, "
+    "dials.image_viewer) assume a monochromatic beam and cannot open it."
+)
+_DIALS_WAVELENGTH_HELP = (
+    "Nominal (peak) wavelength in Angstroms for the monochromatic DIALS beam. "
+    "Only sets the beam model for DIALS tooling; the true per-reflection "
+    "wavelengths are always kept in the reflection table. Defaults to the data's "
+    "representative wavelength."
+)
+
+# Reusable option annotations for the two extra --dials knobs, so every command
+# declares them identically.
+_DialsPolyOpt = Annotated[
+    bool, typer.Option("--dials-polychromatic", help=_DIALS_POLY_HELP)
+]
+_DialsWavelengthOpt = Annotated[
+    Optional[float], typer.Option("--dials-wavelength", help=_DIALS_WAVELENGTH_HELP)
+]
 
 
 def _maybe_export_dials(
@@ -40,12 +60,15 @@ def _maybe_export_dials(
     instrument: str | None = None,
     prefix: str | None = None,
     image_source: str | None = None,
+    polychromatic: bool = False,
+    wavelength: float | None = None,
 ):
     """Emit DIALS .expt/.refl from a subhkl HDF5 output when --dials is set.
 
     ``image_source`` is the image stack (a reduce/merge HDF5) whose pixels back
     this output; when given, an ImageSet is attached so the .expt opens in DIALS
-    image tools.
+    image tools. ``polychromatic``/``wavelength`` select the exported beam model
+    (see :func:`subhkl.io.dials_export.hdf5_to_dials`).
     """
     if not enabled:
         return
@@ -61,6 +84,8 @@ def _maybe_export_dials(
             refl_path,
             instrument=instrument,
             image_source=image_source,
+            polychromatic=polychromatic,
+            wavelength=wavelength,
         )
     except ImportError as exc:
         # DIALS/dxtbx is not installed. The program's native output above has
@@ -156,6 +181,8 @@ def finder(
     dials_prefix: Annotated[
         str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     # Pass everything straight into the core logic function
     run_finder(
@@ -203,6 +230,8 @@ def finder(
         instrument,
         dials_prefix,
         image_source=filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -332,6 +361,8 @@ def indexer(
     dials_prefix: Annotated[
         str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ) -> None:
     # 1. Safely Parse Comma-Separated Strings into Python Lists
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
@@ -425,6 +456,8 @@ def indexer(
         instrument_name,
         dials_prefix,
         image_source=original_nexus_filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -473,6 +506,8 @@ def rbf_integrator(
     dials_prefix: Annotated[
         str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     """
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
@@ -502,6 +537,8 @@ def rbf_integrator(
         instrument,
         dials_prefix,
         image_source=filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -585,6 +622,8 @@ def metrics(
             "Exports the reflections of the primary file being evaluated.",
         ),
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     """
     CLI command to compute and display indexing quality metrics.
@@ -614,6 +653,8 @@ def metrics(
         dials_prefix if dials_prefix else "metrics",
         instrument,
         dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -633,6 +674,8 @@ def peak_predictor(
     dials_prefix: Annotated[
         str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     run_peak_predictor(
         filename,
@@ -653,6 +696,8 @@ def peak_predictor(
         instrument,
         dials_prefix,
         image_source=filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -683,6 +728,8 @@ def integrator(
     dials_prefix: Annotated[
         str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     run_integrator(
         filename,
@@ -713,6 +760,8 @@ def integrator(
         instrument,
         dials_prefix,
         image_source=filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -727,12 +776,20 @@ def mtz_exporter(
     dials_prefix: Annotated[
         str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     run_mtz_exporter(indexed_h5_filename, output_mtz_filename, space_group)
     # The reflection information lives in the input indexed HDF5; the DIALS
     # files are named after the MTZ output.
     _maybe_export_dials(
-        dials, indexed_h5_filename, output_mtz_filename, None, dials_prefix
+        dials,
+        indexed_h5_filename,
+        output_mtz_filename,
+        None,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -751,12 +808,20 @@ def reduce(
     dials_prefix: Annotated[
         str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     run_reduce(
         nexus_filename, output_filename, instrument, wavelength_min, wavelength_max
     )
     _maybe_export_dials(
-        dials, output_filename, output_filename, instrument, dials_prefix
+        dials,
+        output_filename,
+        output_filename,
+        instrument,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 
@@ -778,6 +843,8 @@ def merge_images(
     dials_prefix: Annotated[
         str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     try:
         run_merge_images(
@@ -788,7 +855,15 @@ def merge_images(
         print(str(e))
         raise typer.Exit(code=1)
 
-    _maybe_export_dials(dials, output_filename, output_filename, None, dials_prefix)
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        None,
+        dials_prefix,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
+    )
 
 
 @app.command()
@@ -851,6 +926,8 @@ def zone_axis_search(
     dials_prefix: Annotated[
         str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
     ] = None,
+    dials_polychromatic: _DialsPolyOpt = False,
+    dials_wavelength: _DialsWavelengthOpt = None,
 ):
     """
     Global Zone-Axis Search to find the macroscopic crystal orientation (U matrix).
@@ -884,6 +961,8 @@ def zone_axis_search(
         instrument,
         dials_prefix,
         image_source=merged_h5_filename,
+        polychromatic=dials_polychromatic,
+        wavelength=dials_wavelength,
     )
 
 

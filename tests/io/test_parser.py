@@ -1,3 +1,5 @@
+import re
+
 import pytest
 from typer.testing import CliRunner
 
@@ -17,17 +19,29 @@ DIALS_COMMANDS = [
     "zone-axis-search",
 ]
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
-@pytest.mark.parametrize("command", DIALS_COMMANDS)
-def test_dials_flag_is_wired(command):
-    """Every CLI command exposes the --dials and --dials-prefix options.
 
-    A wide terminal keeps Rich from wrapping the option names apart.
+def _plain_help(command):
+    """Return a command's --help text with Rich's ANSI styling stripped.
+
+    Rich interleaves colour codes inside option names (e.g. ``--dials``), so the
+    raw stdout can't be substring-matched; strip them first. A wide terminal keeps
+    Rich from wrapping long option names across lines.
     """
     result = CliRunner().invoke(app, [command, "--help"], env={"COLUMNS": "200"})
     assert result.exit_code == 0
-    assert "--dials" in result.stdout
-    assert "--dials-prefix" in result.stdout
+    return _ANSI.sub("", result.stdout)
+
+
+@pytest.mark.parametrize("command", DIALS_COMMANDS)
+def test_dials_flag_is_wired(command):
+    """Every CLI command exposes all four --dials export options."""
+    help_text = _plain_help(command)
+    assert "--dials" in help_text
+    assert "--dials-prefix" in help_text
+    assert "--dials-polychromatic" in help_text
+    assert "--dials-wavelength" in help_text
 
 
 def test_maybe_export_dials_without_dials_warns(tmp_path, capsys):
