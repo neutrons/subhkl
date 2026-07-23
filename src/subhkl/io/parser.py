@@ -22,6 +22,46 @@ from subhkl.commands import (
 
 app = typer.Typer()
 
+# Shared help text so every command documents the flag identically.
+_DIALS_HELP = (
+    "Also write the program's output as a DIALS ExperimentList (.expt) and "
+    "reflection_table (.refl) pair. Requires the DIALS/dxtbx toolkit."
+)
+_DIALS_PREFIX_HELP = (
+    "Output stem for the --dials files (default: the program's output filename "
+    "with its extension replaced by .expt/.refl)."
+)
+
+
+def _maybe_export_dials(
+    enabled: bool,
+    read_path: str,
+    name_base: str,
+    instrument: str | None = None,
+    prefix: str | None = None,
+    image_source: str | None = None,
+):
+    """Emit DIALS .expt/.refl from a subhkl HDF5 output when --dials is set.
+
+    ``image_source`` is the image stack (a reduce/merge HDF5) whose pixels back
+    this output; when given, an ImageSet is attached so the .expt opens in DIALS
+    image tools.
+    """
+    if not enabled:
+        return
+    from subhkl.io.dials_export import dials_output_paths, hdf5_to_dials
+
+    expt_path, refl_path = dials_output_paths(name_base, prefix)
+    hdf5_to_dials(
+        read_path,
+        expt_path,
+        refl_path,
+        instrument=instrument,
+        image_source=image_source,
+    )
+    print(f"Wrote DIALS ExperimentList to {expt_path}")
+    print(f"Wrote DIALS reflection_table to {refl_path}")
+
 
 def apply_detector_calibration(hdf5_filename: str, instrument: str):
     """
@@ -103,6 +143,10 @@ def finder(
         str, typer.Option(help="Candidate SNR thresholds alpha for auto-tuning")
     ] = "3.0,5.0,10.0,15.0,20.0,25.0,30.0",
     max_workers: int = 16,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
 ):
     # Pass everything straight into the core logic function
     run_finder(
@@ -142,6 +186,14 @@ def finder(
         sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
         sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
         max_workers=max_workers,
+    )
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        instrument,
+        dials_prefix,
+        image_source=filename,
     )
 
 
@@ -267,6 +319,10 @@ def indexer(
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
     index: Annotated[Optional[bool], typer.Option("--index/--no-index")] = None,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
 ) -> None:
     # 1. Safely Parse Comma-Separated Strings into Python Lists
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
@@ -353,6 +409,14 @@ def indexer(
         num_candidates=num_candidates,
         no_index=not index if index is not None else None,
     )
+    _maybe_export_dials(
+        dials,
+        output_peaks_filename,
+        output_peaks_filename,
+        instrument_name,
+        dials_prefix,
+        image_source=original_nexus_filename,
+    )
 
 
 @app.command()
@@ -396,6 +460,10 @@ def rbf_integrator(
     max_workers: Annotated[
         int | None, typer.Option(help="Maximum number of CPU tasks for visualization.")
     ] = None,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
 ):
     """
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
@@ -417,6 +485,14 @@ def rbf_integrator(
         create_visualizations=create_visualizations,
         chunk_size=chunk_size,
         max_workers=max_workers,
+    )
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        instrument,
+        dials_prefix,
+        image_source=filename,
     )
 
 
@@ -491,6 +567,15 @@ def metrics(
             "overall histogram, 30 for the --per-run per-frame histogram).",
         ),
     ] = None,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None,
+        typer.Option(
+            "--dials-prefix",
+            help="Output stem for the --dials files (default: metrics.expt/.refl). "
+            "Exports the reflections of the primary file being evaluated.",
+        ),
+    ] = None,
 ):
     """
     CLI command to compute and display indexing quality metrics.
@@ -499,7 +584,9 @@ def metrics(
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
 
     csv_output = csv_path if csv_path is not None else ("metrics.csv" if csv else None)
-    plot_output = plot_path if plot_path is not None else ("metrics.png" if plot else None)
+    plot_output = (
+        plot_path if plot_path is not None else ("metrics.png" if plot else None)
+    )
 
     run_metrics(
         file1=file1,
@@ -511,6 +598,13 @@ def metrics(
         csv_output=csv_output,
         plot_output=plot_output,
         plot_bins=bins,
+    )
+    _maybe_export_dials(
+        dials,
+        file1,
+        dials_prefix if dials_prefix else "metrics",
+        instrument,
+        dials_prefix,
     )
 
 
@@ -526,6 +620,10 @@ def peak_predictor(
     wavel_min: float | None = None,
     wavel_max: float | None = None,
     max_workers: int = 16,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
 ):
     run_peak_predictor(
         filename,
@@ -538,6 +636,14 @@ def peak_predictor(
         space_group=space_group,
         max_workers=max_workers,
         create_visualizations=create_visualizations,
+    )
+    _maybe_export_dials(
+        dials,
+        integration_peaks_filename,
+        integration_peaks_filename,
+        instrument,
+        dials_prefix,
+        image_source=filename,
     )
 
 
@@ -564,6 +670,10 @@ def integrator(
     show_progress: bool = True,
     found_peaks_file: str | None = None,
     max_workers: int = 16,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
 ):
     run_integrator(
         filename,
@@ -587,6 +697,14 @@ def integrator(
         found_peaks_file,
         max_workers,
     )
+    _maybe_export_dials(
+        dials,
+        output_filename,
+        output_filename,
+        instrument,
+        dials_prefix,
+        image_source=filename,
+    )
 
 
 @app.command()
@@ -596,8 +714,17 @@ def mtz_exporter(
     space_group: str = typer.Option(
         None, help="Optional. Loaded from indexer h5 if missing."
     ),
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
 ):
     run_mtz_exporter(indexed_h5_filename, output_mtz_filename, space_group)
+    # The reflection information lives in the input indexed HDF5; the DIALS
+    # files are named after the MTZ output.
+    _maybe_export_dials(
+        dials, indexed_h5_filename, output_mtz_filename, None, dials_prefix
+    )
 
 
 @app.command()
@@ -611,9 +738,16 @@ def reduce(
     wavelength_max: Annotated[
         float | None, typer.Option(help="Override max wavelength")
     ] = None,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
 ):
     run_reduce(
         nexus_filename, output_filename, instrument, wavelength_min, wavelength_max
+    )
+    _maybe_export_dials(
+        dials, output_filename, output_filename, instrument, dials_prefix
     )
 
 
@@ -631,6 +765,10 @@ def merge_images(
     beta: float = typer.Argument(..., help="Unit cell parameter beta"),
     gamma: float = typer.Argument(..., help="Unit cell parameter gamma"),
     space_group: str = typer.Argument(..., help="Space group (e.g. 'P 1')"),
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
 ):
     try:
         run_merge_images(
@@ -640,6 +778,8 @@ def merge_images(
     except ValueError as e:
         print(str(e))
         raise typer.Exit(code=1)
+
+    _maybe_export_dials(dials, output_filename, output_filename, None, dials_prefix)
 
 
 @app.command()
@@ -698,6 +838,10 @@ def zone_axis_search(
     batch_size: Annotated[
         int, typer.Option(help="Batch size for validation loop")
     ] = 1024,
+    dials: Annotated[bool, typer.Option("--dials", "-dials", help=_DIALS_HELP)] = False,
+    dials_prefix: Annotated[
+        str | None, typer.Option("--dials-prefix", help=_DIALS_PREFIX_HELP)
+    ] = None,
 ):
     """
     Global Zone-Axis Search to find the macroscopic crystal orientation (U matrix).
@@ -723,6 +867,14 @@ def zone_axis_search(
         num_runs=num_runs,
         output_hough=output_hough,
         batch_size=batch_size,
+    )
+    _maybe_export_dials(
+        dials,
+        output_h5_filename,
+        output_h5_filename,
+        instrument,
+        dials_prefix,
+        image_source=merged_h5_filename,
     )
 
 
