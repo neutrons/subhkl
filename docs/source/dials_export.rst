@@ -82,6 +82,36 @@ subhkl declares it through the ``dxtbx.format`` entry point
 discoverable. If dxtbx does not pick it up, re-run ``dxtbx.print_format_instances``
 or reinstall so the entry point is registered.
 
+Verifying the export in a DIALS environment
+-------------------------------------------
+
+The round-trip tests in ``tests/io/test_dials_export.py`` are guarded by
+``pytest.importorskip("dxtbx")`` and only run where the DIALS toolkit is
+importable, so they are skipped by the ordinary (PyPI/uv) unit run and exercised
+by the dedicated ``DIALS export`` CI workflow. To reproduce that environment
+locally:
+
+.. code-block:: bash
+
+   # 1. A conda env with the DIALS/dxtbx/cctbx toolkit
+   mamba create -y -n ld-subhkl -c conda-forge dials python=3.12
+   mamba activate ld-subhkl
+
+   # 2. Install subhkl so the dxtbx.format entry point registers FormatSubhkl.
+   #    --no-deps keeps the DIALS stack intact (subhkl's PyPI deps are not needed
+   #    to run these tests).
+   pip install -e . --no-deps
+   pip install pytest pytest-dependency
+
+   # 3. Confirm the reader is discoverable, then run the round-trips.
+   python -c "from dxtbx.format.Registry import get_format_class_for; \
+       print(get_format_class_for('FormatSubhkl'))"
+   MESOLITE_MAX_FILES=0 pytest -v tests/io/test_dials_export.py
+
+If ``get_format_class_for('FormatSubhkl')`` raises ``KeyError``, the entry point
+was not picked up — reinstall subhkl in the active env (an editable install must
+be re-run after changing the ``dxtbx.format`` entry in ``pyproject.toml``).
+
 Closest DIALS CLI parallel per program
 ---------------------------------------
 
