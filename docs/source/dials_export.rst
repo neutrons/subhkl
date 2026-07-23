@@ -160,7 +160,7 @@ Closest DIALS CLI parallel per program
 |                     | ``wavelength``, ``predicted`` flag.                           |                                                             |
 +---------------------+---------------------------------------------------------------+-------------------------------------------------------------+
 | ``integrator``      | Integrated reflections: ``intensity.sum``, ``miller_index``,  | ``dials.integrate`` (integrated.refl)                       |
-|                     | ``wavelength``, ``s1``.                                        |                                                             |
+|                     | ``wavelength``, ``s1``.                                       |                                                             |
 +---------------------+---------------------------------------------------------------+-------------------------------------------------------------+
 | ``rbf_integrator``  | Integrated reflections (RBF profile fitting).                 | ``dials.integrate`` (profile-fitting path)                  |
 +---------------------+---------------------------------------------------------------+-------------------------------------------------------------+
@@ -170,6 +170,109 @@ Closest DIALS CLI parallel per program
 | ``metrics``         | The reflections of the evaluated file (default stem           | ``dials.rl_png`` / ``dials.report`` (indexing quality);     |
 |                     | ``metrics``); residuals remain in ``--csv``.                  | residual analysis in ``dials.refine`` logs.                 |
 +---------------------+---------------------------------------------------------------+-------------------------------------------------------------+
+
+Comparing outputs against DIALS / Laue-DIALS
+--------------------------------------------
+
+Because every step emits the same ``.expt``/``.refl`` data model DIALS uses, you
+can run the parallel DIALS or Laue-DIALS step and diff the two with standard DIALS
+tooling. For polychromatic neutron Laue data, **Laue-DIALS** (the ``laue.*``
+commands, which wrap the core ``dials.*`` tools) is the closer comparison: like
+subhkl it treats each goniometer setting as a *still*, carries a monochromatic
+beam with the true per-reflection wavelength in the reflection table's
+``wavelength`` column, and assigns a wavelength to every spot.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 20 30 50
+
+   * - subhkl step
+     - Closest Laue-DIALS step
+     - What to compare, and how
+   * - ``reduce``
+     - ``dials.import``
+     - Detector/beam/goniometer models: ``dials.show a.expt`` vs ``b.expt``;
+       overlay pixels in ``dials.image_viewer``. Check panel origins, fast/slow
+       axes, distances, beam direction.
+   * - ``merge_images``
+     - ``dials.import`` / ``dials.combine_experiments``
+     - Number of experiments (frames) and each frame's goniometer setting
+       rotation (``dials.show``).
+   * - ``finder``
+     - ``laue.find_spots`` (``dials.find_spots``)
+     - Strong-spot tables: counts per panel/frame, ``xyzobs.px`` centroid
+       overlap, ``intensity.sum`` distributions. Overlay both on the images with
+       ``dials.image_viewer scan.expt strong.refl``.
+   * - ``zone_axis_search``
+     - initial ``laue.index`` (monochromatic orientation estimate)
+     - The orientation matrix: ``dials.compare_orientation_matrices
+       subhkl.expt laue.expt`` reports the misorientation angle.
+   * - ``indexer``
+     - ``laue.index`` → ``laue.optimize_indexing`` → ``laue.refine``
+     - Crystal: ``dials.compare_orientation_matrices`` for ``U``, cell in
+       ``dials.show``. Reflections: fraction indexed, ``miller_index`` agreement,
+       and the ``wavelength`` column (the Laue crux). ``dials.report`` for quality.
+   * - ``metrics``
+     - ``laue.compute_rmsds``
+     - Positional RMSDs (observed vs predicted), percent indexed, per-image stats.
+   * - ``peak_predictor``
+     - ``laue.predict``
+     - Predicted tables: ``xyzcal.px``, ``miller_index``, ``wavelength``, count,
+       resolution/wavelength coverage. Overlay predictions on the images.
+   * - ``integrator`` / ``rbf_integrator``
+     - ``laue.integrate``
+     - Integrated ``intensity.sum``/``intensity.prf`` and sigmas, I/σ
+       distributions, intensity correlation matched by ``hkl`` + frame.
+   * - ``mtz_exporter``
+     - ``dials.export format=mtz`` (then ``careless`` for scaling/merging)
+     - MTZ contents via ``gemmi``/``reciprocalspaceship``; the ``--dials``
+       ``.expt``/``.refl`` behind the MTZ for a like-for-like reflection compare.
+
+The reason the ``--dials`` flag matters is that these tools then work on both
+sides without translation:
+
+- ``dials.show model.expt`` — text dump of beam/detector/crystal/goniometer/scan;
+  diff the two dumps.
+- ``dials.compare_orientation_matrices a.expt b.expt`` — the single best crystal
+  cross-check; reports the rotation between the two ``U`` matrices (accounting for
+  symmetry).
+- ``dials.image_viewer scan.expt spots.refl`` — overlay observed/predicted spots
+  on the images to eyeball agreement per panel.
+- ``dials.reflection_viewer table.refl`` — inspect reflection-table columns.
+- A small ``dials.array_family.flex`` script — match rows between the two tables
+  and compute residuals/correlations, e.g. by Miller index for indexed or
+  integrated data:
+
+  .. code-block:: python
+
+     from dials.array_family import flex
+
+     a = flex.reflection_table.from_file("subhkl.refl")
+     b = flex.reflection_table.from_file("laue.refl")
+
+     # Match on (miller_index, experiment id) and compare wavelengths.
+     a_key = {(hkl, i): j for j, (hkl, i) in enumerate(zip(a["miller_index"], a["id"]))}
+     dlam = flex.double()
+     for k, (hkl, i) in enumerate(zip(b["miller_index"], b["id"])):
+         j = a_key.get((hkl, i))
+         if j is not None:
+             dlam.append(a["wavelength"][j] - b["wavelength"][k])
+     print(f"matched {dlam.size()} reflections, "
+           f"mean |Δλ| = {flex.mean(flex.abs(dlam)):.4f} A")
+
+Caveats when comparing:
+
+- **Wavelength lives in the reflection table, not the beam.** Both subhkl (by
+  default) and Laue-DIALS put a monochromatic beam in the ``.expt`` and store the
+  true per-reflection λ in the ``wavelength`` column, so compare the column, not
+  ``beam.get_wavelength()``. Use ``--dials-polychromatic`` to compare
+  ``PolychromaticBeam`` models instead.
+- **Stills model.** subhkl emits one experiment per goniometer setting, the same
+  choice Laue-DIALS makes via ``laue.sequence_to_stills``; match reflections
+  within a frame (``id``), not across the whole set.
+- **Display-only transforms.** The flat panel montage and 1 pm pixel quantisation
+  affect only how ``dials.image_viewer`` draws the detector; the numbers used for
+  geometry and every comparison above are untouched.
 
 Example
 -------
