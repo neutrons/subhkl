@@ -345,6 +345,34 @@ def test_is_image_container_false(tmp_path):
     assert di.is_image_container(str(p)) is False
 
 
+# ---------------------------------------------------------------------------
+# Flat-montage panel grid (no DIALS needed)
+# ---------------------------------------------------------------------------
+
+
+def test_panel_grid_positions_bank_id_grid():
+    # Two-digit bank ids: tens digit -> column, units digit -> row.
+    cells = dx._panel_grid_positions([11, 18, 21, 81, 101, 108])
+    by_bank = dict(zip([11, 18, 21, 81, 101, 108], cells))
+    # Same tens digit (11, 18) share a column; same units digit (11, 21) share a row.
+    assert by_bank[11][1] == by_bank[18][1]
+    assert by_bank[11][0] == by_bank[21][0]
+    # Distinct tens digits get distinct, contiguous columns.
+    assert {c for _, c in cells} == {0, 1, 2, 3}
+    # Every cell is unique (no two panels overlap).
+    assert len(set(cells)) == len(cells)
+
+
+def test_panel_grid_positions_raster_fallback():
+    # Ids that don't encode a two-digit grid fall back to a square raster.
+    cells = dx._panel_grid_positions([1, 2, 3, 4, 5])
+    assert cells == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1)]
+
+
+def test_panel_grid_positions_empty():
+    assert dx._panel_grid_positions([]) == []
+
+
 def test_frame_rotations_apply_offsets(tmp_path):
     """A goniometer/offsets zero-point shifts the reconstructed rotation."""
     from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
@@ -522,3 +550,77 @@ def test_roundtrip_detector_calibration(tmp_path):
     panel = experiments[0].detector[0]  # bank 11 is the first panel
     origin = panel.get_origin()  # millimetres
     assert np.allclose(origin, [100.0, 200.0, -300.0])
+
+
+# ---------------------------------------------------------------------------
+# Beam model, panel projection, probe
+# ---------------------------------------------------------------------------
+
+
+def test_roundtrip_beam_is_monochromatic_by_default(tmp_path):
+    """The default export is a monochromatic beam so standard DIALS tools open it."""
+    pytest.importorskip("dxtbx")
+    from dxtbx.model.experiment_list import ExperimentListFactory
+
+    h5 = tmp_path / "indexed.h5"
+    _write_indexed(str(h5))
+    expt_path = str(tmp_path / "indexed.expt")
+    dx.hdf5_to_dials(
+        str(h5),
+        expt_path,
+        str(tmp_path / "indexed.refl"),
+        instrument="CG4D",
+        wavelength=3.0,
+    )
+
+    beam = ExperimentListFactory.from_json_file(expt_path, check_format=False)[0].beam
+    assert type(beam).__name__ == "Beam"  # not PolychromaticBeam
+    assert beam.get_wavelength() == pytest.approx(3.0)
+    # Probe is marked neutron regardless of the dxtbx build's import layout.
+    assert str(beam.get_probe()) == "neutron"
+
+
+def test_roundtrip_polychromatic_opt_in(tmp_path):
+    """--dials-polychromatic exports a PolychromaticBeam when available."""
+    pytest.importorskip("dxtbx")
+    from dxtbx import model
+    from dxtbx.model.experiment_list import ExperimentListFactory
+
+    if not hasattr(model, "PolychromaticBeam"):
+        pytest.skip("dxtbx build predates PolychromaticBeam")
+
+    h5 = tmp_path / "indexed.h5"
+    _write_indexed(str(h5))
+    expt_path = str(tmp_path / "indexed.expt")
+    dx.hdf5_to_dials(
+        str(h5),
+        expt_path,
+        str(tmp_path / "indexed.refl"),
+        instrument="CG4D",
+        polychromatic=True,
+    )
+
+    beam = ExperimentListFactory.from_json_file(expt_path, check_format=False)[0].beam
+    assert type(beam).__name__ == "PolychromaticBeam"
+
+
+def test_roundtrip_detector_has_flat_projection(tmp_path):
+    """Every exported panel carries a flat 2D projection for the image viewer."""
+    pytest.importorskip("dxtbx")
+    from dxtbx.model.experiment_list import ExperimentListFactory
+
+    h5 = tmp_path / "indexed.h5"
+    _write_indexed(str(h5))
+    expt_path = str(tmp_path / "indexed.expt")
+    dx.hdf5_to_dials(
+        str(h5), expt_path, str(tmp_path / "indexed.refl"), instrument="CG4D"
+    )
+
+    detector = ExperimentListFactory.from_json_file(expt_path, check_format=False)[
+        0
+    ].detector
+    # has_projection_2d() is a detector-level all-panels check.
+    assert detector.has_projection_2d()
+    for panel in detector:
+        r, _t = panel.get_projection_2d()
+        assert tuple(r) == (-1, 0, 0, -1)  # per-panel 180-degree flip

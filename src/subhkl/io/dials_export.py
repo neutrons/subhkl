@@ -23,6 +23,7 @@ subhkl program.
 
 from __future__ import annotations
 
+import math
 import os
 
 import h5py
@@ -338,17 +339,22 @@ def _frame_rotations(f, peaks, frame_ids):
 # ---------------------------------------------------------------------------
 
 
-def _build_beam(model, f, lam):
+def _build_beam(model, f, lam, *, polychromatic=False, wavelength=None):
     ki = _get(f, "beam/ki_vec")
     ki = np.array([0.0, 0.0, 1.0]) if ki is None else np.asarray(ki, dtype=float)
     ki = ki / np.linalg.norm(ki)
 
-    # subhkl is polychromatic (Laue): prefer a PolychromaticBeam that carries only
-    # a direction, with the true per-reflection wavelengths living in the
-    # reflection table's ``wavelength`` column. Fall back to a monochromatic beam
-    # at the mean wavelength if this dxtbx build predates PolychromaticBeam.
+    # subhkl is Laue (polychromatic), so a PolychromaticBeam -- carrying only a
+    # direction, with the true per-reflection wavelengths in the reflection
+    # table's ``wavelength`` column -- is the most faithful model. But standard
+    # DIALS tools (dials.show, dials.image_viewer) assume a monochromatic ``s0``
+    # and cannot open such an experiment, so the default is a monochromatic beam
+    # at a nominal (peak) wavelength, exactly as laue-dials does; the true
+    # per-reflection wavelengths are preserved in the reflection table regardless
+    # of this beam wavelength. Opt into the PolychromaticBeam with
+    # ``polychromatic=True`` when using Laue-aware tooling.
     beam = None
-    if hasattr(model, "PolychromaticBeam"):
+    if polychromatic and hasattr(model, "PolychromaticBeam"):
         try:
             # ``direction`` is the incident beam direction of travel (ki).
             beam = model.BeamFactory.make_polychromatic_beam(direction=_floats(ki))
@@ -358,18 +364,69 @@ def _build_beam(model, f, lam):
             except Exception:
                 beam = None
     if beam is None:
+        wl = float(wavelength) if wavelength else float(_mean_wavelength(f, lam))
         # sample_to_source is antiparallel to the direction of beam travel (ki).
-        beam = model.BeamFactory.make_beam(
-            sample_to_source=_floats(-ki), wavelength=float(_mean_wavelength(f, lam))
-        )
+        beam = model.BeamFactory.make_beam(sample_to_source=_floats(-ki), wavelength=wl)
 
+    # Mark the probe as neutron. The Probe enum's import location varies across
+    # dxtbx builds (``dxtbx.model`` on some, the compiled ext on others), so derive
+    # it from the beam itself to stay build-independent; builds without probe
+    # support simply skip this.
     try:
-        from dxtbx.model import Probe
-
-        beam.set_probe(Probe.neutron)
+        beam.set_probe(type(beam.get_probe()).neutron)
     except Exception:
         pass
     return beam
+
+
+def _panel_grid_positions(banks):
+    """Map each bank id to a ``(row, col)`` montage cell for a flat 2D layout.
+
+    subhkl bank ids commonly encode a physical grid in two digits -- e.g. CG4D
+    ``34`` -> column 3, row 4; ``101`` -> column 10, row 1 -- so lay panels out on
+    that grid to mirror the instrument's module/panel arrangement. The tens digit
+    is the column and the units digit is the row (matching how the banks sit in
+    the image viewer). Distinct row and column values are compacted to contiguous
+    indices so missing banks leave a small gap rather than a huge empty montage.
+    Falls back to a square raster grid (in the given order) when the ids don't
+    encode a usable grid.
+    """
+    banks = [int(b) for b in banks]
+    if banks and all(b >= 11 and b % 10 != 0 for b in banks):
+        # Rows (units digit) run top-to-bottom in the viewer, so map them in
+        # descending order for the units digit to increase downward.
+        rows = {
+            r: i for i, r in enumerate(sorted({b % 10 for b in banks}, reverse=True))
+        }
+        cols = {c: i for i, c in enumerate(sorted({b // 10 for b in banks}))}
+        return [(rows[b % 10], cols[b // 10]) for b in banks]
+    ncols = max(1, math.ceil(math.sqrt(len(banks)))) if banks else 1
+    return [(i // ncols, i % ncols) for i in range(len(banks))]
+
+
+def _apply_flat_projection(detector, banks):
+    """Bake a flat 2D montage projection into every panel.
+
+    A detector whose panels wrap around the sample projects onto a best-fit plane
+    as tilted, foreshortened tiles in ``dials.image_viewer``. Setting an explicit
+    per-panel 2D projection (a rotation + a pixel offset into a grid, as the
+    ESS/ISIS neutron formats do) makes each panel display undistorted and
+    perpendicular. Each panel is flipped 180 deg (r = -I) so its pixels read in
+    the sample-facing sense. This is display-only: the real 3D panel geometry is
+    untouched.
+    """
+    if len(detector) == 0:
+        return
+    for panel, (row, col) in zip(detector, _panel_grid_positions(banks)):
+        fast_px, slow_px = panel.get_image_size()  # (fast, slow), in pixels
+        # Flip each panel 180 deg in place (r = -I) so its pixels read in the
+        # sample-facing sense, offsetting the translation by the panel extent so
+        # the flipped panel stays within its own grid cell.
+        t = (
+            int(slow_px * row + (slow_px - 1)),
+            int(fast_px * col + (fast_px - 1)),
+        )
+        panel.set_projection_2d((-1, 0, 0, -1), t)
 
 
 def _build_detector(model, instrument, bank_ids, calibration=None, origin_shift=None):
@@ -392,9 +449,10 @@ def _build_detector(model, instrument, bank_ids, calibration=None, origin_shift=
     shift = None if origin_shift is None else np.asarray(origin_shift, dtype=float)
     detector = model.Detector()
     bank_to_panel: dict[int, int] = {}
+    added_banks: list[int] = []
     config = beamlines[instrument]
 
-    for panel_index, bank in enumerate(bank_ids):
+    for bank in bank_ids:
         key = str(int(bank))
         if key not in config:
             continue
@@ -428,11 +486,24 @@ def _build_detector(model, instrument, bank_ids, calibration=None, origin_shift=
         panel.set_local_frame(_floats(uhat), _floats(vhat), _floats(center * 1000.0))
         pixel_fast = width / max(m - 1, 1) * 1000.0
         pixel_slow = height / max(n - 1, 1) * 1000.0
+        # dials.image_viewer (rstbx) asserts each panel's two pixel dimensions are
+        # bit-exactly equal and identical across panels. subhkl metrology stores
+        # width and height as separate floats that agree only to ~1e-15 mm, so
+        # faithful division yields spurious sub-picometre anisotropy that trips
+        # that assert. Quantise to 1e-9 mm (1 pm, far finer than any real detector)
+        # so genuinely square/uniform panels export as such, while real anisotropy
+        # (microns) survives untouched.
+        pixel_fast = round(pixel_fast, 9)
+        pixel_slow = round(pixel_slow, 9)
         panel.set_pixel_size((float(pixel_fast), float(pixel_slow)))
         panel.set_image_size((int(m), int(n)))
         panel.set_trusted_range((-1.0, 1.0e9))
-        bank_to_panel[int(bank)] = panel_index
+        # Key on the true dxtbx panel index (banks not in the config are skipped,
+        # so the enumerate index would drift from the panel count).
+        bank_to_panel[int(bank)] = len(detector) - 1
+        added_banks.append(int(bank))
 
+    _apply_flat_projection(detector, added_banks)
     return detector, bank_to_panel
 
 
@@ -487,7 +558,15 @@ def _file_has_images(path):
         return False
 
 
-def hdf5_to_dials(h5_path, expt_path, refl_path, instrument=None, image_source=None):
+def hdf5_to_dials(
+    h5_path,
+    expt_path,
+    refl_path,
+    instrument=None,
+    image_source=None,
+    polychromatic=False,
+    wavelength=None,
+):
     """Convert any subhkl HDF5 output to a DIALS ``.expt`` / ``.refl`` pair.
 
     Parameters
@@ -505,6 +584,16 @@ def hdf5_to_dials(h5_path, expt_path, refl_path, instrument=None, image_source=N
         dataset) whose pixels back this output. When available, an ``ImageSet`` is
         attached so the ``.expt`` opens in DIALS image tools. Defaults to
         ``h5_path`` itself when that is an image stack.
+    polychromatic : bool, optional
+        Export a Laue ``PolychromaticBeam`` instead of the default monochromatic
+        beam. More faithful to the physics, but standard DIALS tools cannot open
+        it (they assume a monochromatic ``s0``). The true per-reflection
+        wavelengths live in the reflection table either way.
+    wavelength : float, optional
+        Nominal (peak) wavelength in Angstroms for the monochromatic beam. Only
+        sets the beam model for DIALS tooling; peak identity and per-reflection
+        wavelengths are unaffected. Defaults to the data's representative
+        wavelength.
     """
     model, flex = _require_dials()
 
@@ -515,7 +604,9 @@ def hdf5_to_dials(h5_path, expt_path, refl_path, instrument=None, image_source=N
         peaks = _collect_flat_peaks(f) or _collect_predicted_peaks(f)
 
         lam = peaks["lambda"] if peaks else None
-        beam = _build_beam(model, f, lam)
+        beam = _build_beam(
+            model, f, lam, polychromatic=polychromatic, wavelength=wavelength
+        )
         crystal = _build_crystal(model, f)
         calibration = _read_detector_calibration(f)
         sample_offset = _read_sample_offset(f)

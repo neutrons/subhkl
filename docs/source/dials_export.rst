@@ -17,6 +17,18 @@ output file with the extension replaced (``indexed.h5`` →
 ``indexed.expt`` + ``indexed.refl``). Use ``--dials-prefix STEM`` to choose a
 different stem.
 
+Two options control the exported beam model:
+
+- ``--dials-wavelength ANGSTROMS`` sets the nominal (peak) wavelength of the
+  default monochromatic beam. It only affects the beam model DIALS tools use for
+  display (beam centre, resolution rings); the true per-reflection wavelengths
+  always live in the reflection table. Defaults to the data's representative
+  wavelength.
+- ``--dials-polychromatic`` exports a Laue ``PolychromaticBeam`` instead. This is
+  more faithful to the physics, but standard DIALS tools (``dials.show``,
+  ``dials.image_viewer``) assume a monochromatic beam and cannot open it, so it
+  is opt-in for use with Laue-aware tooling.
+
 .. note::
 
    The export uses the real ``dxtbx``/``dials`` API, so the DIALS/cctbx toolkit
@@ -33,11 +45,14 @@ up). Because the beam, detector, crystal, and goniometer are all copied out of
 that single subhkl frame, the exported experiment is internally consistent and
 reproduces subhkl's physics, ``s1 = s0 + S · U · B · h``.
 
-- **Beam** — a ``PolychromaticBeam`` carrying only the incident direction
-  (from ``beam/ki_vec``), since subhkl is Laue; the true per-reflection
-  wavelength lives in the reflection table's ``wavelength`` column. On dxtbx
-  builds without ``PolychromaticBeam`` the export falls back to a monochromatic
-  beam at the mean wavelength. Neutron probe is set when supported.
+- **Beam** — by default a monochromatic beam along the incident direction (from
+  ``beam/ki_vec``) at a nominal peak wavelength, so the experiment opens directly
+  in the standard DIALS suite (which assumes a fixed ``s0``). subhkl is Laue, so
+  the true per-reflection wavelength always lives in the reflection table's
+  ``wavelength`` column, independent of this nominal beam wavelength — exactly as
+  laue-dials does. Pass ``--dials-polychromatic`` to export a ``PolychromaticBeam``
+  instead (the most faithful model, but not openable by monochromatic DIALS
+  tools). The neutron probe is set when the dxtbx build supports it.
 - **Detector** — one dxtbx ``Panel`` per subhkl bank. Geometry comes from
   ``beamlines.json``, but a refined ``detector_calibration`` group in the file
   (written by ``indexer --refine-detector``) overrides the nominal metrology per
@@ -47,7 +62,15 @@ reproduces subhkl's physics, ``s1 = s0 + S · U · B · h``.
   panels arranged around the sample (e.g. CG4D, MANDI) map exactly, one dxtbx
   ``Panel`` per bank. dxtbx panels are planar, so if a config uses subhkl's
   cylindrical ``curved`` panel type it is approximated by its tangent plane;
-  peak identity is preserved through the stored pixel coordinates.
+  peak identity is preserved through the stored pixel coordinates. Each panel's
+  two pixel dimensions are quantised to 1 pm so a genuinely square, uniform
+  detector serialises as bit-exactly square — ``dials.image_viewer`` (via
+  ``rstbx``) asserts exact equality and would otherwise reject the float noise in
+  subhkl's metrology. Each panel also carries a flat 2D projection (a bank-id grid
+  montage, as the ESS/ISIS neutron formats do) so a detector that wraps around the
+  sample is drawn perpendicular in the image viewer rather than as tilted,
+  foreshortened tiles. Both are display-only; the 3D geometry used for the physics
+  is untouched.
 - **Crystal** — built from ``sample/U`` and ``sample/B``. subhkl's ``B`` uses
   the crystallographic Busing-Levy convention (no ``2π``), so ``A = U · B``
   maps directly onto the dxtbx setting matrix. The space group comes from
