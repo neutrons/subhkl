@@ -1,4 +1,3 @@
-# src/subhkl/io/command_line_parser.py
 from typing import Annotated
 from typing import Optional
 
@@ -445,6 +444,27 @@ def metrics(
             "--d-min", help="Optional minimum d-spacing filter for metrics calculation."
         ),
     ] = None,
+    per_hkl: Annotated[
+        bool | None,
+        typer.Option(
+            "--per_hkl", help="Creat table metrics/per_hkl."
+        ),
+    ] = None,
+    plot: Annotated[
+        bool,
+        typer.Option(
+            "--plot",
+            help="Generate a PNG plot from metrics/per_hkl.",
+        ),
+    ] = False,
+
+    metric: Annotated[
+        str,
+        typer.Option(
+            "--metric",
+            help="Metric to plot (median_ang_err, mean_ang_err, max_ang_err, ...)",
+        ),
+    ] = "median_ang_err", 
     per_run: Annotated[
         bool,
         typer.Option(
@@ -470,6 +490,9 @@ def metrics(
         instrument=instrument,
         d_min=d_min,
         per_run=per_run,
+        per_hkl=per_hkl,
+        plot=plot,
+        metric=metric,
         ki_vec=ki_vec_parsed,
     )
 
