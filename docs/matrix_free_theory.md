@@ -627,6 +627,70 @@ repeated runs of the real test supports a claim about it -- which is the same
 argument the downsampling series in the test suite makes for preferring
 scale-relative assertions over absolute tolerances.
 
+## 7c. Debiasing an L1 solution can be worse than not debiasing it
+
+The most consequential bug found on this branch, and the one with the widest
+applicability outside this codebase, since "L1 to select, then refit on the
+support to remove shrinkage bias" is a standard recipe.
+
+**The observation.** On two overlapping broad peaks the L1 phase fitted the data
+well -- rms residual 3.3, against 5.6 for the background alone -- and the
+debiasing phase then destroyed it:
+
+| stage | rms residual | max coefficient | likelihood |
+|---|---|---|---|
+| after L1 | 3.3 | 27 | -353160 |
+| debias it 0 | 20.4 | 43 | -327807 |
+| debias it 5 | 56.5 | 100 | -246530 |
+| debias final | 60.1 | 214 | -239144 |
+
+The likelihood gets *worse* at every iteration. The reported model over-predicted
+the data by a factor of eight at the true peak centres.
+
+**Why.** Debiasing solves the unpenalised Newton system restricted to the active
+set. Dropping the L1 term is the whole point of the step, but that term is also
+the only thing holding the near-null-space directions of the active set in check.
+The support here had 256 active coefficients drawn from heavily overlapping broad
+channels, so `A^T W A` restricted to it is close to singular; CG hits its
+iteration cap and returns a direction it has not solved for; and the Newton step
+was then applied with no test that it improved anything.
+
+**A cautionary note about which matrix to look at.** The natural diagnostic --
+the conditioning of the peaks the finder reports -- is entirely misleading here.
+For this case:
+
+| Gram matrix of | condition number |
+|---|---|
+| the two *true* atoms, at 2.67 sigma separation | 1.40 |
+| the five atoms finally *reported* | 1.5 |
+| the 256 active coefficients *inside* the debias solve | near-singular |
+
+Both of the first two look perfectly healthy, and on that basis the case was
+initially, and wrongly, written off as "not a conditioning problem". It is a
+conditioning problem; the ill-conditioned object is an intermediate that never
+appears in the output. The lesson generalises: when a pipeline reports a small,
+well-separated set of parameters, the conditioning that matters is that of
+whatever intermediate representation the solver actually inverted.
+
+**The fix, and why it is the right shape.** Backtrack on the likelihood and
+refuse the step outright if no decrease is found, exactly as the L1 line search
+already did. Debiasing then has the property it should always have had: it can
+only improve on the solution it starts from, and in the worst case it is the
+identity. This is strictly better than tuning the damping factor, because it is
+correct for every support rather than for the ones that were tested.
+
+Measured after the fix: internal model rms 92.5 -> 3.4, model rebuilt from the
+reported peaks 23.8 -> 3.6, against 5.6 for the background alone.
+
+**A diagnostic worth wiring in.** The failure was silent -- the finder returned a
+plausible-looking peak list. The cheap check that catches it is goodness of fit
+at the scale of a peak rather than of the image: the global `Deviance/DoF` the
+code already computes read 1.21 for the pathological case against 1.12 for a
+healthy control, because it averages over 10^4 mostly empty pixels, while the
+same statistic evaluated over a peak's own footprint read 26.9 against 1.04. Any
+stage that fits a model should be asked whether its model beats doing nothing,
+and here that question was never put.
+
 ## 8. Status
 
 | claim | kind | evidence |
