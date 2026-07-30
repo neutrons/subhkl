@@ -7,6 +7,8 @@ import numpy as np
 from tqdm import tqdm
 from functools import partial
 
+from subhkl.search import peak_model
+
 
 class MatrixFreeSparseRBFPeakFinder:
     """
@@ -73,20 +75,8 @@ class MatrixFreeSparseRBFPeakFinder:
         self.K_sq = self.K_weights ** 2
 
     def _build_kernel_bank(self):
-        k_grid = jnp.arange(-self.max_k_rad, self.max_k_rad + 1)
-        yy, xx = jnp.meshgrid(k_grid, k_grid, indexing='ij')
+        return peak_model.kernel_bank(self.sigmas, self.max_k_rad)
 
-        def build_one(s):
-            sig_sq2 = s * jnp.sqrt(2.0) + 1e-6
-            erf_y = jax.scipy.special.erf((yy + 0.5) / sig_sq2) - jax.scipy.special.erf((yy - 0.5) / sig_sq2)
-            erf_x = jax.scipy.special.erf((xx + 0.5) / sig_sq2) - jax.scipy.special.erf((xx - 0.5) / sig_sq2)
-            k_2d = (jnp.pi / 2.0) * (s**2) * erf_y * erf_x
-            return k_2d
-
-        kernels_2d = vmap(build_one)(self.sigmas)
-        sq_norms = jnp.sum(kernels_2d**2, axis=(1, 2))
-        return kernels_2d[:, None, :, :], sq_norms
-        
     @staticmethod
     def _forward_op(c, weights):
         weights_fwd = weights.transpose(1, 0, 2, 3) 
@@ -353,10 +343,9 @@ class MatrixFreeSparseRBFPeakFinder:
         # neighbouring peaks a few pixels apart into one maximum.  Cap it at the
         # finest scale in the bank.
         smooth_sigma = min(1.0, float(self.min_sigma))
-        sig_sq2 = smooth_sigma * jnp.sqrt(2.0) + 1e-6
         k_half = max(1, round(2.0 * smooth_sigma))
         k_grid = jnp.arange(-k_half, k_half + 1)
-        k_1d = jax.scipy.special.erf((k_grid + 0.5) / sig_sq2) - jax.scipy.special.erf((k_grid - 0.5) / sig_sq2)
+        k_1d = peak_model.pixel_integrated_gaussian_1d(k_grid, 0.0, smooth_sigma)
         
         c_smooth_temp = jax.scipy.signal.correlate2d(c_tot, k_1d[:, None], mode="same")
         c_smooth = jax.scipy.signal.correlate2d(c_smooth_temp, k_1d[None, :], mode="same")
@@ -448,63 +437,26 @@ class MatrixFreeSparseRBFPeakFinder:
         and this stays affordable on full detector images.
         """
         H, W = y_img.shape
-        P = 2 * self.max_k_rad + 1
-        off = jnp.arange(P, dtype=jnp.float32)
         mask = active.astype(jnp.float32)
+        lo, hi = float(self.min_sigma), float(self.max_sigma)
 
         # Unconstrained parameterisation keeps amplitude positive and sigma
         # inside the bank's range without needing a projection each step.
-        lo, hi = float(self.min_sigma), float(self.max_sigma)
-        sig0 = jnp.clip(peaks[:, 3], lo + 1e-3, hi - 1e-3)
-        u_init = jnp.stack(
-            [
-                jnp.log(jnp.maximum(peaks[:, 0], 1e-3)),
-                peaks[:, 1],
-                peaks[:, 2],
-                jnp.log((sig0 - lo) / jnp.maximum(hi - sig0, 1e-6)),
-            ],
-            axis=1,
+        log_amp, logit_sig = peak_model.to_unconstrained(
+            peaks[:, 0], peaks[:, 3], lo, hi
         )
+        u_init = jnp.stack([log_amp, peaks[:, 1], peaks[:, 2], logit_sig], axis=1)
 
         def physical(u):
-            amp = jnp.exp(u[:, 0])
-            sig = lo + (hi - lo) * jax.nn.sigmoid(u[:, 3])
+            amp, sig = peak_model.to_physical(u[:, 0], u[:, 3], lo, hi)
             return amp, u[:, 1], u[:, 2], sig
 
-        def render(u):
-            amp, r, c, sig = physical(u)
-            s2 = sig * jnp.sqrt(2.0) + 1e-6
-            r0 = jnp.clip(
-                jnp.round(r).astype(jnp.int32) - self.max_k_rad, 0, H - P
-            )
-            c0 = jnp.clip(
-                jnp.round(c).astype(jnp.int32) - self.max_k_rad, 0, W - P
-            )
-            rr = r0[:, None].astype(jnp.float32) + off[None, :]
-            cc = c0[:, None].astype(jnp.float32) + off[None, :]
-
-            def erf_span(grid, centre):
-                d = grid - centre[:, None]
-                return jax.scipy.special.erf(
-                    (d + 0.5) / s2[:, None]
-                ) - jax.scipy.special.erf((d - 0.5) / s2[:, None])
-
-            ey = erf_span(rr, r)
-            ex = erf_span(cc, c)
-            amp_s = amp * (jnp.pi / 2.0) * (sig**2) * mask
-            patch = amp_s[:, None, None] * ey[:, :, None] * ex[:, None, :]
-
-            idx_r = jnp.broadcast_to(
-                (r0[:, None] + jnp.arange(P))[:, :, None], (peaks.shape[0], P, P)
-            )
-            idx_c = jnp.broadcast_to(
-                (c0[:, None] + jnp.arange(P))[:, None, :], (peaks.shape[0], P, P)
-            )
-            return jnp.zeros((H, W)).at[idx_r, idx_c].add(patch)
-
         def nll(u):
-            model = jnp.maximum(render(u) + bg_img, 1e-6)
-            return jnp.sum(model - y_img * jnp.log(model))
+            amp, r, c, sig = physical(u)
+            model = peak_model.render_patches(
+                (H, W), amp, r, c, sig, self.max_k_rad, active=mask
+            )
+            return peak_model.poisson_nll(model + bg_img, y_img)
 
         grad_fn = jax.value_and_grad(nll)
 
@@ -601,10 +553,10 @@ class MatrixFreeSparseRBFPeakFinder:
     def _predict_batch_scan(self, peaks, x_grid):
         def render_peak(p):
             total_I, r, c, sigma = p[0], p[1], p[2], p[3]
-            sig_sq2 = sigma * jnp.sqrt(2.0) + 1e-6
-            erf_y = jax.scipy.special.erf((x_grid[0] - r + 0.5) / sig_sq2) - jax.scipy.special.erf((x_grid[0] - r - 0.5) / sig_sq2)
-            erf_x = jax.scipy.special.erf((x_grid[1] - c + 0.5) / sig_sq2) - jax.scipy.special.erf((x_grid[1] - c - 0.5) / sig_sq2)
-            return total_I * (jnp.pi / 2.0) * (sigma**2) * erf_y * erf_x * (total_I > 0)
+            rendered = peak_model.render_peak(
+                x_grid[0], x_grid[1], total_I, r, c, sigma
+            )
+            return rendered * (total_I > 0)
 
         def render_image(peaks_img):
             return jnp.sum(vmap(render_peak)(peaks_img), axis=0)
