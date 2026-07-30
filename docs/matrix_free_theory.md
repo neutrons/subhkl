@@ -552,6 +552,81 @@ The practical consequence is that `gamma` should be calibrated like `lambda` --
 against ground truth, over the merge/split error pair -- rather than defaulted.
 And the calibration is only meaningful away from `beta = 0`.
 
+## 7b. A worked case: what `test_poisson_local_variance_suppression` actually measures
+
+This one is included because it shows the theory being used as a predictor, and
+because the prediction turned out to be wrong in an informative way.
+
+The test injects two identical weak peaks (`amp 60`, `sigma 1.5`): peak A on a
+flat background of 10, peak B at the centre of a bright halo,
+`500 exp(-r^2 / 2 . 15^2)`, so the local variance at B is ~50x that at A. With
+`alpha = 8` it asserts that A is found and B is suppressed. It fails
+intermittently, which invited the guess that it is simply a marginal test
+dominated by the scatter of #13.
+
+**The statistic says otherwise.** Computing the quantity the selection rule
+actually thresholds -- `z = A^T W (y - b) / sqrt(H_diag)` from section 1 -- at
+B's location, against the effective threshold `alpha_eff` of (10):
+
+| sigma | 1.0 | 2.0 | 3.0 | 4.0 | 5.0 |
+|---|---|---|---|---|---|
+| `alpha_eff` | 8.00 | 11.31 | 13.86 | 16.00 | 17.89 |
+| `z` at B | 26.5 | 44.2 | 59.6 | 73.7 | 86.3 |
+| margin | +18.5 | +32.9 | +45.8 | +57.7 | +68.4 |
+
+`z` is standardised, so its own sampling standard deviation is 1. A margin of
++68 is not marginal by any reading, and it *grows* with `sigma` -- which is the
+tell, because a `sigma = 1.5` peak should be best matched near `sigma = 1.5`,
+not at the top of the bank.
+
+**What is being detected is the background, not the peak.** The morphological
+background estimator reads 404.8 at the halo centre where the truth is 510, a
+21% shortfall, leaving a broad positive residual of ~105 counts -- larger than
+the 60-count peak the test is asking about. Probing the real test directly:
+
+```
+rep 1 (FAIL)  dB=1.23  amp=65.8  sigma=4.99      dA=0.12  amp=58.2  sigma=1.43
+rep 2 (PASS)  dB=2.78  amp=67.4  sigma=5.00      dA=0.12  amp=58.2  sigma=1.43
+rep 3 (FAIL)  dB=1.23  amp=65.8  sigma=4.99      dA=0.12  amp=58.2  sigma=1.43
+```
+
+Peak A comes back identically every run at the right amplitude and width. Near
+B there is never an atom of width anywhere near 1.5: every one is pinned at
+`max_sigma`. **Peak B is never detected as a peak.** The variance model is doing
+exactly what the test intends; what the test catches is a halo-residual atom
+whose position wanders between 1.2 and 2.8 px across runs, straddling the
+assertion's 2.0 px radius. The assertion counts any atom regardless of width, so
+it reports the background artefact as "incorrectly found the weak peak".
+
+**Two conclusions, one of them reusable.**
+
+*The assertion is mis-specified.* It tests "any atom within 2 px" where it means
+"any *peak-like* atom within 2 px". Adding a width condition -- no atom within
+2 px whose sigma lies in the peak range -- tests the stated intent and is immune
+to where the halo atom lands. The test should be repaired rather than retired:
+it found something real.
+
+*Sigma pinned at the bank boundary is a diagnostic of unmodelled background.*
+A genuine peak's width is set by the point-spread function and should fall
+strictly inside `[sigma_min, sigma_max]`; an atom that runs to the boundary is
+the solver reporting that it needs a wider basis than exists, which is what
+smooth unmodelled structure looks like. Rejecting or flagging atoms with
+`sigma >= 0.98 sigma_max` is a cheap, physically motivated filter, and on real
+Laue data the structures that trigger it -- thermal diffuse scattering, powder
+rings, halos around strong reflections -- are exactly the ones that should not be
+reported as Bragg peaks.
+
+**Methodological note.** Three separate claims about this test were made from
+single observations before the above was measured: that it was not scale
+related, that `gamma = 0.5` fixed it, and that it was scatter dominated. All
+three were wrong, and two of them came from reconstructing the test scenario by
+hand rather than instrumenting the test itself. The reconstruction passed
+deterministically while the test it was standing in for failed two runs in
+three. For a test whose outcome sits near a threshold, nothing short of
+repeated runs of the real test supports a claim about it -- which is the same
+argument the downsampling series in the test suite makes for preferring
+scale-relative assertions over absolute tolerances.
+
 ## 8. Status
 
 | claim | kind | evidence |
