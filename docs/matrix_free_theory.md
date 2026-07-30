@@ -345,6 +345,126 @@ assert abs(jnp.sum(w*op(v)) - jnp.sum(op(w)*v)) < 1e-3 * abs(jnp.sum(w*op(v)))
 
 ---
 
+## 6. Corollary for design: a delta basis makes the deconvolution non-blind
+
+Theorem 1 has a reading that is more useful than "avoid gamma=1".
+
+**The scale degeneracy is blind-deconvolution non-identifiability.** For a fixed
+scale the two formulations are the *same model*:
+
+    A mu = sum_j a_j phi_sigma(. - x_j) = phi_sigma * ( sum_j a_j delta_{x_j} )   (11)
+
+An RBF dictionary with atoms of width `sigma` is a delta basis whose kernel is
+`phi_sigma`. The only difference is *where sigma lives*: a coordinate of the
+parameter space that the solver optimises over, or a fixed, known operator. The
+first is blind deconvolution, and Theorem 1 is precisely its non-identifiability
+-- the ambiguity group being the Gaussian semigroup, `h -> h * g`,
+`mu -> mu deconvolved by g`, which preserves both the data and the mass. The
+second is ordinary deconvolution, where the theory is complete.
+
+So the fix demanded by Corollary 1 is not really a choice of `beta`. It is to
+stop searching over scale and supply the kernel.
+
+**Identifiability is recovered by sharing one kernel across many peaks.** A
+single peak cannot separate its own width from the kernel's. `M` well-separated
+point sources sharing one kernel can: the unknowns drop from `M` widths to one
+kernel while the constraints grow with `M`, which is the standard multichannel /
+sparse blind-deconvolution identifiability setting. The residual ambiguity --
+how much of the observed width is instrument and how much is sample -- is the
+physically real one, and is broken the way it always has been, with a standard
+crystal.
+
+**What the kernel is, physically.** It is the image a single Bragg reflection
+would make, and it factorises into a part that is a property of the instrument
+and a part that is the measurement:
+
+*Instrument (fixed, calibratable, belongs in the kernel for peak finding)*
+
+- pixel aperture -- the integration over a finite pixel, already modelled here by
+  the `erf(x+1/2) - erf(x-1/2)` pixel integral;
+- intrinsic detector response -- light spread in the scintillator and
+  position-encoding error for Anger-type area detectors;
+- parallax / depth of interaction -- neutrons converting at depth in the
+  detector, which displaces and elongates the spot radially, growing with
+  incidence angle, so this term is anisotropic *and* position dependent;
+- beam divergence and moderator extent, projected onto the detector.
+
+*Sample (unknown, per reflection, belongs in integration)*
+
+- mosaic spread, which broadens perpendicular to the scattering vector;
+- strain / `delta d over d`, which broadens along it;
+- crystallite size.
+
+The two sample terms broaden along *different* reciprocal-space directions,
+which is why the peak shape is an ellipse whose orientation and eccentricity vary
+with `(h,k,l)`, wavelength and goniometer setting -- and why an anisotropic
+learned profile is the right object at integration time and the wrong one at
+detection time.
+
+**A kernel that is too narrow re-creates the problem.** If the kernel carries
+only the instrument terms while the crystal is mosaic, the model under-fits and
+the residual is absorbed by extra atoms. Measured on the two-peak image, holding
+everything else fixed:
+
+| kernel | unknowns | lambda_max | peaks reported |
+|---|---|---|---|
+| RBF bank, sigma searched (K=5) | 40500 | 686.4 | 6 |
+| fixed, sigma = 4 (true width) | 7056 | 192.7 | **2** |
+| fixed, sigma = 1 (too narrow) | 4356 | 0.8 | 5 |
+
+The correctly-sized fixed kernel returns exactly the two peaks present. So the
+kernel should be the instrument response convolved with a *nominal, globally
+shared* sample broadening, refined against many reflections at once -- not left
+free per atom.
+
+**Computational consequences.** Removing the scale coordinate is a strict
+simplification:
+
+- *Unknowns fall by the number of scales*: 40500 to 7056 here, a factor 5.7.
+- *The step size grows*: `lambda_max` falls 686 to 193, so the admissible
+  prox-gradient step is 3.6x larger and fewer iterations are needed.
+- *The worst coherence disappears.* In a scale-space dictionary the most
+  coherent pairs are atoms of different width at the same location -- by Lemma 1
+  they are related exactly, so coherence approaches 1. With one scale, what
+  remains is the kernel's autocorrelation, decaying with separation: the
+  classical, well-understood regime where dual-certificate arguments apply.
+- *The prox is unchanged* -- elementwise soft-threshold with a nonnegativity
+  clamp -- on a smaller array.
+- *FFT becomes available, and this is the important one.* A single fixed kernel
+  makes `A` and its adjoint one convolution each, so an FFT implementation costs
+  `O(N log N)` against `O(N P^2)` for direct patch convolution:
+
+  | image | kernel P | direct | FFT | ratio |
+  |---|---|---|---|---|
+  | 256^2 | 31 | 6.3e7 | 5.2e6 | 12x |
+  | 1024^2 | 31 | 1.0e9 | 1.0e8 | 10x |
+  | 2048^2 | 61 | 1.6e10 | 4.6e8 | 34x |
+  | 4096^2 | 61 | 6.2e10 | 2.0e9 | 31x |
+
+  More important than the speed: an FFT operator costs the same for an
+  arbitrary *measured, anisotropic, non-separable* kernel as for a Gaussian. The
+  present implementation is cheap only because the Gaussian is separable and the
+  bank is analytic. The delta formulation is therefore what makes using the real
+  instrument PSF affordable.
+- *Position dependence breaks pure convolution.* Parallax makes the kernel vary
+  across the detector, so `A` is not a convolution globally. The standard remedy
+  is block-wise convolution with a locally constant kernel, or interpolation
+  between a small set of measured kernels, at `O(n_blocks)` FFTs.
+- *The significance threshold simplifies*: one scale means one resolution-element
+  count and one floor in (10), with no cross-scale calibration.
+- *The sliding step matters more, not less.* Deltas on a grid are exactly the
+  classical off-the-grid problem, and the delta form makes a sliding
+  Frank-Wolfe natural: the atom-selection step is a single correlation of the
+  kernel with the residual followed by a continuous argmax.
+
+**And why integration should keep the free anisotropic profile.** The
+degeneracy of Theorem 1 requires unknown positions *and* unknown scale
+simultaneously. Integration has neither problem: positions come from the
+lattice, so no model selection is being performed, and with the instrument
+kernel fixed the sample broadening is identified by the data. A rich
+anisotropic profile is therefore well posed exactly where it is wanted, and
+ill posed exactly where it is not.
+
 ## 6. Status
 
 | claim | kind | evidence |
