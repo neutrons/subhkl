@@ -691,6 +691,59 @@ same statistic evaluated over a peak's own footprint read 26.9 against 1.04. Any
 stage that fits a model should be asked whether its model beats doing nothing,
 and here that question was never put.
 
+## 7d. Debiasing amplifies model misspecification, in proportion to sparsity
+
+Section 7c showed debiasing diverging outright.  This is the subtler failure,
+and it explains a flakiness that looked backwards: two tests were *less* stable
+at a stricter threshold, when a stricter threshold should admit fewer false
+positives.
+
+**The measurement.** A weak peak sits at the centre of a bright halo that the
+background estimator under-fits by about 105 counts.  Varying only the
+threshold and whether debiasing runs:
+
+| alpha | L1 support (nnz) | debias off | debias on |
+|---|---|---|---|
+| 8.0 | 51 | 2 peaks, none near the halo centre | 5 peaks, one at 0.9 px, sigma 3.6, **amp 91** |
+| derived (alpha*) | 8177 | 4 peaks, none near the halo centre | 4 peaks, none near the halo centre |
+
+Turning debiasing off at `alpha = 8` makes the test pass 8 runs out of 8, where
+with it on the test passes 5 out of 8.  At the derived threshold it passes 16
+out of 16 either way.  Debiasing *creates* the spurious detection, and only when
+the support is sparse.
+
+**The mechanism.** Debiasing refits the selected support with the penalty
+removed, which is the point: the L1 term biases amplitudes low and dropping it
+recovers them.  But the penalty was also suppressing whatever the model cannot
+explain.  When the background is misspecified -- here, 105 counts of halo that
+the estimator missed -- the unpenalised refit will use the atoms it has to
+absorb that residual, because doing so genuinely raises the likelihood.  The
+spurious atom's amplitude, 91, is essentially the size of the background
+shortfall it is standing in for.
+
+Sparsity sets how concentrated that absorption is.  With 51 active coefficients
+there are few places for the residual to go, so one atom grows large enough to
+be reported as a peak.  With 8177 the same residual is spread thinly and no
+single coefficient becomes a detection.  A stricter threshold produces a sparser
+support, which is why raising `alpha` made things worse rather than better --
+the effect that looked backwards.
+
+**Consequences.**
+
+- Debiasing is safe when the model is well specified and actively harmful when
+  it is not.  That is exactly the split observed: the one test that *needs*
+  debiasing is an isolated peak on a flat background, where the only bias is L1
+  shrinkage, and the tests it *breaks* are peaks on a poorly-modelled halo.
+- "Sparser is safer" is false for this step.  Sparsity is protective during
+  selection and hazardous during debiasing, because it concentrates whatever the
+  model got wrong onto fewer parameters.
+- The right gate is not a threshold but an adequacy check: debias only where the
+  local fit is already good, which is the per-peak goodness-of-fit statistic of
+  section 7b that the codebase computes globally and never checks. An atom
+  absorbing a background shortfall should be visible to it.
+- Fixing the background estimator removes the cause rather than the symptom, and
+  would make the choice of `alpha` far less consequential.
+
 ## 8. Status
 
 | claim | kind | evidence |
