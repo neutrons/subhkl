@@ -465,7 +465,94 @@ kernel fixed the sample broadening is identified by the data. A rich
 anisotropic profile is therefore well posed exactly where it is wanted, and
 ill posed exactly where it is not.
 
-## 6. Status
+## 7. Can beta = 0 be rescued by an anchoring effect?
+
+The background floor `b > 0` rescued the step size (Theorem 2), so it is natural
+to ask whether some comparable effect anchors `sigma` and makes continuous-scale
+basis pursuit well posed *at* the Radon point, with no weight at all. The answer
+is no, and the reason is worth stating because it says what any rescue must
+supply.
+
+**No statistical anchor can exist.** Theorem 1 gives `A mu_1 = A mu_2` exactly.
+The two models therefore induce the *identical* distribution of the data, for
+Poisson, Gaussian or anything else -- the likelihood is a function of the mean
+alone. No statistic distinguishes them, the Fisher information is singular along
+the degenerate direction, and no quantity of data helps. This is a different
+situation from Theorem 2: there the floor constrained the *operator's* curvature,
+whereas here the ambiguity lies in the null space of the forward map itself.
+There is nothing for data to see.
+
+**Discretisation is not an anchor either.** The semigroup identity is exact only
+in the continuum, so one might hope the pixel grid breaks it. Sampling the spread
+kernel at spacing `Delta` aliases by roughly `exp(-2 pi^2 sigma''^2 / Delta^2)`:
+
+| `sigma''` (px) | 0.25 | 0.50 | 1.0 | 2.0 | 3.52 |
+|---|---|---|---|---|---|
+| aliasing | 0.29 | 7.2e-3 | 2.7e-9 | 5.1e-35 | 6.1e-107 |
+
+The counterexample uses `sigma'' = 3.52 px`. The grid buys nothing except for
+spreads well inside a pixel, which is the regime where the two representations
+coincide anyway.
+
+**What a rescue must supply is cardinality information, and at beta = 0 the
+penalty has none.** Total variation is the convex relaxation of "little mass",
+not of "few atoms". Those coincide only when one atom costs a fixed amount --
+that is, when the atoms are normalised. Under mass normalisation every atom costs
+exactly its mass, so splitting one atom into many is free by construction, and
+Proposition 1 then hands the decision to the fidelity, which always prefers more.
+Requiring the measure to be atomic does not help: the spread can be discretised
+into many Diracs of the same total mass, which ties on penalty and wins on fit.
+Only an explicit bound on the number of atoms, or a normalisation that charges
+per atom, injects the missing information.
+
+**The weight is not the patch -- it is the normalisation, and `gamma = 1` is
+already a weight.** Writing the penalty in terms of `L2`-normalised atoms
+`psi_sigma = phi_sigma / ||phi_sigma||_2` -- the canonical choice for an atomic
+norm, and the one under which coefficients are directly comparable in
+matched-filter SNR, which is the same convention the threshold in section 4
+already assumes -- gives penalty per unit mass proportional to `1/sigma`, i.e.
+**`gamma = 0`**. So plain, unweighted `l1` on `L2`-normalised atoms is `gamma = 0`;
+`gamma = 1` is that penalty multiplied by `sigma`, an up-weighting of broad atoms
+that lands exactly on the degenerate point. The default is not the absence of a
+weight, it is a specific weight chosen to cancel the only cardinality information
+the norm had.
+
+Under `gamma = 0` the counterexample is no longer tied: the spread costs
+`sigma/sigma'` times more, which for the pair in section 1 is 2.385, and 7.75
+against the finest channel.
+
+**But `gamma = 0` over-merges, so the exponent is a real hyperparameter, not a
+patch.** Corollary 1 says every `beta < 0` prefers merging, and the preference
+can be too strong. Measured on three cases -- A: broad `sigma=4` and narrow
+`sigma=1` peaks 5.6 px apart, both of which must be found; B: two `sigma=6` peaks
+16 px apart, both to be isolated with no atom at the composite centre; C: a weak
+`sigma=2` peak in the tail of a strong `sigma=4` peak 8 px away:
+
+| gamma | A (both found, sigma_broad, n) | B (both, ghosts, n) | C (both, n) |
+|---|---|---|---|
+| 0.00 | Y/Y  3.88  n=2 | Y/**N**  1 ghost  n=3 | Y/**N**  n=8 |
+| 0.25 | Y/Y  3.88  n=2 | Y/Y  0  n=2 | Y/**N**  n=2 |
+| **0.50** | **Y/Y  3.47  n=3** | **Y/Y  0  n=2** | **Y/Y  n=4** |
+| 0.75 | Y/Y  3.88  n=6 | **N**/Y  0  n=3 | **N**/Y  n=6 |
+| 1.00 | **N**/Y  2.75  n=13 | Y/Y  **5 ghosts**  n=36 | **N**/Y  n=13 |
+
+`gamma = 0` loses the second peak in B and the weak peak in C: the merging
+preference is strong enough to absorb a real neighbour. `gamma = 1` fails all
+three in the splitting direction. Only `gamma = 0.5` passes all three here.
+
+So the picture is not "gamma = 1 is a bug and gamma = 0 is the fix". It is that
+`beta` trades a merging error against a splitting error, exactly as a
+regularisation strength trades bias against variance, and `beta = 0` is the
+single point at which *there is no trade-off to make* because the penalty carries
+no information about model order. That is what makes it an ideal limit rather
+than a bad setting: it is not one end of a usable range, it is the point where
+the range degenerates.
+
+The practical consequence is that `gamma` should be calibrated like `lambda` --
+against ground truth, over the merge/split error pair -- rather than defaulted.
+And the calibration is only meaningful away from `beta = 0`.
+
+## 8. Status
 
 | claim | kind | evidence |
 |---|---|---|
@@ -477,6 +564,10 @@ ill posed exactly where it is not.
 | Prop 2 — overshoot `= ‖φ‖₁²/‖φ‖₂² = 4πσ²` | believed new as stated | proof + 5-point table, slope 1.84 |
 | §4 — resel-corrected threshold | known, misapplied here | floors vs bare α |
 | §5 — preconditioner breaks CG symmetry | known, instructive failure modes | asymmetry table |
+| §6 — delta basis ⇒ non-blind deconvolution | reframing of Thm 1 | fixed-kernel table, FFT costs |
+| §7 — no statistical anchor exists at β=0 | follows from Thm 1 | likelihood identical by construction |
+| §7 — γ=1 *is* a weight; γ=0 is unweighted ℓ1 on L²-normalised atoms | believed not widely noted | normalisation algebra |
+| §7 — γ=0 over-merges; β is a genuine hyperparameter | measurement | three-case table, γ=0.5 optimum |
 
 The two candidates for an applied-mathematics write-up are Theorem 1 with
 Corollary 1 and Remark 1 — a clean statement that scale-space dictionaries are
