@@ -855,3 +855,186 @@ def test_integrator_large_sensor_halo_suppression():
     assert np.isclose(found_intensity, expected_intensity, rtol=0.15), (
         f"Halo Debias failed: {found_intensity} vs {expected_intensity}"
     )
+
+
+def test_poisson_local_variance_suppression():
+    """
+    Regression test for exact Poisson local variance.
+    Injects two identical weak peaks: one on a dark background (low variance)
+    and one on a bright halo (high variance).
+    The spatially varying 1/U_k variance map MUST suppress the peak on the bright halo
+    while preserving the peak on the dark background.
+    """
+    try:
+        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
+    except ImportError:
+        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+
+    import numpy as np
+    import scipy.special
+
+    H, W = 100, 100
+    np.random.seed(42)
+
+    y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+
+    # 1. Base flat background (Dark / Low Noise) -> expected variance ~ 10
+    bg_flat = 10.0
+    image = np.full((H, W), bg_flat, dtype=np.float32)
+
+    # 2. Add a massive, bright diffuse structure (Bright / High Noise) -> expected variance ~ 510
+    halo_r, halo_c = 50.0, 75.0
+    r2_halo = (x_coords - halo_c) ** 2 + (y_coords - halo_r) ** 2
+    image += 500.0 * np.exp(-r2_halo / (2 * 15**2))
+
+    def generate_erf_peak(y, x, r, c, sig, amp):
+        sig_sq2 = sig * np.sqrt(2.0) + 1e-6
+        erf_y = scipy.special.erf((y + 0.5 - r) / sig_sq2) - scipy.special.erf(
+            (y - 0.5 - r) / sig_sq2
+        )
+        erf_x = scipy.special.erf((x + 0.5 - c) / sig_sq2) - scipy.special.erf(
+            (x - 0.5 - c) / sig_sq2
+        )
+        return amp * (np.pi / 2.0) * (sig**2) * erf_y * erf_x
+
+    # 3. Inject two IDENTICAL weak peaks
+    peak_a_r, peak_a_c = 50.0, 25.0  # Peak A: On the dark background
+    peak_b_r, peak_b_c = 50.0, 75.0  # Peak B: Dead center on the bright halo
+
+    test_amp = 60.0
+    test_sig = 1.5
+
+    image += generate_erf_peak(
+        y_coords, x_coords, peak_a_r, peak_a_c, test_sig, test_amp
+    )
+    image += generate_erf_peak(
+        y_coords, x_coords, peak_b_r, peak_b_c, test_sig, test_amp
+    )
+
+    # Apply true Poisson noise
+    image = np.random.poisson(image).astype(np.float32)
+    image_batch = image[np.newaxis, ...]
+
+    # 4. Configure Finder
+    # Peak A Z-score ≈ Amp / sqrt(10) ≈ 60 / 3.16 ≈ 19.0
+    # Peak B Z-score ≈ Amp / sqrt(510) ≈ 60 / 22.5 ≈ 2.6
+    # Setting alpha=8.0 guarantees A easily survives and B is heavily suppressed.
+    finder = SparseRBFPeakFinder(
+        alpha=8.0,
+        gamma=1.0,
+        min_sigma=1.0,
+        max_sigma=5.0,
+        loss="poisson",
+        show_steps=False,
+    )
+
+    results = finder.find_peaks_batch(image_batch)
+    peaks = results[0]
+
+    found_a = False
+    found_b = False
+
+    for p in peaks:
+        # p = [intensity, r, c, sigma]
+        if np.sqrt((p[1] - peak_a_r) ** 2 + (p[2] - peak_a_c) ** 2) < 2.0:
+            found_a = True
+        if np.sqrt((p[1] - peak_b_r) ** 2 + (p[2] - peak_b_c) ** 2) < 2.0:
+            found_b = True
+
+    assert found_a, "Failed to find the weak peak in the low-variance (dark) region."
+    assert not found_b, (
+        "Incorrectly found the weak peak in the high-variance (bright) region! The local variance map did not suppress it."
+    )
+
+
+def test_poisson_subpatch_variance_suppression():
+    """
+    Regression test explicitly isolating pixel-level 1/U_k variance.
+    A bright 24x24 plateau is injected. It is large enough to survive
+    the 25x25 morphological median filter, but small enough that the
+    median of the 94x94 evaluation patch remains the dark background (10.0).
+
+    The old Gaussian model would assign a global patch noise floor of sqrt(10)
+    and falsely detect Peak B. The new Poisson model evaluates local variance
+    as sqrt(510) and correctly suppresses it.
+    """
+    try:
+        from subhkl.peakfinder.sparse_rbf import SparseRBFPeakFinder
+    except ImportError:
+        from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+
+    import numpy as np
+    import scipy.special
+
+    H, W = 128, 128
+    np.random.seed(42)
+
+    y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+
+    # 1. Base flat background (Dark / Low Noise) -> expected variance ~ 10
+    bg_flat = 10.0
+    image = np.full((H, W), bg_flat, dtype=np.float32)
+
+    # 2. Sub-Patch Plateau (Bright / High Noise) -> expected variance ~ 510
+    # Must be > 18x18 to survive a 25x25 median filter.
+    # Must be < 30x30 so it doesn't inflate the median of the 94x94 patch.
+    plateau_min, plateau_max = 52, 76  # 24x24 square
+    image[plateau_min:plateau_max, plateau_min:plateau_max] += 500.0
+
+    def generate_erf_peak(y, x, r, c, sig, amp):
+        sig_sq2 = sig * np.sqrt(2.0) + 1e-6
+        erf_y = scipy.special.erf((y + 0.5 - r) / sig_sq2) - scipy.special.erf(
+            (y - 0.5 - r) / sig_sq2
+        )
+        erf_x = scipy.special.erf((x + 0.5 - c) / sig_sq2) - scipy.special.erf(
+            (x - 0.5 - c) / sig_sq2
+        )
+        return amp * (np.pi / 2.0) * (sig**2) * erf_y * erf_x
+
+    # 3. Inject two IDENTICAL weak peaks
+    peak_a_r, peak_a_c = 25.0, 25.0  # Peak A: On the dark background
+    peak_b_r, peak_b_c = 64.0, 64.0  # Peak B: Dead center on the bright plateau
+
+    test_amp = 60.0
+    test_sig = 1.5
+
+    image += generate_erf_peak(
+        y_coords, x_coords, peak_a_r, peak_a_c, test_sig, test_amp
+    )
+    image += generate_erf_peak(
+        y_coords, x_coords, peak_b_r, peak_b_c, test_sig, test_amp
+    )
+
+    image = np.random.poisson(image).astype(np.float32)
+    image_batch = image[np.newaxis, ...]
+
+    # 4. Configure Finder
+    # Peak A Poisson Z-score ≈ 60 / sqrt(10) ≈ 19.0
+    # Peak B Poisson Z-score ≈ 60 / sqrt(510) ≈ 2.6
+    # (Old Gaussian Z-score for Peak B would be ≈ 60 / sqrt(patch_median=10) ≈ 19.0)
+    finder = SparseRBFPeakFinder(
+        alpha=8.0,
+        gamma=1.0,
+        min_sigma=1.0,
+        max_sigma=5.0,
+        loss="poisson",
+        show_steps=False,
+    )
+
+    results = finder.find_peaks_batch(image_batch)
+    peaks = results[0]
+
+    found_a = False
+    found_b = False
+
+    for p in peaks:
+        # p = [intensity, r, c, sigma]
+        if np.sqrt((p[1] - peak_a_r) ** 2 + (p[2] - peak_a_c) ** 2) < 2.0:
+            found_a = True
+        if np.sqrt((p[1] - peak_b_r) ** 2 + (p[2] - peak_b_c) ** 2) < 2.0:
+            found_b = True
+
+    assert found_a, "Failed to find the weak peak in the low-variance (dark) region."
+    assert not found_b, (
+        "Regression Failed: Incorrectly found the weak peak on the intense plateau. The exact 1/U_k map did not apply!"
+    )
