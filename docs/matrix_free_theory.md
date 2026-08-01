@@ -963,9 +963,39 @@ candidates that greedy selection has kept apart — the `cond = 1.1` row, where
 `N(A_S) = {0}`. Promoting the problem to a single global convex solve is what
 lets a scale-degenerate cluster become active, and Theorem 3 then applies.
 
----
+### 8.7 Control: the fallback iteration alone
 
-## 9. Status
+Everything above blames the Newton subproblem, not the splitting it is grafted
+onto. That attribution is testable, because the residual the solver already
+forms contains the canonical first-order method as a special case:
+
+    q − τ G(q) = c(q) − τ ∇D(c(q)),                                          (22)
+
+i.e. `dq = −τ G` *is* the forward–backward (prox-gradient) step from `c(q)`,
+and Theorem 2's `τ ≤ 1/L` puts it under the descent lemma unconditionally — a
+step the solver computes on its inactive rows at every iteration and never
+takes as a whole.
+
+The control replaces the CG/Newton direction with `dq = −τ G`, leaving the
+step size, prox, line search, and stopping test untouched, on the same
+6-frame synthetic case as Corollary 4 (float32, batch of 6 vs batch of 1):
+
+| | Newton direction (§8.4) | `dq = −τG` |
+|---|---|---|
+| line-search rejections | 12 / 12 solves terminate by rejection, `bt = 12` | **0 in 12 000 iterations**; every full step accepted at `bt = 0` |
+| exit | reads rejection as convergence, after 9–61 iterations | `max_iter = 1000`, still descending (`ΔJ ≈ −2.7` per step, `‖G‖ ≈ 140`) |
+| batch-6 vs batch-1 | order-unity coefficient differences | `‖Δc‖/‖c‖ ≤ 8 × 10⁻⁷` |
+
+Three attributions follow. The rejection pathology belongs entirely to the
+Newton direction — with the guaranteed step the line search never fires, so
+Corollary 4's budget arithmetic, not float32 cancellation, is the whole story.
+The batch-shape sensitivity was never a property of the optimisation problem:
+it was the stop-at-first-rejection rule amplifying reduction-order noise into
+the choice of stopping iterate, and it collapses to rounding error under a
+monotone iteration. And the first-order method, while sound, contracts like
+`1 − 1/cond` — after 1000 iterations it is far from the `‖Δq‖ ≤ 10⁻³` test —
+so Newton acceleration is still wanted; it just has to come from one of the
+formulations of §8.6 rather than from the inconsistent system of §8.3.
 
 | claim | kind | evidence |
 |---|---|---|
@@ -988,6 +1018,7 @@ lets a scale-degenerate cluster become active, and Theorem 3 then applies.
 | Cor 3 — well-posed estimator and solvable Newton step are exclusive | corollary | Thm 1 + Thm 3 |
 | Cor 4 — backtracking budget structurally insufficient | proof + measurement | needs 16.0 halvings, budget 12; 12/12 solves reject |
 | §8.5 — rank invariant under basis↔penalty reweighting | Sylvester's law | 84–85/108 across γ ∈ {0, 0.5, 1} |
+| §8.7 — failure is the Newton direction, not the splitting | control experiment | 0 rejections in 12 000 FB iterations vs 12/12; batch sensitivity `≤ 8e-7` |
 
 Theorem 3 with Corollary 3 is the sharpest statement here: on a scale-space
 dictionary, well-posedness of the estimator and solvability of the Newton
