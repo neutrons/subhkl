@@ -267,13 +267,39 @@ class MatrixFreeSparseRBFPeakFinder:
             # require symmetry.  Solve the active block, which is symmetric
             # positive definite on its own, then substitute.  One extra operator
             # application per iteration buys the exact Jacobian.
-            eta = 1.0 / jnp.maximum(self._adjoint_op(W_diag, self.K_sq), 1e-6)
+            # H is not dimensionless: A carries [counts]/[c] and W carries
+            # 1/[counts], so H = A^T W A carries [counts]/[c]^2 -- both the
+            # photon scale of the frame and the px^2 scale of the basis.  A bare
+            # additive constant is therefore not a regularisation strength but
+            # whatever fraction of diag(H) the data happens to make it.  Summed
+            # over the bank, K^2 runs 2.9 to 78.3, so diag(H) differs by 27x
+            # between the narrowest and broadest channel on the same frame, and
+            # since W = 1/u it moves four more orders of magnitude between a
+            # bright frame and a photon-starved one.  The old fixed 1e-4 was
+            # 6.4e-4 of the diagonal at 500 counts and 8.2e-7 at the 0.64-count
+            # mean of a real MANDI frame: the same line of code regularising
+            # 800x differently depending on the data, which is why this bites on
+            # real scans and not in the unit tests.
+            #
+            # Scale it by diag(H) instead, so eps is genuinely dimensionless.
+            # Jacobi already divides by diag(H), so a relative ridge becomes
+            # exactly eps in the preconditioned system and bounds its condition
+            # number at ~1/eps whatever the count rate -- where an absolute
+            # ridge became 1e-4 * eta and worked against the preconditioner.
+            # eps is set from that bound and the CG budget, not fitted: 1e-3
+            # gives a preconditioned condition number of ~1e3, whose sqrt is
+            # within the existing maxiter=20.
+            RIDGE_REL = 1e-3
+
+            H_diag_local = jnp.maximum(self._adjoint_op(W_diag, self.K_sq), 1e-6)
+            eta = 1.0 / H_diag_local
 
             def apply_active_block(v):
                 v_active = v * D_mat
                 Av = self._forward_op(v_active, self.K_weights)
                 At_W_Av = self._adjoint_op(W_diag * Av, self.K_weights)
-                return (At_W_Av + 1e-4 * v_active) * D_mat + (1.0 - D_mat) * v
+                ridge = RIDGE_REL * H_diag_local * v_active
+                return (At_W_Av + ridge) * D_mat + (1.0 - D_mat) * v
 
             def jacobi(v):
                 return eta * v * D_mat + (1.0 - D_mat) * v
