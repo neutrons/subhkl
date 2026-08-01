@@ -744,7 +744,228 @@ the effect that looked backwards.
 - Fixing the background estimator removes the cause rather than the symptom, and
   would make the choice of `alpha` far less consequential.
 
-## 8. Status
+## 8. The Newton subproblem is inconsistent exactly when the estimator is well posed
+
+§1 shows the *estimator* is degenerate at `β = 0` and well posed off it. The
+*solver* runs the other way, and the two cannot be satisfied simultaneously.
+This is what actually breaks `matrix_free`'s semismooth Newton iteration, and it
+is visible from first principles rather than from the numerics.
+
+### 8.1 Discrete setting
+
+Discretise over `K` scales and `n` pixels: `c ∈ R^{Kn}`, `c ≥ 0`, forward
+operator `A ∈ R^{n × Kn}` from (1), `u = Ac + b`. Write
+
+    J(c) = D(Ac + b) + ⟨λ, c⟩,     c ≥ 0,     λ_k > 0                       (12)
+
+for any fidelity `D` depending on `c` only through `Ac` (Poisson
+`Σ(u − y log u)` in the code), with `λ_k ∝ σ_k^β` per unit mass by (4). Let
+`S` be the active set, `A_S` the corresponding columns, and
+
+    H_S = A_Sᵀ W A_S,      W = diag(w) ≻ 0                                   (13)
+
+the Gauss–Newton (Fisher) Hessian the solver forms.
+
+**Lemma 2 (the Hessian's kernel is the operator's kernel).** For `W ≻ 0`,
+
+    N(H_S) = N(A_S).                                                         (14)
+
+*Proof.* `⟨v, H_S v⟩ = ‖A_S v‖²_W ≥ 0`, so `H_S ⪰ 0`; for a PSD matrix
+`H_S v = 0 ⟺ ⟨v, H_S v⟩ = 0 ⟺ A_S v = 0`. ∎
+
+Rank–nullity gives `dim N(A) ≥ (K − 1)n`, so with `K = 5` at least 80% of the
+coefficient space is null. What matters is whether an *active* set inherits it.
+Lemma 1 answers constructively, and locally.
+
+**Lemma 3 (null vectors are local, and live inside one cluster).** Fix `x`,
+`σ' < σ`, `σ'' = sqrt(σ² − σ'²)`, and take the mass-matched difference of
+Theorem 1,
+
+    v = δ_{(x,σ)} − φ_{σ''}(· − x) ⊗ δ_{σ'}.                                 (15)
+
+Then `A v = 0` by Lemma 1, and `supp v` lies within `O(σ'')` of `x`.
+
+Measured on the code's own kernels, `‖A v‖ / ‖A δ_{(x,σ)}‖ = 3.7 × 10⁻³`,
+nonzero only through kernel truncation at `max_k_rad` and the grid edge. So an
+active set containing a spatial cluster that spans two scales already contains a
+numerically exact null direction — no asymptotics, no boundary effect. That is
+precisely the configuration ℓ1 produces on a coherent dictionary, where adjacent
+atoms correlate at 0.97–0.99.
+
+### 8.2 The objective is affine along the kernel
+
+**Proposition 3.** Let `v ∈ N(A_S)` and let `I ∋ 0` be an interval on which
+`c + tv ≥ 0`. Then for `t ∈ I`
+
+    u(c + tv) = u(c),    hence    J(c + tv) = J(c) + t⟨λ, v⟩.                (16)
+
+In particular
+
+    (i)  ⟨v, ∇²J v⟩ = 0                    — no curvature along v;
+    (ii) ⟨∇_c D, v⟩ = 0  for every c       — no slope from the data either.
+
+*Proof.* `A(c + tv) = Ac`, so `u`, and therefore `D`, are unchanged; the penalty
+is linear in `c`. For (ii), `∇_c D = Aᵀ ∇_u D`, hence
+`⟨∇_c D, v⟩ = ⟨∇_u D, A v⟩ = 0`. ∎
+
+Part (ii) is the one to isolate: **the data cannot see `v` at any order.** Every
+directional derivative along a null direction comes from the penalty alone, and
+this holds for any fidelity of the form (12), not just Poisson.
+
+### 8.3 The trap
+
+**Theorem 3 (consistency of the Newton system ⟺ β = 0).** Let
+`g = ∇J|_S = ∇_c D + λ` and let `v` be as in (15) with mass `a`. Then
+
+    ⟨g, v⟩ = ⟨λ, v⟩ = a(σ^β − σ'^β)                                          (17)
+
+and, `H_S` being symmetric PSD with `range(H_S) = N(H_S)^⊥`,
+
+    H_S d = −g  is solvable  ⟺  g ⊥ N(A_S)  ⟺  β = 0.                        (18)
+
+*Proof.* The first equality of (17) is Proposition 3(ii); the second is
+Corollary 1 applied to (15). A symmetric PSD system `H d = −g` is consistent iff
+`g ⊥ N(H)`, and `N(H_S) = N(A_S)` by Lemma 2. Finally `σ^β = σ'^β` with
+`σ ≠ σ'` iff `β = 0`. ∎
+
+**Corollary 3 (mutually exclusive requirements).**
+
+| | `β = 0` | `β ≠ 0` |
+|---|---|---|
+| minimiser unique in `σ` | **no** (Thm 1) | yes (Cor 1) |
+| Newton system consistent | **yes** | **no** (Thm 3) |
+
+No `β` makes the estimator well posed *and* the Newton subproblem solvable. Off
+the Radon point the penalty gradient acquires a component in `N(A_S)` that no
+`H_S d` can reproduce. By Proposition 3(ii) this is independent of the fidelity,
+of the discretisation, and of any preconditioner: it is a property of `range A`.
+
+The measurement, with `β = γ − 1` and `v` from (15) — penalty of the single
+broad atom against its mass-matched narrow-scale spread:
+
+| `γ` | `β` | penalty(broad) | penalty(spread) | ratio | `⟨λ, v⟩` |
+|---|---|---|---|---|---|
+| 1.00 | 0 | 7.10109 | 6.85124 | 0.96481 | **+0.24986** |
+| 0.75 | −0.25 | 5.39566 | 6.85124 | 1.26977 | −1.45557 |
+| 0.50 | −0.50 | 4.09982 | 6.85124 | 1.67111 | −2.75142 |
+| 0.00 | −1.00 | 2.36703 | 6.85124 | 2.89444 | −4.48421 |
+
+`⟨λ, v⟩` vanishes at `β = 0` and grows monotonically in `|β|`, with the sign of
+Corollary 1. The residual `+0.25` rather than `0` at `γ = 1` is the `3.7 × 10⁻³`
+truncation error of Lemma 3 acting on penalties of size ≈ 7, not a failure of
+(17).
+
+### 8.4 What the ridge does, and why backtracking cannot recover
+
+Split `g = g_⊥ + g_0` with `g_0 = P_{N(A_S)} g`, nonzero exactly when `β ≠ 0`. A
+ridge `ε` restores solvability, and (14) makes its action explicit:
+
+    d_ε = −(H_S + εI)^{-1} g = −(H_S + εI)^{-1} g_⊥ − g_0/ε                  (19)
+
+    ‖d_ε‖ ≥ ‖g_0‖ / ε  →  ∞   as  ε → 0.                                     (20)
+
+The quadratic model `m(d) = ½⟨d, H_S d⟩ + ⟨g, d⟩` obeys
+`m(−t g_0) = −t‖g_0‖² → −∞`, so it is **unbounded below** and `ε` merely picks a
+point on the diverging ray. The ridge is not damping an ill-conditioned system;
+it is selecting, arbitrarily, among directions the data cannot constrain.
+
+This clarifies what scaling the ridge by `diag H` does and does not buy. `H`
+carries `[counts]/[c]²`, so a bare additive constant is not a regularisation
+strength but whatever fraction of `diag H` the data makes it — measured, the
+same constant was `6.4 × 10⁻⁴` of the diagonal at 500 counts and `8.2 × 10⁻⁷`
+at the 0.64-count mean of a real frame. Scaling by `diag H` makes `ε`
+dimensionless and its meaning count-rate independent. It does not remove the
+failure: by (19) a dimensionally correct `ε` still selects an arbitrary
+null-space point, merely a scale-covariant one rather than a scale-dependent
+one.
+
+**Corollary 4 (the backtracking budget is structurally insufficient).**
+Halving recovers a factor 2, so returning `d_ε` to an `O(1)` step needs
+
+    #halvings  ≳  log₂( ‖g_0‖ / (ε ‖g‖) ).                                   (21)
+
+At the relative ridge `ε = 10⁻⁴` this is ≈ 13.3; the measured
+`‖d‖/‖g‖ = 6.6 × 10⁴` gives `log₂ = 16.0`. The implemented budget is
+`bt_i < 12`, a factor 4096, so the last trial is still ≈ 16× too long. Hence
+every line search exhausts its budget without finding a decrease, at every
+iterate, for any data.
+
+Observed on a 6-frame synthetic case: **12 of 12 solves terminated by
+line-search rejection with `bt = 12`**, none reaching either the convergence
+test `‖Δq‖ ≤ 10⁻³` or the cap `max_iter = 100`. Because a rejected step reports
+zero step norm, the outer loop reads that rejection *as* convergence. The solver
+never converges; it stops at the first iterate whose line search fails, after 9
+to 61 iterations depending on arithmetic order.
+
+### 8.5 Spectra
+
+Jacobi-normalised `H_S`, computed in float64 so these are not float32 artefacts:
+
+| active set | `m` | `λ_min` | `λ_max` | `cond` | `#λ < 10⁻⁴` |
+|---|---|---|---|---|---|
+| random 10% scattered | 172 | 8.95e−07 | 17.15 | 1.9e+07 | 28 |
+| contiguous 6×6 block, all scales | 108 | **1.62e−11** | 55.38 | **3.4e+12** | **48** |
+| contiguous 6×6 block, 1 scale | 36 | 2.75e−05 | 9.62 | 3.5e+05 | 1 |
+| separated atoms (stride 8), 1 scale | 9 | 9.44e−01 | 1.06 | **1.1** | 0 |
+
+Against float32 `eps = 1.2 × 10⁻⁷` the clustered multiscale case has no
+numerically meaningful inverse. Conditioning is entirely a property of *which*
+atoms are co-active, exactly as Lemma 3 predicts: separated atoms give
+`cond = 1.1` and `N(A_S) = {0}`, so Theorem 3 is vacuous there.
+
+Note also `λ_max = 17–55`, not `≈ 1`: Jacobi normalisation fixes the *diagonal*,
+while off-diagonal coherence sets the top of the spectrum. The regularised
+condition number is therefore `λ_max/ε ≈ 5.5 × 10⁵`, not `1/ε`, and CG would
+need `≈ sqrt(5.5 × 10⁵) ≈ 740` iterations against the `maxiter = 20` it is
+given — so the truncation is itself an uncontrolled regulariser.
+
+**Rank is invariant under any redistribution of the `σ^β` weight.** Moving the
+weight between basis and penalty is the change of variables `c = S c̃`,
+`S = diag(s) ≻ 0`, under which `A ↦ AS` and `λ ↦ Sλ`: the same problem in new
+coordinates, and `H ↦ S H S`, a *congruence*. By Sylvester's law of inertia rank
+and inertia are preserved. On a fixed active set:
+
+| `γ` | rank(`H_S`), tol `10⁻⁸` |
+|---|---|
+| 1.0 | 84 / 108 |
+| 0.5 | 85 / 108 |
+| 0.0 | 85 / 108 |
+
+So the choice of where to carry the weight changes conditioning, and changes the
+meaning of any *absolute* constant added to `H` — but it cannot change `N(A)`.
+The degeneracy belongs to the forward operator.
+
+### 8.6 What resolves it
+
+Along `v`, `J` is affine by (16) and, for `β ≠ 0`, strictly monotone. It is
+unbounded below on that ray only *until `c ≥ 0` binds*: the minimiser along the
+ray sits on the boundary of the orthant and is reached by **deactivating**
+coefficients. The subproblem is intrinsically constrained, and the failure of
+§8.4 is what happens when it is solved as though it were not.
+
+Two formulations remain well defined here:
+
+- **Trust region.** `min m(d)` subject to `‖d‖ ≤ Δ` has a solution for any
+  symmetric `H_S` — singular or indefinite — and any `g`, including
+  `g ∉ range(H_S)`. Steihaug-CG runs to the boundary along the zero-curvature
+  direction and returns that point; the radius, not a ridge, sets the scale, and
+  the returned step is a controlled quantity.
+- **Active-set or projected methods**, which locate the binding constraint
+  directly instead of approaching it through an unconstrained model that has no
+  representation of it.
+
+A ridge is neither: by (19) it returns the minimum-norm null-space component, a
+quantity fixed by `ε` rather than by the data.
+
+Finally, this is a cost of the *global* formulation rather than of the
+dictionary. `main`'s greedy path solves small `K_NEIGHBORS` subproblems over
+candidates that greedy selection has kept apart — the `cond = 1.1` row, where
+`N(A_S) = {0}`. Promoting the problem to a single global convex solve is what
+lets a scale-degenerate cluster become active, and Theorem 3 then applies.
+
+---
+
+## 9. Status
 
 | claim | kind | evidence |
 |---|---|---|
@@ -760,6 +981,18 @@ the effect that looked backwards.
 | §7 — no statistical anchor exists at β=0 | follows from Thm 1 | likelihood identical by construction |
 | §7 — γ=1 *is* a weight; γ=0 is unweighted ℓ1 on L²-normalised atoms | believed not widely noted | normalisation algebra |
 | §7 — γ=0 over-merges; β is a genuine hyperparameter | measurement | three-case table, γ=0.5 optimum |
+| Lem 2 — `N(H_S) = N(A_S)` | elementary | proof |
+| Lem 3 — null vectors are local, inside one cluster | corollary of Lem 1 | `‖Av‖/‖Aδ‖ = 3.7e-3` |
+| Prop 3 — `J` affine along `N(A)`; data blind to `v` at all orders | proof | identity `⟨∇D,v⟩ = ⟨∇_u D, Av⟩` |
+| **Thm 3 — Newton system consistent ⟺ β = 0** | believed new as stated | proof + `⟨λ,v⟩` sweep |
+| Cor 3 — well-posed estimator and solvable Newton step are exclusive | corollary | Thm 1 + Thm 3 |
+| Cor 4 — backtracking budget structurally insufficient | proof + measurement | needs 16.0 halvings, budget 12; 12/12 solves reject |
+| §8.5 — rank invariant under basis↔penalty reweighting | Sylvester's law | 84–85/108 across γ ∈ {0, 0.5, 1} |
+
+Theorem 3 with Corollary 3 is the sharpest statement here: on a scale-space
+dictionary, well-posedness of the estimator and solvability of the Newton
+subproblem are mutually exclusive, so the remedy has to be algorithmic — a
+trust region or an active-set method — and cannot be a choice of `β`.
 
 The two candidates for an applied-mathematics write-up are Theorem 1 with
 Corollary 1 and Remark 1 — a clean statement that scale-space dictionaries are
