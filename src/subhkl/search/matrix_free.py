@@ -248,17 +248,28 @@ class MatrixFreeSparseRBFPeakFinder:
             D_mat = (q > tau_alpha).astype(jnp.float32)
 
             # Semi-smooth Newton system for G(q) = (q - c(q))/tau + grad(c(q)).
-            # Since c(q) = max(0, q - tau_alpha), the generalised Jacobian is the
-            # Gauss-Newton Hessian A^T W A on the active set (D_mat == 1) and
-            # 1/tau_local on the inactive set.  Both blocks are carried in a
-            # single operator that is symmetric by construction: CG is only
-            # valid for symmetric positive-definite operators, so the Jacobi
-            # scaling is supplied through the preconditioner argument rather
-            # than multiplied into the operator, which would break symmetry and
-            # leave CG returning a direction that is not a descent direction.
+            # With c(q) = max(0, q - tau_alpha), so dc_k/dq_j = D_k delta_kj,
+            #
+            #     dG_i/dq_j = delta_ij (1 - D_i)/tau + H_ij D_j,   H = A^T W A
+            #
+            # which in the (active, inactive) ordering is block lower-triangular
+            # and *not* symmetric:
+            #
+            #     [ H_AA      0     ]
+            #     [ H_IA    I/tau   ]
+            #
+            # Projecting H onto the active rows would make the whole operator
+            # symmetric, but only by discarding H_IA -- the block carrying how a
+            # change in the fitted peaks moves the residual at the coordinates
+            # still below threshold, which is exactly what decides the atoms
+            # that activate next.  That is an approximation with no error
+            # control, and it is not needed: a triangular system does not
+            # require symmetry.  Solve the active block, which is symmetric
+            # positive definite on its own, then substitute.  One extra operator
+            # application per iteration buys the exact Jacobian.
             eta = 1.0 / jnp.maximum(self._adjoint_op(W_diag, self.K_sq), 1e-6)
 
-            def apply_jacobian(v):
+            def apply_active_block(v):
                 v_active = v * D_mat
                 Av = self._forward_op(v_active, self.K_weights)
                 At_W_Av = self._adjoint_op(W_diag * Av, self.K_weights)
@@ -267,13 +278,23 @@ class MatrixFreeSparseRBFPeakFinder:
             def jacobi(v):
                 return eta * v * D_mat + (1.0 - D_mat) * v
 
-            # Active rows solve A^T W A dq = -G; inactive rows reduce to the
-            # explicit prox-gradient step dq = -tau_local * G.
-            rhs = -Gq * D_mat - tau_local * Gq * (1.0 - D_mat)
-            dq, _ = jax.scipy.sparse.linalg.cg(
-                apply_jacobian, rhs, M=jacobi, tol=1e-3, maxiter=20
+            # Row 1: H_AA dq_A = -G_A.  The identity carried on the inactive
+            # block keeps the operator non-singular for CG; with a right-hand
+            # side supported on the active set every iterate stays there too, so
+            # this solves the active block alone.
+            dq_a, _ = jax.scipy.sparse.linalg.cg(
+                apply_active_block, -Gq * D_mat, M=jacobi, tol=1e-3, maxiter=20
             )
-            dq = jnp.where(jnp.isfinite(dq), dq, 0.0)
+            dq_a = jnp.where(jnp.isfinite(dq_a), dq_a, 0.0) * D_mat
+
+            # Row 2: dq_I = -tau (G_I + (H dq_A)_I).  The 1e-4 ridge is diagonal
+            # and the two index sets are disjoint, so it plays no part in H_IA.
+            H_dq_a = self._adjoint_op(
+                W_diag * self._forward_op(dq_a, self.K_weights), self.K_weights
+            )
+            dq_i = -tau_local * (Gq + H_dq_a) * (1.0 - D_mat)
+
+            dq = jnp.where(jnp.isfinite(dq_a + dq_i), dq_a + dq_i, 0.0)
 
             # Change in objective from c to c_test, accumulated as a single
             # reduction over per-pixel *differences*.
