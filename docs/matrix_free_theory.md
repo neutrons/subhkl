@@ -2,7 +2,10 @@
 
 Results that came out of debugging `MatrixFreeSparseRBFPeakFinder` (PR #15) and
 that are worth stating independently of the code. Each numbered claim is either
-proved or accompanied by the measurement that establishes it.
+proved or accompanied by the measurement that establishes it. Background on
+the solver's framework — proximal operators, forward–backward splitting, the
+natural residual, semismooth Newton — is assumed here and developed from first
+principles in [`proximal_gradient_primer.md`](proximal_gradient_primer.md).
 
 Two of these are, as far as we are aware, not standard: Theorem 1 (the scale
 dimension of a Gaussian scale-space dictionary is exactly redundant under a
