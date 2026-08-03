@@ -369,4 +369,9 @@ Kunisch, *The primal-dual active set strategy as a semismooth Newton method*,
 SIAM J. Optim. 13(3), 2003. For everything specific to this dictionary — the
 scale degeneracy, the significance thresholds, the Newton inconsistency
 theorem, and the control experiments — see
-[`matrix_free_theory.md`](matrix_free_theory.md).
+[`matrix_free_theory.md`](matrix_free_theory.md). A follow-up note,
+[`augmented_penalty_newton.md`](augmented_penalty_newton.md), develops the
+second-order theory further: an exact splitting of the Poisson likelihood
+that makes the fidelity standard self-concordant, and a damped proximal
+Newton analysis that remains valid — global convergence included — when the
+Hessian is singular.
