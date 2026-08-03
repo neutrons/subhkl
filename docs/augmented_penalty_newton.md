@@ -523,6 +523,112 @@ every quantity of §§4–6 per iteration. Findings, in both directions:
    endgame changes the reported support (76 → 75 here) and so interacts
    with the downstream test suite exactly as any solver improvement does.
 
+---
+
+## 8. Subpixel refinement: the limit of the augmentation
+
+Question: does the zero-pixel augmentation alone suffice to make
+*subpixel refinement* well posed — continuous re-estimation of peak
+positions after the convex stage — or is there an informative
+counterexample? Answer: **it does not suffice, for two independent
+reasons, one per counting regime; and the counterexample is not only
+constructible but explains the refinement instability observed in CI.**
+The positive result that survives is an *expected*-curvature statement,
+which converts into a cheap per-peak certificate.
+
+### 8.1 Regime vacuity (measured)
+
+The augmentation term `a₀ = Aᵀ1_{y=0}` is only as informative as the
+empty pixels are numerous. Census of the ghost-test frame (background
+10 counts/pixel, the case whose refinement instability was measured in
+the CI flake): **1 pixel of 10,000 has `y = 0`** (expected `~0.5` from
+background alone). In this regime `a₀ ≈ 0`, `λ' ≈ λ`: the null-space
+augmentation is numerically inert exactly where the subpixel
+instability was observed. What removes sub-significance satellites
+there is the *statistical* part of the penalty retained inside a
+penalized refinement (soft-thresholding can deactivate; the current
+unpenalized refiner cannot) — not the zero-pixel term.
+
+### 8.2 The curvature counterexample
+
+The deeper obstruction is second-order and cannot be cured by *any*
+reweighting of the penalty, because the augmented objective is an exact
+rewrite of the original: stationary structure in the position
+coordinates is untouched. For a single atom `U = B + c φ_σ(· − ξ)`,
+using `Σ_k ∂²Φ_k/∂ξ² = 0` (mass invariance over the detector), the
+position curvature of the exact NLL at a stationary point is
+
+    ∂²(NLL)/∂ξ² = Σ_k (y_k/U_k) [ (∂U_k/∂ξ)²/U_k − ∂²U_k/∂ξ² ],     (15)
+
+a sum over *counted pixels only*, with a per-pixel sign: in the
+continuous approximation a count at distance `x` from the center
+contributes positively iff the local signal-to-background satisfies
+
+    c φ(x)/B  >  x²/σ² − 1.                                          (16)
+
+Counts inside the core stabilize the position; counts in the tails
+(beyond the inflection radius, where the local signal is thin against
+the background) *destabilize* it. Two consequences:
+
+- **`B = 0` is safe:** with no background, (15) reduces to
+  `Σ y_k/σ²` — log-concavity of the Gaussian in `ξ` — and refinement
+  cannot saddle. The pathology requires background, which we always
+  have.
+- **A significant saddle exists.** Place on a flat field at the
+  background mean a ring of extra counts at radius `d` (a symmetric,
+  perfectly legal Poisson realization — and precisely the residual
+  geometry left by an atom whose width is off the σ-bank, i.e. the
+  ghost mechanism). Measured, `σ = 2`, exact autodiff Hessian at the
+  fitted amplitude, float64:
+
+  | B | ring d | fitted amp | matched-filter z | min-eig(position) | refined from ±0.15 px |
+  |---|---|---|---|---|---|
+  | 10 | 3 | 2.20 | 2.5 | −0.063 (saddle) | ±0.24 px |
+  | 10 | 4 | 1.88 | 2.1 | −0.86 (saddle) | ±3.2 px |
+  | 2 | 3 | 2.61 | 6.5 | +1.17 (min) | — |
+  | **2** | **4** | **2.60** | **6.5** | **−3.83 (saddle)** | **±3.0 px** |
+  | 2 | 5 | 0.52 | 1.3 | −0.74 (saddle) | ±4.6 px |
+
+  The boxed row is the informative counterexample: an atom **well above
+  the significance floor** (`z = 6.5` against a floor of ≈ 4.6) whose
+  position is a *saddle point* of the exact likelihood. Refinement
+  bifurcates to `±3` pixels, the branch chosen by the sign of the
+  starting perturbation — in production, by reduction-order noise.
+  This is the measured phenomenology of the CI-flaky ghost (slid one
+  way locally, the other way on CI), now with its mechanism: the ghost
+  was a residual-mopping atom whose counts sat in exactly the
+  destabilizing zone of (16).
+
+### 8.3 What survives, and the certificate
+
+In expectation the pathology vanishes: substituting `y_k → U_k` in
+(15), the `∂²U` terms cancel by mass invariance and
+
+    E[∂²(NLL)/∂ξ²] = Σ_k (∂U_k/∂ξ)² / U_k  ≻  0,                     (17)
+
+the Fisher position information — *subpixel refinement is well posed in
+expectation for every true peak, at every background*. Failures are
+finite-sample events. Monte-Carlo incidence for a genuine centered peak
+on `B = 10` (200 replicates each): indefinite position Hessian at the
+fitted optimum in `1/200` runs at threshold significance (`z = 4.5`),
+`0/200` at `z ≥ 6.7`. Rare per genuine peak — but ring-shaped residuals
+are *systematically* produced by width mismatch, so the incidence among
+residual-mopping atoms (the ones the ghost test exercises) is far
+higher than among true peaks.
+
+The constructive conclusion: subpixel positions need their own
+certificate, and it is second-order. Alongside the amplitude test
+(first-order, against `λ'`), report per refined peak the empirical
+position-information matrix — the `2×2` (or `3×3` with `σ`) block of
+(15), one autodiff Hessian per atom — and flag any peak whose smallest
+eigenvalue is nonpositive (or below a noise floor): *its subpixel
+position is not identifiable at this significance*; report the
+pixel-level position with widened uncertainty instead of a silently
+bifurcating subpixel value. This slots into the framework of this note
+as the position-space sibling of the `Δ` certificate, and into Part II
+of the companion paper: the same matrix's inverse is the position
+covariance for `σ(ξ)` reporting.
+
 ### References
 
 - Nesterov & Nemirovskii, *Interior-Point Polynomial Algorithms in Convex
