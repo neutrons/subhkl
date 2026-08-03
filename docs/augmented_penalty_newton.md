@@ -827,6 +827,61 @@ resolved by deactivation) but order-2-capable in position, where the
 ω-dependence of the augmented weight `a₀(ω)` is the storage location
 of the position information carried by silence.
 
+### 8.7 Wall splitting: the geometry of silence-resolved position
+
+How the second-order silence term resolves positional degeneracy, and
+its geometry. Bookkeeping first: the absence stiffness is not an added
+regularizer — it is the `Z`-part of the likelihood itself. The
+augmentation isolates it as a separately computable, *deterministic*
+quadratic form,
+
+    k_silence(ξ) = c · ∇²(1_Z ∗ Φ_σ)(ξ)                              (21)
+
+— the Hessian of the PSF-blurred dark mask, one convolution pass with
+second-derivative kernels. Given `Z` it carries no Poisson variance,
+and that is the mechanism: where the photon curvature is
+fluctuation-dominated (threshold peaks in the sparse regime, the §8.2
+saddles), a nearby dark boundary adds noise-free restoring curvature.
+Calibration (verified against the exact pixel-integrated kernel): a
+straight dark boundary at distance `D` contributes transverse
+stiffness `2πA·Q''(D/σ)`, `Q''(t) = t φ₁(t)`, peaking at `D ≈ σ` at
+**≈ 24% of the peak's entire photon Fisher information, per wall** —
+and only in the direction transverse to the wall.
+
+The geometric picture is a precise analog of the polyhedral face
+splitting of §6:
+
+| amplitude space (§6) | position space |
+|---|---|
+| nonnegative cone, face lattice | detector plane, stratified by the PSF-blurred dark set |
+| active bound constraint (hard, combinatorial) | dark boundary within ~σ: a **soft wall**, stiffness `2πA·Q''(D/σ)` |
+| strict complementarity picks the face | each wall pins the transverse position coordinate |
+| Lemma D: within-face metric from uniqueness | photon Fisher: within-cell metric from counts |
+| vertex nondegeneracy: active normals span | full pinning: wall normals span `R²` (island / corner) |
+
+`a₀(ξ)` is a self-generated smooth barrier for the illuminated
+region, with the PSF as mollifier — convex on the bright side within
+~σ of each wall, inflecting at the wall. The limits are right: as
+`σ → 0` (or as walls sharpen) the soft barrier converges to the hard
+constraint "position lives in the bright set", where wall splitting
+*is* face splitting; as exposure grows, `Z` empties and the walls
+recede — the machinery again self-retires onto the photon metric.
+Position space is stratified by the nerve of the σ-neighborhood
+arrangement of dark boundary segments: within a cell, wall-transverse
+coordinates are silence-pinned, wall-tangent coordinates are
+photon-priced.
+
+Two consequences for practice. The §8.3 certificate upgrades from a
+scalar flag to a **direction-resolved** one: eigen-split the total
+position Hessian into photon and silence parts and classify each
+direction as photon-pinned, silence-pinned, or unpinned — reporting
+position componentwise (certified transverse to an illumination
+boundary, uncertified along it) instead of a silently bifurcating
+subpixel value. And a design warning: a patch-cropped refiner that
+renders only a small window around the atom *discards wall stiffness*;
+the refinement window must extend ~2–3σ so that the silence within
+reach can testify.
+
 ### References
 
 - Nesterov & Nemirovskii, *Interior-Point Polynomial Algorithms in Convex
