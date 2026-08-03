@@ -906,6 +906,78 @@ renders only a small window around the atom *discards wall stiffness*;
 the refinement window must extend ~2–3σ so that the silence within
 reach can testify.
 
+---
+
+## 9. Scope: the exact problem class, and a stress test that failed informatively
+
+**The class.** The full machinery — certified FB, augmented splitting,
+`Δ`-certificates, dichotomy, row-sum-majorized GPCG — requires:
+(A1) box/cone feasible set (projection is a clamp);
+(A2) entrywise-nonnegative operator;
+(A3) separable standard-self-concordant fidelity (Poisson with integer
+counts);
+(A4) strictly positive additive background;
+(A5) strictly positive linear penalty on the cone.
+Near-optimality of the row-sum metric needs additionally
+(A6) a quasi-regular weight graph (flat Perron vector) — satisfied by
+translation-invariant (convolutional) operators; a star graph breaks
+it by `√degree` (`λ_max = √(N−1)` vs row sum `N−1`).
+
+**The gauntlet.** Testing novelty by bold implication, each conjecture
+proved or killed:
+
+- *"It certifies emission tomography unchanged"* — **half true,
+  measured** (toy 32×32 PET, 48 angles, randoms floor 0.5, 32% zero
+  bins). The certificates transfer verbatim (all quantities
+  computable, `a₀` active up to the λ scale, every step monotone), but
+  the speed does not: residual 5e-2 after 3000 FB + 6 endgame steps,
+  ~3%/step. Two named causes, each an assumption: (A6) fails — the
+  Radon normal operator's Perron vector is the classic `1/r` hub
+  profile, so the row-sum metric is loose and diagonal preconditioning
+  is weak against the ramp spectrum; and pixel-basis activity is not
+  sparse, so uniqueness/strict complementarity are weak — **the
+  dichotomy's contrapositive observed in a second domain** (slow
+  solver ⇒ weakly identified estimator; the reason PET avoids
+  ℓ1-pixel priors, seen from the solver side).
+- *"The row-sum metric accelerates first-order methods"* — **false**,
+  by our own pn2 measurements and the PET run: a majorizer is an
+  identification metric and a certificate carrier, not curvature. Its
+  speed role is only to license crude inner solves via Proposition F.
+- *"It extends to signed dictionaries"* — **structurally false for
+  Poisson**: signed coefficients can drive `u < 0` (the likelihood
+  forces effective nonnegativity), and the folded `a₀` becomes a tilt
+  that can reward negative coefficients, breaking coercivity. The
+  method is native to counting data, not accidentally attached to it.
+- *"The majorizer generalizes to arbitrary symmetric `H`"* —
+  **mathematically yes, computationally no**: `diag(|H|·1) ⪰ H` always
+  (Gershgorin), but `|H|·1` is matrix-free computable exactly when
+  `H ≥ 0` entrywise, i.e. when `|H|·1 = H·1`. The true boundary of the
+  trick is *matrix-free + nonnegative kernel*.
+- *"The dichotomy transfers to nonneg-design GLMs (NMF substeps,
+  Poisson regression)"* — plausibly true, proofs port verbatim; not
+  yet tested.
+
+**A correction the failure taught.** The "diagonal-only law" binds the
+*identification* step (where projections happen), not the
+face-restricted CG: on the face the constraint is locally invisible
+and the CG preconditioner may be any SPD operator. Our implementation
+uses Jacobi there for cheapness, not necessity; a tomography
+adaptation could legally run Fourier/ramp preconditioning inside
+face-CG with row-sum identification outside.
+
+**The modest statement.** The row-sum/GPCG assembly is a specialized
+result, and the gauntlet localizes the specialization exactly: it is
+the right inner metric for **matrix-free, entrywise-nonnegative,
+quasi-translation-invariant operators over boxes with counting
+noise** — the fingerprint of PSF-based counting instruments
+(crystallographic peak finding, Richardson–Lucy-type astronomical and
+microscopy deconvolution, localization microscopy), and *not* of
+tomography. Its genuinely general exports are three: the certificates
+(`Δ` ledger, KKT-relative stopping — metric-independent); the
+sharpened two-metric reading above; and the dichotomy as a portable
+diagnostic — when a certified solver of this family is slow, suspect
+the estimator's identifiability before the algorithm.
+
 ### References
 
 - Nesterov & Nemirovskii, *Interior-Point Polynomial Algorithms in Convex
