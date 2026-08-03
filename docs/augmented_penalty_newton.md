@@ -289,6 +289,17 @@ gradient norm.
   unit analysis §8.4 of the theory notes rejects for this problem; Theorem C
   shows the regularizer is unnecessary for the global theory here, because
   the degeneracy is constant (Lemma A) and polyhedrally resolved (Lemma B).
+  *Novelty caveat (2026):* superlinear convergence of proximal Newton-like
+  methods **to degenerate solutions** is now an active topic — arXiv
+  2602.10470 proves Q-superlinear rates under a Hölderian error bound for
+  inexact proximal Newton with singular, non-Lipschitz Jacobians, and arXiv
+  2607.12551 treats degenerate polyhedral projection by exploiting dual
+  nonuniqueness rather than regularizing. Neither uses self-concordance,
+  derives face-nondegeneracy from estimator uniqueness (Lemma D), or has
+  the `Δ = ½ν² + δ` certificate — those remain this note's distinctive
+  elements — but "fast rates at degenerate solutions without a
+  well-conditioned Hessian" is no longer virgin territory, and a proper
+  comparison is owed before any claim.
 - **Identification.** Finite active-set identification for proximal methods
   under polyhedral `g` and strict complementarity is classical (Hare–Lewis
   partial smoothness); it is the expected mechanism for the local phase
@@ -404,12 +415,36 @@ twice.
    and the argument that one quadratic step keeps the iterate inside the
    identification basin of Lemma E (standard basin bookkeeping); constants
    in Lemma E's `C` and `γ/2` made explicit.
-2. **Inexact subproblems.** Theorem C and Lemma E assume exact `d`. The
-   practical variant accepts `d̂` with model decrease `Δ̂ ≥ ρ Δ` for fixed
-   `ρ ∈ (0, 1]`; the global bound (12) degrades by controlled factors, and
-   Lemma E needs the inexactness to vanish fast enough near the end
-   (superlinear retention under `Δ̂/Δ → 1`, standard in inexact Newton
-   theory but to be carried through the seminorm bookkeeping).
+2. **Inexact subproblems — global half now closed.** The global theory
+   survives inexactness in a form *stronger* than anticipated, because it
+   can be restated entirely in computable quantities:
+
+   **Proposition F (computable inexact decrease).** Let `d̂` be any feasible
+   step (`c + d̂ ≥ 0`) with `ν̂ = ‖d̂‖_H` and computable model decrease
+   `Δ̂ = −[⟨∇f₊(c) + λ', d̂⟩ + ½ν̂²] ≥ 0`. Then the damped step
+   `α = 1/(1+ν̂)` satisfies
+
+       F(c + αd̂) − F(c) ≤ −Δ̂/(1 + ν̂).
+
+   *Proof.* As in Theorem C, the SC bound and convexity of `g` give
+   `F(c+αd̂) − F(c) ≤ α[−Δ̂ − ½ν̂²] + ω_*(αν̂)`. At `α = 1/(1+ν̂)` the
+   `Δ̂`-free terms sum to `−r(ν̂)` with
+   `r(ν) = (ν + ½ν²)/(1+ν) − log(1+ν)`, and `r(0) = 0`,
+   `r'(ν) = ½ν²/(1+ν)² ≥ 0`, so `r ≥ 0`. ∎
+
+   No reference to the exact subproblem solution appears. For global
+   convergence of an implemented method it then suffices that each inner
+   solve is at least as good as its own first projected-gradient step under
+   a majorizing diagonal `D ⪰ H` (Gershgorin, §3 of the primer's
+   machinery): majorized descent gives `Δ̂ ≥ ½‖x₁ − c‖²_D`, and `x₁ − c`
+   is the subproblem's `D`-scaled prox-gradient map at `d = 0`, which
+   vanishes only at stationarity of `F`. So `Δ̂_k → 0` (forced by
+   summability) again implies every accumulation point is a minimizer.
+   Still open on this item: *superlinear retention* under vanishing
+   inexactness (`Δ̂/Δ → 1` near the end), to be carried through the
+   seminorm bookkeeping. A practical corollary the prototype confirmed: for
+   exact solutions `δ = Δ − ½ν² ≥ 0`, so a computed `δ̂ < 0` is a free,
+   rigorous inexactness alarm.
 3. **Without strict complementarity** the identification argument fails and
    the expected behaviour is degradation to a linear rate — not attempted
    here.
@@ -421,6 +456,72 @@ twice.
    plus Theorem D as an assembly is a publishable note, Lemma D's role as
    the identifiability-to-nondegeneracy bridge the most likely genuinely new
    element — is a prior, not a verdict.
+
+---
+
+## 7. Implementation feedback
+
+A fully instrumented prototype of the method (exact splitting, GPCG-lite
+inner solver — Gershgorin projected gradient for identification, Jacobi-CG
+on the free set, projected decrease check — damped/full steps by `ν`, the FB
+step as monotone safeguard) was run on the 4-peak synthetic case, reporting
+every quantity of §§4–6 per iteration. Findings, in both directions:
+
+**Theory confirmed by the implementation.**
+
+- The build-time identity `∇f₊ + a₀ = Aᵀ(1 − y/u)` holds to `1.1e-7`
+  (float32): the augmented and original formulations are the same
+  arithmetic, and the FB safeguard is bit-compatible between them.
+- Theorem C's decrease bound held on **all 80** instrumented cold-start
+  iterations, with the *inexact* inner solver — consistent with
+  Proposition F.
+- The phase structure of §6 is visible in the raw trajectories: at
+  `γ = 0.5` the support froze at iteration 32 and the accepted step
+  switched FB → Newton from that point on; at `γ = 1` the support churned
+  through all 40 iterations without settling — Lemma D's failure, as the
+  identification signature.
+- **Endgame (Theorem D):** warm-started from the production solver's
+  certified endpoint (KKT residual `4.4e-4`), a *single full Newton step*
+  (`ν = 0.075`) dropped the residual to `7.3e-5` and deactivated one atom
+  (Lemma E in action); `Δ̂` fell from `1.2e4` (cold) to `2.5e-6`. All
+  subsequent iterations are float32 noise (`|dF| ≲ 2e-6` on `|F| ~ 1e5`,
+  below the ulp of the fused difference): the quadratic phase is **one
+  step deep at float32**, and it ends at the arithmetic's floor, not the
+  method's.
+- The inexactness alarm works: the one Newton step showed
+  `δ̂ = −6.4e-6 < 0` (relative inexactness `~2e-3` against
+  `Δ̂ = 2.8e-3`), correctly flagging the inner solve as inexact while
+  Proposition F kept the step certified.
+
+**Implementation lessons fed back into the theory and the design.**
+
+- Cold-started damped Newton spends its entire budget in phase 1 (FB steps
+  accepted for 32 straight iterations; `ν ~ 20–150`): the certified
+  architecture is *first-order phase 1 → APN endgame*, i.e. the shipped
+  sufficient-decrease hybrid runs to its `1e-3` certificate and one or two
+  APN outer iterations (~40 convolutions) then buy a `6×` tighter
+  certificate and a cleaner support. The endgame is an add-on, not a
+  replacement.
+- Proposition F exists because the implementation demanded a guarantee in
+  computable quantities; the restatement turned out stronger than the
+  planned `Δ̂ ≥ ρΔ` formulation.
+- The correct stopping quantity in practice is `Δ̂` (it spans ten orders
+  over the run and is monotone-interpretable); `ν` alone freezes at the
+  float32 noise floor (`1.5e-3`) and never certifies anything there.
+
+**Loose ends surfaced.**
+
+1. Observing the quadratic *contraction curve* (rather than one step to
+   the floor) requires float64; the prototype and the production stack are
+   float32. Worth one float64 run before any write-up claims the rate is
+   observed rather than implied.
+2. A stopping rule on `Δ̂` needs its units tied to a user-facing tolerance:
+   `Δ̂` is in objective (count) units; the bridge `F(c) − F* ≤` (function
+   of `ν`, `Δ̂`) in the degenerate case is part of obligation 1's
+   bookkeeping.
+3. Production integration is a design decision, not a math one: the
+   endgame changes the reported support (76 → 75 here) and so interacts
+   with the downstream test suite exactly as any solver improvement does.
 
 ### References
 
