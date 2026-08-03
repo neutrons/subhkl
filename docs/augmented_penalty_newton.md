@@ -931,14 +931,21 @@ proved or killed:
   bins). The certificates transfer verbatim (all quantities
   computable, `a₀` active up to the λ scale, every step monotone), but
   the speed does not: residual 5e-2 after 3000 FB + 6 endgame steps,
-  ~3%/step. Two named causes, each an assumption: (A6) fails — the
-  Radon normal operator's Perron vector is the classic `1/r` hub
-  profile, so the row-sum metric is loose and diagonal preconditioning
-  is weak against the ramp spectrum; and pixel-basis activity is not
-  sparse, so uniqueness/strict complementarity are weak — **the
+  ~3%/step. Attribution, *measured rather than presumed*: the
+  preflight ratio `max_i d_i / λ_max` is **1.16** for the toy Radon
+  normal operator (vs 1.00 for the convolutional bank) — the degree
+  bowl is real but smooth, so the row-sum majorizer stays nearly
+  tight and the identification metric is *not* the culprit. The grind
+  belongs to (i) the face-restricted CG: the Radon spectrum (~1/|freq|
+  ramp) is poorly served by a Jacobi preconditioner, and the legal fix
+  is a non-diagonal face preconditioner (see the correction below);
+  and (ii) weak identifiability: pixel-basis activity is not sparse,
+  so uniqueness/strict complementarity are marginal — **the
   dichotomy's contrapositive observed in a second domain** (slow
   solver ⇒ weakly identified estimator; the reason PET avoids
-  ℓ1-pixel priors, seen from the solver side).
+  ℓ1-pixel priors, seen from the solver side). The star-graph
+  looseness of (A6) remains real in principle but requires stronger
+  hub concentration than smooth ray geometry produces.
 - *"The row-sum metric accelerates first-order methods"* — **false**,
   by our own pn2 measurements and the PET run: a majorizer is an
   identification metric and a certificate carrier, not curvature. Its
