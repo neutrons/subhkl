@@ -739,6 +739,61 @@ Both are checkable from the fit itself; the per-peak empirical Hessian
 of §8.3 remains the exact detector, and `Φ(−z/c*(σ, B))` prices its
 expected trigger rate.
 
+Two closing observations. First, since no signal comes without
+background and `B = 0` is the *only* point where position estimation
+is log-concave, the noiseless-and-backgroundless setting of much of
+the mathematical super-resolution literature (BLASSO stability priced
+against spike separation under additive noise) sits at a measure-zero
+point of practice; the variance-level cost of background is textbook
+in the localization-microscopy literature (CRLB with background), but
+the landscape-level statement — convexity class, saddle bifurcation,
+the failure law `Φ(−z/c*)` — appears not to be articulated there.
+Second, **scoping**: the companion paper and the production
+implementation restrict to the dense regime `πσ²B ≫ z²`, where `Z` is
+empty with high probability, the whole likelihood is standard
+self-concordant directly, `λ' = λ`, and Theorem 2, Theorems C–D, and
+the §8 certificates hold with the augmentation inert; the sparse
+regime — where the augmentation and the photon-currency law do real
+work — is future work (real MANDI frames at 0.64 counts/pixel live
+there).
+
+### 8.6 The curvature and intensity null spaces
+
+The two null spaces that organized this note are one object seen at
+two exposure levels. Writing `Z = {k : y_k = 0}`:
+
+    N(∇²f₊) = N(A_P) = A⁻¹{ fields supported on Z }  ⊇  N(A):        (20)
+
+**the curvature null space is the intensity null space of the
+*effective* experiment** — the forward map restricted to the pixels
+that detected anything. Three structural consequences:
+
+- **Resolution order matches information order.** The structural core
+  `N(A)` (the scale-redundancy rays of Theorem 1 of the notes) is
+  invisible to the data at all orders; only penalty design (`β ≠ 0`)
+  resolves it — order zero. The *data shadow* `N(A_P) ∖ N(A)` is
+  invisible at second order but visible at first: it would have
+  generated mean counts on `Z`, and that linear evidence is exactly
+  `a₀` — the augmentation moves it into the threshold (this is what
+  bought the superlinear solver). The near-null position directions
+  `∂φ/∂ξ` of §8.2 are visible only at second order, with
+  photon-priced stability (the `c*` surface). Design resolves
+  order 0, augmentation order 1, certificates monitor order 2 — and
+  Lemma D is the glue: order-0 uniqueness delivers order-2
+  nondegeneracy on the face once order 1 is cleared.
+- **The identity is Poisson-specific.** Under a Gaussian loss a
+  measured zero retains curvature (`W ≡ 1`); only for Poisson does
+  absence of counts mean absence of curvature while leaving evidence
+  exactly linear — the same `y log u` structure that gives
+  self-concordance. The background pays through its floor (Theorem 2)
+  and its counts (§8.5's dense currency); its absences pay through the
+  augmentation: `P` and `Z` each carry their own theorem.
+- **The shadow is transient.** As exposure grows,
+  `P(y_k = 0) = e^{−U_k} → 0`, so `Z ↓ ∅`, `a₀ → 0`, and
+  `N(A_P) ↓ N(A)`: the machinery self-retires in the infinite-data
+  limit, leaving only the structural core, whose treatment is
+  exposure-independent.
+
 ### References
 
 - Nesterov & Nemirovskii, *Interior-Point Polynomial Algorithms in Convex
