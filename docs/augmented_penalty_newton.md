@@ -794,6 +794,39 @@ that detected anything. Three structural consequences:
   limit, leaving only the structural core, whose treatment is
   exposure-independent.
 
+**Is the curvature null space the space that resolves the positional
+degeneracy?** No — the two are transverse, with a coordinate-dependent
+twist worth stating exactly. A position dipole `∂φ/∂ξ` lies in
+`N(A_P)` only if the atom's gradient-carrying pixels all recorded
+zero counts, in which case the augmented threshold deactivates the
+atom before any position question arises; whenever position is live,
+its dipole carries positive counted-pixel curvature (the photon Fisher
+term) and is *not* in the null space. But the underlying data object —
+the zero-count set `Z` — is position-informative through a mechanism
+the amplitude-space picture hides: "absence of counts is absence of
+curvature" is true only in amplitude coordinates, where the model is
+linear. In position coordinates the same evidence acquires genuine
+second-order content, `∂²[c·a₀(ξ)]/∂ξ² = c Σ_Z ∂²Φ_k/∂ξ² ≠ 0`, and
+the realized position curvature splits as
+
+    κ = Σ_P [ (y/U²)(∂U)² + (1 − y/U) ∂²U ]
+        + c · ∂²(Z-overlap mass)/∂ξ² ,
+
+with mass invariance (`Σ_all ∂²Φ = 0`) trading the second term against
+the counted-pixel model terms to give the P-only identity (15) — two
+ledgers, one number. Physically: **counts attract** (from the tails,
+anti-restoringly — the §8.5 failure mode), **absences repel** (an atom
+whose counted island is surrounded by darkness has its `Z`-overlap
+minimized at the island's center — silence localizes). The absence
+stiffness scales as `c·e^{−R²/2σ²}(R²−σ²)/σ⁴` for a counted island of
+radius `R`: negligible for `R ≫ σ`, material exactly for
+threshold-significance peaks in the sparse regime, whose islands are
+of order σ. So the order classification above is coordinate-dependent:
+`Z`-evidence is order-1 in amplitude (defining the null space,
+resolved by deactivation) but order-2-capable in position, where the
+ω-dependence of the augmented weight `a₀(ω)` is the storage location
+of the position information carried by silence.
+
 ### References
 
 - Nesterov & Nemirovskii, *Interior-Point Polynomial Algorithms in Convex
