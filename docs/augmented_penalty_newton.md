@@ -5,10 +5,14 @@ which developed the forward–backward and semismooth Newton framework of the
 matrix-free finder from first principles. This note prepares the ground for a
 second-order solver with *global* guarantees on the Poisson objective. It
 introduces the definitions and literature needed (self-concordance, proximal
-Newton, error bounds), proves what can be proved today — an exact splitting of
-the Poisson likelihood, a damped-step decrease theorem valid for singular
-Hessians, and global convergence without any Hessian regularization — and
-states precisely the outstanding local-rate result, which is left open here.
+Newton, error bounds) and proves: an exact splitting of the Poisson
+likelihood, a damped-step decrease theorem valid for singular Hessians,
+global convergence without any Hessian regularization (§4), and — under
+uniqueness and strict complementarity — finite active-set identification and
+local quadratic convergence (§6, with the mechanical obligations that remain
+flagged in §6.3). The instructive dead end is also recorded: the natural
+quotient-space proof of the local rate fails, for a reason that is itself a
+result about this problem class (§6.1).
 
 The motivating measurement is a certificate that lied. A prototype damped
 proximal Newton method (exact Hessian weight, decrement-based step control,
@@ -292,37 +296,131 @@ gradient norm.
 
 ---
 
-## 6. The outstanding result
+## 6. The local rate: the quotient fails, the face succeeds
 
-**Conjecture (local rate without regularization).** Under strict
-complementarity at the (unique, for `β ≠ 0`) minimizer, the exact-subproblem
-iteration of Theorem C identifies the optimal active set in finitely many
-steps, after which the null components of the error are resolved exactly by
-the prox and the range components contract quadratically in the local norm of
-`h`: the method is locally superlinear (plausibly quadratic in
-`‖A_P(c_k − c*)‖`), with **no** Hessian regularization.
+The first natural strategy for the local rate is to quotient out the
+degeneracy: `f₊` is constant on cosets of `N(A_P)` (Lemma A), so pass to
+`Rⁿ/N(A_P)`, where the Hessian is nondegenerate, and run the classical
+self-concordant quadratic-phase argument there.
 
-Why this is not a corollary of the literature: the superlinear results under
-the Luo–Tseng error bound control the null space with the regularizer `μ_k I`
-— remove it and their proofs lose the handle on exactly the directions Lemma
-A describes. The natural repair is to quotient by `N(A_P)` and run the
-self-concordant quadratic-phase argument in the range factor only; the
-obstruction is that `g` is polyhedral in `c`, *not* in `A_P c`, so the
-quotient does not act cleanly on the nonsmooth part. Making that argument
-rigorous — or finding the counterexample that shows the rate degrades — is
-the open task. Two further obligations for an implementable theorem:
+### 6.1 Why the quotient fails
 
-1. **Inexact subproblems.** Theorem C assumes exact `d`. The practical
-   variant accepts `d̂` with model decrease `Δ̂ ≥ ρ Δ` for fixed
-   `ρ ∈ (0, 1]`; the decrease bound (12) degrades by controlled factors and
-   the global corollary survives — this is mechanical and should be written
-   out with the constants.
-2. **Literature diligence.** Before any novelty claim: Sun & Tran-Dinh's
+The subproblem does not descend to the quotient. `g` is not constant on
+cosets: by (9), `⟨λ', v⟩ > 0` for *every* nonzero `v ≥ 0` in `N(A_P)`, and
+the cone `{c ≥ 0}` is not coset-invariant either. The obstruction is not
+technical bookkeeping — it is the augmentation itself. §3 deliberately
+*placed information on the null directions* (the empty-pixel evidence `a₀`),
+so any construction that factors those directions out is blind to the very
+term that made the problem well posed. The correct reading: in this problem
+class, degeneracy is resolved **pointwise by the polyhedral part**, never
+**uniformly by quotienting**. One must split by the optimal *face*, not by
+the null *space*.
+
+### 6.2 Splitting by the face
+
+Standing assumptions for this section, on top of §3:
+
+- **(A1) uniqueness:** `F` has a unique minimizer `c*` (for the finder this
+  is the `β ≠ 0` regime; Theorem 1 of the notes denies it at the Radon
+  point). Write `S = supp(c*)`, `T = span{e_i : i ∈ S}`.
+- **(A2) strict complementarity:** `(∇f₊(c*) + λ')_i ≥ γ > 0` for all
+  `i ∉ S`.
+
+**Lemma D (uniqueness transfers nondegeneracy to the face).** Under (A1),
+`N(A_P) ∩ T = {0}`; consequently `H(c)|_T = A_Sᵀ ∇²h A_S ⪰ m I_T` with
+`m > 0` uniformly on a neighbourhood of `c*`.
+
+*Proof.* Let `v ∈ N(A_P) ∩ T`. Since `c*_S > 0` and `v` is supported on `S`,
+the line `c* ± tv` is feasible for small `t > 0`, and along it `f₊` is
+constant by Lemma A, so `F(c* ± tv) = F(c*) ± t⟨λ', v⟩`. Optimality of `c*`
+against *both* directions forces `⟨λ', v⟩ = 0` — but then the whole segment
+consists of minimizers, contradicting (A1) unless `v = 0`. Uniformity follows
+from continuity of `∇²h` and injectivity of `A_S` on the finite-dimensional
+`T`. ∎
+
+This one-paragraph lemma is the bridge of the whole theory: **estimator
+identifiability implies solver nondegeneracy on the optimal face.** It is
+where `β ≠ 0` earns the local rate — at `γ = 1` uniqueness fails, Lemma D
+fails with it, and the stall measured there in the solver-arm study is this
+lemma's failure observed numerically. (In spirit the statement is familiar
+from lasso uniqueness theory, cf. Tibshirani; its role here — feeding a
+self-concordant Newton analysis — appears to be new.)
+
+**Lemma E (finite identification).** Under (A1)–(A2), with exact subproblems:
+`c_k → c*`, and there is `K` such that for all `k ≥ K` every subproblem
+solution `d_k` satisfies `supp(c_k + d_k) = S`, with the `S`-coordinates
+strictly positive.
+
+*Proof.* `c_k → c*` follows from the global corollary, compact level sets,
+and (A1). Off the support: for `i ∉ S`, subproblem stationarity says
+`(∇f₊(c_k) + H_k d_k + λ')_i ≥ 0` *with equality whenever
+`(c_k + d_k)_i > 0`*. By Cauchy–Schwarz,
+`|(H_k d_k)_i| = |⟨W_k^{1/2} A_P e_i, W_k^{1/2} A_P d_k⟩| ≤ C ν_k`, with `C`
+uniform on the level set (weights bounded above and below there, again by the
+background floor), and `ν_k → 0` by Theorem C. Since
+`(∇f₊(c_k) + λ')_i → (∇f₊(c*) + λ')_i ≥ γ`, eventually the stationarity
+component is `≥ γ/2 > 0`, which forbids equality: `(c_k + d_k)_i = 0` for
+every `i ∉ S`. This holds for *every* solution: all subproblem solutions
+share the same `A_P d` (the objective is strictly convex in `A_P d`), hence
+the same `H_k d_k`, hence the same strict inequality. On the support: from
+`(d_k)_i = −(c_k)_i → 0` off `S` and `‖A_P d_k‖ ≤ ν_k / w_min^{1/2} → 0`,
+injectivity of `A_S` on `T` (Lemma D) gives `(d_k)_S → 0`, so
+`(c_k + d_k)_i → c*_i > 0` for `i ∈ S`. ∎
+
+**Theorem D (quadratic local convergence, no regularization).** Under
+(A1)–(A2) and the assumptions of §3, the exact-subproblem iteration of
+Theorem C identifies `S` in finitely many steps, after which it coincides
+with unconstrained Newton's method on the standard self-concordant,
+**nondegenerate** function `φ = (f₊ + ⟨λ', ·⟩)` restricted to the affine
+hull of the face. The classical quadratic phase applies — decrement
+contraction `ν̃_{k+1} ≤ (ν̃_k/(1 − ν̃_k))²` once `ν̃_k` is small — and, by
+Lemma D's uniform `m > 0`, the iterates converge quadratically to `c*` in
+the ordinary norm.
+
+*Proof.* By Lemma E, past `K` every subproblem solution lies on the face
+with `S`-coordinates interior, where the inequality constraints are inactive;
+on the face the subproblem reduces to the unconstrained Newton step of `φ`
+(unique, since `H|_T ≻ 0` by Lemma D). `φ|_T` is standard self-concordant
+(restriction of a standard SC function to an affine subspace, plus a linear
+term) with Hessian `⪰ m I_T` near `c*`, so the textbook Newton phase-two
+theory applies verbatim; positive definiteness converts decrement contraction
+into norm contraction. Remaining bookkeeping — the damped-to-full switch and
+the invariance of the identification basin under the contraction — is
+mechanical and flagged in §6.3. ∎
+
+Together with Theorem C this closes an arc worth stating plainly. Theorem 3
+of the theory notes proved that the *unconstrained* active-set Newton system
+is consistent **iff the estimator is ill-posed** — well-posedness and Newton
+were mutually exclusive (Corollary 3). With the constraint and penalty inside
+the subproblem, the dichotomy inverts: *constrained* proximal Newton is
+globally convergent always (Theorem C) and quadratically convergent **iff
+the estimator is well posed** (unique and strictly complementary, via Lemma
+D). The estimator's health and the solver's speed are the same fact, seen
+twice.
+
+### 6.3 Remaining obligations
+
+1. **Mechanical, to be written out:** the damped-to-full-step switch rule
+   and the argument that one quadratic step keeps the iterate inside the
+   identification basin of Lemma E (standard basin bookkeeping); constants
+   in Lemma E's `C` and `γ/2` made explicit.
+2. **Inexact subproblems.** Theorem C and Lemma E assume exact `d`. The
+   practical variant accepts `d̂` with model decrease `Δ̂ ≥ ρ Δ` for fixed
+   `ρ ∈ (0, 1]`; the global bound (12) degrades by controlled factors, and
+   Lemma E needs the inexactness to vanish fast enough near the end
+   (superlinear retention under `Δ̂/Δ → 1`, standard in inexact Newton
+   theory but to be carried through the seminorm bookkeeping).
+3. **Without strict complementarity** the identification argument fails and
+   the expected behaviour is degradation to a linear rate — not attempted
+   here.
+4. **Literature diligence.** Before any novelty claim: Sun & Tran-Dinh's
    generalized self-concordance (their treatment of Poisson-type losses may
    subsume §1.2's integer-counts observation), Bach's self-concordant GLM
-   analysis, and the recent degenerate/inexact proximal Newton literature.
-   The assessment above — assembly publishable as a note, the
-   no-regularization local rate genuinely new — is a prior, not a verdict.
+   analysis, lasso-uniqueness theory (Tibshirani), and the recent
+   degenerate/inexact proximal Newton literature. The assessment — Theorem C
+   plus Theorem D as an assembly is a publishable note, Lemma D's role as
+   the identifiability-to-nondegeneracy bridge the most likely genuinely new
+   element — is a prior, not a verdict.
 
 ### References
 
@@ -352,4 +450,6 @@ the open task. Two further obligations for an implementable theorem:
   2023.
 - Hare & Lewis, *Identifying active constraints via partial smoothness and
   prox-regularity*, J. Convex Anal. 11(2), 2004.
+- Tibshirani, R. J., *The lasso problem and uniqueness*, Electron. J. Stat.
+  7, 2013.
 - Rockafellar & Wets, *Variational Analysis*, Springer, 1998.
