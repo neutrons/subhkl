@@ -681,6 +681,64 @@ refinement stability. Where the exact quadrature does matter is
 — an integration-accuracy argument for the erf model, not a stability
 one.
 
+### 8.5 The exact failure mode of finite background, and the (non-)existence of a background threshold
+
+The per-count position stiffness admits a closed factorization. With
+`U = B + s`, `s = A e^{−x²/2σ²}`:
+
+    h(x) = s(x) · [σ² s(x) − (x² − σ²) B] / (U² σ⁴),                  (19)
+
+destabilizing iff `s(x)/B < x²/σ² − 1`. The mechanism, exactly: at
+`B = 0` the logarithm linearizes the Gaussian — `−log s` is quadratic
+in displacement, every count is a spring of stiffness `1/σ²`
+(log-concavity). A background floor **de-linearizes the log**: where
+`s ≪ B`, `log(B+s) ≈ log B + s/B` retains the raw exponential, whose
+tail is *convex* in the atom's displacement toward the count — the
+count's pull grows as the atom approaches, an anti-restoring runaway
+attraction. For every `B > 0` the destabilizing annulus exists, its
+inner radius receding only logarithmically (`x_c ≈ σ√(2 log(A/B))`) as
+`B → 0`.
+
+**Is there a `B` threshold below which any σ is robust?** No — in
+three sharpenings, one of which corrects a conjecture we ourselves
+made first.
+
+1. *Deterministically*, only `B = 0` is a sanctuary: for any `B > 0`,
+   ring configurations at growing radius (requiring exponentially many
+   counts as `B → 0`, so astronomically unlikely but legal) pass the
+   significance test with a saddle.
+2. *At fixed matched-filter significance `z`, lowering `B` makes
+   things worse, not better.* We first conjectured contrast domination
+   (`πσ²B ≲ z²`) would suppress failures; the exact computation
+   refutes the direction. Measured `c*(σ, B)` at `z = 4.5` rises
+   monotonically as `B` falls — 1.78 (B=50) → 1.91 (B=10) → 2.66
+   (B=0.2) → 4.92 (B=0.005) at σ=1 — for two reasons: contrast
+   *saturates* the core Fisher information (`(∂s)²/(B+s)`), while in
+   sparse background detection significance becomes cheap (the matched
+   filter accumulates `s²/B` over the wide tails), so a fixed `z` buys
+   fewer and fewer actual photons: `N_sig = 2πσ²A = 1.2` expected
+   photons already give `z = 4.5` at `B = 0.005`.
+3. *The true invariant is a two-currency law.* Position robustness is
+   paid in photons in sparse background and in significance in dense
+   background:
+
+       E[κ]/√Var[κ] ≈ z/√3              (dense: πσ²B ≫ z²),
+       E[κ]/√Var[κ] ≈ (0.6–0.9)·√N_sig  (sparse: counts-limited),
+
+   with the deterministic surface `c*(σ, B)` interpolating (computable
+   a priori, no data). Monte-Carlo shows the Gaussian conversion
+   `Φ(−z/c*)` is *conservative* in the sparse regime (0/199 observed
+   at B=0.5 where 1.6% was predicted; discreteness and skewness of the
+   few-count statistic suppress the left tail), so `Φ(−z/c*)` is a
+   safe upper estimate for flag-rate planning.
+
+Practical rule: "any σ is robust" is not a background threshold but a
+**per-peak resource threshold** — either `z ≳ 3·c*(σ, B)` in the
+dense regime, or `N_sig ≳ 15–20` signal photons in the sparse regime.
+Both are checkable from the fit itself; the per-peak empirical Hessian
+of §8.3 remains the exact detector, and `Φ(−z/c*(σ, B))` prices its
+expected trigger rate.
+
 ### References
 
 - Nesterov & Nemirovskii, *Interior-Point Polynomial Algorithms in Convex
