@@ -445,6 +445,30 @@ twice.
    seminorm bookkeeping. A practical corollary the prototype confirmed: for
    exact solutions `δ = Δ − ½ν² ≥ 0`, so a computed `δ̂ < 0` is a free,
    rigorous inexactness alarm.
+
+   *On the majorizing diagonal.* `D = diag(H·1)` (row sums, one
+   operator application) majorizes any symmetric entrywise-nonnegative
+   `H` by a one-line identity: `vᵀ(D−H)v = ½Σᵢⱼ Hᵢⱼ(vᵢ−vⱼ)² ≥ 0` —
+   `D − H` is literally the graph Laplacian of the weight graph `H`
+   (equivalently: Gershgorin's circle theorem applied to the
+   diagonally-dominant `D−H`). The bound is not merely safe but
+   near-tight: equality holds on constant vectors, and by
+   Perron–Frobenius the spectral radius of a nonnegative
+   translation-invariant operator is attained on a positive,
+   asymptotically constant eigenvector — so the row-sum diagonal
+   matches `H` exactly along the direction that carries `λ_max`,
+   delivering power-iteration accuracy from one matvec plus
+   per-channel adaptivity across the scale bank. It threads between
+   the two measured failure modes: `diag(H)` underestimates `λ_max`
+   by the footprint area `‖φ‖₁²/‖φ‖₂² = 4πσ²` (Prop. 2 of the theory
+   notes), and a scalar `1/λ_max` step over-damps fine channels by
+   `(σ_max/σ_min)²`. Lineage: row-sum/separable majorizers are
+   classical in tomography MM (De Pierro; Erdogan–Fessler separable
+   paraboloidal surrogates) and implicit in NMF multiplicative
+   updates, but are not standard practice in the QP/proximal-Newton
+   literature; here their use is *forced* — box geometry admits only
+   diagonal metrics near the boundary (projection must remain a
+   clamp), and the no-line-search framework demands a certified one.
 3. **Without strict complementarity** the identification argument fails and
    the expected behaviour is degradation to a linear rate — not attempted
    here.
