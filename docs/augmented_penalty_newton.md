@@ -629,6 +629,58 @@ as the position-space sibling of the `Δ` certificate, and into Part II
 of the companion paper: the same matrix's inverse is the position
 covariance for `σ(ξ)` reporting.
 
+### 8.4 The a priori failure law, and the role of the pixel quadrature
+
+The incidence of the finite-sample saddle admits a closed form. In the
+background-dominated regime the curvature statistic `κ = Σ y_k h_k`
+(with `h_k` the bracket of (15)) has mean equal to the Fisher position
+information, `E[κ] = πA²/2B`, and variance dominated by the second
+Gaussian-moment integral, `Var[κ] ≈ 3πA²/4σ²B`. In the ratio,
+**σ, B, and the pixel size all cancel**:
+
+    E[κ]/√Var[κ] = √(π/3) · Aσ/√B = z/√3,
+    ⟹  P(saddle) ≈ Φ(−z/√3).                                          (18)
+
+Check: `Φ(−4.5/√3) = 0.47%` against the measured `1/200 = 0.5%` in
+§8.3's Monte-Carlo. The law is universal to leading order; pixelation
+and finite signal-to-background enter through a correction factor
+computed exactly (deterministic pixel sums over the erf profile — no
+data required):
+
+| σ [px] | c\*(σ) in `P = Φ(−z/c*)` |
+|---|---|
+| 1.0 | 1.906 |
+| 1.5 | 1.858 |
+| 2.0 | 1.829 |
+| 3.0 | 1.798 |
+| 4.0 | 1.782 |
+| ∞ (law) | √3 = 1.732 |
+
+So the a priori, per-reported-peak worst case is
+`Φ(−α_eff(σ_min)/c*(σ_min))` — the false-alarm floor is largest at
+`σ_min`, and so is `c*` — and the expected number of flagged positions
+per frame is `Σ_peaks Φ(−z_i/c*(σ_i))`. At threshold significance the
+failure rate roughly doubles between σ=4 and σ=1 px (0.47% → 0.91%).
+
+**Does the erf (per-pixel) quadrature improve this?** No — measured,
+and the negative is informative. The law (18) is invariant under the
+flux-conserving box smoothing that pixel integration applies
+(`σ_eff² = σ² + w²/12` scales `z` and `E/√Var` identically), so the
+quadrature choice cannot move the stochastic rate at measured `z`. The
+remaining worry was systematic: a midpoint-sampled model against
+integrating-detector data leaves a ring-shaped quadrature residual
+(`∝ (w²/24)(x²−σ²)/σ⁴`), exactly the destabilizing geometry of §8.2.
+Measured against noiseless erf data, the resulting deterministic
+curvature bias is `+0.10·√Var` at σ = 1 px (stabilizing in sign),
+falling to `+0.006·√Var` at σ = 4: negligible against the stochastic
+scale throughout the admissible bank. This quantifies the safety
+margin of the standing policy "quadrature spacing well below σ_min" —
+for `w/σ ≤ 1` the quadrature choice is a sub-tenth-of-a-σ effect on
+refinement stability. Where the exact quadrature does matter is
+*flux*: the midpoint fit underestimates amplitude by 3.5% at σ = 1 px
+— an integration-accuracy argument for the erf model, not a stability
+one.
+
 ### References
 
 - Nesterov & Nemirovskii, *Interior-Point Polynomial Algorithms in Convex
