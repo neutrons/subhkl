@@ -4,6 +4,8 @@ import json
 import re
 import sys
 
+from pathlib import Path
+
 import h5py
 import pytest
 import typer
@@ -11,6 +13,13 @@ import typer
 from typer.testing import CliRunner
 
 from subhkl.utils import provenance
+
+# The commit can only be looked up in git when subhkl is imported from a
+# checkout, which is not the case when it is installed from a wheel.
+SOURCE_TREE = Path(provenance.__file__).resolve().parents[3]
+from_a_checkout = pytest.mark.skipif(
+    not (SOURCE_TREE / ".git").exists(), reason="subhkl is not imported from a checkout"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -20,13 +29,18 @@ def _clear_build_info_cache():
     provenance.build_info.cache_clear()
 
 
-def test_build_info_reports_version_and_commit():
+def test_build_info_reports_a_version_and_a_commit():
     info = provenance.build_info()
 
     assert info["subhkl_version"]
     assert info["git_commit"]
-    # subhkl is developed and tested from a git checkout, so the commit the
-    # code was built from must be resolvable here.
+    assert info["git_commit_source"]
+
+
+@from_a_checkout
+def test_build_info_finds_the_commit_in_the_checkout():
+    info = provenance.build_info()
+
     assert re.fullmatch(r"[0-9a-f]{40}", info["git_commit"])
     assert info["git_commit_source"] == "git"
 
