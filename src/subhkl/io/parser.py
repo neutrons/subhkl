@@ -569,9 +569,7 @@ def integrator(
 
 
 @app.command()
-@provenance.track(
-    outputs=("output_mtz_filename",), inputs=("indexed_h5_filename",)
-)
+@provenance.track(outputs=("output_mtz_filename",), inputs=("indexed_h5_filename",))
 def mtz_exporter(
     indexed_h5_filename: str,
     output_mtz_filename: str,

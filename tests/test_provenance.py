@@ -62,13 +62,13 @@ def test_command_line_is_recorded_the_way_it_is_typed(monkeypatch):
     monkeypatch.setitem(sys.modules, "__main__", _Main())
     monkeypatch.setattr(sys, "argv", ["/some/where/parser.py", "reduce", "in.nxs"])
 
-    assert provenance.command_line().endswith(
-        "-m subhkl.io.parser reduce in.nxs"
-    )
+    assert provenance.command_line().endswith("-m subhkl.io.parser reduce in.nxs")
 
 
 def test_record_renders_values_that_hdf5_cannot_hold():
-    record = provenance.new_record("indexer", {"ki_vec": [0.0, 0.0, 1.0], "obj": object()})
+    record = provenance.new_record(
+        "indexer", {"ki_vec": [0.0, 0.0, 1.0], "obj": object()}
+    )
 
     assert record["parameters"]["ki_vec"] == [0.0, 0.0, 1.0]
     assert isinstance(record["parameters"]["obj"], str)
@@ -169,9 +169,7 @@ def test_a_chain_of_steps_accumulates_provenance(tmp_path):
     second_output = tmp_path / "second.mtz"
 
     CliRunner().invoke(app, ["first", "input.nxs", str(first_output)])
-    result = CliRunner().invoke(
-        app, ["second", str(first_output), str(second_output)]
-    )
+    result = CliRunner().invoke(app, ["second", str(first_output), str(second_output)])
     assert result.exit_code == 0, result.output
 
     # the mtz is not an HDF5 file, so its provenance lands in a sidecar
@@ -219,9 +217,7 @@ def test_an_input_that_is_not_hdf5_is_not_a_problem(tmp_path):
     image.write_bytes(b"II*\x00 not an hdf5 file")
     output = tmp_path / "first.h5"
 
-    result = CliRunner().invoke(
-        _make_app(tmp_path), ["first", str(image), str(output)]
-    )
+    result = CliRunner().invoke(_make_app(tmp_path), ["first", str(image), str(output)])
 
     assert result.exit_code == 0, result.output
     assert len(provenance.read_records(output)) == 1
