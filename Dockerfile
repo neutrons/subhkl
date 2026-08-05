@@ -16,6 +16,10 @@ WORKDIR /build
 # Copy project files (include .git so versioningit can compute versions)
 COPY . /build/
 
+# Bake the commit into the package so every run can report what it was built
+# from, since the image itself carries no git metadata
+RUN git rev-parse HEAD > src/subhkl/resources/git_commit.txt || true
+
 # Create virtual environment and install dependencies
 RUN uv venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
