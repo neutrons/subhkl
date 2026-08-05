@@ -18,6 +18,7 @@ from subhkl.commands import (
     run_merge_images,
     run_zone_axis_search,
 )
+from subhkl.utils import provenance
 
 
 app = typer.Typer()
@@ -60,6 +61,7 @@ app = typer.Typer()
 
 
 @app.command()
+@provenance.track(outputs=("output_filename",), inputs=("filename",))
 def finder(
     filename: Annotated[str, typer.Argument(help="Input raw/event Nexus file")],
     instrument: Annotated[str, typer.Argument(help="Instrument name")],
@@ -146,6 +148,10 @@ def finder(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_peaks_filename",),
+    inputs=("peaks_h5_filename", "bootstrap_filename"),
+)
 def indexer(
     peaks_h5_filename: str,
     output_peaks_filename: str,
@@ -356,6 +362,10 @@ def indexer(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_filename",),
+    inputs=("filename", "integration_peaks_filename"),
+)
 def rbf_integrator(
     filename: Annotated[str, typer.Argument(help="Merged HDF5 image stack")],
     instrument: Annotated[str, typer.Argument(help="Instrument name")],
@@ -421,6 +431,7 @@ def rbf_integrator(
 
 
 @app.command()
+@provenance.track()  # reports metrics on screen, so there is nothing to stamp
 def metrics(
     file1: Annotated[
         str, typer.Argument(help="Primary file (e.g., indexer.h5 or predictor.h5)")
@@ -475,6 +486,10 @@ def metrics(
 
 
 @app.command()
+@provenance.track(
+    outputs=("integration_peaks_filename",),
+    inputs=("filename", "indexed_hdf5_filename"),
+)
 def peak_predictor(
     filename: str,
     instrument: str,
@@ -502,6 +517,10 @@ def peak_predictor(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_filename",),
+    inputs=("filename", "integration_peaks_filename", "found_peaks_file"),
+)
 def integrator(
     filename: str,
     instrument: str,
@@ -550,6 +569,9 @@ def integrator(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_mtz_filename",), inputs=("indexed_h5_filename",)
+)
 def mtz_exporter(
     indexed_h5_filename: str,
     output_mtz_filename: str,
@@ -561,6 +583,7 @@ def mtz_exporter(
 
 
 @app.command()
+@provenance.track(outputs=("output_filename",), inputs=("nexus_filename",))
 def reduce(
     nexus_filename: str,
     output_filename: str,
@@ -578,6 +601,7 @@ def reduce(
 
 
 @app.command()
+@provenance.track(outputs=("output_filename",))
 def merge_images(
     input_pattern: Annotated[
         str,
@@ -603,6 +627,10 @@ def merge_images(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_h5_filename",),
+    inputs=("merged_h5_filename", "peaks_h5_filename"),
+)
 def zone_axis_search(
     merged_h5_filename: str,
     peaks_h5_filename: str,
@@ -684,6 +712,49 @@ def zone_axis_search(
         output_hough=output_hough,
         batch_size=batch_size,
     )
+
+
+@app.command()
+def version():
+    """
+    Print the version of subhkl and the commit it was built from.
+    """
+    info = provenance.build_info()
+    commit = info["git_commit"]
+    if info.get("git_dirty"):
+        commit += " (dirty)"
+    print(f"subhkl {info['subhkl_version']}")
+    print(f"commit {commit} (from {info['git_commit_source']})")
+
+
+@app.command(name="provenance")
+def show_provenance(
+    filename: Annotated[
+        str, typer.Argument(help="Output file of any subhkl step (e.g. indexer.h5)")
+    ],
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the records as JSON.")
+    ] = False,
+):
+    """
+    Print how a file was produced: the command line, options, version and
+    commit of every subhkl step that contributed to it.
+    """
+    records = provenance.read_records(filename)
+    if not records:
+        print(f"No provenance recorded in {filename}.")
+        raise typer.Exit(code=1)
+
+    if as_json:
+        import json
+
+        print(json.dumps(records, indent=2, default=str))
+        return
+
+    for index, record in enumerate(records):
+        if index:
+            print()
+        print(f"[step {index}] {provenance.format_record(record).lstrip()}")
 
 
 if __name__ == "__main__":
