@@ -180,3 +180,9 @@ tools/
 
 # direnv
 .envrc
+
+# Editor swap and backup files
+*.swp
+*.swo
+*~
+.*.sw?

@@ -38,7 +38,16 @@ jobs:
         os:
           - ubuntu-latest
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    # Two heavyweights share this job.  test_1_to_n_goniometer_mapping runs
+    # the indexer with refine_goniometer=True (a global search): 28.6 min on
+    # main, 46.1 min here.  The sparse-rbf finder tests run the global solver
+    # to its convergence certificate (the relative KKT stopping test) instead
+    # of exiting early at an uncertified point, which is 2-3x more solver
+    # iterations per test: ~40 min locally, ~100 min on a hosted runner.  The
+    # previous 120-minute budget was measured-cancelled at exactly 2h; 240
+    # leaves room for runner variance.  If this becomes painful, shard the
+    # job (sparse-rbf suite vs the rest) rather than weakening the stop test.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
       - name: Install uv

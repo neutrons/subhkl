@@ -88,14 +88,57 @@ def finder(
     peak_minimum_pixels: int = 30,
     peak_minimum_signal_to_noise: float = 1.0,
     peak_pixel_outlier_threshold: float = 2.0,
-    sparse_rbf_alpha: float = 0.1,
-    sparse_rbf_gamma: float = 1.0,
+    sparse_rbf_alpha: Annotated[
+        float | None,
+        typer.Option(
+            help="Significance threshold in units of coefficient noise. Left "
+            "unset it is derived so the expected number of false detections "
+            "over the image is O(1), which depends on the image size; set it "
+            "to demand more evidence than that."
+        ),
+    ] = None,
+    sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
     sparse_rbf_max_sigma: float = 10.0,
+    sparse_rbf_false_alarms_per_image: Annotated[
+        float,
+        typer.Option(
+            help="Expected number of false peaks per image (the m0 of the "
+            "false-alarm calibration). This is the parameter that sets the "
+            "detection budget: the significance threshold is solved from "
+            "E[false peaks] = m0 over every (position, scale) tested, so "
+            "lowering it demands more evidence everywhere at once. gamma "
+            "reshapes the threshold across scales at constant budget."
+        ),
+    ] = 1.0,
+    sparse_rbf_num_sigmas: Annotated[
+        int,
+        typer.Option(
+            help="Number of widths in the basis bank, spaced linearly from "
+            "--sparse-rbf-min-sigma to --sparse-rbf-max-sigma. Controls the "
+            "bank's resolution independently of its ceiling: raising max-sigma "
+            "alone widens the spacing, which approximates a peak whose true "
+            "width falls between two available scales with several atoms "
+            "instead of one."
+        ),
+    ] = 5,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_loss: Annotated[
-        str, typer.Option(help="Likelihood for peak finder.")
-    ] = "gaussian",
+        str,
+        typer.Option(
+            help="Likelihood for the peak finder. Detector frames are photon "
+            "counts, so 'poisson' is the matching noise model; 'gaussian' "
+            "assumes a single constant variance across the frame."
+        ),
+    ] = "poisson",
+    sparse_rbf_legacy: Annotated[
+        bool,
+        typer.Option(
+            help="Use the original greedy matching-pursuit sparse-RBF finder "
+            "instead of the global basis-pursuit one. Opt-out for the new "
+            "default; the greedy path is scheduled for removal."
+        ),
+    ] = False,
     sparse_rbf_auto_tune_alpha: Annotated[
         bool, typer.Option(help="Auto-tune SNR threshold.")
     ] = False,
@@ -137,8 +180,11 @@ def finder(
         sparse_rbf_gamma=sparse_rbf_gamma,
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
+        sparse_rbf_num_sigmas=sparse_rbf_num_sigmas,
+        sparse_rbf_false_alarms_per_image=sparse_rbf_false_alarms_per_image,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,
+        sparse_rbf_legacy=sparse_rbf_legacy,
         sparse_rbf_auto_tune_alpha=sparse_rbf_auto_tune_alpha,
         sparse_rbf_candidate_alphas=sparse_rbf_candidate_alphas,
         max_workers=max_workers,

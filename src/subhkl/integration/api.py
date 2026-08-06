@@ -334,6 +334,25 @@ class Peaks:
             f["peaks/sigma"] = detector_peaks.sigma
             f["peaks/radius"] = detector_peaks.radii
 
+            # Per-peak quality metrics, written only when the finder supplies
+            # them.  `deviance` is the leave-one-out likelihood-ratio statistic
+            # for that peak's presence (is it real?), calibrated against chi^2
+            # with four degrees of freedom; `residual_deviance` is the local
+            # goodness of fit per degree of freedom over the peak's own
+            # footprint (is it fitted correctly?), calibrated near 1.  A
+            # mis-sized peak scores high on the first and badly on the second.
+            n_peaks = len(detector_peaks.intensity)
+            if (
+                detector_peaks.deviance is not None
+                and len(detector_peaks.deviance) == n_peaks
+            ):
+                f["peaks/deviance"] = detector_peaks.deviance
+            if (
+                detector_peaks.residual_deviance is not None
+                and len(detector_peaks.residual_deviance) == n_peaks
+            ):
+                f["peaks/residual_deviance"] = detector_peaks.residual_deviance
+
             # Use pixel coordinates exclusively
             f["peaks/pixel_r"] = detector_peaks.peak_rows
             f["peaks/pixel_c"] = detector_peaks.peak_cols
@@ -361,6 +380,8 @@ class Peaks:
         lamda_max: list[float] = []
         intensity: list[float] = []
         sigma: list[float] = []
+        deviance: list[float] = []
+        residual_deviance: list[float] = []
         radii: list[float] = []
         xyz_out: list[list[float]] = []
         banks: list[int] = []
@@ -380,6 +401,10 @@ class Peaks:
                 lamda_max.extend(res["lamda_max"])
                 intensity.extend(res["intensity"])
                 sigma.extend(res["sigma"])
+                deviance.extend(res.get("deviance", [0.0] * res["count"]))
+                residual_deviance.extend(
+                    res.get("residual_deviance", [0.0] * res["count"])
+                )
                 radii.extend(res["radii"])
                 xyz_out.extend(res["xyz"])
                 banks.extend(res["banks"])
@@ -409,6 +434,8 @@ class Peaks:
             self.goniometer.names_raw,
             peak_rows,
             peak_cols,
+            deviance,
+            residual_deviance,
         )
 
         if visualize:
