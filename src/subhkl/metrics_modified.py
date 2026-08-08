@@ -220,7 +220,7 @@ def compute_metrics(
     instrument: str | None = None,
     d_min: float | None = None,
     per_run: bool = False,
-    per_hkl: bool | None = None,
+    per_hkl: bool = False,
     ki_vec_override: np.ndarray | None = None,
 ) -> dict:
     try:
@@ -475,26 +475,15 @@ def compute_metrics(
             "max_ang_err": float(np.max(ang_err)),
             "num_peaks": len(h),
         }
-        print("computing error per_hkl")
-        
+
         if per_hkl:
-            hkl_table = compute_hkl_statistics(h, k, l, d_err, ang_err)
-
-            with h5py.File(file1, "a") as fout:
-                metrics_grp = fout.require_group("metrics")
-                print("Datasets now:", list(metrics_grp.keys()))
-
-                if "per_hkl" in metrics_grp:
-                    del metrics_grp["per_hkl"]
-
-                metrics_grp.create_dataset(
-                    "per_hkl",
-		    data=hkl_table,
-		    compression="gzip",
-            )
-
-            print("Finished writing per_hkl")
- 
+            hkl_table = compute_hkl_statistics(
+	    h,
+	    k,
+	    l,
+	    d_err,
+	    ang_err,
+	)
         if d_filter_message:
             result["filter_message"] = d_filter_message
 
@@ -510,7 +499,7 @@ def compute_metrics(
             run_errors.sort(key=lambda x: x[1], reverse=True)
             result["per_run_errors"] = run_errors
 
-        return result #hkl_table if per_hkl else None
+        return result
 
     except Exception as e:
         import traceback

@@ -476,24 +476,26 @@ def compute_metrics(
             "num_peaks": len(h),
         }
         print("computing error per_hkl")
-        
+        hkl_table = None
         if per_hkl:
-            hkl_table = compute_hkl_statistics(h, k, l, d_err, ang_err)
+            hkl_table = compute_hkl_statistics(
+	    h,
+	    k,
+	    l,
+	    d_err,
+	    ang_err,
+	)
+        with h5py.File(file1, "a") as fout:
+            metrics_grp = fout.require_group("metrics")
+        
+            if "per_hkl" in metrics_grp:
+                del metrics_grp["per_hkl"]
 
-            with h5py.File(file1, "a") as fout:
-                metrics_grp = fout.require_group("metrics")
-                print("Datasets now:", list(metrics_grp.keys()))
-
-                if "per_hkl" in metrics_grp:
-                    del metrics_grp["per_hkl"]
-
-                metrics_grp.create_dataset(
-                    "per_hkl",
+            metrics_grp.create_dataset(
+		    "per_hkl",
 		    data=hkl_table,
 		    compression="gzip",
-            )
-
-            print("Finished writing per_hkl")
+	)
  
         if d_filter_message:
             result["filter_message"] = d_filter_message
@@ -510,7 +512,7 @@ def compute_metrics(
             run_errors.sort(key=lambda x: x[1], reverse=True)
             result["per_run_errors"] = run_errors
 
-        return result #hkl_table if per_hkl else None
+        return result, hkl_table if per_hkl else None
 
     except Exception as e:
         import traceback

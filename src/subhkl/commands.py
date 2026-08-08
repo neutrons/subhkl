@@ -8,8 +8,9 @@ from subhkl.instrument.goniometer import (
 from subhkl.integration import Peaks
 from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
+from subhkl.viz import replay
+from subhkl.instrument.plot_metrics import plot_metric
 from subhkl.viz import detector_assembly, replay
-
 from typing import List
 
 
@@ -878,6 +879,9 @@ def run_metrics(
     file2: str | None = None,
     instrument: str | None = None,
     d_min: float | None = None,
+    per_hkl: bool | None = None,
+    plot = False,
+    metric = "median_ang_err",
     per_run: bool = False,
     ki_vec: List[float] | np.ndarray = None,
 ):
@@ -891,6 +895,7 @@ def run_metrics(
         instrument=instrument,
         d_min=d_min,
         per_run=per_run,
+        per_hkl=per_hkl,
         ki_vec_override=ki_vec,
     )
 
@@ -909,6 +914,24 @@ def run_metrics(
         f"{result['median_ang_err']:.5f} {result['mean_ang_err']:.5f} {result['max_ang_err']:.5f}"
     )
 
+    if plot:
+        plot_metric(
+        file1=file1,
+        metric=metric,
+        output=f"{metric}.png",
+        )
+#    if per_hkl and hkl_table is not None:
+#        with h5py.File(file1, "a") as f:
+#
+#            if "metrics/per_hkl" in f:
+#                del f["metrics/per_hkl"]
+#
+#            f.create_dataset(
+#                "metrics/per_hkl",
+#                data=hkl_table,
+#                compression="gzip",
+#            ) 
+#
     # Print per-run metrics if requested
     if per_run and "per_run_errors" in result:
         print("\nPER-RUN MEDIAN ANGULAR ERROR (deg) - Sorted by error:")
@@ -916,6 +939,17 @@ def run_metrics(
             status = "BAD" if err > 1.0 else "OK"
             print(f"  Run {r:4d}: {err:6.3f} ({count:4d} peaks) [{status}]")
 
+#def run_plot_metrics(
+#    file1: str,
+#    metric: str = "median_ang_err",
+#    output: str = "metric.png",
+#):
+#
+#    plot_hkl_metric(
+#        h5_file=file1,
+#        metric=metric,
+#        output=output,
+#    )
 
 def run_peak_predictor(
     filename: str,
