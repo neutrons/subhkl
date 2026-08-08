@@ -111,17 +111,34 @@ def finder(
             "reshapes the threshold across scales at constant budget."
         ),
     ] = 1.0,
+    sparse_rbf_max_fragmentation_rate: Annotated[
+        float,
+        typer.Option(
+            help="Tolerable unsupported atoms per image -- the bank-sizing "
+            "analogue of --sparse-rbf-false-alarms-per-image.  An unsupported "
+            "atom is one whose leave-one-out deviance falls below the chi^2_4 "
+            "95% point: the signature of one peak reported as a cluster of "
+            "fragments.  Costs nothing extra: the rate maps onto the "
+            "brightness quantile of the measured peak census the bank "
+            "protects (peaks above it may fragment, ~2 unsupported atoms "
+            "each), so it is arithmetic on window moments, not extra solves.  "
+            "The realised rate is reported with the final statistics.  Set "
+            "to 0 (or negative) to keep the fixed p90 census quantile."
+        ),
+    ] = 1.0,
     sparse_rbf_num_sigmas: Annotated[
-        int,
+        int | None,
         typer.Option(
             help="Number of widths in the basis bank, spaced linearly from "
             "--sparse-rbf-min-sigma to --sparse-rbf-max-sigma. Controls the "
             "bank's resolution independently of its ceiling: raising max-sigma "
             "alone widens the spacing, which approximates a peak whose true "
             "width falls between two available scales with several atoms "
-            "instead of one."
+            "instead of one. The default (unset) auto-sizes an adaptive bank "
+            "just dense enough to prevent exactly that fragmentation, and an "
+            "explicit value below that density warns at startup."
         ),
-    ] = 5,
+    ] = None,
     sparse_rbf_chunk_size: int = 512,
     sparse_rbf_loss: Annotated[
         str,
@@ -181,6 +198,7 @@ def finder(
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
         sparse_rbf_num_sigmas=sparse_rbf_num_sigmas,
+        sparse_rbf_max_fragmentation_rate=sparse_rbf_max_fragmentation_rate,
         sparse_rbf_false_alarms_per_image=sparse_rbf_false_alarms_per_image,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,

@@ -318,6 +318,17 @@ def test_gaussian_loss_path_finds_peaks():
     assertion on flux was testing a quantity with no consumer, and it was the
     only thing keeping the debiasing phase alive.  What still needs covering is
     that ``loss="gaussian"`` runs and localises, which is what this asserts.
+
+    Localisation is asserted on the flux-weighted centroid of the detections
+    near each truth position, not on the single nearest detection.  The truth
+    widths here (2.0, 3.0) sat exactly on the historical uniform [1..5] bank,
+    which made a nearest-atom assertion look tight; under the auto-sized bank
+    truth widths are generically off-grid, and the gaussian path may then
+    report a bright peak as a sub-pixel pair straddling the true centre (the
+    thin-grid split on the *position* grid).  The pair's centroid stays within
+    a small fraction of a pixel while the nearest single atom jitters around
+    1 px with GPU nondeterminism, so the centroid is the stable statement of
+    the contract this test exists to keep.
     """
     import numpy as np
 
@@ -345,9 +356,14 @@ def test_gaussian_loss_path_finds_peaks():
         assert len(peaks) >= 2, f"{loss} loss found {len(peaks)} peaks, expected 2"
         for r, c, _sig, _amp in truth:
             d = np.sqrt((peaks[:, 1] - r) ** 2 + (peaks[:, 2] - c) ** 2)
-            assert d.min() < 1.0, (
+            assert d.min() < 2.0, (
                 f"{loss} loss missed the peak at ({r}, {c}); nearest was {d.min():.2f} px"
             )
+            near = peaks[d < 3.0]
+            cy = np.average(near[:, 1], weights=near[:, 0])
+            cx = np.average(near[:, 2], weights=near[:, 0])
+            err = np.sqrt((cy - r) ** 2 + (cx - c) ** 2)
+            assert err < 1.0, f"{loss} loss centroid off by {err:.2f} px at ({r}, {c})"
 
 
 def test_poisson_overlapping_string():
@@ -1190,9 +1206,15 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
             f"gamma={gamma}: E[FP] = {efp:.4f}, not the calibrated 1.0"
         )
 
+    # The comparisons below vary threshold knobs (ref_sigma, m0, alpha) and
+    # compare effective_alpha arrays elementwise, which is only meaningful at
+    # a fixed bank.  Auto-sizing legitimately couples some of those knobs
+    # into the channel count (a stricter m0 raises z, strengthens the
+    # anti-carpet tax, and can drop a channel), and marginal counts can flip
+    # across BLAS/scipy builds, so the bank is pinned here.
     gamma = 0.5
     finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
     sigmas = np.array(finder.sigmas)
     weights = (sigmas / finder.ref_sigma) ** gamma
@@ -1208,7 +1230,12 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
 
     # ref_sigma provably cancels: the calibration absorbs any weight rescaling.
     other_ref = MatrixFreeSparseRBFPeakFinder(
-        alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0, ref_sigma=3.0
+        alpha=None,
+        gamma=gamma,
+        min_sigma=1.0,
+        max_sigma=5.0,
+        ref_sigma=3.0,
+        num_sigmas=5,
     )
     assert np.allclose(
         np.array(other_ref.effective_alpha(256, 256)),
@@ -1223,6 +1250,7 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
         min_sigma=1.0,
         max_sigma=5.0,
         false_alarms_per_image=0.1,
+        num_sigmas=5,
     )
     assert np.all(np.array(stricter.effective_alpha(256, 256)) > a_small)
     assert np.isclose(realised_efp(stricter, 256), 0.1, rtol=1e-3)
@@ -1230,7 +1258,7 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
     # An explicit alpha is a lower bound on significance, not a way under the
     # calibration: too small a request is raised, a strict one is honoured.
     lax_finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=0.01, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        alpha=0.01, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
     assert np.allclose(
         np.array(lax_finder.effective_alpha(130, 130)),
@@ -1239,7 +1267,7 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
     )
 
     strict = MatrixFreeSparseRBFPeakFinder(
-        alpha=20.0, gamma=gamma, min_sigma=1.0, max_sigma=5.0
+        alpha=20.0, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
     assert np.allclose(
         np.array(strict.effective_alpha(130, 130)), 20.0 * weights, rtol=1e-5
@@ -1880,7 +1908,9 @@ def test_num_sigmas_decouples_bank_resolution_from_the_ceiling():
 
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
-    coarse = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0)
+    # The subject is the explicit-num_sigmas contract (uniform grid at a
+    # chosen count); the auto-sized default is covered elsewhere.
+    coarse = MatrixFreeSparseRBFPeakFinder(min_sigma=1.0, max_sigma=5.0, num_sigmas=5)
     assert len(np.asarray(coarse.sigmas)) == 5
     assert np.isclose(np.diff(np.asarray(coarse.sigmas)).mean(), 1.0)
 
@@ -1993,12 +2023,16 @@ def test_bank_saturation_report_flags_a_ceiling_starved_bank():
     assert sized.fit_metrics["bic"] < starved.fit_metrics["bic"]
 
     # m0 plumbing: reaches the finder and tightens the threshold.
+    # Pinned bank: m0 legitimately couples into auto bank sizing (stricter
+    # budget -> higher z -> stronger anti-carpet tax -> fewer channels), and
+    # elementwise threshold comparisons need a common grid.
     strict = MatrixFreeSparseRBFPeakFinder(
         alpha=None,
         gamma=0.5,
         min_sigma=1.0,
         max_sigma=6.0,
         false_alarms_per_image=0.01,
+        num_sigmas=6,
     )
     lax_f = MatrixFreeSparseRBFPeakFinder(
         alpha=None,
@@ -2006,6 +2040,7 @@ def test_bank_saturation_report_flags_a_ceiling_starved_bank():
         min_sigma=1.0,
         max_sigma=6.0,
         false_alarms_per_image=10.0,
+        num_sigmas=6,
     )
     assert np.all(
         np.array(strict.effective_alpha(128, 128))
@@ -2016,3 +2051,115 @@ def test_bank_saturation_report_flags_a_ceiling_starved_bank():
         'harvest_peaks_kwargs.get(\n                    "false_alarms_per_image"' in src
         or ("false_alarms_per_image" in src)
     )
+
+
+def test_moment_peak_amplitude_tracks_the_bright_end_of_the_population():
+    """``A = F / (2 pi sigma^2)`` from window moments, at a high quantile.
+
+    Not the median: the fidelity gap driving fragmentation grows with
+    brightness, so the bank is sized to protect the brightest peaks.  The
+    tolerance here is loose on purpose -- bank size responds to this input as
+    roughly its 0.28th power, so even a 50% error is under one channel.
+    """
+    import numpy as np
+    from scipy.special import erf
+
+    from subhkl.search.matrix_free import _moment_peak_amplitude
+
+    def pixel_integrated(shape, r0, c0, sigma, amp):
+        rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+        s2 = sigma * np.sqrt(2.0)
+        er = erf((rr - r0 + 0.5) / s2) - erf((rr - r0 - 0.5) / s2)
+        ec = erf((cc - c0 + 0.5) / s2) - erf((cc - c0 - 0.5) / s2)
+        return amp * (np.pi / 2.0) * sigma**2 * er * ec
+
+    rng = np.random.default_rng(4)
+    bg = 0.6
+    frame = np.full((256, 256), bg)
+    for r, c, amp in (
+        (60, 60, 200.0),
+        (60, 180, 120.0),
+        (180, 60, 60.0),
+        (180, 180, 300.0),
+    ):
+        frame += pixel_integrated(frame.shape, r, c, 4.0, amp)
+    image = rng.poisson(frame).astype(float)
+    bg_map = np.full_like(image, bg)
+
+    # The bright end of 60/120/200/300, not the median and not the maximum.
+    measured = _moment_peak_amplitude(image[None], bg_map[None], bg, quantile=90.0)
+    assert 120.0 < measured < 400.0
+    assert (
+        _moment_peak_amplitude(image[None], bg_map[None], bg, quantile=99.0) > measured
+    )
+
+
+def test_expected_peak_amplitude_defaults_to_measuring_it():
+    """None means 'derive it from the first batch', the contract
+    expected_background already has."""
+    from subhkl.search.matrix_free import _FRAG_PEAK_AMP, MatrixFreeSparseRBFPeakFinder
+
+    auto = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=5)
+    assert auto._amp_is_auto
+    # Construction still needs a number, and uses the declared nominal.
+    assert auto.expected_peak_amplitude == _FRAG_PEAK_AMP
+
+    explicit = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5, max_sigma=6.5, num_sigmas=5, expected_peak_amplitude=42.0
+    )
+    assert not explicit._amp_is_auto
+    assert explicit.expected_peak_amplitude == 42.0
+
+
+def test_fid_residual_is_a_calibratable_input():
+    """The criterion's empirical constant is an instance parameter: a larger
+    residual claims a larger real-world carpet advantage and must buy a
+    denser bank.  calibrate_fragmentation_residual fits it to a requested
+    unsupported-atom rate; here only the monotone plumbing is asserted,
+    because each calibration rung is a full solve."""
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    kwargs = dict(min_sigma=1.0, max_sigma=25.0)
+    lean = MatrixFreeSparseRBFPeakFinder(fid_residual=2.5, **kwargs)
+    factory = MatrixFreeSparseRBFPeakFinder(**kwargs)
+    dense = MatrixFreeSparseRBFPeakFinder(fid_residual=40.0, **kwargs)
+    assert lean.num_sigmas <= factory.num_sigmas <= dense.num_sigmas
+    assert lean.num_sigmas < dense.num_sigmas
+
+
+def test_fragmentation_rate_maps_to_protected_quantile():
+    """The requested unsupported-atom rate is met without solving: it picks
+    which quantile of the moment census the bank protects (peaks above it may
+    fragment, ~2 unsupported atoms each), so the mapping is arithmetic."""
+    import numpy as np
+    from scipy.special import erf
+
+    from subhkl.search.matrix_free import _frag_protected_quantile, _moment_census
+
+    assert _frag_protected_quantile(1.0, 4.0) == 87.5
+    assert _frag_protected_quantile(1.0, 50.0) == 99.0
+    # Allowing more fragmentation than the census can express floors at the
+    # median; asking for none protects the brightest censused peak outright.
+    assert _frag_protected_quantile(8.0, 4.0) == 50.0
+    assert _frag_protected_quantile(0.0, 4.0) == 100.0
+
+    # The counting census assigns each peak to the one window that owns its
+    # centroid; the amplitude scan keeps every window the peak's flux reaches.
+    def pixel_integrated(shape, r0, c0, sigma, amp):
+        rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+        s2 = sigma * np.sqrt(2.0)
+        er = erf((rr - r0 + 0.5) / s2) - erf((rr - r0 - 0.5) / s2)
+        ec = erf((cc - c0 + 0.5) / s2) - erf((cc - c0 - 0.5) / s2)
+        return amp * (np.pi / 2.0) * sigma**2 * er * ec
+
+    rng = np.random.default_rng(9)
+    frame = np.full((256, 256), 0.6)
+    frame += pixel_integrated(frame.shape, 70, 70, 4.0, 250.0)
+    frame += pixel_integrated(frame.shape, 180, 170, 4.0, 150.0)
+    image = rng.poisson(frame).astype(float)
+    bg_map = np.full_like(image, 0.6)
+
+    counting = _moment_census(image[None], bg_map[None], 0.6, counting=True)
+    scanning = _moment_census(image[None], bg_map[None], 0.6)
+    assert 1 <= counting.size <= 6
+    assert scanning.size > counting.size
