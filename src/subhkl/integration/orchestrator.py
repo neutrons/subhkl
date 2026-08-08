@@ -43,6 +43,10 @@ class DetectorPeaks:
     # the fields above are unaffected.
     deviance: Optional[List[float]] = None
     residual_deviance: Optional[List[float]] = None
+    # The per-peak Gaussian width, for the finders that fit one.  None when no
+    # width was measured, which is the difference from `sigma` above: that one
+    # always holds a number, but only sometimes a width.
+    width: Optional[List[float]] = None
 
     def __iter__(self):
         """Allows tuple unpacking"""

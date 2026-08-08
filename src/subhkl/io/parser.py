@@ -6,6 +6,8 @@ import typer
 import h5py
 import os
 
+from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
+
 from subhkl.commands import (
     run_index,
     run_rbf_integrator,
@@ -17,6 +19,8 @@ from subhkl.commands import (
     run_reduce,
     run_merge_images,
     run_zone_axis_search,
+    run_finder_visualize,
+    run_integrator_visualize,
 )
 
 
@@ -762,6 +766,87 @@ def zone_axis_search(
         num_runs=num_runs,
         output_hough=output_hough,
         batch_size=batch_size,
+    )
+
+
+_IMAGES_HELP = "Reduced (or merged) HDF5 file holding the image stack the search ran on"
+_INSTRUMENT_HELP = (
+    "Instrument name. Read from the peaks file when not given; merged image "
+    "files do not record it, so pass it if the peaks file predates the change."
+)
+_OUTPUT_DIR_HELP = "Where to write the plots (default: next to the peaks file)"
+_N_SIGMA_HELP = (
+    "How many standard deviations out to draw each peak's outline. A peak has "
+    "no edge, only a width, so the circle is a choice of contour; 2 sigma "
+    "holds about 86% of a 2D Gaussian's flux."
+)
+_DPI_HELP = (
+    "Resolution of the saved plots. The inline plots are written at 600, which "
+    "is too heavy to keep for every run of a benchmark sweep."
+)
+
+
+@app.command()
+def finder_visualize(
+    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
+    peaks_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
+    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
+    n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
+    max_workers: Optional[int] = None,
+    show_progress: bool = True,
+):
+    """
+    Redraw the finder's unrolled-detector plots from an existing output file.
+
+    Produces the same '-found.png' per run that 'finder
+    --create-visualizations' would have, reading the peak centres and widths
+    back out of the peaks file instead of searching the images again. Run the
+    finder without visualizations, keep the two HDF5 files, and come back to
+    the pictures later.
+    """
+    run_finder_visualize(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+
+
+@app.command()
+def integrator_visualize(
+    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
+    peaks_filename: Annotated[
+        str, typer.Argument(help="rbf-integrator output HDF5 file")
+    ],
+    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
+    n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
+    max_workers: Optional[int] = None,
+    show_progress: bool = True,
+):
+    """
+    Redraw the RBF integrator's unrolled-detector plots from an existing output file.
+
+    Produces the same '-pred.png' per run that 'rbf-integrator
+    --create-visualizations' would have, drawing each peak at the shape the
+    integrator fitted it, without repeating the integration.
+    """
+    run_integrator_visualize(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
     )
 
 

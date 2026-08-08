@@ -387,6 +387,13 @@ def process_single_image(
             "sigma": (
                 finder_widths.tolist() if finder_widths is not None else sigmas.tolist()
             ),
+            # The same widths again, under a name that means only one thing.
+            # `sigma` above is a width for the finder that fits one and an
+            # intensity uncertainty for the finders that do not, and a reader
+            # cannot tell which from the numbers; anything that needs a peak's
+            # size on the detector -- the plots, which draw it -- needs to be
+            # sure, so it gets a key that is absent rather than ambiguous.
+            "width": finder_widths.tolist() if finder_widths is not None else None,
             # Per-peak leave-one-out deviance: the likelihood-ratio statistic
             # for this atom's presence, on the same scale as the global
             # Deviance/DoF report and calibrated against chi^2 with four

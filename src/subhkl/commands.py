@@ -8,6 +8,7 @@ from subhkl.instrument.goniometer import (
 from subhkl.integration import Peaks
 from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
+from subhkl.viz import detector_assembly, replay
 
 from typing import List
 
@@ -854,6 +855,20 @@ def run_finder(
     ]
 
     with h5py.File(output_filename, "a") as f:
+        f.attrs["finder_algorithm"] = finder_algorithm
+
+        # `peaks/sigma` means different things depending on who filled it: the
+        # sparse-RBF finder writes its per-peak Gaussian width in pixels, every
+        # other path writes the uncertainty on the intensity.  Only the first
+        # describes how big a peak is on the detector, so say which one this
+        # is rather than leaving a reader to guess from a bare number.
+        if "peaks/sigma" in f:
+            f["peaks/sigma"].attrs["quantity"] = (
+                replay.WIDTH_QUANTITY
+                if finder_algorithm == "sparse_rbf"
+                else "intensity_sigma"
+            )
+
         with h5py.File(filename, "r") as f_in:
             for key in copy_keys:
                 if key in f_in:
@@ -1136,11 +1151,21 @@ def run_rbf_integrator(
 
     print(f"Saving RBF integrated peaks to {output_filename}")
     with h5py.File(output_filename, "w") as f:
+        f.attrs["instrument"] = instrument
         f["peaks/h"], f["peaks/k"], f["peaks/l"] = result.h, result.k, result.l
         f["peaks/lambda"] = result.wavelength
         f["peaks/intensity"], f["peaks/sigma"] = result.intensity, result.sigma
         f["peaks/two_theta"], f["peaks/azimuthal"] = result.tt, result.az
         f["peaks/bank"], f["peaks/run_index"] = result.bank, result.run_id
+
+        # Where each peak sits on its detector image, and the shape the fit
+        # gave it.  The integrator computes all of this to draw its own plots
+        # and then dropped it on the way out, which left the plots impossible
+        # to redraw afterwards; `integrator-visualize` reads it back.
+        f["peaks/image_index"] = result.image_index
+        f["peaks/pixel_r"], f["peaks/pixel_c"] = result.peak_rows, result.peak_cols
+        f["peaks/var_u"], f["peaks/var_v"] = result.var_u, result.var_v
+        f["peaks/cov_uv"] = result.cov_uv
 
         # Copy metadata
         copy_keys = [
@@ -1698,3 +1723,64 @@ def run_zone_axis_search(
     print(
         f"Done. You can now run:\n subhkl indexer {merged_h5_filename} <output.h5> --bootstrap {output_h5_filename} ..."
     )
+
+
+def run_finder_visualize(
+    images_filename: str,
+    peaks_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+):
+    """Redraw the finder's unrolled-detector plots from its output file.
+
+    Takes the same pair of files the finder itself worked from and wrote to,
+    and reproduces the `-found.png` it would have produced with
+    `--create-visualizations`, without repeating the peak search.
+    """
+    written = replay.replay_plots(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        suffix="-found",
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+    print(f"Wrote {len(written)} plot(s).")
+    return written
+
+
+def run_integrator_visualize(
+    images_filename: str,
+    peaks_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+):
+    """Redraw the RBF integrator's unrolled-detector plots from its output file.
+
+    Reproduces the `-pred.png` that `rbf-integrator --create-visualizations`
+    would have produced, without repeating the integration.
+    """
+    written = replay.replay_plots(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        suffix="-pred",
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+    print(f"Wrote {len(written)} plot(s).")
+    return written

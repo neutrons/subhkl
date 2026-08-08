@@ -390,6 +390,7 @@ class Peaks:
         gonio_angles_out: list[list[float]] = []
         peak_rows: list[int] = []
         peak_cols: list[int] = []
+        width: list[float] | None = []
 
         for img_key in sorted(self.image.ims.keys()):
             res = results_by_key.get(img_key)
@@ -405,6 +406,14 @@ class Peaks:
                 residual_deviance.extend(
                     res.get("residual_deviance", [0.0] * res["count"])
                 )
+                # Absent for the finders that fit no width; a bank that
+                # reports none leaves the whole column unusable, since a peak
+                # with no size cannot be told apart from one of size zero.
+                bank_widths = res.get("width")
+                if bank_widths is None:
+                    width = None
+                elif width is not None:
+                    width.extend(bank_widths)
                 radii.extend(res["radii"])
                 xyz_out.extend(res["xyz"])
                 banks.extend(res["banks"])
@@ -436,6 +445,7 @@ class Peaks:
             peak_cols,
             deviance,
             residual_deviance,
+            width if width else None,
         )
 
         if visualize:
@@ -467,6 +477,13 @@ class Peaks:
             for r_id, data in runs_plot_data.items():
                 mask = [i for i, run in enumerate(peaks.run_id) if run == r_id]
 
+                # Draw each peak at the width the finder fitted it, when it
+                # fitted one: an isotropic covariance is the same statement as
+                # a radius, and it is the form the plotter already draws.
+                # Without it every peak is drawn the same size, which hides
+                # exactly what these plots are looked at to see.
+                variances = [peaks.width[i] ** 2 for i in mask] if peaks.width else None
+
                 run_peaks = _RunPeaksFinder(
                     xyz=[peaks.xyz[i] for i in mask] if peaks.xyz else [],
                     image_index=[peaks.image_index[i] for i in mask]
@@ -478,6 +495,9 @@ class Peaks:
                     peak_cols=[peaks.peak_cols[i] for i in mask]
                     if peaks.peak_cols
                     else [],
+                    var_u=variances,
+                    var_v=variances,
+                    cov_uv=[0.0] * len(mask) if variances else None,
                 )
 
                 out_name = os.path.join(base_dir, f"{data['label']}-found.png")
