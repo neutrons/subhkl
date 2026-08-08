@@ -144,6 +144,32 @@ def finder(
             "to 0 (or negative) to keep the fixed p90 census quantile."
         ),
     ] = 1.0,
+    sparse_rbf_profile_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Peak profile replacing the Gaussian atom.  'auto' (default) "
+            "measures the radial profile f(u), u = r/sigma, from the first "
+            "batch's own bright peaks and rebuilds the bank; a path reads a "
+            "measured profile as JSON {u: [...], f: [...]}; 'gaussian' keeps "
+            "the analytic Gaussian."
+        ),
+    ] = "auto",
+    sparse_rbf_shape_ratio: Annotated[
+        float,
+        typer.Option(
+            help="Axis ratio of elliptical shape variants added per scale, "
+            "area-preserving.  The default 1.2 is the measured anisotropy of "
+            "CG4D/MANDI reflections; 1.0 restores the isotropic basis (and "
+            "cuts the bank convolution cost 5x)."
+        ),
+    ] = 1.2,
+    sparse_rbf_shape_orientations: Annotated[
+        int,
+        typer.Option(
+            help="Number of position angles for the elliptical variants "
+            "(uniform over 180 deg)."
+        ),
+    ] = 4,
     sparse_rbf_num_sigmas: Annotated[
         int | None,
         typer.Option(
@@ -218,6 +244,9 @@ def finder(
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
         sparse_rbf_num_sigmas=sparse_rbf_num_sigmas,
         sparse_rbf_max_fragmentation_rate=sparse_rbf_max_fragmentation_rate,
+        sparse_rbf_profile_file=sparse_rbf_profile_file,
+        sparse_rbf_shape_ratio=sparse_rbf_shape_ratio,
+        sparse_rbf_shape_orientations=sparse_rbf_shape_orientations,
         sparse_rbf_false_alarms_per_image=sparse_rbf_false_alarms_per_image,
         sparse_rbf_chunk_size=sparse_rbf_chunk_size,
         sparse_rbf_loss=sparse_rbf_loss,

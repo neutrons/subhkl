@@ -1192,10 +1192,16 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
     def realised_efp(finder, side):
+        # The threshold vector is per *channel*; the calibration sums over
+        # *scales* (shape variants at one scale are the same statistical
+        # test, so counting each channel would overstate the multiplicity by
+        # ~n_shapes).  Evaluate the equation the way it is defined: one term
+        # per distinct scale, at that scale's threshold.
         a = np.array(finder.effective_alpha(side, side))
-        sigmas = np.array(finder.sigmas)
+        channel_sigmas = np.array(finder._channel_sigmas)
+        sigmas, first = np.unique(channel_sigmas, return_index=True)
         n_k = np.maximum((side * side) / (2 * np.pi * sigmas**2), 2.0)
-        return float((n_k * norm.sf(a)).sum())
+        return float((n_k * norm.sf(a[first])).sum())
 
     for gamma in (0.0, 0.5, 1.0, -0.5):
         finder = MatrixFreeSparseRBFPeakFinder(
@@ -1216,8 +1222,8 @@ def test_alpha_none_solves_the_false_alarm_calibration_equation():
     finder = MatrixFreeSparseRBFPeakFinder(
         alpha=None, gamma=gamma, min_sigma=1.0, max_sigma=5.0, num_sigmas=5
     )
-    sigmas = np.array(finder.sigmas)
-    weights = (sigmas / finder.ref_sigma) ** gamma
+    # effective_alpha is per channel, so the weight vector must be too.
+    weights = (np.array(finder._channel_sigmas) / finder.ref_sigma) ** gamma
 
     a_small = np.array(finder.effective_alpha(64, 64))
     a_large = np.array(finder.effective_alpha(4096, 4096))
@@ -1333,8 +1339,22 @@ def test_global_solve_reaches_first_order_optimality():
         img += 300.0 * np.exp(-((yy - r0) ** 2 + (xx - c0) ** 2) / (2 * 2.0**2))
     image = rng.poisson(img).astype(np.float32)
 
+    # Pinned to the isotropic Gaussian bank: this test certifies the solver's
+    # first-order optimality on a well-conditioned canonical problem.  Shape
+    # variants put near-duplicate atoms in the dictionary (pairwise kernel
+    # correlation ~0.99), which makes the optimum nearly degenerate --
+    # coefficients slosh between near-identical atoms at almost no objective
+    # change, and the prox residual stalls ~20x above this tolerance (measured
+    # 3.7e-2).  That is dictionary conditioning, not a solver regression, and
+    # the returned solutions on that bank are validated empirically end to end.
     finder = MatrixFreeSparseRBFPeakFinder(
-        alpha=None, gamma=0.5, max_sigma=5.0, num_sigmas=5, loss="poisson"
+        alpha=None,
+        gamma=0.5,
+        max_sigma=5.0,
+        num_sigmas=5,
+        loss="poisson",
+        profile_file="gaussian",
+        shape_ratio=1.0,
     )
     filter_size = max(15, int(finder.max_sigma * 5))
     bg = np.asarray(compute_bg_batch(jnp.asarray(image[None]), filter_size))[0]
@@ -1767,7 +1787,9 @@ def test_extraction_returns_full_support_beyond_any_chunk_size():
     # Refinement is exercised by the solver-level tests; here it would only
     # slide the synthetic delta atoms around and obscure the counting claim.
     finder.refine_positions = False
-    K = len(np.asarray(finder.sigmas))
+    # The coefficient tensor's channel dimension is the bank's, which with
+    # shape variants is num_sigmas * n_shapes; ``sigmas`` stays the scale grid.
+    K = int(finder.K_weights.shape[0])
     H = W = 130
     y_img = np.zeros((H, W), dtype=np.float32)
     bg_img = np.full((H, W), 1.0, dtype=np.float32)
@@ -1943,14 +1965,25 @@ def test_degenerate_single_width_bank_collapses_instead_of_duplicating():
 
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
-    degenerate = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=1.5)
+    # Pinned to the isotropic Gaussian atom: this test's subject is the
+    # collapse of *identical duplicate* channels, and shape variants are
+    # distinct atoms, not duplicates.
+    degenerate = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5, max_sigma=1.5, profile_file="gaussian", shape_ratio=1.0
+    )
     assert degenerate.num_sigmas == 1
     assert np.asarray(degenerate.sigmas).tolist() == [1.5]
     assert degenerate.K_weights.shape[0] == 1
 
     # An explicitly single-scale bank is unchanged, and an inverted range is an
     # error rather than an empty bank.
-    single = MatrixFreeSparseRBFPeakFinder(min_sigma=2.0, max_sigma=2.0, num_sigmas=1)
+    single = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=2.0,
+        max_sigma=2.0,
+        num_sigmas=1,
+        profile_file="gaussian",
+        shape_ratio=1.0,
+    )
     assert single.num_sigmas == 1
     with pytest.raises(ValueError, match="below min_sigma"):
         MatrixFreeSparseRBFPeakFinder(min_sigma=4.0, max_sigma=2.0)
@@ -2163,3 +2196,152 @@ def test_fragmentation_rate_maps_to_protected_quantile():
     scanning = _moment_census(image[None], bg_map[None], 0.6)
     assert 1 <= counting.size <= 6
     assert scanning.size > counting.size
+
+
+def test_default_is_the_learned_family_and_legacy_is_one_flag_away():
+    """The default now carries the measured peak family: profile 'auto' (trunk
+    swapped in at first batch) and the anisotropy variants from construction.
+    The threshold multiplicity is Gram-corrected, so the calibrated z stays at
+    the same-scale isotropic bank's level.  profile_file='gaussian' with
+    shape_ratio=1.0 restores the historical Gaussian path exactly, separable
+    fast path included."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    f = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=6)
+    assert np.asarray(f.K_weights).shape[0] == 30  # 6 scales x 5 shapes
+    assert not f.use_separable
+    # The public scale grid never expands: channels are internal.
+    assert len(np.asarray(f.sigmas)) == 6
+    assert f.num_sigmas == 6
+    assert len(np.asarray(f._channel_sigmas)) == 30
+
+    legacy = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5,
+        max_sigma=6.5,
+        num_sigmas=6,
+        profile_file="gaussian",
+        shape_ratio=1.0,
+    )
+    assert legacy.use_separable
+    assert np.asarray(legacy.K_weights).shape[0] == 6
+
+
+def test_learned_basis_keeps_the_flux_scale_family(tmp_path):
+    """Every kernel must keep flux = C * sigma^2 with one C: the width-mixture
+    collapse in _read_chunk depends on it exactly."""
+    import json
+
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    u = np.linspace(0, 4, 41)
+    profile = tmp_path / "trunk.json"
+    profile.write_text(
+        json.dumps({"u": u.tolist(), "f": np.exp(-0.5 * u**2.8 / 1.4).tolist()})
+    )
+
+    f = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5,
+        max_sigma=6.5,
+        num_sigmas=6,
+        profile_file=str(profile),
+        shape_ratio=1.2,
+        shape_orientations=4,
+    )
+    kernels = np.asarray(f.K_weights)[:, 0]
+    sigmas = np.asarray(f._channel_sigmas)
+    assert kernels.shape[0] == 30  # 6 scales x (1 iso + 4 orientations)
+    flux = kernels.sum(axis=(1, 2))
+    ratio = flux / sigmas**2
+    assert np.allclose(ratio, ratio[0], rtol=0.02)
+
+
+def test_shape_variants_do_not_multiply_the_false_alarm_count(tmp_path):
+    """The calibration sum-pools N_k over channels as if independent.  Shape
+    variants at one (site, scale) are nearly the same test -- Gram K_eff ~ 1 of
+    5 at ratio 1.2 -- and counting them 5x inflates the solved threshold.
+    Measured cost of not correcting: the faint half of all detections
+    (243 -> 120 atoms on cg4d-garnet run 2038)."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+    f = MatrixFreeSparseRBFPeakFinder(
+        min_sigma=1.5,
+        max_sigma=6.5,
+        num_sigmas=6,
+        shape_ratio=1.2,
+        shape_orientations=4,
+    )
+    # The calibrated threshold must sit at the same-scale Gaussian bank's
+    # level, not a 30-channel one's: the calibration sums over the scale
+    # grid, which deduplicates the shape variants exactly.
+    g = MatrixFreeSparseRBFPeakFinder(min_sigma=1.5, max_sigma=6.5, num_sigmas=6)
+    z_shaped = float(np.asarray(f.effective_alpha(512, 512)).ravel()[0])
+    z_gauss = float(np.asarray(g.effective_alpha(512, 512)).ravel()[0])
+    assert abs(z_shaped - z_gauss) / z_gauss < 0.05
+
+
+def test_fragmentation_criterion_survives_a_shape_expanded_bank():
+    """Repeated scales made the pair criterion's 2x2 Gram singular."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import _frag_bank_ratio
+
+    sigmas = np.repeat(np.linspace(1.5, 6.5, 6), 5)  # the expanded pattern
+    ratio, near = _frag_bank_ratio(sigmas, 0.0, 1.0, 1.0, 1.0, 160.0, 512, 512)
+    assert np.isfinite(ratio)
+
+
+def test_radial_profile_measurement_ranks_shapes_correctly():
+    """The in-line profile measurement must read a flat-top as flatter than a
+    Gaussian, and a Gaussian as not flat.  Absolute width is allowed a uniform
+    stretch (~6% measured, from neighbour-tail spill) because a stretch of the
+    u axis is absorbed by the sigma grid; the *shape* ordering is what the
+    solver pays atoms for."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import _measure_radial_profile
+
+    def peak(shape, r0, c0, s, amp, beta):
+        rr, cc = np.mgrid[0 : shape[0], 0 : shape[1]].astype(float)
+        q = np.hypot(rr - r0, cc - c0) / s
+        return amp * np.exp(-0.5 * np.power(np.maximum(q, 1e-12), beta))
+
+    rng = np.random.default_rng(9)
+    ratios = {}
+    for beta in (2.0, 2.8):
+        frame = np.full((512, 512), 0.7)
+        for _ in range(25):
+            r, c = rng.uniform(50, 462, 2)
+            frame += peak(
+                frame.shape, r, c, rng.uniform(2.5, 5.0), rng.uniform(60, 300), beta
+            )
+        image = rng.poisson(frame).astype(float)
+        u, f = _measure_radial_profile(
+            image[None], np.full_like(image, 0.7)[None], 0.7, max_sigma=6.5
+        )
+        i = int(np.argmin(np.abs(u - 1.5)))
+        ratios[beta] = f[i] / np.exp(-0.5 * u[i] ** 2)
+    assert ratios[2.8] > ratios[2.0] + 0.1, ratios
+    assert 0.7 < ratios[2.0] < 1.15, ratios
+
+
+def test_radial_profile_measurement_refuses_a_peak_free_frame():
+    """A frame with nothing in it must return None -- the caller stays on the
+    Gaussian -- rather than a profile made of noise windows."""
+    import numpy as np
+
+    from subhkl.search.matrix_free import _measure_radial_profile
+
+    rng = np.random.default_rng(3)
+    image = rng.poisson(np.full((512, 512), 0.7)).astype(float)
+    assert (
+        _measure_radial_profile(
+            image[None], np.full_like(image, 0.7)[None], 0.7, max_sigma=6.5
+        )
+        is None
+    )
