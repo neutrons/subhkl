@@ -733,6 +733,7 @@ def run_finder(
     peak_minimum_pixels: int = 30,
     peak_minimum_signal_to_noise: float = 1.0,
     peak_pixel_outlier_threshold: float = 2.0,
+    hull_filter: bool = True,
     sparse_rbf_alpha: float | None = None,
     sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
@@ -820,6 +821,10 @@ def run_finder(
         "peak_minimum_pixels": peak_minimum_pixels,
         "peak_minimum_signal_to_noise": peak_minimum_signal_to_noise,
         "peak_pixel_outlier_threshold": peak_pixel_outlier_threshold,
+        # Consumed directly by the harvest worker, not by
+        # PeakIntegrator.build_from_dictionary, like
+        # region_growth_minimum_sigma above it.
+        "hull_filter": hull_filter,
     }
 
     detector_peaks = peaks.get_detector_peaks(

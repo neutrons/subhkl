@@ -116,6 +116,50 @@ def _run_harvest_thresholding(im, **kwargs):
     return coords[:, 0], coords[:, 1]
 
 
+def _aperture_intensity(image, mask, row, col, radius_px):
+    """Aperture photometry for a peak the convex-hull stage did not fit.
+
+    Used only when the hull filter is switched off, to give a peak the finder
+    reported but the hull stage rejected an intensity that is at least defined.
+    Counts inside ``radius_px`` of the centre, minus a local background taken
+    as the median of the annulus from ``radius_px`` to ``1.5 * radius_px``:
+
+        I = sum_ap (y - b),   sigma_I = sqrt(sum_ap y + n_ap * b * (1 + n_ap/n_bg))
+
+    This is a *different estimator* from the hull integration -- no region
+    growing, no shape fit, a fixed circular aperture -- so intensities from the
+    two paths are not interchangeable at the precision the hull path offers.
+    That is the price of switching the filter off, and the reason the filter is
+    on by default.
+    """
+    h, w = image.shape
+    r_out = max(1.0, 1.5 * radius_px)
+    r0 = max(0, int(np.floor(row - r_out)))
+    r1 = min(h, int(np.ceil(row + r_out)) + 1)
+    c0 = max(0, int(np.floor(col - r_out)))
+    c1 = min(w, int(np.ceil(col + r_out)) + 1)
+    if r1 <= r0 or c1 <= c0:
+        return 0.0, 0.0
+
+    yy, xx = np.mgrid[r0:r1, c0:c1]
+    dist = np.sqrt((yy - row) ** 2 + (xx - col) ** 2)
+    patch = np.asarray(image[r0:r1, c0:c1], dtype=float)
+    valid = np.asarray(mask[r0:r1, c0:c1], dtype=bool)
+
+    in_ap = (dist <= max(1.0, radius_px)) & valid
+    in_bg = (dist > max(1.0, radius_px)) & (dist <= r_out) & valid
+    n_ap = int(in_ap.sum())
+    if n_ap == 0:
+        return 0.0, 0.0
+
+    n_bg = int(in_bg.sum())
+    bg = float(np.median(patch[in_bg])) if n_bg > 0 else 0.0
+    total = float(patch[in_ap].sum())
+    intensity = total - n_ap * bg
+    var = total + (n_ap * bg * (1.0 + n_ap / n_bg) if n_bg > 0 else 0.0)
+    return intensity, float(np.sqrt(max(var, 0.0)))
+
+
 def process_single_image(
     img_key,
     img_label,
@@ -217,15 +261,50 @@ def process_single_image(
         physical_bank, image, centers, return_hulls=True
     )
 
-    bank_intensity = np.array([res[3] for res in int_result])
-    bank_sigma = np.array([res[5] for res in int_result])
+    bank_intensity = np.array(
+        [np.nan if res[3] is None else float(res[3]) for res in int_result], dtype=float
+    )
+    bank_sigma = np.array(
+        [np.nan if res[5] is None else float(res[5]) for res in int_result], dtype=float
+    )
 
-    # Strict Keeping (Hull Required)
+    # The convex-hull stage is two things at once: it measures the intensity,
+    # and -- because a candidate it cannot fit a region to is dropped here --
+    # it acts as a true-positive filter on whatever the finder proposed.  The
+    # two roles are separable, and `hull_filter=False` keeps only the first:
+    # every candidate that survived the mask is reported, and the ones the hull
+    # stage could not fit get an aperture intensity instead of being discarded.
+    # It is on by default; switching it off is a statement that the finder's
+    # own output is trusted, which is only true once the finder's per-peak
+    # metrics (peaks/deviance, peaks/residual_deviance) are doing that job.
+    hull_filter = bool(integration_params.get("hull_filter", True))
+
     keep = []
+    aperture_idx = []
     for idx, res in enumerate(int_result):
         has_hull = hulls[idx][1] is not None
         is_valid = res[3] is not None
-        keep.append(is_valid and has_hull)
+        hull_ok = bool(is_valid and has_hull)
+        keep.append(hull_ok or not hull_filter)
+        if not hull_ok and not hull_filter:
+            aperture_idx.append(idx)
+
+    # Fill in the peaks the hull stage could not measure, so that switching the
+    # filter off never emits an undefined intensity.
+    fallback_radius = float(
+        integration_params.get("region_growth_maximum_pixel_radius", 10.0) or 10.0
+    )
+    aperture_px = np.zeros(len(int_result), dtype=float)
+    for idx in aperture_idx:
+        radius_px = (
+            3.0 * float(finder_widths[idx])
+            if finder_widths is not None and np.isfinite(finder_widths[idx])
+            else fallback_radius
+        )
+        aperture_px[idx] = radius_px
+        bank_intensity[idx], bank_sigma[idx] = _aperture_intensity(
+            image, mask, float(i[idx]), float(j[idx]), radius_px
+        )
 
     # Keep integrated centers centers for finder
     i, j = i[keep], j[keep]
@@ -261,9 +340,24 @@ def process_single_image(
         for k_idx, orig_idx in enumerate(kept_indices):
             _, hull, _, _ = hulls[orig_idx]
             if hull is None:
-                radii.append(0.0)
-                continue
-            verts = hull.points[hull.vertices]
+                # No hull to take vertices from.  With the filter on this case
+                # never reaches here; with it off, quote the angular size of
+                # the aperture that was actually integrated rather than 0,
+                # which would claim a point-like peak.
+                if aperture_px[orig_idx] > 0.0:
+                    theta = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+                    verts = np.stack(
+                        [
+                            i[k_idx] + aperture_px[orig_idx] * np.cos(theta),
+                            j[k_idx] + aperture_px[orig_idx] * np.sin(theta),
+                        ],
+                        axis=1,
+                    )
+                else:
+                    radii.append(0.0)
+                    continue
+            else:
+                verts = hull.points[hull.vertices]
             v_i, v_j = verts[:, 0], verts[:, 1]
             v_tt, v_az = det.pixel_to_angles(v_i, v_j, sample_offset=None)
             v_tt_r, v_az_r = np.deg2rad(v_tt), np.deg2rad(v_az)
@@ -322,6 +416,14 @@ def process_single_image(
             f"Integrated {len(i)}/{len(centers)} peaks for {img_label} "
             f"(Bank {physical_bank})"
         )
+        if not hull_filter:
+            # Say how many of those the hull filter would have removed: that
+            # count is the whole effect of the switch, and it is what tells you
+            # whether the finder is ready to be trusted on its own.
+            log_msg += (
+                f"; hull filter off, {len(aperture_idx)} kept by aperture "
+                f"that the filter would have dropped"
+            )
     else:
         res = None
         log_msg = f"{img_label} (Bank {physical_bank}) had 0 valid peaks"

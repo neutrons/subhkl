@@ -7,6 +7,8 @@ Convex hull peak integration is used in two ways in `subhkl`:
 
 Both subcommands use the same CLI parameters, documented below in order of likelihood that you will need to modify them. See [Algorithm](#algorithm) below to understand better how the parameters will affect the algorithm.
 
+Note that role 1 above bundles two separate jobs: the hull *measures* each candidate's intensity, and, because a candidate it cannot fit a region to is discarded, it also *filters* the finder's output. `--no-hull-filter` (see below) keeps the measurement and drops the filtering, for use when the finder's own per-peak statistics are trusted to decide what is real.
+
 - `--region-growth-minimum-intensity`: number, units events/pixel
     - Minimum average intensity (# of events) of neighboring pixels required for a pixel to be included in a peak
     - Set this slightly above the average noise level of each image
@@ -27,6 +29,11 @@ Both subcommands use the same CLI parameters, documented below in order of likel
     - Setting depends on quality of data
     - $\uparrow$ to filter out false positives not filtered by `peak-minimum-pixels`
     - $\downarrow$ to avoid false negatives in noisy data
+- `--hull-filter` / `--no-hull-filter`: flag, default on
+    - **Only meaningful for `finder`**, this controls whether a candidate the hull stage cannot fit a region to is discarded (`--hull-filter`, the historical and default behaviour) or reported anyway (`--no-hull-filter`)
+    - With the filter off, candidates the hull stage rejects are kept and given an *aperture* intensity instead: counts within 3 sigma of the finder's centre, minus a local background from the surrounding annulus, with the aperture's angular size quoted as the peak radius
+    - Those intensities come from a different estimator than the hull path -- fixed circular aperture, no region growing, no shape fit -- so the two are not interchangeable at the hull path's precision. Every parameter above still applies to the peaks the hull stage *can* fit
+    - Switch it off only when something else is doing the filtering. The finder's per-peak statistics are the intended replacement: `peaks/deviance` (is this peak real? calibrated against $\chi^2_4$, 95% point 9.49) and `peaks/residual_deviance` (is it fitted correctly? calibrated near 1). Note the latter loses its calibration below roughly 0.5 counts/pixel, which some real data does reach
 - `--integration-method`: string enum, either `"free_fit"` or `"gaussian_fit"`
     - **Only available for `integrator`**, this controls what method is used to calculate final intensities and uncertainties after the convex hull fitting is complete
     - `"free_fit"` assumes a Poisson process with an arbitrary rate function and estimates the intensity and uncertainty by simply summing intensities in the peak and outer annular regions

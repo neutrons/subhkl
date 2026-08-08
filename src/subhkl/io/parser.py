@@ -88,6 +88,20 @@ def finder(
     peak_minimum_pixels: int = 30,
     peak_minimum_signal_to_noise: float = 1.0,
     peak_pixel_outlier_threshold: float = 2.0,
+    hull_filter: Annotated[
+        bool,
+        typer.Option(
+            "--hull-filter/--no-hull-filter",
+            help=(
+                "Drop candidates the convex-hull stage cannot fit a region to. "
+                "On by default, where the hull acts as a true-positive filter "
+                "on the finder's output. Switch it off to report everything "
+                "the finder proposes, with an aperture intensity for the peaks "
+                "the hull stage rejects -- only sensible when the finder's own "
+                "per-peak metrics are trusted to do the filtering."
+            ),
+        ),
+    ] = True,
     sparse_rbf_alpha: Annotated[
         float | None,
         typer.Option(
@@ -193,6 +207,7 @@ def finder(
         peak_minimum_pixels=peak_minimum_pixels,
         peak_minimum_signal_to_noise=peak_minimum_signal_to_noise,
         peak_pixel_outlier_threshold=peak_pixel_outlier_threshold,
+        hull_filter=hull_filter,
         sparse_rbf_alpha=sparse_rbf_alpha,
         sparse_rbf_gamma=sparse_rbf_gamma,
         sparse_rbf_min_sigma=sparse_rbf_min_sigma,
