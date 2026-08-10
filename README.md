@@ -115,6 +115,48 @@ rs.concat(mtzs).hkl_to_asu().write_mtz("mesolite_202405/meso.mtz")
 which creates a single `.mtz` file `mesolite_202405/meso.mtz` that contains
 all reflections.
 
+## Reproducibility
+
+Every step prints how it was invoked before it runs: the version and commit of
+subhkl, the full command line, and the resolved value of every option,
+including the ones left at their defaults.
+
+```
+subhkl 0.1.0 [finder]
+  commit      : 9987d7423d4d1b0dc0da8a8f6c9e5e1a5e0a0b12
+  started     : 2026-08-04T15:32:11+00:00
+  host        : analysis01
+  directory   : /data/mandi/mesolite
+  command line: python -m subhkl.io.parser finder scan_master.h5 MANDI --output-filename finder.h5
+  options:
+    filename        = "scan_master.h5"
+    instrument      = "MANDI"
+    output_filename = "finder.h5"
+    ...
+```
+
+The same information is written into the output file of the step, under the
+`provenance` group (or into a `<output>.provenance.json` sidecar for outputs
+that are not HDF5 files, such as `.mtz`). Each step also carries over the
+records of its input files, so the last file of a workflow holds the command
+line and options of every step that produced it.
+
+```bash
+# how was this file made?
+python -m subhkl.io.parser provenance integrator.h5
+
+# machine readable, e.g. to attach to a bug report
+python -m subhkl.io.parser provenance integrator.h5 --json > provenance.json
+
+# what am I running?
+python -m subhkl.io.parser version
+```
+
+The commit is taken from the git checkout when running from a source tree, and
+from the value baked into the package at build time otherwise (the Docker image
+records it during the build). Setting `SUBHKL_GIT_COMMIT` overrides both, which
+is useful when packaging subhkl outside of the provided Dockerfile.
+
 ## Physics and Conventions
 
 This project uses the **Laue Equation** to relate Miller indices $(h, k, l)$ to the scattering vector $Q$:
