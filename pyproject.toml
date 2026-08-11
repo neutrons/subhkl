@@ -18,6 +18,16 @@ dependencies = [
 
 license = { text = "GPL3.0" }
 
+# Register the image-container reader with dxtbx's format registry so a DIALS
+# environment (where subhkl is installed) can open the ImageSets written by the
+# --dials export (e.g. in dials.image_viewer).
+# The entry-point *name* encodes the format's base class(es) after a colon, as
+# dxtbx's registry expects (e.g. "FormatHDF5:FormatMultiImage,Format"). Without
+# the ":FormatHDF5" suffix the class is an orphan in dxtbx's format DAG and
+# file-based detection never descends into it.
+[project.entry-points."dxtbx.format"]
+"FormatSubhkl:FormatHDF5" = "subhkl.io.dxtbx_format:FormatSubhkl"
+
 [build-system]
 requires = [
   "setuptools",

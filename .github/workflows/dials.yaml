@@ -1,0 +1,63 @@
+name: DIALS export
+
+# Exercises the --dials export against a real DIALS/dxtbx toolkit. DIALS is a
+# conda-only package, so the round-trip tests in tests/io/test_dials_export.py
+# are skipped by the uv-based unit job (importorskip) and only run here. This
+# job installs subhkl so the dxtbx.format entry point registers FormatSubhkl,
+# then runs the tests that reload the exported .expt with check_format=True.
+#
+# The conda solve is slow, so this is kept as its own workflow; it need not be a
+# required check in branch protection.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    # Weekly, Mondays 06:00 UTC, to catch drift against new DIALS releases.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  dials-roundtrip:
+    name: DIALS round-trip tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        # Login shell so the conda environment is activated for each step.
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up conda (miniforge)
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          channels: conda-forge
+          python-version: "3.12"
+          activate-environment: ld-subhkl
+
+      - name: Install DIALS
+        run: mamba install -y -c conda-forge dials
+
+      - name: Install subhkl (no deps) and pytest
+        run: |
+          pip install -e . --no-deps --no-build-isolation
+          pip install pytest pytest-dependency
+
+      - name: Verify FormatSubhkl is registered via the entry point
+        run: |
+          python -c "from dxtbx.format.Registry import get_format_class_for; \
+            cls = get_format_class_for('FormatSubhkl'); \
+            print('registered:', cls); \
+            assert cls.__name__ == 'FormatSubhkl'"
+
+      - name: Run DIALS round-trip tests
+        env:
+          MESOLITE_MAX_FILES: "0"
+        run: pytest -v tests/io/test_dials_export.py

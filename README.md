@@ -115,6 +115,23 @@ rs.concat(mtzs).hkl_to_asu().write_mtz("mesolite_202405/meso.mtz")
 which creates a single `.mtz` file `mesolite_202405/meso.mtz` that contains
 all reflections.
 
+## DIALS interoperability
+
+Every `subhkl` command accepts a `--dials` (alias `-dials`) flag that additionally
+writes its output as a DIALS `ExperimentList` (`.expt`) and `reflection_table`
+(`.refl`) pair, so results can be loaded and compared directly against the DIALS
+suite:
+
+```bash
+subhkl indexer peaks.h5 indexed.h5 --instrument CG4D --nexus raw.nxs.h5 --dials
+dials.show indexed.expt indexed.refl
+```
+
+By default the files are named after the command's primary output (override with
+`--dials-prefix STEM`). This requires the DIALS/dxtbx toolkit
+(`conda install -c conda-forge dials`). See `docs/source/dials_export.rst` for the
+model mapping and the closest DIALS CLI parallel of each subhkl program.
+
 ## Physics and Conventions
 
 This project uses the **Laue Equation** to relate Miller indices $(h, k, l)$ to the scattering vector $Q$:
