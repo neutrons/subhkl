@@ -190,9 +190,7 @@ def extract_xyz_from_file(file_path, instrument=None):
                     xyz_list.append(xyz)
                     run_list.extend([img_idx] * len(xyz))
                     panel_list.extend([int(phys_bank)] * len(xyz))
-                    frame_list.extend(
-                        [frame_by_slot.get(img_idx, img_idx)] * len(xyz)
-                    )
+                    frame_list.extend([frame_by_slot.get(img_idx, img_idx)] * len(xyz))
                 except KeyError:
                     continue
 

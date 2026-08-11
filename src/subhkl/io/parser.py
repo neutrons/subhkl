@@ -499,7 +499,9 @@ def metrics(
     ki_vec_parsed = [float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None
 
     csv_output = csv_path if csv_path is not None else ("metrics.csv" if csv else None)
-    plot_output = plot_path if plot_path is not None else ("metrics.png" if plot else None)
+    plot_output = (
+        plot_path if plot_path is not None else ("metrics.png" if plot else None)
+    )
 
     run_metrics(
         file1=file1,
