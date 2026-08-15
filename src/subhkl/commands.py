@@ -362,7 +362,7 @@ def run_index(
                 "ERROR: Input file does not contain peaks/pixel_r and peaks/pixel_c. Cannot perform physically sound indexing."
             )
 
-    if "peaks/image_index" in input_data:
+    if "peaks/run_index" not in input_data and "peaks/image_index" in input_data:
         input_data["peaks/run_index"] = input_data["peaks/image_index"]
 
     # --- INJECT SECOND PHASE OF BOOTSTRAP PHYSICS ---
@@ -894,8 +894,11 @@ def run_metrics(
     d_min: float | None = None,
     per_run: bool = False,
     ki_vec: List[float] | np.ndarray = None,
+    csv_output: str | None = None,
+    plot_output: str | None = None,
+    plot_bins: int | None = None,
 ):
-    from subhkl.instrument.metrics import compute_metrics
+    from subhkl.instrument.metrics import compute_metrics, write_per_peak_csv
 
     # No need to call apply_detector_calibration here because metrics.py
     # dynamically shifts coordinates using the detector_calibration group.
@@ -906,6 +909,7 @@ def run_metrics(
         d_min=d_min,
         per_run=per_run,
         ki_vec_override=ki_vec,
+        return_per_peak=csv_output is not None or plot_output is not None,
     )
 
     if "error_message" in result:
@@ -923,12 +927,35 @@ def run_metrics(
         f"{result['median_ang_err']:.5f} {result['mean_ang_err']:.5f} {result['max_ang_err']:.5f}"
     )
 
-    # Print per-run metrics if requested
+    # Print per-frame metrics if requested
     if per_run and "per_run_errors" in result:
-        print("\nPER-RUN MEDIAN ANGULAR ERROR (deg) - Sorted by error:")
+        print("\nPER-FRAME MEDIAN ANGULAR ERROR (deg) - Sorted by error:")
         for r, err, count in result["per_run_errors"]:
             status = "BAD" if err > 1.0 else "OK"
-            print(f"  Run {r:4d}: {err:6.3f} ({count:4d} peaks) [{status}]")
+            print(f"  Frame {r:4d}: {err:6.3f} ({count:4d} peaks) [{status}]")
+
+    if csv_output is not None:
+        write_per_peak_csv(result, csv_output)
+        print(f"Wrote per-peak errors to {csv_output}")
+
+    if plot_output is not None:
+        import os
+
+        from subhkl.viz.metrics_plots import (
+            plot_error_histograms,
+            plot_per_frame_histograms,
+        )
+
+        plot_kwargs = {} if plot_bins is None else {"bins": plot_bins}
+
+        plot_error_histograms(result, plot_output, **plot_kwargs)
+        print(f"Wrote error histograms to {plot_output}")
+
+        if per_run:
+            root, ext = os.path.splitext(plot_output)
+            per_run_plot_output = f"{root}_per_run{ext}"
+            plot_per_frame_histograms(result, per_run_plot_output, **plot_kwargs)
+            print(f"Wrote per-frame error histograms to {per_run_plot_output}")
 
 
 def run_peak_predictor(
