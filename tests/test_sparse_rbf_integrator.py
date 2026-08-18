@@ -71,8 +71,6 @@ def test_single_isolated_peak():
         np.full(1, true_sigma**2),
         np.full(1, true_sigma**2),
         np.zeros(1),
-        alpha=1.0,
-        gamma=1.0,
         ref_sigma=1.0,
         max_sigma=5.0,
     )
@@ -119,8 +117,6 @@ def test_overlapping_peaks_crosstalk():
         np.full(2, 4.0),
         np.full(2, 4.0),
         np.zeros(2),
-        alpha=1.0,
-        gamma=1.0,
         ref_sigma=1.0,
         max_sigma=5.0,
     )
@@ -214,8 +210,6 @@ def test_integrate_peaks_rbf_ssn_orchestrator():
         peak_dict=peak_dict,
         peaks_obj=mock_peaks_obj,
         sigmas=[1.0, 2.0, 3.0],
-        alpha=0.5,
-        gamma=2.0,
         show_progress=False,
     )
 
@@ -689,11 +683,6 @@ def test_large_sensor_basic_integration():
         peak_dict=peak_dict,
         peaks_obj=MockPeaks({0: image}),
         sigmas=[1.0, 2.0, 4.0],
-        alpha=4.0,
-        # gamma=1 is safe here, unlike in the finder: integration is given the
-        # peak positions and does no model selection over them, so the scale
-        # degeneracy of docs/matrix_free_theory.md Theorem 1 does not apply.
-        gamma=1.0,
         show_progress=False,
     )
 
@@ -804,11 +793,6 @@ def test_integrator_large_sensor_halo_suppression():
         peak_dict=peak_dict,
         peaks_obj=MockPeaks({0: image}),
         sigmas=[1.0, 2.0, 4.0],
-        alpha=5.0,
-        # gamma=1 is safe here, unlike in the finder: integration is given the
-        # peak positions and does no model selection over them, so the scale
-        # degeneracy of docs/matrix_free_theory.md Theorem 1 does not apply.
-        gamma=1.0,
         show_progress=False,
     )
 

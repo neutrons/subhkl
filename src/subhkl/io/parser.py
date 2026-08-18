@@ -2,6 +2,7 @@
 from typing import Annotated
 from typing import Optional
 
+import sys
 import typer
 import h5py
 import os
@@ -651,7 +652,8 @@ def indexer(
 
 
 @app.command()
-def rbf_integrator(
+def integrator(
+    ctx: typer.Context,
     filename: Annotated[str, typer.Argument(help="Merged HDF5 image stack")],
     instrument: Annotated[str, typer.Argument(help="Instrument name")],
     integration_peaks_filename: Annotated[
@@ -660,12 +662,6 @@ def rbf_integrator(
     output_filename: Annotated[
         str, typer.Argument(help="Output integrated peaks HDF5 file")
     ],
-    alpha: Annotated[
-        float, typer.Option("--alpha", help="Peak over background threshold (Z-score)")
-    ] = 1.0,
-    gamma: Annotated[
-        float, typer.Option("--gamma", help="Besov space weight exponent")
-    ] = 1.0,
     sigmas: Annotated[str, typer.Option(help="Unstretched peak radii")] = "1.0,2.0,4.0",
     nominal_sigma: Annotated[
         float,
@@ -789,6 +785,11 @@ def rbf_integrator(
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
     Calculates intensities and rigorous I/SIGI via Fisher Information matrix SVD.
     """
+    if ctx.command.name == "rbf-integrator":
+        print(
+            "WARNING: 'rbf-integrator' is a deprecated alias; use 'integrator'.",
+            file=sys.stderr,
+        )
     if not matrix_free:
         raise typer.BadParameter(
             "the per-patch integrator was retired; --no-matrix-free has no "
@@ -800,8 +801,6 @@ def rbf_integrator(
         instrument=instrument,
         integration_peaks_filename=integration_peaks_filename,
         output_filename=output_filename,
-        alpha=alpha,
-        gamma=gamma,
         sigmas=sigmas,
         nominal_sigma=nominal_sigma,
         anisotropic=anisotropic,
@@ -820,6 +819,11 @@ def rbf_integrator(
         chunk_size=chunk_size,
         max_workers=max_workers,
     )
+
+
+# The command's historical name; same callback, flagged deprecated in --help
+# and warned about at runtime (via ctx.command.name above).
+app.command("rbf-integrator", deprecated=True, hidden=True)(integrator)
 
 
 @app.command()
@@ -1036,9 +1040,7 @@ def finder_visualize(
 @app.command()
 def integrator_visualize(
     images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
-    peaks_filename: Annotated[
-        str, typer.Argument(help="rbf-integrator output HDF5 file")
-    ],
+    peaks_filename: Annotated[str, typer.Argument(help="integrator output HDF5 file")],
     instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
     output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
@@ -1049,7 +1051,7 @@ def integrator_visualize(
     """
     Redraw the RBF integrator's unrolled-detector plots from an existing output file.
 
-    Produces the same '-pred.png' per run that 'rbf-integrator
+    Produces the same '-pred.png' per run that 'integrator
     --create-visualizations' would have, drawing each peak at the shape the
     integrator fitted it, without repeating the integration.
     """

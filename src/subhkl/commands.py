@@ -1334,8 +1334,6 @@ def run_rbf_integrator(
     instrument: str,
     integration_peaks_filename: str,
     output_filename: str,
-    alpha: float = 1.0,
-    gamma: float = 1.0,
     sigmas: str = "1.0,2.0,4.0",
     nominal_sigma: float = 1.0,
     anisotropic: bool = False,
@@ -1361,7 +1359,7 @@ def run_rbf_integrator(
 
     sigma_list = [float(k.strip()) for k in sigmas.split(",")]
     print(f"Starting Dense Sparse RBF Integration on {filename}")
-    print(f"Parameters: Alpha={alpha}, Gamma={gamma}, Sigma={sigma_list}")
+    print(f"Parameters: Sigma={sigma_list}")
 
     peak_dict = {}
 
@@ -1401,9 +1399,7 @@ def run_rbf_integrator(
     result = integrate_peaks_rbf_ssn(
         peak_dict=peak_dict,
         peaks_obj=peaks,  # Pass the full Peaks object
-        alpha=alpha,
         sigmas=sigma_list,
-        gamma=gamma,
         nominal_sigma=nominal_sigma,
         show_progress=show_progress,
         all_R=None,

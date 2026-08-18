@@ -3732,8 +3732,6 @@ def integrate_reflections_matrix_free(
     var_us,
     var_vs,
     cov_uvs,
-    alpha,
-    gamma,
     ref_sigma,
     max_sigma,
     static_valid=None,
@@ -3761,7 +3759,7 @@ def integrate_reflections_matrix_free(
         frames: [-] image index per peak
         rs, cs: [Pixel] predicted positions
         var_us, var_vs, cov_uvs: [Pixel^2] projected 2D shape per peak
-        alpha, gamma, ref_sigma: accepted for orchestrator API symmetry
+        ref_sigma: accepted for orchestrator API symmetry
             with the patch integrator, but INERT here: this mode is
             measurement, not detection, so no sparsity gate applies (see
             _solve_image_amplitudes)
