@@ -53,8 +53,15 @@ FINDER_PARAMS = {
 INDEXER_DEFAULTS = {
     "instrument_name": "MANDI",
     "strategy_name": "DE",
-    "n_runs": 10,
-    "population_size": 1000,
+    # Measured (GPU, 471-peak finder output, split-key seeding): a single
+    # DE restart at population 1000 finds the basin ~9% of the time, so
+    # best-of-10 failed ~40% of draws -- the old integer seeds passing was
+    # luck, and the seeding change repriced it.  At population 2000 the
+    # per-restart success is ~50% (10/20 single-restart draws), bimodal:
+    # solves land at ~0.13 deg, misses at ~2 deg.  Best-of-15 then fails
+    # ~3e-5 of draws (<1% even at the 95% upper bound of the measurement).
+    "n_runs": 15,
+    "population_size": 2000,
     "gens": 200,
     "seed": 12345,
     "sigma_init": None,
