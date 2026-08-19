@@ -653,7 +653,6 @@ def indexer(
 
 @app.command()
 def integrator(
-    ctx: typer.Context,
     filename: Annotated[str, typer.Argument(help="Merged HDF5 image stack")],
     instrument: Annotated[str, typer.Argument(help="Instrument name")],
     integration_peaks_filename: Annotated[
@@ -785,7 +784,13 @@ def integrator(
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
     Calculates intensities and rigorous I/SIGI via Fisher Information matrix SVD.
     """
-    if ctx.command.name == "rbf-integrator":
+    # click's context exists only on CLI invocation (silent=True returns None
+    # for direct function calls, where no deprecation question arises), and it
+    # is what knows which of the two registered names was typed.
+    import click
+
+    _ctx = click.get_current_context(silent=True)
+    if _ctx is not None and _ctx.command.name == "rbf-integrator":
         print(
             "WARNING: 'rbf-integrator' is a deprecated alias; use 'integrator'.",
             file=sys.stderr,

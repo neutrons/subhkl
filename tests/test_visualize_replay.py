@@ -16,7 +16,7 @@ import scipy.special
 from PIL import Image
 
 from subhkl.io.parser import finder, finder_visualize, integrator_visualize
-from subhkl.io.parser import rbf_integrator
+from subhkl.io.parser import integrator
 from subhkl.viz import detector_assembly, replay
 
 INSTRUMENT = "MANDI"
@@ -415,14 +415,12 @@ def test_an_integrator_run_can_be_replayed_afterwards(tmp_path):
         grp["wavelength"] = np.array([3.0])
 
     integrated = tmp_path / "integrated.h5"
-    rbf_integrator(
+    integrator(
         filename=str(images),
         instrument=INSTRUMENT,
         integration_peaks_filename=str(predicted),
         output_filename=str(integrated),
         sigmas="1.0,2.0,3.0",
-        alpha=0.5,
-        gamma=2.0,
         create_visualizations=False,
         show_progress=False,
     )
