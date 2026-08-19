@@ -38,6 +38,15 @@ jobs:
         run: uv run pytest -v -m "integration" tests/test_mandi_mesolite.py::TestMandiMesoliteSingleRun
         env:
           MESOLITE_MAX_FILES: 1
+      # Temporary CI forensics for the platform-divergent peak set; remove
+      # together with the debug-artifacts copies in test_mandi_mesolite.py.
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesolite-debug
+          path: debug-artifacts/
+          if-no-files-found: ignore
       - name: Display test summary
         if: always()
         run: |
