@@ -101,14 +101,6 @@ per-patch fits.
 - **Per-peak error tables**: `metrics --per_peak` writes
   `metrics/per_peak` (h, k, l, run, lambda, d_err, ang_err) into the
   indexed file, consumed by the `error_analysis` script.
-- **The sigma bank can be sized for the data**
-  (`--sparse-rbf-expected-peak-amplitude`,
-  `--sparse-rbf-expected-background`): the values the finder's
-  fragmentation warning prescribes are now settable.  An undersized
-  bank reports bright peaks as clusters of narrower atoms, and since
-  fragmentation sits on floating-point rounding, it also makes the
-  peak set platform-dependent (measured: the same file gave 770 peaks
-  on a CPU runner and 471 on a GPU until the bank was sized for it).
 - The finder warns when one image's refinement support exceeds its exact
   single-chunk regime (more than 256 atoms), instead of silently switching
   to a one-sweep block-coordinate refinement.
