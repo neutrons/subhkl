@@ -1069,7 +1069,7 @@ def run_metrics(
     file2: str | None = None,
     instrument: str | None = None,
     d_min: float | None = None,
-    per_peak: bool | None = None,
+    per_peak: bool = False,
     per_run: bool = False,
     ki_vec: List[float] | np.ndarray = None,
 ):

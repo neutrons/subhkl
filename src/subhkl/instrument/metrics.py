@@ -165,7 +165,7 @@ def compute_metrics(
     instrument: str | None = None,
     d_min: float | None = None,
     per_run: bool = False,
-    per_peak: bool | None = None,
+    per_peak: bool = False,
     ki_vec_override: np.ndarray | None = None,
 ) -> dict:
     try:
@@ -420,31 +420,31 @@ def compute_metrics(
             "max_ang_err": float(np.max(ang_err)),
             "num_peaks": len(h),
         }
-        print("error per_peak")
-        with h5py.File(file1, "a") as fout:
-            metrics = fout.require_group("metrics")
+        # Opt-in: writing into file1 is a side effect the plain metrics
+        # call must not have.  scripts/error_analysis.py reads this table.
+        if per_peak:
+            with h5py.File(file1, "a") as fout:
+                metrics = fout.require_group("metrics")
 
-            if "per_peak" in metrics:
-                del metrics["per_peak"]
-
-            peak_grp = metrics.create_group("per_peak")
-            peak_grp.create_dataset("h", data=h.astype(np.int32))
-            peak_grp.create_dataset("k", data=k.astype(np.int32))
-            peak_grp.create_dataset("l", data=l.astype(np.int32))
-            peak_grp.create_dataset("run", data=run_index.astype(np.int32))
-            peak_grp.create_dataset("lambda", data=lam.astype(np.float32))
-            peak_grp.create_dataset(
-                "d_err",
-                data=d_err.astype(np.float32),
-                compression="gzip",
-            )
-
-            peak_grp.create_dataset(
-                "ang_err",
-                data=ang_err.astype(np.float32),
-                compression="gzip",
-            )
-        print("Finished writing metrics/per_peak")
+                if "per_peak" in metrics:
+                    del metrics["per_peak"]
+                peak_grp = metrics.create_group("per_peak")
+                peak_grp.create_dataset("h", data=h.astype(np.int32))
+                peak_grp.create_dataset("k", data=k.astype(np.int32))
+                peak_grp.create_dataset("l", data=l.astype(np.int32))
+                peak_grp.create_dataset("run", data=run_index.astype(np.int32))
+                peak_grp.create_dataset("lambda", data=lam.astype(np.float32))
+                peak_grp.create_dataset(
+                    "d_err",
+                    data=d_err.astype(np.float32),
+                    compression="gzip",
+                )
+                peak_grp.create_dataset(
+                    "ang_err",
+                    data=ang_err.astype(np.float32),
+                    compression="gzip",
+                )
+                print("Finished writing metrics/per_peak")
 
         if d_filter_message:
             result["filter_message"] = d_filter_message

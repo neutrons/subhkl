@@ -863,9 +863,13 @@ def metrics(
         ),
     ] = False,
     per_peak: Annotated[
-        bool | None,
-        typer.Option("--per_peak", help="Creat table metrics/per_peak."),
-    ] = None,
+        bool,
+        typer.Option(
+            "--per-peak",
+            help="Write the metrics/per_peak table (h, k, l, run, lambda,"
+            "d_err, ang_err) into FILE1, for scripts/error_analysis.py.",
+        ),
+    ] = False,
     ki_vec: Annotated[
         str | None,
         typer.Option(
