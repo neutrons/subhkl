@@ -124,8 +124,6 @@ def test_rbf_integrator_goniometer_kinematics():
         peak_dict=peak_dict,
         peaks_obj=peaks_obj,
         sigmas=[1.0, 2.0, 3.0],
-        alpha=0.05,
-        gamma=2.0,
         show_progress=False,
         nominal_sigma=2.0,
         anisotropic=True,

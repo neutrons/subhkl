@@ -28,7 +28,7 @@ def _render(positions, fluxes, rng):
     return rng.poisson(rate).astype(np.float64)
 
 
-def _solve(image, positions, alpha=1.0):
+def _solve(image, positions):
     n = len(positions)
     return integrate_reflections_matrix_free(
         image[None],
@@ -38,8 +38,6 @@ def _solve(image, positions, alpha=1.0):
         np.full(n, VAR),
         np.full(n, VAR),
         np.zeros(n),
-        alpha=alpha,
-        gamma=1.0,
         ref_sigma=1.0,
         max_sigma=3.0,
     )
@@ -144,7 +142,7 @@ def test_weak_peaks_are_measured_not_gated():
     for seed in range(10):
         rng = np.random.default_rng(600 + seed)
         image = _render(positions, truth, rng)
-        out = _solve(image, positions, alpha=3.0)  # champion-recipe alpha
+        out = _solve(image, positions)
         weak.append(out[0, 0])
     weak = np.array(weak)
     # Not gated: the weak peak is nonzero in most realizations (the
@@ -178,8 +176,6 @@ def test_calibrated_admission_censors_subthreshold_only():
             np.full(n, VAR),
             np.full(n, VAR),
             np.zeros(n),
-            alpha=1.0,
-            gamma=1.0,
             ref_sigma=1.0,
             max_sigma=3.0,
             fp_target=0.01,  # z = Phi^-1(1 - 0.005) ~ 2.58
@@ -269,8 +265,6 @@ def test_static_mask_removes_ridge_bias():
             np.full(n, VAR),
             np.full(n, VAR),
             np.zeros(n),
-            alpha=1.0,
-            gamma=1.0,
             ref_sigma=1.0,
             max_sigma=3.0,
             static_valid=valid,
@@ -305,8 +299,6 @@ def _solve_profile(image, positions, profile):
         np.full(n, VAR),
         np.full(n, VAR),
         np.zeros(n),
-        alpha=1.0,
-        gamma=1.0,
         ref_sigma=1.0,
         max_sigma=3.0,
         profile=profile,
@@ -376,8 +368,6 @@ def test_empty_input_returns_empty():
         np.array([]),
         np.array([]),
         np.array([]),
-        alpha=1.0,
-        gamma=1.0,
         ref_sigma=1.0,
         max_sigma=3.0,
     )
@@ -397,8 +387,6 @@ def test_multi_image_scatter_back():
         np.full(2, VAR),
         np.full(2, VAR),
         np.zeros(2),
-        alpha=1.0,
-        gamma=1.0,
         ref_sigma=1.0,
         max_sigma=3.0,
     )
