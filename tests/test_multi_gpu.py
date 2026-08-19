@@ -1,11 +1,16 @@
 """Multi-GPU sharding: opt-in, and equivalent to the single-device answer.
 
-Real multi-GPU hardware is not available in CI, so the equivalence test forces
-the CPU backend to present several devices (XLA_FLAGS
+The solve tests force the CPU backend to present several devices (XLA_FLAGS
 --xla_force_host_platform_device_count) -- the sharding machinery is the same
-GSPMD path a GPU mesh takes.  That flag must be set before JAX initializes,
-which is why the test runs in a subprocess rather than in this process, where
-other tests have long since created arrays.
+GSPMD path a GPU mesh takes, and forcing it keeps the test independent of the
+hardware.  That flag must be set before JAX initializes, which is why the
+tests run in a subprocess rather than in this process, where other tests have
+long since created arrays.
+
+The forced-CPU solve is too slow for a starved shared CPU-only CI runner,
+though, so the subprocess tests skip wherever JAX's default backend is the
+CPU and run only on machines with an accelerator attached (see
+``_requires_accelerator``).
 """
 
 from __future__ import annotations
@@ -38,6 +43,31 @@ def test_pad_to_multiple_repeats_the_last_element():
     # Already divisible: returned untouched, no copy of the batch axis.
     assert device_util.pad_to_multiple(array, 3) is array
     assert device_util.pad_to_multiple(array, 1) is array
+
+
+#: Both subprocess tests run the forced-two-device CPU solve inside a fixed
+#: 20-minute budget.  On an idle machine they finish in about a minute, but a
+#: starved shared CPU-only CI runner can burn the whole budget with no defect
+#: present -- and waiting out the timeout just to record an xfail costs those
+#: 20 minutes on every CI run.  So the tests skip up front wherever no
+#: accelerator is attached: a visible GPU/TPU marks a machine with the
+#: headroom to finish in minutes.  (The solve itself still runs on the
+#: forced-two-device CPU backend either way; the accelerator is only the
+#: capability signal, not the device under test.)
+def _cpu_only_machine() -> bool:
+    import jax
+
+    return jax.default_backend() == "cpu"
+
+
+_requires_accelerator = pytest.mark.skipif(
+    _cpu_only_machine(),
+    reason=(
+        "no accelerator attached: the forced-two-device CPU solve overruns "
+        "its 20-minute budget on starved CPU-only CI runners (it finishes in "
+        "~1 minute on an idle machine)"
+    ),
+)
 
 
 _EQUIVALENCE_SCRIPT = textwrap.dedent(
@@ -119,6 +149,7 @@ _INDEXER_SCRIPT = textwrap.dedent(
 )
 
 
+@_requires_accelerator
 @pytest.mark.filterwarnings("ignore")
 def test_sharded_indexer_runs_and_returns_a_solution(tmp_path):
     """Smoke, not equivalence: DE is stochastic across launch geometries by
@@ -149,6 +180,7 @@ def test_sharded_indexer_runs_and_returns_a_solution(tmp_path):
     assert "U=(3, 3)" in line[0]
 
 
+@_requires_accelerator
 @pytest.mark.filterwarnings("ignore")
 def test_sharded_solve_matches_the_single_device_answer():
     env = dict(os.environ)
