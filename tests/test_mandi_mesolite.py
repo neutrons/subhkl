@@ -46,6 +46,17 @@ SPACE_GROUP = "F d d 2"
 # Integration parameters (from bash script)
 FINDER_PARAMS = {
     "finder_algorithm": "sparse_rbf",
+    # Size the sigma bank for this data, as the finder's own fragmentation
+    # warning prescribes (measured background ~1.8 photons/px, brightest
+    # peaks ~140 photons).  With the default bank the brightest peaks are
+    # reported as clusters of narrower atoms, and fragmentation sits on
+    # floating-point rounding: the same file yielded 770 peaks on a CPU
+    # runner and 471 on a GPU (+64%), and the fragment-polluted set is what
+    # made the DE basin nearly unfindable on CI.  On the data-sized bank,
+    # five of the six seeds that failed indexing now pass at the *old*
+    # budget, and the solutions improve (0.114 vs 0.136 deg median).
+    "sparse_rbf_expected_peak_amplitude": 140.0,
+    "sparse_rbf_expected_background": 1.8,
 }
 
 # Indexer parameters with explicit values for all typer.Option parameters

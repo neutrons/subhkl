@@ -133,6 +133,25 @@ def finder(
             "to 0 (or negative) to keep the fixed p90 census quantile."
         ),
     ] = 1.0,
+    sparse_rbf_expected_peak_amplitude: Annotated[
+        float | None,
+        typer.Option(
+            help="Brightest expected peak flux in photons, used to size the "
+            "sigma bank's fragmentation control for the data.  The finder "
+            "warns with a measured value to pass here when the default bank "
+            "is predicted to fragment bright peaks into clusters of narrow "
+            "atoms -- fragmentation sits on floating-point rounding, so an "
+            "undersized bank also makes the peak set platform-dependent."
+        ),
+    ] = None,
+    sparse_rbf_expected_background: Annotated[
+        float | None,
+        typer.Option(
+            help="Expected background in photons/pixel, the companion of "
+            "--sparse-rbf-expected-peak-amplitude (the same warning "
+            "reports the measured value)."
+        ),
+    ] = None,
     sparse_rbf_profile_file: Annotated[
         str | None,
         typer.Option(
@@ -228,6 +247,8 @@ def finder(
         sparse_rbf_max_sigma=sparse_rbf_max_sigma,
         sparse_rbf_num_sigmas=sparse_rbf_num_sigmas,
         sparse_rbf_max_fragmentation_rate=sparse_rbf_max_fragmentation_rate,
+        sparse_rbf_expected_peak_amplitude=sparse_rbf_expected_peak_amplitude,
+        sparse_rbf_expected_background=sparse_rbf_expected_background,
         sparse_rbf_profile_file=sparse_rbf_profile_file,
         sparse_rbf_shape_ratio=sparse_rbf_shape_ratio,
         sparse_rbf_shape_orientations=sparse_rbf_shape_orientations,
