@@ -12,7 +12,6 @@ Test data is automatically downloaded from Zenodo (DOI: 10.5281/zenodo.18475332)
 """
 
 import os
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -145,13 +144,6 @@ class TestMandiMesoliteSingleRun:
         )
         assert os.path.exists(finder_output), "Finder failed to create output file"
 
-        # Temporary CI forensics: preserve the finder/indexer outputs so the
-        # platform-divergent peak set can be examined off the runner (the
-        # workflow uploads debug-artifacts/).  Remove before merge.
-        debug_dir = Path("debug-artifacts")
-        debug_dir.mkdir(exist_ok=True)
-        shutil.copy(finder_output, debug_dir / "mesolite.finder.h5")
-
         print("[2/5] Running indexer...")
         indexer(
             peaks_h5_filename=finder_output,
@@ -167,7 +159,6 @@ class TestMandiMesoliteSingleRun:
             **INDEXER_DEFAULTS,
         )
         assert os.path.exists(indexer_output), "Indexer failed to create output file"
-        shutil.copy(indexer_output, debug_dir / "mesolite.indexer.h5")
 
         # Check the accuracy
         print("[3/5] Validating metrics...")
