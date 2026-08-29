@@ -96,7 +96,20 @@ def finder(
         ),
     ] = None,
     sparse_rbf_gamma: float = 0.0,
-    sparse_rbf_min_sigma: float = 1.5,
+    sparse_rbf_min_sigma: Annotated[
+        float | None,
+        typer.Option(
+            help="Bank floor in pixels.  The default (unset) measures it from "
+            "the first batch's own peaks -- the same width census that sets "
+            "the ceiling, read at a low percentile -- and places the floor one "
+            "safe scale-gap below the narrowest peak actually present, never "
+            "below the ~1 px sampling limit.  Leaving it unset is what keeps "
+            "the detection threshold independent of the pixel pitch: the "
+            "false-alarm calibration counts resolution elements, so a floor "
+            "pinned in pixels grows a tail of sub-PSF channels as the detector "
+            "is refined and drifts the threshold up as sqrt(2 log N_pixels)."
+        ),
+    ] = None,
     sparse_rbf_max_sigma: Annotated[
         float | None,
         typer.Option(
