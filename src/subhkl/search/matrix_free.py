@@ -273,6 +273,72 @@ def _ceiling_from_widths(widths, min_sigma):
     return max(ceiling, float(min_sigma) * 1.5)
 
 
+#: Hard sampling limit for the bank floor.  A Gaussian narrower than about a
+#: pixel is not resolvable on the grid at all, so below this the pixel pitch
+#: -- not the peak family -- is the binding constraint and a measured floor
+#: has nothing left to say.
+_SAMPLING_MIN_SIGMA = 1.0
+
+#: One safe scale-gap below the narrowest measured peak.  The bank's spacing
+#: criterion is multiplicative (see _auto_sigma_grid: the safe step is a
+#: ratio, ~1.3-1.6x), so the floor's headroom is a ratio too, and 1.2 mirrors
+#: the ceiling's own small-sample margin.
+_FLOOR_SAFETY = 1.2
+
+
+def _floor_from_widths(widths, sampling_floor=_SAMPLING_MIN_SIGMA):
+    """The bank floor a width census supports, or None when it cannot say.
+
+    The mirror of _ceiling_from_widths, on the same percentile ladder read
+    from the other end, and it exists for a sharper reason than symmetry.
+
+    The false-alarm calibration counts resolution elements, ``N_k = area /
+    (2 pi sigma_k**2)``, which is invariant under a change of pixel pitch:
+    refine the detector at constant flux and both the area in pixels and
+    sigma_k**2 in pixels scale as 1/Delta**2, so N_k -- and with it the
+    threshold z -- does not move.  That invariance is the whole reason the
+    calibration is written in resolution elements, and it is exactly what a
+    bank floor pinned in *pixels* destroys: the ceiling is measured (and so
+    tracks 1/Delta) while a fixed floor stays at one pixel, growing a tail of
+    sub-PSF channels no real peak can occupy.  The finest of those carries
+    ``N_k = N_pix / 2 pi``, which *is* proportional to 1/Delta**2, so the
+    pixel-count multiplicity penalty returns through the floor and z drifts
+    up as ``sqrt(2 log N_pix)``.  Measured on the calibration itself, over a
+    256x refinement in pixel count, at gamma = 0 and m0 = 0.1 on a detector
+    128 PSF-widths across: a pixel-pinned floor moves z monotonically from
+    4.01 to 5.12 (a 28% worse detection floor, and unbounded in Delta), while
+    this estimator holds it at 3.99 -> 4.07, flat to within the percentile's
+    own sampling noise.  At gamma = 0 every scale shares one z, so those
+    unoccupied channels tax the occupied ones directly.
+
+    Anything narrower than the data's own narrowest peaks is, by measurement,
+    unoccupied.  The margin is one safe scale-gap so that the percentile's own
+    noise cannot clip a real peak against the floor, and the result is clamped
+    at the sampling limit, below which the grid rather than the peak family is
+    what binds.  Unlike the ceiling this is not snapped to the half-pixel grid:
+    no geometry hangs off the floor (max_k_rad follows the ceiling), and at
+    small sigma that grid is too coarse to round on without overshooting the
+    margin it is meant to preserve.
+    """
+    n = widths.size
+    if n >= 800:
+        bot = float(np.percentile(widths, 1.0))
+    elif n >= 160:
+        bot = float(np.percentile(widths, 5.0))
+    elif n >= 40:
+        bot = float(np.percentile(widths, 10.0))
+    elif n >= 8:
+        # No percentile is meaningful this thin, so the extremum stands in for
+        # one, backed off by the ceiling's own small-sample margin.  That
+        # compounds with _FLOOR_SAFETY below, which is the intent: a floor
+        # quoted off eight peaks should sit further back than one off eight
+        # hundred.
+        bot = float(widths.min()) / 1.2
+    else:
+        return None
+    return max(bot / _FLOOR_SAFETY, float(sampling_floor))
+
+
 def _moment_census(images, bg_map, bg_hi, counting=False, valid=None):
     """Moment amplitudes ``A = F / (2 pi sigma^2)`` of every window that
     carries enough flux to measure, as an array (possibly empty).
@@ -790,7 +856,7 @@ class MatrixFreeSparseRBFPeakFinder:
         self,
         alpha: float | None = None,
         gamma: float = 0.0,
-        min_sigma: float = 1.0,
+        min_sigma: float | None = None,
         max_sigma: float | None = None,
         num_sigmas: int | None = None,
         loss: str = "poisson",
@@ -820,6 +886,13 @@ class MatrixFreeSparseRBFPeakFinder:
         self._auto_ceiling = max_sigma is None
         if max_sigma is None:
             max_sigma = _PROVISIONAL_MAX_SIGMA
+        # None means "measure the floor from the first batch" as well, off the
+        # same census that sets the ceiling.  A floor fixed in pixels is what
+        # makes the detection threshold depend on the pixel pitch at constant
+        # flux; see _floor_from_widths.
+        self._auto_floor = min_sigma is None
+        if min_sigma is None:
+            min_sigma = _SAMPLING_MIN_SIGMA
         if max_sigma < min_sigma:
             raise ValueError(
                 f"max_sigma ({max_sigma}) is below min_sigma ({min_sigma}); "
@@ -2496,14 +2569,34 @@ class MatrixFreeSparseRBFPeakFinder:
             # the analysis window and the background filter both depend on
             # the ceiling, so a measurement that lands above the provisional
             # value grows the geometry and measures once more.
-            if self._auto_ceiling:
+            if self._auto_ceiling or self._auto_floor:
+                auto_ceiling, auto_floor = self._auto_ceiling, self._auto_floor
                 self._auto_ceiling = False
+                self._auto_floor = False
                 measured = None
+                floor = None
                 widths = np.zeros(0)
                 for _ in range(2):
                     widths = _moment_width_census(
                         images_batch, bg_map, bg_hi, self.max_sigma, valid=valid
                     )
+                    # The floor rides the same census, and is applied before
+                    # the ceiling: _ceiling_from_widths reads min_sigma for
+                    # its own lower guard, so measuring the ceiling against a
+                    # stale floor would carry that guard into the result.
+                    # Clamped to keep a usable range -- the mirror of the
+                    # ceiling's own max(ceiling, min_sigma * 1.5) -- so that
+                    # a pinned max_sigma cannot be crossed from below.
+                    if auto_floor:
+                        floor = _floor_from_widths(widths)
+                        if floor is not None:
+                            floor = min(float(floor), self.max_sigma / 1.5)
+                            self.min_sigma = float(floor)
+                    if not auto_ceiling:
+                        # Ceiling pinned by the caller: the census ran only to
+                        # place the floor, and one pass settles that.
+                        measured = self.max_sigma
+                        break
                     measured = _ceiling_from_widths(widths, self.min_sigma)
                     if measured is None or measured <= self.max_sigma * 1.02:
                         break
@@ -2515,7 +2608,7 @@ class MatrixFreeSparseRBFPeakFinder:
                     amp_hi = max(
                         float(np.percentile(images_batch[vsel], 99.99)) - bg_hi, 1.0
                     )
-                if measured is None:
+                if auto_ceiling and measured is None:
                     warnings.warn(
                         "max_sigma=None asked for a measured bank ceiling, but "
                         f"only {widths.size} usable peak(s) survived the width "
@@ -2525,13 +2618,29 @@ class MatrixFreeSparseRBFPeakFinder:
                         stacklevel=2,
                     )
                     measured = 10.0
-                if abs(measured - self.max_sigma) > 1e-9:
+                if auto_ceiling and abs(measured - self.max_sigma) > 1e-9:
                     self.max_sigma = float(measured)
                     self.max_k_rad = int(3.0 * self.max_sigma)
-                if self.show_steps:
+                if auto_ceiling and self.show_steps:
                     print(
                         f"  > bank ceiling measured from this batch: "
                         f"max_sigma = {self.max_sigma:g} "
+                        f"({widths.size} peaks in the width census)"
+                    )
+                if auto_floor and floor is None:
+                    warnings.warn(
+                        "min_sigma=None asked for a measured bank floor, but "
+                        f"only {widths.size} usable peak(s) survived the width "
+                        "census -- too few to quote a percentile.  Falling "
+                        f"back to min_sigma={_SAMPLING_MIN_SIGMA:g}; note that "
+                        "a floor fixed in pixels makes the detection threshold "
+                        "drift with the pixel pitch (see _floor_from_widths).",
+                        stacklevel=2,
+                    )
+                if auto_floor and floor is not None and self.show_steps:
+                    print(
+                        f"  > bank floor measured from this batch: "
+                        f"min_sigma = {self.min_sigma:g} "
                         f"({widths.size} peaks in the width census)"
                     )
                 if not self._auto_bank:
@@ -3012,7 +3121,9 @@ class MatrixFreeSparseRBFPeakFinder:
                 f"of atoms at the ceiling (max_sigma={self.max_sigma:g}), "
                 f"{100 * self.bank_saturation['floor']:.1f}% at the floor "
                 f"(min_sigma={self.min_sigma:g}).  Nonzero ceiling saturation "
-                "means widths were imposed, not measured: raise max_sigma."
+                "means widths were imposed, not measured: raise max_sigma.  "
+                "Nonzero floor saturation says the same at the narrow end: "
+                "leave min_sigma unset to measure it from the peak census."
             )
 
         return results

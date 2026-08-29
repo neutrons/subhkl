@@ -962,7 +962,7 @@ def run_finder(
     wavelength_max: float | None = None,
     sparse_rbf_alpha: float | None = None,
     sparse_rbf_gamma: float = 0.0,
-    sparse_rbf_min_sigma: float = 1.5,
+    sparse_rbf_min_sigma: float | None = None,
     sparse_rbf_max_sigma: float | None = None,
     sparse_rbf_num_sigmas: int | None = None,
     sparse_rbf_false_alarms_per_image: float = 1.0,
