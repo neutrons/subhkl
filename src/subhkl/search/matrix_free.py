@@ -108,6 +108,13 @@ def _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width):
 #: measurement lands above it.
 _PROVISIONAL_MAX_SIGMA = 5.0
 
+#: Convergence tolerance on the per-coordinate KKT residual max|G_i|/lam_i --
+#: the first-order residual everywhere below this fraction of the local
+#: penalty, the scale at which the estimator makes activation decisions.
+#: Module level because find_peaks_batch reports the achieved residual
+#: against it, and a reported number needs the bar it was judged by.
+_KKT_STOP_TOL = 1e-3
+
 #: Two-aperture consistency (see the width census): a neighbour strong enough
 #: to inflate the wide aperture inflates the tight one differently, and 6%
 #: keeps every clean synthetic peak while removing the runaway tail.
@@ -1633,7 +1640,7 @@ class MatrixFreeSparseRBFPeakFinder:
         # activation decisions were settled.  Measured on a 4-peak synthetic
         # case the relative residual reaches 2e-5 (float32 floor ~1e-4 in
         # the prox-gradient map), so 1e-3 certifies with a ~50x margin.
-        STOP_TOL = 1e-3
+        STOP_TOL = _KKT_STOP_TOL
 
         def cond_fn(state):
             step, _, _, kkt_rel = state
@@ -1933,7 +1940,38 @@ class MatrixFreeSparseRBFPeakFinder:
 
         c_l1 = lax.fori_loop(0, 2, apn_body, c_l1)
 
-        return c_l1[0]
+        # The optimality certificate for the iterate actually returned.
+        #
+        # The phase-1 loop's own kkt_rel certifies its endpoint, not this
+        # one: the proximal-Newton endgame above moves c afterwards (by
+        # design -- it measures a ~6x tighter residual and deactivates atoms
+        # the coarser solution carries), so re-measuring here is what makes
+        # the number describe the coefficients the caller receives.
+        #
+        # For the problem  min_{c >= 0} f(c) + lam^T c  the prox-gradient
+        # residual G = (c - prox(c - tau grad f))/tau IS the KKT violation,
+        # coordinate by coordinate: at c_i = 0 it evaluates to
+        # max(0, p_i - lam_i) (dual feasibility, p the matched-filter
+        # correlation of the Poisson residual) and at c_i > 0 to
+        # |lam_i - p_i| (stationarity on the support).  So max|G_i|/lam_i is
+        # the dual certificate's violation measured in units of the local
+        # threshold -- the same quantity, and the same scale, that cond_fn
+        # stops on, which is what lets the reported value be compared
+        # against _KKT_STOP_TOL directly.
+        #
+        # Measuring here rather than forwarding the loop's own exit value is
+        # not just bookkeeping: the endgame's steps are accepted on the merit
+        # function, not on the residual, so the residual is not monotone
+        # across it.  Measured on a 4-peak synthetic at max_sigma = 10, the
+        # endgame rescues a badly unconverged phase 1 (3.8e3 -> 2.1 at
+        # max_iter = 100) and mildly loosens a well-converged one
+        # (5.9e-3 -> 1.2e-2 at max_iter = 400).  Either way the number that
+        # describes the returned coefficients is the one taken at them.
+        _, grad_final, _, _ = get_loss_grad_hess(c_l1)
+        c_fb_final = jnp.maximum(0.0, c_l1 - tau_local * grad_final - tau_alpha)
+        kkt_rel_final = jnp.max(jnp.abs((c_l1 - c_fb_final) / tau_local) / lam)
+
+        return c_l1[0], kkt_rel_final
 
     @partial(jit, static_argnames=["self", "border"])
     def _rank_support(self, c_tensor, border=0, valid=None):
@@ -2774,6 +2812,11 @@ class MatrixFreeSparseRBFPeakFinder:
         # solves -- and the per-device compiles on the first chunk.
         solve_pool = ThreadPoolExecutor(max_workers=n_dev) if n_dev > 1 else None
 
+        # Achieved optimality certificate, one entry per image (see
+        # _solve_ssn_cg_global): collected here because the solve is the only
+        # place that knows it, and reported after the sweep.
+        kkt_report = []
+
         for start in range(0, B, solve_chunk):
             stop = min(start + solve_chunk, B)
             if n_dev > 1:
@@ -2804,16 +2847,26 @@ class MatrixFreeSparseRBFPeakFinder:
                     for f in [solve_pool.submit(solve_batch, *args) for args in pieces]
                 ]
 
+                # pad_to_multiple pads at the end and the pieces are
+                # contiguous, so concatenating in device order puts the padded
+                # rows last, where the slice below drops them.
+                kkt_chunk = np.concatenate(
+                    [np.asarray(part[1]).ravel() for part in parts]
+                )
+
                 def coeff(local, _parts=parts, _per=per_device):
-                    return _parts[local // _per][local % _per]
+                    return _parts[local // _per][0][local % _per]
             else:
                 args = [images_padded[start:stop], bg_padded[start:stop]]
                 if valid_padded is not None:
                     args.append(valid_padded[start:stop])
-                c_tensors = solve_batch(*args)
+                c_tensors, kkt_arr = solve_batch(*args)
+                kkt_chunk = np.asarray(kkt_arr).ravel()
 
                 def coeff(local, _c=c_tensors):
                     return _c[local]
+
+            kkt_report.extend(float(v) for v in kkt_chunk[: stop - start])
 
             # Extraction and sliding refinement in one chunked sweep; the
             # coordinates still match the padded image the model is rendered
@@ -3013,6 +3066,53 @@ class MatrixFreeSparseRBFPeakFinder:
                 f"{100 * self.bank_saturation['floor']:.1f}% at the floor "
                 f"(min_sigma={self.min_sigma:g}).  Nonzero ceiling saturation "
                 "means widths were imposed, not measured: raise max_sigma."
+            )
+
+        # Achieved optimality, against the tolerance the solve stops on.
+        #
+        # The problem is convex, so a certified iterate is *the* optimum and
+        # the reported peaks are the estimator's answer.  An uncertified one
+        # is wherever max_iter left the iteration, and nothing downstream can
+        # tell the two apart: the peaks look the same, carry the same
+        # deviances, and are wrong in no way the output reveals.  The residual
+        # is measured every iteration regardless, so reporting it is free, and
+        # it is the difference between "these are the peaks" and "these are
+        # the peaks the solver reached".
+        kkt = np.asarray(kkt_report, dtype=float)
+        n_bad = int(np.sum(kkt > _KKT_STOP_TOL))
+        self.solve_optimality = {
+            "kkt_rel_max": float(kkt.max()) if kkt.size else 0.0,
+            "kkt_rel_median": float(np.median(kkt)) if kkt.size else 0.0,
+            "n_images": int(kkt.size),
+            "n_uncertified": n_bad,
+            "tol": _KKT_STOP_TOL,
+        }
+        if self.show_steps and kkt.size:
+            print(
+                f"  > Optimality: {kkt.size - n_bad}/{kkt.size} image(s) "
+                f"certified, worst KKT residual "
+                f"{self.solve_optimality['kkt_rel_max']:.3g} "
+                f"(tol {_KKT_STOP_TOL:g})"
+            )
+        if n_bad:
+            warnings.warn(
+                f"{n_bad} of {kkt.size} image(s) left the solve without "
+                "meeting the optimality certificate: the per-coordinate KKT "
+                f"residual reached {self.solve_optimality['kkt_rel_max']:.3g} "
+                f"on the worst image against a tolerance of {_KKT_STOP_TOL:g}. "
+                " Peaks are still reported, but on those images they sit "
+                "wherever the iteration ran out rather than at the optimum of "
+                "the convex problem, so the faint and blended end of the list "
+                "is the least trustworthy part of it.  A wide bank is the "
+                "usual cause: the Newton system is poorly conditioned at "
+                "large max_sigma, every step is rejected, and the loop "
+                "degenerates into short forward-backward steps.  Measured on "
+                "a 4-peak synthetic at max_sigma = 10, the iteration budget "
+                "binds long before the conditioning does -- the residual runs "
+                "3.8e3 at the default max_iter = 100 and 5.9e-3 at 400, then "
+                "plateaus -- so more iterations is the first thing to try and "
+                "a narrower bank the second.",
+                stacklevel=2,
             )
 
         return results
