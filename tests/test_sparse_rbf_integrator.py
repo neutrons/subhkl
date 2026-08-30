@@ -1318,7 +1318,7 @@ def test_global_solve_reaches_first_order_optimality():
     ip = jnp.pad(jnp.asarray(image), ((pad, pad), (pad, pad)), mode="edge")
     bp = jnp.pad(jnp.asarray(bg), ((pad, pad), (pad, pad)), mode="edge")
 
-    c_sol = finder._solve_ssn_cg_global(ip, bp, max_iter=400)[None]
+    c_sol = finder._solve_ssn_cg_global(ip, bp, max_iter=400)[0][None]
 
     # The measure is built from first principles with the test's own step
     # size: c is a KKT point iff c = prox(c - tau grad) for ANY tau > 0,
@@ -1407,7 +1407,7 @@ def test_sparse_regime_certificate_and_shadow_deactivation():
     ip = jnp.pad(jnp.asarray(image), ((pad, pad), (pad, pad)), mode="edge")
     bp = jnp.full_like(ip, bg_level)
 
-    c_sol = finder._solve_ssn_cg_global(ip, bp, max_iter=400)[None]
+    c_sol = finder._solve_ssn_cg_global(ip, bp, max_iter=400)[0][None]
 
     # certificate, from first principles with an independent step size
     y4 = ip[None, None, :, :]
