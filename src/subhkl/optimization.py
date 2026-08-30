@@ -1920,6 +1920,9 @@ class FindUB:
         if no_index is None:
             no_index = self.hkl is not None and self.lambdas is not None
 
+        if no_index and self.hkl is None:
+            raise ValueError("--no-index requires --bootstrap")
+
         self.no_index = no_index
 
         if self.no_index:
