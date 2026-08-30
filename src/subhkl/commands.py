@@ -967,6 +967,8 @@ def run_finder(
     sparse_rbf_num_sigmas: int | None = None,
     sparse_rbf_false_alarms_per_image: float = 1.0,
     sparse_rbf_max_fragmentation_rate: float = 1.0,
+    sparse_rbf_expected_peak_amplitude: float | None = None,
+    sparse_rbf_expected_background: float | None = None,
     sparse_rbf_profile_file: str | None = "auto",
     sparse_rbf_shape_ratio: float = 1.2,
     sparse_rbf_shape_orientations: int = 4,
@@ -1004,6 +1006,7 @@ def run_finder(
             "false_alarms_per_image": sparse_rbf_false_alarms_per_image,
             "max_fragmentation_rate": sparse_rbf_max_fragmentation_rate,
             "profile_file": sparse_rbf_profile_file,
+            "expected_peak_amplitude": sparse_rbf_expected_peak_amplitude,
             "shape_ratio": sparse_rbf_shape_ratio,
             "shape_orientations": sparse_rbf_shape_orientations,
             "chunk_size": sparse_rbf_chunk_size,
@@ -1015,6 +1018,9 @@ def run_finder(
             "loss": sparse_rbf_loss,
         }
     )
+
+    if sparse_rbf_expected_background is not None:
+        peak_kwargs["expected_background"] = sparse_rbf_expected_background
 
     peak_kwargs.update(
         {

@@ -125,6 +125,12 @@ def prepare_harvest_tasks(
             # to --sparse-rbf-chunk-size 64 was actually running at
             # whatever the class default happened to be.
             profile_file=harvest_peaks_kwargs.get("profile_file", "auto"),
+            expected_peak_amplitude=harvest_peaks_kwargs.get("expected_peak_amplitude"),
+            **(
+                {"expected_background": harvest_peaks_kwargs["expected_background"]}
+                if harvest_peaks_kwargs.get("expected_background") is not None
+                else {}
+            ),
             shape_ratio=harvest_peaks_kwargs.get("shape_ratio", 1.2),
             shape_orientations=harvest_peaks_kwargs.get("shape_orientations", 4),
             chunk_size=harvest_peaks_kwargs.get("chunk_size", 64),

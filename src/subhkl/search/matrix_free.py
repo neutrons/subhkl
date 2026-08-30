@@ -2170,6 +2170,18 @@ class MatrixFreeSparseRBFPeakFinder:
 
         chunk = self.EXTRACT_CHUNK
         n_chunks = -(-n // chunk)
+        if n_chunks > 1:
+            # Below this size the docstring's exactness claim holds; above it
+            # the refinement is one block-coordinate sweep, whose answer
+            # depends on the chunk partition.  No production dataset has
+            # crossed the threshold so far (busiest observed image: 74
+            # atoms), so make the regime change loud when one does.
+            warnings.warn(
+                f"peak refinement support ({n} atoms) exceeds the "
+                f"{chunk}-atom chunk: refining as one block-coordinate "
+                f"sweep over {n_chunks} blocks instead of jointly",
+                stacklevel=2,
+            )
         # The order vector has H*W entries and a 3x3-window maximum occupies
         # at least a 2x2 cell, so n_chunks*chunk <= n + chunk - 1 << H*W and
         # this slice never truncates.

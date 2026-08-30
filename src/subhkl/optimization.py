@@ -2461,9 +2461,12 @@ class FindUB:
         # sharding it would reach into evosax internals, while sharding runs
         # only touches the batch dimension the code already vmaps over.  Both
         # the batch size and the run count are rounded up to a multiple of the
-        # device count; the rounding launches extra *real* runs with fresh
-        # seeds rather than padding with dummies, so it can only improve the
-        # best-of-N result it feeds.
+        # device count; the padding runs repeat the last real key and are
+        # excluded from the best-of-N selection below, so the answer is a
+        # function of (seed, n_runs) alone, not of how many devices happened
+        # to be visible.  (They used to be extra real restarts -- a free
+        # best-of-N improvement, but one that made the result depend on the
+        # device count.)
         devices = device_util.batch_devices(multi_gpu)
         n_dev = len(devices)
         n_runs_launched = n_runs
@@ -2477,8 +2480,16 @@ class FindUB:
                 f"(batches of {exec_batch_size}) across {n_dev} devices"
             )
 
-        seeds = jnp.arange(seed, seed + n_runs_launched)
-        all_keys = jax.vmap(jax.random.PRNGKey)(seeds)
+        # One root key split across restarts: the runs' streams are
+        # independent by the PRNG's contract rather than by hoping that
+        # consecutive integer seeds hash apart, and two indexer invocations
+        # with different seeds share no streams at all (seed and seed+1
+        # used to overlap in n_runs-1 of their restarts).  Keys are drawn
+        # before any batching, so batch size still cannot touch them.
+        all_keys = jax.random.split(jax.random.PRNGKey(seed), n_runs)
+        if n_runs_launched > n_runs:
+            pad = jnp.repeat(all_keys[-1:], n_runs_launched - n_runs, axis=0)
+            all_keys = jnp.concatenate([all_keys, pad], axis=0)
         batch_keys_list, batch_states_list = [], []
 
         for b_i in range(int(np.ceil(n_runs_launched / exec_batch_size))):
@@ -2520,7 +2531,9 @@ class FindUB:
             [b.best_solution for b in batch_states_list], axis=0
         )
 
-        best_idx = np.argmin(all_loss)
+        # Only the real restarts compete; the device-count padding (duplicate
+        # keys, see above) is present in all_loss but must not be selected.
+        best_idx = np.argmin(all_loss[:n_runs])
         best_overall_loss, best_overall_member = (
             all_loss[best_idx],
             all_solutions[best_idx],
