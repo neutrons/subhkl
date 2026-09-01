@@ -53,6 +53,62 @@ def _unrolled(xyz):
     return roty, xyz[..., 1]
 
 
+def zone_curve_points(
+    detectors,
+    U,
+    B,
+    R_gonio=None,
+    ki=(0.0, 0.0, 1.0),
+    max_index=1,
+    n_arc=1440,
+    label_max=13,
+):
+    """Per-panel lab positions of the low-index zone conics.
+
+    detectors: {key: Detector} -- the returned entries reuse the same keys,
+    so the caller can feed panels keyed by bank (the standalone plot) or by
+    image index (the unrolled replay layout) alike.  Returns a list of
+    {"label", "color", "points": {key: (Ni, 3) lab xyz}} per zone [uvw].
+    """
+    R = np.eye(3) if R_gonio is None else np.asarray(R_gonio, dtype=float)
+    ki_hat = np.asarray(ki, dtype=float)
+    ki_hat = ki_hat / np.linalg.norm(ki_hat)
+    A_real = np.linalg.inv(np.asarray(B, dtype=float)).T  # rows a, b, c
+
+    uvw = zone_axes_uvw(max_index)
+    cmap = plt.get_cmap("tab10")
+    theta = np.linspace(0.0, 2.0 * np.pi, n_arc, endpoint=False)
+    out = []
+    for zi, z in enumerate(uvw):
+        t = z @ A_real
+        t_lab = R @ (np.asarray(U, dtype=float) @ (t / np.linalg.norm(t)))
+        e1 = np.cross(t_lab, ki_hat)
+        if np.linalg.norm(e1) < 1e-9:
+            e1 = np.cross(t_lab, [1.0, 0.0, 0.0])
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(t_lab, e1)
+        G = np.outer(np.cos(theta), e1) + np.outer(np.sin(theta), e2)
+        keep = G @ ki_hat < -1e-3  # diffracting branch, off the direct beam
+        G = G[keep]
+        kf = ki_hat[None, :] - 2.0 * (G @ ki_hat)[:, None] * G
+        points = {}
+        for key, det in detectors.items():
+            mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
+            if np.any(mask):
+                points[key] = det.pixel_to_lab(row[mask], col[mask])
+        out.append(
+            {
+                # a full index-2 legend is 43 entries and overflows the
+                # canvas; label the low-index families (sorted first) and
+                # let the rest share colors unlabeled
+                "label": f"[{z[0]}{z[1]}{z[2]}]" if zi < label_max else None,
+                "color": cmap(zi % 10),
+                "points": points,
+            }
+        )
+    return out
+
+
 def plot_zone_overlay(
     detectors,
     peak_bank,

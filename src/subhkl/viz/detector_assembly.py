@@ -79,6 +79,7 @@ def plot_unrolled_detector(
     overlay_color="cyan",
     overlay_alpha=0.45,
     overlay_label="Static mask",
+    zone_curves=None,
 ):
     fig, ax = plt.subplots(figsize=(16, 6))
 
@@ -279,6 +280,32 @@ def plot_unrolled_detector(
                 label=label,
             )
             added_finder_label = True
+
+    # 2.6 Zone conics (indexer-visualize): each entry carries per-panel lab
+    # positions of one crystallographic zone's curve, drawn in the same
+    # wrapped/compressed coordinates as everything else on this figure.
+    if zone_curves is not None:
+        for zc in zone_curves:
+            first = True
+            for img_key, xyz in zc["points"].items():
+                det = detectors.get(img_key)
+                if det is None or len(xyz) == 0:
+                    continue
+                s_lab = get_s_lab_for_image(img_key)
+                v = np.asarray(xyz) - s_lab
+                z_roty = np.rad2deg(np.arctan2(v[:, 0], v[:, 2]))
+                if img_key in wrapped_panels:
+                    z_roty = np.where(z_roty < 0, z_roty + 360, z_roty)
+                z_roty = compress_roty(z_roty)
+                ax.scatter(
+                    z_roty,
+                    v[:, 1],
+                    s=0.5,
+                    color=zc["color"],
+                    zorder=4,
+                    label=zc["label"] if first else None,
+                )
+                first = False
 
     # 3. Plot the Projected 3D Ellipsoids
     if (

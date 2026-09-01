@@ -2390,18 +2390,77 @@ def run_indexer_visualize(
         raise ValueError("no instrument in the peaks file; pass --instrument")
     dets = {int(k): Detector(v) for k, v in beamlines[str(inst)].items()}
 
-    raw = None
-    if images_filename is not None:
-        raw = _read_merged_images(images_filename)
-
     base = os.path.splitext(os.path.basename(peaks_filename))[0]
     out_dir = output_dir or os.path.dirname(os.path.abspath(peaks_filename))
+    os.makedirs(out_dir, exist_ok=True)
     written = []
+
+    if images_filename is not None:
+        # With images, adopt the prediction plots' layout and naming
+        # exactly: one unrolled-detector figure per run named
+        # '<RUNID>-index.png' beside '<RUNID>-pred.png', where RUNID is the
+        # source file label the Peaks loader derives -- so the indexing
+        # check sits directly next to the prediction check in a directory
+        # listing.
+        from subhkl.integration.api import Peaks
+        from subhkl.viz.detector_assembly import plot_unrolled_detector
+        from subhkl.viz.zones import zone_curve_points
+
+        loaded = Peaks(images_filename, str(inst))
+        runs_imgs = {}
+        for img_key in sorted(loaded.image.ims):
+            runs_imgs.setdefault(loaded.get_run_id(img_key), []).append(img_key)
+
+        class _Shim:
+            sample_offset = np.zeros(3)
+            R = None
+
+        for r, img_keys in runs_imgs.items():
+            m = run == r
+            if image_index is not None:
+                m = m & (img == int(image_index))
+            if Rg is None:
+                R_frame = None
+            elif Rg.shape[0] == len(pr):
+                R_frame = Rg[np.argmax(m)] if np.any(m) else None
+            else:
+                R_frame = Rg[img_keys[0]]
+            run_dets = {k: loaded.get_detector_by_img(k) for k in img_keys}
+            run_ims = {k: loaded.image.ims[k] for k in img_keys}
+            curves = zone_curve_points(
+                run_dets, U, B, R_gonio=R_frame, ki=ki, max_index=max_index
+            )
+            # measured peaks of this run, mapped onto their (run, bank)
+            # frames by physical bank id
+            bank_to_img = {int(loaded.image.bank_mapping[k]): k for k in img_keys}
+            fpk = {}
+            for j in np.flatnonzero(m):
+                k = bank_to_img.get(int(bank[j]))
+                if k is not None:
+                    fpk.setdefault(k, []).append([0.0, pr[j], pc[j]])
+            fpk = {k: np.asarray(v) for k, v in fpk.items()}
+            label = loaded.get_image_label(img_keys[0])
+            out_name = os.path.join(out_dir, f"{label}-index.png")
+            plot_unrolled_detector(
+                _Shim(),
+                run_ims,
+                run_dets,
+                finder_peaks=fpk,
+                out_name=out_name,
+                instrument=str(inst),
+                dpi=dpi,
+                zone_curves=curves,
+            )
+            written.append(out_name)
+            print(f"wrote {out_name}")
+        return written
+
     for r in np.unique(run):
-        # one figure per run, with every peak of the run: the goniometer is
-        # constant within a run (verified on CG4D garnet: zero deviation),
-        # so all its frames share the same zone conics.  --image-index
-        # restricts to one frame for the rare scanning-within-run case.
+        # no images: the standalone peaks-plus-conics rendering.  One
+        # figure per run with every peak of the run -- the goniometer is
+        # constant within a run (verified on CG4D garnet: zero deviation);
+        # --image-index restricts to one frame for a scanning-within-run
+        # case.
         m = run == r
         if image_index is not None:
             m = m & (img == int(image_index))
@@ -2415,11 +2474,6 @@ def run_indexer_visualize(
             R_frame = Rg[int(np.min(img[m]))]
         mm = m
         sel_img = int(np.min(img[m]))
-        run_images = None
-        if raw is not None:
-            images, bank_ids, run_of_image = raw
-            in_run = run_of_image == int(r)
-            run_images = {int(bank_ids[i]): images[i] for i in np.flatnonzero(in_run)}
         out_name = os.path.join(out_dir, f"{base}-zones-run{int(r)}.png")
         zones.plot_zone_overlay(
             dets,
@@ -2434,7 +2488,6 @@ def run_indexer_visualize(
             out_name=out_name,
             dpi=dpi,
             title=f"{base} run {int(r)} frame {sel_img}: zones to index {max_index}",
-            images=run_images,
         )
         written.append(out_name)
         print(f"wrote {out_name}")
