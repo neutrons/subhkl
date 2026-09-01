@@ -1364,6 +1364,19 @@ def spherical_index(
             help="Comma-separated run indices to index (e.g. '0'): a single run has one goniometer setting, so a per-run solve is immune to goniometer-offset errors, and per-run orientations are the observable an offset calibration wants",
         ),
     ] = None,
+    bandwidth: Annotated[
+        int | None,
+        typer.Option(
+            "--bandwidth",
+            help="Spherical-harmonic bandwidth L (default: auto, capped at "
+            "96).  The cap is a cost ceiling, not a precision floor -- "
+            "refinement locates the correlation peak far below the "
+            "bandwidth (measured: < 0.02 deg change from L = 96 to 192 on "
+            "MANDI garnet raw data) -- but dense models (large cells) need "
+            "L above pi/spacing for basin separation.  Correlogram cost "
+            "scales as L^4, projection as L^2.",
+        ),
+    ] = None,
 ):
     """
     Index by spherical correlation over SO(3) -- global across all panels
@@ -1395,6 +1408,7 @@ def spherical_index(
         images_filename=images,
         binning=binning,
         runs=[int(x.strip()) for x in runs.split(",")] if runs else None,
+        bandwidth=bandwidth,
     )
 
 

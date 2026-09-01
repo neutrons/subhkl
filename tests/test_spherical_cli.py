@@ -175,6 +175,7 @@ def test_raw_count_indexing_and_image_backed_overlay(tmp_path):
         kernel_deg=1.0,
         images_filename=images_file,
         binning=8,
+        runs=[0],  # exercises the frame-side run filter too
     )
     with h5py.File(out_file) as fp:
         U = fp["sample/U"][()]
@@ -182,6 +183,18 @@ def test_raw_count_indexing_and_image_backed_overlay(tmp_path):
     err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
     assert err < 1.0
     assert z[0] > 5.0
+    with h5py.File(out_file) as fp:
+        aligned = float(fp["spherical/quality/aligned_fraction"][()])
+        aligned_med = float(fp["spherical/quality/aligned_median_deg"][()])
+    # The null-subtracted statistic sees through the noise background.  In
+    # this scene the spots carry only ~2% of the positive-excess weight
+    # (6k spot counts against ~270k Poisson upward fluctuations), so a
+    # small aligned fraction IS the truth -- what matters is that the
+    # aligned component is detected at all and located sharply, while the
+    # plain median (dominated by the null-distributed noise weight) would
+    # say nothing.
+    assert 0.02 < aligned < 0.2
+    assert aligned_med < 0.8
 
     written = run_indexer_visualize(
         out_file, output_dir=str(tmp_path), max_index=1, images_filename=images_file

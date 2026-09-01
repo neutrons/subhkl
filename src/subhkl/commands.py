@@ -1834,6 +1834,11 @@ def _spherical_quality(
     dev, loglik = dev_and_loglik(U, want_loglik=True)
     med = wmedian(dev, weights)
     matched = float(np.sum(weights[dev < tol]) / max(np.sum(weights), 1e-12))
+    # weighted CDFs on a fixed grid, for the null-subtracted statistics
+    grid = np.linspace(0.0, 10.0, 1001)
+    wsum = max(np.sum(weights), 1e-12)
+    F = np.cumsum(np.histogram(dev, bins=grid, weights=weights)[0]) / wsum
+    F_null = np.zeros_like(F)
     null_meds, null_matched = [], []
     for _ in range(n_null):
         Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
@@ -1842,6 +1847,25 @@ def _spherical_quality(
         null_matched.append(
             float(np.sum(weights[dv < tol]) / max(np.sum(weights), 1e-12))
         )
+        F_null += np.cumsum(np.histogram(dv, bins=grid, weights=weights)[0]) / (
+            wsum * n_null
+        )
+    # Null-subtracted aligned component.  In raw mode most of the weight is
+    # diffuse scattering with no Bragg alignment, and the plain median then
+    # reports the diffuse floor, not the indexing.  The diffuse component is
+    # distributed (nearly) like the null, so it cancels in the CDF
+    # difference: the height of max(F - F_null) is the weight fraction that
+    # is genuinely aligned beyond chance, and the angle where the difference
+    # reaches half its maximum is that component's median, undiluted.
+    # (Thermal diffuse concentrating near the Bragg lines makes this an
+    # upper bound on the aligned fraction, stated rather than hidden.)
+    diff = F - F_null
+    aligned_frac = float(np.max(diff))
+    if aligned_frac > 0.02:
+        half_idx = int(np.argmax(diff >= 0.5 * aligned_frac))
+        aligned_med = float(grid[1:][half_idx])
+    else:
+        aligned_med = float("nan")
     per_run = {}
     if run_ids is not None:
         for r in np.unique(run_ids):
@@ -1854,6 +1878,8 @@ def _spherical_quality(
         "null_matched_fraction": float(np.mean(null_matched)),
         "matched_tol_deg": tol,
         "loglik_per_weight": loglik,
+        "aligned_fraction": aligned_frac,
+        "aligned_median_deg": aligned_med,
         "per_run_median_deg": per_run,
     }
 
@@ -1894,6 +1920,7 @@ def run_spherical_index(
     images_filename: str | None = None,
     binning: int = 4,
     runs: list | None = None,
+    bandwidth: int | None = None,
 ):
     """Index by spherical correlation over SO(3) -- the matched-filter dual
     of the sparse orientation-recovery problem (subhkl.search.spherical).
@@ -1990,6 +2017,14 @@ def run_spherical_index(
         from subhkl.search.spherical import project_counts as _pc
 
         images, bank_ids, run_of_image = _read_merged_images(images_filename)
+        if runs is not None:
+            # the --runs restriction applies to the frames too: without it,
+            # frames of unselected runs would be projected with no (or the
+            # wrong) goniometer rotation and drown the selected run's signal
+            keep_img = np.isin(run_of_image, np.asarray(list(runs), dtype=int))
+            images = images[keep_img]
+            bank_ids = bank_ids[keep_img]
+            run_of_image = run_of_image[keep_img]
         # per-run goniometer rotation from any of the run's peaks
         run = run if run is not None else np.zeros(len(pr), int)
         R_run = {}
@@ -1998,7 +2033,17 @@ def run_spherical_index(
             for r_ in np.unique(run):
                 R_run[int(r_)] = R_pk[np.argmax(run == r_)]
         sigma_raw = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
-        L_raw = int(min(max(np.ceil(3.0 / sigma_raw), 16), 96))
+        # The auto ceiling of 96 is a cost cap, not a precision floor:
+        # measured on MANDI garnet run-0 raw data, the solution moves by
+        # < 0.02 deg between L = 96 and L = 192 (at 3x and 9x the cost) --
+        # refinement locates the smooth objective's peak far below the
+        # bandwidth.  Raise it (--bandwidth) when a dense model needs basin
+        # SEPARATION, e.g. large cells with direction spacing under pi/L.
+        L_raw = (
+            int(bandwidth)
+            if bandwidth is not None
+            else int(min(max(np.ceil(3.0 / sigma_raw), 16), 96))
+        )
         bin_dirs = {}
         f_raw = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
         raw_pts, raw_w, raw_run = [], [], []
@@ -2055,16 +2100,27 @@ def run_spherical_index(
         C, al_, be_, ga_ = sph.correlogram(f_raw, g)
         cands = sph.top_orientations(C, al_, be_, ga_, n=n_candidates)
         results = []
+        kept_R = []
+        gnorm2 = sph.so3_inner(g, g, np.eye(3))
         for R_, val in cands:
             R_ = sph.refine_local(f_raw, g, R_)
             val = sph.so3_inner(f_raw, g, R_)
+            # lattice-symmetry copies carry the same rotated model
+            # (coherence 1); keep one representative, as the peaks path does
+            mu = max(
+                (abs(sph.so3_inner(g, g, R_.T @ R2)) / gnorm2 for R2 in kept_R),
+                default=0.0,
+            )
+            if mu > 0.99:
+                continue
+            kept_R.append(R_)
             results.append(
                 {
                     "R": R_,
                     "score": val,
                     "z": sph.null_zscore(C, val),
                     "n_matched": 0,
-                    "coherence": 0.0,
+                    "coherence": mu,
                     "c": np.nan,
                 }
             )
@@ -2076,6 +2132,7 @@ def run_spherical_index(
             kernel_deg=kernel_deg,
             n_candidates=n_candidates,
             lam=lam,
+            L=bandwidth,
         )
     if not results:
         raise RuntimeError("no orientation candidate found")
@@ -2084,7 +2141,11 @@ def run_spherical_index(
     B_out = B
     if refine:
         sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
-        L = int(min(max(np.ceil(3.0 / sigma), 16), 96))
+        L = (
+            int(bandwidth)
+            if bandwidth is not None
+            else int(min(max(np.ceil(3.0 / sigma), 16), 96))
+        )
         f = f_raw if f_raw is not None else sph.project_points(d_sample, None, L, sigma)
         hkl_all = np.stack([h_, k_, l_], axis=1)
         U, B_out, _ = sph.refine_matching_free(
@@ -2117,7 +2178,9 @@ def run_spherical_index(
         f"matched(<{quality['matched_tol_deg']:.2f} deg) "
         f"{100 * quality['matched_fraction']:.1f}% "
         f"(null {100 * quality['null_matched_fraction']:.1f}%); "
-        f"loglik/weight {quality['loglik_per_weight']:.3f} nats"
+        f"loglik/weight {quality['loglik_per_weight']:.3f} nats; "
+        f"null-subtracted: {100 * quality['aligned_fraction']:.1f}% of weight "
+        f"aligned, at median {quality['aligned_median_deg']:.3f} deg"
     )
     if quality["per_run_median_deg"] and len(quality["per_run_median_deg"]) > 1:
         worst = max(quality["per_run_median_deg"].items(), key=lambda kv: kv[1])
