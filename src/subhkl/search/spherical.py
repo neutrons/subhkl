@@ -485,14 +485,24 @@ def so3_inner(f, g, R):
     return float(np.real(np.sum(np.conj(f) * rf)))
 
 
-def correlogram(f, g, n_beta=None):
+def correlogram(f, g, n_beta=None, backend="jax"):
     """C(alpha, beta, gamma) = <f, Lambda(R) g> on an Euler-angle grid.
 
     For each beta the coupling S_{m n} = sum_l conj(f^l_m) d^l_{m n} g^l_n
     is a single contraction over degrees (the per-degree coupling is the
     rank-one outer product f^l (g^l)^dagger), and the (alpha, gamma)
-    dependence is a 2D Fourier sum.  Cost O(L^3) per beta; no SO(3) grid
-    finer than the readout grid ever exists.
+    dependence is a 2D Fourier sum.
+
+    backend="jax" (default) runs a fused float32 kernel: profiling showed
+    the numpy path memory-bound on materializing the full Wigner stack
+    ((n_beta, L+1, M, M) = 2.8 GB at L = 96), so the kernel never builds
+    it -- the coupling is reindexed by recursion depth,
+    coefK[k, m, n] = coef[l = k + mx(m, n), m, n], and accumulated inside
+    the Jacobi recursion with two rolling P rows: peak memory O(M^2
+    n_beta) ~ 90 MB, every beta in one fused pass, on whatever device jax
+    holds.  backend="numpy" is the float64 reference the exactness tests
+    pin (agreement with direct kernel sums at 1e-10); the jax path is
+    tested against it at float32 tolerance.
 
     Returns (C [n_a, n_b, n_g] real, alphas, betas, gammas).
     """
@@ -505,6 +515,11 @@ def correlogram(f, g, n_beta=None):
 
     m = np.arange(-L, L + 1)
     Ea = np.exp(-1j * np.outer(m, alphas))  # [M, n_ang]
+
+    if backend == "jax":
+        C = _correlogram_kernel_jax(np.asarray(f), np.asarray(g), betas, Ea)
+        return np.asarray(C, dtype=float), alphas, betas, gammas
+
     C = np.empty((n_ang, n_beta, n_ang))
     # batched Wigner build, chunked so the (L+1, M, M, chunk) tensor stays
     # a few hundred MB (29 MB per beta at L = 96)
@@ -516,6 +531,117 @@ def correlogram(f, g, n_beta=None):
         for j in range(len(bs)):
             C[:, t0 + j, :] = np.real(Ea.T @ S[j] @ Ea)
     return C, alphas, betas, gammas
+
+
+def _wigner_case_tables(L):
+    """Static (m, n) tables of the Jacobi form: mx, a, b, and the
+    sign * prefactor(l) stack.  Pure geometry, numpy float64."""
+    M = 2 * L + 1
+    m = np.arange(-L, L + 1)
+    mm, nn = np.meshgrid(m, m, indexing="ij")
+    mx = np.maximum(np.abs(mm), np.abs(nn))
+    a = np.where(
+        np.abs(nn) >= np.abs(mm),
+        np.where(nn < 0, mm - nn, nn - mm),
+        np.where(mm < 0, nn - mm, mm - nn),
+    )
+    lam = np.where(
+        np.abs(nn) >= np.abs(mm),
+        np.where(nn < 0, mm - nn, 0),
+        np.where(mm < 0, 0, mm - nn),
+    )
+    b = 2 * mx - a
+    fl = _factln(4 * L + 1)
+    sign = np.where(lam % 2 == 0, 1.0, -1.0)
+    pref = np.zeros((L + 1, M, M))
+    for l_ in range(L + 1):
+        valid = mx <= l_
+        k = l_ - mx
+        top = (
+            fl[l_ + mx] - fl[np.maximum(k + a, 0)] - fl[np.maximum(l_ + mx - k - a, 0)]
+        )
+        bot = fl[np.maximum(k + b, 0)] - fl[np.maximum(k, 0)] - fl[b]
+        pref[l_] = np.where(valid, sign * np.exp(0.5 * (top - bot)), 0.0)
+    return mx, a, b, pref
+
+
+def _correlogram_kernel_jax(f, g, betas, Ea):
+    """The fused correlogram: coupling accumulated inside the recursion, no
+    Wigner tensor ever materialized.
+
+    Numerical form matters here: the Jacobi factorization d = pref * ang *
+    P_k balances a prefactor that reaches ~1e28 at L = 96 against an
+    equally extreme angular factor and polynomial -- fine in float64,
+    overflow at L ~ 40 in float32.  The kernel therefore recurs directly on
+    the BOUNDED quantity D_k = pref_k ang P_k (the d-matrix entries
+    themselves, |d| <= 1): ang cancels from the linear recursion because it
+    is k-independent, and pref enters only through the polynomially bounded
+    ratios rho = pref_k / pref_{k-1}, precomputed in float64 and cast.
+    Everything the kernel touches is O(1).
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+
+    L = f.shape[0] - 1
+    mx, a, b, pref = _wigner_case_tables(L)
+    # coupling gathered into recursion-depth order: step k of the recursion
+    # computes degree l = k + mx(m, n) for every (m, n) at once
+    coef = np.conj(f)[:, :, None] * g[:, None, :]
+    l_idx = np.minimum(np.arange(L + 1)[:, None, None] + mx[None], L)
+    in_band = (np.arange(L + 1)[:, None, None] + mx[None]) <= L
+    coefK = np.where(in_band, np.take_along_axis(coef, l_idx, axis=0), 0.0)
+    prefK = np.where(in_band, np.take_along_axis(pref, l_idx, axis=0), 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rho1 = np.where(prefK != 0.0, prefK / np.roll(prefK, 1, axis=0), 0.0)
+        rho2 = np.where(prefK != 0.0, prefK / np.roll(prefK, 2, axis=0), 0.0)
+    rho1[~np.isfinite(rho1)] = 0.0
+    rho2[~np.isfinite(rho2)] = 0.0
+
+    sh, ch = np.sin(betas / 2.0), np.cos(betas / 2.0)
+    with np.errstate(divide="ignore"):
+        ang = np.exp(
+            np.log(np.maximum(sh, 1e-300))[None, None, :] * a[..., None]
+            + np.log(np.maximum(ch, 1e-300))[None, None, :] * b[..., None]
+        )  # float64: exact where float32 would over/underflow
+    x64 = np.cos(betas)
+    D0 = prefK[0][..., None] * ang  # = d at k = 0 (P_0 = 1), O(1)
+    P1_64 = 0.5 * (a - b)[..., None] + (1.0 + 0.5 * (a + b))[..., None] * x64
+    D1 = prefK[1][..., None] * ang * P1_64
+
+    af = jnp.asarray(a, dtype=jnp.float32)[..., None]
+    bf = jnp.asarray(b, dtype=jnp.float32)[..., None]
+    coefK_j = jnp.asarray(coefK, dtype=jnp.complex64)
+    rho1_j = jnp.asarray(rho1, dtype=jnp.float32)
+    rho2_j = jnp.asarray(rho2, dtype=jnp.float32)
+    x = jnp.asarray(x64, dtype=jnp.float32)[None, None, :]
+    D0_j = jnp.asarray(D0, dtype=jnp.float32)
+    D1_j = jnp.asarray(D1, dtype=jnp.float32)
+    Ea_j = jnp.asarray(Ea, dtype=jnp.complex64)
+
+    @jax.jit
+    def kernel(coefK_j, rho1_j, rho2_j, af, bf, x, D0_j, D1_j, Ea_j):
+        S = coefK_j[0][..., None] * D0_j.astype(jnp.complex64) + coefK_j[1][
+            ..., None
+        ] * D1_j.astype(jnp.complex64)
+
+        def body(k, state):
+            Dm2, Dm1, S = state
+            kf = jnp.asarray(k, dtype=jnp.float32)
+            n2 = 2.0 * kf + af + bf
+            c1 = 2.0 * kf * (kf + af + bf) * (n2 - 2.0)
+            c2 = (n2 - 1.0) * (n2 * (n2 - 2.0) * x + af * af - bf * bf)
+            c3 = 2.0 * (kf + af - 1.0) * (kf + bf - 1.0) * n2
+            Dk = (
+                c2 * rho1_j[k][..., None] * Dm1 - c3 * rho2_j[k][..., None] * Dm2
+            ) / c1
+            S = S + coefK_j[k][..., None] * Dk.astype(jnp.complex64)
+            return (Dm1, Dk, S)
+
+        _, _, S = lax.fori_loop(2, coefK_j.shape[0], body, (D0_j, D1_j, S))
+        return jnp.real(jnp.einsum("ma,mnb,nc->abc", Ea_j, S, Ea_j))
+
+    return kernel(coefK_j, rho1_j, rho2_j, af, bf, x, D0_j, D1_j, Ea_j)
 
 
 # ---------------------------------------------------------------------------

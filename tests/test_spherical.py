@@ -169,7 +169,7 @@ def test_correlogram_matches_direct_kernel_sums():
     direct = float(np.sum(wf[:, None] * wg[None, :] * kpoint(pts_f @ (pts_g @ R.T).T)))
     assert so3_inner(f, g, R) == pytest.approx(direct, rel=1e-10)
 
-    C, al, be, ga = correlogram(f, g)
+    C, al, be, ga = correlogram(f, g, backend="numpy")
     i, j, k = 3, 2, 5
     assert C[i, j, k] == pytest.approx(
         so3_inner(f, g, rot_zyz(al[i], be[j], ga[k])), rel=1e-10
@@ -534,3 +534,23 @@ def test_wigner_d_batched_equals_scalar():
     batched = wigner_d_matrix(8, betas)
     for j, b in enumerate(betas):
         assert np.allclose(batched[..., j], wigner_d_matrix(8, float(b)), atol=1e-14)
+
+
+def test_correlogram_jax_matches_numpy_reference():
+    """The fused float32 kernel against the float64 reference: same values
+    to float32 tolerance, same argmax, at a bandwidth past where the naive
+    float32 factorization overflows (the D-recursion keeps every quantity
+    O(1); see _correlogram_kernel_jax)."""
+    rng = np.random.default_rng(2)
+    pf = _rand_dirs(rng, 25)
+    pg = _rand_dirs(rng, 35)
+    for L, sig in ((16, 0.05), (48, 0.02)):
+        f = project_points(pf, rng.uniform(0.5, 2, 25), L, sig, even_only=False)
+        g = project_points(pg, rng.uniform(0.5, 2, 35), L, sig, even_only=False)
+        C_np, *_ = correlogram(f, g, backend="numpy")
+        C_jx, *_ = correlogram(f, g, backend="jax")
+        scale = float(np.abs(C_np).max())
+        assert np.abs(C_jx - C_np).max() / scale < 2e-3
+        assert np.unravel_index(np.argmax(C_np), C_np.shape) == np.unravel_index(
+            np.argmax(C_jx), C_jx.shape
+        )
