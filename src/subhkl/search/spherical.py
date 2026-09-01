@@ -1317,6 +1317,12 @@ def refine_instrument_matching_free(
     global_rot_axis=None,
     refine_banks=None,
     bank_ids_present=None,
+    refine_beam=False,
+    beam_bound_deg=1.0,
+    refine_sample=False,
+    sample_bound_m=0.005,
+    per_run_trans=False,
+    per_run_trans_bound_m=0.005,
 ):
     """Joint matching-free refinement of orientation, cell shape, detector
     panels and goniometer offsets -- one likelihood, no peak assignment.
@@ -1433,7 +1439,10 @@ def refine_instrument_matching_free(
         free6 = np.repeat(keep, 3)
         det_free[sl] = np.concatenate([free6, free6])
 
+    n_tilt = n_prun = n_harm = 0
     if gonio is not None:
+        from subhkl.instrument.refinables import axis_tilt_frames
+
         axes = np.asarray(gonio["axes"], dtype=float)
         angles_deg = np.asarray(gonio["angles_deg"], dtype=float)
         refine_mask = np.asarray(gonio["refine_mask"], dtype=bool)
@@ -1443,8 +1452,42 @@ def refine_instrument_matching_free(
         )
         run_idx = np.asarray(peaks["run_idx"], dtype=int)
         n_goff = int(refine_mask.sum())
+        n_runs_g = angles_deg.shape[0]
+        base_dirs = axes[:, :3] / np.linalg.norm(axes[:, :3], axis=1, keepdims=True)
+        frames_tilt = axis_tilt_frames(axes)
+        # axis-vector tilts: two bounded angles per masked axis, about an
+        # orthonormal basis perpendicular to the nominal direction -- the
+        # classic --refine-goniometer-axis-vector
+        tilt_mask = np.asarray(
+            gonio.get("axis_tilt_mask", np.zeros(len(axes), bool)), dtype=bool
+        )
+        tilt_bound = np.deg2rad(float(gonio.get("tilt_bound_deg", 1.0)))
+        tilt_axes = [k for k in range(len(axes)) if tilt_mask[k]]
+        n_tilt = 2 * len(tilt_axes)
+        # per-run angle corrections on one motor -- the classic
+        # --refine-goniometer-per-run (the literal DPHI); the constant part
+        # is that motor's zero offset and inherits its gauge status
+        per_run_axis = gonio.get("per_run_axis")
+        per_run_bound = float(gonio.get("per_run_bound_deg", 1.0))
+        n_prun = n_runs_g if per_run_axis is not None else 0
+        # harmonic rocking: the per-run correction of one motor constrained
+        # to a Fourier series in its own nominal angle -- the classic
+        # --refine-goniometer-harmonics, at run resolution
+        harmonics_axis = gonio.get("harmonics_axis")
+        harm_orders = list(gonio.get("harmonics_orders", []) or [])
+        harm_bound = float(gonio.get("harmonics_bound_deg", 0.5))
+        n_harm = 2 * len(harm_orders) if harmonics_axis is not None else 0
+        if harmonics_axis is not None:
+            th_h = np.deg2rad(angles_deg[:, int(harmonics_axis)])
+            harm_basis = np.stack(
+                sum(([np.cos(o * th_h), np.sin(o * th_h)] for o in harm_orders), []),
+                axis=1,
+            )  # [n_runs, 2 n_orders]
     else:
         n_goff = 0
+    n_beam = 2 if refine_beam else 0
+    n_samp = 3 if refine_sample else 0
+    n_prt = 3 * angles_deg.shape[0] if (per_run_trans and gonio is not None) else 0
 
     hkl_j = np.asarray(hkl, dtype=float)
     w_model = jnp.ones(len(hkl_j))
@@ -1476,10 +1519,34 @@ def refine_instrument_matching_free(
             det_norm = 0.5 + (det_norm - 0.5) * jnp.asarray(det_free, dtype=jnp.float32)
         i += n_det
         goff = forward_map_param(p[i : i + n_goff], gonio_bound) if n_goff else p[i:i]
-        return rotvec, A, det_norm, goff
+        i += n_goff
+        extras = {}
+        if n_tilt:
+            extras["tilt"] = forward_map_param(p[i : i + n_tilt], tilt_bound)
+            i += n_tilt
+        if n_prun:
+            extras["prun"] = forward_map_param(p[i : i + n_prun], per_run_bound)
+            i += n_prun
+        if n_harm:
+            extras["harm"] = forward_map_param(p[i : i + n_harm], harm_bound)
+            i += n_harm
+        if n_beam:
+            extras["beam"] = forward_map_param(
+                p[i : i + n_beam], np.deg2rad(beam_bound_deg)
+            )
+            i += n_beam
+        if n_samp:
+            extras["samp"] = forward_map_param(p[i : i + n_samp], sample_bound_m)
+            i += n_samp
+        if n_prt:
+            extras["prt"] = forward_map_param(
+                p[i : i + n_prt], per_run_trans_bound_m
+            ).reshape(-1, 3)
+            i += n_prt
+        return rotvec, A, det_norm, goff, extras
 
     def neg_loglik(p):
-        rotvec, A, det_norm, goff = unpack(p)
+        rotvec, A, det_norm, goff, extras = unpack(p)
         # data side: peak directions from the perturbed instrument
         c, u, v, _, _, _ = apply_detector_modes(
             det_norm[None, :],
@@ -1494,15 +1561,52 @@ def refine_instrument_matching_free(
             cylinder_axis=cylinder_axis,
             global_rot_axis=global_rot_axis,
         )
-        xyz = peak_lab_xyz(c, u, v, det_idx, u_off, v_off)[0] - s_off
+        origin = s_off
+        if "samp" in extras:
+            origin = origin + extras["samp"]
+        xyz = peak_lab_xyz(c, u, v, det_idx, u_off, v_off)[0] - origin
+        if "prt" in extras:
+            xyz = xyz - extras["prt"][run_idx]
         kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
-        g_lab = kf - ki_hat
+        ki_eff = ki_hat
+        if "beam" in extras:
+            # the classic refine_beam parameterization: bounded additions to
+            # the transverse components, renormalized
+            ki_eff = ki_hat + jnp.array([extras["beam"][0], extras["beam"][1], 0.0])
+            ki_eff = ki_eff / jnp.linalg.norm(ki_eff)
+        g_lab = kf - ki_eff
         d_lab = g_lab / jnp.linalg.norm(g_lab, axis=1, keepdims=True)
         if gonio is not None:
             offs = jnp.asarray(nominal_off).at[np.where(refine_mask)[0]].add(goff)
+            axis_dirs = None
+            if "tilt" in extras:
+                dirs_list = []
+                t_i = 0
+                for k in range(len(axes)):
+                    if k in tilt_axes:
+                        e1, e2 = frames_tilt[k]
+                        tv = extras["tilt"][2 * t_i] * jnp.asarray(e1) + extras["tilt"][
+                            2 * t_i + 1
+                        ] * jnp.asarray(e2)
+                        dirs_list.append(_rodrigues_jax(tv) @ jnp.asarray(base_dirs[k]))
+                        t_i += 1
+                    else:
+                        dirs_list.append(jnp.asarray(base_dirs[k]))
+                axis_dirs = dirs_list
+
+            def _ang_r(r):
+                ang = jnp.asarray(angles_deg[r])
+                if n_prun:
+                    ang = ang.at[int(per_run_axis)].add(extras["prun"][r])
+                if n_harm:
+                    ang = ang.at[int(harmonics_axis)].add(
+                        jnp.asarray(harm_basis[r]) @ extras["harm"]
+                    )
+                return ang
+
             R_runs = jnp.stack(
                 [
-                    gonio_rotation_jax(axes, jnp.asarray(angles_deg[r]), offs)
+                    gonio_rotation_jax(axes, _ang_r(r), offs, axis_dirs=axis_dirs)
                     for r in range(angles_deg.shape[0])
                 ]
             )
@@ -1528,7 +1632,9 @@ def refine_instrument_matching_free(
     # the same latency pattern measured and removed from refine_local.
     from jax import lax
 
-    n_par = 3 + n_cell + n_det + n_goff
+    n_par = (
+        3 + n_cell + n_det + n_goff + n_tilt + n_prun + n_harm + n_beam + n_samp + n_prt
+    )
     lr0, beta1, beta2, eps = 0.03, 0.9, 0.999, 1e-8
     lrs = jnp.asarray(
         lr0 * 0.5 * (1.0 + np.cos(np.pi * np.arange(1, int(maxiter) + 1) / maxiter)),
@@ -1569,7 +1675,7 @@ def refine_instrument_matching_free(
     best_x, best_v_j = run_adam(jnp.full(n_par, 0.5, dtype=jnp.float32))
     best_v = float(best_v_j)
 
-    rotvec, A, det_norm, goff = unpack(best_x)
+    rotvec, A, det_norm, goff, extras = unpack(best_x)
     out = {
         "R": np.asarray(_rodrigues_jax(jnp.asarray(rotvec))) @ np.asarray(R0),
         "B": (np.eye(3) + np.asarray(A)) @ np.asarray(B0),
@@ -1580,4 +1686,22 @@ def refine_instrument_matching_free(
         offs = np.array(nominal_off)
         offs[refine_mask] += np.asarray(goff)
         out["gonio_offsets_deg"] = offs
+        if n_tilt:
+            tilts = np.rad2deg(np.asarray(extras["tilt"])).reshape(-1, 2)
+            out["axis_tilts_deg"] = {k: tilts[i] for i, k in enumerate(tilt_axes)}
+        if n_prun:
+            out["per_run_deg"] = np.asarray(extras["prun"])
+        if n_harm:
+            out["harmonics_deg"] = np.asarray(extras["harm"])
+            out["harmonics_per_run_deg"] = np.asarray(
+                harm_basis @ np.asarray(extras["harm"])
+            )
+    if n_beam:
+        bx, by = np.asarray(extras["beam"])
+        ki_eff = np.asarray(ki_hat) + np.array([bx, by, 0.0])
+        out["ki_refined"] = ki_eff / np.linalg.norm(ki_eff)
+    if n_samp:
+        out["sample_offset_m"] = np.asarray(s_off) + np.asarray(extras["samp"])
+    if n_prt:
+        out["per_run_trans_m"] = np.asarray(extras["prt"])
     return out

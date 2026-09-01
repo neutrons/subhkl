@@ -2100,6 +2100,19 @@ def run_spherical_index(
     det_global_trans_bound: float = 0.01,
     det_global_rot_axis: list | None = None,
     cylinder_axis: list | None = None,
+    refine_gonio_axis_vector: list | None = None,
+    gonio_axis_vector_bound_deg: float = 1.0,
+    refine_gonio_per_run: str | None = None,
+    gonio_per_run_bound_deg: float = 1.0,
+    refine_gonio_harmonics: str | None = None,
+    gonio_harmonics_orders: list | None = None,
+    gonio_harmonics_bound_deg: float = 0.5,
+    refine_beam: bool = False,
+    beam_bound_deg: float = 1.0,
+    refine_sample: bool = False,
+    sample_bound_m: float = 0.005,
+    refine_gonio_per_run_trans: bool = False,
+    gonio_per_run_trans_bound_m: float = 0.005,
     gonio_bound_deg: float = 5.0,
     refine_maxiter: int = 400,
     refine_max_points: int = 100_000,
@@ -2439,6 +2452,18 @@ def run_spherical_index(
             angles_by_run[r_] = np.asarray(
                 g_angles[row] if g_angles.shape[0] == len(pr) else g_angles[r_]
             )
+
+    def _axis_indices(wanted):
+        short = [n.split(":")[-1] for n in g_names]
+        idx = [
+            k
+            for k, (n, sn) in enumerate(zip(g_names, short))
+            if (n in wanted) or (sn in wanted)
+        ]
+        if not idx:
+            raise ValueError(f"{wanted} matches none of the axes {short}")
+        return idx
+
     gonio_mask = None
     if refine_gonio_axes and g_names is not None:
         short = [n.split(":")[-1] for n in g_names]
@@ -2490,6 +2515,18 @@ def run_spherical_index(
                 "refine_mask": gonio_mask,
                 "bound_deg": gonio_bound_deg,
             }
+            if refine_gonio_axis_vector:
+                tm = np.zeros(len(g_axes), bool)
+                tm[_axis_indices(refine_gonio_axis_vector)] = True
+                gonio_in["axis_tilt_mask"] = tm
+                gonio_in["tilt_bound_deg"] = gonio_axis_vector_bound_deg
+            if refine_gonio_per_run:
+                gonio_in["per_run_axis"] = _axis_indices([refine_gonio_per_run])[0]
+                gonio_in["per_run_bound_deg"] = gonio_per_run_bound_deg
+            if refine_gonio_harmonics:
+                gonio_in["harmonics_axis"] = _axis_indices([refine_gonio_harmonics])[0]
+                gonio_in["harmonics_orders"] = list(gonio_harmonics_orders or [1])
+                gonio_in["harmonics_bound_deg"] = gonio_harmonics_bound_deg
         elif run is not None:
             # rotate data into the sample frame beforehand is not possible
             # through refine_instrument without gonio; fold the nominal
@@ -2530,6 +2567,12 @@ def run_spherical_index(
             global_rot_axis=det_global_rot_axis,
             refine_banks=refine_detector_banks,
             bank_ids_present=banks_r,
+            refine_beam=refine_beam,
+            beam_bound_deg=beam_bound_deg,
+            refine_sample=refine_sample,
+            sample_bound_m=sample_bound_m,
+            per_run_trans=refine_gonio_per_run_trans,
+            per_run_trans_bound_m=gonio_per_run_trans_bound_m,
         )
         U, B_out = out_ref["R"], out_ref["B"]
         from subhkl.instrument.refinables import detector_mode_slices
@@ -2576,6 +2619,30 @@ def run_spherical_index(
             else:
                 msg.append(f"{mode_} {np.round(vals, 5)}")
         print("; ".join(msg))
+        for key_, fmt_ in (
+            (
+                "axis_tilts_deg",
+                lambda v: {
+                    g_names[k2].split(":")[-1]: np.round(t2, 4).tolist()
+                    for k2, t2 in v.items()
+                },
+            ),
+            ("per_run_deg", lambda v: np.round(v, 3).tolist()),
+            ("harmonics_per_run_deg", lambda v: np.round(v, 3).tolist()),
+            ("ki_refined", lambda v: np.round(v, 5).tolist()),
+            ("sample_offset_m", lambda v: np.round(1e3 * v, 3).tolist()),
+        ):
+            if key_ in out_ref:
+                print(f"  {key_}: {fmt_(out_ref[key_])}")
+                det_report = det_report or {}
+                det_report[key_] = out_ref[key_]
+        if "per_run_trans_m" in out_ref:
+            det_report = det_report or {}
+            det_report["per_run_trans_m"] = out_ref["per_run_trans_m"]
+            print(
+                "  per_run_trans_m: largest "
+                f"{1e3 * np.abs(out_ref['per_run_trans_m']).max():.2f} mm"
+            )
         if "gonio_offsets_deg" in out_ref:
             gonio_offsets_deg = out_ref["gonio_offsets_deg"]
             print(
@@ -2722,9 +2789,12 @@ def run_spherical_index(
                 key = n_ if seen[n_] == 1 else f"{n_}_{seen[n_]}"
                 out[f"goniometer/offsets/{key}"] = float(o_)
         if det_report is not None:
-            out["spherical/detector/banks"] = np.array(det_report["banks"])
-            out["spherical/detector/modes"] = np.array(det_report["modes"], dtype="S")
-            out["spherical/detector/det_params"] = det_report["det_params"]
+            if "banks" in det_report:
+                out["spherical/detector/banks"] = np.array(det_report["banks"])
+                out["spherical/detector/modes"] = np.array(
+                    det_report["modes"], dtype="S"
+                )
+                out["spherical/detector/det_params"] = det_report["det_params"]
             for kk in (
                 "trans_m",
                 "rot_rad",
@@ -2735,9 +2805,32 @@ def run_spherical_index(
                 "global_rot",
                 "global_rot_axis",
                 "global_trans",
+                "per_run_deg",
+                "harmonics_per_run_deg",
+                "ki_refined",
+                "sample_offset_m",
+                "per_run_trans_m",
             ):
                 if kk in det_report:
-                    out[f"spherical/detector/{kk}"] = det_report[kk]
+                    out[
+                        f"spherical/gonio/{kk}"
+                        if kk
+                        not in (
+                            "trans_m",
+                            "rot_rad",
+                            "radial",
+                            "cylindrical",
+                            "axial_stretch",
+                            "area",
+                            "global_rot",
+                            "global_rot_axis",
+                            "global_trans",
+                        )
+                        else f"spherical/detector/{kk}"
+                    ] = det_report[kk]
+            if "axis_tilts_deg" in det_report:
+                for k2, t2 in det_report["axis_tilts_deg"].items():
+                    out[f"spherical/gonio/axis_tilt_deg/{g_names[k2]}"] = t2
         for kq, vq in quality.items():
             if kq == "per_run_median_deg":
                 out["spherical/quality/per_run"] = np.array(sorted(vq))

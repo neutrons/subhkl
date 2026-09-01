@@ -1482,6 +1482,86 @@ def spherical_index(
             help="Axis for cylindrical/axial_stretch modes, e.g. '0,1,0'",
         ),
     ] = None,
+    refine_gonio_axis_vector: Annotated[
+        str | None,
+        typer.Option(
+            "--refine-gonio-axis-vector",
+            help="Comma-separated axis names whose DIRECTION is refined "
+            "(two tilt angles each about a basis perpendicular to the "
+            "nominal axis) -- identifiable when that axis's own angle "
+            "varies over a wide arc.",
+        ),
+    ] = None,
+    gonio_axis_vector_bound_deg: Annotated[
+        float,
+        typer.Option("--gonio-axis-vector-bound-deg", help="Axis tilt bound [deg]"),
+    ] = 1.0,
+    refine_gonio_per_run: Annotated[
+        str | None,
+        typer.Option(
+            "--refine-gonio-per-run",
+            help="Motor name refined by one bounded angle correction per "
+            "run -- the literal per-run DPHI; the constant part is that "
+            "motor's zero offset and inherits its gauge status.",
+        ),
+    ] = None,
+    gonio_per_run_bound_deg: Annotated[
+        float,
+        typer.Option(
+            "--gonio-per-run-bound-deg", help="Per-run correction bound [deg]"
+        ),
+    ] = 1.0,
+    refine_gonio_harmonics: Annotated[
+        str | None,
+        typer.Option(
+            "--refine-gonio-harmonics",
+            help="Motor name whose per-run correction is constrained to a "
+            "Fourier series in its own nominal angle (orders from "
+            "--gonio-harmonics-orders).",
+        ),
+    ] = None,
+    gonio_harmonics_orders: Annotated[
+        str | None,
+        typer.Option(
+            "--gonio-harmonics-orders",
+            help="Comma-separated Fourier orders, default '1'",
+        ),
+    ] = None,
+    gonio_harmonics_bound_deg: Annotated[
+        float,
+        typer.Option(
+            "--gonio-harmonics-bound-deg", help="Harmonic coefficient bound [deg]"
+        ),
+    ] = 0.5,
+    refine_beam: Annotated[
+        bool,
+        typer.Option(
+            "--refine-beam",
+            help="Refine the incident beam direction (two transverse tilts)",
+        ),
+    ] = False,
+    beam_bound_deg: Annotated[
+        float, typer.Option("--beam-bound-deg", help="Beam tilt bound [deg]")
+    ] = 1.0,
+    refine_sample: Annotated[
+        bool, typer.Option("--refine-sample", help="Refine a global sample offset [m]")
+    ] = False,
+    sample_bound_m: Annotated[
+        float, typer.Option("--sample-bound-m", help="Sample offset bound [m]")
+    ] = 0.005,
+    refine_gonio_per_run_trans: Annotated[
+        bool,
+        typer.Option(
+            "--refine-gonio-per-run-trans",
+            help="Refine a bounded per-run sample translation (parallax observable)",
+        ),
+    ] = False,
+    gonio_per_run_trans_bound_m: Annotated[
+        float,
+        typer.Option(
+            "--gonio-per-run-trans-bound-m", help="Per-run translation bound [m]"
+        ),
+    ] = 0.005,
 ):
     """
     Index by spherical correlation over SO(3) -- global across all panels
@@ -1548,6 +1628,27 @@ def spherical_index(
             if cylinder_axis
             else None
         ),
+        refine_gonio_axis_vector=(
+            [x.strip() for x in refine_gonio_axis_vector.split(",")]
+            if refine_gonio_axis_vector
+            else None
+        ),
+        gonio_axis_vector_bound_deg=gonio_axis_vector_bound_deg,
+        refine_gonio_per_run=refine_gonio_per_run,
+        gonio_per_run_bound_deg=gonio_per_run_bound_deg,
+        refine_gonio_harmonics=refine_gonio_harmonics,
+        gonio_harmonics_orders=(
+            [int(x.strip()) for x in gonio_harmonics_orders.split(",")]
+            if gonio_harmonics_orders
+            else None
+        ),
+        gonio_harmonics_bound_deg=gonio_harmonics_bound_deg,
+        refine_beam=refine_beam,
+        beam_bound_deg=beam_bound_deg,
+        refine_sample=refine_sample,
+        sample_bound_m=sample_bound_m,
+        refine_gonio_per_run_trans=refine_gonio_per_run_trans,
+        gonio_per_run_trans_bound_m=gonio_per_run_trans_bound_m,
     )
 
 

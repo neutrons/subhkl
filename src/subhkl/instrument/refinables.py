@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 def forward_map_param(norm, bound):
@@ -231,22 +232,49 @@ def peak_lab_xyz(centers, uhats, vhats, det_idx, u_off, v_off):
     return c + u_off[None, :, None] * u + v_off[None, :, None] * v
 
 
-def gonio_rotation_jax(axes, angles_deg, offsets_deg):
+def gonio_rotation_jax(axes, angles_deg, offsets_deg, axis_dirs=None):
     """Composed goniometer rotation with per-axis zero offsets.
 
     R = prod_k R(axis_k, angle_k + offset_k), outermost axis first --
     matching subhkl.instrument.goniometer.sample_to_lab's composition.
-    An offset on the *outermost* axis is pure gauge with the crystal
-    orientation (R_outer(delta) folds into U exactly); offsets on inner
-    axes are identifiable from multi-run data where the outer angles
-    change.  ``axes`` (K, 3), ``angles_deg``/``offsets_deg`` (K,).
+    ``axes`` (K, 3 or 4; direction multiplier honored),
+    ``angles_deg``/``offsets_deg`` (K,).  ``axis_dirs`` (K, 3), when
+    given, overrides the axis DIRECTIONS (e.g. tilted by an axis-vector
+    calibration) while the multiplier still comes from ``axes``.
+
+    Identifiability reminders, all measured elsewhere in this codebase: a
+    zero offset on axis k is pure gauge with the crystal orientation
+    whenever every axis inner to k holds constant angles across the
+    pooled runs (the innermost always is), and a tilt of an axis whose
+    own angle never varies folds into the constant composition the same
+    way.
     """
     R = jnp.eye(3)
     for k in range(axes.shape[0]):
-        ax = jnp.asarray(axes[k][:3])
+        ax = (
+            jnp.asarray(axis_dirs[k])
+            if axis_dirs is not None
+            else jnp.asarray(axes[k][:3])
+        )
         mult = axes[k][3] if len(axes[k]) > 3 else 1.0
         Rk = rotation_matrix_from_axis_angle_jax(
             ax, jnp.deg2rad((angles_deg[k] + offsets_deg[k]) * mult)
         )
         R = R @ Rk
     return R
+
+
+def axis_tilt_frames(axes):
+    """Per-axis orthonormal (e1, e2) perpendicular to each nominal axis --
+    the tilt basis of the classic axis-vector refinement: the refined
+    direction is R(t1 e1 + t2 e2) axis, two bounded angles per axis."""
+    frames = []
+    for k in range(axes.shape[0]):
+        a = np.asarray(axes[k][:3], dtype=float)
+        a = a / np.linalg.norm(a)
+        h = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        e1 = np.cross(a, h)
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(a, e1)
+        frames.append((np.asarray(e1), np.asarray(e2)))
+    return frames
