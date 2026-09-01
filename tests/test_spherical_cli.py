@@ -90,9 +90,16 @@ def test_spherical_index_and_zone_overlay(tmp_path):
         U = fp["sample/U"][()]
         z = fp["spherical/z"][()]
         assert "sample/B" in fp and "beam/ki_vec" in fp  # bootstrap contract
+        q_med = float(fp["spherical/quality/median_deviation_deg"][()])
+        q_null = float(fp["spherical/quality/null_median_deviation_deg"][()])
+        q_frac = float(fp["spherical/quality/matched_fraction"][()])
     err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
     assert err < 0.5
     assert z[0] > 10.0
+    # the native quality report: accuracy far inside its own null floor
+    assert q_med < 0.3
+    assert q_null > 3.0 * q_med
+    assert q_frac > 0.8
 
     written = run_indexer_visualize(out_file, output_dir=str(tmp_path), max_index=1)
     assert len(written) == 1

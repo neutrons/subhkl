@@ -1774,6 +1774,80 @@ def run_mask_visualize(
     return written
 
 
+def _spherical_quality(dirs, U, pts, weights, run_ids, kernel_deg, floor=0.01, n_null=8, chunk=20000, seed=0):
+    """Native quality report of a spherical indexing solution.
+
+    Works identically with found peaks (unit weights) and raw counts
+    (positive excess as weights) -- no hkl assignment anywhere:
+
+    - deviation: the angle of each data direction to the NEAREST model
+      line.  Its weighted median is the assignment-free analogue of the
+      benchmark's median_ang_err, and identical to it wherever assignment
+      is unambiguous (harmonics share a direction, so they never disagree).
+    - null: the same median at random orientations.  Nearest-neighbour
+      selection biases the deviation low as the model densifies, so the
+      metric is only honest next to its own floor; report both, never one.
+    - matched fraction: weight fraction within kernel_FWHM/2 of a line
+      (and its null) -- completeness at the resolution actually claimed.
+    - loglik: mean log of the von Mises mixture density per unit weight,
+      the refinement's own objective -- the proper score for comparing
+      candidates or twin fractions, in nats.
+
+    Also returns the per-run median deviation: with the goniometer in the
+    data path, a spread across runs is the signature of offset errors
+    (measured on MANDI garnet: 0.14 deg per-run vs 1.63 deg multiframe
+    through the nominal goniometer).
+    """
+    rng = np.random.default_rng(seed)
+    sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
+    tol = kernel_deg / 2.0
+
+    def dev_and_loglik(Umat, want_loglik=False):
+        Rm = dirs @ Umat.T
+        dev = np.empty(len(pts))
+        ll = 0.0
+        for i in range(0, len(pts), chunk):
+            dots = np.abs(pts[i : i + chunk] @ Rm.T)
+            np.clip(dots, -1.0, 1.0, out=dots)
+            dev[i : i + chunk] = np.degrees(np.arccos(dots.max(axis=1)))
+            if want_loglik:
+                ang2 = 2.0 * (1.0 - dots)
+                dens = np.exp(-ang2 / (2.0 * sigma * sigma)).sum(axis=1)
+                ll += float(
+                    np.sum(weights[i : i + chunk] * np.log(dens + floor))
+                )
+        return dev, ll / max(np.sum(weights), 1e-12)
+
+    def wmedian(x, w):
+        o = np.argsort(x)
+        cw = np.cumsum(w[o])
+        return float(x[o][np.searchsorted(cw, 0.5 * cw[-1])])
+
+    dev, loglik = dev_and_loglik(U, want_loglik=True)
+    med = wmedian(dev, weights)
+    matched = float(np.sum(weights[dev < tol]) / max(np.sum(weights), 1e-12))
+    null_meds, null_matched = [], []
+    for _ in range(n_null):
+        Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+        dv, _ = dev_and_loglik(Q * np.sign(np.linalg.det(Q)))
+        null_meds.append(wmedian(dv, weights))
+        null_matched.append(float(np.sum(weights[dv < tol]) / max(np.sum(weights), 1e-12)))
+    per_run = {}
+    if run_ids is not None:
+        for r in np.unique(run_ids):
+            m = run_ids == r
+            per_run[int(r)] = wmedian(dev[m], weights[m])
+    return {
+        "median_deviation_deg": med,
+        "null_median_deviation_deg": float(np.mean(null_meds)),
+        "matched_fraction": matched,
+        "null_matched_fraction": float(np.mean(null_matched)),
+        "matched_tol_deg": tol,
+        "loglik_per_weight": loglik,
+        "per_run_median_deg": per_run,
+    }
+
+
 def _read_merged_images(images_filename):
     """merged.h5 -> (images [N, n, m], bank_ids [N], run_of_image [N]).
 
@@ -1914,6 +1988,7 @@ def run_spherical_index(
         L_raw = int(min(max(np.ceil(3.0 / sigma_raw), 16), 96))
         bin_dirs = {}
         f_raw = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
+        raw_pts, raw_w, raw_run = [], [], []
         b2 = int(binning)
         for i_img in range(len(images)):
             bk = int(bank_ids[i_img])
@@ -1938,6 +2013,9 @@ def run_spherical_index(
             if Rr is not None:
                 d = d @ Rr  # R^T applied to each row
             f_raw += _pc(d, excess, L_raw, sigma_raw)
+            raw_pts.append(d)
+            raw_w.append(np.clip(excess, 0.0, None))
+            raw_run.append(np.full(len(d), int(run_of_image[i_img])))
         print(
             f"spherical-index: raw-count mode, {len(images)} frames binned "
             f"{b2}x{b2} -> f at L={L_raw}"
@@ -2005,6 +2083,39 @@ def run_spherical_index(
             f"c={r.get('c', float('nan')):.3f}  coherence={r.get('coherence', 0.0):.3f}"
         )
 
+    # The native quality report, every run -- the solve is seconds, the
+    # metrics are one chunked matmul, and a number without its null floor
+    # is not a number.  Peaks mode weights each peak once; raw mode weights
+    # each binned pixel by its positive excess counts, so the same report
+    # exists with no peak finder anywhere.
+    if f_raw is not None:
+        q_pts = np.concatenate(raw_pts)
+        q_w = np.concatenate(raw_w)
+        q_run = np.concatenate(raw_run)
+    else:
+        q_pts = d_sample
+        q_w = np.ones(len(d_sample))
+        q_run = run if run is not None else None
+    quality = _spherical_quality(dirs, U, q_pts, q_w, q_run, kernel_deg)
+    print(
+        f"  quality: median nearest-line deviation "
+        f"{quality['median_deviation_deg']:.3f} deg "
+        f"(null {quality['null_median_deviation_deg']:.2f}); "
+        f"matched(<{quality['matched_tol_deg']:.2f} deg) "
+        f"{100 * quality['matched_fraction']:.1f}% "
+        f"(null {100 * quality['null_matched_fraction']:.1f}%); "
+        f"loglik/weight {quality['loglik_per_weight']:.3f} nats"
+    )
+    if quality["per_run_median_deg"] and len(quality["per_run_median_deg"]) > 1:
+        worst = max(quality["per_run_median_deg"].items(), key=lambda kv: kv[1])
+        best = min(quality["per_run_median_deg"].items(), key=lambda kv: kv[1])
+        print(
+            f"  per-run median deviation: best run {best[0]} at {best[1]:.3f} deg, "
+            f"worst run {worst[0]} at {worst[1]:.3f} deg -- a large spread is "
+            "the signature of goniometer-offset error (index per run with "
+            "--runs to see any run at its own gauge)"
+        )
+
     with h5py.File(output_filename, "w") as out:
         out["sample/U"] = np.asarray(U, dtype=np.float64)
         out["sample/B"] = np.asarray(B_out, dtype=np.float64)
@@ -2028,6 +2139,14 @@ def run_spherical_index(
         out["spherical/n_matched"] = np.array([r["n_matched"] for r in results])
         out["spherical/c"] = np.array([r.get("c", np.nan) for r in results])
         out["spherical/coherence"] = np.array([r.get("coherence", 0.0) for r in results])
+        for kq, vq in quality.items():
+            if kq == "per_run_median_deg":
+                out["spherical/quality/per_run"] = np.array(sorted(vq))
+                out["spherical/quality/per_run_median_deg"] = np.array(
+                    [vq[r_] for r_ in sorted(vq)]
+                )
+            else:
+                out[f"spherical/quality/{kq}"] = vq
         out.attrs["instrument"] = str(instrument)
     print(f"wrote {output_filename} (bootstrap-compatible: indexer --bootstrap)")
     return output_filename
