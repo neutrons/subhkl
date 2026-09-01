@@ -953,3 +953,227 @@ def refine_matching_free(
     R = np.asarray(_rodrigues_jax(jnp.asarray(delta))) @ np.asarray(R0)
     B = (np.eye(3) + np.asarray(A)) @ np.asarray(B0)
     return R, B, float(-res.fun)
+
+
+def refine_instrument_matching_free(
+    peaks,
+    detector_nominal,
+    hkl,
+    B0,
+    R0,
+    modes=("independent",),
+    det_bounds=None,
+    gonio=None,
+    weights=None,
+    kernel_deg=1.0,
+    ki=(0.0, 0.0, 1.0),
+    sample_offset=None,
+    refine_cell=False,
+    maxiter=600,
+    floor=0.01,
+):
+    """Joint matching-free refinement of orientation, cell shape, detector
+    panels and goniometer offsets -- one likelihood, no peak assignment.
+
+    The objective is the per-peak log-likelihood of the model direction
+    density, a von Mises mixture with a uniform floor -- NOT the
+    correlation.  The search stage maximizes <f, Lambda g> with the data
+    side frozen, where the matched filter is the right detection statistic;
+    but once the DATA side has free parameters, raw correlation rewards
+    concentration -- geometry can bunch data directions onto whichever
+    model kernels are nearest (measured on the two-bank synthetic: it
+    preferred a wrong geometry at C = 42768 over the truth at 42344) --
+    and normalized correlation is nearly flat (truth 0.2447 vs nominal
+    0.2389) because the unobserved part of the model dominates the norms.
+    The likelihood has neither disease: each datum rewards only its own
+    kernel, unobserved model directions cost nothing, and the floor makes
+    outliers a bounded penalty instead of a veto.  No spherical harmonics
+    appear at all here -- the kernel sum is exact, so refinement carries
+    no bandlimit bias either.
+
+    The detector parameterization is *shared* with the peak-list path:
+    subhkl.instrument.refinables.apply_detector_modes is the very code
+    VectorizedObjective runs, so a bank translation means the same thing
+    to both refinements, with the same modes and normalized-parameter
+    convention (0.5 = nominal).  The goniometer follows sample_to_lab's
+    composition (outermost first).  Identifiability of an axis offset is a
+    theorem worth stating exactly, because the first guess is wrong both
+    ways: an offset on axis k is pure gauge with the crystal orientation
+    whenever every axis *inner* to k (closer to the sample) holds a
+    constant angle across the pooled runs -- R_inner constant lets
+    R_k(delta) commute through and fold into U exactly, so in particular
+    the innermost axis offset is ALWAYS gauge, whatever the outer axes do
+    (measured: a 0.6 deg innermost offset came back as 0.36 with the
+    remaining 0.24 deg absorbed into R, at any outer span).  An offset is
+    identifiable precisely when some inner axis varies across the pooled
+    runs (measured: a 0.7 deg outer-axis offset recovered to 0.689 with
+    the inner angle swept 0-60 deg).  Put only identifiable offsets in the
+    refine mask; the gauge ones belong to U by convention.
+
+    peaks: dict with det_idx (N,), u_off (N,) [m], v_off (N,) [m] --
+    physical offsets from the panel center, the convention commands.py
+    stores -- and optionally run_idx (N,) when gonio is given.
+    detector_nominal: dict with centers (nb, 3), uhats, vhats [unit],
+    widths, heights (nb,) [m].
+    gonio: dict with axes (K, 3 or 4; direction multiplier honored),
+    angles_deg (n_runs, K), refine_mask (K,) bool, bound_deg, optionally
+    nominal_offsets_deg (K,).
+
+    Returns dict with R, B, det_params (normalized, 0.5 = nominal),
+    gonio_offsets_deg (full K vector), and the achieved mean
+    log-likelihood per peak ("loglik").
+    """
+    import jax
+    import jax.numpy as jnp
+
+    from subhkl.instrument.refinables import (
+        apply_detector_modes,
+        forward_map_param,
+        gonio_rotation_jax,
+        peak_lab_xyz,
+    )
+
+    sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
+    det_idx = np.asarray(peaks["det_idx"], dtype=int)
+    u_off = jnp.asarray(np.asarray(peaks["u_off"], dtype=float))
+    v_off = jnp.asarray(np.asarray(peaks["v_off"], dtype=float))
+    n_peaks = len(det_idx)
+    w_data = (
+        jnp.ones(n_peaks)
+        if weights is None
+        else jnp.asarray(np.asarray(weights, float))
+    )
+    centers = jnp.asarray(np.asarray(detector_nominal["centers"], float))[None]
+    uhats = jnp.asarray(np.asarray(detector_nominal["uhats"], float))[None]
+    vhats = jnp.asarray(np.asarray(detector_nominal["vhats"], float))[None]
+    widths = jnp.asarray(np.asarray(detector_nominal["widths"], float))[None]
+    heights = jnp.asarray(np.asarray(detector_nominal["heights"], float))[None]
+    n_banks = centers.shape[1]
+    ki_hat = np.asarray(ki, float)
+    ki_hat = jnp.asarray(ki_hat / np.linalg.norm(ki_hat))
+    s_off = jnp.zeros(3) if sample_offset is None else jnp.asarray(sample_offset)
+
+    if det_bounds is None:
+        det_bounds = {
+            "independent_trans": 0.01,  # [m]
+            "independent_rot": np.deg2rad(1.0),  # [rad]
+        }
+    n_det = n_banks * 6 if "independent" in modes else 0
+    param_slices = {"independent": slice(0, n_banks * 6)}
+
+    if gonio is not None:
+        axes = np.asarray(gonio["axes"], dtype=float)
+        angles_deg = np.asarray(gonio["angles_deg"], dtype=float)
+        refine_mask = np.asarray(gonio["refine_mask"], dtype=bool)
+        gonio_bound = float(gonio.get("bound_deg", 2.0))
+        nominal_off = np.asarray(
+            gonio.get("nominal_offsets_deg", np.zeros(axes.shape[0])), dtype=float
+        )
+        run_idx = np.asarray(peaks["run_idx"], dtype=int)
+        n_goff = int(refine_mask.sum())
+    else:
+        n_goff = 0
+
+    hkl_j = np.asarray(hkl, dtype=float)
+    w_model = jnp.ones(len(hkl_j))
+    n_cell = 5 if refine_cell else 0
+
+    # every parameter normalized to [0, 1] with 0.5 = nominal, the shared
+    # forward-map convention -- and not only for consistency: mixed physical
+    # units (radians, meters, degrees) give the optimizer gradient blocks
+    # scaled apart by orders of magnitude, and the joint refinement then
+    # stalls on whichever block is smallest.
+    rot_bound = np.deg2rad(3.0)
+    strain_bound = 0.03
+
+    def unpack(p):
+        rotvec = forward_map_param(p[:3], rot_bound)
+        i = 3
+        A = jnp.zeros((3, 3))
+        if refine_cell:
+            a = forward_map_param(p[i : i + 5], strain_bound)
+            A = jnp.array(
+                [[a[0], a[2], a[3]], [a[2], a[1], a[4]], [a[3], a[4], -a[0] - a[1]]]
+            )
+            i += 5
+        det_norm = p[i : i + n_det]
+        i += n_det
+        goff = forward_map_param(p[i : i + n_goff], gonio_bound) if n_goff else p[i:i]
+        return rotvec, A, det_norm, goff
+
+    def neg_loglik(p):
+        rotvec, A, det_norm, goff = unpack(p)
+        # data side: peak directions from the perturbed instrument
+        c, u, v, _, _, _ = apply_detector_modes(
+            det_norm[None, :],
+            centers,
+            uhats,
+            vhats,
+            widths,
+            heights,
+            modes,
+            param_slices,
+            det_bounds,
+        )
+        xyz = peak_lab_xyz(c, u, v, det_idx, u_off, v_off)[0] - s_off
+        kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
+        g_lab = kf - ki_hat
+        d_lab = g_lab / jnp.linalg.norm(g_lab, axis=1, keepdims=True)
+        if gonio is not None:
+            offs = jnp.asarray(nominal_off).at[np.where(refine_mask)[0]].add(goff)
+            R_runs = jnp.stack(
+                [
+                    gonio_rotation_jax(axes, jnp.asarray(angles_deg[r]), offs)
+                    for r in range(angles_deg.shape[0])
+                ]
+            )
+            d_lab = jnp.einsum("nij,ni->nj", R_runs[run_idx], d_lab)  # R^T d
+        # model side: orientation and (optionally) cell shape
+        R = _rodrigues_jax(rotvec) @ jnp.asarray(R0)
+        B = (jnp.eye(3) + A) @ jnp.asarray(B0)
+        g_vec = hkl_j @ B.T
+        dirs = g_vec / jnp.linalg.norm(g_vec, axis=1, keepdims=True)
+        dots = jnp.abs(d_lab @ (dirs @ R.T).T)  # lines: +- are one direction
+        ang2 = 2.0 * (1.0 - jnp.clip(dots, 0.0, 1.0))
+        dens = jnp.sum(
+            w_model[None, :] * jnp.exp(-ang2 / (2.0 * sigma * sigma)), axis=1
+        )
+        return -jnp.sum(w_data * jnp.log(dens + floor)) / jnp.sum(w_data)
+
+    val_grad = jax.jit(jax.value_and_grad(neg_loglik))
+
+    # Adam with a cosine-decayed step, not a quasi-Newton line search: the
+    # objective is float32 (about seven digits), and line searches read
+    # that noise floor as convergence long before the minimum.  Bounds by
+    # projection; all parameters live in [0, 1] so one rate serves all.
+    x = jnp.full(3 + n_cell + n_det + n_goff, 0.5, dtype=jnp.float32)
+    m = jnp.zeros_like(x)
+    v2 = jnp.zeros_like(x)
+    lr0, beta1, beta2, eps = 0.03, 0.9, 0.999, 1e-8
+    best_x, best_v = x, np.inf
+    for t in range(1, int(maxiter) + 1):
+        val, g = val_grad(x)
+        if float(val) < best_v:
+            best_v, best_x = float(val), x
+        m = beta1 * m + (1 - beta1) * g
+        v2 = beta2 * v2 + (1 - beta2) * g * g
+        mh = m / (1 - beta1**t)
+        vh = v2 / (1 - beta2**t)
+        lr = lr0 * 0.5 * (1.0 + np.cos(np.pi * t / maxiter))
+        x = jnp.clip(x - lr * mh / (jnp.sqrt(vh) + eps), 0.0, 1.0)
+    val = val_grad(x)[0]
+    if float(val) < best_v:
+        best_v, best_x = float(val), x
+
+    rotvec, A, det_norm, goff = unpack(best_x)
+    out = {
+        "R": np.asarray(_rodrigues_jax(jnp.asarray(rotvec))) @ np.asarray(R0),
+        "B": (np.eye(3) + np.asarray(A)) @ np.asarray(B0),
+        "det_params": np.asarray(det_norm),
+        "loglik": float(-best_v),
+    }
+    if gonio is not None:
+        offs = np.array(nominal_off)
+        offs[refine_mask] += np.asarray(goff)
+        out["gonio_offsets_deg"] = offs
+    return out
