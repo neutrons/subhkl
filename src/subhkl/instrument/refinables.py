@@ -126,6 +126,21 @@ def apply_detector_modes(
     (S, n_banks, 3); widths/heights (S, n_banks).  Returns
     (centers, uhats, vhats, widths, heights, area_scale).
     """
+    if cylinder_axis is None and ("cylindrical" in modes or "axial_stretch" in modes):
+        # without this the mode dies deep inside jax as `c * None`
+        raise ValueError(
+            "the 'cylindrical'/'axial_stretch' detector modes scale panel "
+            "centers perpendicular/parallel to a cylinder axis, so they need "
+            "one: pass cylinder_axis=(x, y, z) (the classic path's default is "
+            "the vertical (0, 1, 0); spherical-index mirrors it, "
+            "--cylinder-axis overrides)."
+        )
+    if global_rot_axis is None and "global_rot_axis" in modes:
+        raise ValueError(
+            "the 'global_rot_axis' detector mode rotates the whole assembly "
+            "about a named axis: pass global_rot_axis=(x, y, z) "
+            "(--det-global-rot-axis; the classic default is (0, 1, 0))."
+        )
     c, u, v, w, h = centers, uhats, vhats, widths, heights
     S = det_params.shape[0]
     area_scale = jnp.zeros((S, 1))

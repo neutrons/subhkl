@@ -1562,6 +1562,17 @@ def spherical_index(
             "--gonio-per-run-trans-bound-m", help="Per-run translation bound [m]"
         ),
     ] = 0.005,
+    frame_table: Annotated[
+        str | None,
+        typer.Option(
+            "--frame-table",
+            help="File carrying goniometer/angles per FRAME plus "
+            "file_offsets (a merged image stack's metadata).  Refined "
+            "per-run angle corrections are folded into those frames, which "
+            "is where the predictor and the integrator read them; --images "
+            "already supplies it.",
+        ),
+    ] = None,
 ):
     """
     Index by spherical correlation over SO(3) -- global across all panels
@@ -1649,6 +1660,7 @@ def spherical_index(
         sample_bound_m=sample_bound_m,
         refine_gonio_per_run_trans=refine_gonio_per_run_trans,
         gonio_per_run_trans_bound_m=gonio_per_run_trans_bound_m,
+        frame_table_filename=frame_table,
     )
 
 

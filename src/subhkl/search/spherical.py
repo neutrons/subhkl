@@ -1682,6 +1682,31 @@ def refine_instrument_matching_free(
         "det_params": np.asarray(det_norm),
         "loglik": float(-best_v),
     }
+    # The refined geometry itself, not just the normalized parameters that
+    # encode it: every consumer downstream (the predictor, the integrator,
+    # the overlays, the quality pass) wants panels, not a parameter vector,
+    # and regenerating them here -- through the same apply_detector_modes
+    # call the objective minimized -- is the only way they cannot drift.
+    c_f, u_f, v_f, w_f, h_f, _ = apply_detector_modes(
+        jnp.asarray(det_norm)[None, :],
+        centers,
+        uhats,
+        vhats,
+        widths,
+        heights,
+        modes,
+        param_slices,
+        det_bounds,
+        cylinder_axis=cylinder_axis,
+        global_rot_axis=global_rot_axis,
+    )
+    out["panels"] = {
+        "centers": np.asarray(c_f[0], dtype=float),
+        "uhats": np.asarray(u_f[0], dtype=float),
+        "vhats": np.asarray(v_f[0], dtype=float),
+        "widths": np.asarray(w_f[0], dtype=float),
+        "heights": np.asarray(h_f[0], dtype=float),
+    }
     if gonio is not None:
         offs = np.array(nominal_off)
         offs[refine_mask] += np.asarray(goff)
@@ -1689,6 +1714,24 @@ def refine_instrument_matching_free(
         if n_tilt:
             tilts = np.rad2deg(np.asarray(extras["tilt"])).reshape(-1, 2)
             out["axis_tilts_deg"] = {k: tilts[i] for i, k in enumerate(tilt_axes)}
+            # the tilted axis VECTORS, in the file's own (K, 3 or 4) layout:
+            # what goniometer/axes means downstream, with the direction
+            # multiplier of column 4 (when present) carried through
+            tv_all = np.asarray(extras["tilt"]).reshape(-1, 2)
+            dirs_ref = []
+            for k in range(len(axes)):
+                d_k = np.asarray(base_dirs[k], dtype=float)
+                if k in tilt_axes:
+                    i_t = tilt_axes.index(k)
+                    e1, e2 = frames_tilt[k]
+                    tv = tv_all[i_t, 0] * np.asarray(e1) + tv_all[i_t, 1] * np.asarray(
+                        e2
+                    )
+                    d_k = np.asarray(_rodrigues_jax(jnp.asarray(tv)), dtype=float) @ d_k
+                dirs_ref.append(d_k)
+            axes_ref = np.array(axes, dtype=float)
+            axes_ref[:, :3] = np.stack(dirs_ref)
+            out["axes_refined"] = axes_ref
         if n_prun:
             out["per_run_deg"] = np.asarray(extras["prun"])
         if n_harm:

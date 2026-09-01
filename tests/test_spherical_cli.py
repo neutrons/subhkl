@@ -282,3 +282,135 @@ def test_fit_gonio_offsets_and_gauge_detection(tmp_path):
         off_x = float(fp["goniometer/offsets/inner_x"][()])
     assert abs(off_z - 0.8) < 0.15  # identifiable, recovered
     assert abs(off_x) < 0.15  # gauge: pinned near zero, not a wild number
+
+
+def test_refined_instrument_reaches_the_consumers_layout(tmp_path):
+    """What the refinement fits must land where the consumers look.
+
+    The refinement can improve the fitted U while the predictor keeps
+    running on nominal frames -- measured on cg4d-garnet, aligned median
+    0.69 -> 0.42 deg yet CC(1/2) 0.9853 -> 0.8814, purely because the
+    corrections lived in the report group and nowhere else.  This pins the
+    round trip: refined panels appear as a detector_calibration group that
+    apply_detector_calibration can consume, and per-run angle corrections
+    appear folded into the FRAME-addressed goniometer/angles the predictor
+    reads, with the nominal angles and the run map kept alongside.
+    """
+    from subhkl.commands import apply_detector_calibration
+    from subhkl.config import beamlines as _beamlines
+
+    rng = np.random.default_rng(53)
+    a = 8.0
+    B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
+    h, k, l_ = generate_reflections(a, a, a, 90, 90, 90, space_group="P 1", d_min=1.3)
+    G = np.stack([h, k, l_], axis=1) @ B.T
+    dirs = G / np.linalg.norm(G, axis=1, keepdims=True)
+    Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+    U_true = Q * np.sign(np.linalg.det(Q))
+
+    axes = np.array([[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]])
+    run_angles = np.array([[0.0, 0.0], [0.0, 40.0], [0.0, 80.0]])
+    frames_per_run = 2
+    dets = {int(kk): Detector(v) for kk, v in beamlines["CG4D"].items()}
+
+    from subhkl.instrument.refinables import gonio_rotation_jax
+
+    recs = {k2: [] for k2 in ("bank", "pr", "pc", "img", "run", "R", "ang")}
+    for r in range(len(run_angles)):
+        Rr = np.asarray(gonio_rotation_jax(axes, run_angles[r], np.zeros(2)))
+        d_lab = np.vstack([dirs, -dirs]) @ (Rr @ U_true).T
+        d_lab = d_lab[d_lab[:, 2] < -0.05]
+        kf = np.array([0.0, 0.0, 1.0]) - 2.0 * d_lab[:, 2:3] * d_lab
+        kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+        for bk, det in dets.items():
+            mask, r_, c_ = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
+            n_ = int(np.sum(mask))
+            if n_ == 0:
+                continue
+            recs["bank"].append(np.full(n_, bk))
+            recs["pr"].append(r_[mask] + rng.normal(scale=0.5, size=n_))
+            recs["pc"].append(c_[mask] + rng.normal(scale=0.5, size=n_))
+            recs["img"].append(np.full(n_, r * frames_per_run))
+            recs["run"].append(np.full(n_, r))
+            recs["R"].append(np.tile(Rr, (n_, 1, 1)))
+            recs["ang"].append(np.tile(run_angles[r], (n_, 1)))
+
+    peaks_file = str(tmp_path / "finder.h5")
+    with h5py.File(peaks_file, "w") as fp:
+        fp["bank"] = np.concatenate(recs["bank"])
+        fp["peaks/pixel_r"] = np.concatenate(recs["pr"])
+        fp["peaks/pixel_c"] = np.concatenate(recs["pc"])
+        fp["peaks/image_index"] = np.concatenate(recs["img"])
+        fp["peaks/run_index"] = np.concatenate(recs["run"])
+        fp["goniometer/R"] = np.concatenate(recs["R"])
+        fp["goniometer/angles"] = np.concatenate(recs["ang"])
+        fp["goniometer/axes"] = axes
+        fp["goniometer/names"] = np.array([b"outer_z", b"phi"])
+        for kk, v in zip(
+            ("a", "b", "c", "alpha", "beta", "gamma"), (a, a, a, 90.0, 90.0, 90.0)
+        ):
+            fp[f"sample/{kk}"] = v
+        fp["sample/space_group"] = "P 1"
+        fp["instrument/wavelength"] = np.array([2.0, 10.0])
+        fp.attrs["instrument"] = "CG4D"
+
+    # the frame table the predictor addresses: one row per image, run
+    # boundaries in file_offsets (a merged stack's metadata)
+    n_frames = len(run_angles) * frames_per_run
+    frame_angles = np.repeat(run_angles, frames_per_run, axis=0)
+    images_file = str(tmp_path / "merged.h5")
+    with h5py.File(images_file, "w") as fp:
+        fp["goniometer/angles"] = frame_angles
+        fp["goniometer/axes"] = axes
+        fp["file_offsets"] = np.arange(len(run_angles)) * frames_per_run
+        fp["files"] = np.array([f"run{r}.nxs".encode() for r in range(len(run_angles))])
+
+    out_file = str(tmp_path / "spherical.h5")
+    run_spherical_index(
+        peaks_file,
+        out_file,
+        d_min=1.3,
+        kernel_deg=1.0,
+        refine_instrument=True,
+        detector_modes=["global_trans"],
+        refine_gonio_axes=["outer_z"],
+        refine_gonio_per_run="phi",
+        refine_maxiter=150,
+        frame_table_filename=images_file,
+    )
+
+    with h5py.File(out_file) as fp:
+        assert "detector_calibration" in fp
+        banks = [int(b.split("_")[1]) for b in fp["detector_calibration"]]
+        assert set(banks) == set(
+            int(b) for b in np.unique(np.concatenate(recs["bank"]))
+        )
+        ang = fp["goniometer/angles"][()]
+        ang_nom = fp["goniometer/angles_nominal"][()]
+        delta = fp["goniometer/per_run/delta_deg"][()]
+        f2r = fp["goniometer/per_run/frame_to_run"][()]
+        per_run = fp["spherical/gonio/per_run_deg"][()]
+        motor = fp["goniometer/per_run/motor"][()]
+        centers = {
+            int(b.split("_")[1]): fp[f"detector_calibration/{b}/center"][()]
+            for b in fp["detector_calibration"]
+        }
+
+    # frame-addressed, nominal preserved, correction on the named motor only
+    assert ang.shape == (n_frames, 2)
+    assert np.allclose(ang_nom, frame_angles)
+    assert (motor.decode() if isinstance(motor, bytes) else str(motor)) == "phi"
+    assert np.allclose(ang[:, 0], ang_nom[:, 0])  # untouched axis
+    # every frame carries exactly its run's fitted correction: the fit and
+    # the file cannot disagree
+    assert np.allclose(ang[:, 1] - ang_nom[:, 1], delta[f2r], atol=1e-9)
+    assert np.allclose(delta[: len(per_run)], per_run, atol=1e-9)
+
+    # and the panels are consumable by the very function downstream calls
+    nominal_centers = {b: np.array(dets[b].center) for b in centers}
+    apply_detector_calibration(out_file, "CG4D")
+    for b, c_ref in centers.items():
+        assert np.allclose(_beamlines["CG4D"][str(b)]["center"], c_ref)
+    # global_trans moved every panel by the same vector
+    shifts = np.stack([centers[b] - nominal_centers[b] for b in centers])
+    assert np.allclose(shifts, shifts[0], atol=1e-6)

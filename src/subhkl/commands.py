@@ -1,3 +1,5 @@
+import os
+
 import h5py
 import numpy as np
 
@@ -1804,6 +1806,107 @@ def _panel_offsets(dets, bank, pr, pc):
     return det_idx, u_off, v_off, banks, nominal
 
 
+def _frame_angle_table(filenames, n_peaks=None):
+    """Frame-shaped goniometer angles and the run boundaries, from the
+    first file that carries them.
+
+    The predictor, the integrator and the classic ``--bootstrap`` path all
+    address goniometer angles PER FRAME (``goniometer/angles`` with one row
+    per image, ``file_offsets`` marking the runs) -- a finder file's
+    per-peak angle rows cannot carry a per-run correction to them.  Returns
+    (angles, frame_to_run, files, file_offsets) or None.
+    """
+    for fn in filenames:
+        if fn is None or not os.path.exists(fn):
+            continue
+        with h5py.File(fn, "r") as f:
+            if "goniometer/angles" not in f or "file_offsets" not in f:
+                continue
+            ang = np.asarray(f["goniometer/angles"][()], dtype=float)
+            offs = np.asarray(f["file_offsets"][()], dtype=int)
+            files = f["files"][()] if "files" in f else None
+            if ang.ndim != 2:
+                continue
+            n_frames = ang.shape[0]
+            if n_frames <= offs[-1]:
+                continue
+            if n_peaks is not None and n_frames == n_peaks:
+                # a per-peak angle table alongside run boundaries is
+                # ambiguous; refuse rather than mislabel peaks as frames
+                continue
+            frame_to_run = np.searchsorted(offs, np.arange(n_frames), side="right") - 1
+            return ang, frame_to_run, files, offs
+    return None
+
+
+def _calibrated_dets(dets, banks, panels):
+    """Detector objects carrying refined panel geometry.
+
+    ``panels`` is the ``panels`` block of refine_instrument_matching_free
+    (centers/uhats/vhats/widths/heights, one row per bank in ``banks``).
+    Banks the refinement did not see keep their nominal geometry.
+    """
+    from subhkl.instrument.detector import Detector
+
+    out = dict(dets)
+    for i, b in enumerate(banks):
+        cfg = dict(dets[int(b)].config)
+        cfg["center"] = np.asarray(panels["centers"][i], dtype=float).tolist()
+        cfg["uhat"] = np.asarray(panels["uhats"][i], dtype=float).tolist()
+        cfg["vhat"] = np.asarray(panels["vhats"][i], dtype=float).tolist()
+        cfg["width"] = float(panels["widths"][i])
+        cfg["height"] = float(panels["heights"][i])
+        out[int(b)] = Detector(cfg)
+    return out
+
+
+def _sample_frame_directions(
+    dets_use,
+    bank_a,
+    row_a,
+    col_a,
+    ki_use,
+    run_a=None,
+    R_by_run=None,
+    R_rows=None,
+    sample_offset=None,
+):
+    """Sample-frame Q directions for pixel rows, through a given geometry.
+
+    The one place the spherical stage turns (bank, row, col) into a
+    direction, so the search, the refinement's report and the quality
+    pass cannot disagree about which instrument they mean.  Per-run
+    sample displacements enter as a per-row ``sample_offset``.
+    """
+    import subhkl.search.spherical as sph_
+
+    bank_a = np.asarray(bank_a, dtype=int)
+    n = len(bank_a)
+    d = np.zeros((n, 3))
+    so = (
+        None
+        if sample_offset is None
+        else np.broadcast_to(np.asarray(sample_offset, dtype=float), (n, 3))
+    )
+    for bk in np.unique(bank_a):
+        m = bank_a == bk
+        det = dets_use[int(bk)]
+        xyz = det.pixel_to_lab(np.asarray(row_a)[m], np.asarray(col_a)[m])
+        if so is not None:
+            xyz = xyz - so[m]
+        kf = xyz / np.linalg.norm(xyz, axis=-1, keepdims=True)
+        d[m] = sph_.ghat_from_kf(kf, ki=ki_use)
+    if R_by_run is not None:
+        run_a = np.asarray(run_a)
+        for r_, R_ in R_by_run.items():
+            m = run_a == r_
+            if np.any(m):
+                d[m] = d[m] @ np.asarray(R_, dtype=float)
+    elif R_rows is not None:
+        d = np.einsum("nji,nj->ni", np.asarray(R_rows, dtype=float), d)
+    return d
+
+
 def _lattice_proper_rotations(dirs, tol_deg=0.5):
     """Proper rotations of the lattice's Laue group, found numerically:
     candidates from the 24 cubic operations, kept when they map the model
@@ -2113,6 +2216,7 @@ def run_spherical_index(
     sample_bound_m: float = 0.005,
     refine_gonio_per_run_trans: bool = False,
     gonio_per_run_trans_bound_m: float = 0.005,
+    frame_table_filename: str | None = None,
     gonio_bound_deg: float = 5.0,
     refine_maxiter: int = 400,
     refine_max_points: int = 100_000,
@@ -2200,6 +2304,13 @@ def run_spherical_index(
         sg = fp["sample/space_group"][()]
         sg = sg.decode() if isinstance(sg, bytes) else str(sg)
         wl = fp["instrument/wavelength"][()] if "instrument/wavelength" in fp else None
+        # a sample offset already measured (previous solve, either path) is
+        # this run's nominal origin -- the refinement fits a delta on top
+        in_sample_offset = (
+            np.asarray(fp["goniometer/translations"][()], dtype=float)
+            if "goniometer/translations" in fp
+            else None
+        )
         instrument = instrument_name or fp.attrs.get("instrument")
 
     if instrument is None:
@@ -2225,6 +2336,11 @@ def run_spherical_index(
         run = run[keep]
         print(f"spherical-index: restricted to runs {sorted(set(int(r) for r in run))}")
 
+    # A calibration already in the peaks file -- from a previous solve on
+    # either path -- must reach the search, the refinement's starting point
+    # and the overlays; every classic stage calls this, and without it a
+    # known geometry is silently discarded and every direction is nominal.
+    apply_detector_calibration(peaks_h5_filename, str(instrument))
     dets = {int(k): Detector(v) for k, v in beamlines[str(instrument)].items()}
     d_lab = np.zeros((len(pr), 3))
     for bk in np.unique(bank):
@@ -2447,11 +2563,27 @@ def run_spherical_index(
     run_list = sorted(int(x) for x in np.unique(run)) if run is not None else [0]
     angles_by_run = {}
     if g_angles is not None and run is not None:
+        # three layouts exist in the wild: one row per peak (a finder
+        # file), one per frame (a merged stack, or this stage's own output
+        # after per-run corrections), one per run.  Picking the wrong one
+        # silently mislabels which angles a run was measured at.
+        n_rows = g_angles.shape[0]
+        per_peak = n_rows == len(pr)
+        per_frame = (
+            not per_peak
+            and img is not None
+            and n_rows > int(np.max(run)) + 1
+            and n_rows > int(np.max(img))
+        )
         for r_ in run_list:
-            row = int(np.argmax(run == r_))
-            angles_by_run[r_] = np.asarray(
-                g_angles[row] if g_angles.shape[0] == len(pr) else g_angles[r_]
-            )
+            i0 = int(np.argmax(run == r_))
+            if per_peak:
+                row = i0
+            elif per_frame:
+                row = int(img[i0])
+            else:
+                row = int(r_)
+            angles_by_run[r_] = np.asarray(g_angles[row])
 
     def _axis_indices(wanted):
         short = [n.split(":")[-1] for n in g_names]
@@ -2481,6 +2613,7 @@ def run_spherical_index(
 
     gonio_offsets_deg = None
     det_report = None
+    ref_geom = None
     if refine_instrument:
         # peak-shaped input: found peaks, or the strongest binned pixels of
         # raw mode as weighted peaks
@@ -2542,6 +2675,23 @@ def run_spherical_index(
                     "bound_deg": gonio_bound_deg,
                 }
         modes_r = tuple(detector_modes) if detector_modes else ("independent",)
+        # the cylinder modes scale panel centers about an axis; the classic
+        # path defaults it to the vertical, so mirror that here (with the
+        # value said out loud) rather than dying inside jax as `c * None`
+        if cylinder_axis is None and (
+            "cylindrical" in modes_r or "axial_stretch" in modes_r
+        ):
+            cylinder_axis = [0.0, 1.0, 0.0]
+            print(
+                "  cylinder axis not given; using the classic default "
+                "(0, 1, 0) -- override with --cylinder-axis"
+            )
+        if det_global_rot_axis is None and "global_rot_axis" in modes_r:
+            det_global_rot_axis = [0.0, 1.0, 0.0]
+            print(
+                "  global rotation axis not given; using the classic default "
+                "(0, 1, 0) -- override with --det-global-rot-axis"
+            )
         out_ref = sph.refine_instrument_matching_free(
             peaks_in,
             nominal_r,
@@ -2569,12 +2719,30 @@ def run_spherical_index(
             bank_ids_present=banks_r,
             refine_beam=refine_beam,
             beam_bound_deg=beam_bound_deg,
+            sample_offset=in_sample_offset,
             refine_sample=refine_sample,
             sample_bound_m=sample_bound_m,
             per_run_trans=refine_gonio_per_run_trans,
             per_run_trans_bound_m=gonio_per_run_trans_bound_m,
         )
         U, B_out = out_ref["R"], out_ref["B"]
+        # The refined instrument, kept as geometry (not as the normalized
+        # parameters that encode it): the quality pass scores through it
+        # and the writer persists it in the layout the predictor, the
+        # integrator and the overlays read.
+        ref_geom = {
+            "banks": banks_r,
+            "panels": out_ref.get("panels"),
+            "axes": out_ref.get("axes_refined"),
+            "per_run_deg": out_ref.get("per_run_deg"),
+            "harmonics_deg": out_ref.get("harmonics_deg"),
+            "harmonics_per_run_deg": out_ref.get("harmonics_per_run_deg"),
+            "ki": out_ref.get("ki_refined"),
+            "sample_offset_m": out_ref.get("sample_offset_m"),
+            "per_run_trans_m": out_ref.get("per_run_trans_m"),
+            "per_run_axis": (gonio_in or {}).get("per_run_axis"),
+            "harmonics_axis": (gonio_in or {}).get("harmonics_axis"),
+        }
         from subhkl.instrument.refinables import detector_mode_slices
         from subhkl.instrument.refinables import forward_map_param as _fmp
 
@@ -2718,6 +2886,113 @@ def run_spherical_index(
             f"c={r.get('c', float('nan')):.3f}  coherence={r.get('coherence', 0.0):.3f}"
         )
 
+    # ------------------------------------------------------------------
+    # The refined instrument, assembled once: calibrated panels, the beam,
+    # the sample origin, and the goniometer rotation per run with the zero
+    # offsets, the axis tilts and the per-run (and harmonic) angle
+    # corrections all applied.  Everything below -- the quality pass and
+    # the file -- speaks through these, so a better fit cannot read worse
+    # than the geometry it replaced.
+    # ------------------------------------------------------------------
+    dets_cal = dets
+    ki_out = np.asarray(ki, dtype=float)
+    axes_nominal = np.asarray(g_axes, dtype=float) if g_axes is not None else None
+    axes_out = axes_nominal
+    sample_offset_out = in_sample_offset
+    per_run_trans_out = None
+    per_run_delta = None
+    R_by_run = None
+    if ref_geom is not None:
+        if ref_geom.get("panels") is not None:
+            dets_cal = _calibrated_dets(dets, ref_geom["banks"], ref_geom["panels"])
+        if ref_geom.get("ki") is not None:
+            ki_out = np.asarray(ref_geom["ki"], dtype=float)
+        if ref_geom.get("sample_offset_m") is not None:
+            sample_offset_out = np.asarray(ref_geom["sample_offset_m"], dtype=float)
+        if ref_geom.get("per_run_trans_m") is not None:
+            per_run_trans_out = np.asarray(ref_geom["per_run_trans_m"], dtype=float)
+        if ref_geom.get("axes") is not None:
+            axes_out = np.asarray(ref_geom["axes"], dtype=float)
+        if axes_out is not None:
+            # per-run angle corrections ride on their own motor's angle --
+            # that is what both the DPHI analogue and our harmonic series
+            # are, so both fold exactly into corrected angles (unlike the
+            # classic lab-frame rocking, which cannot)
+            corr = np.zeros((len(run_list), axes_out.shape[0]))
+            for key_, axis_ in (
+                ("per_run_deg", ref_geom.get("per_run_axis")),
+                ("harmonics_per_run_deg", ref_geom.get("harmonics_axis")),
+            ):
+                vals = ref_geom.get(key_)
+                if vals is not None and axis_ is not None:
+                    corr[:, int(axis_)] += np.asarray(vals, dtype=float)
+            if np.any(corr):
+                per_run_delta = corr
+    if (
+        axes_out is not None
+        and angles_by_run
+        and (ref_geom is not None or gonio_offsets_deg is not None)
+    ):
+        from subhkl.instrument.refinables import gonio_rotation_jax as _grj
+
+        offs_use = (
+            np.asarray(gonio_offsets_deg, dtype=float)
+            if gonio_offsets_deg is not None
+            else np.zeros(axes_out.shape[0])
+        )
+        R_by_run = {}
+        for i_r, r_ in enumerate(run_list):
+            ang_r = np.asarray(angles_by_run[r_], dtype=float)
+            if per_run_delta is not None:
+                ang_r = ang_r + per_run_delta[i_r]
+            R_by_run[int(r_)] = np.asarray(_grj(axes_out, ang_r, offs_use))
+
+    if ref_geom is not None or gonio_offsets_deg is not None:
+        # re-derive the data directions through the refined instrument
+        run_pos = {int(r_): i for i, r_ in enumerate(run_list)}
+
+        def _origin(run_a):
+            if sample_offset_out is None and per_run_trans_out is None:
+                return None
+            o = np.zeros((len(run_a), 3))
+            if sample_offset_out is not None:
+                o = o + sample_offset_out
+            if per_run_trans_out is not None:
+                idx = np.array([run_pos.get(int(r_), 0) for r_ in run_a])
+                o = o + per_run_trans_out[idx]
+            return o
+
+        if f_raw is not None:
+            q_bank = np.concatenate(raw_bank)
+            q_row = np.concatenate(raw_prow)
+            q_col = np.concatenate(raw_pcol)
+            q_runs = np.concatenate(raw_run).astype(int)
+            raw_pts = [
+                _sample_frame_directions(
+                    dets_cal,
+                    q_bank,
+                    q_row,
+                    q_col,
+                    ki_out,
+                    run_a=q_runs,
+                    R_by_run=R_by_run if R_by_run else R_run,
+                    sample_offset=_origin(q_runs),
+                )
+            ]
+        else:
+            run_q = run if run is not None else np.zeros(len(pr), int)
+            d_sample = _sample_frame_directions(
+                dets_cal,
+                bank,
+                pr,
+                pc,
+                ki_out,
+                run_a=run_q,
+                R_by_run=R_by_run,
+                R_rows=None if R_by_run else (R_peak if Rg is not None else None),
+                sample_offset=_origin(run_q),
+            )
+
     # The native quality report, every run -- the solve is seconds, the
     # metrics are one chunked matmul, and a number without its null floor
     # is not a number.  Peaks mode weights each peak once; raw mode weights
@@ -2763,7 +3038,9 @@ def run_spherical_index(
         for kname, val in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
             out[f"sample/{kname}"] = val
         out["sample/space_group"] = sg
-        out["beam/ki_vec"] = ki
+        out["beam/ki_vec"] = np.asarray(ki_out, dtype=float)
+        if not np.allclose(ki_out, ki):
+            out["beam/ki_vec_nominal"] = np.asarray(ki, dtype=float)
         if wl is not None:
             out["instrument/wavelength"] = wl
         out["bank"] = bank
@@ -2774,7 +3051,15 @@ def run_spherical_index(
         if run is not None:
             out["peaks/run_index"] = run
         if Rg is not None:
-            out["goniometer/R"] = Rg
+            R_write = Rg
+            if R_by_run is not None and run is not None and Rg.shape[0] == len(pr):
+                # the rotation the solution was fitted with, per peak: zero
+                # offsets, axis tilts and per-run corrections applied
+                R_write = np.stack(
+                    [R_by_run.get(int(r_), Rg[i]) for i, r_ in enumerate(run)]
+                ).astype(np.float64)
+                out["goniometer/R_nominal"] = Rg
+            out["goniometer/R"] = R_write
         out["spherical/U_candidates"] = np.stack([r["R"] for r in results])
         out["spherical/z"] = np.array([r["z"] for r in results])
         out["spherical/n_matched"] = np.array([r["n_matched"] for r in results])
@@ -2788,6 +3073,105 @@ def run_spherical_index(
                 seen[n_] = seen.get(n_, 0) + 1
                 key = n_ if seen[n_] == 1 else f"{n_}_{seen[n_]}"
                 out[f"goniometer/offsets/{key}"] = float(o_)
+        # ------------------------------------------------------------------
+        # The refined instrument in the layout the CONSUMERS read.  The
+        # spherical/* groups below are the report; these are what the
+        # predictor, the integrator, the overlays and the MTZ exporter
+        # actually apply (apply_detector_calibration, goniometer/angles,
+        # goniometer/per_run, goniometer/translations, beam/ki_vec).
+        # Without them a refinement improves the fitted U while prediction
+        # keeps running on nominal frames -- measured: aligned median
+        # 0.69 -> 0.42 deg with per-run corrections, yet CC(1/2)
+        # 0.9853 -> 0.8814, because U and the predictor disagreed.
+        # ------------------------------------------------------------------
+        if ref_geom is not None and ref_geom.get("panels") is not None:
+            panels_ = ref_geom["panels"]
+            for i_b, b_ in enumerate(ref_geom["banks"]):
+                grp = out.create_group(f"detector_calibration/bank_{int(b_)}")
+                grp["center"] = np.asarray(panels_["centers"][i_b], dtype=float)
+                grp["uhat"] = np.asarray(panels_["uhats"][i_b], dtype=float)
+                grp["vhat"] = np.asarray(panels_["vhats"][i_b], dtype=float)
+                grp["width"] = float(panels_["widths"][i_b])
+                grp["height"] = float(panels_["heights"][i_b])
+        if g_names is not None:
+            out.create_dataset(
+                "goniometer/names",
+                data=[str(n) for n in g_names],
+                dtype=h5py.string_dtype(encoding="utf-8"),
+            )
+        if axes_out is not None:
+            out["goniometer/axes"] = np.asarray(axes_out, dtype=float)
+            if axes_nominal is not None and not np.allclose(axes_out, axes_nominal):
+                out["goniometer/axes_nominal"] = np.asarray(axes_nominal, dtype=float)
+        if sample_offset_out is not None:
+            out["goniometer/translations"] = np.asarray(sample_offset_out, dtype=float)
+        # per-run corrections: fold into the frame-addressed angles the
+        # consumers read (with the nominals kept alongside), and record the
+        # run map so the integrator's per-run displacements and the MTZ
+        # exporter's DPHI/DTX/DTY/DTZ columns find what they need
+        frame_tab = _frame_angle_table(
+            (frame_table_filename, images_filename, peaks_h5_filename),
+            n_peaks=len(pr),
+        )
+        if per_run_delta is not None or per_run_trans_out is not None:
+            grp = out.create_group("goniometer/per_run")
+            grp["runs"] = np.asarray(run_list, dtype=np.int32)
+            if ref_geom is not None and ref_geom.get("per_run_axis") is not None:
+                motor_ = g_names[int(ref_geom["per_run_axis"])]
+                grp["motor"] = str(motor_).split(":")[-1]
+            if per_run_trans_out is not None:
+                grp["trans_m"] = np.asarray(per_run_trans_out, dtype=float)
+            if frame_tab is not None:
+                ang_f, frame_to_run, files_, offs_ = frame_tab
+                grp["frame_to_run"] = np.asarray(frame_to_run, dtype=np.int32)
+                if files_ is not None:
+                    grp["run_files"] = files_
+                grp["run_file_offsets"] = np.asarray(offs_, dtype=np.int64)
+                out["file_offsets"] = np.asarray(offs_, dtype=np.int64)
+                if files_ is not None:
+                    out["files"] = files_
+                if per_run_delta is not None:
+                    delta_full = np.zeros((len(offs_), per_run_delta.shape[1]))
+                    for i_r, r_ in enumerate(run_list):
+                        if 0 <= int(r_) < len(offs_):
+                            delta_full[int(r_)] = per_run_delta[i_r]
+                    grp["delta_deg"] = np.asarray(
+                        delta_full[
+                            :,
+                            (
+                                int(ref_geom["per_run_axis"])
+                                if ref_geom.get("per_run_axis") is not None
+                                else 0
+                            ),
+                        ],
+                        dtype=float,
+                    )
+                    grp["delta_deg_all_axes"] = delta_full
+                    out["goniometer/angles_nominal"] = ang_f
+                    out["goniometer/angles"] = ang_f + delta_full[frame_to_run]
+            elif per_run_delta is not None:
+                # no frame table (a peaks file with per-peak angle rows and
+                # no run boundaries): correct in the file's own layout and
+                # say so, rather than writing a frame array nothing can map
+                grp["delta_deg_all_axes"] = np.asarray(per_run_delta, dtype=float)
+                if g_angles is not None and g_angles.shape[0] == len(pr):
+                    pos = {int(r_): i for i, r_ in enumerate(run_list)}
+                    idx = np.array([pos.get(int(r_), 0) for r_ in run])
+                    out["goniometer/angles_nominal"] = g_angles
+                    out["goniometer/angles"] = g_angles + per_run_delta[idx]
+                print(
+                    "  note: no frame table (goniometer/angles + file_offsets) "
+                    "in the inputs -- per-run corrections are recorded and "
+                    "applied per peak, but the predictor addresses frames; "
+                    "pass --images/--frame-table <merged.h5> to persist "
+                    "corrected frames"
+                )
+        elif frame_tab is not None:
+            ang_f, _, files_, offs_ = frame_tab
+            out["goniometer/angles"] = ang_f
+            out["file_offsets"] = np.asarray(offs_, dtype=np.int64)
+            if files_ is not None:
+                out["files"] = files_
         if det_report is not None:
             if "banks" in det_report:
                 out["spherical/detector/banks"] = np.array(det_report["banks"])
@@ -2889,6 +3273,9 @@ def run_indexer_visualize(
         inst = instrument or fp.attrs.get("instrument")
     if inst is None:
         raise ValueError("no instrument in the peaks file; pass --instrument")
+    # the overlay draws the solution's own geometry: a detector_calibration
+    # in the solution file (spherical or classic) beats the nominal panels
+    apply_detector_calibration(peaks_filename, str(inst))
     dets = {int(k): Detector(v) for k, v in beamlines[str(inst)].items()}
 
     base = os.path.splitext(os.path.basename(peaks_filename))[0]
