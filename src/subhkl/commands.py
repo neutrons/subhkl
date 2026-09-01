@@ -2080,8 +2080,6 @@ def run_spherical_index(
 
     f_raw = None
     if images_filename is not None:
-        from subhkl.search.spherical import project_counts as _pc
-
         images, bank_ids, run_of_image = _read_merged_images(images_filename)
         _mark("read")
         if runs is not None:
