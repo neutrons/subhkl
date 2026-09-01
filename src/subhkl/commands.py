@@ -2430,22 +2430,17 @@ def run_indexer_visualize(
             curves = zone_curve_points(
                 run_dets, U, B, R_gonio=R_frame, ki=ki, max_index=max_index
             )
-            # measured peaks of this run, mapped onto their (run, bank)
-            # frames by physical bank id
-            bank_to_img = {int(loaded.image.bank_mapping[k]): k for k in img_keys}
-            fpk = {}
-            for j in np.flatnonzero(m):
-                k = bank_to_img.get(int(bank[j]))
-                if k is not None:
-                    fpk.setdefault(k, []).append([0.0, pr[j], pc[j]])
-            fpk = {k: np.asarray(v) for k, v in fpk.items()}
+            # no peak markers here: with the raw counts rendered underneath,
+            # the diffraction spots speak for themselves and the s=40
+            # circles (an order larger than the spots) only cluttered the
+            # check.  The no-images fallback keeps its peak scatter, since
+            # there the peaks are the only data on the figure.
             label = loaded.get_image_label(img_keys[0])
             out_name = os.path.join(out_dir, f"{label}-index.png")
             plot_unrolled_detector(
                 _Shim(),
                 run_ims,
                 run_dets,
-                finder_peaks=fpk,
                 out_name=out_name,
                 instrument=str(inst),
                 dpi=dpi,
