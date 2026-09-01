@@ -2517,9 +2517,14 @@ def run_spherical_index(
     key = np.round(dirs * np.where(dirs[:, [0]] < -1e-9, -1, 1), 5)
     _, idx = np.unique(key, axis=0, return_index=True)
     dirs = dirs[idx]
+    # Both counts, because they drive different stages: the SEARCH sees
+    # unique directions (harmonics point the same way and collapse), the
+    # REFINEMENT sees every reflection -- 2.4x more on a 100 A cell, and it
+    # is the refinement's model axis that sets its memory.
     print(
         f"spherical-index: {len(pr)} peaks on {len(np.unique(bank))} banks, "
-        f"{len(dirs)} model directions at d_min={d_min:g}"
+        f"{len(dirs)} model directions ({len(h_)} reflections) "
+        f"at d_min={d_min:g}"
     )
 
     if f_raw is not None:
