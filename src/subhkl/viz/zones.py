@@ -67,12 +67,20 @@ def plot_zone_overlay(
     out_name="zones.png",
     dpi=150,
     title=None,
+    images=None,
+    render_binning=2,
 ):
     """One unrolled-detector figure: measured peaks + low-index zone conics.
 
     detectors: {bank: Detector}; peaks as parallel bank/row/col arrays for
     the frame being drawn; U, B the orientation and cell matrices; R_gonio
     the frame's goniometer rotation (identity if None).
+
+    With ``images`` ({bank: 2D counts array}), the raw detector data is
+    rendered underneath in the same unrolled coordinates (log1p grayscale,
+    pcolormesh on the true pixel corners, downsampled by render_binning for
+    figure weight) -- the strongest visual check there is: the conics must
+    ride the raw diffraction streaks, with no peak finder in the loop.
     """
     R = np.eye(3) if R_gonio is None else np.asarray(R_gonio, dtype=float)
     ki_hat = np.asarray(ki, dtype=float)
@@ -80,6 +88,38 @@ def plot_zone_overlay(
     A_real = np.linalg.inv(np.asarray(B, dtype=float)).T  # rows a, b, c [Angstrom]
 
     fig, ax = plt.subplots(figsize=(16, 6))
+
+    if images is not None:
+        vmax = max(
+            (np.percentile(im, 99.8) for im in images.values() if im is not None),
+            default=1.0,
+        )
+        for bk, im in images.items():
+            det = detectors.get(int(bk))
+            if det is None or im is None:
+                continue
+            b = int(render_binning)
+            n2, m2 = (im.shape[0] // b) * b, (im.shape[1] // b) * b
+            imb = im[:n2, :m2].reshape(n2 // b, b, m2 // b, b).sum(axis=(1, 3))
+            rr = np.arange(0, n2 + 1, b) - 0.5
+            cc = np.arange(0, m2 + 1, b) - 0.5
+            RR, CC = np.meshgrid(rr, cc, indexing="ij")
+            x, y = _unrolled(det.pixel_to_lab(RR, CC))
+            # a panel that straddles the +-180 deg seam would smear across
+            # the figure; draw it on one side
+            if np.ptp(x) > 180:
+                x = np.where(x < 0, x + 360.0, x)
+            ax.pcolormesh(
+                x,
+                y,
+                np.log1p(imb),
+                cmap="gray_r",
+                vmin=0.0,
+                vmax=np.log1p(vmax * b * b),
+                zorder=0,
+                shading="flat",
+                rasterized=True,
+            )
 
     # panel outlines and measured peaks
     for bk, det in detectors.items():

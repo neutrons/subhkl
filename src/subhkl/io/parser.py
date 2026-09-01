@@ -1311,6 +1311,8 @@ def spherical_index(
     lam: Annotated[float, typer.Option("--lam", help="L1 penalty on the candidates' sparse weights")] = 0.0,
     instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
     ki_vec: Annotated[str | None, typer.Option("--ki-vec", help="Incident beam vector, e.g. '0,0,1'")] = None,
+    images: Annotated[str | None, typer.Option("--images", help="Merged images HDF5: index from RAW COUNTS instead of the found peaks (every pixel votes with its excess counts; the peaks file still supplies instrument, cell and goniometer metadata)")] = None,
+    binning: Annotated[int, typer.Option("--binning", help="Pixel binning before the raw-count projection (direction changes across a bin are far below the kernel width; cost drops by binning^2)")] = 4,
 ):
     """
     Index by spherical correlation over SO(3) -- global across all panels
@@ -1339,6 +1341,8 @@ def spherical_index(
         lam=lam,
         instrument_name=instrument,
         ki_vec=[float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None,
+        images_filename=images,
+        binning=binning,
     )
 
 
@@ -1350,6 +1354,7 @@ def indexer_visualize(
     max_index: Annotated[int, typer.Option("--max-index", help="Draw zones [uvw] up to this index")] = 1,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
     image_index: Annotated[int | None, typer.Option("--image-index", help="Frame to draw (default: each run's first)")] = None,
+    images: Annotated[str | None, typer.Option("--images", help="Merged images HDF5: render the raw detector counts underneath the zone conics -- the strongest visual check, no peak finder in the loop")] = None,
 ):
     """
     Draw the low-index Laue zone conics over the measured peaks.
@@ -1367,6 +1372,7 @@ def indexer_visualize(
         max_index=max_index,
         dpi=dpi,
         image_index=image_index,
+        images_filename=images,
     )
 
 

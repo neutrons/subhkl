@@ -1774,6 +1774,26 @@ def run_mask_visualize(
     return written
 
 
+def _read_merged_images(images_filename):
+    """merged.h5 -> (images [N, n, m], bank_ids [N], run_of_image [N]).
+
+    The merged file stores one 2D frame per (run, bank); file_offsets mark
+    the run boundaries, so image i belongs to run r with
+    file_offsets[r] <= i < file_offsets[r + 1].
+    """
+    with h5py.File(images_filename, "r") as fp:
+        images = fp["images"][()]
+        bank_ids = (
+            fp["bank_ids"][()] if "bank_ids" in fp else np.zeros(len(images), int)
+        )
+        if "file_offsets" in fp:
+            offs = np.asarray(fp["file_offsets"][()], dtype=int)
+            run_of_image = np.searchsorted(offs, np.arange(len(images)), side="right") - 1
+        else:
+            run_of_image = np.zeros(len(images), dtype=int)
+    return images, bank_ids, run_of_image
+
+
 def run_spherical_index(
     peaks_h5_filename: str,
     output_filename: str,
@@ -1785,6 +1805,8 @@ def run_spherical_index(
     lam: float = 0.0,
     instrument_name: str | None = None,
     ki_vec: list | None = None,
+    images_filename: str | None = None,
+    binning: int = 4,
 ):
     """Index by spherical correlation over SO(3) -- the matched-filter dual
     of the sparse orientation-recovery problem (subhkl.search.spherical).
@@ -1846,6 +1868,61 @@ def run_spherical_index(
     else:
         d_sample = d_lab
 
+    # Raw-count mode: every pixel votes with its excess counts -- no peak
+    # finding in the loop (subhkl.search.spherical.project_counts).  The
+    # peaks file still supplies the metadata (instrument, cell, per-run
+    # goniometer); its peaks are simply not used as the data side.  Pixels
+    # are binned (default 4x4) before projection: the direction across a
+    # bin changes by far less than the angular kernel, and the cost drops
+    # by binning^2.  The per-image background is the scalar zero-fraction
+    # estimator mu = -log(P(y = 0)) -- the sparse-regime rate estimator of
+    # compute_rate_batch collapsed to one number per frame; subtracting it
+    # is what cancels the anisotropic detector acceptance in expectation.
+    f_raw = None
+    if images_filename is not None:
+        from subhkl.search.spherical import project_counts as _pc
+
+        images, bank_ids, run_of_image = _read_merged_images(images_filename)
+        # per-run goniometer rotation from any of the run's peaks
+        run = run if run is not None else np.zeros(len(pr), int)
+        R_run = {}
+        if Rg is not None:
+            R_pk = Rg if Rg.shape[0] == len(pr) else Rg[img]
+            for r_ in np.unique(run):
+                R_run[int(r_)] = R_pk[np.argmax(run == r_)]
+        sigma_raw = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
+        L_raw = int(min(max(np.ceil(3.0 / sigma_raw), 16), 96))
+        bin_dirs = {}
+        f_raw = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
+        b2 = int(binning)
+        for i_img in range(len(images)):
+            bk = int(bank_ids[i_img])
+            det = dets.get(bk)
+            if det is None:
+                continue
+            im = images[i_img].astype(float)
+            n2, m2 = (im.shape[0] // b2) * b2, (im.shape[1] // b2) * b2
+            y = im[:n2, :m2].reshape(n2 // b2, b2, m2 // b2, b2).sum(axis=(1, 3))
+            zero_frac = float(np.mean(im == 0))
+            mu = -np.log(max(zero_frac, 1e-6)) * b2 * b2  # [counts/bin]
+            excess = (y - mu).ravel()
+            if bk not in bin_dirs:
+                rr = (np.arange(n2 // b2) + 0.5) * b2 - 0.5
+                cc = (np.arange(m2 // b2) + 0.5) * b2 - 0.5
+                RR, CC = np.meshgrid(rr, cc, indexing="ij")
+                bin_dirs[bk] = sph.panel_directions(
+                    det, rows=RR.ravel(), cols=CC.ravel(), ki=ki
+                )
+            d = bin_dirs[bk]
+            Rr = R_run.get(int(run_of_image[i_img]))
+            if Rr is not None:
+                d = d @ Rr  # R^T applied to each row
+            f_raw += _pc(d, excess, L_raw, sigma_raw)
+        print(
+            f"spherical-index: raw-count mode, {len(images)} frames binned "
+            f"{b2}x{b2} -> f at L={L_raw}"
+        )
+
     a, b, c_, al, be, ga = cell
     B, _ = cartesian_matrix_metric_tensor(a, b, c_, *np.deg2rad([al, be, ga]))
     h_, k_, l_ = generate_reflections(a, b, c_, al, be, ga, space_group=sg, d_min=d_min)
@@ -1859,9 +1936,36 @@ def run_spherical_index(
         f"{len(dirs)} model directions at d_min={d_min:g}"
     )
 
-    results = sph.find_orientations(
-        d_sample, model_dirs=dirs, kernel_deg=kernel_deg, n_candidates=n_candidates, lam=lam
-    )
+    if f_raw is not None:
+        # assemble the search manually around the precomputed raw f
+        sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
+        L = f_raw.shape[0] - 1
+        g = sph.project_points(dirs, None, L, sigma)
+        C, al_, be_, ga_ = sph.correlogram(f_raw, g)
+        cands = sph.top_orientations(C, al_, be_, ga_, n=n_candidates)
+        results = []
+        for R_, val in cands:
+            R_ = sph.refine_local(f_raw, g, R_)
+            val = sph.so3_inner(f_raw, g, R_)
+            results.append(
+                {
+                    "R": R_,
+                    "score": val,
+                    "z": sph.null_zscore(C, val),
+                    "n_matched": 0,
+                    "coherence": 0.0,
+                    "c": np.nan,
+                }
+            )
+        results.sort(key=lambda r: r["score"], reverse=True)
+    else:
+        results = sph.find_orientations(
+            d_sample,
+            model_dirs=dirs,
+            kernel_deg=kernel_deg,
+            n_candidates=n_candidates,
+            lam=lam,
+        )
     if not results:
         raise RuntimeError("no orientation candidate found")
     best = results[0]
@@ -1870,7 +1974,7 @@ def run_spherical_index(
     if refine:
         sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
         L = int(min(max(np.ceil(3.0 / sigma), 16), 96))
-        f = sph.project_points(d_sample, None, L, sigma)
+        f = f_raw if f_raw is not None else sph.project_points(d_sample, None, L, sigma)
         hkl_all = np.stack([h_, k_, l_], axis=1)
         U, B_out, _ = sph.refine_matching_free(
             f, U, hkl_all, B, kernel_deg=kernel_deg, refine_cell=refine_cell
@@ -1916,6 +2020,7 @@ def run_indexer_visualize(
     max_index: int = 1,
     dpi: int = 150,
     image_index: int | None = None,
+    images_filename: str | None = None,
 ):
     """Draw low-index Laue zone conics over the measured peaks, per run.
 
@@ -1947,6 +2052,10 @@ def run_indexer_visualize(
         raise ValueError("no instrument in the peaks file; pass --instrument")
     dets = {int(k): Detector(v) for k, v in beamlines[str(inst)].items()}
 
+    raw = None
+    if images_filename is not None:
+        raw = _read_merged_images(images_filename)
+
     base = os.path.splitext(os.path.basename(peaks_filename))[0]
     out_dir = output_dir or os.path.dirname(os.path.abspath(peaks_filename))
     written = []
@@ -1968,6 +2077,13 @@ def run_indexer_visualize(
             R_frame = Rg[int(np.min(img[m]))]
         mm = m
         sel_img = int(np.min(img[m]))
+        run_images = None
+        if raw is not None:
+            images, bank_ids, run_of_image = raw
+            in_run = run_of_image == int(r)
+            run_images = {
+                int(bank_ids[i]): images[i] for i in np.flatnonzero(in_run)
+            }
         out_name = os.path.join(out_dir, f"{base}-zones-run{int(r)}.png")
         zones.plot_zone_overlay(
             dets,
@@ -1982,6 +2098,7 @@ def run_indexer_visualize(
             out_name=out_name,
             dpi=dpi,
             title=f"{base} run {int(r)} frame {sel_img}: zones to index {max_index}",
+            images=run_images,
         )
         written.append(out_name)
         print(f"wrote {out_name}")
