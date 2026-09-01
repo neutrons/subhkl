@@ -1784,7 +1784,7 @@ def _spherical_quality(
     n_null=8,
     chunk=20000,
     seed=0,
-    max_points=2_000_000,
+    max_points=500_000,
     max_points_null=200_000,
 ):
     """Native quality report of a spherical indexing solution.
@@ -2069,11 +2069,21 @@ def run_spherical_index(
     # estimator mu = -log(P(y = 0)) -- the sparse-regime rate estimator of
     # compute_rate_batch collapsed to one number per frame; subtracting it
     # is what cancels the anisotropic detector acceptance in expectation.
+    import time as _time
+
+    _t = {"start": _time.perf_counter()}
+
+    def _mark(name):
+        now = _time.perf_counter()
+        _t[name] = _t.get(name, 0.0) + (now - _t["start"])
+        _t["start"] = now
+
     f_raw = None
     if images_filename is not None:
         from subhkl.search.spherical import project_counts as _pc
 
         images, bank_ids, run_of_image = _read_merged_images(images_filename)
+        _mark("read")
         if runs is not None:
             # the --runs restriction applies to the frames too: without it,
             # frames of unselected runs would be projected with no (or the
@@ -2130,6 +2140,7 @@ def run_spherical_index(
             raw_pts.append(d @ Rr if Rr is not None else d)  # R^T per row
             raw_w.append(np.clip(excess, 0.0, None))
             raw_run.append(np.full(len(d), r_))
+        _mark("bin")
 
         # The frame-proportional cost is the associated-Legendre evaluation,
         # and a bank's binned geometry is FIXED in the lab frame -- so the
@@ -2141,16 +2152,39 @@ def run_spherical_index(
         # half an hour of projection for cg4d-garnet's 1114 frames.  The
         # equivalence rests on the coefficient-rotation identity the
         # convention tests pin at 1e-12.
+        from subhkl.search.spherical import project_counts_device
+
         f_lab_run = {}
+        # pad every bank to the same frame count so the device kernel
+        # compiles once (zero rows project to zero and are discarded)
+        nf_max = max(len(rows) for rows in per_bank_rows.values())
         for bk, rows in per_bank_rows.items():
-            W = np.stack([e for _, e in rows])
-            F = _pc(bin_dirs[bk], W, L_raw, sigma_raw)
+            W = np.zeros((nf_max, len(rows[0][1])))
+            for i_, (_, e_) in enumerate(rows):
+                W[i_] = e_
+            F = project_counts_device(bin_dirs[bk], W, L_raw, sigma_raw)
             for (r_, _), Fi in zip(rows, F):
                 f_lab_run[r_] = f_lab_run.get(r_, 0.0) + Fi
+        _mark("project")
+        # one batched Wigner build for every run's rotation instead of a
+        # scalar build per run
+        run_keys = sorted(f_lab_run)
+        rot_keys = [r_ for r_ in run_keys if R_run.get(r_) is not None]
         f_raw = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
-        for r_, fl in f_lab_run.items():
-            Rr = R_run.get(r_)
-            f_raw += sph.rotate_coeffs(fl, Rr.T) if Rr is not None else fl
+        for r_ in run_keys:
+            if r_ not in rot_keys:
+                f_raw += f_lab_run[r_]
+        if rot_keys:
+            eulers = np.array([sph.euler_zyz(R_run[r_].T) for r_ in rot_keys])
+            d_all = sph.wigner_d_matrix(L_raw, eulers[:, 1])  # [l, m, n, r]
+            m_ax = np.arange(-L_raw, L_raw + 1)
+            ea = np.exp(-1j * np.outer(eulers[:, 0], m_ax))  # [r, m]
+            eg = np.exp(-1j * np.outer(eulers[:, 2], m_ax))  # [r, n]
+            f_stack = np.stack([f_lab_run[r_] for r_ in rot_keys])  # [r, l, n]
+            f_raw += np.einsum(
+                "rm,lmnr,rn,rln->lm", ea, d_all, eg, f_stack, optimize=True
+            )
+        _mark("rotate")
         print(
             f"spherical-index: raw-count mode, {len(images)} frames binned "
             f"{b2}x{b2} -> f at L={L_raw}"
@@ -2247,7 +2281,11 @@ def run_spherical_index(
         q_pts = d_sample
         q_w = np.ones(len(d_sample))
         q_run = run if run is not None else None
+    _mark("search+refine")
     quality = _spherical_quality(dirs, U, q_pts, q_w, q_run, kernel_deg)
+    _mark("quality")
+    phases = {k: v for k, v in _t.items() if k != "start"}
+    print("  timings: " + "  ".join(f"{k} {v:.1f}s" for k, v in phases.items()))
     print(
         f"  quality: median nearest-line deviation "
         f"{quality['median_deviation_deg']:.3f} deg "

@@ -86,6 +86,8 @@ no 2 pi).
 
 from __future__ import annotations
 
+from functools import partial
+
 import numpy as np
 from scipy.special import gammaln
 
@@ -317,6 +319,102 @@ def project_counts(pixel_dirs, excess, L, sigma, even_only=True, chunk=8192):
     if even_only:
         f[:, 1::2] = 0.0
     return f[0] if one_d else f
+
+
+_PROJECT_KERNEL = None
+
+
+def _get_project_kernel():
+    """Jitted batched-weights projection (module scope, one cache key):
+    the numpy per-order GEMMs are 14-row skinny complex matmuls that run
+    at ~10 GFLOP/s on CPU BLAS -- measured 98 s of a 158 s benchmark-scale
+    raw run.  Same associated-Legendre fori recursion as _sph_coeffs_jax,
+    contracted against every frame's weights at once on the device."""
+    global _PROJECT_KERNEL
+    if _PROJECT_KERNEL is not None:
+        return _PROJECT_KERNEL
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+
+    @partial(jax.jit, static_argnames=("L",))
+    def kernel(dirs, W, L):
+        ct = jnp.clip(dirs[:, 2], -1.0, 1.0)
+        st = jnp.sqrt(jnp.maximum(1.0 - ct * ct, 1e-20))
+        phi = jnp.arctan2(dirs[:, 1], dirs[:, 0])
+        m_idx = jnp.arange(L + 1, dtype=jnp.float32)
+        E = jnp.exp(-1j * jnp.outer(m_idx, phi))  # [m, j]
+        Wc = W.astype(jnp.complex64)
+        signs = jnp.asarray((-1.0) ** np.arange(1, L + 1))
+
+        def coeffs_from_row(P_row):
+            # cpos[f, m] = sum_j W[f, j] Pbar_{l m}(j) e^{-i m phi_j}
+            cpos = jnp.einsum("mj,fj->fm", (P_row.astype(jnp.complex64) * E), Wc)
+            cneg = signs[None, :] * jnp.conj(cpos[:, 1:])
+            return jnp.concatenate([jnp.flip(cneg, axis=1), cpos], axis=1)
+
+        n = dirs.shape[0]
+        p00 = jnp.full((n,), float(np.sqrt(1.0 / (4.0 * np.pi))), dtype=jnp.float32)
+        P0 = jnp.zeros((L + 1, n), dtype=jnp.float32).at[0].set(p00)
+        F = jnp.zeros((W.shape[0], L + 1, 2 * L + 1), dtype=jnp.complex64)
+        F = F.at[:, 0].set(coeffs_from_row(P0))
+        P1 = (
+            jnp.zeros((L + 1, n), dtype=jnp.float32)
+            .at[0]
+            .set(np.sqrt(3.0) * ct * p00)
+            .at[1]
+            .set(-np.sqrt(3.0 / 2.0) * st * p00)
+        )
+        F = F.at[:, 1].set(coeffs_from_row(P1))
+
+        def body(l_, state):
+            Pm2, Pm1, F = state
+            lf = jnp.asarray(l_, dtype=jnp.float32)
+            a = jnp.sqrt(
+                jnp.abs(
+                    (4.0 * lf**2 - 1.0)
+                    / jnp.where(lf**2 - m_idx**2 != 0.0, lf**2 - m_idx**2, 1.0)
+                )
+            )
+            b = jnp.sqrt(
+                jnp.abs(((lf - 1.0) ** 2 - m_idx**2) / (4.0 * (lf - 1.0) ** 2 - 1.0))
+            )
+            row = a[:, None] * (ct[None, :] * Pm1 - b[:, None] * Pm2)
+            diag_prev = Pm1[l_ - 1]
+            row = row.at[l_ - 1].set(jnp.sqrt(2.0 * lf + 1.0) * ct * diag_prev)
+            row = row.at[l_].set(
+                -jnp.sqrt((2.0 * lf + 1.0) / (2.0 * lf)) * st * diag_prev
+            )
+            row = jnp.where((m_idx <= lf)[:, None], row, 0.0)
+            F = F.at[:, l_].set(coeffs_from_row(row))
+            return (Pm1, row, F)
+
+        _, _, F = lax.fori_loop(2, L + 1, body, (P0, P1, F))
+        return F
+
+    _PROJECT_KERNEL = kernel
+    return kernel
+
+
+def project_counts_device(pixel_dirs, W, L, sigma, even_only=True):
+    """project_counts on the accelerator: float32, all frames of a shared
+    geometry in one fused pass.  Used by the raw-count CLI path; the
+    float64 numpy project_counts remains the reference the exactness
+    tests pin."""
+    import jax.numpy as jnp
+
+    kernel = _get_project_kernel()
+    F = np.asarray(
+        kernel(
+            jnp.asarray(np.asarray(pixel_dirs), dtype=jnp.float32),
+            jnp.asarray(np.asarray(W), dtype=jnp.float32),
+            int(L),
+        )
+    ).astype(complex)
+    F *= _smoothing(L, sigma)[None, :, None]
+    if even_only:
+        F[:, 1::2] = 0.0
+    return F
 
 
 def _legendre_p0(L):
@@ -698,11 +796,30 @@ def _so3_inner_fast_factory(f, g):
     L = f.shape[0] - 1
     a, b, coefK, prefK, rho1, rho2 = _coupling_prep(f, g)
     m = np.arange(-L, L + 1)
+    # place the rotation-independent constants on the device ONCE: passing
+    # numpy here re-uploaded the 28 MB coupling tensor per evaluation --
+    # measured 533 calls x 0.059 s of PCIe traffic per raw-mode run, which
+    # was most of the "GPU at 4%" segment
+    kernel = _get_S_kernel()
+    coefK_d = jnp.asarray(coefK, dtype=jnp.complex64)
+    rho1_d = jnp.asarray(rho1, dtype=jnp.float32)
+    rho2_d = jnp.asarray(rho2, dtype=jnp.float32)
+    af_d = jnp.asarray(a, dtype=jnp.float32)[..., None]
+    bf_d = jnp.asarray(b, dtype=jnp.float32)[..., None]
 
     def inner(R):
         alpha, beta, gamma = euler_zyz(R)
         x64, D0, D1 = _S_terms(a, b, prefK, np.array([beta]))
-        S = _S_kernel_jax(coefK, rho1, rho2, a, b, x64, D0, D1)
+        S = kernel(
+            coefK_d,
+            rho1_d,
+            rho2_d,
+            af_d,
+            bf_d,
+            jnp.asarray(x64, dtype=jnp.float32)[None, None, :],
+            jnp.asarray(D0, dtype=jnp.float32),
+            jnp.asarray(D1, dtype=jnp.float32),
+        )
         ea = jnp.asarray(np.exp(-1j * m * alpha), dtype=jnp.complex64)
         eg = jnp.asarray(np.exp(-1j * m * gamma), dtype=jnp.complex64)
         return float(jnp.real(jnp.einsum("m,mnb,n->", ea, S, eg)))

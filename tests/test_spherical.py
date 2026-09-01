@@ -554,3 +554,16 @@ def test_correlogram_jax_matches_numpy_reference():
         assert np.unravel_index(np.argmax(C_np), C_np.shape) == np.unravel_index(
             np.argmax(C_jx), C_jx.shape
         )
+
+
+def test_project_counts_device_matches_numpy():
+    """The float32 device projection against the float64 reference."""
+    from subhkl.search.spherical import project_counts_device
+
+    rng = np.random.default_rng(3)
+    d = _rand_dirs(rng, 2000)
+    W = rng.normal(size=(5, 2000)) * 10
+    F_np = project_counts(d, W, 48, 0.02)
+    F_dev = project_counts_device(d, W, 48, 0.02)
+    scale = np.abs(F_np).max()
+    assert np.abs(F_dev - F_np).max() / scale < 2e-3
