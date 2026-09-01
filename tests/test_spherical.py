@@ -27,10 +27,13 @@ from subhkl.search.spherical import (
     find_orientations,
     ghat_from_kf,
     lattice_directions,
+    null_zscore,
+    panel_directions,
     project_counts,
     project_points,
     project_rings,
     refine_local,
+    refine_matching_free,
     rot_zyz,
     rotate_coeffs,
     so3_inner,
@@ -383,3 +386,142 @@ def test_orientation_from_raw_counts_below_the_finder_floor():
     R, _ = top_orientations(C, al, be, ga, n=1)[0]
     R = refine_local(f, g, R)
     assert _err_mod(R, R0, _cubic_rots()) < 1.5
+
+
+# ---------------------------------------------------------------------------
+# real detector panels and matching-free refinement
+# ---------------------------------------------------------------------------
+
+
+def _flat_panel(center, uhat, vhat, m=96, n=96, width=0.3, height=0.3):
+    return {
+        "m": m,
+        "n": n,
+        "width": width,
+        "height": height,
+        "center": list(center),
+        "uhat": list(uhat),
+        "vhat": list(vhat),
+        "panel": "flat",
+    }
+
+
+def test_panel_directions_match_the_geometry():
+    from subhkl.instrument.detector import Detector
+
+    cfg = _flat_panel([0.35, 0.0, 0.35], [0.0, 1.0, 0.0], [-0.7071, 0.0, 0.7071])
+    det = Detector(cfg)
+    # the peaks path is a subset of the full-frame path, same convention
+    all_dirs = panel_directions(det)
+    rows = np.array([0, 10, 95])
+    cols = np.array([5, 50, 90])
+    some = panel_directions(det, rows=rows, cols=cols)
+    flat_idx = rows * det.m + cols
+    assert np.allclose(some, all_dirs[flat_idx], atol=1e-12)
+    # and it is the bisector of the pixel's scattering direction
+    xyz = det.pixel_to_lab(rows, cols)
+    kf = xyz / np.linalg.norm(xyz, axis=-1, keepdims=True)
+    assert np.allclose(some, ghat_from_kf(kf), atol=1e-12)
+
+
+def test_orientation_from_raw_panel_frames():
+    """End to end on real Detector geometry: two flat panels, raw Poisson
+    counts, no peak finding -- pooled into one global search."""
+    from subhkl.instrument.detector import Detector
+
+    rng = np.random.default_rng(31)
+    dets = [
+        Detector(
+            _flat_panel([0.35, 0.0, 0.35], [0.0, 1.0, 0.0], [-0.7071, 0.0, 0.7071])
+        ),
+        Detector(
+            _flat_panel([-0.35, 0.0, 0.35], [0.0, -1.0, 0.0], [0.7071, 0.0, 0.7071])
+        ),
+    ]
+    B, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    dirs, w = lattice_directions(B, 1.2)
+    R0 = _rand_rot(rng)
+    spots = np.vstack([dirs, -dirs]) @ R0.T
+    sig_spot = np.deg2rad(0.6)
+
+    pix_all, exc_all = [], []
+    for det in dets:
+        pix = panel_directions(det)
+        rate = np.full(len(pix), 0.3)
+        for shat in spots:
+            ct = pix @ shat
+            near = ct > np.cos(np.deg2rad(3.0))
+            if np.any(near):
+                ang2 = 2.0 * (1.0 - np.clip(ct[near], -1, 1))
+                rate[near] += 25.0 * np.exp(-ang2 / (2 * sig_spot**2))
+        y = rng.poisson(rate).astype(float)
+        pix_all.append(pix)
+        exc_all.append(y - 0.3)
+    pix = np.vstack(pix_all)
+    excess = np.concatenate(exc_all)
+
+    L = 48
+    f = project_counts(pix, excess, L, sig_spot)
+    g = project_points(dirs, w, L, sig_spot)
+    C, al, be, ga = correlogram(f, g)
+    R, v = top_orientations(C, al, be, ga, n=1)[0]
+    R = refine_local(f, g, R)
+    assert _err_mod(R, R0, _cubic_rots()) < 1.0
+    assert null_zscore(C, v) > 5.0
+
+
+def test_matching_free_refinement_recovers_orientation_and_cell():
+    """Refinement with no peak list, no indexing labels, no assignment:
+    gradient ascent of the correlation itself (jax autodiff through the
+    Legendre recursion) recovers a 1.5 deg orientation error to < 0.15 deg
+    and a 1% cell-shape strain to a few 1e-3, jointly, in seconds.  Scale
+    is structurally invisible (directions are degree-zero homogeneous in B)
+    and stays where the parameterization pins it -- traceless strain."""
+    rng = np.random.default_rng(9)
+    B0, _ = cartesian_matrix_metric_tensor(6.0, 7.5, 9.0, *np.deg2rad([90, 90, 90]))
+    A_true = np.array(
+        [[0.010, 0.002, 0.0], [0.002, -0.004, 0.001], [0.0, 0.001, -0.006]]
+    )
+    B_true = (np.eye(3) + A_true) @ B0
+    R_true = _rand_rot(rng)
+
+    binv = np.linalg.inv(B0)
+    bounds = np.ceil(np.linalg.norm(binv, axis=1) / 1.5).astype(int)
+    h, k, l_ = np.meshgrid(*(np.arange(-b, b + 1) for b in bounds), indexing="ij")
+    hkl = np.stack([h.ravel(), k.ravel(), l_.ravel()], axis=1)
+    hkl = hkl[np.any(hkl != 0, axis=1)]
+    hkl = hkl[np.linalg.norm(hkl @ B0.T, axis=1) <= 1.0 / 1.5]
+    gcd = np.gcd.reduce(np.abs(hkl), axis=1)
+    hkl = np.unique(hkl // gcd[:, None], axis=0)
+
+    gt = hkl @ B_true.T
+    dirs_true = gt / np.linalg.norm(gt, axis=1, keepdims=True)
+    sel = rng.random(len(dirs_true)) < 0.65
+    obs = dirs_true[sel] @ R_true.T + rng.normal(
+        scale=np.deg2rad(0.15), size=(int(np.sum(sel)), 3)
+    )
+    obs /= np.linalg.norm(obs, axis=1, keepdims=True)
+    out = _rand_dirs(rng, int(0.2 * len(obs)))
+    data = np.vstack([obs, out])
+    L = 48
+    f = project_points(data, None, L, np.deg2rad(1.0) / np.sqrt(8 * np.log(2)))
+
+    from subhkl.search.spherical import _rodrigues
+
+    d0 = rng.normal(size=3)
+    d0 = d0 / np.linalg.norm(d0) * np.deg2rad(1.5)
+    R_start = _rodrigues(d0) @ R_true
+
+    def shape_err(Be, Br):
+        G1, G2 = Be @ Be.T, Br @ Br.T
+        return np.max(np.abs(G1 / np.trace(G1) - G2 / np.trace(G2))) / np.max(
+            np.abs(G2 / np.trace(G2))
+        )
+
+    R1, _, c1 = refine_matching_free(f, R_start, hkl, B0, refine_cell=False)
+    assert np.rad2deg(_quat_angle(R1, R_true)) < 0.15
+
+    R2, B2, c2 = refine_matching_free(f, R_start, hkl, B0, refine_cell=True)
+    assert np.rad2deg(_quat_angle(R2, R_true)) < 0.15
+    assert shape_err(B2, B_true) < 0.4 * shape_err(B0, B_true)
+    assert c2 > c1  # the cell parameters absorb real signal

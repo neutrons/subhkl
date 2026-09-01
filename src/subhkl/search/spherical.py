@@ -723,3 +723,233 @@ def find_orientations(
             rec["c"] = float(cr)
     out.sort(key=lambda r: r["score"], reverse=True)
     return out
+
+
+# ---------------------------------------------------------------------------
+# real detector panels
+# ---------------------------------------------------------------------------
+
+
+def panel_directions(
+    detector, rows=None, cols=None, sample_offset=None, ki=(0.0, 0.0, 1.0)
+):
+    """Measured Q directions for detector pixels, via the instrument geometry.
+
+    ``detector`` is a subhkl.instrument.detector.Detector (or a config dict
+    for one).  With rows/cols omitted, returns Ghat for *every* pixel of the
+    panel, flattened in the same (row, col) C-order as a counts frame
+    ``counts[row, col]`` -- the raw-counts path: pool
+    ``panel_directions(det)`` and ``(counts - rate_map).ravel()`` across
+    banks and hand them to project_counts.  With explicit rows/cols (e.g. a
+    finder peak table's i/j), returns Ghat per peak -- the peaks path.
+
+    Multi-bank is concatenation: directions from every panel live in the
+    one lab frame already, so a global search across panels is
+    ``np.vstack([panel_directions(d) for d in dets])``.  For a rotated
+    sample (goniometer), rotate the returned directions back to the sample
+    frame with the run's R and pool across runs the same way.
+    """
+    from subhkl.instrument.detector import Detector
+
+    det = detector if hasattr(detector, "pixel_to_lab") else Detector(detector)
+    if (rows is None) != (cols is None):
+        raise ValueError("give both rows and cols, or neither")
+    if rows is None:
+        # full frame: counts[row, col] <-> pixel_to_lab(row, col)
+        n_rows, n_cols = det.n, det.m
+        rr, cc = np.meshgrid(np.arange(n_rows), np.arange(n_cols), indexing="ij")
+        rows, cols = rr.ravel(), cc.ravel()
+    xyz = det.pixel_to_lab(np.asarray(rows), np.asarray(cols))
+    if sample_offset is not None:
+        xyz = xyz - np.asarray(sample_offset, dtype=float)
+    kf = xyz / np.linalg.norm(xyz, axis=-1, keepdims=True)
+    return ghat_from_kf(kf, ki=ki)
+
+
+# ---------------------------------------------------------------------------
+# matching-free refinement (jax)
+# ---------------------------------------------------------------------------
+#
+# Refinement needs no Wigner machinery and no peak list.  The correlation
+#
+#     C(R, B) = Re sum_lm conj(f_lm) g_lm(R, B),
+#     g_lm    = sum_i w_i conj(Y_lm(R Hhat_i(B))) s_l,
+#     Hhat_i  = B hkl_i / |B hkl_i|,
+#
+# is differentiable end to end -- through the associated-Legendre recursion,
+# the normalization, and the rotation -- so orientation and cell SHAPE refine
+# jointly by gradient ascent of the same objective the search maximized,
+# with the data side f frozen (peaks or raw counts, it no longer matters).
+# There is no assignment step: the kernel overlap IS the soft assignment,
+# integrated exactly.  Cell SCALE is structurally invisible here (directions
+# are homogeneous of degree zero in B) and must come from the wavelength/TOF
+# axis downstream; the symmetric-traceless parameterization below makes that
+# explicit instead of letting scale wander.
+
+
+def _sph_coeffs_jax(dirs, weights, L, sigma):
+    """g_lm as a jax array [(L+1), (2L+1)] complex; differentiable in dirs.
+
+    One lax.fori_loop over degrees carrying two Legendre rows -- linear
+    compile time in L (the unrolled per-(l, m) graph took ~90 s to trace at
+    L = 48; this compiles in seconds and evaluates in milliseconds)."""
+    import jax.numpy as jnp
+    from jax import lax
+
+    ct = jnp.clip(dirs[:, 2], -1.0, 1.0)
+    st = jnp.sqrt(jnp.maximum(1.0 - ct * ct, 1e-20))
+    phi = jnp.arctan2(dirs[:, 1], dirs[:, 0])
+    n = dirs.shape[0]
+    m_idx = jnp.arange(L + 1, dtype=jnp.float32)
+    ell = np.arange(L + 1, dtype=float)
+    s_l = jnp.asarray(np.exp(-ell * (ell + 1.0) * sigma * sigma / 2.0))
+    # conj(Y_lm) = Pbar_lm e^{-i m phi}; E[m, j] = w_j e^{-i m phi_j}
+    E = weights[None, :] * jnp.exp(-1j * jnp.outer(m_idx, phi))
+    signs = jnp.asarray((-1.0) ** np.arange(1, L + 1))
+
+    def coeffs_from_row(P_row, l_):
+        cpos = jnp.einsum("mj,mj->m", P_row * 1.0, jnp.real(E)) + 1j * jnp.einsum(
+            "mj,mj->m", P_row * 1.0, jnp.imag(E)
+        )
+        cneg = signs * jnp.conj(cpos[1:])
+        return jnp.concatenate([jnp.flip(cneg), cpos]) * s_l[l_]
+
+    p00 = jnp.full((n,), float(np.sqrt(1.0 / (4.0 * np.pi))))
+    P0 = jnp.zeros((L + 1, n)).at[0].set(p00)  # row l = 0
+    g = jnp.zeros((L + 1, 2 * L + 1), dtype=jnp.complex64)
+    g = g.at[0].set(coeffs_from_row(P0, 0))
+    if L == 0:
+        return g
+    # row l = 1: m = 0 and the diagonal m = 1
+    P1 = (
+        jnp.zeros((L + 1, n))
+        .at[0]
+        .set(np.sqrt(3.0) * ct * p00)
+        .at[1]
+        .set(-np.sqrt(3.0 / 2.0) * st * p00)
+    )
+    g = g.at[1].set(coeffs_from_row(P1, 1))
+
+    def body(l_, state):
+        Pm2, Pm1, g = state
+        lf = jnp.asarray(l_, dtype=jnp.float32)
+        # general recursion, valid for m <= l - 2 (masked elsewhere)
+        a = jnp.sqrt(
+            jnp.abs(
+                (4.0 * lf**2 - 1.0)
+                / jnp.where(lf**2 - m_idx**2 != 0.0, lf**2 - m_idx**2, 1.0)
+            )
+        )
+        b = jnp.sqrt(
+            jnp.abs(((lf - 1.0) ** 2 - m_idx**2) / (4.0 * (lf - 1.0) ** 2 - 1.0))
+        )
+        row = a[:, None] * (ct[None, :] * Pm1 - b[:, None] * Pm2)
+        # m = l - 1 (subdiagonal) and m = l (diagonal), from row l-1's diagonal
+        diag_prev = Pm1[l_ - 1]
+        row = row.at[l_ - 1].set(jnp.sqrt(2.0 * lf + 1.0) * ct * diag_prev)
+        row = row.at[l_].set(-jnp.sqrt((2.0 * lf + 1.0) / (2.0 * lf)) * st * diag_prev)
+        # zero out m > l
+        row = jnp.where((m_idx <= lf)[:, None], row, 0.0)
+        g = g.at[l_].set(coeffs_from_row(row, l_))
+        return (Pm1, row, g)
+
+    _, _, g = lax.fori_loop(2, L + 1, body, (P0, P1, g))
+    return g
+
+
+def _rodrigues_jax(v):
+    """exp([v]x), autodiff-safe at v = 0.
+
+    The naive form has NaN gradients at the origin -- which is exactly
+    where every refinement starts -- through 0/0 in sin(th)/th and the
+    norm's own derivative.  The standard fix: Taylor branches near zero,
+    with *safe inputs to the exact branch* so the untaken branch cannot
+    poison the gradient through jnp.where."""
+    import jax.numpy as jnp
+
+    th2 = v @ v
+    small = th2 < 1e-8
+    th = jnp.sqrt(jnp.where(small, 1.0, th2))
+    A = jnp.where(small, 1.0 - th2 / 6.0, jnp.sin(th) / th)
+    B = jnp.where(
+        small, 0.5 - th2 / 24.0, (1.0 - jnp.cos(th)) / jnp.where(small, 1.0, th2)
+    )
+    K = jnp.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+    return jnp.eye(3) + A * K + B * (K @ K)
+
+
+def refine_matching_free(
+    f,
+    R0,
+    hkl,
+    B0,
+    weights=None,
+    kernel_deg=1.0,
+    refine_cell=False,
+    maxiter=60,
+):
+    """Refine orientation (and cell shape) against the correlation itself.
+
+    Maximizes C(R, B) by L-BFGS with jax gradients, starting from the
+    search's candidate R0 and the nominal B0.  Parameters: a rotation
+    vector delta (R = exp([delta]x) R0) and, with refine_cell, a symmetric
+    traceless 3x3 strain A (B = (I + A) B0): symmetric because the
+    antisymmetric part is a rotation (already delta's job), traceless
+    because pure scale does not move any direction and would be a flat
+    direction of the objective.  Five shape parameters, exactly the cell's
+    direction-visible degrees of freedom.
+
+    Replaces peak-list refinement for everything the sphere can see: no
+    finder, no indexing labels, no predicted-to-observed assignment --
+    the kernel overlap is the soft assignment, integrated exactly.  Scale
+    (and only scale) still needs the wavelength/TOF axis.
+
+    Returns (R, B, C_value).
+    """
+    import jax
+    import jax.numpy as jnp
+    from scipy.optimize import minimize
+
+    L = f.shape[0] - 1
+    sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
+    hkl_j = np.asarray(hkl, dtype=float)
+    w = np.ones(len(hkl_j)) if weights is None else np.asarray(weights, float)
+    fj = np.asarray(f, dtype=complex)
+
+    def unpack(p):
+        delta = p[:3]
+        A = jnp.zeros((3, 3))
+        if refine_cell:
+            a = p[3:]
+            A = jnp.array(
+                [
+                    [a[0], a[2], a[3]],
+                    [a[2], a[1], a[4]],
+                    [a[3], a[4], -a[0] - a[1]],
+                ]
+            )
+        return delta, A
+
+    def neg_corr(p):
+        delta, A = unpack(p)
+        R = _rodrigues_jax(delta) @ jnp.asarray(R0)
+        B = (jnp.eye(3) + A) @ jnp.asarray(B0)
+        g_vec = hkl_j @ B.T
+        dirs = g_vec / jnp.linalg.norm(g_vec, axis=1, keepdims=True)
+        g = _sph_coeffs_jax(dirs @ R.T, jnp.asarray(w), L, sigma)
+        return -jnp.real(jnp.sum(jnp.conj(fj) * g))
+
+    val_grad = jax.jit(jax.value_and_grad(neg_corr))
+
+    def fun(p):
+        v, g = val_grad(jnp.asarray(p, dtype=jnp.float32))
+        return float(v), np.asarray(g, dtype=float)
+
+    n = 8 if refine_cell else 3
+    res = minimize(
+        fun, np.zeros(n), jac=True, method="L-BFGS-B", options={"maxiter": maxiter}
+    )
+    delta, A = unpack(res.x)
+    R = np.asarray(_rodrigues_jax(jnp.asarray(delta))) @ np.asarray(R0)
+    B = (np.eye(3) + np.asarray(A)) @ np.asarray(B0)
+    return R, B, float(-res.fun)
