@@ -1,31 +1,30 @@
 # src/subhkl/io/command_line_parser.py
-from typing import Annotated
-from typing import Optional
-
-import sys
-import typer
-import h5py
 import os
+import sys
+from typing import Annotated
 
-from subhkl.utils.devices import restrict_to_first_device
-from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
+import h5py
+import typer
 
 from subhkl.commands import (
-    run_index,
-    run_rbf_integrator,
     run_finder,
-    run_metrics,
-    run_peak_predictor,
-    run_mtz_exporter,
-    run_reduce,
-    run_merge_images,
     run_finder_visualize,
+    run_index,
+    run_indexer_visualize,
     run_integrator_visualize,
+    run_mask_visualize,
+    run_merge_images,
+    run_metrics,
+    run_mtz_exporter,
+    run_peak_predictor,
+    run_rbf_integrator,
+    run_reduce,
+    run_spherical_index,
     run_static_mask,
     run_sum_images,
-    run_mask_visualize,
 )
-
+from subhkl.utils.devices import restrict_to_first_device
+from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
 
 app = typer.Typer()
 
@@ -324,7 +323,7 @@ def indexer(
         ),
     ] = "1.0",
     refine_goniometer_per_run: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--refine-goniometer-per-run",
             help="Motor name (e.g. 'phi') to refine one bounded angle "
@@ -361,7 +360,7 @@ def indexer(
         ),
     ] = 0.002,
     refine_goniometer_harmonics: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--refine-goniometer-harmonics",
             help="Scan motor name (e.g. 'phi') to refine a Fourier-in-phi "
@@ -374,7 +373,7 @@ def indexer(
         ),
     ] = None,
     goniometer_harmonics_orders: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--goniometer-harmonics-orders",
             help="Comma-separated harmonic orders m (default '1,2,3,4,5,6'). "
@@ -405,7 +404,7 @@ def indexer(
         ),
     ] = 0.5,
     refine_goniometer_trans_axes: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--refine-goniometer-trans-axes",
             help="Comma-separated motor names whose lever-arm translations "
@@ -477,7 +476,7 @@ def indexer(
     num_candidates: Annotated[
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
-    index: Annotated[Optional[bool], typer.Option("--index/--no-index")] = None,
+    index: Annotated[bool | None, typer.Option("--index/--no-index")] = None,
     radial_weight: Annotated[
         float,
         typer.Option(
@@ -489,7 +488,7 @@ def indexer(
         ),
     ] = 1.0,
     radial_weight_poly: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             help="Comma-separated polynomial coefficients for w(lambda) "
             "in Angstrom, highest degree first; overrides --radial-weight."
@@ -1018,11 +1017,11 @@ _DPI_HELP = (
 def finder_visualize(
     images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
     peaks_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
-    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
-    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
     n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
-    max_workers: Optional[int] = None,
+    max_workers: int | None = None,
     show_progress: bool = True,
 ):
     """
@@ -1050,11 +1049,11 @@ def finder_visualize(
 def integrator_visualize(
     images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
     peaks_filename: Annotated[str, typer.Argument(help="integrator output HDF5 file")],
-    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
-    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
     n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
-    max_workers: Optional[int] = None,
+    max_workers: int | None = None,
     show_progress: bool = True,
 ):
     """
@@ -1102,7 +1101,7 @@ def static_mask(
         ),
     ] = None,
     pooled_peaks: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--pooled-peaks",
             help="Finder output from a run on the per-bank *summed* stack "
@@ -1276,10 +1275,10 @@ def mask_visualize(
     mask_filename: Annotated[
         str, typer.Argument(help="Static mask HDF5 (from `static-mask`)")
     ],
-    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
-    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 600,
-    max_workers: Optional[int] = None,
+    max_workers: int | None = None,
     show_progress: bool = True,
 ):
     """
@@ -1297,6 +1296,77 @@ def mask_visualize(
         dpi=dpi,
         max_workers=max_workers,
         show_progress=show_progress,
+    )
+
+
+@app.command()
+def spherical_index(
+    peaks_h5_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
+    output_filename: Annotated[str, typer.Argument(help="Bootstrap HDF5 to write")],
+    d_min: Annotated[float, typer.Option("--d-min", help="Resolution cut for the model direction set [Angstrom]")] = 1.5,
+    kernel_deg: Annotated[float, typer.Option("--kernel-deg", help="Angular kernel FWHM [deg] (mosaic + measurement)")] = 1.0,
+    n_candidates: Annotated[int, typer.Option("--n-candidates", help="Orientation candidates to keep (multi-crystal capable)")] = 4,
+    refine: Annotated[bool, typer.Option("--refine/--no-refine", help="Polish with the matching-free refinement")] = True,
+    refine_cell: Annotated[bool, typer.Option("--refine-cell", help="Also refine the cell SHAPE (scale is structurally invisible to directions and stays nominal)")] = False,
+    lam: Annotated[float, typer.Option("--lam", help="L1 penalty on the candidates' sparse weights")] = 0.0,
+    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
+    ki_vec: Annotated[str | None, typer.Option("--ki-vec", help="Incident beam vector, e.g. '0,0,1'")] = None,
+):
+    """
+    Index by spherical correlation over SO(3) -- global across all panels
+    and runs at once, multi-crystal capable, seconds on a CPU.
+
+    Each spot fixes only the direction of Q (the Laue collapse), so peaks
+    from every bank pool onto the unit sphere and the crystal orientation
+    is the rotation aligning them with the cell's reflection directions --
+    found as the peak of a bandlimited spherical cross-correlation, then
+    polished by matching-free refinement (no peak assignment; the kernel
+    overlap is the soft assignment).  Writes a bootstrap file the classic
+    indexer accepts via --bootstrap, and that indexer-visualize can draw
+    zone overlays from directly.
+    """
+    # same single-device contract as finder/indexer: the refinement uses
+    # jax, and without an explicit opt-in it must not claim every GPU.
+    restrict_to_first_device()
+    run_spherical_index(
+        peaks_h5_filename=peaks_h5_filename,
+        output_filename=output_filename,
+        d_min=d_min,
+        kernel_deg=kernel_deg,
+        n_candidates=n_candidates,
+        refine=refine,
+        refine_cell=refine_cell,
+        lam=lam,
+        instrument_name=instrument,
+        ki_vec=[float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None,
+    )
+
+
+@app.command()
+def indexer_visualize(
+    peaks_filename: Annotated[str, typer.Argument(help="Indexer (or spherical-index) output HDF5 file")],
+    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    max_index: Annotated[int, typer.Option("--max-index", help="Draw zones [uvw] up to this index")] = 1,
+    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
+    image_index: Annotated[int | None, typer.Option("--image-index", help="Frame to draw (default: each run's first)")] = None,
+):
+    """
+    Draw the low-index Laue zone conics over the measured peaks.
+
+    A zone [uvw] is a great circle of Q directions, hence a conic of spot
+    positions per panel: with a correct (U, B) every strong row of spots
+    rides a drawn curve, and a systematic offset points at the refinable
+    that is wrong -- orientation, a panel, or the goniometer.  One
+    unrolled-detector figure per run.
+    """
+    run_indexer_visualize(
+        peaks_filename=peaks_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        max_index=max_index,
+        dpi=dpi,
+        image_index=image_index,
     )
 
 

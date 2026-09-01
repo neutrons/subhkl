@@ -1,3 +1,4 @@
+
 import h5py
 import numpy as np
 
@@ -6,11 +7,9 @@ from subhkl.instrument.goniometer import (
     get_rotation_data_from_nexus,
 )
 from subhkl.integration import Peaks
-from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
+from subhkl.optimization import FindUB
 from subhkl.viz import detector_assembly, replay
-
-from typing import List
 
 
 def apply_detector_calibration(hdf5_filename: str, instrument: str):
@@ -19,8 +18,9 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
     and overrides the in-memory beamlines configuration so downstream
     tasks natively use the calibrated geometry.
     """
-    from subhkl.config import beamlines
     import os
+
+    from subhkl.config import beamlines
 
     if not os.path.exists(hdf5_filename):
         return
@@ -1071,7 +1071,7 @@ def run_metrics(
     d_min: float | None = None,
     per_peak: bool = False,
     per_run: bool = False,
-    ki_vec: List[float] | np.ndarray = None,
+    ki_vec: list[float] | np.ndarray = None,
 ):
     from subhkl.instrument.metrics import compute_metrics
 
@@ -1355,6 +1355,7 @@ def run_rbf_integrator(
     apply_detector_calibration(integration_peaks_filename, instrument)
 
     import h5py
+
     from subhkl.search.sparse_rbf import integrate_peaks_rbf_ssn
 
     sigma_list = [float(k.strip()) for k in sigmas.split(",")]
@@ -1551,8 +1552,9 @@ def run_merge_images(
     gamma: float,
     space_group: str,
 ):
-    from subhkl.core.spacegroup import get_space_group_object
     import glob
+
+    from subhkl.core.spacegroup import get_space_group_object
 
     try:
         get_space_group_object(space_group)
@@ -1769,4 +1771,218 @@ def run_mask_visualize(
         show_progress=show_progress,
     )
     print(f"Wrote {len(written)} plot(s).")
+    return written
+
+
+def run_spherical_index(
+    peaks_h5_filename: str,
+    output_filename: str,
+    d_min: float = 1.5,
+    kernel_deg: float = 1.0,
+    n_candidates: int = 4,
+    refine: bool = True,
+    refine_cell: bool = False,
+    lam: float = 0.0,
+    instrument_name: str | None = None,
+    ki_vec: list | None = None,
+):
+    """Index by spherical correlation over SO(3) -- the matched-filter dual
+    of the sparse orientation-recovery problem (subhkl.search.spherical).
+
+    Reads a finder output file, pools every bank's peaks as lab-frame Q
+    directions (the Laue collapse: a spot fixes only the direction of Q),
+    rotates them to the sample frame with the stored per-peak goniometer
+    rotations, and finds the orientation(s) as peaks of the spherical
+    cross-correlation against the cell's reflection directions -- global
+    over all panels and all runs at once, multi-crystal capable, seconds on
+    a CPU.  Optionally polishes with the matching-free refinement (no peak
+    assignment; kernel overlap is the soft assignment).
+
+    Writes a bootstrap file the existing indexer accepts via --bootstrap:
+    sample/U, sample/B, the cell, beam/ki_vec -- plus the peaks, bank and
+    goniometer groups (so indexer-visualize can draw zone overlays from
+    this file alone) and a spherical/ group with every candidate's z-score,
+    matched count, model coherence and sparse weight.  Validated on real
+    CG4D garnet: U within 0.44 deg of the production indexer in a 4 s
+    search (given the same refined goniometer; with nominal goniometer the
+    difference is the omega offset, which is exactly the gauge the
+    refinement stage owns).
+    """
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import (
+        cartesian_matrix_metric_tensor,
+        generate_reflections,
+    )
+    from subhkl.instrument.detector import Detector
+    from subhkl.search import spherical as sph
+
+    with h5py.File(peaks_h5_filename, "r") as fp:
+        bank = fp["bank"][()]
+        pr = fp["peaks/pixel_r"][()]
+        pc = fp["peaks/pixel_c"][()]
+        img = fp["peaks/image_index"][()] if "peaks/image_index" in fp else None
+        run = fp["peaks/run_index"][()] if "peaks/run_index" in fp else None
+        Rg = fp["goniometer/R"][()] if "goniometer/R" in fp else None
+        cell = tuple(
+            float(fp[f"sample/{k}"][()]) for k in ("a", "b", "c", "alpha", "beta", "gamma")
+        )
+        sg = fp["sample/space_group"][()]
+        sg = sg.decode() if isinstance(sg, bytes) else str(sg)
+        wl = fp["instrument/wavelength"][()] if "instrument/wavelength" in fp else None
+        instrument = instrument_name or fp.attrs.get("instrument")
+
+    if instrument is None:
+        raise ValueError("no instrument in the peaks file; pass --instrument")
+    ki = np.asarray(ki_vec if ki_vec is not None else [0.0, 0.0, 1.0], dtype=float)
+
+    dets = {int(k): Detector(v) for k, v in beamlines[str(instrument)].items()}
+    d_lab = np.zeros((len(pr), 3))
+    for bk in np.unique(bank):
+        m = bank == bk
+        d_lab[m] = sph.panel_directions(dets[int(bk)], rows=pr[m], cols=pc[m], ki=ki)
+    if Rg is not None:
+        R_peak = Rg if Rg.shape[0] == len(pr) else Rg[img]
+        d_sample = np.einsum("nji,nj->ni", R_peak, d_lab)
+    else:
+        d_sample = d_lab
+
+    a, b, c_, al, be, ga = cell
+    B, _ = cartesian_matrix_metric_tensor(a, b, c_, *np.deg2rad([al, be, ga]))
+    h_, k_, l_ = generate_reflections(a, b, c_, al, be, ga, space_group=sg, d_min=d_min)
+    G = np.stack([h_, k_, l_], axis=1) @ B.T
+    dirs = G / np.linalg.norm(G, axis=1, keepdims=True)
+    key = np.round(dirs * np.where(dirs[:, [0]] < -1e-9, -1, 1), 5)
+    _, idx = np.unique(key, axis=0, return_index=True)
+    dirs = dirs[idx]
+    print(
+        f"spherical-index: {len(pr)} peaks on {len(np.unique(bank))} banks, "
+        f"{len(dirs)} model directions at d_min={d_min:g}"
+    )
+
+    results = sph.find_orientations(
+        d_sample, model_dirs=dirs, kernel_deg=kernel_deg, n_candidates=n_candidates, lam=lam
+    )
+    if not results:
+        raise RuntimeError("no orientation candidate found")
+    best = results[0]
+    U = best["R"]
+    B_out = B
+    if refine:
+        sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
+        L = int(min(max(np.ceil(3.0 / sigma), 16), 96))
+        f = sph.project_points(d_sample, None, L, sigma)
+        hkl_all = np.stack([h_, k_, l_], axis=1)
+        U, B_out, _ = sph.refine_matching_free(
+            f, U, hkl_all, B, kernel_deg=kernel_deg, refine_cell=refine_cell
+        )
+    for r in results:
+        print(
+            f"  candidate: z={r['z']:.1f}  matched={r['n_matched']}  "
+            f"c={r.get('c', float('nan')):.3f}  coherence={r.get('coherence', 0.0):.3f}"
+        )
+
+    with h5py.File(output_filename, "w") as out:
+        out["sample/U"] = np.asarray(U, dtype=np.float64)
+        out["sample/B"] = np.asarray(B_out, dtype=np.float64)
+        for kname, val in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            out[f"sample/{kname}"] = val
+        out["sample/space_group"] = sg
+        out["beam/ki_vec"] = ki
+        if wl is not None:
+            out["instrument/wavelength"] = wl
+        out["bank"] = bank
+        out["peaks/pixel_r"] = pr
+        out["peaks/pixel_c"] = pc
+        if img is not None:
+            out["peaks/image_index"] = img
+        if run is not None:
+            out["peaks/run_index"] = run
+        if Rg is not None:
+            out["goniometer/R"] = Rg
+        out["spherical/U_candidates"] = np.stack([r["R"] for r in results])
+        out["spherical/z"] = np.array([r["z"] for r in results])
+        out["spherical/n_matched"] = np.array([r["n_matched"] for r in results])
+        out["spherical/c"] = np.array([r.get("c", np.nan) for r in results])
+        out["spherical/coherence"] = np.array([r.get("coherence", 0.0) for r in results])
+        out.attrs["instrument"] = str(instrument)
+    print(f"wrote {output_filename} (bootstrap-compatible: indexer --bootstrap)")
+    return output_filename
+
+
+def run_indexer_visualize(
+    peaks_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    max_index: int = 1,
+    dpi: int = 150,
+    image_index: int | None = None,
+):
+    """Draw low-index Laue zone conics over the measured peaks, per run.
+
+    Takes an indexer output (or spherical-index output): needs sample/U,
+    sample/B, the peaks, and the goniometer rotations.  One figure per run
+    (its first frame's goniometer setting; --image-index overrides), named
+    '<peaks>-zones-run<r>.png' in --output-dir (default: alongside the
+    peaks file).  See subhkl.viz.zones for what is drawn and why the
+    wavelength band deliberately is not used to clip the curves.
+    """
+    import os
+
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz import zones
+
+    with h5py.File(peaks_filename, "r") as fp:
+        bank = fp["bank"][()]
+        pr = fp["peaks/pixel_r"][()]
+        pc = fp["peaks/pixel_c"][()]
+        img = fp["peaks/image_index"][()] if "peaks/image_index" in fp else np.zeros(len(pr), int)
+        run = fp["peaks/run_index"][()] if "peaks/run_index" in fp else np.zeros(len(pr), int)
+        Rg = fp["goniometer/R"][()] if "goniometer/R" in fp else None
+        U = fp["sample/U"][()]
+        B = fp["sample/B"][()]
+        ki = fp["beam/ki_vec"][()] if "beam/ki_vec" in fp else np.array([0.0, 0.0, 1.0])
+        inst = instrument or fp.attrs.get("instrument")
+    if inst is None:
+        raise ValueError("no instrument in the peaks file; pass --instrument")
+    dets = {int(k): Detector(v) for k, v in beamlines[str(inst)].items()}
+
+    base = os.path.splitext(os.path.basename(peaks_filename))[0]
+    out_dir = output_dir or os.path.dirname(os.path.abspath(peaks_filename))
+    written = []
+    for r in np.unique(run):
+        # one figure per run, with every peak of the run: the goniometer is
+        # constant within a run (verified on CG4D garnet: zero deviation),
+        # so all its frames share the same zone conics.  --image-index
+        # restricts to one frame for the rare scanning-within-run case.
+        m = run == r
+        if image_index is not None:
+            m = m & (img == int(image_index))
+            if not np.any(m):
+                continue
+        if Rg is None:
+            R_frame = None
+        elif Rg.shape[0] == len(pr):
+            R_frame = Rg[np.argmax(m)]
+        else:
+            R_frame = Rg[int(np.min(img[m]))]
+        mm = m
+        sel_img = int(np.min(img[m]))
+        out_name = os.path.join(out_dir, f"{base}-zones-run{int(r)}.png")
+        zones.plot_zone_overlay(
+            dets,
+            bank[mm],
+            pr[mm],
+            pc[mm],
+            U,
+            B,
+            R_gonio=R_frame,
+            ki=ki,
+            max_index=max_index,
+            out_name=out_name,
+            dpi=dpi,
+            title=f"{base} run {int(r)} frame {sel_img}: zones to index {max_index}",
+        )
+        written.append(out_name)
+        print(f"wrote {out_name}")
     return written
