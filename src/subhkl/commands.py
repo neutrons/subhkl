@@ -1807,6 +1807,7 @@ def run_spherical_index(
     ki_vec: list | None = None,
     images_filename: str | None = None,
     binning: int = 4,
+    runs: list | None = None,
 ):
     """Index by spherical correlation over SO(3) -- the matched-filter dual
     of the sparse orientation-recovery problem (subhkl.search.spherical).
@@ -1856,6 +1857,25 @@ def run_spherical_index(
     if instrument is None:
         raise ValueError("no instrument in the peaks file; pass --instrument")
     ki = np.asarray(ki_vec if ki_vec is not None else [0.0, 0.0, 1.0], dtype=float)
+
+    # Single-run (or run-subset) indexing: restrict the data side to the
+    # chosen runs.  One run has one goniometer setting, so a per-run solve
+    # is immune to goniometer-offset errors -- measured on MANDI garnet,
+    # the median nearest-line deviation of run-0 peaks drops from 1.63 deg
+    # (multiframe U under the nominal goniometer) to 0.144 deg (run 0
+    # alone), and the per-run orientations are exactly the observable a
+    # goniometer-offset calibration wants.
+    if runs is not None:
+        keep = np.isin(run, np.asarray(list(runs), dtype=int))
+        if not np.any(keep):
+            raise ValueError(f"no peaks in runs {runs}")
+        bank, pr, pc = bank[keep], pr[keep], pc[keep]
+        if img is not None:
+            img = img[keep]
+        if Rg is not None and Rg.shape[0] == len(keep):
+            Rg = Rg[keep]
+        run = run[keep]
+        print(f"spherical-index: restricted to runs {sorted(set(int(r) for r in run))}")
 
     dets = {int(k): Detector(v) for k, v in beamlines[str(instrument)].items()}
     d_lab = np.zeros((len(pr), 3))

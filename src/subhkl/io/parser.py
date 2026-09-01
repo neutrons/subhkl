@@ -1313,6 +1313,7 @@ def spherical_index(
     ki_vec: Annotated[str | None, typer.Option("--ki-vec", help="Incident beam vector, e.g. '0,0,1'")] = None,
     images: Annotated[str | None, typer.Option("--images", help="Merged images HDF5: index from RAW COUNTS instead of the found peaks (every pixel votes with its excess counts; the peaks file still supplies instrument, cell and goniometer metadata)")] = None,
     binning: Annotated[int, typer.Option("--binning", help="Pixel binning before the raw-count projection (direction changes across a bin are far below the kernel width; cost drops by binning^2)")] = 4,
+    runs: Annotated[str | None, typer.Option("--runs", help="Comma-separated run indices to index (e.g. '0'): a single run has one goniometer setting, so a per-run solve is immune to goniometer-offset errors, and per-run orientations are the observable an offset calibration wants")] = None,
 ):
     """
     Index by spherical correlation over SO(3) -- global across all panels
@@ -1343,6 +1344,7 @@ def spherical_index(
         ki_vec=[float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None,
         images_filename=images,
         binning=binning,
+        runs=[int(x.strip()) for x in runs.split(",")] if runs else None,
     )
 
 
