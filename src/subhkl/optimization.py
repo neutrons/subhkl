@@ -13,7 +13,10 @@ from jax import lax
 
 from subhkl.core.spacegroup import get_space_group_object
 from subhkl.instrument.detector import scattering_vector_from_angles
-from subhkl.instrument.refinables import apply_detector_modes
+from subhkl.instrument.refinables import (
+    apply_detector_modes,
+    detector_mode_slices,
+)
 from subhkl.utils import devices as device_util
 
 try:
@@ -720,24 +723,10 @@ class VectorizedObjective:
                 "independent_rot": jnp.deg2rad(detector_rot_bound_deg),
             }
 
-            for mode in self.det_modes:
-                if mode in ("radial", "cylindrical", "axial_stretch", "area"):
-                    size = 1
-                elif mode == "global_rot":
-                    size = 3
-                elif mode == "global_rot_axis":
-                    size = 1
-                elif mode == "global_trans":
-                    size = 3
-                elif mode == "independent":
-                    size = self.num_banks * 6
-                else:
-                    raise ValueError(f"Unknown detector refinement mode: {mode}")
-
-                self.det_param_slices[mode] = slice(
-                    self.num_det_params, self.num_det_params + size
-                )
-                self.num_det_params += size
+            # one layout definition for both refinement paths
+            self.det_param_slices, self.num_det_params = detector_mode_slices(
+                self.det_modes, self.num_banks
+            )
 
             self.det_widths = jnp.array(
                 [pw * m for pw, m in zip(detector_params["pw"], detector_params["m"])]

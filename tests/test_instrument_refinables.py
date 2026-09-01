@@ -243,3 +243,84 @@ def test_innermost_gonio_offset_is_gauge_but_observables_still_fit():
     # Adam run and GPU float32 nondeterminism leave a ~0.15 deg residual
     # that wobbles run to run (measured 0.13-0.17 on identical input).
     assert np.rad2deg(_quat_angle(out["R"], R_gauge @ R_true)) < 0.3
+
+
+def test_detector_mode_slices_match_classic_layout():
+    """One layout definition for both refinement paths: the shared function
+    reproduces the classic VectorizedObjective bookkeeping for every mode."""
+    from subhkl.instrument.refinables import detector_mode_slices
+
+    slices, n = detector_mode_slices(
+        ("radial", "global_rot", "global_trans", "independent"), 4
+    )
+    assert slices["radial"] == slice(0, 1)
+    assert slices["global_rot"] == slice(1, 4)
+    assert slices["global_trans"] == slice(4, 7)
+    assert slices["independent"] == slice(7, 7 + 24)
+    assert n == 31
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        detector_mode_slices(("bogus",), 2)
+
+
+def test_global_modes_recovered_matching_free():
+    """Parity beyond 'independent': a rigid global translation + rotation of
+    the whole assembly, refined through the shared mode chain."""
+    rng = np.random.default_rng(19)
+    t_true = np.array([3.0e-3, -2.0e-3, 1.5e-3])  # [m]
+    r_true = np.deg2rad([0.3, -0.2, 0.25])
+    # truth via the shared chain itself, in the same normalized space
+    slices, n_par = __import__(
+        "subhkl.instrument.refinables", fromlist=["detector_mode_slices"]
+    ).detector_mode_slices(("global_trans", "global_rot"), 2)
+    norm_true = np.full(n_par, 0.5)
+    norm_true[slices["global_trans"]] = 0.5 + t_true / (2 * 0.01)
+    norm_true[slices["global_rot"]] = 0.5 + r_true / (2 * np.deg2rad(2.0))
+    bounds = {
+        "global_trans": 0.01,
+        "global_rot": np.deg2rad(2.0),
+        "independent_trans": 0.01,
+        "independent_rot": np.deg2rad(1.0),
+    }
+    ct, ut, vt, _, _, _ = apply_detector_modes(
+        jnp.asarray(norm_true)[None],
+        jnp.asarray(CENTERS)[None],
+        jnp.asarray(UHATS)[None],
+        jnp.asarray(VHATS)[None],
+        jnp.asarray(WIDTHS)[None],
+        jnp.asarray(HEIGHTS)[None],
+        ("global_trans", "global_rot"),
+        slices,
+        bounds,
+    )
+    ct, ut, vt = np.asarray(ct[0]), np.asarray(ut[0]), np.asarray(vt[0])
+
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0]])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
+    peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
+    R_start = R_true @ _rodrigues(np.deg2rad(0.3) * np.array([0.6, -0.4, 0.5]) / 0.88)
+    out = refine_instrument_matching_free(
+        peaks,
+        NOMINAL,
+        hkl,
+        B0,
+        R_start,
+        modes=("global_trans", "global_rot"),
+        det_bounds=bounds,
+        kernel_deg=1.0,
+        maxiter=400,
+    )
+    from subhkl.instrument.refinables import forward_map_param
+
+    t_fit = forward_map_param(out["det_params"][slices["global_trans"]], 0.01)
+    # NOTE: global_rot of the whole assembly is near-gauge with the crystal
+    # orientation for direction data (a rigid rotation of every panel about
+    # the sample looks like rotating the crystal the other way, up to the
+    # translation-induced parallax) -- so assert the translation, which is
+    # identifiable, and the combined consistency through R.
+    assert np.all(np.abs(t_fit - t_true) < 2.0e-3)

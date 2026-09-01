@@ -1313,6 +1313,10 @@ def refine_instrument_matching_free(
     refine_cell=False,
     maxiter=600,
     floor=0.01,
+    cylinder_axis=None,
+    global_rot_axis=None,
+    refine_banks=None,
+    bank_ids_present=None,
 ):
     """Joint matching-free refinement of orientation, cell shape, detector
     panels and goniometer offsets -- one likelihood, no peak assignment.
@@ -1395,13 +1399,39 @@ def refine_instrument_matching_free(
     ki_hat = jnp.asarray(ki_hat / np.linalg.norm(ki_hat))
     s_off = jnp.zeros(3) if sample_offset is None else jnp.asarray(sample_offset)
 
-    if det_bounds is None:
-        det_bounds = {
-            "independent_trans": 0.01,  # [m]
-            "independent_rot": np.deg2rad(1.0),  # [rad]
-        }
-    n_det = n_banks * 6 if "independent" in modes else 0
-    param_slices = {"independent": slice(0, n_banks * 6)}
+    from subhkl.instrument.refinables import detector_mode_slices
+
+    # the full classic mode chain, one layout definition for both paths;
+    # bounds default to the classic path's defaults
+    defaults = {
+        "radial": 0.05,
+        "area": 0.05,
+        "global_rot": np.deg2rad(2.0),
+        "global_rot_axis": np.deg2rad(2.0),
+        "global_trans": 0.01,  # [m]
+        "independent_trans": 0.01,  # [m]
+        "independent_rot": np.deg2rad(1.0),  # [rad]
+    }
+    det_bounds = {**defaults, **(det_bounds or {})}
+    param_slices, n_det = detector_mode_slices(modes, n_banks)
+    if cylinder_axis is not None:
+        cylinder_axis = np.asarray(cylinder_axis, float)
+        cylinder_axis = cylinder_axis / np.linalg.norm(cylinder_axis)
+    if global_rot_axis is not None:
+        global_rot_axis = np.asarray(global_rot_axis, float)
+        global_rot_axis = global_rot_axis / np.linalg.norm(global_rot_axis)
+    # freeze mask: independent parameters of banks outside refine_banks stay
+    # at nominal (0.5); global modes always refine
+    det_free = np.ones(n_det, dtype=bool)
+    if (
+        refine_banks is not None
+        and "independent" in modes
+        and bank_ids_present is not None
+    ):
+        keep = np.isin(np.asarray(bank_ids_present), np.asarray(list(refine_banks)))
+        sl = param_slices["independent"]
+        free6 = np.repeat(keep, 3)
+        det_free[sl] = np.concatenate([free6, free6])
 
     if gonio is not None:
         axes = np.asarray(gonio["axes"], dtype=float)
@@ -1439,6 +1469,11 @@ def refine_instrument_matching_free(
             )
             i += 5
         det_norm = p[i : i + n_det]
+        if not det_free.all():
+            # frozen (out-of-subset) parameters pinned at nominal; skipped
+            # entirely when every parameter is free, so the common path is
+            # bit-identical to the pre-subset behavior
+            det_norm = 0.5 + (det_norm - 0.5) * jnp.asarray(det_free, dtype=jnp.float32)
         i += n_det
         goff = forward_map_param(p[i : i + n_goff], gonio_bound) if n_goff else p[i:i]
         return rotvec, A, det_norm, goff
@@ -1456,6 +1491,8 @@ def refine_instrument_matching_free(
             modes,
             param_slices,
             det_bounds,
+            cylinder_axis=cylinder_axis,
+            global_rot_axis=global_rot_axis,
         )
         xyz = peak_lab_xyz(c, u, v, det_idx, u_off, v_off)[0] - s_off
         kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)

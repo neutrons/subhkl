@@ -2090,8 +2090,16 @@ def run_spherical_index(
     bandwidth: int | None = None,
     refine_instrument: bool = False,
     refine_gonio_axes: list | None = None,
+    detector_modes: list | None = None,
+    refine_detector_banks: list | None = None,
     det_trans_bound: float = 0.005,
     det_rot_bound_deg: float = 0.5,
+    det_radial_bound_frac: float = 0.05,
+    det_area_bound_frac: float = 0.05,
+    det_global_rot_bound_deg: float = 2.0,
+    det_global_trans_bound: float = 0.01,
+    det_global_rot_axis: list | None = None,
+    cylinder_axis: list | None = None,
     gonio_bound_deg: float = 5.0,
     refine_maxiter: int = 400,
     refine_max_points: int = 100_000,
@@ -2496,43 +2504,78 @@ def run_spherical_index(
                     "refine_mask": np.zeros(len(g_axes), bool),
                     "bound_deg": gonio_bound_deg,
                 }
+        modes_r = tuple(detector_modes) if detector_modes else ("independent",)
         out_ref = sph.refine_instrument_matching_free(
             peaks_in,
             nominal_r,
             np.stack([h_, k_, l_], axis=1),
             B,
             U,
+            modes=modes_r,
             det_bounds={
                 "independent_trans": det_trans_bound,
                 "independent_rot": np.deg2rad(det_rot_bound_deg),
+                "radial": det_radial_bound_frac,
+                "area": det_area_bound_frac,
+                "global_rot": np.deg2rad(det_global_rot_bound_deg),
+                "global_rot_axis": np.deg2rad(det_global_rot_bound_deg),
+                "global_trans": det_global_trans_bound,
             },
             gonio=gonio_in,
             weights=w_r,
             kernel_deg=kernel_deg,
             refine_cell=refine_cell,
             maxiter=refine_maxiter,
+            cylinder_axis=cylinder_axis,
+            global_rot_axis=det_global_rot_axis,
+            refine_banks=refine_detector_banks,
+            bank_ids_present=banks_r,
         )
         U, B_out = out_ref["R"], out_ref["B"]
+        from subhkl.instrument.refinables import detector_mode_slices
         from subhkl.instrument.refinables import forward_map_param as _fmp
 
         nb_ = len(banks_r)
         dp = out_ref["det_params"]
-        det_report = {
-            "banks": banks_r,
-            "trans_m": _fmp(dp[: nb_ * 3].reshape(nb_, 3), det_trans_bound),
-            "rot_rad": _fmp(
-                dp[nb_ * 3 :].reshape(nb_, 3), np.deg2rad(det_rot_bound_deg)
-            ),
-            "det_params": dp,
+        slices_r, _ = detector_mode_slices(modes_r, nb_)
+        det_report = {"banks": banks_r, "det_params": dp, "modes": list(modes_r)}
+        msg = [
+            f"  instrument refinement ({','.join(modes_r)}): "
+            f"loglik {out_ref['loglik']:.3f}"
+        ]
+        if "independent" in slices_r:
+            ip = dp[slices_r["independent"]]
+            det_report["trans_m"] = _fmp(ip[: nb_ * 3].reshape(nb_, 3), det_trans_bound)
+            det_report["rot_rad"] = _fmp(
+                ip[nb_ * 3 :].reshape(nb_, 3), np.deg2rad(det_rot_bound_deg)
+            )
+            worst = np.abs(det_report["trans_m"]).max(axis=1)
+            wb = banks_r[int(np.argmax(worst))]
+            msg.append(
+                f"largest bank translation {1e3 * worst.max():.2f} mm (bank {wb}), "
+                f"largest tilt {np.rad2deg(np.abs(det_report['rot_rad']).max()):.3f} deg"
+            )
+        mode_bounds = {
+            "radial": det_radial_bound_frac,
+            "cylindrical": det_radial_bound_frac,
+            "axial_stretch": det_radial_bound_frac,
+            "area": det_area_bound_frac,
+            "global_rot": np.deg2rad(det_global_rot_bound_deg),
+            "global_rot_axis": np.deg2rad(det_global_rot_bound_deg),
+            "global_trans": det_global_trans_bound,
         }
-        worst = np.abs(det_report["trans_m"]).max(axis=1)
-        wb = banks_r[int(np.argmax(worst))]
-        print(
-            f"  instrument refinement: loglik {out_ref['loglik']:.3f}; "
-            f"largest bank translation {1e3 * worst.max():.2f} mm (bank {wb}), "
-            f"largest tilt "
-            f"{np.rad2deg(np.abs(det_report['rot_rad']).max()):.3f} deg"
-        )
+        for mode_ in modes_r:
+            if mode_ == "independent":
+                continue
+            vals = _fmp(dp[slices_r[mode_]], mode_bounds[mode_])
+            det_report[mode_] = vals
+            if mode_ in ("global_rot", "global_rot_axis"):
+                msg.append(f"{mode_} {np.round(np.rad2deg(vals), 4)} deg")
+            elif mode_ == "global_trans":
+                msg.append(f"{mode_} {np.round(1e3 * vals, 3)} mm")
+            else:
+                msg.append(f"{mode_} {np.round(vals, 5)}")
+        print("; ".join(msg))
         if "gonio_offsets_deg" in out_ref:
             gonio_offsets_deg = out_ref["gonio_offsets_deg"]
             print(
@@ -2680,8 +2723,21 @@ def run_spherical_index(
                 out[f"goniometer/offsets/{key}"] = float(o_)
         if det_report is not None:
             out["spherical/detector/banks"] = np.array(det_report["banks"])
-            out["spherical/detector/trans_m"] = det_report["trans_m"]
-            out["spherical/detector/rot_rad"] = det_report["rot_rad"]
+            out["spherical/detector/modes"] = np.array(det_report["modes"], dtype="S")
+            out["spherical/detector/det_params"] = det_report["det_params"]
+            for kk in (
+                "trans_m",
+                "rot_rad",
+                "radial",
+                "cylindrical",
+                "axial_stretch",
+                "area",
+                "global_rot",
+                "global_rot_axis",
+                "global_trans",
+            ):
+                if kk in det_report:
+                    out[f"spherical/detector/{kk}"] = det_report[kk]
         for kq, vq in quality.items():
             if kq == "per_run_median_deg":
                 out["spherical/quality/per_run"] = np.array(sorted(vq))

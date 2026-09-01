@@ -77,6 +77,33 @@ def rodrigues_safe_jax(v):
     return jnp.eye(3) + A * K + B * (K @ K)
 
 
+def detector_mode_slices(modes, n_banks):
+    """Parameter layout of the detector mode chain -- one definition for
+    both refinement paths (extracted verbatim from VectorizedObjective, so
+    a --detector-modes string means the same parameters to the peak-list
+    and the spherical refinement alike).
+
+    Returns ({mode: slice}, total_parameter_count)."""
+    slices = {}
+    n = 0
+    for mode in modes:
+        if mode in ("radial", "cylindrical", "axial_stretch", "area"):
+            size = 1
+        elif mode == "global_rot":
+            size = 3
+        elif mode == "global_rot_axis":
+            size = 1
+        elif mode == "global_trans":
+            size = 3
+        elif mode == "independent":
+            size = n_banks * 6
+        else:
+            raise ValueError(f"Unknown detector refinement mode: {mode}")
+        slices[mode] = slice(n, n + size)
+        n += size
+    return slices, n
+
+
 def apply_detector_modes(
     det_params,
     centers,

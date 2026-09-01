@@ -1409,6 +1409,26 @@ def spherical_index(
             "production pipeline's refined omega to 0.08 deg.",
         ),
     ] = False,
+    detector_modes: Annotated[
+        str | None,
+        typer.Option(
+            "--detector-modes",
+            help="Comma-separated detector refinement modes, the same chain "
+            "the classic indexer refines (shared implementation: "
+            "subhkl.instrument.refinables): independent, radial, "
+            "cylindrical, area, axial_stretch, global_rot, global_rot_axis, "
+            "global_trans.  Default: independent.",
+        ),
+    ] = None,
+    refine_detector_banks: Annotated[
+        str | None,
+        typer.Option(
+            "--refine-detector-banks",
+            help="Comma-separated bank IDs whose independent parameters are "
+            "refined; other banks stay at nominal (global modes always "
+            "apply to all banks).",
+        ),
+    ] = None,
     det_trans_bound: Annotated[
         float, typer.Option("--det-trans-bound", help="Bank translation bound [m]")
     ] = 0.005,
@@ -1431,6 +1451,37 @@ def spherical_index(
             help="Raw mode: strongest binned pixels fed to the instrument refinement",
         ),
     ] = 100_000,
+    det_radial_bound_frac: Annotated[
+        float,
+        typer.Option(
+            "--det-radial-bound-frac",
+            help="radial/cylindrical/axial_stretch scale bound [fraction]",
+        ),
+    ] = 0.05,
+    det_area_bound_frac: Annotated[
+        float, typer.Option("--det-area-bound-frac", help="area scale bound [fraction]")
+    ] = 0.05,
+    det_global_rot_bound_deg: Annotated[
+        float,
+        typer.Option("--det-global-rot-bound-deg", help="global rotation bound [deg]"),
+    ] = 2.0,
+    det_global_trans_bound: Annotated[
+        float,
+        typer.Option("--det-global-trans-bound", help="global translation bound [m]"),
+    ] = 0.01,
+    det_global_rot_axis: Annotated[
+        str | None,
+        typer.Option(
+            "--det-global-rot-axis", help="Axis for global_rot_axis mode, e.g. '0,1,0'"
+        ),
+    ] = None,
+    cylinder_axis: Annotated[
+        str | None,
+        typer.Option(
+            "--cylinder-axis",
+            help="Axis for cylindrical/axial_stretch modes, e.g. '0,1,0'",
+        ),
+    ] = None,
 ):
     """
     Index by spherical correlation over SO(3) -- global across all panels
@@ -1475,6 +1526,28 @@ def spherical_index(
         gonio_bound_deg=gonio_bound_deg,
         refine_maxiter=refine_maxiter,
         refine_max_points=refine_max_points,
+        detector_modes=(
+            [x.strip() for x in detector_modes.split(",")] if detector_modes else None
+        ),
+        refine_detector_banks=(
+            [int(x.strip()) for x in refine_detector_banks.split(",")]
+            if refine_detector_banks
+            else None
+        ),
+        det_radial_bound_frac=det_radial_bound_frac,
+        det_area_bound_frac=det_area_bound_frac,
+        det_global_rot_bound_deg=det_global_rot_bound_deg,
+        det_global_trans_bound=det_global_trans_bound,
+        det_global_rot_axis=(
+            [float(x.strip()) for x in det_global_rot_axis.split(",")]
+            if det_global_rot_axis
+            else None
+        ),
+        cylinder_axis=(
+            [float(x.strip()) for x in cylinder_axis.split(",")]
+            if cylinder_axis
+            else None
+        ),
     )
 
 
