@@ -542,3 +542,41 @@ def test_a_clipped_parameter_is_reported_not_hidden():
     assert not [
         e for e in out2["at_bounds"] if e["what"] == "detector independent translation"
     ]
+
+
+def test_chunking_the_overlap_changes_nothing_but_the_memory():
+    """The objective's (data x model) overlap is chunked over the model
+    axis when it would be too large to materialize -- exactly, since the
+    density is a SUM over model directions and a running sum over chunks
+    is the same number.  A 100 A cell puts 65k reflections on the model
+    side at d_min 2.5 (L1 metallo-beta-lactamase), where the half-million
+    weighted pixels of raw mode asked for one 117 GiB allocation and the
+    stress test died in jit_run_adam; chunked, the same problem runs in
+    1 GiB temporaries.  What must not change is the answer."""
+    rng = np.random.default_rng(31)
+    ct, ut, vt = _modes(np.full(12, 0.5))
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0]])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
+    peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
+    n_data = len(peaks["det_idx"])
+
+    common = dict(det_bounds=BOUNDS, kernel_deg=1.0, maxiter=1)
+    whole = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, max_overlap_elems=1 << 30, **common
+    )
+    # a budget of eight model columns per pass: ~65 chunks, padding included
+    chunked = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, max_overlap_elems=n_data * 8, **common
+    )
+    assert abs(whole["loglik"] - chunked["loglik"]) < 1e-5
+    np.testing.assert_allclose(whole["R"], chunked["R"], atol=1e-6)
+    # and the padding rows must not leak in: a chunk size that divides the
+    # model count exactly must agree with one that does not
+    exact = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, max_overlap_elems=n_data * 11, **common
+    )
+    assert abs(whole["loglik"] - exact["loglik"]) < 1e-5

@@ -451,6 +451,17 @@ def _factln(n):
     return gammaln(np.arange(n + 1) + 1.0)
 
 
+#: Largest (data x model) overlap array the matching-free objective will
+#: materialize at once, in elements.  The objective's cost is one such
+#: array; its MEMORY need not be, and a 100 A cell puts 65k reflections on
+#: the model side (L1 metallo-beta-lactamase at d_min 2.5), where 0.5M
+#: weighted pixels would ask for 117 GiB in one allocation.  Chunking the
+#: model axis is exact -- the density is a sum over model directions, so a
+#: running sum over chunks is the same number -- and the chunks are
+#: rematerialized so the backward pass does not undo the saving.
+MAX_OVERLAP_ELEMS = 1 << 28  # ~1.07 GB per float32 temporary
+
+
 def wigner_d_matrix(L, beta):
     """d[l, m + L, n + L] = d^l_{m n}(beta) for all l <= L, float64.
 
@@ -1323,6 +1334,7 @@ def refine_instrument_matching_free(
     sample_bound_m=0.005,
     per_run_trans=False,
     per_run_trans_bound_m=0.005,
+    max_overlap_elems=MAX_OVERLAP_ELEMS,
 ):
     """Joint matching-free refinement of orientation, cell shape, detector
     panels and goniometer offsets -- one likelihood, no peak assignment.
@@ -1491,6 +1503,31 @@ def refine_instrument_matching_free(
 
     hkl_j = np.asarray(hkl, dtype=float)
     w_model = jnp.ones(len(hkl_j))
+    # Chunk plan for the (data x model) overlap -- static, so the jitted
+    # objective has one shape.  Padding rows carry weight 0 and contribute
+    # nothing, which keeps the chunked sum exact rather than approximate.
+    n_model_j = len(hkl_j)
+    if n_peaks * n_model_j <= max_overlap_elems:
+        n_chunks, chunk_m = 1, n_model_j
+        pad_idx = None
+        w_model_pad = w_model
+    else:
+        chunk_m = int(max(1, max_overlap_elems // max(n_peaks, 1)))
+        n_chunks = int(np.ceil(n_model_j / chunk_m))
+        pad_idx = np.concatenate(
+            [np.arange(n_model_j), np.zeros(n_chunks * chunk_m - n_model_j, dtype=int)]
+        )
+        w_model_pad = jnp.asarray(
+            np.concatenate(
+                [np.ones(n_model_j), np.zeros(n_chunks * chunk_m - n_model_j)]
+            )
+        )
+        print(
+            f"    matching-free refinement: {n_peaks} x {n_model_j} overlap "
+            f"chunked into {n_chunks} x ({n_peaks} x {chunk_m}) "
+            f"({n_peaks * n_model_j * 4 / 1024**3:.1f} GiB -> "
+            f"{n_peaks * chunk_m * 4 / 1024**3:.2f} GiB per temporary)"
+        )
     n_cell = 5 if refine_cell else 0
 
     # every parameter normalized to [0, 1] with 0.5 = nominal, the shared
@@ -1616,11 +1653,33 @@ def refine_instrument_matching_free(
         B = (jnp.eye(3) + A) @ jnp.asarray(B0)
         g_vec = hkl_j @ B.T
         dirs = g_vec / jnp.linalg.norm(g_vec, axis=1, keepdims=True)
-        dots = jnp.abs(d_lab @ (dirs @ R.T).T)  # lines: +- are one direction
-        ang2 = 2.0 * (1.0 - jnp.clip(dots, 0.0, 1.0))
-        dens = jnp.sum(
-            w_model[None, :] * jnp.exp(-ang2 / (2.0 * sigma * sigma)), axis=1
-        )
+        if n_chunks == 1:
+            # the small case, untouched: one matmul, bit-identical to
+            # every result measured before chunking existed
+            dots = jnp.abs(d_lab @ (dirs @ R.T).T)  # lines: +- are one direction
+            ang2 = 2.0 * (1.0 - jnp.clip(dots, 0.0, 1.0))
+            dens = jnp.sum(
+                w_model[None, :] * jnp.exp(-ang2 / (2.0 * sigma * sigma)), axis=1
+            )
+        else:
+            dirs_r = (dirs @ R.T)[pad_idx].reshape(n_chunks, chunk_m, 3)
+            w_ch = w_model_pad.reshape(n_chunks, chunk_m)
+
+            @jax.checkpoint
+            def _acc(carry, packed):
+                d_c, w_c = packed
+                dots_c = jnp.abs(d_lab @ d_c.T)
+                ang2_c = 2.0 * (1.0 - jnp.clip(dots_c, 0.0, 1.0))
+                return (
+                    carry
+                    + jnp.sum(
+                        w_c[None, :] * jnp.exp(-ang2_c / (2.0 * sigma * sigma)),
+                        axis=1,
+                    ),
+                    None,
+                )
+
+            dens, _ = jax.lax.scan(_acc, jnp.zeros(n_peaks), (dirs_r, w_ch))
         return -jnp.sum(w_data * jnp.log(dens + floor)) / jnp.sum(w_data)
 
     # Adam with a cosine-decayed step, not a quasi-Newton line search: the
