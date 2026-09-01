@@ -125,12 +125,17 @@ def plot_zone_overlay(
     title=None,
     images=None,
     render_binning=2,
+    zone_alpha=0.5,
 ):
     """One unrolled-detector figure: measured peaks + low-index zone conics.
 
     detectors: {bank: Detector}; peaks as parallel bank/row/col arrays for
     the frame being drawn; U, B the orientation and cell matrices; R_gonio
     the frame's goniometer rotation (identity if None).
+
+    ``zone_alpha`` draws the conics semi-transparent: once a solution is
+    good the curves land ON the spots, and an opaque curve then hides the
+    very agreement it is drawn to show.
 
     With ``images`` ({bank: 2D counts array}), the raw detector data is
     rendered underneath in the same unrolled coordinates (log1p grayscale,
@@ -224,6 +229,7 @@ def plot_zone_overlay(
                 y,
                 s=0.5,
                 color=color,
+                alpha=zone_alpha,
                 zorder=3,
                 label=f"[{z[0]}{z[1]}{z[2]}]" if first else None,
             )
@@ -233,7 +239,9 @@ def plot_zone_overlay(
     ax.set_ylabel("lab y [m]")
     if title:
         ax.set_title(title)
-    ax.legend(loc="upper right", fontsize=7, markerscale=8, ncol=2)
+    leg = ax.legend(loc="upper right", fontsize=7, markerscale=8, ncol=2)
+    for lh in getattr(leg, "legend_handles", getattr(leg, "legendHandles", [])):
+        lh.set_alpha(1.0)
     fig.tight_layout()
     os.makedirs(os.path.dirname(out_name) or ".", exist_ok=True)
     fig.savefig(out_name, dpi=dpi)

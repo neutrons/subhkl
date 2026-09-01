@@ -3276,9 +3276,10 @@ def run_indexer_visualize(
     instrument: str | None = None,
     output_dir: str | None = None,
     max_index: int = 1,
-    dpi: int = 150,
+    dpi: int = 600,
     image_index: int | None = None,
     images_filename: str | None = None,
+    zone_alpha: float = 0.5,
 ):
     """Draw low-index Laue zone conics over the measured peaks, per run.
 
@@ -3376,6 +3377,7 @@ def run_indexer_visualize(
                 instrument=str(inst),
                 dpi=dpi,
                 zone_curves=curves,
+                zone_alpha=zone_alpha,
             )
             written.append(out_name)
             print(f"wrote {out_name}")
@@ -3413,6 +3415,7 @@ def run_indexer_visualize(
             max_index=max_index,
             out_name=out_name,
             dpi=dpi,
+            zone_alpha=zone_alpha,
             title=f"{base} run {int(r)} frame {sel_img}: zones to index {max_index}",
         )
         written.append(out_name)

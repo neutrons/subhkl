@@ -1674,7 +1674,7 @@ def indexer_visualize(
     max_index: Annotated[
         int, typer.Option("--max-index", help="Draw zones [uvw] up to this index")
     ] = 1,
-    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
+    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 600,
     image_index: Annotated[
         int | None,
         typer.Option("--image-index", help="Frame to draw (default: each run's first)"),
@@ -1686,6 +1686,15 @@ def indexer_visualize(
             help="Merged images HDF5: render the raw detector counts underneath the zone conics -- the strongest visual check, no peak finder in the loop",
         ),
     ] = None,
+    zone_alpha: Annotated[
+        float,
+        typer.Option(
+            "--zone-alpha",
+            help="Opacity of the zone conics (0-1).  A good solution puts "
+            "the curves ON the spots, where an opaque curve hides the very "
+            "agreement it is drawn to show.",
+        ),
+    ] = 0.5,
 ):
     """
     Draw the low-index Laue zone conics over the measured peaks.
@@ -1704,6 +1713,7 @@ def indexer_visualize(
         dpi=dpi,
         image_index=image_index,
         images_filename=images,
+        zone_alpha=zone_alpha,
     )
 
 

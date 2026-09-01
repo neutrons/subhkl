@@ -101,7 +101,11 @@ def test_spherical_index_and_zone_overlay(tmp_path):
     assert q_null > 3.0 * q_med
     assert q_frac > 0.8
 
-    written = run_indexer_visualize(out_file, output_dir=str(tmp_path), max_index=1)
+    # dpi kept small on purpose: the product default is 600 (print-grade
+    # overlays), which is a needlessly heavy render for a smoke check
+    written = run_indexer_visualize(
+        out_file, output_dir=str(tmp_path), max_index=1, dpi=150
+    )
     assert len(written) == 1
     assert os.path.exists(written[0])
     assert os.path.getsize(written[0]) > 10_000
@@ -197,7 +201,11 @@ def test_raw_count_indexing_and_image_backed_overlay(tmp_path):
     assert aligned_med < 0.8
 
     written = run_indexer_visualize(
-        out_file, output_dir=str(tmp_path), max_index=1, images_filename=images_file
+        out_file,
+        output_dir=str(tmp_path),
+        max_index=1,
+        images_filename=images_file,
+        dpi=150,
     )
     assert os.path.exists(written[0])
     assert os.path.getsize(written[0]) > 30_000  # images actually rendered

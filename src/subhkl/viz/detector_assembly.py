@@ -80,6 +80,7 @@ def plot_unrolled_detector(
     overlay_alpha=0.45,
     overlay_label="Static mask",
     zone_curves=None,
+    zone_alpha=0.5,
 ):
     fig, ax = plt.subplots(figsize=(16, 6))
 
@@ -302,6 +303,7 @@ def plot_unrolled_detector(
                     v[:, 1],
                     s=0.5,
                     color=zc["color"],
+                    alpha=zone_alpha,
                     zorder=4,
                     label=zc["label"] if first else None,
                 )
@@ -556,13 +558,17 @@ def plot_unrolled_detector(
         labels.append(overlay_label)
     if handles:
         by_label = dict(zip(labels, handles))
-        ax.legend(
+        leg = ax.legend(
             by_label.values(),
             by_label.keys(),
             loc="upper right",
             fontsize=6,
             markerscale=0.5,
         )
+        # the curves are drawn semi-transparent so they do not hide the
+        # spots they land on; the legend keys stay opaque to read
+        for lh in getattr(leg, "legend_handles", getattr(leg, "legendHandles", [])):
+            lh.set_alpha(1.0)
 
     plt.savefig(out_name, dpi=dpi, bbox_inches="tight", pad_inches=0.05)
     plt.close(fig)
