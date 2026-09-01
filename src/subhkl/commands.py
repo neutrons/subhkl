@@ -1784,6 +1784,8 @@ def _spherical_quality(
     n_null=8,
     chunk=20000,
     seed=0,
+    max_points=2_000_000,
+    max_points_null=200_000,
 ):
     """Native quality report of a spherical indexing solution.
 
@@ -1809,22 +1811,49 @@ def _spherical_quality(
     through the nominal goniometer).
     """
     rng = np.random.default_rng(seed)
+    # Raw mode brings tens of millions of weighted pixels, and each of the
+    # 1 + n_null passes is a (points x model-lines) contraction -- minutes
+    # at benchmark scale.  A uniform subsample (weights kept, so every
+    # estimator below stays unbiased) caps that at seconds; peak-mode
+    # inputs are far below the cap and untouched.
+    if len(pts) > int(max_points):
+        idx = rng.choice(len(pts), int(max_points), replace=False)
+        pts = pts[idx]
+        weights = weights[idx]
+        if run_ids is not None:
+            run_ids = run_ids[idx]
     sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
     tol = kernel_deg / 2.0
 
-    def dev_and_loglik(Umat, want_loglik=False):
+    # the null passes only need the floor's median and matched fraction --
+    # a further unbiased subsample makes their 8 full sweeps cheap
+    # (measured: 9 x 11.5 s of elementwise work at the 2M-point cap)
+    if len(pts) > int(max_points_null):
+        nidx = rng.choice(len(pts), int(max_points_null), replace=False)
+        pts_null, w_null = pts[nidx], weights[nidx]
+    else:
+        pts_null, w_null = pts, weights
+    # exp() only where the kernel is alive: contributions beyond 4 sigma
+    # are below e^-8 against the floor, and a compare costs an order less
+    # than an exp
+    cos4 = np.cos(4.0 * sigma)
+
+    def dev_and_loglik(Umat, want_loglik=False, null=False):
+        P, Wt = (pts_null, w_null) if null else (pts, weights)
         Rm = dirs @ Umat.T
-        dev = np.empty(len(pts))
+        dev = np.empty(len(P))
         ll = 0.0
-        for i in range(0, len(pts), chunk):
-            dots = np.abs(pts[i : i + chunk] @ Rm.T)
+        for i in range(0, len(P), chunk):
+            dots = np.abs(P[i : i + chunk] @ Rm.T)
             np.clip(dots, -1.0, 1.0, out=dots)
             dev[i : i + chunk] = np.degrees(np.arccos(dots.max(axis=1)))
             if want_loglik:
-                ang2 = 2.0 * (1.0 - dots)
-                dens = np.exp(-ang2 / (2.0 * sigma * sigma)).sum(axis=1)
-                ll += float(np.sum(weights[i : i + chunk] * np.log(dens + floor)))
-        return dev, ll / max(np.sum(weights), 1e-12)
+                rows, cols = np.nonzero(dots > cos4)
+                ang2 = 2.0 * (1.0 - dots[rows, cols])
+                dens = np.zeros(dots.shape[0])
+                np.add.at(dens, rows, np.exp(-ang2 / (2.0 * sigma * sigma)))
+                ll += float(np.sum(Wt[i : i + chunk] * np.log(dens + floor)))
+        return dev, ll / max(np.sum(Wt), 1e-12)
 
     def wmedian(x, w):
         o = np.argsort(x)
@@ -1842,13 +1871,13 @@ def _spherical_quality(
     null_meds, null_matched = [], []
     for _ in range(n_null):
         Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
-        dv, _ = dev_and_loglik(Q * np.sign(np.linalg.det(Q)))
-        null_meds.append(wmedian(dv, weights))
+        dv, _ = dev_and_loglik(Q * np.sign(np.linalg.det(Q)), null=True)
+        null_meds.append(wmedian(dv, w_null))
         null_matched.append(
-            float(np.sum(weights[dv < tol]) / max(np.sum(weights), 1e-12))
+            float(np.sum(w_null[dv < tol]) / max(np.sum(w_null), 1e-12))
         )
-        F_null += np.cumsum(np.histogram(dv, bins=grid, weights=weights)[0]) / (
-            wsum * n_null
+        F_null += np.cumsum(np.histogram(dv, bins=grid, weights=w_null)[0]) / (
+            max(np.sum(w_null), 1e-12) * n_null
         )
     # Null-subtracted aligned component.  In raw mode most of the weight is
     # diffuse scattering with no Bragg alignment, and the plain median then
@@ -1958,6 +1987,13 @@ def run_spherical_index(
     # upgrade simply misses once and refills.
     try:
         import os
+        import sys
+
+        if "jax" not in sys.modules:
+            # the search loop is CPU-side; do not let the refinement's jax
+            # client reserve 75% of every visible GPU for the whole run
+            # (respects an explicit user setting)
+            os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
         import jax
 
@@ -2066,7 +2102,7 @@ def run_spherical_index(
             else int(min(max(np.ceil(3.0 / sigma_raw), 16), 96))
         )
         bin_dirs = {}
-        f_raw = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
+        per_bank_rows = {}
         raw_pts, raw_w, raw_run = [], [], []
         b2 = int(binning)
         for i_img in range(len(images)):
@@ -2087,14 +2123,34 @@ def run_spherical_index(
                 bin_dirs[bk] = sph.panel_directions(
                     det, rows=RR.ravel(), cols=CC.ravel(), ki=ki
                 )
+            r_ = int(run_of_image[i_img])
+            per_bank_rows.setdefault(bk, []).append((r_, excess))
             d = bin_dirs[bk]
-            Rr = R_run.get(int(run_of_image[i_img]))
-            if Rr is not None:
-                d = d @ Rr  # R^T applied to each row
-            f_raw += _pc(d, excess, L_raw, sigma_raw)
-            raw_pts.append(d)
+            Rr = R_run.get(r_)
+            raw_pts.append(d @ Rr if Rr is not None else d)  # R^T per row
             raw_w.append(np.clip(excess, 0.0, None))
-            raw_run.append(np.full(len(d), int(run_of_image[i_img])))
+            raw_run.append(np.full(len(d), r_))
+
+        # The frame-proportional cost is the associated-Legendre evaluation,
+        # and a bank's binned geometry is FIXED in the lab frame -- so the
+        # projection runs once per bank with every frame batched into one
+        # set of BLAS contractions, and each run's coefficients are rotated
+        # afterwards (rotate_coeffs, O(L^3) per run).  The rotated-points
+        # form this replaces re-evaluated the basis per frame
+        # (O(L^2 n_bins) each): measured ~1.5 s/frame at benchmark scale,
+        # half an hour of projection for cg4d-garnet's 1114 frames.  The
+        # equivalence rests on the coefficient-rotation identity the
+        # convention tests pin at 1e-12.
+        f_lab_run = {}
+        for bk, rows in per_bank_rows.items():
+            W = np.stack([e for _, e in rows])
+            F = _pc(bin_dirs[bk], W, L_raw, sigma_raw)
+            for (r_, _), Fi in zip(rows, F):
+                f_lab_run[r_] = f_lab_run.get(r_, 0.0) + Fi
+        f_raw = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
+        for r_, fl in f_lab_run.items():
+            Rr = R_run.get(r_)
+            f_raw += sph.rotate_coeffs(fl, Rr.T) if Rr is not None else fl
         print(
             f"spherical-index: raw-count mode, {len(images)} frames binned "
             f"{b2}x{b2} -> f at L={L_raw}"

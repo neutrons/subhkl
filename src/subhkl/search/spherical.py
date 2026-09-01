@@ -258,7 +258,7 @@ def project_points(dirs, weights, L, sigma, even_only=True):
 
 
 def project_counts(pixel_dirs, excess, L, sigma, even_only=True, chunk=8192):
-    """SH coefficients of a raw count map -- no peak finding required.
+    """SH coefficients of raw count maps -- no peak finding required.
 
     The data function is the *excess count* density on the sphere: each
     detector pixel contributes its lab direction (detector.pixel_to_lab,
@@ -281,30 +281,42 @@ def project_counts(pixel_dirs, excess, L, sigma, even_only=True, chunk=8192):
     use is bootstrap: orientation first, then the predicted directions hand
     the image-domain finder a positional prior.
 
-    Chunked direct sum; memory is O(L^2 chunk) and cost O(L^2 N_pixels)
-    (~seconds for 10^5 pixels at L = 64 in numpy -- this loop is the
-    module's first candidate for a jax port, being one fixed-geometry
-    matvec per frame once the basis is cached).  Negative weights are fine.
+    ``excess`` may be 1D (N,) -> coefficients (L+1, 2L+1), or 2D
+    (n_frames, N) -> (n_frames, L+1, 2L+1): every frame sharing the same
+    pixel directions is projected in ONE pass, so the associated-Legendre
+    evaluation -- the dominant, memory-bound cost -- is paid per detector
+    bank instead of per frame.  That is the point: a bank's binned
+    geometry is fixed in the lab frame, so project all its frames here and
+    rotate the *coefficients* per run (rotate_coeffs, O(L^3)) instead of
+    rotating directions and re-evaluating the basis per frame
+    (O(L^2 N) each).  Measured at benchmark scale (cg4d-garnet, 1114
+    frames) the per-frame form was ~1.5 s/frame -- half an hour of
+    projection; the batched form is a few large BLAS contractions.
+    Negative weights are fine.
     """
     d = np.asarray(pixel_dirs, dtype=float)
     w = np.asarray(excess, dtype=float)
-    f = np.zeros((L + 1, 2 * L + 1), dtype=complex)
+    one_d = w.ndim == 1
+    W = w[None, :] if one_d else w
+    nf = W.shape[0]
+    f = np.zeros((nf, L + 1, 2 * L + 1), dtype=complex)
     for start in range(0, len(d), int(chunk)):
         dd = d[start : start + int(chunk)]
-        ww = w[start : start + int(chunk)]
+        Wc = W[:, start : start + int(chunk)]
         ct = np.clip(dd[:, 2], -1.0, 1.0)
         phi = np.arctan2(dd[:, 1], dd[:, 0])
         P = _legendre_norm(L, ct)  # [l, m>=0, j]
-        E = np.exp(-1j * np.outer(np.arange(L + 1), phi))  # [m, j]
-        # f_lm = sum_j w_j Pbar_lm e^{-i m phi_j}; negative m by symmetry
-        block = np.einsum("lmj,mj,j->lm", P, E, ww)
-        f[:, L:] += block
-    m = np.arange(1, L + 1)
-    f[:, L - m] = (-1.0) ** m * np.conj(f[:, L + m])
-    f *= _smoothing(L, sigma)[:, None]
+        # f[fr, l, m] = sum_j W[fr, j] Pbar_lm(j) e^{-i m phi_j}: one GEMM
+        # per order m, each (n_frames x chunk) @ (chunk x (L+1-m))
+        for m in range(L + 1):
+            WE = Wc * np.exp(-1j * m * phi)[None, :]
+            f[:, m:, L + m] += WE @ P[m:, m].T
+    mneg = np.arange(1, L + 1)
+    f[:, :, L - mneg] = (-1.0) ** mneg * np.conj(f[:, :, L + mneg])
+    f *= _smoothing(L, sigma)[None, :, None]
     if even_only:
-        f[1::2] = 0.0
-    return f
+        f[:, 1::2] = 0.0
+    return f[0] if one_d else f
 
 
 def _legendre_p0(L):
@@ -565,28 +577,11 @@ def _wigner_case_tables(L):
     return mx, a, b, pref
 
 
-def _correlogram_kernel_jax(f, g, betas, Ea):
-    """The fused correlogram: coupling accumulated inside the recursion, no
-    Wigner tensor ever materialized.
-
-    Numerical form matters here: the Jacobi factorization d = pref * ang *
-    P_k balances a prefactor that reaches ~1e28 at L = 96 against an
-    equally extreme angular factor and polynomial -- fine in float64,
-    overflow at L ~ 40 in float32.  The kernel therefore recurs directly on
-    the BOUNDED quantity D_k = pref_k ang P_k (the d-matrix entries
-    themselves, |d| <= 1): ang cancels from the linear recursion because it
-    is k-independent, and pref enters only through the polynomially bounded
-    ratios rho = pref_k / pref_{k-1}, precomputed in float64 and cast.
-    Everything the kernel touches is O(1).
-    """
-    import jax
-    import jax.numpy as jnp
-    from jax import lax
-
+def _coupling_prep(f, g):
+    """Numpy prep shared by the fused kernels: coupling and prefactor
+    ratios in recursion-depth order (see _correlogram_kernel_jax)."""
     L = f.shape[0] - 1
     mx, a, b, pref = _wigner_case_tables(L)
-    # coupling gathered into recursion-depth order: step k of the recursion
-    # computes degree l = k + mx(m, n) for every (m, n) at once
     coef = np.conj(f)[:, :, None] * g[:, None, :]
     l_idx = np.minimum(np.arange(L + 1)[:, None, None] + mx[None], L)
     in_band = (np.arange(L + 1)[:, None, None] + mx[None]) <= L
@@ -597,30 +592,65 @@ def _correlogram_kernel_jax(f, g, betas, Ea):
         rho2 = np.where(prefK != 0.0, prefK / np.roll(prefK, 2, axis=0), 0.0)
     rho1[~np.isfinite(rho1)] = 0.0
     rho2[~np.isfinite(rho2)] = 0.0
+    return a, b, coefK, prefK, rho1, rho2
 
+
+def _S_terms(a, b, prefK, betas):
+    """float64 numpy inputs of the D-recursion for the given betas:
+    x = cos(beta) and the O(1) starting rows D0, D1 (see the kernel)."""
     sh, ch = np.sin(betas / 2.0), np.cos(betas / 2.0)
     with np.errstate(divide="ignore"):
         ang = np.exp(
             np.log(np.maximum(sh, 1e-300))[None, None, :] * a[..., None]
             + np.log(np.maximum(ch, 1e-300))[None, None, :] * b[..., None]
-        )  # float64: exact where float32 would over/underflow
+        )
     x64 = np.cos(betas)
-    D0 = prefK[0][..., None] * ang  # = d at k = 0 (P_0 = 1), O(1)
+    D0 = prefK[0][..., None] * ang
     P1_64 = 0.5 * (a - b)[..., None] + (1.0 + 0.5 * (a + b))[..., None] * x64
     D1 = prefK[1][..., None] * ang * P1_64
+    return x64, D0, D1
 
-    af = jnp.asarray(a, dtype=jnp.float32)[..., None]
-    bf = jnp.asarray(b, dtype=jnp.float32)[..., None]
-    coefK_j = jnp.asarray(coefK, dtype=jnp.complex64)
-    rho1_j = jnp.asarray(rho1, dtype=jnp.float32)
-    rho2_j = jnp.asarray(rho2, dtype=jnp.float32)
-    x = jnp.asarray(x64, dtype=jnp.float32)[None, None, :]
-    D0_j = jnp.asarray(D0, dtype=jnp.float32)
-    D1_j = jnp.asarray(D1, dtype=jnp.float32)
-    Ea_j = jnp.asarray(Ea, dtype=jnp.complex64)
+
+def _S_kernel_jax(coefK, rho1, rho2, a, b, x64, D0, D1):
+    """S[m, n, beta] = sum_l conj(f)_lm d^l_mn(beta) g_ln, fused.
+
+    Recurs on the bounded D_k = pref_k ang P_k (|d| <= 1): ang cancels
+    from the linear recursion, pref enters via polynomially bounded
+    ratios.  Everything float32/complex64 and O(1); no Wigner tensor is
+    ever materialized.  One compile per (L, n_beta) shape.
+    """
+    import jax.numpy as jnp
+
+    kernel = _get_S_kernel()
+    return kernel(
+        jnp.asarray(coefK, dtype=jnp.complex64),
+        jnp.asarray(rho1, dtype=jnp.float32),
+        jnp.asarray(rho2, dtype=jnp.float32),
+        jnp.asarray(a, dtype=jnp.float32)[..., None],
+        jnp.asarray(b, dtype=jnp.float32)[..., None],
+        jnp.asarray(x64, dtype=jnp.float32)[None, None, :],
+        jnp.asarray(D0, dtype=jnp.float32),
+        jnp.asarray(D1, dtype=jnp.float32),
+    )
+
+
+_S_KERNEL = None
+
+
+def _get_S_kernel():
+    """The jitted recursion, created ONCE at module scope.  A jit closure
+    built inside the calling function is a fresh cache key every call --
+    measured as a full recompile per Nelder-Mead evaluation, slower than
+    the numpy path it replaced."""
+    global _S_KERNEL
+    if _S_KERNEL is not None:
+        return _S_KERNEL
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
 
     @jax.jit
-    def kernel(coefK_j, rho1_j, rho2_j, af, bf, x, D0_j, D1_j, Ea_j):
+    def kernel(coefK_j, rho1_j, rho2_j, af, bf, x, D0_j, D1_j):
         S = coefK_j[0][..., None] * D0_j.astype(jnp.complex64) + coefK_j[1][
             ..., None
         ] * D1_j.astype(jnp.complex64)
@@ -639,9 +669,45 @@ def _correlogram_kernel_jax(f, g, betas, Ea):
             return (Dm1, Dk, S)
 
         _, _, S = lax.fori_loop(2, coefK_j.shape[0], body, (D0_j, D1_j, S))
-        return jnp.real(jnp.einsum("ma,mnb,nc->abc", Ea_j, S, Ea_j))
+        return S
 
-    return kernel(coefK_j, rho1_j, rho2_j, af, bf, x, D0_j, D1_j, Ea_j)
+    _S_KERNEL = kernel
+    return kernel
+
+
+def _correlogram_kernel_jax(f, g, betas, Ea):
+    """The fused correlogram over the full Euler grid (see _S_kernel_jax
+    for the numerics)."""
+    import jax.numpy as jnp
+
+    a, b, coefK, prefK, rho1, rho2 = _coupling_prep(f, g)
+    x64, D0, D1 = _S_terms(a, b, prefK, betas)
+    S = _S_kernel_jax(coefK, rho1, rho2, a, b, x64, D0, D1)
+    Ea_j = jnp.asarray(Ea, dtype=jnp.complex64)
+    return jnp.real(jnp.einsum("ma,mnb,nc->abc", Ea_j, S, Ea_j))
+
+
+def _so3_inner_fast_factory(f, g):
+    """Closure evaluating C(R) = <f, Lambda(R) g> through the fused jax
+    kernel -- for optimizers that evaluate hundreds of single rotations
+    (refine_local's Nelder-Mead spent 48 s in scalar numpy Wigner builds
+    per raw-mode run; this makes each evaluation a milliseconds-scale
+    nb = 1 kernel call with the coupling prepared once)."""
+    import jax.numpy as jnp
+
+    L = f.shape[0] - 1
+    a, b, coefK, prefK, rho1, rho2 = _coupling_prep(f, g)
+    m = np.arange(-L, L + 1)
+
+    def inner(R):
+        alpha, beta, gamma = euler_zyz(R)
+        x64, D0, D1 = _S_terms(a, b, prefK, np.array([beta]))
+        S = _S_kernel_jax(coefK, rho1, rho2, a, b, x64, D0, D1)
+        ea = jnp.asarray(np.exp(-1j * m * alpha), dtype=jnp.complex64)
+        eg = jnp.asarray(np.exp(-1j * m * gamma), dtype=jnp.complex64)
+        return float(jnp.real(jnp.einsum("m,mnb,n->", ea, S, eg)))
+
+    return inner
 
 
 # ---------------------------------------------------------------------------
@@ -734,8 +800,10 @@ def refine_local(f, g, R, span_deg=3.0):
     width / sqrt(matches), not the Wahba floor."""
     from scipy.optimize import minimize
 
+    inner = _so3_inner_fast_factory(f, g)
+
     def neg(v):
-        return -so3_inner(f, g, _rodrigues(v) @ R)
+        return -inner(_rodrigues(v) @ R)
 
     res = minimize(
         neg,
