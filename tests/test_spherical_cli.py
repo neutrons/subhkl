@@ -406,6 +406,42 @@ def test_refined_instrument_reaches_the_consumers_layout(tmp_path):
     assert np.allclose(ang[:, 1] - ang_nom[:, 1], delta[f2r], atol=1e-9)
     assert np.allclose(delta[: len(per_run)], per_run, atol=1e-9)
 
+    # Without a frame table the same run-addressed keys must still be
+    # complete: the predictor requires frame_to_run as soon as trans_m
+    # exists (KeyError on the first native run), and the MTZ exporter
+    # reads the classic delta_deg -- neither may depend on a merged stack
+    # being at hand.
+    out_nt = str(tmp_path / "spherical_no_table.h5")
+    run_spherical_index(
+        peaks_file,
+        out_nt,
+        d_min=1.3,
+        kernel_deg=1.0,
+        refine_instrument=True,
+        detector_modes=["global_trans"],
+        refine_gonio_axes=["outer_z"],
+        refine_gonio_per_run="phi",
+        refine_gonio_per_run_trans=True,
+        refine_maxiter=150,
+    )
+    with h5py.File(out_nt) as fp:
+        g = fp["goniometer/per_run"]
+        assert "frame_to_run" in g and "delta_deg" in g and "trans_m" in g
+        f2r = g["frame_to_run"][()]
+        delta1 = g["delta_deg"][()]
+        trans1 = g["trans_m"][()]
+        per_run1 = fp["spherical/gonio/per_run_deg"][()]
+    # frame -> run is a real map over the frames the peaks witness, and
+    # every per-run array is indexed by RUN ID (what the consumers use),
+    # long enough for the largest run id present
+    n_frames_seen = int(np.max(np.concatenate(recs["img"]))) + 1
+    assert len(f2r) == n_frames_seen
+    for r in range(len(run_angles)):
+        assert f2r[r * frames_per_run] == r
+    n_runs = int(np.max(np.concatenate(recs["run"]))) + 1
+    assert len(delta1) == n_runs and trans1.shape == (n_runs, 3)
+    assert np.allclose(delta1, per_run1, atol=1e-9)
+
     # and the panels are consumable by the very function downstream calls
     nominal_centers = {b: np.array(dets[b].center) for b in centers}
     apply_detector_calibration(out_file, "CG4D")

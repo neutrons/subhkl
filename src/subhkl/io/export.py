@@ -271,8 +271,16 @@ class MTZExporter:
             if corrections_file is not None:
                 with h5py.File(corrections_file) as fc:
                     g = fc.get("goniometer/per_run")
+                    # Either correction can be present alone (an angle-only
+                    # or a translation-only refinement), so size the run
+                    # axis off whichever exists -- reading delta_deg to get
+                    # n_runs BEFORE testing for it made its own guard dead
+                    # code and raised KeyError on a translation-only file.
+                    sizer = None
                     if g is not None:
-                        n_runs = len(g["delta_deg"])
+                        sizer = g["delta_deg"] if "delta_deg" in g else g.get("trans_m")
+                    if sizer is not None:
+                        n_runs = len(sizer)
                         run_c = np.clip(run_raw, 0, n_runs - 1)
                         if "delta_deg" in g:
                             self.extra["DPHI"] = (

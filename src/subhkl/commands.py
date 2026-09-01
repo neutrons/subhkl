@@ -1215,12 +1215,21 @@ def run_peak_predictor(
         per_run_trans = None
         frame_to_run = None
         if "goniometer/per_run/trans_m" in f_idx:
-            per_run_trans = f_idx["goniometer/per_run/trans_m"][()]
-            frame_to_run = f_idx["goniometer/per_run/frame_to_run"][()]
-            print(
-                "Applying per-run sample displacements from indexer "
-                f"({len(per_run_trans)} runs)."
-            )
+            if "goniometer/per_run/frame_to_run" in f_idx:
+                per_run_trans = f_idx["goniometer/per_run/trans_m"][()]
+                frame_to_run = f_idx["goniometer/per_run/frame_to_run"][()]
+                print(
+                    "Applying per-run sample displacements from indexer "
+                    f"({len(per_run_trans)} runs)."
+                )
+            else:
+                # a displacement per run is meaningless without the frame
+                # -> run map; say so and predict without it rather than
+                # dying on a KeyError deep in the setup
+                print(
+                    "WARNING: goniometer/per_run/trans_m without "
+                    "frame_to_run; per-run sample displacements not applied."
+                )
         harmonic_rot = None
         if "goniometer/harmonics" in f_idx:
             # The Fourier rocking steers q in the lab frame; its axes are
@@ -3114,51 +3123,85 @@ def run_spherical_index(
             n_peaks=len(pr),
         )
         if per_run_delta is not None or per_run_trans_out is not None:
-            grp = out.create_group("goniometer/per_run")
-            grp["runs"] = np.asarray(run_list, dtype=np.int32)
-            if ref_geom is not None and ref_geom.get("per_run_axis") is not None:
-                motor_ = g_names[int(ref_geom["per_run_axis"])]
-                grp["motor"] = str(motor_).split(":")[-1]
-            if per_run_trans_out is not None:
-                grp["trans_m"] = np.asarray(per_run_trans_out, dtype=float)
+            # Every per-run array the consumers read is indexed by RUN ID
+            # -- the predictor and the MTZ exporter both do
+            # per_run[frame_to_run[frame]] -- while the refinement orders
+            # its results by position in the refined run list; with --runs
+            # those differ, so expand here.  The frame map is written
+            # unconditionally: the predictor requires it as soon as
+            # trans_m exists.
+            n_runs_out = int(max(run_list)) + 1
+            frame_to_run = None
             if frame_tab is not None:
                 ang_f, frame_to_run, files_, offs_ = frame_tab
+                n_runs_out = max(n_runs_out, len(offs_))
+            elif img is not None and run is not None:
+                # no frame table: the frame -> run map from the peaks
+                # themselves -- exact for every frame carrying a peak,
+                # with the frames between inheriting the last run seen,
+                # which is what a run being a contiguous block of frames
+                # means.  Only the frames a peak witnesses are covered, so
+                # a trailing peakless tail is absent by construction.
+                n_frames_pk = int(np.max(img)) + 1
+                f2r = np.full(n_frames_pk, -1, dtype=np.int64)
+                f2r[np.asarray(img, dtype=int)] = np.asarray(run, dtype=int)
+                valid = np.where(f2r >= 0)[0]
+                if len(valid):
+                    pos_v = (
+                        np.searchsorted(valid, np.arange(n_frames_pk), side="right") - 1
+                    )
+                    frame_to_run = f2r[valid[np.clip(pos_v, 0, len(valid) - 1)]]
+            motor_col = (
+                int(ref_geom["per_run_axis"])
+                if ref_geom is not None and ref_geom.get("per_run_axis") is not None
+                else None
+            )
+
+            def _by_run_id(vals):
+                out_a = np.zeros((n_runs_out,) + np.asarray(vals).shape[1:])
+                for i_r, r_ in enumerate(run_list):
+                    if 0 <= int(r_) < n_runs_out:
+                        out_a[int(r_)] = np.asarray(vals)[i_r]
+                return out_a
+
+            grp = out.create_group("goniometer/per_run")
+            grp["runs"] = np.asarray(run_list, dtype=np.int32)
+            if motor_col is not None:
+                grp["motor"] = str(g_names[motor_col]).split(":")[-1]
+            if frame_to_run is not None:
                 grp["frame_to_run"] = np.asarray(frame_to_run, dtype=np.int32)
+            if per_run_trans_out is not None:
+                grp["trans_m"] = _by_run_id(per_run_trans_out)
+            delta_full = None
+            if per_run_delta is not None:
+                delta_full = _by_run_id(per_run_delta)
+                # delta_deg is the classic key -- the named motor's per-run
+                # correction, what the MTZ exporter writes as DPHI
+                col = (
+                    motor_col
+                    if motor_col is not None
+                    else int(np.argmax(np.abs(delta_full).max(axis=0)))
+                )
+                grp["delta_deg"] = np.asarray(delta_full[:, col], dtype=float)
+                grp["delta_deg_all_axes"] = delta_full
+            if frame_tab is not None:
                 if files_ is not None:
                     grp["run_files"] = files_
+                    out["files"] = files_
                 grp["run_file_offsets"] = np.asarray(offs_, dtype=np.int64)
                 out["file_offsets"] = np.asarray(offs_, dtype=np.int64)
-                if files_ is not None:
-                    out["files"] = files_
-                if per_run_delta is not None:
-                    delta_full = np.zeros((len(offs_), per_run_delta.shape[1]))
-                    for i_r, r_ in enumerate(run_list):
-                        if 0 <= int(r_) < len(offs_):
-                            delta_full[int(r_)] = per_run_delta[i_r]
-                    grp["delta_deg"] = np.asarray(
-                        delta_full[
-                            :,
-                            (
-                                int(ref_geom["per_run_axis"])
-                                if ref_geom.get("per_run_axis") is not None
-                                else 0
-                            ),
-                        ],
-                        dtype=float,
-                    )
-                    grp["delta_deg_all_axes"] = delta_full
+                if delta_full is not None:
                     out["goniometer/angles_nominal"] = ang_f
                     out["goniometer/angles"] = ang_f + delta_full[frame_to_run]
-            elif per_run_delta is not None:
+            elif delta_full is not None:
                 # no frame table (a peaks file with per-peak angle rows and
                 # no run boundaries): correct in the file's own layout and
                 # say so, rather than writing a frame array nothing can map
-                grp["delta_deg_all_axes"] = np.asarray(per_run_delta, dtype=float)
                 if g_angles is not None and g_angles.shape[0] == len(pr):
-                    pos = {int(r_): i for i, r_ in enumerate(run_list)}
-                    idx = np.array([pos.get(int(r_), 0) for r_ in run])
                     out["goniometer/angles_nominal"] = g_angles
-                    out["goniometer/angles"] = g_angles + per_run_delta[idx]
+                    out["goniometer/angles"] = (
+                        g_angles + delta_full[np.asarray(run, dtype=int)]
+                    )
                 print(
                     "  note: no frame table (goniometer/angles + file_offsets) "
                     "in the inputs -- per-run corrections are recorded and "
