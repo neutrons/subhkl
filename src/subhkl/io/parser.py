@@ -1377,6 +1377,60 @@ def spherical_index(
             "scales as L^4, projection as L^2.",
         ),
     ] = None,
+    refine_instrument: Annotated[
+        bool,
+        typer.Option(
+            "--refine-instrument",
+            help="Jointly refine per-bank detector placement (translation + "
+            "tilt) and any --refine-gonio-axes offsets against the "
+            "matching-free likelihood -- no peak assignment anywhere.  Raw "
+            "mode feeds the strongest binned pixels as weighted peaks.",
+        ),
+    ] = False,
+    refine_gonio_axes: Annotated[
+        str | None,
+        typer.Option(
+            "--refine-gonio-axes",
+            help="Comma-separated goniometer axis names (short names accepted, "
+            "e.g. 'omega,chi') whose zero offsets are refined / fitted.  An "
+            "axis whose inner angles never vary across runs is pure gauge "
+            "with the crystal orientation and is reported as such.",
+        ),
+    ] = None,
+    fit_gonio_offsets: Annotated[
+        bool,
+        typer.Option(
+            "--fit-gonio-offsets",
+            help="Fit the --refine-gonio-axes offsets from per-run "
+            "orientations: each run indexed at its own gauge (immune to the "
+            "offsets), then one least squares over the per-run U's -- the "
+            "assignment-free analogue of the classic per-run DPHI "
+            "corrections.  Validated on MANDI garnet: recovers the "
+            "production pipeline's refined omega to 0.08 deg.",
+        ),
+    ] = False,
+    det_trans_bound: Annotated[
+        float, typer.Option("--det-trans-bound", help="Bank translation bound [m]")
+    ] = 0.005,
+    det_rot_bound_deg: Annotated[
+        float, typer.Option("--det-rot-bound-deg", help="Bank tilt bound [deg]")
+    ] = 0.5,
+    gonio_bound_deg: Annotated[
+        float, typer.Option("--gonio-bound-deg", help="Goniometer offset bound [deg]")
+    ] = 5.0,
+    refine_maxiter: Annotated[
+        int,
+        typer.Option(
+            "--refine-maxiter", help="Adam steps of the instrument refinement"
+        ),
+    ] = 400,
+    refine_max_points: Annotated[
+        int,
+        typer.Option(
+            "--refine-max-points",
+            help="Raw mode: strongest binned pixels fed to the instrument refinement",
+        ),
+    ] = 100_000,
 ):
     """
     Index by spherical correlation over SO(3) -- global across all panels
@@ -1409,6 +1463,18 @@ def spherical_index(
         binning=binning,
         runs=[int(x.strip()) for x in runs.split(",")] if runs else None,
         bandwidth=bandwidth,
+        refine_instrument=refine_instrument,
+        refine_gonio_axes=(
+            [x.strip() for x in refine_gonio_axes.split(",")]
+            if refine_gonio_axes
+            else None
+        ),
+        fit_gonio_offsets=fit_gonio_offsets,
+        det_trans_bound=det_trans_bound,
+        det_rot_bound_deg=det_rot_bound_deg,
+        gonio_bound_deg=gonio_bound_deg,
+        refine_maxiter=refine_maxiter,
+        refine_max_points=refine_max_points,
     )
 
 

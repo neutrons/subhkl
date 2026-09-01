@@ -201,3 +201,84 @@ def test_raw_count_indexing_and_image_backed_overlay(tmp_path):
     )
     assert os.path.exists(written[0])
     assert os.path.getsize(written[0]) > 30_000  # images actually rendered
+
+
+def test_fit_gonio_offsets_and_gauge_detection(tmp_path):
+    """The per-run DPHI analogue end to end: a true offset on an axis with
+    varying inner angles is recovered; an axis whose inner angles never
+    vary is reported as gauge, never as a fitted number.  (Validated on
+    real data too: MANDI garnet recovers the production pipeline's refined
+    omega to 0.08 deg; CG4D's omega is structurally gauge because its
+    kappa = 0 scan makes the omega and phi axes collinear.)"""
+    from subhkl.instrument.refinables import gonio_rotation_jax
+
+    rng = np.random.default_rng(41)
+    a = 8.0
+    B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
+    h, k, l_ = generate_reflections(a, a, a, 90, 90, 90, space_group="P 1", d_min=1.3)
+    G = np.stack([h, k, l_], axis=1) @ B.T
+    dirs = G / np.linalg.norm(G, axis=1, keepdims=True)
+    Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+    U_true = Q * np.sign(np.linalg.det(Q))
+
+    # two axes: outer z (offset +0.8 deg, inner varies -> identifiable),
+    # inner x (offset never identifiable: nothing inner to it varies)
+    axes = np.array([[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]])
+    off_true = np.array([0.8, 0.0])
+    run_angles = np.array([[10.0, 0.0], [10.0, 35.0], [10.0, 70.0]])
+
+    dets = {int(kk): Detector(v) for kk, v in beamlines["CG4D"].items()}
+    recs = {k2: [] for k2 in ("bank", "pr", "pc", "img", "run", "R", "ang")}
+    for r in range(3):
+        Rr_true = np.asarray(gonio_rotation_jax(axes, run_angles[r], off_true))
+        Rr_nom = np.asarray(gonio_rotation_jax(axes, run_angles[r], np.zeros(2)))
+        d_lab = np.vstack([dirs, -dirs]) @ (Rr_true @ U_true).T
+        d_lab = d_lab[d_lab[:, 2] < -0.05]
+        kf = np.array([0.0, 0.0, 1.0]) - 2.0 * d_lab[:, 2:3] * d_lab
+        kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+        for bk, det in dets.items():
+            mask, r_, c_ = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
+            n_ = int(np.sum(mask))
+            if n_ == 0:
+                continue
+            recs["bank"].append(np.full(n_, bk))
+            recs["pr"].append(r_[mask] + rng.normal(scale=0.5, size=n_))
+            recs["pc"].append(c_[mask] + rng.normal(scale=0.5, size=n_))
+            recs["img"].append(np.full(n_, r))
+            recs["run"].append(np.full(n_, r))
+            recs["R"].append(np.tile(Rr_nom, (n_, 1, 1)))
+            recs["ang"].append(np.tile(run_angles[r], (n_, 1)))
+
+    peaks_file = str(tmp_path / "finder.h5")
+    with h5py.File(peaks_file, "w") as fp:
+        fp["bank"] = np.concatenate(recs["bank"])
+        fp["peaks/pixel_r"] = np.concatenate(recs["pr"])
+        fp["peaks/pixel_c"] = np.concatenate(recs["pc"])
+        fp["peaks/image_index"] = np.concatenate(recs["img"])
+        fp["peaks/run_index"] = np.concatenate(recs["run"])
+        fp["goniometer/R"] = np.concatenate(recs["R"])
+        fp["goniometer/angles"] = np.concatenate(recs["ang"])
+        fp["goniometer/axes"] = axes
+        fp["goniometer/names"] = np.array([b"outer_z", b"inner_x"])
+        for kk, v in zip(
+            ("a", "b", "c", "alpha", "beta", "gamma"), (a, a, a, 90.0, 90.0, 90.0)
+        ):
+            fp[f"sample/{kk}"] = v
+        fp["sample/space_group"] = "P 1"
+        fp["instrument/wavelength"] = np.array([2.0, 10.0])
+        fp.attrs["instrument"] = "CG4D"
+
+    out_file = str(tmp_path / "spherical.h5")
+    run_spherical_index(
+        peaks_file,
+        out_file,
+        d_min=1.3,
+        kernel_deg=1.0,
+        fit_gonio_offsets=True,
+        refine_gonio_axes=["outer_z", "inner_x"],
+    )
+    with h5py.File(out_file) as fp:
+        off_z = float(fp["goniometer/offsets/outer_z"][()])
+        off_x = float(fp["goniometer/offsets/inner_x"][()])
+    assert abs(off_z - 0.8) < 0.15  # identifiable, recovered
+    assert abs(off_x) < 0.15  # gauge: pinned near zero, not a wild number

@@ -947,7 +947,7 @@ def null_zscore(C, value, trim=0.01):
     return (value - mu) / max(sd, 1e-12)
 
 
-def nonneg_lasso(f, g, rotations, lam=0.0, n_iter=300):
+def nonneg_lasso(f, g, rotations, lam=0.0, n_iter=300, inner_fg=None, inner_gg=None):
     """Sparse nonnegative coefficients over refined orientation candidates.
 
     Solves min_{c >= 0} 1/2 ||f - sum_r c_r Lambda(R_r) g||^2 + lam sum c
@@ -958,16 +958,20 @@ def nonneg_lasso(f, g, rotations, lam=0.0, n_iter=300):
     the sparse recovery, run on the few survivors rather than all of SO(3).
     Returns c [n_candidates].
     """
+    if inner_fg is None:
+        inner_fg = _so3_inner_fast_factory(f, g)
+    if inner_gg is None:
+        inner_gg = _so3_inner_fast_factory(g, g)
     n = len(rotations)
     G = np.empty((n, n))
     b = np.empty(n)
     for r, Rr in enumerate(rotations):
-        b[r] = so3_inner(f, g, Rr)
+        b[r] = inner_fg(Rr)
         for s_, Rs in enumerate(rotations):
             if s_ < r:
                 G[r, s_] = G[s_, r]
             else:
-                G[r, s_] = so3_inner(g, g, Rr.T @ Rs)
+                G[r, s_] = inner_gg(Rr.T @ Rs)
     step = 1.0 / (np.linalg.norm(G, 2) + 1e-12)
     c = np.zeros(n)
     for _ in range(n_iter):
@@ -1017,15 +1021,20 @@ def find_orientations(
     cands = top_orientations(C, al, be, ga, n=n_candidates, min_sep_deg=min_sep_deg)
     out = []
     rotations = []
-    gnorm = np.sqrt(so3_inner(g, g, np.eye(3)))
+    # single-rotation inners through the fused jax kernel: the numpy path
+    # rebuilds a scalar Wigner stack per call (~0.35 s at L = 96), and a
+    # per-run offsets fit makes hundreds of these
+    inner_fg = _so3_inner_fast_factory(f, g)
+    inner_gg = _so3_inner_fast_factory(g, g)
+    gnorm = np.sqrt(inner_gg(np.eye(3)))
     for R, val in cands:
         n_matched = 0
         if refine and model_dirs is not None:
             R, n_matched = refine_wahba(R, data_dirs, model_dirs)
-            val = so3_inner(f, g, R)
+            val = inner_fg(R)
         elif refine:
             R = refine_local(f, g, R)
-            val = so3_inner(f, g, R)
+            val = inner_fg(R)
         # Mutual coherence against the candidates already kept: two rotations
         # equivalent under the lattice's own point group carry the *same*
         # rotated model (Lambda_S g = g for a symmetry S), coherence 1, and
@@ -1035,7 +1044,7 @@ def find_orientations(
         # orthogonal here -- that near-diagonal Gram over the zero-overlap
         # region is what makes the recovery well posed.
         mu = max(
-            (abs(so3_inner(g, g, R.T @ R2)) / gnorm**2 for R2 in rotations),
+            (abs(inner_gg(R.T @ R2)) / gnorm**2 for R2 in rotations),
             default=0.0,
         )
         if mu > 0.99:
@@ -1051,7 +1060,7 @@ def find_orientations(
         )
         rotations.append(R)
     if rotations:
-        c = nonneg_lasso(f, g, rotations, lam=lam)
+        c = nonneg_lasso(f, g, rotations, lam=lam, inner_fg=inner_fg, inner_gg=inner_gg)
         for rec, cr in zip(out, c):
             rec["c"] = float(cr)
     out.sort(key=lambda r: r["score"], reverse=True)
@@ -1473,30 +1482,55 @@ def refine_instrument_matching_free(
         )
         return -jnp.sum(w_data * jnp.log(dens + floor)) / jnp.sum(w_data)
 
-    val_grad = jax.jit(jax.value_and_grad(neg_loglik))
-
     # Adam with a cosine-decayed step, not a quasi-Newton line search: the
     # objective is float32 (about seven digits), and line searches read
     # that noise floor as convergence long before the minimum.  Bounds by
     # projection; all parameters live in [0, 1] so one rate serves all.
-    x = jnp.full(3 + n_cell + n_det + n_goff, 0.5, dtype=jnp.float32)
-    m = jnp.zeros_like(x)
-    v2 = jnp.zeros_like(x)
+    # The WHOLE loop runs on the device as one lax.scan: the python-loop
+    # form synced the loss to the host every step (maxiter round trips) --
+    # the same latency pattern measured and removed from refine_local.
+    from jax import lax
+
+    n_par = 3 + n_cell + n_det + n_goff
     lr0, beta1, beta2, eps = 0.03, 0.9, 0.999, 1e-8
-    best_x, best_v = x, np.inf
-    for t in range(1, int(maxiter) + 1):
-        val, g = val_grad(x)
-        if float(val) < best_v:
-            best_v, best_x = float(val), x
-        m = beta1 * m + (1 - beta1) * g
-        v2 = beta2 * v2 + (1 - beta2) * g * g
-        mh = m / (1 - beta1**t)
-        vh = v2 / (1 - beta2**t)
-        lr = lr0 * 0.5 * (1.0 + np.cos(np.pi * t / maxiter))
-        x = jnp.clip(x - lr * mh / (jnp.sqrt(vh) + eps), 0.0, 1.0)
-    val = val_grad(x)[0]
-    if float(val) < best_v:
-        best_v, best_x = float(val), x
+    lrs = jnp.asarray(
+        lr0 * 0.5 * (1.0 + np.cos(np.pi * np.arange(1, int(maxiter) + 1) / maxiter)),
+        dtype=jnp.float32,
+    )
+    ts = jnp.arange(1, int(maxiter) + 1, dtype=jnp.float32)
+
+    @jax.jit
+    def run_adam(x0):
+        val_grad = jax.value_and_grad(neg_loglik)
+
+        def step(state, sched):
+            x, m, v2, best_x, best_v = state
+            lr, t = sched
+            val, g = val_grad(x)
+            better = val < best_v
+            best_x = jnp.where(better, x, best_x)
+            best_v = jnp.where(better, val, best_v)
+            m = beta1 * m + (1 - beta1) * g
+            v2 = beta2 * v2 + (1 - beta2) * g * g
+            mh = m / (1 - beta1**t)
+            vh = v2 / (1 - beta2**t)
+            x = jnp.clip(x - lr * mh / (jnp.sqrt(vh) + eps), 0.0, 1.0)
+            return (x, m, v2, best_x, best_v), None
+
+        state0 = (
+            x0,
+            jnp.zeros_like(x0),
+            jnp.zeros_like(x0),
+            x0,
+            jnp.asarray(np.inf, dtype=jnp.float32),
+        )
+        (x, _, _, best_x, best_v), _ = lax.scan(step, state0, (lrs, ts))
+        final_v = neg_loglik(x)
+        better = final_v < best_v
+        return jnp.where(better, x, best_x), jnp.minimum(final_v, best_v)
+
+    best_x, best_v_j = run_adam(jnp.full(n_par, 0.5, dtype=jnp.float32))
+    best_v = float(best_v_j)
 
     rotvec, A, det_norm, goff = unpack(best_x)
     out = {

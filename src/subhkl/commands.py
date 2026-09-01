@@ -1773,6 +1773,144 @@ def run_mask_visualize(
     return written
 
 
+def _panel_offsets(dets, bank, pr, pc):
+    """Peak-shaped instrument-refinement input from pixel coordinates.
+
+    Returns (det_idx contiguous over the banks present, u_off, v_off [m],
+    bank_list, detector_nominal dict) -- u_off/v_off are physical offsets
+    from the panel center along uhat/vhat, the convention commands.py
+    stores for the classic refinement, so both paths mean the same thing.
+    """
+    bank = np.asarray(bank, dtype=int)
+    banks = sorted(int(b) for b in np.unique(bank))
+    b2i = {b: i for i, b in enumerate(banks)}
+    det_idx = np.array([b2i[int(b)] for b in bank])
+    u_off = np.empty(len(bank))
+    v_off = np.empty(len(bank))
+    for b in banks:
+        det = dets[b]
+        m = bank == b
+        xyz = det.pixel_to_lab(np.asarray(pr)[m], np.asarray(pc)[m])
+        rel = xyz - np.asarray(det.center)
+        u_off[m] = rel @ np.asarray(det.uhat)
+        v_off[m] = rel @ np.asarray(det.vhat)
+    nominal = {
+        "centers": np.array([dets[b].center for b in banks], dtype=float),
+        "uhats": np.array([dets[b].uhat for b in banks], dtype=float),
+        "vhats": np.array([dets[b].vhat for b in banks], dtype=float),
+        "widths": np.array([dets[b].width for b in banks], dtype=float),
+        "heights": np.array([dets[b].height for b in banks], dtype=float),
+    }
+    return det_idx, u_off, v_off, banks, nominal
+
+
+def _lattice_proper_rotations(dirs, tol_deg=0.5):
+    """Proper rotations of the lattice's Laue group, found numerically:
+    candidates from the 24 cubic operations, kept when they map the model
+    direction set onto itself.  Orthorhombic and lower keep the subset
+    that survives; hexagonal settings fall back to the identity (warned by
+    the caller if it matters)."""
+    from itertools import product as _product
+
+    cands = []
+    for perm in [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]:
+        for sg in _product([1, -1], repeat=3):
+            M = np.zeros((3, 3))
+            for i, (p_, s_) in enumerate(zip(perm, sg)):
+                M[i, p_] = s_
+            if np.linalg.det(M) > 0.5:
+                cands.append(M)
+    keep = []
+    ctol = np.cos(np.deg2rad(tol_deg))
+    sub = dirs[:: max(1, len(dirs) // 200)]
+    for S in cands:
+        rot = sub @ S.T
+        if np.min(np.max(np.abs(rot @ dirs.T), axis=1)) > ctol:
+            keep.append(S)
+    return keep if keep else [np.eye(3)]
+
+
+def _fit_gonio_offsets_from_runs(
+    U_runs_lab, R_nominal, axes, angles_by_run, refine_mask, sym_ops, n_iter=4
+):
+    """Goniometer offsets from per-run orientations: the assignment-free
+    analogue of the classic per-run DPHI corrections.
+
+    Each run's lab-frame orientation U_r (from a per-run spherical solve,
+    immune to the offsets by construction) should equal R_r(delta) U for a
+    single crystal orientation U and per-axis offsets delta.  Linearize:
+    the rotation residual rho_r = log(U_r (R_r(0) U)^T) is fit by the
+    per-axis lab-frame generators a_kr = d/d delta_k [R_r] (numeric, per
+    run) plus a global U correction, as one small least squares over
+    3 n_runs equations; per-run lattice-symmetry alignment and the
+    linearization are alternated.  Offsets on axes whose inner angles
+    never vary are pure gauge with U (see refine_instrument_matching_free)
+    and must not be in the mask.
+
+    Returns (offsets_deg full-length, U, rms_residual_deg,
+    {axis_index: identifiable}) -- an unidentifiable (gauge) axis keeps a
+    ~zero offset and is reported as such, never as a fitted number.
+    """
+    from scipy.spatial.transform import Rotation as _Rot
+
+    from subhkl.instrument.refinables import gonio_rotation_jax
+
+    run_ids = sorted(U_runs_lab)
+    K = len(axes)
+    masked = [k for k in range(K) if refine_mask[k]]
+    delta = np.zeros(K)
+
+    def R_of(r, d):
+        return np.asarray(
+            gonio_rotation_jax(np.asarray(axes), np.asarray(angles_by_run[r]), d)
+        )
+
+    # initial global U: symmetry-aligned average against run 0's estimate
+    U = R_of(run_ids[0], delta).T @ U_runs_lab[run_ids[0]]
+    eps = 1e-4
+    for _ in range(n_iter):
+        rows, rhs = [], []
+        for r in run_ids:
+            Rr = R_of(r, delta)
+            pred = Rr @ U
+            # symmetry copy of this run's estimate closest to the prediction
+            S = min(
+                sym_ops,
+                key=lambda S_: -np.trace(pred.T @ U_runs_lab[r] @ np.asarray(S_)),
+            )
+            rho = _Rot.from_matrix(U_runs_lab[r] @ np.asarray(S) @ pred.T).as_rotvec()
+            J = np.zeros((3, len(masked) + 3))
+            for j, k in enumerate(masked):
+                # generator per radian of offset k at this run's setting
+                dp = delta.copy()
+                dp[k] += eps
+                J[:, j] = _Rot.from_matrix(R_of(r, dp) @ Rr.T).as_rotvec() / np.deg2rad(
+                    eps
+                )
+            J[:, len(masked) :] = Rr  # global U correction generators
+            rows.append(J)
+            rhs.append(rho)
+        A = np.vstack(rows)
+        b = np.concatenate(rhs)
+        # Truncated SVD, and honesty about flat directions: an offset can
+        # be structurally unidentifiable -- e.g. CG4D scans only phi with
+        # kappa = 0, which makes the omega and phi axes collinear, so an
+        # omega offset is exactly absorbable into U and ANY value for it is
+        # a gauge choice (the production pipeline's -3.74 deg included).
+        # A plain min-norm solve lets data systematics drag such a
+        # parameter to an arbitrary confident-looking number; instead the
+        # resolution matrix diagonal flags it and the truncation pins it.
+        Um, sv, Vt = np.linalg.svd(A, full_matrices=False)
+        keep_sv = sv > 0.05 * sv[0]
+        x = (Vt[keep_sv].T / sv[keep_sv]) @ (Um[:, keep_sv].T @ b)
+        resolution = np.einsum("ki,ki->i", Vt[keep_sv], Vt[keep_sv])
+        delta[masked] += np.rad2deg(x[: len(masked)])
+        U = _Rot.from_rotvec(x[len(masked) :]).as_matrix() @ U
+        rms = np.rad2deg(np.sqrt(np.mean(b**2)))
+    identifiable = resolution[: len(masked)] > 0.5
+    return delta, U, rms, {k: bool(i) for k, i in zip(masked, identifiable)}
+
+
 def _spherical_quality(
     dirs,
     U,
@@ -1950,6 +2088,14 @@ def run_spherical_index(
     binning: int = 4,
     runs: list | None = None,
     bandwidth: int | None = None,
+    refine_instrument: bool = False,
+    refine_gonio_axes: list | None = None,
+    det_trans_bound: float = 0.005,
+    det_rot_bound_deg: float = 0.5,
+    gonio_bound_deg: float = 5.0,
+    refine_maxiter: int = 400,
+    refine_max_points: int = 100_000,
+    fit_gonio_offsets: bool = False,
 ):
     """Index by spherical correlation over SO(3) -- the matched-filter dual
     of the sparse orientation-recovery problem (subhkl.search.spherical).
@@ -2016,6 +2162,16 @@ def run_spherical_index(
         img = fp["peaks/image_index"][()] if "peaks/image_index" in fp else None
         run = fp["peaks/run_index"][()] if "peaks/run_index" in fp else None
         Rg = fp["goniometer/R"][()] if "goniometer/R" in fp else None
+        g_axes = fp["goniometer/axes"][()] if "goniometer/axes" in fp else None
+        g_angles = fp["goniometer/angles"][()] if "goniometer/angles" in fp else None
+        g_names = (
+            [
+                n.decode() if isinstance(n, bytes) else str(n)
+                for n in fp["goniometer/names"][()]
+            ]
+            if "goniometer/names" in fp
+            else None
+        )
         cell = tuple(
             float(fp[f"sample/{k}"][()])
             for k in ("a", "b", "c", "alpha", "beta", "gamma")
@@ -2110,8 +2266,10 @@ def run_spherical_index(
             else int(min(max(np.ceil(3.0 / sigma_raw), 16), 96))
         )
         bin_dirs = {}
+        bin_rows, bin_cols = {}, {}
         per_bank_rows = {}
         raw_pts, raw_w, raw_run = [], [], []
+        raw_bank, raw_prow, raw_pcol = [], [], []
         b2 = int(binning)
         for i_img in range(len(images)):
             bk = int(bank_ids[i_img])
@@ -2128,6 +2286,7 @@ def run_spherical_index(
                 rr = (np.arange(n2 // b2) + 0.5) * b2 - 0.5
                 cc = (np.arange(m2 // b2) + 0.5) * b2 - 0.5
                 RR, CC = np.meshgrid(rr, cc, indexing="ij")
+                bin_rows[bk], bin_cols[bk] = RR.ravel(), CC.ravel()
                 bin_dirs[bk] = sph.panel_directions(
                     det, rows=RR.ravel(), cols=CC.ravel(), ki=ki
                 )
@@ -2138,6 +2297,9 @@ def run_spherical_index(
             raw_pts.append(d @ Rr if Rr is not None else d)  # R^T per row
             raw_w.append(np.clip(excess, 0.0, None))
             raw_run.append(np.full(len(d), r_))
+            raw_bank.append(np.full(len(d), bk))
+            raw_prow.append(np.tile(bin_rows[bk], 1))
+            raw_pcol.append(np.tile(bin_cols[bk], 1))
         _mark("bin")
 
         # The frame-proportional cost is the associated-Legendre evaluation,
@@ -2260,6 +2422,186 @@ def run_spherical_index(
         U, B_out, _ = sph.refine_matching_free(
             f, U, hkl_all, B, kernel_deg=kernel_deg, refine_cell=refine_cell
         )
+    # per-run goniometer metadata, shared by the two refinement stages
+    run_list = sorted(int(x) for x in np.unique(run)) if run is not None else [0]
+    angles_by_run = {}
+    if g_angles is not None and run is not None:
+        for r_ in run_list:
+            row = int(np.argmax(run == r_))
+            angles_by_run[r_] = np.asarray(
+                g_angles[row] if g_angles.shape[0] == len(pr) else g_angles[r_]
+            )
+    gonio_mask = None
+    if refine_gonio_axes and g_names is not None:
+        short = [n.split(":")[-1] for n in g_names]
+        gonio_mask = np.array(
+            [
+                (n in refine_gonio_axes) or (sn in refine_gonio_axes)
+                for n, sn in zip(g_names, short)
+            ]
+        )
+        if not gonio_mask.any():
+            raise ValueError(
+                f"none of --refine-gonio-axes {refine_gonio_axes} matches "
+                f"the file's goniometer axes {short}"
+            )
+
+    gonio_offsets_deg = None
+    det_report = None
+    if refine_instrument:
+        # peak-shaped input: found peaks, or the strongest binned pixels of
+        # raw mode as weighted peaks
+        if f_raw is not None:
+            rb = np.concatenate(raw_bank)
+            rr_ = np.concatenate(raw_prow)
+            rc_ = np.concatenate(raw_pcol)
+            rw = np.concatenate(raw_w)
+            rrun = np.concatenate(raw_run)
+            keep = np.argsort(-rw)[: int(refine_max_points)]
+            keep = keep[rw[keep] > 0]
+            det_idx_r, u_off_r, v_off_r, banks_r, nominal_r = _panel_offsets(
+                dets, rb[keep], rr_[keep], rc_[keep]
+            )
+            w_r, run_r = rw[keep], rrun[keep].astype(int)
+        else:
+            det_idx_r, u_off_r, v_off_r, banks_r, nominal_r = _panel_offsets(
+                dets, bank, pr, pc
+            )
+            w_r, run_r = (
+                np.ones(len(pr)),
+                (run if run is not None else np.zeros(len(pr), int)),
+            )
+        peaks_in = {"det_idx": det_idx_r, "u_off": u_off_r, "v_off": v_off_r}
+        gonio_in = None
+        if gonio_mask is not None and angles_by_run:
+            run_pos = {r_: i for i, r_ in enumerate(run_list)}
+            peaks_in["run_idx"] = np.array([run_pos[int(r_)] for r_ in run_r])
+            gonio_in = {
+                "axes": np.asarray(g_axes, dtype=float),
+                "angles_deg": np.stack([angles_by_run[r_] for r_ in run_list]),
+                "refine_mask": gonio_mask,
+                "bound_deg": gonio_bound_deg,
+            }
+        elif run is not None:
+            # rotate data into the sample frame beforehand is not possible
+            # through refine_instrument without gonio; fold the nominal
+            # rotation into the offsets machinery by passing angles with an
+            # all-False mask
+            if angles_by_run:
+                run_pos = {r_: i for i, r_ in enumerate(run_list)}
+                peaks_in["run_idx"] = np.array([run_pos[int(r_)] for r_ in run_r])
+                gonio_in = {
+                    "axes": np.asarray(g_axes, dtype=float),
+                    "angles_deg": np.stack([angles_by_run[r_] for r_ in run_list]),
+                    "refine_mask": np.zeros(len(g_axes), bool),
+                    "bound_deg": gonio_bound_deg,
+                }
+        out_ref = sph.refine_instrument_matching_free(
+            peaks_in,
+            nominal_r,
+            np.stack([h_, k_, l_], axis=1),
+            B,
+            U,
+            det_bounds={
+                "independent_trans": det_trans_bound,
+                "independent_rot": np.deg2rad(det_rot_bound_deg),
+            },
+            gonio=gonio_in,
+            weights=w_r,
+            kernel_deg=kernel_deg,
+            refine_cell=refine_cell,
+            maxiter=refine_maxiter,
+        )
+        U, B_out = out_ref["R"], out_ref["B"]
+        from subhkl.instrument.refinables import forward_map_param as _fmp
+
+        nb_ = len(banks_r)
+        dp = out_ref["det_params"]
+        det_report = {
+            "banks": banks_r,
+            "trans_m": _fmp(dp[: nb_ * 3].reshape(nb_, 3), det_trans_bound),
+            "rot_rad": _fmp(
+                dp[nb_ * 3 :].reshape(nb_, 3), np.deg2rad(det_rot_bound_deg)
+            ),
+            "det_params": dp,
+        }
+        worst = np.abs(det_report["trans_m"]).max(axis=1)
+        wb = banks_r[int(np.argmax(worst))]
+        print(
+            f"  instrument refinement: loglik {out_ref['loglik']:.3f}; "
+            f"largest bank translation {1e3 * worst.max():.2f} mm (bank {wb}), "
+            f"largest tilt "
+            f"{np.rad2deg(np.abs(det_report['rot_rad']).max()):.3f} deg"
+        )
+        if "gonio_offsets_deg" in out_ref:
+            gonio_offsets_deg = out_ref["gonio_offsets_deg"]
+            print(
+                "  goniometer offsets [deg]: "
+                + "  ".join(
+                    f"{n.split(':')[-1]} {o:+.3f}"
+                    for n, o, mflag in zip(g_names, gonio_offsets_deg, gonio_mask)
+                    if mflag
+                )
+            )
+
+    if fit_gonio_offsets:
+        if gonio_mask is None or not angles_by_run or Rg is None:
+            raise ValueError(
+                "--fit-gonio-offsets needs --refine-gonio-axes and a peaks "
+                "file with goniometer axes/angles/R"
+            )
+        # per-run LAB-frame orientations: each run solved at its own gauge,
+        # immune to whatever the offsets are -- the assignment-free
+        # analogue of the classic per-run DPHI corrections
+        U_runs = {}
+        R_nom = {}
+        for r_ in run_list:
+            m_ = run == r_
+            res_r = sph.find_orientations(
+                d_lab[m_],
+                model_dirs=dirs,
+                kernel_deg=kernel_deg,
+                n_candidates=1,
+                L=bandwidth,
+            )
+            U_runs[r_] = res_r[0]["R"]
+            R_nom[r_] = (Rg if Rg.shape[0] == len(pr) else Rg[img])[np.argmax(m_)]
+        sym_ops = _lattice_proper_rotations(dirs)
+        delta, U_fit, rms, ident = _fit_gonio_offsets_from_runs(
+            U_runs,
+            R_nom,
+            np.asarray(g_axes, dtype=float),
+            angles_by_run,
+            gonio_mask,
+            sym_ops,
+        )
+        gonio_offsets_deg = delta
+        U = U_fit
+        parts = []
+        for k_, (n, mflag) in enumerate(zip(g_names, gonio_mask)):
+            if not mflag:
+                continue
+            if ident.get(k_, True):
+                parts.append(f"{n.split(':')[-1]} {delta[k_]:+.3f} deg")
+            else:
+                parts.append(
+                    f"{n.split(':')[-1]} GAUGE (absorbable into U at these "
+                    "scan angles; pinned to 0)"
+                )
+        print(
+            "  per-run offsets fit (rms residual "
+            f"{rms:.3f} deg over {len(run_list)} runs): " + "  ".join(parts)
+        )
+        # quality should judge the OFFSET-CORRECTED frame mapping
+        from subhkl.instrument.refinables import gonio_rotation_jax as _grj
+
+        d_new = np.array(d_sample)
+        for r_ in run_list:
+            m_ = run == r_
+            Rr = np.asarray(_grj(np.asarray(g_axes, float), angles_by_run[r_], delta))
+            d_new[m_] = d_lab[m_] @ Rr
+        d_sample = d_new
+
     for r in results:
         print(
             f"  candidate: z={r['z']:.1f}  matched={r['n_matched']}  "
@@ -2330,6 +2672,16 @@ def run_spherical_index(
         out["spherical/coherence"] = np.array(
             [r.get("coherence", 0.0) for r in results]
         )
+        if gonio_offsets_deg is not None and g_names is not None:
+            seen = {}
+            for n_, o_ in zip(g_names, gonio_offsets_deg):
+                seen[n_] = seen.get(n_, 0) + 1
+                key = n_ if seen[n_] == 1 else f"{n_}_{seen[n_]}"
+                out[f"goniometer/offsets/{key}"] = float(o_)
+        if det_report is not None:
+            out["spherical/detector/banks"] = np.array(det_report["banks"])
+            out["spherical/detector/trans_m"] = det_report["trans_m"]
+            out["spherical/detector/rot_rad"] = det_report["rot_rad"]
         for kq, vq in quality.items():
             if kq == "per_run_median_deg":
                 out["spherical/quality/per_run"] = np.array(sorted(vq))
