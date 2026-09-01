@@ -1477,6 +1477,13 @@ def run_rbf_integrator(
             for k in ["goniometer/axes", "goniometer/names"]:
                 if k in f_in:
                     f_in.copy(f_in[k], f, k)
+            # The refined panels travel with the peaks they positioned: the
+            # predictor already carries the group forward, and without the
+            # same copy here integrator-visualize (and anything else reading
+            # this file) has no way to know which geometry these pixel
+            # coordinates belong to.
+            if "detector_calibration" in f_in:
+                f_in.copy("detector_calibration", f)
 
 
 def run_mtz_exporter(

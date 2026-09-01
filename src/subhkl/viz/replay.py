@@ -233,6 +233,16 @@ def replay_plots(
     table = read_peaks_table(peaks_filename)
     instrument = _resolve_instrument(instrument, table, images_filename)
 
+    # A replayed plot must be the plot the run would have made, and the run
+    # applies the refined panel geometry before it draws anything (the
+    # integrator and the predictor both call this on their input).  Without
+    # it a replay silently draws refined peak positions on nominal panels --
+    # every centre and every ellipse displaced by the calibration the
+    # solution was fitted with.  No-op when the file carries none.
+    from subhkl.commands import apply_detector_calibration
+
+    apply_detector_calibration(peaks_filename, instrument)
+
     images = Peaks(images_filename, instrument)
     if not images.image.ims:
         raise ValueError(f"{images_filename} holds no images to draw on.")

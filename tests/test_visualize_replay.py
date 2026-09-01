@@ -655,3 +655,44 @@ def test_the_inline_finder_plot_still_works_without_widths(tmp_path):
     _run_finder(images, peaks, "sparse_rbf", create_visualizations=True)
 
     assert (tmp_path / "img0-found.png").stat().st_size > 0
+
+
+def test_a_replay_draws_on_the_refined_panels(tmp_path):
+    """A replayed plot must be the plot the run would have made.
+
+    The integrator and the predictor apply `detector_calibration` before
+    they draw, so a replay that skips it puts refined peak positions on
+    nominal panels -- every centre and ellipse displaced by exactly the
+    calibration the solution was fitted with, silently.
+    """
+    from subhkl.config import beamlines
+
+    images = _write_images(tmp_path / "images.h5", runs=("only",))
+    peaks = _write_integrator_peaks(tmp_path / "int.h5", n_images=1)
+
+    bank = str(BANKS[0])
+    nominal = list(beamlines[INSTRUMENT][bank]["center"])
+    shifted = [nominal[0] + 0.02, nominal[1], nominal[2]]
+    with h5py.File(peaks, "a") as f:
+        grp = f.create_group(f"detector_calibration/bank_{bank}")
+        grp["center"] = np.array(shifted)
+        grp["uhat"] = np.array(beamlines[INSTRUMENT][bank]["uhat"], dtype=float)
+        grp["vhat"] = np.array(beamlines[INSTRUMENT][bank]["vhat"], dtype=float)
+
+    try:
+        (written,) = replay.replay_plots(
+            images_filename=str(images),
+            peaks_filename=str(peaks),
+            suffix="-pred",
+            output_dir=str(tmp_path),
+            dpi=50,
+            max_workers=1,
+            show_progress=False,
+        )
+        assert written.endswith("only-pred.png")
+        # the geometry every consumer reads is the config, and the replay
+        # must have moved it to the refined panels
+        np.testing.assert_allclose(beamlines[INSTRUMENT][bank]["center"], shifted)
+    finally:
+        # the config is process-global; leave it as found
+        beamlines[INSTRUMENT][bank]["center"] = nominal
