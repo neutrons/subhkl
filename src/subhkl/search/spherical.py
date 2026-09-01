@@ -23,6 +23,13 @@ degree, O(L^3) total work, no spherical grid at any point of the forward
 projection (points and rings project analytically; the only grid is the
 Euler-angle grid the correlogram is *read out* on).
 
+The data side takes either found peaks (``project_points`` on Ghat
+directions) or -- with no peak finding at all -- the raw frame
+(``project_counts`` on background-subtracted pixel counts): the correlogram
+is then the matched filter of every photon rather than every found peak,
+and recovers orientations from spots individually below the finder's own
+detection floor (measured: F = 5 counts per spot against a floor of 15).
+
 Two model bases:
 
 - ``project_points``: one smoothed delta per reciprocal-lattice direction
@@ -244,6 +251,56 @@ def project_points(dirs, weights, L, sigma, even_only=True):
     w = np.ones(len(dirs)) if weights is None else np.asarray(weights, dtype=float)
     Y = sph_harm_all(L, dirs)
     f = np.einsum("lmj,j->lm", np.conj(Y), w)
+    f *= _smoothing(L, sigma)[:, None]
+    if even_only:
+        f[1::2] = 0.0
+    return f
+
+
+def project_counts(pixel_dirs, excess, L, sigma, even_only=True, chunk=8192):
+    """SH coefficients of a raw count map -- no peak finding required.
+
+    The data function is the *excess count* density on the sphere: each
+    detector pixel contributes its lab direction (detector.pixel_to_lab,
+    normalized after subtracting the sample position) weighted by
+    ``excess = y - U``, its counts above the expected background.  The
+    correlogram then computes C(R) = sum_px (y - U)_px [Lambda(R) g](Ghat_px)
+    -- the matched filter of the raw counts against the predicted direction
+    density, the same statistic the peak path uses with every photon voting
+    instead of every found peak.  Subtracting U (the rate map of
+    subhkl.search.sparse_rbf.compute_rate_batch, in practice) is what makes
+    the null mean zero *per pixel*, so the detector's partial sky coverage
+    -- which is anisotropic and would otherwise correlate with the rotated
+    model -- cancels in expectation rather than biasing the search.
+
+    Because no threshold intervenes, this works below the finder's own
+    detection floor: peaks individually far under the matched-filter
+    F_min = z sqrt(N_bg) still contribute their few photons coherently, and
+    the orientation aggregates all of them (measured in
+    test_orientation_from_raw_counts_below_the_finder_floor).  The intended
+    use is bootstrap: orientation first, then the predicted directions hand
+    the image-domain finder a positional prior.
+
+    Chunked direct sum; memory is O(L^2 chunk) and cost O(L^2 N_pixels)
+    (~seconds for 10^5 pixels at L = 64 in numpy -- this loop is the
+    module's first candidate for a jax port, being one fixed-geometry
+    matvec per frame once the basis is cached).  Negative weights are fine.
+    """
+    d = np.asarray(pixel_dirs, dtype=float)
+    w = np.asarray(excess, dtype=float)
+    f = np.zeros((L + 1, 2 * L + 1), dtype=complex)
+    for start in range(0, len(d), int(chunk)):
+        dd = d[start : start + int(chunk)]
+        ww = w[start : start + int(chunk)]
+        ct = np.clip(dd[:, 2], -1.0, 1.0)
+        phi = np.arctan2(dd[:, 1], dd[:, 0])
+        P = _legendre_norm(L, ct)  # [l, m>=0, j]
+        E = np.exp(-1j * np.outer(np.arange(L + 1), phi))  # [m, j]
+        # f_lm = sum_j w_j Pbar_lm e^{-i m phi_j}; negative m by symmetry
+        block = np.einsum("lmj,mj,j->lm", P, E, ww)
+        f[:, L:] += block
+    m = np.arange(1, L + 1)
+    f[:, L - m] = (-1.0) ** m * np.conj(f[:, L + m])
     f *= _smoothing(L, sigma)[:, None]
     if even_only:
         f[1::2] = 0.0

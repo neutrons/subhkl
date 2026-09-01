@@ -27,6 +27,7 @@ from subhkl.search.spherical import (
     find_orientations,
     ghat_from_kf,
     lattice_directions,
+    project_counts,
     project_points,
     project_rings,
     refine_local,
@@ -310,3 +311,75 @@ def test_ring_basis_is_blind_for_large_cells():
     null = [so3_inner(f, g, _rand_rot(rng)) for _ in range(20)]
     z0 = (so3_inner(f, g, R0) - np.mean(null)) / (np.std(null) + 1e-12)
     assert abs(z0) < 4.0
+
+
+def test_project_counts_matches_project_points():
+    """The chunked raw-count projection is the same operator as the point
+    projection -- including negative weights (excess counts go negative
+    wherever the frame fluctuates below background)."""
+    rng = np.random.default_rng(2)
+    d = _rand_dirs(rng, 500)
+    w = rng.normal(size=500)
+    a = project_counts(d, w, 20, 0.05, even_only=False, chunk=64)
+    b = project_points(d, w, 20, 0.05, even_only=False)
+    assert np.max(np.abs(a - b)) < 1e-12
+
+
+def test_orientation_from_raw_counts_below_the_finder_floor():
+    """Orientation without any peak finding, from photons a finder cannot use.
+
+    A synthetic detector (theta 40-140 deg, phi 0-180 deg -- deliberately
+    partial and anisotropic coverage) records a cubic 8 A pattern where
+    every spot carries F = 5 counts against N_bg = 12 background counts per
+    footprint: a factor ~3 below the matched-filter floor z sqrt(N_bg), so
+    no individual peak is detectable and a find-then-index pipeline has
+    nothing to work with.  Projecting the *excess counts* of every pixel
+    (background subtracted -- which is also what cancels the anisotropic
+    coverage in expectation) still recovers the orientation, because the
+    correlogram aggregates every signal photon coherently.  This is the
+    bootstrap direction: orientation first, finder second, with the
+    predicted directions as its positional prior.
+    """
+    rng = np.random.default_rng(21)
+    nth, nph = 300, 270
+    th = np.deg2rad(40 + 100 * (np.arange(nth) + 0.5) / nth)
+    ph = np.deg2rad(180 * (np.arange(nph) + 0.5) / nph)
+    TH, PH = np.meshgrid(th, ph, indexing="ij")
+    pix = np.stack(
+        [np.sin(TH) * np.cos(PH), np.sin(TH) * np.sin(PH), np.cos(TH)], axis=-1
+    ).reshape(-1, 3)
+    omega = (np.sin(TH) * np.deg2rad(100 / nth) * np.deg2rad(180 / nph)).ravel()
+
+    B, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    dirs, w = lattice_directions(B, 1.2)
+    R0 = _rand_rot(rng)
+    spots = np.vstack([dirs, -dirs]) @ R0.T  # both ends of every +- pair
+    sig_spot = np.deg2rad(0.5)
+    f_peak, b_sky = 5.0, 25000.0  # counts/peak, counts/sr
+    n_bg = b_sky * 2 * np.pi * sig_spot**2
+    # constructional certificate: individually sub-floor by a wide margin
+    assert f_peak < 0.5 * 4.3 * np.sqrt(n_bg)
+
+    rate = b_sky * np.ones(len(pix))
+    for shat in spots:
+        ct = pix @ shat
+        near = ct > np.cos(np.deg2rad(3.0))
+        if not np.any(near):
+            continue
+        ang2 = 2.0 * (1.0 - np.clip(ct[near], -1, 1))
+        rate[near] += (
+            f_peak / (2 * np.pi * sig_spot**2) * np.exp(-ang2 / (2 * sig_spot**2))
+        )
+    y = rng.poisson(rate * omega).astype(float)
+
+    excess = y - b_sky * omega
+    L = 48
+    f = project_counts(pix, excess, L, sig_spot)
+    g = project_points(dirs, w, L, sig_spot)
+    null = [so3_inner(f, g, _rand_rot(rng)) for _ in range(12)]
+    z0 = (so3_inner(f, g, R0) - np.mean(null)) / (np.std(null) + 1e-12)
+    assert z0 > 4.0
+    C, al, be, ga = correlogram(f, g)
+    R, _ = top_orientations(C, al, be, ga, n=1)[0]
+    R = refine_local(f, g, R)
+    assert _err_mod(R, R0, _cubic_rots()) < 1.5
