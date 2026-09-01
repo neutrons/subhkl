@@ -1303,17 +1303,67 @@ def mask_visualize(
 def spherical_index(
     peaks_h5_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
     output_filename: Annotated[str, typer.Argument(help="Bootstrap HDF5 to write")],
-    d_min: Annotated[float, typer.Option("--d-min", help="Resolution cut for the model direction set [Angstrom]")] = 1.5,
-    kernel_deg: Annotated[float, typer.Option("--kernel-deg", help="Angular kernel FWHM [deg] (mosaic + measurement)")] = 1.0,
-    n_candidates: Annotated[int, typer.Option("--n-candidates", help="Orientation candidates to keep (multi-crystal capable)")] = 4,
-    refine: Annotated[bool, typer.Option("--refine/--no-refine", help="Polish with the matching-free refinement")] = True,
-    refine_cell: Annotated[bool, typer.Option("--refine-cell", help="Also refine the cell SHAPE (scale is structurally invisible to directions and stays nominal)")] = False,
-    lam: Annotated[float, typer.Option("--lam", help="L1 penalty on the candidates' sparse weights")] = 0.0,
+    d_min: Annotated[
+        float,
+        typer.Option(
+            "--d-min", help="Resolution cut for the model direction set [Angstrom]"
+        ),
+    ] = 1.5,
+    kernel_deg: Annotated[
+        float,
+        typer.Option(
+            "--kernel-deg", help="Angular kernel FWHM [deg] (mosaic + measurement)"
+        ),
+    ] = 1.0,
+    n_candidates: Annotated[
+        int,
+        typer.Option(
+            "--n-candidates",
+            help="Orientation candidates to keep (multi-crystal capable)",
+        ),
+    ] = 4,
+    refine: Annotated[
+        bool,
+        typer.Option(
+            "--refine/--no-refine", help="Polish with the matching-free refinement"
+        ),
+    ] = True,
+    refine_cell: Annotated[
+        bool,
+        typer.Option(
+            "--refine-cell",
+            help="Also refine the cell SHAPE (scale is structurally invisible to directions and stays nominal)",
+        ),
+    ] = False,
+    lam: Annotated[
+        float,
+        typer.Option("--lam", help="L1 penalty on the candidates' sparse weights"),
+    ] = 0.0,
     instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
-    ki_vec: Annotated[str | None, typer.Option("--ki-vec", help="Incident beam vector, e.g. '0,0,1'")] = None,
-    images: Annotated[str | None, typer.Option("--images", help="Merged images HDF5: index from RAW COUNTS instead of the found peaks (every pixel votes with its excess counts; the peaks file still supplies instrument, cell and goniometer metadata)")] = None,
-    binning: Annotated[int, typer.Option("--binning", help="Pixel binning before the raw-count projection (direction changes across a bin are far below the kernel width; cost drops by binning^2)")] = 4,
-    runs: Annotated[str | None, typer.Option("--runs", help="Comma-separated run indices to index (e.g. '0'): a single run has one goniometer setting, so a per-run solve is immune to goniometer-offset errors, and per-run orientations are the observable an offset calibration wants")] = None,
+    ki_vec: Annotated[
+        str | None, typer.Option("--ki-vec", help="Incident beam vector, e.g. '0,0,1'")
+    ] = None,
+    images: Annotated[
+        str | None,
+        typer.Option(
+            "--images",
+            help="Merged images HDF5: index from RAW COUNTS instead of the found peaks (every pixel votes with its excess counts; the peaks file still supplies instrument, cell and goniometer metadata)",
+        ),
+    ] = None,
+    binning: Annotated[
+        int,
+        typer.Option(
+            "--binning",
+            help="Pixel binning before the raw-count projection (direction changes across a bin are far below the kernel width; cost drops by binning^2)",
+        ),
+    ] = 4,
+    runs: Annotated[
+        str | None,
+        typer.Option(
+            "--runs",
+            help="Comma-separated run indices to index (e.g. '0'): a single run has one goniometer setting, so a per-run solve is immune to goniometer-offset errors, and per-run orientations are the observable an offset calibration wants",
+        ),
+    ] = None,
 ):
     """
     Index by spherical correlation over SO(3) -- global across all panels
@@ -1350,13 +1400,26 @@ def spherical_index(
 
 @app.command()
 def indexer_visualize(
-    peaks_filename: Annotated[str, typer.Argument(help="Indexer (or spherical-index) output HDF5 file")],
+    peaks_filename: Annotated[
+        str, typer.Argument(help="Indexer (or spherical-index) output HDF5 file")
+    ],
     instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
     output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
-    max_index: Annotated[int, typer.Option("--max-index", help="Draw zones [uvw] up to this index")] = 1,
+    max_index: Annotated[
+        int, typer.Option("--max-index", help="Draw zones [uvw] up to this index")
+    ] = 1,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
-    image_index: Annotated[int | None, typer.Option("--image-index", help="Frame to draw (default: each run's first)")] = None,
-    images: Annotated[str | None, typer.Option("--images", help="Merged images HDF5: render the raw detector counts underneath the zone conics -- the strongest visual check, no peak finder in the loop")] = None,
+    image_index: Annotated[
+        int | None,
+        typer.Option("--image-index", help="Frame to draw (default: each run's first)"),
+    ] = None,
+    images: Annotated[
+        str | None,
+        typer.Option(
+            "--images",
+            help="Merged images HDF5: render the raw detector counts underneath the zone conics -- the strongest visual check, no peak finder in the loop",
+        ),
+    ] = None,
 ):
     """
     Draw the low-index Laue zone conics over the measured peaks.

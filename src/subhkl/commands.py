@@ -1,4 +1,3 @@
-
 import h5py
 import numpy as np
 
@@ -1774,7 +1773,18 @@ def run_mask_visualize(
     return written
 
 
-def _spherical_quality(dirs, U, pts, weights, run_ids, kernel_deg, floor=0.01, n_null=8, chunk=20000, seed=0):
+def _spherical_quality(
+    dirs,
+    U,
+    pts,
+    weights,
+    run_ids,
+    kernel_deg,
+    floor=0.01,
+    n_null=8,
+    chunk=20000,
+    seed=0,
+):
     """Native quality report of a spherical indexing solution.
 
     Works identically with found peaks (unit weights) and raw counts
@@ -1813,9 +1823,7 @@ def _spherical_quality(dirs, U, pts, weights, run_ids, kernel_deg, floor=0.01, n
             if want_loglik:
                 ang2 = 2.0 * (1.0 - dots)
                 dens = np.exp(-ang2 / (2.0 * sigma * sigma)).sum(axis=1)
-                ll += float(
-                    np.sum(weights[i : i + chunk] * np.log(dens + floor))
-                )
+                ll += float(np.sum(weights[i : i + chunk] * np.log(dens + floor)))
         return dev, ll / max(np.sum(weights), 1e-12)
 
     def wmedian(x, w):
@@ -1831,7 +1839,9 @@ def _spherical_quality(dirs, U, pts, weights, run_ids, kernel_deg, floor=0.01, n
         Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
         dv, _ = dev_and_loglik(Q * np.sign(np.linalg.det(Q)))
         null_meds.append(wmedian(dv, weights))
-        null_matched.append(float(np.sum(weights[dv < tol]) / max(np.sum(weights), 1e-12)))
+        null_matched.append(
+            float(np.sum(weights[dv < tol]) / max(np.sum(weights), 1e-12))
+        )
     per_run = {}
     if run_ids is not None:
         for r in np.unique(run_ids):
@@ -1862,7 +1872,9 @@ def _read_merged_images(images_filename):
         )
         if "file_offsets" in fp:
             offs = np.asarray(fp["file_offsets"][()], dtype=int)
-            run_of_image = np.searchsorted(offs, np.arange(len(images)), side="right") - 1
+            run_of_image = (
+                np.searchsorted(offs, np.arange(len(images)), side="right") - 1
+            )
         else:
             run_of_image = np.zeros(len(images), dtype=int)
     return images, bank_ids, run_of_image
@@ -1921,7 +1933,8 @@ def run_spherical_index(
         run = fp["peaks/run_index"][()] if "peaks/run_index" in fp else None
         Rg = fp["goniometer/R"][()] if "goniometer/R" in fp else None
         cell = tuple(
-            float(fp[f"sample/{k}"][()]) for k in ("a", "b", "c", "alpha", "beta", "gamma")
+            float(fp[f"sample/{k}"][()])
+            for k in ("a", "b", "c", "alpha", "beta", "gamma")
         )
         sg = fp["sample/space_group"][()]
         sg = sg.decode() if isinstance(sg, bytes) else str(sg)
@@ -2138,7 +2151,9 @@ def run_spherical_index(
         out["spherical/z"] = np.array([r["z"] for r in results])
         out["spherical/n_matched"] = np.array([r["n_matched"] for r in results])
         out["spherical/c"] = np.array([r.get("c", np.nan) for r in results])
-        out["spherical/coherence"] = np.array([r.get("coherence", 0.0) for r in results])
+        out["spherical/coherence"] = np.array(
+            [r.get("coherence", 0.0) for r in results]
+        )
         for kq, vq in quality.items():
             if kq == "per_run_median_deg":
                 out["spherical/quality/per_run"] = np.array(sorted(vq))
@@ -2180,8 +2195,16 @@ def run_indexer_visualize(
         bank = fp["bank"][()]
         pr = fp["peaks/pixel_r"][()]
         pc = fp["peaks/pixel_c"][()]
-        img = fp["peaks/image_index"][()] if "peaks/image_index" in fp else np.zeros(len(pr), int)
-        run = fp["peaks/run_index"][()] if "peaks/run_index" in fp else np.zeros(len(pr), int)
+        img = (
+            fp["peaks/image_index"][()]
+            if "peaks/image_index" in fp
+            else np.zeros(len(pr), int)
+        )
+        run = (
+            fp["peaks/run_index"][()]
+            if "peaks/run_index" in fp
+            else np.zeros(len(pr), int)
+        )
         Rg = fp["goniometer/R"][()] if "goniometer/R" in fp else None
         U = fp["sample/U"][()]
         B = fp["sample/B"][()]
@@ -2220,9 +2243,7 @@ def run_indexer_visualize(
         if raw is not None:
             images, bank_ids, run_of_image = raw
             in_run = run_of_image == int(r)
-            run_images = {
-                int(bank_ids[i]): images[i] for i in np.flatnonzero(in_run)
-            }
+            run_images = {int(bank_ids[i]): images[i] for i in np.flatnonzero(in_run)}
         out_name = os.path.join(out_dir, f"{base}-zones-run{int(r)}.png")
         zones.plot_zone_overlay(
             dets,
