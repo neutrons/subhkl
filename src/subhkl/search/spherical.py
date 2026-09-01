@@ -353,7 +353,17 @@ def wigner_d_matrix(L, beta):
 
     Entries with mx > l are zero.  Validated against the explicit factorial
     sum and closed forms in tests/test_spherical.py.
+
+    ``beta`` may be a scalar (returns (L+1, M, M)) or a 1D array (returns
+    (L+1, M, M, n_beta)): the correlogram's profile showed 45% of a run
+    inside per-slice rebuilds of this tensor -- ~100 small-array numpy ops
+    per beta, overhead-dominated -- and batching the trailing beta axis
+    turns them into a few hundred large-array ops for the whole grid.
     """
+    beta_arr = np.atleast_1d(np.asarray(beta, dtype=float))
+    scalar = np.ndim(beta) == 0
+    nb = beta_arr.size
+
     M = 2 * L + 1
     m = np.arange(-L, L + 1)
     mm, nn = np.meshgrid(m, m, indexing="ij")  # first index m (row), second n
@@ -377,13 +387,14 @@ def wigner_d_matrix(L, beta):
     )
     b = 2 * mx - a
 
-    x = np.cos(beta)
-    sh, ch = np.sin(beta / 2.0), np.cos(beta / 2.0)
-    af, bf = a.astype(float), b.astype(float)
+    x = np.cos(beta_arr)[None, None, :]  # [1, 1, nb]
+    sh, ch = np.sin(beta_arr / 2.0), np.cos(beta_arr / 2.0)
+    af, bf = a.astype(float)[..., None], b.astype(float)[..., None]
 
-    # P_k^{(a,b)}(x) for k = 0..L, elementwise (a, b): standard three-term
-    # recursion of the Jacobi polynomials, forward stable on [-1, 1].
-    P = np.zeros((L + 1, M, M))
+    # P_k^{(a,b)}(x) for k = 0..L, elementwise (a, b), batched over beta:
+    # standard three-term recursion of the Jacobi polynomials, forward
+    # stable on [-1, 1].
+    P = np.zeros((L + 1, M, M, nb))
     P[0] = 1.0
     if L >= 1:
         P[1] = 0.5 * (af - bf) + (1.0 + 0.5 * (af + bf)) * x
@@ -398,13 +409,19 @@ def wigner_d_matrix(L, beta):
     sign = np.where(lam % 2 == 0, 1.0, -1.0)
     # angular factors; 0^0 = 1 is the correct limit here
     with np.errstate(divide="ignore"):
+        log_sh = np.log(np.maximum(sh, 1e-300))[None, None, :]
+        log_ch = np.log(np.maximum(ch, 1e-300))[None, None, :]
         ang = np.where(
-            (a == 0) & (sh == 0.0), 1.0, np.exp(np.log(np.maximum(sh, 1e-300)) * af)
+            (a[..., None] == 0) & (sh[None, None, :] == 0.0),
+            1.0,
+            np.exp(log_sh * af),
         ) * np.where(
-            (b == 0) & (ch == 0.0), 1.0, np.exp(np.log(np.maximum(ch, 1e-300)) * bf)
+            (b[..., None] == 0) & (ch[None, None, :] == 0.0),
+            1.0,
+            np.exp(log_ch * bf),
         )
 
-    d = np.zeros((L + 1, M, M))
+    d = np.zeros((L + 1, M, M, nb))
     for l_ in range(L + 1):
         valid = mx <= l_
         k = l_ - mx
@@ -414,9 +431,9 @@ def wigner_d_matrix(L, beta):
         )
         bot = fl[np.maximum(k + b, 0)] - fl[np.maximum(k, 0)] - fl[b]
         pref = np.exp(0.5 * (top - bot))
-        Pk = np.take_along_axis(P, np.maximum(k, 0)[None], axis=0)[0]
-        d[l_] = np.where(valid, sign * pref * ang * Pk, 0.0)
-    return d
+        Pk = np.take_along_axis(P, np.maximum(k, 0)[None, ..., None], axis=0)[0]
+        d[l_] = np.where(valid[..., None], (sign * pref)[..., None] * ang * Pk, 0.0)
+    return d[..., 0] if scalar else d
 
 
 def rot_zyz(alpha, beta, gamma):
@@ -489,10 +506,15 @@ def correlogram(f, g, n_beta=None):
     m = np.arange(-L, L + 1)
     Ea = np.exp(-1j * np.outer(m, alphas))  # [M, n_ang]
     C = np.empty((n_ang, n_beta, n_ang))
-    for t, beta in enumerate(betas):
-        d = wigner_d_matrix(L, beta)
-        S = np.einsum("lm,lmn,ln->mn", np.conj(f), d, g)
-        C[:, t, :] = np.real(Ea.T @ S @ Ea)
+    # batched Wigner build, chunked so the (L+1, M, M, chunk) tensor stays
+    # a few hundred MB (29 MB per beta at L = 96)
+    chunk = max(1, int(2.5e8 // (8 * (L + 1) * (2 * L + 1) ** 2)))
+    for t0 in range(0, n_beta, chunk):
+        bs = betas[t0 : t0 + chunk]
+        d = wigner_d_matrix(L, bs)  # [L+1, M, M, nb]
+        S = np.einsum("lm,lmnb,ln->bmn", np.conj(f), d, g, optimize=True)
+        for j in range(len(bs)):
+            C[:, t0 + j, :] = np.real(Ea.T @ S[j] @ Ea)
     return C, alphas, betas, gammas
 
 

@@ -1952,6 +1952,27 @@ def run_spherical_index(
     from subhkl.instrument.detector import Detector
     from subhkl.search import spherical as sph
 
+    # Persistent XLA compilation cache: profiling showed 6.5 s of a 29 s
+    # CLI invocation compiling the same matching-free refinement kernels
+    # every run.  The cache is keyed by compiler fingerprint, so a jax
+    # upgrade simply misses once and refills.
+    try:
+        import os
+
+        import jax
+
+        if jax.config.jax_compilation_cache_dir is None:
+            jax.config.update(
+                "jax_compilation_cache_dir",
+                os.path.join(
+                    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+                    "subhkl",
+                    "jax",
+                ),
+            )
+    except Exception:
+        pass
+
     with h5py.File(peaks_h5_filename, "r") as fp:
         bank = fp["bank"][()]
         pr = fp["peaks/pixel_r"][()]

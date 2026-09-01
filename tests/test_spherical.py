@@ -525,3 +525,12 @@ def test_matching_free_refinement_recovers_orientation_and_cell():
     assert np.rad2deg(_quat_angle(R2, R_true)) < 0.15
     assert shape_err(B2, B_true) < 0.4 * shape_err(B0, B_true)
     assert c2 > c1  # the cell parameters absorb real signal
+
+
+def test_wigner_d_batched_equals_scalar():
+    """The beta-batched build (the correlogram hot path) is bit-consistent
+    with the scalar path it replaced."""
+    betas = np.array([0.2, 0.9, 1.7, 2.9])
+    batched = wigner_d_matrix(8, betas)
+    for j, b in enumerate(betas):
+        assert np.allclose(batched[..., j], wigner_d_matrix(8, float(b)), atol=1e-14)
