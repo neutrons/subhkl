@@ -499,3 +499,46 @@ def test_beam_tilt_recovered():
     )
     err = np.rad2deg(np.arccos(np.clip(out["ki_refined"] @ ki_true, -1, 1)))
     assert err < 0.1
+
+
+def test_a_clipped_parameter_is_reported_not_hidden():
+    """A refinable pinned at its bound is a clipped fit, not a converged
+    one, and used to be reported as a plain number.  Measured instance:
+    CG4D's coherent +24 mm radial detector error is 5.4% of the 0.448 m
+    distance, past the 5% default, so the radial mode sat at exactly
+    0.0500 in every report while the geometry stayed wrong.  Here a 2 mm
+    panel translation is refined under a 0.5 mm bound: the fit must run to
+    the bound AND say so, with the flag that lifts it."""
+    rng = np.random.default_rng(19)
+    det_norm_true = np.full(12, 0.5)
+    trans_true = np.array([2.0e-3, 0.0, 0.0])
+    det_norm_true[0:3] = 0.5 + trans_true / (2 * BOUNDS["independent_trans"])
+    ct, ut, vt = _modes(det_norm_true)
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0]])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
+    peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
+
+    tight = {"independent_trans": 5.0e-4, "independent_rot": np.deg2rad(1.0)}
+    out = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, det_bounds=tight, kernel_deg=1.0, maxiter=300
+    )
+    sat = out["at_bounds"]
+    assert sat, "a 2 mm offset refined under a 0.5 mm bound must report the clip"
+    trans_hits = [e for e in sat if e["what"] == "detector independent translation"]
+    assert trans_hits
+    e = max(trans_hits, key=lambda x: abs(x["value"]))
+    assert abs(e["value"]) >= 0.98 * tight["independent_trans"]
+    assert e["flag"] == "--det-trans-bound"
+
+    # and with room to move, nothing is flagged: the check must not cry
+    # wolf on a converged fit
+    out2 = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, det_bounds=BOUNDS, kernel_deg=1.0, maxiter=400
+    )
+    assert not [
+        e for e in out2["at_bounds"] if e["what"] == "detector independent translation"
+    ]

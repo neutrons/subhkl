@@ -1747,4 +1747,135 @@ def refine_instrument_matching_free(
         out["sample_offset_m"] = np.asarray(s_off) + np.asarray(extras["samp"])
     if n_prt:
         out["per_run_trans_m"] = np.asarray(extras["prt"])
+
+    # Bound saturation.  Every refinable lives in [0, 1] mapped onto
+    # [-bound, +bound], and Adam projects back into the box -- so a
+    # parameter that ends AT its bound is a clipped fit, not a converged
+    # one: the objective wanted to go further and was not allowed to.
+    # Silently, until now.  Measured instance: CG4D's coherent +24 mm
+    # radial detector error is 5.4% of the 0.448 m distance, past the 5%
+    # default, so the radial mode sat exactly at 0.0500 in every report
+    # while the geometry stayed wrong.
+    at_bounds = []
+
+    def _check(label, vals, bound, unit, flag):
+        if bound is None or not np.isfinite(bound) or bound <= 0:
+            return
+        v = np.atleast_1d(np.asarray(vals, dtype=float)).reshape(-1)
+        for i_v, x in enumerate(v):
+            if abs(x) >= 0.98 * bound:
+                at_bounds.append(
+                    {
+                        "what": label,
+                        "index": int(i_v),
+                        "value": float(x),
+                        "bound": float(bound),
+                        "unit": unit,
+                        "flag": flag,
+                    }
+                )
+
+    _det_meta = {
+        "radial": ("radial", "radial", "--det-radial-bound-frac", ""),
+        "cylindrical": ("cylindrical", "radial", "--det-radial-bound-frac", ""),
+        "axial_stretch": ("axial_stretch", "radial", "--det-radial-bound-frac", ""),
+        "area": ("area", "area", "--det-area-bound-frac", ""),
+        "global_rot": ("global_rot", "global_rot", "--det-global-rot-bound-deg", "rad"),
+        "global_rot_axis": (
+            "global_rot_axis",
+            "global_rot_axis",
+            "--det-global-rot-bound-deg",
+            "rad",
+        ),
+        "global_trans": (
+            "global_trans",
+            "global_trans",
+            "--det-global-trans-bound",
+            "m",
+        ),
+    }
+    dp_out = np.asarray(det_norm)
+    for mode_ in modes:
+        if mode_ == "independent":
+            ip = dp_out[param_slices["independent"]]
+            _check(
+                "detector independent translation",
+                forward_map_param(ip[: n_banks * 3], det_bounds["independent_trans"]),
+                det_bounds["independent_trans"],
+                "m",
+                "--det-trans-bound",
+            )
+            _check(
+                "detector independent tilt",
+                forward_map_param(ip[n_banks * 3 :], det_bounds["independent_rot"]),
+                det_bounds["independent_rot"],
+                "rad",
+                "--det-rot-bound-deg",
+            )
+            continue
+        name_, bkey, flag_, unit_ = _det_meta[mode_]
+        _check(
+            f"detector {name_}",
+            forward_map_param(dp_out[param_slices[mode_]], det_bounds[bkey]),
+            det_bounds[bkey],
+            unit_,
+            flag_,
+        )
+    if gonio is not None:
+        _check(
+            "goniometer offset",
+            np.asarray(goff),
+            gonio_bound,
+            "deg",
+            "--gonio-bound-deg",
+        )
+        if n_tilt:
+            _check(
+                "goniometer axis tilt",
+                np.asarray(extras["tilt"]),
+                tilt_bound,
+                "rad",
+                "--gonio-axis-vector-bound-deg",
+            )
+        if n_prun:
+            _check(
+                "goniometer per-run correction",
+                np.asarray(extras["prun"]),
+                per_run_bound,
+                "deg",
+                "--gonio-per-run-bound-deg",
+            )
+        if n_harm:
+            _check(
+                "goniometer harmonic coefficient",
+                np.asarray(extras["harm"]),
+                harm_bound,
+                "deg",
+                "--gonio-harmonics-bound-deg",
+            )
+    if n_beam:
+        _check(
+            "beam tilt",
+            np.asarray(extras["beam"]),
+            np.deg2rad(beam_bound_deg),
+            "rad",
+            "--beam-bound-deg",
+        )
+    if n_samp:
+        _check(
+            "sample offset",
+            np.asarray(extras["samp"]),
+            sample_bound_m,
+            "m",
+            "--sample-bound-m",
+        )
+    if n_prt:
+        _check(
+            "per-run sample translation",
+            np.asarray(extras["prt"]),
+            per_run_trans_bound_m,
+            "m",
+            "--gonio-per-run-trans-bound-m",
+        )
+    out["at_bounds"] = at_bounds
     return out

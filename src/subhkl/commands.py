@@ -2820,6 +2820,42 @@ def run_spherical_index(
                 "  per_run_trans_m: largest "
                 f"{1e3 * np.abs(out_ref['per_run_trans_m']).max():.2f} mm"
             )
+        if out_ref.get("at_bounds"):
+            # A refinable pinned at its bound is a clipped fit, not a
+            # converged one -- the objective wanted to go further.  Say so
+            # with the flag that lets it: CG4D's +24 mm radial error is
+            # 5.4% of the distance and sat silently at the 5% default.
+            sat = out_ref["at_bounds"]
+            print(
+                f"  WARNING: {len(sat)} refined parameter(s) sat AT their "
+                "bounds -- the fit was clipped, not converged; raise the "
+                "bound and re-run, or the geometry stays wrong:"
+            )
+            per_flag = {}
+            for entry in sat:
+                per_flag.setdefault(entry["flag"], []).append(entry)
+            for flag_, entries in per_flag.items():
+                e0 = max(entries, key=lambda e: abs(e["value"]))
+                what = e0["what"]
+                unit = e0["unit"]
+                val, bnd = e0["value"], e0["bound"]
+                if unit == "rad":
+                    val, bnd, unit = np.rad2deg(val), np.rad2deg(bnd), "deg"
+                elif unit == "m":
+                    val, bnd, unit = 1e3 * val, 1e3 * bnd, "mm"
+                if what.startswith("goniometer") and g_names is not None:
+                    idx = e0["index"]
+                    if what.endswith("offset") and idx < len(g_names):
+                        what = f"{what} [{g_names[idx].split(':')[-1]}]"
+                    elif "per-run" in what:
+                        what = f"{what} [run {run_list[idx]}]"
+                n_more = len(entries) - 1
+                print(
+                    f"      {what}: {val:+.4g}{' ' + unit if unit else ''} at the "
+                    f"{bnd:.4g}{' ' + unit if unit else ''} bound"
+                    + (f" (and {n_more} more)" if n_more else "")
+                    + f" -- {flag_}"
+                )
         if "gonio_offsets_deg" in out_ref:
             gonio_offsets_deg = out_ref["gonio_offsets_deg"]
             print(
