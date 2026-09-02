@@ -1335,6 +1335,33 @@ def spherical_index(
             help="Also refine the cell SHAPE (scale is structurally invisible to directions and stays nominal)",
         ),
     ] = False,
+    model: Annotated[
+        str,
+        typer.Option(
+            "--model",
+            help=(
+                "Dictionary for the search and the refinements: 'nodal' (crossings "
+                "of the zone-axis great circles, weighted by pair multiplicity; "
+                "small, low-coherence) or 'reflections' (every reflection "
+                "direction at d_min)"
+            ),
+        ),
+    ] = "nodal",
+    nodal_max_index: Annotated[
+        int,
+        typer.Option("--nodal-max-index", help="Zone-axis cut |uvw| for --model nodal"),
+    ] = 3,
+    final_full_refine: Annotated[
+        bool,
+        typer.Option(
+            "--final-full-refine",
+            help=(
+                "Optional last stage on the full reflection list after the nodal "
+                "solve: the instrument refinement (or, without it, one more "
+                "orientation/cell pass) sees every reflection at d_min"
+            ),
+        ),
+    ] = False,
     lam: Annotated[
         float,
         typer.Option("--lam", help="L1 penalty on the candidates' sparse weights"),
@@ -1612,6 +1639,9 @@ def spherical_index(
             else None
         ),
         fit_gonio_offsets=fit_gonio_offsets,
+        model=model,
+        nodal_max_index=nodal_max_index,
+        final_full_refine=final_full_refine,
         det_trans_bound=det_trans_bound,
         det_rot_bound_deg=det_rot_bound_deg,
         gonio_bound_deg=gonio_bound_deg,

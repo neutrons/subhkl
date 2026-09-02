@@ -580,3 +580,51 @@ def test_chunking_the_overlap_changes_nothing_but_the_memory():
         peaks, NOMINAL, hkl, B0, R_true, max_overlap_elems=n_data * 11, **common
     )
     assert abs(whole["loglik"] - exact["loglik"]) < 1e-5
+
+
+def test_model_weights_are_scale_free_and_chunk_exactly():
+    """A weighted dictionary (nodal multiplicities) reaches the objective
+    through model_weights.  The density is unnormalized against a fixed
+    floor, so the weights are scaled to mean 1: a uniform vector of any
+    scale is the unweighted problem, and a non-uniform one gives the same
+    number whether or not the overlap is chunked."""
+    from subhkl.search.spherical import nodal_points
+
+    rng = np.random.default_rng(37)
+    ct, ut, vt = _modes(np.full(12, 0.5))
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0]])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
+    peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
+    n_data = len(peaks["det_idx"])
+    common = dict(det_bounds=BOUNDS, kernel_deg=1.0, maxiter=1)
+
+    plain = refine_instrument_matching_free(peaks, NOMINAL, hkl, B0, R_true, **common)
+    scaled = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, model_weights=np.full(len(hkl), 7.0), **common
+    )
+    assert abs(plain["loglik"] - scaled["loglik"]) < 1e-6
+
+    hkl_n, w_n = nodal_points(B0, max_index=2)
+    whole = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl_n, B0, R_true, model_weights=w_n, **common
+    )
+    chunked = refine_instrument_matching_free(
+        peaks,
+        NOMINAL,
+        hkl_n,
+        B0,
+        R_true,
+        model_weights=w_n,
+        max_overlap_elems=n_data * 8,
+        **common,
+    )
+    assert abs(whole["loglik"] - chunked["loglik"]) < 1e-5
+    # and the weights matter: the nodal problem is not the uniform one
+    uniform = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl_n, B0, R_true, **common
+    )
+    assert abs(whole["loglik"] - uniform["loglik"]) > 1e-4

@@ -567,3 +567,97 @@ def test_project_counts_device_matches_numpy():
     F_dev = project_counts_device(d, W, 48, 0.02)
     scale = np.abs(F_np).max()
     assert np.abs(F_dev - F_np).max() / scale < 2e-3
+
+
+# ---------------------------------------------------------------------------
+# nodal points: the crossings of the zone-ring family
+# ---------------------------------------------------------------------------
+
+
+def test_nodal_points_are_the_zone_crossings():
+    """A node is where two zone great circles cross, and that crossing is a
+    reciprocal direction: hkl = uvw_1 x uvw_2.  The triples come back
+    primitive, sign-canonical and unique, their directions coincide with
+    the real-space cross products of the zone axes, the weights are the
+    accumulated ring-pair weights, and for a cubic cell the set is its
+    own image under the cubic group (which the search relies on when it
+    keeps one representative per Laue-equivalent candidate)."""
+    from subhkl.search.spherical import nodal_points
+
+    a = 8.0
+    B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
+    hkl, w = nodal_points(B, max_index=1)
+    assert np.all(np.gcd.reduce(np.abs(hkl), axis=1) == 1)
+    assert len(np.unique(hkl, axis=0)) == len(hkl)
+    lead = np.where(
+        hkl[:, 0] != 0, hkl[:, 0], np.where(hkl[:, 1] != 0, hkl[:, 1], hkl[:, 2])
+    )
+    assert np.all(lead > 0)
+    assert np.all(w > 0)
+    for node in ([0, 0, 1], [0, 1, 1], [1, 1, 1]):
+        assert np.any(np.all(hkl == node, axis=1))
+    # every node lies on the crossing of two zone rings of the family
+    axes, wz = zone_axes(np.diag([a, a, a]), max_index=1)
+    G = hkl @ B.T
+    dirs = G / np.linalg.norm(G, axis=1, keepdims=True)
+    crossings = []
+    for i in range(len(axes)):
+        for j in range(i + 1, len(axes)):
+            c = np.cross(axes[i], axes[j])
+            if np.linalg.norm(c) > 1e-9:
+                crossings.append(c / np.linalg.norm(c))
+    crossings = np.array(crossings)
+    assert np.all(np.max(np.abs(dirs @ crossings.T), axis=1) > 1 - 1e-9)
+    # [001] collects more ring pairs than [111]: it is the crossing of the
+    # <100> zones and of every <110> pair in its plane
+    w001 = w[np.all(hkl == [0, 0, 1], axis=1)][0]
+    w111 = w[np.all(hkl == [1, 1, 1], axis=1)][0]
+    assert w001 > w111
+    # cubic invariance of the direction set
+    for S in _cubic_rots():
+        assert np.all(np.max(np.abs((dirs @ S.T) @ dirs.T), axis=1) > 1 - 1e-9)
+    # the dictionary grows with the zone cut, well below the reflection count
+    n2 = len(nodal_points(B, max_index=2)[0])
+    n3 = len(nodal_points(B, max_index=3)[0])
+    assert len(hkl) < n2 < n3
+    assert n3 < len(lattice_directions(B, 1.0)[0]) * 4
+
+
+def test_nodal_dictionary_recovers_the_orientation_matching_free():
+    """The nodal points alone -- a few hundred low-index directions, no
+    reflection list -- find the orientation from full-resolution data,
+    polished without any datum-to-node assignment (most data lie on no
+    node), and the matching-free refinement on the nodal TRIPLES carries
+    on from there through the same B the reflections use."""
+    from subhkl.search.spherical import nodal_points
+
+    rng = np.random.default_rng(17)
+    a = 8.0
+    B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
+    dirs, _ = lattice_directions(B, 1.0)
+    R0 = _rand_rot(rng)
+    keep = rng.random(len(dirs)) < 0.7
+    obs = dirs[keep] @ R0.T + rng.normal(scale=np.deg2rad(0.2), size=(keep.sum(), 3))
+    obs /= np.linalg.norm(obs, axis=1, keepdims=True)
+    obs = np.vstack([obs, _rand_dirs(rng, len(obs) // 4)])
+    hkl_n, w_n = nodal_points(B, max_index=2)
+    G = hkl_n @ B.T
+    nodal_dirs = G / np.linalg.norm(G, axis=1, keepdims=True)
+    assert len(nodal_dirs) < len(dirs) / 2
+    res = find_orientations(
+        obs,
+        model_dirs=nodal_dirs,
+        model_weights=w_n,
+        kernel_deg=1.0,
+        n_candidates=2,
+        refine_method="local",
+    )
+    R = res[0]["R"]
+    assert res[0]["n_matched"] == 0  # no assignment was made
+    assert res[0]["z"] > 8.0
+    assert _err_mod(R, R0, _cubic_rots()) < 0.5
+    sig = np.deg2rad(1.0) / np.sqrt(8 * np.log(2))
+    f = project_points(obs, None, 64, sig)
+    R2, B2, _ = refine_matching_free(f, R, hkl_n, B, weights=w_n, kernel_deg=1.0)
+    np.testing.assert_allclose(B2, B)
+    assert _err_mod(R2, R0, _cubic_rots()) < 0.3

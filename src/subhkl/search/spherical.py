@@ -196,6 +196,59 @@ def zone_axes(cell_basis, max_index=3):
     return t / tn[:, None], 1.0 / tn
 
 
+def _canonical_sign(v):
+    """Orient integer triples so the first nonzero component is positive:
+    +-v are one direction on the sphere (and one line for the kernel)."""
+    lead = np.where(v[:, 0] != 0, v[:, 0], np.where(v[:, 1] != 0, v[:, 1], v[:, 2]))
+    return v * np.where(lead < 0, -1, 1)[:, None]
+
+
+def nodal_points(B, max_index=3):
+    """Nodal points: the crossings of the zone-ring family, as hkl.
+
+    Zone [uvw] draws a great circle on the direction sphere (the Funk
+    transform of its reciprocal directions), and two zones cross at the
+    reciprocal direction hkl = uvw_1 x uvw_2 -- so the crossings are
+    themselves lattice directions, the low-index ones, each weighted by
+    the zone pairs meeting there (1/|t_1| 1/|t_2| per pair, the ring
+    weights, summed over pairs).  A 0-D dictionary derived from the 1-D
+    one: it keeps the ring basis's orientation-selective low-index content
+    but has a point-sharp autocorrelation and a mutual-coherence floor far
+    below the uniform reflection set's -- measured on CG4D garnet at a 1
+    deg kernel, 0.003 at |uvw| <= 2 against 0.063 for every reflection to
+    1 A and 0.31 for the rings themselves -- so its correlogram basins
+    separate at modest bandwidth.  Its size follows the zone cut, not the
+    reflection count: 357 / 3,233 / 13,117 points at |uvw| <= 2 / 3 / 4
+    where a 100 A cell has 157k reflections (65k directions) at 2.5 A.
+    The price is leverage: the high-index reflections that pin the finest
+    orientation precision are not in it (0.2 deg against 0.12 deg on
+    garnet), which is what a final pass on the full list restores.
+
+    Returns (hkl [N, 3] int, weights [N]).  Directions are hkl @ B.T
+    normalized, so a refined B moves the nodes exactly as it moves the
+    reflections -- pass the triples, not the directions, to a refinement.
+    """
+    B = np.asarray(B, dtype=float)
+    A = np.linalg.inv(B).T  # real-space basis as rows, a . a* = 1
+    rng = np.arange(-max_index, max_index + 1)
+    u, v, w = np.meshgrid(rng, rng, rng, indexing="ij")
+    uvw = np.stack([u.ravel(), v.ravel(), w.ravel()], axis=1)
+    uvw = uvw[np.any(uvw != 0, axis=1)]
+    gcd = np.gcd.reduce(np.abs(uvw), axis=1)
+    uvw = np.unique(_canonical_sign(uvw // gcd[:, None]), axis=0)
+    wz = 1.0 / np.linalg.norm(uvw @ A, axis=1)
+    i, j = np.triu_indices(len(uvw), k=1)
+    hkl = np.cross(uvw[i], uvw[j])
+    keep = np.any(hkl != 0, axis=1)
+    hkl, wp = hkl[keep], wz[i][keep] * wz[j][keep]
+    gcd = np.gcd.reduce(np.abs(hkl), axis=1)
+    hkl = _canonical_sign(hkl // gcd[:, None])
+    uniq, inv = np.unique(hkl, axis=0, return_inverse=True)
+    weights = np.zeros(len(uniq))
+    np.add.at(weights, inv.ravel(), wp)
+    return uniq, weights
+
+
 # ---------------------------------------------------------------------------
 # spherical harmonics
 # ---------------------------------------------------------------------------
@@ -1003,6 +1056,7 @@ def find_orientations(
     min_sep_deg=10.0,
     refine=True,
     lam=0.0,
+    refine_method="wahba",
 ):
     """Find crystal orientations from measured Q directions.
 
@@ -1012,7 +1066,15 @@ def find_orientations(
     angular width [deg] given to every direction (mosaic + measurement);
     L defaults to the bandwidth at which that kernel has decayed to ~1%,
     capped at 96 -- candidates only need to be separated here, refinement
-    restores full precision off-grid.
+    restores full precision off-grid.  refine_method picks how a point
+    model's candidates are polished: "wahba" assigns each datum to its
+    nearest model direction within 3 deg and solves the orthogonal
+    Procrustes problem, right when the model holds every direction the
+    data can show; "local" ascends the band-limited correlation itself
+    (no assignment), the choice for a partial dictionary such as
+    nodal_points, where most data lie on no model direction and an
+    assignment to the nearest node would bias the fit.  Ring models
+    always use "local".
 
     Returns a list of dicts {R, score, z, n_matched, c}, best first.
     """
@@ -1040,7 +1102,7 @@ def find_orientations(
     gnorm = np.sqrt(inner_gg(np.eye(3)))
     for R, val in cands:
         n_matched = 0
-        if refine and model_dirs is not None:
+        if refine and model_dirs is not None and refine_method == "wahba":
             R, n_matched = refine_wahba(R, data_dirs, model_dirs)
             val = inner_fg(R)
         elif refine:
@@ -1335,6 +1397,7 @@ def refine_instrument_matching_free(
     per_run_trans=False,
     per_run_trans_bound_m=0.005,
     max_overlap_elems=MAX_OVERLAP_ELEMS,
+    model_weights=None,
 ):
     """Joint matching-free refinement of orientation, cell shape, detector
     panels and goniometer offsets -- one likelihood, no peak assignment.
@@ -1502,7 +1565,16 @@ def refine_instrument_matching_free(
     n_prt = 3 * angles_deg.shape[0] if (per_run_trans and gonio is not None) else 0
 
     hkl_j = np.asarray(hkl, dtype=float)
-    w_model = jnp.ones(len(hkl_j))
+    # Model weights (nodal multiplicities, harmonic counts) scaled to mean
+    # 1: the density is unnormalized and the uniform floor is set against
+    # a unit-height direction, so the scale must not drift with the
+    # dictionary.  Uniform weights are untouched by this.
+    if model_weights is None:
+        w_model_np = np.ones(len(hkl_j))
+    else:
+        w_model_np = np.asarray(model_weights, float)
+        w_model_np = w_model_np * (len(w_model_np) / np.sum(w_model_np))
+    w_model = jnp.asarray(w_model_np)
     # Chunk plan for the (data x model) overlap -- static, so the jitted
     # objective has one shape.  Padding rows carry weight 0 and contribute
     # nothing, which keeps the chunked sum exact rather than approximate.
@@ -1518,9 +1590,7 @@ def refine_instrument_matching_free(
             [np.arange(n_model_j), np.zeros(n_chunks * chunk_m - n_model_j, dtype=int)]
         )
         w_model_pad = jnp.asarray(
-            np.concatenate(
-                [np.ones(n_model_j), np.zeros(n_chunks * chunk_m - n_model_j)]
-            )
+            np.concatenate([w_model_np, np.zeros(n_chunks * chunk_m - n_model_j)])
         )
         print(
             f"    matching-free refinement: {n_peaks} x {n_model_j} overlap "

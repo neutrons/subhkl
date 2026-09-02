@@ -458,3 +458,45 @@ def test_refined_instrument_reaches_the_consumers_layout(tmp_path):
     # global_trans moved every panel by the same vector
     shifts = np.stack([centers[b] - nominal_centers[b] for b in centers])
     assert np.allclose(shifts, shifts[0], atol=1e-6)
+
+
+def test_nodal_dictionary_indexes_end_to_end(tmp_path):
+    """The default dictionary is the nodal set: a P1 cell's zone crossings
+    to |uvw| <= 2 index the synthetic scene through the CLI path, the file
+    records which dictionary solved it, and the optional full-list final
+    stage continues from that solution rather than replacing it."""
+    rng = np.random.default_rng(29)
+    peaks_file = str(tmp_path / "finder.h5")
+    U_true, n = _synthetic_finder_file(peaks_file, rng)
+
+    out_nodal = str(tmp_path / "nodal.h5")
+    run_spherical_index(
+        peaks_file, out_nodal, d_min=1.3, kernel_deg=1.0, nodal_max_index=2
+    )
+    with h5py.File(out_nodal) as fp:
+        U = fp["sample/U"][()]
+        assert fp["spherical/model"][()].decode() == "nodal"
+        assert int(fp["spherical/nodal_max_index"][()]) == 2
+        assert not bool(fp["spherical/final_full_refine"][()])
+        n_model = int(fp["spherical/model_size"][()])
+        z = fp["spherical/z"][()]
+    assert 0 < n_model < 400
+    assert z[0] > 8.0
+    err_nodal = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
+    assert err_nodal < 0.5
+
+    out_full = str(tmp_path / "nodal_full.h5")
+    run_spherical_index(
+        peaks_file,
+        out_full,
+        d_min=1.3,
+        kernel_deg=1.0,
+        nodal_max_index=2,
+        final_full_refine=True,
+    )
+    with h5py.File(out_full) as fp:
+        U2 = fp["sample/U"][()]
+        assert bool(fp["spherical/final_full_refine"][()])
+    err_full = min(np.rad2deg(_quat_angle(U2, U_true @ S)) for S in _cubic_rots())
+    assert err_full < 0.5
+    assert err_full <= err_nodal + 0.05

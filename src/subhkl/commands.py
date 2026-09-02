@@ -2243,6 +2243,9 @@ def run_spherical_index(
     refine_maxiter: int = 400,
     refine_max_points: int = 100_000,
     fit_gonio_offsets: bool = False,
+    model: str = "nodal",
+    nodal_max_index: int = 3,
+    final_full_refine: bool = False,
 ):
     """Index by spherical correlation over SO(3) -- the matched-filter dual
     of the sparse orientation-recovery problem (subhkl.search.spherical).
@@ -2265,6 +2268,20 @@ def run_spherical_index(
     search (given the same refined goniometer; with nominal goniometer the
     difference is the omega offset, which is exactly the gauge the
     refinement stage owns).
+
+    ``model`` picks the dictionary the search and the refinements see:
+    "nodal" (default) is the crossings of the zone-axis great circles to
+    |uvw| <= nodal_max_index, weighted by pair multiplicity (see
+    spherical.nodal_points) -- a few thousand low-index directions with a
+    mutual-coherence floor an order of magnitude below the full set's, so
+    its basins separate at the default bandwidth and the (data x model)
+    overlap of the instrument refinement shrinks with it; "reflections" is
+    every reflection direction at d_min, the dictionary before nodal
+    points existed.  ``final_full_refine`` keeps that full-list stage as an
+    optional last step after the nodal solve: the instrument refinement
+    (or, when it is off, one more orientation/cell pass) then sees every
+    reflection, restoring the leverage of the high-index directions the
+    nodal set leaves out.
     """
     from subhkl.config import beamlines
     from subhkl.core.crystallography import (
@@ -2517,6 +2534,42 @@ def run_spherical_index(
     key = np.round(dirs * np.where(dirs[:, [0]] < -1e-9, -1, 1), 5)
     _, idx = np.unique(key, axis=0, return_index=True)
     dirs = dirs[idx]
+    hkl_all = np.stack([h_, k_, l_], axis=1)
+    # The dictionary.  Nodal points enter every stage as INTEGER triples
+    # with weights, so the strain a cell refinement applies to B moves them
+    # exactly as it moves the reflections; the search itself only ever
+    # sees the nominal cell (a coarse stage), and refinement takes it from
+    # there.  A partial dictionary is polished matching-free ("local"):
+    # assigning every datum to its nearest node would bias the fit.
+    if model == "nodal":
+        hkl_model, w_model = sph.nodal_points(B, max_index=nodal_max_index)
+        G_m = hkl_model @ B.T
+        dirs_model = G_m / np.linalg.norm(G_m, axis=1, keepdims=True)
+        # Only the nodes the data can show.  A node is a lattice direction,
+        # but one whose every in-band harmonic lies beyond d_min or is a
+        # systematic absence never receives a peak: it would add mass to
+        # the model (and coherence to the dictionary) and no signal.  On
+        # garnet at 1.2 A this keeps 577 of the 3,217 nodes to |uvw| <= 3.
+        n_nodes = len(hkl_model)
+        seen = np.max(np.abs(dirs_model @ dirs.T), axis=1) > np.cos(np.deg2rad(0.01))
+        hkl_model, w_model, dirs_model = (
+            hkl_model[seen],
+            w_model[seen],
+            dirs_model[seen],
+        )
+        if len(hkl_model) < 4:
+            raise ValueError(
+                f"only {len(hkl_model)} nodal points are observable at "
+                f"d_min={d_min:g}; raise --nodal-max-index or use --model reflections"
+            )
+        refine_method = "local"
+    elif model == "reflections":
+        hkl_model, w_model, dirs_model = hkl_all, None, dirs
+        refine_method = "wahba"
+    else:
+        raise ValueError(f"model must be 'nodal' or 'reflections', got {model!r}")
+    full_final = bool(final_full_refine) and model != "reflections"
+    hkl_inst, w_inst = (hkl_all, None) if full_final else (hkl_model, w_model)
     # Both counts, because they drive different stages: the SEARCH sees
     # unique directions (harmonics point the same way and collapse), the
     # REFINEMENT sees every reflection -- 2.4x more on a 100 A cell, and it
@@ -2526,12 +2579,22 @@ def run_spherical_index(
         f"{len(dirs)} model directions ({len(h_)} reflections) "
         f"at d_min={d_min:g}"
     )
+    if model == "nodal":
+        print(
+            f"spherical-index: nodal dictionary, {len(hkl_model)} of {n_nodes} "
+            f"zone crossings to |uvw| <= {nodal_max_index} observable at d_min"
+            + (
+                "; the final stage sees every reflection"
+                if full_final
+                else " (add --final-full-refine for a last pass on every reflection)"
+            )
+        )
 
     if f_raw is not None:
         # assemble the search manually around the precomputed raw f
         sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
         L = f_raw.shape[0] - 1
-        g = sph.project_points(dirs, None, L, sigma)
+        g = sph.project_points(dirs_model, w_model, L, sigma)
         C, al_, be_, ga_ = sph.correlogram(f_raw, g)
         cands = sph.top_orientations(C, al_, be_, ga_, n=n_candidates)
         results = []
@@ -2563,11 +2626,13 @@ def run_spherical_index(
     else:
         results = sph.find_orientations(
             d_sample,
-            model_dirs=dirs,
+            model_dirs=dirs_model,
+            model_weights=w_model,
             kernel_deg=kernel_deg,
             n_candidates=n_candidates,
             lam=lam,
             L=bandwidth,
+            refine_method=refine_method,
         )
     if not results:
         raise RuntimeError("no orientation candidate found")
@@ -2582,10 +2647,21 @@ def run_spherical_index(
             else int(min(max(np.ceil(3.0 / sigma), 16), 96))
         )
         f = f_raw if f_raw is not None else sph.project_points(d_sample, None, L, sigma)
-        hkl_all = np.stack([h_, k_, l_], axis=1)
         U, B_out, _ = sph.refine_matching_free(
-            f, U, hkl_all, B, kernel_deg=kernel_deg, refine_cell=refine_cell
+            f,
+            U,
+            hkl_model,
+            B,
+            weights=w_model,
+            kernel_deg=kernel_deg,
+            refine_cell=refine_cell,
         )
+        if full_final and not refine_instrument:
+            # the optional full-list stage, here the last one: continue
+            # from the nodal solution with every reflection in the model
+            U, B_out, _ = sph.refine_matching_free(
+                f, U, hkl_all, B_out, kernel_deg=kernel_deg, refine_cell=refine_cell
+            )
     # per-run goniometer metadata, shared by the two refinement stages
     run_list = sorted(int(x) for x in np.unique(run)) if run is not None else [0]
     angles_by_run = {}
@@ -2722,7 +2798,7 @@ def run_spherical_index(
         out_ref = sph.refine_instrument_matching_free(
             peaks_in,
             nominal_r,
-            np.stack([h_, k_, l_], axis=1),
+            hkl_inst,
             B,
             U,
             modes=modes_r,
@@ -2751,6 +2827,7 @@ def run_spherical_index(
             sample_bound_m=sample_bound_m,
             per_run_trans=refine_gonio_per_run_trans,
             per_run_trans_bound_m=gonio_per_run_trans_bound_m,
+            model_weights=w_inst,
         )
         U, B_out = out_ref["R"], out_ref["B"]
         # The refined instrument, kept as geometry (not as the normalized
@@ -2900,10 +2977,12 @@ def run_spherical_index(
             m_ = run == r_
             res_r = sph.find_orientations(
                 d_lab[m_],
-                model_dirs=dirs,
+                model_dirs=dirs_model,
+                model_weights=w_model,
                 kernel_deg=kernel_deg,
                 n_candidates=1,
                 L=bandwidth,
+                refine_method=refine_method,
             )
             U_runs[r_] = res_r[0]["R"]
             R_nom[r_] = (Rg if Rg.shape[0] == len(pr) else Rg[img])[np.argmax(m_)]
@@ -3123,6 +3202,10 @@ def run_spherical_index(
                 ).astype(np.float64)
                 out["goniometer/R_nominal"] = Rg
             out["goniometer/R"] = R_write
+        out["spherical/model"] = model
+        out["spherical/model_size"] = len(hkl_model)
+        out["spherical/nodal_max_index"] = int(nodal_max_index)
+        out["spherical/final_full_refine"] = bool(full_final)
         out["spherical/U_candidates"] = np.stack([r["R"] for r in results])
         out["spherical/z"] = np.array([r["z"] for r in results])
         out["spherical/n_matched"] = np.array([r["n_matched"] for r in results])
