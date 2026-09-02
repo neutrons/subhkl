@@ -1582,7 +1582,6 @@ def refine_instrument_matching_free(
         apply_detector_modes,
         forward_map_param,
         gonio_rotation_jax,
-        peak_lab_xyz,
     )
 
     sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
@@ -1598,6 +1597,15 @@ def refine_instrument_matching_free(
     centers = jnp.asarray(np.asarray(detector_nominal["centers"], float))[None]
     uhats = jnp.asarray(np.asarray(detector_nominal["uhats"], float))[None]
     vhats = jnp.asarray(np.asarray(detector_nominal["vhats"], float))[None]
+    # Row membership as one-hot matrices, not index gathers.  The forward
+    # cost is the same, the BACKWARD is not: the gradient of a gather of
+    # 100k rows from 39 panels (or 11 runs) is a scatter-add into 39 (or
+    # 11) rows, which XLA serializes on the GPU -- an nsys trace of the L1
+    # refinement put 96% of device time in three such scatters, 0.41 s +
+    # 3 x 0.125 s per Adam step, with the GPU at 100 W.  As a matmul the
+    # gradient is a GEMM against the transposed membership, microseconds.
+    n_banks_m = centers.shape[1]
+    M_det_T = jnp.asarray(np.eye(n_banks_m, dtype=np.float32)[det_idx])  # [n, banks]
     widths = jnp.asarray(np.asarray(detector_nominal["widths"], float))[None]
     heights = jnp.asarray(np.asarray(detector_nominal["heights"], float))[None]
     n_banks = centers.shape[1]
@@ -1653,6 +1661,7 @@ def refine_instrument_matching_free(
         run_idx = np.asarray(peaks["run_idx"], dtype=int)
         n_goff = int(refine_mask.sum())
         n_runs_g = angles_deg.shape[0]
+        M_run_T = jnp.asarray(np.eye(n_runs_g, dtype=np.float32)[run_idx])  # [n, runs]
         base_dirs = axes[:, :3] / np.linalg.norm(axes[:, :3], axis=1, keepdims=True)
         frames_tilt = axis_tilt_frames(axes)
         # axis-vector tilts: two bounded angles per masked axis, about an
@@ -1792,9 +1801,15 @@ def refine_instrument_matching_free(
         origin = s_off
         if "samp" in extras:
             origin = origin + extras["samp"]
-        xyz = peak_lab_xyz(c, u, v, det_idx, u_off, v_off)[0] - origin
+        # peak_lab_xyz by membership matmul (see M_det_T above)
+        xyz = (
+            M_det_T @ c[0]
+            + u_off[:, None] * (M_det_T @ u[0])
+            + v_off[:, None] * (M_det_T @ v[0])
+            - origin
+        )
         if "prt" in extras:
-            xyz = xyz - extras["prt"][run_idx]
+            xyz = xyz - M_run_T @ extras["prt"]
         kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
         ki_eff = ki_hat
         if "beam" in extras:
@@ -1838,7 +1853,8 @@ def refine_instrument_matching_free(
                     for r in range(angles_deg.shape[0])
                 ]
             )
-            d_lab = jnp.einsum("nij,ni->nj", R_runs[run_idx], d_lab)  # R^T d
+            R_rows = (M_run_T @ R_runs.reshape(-1, 9)).reshape(-1, 3, 3)
+            d_lab = jnp.einsum("nij,ni->nj", R_rows, d_lab)  # R^T d
         # model side: orientation and (optionally) cell shape
         R = _rodrigues_jax(rotvec) @ jnp.asarray(R0)
         B = (jnp.eye(3) + A) @ jnp.asarray(B0)
