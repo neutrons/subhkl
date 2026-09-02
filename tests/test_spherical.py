@@ -693,3 +693,32 @@ def test_nearest_line_stats_matches_the_numpy_contraction():
     dev2, none = nearest_line_stats(pts, dirs, sigma, want_density=False)
     assert none is None
     np.testing.assert_allclose(dev2, dev_ref, atol=2e-3)
+
+
+def test_sph_coeffs_gradient_is_finite_at_high_bandwidth_near_the_poles():
+    """The matching-free refinement's objective must have a finite
+    gradient at every direction and bandwidth it is run at.  At L = 192
+    in float32 the sectoral Legendre chain underflows within ~20 deg of
+    the poles, and the recursion's backward pass turned that into NaN --
+    L-BFGS then aborted at iteration 0 and the refinement returned its
+    input unchanged, silently.  Measured on L1: 3,984 of 65k directions."""
+    import jax
+    import jax.numpy as jnp
+
+    from subhkl.search.spherical import _sph_coeffs_jax
+
+    rng = np.random.default_rng(2)
+    d = _rand_dirs(rng, 400)
+    d[:100, :2] *= 0.05  # push a quarter of them to within a few degrees of the pole
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    L = 192
+    sigma = np.deg2rad(0.5) / np.sqrt(8 * np.log(2))
+    f = jnp.asarray(rng.normal(size=(L + 1, 2 * L + 1)) + 0j, dtype=jnp.complex64)
+
+    def obj(dd):
+        g = _sph_coeffs_jax(dd, jnp.ones(len(dd)), L, sigma)
+        return -jnp.real(jnp.sum(jnp.conj(f) * g))
+
+    grad = np.asarray(jax.grad(obj)(jnp.asarray(d, dtype=jnp.float32)))
+    assert np.all(np.isfinite(grad))
+    assert np.any(grad != 0)

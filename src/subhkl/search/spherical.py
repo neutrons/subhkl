@@ -1388,6 +1388,16 @@ def _sph_coeffs_jax(dirs, weights, L, sigma):
         row = row.at[l_].set(-jnp.sqrt((2.0 * lf + 1.0) / (2.0 * lf)) * st * diag_prev)
         # zero out m > l
         row = jnp.where((m_idx <= lf)[:, None], row, 0.0)
+        # Entries that have underflowed carry no gradient.  Near the poles
+        # the sectoral chain st^m underflows float32 long before m = L
+        # (st = 0.35 at m = 192 is 1e-88), and the backward pass through
+        # the recursion's near-diagonal coefficients (~2l per step)
+        # amplifies the adjoint of those zeros into inf, then 0 x inf =
+        # NaN: at L = 192, 3,984 of L1's 65k directions -- every one
+        # within 20 deg of a pole -- and L-BFGS aborted at iteration 0, so
+        # refine_matching_free silently returned its input.  The forward
+        # values are untouched; a true 1e-90 has no gradient worth keeping.
+        row = jnp.where(jnp.abs(row) < 1e-30, lax.stop_gradient(row), row)
         g = g.at[l_].set(coeffs_from_row(row, l_))
         return (Pm1, row, g)
 
