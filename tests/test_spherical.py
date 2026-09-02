@@ -661,3 +661,35 @@ def test_nodal_dictionary_recovers_the_orientation_matching_free():
     R2, B2, _ = refine_matching_free(f, R, hkl_n, B, weights=w_n, kernel_deg=1.0)
     np.testing.assert_allclose(B2, B)
     assert _err_mod(R2, R0, _cubic_rots()) < 0.3
+
+
+def test_nearest_line_stats_matches_the_numpy_contraction():
+    """The device kernel behind the quality report is the numpy
+    (points x model-lines) contraction it replaced, chunked and padded
+    or not: the nearest line is found on the device and its angle taken
+    in float64 on the host (a float32 dot near 1 quantizes at 0.02 deg),
+    and the density is the full von Mises sum with no cutoff -- the
+    refinement's objective exactly."""
+    from subhkl.search.spherical import nearest_line_stats
+
+    rng = np.random.default_rng(5)
+    pts = _rand_dirs(rng, 700)
+    dirs = _rand_dirs(rng, 333)
+    # put some points very close to a line, where float32 angles fail
+    pts[:50] = dirs[:50] + rng.normal(scale=2e-4, size=(50, 3))
+    pts[:50] /= np.linalg.norm(pts[:50], axis=1, keepdims=True)
+    sigma = np.deg2rad(1.0) / np.sqrt(8 * np.log(2))
+    dots = np.clip(np.abs(pts @ dirs.T), 0.0, 1.0)
+    dev_ref = np.degrees(np.arccos(dots.max(axis=1)))
+    dens_ref = np.sum(np.exp(-2.0 * (1.0 - dots) / (2.0 * sigma * sigma)), axis=1)
+    for budget in (1 << 30, 700 * 40, 700 * 37):  # one pass; 9 chunks; padding
+        dev, dens = nearest_line_stats(pts, dirs, sigma, max_overlap_elems=budget)
+        np.testing.assert_allclose(dev, dev_ref, atol=2e-3)
+        # the density is a float32 sum of exp(-ang2 / 2 sigma^2) with
+        # 2 sigma^2 = 1e-4: the cancellation in 1 - dot costs ~1e-3
+        # relative, the same arithmetic the refinement's objective uses
+        np.testing.assert_allclose(dens, dens_ref, rtol=5e-3, atol=1e-5)
+        assert np.max(np.abs(dev[:50] - dev_ref[:50])) < 1e-3  # float64 angles
+    dev2, none = nearest_line_stats(pts, dirs, sigma, want_density=False)
+    assert none is None
+    np.testing.assert_allclose(dev2, dev_ref, atol=2e-3)

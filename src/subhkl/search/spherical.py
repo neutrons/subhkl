@@ -91,6 +91,32 @@ from functools import partial
 import numpy as np
 from scipy.special import gammaln
 
+
+def _precise(fn):
+    """Run a jax-backed function with full float32 matmuls.
+
+    On Ampere-class GPUs jax evaluates float32 matmuls at TF32 by
+    default (10-bit mantissa): measured here, a unit-vector dot product
+    carries up to 6e-4 of error, which next to 1 is a 2 deg angle -- the
+    width of the whole kernel these functions integrate over.  On a
+    synthetic scene with known geometry the instrument refinement's
+    orientation error doubled (0.16 -> 0.28 deg) and its panel-parameter
+    error tripled at the default.  Nothing here is a large GEMM, so the
+    cost of asking for the real float32 is nil; the config is scoped to
+    the call so the rest of the process keeps its own setting.
+    """
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        import jax
+
+        with jax.default_matmul_precision("highest"):
+            return fn(*args, **kwargs)
+
+    return wrapper
+
+
 # ---------------------------------------------------------------------------
 # geometry
 # ---------------------------------------------------------------------------
@@ -449,6 +475,7 @@ def _get_project_kernel():
     return kernel
 
 
+@_precise
 def project_counts_device(pixel_dirs, W, L, sigma, even_only=True):
     """project_counts on the accelerator: float32, all frames of a shared
     geometry in one fused pass.  Used by the raw-count CLI path; the
@@ -513,6 +540,96 @@ def _factln(n):
 #: running sum over chunks is the same number -- and the chunks are
 #: rematerialized so the backward pass does not undo the saving.
 MAX_OVERLAP_ELEMS = 1 << 28  # ~1.07 GB per float32 temporary
+
+
+def _overlap_chunk_plan(n_data, n_model, max_elems):
+    """How to slice a (data x model) overlap so no temporary exceeds
+    max_elems: (n_chunks, chunk_m, pad_idx).  pad_idx is None when one
+    pass fits; otherwise it lists model rows with the last chunk padded by
+    repeating row 0, and the caller gives the padding rows weight 0 so the
+    chunked sum stays exact rather than approximate."""
+    if n_data * n_model <= max_elems:
+        return 1, n_model, None
+    chunk_m = int(max(1, max_elems // max(n_data, 1)))
+    n_chunks = int(np.ceil(n_model / chunk_m))
+    pad_idx = np.concatenate(
+        [np.arange(n_model), np.zeros(n_chunks * chunk_m - n_model, dtype=int)]
+    )
+    return n_chunks, chunk_m, pad_idx
+
+
+@_precise
+def nearest_line_stats(
+    pts, dirs, sigma, want_density=True, max_overlap_elems=MAX_OVERLAP_ELEMS
+):
+    """Nearest model line and von Mises density for every data direction,
+    on the device.  Returns (dev_deg [n], dens [n]); dens is None without
+    want_density.
+
+    The same (data x model) overlap the instrument refinement evaluates,
+    chunked over the model axis by the same plan, and for the same
+    reason: at L1 scale (500k pixels against 65k reflection directions,
+    nine passes) the numpy version was a quarter hour of single-threaded
+    elementwise work with OpenBLAS spinning 128 threads around each tiny
+    chunk matmul while the GPU sat idle.  The device does the whole
+    contraction in seconds.  The angle is NOT taken from the float32 dot
+    product -- near 1 that quantizes at 0.02 deg, coarser than the medians
+    reported -- the device finds WHICH line is nearest and the host
+    recomputes that one angle in float64.  The density has no cutoff: it
+    is the refinement's objective exactly, every direction summed.
+    """
+    import jax
+    import jax.numpy as jnp
+    from jax import lax
+
+    P = np.asarray(pts, dtype=np.float64)
+    D = np.asarray(dirs, dtype=np.float64)
+    n, m = len(P), len(D)
+    n_chunks, chunk_m, pad_idx = _overlap_chunk_plan(n, m, max_overlap_elems)
+    valid = np.ones(n_chunks * chunk_m, dtype=np.float32)
+    if pad_idx is not None:
+        valid[m:] = 0.0
+        D_use = D[pad_idx]
+    else:
+        D_use = D
+    inv2s2 = np.float32(1.0 / (2.0 * sigma * sigma))
+    Pj = jnp.asarray(P, dtype=jnp.float32)
+    D_r = jnp.asarray(D_use, dtype=jnp.float32).reshape(n_chunks, chunk_m, 3)
+    v_r = jnp.asarray(valid).reshape(n_chunks, chunk_m)
+
+    @jax.jit
+    def run(Pj, D_r, v_r):
+        def body(carry, packed):
+            best, arg, dens, off = carry
+            d_c, v_c = packed
+            dots = jnp.clip(jnp.abs(Pj @ d_c.T), 0.0, 1.0)  # lines: +- collapse
+            masked = jnp.where(v_c[None, :] > 0, dots, -1.0)
+            loc = jnp.argmax(masked, axis=1)
+            val = jnp.take_along_axis(masked, loc[:, None], axis=1)[:, 0]
+            better = val > best
+            best = jnp.where(better, val, best)
+            arg = jnp.where(better, off + loc, arg)
+            if want_density:
+                ang2 = 2.0 * (1.0 - dots)
+                dens = dens + jnp.sum(v_c[None, :] * jnp.exp(-ang2 * inv2s2), axis=1)
+            return (best, arg, dens, off + chunk_m), None
+
+        init = (
+            jnp.full(n, -1.0, dtype=jnp.float32),
+            jnp.zeros(n, dtype=jnp.int32),
+            jnp.zeros(n, dtype=jnp.float32),
+            jnp.int32(0),
+        )
+        (best, arg, dens, _), _ = lax.scan(body, init, (D_r, v_r))
+        return arg, dens
+
+    arg, dens = run(Pj, D_r, v_r)
+    arg = np.asarray(arg, dtype=int)
+    if pad_idx is not None:
+        arg = pad_idx[arg]
+    cosang = np.abs(np.sum(P * D[arg], axis=1))
+    dev_deg = np.degrees(np.arccos(np.clip(cosang, 0.0, 1.0)))
+    return dev_deg, (np.asarray(dens, dtype=np.float64) if want_density else None)
 
 
 def wigner_d_matrix(L, beta):
@@ -659,6 +776,7 @@ def so3_inner(f, g, R):
     return float(np.real(np.sum(np.conj(f) * rf)))
 
 
+@_precise
 def correlogram(f, g, n_beta=None, backend="jax"):
     """C(alpha, beta, gamma) = <f, Lambda(R) g> on an Euler-angle grid.
 
@@ -849,6 +967,7 @@ def _correlogram_kernel_jax(f, g, betas, Ea):
     return jnp.real(jnp.einsum("ma,mnb,nc->abc", Ea_j, S, Ea_j))
 
 
+@_precise
 def _so3_inner_fast_factory(f, g):
     """Closure evaluating C(R) = <f, Lambda(R) g> through the fused jax
     kernel -- for optimizers that evaluate hundreds of single rotations
@@ -871,6 +990,7 @@ def _so3_inner_fast_factory(f, g):
     af_d = jnp.asarray(a, dtype=jnp.float32)[..., None]
     bf_d = jnp.asarray(b, dtype=jnp.float32)[..., None]
 
+    @_precise
     def inner(R):
         alpha, beta, gamma = euler_zyz(R)
         x64, D0, D1 = _S_terms(a, b, prefK, np.array([beta]))
@@ -973,6 +1093,7 @@ def _rodrigues(v):
     return np.eye(3) + np.sin(th) * K + (1.0 - np.cos(th)) * (K @ K)
 
 
+@_precise
 def refine_local(f, g, R, span_deg=3.0):
     """Grid-free polish by maximizing C(R) itself (Nelder--Mead on the
     rotation vector).  Works for any model -- rings included, where Wahba
@@ -1011,6 +1132,7 @@ def null_zscore(C, value, trim=0.01):
     return (value - mu) / max(sd, 1e-12)
 
 
+@_precise
 def nonneg_lasso(f, g, rotations, lam=0.0, n_iter=300, inner_fg=None, inner_gg=None):
     """Sparse nonnegative coefficients over refined orientation candidates.
 
@@ -1202,6 +1324,7 @@ def panel_directions(
 # explicit instead of letting scale wander.
 
 
+@_precise
 def _sph_coeffs_jax(dirs, weights, L, sigma):
     """g_lm as a jax array [(L+1), (2L+1)] complex; differentiable in dirs.
 
@@ -1293,6 +1416,7 @@ def _rodrigues_jax(v):
     return jnp.eye(3) + A * K + B * (K @ K)
 
 
+@_precise
 def refine_matching_free(
     f,
     R0,
@@ -1370,6 +1494,7 @@ def refine_matching_free(
     return R, B, float(-res.fun)
 
 
+@_precise
 def refine_instrument_matching_free(
     peaks,
     detector_nominal,
@@ -1579,16 +1704,12 @@ def refine_instrument_matching_free(
     # objective has one shape.  Padding rows carry weight 0 and contribute
     # nothing, which keeps the chunked sum exact rather than approximate.
     n_model_j = len(hkl_j)
-    if n_peaks * n_model_j <= max_overlap_elems:
-        n_chunks, chunk_m = 1, n_model_j
-        pad_idx = None
+    n_chunks, chunk_m, pad_idx = _overlap_chunk_plan(
+        n_peaks, n_model_j, max_overlap_elems
+    )
+    if pad_idx is None:
         w_model_pad = w_model
     else:
-        chunk_m = int(max(1, max_overlap_elems // max(n_peaks, 1)))
-        n_chunks = int(np.ceil(n_model_j / chunk_m))
-        pad_idx = np.concatenate(
-            [np.arange(n_model_j), np.zeros(n_chunks * chunk_m - n_model_j, dtype=int)]
-        )
         w_model_pad = jnp.asarray(
             np.concatenate([w_model_np, np.zeros(n_chunks * chunk_m - n_model_j)])
         )

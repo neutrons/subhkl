@@ -2039,7 +2039,7 @@ def _spherical_quality(
     kernel_deg,
     floor=0.01,
     n_null=8,
-    chunk=20000,
+    chunk=None,  # retired: the device kernel plans its own chunks
     seed=0,
     max_points=500_000,
     max_points_null=200_000,
@@ -2090,32 +2090,22 @@ def _spherical_quality(
         pts_null, w_null = pts[nidx], weights[nidx]
     else:
         pts_null, w_null = pts, weights
-    # exp() only where the kernel is alive: contributions beyond 4 sigma
-    # are below e^-8 against the floor, and a compare costs an order less
-    # than an exp
-    cos4 = np.cos(4.0 * sigma)
-
-    # The chunk is a MEMORY budget, not a row count: the temporary is
-    # chunk x n_model, so a fixed 20k rows is 0.2 GB against garnet's 1285
-    # model directions and 10.5 GB against the 65k a 100 A cell puts at
-    # d_min 2.5 (L1 metallo-beta-lactamase).  Hold the product instead.
-    chunk_rows = int(max(1, min(chunk, (chunk * 2000) // max(len(dirs), 1))))
+    # Every pass is the (points x model-lines) overlap the instrument
+    # refinement evaluates, on the device through the same chunked
+    # kernel (spherical.nearest_line_stats): the numpy form was a quarter
+    # hour at L1 scale with the GPU idle.  The log-likelihood is the
+    # refinement's objective exactly -- every direction summed, no
+    # kernel cutoff.
+    from subhkl.search.spherical import nearest_line_stats
 
     def dev_and_loglik(Umat, want_loglik=False, null=False):
         P, Wt = (pts_null, w_null) if null else (pts, weights)
-        Rm = dirs @ Umat.T
-        dev = np.empty(len(P))
+        dev, dens = nearest_line_stats(
+            P, dirs @ Umat.T, sigma, want_density=want_loglik
+        )
         ll = 0.0
-        for i in range(0, len(P), chunk_rows):
-            dots = np.abs(P[i : i + chunk_rows] @ Rm.T)
-            np.clip(dots, -1.0, 1.0, out=dots)
-            dev[i : i + chunk_rows] = np.degrees(np.arccos(dots.max(axis=1)))
-            if want_loglik:
-                rows, cols = np.nonzero(dots > cos4)
-                ang2 = 2.0 * (1.0 - dots[rows, cols])
-                dens = np.zeros(dots.shape[0])
-                np.add.at(dens, rows, np.exp(-ang2 / (2.0 * sigma * sigma)))
-                ll += float(np.sum(Wt[i : i + chunk_rows] * np.log(dens + floor)))
+        if want_loglik:
+            ll = float(np.sum(Wt * np.log(dens + floor)))
         return dev, ll / max(np.sum(Wt), 1e-12)
 
     def wmedian(x, w):
