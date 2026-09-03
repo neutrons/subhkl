@@ -1351,6 +1351,17 @@ def spherical_index(
         int,
         typer.Option("--nodal-max-index", help="Zone-axis cut |uvw| for --model nodal"),
     ] = 3,
+    band_consistency: Annotated[
+        bool,
+        typer.Option(
+            "--band-consistency/--no-band-consistency",
+            help=(
+                "Match each spot only against directions that could have produced "
+                "it at some wavelength in the instrument band (needs "
+                "instrument/wavelength in the peaks file)"
+            ),
+        ),
+    ] = True,
     final_full_refine: Annotated[
         bool,
         typer.Option(
@@ -1642,6 +1653,7 @@ def spherical_index(
         model=model,
         nodal_max_index=nodal_max_index,
         final_full_refine=final_full_refine,
+        band_consistency=band_consistency,
         det_trans_bound=det_trans_bound,
         det_rot_bound_deg=det_rot_bound_deg,
         gonio_bound_deg=gonio_bound_deg,

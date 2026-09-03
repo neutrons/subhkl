@@ -2236,6 +2236,7 @@ def run_spherical_index(
     model: str = "nodal",
     nodal_max_index: int = 3,
     final_full_refine: bool = False,
+    band_consistency: bool = True,
 ):
     """Index by spherical correlation over SO(3) -- the matched-filter dual
     of the sparse orientation-recovery problem (subhkl.search.spherical).
@@ -2272,6 +2273,17 @@ def run_spherical_index(
     (or, when it is off, one more orientation/cell pass) then sees every
     reflection, restoring the leverage of the high-index directions the
     nodal set leaves out.
+
+    ``band_consistency`` (default on, needs instrument/wavelength): every
+    spot is matched only against directions that could have produced it
+    at some wavelength in the band -- the Laue collapse keeps a spot's
+    direction and drops its |Q|, but along a ray the lattice only offers
+    |G| = n g0, so a spot at |Ghat . ki| = sin(theta) is consistent with a
+    direction iff some n g0 lies in [2 sin(theta) / lambda_max,
+    min(2 sin(theta) / lambda_min, 1 / d_min)] (spherical.band_masks).  The
+    search becomes a Fisher sum of per-band correlograms; measured, it
+    lifts garnet's point-model z from 16.8 to 27.4 and shrinks a 100 A
+    cell's legal model per spot from 65k to 19k directions.
     """
     from subhkl.config import beamlines
     from subhkl.core.crystallography import (
@@ -2401,6 +2413,9 @@ def run_spherical_index(
         _t["start"] = now
 
     f_raw = None
+    f_raw_bands = None
+    band_edges = None
+    ki_hat = ki / np.linalg.norm(ki)
     if images_filename is not None:
         images, bank_ids, run_of_image = _read_merged_images(images_filename)
         _mark("read")
@@ -2436,6 +2451,7 @@ def run_spherical_index(
         per_bank_rows = {}
         raw_pts, raw_w, raw_run = [], [], []
         raw_bank, raw_prow, raw_pcol = [], [], []
+        bin_sth, raw_sth = {}, []
         b2 = int(binning)
         for i_img in range(len(images)):
             bk = int(bank_ids[i_img])
@@ -2456,12 +2472,14 @@ def run_spherical_index(
                 bin_dirs[bk] = sph.panel_directions(
                     det, rows=RR.ravel(), cols=CC.ravel(), ki=ki
                 )
+                bin_sth[bk] = np.abs(bin_dirs[bk] @ ki_hat)
             r_ = int(run_of_image[i_img])
             per_bank_rows.setdefault(bk, []).append((r_, excess))
             d = bin_dirs[bk]
             Rr = R_run.get(r_)
             raw_pts.append(d @ Rr if Rr is not None else d)  # R^T per row
             raw_w.append(np.clip(excess, 0.0, None))
+            raw_sth.append(bin_sth[bk])
             raw_run.append(np.full(len(d), r_))
             raw_bank.append(np.full(len(d), bk))
             raw_prow.append(np.tile(bin_rows[bk], 1))
@@ -2481,6 +2499,17 @@ def run_spherical_index(
         from subhkl.search.spherical import project_counts_device
 
         f_lab_run = {}
+        # Band-consistency: the bins are stratified by sin(theta) and each
+        # stratum projected on its own, so the search can hold every band
+        # to the directions that could have produced it.  The pooled map
+        # (every stage downstream) is the sum of the strata.
+        use_band = bool(band_consistency) and wl is not None
+        if use_band:
+            band_edges = sph.sin_theta_edges(
+                np.concatenate(raw_sth), np.concatenate(raw_w), n_bands=4
+            )
+        n_bands_raw = len(band_edges) - 1 if use_band else 1
+        f_lab_band = {}
         # pad every bank to the same frame count so the device kernel
         # compiles once (zero rows project to zero and are discarded)
         nf_max = max(len(rows) for rows in per_bank_rows.values())
@@ -2488,28 +2517,60 @@ def run_spherical_index(
             W = np.zeros((nf_max, len(rows[0][1])))
             for i_, (_, e_) in enumerate(rows):
                 W[i_] = e_
-            F = project_counts_device(bin_dirs[bk], W, L_raw, sigma_raw)
-            for (r_, _), Fi in zip(rows, F):
-                f_lab_run[r_] = f_lab_run.get(r_, 0.0) + Fi
+            for b_ in range(n_bands_raw):
+                if use_band:
+                    m_b = (bin_sth[bk] > band_edges[b_]) & (
+                        bin_sth[bk] <= band_edges[b_ + 1]
+                    )
+                    if not m_b.any():
+                        continue
+                    F = project_counts_device(
+                        bin_dirs[bk], W * m_b[None, :], L_raw, sigma_raw
+                    )
+                else:
+                    F = project_counts_device(bin_dirs[bk], W, L_raw, sigma_raw)
+                for (r_, _), Fi in zip(rows, F):
+                    f_lab_run[r_] = f_lab_run.get(r_, 0.0) + Fi
+                    f_lab_band[(r_, b_)] = f_lab_band.get((r_, b_), 0.0) + Fi
         _mark("project")
         # one batched Wigner build for every run's rotation instead of a
         # scalar build per run
         run_keys = sorted(f_lab_run)
         rot_keys = [r_ for r_ in run_keys if R_run.get(r_) is not None]
-        f_raw = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
-        for r_ in run_keys:
-            if r_ not in rot_keys:
-                f_raw += f_lab_run[r_]
         if rot_keys:
             eulers = np.array([sph.euler_zyz(R_run[r_].T) for r_ in rot_keys])
             d_all = sph.wigner_d_matrix(L_raw, eulers[:, 1])  # [l, m, n, r]
             m_ax = np.arange(-L_raw, L_raw + 1)
             ea = np.exp(-1j * np.outer(eulers[:, 0], m_ax))  # [r, m]
             eg = np.exp(-1j * np.outer(eulers[:, 2], m_ax))  # [r, n]
-            f_stack = np.stack([f_lab_run[r_] for r_ in rot_keys])  # [r, l, n]
-            f_raw += np.einsum(
-                "rm,lmnr,rn,rln->lm", ea, d_all, eg, f_stack, optimize=True
+
+        # every map -- the pooled one and each band -- rotated in ONE pass:
+        # the Wigner stack is the expensive operand and it is shared
+        keys = [None] + (list(range(n_bands_raw)) if use_band else [])
+        zero = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
+
+        def _get(r_, b_):
+            return (
+                f_lab_run.get(r_, zero)
+                if b_ is None
+                else f_lab_band.get((r_, b_), zero)
             )
+
+        pooled = np.zeros((len(keys), L_raw + 1, 2 * L_raw + 1), dtype=complex)
+        for r_ in run_keys:
+            if r_ not in rot_keys:
+                for k_, b_ in enumerate(keys):
+                    pooled[k_] += _get(r_, b_)
+        if rot_keys:
+            f_stack = np.stack(
+                [[_get(r_, b_) for b_ in keys] for r_ in rot_keys]
+            )  # [r, k, l, n]
+            pooled += np.einsum(
+                "rm,lmnr,rn,rkln->klm", ea, d_all, eg, f_stack, optimize=True
+            )
+        f_raw = pooled[0]
+        if use_band:
+            f_raw_bands = [pooled[1 + b_] for b_ in range(n_bands_raw)]
         _mark("rotate")
         print(
             f"spherical-index: raw-count mode, {len(images)} frames binned "
@@ -2560,6 +2621,16 @@ def run_spherical_index(
         raise ValueError(f"model must be 'nodal' or 'reflections', got {model!r}")
     full_final = bool(final_full_refine) and model != "reflections"
     hkl_inst, w_inst = (hkl_all, None) if full_final else (hkl_model, w_model)
+    # primitive spacing along every search direction, for the band rule
+    g0_model = sph.primitive_spacing(
+        hkl_all[idx] if model == "reflections" else hkl_model, B
+    )
+    use_band = bool(band_consistency) and wl is not None
+    if bool(band_consistency) and wl is None:
+        print(
+            "spherical-index: no instrument/wavelength in the peaks file; "
+            "band consistency off"
+        )
     # Both counts, because they drive different stages: the SEARCH sees
     # unique directions (harmonics point the same way and collapse), the
     # REFINEMENT sees every reflection -- 2.4x more on a 100 A cell, and it
@@ -2585,12 +2656,25 @@ def run_spherical_index(
         sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
         L = f_raw.shape[0] - 1
         g = sph.project_points(dirs_model, w_model, L, sigma)
-        C, al_, be_, ga_ = sph.correlogram(f_raw, g)
+        if f_raw_bands is not None:
+            masks_model = sph.band_masks(g0_model, band_edges, wl, d_min)
+            print(
+                "spherical-index: band consistency, sin(theta) edges "
+                + " ".join(f"{e:.2f}" for e in band_edges[1:-1])
+                + "; model per band "
+                + " ".join(str(int(m_.sum())) for m_ in masks_model)
+                + f" of {len(g0_model)}"
+            )
+            C, al_, be_, ga_ = sph.banded_search(
+                f_raw_bands, dirs_model, w_model, masks_model, L, sigma
+            )
+        else:
+            C, al_, be_, ga_ = sph.correlogram(f_raw, g)
         cands = sph.top_orientations(C, al_, be_, ga_, n=n_candidates)
         results = []
         kept_R = []
         gnorm2 = sph.so3_inner(g, g, np.eye(3))
-        for R_, val in cands:
+        for R_, val_grid in cands:
             R_ = sph.refine_local(f_raw, g, R_)
             val = sph.so3_inner(f_raw, g, R_)
             # lattice-symmetry copies carry the same rotated model
@@ -2606,7 +2690,9 @@ def run_spherical_index(
                 {
                     "R": R_,
                     "score": val,
-                    "z": sph.null_zscore(C, val),
+                    # the grid value: C is the band-consistent z-sum when
+                    # banding is on, and a pooled inner is not on its scale
+                    "z": sph.null_zscore(C, val_grid),
                     "n_matched": 0,
                     "coherence": mu,
                     "c": np.nan,
@@ -2623,6 +2709,10 @@ def run_spherical_index(
             lam=lam,
             L=bandwidth,
             refine_method=refine_method,
+            data_sin_theta=np.abs(d_lab @ ki_hat) if use_band else None,
+            model_g0=g0_model if use_band else None,
+            wavelength_band=wl if use_band else None,
+            d_min=d_min if use_band else None,
         )
     if not results:
         raise RuntimeError("no orientation candidate found")

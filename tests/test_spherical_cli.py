@@ -500,3 +500,23 @@ def test_nodal_dictionary_indexes_end_to_end(tmp_path):
     err_full = min(np.rad2deg(_quat_angle(U2, U_true @ S)) for S in _cubic_rots())
     assert err_full < 0.5
     assert err_full <= err_nodal + 0.05
+
+
+def test_band_consistency_is_on_by_default_and_switchable(tmp_path):
+    """The synthetic finder file carries instrument/wavelength, so the
+    default search is the band-consistent one; switching it off still
+    indexes, and the file records the same orientation either way."""
+    rng = np.random.default_rng(31)
+    peaks_file = str(tmp_path / "finder.h5")
+    U_true, _ = _synthetic_finder_file(peaks_file, rng)
+    outs = {}
+    for flag in (True, False):
+        out = str(tmp_path / f"band_{int(flag)}.h5")
+        run_spherical_index(
+            peaks_file, out, d_min=1.3, kernel_deg=1.0, band_consistency=flag
+        )
+        with h5py.File(out) as fp:
+            outs[flag] = fp["sample/U"][()]
+    for flag, U in outs.items():
+        err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
+        assert err < 0.5, (flag, err)

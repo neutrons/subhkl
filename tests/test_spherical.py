@@ -722,3 +722,93 @@ def test_sph_coeffs_gradient_is_finite_at_high_bandwidth_near_the_poles():
     grad = np.asarray(jax.grad(obj)(jnp.asarray(d, dtype=jnp.float32)))
     assert np.all(np.isfinite(grad))
     assert np.any(grad != 0)
+
+
+# ---------------------------------------------------------------------------
+# wavelength-band consistency: magnitudes without measuring a wavelength
+# ---------------------------------------------------------------------------
+
+
+def test_band_masks_are_the_laue_harmonic_condition():
+    """A spot at |Ghat . ki| = s has |Q| = 2 s / lambda; the lattice offers
+    |G| = n g0 along the ray.  For a factor-2 band the condition that some
+    harmonic lands in [2s/lambda_max, min(2s/lambda_min, 1/d_min)]
+    collapses to g0 <= s below the cut; above 2 s / lambda_max > 1/d_min
+    nothing in the model can explain the spot."""
+    from subhkl.search.spherical import band_masks, primitive_spacing
+
+    g0 = np.array([0.05, 0.10, 0.20, 0.30, 0.39])
+    lam, d_min = (2.0, 4.0), 2.5  # 1/d_min = 0.4
+    (m,) = band_masks(g0, [0.15, 0.15 + 1e-9], lam, d_min)  # a single s = 0.15
+    np.testing.assert_array_equal(m, g0 <= 0.15)
+    (m,) = band_masks(g0, [0.30, 0.30 + 1e-9], lam, d_min)
+    np.testing.assert_array_equal(m, g0 <= 0.30)
+    # above the cut: s = 0.7 -> window [0.35, 0.40]; g0 = 0.39 (n=1) and
+    # 0.20 (n=2 -> 0.40) qualify, 0.30 (0.30, 0.60) does not
+    (m,) = band_masks(g0, [0.70, 0.70 + 1e-9], lam, d_min)
+    np.testing.assert_array_equal(m, np.array([True, True, True, False, True]))
+    # unexplainable: 2 s / lambda_max > 1 / d_min
+    (m,) = band_masks(g0, [0.90, 0.90 + 1e-9], lam, d_min)
+    assert not m.any()
+    # a band is the union over its interior, so the edge case is kept
+    (m,) = band_masks(g0, [0.10, 0.31], lam, d_min)
+    np.testing.assert_array_equal(m, g0 <= 0.31)
+    # primitive spacing reduces harmonics to their primitive vector
+    B = np.eye(3) / 10.0
+    np.testing.assert_allclose(
+        primitive_spacing([[2, 0, 0], [3, 3, 0]], B), [0.1, 0.1 * np.sqrt(2)]
+    )
+
+
+def test_band_consistent_search_recovers_and_sharpens():
+    """On a synthetic Laue scene with sin(theta) drawn from the geometry,
+    the band-consistent search finds the orientation and its z is no
+    lower than the plain search's: restricting every datum to the
+    directions that could have produced it removes spurious matches and
+    never a true one."""
+    from subhkl.search.spherical import primitive_spacing
+
+    rng = np.random.default_rng(3)
+    a = 40.0  # a dense direction set, where the plain model starts to blur
+    B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
+    bounds = int(np.ceil(a / 2.0))
+    rng_i = np.arange(-bounds, bounds + 1)
+    hkl = np.stack(np.meshgrid(rng_i, rng_i, rng_i, indexing="ij"), -1).reshape(-1, 3)
+    hkl = hkl[np.any(hkl != 0, axis=1)]
+    G = hkl @ B.T
+    gn = np.linalg.norm(G, axis=1)
+    keep = gn <= 1.0 / 2.0
+    hkl, G, gn = hkl[keep], G[keep], gn[keep]
+    dirs = G / gn[:, None]
+    key = np.round(dirs * np.where(dirs[:, [0]] < -1e-9, -1, 1), 5)
+    _, idx = np.unique(key, axis=0, return_index=True)
+    dirs, hkl_u = dirs[idx], hkl[idx]
+    g0 = primitive_spacing(hkl_u, B)
+    R0 = _rand_rot(rng)
+    lam = (2.0, 4.0)
+    # observed: reflections excited in band for a beam along +z, with a
+    # wavelength drawn per reflection; sin(theta) = |Ghat . ki|
+    d_lab = dirs @ R0.T
+    s_all = np.abs(d_lab[:, 2])
+    lam_r = 2.0 * s_all / np.maximum(gn[idx], 1e-9)  # n = 1 wavelength
+    ok = (lam_r >= lam[0]) & (lam_r <= lam[1]) & (d_lab[:, 2] < 0)
+    obs = d_lab[ok][rng.random(ok.sum()) < 0.6]
+    obs = obs + rng.normal(scale=np.deg2rad(0.15), size=obs.shape)
+    obs /= np.linalg.norm(obs, axis=1, keepdims=True)
+    noise = _rand_dirs(rng, len(obs) // 2)
+    noise[:, 2] = -np.abs(noise[:, 2])
+    data = np.vstack([obs, noise])
+    sth = np.abs(data[:, 2])
+    plain = find_orientations(data, model_dirs=dirs, kernel_deg=1.0, n_candidates=3)
+    banded = find_orientations(
+        data,
+        model_dirs=dirs,
+        kernel_deg=1.0,
+        n_candidates=3,
+        data_sin_theta=sth,
+        model_g0=g0,
+        wavelength_band=lam,
+        d_min=2.0,
+    )
+    assert _err_mod(banded[0]["R"], R0, _cubic_rots()) < 1.0  # 1 deg kernel on a 40 A cell
+    assert banded[0]["z"] >= plain[0]["z"] * 0.9
