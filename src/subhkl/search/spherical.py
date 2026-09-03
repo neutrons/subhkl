@@ -1181,7 +1181,7 @@ def _so3_inner_fast_factory(f, g):
     nb = 1 kernel call with the coupling prepared once)."""
     import jax.numpy as jnp
 
-    L = f.shape[0] - 1
+    L = f.shape[-2] - 1  # a channel stack [K, L+1, M] couples summed over K
     a, b, coefK, prefK, rho1, rho2 = _coupling_prep(f, g)
     m = np.arange(-L, L + 1)
     # place the rotation-independent constants on the device ONCE: passing
@@ -1227,13 +1227,22 @@ def _quat_angle(R1, R2):
     return float(np.arccos(tr))
 
 
-def top_orientations(C, alphas, betas, gammas, n=4, min_sep_deg=10.0):
+def top_orientations(C, alphas, betas, gammas, n=4, min_sep_deg=None):
     """Local maxima of the correlogram as rotations, best first.
 
     Wrap-aware local-maximum test in alpha and gamma, then greedy selection
     with a minimum quaternion separation so one broad peak is not returned
     n times.  Returns [(R, value), ...].
+
+    The separation defaults to twice the grid step (3.7 deg at L = 96): a
+    peak is about one kernel wide, and distinct maxima that close are real.
+    A fixed 10 deg lost MANDI L1 run 0 outright -- the truth (z 13.6, the
+    global maximum of this very correlogram, TOF-validated) sits 4.9 deg
+    from a false peak whose grid sample scored higher (11.3), so it was
+    never refined; the measured valley between them is 2-3 deg.
     """
+    if min_sep_deg is None:
+        min_sep_deg = 2.0 * 180.0 / max(len(betas), 1)
     up = np.roll(C, 1, axis=0) < C
     dn = np.roll(C, -1, axis=0) <= C
     lf = np.roll(C, 1, axis=2) < C
@@ -1380,7 +1389,7 @@ def find_orientations(
     kernel_deg=1.0,
     L=None,
     n_candidates=4,
-    min_sep_deg=10.0,
+    min_sep_deg=None,
     refine=True,
     lam=0.0,
     refine_method="wahba",
@@ -1481,6 +1490,7 @@ def find_orientations(
     cands = top_orientations(C, al, be, ga, n=n_candidates, min_sep_deg=min_sep_deg)
     out = []
     rotations = []
+    kept_vals = []
     # single-rotation inners through the fused jax kernel: the numpy path
     # rebuilds a scalar Wigner stack per call (~0.35 s at L = 96), and a
     # per-run offsets fit makes hundreds of these
@@ -1495,19 +1505,28 @@ def find_orientations(
         elif refine:
             R = refine_local(f, g, R)
             val = inner_fg(R)
-        # Mutual coherence against the candidates already kept: two rotations
-        # equivalent under the lattice's own point group carry the *same*
-        # rotated model (Lambda_S g = g for a symmetry S), coherence 1, and
-        # the sparse stage cannot apportion mass between identical columns.
-        # Orientations are only ever defined up to the Laue group, so keep
-        # one representative.  Distinct orientations are generically nearly
-        # orthogonal here -- that near-diagonal Gram over the zero-overlap
-        # region is what makes the recovery well posed.
+        # Duplicates: the same peak reached twice (within the grid
+        # separation), or a lattice-symmetry copy -- Lambda_S g = g for a
+        # symmetry S, so the copy carries the *same* rotated model and,
+        # exactly, the same objective value; the sparse stage cannot
+        # apportion mass between identical columns, so keep one.  The
+        # coherence alone is NOT the test: for a dictionary that is uniform
+        # at this bandwidth (MANDI L1, 65k lines at L = 96) it is > 0.99
+        # for any rotation of a few degrees, and that deleted the true
+        # orientation (z 13.6, TOF-validated) as a "copy" of a false peak
+        # 4.9 deg away (z 11.3).  Coherence is recorded for the report.
         mu = max(
             (abs(inner_gg(R.T @ R2)) / gnorm**2 for R2 in rotations),
             default=0.0,
         )
-        if mu > 0.99:
+        sep = np.deg2rad(
+            min_sep_deg if min_sep_deg is not None else 2.0 * 180.0 / max(len(be), 1)
+        )
+        if any(
+            _quat_angle(R, R2) < sep
+            or (mu > 0.99 and abs(val - v2) <= 1e-3 * max(abs(val), abs(v2), 1e-30))
+            for R2, v2 in zip(rotations, kept_vals)
+        ):
             continue
         out.append(
             {
@@ -1519,6 +1538,7 @@ def find_orientations(
             }
         )
         rotations.append(R)
+        kept_vals.append(val)
     if rotations:
         c = nonneg_lasso(f, g, rotations, lam=lam, inner_fg=inner_fg, inner_gg=inner_gg)
         for rec, cr in zip(out, c):

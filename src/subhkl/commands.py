@@ -2790,19 +2790,34 @@ def run_spherical_index(
         cands = sph.top_orientations(C, al_, be_, ga_, n=n_candidates)
         results = []
         kept_R = []
+        kept_vals = []
         gnorm2 = sph.so3_inner(g, g, np.eye(3))
+        # refine and rank on the objective that was searched: with the
+        # radial channels the 2D map's maximum sits elsewhere (MANDI L1
+        # run 0: 2.8 deg off the TOF truth, and a far peak outranked it)
+        f_obj, g_obj = (f_raw_radial, g3) if f_raw_radial is not None else (f_raw, g)
+        inner_obj = sph.so3_inner_stack if f_raw_radial is not None else sph.so3_inner
         for R_, val_grid in cands:
-            R_ = sph.refine_local(f_raw, g, R_)
-            val = sph.so3_inner(f_raw, g, R_)
-            # lattice-symmetry copies carry the same rotated model
-            # (coherence 1); keep one representative, as the peaks path does
+            R_ = sph.refine_local(f_obj, g_obj, R_)
+            val = inner_obj(f_obj, g_obj, R_)
+            # duplicates as the peaks path defines them: the same peak
+            # within the grid separation, or a lattice-symmetry copy (same
+            # rotated model AND the same objective value).  Coherence alone
+            # is > 0.99 for any small rotation of a dense dictionary and
+            # deleted the true L1 orientation (see find_orientations).
             mu = max(
                 (abs(sph.so3_inner(g, g, R_.T @ R2)) / gnorm2 for R2 in kept_R),
                 default=0.0,
             )
-            if mu > 0.99:
+            sep = np.deg2rad(2.0 * 180.0 / max(len(be_), 1))
+            if any(
+                sph._quat_angle(R_, R2) < sep
+                or (mu > 0.99 and abs(val - v2) <= 1e-3 * max(abs(val), abs(v2), 1e-30))
+                for R2, v2 in zip(kept_R, kept_vals)
+            ):
                 continue
             kept_R.append(R_)
+            kept_vals.append(val)
             results.append(
                 {
                     "R": R_,
