@@ -85,7 +85,9 @@ def test_spherical_index_and_zone_overlay(tmp_path):
     assert n > 100  # the scene actually covers the instrument
 
     out_file = str(tmp_path / "spherical.h5")
-    run_spherical_index(peaks_file, out_file, d_min=1.3, kernel_deg=1.0)
+    run_spherical_index(
+        peaks_file, out_file, d_min=1.3, kernel_deg=1.0, search="correlogram"
+    )
     with h5py.File(out_file) as fp:
         U = fp["sample/U"][()]
         z = fp["spherical/z"][()]
@@ -179,7 +181,8 @@ def test_raw_count_indexing_and_image_backed_overlay(tmp_path):
         kernel_deg=1.0,
         images_filename=images_file,
         binning=8,
-        runs=[0],  # exercises the frame-side run filter too
+        runs=[0],  # exercises the frame-side run filter too,
+        search="correlogram",
     )
     with h5py.File(out_file) as fp:
         U = fp["sample/U"][()]
@@ -284,6 +287,7 @@ def test_fit_gonio_offsets_and_gauge_detection(tmp_path):
         kernel_deg=1.0,
         fit_gonio_offsets=True,
         refine_gonio_axes=["outer_z", "inner_x"],
+        search="correlogram",
     )
     with h5py.File(out_file) as fp:
         off_z = float(fp["goniometer/offsets/outer_z"][()])
@@ -385,6 +389,7 @@ def test_refined_instrument_reaches_the_consumers_layout(tmp_path):
         refine_gonio_per_run="phi",
         refine_maxiter=150,
         frame_table_filename=images_file,
+        search="correlogram",
     )
 
     with h5py.File(out_file) as fp:
@@ -431,6 +436,7 @@ def test_refined_instrument_reaches_the_consumers_layout(tmp_path):
         refine_gonio_per_run="phi",
         refine_gonio_per_run_trans=True,
         refine_maxiter=150,
+        search="correlogram",
     )
     with h5py.File(out_nt) as fp:
         g = fp["goniometer/per_run"]
@@ -479,6 +485,7 @@ def test_nodal_dictionary_indexes_end_to_end(tmp_path):
         model="nodal",
         radial=0,
         nodal_max_index=2,
+        search="correlogram",
     )
     with h5py.File(out_nodal) as fp:
         U = fp["sample/U"][()]
@@ -502,6 +509,7 @@ def test_nodal_dictionary_indexes_end_to_end(tmp_path):
         radial=0,
         nodal_max_index=2,
         final_full_refine=True,
+        search="correlogram",
     )
     with h5py.File(out_full) as fp:
         U2 = fp["sample/U"][()]
@@ -528,6 +536,7 @@ def test_band_consistency_is_on_by_default_and_switchable(tmp_path):
             kernel_deg=1.0,
             radial=0,
             band_consistency=flag,
+            search="correlogram",
         )
         with h5py.File(out) as fp:
             outs[flag] = fp["sample/U"][()]
@@ -610,6 +619,7 @@ def test_dense_background_regime_isolates_spots_and_masks_rims(tmp_path):
         images_filename=merged,
         binning=4,
         refine=False,
+        search="correlogram",
     )
     with h5py.File(out) as fp:
         U = fp["sample/U"][()]
@@ -639,12 +649,52 @@ def test_ewald_refine_ranks_and_polishes_raw_counts(tmp_path):
         binning=4,
         n_candidates=8,
         ewald_refine=True,
+        search="correlogram",
     )
     with h5py.File(out) as fp:
         U = fp["sample/U"][()]
         assert bool(fp["spherical/ewald_refine"][()])
     err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
     assert err < 0.3
+
+
+def test_lattice_search_indexes_raw_counts_and_peaks(tmp_path):
+    """--search lattice: the direct-lattice ladder.  Spots (raw path: 5 sigma
+    blobs of the excess image; peaks path: the peak list) are scored by
+    their weight on the zone great circles of the shortest direct-lattice
+    vectors, coarse to fine, with no band limit anywhere; in raw-count mode
+    the exact Ewald stage polishes the winner.  Measured on MANDI L1
+    (100 A) and garnet (12 A, 24 copies): every still within 0.16 deg of an
+    independent reference, ~2 s per still on an H100."""
+    from subhkl.commands import run_spherical_index
+
+    meta, merged, U_true = _dense_scene(tmp_path, seed=47)
+    out = str(tmp_path / "lattice_raw.h5")
+    run_spherical_index(
+        meta,
+        out,
+        d_min=1.3,
+        kernel_deg=1.0,
+        images_filename=merged,
+        binning=4,
+        search="lattice",
+    )
+    with h5py.File(out) as fp:
+        U = fp["sample/U"][()]
+        assert fp["spherical/search"][()].decode() == "lattice"
+        assert bool(fp["spherical/ewald_refine"][()])
+    err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
+    assert err < 0.3
+
+    rng = np.random.default_rng(53)
+    peaks_file = str(tmp_path / "finder.h5")
+    U_true, _ = _synthetic_finder_file(peaks_file, rng)
+    out = str(tmp_path / "lattice_peaks.h5")
+    run_spherical_index(peaks_file, out, d_min=1.3, kernel_deg=1.0, search="lattice")
+    with h5py.File(out) as fp:
+        U = fp["sample/U"][()]
+    err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
+    assert err < 0.5
 
 
 def test_radial_search_indexes_both_data_paths(tmp_path):
@@ -657,7 +707,13 @@ def test_radial_search_indexes_both_data_paths(tmp_path):
     U_true, _ = _synthetic_finder_file(peaks_file, rng)
     out = str(tmp_path / "radial_peaks.h5")
     run_spherical_index(
-        peaks_file, out, d_min=1.3, kernel_deg=1.0, model="reflections", radial=16
+        peaks_file,
+        out,
+        d_min=1.3,
+        kernel_deg=1.0,
+        model="reflections",
+        radial=16,
+        search="correlogram",
     )
     with h5py.File(out) as fp:
         U = fp["sample/U"][()]

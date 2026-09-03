@@ -1217,6 +1217,171 @@ def _so3_inner_fast_factory(f, g):
 
 
 # ---------------------------------------------------------------------------
+# the direct-lattice ladder: search on the lattice's own hierarchy
+# ---------------------------------------------------------------------------
+
+
+def direct_lattice_vectors(B, max_index=6):
+    """Primitive direct-lattice vectors [uvw], shortest first: the zone axes.
+
+    The reciprocal lattice's additive structure has an exact dual, the
+    direct lattice (Poisson summation): a Laue frame's spots lie on the
+    great circles perpendicular to R x for x in the direct lattice, and a
+    zone's spot density scales as 1/|x|, so the shortest x are the
+    brightest, best-separated zones.  Returns (unit directions [K, 3] in
+    the crystal frame, lengths [K] in A, integer uvw [K, 3])."""
+    A = np.linalg.inv(np.asarray(B, float)).T  # direct-cell vectors as columns
+    r = range(-max_index, max_index + 1)
+    uvw = np.array(
+        [(u, v, w) for u in r for v in r for w in r if (u, v, w) != (0, 0, 0)]
+    )
+    uvw = uvw[np.gcd.reduce(np.abs(uvw), axis=1) == 1]
+    uvw = uvw[[tuple(x) > tuple(-x) for x in uvw]]
+    X = uvw @ A.T
+    xlen = np.linalg.norm(X, axis=1)
+    o = np.argsort(xlen)
+    return X[o] / xlen[o][:, None], xlen[o], uvw[o]
+
+
+#: rungs of the ladder: (number of shortest zones, tolerance [deg], zoom
+#: half-span [deg], candidates kept, zoom points per axis).  The tolerance is
+#: the basin width; the zone count sets the coverage N * 2 tol / 180 of the
+#: sphere, which must stay well below one for the count to discriminate; the
+#: zoom step must not exceed the tolerance; pruning is deferred until the
+#: coverage-limited z is high (measured on MANDI L1: pruning 3000 -> 150 on
+#: the 1 deg rung, z ~ 5, lost three of eleven stills; at 0.5 deg, z ~ 12-15,
+#: none).  Two constants remain -- the coverage ceiling and the prune margin.
+LATTICE_RUNGS = (
+    (13, 0.5, 1.5, 1000, 9),
+    (30, 0.5, 0.6, 300, 7),
+    (60, 0.3, 0.4, 60, 7),
+    (145, 0.3, 0.3, 20, 7),
+    (145, 0.15, 0.2, 5, 7),
+    (145, 0.15, 0.1, 5, 7),
+)
+
+
+def lattice_ladder(
+    dirs,
+    weights,
+    B,
+    n_shortlist=3000,
+    grid_deg=2.0,
+    coarse_zones=13,
+    coarse_tol_deg=1.0,
+    rungs=LATTICE_RUNGS,
+    n_null=200,
+    seed=0,
+):
+    """Orientation search on the direct lattice, coarse to fine.
+
+    Data: spot directions in the sample frame with weights.  Objective at a
+    rung: the spot weight within the tolerance of the great circles
+    perpendicular to R x over the shortest direct-lattice vectors x,
+    weighted 1/|x| -- the Funk transform of the spot map on the rotated
+    direct lattice, i.e. the lattice Fourier sum with |q| integrated out,
+    exact at every rung (no band limit).  An exhaustive coarse rung on a
+    grid, then zoom-and-prune rungs; the last rung's tolerance is the spot
+    precision, which is the exact Ewald stage's basin.
+
+    Measured (MANDI L1, 100 A cell; CG4D garnet, 12 A cubic): the truth is
+    in the 3000-deep shortlist of the 2 deg coarse rung on every still of
+    both, and every still lands within 0.16 deg of an independent
+    reference; ~2 s per still on an H100 (the exhaustive rung is the whole
+    cost) against 390 s for the L = 192 correlogram, which reaches z 22
+    where this reaches z 38.  Returns [(R, score, z)] best first, z against
+    random orientations on the final rung.
+    """
+    import jax
+    import jax.numpy as jnp
+    from scipy.spatial.transform import Rotation as Rot
+
+    D = np.asarray(dirs, np.float32)
+    D = D / np.linalg.norm(D, axis=1, keepdims=True)
+    w = (
+        np.ones(len(D), np.float32)
+        if weights is None
+        else np.asarray(weights, np.float32)
+    )
+    w = w / max(w.sum(), 1e-12)
+    Zdir, xlen, _ = direct_lattice_vectors(B)
+    Zdir = Zdir.astype(np.float32)
+    Dj, wj = jnp.asarray(D), jnp.asarray(w)
+
+    def make(nz, tol):
+        Zj = jnp.asarray(Zdir[:nz])
+        wz = jnp.asarray((1.0 / xlen[:nz]).astype(np.float32))
+        thr = np.float32(np.sin(np.radians(tol)))
+
+        @jax.jit
+        def score(Rs):
+            Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
+            on = jnp.abs(jnp.einsum("nki,mi->nkm", Zl, Dj)) < thr
+            return jnp.einsum("nkm,k,m->n", on.astype(jnp.float32), wz, wj)
+
+        return score
+
+    step = float(grid_deg)
+    a_ = np.radians(np.arange(0, 360, step))
+    b_ = np.radians(np.arange(step / 2, 180, step))
+    grid = np.array(np.meshgrid(a_, b_, a_, indexing="ij")).reshape(3, -1).T
+    Rs = Rot.from_euler("ZYZ", grid).as_matrix().astype(np.float32)
+    sc = make(int(coarse_zones), float(coarse_tol_deg))
+    # the [orientations, zones, spots] tensor is the whole cost: budget it
+    # (a pooled garnet run has 25k spots; a single L1 still 200)
+    budget = 1.5e8
+    ch = int(max(256, min(32768, budget // (int(coarse_zones) * len(D)))))
+    out = np.concatenate(
+        [np.asarray(sc(jnp.asarray(Rs[i : i + ch]))) for i in range(0, len(Rs), ch)]
+    )
+    cands = Rs[np.argsort(-out)[: int(n_shortlist)]]
+
+    def zoom_all(cands, nz, tol, span, n):
+        rv = (
+            np.array(
+                np.meshgrid(
+                    *[np.radians(np.linspace(-span, span, n))] * 3, indexing="ij"
+                )
+            )
+            .reshape(3, -1)
+            .T
+        )
+        dR = jnp.asarray(Rot.from_rotvec(rv).as_matrix().astype(np.float32))
+        sc_ = make(nz, tol)
+
+        @jax.jit
+        def zb(Uc):
+            Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
+            s_ = sc_(Rs_.reshape(-1, 3, 3)).reshape(Uc.shape[0], -1)
+            k = jnp.argmax(s_, axis=1)
+            idx = jnp.arange(Uc.shape[0])
+            return s_[idx, k], Rs_[idx, k]
+
+        bs, bR = [], []
+        bsz = int(max(1, min(64, budget // (len(rv) * nz * len(D)))))
+        for i in range(0, len(cands), bsz):
+            s_, R_ = zb(jnp.asarray(np.asarray(cands[i : i + bsz], np.float32)))
+            bs.append(np.asarray(s_))
+            bR.append(np.asarray(R_))
+        return np.concatenate(bs), np.concatenate(bR)
+
+    scores = None
+    for nz, tol, span, keep, npts in rungs:
+        s_, R_ = zoom_all(cands, int(nz), float(tol), float(span), int(npts))
+        o = np.argsort(-s_)[: int(keep)]
+        cands, scores = R_[o], s_[o]
+    nz, tol = rungs[-1][0], rungs[-1][1]
+    sc_last = make(int(nz), float(tol))
+    rnd = Rot.random(int(n_null), random_state=seed).as_matrix().astype(np.float32)
+    null = np.asarray(sc_last(jnp.asarray(rnd)))
+    z = (scores - null.mean()) / max(null.std(), 1e-12)
+    return [
+        (np.asarray(R, float), float(sv), float(zv))
+        for R, sv, zv in zip(cands, scores, z)
+    ]
+
+
+# ---------------------------------------------------------------------------
 # peak extraction, refinement, admission
 # ---------------------------------------------------------------------------
 

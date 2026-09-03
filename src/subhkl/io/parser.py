@@ -1374,6 +1374,18 @@ def spherical_index(
             ),
         ),
     ] = 24,
+    search: Annotated[
+        str,
+        typer.Option(
+            "--search",
+            help=(
+                "'lattice' (default: the direct-lattice ladder -- spots against "
+                "the zone great circles of the shortest direct-lattice vectors, "
+                "coarse to fine, no band limit, then the exact Ewald stage in "
+                "raw-count mode) or 'correlogram' (band-limited SO(3) correlation)"
+            ),
+        ),
+    ] = "lattice",
     ewald_refine: Annotated[
         bool,
         typer.Option(
@@ -1677,6 +1689,7 @@ def spherical_index(
         nodal_max_index=nodal_max_index,
         final_full_refine=final_full_refine,
         ewald_refine=ewald_refine,
+        search=search,
         band_consistency=band_consistency,
         radial=radial,
         det_trans_bound=det_trans_bound,

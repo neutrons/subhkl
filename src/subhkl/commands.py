@@ -2188,6 +2188,103 @@ def _read_merged_images(images_filename):
     return images, bank_ids, run_of_image
 
 
+def _ewald_device_factory(G_c, run_ids, R_runs, dets, exc_maps, ki_hat, wl, b2):
+    """The exact Ewald objective on the device for flat panels: for a batch
+    of orientations, predict every in-band reflection's pixel on every
+    bank of every run and gather the binned excess there.  exc_maps:
+    {(run, bank): 2D excess}.  Returns (score_batch, polish) or None when a
+    panel is not flat (the host path handles those)."""
+    import jax
+    import jax.numpy as jnp
+    from scipy.spatial.transform import Rotation as Rot
+
+    from subhkl.instrument.detector import DetectorShape
+
+    banks = sorted({bk for _, bk in exc_maps})
+    if any(dets[bk].panel_type != DetectorShape.flat_panel for bk in banks):
+        return None
+    runs = list(run_ids)
+    H = max(e.shape[0] for e in exc_maps.values())
+    Wd = max(e.shape[1] for e in exc_maps.values())
+    E = np.zeros((len(runs), len(banks), H, Wd), np.float32)
+    for (r_, bk), e in exc_maps.items():
+        E[runs.index(r_), banks.index(bk), : e.shape[0], : e.shape[1]] = e
+    cen = np.array([dets[bk].center for bk in banks], np.float32)
+    uh = np.array([dets[bk].uhat for bk in banks], np.float32)
+    vh = np.array([dets[bk].vhat for bk in banks], np.float32)
+    nrm = np.cross(uh, vh).astype(np.float32)
+    dw = np.array([dets[bk].width / (dets[bk].m - 1) for bk in banks], np.float32)
+    dh = np.array([dets[bk].height / (dets[bk].n - 1) for bk in banks], np.float32)
+    nrow = np.array([dets[bk].n for bk in banks], np.float32)
+    ncol = np.array([dets[bk].m for bk in banks], np.float32)
+    Rr = np.array([R_runs.get(r_, np.eye(3)) for r_ in runs], np.float32)
+    Gc = jnp.asarray(np.asarray(G_c, np.float32))
+    kih = jnp.asarray(np.asarray(ki_hat, np.float32))
+    Ej = jnp.asarray(E)
+    consts = tuple(jnp.asarray(x) for x in (cen, uh, vh, nrm, dw, dh, nrow, ncol, Rr))
+    lo_l, hi_l = np.float32(wl[0]), np.float32(wl[1])
+    b2f = np.float32(b2)
+
+    @jax.jit
+    def score_one(U):
+        cen_, uh_, vh_, nrm_, dw_, dh_, nrow_, ncol_, Rr_ = consts
+        total = 0.0
+        for ir in range(len(runs)):
+            G = (Gc @ U.T) @ Rr_[ir].T  # lab frame, this run
+            qn = jnp.linalg.norm(G, axis=1)
+            sth = -(G @ kih) / qn
+            lam = 2.0 * sth / qn
+            band = (lam >= lo_l) & (lam <= hi_l) & (sth > 0)
+            kf = kih[None, :] + lam[:, None] * G
+            kf = kf / jnp.linalg.norm(kf, axis=1, keepdims=True)
+            dn = kf @ nrm_.T  # [N, Nb]
+            t = (cen_ * nrm_).sum(1)[None, :] / jnp.where(jnp.abs(dn) < 1e-9, 1e-9, dn)
+            p = t[:, :, None] * kf[:, None, :] - cen_[None, :, :]  # [N, Nb, 3]
+            row = (p * vh_[None]).sum(2) / dh_[None]
+            col = (p * uh_[None]).sum(2) / dw_[None]
+            ok = (
+                band[:, None]
+                & (t > 0)
+                & (row >= 0)
+                & (col >= 0)
+                & (row < nrow_[None])
+                & (col < ncol_[None])
+            )
+            irow = jnp.clip(jnp.floor(row / b2f), 0, H - 1).astype(jnp.int32)
+            icol = jnp.clip(jnp.floor(col / b2f), 0, Wd - 1).astype(jnp.int32)
+            ib = jnp.broadcast_to(jnp.arange(len(banks))[None, :], irow.shape)
+            vals = Ej[ir][ib, irow, icol]
+            total = total + jnp.where(ok, vals, 0.0).sum()
+        return total
+
+    score_batch = jax.jit(jax.vmap(score_one))
+
+    def score_np(Us):
+        Us = np.asarray(Us, np.float32).reshape(-1, 3, 3)
+        out = []
+        for i in range(0, len(Us), 32):
+            out.append(np.asarray(score_batch(jnp.asarray(Us[i : i + 32]))))
+        return np.concatenate(out)
+
+    def polish(U, spans=(0.6, 0.2, 0.07), n=7):
+        U = np.asarray(U, np.float32)
+        for span in spans:
+            rv = (
+                np.array(
+                    np.meshgrid(
+                        *[np.radians(np.linspace(-span, span, n))] * 3, indexing="ij"
+                    )
+                )
+                .reshape(3, -1)
+                .T
+            )
+            Rs = Rot.from_rotvec(rv).as_matrix().astype(np.float32) @ U
+            U = Rs[int(np.argmax(score_np(Rs)))]
+        return np.asarray(U, float)
+
+    return score_np, polish
+
+
 def run_spherical_index(
     peaks_h5_filename: str,
     output_filename: str,
@@ -2237,6 +2334,7 @@ def run_spherical_index(
     nodal_max_index: int = 3,
     final_full_refine: bool = False,
     ewald_refine: bool = False,
+    search: str = "lattice",
     band_consistency: bool = True,
     radial: int = 24,
 ):
@@ -2473,6 +2571,7 @@ def run_spherical_index(
         bin_dirs = {}
         bin_rows, bin_cols = {}, {}
         per_bank_rows = {}
+        per_bank_sig = {}
         raw_pts, raw_w, raw_run = [], [], []
         raw_bank, raw_prow, raw_pcol = [], [], []
         bin_sth, raw_sth = {}, []
@@ -2492,6 +2591,7 @@ def run_spherical_index(
                 # and their fraction estimates it (P(0) = e^-mu)
                 mu = -np.log(max(zero_frac, 1e-6)) * b2 * b2  # [counts/bin]
                 excess = (y - mu).ravel()
+                sig_bin = np.full(excess.shape, np.sqrt(max(mu, 1.0)))
             else:
                 # dense regime (mu > 3 counts/pixel): the only zeros are dead
                 # pixels, so the zero fraction reads the panel border, not
@@ -2518,6 +2618,7 @@ def run_spherical_index(
                 keep = binary_erosion(live, iterations=5)
                 exc = np.nan_to_num(y - bg)
                 excess = np.where(keep, exc, 0.0).ravel()
+                sig_bin = np.sqrt(np.clip(np.nan_to_num(bg), 1.0, None)).ravel()
                 if not dense_noted:
                     print(
                         "spherical-index: dense background (zero fraction "
@@ -2536,6 +2637,7 @@ def run_spherical_index(
                 bin_sth[bk] = np.abs(bin_dirs[bk] @ ki_hat)
             r_ = int(run_of_image[i_img])
             per_bank_rows.setdefault(bk, []).append((r_, excess))
+            per_bank_sig.setdefault(bk, []).append((r_, sig_bin))
             d = bin_dirs[bk]
             Rr = R_run.get(r_)
             raw_pts.append(d @ Rr if Rr is not None else d)  # R^T per row
@@ -2772,79 +2874,128 @@ def run_spherical_index(
         )
 
     if f_raw is not None:
-        # assemble the search manually around the precomputed raw f
-        sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
-        L = f_raw.shape[0] - 1
-        g = sph.project_points(dirs_model, w_model, L, sigma)
-        if f_raw_radial is not None:
-            g3 = sph.radial_model_stack(
-                model_shells[0],
-                model_shells[1],
-                model_shells[2],
-                int(radial),
-                1.0 / float(d_min),
-                L,
-                sigma,
-            )
-            C, al_, be_, ga_ = sph.correlogram(f_raw_radial, g3)
-        elif f_raw_bands is not None:
-            masks_model = sph.band_masks(g0_model, band_edges, wl, d_min)
-            print(
-                "spherical-index: band consistency, sin(theta) edges "
-                + " ".join(f"{e:.2f}" for e in band_edges[1:-1])
-                + "; model per band "
-                + " ".join(str(int(m_.sum())) for m_ in masks_model)
-                + f" of {len(g0_model)}"
-            )
-            C, al_, be_, ga_ = sph.banded_search(
-                f_raw_bands, dirs_model, w_model, masks_model, L, sigma
-            )
-        else:
-            C, al_, be_, ga_ = sph.correlogram(f_raw, g)
-        cands = sph.top_orientations(C, al_, be_, ga_, n=n_candidates)
-        results = []
-        kept_R = []
-        kept_vals = []
-        gnorm2 = sph.so3_inner(g, g, np.eye(3))
-        # refine and rank on the objective that was searched: with the
-        # radial channels the 2D map's maximum sits elsewhere (MANDI L1
-        # run 0: 2.8 deg off the TOF truth, and a far peak outranked it)
-        f_obj, g_obj = (f_raw_radial, g3) if f_raw_radial is not None else (f_raw, g)
-        inner_obj = sph.so3_inner_stack if f_raw_radial is not None else sph.so3_inner
-        for R_, val_grid in cands:
-            R_ = sph.refine_local(f_obj, g_obj, R_)
-            val = inner_obj(f_obj, g_obj, R_)
-            # duplicates as the peaks path defines them: the same peak
-            # within the grid separation, or a lattice-symmetry copy (same
-            # rotated model AND the same objective value).  Coherence alone
-            # is > 0.99 for any small rotation of a dense dictionary and
-            # deleted the true L1 orientation (see find_orientations).
-            mu = max(
-                (abs(sph.so3_inner(g, g, R_.T @ R2)) / gnorm2 for R2 in kept_R),
-                default=0.0,
-            )
-            sep = np.deg2rad(2.0 * 180.0 / max(len(be_), 1))
-            if any(
-                sph._quat_angle(R_, R2) < sep
-                or (mu > 0.99 and abs(val - v2) <= 1e-3 * max(abs(val), abs(v2), 1e-30))
-                for R2, v2 in zip(kept_R, kept_vals)
-            ):
-                continue
-            kept_R.append(R_)
-            kept_vals.append(val)
-            results.append(
+        if search == "lattice":
+            # spots from the excess image: 5 sigma blobs, centroid ->
+            # direction in the sample frame, weight sqrt(mass).  The
+            # dense-regime excess with this threshold gave 213 blobs on
+            # MANDI L1 run 0 of which 207 were real (TOF-indexed).
+            from scipy.ndimage import center_of_mass, label
+
+            spot_d, spot_w = [], []
+            for bk, rows in per_bank_rows.items():
+                shape_ = (len(np.unique(bin_rows[bk])), len(np.unique(bin_cols[bk])))
+                for (r_, e_), (_, s_) in zip(rows, per_bank_sig[bk]):
+                    e2, s2 = e_.reshape(shape_), s_.reshape(shape_)
+                    lab_, n_ = label(e2 > 5.0 * s2)
+                    if n_ == 0:
+                        continue
+                    cms = center_of_mass(e2, lab_, range(1, n_ + 1))
+                    mass = np.array([e2[lab_ == k_].sum() for k_ in range(1, n_ + 1)])
+                    pr_ = np.array([cm[0] for cm in cms]) * b2 + (b2 - 1) / 2.0
+                    pc_ = np.array([cm[1] for cm in cms]) * b2 + (b2 - 1) / 2.0
+                    d_ = sph.panel_directions(dets[bk], rows=pr_, cols=pc_, ki=ki)
+                    Rr = R_run.get(r_)
+                    spot_d.append(d_ @ Rr if Rr is not None else d_)
+                    spot_w.append(np.sqrt(np.clip(mass, 0.0, None)))
+            spot_d, spot_w = np.vstack(spot_d), np.concatenate(spot_w)
+            ladder = sph.lattice_ladder(spot_d, spot_w, B)
+            results = [
                 {
                     "R": R_,
-                    "score": val,
-                    # the grid value: C is the band-consistent z-sum when
-                    # banding is on, and a pooled inner is not on its scale
-                    "z": sph.null_zscore(C, val_grid),
+                    "score": s_,
+                    "z": z_,
                     "n_matched": 0,
-                    "coherence": mu,
+                    "coherence": 0.0,
                     "c": np.nan,
                 }
+                for R_, s_, z_ in ladder
+            ]
+            print(
+                f"spherical-index: direct-lattice ladder on {len(spot_d)} spots, "
+                f"final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
             )
-        results.sort(key=lambda r: r["score"], reverse=True)
+            ewald_refine = True  # the ladder ends at the exact stage's basin
+        else:
+            # assemble the search manually around the precomputed raw f
+            sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
+            L = f_raw.shape[0] - 1
+            g = sph.project_points(dirs_model, w_model, L, sigma)
+            if f_raw_radial is not None:
+                g3 = sph.radial_model_stack(
+                    model_shells[0],
+                    model_shells[1],
+                    model_shells[2],
+                    int(radial),
+                    1.0 / float(d_min),
+                    L,
+                    sigma,
+                )
+                C, al_, be_, ga_ = sph.correlogram(f_raw_radial, g3)
+            elif f_raw_bands is not None:
+                masks_model = sph.band_masks(g0_model, band_edges, wl, d_min)
+                print(
+                    "spherical-index: band consistency, sin(theta) edges "
+                    + " ".join(f"{e:.2f}" for e in band_edges[1:-1])
+                    + "; model per band "
+                    + " ".join(str(int(m_.sum())) for m_ in masks_model)
+                    + f" of {len(g0_model)}"
+                )
+                C, al_, be_, ga_ = sph.banded_search(
+                    f_raw_bands, dirs_model, w_model, masks_model, L, sigma
+                )
+            else:
+                C, al_, be_, ga_ = sph.correlogram(f_raw, g)
+            cands = sph.top_orientations(C, al_, be_, ga_, n=n_candidates)
+            results = []
+            kept_R = []
+            kept_vals = []
+            gnorm2 = sph.so3_inner(g, g, np.eye(3))
+            # refine and rank on the objective that was searched: with the
+            # radial channels the 2D map's maximum sits elsewhere (MANDI L1
+            # run 0: 2.8 deg off the TOF truth, and a far peak outranked it)
+            f_obj, g_obj = (
+                (f_raw_radial, g3) if f_raw_radial is not None else (f_raw, g)
+            )
+            inner_obj = (
+                sph.so3_inner_stack if f_raw_radial is not None else sph.so3_inner
+            )
+            for R_, val_grid in cands:
+                R_ = sph.refine_local(f_obj, g_obj, R_)
+                val = inner_obj(f_obj, g_obj, R_)
+                # duplicates as the peaks path defines them: the same peak
+                # within the grid separation, or a lattice-symmetry copy (same
+                # rotated model AND the same objective value).  Coherence alone
+                # is > 0.99 for any small rotation of a dense dictionary and
+                # deleted the true L1 orientation (see find_orientations).
+                mu = max(
+                    (abs(sph.so3_inner(g, g, R_.T @ R2)) / gnorm2 for R2 in kept_R),
+                    default=0.0,
+                )
+                sep = np.deg2rad(2.0 * 180.0 / max(len(be_), 1))
+                if any(
+                    sph._quat_angle(R_, R2) < sep
+                    or (
+                        mu > 0.99
+                        and abs(val - v2) <= 1e-3 * max(abs(val), abs(v2), 1e-30)
+                    )
+                    for R2, v2 in zip(kept_R, kept_vals)
+                ):
+                    continue
+                kept_R.append(R_)
+                kept_vals.append(val)
+                results.append(
+                    {
+                        "R": R_,
+                        "score": val,
+                        # the grid value: C is the band-consistent z-sum when
+                        # banding is on, and a pooled inner is not on its scale
+                        "z": sph.null_zscore(C, val_grid),
+                        "n_matched": 0,
+                        "coherence": mu,
+                        "c": np.nan,
+                    }
+                )
+            results.sort(key=lambda r: r["score"], reverse=True)
         if ewald_refine:
             # The exact Ewald objective, no band limit: predict every
             # in-band reflection's pixel for U and sum the binned excess
@@ -2863,6 +3014,17 @@ def run_spherical_index(
                 bk: [(r_, e_.reshape(_shape[bk])) for r_, e_ in rows]
                 for bk, rows in per_bank_rows.items()
             }
+
+            _dev = _ewald_device_factory(
+                _G_c,
+                sorted(int(x) for x in np.unique(run_of_image)),
+                R_run,
+                dets,
+                {(r_, bk): e_ for bk, rows in _exc2.items() for r_, e_ in rows},
+                ki_hat,
+                wl,
+                b2,
+            )
 
             def ewald_score(Umat):
                 total = 0.0
@@ -2901,6 +3063,11 @@ def run_spherical_index(
                 )
                 return sph._rodrigues(res_.x) @ Umat
 
+            if _dev is not None:
+                _score_np, _polish_dev = _dev
+                ewald_score = lambda Umat: float(_score_np(Umat)[0])  # noqa: E731
+                ewald_polish = _polish_dev
+                print("spherical-index: exact Ewald stage on the device (flat panels)")
             rng_ = np.random.default_rng(0)
             null_ = np.array(
                 [
@@ -2927,6 +3094,23 @@ def run_spherical_index(
                 "spherical-index: exact Ewald polish of the winner, z = "
                 f"{results[0]['ewald_z']:.1f}"
             )
+    elif search == "lattice":
+        ladder = sph.lattice_ladder(d_sample, None, B)
+        results = [
+            {
+                "R": R_,
+                "score": s_,
+                "z": z_,
+                "n_matched": 0,
+                "coherence": 0.0,
+                "c": np.nan,
+            }
+            for R_, s_, z_ in ladder
+        ]
+        print(
+            f"spherical-index: direct-lattice ladder on {len(d_sample)} peaks, "
+            f"final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
+        )
     else:
         results = sph.find_orientations(
             d_sample,
@@ -3519,6 +3703,7 @@ def run_spherical_index(
         out["spherical/nodal_max_index"] = int(nodal_max_index)
         out["spherical/final_full_refine"] = bool(full_final)
         out["spherical/ewald_refine"] = bool(ewald_refine)
+        out["spherical/search"] = str(search)
         out["spherical/U_candidates"] = np.stack([r["R"] for r in results])
         out["spherical/z"] = np.array([r["z"] for r in results])
         out["spherical/n_matched"] = np.array([r["n_matched"] for r in results])
