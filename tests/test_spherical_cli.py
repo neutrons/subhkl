@@ -461,17 +461,24 @@ def test_refined_instrument_reaches_the_consumers_layout(tmp_path):
 
 
 def test_nodal_dictionary_indexes_end_to_end(tmp_path):
-    """The default dictionary is the nodal set: a P1 cell's zone crossings
-    to |uvw| <= 2 index the synthetic scene through the CLI path, the file
-    records which dictionary solved it, and the optional full-list final
-    stage continues from that solution rather than replacing it."""
+    """The nodal dictionary (the 2D search's default, --radial 0): a P1
+    cell's zone crossings to |uvw| <= 2 index the synthetic scene through
+    the CLI path, the file records which dictionary solved it, and the
+    optional full-list final stage continues from that solution rather than
+    replacing it."""
     rng = np.random.default_rng(29)
     peaks_file = str(tmp_path / "finder.h5")
     U_true, n = _synthetic_finder_file(peaks_file, rng)
 
     out_nodal = str(tmp_path / "nodal.h5")
     run_spherical_index(
-        peaks_file, out_nodal, d_min=1.3, kernel_deg=1.0, nodal_max_index=2
+        peaks_file,
+        out_nodal,
+        d_min=1.3,
+        kernel_deg=1.0,
+        model="nodal",
+        radial=0,
+        nodal_max_index=2,
     )
     with h5py.File(out_nodal) as fp:
         U = fp["sample/U"][()]
@@ -491,6 +498,8 @@ def test_nodal_dictionary_indexes_end_to_end(tmp_path):
         out_full,
         d_min=1.3,
         kernel_deg=1.0,
+        model="nodal",
+        radial=0,
         nodal_max_index=2,
         final_full_refine=True,
     )
@@ -513,7 +522,12 @@ def test_band_consistency_is_on_by_default_and_switchable(tmp_path):
     for flag in (True, False):
         out = str(tmp_path / f"band_{int(flag)}.h5")
         run_spherical_index(
-            peaks_file, out, d_min=1.3, kernel_deg=1.0, band_consistency=flag
+            peaks_file,
+            out,
+            d_min=1.3,
+            kernel_deg=1.0,
+            radial=0,
+            band_consistency=flag,
         )
         with h5py.File(out) as fp:
             outs[flag] = fp["sample/U"][()]

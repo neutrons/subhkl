@@ -1342,11 +1342,12 @@ def spherical_index(
             help=(
                 "Dictionary for the search and the refinements: 'nodal' (crossings "
                 "of the zone-axis great circles, weighted by pair multiplicity; "
-                "small, low-coherence) or 'reflections' (every reflection "
-                "direction at d_min)"
+                "small, low-coherence), 'reflections' (every reflection "
+                "direction at d_min) or 'auto' (reflections when the 3D radial "
+                "search is on, nodal otherwise)"
             ),
         ),
-    ] = "nodal",
+    ] = "auto",
     nodal_max_index: Annotated[
         int,
         typer.Option("--nodal-max-index", help="Zone-axis cut |uvw| for --model nodal"),
@@ -1368,11 +1369,11 @@ def spherical_index(
             "--radial",
             help=(
                 "3D search with this many radial channels on the resolution ball "
-                "(data as Laue segments, model as shells at |G|); 0 keeps the "
-                "spherical search"
+                "(data as Laue segments, model as shells at |G|); 0 falls back to "
+                "the 2D spherical search with band consistency"
             ),
         ),
-    ] = 0,
+    ] = 24,
     final_full_refine: Annotated[
         bool,
         typer.Option(

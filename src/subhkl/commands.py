@@ -2233,11 +2233,11 @@ def run_spherical_index(
     refine_maxiter: int = 400,
     refine_max_points: int = 100_000,
     fit_gonio_offsets: bool = False,
-    model: str = "nodal",
+    model: str = "auto",
     nodal_max_index: int = 3,
     final_full_refine: bool = False,
     band_consistency: bool = True,
-    radial: int = 0,
+    radial: int = 24,
 ):
     """Index by spherical correlation over SO(3) -- the matched-filter dual
     of the sparse orientation-recovery problem (subhkl.search.spherical).
@@ -2484,10 +2484,16 @@ def run_spherical_index(
                 # the background -- on MANDI L1 it gave 56 counts/bin
                 # against a true 400 and the projected weight was the
                 # acceptance.  A local median over the live bins is the
-                # background, a 2 sigma Poisson floor drops the noise, and
-                # bins whose median window touches a dead region are
-                # dropped: a panel edge is a great circle on the sphere
-                # and a rim of fake excess along it is a fake zone.
+                # background and the excess is y - bg, zero-mean like the
+                # sparse branch's y - mu: the noise averages out in the
+                # projection.  (A 2 sigma "floor" subtracted here put every
+                # background bin at a systematic -2 sigma -- a biased panel
+                # footprint that left the 2D search at z 6.6 on the dense
+                # test scene and broke the 3D search outright, whose lowest
+                # radial channel sums all of it coherently; unbiased, both
+                # index at z ~30.)  Bins whose median window touches a dead
+                # region are dropped: a panel edge is a great circle on the
+                # sphere and a rim of fake excess along it is a fake zone.
                 from scipy.ndimage import binary_erosion, generic_filter
 
                 blk = im[:n2, :m2].reshape(n2 // b2, b2, m2 // b2, b2)
@@ -2496,13 +2502,13 @@ def run_spherical_index(
                     np.where(live, y, np.nan), np.nanmedian, size=9, mode="nearest"
                 )
                 keep = binary_erosion(live, iterations=5)
-                exc = np.nan_to_num(y - bg - 2.0 * np.sqrt(np.clip(bg, 1.0, None)))
+                exc = np.nan_to_num(y - bg)
                 excess = np.where(keep, exc, 0.0).ravel()
                 if not dense_noted:
                     print(
                         "spherical-index: dense background (zero fraction "
-                        f"{zero_frac:.3f}); local-median background with a "
-                        "2 sigma floor, panel rims masked"
+                        f"{zero_frac:.3f}); local-median background, panel "
+                        "rims masked"
                     )
                     dense_noted = True
             if bk not in bin_dirs:
@@ -2655,6 +2661,14 @@ def run_spherical_index(
     # sees the nominal cell (a coarse stage), and refinement takes it from
     # there.  A partial dictionary is polished matching-free ("local"):
     # assigning every datum to its nearest node would bias the fit.
+    #
+    # 'auto': with the 3D radial search the shells at |G| already carry the
+    # wavelength consistency the nodal points supplied in 2D, and the plain
+    # reflection set is the better dictionary (cg4d-garnet, 21 stills:
+    # CC(1/2) 0.9999 vs 0.9994 for radial + nodal); without it (no band on
+    # the data, or --radial 0) the nodal set is (0.9998 vs 0.9987).
+    if model == "auto":
+        model = "reflections" if int(radial) > 0 and wl is not None else "nodal"
     if model == "nodal":
         hkl_model, w_model = sph.nodal_points(B, max_index=nodal_max_index)
         G_m = hkl_model @ B.T
@@ -2681,7 +2695,9 @@ def run_spherical_index(
         hkl_model, w_model, dirs_model = hkl_all, None, dirs
         refine_method = "wahba"
     else:
-        raise ValueError(f"model must be 'nodal' or 'reflections', got {model!r}")
+        raise ValueError(
+            f"model must be 'nodal', 'reflections' or 'auto', got {model!r}"
+        )
     full_final = bool(final_full_refine) and model != "reflections"
     hkl_inst, w_inst = (hkl_all, None) if full_final else (hkl_model, w_model)
     # primitive spacing along every search direction, for the band rule
