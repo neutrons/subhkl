@@ -2236,6 +2236,7 @@ def run_spherical_index(
     model: str = "auto",
     nodal_max_index: int = 3,
     final_full_refine: bool = False,
+    ewald_refine: bool = False,
     band_consistency: bool = True,
     radial: int = 24,
 ):
@@ -2421,6 +2422,8 @@ def run_spherical_index(
         _t[name] = _t.get(name, 0.0) + (now - _t["start"])
         _t["start"] = now
 
+    ewald_score = None
+    ewald_polish = None
     f_raw = None
     f_raw_bands = None
     f_raw_radial = None
@@ -2831,6 +2834,88 @@ def run_spherical_index(
                 }
             )
         results.sort(key=lambda r: r["score"], reverse=True)
+        if ewald_refine:
+            # The exact Ewald objective, no band limit: predict every
+            # in-band reflection's pixel for U and sum the binned excess
+            # there.  Measured on MANDI L1 run 0 against a TOF reference:
+            # z 48.7 at the truth over random orientations, half-width
+            # 0.2 deg, background by 1 deg -- where the L = 96
+            # correlogram is 13.6 and a peak wide.  Sharp enough to rank
+            # candidates a few degrees apart and to polish the winner; too
+            # narrow to search, so it needs the correlogram's candidates.
+            _G_c = hkl_all @ B.T
+            _shape = {
+                bk: (len(np.unique(bin_rows[bk])), len(np.unique(bin_cols[bk])))
+                for bk in per_bank_rows
+            }
+            _exc2 = {
+                bk: [(r_, e_.reshape(_shape[bk])) for r_, e_ in rows]
+                for bk, rows in per_bank_rows.items()
+            }
+
+            def ewald_score(Umat):
+                total = 0.0
+                for r_ in np.unique(run_of_image):
+                    Rr = R_run.get(int(r_), np.eye(3))
+                    G = (_G_c @ Umat.T) @ Rr.T
+                    q = np.linalg.norm(G, axis=1)
+                    sth = -(G @ ki_hat) / q
+                    lam_ = 2.0 * sth / q
+                    m_ = (lam_ >= wl[0]) & (lam_ <= wl[1]) & (sth > 0)
+                    kf = ki_hat + lam_[m_, None] * G[m_]
+                    kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+                    for bk, rows in _exc2.items():
+                        e_ = next((e for rr, e in rows if rr == r_), None)
+                        if e_ is None:
+                            continue
+                        mask, pr_, pc_ = dets[bk].reflections_mask(
+                            kf[:, 0], kf[:, 1], kf[:, 2]
+                        )
+                        if not np.any(mask):
+                            continue
+                        ir = np.clip((pr_[mask] / b2).astype(int), 0, e_.shape[0] - 1)
+                        ic = np.clip((pc_[mask] / b2).astype(int), 0, e_.shape[1] - 1)
+                        total += float(e_[ir, ic].sum())
+                return total
+
+            def ewald_polish(Umat, span_deg=1.5):
+                from scipy.optimize import minimize
+
+                res_ = minimize(
+                    lambda v: -ewald_score(sph._rodrigues(v) @ Umat),
+                    np.zeros(3),
+                    method="Nelder-Mead",
+                    options={"maxiter": 80, "xatol": np.deg2rad(0.01), "fatol": 1e-9},
+                    bounds=[(-np.deg2rad(span_deg), np.deg2rad(span_deg))] * 3,
+                )
+                return sph._rodrigues(res_.x) @ Umat
+
+            rng_ = np.random.default_rng(0)
+            null_ = np.array(
+                [
+                    ewald_score(sph._rodrigues(rng_.normal(size=3) * 3.0))
+                    for _ in range(16)
+                ]
+            )
+            for r in results:
+                r["ewald_score"] = ewald_score(r["R"])
+                r["ewald_z"] = (r["ewald_score"] - null_.mean()) / max(
+                    null_.std(), 1e-12
+                )
+            results.sort(key=lambda r: r["ewald_score"], reverse=True)
+            print(
+                "spherical-index: exact Ewald ranking of candidates, z = "
+                + ", ".join(f"{r['ewald_z']:.1f}" for r in results)
+            )
+            results[0]["R"] = ewald_polish(results[0]["R"])
+            results[0]["ewald_score"] = ewald_score(results[0]["R"])
+            results[0]["ewald_z"] = (results[0]["ewald_score"] - null_.mean()) / max(
+                null_.std(), 1e-12
+            )
+            print(
+                "spherical-index: exact Ewald polish of the winner, z = "
+                f"{results[0]['ewald_z']:.1f}"
+            )
     else:
         results = sph.find_orientations(
             d_sample,
@@ -2853,7 +2938,9 @@ def run_spherical_index(
     best = results[0]
     U = best["R"]
     B_out = B
-    if refine:
+    # with the exact Ewald stage on, the band-limited matching-free polish
+    # would pull U off the exact maximum again (measured: z 16 -> 9)
+    if refine and ewald_polish is None:
         sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
         L = (
             int(bandwidth)
@@ -3420,6 +3507,7 @@ def run_spherical_index(
         out["spherical/model_size"] = len(hkl_model)
         out["spherical/nodal_max_index"] = int(nodal_max_index)
         out["spherical/final_full_refine"] = bool(full_final)
+        out["spherical/ewald_refine"] = bool(ewald_refine)
         out["spherical/U_candidates"] = np.stack([r["R"] for r in results])
         out["spherical/z"] = np.array([r["z"] for r in results])
         out["spherical/n_matched"] = np.array([r["n_matched"] for r in results])

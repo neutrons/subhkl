@@ -1374,6 +1374,17 @@ def spherical_index(
             ),
         ),
     ] = 24,
+    ewald_refine: Annotated[
+        bool,
+        typer.Option(
+            "--ewald-refine",
+            help=(
+                "Raw-count mode: rank the correlogram's candidates and polish "
+                "the winner on the exact Ewald objective (predicted in-band "
+                "spots against the excess image, no band limit)"
+            ),
+        ),
+    ] = False,
     final_full_refine: Annotated[
         bool,
         typer.Option(
@@ -1665,6 +1676,7 @@ def spherical_index(
         model=model,
         nodal_max_index=nodal_max_index,
         final_full_refine=final_full_refine,
+        ewald_refine=ewald_refine,
         band_consistency=band_consistency,
         radial=radial,
         det_trans_bound=det_trans_bound,

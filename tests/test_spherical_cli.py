@@ -536,16 +536,11 @@ def test_band_consistency_is_on_by_default_and_switchable(tmp_path):
         assert err < 0.5, (flag, err)
 
 
-def test_dense_background_regime_isolates_spots_and_masks_rims(tmp_path):
-    """A frame with a flat 25 count/pixel background has no zero pixels
-    except its dead border, so the zero-fraction estimator reads the
-    border, not the background (56 counts/bin against a true 400 on
-    MANDI L1).  In that regime the raw path must switch to a local
-    median: the excess it projects has to come from the spots, and the
-    panel rim -- a great circle on the sphere -- must carry none."""
-    from subhkl.commands import run_spherical_index
-
-    rng = np.random.default_rng(41)
+def _dense_scene(tmp_path, seed=41):
+    """One still of 80 CG4D banks on a flat 25 count/pixel background with
+    a dead border: the dense-regime scene shared by the raw-path tests.
+    Returns (meta_path, merged_path, U_true)."""
+    rng = np.random.default_rng(seed)
     a = 8.0
     B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
     h, k, l_ = generate_reflections(a, a, a, 90, 90, 90, space_group="P 1", d_min=1.3)
@@ -593,6 +588,19 @@ def test_dense_background_regime_isolates_spots_and_masks_rims(tmp_path):
         fp["sample/space_group"] = "P 1"
         fp["instrument/wavelength"] = np.array([2.0, 10.0])
         fp.attrs["instrument"] = "CG4D"
+    return meta, merged, U_true
+
+
+def test_dense_background_regime_isolates_spots_and_masks_rims(tmp_path):
+    """A frame with a flat 25 count/pixel background has no zero pixels
+    except its dead border, so the zero-fraction estimator reads the
+    border, not the background (56 counts/bin against a true 400 on
+    MANDI L1).  In that regime the raw path must switch to a local
+    median: the excess it projects has to come from the spots, and the
+    panel rim -- a great circle on the sphere -- must carry none."""
+    from subhkl.commands import run_spherical_index
+
+    meta, merged, U_true = _dense_scene(tmp_path)
     out = str(tmp_path / "out.h5")
     run_spherical_index(
         meta,
@@ -609,6 +617,34 @@ def test_dense_background_regime_isolates_spots_and_masks_rims(tmp_path):
     err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
     assert err < 1.0
     assert z[0] > 5.0  # one still on a 25 count/pixel background
+
+
+def test_ewald_refine_ranks_and_polishes_raw_counts(tmp_path):
+    """--ewald-refine: the correlogram's candidates are re-ranked on the
+    exact Ewald objective (predicted in-band spots against the excess
+    image, no band limit) and the winner polished on it.  Measured on
+    MANDI L1: candidates a band-limited z could not order (16 vs 13)
+    separate 3:1 on the exact score, and the polish lands within 0.2 deg
+    of a TOF reference where the band-limited polish left 0.7-1.0 deg."""
+    from subhkl.commands import run_spherical_index
+
+    meta, merged, U_true = _dense_scene(tmp_path, seed=43)
+    out = str(tmp_path / "ewald.h5")
+    run_spherical_index(
+        meta,
+        out,
+        d_min=1.3,
+        kernel_deg=1.0,
+        images_filename=merged,
+        binning=4,
+        n_candidates=8,
+        ewald_refine=True,
+    )
+    with h5py.File(out) as fp:
+        U = fp["sample/U"][()]
+        assert bool(fp["spherical/ewald_refine"][()])
+    err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
+    assert err < 0.3
 
 
 def test_radial_search_indexes_both_data_paths(tmp_path):
