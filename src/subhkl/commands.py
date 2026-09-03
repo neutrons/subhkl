@@ -3595,14 +3595,22 @@ def run_indexer_visualize(
             sample_offset = np.zeros(3)
             R = None
 
+        skipped = []
         for r, img_keys in runs_imgs.items():
             m = run == r
             if image_index is not None:
                 m = m & (img == int(image_index))
+            if not np.any(m):
+                # a run the solution file does not cover (e.g. indexed with
+                # --runs): there is no goniometer setting to draw it with,
+                # and an overlay at the identity is a wrong picture, not a
+                # cautious one -- it sits frozen while the spots move
+                skipped.append(int(r))
+                continue
             if Rg is None:
                 R_frame = None
             elif Rg.shape[0] == len(pr):
-                R_frame = Rg[np.argmax(m)] if np.any(m) else None
+                R_frame = Rg[np.argmax(m)]
             else:
                 R_frame = Rg[img_keys[0]]
             run_dets = {k: loaded.get_detector_by_img(k) for k in img_keys}
@@ -3629,6 +3637,11 @@ def run_indexer_visualize(
             )
             written.append(out_name)
             print(f"wrote {out_name}")
+        if skipped:
+            print(
+                f"indexer-visualize: {len(skipped)} run(s) in the images file have "
+                f"no rows in the solution file and were not drawn: {skipped}"
+            )
         return written
 
     for r in np.unique(run):
