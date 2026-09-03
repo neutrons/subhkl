@@ -1243,6 +1243,66 @@ def direct_lattice_vectors(B, max_index=6):
     return X[o] / xlen[o][:, None], xlen[o], uvw[o]
 
 
+def funk_table(dirs, weights, tol_deg, spacing_deg):
+    """Tabulate the Funk transform of a weighted spot set: for every pole n
+    on a grid of the given spacing, the spot weight within tol of the great
+    circle perpendicular to n.  Returns (lookup, table) with
+    lookup(n [..., 3]) -> flat grid index; the grid is (theta, phi) with the
+    phi bins scaled by sin(theta) so cells are ~spacing wide everywhere.
+
+    A rung's objective is sum_k w_k F(R x_k): with F tabulated an
+    orientation costs K lookups instead of K x N dot products, so the
+    exhaustive rung no longer depends on the spot count."""
+    import jax
+    import jax.numpy as jnp
+
+    D = np.asarray(dirs, np.float32)
+    w = np.asarray(weights, np.float32)
+    nth = int(np.ceil(180.0 / spacing_deg))
+    th = (np.arange(nth) + 0.5) * np.pi / nth
+    nph = np.maximum(1, np.ceil(360.0 * np.sin(th) / spacing_deg)).astype(int)
+    off = np.concatenate([[0], np.cumsum(nph)])
+    poles = []
+    for t_, n_, o_ in zip(th, nph, off[:-1]):
+        ph = (np.arange(n_) + 0.5) * 2 * np.pi / n_
+        poles.append(
+            np.stack(
+                [
+                    np.sin(t_) * np.cos(ph),
+                    np.sin(t_) * np.sin(ph),
+                    np.full(n_, np.cos(t_)),
+                ],
+                1,
+            )
+        )
+    P = np.vstack(poles).astype(np.float32)
+    thr = np.float32(np.sin(np.radians(tol_deg)))
+    Dj, wj = jnp.asarray(D), jnp.asarray(w)
+
+    @jax.jit
+    def chunk(Pc):
+        on = jnp.abs(Pc @ Dj.T) < thr
+        return on.astype(jnp.float32) @ wj
+
+    ch = int(max(256, 2e8 // max(len(D), 1)))
+    table = np.concatenate(
+        [np.asarray(chunk(jnp.asarray(P[i : i + ch]))) for i in range(0, len(P), ch)]
+    )
+    off_j, nph_j = jnp.asarray(off[:-1]), jnp.asarray(nph)
+
+    def lookup(n):
+        n = n / jnp.linalg.norm(n, axis=-1, keepdims=True)
+        t_ = jnp.arccos(jnp.clip(n[..., 2], -1, 1))
+        it = jnp.clip((t_ / jnp.pi * nth).astype(jnp.int32), 0, nth - 1)
+        ph = jnp.arctan2(n[..., 1], n[..., 0]) % (2 * jnp.pi)
+        ip = jnp.clip(
+            (ph / (2 * jnp.pi) * nph_j[it]).astype(jnp.int32), 0, nph_j[it] - 1
+        )
+        return off_j[it] + ip
+
+    return lookup, jnp.asarray(table)
+
+
 #: rungs of the ladder: (number of shortest zones, tolerance [deg], zoom
 #: half-span [deg], candidates kept, zoom points per axis).  The tolerance is
 #: the basin width; the zone count sets the coverage N * 2 tol / 180 of the
@@ -1272,6 +1332,7 @@ def lattice_ladder(
     rungs=LATTICE_RUNGS,
     n_null=200,
     seed=0,
+    table=True,
 ):
     """Orientation search on the direct lattice, coarse to fine.
 
@@ -1326,14 +1387,38 @@ def lattice_ladder(
     b_ = np.radians(np.arange(step / 2, 180, step))
     grid = np.array(np.meshgrid(a_, b_, a_, indexing="ij")).reshape(3, -1).T
     Rs = Rot.from_euler("ZYZ", grid).as_matrix().astype(np.float32)
-    sc = make(int(coarse_zones), float(coarse_tol_deg))
-    # the [orientations, zones, spots] tensor is the whole cost: budget it
-    # (a pooled garnet run has 25k spots; a single L1 still 200)
     budget = 1.5e8
-    ch = int(max(256, min(32768, budget // (int(coarse_zones) * len(D)))))
-    out = np.concatenate(
-        [np.asarray(sc(jnp.asarray(Rs[i : i + ch]))) for i in range(0, len(Rs), ch)]
-    )
+    if table:
+        # the exhaustive rung through the Funk table: K lookups per
+        # orientation, independent of the spot count.  The pole grid is a
+        # third of the tolerance, so a lookup is within tol/6 of the exact
+        # pole; the fine rungs below count exactly on their few candidates.
+        lookup, tab = funk_table(
+            D, w, float(coarse_tol_deg), float(coarse_tol_deg) / 3.0
+        )
+        Zj = jnp.asarray(Zdir[: int(coarse_zones)])
+        wz = jnp.asarray((1.0 / xlen[: int(coarse_zones)]).astype(np.float32))
+
+        @jax.jit
+        def sc_table(Rs_):
+            Zl = jnp.einsum("nij,kj->nki", Rs_, Zj)
+            return (tab[lookup(Zl)] * wz[None, :]).sum(1)
+
+        ch = 262144
+        out = np.concatenate(
+            [
+                np.asarray(sc_table(jnp.asarray(Rs[i : i + ch])))
+                for i in range(0, len(Rs), ch)
+            ]
+        )
+    else:
+        sc = make(int(coarse_zones), float(coarse_tol_deg))
+        # the [orientations, zones, spots] tensor is the whole cost: budget it
+        # (a pooled garnet run has 25k spots; a single L1 still 200)
+        ch = int(max(256, min(32768, budget // (int(coarse_zones) * len(D)))))
+        out = np.concatenate(
+            [np.asarray(sc(jnp.asarray(Rs[i : i + ch]))) for i in range(0, len(Rs), ch)]
+        )
     cands = Rs[np.argsort(-out)[: int(n_shortlist)]]
 
     def zoom_all(cands, nz, tol, span, n):

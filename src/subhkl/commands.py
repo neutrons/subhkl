@@ -2522,6 +2522,7 @@ def run_spherical_index(
 
     ewald_score = None
     ewald_polish = None
+    raw_mode = images_filename is not None
     f_raw = None
     f_raw_bands = None
     f_raw_radial = None
@@ -2557,7 +2558,7 @@ def run_spherical_index(
             if bandwidth is not None
             else int(min(max(np.ceil(3.0 / sigma_raw), 16), 96))
         )
-        if bandwidth is None:
+        if bandwidth is None and (search != "lattice" or refine_instrument):
             # ...unless the dictionary is denser than that resolution: then
             # the model is uniform at L and the search blind (MANDI L1).
             _h, _k, _l = generate_reflections(*cell, space_group=sg, d_min=d_min)
@@ -2662,105 +2663,112 @@ def run_spherical_index(
         from subhkl.search.spherical import project_counts_device
 
         f_lab_run = {}
-        # Band-consistency: the bins are stratified by sin(theta) and each
-        # stratum projected on its own, so the search can hold every band
-        # to the directions that could have produced it.  The pooled map
-        # (every stage downstream) is the sum of the strata.
-        use_radial = int(radial) > 0 and wl is not None
-        use_band = bool(band_consistency) and wl is not None and not use_radial
-        if use_band:
-            band_edges = sph.sin_theta_edges(
-                np.concatenate(raw_sth), np.concatenate(raw_w), n_bands=4
-            )
-        n_bands_raw = len(band_edges) - 1 if use_band else 1
-        n_chan = int(radial) if use_radial else 0
-        q_max_r = 1.0 / float(d_min)
-        f_lab_band = {}
-        # pad every bank to the same frame count so the device kernel
-        # compiles once (zero rows project to zero and are discarded)
-        nf_max = max(len(rows) for rows in per_bank_rows.values())
-        for bk, rows in per_bank_rows.items():
-            W = np.zeros((nf_max, len(rows[0][1])))
-            for i_, (_, e_) in enumerate(rows):
-                W[i_] = e_
-            if use_radial:
-                # every frame x channel as one row of a single projection:
-                # the segment weights depend on the bin's sin(theta) only
-                seg = sph.radial_data_weights(bin_sth[bk], wl, q_max_r, n_chan)
-                W3 = (W[:, None, :] * seg.T[None, :, :]).reshape(-1, W.shape[1])
-                F3 = project_counts_device(bin_dirs[bk], W3, L_raw, sigma_raw).reshape(
-                    len(W), n_chan, L_raw + 1, 2 * L_raw + 1
+        if search != "lattice" or refine_instrument:
+            # the lattice ladder works on spots; no harmonic projection,
+            # no Wigner pass (a third of a still's wall time, most of a
+            # pooled run's) -- unless the matching-free instrument
+            # refinement needs the map
+            # Band-consistency: the bins are stratified by sin(theta) and each
+            # stratum projected on its own, so the search can hold every band
+            # to the directions that could have produced it.  The pooled map
+            # (every stage downstream) is the sum of the strata.
+            use_radial = int(radial) > 0 and wl is not None
+            use_band = bool(band_consistency) and wl is not None and not use_radial
+            if use_band:
+                band_edges = sph.sin_theta_edges(
+                    np.concatenate(raw_sth), np.concatenate(raw_w), n_bands=4
                 )
-                F = project_counts_device(bin_dirs[bk], W, L_raw, sigma_raw)
-                for (r_, _), Fi, F3i in zip(rows, F, F3):
-                    f_lab_run[r_] = f_lab_run.get(r_, 0.0) + Fi
-                    for c_ in range(n_chan):
-                        f_lab_band[(r_, c_)] = f_lab_band.get((r_, c_), 0.0) + F3i[c_]
-                continue
-            for b_ in range(n_bands_raw):
-                if use_band:
-                    m_b = (bin_sth[bk] > band_edges[b_]) & (
-                        bin_sth[bk] <= band_edges[b_ + 1]
-                    )
-                    if not m_b.any():
-                        continue
-                    F = project_counts_device(
-                        bin_dirs[bk], W * m_b[None, :], L_raw, sigma_raw
-                    )
-                else:
+            n_bands_raw = len(band_edges) - 1 if use_band else 1
+            n_chan = int(radial) if use_radial else 0
+            q_max_r = 1.0 / float(d_min)
+            f_lab_band = {}
+            # pad every bank to the same frame count so the device kernel
+            # compiles once (zero rows project to zero and are discarded)
+            nf_max = max(len(rows) for rows in per_bank_rows.values())
+            for bk, rows in per_bank_rows.items():
+                W = np.zeros((nf_max, len(rows[0][1])))
+                for i_, (_, e_) in enumerate(rows):
+                    W[i_] = e_
+                if use_radial:
+                    # every frame x channel as one row of a single projection:
+                    # the segment weights depend on the bin's sin(theta) only
+                    seg = sph.radial_data_weights(bin_sth[bk], wl, q_max_r, n_chan)
+                    W3 = (W[:, None, :] * seg.T[None, :, :]).reshape(-1, W.shape[1])
+                    F3 = project_counts_device(
+                        bin_dirs[bk], W3, L_raw, sigma_raw
+                    ).reshape(len(W), n_chan, L_raw + 1, 2 * L_raw + 1)
                     F = project_counts_device(bin_dirs[bk], W, L_raw, sigma_raw)
-                for (r_, _), Fi in zip(rows, F):
-                    f_lab_run[r_] = f_lab_run.get(r_, 0.0) + Fi
-                    f_lab_band[(r_, b_)] = f_lab_band.get((r_, b_), 0.0) + Fi
-        _mark("project")
-        # one batched Wigner build for every run's rotation instead of a
-        # scalar build per run
-        run_keys = sorted(f_lab_run)
-        rot_keys = [r_ for r_ in run_keys if R_run.get(r_) is not None]
-        if rot_keys:
-            eulers = np.array([sph.euler_zyz(R_run[r_].T) for r_ in rot_keys])
-            d_all = sph.wigner_d_matrix(L_raw, eulers[:, 1])  # [l, m, n, r]
-            m_ax = np.arange(-L_raw, L_raw + 1)
-            ea = np.exp(-1j * np.outer(eulers[:, 0], m_ax))  # [r, m]
-            eg = np.exp(-1j * np.outer(eulers[:, 2], m_ax))  # [r, n]
+                    for (r_, _), Fi, F3i in zip(rows, F, F3):
+                        f_lab_run[r_] = f_lab_run.get(r_, 0.0) + Fi
+                        for c_ in range(n_chan):
+                            f_lab_band[(r_, c_)] = (
+                                f_lab_band.get((r_, c_), 0.0) + F3i[c_]
+                            )
+                    continue
+                for b_ in range(n_bands_raw):
+                    if use_band:
+                        m_b = (bin_sth[bk] > band_edges[b_]) & (
+                            bin_sth[bk] <= band_edges[b_ + 1]
+                        )
+                        if not m_b.any():
+                            continue
+                        F = project_counts_device(
+                            bin_dirs[bk], W * m_b[None, :], L_raw, sigma_raw
+                        )
+                    else:
+                        F = project_counts_device(bin_dirs[bk], W, L_raw, sigma_raw)
+                    for (r_, _), Fi in zip(rows, F):
+                        f_lab_run[r_] = f_lab_run.get(r_, 0.0) + Fi
+                        f_lab_band[(r_, b_)] = f_lab_band.get((r_, b_), 0.0) + Fi
+            _mark("project")
+            # one batched Wigner build for every run's rotation instead of a
+            # scalar build per run
+            run_keys = sorted(f_lab_run)
+            rot_keys = [r_ for r_ in run_keys if R_run.get(r_) is not None]
+            if rot_keys:
+                eulers = np.array([sph.euler_zyz(R_run[r_].T) for r_ in rot_keys])
+                d_all = sph.wigner_d_matrix(L_raw, eulers[:, 1])  # [l, m, n, r]
+                m_ax = np.arange(-L_raw, L_raw + 1)
+                ea = np.exp(-1j * np.outer(eulers[:, 0], m_ax))  # [r, m]
+                eg = np.exp(-1j * np.outer(eulers[:, 2], m_ax))  # [r, n]
 
-        # every map -- the pooled one and each band -- rotated in ONE pass:
-        # the Wigner stack is the expensive operand and it is shared
-        keys = [None] + (
-            list(range(n_chan))
-            if use_radial
-            else (list(range(n_bands_raw)) if use_band else [])
-        )
-        zero = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
-
-        def _get(r_, b_):
-            return (
-                f_lab_run.get(r_, zero)
-                if b_ is None
-                else f_lab_band.get((r_, b_), zero)
+            # every map -- the pooled one and each band -- rotated in ONE pass:
+            # the Wigner stack is the expensive operand and it is shared
+            keys = [None] + (
+                list(range(n_chan))
+                if use_radial
+                else (list(range(n_bands_raw)) if use_band else [])
             )
+            zero = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
 
-        pooled = np.zeros((len(keys), L_raw + 1, 2 * L_raw + 1), dtype=complex)
-        for r_ in run_keys:
-            if r_ not in rot_keys:
-                for k_, b_ in enumerate(keys):
-                    pooled[k_] += _get(r_, b_)
-        if rot_keys:
-            f_stack = np.stack(
-                [[_get(r_, b_) for b_ in keys] for r_ in rot_keys]
-            )  # [r, k, l, n]
-            pooled += np.einsum(
-                "rm,lmnr,rn,rkln->klm", ea, d_all, eg, f_stack, optimize=True
+            def _get(r_, b_):
+                return (
+                    f_lab_run.get(r_, zero)
+                    if b_ is None
+                    else f_lab_band.get((r_, b_), zero)
+                )
+
+            pooled = np.zeros((len(keys), L_raw + 1, 2 * L_raw + 1), dtype=complex)
+            for r_ in run_keys:
+                if r_ not in rot_keys:
+                    for k_, b_ in enumerate(keys):
+                        pooled[k_] += _get(r_, b_)
+            if rot_keys:
+                f_stack = np.stack(
+                    [[_get(r_, b_) for b_ in keys] for r_ in rot_keys]
+                )  # [r, k, l, n]
+                pooled += np.einsum(
+                    "rm,lmnr,rn,rkln->klm", ea, d_all, eg, f_stack, optimize=True
+                )
+            f_raw = pooled[0]
+            if use_band:
+                f_raw_bands = [pooled[1 + b_] for b_ in range(n_bands_raw)]
+            f_raw_radial = pooled[1:] if use_radial else None
+            _mark("rotate")
+            print(
+                f"spherical-index: raw-count mode, {len(images)} frames binned "
+                f"{b2}x{b2} -> f at L={L_raw}"
             )
-        f_raw = pooled[0]
-        if use_band:
-            f_raw_bands = [pooled[1 + b_] for b_ in range(n_bands_raw)]
-        f_raw_radial = pooled[1:] if use_radial else None
-        _mark("rotate")
-        print(
-            f"spherical-index: raw-count mode, {len(images)} frames binned "
-            f"{b2}x{b2} -> f at L={L_raw}"
-        )
 
     a, b, c_, al, be, ga = cell
     B, _ = cartesian_matrix_metric_tensor(a, b, c_, *np.deg2rad([al, be, ga]))
@@ -2873,7 +2881,7 @@ def run_spherical_index(
             )
         )
 
-    if f_raw is not None:
+    if raw_mode:
         if search == "lattice":
             # spots from the excess image: 5 sigma blobs, centroid ->
             # direction in the sample frame, weight sqrt(mass).  The
@@ -3216,7 +3224,7 @@ def run_spherical_index(
     if refine_instrument:
         # peak-shaped input: found peaks, or the strongest binned pixels of
         # raw mode as weighted peaks
-        if f_raw is not None:
+        if raw_mode:
             rb = np.concatenate(raw_bank)
             rr_ = np.concatenate(raw_prow)
             rc_ = np.concatenate(raw_pcol)
@@ -3600,7 +3608,7 @@ def run_spherical_index(
                 o = o + per_run_trans_out[idx]
             return o
 
-        if f_raw is not None:
+        if raw_mode:
             q_bank = np.concatenate(raw_bank)
             q_row = np.concatenate(raw_prow)
             q_col = np.concatenate(raw_pcol)
@@ -3636,7 +3644,7 @@ def run_spherical_index(
     # is not a number.  Peaks mode weights each peak once; raw mode weights
     # each binned pixel by its positive excess counts, so the same report
     # exists with no peak finder anywhere.
-    if f_raw is not None:
+    if raw_mode:
         q_pts = np.concatenate(raw_pts)
         q_w = np.concatenate(raw_w)
         q_run = np.concatenate(raw_run)
