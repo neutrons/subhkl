@@ -520,3 +520,78 @@ def test_band_consistency_is_on_by_default_and_switchable(tmp_path):
     for flag, U in outs.items():
         err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
         assert err < 0.5, (flag, err)
+
+
+def test_dense_background_regime_isolates_spots_and_masks_rims(tmp_path):
+    """A frame with a flat 25 count/pixel background has no zero pixels
+    except its dead border, so the zero-fraction estimator reads the
+    border, not the background (56 counts/bin against a true 400 on
+    MANDI L1).  In that regime the raw path must switch to a local
+    median: the excess it projects has to come from the spots, and the
+    panel rim -- a great circle on the sphere -- must carry none."""
+    from subhkl.commands import run_spherical_index
+
+    rng = np.random.default_rng(41)
+    a = 8.0
+    B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
+    h, k, l_ = generate_reflections(a, a, a, 90, 90, 90, space_group="P 1", d_min=1.3)
+    G = np.stack([h, k, l_], axis=1) @ B.T
+    dirs = G / np.linalg.norm(G, axis=1, keepdims=True)
+    Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+    U_true = Q * np.sign(np.linalg.det(Q))
+    d_lab = dirs @ U_true.T
+    d_lab = d_lab[d_lab[:, 2] < -0.05]
+    kf = np.array([0.0, 0.0, 1.0]) - 2.0 * d_lab[:, 2:3] * d_lab
+    kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+    dets = {int(kk): Detector(v) for kk, v in beamlines["CG4D"].items()}
+    images, bank_ids = [], []
+    yy, xx = np.mgrid[0:512, 0:512]
+    for bk, det in dets.items():
+        mask, r_, c_ = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
+        im = np.full((512, 512), 25.0)
+        for rr, cc in zip(r_[mask], c_[mask]):
+            im += 300.0 * np.exp(-((yy - rr) ** 2 + (xx - cc) ** 2) / (2 * 2.0**2))
+        im = rng.poisson(im).astype(np.int64)
+        im[:6, :] = 0
+        im[-6:, :] = 0
+        im[:, :6] = 0
+        im[:, -6:] = 0  # dead border
+        images.append(im)
+        bank_ids.append(bk)
+    merged = str(tmp_path / "merged.h5")
+    with h5py.File(merged, "w") as fp:
+        fp["images"] = np.stack(images)
+        fp["bank_ids"] = np.array(bank_ids, dtype=np.int32)
+        fp["file_offsets"] = np.array([0], dtype=np.int64)
+    meta = str(tmp_path / "meta.h5")
+    with h5py.File(meta, "w") as fp:
+        n = len(images)
+        fp["bank"] = np.array(bank_ids)
+        fp["peaks/pixel_r"] = np.zeros(n)
+        fp["peaks/pixel_c"] = np.zeros(n)
+        fp["peaks/image_index"] = np.arange(n)
+        fp["peaks/run_index"] = np.zeros(n, dtype=int)
+        fp["goniometer/R"] = np.tile(np.eye(3), (n, 1, 1))
+        for kk, v in zip(
+            ("a", "b", "c", "alpha", "beta", "gamma"), (a, a, a, 90.0, 90.0, 90.0)
+        ):
+            fp[f"sample/{kk}"] = v
+        fp["sample/space_group"] = "P 1"
+        fp["instrument/wavelength"] = np.array([2.0, 10.0])
+        fp.attrs["instrument"] = "CG4D"
+    out = str(tmp_path / "out.h5")
+    run_spherical_index(
+        meta,
+        out,
+        d_min=1.3,
+        kernel_deg=1.0,
+        images_filename=merged,
+        binning=4,
+        refine=False,
+    )
+    with h5py.File(out) as fp:
+        U = fp["sample/U"][()]
+        z = fp["spherical/z"][()]
+    err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
+    assert err < 1.0
+    assert z[0] > 5.0  # one still on a 25 count/pixel background

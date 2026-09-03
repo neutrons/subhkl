@@ -2452,6 +2452,7 @@ def run_spherical_index(
         raw_pts, raw_w, raw_run = [], [], []
         raw_bank, raw_prow, raw_pcol = [], [], []
         bin_sth, raw_sth = {}, []
+        dense_noted = False
         b2 = int(binning)
         for i_img in range(len(images)):
             bk = int(bank_ids[i_img])
@@ -2462,8 +2463,38 @@ def run_spherical_index(
             n2, m2 = (im.shape[0] // b2) * b2, (im.shape[1] // b2) * b2
             y = im[:n2, :m2].reshape(n2 // b2, b2, m2 // b2, b2).sum(axis=(1, 3))
             zero_frac = float(np.mean(im == 0))
-            mu = -np.log(max(zero_frac, 1e-6)) * b2 * b2  # [counts/bin]
-            excess = (y - mu).ravel()
+            if zero_frac >= 0.05:
+                # sparse regime: zeros are Poisson draws of the background
+                # and their fraction estimates it (P(0) = e^-mu)
+                mu = -np.log(max(zero_frac, 1e-6)) * b2 * b2  # [counts/bin]
+                excess = (y - mu).ravel()
+            else:
+                # dense regime (mu > 3 counts/pixel): the only zeros are dead
+                # pixels, so the zero fraction reads the panel border, not
+                # the background -- on MANDI L1 it gave 56 counts/bin
+                # against a true 400 and the projected weight was the
+                # acceptance.  A local median over the live bins is the
+                # background, a 2 sigma Poisson floor drops the noise, and
+                # bins whose median window touches a dead region are
+                # dropped: a panel edge is a great circle on the sphere
+                # and a rim of fake excess along it is a fake zone.
+                from scipy.ndimage import binary_erosion, generic_filter
+
+                blk = im[:n2, :m2].reshape(n2 // b2, b2, m2 // b2, b2)
+                live = (blk > 0).all(axis=(1, 3))
+                bg = generic_filter(
+                    np.where(live, y, np.nan), np.nanmedian, size=9, mode="nearest"
+                )
+                keep = binary_erosion(live, iterations=5)
+                exc = np.nan_to_num(y - bg - 2.0 * np.sqrt(np.clip(bg, 1.0, None)))
+                excess = np.where(keep, exc, 0.0).ravel()
+                if not dense_noted:
+                    print(
+                        "spherical-index: dense background (zero fraction "
+                        f"{zero_frac:.3f}); local-median background with a "
+                        "2 sigma floor, panel rims masked"
+                    )
+                    dense_noted = True
             if bk not in bin_dirs:
                 rr = (np.arange(n2 // b2) + 0.5) * b2 - 0.5
                 cc = (np.arange(m2 // b2) + 0.5) * b2 - 0.5
