@@ -1227,6 +1227,41 @@ def _quat_angle(R1, R2):
     return float(np.arccos(tr))
 
 
+def dictionary_spacing_deg(dirs):
+    """Median nearest-neighbour angle between the model LINES (+-d), the
+    scale the search must resolve.  MANDI L1 at 2.5 A: 0.32 deg over 65k
+    lines; garnet at 1.2 A: 3.1 deg over 710."""
+    from scipy.spatial import cKDTree
+
+    d = np.asarray(dirs, float)
+    d = d / np.linalg.norm(d, axis=1, keepdims=True)
+    d = np.where(d[:, :1] < 0, -d, d)
+    d = np.unique(np.round(d, 6), axis=0)  # harmonics share a line
+    tree = cKDTree(np.vstack([d, -d]))
+    dist, _ = tree.query(d, k=2)
+    return float(
+        np.degrees(2.0 * np.arcsin(np.clip(np.median(dist[:, 1]) / 2.0, 0, 1)))
+    )
+
+
+def dictionary_bandwidth(L, dirs, cap=192):
+    """Raise the cost-capped bandwidth to what the dictionary demands.
+
+    The kernel sets the bandwidth the objective needs to be smooth
+    (3/sigma, capped at 96 as a cost cap); a dictionary denser than the
+    resolution 180/L needs more, or the model is uniform at that L and the
+    search is blind.  Measured on MANDI L1 (0.32 deg spacing, 36 lines per
+    resolution element at L = 96): the truth is not a grid maximum at L =
+    96 on the hard frames and is the global maximum with no competitor at
+    L = 192 (z 5.4 -> 22.4), so the cap moves to 192 when, and only when,
+    the spacing is below the resolution.  Garnet (3.1 deg) stays at 96.
+    """
+    spacing = dictionary_spacing_deg(dirs)
+    if 180.0 / L > spacing:
+        return int(min(cap, max(L, np.ceil(180.0 / spacing)))), spacing
+    return int(L), spacing
+
+
 def top_orientations(C, alphas, betas, gammas, n=4, min_sep_deg=None):
     """Local maxima of the correlogram as rotations, best first.
 
@@ -1434,6 +1469,8 @@ def find_orientations(
     sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
     if L is None:
         L = int(min(max(np.ceil(3.0 / sigma), 16), 96))
+        if model_dirs is not None:
+            L, _ = dictionary_bandwidth(L, model_dirs)
     f = project_points(np.asarray(data_dirs, float), data_weights, L, sigma)
     if (model_dirs is None) == (ring_axes is None):
         raise ValueError("provide exactly one of model_dirs or ring_axes")

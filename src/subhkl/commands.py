@@ -2459,6 +2459,17 @@ def run_spherical_index(
             if bandwidth is not None
             else int(min(max(np.ceil(3.0 / sigma_raw), 16), 96))
         )
+        if bandwidth is None:
+            # ...unless the dictionary is denser than that resolution: then
+            # the model is uniform at L and the search blind (MANDI L1).
+            _h, _k, _l = generate_reflections(*cell, space_group=sg, d_min=d_min)
+            _Bc, _ = cartesian_matrix_metric_tensor(*cell[:3], *np.deg2rad(cell[3:]))
+            _G = np.stack([_h, _k, _l], axis=1) @ _Bc.T
+            L_raw, _spacing = sph.dictionary_bandwidth(L_raw, _G)
+            print(
+                f"spherical-index: dictionary spacing {_spacing:.2f} deg at "
+                f"d_min={d_min:g} -> L = {L_raw}"
+            )
         bin_dirs = {}
         bin_rows, bin_cols = {}, {}
         per_bank_rows = {}
