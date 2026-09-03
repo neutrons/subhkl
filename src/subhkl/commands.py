@@ -2237,6 +2237,7 @@ def run_spherical_index(
     nodal_max_index: int = 3,
     final_full_refine: bool = False,
     band_consistency: bool = True,
+    radial: int = 0,
 ):
     """Index by spherical correlation over SO(3) -- the matched-filter dual
     of the sparse orientation-recovery problem (subhkl.search.spherical).
@@ -2284,6 +2285,14 @@ def run_spherical_index(
     search becomes a Fisher sum of per-band correlograms; measured, it
     lifts garnet's point-model z from 16.8 to 27.4 and shrinks a 100 A
     cell's legal model per spot from 65k to 19k directions.
+
+    ``radial`` (N > 0) replaces the banded search by the 3D one: data as
+    Laue segments and the model as shells at |G| on the resolution ball,
+    N orthonormal radial functions (spherical.radial_basis), the band
+    rule as one inner product and the model's radial position sharp
+    however blurred its angular one.  Measured on garnet raw counts at
+    L = 96: single stills z 10 -> 16 with rank 0 in every run (the 2D
+    nodal default ranks 3-8 per still), 21 runs pooled z 17.3 -> 25.9.
     """
     from subhkl.config import beamlines
     from subhkl.core.crystallography import (
@@ -2414,6 +2423,7 @@ def run_spherical_index(
 
     f_raw = None
     f_raw_bands = None
+    f_raw_radial = None
     band_edges = None
     ki_hat = ki / np.linalg.norm(ki)
     if images_filename is not None:
@@ -2534,12 +2544,15 @@ def run_spherical_index(
         # stratum projected on its own, so the search can hold every band
         # to the directions that could have produced it.  The pooled map
         # (every stage downstream) is the sum of the strata.
-        use_band = bool(band_consistency) and wl is not None
+        use_radial = int(radial) > 0 and wl is not None
+        use_band = bool(band_consistency) and wl is not None and not use_radial
         if use_band:
             band_edges = sph.sin_theta_edges(
                 np.concatenate(raw_sth), np.concatenate(raw_w), n_bands=4
             )
         n_bands_raw = len(band_edges) - 1 if use_band else 1
+        n_chan = int(radial) if use_radial else 0
+        q_max_r = 1.0 / float(d_min)
         f_lab_band = {}
         # pad every bank to the same frame count so the device kernel
         # compiles once (zero rows project to zero and are discarded)
@@ -2548,6 +2561,20 @@ def run_spherical_index(
             W = np.zeros((nf_max, len(rows[0][1])))
             for i_, (_, e_) in enumerate(rows):
                 W[i_] = e_
+            if use_radial:
+                # every frame x channel as one row of a single projection:
+                # the segment weights depend on the bin's sin(theta) only
+                seg = sph.radial_data_weights(bin_sth[bk], wl, q_max_r, n_chan)
+                W3 = (W[:, None, :] * seg.T[None, :, :]).reshape(-1, W.shape[1])
+                F3 = project_counts_device(bin_dirs[bk], W3, L_raw, sigma_raw).reshape(
+                    len(W), n_chan, L_raw + 1, 2 * L_raw + 1
+                )
+                F = project_counts_device(bin_dirs[bk], W, L_raw, sigma_raw)
+                for (r_, _), Fi, F3i in zip(rows, F, F3):
+                    f_lab_run[r_] = f_lab_run.get(r_, 0.0) + Fi
+                    for c_ in range(n_chan):
+                        f_lab_band[(r_, c_)] = f_lab_band.get((r_, c_), 0.0) + F3i[c_]
+                continue
             for b_ in range(n_bands_raw):
                 if use_band:
                     m_b = (bin_sth[bk] > band_edges[b_]) & (
@@ -2577,7 +2604,11 @@ def run_spherical_index(
 
         # every map -- the pooled one and each band -- rotated in ONE pass:
         # the Wigner stack is the expensive operand and it is shared
-        keys = [None] + (list(range(n_bands_raw)) if use_band else [])
+        keys = [None] + (
+            list(range(n_chan))
+            if use_radial
+            else (list(range(n_bands_raw)) if use_band else [])
+        )
         zero = np.zeros((L_raw + 1, 2 * L_raw + 1), dtype=complex)
 
         def _get(r_, b_):
@@ -2602,6 +2633,7 @@ def run_spherical_index(
         f_raw = pooled[0]
         if use_band:
             f_raw_bands = [pooled[1 + b_] for b_ in range(n_bands_raw)]
+        f_raw_radial = pooled[1:] if use_radial else None
         _mark("rotate")
         print(
             f"spherical-index: raw-count mode, {len(images)} frames binned "
@@ -2656,7 +2688,34 @@ def run_spherical_index(
     g0_model = sph.primitive_spacing(
         hkl_all[idx] if model == "reflections" else hkl_model, B
     )
-    use_band = bool(band_consistency) and wl is not None
+    use_radial = int(radial) > 0 and wl is not None
+    use_band = bool(band_consistency) and wl is not None and not use_radial
+    model_shells = None
+    if use_radial:
+        # the 3D model: every reflection at its |G|, carrying its ray's
+        # dictionary weight (1 for the reflection set; a node's
+        # multiplicity, or 0 off the nodes, for the nodal set)
+        G_all = hkl_all @ B.T
+        q_all = np.linalg.norm(G_all, axis=1)
+        d_all = G_all / q_all[:, None]
+        if model == "reflections":
+            w_all = np.ones(len(hkl_all))
+        else:
+            gcd_all = np.maximum(np.gcd.reduce(np.abs(hkl_all), axis=1), 1)
+            prim_all = sph._canonical_sign(hkl_all // gcd_all[:, None])
+            node_w = {
+                tuple(int(x) for x in hh): float(ww)
+                for hh, ww in zip(hkl_model, w_model)
+            }
+            w_all = np.array(
+                [node_w.get(tuple(int(x) for x in pp), 0.0) for pp in prim_all]
+            )
+        model_shells = (d_all, q_all, w_all)
+        print(
+            f"spherical-index: 3D search, {int(radial)} radial channels on "
+            f"|q| <= {1.0 / d_min:.3f} 1/A, {int((w_all > 0).sum())} reflections "
+            "as shells"
+        )
     if bool(band_consistency) and wl is None:
         print(
             "spherical-index: no instrument/wavelength in the peaks file; "
@@ -2687,7 +2746,18 @@ def run_spherical_index(
         sigma = np.deg2rad(kernel_deg) / np.sqrt(8.0 * np.log(2.0))
         L = f_raw.shape[0] - 1
         g = sph.project_points(dirs_model, w_model, L, sigma)
-        if f_raw_bands is not None:
+        if f_raw_radial is not None:
+            g3 = sph.radial_model_stack(
+                model_shells[0],
+                model_shells[1],
+                model_shells[2],
+                int(radial),
+                1.0 / float(d_min),
+                L,
+                sigma,
+            )
+            C, al_, be_, ga_ = sph.correlogram(f_raw_radial, g3)
+        elif f_raw_bands is not None:
             masks_model = sph.band_masks(g0_model, band_edges, wl, d_min)
             print(
                 "spherical-index: band consistency, sin(theta) edges "
@@ -2740,10 +2810,12 @@ def run_spherical_index(
             lam=lam,
             L=bandwidth,
             refine_method=refine_method,
-            data_sin_theta=np.abs(d_lab @ ki_hat) if use_band else None,
+            data_sin_theta=np.abs(d_lab @ ki_hat) if (use_band or use_radial) else None,
             model_g0=g0_model if use_band else None,
-            wavelength_band=wl if use_band else None,
-            d_min=d_min if use_band else None,
+            wavelength_band=wl if (use_band or use_radial) else None,
+            d_min=d_min if (use_band or use_radial) else None,
+            n_radial=int(radial) if use_radial else 0,
+            model_shells=model_shells,
         )
     if not results:
         raise RuntimeError("no orientation candidate found")

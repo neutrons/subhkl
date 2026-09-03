@@ -1362,6 +1362,17 @@ def spherical_index(
             ),
         ),
     ] = True,
+    radial: Annotated[
+        int,
+        typer.Option(
+            "--radial",
+            help=(
+                "3D search with this many radial channels on the resolution ball "
+                "(data as Laue segments, model as shells at |G|); 0 keeps the "
+                "spherical search"
+            ),
+        ),
+    ] = 0,
     final_full_refine: Annotated[
         bool,
         typer.Option(
@@ -1654,6 +1665,7 @@ def spherical_index(
         nodal_max_index=nodal_max_index,
         final_full_refine=final_full_refine,
         band_consistency=band_consistency,
+        radial=radial,
         det_trans_bound=det_trans_bound,
         det_rot_bound_deg=det_rot_bound_deg,
         gonio_bound_deg=gonio_bound_deg,

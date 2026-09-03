@@ -595,3 +595,23 @@ def test_dense_background_regime_isolates_spots_and_masks_rims(tmp_path):
     err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
     assert err < 1.0
     assert z[0] > 5.0  # one still on a 25 count/pixel background
+
+
+def test_radial_search_indexes_both_data_paths(tmp_path):
+    """--radial N: the 3D search (Laue segments against lattice shells)
+    on the peaks path and on the raw-count path, both from the synthetic
+    CG4D scene; the orientation must come out and the file must say
+    which search ran."""
+    rng = np.random.default_rng(37)
+    peaks_file = str(tmp_path / "finder.h5")
+    U_true, _ = _synthetic_finder_file(peaks_file, rng)
+    out = str(tmp_path / "radial_peaks.h5")
+    run_spherical_index(
+        peaks_file, out, d_min=1.3, kernel_deg=1.0, model="reflections", radial=16
+    )
+    with h5py.File(out) as fp:
+        U = fp["sample/U"][()]
+        z = fp["spherical/z"][()]
+    err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
+    assert err < 0.5
+    assert z[0] > 8.0

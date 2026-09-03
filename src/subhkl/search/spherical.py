@@ -270,6 +270,45 @@ def radial_basis(n_radial, q_max):
     return shell, segment
 
 
+def radial_model_stack(dirs, q, weights, n_radial, q_max, L, sigma):
+    """The model on the ball: every reflection (both signs) as a shell at
+    its |G|, carrying its ray's dictionary weight.  Returns [n_radial,
+    L+1, 2L+1]; feed it to correlogram() against radial_data_stack()."""
+    shell, _ = radial_basis(n_radial, q_max)
+    d = np.asarray(dirs, float)
+    qq = np.asarray(q, float)
+    w = np.ones(len(d)) if weights is None else np.asarray(weights, float)
+    keep = (w > 0) & (qq <= q_max)
+    d, qq, w = d[keep], qq[keep], w[keep]
+    dd = np.vstack([d, -d])
+    W = (shell(np.concatenate([qq, qq])) * np.concatenate([w, w])[:, None]).T
+    return project_counts_device(dd, W, L, sigma)
+
+
+def radial_data_weights(sin_theta, wavelength_band, q_max, n_radial):
+    """Per-datum radial channel weights: the integral of the basis over
+    the Laue segment [2 sin(theta) / lambda_max, 2 sin(theta) /
+    lambda_min] clipped to the ball -- [n, n_radial].  Multiply into the
+    data weights and project (project_counts_device with (frame x
+    channel) rows, or radial_data_stack)."""
+    _, segment = radial_basis(n_radial, q_max)
+    s_ = np.asarray(sin_theta, float)
+    lam_lo, lam_hi = float(wavelength_band[0]), float(wavelength_band[1])
+    return segment(2.0 * s_ / lam_hi, np.minimum(2.0 * s_ / lam_lo, q_max))
+
+
+def radial_data_stack(
+    dirs, weights, sin_theta, wavelength_band, q_max, n_radial, L, sigma
+):
+    """The data on the ball: each datum smeared over its admissible |Q|
+    segment.  Returns [n_radial, L+1, 2L+1]."""
+    w = np.ones(len(dirs)) if weights is None else np.asarray(weights, float)
+    seg = radial_data_weights(sin_theta, wavelength_band, q_max, n_radial)  # [n, N]
+    return project_counts_device(
+        np.asarray(dirs, float), (seg * w[:, None]).T, L, sigma
+    )
+
+
 def _canonical_sign(v):
     """Orient integer triples so the first nonzero component is positive:
     +-v are one direction on the sphere (and one line for the kernel)."""
@@ -1350,6 +1389,8 @@ def find_orientations(
     wavelength_band=None,
     d_min=None,
     n_bands=4,
+    n_radial=0,
+    model_shells=None,
 ):
     """Find crystal orientations from measured Q directions.
 
@@ -1373,7 +1414,10 @@ def find_orientations(
     spacing per model direction), wavelength_band and d_min, the search
     is the band-consistent one of banded_search: every datum is matched
     only against directions that could have produced it at some
-    wavelength in the band.
+    wavelength in the band.  With n_radial > 0 and model_shells =
+    (dirs, |G|, weights) over every reflection, the search is the 3D one
+    instead: data as Laue segments and model as shells on the resolution
+    ball (radial_basis), the band rule as one inner product.
 
     Returns a list of dicts {R, score, z, n_matched, c}, best first.
     """
@@ -1389,14 +1433,37 @@ def find_orientations(
     else:
         g = project_rings(np.asarray(ring_axes, float), ring_weights, L, sigma)
 
+    radial3d = (
+        int(n_radial) > 0
+        and model_shells is not None
+        and data_sin_theta is not None
+        and wavelength_band is not None
+        and d_min is not None
+    )
     banded = (
-        data_sin_theta is not None
+        not radial3d
+        and data_sin_theta is not None
         and model_g0 is not None
         and wavelength_band is not None
         and d_min is not None
         and model_dirs is not None
     )
-    if banded:
+    if radial3d:
+        q_max = 1.0 / float(d_min)
+        sd, sq, sw = model_shells
+        g3 = radial_model_stack(sd, sq, sw, int(n_radial), q_max, L, sigma)
+        f3 = radial_data_stack(
+            np.asarray(data_dirs, float),
+            data_weights,
+            data_sin_theta,
+            wavelength_band,
+            q_max,
+            int(n_radial),
+            L,
+            sigma,
+        )
+        C, al, be, ga = correlogram(f3, g3)
+    elif banded:
         sth = np.asarray(data_sin_theta, float)
         edges = sin_theta_edges(sth, data_weights, n_bands)
         masks = band_masks(model_g0, edges, wavelength_band, d_min)
