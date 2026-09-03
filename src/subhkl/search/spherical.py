@@ -222,6 +222,54 @@ def zone_axes(cell_basis, max_index=3):
     return t / tn[:, None], 1.0 / tn
 
 
+def radial_basis(n_radial, q_max):
+    """Orthonormal radial functions on the resolution ball, [0, q_max].
+
+    Shifted Legendre polynomials, R_n(q) = sqrt((2n+1)/q_max)
+    P_n(2 q / q_max - 1): orthonormal under dq, so a function on the ball
+    expanded as sum_{n l m} a_{nlm} R_n(|q|) Y_lm(q^) has the 3D inner
+    product sum |a|^2 -- and a rotation acts on (l, m) alone, which is
+    what lets the correlogram absorb the radial sum into its per-degree
+    coupling (correlogram accepts the [n, l, m] stack directly).
+
+    Returns (shell, segment): shell(q) -> [len(q), n_radial] evaluates the
+    basis at radii (a lattice point's |G|); segment(q_lo, q_hi) ->
+    [len, n_radial] integrates it over radial intervals (a Laue spot's
+    admissible |Q| range, [2 sin(theta) / lambda_max, 2 sin(theta) /
+    lambda_min] clipped to the ball).  A spot and a lattice point then
+    overlap in this basis exactly when the shell lies inside the segment,
+    resolved to ~ q_max / n_radial -- the wavelength-band consistency rule
+    (band_masks) as a single 3D inner product, with no stratification.
+    """
+    from numpy.polynomial import legendre as _leg
+
+    n_radial = int(n_radial)
+    norm = np.sqrt((2.0 * np.arange(n_radial) + 1.0) / float(q_max))
+
+    def shell(q):
+        x = np.clip(2.0 * np.asarray(q, float) / q_max - 1.0, -1.0, 1.0)
+        V = _leg.legvander(x, n_radial - 1)  # [len, n]
+        out = V * norm[None, :]
+        out[np.asarray(q, float) > q_max] = 0.0
+        return out
+
+    # 12-point Gauss-Legendre on each interval: exact for the polynomials
+    xg, wg = np.polynomial.legendre.leggauss(12)
+
+    def segment(q_lo, q_hi):
+        lo = np.asarray(q_lo, float)
+        hi = np.minimum(np.asarray(q_hi, float), q_max)
+        h = np.clip(hi - lo, 0.0, None)
+        mid = 0.5 * (lo + hi)
+        qs = mid[:, None] + 0.5 * h[:, None] * xg[None, :]  # [len, 12]
+        vals = shell(qs.ravel()).reshape(len(lo), len(xg), n_radial)
+        out = np.einsum("g,pgn->pn", wg, vals) * (0.5 * h)[:, None]
+        out[h <= 0.0] = 0.0
+        return out
+
+    return shell, segment
+
+
 def _canonical_sign(v):
     """Orient integer triples so the first nonzero component is positive:
     +-v are one direction on the sphere (and one line for the kernel)."""
@@ -868,6 +916,11 @@ def rotate_coeffs(f, R):
     return np.einsum("m,lmn,n,ln->lm", ea, d, eg, f)
 
 
+def so3_inner_stack(f, g, R):
+    """<f, Lambda(R) g> summed over radial channels (stacks [K, L+1, M])."""
+    return float(sum(so3_inner(f[k], g[k], R) for k in range(len(f))))
+
+
 def so3_inner(f, g, R):
     """C(R) = <f, Lambda(R) g> = sum_l f^l dagger D^l(R) g^l.  [real]"""
     rf = rotate_coeffs(g, R)
@@ -896,7 +949,9 @@ def correlogram(f, g, n_beta=None, backend="jax"):
 
     Returns (C [n_a, n_b, n_g] real, alphas, betas, gammas).
     """
-    L = f.shape[0] - 1
+    f = np.asarray(f)
+    g = np.asarray(g)
+    L = f.shape[-2] - 1
     n_beta = L + 1 if n_beta is None else int(n_beta)
     n_ang = 2 * L + 2
     alphas = 2.0 * np.pi * np.arange(n_ang) / n_ang
@@ -917,7 +972,10 @@ def correlogram(f, g, n_beta=None, backend="jax"):
     for t0 in range(0, n_beta, chunk):
         bs = betas[t0 : t0 + chunk]
         d = wigner_d_matrix(L, bs)  # [L+1, M, M, nb]
-        S = np.einsum("lm,lmnb,ln->bmn", np.conj(f), d, g, optimize=True)
+        if f.ndim == 3:
+            S = np.einsum("klm,lmnb,kln->bmn", np.conj(f), d, g, optimize=True)
+        else:
+            S = np.einsum("lm,lmnb,ln->bmn", np.conj(f), d, g, optimize=True)
         for j in range(len(bs)):
             C[:, t0 + j, :] = np.real(Ea.T @ S[j] @ Ea)
     return C, alphas, betas, gammas
@@ -958,9 +1016,19 @@ def _wigner_case_tables(L):
 def _coupling_prep(f, g):
     """Numpy prep shared by the fused kernels: coupling and prefactor
     ratios in recursion-depth order (see _correlogram_kernel_jax)."""
-    L = f.shape[0] - 1
+    f = np.asarray(f)
+    g = np.asarray(g)
+    L = f.shape[-2] - 1
     mx, a, b, pref = _wigner_case_tables(L)
-    coef = np.conj(f)[:, :, None] * g[:, None, :]
+    if f.ndim == 3:
+        # radial channels (radial_basis): the coupling of a 3D function
+        # is the SUM over channels of the per-channel rank-one couplings,
+        # because a rotation acts on (l, m) alone -- so the whole radial
+        # dimension collapses here, before the SO(3) transform, and the
+        # kernel below never sees it
+        coef = np.einsum("klm,kln->lmn", np.conj(f), g)
+    else:
+        coef = np.conj(f)[:, :, None] * g[:, None, :]
     l_idx = np.minimum(np.arange(L + 1)[:, None, None] + mx[None], L)
     in_band = (np.arange(L + 1)[:, None, None] + mx[None]) <= L
     coefK = np.where(in_band, np.take_along_axis(coef, l_idx, axis=0), 0.0)

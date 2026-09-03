@@ -810,5 +810,108 @@ def test_band_consistent_search_recovers_and_sharpens():
         wavelength_band=lam,
         d_min=2.0,
     )
-    assert _err_mod(banded[0]["R"], R0, _cubic_rots()) < 1.0  # 1 deg kernel on a 40 A cell
+    assert (
+        _err_mod(banded[0]["R"], R0, _cubic_rots()) < 1.0
+    )  # 1 deg kernel on a 40 A cell
     assert banded[0]["z"] >= plain[0]["z"] * 0.9
+
+
+# ---------------------------------------------------------------------------
+# the radial dimension: 3D correlogram through channel stacks
+# ---------------------------------------------------------------------------
+
+
+def test_channel_stacks_collapse_into_the_coupling():
+    """A 3D function on the resolution ball is a stack of spherical
+    coefficient arrays, one per radial channel; a rotation acts on (l, m)
+    alone, so its correlogram is the plain correlogram with the
+    per-degree coupling summed over channels.  One channel is the 2D
+    case; three channels equal the sum of three 2D correlograms; the
+    fused kernel agrees with the numpy reference."""
+    from subhkl.search.spherical import so3_inner_stack
+
+    rng = np.random.default_rng(0)
+    L, sig = 24, np.deg2rad(2.0)
+    f = project_points(_rand_dirs(rng, 50), None, L, sig)
+    g = project_points(_rand_dirs(rng, 80), None, L, sig)
+    C2, *_ = correlogram(f, g)
+    C1, *_ = correlogram(f[None], g[None])
+    np.testing.assert_allclose(C1, C2, rtol=1e-4, atol=1e-4 * np.abs(C2).max())
+    F = np.stack([project_points(_rand_dirs(rng, 50), None, L, sig) for _ in range(3)])
+    G = np.stack([project_points(_rand_dirs(rng, 80), None, L, sig) for _ in range(3)])
+    Cj, al, be, ga = correlogram(F, G)
+    Cn, *_ = correlogram(F, G, backend="numpy")
+    np.testing.assert_allclose(Cj, Cn, rtol=1e-3, atol=1e-3 * np.abs(Cn).max())
+    Cs = sum(correlogram(F[k], G[k])[0] for k in range(3))
+    np.testing.assert_allclose(Cj, Cs, rtol=1e-3, atol=1e-3 * np.abs(Cn).max())
+    R = _rand_rot(rng)
+    assert np.isclose(
+        so3_inner_stack(F, G, R), sum(so3_inner(F[k], G[k], R) for k in range(3))
+    )
+
+
+def test_radial_basis_is_orthonormal_and_integrates_segments():
+    from subhkl.search.spherical import radial_basis
+
+    shell, segment = radial_basis(24, 0.5)
+    x, w = np.polynomial.legendre.leggauss(64)
+    q, wq = 0.25 * (x + 1), 0.25 * w
+    S = shell(q)
+    np.testing.assert_allclose((S * wq[:, None]).T @ S, np.eye(24), atol=1e-10)
+    # the constant function integrates to its length times its normalization
+    assert np.isclose(segment([0.1], [0.3])[0, 0], 0.2 * np.sqrt(1 / 0.5))
+    # beyond the ball there is nothing
+    assert not segment([0.6], [0.7]).any()
+    assert not shell([0.6]).any()
+
+
+def test_radial_correlogram_recovers_orientation_from_band_segments():
+    """Data as Laue segments -- each spot's admissible |Q| range for a
+    wavelength band -- and the model as lattice shells at |G|: the 3D
+    correlogram must recover the orientation, and its z must not fall
+    below the 2D point search's, since the radial overlap can only remove
+    spurious matches (the band rule as one inner product)."""
+    from subhkl.search.spherical import project_counts_device, radial_basis
+
+    rng = np.random.default_rng(6)
+    a = 24.0
+    B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
+    bounds = int(np.ceil(a / 2.0))
+    r_ = np.arange(-bounds, bounds + 1)
+    hkl = np.stack(np.meshgrid(r_, r_, r_, indexing="ij"), -1).reshape(-1, 3)
+    hkl = hkl[np.any(hkl != 0, axis=1)]
+    G = hkl @ B.T
+    gn = np.linalg.norm(G, axis=1)
+    keep = gn <= 0.5
+    G, gn = G[keep], gn[keep]
+    dirs = G / gn[:, None]
+    R0 = _rand_rot(rng)
+    lam, qmax = (2.0, 4.0), 0.5
+    ki = np.array([0.0, 0.0, 1.0])
+    d_lab = dirs @ R0.T
+    s = np.abs(d_lab @ ki)
+    lam_r = 2.0 * s / gn
+    ok = (lam_r >= lam[0]) & (lam_r <= lam[1]) & (d_lab @ ki < 0)
+    obs = d_lab[ok][rng.random(ok.sum()) < 0.5]
+    obs = obs + rng.normal(scale=np.deg2rad(0.2), size=obs.shape)
+    obs /= np.linalg.norm(obs, axis=1, keepdims=True)
+    noise = _rand_dirs(rng, len(obs))
+    noise[:, 2] = -np.abs(noise[:, 2])
+    data = np.vstack([obs, noise])
+    s_d = np.abs(data @ ki)
+    L, sig, N = 48, np.deg2rad(1.5) / np.sqrt(8 * np.log(2)), 16
+    shell, segment = radial_basis(N, qmax)
+    g3 = project_counts_device(
+        np.vstack([dirs, -dirs]), shell(np.concatenate([gn, gn])).T, L, sig
+    )
+    f3 = project_counts_device(
+        data, segment(2 * s_d / lam[1], 2 * s_d / lam[0]).T, L, sig
+    )
+    g2 = project_points(dirs, None, L, sig)
+    f2 = project_points(data, None, L, sig)
+    C3, al, be, ga = correlogram(f3, g3)
+    C2, *_ = correlogram(f2, g2)
+    R3, v3 = top_orientations(C3, al, be, ga, n=1)[0]
+    R2, v2 = top_orientations(C2, al, be, ga, n=1)[0]
+    assert _err_mod(R3, R0, _cubic_rots()) < 1.5
+    assert null_zscore(C3, v3) >= 0.9 * null_zscore(C2, v2)
