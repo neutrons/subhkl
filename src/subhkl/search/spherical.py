@@ -1243,17 +1243,93 @@ def direct_lattice_vectors(B, max_index=6):
     return X[o] / xlen[o][:, None], xlen[o], uvw[o]
 
 
+_LATTICE_JITS = {}
+
+
+def _lattice_kernels():
+    """The ladder's device kernels, compiled once per process (a jit built
+    inside a function is rebuilt -- and recompiled -- on every call)."""
+    if _LATTICE_JITS:
+        return _LATTICE_JITS
+    import jax
+    import jax.numpy as jnp
+
+    def euler_zyz(abg):
+        a, b, g = abg[:, 0], abg[:, 1], abg[:, 2]
+        ca, sa, cb, sb = jnp.cos(a), jnp.sin(a), jnp.cos(b), jnp.sin(b)
+        cg, sg = jnp.cos(g), jnp.sin(g)
+        return jnp.stack(
+            [
+                jnp.stack(
+                    [ca * cb * cg - sa * sg, -ca * cb * sg - sa * cg, ca * sb], -1
+                ),
+                jnp.stack(
+                    [sa * cb * cg + ca * sg, -sa * cb * sg + ca * cg, sa * sb], -1
+                ),
+                jnp.stack([-sb * cg, sb * sg, cb], -1),
+            ],
+            -2,
+        )
+
+    def funk_chunk(Pc, Dj, wj, thr):
+        return (jnp.abs(Pc @ Dj.T) < thr).astype(jnp.float32) @ wj
+
+    def score_exact(Rs, Zj, wz, Dj, wj, thr):
+        Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
+        on = jnp.abs(jnp.einsum("nki,mi->nkm", Zl, Dj)) < thr
+        return jnp.einsum("nkm,k,m->n", on.astype(jnp.float32), wz, wj)
+
+    def score_table(Rs, Zj, wz, tab, off, nph, nth):
+        Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
+        return (tab[_funk_lookup(Zl, off, nph, nth)] * wz[None, :]).sum(1)
+
+    def zoom(Uc, dR, *score_args):
+        Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
+        n = Uc.shape[0]
+        flat = Rs_.reshape(-1, 3, 3)
+        s_ = (
+            score_table(flat, *score_args)
+            if len(score_args) == 6
+            else score_exact(flat, *score_args)
+        ).reshape(n, -1)
+        k = jnp.argmax(s_, axis=1)
+        idx = jnp.arange(n)
+        return s_[idx, k], Rs_[idx, k]
+
+    _LATTICE_JITS.update(
+        euler_zyz=jax.jit(euler_zyz),
+        funk_chunk=jax.jit(funk_chunk),
+        score_exact=jax.jit(score_exact),
+        score_table=jax.jit(score_table, static_argnums=(6,)),
+        zoom_table=jax.jit(zoom, static_argnums=(8,)),
+        zoom_exact=jax.jit(zoom),
+        topk=jax.jit(lambda v, k: jax.lax.top_k(v, k), static_argnums=(1,)),
+    )
+    return _LATTICE_JITS
+
+
+def _funk_lookup(n, off, nph, nth):
+    """Flat grid index of the pole n on the funk_table grid (jit-friendly)."""
+    import jax.numpy as jnp
+
+    n = n / jnp.linalg.norm(n, axis=-1, keepdims=True)
+    t_ = jnp.arccos(jnp.clip(n[..., 2], -1, 1))
+    it = jnp.clip((t_ / jnp.pi * nth).astype(jnp.int32), 0, nth - 1)
+    ph = jnp.arctan2(n[..., 1], n[..., 0]) % (2 * jnp.pi)
+    ip = jnp.clip((ph / (2 * jnp.pi) * nph[it]).astype(jnp.int32), 0, nph[it] - 1)
+    return off[it] + ip
+
+
 def funk_table(dirs, weights, tol_deg, spacing_deg):
     """Tabulate the Funk transform of a weighted spot set: for every pole n
     on a grid of the given spacing, the spot weight within tol of the great
-    circle perpendicular to n.  Returns (lookup, table) with
-    lookup(n [..., 3]) -> flat grid index; the grid is (theta, phi) with the
-    phi bins scaled by sin(theta) so cells are ~spacing wide everywhere.
+    circle perpendicular to n.  Returns (table, off, nph, nth) for
+    _funk_lookup; the grid is (theta, phi) with the phi bins scaled by
+    sin(theta) so cells are ~spacing wide everywhere.
 
     A rung's objective is sum_k w_k F(R x_k): with F tabulated an
-    orientation costs K lookups instead of K x N dot products, so the
-    exhaustive rung no longer depends on the spot count."""
-    import jax
+    orientation costs K lookups instead of K x N dot products, so the rung
+    no longer depends on the spot count."""
     import jax.numpy as jnp
 
     D = np.asarray(dirs, np.float32)
@@ -1262,45 +1338,24 @@ def funk_table(dirs, weights, tol_deg, spacing_deg):
     th = (np.arange(nth) + 0.5) * np.pi / nth
     nph = np.maximum(1, np.ceil(360.0 * np.sin(th) / spacing_deg)).astype(int)
     off = np.concatenate([[0], np.cumsum(nph)])
-    poles = []
-    for t_, n_, o_ in zip(th, nph, off[:-1]):
-        ph = (np.arange(n_) + 0.5) * 2 * np.pi / n_
-        poles.append(
-            np.stack(
-                [
-                    np.sin(t_) * np.cos(ph),
-                    np.sin(t_) * np.sin(ph),
-                    np.full(n_, np.cos(t_)),
-                ],
-                1,
-            )
-        )
-    P = np.vstack(poles).astype(np.float32)
+    it = np.repeat(np.arange(nth), nph)
+    ph = (np.arange(off[-1]) - np.repeat(off[:-1], nph) + 0.5) * (2 * np.pi / nph[it])
+    st, ct = np.sin(th[it]), np.cos(th[it])
+    P = np.stack([st * np.cos(ph), st * np.sin(ph), ct], 1).astype(np.float32)
     thr = np.float32(np.sin(np.radians(tol_deg)))
     Dj, wj = jnp.asarray(D), jnp.asarray(w)
 
-    @jax.jit
-    def chunk(Pc):
-        on = jnp.abs(Pc @ Dj.T) < thr
-        return on.astype(jnp.float32) @ wj
-
-    ch = int(max(256, 2e8 // max(len(D), 1)))
+    kern = _lattice_kernels()["funk_chunk"]
+    # the [poles, spots] chunk is a 4 GB float32 temporary at most: few
+    # dispatches, which is what a 4M-pole table with 30k spots needs
+    ch = int(max(256, 1e9 // max(len(D), 1)))
     table = np.concatenate(
-        [np.asarray(chunk(jnp.asarray(P[i : i + ch]))) for i in range(0, len(P), ch)]
+        [
+            np.asarray(kern(jnp.asarray(P[i : i + ch]), Dj, wj, thr))
+            for i in range(0, len(P), ch)
+        ]
     )
-    off_j, nph_j = jnp.asarray(off[:-1]), jnp.asarray(nph)
-
-    def lookup(n):
-        n = n / jnp.linalg.norm(n, axis=-1, keepdims=True)
-        t_ = jnp.arccos(jnp.clip(n[..., 2], -1, 1))
-        it = jnp.clip((t_ / jnp.pi * nth).astype(jnp.int32), 0, nth - 1)
-        ph = jnp.arctan2(n[..., 1], n[..., 0]) % (2 * jnp.pi)
-        ip = jnp.clip(
-            (ph / (2 * jnp.pi) * nph_j[it]).astype(jnp.int32), 0, nph_j[it] - 1
-        )
-        return off_j[it] + ip
-
-    return lookup, jnp.asarray(table)
+    return jnp.asarray(table), jnp.asarray(off[:-1]), jnp.asarray(nph), int(nth)
 
 
 #: rungs of the ladder: (number of shortest zones, tolerance [deg], zoom
@@ -1332,7 +1387,8 @@ def lattice_ladder(
     rungs=LATTICE_RUNGS,
     n_null=200,
     seed=0,
-    table=True,
+    table_tol_deg=1.0,
+    verbose=False,
 ):
     """Orientation search on the direct lattice, coarse to fine.
 
@@ -1345,18 +1401,35 @@ def lattice_ladder(
     grid, then zoom-and-prune rungs; the last rung's tolerance is the spot
     precision, which is the exact Ewald stage's basin.
 
+    Rungs with tolerance >= table_tol_deg read the Funk transform from a
+    table (pole grid a third of the tolerance wide), so their cost is K
+    lookups per orientation whatever the spot count; by default only the
+    exhaustive rung -- on the zoom rungs the quantisation was measured to
+    move small-cell solutions by up to a degree, and the exact count is
+    cheap there.  One jitted score
+    serves every exact rung: the zones are padded to the full set with
+    zero weight and the tolerance is a runtime argument.
+
     Measured (MANDI L1, 100 A cell; CG4D garnet, 12 A cubic): the truth is
     in the 3000-deep shortlist of the 2 deg coarse rung on every still of
     both, and every still lands within 0.16 deg of an independent
-    reference; ~2 s per still on an H100 (the exhaustive rung is the whole
-    cost) against 390 s for the L = 192 correlogram, which reaches z 22
-    where this reaches z 38.  Returns [(R, score, z)] best first, z against
-    random orientations on the final rung.
+    reference.  Returns [(R, score, z)] best first, z against random
+    orientations on the final rung.
     """
-    import jax
+    import time
+
     import jax.numpy as jnp
     from scipy.spatial.transform import Rotation as Rot
 
+    _t = [time.perf_counter()]
+
+    def _mark(label):
+        if verbose:
+            now = time.perf_counter()
+            print(f"  ladder: {label} {now - _t[0]:.2f}s", flush=True)
+            _t[0] = now
+
+    kern = _lattice_kernels()
     D = np.asarray(dirs, np.float32)
     D = D / np.linalg.norm(D, axis=1, keepdims=True)
     w = (
@@ -1365,61 +1438,63 @@ def lattice_ladder(
         else np.asarray(weights, np.float32)
     )
     w = w / max(w.sum(), 1e-12)
+    # pad the spots to a power of two so the exact kernel compiles once per
+    # size class, not once per still
+    n_pad = 1 << int(np.ceil(np.log2(max(len(D), 2))))
+    D = np.vstack([D, np.tile([[0.0, 0.0, 1.0]], (n_pad - len(D), 1))]).astype(
+        np.float32
+    )
+    w = np.concatenate([w, np.zeros(n_pad - len(w), np.float32)])
     Zdir, xlen, _ = direct_lattice_vectors(B)
-    Zdir = Zdir.astype(np.float32)
+    K_all = max(int(coarse_zones), max(int(r[0]) for r in rungs))
+    Zj = jnp.asarray(Zdir[:K_all].astype(np.float32))
+    winv = (1.0 / xlen[:K_all]).astype(np.float32)
     Dj, wj = jnp.asarray(D), jnp.asarray(w)
 
-    def make(nz, tol):
-        Zj = jnp.asarray(Zdir[:nz])
-        wz = jnp.asarray((1.0 / xlen[:nz]).astype(np.float32))
+    def zone_weights(nz):
+        wz = np.zeros(K_all, np.float32)
+        wz[: int(nz)] = winv[: int(nz)]
+        return jnp.asarray(wz)
+
+    tables = {}
+
+    def score_args(nz, tol):
+        """(kernel name, args after Rs) for a rung, and the chunk size."""
+        wz = zone_weights(nz)
+        if tol >= table_tol_deg:
+            if tol not in tables:
+                tables[tol] = funk_table(D, w, float(tol), float(tol) / 3.0)
+                _mark(f"table {tol:g} deg ({int(tables[tol][0].shape[0]):,} poles)")
+            tab, off, nph, nth = tables[tol]
+            return "table", (Zj, wz, tab, off, nph, nth), 262144
         thr = np.float32(np.sin(np.radians(tol)))
-
-        @jax.jit
-        def score(Rs):
-            Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
-            on = jnp.abs(jnp.einsum("nki,mi->nkm", Zl, Dj)) < thr
-            return jnp.einsum("nkm,k,m->n", on.astype(jnp.float32), wz, wj)
-
-        return score
+        # the exact kernel takes only this rung's zones (one compile per
+        # zone count per spot size class); padding to the full set made a
+        # 13-zone rung do 145 zones of work
+        nz = int(nz)
+        return (
+            "exact",
+            (Zj[:nz], wz[:nz], Dj, wj, thr),
+            int(max(256, min(32768, 1.5e8 // (nz * n_pad)))),
+        )
 
     step = float(grid_deg)
     a_ = np.radians(np.arange(0, 360, step))
     b_ = np.radians(np.arange(step / 2, 180, step))
-    grid = np.array(np.meshgrid(a_, b_, a_, indexing="ij")).reshape(3, -1).T
-    Rs = Rot.from_euler("ZYZ", grid).as_matrix().astype(np.float32)
-    budget = 1.5e8
-    if table:
-        # the exhaustive rung through the Funk table: K lookups per
-        # orientation, independent of the spot count.  The pole grid is a
-        # third of the tolerance, so a lookup is within tol/6 of the exact
-        # pole; the fine rungs below count exactly on their few candidates.
-        lookup, tab = funk_table(
-            D, w, float(coarse_tol_deg), float(coarse_tol_deg) / 3.0
-        )
-        Zj = jnp.asarray(Zdir[: int(coarse_zones)])
-        wz = jnp.asarray((1.0 / xlen[: int(coarse_zones)]).astype(np.float32))
-
-        @jax.jit
-        def sc_table(Rs_):
-            Zl = jnp.einsum("nij,kj->nki", Rs_, Zj)
-            return (tab[lookup(Zl)] * wz[None, :]).sum(1)
-
-        ch = 262144
-        out = np.concatenate(
-            [
-                np.asarray(sc_table(jnp.asarray(Rs[i : i + ch])))
-                for i in range(0, len(Rs), ch)
-            ]
-        )
-    else:
-        sc = make(int(coarse_zones), float(coarse_tol_deg))
-        # the [orientations, zones, spots] tensor is the whole cost: budget it
-        # (a pooled garnet run has 25k spots; a single L1 still 200)
-        ch = int(max(256, min(32768, budget // (int(coarse_zones) * len(D)))))
-        out = np.concatenate(
-            [np.asarray(sc(jnp.asarray(Rs[i : i + ch]))) for i in range(0, len(Rs), ch)]
-        )
-    cands = Rs[np.argsort(-out)[: int(n_shortlist)]]
+    grid = (
+        np.array(np.meshgrid(a_, b_, a_, indexing="ij"))
+        .reshape(3, -1)
+        .T.astype(np.float32)
+    )
+    Rs = kern["euler_zyz"](jnp.asarray(grid))  # device-resident
+    kind, args, ch = score_args(int(coarse_zones), float(coarse_tol_deg))
+    score = kern["score_" + kind]
+    out = jnp.concatenate(
+        [score(Rs[i : i + ch], *args) for i in range(0, len(grid), ch)]
+    )
+    _, top = kern["topk"](out, int(n_shortlist))
+    cands = np.asarray(Rs[top])
+    _mark(f"exhaustive rung ({len(grid):,} orientations)")
 
     def zoom_all(cands, nz, tol, span, n):
         rv = (
@@ -1432,20 +1507,14 @@ def lattice_ladder(
             .T
         )
         dR = jnp.asarray(Rot.from_rotvec(rv).as_matrix().astype(np.float32))
-        sc_ = make(nz, tol)
-
-        @jax.jit
-        def zb(Uc):
-            Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
-            s_ = sc_(Rs_.reshape(-1, 3, 3)).reshape(Uc.shape[0], -1)
-            k = jnp.argmax(s_, axis=1)
-            idx = jnp.arange(Uc.shape[0])
-            return s_[idx, k], Rs_[idx, k]
-
+        kind, args, ch_ = score_args(nz, tol)
+        zoom = kern["zoom_" + kind]
+        bsz = int(max(1, ch_ // len(rv)))
         bs, bR = [], []
-        bsz = int(max(1, min(64, budget // (len(rv) * nz * len(D)))))
         for i in range(0, len(cands), bsz):
-            s_, R_ = zb(jnp.asarray(np.asarray(cands[i : i + bsz], np.float32)))
+            s_, R_ = zoom(
+                jnp.asarray(np.asarray(cands[i : i + bsz], np.float32)), dR, *args
+            )
             bs.append(np.asarray(s_))
             bR.append(np.asarray(R_))
         return np.concatenate(bs), np.concatenate(bR)
@@ -1455,10 +1524,11 @@ def lattice_ladder(
         s_, R_ = zoom_all(cands, int(nz), float(tol), float(span), int(npts))
         o = np.argsort(-s_)[: int(keep)]
         cands, scores = R_[o], s_[o]
+        _mark(f"rung {nz} zones @ {tol:g} deg, {len(R_)} -> {len(o)}")
     nz, tol = rungs[-1][0], rungs[-1][1]
-    sc_last = make(int(nz), float(tol))
+    kind, args, _ = score_args(int(nz), float(tol))
     rnd = Rot.random(int(n_null), random_state=seed).as_matrix().astype(np.float32)
-    null = np.asarray(sc_last(jnp.asarray(rnd)))
+    null = np.asarray(kern["score_" + kind](jnp.asarray(rnd), *args))
     z = (scores - null.mean()) / max(null.std(), 1e-12)
     return [
         (np.asarray(R, float), float(sv), float(zv))
