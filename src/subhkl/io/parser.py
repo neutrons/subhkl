@@ -196,6 +196,17 @@ def finder(
             "CUDA_VISIBLE_DEVICES.",
         ),
     ] = False,
+    corefine: Annotated[
+        bool,
+        typer.Option(
+            "--corefine/--no-corefine",
+            help="Lattice path: co-refine the global detector geometry (radial "
+            "scale, rotation, translation) with each candidate on the band "
+            "objective, adopt the winner's geometry and re-search the "
+            "orientation under it.  What indexes cg4d-l1-mbl, whose nominal "
+            "assembly is off by ~5%% and ~2 deg.",
+        ),
+    ] = True,
     static_mask_file: Annotated[
         str | None,
         typer.Option(
@@ -236,6 +247,7 @@ def finder(
         sparse_rbf_loss=sparse_rbf_loss,
         max_workers=max_workers,
         multi_gpu=multi_gpu,
+        corefine=corefine,
         static_mask_file=static_mask_file,
     )
 
@@ -1319,7 +1331,10 @@ def spherical_index(
         int,
         typer.Option(
             "--n-candidates",
-            help="Orientation candidates to keep (multi-crystal capable)",
+            help="Orientation candidates to keep (multi-crystal capable).  On "
+            "the lattice path this is the depth of the distinct-basin "
+            "shortlist the geometry co-refinement re-ranks; a nominal "
+            "geometry that is off by a degree needs ~32 (cg4d-l1-mbl).",
         ),
     ] = 4,
     refine: Annotated[

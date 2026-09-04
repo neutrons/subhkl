@@ -2335,6 +2335,200 @@ def _ewald_device_factory(G_c, run_ids, R_runs, dets, exc_maps, ki_hat, wl, b2):
     return sph._precise(score_np), sph._precise(polish)
 
 
+def _ladder_rungs(n_candidates):
+    """The ladder's rungs with --n-candidates honoured: the last three rungs
+    keep at least that many, so the co-refinement below sees distinct
+    basins instead of five copies of the winner.  (Measured on cg4d-l1-mbl
+    1996: the default five were one basin, 89 deg from the truth, which the
+    coarse rung had ranked first -- the zoom collapsed onto a competitor.)"""
+    from subhkl.search.spherical import LATTICE_RUNGS
+
+    k = max(int(n_candidates), 5)
+    rungs = list(LATTICE_RUNGS)
+    for i in range(max(0, len(rungs) - 3), len(rungs)):
+        nz, tol, span, keep, npts = rungs[i]
+        rungs[i] = (nz, tol, span, max(int(keep), k), npts)
+    return tuple(rungs)
+
+
+def _resample_directions(dets, bank_a, row_a, col_a, R_a, ki):
+    """Sample-frame Q directions of spots through (possibly corrected)
+    panels: panel_directions per bank, rotated by each spot's goniometer R."""
+    out = np.empty((len(bank_a), 3))
+    R_a = np.asarray(R_a, float)
+    if R_a.ndim == 2:
+        R_a = np.broadcast_to(R_a, (len(bank_a), 3, 3))
+    for b in np.unique(bank_a):
+        m = np.asarray(bank_a) == b
+        d_ = sph_panel_directions(
+            dets[int(b)], rows=np.asarray(row_a)[m], cols=np.asarray(col_a)[m], ki=ki
+        )
+        out[m] = np.einsum("nji,nj->ni", R_a[m], d_)
+    return out
+
+
+def sph_panel_directions(det, rows, cols, ki):
+    from subhkl.search import spherical as sph
+
+    return sph.panel_directions(det, rows=rows, cols=cols, ki=ki)
+
+
+def _corefine_candidates(
+    results, dets, bank_a, row_a, col_a, w_a, R_a, B, wl, d_min, ki, verbose=True
+):
+    """Co-refine every ladder candidate's orientation with the global
+    detector geometry on the band objective, re-rank by the co-refined
+    score, and return (results, dets) with the winner's geometry applied
+    to the banks that carry spots.  None when a panel is not flat or the
+    band is missing -- the caller keeps what it had.
+
+    The ladder searches on nominal geometry, and on IMAGINE-X the nominal
+    assembly is off by enough (radial ~5%, ~2 deg) to displace the band
+    objective's maximum ~1 deg and leave the true basin nearly tied with a
+    false one.  Freeing seven global parameters per candidate breaks the
+    tie the right way (measured on cg4d-l1-mbl 1996: true basin 1.95 ->
+    3.25, false 1.72 -> 2.28) -- see spherical.refine_band_geometry.
+    """
+    from subhkl.instrument.detector import Detector, DetectorShape
+    from subhkl.search import spherical as sph
+
+    if wl is None or d_min is None or not results:
+        return None
+    banks_present = sorted({int(b) for b in np.unique(bank_a)})
+    if any(dets[b].panel_type != DetectorShape.flat_panel for b in banks_present):
+        return None
+    C = np.empty((len(bank_a), 3))
+    O = np.empty((len(bank_a), 3))
+    for b in banks_present:
+        m = np.asarray(bank_a) == b
+        det = dets[b]
+        C[m] = np.asarray(det.center, float)
+        u = np.asarray(col_a)[m] / (det.m - 1) * det.width
+        v = np.asarray(row_a)[m] / (det.n - 1) * det.height
+        O[m] = u[:, None] * np.asarray(det.uhat, float) + v[:, None] * np.asarray(
+            det.vhat, float
+        )
+    # distinct basins only: candidates within 1 deg of one already kept are
+    # the same basin and would be refined to the same place
+    distinct = []
+    for r in results:
+        if all(np.degrees(sph._quat_angle(r["R"], q["R"])) > 1.0 for q in distinct):
+            distinct.append(r)
+    results = distinct
+    bounds = dict(radial_bound=0.15, rot_bound_deg=3.5, trans_bound_m=0.02)
+    outs = []
+    for r in results:
+        o = sph.refine_band_geometry(
+            C, O, w_a, B, R_a, r["R"], wl, float(d_min), ki=ki, **bounds
+        )
+        outs.append(o)
+    order = np.argsort([-o["score"] for o in outs])
+    b_ = outs[order[0]]
+    clipped = (
+        abs(b_["radial_scale"]) >= 0.98 * bounds["radial_bound"]
+        or np.degrees(np.linalg.norm(b_["global_rot_vec"]))
+        >= 0.98 * bounds["rot_bound_deg"]
+        or np.max(np.abs(b_["global_trans_m"])) >= 0.98 * bounds["trans_bound_m"]
+    )
+    if clipped:
+        if verbose:
+            print(
+                "spherical-index: co-refined geometry sat AT its bounds (radial "
+                f"{100 * b_['radial_scale']:+.1f}%, rotation "
+                f"{np.degrees(np.linalg.norm(b_['global_rot_vec'])):.1f} deg, "
+                f"translation {1e3 * np.max(np.abs(b_['global_trans_m'])):.0f} mm) "
+                "-- the fit was clipped, not converged; nominal geometry kept"
+            )
+        return None
+    new_results = []
+    for i in order:
+        r = dict(results[i])
+        # keep the LADDER's orientation: the per-candidate joint optimum's
+        # U is the fragile part (it moved garnet's exact Ewald z 95 -> 31
+        # between two equally good geometries); the geometry is what this
+        # step decides, and the orientation is re-searched under it.  The
+        # joint U rides along as a candidate for the exact stage to judge.
+        r["corefine_score"] = outs[i]["score"]
+        r["corefine_score0"] = outs[i]["score0"]
+        r["R_joint"] = outs[i]["U"]
+        new_results.append(r)
+    best = outs[order[0]]
+    # Geometry is a property of the instrument, not of the hypothesis: under
+    # the WINNER's geometry, orientation-only, the winner must still win.
+    # A candidate that only led because it bent the instrument its own way
+    # loses here, and that is reported rather than hidden.
+    if len(outs) > 1:
+        Rg = np.asarray(sph._rodrigues(best["global_rot_vec"]))
+        C_w = (C * (1.0 + best["radial_scale"])) @ Rg.T + best["global_trans_m"]
+        O_w = O @ Rg.T
+        shared = [
+            sph.refine_band_geometry(
+                C_w,
+                O_w,
+                w_a,
+                B,
+                R_a,
+                o["U"],
+                wl,
+                float(d_min),
+                ki=ki,
+                radial_bound=0.0,
+                rot_bound_deg=0.0,
+                trans_bound_m=0.0,
+                orient_bound_deg=2.0,
+                maxiter=100,
+            )["score"]
+            for o in outs
+        ]
+        j_ = int(np.argmax(shared))
+        if (
+            j_ != int(order[0])
+            and shared[j_] > shared[int(order[0])] * (1.0 + 1e-3)
+            and verbose
+        ):
+            print(
+                "spherical-index: WARNING: under the winner's geometry a different "
+                "candidate scores higher ("
+                f"{shared[int(np.argmax(shared))]:.3f} vs {shared[int(order[0])]:.3f}"
+                ") -- the co-refined ranking was bought by geometry, not earned"
+            )
+    panels = best["panels"](
+        np.array([dets[b].center for b in banks_present], float),
+        np.array([dets[b].uhat for b in banks_present], float),
+        np.array([dets[b].vhat for b in banks_present], float),
+    )
+    dets_new = dict(dets)
+    for i, b in enumerate(banks_present):
+        cfg = dict(dets[b].config)
+        cfg["center"] = panels["centers"][i].tolist()
+        cfg["uhat"] = panels["uhats"][i].tolist()
+        cfg["vhat"] = panels["vhats"][i].tolist()
+        dets_new[b] = Detector(cfg)
+    geom = {
+        "banks": np.asarray(banks_present, int),
+        "panels": {
+            "centers": np.asarray(panels["centers"], float),
+            "uhats": np.asarray(panels["uhats"], float),
+            "vhats": np.asarray(panels["vhats"], float),
+            "widths": np.array([dets[b].width for b in banks_present], float),
+            "heights": np.array([dets[b].height for b in banks_present], float),
+        },
+        "radial_scale": float(best["radial_scale"]),
+        "global_rot_vec": np.asarray(best["global_rot_vec"], float),
+        "global_trans_m": np.asarray(best["global_trans_m"], float),
+    }
+    if verbose:
+        print(
+            "spherical-index: co-refined geometry on the band objective: radial "
+            f"{100 * best['radial_scale']:+.2f}%, global rotation "
+            f"{np.degrees(np.linalg.norm(best['global_rot_vec'])):.2f} deg, "
+            f"translation {1e3 * np.linalg.norm(best['global_trans_m']):.1f} mm; "
+            "candidates re-ranked, score "
+            + ", ".join(f"{r['corefine_score']:.3f}" for r in new_results)
+        )
+    return new_results, dets_new, geom
+
+
 def run_spherical_index(
     peaks_h5_filename: str,
     output_filename: str,
@@ -2385,6 +2579,7 @@ def run_spherical_index(
     final_full_refine: bool = False,
     ewald_refine: bool = False,
     search: str = "lattice",
+    corefine: bool = True,
     static_mask_file: str | None = None,
     band_consistency: bool = True,
     radial: int = 24,
@@ -2573,6 +2768,7 @@ def run_spherical_index(
 
     ewald_score = None
     ewald_polish = None
+    corefine_geom = None
     raw_mode = images_filename is not None
     f_raw = None
     f_raw_bands = None
@@ -2661,9 +2857,7 @@ def run_spherical_index(
             vd = None if static_valid is None else static_valid[i_img]
             n2, m2 = (im.shape[0] // b2) * b2, (im.shape[1] // b2) * b2
             y = im[:n2, :m2].reshape(n2 // b2, b2, m2 // b2, b2).sum(axis=(1, 3))
-            zero_frac = float(
-                np.mean(im == 0) if vd is None else np.mean(im[vd] == 0)
-            )
+            zero_frac = float(np.mean(im == 0) if vd is None else np.mean(im[vd] == 0))
             if zero_frac >= 0.05:
                 # sparse regime: zeros are Poisson draws of the background
                 # and their fraction estimates it (P(0) = e^-mu)
@@ -2691,9 +2885,11 @@ def run_spherical_index(
                 blk = im[:n2, :m2].reshape(n2 // b2, b2, m2 // b2, b2)
                 live = (blk > 0).all(axis=(1, 3))
                 if vd is not None:
-                    live &= vd[:n2, :m2].reshape(
-                        n2 // b2, b2, m2 // b2, b2
-                    ).all(axis=(1, 3))
+                    live &= (
+                        vd[:n2, :m2]
+                        .reshape(n2 // b2, b2, m2 // b2, b2)
+                        .all(axis=(1, 3))
+                    )
                 bg = generic_filter(
                     np.where(live, y, np.nan), np.nanmedian, size=9, mode="nearest"
                 )
@@ -2971,6 +3167,7 @@ def run_spherical_index(
             from scipy.ndimage import center_of_mass, label
 
             spot_d, spot_w, spot_s = [], [], []
+            spot_bk, spot_pr, spot_pc, spot_R = [], [], [], []
             for bk, rows in per_bank_rows.items():
                 shape_ = (len(np.unique(bin_rows[bk])), len(np.unique(bin_cols[bk])))
                 for (r_, e_), (_, s_) in zip(rows, per_bank_sig[bk]):
@@ -2989,6 +3186,14 @@ def run_spherical_index(
                     # sin(theta) is a LAB-frame quantity: the band is set by
                     # the beam, not by where the sample happens to be turned
                     spot_s.append(-(d_ @ np.asarray(ki, float)))
+                    spot_bk.append(np.full(len(pr_), int(bk)))
+                    spot_pr.append(pr_)
+                    spot_pc.append(pc_)
+                    spot_R.append(
+                        np.repeat(
+                            (Rr if Rr is not None else np.eye(3))[None], len(pr_), 0
+                        )
+                    )
             spot_d, spot_w = np.vstack(spot_d), np.concatenate(spot_w)
             spot_s = np.concatenate(spot_s)
             ladder = sph.lattice_ladder(
@@ -2998,6 +3203,7 @@ def run_spherical_index(
                 sin_theta=spot_s,
                 wavelength=wl,
                 d_min=d_min,
+                rungs=_ladder_rungs(n_candidates),
             )
             results = [
                 {
@@ -3014,6 +3220,73 @@ def run_spherical_index(
                 f"spherical-index: direct-lattice ladder on {len(spot_d)} spots, "
                 f"final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
             )
+            _cr = (
+                _corefine_candidates(
+                    results,
+                    dets,
+                    np.concatenate(spot_bk),
+                    np.concatenate(spot_pr),
+                    np.concatenate(spot_pc),
+                    spot_w,
+                    np.concatenate(spot_R),
+                    B,
+                    wl,
+                    d_min,
+                    ki,
+                )
+                if corefine
+                else None
+            )
+            if _cr is not None:
+                results, dets, corefine_geom = _cr
+                # orientation re-searched under the corrected panels, from
+                # the same shortlist: zoom rungs only
+                spot_d2 = _resample_directions(
+                    dets,
+                    np.concatenate(spot_bk),
+                    np.concatenate(spot_pr),
+                    np.concatenate(spot_pc),
+                    np.concatenate(spot_R),
+                    ki,
+                )
+                ladder = sph.lattice_ladder(
+                    spot_d2,
+                    spot_w,
+                    B,
+                    sin_theta=spot_s,
+                    wavelength=wl,
+                    d_min=d_min,
+                    rungs=_ladder_rungs(n_candidates),
+                    cands=[r["R"] for r in results],
+                )
+                results = [
+                    {
+                        "R": R_,
+                        "score": s_,
+                        "z": z_,
+                        "n_matched": 0,
+                        "coherence": 0.0,
+                        "c": np.nan,
+                    }
+                    for R_, s_, z_ in ladder
+                ]
+                print(
+                    "spherical-index: re-searched under the co-refined geometry, "
+                    "final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
+                )
+                results += [
+                    {
+                        "R": r["R_joint"],
+                        "score": r["corefine_score"],
+                        "z": r["z"],
+                        "n_matched": 0,
+                        "coherence": 0.0,
+                        "c": np.nan,
+                        "joint": True,
+                    }
+                    for r in _cr[0]
+                    if "R_joint" in r
+                ]
             ewald_refine = True  # the ladder ends at the exact stage's basin
         else:
             # assemble the search manually around the precomputed raw f
@@ -3240,6 +3513,7 @@ def run_spherical_index(
             sin_theta=sth_peak,
             wavelength=wl,
             d_min=d_min,
+            rungs=_ladder_rungs(n_candidates),
         )
         results = [
             {
@@ -3252,6 +3526,61 @@ def run_spherical_index(
             }
             for R_, s_, z_ in ladder
         ]
+        _cr = (
+            _corefine_candidates(
+                results,
+                dets,
+                bank,
+                pr,
+                pc,
+                np.ones(len(pr)),
+                R_peak if (Rg is not None and R_peak is not None) else np.eye(3),
+                B,
+                wl,
+                d_min,
+                ki,
+            )
+            if corefine
+            else None
+        )
+        if _cr is not None:
+            results, dets, corefine_geom = _cr
+            d_sample2 = _resample_directions(
+                dets,
+                bank,
+                pr,
+                pc,
+                R_peak if (Rg is not None and R_peak is not None) else np.eye(3),
+                ki,
+            )
+            ladder = sph.lattice_ladder(
+                d_sample2,
+                None,
+                B,
+                sin_theta=sth_peak,
+                wavelength=wl,
+                d_min=d_min,
+                rungs=_ladder_rungs(n_candidates),
+                cands=[r["R"] for r in results],
+            )
+            results = [
+                {
+                    "R": R_,
+                    "score": s_,
+                    "z": z_,
+                    "n_matched": 0,
+                    "coherence": 0.0,
+                    "c": np.nan,
+                }
+                for R_, s_, z_ in ladder
+            ]
+            print(
+                "spherical-index: re-searched under the co-refined geometry, "
+                "final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
+            )
+            # everything downstream that projects the data (the band-limited
+            # polish, the quality pass) must see the corrected panels too
+            d_sample = d_sample2
         print(
             f"spherical-index: direct-lattice ladder on {len(d_sample)} peaks, "
             f"final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
@@ -3357,7 +3686,13 @@ def run_spherical_index(
 
     gonio_offsets_deg = None
     det_report = None
-    ref_geom = None
+    # the co-refined global geometry stands as the calibration unless the
+    # instrument refinement below supersedes it (it starts from it either way)
+    ref_geom = (
+        {"banks": corefine_geom["banks"], "panels": corefine_geom["panels"]}
+        if corefine_geom is not None
+        else None
+    )
     if refine_instrument:
         # peak-shaped input: found peaks, or the strongest binned pixels of
         # raw mode as weighted peaks

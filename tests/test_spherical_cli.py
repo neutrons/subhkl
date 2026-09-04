@@ -36,7 +36,12 @@ def _cubic_rots():
     return Rs
 
 
-def _synthetic_finder_file(path, rng):
+def _synthetic_finder_file(path, rng, wavelength=None, perturb=None):
+    """``perturb`` = dict(radial=, rot_deg=) ray-traces onto a DISPLACED
+    detector (every bank centre scaled, the assembly rotated about y) while
+    the file still names the nominal instrument -- the situation on
+    IMAGINE-X.  ``wavelength`` narrower than the default keeps only the
+    reflections the band admits."""
     a = 8.0
     B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
     h, k, l_ = generate_reflections(a, a, a, 90, 90, 90, space_group="P 1", d_min=1.3)
@@ -45,13 +50,32 @@ def _synthetic_finder_file(path, rng):
     Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
     U_true = Q * np.sign(np.linalg.det(Q))
 
-    d_lab = dirs @ U_true.T
-    d_lab = d_lab[d_lab[:, 2] < -0.05]
+    G_lab = G @ U_true.T
+    d_lab = G_lab / np.linalg.norm(G_lab, axis=1, keepdims=True)
+    lam = -2.0 * d_lab[:, 2] / np.linalg.norm(G_lab, axis=1)  # 2 sin(theta) / |Q|
+    keep = d_lab[:, 2] < -0.05
+    if wavelength is not None:  # an explicit band keeps only what it admits
+        keep &= (lam >= wavelength[0]) & (lam <= wavelength[1])
+    d_lab = d_lab[keep]
     kf = np.array([0.0, 0.0, 1.0]) - 2.0 * d_lab[:, 2:3] * d_lab
     kf /= np.linalg.norm(kf, axis=1, keepdims=True)
 
     banks, rows, cols = [], [], []
-    dets = {int(kk): Detector(v) for kk, v in beamlines["CG4D"].items()}
+    dets = {}
+    for kk, v in beamlines["CG4D"].items():
+        cfg = dict(v)
+        if perturb:
+            from scipy.spatial.transform import Rotation as _Rot
+
+            Rp = _Rot.from_rotvec(
+                [0.0, np.deg2rad(perturb["rot_deg"]), 0.0]
+            ).as_matrix()
+            cfg["center"] = (
+                Rp @ (np.asarray(cfg["center"], float) * (1.0 + perturb["radial"]))
+            ).tolist()
+            cfg["uhat"] = (Rp @ np.asarray(cfg["uhat"], float)).tolist()
+            cfg["vhat"] = (Rp @ np.asarray(cfg["vhat"], float)).tolist()
+        dets[int(kk)] = Detector(cfg)
     for bk, det in dets.items():
         mask, r_, c_ = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
         if not np.any(mask):
@@ -73,7 +97,9 @@ def _synthetic_finder_file(path, rng):
         ):
             fp[f"sample/{kk}"] = v
         fp["sample/space_group"] = "P 1"
-        fp["instrument/wavelength"] = np.array([2.0, 10.0])
+        fp["instrument/wavelength"] = np.array(
+            (2.0, 10.0) if wavelength is None else wavelength, float
+        )
         fp.attrs["instrument"] = "CG4D"
     return U_true, n
 
@@ -721,3 +747,67 @@ def test_radial_search_indexes_both_data_paths(tmp_path):
     err = min(np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots())
     assert err < 0.5
     assert z[0] > 8.0
+
+
+def test_corefinement_recovers_a_displaced_detector(tmp_path):
+    """The ladder searches on nominal geometry.  Ray-trace a crystal onto a
+    CG4D assembly that is 5% further out and turned 1.5 deg about y while
+    the file names the nominal instrument -- the IMAGINE-X situation, where
+    the classic calibration wants a 44 mm centre shift.  Co-refining the
+    seven global parameters on the band objective, then re-searching the
+    orientation under the adopted geometry, must beat the same search with
+    the geometry left nominal, and must recover most of the displacement.
+    Not all of it: on ONE still a rotation of the assembly about the sample
+    is, to first order in the directions, a rotation of the crystal, so
+    part of the 1.5 deg lands in U (measured: 0.79 deg, centre residual 41%
+    of the displacement); the pooled instrument refinement downstream is
+    what separates them across runs.  On cg4d-l1-mbl 1996: geometry
+    +5.5% / 2.4 deg, peaks explained 31% -> 54%."""
+    from subhkl.commands import run_spherical_index
+
+    rng = np.random.default_rng(61)
+    peaks_file = str(tmp_path / "finder_displaced.h5")
+    U_true, n = _synthetic_finder_file(
+        peaks_file, rng, wavelength=(2.0, 4.5), perturb=dict(radial=0.05, rot_deg=1.5)
+    )
+    assert n > 40
+    errs = {}
+    for corefine in (False, True):
+        out = str(tmp_path / f"corefine_{corefine}.h5")
+        run_spherical_index(
+            peaks_file,
+            out,
+            d_min=1.3,
+            kernel_deg=1.0,
+            search="lattice",
+            corefine=corefine,
+            n_candidates=8,
+        )
+        with h5py.File(out) as fp:
+            U = fp["sample/U"][()]
+            assert ("detector_calibration" in fp) == corefine
+            if corefine:
+                cal = fp["detector_calibration"]
+                Rp = np.array(
+                    [
+                        [np.cos(np.deg2rad(1.5)), 0, np.sin(np.deg2rad(1.5))],
+                        [0, 1, 0],
+                        [-np.sin(np.deg2rad(1.5)), 0, np.cos(np.deg2rad(1.5))],
+                    ]
+                )
+                resid = []
+                for g in cal:
+                    b = int(g.split("_")[1])
+                    c_nom = np.asarray(beamlines["CG4D"][str(b)]["center"], float)
+                    c_true = Rp @ (c_nom * 1.05)
+                    resid.append(
+                        np.linalg.norm(cal[g]["center"][()] - c_true)
+                        / np.linalg.norm(c_true - c_nom)
+                    )
+                # most of the displacement recovered (0 = all, 1 = none)
+                assert np.median(resid) < 0.6, np.median(resid)
+        errs[corefine] = min(
+            np.rad2deg(_quat_angle(U, U_true @ S)) for S in _cubic_rots()
+        )
+    assert errs[True] < errs[False], errs
+    assert errs[True] < 1.0, errs

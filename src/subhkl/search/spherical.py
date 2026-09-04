@@ -1306,8 +1306,9 @@ def _lattice_kernels():
         """Table cell values: [poles, zone lengths]."""
         u = Pc @ Dj.T
         t = xl[None, :, None] * u[:, None, :]
-        return (band_phase(t, qlo[None, None, :], qhi[None, None, :])
-                * wj[None, None, :]).sum(-1)
+        return (
+            band_phase(t, qlo[None, None, :], qhi[None, None, :]) * wj[None, None, :]
+        ).sum(-1)
 
     def score_band(Rs, Zj, xl, wz, Dj, wj, qlo, qhi):
         Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
@@ -1460,8 +1461,9 @@ def band_table(dirs, weights, q_lo, q_hi, lengths, spacing_deg):
     kern = _lattice_kernels()["band_chunk"]
     xl = jnp.asarray(np.asarray(lengths, np.float32))
     Dj, wj = jnp.asarray(D), jnp.asarray(w)
-    qlo, qhi = jnp.asarray(np.asarray(q_lo, np.float32)), jnp.asarray(
-        np.asarray(q_hi, np.float32)
+    qlo, qhi = (
+        jnp.asarray(np.asarray(q_lo, np.float32)),
+        jnp.asarray(np.asarray(q_hi, np.float32)),
     )
     ch = int(max(64, 5e8 // max(len(D) * len(lengths), 1)))
     table = np.concatenate(
@@ -1476,6 +1478,165 @@ def band_table(dirs, weights, q_lo, q_hi, lengths, spacing_deg):
         jnp.asarray(nph),
         int(nth),
     )
+
+
+@_precise
+def refine_band_geometry(
+    centers,
+    offsets,
+    weights,
+    B,
+    R_spots,
+    U0,
+    wavelength,
+    d_min,
+    n_zones=60,
+    ki=(0.0, 0.0, 1.0),
+    radial_bound=0.15,
+    rot_bound_deg=3.5,
+    trans_bound_m=0.02,
+    orient_bound_deg=11.5,
+    maxiter=400,
+    zone_weight="uniform",
+):
+    """Co-refine the orientation AND the global detector geometry on the
+    band objective.
+
+    The objective sum_x sum_j w_j <cos(2 pi q (x.d_j))> is differentiable
+    in the spot directions d_j, and d_j is a differentiable function of
+    where the detector is.  So co-refinement is the same objective with
+    seven more parameters -- radial scale, a global rotation of the whole
+    assembly about the sample, a global translation -- and not a second
+    machine; no matching, no assignment.  The three modes are the harness's
+    ``radial``, ``global_rot``, ``global_trans``, applied exactly as
+    refinables.forward_map does, so the result is a ``panels`` block
+    _calibrated_dets can consume.
+
+    Why it is needed at all: the ladder searches on nominal geometry.  On
+    IMAGINE-X (CG4D) the nominal assembly is off by a radial ~5% and ~2 deg
+    (its classic calibration absorbs the same error as a 44 mm centre shift
+    and a +5% cell), which displaces the band objective's maximum by ~1
+    deg -- outside the exact Ewald basin -- and, with orientation alone,
+    leaves the true basin nearly tied with a false one (0.826 vs 0.794 on
+    cg4d-l1-mbl run 1996).  Co-refined, the true basin doubles (1.677) and
+    the false one barely moves (1.099): the geometry discriminates.  The
+    fraction of the finder's 149 peaks within 0.3 deg of a prediction goes
+    30.9% -> 61.7%.
+
+    centers, offsets: per-spot bank centre and in-panel offset [m], lab
+    frame (xyz = centre + offset, flat panels).  R_spots: goniometer
+    rotation per spot [n, 3, 3] or one [3, 3].  Returns a dict with U,
+    radial_scale, global_rot_vec [rad], global_trans_m, score, score0, and
+    a callable panels(banks_centers, banks_uhats, banks_vhats) that maps a
+    bank's nominal geometry to the refined one.
+    """
+    import jax
+    import jax.numpy as jnp
+    from scipy.optimize import minimize
+
+    C = jnp.asarray(np.asarray(centers, np.float64))
+    O = jnp.asarray(np.asarray(offsets, np.float64))
+    w = jnp.asarray(np.asarray(weights, np.float64))
+    w = w / jnp.maximum(w.sum(), 1e-12)
+    Rs = np.asarray(R_spots, np.float64)
+    if Rs.ndim == 2:
+        Rs = np.broadcast_to(Rs, (len(centers), 3, 3))
+    Rj = jnp.asarray(Rs)
+    kij = jnp.asarray(np.asarray(ki, np.float64))
+    kij = kij / jnp.linalg.norm(kij)
+    Uj = jnp.asarray(np.asarray(U0, np.float64))
+    zd, zl, _ = direct_lattice_vectors(B)
+    nz = int(n_zones)
+    X0 = jnp.asarray((zl[:nz, None] * zd[:nz]).astype(np.float64))
+    wz = jnp.asarray(
+        (np.ones(nz) if zone_weight == "uniform" else 1.0 / zl[:nz]).astype(np.float64)
+    )
+    lam_lo, lam_hi = float(wavelength[0]), float(wavelength[1])
+    gmax = 1.0 / float(d_min)
+
+    def objective(p):
+        rv, scale, rg, T = p[:3], p[3], p[4:7], p[7:10]
+        Rg = _rodrigues_jax(rg)
+        xyz = (C * (1.0 + scale) + O) @ Rg.T + T[None, :]
+        kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
+        g = kf - kij[None, :]
+        d_lab = g / jnp.linalg.norm(g, axis=1, keepdims=True)
+        s_ = -(d_lab @ kij)
+        q_lo = 2.0 * s_ / lam_hi
+        q_hi = jnp.maximum(jnp.minimum(2.0 * s_ / lam_lo, gmax), q_lo)
+        d = jnp.einsum("nji,nj->ni", Rj, d_lab)  # sample frame: R^T d
+        Rm = _rodrigues_jax(rv) @ Uj
+        t = (X0 @ Rm.T) @ d.T  # [zones, spots]
+        two_pi = 2.0 * jnp.pi
+        den = two_pi * (q_hi - q_lo)[None, :] * t
+        ok = jnp.abs(den) > 1e-7
+        num = jnp.sin(two_pi * q_hi[None, :] * t) - jnp.sin(two_pi * q_lo[None, :] * t)
+        K = jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0)
+        return -jnp.einsum("km,k,m->", K, wz, w)
+
+    vg = jax.jit(jax.value_and_grad(objective))
+
+    def f(p):
+        v, gr = vg(jnp.asarray(p))
+        return float(v), np.asarray(gr, np.float64)
+
+    ob = np.deg2rad(float(orient_bound_deg))
+    rb = np.deg2rad(float(rot_bound_deg))
+    bounds = (
+        [(-ob, ob)] * 3
+        + [(-float(radial_bound), float(radial_bound))]
+        + [(-rb, rb)] * 3
+        + [(-float(trans_bound_m), float(trans_bound_m))] * 3
+    )
+    p0 = np.zeros(10)
+    s0 = -f(p0)[0]
+    # The geometry landscape is bimodal along the radial direction: on
+    # cg4d-l1-mbl the true basin started at nominal rolls to -12% (score
+    # 2.31) while starts at -6, -3, +3% all reach +5.5% (3.25 / 3.42 /
+    # 2.90), and which mode L-BFGS finds turns on a tenth of a degree of
+    # orientation.  A multistart over the dominant nuisance is the honest
+    # answer; the other six parameters follow from each start.
+    starts = (
+        np.linspace(-float(radial_bound), float(radial_bound), 5)
+        if radial_bound > 0
+        else np.array([0.0])
+    )
+    res = None
+    for s_ in starts:
+        q0 = p0.copy()
+        q0[3] = float(np.clip(s_ * 0.6, -radial_bound, radial_bound))
+        r_ = minimize(
+            f,
+            q0,
+            jac=True,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={"maxiter": int(maxiter)},
+        )
+        if res is None or r_.fun < res.fun:
+            res = r_
+    p = np.asarray(res.x, np.float64)
+    Rg = np.asarray(_rodrigues_jax(jnp.asarray(p[4:7])))
+    U = np.asarray(_rodrigues_jax(jnp.asarray(p[:3]))) @ np.asarray(U0, np.float64)
+
+    def panels(bank_centers, bank_uhats, bank_vhats):
+        c = np.asarray(bank_centers, np.float64) * (1.0 + p[3])
+        return {
+            "centers": c @ Rg.T + p[7:10][None, :],
+            "uhats": np.asarray(bank_uhats, np.float64) @ Rg.T,
+            "vhats": np.asarray(bank_vhats, np.float64) @ Rg.T,
+        }
+
+    return {
+        "U": _orthonormalize(U),
+        "radial_scale": float(p[3]),
+        "global_rot_vec": p[4:7].copy(),
+        "global_trans_m": p[7:10].copy(),
+        "score": float(-res.fun),
+        "score0": float(s0),
+        "panels": panels,
+        "n_iter": int(res.nit),
+    }
 
 
 #: rungs of the ladder: (number of shortest zones, tolerance [deg], zoom
@@ -1513,6 +1674,7 @@ def lattice_ladder(
     sin_theta=None,
     wavelength=None,
     d_min=None,
+    cands=None,
 ):
     """Orientation search on the direct lattice, coarse to fine.
 
@@ -1604,9 +1766,7 @@ def lattice_ladder(
                 # n.d, so four samples per turn on the longest zone
                 qbar = float(np.max(0.5 * (q_lo + q_hi)))
                 sp = np.degrees(1.0 / max(4.0 * float(xlen[:nz].max()) * qbar, 1e-9))
-                tables["band"] = band_table(
-                    D, w, q_lo, q_hi, xlen[:nz], min(sp, 5.0)
-                )
+                tables["band"] = band_table(D, w, q_lo, q_hi, xlen[:nz], min(sp, 5.0))
                 _mark(f"band table ({int(tables['band'][0].shape[1]):,} poles)")
             tab, off, nph, nth = tables["band"]
             return "band_table", (Zj[:nz], wz, tab, off, nph, nth), 262144
@@ -1636,6 +1796,11 @@ def lattice_ladder(
             int(max(256, min(32768, 1.5e8 // (nz * n_pad)))),
         )
 
+    if cands is not None:
+        # zoom-only: re-search the orientation from a given shortlist -- the
+        # geometry co-refinement's second pass, under the corrected panels
+        cands = np.asarray(cands, np.float32).reshape(-1, 3, 3)
+        _mark(f"zoom from {len(cands)} given candidates")
     step = float(grid_deg)
     a_ = np.radians(np.arange(0, 360, step))
     b_ = np.radians(np.arange(step / 2, 180, step))
@@ -1644,19 +1809,20 @@ def lattice_ladder(
         .reshape(3, -1)
         .T.astype(np.float32)
     )
-    Rs = kern["euler_zyz"](jnp.asarray(grid))  # device-resident
-    kind, args, ch = (
-        band_args(int(coarse_zones), True)
-        if band
-        else score_args(int(coarse_zones), float(coarse_tol_deg))
-    )
-    score = kern["score_" + kind]
-    out = jnp.concatenate(
-        [score(Rs[i : i + ch], *args) for i in range(0, len(grid), ch)]
-    )
-    _, top = kern["topk"](out, int(n_shortlist))
-    cands = np.asarray(Rs[top])
-    _mark(f"exhaustive rung ({len(grid):,} orientations)")
+    if cands is None:
+        Rs = kern["euler_zyz"](jnp.asarray(grid))  # device-resident
+        kind, args, ch = (
+            band_args(int(coarse_zones), True)
+            if band
+            else score_args(int(coarse_zones), float(coarse_tol_deg))
+        )
+        score = kern["score_" + kind]
+        out = jnp.concatenate(
+            [score(Rs[i : i + ch], *args) for i in range(0, len(grid), ch)]
+        )
+        _, top = kern["topk"](out, int(n_shortlist))
+        cands = np.asarray(Rs[top])
+        _mark(f"exhaustive rung ({len(grid):,} orientations)")
 
     def zoom_all(cands, nz, tol, span, n):
         rv = (
