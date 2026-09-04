@@ -769,6 +769,11 @@ def nearest_line_stats(
 
     P = np.asarray(pts, dtype=np.float64)
     D = np.asarray(dirs, dtype=np.float64)
+    # A line carries a direction, not a length.  Unnormalised input makes
+    # |p.d| exceed 1, the clip below turns that into exactly 0 deg, and a
+    # solve whose lines are the worst fit reads as the most accurate one.
+    P = P / np.linalg.norm(P, axis=1, keepdims=True)
+    D = D / np.linalg.norm(D, axis=1, keepdims=True)
     n, m = len(P), len(D)
     n_chunks, chunk_m, pad_idx = _overlap_chunk_plan(n, m, max_overlap_elems)
     valid = np.ones(n_chunks * chunk_m, dtype=np.float32)
@@ -1376,6 +1381,7 @@ LATTICE_RUNGS = (
 )
 
 
+@_precise
 def lattice_ladder(
     dirs,
     weights,
@@ -1531,7 +1537,7 @@ def lattice_ladder(
     null = np.asarray(kern["score_" + kind](jnp.asarray(rnd), *args))
     z = (scores - null.mean()) / max(null.std(), 1e-12)
     return [
-        (np.asarray(R, float), float(sv), float(zv))
+        (_orthonormalize(R), float(sv), float(zv))
         for R, sv, zv in zip(cands, scores, z)
     ]
 
@@ -1650,6 +1656,22 @@ def refine_wahba(R, data_dirs, model_dirs, match_deg=3.0, n_iter=3):
         S = np.diag([1.0, 1.0, np.sign(np.linalg.det(U @ Vt))])
         R = U @ S @ Vt
     return R, n_matched
+
+
+def _orthonormalize(R):
+    """Nearest rotation to R (polar decomposition).  [3, 3]
+
+    The ladder composes its zoom steps as device matmuls, and a device
+    matmul is not exactly orthogonal: on Ampere-class GPUs jax evaluates
+    float32 matmuls at TF32 by default, and even at real float32 six
+    composed products drift off SO(3).  Measured on garnet: |U^T U - I|
+    reached 7e-4, enough that |p.d| exceeded 1 for a fifth of the data,
+    every such angle clipped to exactly 0 deg, and the quality report read
+    that as a fifth of the weight aligned to better than 0.01 deg.  A
+    rotation returned by a search must be a rotation.
+    """
+    u, _, vt = np.linalg.svd(np.asarray(R, dtype=float))
+    return u @ np.diag([1.0, 1.0, np.sign(np.linalg.det(u @ vt))]) @ vt
 
 
 def _rodrigues(v):

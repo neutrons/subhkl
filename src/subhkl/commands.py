@@ -2156,12 +2156,15 @@ def _spherical_quality(
     # 0.16 deg, and null_matched runs 0.75-0.91.  Reporting the grid step in
     # either case reads as 0.01 deg of accuracy, which is how a saturated
     # diagnostic came to be quoted as a result; say it instead.
-    saturated = bool(
-        np.isfinite(aligned_med)
-        and (
-            aligned_med <= 2.0 * float(grid[1] - grid[0])
-            or float(np.mean(null_matched)) > 0.5
-        )
+    dense = float(np.mean(null_matched)) > 0.5
+    unresolved = bool(
+        np.isfinite(aligned_med) and aligned_med <= 2.0 * float(grid[1] - grid[0])
+    )
+    saturated = bool(dense or (unresolved and np.isfinite(aligned_med)))
+    sat_why = (
+        "the model set is denser than the tolerance"
+        if dense
+        else ("the aligned component rises inside one grid cell" if saturated else "")
     )
     if saturated:
         aligned_med = float("nan")
@@ -2180,6 +2183,7 @@ def _spherical_quality(
         "aligned_fraction": aligned_frac,
         "aligned_median_deg": aligned_med,
         "aligned_median_saturated": saturated,
+        "aligned_median_saturated_why": sat_why,
         "per_run_median_deg": per_run,
     }
 
@@ -2217,6 +2221,7 @@ def _ewald_device_factory(G_c, run_ids, R_runs, dets, exc_maps, ki_hat, wl, b2):
     from scipy.spatial.transform import Rotation as Rot
 
     from subhkl.instrument.detector import DetectorShape
+    from subhkl.search import spherical as sph
 
     banks = sorted({bk for _, bk in exc_maps})
     if any(dets[bk].panel_type != DetectorShape.flat_panel for bk in banks):
@@ -2324,7 +2329,10 @@ def _ewald_device_factory(G_c, run_ids, R_runs, dets, exc_maps, ki_hat, wl, b2):
             U = Rs[int(np.argmax(score_np(Rs)))]
         return np.asarray(U, float)
 
-    return score_np, polish
+    # Same reason the search kernels carry it: a float32 matmul on this
+    # class of GPU is TF32 unless asked otherwise, and this objective is a
+    # dot product of unit vectors read against a binned image.
+    return sph._precise(score_np), sph._precise(polish)
 
 
 def run_spherical_index(
@@ -3726,8 +3734,9 @@ def run_spherical_index(
         f"loglik/weight {quality['loglik_per_weight']:.3f} nats; "
         f"null-subtracted: {100 * quality['aligned_fraction']:.1f}% of weight "
         + (
-            "aligned, median SATURATED (the model set is denser than the "
-            "grid or the tolerance -- read z and CC(1/2) instead)"
+            "aligned, median SATURATED ("
+            + quality.get("aligned_median_saturated_why", "")
+            + " -- read z and CC(1/2) instead)"
             if quality.get("aligned_median_saturated")
             else f"aligned, at median {quality['aligned_median_deg']:.3f} deg"
         )

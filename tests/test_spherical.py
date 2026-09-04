@@ -915,3 +915,40 @@ def test_radial_correlogram_recovers_orientation_from_band_segments():
     R2, v2 = top_orientations(C2, al, be, ga, n=1)[0]
     assert _err_mod(R3, R0, _cubic_rots()) < 1.5
     assert null_zscore(C3, v3) >= 0.9 * null_zscore(C2, v2)
+
+
+def test_a_search_returns_a_rotation_and_a_line_has_no_length():
+    """Two ways an orientation can read as perfect while being wrong.
+
+    Measured on garnet: the ladder composes its zoom steps as device
+    matmuls, jax runs float32 matmuls at TF32 on this class of GPU, and
+    after six rungs |U^T U - I| reached 7e-4.  The model lines U d then
+    had norms above 1, |p.d| exceeded 1 for a fifth of the data, the clip
+    before arccos turned every one of those into exactly 0 deg, and the
+    quality report called the worst-fitting solve the most accurate one
+    (20.6% of the weight inside 0.01 deg, against 0.00% for a solve that
+    really was better).  Both halves are guarded here.
+    """
+    from scipy.spatial.transform import Rotation as Rot
+
+    from subhkl.search.spherical import (
+        _orthonormalize,
+        _quat_angle,
+        nearest_line_stats,
+    )
+
+    rng = np.random.default_rng(0)
+    R = Rot.random(1, random_state=3).as_matrix()[0]
+    drifted = R + 7e-4 * rng.normal(size=(3, 3))
+    assert np.abs(drifted.T @ drifted - np.eye(3)).max() > 1e-4  # the disease
+    fixed = _orthonormalize(drifted)
+    assert np.abs(fixed.T @ fixed - np.eye(3)).max() < 1e-12
+    assert abs(np.linalg.det(fixed) - 1.0) < 1e-12
+    assert _quat_angle(fixed, R) < np.deg2rad(0.2)  # nearest, not just any
+
+    dirs = Rot.random(64, random_state=1).as_matrix()[:, 0]
+    pts = Rot.random(512, random_state=2).as_matrix()[:, 1]
+    dev_unit, _ = nearest_line_stats(pts, dirs, 1.0, want_density=False)
+    dev_long, _ = nearest_line_stats(pts, dirs * 1.001, 1.0, want_density=False)
+    assert np.allclose(dev_unit, dev_long, atol=1e-9)
+    assert not (dev_long < 0.01).any()  # no free zeros from a longer vector
