@@ -685,11 +685,12 @@ def test_ewald_refine_ranks_and_polishes_raw_counts(tmp_path):
 
 
 def test_lattice_search_indexes_raw_counts_and_peaks(tmp_path):
-    """--search lattice: the direct-lattice ladder.  Spots (raw path: 5 sigma
-    blobs of the excess image; peaks path: the peak list) are scored by
-    their weight on the zone great circles of the shortest direct-lattice
-    vectors, coarse to fine, with no band limit anywhere; in raw-count mode
-    the exact Ewald stage polishes the winner.  Measured on MANDI L1
+    """--search lattice: the direct-lattice ladder.  The data side (raw
+    path: every live bin of the excess image with its signed excess for the
+    exhaustive rung, the strongest bins for the zooms; peaks path: the peak
+    list) is scored by the band average of the phase at the shortest
+    direct-lattice vectors, coarse to fine, with no band limit anywhere; in
+    raw-count mode the exact Ewald stage polishes the winner.  Measured on MANDI L1
     (100 A) and garnet (12 A, 24 copies): every still within 0.16 deg of an
     independent reference, ~2 s per still on an H100."""
     from subhkl.commands import run_spherical_index

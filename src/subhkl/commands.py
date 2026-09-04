@@ -2580,6 +2580,7 @@ def run_spherical_index(
     ewald_refine: bool = False,
     search: str = "lattice",
     corefine: bool = True,
+    lattice_sparse_bins: int = 8192,
     static_mask_file: str | None = None,
     band_consistency: bool = True,
     radial: int = 24,
@@ -3160,42 +3161,67 @@ def run_spherical_index(
 
     if raw_mode:
         if search == "lattice":
-            # spots from the excess image: 5 sigma blobs, centroid ->
-            # direction in the sample frame, weight sqrt(mass).  The
-            # dense-regime excess with this threshold gave 213 blobs on
-            # MANDI L1 run 0 of which 207 were real (TOF-indexed).
-            from scipy.ndimage import center_of_mass, label
-
-            spot_d, spot_w, spot_s = [], [], []
-            spot_bk, spot_pr, spot_pc, spot_R = [], [], [], []
+            # The data side is the excess image itself.  Every live bin with
+            # its SIGNED excess feeds the exhaustive rung through the band
+            # table (dense costs nothing there); the zoom rungs, the exact
+            # stage and the geometry co-refinement take the strongest bins
+            # by |excess| -- a rank, not a threshold, and no connected
+            # components.  This replaced the 5 sigma blobs: on MANDI L1 run
+            # 0 the threshold had kept a third of the real spots and the z
+            # at the truth was 10.9 against 17.8 for the full image (13
+            # zones; 16.0 vs 26.0 at 60), the zero-mean excess of the
+            # background adding variance but no bias.  What the threshold
+            # could not see, this cannot fix either: on cg4d-l1-mbl the cap
+            # is fixed positive-excess detector structure, present in any
+            # data side, which is what --static-mask-file is for.
+            all_d, all_w, all_s = [], [], []
+            all_bk, all_pr, all_pc, all_R = [], [], [], []
             for bk, rows in per_bank_rows.items():
-                shape_ = (len(np.unique(bin_rows[bk])), len(np.unique(bin_cols[bk])))
-                for (r_, e_), (_, s_) in zip(rows, per_bank_sig[bk]):
-                    e2, s2 = e_.reshape(shape_), s_.reshape(shape_)
-                    lab_, n_ = label(e2 > 5.0 * s2)
-                    if n_ == 0:
-                        continue
-                    cms = center_of_mass(e2, lab_, range(1, n_ + 1))
-                    mass = np.array([e2[lab_ == k_].sum() for k_ in range(1, n_ + 1)])
-                    pr_ = np.array([cm[0] for cm in cms]) * b2 + (b2 - 1) / 2.0
-                    pc_ = np.array([cm[1] for cm in cms]) * b2 + (b2 - 1) / 2.0
-                    d_ = sph.panel_directions(dets[bk], rows=pr_, cols=pc_, ki=ki)
+                d_lab_ = bin_dirs[bk]
+                s_lab_ = -(d_lab_ @ np.asarray(ki, float))
+                for r_, e_ in rows:
                     Rr = R_run.get(r_)
-                    spot_d.append(d_ @ Rr if Rr is not None else d_)
-                    spot_w.append(np.sqrt(np.clip(mass, 0.0, None)))
-                    # sin(theta) is a LAB-frame quantity: the band is set by
-                    # the beam, not by where the sample happens to be turned
-                    spot_s.append(-(d_ @ np.asarray(ki, float)))
-                    spot_bk.append(np.full(len(pr_), int(bk)))
-                    spot_pr.append(pr_)
-                    spot_pc.append(pc_)
-                    spot_R.append(
+                    live_ = e_ != 0.0
+                    if not np.any(live_):
+                        continue
+                    all_d.append(
+                        (d_lab_[live_] @ Rr) if Rr is not None else d_lab_[live_]
+                    )
+                    all_w.append(e_[live_])
+                    all_s.append(s_lab_[live_])
+                    all_bk.append(np.full(int(live_.sum()), int(bk)))
+                    all_pr.append(bin_rows[bk][live_])
+                    all_pc.append(bin_cols[bk][live_])
+                    all_R.append(
                         np.repeat(
-                            (Rr if Rr is not None else np.eye(3))[None], len(pr_), 0
+                            (Rr if Rr is not None else np.eye(3))[None],
+                            int(live_.sum()),
+                            0,
                         )
                     )
-            spot_d, spot_w = np.vstack(spot_d), np.concatenate(spot_w)
-            spot_s = np.concatenate(spot_s)
+            all_d, all_w, all_s = (
+                np.vstack(all_d),
+                np.concatenate(all_w),
+                np.concatenate(all_s),
+            )
+            all_bk, all_pr, all_pc = (
+                np.concatenate(all_bk),
+                np.concatenate(all_pr),
+                np.concatenate(all_pc),
+            )
+            all_R = np.concatenate(all_R)
+            # the strongest bins by |excess| for everything after the table:
+            # a cost cap (zoom rungs are O(bins) with the exact kernel), not
+            # a detection
+            n_sparse = min(int(lattice_sparse_bins), len(all_w))
+            top_ = np.argpartition(-np.abs(all_w), n_sparse - 1)[:n_sparse]
+            spot_d, spot_w, spot_s = all_d[top_], all_w[top_], all_s[top_]
+            spot_bk, spot_pr, spot_pc, spot_R = (
+                [all_bk[top_]],
+                [all_pr[top_]],
+                [all_pc[top_]],
+                [all_R[top_]],
+            )
             ladder = sph.lattice_ladder(
                 spot_d,
                 spot_w,
@@ -3204,6 +3230,9 @@ def run_spherical_index(
                 wavelength=wl,
                 d_min=d_min,
                 rungs=_ladder_rungs(n_candidates),
+                table_dirs=all_d,
+                table_weights=all_w,
+                table_sin_theta=all_s,
             )
             results = [
                 {
@@ -3217,8 +3246,9 @@ def run_spherical_index(
                 for R_, s_, z_ in ladder
             ]
             print(
-                f"spherical-index: direct-lattice ladder on {len(spot_d)} spots, "
-                f"final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
+                f"spherical-index: direct-lattice ladder on {len(all_d):,} live "
+                f"bins (exhaustive rung), {len(spot_d):,} strongest for the zoom "
+                "rungs; final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
             )
             _cr = (
                 _corefine_candidates(

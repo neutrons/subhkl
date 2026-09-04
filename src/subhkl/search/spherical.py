@@ -1675,6 +1675,9 @@ def lattice_ladder(
     wavelength=None,
     d_min=None,
     cands=None,
+    table_dirs=None,
+    table_weights=None,
+    table_sin_theta=None,
 ):
     """Orientation search on the direct lattice, coarse to fine.
 
@@ -1764,10 +1767,28 @@ def lattice_ladder(
             if "band" not in tables:
                 # resolve the phase: it turns once per 1 / (|x| qbar) in
                 # n.d, so four samples per turn on the longest zone
-                qbar = float(np.max(0.5 * (q_lo + q_hi)))
+                # The table is the one place the data side can be dense at
+                # no search cost: given, every live bin with its signed
+                # excess goes in here (the zoom rungs take the sparse set).
+                # Measured on MANDI L1 run 0: z at the truth 10.9 -> 17.8
+                # (13 zones), 16.0 -> 26.0 (60 zones) against the 5 sigma
+                # bins, because the threshold had dropped two thirds of the
+                # real spots and the zero-mean excess adds variance, not bias.
+                if table_dirs is not None:
+                    Dt = np.asarray(table_dirs, np.float64)
+                    Dt = Dt / np.linalg.norm(Dt, axis=1, keepdims=True)
+                    wt = np.asarray(table_weights, np.float64)
+                    wt = wt / max(np.abs(wt).sum(), 1e-12)
+                    qlt, qht = band_q_range(table_sin_theta, wavelength, d_min)
+                else:
+                    Dt, wt, qlt, qht = D, w, q_lo, q_hi
+                qbar = float(np.max(0.5 * (qlt + qht)))
                 sp = np.degrees(1.0 / max(4.0 * float(xlen[:nz].max()) * qbar, 1e-9))
-                tables["band"] = band_table(D, w, q_lo, q_hi, xlen[:nz], min(sp, 5.0))
-                _mark(f"band table ({int(tables['band'][0].shape[1]):,} poles)")
+                tables["band"] = band_table(Dt, wt, qlt, qht, xlen[:nz], min(sp, 5.0))
+                _mark(
+                    f"band table ({int(tables['band'][0].shape[1]):,} poles, "
+                    f"{len(Dt):,} bins)"
+                )
             tab, off, nph, nth = tables["band"]
             return "band_table", (Zj[:nz], wz, tab, off, nph, nth), 262144
         return (
