@@ -2939,7 +2939,7 @@ def run_spherical_index(
             # MANDI L1 run 0 of which 207 were real (TOF-indexed).
             from scipy.ndimage import center_of_mass, label
 
-            spot_d, spot_w = [], []
+            spot_d, spot_w, spot_s = [], [], []
             for bk, rows in per_bank_rows.items():
                 shape_ = (len(np.unique(bin_rows[bk])), len(np.unique(bin_cols[bk])))
                 for (r_, e_), (_, s_) in zip(rows, per_bank_sig[bk]):
@@ -2955,8 +2955,19 @@ def run_spherical_index(
                     Rr = R_run.get(r_)
                     spot_d.append(d_ @ Rr if Rr is not None else d_)
                     spot_w.append(np.sqrt(np.clip(mass, 0.0, None)))
+                    # sin(theta) is a LAB-frame quantity: the band is set by
+                    # the beam, not by where the sample happens to be turned
+                    spot_s.append(-(d_ @ np.asarray(ki, float)))
             spot_d, spot_w = np.vstack(spot_d), np.concatenate(spot_w)
-            ladder = sph.lattice_ladder(spot_d, spot_w, B)
+            spot_s = np.concatenate(spot_s)
+            ladder = sph.lattice_ladder(
+                spot_d,
+                spot_w,
+                B,
+                sin_theta=spot_s,
+                wavelength=wl,
+                d_min=d_min,
+            )
             results = [
                 {
                     "R": R_,
@@ -3170,7 +3181,35 @@ def run_spherical_index(
                 f"{results[0]['ewald_z']:.1f}"
             )
     elif search == "lattice":
-        ladder = sph.lattice_ladder(d_sample, None, B)
+        # sin(theta) per peak, in the lab frame (see the raw branch)
+        s_peak = np.concatenate(
+            [
+                -(
+                    sph.panel_directions(
+                        dets[int(bk_)],
+                        rows=pr[bank == bk_],
+                        cols=pc[bank == bk_],
+                        ki=ki,
+                    )
+                    @ np.asarray(ki, float)
+                )
+                for bk_ in np.unique(bank)
+                if int(bk_) in dets
+            ]
+        )
+        order = np.concatenate(
+            [np.where(bank == bk_)[0] for bk_ in np.unique(bank) if int(bk_) in dets]
+        )
+        sth_peak = np.empty(len(d_sample))
+        sth_peak[order] = s_peak
+        ladder = sph.lattice_ladder(
+            d_sample,
+            None,
+            B,
+            sin_theta=sth_peak,
+            wavelength=wl,
+            d_min=d_min,
+        )
         results = [
             {
                 "R": R_,

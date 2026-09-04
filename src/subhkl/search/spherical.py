@@ -1279,6 +1279,48 @@ def _lattice_kernels():
     def funk_chunk(Pc, Dj, wj, thr):
         return (jnp.abs(Pc @ Dj.T) < thr).astype(jnp.float32) @ wj
 
+    def band_phase(t, qlo, qhi):
+        """<cos(2 pi q t)>_{q in [qlo, qhi]}: the band average of the phase.
+
+        A spot fixes its Q direction but not |Q|; the wavelength band gives
+        |Q| in [2 s / lam_max, min(2 s / lam_min, 1/d_min)].  For a true
+        reflection G and a direct-lattice vector x, G.x is an INTEGER, so
+        exp(2 pi i G.x) = 1 -- real and positive.  Averaging that phase over
+        the band is the matched statistic, and its real part is
+
+            [sin(2 pi qhi t) - sin(2 pi qlo t)] / (2 pi (qhi - qlo) t),  t = x.d
+
+        which is 1 at t = 0 and decays as the phase winds.  The two limits of
+        the ladder are the two limits of this one expression: a wide band
+        kills everything but t ~ 0 (the zone great circle -- the indicator
+        this replaces), a narrow band leaves cos(2 pi qbar t) (Fourier
+        auto-indexing).  No tolerance: the band sets the window.
+        """
+        two_pi = 2.0 * jnp.pi
+        den = two_pi * (qhi - qlo) * t
+        ok = jnp.abs(den) > 1e-7
+        num = jnp.sin(two_pi * qhi * t) - jnp.sin(two_pi * qlo * t)
+        return jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0)
+
+    def band_chunk(Pc, xl, Dj, wj, qlo, qhi):
+        """Table cell values: [poles, zone lengths]."""
+        u = Pc @ Dj.T
+        t = xl[None, :, None] * u[:, None, :]
+        return (band_phase(t, qlo[None, None, :], qhi[None, None, :])
+                * wj[None, None, :]).sum(-1)
+
+    def score_band(Rs, Zj, xl, wz, Dj, wj, qlo, qhi):
+        Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
+        t = xl[None, :, None] * jnp.einsum("nki,mi->nkm", Zl, Dj)
+        K = band_phase(t, qlo[None, None, :], qhi[None, None, :])
+        return jnp.einsum("nkm,k,m->n", K, wz, wj)
+
+    def score_band_table(Rs, Zj, wz, tab, off, nph, nth):
+        Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
+        idx = _funk_lookup(Zl, off, nph, nth)
+        vals = tab[jnp.arange(tab.shape[0])[None, :], idx]
+        return (vals * wz[None, :]).sum(1)
+
     def score_exact(Rs, Zj, wz, Dj, wj, thr):
         Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
         on = jnp.abs(jnp.einsum("nki,mi->nkm", Zl, Dj)) < thr
@@ -1287,6 +1329,19 @@ def _lattice_kernels():
     def score_table(Rs, Zj, wz, tab, off, nph, nth):
         Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
         return (tab[_funk_lookup(Zl, off, nph, nth)] * wz[None, :]).sum(1)
+
+    def zoom_b(Uc, dR, *score_args):
+        Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
+        n = Uc.shape[0]
+        flat = Rs_.reshape(-1, 3, 3)
+        s_ = (
+            score_band_table(flat, *score_args)
+            if len(score_args) == 6
+            else score_band(flat, *score_args)
+        ).reshape(n, -1)
+        k = jnp.argmax(s_, axis=1)
+        idx = jnp.arange(n)
+        return s_[idx, k], Rs_[idx, k]
 
     def zoom(Uc, dR, *score_args):
         Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
@@ -1304,6 +1359,11 @@ def _lattice_kernels():
     _LATTICE_JITS.update(
         euler_zyz=jax.jit(euler_zyz),
         funk_chunk=jax.jit(funk_chunk),
+        band_chunk=jax.jit(band_chunk),
+        score_band=jax.jit(score_band),
+        score_band_table=jax.jit(score_band_table, static_argnums=(6,)),
+        zoom_band=jax.jit(zoom_b),
+        zoom_band_table=jax.jit(zoom_b, static_argnums=(8,)),
         score_exact=jax.jit(score_exact),
         score_table=jax.jit(score_table, static_argnums=(6,)),
         zoom_table=jax.jit(zoom, static_argnums=(8,)),
@@ -1363,6 +1423,61 @@ def funk_table(dirs, weights, tol_deg, spacing_deg):
     return jnp.asarray(table), jnp.asarray(off[:-1]), jnp.asarray(nph), int(nth)
 
 
+def band_q_range(sin_theta, wavelength, d_min):
+    """[q_lo, q_hi] per spot from the wavelength band.  [1/A]
+
+    |Q| = 2 sin(theta) / lambda, so a spot whose direction fixes sin(theta)
+    has |Q| somewhere in [2 s / lam_max, 2 s / lam_min], truncated at the
+    resolution cut.  Spots whose whole interval lies beyond the cut cannot
+    be explained by any reflection in the model and come back empty.
+    """
+    s_ = np.asarray(sin_theta, dtype=float)
+    lam_lo, lam_hi = float(wavelength[0]), float(wavelength[1])
+    q_lo = 2.0 * s_ / lam_hi
+    q_hi = np.minimum(2.0 * s_ / lam_lo, 1.0 / float(d_min))
+    return q_lo, np.maximum(q_hi, q_lo)
+
+
+def band_table(dirs, weights, q_lo, q_hi, lengths, spacing_deg):
+    """Tabulate the band-averaged phase for every pole and every zone length.
+
+    The Funk table's counterpart for the band objective.  It needs one plane
+    per zone length, because the argument is x.d = |x| (n.d) and not n.d
+    alone; the grid is the funk_table grid so _funk_lookup serves both.
+    """
+    import jax.numpy as jnp
+
+    D = np.asarray(dirs, np.float32)
+    w = np.asarray(weights, np.float32)
+    nth = int(np.ceil(180.0 / spacing_deg))
+    th = (np.arange(nth) + 0.5) * np.pi / nth
+    nph = np.maximum(1, np.ceil(360.0 * np.sin(th) / spacing_deg)).astype(int)
+    off = np.concatenate([[0], np.cumsum(nph)])
+    it = np.repeat(np.arange(nth), nph)
+    ph = (np.arange(off[-1]) - np.repeat(off[:-1], nph) + 0.5) * (2 * np.pi / nph[it])
+    st, ct = np.sin(th[it]), np.cos(th[it])
+    P = np.stack([st * np.cos(ph), st * np.sin(ph), ct], 1).astype(np.float32)
+    kern = _lattice_kernels()["band_chunk"]
+    xl = jnp.asarray(np.asarray(lengths, np.float32))
+    Dj, wj = jnp.asarray(D), jnp.asarray(w)
+    qlo, qhi = jnp.asarray(np.asarray(q_lo, np.float32)), jnp.asarray(
+        np.asarray(q_hi, np.float32)
+    )
+    ch = int(max(64, 5e8 // max(len(D) * len(lengths), 1)))
+    table = np.concatenate(
+        [
+            np.asarray(kern(jnp.asarray(P[i : i + ch]), xl, Dj, wj, qlo, qhi))
+            for i in range(0, len(P), ch)
+        ]
+    )
+    return (
+        jnp.asarray(table.T.copy()),  # [zone lengths, poles]
+        jnp.asarray(off[:-1]),
+        jnp.asarray(nph),
+        int(nth),
+    )
+
+
 #: rungs of the ladder: (number of shortest zones, tolerance [deg], zoom
 #: half-span [deg], candidates kept, zoom points per axis).  The tolerance is
 #: the basin width; the zone count sets the coverage N * 2 tol / 180 of the
@@ -1395,6 +1510,9 @@ def lattice_ladder(
     seed=0,
     table_tol_deg=1.0,
     verbose=False,
+    sin_theta=None,
+    wavelength=None,
+    d_min=None,
 ):
     """Orientation search on the direct lattice, coarse to fine.
 
@@ -1451,6 +1569,12 @@ def lattice_ladder(
         np.float32
     )
     w = np.concatenate([w, np.zeros(n_pad - len(w), np.float32)])
+    band = sin_theta is not None and wavelength is not None and d_min is not None
+    if band:
+        q_lo, q_hi = band_q_range(sin_theta, wavelength, d_min)
+        q_lo = np.concatenate([q_lo, np.zeros(n_pad - len(q_lo))]).astype(np.float32)
+        q_hi = np.concatenate([q_hi, np.ones(n_pad - len(q_hi))]).astype(np.float32)
+        qlo_j, qhi_j = jnp.asarray(q_lo), jnp.asarray(q_hi)
     Zdir, xlen, _ = direct_lattice_vectors(B)
     K_all = max(int(coarse_zones), max(int(r[0]) for r in rungs))
     Zj = jnp.asarray(Zdir[:K_all].astype(np.float32))
@@ -1463,6 +1587,34 @@ def lattice_ladder(
         return jnp.asarray(wz)
 
     tables = {}
+
+    xl_j = jnp.asarray(xlen[:K_all].astype(np.float32))
+
+    def band_args(nz, exhaustive):
+        """The band objective's args.  No tolerance: the band sets the
+        window, so a rung is a zone count and nothing else.  The table is
+        built for the exhaustive rung alone -- the zoom rungs are cheap and
+        a tabulated zoom moved solutions by a degree when it was tried for
+        the Funk objective."""
+        nz = int(nz)
+        wz = zone_weights(nz)[:nz]
+        if exhaustive:
+            if "band" not in tables:
+                # resolve the phase: it turns once per 1 / (|x| qbar) in
+                # n.d, so four samples per turn on the longest zone
+                qbar = float(np.max(0.5 * (q_lo + q_hi)))
+                sp = np.degrees(1.0 / max(4.0 * float(xlen[:nz].max()) * qbar, 1e-9))
+                tables["band"] = band_table(
+                    D, w, q_lo, q_hi, xlen[:nz], min(sp, 5.0)
+                )
+                _mark(f"band table ({int(tables['band'][0].shape[1]):,} poles)")
+            tab, off, nph, nth = tables["band"]
+            return "band_table", (Zj[:nz], wz, tab, off, nph, nth), 262144
+        return (
+            "band",
+            (Zj[:nz], xl_j[:nz], wz, Dj, wj, qlo_j, qhi_j),
+            int(max(64, min(32768, 6e7 // (nz * n_pad)))),
+        )
 
     def score_args(nz, tol):
         """(kernel name, args after Rs) for a rung, and the chunk size."""
@@ -1493,7 +1645,11 @@ def lattice_ladder(
         .T.astype(np.float32)
     )
     Rs = kern["euler_zyz"](jnp.asarray(grid))  # device-resident
-    kind, args, ch = score_args(int(coarse_zones), float(coarse_tol_deg))
+    kind, args, ch = (
+        band_args(int(coarse_zones), True)
+        if band
+        else score_args(int(coarse_zones), float(coarse_tol_deg))
+    )
     score = kern["score_" + kind]
     out = jnp.concatenate(
         [score(Rs[i : i + ch], *args) for i in range(0, len(grid), ch)]
@@ -1513,7 +1669,7 @@ def lattice_ladder(
             .T
         )
         dR = jnp.asarray(Rot.from_rotvec(rv).as_matrix().astype(np.float32))
-        kind, args, ch_ = score_args(nz, tol)
+        kind, args, ch_ = band_args(nz, False) if band else score_args(nz, tol)
         zoom = kern["zoom_" + kind]
         bsz = int(max(1, ch_ // len(rv)))
         bs, bR = [], []
@@ -1532,7 +1688,9 @@ def lattice_ladder(
         cands, scores = R_[o], s_[o]
         _mark(f"rung {nz} zones @ {tol:g} deg, {len(R_)} -> {len(o)}")
     nz, tol = rungs[-1][0], rungs[-1][1]
-    kind, args, _ = score_args(int(nz), float(tol))
+    kind, args, _ = (
+        band_args(int(nz), False) if band else score_args(int(nz), float(tol))
+    )
     rnd = Rot.random(int(n_null), random_state=seed).as_matrix().astype(np.float32)
     null = np.asarray(kern["score_" + kind](jnp.asarray(rnd), *args))
     z = (scores - null.mean()) / max(null.std(), 1e-12)
