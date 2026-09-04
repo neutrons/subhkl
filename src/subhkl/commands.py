@@ -2148,6 +2148,23 @@ def _spherical_quality(
         aligned_med = float(grid[1:][half_idx])
     else:
         aligned_med = float("nan")
+    # Saturation.  Two ways this median stops being a measurement: the
+    # aligned component rises within one grid cell (nothing to read below
+    # 0.01 deg), or the model set is so dense that a random orientation
+    # already matches most of the weight -- on a 100 A cell at 2.5 A the
+    # 65,000 model lines sit 0.32 deg apart, every direction has one within
+    # 0.16 deg, and null_matched runs 0.75-0.91.  Reporting the grid step in
+    # either case reads as 0.01 deg of accuracy, which is how a saturated
+    # diagnostic came to be quoted as a result; say it instead.
+    saturated = bool(
+        np.isfinite(aligned_med)
+        and (
+            aligned_med <= 2.0 * float(grid[1] - grid[0])
+            or float(np.mean(null_matched)) > 0.5
+        )
+    )
+    if saturated:
+        aligned_med = float("nan")
     per_run = {}
     if run_ids is not None:
         for r in np.unique(run_ids):
@@ -2162,6 +2179,7 @@ def _spherical_quality(
         "loglik_per_weight": loglik,
         "aligned_fraction": aligned_frac,
         "aligned_median_deg": aligned_med,
+        "aligned_median_saturated": saturated,
         "per_run_median_deg": per_run,
     }
 
@@ -2250,10 +2268,34 @@ def _ewald_device_factory(G_c, run_ids, R_runs, dets, exc_maps, ki_hat, wl, b2):
                 & (row < nrow_[None])
                 & (col < ncol_[None])
             )
-            irow = jnp.clip(jnp.floor(row / b2f), 0, H - 1).astype(jnp.int32)
-            icol = jnp.clip(jnp.floor(col / b2f), 0, Wd - 1).astype(jnp.int32)
-            ib = jnp.broadcast_to(jnp.arange(len(banks))[None, :], irow.shape)
-            vals = Ej[ir][ib, irow, icol]
+            # bilinear in the binned map: a nearest-bin gather makes the
+            # objective piecewise constant, so its maximum is a plateau half
+            # a bin wide (0.19 deg at 4x4 on CG4D) and the polish stops
+            # there -- measured as a 0.13 deg median residual against the
+            # spots where the band-limited refinement reached 0.074.
+            u = row / b2f - 0.5
+            v = col / b2f - 0.5
+            i0 = jnp.floor(u)
+            j0 = jnp.floor(v)
+            fu = u - i0
+            fv = v - j0
+            ib = jnp.broadcast_to(jnp.arange(len(banks))[None, :], u.shape)
+            i0 = i0.astype(jnp.int32)
+            j0 = j0.astype(jnp.int32)
+
+            def gat(di, dj):
+                return Ej[ir][
+                    ib,
+                    jnp.clip(i0 + di, 0, H - 1),
+                    jnp.clip(j0 + dj, 0, Wd - 1),
+                ]
+
+            vals = (
+                (1 - fu) * (1 - fv) * gat(0, 0)
+                + (1 - fu) * fv * gat(0, 1)
+                + fu * (1 - fv) * gat(1, 0)
+                + fu * fv * gat(1, 1)
+            )
             total = total + jnp.where(ok, vals, 0.0).sum()
         return total
 
@@ -2558,12 +2600,12 @@ def run_spherical_index(
             if bandwidth is not None
             else int(min(max(np.ceil(3.0 / sigma_raw), 16), 96))
         )
+        _h, _k, _l = generate_reflections(*cell, space_group=sg, d_min=d_min)
+        _Bc, _ = cartesian_matrix_metric_tensor(*cell[:3], *np.deg2rad(cell[3:]))
+        _G = np.stack([_h, _k, _l], axis=1) @ _Bc.T
         if bandwidth is None and (search != "lattice" or refine_instrument):
             # ...unless the dictionary is denser than that resolution: then
             # the model is uniform at L and the search blind (MANDI L1).
-            _h, _k, _l = generate_reflections(*cell, space_group=sg, d_min=d_min)
-            _Bc, _ = cartesian_matrix_metric_tensor(*cell[:3], *np.deg2rad(cell[3:]))
-            _G = np.stack([_h, _k, _l], axis=1) @ _Bc.T
             L_raw, _spacing = sph.dictionary_bandwidth(L_raw, _G)
             print(
                 f"spherical-index: dictionary spacing {_spacing:.2f} deg at "
@@ -3054,9 +3096,26 @@ def run_spherical_index(
                         )
                         if not np.any(mask):
                             continue
-                        ir = np.clip((pr_[mask] / b2).astype(int), 0, e_.shape[0] - 1)
-                        ic = np.clip((pc_[mask] / b2).astype(int), 0, e_.shape[1] - 1)
-                        total += float(e_[ir, ic].sum())
+                        u = pr_[mask] / b2 - 0.5
+                        v = pc_[mask] / b2 - 0.5
+                        i0 = np.floor(u).astype(int)
+                        j0 = np.floor(v).astype(int)
+                        fu, fv = u - i0, v - j0
+
+                        def _g(di, dj, i0=i0, j0=j0, e_=e_):
+                            return e_[
+                                np.clip(i0 + di, 0, e_.shape[0] - 1),
+                                np.clip(j0 + dj, 0, e_.shape[1] - 1),
+                            ]
+
+                        total += float(
+                            (
+                                (1 - fu) * (1 - fv) * _g(0, 0)
+                                + (1 - fu) * fv * _g(0, 1)
+                                + fu * (1 - fv) * _g(1, 0)
+                                + fu * fv * _g(1, 1)
+                            ).sum()
+                        )
                 return total
 
             def ewald_polish(Umat, span_deg=1.5):
@@ -3666,7 +3725,12 @@ def run_spherical_index(
         f"(null {100 * quality['null_matched_fraction']:.1f}%); "
         f"loglik/weight {quality['loglik_per_weight']:.3f} nats; "
         f"null-subtracted: {100 * quality['aligned_fraction']:.1f}% of weight "
-        f"aligned, at median {quality['aligned_median_deg']:.3f} deg"
+        + (
+            "aligned, median SATURATED (the model set is denser than the "
+            "grid or the tolerance -- read z and CC(1/2) instead)"
+            if quality.get("aligned_median_saturated")
+            else f"aligned, at median {quality['aligned_median_deg']:.3f} deg"
+        )
     )
     if quality["per_run_median_deg"] and len(quality["per_run_median_deg"]) > 1:
         worst = max(quality["per_run_median_deg"].items(), key=lambda kv: kv[1])
