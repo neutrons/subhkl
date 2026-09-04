@@ -1386,6 +1386,16 @@ def spherical_index(
             ),
         ),
     ] = "lattice",
+    static_mask_file: Annotated[
+        str | None,
+        typer.Option(
+            "--static-mask-file",
+            help="Static-structure mask built by `static-mask`, mapped onto "
+            "the raw frames by bank id.  Raw-count mode only: masked pixels "
+            "are dropped before the background and the spot detection, the "
+            "same mask the finder and integrator already take.",
+        ),
+    ] = None,
     ewald_refine: Annotated[
         bool,
         typer.Option(
@@ -1690,6 +1700,7 @@ def spherical_index(
         final_full_refine=final_full_refine,
         ewald_refine=ewald_refine,
         search=search,
+        static_mask_file=static_mask_file,
         band_consistency=band_consistency,
         radial=radial,
         det_trans_bound=det_trans_bound,

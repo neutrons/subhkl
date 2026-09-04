@@ -2385,6 +2385,7 @@ def run_spherical_index(
     final_full_refine: bool = False,
     ewald_refine: bool = False,
     search: str = "lattice",
+    static_mask_file: str | None = None,
     band_consistency: bool = True,
     radial: int = 24,
 ):
@@ -2580,6 +2581,29 @@ def run_spherical_index(
     ki_hat = ki / np.linalg.norm(ki)
     if images_filename is not None:
         images, bank_ids, run_of_image = _read_merged_images(images_filename)
+        static_valid = None
+        if static_mask_file is not None:
+            # The classic stages all take this mask and the raw path did not,
+            # which is how cg4d-l1-mbl came to index on detector structure:
+            # its 5 sigma bins repeat between runs at 22-36x the chance rate
+            # (fixed features, not scattering) and 62% of them sit on pixels
+            # this mask already calls bad.  Carried as a validity stack, not
+            # folded into the counts: zeroing a masked pixel would make it a
+            # "dead" pixel to the zero-fraction test, and 15% of the panel
+            # zeroed flips the dense regime into the sparse one, whose
+            # background is then meaningless (measured: 2947 -> 41995 spots).
+            from subhkl.search.static_mask import load_mask_for_banks
+
+            static_valid = (
+                load_mask_for_banks(
+                    static_mask_file, [int(b) for b in bank_ids], images.shape[1:]
+                )
+                > 0
+            )
+            print(
+                "spherical-index: static mask applied, "
+                f"{100.0 * (1.0 - static_valid.mean()):.1f}% of pixels masked"
+            )
         _mark("read")
         if runs is not None:
             # the --runs restriction applies to the frames too: without it,
@@ -2634,9 +2658,12 @@ def run_spherical_index(
             if det is None:
                 continue
             im = images[i_img].astype(float)
+            vd = None if static_valid is None else static_valid[i_img]
             n2, m2 = (im.shape[0] // b2) * b2, (im.shape[1] // b2) * b2
             y = im[:n2, :m2].reshape(n2 // b2, b2, m2 // b2, b2).sum(axis=(1, 3))
-            zero_frac = float(np.mean(im == 0))
+            zero_frac = float(
+                np.mean(im == 0) if vd is None else np.mean(im[vd] == 0)
+            )
             if zero_frac >= 0.05:
                 # sparse regime: zeros are Poisson draws of the background
                 # and their fraction estimates it (P(0) = e^-mu)
@@ -2663,6 +2690,10 @@ def run_spherical_index(
 
                 blk = im[:n2, :m2].reshape(n2 // b2, b2, m2 // b2, b2)
                 live = (blk > 0).all(axis=(1, 3))
+                if vd is not None:
+                    live &= vd[:n2, :m2].reshape(
+                        n2 // b2, b2, m2 // b2, b2
+                    ).all(axis=(1, 3))
                 bg = generic_filter(
                     np.where(live, y, np.nan), np.nanmedian, size=9, mode="nearest"
                 )
