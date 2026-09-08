@@ -90,6 +90,26 @@ subhkl will be available for import inside of Python in the container.
 
 ## Workflow example (without normalization, for now)
 
+### Draft count-based solve
+
+`solve` replaces the experimental `calibrate` and `spherical-index` CLI
+commands with one count likelihood for orientation support and detector
+geometry. It uses every valid count bin, including zeros, without a spot
+detection threshold:
+
+```bash
+python -m subhkl.io.parser solve pooled.h5 solution.h5 \
+  --metadata setting.h5 --d-min 3.2 --penalty 1.2
+```
+
+The current draft handles flat panels, beam +z, a known cell/wavelength band,
+and one still or frames pooled at a single goniometer setting. It is not a
+replacement for the old command's multi-setting/goniometer-refinement modes.
+See [the solve workflow and migration guide](docs/solve.md) for input/output
+contracts, measured profile priors, limitations, and validation.
+
+### Existing finder-based example
+
 You will need to get the raw mesolite IMAGINE images from GitLab.
 Assume that they are stored in the folder `mesolite_202405`.
 

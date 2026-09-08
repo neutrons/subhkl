@@ -7,7 +7,6 @@ import h5py
 import typer
 
 from subhkl.commands import (
-    run_calibrate,
     run_finder,
     run_finder_visualize,
     run_index,
@@ -20,7 +19,6 @@ from subhkl.commands import (
     run_peak_predictor,
     run_rbf_integrator,
     run_reduce,
-    run_spherical_index,
     run_static_mask,
     run_sum_images,
 )
@@ -28,6 +26,138 @@ from subhkl.utils.devices import restrict_to_first_device
 from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
 
 app = typer.Typer()
+
+
+@app.command()
+def solve(
+    frames_filename: Annotated[
+        str,
+        typer.Argument(
+            help="One still or one-setting pooled HDF5 counts (images + bank_ids)"
+        ),
+    ],
+    output_filename: Annotated[
+        str, typer.Argument(help="Joint orientation/geometry result HDF5")
+    ],
+    metadata: Annotated[
+        str | None, typer.Option(help="Cell, instrument and setting metadata HDF5")
+    ] = None,
+    instrument: Annotated[
+        str | None, typer.Option(help="Instrument name; defaults to metadata")
+    ] = None,
+    cell: Annotated[
+        str | None, typer.Option(help="a,b,c,alpha,beta,gamma in Angstrom/degrees")
+    ] = None,
+    space_group: Annotated[str | None, typer.Option(help="Space group symbol")] = None,
+    wavelength_min: Annotated[
+        float | None, typer.Option(help="Lower wavelength in Angstrom")
+    ] = None,
+    wavelength_max: Annotated[
+        float | None, typer.Option(help="Upper wavelength in Angstrom")
+    ] = None,
+    d_min: Annotated[
+        float, typer.Option(min=0.0001, help="Reflection resolution in Angstrom")
+    ] = 3.2,
+    binning: Annotated[int, typer.Option(min=1, help="Sum count pixels into bins")] = 8,
+    proposal_binning: Annotated[
+        int,
+        typer.Option(min=1, help="Spatial binning for global orientation proposals"),
+    ] = 32,
+    n_candidates: Annotated[
+        int,
+        typer.Option(
+            min=1, help="Maximum distinct proposed orientations in the sparse fit"
+        ),
+    ] = 4,
+    penalty: Annotated[
+        float,
+        typer.Option(
+            min=0.0,
+            help="Group regularization across orientations; no spot detection threshold",
+        ),
+    ] = 1.2,
+    sigma_px: Annotated[
+        float,
+        typer.Option(min=0.0001, help="Profile sigma in original detector pixels"),
+    ] = 6.0,
+    max_evals: Annotated[
+        int, typer.Option(min=1, help="Joint refinement evaluation budget")
+    ] = 1500,
+    bootstrap: Annotated[
+        str | None,
+        typer.Option(
+            help="Previous solve, or HDF5 orientations (N,3,3) in lab coordinates"
+        ),
+    ] = None,
+    profile_file: Annotated[
+        str | None,
+        typer.Option(help="Measured shape prior HDF5 with profile/u and profile/f"),
+    ] = None,
+    background_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Positive expected-count images plus bank_ids; panel scales are fitted"
+        ),
+    ] = None,
+    static_mask_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Instrument validity mask; all remaining count bins are retained"
+        ),
+    ] = None,
+    fixed_geometry: Annotated[
+        bool,
+        typer.Option(
+            help="Fit orientations/intensities while holding detector geometry fixed"
+        ),
+    ] = False,
+    refine: Annotated[
+        bool,
+        typer.Option(
+            "--refine/--no-refine",
+            help="Jointly refine orientations and geometry after support fitting",
+        ),
+    ] = True,
+):
+    """Solve orientation support and detector geometry from counts together.
+
+    Replaces calibrate and spherical-index. Draft scope: flat panels, beam +z,
+    known cell/band, one goniometer setting. All valid count bins contribute.
+    """
+    from subhkl.solve import run_solve
+
+    try:
+        values = [float(v.strip()) for v in cell.split(",")] if cell else None
+        result = run_solve(
+            frames_filename,
+            output_filename,
+            metadata=metadata,
+            instrument=instrument,
+            cell=values,
+            space_group=space_group,
+            wavelength_min=wavelength_min,
+            wavelength_max=wavelength_max,
+            d_min=d_min,
+            binning=binning,
+            proposal_binning=proposal_binning,
+            n_candidates=n_candidates,
+            penalty=penalty,
+            sigma_px=sigma_px,
+            max_evals=max_evals,
+            bootstrap=bootstrap,
+            profile_file=profile_file,
+            background_file=background_file,
+            static_mask_file=static_mask_file,
+            fixed_geometry=fixed_geometry,
+            do_refine=refine,
+        )
+    except (ValueError, KeyError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except RuntimeError as exc:
+        typer.echo(f"solve failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if result["status"] != "converged":
+        raise typer.Exit(1)
 
 
 def apply_detector_calibration(hdf5_filename: str, instrument: str):
@@ -61,9 +191,6 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
                     count += 1
             if count > 0:
                 print(f"Successfully applied calibration to {count} detector panels.")
-
-
-app = typer.Typer()
 
 
 @app.command()
@@ -1267,121 +1394,6 @@ def static_mask(
 
 
 @app.command()
-def calibrate(
-    frames_filename: Annotated[
-        str,
-        typer.Argument(
-            help="Reduced, summed or merged HDF5 stack (images + bank_ids).  Pool "
-            "the frames of one orientation first (`sum-images`): a single "
-            "still has too few spots above the detection null."
-        ),
-    ],
-    output_filename: Annotated[
-        str,
-        typer.Argument(
-            help="Calibration HDF5 to write: a bootstrap-compatible "
-            "detector_calibration group plus a calibrate/ report.  Pass it to "
-            "spherical-index (or any consumer of apply_detector_calibration)."
-        ),
-    ],
-    instrument: Annotated[
-        str | None,
-        typer.Option(help="Instrument name; defaults to the frames file's attribute."),
-    ] = None,
-    cell: Annotated[
-        str | None,
-        typer.Option(
-            help="Unit cell a,b,c,alpha,beta,gamma (A, deg); defaults to the "
-            "frames file's sample/* group when present."
-        ),
-    ] = None,
-    space_group: Annotated[
-        str | None,
-        typer.Option(
-            help="Space group symbol, e.g. 'P 21'; defaults to sample/space_group."
-        ),
-    ] = None,
-    d_min: Annotated[
-        float, typer.Option(help="Resolution limit of the predicted reflections (A).")
-    ] = 3.2,
-    wavelength_min: Annotated[
-        float | None, typer.Option(help="Override the band's lower edge (A).")
-    ] = None,
-    wavelength_max: Annotated[
-        float | None, typer.Option(help="Override the band's upper edge (A).")
-    ] = None,
-    static_mask_file: Annotated[
-        str | None,
-        typer.Option(help="Static mask (`static-mask` output), carried as validity."),
-    ] = None,
-    background_from: Annotated[
-        str | None,
-        typer.Option(
-            help="A pooled stack of the same setting whose local background is "
-            "scaled per bank to this file's exposure (for a single still)."
-        ),
-    ] = None,
-    quick: Annotated[
-        bool,
-        typer.Option(help="Three shorter stages instead of the four default ones."),
-    ] = False,
-    evals_scale: Annotated[
-        float, typer.Option(help="Multiply every stage's evaluation budget.")
-    ] = 1.0,
-    bin_px: Annotated[
-        int, typer.Option(help="Pixel binning of the residual maps.")
-    ] = 4,
-    seed: Annotated[
-        int, typer.Option(help="Seed for the dictionary's random orientations.")
-    ] = 0,
-    objective: Annotated[
-        str,
-        typer.Option(
-            help="Stage objective: 'cell' (matched-filter correlation of the "
-            "orientation dictionary, default), 'band' (the orientation search's "
-            "own score; free, but coarser) or 'raw' (fraction of detections "
-            "explained)."
-        ),
-    ] = "cell",
-):
-    """Calibrate the detector geometry from raw counts, without a finder.
-
-    Aligns the detector assembly -- radial scale, rotation and sample
-    offset, jointly -- so that a blind orientation search under it explains
-    the most of the raw detections.  The data enter as a sparse detection
-    map (per sphere cell the thresholded maximum of a profiled Poisson
-    log-likelihood ratio); the orientation search runs blind on it and the
-    found orientation's matched-filter correlation with the map (crystal
-    orientations as dictionary atoms, centered to remove the coverage
-    component) is climbed coarse to fine in sphere resolution.  Output is
-    the same detector_calibration group the spherical indexer's bootstrap
-    writes, so downstream commands pick it up unchanged.
-    """
-    cell_values = None
-    if cell:
-        cell_values = [float(v) for v in cell.replace(";", ",").split(",") if v.strip()]
-        if len(cell_values) != 6:
-            raise typer.BadParameter("--cell needs six values: a,b,c,alpha,beta,gamma")
-    run_calibrate(
-        frames_filename=frames_filename,
-        output_filename=output_filename,
-        instrument=instrument,
-        cell=cell_values,
-        space_group=space_group,
-        d_min=d_min,
-        wavelength_min=wavelength_min,
-        wavelength_max=wavelength_max,
-        static_mask_file=static_mask_file,
-        background_from=background_from,
-        quick=quick,
-        evals_scale=evals_scale,
-        bin_px=bin_px,
-        seed=seed,
-        objective=objective,
-    )
-
-
-@app.command()
 def sum_images(
     output_filename: Annotated[str, typer.Argument(help="Summed HDF5 to write")],
     input_filenames: Annotated[
@@ -1435,465 +1447,6 @@ def mask_visualize(
         dpi=dpi,
         max_workers=max_workers,
         show_progress=show_progress,
-    )
-
-
-@app.command()
-def spherical_index(
-    peaks_h5_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
-    output_filename: Annotated[str, typer.Argument(help="Bootstrap HDF5 to write")],
-    d_min: Annotated[
-        float,
-        typer.Option(
-            "--d-min", help="Resolution cut for the model direction set [Angstrom]"
-        ),
-    ] = 1.5,
-    kernel_deg: Annotated[
-        float,
-        typer.Option(
-            "--kernel-deg", help="Angular kernel FWHM [deg] (mosaic + measurement)"
-        ),
-    ] = 1.0,
-    n_candidates: Annotated[
-        int,
-        typer.Option(
-            "--n-candidates",
-            help="Orientation candidates to keep (multi-crystal capable).  On "
-            "the lattice path this is the depth of the distinct-basin "
-            "shortlist the geometry co-refinement re-ranks; a nominal "
-            "geometry that is off by a degree needs ~32 (cg4d-l1-mbl).",
-        ),
-    ] = 4,
-    refine: Annotated[
-        bool,
-        typer.Option(
-            "--refine/--no-refine", help="Polish with the matching-free refinement"
-        ),
-    ] = True,
-    refine_cell: Annotated[
-        bool,
-        typer.Option(
-            "--refine-cell",
-            help="Also refine the cell SHAPE (scale is structurally invisible to directions and stays nominal)",
-        ),
-    ] = False,
-    model: Annotated[
-        str,
-        typer.Option(
-            "--model",
-            help=(
-                "Dictionary for the search and the refinements: 'nodal' (crossings "
-                "of the zone-axis great circles, weighted by pair multiplicity; "
-                "small, low-coherence), 'reflections' (every reflection "
-                "direction at d_min) or 'auto' (reflections when the 3D radial "
-                "search is on, nodal otherwise)"
-            ),
-        ),
-    ] = "auto",
-    nodal_max_index: Annotated[
-        int,
-        typer.Option("--nodal-max-index", help="Zone-axis cut |uvw| for --model nodal"),
-    ] = 3,
-    band_consistency: Annotated[
-        bool,
-        typer.Option(
-            "--band-consistency/--no-band-consistency",
-            help=(
-                "Match each spot only against directions that could have produced "
-                "it at some wavelength in the instrument band (needs "
-                "instrument/wavelength in the peaks file)"
-            ),
-        ),
-    ] = True,
-    radial: Annotated[
-        int,
-        typer.Option(
-            "--radial",
-            help=(
-                "3D search with this many radial channels on the resolution ball "
-                "(data as Laue segments, model as shells at |G|); 0 falls back to "
-                "the 2D spherical search with band consistency"
-            ),
-        ),
-    ] = 24,
-    search: Annotated[
-        str,
-        typer.Option(
-            "--search",
-            help=(
-                "'lattice' (default: the direct-lattice ladder -- spots against "
-                "the zone great circles of the shortest direct-lattice vectors, "
-                "coarse to fine, no band limit, then the exact Ewald stage in "
-                "raw-count mode) or 'correlogram' (band-limited SO(3) correlation)"
-            ),
-        ),
-    ] = "lattice",
-    static_mask_file: Annotated[
-        str | None,
-        typer.Option(
-            "--static-mask-file",
-            help="Static-structure mask built by `static-mask`, mapped onto "
-            "the raw frames by bank id.  Raw-count mode only: masked pixels "
-            "are dropped before the background and the spot detection, the "
-            "same mask the finder and integrator already take.",
-        ),
-    ] = None,
-    ewald_refine: Annotated[
-        bool,
-        typer.Option(
-            "--ewald-refine",
-            help=(
-                "Raw-count mode: rank the correlogram's candidates and polish "
-                "the winner on the exact Ewald objective (predicted in-band "
-                "spots against the excess image, no band limit)"
-            ),
-        ),
-    ] = False,
-    final_full_refine: Annotated[
-        bool,
-        typer.Option(
-            "--final-full-refine",
-            help=(
-                "Optional last stage on the full reflection list after the nodal "
-                "solve: the instrument refinement (or, without it, one more "
-                "orientation/cell pass) sees every reflection at d_min"
-            ),
-        ),
-    ] = False,
-    lam: Annotated[
-        float,
-        typer.Option("--lam", help="L1 penalty on the candidates' sparse weights"),
-    ] = 0.0,
-    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
-    ki_vec: Annotated[
-        str | None, typer.Option("--ki-vec", help="Incident beam vector, e.g. '0,0,1'")
-    ] = None,
-    images: Annotated[
-        str | None,
-        typer.Option(
-            "--images",
-            help="Merged images HDF5: index from RAW COUNTS instead of the found peaks (every pixel votes with its excess counts; the peaks file still supplies instrument, cell and goniometer metadata)",
-        ),
-    ] = None,
-    binning: Annotated[
-        int,
-        typer.Option(
-            "--binning",
-            help="Pixel binning before the raw-count projection (direction changes across a bin are far below the kernel width; cost drops by binning^2)",
-        ),
-    ] = 4,
-    runs: Annotated[
-        str | None,
-        typer.Option(
-            "--runs",
-            help="Comma-separated run indices to index (e.g. '0'): a single run has one goniometer setting, so a per-run solve is immune to goniometer-offset errors, and per-run orientations are the observable an offset calibration wants",
-        ),
-    ] = None,
-    bandwidth: Annotated[
-        int | None,
-        typer.Option(
-            "--bandwidth",
-            help="Spherical-harmonic bandwidth L (default: auto, capped at "
-            "96).  The cap is a cost ceiling, not a precision floor -- "
-            "refinement locates the correlation peak far below the "
-            "bandwidth (measured: < 0.02 deg change from L = 96 to 192 on "
-            "MANDI garnet raw data) -- but dense models (large cells) need "
-            "L above pi/spacing for basin separation.  Correlogram cost "
-            "scales as L^4, projection as L^2.",
-        ),
-    ] = None,
-    refine_instrument: Annotated[
-        bool,
-        typer.Option(
-            "--refine-instrument",
-            help="Jointly refine per-bank detector placement (translation + "
-            "tilt) and any --refine-gonio-axes offsets against the "
-            "matching-free likelihood -- no peak assignment anywhere.  Raw "
-            "mode feeds the strongest binned pixels as weighted peaks.",
-        ),
-    ] = False,
-    refine_gonio_axes: Annotated[
-        str | None,
-        typer.Option(
-            "--refine-gonio-axes",
-            help="Comma-separated goniometer axis names (short names accepted, "
-            "e.g. 'omega,chi') whose zero offsets are refined / fitted.  An "
-            "axis whose inner angles never vary across runs is pure gauge "
-            "with the crystal orientation and is reported as such.",
-        ),
-    ] = None,
-    fit_gonio_offsets: Annotated[
-        bool,
-        typer.Option(
-            "--fit-gonio-offsets",
-            help="Fit the --refine-gonio-axes offsets from per-run "
-            "orientations: each run indexed at its own gauge (immune to the "
-            "offsets), then one least squares over the per-run U's -- the "
-            "assignment-free analogue of the classic per-run DPHI "
-            "corrections.  Validated on MANDI garnet: recovers the "
-            "production pipeline's refined omega to 0.08 deg.",
-        ),
-    ] = False,
-    detector_modes: Annotated[
-        str | None,
-        typer.Option(
-            "--detector-modes",
-            help="Comma-separated detector refinement modes, the same chain "
-            "the classic indexer refines (shared implementation: "
-            "subhkl.instrument.refinables): independent, radial, "
-            "cylindrical, area, axial_stretch, global_rot, global_rot_axis, "
-            "global_trans.  Default: independent.",
-        ),
-    ] = None,
-    refine_detector_banks: Annotated[
-        str | None,
-        typer.Option(
-            "--refine-detector-banks",
-            help="Comma-separated bank IDs whose independent parameters are "
-            "refined; other banks stay at nominal (global modes always "
-            "apply to all banks).",
-        ),
-    ] = None,
-    det_trans_bound: Annotated[
-        float, typer.Option("--det-trans-bound", help="Bank translation bound [m]")
-    ] = 0.005,
-    det_rot_bound_deg: Annotated[
-        float, typer.Option("--det-rot-bound-deg", help="Bank tilt bound [deg]")
-    ] = 0.5,
-    gonio_bound_deg: Annotated[
-        float, typer.Option("--gonio-bound-deg", help="Goniometer offset bound [deg]")
-    ] = 5.0,
-    refine_maxiter: Annotated[
-        int,
-        typer.Option(
-            "--refine-maxiter", help="Adam steps of the instrument refinement"
-        ),
-    ] = 400,
-    refine_max_points: Annotated[
-        int,
-        typer.Option(
-            "--refine-max-points",
-            help="Raw mode: strongest binned pixels fed to the instrument refinement",
-        ),
-    ] = 100_000,
-    det_radial_bound_frac: Annotated[
-        float,
-        typer.Option(
-            "--det-radial-bound-frac",
-            help="radial/cylindrical/axial_stretch scale bound [fraction]",
-        ),
-    ] = 0.05,
-    det_area_bound_frac: Annotated[
-        float, typer.Option("--det-area-bound-frac", help="area scale bound [fraction]")
-    ] = 0.05,
-    det_global_rot_bound_deg: Annotated[
-        float,
-        typer.Option("--det-global-rot-bound-deg", help="global rotation bound [deg]"),
-    ] = 2.0,
-    det_global_trans_bound: Annotated[
-        float,
-        typer.Option("--det-global-trans-bound", help="global translation bound [m]"),
-    ] = 0.01,
-    det_global_rot_axis: Annotated[
-        str | None,
-        typer.Option(
-            "--det-global-rot-axis", help="Axis for global_rot_axis mode, e.g. '0,1,0'"
-        ),
-    ] = None,
-    cylinder_axis: Annotated[
-        str | None,
-        typer.Option(
-            "--cylinder-axis",
-            help="Axis for cylindrical/axial_stretch modes, e.g. '0,1,0'",
-        ),
-    ] = None,
-    refine_gonio_axis_vector: Annotated[
-        str | None,
-        typer.Option(
-            "--refine-gonio-axis-vector",
-            help="Comma-separated axis names whose DIRECTION is refined "
-            "(two tilt angles each about a basis perpendicular to the "
-            "nominal axis) -- identifiable when that axis's own angle "
-            "varies over a wide arc.",
-        ),
-    ] = None,
-    gonio_axis_vector_bound_deg: Annotated[
-        float,
-        typer.Option("--gonio-axis-vector-bound-deg", help="Axis tilt bound [deg]"),
-    ] = 1.0,
-    refine_gonio_per_run: Annotated[
-        str | None,
-        typer.Option(
-            "--refine-gonio-per-run",
-            help="Motor name refined by one bounded angle correction per "
-            "run -- the literal per-run DPHI; the constant part is that "
-            "motor's zero offset and inherits its gauge status.",
-        ),
-    ] = None,
-    gonio_per_run_bound_deg: Annotated[
-        float,
-        typer.Option(
-            "--gonio-per-run-bound-deg", help="Per-run correction bound [deg]"
-        ),
-    ] = 1.0,
-    refine_gonio_harmonics: Annotated[
-        str | None,
-        typer.Option(
-            "--refine-gonio-harmonics",
-            help="Motor name whose per-run correction is constrained to a "
-            "Fourier series in its own nominal angle (orders from "
-            "--gonio-harmonics-orders).",
-        ),
-    ] = None,
-    gonio_harmonics_orders: Annotated[
-        str | None,
-        typer.Option(
-            "--gonio-harmonics-orders",
-            help="Comma-separated Fourier orders, default '1'",
-        ),
-    ] = None,
-    gonio_harmonics_bound_deg: Annotated[
-        float,
-        typer.Option(
-            "--gonio-harmonics-bound-deg", help="Harmonic coefficient bound [deg]"
-        ),
-    ] = 0.5,
-    refine_beam: Annotated[
-        bool,
-        typer.Option(
-            "--refine-beam",
-            help="Refine the incident beam direction (two transverse tilts)",
-        ),
-    ] = False,
-    beam_bound_deg: Annotated[
-        float, typer.Option("--beam-bound-deg", help="Beam tilt bound [deg]")
-    ] = 1.0,
-    refine_sample: Annotated[
-        bool, typer.Option("--refine-sample", help="Refine a global sample offset [m]")
-    ] = False,
-    sample_bound_m: Annotated[
-        float, typer.Option("--sample-bound-m", help="Sample offset bound [m]")
-    ] = 0.005,
-    refine_gonio_per_run_trans: Annotated[
-        bool,
-        typer.Option(
-            "--refine-gonio-per-run-trans",
-            help="Refine a bounded per-run sample translation (parallax observable)",
-        ),
-    ] = False,
-    gonio_per_run_trans_bound_m: Annotated[
-        float,
-        typer.Option(
-            "--gonio-per-run-trans-bound-m", help="Per-run translation bound [m]"
-        ),
-    ] = 0.005,
-    frame_table: Annotated[
-        str | None,
-        typer.Option(
-            "--frame-table",
-            help="File carrying goniometer/angles per FRAME plus "
-            "file_offsets (a merged image stack's metadata).  Refined "
-            "per-run angle corrections are folded into those frames, which "
-            "is where the predictor and the integrator read them; --images "
-            "already supplies it.",
-        ),
-    ] = None,
-):
-    """
-    Index by spherical correlation over SO(3) -- global across all panels
-    and runs at once, multi-crystal capable, seconds on a CPU.
-
-    Each spot fixes only the direction of Q (the Laue collapse), so peaks
-    from every bank pool onto the unit sphere and the crystal orientation
-    is the rotation aligning them with the cell's reflection directions --
-    found as the peak of a bandlimited spherical cross-correlation, then
-    polished by matching-free refinement (no peak assignment; the kernel
-    overlap is the soft assignment).  Writes a bootstrap file the classic
-    indexer accepts via --bootstrap, and that indexer-visualize can draw
-    zone overlays from directly.
-    """
-    # same single-device contract as finder/indexer: the refinement uses
-    # jax, and without an explicit opt-in it must not claim every GPU.
-    restrict_to_first_device()
-    run_spherical_index(
-        peaks_h5_filename=peaks_h5_filename,
-        output_filename=output_filename,
-        d_min=d_min,
-        kernel_deg=kernel_deg,
-        n_candidates=n_candidates,
-        refine=refine,
-        refine_cell=refine_cell,
-        lam=lam,
-        instrument_name=instrument,
-        ki_vec=[float(x.strip()) for x in ki_vec.split(",")] if ki_vec else None,
-        images_filename=images,
-        binning=binning,
-        runs=[int(x.strip()) for x in runs.split(",")] if runs else None,
-        bandwidth=bandwidth,
-        refine_instrument=refine_instrument,
-        refine_gonio_axes=(
-            [x.strip() for x in refine_gonio_axes.split(",")]
-            if refine_gonio_axes
-            else None
-        ),
-        fit_gonio_offsets=fit_gonio_offsets,
-        model=model,
-        nodal_max_index=nodal_max_index,
-        final_full_refine=final_full_refine,
-        ewald_refine=ewald_refine,
-        search=search,
-        static_mask_file=static_mask_file,
-        band_consistency=band_consistency,
-        radial=radial,
-        det_trans_bound=det_trans_bound,
-        det_rot_bound_deg=det_rot_bound_deg,
-        gonio_bound_deg=gonio_bound_deg,
-        refine_maxiter=refine_maxiter,
-        refine_max_points=refine_max_points,
-        detector_modes=(
-            [x.strip() for x in detector_modes.split(",")] if detector_modes else None
-        ),
-        refine_detector_banks=(
-            [int(x.strip()) for x in refine_detector_banks.split(",")]
-            if refine_detector_banks
-            else None
-        ),
-        det_radial_bound_frac=det_radial_bound_frac,
-        det_area_bound_frac=det_area_bound_frac,
-        det_global_rot_bound_deg=det_global_rot_bound_deg,
-        det_global_trans_bound=det_global_trans_bound,
-        det_global_rot_axis=(
-            [float(x.strip()) for x in det_global_rot_axis.split(",")]
-            if det_global_rot_axis
-            else None
-        ),
-        cylinder_axis=(
-            [float(x.strip()) for x in cylinder_axis.split(",")]
-            if cylinder_axis
-            else None
-        ),
-        refine_gonio_axis_vector=(
-            [x.strip() for x in refine_gonio_axis_vector.split(",")]
-            if refine_gonio_axis_vector
-            else None
-        ),
-        gonio_axis_vector_bound_deg=gonio_axis_vector_bound_deg,
-        refine_gonio_per_run=refine_gonio_per_run,
-        gonio_per_run_bound_deg=gonio_per_run_bound_deg,
-        refine_gonio_harmonics=refine_gonio_harmonics,
-        gonio_harmonics_orders=(
-            [int(x.strip()) for x in gonio_harmonics_orders.split(",")]
-            if gonio_harmonics_orders
-            else None
-        ),
-        gonio_harmonics_bound_deg=gonio_harmonics_bound_deg,
-        refine_beam=refine_beam,
-        beam_bound_deg=beam_bound_deg,
-        refine_sample=refine_sample,
-        sample_bound_m=sample_bound_m,
-        refine_gonio_per_run_trans=refine_gonio_per_run_trans,
-        gonio_per_run_trans_bound_m=gonio_per_run_trans_bound_m,
-        frame_table_filename=frame_table,
     )
 
 

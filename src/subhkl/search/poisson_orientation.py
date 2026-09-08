@@ -96,13 +96,24 @@ def geometry_vector(g):
 
 class OrientationModel:
     def __init__(
-        self, data, instrument, cell, space_group, wavelength, d_min, sigma_px=4.0
+        self,
+        data,
+        instrument,
+        cell,
+        space_group,
+        wavelength,
+        d_min,
+        sigma_px=4.0,
+        profile=None,
+        detectors=None,
     ):
         if sigma_px <= 0 or not 0 < wavelength[0] < wavelength[1]:
             raise ValueError("positive PSF width and ordered positive band required")
         self.data, self.instrument = data, instrument
         self.wavelength = wavelength
+        self.d_min = float(d_min)
         self.sigma_px = float(sigma_px)
+        self.profile, self.base_detectors = profile, detectors
         self.B, self.G = reciprocal_lattice(cell, space_group, d_min)
         self.n_hkl = len(self.G)
         self.banks = list(data.pixel_indices)
@@ -114,9 +125,10 @@ class OrientationModel:
         Invisible reflections retain zero columns, preserving intensity IDs
         as the geometry and orientations change. Masked flux is not renormalized.
         """
-        dets = geometry_detectors(self.instrument, geometry_vector(g), self.banks)
+        dets = self.detectors(g)
         rows, cols, values = [], [], []
         sig = self.sigma_px / self.data.bin_px
+        support = 5.0 if self.profile is None else self.profile.u[-1]
         for j, U in enumerate(orientations):
             q = self.G @ np.asarray(U).T
             lam = -2 * q[:, 2] / np.sum(q * q, axis=1)
@@ -138,24 +150,28 @@ class OrientationModel:
                 h, w = self.data.shapes[bank]
                 keep = forward & np.isfinite(rr) & np.isfinite(cc)
                 keep &= (
-                    (rr > -5 * sig)
-                    & (rr < h + 5 * sig)
-                    & (cc > -5 * sig)
-                    & (cc < w + 5 * sig)
+                    (rr > -support * sig)
+                    & (rr < h + support * sig)
+                    & (cc > -support * sig)
+                    & (cc < w + support * sig)
                 )
                 for k in np.flatnonzero(keep):
                     r = np.arange(
-                        max(0, int(np.floor(rr[k] - 5 * sig))),
-                        min(h, int(np.ceil(rr[k] + 5 * sig))),
+                        max(0, int(np.floor(rr[k] - support * sig))),
+                        min(h, int(np.ceil(rr[k] + support * sig))),
                     )
                     c = np.arange(
-                        max(0, int(np.floor(cc[k] - 5 * sig))),
-                        min(w, int(np.ceil(cc[k] + 5 * sig))),
+                        max(0, int(np.floor(cc[k] - support * sig))),
+                        min(w, int(np.ceil(cc[k] + support * sig))),
                     )
                     vr = ndtr((r + 1 - rr[k]) / sig) - ndtr((r - rr[k]) / sig)
                     vc = ndtr((c + 1 - cc[k]) / sig) - ndtr((c - cc[k]) / sig)
                     ix = self.data.pixel_indices[bank][r[:, None], c[None, :]].ravel()
-                    v = np.outer(vr, vc).ravel()
+                    v = (
+                        np.outer(vr, vc)
+                        if self.profile is None
+                        else self.profile.integrate_bins(r, c, rr[k], cc[k], sig)
+                    ).ravel()
                     valid = ix >= 0
                     rows.extend(ix[valid])
                     cols.extend(np.full(valid.sum(), j * self.n_hkl + hk[k]))
@@ -164,6 +180,21 @@ class OrientationModel:
             (values, (rows, cols)),
             shape=(len(self.data.counts), len(orientations) * self.n_hkl),
         )
+
+    def detectors(self, g):
+        if self.base_detectors is None:
+            return geometry_detectors(self.instrument, geometry_vector(g), self.banks)
+        from subhkl.instrument.detector import Detector
+
+        g7 = geometry_vector(g)
+        rotation = Rotation.from_rotvec(g7[1:4]).as_matrix()
+        out = {}
+        for bank, det in self.base_detectors.items():
+            cfg = dict(det.config)
+            cfg["center"] = rotation @ ((1 + g7[0]) * det.center) + g7[4:]
+            cfg["uhat"], cfg["vhat"] = rotation @ det.uhat, rotation @ det.vhat
+            out[bank] = Detector(cfg)
+        return out
 
 
 @dataclass
@@ -176,6 +207,13 @@ class SparseFit:
     iterations: int
     kkt: float
     converged: bool
+    weights: np.ndarray
+
+
+def orientation_weights(A, data, n_groups):
+    """One construction of the geometry-frozen group weights for both stages."""
+    fisher = np.sqrt(np.asarray(A.power(2).T @ (1 / data.background)).ravel())
+    return np.sqrt((fisher.reshape(n_groups, -1) > 1e-12).sum(axis=1))
 
 
 def fit_intensities(
@@ -207,7 +245,7 @@ def fit_intensities(
     )
     M = sparse.hstack([F, B], format="csc")
     if weights is None:
-        weights = np.sqrt((fisher.reshape(n_groups, size) > 1e-12).sum(axis=1))
+        weights = orientation_weights(A, data, n_groups)
     weights = np.asarray(weights, float)
     if weights.shape != (n_groups,) or np.any(weights < 0):
         raise ValueError("one nonnegative weight per orientation required")
@@ -280,6 +318,7 @@ def fit_intensities(
         iteration,
         kkt,
         kkt < tol,
+        weights.copy(),
     )
 
 
@@ -290,6 +329,7 @@ def refine(
     g0=None,
     max_evals=250,
     refine_orientations=True,
+    refine_geometry=True,
     log=None,
 ):
     """Profile the same objective over a local geometry/orientation search.
@@ -302,9 +342,7 @@ def refine(
     orientations = np.asarray(orientations, float)
     n = len(orientations)
     A0 = model.design(orientations, g0)
-    weights = np.sqrt(
-        (np.asarray(A0.power(2).sum(axis=0)).reshape(n, -1) > 1e-20).sum(axis=1)
-    )
+    weights = orientation_weights(A0, model.data, n)
     units = np.array([0.03, 0.02, 0.02, 0.005, 0.005, 0.005])
     extra = 3 * n if refine_orientations else 0
     x0 = np.r_[g0 / units, np.zeros(extra)]
@@ -317,6 +355,8 @@ def refine(
         )
         + [(-3.0, 3.0)] * extra
     )
+    if not refine_geometry:
+        bounds[:6] = [(v, v) for v in x0[:6]]
     best = {"value": np.inf}
 
     def evaluate(x):
