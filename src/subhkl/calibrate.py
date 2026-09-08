@@ -31,8 +31,9 @@ geometry parameters jointly, coarse to fine:
   and the ridge is only resolved by finer cells (0.5, then 0.25 deg).
 * ``raw``: the fraction of raw detections within an angular tolerance of a
   predicted reflection -- the indexing criterion itself with detections in
-  place of finder peaks, continuous in the geometry.  It takes the last step
-  the cell correlation cannot see (sub-cell tilt and offset).
+  place of finder peaks, continuous in the geometry.  Reported always; as a
+  final stage it adds nothing over a fourth cell rung at equal budget, so
+  the default ladder is cell rungs only.
 
 The objectives are invariant to a global rotation of the lattice, so the
 goniometer setting of the frames is irrelevant: the found orientation absorbs
@@ -41,8 +42,12 @@ tail of the detection statistic; on CG4D L1 MBL that means the frames of one
 orientation pooled (10x), not a single still.
 
 Measured on cg4d-l1-mbl (runs 1996-2014/2 pooled): nominal 24.8 % of the
-finder's peaks explained under a full orientation search, the four stages
-43.6 -> 64.4 -> 67.1 -> 73.2 %, the finder-based band-fit ceiling 86.6 %.
+finder's peaks explained under a full orientation search, the default ladder
+75.8 % (radial +5.9 %, tilt 1.55 deg, offset 10.5 mm; the finder-based
+band-fit ceiling is 86.6 % at +5.68 % / 1.88 deg / 11.0 mm).  With that
+geometry the spherical indexer solves all ten stills of the dataset to one
+orientation (cross-run agreement 0.15 deg) where the nominal geometry gives
+ten unrelated ones.
 """
 
 from __future__ import annotations
@@ -97,17 +102,22 @@ class Stage:
     width: float = 3.0
 
 
+# The resolution ladder alone.  At equal total budget (460 evaluations from
+# nominal on cg4d-l1-mbl) a fourth cell rung and the continuous ``raw`` stage
+# reach the same geometry (75.8 % of the finder's peaks explained under a
+# full orientation search, vs 24.8 % nominal) and the ladder is 40 % faster;
+# ``raw`` stays available as a stage objective and is always reported.
 DEFAULT_STAGES = (
     Stage(1.0, "cell", 8.0, 2.0, 160),
     Stage(0.5, "cell", 8.0, 0.7, 100),
     Stage(0.25, "cell", 8.0, 0.7, 100),
-    Stage(0.25, "raw", 12.0, 0.4, 100),
+    Stage(0.25, "cell", 8.0, 0.4, 100),
 )
 
 QUICK_STAGES = (
     Stage(1.0, "cell", 8.0, 2.0, 60),
     Stage(0.5, "cell", 8.0, 0.7, 40),
-    Stage(0.25, "raw", 12.0, 0.4, 40),
+    Stage(0.25, "cell", 8.0, 0.7, 40),
 )
 
 
