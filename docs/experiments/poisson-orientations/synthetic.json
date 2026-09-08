@@ -1,0 +1,347 @@
+{
+  "support": [
+    {
+      "n_true": 0,
+      "brightness": 0.0,
+      "penalty": 0.8,
+      "active": [
+        3,
+        5
+      ],
+      "group_norms": [
+        0.0,
+        0.0,
+        0.0,
+        0.1003214572605534,
+        0.0,
+        0.5339598607245203
+      ],
+      "objective": 16477.689222592067,
+      "background_scale_error": 0.005088840638011627,
+      "iterations": 24,
+      "kkt": 6.560186012791652e-06,
+      "converged": true
+    },
+    {
+      "n_true": 0,
+      "brightness": 0.0,
+      "penalty": 1.2,
+      "active": [],
+      "group_norms": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 16478.01186262297,
+      "background_scale_error": 0.005098833356321997,
+      "iterations": 19,
+      "kkt": 7.556769043201481e-06,
+      "converged": true
+    },
+    {
+      "n_true": 0,
+      "brightness": 0.0,
+      "penalty": 2.0,
+      "active": [],
+      "group_norms": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 16478.01186262296,
+      "background_scale_error": 0.005098833356327326,
+      "iterations": 19,
+      "kkt": 7.557499531310079e-06,
+      "converged": true
+    },
+    {
+      "n_true": 1,
+      "brightness": 120.0,
+      "penalty": 0.8,
+      "active": [
+        0,
+        5
+      ],
+      "group_norms": [
+        41.974651938009224,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.6963492704959925
+      ],
+      "objective": 16633.04929865165,
+      "background_scale_error": 0.004143524997316184,
+      "iterations": 20,
+      "kkt": 5.33723489773785e-06,
+      "converged": true
+    },
+    {
+      "n_true": 1,
+      "brightness": 120.0,
+      "penalty": 1.2,
+      "active": [
+        0
+      ],
+      "group_norms": [
+        38.96556579037428,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 16717.44645228913,
+      "background_scale_error": 0.004033399259467441,
+      "iterations": 20,
+      "kkt": 6.601777002669729e-06,
+      "converged": true
+    },
+    {
+      "n_true": 1,
+      "brightness": 120.0,
+      "penalty": 2.0,
+      "active": [
+        0
+      ],
+      "group_norms": [
+        33.5795884938948,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 16867.950275725332,
+      "background_scale_error": 0.004245792112730795,
+      "iterations": 14,
+      "kkt": 8.800593141676212e-06,
+      "converged": true
+    },
+    {
+      "n_true": 2,
+      "brightness": 120.0,
+      "penalty": 0.8,
+      "active": [
+        0,
+        1
+      ],
+      "group_norms": [
+        42.85939824929017,
+        35.641276545873296,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 16822.702947811278,
+      "background_scale_error": 0.003998188438081418,
+      "iterations": 18,
+      "kkt": 7.398895816525163e-06,
+      "converged": true
+    },
+    {
+      "n_true": 2,
+      "brightness": 120.0,
+      "penalty": 1.2,
+      "active": [
+        0,
+        1
+      ],
+      "group_norms": [
+        39.69731379021557,
+        32.44778579042075,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 16982.99442346407,
+      "background_scale_error": 0.0041674280151132725,
+      "iterations": 24,
+      "kkt": 5.664338947395353e-06,
+      "converged": true
+    },
+    {
+      "n_true": 2,
+      "brightness": 120.0,
+      "penalty": 2.0,
+      "active": [
+        0,
+        1
+      ],
+      "group_norms": [
+        34.104253263213785,
+        26.71113960280914,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 17265.401937346327,
+      "background_scale_error": 0.004673953833390088,
+      "iterations": 18,
+      "kkt": 2.740964722079464e-06,
+      "converged": true
+    },
+    {
+      "n_true": 2,
+      "brightness": 35.0,
+      "penalty": 0.8,
+      "active": [
+        0,
+        1,
+        2,
+        5
+      ],
+      "group_norms": [
+        10.373766536204423,
+        8.690446925391207,
+        0.3144849117582366,
+        0.0,
+        0.0,
+        1.2372191775002037
+      ],
+      "objective": 16609.102462715127,
+      "background_scale_error": 0.005174573445277941,
+      "iterations": 18,
+      "kkt": 4.757830508053353e-06,
+      "converged": true
+    },
+    {
+      "n_true": 2,
+      "brightness": 35.0,
+      "penalty": 1.2,
+      "active": [
+        0,
+        1
+      ],
+      "group_norms": [
+        8.480867758604745,
+        6.443032481874404,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 16646.27232423082,
+      "background_scale_error": 0.005603353278410772,
+      "iterations": 17,
+      "kkt": 4.912409436025154e-06,
+      "converged": true
+    },
+    {
+      "n_true": 2,
+      "brightness": 35.0,
+      "penalty": 2.0,
+      "active": [
+        0,
+        1
+      ],
+      "group_norms": [
+        5.265606953248246,
+        2.5377230118970413,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 16694.015158608257,
+      "background_scale_error": 0.0062207096689079755,
+      "iterations": 19,
+      "kkt": 5.720428330775574e-06,
+      "converged": true
+    }
+  ],
+  "banks": [
+    62,
+    55,
+    43,
+    84,
+    104,
+    94,
+    95,
+    86
+  ],
+  "g_true": [
+    0.025,
+    0.008,
+    -0.006,
+    0.001,
+    -0.0015,
+    0.002
+  ],
+  "geometry": {
+    "g": [
+      0.025089976746852587,
+      0.007907075936851731,
+      -0.005793680203727946,
+      0.0009222008877120686,
+      -0.001516265361525635,
+      0.001967079069409599
+    ],
+    "objective_start": 30386.242003234016,
+    "objective_final": 17828.45712815237,
+    "angle_error_deg": 0.007451264395687484,
+    "success": false,
+    "message": "STOP: TOTAL NO. OF F,G EVALUATIONS EXCEEDS LIMIT",
+    "nfev": 660
+  },
+  "joint": {
+    "seed": 23,
+    "banks": [
+      44,
+      54,
+      83,
+      45,
+      84,
+      106,
+      104,
+      95
+    ],
+    "g_true": [
+      0.025,
+      0.008,
+      -0.006,
+      0.001,
+      -0.0015,
+      0.002
+    ],
+    "g_fit": [
+      0.025286123625928178,
+      0.007978433261613842,
+      -0.006066930763027275,
+      0.0009885755160263187,
+      -0.0014714487381794058,
+      0.0019760134281417365
+    ],
+    "nominal_groups": [
+      65.33011314538314,
+      99.83903956481136,
+      6.962933149036879,
+      4.433743262812988,
+      0.0,
+      22.61331757638207
+    ],
+    "final_groups": [
+      183.74593480799675,
+      205.38495482596997,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "objective_start": 41638.332273375534,
+    "objective_final": 19160.44190436546,
+    "success": true,
+    "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+    "nfev": 154
+  },
+  "seconds": 32.81577167008072
+}
