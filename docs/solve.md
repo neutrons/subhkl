@@ -108,18 +108,28 @@ A supplied metadata file's detector calibration is also honored.
 | `solve/active`, `solve/group_norms`, `solve/group_weights` | Sparse support and its normalization |
 | `solve/intensities`, `solve/hkl` | Physical reflection flux estimates and column identities |
 | `solve/g`, `solve/background_scales` | Shared geometry increment and background scales |
-| `solve/objective_*`, `solve/stationarity_residual` | Fit diagnostics |
+| `solve/objective_*`, `solve/stationarity_residual`, `solve/stationarity_tolerance` | Fit diagnostics and the actual stopping threshold |
 | `solve` attributes | Status, model settings and source provenance |
 | `sample/U` | Primary active orientation, only for a converged nonempty solution |
 
 The existing predictor consumes the primary `sample/U`. Multiple components
 are saved in `solve/` and announced; exporting every component is future work.
 These are group-sparse, shrunken intensity estimates, not final integrated
-intensities for merging. The output is written atomically. An unconverged outer refinement or a fitted
+intensities for merging. The output is written atomically. An unconverged intensity fit, outer refinement, or a fitted
 empty support produces a diagnostic result without `sample/U` and a nonzero
-CLI exit status. Invalid inputs, absent proposal evidence, and failures of an
-inner intensity solve stop before replacing the output. Input files cannot
+CLI exit status. This includes failure of the initial intensity fit, so its
+proposals remain inspectable. Invalid inputs and absent proposal evidence
+stop before replacing the output. Input files cannot
 be overwritten by the output.
+
+Stationarity is checked at the accepted coefficients with a unit proximal
+step, independent of the line-search step. The threshold is `atol + rtol *
+max(1, largest group penalty)` in Fisher-normalized coefficient units;
+`solve` uses `rtol=1e-6`, with `atol=1e-5` initially and `2e-5` during refinement.
+Support-constrained L-BFGS and small reduced Newton systems polish difficult
+fits, followed by the full stationarity check, including inactive groups.
+Background-only pixels are summed by panel as exact sufficient statistics;
+the reported objective and predicted mean retain the original pixel likelihood.
 
 For an explicit dictionary, `--bootstrap candidates.h5` can read an
 `orientations` dataset `(N,3,3)` in lab coordinates. It can also read the
@@ -149,3 +159,15 @@ The real pooled-count objective favors a supplied calibrated geometry, but
 background/profile mismatch activates unrelated candidates and strong penalties
 expose boundary-solver failures. These are draft limitations, not evidence of
 production-ready real-data calibration or crystal counting.
+
+The [CG4D garnet follow-up](experiments/poisson-orientations/garnet.md) shows why
+`--d-min` must suit the crystal: the 3.2 Angstrom default has only 36 allowed
+reflections for this cell/space group and fails blind indexing. At 1.5 Angstrom,
+the blind candidate is 0.57 degrees from the independent reference and its
+intensity fit converges. This does not establish accurate joint calibration;
+the coarse truth-seeded fit converges to an inadequate radial correction.
+
+With the richer garnet dictionary, joint refinement improves the objective and
+reaches a 6.30% radial correction, but the orientation drifts to 1.31 degrees
+from the reference and the outer evaluation budget is exhausted. The result
+remains diagnostic, not a validated calibration.

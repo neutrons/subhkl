@@ -315,6 +315,7 @@ def run_solve(
     model = OrientationModel(
         data, instrument, cell, space_group, band, d_min, sigma_px, profile, dets
     )
+    log(f"Reflection dictionary: {model.n_hkl} hkl at d_min={d_min:g} Angstrom")
     if bootstrap:
         with h5py.File(bootstrap, "r") as f:
             if "solve/orientations_lab" in f:
@@ -332,15 +333,13 @@ def run_solve(
     )
     g = np.zeros(6)
     fit = fit_intensities(
-        model.design(orientations, g), data, len(orientations), penalty
+        model.design(orientations, g), data, len(orientations), penalty, rtol=1e-6
     )
     if not fit.converged:
-        raise RuntimeError(
-            f"initial intensity solve did not converge (residual {fit.kkt:g})"
-        )
+        log(f"initial intensity solve did not converge (residual {fit.kkt:g})")
     initial = fit.objective
     optimizer = None
-    if do_refine and np.any(fit.group_norms > 0):
+    if fit.converged and do_refine and np.any(fit.group_norms > 0):
         result = refine(
             model,
             orientations,
@@ -358,9 +357,9 @@ def run_solve(
     active = np.flatnonzero(fit.group_norms > 0)
     success = fit.converged and (optimizer is None or optimizer.success)
     status = (
-        "no_orientation"
-        if len(active) == 0
-        else ("converged" if success else "not_converged")
+        "not_converged"
+        if not success
+        else ("no_orientation" if len(active) == 0 else "converged")
     )
     output = Path(output_filename)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -418,6 +417,7 @@ def run_solve(
             report["objective_initial"] = initial
             report["objective_final"] = fit.objective
             report["stationarity_residual"] = fit.kkt
+            report["stationarity_tolerance"] = fit.kkt_tolerance
             report["inner_converged"] = fit.converged
             if optimizer is not None:
                 report.attrs["optimizer_message"] = str(optimizer.message)

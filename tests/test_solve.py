@@ -265,3 +265,30 @@ def test_profile_is_used_and_persisted(scene, tmp_path):
 def test_invalid_profile_rejected(u, f):
     with pytest.raises(ValueError, match="profile"):
         RadialProfile(u, f)
+
+
+@pytest.mark.parametrize("inner_failure", [False, True])
+def test_failed_intensity_fit_retains_diagnostics(
+    scene, tmp_path, monkeypatch, inner_failure
+):
+    import subhkl.solve as workflow
+    import subhkl.search.poisson_orientation as engine
+    from dataclasses import replace
+
+    original = engine.fit_intensities
+
+    def fail(*args, **kwargs):
+        return replace(original(*args, **kwargs), converged=False, kkt=123.0)
+
+    monkeypatch.setattr(engine if inner_failure else workflow, "fit_intensities", fail)
+    frame, bootstrap, bg, *_ = scene
+    output = tmp_path / "failed.h5"
+    result = run_solve(
+        frame, output, bootstrap=bootstrap, background_file=bg, d_min=2, verbose=False
+    )
+    assert result["status"] == "not_converged"
+    with h5py.File(output) as f:
+        assert "sample/U" not in f
+        assert f["solve/orientations_lab"].shape == (3, 3, 3)
+        assert f["solve/stationarity_residual"][()] == 123
+        assert not f["solve/inner_converged"][()]

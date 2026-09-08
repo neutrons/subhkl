@@ -34,7 +34,8 @@ def test_geometry_fixes_the_beam_axis_rotation():
     )
 
 
-def test_poisson_solve_matches_independent_scalar_lasso_optimizer():
+@pytest.mark.parametrize("alpha", [0.0, 0.7, 100.0])
+def test_poisson_solve_matches_independent_scalar_lasso_optimizer(alpha):
     # One reflection per group reduces group lasso to ordinary nonnegative L1.
     y = np.array([1.0, 0.0, 8.0, 20.0, 9.0, 3.0, 0.0, 2.0])
     d = CountData.from_images([y.reshape(2, 4)], [1], [np.ones((2, 4)) * 2], 1)
@@ -52,7 +53,6 @@ def test_poisson_solve_matches_independent_scalar_lasso_optimizer():
             ]
         )
     )
-    alpha = 0.7
     fit = fit_intensities(A, d, 2, alpha, weights=np.ones(2), tol=1e-8)
     scale = np.sqrt(np.asarray(A.power(2).T @ (1 / d.background)).ravel())
 
@@ -100,3 +100,33 @@ def test_empty_data_is_rejected():
         CountData.from_images(
             [np.zeros((2, 2))], [1], [1.0], 1, [np.zeros((2, 2), bool)]
         )
+
+
+def test_bright_poisson_fit_preserves_full_pixel_objective():
+    # Large flux contrast and many background-only bins reproduce the
+    # conditioning of the garnet still without distributing facility data.
+    from scipy.special import xlogy
+
+    rng = np.random.default_rng(8)
+    pixels = 4000
+    columns = np.zeros((pixels, 5))
+    for j in range(5):
+        columns[j * 10 : j * 10 + 5, j] = [0.05, 0.2, 0.5, 0.2, 0.05]
+    A = sparse.csc_matrix(columns)
+    bg = np.linspace(0.1, 100, pixels)
+    y = rng.poisson(bg * 1.7 + A @ np.array([1e6, 100, 1e4, 0, 5e5]))
+    data = CountData.from_images([y.reshape(50, 80)], [1], [bg.reshape(50, 80)], 1)
+    fit = fit_intensities(A, data, 1, 1.2, rtol=1e-6)
+    assert fit.converged
+    assert fit.kkt < fit.kkt_tolerance
+    expected = bg * fit.background_scales[0] + A @ fit.intensities.ravel()
+    np.testing.assert_allclose(fit.mean, expected)
+    objective = np.sum(expected - y + xlogy(y, y / expected))
+    objective += 1.2 * (fit.weights @ fit.group_norms)
+    np.testing.assert_allclose(fit.objective, objective, rtol=1e-10)
+    fisher = np.sqrt(np.asarray(A.power(2).T @ (1 / bg)).ravel())
+    coefficients = fit.intensities.ravel() * fisher
+    gradient = np.asarray(A.T @ (1 - y / expected)).ravel() / fisher
+    gradient += 1.2 * fit.weights[0] * coefficients / np.linalg.norm(coefficients)
+    projected = np.where(coefficients > 0, gradient, np.minimum(gradient, 0))
+    assert np.max(np.abs(projected)) < 2 * fit.kkt_tolerance

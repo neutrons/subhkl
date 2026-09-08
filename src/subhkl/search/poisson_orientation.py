@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from scipy import sparse
-from scipy.optimize import minimize
+from scipy.optimize import OptimizeResult, minimize
 from scipy.special import ndtr, xlogy
 from scipy.spatial.transform import Rotation
 
@@ -208,6 +208,7 @@ class SparseFit:
     kkt: float
     converged: bool
     weights: np.ndarray
+    kkt_tolerance: float
 
 
 def orientation_weights(A, data, n_groups):
@@ -217,7 +218,7 @@ def orientation_weights(A, data, n_groups):
 
 
 def fit_intensities(
-    A, data, n_groups, penalty=3.0, weights=None, max_iter=3000, tol=1e-5
+    A, data, n_groups, penalty=3.0, weights=None, max_iter=3000, tol=1e-5, rtol=0.0
 ):
     """Nonnegative Poisson group lasso, including unpenalized panel backgrounds.
 
@@ -226,7 +227,9 @@ def fit_intensities(
     fluxes are returned. Group weights default to sqrt(visible reflections).
     They should be fixed across an outer refinement, not adapted to its fit.
     An accelerated proximal-gradient solve with monotone restarts reports its
-    stationarity residual. Acceleration matters near disappearing groups.
+    stationarity residual at the accepted iterate. The stopping threshold is
+    tol + rtol * max(1, largest group penalty), in Fisher-normalized units.
+    Acceleration matters near disappearing groups.
     """
     y, bg = data.counts, data.background
     if penalty < 0 or n_groups < 1 or A.shape[1] % n_groups:
@@ -244,11 +247,36 @@ def fit_intensities(
         shape=(len(y), nb),
     )
     M = sparse.hstack([F, B], format="csc")
+    full_M = M
+    # Pixels outside every reflection footprint constrain only their panel's
+    # background scale. Their totals are exact Poisson sufficient statistics.
+    live = np.asarray(A.getnnz(axis=1)).ravel() > 0
+    empty_y = np.bincount(data.bank_index[~live], weights=y[~live], minlength=nb)
+    empty_bg = np.bincount(data.bank_index[~live], weights=bg[~live], minlength=nb)
+    panels = np.flatnonzero(empty_bg > 0)
+    collapsed = sparse.csc_matrix(
+        (
+            empty_bg[panels] / bg_norm[panels],
+            (np.arange(len(panels)), A.shape[1] + panels),
+        ),
+        shape=(len(panels), M.shape[1]),
+    )
+    constant = float(
+        np.sum(xlogy(y[~live], y[~live] / bg[~live]))
+        - np.sum(xlogy(empty_y[panels], empty_y[panels] / empty_bg[panels]))
+    )
+    M = sparse.vstack([M[live], collapsed], format="csc")
+    y = np.r_[y[live], empty_y[panels]]
     if weights is None:
         weights = orientation_weights(A, data, n_groups)
     weights = np.asarray(weights, float)
     if weights.shape != (n_groups,) or np.any(weights < 0):
         raise ValueError("one nonnegative weight per orientation required")
+    if tol <= 0 or rtol < 0:
+        raise ValueError(
+            "positive absolute and nonnegative relative tolerances required"
+        )
+    tolerance = tol + rtol * max(1.0, penalty * np.max(weights))
     x = np.r_[np.zeros(A.shape[1]), bg_norm]
 
     def smooth(z):
@@ -280,9 +308,11 @@ def fit_intensities(
     for iteration in range(1, max_iter + 1):
         # Extrapolation can make a vanishing reflection negative. Near a
         # low-background pixel that cancellation makes Poisson curvature
-        # arbitrarily large. Restart at the feasible iterate instead.
+        # arbitrarily large. Project the extrapolation to preserve feasibility
+        # without discarding all momentum whenever one coefficient hits zero.
         if np.any(extrapolated[:-nb] < 0) or np.any(extrapolated[-nb:] <= 0):
-            extrapolated, momentum = x.copy(), 1.0
+            extrapolated = np.maximum(extrapolated, 0.0)
+            extrapolated[-nb:] = np.maximum(extrapolated[-nb:], 1e-10)
         fv, mv = smooth(extrapolated)
         if not np.isfinite(fv):
             extrapolated, momentum = x.copy(), 1.0
@@ -293,32 +323,130 @@ def fit_intensities(
             trial = prox(extrapolated - step * grad, step)
             delta = trial - extrapolated
             ft, mt = smooth(trial)
-            if ft <= fv + grad @ delta + delta @ delta / (2 * step) + 1e-9:
+            if ft <= fv + grad @ delta + delta @ delta / (2 * step) + 1e-12 * max(
+                1, abs(fv)
+            ):
                 break
             step *= 0.5
         else:
-            raise RuntimeError("Poisson line search failed")
-        if ft + regularizer(trial) > f + regularizer(x) + 1e-8:
+            # Preserve the last feasible fit for the caller's diagnostics.
+            break
+        if ft + regularizer(trial) > f + regularizer(x) + 1e-12 * max(1, abs(f)):
             extrapolated, momentum = x.copy(), 1.0
             continue
-        kkt = float(np.max(np.abs(delta)) / step)
+        # Check stationarity at the accepted point with a unit proximal step,
+        # independent of backtracking and acceleration. Tiny line-search
+        # steps must not round the reported residual down to zero.
+        trial_grad = np.asarray(M.T @ (1 - y / mt))
+        kkt = float(np.max(np.abs(trial - prox(trial - trial_grad, 1.0))))
         next_momentum = (1 + np.sqrt(1 + 4 * momentum**2)) / 2
         extrapolated = trial + ((momentum - 1) / next_momentum) * (trial - x)
         momentum = next_momentum
         x, f, mu = trial, ft, mt
-        if kkt < tol:
+        if kkt < tolerance:
             break
+    if kkt >= tolerance and max_iter >= 100:
+        # Once proximal iterations identify support, curvature-aware polishing
+        # avoids a single bright reflection setting the step for every panel.
+        # Inactive groups remain fixed; the full proximal KKT check below
+        # still rejects a solution that should activate another group.
+        active_columns = np.repeat(
+            np.linalg.norm(x[:-nb].reshape(n_groups, size), axis=1) > 0, size
+        )
+
+        def value_gradient(z):
+            value, mean = smooth(z)
+            groups = z[:-nb].reshape(n_groups, size)
+            norms = np.linalg.norm(groups, axis=1)
+            gradient = np.asarray(M.T @ (1 - y / mean))
+            gradient[:-nb] += (
+                penalty * weights[:, None] * groups / np.maximum(norms[:, None], 1e-300)
+            ).ravel()
+            return value + regularizer(z), gradient
+
+        polished = minimize(
+            value_gradient,
+            x,
+            jac=True,
+            method="L-BFGS-B",
+            bounds=[(0, None) if active else (0, 0) for active in active_columns]
+            + [(1e-10, None)] * nb,
+            options={
+                "maxiter": max_iter,
+                "ftol": 0.0,
+                "gtol": tol * 0.1,
+                "maxls": 50,
+                "maxcor": 30,
+            },
+        )
+        if polished.fun <= f + regularizer(x):
+            x = polished.x
+            f, mu = smooth(x)
+            grad = np.asarray(M.T @ (1 - y / mu))
+            kkt = float(np.max(np.abs(x - prox(x - grad, 1.0))))
+            iteration += polished.nit
+        # A few reduced Newton steps remove the objective-roundoff floor of
+        # L-BFGS on bright data. Only free coefficients enter this small dense
+        # system; large problems retain the checked proximal/L-BFGS result.
+        for _ in range(12):
+            value, gradient = value_gradient(x)
+            free = (x > 1e-9) | (gradient < 0)
+            free[:-nb] &= active_columns
+            indices = np.flatnonzero(free)
+            if kkt < tolerance or len(indices) > 512:
+                break
+            reduced = M[:, indices]
+            hessian = (reduced.T @ reduced.multiply((y / mu**2)[:, None])).toarray()
+            for group in range(n_groups):
+                start, end = group * size, (group + 1) * size
+                pos = np.flatnonzero((indices >= start) & (indices < end))
+                norm = np.linalg.norm(x[start:end])
+                if len(pos) and norm > 0:
+                    z = x[indices[pos]] / norm
+                    hessian[np.ix_(pos, pos)] += (
+                        penalty
+                        * weights[group]
+                        / norm
+                        * (np.eye(len(pos)) - np.outer(z, z))
+                    )
+            direction = np.linalg.lstsq(hessian, -gradient[indices], rcond=1e-12)[0]
+            descent = gradient[indices] @ direction
+            if descent >= 0:
+                break
+            negative = direction < 0
+            length = (
+                min(1.0, float(np.min(-x[indices[negative]] / direction[negative])))
+                if np.any(negative)
+                else 1.0
+            )
+            for _ in range(30):
+                trial = x.copy()
+                trial[indices] = np.maximum(x[indices] + length * direction, 0)
+                trial[-nb:] = np.maximum(trial[-nb:], 1e-10)
+                ft, mt = smooth(trial)
+                if ft + regularizer(
+                    trial
+                ) <= value + 1e-4 * length * descent + 1e-12 * max(1, abs(value)):
+                    x, f, mu = trial, ft, mt
+                    break
+                length *= 0.5
+            else:
+                break
+            grad = np.asarray(M.T @ (1 - y / mu))
+            kkt = float(np.max(np.abs(x - prox(x - grad, 1.0))))
+            iteration += 1
     norms = np.linalg.norm(x[:-nb].reshape(n_groups, size), axis=1)
     return SparseFit(
         (x[:-nb] / scale).reshape(n_groups, size),
         norms,
         x[-nb:] / bg_norm,
-        mu,
-        f + regularizer(x),
+        np.asarray(full_M @ x),
+        f + regularizer(x) + constant,
         iteration,
         kkt,
-        kkt < tol,
+        kkt < tolerance,
         weights.copy(),
+        tolerance,
     )
 
 
@@ -358,8 +486,14 @@ def refine(
     if not refine_geometry:
         bounds[:6] = [(v, v) for v in x0[:6]]
     best = {"value": np.inf}
+    evaluations = 0
+
+    class InnerNotConverged(RuntimeError):
+        pass
 
     def evaluate(x):
+        nonlocal evaluations
+        evaluations += 1
         g = x[:6] * units
         U = (
             orientations
@@ -368,28 +502,38 @@ def refine(
             @ orientations
         )
         fit = fit_intensities(
-            model.design(U, g), model.data, n, penalty, weights, max_iter=2000, tol=2e-5
+            model.design(U, g),
+            model.data,
+            n,
+            penalty,
+            weights,
+            max_iter=2000,
+            tol=2e-5,
+            rtol=1e-6,
         )
-        if not fit.converged:
-            raise RuntimeError(f"inner solve did not converge: KKT={fit.kkt:g}")
         if fit.objective < best["value"]:
             best.update(value=fit.objective, g=g.copy(), orientations=U.copy(), fit=fit)
             if log:
                 log(f"objective {fit.objective:.5f}; g={g}; groups={fit.group_norms}")
+        if not fit.converged:
+            raise InnerNotConverged(f"inner solve did not converge: KKT={fit.kkt:g}")
         return fit.objective
 
-    result = minimize(
-        evaluate,
-        x0,
-        method="L-BFGS-B",
-        bounds=bounds,
-        options={
-            "maxfun": max_evals,
-            "maxiter": max_evals,
-            "ftol": 1e-9,
-            "gtol": 1e-4,
-            "eps": 1e-4,
-        },
-    )
+    try:
+        result = minimize(
+            evaluate,
+            x0,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={
+                "maxfun": max_evals,
+                "maxiter": max_evals,
+                "ftol": 1e-9,
+                "gtol": 1e-4,
+                "eps": 1e-4,
+            },
+        )
+    except InnerNotConverged as error:
+        result = OptimizeResult(success=False, message=str(error), nfev=evaluations)
     best["optimizer"] = result
     return best
