@@ -7,6 +7,7 @@ import h5py
 import typer
 
 from subhkl.commands import (
+    run_calibrate,
     run_finder,
     run_finder_visualize,
     run_index,
@@ -1262,6 +1263,121 @@ def static_mask(
         dilate_px=dilate_px,
         static_quantile=static_quantile,
         grad_min_frac=grad_min_frac,
+    )
+
+
+@app.command()
+def calibrate(
+    frames_filename: Annotated[
+        str,
+        typer.Argument(
+            help="Reduced, summed or merged HDF5 stack (images + bank_ids).  Pool "
+            "the frames of one orientation first (`sum-images`): a single "
+            "still has too few spots above the detection null."
+        ),
+    ],
+    output_filename: Annotated[
+        str,
+        typer.Argument(
+            help="Calibration HDF5 to write: a bootstrap-compatible "
+            "detector_calibration group plus a calibrate/ report.  Pass it to "
+            "spherical-index (or any consumer of apply_detector_calibration)."
+        ),
+    ],
+    instrument: Annotated[
+        str | None,
+        typer.Option(help="Instrument name; defaults to the frames file's attribute."),
+    ] = None,
+    cell: Annotated[
+        str | None,
+        typer.Option(
+            help="Unit cell a,b,c,alpha,beta,gamma (A, deg); defaults to the "
+            "frames file's sample/* group when present."
+        ),
+    ] = None,
+    space_group: Annotated[
+        str | None,
+        typer.Option(
+            help="Space group symbol, e.g. 'P 21'; defaults to sample/space_group."
+        ),
+    ] = None,
+    d_min: Annotated[
+        float, typer.Option(help="Resolution limit of the predicted reflections (A).")
+    ] = 3.2,
+    wavelength_min: Annotated[
+        float | None, typer.Option(help="Override the band's lower edge (A).")
+    ] = None,
+    wavelength_max: Annotated[
+        float | None, typer.Option(help="Override the band's upper edge (A).")
+    ] = None,
+    static_mask_file: Annotated[
+        str | None,
+        typer.Option(help="Static mask (`static-mask` output), carried as validity."),
+    ] = None,
+    background_from: Annotated[
+        str | None,
+        typer.Option(
+            help="A pooled stack of the same setting whose local background is "
+            "scaled per bank to this file's exposure (for a single still)."
+        ),
+    ] = None,
+    quick: Annotated[
+        bool,
+        typer.Option(help="Three shorter stages instead of the four default ones."),
+    ] = False,
+    evals_scale: Annotated[
+        float, typer.Option(help="Multiply every stage's evaluation budget.")
+    ] = 1.0,
+    bin_px: Annotated[
+        int, typer.Option(help="Pixel binning of the residual maps.")
+    ] = 4,
+    seed: Annotated[
+        int, typer.Option(help="Seed for the dictionary's random orientations.")
+    ] = 0,
+    objective: Annotated[
+        str,
+        typer.Option(
+            help="Stage objective: 'cell' (matched-filter correlation of the "
+            "orientation dictionary, default), 'band' (the orientation search's "
+            "own score; free, but coarser) or 'raw' (fraction of detections "
+            "explained)."
+        ),
+    ] = "cell",
+):
+    """Calibrate the detector geometry from raw counts, without a finder.
+
+    Aligns the detector assembly -- radial scale, rotation and sample
+    offset, jointly -- so that a blind orientation search under it explains
+    the most of the raw detections.  The data enter as a sparse detection
+    map (per sphere cell the thresholded maximum of a profiled Poisson
+    log-likelihood ratio); the orientation search runs blind on it and the
+    found orientation's matched-filter correlation with the map (crystal
+    orientations as dictionary atoms, centered to remove the coverage
+    component) is climbed coarse to fine in sphere resolution.  Output is
+    the same detector_calibration group the spherical indexer's bootstrap
+    writes, so downstream commands pick it up unchanged.
+    """
+    cell_values = None
+    if cell:
+        cell_values = [float(v) for v in cell.replace(";", ",").split(",") if v.strip()]
+        if len(cell_values) != 6:
+            raise typer.BadParameter("--cell needs six values: a,b,c,alpha,beta,gamma")
+    run_calibrate(
+        frames_filename=frames_filename,
+        output_filename=output_filename,
+        instrument=instrument,
+        cell=cell_values,
+        space_group=space_group,
+        d_min=d_min,
+        wavelength_min=wavelength_min,
+        wavelength_max=wavelength_max,
+        static_mask_file=static_mask_file,
+        background_from=background_from,
+        quick=quick,
+        evals_scale=evals_scale,
+        bin_px=bin_px,
+        seed=seed,
+        objective=objective,
     )
 
 

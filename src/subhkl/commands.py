@@ -1768,6 +1768,162 @@ def run_sum_images(
     return summary
 
 
+def run_calibrate(
+    frames_filename: str,
+    output_filename: str,
+    instrument: str | None = None,
+    cell: list[float] | None = None,
+    space_group: str | None = None,
+    d_min: float = 3.2,
+    wavelength_min: float | None = None,
+    wavelength_max: float | None = None,
+    static_mask_file: str | None = None,
+    background_from: str | None = None,
+    quick: bool = False,
+    evals_scale: float = 1.0,
+    bin_px: int = 4,
+    seed: int = 0,
+    stages=None,
+    verbose: bool = True,
+    objective: str = "cell",
+):
+    """Calibrate the rigid detector geometry from raw counts, finder-free.
+
+    Reads a reduced / summed / merged stack (``images`` + ``bank_ids``),
+    aligns the detector assembly -- radial scale, rotation, sample offset --
+    so that a blind orientation search under it explains the most of the
+    raw detections, and writes a bootstrap-compatible
+    ``detector_calibration`` group the spherical indexer consumes through
+    ``apply_detector_calibration``.  See :mod:`subhkl.calibrate` for the
+    objective; pool the frames of one orientation first (``sum-images``),
+    a single still has too few spots above the null tail.
+    """
+    from subhkl.calibrate import (
+        DEFAULT_STAGES,
+        QUICK_STAGES,
+        Calibrator,
+        Stage,
+        load_masks,
+        prepare_banks,
+        with_objective,
+        write_detector_calibration,
+        write_report,
+    )
+
+    def log(
+        *args,
+    ):  # a stage is minutes of silence otherwise, buffered behind a redirect
+        print(*args, flush=True)
+
+    if not verbose:
+        log = None
+    with h5py.File(frames_filename, "r") as f:
+        images = f["images"][()]
+        bank_ids = [int(b) for b in f["bank_ids"][()]]
+        if instrument is None:
+            instrument = f.attrs.get("instrument")
+            if isinstance(instrument, bytes):
+                instrument = instrument.decode()
+        wl = f["instrument/wavelength"][()] if "instrument/wavelength" in f else None
+        if cell is None and "sample/a" in f:
+            cell = [
+                float(f[f"sample/{k}"][()])
+                for k in ("a", "b", "c", "alpha", "beta", "gamma")
+            ]
+        if space_group is None and "sample/space_group" in f:
+            sg = f["sample/space_group"][()]
+            space_group = sg.decode() if isinstance(sg, bytes) else str(sg)
+    if instrument is None:
+        raise ValueError("instrument: not in the frames file, pass --instrument")
+    if cell is None or len(cell) != 6:
+        raise ValueError(
+            "cell: pass --cell a,b,c,alpha,beta,gamma (or a merged file with sample/*)"
+        )
+    if space_group is None:
+        raise ValueError(
+            "space group: pass --space-group (or a merged file with sample/space_group)"
+        )
+    if wl is None and (wavelength_min is None or wavelength_max is None):
+        raise ValueError(
+            "wavelength band: not in the frames file, pass --wavelength-min/--wavelength-max"
+        )
+    wavelength = (
+        float(wavelength_min if wavelength_min is not None else wl[0]),
+        float(wavelength_max if wavelength_max is not None else wl[1]),
+    )
+
+    masks = load_masks(static_mask_file, bank_ids, images.shape[1:])
+    reference = None
+    if background_from:
+        with h5py.File(background_from, "r") as f:
+            ref_images = f["images"][()]
+            ref_banks = [int(b) for b in f["bank_ids"][()]]
+        reference = prepare_banks(ref_images, ref_banks, masks=masks, bin_px=bin_px)
+    data = prepare_banks(
+        images, bank_ids, masks=masks, bin_px=bin_px, background_reference=reference
+    )
+    if not data:
+        raise ValueError("no bank with enough valid pixels to calibrate")
+    if log:
+        log(
+            f"calibrate: {len(data)} banks, cell {cell}, {space_group}, "
+            f"band {wavelength[0]:.2f}-{wavelength[1]:.2f} A, d_min {d_min} A"
+        )
+
+    if stages is None:
+        base = with_objective(QUICK_STAGES if quick else DEFAULT_STAGES, objective)
+        stages = tuple(
+            Stage(
+                s.cell_deg,
+                s.objective,
+                s.theta,
+                s.step_scale,
+                max(8, int(round(s.max_evals * evals_scale))),
+                s.tol_deg,
+                s.width,
+            )
+            for s in base
+        )
+    cal = Calibrator(
+        data,
+        instrument,
+        cell,
+        space_group,
+        wavelength,
+        d_min,
+        bin_px=bin_px,
+        seed=seed,
+        report_cell=any(s.objective == "cell" for s in stages),
+    )
+    result = cal.calibrate(stages=stages, log=log)
+
+    with h5py.File(output_filename, "w") as out:
+        out.attrs["instrument"] = instrument
+        out.attrs["source"] = os.path.abspath(frames_filename)
+        out["instrument/wavelength"] = np.asarray(wavelength, float)
+        for k, v in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            out[f"sample/{k}"] = float(v)
+        out["sample/space_group"] = space_group
+        write_detector_calibration(out, result.dets)
+        write_report(out, result, instrument)
+    if log:
+        g = result.g
+        log(
+            f"calibrated: radial {100 * g[0]:+.2f}%  rotation "
+            f"{np.degrees(np.linalg.norm(g[1:4])):.2f} deg  offset "
+            f"{np.round(1e3 * g[4:7], 1)} mm"
+        )
+        if result.nominal is not None and result.final is not None:
+            log(
+                f"raw detections explained: {100 * result.nominal.raw_explained:.1f}% "
+                f"(nominal) -> {100 * result.final.raw_explained:.1f}% (calibrated)"
+            )
+        log(
+            f"Wrote {output_filename}: detector_calibration for {len(result.dets)} panels."
+        )
+    return result
+
+
 def run_mask_visualize(
     images_filename: str,
     mask_filename: str,
