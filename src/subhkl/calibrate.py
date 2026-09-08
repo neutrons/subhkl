@@ -440,16 +440,53 @@ def orientation_atom(
     return np.unique(grid.to_cell(ghat))
 
 
+def _enable_compilation_cache():
+    """Persist XLA compilations across runs (the same cache spherical-index
+    uses); a calibration is hundreds of ladder calls."""
+    try:
+        import os
+
+        import jax
+
+        if jax.config.jax_compilation_cache_dir is None:
+            jax.config.update(
+                "jax_compilation_cache_dir",
+                os.path.join(
+                    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+                    "subhkl",
+                    "jax",
+                ),
+            )
+    except Exception:
+        pass
+
+
 def blind_orientation(
-    dmap: DetectionMap, B: np.ndarray, wavelength, d_min: float, seed: int = 0
+    dmap: DetectionMap,
+    B: np.ndarray,
+    wavelength,
+    d_min: float,
+    seed: int = 0,
+    n_pad: int | None = None,
 ):
     """The lattice ladder on the detected cells' exact directions -- no seed
-    orientation, no finder.  Returns ``(U, band_score, n_detections)``."""
+    orientation, no finder.  Returns ``(U, band_score, n_detections)``.
+
+    ``n_pad`` pads the detection list (a repeated real direction at zero
+    weight, which every ladder kernel ignores) so its shape does not change
+    from one geometry to the next: the ladder compiles per size class, and
+    an optimiser whose detection count straddles a class boundary would
+    otherwise recompile on almost every evaluation (9 s of a 20 s call).
+    """
     from subhkl.search.spherical import _orthonormalize, lattice_ladder
 
     sel = np.where(dmap.detected)[0]
     d = dmap.direction[sel]
     w = dmap.y[sel]
+    if n_pad is not None and len(d) < n_pad and len(d) > 0:
+        extra = n_pad - len(d)
+        d = np.vstack([d, np.tile(d[:1], (extra, 1))])
+        w = np.concatenate([w, np.zeros(extra)])
     res = lattice_ladder(
         d,
         w,
@@ -479,7 +516,7 @@ def cell_correlation(
     """Matched-filter correlation of orientation ``U``'s atom with the data
     map, both centered over the covered cells.  The random orientations
     supply the mean atom -- the coverage component -- that centering removes;
-    200 of them reproduce 2500 to 0.02."""
+    50 of them reproduce 200 (and 200 reproduce 2500) to a few hundredths."""
     atoms = [
         orientation_atom(dets, R, G_c, wavelength, grid)
         for R in [U, *random_orientations]
@@ -574,7 +611,7 @@ class Calibrator:
         wavelength,
         d_min: float,
         bin_px: int = 4,
-        n_random: int = 200,
+        n_random: int = 50,
         seed: int = 0,
         sigma_div: float = 1.6,
         sigma_psf: float = 0.8,
@@ -589,6 +626,8 @@ class Calibrator:
         self.sigma_div, self.sigma_psf = float(sigma_div), float(sigma_psf)
         self.B, self.G_c = reciprocal_lattice(cell, space_group, d_min)
         rng = np.random.default_rng(seed)
+        self._n_pad: dict[tuple, int] = {}  # stable ladder input size per stage
+        _enable_compilation_cache()
         self.random_orientations = [
             Rot.random(random_state=rng).as_matrix() for _ in range(n_random)
         ]
@@ -616,8 +655,15 @@ class Calibrator:
         dmap, dets = self.detection_map(g, stage)
         grid = SphereGrid(stage.cell_deg)
         if orientation is None:
+            # one size class per stage, with headroom; bumped only if exceeded
+            key = (stage.cell_deg, stage.theta)
+            n_det = int(dmap.detected.sum())
+            n_pad = self._n_pad.get(key)
+            if n_pad is None or n_det > n_pad:
+                n_pad = 1 << int(np.ceil(np.log2(max(int(1.25 * n_det), 2))))
+                self._n_pad[key] = n_pad
             U, band, n_det = blind_orientation(
-                dmap, self.B, self.wavelength, self.d_min, self.seed
+                dmap, self.B, self.wavelength, self.d_min, self.seed, n_pad=n_pad
             )
         else:
             U, band, n_det = (
