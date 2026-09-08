@@ -20,6 +20,7 @@ import pytest
 
 from subhkl.calibrate import (
     Calibrator,
+    Evaluation,
     Stage,
     geometry_detectors,
     prepare_banks,
@@ -196,6 +197,27 @@ def test_objectives_prefer_the_displacing_geometry(frames, calibrator):
     assert true.cell_correlation > nominal.cell_correlation
 
 
+def test_cell_dictionary_is_optional(frames, calibrator):
+    """The cell dictionary is the default objective but optional: the
+    correlation is computed only for the 'cell' objective (or when asked
+    for), and the ladder's own 'band' score can be selected instead."""
+    from subhkl.calibrate import DEFAULT_STAGES, QUICK_STAGES, with_objective
+
+    assert all(s.objective == "cell" for s in DEFAULT_STAGES + QUICK_STAGES)
+    assert [s.objective for s in with_objective(QUICK_STAGES, "band")] == ["band"] * 3
+    with pytest.raises(ValueError):
+        with_objective(QUICK_STAGES, "zone")
+    _, U_true, _ = frames
+    band = calibrator.evaluate(G_TRUE, Stage(1.0, "band", 8.0, 1.0, 1), orientation=U_true)
+    assert np.isnan(band.cell_correlation)
+    cell = calibrator.evaluate(G_TRUE, Stage(1.0, "cell", 8.0, 1.0, 1), orientation=U_true)
+    assert np.isfinite(cell.cell_correlation)
+    assert Calibrator.objective_value(cell, Stage(1.0, "cell", 8.0, 1.0, 1)) == cell.cell_correlation
+    ev = Evaluation(G_TRUE, U_true, 0.0123, 1, float("nan"), 0.5, 1)
+    assert Calibrator.objective_value(ev, Stage(1.0, "band", 8.0, 1.0, 1)) == pytest.approx(12.3)
+    assert Calibrator.objective_value(ev, Stage(1.0, "raw", 8.0, 1.0, 1)) == pytest.approx(50.0)
+
+
 def test_detection_map_is_sparse_and_precise(calibrator, frames):
     """Detections are a small fraction of the covered cells, and each carries
     the exact direction of its argmax pixel (unit, inside its own cell)."""
@@ -229,7 +251,7 @@ def test_calibrate_climbs_toward_the_displacing_geometry(frames, calibrator):
     the basin's reach is a matter of spot count, not of the optimiser.
     """
     g0 = 0.5 * G_TRUE
-    stages = (Stage(1.0, "cell", 8.0, 1.0, 30), Stage(0.5, "raw", 8.0, 0.5, 20))
+    stages = (Stage(1.0, "band", 8.0, 1.0, 30), Stage(0.5, "raw", 8.0, 0.5, 20))
     start = calibrator.evaluate(g0, stages[-1])
     res = calibrator.calibrate(stages=stages, g0=g0)
     assert res.final.raw_explained > start.raw_explained + 0.03

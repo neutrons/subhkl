@@ -1334,15 +1334,26 @@ def calibrate(
     seed: Annotated[
         int, typer.Option(help="Seed for the dictionary's random orientations.")
     ] = 0,
+    objective: Annotated[
+        str,
+        typer.Option(
+            help="Stage objective: 'cell' (matched-filter correlation of the "
+            "orientation dictionary, default), 'band' (the orientation search's "
+            "own score; free, but coarser) or 'raw' (fraction of detections "
+            "explained)."
+        ),
+    ] = "cell",
 ):
     """Calibrate the detector geometry from raw counts, without a finder.
 
     Aligns the detector assembly -- radial scale, rotation and sample
     offset, jointly -- so that a blind orientation search under it explains
-    the most of the raw detections.  The objective treats crystal
-    orientations as dictionary atoms (centered to remove the coverage
-    component), the data as a sparse detection map, and climbs coarse to
-    fine in sphere resolution before a final continuous stage.  Output is
+    the most of the raw detections.  The data enter as a sparse detection
+    map (per sphere cell the thresholded maximum of a profiled Poisson
+    log-likelihood ratio); the orientation search runs blind on it and the
+    found orientation's matched-filter correlation with the map (crystal
+    orientations as dictionary atoms, centered to remove the coverage
+    component) is climbed coarse to fine in sphere resolution.  Output is
     the same detector_calibration group the spherical indexer's bootstrap
     writes, so downstream commands pick it up unchanged.
     """
@@ -1366,6 +1377,7 @@ def calibrate(
         evals_scale=evals_scale,
         bin_px=bin_px,
         seed=seed,
+        objective=objective,
     )
 
 

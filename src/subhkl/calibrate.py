@@ -21,19 +21,37 @@ the spherical indexer maximises.  Two things make the raw problem tractable:
   fatally coherent and that subtracting the mean atom removes exactly.
 
 With the exact scattering direction of each detected cell's argmax pixel as
-its peak list, the lattice ladder finds an orientation blind.  Two scalar
-objectives are then read off that orientation and maximised over the seven
+its peak list, the lattice ladder finds an orientation blind.  A scalar
+objective is then read off that orientation and maximised over the seven
 geometry parameters jointly, coarse to fine:
 
-* ``cell``: the matched-filter correlation of the found atom against the
-  centered data map.  Wide basin, deterministic, but quantised to cells --
-  at 1 deg three geometries indexing at 44 / 57 / 87 % are indistinguishable
-  and the ridge is only resolved by finer cells (0.5, then 0.25 deg).
+* ``cell`` (default): the matched-filter correlation of the found
+  orientation's atom against the centered data map -- the dictionary
+  construction above.  Wide basin, deterministic, but quantised to cells:
+  at 1 deg three geometries indexing at 44 / 57 / 87 % are
+  indistinguishable and the ridge is only resolved by finer cells (0.5,
+  then 0.25 deg).  A third of an evaluation's time.
+* ``band``: the ladder's own score at the orientation it found -- the
+  band-averaged lattice phase summed over the shortest direct-lattice
+  zones, i.e. the *zone* dictionary read coherently at one orientation.
+  Free, and the same basin at a quick budget (38.5 vs 40.1 % of the
+  detections explained on cg4d-l1-mbl), but at the full budget it stops
+  short (69.1 vs 75.8 % of the finder's peaks explained under a full
+  search; offset 6.8 vs 10.5 mm): the band kernel's angular width is set
+  by the zone lengths and the wavelength band, a few degrees for the short
+  zones, so finer sphere cells sharpen the cell dictionary and not this.
+  The zones must be read at one orientation either way -- letting every
+  zone pick its own best pole (the incoherent sum of per-zone maxima)
+  climbs to a geometry that indexes worse than nominal.
 * ``raw``: the fraction of raw detections within an angular tolerance of a
   predicted reflection -- the indexing criterion itself with detections in
   place of finder peaks, continuous in the geometry.  Reported always; as a
-  final stage it adds nothing over a fourth cell rung at equal budget, so
-  the default ladder is cell rungs only.
+  final stage it adds nothing over a fourth cell rung at equal budget.
+
+The detection readout must be a threshold: with the orientation known every
+readout of the per-cell maximum ranks the geometries alike, but the blind
+ladder on linear (or square-root) weights lands 44 deg from the crystal --
+the coherent sum is then a few bright cells, not a count of consistent ones.
 
 The objectives are invariant to a global rotation of the lattice, so the
 goniometer setting of the frames is irrelevant: the found orientation absorbs
@@ -83,8 +101,11 @@ class Stage:
     """One rung of the coarse-to-fine optimisation.
 
     cell_deg     sphere cell size for the detection map and the atoms
-    objective    'cell' (matched-filter correlation) or 'raw' (fraction of
-                 detections explained within ``tol_deg``)
+    objective    'cell' (matched-filter correlation of the orientation
+                 dictionary; computed only for this objective or when the
+                 calibrator is asked to report it), 'band' (the ladder's
+                 score at the found orientation, free) or 'raw' (fraction
+                 of detections explained within ``tol_deg``)
     theta        detection threshold on the profiled LLR ``t``; ``t`` is
                  standardised so the null false-positive rate it fixes is
                  exposure-independent (8 permissive, 12 for the continuous
@@ -102,11 +123,13 @@ class Stage:
     width: float = 3.0
 
 
-# The resolution ladder alone.  At equal total budget (460 evaluations from
-# nominal on cg4d-l1-mbl) a fourth cell rung and the continuous ``raw`` stage
-# reach the same geometry (75.8 % of the finder's peaks explained under a
-# full orientation search, vs 24.8 % nominal) and the ladder is 40 % faster;
-# ``raw`` stays available as a stage objective and is always reported.
+# The resolution ladder alone, on the cell dictionary.  At equal total budget
+# (460 evaluations from nominal on cg4d-l1-mbl) a fourth cell rung and the
+# continuous ``raw`` stage reach the same geometry (75.8 % of the finder's
+# peaks explained under a full orientation search, vs 24.8 % nominal) and
+# the ladder is 40 % faster; the free ``band`` objective reaches 69.1 %.
+# ``band`` and ``raw`` stay available as stage objectives (``with_objective``
+# or the CLI's --objective) and ``raw`` is always reported.
 DEFAULT_STAGES = (
     Stage(1.0, "cell", 8.0, 2.0, 160),
     Stage(0.5, "cell", 8.0, 0.7, 100),
@@ -119,6 +142,20 @@ QUICK_STAGES = (
     Stage(0.5, "cell", 8.0, 0.7, 40),
     Stage(0.25, "cell", 8.0, 0.7, 40),
 )
+
+OBJECTIVES = ("band", "cell", "raw")
+
+
+def with_objective(stages, objective: str):
+    """The same stage table on another objective."""
+    if objective not in OBJECTIVES:
+        raise ValueError(f"objective must be one of {OBJECTIVES}, got {objective!r}")
+    return tuple(
+        Stage(
+            s.cell_deg, objective, s.theta, s.step_scale, s.max_evals, s.tol_deg, s.width
+        )
+        for s in stages
+    )
 
 
 # --------------------------------------------------------------------------
@@ -625,8 +662,10 @@ class Calibrator:
         seed: int = 0,
         sigma_div: float = 1.6,
         sigma_psf: float = 0.8,
+        report_cell: bool = False,
     ):
         self.data = data
+        self.report_cell = bool(report_cell)  # cell correlation on every stage
         self.instrument = instrument
         self.banks = sorted(data)
         self.wavelength = (float(wavelength[0]), float(wavelength[1]))
@@ -681,8 +720,14 @@ class Calibrator:
                 float("nan"),
                 int(dmap.detected.sum()),
             )
-        corr = cell_correlation(
-            dmap, dets, U, self.G_c, self.wavelength, grid, self.random_orientations
+        # the cell dictionary is optional: a third of an evaluation, and the
+        # ladder's own score reaches the same geometry
+        corr = (
+            cell_correlation(
+                dmap, dets, U, self.G_c, self.wavelength, grid, self.random_orientations
+            )
+            if stage.objective == "cell" or self.report_cell
+            else float("nan")
         )
         frac, n_pred = raw_explained(
             dmap, dets, U, self.G_c, self.wavelength, stage.tol_deg
@@ -691,11 +736,12 @@ class Calibrator:
 
     @staticmethod
     def objective_value(ev: Evaluation, stage: Stage) -> float:
-        return (
-            100.0 * ev.raw_explained
-            if stage.objective == "raw"
-            else ev.cell_correlation
-        )
+        if stage.objective == "raw":
+            return 100.0 * ev.raw_explained
+        if stage.objective == "cell":
+            return ev.cell_correlation
+        # the ladder's band score is a weight fraction ~1e-2; scaled for the log
+        return 1000.0 * ev.band_score
 
     def optimise_stage(
         self, g0, stage: Stage, log=None
@@ -755,8 +801,9 @@ class Calibrator:
         nominal = self.evaluate(np.zeros(7), stages[0])
         if log is not None:
             log(
-                f"nominal geometry: {nominal.n_detections} detections, cell corr "
-                f"{nominal.cell_correlation:.3f}, raw explained {100 * nominal.raw_explained:.1f}%"
+                f"nominal geometry: {nominal.n_detections} detections, band score "
+                f"{1000 * nominal.band_score:.3f}, cell corr {nominal.cell_correlation:.3f}, "
+                f"raw explained {100 * nominal.raw_explained:.1f}%"
             )
         results, ev = [], None
         for stage in stages:

@@ -1785,6 +1785,7 @@ def run_calibrate(
     seed: int = 0,
     stages=None,
     verbose: bool = True,
+    objective: str = "cell",
 ):
     """Calibrate the rigid detector geometry from raw counts, finder-free.
 
@@ -1804,6 +1805,7 @@ def run_calibrate(
         Stage,
         load_masks,
         prepare_banks,
+        with_objective,
         write_detector_calibration,
         write_report,
     )
@@ -1869,7 +1871,7 @@ def run_calibrate(
         )
 
     if stages is None:
-        base = QUICK_STAGES if quick else DEFAULT_STAGES
+        base = with_objective(QUICK_STAGES if quick else DEFAULT_STAGES, objective)
         stages = tuple(
             Stage(
                 s.cell_deg,
@@ -1891,6 +1893,7 @@ def run_calibrate(
         d_min,
         bin_px=bin_px,
         seed=seed,
+        report_cell=any(s.objective == "cell" for s in stages),
     )
     result = cal.calibrate(stages=stages, log=log)
 
