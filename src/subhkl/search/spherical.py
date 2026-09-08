@@ -1842,10 +1842,14 @@ def lattice_ladder(
             [score(Rs[i : i + ch], *args) for i in range(0, len(grid), ch)]
         )
         _, top = kern["topk"](out, int(n_shortlist))
-        cands = np.asarray(Rs[top])
+        cands = Rs[top]  # stays on the device through the zoom rungs
         _mark(f"exhaustive rung ({len(grid):,} orientations)")
 
     def zoom_all(cands, nz, tol, span, n):
+        """One zoom rung, device-resident: the candidates go in as a device
+        array and the scores and refined orientations come back as device
+        arrays -- no host round trip per batch (hundreds per ladder call
+        otherwise, each a synchronisation)."""
         rv = (
             np.array(
                 np.meshgrid(
@@ -1861,19 +1865,22 @@ def lattice_ladder(
         bsz = int(max(1, ch_ // len(rv)))
         bs, bR = [], []
         for i in range(0, len(cands), bsz):
-            s_, R_ = zoom(
-                jnp.asarray(np.asarray(cands[i : i + bsz], np.float32)), dR, *args
-            )
-            bs.append(np.asarray(s_))
-            bR.append(np.asarray(R_))
-        return np.concatenate(bs), np.concatenate(bR)
+            s_, R_ = zoom(cands[i : i + bsz], dR, *args)
+            bs.append(s_)
+            bR.append(R_)
+        return jnp.concatenate(bs), jnp.concatenate(bR)
 
+    # caller-supplied candidates are uploaded once; a device array passes through
+    cands = jnp.asarray(cands, dtype=jnp.float32)
     scores = None
     for nz, tol, span, keep, npts in rungs:
         s_, R_ = zoom_all(cands, int(nz), float(tol), float(span), int(npts))
-        o = np.argsort(-s_)[: int(keep)]
-        cands, scores = R_[o], s_[o]
-        _mark(f"rung {nz} zones @ {tol:g} deg, {len(R_)} -> {len(o)}")
+        k = min(int(keep), int(s_.shape[0]))
+        scores, o = kern["topk"](s_, k)
+        cands = R_[o]
+        _mark(f"rung {nz} zones @ {tol:g} deg, {len(R_)} -> {k}")
+    cands = np.asarray(cands)
+    scores = np.asarray(scores, float)
     nz, tol = rungs[-1][0], rungs[-1][1]
     kind, args, _ = (
         band_args(int(nz), False) if band else score_args(int(nz), float(tol))
