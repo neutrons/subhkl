@@ -36,9 +36,25 @@ class RadialProfile:
 
     def integrate_bins(self, rows, cols, center_r, center_c, sigma):
         """Integrate over unit bins, normalized on the entire unmasked plane."""
-        nodes, weights = np.polynomial.legendre.leggauss(4)
-        dr = (rows[:, None] + 0.5 + nodes / 2 - center_r) / sigma
-        dc = (cols[:, None] + 0.5 + nodes / 2 - center_c) / sigma
+        if not np.isfinite(sigma) or sigma <= 0:
+            raise ValueError("profile sigma must be finite and positive")
+        # Clip integration intervals to the footprint before quadrature.
+        # A very narrow profile inside a coarse bin must not fall between
+        # quadrature nodes and disappear. Work per model sigma, bounding the
+        # node count even when sigma is tiny relative to a count bin.
+        bound = self.u[-1] * sigma
+        order = max(4, int(np.ceil(4 * min(1 / sigma, 2 * self.u[-1]))))
+        nodes, weights = np.polynomial.legendre.leggauss(order)
+
+        def axis_bins(bins, center):
+            lo = np.clip(bins - center, -bound, bound)
+            hi = np.clip(bins + 1 - center, -bound, bound)
+            half = (hi - lo) / 2
+            points = ((hi + lo)[:, None] / 2 + half[:, None] * nodes) / sigma
+            return points, half[:, None] * weights
+
+        dr, wr = axis_bins(np.asarray(rows), center_r)
+        dc, wc = axis_bins(np.asarray(cols), center_c)
         radius = np.hypot(dr[:, None, :, None], dc[None, :, None, :])
         values = np.interp(radius, self.u, self.f, left=self.f[0], right=0.0)
         u = np.r_[0.0, self.u] if self.u[0] > 0 else self.u
@@ -46,7 +62,7 @@ class RadialProfile:
         slope = np.diff(f) / np.diff(u)
         intercept = f[:-1] - slope * u[:-1]
         integral = np.sum(slope * np.diff(u**3) / 3 + intercept * np.diff(u**2) / 2)
-        return np.einsum("rcij,i,j->rc", values, weights / 2, weights / 2) / (
+        return np.einsum("rcij,ri,cj->rc", values, wr, wc) / (
             2 * np.pi * integral * sigma**2
         )
 

@@ -227,6 +227,18 @@ def test_empirical_gaussian_prior_matches_integrated_gaussian():
     assert profile.integrate_bins(r[r >= 0], c, 0.23, -0.37, 1.3).sum() < 1
 
 
+@pytest.mark.parametrize("sigma", [0.04, 0.2])
+def test_narrow_profile_conserves_flux_in_coarse_bins(sigma):
+    u = np.linspace(0, 6, 601)
+    profile = RadialProfile(u, np.exp(-0.5 * u * u))
+    bins = np.arange(-2, 3)
+    actual = profile.integrate_bins(bins, bins, 0.03, 0.43, sigma)
+    vr = ndtr((bins + 1 - 0.03) / sigma) - ndtr((bins - 0.03) / sigma)
+    vc = ndtr((bins + 1 - 0.43) / sigma) - ndtr((bins - 0.43) / sigma)
+    np.testing.assert_allclose(actual, np.outer(vr, vc), atol=1e-5)
+    assert abs(actual.sum() - 1) < 1e-5
+
+
 def test_profile_is_used_and_persisted(scene, tmp_path):
     frame, bootstrap, bg, *_ = scene
     prior = tmp_path / "profile.h5"
