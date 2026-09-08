@@ -13,11 +13,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one Poisson group-sparse fit of intensities, orientations and shared detector
   geometry. The standalone numerical Python runners remain reference APIs for
   regression comparisons, not alternate `solve` modes.
+- `solve` accepts rotation scans, enables identifiable beam-axis detector roll,
+  and honors existing global/per-run goniometer corrections. Its outputs can
+  be inspected with finder-free `indexer-visualize` overlays, including labeled
+  diagnostics for unsuccessful fits.
 - Reflection-family profile measurement is shared in `subhkl.search.profiles`.
   Finder and integrator retain their existing measurements; `solve` can use
   an explicit measured radial prior through `--profile-file`.
 
-The new workflow is draft functionality: one goniometer setting, flat panels,
+The new workflow is draft functionality: frame-addressed stills/scans, flat panels,
 fixed cell and wavelength band, beam +z. See [migration and limitations](docs/solve.md).
 
 ## [1.4.0]

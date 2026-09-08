@@ -106,6 +106,7 @@ class OrientationModel:
         sigma_px=4.0,
         profile=None,
         detectors=None,
+        sample_origin=None,
     ):
         if sigma_px <= 0 or not 0 < wavelength[0] < wavelength[1]:
             raise ValueError("positive PSF width and ordered positive band required")
@@ -114,6 +115,9 @@ class OrientationModel:
         self.d_min = float(d_min)
         self.sigma_px = float(sigma_px)
         self.profile, self.base_detectors = profile, detectors
+        self.sample_origin = (
+            np.zeros(3) if sample_origin is None else np.asarray(sample_origin, float)
+        )
         self.B, self.G = reciprocal_lattice(cell, space_group, d_min)
         self.n_hkl = len(self.G)
         self.banks = list(data.pixel_indices)
@@ -125,7 +129,7 @@ class OrientationModel:
         Invisible reflections retain zero columns, preserving intensity IDs
         as the geometry and orientations change. Masked flux is not renormalized.
         """
-        dets = self.detectors(g)
+        dets = self.projection_detectors(g)
         rows, cols, values = [], [], []
         sig = self.sigma_px / self.data.bin_px
         support = 5.0 if self.profile is None else self.profile.u[-1]
@@ -182,11 +186,11 @@ class OrientationModel:
         )
 
     def detectors(self, g):
+        g7 = np.asarray(g, float) if len(g) == 7 else geometry_vector(g)
         if self.base_detectors is None:
-            return geometry_detectors(self.instrument, geometry_vector(g), self.banks)
+            return geometry_detectors(self.instrument, g7, self.banks)
         from subhkl.instrument.detector import Detector
 
-        g7 = geometry_vector(g)
         rotation = Rotation.from_rotvec(g7[1:4]).as_matrix()
         out = {}
         for bank, det in self.base_detectors.items():
@@ -195,6 +199,14 @@ class OrientationModel:
             cfg["uhat"], cfg["vhat"] = rotation @ det.uhat, rotation @ det.vhat
             out[bank] = Detector(cfg)
         return out
+
+    def projection_detectors(self, g):
+        from subhkl.instrument.detector import Detector
+
+        return {
+            bank: Detector(dict(det.config, center=det.center - self.sample_origin))
+            for bank, det in self.detectors(g).items()
+        }
 
 
 @dataclass
@@ -467,25 +479,30 @@ def refine(
     intentionally simple reference implementation prioritizes an inspectable
     objective over speed; it is not a replacement for a global indexer.
     """
-    g0 = np.zeros(6) if g0 is None else np.asarray(g0, float)
+    ng = getattr(model, "geometry_size", 6)
+    g0 = np.zeros(ng) if g0 is None else np.asarray(g0, float)
     orientations = np.asarray(orientations, float)
     n = len(orientations)
     A0 = model.design(orientations, g0)
     weights = orientation_weights(A0, model.data, n)
     units = np.array([0.03, 0.02, 0.02, 0.005, 0.005, 0.005])
+    limits = np.array([0.08, 0.05, 0.05, 0.02, 0.02, 0.02])
+    if ng == 7:
+        units = np.insert(units, 3, 0.02)
+        limits = np.insert(limits, 3, 0.05)
     extra = 3 * n if refine_orientations else 0
     x0 = np.r_[g0 / units, np.zeros(extra)]
     bounds = (
         list(
             zip(
-                -np.array([0.08, 0.05, 0.05, 0.02, 0.02, 0.02]) / units,
-                np.array([0.08, 0.05, 0.05, 0.02, 0.02, 0.02]) / units,
+                -limits / units,
+                limits / units,
             )
         )
         + [(-3.0, 3.0)] * extra
     )
     if not refine_geometry:
-        bounds[:6] = [(v, v) for v in x0[:6]]
+        bounds[:ng] = [(v, v) for v in x0[:ng]]
     best = {"value": np.inf}
     evaluations = 0
 
@@ -495,11 +512,11 @@ def refine(
     def evaluate(x):
         nonlocal evaluations
         evaluations += 1
-        g = x[:6] * units
+        g = x[:ng] * units
         U = (
             orientations
             if not extra
-            else Rotation.from_rotvec(x[6:].reshape(n, 3) * 0.02).as_matrix()
+            else Rotation.from_rotvec(x[ng:].reshape(n, 3) * 0.02).as_matrix()
             @ orientations
         )
         design = model.design(U, g)

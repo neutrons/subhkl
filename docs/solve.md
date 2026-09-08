@@ -11,19 +11,30 @@ python -m subhkl.io.parser solve pooled.h5 solution.h5 \
   --metadata setting.h5 --d-min 3.2 --penalty 1.2
 ```
 
-`pooled.h5` contains `images` shaped `(banks, rows, columns)` and distinct
-`bank_ids`. Use one still or pool frames recorded at the same setting. Multiple
-images per bank and mixed `goniometer/R` settings are rejected; summing a
-rotation scan is not supported. The metadata file supplies the instrument
-attribute, `sample/{a,b,c,alpha,beta,gamma,space_group}`, the wavelength band at
-`instrument/wavelength`, and the common setting at `goniometer/R`. These can
-live in the counts file instead. Cell/instrument/band values have CLI overrides.
+The input contains `images` shaped `(frames, rows, columns)` and one `bank_ids`
+entry per image. A still, repeated exposures, or a rotation scan can be supplied.
+`file_offsets` and `files` retain run boundaries and labels. Each setting gets
+its own reflection intensities and panel background scales; orientations in
+sample coordinates and detector corrections are shared. Raw images and explicit
+background priors are read one setting at a time. Do not sum images recorded at
+different angles.
 
-Without `goniometer/R`, the sample frame is explicitly defined as the lab
-frame. Supply setting metadata before using the result with a predictor that
-reads nonidentity goniometer angles from the original acquisition. Angles
-without their rotation matrix, nonzero goniometer translations, non-+z beams,
-and curved panels are currently rejected rather than silently approximated.
+Instrument, cell, space group and wavelength metadata can live in the counts
+file or `--metadata`. Goniometer rotations are frame-addressed `goniometer/R`
+(one matrix may be broadcast for a still). When R is absent, the solver computes
+it from `goniometer/axes` and frame-addressed `goniometer/angles`, including
+stored global offsets. Without either representation, sample coordinates are
+defined as lab coordinates. Non-+z beams and curved panels remain unsupported.
+
+Input `goniometer/per_run` corrections are honored. Unfolded `delta_deg` or
+`delta_deg_all_axes` is applied using `frame_to_run` (or `file_offsets`), while
+canonical corrected angles with `angles_nominal` are not corrected twice.
+`goniometer/translations` can be a sample-frame vector or one lever arm per axis;
+`per_run/trans_m` is an additional sample-frame displacement. The forward model
+uses the resulting lab sample origin, separately from detector placement.
+Outputs preserve corrected angles, offsets, run maps, translations and absolute
+detector geometry in the existing consumer layout. These goniometer corrections
+are currently **read and held fixed**, not newly refined by `solve`.
 
 ## What is unified
 
@@ -32,7 +43,11 @@ residuals. It proposes distinct orientations, quotienting by lattice
 symmetries that preserve the allowed reflection set. One nonnegative Poisson
 group-sparse fit then estimates reflection intensities and panel background
 scales. A local outer refinement profiles that same objective over orientations
-and one six-parameter geometry (radial scale, two tilts, three translations).
+and shared detector geometry. Stills use six parameters (radial scale, two
+tilts, three translations); scans free detector roll about the beam as a seventh
+parameter when relative setting rotations do not commute with beam-axis rotation.
+Joint proposals rotate scattering-vector directions into the sample frame while
+retaining the lab scattering angles for wavelength consistency.
 The group weights are frozen at the starting geometry of the fit/refinement.
 
 The proposal score is an acceleration mechanism, not the likelihood itself.
@@ -104,7 +119,10 @@ A supplied metadata file's detector calibration is also honored.
 
 | Dataset/group | Meaning |
 |---|---|
-| `solve/orientations_lab`, `solve/orientations_sample` | Every fitted candidate, in the named frame |
+| `solve/orientations_lab`, `solve/orientations_sample` | Lab orientations `(settings,N,3,3)` for scans, `(N,3,3)` for a still; sample orientations always `(N,3,3)` |
+| `solve/frame_to_setting`, `solve/frame_to_run`, `solve/sample_origin_lab` | Frame-addressed setting/run maps and sample origins |
+| `solve/reflection_setting`, `solve/hkl` | Setting and hkl identity of each intensity column |
+| `solve/geometry_parameter_names` | Explicit six- or seven-parameter ordering |
 | `solve/active`, `solve/group_norms`, `solve/group_weights` | Sparse support and its normalization |
 | `solve/intensities`, `solve/hkl` | Physical reflection flux estimates and column identities |
 | `solve/g`, `solve/background_scales` | Shared geometry increment and background scales |
@@ -176,5 +194,32 @@ An [experimental multi-setting comparison](experiments/poisson-orientations/garn
 reduces garnet orientation error from 0.91 degrees with one setting to 0.46
 with five, and lowers the conditional objective on unused settings by 26.7%.
 It uses a shared sample orientation/geometry and per-setting intensities.
-The experiment is available as a Python model and script; the CLI remains
-limited to one setting.
+The original experiment held detector roll fixed for a controlled comparison;
+the scan-aware CLI now enables it when identifiable.
+
+
+## Finder-free visual acceptance
+
+```bash
+python -m subhkl.io.parser indexer-visualize solution.h5 \
+  --images merged.h5 --output-dir overlays
+```
+
+No peaks table is required for `solve` output. The overlay uses its own calibrated
+panels, per-frame rotations and sample origins, draws all active orientations,
+and renders each setting separately. `--image-index` selects one frame. If
+`--images` is omitted, the recorded counts source is used when available.
+Unconverged or empty-support results can be inspected as candidate diagnostics:
+plots and filenames explicitly carry `DIAGNOSTIC` and the solver status. This
+does not create `sample/U` or promote an unsuccessful fit to a usable solution.
+
+On the real 21-setting garnet stack (1114 panel frames), the CLI accepted the
+scan and wrote full frame-addressed diagnostics. The seeded no-refinement probe
+at d_min 1.5, binning 16 still failed its initial intensity stopping test
+(residual 2.20e-4); this is not a successful full-scan calibration. All 21
+finder-free overlays rendered with the failure status visible.
+
+[Scan/visualizer diagnostics](experiments/poisson-orientations/garnet-scan-io.json)
+and one of the 21 generated overlays (explicitly an unconverged diagnostic):
+
+![Garnet run 2022 diagnostic zone overlay](experiments/poisson-orientations/garnet-scan-overlay.png)

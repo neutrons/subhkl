@@ -37,7 +37,7 @@ Important restrictions:
 - This experiment uses nominal encoder rotations; it does not fit goniometer offsets, per-run translations, or per-panel geometry. More frames can expose inconsistency in those fixed assumptions.
 - Detector roll about the beam remains fixed to match the one-setting model. The single-still gauge argument does **not** generally extend to settings whose rotations do not commute with rotation about the beam: R_s U must hold simultaneously, so a common lab beam-axis rotation cannot generally be absorbed in one U. A complete joint calibration should revisit this parameter.
 - The reference orientation is used for scoring and the explicitly labeled fixed-orientation profiles. It is not used to initialize joint refinement. These probes do not test blind multi-setting proposal generation or multi-crystal discovery.
-- This is an experimental numerical API and comparison script. The production `solve` CLI still rejects mixed settings; no unsupported output contract has been introduced.
+- This is an experimental numerical API and comparison script. These measurements predate scan support in the CLI; current `solve` accepts mixed settings and frees identifiable detector roll. The historical comparison script retains its fixed-roll model.
 
 Reproduce with:
 

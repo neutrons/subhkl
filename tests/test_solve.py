@@ -148,7 +148,7 @@ def test_cli_executes_count_workflow(scene, tmp_path):
         assert f["solve"].attrs["status"] == "converged"
 
 
-def test_mixed_settings_are_rejected(scene, tmp_path):
+def test_unaddressed_rotations_are_rejected(scene, tmp_path):
     frame, *_ = scene
     metadata = tmp_path / "mixed.h5"
     with h5py.File(frame) as src, h5py.File(metadata, "w") as f:
@@ -156,7 +156,7 @@ def test_mixed_settings_are_rejected(scene, tmp_path):
         src.copy("instrument", f)
         f.attrs["instrument"] = "CG4D"
         f["goniometer/R"] = [np.eye(3), Rotation.from_rotvec([0.1, 0, 0]).as_matrix()]
-    with pytest.raises(ValueError, match="mixed goniometer"):
+    with pytest.raises(ValueError, match="frame-addressed"):
         run_solve(frame, tmp_path / "bad.h5", metadata=metadata, do_refine=False)
 
 

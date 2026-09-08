@@ -32,9 +32,7 @@ app = typer.Typer()
 def solve(
     frames_filename: Annotated[
         str,
-        typer.Argument(
-            help="One still or one-setting pooled HDF5 counts (images + bank_ids)"
-        ),
+        typer.Argument(help="Still or rotation-scan HDF5 counts (images + bank_ids)"),
     ],
     output_filename: Annotated[
         str, typer.Argument(help="Joint orientation/geometry result HDF5")
@@ -122,7 +120,7 @@ def solve(
     """Solve orientation support and detector geometry from counts together.
 
     Replaces calibrate and spherical-index. Draft scope: flat panels, beam +z,
-    known cell/band, one goniometer setting. All valid count bins contribute.
+    known cell/band, frame-addressed goniometer settings. All valid bins contribute.
     """
     from subhkl.solve import run_solve
 

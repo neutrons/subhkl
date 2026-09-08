@@ -103,8 +103,9 @@ python -m subhkl.io.parser solve pooled.h5 solution.h5 \
 ```
 
 The current draft handles flat panels, beam +z, a known cell/wavelength band,
-and one still or frames pooled at a single goniometer setting. It is not a
-replacement for the old command's multi-setting/goniometer-refinement modes.
+and frame-addressed stills or rotation scans. Existing goniometer corrections
+are honored; fitting new global/per-run goniometer corrections remains future
+work. `indexer-visualize` overlays zones on the counts without a peaks table.
 See [the solve workflow and migration guide](docs/solve.md) for input/output
 contracts, measured profile priors, limitations, and validation.
 

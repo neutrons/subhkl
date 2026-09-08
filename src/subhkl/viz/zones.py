@@ -62,6 +62,7 @@ def zone_curve_points(
     max_index=1,
     n_arc=1440,
     label_max=13,
+    sample_origin=None,
 ):
     """Per-panel lab positions of the low-index zone conics.
 
@@ -70,6 +71,13 @@ def zone_curve_points(
     image index (the unrolled replay layout) alike.  Returns a list of
     {"label", "color", "points": {key: (Ni, 3) lab xyz}} per zone [uvw].
     """
+    from subhkl.instrument.detector import Detector
+
+    origin = np.zeros(3) if sample_origin is None else np.asarray(sample_origin, float)
+    projected = {
+        key: Detector(dict(det.config, center=det.center - origin))
+        for key, det in detectors.items()
+    }
     R = np.eye(3) if R_gonio is None else np.asarray(R_gonio, dtype=float)
     ki_hat = np.asarray(ki, dtype=float)
     ki_hat = ki_hat / np.linalg.norm(ki_hat)
@@ -93,7 +101,9 @@ def zone_curve_points(
         kf = ki_hat[None, :] - 2.0 * (G @ ki_hat)[:, None] * G
         points = {}
         for key, det in detectors.items():
-            mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
+            mask, row, col = projected[key].reflections_mask(
+                kf[:, 0], kf[:, 1], kf[:, 2]
+            )
             if np.any(mask):
                 points[key] = det.pixel_to_lab(row[mask], col[mask])
         out.append(

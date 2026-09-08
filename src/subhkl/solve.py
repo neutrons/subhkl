@@ -1,6 +1,6 @@
 """Shared threshold-free count workflow for orientation and detector geometry.
 
-The draft workflow accepts a single still or frames pooled at one setting.
+The workflow accepts stills and frame-addressed rotation scans.
 Global lattice proposals seed a Poisson group fit; geometry and orientations
 then refine together. Numerical engines from the retired commands remain
 available as Python comparison APIs, but are not invoked by this workflow.
@@ -46,15 +46,15 @@ def _rotations(value):
     return value
 
 
-def propose(model, cell, n_candidates=4, proposal_bin=32, g=None):
+def _proposal_data(model, proposal_bin, g=None):
     """Use every valid signed residual in spatial bins; no detection cutoff."""
-    from subhkl.search.spherical import lattice_ladder, panel_directions
+    from subhkl.search.spherical import panel_directions
 
     data = model.data
     factor = proposal_bin // data.bin_px
     if factor < 1 or proposal_bin % data.bin_px:
         raise ValueError("proposal binning must be a multiple of count binning")
-    dets = model.detectors(np.zeros(6) if g is None else g)
+    dets = model.projection_detectors(np.zeros(6) if g is None else g)
     dirs, residuals = [], []
     for bank in model.banks:
         index = data.pixel_indices[bank]
@@ -76,7 +76,26 @@ def propose(model, cell, n_candidates=4, proposal_bin=32, g=None):
         col = col.reshape(shape).sum(axis=(1, 3))[live] / count[live]
         dirs.append(panel_directions(dets[bank], row, col))
         residuals.append(residual.reshape(shape).sum(axis=(1, 3))[live])
-    D, weights = np.concatenate(dirs), np.concatenate(residuals)
+    return np.concatenate(dirs), np.concatenate(residuals)
+
+
+def propose(model, cell, n_candidates=4, proposal_bin=32, g=None):
+    """Joint signed count proposals in the sample frame for multiple settings."""
+    from subhkl.search.spherical import lattice_ladder
+    from subhkl.search.multi_setting import MultiSettingModel
+
+    if isinstance(model, MultiSettingModel):
+        directions, residuals, angles = [], [], []
+        for child, rotation in zip(model.models, model.rotations):
+            D, w = _proposal_data(child, proposal_bin, g)
+            directions.append(D @ rotation)
+            residuals.append(w)
+            angles.append(-D[:, 2])
+        D, weights = np.concatenate(directions), np.concatenate(residuals)
+        sin_theta = np.concatenate(angles)
+    else:
+        D, weights = _proposal_data(model, proposal_bin, g)
+        sin_theta = -D[:, 2]
     if not np.any(weights):
         raise ValueError(
             "no residual evidence for orientation proposals; supply a bootstrap to test the null"
@@ -96,7 +115,7 @@ def propose(model, cell, n_candidates=4, proposal_bin=32, g=None):
             (60, 0.3, 0.5, pool, 5),
             (145, 0.3, 0.25, pool, 5),
         ),
-        sin_theta=-D[:, 2],
+        sin_theta=sin_theta,
         wavelength=model.wavelength,
         d_min=model.d_min,
         cands=None,
@@ -159,7 +178,7 @@ def run_solve(
     do_refine=True,
     verbose=True,
 ):
-    """Solve one still/one-setting pooled stack and atomically write its result."""
+    """Solve stills or a rotation scan and atomically write frame-addressed results."""
     inputs = [
         frames_filename,
         metadata,
@@ -184,11 +203,9 @@ def run_solve(
         )
     log = print if verbose else lambda *args: None
     with h5py.File(frames_filename, "r") as f:
-        images, banks = f["images"][()], f["bank_ids"][()].astype(int)
-    if images.ndim != 3 or len(banks) != len(images) or len(set(banks)) != len(banks):
-        raise ValueError(
-            "solve requires one image per bank: select one still or pool one setting first"
-        )
+        image_shape, banks = f["images"].shape, f["bank_ids"][()].astype(int)
+    if len(image_shape) != 3 or len(banks) != image_shape[0] or len(banks) == 0:
+        raise ValueError("solve requires a nonempty image stack with matching bank_ids")
     source = metadata or frames_filename
     with h5py.File(source, "r") as f:
         instrument = instrument or f.attrs.get("instrument")
@@ -209,30 +226,26 @@ def run_solve(
             if "instrument/wavelength" in f
             else (None, None)
         )
-        R = (
-            _rotations(f["goniometer/R"][()])
-            if "goniometer/R" in f
-            else np.eye(3)[None]
-        )
-        if not np.allclose(R, R[0], atol=1e-6):
-            raise ValueError(
-                "mixed goniometer settings are not supported; solve one setting at a time"
+        from subhkl.solve_frames import frame_kinematics, setting_groups
+
+        with h5py.File(frames_filename, "r") as frames:
+            file_offsets = (
+                frames["file_offsets"][()] if "file_offsets" in frames else None
             )
+        if file_offsets is None and "file_offsets" in f:
+            file_offsets = f["file_offsets"][()]
+        R, origins, run_ids, corrected_angles, angles_changed = frame_kinematics(
+            f, len(banks), file_offsets
+        )
         R0 = R[0]
-        if "goniometer/R" not in f:
-            if "goniometer/angles" in f:
-                raise ValueError("setting angles need matching goniometer/R metadata")
+        groups = setting_groups(banks, R, origins, run_ids)
+        multi = len(groups) > 1
+        if "goniometer/R" not in f and "goniometer/angles" not in f:
             log(
-                "No goniometer/R supplied: defining the output sample frame as the lab frame."
+                "No goniometer metadata supplied: defining the sample frame as the lab frame."
             )
         if "beam/ki_vec" in f and not np.allclose(f["beam/ki_vec"][()], [0, 0, 1]):
             raise ValueError("draft solve currently requires incident beam +z")
-        if "goniometer/translations" in f and not np.allclose(
-            f["goniometer/translations"][()], 0
-        ):
-            raise ValueError(
-                "nonzero goniometer translations require a common-origin geometry model"
-            )
     if instrument is None or cell is None or space_group is None:
         raise ValueError(
             "provide instrument, six cell values, and space group via metadata or options"
@@ -256,12 +269,12 @@ def run_solve(
         or not 0 < band[0] < band[1]
     ):
         raise ValueError("provide an ordered positive wavelength band")
-    dets = geometry_detectors(instrument, np.zeros(7), list(banks))
+    dets = geometry_detectors(instrument, np.zeros(7), list(dict.fromkeys(banks)))
     if set(dets) != set(banks):
         raise ValueError("input contains banks absent from instrument geometry")
-    for bank, im in zip(banks, images):
+    for bank in set(banks):
         d = dets[bank]
-        if d.config["panel"] != "flat" or im.shape != (d.n, d.m):
+        if d.config["panel"] != "flat" or image_shape[1:] != (d.n, d.m):
             raise ValueError(
                 "draft solve requires full flat-panel images matching instrument geometry"
             )
@@ -283,47 +296,99 @@ def run_solve(
         from subhkl.search.static_mask import load_mask_for_banks
 
         masks = (
-            load_mask_for_banks(static_mask_file, list(banks), images.shape[1:]) > 0.5
+            load_mask_for_banks(static_mask_file, list(banks), image_shape[1:]) > 0.5
         )
-    # Construct binned data before estimating shape, so all validity handling
-    # and count conservation lives in CountData, not a spot detector.
-    data = CountData.from_images(images, banks, np.ones(len(banks)), binning, masks)
+    bg = None
     if background_file:
         with h5py.File(background_file, "r") as f:
             ref_banks = f["bank_ids"][()].astype(int)
-            if len(set(ref_banks)) != len(ref_banks) or set(ref_banks) != set(banks):
-                raise ValueError("background bank ids must match counts exactly")
-            order = {b: i for i, b in enumerate(ref_banks)}
-            bg = np.asarray([f["images"][order[b]] for b in banks])
-        data.background = CountData.from_images(
-            images, banks, bg, binning, masks
-        ).background
-    else:
-        for bank, index in data.pixel_indices.items():
-            live = index >= 0
-            if not np.any(live):
-                raise ValueError(f"bank {bank} has no valid count bins")
-            frame = np.full(index.shape, np.median(data.counts[index[live]]))
-            frame[live] = data.counts[index[live]]
-            data.background[index[live]] = np.maximum(
-                median_filter(frame, size=7)[live], 0.1
-            )
+            if np.array_equal(ref_banks, banks):
+                bg = np.arange(len(banks))
+            elif len(set(ref_banks)) == len(ref_banks) and set(ref_banks) == set(banks):
+                order = {bank: i for i, bank in enumerate(ref_banks)}
+                bg = np.asarray([order[bank] for bank in banks])
+            else:
+                raise ValueError(
+                    "background bank ids must match counts or provide one image per bank"
+                )
     profile = None
     if profile_file:
         with h5py.File(profile_file, "r") as f:
             profile = RadialProfile(f["profile/u"][()], f["profile/f"][()])
-    model = OrientationModel(
-        data, instrument, cell, space_group, band, d_min, sigma_px, profile, dets
+    children = []
+    for frames in groups:
+        with h5py.File(frames_filename, "r") as raw:
+            setting_images = raw["images"][frames]
+        setting_background = np.ones(len(frames))
+        if bg is not None:
+            with h5py.File(background_file, "r") as raw_bg:
+                setting_background = np.asarray(
+                    [raw_bg["images"][int(i)] for i in bg[frames]]
+                )
+        data = CountData.from_images(
+            setting_images,
+            banks[frames],
+            setting_background,
+            binning,
+            None if masks is None else masks[frames],
+        )
+        if bg is None:
+            for bank, index in data.pixel_indices.items():
+                live = index >= 0
+                if not np.any(live):
+                    raise ValueError(f"bank {bank} has no valid count bins")
+                frame = np.full(index.shape, np.median(data.counts[index[live]]))
+                frame[live] = data.counts[index[live]]
+                data.background[index[live]] = np.maximum(
+                    median_filter(frame, size=7)[live], 0.1
+                )
+        children.append(
+            OrientationModel(
+                data,
+                instrument,
+                cell,
+                space_group,
+                band,
+                d_min,
+                sigma_px,
+                profile,
+                {bank: dets[bank] for bank in banks[frames]},
+                origins[frames[0]],
+            )
+        )
+    if multi:
+        from subhkl.search.multi_setting import MultiSettingModel
+
+        model = MultiSettingModel(
+            children,
+            R[[frames[0] for frames in groups]],
+            free_roll=not np.allclose(
+                (R @ R[0].T) @ np.array([0.0, 0.0, 1.0]),
+                [0.0, 0.0, 1.0],
+                atol=1e-8,
+                rtol=0,
+            ),
+        )
+    else:
+        model = children[0]
+    data = model.data
+    log(
+        f"Reflection dictionary: {children[0].n_hkl} hkl per setting; {len(groups)} setting(s)"
     )
-    log(f"Reflection dictionary: {model.n_hkl} hkl at d_min={d_min:g} Angstrom")
     if bootstrap:
         with h5py.File(bootstrap, "r") as f:
-            if "solve/orientations_lab" in f:
-                orientations = _rotations(f["solve/orientations_lab"][()])
+            if "solve/orientations_sample" in f:
+                sample = _rotations(f["solve/orientations_sample"][()])
+                orientations = sample if multi else R0 @ sample
+            elif "solve/orientations_lab" in f:
+                lab = _rotations(f["solve/orientations_lab"][()])
+                orientations = R0.T @ lab if multi else lab
             elif "orientations" in f:
-                orientations = _rotations(f["orientations"][()])
+                lab = _rotations(f["orientations"][()])
+                orientations = R0.T @ lab if multi else lab
             else:
-                orientations = R0 @ _rotations(f["sample/U"][()])
+                sample = _rotations(f["sample/U"][()])
+                orientations = sample if multi else R0 @ sample
         scores = np.full(len(orientations), np.nan)
     else:
         log("Searching orientations from all signed count residuals...")
@@ -331,7 +396,7 @@ def run_solve(
     log(
         f"Fitting {len(orientations)} orientation candidates on {len(data.counts)} valid count bins"
     )
-    g = np.zeros(6)
+    g = np.zeros(getattr(model, "geometry_size", 6))
     fit = fit_intensities(
         model.design(orientations, g), data, len(orientations), penalty, rtol=1e-6
     )
@@ -376,18 +441,58 @@ def run_solve(
             out["sample/B"] = model.B
             out["instrument/wavelength"] = band
             out["beam/ki_vec"] = [0.0, 0.0, 1.0]
-            out["goniometer/R"] = R0[None]
+            out["goniometer/R"] = R
             # Preserve the setting metadata consumed by the predictor.
             with h5py.File(source, "r") as meta:
                 if "goniometer" in meta:
                     for key in meta["goniometer"]:
-                        if key != "R":
+                        if key != "R" and not (
+                            key == "angles" and corrected_angles is not None
+                        ):
                             meta.copy(f"goniometer/{key}", out["goniometer"])
+            if corrected_angles is not None:
+                out["goniometer/angles"] = corrected_angles
+                # Predictor displacements ride on the innermost lever arm.
+                # Canonicalize a sample-frame vector to that native layout.
+                if "goniometer/translations" in out and out[
+                    "goniometer/translations"
+                ].shape == (3,):
+                    lever = np.zeros((corrected_angles.shape[1], 3))
+                    lever[-1] = out["goniometer/translations"][()]
+                    del out["goniometer/translations"]
+                    out["goniometer/translations"] = lever
+                if angles_changed and "goniometer/angles_nominal" not in out:
+                    with h5py.File(source, "r") as meta:
+                        out["goniometer/angles_nominal"] = meta["goniometer/angles"][()]
+            if (
+                "goniometer/per_run" in out
+                and "goniometer/per_run/frame_to_run" not in out
+            ):
+                out["goniometer/per_run/frame_to_run"] = run_ids
+            if (
+                "goniometer/per_run/trans_m" in out
+                and "goniometer/translations" not in out
+                and corrected_angles is not None
+            ):
+                out["goniometer/translations"] = np.zeros(
+                    (corrected_angles.shape[1], 3)
+                )
+            with h5py.File(frames_filename, "r") as frames:
+                for key in ("files", "file_offsets"):
+                    if key in frames:
+                        frames.copy(key, out)
+            with h5py.File(source, "r") as meta:
+                for key in ("files", "file_offsets"):
+                    if key not in out and key in meta:
+                        meta.copy(key, out)
             out["bank_ids"] = banks
-            write_detector_calibration(out, model.detectors(g))
+            absolute = {}
+            for child in children:
+                absolute.update(child.detectors(g))
+            write_detector_calibration(out, absolute)
             report = out.create_group("solve")
             report.attrs["status"] = status
-            report.attrs["orientation_frame"] = "lab"
+            report.attrs["orientation_frame"] = "sample" if multi else "lab"
             report.attrs["binning"] = binning
             report.attrs["d_min"] = d_min
             report.attrs["requested_candidates"] = n_candidates
@@ -405,14 +510,34 @@ def run_solve(
             report.attrs["profile_source"] = str(profile_file or "Gaussian")
             report.attrs["bootstrap"] = str(bootstrap or "")
             report["g"] = g
-            report["orientations_lab"] = orientations
-            report["orientations_sample"] = R0.T @ orientations
+            sample = orientations if multi else R0.T @ orientations
+            report["orientations_sample"] = sample
+            report["orientations_lab"] = (
+                np.einsum("sij,njk->snik", model.rotations, sample)
+                if multi
+                else orientations
+            )
+            frame_to_setting = np.empty(len(banks), int)
+            for setting, frames in enumerate(groups):
+                frame_to_setting[frames] = setting
+            report["frame_to_setting"] = frame_to_setting
+            report["frame_to_run"] = run_ids
+            report["sample_origin_lab"] = origins
+            report["setting_first_frame"] = [frames[0] for frames in groups]
+            report["geometry_parameter_names"] = np.asarray(
+                ["scale", "tilt_x", "tilt_y"]
+                + (["roll_z"] if len(g) == 7 else [])
+                + ["tx", "ty", "tz"],
+                dtype=h5py.string_dtype(),
+            )
             report["proposal_scores"] = scores
             report["active"] = active
             report["group_norms"] = fit.group_norms
             report["group_weights"] = fit.weights
             report["intensities"] = fit.intensities
-            report["hkl"] = np.rint(model.G @ np.linalg.inv(model.B).T).astype(int)
+            hkl = np.rint(model.G @ np.linalg.inv(model.B).T).astype(int)
+            report["hkl"] = np.tile(hkl, (len(groups), 1))
+            report["reflection_setting"] = np.repeat(np.arange(len(groups)), len(hkl))
             report["background_scales"] = fit.background_scales
             report["objective_initial"] = initial
             report["objective_final"] = fit.objective
@@ -427,7 +552,7 @@ def run_solve(
             if len(active) and success:
                 primary = int(active[np.argmax(fit.group_norms[active])])
                 report["primary_orientation"] = primary
-                out["sample/U"] = R0.T @ orientations[primary]
+                out["sample/U"] = sample[primary]
         os.replace(tmp, output)
     finally:
         if os.path.exists(tmp):
