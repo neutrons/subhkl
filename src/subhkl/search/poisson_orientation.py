@@ -459,6 +459,7 @@ def refine(
     refine_orientations=True,
     refine_geometry=True,
     log=None,
+    inner_max_iter=2000,
 ):
     """Profile the same objective over a local geometry/orientation search.
 
@@ -501,16 +502,30 @@ def refine(
             else Rotation.from_rotvec(x[6:].reshape(n, 3) * 0.02).as_matrix()
             @ orientations
         )
+        design = model.design(U, g)
         fit = fit_intensities(
-            model.design(U, g),
+            design,
             model.data,
             n,
             penalty,
             weights,
-            max_iter=2000,
+            max_iter=inner_max_iter,
             tol=2e-5,
             rtol=1e-6,
         )
+        if not fit.converged and inner_max_iter < 2000:
+            # A short first pass is useful for large setting stacks. Retry
+            # difficult evaluations with the standard budget before failing.
+            fit = fit_intensities(
+                design,
+                model.data,
+                n,
+                penalty,
+                weights,
+                max_iter=2000,
+                tol=2e-5,
+                rtol=1e-6,
+            )
         if fit.objective < best["value"]:
             best.update(value=fit.objective, g=g.copy(), orientations=U.copy(), fit=fit)
             if log:

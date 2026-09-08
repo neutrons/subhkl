@@ -171,3 +171,10 @@ With the richer garnet dictionary, joint refinement improves the objective and
 reaches a 6.30% radial correction, but the orientation drifts to 1.31 degrees
 from the reference and the outer evaluation budget is exhausted. The result
 remains diagnostic, not a validated calibration.
+
+An [experimental multi-setting comparison](experiments/poisson-orientations/garnet-multi-setting.md)
+reduces garnet orientation error from 0.91 degrees with one setting to 0.46
+with five, and lowers the conditional objective on unused settings by 26.7%.
+It uses a shared sample orientation/geometry and per-setting intensities.
+The experiment is available as a Python model and script; the CLI remains
+limited to one setting.
