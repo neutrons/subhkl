@@ -400,6 +400,11 @@ def run_solve(
     fit = fit_intensities(
         model.design(orientations, g), data, len(orientations), penalty, rtol=1e-6
     )
+    log(
+        f"Initial stationarity: reflections {fit.reflection_kkt:g}, "
+        f"backgrounds {fit.background_kkt:g}; tolerance {fit.kkt_tolerance:g} "
+        f"({fit.newton_iterations} Newton, {fit.cg_iterations} CG iterations)"
+    )
     if not fit.converged:
         log(f"initial intensity solve did not converge (residual {fit.kkt:g})")
     initial = fit.objective
@@ -543,6 +548,10 @@ def run_solve(
             report["objective_final"] = fit.objective
             report["stationarity_residual"] = fit.kkt
             report["stationarity_tolerance"] = fit.kkt_tolerance
+            report["reflection_stationarity_residual"] = fit.reflection_kkt
+            report["background_stationarity_residual"] = fit.background_kkt
+            report["newton_iterations"] = fit.newton_iterations
+            report["cg_iterations"] = fit.cg_iterations
             report["inner_converged"] = fit.converged
             if optimizer is not None:
                 report.attrs["optimizer_message"] = str(optimizer.message)

@@ -221,6 +221,10 @@ class SparseFit:
     converged: bool
     weights: np.ndarray
     kkt_tolerance: float
+    reflection_kkt: float
+    background_kkt: float
+    newton_iterations: int
+    cg_iterations: int
 
 
 def orientation_weights(A, data, n_groups):
@@ -314,6 +318,7 @@ def fit_intensities(
             weights @ np.linalg.norm(z[:-nb].reshape(n_groups, size), axis=1)
         )
 
+    newton_iterations, cg_iterations = 0, 0
     step, kkt = 1.0, np.inf
     f, mu = smooth(x)
     extrapolated, momentum = x.copy(), 1.0
@@ -397,56 +402,54 @@ def fit_intensities(
             grad = np.asarray(M.T @ (1 - y / mu))
             kkt = float(np.max(np.abs(x - prox(x - grad, 1.0))))
             iteration += polished.nit
-        # A few reduced Newton steps remove the objective-roundoff floor of
-        # L-BFGS on bright data. Only free coefficients enter this small dense
-        # system; large problems retain the checked proximal/L-BFGS result.
-        for _ in range(12):
+        # Eliminate the diagonal panel-background block and solve the
+        # reflection Schur complement with preconditioned conjugate gradients.
+        # This path applies at every problem size, including full scans.
+        from subhkl.search.poisson_newton import schur_direction
+
+        for _ in range(50):
+            if kkt < tolerance:
+                break
             value, gradient = value_gradient(x)
-            free = (x > 1e-9) | (gradient < 0)
-            free[:-nb] &= active_columns
-            indices = np.flatnonzero(free)
-            if kkt < tolerance or len(indices) > 512:
-                break
-            reduced = M[:, indices]
-            hessian = (reduced.T @ reduced.multiply((y / mu**2)[:, None])).toarray()
-            for group in range(n_groups):
-                start, end = group * size, (group + 1) * size
-                pos = np.flatnonzero((indices >= start) & (indices < end))
-                norm = np.linalg.norm(x[start:end])
-                if len(pos) and norm > 0:
-                    z = x[indices[pos]] / norm
-                    hessian[np.ix_(pos, pos)] += (
-                        penalty
-                        * weights[group]
-                        / norm
-                        * (np.eye(len(pos)) - np.outer(z, z))
-                    )
-            direction = np.linalg.lstsq(hessian, -gradient[indices], rcond=1e-12)[0]
-            descent = gradient[indices] @ direction
-            if descent >= 0:
-                break
-            negative = direction < 0
-            length = (
-                min(1.0, float(np.min(-x[indices[negative]] / direction[negative])))
-                if np.any(negative)
-                else 1.0
+            direction, linear_iterations, _ = schur_direction(
+                M, y / mu**2, x, gradient, penalty * weights, nb
             )
-            for _ in range(30):
-                trial = x.copy()
-                trial[indices] = np.maximum(x[indices] + length * direction, 0)
-                trial[-nb:] = np.maximum(trial[-nb:], 1e-10)
-                ft, mt = smooth(trial)
-                if ft + regularizer(
-                    trial
-                ) <= value + 1e-4 * length * descent + 1e-12 * max(1, abs(value)):
-                    x, f, mu = trial, ft, mt
+            newton_iterations += 1
+            cg_iterations += linear_iterations
+            # Projection permits coefficients to enter or leave their bounds;
+            # the old fraction-to-boundary step could get stuck at length zero.
+            accepted = False
+            smooth_grad = np.asarray(M.T @ (1 - y / mu))
+            for candidate in (
+                direction,
+                prox(x - smooth_grad, 1.0) - x,
+            ):
+                length = 1.0
+                for _ in range(40):
+                    trial = np.maximum(x + length * candidate, 0.0)
+                    trial[-nb:] = np.maximum(trial[-nb:], 1e-10)
+                    delta = trial - x
+                    ft, mt = smooth(trial)
+                    # This composite directional bound also covers groups
+                    # entering from zero, where the norm is nonsmooth.
+                    descent = smooth_grad @ delta + regularizer(trial) - regularizer(x)
+                    if descent < 0 and ft + regularizer(
+                        trial
+                    ) <= value + 1e-4 * descent + 1e-12 * max(1, abs(value)):
+                        x, f, mu = trial, ft, mt
+                        accepted = True
+                        break
+                    length *= 0.5
+                if accepted:
                     break
-                length *= 0.5
-            else:
+            if not accepted:
                 break
             grad = np.asarray(M.T @ (1 - y / mu))
             kkt = float(np.max(np.abs(x - prox(x - grad, 1.0))))
             iteration += 1
+    grad = np.asarray(M.T @ (1 - y / mu))
+    residual = np.abs(x - prox(x - grad, 1.0))
+    kkt = float(np.max(residual))
     norms = np.linalg.norm(x[:-nb].reshape(n_groups, size), axis=1)
     return SparseFit(
         (x[:-nb] / scale).reshape(n_groups, size),
@@ -459,6 +462,10 @@ def fit_intensities(
         kkt < tolerance,
         weights.copy(),
         tolerance,
+        float(np.max(residual[:-nb], initial=0)),
+        float(np.max(residual[-nb:], initial=0)),
+        newton_iterations,
+        cg_iterations,
     )
 
 

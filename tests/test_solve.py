@@ -101,6 +101,15 @@ def test_solve_writes_all_components_and_sample_frame_without_global_mutation(
         np.testing.assert_allclose(f["sample/U"][()], R.T @ U[primary])
         assert f["solve/intensities"].shape[0] == 3
         assert f["solve/hkl"].shape[1] == 3
+        assert (
+            max(
+                f["solve/reflection_stationarity_residual"][()],
+                f["solve/background_stationarity_residual"][()],
+            )
+            == f["solve/stationarity_residual"][()]
+        )
+        assert f["solve/newton_iterations"][()] >= 0
+        assert f["solve/cg_iterations"][()] >= 0
         expected = geometry_detectors("CG4D", geometry_vector(g))
         np.testing.assert_allclose(
             f["detector_calibration/bank_62/center"][()], expected[62].center

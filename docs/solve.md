@@ -144,8 +144,14 @@ Stationarity is checked at the accepted coefficients with a unit proximal
 step, independent of the line-search step. The threshold is `atol + rtol *
 max(1, largest group penalty)` in Fisher-normalized coefficient units;
 `solve` uses `rtol=1e-6`, with `atol=1e-5` initially and `2e-5` during refinement.
-Support-constrained L-BFGS and small reduced Newton systems polish difficult
+Support-constrained L-BFGS and matrix-free Newton steps polish difficult
 fits, followed by the full stationarity check, including inactive groups.
+Newton steps eliminate the diagonal panel-background block and solve the
+reflection Schur complement with preconditioned conjugate gradients, without
+a dense Hessian or a problem-size cutoff. The output records separate
+`reflection_stationarity_residual` and `background_stationarity_residual`
+datasets under `solve`, plus `newton_iterations` and `cg_iterations` for the
+returned intensity fit.
 Background-only pixels are summed by panel as exact sufficient statistics;
 the reported objective and predicted mean retain the original pixel likelihood.
 
@@ -214,9 +220,15 @@ plots and filenames explicitly carry `DIAGNOSTIC` and the solver status. This
 does not create `sample/U` or promote an unsuccessful fit to a usable solution.
 
 On the real 21-setting garnet stack (1114 panel frames), the CLI accepted the
-scan and wrote full frame-addressed diagnostics. The seeded no-refinement probe
-at d_min 1.5, binning 16 still failed its initial intensity stopping test
-(residual 2.20e-4); this is not a successful full-scan calibration. All 21
+scan and wrote full frame-addressed diagnostics. The original seeded
+no-refinement probe at d_min 1.5, binning 16 failed its initial intensity
+stopping test (residual 2.20e-4). Repeating the same fixed dictionary with
+matrix-free Newton polishing passes at 4.80e-9, against the unchanged 5.37e-5
+tolerance, with one Newton step and 14 CG iterations. The full CLI
+no-refinement rerun also passes. This isolates a numerical failure of the
+inner solver; it does not validate orientation proposals or full-scan
+calibration. See the [fixed-dictionary comparison](experiments/poisson-orientations/garnet-scan-newton.json).
+All 21 original
 finder-free overlays rendered with the failure status visible.
 
 [Scan/visualizer diagnostics](experiments/poisson-orientations/garnet-scan-io.json)
