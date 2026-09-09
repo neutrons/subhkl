@@ -1,0 +1,61 @@
+{
+  "settings": [
+    2,
+    8,
+    18
+  ],
+  "angles_deg": [
+    [
+      0.0,
+      45.0,
+      0.0,
+      45.0,
+      76.0
+    ],
+    [
+      0.0,
+      45.0,
+      0.0,
+      45.0,
+      94.0
+    ],
+    [
+      0.0,
+      45.0,
+      0.0,
+      45.0,
+      123.0
+    ]
+  ],
+  "binning": 16,
+  "seed_error_deg": 0.5711925517516737,
+  "count_bins": 164864,
+  "reference_radial_profile": [],
+  "max_evals": 1500,
+  "conditional_evaluation": [
+    {
+      "source": "garnet-multi-one.json",
+      "source_outer_converged": true,
+      "objective": 5976993.891662978,
+      "converged": true,
+      "kkt": 5.509905587786079e-06,
+      "kkt_tolerance": 2.6714065932620944e-05
+    },
+    {
+      "source": "garnet-multi-three.json",
+      "source_outer_converged": true,
+      "objective": 4786648.148956446,
+      "converged": true,
+      "kkt": 3.1571745218172964e-10,
+      "kkt_tolerance": 2.6714065932620944e-05
+    },
+    {
+      "source": "garnet-multi-five.json",
+      "source_outer_converged": true,
+      "objective": 4381140.202610179,
+      "converged": true,
+      "kkt": 1.5151136734115056e-09,
+      "kkt_tolerance": 2.6714065932620944e-05
+    }
+  ]
+}

@@ -1726,7 +1726,10 @@ def lattice_ladder(
         if weights is None
         else np.asarray(weights, np.float32)
     )
-    w = w / max(w.sum(), 1e-12)
+    # Dense count proposals carry signed residuals, including negative total
+    # excess. Absolute normalization preserves those signs without amplifying
+    # a nonpositive sum by 1e12; positive peak weights are unchanged.
+    w = w / max(np.abs(w).sum(), 1e-12)
     # pad the spots to a power of two so the exact kernel compiles once per
     # size class, not once per still
     n_pad = 1 << int(np.ceil(np.log2(max(len(D), 2))))

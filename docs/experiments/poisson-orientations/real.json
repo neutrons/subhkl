@@ -1,0 +1,167 @@
+{
+  "frames": "/home/xvg/.claude/jobs/cf39132c/tmp/pool/merged_sum.h5",
+  "calibration": "/home/xvg/.claude/jobs/cf39132c/tmp/calibrate_real.h5",
+  "bin_px": 16,
+  "records": [
+    {
+      "geometry": "nominal",
+      "sigma_px": 6.0,
+      "penalty": 1.2,
+      "groups": [
+        131.67355222585397,
+        129.48344465729394,
+        148.04456381525543,
+        123.71844052112097
+      ],
+      "objective": 408582.49359484325,
+      "validation_loglik_gain": 80605.4336508395,
+      "converged": true,
+      "kkt": 3.814432628219163e-05,
+      "iterations": 854,
+      "validation_half_deviance": 377616.3931033734
+    },
+    {
+      "geometry": "nominal",
+      "sigma_px": 6.0,
+      "penalty": 4.0,
+      "groups": [
+        27.228920131941425,
+        20.68544346795606,
+        31.266905735335765,
+        16.726718005503642
+      ],
+      "objective": 453211.89045541233,
+      "validation_loglik_gain": 23552.586246722967,
+      "converged": true,
+      "kkt": 9.985716381053228e-05,
+      "iterations": 707,
+      "validation_half_deviance": 434669.2405074899
+    },
+    {
+      "geometry": "nominal",
+      "sigma_px": 6.0,
+      "penalty": 6.0,
+      "groups": [
+        0.0,
+        0.10984880665703269,
+        0.0,
+        0.0
+      ],
+      "objective": 455862.55378857214,
+      "validation_loglik_gain": 47.62859934506448,
+      "converged": true,
+      "kkt": 7.356350720584663e-05,
+      "iterations": 1339,
+      "validation_half_deviance": 458174.19815486774
+    },
+    {
+      "geometry": "nominal",
+      "sigma_px": 6.0,
+      "penalty": 8.0,
+      "groups": [
+        0.0,
+        0.043674624746608603,
+        0.0,
+        0.0
+      ],
+      "objective": 455869.8359122423,
+      "validation_loglik_gain": 22.745037312359898,
+      "converged": true,
+      "kkt": 6.494215932253631e-05,
+      "iterations": 2746,
+      "validation_half_deviance": 458199.08171690063
+    },
+    {
+      "geometry": "nominal",
+      "sigma_px": 6.0,
+      "penalty": 12.0,
+      "groups": [
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "objective": 455873.05818804586,
+      "validation_loglik_gain": 6.604577334439014e-05,
+      "converged": true,
+      "kkt": 9.985179840500738e-05,
+      "iterations": 662,
+      "validation_half_deviance": 458221.8266881673
+    },
+    {
+      "geometry": "seed_calibration",
+      "sigma_px": 6.0,
+      "penalty": 1.2,
+      "groups": [
+        315.059512893493,
+        157.07612158925946,
+        136.91020601010018,
+        128.83406839352307
+      ],
+      "objective": 362186.5861356529,
+      "validation_loglik_gain": 139530.60710334452,
+      "converged": true,
+      "kkt": 7.220684300653679e-05,
+      "iterations": 457,
+      "validation_half_deviance": 318691.21965086844
+    },
+    {
+      "geometry": "seed_calibration",
+      "sigma_px": 6.0,
+      "penalty": 4.0,
+      "groups": [
+        162.7156130687333,
+        41.52934763132273,
+        24.440961078128122,
+        14.952032283198683
+      ],
+      "objective": 433525.3142339348,
+      "validation_loglik_gain": 75241.46692220378,
+      "converged": true,
+      "kkt": 7.272904174136659e-05,
+      "iterations": 339,
+      "validation_half_deviance": 382980.3598320091
+    },
+    {
+      "geometry": "seed_calibration",
+      "sigma_px": 6.0,
+      "penalty": 6.0,
+      "groups": [
+        87.0953641559907,
+        0.0,
+        0.011477152287649199,
+        0.0
+      ],
+      "objective": 449682.56696794956,
+      "validation_loglik_gain": 34715.61358153941,
+      "converged": false,
+      "kkt": 3.0397408961155086,
+      "iterations": 5000,
+      "validation_half_deviance": 423506.2131726735
+    },
+    {
+      "geometry": "seed_calibration",
+      "sigma_px": 6.0,
+      "penalty": 8.0,
+      "groups": [
+        27.301354406341638,
+        0.0,
+        0.004036853093433353,
+        0.0
+      ],
+      "objective": 455728.44554998685,
+      "validation_loglik_gain": 12094.412433158055,
+      "converged": false,
+      "kkt": 10.084879559213533,
+      "iterations": 5000,
+      "validation_half_deviance": 446127.4143210549
+    },
+    {
+      "geometry": "seed_calibration",
+      "sigma_px": 6.0,
+      "penalty": 12.0,
+      "converged": false,
+      "error": "Poisson line search failed"
+    }
+  ]
+}

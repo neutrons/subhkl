@@ -4604,6 +4604,22 @@ def run_indexer_visualize(
     from subhkl.viz import zones
 
     with h5py.File(peaks_filename, "r") as fp:
+        is_solve = "solve" in fp
+    if is_solve:
+        from subhkl.viz.solve import plot_solve
+
+        return plot_solve(
+            peaks_filename,
+            instrument,
+            output_dir,
+            max_index,
+            dpi,
+            image_index,
+            images_filename,
+            zone_alpha,
+        )
+
+    with h5py.File(peaks_filename, "r") as fp:
         bank = fp["bank"][()]
         pr = fp["peaks/pixel_r"][()]
         pc = fp["peaks/pixel_c"][()]

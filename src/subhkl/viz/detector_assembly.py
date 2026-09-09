@@ -540,6 +540,8 @@ def plot_unrolled_detector(
     if instrument is not None:
         title_str = f"{instrument} | {title_str}"
 
+    if getattr(peaks, "diagnostic_status", None):
+        title_str += f" | DIAGNOSTIC: {peaks.diagnostic_status}"
     ax.set_title(title_str)
 
     if mesh_handle is not None:

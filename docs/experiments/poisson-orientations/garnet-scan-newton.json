@@ -1,0 +1,30 @@
+{
+  "dataset": "CG4D garnet, runs 2022–2062, 21 settings",
+  "scope": "Same fixed dictionary from the existing blind single-setting candidate; no orientation or geometry refinement, no repeat of the GPU proposal search",
+  "command": "solve merged.h5 solution.h5 --bootstrap blind.h5 --d-min 1.5 --binning 16 --no-refine",
+  "dictionary_shape": [1140736, 16422],
+  "dictionary_nonzeros": 29015,
+  "panel_backgrounds": 1114,
+  "penalty": 1.2,
+  "stationarity_tolerance": 0.00005369713949447949,
+  "before_commit": "9deef4c7",
+  "before": {
+    "converged": false,
+    "objective": 42336648.82774863,
+    "stationarity_residual": 0.0002204107941578548,
+    "fit_seconds": 4.848441761918366
+  },
+  "after": {
+    "converged": true,
+    "objective": 42336648.82774843,
+    "stationarity_residual": 4.800636554946891e-9,
+    "reflection_stationarity_residual": 1.560689355528666e-10,
+    "background_stationarity_residual": 4.800636554946891e-9,
+    "newton_iterations": 1,
+    "cg_iterations": 14,
+    "fit_seconds": 4.782732725143433,
+    "full_cli_no_refinement_status": "converged"
+  },
+  "timing_note": "Single CPU measurements of fit_intensities only, excluding dictionary construction and I/O; not a performance benchmark",
+  "interpretation": "The initial stopping failure is numerical. This does not establish physical correctness or convergence of joint calibration."
+}

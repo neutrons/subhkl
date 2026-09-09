@@ -4,6 +4,26 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The experimental `calibrate` and `spherical-index` CLI entry points are
+  replaced by `solve`: global count-based orientation proposals followed by
+  one Poisson group-sparse fit of intensities, orientations and shared detector
+  geometry. The standalone numerical Python runners remain reference APIs for
+  regression comparisons, not alternate `solve` modes.
+- `solve` accepts rotation scans, enables identifiable beam-axis detector roll,
+  and honors existing global/per-run goniometer corrections. Its outputs can
+  be inspected with finder-free `indexer-visualize` overlays, including labeled
+  diagnostics for unsuccessful fits.
+- Reflection-family profile measurement is shared in `subhkl.search.profiles`.
+  Finder and integrator retain their existing measurements; `solve` can use
+  an explicit measured radial prior through `--profile-file`.
+
+The new workflow is draft functionality: frame-addressed stills/scans, flat panels,
+fixed cell and wavelength band, beam +z. See [migration and limitations](docs/solve.md).
+
 ## [1.4.0]
 
 The experimental paths that 1.3 kept alongside the new ones are gone: one
