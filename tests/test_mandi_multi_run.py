@@ -6,6 +6,10 @@ import numpy as np
 import random
 import time
 
+# These tests run on the mesolite dataset, which is downloaded on demand, so
+# they are deselected by default; run them with `pytest -m mesolite`.
+pytestmark = pytest.mark.mesolite
+
 INSTRUMENT = "MANDI"
 LATTICE_PARAMS = [18.39, 56.55, 6.54, 90, 90, 90]
 SPACE_GROUP = "F d d 2"
@@ -13,30 +17,14 @@ WAVELENGTH = [2.0, 4.5]
 
 FINDER_PARAMS = [
     "--finder-algorithm",
-    "thresholding",
-    "--thresholding-noise-cutoff-quantile",
-    "0.99",
-    "--region-growth-minimum-intensity",
-    "3.0",
-    "--region-growth-maximum-pixel-radius",
-    "12.0",
-    "--peak-center-box-size",
-    "3",
-    "--peak-smoothing-window-size",
-    "5",
-    "--peak-minimum-pixels",
-    "40",
-    "--peak-minimum-signal-to-noise",
-    "0.0",
-    "--peak-pixel-outlier-threshold",
-    "4.0",
+    "sparse_rbf",
 ]
 
 
 @pytest.fixture
-def random_mesolite_pair(test_data_dir):
+def random_mesolite_pair(mesolite_data):
     """Pick two random MANDI files with significantly different goniometer settings."""
-    path = Path(test_data_dir) / "MANDI" / "mesolite"
+    path = Path(mesolite_data)
     available_files = sorted(list(path.glob("MANDI_*.nxs.h5")))
 
     if len(available_files) < 2:

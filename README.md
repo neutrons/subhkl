@@ -1,6 +1,10 @@
 # subhkl
 Solving crystal orientation from 2D Laue diffraction images
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/neutrons/subhkl/main/docs/subhkl_logo.png" alt="subhkl logo">
+</p>
+
 ---
 
 ## Installation
@@ -18,7 +22,7 @@ Then create a virtual environment and install the project:
 ```bash
 uv venv env
 source env/bin/activate  # On Windows: env\Scripts\activate
-uv pip install -e .
+uv pip install subhkl
 ```
 
 ### Option 2: Using standard Python venv
@@ -26,10 +30,10 @@ uv pip install -e .
 ```bash
 python -m venv env
 source env/bin/activate  # On Windows: env\Scripts\activate
-python -m pip install -e .
+python -m pip install subhkl
 ```
 
-### Installing test dependencies
+### Installing test dependencies for local build
 
 ```bash
 uv pip install -e ".[test]"  # with uv
@@ -157,6 +161,35 @@ from the value baked into the package at build time otherwise (the Docker image
 records it during the build). Setting `SUBHKL_GIT_COMMIT` overrides both, which
 is useful when packaging subhkl outside of the provided Dockerfile.
 
+## Plotting after the fact
+
+`finder` and `rbf-integrator` draw their unrolled-detector plots while they
+run, which costs both rendering time and a lot of disk at the 600 dpi they use.
+Two commands rebuild those plots later from the HDF5 files, so a run can be
+told to draw nothing and still be looked at afterwards:
+
+```bash
+# run the search without drawing anything
+python -m subhkl.io.parser finder images.h5 MANDI --output-filename found.h5
+
+# ... and draw it later, from the two HDF5 files
+python -m subhkl.io.parser finder-visualize images.h5 found.h5
+python -m subhkl.io.parser integrator-visualize images.h5 integrated.h5
+```
+
+`images.h5` is the reduced (or merged) image stack the step ran on; the peaks
+file supplies the peak centres and the width fitted to each one. Neither
+command re-runs the search, so this is quick, and `--dpi` trades resolution for
+size. Keep the two HDF5 files -- from a benchmark artifact, for instance -- and
+any run can be spot-checked without the raw data.
+
+Each peak is outlined at the size it was actually fitted with, not at a fixed
+marker size: a circle of radius `n_sigma * sigma` for the sparse-RBF finder's
+isotropic widths, and the corresponding ellipse for the RBF integrator's full
+covariance. `--n-sigma` sets which contour that is (2 by default, holding about
+86% of a 2D Gaussian's flux). The finders that fit no width are drawn as plain
+markers, because there is no size to draw.
+
 ## Physics and Conventions
 
 This project uses the **Laue Equation** to relate Miller indices $(h, k, l)$ to the scattering vector $Q$:
@@ -186,6 +219,20 @@ where $\hat{k}_f$ and $\hat{k}_i$ are unit vectors along the scattered and incid
 ```bash
 pytest -v
 ```
+
+Tests that need the mesolite dataset are marked `mesolite` and are left out of
+that run, because the dataset is downloaded from Zenodo on first use and that
+takes hours. Ask for them explicitly:
+
+```bash
+pytest -v -m mesolite
+
+# or download only the first few files, which is enough for most of them
+MESOLITE_MAX_FILES=1 pytest -v -m mesolite
+```
+
+The other markers are `slow` and `integration`; CI runs unit tests with
+`-m "not slow and not integration and not mesolite"`.
 
 ### Running Linting
 

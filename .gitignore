@@ -183,3 +183,15 @@ tools/
 
 # commit baked into the package at build time (see Dockerfile)
 src/subhkl/resources/git_commit.txt
+
+# Editor swap and backup files
+*.swp
+*.swo
+*~
+.*.sw?
+
+#versioningit
+src/subhkl/_version.py
+
+# claude
+.claude

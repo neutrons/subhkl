@@ -8,6 +8,7 @@ from subhkl.instrument.goniometer import (
 from subhkl.integration import Peaks
 from subhkl.optimization import FindUB
 from subhkl.io.export import ImageStackMerger, MTZExporter
+from subhkl.viz import detector_assembly, replay
 
 from typing import List
 
@@ -56,6 +57,35 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
                 print(f"Successfully applied calibration to {count} detector panels.")
 
 
+def _file_frame_run_map(
+    angles: np.ndarray, n_axes: int, file_offsets: np.ndarray
+) -> tuple[bool, np.ndarray]:
+    """Frame layout and frame -> run map for a peaks file's own angles.
+
+    The optimizer's internal angle array cannot index the file being
+    written: columns that are all identical collapse to one and re-tile
+    only up to the last peak-bearing image, so its frame count falls
+    short of the file's whenever trailing images carry no peaks
+    (guaranteed in single-run files, where every frame shares one angle
+    setting).  Corrections therefore address the file's frames
+    directly: layout is decided by which dimension spans the goniometer
+    axes (square arrays take the writer's frame-first convention), and
+    the map is rebuilt from the run boundaries in ``file_offsets``.
+    """
+    angles = np.asarray(angles)
+    if angles.ndim != 2 or n_axes not in angles.shape:
+        raise ValueError(
+            f"goniometer/angles shape {angles.shape} does not span "
+            f"{n_axes} goniometer axes"
+        )
+    frame_first = angles.shape[1] == n_axes
+    n_frames = angles.shape[0] if frame_first else angles.shape[1]
+    frame_to_run = (
+        np.searchsorted(np.asarray(file_offsets), np.arange(n_frames), side="right") - 1
+    )
+    return frame_first, frame_to_run
+
+
 def run_index(
     peaks_h5_filename: str,
     output_peaks_filename: str,
@@ -84,6 +114,17 @@ def run_index(
     refine_goniometer: bool = False,
     refine_goniometer_axes: list[str] | None = None,
     goniometer_bound_deg: float | list[float] | np.ndarray = 5.0,
+    refine_goniometer_axis_vector: list[str] | None = None,
+    goniometer_axis_vector_bound_deg: float | list[float] | np.ndarray = 1.0,
+    refine_goniometer_per_run: str | None = None,
+    goniometer_per_run_bound_deg: float = 0.5,
+    refine_goniometer_per_run_trans: bool = False,
+    goniometer_per_run_trans_bound_meters: float = 0.002,
+    refine_goniometer_harmonics: str | None = None,
+    goniometer_harmonics_orders: list[int] | None = None,
+    goniometer_harmonics_axes: str = "rocking",
+    goniometer_harmonics_bound_deg: float = 0.5,
+    refine_goniometer_trans_axes: list[str] | None = None,
     refine_goniometer_trans: bool = False,
     goniometer_trans_bound_meters: float | list[float] | np.ndarray = 0.005,
     refine_beam: bool = False,
@@ -104,6 +145,11 @@ def run_index(
     input_data: dict | None = None,
     num_candidates: int | None = None,
     no_index: bool | None = None,
+    radial_weight: float = 1.0,
+    radial_weight_poly: list[float] | None = None,
+    hkl_metric: str = "isotropic",
+    hkl_metric_floor: float = 0.1,
+    multi_gpu: bool = False,
 ):
     input_data = input_data or {}
 
@@ -318,6 +364,7 @@ def run_index(
             u_offsets = np.zeros(len(pixel_r))
             v_offsets = np.zeros(len(pixel_r))
             bank_indices = np.zeros(len(pixel_r), dtype=np.int32)
+            bank_refined = np.zeros(len(pixel_r), dtype=bool)
 
             for phys_bank in np.unique(bank_array):
                 mask = bank_array == phys_bank
@@ -337,6 +384,7 @@ def run_index(
 
                     if refine_detector and int(phys_bank) in bank_to_idx:
                         bank_indices[mask] = bank_to_idx[int(phys_bank)]
+                        bank_refined[mask] = True
                         u_offsets[mask] = np.dot(xyz_p - det.center, det.uhat)
                         v_offsets[mask] = np.dot(xyz_p - det.center, det.vhat)
 
@@ -354,6 +402,7 @@ def run_index(
                     "u_offsets": u_offsets.tolist(),
                     "v_offsets": v_offsets.tolist(),
                     "bank_indices": bank_indices.tolist(),
+                    "refined_mask": bank_refined.tolist(),
                 }
         else:
             raise ValueError(
@@ -417,9 +466,16 @@ def run_index(
         )
     if refine_beam:
         print(f"Refining beam tilt with {beam_bound_deg}° bounds.")
+    if refine_goniometer_axis_vector:
+        print(
+            f"Refining goniometer axis vectors for {refine_goniometer_axis_vector} "
+            f"with {goniometer_axis_vector_bound_deg} deg tilt bounds."
+        )
 
     goniometer_names = None
 
+    per_run_file_offsets = None
+    per_run_files = None
     if original_nexus_filename and instrument_name:
         is_merged = False
         with h5py.File(original_nexus_filename, "r") as f_check:
@@ -427,6 +483,17 @@ def run_index(
                 is_merged = True
                 axes = f_check["goniometer/axes"][()]
                 angles = f_check["goniometer/angles"][()]
+                per_run_file_offsets = (
+                    f_check["file_offsets"][()] if "file_offsets" in f_check else None
+                )
+                per_run_files = (
+                    [
+                        x.decode() if isinstance(x, bytes) else str(x)
+                        for x in f_check["files"][()]
+                    ]
+                    if "files" in f_check
+                    else None
+                )
                 names = (
                     [n.decode("utf-8") for n in f_check["goniometer/names"][()]]
                     if "goniometer/names" in f_check
@@ -529,6 +596,31 @@ def run_index(
                         f"CRITICAL: Angle shape {angles.shape} cannot map to {num_peaks} peaks."
                     )
 
+    # A previous pass's refined axis vectors are this pass's nominal
+    # geometry, exactly as offsets and translations already bootstrap.  The
+    # nexus block above re-reads the nominal axes, so this override must
+    # come after it; unrefined bootstraps carry the nominal axes and this
+    # is a no-op.
+    if bootstrap_filename and opt.goniometer_axes is not None:
+        with h5py.File(bootstrap_filename, "r") as b_f:
+            if "goniometer/axes" in b_f:
+                boot_axes = np.asarray(b_f["goniometer/axes"][()], dtype=float)
+                if boot_axes.shape == np.asarray(opt.goniometer_axes).shape:
+                    opt.goniometer_axes = boot_axes
+                    input_data["goniometer/axes"] = boot_axes
+            # A previous pass's per-run-corrected angles likewise become
+            # this pass's nominal angles (goniometer/angles in the
+            # bootstrap is written per image, already corrected).
+            if "goniometer/per_run" in b_f and "goniometer/angles" in b_f:
+                boot_ang = np.asarray(b_f["goniometer/angles"][()], dtype=float)
+                cur = np.asarray(opt.goniometer_angles)
+                if boot_ang.shape == cur.shape:
+                    opt.goniometer_angles = boot_ang
+                    input_data["goniometer/angles"] = boot_ang
+                elif boot_ang.T.shape == cur.shape:
+                    opt.goniometer_angles = boot_ang.T
+                    input_data["goniometer/angles"] = boot_ang
+
     # Apply the console messages appropriately
     if refine_goniometer:
         print(
@@ -555,6 +647,21 @@ def run_index(
             freeze_orientation=freeze_orientation,
         )
 
+    per_run_frame_map = None
+    if refine_goniometer_per_run or refine_goniometer_per_run_trans:
+        if per_run_file_offsets is None:
+            raise ValueError(
+                "--refine-goniometer-per-run needs a merged --nexus file "
+                "with file_offsets (the frame -> run bookkeeping)."
+            )
+        n_frames = int(np.asarray(opt.goniometer_angles).shape[-1])
+        per_run_frame_map = (
+            np.searchsorted(
+                np.asarray(per_run_file_offsets), np.arange(n_frames), side="right"
+            )
+            - 1
+        )
+
     num, hkl, lamda, U = opt.minimize(
         strategy_name=strategy_name,
         population_size=population_size,
@@ -568,6 +675,18 @@ def run_index(
         lattice_bound_frac=lattice_bound_frac,
         refine_goniometer=refine_goniometer,
         refine_goniometer_axes=refine_goniometer_axes,
+        refine_goniometer_axis_vector=refine_goniometer_axis_vector,
+        goniometer_axis_vector_bound_deg=goniometer_axis_vector_bound_deg,
+        refine_goniometer_per_run=refine_goniometer_per_run,
+        goniometer_per_run_bound_deg=goniometer_per_run_bound_deg,
+        refine_goniometer_per_run_trans=refine_goniometer_per_run_trans,
+        goniometer_per_run_trans_bound_meters=goniometer_per_run_trans_bound_meters,
+        refine_goniometer_harmonics=refine_goniometer_harmonics,
+        goniometer_harmonics_orders=goniometer_harmonics_orders,
+        goniometer_harmonics_axes=goniometer_harmonics_axes,
+        goniometer_harmonics_bound_deg=goniometer_harmonics_bound_deg,
+        refine_goniometer_trans_axes=refine_goniometer_trans_axes,
+        per_run_frame_map=per_run_frame_map,
         goniometer_names=goniometer_names,
         refine_sample=refine_goniometer_trans,
         goniometer_trans_bound_meters=goniometer_trans_bound_meters,
@@ -582,6 +701,11 @@ def run_index(
         freeze_orientation=freeze_orientation,
         num_candidates=num_candidates,
         no_index=no_index,
+        radial_weight=radial_weight,
+        radial_weight_poly=radial_weight_poly,
+        hkl_metric=hkl_metric,
+        hkl_metric_floor=hkl_metric_floor,
+        multi_gpu=multi_gpu,
     )
 
     print(f"\nOptimization complete. Best solution indexed {num} peaks.")
@@ -630,6 +754,110 @@ def run_index(
 
         safe_write(f, "goniometer/R", opt.R)
 
+        if (
+            refine_goniometer_axis_vector
+            and getattr(opt, "goniometer_axes_refined", None) is not None
+        ):
+            # Downstream stages (metrics, predictor, integrator) read
+            # goniometer/axes from this file, so the refined vectors go
+            # there; the nominal axes and the per-motor tilt angles are
+            # kept alongside for provenance.
+            if "goniometer/axes" in f:
+                safe_write(f, "goniometer/axes_nominal", f["goniometer/axes"][()])
+            safe_write(f, "goniometer/axes", opt.goniometer_axes_refined)
+            grp_name = "goniometer/axis_tilts"
+            if grp_name in f:
+                del f[grp_name]
+            tilts = opt.goniometer_axis_tilts
+            if isinstance(tilts, dict):
+                grp = f.create_group(grp_name)
+                for k, v in tilts.items():
+                    grp[k] = v
+            elif tilts is not None:
+                f[grp_name] = tilts
+
+        if (
+            refine_goniometer_per_run
+            and getattr(opt, "goniometer_per_run_delta", None) is not None
+        ):
+            # Downstream stages read per-image goniometer/angles from this
+            # file, so the corrected angles go there; nominal angles, the
+            # per-run deltas, the image -> run map and the source run
+            # files are kept alongside for provenance.
+            delta = np.asarray(opt.goniometer_per_run_delta, dtype=float)
+            ang = np.asarray(f["goniometer/angles"][()], dtype=float)
+            names_axes = [
+                n.decode() if isinstance(n, bytes) else str(n)
+                for n in f["goniometer/names"][()]
+            ]
+            axis_cols = [
+                i
+                for i, n in enumerate(names_axes)
+                if refine_goniometer_per_run.lower() in n.lower()
+            ]
+            frame_first, file_frame_map = _file_frame_run_map(
+                ang, len(names_axes), per_run_file_offsets
+            )
+            corr = delta[file_frame_map]
+            safe_write(f, "goniometer/angles_nominal", ang)
+            for col in axis_cols:
+                if frame_first:
+                    ang[:, col] += corr
+                else:
+                    ang[col, :] += corr
+            safe_write(f, "goniometer/angles", ang)
+            grp_name = "goniometer/per_run"
+            if grp_name in f:
+                del f[grp_name]
+            grp = f.create_group(grp_name)
+            grp["motor"] = refine_goniometer_per_run
+            grp["delta_deg"] = delta
+            grp["frame_to_run"] = np.asarray(file_frame_map, dtype=np.int32)
+            if per_run_files is not None:
+                grp["run_files"] = np.array(per_run_files, dtype="S")
+            if per_run_file_offsets is not None:
+                grp["run_file_offsets"] = np.asarray(per_run_file_offsets)
+
+        if (
+            refine_goniometer_per_run_trans
+            and getattr(opt, "goniometer_per_run_trans", None) is not None
+        ):
+            # Per-run sample displacements cannot be folded into any static
+            # dataset the downstream stages read (unlike the corrected
+            # angles above): they are recorded here for provenance, and
+            # consumers need explicit support to apply them.
+            grp_name = "goniometer/per_run"
+            grp = f[grp_name] if grp_name in f else f.create_group(grp_name)
+            if "trans_m" in grp:
+                del grp["trans_m"]
+            grp["trans_m"] = np.asarray(opt.goniometer_per_run_trans)
+            if "frame_to_run" not in grp:
+                ang = np.asarray(f["goniometer/angles"][()], dtype=float)
+                _, file_frame_map = _file_frame_run_map(
+                    ang, len(f["goniometer/names"]), per_run_file_offsets
+                )
+                grp["frame_to_run"] = np.asarray(file_frame_map, dtype=np.int32)
+            if "run_files" not in grp and per_run_files is not None:
+                grp["run_files"] = np.array(per_run_files, dtype="S")
+
+        if (
+            refine_goniometer_harmonics
+            and getattr(opt, "goniometer_harmonics", None) is not None
+        ):
+            # The Fourier rocking has no angle representation (its axes
+            # are not motors), so the coefficients travel with the file
+            # and the predictor rebuilds the per-frame rotation from
+            # them (subhkl.optimization.harmonic_rocking_matrices).
+            gh = opt.goniometer_harmonics
+            grp_name = "goniometer/harmonics"
+            if grp_name in f:
+                del f[grp_name]
+            grp = f.create_group(grp_name)
+            grp["motor"] = gh["motor"]
+            grp["orders"] = np.asarray(gh["orders"], dtype=np.int32)
+            grp["axes"] = np.asarray(gh["axes"], dtype=float)
+            grp["coeffs_deg"] = np.asarray(gh["coeffs_deg"], dtype=float)
+
         if opt.goniometer_offsets is not None:
             grp_name = "goniometer/offsets"
             if grp_name in f:
@@ -675,11 +903,26 @@ def run_index(
 
         flags = {
             "no_index": opt.no_index,
+            "radial_weight": radial_weight,
+            "radial_weight_poly": radial_weight_poly,
+            "hkl_metric": hkl_metric,
+            "hkl_metric_floor": hkl_metric_floor,
             "refine_lattice": refine_lattice,
             "refine_goniometer": refine_goniometer,
+            "refine_goniometer_axis_vector": refine_goniometer_axis_vector,
+            "refine_goniometer_per_run": refine_goniometer_per_run,
+            "goniometer_per_run_bound_deg": goniometer_per_run_bound_deg,
+            "refine_goniometer_per_run_trans": refine_goniometer_per_run_trans,
+            "goniometer_per_run_trans_bound_meters": goniometer_per_run_trans_bound_meters,
+            "refine_goniometer_harmonics": refine_goniometer_harmonics,
+            "goniometer_harmonics_orders": goniometer_harmonics_orders,
+            "goniometer_harmonics_axes": goniometer_harmonics_axes,
+            "goniometer_harmonics_bound_deg": goniometer_harmonics_bound_deg,
+            "refine_goniometer_trans_axes": refine_goniometer_trans_axes,
             "refine_goniometer_trans": refine_goniometer_trans,
             "refine_beam": refine_beam,
             "refine_detector": refine_detector,
+            "refine_detector_banks": refine_detector_banks,
             "detector_modes": detector_modes,
             "freeze_orientation": freeze_orientation,
         }
@@ -709,41 +952,31 @@ def run_finder(
     filename: str,
     instrument: str,
     output_filename: str = "output.h5",
-    finder_algorithm: str = "peak_local_max",
+    finder_algorithm: str = "sparse_rbf",
     show_progress: bool = True,
     create_visualizations: bool = False,
     show_steps: bool = False,
-    peak_local_max_min_pixel_distance: int = -1,
-    peak_local_max_min_relative_intensity: float = -1,
-    peak_local_max_normalization: bool = False,
     mask_file: str | None = None,
     mask_rel_erosion_radius: float | None = None,
-    thresholding_noise_cutoff_quantile: float = 0.8,
-    thresholding_min_peak_dist_pixels: float = 8.0,
-    thresholding_blur_kernel_sigma: int = 5,
-    thresholding_open_kernel_size_pixels: int = 3,
     wavelength_min: float | None = None,
     wavelength_max: float | None = None,
-    region_growth_distance_threshold: float = 1.5,
-    region_growth_minimum_sigma: float | None = None,
-    region_growth_minimum_intensity: float = 4500.0,
-    region_growth_maximum_pixel_radius: float = 17.0,
-    peak_center_box_size: int = 15,
-    peak_smoothing_window_size: int = 15,
-    peak_minimum_pixels: int = 30,
-    peak_minimum_signal_to_noise: float = 1.0,
-    peak_pixel_outlier_threshold: float = 2.0,
-    sparse_rbf_alpha: float = 0.1,
-    sparse_rbf_gamma: float = 1.0,
+    sparse_rbf_alpha: float | None = None,
+    sparse_rbf_gamma: float = 0.0,
     sparse_rbf_min_sigma: float = 1.5,
-    sparse_rbf_max_sigma: float = 10.0,
-    sparse_rbf_chunk_size: int = 512,
+    sparse_rbf_max_sigma: float | None = None,
+    sparse_rbf_num_sigmas: int | None = None,
+    sparse_rbf_false_alarms_per_image: float = 1.0,
+    sparse_rbf_max_fragmentation_rate: float = 1.0,
+    sparse_rbf_profile_file: str | None = "auto",
+    sparse_rbf_shape_ratio: float = 1.2,
+    sparse_rbf_shape_orientations: int = 4,
+    sparse_rbf_chunk_size: int = 64,
     sparse_rbf_tile_rows: int = 2,
     sparse_rbf_tile_cols: int = 2,
-    sparse_rbf_loss: str = "gaussian",
-    sparse_rbf_auto_tune_alpha: bool = False,
-    sparse_rbf_candidate_alphas: str = "3.0,5.0,10.0,15.0,20.0,25.0,30",
+    sparse_rbf_loss: str = "poisson",
     max_workers: int = 16,
+    multi_gpu: bool = False,
+    static_mask_file: str | None = None,
 ):
     print(f"Creating peaks from {filename} for instrument {instrument}")
 
@@ -755,45 +988,33 @@ def run_finder(
 
     peaks = Peaks(filename, instrument, **wavelength_kwargs)
 
+    if finder_algorithm != "sparse_rbf":
+        raise ValueError(
+            f"Unknown finder algorithm: {finder_algorithm!r} (peak_local_max "
+            "and thresholding retired with the convex-hull stage)"
+        )
     peak_kwargs = {"algorithm": finder_algorithm}
-    if finder_algorithm == "peak_local_max":
-        if peak_local_max_min_pixel_distance > 0:
-            peak_kwargs["min_pix"] = peak_local_max_min_pixel_distance
-        if peak_local_max_min_relative_intensity > 0:
-            peak_kwargs["min_rel_intensity"] = peak_local_max_min_relative_intensity
-        peak_kwargs["normalize"] = peak_local_max_normalization
-    elif finder_algorithm == "thresholding":
-        peak_kwargs.update(
-            {
-                "noise_cutoff_quantile": thresholding_noise_cutoff_quantile,
-                "min_peak_dist_pixels": thresholding_min_peak_dist_pixels,
-                "blur_kernel_sigma": thresholding_blur_kernel_sigma,
-                "open_kernel_size_pixels": thresholding_open_kernel_size_pixels,
-                "show_steps": show_steps,
-                "show_scale": "log",
-            }
-        )
-    elif finder_algorithm == "sparse_rbf":
-        # Because we separated Typer from core logic, this split is 100% safe
-        alpha_list = [float(k.strip()) for k in sparse_rbf_candidate_alphas.split(",")]
-
-        peak_kwargs.update(
-            {
-                "alpha": sparse_rbf_alpha,
-                "gamma": sparse_rbf_gamma,
-                "min_sigma": sparse_rbf_min_sigma,
-                "max_sigma": sparse_rbf_max_sigma,
-                "chunk_size": sparse_rbf_chunk_size,
-                "show_steps": show_steps,
-                "show_scale": "linear",
-                "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),
-                "loss": sparse_rbf_loss,
-                "auto_tune_alpha": sparse_rbf_auto_tune_alpha,
-                "candidate_alphas": alpha_list,
-            }
-        )
-    else:
-        raise ValueError("Invalid finder algorithm")
+    peak_kwargs.update(
+        {
+            "alpha": sparse_rbf_alpha,
+            "gamma": sparse_rbf_gamma,
+            "min_sigma": sparse_rbf_min_sigma,
+            "max_sigma": sparse_rbf_max_sigma,
+            "num_sigmas": sparse_rbf_num_sigmas,
+            "false_alarms_per_image": sparse_rbf_false_alarms_per_image,
+            "max_fragmentation_rate": sparse_rbf_max_fragmentation_rate,
+            "profile_file": sparse_rbf_profile_file,
+            "shape_ratio": sparse_rbf_shape_ratio,
+            "shape_orientations": sparse_rbf_shape_orientations,
+            "chunk_size": sparse_rbf_chunk_size,
+            "multi_gpu": multi_gpu,
+            "static_mask_file": static_mask_file,
+            "show_steps": show_steps,
+            "show_scale": "linear",
+            "tiles": (sparse_rbf_tile_rows, sparse_rbf_tile_cols),
+            "loss": sparse_rbf_loss,
+        }
+    )
 
     peak_kwargs.update(
         {
@@ -802,21 +1023,9 @@ def run_finder(
         }
     )
 
-    integration_params = {
-        "region_growth_distance_threshold": region_growth_distance_threshold,
-        "region_growth_minimum_sigma": region_growth_minimum_sigma,
-        "region_growth_minimum_intensity": region_growth_minimum_intensity,
-        "region_growth_maximum_pixel_radius": region_growth_maximum_pixel_radius,
-        "peak_center_box_size": peak_center_box_size,
-        "peak_smoothing_window_size": peak_smoothing_window_size,
-        "peak_minimum_pixels": peak_minimum_pixels,
-        "peak_minimum_signal_to_noise": peak_minimum_signal_to_noise,
-        "peak_pixel_outlier_threshold": peak_pixel_outlier_threshold,
-    }
-
     detector_peaks = peaks.get_detector_peaks(
         peak_kwargs,
-        integration_params,
+        {},
         visualize=create_visualizations,
         show_progress=show_progress,
         file_prefix=filename,
@@ -841,6 +1050,14 @@ def run_finder(
     ]
 
     with h5py.File(output_filename, "a") as f:
+        f.attrs["finder_algorithm"] = finder_algorithm
+
+        # peaks/sigma is the finder's per-peak Gaussian width in pixels
+        # (the finder measures no intensity, so no intensity sigma exists
+        # to confuse it with); say so explicitly for readers.
+        if "peaks/sigma" in f:
+            f["peaks/sigma"].attrs["quantity"] = replay.WIDTH_QUANTITY
+
         with h5py.File(filename, "r") as f_in:
             for key in copy_keys:
                 if key in f_in:
@@ -852,6 +1069,7 @@ def run_metrics(
     file2: str | None = None,
     instrument: str | None = None,
     d_min: float | None = None,
+    per_peak: bool = False,
     per_run: bool = False,
     ki_vec: List[float] | np.ndarray = None,
 ):
@@ -864,6 +1082,7 @@ def run_metrics(
         file2=file2,
         instrument=instrument,
         d_min=d_min,
+        per_peak=per_peak,
         per_run=per_run,
         ki_vec_override=ki_vec,
     )
@@ -970,6 +1189,75 @@ def run_peak_predictor(
     if gonio_offsets is not None:
         print(f"Applying refined goniometer offsets from indexer: {gonio_offsets}")
 
+    # The indexer's refined kinematics -- per-run-corrected angles and
+    # refined axis vectors -- are written to its output file; the nexus
+    # only carries the nominals.  Prefer the refined values whenever the
+    # shapes line up, so prediction runs on the same geometry the
+    # solution was fitted with.
+    with h5py.File(indexed_hdf5_filename, "r") as f_idx:
+        for key, attr in (
+            ("goniometer/angles", "angles_raw"),
+            ("goniometer/axes", "axes_raw"),
+        ):
+            if key not in f_idx:
+                continue
+            refined = np.asarray(f_idx[key][()], dtype=float)
+            current = np.asarray(getattr(peaks.goniometer, attr))
+            if refined.shape == current.shape and not np.allclose(refined, current):
+                setattr(peaks.goniometer, attr, refined)
+                print(f"Applying refined {key} from indexer.")
+            elif refined.T.shape == current.shape and not np.allclose(
+                refined.T, current
+            ):
+                setattr(peaks.goniometer, attr, refined.T)
+                print(f"Applying refined {key} from indexer (transposed).")
+        per_run_trans = None
+        frame_to_run = None
+        if "goniometer/per_run/trans_m" in f_idx:
+            per_run_trans = f_idx["goniometer/per_run/trans_m"][()]
+            frame_to_run = f_idx["goniometer/per_run/frame_to_run"][()]
+            print(
+                "Applying per-run sample displacements from indexer "
+                f"({len(per_run_trans)} runs)."
+            )
+        harmonic_rot = None
+        if "goniometer/harmonics" in f_idx:
+            # The Fourier rocking steers q in the lab frame; its axes are
+            # not motors, so it cannot ride on the corrected angles and is
+            # rebuilt here from the stored coefficients, per frame.
+            from subhkl.optimization import harmonic_rocking_matrices
+
+            gh = f_idx["goniometer/harmonics"]
+            harm_motor = gh["motor"][()]
+            harm_motor = (
+                harm_motor.decode("utf-8")
+                if isinstance(harm_motor, bytes)
+                else str(harm_motor)
+            )
+            harm_row = None
+            if gonio_names is not None:
+                for i, name in enumerate(gonio_names):
+                    if harm_motor.lower() in name.lower():
+                        harm_row = i
+                        break
+            if harm_row is None:
+                raise ValueError(
+                    f"Harmonic motor {harm_motor!r} not found in goniometer "
+                    f"names {gonio_names}."
+                )
+            ang = np.asarray(peaks.goniometer.angles_raw, dtype=float)
+            n_axes = len(gonio_names)
+            frame_first, _ = _file_frame_run_map(ang, n_axes, np.zeros(1, dtype=int))
+            harm_angles = ang[:, harm_row] if frame_first else ang[harm_row, :]
+            harmonic_rot = harmonic_rocking_matrices(
+                harm_angles, gh["axes"][()], gh["orders"][()], gh["coeffs_deg"][()]
+            )
+            print(
+                f"Applying Fourier rocking from indexer ({harm_motor}, "
+                f"orders {list(gh['orders'][()])}, "
+                f"{harmonic_rot.shape[0]} frames)."
+            )
+
     # Pass the Base UB matrix. The predictor will apply dynamic R_gonio internally!
     UB = U @ B
 
@@ -991,6 +1279,9 @@ def run_peak_predictor(
         gonio_axes=peaks.goniometer.axes_raw,
         gonio_angles=peaks.goniometer.angles_raw,
         gonio_offsets=gonio_offsets,  # Pass the pure zero-points
+        per_run_trans=per_run_trans,
+        frame_to_run=frame_to_run,
+        harmonic_rot=harmonic_rot,
     )
 
     print(f"Saving predictions to {integration_peaks_filename}")
@@ -1043,12 +1334,18 @@ def run_rbf_integrator(
     instrument: str,
     integration_peaks_filename: str,
     output_filename: str,
-    alpha: float = 1.0,
-    gamma: float = 1.0,
     sigmas: str = "1.0,2.0,4.0",
     nominal_sigma: float = 1.0,
     anisotropic: bool = False,
     fit_mosaicity: bool = False,
+    mosaicity_radial: bool = False,
+    shape_spherical: bool = False,
+    mosaicity_bound_mrad: float = 10.0,
+    shape_fit_min_snr: float = 0.0,
+    shape_fit_normalized: bool = False,
+    matrix_free_profile: str = "gaussian",
+    matrix_free_fp_target: float | None = None,
+    static_mask_file: str | None = None,
     rel_border_width: float = 0.0,
     show_progress: bool = True,
     create_visualizations: bool = False,
@@ -1062,7 +1359,7 @@ def run_rbf_integrator(
 
     sigma_list = [float(k.strip()) for k in sigmas.split(",")]
     print(f"Starting Dense Sparse RBF Integration on {filename}")
-    print(f"Parameters: Alpha={alpha}, Gamma={gamma}, Sigma={sigma_list}")
+    print(f"Parameters: Sigma={sigma_list}")
 
     peak_dict = {}
 
@@ -1102,15 +1399,21 @@ def run_rbf_integrator(
     result = integrate_peaks_rbf_ssn(
         peak_dict=peak_dict,
         peaks_obj=peaks,  # Pass the full Peaks object
-        alpha=alpha,
         sigmas=sigma_list,
-        gamma=gamma,
         nominal_sigma=nominal_sigma,
         show_progress=show_progress,
         all_R=None,
         sample_offset=sample_offset,
         anisotropic=anisotropic,
         fit_mosaicity=fit_mosaicity,
+        mosaicity_radial=mosaicity_radial,
+        shape_spherical=shape_spherical,
+        mosaicity_bound_rad=mosaicity_bound_mrad * 1e-3,
+        shape_fit_min_snr=shape_fit_min_snr,
+        shape_fit_normalized=shape_fit_normalized,
+        matrix_free_profile=matrix_free_profile,
+        matrix_free_fp_target=matrix_free_fp_target,
+        static_mask_file=static_mask_file,
         border_width=border_width,
         chunk_size=chunk_size,
         create_visualizations=create_visualizations,
@@ -1123,11 +1426,21 @@ def run_rbf_integrator(
 
     print(f"Saving RBF integrated peaks to {output_filename}")
     with h5py.File(output_filename, "w") as f:
+        f.attrs["instrument"] = instrument
         f["peaks/h"], f["peaks/k"], f["peaks/l"] = result.h, result.k, result.l
         f["peaks/lambda"] = result.wavelength
         f["peaks/intensity"], f["peaks/sigma"] = result.intensity, result.sigma
         f["peaks/two_theta"], f["peaks/azimuthal"] = result.tt, result.az
         f["peaks/bank"], f["peaks/run_index"] = result.bank, result.run_id
+
+        # Where each peak sits on its detector image, and the shape the fit
+        # gave it.  The integrator computes all of this to draw its own plots
+        # and then dropped it on the way out, which left the plots impossible
+        # to redraw afterwards; `integrator-visualize` reads it back.
+        f["peaks/image_index"] = result.image_index
+        f["peaks/pixel_r"], f["peaks/pixel_c"] = result.peak_rows, result.peak_cols
+        f["peaks/var_u"], f["peaks/var_v"] = result.var_u, result.var_v
+        f["peaks/cov_uv"] = result.cov_uv
 
         # Copy metadata
         copy_keys = [
@@ -1155,147 +1468,19 @@ def run_rbf_integrator(
                     f_in.copy(f_in[k], f, k)
 
 
-def run_integrator(
-    filename: str,
-    instrument: str,
-    integration_peaks_filename: str,
-    output_filename: str,
-    integration_method: str = "free_fit",
-    integration_mask_file: str | None = None,
-    integration_mask_rel_erosion_radius: float | None = 0.05,
-    region_growth_distance_threshold: float = 1.5,
-    region_growth_minimum_intensity: float = 50.0,
-    region_growth_minimum_sigma: float | None = None,
-    region_growth_maximum_pixel_radius: float = 17.0,
-    peak_center_box_size: int = 15,
-    peak_smoothing_window_size: int = 15,
-    peak_minimum_pixels: int = 10,
-    peak_minimum_signal_to_noise: float = 1.0,
-    peak_pixel_outlier_threshold: float = 2.0,
-    create_visualizations: bool = False,
-    show_progress: bool = True,
-    found_peaks_file: str | None = None,
-    max_workers: int = 16,
-):
-    apply_detector_calibration(integration_peaks_filename, instrument)
-
-    peak_dict = {}
-    angles_stack = None
-    all_R = None
-    with h5py.File(integration_peaks_filename, "r") as f:
-        U = f["sample/U"][()] if "sample/U" in f else None
-        B = f["sample/B"][()] if "sample/B" in f else None
-        all_R = f["goniometer/R"][()] if "goniometer/R" in f else None
-        angles_stack = f["goniometer/angles"][()] if "goniometer/angles" in f else None
-        sample_offset = (
-            f["goniometer/translations"][()]
-            if "goniometer/translations" in f
-            else np.zeros(3)
-        )
-        ki_vec = (
-            f["beam/ki_vec"][()] if "beam/ki_vec" in f else np.array([0.0, 0.0, 1.0])
-        )
-
-        for key in f["banks"].keys():
-            img_idx = int(key)
-            grp = f[f"banks/{key}"]
-            peak_dict[img_idx] = [
-                grp["i"][()],
-                grp["j"][()],
-                grp["h"][()],
-                grp["k"][()],
-                grp["l"][()],
-                grp["wavelength"][()],
-            ]
-
-    peaks = Peaks(filename, instrument)
-
-    integration_params = {
-        "region_growth_distance_threshold": region_growth_distance_threshold,
-        "region_growth_minimum_intensity": region_growth_minimum_intensity,
-        "region_growth_minimum_sigma": region_growth_minimum_sigma,
-        "region_growth_maximum_pixel_radius": region_growth_maximum_pixel_radius,
-        "peak_center_box_size": peak_center_box_size,
-        "peak_smoothing_window_size": peak_smoothing_window_size,
-        "peak_minimum_pixels": peak_minimum_pixels,
-        "peak_minimum_signal_to_noise": peak_minimum_signal_to_noise,
-        "peak_pixel_outlier_threshold": peak_pixel_outlier_threshold,
-        "integration_mask_file": integration_mask_file,
-        "integration_mask_rel_erosion_radius": integration_mask_rel_erosion_radius,
-    }
-
-    if all_R is None:
-        print("Warning: Refined R stack not found in prediction file. Using nominal.")
-        all_R = peaks.goniometer.rotation
-
-    if angles_stack is None:
-        angles_stack = peaks.goniometer.angles_raw
-
-    UB = U @ B if U is not None and B is not None else None
-    RUB = None
-    if UB is not None:
-        RUB = np.matmul(all_R, UB) if all_R.ndim == 3 else all_R @ UB
-
-    result = peaks.integrate(
-        peak_dict,
-        integration_params,
-        RUB=RUB,
-        R_stack=all_R,
-        angles_stack=angles_stack,
-        sample_offset=sample_offset,
-        ki_vec=ki_vec,
-        create_visualizations=create_visualizations,
-        show_progress=show_progress,
-        integration_method=integration_method,
-        file_prefix=filename,
-        found_peaks_file=found_peaks_file,
-        max_workers=max_workers,
-    )
-
-    print(f"Saving integrated peaks to {output_filename}")
-
-    copy_keys = [
-        "sample/a",
-        "sample/b",
-        "sample/c",
-        "sample/alpha",
-        "sample/beta",
-        "sample/gamma",
-        "sample/space_group",
-        "sample/U",
-        "sample/B",
-        "goniometer/translations",
-        "beam/ki_vec",
-        "instrument/wavelength",
-    ]
-
-    with h5py.File(output_filename, "w") as f:
-        f["peaks/h"], f["peaks/k"], f["peaks/l"] = result.h, result.k, result.l
-        f["peaks/lambda"] = result.wavelength
-        f["peaks/intensity"], f["peaks/sigma"] = result.intensity, result.sigma
-        f["peaks/two_theta"], f["peaks/azimuthal"] = result.tt, result.az
-        f["peaks/bank"] = result.bank
-        f["peaks/run_index"] = result.run_id
-        f["peaks/xyz"] = result.xyz
-
-        if result.R and any(r is not None for r in result.R):
-            f["goniometer/R"] = np.array(result.R)
-        if result.angles and any(a is not None for a in result.angles):
-            f["goniometer/angles"] = np.array(result.angles)
-
-        with h5py.File(integration_peaks_filename, "r") as f_in:
-            for key in copy_keys:
-                if key in f_in:
-                    f_in.copy(f_in[key], f, key)
-            for k in ["goniometer/axes", "goniometer/names"]:
-                if k in f_in:
-                    f_in.copy(f_in[k], f, k)
-
-
 def run_mtz_exporter(
-    indexed_h5_filename: str, output_mtz_filename: str, space_group: str = None
+    indexed_h5_filename: str,
+    output_mtz_filename: str,
+    space_group: str = None,
+    predictions_file: str | None = None,
+    corrections_file: str | None = None,
 ):
-    algorithm = MTZExporter(indexed_h5_filename, space_group)
+    algorithm = MTZExporter(
+        indexed_h5_filename,
+        space_group,
+        predictions_file=predictions_file,
+        corrections_file=corrections_file,
+    )
     algorithm.write_mtz(output_mtz_filename)
 
 
@@ -1402,286 +1587,186 @@ def run_merge_images(
     print(f"Successfully created {output_filename} with unit cell info embedded.")
 
 
-def run_zone_axis_search(
-    merged_h5_filename: str,
-    peaks_h5_filename: str,
-    instrument: str,
-    output_h5_filename: str,
-    space_group: str = None,
-    d_min: float = 1.0,
-    vector_tolerance: float = 0.15,
-    border_frac: float = 0.1,
-    min_intensity: float = 50.0,
-    hough_grid_resolution: int = 1024,
-    n_hough: int = 15,
-    davenport_angle_tol: float = 0.5,
-    top_k_rays: int = 15,
-    max_uvw: int = 25,
-    L_max: float = 250.0,
-    top_k: int = 1000,
-    num_runs: int = 0,
-    output_hough: str | None = None,
-    batch_size: int = 1024,
+def run_finder_visualize(
+    images_filename: str,
+    peaks_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
+    max_workers: int | None = None,
+    show_progress: bool = True,
 ):
+    """Redraw the finder's unrolled-detector plots from its output file.
+
+    Takes the same pair of files the finder itself worked from and wrote to,
+    and reproduces the `-found.png` it would have produced with
+    `--create-visualizations`, without repeating the peak search.
     """
-    Global Zone-Axis Search to find the macroscopic crystal orientation (U matrix).
-    Outputs an HDF5 file that can be passed directly to 'indexer --bootstrap'.
+    written = replay.replay_plots(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        suffix="-found",
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+    print(f"Wrote {len(written)} plot(s).")
+    return written
+
+
+def run_integrator_visualize(
+    images_filename: str,
+    peaks_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 150,
+    n_sigma: float = detector_assembly.DEFAULT_N_SIGMA,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+):
+    """Redraw the RBF integrator's unrolled-detector plots from its output file.
+
+    Reproduces the `-pred.png` that `rbf-integrator --create-visualizations`
+    would have produced, without repeating the integration.
     """
-    import h5py
-    import numpy as np
-    import jax.numpy as jnp
-    from subhkl.config import reduction_settings
-    from subhkl.optimization import FindUB, VectorizedObjective
-    from subhkl.search.prior import HoughPrior
-
-    print(f"Loading data from {merged_h5_filename}...")
-    with h5py.File(merged_h5_filename, "r") as f_in:
-        file_bank_ids = list(int(bid) for bid in f_in["bank_ids"])
-        ax = f_in["goniometer/axes"][()]
-        goniometer_angles = np.array(f_in["goniometer/angles"][()])
-
-        from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
-
-        R_stack = np.stack(
-            [calc_goniometer_rotation_matrix(ax, ang) for ang in goniometer_angles]
-        )
-        file_offsets = f_in["file_offsets"][()]
-
-        a = float(f_in["sample/a"][()])
-        b = float(f_in["sample/b"][()])
-        c = float(f_in["sample/c"][()])
-        alpha = float(f_in["sample/alpha"][()])
-        beta = float(f_in["sample/beta"][()])
-        gamma = float(f_in["sample/gamma"][()])
-
-        if space_group is None:
-            space_group = f_in["sample/space_group"][()].decode("utf-8")
-
-    # Dynamically slice the arrays based on the requested number of runs
-    if num_runs > 0:
-        if len(file_offsets) > num_runs:
-            end_idx = file_offsets[num_runs]
-        else:
-            end_idx = len(file_bank_ids)
-            num_runs = len(file_offsets)
-
-        print(
-            f"Limiting search to the first {num_runs} run(s) (Images 0 to {end_idx - 1})..."
-        )
-        file_bank_ids = file_bank_ids[:end_idx]
-        R_stack = R_stack[:end_idx]
-    else:
-        end_idx = len(file_bank_ids)
-        print(f"Using all {len(file_offsets)} available runs for the search...")
-
-    settings = reduction_settings[instrument]
-    wavelength_min, wavelength_max = settings.get("Wavelength")
-
-    ub_helper = FindUB()
-    ub_helper.a, ub_helper.b, ub_helper.c = a, b, c
-    ub_helper.alpha, ub_helper.beta, ub_helper.gamma = alpha, beta, gamma
-    B_mat = ub_helper.reciprocal_lattice_B()
-
-    print("\n--- HOUGH PRIOR GENERATION ---")
-    prior_engine = HoughPrior(
-        B_mat, np.array(R_stack), ki_vec=np.array([0.0, 0.0, 1.0])
+    written = replay.replay_plots(
+        images_filename=images_filename,
+        peaks_filename=peaks_filename,
+        suffix="-pred",
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        n_sigma=n_sigma,
+        max_workers=max_workers,
+        show_progress=show_progress,
     )
+    print(f"Wrote {len(written)} plot(s).")
+    return written
 
-    print(f"Loading empirical rays from {peaks_h5_filename}...")
 
-    with h5py.File(peaks_h5_filename, "r") as f_peaks:
-        peaks_xyz = f_peaks["peaks/xyz"][()]
-        peaks_intensity = f_peaks["peaks/intensity"][()]
+def run_static_mask(
+    output_filename: str,
+    input_filenames: list[str],
+    peaks_filenames: list[str] | None = None,
+    pooled_peaks_filename: str | None = None,
+    peak_deviance_min: float = 9.488,
+    peak_residual_max: float = 2.0,
+    peak_clear_nsigmas: float = 3.5,
+    min_frames: int = 5,
+    smooth_sigma: float = 2.0,
+    grad_nmads: float = 8.0,
+    texture_factor: float = 0.15,
+    wide_sigma: float = 20.0,
+    edge_sigma: float = 25.0,
+    dilate_px: int = 8,
+    static_quantile: float = 25.0,
+    grad_min_frac: float = 0.02,
+):
+    """Build a static-structure mask from reduced/merged frame stacks.
 
-        # CRITICAL: image_index maps 1:1 to the N_banks dimension of R_stack in merged.h5
-        if "peaks/image_index" in f_peaks:
-            group_indices = f_peaks["peaks/image_index"][()]
-        else:
-            group_indices = f_peaks["peaks/run_index"][()]
+    See subhkl.search.static_mask for the estimator; the output is itself a
+    reduced single-frame stack (1 = valid, 0 = masked, one frame per physical
+    bank), so any tool that reads reduced files can display it, and the
+    finder maps it onto its input by bank id (--static-mask-file).
+    """
+    from subhkl.search.static_mask import build_mask_file
 
-        if "beam/ki_vec" in f_peaks:
-            ki_vec = f_peaks["beam/ki_vec"][()]
-        else:
-            ki_vec = np.array([0.0, 0.0, 1.0])
-
-        # If Peaks file overrides the goniometer entirely, use it. Otherwise rely on Peaks API/merged.h5
-        R_peaks_override = f_peaks.get("goniometer/R")
-        if R_peaks_override is not None:
-            R_peaks_override = R_peaks_override[()]
-
-    q_hat_list, q_lab_list, peaks_xyz_list, intensities_list, mapped_bank_indices = (
-        [],
-        [],
-        [],
-        [],
-        [],
-    )
-
-    unique_groups = np.unique(group_indices)
-    for g_idx in unique_groups:
-        if g_idx >= end_idx:
-            continue
-
-        mask = group_indices == g_idx
-        grp_xyz = peaks_xyz[mask]
-        grp_intensity = peaks_intensity[mask]
-
-        # 2. Safely grab the rotation matrix using the flat bank index (g_idx)
-        if R_peaks_override is not None:
-            if R_peaks_override.ndim == 3 and R_peaks_override.shape[0] == len(
-                peaks_xyz
-            ):
-                R_gonio = R_peaks_override[mask][0]
-            elif R_peaks_override.ndim == 3 and R_peaks_override.shape[0] > g_idx:
-                R_gonio = R_peaks_override[g_idx]
-            else:
-                R_gonio = R_peaks_override
-        else:
-            # Let the flat R_stack (N_banks, 3, 3) map directly to the image/bank index
-            R_gonio = R_stack[g_idx] if g_idx < len(R_stack) else np.eye(3)
-
-        intensity_mask = grp_intensity >= min_intensity
-        if not np.any(intensity_mask):
-            continue
-
-        grp_xyz = grp_xyz[intensity_mask]
-        grp_intensity = grp_intensity[intensity_mask]
-
-        top_k_idx = np.argsort(grp_intensity)[::-1][
-            : min(top_k_rays, len(grp_intensity))
-        ]
-        grp_xyz_top = grp_xyz[top_k_idx]
-        grp_intensity_top = grp_intensity[top_k_idx]
-
-        kf = grp_xyz_top / np.linalg.norm(grp_xyz_top, axis=1, keepdims=True)
-        q_lab = kf - ki_vec[None, :]
-        q_sample = np.dot(q_lab, R_gonio)
-
-        q_norms = np.linalg.norm(q_sample, axis=1, keepdims=True)
-        q_hat_grp = q_sample / q_norms
-
-        q_hat_list.append(q_hat_grp)
-        q_lab_list.append(q_lab)
-        peaks_xyz_list.append(grp_xyz_top)
-        intensities_list.append(grp_intensity_top)
-
-        # 3. Map the VectorizedObjective strictly to the flat bank index
-        mapped_bank_indices.append(np.full(len(grp_xyz_top), g_idx))
-
-    if not q_hat_list:
-        print(
-            "Failed to extract any valid rays from the peaks file. Check your --min-intensity threshold."
-        )
-        return
-
-    q_hat = np.vstack(q_hat_list)
-    q_lab_all = np.vstack(q_lab_list).T
-    peaks_xyz_all = np.vstack(peaks_xyz_list).T
-    intensities_all = np.concatenate(intensities_list)
-
-    # This array now contains the exact bank index (0 to N_banks-1) for every single ray
-    bank_indices_all = np.concatenate(mapped_bank_indices)
-
-    median_intensity = np.median(intensities_all)
-    weights_all = intensities_all / (median_intensity + 1e-6)
-    weights_all = np.clip(weights_all, 0.0, 10.0)
-
-    print(f"Extracted {len(q_hat)} physical rays. Running 3D Combinatorial Hough...")
-    n_obs, weights_obs = prior_engine.compute_hough_accumulator(
-        q_hat,
-        grid_resolution=hough_grid_resolution,
-        n_hough=n_hough,
-        plot_filename=output_hough,
-        border_frac=border_frac,
-    )
-
-    if len(n_obs) == 0:
-        return
-
-    n_calc = prior_engine.generate_theoretical_zones(
-        L_max=L_max, top_k=top_k, max_uvw=max_uvw
+    summary = build_mask_file(
+        input_filenames,
+        output_filename,
+        peaks=peaks_filenames,
+        pooled_peaks=pooled_peaks_filename,
+        peak_deviance_min=peak_deviance_min,
+        peak_residual_max=peak_residual_max,
+        peak_clear_nsigmas=peak_clear_nsigmas,
+        min_frames=min_frames,
+        smooth_sigma=smooth_sigma,
+        grad_nmads=grad_nmads,
+        texture_factor=texture_factor,
+        wide_sigma=wide_sigma,
+        edge_sigma=edge_sigma,
+        dilate_px=dilate_px,
+        static_quantile=static_quantile,
+        grad_min_frac=grad_min_frac,
     )
     print(
-        f"Extracted {len(n_obs)} Empirical Zones against {len(n_calc)} Theoretical Zones."
+        f"Wrote {output_filename}: {len(summary['banks'])} bank(s), "
+        f"{100 * summary['masked_fraction']:.2f}% of pixels masked."
     )
+    if summary["thin_banks"]:
+        print(
+            f"Banks with fewer than {min_frames} distinct frames stay fully "
+            "valid: " + ", ".join(str(b) for b in summary["thin_banks"])
+        )
+    if summary.get("n_exonerated"):
+        print(
+            f"Exonerated {summary['n_exonerated']} metric-certified peak "
+            "footprint(s) from the static evidence."
+        )
+    if summary.get("n_exonerated_pooled"):
+        print(
+            f"Exonerated {summary['n_exonerated_pooled']} bank-level peak "
+            "footprint(s) certified by the pooled (summed-frame) fit."
+        )
+    if summary["duplicates_dropped"]:
+        n = sum(summary["duplicates_dropped"].values())
+        print(
+            f"WARNING: dropped {n} duplicate frame(s) (same goniometer "
+            "orientation or identical content).  The estimator needs the "
+            "sample to move between frames; repeats would promote true "
+            "signal into the mask."
+        )
+    return summary
 
-    quats, _ = prior_engine.solve_permutations(
-        jnp.array(n_obs),
-        jnp.array(weights_obs),
-        n_calc,
-        q_hat,
-        space_group=space_group,
-        angle_tol_deg=davenport_angle_tol,
-        scoring_tol_deg=vector_tolerance,
-        d_min=d_min,
-    )
 
-    if quats is None or len(quats) == 0:
-        return
+def run_sum_images(
+    output_filename: str,
+    input_filenames: list[str],
+):
+    """Sum each physical bank's deduplicated frames into a one-frame-per-bank
+    stack.
 
-    print("Filtering Prior through Exact Physics Forward-Model...")
+    The companion of `static-mask`: a finder run on the summed stack sees the
+    pooled evidence exactly as the static-map quantile does, so quasi-static
+    reflections too faint for any single frame's certificate compound to
+    certification there (deviance is additive across frames).  Feed that
+    finder output back to `static-mask` as --pooled-peaks.
+    """
+    from subhkl.search.static_mask import build_summed_file
 
-    # Retrieve names to build the map for the objective function
-    axis_names = None
-    with h5py.File(merged_h5_filename, "r") as f_in:
-        if "goniometer/names" in f_in:
-            axis_names = [n.decode("utf-8") for n in f_in["goniometer/names"][()]]
-
-    motor_map = None
-    if axis_names is not None:
-        unique_motors = []
-        motor_map = []
-        for name in axis_names:
-            if name not in unique_motors:
-                unique_motors.append(name)
-            motor_map.append(unique_motors.index(name))
-
-    ray_objective = VectorizedObjective(
-        B=B_mat,
-        kf_ki_dir=q_lab_all,
-        peak_xyz_lab=peaks_xyz_all,
-        wavelength=[wavelength_min, wavelength_max],
-        cell_params=[a, b, c, alpha, beta, gamma],
-        motor_map=motor_map,
-        # 4. The Magic Link:
-        # static_R has length N_banks. peak_run_indices contains values from 0 to N_banks-1.
-        # VectorizedObjective will now perfectly map every single ray to its exact physical bank geometry.
-        static_R=R_stack,
-        peak_run_indices=bank_indices_all,
-    )
-
-    prior_rots = prior_engine.physics_filter(
-        quats, ray_objective, batch_size=batch_size, z_score_threshold=3.0
-    )
-
-    if prior_rots is None or len(prior_rots) == 0:
-        print("Exact physical model rejected all seeds. Exiting.")
-        return
-
-    print(f"Success! Saving optimal seed to {output_h5_filename}...")
-    with h5py.File(output_h5_filename, "w") as f:
-        best_rot = np.array(prior_rots[0])
-        f.create_dataset("optimization/best_params", data=best_rot)
-
-        from subhkl.optimization import rotation_matrix_from_rodrigues_jax
-
-        U_matrix = np.array(rotation_matrix_from_rodrigues_jax(best_rot))
-        f.create_dataset("sample/U", data=U_matrix)
-        f.create_dataset("sample/B", data=B_mat)
-
-        f.create_dataset("sample/a", data=a)
-        f.create_dataset("sample/b", data=b)
-        f.create_dataset("sample/c", data=c)
-        f.create_dataset("sample/alpha", data=alpha)
-        f.create_dataset("sample/beta", data=beta)
-        f.create_dataset("sample/gamma", data=gamma)
-
-        f.create_dataset("sample/offset", data=np.zeros(3))
-        f.create_dataset("beam/ki_vec", data=np.array([0.0, 0.0, 1.0]))
-        f.create_dataset("optimization/goniometer_offsets", data=np.zeros(len(ax)))
-        f.create_dataset("sample/space_group", data=space_group.encode("utf-8"))
-        f.create_dataset("instrument/wavelength", data=[wavelength_min, wavelength_max])
-
+    summary = build_summed_file(input_filenames, output_filename)
     print(
-        f"Done. You can now run:\n subhkl indexer {merged_h5_filename} <output.h5> --bootstrap {output_h5_filename} ..."
+        f"Wrote {output_filename}: {len(summary['banks'])} bank(s), "
+        f"{sum(summary['n_frames'].values())} frame(s) summed."
     )
+    if summary["duplicates_dropped"]:
+        n = sum(summary["duplicates_dropped"].values())
+        print(f"Dropped {n} duplicate frame(s) before summing.")
+    return summary
+
+
+def run_mask_visualize(
+    images_filename: str,
+    mask_filename: str,
+    instrument: str | None = None,
+    output_dir: str | None = None,
+    dpi: int = 600,
+    max_workers: int | None = None,
+    show_progress: bool = True,
+):
+    """Draw the static mask over the frames it applies to (`<label>-mask.png`)."""
+    written = replay.replay_mask_plots(
+        images_filename=images_filename,
+        mask_filename=mask_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        dpi=dpi,
+        max_workers=max_workers,
+        show_progress=show_progress,
+    )
+    print(f"Wrote {len(written)} plot(s).")
+    return written

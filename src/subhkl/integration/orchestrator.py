@@ -1,4 +1,3 @@
-import os
 from dataclasses import dataclass, astuple
 import numpy as np
 from typing import List, Any, Optional, Dict, Tuple
@@ -6,7 +5,7 @@ from typing import List, Any, Optional, Dict, Tuple
 from .image_data import ImageData
 from subhkl.config import beamlines
 from subhkl.instrument.goniometer import Goniometer
-from subhkl.search.sparse_rbf import SparseRBFPeakFinder
+from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
 
 @dataclass(frozen=True)
@@ -25,7 +24,8 @@ class DetectorPeaks:
     az_phi: List[float]
     wavelength_mins: List[float]
     wavelength_maxes: List[float]
-    intensity: List[float]
+    # No intensity: the finder reports positions, shape and validation
+    # metrics; amplitude measurement belongs to the integrator.
     sigma: List[float]
     radii: List[float]
     xyz: List[List[float]]
@@ -37,31 +37,15 @@ class DetectorPeaks:
     gonio_names: Optional[List[str]]
     peak_rows: Optional[List[int]]
     peak_cols: Optional[List[int]]
-
-    def __iter__(self):
-        """Allows tuple unpacking"""
-        return iter(astuple(self))
-
-    def __getitem__(self, index):
-        """Allows index access"""
-        return astuple(self)[index]
-
-
-@dataclass(frozen=True)
-class IntegrationResult:
-    h: List[float]
-    k: List[float]
-    l: List[float]
-    intensity: List[float]
-    sigma: List[float]
-    tt: List[float]
-    az: List[float]
-    wavelength: List[float]
-    bank: List[int]
-    run_id: List[int]
-    xyz: List[List[float]]
-    R: List[Any]
-    angles: List[List[float]]
+    # Per-peak quality metrics from the finder, when it reports them.
+    # Trailing and defaulted so that positional construction and unpacking of
+    # the fields above are unaffected.
+    deviance: Optional[List[float]] = None
+    residual_deviance: Optional[List[float]] = None
+    # The per-peak Gaussian width, for the finders that fit one.  None when no
+    # width was measured, which is the difference from `sigma` above: that one
+    # always holds a number, but only sometimes a width.
+    width: Optional[List[float]] = None
 
     def __iter__(self):
         """Allows tuple unpacking"""
@@ -87,6 +71,8 @@ def prepare_harvest_tasks(
 
     # --- BATCH PRE-PROCESSING (SparseRBF) ---
     precomputed_peaks = {}
+    precomputed_deviance = {}
+    precomputed_residual = {}
     if finder_algorithm == "sparse_rbf":
         img_keys = sorted(ims.keys())
         images_list = [ims[k] for k in img_keys]
@@ -97,20 +83,88 @@ def prepare_harvest_tasks(
             border_width = 0.0
         border_width *= min(img_stack.shape[1], img_stack.shape[2])
 
-        alg = SparseRBFPeakFinder(
-            alpha=harvest_peaks_kwargs.get("alpha", 0.1),
-            gamma=harvest_peaks_kwargs.get("gamma", 2.0),
-            loss=harvest_peaks_kwargs.get("loss", "gaussian"),
+        # The global basis-pursuit finder is the only finder: the greedy
+        # matching-pursuit one it superseded is retired.  Returns
+        # [amplitude, row, column, sigma] per peak.
+        alg = MatrixFreeSparseRBFPeakFinder(
+            # None means "derive it from the image size"; see
+            # MatrixFreeSparseRBFPeakFinder.effective_alpha.
+            alpha=harvest_peaks_kwargs.get("alpha"),
+            # 0, not the greedy finder's historical 2.0: the flux-matched
+            # default; see the class docstring.
+            gamma=harvest_peaks_kwargs.get("gamma", 0.0),
+            loss=harvest_peaks_kwargs.get("loss", "poisson"),
             min_sigma=harvest_peaks_kwargs.get("min_sigma", 1.0),
-            max_sigma=harvest_peaks_kwargs.get("max_sigma", 10.0),
-            border_width=int(border_width),
-            chunk_size=harvest_peaks_kwargs.get("chunk_size", 128),
+            # None measures the ceiling from the first batch's own width
+            # census.
+            max_sigma=harvest_peaks_kwargs.get("max_sigma"),
+            # Bank resolution, independent of the ceiling.  None lets the
+            # finder auto-size the bank against carpet fragmentation; an
+            # explicit count keeps the historical uniform grid.
+            num_sigmas=harvest_peaks_kwargs.get("num_sigmas"),
+            # Tolerable unsupported atoms per image.  Mapped onto the
+            # brightness quantile the auto bank protects, via the moment
+            # census of each batch -- arithmetic, no extra solves; see
+            # _frag_protected_quantile.  Non-positive keeps the fixed
+            # p90 census quantile.
+            max_fragmentation_rate=harvest_peaks_kwargs.get(
+                "max_fragmentation_rate", 1.0
+            ),
+            # The m0 of the false-alarm calibration: expected false peaks
+            # per image.  The one knob that sets the detection budget.
+            false_alarms_per_image=harvest_peaks_kwargs.get(
+                "false_alarms_per_image", 1.0
+            ),
             show_steps=harvest_peaks_kwargs.get("show_steps", False),
-            auto_tune_alpha=harvest_peaks_kwargs.get("auto_tune_alpha", False),
-            candidate_alphas=harvest_peaks_kwargs.get("candidate_alphas", None),
+            # These four were not forwarded at first, and the omission was
+            # invisible from the CLI: the constructor's **kwargs swallows
+            # nothing, the class defaults are sensible, and every unit test
+            # builds the class directly.  The visible symptoms were that
+            # --sparse-rbf-profile-file gaussian (the documented opt-out
+            # of the learned family) did nothing, and that a suite tuned
+            # to --sparse-rbf-chunk-size 64 was actually running at
+            # whatever the class default happened to be.
+            profile_file=harvest_peaks_kwargs.get("profile_file", "auto"),
+            shape_ratio=harvest_peaks_kwargs.get("shape_ratio", 1.2),
+            shape_orientations=harvest_peaks_kwargs.get("shape_orientations", 4),
+            chunk_size=harvest_peaks_kwargs.get("chunk_size", 64),
+            multi_gpu=harvest_peaks_kwargs.get("multi_gpu", False),
         )
-        batch_coords = alg.find_peaks_batch(img_stack)
+        # A static-structure mask (see subhkl.search.static_mask) is mapped
+        # onto the input by *physical* bank, so a mask built from any scans of
+        # this instrument -- different sample included -- applies here, and a
+        # bank the mask file does not carry runs unmasked.
+        valid_stack = None
+        static_mask_file = harvest_peaks_kwargs.get("static_mask_file")
+        if static_mask_file and isinstance(alg, MatrixFreeSparseRBFPeakFinder):
+            from subhkl.search.static_mask import load_mask_for_banks
+
+            valid_stack = load_mask_for_banks(
+                static_mask_file,
+                [bank_mapping.get(k, k) for k in img_keys],
+                img_stack.shape[1:],
+            )
+        elif static_mask_file:
+            print(
+                "WARNING: --static-mask-file is only honored by the matrix-free finder."
+            )
+
+        if valid_stack is not None:
+            batch_coords = alg.find_peaks_batch(img_stack, valid=valid_stack)
+        else:
+            batch_coords = alg.find_peaks_batch(img_stack)
         precomputed_peaks = {k: c for k, c in zip(img_keys, batch_coords, strict=False)}
+        # Per-peak quality metrics, when the finder reports them (the
+        batch_deviance = getattr(alg, "peak_deviance", None)
+        if batch_deviance is not None:
+            precomputed_deviance = {
+                k: d for k, d in zip(img_keys, batch_deviance, strict=False)
+            }
+        batch_residual = getattr(alg, "peak_residual_deviance", None)
+        if batch_residual is not None:
+            precomputed_residual = {
+                k: d for k, d in zip(img_keys, batch_residual, strict=False)
+            }
 
     tasks = []
     for img_key in sorted(ims.keys()):
@@ -149,11 +203,26 @@ def prepare_harvest_tasks(
         pre_coords = None
         if finder_algorithm == "sparse_rbf":
             coords = precomputed_peaks[img_key]
-            # coords shape is [intensity, r, c, sigma]
+            # coords shape is [intensity, r, c, sigma].  The third slot of
+            # pre_coords carries the finder's per-peak Gaussian width so the
+            # harvest output can record it (peaks/sigma) for --max-sigma
+            # tuning diagnostics; the fourth carries the per-peak leave-one-out
+            # deviance (peaks/deviance), the significance of that atom against
+            # chi^2 on its four parameters; the fifth the local residual
+            # deviance per degree of freedom (peaks/residual_deviance), which
+            # says whether the neighbourhood is actually explained -- a
+            # mis-sized sigma scores high on the fourth and badly on the fifth.
+            dev = precomputed_deviance.get(img_key)
+            res = precomputed_residual.get(img_key)
             if len(coords) > 0:
-                pre_coords = (coords[:, 1], coords[:, 2])
+                if dev is None or len(dev) != len(coords):
+                    dev = np.zeros(len(coords))
+                if res is None or len(res) != len(coords):
+                    res = np.zeros(len(coords))
+                pre_coords = (coords[:, 1], coords[:, 2], coords[:, 3], dev, res)
             else:
-                pre_coords = (np.array([]), np.array([]))
+                empty = np.array([])
+                pre_coords = (empty, empty, empty, empty, empty)
 
         finder_info = (finder_algorithm, harvest_peaks_kwargs, pre_coords)
         mask_info = (
@@ -205,6 +274,9 @@ def prepare_predict_tasks(
     gonio_axes: Optional[Any] = None,
     gonio_angles: Optional[np.ndarray] = None,
     gonio_offsets: Optional[np.ndarray] = None,
+    per_run_trans: Optional[np.ndarray] = None,
+    frame_to_run: Optional[np.ndarray] = None,
+    harmonic_rot: Optional[np.ndarray] = None,
 ) -> List[Tuple[Any, ...]]:
     bank_mapping = image_data.bank_mapping
     tasks = []
@@ -261,6 +333,24 @@ def prepare_predict_tasks(
             else:
                 angles_bank = gonio_angles
 
+        # Per-run sample displacement rides on the innermost axis; the
+        # per-image task granularity makes it a per-task effective offset.
+        so_eff = sample_offset
+        if (
+            per_run_trans is not None
+            and frame_to_run is not None
+            and sample_offset is not None
+            and np.ndim(sample_offset) == 2
+            and img_index < len(frame_to_run)
+        ):
+            so_eff = np.array(sample_offset, dtype=float, copy=True)
+            so_eff[-1] = so_eff[-1] + per_run_trans[int(frame_to_run[img_index])]
+
+        # Fourier rocking: a lab-frame q-steering rotation per image.
+        extra_rot = None
+        if harmonic_rot is not None and img_index < len(harmonic_rot):
+            extra_rot = harmonic_rot[img_index]
+
         tasks.append(
             (
                 img_key,
@@ -270,176 +360,13 @@ def prepare_predict_tasks(
                 UB,  # <-- Pass constant UB!
                 wavelength_min,
                 wavelength_max,
-                sample_offset,
+                so_eff,
                 ki_vec,
                 R_bank,
                 gonio_axes,
                 angles_bank,
                 gonio_offsets,  # <-- NEW
-            )
-        )
-    return tasks
-
-
-def prepare_integrate_tasks(
-    image: ImageData,
-    filename: str,
-    instrument: str,
-    peak_dict: Dict[str, List[Any]],
-    integration_params: Dict[str, Any],
-    RUB: np.ndarray,
-    R_stack: Optional[np.ndarray] = None,
-    angles_stack: Optional[np.ndarray] = None,
-    sample_offset: Optional[np.ndarray] = None,
-    ki_vec: Optional[np.ndarray] = None,
-    integration_method: str = "free_fit",
-    create_visualizations: bool = False,
-    show_progress: bool = False,
-    found_peaks_file: Optional[str] = None,
-) -> List[Tuple[Any, ...]]:
-    found_peaks_xyz = None
-    found_peaks_bank = None
-    found_peaks_run = None
-    if found_peaks_file is not None:
-        try:
-            import h5py
-
-            print(f"Loading found peaks from: {found_peaks_file}")
-            with h5py.File(found_peaks_file, "r") as f:
-                if "files" in f and "file_offsets" in f and "peaks/xyz" in f:
-                    files_db = f["files"][()]
-                    offsets = f["file_offsets"][()]
-                    target_name = os.path.basename(filename)
-                    match_idxs = []
-                    # 1. Direct match
-                    for i, fname_bytes in enumerate(files_db):
-                        fname_str = (
-                            fname_bytes.decode("utf-8")
-                            if isinstance(fname_bytes, bytes)
-                            else str(fname_bytes)
-                        )
-                        if target_name in fname_str:
-                            match_idxs.append(i)
-
-                    # 2. Match via source files (if is a merged master)
-                    if not match_idxs and image.raw_files:
-                        for src_file in image.raw_files:
-                            src_name = os.path.basename(src_file)
-                            for i, fname_bytes in enumerate(files_db):
-                                fname_str = (
-                                    fname_bytes.decode("utf-8")
-                                    if isinstance(fname_bytes, bytes)
-                                    else str(fname_bytes)
-                                )
-                                if src_name == os.path.basename(fname_str):
-                                    if i not in match_idxs:
-                                        match_idxs.append(i)
-
-                    if match_idxs:
-                        # Load and concatenate from all matched indices
-                        xyz_list = []
-                        bank_list = []
-                        run_list = []
-                        for idx in match_idxs:
-                            start = int(offsets[idx])
-                            end = (
-                                int(offsets[idx + 1])
-                                if idx < len(files_db) - 1
-                                else f["peaks/xyz"].shape[0]
-                            )
-                            xyz_list.append(f["peaks/xyz"][start:end])
-                            if "bank" in f:
-                                bank_list.append(f["bank"][start:end])
-                            elif "peaks/bank" in f:
-                                bank_list.append(f["peaks/bank"][start:end])
-
-                            if "peaks/run_index" in f:
-                                run_list.append(f["peaks/run_index"][start:end])
-
-                        found_peaks_xyz = (
-                            np.concatenate(xyz_list, axis=0) if xyz_list else None
-                        )
-                        found_peaks_bank = (
-                            np.concatenate(bank_list, axis=0) if bank_list else None
-                        )
-                        found_peaks_run = (
-                            np.concatenate(run_list, axis=0) if run_list else None
-                        )
-                elif "peaks/xyz" in f:
-                    found_peaks_xyz = f["peaks/xyz"][()]
-                    if "bank" in f:
-                        found_peaks_bank = f["bank"][()]
-                    elif "peaks/bank" in f:
-                        found_peaks_bank = f["peaks/bank"][()]
-                    if "peaks/run_index" in f:
-                        found_peaks_run = f["peaks/run_index"][()]
-        except Exception as e:
-            print(f"Failed to load found peaks: {e}")
-
-    tasks = []
-    os.path.basename(filename)
-
-    sorted_keys = sorted(peak_dict.keys())
-    if not sorted_keys:
-        return []
-
-    total_images = len(sorted_keys)
-
-    def _resolve(stack, seq_idx, name):
-        if stack is None:
-            return None
-
-        is_batch = (stack.ndim == 3) or (stack.ndim == 2 and name == "angles_stack")
-        if not is_batch:
-            return stack
-
-        n_items = stack.shape[0]
-        if n_items == 1:
-            return stack[0]
-
-        if n_items == total_images:
-            return stack[seq_idx]
-
-        raise ValueError(
-            f"CRITICAL: Array dimension mismatch for '{name}'. "
-            f"The stack contains {n_items} matrices, but there are {total_images} images scheduled. "
-            f"Run index fallback is strictly disabled."
-        )
-
-    for _i, bank in enumerate(sorted_keys):
-        peaks = peak_dict[bank]
-        physical_bank = image.bank_mapping.get(bank, bank)
-        det_config = beamlines[instrument][str(physical_bank)]
-
-        current_rub = _resolve(RUB, _i, "RUB")
-        current_R_val = _resolve(R_stack, _i, "R_stack")
-        current_angles_val = _resolve(angles_stack, _i, "angles_stack")
-
-        # The physical run_id can still be safely fetched for metadata logging
-        run_id = image.get_run_id(bank)
-
-        metrics_info = (
-            found_peaks_xyz,
-            found_peaks_bank,
-            found_peaks_run,
-            run_id,
-            current_rub,
-            current_angles_val,
-            current_R_val,
-            sample_offset,
-            ki_vec,
-        )
-
-        tasks.append(
-            (
-                bank,
-                physical_bank,
-                image.ims[bank],
-                peaks,
-                det_config,
-                integration_params,
-                integration_method,
-                metrics_info,
+                extra_rot,
             )
         )
     return tasks

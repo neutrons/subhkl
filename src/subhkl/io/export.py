@@ -70,6 +70,14 @@ class BaseConcatenateMerger:
         with h5py.File(output_filename, "w") as f_out:
             # Open the valid template file we found (or the first one if all are empty)
             with h5py.File(typical_file_path, "r") as f_typical:
+                # Root attributes ride along (the reduced files record e.g.
+                # instrument='CG4D' there).  Dropping them was how a merged
+                # file ended up unable to say which instrument it belongs
+                # to, so every replay command downstream needed the caller
+                # to repeat what the inputs already knew.
+                for name, value in f_typical.attrs.items():
+                    f_out.attrs[name] = value
+
                 for key in self.copy_keys:
                     if key in f_typical:
                         f_out[key] = np.array(f_typical[key])
@@ -163,7 +171,35 @@ class FinderConcatenateMerger(BaseConcatenateMerger):
 
 
 class MTZExporter:
-    def __init__(self, peaks_file, space_group=None):
+    """Unmerged MTZ from an integrator output.
+
+    With ``predictions_file`` / ``corrections_file``, per-observation
+    systematics proxies ride along as extra real-valued columns so a
+    downstream scaling model (careless) can LEARN the residual error
+    surface instead of having it folded silently into the merged
+    intensities:
+
+    - SIGEFF [px]: the projected peak radius (det Sigma)^(1/4);
+    - SNAPD [px]: distance from the integrated position to the nearest
+      predicted position on the same image -- how far the geometry was
+      off for THIS peak, the direct flux-error proxy;
+    - DPHI [deg], DTX/DTY/DTZ [mm]: the fitted per-run goniometer angle
+      and translation corrections of the peak's run.  As per-run
+      constants these are spanned by image-wise scales; their value to
+      the scale model is in interactions with the per-peak geometry
+      (a run whose phi was 0.7 deg off does not err uniformly).
+
+    Columns appear only when their source file is supplied, so existing
+    exports are byte-identical.
+    """
+
+    def __init__(
+        self,
+        peaks_file,
+        space_group=None,
+        predictions_file=None,
+        corrections_file=None,
+    ):
         with h5py.File(peaks_file) as f:
             self.a = float(np.array(f["sample/a"]))
             self.b = float(np.array(f["sample/b"]))
@@ -199,7 +235,54 @@ class MTZExporter:
             else:
                 self.runs = np.zeros_like(self.h, dtype=np.int32)
 
+            run_raw = self.runs.copy()
             self.runs = 1000 * self.runs + f["peaks/bank"]
+
+            self.extra = {}  # column name -> (mtz type, per-row values)
+            has_shape = all(k in f["peaks"] for k in ("var_u", "var_v", "cov_uv"))
+            if (predictions_file or corrections_file) and has_shape:
+                var_u = np.array(f["peaks/var_u"], dtype=float)
+                var_v = np.array(f["peaks/var_v"], dtype=float)
+                cov_uv = np.array(f["peaks/cov_uv"], dtype=float)
+                det = np.maximum(var_u * var_v - cov_uv**2, 1e-6)
+                self.extra["SIGEFF"] = ("R", det**0.25)
+            if predictions_file is not None:
+                img = np.array(f["peaks/image_index"], dtype=int)
+                pr = np.array(f["peaks/pixel_r"], dtype=float)
+                pc = np.array(f["peaks/pixel_c"], dtype=float)
+                snapd = np.zeros(len(pr))
+                with h5py.File(predictions_file) as fp:
+                    pred = {
+                        int(k): np.stack(
+                            [fp[f"banks/{k}/i"][()], fp[f"banks/{k}/j"][()]],
+                            axis=1,
+                        )
+                        for k in fp["banks"]
+                    }
+                for i in range(len(pr)):
+                    P = pred.get(img[i])
+                    if P is None or len(P) == 0:
+                        continue
+                    d2 = (P[:, 0] - pr[i]) ** 2 + (P[:, 1] - pc[i]) ** 2
+                    # Cap at 5 px: a farther "match" is a bookkeeping
+                    # mismatch, not a measured displacement.
+                    snapd[i] = min(float(np.sqrt(d2.min())), 5.0)
+                self.extra["SNAPD"] = ("R", snapd)
+            if corrections_file is not None:
+                with h5py.File(corrections_file) as fc:
+                    g = fc.get("goniometer/per_run")
+                    if g is not None:
+                        n_runs = len(g["delta_deg"])
+                        run_c = np.clip(run_raw, 0, n_runs - 1)
+                        if "delta_deg" in g:
+                            self.extra["DPHI"] = (
+                                "R",
+                                np.array(g["delta_deg"])[run_c],
+                            )
+                        if "trans_m" in g:
+                            t_mm = 1e3 * np.array(g["trans_m"])[run_c]
+                            for j, ax in enumerate(("DTX", "DTY", "DTZ")):
+                                self.extra[ax] = ("R", t_mm[:, j])
 
         self.space_group = space_group
 
@@ -226,11 +309,18 @@ class MTZExporter:
         mtz.add_column("THETA", "W")
         mtz.add_column("PHI", "W")
         mtz.add_column("BATCH", "B")
+        for name, (mtz_type, _vals) in self.extra.items():
+            mtz.add_column(name, mtz_type)
 
-        # Column order: h, k, l, I, sigI, [FP, sigFP,] wavel, theta, phi, batch
+        # Column order: h, k, l, I, sigI, [FP, sigFP,] wavel, theta, phi,
+        # batch, [extras...]
         n_base_cols = 9  # h, k, l, I, sigI, wavel, theta, phi, batch
         n_structure_factor_cols = 2  # FP, sigFP
-        n_cols = n_base_cols + (n_structure_factor_cols if self.f is not None else 0)
+        n_cols = (
+            n_base_cols
+            + (n_structure_factor_cols if self.f is not None else 0)
+            + len(self.extra)
+        )
 
         data = []
 
@@ -239,6 +329,13 @@ class MTZExporter:
 
             # Drop invalid peaks
             if h == 0 and k == 0 and l == 0:
+                continue
+
+            # A nonpositive sigma is a marker, not a measurement: the
+            # matrix-free integrator stamps sigI = 0 on amplitudes pinned
+            # at its nonnegativity boundary (censored observations that
+            # would bias weak merged intensities if exported as 0 +- sigma).
+            if self.sigma[i] <= 0.0:
                 continue
 
             intensity, sigma = self.intensity[i], self.sigma[i]
@@ -268,6 +365,7 @@ class MTZExporter:
                 ]
             else:
                 row = [h, k, l, intensity, sigma, wl, theta, phi, run]
+            row.extend(float(vals[i]) for _t, vals in self.extra.values())
 
             data.append(row)
 

@@ -45,6 +45,7 @@ def predict_reflections_on_panel(
     gonio_axes=None,
     gonio_angles=None,
     gonio_offsets=None,  # <-- NEW
+    extra_rot=None,
 ):
     """
     Predict reflection positions on a specific detector panel.
@@ -98,6 +99,11 @@ def predict_reflections_on_panel(
         s = sample_offset if sample_offset is not None else np.zeros(3)
         s_lab = R_all @ s if R_all is not None else s
         q_lab = R_all @ q_sample if R_all is not None else q_sample
+
+    if extra_rot is not None:
+        # Fourier rocking: steers the diffraction directions in the lab
+        # frame and leaves the sample origin untouched.
+        q_lab = np.asarray(extra_rot) @ q_lab
 
     Q_vec = 2 * np.pi * q_lab  # (3, M)
     Q_sq = np.sum(Q_vec**2, axis=0)  # (M,)

@@ -3,6 +3,69 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as colors
 
 
+#: How many standard deviations out the drawn peak outline sits.  A peak has
+#: no edge, only a width, so any outline is a choice of contour; 2 sigma is
+#: what this plot has always drawn and holds about 86% of a 2D Gaussian's flux.
+DEFAULT_N_SIGMA = 2.0
+
+
+def peak_outline(row, col, var_u, var_v, cov_uv, n_sigma=DEFAULT_N_SIGMA, n_points=50):
+    """Points on a peak's `n_sigma` contour, in (row, col) pixel space.
+
+    Takes the peak's fitted 2x2 covariance and returns the ellipse its
+    eigenvectors describe, so a peak is drawn at the size and orientation it
+    was actually fitted with rather than at a fixed marker size.  An isotropic
+    peak (`var_u == var_v`, no correlation) comes back as a circle of radius
+    `n_sigma * sigma`, which is the case for the sparse-RBF finder's output.
+    """
+    theta = np.linspace(0, 2 * np.pi, n_points)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+
+    diff = var_u - var_v
+    sq = np.sqrt(diff**2 + 4.0 * cov_uv**2)
+
+    sigma_1 = np.sqrt(max((var_u + var_v + sq) / 2.0, 1e-6))
+    sigma_2 = np.sqrt(max((var_u + var_v - sq) / 2.0, 1e-6))
+    phi = 0.5 * np.arctan2(2.0 * cov_uv, diff)
+    a, b = n_sigma * sigma_1, n_sigma * sigma_2
+
+    cols = col + a * cos_t * np.cos(phi) - b * sin_t * np.sin(phi)
+    rows = row + a * cos_t * np.sin(phi) + b * sin_t * np.cos(phi)
+    return rows, cols
+
+
+def _draw_outlines(
+    ax, det, s_lab, peaks_iter, n_sigma, color, label, wrapped, compress
+):
+    """Draw isotropic peak outlines, unrolling each onto the plot's axes.
+
+    Takes (row, col, sigma) per peak and projects the contour the same way the
+    anisotropic path does, so both kinds of circle land in the same place by
+    the same route.
+    """
+    for row, col, sigma in peaks_iter:
+        if not np.isfinite(sigma) or sigma <= 0:
+            continue
+
+        variance = float(sigma) ** 2
+        rows, cols = peak_outline(row, col, variance, variance, 0.0, n_sigma=n_sigma)
+
+        xyz = det.pixel_to_lab(rows, cols) - s_lab
+        roty = np.rad2deg(np.arctan2(xyz[..., 0], xyz[..., 2]))
+        if wrapped or np.ptp(roty) > 180:
+            roty = np.where(roty < 0, roty + 360, roty)
+
+        ax.plot(
+            compress(roty),
+            xyz[..., 1],
+            color=color,
+            lw=0.25,
+            alpha=0.8,
+            label=label,
+        )
+        label = ""
+
+
 def plot_unrolled_detector(
     peaks,
     images,
@@ -10,6 +73,12 @@ def plot_unrolled_detector(
     finder_peaks=None,
     out_name="unrolled_detector_peaks.png",
     instrument=None,
+    dpi=600,
+    n_sigma=DEFAULT_N_SIGMA,
+    overlay=None,
+    overlay_color="cyan",
+    overlay_alpha=0.45,
+    overlay_label="Static mask",
 ):
     fig, ax = plt.subplots(figsize=(16, 6))
 
@@ -139,6 +208,18 @@ def plot_unrolled_detector(
         if mesh_handle is None:
             mesh_handle = mesh
 
+        # An optional binary overlay (e.g. the static mask) drawn as its own
+        # translucent colour layer, so it reads as an annotation on top of
+        # the data rather than as bright counts: burning masked pixels into
+        # the intensity scale made them indistinguishable from saturated
+        # Bragg peaks and shifted the shared LogNorm for everything else.
+        if overlay is not None and img_key in overlay:
+            ov = np.asarray(overlay[img_key], dtype=float)
+            ov_cmap = colors.ListedColormap(
+                [(0, 0, 0, 0), colors.to_rgba(overlay_color, overlay_alpha)]
+            )
+            ax.pcolormesh(roty, Y, ov, shading="auto", cmap=ov_cmap, vmin=0.0, vmax=1.0)
+
     # 2. Plot Finder Peaks
     if finder_peaks is not None:
         added_finder_label = False
@@ -153,6 +234,25 @@ def plot_unrolled_detector(
 
             coords = np.atleast_2d(coords)
             f_rows, f_cols = coords[:, 1], coords[:, 2]
+
+            # [intensity, row, col, sigma]: when the finder fitted a width to
+            # each candidate, draw each one at its own radius.  A fixed marker
+            # size says every peak is the same size, which is the one thing
+            # these plots are looked at to check.
+            if coords.shape[1] > 3:
+                _draw_outlines(
+                    ax,
+                    det,
+                    s_lab,
+                    zip(f_rows, f_cols, coords[:, 3], strict=False),
+                    n_sigma=n_sigma,
+                    color="blue",
+                    label="Finder Candidates" if not added_finder_label else "",
+                    wrapped=img_key in wrapped_panels,
+                    compress=compress_roty,
+                )
+                added_finder_label = True
+                continue
 
             f_xyz = det.pixel_to_lab(f_rows, f_cols)
             f_xyz = f_xyz - s_lab
@@ -191,8 +291,6 @@ def plot_unrolled_detector(
         base_label = "Isotropic Radius" if is_isotropic else "Projected 3D Tensor"
 
         added_ellipse_label = False
-        theta = np.linspace(0, 2 * np.pi, 50)
-        cos_t, sin_t = np.cos(theta), np.sin(theta)
 
         for i in range(len(peaks.image_index)):
             img_key = peaks.image_index[i]
@@ -207,17 +305,9 @@ def plot_unrolled_detector(
             if var_u is None or var_v is None:
                 continue
 
-            diff = var_u - var_v
-            sum_uv = var_u + var_v
-            sq = np.sqrt(diff**2 + 4.0 * cov_uv**2)
-
-            sigma_1 = np.sqrt(max((sum_uv + sq) / 2.0, 1e-6))
-            sigma_2 = np.sqrt(max((sum_uv - sq) / 2.0, 1e-6))
-            phi = 0.5 * np.arctan2(2.0 * cov_uv, diff)
-            a, b = 2.0 * sigma_1, 2.0 * sigma_2
-
-            u_ell = c_center + a * cos_t * np.cos(phi) - b * sin_t * np.sin(phi)
-            v_ell = r_center + a * cos_t * np.sin(phi) + b * sin_t * np.cos(phi)
+            v_ell, u_ell = peak_outline(
+                r_center, c_center, var_u, var_v, cov_uv, n_sigma=n_sigma
+            )
 
             ell_xyz = det.pixel_to_lab(v_ell, u_ell)
             ell_xyz = ell_xyz - s_lab
@@ -428,6 +518,15 @@ def plot_unrolled_detector(
         cbar.set_label("Intensity (counts)")
 
     handles, labels = ax.get_legend_handles_labels()
+    if overlay is not None:
+        from matplotlib.patches import Patch
+
+        handles.append(
+            Patch(
+                color=colors.to_rgba(overlay_color, overlay_alpha), label=overlay_label
+            )
+        )
+        labels.append(overlay_label)
     if handles:
         by_label = dict(zip(labels, handles))
         ax.legend(
@@ -438,5 +537,5 @@ def plot_unrolled_detector(
             markerscale=0.5,
         )
 
-    plt.savefig(out_name, dpi=600, bbox_inches="tight", pad_inches=0.05)
+    plt.savefig(out_name, dpi=dpi, bbox_inches="tight", pad_inches=0.05)
     plt.close(fig)

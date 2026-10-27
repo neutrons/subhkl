@@ -24,12 +24,11 @@ def test_integration_bank_alignment_crash(tmp_path):
     peaks = Peaks(str(h5_file), instrument="IMAGINE")
 
     harvest_kwargs = {
-        "algorithm": "peak_local_max",
-        "max_peaks": 10,
-        "min_pix": 1,
-        "min_rel_intensity": 0.1,
+        "algorithm": "sparse_rbf",
+        "min_sigma": 1.0,
+        "max_sigma": 3.0,
     }
-    integration_params = {"peak_minimum_pixels": 1}
+    integration_params = {}
 
     try:
         # Parallel integration will fail when trying to get det_config for bank 999

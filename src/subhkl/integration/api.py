@@ -13,7 +13,7 @@ from subhkl.instrument.detector import Detector
 from subhkl.instrument.goniometer import Goniometer
 from subhkl.integration import worker, orchestrator
 from subhkl.integration.image_data import ImageData
-from subhkl.integration.orchestrator import DetectorPeaks, IntegrationResult, Wavelength
+from subhkl.integration.orchestrator import DetectorPeaks, Wavelength
 from subhkl.integration.worker import _RunPeaksFinder, _safe_plot_wrapper
 
 
@@ -197,6 +197,9 @@ class Peaks:
         gonio_axes=None,
         gonio_angles=None,
         gonio_offsets=None,
+        per_run_trans=None,
+        frame_to_run=None,
+        harmonic_rot=None,
     ) -> dict:
         peak_dict = {}
         tasks = orchestrator.prepare_predict_tasks(
@@ -219,6 +222,9 @@ class Peaks:
             gonio_axes=gonio_axes,
             gonio_angles=gonio_angles,
             gonio_offsets=gonio_offsets,
+            per_run_trans=per_run_trans,
+            frame_to_run=frame_to_run,
+            harmonic_rot=harmonic_rot,
         )
 
         ctx = multiprocessing.get_context("spawn")
@@ -247,62 +253,6 @@ class Peaks:
 
         return peak_dict
 
-    def integrate(
-        self,
-        peak_dict,
-        integration_params,
-        RUB,
-        R_stack=None,
-        angles_stack=None,
-        sample_offset=None,
-        ki_vec=None,
-        integration_method="free_fit",
-        create_visualizations=False,
-        show_progress=False,
-        file_prefix=None,
-        found_peaks_file=None,
-        max_workers=None,
-    ):
-        tasks = orchestrator.prepare_integrate_tasks(
-            self.image,
-            self.filename,
-            self.instrument,
-            peak_dict,
-            integration_params,
-            RUB,
-            R_stack,
-            angles_stack,
-            sample_offset,
-            ki_vec,
-            integration_method,
-            show_progress,
-            found_peaks_file,
-        )
-        print(f"Integrating {len(tasks)} banks in parallel...")
-
-        ctx = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
-            future_to_bank = {
-                executor.submit(worker.integrate_single_bank, *t): t[0] for t in tasks
-            }
-
-            results_by_bank = {}
-            for future in tqdm(
-                as_completed(future_to_bank),
-                total=len(future_to_bank),
-                desc="Integrating",
-                disable=not show_progress,
-            ):
-                bank_id = future_to_bank[future]
-                try:
-                    res = future.result()
-                    if res:
-                        results_by_bank[bank_id] = res
-                except Exception as e:
-                    print(f"Integration worker failed for bank {bank_id}: {e}")
-
-        return self._assemble_integration_result(peak_dict, results_by_bank)
-
     def write_hdf5(self, output_filename, detector_peaks, instrument_wavelength):
         """
         Directly writes finder peaks to HDF5.
@@ -329,10 +279,30 @@ class Peaks:
                     "goniometer/names", data=detector_peaks.gonio_names, dtype=dt
                 )
 
-            # Peak Data
-            f["peaks/intensity"] = detector_peaks.intensity
+            # Peak Data.  No peaks/intensity: the finder measures no
+            # amplitude (positions, shape and validation metrics only);
+            # intensities come from the integrator's output file.
             f["peaks/sigma"] = detector_peaks.sigma
             f["peaks/radius"] = detector_peaks.radii
+
+            # Per-peak quality metrics, written only when the finder supplies
+            # them.  `deviance` is the leave-one-out likelihood-ratio statistic
+            # for that peak's presence (is it real?), calibrated against chi^2
+            # with four degrees of freedom; `residual_deviance` is the local
+            # goodness of fit per degree of freedom over the peak's own
+            # footprint (is it fitted correctly?), calibrated near 1.  A
+            # mis-sized peak scores high on the first and badly on the second.
+            n_peaks = len(detector_peaks.sigma)
+            if (
+                detector_peaks.deviance is not None
+                and len(detector_peaks.deviance) == n_peaks
+            ):
+                f["peaks/deviance"] = detector_peaks.deviance
+            if (
+                detector_peaks.residual_deviance is not None
+                and len(detector_peaks.residual_deviance) == n_peaks
+            ):
+                f["peaks/residual_deviance"] = detector_peaks.residual_deviance
 
             # Use pixel coordinates exclusively
             f["peaks/pixel_r"] = detector_peaks.peak_rows
@@ -359,8 +329,9 @@ class Peaks:
         az_phi: list[float] = []
         lamda_min: list[float] = []
         lamda_max: list[float] = []
-        intensity: list[float] = []
         sigma: list[float] = []
+        deviance: list[float] = []
+        residual_deviance: list[float] = []
         radii: list[float] = []
         xyz_out: list[list[float]] = []
         banks: list[int] = []
@@ -369,6 +340,7 @@ class Peaks:
         gonio_angles_out: list[list[float]] = []
         peak_rows: list[int] = []
         peak_cols: list[int] = []
+        width: list[float] | None = []
 
         for img_key in sorted(self.image.ims.keys()):
             res = results_by_key.get(img_key)
@@ -378,8 +350,19 @@ class Peaks:
                 R.extend(res["R"])
                 lamda_min.extend(res["lamda_min"])
                 lamda_max.extend(res["lamda_max"])
-                intensity.extend(res["intensity"])
                 sigma.extend(res["sigma"])
+                deviance.extend(res.get("deviance", [0.0] * res["count"]))
+                residual_deviance.extend(
+                    res.get("residual_deviance", [0.0] * res["count"])
+                )
+                # Absent for the finders that fit no width; a bank that
+                # reports none leaves the whole column unusable, since a peak
+                # with no size cannot be told apart from one of size zero.
+                bank_widths = res.get("width")
+                if bank_widths is None:
+                    width = None
+                elif width is not None:
+                    width.extend(bank_widths)
                 radii.extend(res["radii"])
                 xyz_out.extend(res["xyz"])
                 banks.extend(res["banks"])
@@ -397,7 +380,6 @@ class Peaks:
             az_phi,
             lamda_min,
             lamda_max,
-            intensity,
             sigma,
             radii,
             xyz_out,
@@ -409,6 +391,9 @@ class Peaks:
             self.goniometer.names_raw,
             peak_rows,
             peak_cols,
+            deviance,
+            residual_deviance,
+            width if width else None,
         )
 
         if visualize:
@@ -440,6 +425,13 @@ class Peaks:
             for r_id, data in runs_plot_data.items():
                 mask = [i for i, run in enumerate(peaks.run_id) if run == r_id]
 
+                # Draw each peak at the width the finder fitted it, when it
+                # fitted one: an isotropic covariance is the same statement as
+                # a radius, and it is the form the plotter already draws.
+                # Without it every peak is drawn the same size, which hides
+                # exactly what these plots are looked at to see.
+                variances = [peaks.width[i] ** 2 for i in mask] if peaks.width else None
+
                 run_peaks = _RunPeaksFinder(
                     xyz=[peaks.xyz[i] for i in mask] if peaks.xyz else [],
                     image_index=[peaks.image_index[i] for i in mask]
@@ -451,6 +443,9 @@ class Peaks:
                     peak_cols=[peaks.peak_cols[i] for i in mask]
                     if peaks.peak_cols
                     else [],
+                    var_u=variances,
+                    var_v=variances,
+                    cov_uv=[0.0] * len(mask) if variances else None,
                 )
 
                 out_name = os.path.join(base_dir, f"{data['label']}-found.png")
@@ -494,47 +489,3 @@ class Peaks:
                         traceback.print_exc()
 
         return peaks
-
-    def _assemble_integration_result(self, peak_dict, results_by_bank):
-        h, k, l = [], [], []  # noqa: E741
-        intensity, sigma = [], []
-        tt, az = [], []
-        wavelength = []
-        banks = []
-        run_ids = []
-        xyz = []
-        R_out = []
-        angles_out = []
-
-        for bank_id in sorted(peak_dict.keys()):
-            res = results_by_bank.get(bank_id)
-            if res:
-                h.extend(res["h"])
-                k.extend(res["k"])
-                l.extend(res["l"])
-                intensity.extend(res["intensity"])
-                sigma.extend(res["sigma"])
-                tt.extend(res["tt"])
-                az.extend(res["az"])
-                wavelength.extend(res["wavelength"])
-                xyz.extend(res["xyz"])
-                banks.extend(res["bank"])
-                run_ids.extend(res["run_id"])
-                R_out.extend(res["R"])
-                angles_out.extend(res["angles"])
-
-        return IntegrationResult(
-            h,
-            k,
-            l,
-            intensity,
-            sigma,
-            tt,
-            az,
-            wavelength,
-            banks,
-            run_ids,
-            xyz,
-            R_out,
-            angles_out,
-        )

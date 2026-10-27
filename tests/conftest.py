@@ -18,12 +18,11 @@ DATA_DIR = Path(__file__).parent / "data" / "MANDI" / "mesolite"
 ZENODO_FILES = [f"MANDI_{i}.nxs.h5" for i in range(11613, 11685)]
 
 
-@pytest.fixture(scope="session", autouse=True)
-def download_mesolite_data():
+def download_mesolite_data() -> Path:
     """Download mesolite test data from Zenodo if not already present.
 
     Set MESOLITE_MAX_FILES environment variable to limit number of files downloaded (for testing).
-    Example: MESOLITE_MAX_FILES=5 uv run pytest tests/
+    Example: MESOLITE_MAX_FILES=5 uv run pytest -m mesolite
     """
     max_files = os.environ.get("MESOLITE_MAX_FILES")
     max_files = int(max_files) if max_files is not None else len(ZENODO_FILES)
@@ -39,7 +38,7 @@ def download_mesolite_data():
         print(
             f"All {len(files_to_download)} requested mesolite test files already exist at {DATA_DIR}"
         )
-        return
+        return DATA_DIR
 
     print(
         f"Downloading {len(needed_files)} missing mesolite files from Zenodo (record {ZENODO_RECORD_ID})..."
@@ -59,6 +58,19 @@ def download_mesolite_data():
 
     downloaded_count = len(list(DATA_DIR.glob("*.h5")))
     print(f"✓ Downloaded {downloaded_count} files to {DATA_DIR}")
+    return DATA_DIR
+
+
+@pytest.fixture(scope="session", name="mesolite_data")
+def fixture__mesolite_data() -> Path:
+    """Directory holding the mesolite dataset, downloading it on first use.
+
+    Downloading the dataset takes hours, so it happens only for the tests that
+    ask for this fixture. Those tests carry the ``mesolite`` marker, which is
+    deselected by default (see ``addopts`` in pyproject.toml); run them with
+    ``pytest -m mesolite``.
+    """
+    return download_mesolite_data()
 
 
 @pytest.fixture(name="test_data_dir")

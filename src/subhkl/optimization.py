@@ -14,6 +14,7 @@ import h5py
 import scipy.linalg
 
 from subhkl.instrument.detector import scattering_vector_from_angles
+from subhkl.utils import devices as device_util
 from subhkl.core.spacegroup import get_space_group_object
 
 try:
@@ -31,6 +32,69 @@ def _forward_map_lattice(norm, nominal, frac_bound):
     min_val = nominal - delta
     max_val = nominal + delta
     return min_val + norm * (max_val - min_val)
+
+
+HARMONIC_AXES_MODES = ("rocking", "transverse", "full")
+
+
+def harmonic_axes_from_scan(scan_dir, ki_vec, mode="rocking"):
+    """Lab-frame rotation axes for the Fourier-in-phi rocking model.
+
+    The measured steering on cg4d-t4-lysozyme puts 96% of its power on
+    the single axis perpendicular to both the scan axis and the beam
+    (the rocking-curve axis), so that axis alone is the default.
+    "transverse" adds the second axis perpendicular to the scan axis;
+    "full" adds the scan axis itself, whose harmonics represent a
+    periodic drive error (its constant term stays excluded everywhere:
+    that is the motor zero the global offsets already refine).
+    """
+    if mode not in HARMONIC_AXES_MODES:
+        raise ValueError(
+            f"Unknown harmonic axes mode {mode!r}; pick from {HARMONIC_AXES_MODES}."
+        )
+    n = np.asarray(scan_dir, dtype=float)
+    n = n / np.linalg.norm(n)
+    b = np.asarray(ki_vec, dtype=float)
+    b = b / np.linalg.norm(b)
+    e1 = np.cross(n, b)
+    if np.linalg.norm(e1) < 1e-6:
+        # Scan axis along the beam: any perpendicular direction serves.
+        ref = np.array([1.0, 0.0, 0.0])
+        if abs(n @ ref) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0])
+        e1 = np.cross(n, ref)
+    e1 = e1 / np.linalg.norm(e1)
+    if mode == "rocking":
+        return np.array([e1])
+    e2 = np.cross(n, e1)
+    e2 = e2 / np.linalg.norm(e2)
+    if mode == "transverse":
+        return np.array([e1, e2])
+    return np.array([e1, e2, n])
+
+
+def harmonic_rocking_vectors(angles_deg, axes, orders, coeffs_deg):
+    """Per-frame Rodrigues vectors (radians) of the Fourier rocking.
+
+    delta_k(phi) = sum_m a_km cos(m phi) + b_km sin(m phi) about lab
+    axis e_k, with coeffs_deg shaped (n_axes, n_orders, 2) as (a, b).
+    """
+    ang = np.asarray(angles_deg, dtype=float)
+    orders_np = np.asarray(list(orders), dtype=float)
+    phase = np.deg2rad(orders_np[None, :] * ang[:, None])  # (F, n)
+    c = np.asarray(coeffs_deg, dtype=float)  # (K, n, 2)
+    delta = np.einsum("kn,fn->kf", c[..., 0], np.cos(phase)) + np.einsum(
+        "kn,fn->kf", c[..., 1], np.sin(phase)
+    )
+    return np.deg2rad(np.einsum("kf,kd->fd", delta, np.asarray(axes, dtype=float)))
+
+
+def harmonic_rocking_matrices(angles_deg, axes, orders, coeffs_deg):
+    """Per-frame 3x3 rocking rotations, applied to lab-frame q vectors."""
+    from scipy.spatial.transform import Rotation
+
+    w = harmonic_rocking_vectors(angles_deg, axes, orders, coeffs_deg)
+    return Rotation.from_rotvec(w).as_matrix()
 
 
 def _get_active_lattice_indices(lattice_system):
@@ -206,7 +270,19 @@ class VectorizedObjective:
         refine_goniometer=False,
         goniometer_bound_deg=5.0,
         goniometer_refine_mask=None,
+        goniometer_trans_refine_mask=None,
         goniometer_nominal_offsets=None,
+        goniometer_axis_vector_mask=None,
+        goniometer_axis_vector_bound_deg=1.0,
+        per_run_motor_index=None,
+        per_run_frame_map=None,
+        per_run_bound_deg=0.5,
+        per_run_trans=False,
+        per_run_trans_bound_m=0.002,
+        harmonic_frame_angles_deg=None,
+        harmonic_axes=None,
+        harmonic_orders=None,
+        harmonic_bound_deg=0.5,
         refine_sample=False,
         goniometer_trans_bound_meters=0.005,
         sample_nominal=None,
@@ -227,11 +303,39 @@ class VectorizedObjective:
         no_index=False,
         hkl_fixed=None,
         lambda_fixed=None,
+        radial_weight=1.0,
+        radial_weight_poly=None,
+        hkl_metric="isotropic",
+        hkl_metric_floor=0.1,
     ):
         self.no_index = no_index
         if self.no_index:
             self.hkl_fixed = jnp.array(hkl_fixed)  # Shape: (3, N)
             self.lambda_fixed = jnp.array(lambda_fixed)  # Shape: (N,)
+        # w in [0, 1]: dimensionless weight multiplying the radial
+        # residual component, w = tangential scale / radial scale.
+        # w = 1 keeps the isotropic chord, w = 0 discards the radial
+        # direction entirely (the measured streak ratio 3.7 on
+        # cg4d-t4-lysozyme corresponds to w = 0.27).  A polynomial in
+        # the elastic wavelength (Angstrom, highest-degree coefficient
+        # first) overrides the scalar.
+        self.radial_weight = float(radial_weight)
+        self.radial_weight_poly = (
+            jnp.array(radial_weight_poly) if radial_weight_poly is not None else None
+        )
+        self.radial_weight_active = bool(
+            radial_weight_poly is not None or self.radial_weight < 1.0
+        )
+        # Soft-indexer basin metric.  "isotropic" is the plain fractional-hkl
+        # washboard; "positional" warps each basin by the per-peak Jacobian
+        # that maps fractional defects to detector displacement, weighted by
+        # radial_weight in the streak frame, with hkl_metric_floor as the
+        # dimensionless isotropic floor that keeps the Jacobian's null
+        # direction (the wavelength tube) from becoming gauge.
+        if hkl_metric not in ("isotropic", "positional"):
+            raise ValueError(f"Unknown hkl_metric: {hkl_metric!r}")
+        self.hkl_metric_positional = hkl_metric == "positional"
+        self.hkl_metric_floor = float(hkl_metric_floor)
 
         self.B = jnp.array(B)
         self.kf_ki_dir_init = jnp.array(kf_ki_dir)
@@ -303,7 +407,17 @@ class VectorizedObjective:
             )
             self.num_active_gonio = np.sum(self.gonio_mask)
 
-            self.gonio_trans_mask = self.gonio_mask[self.motor_map]
+            # The translation mask follows the angle mask unless a
+            # separate per-motor selection is given: the phi-stage lever
+            # arm (a sample-on-pin eccentricity rotates WITH phi) is only
+            # refinable through this mask, and slaving it to the angle
+            # list would also free the pure-gauge phi zero point.
+            trans_motor_mask = (
+                np.array(goniometer_trans_refine_mask, dtype=bool)
+                if goniometer_trans_refine_mask is not None
+                else np.asarray(self.gonio_mask, dtype=bool)
+            )
+            self.gonio_trans_mask = trans_motor_mask[self.motor_map]
             self.num_active_trans = np.sum(self.gonio_trans_mask)
 
             raw_trans_bounds = jnp.array(goniometer_trans_bound_meters)
@@ -320,12 +434,149 @@ class VectorizedObjective:
                 if goniometer_nominal_offsets is not None
                 else jnp.zeros(self.num_motors)
             )
+
+            # --- Goniometer axis-vector refinement (mount tilt) ---
+            # The direction of each rotation axis, not just the zero point
+            # about it: a goniometer mounted at a small angle to the
+            # detector frame tilts every axis, an error the angular offsets
+            # and translations can only chase degenerately.  Each selected
+            # motor gets two tilt parameters about an orthonormal basis
+            # perpendicular to its nominal direction; every physical axis
+            # of that motor tilts identically (one mount, one error).
+            self.axis_vec_mask = (
+                np.array(goniometer_axis_vector_mask, dtype=bool)
+                if goniometer_axis_vector_mask is not None
+                else np.zeros(int(self.num_motors), dtype=bool)
+            )
+            self.num_active_axis_vec = int(np.sum(self.axis_vec_mask))
+            raw_av = np.atleast_1d(
+                np.asarray(goniometer_axis_vector_bound_deg, dtype=float)
+            )
+            av_bounds = (
+                raw_av
+                if raw_av.size == int(self.num_motors)
+                else np.full(int(self.num_motors), raw_av.ravel()[0])
+            )
+            self.axis_vec_bound_rad = jnp.deg2rad(
+                jnp.array(av_bounds[self.axis_vec_mask])
+            )
+            self.axis_vec_active_motors = np.nonzero(self.axis_vec_mask)[0]
+            # Static (python-level) per-axis decision: the objective is
+            # jitted with self in the pytree, so jnp attributes are traced
+            # and cannot steer python control flow.
+            motor_map_np = np.asarray(
+                motor_map if motor_map is not None else np.arange(self.num_gonio_axes)
+            ).astype(int)
+            self._num_motors_static = (
+                int(motor_map_np.max()) + 1 if motor_map_np.size else 0
+            )
+            self.axis_vec_refined_per_axis = [
+                bool(self.axis_vec_mask[m]) for m in motor_map_np
+            ]
+            self._motor_map_list = motor_map_np.tolist()
+            dirs = np.asarray(self.gonio_axes[:, 0:3], dtype=float)
+            dirs = dirs / np.linalg.norm(dirs, axis=1, keepdims=True)
+            ref = np.where(
+                np.abs(dirs[:, 2:3]) < 0.9,
+                np.array([[0.0, 0.0, 1.0]]),
+                np.array([[1.0, 0.0, 0.0]]),
+            )
+            e1 = np.cross(dirs, ref)
+            e1 = e1 / np.linalg.norm(e1, axis=1, keepdims=True)
+            e2 = np.cross(dirs, e1)
+            self.axis_dirs_nominal = jnp.array(dirs)
+            self.axis_e1 = jnp.array(e1)
+            self.axis_e2 = jnp.array(e2)
+
+            # Per-run angle corrections: one bounded delta per scan run for
+            # a single motor, applied to every frame of that run.  Static
+            # per-setting positioning errors (encoder repeatability, mount
+            # settling; measured 0.13 deg rms across the six t4 phi
+            # settings, random signs) cannot be represented by any static
+            # geometry parameter -- offsets, axis vectors and detector
+            # modes all slid along a flat valley trying to average them.
+            self.per_run_motor_idx = (
+                int(per_run_motor_index) if per_run_motor_index is not None else None
+            )
+            self.per_run_trans = bool(per_run_trans)
+            if self.per_run_motor_idx is not None or self.per_run_trans:
+                if per_run_frame_map is None:
+                    raise ValueError(
+                        "Per-run refinement needs per_run_frame_map "
+                        "(frame index -> run ordinal)."
+                    )
+                frame_map_np = np.asarray(per_run_frame_map, dtype=int)
+                self.per_run_frame_map = jnp.array(frame_map_np, dtype=jnp.int32)
+                self.num_runs_static = int(frame_map_np.max()) + 1
+            else:
+                self.per_run_frame_map = None
+                self.num_runs_static = 0
+            self.num_per_run_params = (
+                self.num_runs_static if self.per_run_motor_idx is not None else 0
+            )
+            self.per_run_bound_deg = float(per_run_bound_deg)
+            # Per-run translational offsets: the angular wobble's twin.
+            # One 3-vector per scan run at the INNERMOST axis, so it rides
+            # with the sample (mount settling, sphere-of-confusion).
+            self.num_per_run_trans_params = (
+                3 * self.num_runs_static if self.per_run_trans else 0
+            )
+            self.per_run_trans_bound_m = float(per_run_trans_bound_m)
+            # Fourier-in-phi rocking: the crystal's effective orientation
+            # oscillates about fixed lab axes as the scan motor turns
+            # (crystal-fixed anisotropic mosaicity sampled by the
+            # rotation).  Bounded Fourier coefficients per axis over the
+            # requested harmonic band; m = 0 is excluded by construction
+            # (degenerate with the global goniometer offsets).
+            self.num_harmonic_params = 0
+            if harmonic_axes is not None and harmonic_orders is not None:
+                if harmonic_frame_angles_deg is None:
+                    raise ValueError(
+                        "Harmonic rocking needs harmonic_frame_angles_deg "
+                        "(scan-motor angle per frame)."
+                    )
+                ang = np.asarray(harmonic_frame_angles_deg, dtype=float)
+                n_frames = np.asarray(goniometer_angles).shape[1]
+                if ang.shape != (n_frames,):
+                    raise ValueError(
+                        f"harmonic_frame_angles_deg shape {ang.shape} does "
+                        f"not match the {n_frames} goniometer frames."
+                    )
+                orders_np = np.asarray(list(harmonic_orders), dtype=float)
+                if orders_np.size == 0 or np.any(orders_np < 1):
+                    raise ValueError(
+                        "Harmonic orders must be positive integers; the "
+                        "m = 0 term is the motor zero the global offsets "
+                        "already refine."
+                    )
+                phase = np.deg2rad(orders_np[:, None] * ang[None, :])
+                self.harmonic_cos = jnp.array(np.cos(phase))
+                self.harmonic_sin = jnp.array(np.sin(phase))
+                axes_np = np.asarray(harmonic_axes, dtype=float)
+                self.harmonic_axes_mat = jnp.array(
+                    axes_np / np.linalg.norm(axes_np, axis=1, keepdims=True)
+                )
+                self.num_harmonic_axes = axes_np.shape[0]
+                self.num_harmonic_orders = orders_np.shape[0]
+                self.num_harmonic_params = (
+                    2 * self.num_harmonic_axes * self.num_harmonic_orders
+                )
+            self.harmonic_bound_deg = float(harmonic_bound_deg)
         else:
             self.gonio_axes = None
             self.num_gonio_axes = 0
             self.num_active_trans = 1
             self.gonio_trans_mask = np.ones(1, dtype=bool)
             self.num_motors = 0
+            self.axis_vec_mask = np.zeros(0, dtype=bool)
+            self.num_active_axis_vec = 0
+            self.per_run_motor_idx = None
+            self.per_run_frame_map = None
+            self.num_per_run_params = 0
+            self.per_run_trans = False
+            self.num_per_run_trans_params = 0
+            self.num_runs_static = 0
+            self.num_harmonic_params = 0
 
         self.refine_gonio_trans = refine_sample
         num_trans = max(1, self.num_gonio_axes)
@@ -423,6 +674,24 @@ class VectorizedObjective:
                 peak_pixel_coords["bank_indices"], dtype=jnp.int32
             )
 
+            # Peaks on banks outside the refined subset keep their static
+            # lab positions; without this they would all collapse onto
+            # refined bank 0 (bank_indices defaults to zero for them).
+            refined_mask = np.asarray(
+                peak_pixel_coords.get(
+                    "refined_mask",
+                    np.ones(len(peak_pixel_coords["bank_indices"]), dtype=bool),
+                ),
+                dtype=bool,
+            )
+            self.peak_det_refined = jnp.array(refined_mask)
+            self.all_peaks_on_refined_banks = bool(np.all(refined_mask))
+            if not self.all_peaks_on_refined_banks and self.peak_xyz is None:
+                raise ValueError(
+                    "Refining a subset of detector banks requires peaks/xyz "
+                    "for the peaks on the unrefined banks."
+                )
+
             self.num_banks = self.det_centers.shape[0]
 
             self.det_modes = detector_params.get("modes", ["independent"])
@@ -504,6 +773,7 @@ class VectorizedObjective:
             )
         else:  # Default to P
             self.M_prim = jnp.eye(3)
+        self.M_prim_inv = jnp.linalg.inv(self.M_prim)
 
     def orientation_U_jax(self, param):
         U = jax.vmap(rotation_matrix_from_rodrigues_jax)(param)
@@ -607,6 +877,12 @@ class VectorizedObjective:
 
         offsets_total = None
         R_cum = None
+        axis_dirs = None
+        axis_tilts = None
+        per_run_delta = None
+        per_run_trans_delta = None
+        harmonic_coeffs = None
+        per_frame_trans = None
         sample_origin_lab = jnp.zeros((x.shape[0], 1, 3))
 
         if self.gonio_axes is not None:
@@ -628,6 +904,65 @@ class VectorizedObjective:
                 )
 
             S, M = offsets_total.shape[0], self.gonio_angles.shape[1]
+
+            # Axis-vector tilts: two bounded angles per selected motor,
+            # applied as a gnomonic perturbation of the nominal direction
+            # (d = n + tan(a) e1 + tan(b) e2, renormalised) -- exact over
+            # the bounded cap and trivially invertible for reporting.
+            axis_dirs = None
+            if self.num_active_axis_vec > 0:
+                av_norm = x[:, idx : idx + 2 * self.num_active_axis_vec].reshape(
+                    -1, self.num_active_axis_vec, 2
+                )
+                idx += 2 * self.num_active_axis_vec
+                tilts_active = _forward_map_param(
+                    av_norm, self.axis_vec_bound_rad[None, :, None]
+                )
+                axis_tilts = jnp.zeros((x.shape[0], self._num_motors_static, 2))
+                axis_tilts = axis_tilts.at[
+                    :, jnp.array(self.axis_vec_active_motors), :
+                ].set(tilts_active)
+                tilt_per_axis = axis_tilts[
+                    :, jnp.array([m for m in self._motor_map_list]), :
+                ]
+                d = (
+                    self.axis_dirs_nominal[None, :, :]
+                    + jnp.tan(tilt_per_axis[..., 0:1]) * self.axis_e1[None, :, :]
+                    + jnp.tan(tilt_per_axis[..., 1:2]) * self.axis_e2[None, :, :]
+                )
+                axis_dirs = d / jnp.linalg.norm(d, axis=-1, keepdims=True)
+
+            per_run_delta = None
+            per_frame_corr = None
+            if self.num_per_run_params > 0:
+                pr_norm = x[:, idx : idx + self.num_per_run_params]
+                idx += self.num_per_run_params
+                per_run_delta = _forward_map_param(pr_norm, self.per_run_bound_deg)
+                per_frame_corr = per_run_delta[:, self.per_run_frame_map]  # (S, M)
+
+            per_run_trans_delta = None
+            per_frame_trans = None
+            if self.num_per_run_trans_params > 0:
+                prt_norm = x[:, idx : idx + self.num_per_run_trans_params].reshape(
+                    -1, self.num_runs_static, 3
+                )
+                idx += self.num_per_run_trans_params
+                per_run_trans_delta = _forward_map_param(
+                    prt_norm, self.per_run_trans_bound_m
+                )
+                per_frame_trans = per_run_trans_delta[
+                    :, self.per_run_frame_map, :
+                ]  # (S, M, 3)
+
+            if self.num_harmonic_params > 0:
+                hc_norm = x[:, idx : idx + self.num_harmonic_params].reshape(
+                    -1, self.num_harmonic_axes, self.num_harmonic_orders, 2
+                )
+                idx += self.num_harmonic_params
+                harmonic_coeffs = _forward_map_param(
+                    hc_norm, self.harmonic_bound_deg
+                )  # (S, K, n, 2) in degrees
+
             R_list = []
             deg2rad = jnp.pi / 180.0
 
@@ -644,18 +979,49 @@ class VectorizedObjective:
                     self.gonio_angles[i, :][None, :]
                     + offsets_total[:, motor_idx][:, None]
                 )
+                if (
+                    per_frame_corr is not None
+                    and self._motor_map_list[i] == self.per_run_motor_idx
+                ):
+                    current_axis_angle = current_axis_angle + per_frame_corr
 
                 theta = direction_mult * current_axis_angle * deg2rad
-                Ri = rotation_matrix_from_axis_angle_jax(direction, theta)
+                if axis_dirs is not None and self.axis_vec_refined_per_axis[i]:
+                    # Per-sample tilted axis: batch the rotation over S.
+                    Ri = jax.vmap(rotation_matrix_from_axis_angle_jax)(
+                        axis_dirs[:, i, :], theta
+                    )
+                else:
+                    Ri = rotation_matrix_from_axis_angle_jax(direction, theta)
                 R_list.append(Ri)
 
             R_cum = jnp.eye(3)[None, None, ...].repeat(S, axis=0).repeat(M, axis=1)
             for i in range(self.num_gonio_axes):
                 R_cum = jnp.matmul(R_cum, R_list[i])
 
+            if harmonic_coeffs is not None:
+                # The rocking multiplies from the lab side: it steers the
+                # diffraction directions (q -> R_harm q) and leaves the
+                # sample origin untouched, which is why it is folded into
+                # R_cum after the translation stack is assembled.
+                delta_deg = jnp.einsum(
+                    "skn,nm->skm", harmonic_coeffs[..., 0], self.harmonic_cos
+                ) + jnp.einsum(
+                    "skn,nm->skm", harmonic_coeffs[..., 1], self.harmonic_sin
+                )
+                w = jnp.deg2rad(
+                    jnp.einsum("skm,kd->smd", delta_deg, self.harmonic_axes_mat)
+                )
+                R_harm = jax.vmap(jax.vmap(rotation_matrix_from_rodrigues_jax))(w)
+                R_cum = jnp.matmul(R_harm, R_cum)
+
             sample_origin_lab = jnp.zeros((S, M, 3))
             for i in reversed(range(self.num_gonio_axes)):
                 t_i = t_axes[:, i, :][:, None, :]
+                if per_frame_trans is not None and i == self.num_gonio_axes - 1:
+                    # Per-run sample displacement rides on the innermost
+                    # axis: s_lab gains R_full(frame) @ t_run(frame).
+                    t_i = t_i + per_frame_trans
                 # --- NEW KINEMATICS: Translate in local frame, THEN Rotate ---
                 sample_origin_lab = jnp.einsum(
                     "smij,smj->smi", R_list[i], sample_origin_lab + t_i
@@ -792,9 +1158,89 @@ class VectorizedObjective:
             dyn_widths,
             dyn_heights,
             area_scale,
+            axis_dirs,
+            axis_tilts,
+            per_run_delta,
+            per_run_trans_delta,
+            harmonic_coeffs,
         )
 
-    def indexer_dynamic_soft_jax(self, ub_mat, kf_ki_sample, k_sq_override=None):
+    def _positional_metric_vectors(self, ub_mat, kf_ki_sample, ki_sample, k_sq):
+        """Per-peak rows of the Jacobian mapping fractional-hkl defects to
+        detector displacement, in the streak frame.
+
+        kf_pred depends on hkl only through q_hat = normalize(UB hkl), so
+        d(kf) = -2 [q_hat ki^T + (ki.q_hat) I] (I - q_hat q_hat^T) UB dhkl
+        times lambda/|q| (applied per candidate in the scan, where the
+        analytic lambda lives).  Projected on the per-peak frame
+        t = ki x kf (tangential; t.q_hat = 0 collapses that row) and
+        r = t x kf (radial, streak-elongated, weighted by radial_weight).
+        Centering is folded in: the scan's fractional defects are primitive,
+        so UB is post-multiplied by M_prim^-1.
+
+        Returns (p_t, p_r, floor): two (S, 3, N) row vectors and the
+        per-peak isotropic floor, set to 1 where the frame is degenerate
+        (near-forward peaks) so those keep the plain fractional distance.
+        """
+        k_norm = jnp.sqrt(jnp.maximum(k_sq, 1e-12))
+        q_hat = kf_ki_sample / k_norm[:, None, :]
+        kf_s = kf_ki_sample + ki_sample
+
+        t_vec = jnp.cross(ki_sample, kf_s, axis=1)
+        t_norm = jnp.linalg.norm(t_vec, axis=1, keepdims=True)
+        degenerate = t_norm[:, 0, :] < 1e-6
+        t_hat = t_vec / jnp.where(t_norm == 0.0, 1.0, t_norm)
+        r_vec = jnp.cross(t_hat, kf_s, axis=1)
+        r_hat = r_vec / jnp.maximum(
+            jnp.linalg.norm(r_vec, axis=1, keepdims=True), 1e-12
+        )
+
+        c = jnp.sum(ki_sample * q_hat, axis=1)  # (S, N)
+        rq = jnp.sum(r_hat * q_hat, axis=1)
+        ki_perp = ki_sample - c[:, None, :] * q_hat
+        r_perp = r_hat - rq[:, None, :] * q_hat
+
+        b_t = -2.0 * c[:, None, :] * t_hat
+        b_r = -2.0 * (rq[:, None, :] * ki_perp + c[:, None, :] * r_perp)
+
+        W = jnp.matmul(ub_mat, self.M_prim_inv[None, :, :])  # (S, 3, 3) tiny
+
+        def project(b):
+            # W^T b as explicit multiply-adds: an einsum here lowers to a
+            # batched 3x3 cuBLAS GEMM (S tiny matrices), which neither
+            # fuses into the elementwise graph nor rematerializes cheaply
+            # inside the candidate scan.
+            return jnp.stack(
+                [
+                    W[:, 0, i, None] * b[:, 0, :]
+                    + W[:, 1, i, None] * b[:, 1, :]
+                    + W[:, 2, i, None] * b[:, 2, :]
+                    for i in range(3)
+                ],
+                axis=1,
+            )
+
+        p_t = project(b_t)
+        p_r = project(b_r)
+
+        zero = jnp.zeros_like(p_t)
+        p_t = jnp.where(degenerate[:, None, :], zero, p_t)
+        p_r = jnp.where(degenerate[:, None, :], zero, p_r)
+        floor = jnp.where(degenerate, 1.0, self.hkl_metric_floor)
+        # The candidate scan reads these seven (S, N)-planes once per
+        # wavelength candidate, and that traffic dominates the metric's
+        # cost.  A weight needs ~1% accuracy; bfloat16 (0.4% relative)
+        # halves the traffic -- measured 1.3x per generation with 99.97%
+        # identical assignments and <0.1% loss difference.
+        return (
+            p_t.astype(jnp.bfloat16),
+            p_r.astype(jnp.bfloat16),
+            floor.astype(jnp.bfloat16),
+        )
+
+    def indexer_dynamic_soft_jax(
+        self, ub_mat, kf_ki_sample, k_sq_override=None, pos_metric=None
+    ):
         ub_inv = jnp.linalg.inv(ub_mat)
         v = jnp.matmul(ub_inv, kf_ki_sample)
 
@@ -805,11 +1251,21 @@ class VectorizedObjective:
         )
 
         S, _, N = v.shape
-        initial_carry = (
-            jnp.inf * jnp.ones((S, N)),
-            jnp.zeros((S, 3, N), dtype=jnp.int32),
-            jnp.zeros((S, N)),
-        )
+        if pos_metric is not None:
+            p_t, p_r, floor = pos_metric
+            k_norm = jnp.sqrt(jnp.maximum(k_sq, 1e-12))
+            initial_carry = (
+                jnp.inf * jnp.ones((S, N)),
+                jnp.zeros((S, N)),
+                jnp.zeros((S, 3, N), dtype=jnp.int32),
+                jnp.zeros((S, N)),
+            )
+        else:
+            initial_carry = (
+                jnp.inf * jnp.ones((S, N)),
+                jnp.zeros((S, 3, N), dtype=jnp.int32),
+                jnp.zeros((S, N)),
+            )
 
         # 1. Unpack v
         v_h = v[:, 0, :]
@@ -823,7 +1279,10 @@ class VectorizedObjective:
         ub_T_kf_ki_l = ub_T_kf_ki[:, 2, :]
 
         def scan_body(carry, i):
-            curr_min, curr_best_hkl, curr_best_lamb = carry
+            if pos_metric is not None:
+                curr_min, curr_best_frac, curr_best_hkl, curr_best_lamb = carry
+            else:
+                curr_min, curr_best_hkl, curr_best_lamb = carry
 
             lamda_cand = lam_grid[i]
 
@@ -864,6 +1323,27 @@ class VectorizedObjective:
             dl = jnp.sin(jnp.pi * l_p)
             dist = jnp.sqrt(dh**2 + dk**2 + dl**2) / jnp.pi
 
+            if pos_metric is not None:
+                # Basin metric: the positional displacement this fractional
+                # defect implies, weighted in the streak frame, plus the
+                # isotropic floor for the Jacobian's null direction.  The
+                # candidate is SELECTED by this metric (anisotropic
+                # assignment); `dist` keeps the fractional units downstream.
+                c_t = (p_t[:, 0] * dh + p_t[:, 1] * dk + p_t[:, 2] * dl) / jnp.pi
+                c_r = (p_r[:, 0] * dh + p_r[:, 1] * dk + p_r[:, 2] * dl) / jnp.pi
+                scale = lambda_opt / k_norm
+                pos_sq = scale**2 * (c_t**2 + (self.radial_weight * c_r) ** 2)
+                metric = jnp.sqrt(pos_sq + (floor * dist) ** 2)
+
+                update_mask = metric < curr_min
+                new_min = jnp.where(update_mask, metric, curr_min)
+                new_frac = jnp.where(update_mask, dist, curr_best_frac)
+                new_best_hkl = jnp.where(
+                    update_mask[:, None, :], hkl_int, curr_best_hkl
+                )
+                new_best_lamb = jnp.where(update_mask, lambda_opt, curr_best_lamb)
+                return (new_min, new_frac, new_best_hkl, new_best_lamb), None
+
             # 6. Update states
             update_mask = dist < curr_min
             new_min = jnp.where(update_mask, dist, curr_min)
@@ -875,34 +1355,89 @@ class VectorizedObjective:
         final_carry, _ = lax.scan(
             scan_body, initial_carry, jnp.arange(self.num_candidates)
         )
-        dist_min, best_hkl, best_lamb = final_carry
-
-        loss = jnp.mean(dist_min, axis=1)
+        if pos_metric is not None:
+            metric_min, dist_min, best_hkl, best_lamb = final_carry
+            loss = jnp.mean(metric_min, axis=1)
+        else:
+            dist_min, best_hkl, best_lamb = final_carry
+            loss = jnp.mean(dist_min, axis=1)
         return loss, dist_min, best_hkl.transpose((0, 2, 1)), best_lamb
 
-    def geometric_loss_jax(self, ub_mat, kf_ki_sample):
+    def geometric_loss_jax(self, ub_mat, kf_ki_sample, ki_sample):
+        """Predicted-vs-observed scattering-direction residual at fixed hkl.
+
+        The wavelength is not a free parameter here: the elastic condition
+        fixes it from the assigned integer hkl and the current geometry,
+        lam = -2 (ki . G) / |G|^2 with G = UB hkl, so a geometry error must
+        surface as a direction mismatch instead of being absorbed into a
+        per-peak wavelength.  In particular kf_pred = ki + lam G is exactly
+        invariant under an isotropic lattice rescale (G -> sG, lam -> lam/s),
+        which removes the detector-distance <-> lattice-scale valley the
+        free-wavelength indexing loss slides along.
+
+        The residual is the chord |kf_pred - kf_obs| between unit vectors:
+        equal to the angular error in radians to third order, and smooth at
+        zero where arccos is not.
+
+        Laue spots are streaks along the 2-theta gradient (mosaic blocks
+        rotated within the scattering plane stay reflective at an adjusted
+        wavelength), so the observed centroid scatters radially far more
+        than tangentially (measured 3.7x on cg4d-t4-lysozyme).  The chord
+        is therefore decomposed in the per-peak frame t = ki x kf (out of
+        the scattering plane), r = t x kf (2-theta gradient), and the
+        radial component is multiplied by the dimensionless weight
+        w = radial_weight in [0, 1] (tangential-to-radial scale ratio),
+        optionally wavelength-dependent through a polynomial w(lam) --
+        streak-centroid noise then cannot steer the geometry, while the
+        narrow tangential direction keeps full weight.  w = 1 reproduces
+        the plain chord exactly; w = 0 fits tangential-only, at which
+        point purely radial parameter directions become gauge.
         """
-        Direct displacement loss in q-space bypassing integer grid search.
-        Minimizes || q_obs - q_pred ||_2 where q_pred = UB * hkl.
-        """
-        # q_obs: (S, 3, N) | Derived from exact detector pixels and fixed lambda
-        q_obs = kf_ki_sample / self.lambda_fixed[None, None, :]
+        G = jnp.matmul(ub_mat, self.hkl_fixed)  # (S, 3, N)
+        G_sq = jnp.sum(G * G, axis=1)
+        lam = -2.0 * jnp.sum(ki_sample * G, axis=1) / jnp.where(G_sq == 0.0, 1.0, G_sq)
+        kf_pred = ki_sample + lam[:, None, :] * G
+        kf_obs = kf_ki_sample + ki_sample
 
-        # q_pred: (S, 3, N) | Theoretical q-vector from dynamic UB matrix
-        q_pred = jnp.matmul(ub_mat, self.hkl_fixed)
+        delta = kf_pred - kf_obs
+        if self.radial_weight_active:
+            t_vec = jnp.cross(ki_sample, kf_obs, axis=1)
+            t_norm = jnp.linalg.norm(t_vec, axis=1, keepdims=True)
+            t_hat = t_vec / jnp.where(t_norm == 0.0, 1.0, t_norm)
+            r_vec = jnp.cross(t_hat, kf_obs, axis=1)
+            r_norm = jnp.linalg.norm(r_vec, axis=1, keepdims=True)
+            r_hat = r_vec / jnp.where(r_norm == 0.0, 1.0, r_norm)
 
-        # Vector displacement distance
-        dist = jnp.linalg.norm(q_obs - q_pred, axis=1)
+            c_t = jnp.sum(delta * t_hat, axis=1)
+            c_r = jnp.sum(delta * r_hat, axis=1)
+            c_l = jnp.sum(delta * kf_obs, axis=1)
 
-        # Mean loss across all peaks for the optimizer
-        loss = jnp.mean(dist, axis=1)
+            if self.radial_weight_poly is not None:
+                w = jnp.polyval(self.radial_weight_poly, lam)
+            else:
+                w = self.radial_weight
+            w = jnp.clip(w, 0.0, 1.0)
 
-        # Format returns to match indexer_dynamic_soft_jax signature (loss, dist, hkl, lamb)
-        S, _, _ = kf_ki_sample.shape
+            weighted = jnp.sqrt(c_t**2 + c_l**2 + (w * c_r) ** 2)
+            # Near-forward peaks (ki x kf -> 0) have no defined frame:
+            # keep the isotropic chord there.
+            degenerate = t_norm[:, 0, :] < 1e-6
+            dist = jnp.where(degenerate, jnp.linalg.norm(delta, axis=1), weighted)
+        else:
+            dist = jnp.linalg.norm(delta, axis=1)
+        # hkl = 0 rows (peaks the bootstrap left unassigned) carry no
+        # assignment information and must not enter the loss: their
+        # kf_pred = ki makes the residual |kf_obs - ki| = 2 sin(theta),
+        # which the detector and beam parameters CAN shrink -- measured on
+        # t4, 1800 such peaks dragged the fit to its bounds.  They still
+        # get lam = 0 and a reported residual, and always fail the cut.
+        assigned = jnp.any(self.hkl_fixed != 0.0, axis=0)
+        n_assigned = jnp.maximum(jnp.sum(assigned), 1.0)
+        loss = jnp.sum(dist * assigned[None, :], axis=1) / n_assigned
+
+        S = kf_ki_sample.shape[0]
         hkl_ret = jnp.tile(self.hkl_fixed.T[None, :, :], (S, 1, 1))
-        lamb_ret = jnp.tile(self.lambda_fixed[None, :], (S, 1))
-
-        return loss, dist, hkl_ret, lamb_ret
+        return loss, dist, hkl_ret, lam
 
     @partial(jax.jit, static_argnames="self")
     def get_results(self, x):
@@ -924,6 +1459,11 @@ class VectorizedObjective:
             dyn_widths,
             dyn_heights,
             area_scale,
+            _,
+            _,
+            _,
+            _,
+            _,
         ) = self._get_physical_params_jax(x_pad)
 
         R_curr = R_cum if R_cum is not None else self.static_R
@@ -957,6 +1497,12 @@ class VectorizedObjective:
                 c + u_offset[None, :, None] * u_vec + v_offset[None, :, None] * v_vec
             )
             p = dynamic_xyz.transpose(0, 2, 1)
+            if not self.all_peaks_on_refined_banks:
+                p = jnp.where(
+                    self.peak_det_refined[None, None, :],
+                    p,
+                    self.peak_xyz[None, :, :],
+                )
         else:
             p = self.peak_xyz[None, :, :] if self.peak_xyz is not None else None
 
@@ -976,29 +1522,37 @@ class VectorizedObjective:
         # q_lab is a pure momentum vector, so it strictly requires the
         # inverse goniometer rotation (R^T) to reach the sample frame
         if R_curr is not None:
-            q_lab_vec = q_lab.transpose(0, 2, 1)[..., None]
             if R_curr.ndim == 4:
-                R_per_peak_full = R_curr[:, self.peak_run_indices, :, :]
-                RT = R_per_peak_full.transpose(0, 1, 3, 2)
-                kf_ki_vec_T = jnp.matmul(RT, q_lab_vec).squeeze(-1)
+                RT = R_curr[:, self.peak_run_indices, :, :].transpose(0, 1, 3, 2)
             elif R_curr.ndim == 3:
-                R_per_peak_full = R_curr[self.peak_run_indices, :, :]
-                RT = R_per_peak_full.transpose(0, 2, 1)[None, ...]
-                kf_ki_vec_T = jnp.matmul(RT, q_lab_vec).squeeze(-1)
+                RT = R_curr[self.peak_run_indices, :, :].transpose(0, 2, 1)[None, ...]
             else:
                 RT = R_curr.T[None, None, ...]
-                kf_ki_vec_T = jnp.matmul(RT, q_lab_vec).squeeze(-1)
-            kf_ki_vec = kf_ki_vec_T.transpose(0, 2, 1)
+
+            def to_sample(vec):
+                vec_T = jnp.matmul(RT, vec.transpose(0, 2, 1)[..., None]).squeeze(-1)
+                return vec_T.transpose(0, 2, 1)
+
+            kf_ki_vec = to_sample(q_lab)
         else:
             kf_ki_vec = q_lab
 
+        if self.no_index or self.hkl_metric_positional:
+            ki_full = jnp.broadcast_to(ki, q_lab.shape)
+            ki_sample = to_sample(ki_full) if R_curr is not None else ki_full
         if self.no_index:
-            res = self.geometric_loss_jax(UB, kf_ki_vec)
+            res = self.geometric_loss_jax(UB, kf_ki_vec, ki_sample)
         else:
+            pos_metric = None
+            if self.hkl_metric_positional:
+                pos_metric = self._positional_metric_vectors(
+                    UB, kf_ki_vec, ki_sample, k_sq_dyn
+                )
             res = self.indexer_dynamic_soft_jax(
                 UB,
                 kf_ki_vec,
                 k_sq_override=k_sq_dyn,
+                pos_metric=pos_metric,
             )
 
         return jax.tree.map(
@@ -1019,6 +1573,12 @@ class FindUB:
         self.goniometer_axes = None
         self.goniometer_angles = None
         self.goniometer_offsets = None
+        self.goniometer_axes_refined = None
+        self.goniometer_axis_tilts = None
+        self.goniometer_per_run_delta = None
+        self.goniometer_per_run_motor = None
+        self.goniometer_per_run_trans = None
+        self.goniometer_harmonics = None
         self.goniometer_names = None
         self.sample_offset = None
         self.peak_xyz = None
@@ -1317,7 +1877,19 @@ class FindUB:
         goniometer_bound_deg: float | list | np.ndarray = 5.0,
         goniometer_names: list | None = None,
         refine_goniometer_axes: list | None = None,
+        refine_goniometer_axis_vector: list | None = None,
+        goniometer_axis_vector_bound_deg: float | list | np.ndarray = 1.0,
+        refine_goniometer_per_run: str | None = None,
+        goniometer_per_run_bound_deg: float = 0.5,
+        refine_goniometer_per_run_trans: bool = False,
+        goniometer_per_run_trans_bound_meters: float = 0.002,
+        per_run_frame_map: np.ndarray | None = None,
+        refine_goniometer_harmonics: str | None = None,
+        goniometer_harmonics_orders: list[int] | None = None,
+        goniometer_harmonics_axes: str = "rocking",
+        goniometer_harmonics_bound_deg: float = 0.5,
         refine_sample: bool = False,
+        refine_goniometer_trans_axes: list | None = None,
         goniometer_trans_bound_meters: float | list | np.ndarray = 0.005,
         refine_beam: bool = False,
         beam_bound_deg: float = 1.0,
@@ -1330,6 +1902,11 @@ class FindUB:
         detector_rot_bound_deg: float = 1.0,
         freeze_orientation: bool = False,
         no_index: bool | None = None,
+        radial_weight: float = 1.0,
+        radial_weight_poly: list | None = None,
+        hkl_metric: str = "isotropic",
+        hkl_metric_floor: float = 0.1,
+        multi_gpu: bool = False,
         **kwargs,
     ):
         if goniometer_axes is None and self.goniometer_axes is not None:
@@ -1457,6 +2034,114 @@ class FindUB:
             if len(gonio_bounds_list) == len(unique_motors):
                 bounds_array = np.array(gonio_bounds_list)
 
+        # Axis-vector refinement: per-motor mask and tilt bounds, matched
+        # by the same case-insensitive name rule as the angular offsets.
+        axis_vector_mask = None
+        if refine_goniometer_axis_vector:
+            av_bounds_raw = (
+                [float(goniometer_axis_vector_bound_deg)]
+                if isinstance(goniometer_axis_vector_bound_deg, (int, float))
+                else list(goniometer_axis_vector_bound_deg)
+            )
+            axis_vector_mask = np.zeros(len(unique_motors), dtype=bool)
+            bounds_array_axis_vec = np.full(
+                len(unique_motors), av_bounds_raw[0] if av_bounds_raw else 1.0
+            )
+            for i, name in enumerate(unique_motors):
+                for req_idx, req in enumerate(refine_goniometer_axis_vector):
+                    if req.lower() in name.lower():
+                        axis_vector_mask[i] = True
+                        if len(av_bounds_raw) == len(refine_goniometer_axis_vector):
+                            bounds_array_axis_vec[i] = av_bounds_raw[req_idx]
+        else:
+            bounds_array_axis_vec = np.full(len(unique_motors), 1.0)
+
+        # Per-run corrections: resolve the single target motor by the same
+        # case-insensitive name rule.
+        per_run_motor_index = None
+        if refine_goniometer_per_run:
+            for i, name in enumerate(unique_motors):
+                if refine_goniometer_per_run.lower() in name.lower():
+                    per_run_motor_index = i
+                    break
+            if per_run_motor_index is None:
+                raise ValueError(
+                    f"Motor {refine_goniometer_per_run!r} not found in "
+                    f"{unique_motors} for per-run refinement."
+                )
+            if per_run_frame_map is None:
+                raise ValueError(
+                    "Per-run refinement needs per_run_frame_map "
+                    "(frame index -> run ordinal)."
+                )
+        trans_refine_mask = None
+        if refine_goniometer_trans_axes:
+            trans_refine_mask = np.array(
+                [
+                    any(
+                        req.lower() in name.lower()
+                        for req in refine_goniometer_trans_axes
+                    )
+                    for name in unique_motors
+                ],
+                dtype=bool,
+            )
+            if not trans_refine_mask.any():
+                raise ValueError(
+                    f"None of {refine_goniometer_trans_axes} matched motors "
+                    f"{unique_motors} for translation refinement."
+                )
+
+        if refine_goniometer_per_run_trans and per_run_frame_map is None:
+            raise ValueError(
+                "Per-run translation refinement needs per_run_frame_map "
+                "(frame index -> run ordinal)."
+            )
+
+        # Fourier-in-phi rocking: resolve the scan motor, take its axis
+        # direction and the beam to build the rocking axes, and hand the
+        # scan angle per frame to the objective as the harmonic phase.
+        harmonic_axes_mat = None
+        harmonic_orders_list = None
+        harmonic_frame_angles = None
+        if refine_goniometer_harmonics:
+            if goniometer_axes is None or goniometer_angles is None:
+                raise ValueError(
+                    "Harmonic rocking refinement needs goniometer axes and angles."
+                )
+            harm_motor_index = None
+            for i, name in enumerate(unique_motors):
+                if refine_goniometer_harmonics.lower() in name.lower():
+                    harm_motor_index = i
+                    break
+            if harm_motor_index is None:
+                raise ValueError(
+                    f"Motor {refine_goniometer_harmonics!r} not found in "
+                    f"{unique_motors} for harmonic refinement."
+                )
+            harm_axis_row = motor_map.index(harm_motor_index)
+            axis_arr = np.asarray(goniometer_axes[harm_axis_row], dtype=float)
+            scan_dir = axis_arr[0:3] * (axis_arr[3] if axis_arr.shape[0] > 3 else 1.0)
+            ki_nominal = np.asarray(
+                self.ki_vec if self.ki_vec is not None else [0.0, 0.0, 1.0],
+                dtype=float,
+            )
+            harmonic_axes_mat = harmonic_axes_from_scan(
+                scan_dir, ki_nominal, goniometer_harmonics_axes
+            )
+            # The full band 1..6 by default: crystallographic rotation
+            # orders top out at 6 (cubic included), and a symmetry axis
+            # tilted from the scan axis leaks its harmonic n into the
+            # n +/- 1 sidebands, so multiples of n alone are not enough.
+            harmonic_orders_list = (
+                [int(m) for m in goniometer_harmonics_orders]
+                if goniometer_harmonics_orders
+                else list(range(1, 7))
+            )
+            harmonic_frame_angles = np.asarray(goniometer_angles, dtype=float)[
+                harm_axis_row, :
+            ]
+
         # Map translation bounds to active axes
         if isinstance(goniometer_trans_bound_meters, (int, float)):
             gonio_trans_bounds_list = [float(goniometer_trans_bound_meters)]
@@ -1507,8 +2192,20 @@ class FindUB:
             goniometer_angles=goniometer_angles,
             refine_goniometer=refine_goniometer,
             goniometer_refine_mask=goniometer_refine_mask,
+            goniometer_trans_refine_mask=trans_refine_mask,
             goniometer_nominal_offsets=self.base_gonio_offset,
             goniometer_bound_deg=bounds_array,
+            goniometer_axis_vector_mask=axis_vector_mask,
+            goniometer_axis_vector_bound_deg=bounds_array_axis_vec,
+            per_run_motor_index=per_run_motor_index,
+            per_run_frame_map=per_run_frame_map,
+            per_run_bound_deg=goniometer_per_run_bound_deg,
+            per_run_trans=refine_goniometer_per_run_trans,
+            per_run_trans_bound_m=goniometer_per_run_trans_bound_meters,
+            harmonic_frame_angles_deg=harmonic_frame_angles,
+            harmonic_axes=harmonic_axes_mat,
+            harmonic_orders=harmonic_orders_list,
+            harmonic_bound_deg=goniometer_harmonics_bound_deg,
             goniometer_trans_bound_meters=bounds_array_trans,
             sample_nominal=self.base_sample_offset,
             refine_beam=refine_beam,
@@ -1528,15 +2225,24 @@ class FindUB:
             no_index=self.no_index,
             hkl_fixed=self.hkl,
             lambda_fixed=self.lambdas,
+            radial_weight=radial_weight,
+            radial_weight_poly=radial_weight_poly,
+            hkl_metric=hkl_metric,
+            hkl_metric_floor=hkl_metric_floor,
         )
 
         num_dims = 0 if freeze_orientation else 3
         if refine_lattice:
             num_dims += num_lattice_params
         if refine_sample and self.peak_xyz is not None:
-            if goniometer_refine_mask is not None and goniometer_axes is not None:
+            trans_motor_mask = (
+                trans_refine_mask
+                if trans_refine_mask is not None
+                else goniometer_refine_mask
+            )
+            if trans_motor_mask is not None and goniometer_axes is not None:
                 # motor_map exists here, map mask to axes
-                axis_mask = goniometer_refine_mask[motor_map]
+                axis_mask = trans_motor_mask[motor_map]
                 num_dims += np.sum(axis_mask) * 3
             else:
                 num_trans = (
@@ -1551,6 +2257,14 @@ class FindUB:
                 if goniometer_refine_mask is not None
                 else len(goniometer_axes)
             )
+        if axis_vector_mask is not None:
+            num_dims += 2 * int(np.sum(axis_vector_mask))
+        if per_run_motor_index is not None:
+            num_dims += objective.num_per_run_params
+        if refine_goniometer_per_run_trans:
+            num_dims += objective.num_per_run_trans_params
+        if harmonic_axes_mat is not None:
+            num_dims += objective.num_harmonic_params
         if refine_detector:
             num_dims += objective.num_det_params
 
@@ -1574,6 +2288,11 @@ class FindUB:
                 dyn_widths,
                 dyn_heights,
                 area_scale,
+                axes_refined_batch,
+                axis_tilts_batch,
+                per_run_delta_batch,
+                per_run_trans_batch,
+                harmonic_coeffs_batch,
             ) = objective._get_physical_params_jax(x_batch)
             self.sample_offset = np.array(t_axes_batch[0])
             self.ki_vec = np.array(ki_vec_batch[0]).flatten()
@@ -1587,7 +2306,11 @@ class FindUB:
 
             loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
             dist_min_final = np.array(dist_min[0])
-            mask = dist_min_final < 0.15
+            # Soft indexing measures fractional-hkl distance; the fixed-hkl
+            # geometric loss measures an angular chord, cut at the 1 degree
+            # line the metrics report already calls BAD.
+            threshold = np.deg2rad(1.0) if objective.no_index else 0.15
+            mask = dist_min_final < threshold
             num_indexed = int(np.sum(mask))
             hkl_final = np.array(hkl[0])
             hkl_final[~mask] = 0
@@ -1731,16 +2454,44 @@ class FindUB:
         step_batch_jit = jax.jit(jax.vmap(step_single_run, in_axes=(0, 0)))
 
         exec_batch_size = batch_size if batch_size is not None else n_runs
-        seeds = jnp.arange(seed, seed + n_runs)
+
+        # Opted in via multi_gpu, the vmapped run axis is sharded across the
+        # visible devices.  Runs is the outer, embarrassingly parallel axis
+        # here -- the population lives *inside* each run's strategy state, so
+        # sharding it would reach into evosax internals, while sharding runs
+        # only touches the batch dimension the code already vmaps over.  Both
+        # the batch size and the run count are rounded up to a multiple of the
+        # device count; the rounding launches extra *real* runs with fresh
+        # seeds rather than padding with dummies, so it can only improve the
+        # best-of-N result it feeds.
+        devices = device_util.batch_devices(multi_gpu)
+        n_dev = len(devices)
+        n_runs_launched = n_runs
+        run_sharding = None
+        if n_dev > 1:
+            exec_batch_size = -(-exec_batch_size // n_dev) * n_dev
+            n_runs_launched = -(-n_runs // n_dev) * n_dev
+            run_sharding = device_util.batch_sharding(devices)
+            print(
+                f"Sharding {n_runs_launched} optimization runs "
+                f"(batches of {exec_batch_size}) across {n_dev} devices"
+            )
+
+        seeds = jnp.arange(seed, seed + n_runs_launched)
         all_keys = jax.vmap(jax.random.PRNGKey)(seeds)
         batch_keys_list, batch_states_list = [], []
 
-        for b_i in range(int(np.ceil(n_runs / exec_batch_size))):
+        for b_i in range(int(np.ceil(n_runs_launched / exec_batch_size))):
             start_idx, end_idx = (
                 b_i * exec_batch_size,
-                min((b_i + 1) * exec_batch_size, n_runs),
+                min((b_i + 1) * exec_batch_size, n_runs_launched),
             )
-            batch_keys_list.append(all_keys[start_idx:end_idx])
+            batch_keys = all_keys[start_idx:end_idx]
+            if run_sharding is not None:
+                # Every batch length is a multiple of n_dev (both operands
+                # were rounded up), so the shards are equal-sized.
+                batch_keys = jax.device_put(batch_keys, run_sharding)
+            batch_keys_list.append(batch_keys)
             batch_states_list.append(
                 init_batch_jit(batch_keys_list[-1], start_sol_processed)
             )
@@ -1810,6 +2561,11 @@ class FindUB:
             dyn_widths,
             dyn_heights,
             area_scale,
+            axes_refined_batch,
+            axis_tilts_batch,
+            per_run_delta_batch,
+            per_run_trans_batch,
+            harmonic_coeffs_batch,
         ) = objective._get_physical_params_jax(x_batch)
 
         self.sample_offset = np.array(t_axes_batch[0])
@@ -1828,6 +2584,63 @@ class FindUB:
                 self.goniometer_offsets = raw_offsets
         if R_batch is not None:
             self.R = np.array(R_batch[0])
+
+        if axis_vector_mask is not None and axes_refined_batch is not None:
+            axes_full = np.array(objective.gonio_axes)
+            axes_full[:, 0:3] = np.array(axes_refined_batch[0])
+            self.goniometer_axes_refined = axes_full
+            tilts_deg = np.rad2deg(np.array(axis_tilts_batch[0]))
+            if goniometer_names is not None:
+                unique = []
+                for name in goniometer_names:
+                    if name not in unique:
+                        unique.append(name)
+                self.goniometer_axis_tilts = {
+                    name: tilts_deg[i].tolist() for i, name in enumerate(unique)
+                }
+            else:
+                self.goniometer_axis_tilts = tilts_deg
+            for name, (ta, tb) in (
+                self.goniometer_axis_tilts.items()
+                if isinstance(self.goniometer_axis_tilts, dict)
+                else enumerate(self.goniometer_axis_tilts)
+            ):
+                if abs(ta) > 1e-6 or abs(tb) > 1e-6:
+                    print(f"Refined axis tilt {name}: ({ta:+.4f}, {tb:+.4f}) deg")
+
+        if per_run_motor_index is not None and per_run_delta_batch is not None:
+            self.goniometer_per_run_delta = np.array(per_run_delta_batch[0])
+            self.goniometer_per_run_motor = refine_goniometer_per_run
+            print(
+                f"Per-run corrections for {refine_goniometer_per_run}: "
+                + " ".join(f"{d:+.4f}" for d in self.goniometer_per_run_delta)
+                + " deg"
+            )
+        if refine_goniometer_per_run_trans and per_run_trans_batch is not None:
+            self.goniometer_per_run_trans = np.array(per_run_trans_batch[0])
+            norms = np.linalg.norm(self.goniometer_per_run_trans, axis=1) * 1e3
+            print(
+                "Per-run sample displacements (|t| mm): "
+                + " ".join(f"{v:.3f}" for v in norms)
+            )
+
+        if harmonic_axes_mat is not None and harmonic_coeffs_batch is not None:
+            coeffs = np.array(harmonic_coeffs_batch[0])
+            self.goniometer_harmonics = {
+                "motor": refine_goniometer_harmonics,
+                "orders": np.asarray(harmonic_orders_list, dtype=np.int32),
+                "axes": np.asarray(harmonic_axes_mat, dtype=float),
+                "coeffs_deg": coeffs,
+            }
+            amp = np.hypot(coeffs[..., 0], coeffs[..., 1])
+            for k in range(amp.shape[0]):
+                print(
+                    f"Harmonic rocking axis {np.round(harmonic_axes_mat[k], 3)}: "
+                    + " ".join(
+                        f"m={m}: {a:.4f}" for m, a in zip(harmonic_orders_list, amp[k])
+                    )
+                    + " deg"
+                )
 
         if freeze_orientation:
             rot_params = self.fixed_rot_params
@@ -1867,7 +2680,8 @@ class FindUB:
         loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
         dist_min_final = np.array(dist_min[0])
 
-        mask = dist_min_final < 0.15
+        threshold = np.deg2rad(1.0) if objective.no_index else 0.15
+        mask = dist_min_final < threshold
         num_indexed = int(np.sum(mask))
 
         hkl_final = np.array(hkl[0])

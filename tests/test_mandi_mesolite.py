@@ -45,14 +45,7 @@ SPACE_GROUP = "F d d 2"
 
 # Integration parameters (from bash script)
 FINDER_PARAMS = {
-    "finder_algorithm": "thresholding",
-    "thresholding_noise_cutoff_quantile": 0.99,
-    "region_growth_minimum_intensity": 25.0,
-    "region_growth_maximum_pixel_radius": 6.0,
-    "peak_center_box_size": 3,
-    "peak_smoothing_window_size": 5,
-    "peak_minimum_pixels": 40,
-    "peak_minimum_signal_to_noise": 4.0,
+    "finder_algorithm": "sparse_rbf",
 }
 
 # Indexer parameters with explicit values for all typer.Option parameters
@@ -80,9 +73,9 @@ INDEXER_DEFAULTS = {
 
 
 @pytest.fixture(name="mesolite_input_file")
-def fixture__mesolite_input_file(test_data_dir):
+def fixture__mesolite_input_file(mesolite_data):
     """Provide path to mesolite test data file."""
-    filepath = Path(test_data_dir) / "MANDI" / "mesolite" / MESOLITE_FILE
+    filepath = Path(mesolite_data) / MESOLITE_FILE
 
     if not filepath.exists():
         pytest.skip(f"Mesolite test file not found: {filepath}")
@@ -199,5 +192,6 @@ class TestMandiMesoliteSingleRun:
         print(f"  Output files in: {temp_output_dir}")
 
 
-# Mark the test class for pytest markers
-pytestmark = pytest.mark.integration
+# Mark the test class for pytest markers. `mesolite` keeps these tests, and the
+# hours-long dataset download they need, out of a default test run.
+pytestmark = [pytest.mark.integration, pytest.mark.mesolite]

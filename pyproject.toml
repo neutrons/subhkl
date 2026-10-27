@@ -2,6 +2,7 @@
 name = "subhkl"
 description = "Solving crystal orientation from Laue images"
 dynamic = ["version"]
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "h5py>=3.11.0",
@@ -14,9 +15,12 @@ dependencies = [
     "gemmi>=0.7.3",
     "tdqm>=0.0.1",
     "scipy>=1.17.1",
+    "click",
 ]
-
 license = { text = "GPL3.0" }
+
+[project.urls]
+Repository = "https://github.com/neutrons/subhkl"
 
 [build-system]
 requires = [
@@ -40,16 +44,16 @@ rocm = [
 
 [tool.versioningit.vcs]
 method = "git"
-match = ["v*"]
+match = ["*"]
 default-tag = "0.0.1"
 
 [tool.versioningit.next-version]
 method = "minor"
 
 [tool.versioningit.format]
-distance = "{next_version}"
-dirty = "{next_version}"
-distance-dirty = "{next_version}"
+distance = "{base_version}"
+dirty = "{base_version}"
+distance-dirty = "{base_version}"
 
 [tool.versioningit.write]
 file = "src/subhkl/_version.py"
@@ -75,7 +79,11 @@ extension-pkg-whitelist = ["PyQt5"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
+    "mesolite: needs the mesolite dataset, downloaded from Zenodo on first use (select with '-m mesolite')",
 ]
+# Downloading the mesolite dataset takes hours, so the tests that need it are
+# left out of a plain `pytest` run. Select them explicitly with `-m mesolite`.
+addopts = "-m 'not mesolite'"
 
 [tool.ruff]
 include = ["pyproject.toml", "src/**/*.py", "scripts/**/*.py", "tests/**/*.py"]
