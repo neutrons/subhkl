@@ -45,6 +45,28 @@ def test_build_info_finds_the_commit_in_the_checkout():
     assert info["git_commit_source"] == "git"
 
 
+def test_build_info_falls_back_to_the_installed_version(monkeypatch):
+    """An editable install has no generated _version module, only metadata."""
+    monkeypatch.setitem(sys.modules, "subhkl._version", None)  # import fails
+    monkeypatch.setattr(
+        provenance.importlib.metadata,
+        "version",
+        lambda name: "9.9.9" if name == "subhkl" else None,
+    )
+
+    assert provenance.build_info()["subhkl_version"] == "9.9.9"
+
+
+def test_build_info_without_any_version_says_so(monkeypatch):
+    def not_installed(name):
+        raise provenance.importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setitem(sys.modules, "subhkl._version", None)
+    monkeypatch.setattr(provenance.importlib.metadata, "version", not_installed)
+
+    assert provenance.build_info()["subhkl_version"] == "unknown"
+
+
 def test_build_info_prefers_the_environment(monkeypatch):
     monkeypatch.setenv(provenance.COMMIT_ENV_VAR, "0123456789abcdef")
 

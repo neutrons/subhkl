@@ -16,6 +16,7 @@ Inspect what a file carries with::
 import functools
 import getpass
 import hashlib
+import importlib.metadata
 import inspect
 import json
 import os
@@ -74,11 +75,18 @@ def build_info() -> dict:
     and in the git checkout the package is imported from. It is ``"unknown"``
     when subhkl was installed from a source or wheel distribution that carries
     no commit information.
+
+    The version comes from the module versioningit generates when a wheel
+    or sdist is built, and otherwise from the installed package metadata,
+    which is all an editable install of a checkout has.
     """
     try:
         from subhkl._version import __version__ as version
-    except ImportError:  # pragma: no cover - _version is generated at build
-        version = "unknown"
+    except ImportError:
+        try:
+            version = importlib.metadata.version("subhkl")
+        except importlib.metadata.PackageNotFoundError:
+            version = "unknown"
 
     commit = os.environ.get(COMMIT_ENV_VAR, "").strip()
     source = "environment" if commit else ""
