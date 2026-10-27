@@ -119,9 +119,27 @@ rs.concat(mtzs).hkl_to_asu().write_mtz("mesolite_202405/meso.mtz")
 which creates a single `.mtz` file `mesolite_202405/meso.mtz` that contains
 all reflections.
 
+## DIALS interoperability
+
+Every `subhkl` command accepts a `--dials` (alias `-dials`) flag that additionally
+writes its output as a DIALS `ExperimentList` (`.expt`) and `reflection_table`
+(`.refl`) pair, so results can be loaded and compared directly against the DIALS
+suite:
+
+```bash
+subhkl indexer peaks.h5 indexed.h5 --instrument CG4D --nexus raw.nxs.h5 --dials
+dials.show indexed.expt indexed.refl
+```
+
+By default the files are named after the command's primary output (override with
+`--dials-prefix STEM`); the `*-visualize` commands, whose output is plots, name
+them after the peaks or mask file they draw. This requires the DIALS/dxtbx toolkit
+(`conda install -c conda-forge dials`). See `docs/source/dials_export.rst` for the
+model mapping and the closest DIALS CLI parallel of each subhkl program.
+
 ## Plotting after the fact
 
-`finder` and `rbf-integrator` draw their unrolled-detector plots while they
+`finder` and `integrator` draw their unrolled-detector plots while they
 run, which costs both rendering time and a lot of disk at the 600 dpi they use.
 Two commands rebuild those plots later from the HDF5 files, so a run can be
 told to draw nothing and still be looked at afterwards:
