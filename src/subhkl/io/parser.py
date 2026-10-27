@@ -1033,6 +1033,7 @@ _DPI_HELP = (
 
 
 @app.command()
+@provenance.track()  # draws plots only, so there is no file to stamp
 def finder_visualize(
     images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
     peaks_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
@@ -1065,6 +1066,7 @@ def finder_visualize(
 
 
 @app.command()
+@provenance.track()  # draws plots only, so there is no file to stamp
 def integrator_visualize(
     images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
     peaks_filename: Annotated[str, typer.Argument(help="integrator output HDF5 file")],
@@ -1095,6 +1097,10 @@ def integrator_visualize(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_filename",),
+    inputs=("input_filenames", "peaks", "pooled_peaks"),
+)
 def static_mask(
     output_filename: Annotated[str, typer.Argument(help="Mask HDF5 to write")],
     input_filenames: Annotated[
@@ -1262,6 +1268,7 @@ def static_mask(
 
 
 @app.command()
+@provenance.track(outputs=("output_filename",), inputs=("input_filenames",))
 def sum_images(
     output_filename: Annotated[str, typer.Argument(help="Summed HDF5 to write")],
     input_filenames: Annotated[
@@ -1289,6 +1296,7 @@ def sum_images(
 
 
 @app.command()
+@provenance.track()  # draws plots only, so there is no file to stamp
 def mask_visualize(
     images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
     mask_filename: Annotated[
