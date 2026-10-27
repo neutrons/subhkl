@@ -68,7 +68,7 @@ app = typer.Typer()
 
 
 @app.command()
-@provenance.track(outputs=("output_filename",), inputs=("filename",))
+@provenance.track(outputs=("output_filename",), inputs=("filename", "static_mask_file"))
 def finder(
     filename: Annotated[str, typer.Argument(help="Input raw/event Nexus file")],
     instrument: Annotated[str, typer.Argument(help="Instrument name")],
@@ -660,7 +660,7 @@ def indexer(
 @app.command()
 @provenance.track(
     outputs=("output_filename",),
-    inputs=("filename", "integration_peaks_filename"),
+    inputs=("filename", "integration_peaks_filename", "static_mask_file"),
 )
 def integrator(
     filename: Annotated[str, typer.Argument(help="Merged HDF5 image stack")],
@@ -937,7 +937,10 @@ def peak_predictor(
 
 
 @app.command()
-@provenance.track(outputs=("output_mtz_filename",), inputs=("indexed_h5_filename",))
+@provenance.track(
+    outputs=("output_mtz_filename",),
+    inputs=("indexed_h5_filename", "predictions_file", "corrections_file"),
+)
 def mtz_exporter(
     indexed_h5_filename: str,
     output_mtz_filename: str,
