@@ -181,6 +181,9 @@ tools/
 # direnv
 .envrc
 
+# commit baked into the package at build time (see Dockerfile)
+src/subhkl/resources/git_commit.txt
+
 # Editor swap and backup files
 *.swp
 *.swo

@@ -25,6 +25,7 @@ from subhkl.commands import (
     run_sum_images,
     run_mask_visualize,
 )
+from subhkl.utils import provenance
 
 
 app = typer.Typer()
@@ -67,6 +68,10 @@ app = typer.Typer()
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_filename",),
+    inputs=("filename", "mask_file", "static_mask_file"),
+)
 def finder(
     filename: Annotated[str, typer.Argument(help="Input raw/event Nexus file")],
     instrument: Annotated[str, typer.Argument(help="Instrument name")],
@@ -242,6 +247,10 @@ def finder(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_peaks_filename",),
+    inputs=("peaks_h5_filename", "bootstrap_filename", "original_nexus_filename"),
+)
 def indexer(
     peaks_h5_filename: str,
     output_peaks_filename: str,
@@ -652,6 +661,10 @@ def indexer(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_filename",),
+    inputs=("filename", "integration_peaks_filename", "static_mask_file"),
+)
 def integrator(
     filename: Annotated[str, typer.Argument(help="Merged HDF5 image stack")],
     instrument: Annotated[str, typer.Argument(help="Instrument name")],
@@ -832,6 +845,7 @@ app.command("rbf-integrator", deprecated=True, hidden=True)(integrator)
 
 
 @app.command()
+@provenance.track()  # reports metrics on screen, so there is nothing to stamp
 def metrics(
     file1: Annotated[
         str, typer.Argument(help="Primary file (e.g., indexer.h5 or predictor.h5)")
@@ -895,6 +909,10 @@ def metrics(
 
 
 @app.command()
+@provenance.track(
+    outputs=("integration_peaks_filename",),
+    inputs=("filename", "indexed_hdf5_filename"),
+)
 def peak_predictor(
     filename: str,
     instrument: str,
@@ -922,6 +940,10 @@ def peak_predictor(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_mtz_filename",),
+    inputs=("indexed_h5_filename", "predictions_file", "corrections_file"),
+)
 def mtz_exporter(
     indexed_h5_filename: str,
     output_mtz_filename: str,
@@ -956,6 +978,7 @@ def mtz_exporter(
 
 
 @app.command()
+@provenance.track(outputs=("output_filename",), inputs=("nexus_filename",))
 def reduce(
     nexus_filename: str,
     output_filename: str,
@@ -973,6 +996,7 @@ def reduce(
 
 
 @app.command()
+@provenance.track(outputs=("output_filename",))
 def merge_images(
     input_pattern: Annotated[
         str,
@@ -1015,6 +1039,7 @@ _DPI_HELP = (
 
 
 @app.command()
+@provenance.track()  # draws plots only, so there is no file to stamp
 def finder_visualize(
     images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
     peaks_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
@@ -1047,6 +1072,7 @@ def finder_visualize(
 
 
 @app.command()
+@provenance.track()  # draws plots only, so there is no file to stamp
 def integrator_visualize(
     images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
     peaks_filename: Annotated[str, typer.Argument(help="integrator output HDF5 file")],
@@ -1077,6 +1103,10 @@ def integrator_visualize(
 
 
 @app.command()
+@provenance.track(
+    outputs=("output_filename",),
+    inputs=("input_filenames", "peaks", "pooled_peaks"),
+)
 def static_mask(
     output_filename: Annotated[str, typer.Argument(help="Mask HDF5 to write")],
     input_filenames: Annotated[
@@ -1244,6 +1274,7 @@ def static_mask(
 
 
 @app.command()
+@provenance.track(outputs=("output_filename",), inputs=("input_filenames",))
 def sum_images(
     output_filename: Annotated[str, typer.Argument(help="Summed HDF5 to write")],
     input_filenames: Annotated[
@@ -1271,6 +1302,7 @@ def sum_images(
 
 
 @app.command()
+@provenance.track()  # draws plots only, so there is no file to stamp
 def mask_visualize(
     images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
     mask_filename: Annotated[
@@ -1298,6 +1330,51 @@ def mask_visualize(
         max_workers=max_workers,
         show_progress=show_progress,
     )
+
+
+@app.command()
+def version():
+    """
+    Print the version of subhkl and the commit it was built from.
+    """
+    info = provenance.build_info()
+    commit = info["git_commit"]
+    if info.get("git_dirty"):
+        commit += " (dirty)"
+    print(f"subhkl {info['subhkl_version']}")
+    print(f"commit {commit} (from {info['git_commit_source']})")
+
+
+@app.command(name="provenance")
+# stderr, so --json output on stdout stays parseable
+@provenance.track(to_stderr=True)
+def show_provenance(
+    filename: Annotated[
+        str, typer.Argument(help="Output file of any subhkl step (e.g. indexer.h5)")
+    ],
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the records as JSON.")
+    ] = False,
+):
+    """
+    Print how a file was produced: the command line, options, version and
+    commit of every subhkl step that contributed to it.
+    """
+    records = provenance.read_records(filename)
+    if not records:
+        print(f"No provenance recorded in {filename}.")
+        raise typer.Exit(code=1)
+
+    if as_json:
+        import json
+
+        print(json.dumps(records, indent=2, default=str))
+        return
+
+    for index, record in enumerate(records):
+        if index:
+            print()
+        print(f"[step {index}] {provenance.format_record(record).lstrip()}")
 
 
 if __name__ == "__main__":
