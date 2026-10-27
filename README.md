@@ -143,7 +143,10 @@ The same information is written into the output file of the step, under the
 `provenance` group (or into a `<output>.provenance.json` sidecar for outputs
 that are not HDF5 files, such as `.mtz`). Each step also carries over the
 records of its input files, so the last file of a workflow holds the command
-line and options of every step that produced it.
+line and options of every step that produced it. Steps that only report or
+draw -- `metrics` and the `*-visualize` commands -- print the record but have
+no output file to store it in. `provenance` prints its own record to stderr,
+so `--json` output on stdout stays valid JSON.
 
 ```bash
 # how was this file made?
@@ -159,7 +162,14 @@ python -m subhkl.io.parser version
 The commit is taken from the git checkout when running from a source tree, and
 from the value baked into the package at build time otherwise (the Docker image
 records it during the build). Setting `SUBHKL_GIT_COMMIT` overrides both, which
-is useful when packaging subhkl outside of the provided Dockerfile.
+is useful when packaging subhkl outside of the provided Dockerfile. When run
+from a checkout with uncommitted changes, the commit is marked `(dirty)`, as
+`git describe --dirty` does, since the code that ran is not exactly that
+commit.
+
+The version comes from the module versioningit generates when a wheel or sdist
+is built, or, for an editable install of a checkout, from the installed
+package metadata.
 
 ## Plotting after the fact
 
