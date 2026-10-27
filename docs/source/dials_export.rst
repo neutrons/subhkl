@@ -125,10 +125,11 @@ locally:
    mamba activate ld-subhkl
 
    # 2. Install subhkl so the dxtbx.format entry point registers FormatSubhkl.
-   #    --no-deps keeps the DIALS stack intact (subhkl's PyPI deps are not needed
-   #    to run these tests).
-   pip install -e . --no-deps
+   #    Its dependencies are needed too: the CLI round-trip tests run the
+   #    commands themselves. pip check reports any clash with the DIALS stack.
+   pip install -e .
    pip install pytest pytest-dependency
+   pip check
 
    # 3. Confirm the reader is discoverable, then run the round-trips.
    python -c "from dxtbx.format.Registry import get_format_class_for; \

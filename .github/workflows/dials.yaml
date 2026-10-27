@@ -45,10 +45,14 @@ jobs:
       - name: Install DIALS
         run: mamba install -y -c conda-forge dials
 
-      - name: Install subhkl (no deps) and pytest
+      # With its dependencies: the CLI round-trip tests import the commands,
+      # which need typer, OpenCV, jax and the rest. pip check fails the job if
+      # they clash with the conda DIALS stack.
+      - name: Install subhkl and pytest
         run: |
-          pip install -e . --no-deps --no-build-isolation
+          pip install -e . --no-build-isolation
           pip install pytest pytest-dependency
+          pip check
 
       - name: Verify FormatSubhkl is registered via the entry point
         run: |
