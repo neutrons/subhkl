@@ -126,16 +126,17 @@ subhkl, the full command line, and the resolved value of every option,
 including the ones left at their defaults.
 
 ```
-subhkl 0.1.0 [finder]
-  commit      : 9987d7423d4d1b0dc0da8a8f6c9e5e1a5e0a0b12
-  started     : 2026-08-04T15:32:11+00:00
+subhkl 1.4.0 [finder]
+  commit      : b0ddd492d29792b52b2c5d19a9c3efb811b25eb1
+  started     : 2026-10-27T15:32:11+00:00
   host        : analysis01
   directory   : /data/mandi/mesolite
   command line: python -m subhkl.io.parser finder scan_master.h5 MANDI --output-filename finder.h5
   options:
-    filename        = "scan_master.h5"
-    instrument      = "MANDI"
-    output_filename = "finder.h5"
+    filename                          = "scan_master.h5"
+    instrument                        = "MANDI"
+    output_filename                   = "finder.h5"
+    finder_algorithm                  = "sparse_rbf"
     ...
 ```
 
