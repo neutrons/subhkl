@@ -194,9 +194,9 @@ def format_record(record: dict, indent: str = "") -> str:
     return "\n".join(indent + line for line in lines)
 
 
-def print_record(record: dict) -> None:
+def print_record(record: dict, file=None) -> None:
     """Print a record, flushing so it precedes the output of the step itself."""
-    print(format_record(record), flush=True)
+    print(format_record(record), file=file or sys.stdout, flush=True)
 
 
 def _write_group(parent: h5py.Group, name: str, record: dict) -> None:
@@ -289,7 +289,7 @@ def stamp(filename, record: dict, inputs=()) -> None:
         print(f"Warning: could not write provenance to {filename}: {error}")
 
 
-def track(outputs=(), inputs=()):
+def track(outputs=(), inputs=(), to_stderr=False):
     """Record the invocation of a CLI step and stamp it into its outputs.
 
     ``outputs`` and ``inputs`` name the parameters of the decorated command
@@ -298,6 +298,8 @@ def track(outputs=(), inputs=()):
     together with the records carried by the inputs. A step that raises is
     recorded too, with the error it failed on, since a file left behind by a
     failed run is exactly the one whose origin is hard to reconstruct.
+    ``to_stderr`` prints the record to stderr, for a command whose stdout is
+    meant to be parsed.
     """
 
     def decorator(function):
@@ -308,7 +310,7 @@ def track(outputs=(), inputs=()):
             parameters = dict(bound.arguments)
 
             record = new_record(function.__name__.replace("_", "-"), parameters)
-            print_record(record)
+            print_record(record, file=sys.stderr if to_stderr else None)
 
             started = time.monotonic()
             try:

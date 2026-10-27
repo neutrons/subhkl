@@ -68,7 +68,10 @@ app = typer.Typer()
 
 
 @app.command()
-@provenance.track(outputs=("output_filename",), inputs=("filename", "static_mask_file"))
+@provenance.track(
+    outputs=("output_filename",),
+    inputs=("filename", "mask_file", "static_mask_file"),
+)
 def finder(
     filename: Annotated[str, typer.Argument(help="Input raw/event Nexus file")],
     instrument: Annotated[str, typer.Argument(help="Instrument name")],
@@ -246,7 +249,7 @@ def finder(
 @app.command()
 @provenance.track(
     outputs=("output_peaks_filename",),
-    inputs=("peaks_h5_filename", "bootstrap_filename"),
+    inputs=("peaks_h5_filename", "bootstrap_filename", "original_nexus_filename"),
 )
 def indexer(
     peaks_h5_filename: str,
@@ -1343,6 +1346,8 @@ def version():
 
 
 @app.command(name="provenance")
+# stderr, so --json output on stdout stays parseable
+@provenance.track(to_stderr=True)
 def show_provenance(
     filename: Annotated[
         str, typer.Argument(help="Output file of any subhkl step (e.g. indexer.h5)")

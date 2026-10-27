@@ -273,7 +273,23 @@ def test_cli_reports_version_and_stored_provenance(tmp_path):
 
     as_json = runner.invoke(cli, ["provenance", str(output), "--json"])
     assert as_json.exit_code == 0
-    assert json.loads(as_json.output)[0]["command"] == "first"
+    # stdout is what `provenance --json > provenance.json` captures, so the
+    # command's own build information goes to stderr
+    assert json.loads(as_json.stdout)[0]["command"] == "first"
+    assert "commit" in as_json.stderr
 
     missing = runner.invoke(cli, ["provenance", str(tmp_path / "nope.h5")])
     assert missing.exit_code == 1
+
+
+def test_every_command_prints_its_build_information():
+    """Each subhkl command reports the version and commit it ran as: through
+    provenance.track, or, for `version`, as the whole of what it prints."""
+    from subhkl.io.parser import app as cli
+
+    untracked = [
+        command.name or command.callback.__name__
+        for command in cli.registered_commands
+        if not hasattr(command.callback, "__wrapped__")
+    ]
+    assert untracked == ["version"]
