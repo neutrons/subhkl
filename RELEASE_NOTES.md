@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- CG4D omega polarity is now -1 for newly ingested metadata. Existing HDF5
+  axes/rotations are preserved and must be corrected explicitly when needed.
+- `solve --refinement band` adds staged CG4D scan refinement with selectable
+  axial, cell, per-run, sample and panel modes, optional fixed-assignment pixel
+  polish, and a finder-less signed-count variant. See the betalac experiment
+  report for scope, measured results and remaining blind-indexing limitations.
+
 - The experimental `calibrate` and `spherical-index` CLI entry points are
   replaced by `solve`: global count-based orientation proposals followed by
   one Poisson group-sparse fit of intensities, orientations and shared detector

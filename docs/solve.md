@@ -1,5 +1,11 @@
 # Joint count-based solve (draft)
 
+The [betalac staged-refinement experiment](experiments/poisson-orientations/betalac-modes.md)
+adds `--refinement band`, selectable geometry/cell/per-run modes, an optional
+finder comparison and fixed-assignment pixel polish. Its count-only variant
+uses signed residuals without detection thresholds. The Poisson/group-L1 path
+described below remains the default.
+
 `solve` is the sole CLI entry point for the experimental count-based indexing
 and detector calibration workflow. `calibrate` and `spherical-index` are
 removed from the CLI, with no aliases. Their numerical Python runners remain

@@ -116,6 +116,49 @@ def solve(
             help="Jointly refine orientations and geometry after support fitting",
         ),
     ] = True,
+    refinement: Annotated[
+        str, typer.Option(help="Refinement objective: poisson or staged band")
+    ] = "poisson",
+    finder_peaks: Annotated[
+        str | None,
+        typer.Option(help="Optional finder observations for band comparison"),
+    ] = None,
+    refine_modes: Annotated[
+        str | None,
+        typer.Option(
+            help="Band modes: cylindrical,axial_stretch,area,global_rot,global_trans,sample,cell,per_run,panels"
+        ),
+    ] = None,
+    runs: Annotated[
+        str | None, typer.Option(help="Zero-based run indices for band refinement")
+    ] = None,
+    stable_runs: Annotated[
+        str | None, typer.Option(help="Drift-free subset for initial band geometry")
+    ] = None,
+    band_zones: Annotated[
+        int, typer.Option(min=60, help="Final band zone count")
+    ] = 400,
+    band_maxiter: Annotated[
+        int, typer.Option(min=1, help="Iteration limit per band/pixel stage")
+    ] = 600,
+    min_deviance: Annotated[
+        float,
+        typer.Option(
+            min=0, help="Finder comparison selection only; never applied to counts"
+        ),
+    ] = 100.0,
+    pixel_polish: Annotated[
+        bool,
+        typer.Option(
+            help="Fixed-assignment robust polish after band fit; requires finder peaks"
+        ),
+    ] = False,
+    assignment_wavelength_min: Annotated[
+        float, typer.Option(help="Prediction/pixel-polish band lower bound")
+    ] = 2.8,
+    assignment_wavelength_max: Annotated[
+        float, typer.Option(help="Prediction/pixel-polish band upper bound")
+    ] = 4.5,
 ):
     """Solve orientation support and detector geometry from counts together.
 
@@ -126,6 +169,46 @@ def solve(
 
     try:
         values = [float(v.strip()) for v in cell.split(",")] if cell else None
+        if refinement not in ("poisson", "band"):
+            raise ValueError("refinement must be poisson or band")
+        if refinement == "band":
+            from subhkl.scan_refine import run_scan_refinement
+
+            if not refine or fixed_geometry:
+                raise ValueError(
+                    "band uses --refine-modes to select free geometry; omit --no-refine/--fixed-geometry"
+                )
+            band_result = run_scan_refinement(
+                frames_filename,
+                output_filename,
+                bootstrap=bootstrap,
+                finder=finder_peaks,
+                instrument=instrument or "CG4D",
+                cell=values,
+                space_group=space_group,
+                wavelength=(wavelength_min or 2.85, wavelength_max or 4.35),
+                assignment_wavelength=(
+                    assignment_wavelength_min,
+                    assignment_wavelength_max,
+                ),
+                runs=[int(x) for x in runs.split(",")] if runs else None,
+                stable_runs=[int(x) for x in stable_runs.split(",")]
+                if stable_runs
+                else None,
+                modes=refine_modes.split(",") if refine_modes is not None else None,
+                n_zones=band_zones,
+                d_min=d_min,
+                min_deviance=min_deviance,
+                pixel_polish=pixel_polish,
+                binning=binning,
+                maxiter=band_maxiter,
+                static_mask_file=static_mask_file,
+            )
+            if band_result["status"] != "converged":
+                raise typer.Exit(1)
+            return
+        if finder_peaks or refine_modes or runs or stable_runs or pixel_polish:
+            raise ValueError("finder/mode/run/pixel options require --refinement band")
         result = run_solve(
             frames_filename,
             output_filename,
@@ -149,6 +232,8 @@ def solve(
             fixed_geometry=fixed_geometry,
             do_refine=refine,
         )
+    except typer.Exit:
+        raise
     except (ValueError, KeyError, OSError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     except RuntimeError as exc:

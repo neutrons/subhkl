@@ -1,0 +1,372 @@
+{
+  "dataset": "CG4D betalac-3, independent work in betalac-5",
+  "base_commit": "93c90929",
+  "valid_count_bins": 2796272,
+  "interpretation": "Seeded single-orientation band refinement, not blind indexing or expanded Poisson/L1 refinement",
+  "results": {
+    "Original custom script output": {
+      "200": {
+        "n": 823,
+        "median_px": 2.0668798480269457,
+        "within_2sigma": 0.8991494532199271,
+        "within_3sigma": 0.982989064398542
+      },
+      "100": {
+        "n": 1572,
+        "median_px": 1.9220765449491046,
+        "within_2sigma": 0.9033078880407125,
+        "within_3sigma": 0.9751908396946565
+      },
+      "50": {
+        "n": 2798,
+        "median_px": 2.0149248168553235,
+        "within_2sigma": 0.8677626876340243,
+        "within_3sigma": 0.9503216583273767
+      },
+      "per_run": {
+        "2": {
+          "n": 104,
+          "median_px": 1.8809664935150852
+        },
+        "3": {
+          "n": 121,
+          "median_px": 2.0476832681056365
+        },
+        "4": {
+          "n": 111,
+          "median_px": 2.2740563381916528
+        },
+        "5": {
+          "n": 130,
+          "median_px": 1.890409163402161
+        },
+        "6": {
+          "n": 45,
+          "median_px": 2.3715555122245453
+        },
+        "7": {
+          "n": 127,
+          "median_px": 1.5934979647844512
+        },
+        "8": {
+          "n": 144,
+          "median_px": 1.63982549227484
+        },
+        "9": {
+          "n": 136,
+          "median_px": 1.7529174350362235
+        },
+        "10": {
+          "n": 109,
+          "median_px": 1.9825883441210543
+        },
+        "11": {
+          "n": 115,
+          "median_px": 1.96237587414899
+        },
+        "12": {
+          "n": 104,
+          "median_px": 1.6803142121979922
+        },
+        "13": {
+          "n": 107,
+          "median_px": 2.0425992659729113
+        },
+        "14": {
+          "n": 105,
+          "median_px": 1.9370966249761763
+        },
+        "15": {
+          "n": 114,
+          "median_px": 2.2257462685909823
+        }
+      },
+      "solution": "/home/xvg/subhkl-examples/betalac-5/reference/indexer_refined.h5",
+      "status": "reference",
+      "evaluation": "Nearest forward predicted hit on the observed panel, lambda 2.8..4.5 A, d_min 2.0 A; all observations at each deviance threshold, without trimming"
+    },
+    "Staged band + pixel polish": {
+      "200": {
+        "n": 823,
+        "median_px": 1.4540853100255637,
+        "within_2sigma": 0.9732685297691372,
+        "within_3sigma": 0.9963547995139733
+      },
+      "100": {
+        "n": 1572,
+        "median_px": 1.44716878624107,
+        "within_2sigma": 0.9694656488549618,
+        "within_3sigma": 0.989821882951654
+      },
+      "50": {
+        "n": 2798,
+        "median_px": 1.5139366266178182,
+        "within_2sigma": 0.9335239456754825,
+        "within_3sigma": 0.9703359542530379
+      },
+      "per_run": {
+        "2": {
+          "n": 104,
+          "median_px": 1.3048913930403385
+        },
+        "3": {
+          "n": 121,
+          "median_px": 1.2809970433153135
+        },
+        "4": {
+          "n": 111,
+          "median_px": 1.737141097207983
+        },
+        "5": {
+          "n": 130,
+          "median_px": 1.4223555212974541
+        },
+        "6": {
+          "n": 45,
+          "median_px": 1.6487557468557554
+        },
+        "7": {
+          "n": 127,
+          "median_px": 1.2750754567390814
+        },
+        "8": {
+          "n": 144,
+          "median_px": 1.3973721851838175
+        },
+        "9": {
+          "n": 136,
+          "median_px": 1.469041191928057
+        },
+        "10": {
+          "n": 109,
+          "median_px": 1.4617024525088749
+        },
+        "11": {
+          "n": 115,
+          "median_px": 1.4690389864268905
+        },
+        "12": {
+          "n": 104,
+          "median_px": 1.527025383664991
+        },
+        "13": {
+          "n": 107,
+          "median_px": 1.468367206156031
+        },
+        "14": {
+          "n": 105,
+          "median_px": 1.4083933210030704
+        },
+        "15": {
+          "n": 114,
+          "median_px": 1.4076648463999966
+        }
+      },
+      "solution": "/home/xvg/subhkl-examples/betalac-5/work/band-peaks-regularized.h5",
+      "status": "converged",
+      "evaluation": "Nearest forward predicted hit on the observed panel, lambda 2.8..4.5 A, d_min 2.0 A; all observations at each deviance threshold, without trimming",
+      "optimizer_stages": [
+        {
+          "stage": "global",
+          "objective": -2.8995211179142006,
+          "iterations": 281,
+          "success": true,
+          "message": "Replayed saved stage: CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+        },
+        {
+          "stage": "120-zones",
+          "objective": -4.91422735615036,
+          "iterations": 263,
+          "success": true,
+          "message": "Replayed saved stage: CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+        },
+        {
+          "stage": "cell",
+          "objective": -10.193237203980422,
+          "iterations": 409,
+          "success": true,
+          "message": "Replayed saved stage: CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+        },
+        {
+          "stage": "panels",
+          "objective": -10.866582329872662,
+          "iterations": 600,
+          "success": false,
+          "message": "Replayed saved stage: STOP: TOTAL NO. OF ITERATIONS REACHED LIMIT"
+        },
+        {
+          "stage": "pixel-1",
+          "objective": 1.666601361804628,
+          "iterations": 17,
+          "success": true,
+          "message": "`ftol` termination condition is satisfied."
+        },
+        {
+          "stage": "pixel-2",
+          "objective": 1.1408541621705344,
+          "iterations": 16,
+          "success": true,
+          "message": "`ftol` termination condition is satisfied."
+        }
+      ],
+      "parameters_at_bounds": [],
+      "scan_corrections_deg": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "radial_scale": 0.056487661469542275,
+      "axial_scale": 0.04826126901337777
+    },
+    "Finder-less band, 8-pixel bins": {
+      "200": {
+        "n": 823,
+        "median_px": 2.213990941289912,
+        "within_2sigma": 0.9161603888213852,
+        "within_3sigma": 0.9902794653705954
+      },
+      "100": {
+        "n": 1572,
+        "median_px": 2.038583905114095,
+        "within_2sigma": 0.9230279898218829,
+        "within_3sigma": 0.9809160305343512
+      },
+      "50": {
+        "n": 2798,
+        "median_px": 2.0729589656749443,
+        "within_2sigma": 0.8877769835596855,
+        "within_3sigma": 0.9599714081486777
+      },
+      "per_run": {
+        "2": {
+          "n": 104,
+          "median_px": 2.36358615872037
+        },
+        "3": {
+          "n": 121,
+          "median_px": 1.976606766241445
+        },
+        "4": {
+          "n": 111,
+          "median_px": 2.30081916290057
+        },
+        "5": {
+          "n": 130,
+          "median_px": 2.0676949023786264
+        },
+        "6": {
+          "n": 45,
+          "median_px": 2.3791681319454834
+        },
+        "7": {
+          "n": 127,
+          "median_px": 1.801272179366982
+        },
+        "8": {
+          "n": 144,
+          "median_px": 1.7829919485805144
+        },
+        "9": {
+          "n": 136,
+          "median_px": 1.8234751861127587
+        },
+        "10": {
+          "n": 109,
+          "median_px": 1.7897802226211956
+        },
+        "11": {
+          "n": 115,
+          "median_px": 1.8672627860341418
+        },
+        "12": {
+          "n": 104,
+          "median_px": 2.2614406918180663
+        },
+        "13": {
+          "n": 107,
+          "median_px": 2.2762842422067617
+        },
+        "14": {
+          "n": 105,
+          "median_px": 2.22094696376786
+        },
+        "15": {
+          "n": 114,
+          "median_px": 2.6668472794240508
+        }
+      },
+      "solution": "/home/xvg/subhkl-examples/betalac-5/work/band-counts8-refined.h5",
+      "status": "converged",
+      "evaluation": "Nearest forward predicted hit on the observed panel, lambda 2.8..4.5 A, d_min 2.0 A; all observations at each deviance threshold, without trimming",
+      "optimizer_stages": [
+        {
+          "stage": "global",
+          "objective": -0.14089431520691692,
+          "iterations": 131,
+          "success": true,
+          "message": "Replayed saved stage: CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+        },
+        {
+          "stage": "120-zones",
+          "objective": -0.2325044734178741,
+          "iterations": 198,
+          "success": true,
+          "message": "Replayed saved stage: CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+        },
+        {
+          "stage": "cell",
+          "objective": -0.38279869392260374,
+          "iterations": 213,
+          "success": true,
+          "message": "Replayed saved stage: CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+        },
+        {
+          "stage": "panels",
+          "objective": -0.40826487893878627,
+          "iterations": 883,
+          "success": true,
+          "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+        }
+      ],
+      "parameters_at_bounds": [],
+      "scan_corrections_deg": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "radial_scale": 0.06647104887555996,
+      "axial_scale": 0.05513391141850759
+    }
+  },
+  "source_hashes": {
+    "src/subhkl/search/scan_band.py": "874fed1526070fcd5b9f1a9409808456c6fb055e7899cade969fd0fef1c07165",
+    "src/subhkl/scan_refine.py": "a2f359ad69e937412bb57e0db55b05907b2ac5c437bd32bd7cd58a3111050698",
+    "src/subhkl/io/parser.py": "b51334692d27555cce309be557a2834045976c4d25763fbc7a6b0248966fb4c6"
+  }
+}
