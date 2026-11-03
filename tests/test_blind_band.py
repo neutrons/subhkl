@@ -3,7 +3,11 @@
 import numpy as np
 import pytest
 
-from subhkl.search.blind_band import sample_signed, distinct_orientations
+from subhkl.search.blind_band import (
+    count_search_weights,
+    distinct_orientations,
+    sample_signed,
+)
 
 
 def test_signed_quadrature_is_unbiased_and_keeps_negative_evidence():
@@ -81,3 +85,15 @@ def test_signed_band_geometry_is_invariant_to_positive_weight_rescaling():
         second = fit(np.array([-21.0, 7.0]))
     np.testing.assert_allclose(first["score"], second["score"], atol=1e-12)
     np.testing.assert_allclose(first["U"], second["U"], atol=1e-12)
+
+
+def test_count_search_weights_are_threshold_free_and_suppress_null_noise():
+    dev = np.array([0.0, 0.5, 1.0, 25.0, 100.0, 400.0])
+    w = count_search_weights(dev)
+    assert w[0] == 0.0
+    assert np.all(w[1:] > 0.0)
+    assert np.all(np.diff(w) > 0.0)
+    # 1-sigma background fluctuation is suppressed by >1e4 relative to a 5-sigma spot
+    assert w[2] / w[3] < 2e-4
+    # Sublinear sqrt(D) growth at high deviance prevents flare monopolization
+    assert np.isclose(w[5] / w[4], 2.0, rtol=1e-3)

@@ -51,16 +51,12 @@ def run_scan_refinement(
     search_candidates=6,
     search_seed=0,
 ):
-    """Index from finder observations or refine a seed with band-geometry modes.
+    """Index from finder observations or count bins and refine with band-geometry modes.
 
     The bootstrap supplies orientation only. Detector geometry starts from
     instrument metrology, matching the staged reference protocol. Counts mode
     keeps signed residuals from every valid bin and cannot use pixel polish.
     """
-    if bootstrap is None and finder is None:
-        raise ValueError(
-            "blind band indexing requires --finder-peaks; count-only refinement requires --bootstrap"
-        )
     if search_samples < 1 or search_candidates < 1 or search_seed < 0:
         raise ValueError("invalid blind search budget or seed")
     if instrument != "CG4D":
@@ -259,12 +255,20 @@ def load_observations(args):
                     good = valid.reshape(512 // b, b, 512 // b, b).all((1, 3))
                     bg = median_filter(y, size=7, mode="nearest")
                     weight = y - bg
+                    bg_5 = median_filter(y, size=5, mode="nearest")
+                    bg_safe = np.maximum(bg_5, 1.0)
+                    y_safe = np.maximum(y, bg_safe)
+                    dev_bin = np.where(
+                        y > bg_safe,
+                        2.0 * (y_safe * np.log(y_safe / bg_safe) - (y_safe - bg_safe)),
+                        0.0,
+                    )
                     n = int(good.sum())
                     values = (
                         np.full(n, frame_banks[i]),
                         rr[good],
                         cc[good],
-                        np.zeros(n),
+                        dev_bin[good],
                         np.zeros(n),
                         np.full(n, run_ids[i]),
                         np.repeat(angles[i : i + 1], n, axis=0),

@@ -6,11 +6,10 @@ finder comparison and fixed-assignment pixel polish. Its count-only variant
 uses signed residuals without detection thresholds. The Poisson/group-L1 path
 described below remains the default.
 
-Band mode now also supports [blind single-crystal indexing from finder
-observations](experiments/poisson-orientations/betalac-blind.md): omit
-`--bootstrap` and supply `--finder-peaks`. It searches orientations from nominal
-metrology before running the same joint refinement. Blind raw-count band
-discovery is not supported; count-only band refinement still needs a seed.
+Band mode now also supports [blind single-crystal indexing](experiments/poisson-orientations/betalac-blind.md)
+without `--bootstrap`: either from finder observations (`--finder-peaks`) or
+directly from raw detector counts (`--finder-peaks` omitted). It searches
+orientations from nominal metrology before running the same joint refinement.
 
 `solve` is the sole CLI entry point for the experimental count-based indexing
 and detector calibration workflow. `calibrate` and `spherical-index` are

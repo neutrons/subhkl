@@ -180,10 +180,32 @@ def test_cg4d_omega_future_metadata_polarity():
     )
 
 
-def test_unseeded_count_path_is_not_advertised_as_working(inputs, tmp_path):
+def test_unseeded_count_path_runs_blind_search_then_refinement(
+    inputs, tmp_path, monkeypatch
+):
     frames, _ = inputs
-    with pytest.raises(ValueError, match="blind band indexing requires --finder-peaks"):
-        run_scan_refinement(frames, tmp_path / "blind.h5")
+    output = tmp_path / "blind_counts.h5"
+    seed = tmp_path / "blind_counts.blind.h5"
+    seen = []
+
+    def discover(args, *budgets):
+        assert args.bootstrap is None
+        assert args.finder is None
+        seen.append("search_counts")
+        with h5py.File(seed, "w") as f:
+            f["sample/U"] = np.eye(3)
+        return str(seed)
+
+    def refine(args):
+        seen.append("refine_counts")
+        assert args.bootstrap == args.blind_search == str(seed)
+        return {"status": "converged"}
+
+    monkeypatch.setattr("subhkl.search.blind_band.discover", discover)
+    monkeypatch.setattr("subhkl.search.scan_band.refine_scan", refine)
+    result = run_scan_refinement(frames, output)
+    assert result["status"] == "converged"
+    assert seen == ["search_counts", "refine_counts"]
 
 
 def test_missing_bootstrap_runs_blind_search_then_same_refinement(

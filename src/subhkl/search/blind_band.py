@@ -58,6 +58,21 @@ def distinct_orientations(candidates, B, space_group, count, separation_deg=1.0)
     return selected
 
 
+def count_search_weights(deviance, scale=25.0):
+    """Smooth chi-square-null-suppressed Poisson deviance weights for count bins.
+
+    Under a Poisson background null, single-bin deviance follows chi^2_1 (~1),
+    whereas genuine Bragg reflections in an 8x8 bin produce deviance >> 25.
+    Weighting by sqrt(D) * (1 - exp(-(D / scale)^3)) is strictly threshold-free
+    (every positive-deviance bin has positive weight), suppresses 1-sigma background
+    fluctuations by ~6e-5 so importance sampling is not flooded by background bins,
+    and grows as sqrt(D) at high deviance so bright flare pixels cannot monopolize
+    the sample.
+    """
+    dev = np.maximum(np.asarray(deviance, float), 0.0)
+    return np.sqrt(dev) * (1.0 - np.exp(-((dev / float(scale)) ** 3)))
+
+
 def discover(args, samples=16384, candidates=6, seed=0):
     """Find a seed without reading any reference orientation or calibration.
 
@@ -66,16 +81,18 @@ def discover(args, samples=16384, candidates=6, seed=0):
     same winning global geometry, not each candidate's preferred detector.
     """
     start = time.monotonic()
-    if not args.finder:
-        raise ValueError("blind band discovery currently requires finder observations")
     observations = load_observations(args)
     banks, rows, cols, dev, _, runs, angles, weights = observations
     use = np.isin(runs, args.stable_runs)
     if args.finder:
         use &= dev >= args.min_deviance
-    banks, rows, cols, angles, weights = [
-        v[use] for v in (banks, rows, cols, angles, weights)
-    ]
+        search_weights = weights[use]
+        weighting_desc = "sqrt finder deviance"
+    else:
+        search_weights = count_search_weights(dev[use])
+        weighting_desc = "smooth chi2-suppressed bin Poisson deviance"
+    banks, rows, cols, angles = [v[use] for v in (banks, rows, cols, angles)]
+    weights = search_weights
     idx, sampled_weights = sample_signed(weights, samples, seed)
     scan_col = int(np.argmax(np.ptp(angles, axis=0)))
     Rs = Rotation.from_rotvec(
@@ -218,5 +235,5 @@ def discover(args, samples=16384, candidates=6, seed=0):
         g.attrs["seconds"] = time.monotonic() - start
         g.attrs["source"] = str(Path(args.nexus).resolve())
         g.attrs["finder"] = str(args.finder or "")
-        g.attrs["weighting"] = "sqrt finder deviance"
+        g.attrs["weighting"] = weighting_desc
     return str(path)
