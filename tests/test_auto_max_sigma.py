@@ -17,6 +17,7 @@ from scipy.special import erf
 from subhkl.search.matrix_free import (
     MatrixFreeSparseRBFPeakFinder,
     _ceiling_from_widths,
+    _filter_widths_by_prior,
     _moment_width_census,
     _sigma_from_truncated_m2,
     _truncated_m2_ratio,
@@ -132,3 +133,47 @@ def test_explicit_max_sigma_is_never_second_guessed():
     assert not finder._auto_ceiling
     finder.find_peaks_batch(frames)
     assert finder.max_sigma == 4.0
+
+
+def test_functional_prior_rejects_halo_and_non_monotonic_artifacts():
+    rng = np.random.default_rng(42)
+    # 150 genuine Bragg peaks following a gentle monotonic dependence on 2theta
+    tt_bragg = rng.uniform(15.0, 75.0, 150)
+    s_bragg = np.sin(0.5 * np.radians(tt_bragg))
+    w_bragg = 2.6 + 0.8 * s_bragg + rng.normal(0.0, 0.12, 150)
+
+    # Inject low-2theta direct-beam halo outliers (sigma = 6..12) and a
+    # non-monotonic shadow spike at 2theta ~ 85 deg (sigma = 5..8)
+    tt_outliers = np.concatenate([np.full(12, 18.0), np.full(8, 85.0)])
+    w_outliers = np.concatenate([rng.uniform(6.0, 12.0, 12), rng.uniform(5.0, 8.0, 8)])
+
+    widths = np.concatenate([w_bragg, w_outliers])
+    two_theta = np.concatenate([tt_bragg, tt_outliers])
+
+    filtered, keep, pred = _filter_widths_by_prior(widths, two_theta)
+    # All 20 artifact outliers are rejected while >=95% of genuine peaks survive
+    assert keep[:150].mean() >= 0.95
+    assert not np.any(keep[150:])
+    assert _ceiling_from_widths(filtered, 1.5) == pytest.approx(4.0, abs=0.5)
+
+
+def test_width_census_ignores_unbracketed_shadow_pedestals():
+    # A clean 3-frame batch with sigma=2.8 peaks, plus a fourth frame carrying a
+    # large bright shadow/halo pedestal that fills a 27x27 window.
+    frames = frames_with_peaks(2.8, n_frames=3, amp=2500.0, seed=11)
+    artifact_frame = np.ones((1, 160, 160), dtype=np.float32)
+    rr, cc = np.mgrid[0:160, 0:160].astype(float)
+    # Broad flat-top flare (radius 18 px) that previously saturated both
+    # tight and wide apertures at step=13 and passed consistency with w ~ 10+
+    flare = 40.0 * np.exp(-0.5 * ((rr - 80.0) ** 2 + (cc - 80.0) ** 2) / 14.0**2)
+    artifact_frame[0] += flare.astype(np.float32)
+    batch = np.concatenate([frames, artifact_frame], axis=0)
+    bg = np.ones_like(batch)
+
+    widths = _moment_width_census(
+        batch, bg, 1.0, window_sigma=5.0, two_theta=np.array([25.0, 35.0, 45.0, 18.0])
+    )
+    assert widths.size >= 8
+    assert np.median(widths) == pytest.approx(2.8, abs=0.25)
+    assert widths.max() < 3.6
+    assert _ceiling_from_widths(widths, 1.5) == pytest.approx(4.0, abs=0.5)
