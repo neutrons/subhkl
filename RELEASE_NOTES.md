@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Band mode can discover a single-crystal orientation from finder observations
+  without `--bootstrap`, then jointly refine geometry and scan drift. Betalac
+  reproduces the seeded fit; blind raw-count band discovery remains unsupported.
 - CG4D omega polarity is now -1 for newly ingested metadata. Existing HDF5
   axes/rotations are preserved and must be corrected explicitly when needed.
 - `solve --refinement band` adds staged CG4D scan refinement with selectable

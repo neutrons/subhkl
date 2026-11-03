@@ -24,6 +24,8 @@ All modes are enabled by default. The current scope is 512x512 CG4D flat
 panels, beam +z, a monoclinic unique-b cell, and a net vertical goniometer
 rotation. Unsupported geometries are rejected. The bootstrap supplies only the
 orientation; detector geometry starts from nominal instrument metrology.
+With finder observations, the bootstrap can now be omitted: a blind band
+search supplies the orientation automatically. See the [blind benchmark](betalac-blind.md).
 
 The stages are stable-run 60-zone multistart, a per-run angle scan, 120-zone
 refinement, fine-zone cell refinement, and regularized panel shifts. Optional
@@ -34,6 +36,10 @@ The vertical sample/global-detector translation ambiguity is fixed by setting
 sample y=0. This leaves the predicted rays unchanged. New CG4D metadata uses
 omega polarity -1. Historical HDF5 axes/R are not silently rewritten: the
 experiment's preparation script corrects copies explicitly.
+The varying encoder in these betalac files is phi; omega is fixed at zero.
+The results JSON now reports corrections from that varying column, correcting
+an earlier reporting error that displayed the fixed omega column as zeros.
+The fitted corrections themselves were already applied to the correct axis.
 
 ## Reproduction
 

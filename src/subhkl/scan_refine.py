@@ -30,7 +30,7 @@ def run_scan_refinement(
     frames,
     output,
     *,
-    bootstrap,
+    bootstrap=None,
     finder=None,
     instrument="CG4D",
     cell=None,
@@ -47,21 +47,34 @@ def run_scan_refinement(
     binning=16,
     maxiter=600,
     static_mask_file=None,
+    search_samples=16384,
+    search_candidates=6,
+    search_seed=0,
 ):
-    """Refine an orientation seed with selectable band-geometry modes.
+    """Index from finder observations or refine a seed with band-geometry modes.
 
     The bootstrap supplies orientation only. Detector geometry starts from
     instrument metrology, matching the staged reference protocol. Counts mode
     keeps signed residuals from every valid bin and cannot use pixel polish.
     """
-    if not bootstrap:
-        raise ValueError("staged band refinement requires an orientation bootstrap")
+    if bootstrap is None and finder is None:
+        raise ValueError(
+            "blind band indexing requires --finder-peaks; count-only refinement requires --bootstrap"
+        )
+    if search_samples < 1 or search_candidates < 1 or search_seed < 0:
+        raise ValueError("invalid blind search budget or seed")
     if instrument != "CG4D":
         raise ValueError(
             "staged band refinement currently supports CG4D vertical scans"
         )
+    destinations = {
+        Path(output).resolve(),
+        Path(output).with_suffix(".stages.h5").resolve(),
+    }
+    if bootstrap is None:
+        destinations.add(Path(output).with_suffix(".blind.h5").resolve())
     for source in (frames, bootstrap, finder, static_mask_file):
-        if source and Path(source).resolve() == Path(output).resolve():
+        if source and Path(source).resolve() in destinations:
             raise ValueError("output cannot overwrite an input")
     if pixel_polish and not finder:
         raise ValueError("pixel polish needs finder observations; omit it for counts")
@@ -151,7 +164,7 @@ def run_scan_refinement(
     args = SimpleNamespace(
         nexus=str(frames),
         output=str(output),
-        bootstrap=str(bootstrap),
+        bootstrap=str(bootstrap) if bootstrap is not None else None,
         finder=finder,
         instrument=instrument,
         cell=cell,
@@ -176,6 +189,13 @@ def run_scan_refinement(
     import jax
 
     with jax.enable_x64(), jax.default_matmul_precision("highest"):
+        if bootstrap is None:
+            from subhkl.search.blind_band import discover
+
+            args.bootstrap = discover(
+                args, search_samples, search_candidates, search_seed
+            )
+            args.blind_search = args.bootstrap
         return refine_scan(args)
 
 
@@ -404,6 +424,9 @@ def write_result(
             view.attrs["objective"] = "band"
             view["orientations_sample"] = U[None]
             view["active"] = np.array([0], dtype=int)
+            if hasattr(args, "blind_search"):
+                with h5py.File(args.blind_search) as search:
+                    search.copy("search", out, name="blind_search")
         os.replace(temp, args.output)
         print(
             f"Band refinement: {status}; {len(args.bound_parameters)} parameters at bounds",

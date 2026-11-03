@@ -159,11 +159,22 @@ def solve(
     assignment_wavelength_max: Annotated[
         float, typer.Option(help="Prediction/pixel-polish band upper bound")
     ] = 4.5,
+    search_samples: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Observation budget for blind band proposals; smaller lists use all observations",
+        ),
+    ] = 16384,
+    search_seed: Annotated[
+        int, typer.Option(min=0, help="Reproducible blind band sampling seed")
+    ] = 0,
 ):
     """Solve orientation support and detector geometry from counts together.
 
-    Replaces calibrate and spherical-index. Draft scope: flat panels, beam +z,
-    known cell/band, frame-addressed goniometer settings. All valid bins contribute.
+    Replaces calibrate and spherical-index. The default count path uses all
+    valid bins. Band refinement can index finder observations blindly, or
+    refine count data with an explicit orientation seed.
     """
     from subhkl.solve import run_solve
 
@@ -203,6 +214,9 @@ def solve(
                 binning=binning,
                 maxiter=band_maxiter,
                 static_mask_file=static_mask_file,
+                search_samples=search_samples,
+                search_seed=search_seed,
+                search_candidates=n_candidates,
             )
             if band_result["status"] != "converged":
                 raise typer.Exit(1)

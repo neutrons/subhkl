@@ -1,0 +1,197 @@
+{
+  "dataset": "CG4D betalac, 14 fitted runs, 8 stable search runs",
+  "reference_used_only_for_evaluation": "/home/xvg/subhkl-examples/betalac-5/work/band-peaks-cli.h5",
+  "base_commit": "5ef79c47",
+  "supplied_priors": [
+    "unit cell and space group",
+    "wavelength band",
+    "nominal instrument geometry",
+    "frame-addressed goniometry",
+    "runs 2..9 identified as stable"
+  ],
+  "benchmark_scope": "One real dataset plus a coordinate-covariance check; not an independent second dataset",
+  "cases": {
+    "blind-peaks": {
+      "search_seconds": 47.0866793920286,
+      "stable_observations": 918,
+      "sampled_observations": 918,
+      "candidate_scores": [
+        2.7835037868801753,
+        2.78350378680868,
+        0.26849846383799203
+      ],
+      "selected_orientation_difference_deg": 0.29312438816127456,
+      "supplied_orientation": false,
+      "supplied_fitted_calibration": false,
+      "status": "converged",
+      "final_orientation_difference_deg": 7.178914506300842e-12,
+      "parameters_at_bounds": [],
+      "scan_motor": "CG4D:Mot:phi",
+      "scan_corrections_deg": [
+        0.0,
+        0.0,
+        0.0,
+        -0.15329661362429875,
+        -0.07644280118691353,
+        0.13091660543197528,
+        0.16596066132846016,
+        0.20701052471091205,
+        0.14705645197288064,
+        0.10126203255173032,
+        0.420095883878925,
+        1.2275004486421697,
+        2.419574097093397,
+        3.391415305227965,
+        3.7023815223463763,
+        3.132782124279909
+      ],
+      "pixel_validation": {
+        "200": {
+          "n": 823,
+          "median_px": 1.4540853101923554,
+          "within_2sigma": 0.9732685297691372,
+          "within_3sigma": 0.9963547995139733
+        },
+        "100": {
+          "n": 1572,
+          "median_px": 1.4471687862304208,
+          "within_2sigma": 0.9694656488549618,
+          "within_3sigma": 0.989821882951654
+        },
+        "50": {
+          "n": 2798,
+          "median_px": 1.5139366265798844,
+          "within_2sigma": 0.9335239456754825,
+          "within_3sigma": 0.9703359542530379
+        }
+      }
+    },
+    "blind-peaks-rotated": {
+      "search_seconds": 54.966588912997395,
+      "stable_observations": 918,
+      "sampled_observations": 918,
+      "candidate_scores": [
+        2.796228649202652,
+        2.783018480384581,
+        0.3127108354877447,
+        0.3871576530926352
+      ],
+      "selected_orientation_difference_deg": 0.28082417484989,
+      "supplied_orientation": false,
+      "supplied_fitted_calibration": false,
+      "status": "converged",
+      "final_orientation_difference_deg": 2.8782852007286527e-12,
+      "parameters_at_bounds": [],
+      "scan_motor": "CG4D:Mot:phi",
+      "scan_corrections_deg": [
+        0.0,
+        0.0,
+        0.0,
+        -0.15329661362392044,
+        -0.0764428011868753,
+        0.13091660543152533,
+        0.16596066132756207,
+        0.2070105247101156,
+        0.14705645197063325,
+        0.10126203254809418,
+        0.42009588387431995,
+        1.227500448638754,
+        2.419574097090772,
+        3.3914153052268543,
+        3.7023815223459966,
+        3.1327821242790344
+      ],
+      "pixel_validation": {
+        "200": {
+          "n": 823,
+          "median_px": 1.4540853100857096,
+          "within_2sigma": 0.9732685297691372,
+          "within_3sigma": 0.9963547995139733
+        },
+        "100": {
+          "n": 1572,
+          "median_px": 1.447168786238068,
+          "within_2sigma": 0.9694656488549618,
+          "within_3sigma": 0.989821882951654
+        },
+        "50": {
+          "n": 2798,
+          "median_px": 1.5139366265971732,
+          "within_2sigma": 0.9335239456754825,
+          "within_3sigma": 0.9703359542530379
+        }
+      }
+    },
+    "blind-counts-seed0": {
+      "search_seconds": 81.80798038374633,
+      "stable_observations": 1594944,
+      "sampled_observations": 16000,
+      "candidate_scores": [
+        0.011634583333161683,
+        0.002210480707486877,
+        0.016065238294656586,
+        0.005105601750186597,
+        0.0008471869762633957,
+        0.010046128866822625
+      ],
+      "selected_orientation_difference_deg": 147.2111622525968,
+      "supplied_orientation": false,
+      "supplied_fitted_calibration": false,
+      "status": "failed discovery; remaining local refinement interrupted",
+      "note": "Candidate differs from the validated seeded solution by more than the subsequent local orientation bounds can recover. No successful blind count solution is claimed."
+    },
+    "blind-deviance-seed0": {
+      "search_seconds": 75.00065028714016,
+      "stable_observations": 1594944,
+      "sampled_observations": 5958,
+      "candidate_scores": [
+        0.2123663224875069,
+        0.24100754681296677,
+        0.3706983486531955,
+        0.17184931757808045,
+        0.10783928402585624,
+        0.19179693145080595
+      ],
+      "selected_orientation_difference_deg": 103.87836248183135,
+      "supplied_orientation": false,
+      "supplied_fitted_calibration": false,
+      "status": "failed discovery; remaining local refinement interrupted",
+      "note": "Candidate differs from the validated seeded solution by more than the subsequent local orientation bounds can recover. No successful blind count solution is claimed."
+    },
+    "blind-radial-seed0": {
+      "search_seconds": 95.81880058487877,
+      "stable_observations": 1594944,
+      "sampled_observations": 5958,
+      "candidate_scores": [
+        0.0979996477234654,
+        1.1853916459359324,
+        0.004711425318124072,
+        0.06927840814142515,
+        0.005381805697913458,
+        0.07499247320887226
+      ],
+      "selected_orientation_difference_deg": 48.37893134449761,
+      "supplied_orientation": false,
+      "supplied_fitted_calibration": false,
+      "status": "failed discovery; remaining local refinement interrupted",
+      "note": "Candidate differs from the validated seeded solution by more than the subsequent local orientation bounds can recover. No successful blind count solution is claimed."
+    },
+    "blind-scanbg-seed0": {
+      "search_seconds": 81.20078726112843,
+      "stable_observations": 1594944,
+      "sampled_observations": 10804,
+      "candidate_scores": [
+        0.051317495980134284,
+        0.36312909848945635,
+        0.4732836071943381,
+        0.41559431591313617,
+        0.7205082828841206
+      ],
+      "selected_orientation_difference_deg": 78.78564321043778,
+      "supplied_orientation": false,
+      "supplied_fitted_calibration": false,
+      "status": "failed discovery; remaining local refinement interrupted",
+      "note": "Candidate differs from the validated seeded solution by more than the subsequent local orientation bounds can recover. No successful blind count solution is claimed."
+    }
+  }
+}

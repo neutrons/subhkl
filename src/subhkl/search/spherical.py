@@ -1537,7 +1537,7 @@ def refine_band_geometry(
     C = jnp.asarray(np.asarray(centers, np.float64))
     O = jnp.asarray(np.asarray(offsets, np.float64))
     w = jnp.asarray(np.asarray(weights, np.float64))
-    w = w / jnp.maximum(w.sum(), 1e-12)
+    w = w / jnp.maximum(jnp.abs(w).sum(), 1e-12)
     Rs = np.asarray(R_spots, np.float64)
     if Rs.ndim == 2:
         Rs = np.broadcast_to(Rs, (len(centers), 3, 3))

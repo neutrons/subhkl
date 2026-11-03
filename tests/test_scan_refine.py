@@ -178,3 +178,48 @@ def test_cg4d_omega_future_metadata_polarity():
     np.testing.assert_allclose(
         calc_goniometer_rotation_matrix(axes, angles), expected, atol=1e-12
     )
+
+
+def test_unseeded_count_path_is_not_advertised_as_working(inputs, tmp_path):
+    frames, _ = inputs
+    with pytest.raises(ValueError, match="blind band indexing requires --finder-peaks"):
+        run_scan_refinement(frames, tmp_path / "blind.h5")
+
+
+def test_missing_bootstrap_runs_blind_search_then_same_refinement(
+    inputs, tmp_path, monkeypatch
+):
+    frames, _ = inputs
+    finder = tmp_path / "finder.h5"
+    finder.touch()
+    output = tmp_path / "blind.h5"
+    seed = tmp_path / "blind.blind.h5"
+    seen = []
+
+    def discover(args, *budgets):
+        assert args.bootstrap is None
+        assert args.finder == finder
+        seen.append("search")
+        with h5py.File(seed, "w") as f:
+            f["sample/U"] = np.eye(3)
+        return str(seed)
+
+    def refine(args):
+        seen.append("refine")
+        assert args.bootstrap == args.blind_search == str(seed)
+        return {"status": "converged"}
+
+    monkeypatch.setattr("subhkl.search.blind_band.discover", discover)
+    monkeypatch.setattr("subhkl.search.scan_band.refine_scan", refine)
+    result = run_scan_refinement(frames, output, finder=finder)
+    assert result["status"] == "converged"
+    assert seen == ["search", "refine"]
+
+
+def test_generated_search_file_cannot_overwrite_finder(inputs, tmp_path):
+    frames, _ = inputs
+    finder = tmp_path / "result.blind.h5"
+    finder.write_bytes(b"do not overwrite")
+    with pytest.raises(ValueError, match="overwrite"):
+        run_scan_refinement(frames, tmp_path / "result.h5", finder=finder)
+    assert finder.read_bytes() == b"do not overwrite"
