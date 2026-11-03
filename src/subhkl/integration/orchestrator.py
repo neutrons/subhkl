@@ -149,10 +149,32 @@ def prepare_harvest_tasks(
                 "WARNING: --static-mask-file is only honored by the matrix-free finder."
             )
 
+        from subhkl.instrument.detector import Detector
+
+        det_cache: Dict[str, Detector] = {}
+        phys_banks = [str(bank_mapping.get(k, k)) for k in img_keys]
+        inst_cfg = beamlines.get(instrument, {})
+
+        def _two_theta_lookup(fi: int, row: float, col: float) -> float:
+            b_str = phys_banks[fi]
+            if b_str not in inst_cfg:
+                return 45.0
+            det = det_cache.get(b_str)
+            if det is None:
+                det = Detector(inst_cfg[b_str])
+                det_cache[b_str] = det
+            xyz = det.pixel_to_lab(np.array([row]), np.array([col]))[0]
+            norm = float(np.linalg.norm(xyz))
+            if norm <= 0.0:
+                return 0.0
+            return float(np.degrees(np.arccos(np.clip(xyz[2] / norm, -1.0, 1.0))))
+
         if valid_stack is not None:
-            batch_coords = alg.find_peaks_batch(img_stack, valid=valid_stack)
+            batch_coords = alg.find_peaks_batch(
+                img_stack, valid=valid_stack, two_theta=_two_theta_lookup
+            )
         else:
-            batch_coords = alg.find_peaks_batch(img_stack)
+            batch_coords = alg.find_peaks_batch(img_stack, two_theta=_two_theta_lookup)
         precomputed_peaks = {k: c for k, c in zip(img_keys, batch_coords, strict=False)}
         # Per-peak quality metrics, when the finder reports them (the
         batch_deviance = getattr(alg, "peak_deviance", None)
