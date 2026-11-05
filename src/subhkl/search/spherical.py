@@ -508,19 +508,17 @@ def _smoothing(L, sigma):
     return np.exp(-ell * (ell + 1.0) * sigma * sigma / 2.0)
 
 
-def project_points(dirs, weights, L, sigma, even_only=True):
+def project_points(dirs, weights, L, sigma, even_only=True, chunk=2048):
     """SH coefficients of a sum of smoothed deltas.  f[l, m + L] complex.
 
     f_lm = sum_j w_j conj(Y_lm(dir_j)) s_l -- a direct nonuniform sum; no
     spherical grid.  even_only drops odd degrees (antipodal symmetry).
+    Chunked over directions via project_counts so high-bandwidth dictionaries
+    (e.g. L = 192 with 15k-65k directions) do not materialize a multi-GB
+    (L+1, 2L+1, N) complex128 array at once.
     """
     w = np.ones(len(dirs)) if weights is None else np.asarray(weights, dtype=float)
-    Y = sph_harm_all(L, dirs)
-    f = np.einsum("lmj,j->lm", np.conj(Y), w)
-    f *= _smoothing(L, sigma)[:, None]
-    if even_only:
-        f[1::2] = 0.0
-    return f
+    return project_counts(dirs, w, L, sigma, even_only=even_only, chunk=chunk)
 
 
 def project_counts(pixel_dirs, excess, L, sigma, even_only=True, chunk=8192):

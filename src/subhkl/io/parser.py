@@ -421,27 +421,6 @@ def finder(
             "CUDA_VISIBLE_DEVICES.",
         ),
     ] = False,
-    lattice_sparse_bins: Annotated[
-        int,
-        typer.Option(
-            "--lattice-sparse-bins",
-            help="Raw-count lattice path: the exhaustive rung sees every live "
-            "bin through the band table; the zoom rungs, the exact stage and "
-            "the geometry co-refinement take this many strongest bins by "
-            "|excess| (a cost cap, not a detection threshold).",
-        ),
-    ] = 8192,
-    corefine: Annotated[
-        bool,
-        typer.Option(
-            "--corefine/--no-corefine",
-            help="Lattice path: co-refine the global detector geometry (radial "
-            "scale, rotation, translation) with each candidate on the band "
-            "objective, adopt the winner's geometry and re-search the "
-            "orientation under it.  What indexes cg4d-l1-mbl, whose nominal "
-            "assembly is off by ~5%% and ~2 deg.",
-        ),
-    ] = True,
     static_mask_file: Annotated[
         str | None,
         typer.Option(
@@ -482,8 +461,6 @@ def finder(
         sparse_rbf_loss=sparse_rbf_loss,
         max_workers=max_workers,
         multi_gpu=multi_gpu,
-        lattice_sparse_bins=lattice_sparse_bins,
-        corefine=corefine,
         static_mask_file=static_mask_file,
     )
 

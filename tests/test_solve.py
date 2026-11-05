@@ -65,14 +65,15 @@ def scene(tmp_path_factory):
 
 def test_cli_has_only_unified_entry_point():
     runner = CliRunner()
-    out = runner.invoke(app, ["--help"])
+    env = {"COLUMNS": "120", "NO_COLOR": "1"}
+    out = runner.invoke(app, ["--help"], env=env)
     assert out.exit_code == 0, out.output
     names = [
         c.name or c.callback.__name__.replace("_", "-") for c in app.registered_commands
     ]
     assert "solve" in names
     assert "calibrate" not in names and "spherical-index" not in names
-    out = runner.invoke(app, ["solve", "--help"])
+    out = runner.invoke(app, ["solve", "--help"], env=env)
     assert out.exit_code == 0, out.output
     assert "--profile-file" in out.output
 
