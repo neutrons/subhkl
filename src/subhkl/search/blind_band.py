@@ -3,13 +3,13 @@
 from pathlib import Path
 import time
 
-import gemmi
 import h5py
 import jax.numpy as jnp
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from subhkl.config import beamlines
+from subhkl.core.spacegroup import get_space_group_object
 from subhkl.instrument.detector import Detector
 from subhkl.scan_refine import load_observations
 from subhkl.search.scan_band import band_sum, build_B_jax, direct_lattice_uvw
@@ -40,7 +40,7 @@ def sample_signed(weights, size, seed=0):
 def distinct_orientations(candidates, B, space_group, count, separation_deg=1.0):
     """Remove duplicates under proper crystallographic rotations."""
     operations = []
-    for op in gemmi.SpaceGroup(space_group).operations().sym_ops:
+    for op in get_space_group_object(space_group).operations().sym_ops:
         S = B @ np.linalg.inv(np.asarray(op.rot) / op.DEN).T @ np.linalg.inv(B)
         if np.linalg.det(S) > 0:
             operations.append(S)
@@ -81,8 +81,8 @@ def discover(args, samples=16384, candidates=6, seed=0):
     same winning global geometry, not each candidate's preferred detector.
     """
     start = time.monotonic()
-    observations = load_observations(args)
-    banks, rows, cols, dev, _, runs, angles, weights = observations
+    observations = load_observations(args, return_kinematics=True)
+    banks, rows, cols, dev, _, runs, _angles, weights, R_obs, _scan_axes = observations
     use = np.isin(runs, args.stable_runs)
     if args.finder:
         use &= dev >= args.min_deviance
@@ -91,23 +91,19 @@ def discover(args, samples=16384, candidates=6, seed=0):
     else:
         search_weights = count_search_weights(dev[use])
         weighting_desc = "smooth chi2-suppressed bin Poisson deviance"
-    banks, rows, cols, angles = [v[use] for v in (banks, rows, cols, angles)]
+    banks, rows, cols, Rs = [v[use] for v in (banks, rows, cols, R_obs)]
     weights = search_weights
     idx, sampled_weights = sample_signed(weights, samples, seed)
-    scan_col = int(np.argmax(np.ptp(angles, axis=0)))
-    Rs = Rotation.from_rotvec(
-        -np.deg2rad(angles[:, scan_col])[:, None] * [0, 1, 0]
-    ).as_matrix()
     C, O = np.empty((len(weights), 3)), np.empty((len(weights), 3))
     for bank in np.unique(banks):
         m = banks == bank
         det = Detector(dict(beamlines[args.instrument][str(bank)]))
         C[m] = det.center
-        O[m] = (cols[m] / 511 * det.width)[:, None] * det.uhat + (
-            rows[m] / 511 * det.height
+        O[m] = (cols[m] / (det.m - 1) * det.width)[:, None] * det.uhat + (
+            rows[m] / (det.n - 1) * det.height
         )[:, None] * det.vhat
     Cs, Os, rotations = C[idx], O[idx], Rs[idx]
-    B = np.asarray(build_B_jax(*args.cell[:3], np.deg2rad(args.cell[4])))
+    B = np.asarray(build_B_jax(*args.cell[:3], *np.deg2rad(args.cell[3:])))
     wavelength = (args.wl_min, args.wl_max)
     print(
         f"Blind band search: {len(weights)} stable-run observations, {len(idx)} search observations",

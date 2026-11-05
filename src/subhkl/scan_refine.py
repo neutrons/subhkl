@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import h5py
 import numpy as np
 from scipy.ndimage import median_filter
+from scipy.spatial.transform import Rotation
 
+from subhkl.config import beamlines
+from subhkl.core.spacegroup import get_space_group_object
+from subhkl.instrument.detector import Detector, DetectorShape
 from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
 
 MODES = frozenset(
@@ -24,6 +28,83 @@ MODES = frozenset(
         "panels",
     ]
 )
+
+
+def _frame_offsets(f, n_frames):
+    if "file_offsets" not in f:
+        return np.array([0], dtype=int)
+    offsets = np.asarray(f["file_offsets"][()], int)
+    if (
+        offsets.ndim != 1
+        or len(offsets) == 0
+        or offsets[0] != 0
+        or np.any(np.diff(offsets) <= 0)
+        or offsets[-1] >= n_frames
+    ):
+        raise ValueError("invalid frame file_offsets")
+    return offsets
+
+
+def _frame_rotations_and_scan_axes(f, n_frames):
+    """Return nominal per-frame rotations, scan-axis index, and lab scan axes."""
+    has_angles = "goniometer/angles" in f
+    has_axes = "goniometer/axes" in f
+    axes = np.asarray(f["goniometer/axes"][()], float) if has_axes else None
+    angles = np.asarray(f["goniometer/angles"][()], float) if has_angles else None
+    if angles is not None:
+        if axes is None:
+            raise ValueError("goniometer angles require axes")
+        if (
+            axes.ndim != 2
+            or axes.shape[1] != 4
+            or not np.isfinite(axes).all()
+            or np.any(np.linalg.norm(axes[:, :3], axis=1) == 0)
+        ):
+            raise ValueError("invalid goniometer axes")
+        if angles.ndim == 1 and len(angles) == len(axes):
+            angles = np.repeat(angles[None, :], n_frames, axis=0)
+        if angles.shape != (n_frames, len(axes)) or not np.isfinite(angles).all():
+            raise ValueError("goniometer angles must be frame-addressed")
+        ptp = np.ptp(angles, axis=0)
+        scan_col = int(np.argmax(ptp)) if np.any(ptp > 0) else len(axes) - 1
+        actual = np.stack([calc_goniometer_rotation_matrix(axes, a) for a in angles])
+        u_k = axes[scan_col, :3] / np.linalg.norm(axes[scan_col, :3])
+        signed_u = axes[scan_col, 3] * u_k
+        if scan_col == 0:
+            scan_axes_lab = np.repeat(signed_u[None, :], n_frames, axis=0)
+        else:
+            R_outer = np.stack(
+                [
+                    calc_goniometer_rotation_matrix(axes[:scan_col], a[:scan_col])
+                    for a in angles
+                ]
+            )
+            scan_axes_lab = R_outer @ signed_u
+    else:
+        scan_col = None
+        actual = None
+        scan_axes_lab = np.repeat(np.array([[0.0, -1.0, 0.0]]), n_frames, axis=0)
+
+    if "goniometer/R" in f:
+        R = np.asarray(f["goniometer/R"][()], float)
+        if R.ndim == 2 and R.shape == (3, 3):
+            R = np.repeat(R[None, :, :], n_frames, axis=0)
+        if R.shape != (n_frames, 3, 3) or not np.isfinite(R).all():
+            raise ValueError("goniometer R must be frame-addressed")
+        if actual is not None and not np.allclose(R, actual, atol=1e-6):
+            raise ValueError(
+                "stored R disagrees with axes/angles; correct historical metadata"
+            )
+    elif actual is not None:
+        R = actual
+    else:
+        R = np.repeat(np.eye(3)[None, :, :], n_frames, axis=0)
+
+    if not np.allclose(R @ R.swapaxes(1, 2), np.eye(3), atol=1e-6) or not np.allclose(
+        np.linalg.det(R), 1.0, atol=1e-6
+    ):
+        raise ValueError("goniometer R must contain proper rotations")
+    return R, axes, angles, scan_col, scan_axes_lab
 
 
 def run_scan_refinement(
@@ -59,10 +140,11 @@ def run_scan_refinement(
     """
     if search_samples < 1 or search_candidates < 1 or search_seed < 0:
         raise ValueError("invalid blind search budget or seed")
-    if instrument != "CG4D":
-        raise ValueError(
-            "staged band refinement currently supports CG4D vertical scans"
-        )
+    if instrument not in beamlines:
+        raise ValueError(f"unknown instrument: {instrument}")
+    dets = {int(k): Detector(dict(cfg)) for k, cfg in beamlines[instrument].items()}
+    if any(det.panel_type != DetectorShape.flat_panel for det in dets.values()):
+        raise ValueError("staged band refinement requires flat-panel detectors")
     destinations = {
         Path(output).resolve(),
         Path(output).with_suffix(".stages.h5").resolve(),
@@ -81,8 +163,6 @@ def run_scan_refinement(
         raise ValueError(
             "invalid band refinement budget, zones, resolution or deviance"
         )
-    if binning < 1 or 512 % binning:
-        raise ValueError("band binning must divide the detector size (512)")
     for band in (wavelength, assignment_wavelength):
         if not 0 < band[0] < band[1]:
             raise ValueError("wavelength bounds must be positive and increasing")
@@ -104,40 +184,20 @@ def run_scan_refinement(
                 raise ValueError(
                     "fold global goniometer offsets into angles before band refinement"
                 )
-        if f["images"].shape[1:] != (512, 512):
-            raise ValueError("staged band refinement currently requires 512x512 panels")
-        axes = np.asarray(f["goniometer/axes"], float)
-        angles = np.asarray(f["goniometer/angles"], float)
-        offsets = np.asarray(f["file_offsets"], int)
-        if len(angles) != len(f["images"]):
-            raise ValueError("goniometer angles must be frame-addressed")
-        if (
-            offsets[0] != 0
-            or np.any(np.diff(offsets) <= 0)
-            or offsets[-1] >= len(angles)
-        ):
-            raise ValueError("invalid frame file_offsets")
-        scan_col = int(np.argmax(np.ptp(angles, axis=0)))
-        if not np.allclose(axes[scan_col], [0, 1, 0, -1]):
+        img_shape = f["images"].shape
+        if len(img_shape) != 3:
+            raise ValueError("images must be a 3D stack (n_frames, n_rows, n_cols)")
+        n_frames, n_rows, n_cols = (
+            int(img_shape[0]),
+            int(img_shape[1]),
+            int(img_shape[2]),
+        )
+        if binning < 1 or n_rows % binning or n_cols % binning:
             raise ValueError(
-                "band scan requires a vertical negative-polarity axis; correct historical metadata explicitly"
+                f"band binning ({binning}) must divide the detector size ({n_rows}x{n_cols})"
             )
-        from scipy.spatial.transform import Rotation
-
-        expected = Rotation.from_rotvec(
-            np.deg2rad(-angles[:, scan_col])[:, None] * np.array([0, 1, 0])
-        ).as_matrix()
-        actual = np.stack([calc_goniometer_rotation_matrix(axes, a) for a in angles])
-        if not np.allclose(expected, actual, atol=1e-7):
-            raise ValueError(
-                "staged band refinement currently requires a single vertical rotation"
-            )
-        if "goniometer/R" in f and not np.allclose(
-            f["goniometer/R"], actual, atol=1e-7
-        ):
-            raise ValueError(
-                "stored R disagrees with axes/angles; correct historical metadata"
-            )
+        offsets = _frame_offsets(f, n_frames)
+        _frame_rotations_and_scan_axes(f, n_frames)
         if cell is None:
             cell = [
                 float(f[f"sample/{k}"][()])
@@ -147,10 +207,15 @@ def run_scan_refinement(
             space_group = f["sample/space_group"][()]
             if isinstance(space_group, bytes):
                 space_group = space_group.decode()
-    if not np.isfinite(cell).all() or len(cell) != 6 or min(cell[:3]) <= 0:
+    if (
+        not np.isfinite(cell).all()
+        or len(cell) != 6
+        or min(cell[:3]) <= 0
+        or min(cell[3:]) <= 0
+        or max(cell[3:]) >= 180
+    ):
         raise ValueError("invalid cell")
-    if not np.allclose([cell[3], cell[5]], [90, 90]):
-        raise ValueError("cell refinement currently supports monoclinic unique-b cells")
+    get_space_group_object(space_group)
     selected = list(range(len(offsets))) if runs is None else list(runs)
     stable = selected if stable_runs is None else list(stable_runs)
     if not selected or not stable or not set(stable) <= set(selected):
@@ -195,47 +260,63 @@ def run_scan_refinement(
         return refine_scan(args)
 
 
-def load_observations(args):
+def load_observations(args, *, return_kinematics=False):
     with h5py.File(args.nexus) as f:
-        angles = np.asarray(f["goniometer/angles"], float)
-        frame_banks = np.asarray(f["bank_ids"], int)
-        run_ids = (
-            np.searchsorted(f["file_offsets"][()], np.arange(len(angles)), side="right")
-            - 1
+        img_shape = f["images"].shape
+        n_frames, n_rows, n_cols = (
+            int(img_shape[0]),
+            int(img_shape[1]),
+            int(img_shape[2]),
         )
+        offsets = _frame_offsets(f, n_frames)
+        R_frames, _, angles, _, scan_axes_lab = _frame_rotations_and_scan_axes(
+            f, n_frames
+        )
+        if angles is None:
+            angles = np.zeros((n_frames, 1), dtype=float)
+        frame_banks = np.asarray(f["bank_ids"], int)
+        run_ids = np.searchsorted(offsets, np.arange(n_frames), side="right") - 1
         if args.finder:
             with h5py.File(args.finder) as peaks:
                 images = np.asarray(peaks["peaks/image_index"], int)
                 banks = np.asarray(peaks["bank"], int)
-                if np.any(images < 0) or np.any(images >= len(angles)):
+                if np.any(images < 0) or np.any(images >= n_frames):
                     raise ValueError(
                         "finder image_index must address the source frames"
                     )
                 if not np.array_equal(frame_banks[images], banks):
                     raise ValueError("finder banks do not match source image_index")
                 dev = np.asarray(peaks["peaks/deviance"], float)
+                scale_px = 0.5 * ((n_rows - 1) + (n_cols - 1))
                 result = (
                     banks,
                     peaks["peaks/pixel_r"][()],
                     peaks["peaks/pixel_c"][()],
                     dev,
-                    peaks["peaks/radius"][()] * 511,
+                    peaks["peaks/radius"][()] * scale_px,
                     run_ids[images],
                     angles[images],
                     np.sqrt(np.maximum(dev, 0)),
                 )
+                kinematics = (R_frames[images], scan_axes_lab[images])
         else:
             # No connected components, local maxima or signal qualification.
             # All instrument-valid bins contribute, including negative excess.
-            b = args.binning
-            centers = np.arange(512 // b) * b + (b - 1) / 2
-            rr, cc = np.meshgrid(centers, centers, indexing="ij")
+            b = int(args.binning)
+            if n_rows % b or n_cols % b:
+                raise ValueError(
+                    f"band binning ({b}) must divide the detector size ({n_rows}x{n_cols})"
+                )
+            centers_r = np.arange(n_rows // b) * b + (b - 1) / 2
+            centers_c = np.arange(n_cols // b) * b + (b - 1) / 2
+            rr, cc = np.meshgrid(centers_r, centers_c, indexing="ij")
             collected = [[] for _ in range(8)]
+            collected_kin = [[], []]
             mask_file = (
                 h5py.File(args.static_mask_file) if args.static_mask_file else None
             )
             try:
-                for i in range(len(angles)):
+                for i in range(n_frames):
                     if run_ids[i] not in args.runs:
                         continue
                     raw = np.asarray(f["images"][i], float)
@@ -249,10 +330,10 @@ def load_observations(args):
                         valid &= np.asarray(mask_file[key][matches[0]], bool)
                     y = (
                         np.where(valid, raw, 0)
-                        .reshape(512 // b, b, 512 // b, b)
+                        .reshape(n_rows // b, b, n_cols // b, b)
                         .sum((1, 3))
                     )
-                    good = valid.reshape(512 // b, b, 512 // b, b).all((1, 3))
+                    good = valid.reshape(n_rows // b, b, n_cols // b, b).all((1, 3))
                     bg = median_filter(y, size=7, mode="nearest")
                     weight = y - bg
                     bg_5 = median_filter(y, size=5, mode="nearest")
@@ -276,7 +357,12 @@ def load_observations(args):
                     )
                     for dest, value in zip(collected, values):
                         dest.append(value)
+                    collected_kin[0].append(np.repeat(R_frames[i : i + 1], n, axis=0))
+                    collected_kin[1].append(
+                        np.repeat(scan_axes_lab[i : i + 1], n, axis=0)
+                    )
                 result = tuple(np.concatenate(v) for v in collected)
+                kinematics = tuple(np.concatenate(v) for v in collected_kin)
             finally:
                 if mask_file is not None:
                     mask_file.close()
@@ -293,6 +379,8 @@ def load_observations(args):
         f"{'finder peaks' if args.finder else 'all signed count residuals'}",
         flush=True,
     )
+    if return_kinematics:
+        return result + kinematics
     return result
 
 
@@ -358,32 +446,41 @@ def write_result(
                 del out["sample/U"]
             put("sample/B", B)
             put("instrument/wavelength", args.assign_wavelength)
-            angles = np.asarray(source["goniometer/angles"], float)
-            axes = source["goniometer/axes"][()]
-            run_ids = (
-                np.searchsorted(
-                    source["file_offsets"][()], np.arange(len(angles)), side="right"
-                )
-                - 1
+            n_frames = int(source["images"].shape[0])
+            offsets = _frame_offsets(source, n_frames)
+            if "file_offsets" not in out:
+                put("file_offsets", offsets)
+            R_nom, axes, angles, col, scan_axes_lab = _frame_rotations_and_scan_axes(
+                source, n_frames
             )
-            col = int(np.argmax(np.ptp(angles, axis=0)))
-            corrected = angles.copy()
-            corrected[:, col] += delta[run_ids]
-            put("goniometer/angles_nominal", angles)
-            put("goniometer/angles", corrected)
-            put(
-                "goniometer/R",
-                np.stack([calc_goniometer_rotation_matrix(axes, a) for a in corrected]),
-            )
-            shifts = np.zeros((len(axes), 3))
-            shifts[-1] = sample
-            put("goniometer/translations", shifts)
+            run_ids = np.searchsorted(offsets, np.arange(n_frames), side="right") - 1
             if "goniometer/per_run" in out:
                 del out["goniometer/per_run"]
-            changes = np.zeros((args.n_runs, len(axes)))
-            changes[:, col] = delta
-            put("goniometer/per_run/delta_deg_all_axes", changes)
-            put("goniometer/per_run/frame_to_run", run_ids)
+            if angles is not None and axes is not None and col is not None:
+                corrected = angles.copy()
+                corrected[:, col] += delta[run_ids]
+                put("goniometer/angles_nominal", angles)
+                put("goniometer/angles", corrected)
+                put(
+                    "goniometer/R",
+                    np.stack(
+                        [calc_goniometer_rotation_matrix(axes, a) for a in corrected]
+                    ),
+                )
+                shifts = np.zeros((len(axes), 3))
+                shifts[-1] = sample
+                put("goniometer/translations", shifts)
+                changes = np.zeros((args.n_runs, len(axes)))
+                changes[:, col] = delta
+                put("goniometer/per_run/delta_deg_all_axes", changes)
+                put("goniometer/per_run/frame_to_run", run_ids)
+            else:
+                d_rot = Rotation.from_rotvec(
+                    np.deg2rad(delta[run_ids])[:, None] * scan_axes_lab
+                ).as_matrix()
+                put("goniometer/R", np.einsum("nij,njk->nik", d_rot, R_nom))
+                put("goniometer/translations", np.asarray(sample, float))
+                put("goniometer/per_run/frame_to_run", run_ids)
             for i, bank in enumerate(banks):
                 for key, value in (
                     ("center", centers[i]),

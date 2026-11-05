@@ -245,3 +245,138 @@ def test_generated_search_file_cannot_overwrite_finder(inputs, tmp_path):
     with pytest.raises(ValueError, match="overwrite"):
         run_scan_refinement(frames, tmp_path / "result.h5", finder=finder)
     assert finder.read_bytes() == b"do not overwrite"
+
+
+def test_mandi_256_panel_multi_axis_goniometer_and_trigonal_cell(tmp_path):
+    frames, bootstrap = tmp_path / "mandi_counts.h5", tmp_path / "mandi_seed.h5"
+    axes = np.array([[0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0]])
+    angles = np.array([[26.0, 90.0, 0.0], [26.0, 90.0, 20.0]])
+    counts = np.full((2, 256, 256), 3.0)
+    counts[0, :32, :32] = 1.0
+    counts[1, :32, :32] = 5.0
+    with h5py.File(frames, "w") as f:
+        f["images"] = counts
+        f["bank_ids"] = [20, 20]
+        f["file_offsets"] = [0, 1]
+        f["goniometer/axes"] = axes
+        f["goniometer/angles"] = angles
+        f["goniometer/names"] = [b"omega", b"chi", b"phi"]
+        for k, v in zip(
+            ("a", "b", "c", "alpha", "beta", "gamma"),
+            [61.5, 61.5, 95.9, 90.0, 90.0, 120.0],
+        ):
+            f[f"sample/{k}"] = v
+        f["sample/space_group"] = "P3_221"
+    with h5py.File(bootstrap, "w") as f:
+        f["sample/U"] = np.eye(3)
+
+    obs = load_observations(
+        SimpleNamespace(
+            nexus=frames,
+            finder=None,
+            runs=[0, 1],
+            stable_runs=[0],
+            binning=32,
+            static_mask_file=None,
+        )
+    )
+    assert len(obs[0]) == 128
+    assert obs[1].min() == obs[2].min() == 15.5
+    assert obs[1].max() == obs[2].max() == 239.5
+
+    output = tmp_path / "mandi_band.h5"
+    result = run_scan_refinement(
+        frames,
+        output,
+        bootstrap=bootstrap,
+        instrument="MANDI",
+        wavelength=(2.0, 4.0),
+        assignment_wavelength=(2.0, 4.0),
+        runs=[0, 1],
+        stable_runs=[0],
+        modes=["cell", "per_run"],
+        maxiter=1,
+        n_zones=60,
+        binning=32,
+    )
+    assert result["status"] in ("converged", "not_converged")
+    with h5py.File(output) as f:
+        assert f.attrs["instrument"] == "MANDI"
+        np.testing.assert_allclose(
+            f["sample/a"][()], f["sample/b"][()], rtol=1e-12, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            [f["sample/alpha"][()], f["sample/beta"][()], f["sample/gamma"][()]],
+            [90.0, 90.0, 120.0],
+            atol=1e-12,
+        )
+        bounds = f["scan_refinement/parameter_bounds"][()]
+        # Hexagonal/trigonal cell: only da (slot 15) is free; db (16) and dtheta (17) are locked
+        assert bounds[15, 0] < bounds[15, 1]
+        np.testing.assert_array_equal(bounds[16], [0.0, 0.0])
+        np.testing.assert_array_equal(bounds[17], [0.0, 0.0])
+        R, _, runs_out, angles_out, changed = frame_kinematics(
+            f, 2, f["file_offsets"][()]
+        )
+        assert not changed
+        np.testing.assert_array_equal(runs_out, [0, 1])
+        expected = [
+            calc_goniometer_rotation_matrix(f["goniometer/axes"][()], a)
+            for a in angles_out
+        ]
+        np.testing.assert_allclose(R, expected, atol=1e-12)
+
+
+@pytest.mark.parametrize(
+    "cell,sg,expected_free",
+    [
+        ([11.93, 11.93, 11.93, 90.0, 90.0, 90.0], "Ia-3d", ()),
+        ([79.1, 79.1, 37.9, 90.0, 90.0, 90.0], "P4_32_12", (0,)),
+        ([18.39, 56.55, 6.54, 90.0, 90.0, 90.0], "Fdd2", (0, 1)),
+        ([68.84, 98.07, 90.92, 90.0, 106.11, 90.0], "P21", (0, 1, 2)),
+    ],
+)
+def test_cell_symmetry_constraints(cell, sg, expected_free):
+    from subhkl.search.scan_band import _cell_symmetry_spec
+
+    _, active = _cell_symmetry_spec(cell, sg)
+    assert active == expected_free
+
+
+def test_single_run_support_without_file_offsets(tmp_path):
+    frames, bootstrap = tmp_path / "single.h5", tmp_path / "seed.h5"
+    counts = np.full((1, 256, 256), 3.0)
+    counts[0, :32, :32] = 6.0
+    cell = [18.39, 56.55, 6.54, 90.0, 90.0, 90.0]
+    with h5py.File(frames, "w") as f:
+        f["images"] = counts
+        f["bank_ids"] = [20]
+        f["goniometer/axes"] = np.array([[0.0, 1.0, 0.0, -1.0]])
+        f["goniometer/angles"] = np.array([[35.0]])
+        for k, v in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            f[f"sample/{k}"] = v
+        f["sample/space_group"] = "Fdd2"
+    with h5py.File(bootstrap, "w") as f:
+        f["sample/U"] = np.eye(3)
+
+    output = tmp_path / "single_out.h5"
+    result = run_scan_refinement(
+        frames,
+        output,
+        bootstrap=bootstrap,
+        instrument="MANDI",
+        modes=["cell", "per_run", "sample"],
+        maxiter=1,
+        n_zones=60,
+        binning=32,
+    )
+    assert result["status"] in ("converged", "not_converged")
+    with h5py.File(output) as f:
+        np.testing.assert_array_equal(f["file_offsets"][()], [0])
+        bounds = f["scan_refinement/parameter_bounds"][()]
+        # Single run: per_run drift (index 18) and sample shift (indices 12..14) are gauge-fixed
+        np.testing.assert_array_equal(bounds[12:15], np.zeros((3, 2)))
+        np.testing.assert_array_equal(bounds[18], [0.0, 0.0])
+        assert bounds[15, 0] < bounds[15, 1]
+        assert bounds[16, 0] < bounds[16, 1]
+        np.testing.assert_array_equal(bounds[17], [0.0, 0.0])

@@ -1,10 +1,4 @@
-"""Staged zone-band and fixed-assignment pixel refinement.
-
-Adapted from the betalac-3 reference experiment (refine_betalac3.py).
-The experimental scope is a monoclinic cell and a vertical single-axis scan.
-Input selection, mode configuration, provenance and native HDF5 output are
-handled by scan_refine; the band objective also accepts signed count residuals.
-"""
+"""Staged zone-band and fixed-assignment pixel refinement."""
 
 import h5py
 import jax
@@ -16,6 +10,7 @@ from subhkl.config import beamlines
 from subhkl.core.crystallography import (
     generate_reflections,
 )
+from subhkl.core.spacegroup import get_space_group_object
 from subhkl.instrument.detector import Detector
 
 
@@ -56,6 +51,27 @@ def rodrigues_jax(rv):
     return jnp.eye(3) + jnp.sin(th) * K + (1.0 - jnp.cos(th)) * (K @ K)
 
 
+def rodrigues_batch_jax(rv):
+    th = jnp.sqrt(jnp.sum(rv * rv, axis=-1, keepdims=True) + 1e-30)
+    k = rv / th
+    kx, ky, kz = k[:, 0], k[:, 1], k[:, 2]
+    z = jnp.zeros_like(kx)
+    K = jnp.stack(
+        [
+            jnp.stack([z, -kz, ky], axis=-1),
+            jnp.stack([kz, z, -kx], axis=-1),
+            jnp.stack([-ky, kx, z], axis=-1),
+        ],
+        axis=-2,
+    )
+    th2 = th[..., None]
+    return (
+        jnp.eye(3)[None, :, :]
+        + jnp.sin(th2) * K
+        + (1.0 - jnp.cos(th2)) * jnp.matmul(K, K)
+    )
+
+
 def ewald_directions(G_lab):
     """Outgoing rays with finite derivatives for unassigned hkl=0 rows."""
     G_sq = jnp.sum(G_lab**2, axis=1)
@@ -76,16 +92,66 @@ def parameter_units(n_runs, n_banks):
     ]
 
 
-def build_B_jax(a, b, c, beta_rad):
-    sb = jnp.sin(beta_rad)
-    cb = jnp.cos(beta_rad)
-    return jnp.array(
+def build_B_jax(a, b, c, alpha_rad, beta_rad=None, gamma_rad=None):
+    """Upper-triangular reciprocal-cell matrix matching cartesian_matrix_metric_tensor."""
+    if beta_rad is None:
+        beta_rad = alpha_rad
+        alpha_rad = gamma_rad = jnp.pi / 2.0
+    ca, cb, cg = jnp.cos(alpha_rad), jnp.cos(beta_rad), jnp.cos(gamma_rad)
+    G = jnp.array(
         [
-            [1.0 / (a * sb), 0.0, -cb / (c * sb)],
-            [0.0, 1.0 / b, 0.0],
-            [0.0, 0.0, 1.0 / c],
+            [a * a, a * b * cg, a * c * cb],
+            [a * b * cg, b * b, b * c * ca],
+            [a * c * cb, b * c * ca, c * c],
         ]
     )
+    return jnp.linalg.cholesky(jnp.linalg.inv(G)).T
+
+
+def _cell_symmetry_spec(cell, space_group):
+    """Determine active cell-shape slots in (da, db, dtheta) and angle mapping."""
+    a0, b0, c0, al0, be0, ga0 = [float(v) for v in cell]
+    sg = get_space_group_object(space_group)
+    sys_str = str(sg.crystal_system()).split(".")[-1].lower()
+    centering = sg.centring_type()
+    if sys_str == "cubic":
+        return "cubic", ()
+    if sys_str == "tetragonal":
+        return "tetragonal", (0,)
+    if sys_str == "hexagonal":
+        return "hexagonal", (0,)
+    if sys_str == "trigonal":
+        if (
+            centering == "R"
+            and np.allclose([a0, b0], [c0, c0], atol=0.05)
+            and np.allclose([al0, be0], [ga0, ga0], atol=0.5)
+        ):
+            return "rhombohedral", (2,)
+        return "hexagonal", (0,)
+    if sys_str == "orthorhombic":
+        return "orthorhombic", (0, 1)
+    if sys_str == "monoclinic":
+        non90 = int(np.argmax(np.abs(np.array([al0, be0, ga0]) - 90.0)))
+        return f"monoclinic_{non90}", (0, 1, 2)
+    return "triclinic", (0, 1, 2)
+
+
+def _apply_cell_jax(cell0, symmetry_kind, da, db, dtheta):
+    a0, b0, c0, al0, be0, ga0 = [float(v) for v in cell0]
+    al_r, be_r, ga_r = np.deg2rad([al0, be0, ga0])
+    if symmetry_kind == "cubic":
+        return a0, b0, c0, al_r, be_r, ga_r
+    if symmetry_kind in ("tetragonal", "hexagonal"):
+        return a0 * (1.0 + da), b0 * (1.0 + da), c0, al_r, be_r, ga_r
+    if symmetry_kind == "rhombohedral":
+        return a0, b0, c0, al_r + dtheta, be_r + dtheta, ga_r + dtheta
+    if symmetry_kind == "orthorhombic":
+        return a0 * (1.0 + da), b0 * (1.0 + db), c0, al_r, be_r, ga_r
+    if symmetry_kind == "monoclinic_0":
+        return a0 * (1.0 + da), b0 * (1.0 + db), c0, al_r + dtheta, be_r, ga_r
+    if symmetry_kind == "monoclinic_2":
+        return a0 * (1.0 + da), b0 * (1.0 + db), c0, al_r, be_r, ga_r + dtheta
+    return a0 * (1.0 + da), b0 * (1.0 + db), c0, al_r, be_r + dtheta, ga_r
 
 
 def direct_lattice_uvw(B, max_index=6):
@@ -129,15 +195,15 @@ def refine_scan(args):
         if U0.ndim == 3:
             U0 = U0[0]
 
-    a0, b0, c0, _, beta0, _ = args.cell
-    beta0_rad = np.deg2rad(beta0)
+    cell0 = [float(v) for v in args.cell]
+    symmetry_kind, active_cell_slots = _cell_symmetry_spec(cell0, args.space_group)
     B0 = np.asarray(
-        build_B_jax(a0, b0, c0, beta0_rad),
+        build_B_jax(*cell0[:3], *np.deg2rad(cell0[3:])),
         dtype=np.float64,
     )
 
-    obs = load_observations(args)
-    banks, pr, pc, dev, sig_px, runs, angs, spot_weights = obs
+    obs = load_observations(args, return_kinematics=True)
+    banks, pr, pc, dev, sig_px, runs, _angs, spot_weights, R_obs, scan_axes_obs = obs
     n_runs = args.n_runs
     bank_ids = sorted(int(k) for k in beamlines[args.instrument].keys())
     bank_to_idx = {b: i for i, b in enumerate(bank_ids)}
@@ -149,12 +215,12 @@ def refine_scan(args):
     vhat_bank = np.array([dets[b].vhat for b in bank_ids])
     W_bank = np.array([dets[b].width for b in bank_ids])
     H_bank = np.array([dets[b].height for b in bank_ids])
+    M_bank = np.array([float(dets[b].m - 1) for b in bank_ids])
+    N_bank = np.array([float(dets[b].n - 1) for b in bank_ids])
 
     b_idx_all = np.array([bank_to_idx[b] for b in banks], dtype=np.int32)
-    u_off_all = W_bank[b_idx_all] * (pc / 511.0)
-    v_off_all = H_bank[b_idx_all] * (pr / 511.0)
-    scan_col = int(np.argmax(np.ptp(angs, axis=0)))
-    om_rad_all = np.deg2rad(angs[:, scan_col])
+    u_off_all = W_bank[b_idx_all] * (pc / M_bank[b_idx_all])
+    v_off_all = H_bank[b_idx_all] * (pr / N_bank[b_idx_all])
 
     sel = np.isin(runs, args.runs)
     if args.finder:
@@ -162,7 +228,8 @@ def refine_scan(args):
     b_idx = jnp.asarray(b_idx_all[sel], dtype=jnp.int32)
     u_off = jnp.asarray(u_off_all[sel], dtype=jnp.float64)
     v_off = jnp.asarray(v_off_all[sel], dtype=jnp.float64)
-    om_rad = jnp.asarray(om_rad_all[sel], dtype=jnp.float64)
+    R0_j = jnp.asarray(R_obs[sel], dtype=jnp.float64)
+    e_scan_j = jnp.asarray(scan_axes_obs[sel], dtype=jnp.float64)
     r_idx = jnp.asarray(runs[sel], dtype=jnp.int32)
     w_j = jnp.asarray(
         spot_weights[sel] / np.abs(spot_weights[sel]).sum(), dtype=jnp.float64
@@ -211,19 +278,8 @@ def refine_scan(args):
         )[:, None] * vh_j
         xyz_det = (C_scaled + O_scaled) @ Rg.T + T[None, :]
 
-        ang = -(om_rad + dom[r_idx])
-        ca, sa = jnp.cos(ang), jnp.sin(ang)
-        R_run = jnp.stack(
-            [
-                jnp.stack([ca, jnp.zeros_like(ca), sa], -1),
-                jnp.stack(
-                    [jnp.zeros_like(ca), jnp.ones_like(ca), jnp.zeros_like(ca)],
-                    -1,
-                ),
-                jnp.stack([-sa, jnp.zeros_like(ca), ca], -1),
-            ],
-            -2,
-        )
+        dR = rodrigues_batch_jax(dom[r_idx][:, None] * e_scan_j)
+        R_run = jnp.einsum("nij,njk->nik", dR, R0_j)
         x_s = jnp.einsum("nij,j->ni", R_run, s_samp)
         xyz = xyz_det - x_s
         kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
@@ -236,7 +292,7 @@ def refine_scan(args):
         )
         d = jnp.einsum("nji,nj->ni", R_run, d_lab)
 
-        B_cur = build_B_jax(a0 * (1.0 + da), b0 * (1.0 + db), c0, beta0_rad + dbeta)
+        B_cur = build_B_jax(*_apply_cell_jax(cell0, symmetry_kind, da, db, dbeta))
         A_cur = jnp.linalg.inv(B_cur).T
         X0 = uvw_j[:n_z] @ A_cur.T
         Rm = rodrigues_jax(rv) @ Uj
@@ -299,10 +355,22 @@ def refine_scan(args):
             if mode not in args.modes:
                 for i in indices:
                     bounds[i] = (0.0, 0.0)
+        for slot in range(3):
+            if slot not in active_cell_slots:
+                bounds[15 + slot] = (0.0, 0.0)
         bounds[18 + args.anchor_run] = (0.0, 0.0)
-        # A vertical sample shift is indistinguishable from the same global
-        # detector translation for a purely vertical scan. Fix that gauge.
-        bounds[13] = (0.0, 0.0)
+        # Fix sample-shift gauge: for a single orientation setting, s_samp is
+        # indistinguishable from global detector translation; for a multi-run
+        # scan, fix the component along the dominant sample-frame rotation axis.
+        if len(args.runs) <= 1 or np.allclose(R_obs[sel], R_obs[sel][0:1], atol=1e-6):
+            for idx_s in (12, 13, 14):
+                bounds[idx_s] = (0.0, 0.0)
+        else:
+            axis_samp = np.einsum("nji,nj->ni", R_obs[sel], scan_axes_obs[sel]).mean(
+                axis=0
+            )
+            gauge_dim = int(np.argmax(np.abs(axis_samp)))
+            bounds[12 + gauge_dim] = (0.0, 0.0)
         for r in set(range(n_runs)) - set(args.runs):
             bounds[18 + r] = (0.0, 0.0)
 
@@ -354,7 +422,7 @@ def refine_scan(args):
         take = np.flatnonzero(runs[sel] == r)
         Cr, ur, vr = C_j[take], uh_j[take], vh_j[take]
         uor, vor = u_off[take], v_off[take]
-        omr, rid = om_rad[take], r_idx[take]
+        R0r, er, rid = R0_j[take], e_scan_j[take], r_idx[take]
         w_r = w_j[take]
         w_r = w_r / jnp.maximum(jnp.abs(w_r).sum(), 1e-12)
 
@@ -377,23 +445,8 @@ def refine_scan(args):
                 :, None
             ] * vr
             xyz_det = (C_scaled + O_scaled) @ Rg.T + T[None, :]
-            ang = -(omr + dom[rid])
-            ca, sa = jnp.cos(ang), jnp.sin(ang)
-            R_run = jnp.stack(
-                [
-                    jnp.stack([ca, jnp.zeros_like(ca), sa], -1),
-                    jnp.stack(
-                        [
-                            jnp.zeros_like(ca),
-                            jnp.ones_like(ca),
-                            jnp.zeros_like(ca),
-                        ],
-                        -1,
-                    ),
-                    jnp.stack([-sa, jnp.zeros_like(ca), ca], -1),
-                ],
-                -2,
-            )
+            dR = rodrigues_batch_jax(dom[rid][:, None] * er)
+            R_run = jnp.einsum("nij,njk->nik", dR, R0r)
             xyz = xyz_det - jnp.einsum("nij,j->ni", R_run, s_samp)
             kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
             g = kf - kij[None, :]
@@ -405,7 +458,7 @@ def refine_scan(args):
                 q_lo + 1e-4,
             )
             d = jnp.einsum("nji,nj->ni", R_run, d_lab)
-            A_cur = jnp.linalg.inv(build_B_jax(a0, b0, c0, beta0_rad)).T
+            A_cur = jnp.linalg.inv(jnp.asarray(B0)).T
             X0 = uvw_j[:60] @ A_cur.T
             wz = 1.0 / jnp.linalg.norm(X0, axis=1)
             Rm = rodrigues_jax(rv) @ Uj
@@ -472,12 +525,7 @@ def refine_scan(args):
         # Stage 3: 2-step median-trimmed pixel residual polish on assigned reflections
         hkl_pool = np.stack(
             generate_reflections(
-                a0,
-                b0,
-                c0,
-                90.0,
-                beta0,
-                90.0,
+                *cell0,
                 space_group=args.space_group,
                 d_min=args.d_min,
             ),
@@ -487,7 +535,8 @@ def refine_scan(args):
         b_p = b_idx_all[sel_pol]
         u_p = u_off_all[sel_pol]
         v_p = v_off_all[sel_pol]
-        om_p = om_rad_all[sel_pol]
+        R0_p = R_obs[sel_pol]
+        e_p = scan_axes_obs[sel_pol]
         r_p = runs[sel_pol]
 
         rv, s_rad, s_ax, s_area, rg, T, s_samp, da, db, dbeta, dom, du, dv = unpack(
@@ -496,7 +545,7 @@ def refine_scan(args):
         Rg = np.asarray(rodrigues_jax(rg))
         U_c = np.asarray(rodrigues_jax(rv) @ Uj)
         B_c = np.asarray(
-            build_B_jax(a0 * (1.0 + da), b0 * (1.0 + db), c0, beta0_rad + dbeta)
+            build_B_jax(*_apply_cell_jax(cell0, symmetry_kind, da, db, dbeta))
         )
         UB_c = U_c @ B_c
         G_pool = hkl_pool @ UB_c.T
@@ -524,9 +573,8 @@ def refine_scan(args):
         for i in range(len(b_p)):
             bi = b_p[i]
             ri = r_p[i]
-            ang = -(om_p[i] + float(dom[ri]))
-            ca, sa = np.cos(ang), np.sin(ang)
-            Rr = np.array([[ca, 0.0, sa], [0.0, 1.0, 0.0], [-sa, 0.0, ca]])
+            dR_i = np.asarray(rodrigues_jax(float(dom[ri]) * jnp.asarray(e_p[i])))
+            Rr = dR_i @ R0_p[i]
             xs = Rr @ np.asarray(s_samp)
             xyz = (
                 C_new[bi]
@@ -554,7 +602,8 @@ def refine_scan(args):
         b_pj = jnp.asarray(b_p, dtype=jnp.int32)
         u_pj = jnp.asarray(u_p, dtype=jnp.float64)
         v_pj = jnp.asarray(v_p, dtype=jnp.float64)
-        om_pj = jnp.asarray(om_p, dtype=jnp.float64)
+        R0_pj = jnp.asarray(R0_p, dtype=jnp.float64)
+        e_pj = jnp.asarray(e_p, dtype=jnp.float64)
         r_pj = jnp.asarray(r_p, dtype=jnp.int32)
         hkl_pj = jnp.asarray(hkl_assigned, dtype=jnp.float64)
         C_bj = jnp.asarray(C_bank, dtype=jnp.float64)
@@ -562,6 +611,8 @@ def refine_scan(args):
         vh_bj = jnp.asarray(vhat_bank, dtype=jnp.float64)
         W_bj = jnp.asarray(W_bank, dtype=jnp.float64)
         H_bj = jnp.asarray(H_bank, dtype=jnp.float64)
+        M_bj = jnp.asarray(M_bank, dtype=jnp.float64)
+        N_bj = jnp.asarray(N_bank, dtype=jnp.float64)
 
         def make_loss_pix(inl_arr):
             inl_j = jnp.asarray(inl_arr, dtype=jnp.float64)
@@ -584,27 +635,10 @@ def refine_scan(args):
                 ) = unpack(p)
                 Rg = rodrigues_jax(rg)
                 U_c = rodrigues_jax(rv) @ Uj
-                B_c = build_B_jax(
-                    a0 * (1.0 + da), b0 * (1.0 + db), c0, beta0_rad + dbeta
-                )
+                B_c = build_B_jax(*_apply_cell_jax(cell0, symmetry_kind, da, db, dbeta))
                 G_c = hkl_pj @ (U_c @ B_c).T
-                ang = -(om_pj + dom[r_pj])
-                ca, sa = jnp.cos(ang), jnp.sin(ang)
-                Rr = jnp.stack(
-                    [
-                        jnp.stack([ca, jnp.zeros_like(ca), sa], -1),
-                        jnp.stack(
-                            [
-                                jnp.zeros_like(ca),
-                                jnp.ones_like(ca),
-                                jnp.zeros_like(ca),
-                            ],
-                            -1,
-                        ),
-                        jnp.stack([-sa, jnp.zeros_like(ca), ca], -1),
-                    ],
-                    -2,
-                )
+                dR = rodrigues_batch_jax(dom[r_pj][:, None] * e_pj)
+                Rr = jnp.einsum("nij,njk->nik", dR, R0_pj)
                 G_lab = jnp.einsum("nij,nj->ni", Rr, G_c)
                 kf_pred = ewald_directions(G_lab)
                 xs = jnp.einsum("nij,j->ni", Rr, s_samp)
@@ -639,10 +673,10 @@ def refine_scan(args):
                 u_hit = jnp.sum(P_hit * uh_s, axis=1)
                 v_hit = jnp.sum(P_hit * vh_s, axis=1)
                 du_px = (u_hit - u_pj * (1.0 + s_area)) * (
-                    511.0 / (W_bj[b_pj] * (1.0 + s_area))
+                    M_bj[b_pj] / (W_bj[b_pj] * (1.0 + s_area))
                 )
                 dv_px = (v_hit - v_pj * (1.0 + s_area)) * (
-                    511.0 / (H_bj[b_pj] * (1.0 + s_area))
+                    N_bj[b_pj] / (H_bj[b_pj] * (1.0 + s_area))
                 )
                 r2 = jnp.where(inl_j > 0, du_px**2 + dv_px**2, 0.0)
                 delta = 2.0
@@ -730,7 +764,7 @@ def refine_scan(args):
             Rg = np.asarray(rodrigues_jax(rg))
             U_c = np.asarray(rodrigues_jax(rv) @ Uj)
             B_c = np.asarray(
-                build_B_jax(a0 * (1.0 + da), b0 * (1.0 + db), c0, beta0_rad + dbeta)
+                build_B_jax(*_apply_cell_jax(cell0, symmetry_kind, da, db, dbeta))
             )
             C_sc = np.stack(
                 [
@@ -753,9 +787,8 @@ def refine_scan(args):
                 if inlier[i] == 0:
                     continue
                 bi, ri = b_p[i], r_p[i]
-                ang = -(om_p[i] + float(dom[ri]))
-                ca, sa = np.cos(ang), np.sin(ang)
-                Rr = np.array([[ca, 0.0, sa], [0.0, 1.0, 0.0], [-sa, 0.0, ca]])
+                dR_i = np.asarray(rodrigues_jax(float(dom[ri]) * jnp.asarray(e_p[i])))
+                Rr = dR_i @ R0_p[i]
                 xs = Rr @ np.asarray(s_samp)
                 G_l = Rr @ (U_c @ B_c @ hkl_assigned[i])
                 lam = -2.0 * G_l[2] / np.sum(G_l**2)
@@ -765,10 +798,10 @@ def refine_scan(args):
                 tr = np.dot(Cs, nh_new[bi]) / np.dot(kfp, nh_new[bi])
                 Ph = tr * kfp - Cs
                 du_p = (np.dot(Ph, uh_new[bi]) - u_p[i] * (1.0 + float(s_area))) * (
-                    511.0 / (W_bank[bi] * (1.0 + float(s_area)))
+                    M_bank[bi] / (W_bank[bi] * (1.0 + float(s_area)))
                 )
                 dv_p = (np.dot(Ph, vh_new[bi]) - v_p[i] * (1.0 + float(s_area))) * (
-                    511.0 / (H_bank[bi] * (1.0 + float(s_area)))
+                    N_bank[bi] / (H_bank[bi] * (1.0 + float(s_area)))
                 )
                 res_px[i] = np.hypot(du_p, dv_p)
             return res_px
@@ -806,11 +839,11 @@ def refine_scan(args):
     )
     Rg = np.asarray(rodrigues_jax(rg))
     U_opt = np.asarray(rodrigues_jax(rv) @ Uj)
-    a_opt = a0 * (1.0 + float(da))
-    b_opt = b0 * (1.0 + float(db))
-    c_opt = c0
-    beta_opt = np.degrees(beta0_rad + float(dbeta))
-    B_opt = np.asarray(build_B_jax(a_opt, b_opt, c_opt, np.deg2rad(beta_opt)))
+    a_opt, b_opt, c_opt, al_opt_r, be_opt_r, ga_opt_r = [
+        float(v) for v in _apply_cell_jax(cell0, symmetry_kind, da, db, dbeta)
+    ]
+    al_opt, be_opt, ga_opt = np.degrees([al_opt_r, be_opt_r, ga_opt_r]).tolist()
+    B_opt = np.asarray(build_B_jax(a_opt, b_opt, c_opt, al_opt_r, be_opt_r, ga_opt_r))
     dom_deg = np.degrees(np.asarray(dom))
 
     C_sc = np.stack(
@@ -843,7 +876,7 @@ def refine_scan(args):
         args,
         U_opt,
         B_opt,
-        [a_opt, b_opt, c_opt, 90.0, beta_opt, 90.0],
+        [a_opt, b_opt, c_opt, al_opt, be_opt, ga_opt],
         bank_ids,
         C_final,
         uh_final,
