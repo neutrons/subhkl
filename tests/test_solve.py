@@ -64,18 +64,21 @@ def scene(tmp_path_factory):
 
 
 def test_cli_has_only_unified_entry_point():
+    import re
+
     runner = CliRunner()
-    env = {"COLUMNS": "120", "NO_COLOR": "1"}
-    out = runner.invoke(app, ["--help"], env=env)
+    env = {"COLUMNS": "120", "NO_COLOR": "1", "TERM": "dumb"}
+    out = runner.invoke(app, ["--help"], env=env, color=False)
     assert out.exit_code == 0, out.output
     names = [
         c.name or c.callback.__name__.replace("_", "-") for c in app.registered_commands
     ]
     assert "solve" in names
     assert "calibrate" not in names and "spherical-index" not in names
-    out = runner.invoke(app, ["solve", "--help"], env=env)
+    out = runner.invoke(app, ["solve", "--help"], env=env, color=False)
     assert out.exit_code == 0, out.output
-    assert "--profile-file" in out.output
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", out.output)
+    assert "--profile-file" in plain
 
 
 def test_solve_writes_all_components_and_sample_frame_without_global_mutation(
