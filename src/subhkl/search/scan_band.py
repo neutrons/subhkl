@@ -26,7 +26,9 @@ def band_sum(X, directions, q_lo, q_hi, weights, zone_weights, chunk_size=2048):
         num = jnp.sin(2 * jnp.pi * hi_safe[None, :] * t) - jnp.sin(
             2 * jnp.pi * lo[None, :] * t
         )
-        envelope = jnp.tanh((hi_safe - lo)[None, :] / jnp.maximum(0.02 * lo[None, :], 1e-6))
+        envelope = jnp.tanh(
+            (hi_safe - lo)[None, :] / jnp.maximum(0.02 * lo[None, :], 1e-6)
+        )
         kernel = jnp.where(
             valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
         )
@@ -234,9 +236,7 @@ def refine_scan(args):
     else:
         from subhkl.search.blind_band import count_search_weights
 
-        weights_sel = count_search_weights(
-            dev[sel], max_quantile=0.999, max_factor=3.0
-        )
+        weights_sel = count_search_weights(dev[sel], max_quantile=0.999, max_factor=3.0)
         if not np.any(weights_sel > 0):
             weights_sel = spot_weights[sel]
     b_idx = jnp.asarray(b_idx_all[sel], dtype=jnp.int32)
@@ -531,7 +531,12 @@ def refine_scan(args):
             method="L-BFGS-B",
             jac=True,
             bounds=np.asarray(bounds_panel) / units[:, None],
-            options={"maxiter": args.maxiter, "ftol": 1e-12, "gtol": 1e-8, "maxcor": 30},
+            options={
+                "maxiter": args.maxiter,
+                "ftol": 1e-12,
+                "gtol": 1e-8,
+                "maxcor": 30,
+            },
         )
         res_p.x *= units
         p_cur = res_p.x.copy()
