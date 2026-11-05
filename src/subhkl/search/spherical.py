@@ -1295,10 +1295,15 @@ def _lattice_kernels():
         auto-indexing).  No tolerance: the band sets the window.
         """
         two_pi = 2.0 * jnp.pi
-        den = two_pi * (qhi - qlo) * t
+        valid = qhi > qlo
+        hi_safe = jnp.where(valid, qhi, qlo + 1.0)
+        den = two_pi * (hi_safe - qlo) * t
         ok = jnp.abs(den) > 1e-7
-        num = jnp.sin(two_pi * qhi * t) - jnp.sin(two_pi * qlo * t)
-        return jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0)
+        num = jnp.sin(two_pi * hi_safe * t) - jnp.sin(two_pi * qlo * t)
+        envelope = jnp.tanh((hi_safe - qlo) / jnp.maximum(0.02 * qlo, 1e-6))
+        return jnp.where(
+            valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
+        )
 
     def band_chunk(Pc, xl, Dj, wj, qlo, qhi):
         """Table cell values: [poles, zone lengths]."""
@@ -1566,10 +1571,17 @@ def refine_band_geometry(
         Rm = _rodrigues_jax(rv) @ Uj
         t = (X0 @ Rm.T) @ d.T  # [zones, spots]
         two_pi = 2.0 * jnp.pi
-        den = two_pi * (q_hi - q_lo)[None, :] * t
+        valid = (q_hi > q_lo)[None, :]
+        hi_safe = jnp.where(q_hi > q_lo, q_hi, q_lo + 1.0)[None, :]
+        den = two_pi * (hi_safe - q_lo[None, :]) * t
         ok = jnp.abs(den) > 1e-7
-        num = jnp.sin(two_pi * q_hi[None, :] * t) - jnp.sin(two_pi * q_lo[None, :] * t)
-        K = jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0)
+        num = jnp.sin(two_pi * hi_safe * t) - jnp.sin(two_pi * q_lo[None, :] * t)
+        envelope = jnp.tanh(
+            (hi_safe - q_lo[None, :]) / jnp.maximum(0.02 * q_lo[None, :], 1e-6)
+        )
+        K = jnp.where(
+            valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
+        )
         return -jnp.einsum("km,k,m->", K, wz, w)
 
     vg = jax.jit(jax.value_and_grad(objective))

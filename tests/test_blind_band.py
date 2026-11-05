@@ -97,3 +97,8 @@ def test_count_search_weights_are_threshold_free_and_suppress_null_noise():
     assert w[2] / w[3] < 2e-4
     # Sublinear sqrt(D) growth at high deviance prevents flare monopolization
     assert np.isclose(w[5] / w[4], 2.0, rtol=1e-3)
+    # Quantile cap prevents a single beamstop-flare bin from dominating
+    flare = np.append(np.full(1000, 100.0), 1e8)
+    w_capped = count_search_weights(flare, max_quantile=0.99, max_factor=3.0)
+    assert np.isclose(w_capped[-1] / w_capped[0], 3.0, rtol=1e-3)
+

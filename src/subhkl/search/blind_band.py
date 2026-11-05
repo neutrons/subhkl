@@ -58,7 +58,7 @@ def distinct_orientations(candidates, B, space_group, count, separation_deg=1.0)
     return selected
 
 
-def count_search_weights(deviance, scale=25.0):
+def count_search_weights(deviance, scale=25.0, max_quantile=None, max_factor=3.0):
     """Smooth chi-square-null-suppressed Poisson deviance weights for count bins.
 
     Under a Poisson background null, single-bin deviance follows chi^2_1 (~1),
@@ -67,10 +67,16 @@ def count_search_weights(deviance, scale=25.0):
     (every positive-deviance bin has positive weight), suppresses 1-sigma background
     fluctuations by ~6e-5 so importance sampling is not flooded by background bins,
     and grows as sqrt(D) at high deviance so bright flare pixels cannot monopolize
-    the sample.
+    the sample. When `max_quantile` is set, extreme unmasked beamstop-flare bins are
+    capped at `max_factor` times that positive-weight quantile.
     """
     dev = np.maximum(np.asarray(deviance, float), 0.0)
-    return np.sqrt(dev) * (1.0 - np.exp(-((dev / float(scale)) ** 3)))
+    w = np.sqrt(dev) * (1.0 - np.exp(-((dev / float(scale)) ** 3)))
+    if max_quantile is not None:
+        pos = w[w > 0]
+        if len(pos):
+            w = np.minimum(w, float(max_factor) * float(np.quantile(pos, max_quantile)))
+    return w
 
 
 def discover(args, samples=16384, candidates=6, seed=0):
@@ -89,7 +95,9 @@ def discover(args, samples=16384, candidates=6, seed=0):
         search_weights = weights[use]
         weighting_desc = "sqrt finder deviance"
     else:
-        search_weights = count_search_weights(dev[use])
+        search_weights = count_search_weights(
+            dev[use], max_quantile=0.999, max_factor=3.0
+        )
         weighting_desc = "smooth chi2-suppressed bin Poisson deviance"
     banks, rows, cols, Rs = [v[use] for v in (banks, rows, cols, R_obs)]
     weights = search_weights

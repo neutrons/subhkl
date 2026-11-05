@@ -33,6 +33,12 @@ def test_chunked_band_value_and_gradient_match_dense_signed_sum():
         )
         for a, b in zip(dense, chunked):
             np.testing.assert_allclose(a, b, atol=1e-12, rtol=1e-12)
+        # Empty resolution intervals (hi <= lo) contribute zero value and zero gradient
+        empty_val, empty_grad = jax.value_and_grad(
+            lambda x: band_sum(x, d, hi, lo, weights, zw, 8)
+        )(X)
+        assert float(empty_val) == 0.0
+        np.testing.assert_array_equal(empty_grad, 0.0)
 
 
 def test_unassigned_reflection_has_finite_masked_gradient():

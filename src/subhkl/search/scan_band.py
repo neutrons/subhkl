@@ -19,12 +19,17 @@ def band_sum(X, directions, q_lo, q_hi, weights, zone_weights, chunk_size=2048):
 
     def score(d, lo, hi, w):
         t = X @ d.T
-        den = 2 * jnp.pi * (hi - lo)[None, :] * t
+        valid = (hi > lo)[None, :]
+        hi_safe = jnp.where(hi > lo, hi, lo + 1.0)
+        den = 2 * jnp.pi * (hi_safe - lo)[None, :] * t
         ok = jnp.abs(den) > 1e-7
-        num = jnp.sin(2 * jnp.pi * hi[None, :] * t) - jnp.sin(
+        num = jnp.sin(2 * jnp.pi * hi_safe[None, :] * t) - jnp.sin(
             2 * jnp.pi * lo[None, :] * t
         )
-        kernel = jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0)
+        envelope = jnp.tanh((hi_safe - lo)[None, :] / jnp.maximum(0.02 * lo[None, :], 1e-6))
+        kernel = jnp.where(
+            valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
+        )
         return jnp.einsum("km,k,m->", kernel, zone_weights, w)
 
     if len(weights) <= chunk_size:
@@ -225,6 +230,15 @@ def refine_scan(args):
     sel = np.isin(runs, args.runs)
     if args.finder:
         sel &= dev >= args.min_deviance
+        weights_sel = spot_weights[sel]
+    else:
+        from subhkl.search.blind_band import count_search_weights
+
+        weights_sel = count_search_weights(
+            dev[sel], max_quantile=0.999, max_factor=3.0
+        )
+        if not np.any(weights_sel > 0):
+            weights_sel = spot_weights[sel]
     b_idx = jnp.asarray(b_idx_all[sel], dtype=jnp.int32)
     u_off = jnp.asarray(u_off_all[sel], dtype=jnp.float64)
     v_off = jnp.asarray(v_off_all[sel], dtype=jnp.float64)
@@ -232,7 +246,7 @@ def refine_scan(args):
     e_scan_j = jnp.asarray(scan_axes_obs[sel], dtype=jnp.float64)
     r_idx = jnp.asarray(runs[sel], dtype=jnp.int32)
     w_j = jnp.asarray(
-        spot_weights[sel] / np.abs(spot_weights[sel]).sum(), dtype=jnp.float64
+        weights_sel / np.maximum(np.abs(weights_sel).sum(), 1e-12), dtype=jnp.float64
     )
 
     C_j = jnp.asarray(C_bank[b_idx_all[sel]], dtype=jnp.float64)
@@ -287,9 +301,7 @@ def refine_scan(args):
         d_lab = g / jnp.linalg.norm(g, axis=1, keepdims=True)
         s_ = -(d_lab @ kij)
         q_lo = 2.0 * s_ / args.wl_max
-        q_hi = jnp.maximum(
-            jnp.minimum(2.0 * s_ / args.wl_min, 1.0 / args.d_min), q_lo + 1e-4
-        )
+        q_hi = jnp.maximum(jnp.minimum(2.0 * s_ / args.wl_min, 1.0 / args.d_min), q_lo)
         d = jnp.einsum("nji,nj->ni", R_run, d_lab)
 
         B_cur = build_B_jax(*_apply_cell_jax(cell0, symmetry_kind, da, db, dbeta))
@@ -303,6 +315,8 @@ def refine_scan(args):
             reg_panel * (jnp.sum(du**2) + jnp.sum(dv**2))
             + 20.0 * (da**2 + db**2 + dbeta**2)
             + 500.0 * s_area**2
+            + 5.0 * jnp.sum(dom**2)
+            + 5.0 * (jnp.sum(rg**2) + jnp.sum((T / 0.03) ** 2))
         )
         return -score + reg
 
@@ -455,7 +469,7 @@ def refine_scan(args):
             q_lo = 2.0 * s_ / args.wl_max
             q_hi = jnp.maximum(
                 jnp.minimum(2.0 * s_ / args.wl_min, 1.0 / args.d_min),
-                q_lo + 1e-4,
+                q_lo,
             )
             d = jnp.einsum("nji,nj->ni", R_run, d_lab)
             A_cur = jnp.linalg.inv(jnp.asarray(B0)).T
@@ -464,7 +478,9 @@ def refine_scan(args):
             Rm = rodrigues_jax(rv) @ Uj
             return band_sum(X0 @ Rm.T, d, q_lo, q_hi, wr, wz)
 
-        scores_r = np.asarray([float(eval_dom(d)) for d in dom_grid])
+        scores_r = np.asarray(
+            [float(eval_dom(d)) - 5.0 * float(d) ** 2 for d in dom_grid]
+        )
         best_p[18 + r] = float(dom_grid[int(np.argmax(scores_r))])
 
     # Stage 1a: 120-zone band across all selected runs, including scan drift.
@@ -502,24 +518,27 @@ def refine_scan(args):
     )
 
     # Stage 2: Regularized per-bank (du, dv) shifts on 400-zone band objective
-    units = parameter_units(n_runs, n_banks)
+    if "panels" in args.modes:
+        units = parameter_units(n_runs, n_banks)
 
-    def panel_objective(z):
-        value, gradient = vg_band_p(jnp.asarray(z * units))
-        return float(value), np.asarray(gradient, float) * units
+        def panel_objective(z):
+            value, gradient = vg_band_p(jnp.asarray(z * units))
+            return float(value), np.asarray(gradient, float) * units
 
-    res_p = minimize(
-        panel_objective,
-        best_p / units,
-        method="L-BFGS-B",
-        jac=True,
-        bounds=np.asarray(bounds_panel) / units[:, None],
-        options={"maxiter": args.maxiter, "ftol": 1e-12, "gtol": 1e-8, "maxcor": 30},
-    )
-    res_p.x *= units
-    p_cur = res_p.x.copy()
-    record("panels", res_p)
-    print(f"[Stage 2: +Regularized Per-Bank Shifts] loss = {res_p.fun:.4f}")
+        res_p = minimize(
+            panel_objective,
+            best_p / units,
+            method="L-BFGS-B",
+            jac=True,
+            bounds=np.asarray(bounds_panel) / units[:, None],
+            options={"maxiter": args.maxiter, "ftol": 1e-12, "gtol": 1e-8, "maxcor": 30},
+        )
+        res_p.x *= units
+        p_cur = res_p.x.copy()
+        record("panels", res_p)
+        print(f"[Stage 2: +Regularized Per-Bank Shifts] loss = {res_p.fun:.4f}")
+    else:
+        p_cur = best_p.copy()
 
     if args.pixel_polish:
         # Stage 3: 2-step median-trimmed pixel residual polish on assigned reflections
