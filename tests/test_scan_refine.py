@@ -356,6 +356,8 @@ def test_single_run_support_without_file_offsets(tmp_path):
         for k, v in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
             f[f"sample/{k}"] = v
         f["sample/space_group"] = "Fdd2"
+        f["instrument/wavelength"] = [1.1, 8.5]
+        f.attrs["instrument"] = "MANDI"
     with h5py.File(bootstrap, "w") as f:
         f["sample/U"] = np.eye(3)
 
@@ -364,7 +366,7 @@ def test_single_run_support_without_file_offsets(tmp_path):
         frames,
         output,
         bootstrap=bootstrap,
-        instrument="MANDI",
+        instrument=None,
         modes=["cell", "per_run", "sample"],
         maxiter=1,
         n_zones=60,
@@ -372,7 +374,11 @@ def test_single_run_support_without_file_offsets(tmp_path):
     )
     assert result["status"] in ("converged", "not_converged")
     with h5py.File(output) as f:
+        assert f.attrs["instrument"] == "MANDI"
+        np.testing.assert_allclose(f["instrument/wavelength"][()], [1.1, 8.5])
+        np.testing.assert_allclose(f["scan_refinement/band_wavelength"][()], [1.1, 8.5])
         np.testing.assert_array_equal(f["file_offsets"][()], [0])
+        np.testing.assert_array_equal(f["goniometer/per_run/delta_deg"][()], [0.0])
         bounds = f["scan_refinement/parameter_bounds"][()]
         # Single run: per_run drift (index 18) and sample shift (indices 12..14) are gauge-fixed
         np.testing.assert_array_equal(bounds[12:15], np.zeros((3, 2)))

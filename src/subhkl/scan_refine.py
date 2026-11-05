@@ -116,8 +116,8 @@ def run_scan_refinement(
     instrument="CG4D",
     cell=None,
     space_group=None,
-    wavelength=(2.85, 4.35),
-    assignment_wavelength=(2.8, 4.5),
+    wavelength=None,
+    assignment_wavelength=None,
     runs=None,
     stable_runs=None,
     modes=None,
@@ -140,6 +140,17 @@ def run_scan_refinement(
     """
     if search_samples < 1 or search_candidates < 1 or search_seed < 0:
         raise ValueError("invalid blind search budget or seed")
+    with h5py.File(frames) as f:
+        if instrument is None:
+            inst_attr = f.attrs.get("instrument")
+            if isinstance(inst_attr, bytes):
+                inst_attr = inst_attr.decode()
+            instrument = str(inst_attr) if inst_attr else "CG4D"
+        file_wl = (
+            tuple(float(x) for x in f["instrument/wavelength"][()][:2])
+            if "instrument/wavelength" in f
+            else None
+        )
     if instrument not in beamlines:
         raise ValueError(f"unknown instrument: {instrument}")
     dets = {int(k): Detector(dict(cfg)) for k, cfg in beamlines[instrument].items()}
@@ -163,6 +174,29 @@ def run_scan_refinement(
         raise ValueError(
             "invalid band refinement budget, zones, resolution or deviance"
         )
+    wl_low, wl_high = (None, None) if wavelength is None else wavelength
+    if wl_low is None:
+        wl_low = file_wl[0] if file_wl is not None else 2.85
+    if wl_high is None:
+        wl_high = file_wl[1] if file_wl is not None else 4.35
+    wavelength = (float(wl_low), float(wl_high))
+
+    awl_low, awl_high = (
+        (None, None) if assignment_wavelength is None else assignment_wavelength
+    )
+    if awl_low is None:
+        awl_low = (
+            file_wl[0]
+            if file_wl is not None
+            else (2.8 if wavelength == (2.85, 4.35) else wavelength[0])
+        )
+    if awl_high is None:
+        awl_high = (
+            file_wl[1]
+            if file_wl is not None
+            else (4.5 if wavelength == (2.85, 4.35) else wavelength[1])
+        )
+    assignment_wavelength = (float(awl_low), float(awl_high))
     for band in (wavelength, assignment_wavelength):
         if not 0 < band[0] < band[1]:
             raise ValueError("wavelength bounds must be positive and increasing")
@@ -472,6 +506,7 @@ def write_result(
                 put("goniometer/translations", shifts)
                 changes = np.zeros((args.n_runs, len(axes)))
                 changes[:, col] = delta
+                put("goniometer/per_run/delta_deg", np.asarray(delta, float))
                 put("goniometer/per_run/delta_deg_all_axes", changes)
                 put("goniometer/per_run/frame_to_run", run_ids)
             else:
@@ -480,6 +515,7 @@ def write_result(
                 ).as_matrix()
                 put("goniometer/R", np.einsum("nij,njk->nik", d_rot, R_nom))
                 put("goniometer/translations", np.asarray(sample, float))
+                put("goniometer/per_run/delta_deg", np.asarray(delta, float))
                 put("goniometer/per_run/frame_to_run", run_ids)
             for i, bank in enumerate(banks):
                 for key, value in (

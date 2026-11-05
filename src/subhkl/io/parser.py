@@ -154,11 +154,11 @@ def solve(
         ),
     ] = False,
     assignment_wavelength_min: Annotated[
-        float, typer.Option(help="Prediction/pixel-polish band lower bound")
-    ] = 2.8,
+        float | None, typer.Option(help="Prediction/pixel-polish band lower bound")
+    ] = None,
     assignment_wavelength_max: Annotated[
-        float, typer.Option(help="Prediction/pixel-polish band upper bound")
-    ] = 4.5,
+        float | None, typer.Option(help="Prediction/pixel-polish band upper bound")
+    ] = None,
     search_samples: Annotated[
         int,
         typer.Option(
@@ -194,10 +194,10 @@ def solve(
                 output_filename,
                 bootstrap=bootstrap,
                 finder=finder_peaks,
-                instrument=instrument or "CG4D",
+                instrument=instrument,
                 cell=values,
                 space_group=space_group,
-                wavelength=(wavelength_min or 2.85, wavelength_max or 4.35),
+                wavelength=(wavelength_min, wavelength_max),
                 assignment_wavelength=(
                     assignment_wavelength_min,
                     assignment_wavelength_max,
