@@ -23,7 +23,12 @@ def plot_solve(
     zone_alpha=0.5,
 ):
     with h5py.File(filename) as f:
-        status = f["solve"].attrs.get("status", "unknown")
+        if "solve" in f:
+            status = f["solve"].attrs.get("status", "unknown")
+        elif "scan_refinement" in f:
+            status = f["scan_refinement"].attrs.get("status", "unknown")
+        else:
+            status = "converged"
         if isinstance(status, bytes):
             status = status.decode()
         diagnostic = status if "sample/U" not in f else None
@@ -33,11 +38,13 @@ def plot_solve(
         if instrument is None:
             raise ValueError("solve output has no instrument")
         images_filename = images_filename or f.attrs.get("source")
+        if isinstance(images_filename, bytes):
+            images_filename = images_filename.decode()
         if not images_filename or not Path(images_filename).is_file():
             raise ValueError("solve visualization requires raw counts via --images")
         with h5py.File(images_filename) as raw:
             banks = raw["bank_ids"][()].astype(int)
-            if not np.array_equal(banks, f["bank_ids"][()]):
+            if "bank_ids" in f and not np.array_equal(banks, f["bank_ids"][()]):
                 raise ValueError(
                     "visualizer images must match the solve frame/bank layout"
                 )
@@ -50,11 +57,26 @@ def plot_solve(
             origins = f["solve/sample_origin_lab"][()]
         groups = setting_groups(banks, R, origins, runs)
         B = f["sample/B"][()]
+        wl = (
+            tuple(float(v) for v in f["instrument/wavelength"][()][:2])
+            if "instrument/wavelength" in f
+            else None
+        )
+        sg = f["sample/space_group"][()] if "sample/space_group" in f else "P 1"
+        if isinstance(sg, bytes):
+            sg = sg.decode()
+        d_min = None
+        sigma_px = 4.0
+        if "solve" in f:
+            d_min = f["solve"].attrs.get("d_min")
+            sigma_px = float(f["solve"].attrs.get("sigma_px", 4.0))
         U = f["sample/U"][()][None] if "sample/U" in f else None
         if "solve/orientations_sample" in f and "solve/active" in f:
             candidates = f["solve/orientations_sample"][()]
             active = f["solve/active"][()].astype(int)
             U = candidates[active] if len(active) else candidates
+        elif U is None and "scan_refinement/U" in f:
+            U = f["scan_refinement/U"][()][None]
         if U is None or len(U) == 0:
             raise ValueError(
                 "solve output contains no orientation candidates to visualize"
@@ -96,6 +118,10 @@ def plot_solve(
                 R_gonio=R[first],
                 max_index=max_index,
                 sample_origin=origins[first],
+                wavelength=wl,
+                d_min=d_min,
+                space_group=sg,
+                sigma_px=sigma_px,
             )
             if len(U) > 1:
                 for curve in component_curves:

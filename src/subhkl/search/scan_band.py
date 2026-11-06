@@ -217,17 +217,25 @@ def refine_scan(args):
     n_banks = len(bank_ids)
 
     dets = {b: Detector(dict(beamlines[args.instrument][str(b)])) for b in bank_ids}
-    C_bank = np.array([dets[b].center for b in bank_ids])
+    C_bank_corner = np.array([dets[b].center for b in bank_ids])
     uhat_bank = np.array([dets[b].uhat for b in bank_ids])
     vhat_bank = np.array([dets[b].vhat for b in bank_ids])
     W_bank = np.array([dets[b].width for b in bank_ids])
     H_bank = np.array([dets[b].height for b in bank_ids])
     M_bank = np.array([float(dets[b].m - 1) for b in bank_ids])
     N_bank = np.array([float(dets[b].n - 1) for b in bank_ids])
+    # Detector.center is the (row=0, col=0) corner; center panel scaling and
+    # offsets on the physical panel midpoint so radial scaling does not introduce
+    # a spurious half-panel tangential shift.
+    C_bank = (
+        C_bank_corner
+        + 0.5 * W_bank[:, None] * uhat_bank
+        + 0.5 * H_bank[:, None] * vhat_bank
+    )
 
     b_idx_all = np.array([bank_to_idx[b] for b in banks], dtype=np.int32)
-    u_off_all = W_bank[b_idx_all] * (pc / M_bank[b_idx_all])
-    v_off_all = H_bank[b_idx_all] * (pr / N_bank[b_idx_all])
+    u_off_all = W_bank[b_idx_all] * (pc / M_bank[b_idx_all] - 0.5)
+    v_off_all = H_bank[b_idx_all] * (pr / N_bank[b_idx_all] - 0.5)
 
     sel = np.isin(runs, args.runs)
     if args.finder:
@@ -260,10 +268,14 @@ def refine_scan(args):
     w_r29 = jnp.where(jnp.isin(r_idx, jnp.asarray(args.stable_runs)), w_j, 0.0)
     w_r29 = w_r29 / jnp.maximum(jnp.abs(w_r29).sum(), 1e-12)
 
+    is_single_setting = len(args.runs) <= 1 or np.allclose(
+        R_obs[sel], R_obs[sel][0:1], atol=1e-6
+    )
+
     def unpack(p):
         rv = p[0:3]
         s_rad = p[3]
-        s_ax = p[4]
+        s_ax = s_rad if is_single_setting and "axial_stretch" in args.modes else p[4]
         s_area = p[5]
         rg = p[6:9]
         T = p[9:12]
@@ -311,12 +323,14 @@ def refine_scan(args):
         w_spots = w_r29 if use_r29 else w_j
         wz = 1.0 / jnp.linalg.norm(X0, axis=1) if inv_len_weight else jnp.ones(len(X0))
         score = band_sum(X0 @ Rm.T, d, q_lo, q_hi, w_spots, wz)
+        reg_geom = 0.1 if is_single_setting else 5.0
+        reg_cell = 1000.0 if is_single_setting else 20.0
         reg = (
             reg_panel * (jnp.sum(du**2) + jnp.sum(dv**2))
-            + 20.0 * (da**2 + db**2 + dbeta**2)
+            + reg_cell * (da**2 + db**2 + dbeta**2)
             + 500.0 * s_area**2
             + 5.0 * jnp.sum(dom**2)
-            + 5.0 * (jnp.sum(rg**2) + jnp.sum((T / 0.03) ** 2))
+            + reg_geom * (jnp.sum(rg**2) + jnp.sum((T / 0.03) ** 2))
         )
         return -score + reg
 
@@ -376,9 +390,15 @@ def refine_scan(args):
         # Fix sample-shift gauge: for a single orientation setting, s_samp is
         # indistinguishable from global detector translation; for a multi-run
         # scan, fix the component along the dominant sample-frame rotation axis.
-        if len(args.runs) <= 1 or np.allclose(R_obs[sel], R_obs[sel][0:1], atol=1e-6):
+        if is_single_setting:
+            bounds[4] = (0.0, 0.0)
+            bounds[5] = (0.0, 0.0)
+            bounds[6] = (0.0, 0.0)
+            bounds[8] = (0.0, 0.0)
             for idx_s in (12, 13, 14):
                 bounds[idx_s] = (0.0, 0.0)
+            for idx_p in range(18 + n_runs, 18 + n_runs + 2 * n_banks):
+                bounds[idx_p] = (0.0, 0.0)
         else:
             axis_samp = np.einsum("nji,nj->ni", R_obs[sel], scan_axes_obs[sel]).mean(
                 axis=0
@@ -518,7 +538,7 @@ def refine_scan(args):
     )
 
     # Stage 2: Regularized per-bank (du, dv) shifts on 400-zone band objective
-    if "panels" in args.modes:
+    if "panels" in args.modes and not is_single_setting:
         units = parameter_units(n_runs, n_banks)
 
         def panel_objective(z):
@@ -878,13 +898,18 @@ def refine_scan(args):
         ],
         axis=-1,
     )
-    C_final = (
-        C_sc + np.asarray(du)[:, None] * uhat_bank + np.asarray(dv)[:, None] * vhat_bank
-    ) @ Rg.T + np.asarray(T)[None, :]
-    uh_final = uhat_bank @ Rg.T
-    vh_final = vhat_bank @ Rg.T
     W_final = W_bank * (1.0 + float(s_area))
     H_final = H_bank * (1.0 + float(s_area))
+    uh_final = uhat_bank @ Rg.T
+    vh_final = vhat_bank @ Rg.T
+    C_midpoint_final = (
+        C_sc + np.asarray(du)[:, None] * uhat_bank + np.asarray(dv)[:, None] * vhat_bank
+    ) @ Rg.T + np.asarray(T)[None, :]
+    C_final = (
+        C_midpoint_final
+        - 0.5 * W_final[:, None] * uh_final
+        - 0.5 * H_final[:, None] * vh_final
+    )
 
     lower, upper = np.asarray(bounds_panel).T
     args.parameter_bounds = np.asarray(bounds_panel)

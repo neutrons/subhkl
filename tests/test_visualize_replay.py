@@ -431,8 +431,7 @@ def test_an_integrator_run_can_be_replayed_afterwards(tmp_path):
             assert f[f"peaks/{name}"].shape == f["peaks/intensity"].shape
 
     integrator_visualize(
-        images_filename=str(images),
-        peaks_filename=str(integrated),
+        images_filename=str(integrated),
         output_dir=str(tmp_path),
         dpi=50,
         max_workers=1,

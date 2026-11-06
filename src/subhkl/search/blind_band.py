@@ -106,9 +106,9 @@ def discover(args, samples=16384, candidates=6, seed=0):
     for bank in np.unique(banks):
         m = banks == bank
         det = Detector(dict(beamlines[args.instrument][str(bank)]))
-        C[m] = det.center
-        O[m] = (cols[m] / (det.m - 1) * det.width)[:, None] * det.uhat + (
-            rows[m] / (det.n - 1) * det.height
+        C[m] = det.center + 0.5 * det.width * det.uhat + 0.5 * det.height * det.vhat
+        O[m] = ((cols[m] / (det.m - 1) - 0.5) * det.width)[:, None] * det.uhat + (
+            (rows[m] / (det.n - 1) - 0.5) * det.height
         )[:, None] * det.vhat
     Cs, Os, rotations = C[idx], O[idx], Rs[idx]
     B = np.asarray(build_B_jax(*args.cell[:3], *np.deg2rad(args.cell[3:])))
@@ -147,6 +147,10 @@ def discover(args, samples=16384, candidates=6, seed=0):
     print(
         f"Joint band refinement of {len(found)} distinct blind candidates", flush=True
     )
+    is_single_setting = len(args.stable_runs) <= 1 or np.allclose(
+        Rs, Rs[0:1], atol=1e-6
+    )
+    rot_axis_only = (0.0, 1.0, 0.0) if is_single_setting else None
     fits = []
     for i, item in enumerate(found):
         U = item[0]
@@ -160,6 +164,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
             wavelength,
             args.d_min,
             maxiter=150,
+            rot_axis_only=rot_axis_only,
         )
         fits.append(fit)
         print(

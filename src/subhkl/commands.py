@@ -1297,6 +1297,7 @@ def run_peak_predictor(
     print(f"Saving predictions to {integration_peaks_filename}")
     with h5py.File(integration_peaks_filename, "w") as f:
         f.attrs["instrument"] = instrument
+        f.attrs["source"] = os.path.abspath(filename)
         f["sample/a"], f["sample/b"], f["sample/c"] = a, b, c
         f["sample/alpha"], f["sample/beta"], f["sample/gamma"] = alpha, beta, gamma
 
@@ -1438,6 +1439,7 @@ def run_rbf_integrator(
     print(f"Saving RBF integrated peaks to {output_filename}")
     with h5py.File(output_filename, "w") as f:
         f.attrs["instrument"] = instrument
+        f.attrs["source"] = os.path.abspath(filename)
         f["peaks/h"], f["peaks/k"], f["peaks/l"] = result.h, result.k, result.l
         f["peaks/lambda"] = result.wavelength
         f["peaks/intensity"], f["peaks/sigma"] = result.intensity, result.sigma
@@ -1607,8 +1609,8 @@ def run_merge_images(
 
 
 def run_finder_visualize(
-    images_filename: str,
-    peaks_filename: str,
+    images_filename: str | None = None,
+    peaks_filename: str | None = None,
     instrument: str | None = None,
     output_dir: str | None = None,
     dpi: int = 150,
@@ -1638,8 +1640,8 @@ def run_finder_visualize(
 
 
 def run_integrator_visualize(
-    images_filename: str,
-    peaks_filename: str,
+    images_filename: str | None = None,
+    peaks_filename: str | None = None,
     instrument: str | None = None,
     output_dir: str | None = None,
     dpi: int = 150,
@@ -4604,7 +4606,7 @@ def run_indexer_visualize(
     from subhkl.viz import zones
 
     with h5py.File(peaks_filename, "r") as fp:
-        is_solve = "solve" in fp
+        is_solve = "solve" in fp or "scan_refinement" in fp or "peaks/pixel_r" not in fp
     if is_solve:
         from subhkl.viz.solve import plot_solve
 
@@ -4619,6 +4621,8 @@ def run_indexer_visualize(
             zone_alpha,
         )
 
+    wl = None
+    sg = "P 1"
     with h5py.File(peaks_filename, "r") as fp:
         bank = fp["bank"][()]
         pr = fp["peaks/pixel_r"][()]
@@ -4637,6 +4641,13 @@ def run_indexer_visualize(
         U = fp["sample/U"][()]
         B = fp["sample/B"][()]
         ki = fp["beam/ki_vec"][()] if "beam/ki_vec" in fp else np.array([0.0, 0.0, 1.0])
+        if "instrument/wavelength" in fp:
+            wl_arr = np.asarray(fp["instrument/wavelength"], dtype=np.float64).ravel()
+            if wl_arr.size >= 2:
+                wl = (float(wl_arr[0]), float(wl_arr[1]))
+        if "sample/space_group" in fp:
+            raw_sg = fp["sample/space_group"][()]
+            sg = raw_sg.decode("utf-8") if isinstance(raw_sg, bytes) else str(raw_sg)
         inst = instrument or fp.attrs.get("instrument")
     if inst is None:
         raise ValueError("no instrument in the peaks file; pass --instrument")
@@ -4691,7 +4702,14 @@ def run_indexer_visualize(
             run_dets = {k: loaded.get_detector_by_img(k) for k in img_keys}
             run_ims = {k: loaded.image.ims[k] for k in img_keys}
             curves = zone_curve_points(
-                run_dets, U, B, R_gonio=R_frame, ki=ki, max_index=max_index
+                run_dets,
+                U,
+                B,
+                R_gonio=R_frame,
+                ki=ki,
+                max_index=max_index,
+                wavelength=wl,
+                space_group=sg,
             )
             # no peak markers here: with the raw counts rendered underneath,
             # the diffraction spots speak for themselves and the s=40

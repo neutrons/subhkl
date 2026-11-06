@@ -1501,6 +1501,7 @@ def refine_band_geometry(
     orient_bound_deg=11.5,
     maxiter=400,
     zone_weight="uniform",
+    rot_axis_only=None,
 ):
     """Co-refine the orientation AND the global detector geometry on the
     band objective.
@@ -1592,10 +1593,15 @@ def refine_band_geometry(
 
     ob = np.deg2rad(float(orient_bound_deg))
     rb = np.deg2rad(float(rot_bound_deg))
+    if rot_axis_only is not None:
+        ax_mask = np.abs(np.asarray(rot_axis_only, float)) > 0
+        rot_bounds = [(-rb, rb) if m else (0.0, 0.0) for m in ax_mask]
+    else:
+        rot_bounds = [(-rb, rb)] * 3
     bounds = (
         [(-ob, ob)] * 3
         + [(-float(radial_bound), float(radial_bound))]
-        + [(-rb, rb)] * 3
+        + rot_bounds
         + [(-float(trans_bound_m), float(trans_bound_m))] * 3
     )
     p0 = np.zeros(10)

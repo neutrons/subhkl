@@ -343,7 +343,14 @@ def load_observations(args, *, return_kinematics=False):
                 )
             centers_r = np.arange(n_rows // b) * b + (b - 1) / 2
             centers_c = np.arange(n_cols // b) * b + (b - 1) / 2
-            rr, cc = np.meshgrid(centers_r, centers_c, indexing="ij")
+            rr_0, cc_0 = np.meshgrid(centers_r, centers_c, indexing="ij")
+            rows_full, cols_full = np.meshgrid(
+                np.arange(n_rows, dtype=float),
+                np.arange(n_cols, dtype=float),
+                indexing="ij",
+            )
+            rows_bin = rows_full.reshape(n_rows // b, b, n_cols // b, b)
+            cols_bin = cols_full.reshape(n_rows // b, b, n_cols // b, b)
             collected = [[] for _ in range(8)]
             collected_kin = [[], []]
             mask_file = (
@@ -362,11 +369,10 @@ def load_observations(args, *, return_kinematics=False):
                         if len(matches) != 1:
                             raise ValueError("mask must have one entry per bank")
                         valid &= np.asarray(mask_file[key][matches[0]], bool)
-                    y = (
-                        np.where(valid, raw, 0)
-                        .reshape(n_rows // b, b, n_cols // b, b)
-                        .sum((1, 3))
+                    raw_blocks = np.where(valid, raw, 0).reshape(
+                        n_rows // b, b, n_cols // b, b
                     )
+                    y = raw_blocks.sum((1, 3))
                     good = valid.reshape(n_rows // b, b, n_cols // b, b).all((1, 3))
                     bg = median_filter(y, size=7, mode="nearest")
                     weight = y - bg
@@ -377,6 +383,23 @@ def load_observations(args, *, return_kinematics=False):
                         y > bg_safe,
                         2.0 * (y_safe * np.log(y_safe / bg_safe) - (y_safe - bg_safe)),
                         0.0,
+                    )
+                    excess_sq = (
+                        np.maximum(raw_blocks - (bg_5 / (b * b))[:, None, :, None], 0.0)
+                        ** 2
+                    )
+                    excess_sum = excess_sq.sum((1, 3))
+                    rr = np.where(
+                        excess_sum > 0,
+                        (excess_sq * rows_bin).sum((1, 3))
+                        / np.maximum(excess_sum, 1e-12),
+                        rr_0,
+                    )
+                    cc = np.where(
+                        excess_sum > 0,
+                        (excess_sq * cols_bin).sum((1, 3))
+                        / np.maximum(excess_sum, 1e-12),
+                        cc_0,
                     )
                     n = int(good.sum())
                     values = (

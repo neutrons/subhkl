@@ -1240,8 +1240,22 @@ _DPI_HELP = (
 
 @app.command()
 def finder_visualize(
-    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
-    peaks_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
+    images_filename: Annotated[
+        str,
+        typer.Argument(
+            help="Finder output HDF5 file (or reduced/merged images HDF5 if two positional arguments are given)"
+        ),
+    ],
+    peaks_filename: Annotated[
+        str | None,
+        typer.Argument(
+            help="Finder output HDF5 file (optional when images are resolved from source or --images)"
+        ),
+    ] = None,
+    images: Annotated[
+        str | None,
+        typer.Option("--images", help=_IMAGES_HELP),
+    ] = None,
     instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
     output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
@@ -1258,6 +1272,9 @@ def finder_visualize(
     finder without visualizations, keep the two HDF5 files, and come back to
     the pictures later.
     """
+    if peaks_filename is None and images is not None:
+        peaks_filename = images_filename
+        images_filename = images
     run_finder_visualize(
         images_filename=images_filename,
         peaks_filename=peaks_filename,
@@ -1272,8 +1289,22 @@ def finder_visualize(
 
 @app.command()
 def integrator_visualize(
-    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
-    peaks_filename: Annotated[str, typer.Argument(help="integrator output HDF5 file")],
+    images_filename: Annotated[
+        str,
+        typer.Argument(
+            help="Integrator output HDF5 file (or reduced/merged images HDF5 if two positional arguments are given)"
+        ),
+    ],
+    peaks_filename: Annotated[
+        str | None,
+        typer.Argument(
+            help="Integrator output HDF5 file (optional when images are resolved from source or --images)"
+        ),
+    ] = None,
+    images: Annotated[
+        str | None,
+        typer.Option("--images", help=_IMAGES_HELP),
+    ] = None,
     instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
     output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
@@ -1288,6 +1319,9 @@ def integrator_visualize(
     --create-visualizations' would have, drawing each peak at the shape the
     integrator fitted it, without repeating the integration.
     """
+    if peaks_filename is None and images is not None:
+        peaks_filename = images_filename
+        images_filename = images
     run_integrator_visualize(
         images_filename=images_filename,
         peaks_filename=peaks_filename,
