@@ -101,3 +101,52 @@ def test_count_search_weights_are_threshold_free_and_suppress_null_noise():
     flare = np.append(np.full(1000, 100.0), 1e8)
     w_capped = count_search_weights(flare, max_quantile=0.99, max_factor=3.0)
     assert np.isclose(w_capped[-1] / w_capped[0], 3.0, rtol=1e-3)
+
+
+def test_refine_band_geometry_arbitrary_and_unconstrained_rot_axis():
+    import jax
+    from subhkl.search.spherical import refine_band_geometry
+
+    C = np.array([[0.2, 0.1, 0.2], [-0.2, 0.2, 0.3], [0.1, -0.2, 0.25]])
+    O = np.array([[0.01, -0.02, 0.0], [-0.01, 0.01, 0.02], [0.02, 0.0, -0.01]])
+    w = np.array([2.0, 1.5, 3.0])
+    with jax.enable_x64():
+        fit_diag = refine_band_geometry(
+            C,
+            O,
+            w,
+            np.eye(3) / 12,
+            np.eye(3),
+            np.eye(3),
+            (2.0, 4.0),
+            2.0,
+            n_zones=13,
+            radial_bound=0.0,
+            rot_bound_deg=1.0,
+            rot_axis_only=(1.0, 1.0, 0.0),
+            trans_bound_m=0.0,
+            orient_bound_deg=0.0,
+            maxiter=2,
+        )
+        rg_diag = fit_diag["global_rot_vec"]
+        np.testing.assert_allclose(rg_diag[0], rg_diag[1], atol=1e-12)
+        assert rg_diag[2] == 0.0
+
+        fit_free = refine_band_geometry(
+            C,
+            O,
+            w,
+            np.eye(3) / 12,
+            np.eye(3),
+            np.eye(3),
+            (2.0, 4.0),
+            2.0,
+            n_zones=13,
+            radial_bound=0.0,
+            rot_bound_deg=1.0,
+            rot_axis_only=None,
+            trans_bound_m=0.0,
+            orient_bound_deg=0.0,
+            maxiter=2,
+        )
+        assert fit_free["global_rot_vec"].shape == (3,)

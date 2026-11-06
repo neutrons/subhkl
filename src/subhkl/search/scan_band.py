@@ -271,13 +271,25 @@ def refine_scan(args):
     is_single_setting = len(args.runs) <= 1 or np.allclose(
         R_obs[sel], R_obs[sel][0:1], atol=1e-6
     )
+    rot_axis = getattr(args, "global_rot_axis", (0.0, 1.0, 0.0))
+    if rot_axis is not None:
+        ax_arr = np.asarray(rot_axis, dtype=np.float64)
+        rot_axis_unit = ax_arr / np.linalg.norm(ax_arr)
+        rot_dom_idx = int(np.argmax(np.abs(rot_axis_unit)))
+        if rot_axis_unit[rot_dom_idx] < 0:
+            rot_axis_unit = -rot_axis_unit
+        rot_axis_j = jnp.asarray(rot_axis_unit, dtype=jnp.float64)
+    else:
+        rot_axis_unit = None
+        rot_dom_idx = None
+        rot_axis_j = None
 
     def unpack(p):
         rv = p[0:3]
         s_rad = p[3]
         s_ax = s_rad if is_single_setting and "axial_stretch" in args.modes else p[4]
         s_area = p[5]
-        rg = p[6:9]
+        rg = p[6 + rot_dom_idx] * rot_axis_j if rot_axis_j is not None else p[6:9]
         T = p[9:12]
         s_samp = p[12:15]
         da = p[15]
@@ -387,14 +399,16 @@ def refine_scan(args):
             if slot not in active_cell_slots:
                 bounds[15 + slot] = (0.0, 0.0)
         bounds[18 + args.anchor_run] = (0.0, 0.0)
+        if rot_axis_unit is not None:
+            for i in range(3):
+                if i != rot_dom_idx:
+                    bounds[6 + i] = (0.0, 0.0)
         # Fix sample-shift gauge: for a single orientation setting, s_samp is
         # indistinguishable from global detector translation; for a multi-run
         # scan, fix the component along the dominant sample-frame rotation axis.
         if is_single_setting:
             bounds[4] = (0.0, 0.0)
             bounds[5] = (0.0, 0.0)
-            bounds[6] = (0.0, 0.0)
-            bounds[8] = (0.0, 0.0)
             for idx_s in (12, 13, 14):
                 bounds[idx_s] = (0.0, 0.0)
             for idx_p in range(18 + n_runs, 18 + n_runs + 2 * n_banks):
@@ -921,6 +935,8 @@ def refine_scan(args):
             | (upper - p_cur < 1e-4 * (upper - lower))
         )
     )
+    p_out = p_cur.copy()
+    p_out[6:9] = np.asarray(rg, dtype=np.float64)
     status = write_result(
         args,
         U_opt,
@@ -934,7 +950,7 @@ def refine_scan(args):
         H_final,
         dom_deg,
         np.asarray(s_samp),
-        p_cur,
+        p_out,
         diagnostics,
     )
     print(f"Wrote staged band refinement to {args.output}", flush=True)

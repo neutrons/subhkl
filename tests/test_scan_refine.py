@@ -392,3 +392,82 @@ def test_single_run_support_without_file_offsets(tmp_path):
         assert bounds[15, 0] < bounds[15, 1]
         assert bounds[16, 0] < bounds[16, 1]
         np.testing.assert_array_equal(bounds[17], [0.0, 0.0])
+
+
+def test_global_rot_axis_modes(tmp_path):
+    frames, bootstrap = tmp_path / "rot_axis.h5", tmp_path / "seed_rot.h5"
+    counts = np.full((1, 256, 256), 3.0)
+    counts[0, :32, :32] = 6.0
+    cell = [18.39, 56.55, 6.54, 90.0, 90.0, 90.0]
+    with h5py.File(frames, "w") as f:
+        f["images"] = counts
+        f["bank_ids"] = [20]
+        f["goniometer/axes"] = np.array([[0.0, 1.0, 0.0, -1.0]])
+        f["goniometer/angles"] = np.array([[35.0]])
+        for k, v in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            f[f"sample/{k}"] = v
+        f["sample/space_group"] = "Fdd2"
+        f["instrument/wavelength"] = [1.1, 8.5]
+        f.attrs["instrument"] = "MANDI"
+    with h5py.File(bootstrap, "w") as f:
+        f["sample/U"] = np.eye(3)
+
+    # 1. Default vertical axis (0,1,0): only slot 7 is free; slots 6 and 8 are locked
+    out_y = tmp_path / "rot_y.h5"
+    run_scan_refinement(
+        frames,
+        out_y,
+        bootstrap=bootstrap,
+        instrument="MANDI",
+        modes=["global_rot"],
+        maxiter=1,
+        n_zones=60,
+        binning=32,
+    )
+    with h5py.File(out_y) as f:
+        assert f["scan_refinement"].attrs["global_rot_axis"] == "0,1,0"
+        bounds = f["scan_refinement/parameter_bounds"][()]
+        np.testing.assert_array_equal(bounds[6], [0.0, 0.0])
+        assert bounds[7, 0] < bounds[7, 1]
+        np.testing.assert_array_equal(bounds[8], [0.0, 0.0])
+
+    # 2. Unconstrained 3D rotation ('none'): all 3 slots 6..8 are free
+    out_none = tmp_path / "rot_none.h5"
+    run_scan_refinement(
+        frames,
+        out_none,
+        bootstrap=bootstrap,
+        instrument="MANDI",
+        modes=["global_rot"],
+        global_rot_axis="none",
+        maxiter=1,
+        n_zones=60,
+        binning=32,
+    )
+    with h5py.File(out_none) as f:
+        assert f["scan_refinement"].attrs["global_rot_axis"] == "none"
+        bounds = f["scan_refinement/parameter_bounds"][()]
+        for idx in (6, 7, 8):
+            assert bounds[idx, 0] < bounds[idx, 1]
+
+    # 3. Arbitrary diagonal axis ('1,1,0'): 1 free slot (slot 6), rg parallel to (1,1,0)
+    out_diag = tmp_path / "rot_diag.h5"
+    run_scan_refinement(
+        frames,
+        out_diag,
+        bootstrap=bootstrap,
+        instrument="MANDI",
+        modes=["global_rot"],
+        global_rot_axis="1,1,0",
+        maxiter=1,
+        n_zones=60,
+        binning=32,
+    )
+    with h5py.File(out_diag) as f:
+        bounds = f["scan_refinement/parameter_bounds"][()]
+        assert bounds[6, 0] < bounds[6, 1]
+        np.testing.assert_array_equal(bounds[7], [0.0, 0.0])
+        np.testing.assert_array_equal(bounds[8], [0.0, 0.0])
+        rg = f["scan_refinement/parameters"][()][6:9]
+        np.testing.assert_allclose(rg[0], rg[1], atol=1e-12)
+        assert rg[2] == 0.0

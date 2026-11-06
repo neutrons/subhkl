@@ -107,6 +107,34 @@ def _frame_rotations_and_scan_axes(f, n_frames):
     return R, axes, angles, scan_col, scan_axes_lab
 
 
+def _parse_rot_axis(axis):
+    if axis is None:
+        return None
+    if isinstance(axis, str):
+        s = axis.strip()
+        if s.lower() in ("", "none"):
+            return None
+        try:
+            vals = [float(v.strip()) for v in s.split(",")]
+        except ValueError as exc:
+            raise ValueError(
+                "global_rot_axis must be three comma-separated floats or 'none'"
+            ) from exc
+    else:
+        vals = [float(v) for v in axis]
+    arr = np.asarray(vals, dtype=float)
+    if arr.shape != (3,) or not np.isfinite(arr).all():
+        raise ValueError("global_rot_axis must be a finite 3-vector or None")
+    norm = float(np.linalg.norm(arr))
+    if norm == 0.0:
+        raise ValueError("global_rot_axis must be nonzero")
+    unit = arr / norm
+    dom = int(np.argmax(np.abs(unit)))
+    if unit[dom] < 0:
+        unit = -unit
+    return tuple(float(v) for v in unit)
+
+
 def run_scan_refinement(
     frames,
     output,
@@ -131,6 +159,7 @@ def run_scan_refinement(
     search_samples=16384,
     search_candidates=6,
     search_seed=0,
+    global_rot_axis=(0.0, 1.0, 0.0),
 ):
     """Index from finder observations or count bins and refine with band-geometry modes.
 
@@ -250,6 +279,7 @@ def run_scan_refinement(
     ):
         raise ValueError("invalid cell")
     get_space_group_object(space_group)
+    rot_axis = _parse_rot_axis(global_rot_axis)
     selected = list(range(len(offsets))) if runs is None else list(runs)
     stable = selected if stable_runs is None else list(stable_runs)
     if not selected or not stable or not set(stable) <= set(selected):
@@ -279,6 +309,7 @@ def run_scan_refinement(
         binning=binning,
         maxiter=maxiter,
         static_mask_file=static_mask_file,
+        global_rot_axis=rot_axis,
     )
     from subhkl.search.scan_band import refine_scan
     import jax
@@ -558,6 +589,10 @@ def write_result(
             report["runs"] = args.runs
             report["stable_runs"] = args.stable_runs
             report.attrs["modes"] = ",".join(sorted(args.modes))
+            rot_ax = getattr(args, "global_rot_axis", (0.0, 1.0, 0.0))
+            report.attrs["global_rot_axis"] = (
+                "none" if rot_ax is None else ",".join(f"{v:g}" for v in rot_ax)
+            )
             report.attrs["source"] = str(Path(args.nexus).resolve())
             report.attrs["finder"] = str(args.finder or "")
             report.attrs["bootstrap"] = str(Path(args.bootstrap).resolve())

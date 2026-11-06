@@ -147,10 +147,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
     print(
         f"Joint band refinement of {len(found)} distinct blind candidates", flush=True
     )
-    is_single_setting = len(args.stable_runs) <= 1 or np.allclose(
-        Rs, Rs[0:1], atol=1e-6
-    )
-    rot_axis_only = (0.0, 1.0, 0.0) if is_single_setting else None
+    rot_axis_only = getattr(args, "global_rot_axis", (0.0, 1.0, 0.0))
     fits = []
     for i, item in enumerate(found):
         U = item[0]

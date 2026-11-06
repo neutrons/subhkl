@@ -1557,9 +1557,31 @@ def refine_band_geometry(
     )
     lam_lo, lam_hi = float(wavelength[0]), float(wavelength[1])
     gmax = 1.0 / float(d_min)
+    ob = np.deg2rad(float(orient_bound_deg))
+    rb = np.deg2rad(float(rot_bound_deg))
+    if rot_axis_only is not None:
+        ax_arr = np.asarray(rot_axis_only, np.float64)
+        if (
+            ax_arr.shape != (3,)
+            or not np.isfinite(ax_arr).all()
+            or np.linalg.norm(ax_arr) == 0
+        ):
+            raise ValueError("rot_axis_only must be a nonzero 3-vector or None")
+        rot_axis_unit = ax_arr / np.linalg.norm(ax_arr)
+        rot_dom_idx = int(np.argmax(np.abs(rot_axis_unit)))
+        if rot_axis_unit[rot_dom_idx] < 0:
+            rot_axis_unit = -rot_axis_unit
+        rot_axis_j = jnp.asarray(rot_axis_unit, jnp.float64)
+        rot_bounds = [(-rb, rb) if i == rot_dom_idx else (0.0, 0.0) for i in range(3)]
+    else:
+        rot_axis_unit = None
+        rot_dom_idx = None
+        rot_axis_j = None
+        rot_bounds = [(-rb, rb)] * 3
 
     def objective(p):
-        rv, scale, rg, T = p[:3], p[3], p[4:7], p[7:10]
+        rv, scale, T = p[:3], p[3], p[7:10]
+        rg = p[4 + rot_dom_idx] * rot_axis_j if rot_axis_j is not None else p[4:7]
         Rg = _rodrigues_jax(rg)
         xyz = (C * (1.0 + scale) + O) @ Rg.T + T[None, :]
         kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
@@ -1591,13 +1613,6 @@ def refine_band_geometry(
         v, gr = vg(jnp.asarray(p))
         return float(v), np.asarray(gr, np.float64)
 
-    ob = np.deg2rad(float(orient_bound_deg))
-    rb = np.deg2rad(float(rot_bound_deg))
-    if rot_axis_only is not None:
-        ax_mask = np.abs(np.asarray(rot_axis_only, float)) > 0
-        rot_bounds = [(-rb, rb) if m else (0.0, 0.0) for m in ax_mask]
-    else:
-        rot_bounds = [(-rb, rb)] * 3
     bounds = (
         [(-ob, ob)] * 3
         + [(-float(radial_bound), float(radial_bound))]
@@ -1632,7 +1647,12 @@ def refine_band_geometry(
         if res is None or r_.fun < res.fun:
             res = r_
     p = np.asarray(res.x, np.float64)
-    Rg = np.asarray(_rodrigues_jax(jnp.asarray(p[4:7])))
+    rg_vec = (
+        float(p[4 + rot_dom_idx]) * rot_axis_unit
+        if rot_axis_unit is not None
+        else p[4:7].copy()
+    )
+    Rg = np.asarray(_rodrigues_jax(jnp.asarray(rg_vec)))
     U = np.asarray(_rodrigues_jax(jnp.asarray(p[:3]))) @ np.asarray(U0, np.float64)
 
     def panels(bank_centers, bank_uhats, bank_vhats):
@@ -1646,7 +1666,7 @@ def refine_band_geometry(
     return {
         "U": _orthonormalize(U),
         "radial_scale": float(p[3]),
-        "global_rot_vec": p[4:7].copy(),
+        "global_rot_vec": rg_vec.copy(),
         "global_trans_m": p[7:10].copy(),
         "score": float(-res.fun),
         "score0": float(s0),
