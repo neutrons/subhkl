@@ -1,0 +1,28 @@
+{
+  "command": "solve counts.h5 result.h5 --background-file background.h5 --n-candidates 1 --d-min 2",
+  "status": "converged",
+  "orientation_error_deg": 0.009427671026338002,
+  "g_true": [
+    0.025,
+    0.008,
+    -0.006,
+    0.001,
+    -0.0015,
+    0.002
+  ],
+  "g_fit": [
+    0.024459948703200073,
+    0.007686120243309089,
+    -0.005908054034604806,
+    0.0010073865736445703,
+    -0.001575274677552693,
+    0.0020140774817286418
+  ],
+  "n_evaluations": 510,
+  "active": [
+    0
+  ],
+  "objective_initial": 28024.159559687607,
+  "objective_final": 17822.016553231486,
+  "stationarity_residual": 1.6143118084234036e-05
+}

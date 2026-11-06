@@ -208,14 +208,25 @@ def test_cell_dictionary_is_optional(frames, calibrator):
     with pytest.raises(ValueError):
         with_objective(QUICK_STAGES, "zone")
     _, U_true, _ = frames
-    band = calibrator.evaluate(G_TRUE, Stage(1.0, "band", 8.0, 1.0, 1), orientation=U_true)
+    band = calibrator.evaluate(
+        G_TRUE, Stage(1.0, "band", 8.0, 1.0, 1), orientation=U_true
+    )
     assert np.isnan(band.cell_correlation)
-    cell = calibrator.evaluate(G_TRUE, Stage(1.0, "cell", 8.0, 1.0, 1), orientation=U_true)
+    cell = calibrator.evaluate(
+        G_TRUE, Stage(1.0, "cell", 8.0, 1.0, 1), orientation=U_true
+    )
     assert np.isfinite(cell.cell_correlation)
-    assert Calibrator.objective_value(cell, Stage(1.0, "cell", 8.0, 1.0, 1)) == cell.cell_correlation
+    assert (
+        Calibrator.objective_value(cell, Stage(1.0, "cell", 8.0, 1.0, 1))
+        == cell.cell_correlation
+    )
     ev = Evaluation(G_TRUE, U_true, 0.0123, 1, float("nan"), 0.5, 1)
-    assert Calibrator.objective_value(ev, Stage(1.0, "band", 8.0, 1.0, 1)) == pytest.approx(12.3)
-    assert Calibrator.objective_value(ev, Stage(1.0, "raw", 8.0, 1.0, 1)) == pytest.approx(50.0)
+    assert Calibrator.objective_value(
+        ev, Stage(1.0, "band", 8.0, 1.0, 1)
+    ) == pytest.approx(12.3)
+    assert Calibrator.objective_value(
+        ev, Stage(1.0, "raw", 8.0, 1.0, 1)
+    ) == pytest.approx(50.0)
 
 
 def test_detection_map_is_sparse_and_precise(calibrator, frames):

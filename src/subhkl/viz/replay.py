@@ -213,10 +213,53 @@ def _render(args):
     return out_name
 
 
+def _resolve_images_and_peaks(
+    images_filename: str | None,
+    peaks_filename: str | None,
+) -> tuple[str, str]:
+    """Allow passing either (peaks_filename) or (images_filename, peaks_filename)."""
+    if peaks_filename is None:
+        if images_filename is None:
+            raise ValueError("peaks_filename is required")
+        peaks_filename = images_filename
+        images_filename = None
+    elif images_filename is not None and os.path.isfile(images_filename):
+        # If the user passed (peaks.h5, images.h5) in reverse order, swap them
+        try:
+            with (
+                h5py.File(images_filename, "r") as f_a,
+                h5py.File(peaks_filename, "r") as f_b,
+            ):
+                if "peaks" in f_a and "images" not in f_a and "images" in f_b:
+                    images_filename, peaks_filename = peaks_filename, images_filename
+        except OSError:
+            pass
+
+    if images_filename is None:
+        with h5py.File(peaks_filename, "r") as f:
+            src = f.attrs.get("source")
+            if isinstance(src, bytes):
+                src = src.decode("utf-8")
+            if src and os.path.isfile(src):
+                images_filename = str(src)
+        if images_filename is None:
+            sibling = os.path.join(
+                os.path.dirname(os.path.abspath(peaks_filename)), "merged.h5"
+            )
+            if os.path.isfile(sibling):
+                images_filename = sibling
+        if images_filename is None:
+            raise ValueError(
+                f"{peaks_filename} does not record its source image stack; "
+                "pass the reduced/merged images HDF5 via --images or as the first argument."
+            )
+    return images_filename, peaks_filename
+
+
 def replay_plots(
-    images_filename: str,
-    peaks_filename: str,
-    suffix: str,
+    images_filename: str | None = None,
+    peaks_filename: str | None = None,
+    suffix: str = "-pred",
     instrument: str | None = None,
     output_dir: str | None = None,
     dpi: int = 600,
@@ -230,6 +273,9 @@ def replay_plots(
     inline plots already use, so a replayed plot lands where the original would
     have.
     """
+    images_filename, peaks_filename = _resolve_images_and_peaks(
+        images_filename, peaks_filename
+    )
     table = read_peaks_table(peaks_filename)
     instrument = _resolve_instrument(instrument, table, images_filename)
 

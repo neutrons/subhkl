@@ -46,7 +46,6 @@ def _synthetic_finder_file(path, rng, wavelength=None, perturb=None):
     B, _ = cartesian_matrix_metric_tensor(a, a, a, *np.deg2rad([90, 90, 90]))
     h, k, l_ = generate_reflections(a, a, a, 90, 90, 90, space_group="P 1", d_min=1.3)
     G = np.stack([h, k, l_], axis=1) @ B.T
-    dirs = G / np.linalg.norm(G, axis=1, keepdims=True)
     Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
     U_true = Q * np.sign(np.linalg.det(Q))
 

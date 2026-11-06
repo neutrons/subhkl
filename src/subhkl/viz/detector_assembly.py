@@ -282,12 +282,34 @@ def plot_unrolled_detector(
             )
             added_finder_label = True
 
-    # 2.6 Zone conics (indexer-visualize): each entry carries per-panel lab
-    # positions of one crystallographic zone's curve, drawn in the same
-    # wrapped/compressed coordinates as everything else on this figure.
+    # 2.6 Zone Bragg peak circles (indexer-visualize): each entry carries
+    # per-panel isotropic Bragg peak circles (or fallback curve points) of
+    # one crystallographic zone [uvw], color-coded by zone so predicted
+    # reflections surround rather than cover the raw detector spots.
     if zone_curves is not None:
         for zc in zone_curves:
             first = True
+            z_peaks = zc.get("peaks")
+            if z_peaks:
+                for img_key, pk_arr in z_peaks.items():
+                    det = detectors.get(img_key)
+                    if det is None or len(pk_arr) == 0:
+                        continue
+                    s_lab = get_s_lab_for_image(img_key)
+                    pk_arr = np.atleast_2d(pk_arr)
+                    _draw_outlines(
+                        ax,
+                        det,
+                        s_lab,
+                        zip(pk_arr[:, 0], pk_arr[:, 1], pk_arr[:, 2], strict=False),
+                        n_sigma=n_sigma,
+                        color=zc["color"],
+                        label=zc["label"] if first and zc.get("label") else "",
+                        wrapped=img_key in wrapped_panels,
+                        compress=compress_roty,
+                    )
+                    first = False
+                continue
             for img_key, xyz in zc["points"].items():
                 det = detectors.get(img_key)
                 if det is None or len(xyz) == 0:
@@ -540,6 +562,8 @@ def plot_unrolled_detector(
     if instrument is not None:
         title_str = f"{instrument} | {title_str}"
 
+    if getattr(peaks, "diagnostic_status", None):
+        title_str += f" | DIAGNOSTIC: {peaks.diagnostic_status}"
     ax.set_title(title_str)
 
     if mesh_handle is not None:

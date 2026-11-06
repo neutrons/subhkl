@@ -508,19 +508,17 @@ def _smoothing(L, sigma):
     return np.exp(-ell * (ell + 1.0) * sigma * sigma / 2.0)
 
 
-def project_points(dirs, weights, L, sigma, even_only=True):
+def project_points(dirs, weights, L, sigma, even_only=True, chunk=2048):
     """SH coefficients of a sum of smoothed deltas.  f[l, m + L] complex.
 
     f_lm = sum_j w_j conj(Y_lm(dir_j)) s_l -- a direct nonuniform sum; no
     spherical grid.  even_only drops odd degrees (antipodal symmetry).
+    Chunked over directions via project_counts so high-bandwidth dictionaries
+    (e.g. L = 192 with 15k-65k directions) do not materialize a multi-GB
+    (L+1, 2L+1, N) complex128 array at once.
     """
     w = np.ones(len(dirs)) if weights is None else np.asarray(weights, dtype=float)
-    Y = sph_harm_all(L, dirs)
-    f = np.einsum("lmj,j->lm", np.conj(Y), w)
-    f *= _smoothing(L, sigma)[:, None]
-    if even_only:
-        f[1::2] = 0.0
-    return f
+    return project_counts(dirs, w, L, sigma, even_only=even_only, chunk=chunk)
 
 
 def project_counts(pixel_dirs, excess, L, sigma, even_only=True, chunk=8192):
@@ -1297,10 +1295,15 @@ def _lattice_kernels():
         auto-indexing).  No tolerance: the band sets the window.
         """
         two_pi = 2.0 * jnp.pi
-        den = two_pi * (qhi - qlo) * t
+        valid = qhi > qlo
+        hi_safe = jnp.where(valid, qhi, qlo + 1.0)
+        den = two_pi * (hi_safe - qlo) * t
         ok = jnp.abs(den) > 1e-7
-        num = jnp.sin(two_pi * qhi * t) - jnp.sin(two_pi * qlo * t)
-        return jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0)
+        num = jnp.sin(two_pi * hi_safe * t) - jnp.sin(two_pi * qlo * t)
+        envelope = jnp.tanh((hi_safe - qlo) / jnp.maximum(0.02 * qlo, 1e-6))
+        return jnp.where(
+            valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
+        )
 
     def band_chunk(Pc, xl, Dj, wj, qlo, qhi):
         """Table cell values: [poles, zone lengths]."""
@@ -1498,6 +1501,7 @@ def refine_band_geometry(
     orient_bound_deg=11.5,
     maxiter=400,
     zone_weight="uniform",
+    rot_axis_only=None,
 ):
     """Co-refine the orientation AND the global detector geometry on the
     band objective.
@@ -1537,7 +1541,7 @@ def refine_band_geometry(
     C = jnp.asarray(np.asarray(centers, np.float64))
     O = jnp.asarray(np.asarray(offsets, np.float64))
     w = jnp.asarray(np.asarray(weights, np.float64))
-    w = w / jnp.maximum(w.sum(), 1e-12)
+    w = w / jnp.maximum(jnp.abs(w).sum(), 1e-12)
     Rs = np.asarray(R_spots, np.float64)
     if Rs.ndim == 2:
         Rs = np.broadcast_to(Rs, (len(centers), 3, 3))
@@ -1553,9 +1557,31 @@ def refine_band_geometry(
     )
     lam_lo, lam_hi = float(wavelength[0]), float(wavelength[1])
     gmax = 1.0 / float(d_min)
+    ob = np.deg2rad(float(orient_bound_deg))
+    rb = np.deg2rad(float(rot_bound_deg))
+    if rot_axis_only is not None:
+        ax_arr = np.asarray(rot_axis_only, np.float64)
+        if (
+            ax_arr.shape != (3,)
+            or not np.isfinite(ax_arr).all()
+            or np.linalg.norm(ax_arr) == 0
+        ):
+            raise ValueError("rot_axis_only must be a nonzero 3-vector or None")
+        rot_axis_unit = ax_arr / np.linalg.norm(ax_arr)
+        rot_dom_idx = int(np.argmax(np.abs(rot_axis_unit)))
+        if rot_axis_unit[rot_dom_idx] < 0:
+            rot_axis_unit = -rot_axis_unit
+        rot_axis_j = jnp.asarray(rot_axis_unit, jnp.float64)
+        rot_bounds = [(-rb, rb) if i == rot_dom_idx else (0.0, 0.0) for i in range(3)]
+    else:
+        rot_axis_unit = None
+        rot_dom_idx = None
+        rot_axis_j = None
+        rot_bounds = [(-rb, rb)] * 3
 
     def objective(p):
-        rv, scale, rg, T = p[:3], p[3], p[4:7], p[7:10]
+        rv, scale, T = p[:3], p[3], p[7:10]
+        rg = p[4 + rot_dom_idx] * rot_axis_j if rot_axis_j is not None else p[4:7]
         Rg = _rodrigues_jax(rg)
         xyz = (C * (1.0 + scale) + O) @ Rg.T + T[None, :]
         kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
@@ -1568,10 +1594,17 @@ def refine_band_geometry(
         Rm = _rodrigues_jax(rv) @ Uj
         t = (X0 @ Rm.T) @ d.T  # [zones, spots]
         two_pi = 2.0 * jnp.pi
-        den = two_pi * (q_hi - q_lo)[None, :] * t
+        valid = (q_hi > q_lo)[None, :]
+        hi_safe = jnp.where(q_hi > q_lo, q_hi, q_lo + 1.0)[None, :]
+        den = two_pi * (hi_safe - q_lo[None, :]) * t
         ok = jnp.abs(den) > 1e-7
-        num = jnp.sin(two_pi * q_hi[None, :] * t) - jnp.sin(two_pi * q_lo[None, :] * t)
-        K = jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0)
+        num = jnp.sin(two_pi * hi_safe * t) - jnp.sin(two_pi * q_lo[None, :] * t)
+        envelope = jnp.tanh(
+            (hi_safe - q_lo[None, :]) / jnp.maximum(0.02 * q_lo[None, :], 1e-6)
+        )
+        K = jnp.where(
+            valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
+        )
         return -jnp.einsum("km,k,m->", K, wz, w)
 
     vg = jax.jit(jax.value_and_grad(objective))
@@ -1580,12 +1613,10 @@ def refine_band_geometry(
         v, gr = vg(jnp.asarray(p))
         return float(v), np.asarray(gr, np.float64)
 
-    ob = np.deg2rad(float(orient_bound_deg))
-    rb = np.deg2rad(float(rot_bound_deg))
     bounds = (
         [(-ob, ob)] * 3
         + [(-float(radial_bound), float(radial_bound))]
-        + [(-rb, rb)] * 3
+        + rot_bounds
         + [(-float(trans_bound_m), float(trans_bound_m))] * 3
     )
     p0 = np.zeros(10)
@@ -1616,7 +1647,12 @@ def refine_band_geometry(
         if res is None or r_.fun < res.fun:
             res = r_
     p = np.asarray(res.x, np.float64)
-    Rg = np.asarray(_rodrigues_jax(jnp.asarray(p[4:7])))
+    rg_vec = (
+        float(p[4 + rot_dom_idx]) * rot_axis_unit
+        if rot_axis_unit is not None
+        else p[4:7].copy()
+    )
+    Rg = np.asarray(_rodrigues_jax(jnp.asarray(rg_vec)))
     U = np.asarray(_rodrigues_jax(jnp.asarray(p[:3]))) @ np.asarray(U0, np.float64)
 
     def panels(bank_centers, bank_uhats, bank_vhats):
@@ -1630,7 +1666,7 @@ def refine_band_geometry(
     return {
         "U": _orthonormalize(U),
         "radial_scale": float(p[3]),
-        "global_rot_vec": p[4:7].copy(),
+        "global_rot_vec": rg_vec.copy(),
         "global_trans_m": p[7:10].copy(),
         "score": float(-res.fun),
         "score0": float(s0),
@@ -1726,7 +1762,10 @@ def lattice_ladder(
         if weights is None
         else np.asarray(weights, np.float32)
     )
-    w = w / max(w.sum(), 1e-12)
+    # Dense count proposals carry signed residuals, including negative total
+    # excess. Absolute normalization preserves those signs without amplifying
+    # a nonpositive sum by 1e12; positive peak weights are unchanged.
+    w = w / max(np.abs(w).sum(), 1e-12)
     # pad the spots to a power of two so the exact kernel compiles once per
     # size class, not once per still
     n_pad = 1 << int(np.ceil(np.log2(max(len(D), 2))))

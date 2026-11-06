@@ -152,7 +152,13 @@ def with_objective(stages, objective: str):
         raise ValueError(f"objective must be one of {OBJECTIVES}, got {objective!r}")
     return tuple(
         Stage(
-            s.cell_deg, objective, s.theta, s.step_scale, s.max_evals, s.tol_deg, s.width
+            s.cell_deg,
+            objective,
+            s.theta,
+            s.step_scale,
+            s.max_evals,
+            s.tol_deg,
+            s.width,
         )
         for s in stages
     )
