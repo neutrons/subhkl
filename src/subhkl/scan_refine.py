@@ -160,6 +160,7 @@ def run_scan_refinement(
     search_candidates=6,
     search_seed=0,
     global_rot_axis=(0.0, 1.0, 0.0),
+    border_width=4,
 ):
     """Index from finder observations or count bins and refine with band-geometry modes.
 
@@ -199,9 +200,15 @@ def run_scan_refinement(
     chosen = MODES if modes is None else frozenset(modes)
     if chosen - MODES:
         raise ValueError(f"unknown band refinement modes: {sorted(chosen - MODES)}")
-    if min_deviance < 0 or maxiter < 1 or n_zones < 60 or d_min <= 0:
+    if (
+        min_deviance < 0
+        or maxiter < 1
+        or n_zones < 60
+        or d_min <= 0
+        or border_width < 0
+    ):
         raise ValueError(
-            "invalid band refinement budget, zones, resolution or deviance"
+            "invalid band refinement budget, zones, resolution, deviance or border_width"
         )
     wl_low, wl_high = (None, None) if wavelength is None else wavelength
     if wl_low is None:
@@ -310,6 +317,7 @@ def run_scan_refinement(
         maxiter=maxiter,
         static_mask_file=static_mask_file,
         global_rot_axis=rot_axis,
+        border_width=int(border_width),
     )
     from subhkl.search.scan_band import refine_scan
     import jax
@@ -387,6 +395,7 @@ def load_observations(args, *, return_kinematics=False):
             mask_file = (
                 h5py.File(args.static_mask_file) if args.static_mask_file else None
             )
+            bw = int(getattr(args, "border_width", 4))
             try:
                 for i in range(n_frames):
                     if run_ids[i] not in args.runs:
@@ -400,6 +409,13 @@ def load_observations(args, *, return_kinematics=False):
                         if len(matches) != 1:
                             raise ValueError("mask must have one entry per bank")
                         valid &= np.asarray(mask_file[key][matches[0]], bool)
+                    if bw > 0 and n_rows > 4 * max(b, bw) and n_cols > 4 * max(b, bw):
+                        raw = np.pad(raw[bw:-bw, bw:-bw], bw, mode="edge")
+                        if bw >= b:
+                            valid[: (bw // b) * b, :] = False
+                            valid[-((bw // b) * b) :, :] = False
+                            valid[:, : (bw // b) * b] = False
+                            valid[:, -((bw // b) * b) :] = False
                     raw_blocks = np.where(valid, raw, 0).reshape(
                         n_rows // b, b, n_cols // b, b
                     )
@@ -482,6 +498,47 @@ def checkpoint(args, name, parameters, diagnostics):
         group.attrs["diagnostics"] = json.dumps(diagnostics[-1])
 
 
+def _decompose_R_to_angles(axes, ang_nom, R_target):
+    """Decompose a 3D rotation matrix R_target into motor angles on `axes` near `ang_nom`."""
+    from scipy.optimize import least_squares
+
+    K = len(axes)
+    if K == 3:
+        free_cols = [0, 1, 2]
+        inits = [np.zeros(3)]
+    elif K == 5:
+        free_cols = [0, 2, 4]
+        inits = [
+            np.array([0.0, 2.0, 0.0]),
+            np.array([0.0, -2.0, 0.0]),
+            np.zeros(3),
+        ]
+    else:
+        free_cols = list(range(min(K, 3)))
+        inits = [np.zeros(len(free_cols))]
+    best_a, best_err = ang_nom.copy(), 1e9
+    for x0 in inits:
+
+        def fn(x):
+            a = ang_nom.copy()
+            for idx, c in enumerate(free_cols):
+                a[c] += x[idx]
+            return Rotation.from_matrix(
+                calc_goniometer_rotation_matrix(axes, a) @ R_target.T
+            ).as_rotvec()
+
+        res = least_squares(fn, x0, ftol=1e-15, xtol=1e-15, gtol=1e-15, max_nfev=200)
+        a = ang_nom.copy()
+        for idx, c in enumerate(free_cols):
+            a[c] += res.x[idx]
+        err = float(np.max(np.abs(calc_goniometer_rotation_matrix(axes, a) - R_target)))
+        if err < best_err:
+            best_err, best_a = err, a
+        if best_err < 1e-13:
+            break
+    return best_a
+
+
 def write_result(
     args,
     U,
@@ -544,9 +601,21 @@ def write_result(
             run_ids = np.searchsorted(offsets, np.arange(n_frames), side="right") - 1
             if "goniometer/per_run" in out:
                 del out["goniometer/per_run"]
+            R_runs_ref = getattr(args, "R_runs_refined", None)
             if angles is not None and axes is not None and col is not None:
-                corrected = angles.copy()
-                corrected[:, col] += delta[run_ids]
+                changes = np.zeros((args.n_runs, len(axes)))
+                if R_runs_ref is not None and len(axes) >= 3:
+                    for r in range(args.n_runs):
+                        ang_nom_r = angles[offsets[r]]
+                        ang_corr_r = _decompose_R_to_angles(
+                            axes, ang_nom_r, R_runs_ref[r]
+                        )
+                        changes[r] = ang_corr_r - ang_nom_r
+                    corrected = angles + changes[run_ids]
+                else:
+                    changes[:, col] = delta
+                    corrected = angles.copy()
+                    corrected[:, col] += delta[run_ids]
                 put("goniometer/angles_nominal", angles)
                 put("goniometer/angles", corrected)
                 put(
@@ -558,16 +627,17 @@ def write_result(
                 shifts = np.zeros((len(axes), 3))
                 shifts[-1] = sample
                 put("goniometer/translations", shifts)
-                changes = np.zeros((args.n_runs, len(axes)))
-                changes[:, col] = delta
                 put("goniometer/per_run/delta_deg", np.asarray(delta, float))
                 put("goniometer/per_run/delta_deg_all_axes", changes)
                 put("goniometer/per_run/frame_to_run", run_ids)
             else:
-                d_rot = Rotation.from_rotvec(
-                    np.deg2rad(delta[run_ids])[:, None] * scan_axes_lab
-                ).as_matrix()
-                put("goniometer/R", np.einsum("nij,njk->nik", d_rot, R_nom))
+                if R_runs_ref is not None:
+                    put("goniometer/R", np.asarray(R_runs_ref, float)[run_ids])
+                else:
+                    d_rot = Rotation.from_rotvec(
+                        np.deg2rad(delta[run_ids])[:, None] * scan_axes_lab
+                    ).as_matrix()
+                    put("goniometer/R", np.einsum("nij,njk->nik", d_rot, R_nom))
                 put("goniometer/translations", np.asarray(sample, float))
                 put("goniometer/per_run/delta_deg", np.asarray(delta, float))
                 put("goniometer/per_run/frame_to_run", run_ids)

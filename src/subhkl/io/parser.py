@@ -177,6 +177,14 @@ def solve(
             help="Axis vector for global detector rotation (e.g. '0,1,0', or 'none' for unconstrained 3D rotation)",
         ),
     ] = "0,1,0",
+    border_width: Annotated[
+        int,
+        typer.Option(
+            "--border-width",
+            min=0,
+            help="Detector panel border width in pixels to mask during band refinement (0 disables border masking)",
+        ),
+    ] = 4,
 ):
     """Solve orientation support and detector geometry from counts together.
 
@@ -226,6 +234,7 @@ def solve(
                 search_seed=search_seed,
                 search_candidates=n_candidates,
                 global_rot_axis=global_rot_axis,
+                border_width=border_width,
             )
             if band_result["status"] != "converged":
                 raise typer.Exit(1)

@@ -1267,6 +1267,12 @@ def run_peak_predictor(
                 f"orders {list(gh['orders'][()])}, "
                 f"{harmonic_rot.shape[0]} frames)."
             )
+        R_all = None
+        if "goniometer/R" in f_idx:
+            R_all = np.asarray(f_idx["goniometer/R"][()], dtype=float)
+            print(
+                f"Applying 3D per-run goniometer R from indexer ({R_all.shape[0]} frames)."
+            )
 
     # Pass the Base UB matrix. The predictor will apply dynamic R_gonio internally!
     UB = U @ B
@@ -1285,7 +1291,7 @@ def run_peak_predictor(
         ki_vec=ki_vec,
         max_workers=max_workers,
         # --- NEW GROUND TRUTH DELEGATION ---
-        R_all=None,  # Force dynamic evaluation
+        R_all=R_all,
         gonio_axes=peaks.goniometer.axes_raw,
         gonio_angles=peaks.goniometer.angles_raw,
         gonio_offsets=gonio_offsets,  # Pass the pure zero-points
@@ -1318,6 +1324,8 @@ def run_peak_predictor(
         f["goniometer/translations"] = sample_offset
         if gonio_offsets is not None:
             f["goniometer/offsets"] = gonio_offsets
+        if R_all is not None:
+            f["goniometer/R"] = R_all
 
         if peaks.goniometer.names_raw:
             dt = h5py.string_dtype(encoding="utf-8")
@@ -1387,6 +1395,7 @@ def run_rbf_integrator(
         gonio_offsets = (
             f["goniometer/offsets"][()] if "goniometer/offsets" in f else None
         )
+        all_R = f["goniometer/R"][()] if "goniometer/R" in f else None
 
         for key in f["banks"].keys():
             img_idx = int(key)
@@ -1414,7 +1423,7 @@ def run_rbf_integrator(
         sigmas=sigma_list,
         nominal_sigma=nominal_sigma,
         show_progress=show_progress,
-        all_R=None,
+        all_R=all_R,
         sample_offset=sample_offset,
         anisotropic=anisotropic,
         fit_mosaicity=fit_mosaicity,
