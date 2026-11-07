@@ -98,9 +98,9 @@ def jax_median_2d(img, window_size, max_samples=None):
     if _JAX_MEDIAN_2D_JIT is None:
         from jax import jit
 
-        _JAX_MEDIAN_2D_JIT = partial(jit, static_argnames=["window_size", "max_samples"])(
-            _jax_median_2d_impl
-        )
+        _JAX_MEDIAN_2D_JIT = partial(
+            jit, static_argnames=["window_size", "max_samples"]
+        )(_jax_median_2d_impl)
     return _JAX_MEDIAN_2D_JIT(img, window_size, max_samples=max_samples)
 
 
@@ -753,7 +753,10 @@ def integrate_peaks_rbf_ssn(
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes)
                 if gonio_angles.shape[1] == num_axes:
-                    if gonio_angles.shape[0] == total_images and f_idx < gonio_angles.shape[0]:
+                    if (
+                        gonio_angles.shape[0] == total_images
+                        and f_idx < gonio_angles.shape[0]
+                    ):
                         ang = gonio_angles[f_idx, :]
                     else:
                         ang = (
@@ -762,7 +765,10 @@ def integrate_peaks_rbf_ssn(
                             else gonio_angles[0, :]
                         )
                 else:
-                    if gonio_angles.shape[1] == total_images and f_idx < gonio_angles.shape[1]:
+                    if (
+                        gonio_angles.shape[1] == total_images
+                        and f_idx < gonio_angles.shape[1]
+                    ):
                         ang = gonio_angles[:, f_idx]
                     else:
                         ang = (
@@ -811,7 +817,10 @@ def integrate_peaks_rbf_ssn(
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes)
                 if gonio_angles.shape[1] == num_axes:
-                    if gonio_angles.shape[0] == total_images and f_idx < gonio_angles.shape[0]:
+                    if (
+                        gonio_angles.shape[0] == total_images
+                        and f_idx < gonio_angles.shape[0]
+                    ):
                         ang = gonio_angles[f_idx, :]
                     else:
                         ang = (
@@ -820,7 +829,10 @@ def integrate_peaks_rbf_ssn(
                             else gonio_angles[0, :]
                         )
                 else:
-                    if gonio_angles.shape[1] == total_images and f_idx < gonio_angles.shape[1]:
+                    if (
+                        gonio_angles.shape[1] == total_images
+                        and f_idx < gonio_angles.shape[1]
+                    ):
                         ang = gonio_angles[:, f_idx]
                     else:
                         ang = (
