@@ -23,8 +23,6 @@ Conventions (inherited from VectorizedObjective, unchanged):
 
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
 
@@ -34,6 +32,8 @@ def forward_map_param(norm, bound):
 
 
 def rotation_matrix_from_axis_angle_jax(axis, angle_rad):
+    import jax.numpy as jnp
+
     u = axis / jnp.linalg.norm(axis)
     ux, uy, uz = u
     K = jnp.array([[0.0, -uz, uy], [uz, 0.0, -ux], [-uy, ux, 0.0]])
@@ -51,6 +51,8 @@ def rotation_matrix_from_rodrigues_jax(w):
     starting from the nominal geometry does.  Use rodrigues_safe_jax for
     gradient-based refinement.
     """
+    import jax.numpy as jnp
+
     theta = jnp.linalg.norm(w) + 1e-9
     k = w / theta
     K = jnp.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
@@ -67,6 +69,8 @@ def rodrigues_safe_jax(v):
     with *safe inputs to the exact branch* so the untaken branch cannot
     poison the gradient through jnp.where.
     """
+    import jax.numpy as jnp
+
     th2 = v @ v
     small = th2 < 1e-8
     th = jnp.sqrt(jnp.where(small, 1.0, th2))
@@ -141,6 +145,9 @@ def apply_detector_modes(
             "about a named axis: pass global_rot_axis=(x, y, z) "
             "(--det-global-rot-axis; the classic default is (0, 1, 0))."
         )
+    import jax
+    import jax.numpy as jnp
+
     c, u, v, w, h = centers, uhats, vhats, widths, heights
     S = det_params.shape[0]
     area_scale = jnp.zeros((S, 1))
@@ -264,6 +271,8 @@ def gonio_rotation_jax(axes, angles_deg, offsets_deg, axis_dirs=None):
     own angle never varies folds into the constant composition the same
     way.
     """
+    import jax.numpy as jnp
+
     R = jnp.eye(3)
     for k in range(axes.shape[0]):
         ax = (

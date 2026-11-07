@@ -9,7 +9,6 @@ from subhkl.instrument.goniometer import (
 )
 from subhkl.integration import Peaks
 from subhkl.io.export import ImageStackMerger, MTZExporter
-from subhkl.optimization import FindUB
 from subhkl.viz import detector_assembly, replay
 
 
@@ -438,6 +437,8 @@ def run_index(
     input_data["sample/space_group"] = space_group
     input_data["instrument/wavelength"] = [float(wavelength_min), float(wavelength_max)]
     input_data["beam/ki_vec"] = ki_vec_val
+
+    from subhkl.optimization import FindUB
 
     opt = FindUB(data=input_data)
     opt.wavelength = [float(wavelength_min), float(wavelength_max)]
@@ -2821,13 +2822,6 @@ def run_spherical_index(
     # upgrade simply misses once and refills.
     try:
         import os
-        import sys
-
-        if "jax" not in sys.modules:
-            # the search loop is CPU-side; do not let the refinement's jax
-            # client reserve 75% of every visible GPU for the whole run
-            # (respects an explicit user setting)
-            os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
         import jax
 

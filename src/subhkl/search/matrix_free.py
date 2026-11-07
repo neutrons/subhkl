@@ -7,14 +7,12 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-import jax
-import jax.numpy as jnp
-import jax.scipy.signal
-import jax.scipy.sparse.linalg
 import numpy as np
-from jax import jit, lax, vmap
 
 from subhkl.utils import devices as device_util
+
+_SNAP_POSITIONS_JIT = None
+_SOLVE_IMAGE_AMPLITUDES_JIT = None
 
 # --- Carpet-fragmentation control --------------------------------------------
 #
@@ -874,6 +872,8 @@ class MatrixFreeSparseRBFPeakFinder:
         Auto-sized banks call this again from find_peaks_batch when the real
         frame and measured background imply a different grid than the
         construction-time assumptions did."""
+        import jax.numpy as jnp
+
         self.num_sigmas = len(sigma_grid)
         self.sigmas = jnp.asarray(np.asarray(sigma_grid), dtype=jnp.float32)
         # Per-channel scale.  ``sigmas`` is the public scale grid and never
@@ -902,10 +902,23 @@ class MatrixFreeSparseRBFPeakFinder:
         # stale traces silently -- _extract_peaks_all would read widths off
         # the old grid.  Resizing is rare, so drop every cached trace and
         # let the next call retrace against the new bank.
+        self._jit_cache = {}
         for name in dir(type(self)):
             fn = getattr(type(self), name, None)
             if hasattr(fn, "clear_cache"):
                 fn.clear_cache()
+
+    def _get_jit(self, name, impl, static_argnames=()):
+        cache = self.__dict__.setdefault("_jit_cache", {})
+        if name not in cache:
+            from jax import jit
+
+            cache[name] = (
+                partial(jit, static_argnames=list(static_argnames))(impl)
+                if static_argnames
+                else jit(impl)
+            )
+        return cache[name]
 
     def effective_alpha(self, height, width):
         """Per-scale significance threshold, in units of the dual's noise.
@@ -957,6 +970,10 @@ class MatrixFreeSparseRBFPeakFinder:
         ``max(alpha, z*) * w_k``, so a user can demand more evidence than
         false-alarm control requires but not less.
         """
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import lax
+
         # The calibration sums over *scales*, not channels.  Shape variants at
         # one (site, scale) are the same statistical test -- their kernels
         # correlate at ~0.99 -- so counting each channel would solve z against
@@ -1020,6 +1037,8 @@ class MatrixFreeSparseRBFPeakFinder:
         uses its FFT path; the separable erf fast path stays for the default
         Gaussian bank.
         """
+        import jax.numpy as jnp
+
         mode = self.profile_file
         gaussian_trunk = mode in (None, "gaussian", "none") or (
             mode == "auto" and self._measured_trunk is None
@@ -1100,6 +1119,10 @@ class MatrixFreeSparseRBFPeakFinder:
         return kernels_2d[:, None, :, :], sq_norms
 
     def _build_gaussian_bank(self):
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import vmap
+
         k_grid = jnp.arange(-self.max_k_rad, self.max_k_rad + 1)
         yy, xx = jnp.meshgrid(k_grid, k_grid, indexing="ij")
 
@@ -1145,6 +1168,8 @@ class MatrixFreeSparseRBFPeakFinder:
     @staticmethod
     def _sep_depthwise(x, rows, cols):
         """Two 1D depthwise passes; rows [K,1,t,1], cols [K,1,1,t]."""
+        from jax import lax
+
         K = rows.shape[0]
         y = lax.conv_general_dilated(
             x,
@@ -1288,6 +1313,9 @@ class MatrixFreeSparseRBFPeakFinder:
         return getattr(self, "use_sm_precond", False) and self._use_fft(self.K_weights)
 
     def _forward_op(self, c, weights):
+        import jax.numpy as jnp
+        from jax import lax
+
         if self._use_fft(weights):
             H, W = c.shape[-2:]
             nf = self._fft_len(max(H, W) + 2 * self.max_k_rad)
@@ -1309,6 +1337,9 @@ class MatrixFreeSparseRBFPeakFinder:
         )
 
     def _adjoint_op(self, u, weights):
+        import jax.numpy as jnp
+        from jax import lax
+
         if self._use_fft(weights):
             H, W = u.shape[-2:]
             nf = self._fft_len(max(H, W) + 2 * self.max_k_rad)
@@ -1329,8 +1360,19 @@ class MatrixFreeSparseRBFPeakFinder:
             dimension_numbers=("NCHW", "OIHW", "NCHW"),
         )
 
-    @partial(jit, static_argnames=["self", "max_iter"])
     def _solve_ssn_cg_global(self, y_img, bg_img, valid_img=None, max_iter=100):
+        fn = self._get_jit(
+            "_solve_ssn_cg_global",
+            self._solve_ssn_cg_global_impl,
+            static_argnames=("max_iter",),
+        )
+        return fn(y_img, bg_img, valid_img=valid_img, max_iter=max_iter)
+
+    def _solve_ssn_cg_global_impl(self, y_img, bg_img, valid_img=None, max_iter=100):
+        import jax.numpy as jnp
+        import jax.scipy.sparse.linalg
+        from jax import lax
+
         H, W = y_img.shape
         y = y_img[None, None, :, :]
         bg = bg_img[None, None, :, :]
@@ -1813,8 +1855,15 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return c_l1[0]
 
-    @partial(jit, static_argnames=["self", "border"])
     def _rank_support(self, c_tensor, border=0, valid=None):
+        fn = self._get_jit(
+            "_rank_support",
+            self._rank_support_impl,
+            static_argnames=("border",),
+        )
+        return fn(c_tensor, border=border, valid=valid)
+
+    def _rank_support_impl(self, c_tensor, border=0, valid=None):
         """Rank the significance-gated support of one image, capacity-free.
 
         Everything here is independent of how many peaks there are -- the
@@ -1825,6 +1874,12 @@ class MatrixFreeSparseRBFPeakFinder:
         exact support count; the capacity-dependent work (measuring and
         refining candidates) happens downstream in fixed-size chunks.
         """
+        import jax
+        import jax.numpy as jnp
+        import jax.scipy.signal
+        import jax.scipy.special
+        from jax import lax
+
         c_tot = jnp.sum(c_tensor, axis=0)  # [H, W]
 
         # Smooth the discrete L1 coefficients to recover true continuous center
@@ -1885,11 +1940,17 @@ class MatrixFreeSparseRBFPeakFinder:
         order = jnp.argsort(c_flat)[::-1]
         return order, jnp.sum(is_max)
 
-    @partial(jit, static_argnames=["self"])
     def _measure_candidates(self, c_tensor, idx):
+        fn = self._get_jit("_measure_candidates", self._measure_candidates_impl)
+        return fn(c_tensor, idx)
+
+    def _measure_candidates_impl(self, c_tensor, idx):
         """Read (amplitude, row, column, sigma) for one fixed-size chunk of
         ranked candidate indices.  Shapes depend only on the image and the
         chunk length, never on the support size, so this compiles once."""
+        import jax.numpy as jnp
+        from jax import lax, vmap
+
         H, W = c_tensor.shape[1], c_tensor.shape[2]
 
         def process_peak(idx):
@@ -1950,10 +2011,16 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return vmap(process_peak)(idx)
 
-    @partial(jit, static_argnames=["self"])
     def _render_atoms(self, y_img, peaks, active):
+        fn = self._get_jit("_render_atoms", self._render_atoms_impl)
+        return fn(y_img, peaks, active)
+
+    def _render_atoms_impl(self, y_img, peaks, active):
         """Render one chunk of atoms into an [H, W] image, boxes clipped at
         the borders exactly as ``_refine_peaks`` renders them."""
+        import jax.numpy as jnp
+        import jax.scipy.special
+
         H, W = y_img.shape
         P = 2 * self.max_k_rad + 1
         off = jnp.arange(P, dtype=jnp.float32)
@@ -2041,6 +2108,8 @@ class MatrixFreeSparseRBFPeakFinder:
     def _extract_dispatch(self, c_tensor, y_img, bg_img, ranked):
         """Dispatch one image's measurement and refinement; sync only on the
         support count.  Returns opaque state for :meth:`_extract_finalize`."""
+        import jax.numpy as jnp
+
         order, count = ranked
         n = int(count)
         if n == 0:
@@ -2086,8 +2155,15 @@ class MatrixFreeSparseRBFPeakFinder:
         mask_all = np.concatenate(masks)
         return peaks_all[mask_all].astype(np.float32)
 
-    @partial(jit, static_argnames=["self", "n_steps"])
     def _refine_peaks(self, y_img, bg_img, peaks, active, n_steps=200):
+        fn = self._get_jit(
+            "_refine_peaks",
+            self._refine_peaks_impl,
+            static_argnames=("n_steps",),
+        )
+        return fn(y_img, bg_img, peaks, active, n_steps=n_steps)
+
+    def _refine_peaks_impl(self, y_img, bg_img, peaks, active, n_steps=200):
         """Continuous ("sliding") refinement of the selected support.
 
         The convex solve picks *which* atoms are present, but it can only place
@@ -2103,6 +2179,11 @@ class MatrixFreeSparseRBFPeakFinder:
         model, so cost is O(n_peaks * patch^2) rather than O(n_peaks * H * W)
         and this stays affordable on full detector images.
         """
+        import jax
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import lax
+
         H, W = y_img.shape
         P = 2 * self.max_k_rad + 1
         off = jnp.arange(P, dtype=jnp.float32)
@@ -2230,6 +2311,10 @@ class MatrixFreeSparseRBFPeakFinder:
         the batched hot path.  Returns (eig_total, eig_silence), each of
         shape [N, 2], ascending.
         """
+        import jax
+        import jax.numpy as jnp
+        import jax.scipy.special
+
         y = jnp.asarray(y_img)
         bg = jnp.asarray(bg_img)
         peaks = jnp.asarray(peaks)
@@ -2277,6 +2362,9 @@ class MatrixFreeSparseRBFPeakFinder:
         return eig_total, eig_silence
 
     def find_peaks_batch(self, images_batch, valid=None):
+        import jax
+        import jax.numpy as jnp
+
         # Detector frames arrive as integer counts.  Everything below is a
         # convolution, and cuDNN will not lower an integer convolution, so the
         # cast is required rather than cosmetic: without it the background
@@ -2895,8 +2983,11 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return results
 
-    @partial(jit, static_argnames=["self"])
     def _peak_metrics_image(self, peaks, target, bg):
+        fn = self._get_jit("_peak_metrics_image", self._peak_metrics_image_impl)
+        return fn(peaks, target, bg)
+
+    def _peak_metrics_image_impl(self, peaks, target, bg):
         """Leave-one-out and local residual deviance for every atom of one image.
 
         **Leave-one-out deviance.**
@@ -2964,6 +3055,9 @@ class MatrixFreeSparseRBFPeakFinder:
         116.8 on the sigma = 1 case above) because it averages the mismatch
         against a large annulus of pure background.
         """
+        import jax.numpy as jnp
+        import jax.scipy.special
+
         R = self.max_k_rad
         d = jnp.arange(-R, R + 1)
         dy, dx = jnp.meshgrid(d, d, indexing="ij")
@@ -3105,6 +3199,8 @@ class MatrixFreeSparseRBFPeakFinder:
             ``compute_metrics``, whose per-atom parameter penalty is the
             anti-tiling term the local metrics lack.
         """
+        import jax.numpy as jnp
+
         B = images_raw.shape[0]
         max_k = max([len(p) for p in peaks_list] + [1])
 
@@ -3152,8 +3248,15 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return out, out_res
 
-    @partial(jit, static_argnames=["self"])
     def _predict_batch_scan(self, peaks, x_grid):
+        fn = self._get_jit("_predict_batch_scan", self._predict_batch_scan_impl)
+        return fn(peaks, x_grid)
+
+    def _predict_batch_scan_impl(self, peaks, x_grid):
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import vmap
+
         def render_peak(p):
             total_I, r, c, sigma = p[0], p[1], p[2], p[3]
             sig_sq2 = sigma * jnp.sqrt(2.0) + 1e-6
@@ -3176,6 +3279,10 @@ class MatrixFreeSparseRBFPeakFinder:
             images_raw, bg_map: [photons/Pixel]
             global_max: [photons/Pixel]
         """
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import jit
+
         B, H, W = images_raw.shape
         yy, xx = np.indices((H, W))  # [Pixel^0.5]
         x_grid = jnp.array([yy, xx])  # [Pixel^0.5]
@@ -3322,8 +3429,7 @@ def _footprint_mask(B, H, W, frames, rs, cs, var_us, var_vs, cov_uvs):
     return valid
 
 
-@partial(jit, static_argnames=["patch_size"])
-def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
+def _snap_positions_impl(images, bg_maps, valid, frames, rs, cs, patch_size=15):
     """Log-parabolic sub-pixel snap, the patch integrator's estimator.
 
     Args:
@@ -3334,6 +3440,11 @@ def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
     Returns:
         snapped (rs, cs), each clamped to +-MAX_SNAP_SHIFT of the input
     """
+    import jax.numpy as jnp
+    import jax.scipy.signal
+    import jax.scipy.special
+    from jax import lax, vmap
+
     P = patch_size
     half = P // 2
     pad = P
@@ -3377,8 +3488,20 @@ def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
     return vmap(snap_one)(frames, rs, cs)
 
 
-@jit
-def _solve_image_amplitudes(
+def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
+    global _SNAP_POSITIONS_JIT
+    if _SNAP_POSITIONS_JIT is None:
+        from jax import jit
+
+        _SNAP_POSITIONS_JIT = partial(jit, static_argnames=["patch_size"])(
+            _snap_positions_impl
+        )
+    return _SNAP_POSITIONS_JIT(
+        images, bg_maps, valid, frames, rs, cs, patch_size=patch_size
+    )
+
+
+def _solve_image_amplitudes_impl(
     image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, admission_z, profile=None
 ):
     """One image, all its reflections: L1-admitted, debiased Poisson solve.
@@ -3425,6 +3548,9 @@ def _solve_image_amplitudes(
     Returns:
         (flux [photons], sigma [photons]) per atom
     """
+    import jax.numpy as jnp
+    from jax import vmap
+
     H, W = image.shape
     yy, xx = jnp.indices((H, W), dtype=jnp.float32)
     v_flat = valid.flatten()
@@ -3480,6 +3606,29 @@ def _solve_image_amplitudes(
     C = jnp.linalg.inv(I_F)
     sigma = jnp.sqrt(jnp.maximum(jnp.diag(C), 0.0))
     return c, sigma
+
+
+def _solve_image_amplitudes(
+    image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, admission_z, profile=None
+):
+    global _SOLVE_IMAGE_AMPLITUDES_JIT
+    if _SOLVE_IMAGE_AMPLITUDES_JIT is None:
+        from jax import jit
+
+        _SOLVE_IMAGE_AMPLITUDES_JIT = jit(_solve_image_amplitudes_impl)
+    return _SOLVE_IMAGE_AMPLITUDES_JIT(
+        image,
+        bg,
+        valid,
+        rs,
+        cs,
+        var_u,
+        var_v,
+        cov_uv,
+        atom_ok,
+        admission_z,
+        profile=profile,
+    )
 
 
 def integrate_reflections_matrix_free(
@@ -3545,6 +3694,7 @@ def integrate_reflections_matrix_free(
     """
     # Local import: sparse_rbf imports this function lazily at its call
     # site, so a top-level import there would be circular.
+    import jax.numpy as jnp
     from subhkl.search.sparse_rbf import compute_rate_batch
 
     B, H, W = images_batch.shape

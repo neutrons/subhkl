@@ -4,7 +4,6 @@ from pathlib import Path
 import time
 
 import h5py
-import jax.numpy as jnp
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -202,6 +201,8 @@ def discover(args, samples=16384, candidates=6, seed=0):
     uvw = direct_lattice_uvw(B, space_group=args.space_group)[:60]
     X = uvw @ np.linalg.inv(B)
     w = weights / np.abs(weights).sum()
+    import jax.numpy as jnp
+
     scores = [
         float(
             band_sum(

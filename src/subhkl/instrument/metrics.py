@@ -10,7 +10,6 @@ import scipy.spatial
 from subhkl.config import beamlines
 from subhkl.instrument.detector import Detector
 from subhkl.instrument.physics import calculate_angular_error
-from subhkl.optimization import FindUB
 
 
 def _get_safe_R_stack(R_file_in, run_indices_in, target_len):
@@ -169,6 +168,8 @@ def compute_metrics(
     ki_vec_override: np.ndarray | None = None,
 ) -> dict:
     try:
+        from subhkl.optimization import FindUB
+
         with h5py.File(file1, "r") as f:
             ub_helper = FindUB()
             ub_helper.a = f["sample/a"][()]

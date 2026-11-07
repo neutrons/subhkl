@@ -1,8 +1,6 @@
 """Staged zone-band and fixed-assignment pixel refinement."""
 
 import h5py
-import jax
-import jax.numpy as jnp
 import numpy as np
 from scipy.optimize import minimize, least_squares, OptimizeResult
 
@@ -16,6 +14,8 @@ from subhkl.instrument.detector import Detector
 
 def band_sum(X, directions, q_lo, q_hi, weights, zone_weights, chunk_size=2048):
     """Fourier band sum with bounded forward and reverse-mode memory."""
+    import jax
+    import jax.numpy as jnp
 
     def score(d, lo, hi, w):
         t = X @ d.T
@@ -52,6 +52,8 @@ def band_sum(X, directions, q_lo, q_hi, weights, zone_weights, chunk_size=2048):
 
 
 def rodrigues_jax(rv):
+    import jax.numpy as jnp
+
     th = jnp.sqrt(jnp.sum(rv * rv) + 1e-30)
     k = rv / th
     K = jnp.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
@@ -59,6 +61,8 @@ def rodrigues_jax(rv):
 
 
 def rodrigues_batch_jax(rv):
+    import jax.numpy as jnp
+
     th = jnp.sqrt(jnp.sum(rv * rv, axis=-1, keepdims=True) + 1e-30)
     k = rv / th
     kx, ky, kz = k[:, 0], k[:, 1], k[:, 2]
@@ -81,6 +85,8 @@ def rodrigues_batch_jax(rv):
 
 def ewald_directions(G_lab):
     """Outgoing rays with finite derivatives for unassigned hkl=0 rows."""
+    import jax.numpy as jnp
+
     G_sq = jnp.sum(G_lab**2, axis=1)
     lam = jnp.where(G_sq > 1e-12, -2 * G_lab[:, 2] / jnp.maximum(G_sq, 1e-12), 3.5)
     ray = jnp.array([0.0, 0.0, 1.0])[None, :] + lam[:, None] * G_lab
@@ -101,6 +107,8 @@ def parameter_units(n_runs, n_banks):
 
 def build_B_jax(a, b, c, alpha_rad, beta_rad=None, gamma_rad=None):
     """Upper-triangular reciprocal-cell matrix matching cartesian_matrix_metric_tensor."""
+    import jax.numpy as jnp
+
     if beta_rad is None:
         beta_rad = alpha_rad
         alpha_rad = gamma_rad = jnp.pi / 2.0
@@ -169,6 +177,8 @@ def direct_lattice_uvw(B, max_index=6, space_group=None):
 
 def _build_ewald_excess_maps(args):
     """Build winsorized fine-binned local-median-subtracted excess maps per (run, bank)."""
+    import jax
+    import jax.numpy as jnp
     from subhkl.scan_refine import _frame_offsets
 
     with h5py.File(args.nexus, "r") as f:
@@ -250,6 +260,8 @@ def _make_ewald_polisher(
     b2,
     s_samp=None,
 ):
+    import jax
+    import jax.numpy as jnp
     from scipy.spatial.transform import Rotation as Rot
 
     runs = list(run_ids)
@@ -438,6 +450,8 @@ def _make_ewald_polisher(
 
 def refine_scan(args):
     """Staged band refinement; configuration and input validation live in scan_refine."""
+    import jax
+    import jax.numpy as jnp
     from subhkl.scan_refine import load_observations, write_result, checkpoint
 
     diagnostics = []
@@ -852,10 +866,11 @@ def refine_scan(args):
         R0r, er, rid = R0_j[take], e_scan_j[take], r_idx[take]
         w_r = w_j[take]
         w_r = w_r / jnp.maximum(jnp.abs(w_r).sum(), 1e-12)
+        p_base_j = jnp.asarray(best_p)
 
         @jax.jit
-        def eval_dom(d_val, p_base=jnp.asarray(best_p), wr=w_r):
-            p_try = p_base.at[18 + r].set(d_val)
+        def eval_dom(d_val):
+            p_try = p_base_j.at[18 + r].set(d_val)
             rv, s_rad, s_ax, s_area, rg, T, s_samp, da, db, dbeta, dom, du, dv = unpack(
                 p_try
             )
@@ -889,7 +904,7 @@ def refine_scan(args):
             X0 = uvw_j[:120] @ A_cur.T
             wz = jnp.ones(len(X0))
             Rm = rodrigues_jax(rv) @ Uj
-            return band_sum(X0 @ Rm.T, d, q_lo, q_hi, wr, wz)
+            return band_sum(X0 @ Rm.T, d, q_lo, q_hi, w_r, wz)
 
         scores_r = np.asarray(
             [float(eval_dom(d)) - 5.0 * float(d) ** 2 for d in dom_grid]

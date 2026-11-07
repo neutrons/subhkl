@@ -219,7 +219,13 @@ def prepare_harvest_tasks(
                     dev = np.zeros(len(coords))
                 if res is None or len(res) != len(coords):
                     res = np.zeros(len(coords))
-                pre_coords = (coords[:, 1], coords[:, 2], coords[:, 3], dev, res)
+                pre_coords = (
+                    np.asarray(coords[:, 1]),
+                    np.asarray(coords[:, 2]),
+                    np.asarray(coords[:, 3]),
+                    np.asarray(dev),
+                    np.asarray(res),
+                )
             else:
                 empty = np.array([])
                 pre_coords = (empty, empty, empty, empty, empty)
