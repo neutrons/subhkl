@@ -886,8 +886,8 @@ def refine_scan(args):
             )
             d = jnp.einsum("nji,nj->ni", R_run, d_lab)
             A_cur = jnp.linalg.inv(jnp.asarray(B0)).T
-            X0 = uvw_j[:60] @ A_cur.T
-            wz = 1.0 / jnp.linalg.norm(X0, axis=1)
+            X0 = uvw_j[:120] @ A_cur.T
+            wz = jnp.ones(len(X0))
             Rm = rodrigues_jax(rv) @ Uj
             return band_sum(X0 @ Rm.T, d, q_lo, q_hi, wr, wz)
 
@@ -895,6 +895,7 @@ def refine_scan(args):
             [float(eval_dom(d)) - 5.0 * float(d) ** 2 for d in dom_grid]
         )
         best_p[18 + r] = float(dom_grid[int(np.argmax(scores_r))])
+    best_p[18 : 18 + n_runs] -= best_p[18 + args.anchor_run]
 
     # Stage 1a: 120-zone band across all selected runs, including scan drift.
     res_1a = minimize(
