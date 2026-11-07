@@ -161,18 +161,10 @@ def _apply_cell_jax(cell0, symmetry_kind, da, db, dtheta):
     return a0 * (1.0 + da), b0 * (1.0 + db), c0, al_r, be_r + dtheta, ga_r
 
 
-def direct_lattice_uvw(B, max_index=6):
-    A = np.linalg.inv(np.asarray(B, float)).T
-    r = range(-max_index, max_index + 1)
-    uvw = np.array(
-        [(u, v, w) for u in r for v in r for w in r if (u, v, w) != (0, 0, 0)]
-    )
-    uvw = uvw[np.gcd.reduce(np.abs(uvw), axis=1) == 1]
-    uvw = uvw[[tuple(x) > tuple(-x) for x in uvw]]
-    X = uvw @ A.T
-    xlen = np.linalg.norm(X, axis=1)
-    o = np.argsort(xlen)
-    return uvw[o]
+def direct_lattice_uvw(B, max_index=6, space_group=None):
+    from subhkl.search.spherical import direct_lattice_vectors
+
+    return direct_lattice_vectors(B, max_index=max_index, space_group=space_group)[2]
 
 
 def _build_ewald_excess_maps(args):
@@ -477,6 +469,11 @@ def refine_scan(args):
             ]:
                 if not any(np.allclose(Uc, Uprev, atol=1e-4) for Uprev in cand_Us):
                     cand_Us.append(Uc)
+        shared_geom = (
+            np.asarray(f["search/shared_geometry"][()], dtype=np.float64)
+            if "search/shared_geometry" in f
+            else None
+        )
 
     cell0 = [float(v) for v in args.cell]
     symmetry_kind, active_cell_slots = _cell_symmetry_spec(cell0, args.space_group)
@@ -575,13 +572,22 @@ def refine_scan(args):
                 R_runs_pre = dict(R_runs_nom)
                 for ir, r in enumerate(args.runs):
                     R_runs_pre[r] = R_runs_nom[r] @ Urs_nom[ir] @ U_nom_joint.T
-                for r in args.runs:
-                    R_obs[runs == r] = R_runs_pre[r]
+                used_pre_polish = (
+                    shared_geom is None or abs(float(shared_geom[0])) < 0.015
+                )
+                if used_pre_polish:
+                    for r in args.runs:
+                        R_obs[runs == r] = R_runs_pre[r]
+                    U0 = U_nom_joint
             else:
                 Urs_nom = np.repeat(U_nom_joint[None], len(args.runs), axis=0)
                 ew_nom = float(ew_nom_joint)
                 R_runs_pre = dict(R_runs_nom)
-            U0 = U_nom_joint
+                used_pre_polish = (
+                    shared_geom is None or abs(float(shared_geom[0])) < 0.015
+                )
+                if used_pre_polish:
+                    U0 = U_nom_joint
             ewald_ctx = dict(
                 exc_maps=exc_maps,
                 b2=b2_ew,
@@ -590,6 +596,7 @@ def refine_scan(args):
                 Urs_nom=Urs_nom,
                 ew_nom=ew_nom,
                 R_runs_pre=R_runs_pre,
+                R_runs_band_base=R_runs_pre if used_pre_polish else R_runs_nom,
             )
 
     b_idx = jnp.asarray(b_idx_all[sel], dtype=jnp.int32)
@@ -608,7 +615,9 @@ def refine_scan(args):
     Uj = jnp.asarray(U0, dtype=jnp.float64)
     kij = jnp.array([0.0, 0.0, 1.0], dtype=jnp.float64)
 
-    uvw = direct_lattice_uvw(B0, max_index=6)[: args.n_zones]
+    uvw = direct_lattice_uvw(B0, max_index=6, space_group=args.space_group)[
+        : args.n_zones
+    ]
     uvw_j = jnp.asarray(uvw, dtype=jnp.float64)
     w_r29 = jnp.where(jnp.isin(r_idx, jnp.asarray(args.stable_runs)), w_j, 0.0)
     w_r29 = w_r29 / jnp.maximum(jnp.abs(w_r29).sum(), 1e-12)
@@ -686,7 +695,7 @@ def refine_scan(args):
             + reg_geom
             * (
                 jnp.sum(rg**2)
-                + jnp.sum((T / 0.03) ** 2)
+                + jnp.sum((T / 0.15) ** 2)
                 + jnp.sum((s_samp / 0.015) ** 2)
             )
         )
@@ -792,6 +801,18 @@ def refine_scan(args):
         p0 = np.zeros(18 + n_runs + 2 * n_banks)
         p0[3] = s_init
         p0[4] = s_init
+        if (
+            shared_geom is not None
+            and len(shared_geom) == 7
+            and abs(s_init - float(shared_geom[0])) <= 0.03
+        ):
+            p0[3] = float(shared_geom[0])
+            p0[4] = float(shared_geom[0])
+            if "global_rot" in args.modes:
+                p0[6:9] = shared_geom[1:4]
+            if "global_trans" in args.modes:
+                p0[9:12] = shared_geom[4:7]
+        p0 = np.clip(p0, *np.asarray(bounds_0).T)
         res = minimize(
             lambda x: (
                 float(vg_band_60(jnp.asarray(x))[0]),
@@ -814,7 +835,14 @@ def refine_scan(args):
     # Initialize per-run omega drift via 1D scan on 120-zone band score
     dom_grid = np.deg2rad(np.linspace(-5.0, 5.0, 201))
     for r in args.runs:
-        if ewald_ctx is not None or r == args.anchor_run or "per_run" not in args.modes:
+        if (
+            (
+                ewald_ctx is not None
+                and ewald_ctx.get("R_runs_band_base") is ewald_ctx.get("R_runs_pre")
+            )
+            or r == args.anchor_run
+            or "per_run" not in args.modes
+        ):
             continue
         if not np.any(runs[sel] == r):
             continue
@@ -1279,7 +1307,7 @@ def refine_scan(args):
     if ewald_ctx is not None:
         from scipy.spatial.transform import Rotation as Rot
 
-        R_runs_band = dict(ewald_ctx["R_runs_pre"])
+        R_runs_band = dict(ewald_ctx["R_runs_band_base"])
         for r in args.runs:
             idx_r = np.flatnonzero(runs == r)
             if len(idx_r):
@@ -1313,15 +1341,17 @@ def refine_scan(args):
         if "per_run" in args.modes and not is_single_setting:
             Urs_cal, s_cal_r = polish_per_run_cal(U_cal_joint)
             ew_cal = float(s_cal_r.sum())
+            used_per_run_cal = True
         else:
             Urs_cal = np.repeat(U_cal_joint[None], len(args.runs), axis=0)
             ew_cal = float(ew_cal_joint)
+            used_per_run_cal = False
 
         ew_nom = float(ewald_ctx["ew_nom"])
         if ew_cal >= ew_nom:
             U_opt = U_cal_joint
             p_cur[0:3] = Rot.from_matrix(U_opt @ np.asarray(Uj).T).as_rotvec()
-            if "per_run" in args.modes and not is_single_setting:
+            if used_per_run_cal:
                 R_runs_final = dict(R_runs_band)
                 for ir, r in enumerate(args.runs):
                     R_runs_final[r] = R_runs_band[r] @ Urs_cal[ir] @ U_cal_joint.T

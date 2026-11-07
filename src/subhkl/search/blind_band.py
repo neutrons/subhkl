@@ -140,6 +140,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
         n_null=32,
         seed=seed,
         verbose=True,
+        space_group=args.space_group,
     )
     found = distinct_orientations(found, B, args.space_group, candidates)
     if not found:
@@ -162,6 +163,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
             args.d_min,
             maxiter=150,
             rot_axis_only=rot_axis_only,
+            space_group=args.space_group,
         )
         fits.append(fit)
         print(
@@ -189,6 +191,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
             trans_bound_m=0,
             orient_bound_deg=2.0,
             maxiter=100,
+            space_group=args.space_group,
         )
         U_shared.append(local["U"])
     xyz = C_shared + O_shared
@@ -196,7 +199,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
     lab = q / np.linalg.norm(q, axis=1, keepdims=True)
     D = np.einsum("nji,nj->ni", Rs, lab)
     lo, hi = band_q_range(-lab[:, 2], wavelength, args.d_min)
-    uvw = direct_lattice_uvw(B)[:60]
+    uvw = direct_lattice_uvw(B, space_group=args.space_group)[:60]
     X = uvw @ np.linalg.inv(B)
     w = weights / np.abs(weights).sum()
     scores = [
@@ -234,6 +237,17 @@ def discover(args, samples=16384, candidates=6, seed=0):
             geometry["global_rot_vec"],
             geometry["global_trans_m"],
         ]
+        g["candidate_geometries"] = np.array(
+            [
+                np.r_[
+                    v["radial_scale"],
+                    v["global_rot_vec"],
+                    v["global_trans_m"],
+                ]
+                for v in fits
+            ],
+            dtype=np.float64,
+        )
         g.attrs["selected"] = selected
         g.attrs["samples_requested"] = samples
         g.attrs["seed"] = seed

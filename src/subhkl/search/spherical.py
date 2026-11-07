@@ -1224,7 +1224,7 @@ def _so3_inner_fast_factory(f, g):
 # ---------------------------------------------------------------------------
 
 
-def direct_lattice_vectors(B, max_index=6):
+def direct_lattice_vectors(B, max_index=6, space_group=None):
     """Primitive direct-lattice vectors [uvw], shortest first: the zone axes.
 
     The reciprocal lattice's additive structure has an exact dual, the
@@ -1232,7 +1232,7 @@ def direct_lattice_vectors(B, max_index=6):
     great circles perpendicular to R x for x in the direct lattice, and a
     zone's spot density scales as 1/|x|, so the shortest x are the
     brightest, best-separated zones.  Returns (unit directions [K, 3] in
-    the crystal frame, lengths [K] in A, integer uvw [K, 3])."""
+    the crystal frame, lengths [K] in A, uvw [K, 3])."""
     A = np.linalg.inv(np.asarray(B, float)).T  # direct-cell vectors as columns
     r = range(-max_index, max_index + 1)
     uvw = np.array(
@@ -1240,6 +1240,26 @@ def direct_lattice_vectors(B, max_index=6):
     )
     uvw = uvw[np.gcd.reduce(np.abs(uvw), axis=1) == 1]
     uvw = uvw[[tuple(x) > tuple(-x) for x in uvw]]
+    if space_group is not None:
+        from subhkl.core.spacegroup import get_space_group_object
+
+        sg = (
+            get_space_group_object(space_group)
+            if isinstance(space_group, (str, bytes))
+            else space_group
+        )
+        cen = np.array([list(c) for c in sg.operations().cen_ops], dtype=np.int64)
+        D = int(np.lcm.reduce((24 // np.gcd(cen, 24)).ravel()))
+        if D > 1:
+            cen_D = (cen * D) // 24
+            scales = np.ones(len(uvw), dtype=np.float64)
+            for m in range(D, 0, -1):
+                rem = (m * uvw) % D
+                match = np.any(
+                    np.all(rem[:, None, :] == cen_D[None, :, :], axis=-1), axis=-1
+                )
+                scales[match] = m / float(D)
+            uvw = uvw * scales[:, None]
     X = uvw @ A.T
     xlen = np.linalg.norm(X, axis=1)
     o = np.argsort(xlen)
@@ -1502,6 +1522,7 @@ def refine_band_geometry(
     maxiter=400,
     zone_weight="uniform",
     rot_axis_only=None,
+    space_group=None,
 ):
     """Co-refine the orientation AND the global detector geometry on the
     band objective.
@@ -1549,7 +1570,7 @@ def refine_band_geometry(
     kij = jnp.asarray(np.asarray(ki, np.float64))
     kij = kij / jnp.linalg.norm(kij)
     Uj = jnp.asarray(np.asarray(U0, np.float64))
-    zd, zl, _ = direct_lattice_vectors(B)
+    zd, zl, _ = direct_lattice_vectors(B, space_group=space_group)
     nz = int(n_zones)
     X0 = jnp.asarray((zl[:nz, None] * zd[:nz]).astype(np.float64))
     wz = jnp.asarray(
@@ -1714,6 +1735,8 @@ def lattice_ladder(
     table_dirs=None,
     table_weights=None,
     table_sin_theta=None,
+    space_group=None,
+    dedup_deg=3.0,
 ):
     """Orientation search on the direct lattice, coarse to fine.
 
@@ -1779,7 +1802,7 @@ def lattice_ladder(
         q_lo = np.concatenate([q_lo, np.zeros(n_pad - len(q_lo))]).astype(np.float32)
         q_hi = np.concatenate([q_hi, np.ones(n_pad - len(q_hi))]).astype(np.float32)
         qlo_j, qhi_j = jnp.asarray(q_lo), jnp.asarray(q_hi)
-    Zdir, xlen, _ = direct_lattice_vectors(B)
+    Zdir, xlen, _ = direct_lattice_vectors(B, space_group=space_group)
     K_all = max(int(coarse_zones), max(int(r[0]) for r in rungs))
     Zj = jnp.asarray(Zdir[:K_all].astype(np.float32))
     winv = (1.0 / xlen[:K_all]).astype(np.float32)
@@ -1880,8 +1903,19 @@ def lattice_ladder(
         out = jnp.concatenate(
             [score(Rs[i : i + ch], *args) for i in range(0, len(grid), ch)]
         )
-        _, top = kern["topk"](out, int(n_shortlist))
+        _, top = kern["topk"](
+            out, int(n_shortlist) * 4 if dedup_deg > 0 else int(n_shortlist)
+        )
         cands = np.asarray(Rs[top])
+        if dedup_deg > 0:
+            cos_thr = float(2.0 * np.cos(np.radians(dedup_deg)) + 1.0)
+            kept = []
+            for R in cands:
+                if not kept or np.max(np.einsum("nij,ij->n", kept, R)) < cos_thr:
+                    kept.append(R)
+                    if len(kept) >= int(n_shortlist):
+                        break
+            cands = np.asarray(kept)
         _mark(f"exhaustive rung ({len(grid):,} orientations)")
 
     def zoom_all(cands, nz, tol, span, n):
@@ -1910,7 +1944,21 @@ def lattice_ladder(
     scores = None
     for nz, tol, span, keep, npts in rungs:
         s_, R_ = zoom_all(cands, int(nz), float(tol), float(span), int(npts))
-        o = np.argsort(-s_)[: int(keep)]
+        o = np.argsort(-s_)
+        if dedup_deg > 0:
+            cos_thr = float(2.0 * np.cos(np.radians(dedup_deg)) + 1.0)
+            kept_idx = []
+            kept_R = []
+            for idx_k in o:
+                Rk = R_[idx_k]
+                if not kept_R or np.max(np.einsum("nij,ij->n", kept_R, Rk)) < cos_thr:
+                    kept_R.append(Rk)
+                    kept_idx.append(idx_k)
+                    if len(kept_idx) >= int(keep):
+                        break
+            o = np.asarray(kept_idx, dtype=int)
+        else:
+            o = o[: int(keep)]
         cands, scores = R_[o], s_[o]
         _mark(f"rung {nz} zones @ {tol:g} deg, {len(R_)} -> {len(o)}")
     nz, tol = rungs[-1][0], rungs[-1][1]
