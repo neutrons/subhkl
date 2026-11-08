@@ -1638,15 +1638,15 @@ def render_rainbow_html(
 <script src="https://cdn.jsdelivr.net/npm/h5wasm@0.7.8/dist/iife/h5wasm.js" async></script>
 <style>
   :root {{
-    --bg-primary: #070913;
-    --bg-panel: #0e1326;
-    --bg-card: #151c38;
-    --border-color: #293668;
-    --text-main: #f0f4ff;
+    --bg-primary: #070911;
+    --bg-panel: #0d111f;
+    --bg-card: #13192b;
+    --border-color: #26314f;
+    --text-main: #f1f5f9;
     --text-dim: #94a3b8;
-    --accent-gold: #fbbf24;
-    --accent-cyan: #22d3ee;
-    --accent-pink: #f43f5e;
+    --accent-gold: #f472b6;
+    --accent-cyan: #38bdf8;
+    --accent-pink: #f43f85;
     --accent-green: #34d399;
     --font-display: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
     --font-body: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -1690,13 +1690,24 @@ def render_rainbow_html(
   }}
 
   .rainbow-logo {{
-    font-family: var(--font-display);
+    font-family: var(--font-body);
     font-weight: 800;
-    font-size: 0.92rem;
-    letter-spacing: 0.5px;
-    background: linear-gradient(90deg, #ff2a55, #ff8c1a, #ffe600, #1aff66, #00e5ff, #b833ff);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+    font-size: 1.05rem;
+    letter-spacing: 0.3px;
+    display: inline-flex;
+    align-items: baseline;
+  }}
+
+  .logo-sub {{
+    color: #cbd5e1;
+    font-style: normal;
+  }}
+
+  .logo-hkl {{
+    color: #f43f85;
+    font-style: italic;
+    margin-left: 1px;
+    text-shadow: 0 0 12px rgba(244, 63, 133, 0.38);
   }}
 
   .subtitle-tag {{
@@ -1766,9 +1777,9 @@ def render_rainbow_html(
   }}
 
   button.active-btn {{
-    background: linear-gradient(135deg, #e11d48, #d97706);
-    border-color: #fbbf24;
-    color: #fff;
+    background: rgba(244, 63, 133, 0.22);
+    border-color: var(--accent-pink);
+    color: #fce7f3;
   }}
 
   /* Main Workspace: Maximize Hero Detector + Compact Right Sidebar */
@@ -1968,31 +1979,79 @@ def render_rainbow_html(
 
   .stage-pill {{
     font-family: var(--font-display);
-    font-size: 0.62rem;
-    padding: 1px 6px;
-    border-radius: 999px;
+    font-size: 0.65rem;
+    padding: 3px 9px;
+    border-radius: 5px;
     border: 1px solid var(--border-color);
     background: var(--bg-card);
-    color: var(--text-dim);
+    color: var(--text-main);
     cursor: pointer;
     transition: all 0.12s ease;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
   }}
 
   .stage-pill:hover {{
-    border-color: var(--accent-cyan);
-    color: var(--text-main);
+    border-color: var(--accent-pink);
+    background: rgba(244, 63, 133, 0.15);
+    color: #fff;
   }}
 
   .stage-pill.stage-active {{
-    border-color: var(--accent-cyan);
-    color: var(--accent-cyan);
-    background: rgba(34, 211, 238, 0.14);
+    border-color: var(--accent-pink);
+    color: #fce7f3;
+    background: rgba(244, 63, 133, 0.24);
     font-weight: 700;
   }}
 
   .stage-pill.stage-done {{
     border-color: rgba(52, 211, 153, 0.5);
     color: var(--accent-green);
+  }}
+
+  .terminal-box {{
+    background: #04060c;
+    border: 1px solid #1e293b;
+    border-radius: 5px;
+    padding: 6px 8px;
+    font-size: 0.62rem;
+    line-height: 1.38;
+    font-family: var(--font-display);
+    color: #cbd5e1;
+    height: 145px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    user-select: text;
+  }}
+
+  .params-drawer {{
+    display: none;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    background: #090d18;
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    padding: 4px 8px;
+    font-family: var(--font-display);
+    font-size: 0.64rem;
+  }}
+
+  .params-drawer.open {{
+    display: flex;
+  }}
+
+  .params-drawer input {{
+    background: var(--bg-card);
+    color: var(--text-main);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    padding: 2px 5px;
+    font-family: var(--font-display);
+    font-size: 0.64rem;
+    width: 54px;
   }}
 
   .iframe-popout-banner {{
@@ -2071,7 +2130,7 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title">🌈 SUBHKL</div>
+      <div class="rainbow-logo" id="app-title"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></div>
       <span class="subtitle-tag">{inst} · {sg}</span>
     </div>
 
@@ -2219,42 +2278,56 @@ def render_rainbow_html(
 
       <div>
         <div class="section-title">
-          <span>🔍 Spot &amp; Lattice Inspector</span>
+          <span>Inspector</span>
           <span id="combo-badge" style="color:var(--accent-cyan);">HOVER SPOT</span>
         </div>
-        <div class="inspector-box" id="inspector-box">
-          Move your mouse across the detector to shift the floating Bragg rings aside and look directly at the raw detector counts underneath each predicted reflection.
+        <div class="inspector-box" id="inspector-box" style="padding:5px 8px;font-size:0.68rem;">
+          Hover or click a Bragg spot to inspect (hkl), λ, d-spacing, and detector bank.
         </div>
       </div>
 
-      <div>
+      <div style="display:flex;flex-direction:column;flex:1;min-height:110px;">
         <div class="section-title">
-          <span>📊 Angular Residual Δθ</span>
-          <span id="cell-summary" style="font-size:0.66rem;color:var(--text-dim);"></span>
+          <span>&gt;_ Terminal // Stdio</span>
+          <span id="cell-summary" style="font-size:0.62rem;color:var(--accent-pink);">IDLE</span>
         </div>
-        <canvas id="canvas-hist" style="width:100%;height:68px;background:var(--bg-card);border-radius:6px;border:1px solid var(--border-color);"></canvas>
+        <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [▶ 1. Reduce], [▶ 2. Solve], [▶ 3. Integrate], or [▶ 4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
+        <canvas id="canvas-hist" style="display:none;width:100%;height:40px;"></canvas>
       </div>
     </aside>
   </main>
 
-  <!-- SINGLE-ROW SOLVE LATTICE LADDER FOOTER (WITH COMPACT INLINE WORKFLOW STAGE STRIP) -->
+  <!-- SINGLE-ROW SOLVE LATTICE LADDER FOOTER (WITH INTERACTIVE WORKFLOW STAGE BUTTONS) -->
   <footer class="ladder-bar">
     <div class="ladder-header">
       <div class="ladder-title" id="ladder-desc">
-        🪜 LATTICE LADDER: Step through how subhkl locks the 3D crystal orientation
+        LATTICE LADDER: Step through orientation refinement or click a workflow stage to execute
       </div>
-      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap;">
+        <span style="font-size:0.62rem;color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
         <div id="pipeline-stages" style="display:flex;align-items:center;gap:4px;"></div>
-        <span id="galaxy-status-badge" style="font-size:0.64rem;font-family:var(--font-display);padding:2px 7px;border-radius:999px;border:1px solid #334155;color:var(--text-dim);">
+        <button id="btn-params-toggle" title="Configure unit cell, space group, and wavelength parameters for Solve/Integrate">
+          ⚙ Params
+        </button>
+        <span id="galaxy-status-badge" style="font-size:0.62rem;font-family:var(--font-display);padding:2px 6px;border-radius:4px;border:1px solid #334155;color:var(--text-dim);">
           ⚪ LOCAL
         </span>
-        <button id="btn-galaxy-dispatch" style="border-color:var(--accent-gold);color:var(--accent-gold);padding:3px 8px;font-size:0.7rem;" title="Dispatch the selected workflow stage (e.g. Solve) to Galaxy / GPU container runner">
-          ⚡ RUN IN GALAXY
-        </button>
-        <button id="btn-ladder-prev" style="padding:3px 8px;font-size:0.7rem;">◀</button>
-        <button id="btn-ladder-play" class="active-btn" style="padding:3px 9px;font-size:0.7rem;">▶ WALK STEPS</button>
-        <button id="btn-ladder-next" style="padding:3px 8px;font-size:0.7rem;">▶</button>
+        <button id="btn-galaxy-dispatch" style="display:none;">Run</button>
+        <button id="btn-ladder-prev" style="padding:2px 7px;font-size:0.66rem;">◀</button>
+        <button id="btn-ladder-play" class="active-btn" style="padding:2px 8px;font-size:0.66rem;">▶ Walk</button>
+        <button id="btn-ladder-next" style="padding:2px 7px;font-size:0.66rem;">▶</button>
       </div>
+    </div>
+    <div id="params-drawer" class="params-drawer">
+      <span>SG <input id="inp-sg" type="text" value="{sg}" style="width:78px;" /></span>
+      <span>a <input id="inp-a" type="number" step="0.1" value="68.7" /></span>
+      <span>b <input id="inp-b" type="number" step="0.1" value="69.8" /></span>
+      <span>c <input id="inp-c" type="number" step="0.1" value="156.9" /></span>
+      <span>α <input id="inp-alpha" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
+      <span>β <input id="inp-beta" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
+      <span>γ <input id="inp-gamma" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
+      <span>d_min <input id="inp-dmin" type="number" step="0.1" value="2.5" style="width:44px;" /></span>
+      <span>steps <input id="inp-steps" type="number" step="10" value="120" style="width:48px;" /></span>
     </div>
     <div class="ladder-rungs" id="ladder-rungs"></div>
   </footer>
@@ -2385,6 +2458,55 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const c = DATA.cell;
     document.getElementById("cell-summary").textContent =
       `${{c[0].toFixed(1)}}, ${{c[1].toFixed(1)}}, ${{c[2].toFixed(1)}} Å`;
+    const ids = ["inp-a", "inp-b", "inp-c", "inp-alpha", "inp-beta", "inp-gamma"];
+    ids.forEach((id, i) => {{
+      const el = document.getElementById(id);
+      if (el && typeof c[i] === "number") el.value = c[i].toFixed(1);
+    }});
+  }}
+
+  const btnParamsToggle = document.getElementById("btn-params-toggle");
+  const paramsDrawer = document.getElementById("params-drawer");
+  if (btnParamsToggle && paramsDrawer) {{
+    btnParamsToggle.addEventListener("click", () => {{
+      paramsDrawer.classList.toggle("open");
+      btnParamsToggle.classList.toggle("active-btn", paramsDrawer.classList.contains("open"));
+    }});
+  }}
+
+  function appendTerminalLog(text, replace = false) {{
+    const box = document.getElementById("terminal-box");
+    if (!box) return;
+    if (replace) {{
+      box.textContent = text;
+    }} else {{
+      box.textContent += (box.textContent.endsWith("\n") ? "" : "\n") + text;
+    }}
+    box.scrollTop = box.scrollHeight;
+  }}
+
+  function collectWorkflowParams() {{
+    const cell = DATA.cell || [68.7, 69.8, 156.9, 90.0, 90.0, 90.0];
+    const getNum = (id, fb) => {{
+      const el = document.getElementById(id);
+      const v = el ? parseFloat(el.value) : NaN;
+      return Number.isFinite(v) ? v : fb;
+    }};
+    const sgEl = document.getElementById("inp-sg");
+    return {{
+      instrument: DATA.instrument || "CG4D",
+      space_group: (sgEl && sgEl.value.trim()) || DATA.space_group || "P 21 21 21",
+      a: getNum("inp-a", cell[0]),
+      b: getNum("inp-b", cell[1]),
+      c: getNum("inp-c", cell[2]),
+      alpha: getNum("inp-alpha", cell[3]),
+      beta: getNum("inp-beta", cell[4]),
+      gamma: getNum("inp-gamma", cell[5]),
+      d_min: getNum("inp-dmin", 2.5),
+      steps: Math.round(getNum("inp-steps", 120)),
+      wavelength_min: state.lamMin,
+      wavelength_max: state.lamMax,
+    }};
   }}
 
   // Vibrant spectral color preset for wavelength / zone highlights
@@ -2463,11 +2585,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     PIPELINE.forEach((st, idx) => {{
       const isAct = idx === state.currentPipelineIdx;
       const isDone = idx < state.currentPipelineIdx;
-      const pill = document.createElement("span");
+      const pill = document.createElement("button");
       pill.className = "stage-pill" + (isAct ? " stage-active" : (isDone ? " stage-done" : ""));
-      pill.title = `${{st.name}} (${{(st.tool_ids || []).join(" + ")}}) — ${{st.artifact}}`;
-      pill.textContent = shortLabels[idx] || st.name;
-      pill.addEventListener("click", () => selectPipelineStage(idx));
+      const icon = (state.runningStageIdx === idx) ? "⏳" : (isDone ? "✓" : "▶");
+      pill.title = `Click to execute ${{st.name}} (${{(st.tool_ids || []).join(" + ")}}) → ${{st.artifact}}`;
+      pill.textContent = `${{icon}} ${{shortLabels[idx] || st.name}}`;
+      pill.addEventListener("click", () => {{
+        selectPipelineStage(idx, true);
+        executeWorkflowStage(idx);
+      }});
       container.appendChild(pill);
     }});
   }}
@@ -2478,10 +2604,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const st = PIPELINE[pIdx];
     document.getElementById("combo-badge").textContent = `STAGE ${{st.step_num}}`;
     document.getElementById("inspector-box").innerHTML = `
-      <div><strong style="color:var(--accent-cyan);">${{st.name}}</strong></div>
+      <div><strong style="color:var(--accent-pink);">${{st.name}}</strong> → <strong style="color:var(--accent-cyan);">${{st.artifact}}</strong></div>
       <div>Tools: <code>${{(st.tool_ids || []).join(", ")}}</code></div>
-      <div>Container: <code>${{st.container || "ghcr.io/neutrons/subhkl:feat-rainbow-zones"}}</code></div>
-      <div>Artifact: <strong style="color:var(--accent-gold);">${{st.artifact}}</strong></div>
     `;
     if (syncLadder && typeof st.ladder_rung_idx === "number") {{
       selectLadderRung(st.ladder_rung_idx, false);
@@ -2877,8 +3001,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         return;
       }}
 
-      const baseR = captured ? 5.4 : 3.2;
-      const r = isHovered ? baseR + 3.2 : baseR;
+      const baseR = Math.max(1.6, Math.min(28.0, 2.8 * state.detZoom));
+      const r = isHovered ? baseR + 2.2 : baseR;
 
       ctx.save();
       // Subtle depth tether connecting the floating Bragg ring to its physical spot on the detector panel
@@ -2886,18 +3010,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.beginPath();
         ctx.moveTo(bx, by);
         ctx.lineTo(x, y);
-        ctx.strokeStyle = "rgba(251, 191, 36, 0.35)";
+        ctx.strokeStyle = "rgba(244, 63, 133, 0.38)";
         ctx.lineWidth = 1.0;
         ctx.stroke();
       }}
 
-      // Open vibrant spectral ring around the spot
+      // Open ring around the spot (uniform radius scaled by zoom factor)
       ctx.beginPath();
       ctx.arc(x, y, r, 0, Math.PI * 2);
       ctx.strokeStyle = isHovered
-        ? "#fbbf24"
-        : wavelengthToColor(p.wavelength, captured ? 0.95 : 0.35);
-      ctx.lineWidth = isHovered ? 2.6 : (captured ? 2.1 : 1.1);
+        ? "#f43f85"
+        : wavelengthToColor(p.wavelength, captured ? 0.95 : 0.38);
+      ctx.lineWidth = isHovered ? 2.4 : (captured ? 1.85 : 1.05);
       ctx.stroke();
 
       if (state.detAlpha < 0.2) {{
@@ -3776,168 +3900,212 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
   probeGalaxyConnection();
 
-  if (btnGalaxyDispatch) {{
-    btnGalaxyDispatch.addEventListener("click", async () => {{
-      const st = PIPELINE[state.currentPipelineIdx] || PIPELINE[1] || {{ stage_id: "solve", name: "2. SOLVE" }};
-      const stageId = st.stage_id || "solve";
-      const pipeDesc = document.getElementById("pipeline-desc");
+  async function executeWorkflowStage(stageIdx) {{
+    const st = PIPELINE[stageIdx] || PIPELINE[state.currentPipelineIdx] || PIPELINE[1] || {{ stage_id: "solve", name: "2. SOLVE" }};
+    const stageId = st.stage_id || "solve";
+    const params = collectWorkflowParams();
+    state.runningStageIdx = stageIdx;
+    renderPipeline();
+    const cellSummary = document.getElementById("cell-summary");
+    if (cellSummary) cellSummary.textContent = `RUNNING ${{stageId.toUpperCase()}}...`;
+    appendTerminalLog(
+      `$ subhkl [${{st.name}}] — dispatching (SG=${{params.space_group}}, cell=${{params.a}},${{params.b}},${{params.c}}, λ=${{params.wavelength_min.toFixed(2)}}–${{params.wavelength_max.toFixed(2)}} Å)...\n`,
+      true
+    );
 
-      if (galaxyBridge.mode === "nova") {{
-        btnGalaxyDispatch.textContent = "⏳ SUBMITTING TO GALAXY / PULSAR...";
-        try {{
-          const resp = await fetch("api/pipeline/run", {{
-            method: "POST",
-            headers: {{ "Content-Type": "application/json" }},
-            body: JSON.stringify({{ stage_id: stageId }}),
-          }});
-          const res = await resp.json();
-          if (!resp.ok || res.status === "error") {{
-            throw new Error(res.error || "Failed to dispatch job");
-          }}
-          const jobId = res.job && res.job.job_id;
-          if (pipeDesc) {{
-            pipeDesc.textContent = `🚀 DISPATCHED ${{st.name}} TO GALAXY / PULSAR (Job ${{jobId || "sim"}})`;
-          }}
-          if (stageId === "solve") selectLadderRung(0, false);
-          if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
-          galaxyBridge.pollTimer = setInterval(async () => {{
-            try {{
-              const sr = await fetch("api/pipeline/status", {{ cache: "no-store" }});
-              if (!sr.ok) return;
-              const sdoc = await sr.json();
-              const aj = sdoc.active_job;
-              if (!aj) return;
-              if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
-                selectLadderRung(aj.ladder_rung_idx, false);
-              }}
-              btnGalaxyDispatch.textContent = `⏳ PULSAR GPU [${{aj.state.toUpperCase()}}]: ${{aj.tool_id}}`;
-              if (aj.state === "ok" || aj.state === "error") {{
-                clearInterval(galaxyBridge.pollTimer);
-                galaxyBridge.pollTimer = null;
-                btnGalaxyDispatch.textContent = aj.state === "ok"
-                  ? "✅ PULSAR JOB COMPLETE (RELOADED)"
-                  : "❌ PULSAR JOB ERROR";
-                if (aj.state === "ok" && aj.updated_payload_ready) {{
-                  window.location.reload();
-                }}
-              }}
-            }} catch (_pe) {{}}
-          }}, 1800);
-        }} catch (err) {{
-          btnGalaxyDispatch.textContent = `⚠️ ${{err.message}}`;
+    if (galaxyBridge.mode === "nova") {{
+      try {{
+        const resp = await fetch("api/pipeline/run", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ stage_id: stageId, params: params }}),
+        }});
+        const res = await resp.json();
+        if (!resp.ok || res.status === "error") {{
+          throw new Error(res.error || "Failed to dispatch job");
         }}
-        return;
-      }}
-
-      if (galaxyBridge.mode === "galaxy_iframe" && galaxyBridge.historyId) {{
-        btnGalaxyDispatch.textContent = "⏳ SUBMITTING TO GALAXY / PULSAR...";
-        try {{
-          await probeGalaxyConnection();
-          const h5s = galaxyBridge.datasets.filter(
-            d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
-          );
-          const mergedDs = [...h5s].reverse().find(
-            d => /merged|image|scan|prepare/i.test(d.name || "")
-          ) || h5s[h5s.length - 1];
-          const solveDs = [...h5s].reverse().find(
-            d => /solve|index/i.test(d.name || "")
-          ) || h5s[0];
-
-          let toolId = "imaginex_subhkl_solve";
-          let inputs = {{}};
-          const cell = DATA.cell || [68.7, 69.8, 156.9, 90.0, 90.0, 90.0];
-          const wl = DATA.wavelength_range || [1.8, 4.5];
-
-          if (stageId === "solve") {{
-            if (!mergedDs) throw new Error("Upload merged.h5 to History first");
-            toolId = "imaginex_subhkl_solve";
-            inputs = {{
-              input_h5: {{ src: "hda", id: mergedDs.id }},
-              instrument: DATA.instrument || "CG4D",
-              space_group: DATA.space_group || "P 21 21 21",
-              a: cell[0], b: cell[1], c: cell[2],
-              alpha: cell[3], beta: cell[4], gamma: cell[5],
-              wavelength_min: wl[0], wavelength_max: wl[1],
-              objective: "band",
-              d_min: 2.5,
-              n_zones: 400,
-              steps: 250,
-            }};
-          }} else if (stageId === "integrate") {{
-            if (!mergedDs || !solveDs) throw new Error("Need merged.h5 and solve.h5 in History");
-            toolId = "imaginex_subhkl_predict";
-            inputs = {{
-              input: {{ src: "hda", id: mergedDs.id }},
-              indexed_peaks: {{ src: "hda", id: solveDs.id }},
-              instrument: DATA.instrument || "CG4D",
-              d_min: 1.8,
-              wavelength_min: wl[0],
-              wavelength_max: wl[1],
-            }};
-          }} else {{
-            if (!mergedDs) throw new Error("No HDF5 dataset in History");
-            toolId = (st.tool_ids && st.tool_ids[0]) || "imaginex_subhkl_solve";
-            inputs = {{ input_h5: {{ src: "hda", id: mergedDs.id }} }};
-          }}
-
-          const tr = await fetch("/api/tools", {{
-            method: "POST",
-            credentials: "same-origin",
-            headers: {{ "Content-Type": "application/json" }},
-            body: JSON.stringify({{
-              history_id: galaxyBridge.historyId,
-              tool_id: toolId,
-              inputs: inputs,
-            }}),
-          }});
-          const tres = await tr.json();
-          if (!tr.ok) {{
-            throw new Error((tres && tres.err_msg) || "Galaxy /api/tools error");
-          }}
-          const jobId = tres.jobs && tres.jobs[0] && tres.jobs[0].id;
-          if (pipeDesc) {{
-            pipeDesc.textContent = `🚀 DISPATCHED ${{toolId}} TO GALAXY / PULSAR (Job ${{jobId}})`;
-          }}
-          if (stageId === "solve") selectLadderRung(0, false);
-          let rungStep = 0;
-          if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
-          galaxyBridge.pollTimer = setInterval(async () => {{
-            try {{
-              const jr = await fetch(`/api/jobs/${{jobId}}`, {{ credentials: "same-origin" }});
-              if (!jr.ok) return;
-              const jdoc = await jr.json();
-              const jstate = jdoc.state || "running";
-              btnGalaxyDispatch.textContent = `⏳ PULSAR GPU [${{jstate.toUpperCase()}}]: ${{toolId}}`;
-              if (stageId === "solve" && (jstate === "queued" || jstate === "running")) {{
-                rungStep = Math.min(3, rungStep + 1);
-                selectLadderRung(rungStep, false);
-              }}
-              if (jstate === "ok" || jstate === "error") {{
-                clearInterval(galaxyBridge.pollTimer);
-                galaxyBridge.pollTimer = null;
-                if (jstate === "ok") {{
-                  selectLadderRung(4, false);
-                  btnGalaxyDispatch.textContent = "✅ JOB COMPLETE (LOADING H5...)";
-                  await probeGalaxyConnection();
-                  const outs = (tres.outputs || []).filter(o => o.extension === "h5" || o.extension === "hdf5");
-                  if (outs.length > 0) {{
-                    await loadFromGalaxyDatasetId(outs[0].id);
+        const jobObj = res.job || {{}};
+        const jobId = jobObj.job_id || "local";
+        if (jobObj.stdout || jobObj.stderr) {{
+          appendTerminalLog((jobObj.stdout || "") + (jobObj.stderr ? `\n[stderr]\n${{jobObj.stderr}}` : ""), true);
+        }}
+        if (stageId === "solve") selectLadderRung(0, false);
+        if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
+        galaxyBridge.pollTimer = setInterval(async () => {{
+          try {{
+            const sr = await fetch("api/pipeline/status", {{ cache: "no-store" }});
+            if (!sr.ok) return;
+            const sdoc = await sr.json();
+            const aj = sdoc.active_job;
+            if (!aj) return;
+            const outText = (aj.stdout || "") + (aj.stderr ? `\n[stderr]\n${{aj.stderr}}` : "");
+            if (outText) appendTerminalLog(outText, true);
+            if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
+              selectLadderRung(aj.ladder_rung_idx, false);
+            }}
+            if (cellSummary) cellSummary.textContent = `${{aj.mode === "galaxy" ? "PULSAR" : "SUBHKL"}} [${{(aj.state || "running").toUpperCase()}}]`;
+            if (aj.state === "ok" || aj.state === "error") {{
+              clearInterval(galaxyBridge.pollTimer);
+              galaxyBridge.pollTimer = null;
+              state.runningStageIdx = -1;
+              renderPipeline();
+              if (cellSummary) cellSummary.textContent = aj.state === "ok" ? "DONE ✓" : "ERROR ✗";
+              if (aj.state === "ok" && aj.updated_payload_ready) {{
+                try {{
+                  const pr = await fetch("api/payload", {{ cache: "no-store" }});
+                  if (pr.ok) {{
+                    const newPayload = await pr.json();
+                    recomputeBoundsAndReload(newPayload);
+                    appendTerminalLog("\n✓ Reloaded updated orientation & Bragg reflections into viewport.");
                   }}
-                }} else {{
-                  btnGalaxyDispatch.textContent = "❌ PULSAR JOB ERROR";
-                }}
+                }} catch (_re) {{}}
               }}
-            }} catch (_je) {{}}
-          }}, 1800);
-        }} catch (err) {{
-          btnGalaxyDispatch.textContent = `⚠️ ${{err.message}}`;
-        }}
-        return;
+            }}
+          }} catch (_pe) {{}}
+        }}, 700);
+      }} catch (err) {{
+        state.runningStageIdx = -1;
+        renderPipeline();
+        appendTerminalLog(`\n[error] ${{err.message}}`);
       }}
+      return;
+    }}
 
-      // Fallback when opened as a standalone local HTML file outside Galaxy: walk the pipeline
-      if (btnPipeRun) btnPipeRun.click();
-    }});
+    if (galaxyBridge.mode === "galaxy_iframe" && galaxyBridge.historyId) {{
+      try {{
+        await probeGalaxyConnection();
+        const h5s = galaxyBridge.datasets.filter(
+          d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
+        );
+        const mergedDs = [...h5s].reverse().find(
+          d => /merged|image|scan|prepare/i.test(d.name || "")
+        ) || h5s[h5s.length - 1];
+        const solveDs = [...h5s].reverse().find(
+          d => /solve|index/i.test(d.name || "")
+        ) || h5s[0];
+
+        let toolId = "imaginex_subhkl_solve";
+        let inputs = {{}};
+
+        if (stageId === "solve") {{
+          if (!mergedDs) throw new Error("Upload merged.h5 to Galaxy History first");
+          toolId = "imaginex_subhkl_solve";
+          inputs = {{
+            input_h5: {{ src: "hda", id: mergedDs.id }},
+            instrument: params.instrument,
+            space_group: params.space_group,
+            a: params.a, b: params.b, c: params.c,
+            alpha: params.alpha, beta: params.beta, gamma: params.gamma,
+            wavelength_min: params.wavelength_min,
+            wavelength_max: params.wavelength_max,
+            objective: "band",
+            d_min: params.d_min,
+            n_zones: 400,
+            steps: params.steps,
+          }};
+        }} else if (stageId === "integrate") {{
+          if (!mergedDs || !solveDs) throw new Error("Need merged.h5 and solve.h5 in Galaxy History");
+          toolId = "imaginex_subhkl_predict";
+          inputs = {{
+            input: {{ src: "hda", id: mergedDs.id }},
+            indexed_peaks: {{ src: "hda", id: solveDs.id }},
+            instrument: params.instrument,
+            d_min: params.d_min,
+            wavelength_min: params.wavelength_min,
+            wavelength_max: params.wavelength_max,
+          }};
+        }} else {{
+          if (!mergedDs) throw new Error("No HDF5 dataset in Galaxy History");
+          toolId = (st.tool_ids && st.tool_ids[0]) || "imaginex_subhkl_solve";
+          inputs = {{ input_h5: {{ src: "hda", id: mergedDs.id }} }};
+        }}
+
+        appendTerminalLog(`POST /api/tools -> tool_id=${{toolId}} (history=${{galaxyBridge.historyId}})...`);
+        const tr = await fetch("/api/tools", {{
+          method: "POST",
+          credentials: "same-origin",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            history_id: galaxyBridge.historyId,
+            tool_id: toolId,
+            inputs: inputs,
+          }}),
+        }});
+        const tres = await tr.json();
+        if (!tr.ok) {{
+          throw new Error((tres && tres.err_msg) || "Galaxy /api/tools error");
+        }}
+        const jobId = tres.jobs && tres.jobs[0] && tres.jobs[0].id;
+        appendTerminalLog(`Dispatched Galaxy / Pulsar job ${{jobId}} (${{toolId}}). Polling stdio...`);
+        if (stageId === "solve") selectLadderRung(0, false);
+        let rungStep = 0;
+        if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
+        galaxyBridge.pollTimer = setInterval(async () => {{
+          try {{
+            const jr = await fetch(`/api/jobs/${{jobId}}?full=true`, {{ credentials: "same-origin" }});
+            if (!jr.ok) return;
+            const jdoc = await jr.json();
+            const jstate = jdoc.state || "running";
+            const cmdLine = jdoc.command_line ? `$ ${{jdoc.command_line}}\n` : "";
+            const stdOut = jdoc.tool_stdout || jdoc.stdout || "";
+            const stdErr = jdoc.tool_stderr || jdoc.stderr || "";
+            if (cmdLine || stdOut || stdErr) {{
+              appendTerminalLog(
+                `[job ${{jobId}} · ${{jstate}}]\n${{cmdLine}}${{stdOut}}${{stdErr ? "\\n[stderr]\\n" + stdErr : ""}}`,
+                true
+              );
+            }}
+            if (cellSummary) cellSummary.textContent = `GALAXY [${{jstate.toUpperCase()}}]`;
+            if (stageId === "solve" && (jstate === "queued" || jstate === "running")) {{
+              rungStep = Math.min(3, rungStep + 1);
+              selectLadderRung(rungStep, false);
+            }}
+            if (jstate === "ok" || jstate === "error") {{
+              clearInterval(galaxyBridge.pollTimer);
+              galaxyBridge.pollTimer = null;
+              state.runningStageIdx = -1;
+              renderPipeline();
+              if (jstate === "ok") {{
+                selectLadderRung(4, false);
+                if (cellSummary) cellSummary.textContent = "DONE ✓";
+                await probeGalaxyConnection();
+                const outs = (tres.outputs || []).filter(o => o.extension === "h5" || o.extension === "hdf5");
+                if (outs.length > 0) {{
+                  appendTerminalLog(`\n✓ Loading output dataset ${{outs[0].id}} into viewport...`);
+                  await loadFromGalaxyDatasetId(outs[0].id);
+                }}
+              }} else {{
+                if (cellSummary) cellSummary.textContent = "ERROR ✗";
+              }}
+            }}
+          }} catch (_je) {{}}
+        }}, 1200);
+      }} catch (err) {{
+        state.runningStageIdx = -1;
+        renderPipeline();
+        appendTerminalLog(`\n[error] ${{err.message}}`);
+      }}
+      return;
+    }}
+
+    // Standalone static file fallback: step through the Lattice Ladder rungs with diagnostic output
+    state.runningStageIdx = -1;
+    renderPipeline();
+    if (stageId === "solve") {{
+      let r = 0;
+      selectLadderRung(0, false);
+      const t = setInterval(() => {{
+        const rung = LADDER[r];
+        if (rung) appendTerminalLog(`[step ${{rung.step_num}}] ${{rung.name}} — ${{rung.metric_label}}`);
+        r++;
+        if (r < LADDER.length) selectLadderRung(r, false);
+        else clearInterval(t);
+      }}, 650);
+    }}
+  }}
+
+  if (btnGalaxyDispatch) {{
+    btnGalaxyDispatch.addEventListener("click", () => executeWorkflowStage(state.currentPipelineIdx));
   }}
 
   function animate() {{

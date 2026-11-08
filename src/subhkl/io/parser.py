@@ -1760,5 +1760,8 @@ def rainbow_visualize(
     return out
 
 
+app.command("parallax-visualize")(rainbow_visualize)
+
+
 if __name__ == "__main__":
     app()

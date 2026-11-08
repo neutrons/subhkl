@@ -356,6 +356,11 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
     assert app.server is not None
     assert app.view_model.view_state.running is False
     assert app.view_model.model.subhkl.data.instrument == InstrumentOptions.CG4D
-    assert "DIFFRACTION PARALLAX" in app.server.state.parallax_html
+    html = app.server.state.parallax_html
+    assert "DIFFRACTION PARALLAX" in html
+    assert '<span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span>' in html
+    assert "executeWorkflowStage" in html
+    assert 'id="terminal-box"' in html
+    assert "2.8 * state.detZoom" in html
 
 

@@ -213,12 +213,7 @@ class NovaGalaxyPipelineRunner:
         params = dict(params or {})
         tool_ids = self.STAGE_TOOLS[stage_id]
         if not self.is_connected:
-            return {
-                "stage_id": stage_id,
-                "mode": "local_preview",
-                "tool_ids": tool_ids,
-                "status": "simulated",
-            }
+            return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
 
         datasets = self.list_history_datasets()
         h5_ok = [
@@ -252,7 +247,7 @@ class NovaGalaxyPipelineRunner:
             primary_tool = "imaginex_subhkl_solve"
             input_id = params.get("input_h5_id") or (merged_ds["id"] if merged_ds else None)
             if not input_id:
-                raise RuntimeError("No input HDF5 dataset found in Galaxy history for Solve.")
+                return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
             cell = params.get("cell") or [68.7, 69.8, 156.9, 90.0, 90.0, 90.0]
             wl = params.get("wavelength_range") or [1.8, 4.5]
             tool_inputs = {
@@ -277,7 +272,7 @@ class NovaGalaxyPipelineRunner:
             img_id = params.get("images_h5_id") or (merged_ds["id"] if merged_ds else None)
             idx_id = params.get("indexed_h5_id") or (solve_ds["id"] if solve_ds else img_id)
             if not img_id or not idx_id:
-                raise RuntimeError("Need both merged images and solve.h5 in Galaxy history.")
+                return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
             wl = params.get("wavelength_range") or [1.8, 4.5]
             tool_inputs = {
                 "input": {"src": "hda", "id": img_id},
@@ -289,15 +284,19 @@ class NovaGalaxyPipelineRunner:
             }
         else:
             input_id = params.get("input_h5_id") or (merged_ds["id"] if merged_ds else None)
-            if input_id:
-                tool_inputs["input"] = {"src": "hda", "id": input_id}
+            if not input_id:
+                return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
+            tool_inputs["input"] = {"src": "hda", "id": input_id}
 
         submit_body = {
             "history_id": self.history_id,
             "tool_id": primary_tool,
             "inputs": tool_inputs,
         }
-        resp = self._api_request("POST", "/api/tools", payload=submit_body)
+        try:
+            resp = self._api_request("POST", "/api/tools", payload=submit_body)
+        except Exception:
+            return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
         jobs = resp.get("jobs", []) if isinstance(resp, dict) else []
         outputs = resp.get("outputs", []) if isinstance(resp, dict) else []
         job_id = jobs[0].get("id") if jobs else None
@@ -307,6 +306,9 @@ class NovaGalaxyPipelineRunner:
             "tool_id": primary_tool,
             "stage_id": stage_id,
             "state": "queued",
+            "command_line": f"galaxy/pulsar :: {primary_tool}",
+            "stdout": f"[ndip/pulsar] Dispatched {primary_tool} (job {job_id}) to {self.galaxy_url}\n",
+            "stderr": "",
             "ladder_rung_idx": 0 if stage_id == "solve" else 4,
             "outputs": [
                 {"id": o.get("id"), "name": o.get("name"), "extension": o.get("extension")}
@@ -334,17 +336,169 @@ class NovaGalaxyPipelineRunner:
             "status": "submitted",
         }
 
+    def _submit_local_subhkl_stage(
+        self,
+        stage_id: str,
+        params: dict[str, Any],
+        on_complete_h5: Any = None,
+    ) -> dict[str, Any]:
+        """Run subhkl stage in a background subprocess and stream live stdout/stderr to the GUI console."""
+        import subprocess
+        import sys
+
+        cell = params.get("cell") or [68.7, 69.8, 156.9, 90.0, 90.0, 90.0]
+        wl = params.get("wavelength_range") or [1.8, 4.5]
+        inst = params.get("instrument", "CG4D")
+        sg = params.get("space_group", "P 21 21 21")
+        merged_path = params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
+        solve_path = params.get("peaks_file") or "/home/xvg/subhkl-examples/betalac-7/solve.h5"
+        out_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_{stage_id}_{int(time.time())}.h5")
+
+        if stage_id == "solve" and os.path.isfile(merged_path):
+            cmd = [
+                sys.executable,
+                "-u",
+                "-m",
+                "subhkl.io.parser",
+                "solve",
+                merged_path,
+                out_h5,
+                inst,
+                "--space-group",
+                str(sg),
+                "-a",
+                str(cell[0]),
+                "-b",
+                str(cell[1]),
+                "-c",
+                str(cell[2]),
+                "--alpha",
+                str(cell[3]),
+                "--beta",
+                str(cell[4]),
+                "--gamma",
+                str(cell[5]),
+                "--wavelength-min",
+                str(wl[0]),
+                "--wavelength-max",
+                str(wl[1]),
+                "--d-min",
+                str(params.get("d_min", 2.8)),
+                "--n-zones",
+                str(params.get("n_zones", 120)),
+                "--steps",
+                str(params.get("steps", 80)),
+            ]
+        elif stage_id == "integrate" and os.path.isfile(merged_path) and os.path.isfile(solve_path):
+            cmd = [
+                sys.executable,
+                "-u",
+                "-m",
+                "subhkl.io.parser",
+                "peak-predictor",
+                merged_path,
+                out_h5,
+                inst,
+                "--indexed-peaks-h5-filename",
+                solve_path,
+                "--d-min",
+                str(params.get("d_min", 2.2)),
+                "--wavelength-min",
+                str(wl[0]),
+                "--wavelength-max",
+                str(wl[1]),
+            ]
+        else:
+            cmd = [
+                sys.executable,
+                "-u",
+                "-m",
+                "subhkl.io.parser",
+                "metrics",
+                solve_path,
+            ]
+
+        cmd_str = " ".join(cmd)
+        job_id = f"local-{int(time.time())}"
+        job_record: dict[str, Any] = {
+            "job_id": job_id,
+            "tool_id": f"subhkl::{stage_id}",
+            "stage_id": stage_id,
+            "state": "running",
+            "command_line": cmd_str,
+            "stdout": f"$ {cmd_str}\n",
+            "stderr": "",
+            "ladder_rung_idx": 0 if stage_id == "solve" else 4,
+            "outputs": [{"id": job_id, "name": os.path.basename(out_h5), "extension": "h5"}],
+            "updated_payload_ready": False,
+            "started_at": time.time(),
+        }
+        self.active_job = job_record
+
+        def _stream_proc() -> None:
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    job_record["stdout"] = (job_record.get("stdout", "") + line)[-24000:]
+                    low = line.lower()
+                    if stage_id == "solve":
+                        if "ladder" in low or "blind" in low:
+                            job_record["ladder_rung_idx"] = max(job_record["ladder_rung_idx"], 1)
+                        elif "global" in low or "60-zone" in low:
+                            job_record["ladder_rung_idx"] = max(job_record["ladder_rung_idx"], 2)
+                        elif "120" in low or "cell" in low or "stage" in low:
+                            job_record["ladder_rung_idx"] = max(job_record["ladder_rung_idx"], 3)
+                rc = proc.wait()
+                if rc == 0:
+                    job_record["state"] = "ok"
+                    job_record["ladder_rung_idx"] = 4
+                    job_record["stdout"] += f"\n[subhkl] Stage '{stage_id}' completed (exit 0).\n"
+                    if os.path.isfile(out_h5) and callable(on_complete_h5):
+                        on_complete_h5(out_h5)
+                        job_record["updated_payload_ready"] = True
+                else:
+                    job_record["state"] = "error"
+                    job_record["stderr"] += f"\n[subhkl] Process exited with code {rc}\n"
+            except Exception as exc:
+                job_record["state"] = "error"
+                job_record["stderr"] += f"\n[subhkl] Error: {exc}\n"
+
+        threading.Thread(target=_stream_proc, daemon=True).start()
+        return {
+            "stage_id": stage_id,
+            "mode": "local_stream",
+            "galaxy_url": self.galaxy_url,
+            "history_id": self.history_id,
+            "job": job_record,
+            "status": "submitted",
+        }
+
     def _poll_galaxy_job(self, job_record: dict[str, Any], on_complete_h5: Any = None) -> None:
         job_id = job_record.get("job_id")
         if not job_id:
             return
         step_counter = 0
         while True:
-            time.sleep(1.8)
+            time.sleep(1.4)
             try:
-                jinfo = self._api_request("GET", f"/api/jobs/{job_id}")
+                jinfo = self._api_request("GET", f"/api/jobs/{job_id}?full=true")
                 state = jinfo.get("state", "running")
                 job_record["state"] = state
+                if jinfo.get("command_line"):
+                    job_record["command_line"] = jinfo["command_line"]
+                out_txt = jinfo.get("tool_stdout") or jinfo.get("stdout") or ""
+                err_txt = jinfo.get("tool_stderr") or jinfo.get("stderr") or ""
+                if out_txt:
+                    job_record["stdout"] = f"$ {job_record.get('command_line', '')}\n{out_txt}"
+                if err_txt:
+                    job_record["stderr"] = err_txt
                 if job_record.get("stage_id") == "solve" and state in ("queued", "running"):
                     step_counter = min(3, step_counter + 1)
                     job_record["ladder_rung_idx"] = step_counter
