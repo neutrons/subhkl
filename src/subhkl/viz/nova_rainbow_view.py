@@ -32,23 +32,22 @@ class NovaGalaxyPipelineRunner:
 
     Patterned directly on ``topaz-reduction-gui`` (``models/galaxy.py``) and the
     IMAGINE-X tool suite on ``code.ornl.gov/ndip/galaxy-tools`` (branch ``prototype``):
-      - Stage 1 (Reduce & Find): ``imaginex_subhkl_prepare_peaks`` -> ``imaginex_subhkl_peak_fit``
-      - Stage 2 (Solve UB & Zones): ``imaginex_subhkl`` (``imaginex_subhkl_index.xml``)
+      - Stage 1 (Reduce & Merge): ``imaginex_subhkl_prepare_peaks`` (``merged.h5``)
+      - Stage 2 (Solve Lattice Ladder): ``imaginex_subhkl_solve`` (finder-less ``solve.h5``)
       - Stage 3 (Predict & Integrate): ``imaginex_subhkl_predict`` -> ``imaginex_subhkl_integrate``
-      - Stage 4 (Merge & Analysis): ``imaginex_merge`` -> ``imaginex_analysis``
+      - Stage 4 (Merge & MTZ): ``imaginex_subhkl_mtz`` / ``imaginex_merge`` -> ``imaginex_analysis``
     """
 
     STAGE_TOOLS: dict[str, list[str]] = {
         "reduce": [
             "imaginex_subhkl_prepare_peaks",
-            "imaginex_subhkl_peak_fit",
         ],
-        "solve": ["imaginex_subhkl"],
+        "solve": ["imaginex_subhkl_solve"],
         "integrate": [
             "imaginex_subhkl_predict",
             "imaginex_subhkl_integrate",
         ],
-        "merge": ["imaginex_merge", "imaginex_analysis"],
+        "merge": ["imaginex_subhkl_mtz", "imaginex_merge", "imaginex_analysis"],
     }
 
     def __init__(

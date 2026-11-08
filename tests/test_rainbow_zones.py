@@ -270,3 +270,57 @@ def test_nova_view_model_and_cli_rainbow_flag(tmp_path):
     )
     assert res2.exit_code == 0, res2.output
     assert idx_html.exists()
+
+
+def test_finderless_solve_h5_forward_projection_and_stages(tmp_path):
+    """Finder-less solve.h5 (without peaks/xyz) forward-projects reflections and populates solve stage rungs."""
+    _, U, B, _, _, _ = _synthetic_orthorhombic_peaks()
+
+    solve_h5 = tmp_path / "synthetic_solve.h5"
+    with h5py.File(solve_h5, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f["sample/U"] = U
+        f["sample/B"] = B
+        f["sample/a"] = 18.0
+        f["sample/b"] = 24.0
+        f["sample/c"] = 32.0
+        f["sample/alpha"] = 90.0
+        f["sample/beta"] = 90.0
+        f["sample/gamma"] = 90.0
+        f["sample/space_group"] = "P 21 21 21"
+        f["instrument/wavelength"] = np.array([2.0, 4.5])
+        f["goniometer/R"] = np.eye(3)[None, :, :]
+        f["bank_ids"] = np.array([101], dtype=np.int32)
+        f["file_offsets"] = np.array([0], dtype=np.int64)
+
+        bs = f.create_group("blind_search")
+        bs.attrs["stable_observations"] = 791552
+        bs.attrs["samples_requested"] = 16384
+        bs.attrs["weighting"] = "smooth chi2-suppressed bin Poisson deviance"
+        bs["proposal_scores"] = np.array([0.0012, 0.0011], dtype=np.float64)
+        bs["full_scores"] = np.array([0.481, 0.102], dtype=np.float64)
+
+        sr = f.create_group("scan_refinement")
+        sr.attrs["d_min"] = 3.0
+        sr.attrs["n_zones"] = 400
+        sr.attrs["status"] = "converged"
+        sr.attrs["stages"] = json.dumps(
+            [
+                {"stage": "global", "objective": -0.513, "iterations": 97, "success": True},
+                {"stage": "120-zones", "objective": -1.101, "iterations": 192, "success": True},
+                {"stage": "cell", "objective": -2.011, "iterations": 235, "success": True},
+            ]
+        )
+
+    payload = build_rainbow_zone_payload(replay_h5=solve_h5)
+    assert payload["instrument"] == "CG4D"
+    assert len(payload["peaks"]) > 0
+    assert len(payload["zones"]) > 0
+    assert "Binned Count Excess" in payload["ladder_steps"][0]["stage"]
+    assert "Zone Ladder" in payload["ladder_steps"][1]["stage"]
+    assert "60-Zone Global" in payload["ladder_steps"][2]["stage"]
+    assert "120→400 Zone + Cell" in payload["ladder_steps"][3]["stage"]
+    assert "Converged Solve UB" in payload["ladder_steps"][4]["stage"]
+    assert payload["pipeline_stages"][0]["name"] == "1. REDUCE & MERGE"
+    assert "imaginex_subhkl_solve" in payload["pipeline_stages"][1]["tool_ids"]
+

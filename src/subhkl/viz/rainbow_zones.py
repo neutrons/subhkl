@@ -140,7 +140,7 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
 
 
 def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
-    """Auto-discover an accompanying ``*.im.h5`` or ``merged.h5`` in the same directory."""
+    """Auto-discover an accompanying ``*.im.h5`` or ``merged.h5`` (or ``attrs['source']``)."""
     if replay_h5 is None:
         return None
     p = Path(replay_h5).resolve()
@@ -150,6 +150,16 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
         with h5py.File(p, "r") as f:
             if "images" in f:
                 return str(p)
+            src_attr = _decode_str(f.attrs.get("source"), "")
+            if src_attr:
+                for cand_src in (Path(src_attr), p.parent / Path(src_attr).name):
+                    if cand_src.exists():
+                        try:
+                            with h5py.File(cand_src, "r") as sf:
+                                if "images" in sf:
+                                    return str(cand_src.resolve())
+                        except Exception:
+                            pass
     except Exception:
         pass
 
@@ -176,6 +186,7 @@ def _encode_panel_textures(
     sigma_arr: np.ndarray | None,
     images_h5: str | os.PathLike | None = None,
     render_binning: int = 4,
+    frame_slice: tuple[int, int] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Build cylindrical + spherical detector panel geometries and base64 log-intensity PNG textures.
 
@@ -191,15 +202,26 @@ def _encode_panel_textures(
             with h5py.File(images_h5, "r") as f:
                 if "images" in f:
                     ims = f["images"]
-                    b_ids = (
+                    n_total_frames = len(ims)
+                    b_ids_all = (
                         np.asarray(f["bank_ids"][()], dtype=int)
                         if "bank_ids" in f
-                        else np.arange(1, len(ims) + 1)
+                        else np.arange(1, n_total_frames + 1)
                     )
+                    f0, f1 = 0, n_total_frames
+                    if frame_slice is not None:
+                        f0 = max(0, min(int(frame_slice[0]), n_total_frames))
+                        f1 = max(f0, min(int(frame_slice[1]), n_total_frames))
+                    elif "file_offsets" in f:
+                        offsets = np.asarray(f["file_offsets"][()], dtype=int)
+                        if len(offsets) > 1:
+                            counts = np.diff(np.append(offsets, n_total_frames))
+                            best_r = int(np.argmax(counts))
+                            f0 = int(offsets[best_r])
+                            f1 = int(offsets[best_r] + counts[best_r])
                     b = max(1, int(render_binning))
-                    for idx, bk in enumerate(b_ids):
-                        if idx >= len(ims):
-                            break
+                    for idx in range(f0, f1):
+                        bk = int(b_ids_all[idx])
                         im = np.asarray(ims[idx], dtype=np.float32)
                         if im.ndim != 2:
                             continue
@@ -212,12 +234,12 @@ def _encode_panel_textures(
                             )
                         else:
                             imb = im
-                        if int(bk) in raw_bank_images:
-                            raw_bank_images[int(bk)] = np.maximum(
-                                raw_bank_images[int(bk)], imb
+                        if bk in raw_bank_images:
+                            raw_bank_images[bk] = np.maximum(
+                                raw_bank_images[bk], imb
                             )
                         else:
-                            raw_bank_images[int(bk)] = imb
+                            raw_bank_images[bk] = imb
                     if raw_bank_images:
                         intensity_source = "raw_h5"
         except Exception:
@@ -405,6 +427,9 @@ def _extract_from_h5(h5_path: str | os.PathLike) -> dict[str, Any]:
         bank = (
             np.asarray(f["bank"][()], dtype=int) if "bank" in f else None
         )
+        if "peaks/bank" in f and bank is None:
+            bank = np.asarray(f["peaks/bank"][()], dtype=int)
+
         pixel_r = (
             np.asarray(f["peaks/pixel_r"][()], dtype=float)
             if "peaks/pixel_r" in f
@@ -446,32 +471,51 @@ def _extract_from_h5(h5_path: str | os.PathLike) -> dict[str, Any]:
                     )
             peaks_xyz = xyz_list
 
-        if peaks_xyz is None:
-            peaks_xyz = np.zeros((0, 3), dtype=float)
+        # Extract finder-less solve / lattice-ladder / staged-band diagnostics if present
+        solve_diagnostics: dict[str, Any] | None = None
+        frame_slice: tuple[int, int] | None = None
+        if "file_offsets" in f and "bank_ids" in f:
+            offsets = np.asarray(f["file_offsets"][()], dtype=int)
+            n_frames_total = len(f["bank_ids"])
+            if len(offsets) >= 1:
+                counts = np.diff(np.append(offsets, n_frames_total))
+                best_run = int(np.argmax(counts))
+                f0 = int(offsets[best_run])
+                f1 = int(offsets[best_run] + counts[best_run])
+                frame_slice = (f0, f1)
 
-        n_peaks = len(peaks_xyz)
-        if bank is None:
-            bank = np.ones(n_peaks, dtype=int)
-        if pixel_r is None:
-            pixel_r = np.zeros(n_peaks, dtype=float)
-        if pixel_c is None:
-            pixel_c = np.zeros(n_peaks, dtype=float)
+        if any(k in f for k in ("blind_search", "scan_refinement", "solve", "search")):
+            solve_diagnostics = {}
+            bs_grp = f["blind_search"] if "blind_search" in f else (f["search"] if "search" in f else None)
+            if bs_grp is not None:
+                solve_diagnostics["stable_observations"] = int(bs_grp.attrs.get("stable_observations", 0))
+                solve_diagnostics["samples_requested"] = int(bs_grp.attrs.get("samples_requested", 0))
+                solve_diagnostics["weighting"] = _decode_str(
+                    bs_grp.attrs.get("weighting"), "smooth chi2-suppressed bin Poisson deviance"
+                )
+                if "proposal_scores" in bs_grp:
+                    ps = np.asarray(bs_grp["proposal_scores"][()], dtype=float).ravel()
+                    solve_diagnostics["n_candidates"] = int(len(ps))
+                    solve_diagnostics["top_proposal_score"] = float(np.max(ps)) if len(ps) else 0.0
+                if "full_scores" in bs_grp:
+                    fs = np.asarray(bs_grp["full_scores"][()], dtype=float).ravel()
+                    solve_diagnostics["top_full_score"] = float(np.max(fs)) if len(fs) else 0.0
+            if "scan_refinement" in f:
+                sr_grp = f["scan_refinement"]
+                solve_diagnostics["d_min"] = float(sr_grp.attrs.get("d_min", 2.5))
+                solve_diagnostics["n_zones"] = int(sr_grp.attrs.get("n_zones", 400))
+                solve_diagnostics["modes"] = _decode_str(sr_grp.attrs.get("modes"), "")
+                solve_diagnostics["status"] = _decode_str(sr_grp.attrs.get("status"), "converged")
+                stages_raw = _decode_str(sr_grp.attrs.get("stages"), "[]")
+                try:
+                    solve_diagnostics["stages"] = json.loads(stages_raw)
+                except Exception:
+                    solve_diagnostics["stages"] = []
+            elif "solve" in f:
+                s_grp = f["solve"]
+                solve_diagnostics["objective"] = _decode_str(s_grp.attrs.get("objective"), "poisson")
+                solve_diagnostics["status"] = _decode_str(s_grp.attrs.get("status"), "converged")
 
-        intensity = (
-            np.asarray(f["peaks/intensity"][()], dtype=float)
-            if "peaks/intensity" in f
-            else np.ones(n_peaks, dtype=float) * 100.0
-        )
-        sigma = (
-            np.asarray(f["peaks/sigma"][()], dtype=float)
-            if "peaks/sigma" in f
-            else np.ones(n_peaks, dtype=float) * 3.0
-        )
-        run_index = (
-            np.asarray(f["peaks/run_index"][()], dtype=int)
-            if "peaks/run_index" in f
-            else np.zeros(n_peaks, dtype=int)
-        )
         hkl = None
         if all(f"peaks/{k}" in f for k in ("h", "k", "l")):
             hkl = np.column_stack(
@@ -486,19 +530,214 @@ def _extract_from_h5(h5_path: str | os.PathLike) -> dict[str, Any]:
             if "peaks/lambda" in f
             else None
         )
+        intensity = (
+            np.asarray(f["peaks/intensity"][()], dtype=float)
+            if "peaks/intensity" in f
+            else None
+        )
+        sigma = (
+            np.asarray(f["peaks/sigma"][()], dtype=float)
+            if "peaks/sigma" in f
+            else None
+        )
+        run_index = (
+            np.asarray(f["peaks/run_index"][()], dtype=int)
+            if "peaks/run_index" in f
+            else None
+        )
 
         R_gonio = None
         if "goniometer/R" in f:
             R_all = np.asarray(f["goniometer/R"][()], dtype=float)
             if R_all.ndim == 3 and len(R_all) > 0:
-                if len(R_all) == n_peaks:
+                if peaks_xyz is not None and len(R_all) == len(peaks_xyz):
                     R_gonio = R_all
-                elif np.max(run_index, initial=0) < len(R_all):
+                elif (
+                    run_index is not None
+                    and len(run_index) > 0
+                    and np.max(run_index, initial=0) < len(R_all)
+                ):
                     R_gonio = R_all[run_index]
+                elif frame_slice is not None and frame_slice[0] < len(R_all):
+                    R_gonio = R_all[frame_slice[0]]
                 else:
                     R_gonio = R_all[0]
             elif R_all.ndim == 2:
                 R_gonio = R_all
+
+        # Finder-less solve.h5 forward projection onto calibrated detector banks
+        if (peaks_xyz is None or len(peaks_xyz) == 0) and U is not None and B is not None and detectors:
+            try:
+                from subhkl.core.crystallography import generate_reflections
+
+                U_mat = np.asarray(U, dtype=float)
+                if U_mat.ndim == 3:
+                    U_mat = U_mat[0]
+                U = U_mat
+                B_mat = np.asarray(B, dtype=float)
+                R_run = (
+                    np.asarray(R_gonio, dtype=float)
+                    if R_gonio is not None and np.asarray(R_gonio).ndim == 2
+                    else np.eye(3)
+                )
+                RUB = R_run @ U_mat @ B_mat
+                cell_use = cell if cell and len(cell) == 6 else list(_cell_from_B(B_mat))
+                d_min_use = (
+                    float(solve_diagnostics.get("d_min", 2.5))
+                    if solve_diagnostics and "d_min" in solve_diagnostics
+                    else 2.5
+                )
+                hkl_all = np.stack(
+                    generate_reflections(
+                        *cell_use, space_group=space_group, d_min=d_min_use
+                    ),
+                    axis=1,
+                ).astype(int)
+                G = hkl_all.astype(float) @ RUB.T
+                qn = np.linalg.norm(G, axis=1)
+                ki_vec = np.asarray(ki, dtype=float)
+                ki_vec = ki_vec / max(float(np.linalg.norm(ki_vec)), 1e-12)
+                sth = -(G @ ki_vec) / np.maximum(qn, 1e-12)
+                lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
+                keep_wl = (
+                    (lam_pred >= wavelength_range[0])
+                    & (lam_pred <= wavelength_range[1])
+                    & (sth > 0)
+                )
+                hkl_b = hkl_all[keep_wl]
+                lam_b = lam_pred[keep_wl]
+                G_b = G[keep_wl]
+                kf = ki_vec[None, :] + lam_b[:, None] * G_b
+                kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+
+                bank_imgs: dict[int, np.ndarray] = {}
+                src_h5 = _discover_images_h5(h5_path)
+                if src_h5 and os.path.exists(src_h5):
+                    try:
+                        with h5py.File(src_h5, "r") as mf:
+                            if "images" in mf and "bank_ids" in mf:
+                                f0_s, f1_s = (
+                                    frame_slice
+                                    if frame_slice is not None
+                                    else (0, len(mf["bank_ids"]))
+                                )
+                                b_ids_s = np.asarray(
+                                    mf["bank_ids"][f0_s:f1_s], dtype=int
+                                )
+                                ims_s = np.asarray(
+                                    mf["images"][f0_s:f1_s], dtype=np.float32
+                                )
+                                for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                    bank_imgs[int(b_id_s)] = im_s
+                    except Exception:
+                        pass
+
+                xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l, inten_l = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                for bid, det in sorted(detectors.items()):
+                    cen = np.asarray(det.center, dtype=float)
+                    uh = np.asarray(det.uhat, dtype=float)
+                    vh = np.asarray(det.vhat, dtype=float)
+                    w_d, h_d = float(det.width), float(det.height)
+                    nrm = np.cross(uh, vh)
+                    dn = kf @ nrm
+                    t_ray = np.dot(cen, nrm) / np.where(
+                        np.abs(dn) < 1e-9, -1.0, dn
+                    )
+                    hit = t_ray > 0
+                    if not np.any(hit):
+                        continue
+                    idx_h = np.flatnonzero(hit)
+                    p_hit = t_ray[idx_h, None] * kf[idx_h] - cen[None, :]
+                    um = p_hit @ uh
+                    vm = p_hit @ vh
+                    in_b = (
+                        (um >= w_d * 0.02)
+                        & (um <= w_d * 0.98)
+                        & (vm >= h_d * 0.02)
+                        & (vm <= h_d * 0.98)
+                    )
+                    if not np.any(in_b):
+                        continue
+                    idx_h = idx_h[in_b]
+                    um, vm = um[in_b], vm[in_b]
+                    pr_hit = vm / max(h_d, 1e-6) * (det.n - 1)
+                    pc_hit = um / max(w_d, 1e-6) * (det.m - 1)
+                    im_b = bank_imgs.get(int(bid))
+                    if im_b is not None:
+                        r_i = np.clip(
+                            np.round(pr_hit).astype(int), 2, im_b.shape[0] - 3
+                        )
+                        c_i = np.clip(
+                            np.round(pc_hit).astype(int), 2, im_b.shape[1] - 3
+                        )
+                        peak_val = np.maximum.reduce(
+                            [
+                                im_b[r_i + dr, c_i + dc]
+                                for dr in (-1, 0, 1)
+                                for dc in (-1, 0, 1)
+                            ]
+                        )
+                        bg_val = float(np.median(im_b))
+                        snr = (peak_val - bg_val) / np.sqrt(max(bg_val, 1.0))
+                        keep_snr = snr >= 3.0
+                        if not np.any(keep_snr):
+                            continue
+                        idx_h = idx_h[keep_snr]
+                        um, vm = um[keep_snr], vm[keep_snr]
+                        pr_hit, pc_hit = pr_hit[keep_snr], pc_hit[keep_snr]
+                        peak_val = peak_val[keep_snr]
+                    else:
+                        peak_val = np.full(len(idx_h), 150.0, dtype=float)
+
+                    xyz_hit = (
+                        cen[None, :]
+                        + um[:, None] * uh[None, :]
+                        + vm[:, None] * vh[None, :]
+                    )
+                    xyz_l.append(xyz_hit)
+                    hkl_l.append(hkl_b[idx_h])
+                    lam_l.append(lam_b[idx_h])
+                    bank_l.append(np.full(len(idx_h), int(bid), dtype=int))
+                    pr_l.append(pr_hit)
+                    pc_l.append(pc_hit)
+                    inten_l.append(peak_val)
+
+                if xyz_l:
+                    peaks_xyz = np.concatenate(xyz_l, axis=0)
+                    hkl = np.concatenate(hkl_l, axis=0)
+                    lam = np.concatenate(lam_l, axis=0)
+                    bank = np.concatenate(bank_l, axis=0)
+                    pixel_r = np.concatenate(pr_l, axis=0)
+                    pixel_c = np.concatenate(pc_l, axis=0)
+                    intensity = np.concatenate(inten_l, axis=0)
+                    sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
+            except Exception:
+                pass
+
+        if peaks_xyz is None:
+            peaks_xyz = np.zeros((0, 3), dtype=float)
+
+        n_peaks = len(peaks_xyz)
+        if bank is None:
+            bank = np.ones(n_peaks, dtype=int)
+        if pixel_r is None:
+            pixel_r = np.zeros(n_peaks, dtype=float)
+        if pixel_c is None:
+            pixel_c = np.zeros(n_peaks, dtype=float)
+        if intensity is None:
+            intensity = np.ones(n_peaks, dtype=float) * 100.0
+        if sigma is None:
+            sigma = np.ones(n_peaks, dtype=float) * 3.0
+        if run_index is None:
+            run_index = np.zeros(n_peaks, dtype=int)
 
         return {
             "instrument": instrument,
@@ -519,6 +758,8 @@ def _extract_from_h5(h5_path: str | os.PathLike) -> dict[str, Any]:
             "hkl": hkl,
             "wavelength": lam,
             "R_gonio": R_gonio,
+            "solve_diagnostics": solve_diagnostics,
+            "frame_slice": frame_slice,
         }
 
 
@@ -527,6 +768,7 @@ def _build_lattice_ladder_steps(
     peaks_list: list[dict[str, Any]],
     cell: list[float] | None,
     space_group: str,
+    solve_diagnostics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Construct the interactive Lattice Ladder progression (Rung 1 -> Goal)."""
     n_total = max(len(peaks_list), 1)
@@ -541,12 +783,38 @@ def _build_lattice_ladder_steps(
         else 0.0
     )
 
+    stages_map: dict[str, dict[str, Any]] = {}
+    if solve_diagnostics and isinstance(solve_diagnostics.get("stages"), list):
+        for st in solve_diagnostics["stages"]:
+            if isinstance(st, dict) and "stage" in st:
+                stages_map[str(st["stage"])] = st
+
     all_ids = [p["id"] for p in peaks_list]
+    if solve_diagnostics and solve_diagnostics.get("stable_observations"):
+        n_obs = int(solve_diagnostics.get("stable_observations", 0))
+        n_samp = int(solve_diagnostics.get("samples_requested", 16384))
+        w_desc = solve_diagnostics.get(
+            "weighting", "smooth chi2-suppressed bin Poisson deviance"
+        )
+        s1_stage = "1. Binned Count Excess"
+        s1_sub = f"Finder-less Poisson deviance ({n_obs:,} bins → {n_samp:,} sampled)"
+        s1_desc = (
+            f"Threshold-free count extraction ({w_desc}): {n_obs:,} stable-run count bins "
+            f"({n_samp:,} quadrature samples) enter lattice_ladder directly with no spot finder."
+        )
+    else:
+        s1_stage = "1. Raw Detector Counts"
+        s1_sub = "Neutron counts & peak centroids on panels"
+        s1_desc = (
+            f"Inspect the raw detector banks: {len(all_ids)} diffraction "
+            "spots sit directly on the panels with no predicted overlay."
+        )
+
     steps: list[dict[str, Any]] = [
         {
             "rung": 1,
-            "stage": "1. Raw Detector Counts",
-            "subtitle": "Neutron counts & peak centroids on panels",
+            "stage": s1_stage,
+            "subtitle": s1_sub,
             "active_zones": [],
             "highlighted_peaks": [],
             "n_captured": len(all_ids),
@@ -554,10 +822,7 @@ def _build_lattice_ladder_steps(
             "fraction_indexed": round(len(indexed_peaks) / n_total, 4),
             "rms_deg": round(overall_rms, 3),
             "zone_tol_deg": 1.0,
-            "description": (
-                f"Inspect the raw detector banks: {len(all_ids)} diffraction "
-                "spots sit directly on the panels with no predicted overlay."
-            ),
+            "description": s1_desc,
         }
     ]
 
@@ -565,11 +830,19 @@ def _build_lattice_ladder_steps(
     z0_peaks = zones[0]["member_peak_ids"] if len(zones) >= 1 else []
     z0_label = zones[0]["label"] if len(zones) >= 1 else "[1 0 0]"
     z0_rms = zones[0]["angular_rms_deg"] if len(zones) >= 1 else overall_rms
+    if solve_diagnostics and solve_diagnostics.get("n_candidates"):
+        n_cands = int(solve_diagnostics.get("n_candidates", 4))
+        full_sc = float(solve_diagnostics.get("top_full_score", 0.0))
+        s2_stage = f"2. 13→145 Zone Ladder ({z0_label})"
+        s2_sub = f"Blind Lattice-Ladder ({n_cands} candidates • score {full_sc:.3f})"
+    else:
+        s2_stage = f"2. Primary Zone {z0_label}"
+        s2_sub = f"Coarse zone lock ({len(z0_peaks)} spots in family)"
     steps.append(
         {
             "rung": 2,
-            "stage": f"2. Primary Zone {z0_label}",
-            "subtitle": f"Coarse zone lock ({len(z0_peaks)} spots in family)",
+            "stage": s2_stage,
+            "subtitle": s2_sub,
             "active_zones": z0_ids,
             "highlighted_peaks": z0_peaks,
             "n_captured": len(z0_peaks),
@@ -579,7 +852,7 @@ def _build_lattice_ladder_steps(
             "zone_tol_deg": 1.0,
             "description": (
                 f"Primary crystal zone axis {z0_label} captures {len(z0_peaks)} "
-                "coplanar scattering vectors (G · t_uvw = 0)."
+                "coplanar scattering vectors (G · t_uvw = 0) during lattice_ladder (13→30→60→145 zones)."
             ),
         }
     )
@@ -596,11 +869,18 @@ def _build_lattice_ladder_steps(
             np.rad2deg(np.arccos(np.clip(np.dot(a0, a1), -1.0, 1.0)))
         )
     z1_label = zones[1]["label"] if len(zones) >= 2 else "[0 1 0]"
+    if "global" in stages_map:
+        st_g = stages_map["global"]
+        s3_stage = f"3. 60-Zone Global ({z0_label}×{z1_label})"
+        s3_sub = f"Stage 0 global geometry • score={-float(st_g.get('objective', 0.0)):.3f} ({int(st_g.get('iterations', 0))} iters)"
+    else:
+        s3_stage = f"3. Zone Lock {z0_label} × {z1_label}"
+        s3_sub = f"Inter-zone angle ψ = {psi_deg:.1f}° locks 3D orientation"
     steps.append(
         {
             "rung": 3,
-            "stage": f"3. Zone Lock {z0_label} × {z1_label}",
-            "subtitle": f"Inter-zone angle ψ = {psi_deg:.1f}° locks 3D orientation",
+            "stage": s3_stage,
+            "subtitle": s3_sub,
             "active_zones": z12_ids,
             "highlighted_peaks": z12_peaks,
             "n_captured": len(z12_peaks),
@@ -616,7 +896,7 @@ def _build_lattice_ladder_steps(
             "psi_deg": round(psi_deg, 2),
             "description": (
                 f"Two intersecting zone families ({z0_label} and {z1_label}, ψ = {psi_deg:.1f}°) "
-                "pin down the 3D crystal orientation on the detector."
+                "lock 3D crystal orientation and global detector geometry."
             ),
         }
     )
@@ -629,11 +909,18 @@ def _build_lattice_ladder_steps(
             for pid in z["member_peak_ids"]
         }
     )
+    if "cell" in stages_map or "120-zones" in stages_map:
+        st_c = stages_map.get("cell", stages_map.get("120-zones", {}))
+        s4_stage = "4. 120→400 Zone + Cell"
+        s4_sub = f"Staged band + cell/per-run • score={-float(st_c.get('objective', 0.0)):.3f} ({int(st_c.get('iterations', 0))} iters)"
+    else:
+        s4_stage = "4. Multi-Zone Refinement"
+        s4_sub = f"{len(z_const_ids)} major zones capture {len(z_const_peaks)} spots"
     steps.append(
         {
             "rung": 4,
-            "stage": "4. Multi-Zone Refinement",
-            "subtitle": f"{len(z_const_ids)} major zones capture {len(z_const_peaks)} spots",
+            "stage": s4_stage,
+            "subtitle": s4_sub,
             "active_zones": z_const_ids,
             "highlighted_peaks": z_const_peaks,
             "n_captured": len(z_const_peaks),
@@ -654,8 +941,8 @@ def _build_lattice_ladder_steps(
             ),
             "zone_tol_deg": 0.3,
             "description": (
-                f"Zoom-and-prune ladder adds secondary zone families ({len(z_const_ids)} active), "
-                "tightening angular tolerance to 0.3°."
+                f"Staged 120→400 zone-band refinement adds higher-order zones ({len(z_const_ids)} shown), "
+                "co-refining axial stretch, per-run ω drift, and unit-cell ratios."
             ),
         }
     )
@@ -666,10 +953,15 @@ def _build_lattice_ladder_steps(
         if cell and len(cell) == 6
         else "Refined UB Matrix"
     )
+    s5_stage = (
+        "5. Converged Solve UB"
+        if solve_diagnostics
+        else "5. Indexed UB Solution"
+    )
     steps.append(
         {
             "rung": 5,
-            "stage": "5. Indexed UB Solution",
+            "stage": s5_stage,
             "subtitle": f"{space_group} • {cell_str}",
             "active_zones": all_zone_ids,
             "highlighted_peaks": [p["id"] for p in indexed_peaks] or all_ids,
@@ -696,6 +988,7 @@ def _build_ndip_pipeline_stages(
     instrument: str = "CG4D",
     space_group: str = "P 1",
     cell: list[float] | None = None,
+    solve_diagnostics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the 4-stage coarse NDIP/Galaxy workflow pipeline descriptors."""
     n_peaks = len(peaks_list)
@@ -706,36 +999,44 @@ def _build_ndip_pipeline_stages(
         if cell and len(cell) >= 3
         else space_group
     )
+    is_finderless = bool(
+        solve_diagnostics and solve_diagnostics.get("stable_observations")
+    )
     return [
         {
             "stage_id": "reduce",
             "step_num": 1,
-            "name": "1. REDUCE & FIND",
-            "tool_ids": [
-                "imaginex_subhkl_prepare_peaks",
-                "imaginex_subhkl_peak_fit",
-            ],
+            "name": "1. REDUCE & MERGE" if is_finderless else "1. REDUCE & FIND",
+            "tool_ids": (
+                ["imaginex_subhkl_prepare_peaks"]
+                if is_finderless
+                else ["imaginex_subhkl_prepare_peaks", "imaginex_subhkl_peak_fit"]
+            ),
             "container": "ghcr.io/neutrons/subhkl:1.4.0",
-            "artifact": f"scan_master.h5 → finder.h5 ({n_peaks} peaks)",
+            "artifact": (
+                f"merged.h5 ({solve_diagnostics['stable_observations']:,} count bins)"
+                if is_finderless and solve_diagnostics
+                else f"scan_master.h5 → finder.h5 ({n_peaks} peaks)"
+            ),
             "status": "completed",
             "ladder_rung_idx": 0,
             "summary": (
-                f"NDIP Reduce & Peak Finding ({instrument}): "
-                f"reduced detector banks into scan_master.h5 and extracted {n_peaks} candidate peaks."
+                f"NDIP Image Reduction & Merge ({instrument}): "
+                "reduced raw NeXus event data into merged.h5 detector bank stacks."
             ),
         },
         {
             "stage_id": "solve",
             "step_num": 2,
-            "name": "2. SOLVE (UB & ZONES)",
-            "tool_ids": ["imaginex_subhkl"],
+            "name": "2. SOLVE (LATTICE LADDER)",
+            "tool_ids": ["imaginex_subhkl_solve", "imaginex_subhkl"],
             "container": "ghcr.io/neutrons/subhkl:1.4.0",
-            "artifact": f"indexer.h5 ({n_indexed}/{n_peaks} indexed • {n_zones_ord1} ord-1 zones)",
+            "artifact": f"solve.h5 ({n_indexed}/{n_peaks} spots • {n_zones_ord1} ord-1 zones)",
             "status": "active",
             "ladder_rung_idx": 4,
             "summary": (
-                f"NDIP Peak Indexing (imaginex_subhkl): steps 1–5 below lock the 3D UB orientation "
-                f"({space_group}, {cell_tag}) with {n_indexed}/{n_peaks} spots indexed."
+                f"NDIP Finder-Less Solve (imaginex_subhkl_solve): steps 1–5 below run "
+                f"lattice_ladder + staged zone-band refinement ({space_group}, {cell_tag})."
             ),
         },
         {
@@ -747,26 +1048,26 @@ def _build_ndip_pipeline_stages(
                 "imaginex_subhkl_integrate",
             ],
             "container": "ghcr.io/neutrons/subhkl:1.4.0",
-            "artifact": "peak_predictor.h5 → integrator.h5",
+            "artifact": "predictor.h5 → integrated.h5",
             "status": "ready",
             "ladder_rung_idx": 4,
             "summary": (
-                "NDIP Peak Prediction & Integration: forward-projects all reflections across the "
-                "wavelength band onto detector panels and integrates shoeboxes/profiles."
+                "NDIP Peak Prediction & Matrix-Free Integration: forward-projects reflections using "
+                "solve.h5 calibrated geometry and integrates 3D Gaussian profiles on raw images."
             ),
         },
         {
             "stage_id": "merge",
             "step_num": 4,
             "name": "4. MERGE & MTZ",
-            "tool_ids": ["imaginex_merge", "imaginex_analysis"],
-            "container": "savannah.ornl.gov/imagine-x/coverage/main:latest",
-            "artifact": "out.mtz + completeness report",
+            "tool_ids": ["imaginex_subhkl_mtz", "imaginex_merge", "imaginex_analysis"],
+            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "artifact": "reflections.mtz + completeness report",
             "status": "ready",
             "ladder_rung_idx": 4,
             "summary": (
-                "NDIP Multi-Orientation Merge: merges integrated reflections across goniometer φ "
-                "settings into a structure-factor MTZ dataset."
+                "NDIP Multi-Orientation Merge & MTZ Export: merges integrated reflections across "
+                "goniometer settings into a structure-factor MTZ dataset."
             ),
         },
     ]
@@ -809,6 +1110,8 @@ def build_rainbow_zone_payload(
     sigma_arr = None
     hkl_arr = None
     lam_arr = None
+    solve_diagnostics = None
+    frame_slice = None
 
     if replay_h5 is not None:
         extracted = _extract_from_h5(replay_h5)
@@ -831,6 +1134,8 @@ def build_rainbow_zone_payload(
         sigma_arr = extracted["sigma"]
         hkl_arr = extracted["hkl"]
         lam_arr = extracted["wavelength"]
+        solve_diagnostics = extracted.get("solve_diagnostics")
+        frame_slice = extracted.get("frame_slice")
         if R_gonio is None:
             R_gonio = extracted["R_gonio"]
         if images_h5 is None:
@@ -1247,6 +1552,7 @@ def build_rainbow_zone_payload(
         sigma_arr=sigma_arr,
         images_h5=images_h5,
         render_binning=render_binning,
+        frame_slice=frame_slice,
     )
 
     ladder_steps = _build_lattice_ladder_steps(
@@ -1254,6 +1560,7 @@ def build_rainbow_zone_payload(
         peaks_list,
         cell=cell,
         space_group=space_group,
+        solve_diagnostics=solve_diagnostics,
     )
 
     pipeline_stages = _build_ndip_pipeline_stages(
@@ -1262,6 +1569,7 @@ def build_rainbow_zone_payload(
         instrument=str(instrument),
         space_group=str(space_group),
         cell=cell,
+        solve_diagnostics=solve_diagnostics,
     )
 
     resolved_proj = (
