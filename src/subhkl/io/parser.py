@@ -3,6 +3,9 @@ import os
 import sys
 from typing import Annotated
 
+if "rainbow-visualize" in sys.argv:
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import h5py
 import typer
 
@@ -1640,11 +1643,11 @@ def indexer_visualize(
 @app.command("rainbow-visualize")
 def rainbow_visualize(
     peaks_filename: Annotated[
-        str,
+        str | None,
         typer.Argument(
-            help="Indexer, spherical-index, solve, or finder output HDF5"
+            help="Indexer, spherical-index, solve, finder, or merged images HDF5 (optional in --serve mode)"
         ),
-    ],
+    ] = None,
     output_html: Annotated[
         str,
         typer.Option(
@@ -1690,6 +1693,7 @@ def rainbow_visualize(
         float,
         typer.Option(
             "--zone-tolerance-deg",
+            "--tolerance-deg",
             min=0.05,
             help="Angular half-width [deg] for assigning reflections to a Laue zone",
         ),
@@ -1714,11 +1718,23 @@ def rainbow_visualize(
     from subhkl.viz.rainbow_zones import export_rainbow_widget
 
     extra = {"instrument": instrument} if instrument else {}
+    replay_target = peaks_filename or images
+    if output_html and replay_target:
+        export_rainbow_widget(
+            replay_target,
+            output_html=output_html,
+            images_h5=images,
+            projection=projection,
+            default_mode=mode,
+            max_zone_index=max_zone_index,
+            zone_tolerance_deg=zone_tolerance_deg,
+            **extra,
+        )
     if serve:
         from subhkl.viz.nova_rainbow_view import serve_rainbow_zones
 
         serve_rainbow_zones(
-            replay_h5=peaks_filename,
+            replay_h5=replay_target,
             images_h5=images,
             projection=projection,
             host=host,
@@ -1731,7 +1747,7 @@ def rainbow_visualize(
         return None
 
     out = export_rainbow_widget(
-        peaks_filename,
+        replay_target,
         output_html,
         images_h5=images,
         projection=projection,

@@ -369,7 +369,10 @@ def _encode_panel_textures(
     return panels_payload, intensity_source
 
 
-def _extract_from_h5(h5_path: str | os.PathLike) -> dict[str, Any]:
+def _extract_from_h5(
+    h5_path: str | os.PathLike,
+    images_h5: str | os.PathLike | None = None,
+) -> dict[str, Any]:
     """Extract peaks, detectors, UB, wavelength range, and metadata from a subhkl HDF5 file."""
     with h5py.File(h5_path, "r") as f:
         instrument = _decode_str(f.attrs.get("instrument"), "IMAGINE")
@@ -611,7 +614,11 @@ def _extract_from_h5(h5_path: str | os.PathLike) -> dict[str, Any]:
                 kf /= np.linalg.norm(kf, axis=1, keepdims=True)
 
                 bank_imgs: dict[int, np.ndarray] = {}
-                src_h5 = _discover_images_h5(h5_path)
+                src_h5 = (
+                    str(images_h5)
+                    if images_h5 is not None and os.path.exists(images_h5)
+                    else _discover_images_h5(h5_path)
+                )
                 if src_h5 and os.path.exists(src_h5):
                     try:
                         with h5py.File(src_h5, "r") as mf:
@@ -1114,7 +1121,7 @@ def build_rainbow_zone_payload(
     frame_slice = None
 
     if replay_h5 is not None:
-        extracted = _extract_from_h5(replay_h5)
+        extracted = _extract_from_h5(replay_h5, images_h5=images_h5)
         instrument = extracted["instrument"] or instrument
         ki = extracted["ki"]
         wavelength_range = extracted["wavelength_range"]
@@ -2262,8 +2269,14 @@ def render_rainbow_html(
         ⚙️ NDIP WORKFLOW PIPELINE: Coarse Reduce → Solve → Predict &amp; Integrate → Merge sequence (backed by ghcr.io/neutrons/subhkl)
       </div>
       <div style="display:flex;align-items:center;gap:6px;">
+        <span id="galaxy-status-badge" style="font-size:0.65rem;font-family:var(--font-display);padding:2px 8px;border-radius:999px;border:1px solid #334155;color:var(--text-dim);">
+          ⚪ STANDALONE / LOCAL
+        </span>
+        <button id="btn-galaxy-dispatch" style="border-color:var(--accent-gold);color:var(--accent-gold);" title="Dispatch the selected NDIP workflow stage (e.g. Solve) to Galaxy / GPU Pulsar runner">
+          ⚡ DISPATCH STAGE TO GALAXY (PULSAR GPU)
+        </button>
         <button id="btn-pipeline-run" class="active-btn" title="Walk through the 4 NDIP workflow stages and light up Steps 1–5 during Solve">
-          ▶ RUN NDIP PIPELINE
+          ▶ WALK NDIP PIPELINE
         </button>
       </div>
     </div>
@@ -3233,9 +3246,232 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }} else {{
           clearInterval(state.ladderTimer);
           state.ladderTimer = null;
-          ev.currentTarget.textContent = "▶ RUN NDIP PIPELINE";
+          ev.currentTarget.textContent = "▶ WALK NDIP PIPELINE";
         }}
       }}, 1600);
+    }});
+  }}
+
+  // Live Galaxy / NOVA / Pulsar GPU job orchestration
+  const galaxyBridge = {{
+    mode: "none", // "nova" | "galaxy_iframe" | "none"
+    historyId: null,
+    datasets: [],
+    pollTimer: null,
+  }};
+
+  const elGalaxyBadge = document.getElementById("galaxy-status-badge");
+  const btnGalaxyDispatch = document.getElementById("btn-galaxy-dispatch");
+
+  async function probeGalaxyConnection() {{
+    // 1. Check NOVA server endpoint (api/pipeline/status)
+    try {{
+      const r = await fetch("api/pipeline/status", {{ cache: "no-store" }});
+      if (r.ok) {{
+        const doc = await r.json();
+        if (doc && typeof doc.galaxy_connected === "boolean") {{
+          galaxyBridge.mode = "nova";
+          galaxyBridge.historyId = doc.history_id;
+          galaxyBridge.datasets = doc.history_datasets || [];
+          if (elGalaxyBadge) {{
+            elGalaxyBadge.textContent = doc.galaxy_connected
+              ? `🟢 NOVA → GALAXY CONNECTED (${{galaxyBridge.datasets.length}} H5s)`
+              : "🟡 NOVA SERVER (LOCAL PREVIEW)";
+            elGalaxyBadge.style.borderColor = doc.galaxy_connected ? "#34d399" : "#fbbf24";
+            elGalaxyBadge.style.color = doc.galaxy_connected ? "#34d399" : "#fbbf24";
+          }}
+          return;
+        }}
+      }}
+    }} catch (_e) {{}}
+
+    // 2. Check same-origin Galaxy REST API (when viewed inside Galaxy center iframe)
+    try {{
+      const r = await fetch("/api/histories?limit=1", {{ credentials: "same-origin" }});
+      if (r.ok) {{
+        const hists = await r.json();
+        if (Array.isArray(hists) && hists.length > 0 && hists[0].id) {{
+          galaxyBridge.mode = "galaxy_iframe";
+          galaxyBridge.historyId = hists[0].id;
+          const cr = await fetch(
+            `/api/histories/${{galaxyBridge.historyId}}/contents?v=dev&q=deleted&qv=false`,
+            {{ credentials: "same-origin" }}
+          );
+          if (cr.ok) {{
+            const items = await cr.json();
+            if (Array.isArray(items)) {{
+              galaxyBridge.datasets = items.filter(
+                it => it.history_content_type === "dataset" && !it.deleted
+              );
+            }}
+          }}
+          if (elGalaxyBadge) {{
+            elGalaxyBadge.textContent = `🟢 GALAXY CONNECTED (${{hists[0].name || "History"}} • ${{galaxyBridge.datasets.length}} datasets)`;
+            elGalaxyBadge.style.borderColor = "#34d399";
+            elGalaxyBadge.style.color = "#34d399";
+          }}
+        }}
+      }}
+    }} catch (_e) {{}}
+  }}
+  probeGalaxyConnection();
+
+  if (btnGalaxyDispatch) {{
+    btnGalaxyDispatch.addEventListener("click", async () => {{
+      const st = PIPELINE[state.currentPipelineIdx] || PIPELINE[1] || {{ stage_id: "solve", name: "2. SOLVE" }};
+      const stageId = st.stage_id || "solve";
+      const pipeDesc = document.getElementById("pipeline-desc");
+
+      if (galaxyBridge.mode === "nova") {{
+        btnGalaxyDispatch.textContent = "⏳ SUBMITTING TO GALAXY / PULSAR...";
+        try {{
+          const resp = await fetch("api/pipeline/run", {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{ stage_id: stageId }}),
+          }});
+          const res = await resp.json();
+          if (!resp.ok || res.status === "error") {{
+            throw new Error(res.error || "Failed to dispatch job");
+          }}
+          const jobId = res.job && res.job.job_id;
+          if (pipeDesc) {{
+            pipeDesc.textContent = `🚀 DISPATCHED ${{st.name}} TO GALAXY / PULSAR (Job ${{jobId || "sim"}})`;
+          }}
+          if (stageId === "solve") selectLadderRung(0, false);
+          if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
+          galaxyBridge.pollTimer = setInterval(async () => {{
+            try {{
+              const sr = await fetch("api/pipeline/status", {{ cache: "no-store" }});
+              if (!sr.ok) return;
+              const sdoc = await sr.json();
+              const aj = sdoc.active_job;
+              if (!aj) return;
+              if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
+                selectLadderRung(aj.ladder_rung_idx, false);
+              }}
+              btnGalaxyDispatch.textContent = `⏳ PULSAR GPU [${{aj.state.toUpperCase()}}]: ${{aj.tool_id}}`;
+              if (aj.state === "ok" || aj.state === "error") {{
+                clearInterval(galaxyBridge.pollTimer);
+                galaxyBridge.pollTimer = null;
+                btnGalaxyDispatch.textContent = aj.state === "ok"
+                  ? "✅ PULSAR JOB COMPLETE (RELOADED)"
+                  : "❌ PULSAR JOB ERROR";
+                if (aj.state === "ok" && aj.updated_payload_ready) {{
+                  window.location.reload();
+                }}
+              }}
+            }} catch (_pe) {{}}
+          }}, 1800);
+        }} catch (err) {{
+          btnGalaxyDispatch.textContent = `⚠️ ${{err.message}}`;
+        }}
+        return;
+      }}
+
+      if (galaxyBridge.mode === "galaxy_iframe" && galaxyBridge.historyId) {{
+        btnGalaxyDispatch.textContent = "⏳ SUBMITTING TO GALAXY / PULSAR...";
+        try {{
+          await probeGalaxyConnection();
+          const h5s = galaxyBridge.datasets.filter(
+            d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
+          );
+          const mergedDs = [...h5s].reverse().find(
+            d => /merged|image|scan|prepare/i.test(d.name || "")
+          ) || h5s[h5s.length - 1];
+          const solveDs = [...h5s].reverse().find(
+            d => /solve|index/i.test(d.name || "")
+          ) || h5s[0];
+
+          let toolId = "imaginex_subhkl_solve";
+          let inputs = {{}};
+          const cell = DATA.cell || [68.7, 69.8, 156.9, 90.0, 90.0, 90.0];
+          const wl = DATA.wavelength_range || [1.8, 4.5];
+
+          if (stageId === "solve") {{
+            if (!mergedDs) throw new Error("Upload merged.h5 to History first");
+            toolId = "imaginex_subhkl_solve";
+            inputs = {{
+              input_h5: {{ src: "hda", id: mergedDs.id }},
+              instrument: DATA.instrument || "CG4D",
+              space_group: DATA.space_group || "P 21 21 21",
+              a: cell[0], b: cell[1], c: cell[2],
+              alpha: cell[3], beta: cell[4], gamma: cell[5],
+              wavelength_min: wl[0], wavelength_max: wl[1],
+              objective: "band",
+              d_min: 2.5,
+              n_zones: 400,
+              steps: 250,
+            }};
+          }} else if (stageId === "integrate") {{
+            if (!mergedDs || !solveDs) throw new Error("Need merged.h5 and solve.h5 in History");
+            toolId = "imaginex_subhkl_predict";
+            inputs = {{
+              input: {{ src: "hda", id: mergedDs.id }},
+              indexed_peaks: {{ src: "hda", id: solveDs.id }},
+              instrument: DATA.instrument || "CG4D",
+              d_min: 1.8,
+              wavelength_min: wl[0],
+              wavelength_max: wl[1],
+            }};
+          }} else {{
+            if (!mergedDs) throw new Error("No HDF5 dataset in History");
+            toolId = (st.tool_ids && st.tool_ids[0]) || "imaginex_subhkl_solve";
+            inputs = {{ input_h5: {{ src: "hda", id: mergedDs.id }} }};
+          }}
+
+          const tr = await fetch("/api/tools", {{
+            method: "POST",
+            credentials: "same-origin",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify({{
+              history_id: galaxyBridge.historyId,
+              tool_id: toolId,
+              inputs: inputs,
+            }}),
+          }});
+          const tres = await tr.json();
+          if (!tr.ok) {{
+            throw new Error((tres && tres.err_msg) || "Galaxy /api/tools error");
+          }}
+          const jobId = tres.jobs && tres.jobs[0] && tres.jobs[0].id;
+          if (pipeDesc) {{
+            pipeDesc.textContent = `🚀 DISPATCHED ${{toolId}} TO GALAXY / PULSAR (Job ${{jobId}})`;
+          }}
+          if (stageId === "solve") selectLadderRung(0, false);
+          let rungStep = 0;
+          if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
+          galaxyBridge.pollTimer = setInterval(async () => {{
+            try {{
+              const jr = await fetch(`/api/jobs/${{jobId}}`, {{ credentials: "same-origin" }});
+              if (!jr.ok) return;
+              const jdoc = await jr.json();
+              const jstate = jdoc.state || "running";
+              btnGalaxyDispatch.textContent = `⏳ PULSAR GPU [${{jstate.toUpperCase()}}]: ${{toolId}}`;
+              if (stageId === "solve" && (jstate === "queued" || jstate === "running")) {{
+                rungStep = Math.min(3, rungStep + 1);
+                selectLadderRung(rungStep, false);
+              }}
+              if (jstate === "ok" || jstate === "error") {{
+                clearInterval(galaxyBridge.pollTimer);
+                galaxyBridge.pollTimer = null;
+                if (jstate === "ok") {{
+                  selectLadderRung(4, false);
+                  btnGalaxyDispatch.textContent = "✅ PULSAR JOB COMPLETE (CHECK HISTORY)";
+                }} else {{
+                  btnGalaxyDispatch.textContent = "❌ PULSAR JOB ERROR";
+                }}
+              }}
+            }} catch (_je) {{}}
+          }}, 1800);
+        }} catch (err) {{
+          btnGalaxyDispatch.textContent = `⚠️ ${{err.message}}`;
+        }}
+        return;
+      }}
+
+      // Fallback when opened as a standalone local HTML file outside Galaxy: walk the pipeline
+      if (btnPipeRun) btnPipeRun.click();
     }});
   }}
 
