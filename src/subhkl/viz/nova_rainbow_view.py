@@ -201,131 +201,56 @@ class NovaGalaxyPipelineRunner:
         helper = self.connect()
         return helper.get_data_store(history_name, create=True)
 
+    def _has_tool_on_galaxy(self, tool_id: str) -> bool:
+        try:
+            doc = self._api_request("GET", f"/api/tools/{tool_id}")
+            return isinstance(doc, dict) and doc.get("id") == tool_id
+        except Exception:
+            return False
+
     def submit_galaxy_stage(
         self,
         stage_id: str,
         params: dict[str, Any] | None = None,
         on_complete_h5: Any = None,
     ) -> dict[str, Any]:
-        """Submit a coarse NDIP workflow stage to Galaxy REST API (dispatched to Pulsar GPU)."""
+        """Submit a coarse NDIP workflow stage via nova-galaxy -> Galaxy -> Pulsar GPU container."""
         if stage_id not in self.STAGE_TOOLS:
             raise ValueError(f"Unknown pipeline stage: {stage_id}")
         params = dict(params or {})
-        tool_ids = self.STAGE_TOOLS[stage_id]
         if not self.is_connected:
-            return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
+            return self._submit_local_subhkl_stage(
+                stage_id,
+                params,
+                on_complete_h5,
+                fallback_reason="GALAXY_URL / GALAXY_API_KEY not set",
+            )
 
-        datasets = self.list_history_datasets()
-        h5_ok = [
-            d
-            for d in datasets
-            if d.get("state") == "ok" and d.get("extension") in ("h5", "hdf5", "nxs.h5")
-        ]
-
-        # Match appropriate input datasets from the active Galaxy history
-        merged_ds = next(
-            (
-                d
-                for d in reversed(h5_ok)
-                if any(k in (d.get("name") or "").lower() for k in ("merged", "image", "scan", "prepare"))
-            ),
-            h5_ok[-1] if h5_ok else None,
-        )
-        solve_ds = next(
-            (
-                d
-                for d in reversed(h5_ok)
-                if any(k in (d.get("name") or "").lower() for k in ("solve", "index"))
-            ),
-            h5_ok[0] if h5_ok else None,
-        )
-
-        primary_tool = tool_ids[0]
-        tool_inputs: dict[str, Any] = {}
-
-        if stage_id == "solve":
-            primary_tool = "imaginex_subhkl_solve"
-            input_id = params.get("input_h5_id") or (merged_ds["id"] if merged_ds else None)
-            if not input_id:
-                return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
-            cell = params.get("cell") or [68.7, 69.8, 156.9, 90.0, 90.0, 90.0]
-            wl = params.get("wavelength_range") or [1.8, 4.5]
-            tool_inputs = {
-                "input_h5": {"src": "hda", "id": input_id},
-                "instrument": params.get("instrument", "CG4D"),
-                "space_group": params.get("space_group", "P 21 21 21"),
-                "a": float(cell[0]),
-                "b": float(cell[1]),
-                "c": float(cell[2]),
-                "alpha": float(cell[3]),
-                "beta": float(cell[4]),
-                "gamma": float(cell[5]),
-                "wavelength_min": float(wl[0]),
-                "wavelength_max": float(wl[1]),
-                "objective": params.get("objective", "band"),
-                "d_min": float(params.get("d_min", 2.5)),
-                "n_zones": int(params.get("n_zones", 400)),
-                "steps": int(params.get("steps", 250)),
-            }
-        elif stage_id == "integrate":
-            primary_tool = "imaginex_subhkl_predict"
-            img_id = params.get("images_h5_id") or (merged_ds["id"] if merged_ds else None)
-            idx_id = params.get("indexed_h5_id") or (solve_ds["id"] if solve_ds else img_id)
-            if not img_id or not idx_id:
-                return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
-            wl = params.get("wavelength_range") or [1.8, 4.5]
-            tool_inputs = {
-                "input": {"src": "hda", "id": img_id},
-                "indexed_peaks": {"src": "hda", "id": idx_id},
-                "instrument": params.get("instrument", "CG4D"),
-                "d_min": float(params.get("d_min", 1.8)),
-                "wavelength_min": float(wl[0]),
-                "wavelength_max": float(wl[1]),
-            }
-        else:
-            input_id = params.get("input_h5_id") or (merged_ds["id"] if merged_ds else None)
-            if not input_id:
-                return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
-            tool_inputs["input"] = {"src": "hda", "id": input_id}
-
-        submit_body = {
-            "history_id": self.history_id,
-            "tool_id": primary_tool,
-            "inputs": tool_inputs,
-        }
-        try:
-            resp = self._api_request("POST", "/api/tools", payload=submit_body)
-        except Exception:
-            return self._submit_local_subhkl_stage(stage_id, params, on_complete_h5)
-        jobs = resp.get("jobs", []) if isinstance(resp, dict) else []
-        outputs = resp.get("outputs", []) if isinstance(resp, dict) else []
-        job_id = jobs[0].get("id") if jobs else None
-
-        job_record = {
-            "job_id": job_id,
-            "tool_id": primary_tool,
+        job_record: dict[str, Any] = {
+            "job_id": f"nova-{int(time.time())}",
+            "tool_id": self.STAGE_TOOLS[stage_id][0],
             "stage_id": stage_id,
+            "mode": "galaxy",
             "state": "queued",
-            "command_line": f"galaxy/pulsar :: {primary_tool}",
-            "stdout": f"[ndip/pulsar] Dispatched {primary_tool} (job {job_id}) to {self.galaxy_url}\n",
+            "command_line": f"nova-galaxy -> {self.galaxy_url}",
+            "stdout": (
+                f"[nova -> galaxy] Connecting to {self.galaxy_url} (datastore: 'IMAGINE-X SubHKL')...\n"
+                f"[pulsar] Target GPU worker queue on this node (IMAGINEX-1): imaginex1-test / imaginex1\n"
+                f"[pulsar] Staging dir on IMAGINEX-1: /data/staging_test/ (or /data/staging/)\n"
+            ),
             "stderr": "",
             "ladder_rung_idx": 0 if stage_id == "solve" else 4,
-            "outputs": [
-                {"id": o.get("id"), "name": o.get("name"), "extension": o.get("extension")}
-                for o in outputs
-                if isinstance(o, dict)
-            ],
+            "outputs": [],
             "updated_payload_ready": False,
             "started_at": time.time(),
         }
         self.active_job = job_record
 
-        if job_id:
-            threading.Thread(
-                target=self._poll_galaxy_job,
-                args=(job_record, on_complete_h5),
-                daemon=True,
-            ).start()
+        threading.Thread(
+            target=self._dispatch_nova_galaxy_thread,
+            args=(stage_id, params, job_record, on_complete_h5),
+            daemon=True,
+        ).start()
 
         return {
             "stage_id": stage_id,
@@ -336,104 +261,331 @@ class NovaGalaxyPipelineRunner:
             "status": "submitted",
         }
 
+    def _dispatch_nova_galaxy_thread(
+        self,
+        stage_id: str,
+        params: dict[str, Any],
+        job_record: dict[str, Any],
+        on_complete_h5: Any = None,
+    ) -> None:
+        """Background worker that links/uploads datasets via nova-galaxy, dispatches to Pulsar, and streams console_output."""
+        try:
+            from nova.galaxy import Dataset, Parameters, Tool
+
+            store = self.get_datastore("IMAGINE-X SubHKL")
+            self.history_id = store.history_id
+            job_record["stdout"] += (
+                f"[nova -> galaxy] Attached to Galaxy history_id={store.history_id} on {self.galaxy_url}\n"
+            )
+
+            raw_cell = params.get("cell") or [
+                params.get("a", 68.7),
+                params.get("b", 69.8),
+                params.get("c", 156.9),
+                params.get("alpha", 90.0),
+                params.get("beta", 90.0),
+                params.get("gamma", 90.0),
+            ]
+            wl = params.get("wavelength_range") or [
+                params.get("wavelength_min", 1.8),
+                params.get("wavelength_max", 4.5),
+            ]
+            inst = str(params.get("instrument", "CG4D"))
+            sg = str(params.get("space_group", "P 21 21 21"))
+            merged_path = params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
+            solve_path = params.get("peaks_file") or "/home/xvg/subhkl-examples/betalac-7/solve.h5"
+
+            tool_params = Parameters()
+            if stage_id == "solve":
+                if self._has_tool_on_galaxy("imaginex_subhkl_solve"):
+                    primary_tool = "imaginex_subhkl_solve"
+                    job_record["stdout"] += (
+                        f"[nova -> galaxy] Linking/uploading scan '{os.path.basename(merged_path)}' for {primary_tool}...\n"
+                    )
+                    tool_params.add_input("scan", Dataset(path=merged_path, force_upload=False))
+                    tool_params.add_input("instrument", inst)
+                    tool_params.add_input("spaceGroup", sg)
+                    tool_params.add_input("a", float(raw_cell[0]))
+                    tool_params.add_input("b", float(raw_cell[1]))
+                    tool_params.add_input("c", float(raw_cell[2]))
+                    tool_params.add_input("alpha", float(raw_cell[3]))
+                    tool_params.add_input("beta", float(raw_cell[4]))
+                    tool_params.add_input("gamma", float(raw_cell[5]))
+                    tool_params.add_input("wavelengthMin", float(wl[0]))
+                    tool_params.add_input("wavelengthMax", float(wl[1]))
+                    tool_params.add_input("refinement", str(params.get("objective", "band")))
+                    tool_params.add_input("dMin", float(params.get("d_min", 2.5)))
+                    tool_params.add_input("nZones", int(params.get("n_zones", 400)))
+                    tool_params.add_input("maxiter", int(params.get("steps", 120)))
+                else:
+                    # Before MR is merged to ndip-test, use deployed imaginex_subhkl_predict (or imaginex_subhkl)
+                    # so execution still routes through NOVA -> Galaxy -> RabbitMQ -> Pulsar -> GPU Docker container!
+                    primary_tool = "imaginex_subhkl_predict"
+                    job_record["stdout"] += (
+                        f"[nova -> galaxy] Note: 'imaginex_subhkl_solve' MR not yet deployed on {self.galaxy_url}; "
+                        f"dispatching deployed '{primary_tool}' to Pulsar GPU container (imaginex1-test)...\n"
+                        f"[nova -> galaxy] Linking/uploading '{os.path.basename(merged_path)}' and '{os.path.basename(solve_path)}'...\n"
+                    )
+                    tool_params.add_input("scan", Dataset(path=merged_path, force_upload=False))
+                    tool_params.add_input("indexer", Dataset(path=solve_path, force_upload=False))
+                    tool_params.add_input("instrument", inst)
+                    tool_params.add_input("dMin", float(params.get("d_min", 2.5)))
+                    tool_params.add_input("wavelengthMin", float(wl[0]))
+                    tool_params.add_input("wavelengthMax", float(wl[1]))
+                    tool_params.add_input("space", sg)
+            elif stage_id == "integrate":
+                primary_tool = "imaginex_subhkl_predict"
+                job_record["stdout"] += (
+                    f"[nova -> galaxy] Linking/uploading '{os.path.basename(merged_path)}' + '{os.path.basename(solve_path)}' for {primary_tool}...\n"
+                )
+                tool_params.add_input("scan", Dataset(path=merged_path, force_upload=False))
+                tool_params.add_input("indexer", Dataset(path=solve_path, force_upload=False))
+                tool_params.add_input("instrument", inst)
+                tool_params.add_input("dMin", float(params.get("d_min", 2.1)))
+                tool_params.add_input("wavelengthMin", float(wl[0]))
+                tool_params.add_input("wavelengthMax", float(wl[1]))
+                tool_params.add_input("space", sg)
+            elif stage_id == "reduce":
+                primary_tool = "imaginex_subhkl_prepare_peaks"
+                job_record["stdout"] += (
+                    f"[nova -> galaxy] Linking/uploading '{os.path.basename(solve_path)}' for {primary_tool}...\n"
+                )
+                tool_params.add_input("inputs_0|input", Dataset(path=solve_path, force_upload=False))
+                tool_params.add_input("instrument", inst)
+                tool_params.add_input("a", float(raw_cell[0]))
+                tool_params.add_input("b", float(raw_cell[1]))
+                tool_params.add_input("c", float(raw_cell[2]))
+                tool_params.add_input("alpha", float(raw_cell[3]))
+                tool_params.add_input("beta", float(raw_cell[4]))
+                tool_params.add_input("gamma", float(raw_cell[5]))
+                tool_params.add_input("spaceGroup", sg)
+            else:
+                primary_tool = "imaginex_subhkl_metrics"
+                job_record["stdout"] += (
+                    f"[nova -> galaxy] Linking/uploading '{os.path.basename(solve_path)}' for {primary_tool}...\n"
+                )
+                tool_params.add_input("peaks", Dataset(path=solve_path, force_upload=False))
+
+            job_record["tool_id"] = primary_tool
+            tool = Tool(primary_tool)
+            tool.run(store, tool_params, wait=False)
+
+            # Wait briefly for nova.galaxy's submit() thread to populate tool._job.id
+            for _ in range(180):
+                if tool._job and tool._job.id:
+                    break
+                if tool._job and str(tool._job.status.state).endswith("ERROR"):
+                    raise RuntimeError(str(tool._job.status.details))
+                time.sleep(0.5)
+
+            if not tool._job or not tool._job.id:
+                raise RuntimeError(f"Timed out waiting for Galaxy job submission of {primary_tool}")
+
+            job_id = tool._job.id
+            job_record["job_id"] = job_id
+            job_record["outputs"] = [
+                {
+                    "id": d.get("id"),
+                    "name": d.get("output_name") or d.get("name"),
+                    "extension": d.get("file_ext") or d.get("extension") or "h5",
+                }
+                for d in (tool._job.datasets or [])
+                if isinstance(d, dict)
+            ]
+            job_record["stdout"] += (
+                f"[galaxy -> pulsar] Dispatched {primary_tool} (Galaxy job_id={job_id}) -> Pulsar queue on IMAGINEX-1\n"
+            )
+            self._poll_galaxy_job(job_record, on_complete_h5, nova_job=tool._job)
+        except Exception as exc:
+            job_record["stdout"] += f"[nova -> galaxy] Dispatch error ({exc}); falling back to local GPU container...\n"
+            self._submit_local_subhkl_stage(
+                stage_id,
+                params,
+                on_complete_h5,
+                fallback_reason=str(exc),
+                existing_job_record=job_record,
+            )
+
     def _submit_local_subhkl_stage(
         self,
         stage_id: str,
         params: dict[str, Any],
         on_complete_h5: Any = None,
+        fallback_reason: str | None = None,
+        existing_job_record: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run subhkl stage in a background subprocess and stream live stdout/stderr to the GUI console."""
+        """Run subhkl stage inside the GPU Docker/Podman container on IMAGINEX-1 and stream live stdout/stderr."""
+        import shutil
+        import socket
         import subprocess
         import sys
 
-        cell = params.get("cell") or [68.7, 69.8, 156.9, 90.0, 90.0, 90.0]
-        wl = params.get("wavelength_range") or [1.8, 4.5]
+        raw_cell = params.get("cell") or [
+            params.get("a", 68.7),
+            params.get("b", 69.8),
+            params.get("c", 156.9),
+            params.get("alpha", 90.0),
+            params.get("beta", 90.0),
+            params.get("gamma", 90.0),
+        ]
+        cell_str = ",".join(str(float(x)) for x in raw_cell[:6])
+        wl = params.get("wavelength_range") or [
+            params.get("wavelength_min", 1.8),
+            params.get("wavelength_max", 4.5),
+        ]
         inst = params.get("instrument", "CG4D")
         sg = params.get("space_group", "P 21 21 21")
-        merged_path = params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
-        solve_path = params.get("peaks_file") or "/home/xvg/subhkl-examples/betalac-7/solve.h5"
+        merged_path = os.path.abspath(
+            params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
+        )
+        solve_path = os.path.abspath(
+            params.get("peaks_file") or "/home/xvg/subhkl-examples/betalac-7/solve.h5"
+        )
         out_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_{stage_id}_{int(time.time())}.h5")
 
-        if stage_id == "solve" and os.path.isfile(merged_path):
-            cmd = [
-                sys.executable,
+        if stage_id == "reduce" and os.path.isfile(merged_path):
+            inner_cmd = [
+                "python",
+                "-u",
+                "-m",
+                "subhkl.io.parser",
+                "sum-images",
+                out_h5,
+                merged_path,
+            ]
+        elif stage_id == "solve" and os.path.isfile(merged_path):
+            inner_cmd = [
+                "python",
                 "-u",
                 "-m",
                 "subhkl.io.parser",
                 "solve",
                 merged_path,
                 out_h5,
-                inst,
+                "--instrument",
+                str(inst),
+                "--cell",
+                cell_str,
                 "--space-group",
                 str(sg),
-                "-a",
-                str(cell[0]),
-                "-b",
-                str(cell[1]),
-                "-c",
-                str(cell[2]),
-                "--alpha",
-                str(cell[3]),
-                "--beta",
-                str(cell[4]),
-                "--gamma",
-                str(cell[5]),
                 "--wavelength-min",
                 str(wl[0]),
                 "--wavelength-max",
                 str(wl[1]),
                 "--d-min",
                 str(params.get("d_min", 2.8)),
-                "--n-zones",
-                str(params.get("n_zones", 120)),
-                "--steps",
-                str(params.get("steps", 80)),
+                "--refinement",
+                str(params.get("objective", "band")),
+                "--band-zones",
+                str(max(60, int(params.get("n_zones", 400)))),
+                "--band-maxiter",
+                str(max(10, int(params.get("steps", 120)))),
             ]
         elif stage_id == "integrate" and os.path.isfile(merged_path) and os.path.isfile(solve_path):
-            cmd = [
-                sys.executable,
+            inner_cmd = [
+                "python",
                 "-u",
                 "-m",
                 "subhkl.io.parser",
                 "peak-predictor",
                 merged_path,
-                out_h5,
-                inst,
-                "--indexed-peaks-h5-filename",
+                str(inst),
                 solve_path,
+                out_h5,
                 "--d-min",
                 str(params.get("d_min", 2.2)),
-                "--wavelength-min",
+                "--wavel-min",
                 str(wl[0]),
-                "--wavelength-max",
+                "--wavel-max",
                 str(wl[1]),
+                "--space-group",
+                str(sg),
             ]
         else:
-            cmd = [
-                sys.executable,
+            inner_cmd = [
+                "python",
                 "-u",
                 "-m",
                 "subhkl.io.parser",
-                "metrics",
+                "indexer-visualize",
                 solve_path,
+                "--instrument",
+                str(inst),
+                "--output-dir",
+                tempfile.gettempdir(),
+                "--dpi",
+                "72",
             ]
 
+        container_image = "ghcr.io/neutrons/subhkl:feat-rainbow-zones"
+        if shutil.which("podman"):
+            mount_dirs = sorted(
+                {os.path.dirname(merged_path), os.path.dirname(solve_path), tempfile.gettempdir()}
+            )
+            cmd = [
+                "podman",
+                "run",
+                "--rm",
+                "--security-opt",
+                "label=disable",
+                "--device",
+                "nvidia.com/gpu=all",
+                "-e",
+                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '0')}",
+            ]
+            for d in mount_dirs:
+                if os.path.isdir(d):
+                    cmd.extend(["-v", f"{d}:{d}"])
+            cmd.append(container_image)
+            cmd.extend(inner_cmd)
+        else:
+            cmd = [sys.executable] + inner_cmd[1:]
+
+        gpu_env = os.environ.copy()
+        gpu_env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        try:
+            gpu_info = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"],
+                text=True,
+                timeout=2.0,
+            ).strip().splitlines()[0]
+        except Exception:
+            gpu_info = "CPU fallback"
+
+        host_tag = socket.gethostname()
+        header_lines = []
+        if fallback_reason:
+            header_lines.append(f"[ndip] Note: {fallback_reason}")
+        header_lines.append(
+            f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
+        )
         cmd_str = " ".join(cmd)
-        job_id = f"local-{int(time.time())}"
-        job_record: dict[str, Any] = {
-            "job_id": job_id,
-            "tool_id": f"subhkl::{stage_id}",
-            "stage_id": stage_id,
-            "state": "running",
-            "command_line": cmd_str,
-            "stdout": f"$ {cmd_str}\n",
-            "stderr": "",
-            "ladder_rung_idx": 0 if stage_id == "solve" else 4,
-            "outputs": [{"id": job_id, "name": os.path.basename(out_h5), "extension": "h5"}],
-            "updated_payload_ready": False,
-            "started_at": time.time(),
-        }
-        self.active_job = job_record
+        header_lines.append(f"$ {cmd_str}\n")
+
+        job_id = f"gpu-{int(time.time())}"
+        if existing_job_record is not None:
+            job_record = existing_job_record
+            job_record["job_id"] = job_id
+            job_record["mode"] = "container_gpu"
+            job_record["state"] = "running"
+            job_record["command_line"] = cmd_str
+            job_record["stdout"] = (job_record.get("stdout", "") + "\n" + "\n".join(header_lines))[-24000:]
+        else:
+            job_record = {
+                "job_id": job_id,
+                "tool_id": f"subhkl::{stage_id}",
+                "stage_id": stage_id,
+                "mode": "container_gpu",
+                "state": "running",
+                "command_line": cmd_str,
+                "stdout": "\n".join(header_lines),
+                "stderr": "",
+                "ladder_rung_idx": 0 if stage_id == "solve" else 4,
+                "outputs": [{"id": job_id, "name": os.path.basename(out_h5), "extension": "h5"}],
+                "updated_payload_ready": False,
+                "started_at": time.time(),
+            }
+            self.active_job = job_record
 
         def _stream_proc() -> None:
             try:
@@ -443,6 +595,7 @@ class NovaGalaxyPipelineRunner:
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    env=gpu_env,
                 )
                 assert proc.stdout is not None
                 for line in proc.stdout:
@@ -480,31 +633,79 @@ class NovaGalaxyPipelineRunner:
             "status": "submitted",
         }
 
-    def _poll_galaxy_job(self, job_record: dict[str, Any], on_complete_h5: Any = None) -> None:
+    def _poll_galaxy_job(
+        self,
+        job_record: dict[str, Any],
+        on_complete_h5: Any = None,
+        nova_job: Any = None,
+    ) -> None:
         job_id = job_record.get("job_id")
         if not job_id:
             return
         step_counter = 0
+        base_log = job_record.get("stdout", "")
+        seen_pulsar_dirs: set[str] = set()
+        for droot in ("/data/staging_test", "/data/staging"):
+            if os.path.isdir(droot):
+                try:
+                    for entry in os.listdir(droot):
+                        seen_pulsar_dirs.add(os.path.join(droot, entry))
+                except Exception:
+                    pass
+
         while True:
-            time.sleep(1.4)
+            time.sleep(1.5)
             try:
+                # 1. Detect live Pulsar staging directory on this GPU node (IMAGINEX-1)
+                for droot in ("/data/staging_test", "/data/staging"):
+                    if os.path.isdir(droot):
+                        try:
+                            for entry in os.listdir(droot):
+                                full_dir = os.path.join(droot, entry)
+                                if full_dir not in seen_pulsar_dirs and os.path.isdir(full_dir):
+                                    seen_pulsar_dirs.add(full_dir)
+                                    base_log += f"[pulsar] Staged on IMAGINEX-1: {full_dir}\n"
+                        except Exception:
+                            pass
+
+                # 2. Fetch job status & live Pulsar console_output stream from NDIP Galaxy
                 jinfo = self._api_request("GET", f"/api/jobs/{job_id}?full=true")
                 state = jinfo.get("state", "running")
                 job_record["state"] = state
                 if jinfo.get("command_line"):
                     job_record["command_line"] = jinfo["command_line"]
-                out_txt = jinfo.get("tool_stdout") or jinfo.get("stdout") or ""
-                err_txt = jinfo.get("tool_stderr") or jinfo.get("stderr") or ""
-                if out_txt:
-                    job_record["stdout"] = f"$ {job_record.get('command_line', '')}\n{out_txt}"
+
+                console_out = ""
+                console_err = ""
+                try:
+                    cinfo = self._api_request(
+                        "GET",
+                        f"/api/jobs/{job_id}/console_output?stdout_position=0&stdout_length=65536&stderr_position=0&stderr_length=65536",
+                    )
+                    if isinstance(cinfo, dict):
+                        console_out = cinfo.get("stdout") or ""
+                        console_err = cinfo.get("stderr") or ""
+                except Exception:
+                    pass
+
+                out_txt = console_out or jinfo.get("tool_stdout") or jinfo.get("stdout") or ""
+                err_txt = console_err or jinfo.get("tool_stderr") or jinfo.get("stderr") or ""
+                cmd_header = (
+                    f"$ {job_record['command_line']}\n" if job_record.get("command_line") else ""
+                )
+                job_record["stdout"] = f"{base_log}{cmd_header}{out_txt}"[-24000:]
                 if err_txt:
-                    job_record["stderr"] = err_txt
+                    job_record["stderr"] = err_txt[-16000:]
+
                 if job_record.get("stage_id") == "solve" and state in ("queued", "running"):
                     step_counter = min(3, step_counter + 1)
                     job_record["ladder_rung_idx"] = step_counter
                 if state in ("ok", "error", "deleted", "paused"):
                     if state == "ok":
                         job_record["ladder_rung_idx"] = 4
+                        job_record["stdout"] += (
+                            f"\n[galaxy -> pulsar] Job {job_id} finished (state=ok).\n"
+                        )
                         h5_outs = [
                             o
                             for o in job_record.get("outputs", [])
