@@ -59,7 +59,10 @@ def solve(
     d_min: Annotated[
         float, typer.Option(min=0.0001, help="Reflection resolution in Angstrom")
     ] = 3.2,
-    binning: Annotated[int, typer.Option(min=1, help="Sum count pixels into bins")] = 8,
+    binning: Annotated[
+        int | None,
+        typer.Option(min=1, help="Sum count pixels into bins (default: 8 for poisson, 16 for band)"),
+    ] = None,
     proposal_binning: Annotated[
         int,
         typer.Option(min=1, help="Spatial binning for global orientation proposals"),
@@ -230,7 +233,7 @@ def solve(
                 d_min=d_min,
                 min_deviance=min_deviance,
                 pixel_polish=pixel_polish,
-                binning=binning,
+                binning=16 if binning is None else binning,
                 maxiter=band_maxiter,
                 static_mask_file=static_mask_file,
                 search_samples=search_samples,
@@ -254,7 +257,7 @@ def solve(
             wavelength_min=wavelength_min,
             wavelength_max=wavelength_max,
             d_min=d_min,
-            binning=binning,
+            binning=8 if binning is None else binning,
             proposal_binning=proposal_binning,
             n_candidates=n_candidates,
             penalty=penalty,

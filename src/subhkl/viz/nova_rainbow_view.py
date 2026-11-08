@@ -287,13 +287,20 @@ class NovaGalaxyPipelineRunner:
                 gi.datasets.wait_for_dataset(ds_id, maxwait=120, interval=2.0, check=True)
                 return ds_id
 
-        job_record["stdout"] += f"[nova -> galaxy] Uploading '{fname}' (file_type=h5, to_posix_lines=False)...\n"
+        is_local_gx = any(
+            h in (getattr(gi, "base_url", "") or self.galaxy_url)
+            for h in ("127.0.0.1", "localhost")
+        )
+        job_record["stdout"] += (
+            f"[nova -> galaxy] Uploading/linking '{fname}' (file_type=h5, link_to_files={is_local_gx})...\n"
+        )
         up_info = gi.tools.upload_file(
             path=local_path,
             history_id=store.history_id,
             file_name=fname,
             file_type="h5",
             to_posix_lines=False,
+            link_to_files=is_local_gx,
         )
         ds_id = up_info["outputs"][0]["id"]
         gi.datasets.wait_for_dataset(ds_id, maxwait=180, interval=2.0, check=True)
@@ -335,6 +342,21 @@ class NovaGalaxyPipelineRunner:
 
             tool_inputs: dict[str, Any] = {}
             if stage_id == "solve":
+                if not self._has_tool_on_galaxy("imaginex_subhkl_solve"):
+                    # Check if local Planemo Galaxy (http://127.0.0.1:9090) has imaginex_subhkl_solve deployed
+                    from nova.galaxy import Connection
+
+                    job_record["stdout"] += (
+                        f"[nova -> galaxy] 'imaginex_subhkl_solve' not yet merged on {self.galaxy_url}; "
+                        f"switching to local Galaxy instance http://127.0.0.1:9090 (GPU container runner)...\n"
+                    )
+                    local_conn = Connection(galaxy_url="http://127.0.0.1:9090", galaxy_key="test_key")
+                    store = local_conn.connect().create_data_store("IMAGINE-X SubHKL")
+                    gi = store.nova_connection.galaxy_instance
+                    self.galaxy_url = "http://127.0.0.1:9090"
+                    self.api_key = gi.key
+                    self.history_id = store.history_id
+
                 if self._has_tool_on_galaxy("imaginex_subhkl_solve"):
                     primary_tool = "imaginex_subhkl_solve"
                     scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
@@ -351,9 +373,7 @@ class NovaGalaxyPipelineRunner:
                         "wavelengthMin": float(wl[0]),
                         "wavelengthMax": float(wl[1]),
                         "refinement": str(params.get("objective", "band")),
-                        "dMin": float(params.get("d_min", 2.5)),
-                        "nZones": int(params.get("n_zones", 120)),
-                        "maxiter": int(params.get("steps", 120)),
+                        "dMin": float(params.get("d_min", 2.8)),
                     }
                 else:
                     raise RuntimeError(
@@ -495,10 +515,6 @@ class NovaGalaxyPipelineRunner:
                 str(params.get("d_min", 2.8)),
                 "--refinement",
                 str(params.get("objective", "band")),
-                "--band-zones",
-                str(max(60, int(params.get("n_zones", 120)))),
-                "--band-maxiter",
-                str(max(10, int(params.get("steps", 120)))),
             ]
         elif stage_id == "integrate" and os.path.isfile(merged_path) and os.path.isfile(solve_path):
             inner_cmd = [
@@ -551,10 +567,6 @@ class NovaGalaxyPipelineRunner:
                 "nvidia.com/gpu=all",
                 "-e",
                 f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '0')}",
-                "-e",
-                "XLA_PYTHON_CLIENT_PREALLOCATE=false",
-                "-e",
-                "TF_GPU_ALLOCATOR=cuda_malloc_async",
             ]
             for d in mount_dirs:
                 if os.path.isdir(d):
@@ -566,8 +578,6 @@ class NovaGalaxyPipelineRunner:
 
         gpu_env = os.environ.copy()
         gpu_env.setdefault("CUDA_VISIBLE_DEVICES", "0")
-        gpu_env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-        gpu_env.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
         try:
             gpu_info = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"],
