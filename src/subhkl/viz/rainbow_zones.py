@@ -1,0 +1,2988 @@
+"""Interactive Laue diffraction & orientation diagnostic widget for subhkl.
+
+Key features:
+1. **Detector Intensity Grounding**: Renders actual log-scaled neutron detector bank
+   pixel intensities (from ``--images`` / ``*.im.h5`` / ``merged.h5``, or synthesized
+   2D Gaussian spot maps from peak centroids/sigmas/intensities when raw images
+   are omitted) directly onto each panel.
+2. **Instrument-Aware Cylindrical & Spherical Projections**:
+   - *Cylindrical* ``(Azimuth φ [deg], Height y [m])`` — default for ``CG4D`` / ``IMAGINE``
+     (and other cylindrical detector geometries).
+   - *Spherical* ``(Azimuth φ [deg], Elevation ψ [deg])`` — default for ``MANDI``
+     (and other spherical/soccer-ball detector geometries), with an instant UI toggle
+     to switch between Cylindrical and Spherical views at any time.
+3. **2-Layer Depth Parallax ("Look Behind the Predicted Spots")**:
+   - *Back Layer (Detector Plate)*: Physical detector bank panels & log1p pixel intensity heatmaps.
+   - *Front Layer (Bragg Reflections)*: Vibrant spectral Bragg peak rings floating by
+     resolution ($d$-spacing) with subtle depth tethers to their physical spots on the
+     detector plate — moving the mouse shifts the predicted rings aside so you can
+     inspect the raw detector spot morphology directly underneath!
+"""
+
+from __future__ import annotations
+
+import base64
+import glob
+import io
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+import h5py
+import numpy as np
+from PIL import Image
+
+from subhkl.viz.zones import (
+    _cell_from_B,
+    _spherical_angles,
+    _unrolled,
+    get_zone_conic_points,
+    identify_zones,
+    stereographic_projection,
+)
+
+# Vibrant 7-color spectral palette
+RAINBOW_SPECTRAL_HEX = [
+    "#ff2a55",  # Red
+    "#ff8c1a",  # Orange
+    "#ffe600",  # Yellow
+    "#1aff66",  # Green
+    "#00e5ff",  # Cyan
+    "#3366ff",  # Blue
+    "#b833ff",  # Violet
+]
+
+PRO_PALETTE_HEX = [
+    "#38bdf8",
+    "#fb923c",
+    "#4ade80",
+    "#f87171",
+    "#c084fc",
+    "#facc15",
+    "#2dd4bf",
+    "#f472b6",
+    "#a3e635",
+    "#60a5fa",
+]
+
+# Instruments whose native detector arrangement is spherical rather than cylindrical
+SPHERICAL_INSTRUMENTS = {"MANDI", "TOPAZ", "SNS_MANDI", "CORELLI"}
+
+
+def default_projection_for_instrument(instrument: str | None) -> str:
+    """Return ``'spherical'`` for spherical instruments (e.g. MANDI) and ``'cylindrical'`` for cylindrical ones (e.g. CG4D)."""
+    if instrument and str(instrument).strip().upper() in SPHERICAL_INSTRUMENTS:
+        return "spherical"
+    return "cylindrical"
+
+
+def _decode_str(val: Any, default: str = "") -> str:
+    if val is None:
+        return default
+    if isinstance(val, (bytes, np.bytes_)):
+        return val.decode("utf-8", errors="replace")
+    if isinstance(val, np.ndarray) and val.ndim == 0:
+        item = val.item()
+        if isinstance(item, (bytes, np.bytes_)):
+            return item.decode("utf-8", errors="replace")
+        return str(item)
+    return str(val)
+
+
+def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, Any]:
+    """Load calibrated or nominal detector banks from ``subhkl.config.beamlines`` + HDF5 calibration."""
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+
+    detectors: dict[int, Any] = {}
+    base_configs: dict[int, dict] = {}
+    if instrument and str(instrument) in beamlines:
+        for k, v in beamlines[str(instrument)].items():
+            try:
+                base_configs[int(k)] = dict(v)
+            except (ValueError, TypeError):
+                pass
+
+    for bank_id, cfg in base_configs.items():
+        try:
+            detectors[bank_id] = Detector(cfg)
+        except Exception:
+            pass
+
+    if "detector_calibration" in f:
+        cal_grp = f["detector_calibration"]
+        for name in cal_grp:
+            if not name.startswith("bank_"):
+                continue
+            try:
+                bank_id = int(name.split("_", 1)[1])
+            except ValueError:
+                continue
+            g = cal_grp[name]
+            cfg = dict(
+                base_configs.get(
+                    bank_id, {"panel_type": "flat", "m": 256, "n": 256}
+                )
+            )
+            for field in ("center", "uhat", "vhat"):
+                if field in g:
+                    cfg[field] = np.asarray(g[field][()], dtype=float).tolist()
+            for field in ("width", "height"):
+                if field in g:
+                    cfg[field] = float(g[field][()])
+            try:
+                detectors[bank_id] = Detector(cfg)
+            except Exception:
+                pass
+
+    return detectors
+
+
+def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
+    """Auto-discover an accompanying ``*.im.h5`` or ``merged.h5`` in the same directory."""
+    if replay_h5 is None:
+        return None
+    p = Path(replay_h5).resolve()
+    if not p.exists():
+        return None
+    try:
+        with h5py.File(p, "r") as f:
+            if "images" in f:
+                return str(p)
+    except Exception:
+        pass
+
+    parent = p.parent
+    candidates = sorted(glob.glob(str(parent / "*.im.h5"))) + sorted(
+        glob.glob(str(parent / "*merged*.h5"))
+    )
+    for cand in candidates:
+        try:
+            with h5py.File(cand, "r") as f:
+                if "images" in f and "bank_ids" in f:
+                    return cand
+        except Exception:
+            continue
+    return None
+
+
+def _encode_panel_textures(
+    detectors: dict[int, Any],
+    bank_arr: np.ndarray | None,
+    pixel_r_arr: np.ndarray | None,
+    pixel_c_arr: np.ndarray | None,
+    intensity_arr: np.ndarray | None,
+    sigma_arr: np.ndarray | None,
+    images_h5: str | os.PathLike | None = None,
+    render_binning: int = 4,
+) -> tuple[list[dict[str, Any]], str]:
+    """Build cylindrical + spherical detector panel geometries and base64 log-intensity PNG textures.
+
+    Returns ``(panels_payload, intensity_source)`` where ``intensity_source`` is
+    ``"raw_h5"`` when real detector images were loaded or ``"synthesized_peaks"``
+    when reconstructed from fitted peak intensities/widths.
+    """
+    raw_bank_images: dict[int, np.ndarray] = {}
+    intensity_source = "synthesized_peaks"
+
+    if images_h5 is not None and os.path.exists(images_h5):
+        try:
+            with h5py.File(images_h5, "r") as f:
+                if "images" in f:
+                    ims = f["images"]
+                    b_ids = (
+                        np.asarray(f["bank_ids"][()], dtype=int)
+                        if "bank_ids" in f
+                        else np.arange(1, len(ims) + 1)
+                    )
+                    b = max(1, int(render_binning))
+                    for idx, bk in enumerate(b_ids):
+                        if idx >= len(ims):
+                            break
+                        im = np.asarray(ims[idx], dtype=np.float32)
+                        if im.ndim != 2:
+                            continue
+                        n2, m2 = (im.shape[0] // b) * b, (im.shape[1] // b) * b
+                        if n2 > 0 and m2 > 0:
+                            imb = (
+                                im[:n2, :m2]
+                                .reshape(n2 // b, b, m2 // b, b)
+                                .mean(axis=(1, 3))
+                            )
+                        else:
+                            imb = im
+                        if int(bk) in raw_bank_images:
+                            raw_bank_images[int(bk)] = np.maximum(
+                                raw_bank_images[int(bk)], imb
+                            )
+                        else:
+                            raw_bank_images[int(bk)] = imb
+                    if raw_bank_images:
+                        intensity_source = "raw_h5"
+        except Exception:
+            pass
+
+    # If no raw images were loaded, synthesize clean 2D Gaussian spot maps on each populated bank
+    if not raw_bank_images and bank_arr is not None and len(bank_arr) > 0:
+        grid_size = 96
+        yy, xx = np.meshgrid(
+            np.arange(grid_size, dtype=np.float32),
+            np.arange(grid_size, dtype=np.float32),
+            indexing="ij",
+        )
+        for bk in np.unique(bank_arr):
+            bk_int = int(bk)
+            det = detectors.get(bk_int)
+            n_det = float(getattr(det, "n", 256))
+            m_det = float(getattr(det, "m", 256))
+            mask = bank_arr == bk_int
+            if not np.any(mask):
+                continue
+            canvas = np.zeros((grid_size, grid_size), dtype=np.float32)
+            pr_b = (
+                pixel_r_arr[mask]
+                if pixel_r_arr is not None
+                else np.full(np.sum(mask), n_det * 0.5)
+            )
+            pc_b = (
+                pixel_c_arr[mask]
+                if pixel_c_arr is not None
+                else np.full(np.sum(mask), m_det * 0.5)
+            )
+            inten_b = (
+                intensity_arr[mask]
+                if intensity_arr is not None
+                else np.full(np.sum(mask), 200.0)
+            )
+            sig_b = (
+                sigma_arr[mask]
+                if sigma_arr is not None
+                else np.full(np.sum(mask), 3.5)
+            )
+            for r0, c0, amp, sig in zip(pr_b, pc_b, inten_b, sig_b):
+                ry = float(r0) / max(n_det, 1.0) * (grid_size - 1)
+                cx = float(c0) / max(m_det, 1.0) * (grid_size - 1)
+                s_grid = max(
+                    1.3,
+                    min(5.0, float(sig) / max(n_det, 1.0) * grid_size * 1.4),
+                )
+                g_spot = max(float(amp), 10.0) * np.exp(
+                    -0.5 * (((yy - ry) / s_grid) ** 2 + ((xx - cx) / s_grid) ** 2)
+                )
+                canvas += g_spot
+            raw_bank_images[bk_int] = canvas
+
+    # Compute global log1p normalization across all bank images for consistent contrast
+    vmin, vmax = 0.0, 1.0
+    if raw_bank_images:
+        all_logs = [
+            np.log1p(np.maximum(im, 0.0)) for im in raw_bank_images.values()
+        ]
+        flat = np.concatenate([a.ravel() for a in all_logs])
+        if len(flat) > 0:
+            vmin = float(np.percentile(flat, 10.0))
+            vmax = float(np.percentile(flat, 99.6))
+            if vmax <= vmin + 1e-5:
+                vmax = float(np.max(flat)) + 1.0
+
+    panels_payload: list[dict[str, Any]] = []
+    for bk, det in sorted(detectors.items()):
+        try:
+            rr = np.array([0, det.n - 1, det.n - 1, 0, 0], dtype=float)
+            cc = np.array([0, 0, det.m - 1, det.m - 1, 0], dtype=float)
+            xyz_corners = det.pixel_to_lab(rr, cc)
+            x, y = _unrolled(xyz_corners)
+            _, el = _spherical_angles(xyz_corners)
+            if np.ptp(x) > 180.0:
+                continue
+
+            az_min, az_max = float(np.min(x[:4])), float(np.max(x[:4]))
+            y_min, y_max = float(np.min(y[:4])), float(np.max(y[:4]))
+            el_min, el_max = float(np.min(el[:4])), float(np.max(el[:4]))
+
+            tex_b64 = None
+            im = raw_bank_images.get(int(bk))
+            if im is not None:
+                im_oriented = im.copy()
+                if y[1] > y[0]:
+                    im_oriented = im_oriented[::-1, :]
+                if x[3] < x[0]:
+                    im_oriented = im_oriented[:, ::-1]
+
+                log_im = np.log1p(np.maximum(im_oriented, 0.0))
+                norm = np.clip(
+                    (log_im - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0
+                )
+                u8 = (norm * 255.0).astype(np.uint8)
+                buf = io.BytesIO()
+                Image.fromarray(u8, mode="L").save(
+                    buf, format="PNG", optimize=True
+                )
+                tex_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+            panels_payload.append(
+                {
+                    "bank": int(bk),
+                    "az_min": round(az_min, 3),
+                    "az_max": round(az_max, 3),
+                    "y_min": round(y_min, 4),
+                    "y_max": round(y_max, 4),
+                    "el_min": round(el_min, 3),
+                    "el_max": round(el_max, 3),
+                    "outline": [
+                        [round(float(x[j]), 2), round(float(y[j]), 4)]
+                        for j in range(len(x))
+                    ],
+                    "outline_sph": [
+                        [round(float(x[j]), 2), round(float(el[j]), 3)]
+                        for j in range(len(x))
+                    ],
+                    "texture_b64": tex_b64,
+                }
+            )
+        except Exception:
+            pass
+
+    return panels_payload, intensity_source
+
+
+def _extract_from_h5(h5_path: str | os.PathLike) -> dict[str, Any]:
+    """Extract peaks, detectors, UB, wavelength range, and metadata from a subhkl HDF5 file."""
+    with h5py.File(h5_path, "r") as f:
+        instrument = _decode_str(f.attrs.get("instrument"), "IMAGINE")
+        ki = (0.0, 0.0, 1.0)
+        if "beam/ki_vec" in f:
+            ki = tuple(
+                float(x)
+                for x in np.asarray(f["beam/ki_vec"][()], dtype=float).ravel()[
+                    :3
+                ]
+            )
+
+        wavelength_range = (1.8, 4.5)
+        if "instrument/wavelength" in f:
+            wl = np.asarray(
+                f["instrument/wavelength"][()], dtype=float
+            ).ravel()
+            if len(wl) >= 2:
+                wavelength_range = (float(wl[0]), float(wl[1]))
+
+        U = (
+            np.asarray(f["sample/U"][()], dtype=float)
+            if "sample/U" in f
+            else None
+        )
+        B = (
+            np.asarray(f["sample/B"][()], dtype=float)
+            if "sample/B" in f
+            else None
+        )
+        space_group = (
+            _decode_str(f["sample/space_group"][()], "P 1")
+            if "sample/space_group" in f
+            else "P 1"
+        )
+
+        cell = None
+        if all(
+            f"sample/{k}" in f
+            for k in ("a", "b", "c", "alpha", "beta", "gamma")
+        ):
+            cell = [
+                float(f["sample/a"][()]),
+                float(f["sample/b"][()]),
+                float(f["sample/c"][()]),
+                float(f["sample/alpha"][()]),
+                float(f["sample/beta"][()]),
+                float(f["sample/gamma"][()]),
+            ]
+        elif B is not None:
+            cell = list(_cell_from_B(B))
+
+        detectors = _load_detectors_from_h5(f, instrument)
+
+        bank = (
+            np.asarray(f["bank"][()], dtype=int) if "bank" in f else None
+        )
+        pixel_r = (
+            np.asarray(f["peaks/pixel_r"][()], dtype=float)
+            if "peaks/pixel_r" in f
+            else None
+        )
+        pixel_c = (
+            np.asarray(f["peaks/pixel_c"][()], dtype=float)
+            if "peaks/pixel_c" in f
+            else None
+        )
+        peaks_xyz = (
+            np.asarray(f["peaks/xyz"][()], dtype=float)
+            if "peaks/xyz" in f
+            else None
+        )
+
+        if (
+            peaks_xyz is None
+            and pixel_r is not None
+            and pixel_c is not None
+            and bank is not None
+        ):
+            xyz_list = np.zeros((len(pixel_r), 3), dtype=float)
+            for bk in np.unique(bank):
+                mask = bank == bk
+                det = detectors.get(int(bk))
+                if det is not None:
+                    xyz_list[mask] = det.pixel_to_lab(
+                        pixel_r[mask], pixel_c[mask]
+                    )
+                else:
+                    az = (int(bk) * 37.0 % 360.0 - 180.0) + (
+                        pixel_c[mask] - 128.0
+                    ) * 0.12
+                    rad = np.deg2rad(az)
+                    y = (pixel_r[mask] - 128.0) * 0.002
+                    xyz_list[mask] = np.column_stack(
+                        [np.sin(rad), y, np.cos(rad)]
+                    )
+            peaks_xyz = xyz_list
+
+        if peaks_xyz is None:
+            peaks_xyz = np.zeros((0, 3), dtype=float)
+
+        n_peaks = len(peaks_xyz)
+        if bank is None:
+            bank = np.ones(n_peaks, dtype=int)
+        if pixel_r is None:
+            pixel_r = np.zeros(n_peaks, dtype=float)
+        if pixel_c is None:
+            pixel_c = np.zeros(n_peaks, dtype=float)
+
+        intensity = (
+            np.asarray(f["peaks/intensity"][()], dtype=float)
+            if "peaks/intensity" in f
+            else np.ones(n_peaks, dtype=float) * 100.0
+        )
+        sigma = (
+            np.asarray(f["peaks/sigma"][()], dtype=float)
+            if "peaks/sigma" in f
+            else np.ones(n_peaks, dtype=float) * 3.0
+        )
+        run_index = (
+            np.asarray(f["peaks/run_index"][()], dtype=int)
+            if "peaks/run_index" in f
+            else np.zeros(n_peaks, dtype=int)
+        )
+        hkl = None
+        if all(f"peaks/{k}" in f for k in ("h", "k", "l")):
+            hkl = np.column_stack(
+                [
+                    np.asarray(f["peaks/h"][()], dtype=int),
+                    np.asarray(f["peaks/k"][()], dtype=int),
+                    np.asarray(f["peaks/l"][()], dtype=int),
+                ]
+            )
+        lam = (
+            np.asarray(f["peaks/lambda"][()], dtype=float)
+            if "peaks/lambda" in f
+            else None
+        )
+
+        R_gonio = None
+        if "goniometer/R" in f:
+            R_all = np.asarray(f["goniometer/R"][()], dtype=float)
+            if R_all.ndim == 3 and len(R_all) > 0:
+                if len(R_all) == n_peaks:
+                    R_gonio = R_all
+                elif np.max(run_index, initial=0) < len(R_all):
+                    R_gonio = R_all[run_index]
+                else:
+                    R_gonio = R_all[0]
+            elif R_all.ndim == 2:
+                R_gonio = R_all
+
+        return {
+            "instrument": instrument,
+            "ki": ki,
+            "wavelength_range": wavelength_range,
+            "U": U,
+            "B": B,
+            "space_group": space_group,
+            "cell": cell,
+            "detectors": detectors,
+            "peaks_xyz": peaks_xyz,
+            "bank": bank,
+            "pixel_r": pixel_r,
+            "pixel_c": pixel_c,
+            "intensity": intensity,
+            "sigma": sigma,
+            "run_index": run_index,
+            "hkl": hkl,
+            "wavelength": lam,
+            "R_gonio": R_gonio,
+        }
+
+
+def _build_lattice_ladder_steps(
+    zones: list[dict[str, Any]],
+    peaks_list: list[dict[str, Any]],
+    cell: list[float] | None,
+    space_group: str,
+) -> list[dict[str, Any]]:
+    """Construct the interactive Lattice Ladder progression (Rung 1 -> Goal)."""
+    n_total = max(len(peaks_list), 1)
+    indexed_peaks = [p for p in peaks_list if p["indexed"]]
+    overall_rms = (
+        float(
+            np.sqrt(
+                np.mean([p["angular_error_deg"] ** 2 for p in indexed_peaks])
+            )
+        )
+        if indexed_peaks
+        else 0.0
+    )
+
+    all_ids = [p["id"] for p in peaks_list]
+    steps: list[dict[str, Any]] = [
+        {
+            "rung": 1,
+            "stage": "1. Raw Detector Counts",
+            "subtitle": "Neutron counts & peak centroids on panels",
+            "active_zones": [],
+            "highlighted_peaks": [],
+            "n_captured": len(all_ids),
+            "n_total": len(all_ids),
+            "fraction_indexed": round(len(indexed_peaks) / n_total, 4),
+            "rms_deg": round(overall_rms, 3),
+            "zone_tol_deg": 1.0,
+            "description": (
+                f"Inspect the raw detector banks: {len(all_ids)} diffraction "
+                "spots sit directly on the panels with no predicted overlay."
+            ),
+        }
+    ]
+
+    z0_ids = [zones[0]["zone_id"]] if len(zones) >= 1 else []
+    z0_peaks = zones[0]["member_peak_ids"] if len(zones) >= 1 else []
+    z0_label = zones[0]["label"] if len(zones) >= 1 else "[1 0 0]"
+    z0_rms = zones[0]["angular_rms_deg"] if len(zones) >= 1 else overall_rms
+    steps.append(
+        {
+            "rung": 2,
+            "stage": f"2. Primary Zone {z0_label}",
+            "subtitle": f"Coarse zone lock ({len(z0_peaks)} spots in family)",
+            "active_zones": z0_ids,
+            "highlighted_peaks": z0_peaks,
+            "n_captured": len(z0_peaks),
+            "n_total": len(all_ids),
+            "fraction_indexed": round(len(z0_peaks) / n_total, 4),
+            "rms_deg": round(float(z0_rms), 3),
+            "zone_tol_deg": 1.0,
+            "description": (
+                f"Primary crystal zone axis {z0_label} captures {len(z0_peaks)} "
+                "coplanar scattering vectors (G · t_uvw = 0)."
+            ),
+        }
+    )
+
+    z12_ids = [z["zone_id"] for z in zones[:2]]
+    z12_peaks = sorted(
+        {pid for z in zones[:2] for pid in z["member_peak_ids"]}
+    )
+    psi_deg = 90.0
+    if len(zones) >= 2:
+        a0 = np.asarray(zones[0]["axis_crystal_xyz"], dtype=float)
+        a1 = np.asarray(zones[1]["axis_crystal_xyz"], dtype=float)
+        psi_deg = float(
+            np.rad2deg(np.arccos(np.clip(np.dot(a0, a1), -1.0, 1.0)))
+        )
+    z1_label = zones[1]["label"] if len(zones) >= 2 else "[0 1 0]"
+    steps.append(
+        {
+            "rung": 3,
+            "stage": f"3. Zone Lock {z0_label} × {z1_label}",
+            "subtitle": f"Inter-zone angle ψ = {psi_deg:.1f}° locks 3D orientation",
+            "active_zones": z12_ids,
+            "highlighted_peaks": z12_peaks,
+            "n_captured": len(z12_peaks),
+            "n_total": len(all_ids),
+            "fraction_indexed": round(len(z12_peaks) / n_total, 4),
+            "rms_deg": round(
+                float(np.mean([z["angular_rms_deg"] for z in zones[:2]]))
+                if zones
+                else overall_rms,
+                3,
+            ),
+            "zone_tol_deg": 0.5,
+            "psi_deg": round(psi_deg, 2),
+            "description": (
+                f"Two intersecting zone families ({z0_label} and {z1_label}, ψ = {psi_deg:.1f}°) "
+                "pin down the 3D crystal orientation on the detector."
+            ),
+        }
+    )
+
+    z_const_ids = [z["zone_id"] for z in zones[: min(6, len(zones))]]
+    z_const_peaks = sorted(
+        {
+            pid
+            for z in zones[: min(6, len(zones))]
+            for pid in z["member_peak_ids"]
+        }
+    )
+    steps.append(
+        {
+            "rung": 4,
+            "stage": "4. Multi-Zone Refinement",
+            "subtitle": f"{len(z_const_ids)} major zones capture {len(z_const_peaks)} spots",
+            "active_zones": z_const_ids,
+            "highlighted_peaks": z_const_peaks,
+            "n_captured": len(z_const_peaks),
+            "n_total": len(all_ids),
+            "fraction_indexed": round(len(z_const_peaks) / n_total, 4),
+            "rms_deg": round(
+                float(
+                    np.mean(
+                        [
+                            z["angular_rms_deg"]
+                            for z in zones[: min(6, len(zones))]
+                        ]
+                    )
+                )
+                if zones
+                else overall_rms,
+                3,
+            ),
+            "zone_tol_deg": 0.3,
+            "description": (
+                f"Zoom-and-prune ladder adds secondary zone families ({len(z_const_ids)} active), "
+                "tightening angular tolerance to 0.3°."
+            ),
+        }
+    )
+
+    all_zone_ids = [z["zone_id"] for z in zones]
+    cell_str = (
+        f"a={cell[0]:.2f}, b={cell[1]:.2f}, c={cell[2]:.2f} Å"
+        if cell and len(cell) == 6
+        else "Refined UB Matrix"
+    )
+    steps.append(
+        {
+            "rung": 5,
+            "stage": "5. Indexed UB Solution",
+            "subtitle": f"{space_group} • {cell_str}",
+            "active_zones": all_zone_ids,
+            "highlighted_peaks": [p["id"] for p in indexed_peaks] or all_ids,
+            "n_captured": len(indexed_peaks),
+            "n_total": len(all_ids),
+            "fraction_indexed": round(len(indexed_peaks) / n_total, 4),
+            "rms_deg": round(overall_rms, 3),
+            "zone_tol_deg": 0.15,
+            "description": (
+                f"Full 3D UB solution ({space_group}, {cell_str}): "
+                f"{len(indexed_peaks)}/{len(peaks_list)} reflections indexed "
+                f"({100.0 * len(indexed_peaks) / n_total:.1f}%), Δθ RMS = {overall_rms:.3f}°. "
+                "Move the mouse to shift predicted rings aside and inspect raw spots behind them."
+            ),
+        }
+    )
+    return steps
+
+
+def _build_ndip_pipeline_stages(
+    peaks_list: list[dict[str, Any]],
+    zones: list[dict[str, Any]],
+    *,
+    instrument: str = "CG4D",
+    space_group: str = "P 1",
+    cell: list[float] | None = None,
+) -> list[dict[str, Any]]:
+    """Build the 4-stage coarse NDIP/Galaxy workflow pipeline descriptors."""
+    n_peaks = len(peaks_list)
+    n_indexed = sum(1 for p in peaks_list if p.get("indexed"))
+    n_zones_ord1 = sum(1 for z in zones if (z.get("order") or 1) <= 1)
+    cell_tag = (
+        f"{cell[0]:.1f}, {cell[1]:.1f}, {cell[2]:.1f} Å"
+        if cell and len(cell) >= 3
+        else space_group
+    )
+    return [
+        {
+            "stage_id": "reduce",
+            "step_num": 1,
+            "name": "1. REDUCE & FIND",
+            "tool_ids": [
+                "imaginex_subhkl_prepare_peaks",
+                "imaginex_subhkl_peak_fit",
+            ],
+            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "artifact": f"scan_master.h5 → finder.h5 ({n_peaks} peaks)",
+            "status": "completed",
+            "ladder_rung_idx": 0,
+            "summary": (
+                f"NDIP Reduce & Peak Finding ({instrument}): "
+                f"reduced detector banks into scan_master.h5 and extracted {n_peaks} candidate peaks."
+            ),
+        },
+        {
+            "stage_id": "solve",
+            "step_num": 2,
+            "name": "2. SOLVE (UB & ZONES)",
+            "tool_ids": ["imaginex_subhkl"],
+            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "artifact": f"indexer.h5 ({n_indexed}/{n_peaks} indexed • {n_zones_ord1} ord-1 zones)",
+            "status": "active",
+            "ladder_rung_idx": 4,
+            "summary": (
+                f"NDIP Peak Indexing (imaginex_subhkl): steps 1–5 below lock the 3D UB orientation "
+                f"({space_group}, {cell_tag}) with {n_indexed}/{n_peaks} spots indexed."
+            ),
+        },
+        {
+            "stage_id": "integrate",
+            "step_num": 3,
+            "name": "3. PREDICT & INTEGRATE",
+            "tool_ids": [
+                "imaginex_subhkl_predict",
+                "imaginex_subhkl_integrate",
+            ],
+            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "artifact": "peak_predictor.h5 → integrator.h5",
+            "status": "ready",
+            "ladder_rung_idx": 4,
+            "summary": (
+                "NDIP Peak Prediction & Integration: forward-projects all reflections across the "
+                "wavelength band onto detector panels and integrates shoeboxes/profiles."
+            ),
+        },
+        {
+            "stage_id": "merge",
+            "step_num": 4,
+            "name": "4. MERGE & MTZ",
+            "tool_ids": ["imaginex_merge", "imaginex_analysis"],
+            "container": "savannah.ornl.gov/imagine-x/coverage/main:latest",
+            "artifact": "out.mtz + completeness report",
+            "status": "ready",
+            "ladder_rung_idx": 4,
+            "summary": (
+                "NDIP Multi-Orientation Merge: merges integrated reflections across goniometer φ "
+                "settings into a structure-factor MTZ dataset."
+            ),
+        },
+    ]
+
+
+def build_rainbow_zone_payload(
+    peaks_xyz: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None = None,
+    replay_h5: str | os.PathLike | None = None,
+    *,
+    images_h5: str | os.PathLike | None = None,
+    projection: str | None = None,
+    U: np.ndarray | None = None,
+    B: np.ndarray | None = None,
+    R_gonio: np.ndarray | None = None,
+    ki: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    wavelength_range: tuple[float, float] = (1.8, 4.5),
+    instrument: str = "IMAGINE",
+    space_group: str = "P 1",
+    max_zone_index: int = 3,
+    zone_tolerance_deg: float = 0.75,
+    min_zone_peaks: int = 2,
+    max_zones: int = 36,
+    n_arc: int = 720,
+    max_peaks: int = 2500,
+    render_binning: int = 4,
+) -> dict[str, Any]:
+    """Build the JSON-serializable data contract for the Rainbow Zones widget.
+
+    Includes detector bank outlines in both Cylindrical ``(az, y)`` and Spherical
+    ``(az, elevation)`` coordinates, log-scaled detector intensity heatmaps,
+    peak reflections, and Lattice Ladder steps.
+    """
+    detectors: dict[int, Any] = {}
+    cell: list[float] | None = None
+    bank_arr = None
+    pixel_r_arr = None
+    pixel_c_arr = None
+    intensity_arr = None
+    sigma_arr = None
+    hkl_arr = None
+    lam_arr = None
+
+    if replay_h5 is not None:
+        extracted = _extract_from_h5(replay_h5)
+        instrument = extracted["instrument"] or instrument
+        ki = extracted["ki"]
+        wavelength_range = extracted["wavelength_range"]
+        if U is None:
+            U = extracted["U"]
+        if B is None:
+            B = extracted["B"]
+        space_group = extracted["space_group"] or space_group
+        cell = extracted["cell"]
+        detectors = extracted["detectors"]
+        if peaks_xyz is None:
+            peaks_xyz = extracted["peaks_xyz"]
+        bank_arr = extracted["bank"]
+        pixel_r_arr = extracted["pixel_r"]
+        pixel_c_arr = extracted["pixel_c"]
+        intensity_arr = extracted["intensity"]
+        sigma_arr = extracted["sigma"]
+        hkl_arr = extracted["hkl"]
+        lam_arr = extracted["wavelength"]
+        if R_gonio is None:
+            R_gonio = extracted["R_gonio"]
+        if images_h5 is None:
+            images_h5 = _discover_images_h5(replay_h5)
+
+    if peaks_xyz is None:
+        peaks_xyz = np.zeros((0, 3), dtype=float)
+    pts = np.asarray(peaks_xyz, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("peaks_xyz must have shape (N, 3)")
+
+    if ub_matrix is None and U is not None and B is not None:
+        ub_matrix = np.asarray(U, dtype=float) @ np.asarray(B, dtype=float)
+    elif ub_matrix is not None:
+        ub_matrix = np.asarray(ub_matrix, dtype=float)
+        if B is None:
+            cell = list(_cell_from_B(ub_matrix))
+
+    if cell is None and B is not None:
+        cell = list(_cell_from_B(B))
+
+    n_raw = len(pts)
+    if n_raw > max_peaks:
+        order = (
+            np.argsort(-np.asarray(intensity_arr))[:max_peaks]
+            if intensity_arr is not None and len(intensity_arr) == n_raw
+            else np.linspace(0, n_raw - 1, max_peaks, dtype=int)
+        )
+        order = np.sort(order)
+        pts = pts[order]
+        if bank_arr is not None and len(bank_arr) == n_raw:
+            bank_arr = bank_arr[order]
+        if pixel_r_arr is not None and len(pixel_r_arr) == n_raw:
+            pixel_r_arr = pixel_r_arr[order]
+        if pixel_c_arr is not None and len(pixel_c_arr) == n_raw:
+            pixel_c_arr = pixel_c_arr[order]
+        if intensity_arr is not None and len(intensity_arr) == n_raw:
+            intensity_arr = intensity_arr[order]
+        if sigma_arr is not None and len(sigma_arr) == n_raw:
+            sigma_arr = sigma_arr[order]
+        if hkl_arr is not None and len(hkl_arr) == n_raw:
+            hkl_arr = hkl_arr[order]
+        if lam_arr is not None and len(lam_arr) == n_raw:
+            lam_arr = lam_arr[order]
+        if (
+            isinstance(R_gonio, np.ndarray)
+            and R_gonio.ndim == 3
+            and len(R_gonio) == n_raw
+        ):
+            R_gonio = R_gonio[order]
+
+    n_peaks = len(pts)
+    ki_hat = np.asarray(ki, dtype=float)
+    ki_hat = ki_hat / np.linalg.norm(ki_hat)
+
+    norms = np.linalg.norm(pts, axis=1, keepdims=True)
+    kf_hat = pts / np.maximum(norms, 1e-12)
+    q_vec = kf_hat - ki_hat[None, :]
+    q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True)
+    g_hat = np.where(q_norm > 1e-6, q_vec / np.maximum(q_norm, 1e-12), kf_hat)
+
+    R_single = np.eye(3)
+    if R_gonio is not None:
+        R_arr = np.asarray(R_gonio, dtype=float)
+        if R_arr.ndim == 2:
+            R_single = R_arr
+            g_crystal = g_hat @ R_single
+        elif R_arr.ndim == 3 and len(R_arr) == n_peaks:
+            g_crystal = np.einsum("ni,nij->nj", g_hat, R_arr)
+            R_single = R_arr[0]
+        else:
+            g_crystal = g_hat
+    else:
+        g_crystal = g_hat
+
+    sx, sy, hemi = (
+        stereographic_projection(g_crystal)
+        if n_peaks > 0
+        else (np.zeros(0), np.zeros(0), np.zeros(0, dtype=np.int8))
+    )
+    det_x, det_y = (
+        _unrolled(pts)
+        if n_peaks > 0
+        else (np.zeros(0, dtype=float), np.zeros(0, dtype=float))
+    )
+    _, det_el = (
+        _spherical_angles(pts)
+        if n_peaks > 0
+        else (np.zeros(0, dtype=float), np.zeros(0, dtype=float))
+    )
+
+    wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
+    if n_peaks > 0 and ub_matrix is not None:
+        inv_ub = np.linalg.inv(ub_matrix)
+        hkl_dir = g_crystal @ inv_ub.T
+        sin_theta = np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999)
+        if hkl_arr is None:
+            lam_grid = np.linspace(wl_min, wl_max, 64)
+            q_mag_grid = (2.0 * sin_theta[:, None]) / lam_grid[None, :]
+            hkl_cand = hkl_dir[:, None, :] * q_mag_grid[:, :, None]
+            hkl_round = np.rint(hkl_cand)
+            nonzero = np.any(hkl_round != 0, axis=-1)
+            diff = np.linalg.norm(hkl_cand - hkl_round, axis=-1)
+            diff = np.where(nonzero, diff, 1e9)
+            best_l = np.argmin(diff, axis=1)
+            hkl_arr = hkl_round[np.arange(n_peaks), best_l].astype(int)
+
+        G_pred_cryst = hkl_arr @ ub_matrix.T
+        G_norm = np.linalg.norm(G_pred_cryst, axis=1)
+        valid_hkl = G_norm > 1e-8
+        G_pred_hat = np.divide(
+            G_pred_cryst, np.maximum(G_norm[:, None], 1e-12)
+        )
+        cos_err = np.clip(np.sum(g_crystal * G_pred_hat, axis=1), -1.0, 1.0)
+        ang_err_deg = np.where(valid_hkl, np.rad2deg(np.arccos(cos_err)), 90.0)
+        d_spacing = np.where(valid_hkl, 1.0 / np.maximum(G_norm, 1e-8), 0.0)
+        if lam_arr is None:
+            lam_arr = np.where(
+                valid_hkl,
+                2.0 * sin_theta / np.maximum(G_norm, 1e-8),
+                0.5 * (wl_min + wl_max),
+            )
+    else:
+        if hkl_arr is None:
+            hkl_arr = np.zeros((n_peaks, 3), dtype=int)
+        sin_theta = (
+            np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999)
+            if n_peaks > 0
+            else np.zeros(0)
+        )
+        if lam_arr is None:
+            lam_arr = np.full(n_peaks, 0.5 * (wl_min + wl_max), dtype=float)
+        d_spacing = (
+            lam_arr / np.maximum(2.0 * sin_theta, 1e-4)
+            if n_peaks > 0
+            else np.zeros(0, dtype=float)
+        )
+        ang_err_deg = np.zeros(n_peaks, dtype=float)
+
+    raw_zones = (
+        identify_zones(
+            pts,
+            ub_matrix=ub_matrix,
+            R_gonio=R_gonio,
+            ki=ki_hat,
+            max_index=max_zone_index,
+            tolerance_deg=zone_tolerance_deg,
+            min_peaks=0 if ub_matrix is not None else min(min_zone_peaks, max(1, n_peaks)),
+            n_arc=n_arc,
+        )
+        if n_peaks > 0
+        else []
+    )
+    for z in raw_zones:
+        uvw_vals = [abs(int(x)) for x in z.get("uvw", [1, 0, 0])]
+        z["order"] = max(uvw_vals) if any(uvw_vals) else 1
+
+    # Keep all fundamental Order 1 zones (|u|,|v|,|w| <= 1) plus populated Order 2 and Order 3 zones
+    selected_zones: list[dict[str, Any]] = []
+    z_ord1 = [
+        z for z in raw_zones
+        if z["order"] == 1 and (z["n_peaks"] >= 1 or len(z["conic"]["det_x"]) > 0)
+    ][:13]
+    z_ord2 = [
+        z for z in raw_zones
+        if z["order"] == 2 and z["n_peaks"] >= max(1, min_zone_peaks)
+    ][:14]
+    z_ord3 = [
+        z for z in raw_zones
+        if z["order"] == 3 and z["n_peaks"] >= max(2, min_zone_peaks)
+    ][:16]
+    selected_zones.extend(z_ord1)
+    selected_zones.extend(z_ord2)
+    selected_zones.extend(z_ord3)
+    other_zones = [
+        z for z in raw_zones
+        if z["order"] > 3 and z["n_peaks"] >= max(2, min_zone_peaks)
+    ][:8]
+    selected_zones.extend(other_zones)
+    selected_zones.sort(
+        key=lambda z: (z["order"], -z["n_peaks"], -z["score"])
+    )
+    raw_zones = selected_zones[:max(max_zones, len(z_ord1) + len(z_ord2))]
+    for new_zid, z in enumerate(raw_zones):
+        z["zone_id"] = new_zid
+
+    peak_zones: list[list[int]] = [[] for _ in range(n_peaks)]
+    for z in raw_zones:
+        zid = z["zone_id"]
+        for pid in z["member_peak_ids"]:
+            if 0 <= pid < n_peaks:
+                peak_zones[pid].append(zid)
+
+    peaks_list: list[dict[str, Any]] = []
+    for i in range(n_peaks):
+        h_i, k_i, l_i = (
+            int(hkl_arr[i, 0]),
+            int(hkl_arr[i, 1]),
+            int(hkl_arr[i, 2]),
+        )
+        g_gcd = (
+            int(np.gcd.reduce(np.abs([h_i, k_i, l_i])))
+            if (h_i or k_i or l_i)
+            else 1
+        )
+        d_val = float(d_spacing[i]) if i < len(d_spacing) else 2.0
+        lam_val = (
+            float(lam_arr[i]) if i < len(lam_arr) else 0.5 * (wl_min + wl_max)
+        )
+        err_val = float(ang_err_deg[i]) if i < len(ang_err_deg) else 0.0
+        is_indexed = bool(
+            (
+                (h_i != 0 or k_i != 0 or l_i != 0)
+                and err_val <= max(2.0, zone_tolerance_deg * 2.5)
+            )
+            or len(peak_zones[i]) > 0
+        )
+        parallax_depth = float(
+            np.clip(1.0 / (1.0 + 0.35 * max(d_val, 0.2)), 0.05, 0.98)
+        )
+
+        peaks_list.append(
+            {
+                "id": i,
+                "bank": (
+                    int(bank_arr[i])
+                    if bank_arr is not None and i < len(bank_arr)
+                    else 1
+                ),
+                "row": (
+                    round(float(pixel_r_arr[i]), 2)
+                    if pixel_r_arr is not None and i < len(pixel_r_arr)
+                    else 0.0
+                ),
+                "col": (
+                    round(float(pixel_c_arr[i]), 2)
+                    if pixel_c_arr is not None and i < len(pixel_c_arr)
+                    else 0.0
+                ),
+                "det_x": round(float(det_x[i]), 3),
+                "det_y": round(float(det_y[i]), 4),
+                "det_el": round(float(det_el[i]), 3),
+                "q_hat": [round(float(x), 5) for x in g_crystal[i]],
+                "stereographic": [
+                    round(float(sx[i]), 5),
+                    round(float(sy[i]), 5),
+                ],
+                "hemisphere": int(hemi[i]),
+                "intensity": (
+                    round(float(intensity_arr[i]), 2)
+                    if intensity_arr is not None and i < len(intensity_arr)
+                    else 100.0
+                ),
+                "sigma": (
+                    round(float(sigma_arr[i]), 2)
+                    if sigma_arr is not None and i < len(sigma_arr)
+                    else 3.0
+                ),
+                "wavelength": round(
+                    float(np.clip(lam_val, wl_min * 0.5, wl_max * 1.5)), 4
+                ),
+                "d_spacing": round(d_val, 4),
+                "harmonic_order": max(1, g_gcd),
+                "parallax_depth": round(parallax_depth, 4),
+                "hkl": [h_i, k_i, l_i],
+                "zone_ids": peak_zones[i],
+                "indexed": is_indexed,
+                "angular_error_deg": round(err_val, 4),
+            }
+        )
+
+    zones_payload: list[dict[str, Any]] = []
+    for zi, z in enumerate(raw_zones):
+        t_cryst = np.asarray(z["axis_crystal_xyz"], dtype=float)
+        t_lab = R_single @ t_cryst
+        conic_cryst = get_zone_conic_points(t_cryst, ki=ki_hat, n_arc=n_arc)
+        conic_lab = get_zone_conic_points(t_lab, ki=ki_hat, n_arc=n_arc)
+
+        det_segments: list[list[list[float]]] = []
+        det_segments_sph: list[list[list[float]]] = []
+        kf = conic_lab["kf_hat"]
+        if detectors:
+            for bk, det in sorted(detectors.items()):
+                try:
+                    mask, row, col = det.reflections_mask(
+                        kf[:, 0], kf[:, 1], kf[:, 2]
+                    )
+                    if not np.any(mask):
+                        continue
+                    idx_hits = np.where(mask)[0]
+                    splits = np.where(np.diff(idx_hits) > 2)[0] + 1
+                    for chunk in np.split(idx_hits, splits):
+                        if len(chunk) < 2:
+                            continue
+                        xyz_seg = det.pixel_to_lab(row[chunk], col[chunk])
+                        px, py = _unrolled(xyz_seg)
+                        _, pel = _spherical_angles(xyz_seg)
+                        if np.ptp(px) <= 90.0:
+                            step_s = max(1, len(px) // 32)
+                            det_segments.append(
+                                [
+                                    [
+                                        round(float(px[j]), 2),
+                                        round(float(py[j]), 4),
+                                    ]
+                                    for j in range(0, len(px), step_s)
+                                ]
+                            )
+                            det_segments_sph.append(
+                                [
+                                    [
+                                        round(float(px[j]), 2),
+                                        round(float(pel[j]), 3),
+                                    ]
+                                    for j in range(0, len(px), step_s)
+                                ]
+                            )
+                except Exception:
+                    pass
+
+        dx = np.asarray(conic_lab["det_x"], dtype=float)
+        dy = np.asarray(conic_lab["det_y"], dtype=float)
+        del_deg = np.asarray(conic_lab["det_el"], dtype=float)
+        if n_peaks > 0:
+            med_r_xz = float(np.median(np.hypot(pts[:, 0], pts[:, 2])))
+            if med_r_xz > 0.05:
+                dy = dy * med_r_xz
+
+        continuous_segments: list[list[list[float]]] = []
+        continuous_segments_sph: list[list[list[float]]] = []
+        cur_seg: list[list[float]] = []
+        cur_seg_sph: list[list[float]] = []
+        for k in range(0, len(dx), 2):
+            if cur_seg and abs(dx[k] - cur_seg[-1][0]) > 45.0:
+                if len(cur_seg) >= 2:
+                    continuous_segments.append(cur_seg)
+                    continuous_segments_sph.append(cur_seg_sph)
+                cur_seg = []
+                cur_seg_sph = []
+            cur_seg.append([round(float(dx[k]), 2), round(float(dy[k]), 4)])
+            cur_seg_sph.append(
+                [round(float(dx[k]), 2), round(float(del_deg[k]), 3)]
+            )
+        if len(cur_seg) >= 2:
+            continuous_segments.append(cur_seg)
+            continuous_segments_sph.append(cur_seg_sph)
+
+        if not detectors and not det_segments:
+            det_segments = continuous_segments
+            det_segments_sph = continuous_segments_sph
+
+        sx_z = np.asarray(conic_cryst["sx"], dtype=float)
+        sy_z = np.asarray(conic_cryst["sy"], dtype=float)
+        hm_z = np.asarray(conic_cryst["hemisphere"], dtype=int)
+        stereo_segments: list[list[list[float]]] = []
+        cur_s: list[list[float]] = []
+        for k in range(0, len(sx_z), 2):
+            if cur_s and (
+                hm_z[k] != cur_s[-1][2]
+                or np.hypot(sx_z[k] - cur_s[-1][0], sy_z[k] - cur_s[-1][1])
+                > 0.35
+            ):
+                if len(cur_s) >= 2:
+                    stereo_segments.append(cur_s)
+                cur_s = []
+            cur_s.append(
+                [
+                    round(float(sx_z[k]), 4),
+                    round(float(sy_z[k]), 4),
+                    int(hm_z[k]),
+                ]
+            )
+        if len(cur_s) >= 2:
+            stereo_segments.append(cur_s)
+
+        pole_sx, pole_sy, pole_hemi = stereographic_projection(t_cryst)
+
+        zones_payload.append(
+            {
+                "zone_id": int(z["zone_id"]),
+                "uvw": z["uvw"],
+                "order": int(z.get("order", max(abs(int(x)) for x in z["uvw"]))),
+                "label": z["label"],
+                "axis_xyz": z["axis_xyz"],
+                "axis_crystal_xyz": z["axis_crystal_xyz"],
+                "pole_stereo": [
+                    round(float(pole_sx), 4),
+                    round(float(pole_sy), 4),
+                    int(pole_hemi),
+                ],
+                "d_direct": z["d_direct"],
+                "score": z["score"],
+                "n_peaks": z["n_peaks"],
+                "angular_rms_deg": z["angular_rms_deg"],
+                "member_peak_ids": z["member_peak_ids"],
+                "rainbow_color": RAINBOW_SPECTRAL_HEX[
+                    zi % len(RAINBOW_SPECTRAL_HEX)
+                ],
+                "pro_color": PRO_PALETTE_HEX[zi % len(PRO_PALETTE_HEX)],
+                "stereo_segments": stereo_segments,
+                "detector_segments": det_segments,
+                "detector_segments_sph": det_segments_sph,
+                "continuous_segments": continuous_segments,
+                "continuous_segments_sph": continuous_segments_sph,
+            }
+        )
+
+    panels_payload, intensity_source = _encode_panel_textures(
+        detectors=detectors,
+        bank_arr=bank_arr,
+        pixel_r_arr=pixel_r_arr,
+        pixel_c_arr=pixel_c_arr,
+        intensity_arr=intensity_arr,
+        sigma_arr=sigma_arr,
+        images_h5=images_h5,
+        render_binning=render_binning,
+    )
+
+    ladder_steps = _build_lattice_ladder_steps(
+        zones_payload,
+        peaks_list,
+        cell=cell,
+        space_group=space_group,
+    )
+
+    pipeline_stages = _build_ndip_pipeline_stages(
+        peaks_list,
+        zones_payload,
+        instrument=str(instrument),
+        space_group=str(space_group),
+        cell=cell,
+    )
+
+    resolved_proj = (
+        str(projection).lower()
+        if projection in ("cylindrical", "spherical")
+        else default_projection_for_instrument(instrument)
+    )
+
+    return {
+        "instrument": str(instrument),
+        "default_projection": resolved_proj,
+        "space_group": str(space_group),
+        "intensity_source": intensity_source,
+        "wavelength_range": [round(wl_min, 3), round(wl_max, 3)],
+        "cell": [round(float(x), 4) for x in cell] if cell else None,
+        "ub_matrix": (
+            [[round(float(v), 6) for v in row] for row in ub_matrix]
+            if ub_matrix is not None
+            else None
+        ),
+        "peaks": peaks_list,
+        "zones": zones_payload,
+        "panels": panels_payload,
+        "ladder_steps": ladder_steps,
+        "pipeline_stages": pipeline_stages,
+    }
+
+
+def render_rainbow_html(
+    payload: dict[str, Any],
+    *,
+    default_mode: str = "arcade",
+    projection: str | None = None,
+    title: str = "SUBHKL // DIFFRACTION PARALLAX",
+) -> str:
+    """Render a unified, self-contained HTML5/Canvas/JS diffraction parallax widget."""
+    payload_json = json.dumps(payload, separators=(",", ":"))
+    inst = payload.get("instrument", "IMAGINE")
+    sg = payload.get("space_group", "P 1")
+    initial_proj = (
+        str(projection).lower()
+        if projection in ("cylindrical", "spherical")
+        else payload.get(
+            "default_projection", default_projection_for_instrument(inst)
+        )
+    )
+    src_badge = (
+        "RAW DETECTOR COUNTS"
+        if payload.get("intensity_source") == "raw_h5"
+        else "RECONSTRUCTED SPOT INTENSITY"
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>{title}</title>
+<style>
+  :root {{
+    --bg-primary: #070913;
+    --bg-panel: #0e1326;
+    --bg-card: #151c38;
+    --border-color: #293668;
+    --text-main: #f0f4ff;
+    --text-dim: #94a3b8;
+    --accent-gold: #fbbf24;
+    --accent-cyan: #22d3ee;
+    --accent-pink: #f43f5e;
+    --accent-green: #34d399;
+    --font-display: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
+    --font-body: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }}
+
+  * {{
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }}
+
+  body {{
+    background: var(--bg-primary);
+    color: var(--text-main);
+    font-family: var(--font-body);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    user-select: none;
+  }}
+
+  /* Top Header Bar */
+  .top-bar {{
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 16px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border-color);
+  }}
+
+  .brand-block {{
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }}
+
+  .rainbow-logo {{
+    font-family: var(--font-display);
+    font-weight: 800;
+    font-size: 1.1rem;
+    letter-spacing: 0.8px;
+    background: linear-gradient(90deg, #ff2a55, #ff8c1a, #ffe600, #1aff66, #00e5ff, #b833ff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }}
+
+  .subtitle-tag {{
+    font-size: 0.74rem;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    color: var(--accent-cyan);
+    font-family: var(--font-display);
+  }}
+
+  .hud-metrics {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }}
+
+  .hud-pill {{
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 4px 10px;
+    display: flex;
+    flex-direction: column;
+  }}
+
+  .hud-label {{
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    font-family: var(--font-display);
+  }}
+
+  .hud-value {{
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: var(--accent-gold);
+    font-family: var(--font-display);
+  }}
+
+  .controls-cluster {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }}
+
+  button {{
+    background: var(--bg-card);
+    color: var(--text-main);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 0.76rem;
+    font-family: var(--font-display);
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }}
+
+  button:hover {{
+    border-color: var(--accent-cyan);
+  }}
+
+  button.active-btn {{
+    background: linear-gradient(135deg, #e11d48, #d97706);
+    border-color: #fbbf24;
+    color: #fff;
+  }}
+
+  /* Main Workspace: Hero Unrolled Detector + Clean Right Inspector */
+  .workspace {{
+    display: grid;
+    grid-template-columns: 1fr 310px;
+    gap: 10px;
+    padding: 10px 14px;
+    flex: 1;
+    min-height: 0;
+  }}
+
+  .canvas-card {{
+    background: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }}
+
+  .card-header {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    background: var(--bg-card);
+    border-bottom: 1px solid var(--border-color);
+    font-size: 0.78rem;
+    font-family: var(--font-display);
+  }}
+
+  .card-header .hint {{
+    font-size: 0.7rem;
+    color: var(--text-dim);
+  }}
+
+  .canvas-wrap {{
+    position: relative;
+    flex: 1;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+  }}
+
+  canvas {{
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: grab;
+  }}
+
+  canvas:active {{
+    cursor: grabbing;
+  }}
+
+  /* Floating Stereogram Mini-HUD in Bottom-Left of Detector Canvas */
+  .stereo-inset {{
+    position: absolute;
+    bottom: 14px;
+    left: 14px;
+    width: 215px;
+    height: 215px;
+    background: rgba(10, 14, 28, 0.9);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    backdrop-filter: blur(6px);
+    transition: opacity 0.2s ease, transform 0.2s ease;
+  }}
+
+  .stereo-inset.hidden {{
+    opacity: 0;
+    pointer-events: none;
+    transform: scale(0.9);
+  }}
+
+  .stereo-inset-header {{
+    font-family: var(--font-display);
+    font-size: 0.66rem;
+    padding: 4px 8px;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text-dim);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }}
+
+  /* Layer Legend Overlay in Top-Left of Detector Canvas */
+  .layer-legend {{
+    position: absolute;
+    top: 12px;
+    left: 56px;
+    background: rgba(10, 14, 28, 0.84);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.72rem;
+    font-family: var(--font-display);
+    display: flex;
+    gap: 14px;
+    pointer-events: none;
+    backdrop-filter: blur(4px);
+  }}
+
+  .legend-item {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-main);
+  }}
+
+  .side-panel {{
+    background: var(--bg-panel);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px;
+    overflow-y: auto;
+  }}
+
+  .section-title {{
+    font-family: var(--font-display);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--accent-gold);
+    border-bottom: 1px solid var(--border-color);
+    padding-bottom: 4px;
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }}
+
+  .slider-group {{
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    background: var(--bg-card);
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border-color);
+  }}
+
+  .slider-row {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.73rem;
+  }}
+
+  input[type="range"] {{
+    width: 100%;
+    accent-color: var(--accent-cyan);
+    cursor: pointer;
+  }}
+
+  .zone-list {{
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 210px;
+    overflow-y: auto;
+  }}
+
+  .zone-item {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 5px 8px;
+    border-radius: 5px;
+    background: var(--bg-card);
+    border: 1px solid transparent;
+    cursor: pointer;
+    font-size: 0.75rem;
+  }}
+
+  .zone-item:hover {{
+    border-color: var(--accent-cyan);
+  }}
+
+  .zone-item.zone-active {{
+    border-color: var(--accent-gold);
+    background: rgba(251, 191, 36, 0.1);
+  }}
+
+  .zone-swatch {{
+    width: 11px;
+    height: 11px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 7px;
+  }}
+
+  .inspector-box {{
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 0.74rem;
+    line-height: 1.45;
+    font-family: var(--font-display);
+  }}
+
+  /* Coarse NDIP Workflow Pipeline + Fine Solve Lattice Ladder */
+  .ladder-bar {{
+    background: var(--bg-panel);
+    border-top: 1px solid var(--border-color);
+    padding: 6px 16px 8px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }}
+
+  .pipeline-row {{
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px dashed rgba(148, 163, 184, 0.22);
+  }}
+
+  .pipe-card {{
+    background: rgba(15, 23, 42, 0.85);
+    border: 1.5px solid var(--border-color);
+    border-radius: 6px;
+    padding: 5px 10px;
+    cursor: pointer;
+    transition: all 0.14s ease;
+    position: relative;
+  }}
+
+  .pipe-card:hover {{
+    border-color: var(--accent-cyan);
+  }}
+
+  .pipe-card.pipe-completed {{
+    border-color: rgba(52, 211, 153, 0.65);
+    background: linear-gradient(180deg, rgba(16, 185, 129, 0.12), rgba(15, 23, 42, 0.9));
+  }}
+
+  .pipe-card.pipe-active {{
+    border-color: var(--accent-cyan);
+    box-shadow: 0 0 10px rgba(34, 211, 238, 0.25);
+    background: linear-gradient(180deg, rgba(34, 211, 238, 0.18), rgba(15, 23, 42, 0.92));
+  }}
+
+  .pipe-top {{
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-family: var(--font-display);
+    font-size: 0.64rem;
+    color: var(--text-dim);
+  }}
+
+  .pipe-status-badge {{
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 0.6rem;
+    font-weight: 700;
+    text-transform: uppercase;
+  }}
+
+  .pipe-name {{
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 0.76rem;
+    color: var(--text-main);
+    margin: 1px 0;
+  }}
+
+  .pipe-sub {{
+    font-size: 0.65rem;
+    color: var(--text-dim);
+    font-family: var(--font-display);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+
+  .ladder-header {{
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }}
+
+  .ladder-title {{
+    font-family: var(--font-display);
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--accent-gold);
+  }}
+
+  .ladder-rungs {{
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 8px;
+  }}
+
+  .rung-card {{
+    background: var(--bg-card);
+    border: 1.5px solid var(--border-color);
+    border-radius: 6px;
+    padding: 6px 10px;
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }}
+
+  .rung-card:hover {{
+    border-color: var(--accent-cyan);
+  }}
+
+  .rung-card.rung-current {{
+    border-color: var(--accent-gold);
+    background: linear-gradient(180deg, rgba(251, 191, 36, 0.16), var(--bg-card));
+  }}
+
+  .rung-top {{
+    display: flex;
+    justify-content: space-between;
+    font-family: var(--font-display);
+    font-size: 0.68rem;
+    color: var(--accent-cyan);
+  }}
+
+  .rung-name {{
+    font-family: var(--font-display);
+    font-weight: 700;
+    font-size: 0.78rem;
+    margin: 2px 0;
+  }}
+
+  .rung-sub {{
+    font-size: 0.68rem;
+    color: var(--text-dim);
+  }}
+</style>
+</head>
+<body>
+
+  <!-- TOP BAR -->
+  <header class="top-bar">
+    <div class="brand-block">
+      <div class="rainbow-logo" id="app-title">🌈 SUBHKL // DIFFRACTION PARALLAX</div>
+      <span class="subtitle-tag">{inst} • {sg} • {src_badge}</span>
+    </div>
+
+    <div class="hud-metrics">
+      <div class="hud-pill">
+        <span class="hud-label">INDEXED PEAKS</span>
+        <span class="hud-value" id="val-indexed">0 / 0 (0%)</span>
+      </div>
+      <div class="hud-pill">
+        <span class="hud-label">ANGULAR Δθ RMS</span>
+        <span class="hud-value" id="val-rms">0.000°</span>
+      </div>
+      <div class="hud-pill">
+        <span class="hud-label">ACTIVE ZONES</span>
+        <span class="hud-value" id="val-zones">0 ACTIVE</span>
+      </div>
+      <div class="hud-pill">
+        <span class="hud-label">PROJECTION</span>
+        <span class="hud-value" id="val-proj">CYLINDRICAL</span>
+      </div>
+    </div>
+
+    <div class="controls-cluster">
+      <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
+        🥫 PROJ: CYLINDRICAL
+      </button>
+      <button id="btn-zone-order" class="active-btn" title="Cycle maximum Laue zone index order: |u,v,w| ≤ 1 (fundamental) → ≤ 2 → ≤ 3 (higher-order)">
+        📐 ZONES: |u,v,w| ≤ 1
+      </button>
+      <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
+        〰️ ZONE ARCS: ON
+      </button>
+      <button id="btn-heatmap-cmap" title="Cycle Detector Intensity Heatmap Colormap (Magma / Cyan Glow / Film)">
+        🔥 DETECTOR: MAGMA
+      </button>
+      <button id="btn-stereo-toggle" class="active-btn" title="Show/Hide 3D Crystal Stereogram Inset">
+        🌐 STEREOGRAM HUD
+      </button>
+      <button id="btn-reset-view" title="Reset Zoom, Pan, and Parallax">
+        ⟲ RESET VIEW
+      </button>
+    </div>
+  </header>
+
+  <!-- MAIN WORKSPACE -->
+  <main class="workspace">
+    <!-- Hero View: Unrolled Detector with Grounded Pixel Intensity + Parallax Layers -->
+    <section class="canvas-card">
+      <div class="card-header">
+        <span id="detector-header-title">🎯 DETECTOR ASSEMBLY — LOG(INTENSITY) + PARALLAX BRAGG RINGS</span>
+        <span class="hint">Move mouse to peek behind predicted rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="canvas-detector"></canvas>
+
+        <!-- Clear 3-Layer Depth Legend -->
+        <div class="layer-legend">
+          <div class="legend-item">
+            <span style="display:inline-block;width:10px;height:10px;background:#f97316;border-radius:2px;"></span>
+            <span>Back Layer: Detector Pixel Counts</span>
+          </div>
+          <div class="legend-item">
+            <span style="display:inline-block;width:14px;height:3px;background:#00e5ff;border-radius:2px;"></span>
+            <span>Mid Layer: Single-Arc Zone Conics [uvw]</span>
+          </div>
+          <div class="legend-item">
+            <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
+            <span>Front Layer: Predicted Bragg Rings (parallax peeks behind spots)</span>
+          </div>
+        </div>
+
+        <!-- Optional Corner Stereogram Inset -->
+        <div class="stereo-inset" id="stereo-inset">
+          <div class="stereo-inset-header">
+            <span>S² CRYSTAL WULFF NET</span>
+            <span id="stereo-hint">Ĝ DIRECTIONS</span>
+          </div>
+          <canvas id="canvas-stereo"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Right Sidebar: Grounded Controls & Inspector -->
+    <aside class="side-panel">
+      <div>
+        <div class="section-title">
+          <span>🎛️ Detector &amp; Parallax Controls</span>
+          <span id="wl-readout">λ: 1.8–4.5 Å</span>
+        </div>
+        <div class="slider-group">
+          <div class="slider-row">
+            <span>Detector Image Contrast</span>
+            <span id="lbl-det-alpha">85%</span>
+          </div>
+          <input type="range" id="slider-det-alpha" min="0.0" max="1.0" step="0.05" value="0.85" />
+
+          <div class="slider-row">
+            <span>Depth Parallax ("Peek Behind")</span>
+            <span id="lbl-parallax">1.00×</span>
+          </div>
+          <input type="range" id="slider-parallax" min="0.0" max="2.5" step="0.05" value="1.00" />
+
+          <div class="slider-row">
+            <span>Wavelength Band λ [Å]</span>
+            <span id="lbl-lam-band">1.80–4.50</span>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <input type="range" id="slider-lam-min" min="0.5" max="6.0" step="0.05" value="1.80" title="Min Wavelength" />
+            <input type="range" id="slider-lam-max" min="1.0" max="10.0" step="0.05" value="4.50" title="Max Wavelength" />
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="section-title">
+          <span>🧬 Laue Zone Arcs [uvw]</span>
+          <div style="display:flex;gap:4px;">
+            <button id="btn-order-1" class="active-btn" style="padding:2px 6px;font-size:0.65rem;" title="Fundamental zones |u|,|v|,|w| ≤ 1">≤1</button>
+            <button id="btn-order-2" style="padding:2px 6px;font-size:0.65rem;" title="Include 2nd-order zones |u|,|v|,|w| ≤ 2">≤2</button>
+            <button id="btn-order-3" style="padding:2px 6px;font-size:0.65rem;" title="Include higher-order zones |u|,|v|,|w| ≤ 3">≤3</button>
+            <button id="btn-zones-all" style="padding:2px 6px;font-size:0.65rem;" title="Enable all zones in current order">ALL</button>
+            <button id="btn-zones-none" style="padding:2px 6px;font-size:0.65rem;" title="Hide all zone arcs">NONE</button>
+          </div>
+        </div>
+        <div class="zone-list" id="zone-list"></div>
+      </div>
+
+      <div>
+        <div class="section-title">
+          <span>🔍 Spot &amp; Lattice Inspector</span>
+          <span id="combo-badge" style="color:var(--accent-cyan);">HOVER SPOT</span>
+        </div>
+        <div class="inspector-box" id="inspector-box">
+          Move your mouse across the detector to shift the floating Bragg rings aside and look directly at the raw detector counts underneath each predicted reflection.
+        </div>
+      </div>
+
+      <div>
+        <div class="section-title">
+          <span>📊 Angular Residual Δθ</span>
+          <span id="cell-summary" style="font-size:0.66rem;color:var(--text-dim);"></span>
+        </div>
+        <canvas id="canvas-hist" style="width:100%;height:68px;background:var(--bg-card);border-radius:6px;border:1px solid var(--border-color);"></canvas>
+      </div>
+    </aside>
+  </main>
+
+  <!-- BOTTOM COARSE NDIP PIPELINE + FINE SOLVE LATTICE LADDER -->
+  <footer class="ladder-bar">
+    <div class="ladder-header">
+      <div class="ladder-title" id="pipeline-desc" style="color:var(--accent-cyan);">
+        ⚙️ NDIP WORKFLOW PIPELINE: Coarse Reduce → Solve → Predict &amp; Integrate → Merge sequence (backed by ghcr.io/neutrons/subhkl)
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;">
+        <button id="btn-pipeline-run" class="active-btn" title="Walk through the 4 NDIP workflow stages and light up Steps 1–5 during Solve">
+          ▶ RUN NDIP PIPELINE
+        </button>
+      </div>
+    </div>
+    <div class="pipeline-row" id="pipeline-stages"></div>
+
+    <div class="ladder-header" style="margin-top:2px;">
+      <div class="ladder-title" id="ladder-desc">
+        🪜 SOLVE LATTICE LADDER (STEPS 1–5): How subhkl locks the 3D crystal orientation during Stage 2 (SOLVE)
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;">
+        <button id="btn-ladder-prev">◀ PREV STEP</button>
+        <button id="btn-ladder-play">▶ WALK SOLVE STEPS</button>
+        <button id="btn-ladder-next">NEXT STEP ▶</button>
+      </div>
+    </div>
+    <div class="ladder-rungs" id="ladder-rungs"></div>
+  </footer>
+
+<script>
+window.RAINBOW_ZONES_DATA = {payload_json};
+
+(function() {{
+  const DATA = window.RAINBOW_ZONES_DATA || {{ peaks: [], zones: [], panels: [], ladder_steps: [], pipeline_stages: [] }};
+  const PEAKS = DATA.peaks || [];
+  const ZONES = DATA.zones || [];
+  const PANELS = DATA.panels || [];
+  const LADDER = DATA.ladder_steps || [];
+  const PIPELINE = DATA.pipeline_stages || [];
+
+  const wlRange = DATA.wavelength_range || [1.8, 4.5];
+  const order1ZoneIds = ZONES.filter(z => (z.order || 1) <= 1).map(z => z.zone_id);
+  const initialZoneIds = order1ZoneIds.length > 0
+    ? order1ZoneIds
+    : ZONES.slice(0, Math.min(6, ZONES.length)).map(z => z.zone_id);
+
+  const state = {{
+    projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
+    maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
+    showZoneArcs: true,           // single vibrant arc per zone (not multi-band rainbow)
+    heatmapStyle: "magma",        // "magma" | "cyan" | "gray"
+    detAlpha: 0.85,
+    showStereo: true,
+    lamMin: wlRange[0],
+    lamMax: wlRange[1],
+    zoneTolDeg: 0.75,
+    parallaxStrength: 1.0,
+    activeZones: new Set(initialZoneIds),
+    selectedZoneId: null,
+    hoveredPeakId: null,
+    selectedPeakId: null,
+    currentPipelineIdx: 1,        // 0: Reduce, 1: Solve, 2: Integrate, 3: Merge
+    currentRungIdx: Math.max(0, LADDER.length - 1),
+    ladderTimer: null,
+    parallaxX: 0.0,
+    parallaxY: 0.0,
+    targetParallaxX: 0.0,
+    targetParallaxY: 0.0,
+    detZoom: 1.0,
+    detPanX: 0.0,
+    detPanY: 0.0,
+  }};
+
+  // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
+  const bankCanvases = new Map();
+
+  function colorizeGrayscaleImage(img, style) {{
+    const c = document.createElement("canvas");
+    c.width = img.width || 64;
+    c.height = img.height || 64;
+    const ctx = c.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    const imgData = ctx.getImageData(0, 0, c.width, c.height);
+    const d = imgData.data;
+
+    for (let i = 0; i < d.length; i += 4) {{
+      const v = d[i] / 255.0;
+      const t = Math.pow(Math.max(0, (v - 0.06) / 0.94), 0.85);
+      if (style === "magma") {{
+        d[i]     = Math.min(255, Math.round(12 + 255 * Math.pow(t, 0.75)));
+        d[i + 1] = Math.min(255, Math.round(14 + 220 * Math.pow(t, 1.65)));
+        d[i + 2] = Math.min(255, Math.round(36 + 180 * Math.sin(t * Math.PI * 0.85) + 120 * Math.pow(t, 3.0)));
+        d[i + 3] = Math.round(255 * Math.min(1.0, 0.25 + t * 0.95));
+      }} else if (style === "cyan") {{
+        d[i]     = Math.min(255, Math.round(8 + 245 * Math.pow(t, 2.2)));
+        d[i + 1] = Math.min(255, Math.round(20 + 235 * Math.pow(t, 0.95)));
+        d[i + 2] = Math.min(255, Math.round(45 + 210 * Math.pow(t, 0.65)));
+        d[i + 3] = Math.round(255 * Math.min(1.0, 0.25 + t * 0.95));
+      }} else {{
+        const g = Math.round(18 + 237 * t);
+        d[i] = g; d[i + 1] = g; d[i + 2] = g;
+        d[i + 3] = Math.round(255 * Math.min(1.0, 0.25 + t * 0.95));
+      }}
+    }}
+    ctx.putImageData(imgData, 0, 0);
+    return c;
+  }}
+
+  const rawBankImages = new Map();
+  function decodeAllBankTextures() {{
+    PANELS.forEach(p => {{
+      if (!p.texture_b64) return;
+      const img = new Image();
+      img.onload = () => {{
+        rawBankImages.set(p.bank, img);
+        bankCanvases.set(p.bank, colorizeGrayscaleImage(img, state.heatmapStyle));
+      }};
+      img.src = "data:image/png;base64," + p.texture_b64;
+    }});
+  }}
+
+  function rebuildBankColorMaps() {{
+    rawBankImages.forEach((img, bank) => {{
+      bankCanvases.set(bank, colorizeGrayscaleImage(img, state.heatmapStyle));
+    }});
+  }}
+
+  decodeAllBankTextures();
+
+  // Initialize sliders
+  const slDetAlpha = document.getElementById("slider-det-alpha");
+  const slParallax = document.getElementById("slider-parallax");
+  const slLamMin = document.getElementById("slider-lam-min");
+  const slLamMax = document.getElementById("slider-lam-max");
+
+  slLamMin.min = Math.max(0.2, (wlRange[0] * 0.5)).toFixed(2);
+  slLamMin.max = (wlRange[1] * 1.2).toFixed(2);
+  slLamMin.value = wlRange[0].toFixed(2);
+
+  slLamMax.min = Math.max(0.3, (wlRange[0] * 0.6)).toFixed(2);
+  slLamMax.max = (wlRange[1] * 1.5).toFixed(2);
+  slLamMax.value = wlRange[1].toFixed(2);
+
+  function updateWavelengthLabels() {{
+    document.getElementById("lbl-lam-band").textContent =
+      `${{state.lamMin.toFixed(2)}}–${{state.lamMax.toFixed(2)}}`;
+    document.getElementById("wl-readout").textContent =
+      `λ: ${{state.lamMin.toFixed(1)}}–${{state.lamMax.toFixed(1)}} Å`;
+  }}
+  updateWavelengthLabels();
+
+  if (DATA.cell && DATA.cell.length === 6) {{
+    const c = DATA.cell;
+    document.getElementById("cell-summary").textContent =
+      `${{c[0].toFixed(1)}}, ${{c[1].toFixed(1)}}, ${{c[2].toFixed(1)}} Å`;
+  }}
+
+  // Vibrant spectral color preset for wavelength / zone highlights
+  function wavelengthToColor(lam, alpha = 1.0) {{
+    const t = Math.max(0, Math.min(1, (lam - state.lamMin) / Math.max(0.05, state.lamMax - state.lamMin)));
+    const hue = (1.0 - t) * 265;
+    return `hsla(${{hue.toFixed(1)}}, 95%, 60%, ${{alpha}})`;
+  }}
+
+  function syncProjectionUI() {{
+    const isSph = state.projection === "spherical";
+    const btn = document.getElementById("btn-proj-toggle");
+    btn.textContent = isSph ? "🌐 PROJ: SPHERICAL (MANDI)" : "🥫 PROJ: CYLINDRICAL (CG4D)";
+    document.getElementById("val-proj").textContent = isSph ? "SPHERICAL (φ, ψ)" : "CYLINDRICAL (φ, Y)";
+    document.getElementById("detector-header-title").textContent = isSph
+      ? "🎯 SPHERICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs ELEVATION ψ [deg])"
+      : "🎯 CYLINDRICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs LAB HEIGHT Y [m])";
+  }}
+  syncProjectionUI();
+
+  function setMaxZoneOrder(ordLevel) {{
+    state.maxZoneOrder = ordLevel;
+    const matching = ZONES.filter(z => (z.order || 1) <= ordLevel).map(z => z.zone_id);
+    state.activeZones = new Set(matching);
+    const btnTop = document.getElementById("btn-zone-order");
+    if (btnTop) btnTop.textContent = `📐 ZONES: |u,v,w| ≤ ${{ordLevel}}`;
+    [1, 2, 3].forEach(k => {{
+      const b = document.getElementById(`btn-order-${{k}}`);
+      if (b) b.classList.toggle("active-btn", k === ordLevel);
+    }});
+    renderZoneList();
+    updateHUD();
+  }}
+
+  function renderZoneList() {{
+    const container = document.getElementById("zone-list");
+    container.innerHTML = "";
+    const filtered = ZONES.filter(z => (z.order || 1) <= state.maxZoneOrder);
+    filtered.forEach(z => {{
+      const item = document.createElement("div");
+      const isAct = state.activeZones.has(z.zone_id);
+      item.className = "zone-item" + (isAct ? " zone-active" : "");
+      const color = z.rainbow_color;
+      const ordTag = `ord ${{z.order || 1}}`;
+      item.innerHTML = `
+        <div style="display:flex;align-items:center;">
+          <span class="zone-swatch" style="background:${{color}};"></span>
+          <strong style="font-family:var(--font-display);">${{z.label}}</strong>
+          <span style="margin-left:6px;font-size:0.62rem;color:var(--text-dim);font-family:var(--font-display);">(${{ordTag}})</span>
+        </div>
+        <span style="color:var(--text-dim);font-family:var(--font-display);font-size:0.7rem;">
+          ${{z.n_peaks}} spots • ${{z.angular_rms_deg.toFixed(2)}}°
+        </span>
+      `;
+      item.addEventListener("click", (ev) => {{
+        if (ev.shiftKey) {{
+          state.activeZones = new Set([z.zone_id]);
+        }} else {{
+          if (state.activeZones.has(z.zone_id)) state.activeZones.delete(z.zone_id);
+          else state.activeZones.add(z.zone_id);
+        }}
+        state.selectedZoneId = z.zone_id;
+        updateZoneInspector(z);
+        renderZoneList();
+        updateHUD();
+      }});
+      container.appendChild(item);
+    }});
+  }}
+
+  function renderPipeline() {{
+    const container = document.getElementById("pipeline-stages");
+    if (!container) return;
+    container.innerHTML = "";
+    PIPELINE.forEach((st, idx) => {{
+      const isAct = idx === state.currentPipelineIdx;
+      const isDone = idx < state.currentPipelineIdx;
+      const card = document.createElement("div");
+      card.className = "pipe-card" + (isAct ? " pipe-active" : (isDone ? " pipe-completed" : ""));
+      const badgeColor = isAct ? "#22d3ee" : (isDone ? "#34d399" : "#64748b");
+      const badgeText = isAct ? "ACTIVE" : (isDone ? "DONE" : "READY");
+      const toolsStr = (st.tool_ids || []).join(" + ");
+      card.innerHTML = `
+        <div class="pipe-top">
+          <span>${{toolsStr}}</span>
+          <span class="pipe-status-badge" style="color:${{badgeColor}};border:1px solid ${{badgeColor}};">${{badgeText}}</span>
+        </div>
+        <div class="pipe-name">${{st.name}}</div>
+        <div class="pipe-sub" title="${{st.artifact}}">${{st.artifact}}</div>
+      `;
+      card.addEventListener("click", () => selectPipelineStage(idx));
+      container.appendChild(card);
+    }});
+  }}
+
+  function selectPipelineStage(pIdx, syncLadder = true) {{
+    if (pIdx < 0 || pIdx >= PIPELINE.length) return;
+    state.currentPipelineIdx = pIdx;
+    const st = PIPELINE[pIdx];
+    const pipeDesc = document.getElementById("pipeline-desc");
+    if (pipeDesc) {{
+      pipeDesc.textContent = `⚙️ NDIP STAGE ${{st.step_num}}: ${{st.summary}}`;
+    }}
+    document.getElementById("combo-badge").textContent = `NDIP STAGE ${{st.step_num}}`;
+    document.getElementById("inspector-box").innerHTML = `
+      <div><strong style="color:var(--accent-cyan);">${{st.name}}</strong></div>
+      <div>NDIP Tools: <code>${{(st.tool_ids || []).join(", ")}}</code></div>
+      <div>Container: <code>${{st.container || "ghcr.io/neutrons/subhkl:1.4.0"}}</code></div>
+      <div>Artifact: <strong style="color:var(--accent-gold);">${{st.artifact}}</strong></div>
+    `;
+    if (syncLadder && typeof st.ladder_rung_idx === "number") {{
+      selectLadderRung(st.ladder_rung_idx, false);
+    }}
+    renderPipeline();
+  }}
+
+  function renderLadder() {{
+    const container = document.getElementById("ladder-rungs");
+    container.innerHTML = "";
+    LADDER.forEach((step, idx) => {{
+      const card = document.createElement("div");
+      card.className = "rung-card" + (idx === state.currentRungIdx ? " rung-current" : "");
+      card.innerHTML = `
+        <div class="rung-top">
+          <span>STEP ${{step.rung}}</span>
+          <span>${{step.n_captured}} SPOTS</span>
+        </div>
+        <div class="rung-name">${{step.stage}}</div>
+        <div class="rung-sub">${{step.subtitle}}</div>
+      `;
+      card.addEventListener("click", () => selectLadderRung(idx));
+      container.appendChild(card);
+    }});
+  }}
+
+  function selectLadderRung(idx, setSolveStage = true) {{
+    if (idx < 0 || idx >= LADDER.length) return;
+    state.currentRungIdx = idx;
+    if (setSolveStage && PIPELINE.length >= 2) {{
+      state.currentPipelineIdx = idx === 0 ? 0 : 1;
+      renderPipeline();
+    }}
+    const step = LADDER[idx];
+    if (idx === 0) {{
+      state.activeZones = new Set();
+    }} else if (step.active_zones && step.active_zones.length > 0) {{
+      state.activeZones = new Set(step.active_zones);
+    }}
+    document.getElementById("ladder-desc").textContent =
+      `🪜 STEP ${{step.rung}}: ${{step.description}}`;
+    document.getElementById("inspector-box").innerHTML = `
+      <strong style="color:var(--accent-gold);">${{step.stage}}</strong><br/>
+      <span>${{step.description}}</span>
+    `;
+    renderZoneList();
+    renderLadder();
+    updateHUD();
+  }}
+
+  function updatePeakInspector(p) {{
+    if (!p) return;
+    const zLabels = (p.zone_ids || [])
+      .map(id => ZONES.find(z => z.zone_id === id))
+      .filter(Boolean)
+      .map(z => z.label)
+      .join(", ") || "None";
+    const elVal = typeof p.det_el === "number" ? p.det_el : 0.0;
+    document.getElementById("combo-badge").textContent = `BANK ${{p.bank}} • PEAK #${{p.id}}`;
+    document.getElementById("inspector-box").innerHTML = `
+      <div><strong>Reflection (hkl): <span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong> (Harmonic n=${{p.harmonic_order}})</div>
+      <div>Bank <strong>#${{p.bank}}</strong> (r=${{p.row}}, c=${{p.col}}): φ=${{p.det_x.toFixed(1)}}°, Y=${{p.det_y.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}°</div>
+      <div>Wavelength λ = <strong>${{p.wavelength.toFixed(3)}} Å</strong> • d = <strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I = <strong>${{Math.round(p.intensity)}}</strong></div>
+      <div>Zone Families: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ = ${{p.angular_error_deg.toFixed(3)}}°)</div>
+    `;
+  }}
+
+  function updateZoneInspector(z) {{
+    if (!z) return;
+    document.getElementById("combo-badge").textContent = `ZONE ${{z.label}}`;
+    document.getElementById("inspector-box").innerHTML = `
+      <div><strong style="color:var(--accent-gold);">Crystal Zone Family ${{z.label}}</strong></div>
+      <div>Captures <strong>${{z.n_peaks}}</strong> observed detector spots (RMS Δθ = ${{z.angular_rms_deg.toFixed(3)}}°)</div>
+      <div>Real-Space Zone Repeat |t_uvw| = <strong>${{z.d_direct.toFixed(2)}} Å</strong></div>
+      <div style="color:var(--text-dim);font-size:0.7rem;">Every highlighted spot in this family satisfies G · ${{z.label}} = 0.</div>
+    `;
+  }}
+
+  function isPeakVisible(p) {{
+    return p.wavelength >= state.lamMin && p.wavelength <= state.lamMax;
+  }}
+
+  function isPeakCapturedByActiveZone(p) {{
+    if (!p.zone_ids || p.zone_ids.length === 0) return false;
+    for (let i = 0; i < p.zone_ids.length; i++) {{
+      if (state.activeZones.has(p.zone_ids[i])) return true;
+    }}
+    return false;
+  }}
+
+  function updateHUD() {{
+    const visiblePeaks = PEAKS.filter(isPeakVisible);
+    const capturedPeaks = visiblePeaks.filter(p => p.indexed && isPeakCapturedByActiveZone(p));
+    const nVis = visiblePeaks.length;
+    const nCap = capturedPeaks.length;
+    const pct = nVis > 0 ? ((nCap / nVis) * 100).toFixed(1) : "0.0";
+
+    document.getElementById("val-indexed").textContent = `${{nCap}} / ${{nVis}} (${{pct}}%)`;
+    const rms = nCap > 0
+      ? Math.sqrt(capturedPeaks.reduce((s, p) => s + p.angular_error_deg * p.angular_error_deg, 0) / nCap)
+      : 0.0;
+    document.getElementById("val-rms").textContent = `${{rms.toFixed(3)}}°`;
+    const elZones = document.getElementById("val-zones");
+    if (elZones) elZones.textContent = `${{state.activeZones.size}} (≤${{state.maxZoneOrder}})`;
+    drawHistogram(visiblePeaks);
+  }}
+
+  const histCanvas = document.getElementById("canvas-hist");
+  function drawHistogram(visiblePeaks) {{
+    const rect = histCanvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    histCanvas.width = Math.max(100, rect.width * dpr);
+    histCanvas.height = Math.max(45, rect.height * dpr);
+    const ctx = histCanvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    const w = rect.width;
+    const h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const nBins = 20;
+    const maxDeg = 1.5;
+    const bins = new Array(nBins).fill(0);
+    visiblePeaks.forEach(p => {{
+      const b = Math.min(nBins - 1, Math.floor((p.angular_error_deg / maxDeg) * nBins));
+      if (b >= 0) bins[b]++;
+    }});
+    const maxCount = Math.max(1, ...bins);
+    const barW = (w - 16) / nBins;
+
+    for (let i = 0; i < nBins; i++) {{
+      const bh = ((bins[i] / maxCount) * (h - 20));
+      const x = 8 + i * barW;
+      const y = h - 14 - bh;
+      const degCenter = ((i + 0.5) / nBins) * maxDeg;
+      ctx.fillStyle = degCenter <= state.zoneTolDeg ? "#34d399" : "#64748b";
+      ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+    }}
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "10px monospace";
+    ctx.fillText("0.0°", 6, h - 3);
+    ctx.fillText("Δθ error", w * 0.42, h - 3);
+    ctx.fillText("1.5°", w - 28, h - 3);
+  }}
+
+  // Compute detector coordinate bounds for both Cylindrical (y [m]) and Spherical (elevation [deg])
+  const detCanvas = document.getElementById("canvas-detector");
+  const stereoCanvas = document.getElementById("canvas-stereo");
+
+  const cylBounds = {{ minX: -180, maxX: 180, minY: -0.42, maxY: 0.42 }};
+  const sphBounds = {{ minX: -180, maxX: 180, minY: -75.0, maxY: 75.0 }};
+
+  if (PANELS.length > 0) {{
+    const allY = [];
+    const allEl = [];
+    PANELS.forEach(p => {{
+      allY.push(p.y_min, p.y_max);
+      if (typeof p.el_min === "number") allEl.push(p.el_min, p.el_max);
+    }});
+    PEAKS.forEach(p => {{
+      allY.push(p.det_y);
+      if (typeof p.det_el === "number") allEl.push(p.det_el);
+    }});
+    const maxAbsY = Math.max(0.28, ...allY.map(v => Math.abs(v))) * 1.15;
+    cylBounds.minY = -maxAbsY;
+    cylBounds.maxY = maxAbsY;
+    if (allEl.length > 0) {{
+      const maxAbsEl = Math.min(88.0, Math.max(45.0, ...allEl.map(v => Math.abs(v))) * 1.12);
+      sphBounds.minY = -maxAbsEl;
+      sphBounds.maxY = maxAbsEl;
+    }}
+  }} else if (PEAKS.length > 0) {{
+    const maxAbsY = Math.max(0.28, ...PEAKS.map(p => Math.abs(p.det_y))) * 1.25;
+    cylBounds.minY = -maxAbsY;
+    cylBounds.maxY = maxAbsY;
+    const allEl = PEAKS.map(p => Math.abs(typeof p.det_el === "number" ? p.det_el : 30.0));
+    const maxAbsEl = Math.min(88.0, Math.max(45.0, ...allEl) * 1.18);
+    sphBounds.minY = -maxAbsEl;
+    sphBounds.maxY = maxAbsEl;
+  }}
+
+  function getActiveBounds() {{
+    return state.projection === "spherical" ? sphBounds : cylBounds;
+  }}
+
+  function getPeakVert(p) {{
+    if (state.projection === "spherical") {{
+      return typeof p.det_el === "number" ? p.det_el : 0.0;
+    }}
+    return p.det_y;
+  }}
+
+  function getPanelVertRange(panel) {{
+    if (state.projection === "spherical" && typeof panel.el_min === "number") {{
+      return [panel.el_min, panel.el_max];
+    }}
+    return [panel.y_min, panel.y_max];
+  }}
+
+  // Physical Parallax Transform:
+  // layerOffset = -0.35 (Back: Detector Intensity Panels)
+  // layerOffset = +0.25..+0.90 (Front: Predicted Bragg Rings floating by d-spacing)
+  function detToScreen(dx, dy, w, h, layerOffset = 0.0) {{
+    const bounds = getActiveBounds();
+    const padL = 52, padR = 20, padT = 36, padB = 28;
+    const plotW = Math.max(50, w - padL - padR);
+    const plotH = Math.max(50, h - padT - padB);
+    const u = (dx - bounds.minX) / (bounds.maxX - bounds.minX);
+    const v = (dy - bounds.minY) / (bounds.maxY - bounds.minY);
+    const x0 = padL + u * plotW;
+    const y0 = padT + (1.0 - v) * plotH;
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const shiftX = state.parallaxX * state.parallaxStrength * layerOffset * 18.0;
+    const shiftY = state.parallaxY * state.parallaxStrength * layerOffset * 12.0;
+    return [
+      cx + (x0 - cx) * state.detZoom + state.detPanX + shiftX,
+      cy + (y0 - cy) * state.detZoom + state.detPanY + shiftY,
+    ];
+  }}
+
+  function drawSingleZoneArc(ctx, pts, zone, isContinuousGap = false) {{
+    if (!pts || pts.length < 2) return;
+    const isSelected = state.selectedZoneId === zone.zone_id;
+    const zOrder = zone.order || 1;
+    ctx.save();
+    ctx.beginPath();
+    pts.forEach((p, idx) => {{
+      if (idx === 0) ctx.moveTo(p[0], p[1]);
+      else ctx.lineTo(p[0], p[1]);
+    }});
+    ctx.strokeStyle = zone.rainbow_color;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    if (isContinuousGap) {{
+      ctx.lineWidth = 1.0;
+      ctx.globalAlpha = 0.22;
+      ctx.setLineDash([4, 4]);
+    }} else {{
+      const baseW = zOrder === 1 ? 2.2 : (zOrder === 2 ? 1.6 : 1.25);
+      ctx.lineWidth = isSelected ? baseW + 1.2 : baseW;
+      ctx.globalAlpha = isSelected ? 0.96 : (zOrder === 1 ? 0.84 : (zOrder === 2 ? 0.68 : 0.54));
+    }}
+    ctx.stroke();
+    ctx.restore();
+  }}
+
+  function renderDetectorCanvas() {{
+    const rect = detCanvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    detCanvas.width = Math.max(200, rect.width * dpr);
+    detCanvas.height = Math.max(200, rect.height * dpr);
+    const ctx = detCanvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    const w = rect.width;
+    const h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const bounds = getActiveBounds();
+    const isSph = state.projection === "spherical";
+
+    // 1. Coordinate Grid (Azimuth deg vs Height [m] or Elevation [deg])
+    ctx.save();
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.12)";
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "10px monospace";
+    for (let az = -180; az <= 180; az += 45) {{
+      const [gx, gy0] = detToScreen(az, bounds.minY, w, h, -0.35);
+      const [, gy1] = detToScreen(az, bounds.maxY, w, h, -0.35);
+      ctx.beginPath();
+      ctx.moveTo(gx, gy0);
+      ctx.lineTo(gx, gy1);
+      ctx.stroke();
+      ctx.fillText(`${{az}}°`, gx - 12, h - 8);
+    }}
+    const yStep = Number(((bounds.maxY - bounds.minY) / 4).toFixed(isSph ? 0 : 2)) || (isSph ? 30 : 0.15);
+    for (let yv = bounds.minY; yv <= bounds.maxY + 1e-4; yv += yStep) {{
+      const [gx0, gy] = detToScreen(bounds.minX, yv, w, h, -0.35);
+      const [gx1] = detToScreen(bounds.maxX, yv, w, h, -0.35);
+      ctx.beginPath();
+      ctx.moveTo(gx0, gy);
+      ctx.lineTo(gx1, gy);
+      ctx.stroke();
+      const lbl = isSph ? `${{yv.toFixed(0)}}°` : `${{yv.toFixed(2)}}m`;
+      ctx.fillText(lbl, 4, gy + 3);
+    }}
+    ctx.restore();
+
+    // 2. LAYER 0 (BACK): Detector Bank Pixel Intensity Heatmaps + Panel Outlines
+    ctx.save();
+    PANELS.forEach(panel => {{
+      const [vMin, vMax] = getPanelVertRange(panel);
+      const [x0, y0] = detToScreen(panel.az_min, vMax, w, h, -0.35);
+      const [x1, y1] = detToScreen(panel.az_max, vMin, w, h, -0.35);
+      const pw = x1 - x0;
+      const ph = y1 - y0;
+
+      const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
+
+      ctx.save();
+      if (outlinePts && outlinePts.length >= 4) {{
+        ctx.beginPath();
+        outlinePts.forEach((pt, idx) => {{
+          const [ox, oy] = detToScreen(pt[0], pt[1], w, h, -0.35);
+          if (idx === 0) ctx.moveTo(ox, oy);
+          else ctx.lineTo(ox, oy);
+        }});
+        ctx.closePath();
+        ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+        ctx.fill();
+        ctx.clip();
+      }} else {{
+        ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+        ctx.fillRect(x0, y0, pw, ph);
+      }}
+
+      const texCanvas = bankCanvases.get(panel.bank);
+      if (texCanvas && state.detAlpha > 0.01) {{
+        ctx.globalAlpha = state.detAlpha;
+        ctx.imageSmoothingEnabled = true;
+        ctx.drawImage(texCanvas, x0, y0, pw, ph);
+      }}
+      ctx.restore();
+
+      // True panel polygon border (shows curved elevation edges in Spherical MANDI view)
+      ctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
+      ctx.lineWidth = texCanvas ? 1.1 : 0.7;
+      if (outlinePts && outlinePts.length >= 4) {{
+        ctx.beginPath();
+        outlinePts.forEach((pt, idx) => {{
+          const [ox, oy] = detToScreen(pt[0], pt[1], w, h, -0.35);
+          if (idx === 0) ctx.moveTo(ox, oy);
+          else ctx.lineTo(ox, oy);
+        }});
+        ctx.closePath();
+        ctx.stroke();
+      }} else {{
+        ctx.strokeRect(x0, y0, pw, ph);
+      }}
+
+      if (pw > 26 && ph > 18) {{
+        ctx.fillStyle = "rgba(148, 163, 184, 0.48)";
+        ctx.font = "9px monospace";
+        ctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 10);
+      }}
+    }});
+    ctx.restore();
+
+    // 3. LAYER 1 (MID): Single-Arc Laue Zone Conics [uvw] clipped to detector panels
+    if (state.showZoneArcs) {{
+      const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
+      ZONES.forEach(zone => {{
+        if (!state.activeZones.has(zone.zone_id)) return;
+        const contSegs = isSph
+          ? (zone.continuous_segments_sph || [])
+          : (zone.continuous_segments || []);
+        const panelSegs = isSph
+          ? (hasPanels ? (zone.detector_segments_sph || []) : (zone.detector_segments_sph || contSegs))
+          : (hasPanels ? (zone.detector_segments || []) : (zone.detector_segments || contSegs));
+        panelSegs.forEach((seg, sIdx) => {{
+          const screenPts = seg.map(pt => detToScreen(pt[0], pt[1], w, h, 0.0));
+          drawSingleZoneArc(ctx, screenPts, zone, false);
+          if (sIdx === 0 && screenPts.length > 2) {{
+            const mid = screenPts[Math.floor(screenPts.length * 0.5)];
+            ctx.save();
+            ctx.font = "bold 10px monospace";
+            ctx.fillStyle = "#070913";
+            ctx.fillText(zone.label, mid[0] + 6, mid[1] - 4);
+            ctx.fillStyle = zone.rainbow_color;
+            ctx.fillText(zone.label, mid[0] + 5, mid[1] - 5);
+            ctx.restore();
+          }}
+        }});
+      }});
+    }}
+
+    // 4. FOREGROUND LAYER: Predicted Bragg Rings floating by d-spacing
+    // Moving the mouse shifts these rings relative to the back detector plate so you can look "behind" them!
+    const visiblePeaks = PEAKS.filter(isPeakVisible)
+      .slice()
+      .sort((a, b) => b.parallax_depth - a.parallax_depth);
+
+    visiblePeaks.forEach(p => {{
+      const py = getPeakVert(p);
+      const fgLayer = 0.25 + (1.0 - p.parallax_depth) * 0.65;
+      const [x, y] = detToScreen(p.det_x, py, w, h, fgLayer);
+      const [bx, by] = detToScreen(p.det_x, py, w, h, -0.35);
+
+      const captured = isPeakCapturedByActiveZone(p);
+      const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
+      if (!captured && !isHovered && state.activeZones.size === 0) {{
+        // Step 1 (Raw Detector Counts): don't clutter raw spots unless hovered
+        return;
+      }}
+
+      const baseR = captured ? 5.4 : 3.2;
+      const r = isHovered ? baseR + 3.2 : baseR;
+
+      ctx.save();
+      // Subtle depth tether connecting the floating Bragg ring to its physical spot on the detector panel
+      if (Math.hypot(x - bx, y - by) > 2.0 && (captured || isHovered)) {{
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.lineTo(x, y);
+        ctx.strokeStyle = "rgba(251, 191, 36, 0.35)";
+        ctx.lineWidth = 1.0;
+        ctx.stroke();
+      }}
+
+      // Open vibrant spectral ring around the spot
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.strokeStyle = isHovered
+        ? "#fbbf24"
+        : wavelengthToColor(p.wavelength, captured ? 0.95 : 0.35);
+      ctx.lineWidth = isHovered ? 2.6 : (captured ? 2.1 : 1.1);
+      ctx.stroke();
+
+      if (state.detAlpha < 0.2) {{
+        ctx.fillStyle = wavelengthToColor(p.wavelength, 0.85);
+        ctx.fill();
+      }}
+
+      if (isHovered) {{
+        const tag = `(${{p.hkl.join(",")}}) λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å`;
+        ctx.font = "bold 11px monospace";
+        const tw = ctx.measureText(tag).width + 10;
+        ctx.fillStyle = "rgba(11, 15, 23, 0.92)";
+        ctx.fillRect(x + 8, y - 20, tw, 18);
+        ctx.strokeStyle = "#fbbf24";
+        ctx.lineWidth = 1.0;
+        ctx.strokeRect(x + 8, y - 20, tw, 18);
+        ctx.fillStyle = "#fbbf24";
+        ctx.fillText(tag, x + 13, y - 7);
+      }}
+      ctx.restore();
+    }});
+  }}
+
+  // Render Corner Stereographic Wulff Net Inset
+  function renderStereoInset() {{
+    if (!state.showStereo) return;
+    const rect = stereoCanvas.getBoundingClientRect();
+    if (rect.width < 20 || rect.height < 20) return;
+    const dpr = window.devicePixelRatio || 1;
+    stereoCanvas.width = rect.width * dpr;
+    stereoCanvas.height = rect.height * dpr;
+    const ctx = stereoCanvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    const w = rect.width;
+    const h = rect.height;
+    ctx.clearRect(0, 0, w, h);
+
+    const cx = w * 0.5;
+    const cy = h * 0.5;
+    const R = Math.min(w, h) * 0.43;
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(7, 9, 19, 0.92)";
+    ctx.fill();
+    ctx.strokeStyle = "#334155";
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+    ctx.clip();
+
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
+    ctx.lineWidth = 1.0;
+    ctx.beginPath();
+    ctx.arc(cx, cy, R * Math.tan(Math.PI / 8), 0, Math.PI * 2);
+    ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
+    ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R);
+    ctx.stroke();
+
+    if (state.showZoneArcs) {{
+      ZONES.forEach(zone => {{
+        if (!state.activeZones.has(zone.zone_id)) return;
+        ctx.strokeStyle = zone.rainbow_color;
+        ctx.lineWidth = state.selectedZoneId === zone.zone_id ? 2.0 : 1.2;
+        ctx.globalAlpha = 0.72;
+        (zone.stereo_segments || []).forEach(seg => {{
+          ctx.beginPath();
+          seg.forEach((pt, idx) => {{
+            const sx = cx + pt[0] * R;
+            const sy = cy - pt[1] * R;
+            if (idx === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }});
+          ctx.stroke();
+        }});
+      }});
+    }}
+
+    PEAKS.filter(isPeakVisible).forEach(p => {{
+      const sx = cx + p.stereographic[0] * R;
+      const sy = cy - p.stereographic[1] * R;
+      const captured = isPeakCapturedByActiveZone(p);
+      const isHovered = state.hoveredPeakId === p.id;
+      ctx.beginPath();
+      ctx.arc(sx, sy, isHovered ? 4.5 : (captured ? 2.6 : 1.8), 0, Math.PI * 2);
+      ctx.fillStyle = isHovered ? "#fbbf24" : wavelengthToColor(p.wavelength, captured ? 0.95 : 0.35);
+      ctx.fill();
+    }});
+    ctx.restore();
+  }}
+
+  function findNearestPeakDetector(mx, my) {{
+    const rect = detCanvas.getBoundingClientRect();
+    let best = null;
+    let bestDist = 14.0;
+    PEAKS.forEach(p => {{
+      if (!isPeakVisible(p)) return;
+      const py = getPeakVert(p);
+      const fgLayer = 0.25 + (1.0 - p.parallax_depth) * 0.65;
+      const [x, y] = detToScreen(p.det_x, py, rect.width, rect.height, fgLayer);
+      const [bx, by] = detToScreen(p.det_x, py, rect.width, rect.height, -0.35);
+      const d = Math.min(Math.hypot(mx - x, my - y), Math.hypot(mx - bx, my - by));
+      if (d < bestDist) {{
+        bestDist = d;
+        best = p;
+      }}
+    }});
+    return best;
+  }}
+
+  // Mouse & Wheel interactions on Detector Canvas
+  let isPanningDet = false;
+  let panStart = [0, 0];
+  detCanvas.addEventListener("mousedown", (ev) => {{
+    isPanningDet = true;
+    panStart = [ev.clientX - state.detPanX, ev.clientY - state.detPanY];
+  }});
+  window.addEventListener("mouseup", () => {{ isPanningDet = false; }});
+
+  detCanvas.addEventListener("mousemove", (ev) => {{
+    const rect = detCanvas.getBoundingClientRect();
+    const mx = ev.clientX - rect.left;
+    const my = ev.clientY - rect.top;
+    state.targetParallaxX = ((mx / rect.width) - 0.5) * 2.0;
+    state.targetParallaxY = ((my / rect.height) - 0.5) * 2.0;
+
+    if (isPanningDet) {{
+      state.detPanX = ev.clientX - panStart[0];
+      state.detPanY = ev.clientY - panStart[1];
+      return;
+    }}
+    const hit = findNearestPeakDetector(mx, my);
+    state.hoveredPeakId = hit ? hit.id : null;
+    if (hit) updatePeakInspector(hit);
+  }});
+
+  detCanvas.addEventListener("mouseleave", () => {{
+    state.targetParallaxX = 0.0;
+    state.targetParallaxY = 0.0;
+  }});
+
+  detCanvas.addEventListener("wheel", (ev) => {{
+    ev.preventDefault();
+    const factor = ev.deltaY < 0 ? 1.14 : 0.88;
+    state.detZoom = Math.max(0.7, Math.min(10.0, state.detZoom * factor));
+  }}, {{ passive: false }});
+
+  detCanvas.addEventListener("click", (ev) => {{
+    const rect = detCanvas.getBoundingClientRect();
+    const hit = findNearestPeakDetector(ev.clientX - rect.left, ev.clientY - rect.top);
+    if (hit) {{
+      state.selectedPeakId = hit.id;
+      updatePeakInspector(hit);
+    }}
+  }});
+
+  // Controls bindings
+  slDetAlpha.addEventListener("input", () => {{
+    state.detAlpha = parseFloat(slDetAlpha.value);
+    document.getElementById("lbl-det-alpha").textContent = Math.round(state.detAlpha * 100) + "%";
+  }});
+
+  slParallax.addEventListener("input", () => {{
+    state.parallaxStrength = parseFloat(slParallax.value);
+    document.getElementById("lbl-parallax").textContent = state.parallaxStrength.toFixed(2) + "×";
+  }});
+
+  slLamMin.addEventListener("input", () => {{
+    state.lamMin = Math.min(parseFloat(slLamMin.value), state.lamMax - 0.05);
+    slLamMin.value = state.lamMin;
+    updateWavelengthLabels();
+    updateHUD();
+  }});
+
+  slLamMax.addEventListener("input", () => {{
+    state.lamMax = Math.max(parseFloat(slLamMax.value), state.lamMin + 0.05);
+    slLamMax.value = state.lamMax;
+    updateWavelengthLabels();
+    updateHUD();
+  }});
+
+  document.getElementById("btn-proj-toggle").addEventListener("click", () => {{
+    state.projection = state.projection === "cylindrical" ? "spherical" : "cylindrical";
+    syncProjectionUI();
+  }});
+
+  document.getElementById("btn-zone-order").addEventListener("click", () => {{
+    const nextOrder = state.maxZoneOrder >= 3 ? 1 : state.maxZoneOrder + 1;
+    setMaxZoneOrder(nextOrder);
+  }});
+
+  [1, 2, 3].forEach(ordLevel => {{
+    const b = document.getElementById(`btn-order-${{ordLevel}}`);
+    if (b) b.addEventListener("click", () => setMaxZoneOrder(ordLevel));
+  }});
+
+  document.getElementById("btn-zone-arcs").addEventListener("click", (ev) => {{
+    state.showZoneArcs = !state.showZoneArcs;
+    ev.currentTarget.classList.toggle("active-btn", state.showZoneArcs);
+    ev.currentTarget.textContent = state.showZoneArcs
+      ? "〰️ ZONE ARCS: ON"
+      : "〰️ ZONE ARCS: OFF";
+  }});
+
+  document.getElementById("btn-heatmap-cmap").addEventListener("click", (ev) => {{
+    const order = ["magma", "cyan", "gray"];
+    const labels = {{ magma: "🔥 DETECTOR: MAGMA", cyan: "💎 DETECTOR: CYAN", gray: "🎞️ DETECTOR: FILM" }};
+    state.heatmapStyle = order[(order.indexOf(state.heatmapStyle) + 1) % order.length];
+    ev.currentTarget.textContent = labels[state.heatmapStyle];
+    rebuildBankColorMaps();
+  }});
+
+  document.getElementById("btn-stereo-toggle").addEventListener("click", (ev) => {{
+    state.showStereo = !state.showStereo;
+    ev.currentTarget.classList.toggle("active-btn", state.showStereo);
+    document.getElementById("stereo-inset").classList.toggle("hidden", !state.showStereo);
+  }});
+
+  document.getElementById("btn-reset-view").addEventListener("click", () => {{
+    state.detZoom = 1.0;
+    state.detPanX = 0.0;
+    state.detPanY = 0.0;
+    setMaxZoneOrder(1);
+  }});
+
+  document.getElementById("btn-zones-all").addEventListener("click", () => {{
+    state.activeZones = new Set(
+      ZONES.filter(z => (z.order || 1) <= state.maxZoneOrder).map(z => z.zone_id)
+    );
+    renderZoneList();
+    updateHUD();
+  }});
+
+  document.getElementById("btn-zones-none").addEventListener("click", () => {{
+    state.activeZones = new Set();
+    renderZoneList();
+    updateHUD();
+  }});
+
+  document.getElementById("btn-ladder-prev").addEventListener("click", () => {{
+    selectLadderRung((state.currentRungIdx - 1 + LADDER.length) % LADDER.length);
+  }});
+
+  document.getElementById("btn-ladder-next").addEventListener("click", () => {{
+    selectLadderRung((state.currentRungIdx + 1) % LADDER.length);
+  }});
+
+  document.getElementById("btn-ladder-play").addEventListener("click", (ev) => {{
+    if (state.ladderTimer) {{
+      clearInterval(state.ladderTimer);
+      state.ladderTimer = null;
+      ev.currentTarget.textContent = "▶ WALK SOLVE STEPS";
+      return;
+    }}
+    selectPipelineStage(1, false);
+    selectLadderRung(0, false);
+    ev.currentTarget.textContent = "⏹ STOP";
+    state.ladderTimer = setInterval(() => {{
+      if (state.currentRungIdx + 1 < LADDER.length) {{
+        selectLadderRung(state.currentRungIdx + 1, false);
+      }} else {{
+        clearInterval(state.ladderTimer);
+        state.ladderTimer = null;
+        document.getElementById("btn-ladder-play").textContent = "▶ WALK SOLVE STEPS";
+      }}
+    }}, 1800);
+  }});
+
+  const btnPipeRun = document.getElementById("btn-pipeline-run");
+  if (btnPipeRun) {{
+    btnPipeRun.addEventListener("click", (ev) => {{
+      if (state.ladderTimer) {{
+        clearInterval(state.ladderTimer);
+        state.ladderTimer = null;
+        ev.currentTarget.textContent = "▶ RUN NDIP PIPELINE";
+        return;
+      }}
+      // Sequence: Stage 0 (Reduce, Rung 0) -> Stage 1 (Solve, Rungs 1..4) -> Stage 2 (Integrate) -> Stage 3 (Merge)
+      const seq = [
+        {{ p: 0, r: 0 }},
+        {{ p: 1, r: 1 }},
+        {{ p: 1, r: 2 }},
+        {{ p: 1, r: 3 }},
+        {{ p: 1, r: 4 }},
+        {{ p: 2, r: 4 }},
+        {{ p: 3, r: 4 }},
+      ];
+      let stepPtr = 0;
+      ev.currentTarget.textContent = "⏹ STOP PIPELINE";
+      const applyStep = (item) => {{
+        selectPipelineStage(item.p, false);
+        selectLadderRung(item.r, false);
+      }};
+      applyStep(seq[0]);
+      state.ladderTimer = setInterval(() => {{
+        stepPtr += 1;
+        if (stepPtr < seq.length) {{
+          applyStep(seq[stepPtr]);
+        }} else {{
+          clearInterval(state.ladderTimer);
+          state.ladderTimer = null;
+          ev.currentTarget.textContent = "▶ RUN NDIP PIPELINE";
+        }}
+      }}, 1600);
+    }});
+  }}
+
+  function animate() {{
+    state.parallaxX += (state.targetParallaxX - state.parallaxX) * 0.14;
+    state.parallaxY += (state.targetParallaxY - state.parallaxY) * 0.14;
+    renderDetectorCanvas();
+    renderStereoInset();
+    requestAnimationFrame(animate);
+  }}
+
+  renderZoneList();
+  renderPipeline();
+  renderLadder();
+  updateHUD();
+  requestAnimationFrame(animate);
+}})();
+</script>
+</body>
+</html>
+"""
+    return html
+
+
+def export_rainbow_widget(
+    payload_or_h5: dict[str, Any] | str | os.PathLike,
+    output_html: str | os.PathLike,
+    *,
+    images_h5: str | os.PathLike | None = None,
+    projection: str | None = None,
+    default_mode: str = "arcade",
+    title: str = "SUBHKL // DIFFRACTION PARALLAX",
+    **payload_kwargs: Any,
+) -> str:
+    """Export a standalone HTML5/Canvas diffraction parallax interactive widget."""
+    if isinstance(payload_or_h5, (str, os.PathLike, Path)):
+        payload = build_rainbow_zone_payload(
+            replay_h5=payload_or_h5,
+            images_h5=images_h5,
+            projection=projection,
+            **payload_kwargs,
+        )
+    elif isinstance(payload_or_h5, dict):
+        payload = payload_or_h5
+    else:
+        raise TypeError("payload_or_h5 must be a dict or path to an HDF5 file")
+
+    html = render_rainbow_html(
+        payload,
+        default_mode=default_mode,
+        projection=projection,
+        title=title,
+    )
+    out_path = os.path.abspath(os.fspath(output_html))
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    return out_path

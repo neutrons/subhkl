@@ -1,0 +1,41 @@
+<tool id="imaginex_subhkl_rainbow_zones" name="IMAGINE-X subhkl Rainbow Zones Visualizer" profile="22.05" version="0.1.0-dev" python_template_version="3.5">
+  <requirements>
+    <container type="docker">ghcr.io/neutrons/subhkl:1.4.0</container>
+  </requirements>
+  <command detect_errors="exit_code"><![CDATA[
+    mkdir -p out ;
+    mv "$peaks_h5" "$peaks_h5.element_identifier" ;
+
+    python -m subhkl.io.parser rainbow-visualize "$peaks_h5.element_identifier"
+      --output-html out/rainbow_zones.html
+      --mode $default_mode
+      --max-zone-index $max_zone_index
+      --zone-tolerance-deg $zone_tolerance_deg
+    #if $instrument != "AUTO":
+      --instrument $instrument
+    #end if
+  ]]></command>
+  <inputs>
+    <param format="h5" name="peaks_h5" type="data" label="Indexed or Found Peaks HDF5 (indexer.h5 / solve.h5 / finder.h5)" />
+    <param name="default_mode" type="select" value="arcade" label="Default Visual Mode">
+      <option value="arcade" selected="true">Rainbow Arcade Mode (1987 Taito Rainbow Islands + 80s Parallax)</option>
+      <option value="pro">Pro View Mode (Beamline Diagnostics)</option>
+    </param>
+    <param name="instrument" type="select" value="AUTO" label="Instrument Override">
+      <option value="AUTO" selected="true">Auto-detect from HDF5</option>
+      <option value="CG4D">IMAGINE-X (CG4D)</option>
+      <option value="IMAGINE">IMAGINE</option>
+      <option value="MANDI">MANDI</option>
+    </param>
+    <param name="max_zone_index" type="integer" value="2" min="1" max="4" label="Max Zone Axis Miller Index |u|,|v|,|w|" />
+    <param name="zone_tolerance_deg" type="float" value="0.75" min="0.05" max="3.0" label="Zone Capture Angular Tolerance (deg)" />
+  </inputs>
+  <outputs>
+    <data format="html" name="rainbow_html" label="Rainbow Zones Interactive Report on ${on_string}" from_work_dir="out/rainbow_zones.html" />
+  </outputs>
+  <help><![CDATA[
+    Generates the interactive **Rainbow Zones** Laue zone diagnostic report (featuring synchronized
+    Stereographic Wulff Net + Unrolled Detector Conics, Lattice Ladder rung progression, 80s resolution
+    parallax, and one-click toggle between *Rainbow Arcade Mode* and *Pro View*).
+  ]]></help>
+</tool>

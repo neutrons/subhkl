@@ -4592,6 +4592,7 @@ def run_indexer_visualize(
     image_index: int | None = None,
     images_filename: str | None = None,
     zone_alpha: float = 0.5,
+    rainbow_html: str | None = None,
 ):
     """Draw low-index Laue zone conics over the measured peaks, per run.
 
@@ -4607,6 +4608,18 @@ def run_indexer_visualize(
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
     from subhkl.viz import zones
+
+    if rainbow_html is not None:
+        from subhkl.viz.rainbow_zones import export_rainbow_widget
+
+        out_html = export_rainbow_widget(
+            peaks_filename,
+            rainbow_html,
+            images_h5=images_filename,
+            max_zone_index=max(1, int(max_index)),
+            **({"instrument": instrument} if instrument else {}),
+        )
+        print(f"wrote {out_html}")
 
     with h5py.File(peaks_filename, "r") as fp:
         is_solve = "solve" in fp or "scan_refinement" in fp or "peaks/pixel_r" not in fp

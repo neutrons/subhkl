@@ -1607,6 +1607,13 @@ def indexer_visualize(
             "agreement it is drawn to show.",
         ),
     ] = 0.5,
+    rainbow_html: Annotated[
+        str | None,
+        typer.Option(
+            "--rainbow-html",
+            help="Export interactive HTML5/Canvas Rainbow Zones diagnostic widget (Arcade + Pro View)",
+        ),
+    ] = None,
 ):
     """
     Draw the low-index Laue zone conics over the measured peaks.
@@ -1626,7 +1633,115 @@ def indexer_visualize(
         image_index=image_index,
         images_filename=images,
         zone_alpha=zone_alpha,
+        rainbow_html=rainbow_html,
     )
+
+
+@app.command("rainbow-visualize")
+def rainbow_visualize(
+    peaks_filename: Annotated[
+        str,
+        typer.Argument(
+            help="Indexer, spherical-index, solve, or finder output HDF5"
+        ),
+    ],
+    output_html: Annotated[
+        str,
+        typer.Option(
+            "--output-html",
+            "-o",
+            help="Destination path for standalone interactive HTML widget",
+        ),
+    ] = "rainbow_zones.html",
+    images: Annotated[
+        str | None,
+        typer.Option(
+            "--images",
+            help="Optional merged images HDF5 (*.im.h5) to render raw detector counts on the panels",
+        ),
+    ] = None,
+    projection: Annotated[
+        str | None,
+        typer.Option(
+            "--projection",
+            help="Detector projection: 'cylindrical' (CG4D default), 'spherical' (MANDI default), or auto from instrument",
+        ),
+    ] = None,
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help="Initial UI mode: 'arcade' (Rainbow Islands / 80s parallax) or 'pro' (Pro View)",
+        ),
+    ] = "arcade",
+    instrument: Annotated[
+        str | None,
+        typer.Option("--instrument", help="Override instrument name from HDF5"),
+    ] = None,
+    max_zone_index: Annotated[
+        int,
+        typer.Option(
+            "--max-zone-index",
+            min=1,
+            help="Generate primitive zones [uvw] with |u|,|v|,|w| <= max-zone-index",
+        ),
+    ] = 3,
+    zone_tolerance_deg: Annotated[
+        float,
+        typer.Option(
+            "--zone-tolerance-deg",
+            min=0.05,
+            help="Angular half-width [deg] for assigning reflections to a Laue zone",
+        ),
+    ] = 0.75,
+    serve: Annotated[
+        bool,
+        typer.Option(
+            "--serve",
+            help="Start live HTTP / Trame server (for NDIP Galaxy / NOVA interactive tools)",
+        ),
+    ] = False,
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Bind address when --serve is enabled"),
+    ] = "0.0.0.0",
+    port: Annotated[
+        int,
+        typer.Option("--port", help="Bind port when --serve is enabled"),
+    ] = 8080,
+):
+    """Export or serve the interactive 'Rainbow Zones' Laue zone GUI (Arcade + Pro View)."""
+    from subhkl.viz.rainbow_zones import export_rainbow_widget
+
+    extra = {"instrument": instrument} if instrument else {}
+    if serve:
+        from subhkl.viz.nova_rainbow_view import serve_rainbow_zones
+
+        serve_rainbow_zones(
+            replay_h5=peaks_filename,
+            images_h5=images,
+            projection=projection,
+            host=host,
+            port=port,
+            default_mode=mode,
+            max_zone_index=max_zone_index,
+            zone_tolerance_deg=zone_tolerance_deg,
+            **extra,
+        )
+        return None
+
+    out = export_rainbow_widget(
+        peaks_filename,
+        output_html,
+        images_h5=images,
+        projection=projection,
+        default_mode=mode,
+        max_zone_index=max_zone_index,
+        zone_tolerance_deg=zone_tolerance_deg,
+        **extra,
+    )
+    print(f"wrote {out}")
+    return out
 
 
 if __name__ == "__main__":
