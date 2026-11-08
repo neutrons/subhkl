@@ -181,7 +181,9 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert "btn-zone-arcs" in content
     assert "showZoneArcs: true" in content
     assert "drawSingleZoneArc" in content
-    assert "NDIP WORKFLOW PIPELINE" in content
+    assert "pipeline-stages" in content
+    assert "parseH5BuffersInBrowser" in content
+    assert "btn-new-tab" in content
     assert "LATTICE LADDER" in content
 
     # Extract embedded JSON and validate it parses cleanly

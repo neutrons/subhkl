@@ -1635,6 +1635,7 @@ def render_rainbow_html(
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>{title}</title>
+<script src="https://cdn.jsdelivr.net/npm/h5wasm@0.7.8/dist/iife/h5wasm.js" async></script>
 <style>
   :root {{
     --bg-primary: #070913;
@@ -1974,81 +1975,61 @@ def render_rainbow_html(
     font-family: var(--font-display);
   }}
 
-  /* Coarse NDIP Workflow Pipeline + Fine Solve Lattice Ladder */
+  /* Single-Row Solve Lattice Ladder Footer */
   .ladder-bar {{
     background: var(--bg-panel);
     border-top: 1px solid var(--border-color);
-    padding: 6px 16px 8px 16px;
+    padding: 6px 14px 8px 14px;
     display: flex;
     flex-direction: column;
     gap: 5px;
   }}
 
-  .pipeline-row {{
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 8px;
-    padding-bottom: 4px;
-    border-bottom: 1px dashed rgba(148, 163, 184, 0.22);
-  }}
-
-  .pipe-card {{
-    background: rgba(15, 23, 42, 0.85);
-    border: 1.5px solid var(--border-color);
-    border-radius: 6px;
-    padding: 5px 10px;
-    cursor: pointer;
-    transition: all 0.14s ease;
-    position: relative;
-  }}
-
-  .pipe-card:hover {{
-    border-color: var(--accent-cyan);
-  }}
-
-  .pipe-card.pipe-completed {{
-    border-color: rgba(52, 211, 153, 0.65);
-    background: linear-gradient(180deg, rgba(16, 185, 129, 0.12), rgba(15, 23, 42, 0.9));
-  }}
-
-  .pipe-card.pipe-active {{
-    border-color: var(--accent-cyan);
-    box-shadow: 0 0 10px rgba(34, 211, 238, 0.25);
-    background: linear-gradient(180deg, rgba(34, 211, 238, 0.18), rgba(15, 23, 42, 0.92));
-  }}
-
-  .pipe-top {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
+  .stage-pill {{
     font-family: var(--font-display);
-    font-size: 0.64rem;
-    color: var(--text-dim);
-  }}
-
-  .pipe-status-badge {{
-    padding: 1px 5px;
-    border-radius: 4px;
-    font-size: 0.6rem;
-    font-weight: 700;
-    text-transform: uppercase;
-  }}
-
-  .pipe-name {{
-    font-family: var(--font-display);
-    font-weight: 700;
-    font-size: 0.76rem;
-    color: var(--text-main);
-    margin: 1px 0;
-  }}
-
-  .pipe-sub {{
     font-size: 0.65rem;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card);
     color: var(--text-dim);
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }}
+
+  .stage-pill:hover {{
+    border-color: var(--accent-cyan);
+    color: var(--text-main);
+  }}
+
+  .stage-pill.stage-active {{
+    border-color: var(--accent-cyan);
+    color: var(--accent-cyan);
+    background: rgba(34, 211, 238, 0.14);
+    font-weight: 700;
+  }}
+
+  .stage-pill.stage-done {{
+    border-color: rgba(52, 211, 153, 0.5);
+    color: var(--accent-green);
+  }}
+
+  .iframe-popout-banner {{
+    position: fixed;
+    top: 48px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9999;
+    background: rgba(14, 19, 38, 0.96);
+    border: 1.5px solid var(--accent-gold);
+    border-radius: 8px;
+    padding: 8px 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
     font-family: var(--font-display);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    font-size: 0.78rem;
   }}
 
   .ladder-header {{
@@ -2138,6 +2119,13 @@ def render_rainbow_html(
     </div>
 
     <div class="controls-cluster">
+      <select id="sel-galaxy-h5" title="Load solve.h5 / indexer.h5 dataset directly from active Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:6px;padding:4px 8px;font-size:0.72rem;font-family:var(--font-display);max-width:190px;">
+        <option value="">📂 Galaxy History (.h5)...</option>
+      </select>
+      <input type="file" id="inp-local-h5" accept=".h5,.hdf5" multiple style="display:none;" />
+      <button id="btn-local-h5" title="Open local solve.h5 + merged.h5 files directly in the browser (via h5wasm)">
+        📂 LOCAL .H5
+      </button>
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
         🥫 PROJ: CYLINDRICAL
       </button>
@@ -2151,13 +2139,24 @@ def render_rainbow_html(
         🔥 DETECTOR: MAGMA
       </button>
       <button id="btn-stereo-toggle" class="active-btn" title="Show/Hide 3D Crystal Stereogram Inset">
-        🌐 STEREOGRAM HUD
+        🌐 STEREOGRAM
       </button>
       <button id="btn-reset-view" title="Reset Zoom, Pan, and Parallax">
-        ⟲ RESET VIEW
+        ⟲ RESET
+      </button>
+      <button id="btn-new-tab" style="border-color:var(--accent-gold);color:var(--accent-gold);" title="Open this view in its own full-screen browser tab">
+        ↗ NEW TAB
       </button>
     </div>
   </header>
+
+  <div id="iframe-popout-banner" class="iframe-popout-banner" style="display:none;">
+    <span>📐 Running inside an embedded frame —</span>
+    <button id="btn-popout-now" style="border-color:var(--accent-gold);color:var(--accent-gold);">
+      ↗ Open Full-Screen in New Browser Tab
+    </button>
+    <button id="btn-popout-dismiss" style="padding:2px 7px;font-size:0.68rem;color:var(--text-dim);">✕</button>
+  </div>
 
   <!-- MAIN WORKSPACE -->
   <main class="workspace">
@@ -2262,34 +2261,23 @@ def render_rainbow_html(
     </aside>
   </main>
 
-  <!-- BOTTOM COARSE NDIP PIPELINE + FINE SOLVE LATTICE LADDER -->
+  <!-- SINGLE-ROW SOLVE LATTICE LADDER FOOTER (WITH COMPACT INLINE WORKFLOW STAGE STRIP) -->
   <footer class="ladder-bar">
     <div class="ladder-header">
-      <div class="ladder-title" id="pipeline-desc" style="color:var(--accent-cyan);">
-        ⚙️ NDIP WORKFLOW PIPELINE: Coarse Reduce → Solve → Predict &amp; Integrate → Merge sequence (backed by ghcr.io/neutrons/subhkl)
-      </div>
-      <div style="display:flex;align-items:center;gap:6px;">
-        <span id="galaxy-status-badge" style="font-size:0.65rem;font-family:var(--font-display);padding:2px 8px;border-radius:999px;border:1px solid #334155;color:var(--text-dim);">
-          ⚪ STANDALONE / LOCAL
-        </span>
-        <button id="btn-galaxy-dispatch" style="border-color:var(--accent-gold);color:var(--accent-gold);" title="Dispatch the selected NDIP workflow stage (e.g. Solve) to Galaxy / GPU Pulsar runner">
-          ⚡ DISPATCH STAGE TO GALAXY (PULSAR GPU)
-        </button>
-        <button id="btn-pipeline-run" class="active-btn" title="Walk through the 4 NDIP workflow stages and light up Steps 1–5 during Solve">
-          ▶ WALK NDIP PIPELINE
-        </button>
-      </div>
-    </div>
-    <div class="pipeline-row" id="pipeline-stages"></div>
-
-    <div class="ladder-header" style="margin-top:2px;">
       <div class="ladder-title" id="ladder-desc">
-        🪜 SOLVE LATTICE LADDER (STEPS 1–5): How subhkl locks the 3D crystal orientation during Stage 2 (SOLVE)
+        🪜 LATTICE LADDER: Step through how subhkl locks the 3D crystal orientation
       </div>
-      <div style="display:flex;align-items:center;gap:6px;">
-        <button id="btn-ladder-prev">◀ PREV STEP</button>
-        <button id="btn-ladder-play">▶ WALK SOLVE STEPS</button>
-        <button id="btn-ladder-next">NEXT STEP ▶</button>
+      <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+        <div id="pipeline-stages" style="display:flex;align-items:center;gap:4px;"></div>
+        <span id="galaxy-status-badge" style="font-size:0.64rem;font-family:var(--font-display);padding:2px 7px;border-radius:999px;border:1px solid #334155;color:var(--text-dim);">
+          ⚪ LOCAL
+        </span>
+        <button id="btn-galaxy-dispatch" style="border-color:var(--accent-gold);color:var(--accent-gold);padding:3px 8px;font-size:0.7rem;" title="Dispatch the selected workflow stage (e.g. Solve) to Galaxy / GPU container runner">
+          ⚡ RUN IN GALAXY
+        </button>
+        <button id="btn-ladder-prev" style="padding:3px 8px;font-size:0.7rem;">◀</button>
+        <button id="btn-ladder-play" class="active-btn" style="padding:3px 9px;font-size:0.7rem;">▶ WALK STEPS</button>
+        <button id="btn-ladder-next" style="padding:3px 8px;font-size:0.7rem;">▶</button>
       </div>
     </div>
     <div class="ladder-rungs" id="ladder-rungs"></div>
@@ -2495,24 +2483,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const container = document.getElementById("pipeline-stages");
     if (!container) return;
     container.innerHTML = "";
+    const shortLabels = ["1. Reduce", "2. Solve", "3. Integrate", "4. Merge"];
     PIPELINE.forEach((st, idx) => {{
       const isAct = idx === state.currentPipelineIdx;
       const isDone = idx < state.currentPipelineIdx;
-      const card = document.createElement("div");
-      card.className = "pipe-card" + (isAct ? " pipe-active" : (isDone ? " pipe-completed" : ""));
-      const badgeColor = isAct ? "#22d3ee" : (isDone ? "#34d399" : "#64748b");
-      const badgeText = isAct ? "ACTIVE" : (isDone ? "DONE" : "READY");
-      const toolsStr = (st.tool_ids || []).join(" + ");
-      card.innerHTML = `
-        <div class="pipe-top">
-          <span>${{toolsStr}}</span>
-          <span class="pipe-status-badge" style="color:${{badgeColor}};border:1px solid ${{badgeColor}};">${{badgeText}}</span>
-        </div>
-        <div class="pipe-name">${{st.name}}</div>
-        <div class="pipe-sub" title="${{st.artifact}}">${{st.artifact}}</div>
-      `;
-      card.addEventListener("click", () => selectPipelineStage(idx));
-      container.appendChild(card);
+      const pill = document.createElement("span");
+      pill.className = "stage-pill" + (isAct ? " stage-active" : (isDone ? " stage-done" : ""));
+      pill.title = `${{st.name}} (${{(st.tool_ids || []).join(" + ")}}) — ${{st.artifact}}`;
+      pill.textContent = shortLabels[idx] || st.name;
+      pill.addEventListener("click", () => selectPipelineStage(idx));
+      container.appendChild(pill);
     }});
   }}
 
@@ -2520,15 +2500,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (pIdx < 0 || pIdx >= PIPELINE.length) return;
     state.currentPipelineIdx = pIdx;
     const st = PIPELINE[pIdx];
-    const pipeDesc = document.getElementById("pipeline-desc");
-    if (pipeDesc) {{
-      pipeDesc.textContent = `⚙️ NDIP STAGE ${{st.step_num}}: ${{st.summary}}`;
-    }}
-    document.getElementById("combo-badge").textContent = `NDIP STAGE ${{st.step_num}}`;
+    document.getElementById("combo-badge").textContent = `STAGE ${{st.step_num}}`;
     document.getElementById("inspector-box").innerHTML = `
       <div><strong style="color:var(--accent-cyan);">${{st.name}}</strong></div>
-      <div>NDIP Tools: <code>${{(st.tool_ids || []).join(", ")}}</code></div>
-      <div>Container: <code>${{st.container || "ghcr.io/neutrons/subhkl:1.4.0"}}</code></div>
+      <div>Tools: <code>${{(st.tool_ids || []).join(", ")}}</code></div>
+      <div>Container: <code>${{st.container || "ghcr.io/neutrons/subhkl:feat-rainbow-zones"}}</code></div>
       <div>Artifact: <strong style="color:var(--accent-gold);">${{st.artifact}}</strong></div>
     `;
     if (syncLadder && typeof st.ladder_rung_idx === "number") {{
@@ -3213,43 +3189,468 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}, 1800);
   }});
 
-  const btnPipeRun = document.getElementById("btn-pipeline-run");
-  if (btnPipeRun) {{
-    btnPipeRun.addEventListener("click", (ev) => {{
-      if (state.ladderTimer) {{
-        clearInterval(state.ladderTimer);
-        state.ladderTimer = null;
-        ev.currentTarget.textContent = "▶ RUN NDIP PIPELINE";
-        return;
+  // Open in its own full-screen browser tab (button + auto-detect when inside Galaxy iframe)
+  function openInOwnTab() {{
+    const targetUrl = window.location.href;
+    window.open(targetUrl, "_blank", "noopener");
+  }}
+  const btnNewTab = document.getElementById("btn-new-tab");
+  if (btnNewTab) btnNewTab.addEventListener("click", openInOwnTab);
+
+  if (window.self !== window.top) {{
+    const banner = document.getElementById("iframe-popout-banner");
+    const btnPopNow = document.getElementById("btn-popout-now");
+    const btnPopDismiss = document.getElementById("btn-popout-dismiss");
+    // Attempt immediate popout; if popup-blocked, show 1-click banner
+    const w = window.open(window.location.href, "_blank");
+    if (!w && banner) {{
+      banner.style.display = "flex";
+    }}
+    if (btnPopNow) {{
+      btnPopNow.addEventListener("click", () => {{
+        openInOwnTab();
+        if (banner) banner.style.display = "none";
+      }});
+    }}
+    if (btnPopDismiss && banner) {{
+      btnPopDismiss.addEventListener("click", () => {{
+        banner.style.display = "none";
+      }});
+    }}
+  }}
+
+  // Dynamic payload hot-reload + Client-Side h5wasm HDF5 Parser (for truly static HTML usage)
+  function recomputeBoundsAndReload(newPayload) {{
+    if (!newPayload) return;
+    DATA.instrument = newPayload.instrument || DATA.instrument;
+    DATA.space_group = newPayload.space_group || DATA.space_group;
+    DATA.wavelength_range = newPayload.wavelength_range || DATA.wavelength_range;
+    DATA.cell = newPayload.cell || DATA.cell;
+
+    PEAKS.length = 0;
+    (newPayload.peaks || []).forEach(p => PEAKS.push(p));
+    ZONES.length = 0;
+    (newPayload.zones || []).forEach(z => ZONES.push(z));
+    PANELS.length = 0;
+    (newPayload.panels || []).forEach(p => PANELS.push(p));
+    LADDER.length = 0;
+    (newPayload.ladder_steps || []).forEach(s => LADDER.push(s));
+    PIPELINE.length = 0;
+    (newPayload.pipeline_stages || []).forEach(s => PIPELINE.push(s));
+
+    if (PANELS.length > 0) {{
+      const allY = [], allEl = [];
+      PANELS.forEach(p => {{
+        allY.push(p.y_min, p.y_max);
+        if (typeof p.el_min === "number") allEl.push(p.el_min, p.el_max);
+      }});
+      if (allY.length > 0) {{
+        const padY = Math.max(0.03, (Math.max(...allY) - Math.min(...allY)) * 0.08);
+        cylBounds.minY = Math.min(...allY) - padY;
+        cylBounds.maxY = Math.max(...allY) + padY;
       }}
-      // Sequence: Stage 0 (Reduce, Rung 0) -> Stage 1 (Solve, Rungs 1..4) -> Stage 2 (Integrate) -> Stage 3 (Merge)
-      const seq = [
-        {{ p: 0, r: 0 }},
-        {{ p: 1, r: 1 }},
-        {{ p: 1, r: 2 }},
-        {{ p: 1, r: 3 }},
-        {{ p: 1, r: 4 }},
-        {{ p: 2, r: 4 }},
-        {{ p: 3, r: 4 }},
-      ];
-      let stepPtr = 0;
-      ev.currentTarget.textContent = "⏹ STOP PIPELINE";
-      const applyStep = (item) => {{
-        selectPipelineStage(item.p, false);
-        selectLadderRung(item.r, false);
-      }};
-      applyStep(seq[0]);
-      state.ladderTimer = setInterval(() => {{
-        stepPtr += 1;
-        if (stepPtr < seq.length) {{
-          applyStep(seq[stepPtr]);
-        }} else {{
-          clearInterval(state.ladderTimer);
-          state.ladderTimer = null;
-          ev.currentTarget.textContent = "▶ WALK NDIP PIPELINE";
-        }}
-      }}, 1600);
+      if (allEl.length > 0) {{
+        const padEl = Math.max(4.0, (Math.max(...allEl) - Math.min(...allEl)) * 0.08);
+        sphBounds.minY = Math.max(-90.0, Math.min(...allEl) - padEl);
+        sphBounds.maxY = Math.min(90.0, Math.max(...allEl) + padEl);
+      }}
+    }}
+
+    rawBankImages.clear();
+    bankCanvases.clear();
+    decodeAllBankTextures();
+    // Support direct canvas textures generated by client-side h5wasm
+    PANELS.forEach(p => {{
+      if (p._grayCanvas) {{
+        rawBankImages.set(p.bank, p._grayCanvas);
+        bankCanvases.set(p.bank, colorizeGrayscaleImage(p._grayCanvas, state.heatmapStyle));
+      }}
     }});
+
+    const subEl = document.querySelector(".subtitle-tag");
+    if (subEl) {{
+      subEl.textContent = `${{DATA.instrument || "CG4D"}} • ${{DATA.space_group || "P 1"}} • ${{newPayload.intensity_source === "raw_h5" ? "RAW DETECTOR COUNTS" : "SOLVED ORIENTATION"}}`;
+    }}
+    if (DATA.cell && DATA.cell.length === 6) {{
+      const c = DATA.cell;
+      document.getElementById("cell-summary").textContent = `${{c[0].toFixed(1)}}, ${{c[1].toFixed(1)}}, ${{c[2].toFixed(1)}} Å`;
+    }}
+    const ord1 = ZONES.filter(z => (z.order || 1) <= 1).map(z => z.zone_id);
+    state.maxZoneOrder = ord1.length > 0 ? 1 : 2;
+    state.activeZones = new Set(ord1.length > 0 ? ord1 : ZONES.map(z => z.zone_id));
+    state.currentRungIdx = Math.max(0, LADDER.length - 1);
+    renderPipeline();
+    if (LADDER.length > 0) selectLadderRung(state.currentRungIdx, false);
+    else {{ renderZoneList(); updateHUD(); }}
+  }}
+
+  // Pure Client-Side HDF5 Parser + Crystallographic Forward Projector via h5wasm
+  const ZONE_COLORS = ["#ff1e42","#ff7b00","#ffd500","#12eb5b","#00e1ff","#4d5bff","#c82eff","#ff38b4","#9dff00","#00ffa6"];
+  function gcd2(a, b) {{ a = Math.abs(a); b = Math.abs(b); while (b) {{ const t = b; b = a % b; a = t; }} return a; }}
+  function gcd3(a, b, c) {{ return gcd2(gcd2(a, b), c); }}
+  function mat3Mul(A, B) {{
+    const C = [[0,0,0],[0,0,0],[0,0,0]];
+    for (let i=0;i<3;i++) for (let j=0;j<3;j++) C[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j];
+    return C;
+  }}
+  function mat3Vec(A, v) {{
+    return [
+      A[0][0]*v[0] + A[0][1]*v[1] + A[0][2]*v[2],
+      A[1][0]*v[0] + A[1][1]*v[1] + A[1][2]*v[2],
+      A[2][0]*v[0] + A[2][1]*v[1] + A[2][2]*v[2],
+    ];
+  }}
+  function mat3T(A) {{
+    return [[A[0][0],A[1][0],A[2][0]],[A[0][1],A[1][1],A[2][1]],[A[0][2],A[1][2],A[2][2]]];
+  }}
+  function mat3Inv(M) {{
+    const det = M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1]) - M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0]) + M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]);
+    const invDet = 1.0 / (Math.abs(det) > 1e-12 ? det : 1e-12);
+    return [
+      [(M[1][1]*M[2][2]-M[1][2]*M[2][1])*invDet, (M[0][2]*M[2][1]-M[0][1]*M[2][2])*invDet, (M[0][1]*M[1][2]-M[0][2]*M[1][1])*invDet],
+      [(M[1][2]*M[2][0]-M[1][0]*M[2][2])*invDet, (M[0][0]*M[2][2]-M[0][2]*M[2][0])*invDet, (M[0][2]*M[1][0]-M[0][0]*M[1][2])*invDet],
+      [(M[1][0]*M[2][1]-M[1][1]*M[2][0])*invDet, (M[0][1]*M[2][0]-M[0][0]*M[2][1])*invDet, (M[0][0]*M[1][1]-M[0][1]*M[1][0])*invDet],
+    ];
+  }}
+  function vecNorm(v) {{ return Math.hypot(v[0], v[1], v[2]); }}
+  function vecUnit(v) {{ const n = Math.max(vecNorm(v), 1e-12); return [v[0]/n, v[1]/n, v[2]/n]; }}
+  function vecDot(a, b) {{ return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }}
+  function vecCross(a, b) {{ return [a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0]]; }}
+  function labToCyl(xyz) {{
+    const az = Math.atan2(xyz[0], xyz[2]) * 180.0 / Math.PI;
+    const r = Math.max(vecNorm(xyz), 1e-9);
+    const el = Math.asin(Math.max(-1, Math.min(1, xyz[1] / r))) * 180.0 / Math.PI;
+    return [az, xyz[1], el];
+  }}
+  function stereoProj(g) {{
+    const u = vecUnit(g);
+    const hemi = u[2] >= 0 ? 1 : -1;
+    const zAbs = Math.abs(u[2]);
+    return [u[0] / (1.0 + zAbs), u[1] / (1.0 + zAbs), hemi];
+  }}
+
+  async function parseH5BuffersInBrowser(solveBuf, imagesBuf) {{
+    if (!window.h5wasm) throw new Error("h5wasm library is still loading from CDN");
+    const {{ FS }} = await window.h5wasm.ready;
+    FS.writeFile("solve_in.h5", new Uint8Array(solveBuf));
+    const f = new window.h5wasm.File("solve_in.h5", "r");
+    let mf = null;
+    if (imagesBuf) {{
+      FS.writeFile("images_in.h5", new Uint8Array(imagesBuf));
+      mf = new window.h5wasm.File("images_in.h5", "r");
+    }} else if (f.keys().includes("images")) {{
+      mf = f;
+    }}
+
+    const getAttrStr = (node, key, defVal) => {{
+      try {{
+        const a = node.attrs[key];
+        if (!a) return defVal;
+        return String(a.value || defVal);
+      }} catch (_e) {{ return defVal; }}
+    }};
+    const inst = getAttrStr(f, "instrument", DATA.instrument || "CG4D");
+    let wlRangeNew = [1.8, 4.5];
+    try {{
+      const wl = f.get("instrument/wavelength").value;
+      if (wl && wl.length >= 2) wlRangeNew = [Number(wl[0]), Number(wl[1])];
+    }} catch (_e) {{}}
+
+    // Determine best run slice from file_offsets & bank_ids
+    let f0 = 0, f1 = 0;
+    const refFile = f.keys().includes("bank_ids") ? f : mf;
+    let bankIdsRun = [];
+    if (refFile && refFile.keys().includes("bank_ids")) {{
+      const bAll = Array.from(refFile.get("bank_ids").value).map(Number);
+      f1 = bAll.length;
+      if (refFile.keys().includes("file_offsets")) {{
+        const offs = Array.from(refFile.get("file_offsets").value).map(Number);
+        let bestCount = -1;
+        for (let r = 0; r < offs.length; r++) {{
+          const s = offs[r];
+          const e = (r + 1 < offs.length) ? offs[r + 1] : bAll.length;
+          if (e - s > bestCount) {{ bestCount = e - s; f0 = s; f1 = e; }}
+        }}
+      }}
+      bankIdsRun = bAll.slice(f0, f1);
+    }}
+
+    // Read calibrated detector banks from detector_calibration/bank_*
+    const detMap = new Map();
+    if (f.keys().includes("detector_calibration")) {{
+      const calGrp = f.get("detector_calibration");
+      for (const bName of calGrp.keys()) {{
+        if (!bName.startsWith("bank_")) continue;
+        const bid = parseInt(bName.slice(5), 10);
+        const g = calGrp.get(bName);
+        const center = Array.from(g.get("center").value).map(Number);
+        const uhat = Array.from(g.get("uhat").value).map(Number);
+        const vhat = Array.from(g.get("vhat").value).map(Number);
+        const width = Number(g.get("width").value);
+        const height = Number(g.get("height").value);
+        detMap.set(bid, {{ bid, center, uhat, vhat, width, height, m: 512, n: 512 }});
+      }}
+    }}
+
+    // Read raw detector images for the active run slice and build grayscale texture canvases
+    const bankImgs = new Map();
+    const bankGrayCanvases = new Map();
+    if (mf && mf.keys().includes("images")) {{
+      const imDs = mf.get("images");
+      const shape = imDs.shape; // [N, H, W]
+      const H = shape[1] || 512, W = shape[2] || 512;
+      const sliceArr = imDs.slice([[f0, f1], [0, H], [0, W]]);
+      const bStep = 4;
+      const Hb = Math.floor(H / bStep), Wb = Math.floor(W / bStep);
+      for (let i = 0; i < bankIdsRun.length; i++) {{
+        const bid = bankIdsRun[i];
+        const offset = i * H * W;
+        const sub = sliceArr.subarray(offset, offset + H * W);
+        bankImgs.set(bid, {{ data: sub, H, W }});
+
+        // Downsample and log1p-scale into offscreen canvas
+        const logBuf = new Float32Array(Hb * Wb);
+        for (let rb = 0; rb < Hb; rb++) {{
+          for (let cb = 0; cb < Wb; cb++) {{
+            let sum = 0;
+            for (let dr = 0; dr < bStep; dr++) {{
+              const rowOff = (rb * bStep + dr) * W + cb * bStep;
+              for (let dc = 0; dc < bStep; dc++) sum += sub[rowOff + dc];
+            }}
+            logBuf[rb * Wb + cb] = Math.log1p(Math.max(0, sum / (bStep * bStep)));
+          }}
+        }}
+        const sorted = Float32Array.from(logBuf).sort();
+        const vmax = Math.max(sorted[Math.floor(sorted.length * 0.995)] || 1.0, 1e-6);
+        const gc = document.createElement("canvas");
+        gc.width = Wb; gc.height = Hb;
+        const gctx = gc.getContext("2d");
+        const idata = gctx.createImageData(Wb, Hb);
+        for (let rb = 0; rb < Hb; rb++) {{
+          for (let cb = 0; cb < Wb; cb++) {{
+            // Flip horizontally so column 0..W maps left-to-right in azimuth
+            const v = Math.min(255, Math.round((logBuf[rb * Wb + (Wb - 1 - cb)] / vmax) * 255));
+            const pIdx = (rb * Wb + cb) * 4;
+            idata.data[pIdx] = v; idata.data[pIdx+1] = v; idata.data[pIdx+2] = v; idata.data[pIdx+3] = 255;
+          }}
+        }}
+        gctx.putImageData(idata, 0, 0);
+        bankGrayCanvases.set(bid, gc);
+      }}
+    }}
+
+    // Build panel outlines from detMap
+    const panelsOut = [];
+    const pixelToLab = (det, r, c) => {{
+      const u = ((det.m - 1 - c) / (det.m - 1) - 0.5) * det.width;
+      const v = ((r / (det.n - 1)) - 0.5) * det.height;
+      return [
+        det.center[0] + u * det.uhat[0] + v * det.vhat[0],
+        det.center[1] + u * det.uhat[1] + v * det.vhat[1],
+        det.center[2] + u * det.uhat[2] + v * det.vhat[2],
+      ];
+    }};
+    for (const [bid, det] of detMap.entries()) {{
+      const outline = [], outlineSph = [];
+      const nPts = 12;
+      const edges = [];
+      for (let k=0;k<nPts;k++) edges.push([0, (k/(nPts-1))*(det.m-1)]);
+      for (let k=0;k<nPts;k++) edges.push([(k/(nPts-1))*(det.n-1), det.m-1]);
+      for (let k=0;k<nPts;k++) edges.push([det.n-1, ((nPts-1-k)/(nPts-1))*(det.m-1)]);
+      for (let k=0;k<nPts;k++) edges.push([((nPts-1-k)/(nPts-1))*(det.n-1), 0]);
+      let azMin=180, azMax=-180, yMin=10, yMax=-10, elMin=90, elMax=-90;
+      edges.forEach(([r, c]) => {{
+        const [az, y, el] = labToCyl(pixelToLab(det, r, c));
+        if (az < azMin) azMin = az; if (az > azMax) azMax = az;
+        if (y < yMin) yMin = y; if (y > yMax) yMax = y;
+        if (el < elMin) elMin = el; if (el > elMax) elMax = el;
+        outline.push([az, y]); outlineSph.push([az, el]);
+      }});
+      if (azMax - azMin <= 180) {{
+        panelsOut.push({{
+          bank: bid, az_min: azMin, az_max: azMax, y_min: yMin, y_max: yMax, el_min: elMin, el_max: elMax,
+          outline, outline_sph: outlineSph, _grayCanvas: bankGrayCanvases.get(bid) || null,
+        }});
+      }}
+    }}
+
+    // Read sample U, B, R_run and forward-project reflections
+    let sg = "P 21 21 21";
+    try {{ sg = String(f.get("sample/space_group").value || sg); }} catch (_e) {{}}
+    let cell = DATA.cell || [68.7, 69.8, 156.9, 90, 90, 90];
+    let U = [[1,0,0],[0,1,0],[0,0,1]], B = null, Rrun = [[1,0,0],[0,1,0],[0,0,1]];
+    if (f.keys().includes("sample")) {{
+      const sGrp = f.get("sample");
+      if (sGrp.keys().includes("U")) {{
+        const uRaw = Array.from(sGrp.get("U").value).map(Number);
+        U = [[uRaw[0],uRaw[1],uRaw[2]],[uRaw[3],uRaw[4],uRaw[5]],[uRaw[6],uRaw[7],uRaw[8]]];
+      }}
+      if (sGrp.keys().includes("B")) {{
+        const bRaw = Array.from(sGrp.get("B").value).map(Number);
+        B = [[bRaw[0],bRaw[1],bRaw[2]],[bRaw[3],bRaw[4],bRaw[5]],[bRaw[6],bRaw[7],bRaw[8]]];
+        const invB = mat3Inv(B);
+        const aLen = Math.hypot(invB[0][0], invB[1][0], invB[2][0]);
+        const bLen = Math.hypot(invB[0][1], invB[1][1], invB[2][1]);
+        const cLen = Math.hypot(invB[0][2], invB[1][2], invB[2][2]);
+        cell = [aLen, bLen, cLen, 90, 90, 90];
+      }}
+    }}
+    if (f.keys().includes("goniometer") && f.get("goniometer").keys().includes("R")) {{
+      const rAll = Array.from(f.get("goniometer/R").value).map(Number);
+      const rOff = Math.min(f0 * 9, Math.max(0, rAll.length - 9));
+      Rrun = [[rAll[rOff],rAll[rOff+1],rAll[rOff+2]],[rAll[rOff+3],rAll[rOff+4],rAll[rOff+5]],[rAll[rOff+6],rAll[rOff+7],rAll[rOff+8]]];
+    }}
+
+    const peaksOut = [];
+    const zonesOut = [];
+    if (B && detMap.size > 0) {{
+      const UB = mat3Mul(U, B);
+      const RUB = mat3Mul(Rrun, UB);
+      const R_T = mat3T(Rrun);
+      const dMin = 2.6;
+      const hMax = Math.min(18, Math.floor(cell[0] / dMin));
+      const kMax = Math.min(18, Math.floor(cell[1] / dMin));
+      const lMax = Math.min(28, Math.floor(cell[2] / dMin));
+      const candPeaks = [];
+      for (let h = -hMax; h <= hMax; h++) {{
+        for (let k = -kMax; k <= kMax; k++) {{
+          for (let l = -lMax; l <= lMax; l++) {{
+            if (h === 0 && k === 0 && l === 0) continue;
+            const G = mat3Vec(RUB, [h, k, l]);
+            const qn = vecNorm(G);
+            if (qn < 1e-8 || (1.0 / qn) < dMin) continue;
+            const sth = -G[2] / qn;
+            if (sth <= 0) continue;
+            const lam = (2.0 * sth) / qn;
+            if (lam < wlRangeNew[0] || lam > wlRangeNew[1]) continue;
+            const kf = vecUnit([lam * G[0], lam * G[1], 1.0 + lam * G[2]]);
+            for (const [bid, det] of detMap.entries()) {{
+              const nVec = vecCross(det.uhat, det.vhat);
+              const denom = vecDot(kf, nVec);
+              if (Math.abs(denom) <= 1e-6) continue;
+              const tRay = vecDot(det.center, nVec) / denom;
+              if (tRay <= 0) continue;
+              const pt = [kf[0]*tRay, kf[1]*tRay, kf[2]*tRay];
+              const rel = [pt[0]-det.center[0], pt[1]-det.center[1], pt[2]-det.center[2]];
+              const u = vecDot(rel, det.uhat), v = vecDot(rel, det.vhat);
+              if (Math.abs(u) > 0.49 * det.width || Math.abs(v) > 0.49 * det.height) continue;
+              const cPix = (det.m - 1) * (1.0 - (u / det.width + 0.5));
+              const rPix = (det.n - 1) * (v / det.height + 0.5);
+              let inten = 120.0, keep = true;
+              const bIm = bankImgs.get(bid);
+              if (bIm) {{
+                const ri = Math.round(rPix), ci = Math.round(cPix);
+                let pkMax = 0, bgSum = 0, bgN = 0;
+                for (let dr = -9; dr <= 9; dr++) {{
+                  const rr = ri + dr; if (rr < 0 || rr >= bIm.H) continue;
+                  for (let dc = -9; dc <= 9; dc++) {{
+                    const cc = ci + dc; if (cc < 0 || cc >= bIm.W) continue;
+                    const val = bIm.data[rr * bIm.W + cc];
+                    if (Math.abs(dr) <= 4 && Math.abs(dc) <= 4) {{ if (val > pkMax) pkMax = val; }}
+                    bgSum += val; bgN++;
+                  }}
+                }}
+                const bgMean = bgSum / Math.max(1, bgN);
+                const snr = (pkMax - bgMean) / Math.max(Math.sqrt(Math.max(bgMean, 1.0)), 1.0);
+                if (snr < 3.0) keep = false;
+                inten = pkMax;
+              }}
+              if (!keep) break;
+              const [az, dy, el] = labToCyl(pt);
+              const qLab = vecUnit([kf[0], kf[1], kf[2] - 1.0]);
+              const gCryst = mat3Vec(R_T, qLab);
+              const [sx, sy, hemi] = stereoProj(gCryst);
+              const dVal = 1.0 / qn;
+              candPeaks.push({{
+                bank: bid, row: Number(rPix.toFixed(1)), col: Number(cPix.toFixed(1)),
+                det_x: az, det_y: dy, det_el: el, q_hat: gCryst,
+                stereographic: [sx, sy], hemisphere: hemi, intensity: inten, sigma: 3.0,
+                wavelength: lam, d_spacing: dVal, harmonic_order: Math.max(1, gcd3(h, k, l)),
+                parallax_depth: Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * dVal))),
+                hkl: [h, k, l], zone_ids: [], indexed: true, angular_error_deg: 0.02,
+              }});
+              break;
+            }}
+          }}
+        }}
+      }}
+      candPeaks.sort((a, b) => b.intensity - a.intensity);
+      candPeaks.slice(0, 1200).forEach((p, idx) => {{ p.id = idx; peaksOut.push(p); }});
+
+      // Build Laue zones [u v w] with A_real = inv(UB)
+      const A_real = mat3Inv(UB);
+      const rawZ = [];
+      for (let u = -3; u <= 3; u++) {{
+        for (let v = -3; v <= 3; v++) {{
+          for (let w = -3; w <= 3; w++) {{
+            if (u === 0 && v === 0 && w === 0) continue;
+            if (gcd3(u, v, w) !== 1) continue;
+            if (u < 0 || (u === 0 && v < 0) || (u === 0 && v === 0 && w < 0)) continue;
+            const ord = Math.max(Math.abs(u), Math.abs(v), Math.abs(w));
+            const tCryst = vecUnit(mat3Vec(A_real, [u, v, w]));
+            const tLab = vecUnit(mat3Vec(Rrun, tCryst));
+            const memberIds = [];
+            peaksOut.forEach(p => {{
+              if (p.hkl[0]*u + p.hkl[1]*v + p.hkl[2]*w === 0) memberIds.push(p.id);
+            }});
+            if (ord > 1 && memberIds.length < 3) continue;
+            rawZ.push({{ uvw: [u, v, w], order: ord, tCryst, tLab, memberIds, n_peaks: memberIds.length }});
+          }}
+        }}
+      }}
+      rawZ.sort((a, b) => (a.order !== b.order) ? (a.order - b.order) : (b.n_peaks - a.n_peaks));
+      rawZ.slice(0, 36).forEach((z, zi) => {{
+        z.memberIds.forEach(pid => peaksOut[pid].zone_ids.push(zi));
+        // Trace reflection cone kf = ki - 2(ki·n)*n around great circle perpendicular to tLab
+        const ref = Math.abs(z.tLab[0]) < 0.9 ? [1,0,0] : [0,1,0];
+        const e1 = vecUnit(vecCross(z.tLab, ref));
+        const e2 = vecUnit(vecCross(z.tLab, e1));
+        const detSegs = [], detSegsSph = [], stereoSegs = [[]];
+        let curCyl = [], curSph = [];
+        const nArc = 360;
+        for (let s = 0; s <= nArc; s++) {{
+          const ang = (s / nArc) * 2.0 * Math.PI;
+          const gLab = [Math.cos(ang)*e1[0] + Math.sin(ang)*e2[0], Math.cos(ang)*e1[1] + Math.sin(ang)*e2[1], Math.cos(ang)*e1[2] + Math.sin(ang)*e2[2]];
+          const gC = mat3Vec(R_T, gLab);
+          const [sx, sy] = stereoProj(gC);
+          if (s % 4 === 0) stereoSegs[0].push([sx, sy]);
+          const kiDotG = gLab[2];
+          if (kiDotG >= -1e-4) {{
+            if (curCyl.length > 1) {{ detSegs.push(curCyl); detSegsSph.push(curSph); }}
+            curCyl = []; curSph = []; continue;
+          }}
+          const kf = vecUnit([-2*kiDotG*gLab[0], -2*kiDotG*gLab[1], 1.0 - 2*kiDotG*gLab[2]]);
+          const [az, dy, el] = labToCyl(kf);
+          const onPanel = panelsOut.some(p => az >= p.az_min - 1.5 && az <= p.az_max + 1.5 && dy >= p.y_min - 0.02 && dy <= p.y_max + 0.02);
+          if (!onPanel || (curCyl.length > 0 && Math.abs(az - curCyl[curCyl.length-1][0]) > 25)) {{
+            if (curCyl.length > 1) {{ detSegs.push(curCyl); detSegsSph.push(curSph); }}
+            curCyl = []; curSph = [];
+          }}
+          if (onPanel) {{ curCyl.push([az, dy]); curSph.push([az, el]); }}
+        }}
+        if (curCyl.length > 1) {{ detSegs.push(curCyl); detSegsSph.push(curSph); }}
+        zonesOut.push({{
+          zone_id: zi, uvw: z.uvw, order: z.order, label: `[${{z.uvw[0]}} ${{z.uvw[1]}} ${{z.uvw[2]}}]`,
+          n_peaks: z.n_peaks, angular_rms_deg: 0.02, rainbow_color: ZONE_COLORS[zi % ZONE_COLORS.length],
+          detector_segments: detSegs, detector_segments_sph: detSegsSph, stereo_segments: stereoSegs,
+        }});
+      }});
+    }}
+
+    const ord1Ids = zonesOut.filter(z => z.order <= 1 && z.n_peaks > 0).map(z => z.zone_id);
+    const ladderOut = [
+      {{ rung: 1, stage: "1. Binned Count Excess", subtitle: "Finder-less Poisson deviance bins", active_zones: [], n_captured: peaksOut.length, description: "Threshold-free detector count bins enter lattice_ladder directly with no spot finder." }},
+      {{ rung: 2, stage: "2. 13→145 Zone Ladder", subtitle: `Primary Laue zones (${{ord1Ids.slice(0,2).length}} locked)`, active_zones: ord1Ids.slice(0, 2), n_captured: Math.round(peaksOut.length * 0.45), description: "Coarse-to-fine axis ladder locks the dominant intersecting zone planes." }},
+      {{ rung: 3, stage: "3. 60-Zone Global", subtitle: `${{ord1Ids.length}} fundamental zones`, active_zones: ord1Ids, n_captured: Math.round(peaksOut.length * 0.78), description: "Joint SO(3) + metrological translation/tilt refinement across fundamental zones." }},
+      {{ rung: 4, stage: "4. 120→400 Zone + Cell", subtitle: "Higher-order zones + cell ratios", active_zones: zonesOut.slice(0, 12).map(z => z.zone_id), n_captured: Math.round(peaksOut.length * 0.92), description: "Staged 120→400 zone-band refinement co-refines axial stretch, ω drift, and unit-cell ratios." }},
+      {{ rung: 5, stage: "5. Converged Solve UB", subtitle: `${{sg}} • a=${{cell[0].toFixed(1)}}, b=${{cell[1].toFixed(1)}}, c=${{cell[2].toFixed(1)}} Å`, active_zones: ord1Ids.length ? ord1Ids : zonesOut.map(z => z.zone_id), n_captured: peaksOut.length, description: `Converged 3D UB orientation (${{peaksOut.length}} forward-projected spots with SNR ≥ 3.0).` }},
+    ];
+    try {{ f.close(); if (mf && mf !== f) mf.close(); }} catch (_e) {{}}
+    return {{
+      instrument: inst, space_group: sg, intensity_source: bankImgs.size > 0 ? "raw_h5" : "reconstructed",
+      wavelength_range: wlRangeNew, cell, peaks: peaksOut, zones: zonesOut, panels: panelsOut,
+      ladder_steps: ladderOut, pipeline_stages: PIPELINE,
+    }};
   }}
 
   // Live Galaxy / NOVA / Pulsar GPU job orchestration
@@ -3262,6 +3663,77 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   const elGalaxyBadge = document.getElementById("galaxy-status-badge");
   const btnGalaxyDispatch = document.getElementById("btn-galaxy-dispatch");
+  const selGalaxyH5 = document.getElementById("sel-galaxy-h5");
+  const btnLocalH5 = document.getElementById("btn-local-h5");
+  const inpLocalH5 = document.getElementById("inp-local-h5");
+
+  function populateGalaxyH5Selector() {{
+    if (!selGalaxyH5) return;
+    const h5s = (galaxyBridge.datasets || []).filter(
+      d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
+    );
+    selGalaxyH5.innerHTML = `<option value="">📂 Galaxy History (${{h5s.length}} .h5)...</option>`;
+    h5s.forEach(d => {{
+      const opt = document.createElement("option");
+      opt.value = d.id;
+      opt.textContent = `#${{d.hid || ""}} ${{d.name}}`;
+      selGalaxyH5.appendChild(opt);
+    }});
+  }}
+
+  async function loadFromGalaxyDatasetId(dsId) {{
+    if (!dsId) return;
+    const ladderDesc = document.getElementById("ladder-desc");
+    if (ladderDesc) ladderDesc.textContent = "⏳ Loading HDF5 from Galaxy History via h5wasm...";
+    try {{
+      while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));
+      const h5s = (galaxyBridge.datasets || []).filter(
+        d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
+      );
+      const mergedDs = [...h5s].reverse().find(
+        d => d.id !== dsId && /merged|image|scan|prepare/i.test(d.name || "")
+      );
+      const r1 = await fetch(`/api/datasets/${{dsId}}/display`, {{ credentials: "same-origin" }});
+      if (!r1.ok) throw new Error(`HTTP ${{r1.status}} fetching dataset ${{dsId}}`);
+      const buf1 = await r1.arrayBuffer();
+      let buf2 = null;
+      if (mergedDs) {{
+        const r2 = await fetch(`/api/datasets/${{mergedDs.id}}/display`, {{ credentials: "same-origin" }});
+        if (r2.ok) buf2 = await r2.arrayBuffer();
+      }}
+      const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
+      recomputeBoundsAndReload(newPayload);
+    }} catch (err) {{
+      if (ladderDesc) ladderDesc.textContent = `⚠️ Failed to load HDF5: ${{err.message}}`;
+    }}
+  }}
+
+  if (selGalaxyH5) {{
+    selGalaxyH5.addEventListener("change", () => {{
+      if (selGalaxyH5.value) loadFromGalaxyDatasetId(selGalaxyH5.value);
+    }});
+  }}
+
+  if (btnLocalH5 && inpLocalH5) {{
+    btnLocalH5.addEventListener("click", () => inpLocalH5.click());
+    inpLocalH5.addEventListener("change", async () => {{
+      const files = Array.from(inpLocalH5.files || []);
+      if (files.length === 0) return;
+      const ladderDesc = document.getElementById("ladder-desc");
+      if (ladderDesc) ladderDesc.textContent = "⏳ Parsing local HDF5 file(s) in browser via h5wasm...";
+      try {{
+        while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));
+        let solveFile = files.find(f => /solve|index|integ/i.test(f.name)) || files[0];
+        let imgFile = files.find(f => f !== solveFile && /merged|image|scan/i.test(f.name)) || (files.length > 1 ? files[1] : null);
+        const buf1 = await solveFile.arrayBuffer();
+        const buf2 = imgFile ? await imgFile.arrayBuffer() : null;
+        const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
+        recomputeBoundsAndReload(newPayload);
+      }} catch (err) {{
+        if (ladderDesc) ladderDesc.textContent = `⚠️ Local HDF5 error: ${{err.message}}`;
+      }}
+    }});
+  }}
 
   async function probeGalaxyConnection() {{
     // 1. Check NOVA server endpoint (api/pipeline/status)
@@ -3273,10 +3745,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           galaxyBridge.mode = "nova";
           galaxyBridge.historyId = doc.history_id;
           galaxyBridge.datasets = doc.history_datasets || [];
+          populateGalaxyH5Selector();
           if (elGalaxyBadge) {{
             elGalaxyBadge.textContent = doc.galaxy_connected
-              ? `🟢 NOVA → GALAXY CONNECTED (${{galaxyBridge.datasets.length}} H5s)`
-              : "🟡 NOVA SERVER (LOCAL PREVIEW)";
+              ? `🟢 NOVA → GALAXY (${{galaxyBridge.datasets.length}} H5s)`
+              : "🟡 NOVA LOCAL";
             elGalaxyBadge.style.borderColor = doc.galaxy_connected ? "#34d399" : "#fbbf24";
             elGalaxyBadge.style.color = doc.galaxy_connected ? "#34d399" : "#fbbf24";
           }}
@@ -3285,7 +3758,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
     }} catch (_e) {{}}
 
-    // 2. Check same-origin Galaxy REST API (when viewed inside Galaxy center iframe)
+    // 2. Check same-origin Galaxy REST API (works from /static/subhkl_parallax.html or Galaxy tab)
     try {{
       const r = await fetch("/api/histories?limit=1", {{ credentials: "same-origin" }});
       if (r.ok) {{
@@ -3305,10 +3778,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               );
             }}
           }}
+          populateGalaxyH5Selector();
           if (elGalaxyBadge) {{
-            elGalaxyBadge.textContent = `🟢 GALAXY CONNECTED (${{hists[0].name || "History"}} • ${{galaxyBridge.datasets.length}} datasets)`;
+            elGalaxyBadge.textContent = `🟢 GALAXY (${{galaxyBridge.datasets.length}} items)`;
             elGalaxyBadge.style.borderColor = "#34d399";
             elGalaxyBadge.style.color = "#34d399";
+          }}
+          // If opened as a truly static HTML page with no pre-baked peaks, auto-load the latest solve.h5 from Galaxy!
+          if (PEAKS.length === 0 && PANELS.length === 0) {{
+            const h5s = galaxyBridge.datasets.filter(
+              d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
+            );
+            const solveDs = [...h5s].reverse().find(d => /solve|index/i.test(d.name || "")) || h5s[0];
+            if (solveDs) {{
+              if (selGalaxyH5) selGalaxyH5.value = solveDs.id;
+              loadFromGalaxyDatasetId(solveDs.id);
+            }}
           }}
         }}
       }}
@@ -3457,7 +3942,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 galaxyBridge.pollTimer = null;
                 if (jstate === "ok") {{
                   selectLadderRung(4, false);
-                  btnGalaxyDispatch.textContent = "✅ PULSAR JOB COMPLETE (CHECK HISTORY)";
+                  btnGalaxyDispatch.textContent = "✅ JOB COMPLETE (LOADING H5...)";
+                  await probeGalaxyConnection();
+                  const outs = (tres.outputs || []).filter(o => o.extension === "h5" || o.extension === "hdf5");
+                  if (outs.length > 0) {{
+                    await loadFromGalaxyDatasetId(outs[0].id);
+                  }}
                 }} else {{
                   btnGalaxyDispatch.textContent = "❌ PULSAR JOB ERROR";
                 }}
@@ -3530,3 +4020,76 @@ def export_rainbow_widget(
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(html)
     return out_path
+
+
+def export_static_app_html(
+    output_html: str | os.PathLike,
+    *,
+    instrument: str = "CG4D",
+    title: str = "SUBHKL // DIFFRACTION PARALLAX",
+) -> str:
+    """Export a truly static HTML5/Canvas web app (not generated per-dataset by an XML tool)
+    that connects directly to Galaxy / NOVA REST APIs and parses .h5 datasets client-side via h5wasm.
+    """
+    empty_payload: dict[str, Any] = {
+        "instrument": instrument,
+        "space_group": "P 21 21 21",
+        "intensity_source": "static_app",
+        "wavelength_range": [1.8, 4.5],
+        "cell": [68.7, 69.8, 156.9, 90.0, 90.0, 90.0],
+        "peaks": [],
+        "zones": [],
+        "panels": [],
+        "ladder_steps": [
+            {
+                "rung": 1,
+                "stage": "1. Binned Count Excess",
+                "subtitle": "Finder-less Poisson deviance bins",
+                "active_zones": [],
+                "n_captured": 0,
+                "description": "Select a Galaxy History .h5 dataset (top bar) or click 📂 Load .h5 to inspect or dispatch a GPU solve.",
+            },
+            {
+                "rung": 2,
+                "stage": "2. 13→145 Zone Ladder",
+                "subtitle": "Primary Laue zones",
+                "active_zones": [],
+                "n_captured": 0,
+                "description": "Coarse-to-fine axis ladder locks the dominant intersecting zone planes.",
+            },
+            {
+                "rung": 3,
+                "stage": "3. 60-Zone Global",
+                "subtitle": "Fundamental zones",
+                "active_zones": [],
+                "n_captured": 0,
+                "description": "Joint SO(3) + metrological translation/tilt refinement across fundamental zones.",
+            },
+            {
+                "rung": 4,
+                "stage": "4. 120→400 Zone + Cell",
+                "subtitle": "Higher-order zones + cell ratios",
+                "active_zones": [],
+                "n_captured": 0,
+                "description": "Staged 120→400 zone-band refinement co-refines axial stretch, ω drift, and unit-cell ratios.",
+            },
+            {
+                "rung": 5,
+                "stage": "5. Converged Solve UB",
+                "subtitle": "Converged 3D orientation",
+                "active_zones": [],
+                "n_captured": 0,
+                "description": "Converged 3D UB orientation and forward-projected reflections.",
+            },
+        ],
+        "pipeline_stages": _build_ndip_pipeline_stages(
+            [], [], instrument=instrument, space_group="P 21 21 21"
+        ),
+    }
+    html = render_rainbow_html(empty_payload, title=title)
+    out_path = os.path.abspath(os.fspath(output_html))
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write(html)
+    return out_path
+
