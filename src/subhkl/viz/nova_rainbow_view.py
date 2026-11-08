@@ -261,6 +261,45 @@ class NovaGalaxyPipelineRunner:
             "status": "submitted",
         }
 
+    def _ensure_galaxy_h5_dataset(
+        self,
+        store: Any,
+        local_path: str,
+        job_record: dict[str, Any],
+    ) -> str:
+        """Link an existing 'ok' dataset in the Galaxy history or upload with file_type='h5', to_posix_lines=False."""
+        fname = os.path.basename(local_path)
+        gi = store.nova_connection.galaxy_instance
+        existing = gi.datasets.get_datasets(history_id=store.history_id, name=fname)
+        for ds in existing:
+            ds_id = ds.get("id")
+            if not ds_id:
+                continue
+            info = gi.datasets.show_dataset(ds_id)
+            st = info.get("state")
+            if st == "ok":
+                job_record["stdout"] += f"[nova -> galaxy] Linked existing dataset '{fname}' (id={ds_id}, state=ok)\n"
+                return ds_id
+            if st in ("queued", "running", "new", "upload"):
+                job_record["stdout"] += (
+                    f"[nova -> galaxy] Waiting for in-progress upload of '{fname}' (id={ds_id}, state={st})...\n"
+                )
+                gi.datasets.wait_for_dataset(ds_id, maxwait=120, interval=2.0, check=True)
+                return ds_id
+
+        job_record["stdout"] += f"[nova -> galaxy] Uploading '{fname}' (file_type=h5, to_posix_lines=False)...\n"
+        up_info = gi.tools.upload_file(
+            path=local_path,
+            history_id=store.history_id,
+            file_name=fname,
+            file_type="h5",
+            to_posix_lines=False,
+        )
+        ds_id = up_info["outputs"][0]["id"]
+        gi.datasets.wait_for_dataset(ds_id, maxwait=180, interval=2.0, check=True)
+        job_record["stdout"] += f"[nova -> galaxy] Upload of '{fname}' ready (id={ds_id})\n"
+        return ds_id
+
     def _dispatch_nova_galaxy_thread(
         self,
         stage_id: str,
@@ -268,12 +307,11 @@ class NovaGalaxyPipelineRunner:
         job_record: dict[str, Any],
         on_complete_h5: Any = None,
     ) -> None:
-        """Background worker that links/uploads datasets via nova-galaxy, dispatches to Pulsar, and streams console_output."""
+        """Background worker that links/uploads datasets, dispatches to Pulsar on IMAGINEX-1, and streams console_output."""
         try:
-            from nova.galaxy import Dataset, Parameters, Tool
-
             store = self.get_datastore("IMAGINE-X SubHKL")
             self.history_id = store.history_id
+            gi = store.nova_connection.galaxy_instance
             job_record["stdout"] += (
                 f"[nova -> galaxy] Attached to Galaxy history_id={store.history_id} on {self.galaxy_url}\n"
             )
@@ -295,93 +333,74 @@ class NovaGalaxyPipelineRunner:
             merged_path = params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
             solve_path = params.get("peaks_file") or "/home/xvg/subhkl-examples/betalac-7/solve.h5"
 
-            tool_params = Parameters()
+            tool_inputs: dict[str, Any] = {}
             if stage_id == "solve":
                 if self._has_tool_on_galaxy("imaginex_subhkl_solve"):
                     primary_tool = "imaginex_subhkl_solve"
-                    job_record["stdout"] += (
-                        f"[nova -> galaxy] Linking/uploading scan '{os.path.basename(merged_path)}' for {primary_tool}...\n"
-                    )
-                    tool_params.add_input("scan", Dataset(path=merged_path, force_upload=False))
-                    tool_params.add_input("instrument", inst)
-                    tool_params.add_input("spaceGroup", sg)
-                    tool_params.add_input("a", float(raw_cell[0]))
-                    tool_params.add_input("b", float(raw_cell[1]))
-                    tool_params.add_input("c", float(raw_cell[2]))
-                    tool_params.add_input("alpha", float(raw_cell[3]))
-                    tool_params.add_input("beta", float(raw_cell[4]))
-                    tool_params.add_input("gamma", float(raw_cell[5]))
-                    tool_params.add_input("wavelengthMin", float(wl[0]))
-                    tool_params.add_input("wavelengthMax", float(wl[1]))
-                    tool_params.add_input("refinement", str(params.get("objective", "band")))
-                    tool_params.add_input("dMin", float(params.get("d_min", 2.5)))
-                    tool_params.add_input("nZones", int(params.get("n_zones", 400)))
-                    tool_params.add_input("maxiter", int(params.get("steps", 120)))
+                    scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
+                    tool_inputs = {
+                        "scan": {"src": "hda", "id": scan_id},
+                        "instrument": inst,
+                        "spaceGroup": sg,
+                        "a": float(raw_cell[0]),
+                        "b": float(raw_cell[1]),
+                        "c": float(raw_cell[2]),
+                        "alpha": float(raw_cell[3]),
+                        "beta": float(raw_cell[4]),
+                        "gamma": float(raw_cell[5]),
+                        "wavelengthMin": float(wl[0]),
+                        "wavelengthMax": float(wl[1]),
+                        "refinement": str(params.get("objective", "band")),
+                        "dMin": float(params.get("d_min", 2.5)),
+                        "nZones": int(params.get("n_zones", 120)),
+                        "maxiter": int(params.get("steps", 120)),
+                    }
                 else:
-                    # Before MR is merged to ndip-test, use deployed imaginex_subhkl_predict (or imaginex_subhkl)
-                    # so execution still routes through NOVA -> Galaxy -> RabbitMQ -> Pulsar -> GPU Docker container!
-                    primary_tool = "imaginex_subhkl_predict"
-                    job_record["stdout"] += (
-                        f"[nova -> galaxy] Note: 'imaginex_subhkl_solve' MR not yet deployed on {self.galaxy_url}; "
-                        f"dispatching deployed '{primary_tool}' to Pulsar GPU container (imaginex1-test)...\n"
-                        f"[nova -> galaxy] Linking/uploading '{os.path.basename(merged_path)}' and '{os.path.basename(solve_path)}'...\n"
+                    raise RuntimeError(
+                        f"'imaginex_subhkl_solve' is not yet deployed on {self.galaxy_url} "
+                        f"(awaiting MR merge on ndip/galaxy-tools)"
                     )
-                    tool_params.add_input("scan", Dataset(path=merged_path, force_upload=False))
-                    tool_params.add_input("indexer", Dataset(path=solve_path, force_upload=False))
-                    tool_params.add_input("instrument", inst)
-                    tool_params.add_input("dMin", float(params.get("d_min", 2.5)))
-                    tool_params.add_input("wavelengthMin", float(wl[0]))
-                    tool_params.add_input("wavelengthMax", float(wl[1]))
-                    tool_params.add_input("space", sg)
             elif stage_id == "integrate":
                 primary_tool = "imaginex_subhkl_predict"
-                job_record["stdout"] += (
-                    f"[nova -> galaxy] Linking/uploading '{os.path.basename(merged_path)}' + '{os.path.basename(solve_path)}' for {primary_tool}...\n"
-                )
-                tool_params.add_input("scan", Dataset(path=merged_path, force_upload=False))
-                tool_params.add_input("indexer", Dataset(path=solve_path, force_upload=False))
-                tool_params.add_input("instrument", inst)
-                tool_params.add_input("dMin", float(params.get("d_min", 2.1)))
-                tool_params.add_input("wavelengthMin", float(wl[0]))
-                tool_params.add_input("wavelengthMax", float(wl[1]))
-                tool_params.add_input("space", sg)
+                scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
+                idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
+                tool_inputs = {
+                    "scan": {"src": "hda", "id": scan_id},
+                    "indexer": {"src": "hda", "id": idx_id},
+                    "instrument": inst,
+                    "dMin": float(params.get("d_min", 2.1)),
+                    "wavelengthMin": float(wl[0]),
+                    "wavelengthMax": float(wl[1]),
+                    "space": sg,
+                }
             elif stage_id == "reduce":
                 primary_tool = "imaginex_subhkl_prepare_peaks"
-                job_record["stdout"] += (
-                    f"[nova -> galaxy] Linking/uploading '{os.path.basename(solve_path)}' for {primary_tool}...\n"
-                )
-                tool_params.add_input("inputs_0|input", Dataset(path=solve_path, force_upload=False))
-                tool_params.add_input("instrument", inst)
-                tool_params.add_input("a", float(raw_cell[0]))
-                tool_params.add_input("b", float(raw_cell[1]))
-                tool_params.add_input("c", float(raw_cell[2]))
-                tool_params.add_input("alpha", float(raw_cell[3]))
-                tool_params.add_input("beta", float(raw_cell[4]))
-                tool_params.add_input("gamma", float(raw_cell[5]))
-                tool_params.add_input("spaceGroup", sg)
+                idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
+                tool_inputs = {
+                    "inputs_0|input": {"src": "hda", "id": idx_id},
+                    "instrument": inst,
+                    "a": float(raw_cell[0]),
+                    "b": float(raw_cell[1]),
+                    "c": float(raw_cell[2]),
+                    "alpha": float(raw_cell[3]),
+                    "beta": float(raw_cell[4]),
+                    "gamma": float(raw_cell[5]),
+                    "spaceGroup": sg,
+                }
             else:
                 primary_tool = "imaginex_subhkl_metrics"
-                job_record["stdout"] += (
-                    f"[nova -> galaxy] Linking/uploading '{os.path.basename(solve_path)}' for {primary_tool}...\n"
-                )
-                tool_params.add_input("peaks", Dataset(path=solve_path, force_upload=False))
+                idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
+                tool_inputs = {
+                    "peaks": {"src": "hda", "id": idx_id},
+                }
 
             job_record["tool_id"] = primary_tool
-            tool = Tool(primary_tool)
-            tool.run(store, tool_params, wait=False)
-
-            # Wait briefly for nova.galaxy's submit() thread to populate tool._job.id
-            for _ in range(180):
-                if tool._job and tool._job.id:
-                    break
-                if tool._job and str(tool._job.status.state).endswith("ERROR"):
-                    raise RuntimeError(str(tool._job.status.details))
-                time.sleep(0.5)
-
-            if not tool._job or not tool._job.id:
-                raise RuntimeError(f"Timed out waiting for Galaxy job submission of {primary_tool}")
-
-            job_id = tool._job.id
+            results = gi.tools.run_tool(
+                history_id=store.history_id,
+                tool_id=primary_tool,
+                tool_inputs=tool_inputs,
+            )
+            job_id = results["jobs"][0]["id"]
             job_record["job_id"] = job_id
             job_record["outputs"] = [
                 {
@@ -389,15 +408,15 @@ class NovaGalaxyPipelineRunner:
                     "name": d.get("output_name") or d.get("name"),
                     "extension": d.get("file_ext") or d.get("extension") or "h5",
                 }
-                for d in (tool._job.datasets or [])
+                for d in (results.get("outputs") or [])
                 if isinstance(d, dict)
             ]
             job_record["stdout"] += (
                 f"[galaxy -> pulsar] Dispatched {primary_tool} (Galaxy job_id={job_id}) -> Pulsar queue on IMAGINEX-1\n"
             )
-            self._poll_galaxy_job(job_record, on_complete_h5, nova_job=tool._job)
+            self._poll_galaxy_job(job_record, on_complete_h5)
         except Exception as exc:
-            job_record["stdout"] += f"[nova -> galaxy] Dispatch error ({exc}); falling back to local GPU container...\n"
+            job_record["stdout"] += f"[nova -> galaxy] {exc}; running GPU container on IMAGINEX-1...\n"
             self._submit_local_subhkl_stage(
                 stage_id,
                 params,
@@ -477,7 +496,7 @@ class NovaGalaxyPipelineRunner:
                 "--refinement",
                 str(params.get("objective", "band")),
                 "--band-zones",
-                str(max(60, int(params.get("n_zones", 400)))),
+                str(max(60, int(params.get("n_zones", 120)))),
                 "--band-maxiter",
                 str(max(10, int(params.get("steps", 120)))),
             ]
@@ -532,6 +551,10 @@ class NovaGalaxyPipelineRunner:
                 "nvidia.com/gpu=all",
                 "-e",
                 f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '0')}",
+                "-e",
+                "XLA_PYTHON_CLIENT_PREALLOCATE=false",
+                "-e",
+                "TF_GPU_ALLOCATOR=cuda_malloc_async",
             ]
             for d in mount_dirs:
                 if os.path.isdir(d):
@@ -543,6 +566,8 @@ class NovaGalaxyPipelineRunner:
 
         gpu_env = os.environ.copy()
         gpu_env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        gpu_env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+        gpu_env.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
         try:
             gpu_info = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"],
@@ -657,14 +682,41 @@ class NovaGalaxyPipelineRunner:
             time.sleep(1.5)
             try:
                 # 1. Detect live Pulsar staging directory on this GPU node (IMAGINEX-1)
+                pulsar_live_out = ""
+                pulsar_live_err = ""
                 for droot in ("/data/staging_test", "/data/staging"):
                     if os.path.isdir(droot):
                         try:
                             for entry in os.listdir(droot):
                                 full_dir = os.path.join(droot, entry)
-                                if full_dir not in seen_pulsar_dirs and os.path.isdir(full_dir):
+                                if not os.path.isdir(full_dir):
+                                    continue
+                                if full_dir not in seen_pulsar_dirs:
                                     seen_pulsar_dirs.add(full_dir)
-                                    base_log += f"[pulsar] Staged on IMAGINEX-1: {full_dir}\n"
+                                    pid_path = os.path.join(full_dir, "pid")
+                                    ctr_path = os.path.join(
+                                        full_dir, "metadata", "__instrument_core_container"
+                                    )
+                                    pid_str = (
+                                        open(pid_path).read().strip()
+                                        if os.path.isfile(pid_path)
+                                        else "?"
+                                    )
+                                    ctr_str = (
+                                        open(ctr_path).read().strip()
+                                        if os.path.isfile(ctr_path)
+                                        else "docker"
+                                    )
+                                    base_log += (
+                                        f"[pulsar] Staged on IMAGINEX-1: {full_dir} "
+                                        f"(PID={pid_str}, container={ctr_str})\n"
+                                    )
+                                p_out = os.path.join(full_dir, "metadata", "job_stdout")
+                                p_err = os.path.join(full_dir, "metadata", "job_stderr")
+                                if os.path.isfile(p_out):
+                                    pulsar_live_out = open(p_out, errors="replace").read()
+                                if os.path.isfile(p_err):
+                                    pulsar_live_err = open(p_err, errors="replace").read()
                         except Exception:
                             pass
 
@@ -688,8 +740,20 @@ class NovaGalaxyPipelineRunner:
                 except Exception:
                     pass
 
-                out_txt = console_out or jinfo.get("tool_stdout") or jinfo.get("stdout") or ""
-                err_txt = console_err or jinfo.get("tool_stderr") or jinfo.get("stderr") or ""
+                out_txt = (
+                    console_out
+                    or pulsar_live_out
+                    or jinfo.get("tool_stdout")
+                    or jinfo.get("stdout")
+                    or ""
+                )
+                err_txt = (
+                    console_err
+                    or pulsar_live_err
+                    or jinfo.get("tool_stderr")
+                    or jinfo.get("stderr")
+                    or ""
+                )
                 cmd_header = (
                     f"$ {job_record['command_line']}\n" if job_record.get("command_line") else ""
                 )

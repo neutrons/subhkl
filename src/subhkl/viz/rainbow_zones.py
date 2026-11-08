@@ -4000,7 +4000,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             wavelength_max: params.wavelength_max,
             objective: "band",
             d_min: params.d_min,
-            n_zones: 400,
+            n_zones: 120,
             steps: params.steps,
           }};
         }} else if (stageId === "integrate") {{
