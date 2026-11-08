@@ -326,3 +326,42 @@ def test_finderless_solve_h5_forward_projection_and_stages(tmp_path):
     assert payload["pipeline_stages"][0]["name"] == "1. REDUCE & MERGE"
     assert "imaginex_subhkl_solve" in payload["pipeline_stages"][1]["tool_ids"]
 
+
+def test_nova_mvvm_pydantic_and_view_model(tmp_path):
+    """Verify NOVA tutorial MVVM architecture (`SubhklConfig`, `MainModel`, `MainViewModel`, `create_viewmodels`)."""
+    import pytest
+
+    pytest.importorskip("pydantic")
+    pytest.importorskip("nova.mvvm")
+    from pydantic import ValidationError
+    from nova.mvvm.trame_binding import TrameBinding
+    from trame.app import get_server
+
+    from subhkl.viz.nova_app.models.subhkl_model import InstrumentOptions, SubhklConfig
+    from subhkl.viz.nova_app.mvvm_factory import create_viewmodels
+
+    # 1. Verify Pydantic validation & defaults
+    cfg = SubhklConfig(instrument=InstrumentOptions.MANDI, a=70.0)
+    assert cfg.instrument == InstrumentOptions.MANDI
+    assert cfg.a == 70.0
+    assert cfg.wavelength_max > cfg.wavelength_min
+
+    with pytest.raises(ValidationError):
+        SubhklConfig(wavelength_min=5.0, wavelength_max=2.0)
+
+    # 2. Verify MVVM factory & ViewModel bindings with nova-mvvm TrameBinding
+    server = get_server("subhkl_test_server", client_type="vue3")
+    binding = TrameBinding(server.state)
+    vms = create_viewmodels(binding, instrument="CG4D")
+    vm = vms["main"]
+    vm.config_bind.connect("config")
+    vm.view_state_bind.connect("view_state")
+    vm.parallax_html_bind.connect("parallax_html")
+    vm.update_view()
+
+    assert vm.view_state.running is False
+    assert vm.model.subhkl.data.instrument == InstrumentOptions.CG4D
+    html_doc = vm.model.subhkl.render_html()
+    assert "DIFFRACTION PARALLAX" in html_doc
+
+

@@ -535,11 +535,27 @@ def serve_rainbow_zones(
 
     if prefer_trame:
         try:
-            app = RainbowZonesTrameApp(vm)
-            app.start(host=host, port=port)
+            from subhkl.viz.nova_app.views.main_view import MainApp
+
+            nova_app = MainApp(
+                peaks_h5=replay_h5,
+                images_h5=payload_kwargs.get("images_h5"),
+                instrument=payload_kwargs.get("instrument") or "CG4D",
+            )
+            nova_app.server.start(
+                host=host,
+                port=port,
+                open_browser=False,
+                timeout=0,
+            )
             return
-        except RuntimeError:
-            pass
+        except Exception:
+            try:
+                app = RainbowZonesTrameApp(vm)
+                app.start(host=host, port=port)
+                return
+            except RuntimeError:
+                pass
 
     ep_path = os.environ.get("EP_PATH", "").rstrip("/")
 
