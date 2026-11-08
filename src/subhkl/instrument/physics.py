@@ -162,6 +162,7 @@ def calculate_angular_error(
     gonio_axes: npt.NDArray = None,
     gonio_angles: npt.NDArray = None,
     gonio_offsets: npt.NDArray = None,  # <-- NEW
+    per_run_trans: npt.NDArray = None,
 ):
     if sample_offset is None:
         sample_offset = np.zeros(3)
@@ -199,8 +200,13 @@ def calculate_angular_error(
         )
 
         # Sample origin translates and rotates (is_vector=False applies translations)
+        s_init = (
+            np.asarray(per_run_trans, dtype=float)
+            if per_run_trans is not None
+            else np.zeros((len(xyz_det), 3))
+        )
         s_lab = sample_to_lab(
-            np.zeros((len(xyz_det), 3)),
+            s_init,
             gonio_axes,
             angles.T,
             offsets_full,
@@ -211,12 +217,19 @@ def calculate_angular_error(
         v = xyz_det - s_lab
     elif R_all is not None:
         # Legacy static fallback
+        s_eff = sample_offset[-1] if sample_offset.ndim == 2 else sample_offset
         if R_all.ndim == 3:
             q_lab_calc = np.einsum("nij,nj->ni", R_all, q_sample_calc)
-            s_lab = np.einsum("nij,j->ni", R_all, sample_offset)
+            if per_run_trans is not None:
+                s_lab = np.einsum("nij,nj->ni", R_all, s_eff[None, :] + per_run_trans)
+            else:
+                s_lab = np.einsum("nij,j->ni", R_all, s_eff)
         else:
             q_lab_calc = q_sample_calc @ R_all.T
-            s_lab = R_all @ sample_offset
+            if per_run_trans is not None:
+                s_lab = (s_eff[None, :] + per_run_trans) @ R_all.T
+            else:
+                s_lab = R_all @ s_eff
         v = xyz_det - s_lab
     else:
         q_lab_calc = q_sample_calc

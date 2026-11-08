@@ -471,3 +471,135 @@ def test_global_rot_axis_modes(tmp_path):
         rg = f["scan_refinement/parameters"][()][6:9]
         np.testing.assert_allclose(rg[0], rg[1], atol=1e-12)
         assert rg[2] == 0.0
+
+
+def test_per_run_trans_polish_recovers_shift_and_writes_trans_m(tmp_path):
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import generate_reflections
+    from subhkl.instrument.detector import Detector
+    from subhkl.instrument.physics import predict_reflections_on_panel
+    from subhkl.search.scan_band import _polish_per_run_translations, build_B_jax
+
+    cell = [30.0, 35.0, 40.0, 90.0, 90.0, 90.0]
+    sg = "P 21 21 21"
+    U_true = np.eye(3)
+    B_true = np.asarray(build_B_jax(*cell[:3], *np.deg2rad(cell[3:])), dtype=float)
+    UB_true = U_true @ B_true
+    h, k, l = generate_reflections(*cell, space_group=sg, d_min=2.5)
+    axes = np.array([[0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, -1.0]])
+    angles_run = [np.array([0.0, 0.0, 10.0]), np.array([0.0, 0.0, 130.0])]
+    R_runs_init = [calc_goniometer_rotation_matrix(axes, a) for a in angles_run]
+    # Run 0 has zero shift; Run 1 has a +3 mm z / -2 mm y lab-frame sample displacement
+    ds_lab_true = [np.zeros(3), np.array([0.0, -0.002, 0.003])]
+    bank_ids = sorted(int(k_) for k_ in beamlines["CG4D"].keys())
+    dets = {b: Detector(dict(beamlines["CG4D"][str(b)])) for b in bank_ids}
+    C_final = np.array([dets[b].center for b in bank_ids])
+    uh_final = np.array([dets[b].uhat for b in bank_ids])
+    vh_final = np.array([dets[b].vhat for b in bank_ids])
+    W_final = np.array([dets[b].width for b in bank_ids])
+    H_final = np.array([dets[b].height for b in bank_ids])
+    M_bank = np.array([float(dets[b].m - 1) for b in bank_ids])
+    N_bank = np.array([float(dets[b].n - 1) for b in bank_ids])
+
+    banks_l, pr_l, pc_l, dev_l, sig_l, runs_l, angs_l, w_l = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+    for r in (0, 1):
+        s_samp_r = R_runs_init[r].T @ ds_lab_true[r]
+        for b in bank_ids:
+            row, col, _, _, _, _ = predict_reflections_on_panel(
+                dets[b],
+                h,
+                k,
+                l,
+                UB_true,
+                2.8,
+                4.5,
+                sample_offset=s_samp_r,
+                R_all=R_runs_init[r],
+            )
+            if len(row):
+                n = len(row)
+                banks_l.append(np.full(n, b, int))
+                pr_l.append(row)
+                pc_l.append(col)
+                dev_l.append(np.full(n, 200.0))
+                sig_l.append(np.full(n, 1.5))
+                runs_l.append(np.full(n, r, int))
+                angs_l.append(np.repeat(angles_run[r][None, :], n, axis=0))
+                w_l.append(np.ones(n))
+    obs = tuple(
+        np.concatenate(v)
+        for v in (banks_l, pr_l, pc_l, dev_l, sig_l, runs_l, angs_l, w_l)
+    )
+    sel = np.ones(len(obs[0]), dtype=bool)
+    args = SimpleNamespace(
+        runs=[0, 1],
+        n_runs=2,
+        space_group=sg,
+        d_min=2.5,
+        assign_wavelength=(2.8, 4.5),
+        finder="finder.h5",
+    )
+    R_out, trans_out, med_b, med_a = _polish_per_run_translations(
+        args,
+        U_true,
+        B_true,
+        cell,
+        R_runs_init,
+        np.zeros(3),
+        bank_ids,
+        C_final,
+        uh_final,
+        vh_final,
+        W_final,
+        H_final,
+        M_bank,
+        N_bank,
+        obs=obs,
+        sel=sel,
+    )
+    assert med_a[1] < 0.35 * med_b[1]
+    recovered_lab_1 = R_out[1] @ trans_out[1]
+    np.testing.assert_allclose(recovered_lab_1, ds_lab_true[1], atol=4e-4)
+
+    # Verify run_scan_refinement with per_run_trans writes goniometer/per_run/trans_m
+    frames, bootstrap = tmp_path / "prt_counts.h5", tmp_path / "prt_seed.h5"
+    counts = np.full((2, 512, 512), 3.0)
+    counts[0, :32, :32] = 1.0
+    counts[1, :32, :32] = 5.0
+    with h5py.File(frames, "w") as f:
+        f["images"] = counts
+        f["bank_ids"] = [62, 62]
+        f["file_offsets"] = [0, 1]
+        f["goniometer/axes"] = axes
+        f["goniometer/angles"] = np.stack(angles_run)
+        f["goniometer/names"] = [b"omega", b"chi", b"phi"]
+        for k_, v_ in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            f[f"sample/{k_}"] = v_
+        f["sample/space_group"] = sg
+    with h5py.File(bootstrap, "w") as f:
+        f["sample/U"] = U_true
+    out_h5 = tmp_path / "prt_out.h5"
+    run_scan_refinement(
+        frames,
+        out_h5,
+        bootstrap=bootstrap,
+        modes=["per_run_trans"],
+        maxiter=1,
+        n_zones=60,
+        binning=32,
+    )
+    with h5py.File(out_h5) as f:
+        assert "goniometer/per_run/trans_m" in f
+        assert f["goniometer/per_run/trans_m"].shape == (2, 3)
+        R_kin, origins_kin, _, _, _ = frame_kinematics(f, 2, f["file_offsets"][()])
+        assert R_kin.shape == (2, 3, 3)
+        assert origins_kin.shape == (2, 3)

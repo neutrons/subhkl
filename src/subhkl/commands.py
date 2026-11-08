@@ -1347,6 +1347,10 @@ def run_peak_predictor(
         with h5py.File(indexed_hdf5_filename, "r") as f_in:
             if "detector_calibration" in f_in:
                 f_in.copy("detector_calibration", f)
+            if "goniometer/per_run" in f_in:
+                if "goniometer/per_run" in f:
+                    del f["goniometer/per_run"]
+                f_in.copy("goniometer/per_run", f["goniometer"])
 
 
 def run_rbf_integrator(
@@ -1397,6 +1401,16 @@ def run_rbf_integrator(
             f["goniometer/offsets"][()] if "goniometer/offsets" in f else None
         )
         all_R = f["goniometer/R"][()] if "goniometer/R" in f else None
+        per_run_trans = (
+            f["goniometer/per_run/trans_m"][()]
+            if "goniometer/per_run/trans_m" in f
+            else None
+        )
+        frame_to_run = (
+            f["goniometer/per_run/frame_to_run"][()]
+            if "goniometer/per_run/frame_to_run" in f
+            else None
+        )
 
         for key in f["banks"].keys():
             img_idx = int(key)
@@ -1444,6 +1458,8 @@ def run_rbf_integrator(
         gonio_axes=gonio_axes,
         gonio_angles=angles_stack,
         gonio_offsets=gonio_offsets,
+        per_run_trans=per_run_trans,
+        frame_to_run=frame_to_run,
     )
 
     print(f"Saving RBF integrated peaks to {output_filename}")
@@ -1496,6 +1512,10 @@ def run_rbf_integrator(
             # coordinates belong to.
             if "detector_calibration" in f_in:
                 f_in.copy("detector_calibration", f)
+            if "goniometer/per_run" in f_in:
+                if "goniometer/per_run" in f:
+                    del f["goniometer/per_run"]
+                f_in.copy("goniometer/per_run", f["goniometer"])
 
 
 def run_mtz_exporter(

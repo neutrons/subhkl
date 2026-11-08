@@ -448,6 +448,300 @@ def _make_ewald_polisher(
     return eval_runs, polish_joint, polish_per_run
 
 
+def _polish_per_run_translations(
+    args,
+    U_opt,
+    B_opt,
+    cell_opt,
+    R_runs_init,
+    s_samp,
+    bank_ids,
+    C_final,
+    uh_final,
+    vh_final,
+    W_final,
+    H_final,
+    M_bank,
+    N_bank,
+    exc_maps=None,
+    b2_ew=4,
+    obs=None,
+    sel=None,
+):
+    """Refine per-run 6-DOF (dR_r, ds_lab_r) via 3-round robust ICP on local peak maxima."""
+    from scipy.spatial.transform import Rotation as Rot
+
+    bank_to_idx = {b: i for i, b in enumerate(bank_ids)}
+    hkl = np.stack(
+        generate_reflections(
+            *cell_opt,
+            space_group=args.space_group,
+            d_min=args.d_min,
+        ),
+        axis=1,
+    ).astype(np.float64)
+    Gc = hkl @ B_opt.T
+    kih = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    nh_final = np.cross(uh_final, vh_final)
+    dw = W_final / np.maximum(M_bank, 1.0)
+    dh = H_final / np.maximum(N_bank, 1.0)
+    wmin, wmax = float(args.assign_wavelength[0]), float(args.assign_wavelength[1])
+    s_samp_vec = np.asarray(s_samp, dtype=np.float64)
+
+    R_runs_out = [
+        np.asarray(R_runs_init[r], dtype=np.float64).copy() for r in range(args.n_runs)
+    ]
+    trans_runs = np.zeros((args.n_runs, 3), dtype=np.float64)
+    med_before_list, med_after_list = [], []
+
+    for r in args.runs:
+        if args.finder and obs is not None and sel is not None:
+            banks_o, pr_o, pc_o, _dev_o, _sig_o, runs_o, _angs_o, weights_o = obs[:8]
+            m_r = sel & (runs_o == r)
+            b_r = np.array([bank_to_idx[int(b)] for b in banks_o[m_r]], dtype=np.int32)
+            pr_r = np.asarray(pr_o[m_r], dtype=np.float64)
+            pc_r = np.asarray(pc_o[m_r], dtype=np.float64)
+            w_raw = np.maximum(np.asarray(weights_o[m_r], dtype=np.float64), 1e-6)
+            if len(w_raw) > 300:
+                order = np.argsort(w_raw)[-300:]
+                b_r, pr_r, pc_r, w_raw = (
+                    b_r[order],
+                    pr_r[order],
+                    pc_r[order],
+                    w_raw[order],
+                )
+            w_r = (
+                np.clip(
+                    np.sqrt(w_raw / np.maximum(np.median(w_raw), 1e-6)),
+                    0.5,
+                    2.5,
+                )
+                if len(w_raw)
+                else np.array([], dtype=np.float64)
+            )
+        elif exc_maps is not None:
+            pos_r = [
+                exc_maps[(r, b)][exc_maps[(r, b)] > 0]
+                for b in bank_ids
+                if (r, b) in exc_maps and np.any(exc_maps[(r, b)] > 0)
+            ]
+            if not pos_r:
+                continue
+            all_pos = np.concatenate(pos_r)
+            thr = max(float(np.quantile(all_pos, 0.96)), 15.0)
+            b_list, pr_list, pc_list, ex_vals = [], [], [], []
+            for bi, b in enumerate(bank_ids):
+                ex = exc_maps.get((r, b))
+                if ex is None or ex.shape[0] <= 6 or ex.shape[1] <= 6:
+                    continue
+                H_e, W_e = ex.shape
+                center = ex[3:-3, 3:-3]
+                is_max = center >= thr
+                for di in range(-2, 3):
+                    for dj in range(-2, 3):
+                        if di == 0 and dj == 0:
+                            continue
+                        is_max &= (
+                            center >= ex[3 + di : H_e - 3 + di, 3 + dj : W_e - 3 + dj]
+                        )
+                ii, jj = np.nonzero(is_max)
+                ii = ii + 3
+                jj = jj + 3
+                for i_m, j_m in zip(ii, jj):
+                    patch = (
+                        np.maximum(ex[i_m - 1 : i_m + 2, j_m - 1 : j_m + 2], 0.0) ** 2
+                    )
+                    ps = float(patch.sum())
+                    if ps <= 0.0:
+                        continue
+                    di_c = float(patch[2, :].sum() - patch[0, :].sum()) / ps
+                    dj_c = float(patch[:, 2].sum() - patch[:, 0].sum()) / ps
+                    row_px = (i_m + di_c + 0.5) * float(b2_ew) - 0.5
+                    col_px = (j_m + dj_c + 0.5) * float(b2_ew) - 0.5
+                    b_list.append(bi)
+                    pr_list.append(row_px)
+                    pc_list.append(col_px)
+                    ex_vals.append(float(ex[i_m, j_m]))
+            if len(ex_vals) > 300:
+                order = np.argsort(ex_vals)[-300:]
+                b_r = np.array(b_list, dtype=np.int32)[order]
+                pr_r = np.array(pr_list, dtype=np.float64)[order]
+                pc_r = np.array(pc_list, dtype=np.float64)[order]
+                w_raw = np.array(ex_vals, dtype=np.float64)[order]
+            else:
+                b_r = np.array(b_list, dtype=np.int32)
+                pr_r = np.array(pr_list, dtype=np.float64)
+                pc_r = np.array(pc_list, dtype=np.float64)
+                w_raw = np.array(ex_vals, dtype=np.float64)
+            w_r = (
+                np.clip(
+                    np.sqrt(w_raw / np.maximum(np.median(w_raw), 1.0)),
+                    0.5,
+                    2.5,
+                )
+                if len(w_raw)
+                else np.array([], dtype=np.float64)
+            )
+        else:
+            continue
+
+        if len(b_r) < 8:
+            continue
+
+        R_r0 = R_runs_out[r]
+        xs0 = R_r0 @ s_samp_vec
+
+        def project_reflections(x_val):
+            rv0, ds0 = x_val[:3], x_val[3:6]
+            dR0 = Rot.from_rotvec(rv0).as_matrix()
+            G0 = (Gc @ (dR0 @ U_opt).T) @ R_r0.T
+            qn = np.linalg.norm(G0, axis=1)
+            sth = -(G0 @ kih) / np.maximum(qn, 1e-12)
+            lam = 2.0 * sth / np.maximum(qn, 1e-12)
+            band = (lam >= wmin) & (lam <= wmax) & (sth > 0)
+            idx_band = np.flatnonzero(band)
+            if len(idx_band) == 0:
+                return (
+                    idx_band,
+                    np.empty((0, len(bank_ids))),
+                    np.empty((0, len(bank_ids))),
+                    np.empty((0, len(bank_ids)), dtype=bool),
+                )
+            G_b, lam_b = G0[band], lam[band]
+            kf = kih[None, :] + lam_b[:, None] * G_b
+            kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+            cen_r = C_final - (xs0 + ds0)[None, :]
+            dn = kf @ nh_final.T
+            t = (cen_r * nh_final).sum(1)[None, :] / np.where(
+                np.abs(dn) < 1e-9, 1e-9, dn
+            )
+            p = t[:, :, None] * kf[:, None, :] - cen_r[None, :, :]
+            row = (p * vh_final[None]).sum(2) / dh[None]
+            col = (p * uh_final[None]).sum(2) / dw[None]
+            ok = (
+                (t > 0)
+                & (row >= 0)
+                & (col >= 0)
+                & (row <= N_bank[None])
+                & (col <= M_bank[None])
+            )
+            return idx_band, row, col, ok
+
+        def get_matches(x_val, radius):
+            idx_band, row, col, ok = project_reflections(x_val)
+            m_obs, m_hkl = [], []
+            if len(idx_band) == 0:
+                return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
+            for i_obs in range(len(b_r)):
+                bi = b_r[i_obs]
+                valid_h = np.flatnonzero(ok[:, bi])
+                if not len(valid_h):
+                    continue
+                d2 = (row[valid_h, bi] - pr_r[i_obs]) ** 2 + (
+                    col[valid_h, bi] - pc_r[i_obs]
+                ) ** 2
+                k = int(np.argmin(d2))
+                if d2[k] < radius**2:
+                    m_obs.append(i_obs)
+                    m_hkl.append(idx_band[valid_h[k]])
+            return np.array(m_obs, dtype=np.int32), np.array(m_hkl, dtype=np.int32)
+
+        def fit_matches(x_init, m_obs, m_hkl, f_sc=2.5, prior_ds=0.45):
+            if len(m_obs) < 8:
+                return x_init
+            b_m = b_r[m_obs]
+            rm = pr_r[m_obs]
+            cm = pc_r[m_obs]
+            wm = w_r[m_obs]
+            Gc_m = Gc[m_hkl]
+            C_m = C_final[b_m]
+            uh_m = uh_final[b_m]
+            vh_m = vh_final[b_m]
+            nh_m = nh_final[b_m]
+            dw_m = dw[b_m]
+            dh_m = dh[b_m]
+
+            def res_fn(x):
+                rv, ds = x[:3], x[3:6]
+                dR = Rot.from_rotvec(rv).as_matrix()
+                G = (Gc_m @ (dR @ U_opt).T) @ R_r0.T
+                q = np.linalg.norm(G, axis=1)
+                st = -(G @ kih) / np.maximum(q, 1e-12)
+                lm = 2.0 * st / np.maximum(q, 1e-12)
+                kf = kih[None, :] + lm[:, None] * G
+                kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+                cen_m = C_m - (xs0 + ds)[None, :]
+                denom = np.sum(kf * nh_m, axis=1)
+                denom = np.where(np.abs(denom) < 1e-9, 1e-9, denom)
+                t = (cen_m * nh_m).sum(1) / denom
+                p = t[:, None] * kf - cen_m
+                rp = np.sum(p * vh_m, axis=1) / dh_m
+                cp = np.sum(p * uh_m, axis=1) / dw_m
+                return np.concatenate(
+                    [
+                        wm * (rm - rp),
+                        wm * (cm - cp),
+                        (ds * 1000.0) * prior_ds,
+                        np.degrees(rv) * 1.5,
+                    ]
+                )
+
+            sol = least_squares(
+                res_fn,
+                x_init,
+                bounds=(
+                    [-0.03, -0.03, -0.03, -0.008, -0.008, -0.008],
+                    [0.03, 0.03, 0.03, 0.008, 0.008, 0.008],
+                ),
+                loss="soft_l1",
+                f_scale=f_sc,
+            )
+            return sol.x
+
+        def eval_med_dist(x_val, m_obs, m_hkl):
+            if len(m_obs) == 0:
+                return 999.0
+            rv, ds = x_val[:3], x_val[3:6]
+            dR = Rot.from_rotvec(rv).as_matrix()
+            G = (Gc[m_hkl] @ (dR @ U_opt).T) @ R_r0.T
+            q = np.linalg.norm(G, axis=1)
+            st = -(G @ kih) / np.maximum(q, 1e-12)
+            lm = 2.0 * st / np.maximum(q, 1e-12)
+            kf = kih[None, :] + lm[:, None] * G
+            kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+            b_m = b_r[m_obs]
+            cen_m = C_final[b_m] - (xs0 + ds)[None, :]
+            denom = np.sum(kf * nh_final[b_m], axis=1)
+            denom = np.where(np.abs(denom) < 1e-9, 1e-9, denom)
+            t = (cen_m * nh_final[b_m]).sum(1) / denom
+            p = t[:, None] * kf - cen_m
+            rp = np.sum(p * vh_final[b_m], axis=1) / dh[b_m]
+            cp = np.sum(p * uh_final[b_m], axis=1) / dw[b_m]
+            return float(np.median(np.hypot(pr_r[m_obs] - rp, pc_r[m_obs] - cp)))
+
+        mo0, mh0 = get_matches(np.zeros(6), 18.0)
+        if len(mo0) < 8:
+            continue
+        d_before = eval_med_dist(np.zeros(6), mo0, mh0)
+        x = fit_matches(np.zeros(6), mo0, mh0, f_sc=3.5, prior_ds=0.45)
+        mo1, mh1 = get_matches(x, 14.0)
+        x = fit_matches(x, mo1, mh1, f_sc=2.0, prior_ds=0.45)
+        mo2, mh2 = get_matches(x, 8.0)
+        x = fit_matches(x, mo2, mh2, f_sc=1.5, prior_ds=0.45)
+        d_after = eval_med_dist(x, mo0, mh0)
+        med_before_list.append(d_before)
+        if d_after < d_before:
+            dR_r = Rot.from_rotvec(x[:3]).as_matrix()
+            R_new = R_r0 @ dR_r
+            R_runs_out[r] = R_new
+            trans_runs[r] = R_new.T @ (xs0 + x[3:6]) - s_samp_vec
+            med_after_list.append(d_after)
+        else:
+            med_after_list.append(d_before)
+
+    return R_runs_out, trans_runs, med_before_list, med_after_list
+
+
 def refine_scan(args):
     """Staged band refinement; configuration and input validation live in scan_refine."""
     import jax
@@ -538,6 +832,7 @@ def refine_scan(args):
     is_single_setting = len(args.runs) <= 1 or np.allclose(
         R_obs[sel], R_obs[sel][0:1], atol=1e-6
     )
+    per_run_active = "per_run" in args.modes or "per_run_trans" in args.modes
 
     R_runs_nom = {}
     for r in range(n_runs):
@@ -580,7 +875,7 @@ def refine_scan(args):
             U_nom_joint, ew_nom_joint = polish_joint_nom(
                 best_u_nom, spans=(0.12, 0.04), n=7
             )
-            if "per_run" in args.modes and not is_single_setting:
+            if per_run_active and not is_single_setting:
                 Urs_nom, s_nom_r = polish_per_run_nom(U_nom_joint)
                 ew_nom = float(s_nom_r.sum())
                 R_runs_pre = dict(R_runs_nom)
@@ -761,7 +1056,8 @@ def refine_scan(args):
     }
     for bounds in (bounds_0, bounds_120, bounds_global, bounds_panel):
         for mode, indices in blocks.items():
-            if mode not in args.modes:
+            mode_on = per_run_active if mode == "per_run" else (mode in args.modes)
+            if not mode_on:
                 for i in indices:
                     bounds[i] = (0.0, 0.0)
         for slot in range(3):
@@ -855,7 +1151,7 @@ def refine_scan(args):
                 and ewald_ctx.get("R_runs_band_base") is ewald_ctx.get("R_runs_pre")
             )
             or r == args.anchor_run
-            or "per_run" not in args.modes
+            or not per_run_active
         ):
             continue
         if not np.any(runs[sel] == r):
@@ -1354,7 +1650,7 @@ def refine_scan(args):
             U_cal_joint, ew_cal_joint = U_cal_2, s_cal_2
         else:
             U_cal_joint, ew_cal_joint = U_cal_1, s_cal_1
-        if "per_run" in args.modes and not is_single_setting:
+        if per_run_active and not is_single_setting:
             Urs_cal, s_cal_r = polish_per_run_cal(U_cal_joint)
             ew_cal = float(s_cal_r.sum())
             used_per_run_cal = True
@@ -1388,7 +1684,7 @@ def refine_scan(args):
             vh_final = vhat_bank.copy()
             W_final = W_bank.copy()
             H_final = H_bank.copy()
-            if "per_run" in args.modes and not is_single_setting:
+            if per_run_active and not is_single_setting:
                 args.R_runs_refined = [
                     ewald_ctx["R_runs_pre"][r] for r in range(n_runs)
                 ]
@@ -1408,6 +1704,57 @@ def refine_scan(args):
             f"(cal={ew_cal:.1f}, nom={ew_nom:.1f})",
             flush=True,
         )
+
+    if "per_run_trans" in args.modes and not is_single_setting:
+        if getattr(args, "R_runs_refined", None) is not None:
+            R_runs_init = list(args.R_runs_refined)
+        else:
+            R_runs_init = []
+            for r in range(n_runs):
+                idx_r = np.flatnonzero(runs == r)
+                if len(idx_r):
+                    dR_r = np.asarray(
+                        rodrigues_jax(
+                            float(dom[r]) * jnp.asarray(scan_axes_obs[idx_r[0]])
+                        )
+                    )
+                    R_runs_init.append(dR_r @ R_obs[idx_r[0]])
+                else:
+                    R_runs_init.append(R_runs_nom[r])
+        exc_maps_pol = ewald_ctx["exc_maps"] if ewald_ctx is not None else None
+        b2_pol = ewald_ctx["b2"] if ewald_ctx is not None else 4
+        if exc_maps_pol is None and not args.finder:
+            exc_maps_pol, b2_pol, _ = _build_ewald_excess_maps(args)
+        R_runs_pol, trans_runs_pol, med_b, med_a = _polish_per_run_translations(
+            args,
+            U_opt,
+            B_opt,
+            [a_opt, b_opt, c_opt, al_opt, be_opt, ga_opt],
+            R_runs_init,
+            np.asarray(s_samp),
+            bank_ids,
+            C_final,
+            uh_final,
+            vh_final,
+            W_final,
+            H_final,
+            M_bank,
+            N_bank,
+            exc_maps=exc_maps_pol,
+            b2_ew=b2_pol,
+            obs=obs,
+            sel=sel,
+        )
+        args.R_runs_refined = R_runs_pol
+        args.trans_runs_refined = trans_runs_pol
+        max_t_mm = float(1e3 * np.linalg.norm(trans_runs_pol, axis=1).max())
+        if med_b:
+            print(
+                f"[Stage 4: Per-Run Translation Polish] med_px = "
+                f"{np.median(med_b):.2f} -> {np.median(med_a):.2f}, "
+                f"max_trans = {max_t_mm:.2f} mm",
+                flush=True,
+            )
 
     lower, upper = np.asarray(bounds_panel).T
     args.parameter_bounds = np.asarray(bounds_panel)
