@@ -187,10 +187,22 @@ class SubhklGalaxyModel:
             if instrument in InstrumentOptions.__members__
             else InstrumentOptions.CG4D
         )
+        default_peaks = "/home/xvg/subhkl-examples/betalac-7/solve.h5"
+        default_images = "/home/xvg/subhkl-examples/betalac-7/merged.h5"
+        resolved_peaks = (
+            str(peaks_h5)
+            if peaks_h5
+            else (default_peaks if os.path.isfile(default_peaks) else "")
+        )
+        resolved_images = (
+            str(images_h5)
+            if images_h5
+            else (default_images if os.path.isfile(default_images) else "")
+        )
         self.data = SubhklConfig(
             instrument=inst,
-            peaks_file=str(peaks_h5) if peaks_h5 else "",
-            images_file=str(images_h5) if images_h5 else "",
+            peaks_file=resolved_peaks,
+            images_file=resolved_images,
         )
         self.payload: dict[str, Any] | None = None
         self.last_job_result: dict[str, Any] = {}

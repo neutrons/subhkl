@@ -349,19 +349,13 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
     with pytest.raises(ValidationError):
         SubhklConfig(wavelength_min=5.0, wavelength_max=2.0)
 
-    # 2. Verify MVVM factory & ViewModel bindings with nova-mvvm TrameBinding
-    server = get_server("subhkl_test_server", client_type="vue3")
-    binding = TrameBinding(server.state)
-    vms = create_viewmodels(binding, instrument="CG4D")
-    vm = vms["main"]
-    vm.config_bind.connect("config")
-    vm.view_state_bind.connect("view_state")
-    vm.parallax_html_bind.connect("parallax_html")
-    vm.update_view()
+    # 2. Verify MainApp(server=None) initializes ThemedApp, TrameBinding, ViewModel & UI cleanly
+    from subhkl.viz.nova_app.views.main_view import MainApp
 
-    assert vm.view_state.running is False
-    assert vm.model.subhkl.data.instrument == InstrumentOptions.CG4D
-    html_doc = vm.model.subhkl.render_html()
-    assert "DIFFRACTION PARALLAX" in html_doc
+    app = MainApp(instrument="CG4D")
+    assert app.server is not None
+    assert app.view_model.view_state.running is False
+    assert app.view_model.model.subhkl.data.instrument == InstrumentOptions.CG4D
+    assert "DIFFRACTION PARALLAX" in app.server.state.parallax_html
 
 

@@ -25,7 +25,6 @@ class MainApp(ThemedApp):
         instrument: str = "CG4D",
     ) -> None:
         super().__init__(server=server)
-        self.server = server
         self._peaks_h5 = peaks_h5
         self._images_h5 = images_h5
         self._instrument = instrument
