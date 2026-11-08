@@ -126,7 +126,7 @@ def solve(
     refine_modes: Annotated[
         str | None,
         typer.Option(
-            help="Band modes: cylindrical,axial_stretch,area,global_rot,global_trans,sample,cell,per_run,panels"
+            help="Band modes: cylindrical,axial_stretch,area,global_rot,global_trans,sample,cell,per_run,per_run_trans,panels"
         ),
     ] = None,
     runs: Annotated[

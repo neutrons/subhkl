@@ -697,6 +697,8 @@ def integrate_peaks_rbf_ssn(
     gonio_axes: np.ndarray = None,
     gonio_angles: np.ndarray = None,
     gonio_offsets: np.ndarray = None,
+    per_run_trans: np.ndarray = None,
+    frame_to_run: np.ndarray = None,
 ):
     """
     Args:
@@ -850,7 +852,16 @@ def integrate_peaks_rbf_ssn(
             elif offsets is None:
                 offsets_full = np.zeros((len(gonio_axes), 3))
             else:
-                offsets_full = offsets
+                offsets_full = np.array(offsets, dtype=float, copy=True)
+            if per_run_trans is not None:
+                r_id = (
+                    int(frame_to_run[f_idx])
+                    if frame_to_run is not None and f_idx < len(frame_to_run)
+                    else int(run_id)
+                )
+                if 0 <= r_id < len(per_run_trans):
+                    offsets_full = np.array(offsets_full, dtype=float, copy=True)
+                    offsets_full[-1] = offsets_full[-1] + per_run_trans[r_id]
 
             return sample_to_lab(
                 np.array([0.0, 0.0, 0.0]),
@@ -866,6 +877,14 @@ def integrate_peaks_rbf_ssn(
             if sample_offset is not None and sample_offset.ndim == 1
             else (sample_offset[-1] if sample_offset is not None else np.zeros(3))
         )
+        if per_run_trans is not None:
+            r_id = (
+                int(frame_to_run[f_idx])
+                if frame_to_run is not None and f_idx < len(frame_to_run)
+                else int(run_id)
+            )
+            if 0 <= r_id < len(per_run_trans):
+                s_off = s_off + per_run_trans[r_id]
         return R_val @ s_off if R_val is not None else s_off
 
     max_sigma = max(sigmas)

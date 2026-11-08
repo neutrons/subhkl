@@ -25,6 +25,7 @@ MODES = frozenset(
         "sample",
         "cell",
         "per_run",
+        "per_run_trans",
         "panels",
     ]
 )
@@ -641,6 +642,9 @@ def write_result(
                 put("goniometer/translations", np.asarray(sample, float))
                 put("goniometer/per_run/delta_deg", np.asarray(delta, float))
                 put("goniometer/per_run/frame_to_run", run_ids)
+            trans_runs_ref = getattr(args, "trans_runs_refined", None)
+            if trans_runs_ref is not None:
+                put("goniometer/per_run/trans_m", np.asarray(trans_runs_ref, float))
             for i, bank in enumerate(banks):
                 for key, value in (
                     ("center", centers[i]),
