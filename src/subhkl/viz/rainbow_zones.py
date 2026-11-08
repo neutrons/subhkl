@@ -2480,7 +2480,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (replace) {{
       box.textContent = text;
     }} else {{
-      box.textContent += (box.textContent.endsWith("\n") ? "" : "\n") + text;
+      box.textContent += (box.textContent.endsWith("\\n") ? "" : "\\n") + text;
     }}
     box.scrollTop = box.scrollHeight;
   }}
@@ -3909,7 +3909,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const cellSummary = document.getElementById("cell-summary");
     if (cellSummary) cellSummary.textContent = `RUNNING ${{stageId.toUpperCase()}}...`;
     appendTerminalLog(
-      `$ subhkl [${{st.name}}] — dispatching (SG=${{params.space_group}}, cell=${{params.a}},${{params.b}},${{params.c}}, λ=${{params.wavelength_min.toFixed(2)}}–${{params.wavelength_max.toFixed(2)}} Å)...\n`,
+      `$ subhkl [${{st.name}}] — dispatching (SG=${{params.space_group}}, cell=${{params.a}},${{params.b}},${{params.c}}, λ=${{params.wavelength_min.toFixed(2)}}–${{params.wavelength_max.toFixed(2)}} Å)...\\n`,
       true
     );
 
@@ -3927,7 +3927,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const jobObj = res.job || {{}};
         const jobId = jobObj.job_id || "local";
         if (jobObj.stdout || jobObj.stderr) {{
-          appendTerminalLog((jobObj.stdout || "") + (jobObj.stderr ? `\n[stderr]\n${{jobObj.stderr}}` : ""), true);
+          appendTerminalLog((jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : ""), true);
         }}
         if (stageId === "solve") selectLadderRung(0, false);
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
@@ -3938,7 +3938,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const sdoc = await sr.json();
             const aj = sdoc.active_job;
             if (!aj) return;
-            const outText = (aj.stdout || "") + (aj.stderr ? `\n[stderr]\n${{aj.stderr}}` : "");
+            const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");
             if (outText) appendTerminalLog(outText, true);
             if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
               selectLadderRung(aj.ladder_rung_idx, false);
@@ -3956,7 +3956,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                   if (pr.ok) {{
                     const newPayload = await pr.json();
                     recomputeBoundsAndReload(newPayload);
-                    appendTerminalLog("\n✓ Reloaded updated orientation & Bragg reflections into viewport.");
+                    appendTerminalLog("\\n✓ Reloaded updated orientation & Bragg reflections into viewport.");
                   }}
                 }} catch (_re) {{}}
               }}
@@ -3966,7 +3966,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }} catch (err) {{
         state.runningStageIdx = -1;
         renderPipeline();
-        appendTerminalLog(`\n[error] ${{err.message}}`);
+        appendTerminalLog(`\\n[error] ${{err.message}}`);
       }}
       return;
     }}
@@ -4046,12 +4046,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (!jr.ok) return;
             const jdoc = await jr.json();
             const jstate = jdoc.state || "running";
-            const cmdLine = jdoc.command_line ? `$ ${{jdoc.command_line}}\n` : "";
+            const cmdLine = jdoc.command_line ? `$ ${{jdoc.command_line}}\\n` : "";
             const stdOut = jdoc.tool_stdout || jdoc.stdout || "";
             const stdErr = jdoc.tool_stderr || jdoc.stderr || "";
             if (cmdLine || stdOut || stdErr) {{
               appendTerminalLog(
-                `[job ${{jobId}} · ${{jstate}}]\n${{cmdLine}}${{stdOut}}${{stdErr ? "\\n[stderr]\\n" + stdErr : ""}}`,
+                `[job ${{jobId}} · ${{jstate}}]\\n${{cmdLine}}${{stdOut}}${{stdErr ? "\\n[stderr]\\n" + stdErr : ""}}`,
                 true
               );
             }}
@@ -4071,7 +4071,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 await probeGalaxyConnection();
                 const outs = (tres.outputs || []).filter(o => o.extension === "h5" || o.extension === "hdf5");
                 if (outs.length > 0) {{
-                  appendTerminalLog(`\n✓ Loading output dataset ${{outs[0].id}} into viewport...`);
+                  appendTerminalLog(`\\n✓ Loading output dataset ${{outs[0].id}} into viewport...`);
                   await loadFromGalaxyDatasetId(outs[0].id);
                 }}
               }} else {{
@@ -4083,7 +4083,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }} catch (err) {{
         state.runningStageIdx = -1;
         renderPipeline();
-        appendTerminalLog(`\n[error] ${{err.message}}`);
+        appendTerminalLog(`\\n[error] ${{err.message}}`);
       }}
       return;
     }}

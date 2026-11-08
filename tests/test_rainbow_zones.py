@@ -363,4 +363,19 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
     assert 'id="terminal-box"' in html
     assert "2.8 * state.detZoom" in html
 
+    # 3. Verify embedded JavaScript has zero syntax errors
+    import re
+    import shutil
+    import subprocess
+
+    if shutil.which("node"):
+        scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+        assert scripts
+        js_file = tmp_path / "embedded_check.js"
+        js_file.write_text(scripts[-1], encoding="utf-8")
+        proc = subprocess.run(
+            ["node", "--check", str(js_file)], capture_output=True, text=True
+        )
+        assert proc.returncode == 0, f"JS syntax error: {proc.stderr}"
+
 

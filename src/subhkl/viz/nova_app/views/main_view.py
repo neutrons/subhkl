@@ -63,6 +63,10 @@ class MainApp:
         async def handle_payload(_request: web.Request) -> web.Response:
             return web.json_response(self.view_model.model.subhkl.payload or {})
 
+        async def handle_standalone_html(_request: web.Request) -> web.Response:
+            html_doc = self.view_model.model.subhkl.get_widget_html()
+            return web.Response(text=html_doc, content_type="text/html")
+
         async def handle_run(request: web.Request) -> web.Response:
             try:
                 body = await request.json()
@@ -104,6 +108,7 @@ class MainApp:
                 web.get("/api/pipeline/status", handle_status),
                 web.get("/api/payload", handle_payload),
                 web.post("/api/pipeline/run", handle_run),
+                web.get("/subhkl_parallax.html", handle_standalone_html),
             ]
         )
 
