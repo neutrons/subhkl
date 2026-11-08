@@ -1669,37 +1669,39 @@ def render_rainbow_html(
     user-select: none;
   }}
 
-  /* Top Header Bar */
+  /* Top Header Bar — single compact row */
   .top-bar {{
     display: flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     align-items: center;
     justify-content: space-between;
-    gap: 10px;
-    padding: 8px 16px;
+    gap: 8px;
+    padding: 5px 12px;
     background: var(--bg-panel);
     border-bottom: 1px solid var(--border-color);
+    min-height: 38px;
   }}
 
   .brand-block {{
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 8px;
+    white-space: nowrap;
   }}
 
   .rainbow-logo {{
     font-family: var(--font-display);
     font-weight: 800;
-    font-size: 1.1rem;
-    letter-spacing: 0.8px;
+    font-size: 0.92rem;
+    letter-spacing: 0.5px;
     background: linear-gradient(90deg, #ff2a55, #ff8c1a, #ffe600, #1aff66, #00e5ff, #b833ff);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
   }}
 
   .subtitle-tag {{
-    font-size: 0.74rem;
-    padding: 3px 8px;
+    font-size: 0.68rem;
+    padding: 2px 6px;
     border-radius: 4px;
     background: var(--bg-card);
     border: 1px solid var(--border-color);
@@ -1710,27 +1712,29 @@ def render_rainbow_html(
   .hud-metrics {{
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 6px;
+    white-space: nowrap;
   }}
 
   .hud-pill {{
     background: var(--bg-card);
     border: 1px solid var(--border-color);
-    border-radius: 6px;
-    padding: 4px 10px;
+    border-radius: 4px;
+    padding: 2px 7px;
     display: flex;
-    flex-direction: column;
+    align-items: baseline;
+    gap: 5px;
   }}
 
   .hud-label {{
-    font-size: 0.62rem;
+    font-size: 0.58rem;
     text-transform: uppercase;
     color: var(--text-dim);
     font-family: var(--font-display);
   }}
 
   .hud-value {{
-    font-size: 0.9rem;
+    font-size: 0.74rem;
     font-weight: 700;
     color: var(--accent-gold);
     font-family: var(--font-display);
@@ -1739,20 +1743,21 @@ def render_rainbow_html(
   .controls-cluster {{
     display: flex;
     align-items: center;
-    gap: 6px;
-    flex-wrap: wrap;
+    gap: 4px;
+    flex-wrap: nowrap;
   }}
 
   button {{
     background: var(--bg-card);
     color: var(--text-main);
     border: 1px solid var(--border-color);
-    border-radius: 6px;
-    padding: 5px 10px;
-    font-size: 0.76rem;
+    border-radius: 5px;
+    padding: 3px 8px;
+    font-size: 0.68rem;
     font-family: var(--font-display);
     font-weight: 600;
     cursor: pointer;
+    white-space: nowrap;
     transition: all 0.12s ease;
   }}
 
@@ -1766,12 +1771,12 @@ def render_rainbow_html(
     color: #fff;
   }}
 
-  /* Main Workspace: Hero Unrolled Detector + Clean Right Inspector */
+  /* Main Workspace: Maximize Hero Detector + Compact Right Sidebar */
   .workspace {{
     display: grid;
-    grid-template-columns: 1fr 310px;
-    gap: 10px;
-    padding: 10px 14px;
+    grid-template-columns: 1fr 264px;
+    gap: 6px;
+    padding: 6px 8px;
     flex: 1;
     min-height: 0;
   }}
@@ -1779,7 +1784,7 @@ def render_rainbow_html(
   .canvas-card {{
     background: var(--bg-panel);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: 6px;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -1787,19 +1792,7 @@ def render_rainbow_html(
   }}
 
   .card-header {{
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 12px;
-    background: var(--bg-card);
-    border-bottom: 1px solid var(--border-color);
-    font-size: 0.78rem;
-    font-family: var(--font-display);
-  }}
-
-  .card-header .hint {{
-    font-size: 0.7rem;
-    color: var(--text-dim);
+    display: none;
   }}
 
   .canvas-wrap {{
@@ -1824,14 +1817,14 @@ def render_rainbow_html(
   /* Floating Stereogram Mini-HUD in Bottom-Left of Detector Canvas */
   .stereo-inset {{
     position: absolute;
-    bottom: 14px;
-    left: 14px;
-    width: 215px;
-    height: 215px;
+    bottom: 10px;
+    left: 10px;
+    width: 165px;
+    height: 165px;
     background: rgba(10, 14, 28, 0.9);
     border: 1px solid var(--border-color);
-    border-radius: 10px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
+    border-radius: 8px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.65);
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -1847,8 +1840,8 @@ def render_rainbow_html(
 
   .stereo-inset-header {{
     font-family: var(--font-display);
-    font-size: 0.66rem;
-    padding: 4px 8px;
+    font-size: 0.6rem;
+    padding: 3px 6px;
     background: rgba(255, 255, 255, 0.05);
     color: var(--text-dim);
     display: flex;
@@ -1856,21 +1849,9 @@ def render_rainbow_html(
     align-items: center;
   }}
 
-  /* Layer Legend Overlay in Top-Left of Detector Canvas */
+  /* Hidden legend overlay so it never obscures the detector canvas */
   .layer-legend {{
-    position: absolute;
-    top: 12px;
-    left: 56px;
-    background: rgba(10, 14, 28, 0.84);
-    border: 1px solid var(--border-color);
-    border-radius: 6px;
-    padding: 6px 10px;
-    font-size: 0.72rem;
-    font-family: var(--font-display);
-    display: flex;
-    gap: 14px;
-    pointer-events: none;
-    backdrop-filter: blur(4px);
+    display: none;
   }}
 
   .legend-item {{
@@ -1979,16 +1960,16 @@ def render_rainbow_html(
   .ladder-bar {{
     background: var(--bg-panel);
     border-top: 1px solid var(--border-color);
-    padding: 6px 14px 8px 14px;
+    padding: 4px 8px 6px 8px;
     display: flex;
     flex-direction: column;
-    gap: 5px;
+    gap: 4px;
   }}
 
   .stage-pill {{
     font-family: var(--font-display);
-    font-size: 0.65rem;
-    padding: 2px 7px;
+    font-size: 0.62rem;
+    padding: 1px 6px;
     border-radius: 999px;
     border: 1px solid var(--border-color);
     background: var(--bg-card);
@@ -2015,21 +1996,7 @@ def render_rainbow_html(
   }}
 
   .iframe-popout-banner {{
-    position: fixed;
-    top: 48px;
-    left: 50%;
-    transform: translateX(-50%);
-    z-index: 9999;
-    background: rgba(14, 19, 38, 0.96);
-    border: 1.5px solid var(--accent-gold);
-    border-radius: 8px;
-    padding: 8px 16px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.65);
-    font-family: var(--font-display);
-    font-size: 0.78rem;
+    display: none !important;
   }}
 
   .ladder-header {{
@@ -2040,22 +2007,25 @@ def render_rainbow_html(
 
   .ladder-title {{
     font-family: var(--font-display);
-    font-size: 0.8rem;
+    font-size: 0.72rem;
     font-weight: 700;
     color: var(--accent-gold);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }}
 
   .ladder-rungs {{
     display: grid;
     grid-template-columns: repeat(5, 1fr);
-    gap: 8px;
+    gap: 6px;
   }}
 
   .rung-card {{
     background: var(--bg-card);
-    border: 1.5px solid var(--border-color);
-    border-radius: 6px;
-    padding: 6px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    padding: 4px 8px;
     cursor: pointer;
     transition: all 0.12s ease;
   }}
@@ -2073,20 +2043,26 @@ def render_rainbow_html(
     display: flex;
     justify-content: space-between;
     font-family: var(--font-display);
-    font-size: 0.68rem;
+    font-size: 0.62rem;
     color: var(--accent-cyan);
   }}
 
   .rung-name {{
     font-family: var(--font-display);
     font-weight: 700;
-    font-size: 0.78rem;
-    margin: 2px 0;
+    font-size: 0.7rem;
+    margin: 1px 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }}
 
   .rung-sub {{
-    font-size: 0.68rem;
+    font-size: 0.62rem;
     color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }}
 </style>
 </head>
@@ -2095,57 +2071,57 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title">🌈 SUBHKL // DIFFRACTION PARALLAX</div>
-      <span class="subtitle-tag">{inst} • {sg} • {src_badge}</span>
+      <div class="rainbow-logo" id="app-title">🌈 SUBHKL</div>
+      <span class="subtitle-tag">{inst} · {sg}</span>
     </div>
 
     <div class="hud-metrics">
       <div class="hud-pill">
-        <span class="hud-label">INDEXED PEAKS</span>
-        <span class="hud-value" id="val-indexed">0 / 0 (0%)</span>
+        <span class="hud-label">PEAKS</span>
+        <span class="hud-value" id="val-indexed">0 / 0</span>
       </div>
       <div class="hud-pill">
-        <span class="hud-label">ANGULAR Δθ RMS</span>
+        <span class="hud-label">Δθ</span>
         <span class="hud-value" id="val-rms">0.000°</span>
       </div>
       <div class="hud-pill">
-        <span class="hud-label">ACTIVE ZONES</span>
-        <span class="hud-value" id="val-zones">0 ACTIVE</span>
+        <span class="hud-label">ZONES</span>
+        <span class="hud-value" id="val-zones">0</span>
       </div>
-      <div class="hud-pill">
-        <span class="hud-label">PROJECTION</span>
-        <span class="hud-value" id="val-proj">CYLINDRICAL</span>
+      <div class="hud-pill" style="display:none;">
+        <span class="hud-label">PROJ</span>
+        <span class="hud-value" id="val-proj">CYL</span>
       </div>
     </div>
 
     <div class="controls-cluster">
-      <select id="sel-galaxy-h5" title="Load solve.h5 / indexer.h5 dataset directly from active Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:6px;padding:4px 8px;font-size:0.72rem;font-family:var(--font-display);max-width:190px;">
-        <option value="">📂 Galaxy History (.h5)...</option>
+      <select id="sel-galaxy-h5" title="Load solve.h5 / indexer.h5 dataset directly from active Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:5px;padding:3px 6px;font-size:0.68rem;font-family:var(--font-display);max-width:145px;">
+        <option value="">📂 Galaxy (.h5)...</option>
       </select>
       <input type="file" id="inp-local-h5" accept=".h5,.hdf5" multiple style="display:none;" />
       <button id="btn-local-h5" title="Open local solve.h5 + merged.h5 files directly in the browser (via h5wasm)">
-        📂 LOCAL .H5
+        📂 Local .h5
       </button>
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
-        🥫 PROJ: CYLINDRICAL
+        🥫 Cyl
       </button>
       <button id="btn-zone-order" class="active-btn" title="Cycle maximum Laue zone index order: |u,v,w| ≤ 1 (fundamental) → ≤ 2 → ≤ 3 (higher-order)">
-        📐 ZONES: |u,v,w| ≤ 1
+        |uvw|≤1
       </button>
       <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
-        〰️ ZONE ARCS: ON
+        Arcs
       </button>
       <button id="btn-heatmap-cmap" title="Cycle Detector Intensity Heatmap Colormap (Magma / Cyan Glow / Film)">
-        🔥 DETECTOR: MAGMA
+        Magma
       </button>
-      <button id="btn-stereo-toggle" class="active-btn" title="Show/Hide 3D Crystal Stereogram Inset">
-        🌐 STEREOGRAM
+      <button id="btn-stereo-toggle" title="Show/Hide 3D Crystal Stereogram Inset">
+        Wulff
       </button>
       <button id="btn-reset-view" title="Reset Zoom, Pan, and Parallax">
-        ⟲ RESET
+        ⟲
       </button>
       <button id="btn-new-tab" style="border-color:var(--accent-gold);color:var(--accent-gold);" title="Open this view in its own full-screen browser tab">
-        ↗ NEW TAB
+        ↗
       </button>
     </div>
   </header>
@@ -2185,11 +2161,11 @@ def render_rainbow_html(
           </div>
         </div>
 
-        <!-- Optional Corner Stereogram Inset -->
-        <div class="stereo-inset" id="stereo-inset">
+        <!-- Optional Corner Stereogram Inset (hidden by default so detector banks are unobstructed) -->
+        <div class="stereo-inset hidden" id="stereo-inset">
           <div class="stereo-inset-header">
-            <span>S² CRYSTAL WULFF NET</span>
-            <span id="stereo-hint">Ĝ DIRECTIONS</span>
+            <span>WULFF NET</span>
+            <span id="stereo-hint">Ĝ</span>
           </div>
           <canvas id="canvas-stereo"></canvas>
         </div>
@@ -2306,7 +2282,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     showZoneArcs: true,           // single vibrant arc per zone (not multi-band rainbow)
     heatmapStyle: "magma",        // "magma" | "cyan" | "gray"
     detAlpha: 0.85,
-    showStereo: true,
+    showStereo: false,
     lamMin: wlRange[0],
     lamMax: wlRange[1],
     zoneTolDeg: 0.75,
@@ -2421,8 +2397,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function syncProjectionUI() {{
     const isSph = state.projection === "spherical";
     const btn = document.getElementById("btn-proj-toggle");
-    btn.textContent = isSph ? "🌐 PROJ: SPHERICAL (MANDI)" : "🥫 PROJ: CYLINDRICAL (CG4D)";
-    document.getElementById("val-proj").textContent = isSph ? "SPHERICAL (φ, ψ)" : "CYLINDRICAL (φ, Y)";
+    btn.textContent = isSph ? "🌐 Sph" : "🥫 Cyl";
+    document.getElementById("val-proj").textContent = isSph ? "SPH" : "CYL";
     document.getElementById("detector-header-title").textContent = isSph
       ? "🎯 SPHERICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs ELEVATION ψ [deg])"
       : "🎯 CYLINDRICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs LAB HEIGHT Y [m])";
@@ -2434,7 +2410,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const matching = ZONES.filter(z => (z.order || 1) <= ordLevel).map(z => z.zone_id);
     state.activeZones = new Set(matching);
     const btnTop = document.getElementById("btn-zone-order");
-    if (btnTop) btnTop.textContent = `📐 ZONES: |u,v,w| ≤ ${{ordLevel}}`;
+    if (btnTop) btnTop.textContent = `|uvw|≤${{ordLevel}}`;
     [1, 2, 3].forEach(k => {{
       const b = document.getElementById(`btn-order-${{k}}`);
       if (b) b.classList.toggle("active-btn", k === ordLevel);
@@ -2709,7 +2685,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   // layerOffset = +0.25..+0.90 (Front: Predicted Bragg Rings floating by d-spacing)
   function detToScreen(dx, dy, w, h, layerOffset = 0.0) {{
     const bounds = getActiveBounds();
-    const padL = 52, padR = 20, padT = 36, padB = 28;
+    const padL = 42, padR = 12, padT = 14, padB = 22;
     const plotW = Math.max(50, w - padL - padR);
     const plotH = Math.max(50, h - padT - padB);
     const u = (dx - bounds.minX) / (bounds.maxX - bounds.minX);
@@ -2845,10 +2821,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.strokeRect(x0, y0, pw, ph);
       }}
 
-      if (pw > 26 && ph > 18) {{
-        ctx.fillStyle = "rgba(148, 163, 184, 0.48)";
-        ctx.font = "9px monospace";
-        ctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 10);
+    // Only show bank labels when zoomed in so default view is clean
+      if (state.detZoom > 1.35 && pw > 34 && ph > 24) {{
+        ctx.fillStyle = "rgba(148, 163, 184, 0.42)";
+        ctx.font = "8px monospace";
+        ctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 9);
       }}
     }});
     ctx.restore();
@@ -2867,10 +2844,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         panelSegs.forEach((seg, sIdx) => {{
           const screenPts = seg.map(pt => detToScreen(pt[0], pt[1], w, h, 0.0));
           drawSingleZoneArc(ctx, screenPts, zone, false);
-          if (sIdx === 0 && screenPts.length > 2) {{
+          if (sIdx === 0 && screenPts.length > 2 && (state.selectedZoneId === zone.zone_id || state.detZoom > 1.35)) {{
             const mid = screenPts[Math.floor(screenPts.length * 0.5)];
             ctx.save();
-            ctx.font = "bold 10px monospace";
+            ctx.font = "bold 9px monospace";
             ctx.fillStyle = "#070913";
             ctx.fillText(zone.label, mid[0] + 6, mid[1] - 4);
             ctx.fillStyle = zone.rainbow_color;
@@ -3120,14 +3097,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   document.getElementById("btn-zone-arcs").addEventListener("click", (ev) => {{
     state.showZoneArcs = !state.showZoneArcs;
     ev.currentTarget.classList.toggle("active-btn", state.showZoneArcs);
-    ev.currentTarget.textContent = state.showZoneArcs
-      ? "〰️ ZONE ARCS: ON"
-      : "〰️ ZONE ARCS: OFF";
+    ev.currentTarget.textContent = "Arcs";
   }});
 
   document.getElementById("btn-heatmap-cmap").addEventListener("click", (ev) => {{
     const order = ["magma", "cyan", "gray"];
-    const labels = {{ magma: "🔥 DETECTOR: MAGMA", cyan: "💎 DETECTOR: CYAN", gray: "🎞️ DETECTOR: FILM" }};
+    const labels = {{ magma: "Magma", cyan: "Cyan", gray: "Film" }};
     state.heatmapStyle = order[(order.indexOf(state.heatmapStyle) + 1) % order.length];
     ev.currentTarget.textContent = labels[state.heatmapStyle];
     rebuildBankColorMaps();
