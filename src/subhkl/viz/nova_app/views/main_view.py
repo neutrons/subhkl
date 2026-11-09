@@ -80,9 +80,9 @@ class MainApp:
             params.setdefault(
                 "cell", [data.a, data.b, data.c, data.alpha, data.beta, data.gamma]
             )
-            params.setdefault(
-                "wavelength_range", [data.wavelength_min, data.wavelength_max]
-            )
+            wl_min = float(params.get("wavelength_min", data.wavelength_min))
+            wl_max = float(params.get("wavelength_max", data.wavelength_max))
+            params["wavelength_range"] = [wl_min, wl_max]
             params.setdefault("d_min", data.d_min)
             params.setdefault("n_zones", data.n_zones)
             params.setdefault("steps", data.steps)

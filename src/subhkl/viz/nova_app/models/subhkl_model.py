@@ -114,7 +114,7 @@ class SubhklConfig(BaseModel):
         description="Unit cell gamma (deg)",
     )
     wavelength_min: float = Field(
-        default=1.8,
+        default=2.8,
         gt=0.05,
         le=30.0,
         title="λ min (Å)",
@@ -128,7 +128,7 @@ class SubhklConfig(BaseModel):
         description="Maximum incident wavelength (Å)",
     )
     d_min: float = Field(
-        default=2.5,
+        default=2.8,
         gt=0.3,
         le=20.0,
         title="d_min (Å)",
@@ -236,6 +236,12 @@ class SubhklGalaxyModel:
         sg = self.payload.get("space_group")
         if sg and sg not in ("Unknown", "P 1"):
             self.data.space_group = str(sg)
+        wl_range = self.payload.get("wavelength_range") or []
+        if len(wl_range) >= 2 and float(wl_range[1]) > float(wl_range[0]) > 0:
+            self.data.wavelength_min = round(float(wl_range[0]), 3)
+            self.data.wavelength_max = round(float(wl_range[1]), 3)
+        if self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
+            self.data.d_min = round(float(self.payload["d_min"]), 3)
         return self.payload
 
     def render_html(self) -> str:

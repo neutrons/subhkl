@@ -304,9 +304,8 @@ def _make_ewald_polisher(
         cen_r = cen - (R_r @ s_samp_j)[None, :]
         dn = kf @ nrm.T
         t = (cen_r * nrm).sum(1)[None, :] / jnp.where(jnp.abs(dn) < 1e-9, 1e-9, dn)
-        p = t[:, :, None] * kf[:, None, :] - cen_r[None, :, :]
-        row = (p * vh[None]).sum(2) / dh[None]
-        col = (p * uh[None]).sum(2) / dw[None]
+        row = (t * (kf @ vh.T) - (cen_r * vh).sum(1)[None, :]) / dh[None]
+        col = (t * (kf @ uh.T) - (cen_r * uh).sum(1)[None, :]) / dw[None]
         ok = (
             band[:, None]
             & (t > 0)
@@ -354,8 +353,8 @@ def _make_ewald_polisher(
     def eval_runs(Us):
         Us = np.asarray(Us, np.float32).reshape(-1, 3, 3)
         out = []
-        for i in range(0, len(Us), 32):
-            out.append(np.asarray(score_batch_runs(jnp.asarray(Us[i : i + 32]))))
+        for i in range(0, len(Us), 4):
+            out.append(np.asarray(score_batch_runs(jnp.asarray(Us[i : i + 4]))))
         return np.concatenate(out, axis=0)
 
     def polish_joint(U, spans=(1.0, 0.35, 0.12, 0.04), n=7):
@@ -428,12 +427,12 @@ def _make_ewald_polisher(
             rv = np.array(np.meshgrid(ax, ax, ax, indexing="ij")).reshape(3, -1).T
             dR = Rot.from_rotvec(rv).as_matrix().astype(np.float32)
             scores_list = []
-            for i in range(0, len(dR), 64):
+            for i in range(0, len(dR), 4):
                 scores_list.append(
                     np.asarray(
                         score_per_run_grid(
                             jnp.asarray(Urs, jnp.float32),
-                            jnp.asarray(dR[i : i + 64]),
+                            jnp.asarray(dR[i : i + 4]),
                         )
                     )
                 )

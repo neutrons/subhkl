@@ -331,10 +331,13 @@ class NovaGalaxyPipelineRunner:
                 params.get("beta", 90.0),
                 params.get("gamma", 90.0),
             ]
-            wl = params.get("wavelength_range") or [
-                params.get("wavelength_min", 1.8),
-                params.get("wavelength_max", 4.5),
-            ]
+            if "wavelength_min" in params or "wavelength_max" in params:
+                wl = [
+                    float(params.get("wavelength_min", 2.8)),
+                    float(params.get("wavelength_max", 4.5)),
+                ]
+            else:
+                wl = params.get("wavelength_range") or [2.8, 4.5]
             inst = str(params.get("instrument", "CG4D"))
             sg = str(params.get("space_group", "P 21 21 21"))
             merged_path = params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
@@ -468,10 +471,13 @@ class NovaGalaxyPipelineRunner:
             params.get("gamma", 90.0),
         ]
         cell_str = ",".join(str(float(x)) for x in raw_cell[:6])
-        wl = params.get("wavelength_range") or [
-            params.get("wavelength_min", 1.8),
-            params.get("wavelength_max", 4.5),
-        ]
+        if "wavelength_min" in params or "wavelength_max" in params:
+            wl = [
+                float(params.get("wavelength_min", 2.8)),
+                float(params.get("wavelength_max", 4.5)),
+            ]
+        else:
+            wl = params.get("wavelength_range") or [2.8, 4.5]
         inst = params.get("instrument", "CG4D")
         sg = params.get("space_group", "P 21 21 21")
         merged_path = os.path.abspath(

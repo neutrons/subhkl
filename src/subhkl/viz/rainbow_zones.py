@@ -386,12 +386,40 @@ def _extract_from_h5(
             )
 
         wavelength_range = (1.8, 4.5)
-        if "instrument/wavelength" in f:
+        if "scan_refinement/band_wavelength" in f:
+            wl = np.asarray(
+                f["scan_refinement/band_wavelength"][()], dtype=float
+            ).ravel()
+            if len(wl) >= 2:
+                wavelength_range = (float(wl[0]), float(wl[1]))
+        elif "instrument/wavelength" in f:
             wl = np.asarray(
                 f["instrument/wavelength"][()], dtype=float
             ).ravel()
             if len(wl) >= 2:
                 wavelength_range = (float(wl[0]), float(wl[1]))
+                if (
+                    abs(wavelength_range[0] - 2.0) < 1e-3
+                    and abs(wavelength_range[1] - 10.0) < 1e-3
+                ):
+                    sib_solve = Path(h5_path).parent / "solve.h5"
+                    if sib_solve.is_file() and sib_solve != Path(h5_path):
+                        try:
+                            with h5py.File(sib_solve, "r") as sf:
+                                for wk in (
+                                    "scan_refinement/band_wavelength",
+                                    "instrument/wavelength",
+                                ):
+                                    if wk in sf:
+                                        swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                                        if len(swl) >= 2:
+                                            wavelength_range = (
+                                                float(swl[0]),
+                                                float(swl[1]),
+                                            )
+                                            break
+                        except Exception:
+                            pass
 
         U = (
             np.asarray(f["sample/U"][()], dtype=float)
@@ -505,7 +533,7 @@ def _extract_from_h5(
                     solve_diagnostics["top_full_score"] = float(np.max(fs)) if len(fs) else 0.0
             if "scan_refinement" in f:
                 sr_grp = f["scan_refinement"]
-                solve_diagnostics["d_min"] = float(sr_grp.attrs.get("d_min", 2.5))
+                solve_diagnostics["d_min"] = float(sr_grp.attrs.get("d_min", 2.8))
                 solve_diagnostics["n_zones"] = int(sr_grp.attrs.get("n_zones", 400))
                 solve_diagnostics["modes"] = _decode_str(sr_grp.attrs.get("modes"), "")
                 solve_diagnostics["status"] = _decode_str(sr_grp.attrs.get("status"), "converged")
@@ -1585,12 +1613,15 @@ def build_rainbow_zone_payload(
         else default_projection_for_instrument(instrument)
     )
 
+    d_min_use = float((solve_diagnostics or {}).get("d_min", 2.8))
+
     return {
         "instrument": str(instrument),
         "default_projection": resolved_proj,
         "space_group": str(space_group),
         "intensity_source": intensity_source,
         "wavelength_range": [round(wl_min, 3), round(wl_max, 3)],
+        "d_min": round(d_min_use, 3),
         "cell": [round(float(x), 4) for x in cell] if cell else None,
         "ub_matrix": (
             [[round(float(v), 6) for v in row] for row in ub_matrix]
@@ -1628,6 +1659,10 @@ def render_rainbow_html(
         if payload.get("intensity_source") == "raw_h5"
         else "RECONSTRUCTED SPOT INTENSITY"
     )
+    init_wl = payload.get("wavelength_range") or [2.8, 4.5]
+    init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
+    init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
+    init_dmin = float(payload.get("d_min") or 2.8)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1878,9 +1913,9 @@ def render_rainbow_html(
     border-radius: 8px;
     display: flex;
     flex-direction: column;
-    gap: 10px;
-    padding: 10px;
-    overflow-y: auto;
+    gap: 8px;
+    padding: 8px;
+    overflow: hidden;
   }}
 
   .section-title {{
@@ -1924,7 +1959,7 @@ def render_rainbow_html(
     display: flex;
     flex-direction: column;
     gap: 4px;
-    max-height: 210px;
+    max-height: 150px;
     overflow-y: auto;
   }}
 
@@ -2019,11 +2054,13 @@ def render_rainbow_html(
     line-height: 1.38;
     font-family: var(--font-display);
     color: #cbd5e1;
-    height: 145px;
+    flex: 1;
+    min-height: 120px;
     overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-all;
     user-select: text;
+    margin: 0;
   }}
 
   .params-drawer {{
@@ -2231,12 +2268,12 @@ def render_rainbow_html(
       </div>
     </section>
 
-    <!-- Right Sidebar: Grounded Controls & Inspector -->
+    <!-- Right Sidebar: Grounded Controls & Terminal -->
     <aside class="side-panel">
       <div>
         <div class="section-title">
           <span>🎛️ Detector &amp; Parallax Controls</span>
-          <span id="wl-readout">λ: 1.8–4.5 Å</span>
+          <span id="wl-readout">λ: {init_wl_min:.1f}–{init_wl_max:.1f} Å</span>
         </div>
         <div class="slider-group">
           <div class="slider-row">
@@ -2253,11 +2290,11 @@ def render_rainbow_html(
 
           <div class="slider-row">
             <span>Wavelength Band λ [Å]</span>
-            <span id="lbl-lam-band">1.80–4.50</span>
+            <span id="lbl-lam-band">{init_wl_min:.2f}–{init_wl_max:.2f}</span>
           </div>
           <div style="display:flex;gap:6px;">
-            <input type="range" id="slider-lam-min" min="0.5" max="6.0" step="0.05" value="1.80" title="Min Wavelength" />
-            <input type="range" id="slider-lam-max" min="1.0" max="10.0" step="0.05" value="4.50" title="Max Wavelength" />
+            <input type="range" id="slider-lam-min" min="0.5" max="6.0" step="0.05" value="{init_wl_min:.2f}" title="Min Wavelength" />
+            <input type="range" id="slider-lam-max" min="1.0" max="10.0" step="0.05" value="{init_wl_max:.2f}" title="Max Wavelength" />
           </div>
         </div>
       </div>
@@ -2276,17 +2313,7 @@ def render_rainbow_html(
         <div class="zone-list" id="zone-list"></div>
       </div>
 
-      <div>
-        <div class="section-title">
-          <span>Inspector</span>
-          <span id="combo-badge" style="color:var(--accent-cyan);">HOVER SPOT</span>
-        </div>
-        <div class="inspector-box" id="inspector-box" style="padding:5px 8px;font-size:0.68rem;">
-          Hover or click a Bragg spot to inspect (hkl), λ, d-spacing, and detector bank.
-        </div>
-      </div>
-
-      <div style="display:flex;flex-direction:column;flex:1;min-height:110px;">
+      <div style="display:flex;flex-direction:column;flex:1;min-height:140px;">
         <div class="section-title">
           <span>&gt;_ Terminal // Stdio</span>
           <span id="cell-summary" style="font-size:0.62rem;color:var(--accent-pink);">IDLE</span>
@@ -2297,11 +2324,11 @@ def render_rainbow_html(
     </aside>
   </main>
 
-  <!-- SINGLE-ROW SOLVE LATTICE LADDER FOOTER (WITH INTERACTIVE WORKFLOW STAGE BUTTONS) -->
+  <!-- SINGLE-ROW SOLVE LATTICE LADDER FOOTER (WITH MERGED STATUS/INSPECTOR LINE & WORKFLOW STAGE BUTTONS) -->
   <footer class="ladder-bar">
     <div class="ladder-header">
-      <div class="ladder-title" id="ladder-desc">
-        LATTICE LADDER: Step through orientation refinement or click a workflow stage to execute
+      <div class="ladder-title" id="ladder-desc" style="flex:1;min-width:0;margin-right:8px;">
+        <span id="combo-badge" style="color:var(--accent-cyan);margin-right:6px;">[INSPECTOR]</span><span id="inspector-box">Hover or click a Bragg spot to inspect (hkl), λ, d, and bank • Step through Lattice Ladder below</span>
       </div>
       <div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap;">
         <span style="font-size:0.62rem;color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
@@ -2326,7 +2353,7 @@ def render_rainbow_html(
       <span>α <input id="inp-alpha" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>β <input id="inp-beta" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>γ <input id="inp-gamma" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
-      <span>d_min <input id="inp-dmin" type="number" step="0.1" value="2.5" style="width:44px;" /></span>
+      <span>d_min <input id="inp-dmin" type="number" step="0.1" value="{init_dmin:.1f}" style="width:44px;" /></span>
       <span>steps <input id="inp-steps" type="number" step="10" value="120" style="width:48px;" /></span>
     </div>
     <div class="ladder-rungs" id="ladder-rungs"></div>
@@ -2343,7 +2370,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const LADDER = DATA.ladder_steps || [];
   const PIPELINE = DATA.pipeline_stages || [];
 
-  const wlRange = DATA.wavelength_range || [1.8, 4.5];
+  const wlRange = DATA.wavelength_range || [2.8, 4.5];
   const order1ZoneIds = ZONES.filter(z => (z.order || 1) <= 1).map(z => z.zone_id);
   const initialZoneIds = order1ZoneIds.length > 0
     ? order1ZoneIds
@@ -2502,7 +2529,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       alpha: getNum("inp-alpha", cell[3]),
       beta: getNum("inp-beta", cell[4]),
       gamma: getNum("inp-gamma", cell[5]),
-      d_min: getNum("inp-dmin", 2.5),
+      d_min: getNum("inp-dmin", DATA.d_min || 2.8),
       steps: Math.round(getNum("inp-steps", 120)),
       wavelength_min: state.lamMin,
       wavelength_max: state.lamMax,
@@ -2598,15 +2625,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  function setStatusLine(badgeText, contentHtml) {{
+    const cb = document.getElementById("combo-badge");
+    const ib = document.getElementById("inspector-box");
+    if (cb && ib) {{
+      cb.textContent = badgeText;
+      ib.innerHTML = contentHtml;
+      return;
+    }}
+    const ld = document.getElementById("ladder-desc");
+    if (ld) {{
+      ld.innerHTML = `<span id="combo-badge" style="color:var(--accent-cyan);margin-right:6px;">${{badgeText}}</span><span id="inspector-box">${{contentHtml}}</span>`;
+    }}
+  }}
+
   function selectPipelineStage(pIdx, syncLadder = true) {{
     if (pIdx < 0 || pIdx >= PIPELINE.length) return;
     state.currentPipelineIdx = pIdx;
     const st = PIPELINE[pIdx];
-    document.getElementById("combo-badge").textContent = `STAGE ${{st.step_num}}`;
-    document.getElementById("inspector-box").innerHTML = `
-      <div><strong style="color:var(--accent-pink);">${{st.name}}</strong> → <strong style="color:var(--accent-cyan);">${{st.artifact}}</strong></div>
-      <div>Tools: <code>${{(st.tool_ids || []).join(", ")}}</code></div>
-    `;
+    setStatusLine(
+      `[STAGE ${{st.step_num}}]`,
+      `<strong style="color:var(--accent-pink);">${{st.name}}</strong> → <strong style="color:var(--accent-cyan);">${{st.artifact}}</strong> • Tools: <code>${{(st.tool_ids || []).join(", ")}}</code>`
+    );
     if (syncLadder && typeof st.ladder_rung_idx === "number") {{
       selectLadderRung(st.ladder_rung_idx, false);
     }}
@@ -2645,12 +2685,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }} else if (step.active_zones && step.active_zones.length > 0) {{
       state.activeZones = new Set(step.active_zones);
     }}
-    document.getElementById("ladder-desc").textContent =
-      `🪜 STEP ${{step.rung}}: ${{step.description}}`;
-    document.getElementById("inspector-box").innerHTML = `
-      <strong style="color:var(--accent-gold);">${{step.stage}}</strong><br/>
-      <span>${{step.description}}</span>
-    `;
+    setStatusLine(
+      `[🪜 STEP ${{step.rung}}]`,
+      `<strong style="color:var(--accent-gold);">${{step.stage}}</strong> — <span>${{step.description}}</span>`
+    );
     renderZoneList();
     renderLadder();
     updateHUD();
@@ -2664,24 +2702,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       .map(z => z.label)
       .join(", ") || "None";
     const elVal = typeof p.det_el === "number" ? p.det_el : 0.0;
-    document.getElementById("combo-badge").textContent = `BANK ${{p.bank}} • PEAK #${{p.id}}`;
-    document.getElementById("inspector-box").innerHTML = `
-      <div><strong>Reflection (hkl): <span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong> (Harmonic n=${{p.harmonic_order}})</div>
-      <div>Bank <strong>#${{p.bank}}</strong> (r=${{p.row}}, c=${{p.col}}): φ=${{p.det_x.toFixed(1)}}°, Y=${{p.det_y.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}°</div>
-      <div>Wavelength λ = <strong>${{p.wavelength.toFixed(3)}} Å</strong> • d = <strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I = <strong>${{Math.round(p.intensity)}}</strong></div>
-      <div>Zone Families: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ = ${{p.angular_error_deg.toFixed(3)}}°)</div>
-    `;
+    setStatusLine(
+      `[BANK #${{p.bank}} • #${{p.id}}]`,
+      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong> (n=${{p.harmonic_order}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong> • φ=${{p.det_x.toFixed(1)}}°, Y=${{p.det_y.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{p.angular_error_deg.toFixed(3)}}°)`
+    );
   }}
 
   function updateZoneInspector(z) {{
     if (!z) return;
-    document.getElementById("combo-badge").textContent = `ZONE ${{z.label}}`;
-    document.getElementById("inspector-box").innerHTML = `
-      <div><strong style="color:var(--accent-gold);">Crystal Zone Family ${{z.label}}</strong></div>
-      <div>Captures <strong>${{z.n_peaks}}</strong> observed detector spots (RMS Δθ = ${{z.angular_rms_deg.toFixed(3)}}°)</div>
-      <div>Real-Space Zone Repeat |t_uvw| = <strong>${{z.d_direct.toFixed(2)}} Å</strong></div>
-      <div style="color:var(--text-dim);font-size:0.7rem;">Every highlighted spot in this family satisfies G · ${{z.label}} = 0.</div>
-    `;
+    setStatusLine(
+      `[ZONE ${{z.label}}]`,
+      `<strong style="color:var(--accent-gold);">Zone ${{z.label}}</strong> • Captures <strong>${{z.n_peaks}}</strong> spots (RMS Δθ=${{z.angular_rms_deg.toFixed(3)}}°) • |t_uvw|=<strong>${{z.d_direct.toFixed(2)}} Å</strong> • G · ${{z.label}} = 0`
+    );
   }}
 
   function isPeakVisible(p) {{
@@ -3324,7 +3356,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     DATA.instrument = newPayload.instrument || DATA.instrument;
     DATA.space_group = newPayload.space_group || DATA.space_group;
     DATA.wavelength_range = newPayload.wavelength_range || DATA.wavelength_range;
+    DATA.d_min = newPayload.d_min || DATA.d_min;
     DATA.cell = newPayload.cell || DATA.cell;
+
+    if (DATA.wavelength_range && DATA.wavelength_range.length >= 2) {{
+      state.lamMin = Number(DATA.wavelength_range[0]);
+      state.lamMax = Number(DATA.wavelength_range[1]);
+      if (slLamMin) slLamMin.value = state.lamMin.toFixed(2);
+      if (slLamMax) slLamMax.value = state.lamMax.toFixed(2);
+      updateWavelengthLabels();
+    }}
+    if (DATA.d_min) {{
+      const dEl = document.getElementById("inp-dmin");
+      if (dEl) dEl.value = Number(DATA.d_min).toFixed(1);
+    }}
 
     PEAKS.length = 0;
     (newPayload.peaks || []).forEach(p => PEAKS.push(p));
@@ -3449,10 +3494,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }} catch (_e) {{ return defVal; }}
     }};
     const inst = getAttrStr(f, "instrument", DATA.instrument || "CG4D");
-    let wlRangeNew = [1.8, 4.5];
+    let wlRangeNew = [2.8, 4.5];
+    let dMinNew = 2.8;
     try {{
-      const wl = f.get("instrument/wavelength").value;
-      if (wl && wl.length >= 2) wlRangeNew = [Number(wl[0]), Number(wl[1])];
+      if (f.keys().includes("scan_refinement")) {{
+        const srGrp = f.get("scan_refinement");
+        if (srGrp.keys().includes("band_wavelength")) {{
+          const bwl = srGrp.get("band_wavelength").value;
+          if (bwl && bwl.length >= 2) wlRangeNew = [Number(bwl[0]), Number(bwl[1])];
+        }}
+        if (srGrp.attrs && srGrp.attrs["d_min"]) {{
+          dMinNew = Number(srGrp.attrs["d_min"].value) || 2.8;
+        }}
+      }}
+      if (wlRangeNew[0] === 2.8 && f.keys().includes("instrument")) {{
+        const wl = f.get("instrument/wavelength").value;
+        if (wl && wl.length >= 2 && !(Math.abs(Number(wl[0]) - 2.0) < 1e-3 && Math.abs(Number(wl[1]) - 10.0) < 1e-3)) {{
+          wlRangeNew = [Number(wl[0]), Number(wl[1])];
+        }}
+      }}
     }} catch (_e) {{}}
 
     // Determine best run slice from file_offsets & bank_ids
@@ -3747,7 +3807,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     try {{ f.close(); if (mf && mf !== f) mf.close(); }} catch (_e) {{}}
     return {{
       instrument: inst, space_group: sg, intensity_source: bankImgs.size > 0 ? "raw_h5" : "reconstructed",
-      wavelength_range: wlRangeNew, cell, peaks: peaksOut, zones: zonesOut, panels: panelsOut,
+      wavelength_range: wlRangeNew, d_min: dMinNew, cell, peaks: peaksOut, zones: zonesOut, panels: panelsOut,
       ladder_steps: ladderOut, pipeline_stages: PIPELINE,
     }};
   }}
