@@ -59,6 +59,50 @@ class NovaGalaxyPipelineRunner:
         "merge": ["imaginex_subhkl_merge"],
     }
 
+    # Upstream NDIP ``neutrons_load_data`` tool hardcodes ``<select name="instrument">``
+    # options when ``params|ingest_mode == "oncat"``, omitting instruments such as
+    # ``CG4D`` / ``IMAGINE``. When an instrument is not in this allow-list, we pass
+    # the ONCat-resolved path via ``params|ingest_mode == "file"`` (``params|filepath``).
+    NEUTRONS_LOAD_DATA_ONCAT_INSTRUMENTS: dict[str, set[str]] = {
+        "SNS": {
+            "ARCS",
+            "BL0",
+            "CNCS",
+            "CORELLI",
+            "EQSANS",
+            "FNPB",
+            "HYSPEC",
+            "MANDI",
+            "NOMAD",
+            "NSE",
+            "PG3",
+            "POWGEN",
+            "REF_L",
+            "REF_M",
+            "SEQ",
+            "SNAP",
+            "TOPAZ",
+            "USANS",
+            "VENUS",
+            "VISION",
+            "VULCAN",
+        },
+        "HFIR": {
+            "CG1B",
+            "CG1D",
+            "CG2",
+            "CG3",
+            "CG4C",
+            "HB1",
+            "HB1A",
+            "HB2A",
+            "HB2B",
+            "HB2C",
+            "HB3",
+            "HB3A",
+        },
+    }
+
     def __init__(
         self,
         galaxy_url: str | None = None,
@@ -80,7 +124,181 @@ class NovaGalaxyPipelineRunner:
         self.history_id = raw_hid or None
         self._conn_helper: Any = None
         self.active_job: dict[str, Any] | None = None
+        self.current_frame_index: int | None = None
         self._auto_discover_local_galaxy()
+
+    def _build_neutrons_load_data_inputs(
+        self,
+        *,
+        ingest_mode: str,
+        fac: str,
+        inst: str,
+        ipts_raw: str,
+        run_num: int | None,
+        filepath: str,
+    ) -> dict[str, Any]:
+        """Build ``neutrons_load_data`` inputs, falling back to ``file`` mode for instruments
+        (such as HFIR ``CG4D``) omitted from upstream's hardcoded ``oncat`` dropdown."""
+        fac_u = str(
+            fac or ("SNS" if str(filepath).startswith("/SNS/") else "HFIR")
+        ).upper()
+        inst_u = str(inst or "").upper()
+        allowed_oncat = self.NEUTRONS_LOAD_DATA_ONCAT_INSTRUMENTS.get(fac_u, set())
+        if (
+            str(ingest_mode or "oncat") != "file"
+            and ipts_raw
+            and run_num is not None
+            and inst_u in allowed_oncat
+        ):
+            return {
+                "params|ingest_mode": "oncat",
+                "params|facility": fac_u,
+                "params|instrument": inst_u,
+                "params|ipts": str(ipts_raw),
+                "params|run": int(run_num),
+            }
+        return {
+            "params|ingest_mode": "file",
+            "params|filepath": str(filepath),
+        }
+
+    def _run_neutrons_load_data_tool(
+        self,
+        gi: Any,
+        history_id: str,
+        nld_inputs: dict[str, Any],
+        filepath: str,
+    ) -> dict[str, Any]:
+        """Execute ``neutrons_load_data`` and automatically retry in ``file`` mode if
+        upstream Galaxy rejects an ``oncat`` parameter option (HTTP 400)."""
+        try:
+            return gi.tools.run_tool(
+                history_id=history_id,
+                tool_id="neutrons_load_data",
+                tool_inputs=nld_inputs,
+            )
+        except Exception:
+            if nld_inputs.get("params|ingest_mode") == "oncat" and filepath:
+                fallback_inputs = {
+                    "params|ingest_mode": "file",
+                    "params|filepath": str(filepath),
+                }
+                nld_inputs.clear()
+                nld_inputs.update(fallback_inputs)
+                return gi.tools.run_tool(
+                    history_id=history_id,
+                    tool_id="neutrons_load_data",
+                    tool_inputs=nld_inputs,
+                )
+            raise
+
+    def _lookup_oncat_run_title(self, nxs_path: str) -> str:
+        """Look up a NeXus run's ONCat title and goniometer angles without reading the host filesystem."""
+        import re as _re
+
+        p_str = str(nxs_path or "")
+        m_loc = _re.search(r"/(SNS|HFIR)/([^/]+)/IPTS-([^/]+)/", p_str, _re.I)
+        m_run = _re.search(r"_([0-9]+)\.nxs", os.path.basename(p_str), _re.I)
+        if not m_loc:
+            return ""
+        fac_u = m_loc.group(1).upper()
+        inst_u = m_loc.group(2).upper()
+        ipts_num = m_loc.group(3)
+        run_num = int(m_run.group(1)) if m_run else None
+        try:
+            cat = self.browse_oncat_catalog(
+                {
+                    "facility": fac_u,
+                    "instrument": inst_u,
+                    "ipts": f"IPTS-{ipts_num}",
+                }
+            )
+            for r in cat.get("runs") or []:
+                if str(r.get("location") or "") == p_str or (
+                    run_num is not None and r.get("run_number") == run_num
+                ):
+                    t_part = str(r.get("title") or "").strip()
+                    g_part = str(r.get("angles") or "").strip()
+                    return f"{t_part} {g_part}".strip()
+        except Exception:
+            pass
+        return ""
+
+    def apply_active_solve_overlay(
+        self,
+        payload: dict[str, Any],
+        frame_index: int | None = None,
+    ) -> dict[str, Any]:
+        """If a solve job is currently active and has produced an intermediate blind solution,
+        overlay its zones and ladder steps projected for ``frame_index`` onto ``payload``."""
+        if frame_index is not None:
+            self.current_frame_index = int(frame_index)
+        aj = self.active_job
+        if not isinstance(aj, dict):
+            return payload
+        if aj.get("stage_id") != "solve" or aj.get("state") not in (
+            "queued",
+            "running",
+        ):
+            return payload
+        partial_h5 = aj.get("partial_h5_path")
+        images_h5 = aj.get("images_h5_path")
+        sp = aj.get("solve_params") or {}
+        if (
+            partial_h5
+            and os.path.isfile(partial_h5)
+            and os.path.getsize(partial_h5) > 0
+        ):
+            try:
+                from subhkl.viz.rainbow_zones import build_rainbow_zone_payload
+
+                p_blind = build_rainbow_zone_payload(
+                    replay_h5=partial_h5,
+                    images_h5=(
+                        images_h5 if (images_h5 and os.path.isfile(images_h5)) else None
+                    ),
+                    instrument=str(
+                        sp.get("instrument") or payload.get("instrument") or "CG4D"
+                    ),
+                    space_group=str(
+                        sp.get("space_group") or payload.get("space_group") or "P 1"
+                    ),
+                    cell=list(
+                        sp.get("cell")
+                        or payload.get("cell")
+                        or [10, 10, 10, 90, 90, 90]
+                    ),
+                    wavelength_range=tuple(
+                        sp.get("wavelength_range")
+                        or payload.get("wavelength_range")
+                        or (2.0, 4.5)
+                    ),
+                    max_zone_index=1,
+                    max_zones=13,
+                    include_panels=False,
+                    include_peaks=False,
+                    n_arc=720,
+                    frame_index=(
+                        frame_index
+                        if frame_index is not None
+                        else self.current_frame_index
+                    ),
+                )
+                if p_blind.get("zones"):
+                    payload["zones"] = p_blind["zones"]
+                    if p_blind.get("ladder_steps"):
+                        payload["ladder_steps"] = p_blind["ladder_steps"]
+                    payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
+                    return payload
+            except Exception:
+                pass
+        ov = aj.get("partial_overlay")
+        if isinstance(ov, dict) and ov.get("zones") and not payload.get("zones"):
+            payload["zones"] = ov["zones"]
+            if ov.get("ladder_steps"):
+                payload["ladder_steps"] = ov["ladder_steps"]
+            payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
+        return payload
 
     @staticmethod
     def _is_galaxy_server(url: str) -> bool:
@@ -1183,26 +1401,22 @@ class NovaGalaxyPipelineRunner:
                         m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.I)
                         if m_ip:
                             ipts_str = m_ip.group(1)
-                    if params.get("ingest_mode") == "oncat" and ipts_str and m_run:
-                        nld_inputs = {
-                            "params|ingest_mode": "oncat",
-                            "params|facility": str(
-                                params.get("facility")
-                                or ("SNS" if first_p.startswith("/SNS/") else "HFIR")
-                            ),
-                            "params|instrument": inst,
-                            "params|ipts": ipts_str,
-                            "params|run": int(m_run.group(1)),
-                        }
-                    else:
-                        nld_inputs = {
-                            "params|ingest_mode": "file",
-                            "params|filepath": first_p,
-                        }
-                    nld_res = gi.tools.run_tool(
+                    nld_inputs = self._build_neutrons_load_data_inputs(
+                        ingest_mode=str(params.get("ingest_mode") or "oncat"),
+                        fac=str(
+                            params.get("facility")
+                            or ("SNS" if first_p.startswith("/SNS/") else "HFIR")
+                        ),
+                        inst=inst,
+                        ipts_raw=ipts_str,
+                        run_num=int(m_run.group(1)) if m_run else None,
+                        filepath=first_p,
+                    )
+                    nld_res = self._run_neutrons_load_data_tool(
+                        gi=gi,
                         history_id=store.history_id,
-                        tool_id="neutrons_load_data",
-                        tool_inputs=nld_inputs,
+                        nld_inputs=nld_inputs,
+                        filepath=first_p,
                     )
                     nld_jid = (nld_res.get("jobs") or [{}])[0].get("id")
                     nld_outs = [
@@ -1602,9 +1816,7 @@ class NovaGalaxyPipelineRunner:
                                     r_num = int(m_r.group(1))
                                     info = run_map.get(r_num)
                                     if info:
-                                        oncat_existing.append(
-                                            info.get("location") or p
-                                        )
+                                        oncat_existing.append(info.get("location") or p)
                                         t_str = str(info.get("title") or "").strip()
                                         g_str = str(info.get("angles") or "").strip()
                                         if t_str and t_str not in titles_seen:
@@ -1620,33 +1832,25 @@ class NovaGalaxyPipelineRunner:
 
                 store = self.get_datastore("IMAGINE-X SubHKL")
                 gi = store.nova_connection.galaxy_instance
-                first_p = expanded[0]
+                first_p = oncat_existing[0] if oncat_existing else expanded[0]
                 m_run = _re.search(r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.I)
                 if not ipts_raw:
                     m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.I)
                     if m_ip:
                         ipts_raw = m_ip.group(1)
-                if (
-                    ipts_raw
-                    and m_run
-                    and str(body.get("ingest_mode") or "oncat") != "file"
-                ):
-                    nld_in: dict[str, Any] = {
-                        "params|ingest_mode": "oncat",
-                        "params|facility": fac,
-                        "params|instrument": inst,
-                        "params|ipts": ipts_raw,
-                        "params|run": int(m_run.group(1)),
-                    }
-                else:
-                    nld_in = {
-                        "params|ingest_mode": "file",
-                        "params|filepath": first_p,
-                    }
-                nld_res = gi.tools.run_tool(
+                nld_in = self._build_neutrons_load_data_inputs(
+                    ingest_mode=str(body.get("ingest_mode") or "oncat"),
+                    fac=fac,
+                    inst=inst,
+                    ipts_raw=ipts_raw,
+                    run_num=int(m_run.group(1)) if m_run else None,
+                    filepath=first_p,
+                )
+                nld_res = self._run_neutrons_load_data_tool(
+                    gi=gi,
                     history_id=store.history_id,
-                    tool_id="neutrons_load_data",
-                    tool_inputs=nld_in,
+                    nld_inputs=nld_in,
+                    filepath=first_p,
                 )
                 jid = (nld_res.get("jobs") or [{}])[0].get("id")
                 out_ids = [
@@ -1757,9 +1961,7 @@ class NovaGalaxyPipelineRunner:
             return
 
         raw_token = (
-            os.environ.get("ONCAT_TOKEN")
-            or os.environ.get("NDIP_OIDC_TOKEN")
-            or ""
+            os.environ.get("ONCAT_TOKEN") or os.environ.get("NDIP_OIDC_TOKEN") or ""
         ).strip()
         if not raw_token:
             token_ep = (
@@ -1794,17 +1996,13 @@ class NovaGalaxyPipelineRunner:
             except Exception:
                 pass
 
-    def _build_oauth_oncat_client(
-        self, verification_handler: Any = None
-    ) -> Any:
+    def _build_oauth_oncat_client(self, verification_handler: Any = None) -> Any:
         """Build a pyoncat.ONCat client configured with FileSystemTokenStore and OAuth flow."""
         import pyoncat  # type: ignore[import-untyped]
 
         self._seed_oidc_token_if_available()
         url = os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
-        client_id = os.environ.get(
-            "ONCAT_CLIENT_ID", self.ONCAT_DEFAULT_CLIENT_ID
-        )
+        client_id = os.environ.get("ONCAT_CLIENT_ID", self.ONCAT_DEFAULT_CLIENT_ID)
         client_secret = os.environ.get("ONCAT_CLIENT_SECRET")
         username = os.environ.get("ONCAT_USERNAME")
         password = os.environ.get("ONCAT_PASSWORD")
@@ -1923,9 +2121,7 @@ class NovaGalaxyPipelineRunner:
                 "status": "pending_verification",
                 "user": None,
                 "verification_uri": state.get("verification_uri"),
-                "verification_uri_complete": state.get(
-                    "verification_uri_complete"
-                ),
+                "verification_uri_complete": state.get("verification_uri_complete"),
                 "user_code": state.get("user_code"),
                 "expires_in": state.get("expires_in"),
                 "message": state.get("message")
@@ -1994,9 +2190,7 @@ class NovaGalaxyPipelineRunner:
             tp = self._get_oncat_token_path()
             os.makedirs(os.path.dirname(tp), exist_ok=True)
             store = pyoncat.FileSystemTokenStore(tp)
-            store.write_token(
-                {"access_token": raw_tok, "token_type": "Bearer"}
-            )
+            store.write_token({"access_token": raw_tok, "token_type": "Bearer"})
             self._oncat_auth_state = {"status": "signed_in", "user": None}
             self._invalidate_oncat_caches()
             return self.get_oncat_auth_status()
@@ -2112,9 +2306,8 @@ class NovaGalaxyPipelineRunner:
         # NDIP's raw `neutrons_load_data` (oncat mode) accepts 1 integer run per tool invocation,
         # whereas `imaginex_subhkl_prepare_peaks` (and local GPU container reduction) accepts
         # multiple run locations resolved by pyoncat and merges them via `subhkl merge-images`.
-        has_prepare_peaks = (
-            not self.is_connected
-            or self._has_tool_on_galaxy("imaginex_subhkl_prepare_peaks")
+        has_prepare_peaks = not self.is_connected or self._has_tool_on_galaxy(
+            "imaginex_subhkl_prepare_peaks"
         )
         multi_run_supported = bool(has_prepare_peaks)
         multi_run_note = (
@@ -2131,9 +2324,9 @@ class NovaGalaxyPipelineRunner:
         auth_status = self.get_oncat_auth_status()
         is_auth = bool(auth_status.get("authenticated") or is_auth)
 
-        exp_cache: dict[
-            tuple[str, str, bool], tuple[float, list[dict[str, Any]]]
-        ] = getattr(self, "_oncat_exp_cache", {})
+        exp_cache: dict[tuple[str, str, bool], tuple[float, list[dict[str, Any]]]] = (
+            getattr(self, "_oncat_exp_cache", {})
+        )
         now = time.time()
         experiments: list[dict[str, Any]] = []
         cached_exp = exp_cache.get((fac, inst, is_auth))
@@ -2153,9 +2346,7 @@ class NovaGalaxyPipelineRunner:
                         os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
                     )
                     is_auth = False
-                    raw_exps = oncat.Experiment.list(
-                        facility=fac, instrument=inst
-                    )
+                    raw_exps = oncat.Experiment.list(facility=fac, instrument=inst)
 
                 for e in raw_exps:
                     eid = str(e.get("id") or "")
@@ -2164,9 +2355,7 @@ class NovaGalaxyPipelineRunner:
                     n_runs = int(e.get("size") or 0)
                     r_info = (e.get("indexed") or {}).get("run_number") or {}
                     ranges_str = str(r_info.get("ranges") or "")
-                    latest_dt = str(
-                        ((e.get("latest") or {}).get("created") or "")
-                    )[:10]
+                    latest_dt = str(((e.get("latest") or {}).get("created") or ""))[:10]
                     title_str = str(e.get("title") or "").strip()
                     experiments.append(
                         {
@@ -2270,9 +2459,10 @@ class NovaGalaxyPipelineRunner:
                         angle_parts: list[str] = []
                         for ax_name in ("omega", "chi", "phi"):
                             ax_obj = daslogs.get(ax_name)
-                            if isinstance(ax_obj, dict) and ax_obj.get(
-                                "average_value"
-                            ) is not None:
+                            if (
+                                isinstance(ax_obj, dict)
+                                and ax_obj.get("average_value") is not None
+                            ):
                                 try:
                                     val_f = float(ax_obj["average_value"])
                                     angle_parts.append(f"{ax_name}={val_f:.1f}")
@@ -2287,13 +2477,10 @@ class NovaGalaxyPipelineRunner:
                             )
                             if ax_m:
                                 angles = ";".join(
-                                    f"{k.replace(' ', '').lower()}={v}"
-                                    for k, v in ax_m
+                                    f"{k.replace(' ', '').lower()}={v}" for k, v in ax_m
                                 )
                         sz_bytes = int(d.get("size") or 0)
-                        created_str = str(d.get("created") or "")[:16].replace(
-                            "T", " "
-                        )
+                        created_str = str(d.get("created") or "")[:16].replace("T", " ")
                         dur_s = float(meta_entry.get("duration") or 0.0)
                         if dur_s > 0:
                             tot_sec = int(round(dur_s))
@@ -2843,6 +3030,8 @@ class NovaGalaxyPipelineRunner:
                 "-e",
                 "OMP_NUM_THREADS=1",
                 "-e",
+                "JAX_PLATFORMS=",
+                "-e",
                 "MKL_NUM_THREADS=1",
             ]
             for d in mount_dirs:
@@ -2867,6 +3056,7 @@ class NovaGalaxyPipelineRunner:
                 cmd = [sys.executable] + inner_cmd[1:]
 
         gpu_env = os.environ.copy()
+        gpu_env["JAX_PLATFORMS"] = ""
         gpu_env.setdefault("CUDA_VISIBLE_DEVICES", "0")
         gpu_env.setdefault("OPENBLAS_NUM_THREADS", "1")
         gpu_env.setdefault("OMP_NUM_THREADS", "1")
@@ -2930,6 +3120,15 @@ class NovaGalaxyPipelineRunner:
                 "started_at": time.time(),
             }
             self.active_job = job_record
+
+        if stage_id == "solve":
+            job_record["images_h5_path"] = merged_path
+            job_record["solve_params"] = {
+                "instrument": str(inst),
+                "space_group": str(sg),
+                "cell": [float(x) for x in raw_cell[:6]],
+                "wavelength_range": (float(wl[0]), float(wl[1])),
+            }
 
         def _stream_proc() -> None:
             try:
@@ -2995,6 +3194,7 @@ class NovaGalaxyPipelineRunner:
                                 if cur_mtime >= last_blind_mtime:
                                     last_blind_mtime = cur_mtime
                                     shutil.copy2(blind_src, blind_dst)
+                                    job_record["partial_h5_path"] = blind_dst
                                     from subhkl.viz.rainbow_zones import (
                                         build_rainbow_zone_payload,
                                     )
@@ -3014,6 +3214,7 @@ class NovaGalaxyPipelineRunner:
                                         include_panels=False,
                                         include_peaks=False,
                                         n_arc=720,
+                                        frame_index=self.current_frame_index,
                                     )
                                     if p_blind.get("zones"):
                                         partial_seq += 1
@@ -3470,7 +3671,9 @@ class NovaGalaxyPipelineRunner:
                                         import h5py
                                         import numpy as np
                                         from subhkl.instrument.goniometer import (
+                                            calc_goniometer_rotation_matrix,
                                             get_rotation_data_from_nexus,
+                                            get_rotation_data_from_title,
                                         )
 
                                         raw_nxs_list = job_record["raw_nxs"]
@@ -3497,6 +3700,17 @@ class NovaGalaxyPipelineRunner:
                                                                     nxs_f, inst_name
                                                                 )
                                                             )
+                                                        else:
+                                                            title_meta = self._lookup_oncat_run_title(
+                                                                nxs_f
+                                                            )
+                                                            ax, ang, nms = (
+                                                                get_rotation_data_from_title(
+                                                                    title_meta,
+                                                                    inst_name,
+                                                                )
+                                                            )
+                                                        if ang:
                                                             new_axes.append(ax)
                                                             new_angles.append(ang)
                                                             new_names.append(nms)
@@ -3525,9 +3739,24 @@ class NovaGalaxyPipelineRunner:
                                                                 new_names, dtype="S"
                                                             )
                                                         )
-                                                        job_record["stdout"] += (
-                                                            f"[subhkl] Patched goniometer angles from NeXus title into {os.path.basename(tmp_path)}\n"
+                                                        new_R = [
+                                                            calc_goniometer_rotation_matrix(
+                                                                ax_r, ang_r
+                                                            )
+                                                            for ax_r, ang_r in zip(
+                                                                new_axes, new_angles
+                                                            )
+                                                        ]
+                                                        if "goniometer/R" in hf:
+                                                            del hf["goniometer/R"]
+                                                        hf["goniometer/R"] = np.asarray(
+                                                            new_R, dtype=np.float64
                                                         )
+                                                        job_record["stdout"] += (
+                                                            f"[subhkl] Patched goniometer angles from NeXus/ONCat title into {os.path.basename(tmp_path)}\n"
+                                                        )
+                                        if os.path.isfile(cache_gx_path):
+                                            shutil.copy2(tmp_path, cache_gx_path)
                                     except Exception:
                                         pass
 
@@ -3877,7 +4106,16 @@ def serve_rainbow_zones(
                         pass
                 if "frame" in qs and qs["frame"]:
                     try:
-                        vm.reload(frame_index=int(qs["frame"][0]))
+                        f_idx = int(qs["frame"][0])
+                        vm.reload(frame_index=f_idx)
+                        vm.pipeline_runner.apply_active_solve_overlay(
+                            vm.payload, frame_index=f_idx
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        vm.pipeline_runner.apply_active_solve_overlay(vm.payload)
                     except Exception:
                         pass
                 body = json.dumps(vm.payload).encode("utf-8")

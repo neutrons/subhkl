@@ -956,3 +956,84 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
             os.environ.pop("ONCAT_TOKEN_PATH", None)
         else:
             os.environ["ONCAT_TOKEN_PATH"] = monkeypatch_prev
+
+
+def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
+    """Verify CG4D neutrons_load_data file-mode routing, active-solve frame overlay, and MANDI curvilinear panel mesh."""
+    import numpy as np
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.instrument.goniometer import get_rotation_data_from_title
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import _encode_panel_textures, export_rainbow_widget
+
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+
+    # 1. HFIR CG4D routes via params|ingest_mode="file" since upstream neutrons_load_data omits CG4D from oncat select
+    cg4d_in = runner._build_neutrons_load_data_inputs(
+        ingest_mode="oncat",
+        fac="HFIR",
+        inst="CG4D",
+        ipts_raw="36148",
+        run_num=192,
+        filepath="/HFIR/CG4D/IPTS-36148/nexus/CG4D_192.nxs.h5",
+    )
+    assert cg4d_in == {
+        "params|ingest_mode": "file",
+        "params|filepath": "/HFIR/CG4D/IPTS-36148/nexus/CG4D_192.nxs.h5",
+    }
+    mandi_in = runner._build_neutrons_load_data_inputs(
+        ingest_mode="oncat",
+        fac="SNS",
+        inst="MANDI",
+        ipts_raw="34270",
+        run_num=12737,
+        filepath="/SNS/MANDI/IPTS-34270/nexus/MANDI_12737.nxs.h5",
+    )
+    assert mandi_in["params|ingest_mode"] == "oncat"
+    assert mandi_in["params|instrument"] == "MANDI"
+
+    axes, angles, names = get_rotation_data_from_title("CaTiO3 phi=-59.0", "CG4D")
+    assert len(angles) == 5
+    assert angles[-1] == -59.0
+    assert "CG4D:Mot:phi" in names
+
+    # 2. Active solve overlay preserves intermediate zones/ladder across frame switches
+    runner.active_job = {
+        "stage_id": "solve",
+        "state": "running",
+        "ladder_rung_idx": 2,
+        "partial_overlay": {
+            "seq": 1,
+            "zones": [{"zone_id": "z_1_0_0", "uvw": [1, 0, 0]}],
+            "ladder_steps": [{"step": 1, "name": "First Solve"}],
+        },
+    }
+    frame_payload = {"zones": [], "ladder_steps": [], "frame_index": 3}
+    runner.apply_active_solve_overlay(frame_payload, frame_index=3)
+    assert runner.current_frame_index == 3
+    assert len(frame_payload["zones"]) == 1
+    assert frame_payload["active_rung_idx"] == 2
+
+    # 3. MANDI bottom-plane panels have 9x9 curvilinear mesh and Bank 5 unwraps across +-180 deg seam
+    dets = {int(bk): Detector(cfg) for bk, cfg in beamlines["MANDI"].items()}
+    empty = np.array([])
+    panels, _ = _encode_panel_textures(dets, empty, empty, empty, empty, empty)
+    assert len(panels) == len(dets)
+    by_bank = {p["bank"]: p for p in panels}
+    for bk in (1, 2, 3, 5, 7, 8):
+        assert bk in by_bank
+        p = by_bank[bk]
+        assert len(p["mesh_sph"]) == 9 and len(p["mesh_sph"][0]) == 9
+        el_mesh_min = min(pt[1] for row in p["mesh_sph"] for pt in row)
+        el_out_min = min(pt[1] for pt in p["outline_sph"])
+        assert abs(el_mesh_min - el_out_min) < 1e-2
+
+    out_html = tmp_path / "mandi_curv.html"
+    export_rainbow_widget(
+        {"zones": [], "peaks": [], "panels": []},
+        output_html=out_html,
+    )
+    html = out_html.read_text()
+    assert "panel.mesh_sph" in html
+    assert "isFrameSwitch" in html

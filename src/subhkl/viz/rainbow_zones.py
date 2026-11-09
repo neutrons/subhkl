@@ -349,6 +349,8 @@ def _encode_panel_textures(
 
     panels_payload: list[dict[str, Any]] = []
     t_edge = np.linspace(0.0, 1.0, 12, endpoint=False)
+    grid_n = 8
+    t_grid = np.linspace(0.0, 1.0, grid_n + 1)
     for bk, det in sorted(detectors.items()):
         try:
             # 4 canonical corners: C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
@@ -357,8 +359,6 @@ def _encode_panel_textures(
             xyz_corners = det.pixel_to_lab(rr_c, cc_c)
             x_c, y_c = _unrolled(xyz_corners)
             _, el_c = _spherical_angles(xyz_corners)
-            if np.ptp(x_c) > 180.0:
-                continue
 
             # Dense 48-point perimeter along all 4 edges for curved spherical/cylindrical borders
             rr_e = np.concatenate(
@@ -380,12 +380,37 @@ def _encode_panel_textures(
             xyz_edge = det.pixel_to_lab(rr_e, cc_e)
             x_e, y_e = _unrolled(xyz_edge)
             _, el_e = _spherical_angles(xyz_edge)
-            if np.ptp(x_e) > 180.0:
-                continue
 
-            az_min, az_max = float(np.min(x_e)), float(np.max(x_e))
-            y_min, y_max = float(np.min(y_e)), float(np.max(y_e))
-            el_min, el_max = float(np.min(el_e)), float(np.max(el_e))
+            # Curvilinear (grid_n + 1) x (grid_n + 1) interior/boundary mesh so high-elevation
+            # panels (such as MANDI's bottom-plane banks) warp accurately to their curved outlines
+            rr_m_grid, cc_m_grid = np.meshgrid(
+                t_grid * (det.n - 1), t_grid * (det.m - 1), indexing="ij"
+            )
+            xyz_mesh = det.pixel_to_lab(rr_m_grid.ravel(), cc_m_grid.ravel())
+            x_m, y_m = _unrolled(xyz_mesh)
+            _, el_m = _spherical_angles(xyz_mesh)
+
+            # Unwrap azimuth across the +-180 deg seam (e.g., MANDI Bank 5 straddling +-180 deg)
+            x_all = np.concatenate([x_c, x_e, x_m])
+            if np.ptp(x_all) > 180.0:
+                x_all_u = np.where(x_all < 0.0, x_all + 360.0, x_all)
+                if np.ptp(x_all_u) <= 180.0:
+                    x_c = np.where(x_c < 0.0, x_c + 360.0, x_c)
+                    x_e = np.where(x_e < 0.0, x_e + 360.0, x_e)
+                    x_m = np.where(x_m < 0.0, x_m + 360.0, x_m)
+                else:
+                    continue
+
+            az_min = float(min(np.min(x_e), np.min(x_m)))
+            az_max = float(max(np.max(x_e), np.max(x_m)))
+            y_min = float(min(np.min(y_e), np.min(y_m)))
+            y_max = float(max(np.max(y_e), np.max(y_m)))
+            el_min = float(min(np.min(el_e), np.min(el_m)))
+            el_max = float(max(np.max(el_e), np.max(el_m)))
+
+            x_m_2d = x_m.reshape(grid_n + 1, grid_n + 1)
+            y_m_2d = y_m.reshape(grid_n + 1, grid_n + 1)
+            el_m_2d = el_m.reshape(grid_n + 1, grid_n + 1)
 
             tex_b64 = None
             im = raw_bank_images.get(int(bk))
@@ -414,6 +439,26 @@ def _encode_panel_textures(
                     "corners_sph": [
                         [round(float(x_c[j]), 3), round(float(el_c[j]), 3)]
                         for j in range(4)
+                    ],
+                    "mesh": [
+                        [
+                            [
+                                round(float(x_m_2d[ir, ic]), 3),
+                                round(float(y_m_2d[ir, ic]), 4),
+                            ]
+                            for ic in range(grid_n + 1)
+                        ]
+                        for ir in range(grid_n + 1)
+                    ],
+                    "mesh_sph": [
+                        [
+                            [
+                                round(float(x_m_2d[ir, ic]), 3),
+                                round(float(el_m_2d[ir, ic]), 3),
+                            ]
+                            for ic in range(grid_n + 1)
+                        ]
+                        for ir in range(grid_n + 1)
                     ],
                     "outline": [
                         [round(float(x_e[j]), 2), round(float(y_e[j]), 4)]
@@ -4994,6 +5039,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
         const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
         const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+        const meshPts = isSph && panel.mesh_sph ? panel.mesh_sph : panel.mesh;
 
         ctx.save();
         if (outlinePts && outlinePts.length >= 4) {{
@@ -5016,14 +5062,103 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (texCanvas && state.detAlpha > 0.01) {{
           ctx.globalAlpha = state.detAlpha;
           ctx.imageSmoothingEnabled = true;
-          if (cornersPts && cornersPts.length === 4) {{
+          const W = Math.max(1, texCanvas.width);
+          const H = Math.max(1, texCanvas.height);
+          if (Array.isArray(meshPts) && meshPts.length >= 2 && Array.isArray(meshPts[0]) && meshPts[0].length >= 2) {{
+            // Curvilinear mesh warping (Nr x Nc grid of sub-quads) so high-latitude / tilted panels
+            // (e.g. MANDI bottom-plane panels) fill their curved outlines accurately
+            const nRows = meshPts.length - 1;
+            const nCols = meshPts[0].length - 1;
+            const SGrid = meshPts.map(row => row.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35)));
+            const S0 = SGrid[0][0], S1 = SGrid[nRows][0], S2 = SGrid[nRows][nCols], S3 = SGrid[0][nCols];
+            const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
+            const midR = Math.floor(nRows / 2), midC = Math.floor(nCols / 2);
+            const topBow = Math.hypot(SGrid[0][midC][0] - 0.5 * (S0[0] + S3[0]), SGrid[0][midC][1] - 0.5 * (S0[1] + S3[1]));
+            const botBow = Math.hypot(SGrid[nRows][midC][0] - 0.5 * (S1[0] + S2[0]), SGrid[nRows][midC][1] - 0.5 * (S1[1] + S2[1]));
+            const lftBow = Math.hypot(SGrid[midR][0][0] - 0.5 * (S0[0] + S1[0]), SGrid[midR][0][1] - 0.5 * (S0[1] + S1[1]));
+            const rgtBow = Math.hypot(SGrid[midR][nCols][0] - 0.5 * (S3[0] + S2[0]), SGrid[midR][nCols][1] - 0.5 * (S3[1] + S2[1]));
+            const maxBow = Math.max(topBow, botBow, lftBow, rgtBow);
+            if (nonPara < 1.5 && maxBow < 1.2) {{
+              const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
+              const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
+              const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
+              const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
+              const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
+              const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
+              ctx.save();
+              ctx.transform(ax, ay, cx, cy, ex, ey);
+              ctx.drawImage(texCanvas, 0, 0, W, H);
+              ctx.restore();
+            }} else {{
+              const du = W / nCols;
+              const dv = H / nRows;
+              const expandTri = (A, B, C) => {{
+                const mx = (A[0] + B[0] + C[0]) / 3;
+                const my = (A[1] + B[1] + C[1]) / 3;
+                const pad = 0.45;
+                return [A, B, C].map(P => {{
+                  const dx = P[0] - mx, dy = P[1] - my;
+                  const len = Math.hypot(dx, dy) || 1;
+                  return [P[0] + (dx / len) * pad, P[1] + (dy / len) * pad];
+                }});
+              }};
+              for (let ir = 0; ir < nRows; ir++) {{
+                const v0 = ir * dv;
+                const v1 = (ir + 1) * dv;
+                for (let ic = 0; ic < nCols; ic++) {{
+                  const u0 = ic * du;
+                  const u1 = (ic + 1) * du;
+                  const P00 = SGrid[ir][ic];
+                  const P01 = SGrid[ir][ic + 1];
+                  const P11 = SGrid[ir + 1][ic + 1];
+                  const P10 = SGrid[ir + 1][ic];
+
+                  // Sub-triangle 1: (u0, v0)->P00, (u1, v0)->P01, (u0, v1)->P10
+                  const [T1A, T1B, T1C] = expandTri(P00, P01, P10);
+                  const a1 = (P01[0] - P00[0]) / du;
+                  const b1 = (P01[1] - P00[1]) / du;
+                  const c1 = (P10[0] - P00[0]) / dv;
+                  const d1 = (P10[1] - P00[1]) / dv;
+                  const e1 = P00[0] - a1 * u0 - c1 * v0;
+                  const f1 = P00[1] - b1 * u0 - d1 * v0;
+                  ctx.save();
+                  ctx.beginPath();
+                  ctx.moveTo(T1A[0], T1A[1]);
+                  ctx.lineTo(T1B[0], T1B[1]);
+                  ctx.lineTo(T1C[0], T1C[1]);
+                  ctx.closePath();
+                  ctx.clip();
+                  ctx.transform(a1, b1, c1, d1, e1, f1);
+                  ctx.drawImage(texCanvas, 0, 0, W, H);
+                  ctx.restore();
+
+                  // Sub-triangle 2: (u1, v0)->P01, (u1, v1)->P11, (u0, v1)->P10
+                  const [T2A, T2B, T2C] = expandTri(P01, P11, P10);
+                  const a2 = (P11[0] - P10[0]) / du;
+                  const b2 = (P11[1] - P10[1]) / du;
+                  const c2 = (P11[0] - P01[0]) / dv;
+                  const d2 = (P11[1] - P01[1]) / dv;
+                  const e2 = P11[0] - a2 * u1 - c2 * v1;
+                  const f2 = P11[1] - b2 * u1 - d2 * v1;
+                  ctx.save();
+                  ctx.beginPath();
+                  ctx.moveTo(T2A[0], T2A[1]);
+                  ctx.lineTo(T2B[0], T2B[1]);
+                  ctx.lineTo(T2C[0], T2C[1]);
+                  ctx.closePath();
+                  ctx.clip();
+                  ctx.transform(a2, b2, c2, d2, e2, f2);
+                  ctx.drawImage(texCanvas, 0, 0, W, H);
+                  ctx.restore();
+                }}
+              }}
+            }}
+          }} else if (cornersPts && cornersPts.length === 4) {{
             // True 2-triangle affine texture projection from (r, c) corners C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
             const S0 = detToScreen(cornersPts[0][0] + shiftAz, cornersPts[0][1], w, h, -0.35);
             const S1 = detToScreen(cornersPts[1][0] + shiftAz, cornersPts[1][1], w, h, -0.35);
             const S2 = detToScreen(cornersPts[2][0] + shiftAz, cornersPts[2][1], w, h, -0.35);
             const S3 = detToScreen(cornersPts[3][0] + shiftAz, cornersPts[3][1], w, h, -0.35);
-            const W = Math.max(1, texCanvas.width);
-            const H = Math.max(1, texCanvas.height);
             const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
             if (nonPara < 2.2) {{
               const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
@@ -5862,14 +5997,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   // Dynamic payload hot-reload + Client-Side h5wasm HDF5 Parser (for truly static HTML usage)
-  function recomputeBoundsAndReload(newPayload) {{
+  function recomputeBoundsAndReload(newPayload, opts) {{
     if (!newPayload) return;
+    const isFrameSwitch = Boolean(opts && opts.isFrameSwitch);
+    const isSolveRunning = state.runningStageIdx === 1 || typeof newPayload.active_rung_idx === "number";
+    const prevZones = [...ZONES];
+    const prevPeaks = [...PEAKS];
+    const prevSamplePeaks = [...SAMPLE_PEAKS];
+    const prevLadder = [...LADDER];
+    const prevRungIdx = state.currentRungIdx;
+    const prevPipelineIdx = state.currentPipelineIdx;
     const prevInst = DATA.instrument;
     DATA.instrument = newPayload.instrument || DATA.instrument;
     if (newPayload.beamline_detectors) {{
       DATA.beamline_detectors = newPayload.beamline_detectors;
     }}
-    if (newPayload.default_projection || (DATA.instrument && DATA.instrument !== prevInst)) {{
+    if (!isFrameSwitch && (newPayload.default_projection || (DATA.instrument && DATA.instrument !== prevInst))) {{
       const nextProj = newPayload.default_projection || ((DATA.instrument === "MANDI" || DATA.instrument === "TOPAZ") ? "spherical" : "cylindrical");
       state.projection = nextProj;
       syncProjectionUI();
@@ -5902,12 +6045,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (dEl) dEl.value = Number(DATA.d_min).toFixed(1);
     }}
 
-    const nextPeaks = Array.isArray(newPayload.peaks) ? [...newPayload.peaks] : [];
-    const nextSamplePeaks = Array.isArray(newPayload.sample_peaks) ? [...newPayload.sample_peaks] : nextPeaks;
-    const nextZones = Array.isArray(newPayload.zones) ? [...newPayload.zones] : [];
+    let nextPeaks = Array.isArray(newPayload.peaks) ? [...newPayload.peaks] : [];
+    let nextSamplePeaks = Array.isArray(newPayload.sample_peaks) ? [...newPayload.sample_peaks] : nextPeaks;
+    let nextZones = Array.isArray(newPayload.zones) ? [...newPayload.zones] : [];
     const nextPanels = Array.isArray(newPayload.panels) ? [...newPayload.panels] : [];
-    const nextLadder = Array.isArray(newPayload.ladder_steps) && newPayload.ladder_steps.length > 0 ? [...newPayload.ladder_steps] : [...LADDER];
+    let nextLadder = Array.isArray(newPayload.ladder_steps) && newPayload.ladder_steps.length > 0 ? [...newPayload.ladder_steps] : [...LADDER];
     const nextPipeline = Array.isArray(newPayload.pipeline_stages) && newPayload.pipeline_stages.length > 0 ? [...newPayload.pipeline_stages] : [...PIPELINE];
+
+    if (isSolveRunning) {{
+      if (nextZones.length === 0 && prevZones.length > 0) {{
+        nextZones = prevZones;
+        nextLadder = prevLadder;
+      }}
+      if (nextPeaks.length === 0 && prevPeaks.length > 0) {{
+        nextPeaks = prevPeaks;
+        nextSamplePeaks = prevSamplePeaks;
+      }}
+    }}
 
     PEAKS.length = 0;
     nextPeaks.forEach(p => PEAKS.push(p));
@@ -6003,8 +6157,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const ord1 = ZONES.filter(z => (z.order || 1) <= 1).map(z => z.zone_id);
     state.maxZoneOrder = ord1.length > 0 ? 1 : 2;
     state.activeZones = new Set(ord1.length > 0 ? ord1 : ZONES.map(z => z.zone_id));
-    state.currentPipelineIdx = pipelineIdxForArtifactKind(artKind);
-    state.currentRungIdx = artKind === "merged" ? 0 : Math.max(0, LADDER.length - 1);
+    if (isSolveRunning) {{
+      state.currentPipelineIdx = 1;
+      state.currentRungIdx = typeof newPayload.active_rung_idx === "number"
+        ? newPayload.active_rung_idx
+        : Math.max(1, prevRungIdx);
+    }} else if (isFrameSwitch) {{
+      state.currentPipelineIdx = prevPipelineIdx;
+      state.currentRungIdx = prevRungIdx;
+    }} else {{
+      state.currentPipelineIdx = pipelineIdxForArtifactKind(artKind);
+      state.currentRungIdx = artKind === "merged" ? 0 : Math.max(0, LADDER.length - 1);
+    }}
     if (artKind === "merged_careless" || Boolean(DATA.merge_metrics)) {{
       state.showStereo = true;
       state.wulffExpanded = true;
@@ -6018,6 +6182,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     else {{ renderZoneList(); updateHUD(); }}
     renderFilesDrawer();
     probeGalaxyConnection();
+    if (isFrameSwitch) {{
+      return;
+    }}
     if (artKind === "merged_careless" && DATA.merge_metrics) {{
       const m = DATA.merge_metrics;
       const cc = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
@@ -6275,18 +6442,56 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       for (let k=0;k<nPts;k++) edges.push([det.n-1, (k/nPts)*(det.m-1)]);
       for (let k=0;k<nPts;k++) edges.push([((nPts-k)/nPts)*(det.n-1), det.m-1]);
       for (let k=0;k<nPts;k++) edges.push([0, ((nPts-k)/nPts)*(det.m-1)]);
-      let azMin=180, azMax=-180, yMin=10, yMax=-10, elMin=90, elMax=-90;
       edges.forEach(([r, c]) => {{
         const [az, y, el] = labToCyl(pixelToLab(det, r, c));
-        if (az < azMin) azMin = az; if (az > azMax) azMax = az;
-        if (y < yMin) yMin = y; if (y > yMax) yMax = y;
-        if (el < elMin) elMin = el; if (el > elMax) elMax = el;
         outline.push([az, y]); outlineSph.push([az, el]);
       }});
-      if (azMax - azMin <= 180) {{
+      const gridN = 8;
+      const mesh = [], meshSph = [];
+      for (let ir = 0; ir <= gridN; ir++) {{
+        const r = (ir / gridN) * (det.n - 1);
+        const rowCyl = [], rowSph = [];
+        for (let ic = 0; ic <= gridN; ic++) {{
+          const c = (ic / gridN) * (det.m - 1);
+          const [azM, yM, elM] = labToCyl(pixelToLab(det, r, c));
+          rowCyl.push([azM, yM]);
+          rowSph.push([azM, elM]);
+        }}
+        mesh.push(rowCyl);
+        meshSph.push(rowSph);
+      }}
+      const allAz = [
+        ...corners.map(p => p[0]),
+        ...outline.map(p => p[0]),
+        ...mesh.flat().map(p => p[0]),
+      ];
+      let azSpan = Math.max(...allAz) - Math.min(...allAz);
+      if (azSpan > 180) {{
+        const unwrapped = allAz.map(a => a < 0 ? a + 360 : a);
+        const uSpan = Math.max(...unwrapped) - Math.min(...unwrapped);
+        if (uSpan <= 180) {{
+          corners.forEach(p => {{ if (p[0] < 0) p[0] += 360; }});
+          cornersSph.forEach(p => {{ if (p[0] < 0) p[0] += 360; }});
+          outline.forEach(p => {{ if (p[0] < 0) p[0] += 360; }});
+          outlineSph.forEach(p => {{ if (p[0] < 0) p[0] += 360; }});
+          mesh.forEach(row => row.forEach(p => {{ if (p[0] < 0) p[0] += 360; }}));
+          meshSph.forEach(row => row.forEach(p => {{ if (p[0] < 0) p[0] += 360; }}));
+          azSpan = uSpan;
+        }}
+      }}
+      if (azSpan <= 180) {{
+        const ptsCyl = [...outline, ...mesh.flat()];
+        const ptsSph = [...outlineSph, ...meshSph.flat()];
+        const azMin = Math.min(...ptsCyl.map(p => p[0]));
+        const azMax = Math.max(...ptsCyl.map(p => p[0]));
+        const yMin = Math.min(...ptsCyl.map(p => p[1]));
+        const yMax = Math.max(...ptsCyl.map(p => p[1]));
+        const elMin = Math.min(...ptsSph.map(p => p[1]));
+        const elMax = Math.max(...ptsSph.map(p => p[1]));
         panelsOut.push({{
           bank: bid, az_min: azMin, az_max: azMax, y_min: yMin, y_max: yMax, el_min: elMin, el_max: elMax,
           corners, corners_sph: cornersSph,
+          mesh, mesh_sph: meshSph,
           outline, outline_sph: outlineSph, _grayCanvas: bankGrayCanvases.get(bid) || null,
         }});
       }}
@@ -8100,7 +8305,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const resp = await fetch(`api/payload?frame=${{clamped}}`, {{ cache: "no-store" }});
       if (resp.ok) {{
         const newPayload = await resp.json();
-        recomputeBoundsAndReload(newPayload);
+        recomputeBoundsAndReload(newPayload, {{ isFrameSwitch: true }});
       }}
     }} catch (_e) {{}}
   }}

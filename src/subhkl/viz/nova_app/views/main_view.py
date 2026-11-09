@@ -144,8 +144,19 @@ class MainApp:
             frame_q = request.rel_url.query.get("frame")
             if frame_q is not None and str(frame_q).strip() != "":
                 try:
-                    self.view_model.model.subhkl.refresh_payload(
-                        frame_index=int(frame_q)
+                    f_idx = int(frame_q)
+                    self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                    if isinstance(self.view_model.model.subhkl.payload, dict):
+                        self.pipeline_runner.apply_active_solve_overlay(
+                            self.view_model.model.subhkl.payload,
+                            frame_index=f_idx,
+                        )
+                except Exception:
+                    pass
+            elif isinstance(self.view_model.model.subhkl.payload, dict):
+                try:
+                    self.pipeline_runner.apply_active_solve_overlay(
+                        self.view_model.model.subhkl.payload
                     )
                 except Exception:
                     pass
@@ -364,9 +375,7 @@ class MainApp:
         async def handle_oncat_auth_get(request: web.Request) -> web.Response:
             import asyncio
 
-            res = await asyncio.to_thread(
-                self.pipeline_runner.get_oncat_auth_status
-            )
+            res = await asyncio.to_thread(self.pipeline_runner.get_oncat_auth_status)
             return web.json_response(res)
 
         async def handle_oncat_auth_post(request: web.Request) -> web.Response:
@@ -376,9 +385,7 @@ class MainApp:
                 body = await request.json()
             except Exception:
                 body = {}
-            res = await asyncio.to_thread(
-                self.pipeline_runner.handle_oncat_auth, body
-            )
+            res = await asyncio.to_thread(self.pipeline_runner.handle_oncat_auth, body)
             return web.json_response(res)
 
         app._client_max_size = 4 * 1024**3

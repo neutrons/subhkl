@@ -102,6 +102,29 @@ def _read_nexus_title(f: h5py.File) -> str:
     return str(raw)
 
 
+def get_rotation_data_from_title(title: str, instrument: str):
+    """Build (axes, angles, names) from a run title/angles string using reduction_settings[instrument]."""
+    settings = reduction_settings[instrument]
+    axes, angles, names = [], [], []
+    title_angles = harvest_goniometer_angles_from_title(title or "")
+    for axis_name, axis_spec in settings["Goniometer"].items():
+        log_name = axis_name.split("#")[0]
+        short_key = log_name.split(":")[-1].lower()
+        angle_deg = None
+        if short_key in title_angles:
+            angle_deg = float(title_angles[short_key])
+        elif (
+            str(instrument).upper() in ("CG4D", "IMAGINE")
+            and short_key in _CG4D_NOMINAL_DEFAULTS
+        ):
+            angle_deg = float(_CG4D_NOMINAL_DEFAULTS[short_key])
+        if angle_deg is not None:
+            axes.append(np.array(axis_spec, dtype=float))
+            angles.append(angle_deg)
+            names.append(log_name)
+    return axes, angles, names
+
+
 def get_rotation_data_from_nexus(filename, instrument):
     settings = reduction_settings[instrument]
     axes, angles, names = [], [], []
