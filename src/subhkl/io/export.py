@@ -84,9 +84,19 @@ class BaseConcatenateMerger:
 
                 for merge_key in self.merge_keys:
                     # Use the shape from the typical file
-                    shape = (total_peaks,) + f_typical[merge_key].shape[1:]
+                    tail_shape = f_typical[merge_key].shape[1:]
+                    shape = (total_peaks,) + tail_shape
                     dtype = f_typical[merge_key].dtype
-                    f_out.create_dataset(merge_key, shape, dtype)
+                    if len(shape) >= 3 and total_peaks > 0:
+                        f_out.create_dataset(
+                            merge_key,
+                            shape,
+                            dtype,
+                            chunks=(1,) + tail_shape,
+                            compression="lzf",
+                        )
+                    else:
+                        f_out.create_dataset(merge_key, shape, dtype)
 
                 for per_file_key in self.per_file_keys:
                     if per_file_key in f_typical:

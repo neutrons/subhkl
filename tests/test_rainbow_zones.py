@@ -1037,3 +1037,74 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     html = out_html.read_text()
     assert "panel.mesh_sph" in html
     assert "isFrameSwitch" in html
+
+    # 4. ImageStackMerger writes LZF-compressed 3D image stacks and multi-run check_neutron_paths returns verified_dataset_ids
+    import h5py
+    from unittest.mock import MagicMock
+    from subhkl.commands import run_merge_images
+
+    r1 = tmp_path / "run_001.reduce.h5"
+    r2 = tmp_path / "run_002.reduce.h5"
+    for rp, ang in ((r1, 10.0), (r2, 20.0)):
+        with h5py.File(rp, "w") as hf:
+            hf.attrs["instrument"] = "CG4D"
+            hf.create_dataset(
+                "images",
+                data=np.zeros((2, 16, 16), dtype=np.int64),
+                chunks=(1, 16, 16),
+                compression="lzf",
+            )
+            hf.create_dataset("bank_ids", data=np.array([1, 2], dtype=np.int32))
+            hf.create_dataset(
+                "goniometer/angles", data=np.array([[ang, 45.0, 0.0], [ang, 45.0, 0.0]])
+            )
+            hf.create_dataset("goniometer/axes", data=np.eye(3))
+            hf.create_dataset("instrument/wavelength", data=np.array([2.8, 4.5]))
+    merged_lzf = tmp_path / "merged_lzf.h5"
+    run_merge_images(
+        f"{r1} {r2}",
+        str(merged_lzf),
+        54.0,
+        54.0,
+        54.0,
+        90.0,
+        90.0,
+        90.0,
+        "P 1",
+    )
+    with h5py.File(merged_lzf, "r") as hf:
+        assert hf["images"].compression == "lzf"
+        assert hf["images"].chunks == (1, 16, 16)
+        assert hf["images"].shape == (4, 16, 16)
+
+    runner_multi = NovaGalaxyPipelineRunner(
+        galaxy_url="https://ndip-test.ornl.gov",
+        galaxy_api_key="mock_key",
+    )
+    mock_gi = MagicMock()
+    mock_gi.tools.run_tool.return_value = {
+        "jobs": [{"id": "job_ndip_m"}],
+        "outputs": [{"id": "ds_ndip_m"}],
+    }
+    mock_store = MagicMock()
+    mock_store.history_id = "hist_m"
+    mock_store.nova_connection.galaxy_instance = mock_gi
+    runner_multi.get_datastore = MagicMock(return_value=mock_store)
+    runner_multi._has_tool_on_galaxy = MagicMock(return_value=True)
+    runner_multi.browse_oncat_catalog = MagicMock(return_value={"runs": []})
+    runner_multi._api_request = MagicMock(return_value={"state": "ok", "exit_code": 0})
+    chk_multi = runner_multi.check_neutron_paths(
+        {
+            "ingest_mode": "oncat",
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "36148",
+            "paths": [
+                "/HFIR/CG4D/IPTS-36148/nexus/CG4D_2625.nxs.h5",
+                "/HFIR/CG4D/IPTS-36148/nexus/CG4D_2626.nxs.h5",
+            ],
+        }
+    )
+    assert chk_multi["ok"] is True
+    assert chk_multi["verified_dataset_ids"] == ["ds_ndip_m"]
+

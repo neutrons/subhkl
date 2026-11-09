@@ -3,7 +3,10 @@ import os
 import sys
 from typing import Annotated
 
-if "rainbow-visualize" in sys.argv:
+if any(
+    cmd in sys.argv
+    for cmd in ("rainbow-visualize", "reduce", "reduce-batch", "merge-images")
+):
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import h5py
@@ -22,6 +25,7 @@ from subhkl.commands import (
     run_peak_predictor,
     run_rbf_integrator,
     run_reduce,
+    run_reduce_batch,
     run_static_mask,
     run_sum_images,
 )
@@ -1220,6 +1224,45 @@ def reduce(
 ):
     run_reduce(
         nexus_filename, output_filename, instrument, wavelength_min, wavelength_max
+    )
+
+
+@app.command()
+def reduce_batch(
+    nexus_filenames: Annotated[
+        list[str],
+        typer.Argument(help="List of input NeXus (.nxs.h5) files to reduce in parallel"),
+    ],
+    output_dir: Annotated[
+        str, typer.Option("--output-dir", "-o", help="Directory for *.reduce.h5 outputs")
+    ] = "out",
+    instrument: Annotated[
+        str, typer.Option("--instrument", "-i", help="Instrument name")
+    ] = "CG4D",
+    wavelength_min: Annotated[
+        float | None, typer.Option(help="Override min wavelength")
+    ] = None,
+    wavelength_max: Annotated[
+        float | None, typer.Option(help="Override max wavelength")
+    ] = None,
+    workers: Annotated[
+        int | None, typer.Option(help="Max parallel CPU worker processes")
+    ] = None,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    tasks: list[tuple[str, str]] = []
+    for idx, nxs_p in enumerate(nexus_filenames):
+        bn = os.path.basename(nxs_p).split(".")[0] or f"run_{idx:03d}"
+        out_p = os.path.join(output_dir, f"{bn}.reduce.h5")
+        if any( existing_out == out_p for _, existing_out in tasks ):
+            out_p = os.path.join(output_dir, f"{idx:03d}_{bn}.reduce.h5")
+        tasks.append((nxs_p, out_p))
+    run_reduce_batch(
+        tasks,
+        instrument,
+        wavelength_min=wavelength_min,
+        wavelength_max=wavelength_max,
+        max_workers=workers,
     )
 
 

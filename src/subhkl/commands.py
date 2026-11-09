@@ -1570,7 +1570,10 @@ def run_reduce(
     )
 
     with h5py.File(output_filename, "w") as f:
-        f.create_dataset("images", data=image_stack, compression="lzf")
+        chunks = (1,) + image_stack.shape[1:] if image_stack.ndim >= 3 else None
+        f.create_dataset(
+            "images", data=image_stack, chunks=chunks, compression="lzf"
+        )
         f.create_dataset("bank_ids", data=bank_ids)
         f.create_dataset("goniometer/angles", data=angles_repeated)
         f.create_dataset("goniometer/axes", data=axes)
@@ -1588,6 +1591,63 @@ def run_reduce(
         f.attrs["instrument"] = instrument
 
     print(f"Saved {n_images} banks to {output_filename}")
+
+
+def _reduce_worker(
+    task: tuple[str, str, str, float | None, float | None],
+) -> str:
+    nexus_filename, output_filename, instrument, wavelength_min, wavelength_max = task
+    run_reduce(
+        nexus_filename,
+        output_filename,
+        instrument,
+        wavelength_min=wavelength_min,
+        wavelength_max=wavelength_max,
+    )
+    return output_filename
+
+
+def run_reduce_batch(
+    tasks: list[tuple[str, str]],
+    instrument: str,
+    wavelength_min: float | None = None,
+    wavelength_max: float | None = None,
+    max_workers: int | None = None,
+) -> list[str]:
+    """Reduce multiple (nexus_filename, output_filename) pairs in parallel across CPU cores."""
+    import concurrent.futures
+    import multiprocessing as mp
+
+    if not tasks:
+        return []
+    if len(tasks) == 1:
+        nxs_f, out_f = tasks[0]
+        run_reduce(
+            nxs_f,
+            out_f,
+            instrument,
+            wavelength_min=wavelength_min,
+            wavelength_max=wavelength_max,
+        )
+        return [out_f]
+
+    cpu_cnt = os.cpu_count() or 4
+    workers = min(len(tasks), max_workers or min(cpu_cnt, 16))
+    worker_args = [
+        (nxs_f, out_f, instrument, wavelength_min, wavelength_max)
+        for nxs_f, out_f in tasks
+    ]
+    print(
+        f"Reducing {len(tasks)} runs in parallel across {workers} CPU workers..."
+    )
+    try:
+        ctx = mp.get_context("fork")
+    except ValueError:
+        ctx = mp.get_context()
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=workers, mp_context=ctx
+    ) as pool:
+        return list(pool.map(_reduce_worker, worker_args))
 
 
 def run_merge_images(

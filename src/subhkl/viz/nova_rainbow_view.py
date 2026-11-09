@@ -1219,7 +1219,10 @@ class NovaGalaxyPipelineRunner:
                 tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}"
             )
             if os.path.isfile(local_path) and not os.path.exists(cache_dest):
-                shutil.copy2(local_path, cache_dest)
+                try:
+                    os.link(local_path, cache_dest)
+                except Exception:
+                    shutil.copy2(local_path, cache_dest)
         except Exception:
             pass
         job_record["stdout"] += (
@@ -1510,15 +1513,43 @@ class NovaGalaxyPipelineRunner:
                 )
             )
             if is_multi_run_legacy_reduce:
+                import concurrent.futures
+                import re as _re
+
                 raw_nxs_all = list(job_record.get("raw_nxs") or [])
                 out_sub = os.path.join(work_dir, "out")
                 os.makedirs(out_sub, exist_ok=True)
+                # Pre-warm ONCat catalog cache once for the sweep so parallel workers don't re-fetch it per run
+                try:
+                    m_ip = _re.search(r"/IPTS-([0-9]+)/", raw_nxs_all[0], _re.I)
+                    if m_ip:
+                        fac_pre = (
+                            "HFIR"
+                            if (
+                                raw_nxs_all[0].startswith("/HFIR")
+                                or inst.upper().startswith(("CG", "HB"))
+                            )
+                            else "SNS"
+                        )
+                        self.browse_oncat_catalog(
+                            {
+                                "facility": fac_pre,
+                                "instrument": inst,
+                                "ipts": m_ip.group(1),
+                            }
+                        )
+                except Exception:
+                    pass
+
                 job_record["stdout"] += (
                     f"[galaxy -> pulsar] Multi-run reduction ({len(raw_nxs_all)} runs): "
-                    f"dispatching per-run {primary_tool} jobs on {self.galaxy_url}...\n"
+                    f"dispatching parallel per-run {primary_tool} jobs on {self.galaxy_url}...\n"
                 )
-                submitted_parts: list[tuple[str, str, list[dict[str, Any]], str]] = []
-                for idx_r, nxs_p in enumerate(raw_nxs_all):
+
+                def _submit_one_part(
+                    arg: tuple[int, str],
+                ) -> tuple[int, str, str, list[dict[str, Any]], str]:
+                    idx_r, nxs_p = arg
                     bn = os.path.basename(nxs_p).split(".")[0]
                     part_path = os.path.join(out_sub, f"{bn}.reduce.h5")
                     part_inputs = {
@@ -1551,30 +1582,54 @@ class NovaGalaxyPipelineRunner:
                         for d in (part_res.get("outputs") or [])
                         if isinstance(d, dict)
                     ]
-                    submitted_parts.append((nxs_p, p_jid, p_outs, part_path))
+                    return idx_r, nxs_p, p_jid, p_outs, part_path
+
+                submit_workers = min(len(raw_nxs_all), 6)
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=submit_workers
+                ) as sub_pool:
+                    submitted_indexed = list(
+                        sub_pool.map(
+                            _submit_one_part, list(enumerate(raw_nxs_all))
+                        )
+                    )
+                submitted_indexed.sort(key=lambda item: item[0])
+                submitted_parts = [
+                    (nxs_p, p_jid, p_outs, part_path)
+                    for idx_r, nxs_p, p_jid, p_outs, part_path in submitted_indexed
+                ]
+                for idx_r, (nxs_p, p_jid, _p_outs, _part_path) in enumerate(
+                    submitted_parts
+                ):
                     job_record["stdout"] += (
                         f"[galaxy -> pulsar] Dispatched Run {idx_r + 1}/{len(raw_nxs_all)} "
                         f"({os.path.basename(nxs_p)}, job_id={p_jid})\n"
                     )
 
-                part_paths: list[str] = []
-                for idx_r, (nxs_p, p_jid, p_outs, part_path) in enumerate(
-                    submitted_parts
-                ):
-                    job_record["job_id"] = p_jid
-                    job_record["outputs"] = p_outs
-                    job_record["raw_nxs"] = [nxs_p]
-                    job_record["reduce_part_path"] = part_path
+                log_lock = threading.Lock()
+
+                def _poll_one_part(
+                    arg: tuple[int, tuple[str, str, list[dict[str, Any]], str]],
+                ) -> tuple[int, str, str, str]:
+                    idx_r, (nxs_p, p_jid, p_outs, part_path) = arg
+                    part_rec: dict[str, Any] = {
+                        "stage_id": "reduce",
+                        "job_id": p_jid,
+                        "outputs": p_outs,
+                        "raw_nxs": [nxs_p],
+                        "instrument": inst,
+                        "merged_label": os.path.basename(part_path),
+                        "reduce_part_path": part_path,
+                        "state": "running",
+                        "stdout": "",
+                        "stderr": "",
+                    }
                     self._poll_galaxy_job(
-                        job_record,
+                        part_rec,
                         None,
                         final_step=False,
                         work_dir=work_dir,
                     )
-                    if job_record.get("state") in ("error", "deleted", "paused"):
-                        return
-                    if os.path.isfile(part_path):
-                        part_paths.append(part_path)
                     for po in p_outs:
                         if po.get("id") and self.history_id:
                             try:
@@ -1585,6 +1640,33 @@ class NovaGalaxyPipelineRunner:
                                 )
                             except Exception:
                                 pass
+                    st_part = str(part_rec.get("state") or "ok")
+                    with log_lock:
+                        job_record["stdout"] += (
+                            f"[nova <- galaxy] Completed Run {idx_r + 1}/{len(raw_nxs_all)} "
+                            f"({os.path.basename(nxs_p)}, state={st_part})\n"
+                        )
+                    return idx_r, part_path, st_part, str(part_rec.get("stderr") or "")
+
+                poll_workers = min(len(submitted_parts), 8)
+                with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=poll_workers
+                ) as poll_pool:
+                    polled_results = list(
+                        poll_pool.map(
+                            _poll_one_part, list(enumerate(submitted_parts))
+                        )
+                    )
+                polled_results.sort(key=lambda item: item[0])
+                part_paths: list[str] = []
+                for _idx_r, part_path, st_part, err_part in polled_results:
+                    if st_part in ("error", "deleted", "paused"):
+                        job_record["state"] = st_part
+                        if err_part:
+                            job_record["stderr"] = err_part
+                        return
+                    if os.path.isfile(part_path):
+                        part_paths.append(part_path)
 
                 job_record.pop("reduce_part_path", None)
                 job_record["raw_nxs"] = raw_nxs_all
@@ -1600,7 +1682,7 @@ class NovaGalaxyPipelineRunner:
                 import numpy as np
 
                 job_record["stdout"] += (
-                    f"\n[subhkl] Merging {len(part_paths)} reduced runs -> {merged_dest}...\n"
+                    f"\n[subhkl] Merging {len(part_paths)} reduced runs (LZF compressed) -> {merged_dest}...\n"
                 )
                 run_merge_images(
                     " ".join(part_paths),
@@ -1627,21 +1709,12 @@ class NovaGalaxyPipelineRunner:
                     pass
                 self._stamp_merged_metadata(merged_dest, job_record)
                 if os.path.abspath(merged_dest) != os.path.abspath(merged_link):
-                    shutil.copy2(merged_dest, merged_link)
-                up_id = self._ensure_galaxy_h5_dataset(
-                    store,
-                    merged_dest,
-                    job_record,
-                    force_upload=True,
-                    file_ext="h5",
-                )
-                job_record["outputs"] = [
-                    {
-                        "id": up_id,
-                        "name": merged_label,
-                        "extension": "h5",
-                    }
-                ]
+                    try:
+                        if os.path.exists(merged_link):
+                            os.remove(merged_link)
+                        os.link(merged_dest, merged_link)
+                    except Exception:
+                        shutil.copy2(merged_dest, merged_link)
                 job_record["output_h5_path"] = merged_dest
                 if callable(on_complete_h5):
                     on_complete_h5(merged_dest)
@@ -1650,6 +1723,28 @@ class NovaGalaxyPipelineRunner:
                     f"\n[galaxy -> pulsar] Multi-run reduction ({len(part_paths)} runs) finished (state=ok).\n"
                 )
                 job_record["state"] = "ok"
+
+                def _bg_preupload() -> None:
+                    try:
+                        bg_rec: dict[str, Any] = {"stdout": ""}
+                        up_id = self._ensure_galaxy_h5_dataset(
+                            store,
+                            merged_link,
+                            bg_rec,
+                            force_upload=True,
+                            file_ext="h5",
+                        )
+                        job_record["outputs"] = [
+                            {
+                                "id": up_id,
+                                "name": merged_label,
+                                "extension": "h5",
+                            }
+                        ]
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_bg_preupload, daemon=True).start()
                 return
 
             job_record["tool_id"] = primary_tool
@@ -1872,8 +1967,9 @@ class NovaGalaxyPipelineRunner:
                             )
                         else:
                             ok = True
-                            if len(expanded) == 1:
-                                verified_dataset_ids = out_ids
+                            verified_dataset_ids = out_ids or [
+                                f"verified:{len(expanded)}"
+                            ]
                             msg = (
                                 f"Verified {len(expanded)} run(s) via NDIP Load Neutron Data "
                                 f"({inst} IPTS-{ipts_raw or '?'})"
@@ -2687,27 +2783,50 @@ class NovaGalaxyPipelineRunner:
                     "                    names.append(ln)\n"
                     "            return axes, angles, names\n"
                     "    _gonio.get_rotation_data_from_nexus = _patched_get_rot\n"
+                    "    _orig_cd = h5py.File.create_dataset\n"
+                    "    def _lzf_cd(self, name, shape=None, dtype=None, data=None, **kw):\n"
+                    "        sh = shape if shape is not None else (data.shape if data is not None else ())\n"
+                    "        if name == 'images' and len(sh) >= 3 and sh[0] > 0:\n"
+                    "            kw.setdefault('compression', 'lzf')\n"
+                    "            kw.setdefault('chunks', (1,) + tuple(sh[1:]))\n"
+                    "        return _orig_cd(self, name, shape=shape, dtype=dtype, data=data, **kw)\n"
+                    "    h5py.File.create_dataset = _lzf_cd\n"
                     "except Exception:\n"
                     "    pass\n"
                 )
-            reduce_cmds: list[str] = []
-            for i_nxs, nxs_p in enumerate(raw_nxs_local):
-                red_out = os.path.join(reduce_tmp_dir, f"run_{i_nxs:03d}.reduce.h5")
-                r_cmd = [
-                    "python",
-                    "-u",
-                    "-m",
-                    "subhkl.io.parser",
-                    "reduce",
-                    nxs_p,
-                    red_out,
-                    str(inst),
-                    "--wavelength-min",
-                    str(wl[0]),
-                    "--wavelength-max",
-                    str(wl[1]),
-                ]
-                reduce_cmds.append(shlex.join(r_cmd))
+            batch_py_path = os.path.join(reduce_tmp_dir, "_run_batch_reduce.py")
+            with open(batch_py_path, "w") as bf:
+                bf.write(
+                    "import os, sys, concurrent.futures, multiprocessing as mp\n"
+                    "os.environ.setdefault('JAX_PLATFORMS', 'cpu')\n"
+                    "from subhkl.commands import run_reduce\n"
+                    "def _w(t):\n"
+                    "    run_reduce(t[0], t[1], t[2], wavelength_min=t[3], wavelength_max=t[4])\n"
+                    "if __name__ == '__main__':\n"
+                    "    inst = sys.argv[1]\n"
+                    "    wl_min, wl_max = float(sys.argv[2]), float(sys.argv[3])\n"
+                    "    out_dir = sys.argv[4]\n"
+                    "    nxs_files = sys.argv[5:]\n"
+                    "    tasks = [(p, os.path.join(out_dir, f'run_{i:03d}.reduce.h5'), inst, wl_min, wl_max) for i, p in enumerate(nxs_files)]\n"
+                    "    if len(tasks) == 1:\n"
+                    "        _w(tasks[0])\n"
+                    "    else:\n"
+                    "        workers = min(len(tasks), os.cpu_count() or 8, 16)\n"
+                    "        print(f'Reducing {len(tasks)} runs in parallel across {workers} CPU cores...')\n"
+                    "        ctx = mp.get_context('fork')\n"
+                    "        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:\n"
+                    "            list(ex.map(_w, tasks))\n"
+                )
+            r_cmd = [
+                "python",
+                "-u",
+                batch_py_path,
+                str(inst),
+                str(wl[0]),
+                str(wl[1]),
+                reduce_tmp_dir,
+                *raw_nxs_local,
+            ]
             merge_cmd = [
                 "python",
                 "-u",
@@ -2724,7 +2843,7 @@ class NovaGalaxyPipelineRunner:
                 str(float(raw_cell[5])),
                 str(sg),
             ]
-            reduce_cmds.append(shlex.join(merge_cmd))
+            reduce_cmds = [shlex.join(r_cmd), shlex.join(merge_cmd)]
             chained_reduce = (
                 f"set -e; export PYTHONPATH={shlex.quote(reduce_tmp_dir)}:${{PYTHONPATH:-}}; "
                 + " && ".join(reduce_cmds)
@@ -3645,11 +3764,12 @@ class NovaGalaxyPipelineRunner:
                                         with open(target_path, "wb") as f:
                                             f.write(raw_bytes)
                                         tmp_path = target_path
-                                        try:
-                                            with open(cache_gx_path, "wb") as cf:
-                                                cf.write(raw_bytes)
-                                        except Exception:
-                                            pass
+                                        if not job_record.get("reduce_part_path"):
+                                            try:
+                                                with open(cache_gx_path, "wb") as cf:
+                                                    cf.write(raw_bytes)
+                                            except Exception:
+                                                pass
                                         job_record["stdout"] += (
                                             f"[nova <- galaxy] Synced '{merged_label}' (id={ds_id}) -> {target_path}\n"
                                         )
