@@ -478,16 +478,21 @@ class NovaGalaxyPipelineRunner:
                     "scan": {"src": "hda", "id": scan_id},
                     "indexer": {"src": "hda", "id": idx_id},
                     "instrument": inst,
-                    "dMin": float(params.get("d_min", 2.1)),
+                    "dMin": float(params.get("d_min", 2.8)),
                     "wavelengthMin": float(wl[0]),
                     "wavelengthMax": float(wl[1]),
                     "space": sg,
                 }
             elif stage_id == "reduce":
+                import glob as _glob
+
+                raw_nxs = sorted(_glob.glob(os.path.join(work_dir, "*.nxs.h5")))
+                if not raw_nxs:
+                    raise RuntimeError(
+                        f"Using pre-merged scan {os.path.basename(merged_path)} (no raw *.nxs.h5 in {work_dir})"
+                    )
                 primary_tool = "imaginex_subhkl_prepare_peaks"
-                idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
                 tool_inputs = {
-                    "inputs_0|input": {"src": "hda", "id": idx_id},
                     "instrument": inst,
                     "a": float(raw_cell[0]),
                     "b": float(raw_cell[1]),
@@ -496,7 +501,11 @@ class NovaGalaxyPipelineRunner:
                     "beta": float(raw_cell[4]),
                     "gamma": float(raw_cell[5]),
                     "spaceGroup": sg,
+                    "wavelengthMin": float(wl[0]),
+                    "wavelengthMax": float(wl[1]),
                 }
+                for i_nxs, nxs_p in enumerate(raw_nxs):
+                    tool_inputs[f"inputs_{i_nxs}|input"] = nxs_p
             else:
                 primary_tool = "imaginex_subhkl_metrics"
                 idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
@@ -504,6 +513,9 @@ class NovaGalaxyPipelineRunner:
                     "peaks": {"src": "hda", "id": idx_id},
                 }
 
+            is_two_step_integrate = stage_id == "integrate" and self._has_tool_on_galaxy(
+                "imaginex_subhkl_integrate"
+            )
             job_record["tool_id"] = primary_tool
             results = gi.tools.run_tool(
                 history_id=store.history_id,
@@ -521,10 +533,64 @@ class NovaGalaxyPipelineRunner:
                 for d in (results.get("outputs") or [])
                 if isinstance(d, dict)
             ]
+            step_lbl = "Step 1/2 " if is_two_step_integrate else ""
             job_record["stdout"] += (
-                f"[galaxy -> pulsar] Dispatched {primary_tool} (Galaxy job_id={job_id}) -> Pulsar queue on IMAGINEX-1\n"
+                f"[galaxy -> pulsar] Dispatched {step_lbl}{primary_tool} (Galaxy job_id={job_id}) -> Pulsar queue on IMAGINEX-1\n"
             )
-            self._poll_galaxy_job(job_record, on_complete_h5)
+            self._poll_galaxy_job(
+                job_record,
+                None if is_two_step_integrate else on_complete_h5,
+                final_step=not is_two_step_integrate,
+                work_dir=work_dir,
+            )
+
+            # Chain Step 2/2: imaginex_subhkl_integrate (integrator + mtz-exporter)
+            if (
+                is_two_step_integrate
+                and job_record.get("state") not in ("error", "deleted", "paused")
+                and job_record.get("outputs")
+            ):
+                pred_ds_id = job_record["outputs"][0]["id"]
+                gi.datasets.wait_for_dataset(pred_ds_id, maxwait=60, interval=1.5, check=True)
+                int_tool = "imaginex_subhkl_integrate"
+                int_inputs = {
+                    "scan": {"src": "hda", "id": scan_id},
+                    "predicted": {"src": "hda", "id": pred_ds_id},
+                    "instrument": inst,
+                    "anisotropic": True,
+                    "mosaicFit": True,
+                    "normalized": True,
+                    "snr": 5.0,
+                    "matrix": True,
+                    "matrixProfile": "gaussian",
+                    "createVisualizations": False,
+                }
+                job_record["tool_id"] = int_tool
+                int_results = gi.tools.run_tool(
+                    history_id=store.history_id,
+                    tool_id=int_tool,
+                    tool_inputs=int_inputs,
+                )
+                int_job_id = int_results["jobs"][0]["id"]
+                job_record["job_id"] = int_job_id
+                job_record["outputs"] = [
+                    {
+                        "id": d.get("id"),
+                        "name": d.get("output_name") or d.get("name"),
+                        "extension": d.get("file_ext") or d.get("extension") or "h5",
+                    }
+                    for d in (int_results.get("outputs") or [])
+                    if isinstance(d, dict)
+                ]
+                job_record["stdout"] += (
+                    f"\n[galaxy -> pulsar] Dispatched Step 2/2 {int_tool} (Galaxy job_id={int_job_id}) -> Pulsar queue on IMAGINEX-1\n"
+                )
+                self._poll_galaxy_job(
+                    job_record,
+                    on_complete_h5,
+                    final_step=True,
+                    work_dir=work_dir,
+                )
         except Exception as exc:
             clean_msg = self._clean_err_msg(exc)
             job_record["stdout"] += f"[nova -> galaxy] {clean_msg}; running GPU container on IMAGINEX-1...\n"
@@ -901,6 +967,9 @@ class NovaGalaxyPipelineRunner:
         job_record: dict[str, Any],
         on_complete_h5: Any = None,
         nova_job: Any = None,
+        *,
+        final_step: bool = True,
+        work_dir: str | None = None,
     ) -> None:
         job_id = job_record.get("job_id")
         if not job_id:
@@ -961,7 +1030,10 @@ class NovaGalaxyPipelineRunner:
                 # 2. Fetch job status & live Pulsar console_output stream from NDIP Galaxy
                 jinfo = self._api_request("GET", f"/api/jobs/{job_id}?full=true")
                 state = jinfo.get("state", "running")
-                job_record["state"] = state
+                if state != "ok":
+                    job_record["state"] = state
+                else:
+                    job_record["state"] = "running"
                 if jinfo.get("command_line"):
                     job_record["command_line"] = jinfo["command_line"]
 
@@ -1013,16 +1085,51 @@ class NovaGalaxyPipelineRunner:
                             for o in job_record.get("outputs", [])
                             if o.get("extension") in ("h5", "hdf5")
                         ]
-                        if h5_outs and callable(on_complete_h5):
+                        mtz_outs = [
+                            o
+                            for o in job_record.get("outputs", [])
+                            if o.get("extension") == "mtz"
+                            or "mtz" in str(o.get("name", "")).lower()
+                        ]
+                        if h5_outs:
                             ds_id = h5_outs[0]["id"]
                             raw_bytes = self._api_request(
                                 "GET", f"/api/datasets/{ds_id}/display", raw=True
                             )
-                            fd, tmp_path = tempfile.mkstemp(suffix=".h5", prefix="galaxy_solve_")
-                            with os.fdopen(fd, "wb") as f:
-                                f.write(raw_bytes)
-                            on_complete_h5(tmp_path)
-                            job_record["updated_payload_ready"] = True
+                            target_path = None
+                            if work_dir and os.path.isdir(work_dir):
+                                if not final_step and job_record.get("stage_id") == "integrate":
+                                    target_path = os.path.join(work_dir, "predictor.h5")
+                                elif job_record.get("stage_id") == "integrate":
+                                    target_path = os.path.join(work_dir, "integrated.h5")
+                                elif job_record.get("stage_id") == "solve":
+                                    target_path = os.path.join(work_dir, "solve.h5")
+                            if target_path:
+                                with open(target_path, "wb") as f:
+                                    f.write(raw_bytes)
+                                tmp_path = target_path
+                                job_record["stdout"] += f"[subhkl] Saved {os.path.basename(target_path)} -> {target_path}\n"
+                            else:
+                                fd, tmp_path = tempfile.mkstemp(suffix=".h5", prefix="galaxy_solve_")
+                                with os.fdopen(fd, "wb") as f:
+                                    f.write(raw_bytes)
+                            if final_step and callable(on_complete_h5):
+                                on_complete_h5(tmp_path)
+                                job_record["updated_payload_ready"] = True
+                        if final_step and mtz_outs and work_dir and os.path.isdir(work_dir):
+                            try:
+                                mtz_id = mtz_outs[0]["id"]
+                                mtz_bytes = self._api_request(
+                                    "GET", f"/api/datasets/{mtz_id}/display", raw=True
+                                )
+                                mtz_dest = os.path.join(work_dir, "reflections.mtz")
+                                with open(mtz_dest, "wb") as f:
+                                    f.write(mtz_bytes)
+                                job_record["stdout"] += f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
+                            except Exception:
+                                pass
+                        if final_step:
+                            job_record["state"] = "ok"
                     break
             except Exception as exc:
                 job_record["error"] = str(exc)
