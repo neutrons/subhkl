@@ -266,7 +266,7 @@ class NovaGalaxyPipelineRunner:
             ch if (ch.isalnum() or ch in "._-") else "_"
             for ch in os.path.basename(name)
         )
-        if not safe_name.endswith((".h5", ".hdf5")):
+        if not safe_name.endswith((".h5", ".hdf5", ".mtz", ".json", ".nxs")):
             safe_name += ".h5"
         tmp_dest = os.path.join(tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}")
         if os.path.isfile(tmp_dest) and os.path.getsize(tmp_dest) > 0:
@@ -280,6 +280,154 @@ class NovaGalaxyPipelineRunner:
         with open(tmp_dest, "wb") as fh:
             fh.write(data)
         return tmp_dest, info
+
+    @staticmethod
+    def _classify_artifact_stage(filename: str) -> str | None:
+        """Map an artifact filename to one of ('reduce', 'solve', 'integrate', 'merge')."""
+        low = os.path.basename(filename).lower()
+        if not low or low.startswith("."):
+            return None
+        if any(
+            low == k or low.endswith(k)
+            for k in (
+                "merged.mtz",
+                "predictions.mtz",
+                "xval.mtz",
+                "careless_metrics.json",
+                "careless_0.mtz",
+                "careless_predictions_0.mtz",
+                "careless_xval_0.mtz",
+            )
+        ):
+            return "merge"
+        if any(
+            low == k or low.endswith(k)
+            for k in ("predictor.h5", "integrated.h5", "reflections.mtz")
+        ):
+            return "integrate"
+        if "solve" in low and low.endswith(".h5"):
+            return "solve"
+        if any(
+            k in low
+            for k in (
+                "merged.h5",
+                "_merged.h5",
+                ".reduce.h5",
+                ".nxs.h5",
+                "scan_master.h5",
+            )
+        ):
+            return "reduce"
+        return None
+
+    def _active_work_dir(self, current_h5: str | None = None) -> str | None:
+        cand = current_h5
+        if not cand and isinstance(self.active_job, dict):
+            cand = self.active_job.get("output_h5_path")
+        if cand and os.path.isfile(str(cand)):
+            wd, _ = self._resolve_work_dir_and_merged(str(cand))
+            if os.path.isdir(wd):
+                return wd
+            parent = os.path.dirname(os.path.abspath(str(cand)))
+            if os.path.isdir(parent):
+                return parent
+        return None
+
+    def list_step_artifacts(
+        self,
+        current_h5: str | None = None,
+        history_datasets: list[dict[str, Any]] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return downloadable artifacts grouped by pipeline stage ('reduce', 'solve', 'integrate', 'merge')."""
+        stages: dict[str, dict[str, dict[str, Any]]] = {
+            "reduce": {},
+            "solve": {},
+            "integrate": {},
+            "merge": {},
+        }
+        if history_datasets is None:
+            history_datasets = self.list_history_datasets()
+
+        for ds in history_datasets or []:
+            if ds.get("state") and ds.get("state") != "ok":
+                continue
+            raw_name = str(ds.get("name") or "")
+            base_name = os.path.basename(raw_name)
+            st = self._classify_artifact_stage(base_name)
+            if not st:
+                continue
+            stages[st][base_name] = {
+                "name": base_name,
+                "stage_id": st,
+                "dataset_id": str(ds.get("id") or ""),
+                "hid": ds.get("hid"),
+                "source": "NDIP",
+            }
+
+        work_dir = self._active_work_dir(current_h5)
+        if work_dir and os.path.isdir(work_dir):
+            try:
+                for fn in sorted(os.listdir(work_dir)):
+                    fp = os.path.join(work_dir, fn)
+                    if not os.path.isfile(fp) or os.path.getsize(fp) <= 0:
+                        continue
+                    st = self._classify_artifact_stage(fn)
+                    if not st:
+                        continue
+                    entry = stages[st].get(
+                        fn, {"name": fn, "stage_id": st, "source": "LOCAL"}
+                    )
+                    entry["size_bytes"] = int(os.path.getsize(fp))
+                    entry["has_local"] = True
+                    stages[st][fn] = entry
+                    if fn == "integrated.h5" and os.path.isfile(
+                        os.path.join(work_dir, "careless_metrics.json")
+                    ):
+                        m_entry = dict(entry)
+                        m_entry["stage_id"] = "merge"
+                        stages["merge"][fn] = m_entry
+            except Exception:
+                pass
+
+        return {k: list(v.values()) for k, v in stages.items()}
+
+    def resolve_artifact_for_download(
+        self,
+        *,
+        dataset_id: str = "",
+        name: str = "",
+        current_h5: str | None = None,
+    ) -> tuple[str, str]:
+        """Resolve an artifact by dataset_id or filename to `(local_file_path, download_filename)`."""
+        clean_name = os.path.basename(name.strip()) if name else ""
+        work_dir = self._active_work_dir(current_h5)
+        if clean_name and work_dir and os.path.isdir(work_dir):
+            cand = os.path.join(work_dir, clean_name)
+            if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                return cand, clean_name
+
+        ds_id = dataset_id.strip()
+        if not ds_id and clean_name:
+            for ds in reversed(self.list_history_datasets()):
+                if (
+                    ds.get("state") == "ok"
+                    and os.path.basename(str(ds.get("name") or "")) == clean_name
+                ):
+                    ds_id = str(ds.get("id") or "")
+                    break
+
+        if ds_id:
+            local_p, info = self.resolve_dataset_to_local_h5(
+                ds_id, fallback_dir=work_dir
+            )
+            dl_name = clean_name or os.path.basename(
+                str(info.get("name") or os.path.basename(local_p))
+            )
+            return local_p, dl_name
+
+        raise FileNotFoundError(
+            f"Artifact '{clean_name or dataset_id}' not found in work_dir or NDIP Galaxy history."
+        )
 
     def _work_dir_for_reduce(
         self, raw_nxs: list[str], fallback_dir: str
@@ -489,6 +637,7 @@ class NovaGalaxyPipelineRunner:
         metrics_path = os.path.join(work_dir, "careless_metrics.json")
         pred_mtz_path = os.path.join(work_dir, "predictions.mtz")
         merged_mtz_path = os.path.join(work_dir, "merged.mtz")
+        xval_mtz_path = os.path.join(work_dir, "xval.mtz")
         metrics_raw = "{}"
         metrics_doc: dict[str, Any] = {}
         if os.path.isfile(metrics_path):
@@ -498,6 +647,172 @@ class NovaGalaxyPipelineRunner:
                     metrics_doc = json.loads(metrics_raw)
                 except Exception:
                     metrics_doc = {}
+
+        if os.path.isfile(merged_mtz_path):
+            try:
+                mtz_m = gemmi.read_mtz_file(merged_mtz_path)
+                mcols = {c.label: np.array(c, dtype=np.float64) for c in mtz_m.columns}
+                mI = mcols.get("I", mcols.get("I(+)", np.array([])))
+                mS = mcols.get("SigI", mcols.get("SigI(+)", np.array([])))
+                val_m = np.isfinite(mI) & np.isfinite(mS) & (mS > 0)
+                if np.any(val_m):
+                    hm_v = mcols["H"][val_m].astype(int)
+                    km_v = mcols["K"][val_m].astype(int)
+                    lm_v = mcols["L"][val_m].astype(int)
+                    isigi_v = mI[val_m] / mS[val_m]
+                    d_m = np.array(
+                        [
+                            mtz_m.cell.calculate_d([int(hh), int(kk), int(ll)])
+                            for hh, kk, ll in zip(hm_v, km_v, lm_v)
+                        ],
+                        dtype=np.float64,
+                    )
+                    inv_d2_m = 1.0 / np.maximum(d_m**2, 1e-6)
+                    edges = np.linspace(
+                        float(inv_d2_m.min()), float(inv_d2_m.max()), 11
+                    )
+                    dmin_obs = float(np.min(d_m))
+                    sg_m = mtz_m.spacegroup or gemmi.find_spacegroup_by_name("P 1")
+                    asu_m = gemmi.ReciprocalAsu(sg_m)
+                    ops_m = sg_m.operations()
+                    hmax = int(np.ceil(mtz_m.cell.a / max(dmin_obs, 0.5))) + 1
+                    kmax = int(np.ceil(mtz_m.cell.b / max(dmin_obs, 0.5))) + 1
+                    lmax = int(np.ceil(mtz_m.cell.c / max(dmin_obs, 0.5))) + 1
+                    theo_set: set[tuple[int, int, int]] = set()
+                    for hh in range(-hmax, hmax + 1):
+                        for kk in range(-kmax, kmax + 1):
+                            for ll in range(-lmax, lmax + 1):
+                                if hh == 0 and kk == 0 and ll == 0:
+                                    continue
+                                if ops_m.is_systematically_absent([hh, kk, ll]):
+                                    continue
+                                d_val = mtz_m.cell.calculate_d([hh, kk, ll])
+                                if d_val >= dmin_obs - 1e-5:
+                                    hasu, _ = asu_m.to_asu([hh, kk, ll], ops_m)
+                                    theo_set.add(
+                                        (int(hasu[0]), int(hasu[1]), int(hasu[2]))
+                                    )
+                    d_theo = (
+                        np.array(
+                            [
+                                mtz_m.cell.calculate_d([hh, kk, ll])
+                                for hh, kk, ll in theo_set
+                            ],
+                            dtype=np.float64,
+                        )
+                        if theo_set
+                        else np.array([], dtype=np.float64)
+                    )
+                    inv_d2_t = (
+                        1.0 / np.maximum(d_theo**2, 1e-6)
+                        if len(d_theo)
+                        else np.array([], dtype=np.float64)
+                    )
+
+                    xv_v0 = np.array([], dtype=np.float64)
+                    xv_v1 = np.array([], dtype=np.float64)
+                    inv_d2_x = np.array([], dtype=np.float64)
+                    if os.path.isfile(xval_mtz_path):
+                        xv = gemmi.read_mtz_file(xval_mtz_path)
+                        xcols = {
+                            c.label: np.array(c, dtype=np.float64) for c in xv.columns
+                        }
+                        xh = xcols["H"].astype(int)
+                        xk = xcols["K"].astype(int)
+                        xl = xcols["L"].astype(int)
+                        xhalf = xcols.get("half", np.zeros_like(xh)).astype(int)
+                        xI = xcols.get("I", xcols.get("F", np.zeros_like(xcols["H"])))
+                        xd = np.array(
+                            [
+                                xv.cell.calculate_d([int(hh), int(kk), int(ll)])
+                                for hh, kk, ll in zip(xh, xk, xl)
+                            ],
+                            dtype=np.float64,
+                        )
+                        m0 = xhalf == 0
+                        m1 = xhalf == 1
+                        map0 = {
+                            (int(hh), int(kk), int(ll)): (float(val), float(dd))
+                            for hh, kk, ll, val, dd in zip(
+                                xh[m0], xk[m0], xl[m0], xI[m0], xd[m0]
+                            )
+                            if np.isfinite(val)
+                        }
+                        map1 = {
+                            (int(hh), int(kk), int(ll)): float(val)
+                            for hh, kk, ll, val in zip(xh[m1], xk[m1], xl[m1], xI[m1])
+                            if np.isfinite(val)
+                        }
+                        common = [k for k in map0 if k in map1]
+                        if common:
+                            xv_v0 = np.array(
+                                [map0[k][0] for k in common], dtype=np.float64
+                            )
+                            xv_v1 = np.array(
+                                [map1[k] for k in common], dtype=np.float64
+                            )
+                            d_c = np.array(
+                                [map0[k][1] for k in common], dtype=np.float64
+                            )
+                            inv_d2_x = 1.0 / np.maximum(d_c**2, 1e-6)
+
+                    bins = []
+                    for b in range(10):
+                        hi_edge = edges[b + 1]
+                        lo_edge = edges[b]
+                        bm_m = (inv_d2_m >= lo_edge) & (
+                            inv_d2_m <= hi_edge if b == 9 else inv_d2_m < hi_edge
+                        )
+                        bm_t = (
+                            (inv_d2_t >= lo_edge)
+                            & (inv_d2_t <= hi_edge if b == 9 else inv_d2_t < hi_edge)
+                            if len(inv_d2_t)
+                            else np.array([], dtype=bool)
+                        )
+                        n_m_b = int(np.sum(bm_m))
+                        n_t_b = max(n_m_b, int(np.sum(bm_t))) if len(bm_t) else n_m_b
+                        comp_b = (
+                            round(float(100.0 * n_m_b / max(1, n_t_b)), 2)
+                            if n_t_b > 0
+                            else 0.0
+                        )
+                        isigi_b = (
+                            round(float(np.mean(isigi_v[bm_m])), 2)
+                            if n_m_b > 0
+                            else 0.0
+                        )
+                        cc_b: float | None = None
+                        if len(inv_d2_x):
+                            bm_x = (inv_d2_x >= lo_edge) & (
+                                inv_d2_x <= hi_edge if b == 9 else inv_d2_x < hi_edge
+                            )
+                            if int(np.sum(bm_x)) >= 2:
+                                s0 = xv_v0[bm_x]
+                                s1 = xv_v1[bm_x]
+                                if np.std(s0) > 1e-12 and np.std(s1) > 1e-12:
+                                    r_val = float(np.corrcoef(s0, s1)[0, 1])
+                                    if np.isfinite(r_val):
+                                        cc_b = round(r_val, 4)
+                        d_hi = float(1.0 / np.sqrt(max(hi_edge, 1e-6)))
+                        d_lo = float(1.0 / np.sqrt(max(lo_edge, 1e-6)))
+                        bins.append(
+                            {
+                                "bin": b,
+                                "d_max": round(d_lo, 2),
+                                "d_min": round(d_hi, 2),
+                                "n_refl": n_m_b,
+                                "n_theo": n_t_b,
+                                "completeness_pct": comp_b,
+                                "mean_isigi": isigi_b,
+                                "cc_half": cc_b,
+                            }
+                        )
+                    metrics_doc["resolution_bins"] = bins
+                    metrics_raw = json.dumps(metrics_doc, indent=2)
+                    with open(metrics_path, "w", encoding="utf-8") as fh_out:
+                        fh_out.write(metrics_raw)
+            except Exception:
+                pass
 
         with h5py.File(integrated_h5_path, "r+") as hf:
             cgrp = hf.require_group("careless")
@@ -1783,22 +2098,26 @@ class NovaGalaxyPipelineRunner:
                 "    map0 = {(int(hh), int(kk), int(ll)): (float(val), float(dd)) for hh, kk, ll, val, dd in zip(h[m0], k[m0], l[m0], xI[m0], d_arr[m0]) if np.isfinite(val)}\n"
                 "    map1 = {(int(hh), int(kk), int(ll)): float(val) for hh, kk, ll, val in zip(h[m1], k[m1], l[m1], xI[m1]) if np.isfinite(val)}\n"
                 "    common = [key for key in map0 if key in map1]\n"
-                "    if len(common) >= 3:\n"
+                "    if len(common) >= 2:\n"
                 "        v0 = np.array([map0[k][0] for k in common]); v1 = np.array([map1[k] for k in common]); d_c = np.array([map0[k][1] for k in common])\n"
-                "        summary['cc_half'] = float(pearsonr(v0, v1)[0])\n"
-                "        summary['cc_half_spearman'] = float(spearmanr(v0, v1)[0])\n"
+                "        summary['cc_half'] = float(pearsonr(v0, v1)[0]) if len(common) >= 3 else float(np.corrcoef(v0, v1)[0, 1])\n"
+                "        summary['cc_half_spearman'] = float(spearmanr(v0, v1)[0]) if len(common) >= 3 else summary['cc_half']\n"
                 "        inv_d2 = 1.0 / np.maximum(d_c ** 2, 1e-6)\n"
                 "        edges = np.linspace(inv_d2.min(), inv_d2.max(), 11)\n"
                 "        bins = []\n"
                 "        for b in range(10):\n"
                 "            bm = (inv_d2 >= edges[b]) & (inv_d2 <= edges[b+1] if b == 9 else inv_d2 < edges[b+1])\n"
-                "            cc_b = float(pearsonr(v0[bm], v1[bm])[0]) if np.sum(bm) >= 3 else float('nan')\n"
+                "            cc_b = float(np.corrcoef(v0[bm], v1[bm])[0, 1]) if np.sum(bm) >= 2 else float('nan')\n"
                 "            d_hi = float(1.0 / np.sqrt(max(edges[b+1], 1e-6)))\n"
                 "            d_lo = float(1.0 / np.sqrt(max(edges[b], 1e-6)))\n"
                 "            bins.append({'bin': b, 'd_max': round(d_lo, 2), 'd_min': round(d_hi, 2), 'n_refl': int(np.sum(bm)), 'cc_half': round(cc_b, 4) if np.isfinite(cc_b) else None})\n"
                 "        summary['resolution_bins'] = bins\n"
                 f"with open({metrics_json_out!r}, 'w') as fh:\n"
                 "    json.dump(summary, fh, indent=2)\n"
+                f"for _p in ({merged_mtz_out!r}, {pred_mtz_out!r}, {xval_mtz_out!r}, {metrics_json_out!r}):\n"
+                "    if os.path.exists(_p):\n"
+                "        try: os.chmod(_p, 0o666)\n"
+                "        except Exception: pass\n"
                 "print('[careless] Merge summary:', json.dumps(summary))\n"
             )
             chained_merge = (
@@ -2922,12 +3241,49 @@ def serve_rainbow_zones(
                     self.wfile.write(err_body)
                 return
 
+            if req_path == "/api/artifacts/download":
+                ds_id = str(qs.get("dataset_id", [""])[0]).strip()
+                fname = str(qs.get("name", [""])[0]).strip()
+                try:
+                    local_fp, dl_name = (
+                        vm.pipeline_runner.resolve_artifact_for_download(
+                            dataset_id=ds_id,
+                            name=fname,
+                            current_h5=vm.replay_h5,
+                        )
+                    )
+                    with open(local_fp, "rb") as fh:
+                        raw_bytes = fh.read()
+                    safe_dl = dl_name.replace('"', "")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header(
+                        "Content-Disposition",
+                        f'attachment; filename="{safe_dl}"',
+                    )
+                    self.send_header("Content-Length", str(len(raw_bytes)))
+                    self.end_headers()
+                    self.wfile.write(raw_bytes)
+                except Exception as exc:
+                    err_body = str(exc).encode("utf-8")
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                return
+
             if req_path == "/api/pipeline/status":
+                hist_ds = vm.pipeline_runner.list_history_datasets()
                 status_doc = {
                     "galaxy_connected": vm.pipeline_runner.is_connected,
                     "galaxy_url": vm.pipeline_runner.galaxy_url,
                     "history_id": vm.pipeline_runner.history_id,
-                    "history_datasets": vm.pipeline_runner.list_history_datasets(),
+                    "history_datasets": hist_ds,
+                    "step_artifacts": vm.pipeline_runner.list_step_artifacts(
+                        current_h5=vm.replay_h5,
+                        history_datasets=hist_ds,
+                    ),
                     "active_job": vm.pipeline_runner.active_job,
                     "pipeline_stages": vm.payload.get("pipeline_stages", []),
                     "ladder_steps": vm.payload.get("ladder_steps", []),

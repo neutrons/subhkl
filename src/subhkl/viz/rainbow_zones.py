@@ -2684,21 +2684,179 @@ def build_rainbow_zone_payload(
                 sp_item["careless_residual"] = round(float(res_all[j]), 3)
             if scl_all is not None and j < len(scl_all) and np.isfinite(scl_all[j]):
                 sp_item["careless_scale"] = round(float(scl_all[j]), 4)
+            if (
+                merged_i_arr is not None
+                and j < len(merged_i_arr)
+                and np.isfinite(merged_i_arr[j])
+            ):
+                sp_item["merged_i"] = round(float(merged_i_arr[j]), 2)
+            if (
+                merged_sigi_arr is not None
+                and j < len(merged_sigi_arr)
+                and np.isfinite(merged_sigi_arr[j])
+            ):
+                sp_item["merged_sigi"] = round(float(merged_sigi_arr[j]), 2)
             sample_peaks.append(sp_item)
     else:
         sample_peaks = peaks_list
 
-    if (
-        isinstance(merge_metrics, dict)
-        and "harmonic_overlap_fraction" not in merge_metrics
-    ):
-        if len(sample_peaks) > 0:
+    if isinstance(merge_metrics, dict):
+        if "harmonic_overlap_fraction" not in merge_metrics and len(sample_peaks) > 0:
             n_harm = sum(
                 1 for p in sample_peaks if int(p.get("harmonic_multiplicity", 1)) > 1
             )
             merge_metrics["harmonic_overlap_fraction"] = round(
                 float(n_harm) / float(len(sample_peaks)), 4
             )
+        bins_in = merge_metrics.get("cc_half_bins")
+        needs_bin_enrich = (
+            not isinstance(bins_in, list)
+            or len(bins_in) == 0
+            or any(
+                "mean_isigi" not in b or "completeness_pct" not in b for b in bins_in
+            )
+        )
+        if needs_bin_enrich and len(sample_peaks) > 0:
+            try:
+                import gemmi as _gm
+
+                asu_obs_map: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
+                for sp in sample_peaks:
+                    ak = tuple(
+                        int(x)
+                        for x in (sp.get("asu_hkl") or sp.get("hkl") or (0, 0, 0))
+                    )
+                    if ak == (0, 0, 0):
+                        continue
+                    asu_obs_map.setdefault(ak, []).append(sp)
+                if asu_obs_map:
+                    asu_keys = list(asu_obs_map.keys())
+                    asu_d = np.array(
+                        [
+                            float(asu_obs_map[k][0].get("d_spacing", 2.0))
+                            for k in asu_keys
+                        ],
+                        dtype=float,
+                    )
+                    asu_isigi = np.array(
+                        [
+                            float(asu_obs_map[k][0]["merged_i"])
+                            / max(
+                                float(asu_obs_map[k][0].get("merged_sigi", 1.0)), 1e-6
+                            )
+                            if "merged_i" in asu_obs_map[k][0]
+                            and float(asu_obs_map[k][0].get("merged_sigi", 0.0)) > 0
+                            else float(asu_obs_map[k][0].get("intensity", 100.0))
+                            / max(float(asu_obs_map[k][0].get("sigma", 3.0)), 1e-6)
+                            for k in asu_keys
+                        ],
+                        dtype=float,
+                    )
+                    inv_d2_obs = 1.0 / np.maximum(asu_d**2, 1e-6)
+                    if isinstance(bins_in, list) and len(bins_in) == 10:
+                        edges = [
+                            1.0
+                            / max(
+                                float(bins_in[0].get("d_max", np.max(asu_d))) ** 2, 1e-6
+                            )
+                        ] + [
+                            1.0 / max(float(b.get("d_min", np.min(asu_d))) ** 2, 1e-6)
+                            for b in bins_in
+                        ]
+                        edges_arr = np.asarray(edges, dtype=float)
+                    else:
+                        edges_arr = np.linspace(
+                            float(inv_d2_obs.min()), float(inv_d2_obs.max()), 11
+                        )
+                    c6 = (
+                        cell
+                        if len(cell) == 6
+                        else [11.93, 11.93, 11.93, 90.0, 90.0, 90.0]
+                    )
+                    uc = _gm.UnitCell(*[float(x) for x in c6])
+                    sg_obj = _gm.find_spacegroup_by_name(
+                        str(space_group)
+                    ) or _gm.find_spacegroup_by_name("P 1")
+                    asu_rec = _gm.ReciprocalAsu(sg_obj)
+                    ops_rec = sg_obj.operations()
+                    dmin_th = max(float(np.min(asu_d)), 0.6)
+                    h_lim = min(28, int(np.ceil(uc.a / dmin_th)) + 1)
+                    k_lim = min(28, int(np.ceil(uc.b / dmin_th)) + 1)
+                    l_lim = min(28, int(np.ceil(uc.c / dmin_th)) + 1)
+                    theo_asu_set: set[tuple[int, int, int]] = set()
+                    for hh in range(-h_lim, h_lim + 1):
+                        for kk in range(-k_lim, k_lim + 1):
+                            for ll in range(-l_lim, l_lim + 1):
+                                if hh == 0 and kk == 0 and ll == 0:
+                                    continue
+                                if ops_rec.is_systematically_absent([hh, kk, ll]):
+                                    continue
+                                dv_th = uc.calculate_d([hh, kk, ll])
+                                if dv_th >= dmin_th - 1e-5:
+                                    ha, _ = asu_rec.to_asu([hh, kk, ll], ops_rec)
+                                    theo_asu_set.add(
+                                        (int(ha[0]), int(ha[1]), int(ha[2]))
+                                    )
+                    inv_d2_th = (
+                        np.array(
+                            [
+                                1.0 / max(uc.calculate_d(list(k)) ** 2, 1e-6)
+                                for k in theo_asu_set
+                            ],
+                            dtype=float,
+                        )
+                        if theo_asu_set
+                        else np.array([], dtype=float)
+                    )
+                    enriched_bins: list[dict[str, Any]] = []
+                    for b_idx in range(10):
+                        lo_e = float(edges_arr[b_idx])
+                        hi_e = float(edges_arr[b_idx + 1])
+                        bm_o = (inv_d2_obs >= lo_e) & (
+                            inv_d2_obs <= hi_e if b_idx == 9 else inv_d2_obs < hi_e
+                        )
+                        bm_t = (
+                            (inv_d2_th >= lo_e)
+                            & (inv_d2_th <= hi_e if b_idx == 9 else inv_d2_th < hi_e)
+                            if len(inv_d2_th)
+                            else np.array([], dtype=bool)
+                        )
+                        n_m_b = int(np.sum(bm_o))
+                        n_t_b = max(n_m_b, int(np.sum(bm_t))) if len(bm_t) else n_m_b
+                        comp_b = (
+                            round(100.0 * n_m_b / max(1, n_t_b), 2)
+                            if n_t_b > 0
+                            else 0.0
+                        )
+                        isig_b = (
+                            round(float(np.mean(asu_isigi[bm_o])), 2)
+                            if n_m_b > 0
+                            else 0.0
+                        )
+                        orig_b = (
+                            bins_in[b_idx]
+                            if isinstance(bins_in, list) and b_idx < len(bins_in)
+                            else {}
+                        )
+                        cc_b = orig_b.get("cc_half")
+                        d_lo = round(float(1.0 / np.sqrt(max(lo_e, 1e-6))), 2)
+                        d_hi = round(float(1.0 / np.sqrt(max(hi_e, 1e-6))), 2)
+                        enriched_bins.append(
+                            {
+                                "bin": b_idx,
+                                "d_max": orig_b.get("d_max", d_lo),
+                                "d_min": orig_b.get("d_min", d_hi),
+                                "n_refl": n_m_b,
+                                "n_theo": n_t_b,
+                                "completeness_pct": comp_b,
+                                "mean_isigi": isig_b,
+                                "cc_half": cc_b,
+                            }
+                        )
+                    merge_metrics["cc_half_bins"] = enriched_bins
+                    merge_metrics["resolution_bins"] = enriched_bins
+            except Exception:
+                pass
 
     zones_payload: list[dict[str, Any]] = []
     for zi, z in enumerate(raw_zones):
@@ -3441,6 +3599,28 @@ def render_rainbow_html(
     width: 54px;
   }}
 
+  .file-dl-pill {{
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--bg-card);
+    color: var(--accent-cyan);
+    border: 1px solid rgba(56, 189, 248, 0.4);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-family: var(--font-display);
+    font-size: 0.63rem;
+    text-decoration: none;
+    cursor: pointer;
+    transition: all 0.12s ease;
+  }}
+
+  .file-dl-pill:hover {{
+    border-color: var(--accent-gold);
+    color: var(--accent-gold);
+    background: rgba(251, 191, 36, 0.12);
+  }}
+
   .iframe-popout-banner {{
     display: none !important;
   }}
@@ -3695,7 +3875,7 @@ def render_rainbow_html(
           <span id="cell-summary" style="font-size:0.62rem;color:var(--accent-pink);">IDLE</span>
         </div>
         <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
-        <canvas id="canvas-hist" style="display:none;width:100%;height:40px;"></canvas>
+        <canvas id="canvas-hist" title="Click to cycle resolution sparkline: CC½ vs d → Completeness vs d → ⟨I/σ⟩ vs d" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
       </div>
     </aside>
   </main>
@@ -3711,6 +3891,9 @@ def render_rainbow_html(
         <div id="pipeline-stages" style="display:flex;align-items:center;gap:4px;"></div>
         <button id="btn-params-toggle" title="Configure unit cell, space group, and wavelength parameters for Solve/Integrate">
           Params
+        </button>
+        <button id="btn-files-toggle" title="Download NDIP / workflow artifacts for the current step (switch steps with < Walk > arrows)">
+          Files
         </button>
         <span id="galaxy-status-badge" style="font-size:0.62rem;font-family:var(--font-display);padding:2px 6px;border-radius:4px;border:1px solid #334155;color:var(--text-dim);">
           LOCAL
@@ -3732,6 +3915,7 @@ def render_rainbow_html(
       <span>d_min <input id="inp-dmin" type="number" step="0.1" value="{init_dmin:.1f}" style="width:44px;" /></span>
       <span>steps <input id="inp-steps" type="number" step="10" value="120" style="width:48px;" /></span>
     </div>
+    <div id="files-drawer" class="params-drawer"></div>
     <div class="ladder-rungs" id="ladder-rungs"></div>
   </footer>
 
@@ -3900,6 +4084,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
+    histMetric: "cc_half",        // "cc_half" | "completeness" | "isigi"
     lamMin: wlRange[0],
     lamMax: wlRange[1],
     zoneTolDeg: 0.75,
@@ -4018,10 +4203,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   const btnParamsToggle = document.getElementById("btn-params-toggle");
   const paramsDrawer = document.getElementById("params-drawer");
+  const btnFilesToggle = document.getElementById("btn-files-toggle");
+  const filesDrawer = document.getElementById("files-drawer");
   if (btnParamsToggle && paramsDrawer) {{
     btnParamsToggle.addEventListener("click", () => {{
-      paramsDrawer.classList.toggle("open");
-      btnParamsToggle.classList.toggle("active-btn", paramsDrawer.classList.contains("open"));
+      const nextOpen = !paramsDrawer.classList.contains("open");
+      paramsDrawer.classList.toggle("open", nextOpen);
+      btnParamsToggle.classList.toggle("active-btn", nextOpen);
+      if (nextOpen && filesDrawer && btnFilesToggle) {{
+        filesDrawer.classList.remove("open");
+        btnFilesToggle.classList.remove("active-btn");
+      }}
+    }});
+  }}
+  if (btnFilesToggle && filesDrawer) {{
+    btnFilesToggle.addEventListener("click", () => {{
+      const nextOpen = !filesDrawer.classList.contains("open");
+      filesDrawer.classList.toggle("open", nextOpen);
+      btnFilesToggle.classList.toggle("active-btn", nextOpen);
+      if (nextOpen && paramsDrawer && btnParamsToggle) {{
+        paramsDrawer.classList.remove("open");
+        btnParamsToggle.classList.remove("active-btn");
+      }}
+      if (nextOpen) renderFilesDrawer();
     }});
   }}
 
@@ -4292,6 +4496,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       selectLadderRung(st.ladder_rung_idx, false);
     }}
     renderPipeline();
+    if (typeof renderFilesDrawer === "function") renderFilesDrawer();
   }}
 
   function renderLadder() {{
@@ -4333,6 +4538,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     renderZoneList();
     renderLadder();
     updateHUD();
+    if (typeof renderFilesDrawer === "function") renderFilesDrawer();
   }}
 
   function updatePeakInspector(p) {{
@@ -4448,6 +4654,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   const histCanvas = document.getElementById("canvas-hist");
+  if (histCanvas) {{
+    histCanvas.addEventListener("click", () => {{
+      if (!DATA.merge_metrics) return;
+      const order = ["cc_half", "completeness", "isigi"];
+      state.histMetric = order[(order.indexOf(state.histMetric || "cc_half") + 1) % order.length];
+      drawHistogram(PEAKS.filter(isPeakVisible));
+    }});
+  }}
   function drawHistogram(visiblePeaks) {{
     const m = DATA.merge_metrics;
     const hasMergeBins = Boolean(m && Array.isArray(m.cc_half_bins) && m.cc_half_bins.length > 0);
@@ -4470,22 +4684,57 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const bins = m.cc_half_bins;
       const nBins = bins.length;
       const barW = (w - 16) / Math.max(1, nBins);
+      const metric = state.histMetric || "cc_half";
+      const maxComp = Math.max(20, ...bins.map(b => Number(b.completeness_pct || 0)));
+      const maxIsig = Math.max(5, ...bins.map(b => Number(b.mean_isigi || 0)));
       for (let i = 0; i < nBins; i++) {{
-        const ccVal = Math.max(0, Math.min(1, Number(bins[i].cc_half || 0)));
-        const bh = ccVal * (h - 20);
         const x = 8 + i * barW;
-        const y = h - 14 - bh;
-        ctx.fillStyle = ccVal >= 0.8 ? "#34d399" : (ccVal >= 0.5 ? "#fbbf24" : "#f43f5e");
-        ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+        if (metric === "completeness") {{
+          const cVal = Math.max(0, Number(bins[i].completeness_pct || 0));
+          const frac = Math.min(1, cVal / maxComp);
+          const bh = cVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
+          const y = h - 14 - bh;
+          ctx.fillStyle = cVal > 0 ? (cVal >= 50 ? "#34d399" : "#38bdf8") : "#1e293b";
+          ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+        }} else if (metric === "isigi") {{
+          const sVal = Math.max(0, Number(bins[i].mean_isigi || 0));
+          const frac = Math.min(1, sVal / maxIsig);
+          const bh = sVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
+          const y = h - 14 - bh;
+          ctx.fillStyle = sVal > 0 ? (sVal >= 5 ? "#fbbf24" : "#38bdf8") : "#1e293b";
+          ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+        }} else {{
+          const rawCc = bins[i].cc_half;
+          const hasCc = rawCc !== null && rawCc !== undefined && Number.isFinite(Number(rawCc));
+          const ccVal = hasCc ? Math.max(0, Math.min(1, Number(rawCc))) : 0;
+          const bh = hasCc ? Math.max(2, ccVal * (h - 20)) : 1;
+          const y = h - 14 - bh;
+          ctx.fillStyle = !hasCc ? "#1e293b" : (ccVal >= 0.8 ? "#34d399" : (ccVal >= 0.5 ? "#fbbf24" : "#f43f5e"));
+          ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+        }}
       }}
       ctx.fillStyle = "#94a3b8";
       ctx.font = "9px monospace";
       const d0 = bins[0] && bins[0].d_max ? `${{Number(bins[0].d_max).toFixed(1)}}Å` : "low-q";
       const d1 = bins[nBins - 1] && bins[nBins - 1].d_min ? `${{Number(bins[nBins - 1].d_min).toFixed(2)}}Å` : "d_min";
-      const ccOv = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "";
       ctx.fillText(d0, 6, h - 3);
-      ctx.fillStyle = "#38bdf8";
-      ctx.fillText(`CC½ vs d (${{ccOv}})`, Math.max(38, w * 0.28), h - 3);
+      let midLbl = "";
+      let midCol = "#38bdf8";
+      if (metric === "completeness") {{
+        const compOv = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
+        midLbl = `Compl. vs d (${{compOv}}) ↻`;
+        midCol = "#34d399";
+      }} else if (metric === "isigi") {{
+        const isigOv = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
+        midLbl = `⟨I/σ⟩ vs d (${{isigOv}}) ↻`;
+        midCol = "#fbbf24";
+      }} else {{
+        const ccOv = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
+        midLbl = `CC½ vs d (${{ccOv}}) ↻`;
+        midCol = "#38bdf8";
+      }}
+      ctx.fillStyle = midCol;
+      ctx.fillText(midLbl, Math.max(36, w * 0.24), h - 3);
       ctx.fillStyle = "#94a3b8";
       ctx.fillText(d1, Math.max(w - 36, 60), h - 3);
       return;
@@ -5408,11 +5657,55 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }});
 
   document.getElementById("btn-ladder-prev").addEventListener("click", () => {{
-    selectLadderRung((state.currentRungIdx - 1 + LADDER.length) % LADDER.length);
+    if (filesDrawer && filesDrawer.classList.contains("open") && PIPELINE.length > 0) {{
+      const curStage = Math.min(PIPELINE.length - 1, Math.max(0, state.currentPipelineIdx));
+      selectPipelineStage((curStage - 1 + PIPELINE.length) % PIPELINE.length, true);
+      return;
+    }}
+    if (state.currentPipelineIdx >= 2 && PIPELINE.length >= 4) {{
+      const curStage = Math.min(3, state.currentPipelineIdx);
+      if (curStage === 3) {{
+        selectPipelineStage(2, false);
+        return;
+      }}
+      if (curStage === 2) {{
+        selectLadderRung(Math.max(0, LADDER.length - 1), true);
+        return;
+      }}
+    }}
+    if (state.currentRungIdx > 0) {{
+      selectLadderRung(state.currentRungIdx - 1);
+    }} else if (PIPELINE.length >= 4) {{
+      selectPipelineStage(3, false);
+    }} else {{
+      selectLadderRung((state.currentRungIdx - 1 + LADDER.length) % LADDER.length);
+    }}
   }});
 
   document.getElementById("btn-ladder-next").addEventListener("click", () => {{
-    selectLadderRung((state.currentRungIdx + 1) % LADDER.length);
+    if (filesDrawer && filesDrawer.classList.contains("open") && PIPELINE.length > 0) {{
+      const curStage = Math.min(PIPELINE.length - 1, Math.max(0, state.currentPipelineIdx));
+      selectPipelineStage((curStage + 1) % PIPELINE.length, true);
+      return;
+    }}
+    if (state.currentPipelineIdx >= 2 && PIPELINE.length >= 4) {{
+      const curStage = Math.min(3, state.currentPipelineIdx);
+      if (curStage === 2) {{
+        selectPipelineStage(3, false);
+        return;
+      }}
+      if (curStage === 3) {{
+        selectLadderRung(0, true);
+        return;
+      }}
+    }}
+    if (state.currentRungIdx + 1 < LADDER.length) {{
+      selectLadderRung(state.currentRungIdx + 1);
+    }} else if (PIPELINE.length >= 4) {{
+      selectPipelineStage(2, false);
+    }} else {{
+      selectLadderRung((state.currentRungIdx + 1) % LADDER.length);
+    }}
   }});
 
   document.getElementById("btn-ladder-play").addEventListener("click", (ev) => {{
@@ -5619,6 +5912,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     renderPipeline();
     if (LADDER.length > 0) selectLadderRung(state.currentRungIdx, false);
     else {{ renderZoneList(); updateHUD(); }}
+    renderFilesDrawer();
+    probeGalaxyConnection();
     if (artKind === "merged_careless" && DATA.merge_metrics) {{
       const m = DATA.merge_metrics;
       const cc = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
@@ -6257,8 +6552,91 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     mode: "none", // "nova" | "galaxy_iframe" | "none"
     historyId: null,
     datasets: [],
+    stepArtifacts: {{}},
     pollTimer: null,
   }};
+
+  function classifyArtifactStageClient(filename) {{
+    const low = String(filename || "").split("/").pop().toLowerCase();
+    if (!low) return null;
+    if (["merged.mtz", "predictions.mtz", "xval.mtz", "careless_metrics.json", "careless_0.mtz", "careless_predictions_0.mtz", "careless_xval_0.mtz"].some(k => low === k || low.endsWith(k))) {{
+      return "merge";
+    }}
+    if (["predictor.h5", "integrated.h5", "reflections.mtz"].some(k => low === k || low.endsWith(k))) {{
+      return "integrate";
+    }}
+    if (low.includes("solve") && low.endsWith(".h5")) return "solve";
+    if (["merged.h5", "_merged.h5", ".reduce.h5", ".nxs.h5", "scan_master.h5"].some(k => low.includes(k))) return "reduce";
+    return null;
+  }}
+
+  function renderFilesDrawer() {{
+    if (!filesDrawer) return;
+    const stageKeys = ["reduce", "solve", "integrate", "merge"];
+    const stageTitles = ["1. Reduce", "2. Solve", "3. Integrate", "4. Merge"];
+    const pIdx = Math.min(3, Math.max(0, state.currentPipelineIdx));
+    const stageId = (PIPELINE[pIdx] && PIPELINE[pIdx].stage_id) || stageKeys[pIdx] || "solve";
+    const stageTitle = stageTitles[pIdx] || (PIPELINE[pIdx] && PIPELINE[pIdx].name) || stageId.toUpperCase();
+
+    const byName = new Map();
+    const srvList = (galaxyBridge.stepArtifacts && galaxyBridge.stepArtifacts[stageId]) || [];
+    srvList.forEach(it => {{
+      if (it && it.name) byName.set(it.name, {{ ...it }});
+    }});
+    (galaxyBridge.datasets || []).forEach(ds => {{
+      if (ds.state && ds.state !== "ok") return;
+      const bname = String(ds.name || "").split("/").pop();
+      if (!bname) return;
+      if (classifyArtifactStageClient(bname) !== stageId) return;
+      const cur = byName.get(bname) || {{ name: bname, stage_id: stageId }};
+      if (ds.id) cur.dataset_id = ds.id;
+      if (ds.hid) cur.hid = ds.hid;
+      byName.set(bname, cur);
+    }});
+
+    filesDrawer.innerHTML = "";
+    const lbl = document.createElement("span");
+    lbl.style.color = "var(--accent-gold)";
+    lbl.style.fontWeight = "700";
+    lbl.textContent = `${{stageTitle.toUpperCase()}} FILES:`;
+    filesDrawer.appendChild(lbl);
+
+    const items = Array.from(byName.values());
+    if (items.length === 0) {{
+      const emptyEl = document.createElement("span");
+      emptyEl.style.color = "var(--text-dim)";
+      emptyEl.textContent = `No stored artifacts yet for ${{stageTitle}} (use < Walk > arrows to switch steps).`;
+      filesDrawer.appendChild(emptyEl);
+      return;
+    }}
+
+    items.forEach(item => {{
+      const a = document.createElement("a");
+      a.className = "file-dl-pill";
+      const qs = new URLSearchParams();
+      if (item.name) qs.set("name", item.name);
+      if (item.dataset_id) qs.set("dataset_id", item.dataset_id);
+      if (galaxyBridge.mode === "galaxy_iframe" && item.dataset_id && !item.has_local) {{
+        a.href = `/api/datasets/${{encodeURIComponent(item.dataset_id)}}/display?to_ext=${{encodeURIComponent(item.name.split(".").pop() || "h5")}}`;
+      }} else {{
+        a.href = `api/artifacts/download?${{qs.toString()}}`;
+      }}
+      a.setAttribute("download", item.name);
+      const sizeStr = typeof item.size_bytes === "number" && item.size_bytes > 0
+        ? ` (${{item.size_bytes >= 1048576 ? (item.size_bytes / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(item.size_bytes / 1024)) + " KB"}})`
+        : (item.hid ? ` (#${{item.hid}})` : "");
+      a.textContent = `↓ ${{item.name}}${{sizeStr}}`;
+      a.title = `Download ${{item.name}} (${{stageTitle}}) to local computer`;
+      filesDrawer.appendChild(a);
+    }});
+
+    const hintEl = document.createElement("span");
+    hintEl.style.color = "var(--text-dim)";
+    hintEl.style.marginLeft = "auto";
+    hintEl.style.fontSize = "0.58rem";
+    hintEl.textContent = "Switch step with < Walk >";
+    filesDrawer.appendChild(hintEl);
+  }}
 
   const elGalaxyBadge = document.getElementById("galaxy-status-badge");
   const btnGalaxyDispatch = document.getElementById("btn-galaxy-dispatch");
@@ -6817,7 +7195,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           galaxyBridge.mode = "nova";
           galaxyBridge.historyId = doc.history_id;
           galaxyBridge.datasets = doc.history_datasets || [];
+          galaxyBridge.stepArtifacts = doc.step_artifacts || {{}};
           populateGalaxyH5Selector();
+          renderFilesDrawer();
           if (elGalaxyBadge) {{
             elGalaxyBadge.textContent = doc.galaxy_connected
               ? `NOVA → GALAXY (${{galaxyBridge.datasets.length}} H5s)`
@@ -6851,6 +7231,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
           }}
           populateGalaxyH5Selector();
+          renderFilesDrawer();
           if (elGalaxyBadge) {{
             elGalaxyBadge.textContent = `GALAXY (${{galaxyBridge.datasets.length}} items)`;
             elGalaxyBadge.style.borderColor = "#34d399";
@@ -6921,6 +7302,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const sr = await fetch("api/pipeline/status", {{ cache: "no-store" }});
             if (!sr.ok) return;
             const sdoc = await sr.json();
+            if (sdoc.step_artifacts) {{
+              galaxyBridge.stepArtifacts = sdoc.step_artifacts;
+              renderFilesDrawer();
+            }}
             const aj = sdoc.active_job;
             if (!aj) return;
             const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");

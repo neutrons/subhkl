@@ -508,8 +508,29 @@ def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     assert "btn-wulff-couple" in html
     assert "sel-wulff-color" in html
     assert "wulff-merge-bar" in html
+    assert "btn-files-toggle" in html
+    assert "files-drawer" in html
+    assert "Compl. vs d" in html
+    assert "⟨I/σ⟩ vs d" in html
+    assert len(payload["merge_metrics"]["cc_half_bins"]) == 10
+    assert all(
+        "completeness_pct" in b and "mean_isigi" in b
+        for b in payload["merge_metrics"]["cc_half_bins"]
+    )
     assert payload["pipeline_stages"][3]["name"] == "4. MERGE (CARELESS)"
     assert "imaginex_subhkl_merge" in payload["pipeline_stages"][3]["tool_ids"]
+
+    runner.active_job = None
+    step_arts = runner.list_step_artifacts(current_h5=str(h5_path), history_datasets=[])
+    merge_names = {a["name"] for a in step_arts["merge"]}
+    assert "merged.mtz" in merge_names
+    assert "predictions.mtz" in merge_names
+    assert "careless_metrics.json" in merge_names
+    local_fp, dl_name = runner.resolve_artifact_for_download(
+        name="merged.mtz", current_h5=str(h5_path)
+    )
+    assert local_fp == str(tmp_path / "merged.mtz")
+    assert dl_name == "merged.mtz"
 
 
 def test_nova_mvvm_pydantic_and_view_model(tmp_path):

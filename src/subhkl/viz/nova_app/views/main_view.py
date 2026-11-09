@@ -50,16 +50,48 @@ class MainApp:
 
         async def handle_status(_request: web.Request) -> web.Response:
             payload = self.view_model.model.subhkl.payload or {}
+            hist_ds = self.pipeline_runner.list_history_datasets()
+            cur_h5 = (
+                self.view_model.model.subhkl.data.peaks_file
+                or self.view_model.model.subhkl.data.images_file
+            )
             doc = {
                 "galaxy_connected": self.pipeline_runner.is_connected,
                 "galaxy_url": self.pipeline_runner.galaxy_url,
                 "history_id": self.pipeline_runner.history_id,
-                "history_datasets": self.pipeline_runner.list_history_datasets(),
+                "history_datasets": hist_ds,
+                "step_artifacts": self.pipeline_runner.list_step_artifacts(
+                    current_h5=cur_h5,
+                    history_datasets=hist_ds,
+                ),
                 "active_job": self.pipeline_runner.active_job,
                 "pipeline_stages": payload.get("pipeline_stages", []),
                 "ladder_steps": payload.get("ladder_steps", []),
             }
             return web.json_response(doc)
+
+        async def handle_artifact_download(request: web.Request) -> web.Response:
+            ds_id = str(request.rel_url.query.get("dataset_id") or "").strip()
+            fname = str(request.rel_url.query.get("name") or "").strip()
+            cur_h5 = (
+                self.view_model.model.subhkl.data.peaks_file
+                or self.view_model.model.subhkl.data.images_file
+            )
+            try:
+                local_fp, dl_name = self.pipeline_runner.resolve_artifact_for_download(
+                    dataset_id=ds_id,
+                    name=fname,
+                    current_h5=cur_h5,
+                )
+                safe_dl = dl_name.replace('"', "")
+                return web.FileResponse(
+                    path=local_fp,
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{safe_dl}"'
+                    },
+                )
+            except Exception as exc:
+                return web.Response(text=str(exc), status=404)
 
         async def handle_payload(request: web.Request) -> web.Response:
             fp_q = request.rel_url.query.get("file_path")
@@ -319,6 +351,7 @@ class MainApp:
         app.add_routes(
             [
                 web.get("/api/pipeline/status", handle_status),
+                web.get("/api/artifacts/download", handle_artifact_download),
                 web.get("/api/payload", handle_payload),
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
