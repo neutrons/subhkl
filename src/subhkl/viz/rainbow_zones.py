@@ -5690,7 +5690,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   detCanvas.addEventListener("wheel", (ev) => {{
     ev.preventDefault();
-    const factor = ev.deltaY < 0 ? 1.14 : 0.88;
+    const rawDy = ev.deltaMode === 1 ? ev.deltaY * 16 : (ev.deltaMode === 2 ? ev.deltaY * 100 : ev.deltaY);
+    const clampedDy = Math.max(-50, Math.min(50, rawDy));
+    const sensitivity = ev.ctrlKey ? 0.0035 : 0.0016;
+    const factor = Math.exp(-clampedDy * sensitivity);
     state.detZoom = Math.max(0.7, Math.min(10.0, state.detZoom * factor));
   }}, {{ passive: false }});
 
@@ -5745,7 +5748,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
     stereoCanvas.addEventListener("wheel", (ev) => {{
       ev.preventDefault();
-      const factor = ev.deltaY < 0 ? 1.12 : 0.89;
+      const rawDy = ev.deltaMode === 1 ? ev.deltaY * 16 : (ev.deltaMode === 2 ? ev.deltaY * 100 : ev.deltaY);
+      const clampedDy = Math.max(-50, Math.min(50, rawDy));
+      const sensitivity = ev.ctrlKey ? 0.0035 : 0.0016;
+      const factor = Math.exp(-clampedDy * sensitivity);
       state.wulffZoom = Math.max(0.6, Math.min(5.0, (state.wulffZoom || 1.0) * factor));
     }}, {{ passive: false }});
     stereoCanvas.addEventListener("click", (ev) => {{
