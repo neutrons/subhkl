@@ -7044,6 +7044,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }}
 
+  function formatRunDurationHMS(r) {{
+    if (!r) return "";
+    if (r.duration_hms) return String(r.duration_hms);
+    const s = Number(r.duration_s || 0);
+    if (!(s > 0)) return "";
+    const tot = Math.round(s);
+    const hh = Math.floor(tot / 3600);
+    const mm = Math.floor((tot % 3600) / 60);
+    const ss = tot % 60;
+    return [hh, mm, ss].map(v => String(v).padStart(2, "0")).join(":");
+  }}
+
   function renderOncatRunsList(scrollToSelected = false) {{
     const listEl = document.getElementById("nd-runs-list");
     const hdrEl = document.getElementById("nd-runs-header");
@@ -7067,7 +7079,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const allRuns = ndOncatCatalog.runs || [];
     const filtered = allRuns.filter(r => {{
       if (!filterVal) return true;
-      const hay = `${{r.run}} ${{r.title || ""}} ${{r.sample_name || ""}} ${{r.angles || ""}} ${{r.created || ""}}`.toLowerCase();
+      const durHms = formatRunDurationHMS(r);
+      const hay = `${{r.run}} ${{r.title || ""}} ${{r.sample_name || ""}} ${{r.angles || ""}} ${{durHms}} ${{r.created || ""}}`.toLowerCase();
       return hay.includes(filterVal);
     }});
     if (hdrEl) {{
@@ -7086,8 +7099,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     filtered.forEach(r => {{
       const rNum = Number(r.run);
       const isSel = selectedSet.has(rNum);
+      const durHms = formatRunDurationHMS(r);
       const row = document.createElement("div");
-      row.style.cssText = `padding:3px 6px;border-radius:4px;cursor:pointer;display:grid;grid-template-columns:auto 54px 1fr auto;align-items:center;gap:6px;border:1px solid ${{isSel ? "var(--accent-cyan)" : "transparent"}};background:${{isSel ? "rgba(56,189,248,0.16)" : "rgba(255,255,255,0.015)"}};`;
+      row.style.cssText = `padding:3px 6px;border-radius:4px;cursor:pointer;display:grid;grid-template-columns:auto 54px 1fr auto auto;align-items:center;gap:6px;border:1px solid ${{isSel ? "var(--accent-cyan)" : "transparent"}};background:${{isSel ? "rgba(56,189,248,0.16)" : "rgba(255,255,255,0.015)"}};`;
 
       const cb = document.createElement("input");
       cb.type = multiOk ? "checkbox" : "radio";
@@ -7105,6 +7119,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ? `${{r.title}} (${{r.sample_name}})`
         : primaryTitle;
 
+      const durSpan = document.createElement("span");
+      durSpan.style.cssText = "font-family:var(--font-display);font-size:0.59rem;color:var(--text-dim);white-space:nowrap;";
+      durSpan.textContent = durHms;
+
       const metaSpan = document.createElement("span");
       metaSpan.style.cssText = "font-family:var(--font-display);font-size:0.59rem;color:var(--accent-gold);white-space:nowrap;";
       metaSpan.textContent = r.angles || (r.size_mb ? `${{r.size_mb}} MB` : "");
@@ -7112,6 +7130,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const tipLines = [`Run #${{rNum}} (${{r.location || ""}})`];
       if (r.title) tipLines.push(`Title: ${{r.title}}`);
       if (r.sample_name) tipLines.push(`Sample: ${{r.sample_name}}`);
+      if (durHms) tipLines.push(`Duration: ${{durHms}}`);
       if (r.angles) tipLines.push(`Goniometer: ${{r.angles}}`);
       if (r.created) tipLines.push(`Created: ${{r.created}}`);
       if (r.size_mb) tipLines.push(`Size: ${{r.size_mb}} MB`);
@@ -7148,6 +7167,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       row.appendChild(cb);
       row.appendChild(runSpan);
       row.appendChild(titleSpan);
+      row.appendChild(durSpan);
       row.appendChild(metaSpan);
       if (isSel && !firstSelRow) firstSelRow = row;
       listEl.appendChild(row);
@@ -7311,7 +7331,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const previews = selRuns
         .map(n => runMap.get(Number(n)))
         .filter(Boolean)
-        .map(r => `#${{r.run}}: ${{r.title || r.sample_name || "—"}}${{r.angles ? " [" + r.angles + "]" : ""}}`);
+        .map(r => {{
+          const durHms = formatRunDurationHMS(r);
+          return `#${{r.run}}: ${{r.title || r.sample_name || "—"}}${{durHms ? " (" + durHms + ")" : ""}}${{r.angles ? " [" + r.angles + "]" : ""}}`;
+        }});
       titlePrevEl.textContent = previews.length > 0
         ? `Title Preview: ${{previews.slice(0, 3).join("  |  ")}}${{previews.length > 3 ? ` (+${{previews.length - 3}} more)` : ""}}`
         : "";

@@ -898,6 +898,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     assert "api/pipeline/oncat_auth" in html_merged
     assert "nd-oncat-browser" in html_merged
     assert "nd-oncat-auth-bar" in html_merged
+    assert "formatRunDurationHMS" in html_merged
     assert "+ Neutron data" not in html_merged
     assert "+ From local computer" not in html_merged
     assert ">Neutron data (SNS/HFIR)...</option>" in html_merged

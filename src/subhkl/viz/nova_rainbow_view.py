@@ -2294,6 +2294,14 @@ class NovaGalaxyPipelineRunner:
                         created_str = str(d.get("created") or "")[:16].replace(
                             "T", " "
                         )
+                        dur_s = float(meta_entry.get("duration") or 0.0)
+                        if dur_s > 0:
+                            tot_sec = int(round(dur_s))
+                            hh, rem = divmod(tot_sec, 3600)
+                            mm, ss = divmod(rem, 60)
+                            dur_hms = f"{hh:02d}:{mm:02d}:{ss:02d}"
+                        else:
+                            dur_hms = ""
                         by_run[r_num] = {
                             "run": r_num,
                             "location": loc,
@@ -2302,9 +2310,8 @@ class NovaGalaxyPipelineRunner:
                             "angles": angles,
                             "size_mb": round(sz_bytes / (1024.0 * 1024.0), 1),
                             "created": created_str,
-                            "duration_s": float(
-                                meta_entry.get("duration") or 0.0
-                            ),
+                            "duration_s": dur_s,
+                            "duration_hms": dur_hms,
                             "total_counts": int(
                                 float(meta_entry.get("total_counts") or 0)
                             ),
