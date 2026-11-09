@@ -112,30 +112,29 @@ def discover(args, samples=16384, candidates=6, seed=0):
     Cs, Os, rotations = C[idx], O[idx], Rs[idx]
     B = np.asarray(build_B_jax(*args.cell[:3], *np.deg2rad(args.cell[3:])))
     wavelength = (args.wl_min, args.wl_max)
-    print(
-        f"Blind band search: {len(weights)} stable-run observations, {len(idx)} search observations",
-        flush=True,
-    )
     pool = max(24, 4 * candidates)
     xyz = Cs + Os
     q = xyz / np.linalg.norm(xyz, axis=1, keepdims=True) - [0, 0, 1]
     lab = q / np.linalg.norm(q, axis=1, keepdims=True)
     directions = np.einsum("nji,nj->ni", rotations, lab)
     blind_path = Path(args.output).with_suffix(".blind.h5")
+    src_nexus = getattr(args, "nexus", getattr(args, "input", ""))
 
     def _write_blind_rung(stage_label: str, nz_val: int, u_cand: np.ndarray) -> None:
         tmp_path = blind_path.with_suffix(".blind.tmp.h5")
         try:
             with h5py.File(tmp_path, "w") as bf:
+                bf.attrs["instrument"] = str(args.instrument)
                 bf["sample/U"] = np.asarray(u_cand, dtype=float)
                 bf["sample/B"] = np.asarray(B, dtype=float)
                 bf["sample/cell"] = np.asarray(args.cell, dtype=float)
                 bf["sample/space_group"] = str(args.space_group)
+                bf["instrument/name"] = str(args.instrument)
                 bf["instrument/wavelength"] = np.asarray(
                     [args.wl_min, args.wl_max], dtype=float
                 )
                 sg = bf.create_group("search")
-                sg.attrs["source"] = str(Path(args.input).resolve())
+                sg.attrs["source"] = str(Path(src_nexus).resolve()) if src_nexus else ""
                 sg.attrs["instrument"] = str(args.instrument)
                 sg.attrs["d_min"] = float(args.d_min)
                 sg.attrs["ladder_stage"] = str(stage_label)
@@ -143,6 +142,12 @@ def discover(args, samples=16384, candidates=6, seed=0):
             tmp_path.replace(blind_path)
         except Exception:
             pass
+
+    _write_blind_rung("init", 13, np.eye(3))
+    print(
+        f"Blind band search: {len(weights)} stable-run observations, {len(idx)} search observations (exhaustive rung init)",
+        flush=True,
+    )
 
     found = lattice_ladder(
         directions,
@@ -189,6 +194,8 @@ def discover(args, samples=16384, candidates=6, seed=0):
             space_group=args.space_group,
         )
         fits.append(fit)
+        best_fit_so_far = max(fits, key=lambda f_it: f_it["score"])
+        _write_blind_rung(f"joint_{i}", 60, best_fit_so_far["U"])
         print(
             f"  candidate {i}: score {fit['score']:.6g}, radial {fit['radial_scale']:+.4f}",
             flush=True,
@@ -241,14 +248,16 @@ def discover(args, samples=16384, candidates=6, seed=0):
         for U in U_shared
     ]
     selected = int(np.argmax(scores))
-    print(
-        f"Full-data scores under common geometry: {scores}; selected {selected}",
-        flush=True,
-    )
     path = Path(args.output).with_suffix(".blind.h5")
-    with h5py.File(path, "w") as f:
+    tmp_final = path.with_suffix(".blind.tmp.h5")
+    with h5py.File(tmp_final, "w") as f:
+        f.attrs["instrument"] = str(args.instrument)
         f["sample/U"] = U_shared[selected]
         f["sample/B"] = B
+        f["sample/cell"] = np.asarray(args.cell, dtype=float)
+        f["sample/space_group"] = str(args.space_group)
+        f["instrument/name"] = str(args.instrument)
+        f["instrument/wavelength"] = np.asarray([args.wl_min, args.wl_max], dtype=float)
         g = f.create_group("search")
         g["orientations"] = U_shared
         g["full_scores"] = scores
@@ -278,7 +287,13 @@ def discover(args, samples=16384, candidates=6, seed=0):
         g.attrs["seed"] = seed
         g.attrs["stable_observations"] = len(weights)
         g.attrs["seconds"] = time.monotonic() - start
-        g.attrs["source"] = str(Path(args.nexus).resolve())
+        g.attrs["source"] = str(Path(src_nexus).resolve()) if src_nexus else ""
+        g.attrs["instrument"] = str(args.instrument)
         g.attrs["finder"] = str(args.finder or "")
         g.attrs["weighting"] = weighting_desc
+    tmp_final.replace(path)
+    print(
+        f"Full-data scores under common geometry: {scores}; selected {selected}",
+        flush=True,
+    )
     return str(path)

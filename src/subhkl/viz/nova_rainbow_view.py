@@ -1670,7 +1670,12 @@ class NovaGalaxyPipelineRunner:
                     low = line.lower()
                     if stage_id == "solve":
                         trigger_blind_sync = False
-                        if "exhaustive rung" in low or "rung 13 zones" in low:
+                        if (
+                            "blind band search" in low
+                            or "band table" in low
+                            or "exhaustive rung" in low
+                            or "rung 13 zones" in low
+                        ):
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 1
                             )
@@ -1683,6 +1688,7 @@ class NovaGalaxyPipelineRunner:
                         elif (
                             "rung 145 zones" in low
                             or "joint band refinement" in low
+                            or "candidate " in low
                             or "full-data scores" in low
                             or "global" in low
                             or "60-zone" in low
@@ -1703,7 +1709,7 @@ class NovaGalaxyPipelineRunner:
                         ):
                             try:
                                 cur_mtime = os.path.getmtime(blind_src)
-                                if cur_mtime > last_blind_mtime:
+                                if cur_mtime >= last_blind_mtime:
                                     last_blind_mtime = cur_mtime
                                     shutil.copy2(blind_src, blind_dst)
                                     from subhkl.viz.rainbow_zones import (
@@ -1720,9 +1726,11 @@ class NovaGalaxyPipelineRunner:
                                             float(wl[0]),
                                             float(wl[1]),
                                         ),
+                                        max_zone_index=1,
+                                        max_zones=13,
                                         include_panels=False,
                                         include_peaks=False,
-                                        n_arc=240,
+                                        n_arc=720,
                                     )
                                     if p_blind.get("zones"):
                                         partial_seq += 1

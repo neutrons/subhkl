@@ -438,6 +438,7 @@ def _extract_from_h5(
     frame_index: int | None = None,
     *,
     include_peaks: bool = True,
+    default_instrument: str = "IMAGINE",
 ) -> dict[str, Any]:
     """Extract peaks, detectors, UB, wavelength range, goniometer frames, and metadata from a subhkl HDF5 file."""
     disc_h5 = _discover_images_h5(h5_path)
@@ -470,7 +471,9 @@ def _extract_from_h5(
         )
         if is_pure_merged:
             sib_solve_path = None
-        instrument = _decode_str(f.attrs.get("instrument"), "IMAGINE")
+        instrument = _decode_str(
+            f.attrs.get("instrument"), default_instrument or "IMAGINE"
+        )
         ki = (0.0, 0.0, 1.0)
         if "beam/ki_vec" in f:
             ki = tuple(
@@ -552,6 +555,10 @@ def _extract_from_h5(
         explicit_h5_inst = _decode_str(f.attrs.get("instrument"), "").strip()
         if not explicit_h5_inst and "instrument/name" in f:
             explicit_h5_inst = _decode_str(f["instrument/name"][()], "").strip()
+        if not explicit_h5_inst and "search" in f:
+            explicit_h5_inst = _decode_str(
+                f["search"].attrs.get("instrument"), ""
+            ).strip()
         if explicit_h5_inst:
             instrument = explicit_h5_inst
         else:
@@ -1882,6 +1889,7 @@ def build_rainbow_zone_payload(
             images_h5=images_h5,
             frame_index=frame_index,
             include_peaks=include_peaks,
+            default_instrument=instrument or "IMAGINE",
         )
         instrument = extracted["instrument"] or instrument
         ki = extracted["ki"]
