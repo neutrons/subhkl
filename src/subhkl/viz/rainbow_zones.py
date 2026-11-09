@@ -390,6 +390,14 @@ def _extract_from_h5(
     )
 
     with h5py.File(h5_path, "r") as f:
+        is_pure_merged = (
+            "images" in f
+            and "sample/U" not in f
+            and "peaks" not in f
+            and "banks" not in f
+        )
+        if is_pure_merged:
+            sib_solve_path = None
         instrument = _decode_str(f.attrs.get("instrument"), "IMAGINE")
         ki = (0.0, 0.0, 1.0)
         if "beam/ki_vec" in f:
@@ -492,13 +500,19 @@ def _extract_from_h5(
                     if known_inst in fn_s:
                         instrument = known_inst
                         break
-        if not explicit_h5_inst and instrument == "CG4D" and "detector_calibration" not in f:
-            for b_key in ("bank_ids", "peaks/bank", "bank"):
-                if b_key in f:
-                    b_arr_chk = np.asarray(f[b_key][()], dtype=int)
-                    if len(np.unique(b_arr_chk)) > 8:
-                        instrument = "MANDI"
-                        break
+        if not explicit_h5_inst and instrument in ("CG4D", "IMAGINE") and "detector_calibration" not in f:
+            if "images" in f and len(f["images"].shape) >= 3 and int(f["images"].shape[1]) == 256:
+                instrument = "MANDI"
+            else:
+                for b_key in ("bank_ids", "peaks/bank", "bank"):
+                    if b_key in f:
+                        b_arr_chk = np.asarray(f[b_key][()], dtype=int)
+                        if len(b_arr_chk) > 0 and int(np.max(b_arr_chk)) > 60:
+                            instrument = "CG4D"
+                            break
+                        if 8 < len(np.unique(b_arr_chk)) <= 45:
+                            instrument = "MANDI"
+                            break
 
         detectors = _load_detectors_from_h5(f, instrument)
 
@@ -3192,12 +3206,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   const rawBankImages = new Map();
   function decodeAllBankTextures() {{
+    let pending = 0;
     PANELS.forEach(p => {{
       if (!p.texture_b64) return;
+      pending++;
       const img = new Image();
       img.onload = () => {{
         rawBankImages.set(p.bank, img);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(img, state.heatmapStyle));
+        pending--;
+        if (pending <= 0 || pending % 8 === 0) {{
+          renderDetector();
+        }}
       }};
       img.src = "data:image/png;base64," + p.texture_b64;
     }});
@@ -4478,15 +4498,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const bankGrayCanvases = new Map();
     if (mf && mf.keys().includes("images")) {{
       const imDs = mf.get("images");
-      const shape = imDs.shape; // [N, H, W]
+      const shape = Array.from(imDs.shape || []).map(Number); // [N, H, W]
       const H = shape[1] || 512, W = shape[2] || 512;
-      const sliceArr = imDs.slice([[f0, f1], [0, H], [0, W]]);
       const bStep = 4;
       const Hb = Math.floor(H / bStep), Wb = Math.floor(W / bStep);
       for (let i = 0; i < bankIdsRun.length; i++) {{
-        const bid = bankIdsRun[i];
-        const offset = i * H * W;
-        const sub = sliceArr.subarray(offset, offset + H * W);
+        const bid = Number(bankIdsRun[i]);
+        const sub = imDs.slice([[f0 + i, f0 + i + 1], [0, H], [0, W]]);
         bankImgs.set(bid, {{ data: sub, H, W }});
 
         // Downsample and log1p-scale into offscreen canvas
@@ -4496,7 +4514,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             let sum = 0;
             for (let dr = 0; dr < bStep; dr++) {{
               const rowOff = (rb * bStep + dr) * W + cb * bStep;
-              for (let dc = 0; dc < bStep; dc++) sum += sub[rowOff + dc];
+              for (let dc = 0; dc < bStep; dc++) sum += Number(sub[rowOff + dc]);
             }}
             logBuf[rb * Wb + cb] = Math.log1p(Math.max(0, sum / (bStep * bStep)));
           }}
@@ -4556,9 +4574,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (panelsOut.length === 0 && PANELS.length > 0) {{
       PANELS.forEach(p => {{
+        const gc = bankGrayCanvases.get(p.bank) || p._grayCanvas || null;
         panelsOut.push({{
           ...p,
-          _grayCanvas: bankGrayCanvases.get(p.bank) || p._grayCanvas || null,
+          texture_b64: gc ? null : p.texture_b64,
+          _grayCanvas: gc,
         }});
       }});
     }}
@@ -4787,7 +4807,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                   const rr = ri + dr; if (rr < 0 || rr >= bIm.H) continue;
                   for (let dc = -9; dc <= 9; dc++) {{
                     const cc = ci + dc; if (cc < 0 || cc >= bIm.W) continue;
-                    const val = bIm.data[rr * bIm.W + cc];
+                    const val = Number(bIm.data[rr * bIm.W + cc]);
                     if (Math.abs(dr) <= 4 && Math.abs(dc) <= 4) {{ if (val > pkMax) pkMax = val; }}
                     bgSum += val; bgN++;
                   }}
@@ -5234,15 +5254,48 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const params = collectWorkflowParams();
     const isRawNexus = forceReduce || files.some(f => /\\.nxs(\\.h5)?$/i.test(f.name));
     try {{
-      const fd = new FormData();
-      files.forEach(f => fd.append("files", f, f.name));
-      fd.append("params", JSON.stringify(params));
       setStatusLine(
         "[⏳ LOCAL HDF5]",
         isRawNexus
-          ? `Uploading ${{files.length}} raw NeXus file(s) and triggering <strong>1. Reduce + Merge Images</strong>...`
+          ? `Opening ${{files.length}} raw NeXus file(s) and triggering <strong>1. Reduce + Merge Images</strong>...`
           : `Loading <strong>${{files.map(f => f.name).join(", ")}}</strong>...`
       );
+      // Fast path: check if the selected local file(s) already exist on the server filesystem by (name, size)
+      try {{
+        const rr = await fetch("api/pipeline/resolve_local_files", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{
+            files: files.map(f => ({{ name: f.name, size: f.size, lastModified: f.lastModified }})),
+          }}),
+        }});
+        if (rr.ok) {{
+          const rdoc = await rr.json();
+          const matchedPaths = rdoc.matched_paths || [];
+          if (matchedPaths.length === files.length && matchedPaths.length > 0) {{
+            if (isRawNexus) {{
+              selectPipelineStage(0, true);
+              await executeWorkflowStage(0, {{
+                ingest_mode: "file",
+                nexus_files: matchedPaths,
+              }});
+              return;
+            }}
+            const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(matchedPaths[0])}}`, {{ cache: "no-store" }});
+            if (pr.ok) {{
+              const srvPayload = await pr.json();
+              if (srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
+                recomputeBoundsAndReload(srvPayload);
+                return;
+              }}
+            }}
+          }}
+        }}
+      }} catch (_fastErr) {{}}
+
+      const fd = new FormData();
+      files.forEach(f => fd.append("files", f, f.name));
+      fd.append("params", JSON.stringify(params));
       const r = await fetch("api/pipeline/upload_h5", {{
         method: "POST",
         body: fd,

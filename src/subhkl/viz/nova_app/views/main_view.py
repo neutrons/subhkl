@@ -208,15 +208,13 @@ class MainApp:
 
         async def handle_upload_h5(request: web.Request) -> web.Response:
             import tempfile
+            import time
 
             try:
-                cur_peaks = self.view_model.model.subhkl.data.peaks_file
-                cur_imgs = self.view_model.model.subhkl.data.images_file
-                fb_dir = tempfile.gettempdir()
-                for p in (cur_peaks, cur_imgs):
-                    if p and os.path.isfile(p):
-                        fb_dir = os.path.dirname(os.path.abspath(p))
-                        break
+                upload_dir = os.path.join(
+                    tempfile.gettempdir(), f"subhkl_upload_{int(time.time())}"
+                )
+                os.makedirs(upload_dir, exist_ok=True)
                 reader = await request.multipart()
                 saved_paths: list[str] = []
                 while True:
@@ -225,9 +223,10 @@ class MainApp:
                         break
                     fname = part.filename
                     if not fname:
+                        await part.read()
                         continue
                     safe_name = os.path.basename(fname)
-                    dest_path = os.path.join(fb_dir, safe_name)
+                    dest_path = os.path.join(upload_dir, safe_name)
                     with open(dest_path, "wb") as f_out:
                         while True:
                             chunk = await part.read_chunk()
@@ -237,7 +236,7 @@ class MainApp:
                     saved_paths.append(dest_path)
                 if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(".nxs.h5"):
                     sp = saved_paths[0]
-                    if "merged" in os.path.basename(sp).lower():
+                    if "merged" in os.path.basename(sp).lower() or "scan" in os.path.basename(sp).lower():
                         self.view_model.model.subhkl.data.images_file = sp
                     self.view_model.model.subhkl.data.peaks_file = sp
                     self.view_model.model.subhkl.refresh_payload()
@@ -247,6 +246,56 @@ class MainApp:
                     {"status": "error", "error": str(exc)}, status=400
                 )
 
+        async def handle_resolve_local_files(request: web.Request) -> web.Response:
+            import glob as _glob
+            import tempfile
+
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            req_files = body.get("files") or []
+            matched_paths: list[str] = []
+            cur_peaks = self.view_model.model.subhkl.data.peaks_file
+            cur_imgs = self.view_model.model.subhkl.data.images_file
+            search_dirs: list[str] = []
+            for p in (cur_peaks, cur_imgs):
+                if p and os.path.isfile(p):
+                    d = os.path.dirname(os.path.abspath(p))
+                    if d not in search_dirs:
+                        search_dirs.append(d)
+            for extra_root in ("/home/xvg/subhkl-examples", tempfile.gettempdir()):
+                if os.path.isdir(extra_root) and extra_root not in search_dirs:
+                    search_dirs.append(extra_root)
+
+            for fmeta in req_files:
+                if not isinstance(fmeta, dict):
+                    continue
+                fname = os.path.basename(str(fmeta.get("name") or "").strip())
+                fsize = int(fmeta.get("size") or -1)
+                if not fname or fsize < 0:
+                    break
+                found: str | None = None
+                for sdir in search_dirs:
+                    direct = os.path.join(sdir, fname)
+                    if os.path.isfile(direct) and os.path.getsize(direct) == fsize:
+                        found = direct
+                        break
+                    for sub_cand in _glob.glob(os.path.join(sdir, "*", fname)):
+                        if os.path.isfile(sub_cand) and os.path.getsize(sub_cand) == fsize:
+                            found = sub_cand
+                            break
+                    if found:
+                        break
+                if found:
+                    matched_paths.append(found)
+            return web.json_response(
+                {
+                    "matched": len(matched_paths) == len(req_files) and len(matched_paths) > 0,
+                    "matched_paths": matched_paths,
+                }
+            )
+
         async def handle_check_neutron_paths(request: web.Request) -> web.Response:
             try:
                 body = await request.json()
@@ -255,6 +304,7 @@ class MainApp:
             res = self.pipeline_runner.check_neutron_paths(body)
             return web.json_response(res)
 
+        app._client_max_size = 4 * 1024**3
         app.add_routes(
             [
                 web.get("/api/pipeline/status", handle_status),
@@ -262,6 +312,7 @@ class MainApp:
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
                 web.post("/api/pipeline/upload_h5", handle_upload_h5),
+                web.post("/api/pipeline/resolve_local_files", handle_resolve_local_files),
                 web.post("/api/pipeline/check_neutron_paths", handle_check_neutron_paths),
                 web.get("/subhkl_parallax.html", handle_standalone_html),
             ]

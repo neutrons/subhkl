@@ -600,6 +600,22 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
         assert chk_mandi["ok"] is False
         assert chk_mandi["suggested_ipts"] == "34720"
 
+    # 5. Verify _work_dir_for_reduce isolates reduction outputs from existing directories
+    red_dir, red_label = runner._work_dir_for_reduce(
+        ["/SNS/MANDI/IPTS-34720/nexus/MANDI_12737.nxs.h5"],
+        "/home/xvg/subhkl-examples/betalac-7",
+    )
+    assert red_dir != "/home/xvg/subhkl-examples/betalac-7"
+    assert "MANDI_12737" in red_dir
+    assert red_label == "MANDI_12737_merged.h5"
+
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    html_merged = render_rainbow_html(p_merged)
+    assert "Number(sub[rowOff + dc])" in html_merged
+    assert "api/pipeline/resolve_local_files" in html_merged
+
+
 
 
 
