@@ -1328,6 +1328,14 @@ class NovaGalaxyPipelineRunner:
                             f"subhkl GPU tool '{required_tool}' not yet deployed on {self.galaxy_url} "
                             f"(awaiting MR merge on ndip/galaxy-tools)"
                         )
+                    if (
+                        stage_id != "reduce"
+                        and getattr(self, "_pulsar_queue_stalled_until", 0.0)
+                        > time.time()
+                    ):
+                        raise RuntimeError(
+                            f"Galaxy Pulsar queue on {self.galaxy_url} is stalled in state=new"
+                        )
 
             if stage_id == "solve":
                 primary_tool = "imaginex_subhkl_solve"
@@ -1458,6 +1466,10 @@ class NovaGalaxyPipelineRunner:
                                 f"NDIP neutrons_load_data failed: {err_out.splitlines()[0]}"
                             )
                         time.sleep(1.0)
+                if getattr(self, "_pulsar_queue_stalled_until", 0.0) > time.time():
+                    raise RuntimeError(
+                        f"Galaxy Pulsar queue on {self.galaxy_url} is stalled in state=new"
+                    )
                 primary_tool = "imaginex_subhkl_prepare_peaks"
                 tool_inputs = {
                     "instrument": inst,
@@ -1517,6 +1529,11 @@ class NovaGalaxyPipelineRunner:
                 import re as _re
 
                 raw_nxs_all = list(job_record.get("raw_nxs") or [])
+                if all(os.path.isfile(p) for p in raw_nxs_all):
+                    raise RuntimeError(
+                        f"imaginex_subhkl_prepare_peaks 0.1.0-dev on {self.galaxy_url} lacks multi-input batching; "
+                        f"switching to multi-core container reduction ({len(raw_nxs_all)} runs)"
+                    )
                 out_sub = os.path.join(work_dir, "out")
                 os.makedirs(out_sub, exist_ok=True)
                 # Pre-warm ONCat catalog cache once for the sweep so parallel workers don't re-fetch it per run
@@ -2843,7 +2860,11 @@ class NovaGalaxyPipelineRunner:
                 str(float(raw_cell[5])),
                 str(sg),
             ]
-            reduce_cmds = [shlex.join(r_cmd), shlex.join(merge_cmd)]
+            reduce_cmds = [
+                shlex.join(r_cmd),
+                shlex.join(merge_cmd),
+                f"rm -f {shlex.quote(reduce_tmp_dir)}/*.reduce.h5",
+            ]
             chained_reduce = (
                 f"set -e; export PYTHONPATH={shlex.quote(reduce_tmp_dir)}:${{PYTHONPATH:-}}; "
                 + " && ".join(reduce_cmds)
@@ -3356,11 +3377,16 @@ class NovaGalaxyPipelineRunner:
                         merged_link = os.path.join(work_dir, "merged.h5")
                         try:
                             self._stamp_merged_metadata(out_h5, job_record)
-                            shutil.copy2(out_h5, merged_dest)
+                            shutil.move(out_h5, merged_dest)
                             if os.path.abspath(merged_dest) != os.path.abspath(
                                 merged_link
                             ):
-                                shutil.copy2(out_h5, merged_link)
+                                try:
+                                    if os.path.lexists(merged_link):
+                                        os.remove(merged_link)
+                                    os.link(merged_dest, merged_link)
+                                except Exception:
+                                    shutil.copy2(merged_dest, merged_link)
                             final_h5 = merged_dest
                             job_record["stdout"] += (
                                 f"\n[subhkl] Saved {merged_label} -> {merged_dest}\n"
@@ -3371,26 +3397,33 @@ class NovaGalaxyPipelineRunner:
                             )
 
                         if self.is_connected and os.path.isfile(final_h5):
-                            try:
-                                store = self.get_datastore("IMAGINE-X SubHKL")
-                                up_id = self._ensure_galaxy_h5_dataset(
-                                    store,
-                                    final_h5,
-                                    job_record,
-                                    force_upload=True,
-                                    file_ext="h5",
-                                )
-                                job_record["outputs"] = [
-                                    {
-                                        "id": up_id,
-                                        "name": os.path.basename(final_h5),
-                                        "extension": "h5",
-                                    }
-                                ]
-                            except Exception as up_exc:
-                                job_record["stdout"] += (
-                                    f"[nova -> galaxy] Warning uploading {merged_label}: {self._clean_err_msg(up_exc)}\n"
-                                )
+                            def _bg_upload_reduced(
+                                _f_h5: str = final_h5,
+                                _lbl: str = merged_label,
+                            ) -> None:
+                                try:
+                                    store = self.get_datastore("IMAGINE-X SubHKL")
+                                    bg_rec: dict[str, Any] = {"stdout": ""}
+                                    up_id = self._ensure_galaxy_h5_dataset(
+                                        store,
+                                        _f_h5,
+                                        bg_rec,
+                                        force_upload=True,
+                                        file_ext="h5",
+                                    )
+                                    job_record["outputs"] = [
+                                        {
+                                            "id": up_id,
+                                            "name": os.path.basename(_f_h5),
+                                            "extension": "h5",
+                                        }
+                                    ]
+                                except Exception:
+                                    pass
+
+                            threading.Thread(
+                                target=_bg_upload_reduced, daemon=True
+                            ).start()
                     elif stage_id == "solve" and os.path.isfile(out_h5):
                         try:
                             shutil.copy2(out_h5, solve_dest)
@@ -3597,6 +3630,7 @@ class NovaGalaxyPipelineRunner:
             return
         step_counter = 0
         poll_errors = 0
+        new_state_ticks = 0
         base_log = job_record.get("stdout", "")
 
         while True:
@@ -3606,6 +3640,19 @@ class NovaGalaxyPipelineRunner:
                 jinfo = self._api_request("GET", f"/api/jobs/{job_id}?full=true")
                 poll_errors = 0
                 state = jinfo.get("state", "running")
+                if state == "new":
+                    new_state_ticks += 1
+                    if new_state_ticks >= 10:
+                        self._pulsar_queue_stalled_until = time.time() + 300.0
+                        try:
+                            self._api_request("DELETE", f"/api/jobs/{job_id}")
+                        except Exception:
+                            pass
+                        raise TimeoutError(
+                            f"Galaxy Pulsar queue did not pick up job {job_id} after 15s (stuck in state=new)"
+                        )
+                else:
+                    new_state_ticks = 0
                 if state != "ok":
                     job_record["state"] = state
                 else:
@@ -3979,6 +4026,8 @@ class NovaGalaxyPipelineRunner:
                     else:
                         job_record["state"] = state
                     break
+            except TimeoutError:
+                raise
             except Exception as exc:
                 poll_errors += 1
                 if poll_errors < 5:
