@@ -61,7 +61,10 @@ def solve(
     ] = 3.2,
     binning: Annotated[
         int | None,
-        typer.Option(min=1, help="Sum count pixels into bins (default: 8 for poisson, 16 for band)"),
+        typer.Option(
+            min=1,
+            help="Sum count pixels into bins (default: 8 for poisson, 16 for band)",
+        ),
     ] = None,
     proposal_binning: Annotated[
         int,
@@ -1223,8 +1226,10 @@ def reduce(
 @app.command()
 def merge_images(
     input_pattern: Annotated[
-        str,
-        typer.Argument(help="Glob pattern for reduced .h5 files (e.g. 'reduced/*.h5')"),
+        list[str],
+        typer.Argument(
+            help="Glob pattern or list of reduced .h5 files (e.g. 'reduced/*.h5')"
+        ),
     ],
     output_filename: Annotated[str, typer.Argument(help="Output master .h5 file")],
     a: float = typer.Argument(..., help="Unit cell parameter a"),
@@ -1236,8 +1241,13 @@ def merge_images(
     space_group: str = typer.Argument(..., help="Space group (e.g. 'P 1')"),
 ):
     try:
+        joined_pattern = (
+            " ".join(str(p) for p in input_pattern)
+            if isinstance(input_pattern, (list, tuple))
+            else str(input_pattern)
+        )
         run_merge_images(
-            input_pattern, output_filename, a, b, c, alpha, beta, gamma, space_group
+            joined_pattern, output_filename, a, b, c, alpha, beta, gamma, space_group
         )
 
     except ValueError as e:

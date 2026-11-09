@@ -1122,6 +1122,12 @@ def _extract_from_h5(
             if R_all.ndim == 3 and len(R_all) > 0:
                 if frame_slice is not None and frame_slice[0] < len(R_all):
                     R_gonio = R_all[frame_slice[0]]
+                elif (
+                    offsets is not None
+                    and len(R_all) == len(offsets)
+                    and active_frame < len(R_all)
+                ):
+                    R_gonio = R_all[active_frame]
                 elif peaks_xyz is not None and len(R_all) == len(peaks_xyz):
                     R_gonio = R_all
                 elif (

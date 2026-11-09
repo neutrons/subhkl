@@ -322,6 +322,15 @@ class NovaGalaxyPipelineRunner:
         except Exception:
             return False
 
+    def _get_tool_version(self, tool_id: str) -> str:
+        try:
+            doc = self._api_request("GET", f"/api/tools/{tool_id}")
+            if isinstance(doc, dict):
+                return str(doc.get("version") or "")
+        except Exception:
+            pass
+        return ""
+
     def submit_galaxy_stage(
         self,
         stage_id: str,
@@ -741,6 +750,156 @@ class NovaGalaxyPipelineRunner:
                 stage_id == "integrate"
                 and self._has_tool_on_galaxy("imaginex_subhkl_integrate")
             )
+            is_multi_run_legacy_reduce = (
+                stage_id == "reduce"
+                and len(job_record.get("raw_nxs") or []) > 1
+                and self._get_tool_version("imaginex_subhkl_prepare_peaks").startswith(
+                    "0.1"
+                )
+            )
+            if is_multi_run_legacy_reduce:
+                raw_nxs_all = list(job_record.get("raw_nxs") or [])
+                out_sub = os.path.join(work_dir, "out")
+                os.makedirs(out_sub, exist_ok=True)
+                job_record["stdout"] += (
+                    f"[galaxy -> pulsar] Multi-run reduction ({len(raw_nxs_all)} runs): "
+                    f"dispatching per-run {primary_tool} jobs on {self.galaxy_url}...\n"
+                )
+                submitted_parts: list[tuple[str, str, list[dict[str, Any]], str]] = []
+                for idx_r, nxs_p in enumerate(raw_nxs_all):
+                    bn = os.path.basename(nxs_p).split(".")[0]
+                    part_path = os.path.join(out_sub, f"{bn}.reduce.h5")
+                    part_inputs = {
+                        "instrument": inst,
+                        "a": float(raw_cell[0]),
+                        "b": float(raw_cell[1]),
+                        "c": float(raw_cell[2]),
+                        "alpha": float(raw_cell[3]),
+                        "beta": float(raw_cell[4]),
+                        "gamma": float(raw_cell[5]),
+                        "spaceGroup": sg,
+                        "wavelengthMin": float(wl[0]),
+                        "wavelengthMax": float(wl[1]),
+                        "inputs_0|input": nxs_p,
+                    }
+                    part_res = gi.tools.run_tool(
+                        history_id=store.history_id,
+                        tool_id=primary_tool,
+                        tool_inputs=part_inputs,
+                    )
+                    p_jid = part_res["jobs"][0]["id"]
+                    p_outs = [
+                        {
+                            "id": d.get("id"),
+                            "name": d.get("output_name") or d.get("name"),
+                            "extension": d.get("file_ext")
+                            or d.get("extension")
+                            or "h5",
+                        }
+                        for d in (part_res.get("outputs") or [])
+                        if isinstance(d, dict)
+                    ]
+                    submitted_parts.append((nxs_p, p_jid, p_outs, part_path))
+                    job_record["stdout"] += (
+                        f"[galaxy -> pulsar] Dispatched Run {idx_r + 1}/{len(raw_nxs_all)} "
+                        f"({os.path.basename(nxs_p)}, job_id={p_jid})\n"
+                    )
+
+                part_paths: list[str] = []
+                for idx_r, (nxs_p, p_jid, p_outs, part_path) in enumerate(
+                    submitted_parts
+                ):
+                    job_record["job_id"] = p_jid
+                    job_record["outputs"] = p_outs
+                    job_record["raw_nxs"] = [nxs_p]
+                    job_record["reduce_part_path"] = part_path
+                    self._poll_galaxy_job(
+                        job_record,
+                        None,
+                        final_step=False,
+                        work_dir=work_dir,
+                    )
+                    if job_record.get("state") in ("error", "deleted", "paused"):
+                        return
+                    if os.path.isfile(part_path):
+                        part_paths.append(part_path)
+                    for po in p_outs:
+                        if po.get("id") and self.history_id:
+                            try:
+                                self._api_request(
+                                    "PUT",
+                                    f"/api/histories/{self.history_id}/contents/{po['id']}",
+                                    payload={"deleted": True, "purged": True},
+                                )
+                            except Exception:
+                                pass
+
+                job_record.pop("reduce_part_path", None)
+                job_record["raw_nxs"] = raw_nxs_all
+                if not part_paths:
+                    raise RuntimeError(
+                        "No reduced HDF5 files were produced by multi-run reduction."
+                    )
+                merged_label = str(job_record.get("merged_label") or "merged.h5")
+                merged_dest = os.path.join(work_dir, merged_label)
+                merged_link = os.path.join(work_dir, "merged.h5")
+                from subhkl.commands import run_merge_images
+                import h5py
+                import numpy as np
+
+                job_record["stdout"] += (
+                    f"\n[subhkl] Merging {len(part_paths)} reduced runs -> {merged_dest}...\n"
+                )
+                run_merge_images(
+                    " ".join(part_paths),
+                    merged_dest,
+                    float(raw_cell[0]),
+                    float(raw_cell[1]),
+                    float(raw_cell[2]),
+                    float(raw_cell[3]),
+                    float(raw_cell[4]),
+                    float(raw_cell[5]),
+                    sg,
+                )
+                try:
+                    with h5py.File(merged_dest, "r+") as hf:
+                        if "files" in hf:
+                            del hf["files"]
+                        hf["files"] = np.array(
+                            [
+                                f"out/{os.path.basename(p)}".encode("utf-8")
+                                for p in part_paths
+                            ]
+                        )
+                except Exception:
+                    pass
+                self._stamp_merged_metadata(merged_dest, job_record)
+                if os.path.abspath(merged_dest) != os.path.abspath(merged_link):
+                    shutil.copy2(merged_dest, merged_link)
+                up_id = self._ensure_galaxy_h5_dataset(
+                    store,
+                    merged_dest,
+                    job_record,
+                    force_upload=True,
+                    file_ext="h5",
+                )
+                job_record["outputs"] = [
+                    {
+                        "id": up_id,
+                        "name": merged_label,
+                        "extension": "h5",
+                    }
+                ]
+                job_record["output_h5_path"] = merged_dest
+                if callable(on_complete_h5):
+                    on_complete_h5(merged_dest)
+                    job_record["updated_payload_ready"] = True
+                job_record["stdout"] += (
+                    f"\n[galaxy -> pulsar] Multi-run reduction ({len(part_paths)} runs) finished (state=ok).\n"
+                )
+                job_record["state"] = "ok"
+                return
+
             job_record["tool_id"] = primary_tool
             results = gi.tools.run_tool(
                 history_id=store.history_id,
@@ -1758,6 +1917,7 @@ class NovaGalaxyPipelineRunner:
                                 )
                                 if (
                                     job_record.get("stage_id") == "reduce"
+                                    and final_step
                                     and self.history_id
                                 ):
                                     try:
@@ -1773,7 +1933,13 @@ class NovaGalaxyPipelineRunner:
                                     except Exception:
                                         pass
                                 target_path = None
-                                if work_dir and os.path.isdir(work_dir):
+                                if (
+                                    not final_step
+                                    and job_record.get("stage_id") == "reduce"
+                                    and job_record.get("reduce_part_path")
+                                ):
+                                    target_path = str(job_record["reduce_part_path"])
+                                elif work_dir and os.path.isdir(work_dir):
                                     if (
                                         not final_step
                                         and job_record.get("stage_id") == "integrate"
