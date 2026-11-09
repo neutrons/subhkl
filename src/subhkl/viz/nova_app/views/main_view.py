@@ -347,10 +347,25 @@ class MainApp:
             res = self.pipeline_runner.check_neutron_paths(body)
             return web.json_response(res)
 
+        async def handle_oncat_catalog(request: web.Request) -> web.Response:
+            import asyncio
+
+            q = request.rel_url.query
+            params = {
+                "facility": str(q.get("facility") or "HFIR").strip(),
+                "instrument": str(q.get("instrument") or "CG4D").strip(),
+                "ipts": str(q.get("ipts") or "").strip(),
+            }
+            res = await asyncio.to_thread(
+                self.pipeline_runner.browse_oncat_catalog, params
+            )
+            return web.json_response(res)
+
         app._client_max_size = 4 * 1024**3
         app.add_routes(
             [
                 web.get("/api/pipeline/status", handle_status),
+                web.get("/api/pipeline/oncat_catalog", handle_oncat_catalog),
                 web.get("/api/artifacts/download", handle_artifact_download),
                 web.get("/api/payload", handle_payload),
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),

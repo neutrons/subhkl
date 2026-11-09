@@ -1833,6 +1833,7 @@ class NovaGalaxyPipelineRunner:
             return meta
         try:
             import re as _re
+            import h5py
 
             with h5py.File(path, "r") as f:
                 entry = f.get("entry")
@@ -2037,7 +2038,6 @@ class NovaGalaxyPipelineRunner:
                                 (meta_entry.get("sample") or {}).get("name") or ""
                             ).strip()
                             or str(inv_rec.get("sample_name") or "").strip()
-                            or str(idx_d.get("sample_id") or "").strip()
                         )
                         angles = str(inv_rec.get("angles") or "").strip()
                         if not angles and title:
