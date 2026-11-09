@@ -436,6 +436,8 @@ def _extract_from_h5(
     h5_path: str | os.PathLike,
     images_h5: str | os.PathLike | None = None,
     frame_index: int | None = None,
+    *,
+    include_peaks: bool = True,
 ) -> dict[str, Any]:
     """Extract peaks, detectors, UB, wavelength range, goniometer frames, and metadata from a subhkl HDF5 file."""
     disc_h5 = _discover_images_h5(h5_path)
@@ -445,12 +447,17 @@ def _extract_from_h5(
         src_h5 = str(images_h5)
     else:
         src_h5 = None
+    is_blind_h5 = str(h5_path).endswith(".blind.h5")
     sib_solve = Path(h5_path).parent / "solve.h5"
     if (not sib_solve.is_file() or sib_solve == Path(h5_path)) and src_h5:
         sib_solve = Path(src_h5).parent / "solve.h5"
     sib_solve_path = (
         str(sib_solve)
-        if sib_solve.is_file() and sib_solve.resolve() != Path(h5_path).resolve()
+        if (
+            not is_blind_h5
+            and sib_solve.is_file()
+            and sib_solve.resolve() != Path(h5_path).resolve()
+        )
         else None
     )
 
@@ -1194,7 +1201,8 @@ def _extract_from_h5(
 
         # Finder-less solve.h5 forward projection onto calibrated detector banks
         if (
-            (peaks_xyz is None or len(peaks_xyz) == 0)
+            include_peaks
+            and (peaks_xyz is None or len(peaks_xyz) == 0)
             and U is not None
             and B is not None
             and detectors
@@ -1542,18 +1550,23 @@ def _build_lattice_ladder_steps(
         }
     ]
 
-    z0_ids = [zones[0]["zone_id"]] if len(zones) >= 1 else []
-    z0_peaks = zones[0]["member_peak_ids"] if len(zones) >= 1 else []
+    z0_slice = zones[: min(3, len(zones))]
+    z0_ids = [z["zone_id"] for z in z0_slice]
+    z0_peaks = sorted({pid for z in z0_slice for pid in z["member_peak_ids"]})
     z0_label = zones[0]["label"] if len(zones) >= 1 else "[1 0 0]"
-    z0_rms = zones[0]["angular_rms_deg"] if len(zones) >= 1 else overall_rms
+    z0_rms = (
+        float(np.mean([z["angular_rms_deg"] for z in z0_slice]))
+        if z0_slice
+        else overall_rms
+    )
     if solve_diagnostics and solve_diagnostics.get("n_candidates"):
         n_cands = int(solve_diagnostics.get("n_candidates", 4))
         full_sc = float(solve_diagnostics.get("top_full_score", 0.0))
         s2_stage = f"2. 13→145 Zone Ladder ({z0_label})"
         s2_sub = f"Blind Lattice-Ladder ({n_cands} candidates • score {full_sc:.3f})"
     else:
-        s2_stage = f"2. Primary Zone {z0_label}"
-        s2_sub = f"Coarse zone lock ({len(z0_peaks)} spots in family)"
+        s2_stage = f"2. Primary Zones ({z0_label})"
+        s2_sub = f"Coarse 13-zone rung ({len(z0_ids)} principal axes)"
     steps.append(
         {
             "rung": 2,
@@ -1567,14 +1580,15 @@ def _build_lattice_ladder_steps(
             "rms_deg": round(float(z0_rms), 3),
             "zone_tol_deg": 1.0,
             "description": (
-                f"Primary crystal zone axis {z0_label} captures {len(z0_peaks)} "
+                f"Primary crystal zone axes ({len(z0_ids)} shown, led by {z0_label}) capture {len(z0_peaks)} "
                 "coplanar scattering vectors (G · t_uvw = 0) during lattice_ladder (13→30→60→145 zones)."
             ),
         }
     )
 
-    z12_ids = [z["zone_id"] for z in zones[:2]]
-    z12_peaks = sorted({pid for z in zones[:2] for pid in z["member_peak_ids"]})
+    z12_slice = zones[: min(7, len(zones))]
+    z12_ids = [z["zone_id"] for z in z12_slice]
+    z12_peaks = sorted({pid for z in z12_slice for pid in z["member_peak_ids"]})
     psi_deg = 90.0
     if len(zones) >= 2:
         a0 = np.asarray(zones[0]["axis_crystal_xyz"], dtype=float)
@@ -1599,31 +1613,33 @@ def _build_lattice_ladder_steps(
             "n_total": len(all_ids),
             "fraction_indexed": round(len(z12_peaks) / n_total, 4),
             "rms_deg": round(
-                float(np.mean([z["angular_rms_deg"] for z in zones[:2]]))
-                if zones
+                float(np.mean([z["angular_rms_deg"] for z in z12_slice]))
+                if z12_slice
                 else overall_rms,
                 3,
             ),
             "zone_tol_deg": 0.5,
             "psi_deg": round(psi_deg, 2),
             "description": (
-                f"Two intersecting zone families ({z0_label} and {z1_label}, ψ = {psi_deg:.1f}°) "
+                f"Intersecting zone families ({z0_label} and {z1_label}, ψ = {psi_deg:.1f}°, {len(z12_ids)} zones shown) "
                 "lock 3D crystal orientation and global detector geometry."
             ),
         }
     )
 
-    z_const_ids = [z["zone_id"] for z in zones[: min(6, len(zones))]]
-    z_const_peaks = sorted(
-        {pid for z in zones[: min(6, len(zones))] for pid in z["member_peak_ids"]}
-    )
+    ord1_zones = [z for z in zones if z.get("order", 1) <= 1]
+    z_const_slice = ord1_zones if ord1_zones else zones[: min(13, len(zones))]
+    z_const_ids = [z["zone_id"] for z in z_const_slice]
+    z_const_peaks = sorted({pid for z in z_const_slice for pid in z["member_peak_ids"]})
     if "cell" in stages_map or "120-zones" in stages_map:
         st_c = stages_map.get("cell", stages_map.get("120-zones", {}))
         s4_stage = "4. 120→400 Zone + Cell"
         s4_sub = f"Staged band + cell/per-run • score={-float(st_c.get('objective', 0.0)):.3f} ({int(st_c.get('iterations', 0))} iters)"
     else:
         s4_stage = "4. Multi-Zone Refinement"
-        s4_sub = f"{len(z_const_ids)} major zones capture {len(z_const_peaks)} spots"
+        s4_sub = (
+            f"{len(z_const_ids)} fundamental zones capture {len(z_const_peaks)} spots"
+        )
     steps.append(
         {
             "rung": 4,
@@ -1635,22 +1651,22 @@ def _build_lattice_ladder_steps(
             "n_total": len(all_ids),
             "fraction_indexed": round(len(z_const_peaks) / n_total, 4),
             "rms_deg": round(
-                float(
-                    np.mean([z["angular_rms_deg"] for z in zones[: min(6, len(zones))]])
-                )
-                if zones
+                float(np.mean([z["angular_rms_deg"] for z in z_const_slice]))
+                if z_const_slice
                 else overall_rms,
                 3,
             ),
             "zone_tol_deg": 0.3,
             "description": (
-                f"Staged 120→400 zone-band refinement adds higher-order zones ({len(z_const_ids)} shown), "
+                f"Staged 120→400 zone-band refinement locks all fundamental zones ({len(z_const_ids)} shown), "
                 "co-refining axial stretch, per-run ω drift, and unit-cell ratios."
             ),
         }
     )
 
-    all_zone_ids = [z["zone_id"] for z in zones]
+    all_zone_ids = [z["zone_id"] for z in z_const_slice] or [
+        z["zone_id"] for z in zones
+    ]
     cell_str = (
         f"a={cell[0]:.2f}, b={cell[1]:.2f}, c={cell[2]:.2f} Å"
         if cell and len(cell) == 6
@@ -1830,6 +1846,8 @@ def build_rainbow_zone_payload(
     max_peaks: int = 2500,
     render_binning: int = 4,
     frame_index: int | None = None,
+    include_panels: bool = True,
+    include_peaks: bool = True,
 ) -> dict[str, Any]:
     """Build the JSON-serializable data contract for the Rainbow Zones widget.
 
@@ -1860,7 +1878,10 @@ def build_rainbow_zone_payload(
 
     if replay_h5 is not None:
         extracted = _extract_from_h5(
-            replay_h5, images_h5=images_h5, frame_index=frame_index
+            replay_h5,
+            images_h5=images_h5,
+            frame_index=frame_index,
+            include_peaks=include_peaks,
         )
         instrument = extracted["instrument"] or instrument
         ki = extracted["ki"]
@@ -2052,7 +2073,7 @@ def build_rainbow_zone_payload(
             else min(min_zone_peaks, max(1, n_peaks)),
             n_arc=n_arc,
         )
-        if n_peaks > 0
+        if (n_peaks > 0 or ub_matrix is not None)
         else []
     )
     for z in raw_zones:
@@ -2069,12 +2090,20 @@ def build_rainbow_zone_payload(
     z_ord2 = [
         z
         for z in raw_zones
-        if z["order"] == 2 and z["n_peaks"] >= max(1, min_zone_peaks)
+        if z["order"] == 2
+        and (
+            z["n_peaks"] >= max(1, min_zone_peaks)
+            or (n_peaks == 0 and len(z["conic"]["det_x"]) > 0)
+        )
     ][:14]
     z_ord3 = [
         z
         for z in raw_zones
-        if z["order"] == 3 and z["n_peaks"] >= max(2, min_zone_peaks)
+        if z["order"] == 3
+        and (
+            z["n_peaks"] >= max(2, min_zone_peaks)
+            or (n_peaks == 0 and len(z["conic"]["det_x"]) > 0)
+        )
     ][:16]
     selected_zones.extend(z_ord1)
     selected_zones.extend(z_ord2)
@@ -2388,17 +2417,20 @@ def build_rainbow_zone_payload(
             }
         )
 
-    panels_payload, intensity_source = _encode_panel_textures(
-        detectors=detectors,
-        bank_arr=bank_arr,
-        pixel_r_arr=pixel_r_arr,
-        pixel_c_arr=pixel_c_arr,
-        intensity_arr=intensity_arr,
-        sigma_arr=sigma_arr,
-        images_h5=images_h5,
-        render_binning=render_binning,
-        frame_slice=frame_slice,
-    )
+    if include_panels:
+        panels_payload, intensity_source = _encode_panel_textures(
+            detectors=detectors,
+            bank_arr=bank_arr,
+            pixel_r_arr=pixel_r_arr,
+            pixel_c_arr=pixel_c_arr,
+            intensity_arr=intensity_arr,
+            sigma_arr=sigma_arr,
+            images_h5=images_h5,
+            render_binning=render_binning,
+            frame_slice=frame_slice,
+        )
+    else:
+        panels_payload, intensity_source = [], "raw_h5"
 
     ladder_steps = _build_lattice_ladder_steps(
         zones_payload,
@@ -2534,11 +2566,15 @@ def render_rainbow_html(
     padding: 0;
   }}
 
-  body {{
+  html, body {{
     background: var(--bg-primary);
     color: var(--text-main);
     font-family: var(--font-body);
-    height: 100vh;
+    width: 100%;
+    height: 100%;
+    max-height: 100dvh;
+    margin: 0;
+    padding: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -2552,10 +2588,11 @@ def render_rainbow_html(
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    padding: 5px 12px;
+    padding: 3px 10px;
     background: var(--bg-panel);
     border-bottom: 1px solid var(--border-color);
-    min-height: 38px;
+    min-height: 32px;
+    flex-shrink: 0;
   }}
 
   .brand-block {{
@@ -2661,11 +2698,13 @@ def render_rainbow_html(
   /* Main Workspace: Maximize Hero Detector + Compact Right Sidebar */
   .workspace {{
     display: grid;
-    grid-template-columns: 1fr 264px;
-    gap: 6px;
-    padding: 6px 8px;
-    flex: 1;
+    grid-template-columns: minmax(0, 1fr) 224px;
+    grid-template-rows: minmax(0, 1fr);
+    gap: 5px;
+    padding: 4px 8px;
+    flex: 1 1 0;
     min-height: 0;
+    overflow: hidden;
   }}
 
   .canvas-card {{
@@ -2674,6 +2713,7 @@ def render_rainbow_html(
     border-radius: 6px;
     display: flex;
     flex-direction: column;
+    min-height: 0;
     overflow: hidden;
     position: relative;
   }}
@@ -2751,23 +2791,24 @@ def render_rainbow_html(
   .side-panel {{
     background: var(--bg-panel);
     border: 1px solid var(--border-color);
-    border-radius: 8px;
+    border-radius: 6px;
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    padding: 8px;
+    gap: 5px;
+    padding: 6px;
+    min-height: 0;
     overflow: hidden;
   }}
 
   .section-title {{
     font-family: var(--font-display);
-    font-size: 0.75rem;
+    font-size: 0.66rem;
     text-transform: uppercase;
-    letter-spacing: 0.6px;
+    letter-spacing: 0.4px;
     color: var(--accent-gold);
     border-bottom: 1px solid var(--border-color);
-    padding-bottom: 4px;
-    margin-bottom: 6px;
+    padding-bottom: 2px;
+    margin-bottom: 3px;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -2776,10 +2817,10 @@ def render_rainbow_html(
   .slider-group {{
     display: flex;
     flex-direction: column;
-    gap: 5px;
+    gap: 3px;
     background: var(--bg-card);
-    padding: 8px 10px;
-    border-radius: 6px;
+    padding: 5px 7px;
+    border-radius: 5px;
     border: 1px solid var(--border-color);
   }}
 
@@ -2787,20 +2828,21 @@ def render_rainbow_html(
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 0.73rem;
+    font-size: 0.66rem;
   }}
 
   input[type="range"] {{
     width: 100%;
+    height: 12px;
     accent-color: var(--accent-cyan);
     cursor: pointer;
   }}
 
   .zone-list {{
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    max-height: 150px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 3px;
+    max-height: 92px;
     overflow-y: auto;
   }}
 
@@ -2808,12 +2850,13 @@ def render_rainbow_html(
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 5px 8px;
-    border-radius: 5px;
+    padding: 2px 5px;
+    border-radius: 4px;
     background: var(--bg-card);
     border: 1px solid transparent;
     cursor: pointer;
-    font-size: 0.75rem;
+    font-size: 0.62rem;
+    min-width: 0;
   }}
 
   .zone-item:hover {{
@@ -2826,11 +2869,12 @@ def render_rainbow_html(
   }}
 
   .zone-swatch {{
-    width: 11px;
-    height: 11px;
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
     display: inline-block;
-    margin-right: 7px;
+    margin-right: 4px;
+    flex-shrink: 0;
   }}
 
   .inspector-box {{
@@ -2847,10 +2891,11 @@ def render_rainbow_html(
   .ladder-bar {{
     background: var(--bg-panel);
     border-top: 1px solid var(--border-color);
-    padding: 4px 8px 6px 8px;
+    padding: 3px 8px 4px 8px;
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 3px;
+    flex-shrink: 0;
   }}
 
   .stage-pill {{
@@ -2890,13 +2935,13 @@ def render_rainbow_html(
     background: #04060c;
     border: 1px solid #1e293b;
     border-radius: 5px;
-    padding: 6px 8px;
-    font-size: 0.62rem;
-    line-height: 1.38;
+    padding: 5px 7px;
+    font-size: 0.6rem;
+    line-height: 1.32;
     font-family: var(--font-display);
     color: #cbd5e1;
-    flex: 1;
-    min-height: 120px;
+    flex: 1 1 0;
+    min-height: 0;
     overflow-y: auto;
     white-space: pre-wrap;
     word-break: break-all;
@@ -3156,19 +3201,19 @@ def render_rainbow_html(
 
       <div>
         <div class="section-title">
-          <span>Laue Zone Arcs [uvw]</span>
-          <div style="display:flex;gap:4px;">
-            <button id="btn-order-1" class="active-btn" style="padding:2px 6px;font-size:0.65rem;" title="Fundamental zones |u|,|v|,|w| ≤ 1">≤1</button>
-            <button id="btn-order-2" style="padding:2px 6px;font-size:0.65rem;" title="Include 2nd-order zones |u|,|v|,|w| ≤ 2">≤2</button>
-            <button id="btn-order-3" style="padding:2px 6px;font-size:0.65rem;" title="Include higher-order zones |u|,|v|,|w| ≤ 3">≤3</button>
-            <button id="btn-zones-all" style="padding:2px 6px;font-size:0.65rem;" title="Enable all zones in current order">ALL</button>
-            <button id="btn-zones-none" style="padding:2px 6px;font-size:0.65rem;" title="Hide all zone arcs">NONE</button>
+          <span>Laue Zones [uvw]</span>
+          <div style="display:flex;gap:2px;">
+            <button id="btn-order-1" class="active-btn" style="padding:1px 4px;font-size:0.58rem;" title="Fundamental zones |u|,|v|,|w| ≤ 1">≤1</button>
+            <button id="btn-order-2" style="padding:1px 4px;font-size:0.58rem;" title="Include 2nd-order zones |u|,|v|,|w| ≤ 2">≤2</button>
+            <button id="btn-order-3" style="padding:1px 4px;font-size:0.58rem;" title="Include higher-order zones |u|,|v|,|w| ≤ 3">≤3</button>
+            <button id="btn-zones-all" style="padding:1px 4px;font-size:0.58rem;" title="Enable all zones in current order">ALL</button>
+            <button id="btn-zones-none" style="padding:1px 4px;font-size:0.58rem;" title="Hide all zone arcs">NONE</button>
           </div>
         </div>
         <div class="zone-list" id="zone-list"></div>
       </div>
 
-      <div style="display:flex;flex-direction:column;flex:1;min-height:140px;">
+      <div style="display:flex;flex-direction:column;flex:1 1 0;min-height:0;">
         <div class="section-title">
           <span>&gt;_ Terminal // Stdio</span>
           <span id="cell-summary" style="font-size:0.62rem;color:var(--accent-pink);">IDLE</span>
@@ -3569,15 +3614,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const isAct = state.activeZones.has(z.zone_id);
       item.className = "zone-item" + (isAct ? " zone-active" : "");
       const color = z.rainbow_color;
-      const ordTag = `ord ${{z.order || 1}}`;
+      const rightStat = z.n_peaks > 0 ? `${{z.n_peaks}}p` : `o${{z.order || 1}}`;
+      item.title = `${{z.label}} (order ${{z.order || 1}}) • ${{z.n_peaks}} spots • Δθ=${{z.angular_rms_deg.toFixed(2)}}°`;
       item.innerHTML = `
-        <div style="display:flex;align-items:center;">
+        <div style="display:flex;align-items:center;min-width:0;overflow:hidden;">
           <span class="zone-swatch" style="background:${{color}};"></span>
-          <strong style="font-family:var(--font-display);">${{z.label}}</strong>
-          <span style="margin-left:6px;font-size:0.62rem;color:var(--text-dim);font-family:var(--font-display);">(${{ordTag}})</span>
+          <strong style="font-family:var(--font-display);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${{z.label}}</strong>
         </div>
-        <span style="color:var(--text-dim);font-family:var(--font-display);font-size:0.7rem;">
-          ${{z.n_peaks}} spots • ${{z.angular_rms_deg.toFixed(2)}}°
+        <span style="color:var(--text-dim);font-family:var(--font-display);font-size:0.58rem;margin-left:3px;flex-shrink:0;">
+          ${{rightStat}}
         </span>
       `;
       item.addEventListener("click", (ev) => {{
@@ -5920,7 +5965,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (jobObj.stdout || jobObj.stderr) {{
           appendTerminalLog((jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : ""), true);
         }}
-        if (stageId === "solve") selectLadderRung(0, false);
+        if (stageId === "solve") {{
+          PEAKS.length = 0;
+          ZONES.length = 0;
+          state.activeZones = new Set();
+          selectLadderRung(0, false);
+          renderZoneList();
+          updateHUD();
+        }}
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
         let lastPartialSeq = 0;
         galaxyBridge.pollTimer = setInterval(async () => {{
@@ -5940,18 +5992,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             ) {{
               lastPartialSeq = aj.partial_overlay.seq;
               if (Array.isArray(aj.partial_overlay.zones) && aj.partial_overlay.zones.length > 0) {{
-                ZONES = aj.partial_overlay.zones;
+                ZONES.length = 0;
+                aj.partial_overlay.zones.forEach(z => ZONES.push(z));
               }}
-              if (Array.isArray(aj.partial_overlay.peaks) && aj.partial_overlay.peaks.length > 0) {{
-                PEAKS = aj.partial_overlay.peaks;
+              if (Array.isArray(aj.partial_overlay.peaks)) {{
+                PEAKS.length = 0;
+                aj.partial_overlay.peaks.forEach(p => PEAKS.push(p));
               }}
               if (Array.isArray(aj.partial_overlay.ladder_steps) && aj.partial_overlay.ladder_steps.length > 0) {{
-                LADDER = aj.partial_overlay.ladder_steps;
+                LADDER.length = 0;
+                aj.partial_overlay.ladder_steps.forEach(s => LADDER.push(s));
               }}
+              const targetRung = Math.max(1, typeof aj.ladder_rung_idx === "number" ? aj.ladder_rung_idx : 1);
+              selectLadderRung(targetRung, false);
               renderZoneList();
               renderLadder();
-            }}
-            if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
+              updateHUD();
+            }} else if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
             if (cellSummary) cellSummary.textContent = `${{aj.mode === "galaxy" ? "PULSAR" : "SUBHKL"}} [${{(aj.state || "running").toUpperCase()}}]`;

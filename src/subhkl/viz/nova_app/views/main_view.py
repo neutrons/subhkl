@@ -112,7 +112,9 @@ class MainApp:
             frame_q = request.rel_url.query.get("frame")
             if frame_q is not None and str(frame_q).strip() != "":
                 try:
-                    self.view_model.model.subhkl.refresh_payload(frame_index=int(frame_q))
+                    self.view_model.model.subhkl.refresh_payload(
+                        frame_index=int(frame_q)
+                    )
                 except Exception:
                     pass
             return web.json_response(self.view_model.model.subhkl.payload or {})
@@ -234,9 +236,14 @@ class MainApp:
                                 break
                             f_out.write(chunk)
                     saved_paths.append(dest_path)
-                if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(".nxs.h5"):
+                if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(
+                    ".nxs.h5"
+                ):
                     sp = saved_paths[0]
-                    if "merged" in os.path.basename(sp).lower() or "scan" in os.path.basename(sp).lower():
+                    if (
+                        "merged" in os.path.basename(sp).lower()
+                        or "scan" in os.path.basename(sp).lower()
+                    ):
                         self.view_model.model.subhkl.data.images_file = sp
                     self.view_model.model.subhkl.data.peaks_file = sp
                     self.view_model.model.subhkl.refresh_payload()
@@ -282,7 +289,10 @@ class MainApp:
                         found = direct
                         break
                     for sub_cand in _glob.glob(os.path.join(sdir, "*", fname)):
-                        if os.path.isfile(sub_cand) and os.path.getsize(sub_cand) == fsize:
+                        if (
+                            os.path.isfile(sub_cand)
+                            and os.path.getsize(sub_cand) == fsize
+                        ):
                             found = sub_cand
                             break
                     if found:
@@ -291,7 +301,8 @@ class MainApp:
                     matched_paths.append(found)
             return web.json_response(
                 {
-                    "matched": len(matched_paths) == len(req_files) and len(matched_paths) > 0,
+                    "matched": len(matched_paths) == len(req_files)
+                    and len(matched_paths) > 0,
                     "matched_paths": matched_paths,
                 }
             )
@@ -312,8 +323,12 @@ class MainApp:
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
                 web.post("/api/pipeline/upload_h5", handle_upload_h5),
-                web.post("/api/pipeline/resolve_local_files", handle_resolve_local_files),
-                web.post("/api/pipeline/check_neutron_paths", handle_check_neutron_paths),
+                web.post(
+                    "/api/pipeline/resolve_local_files", handle_resolve_local_files
+                ),
+                web.post(
+                    "/api/pipeline/check_neutron_paths", handle_check_neutron_paths
+                ),
                 web.get("/subhkl_parallax.html", handle_standalone_html),
             ]
         )
@@ -332,11 +347,10 @@ class MainApp:
         self.state.trame__title = "SUBHKL // Diffraction Parallax"
         with DivLayout(self.server) as layout:
             layout.root.style = (
-                "margin: 0; padding: 0; width: 100vw; height: 100vh; "
-                "overflow: hidden; background: #070913;"
+                "position: fixed; inset: 0; margin: 0; padding: 0; "
+                "width: 100%; height: 100%; overflow: hidden; background: #070913;"
             )
             html.Iframe(
                 srcdoc=("parallax_html",),
-                style="width: 100vw; height: 100vh; border: none; display: block;",
+                style="width: 100%; height: 100%; border: none; display: block;",
             )
-

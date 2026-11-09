@@ -1569,6 +1569,16 @@ class NovaGalaxyPipelineRunner:
             for d in mount_dirs:
                 if os.path.isdir(d):
                     cmd.extend(["-v", f"{d}:{d}"])
+            local_subhkl_pkg = os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))
+            )
+            if os.path.isdir(local_subhkl_pkg):
+                cmd.extend(
+                    [
+                        "-v",
+                        f"{local_subhkl_pkg}:/usr/local/lib/python3.13/site-packages/subhkl:ro",
+                    ]
+                )
             cmd.append(container_image)
             cmd.extend(inner_cmd)
         else:
@@ -1651,23 +1661,33 @@ class NovaGalaxyPipelineRunner:
                 assert proc.stdout is not None
                 blind_src = out_h5[:-3] + ".blind.h5"
                 blind_dst = solve_dest[:-3] + ".blind.h5"
-                blind_synced = False
+                last_blind_mtime = 0.0
+                partial_seq = 0
                 for line in proc.stdout:
                     job_record["stdout"] = (job_record.get("stdout", "") + line)[
                         -24000:
                     ]
                     low = line.lower()
                     if stage_id == "solve":
-                        if "full-data scores" in low or "joint band refinement" in low:
+                        trigger_blind_sync = False
+                        if "exhaustive rung" in low or "rung 13 zones" in low:
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 1
                             )
-                        elif "global" in low or "60-zone" in low or "stage 0" in low:
+                            trigger_blind_sync = True
+                        elif "rung 30 zones" in low or "rung 60 zones" in low:
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 2
                             )
+                            trigger_blind_sync = True
                         elif (
-                            "120" in low
+                            "rung 145 zones" in low
+                            or "joint band refinement" in low
+                            or "full-data scores" in low
+                            or "global" in low
+                            or "60-zone" in low
+                            or "stage 0" in low
+                            or "120" in low
                             or "cell" in low
                             or "stage 1" in low
                             or "stage 3" in low
@@ -1675,37 +1695,45 @@ class NovaGalaxyPipelineRunner:
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 3
                             )
+                            trigger_blind_sync = True
                         if (
-                            not blind_synced
-                            and (
-                                "band fit:" in low
-                                or "stage 0" in low
-                                or "60-zone" in low
-                            )
+                            trigger_blind_sync
                             and os.path.isfile(blind_src)
                             and os.path.getsize(blind_src) > 0
                         ):
                             try:
-                                shutil.copy2(blind_src, blind_dst)
-                                blind_synced = True
-                                from subhkl.viz.rainbow_zones import (
-                                    build_rainbow_zone_payload,
-                                )
+                                cur_mtime = os.path.getmtime(blind_src)
+                                if cur_mtime > last_blind_mtime:
+                                    last_blind_mtime = cur_mtime
+                                    shutil.copy2(blind_src, blind_dst)
+                                    from subhkl.viz.rainbow_zones import (
+                                        build_rainbow_zone_payload,
+                                    )
 
-                                p_blind = build_rainbow_zone_payload(
-                                    replay_h5=blind_dst,
-                                    images_h5=merged_path,
-                                    instrument=str(inst),
-                                    space_group=str(sg),
-                                    cell=[float(x) for x in raw_cell[:6]],
-                                )
-                                if p_blind.get("zones"):
-                                    job_record["partial_overlay"] = {
-                                        "seq": 1,
-                                        "zones": p_blind.get("zones", []),
-                                        "peaks": p_blind.get("peaks", []),
-                                        "ladder_steps": p_blind.get("ladder_steps", []),
-                                    }
+                                    p_blind = build_rainbow_zone_payload(
+                                        replay_h5=blind_dst,
+                                        images_h5=merged_path,
+                                        instrument=str(inst),
+                                        space_group=str(sg),
+                                        cell=[float(x) for x in raw_cell[:6]],
+                                        wavelength_range=(
+                                            float(wl[0]),
+                                            float(wl[1]),
+                                        ),
+                                        include_panels=False,
+                                        include_peaks=False,
+                                        n_arc=240,
+                                    )
+                                    if p_blind.get("zones"):
+                                        partial_seq += 1
+                                        job_record["partial_overlay"] = {
+                                            "seq": partial_seq,
+                                            "zones": p_blind.get("zones", []),
+                                            "peaks": [],
+                                            "ladder_steps": p_blind.get(
+                                                "ladder_steps", []
+                                            ),
+                                        }
                             except Exception:
                                 pass
                 rc = proc.wait()

@@ -121,6 +121,29 @@ def discover(args, samples=16384, candidates=6, seed=0):
     q = xyz / np.linalg.norm(xyz, axis=1, keepdims=True) - [0, 0, 1]
     lab = q / np.linalg.norm(q, axis=1, keepdims=True)
     directions = np.einsum("nji,nj->ni", rotations, lab)
+    blind_path = Path(args.output).with_suffix(".blind.h5")
+
+    def _write_blind_rung(stage_label: str, nz_val: int, u_cand: np.ndarray) -> None:
+        tmp_path = blind_path.with_suffix(".blind.tmp.h5")
+        try:
+            with h5py.File(tmp_path, "w") as bf:
+                bf["sample/U"] = np.asarray(u_cand, dtype=float)
+                bf["sample/B"] = np.asarray(B, dtype=float)
+                bf["sample/cell"] = np.asarray(args.cell, dtype=float)
+                bf["sample/space_group"] = str(args.space_group)
+                bf["instrument/wavelength"] = np.asarray(
+                    [args.wl_min, args.wl_max], dtype=float
+                )
+                sg = bf.create_group("search")
+                sg.attrs["source"] = str(Path(args.input).resolve())
+                sg.attrs["instrument"] = str(args.instrument)
+                sg.attrs["d_min"] = float(args.d_min)
+                sg.attrs["ladder_stage"] = str(stage_label)
+                sg.attrs["ladder_zones"] = int(nz_val)
+            tmp_path.replace(blind_path)
+        except Exception:
+            pass
+
     found = lattice_ladder(
         directions,
         sampled_weights,
@@ -140,6 +163,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
         seed=seed,
         verbose=True,
         space_group=args.space_group,
+        on_rung=_write_blind_rung,
     )
     found = distinct_orientations(found, B, args.space_group, candidates)
     if not found:
