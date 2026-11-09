@@ -109,24 +109,39 @@ class NovaGalaxyPipelineRunner:
 
     def _auto_discover_local_galaxy(self) -> None:
         """Auto-discover local Planemo / Galaxy server if env vars were not injected."""
+        if self.galaxy_url and self.galaxy_url.startswith("https://"):
+            http_alt = "http://" + self.galaxy_url[len("https://") :]
+            if (
+                any(h in self.galaxy_url for h in ("localhost", "127.0.0.1"))
+                and not self._is_galaxy_server(self.galaxy_url)
+                and self._is_galaxy_server(http_alt)
+            ):
+                self.galaxy_url = http_alt
+
         if not self.galaxy_url:
             for candidate in ("http://127.0.0.1:9090", "http://localhost:9090"):
                 if self._is_galaxy_server(candidate):
                     self.galaxy_url = candidate
                     break
 
-        if self.galaxy_url and not self.galaxy_api_key:
+        if self.galaxy_url and (
+            not self.galaxy_api_key or self.galaxy_api_key == "test_key"
+        ):
             # Check if Planemo's default master_api_key ('test_key') can mint/fetch a user key
             try:
                 users = self._api_request("GET", "/api/users", api_key="test_key")
                 if isinstance(users, list) and users:
                     uid = users[0]["id"]
                     ukey = self._api_request(
-                        "POST", f"/api/users/{uid}/api_key", api_key="test_key"
+                        "GET", f"/api/users/{uid}/api_key", api_key="test_key"
                     )
+                    if not (isinstance(ukey, str) and ukey):
+                        ukey = self._api_request(
+                            "POST", f"/api/users/{uid}/api_key", api_key="test_key"
+                        )
                     if isinstance(ukey, str) and ukey:
                         self.galaxy_api_key = ukey
-                    else:
+                    elif not self.galaxy_api_key:
                         self.galaxy_api_key = "test_key"
             except Exception:
                 pass
@@ -215,6 +230,8 @@ class NovaGalaxyPipelineRunner:
         from nova.galaxy import Connection
 
         conn = Connection(self.galaxy_url, self.galaxy_api_key)
+        # Preserve explicit port (e.g. :9090 for local Planemo/Galaxy) stripped by nova.galaxy.Connection.__init__
+        conn.galaxy_url = self.galaxy_url
         self._conn_helper = conn.connect()
         return self._conn_helper
 
@@ -312,6 +329,8 @@ class NovaGalaxyPipelineRunner:
                     gi.datasets.wait_for_dataset(ds_id, maxwait=120, interval=2.0, check=True)
                     return ds_id
 
+        if file_ext == "mtz":
+            file_ext = "binary"
         is_local_gx = any(
             h in (getattr(gi, "base_url", "") or self.galaxy_url or "")
             for h in ("127.0.0.1", "localhost")
@@ -810,7 +829,7 @@ class NovaGalaxyPipelineRunner:
                                     )
                                 if os.path.isfile(mtz_dest):
                                     self._ensure_galaxy_h5_dataset(
-                                        store, mtz_dest, job_record, force_upload=True, file_ext="mtz"
+                                        store, mtz_dest, job_record, force_upload=True, file_ext="binary"
                                     )
                             except Exception as up_exc:
                                 job_record["stdout"] += (
