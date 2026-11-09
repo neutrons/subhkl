@@ -2887,7 +2887,7 @@ class NovaGalaxyPipelineRunner:
                     "    _gonio.get_rotation_data_from_nexus = _patched_get_rot\n"
                     "    _orig_cd = h5py.File.create_dataset\n"
                     "    def _lzf_cd(self, name, shape=None, dtype=None, data=None, **kw):\n"
-                    "        sh = shape if shape is not None else (data.shape if data is not None else ())\n"
+                    "        sh = shape if shape is not None else getattr(data, 'shape', ())\n"
                     "        if name == 'images' and len(sh) >= 3 and sh[0] > 0:\n"
                     "            kw.setdefault('compression', 'lzf')\n"
                     "            kw.setdefault('chunks', (1,) + tuple(sh[1:]))\n"
