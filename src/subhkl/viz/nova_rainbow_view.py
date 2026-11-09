@@ -2120,11 +2120,22 @@ class NovaGalaxyPipelineRunner:
                 "        except Exception: pass\n"
                 "print('[careless] Merge summary:', json.dumps(summary))\n"
             )
+            prep_script = os.path.join(merge_work, "prep_merge.py")
+            post_script = os.path.join(merge_work, "post_merge.py")
+            with open(prep_script, "w", encoding="utf-8") as fh:
+                fh.write(prep_py)
+            with open(post_script, "w", encoding="utf-8") as fh:
+                fh.write(post_py)
+            try:
+                os.chmod(prep_script, 0o666)
+                os.chmod(post_script, 0o666)
+            except Exception:
+                pass
             chained_merge = (
                 f"set -e; "
-                f"MKEYS=$(python -c {shlex.quote(prep_py)}) && "
+                f"MKEYS=$(python {shlex.quote(prep_script)}) && "
                 f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
-                f"python -c {shlex.quote(post_py)}"
+                f"python {shlex.quote(post_script)}"
             )
             inner_cmd = ["bash", "-c", chained_merge]
         else:
@@ -2223,14 +2234,15 @@ class NovaGalaxyPipelineRunner:
             gpu_info = "CPU fallback"
 
         host_tag = socket.gethostname()
-        header_lines = []
-        if fallback_reason and existing_job_record is None:
-            header_lines.append(f"[ndip] Note: {fallback_reason}")
-        header_lines.append(
-            f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
-        )
         cmd_str = " ".join(cmd)
-        header_lines.append(f"$ {cmd_str}\n")
+        header_lines: list[str] = []
+        if stage_id != "merge":
+            if fallback_reason and existing_job_record is None:
+                header_lines.append(f"[ndip] Note: {fallback_reason}")
+            header_lines.append(
+                f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
+            )
+            header_lines.append(f"$ {cmd_str}\n")
 
         job_id = f"gpu-{int(time.time())}"
         if existing_job_record is not None:
@@ -2239,9 +2251,12 @@ class NovaGalaxyPipelineRunner:
             job_record["mode"] = "container_gpu"
             job_record["state"] = "running"
             job_record["command_line"] = cmd_str
-            job_record["stdout"] = (
-                job_record.get("stdout", "") + "\n".join(header_lines)
-            )[-24000:]
+            if stage_id == "merge":
+                job_record["stdout"] = ""
+            else:
+                job_record["stdout"] = (
+                    job_record.get("stdout", "") + "\n".join(header_lines)
+                )[-24000:]
         else:
             job_record = {
                 "job_id": job_id,
@@ -2250,7 +2265,7 @@ class NovaGalaxyPipelineRunner:
                 "mode": "container_gpu",
                 "state": "running",
                 "command_line": cmd_str,
-                "stdout": "\n".join(header_lines),
+                "stdout": "" if stage_id == "merge" else "\n".join(header_lines),
                 "stderr": "",
                 "ladder_rung_idx": 0 if stage_id == "solve" else 4,
                 "outputs": [
@@ -2642,12 +2657,16 @@ class NovaGalaxyPipelineRunner:
                 err_txt = (
                     console_err or jinfo.get("tool_stderr") or jinfo.get("stderr") or ""
                 )
-                cmd_header = (
-                    f"$ {job_record['command_line']}\n"
-                    if job_record.get("command_line")
-                    else ""
-                )
-                job_record["stdout"] = f"{base_log}{cmd_header}{out_txt}"[-24000:]
+                if job_record.get("stage_id") == "merge":
+                    job_record["stdout"] = out_txt[-24000:]
+                else:
+                    raw_cmd = str(job_record.get("command_line") or "").strip()
+                    cmd_header = (
+                        f"$ {raw_cmd}\n"
+                        if raw_cmd and "\n" not in raw_cmd and "PYEOF" not in raw_cmd
+                        else ""
+                    )
+                    job_record["stdout"] = f"{base_log}{cmd_header}{out_txt}"[-24000:]
                 if err_txt:
                     job_record["stderr"] = err_txt[-16000:]
 

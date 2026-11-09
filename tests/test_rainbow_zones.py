@@ -502,10 +502,13 @@ def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     assert payload["sample_peaks"][1]["harmonic_multiplicity"] == 2
     assert "careless_residual" in payload["sample_peaks"][0]
     assert "careless_scale" in payload["sample_peaks"][0]
+    assert "q_hat_lab" in payload["sample_peaks"][0]
+    assert "goniometer_R" in payload and len(payload["goniometer_R"]) == 3
 
     html = render_rainbow_html(payload)
     assert "btn-wulff-scope" in html
-    assert "btn-wulff-couple" in html
+    assert "btn-wulff-frame" in html
+    assert "btn-wulff-couple" not in html
     assert "sel-wulff-color" in html
     assert "wulff-merge-bar" in html
     assert "btn-files-toggle" in html
