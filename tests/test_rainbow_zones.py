@@ -476,6 +476,93 @@ def test_predictor_and_integrator_ellipses_and_galaxy_dataset_loading(tmp_path):
     html = render_rainbow_html(p_aniso)
     assert "api/payload?dataset_id=" in html
     assert "INTEGRATED • 3D TENSOR ELLIPSES" in html
+    assert "__action_neutron_data__" in html
+    assert "__action_local_file__" in html
+    assert 'id="modal-neutron-data"' in html
+
+
+def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
+    """Verify merged.h5 sets pending_stage='solve' and CG4D /entry/title goniometer angles are harvested."""
+    import h5py
+    import pytest
+    from subhkl.instrument.goniometer import (
+        get_rotation_data_from_nexus,
+        harvest_goniometer_angles_from_title,
+    )
+
+    # 1. Verify regex harvesting for all CG4D /entry/title formats
+    assert harvest_goniometer_angles_from_title(
+        "Beta-Lac crystal, Omega = 110 degrees"
+    ) == {"omega": 110.0}
+    assert harvest_goniometer_angles_from_title(
+        "beta lac axis2 = 92 degrees"
+    ) == {"omega": 92.0}
+    assert harvest_goniometer_angles_from_title(
+        "Garnet axis0 = 82 degrees, axis1 = -15.5 degrees"
+    ) == {"phi": 82.0, "kappa": -15.5}
+
+    # 2. Verify get_rotation_data_from_nexus harvests /entry/title when CG4D:Mot:... is absent from DASlogs
+    raw_nxs = tmp_path / "CG4D_2625.nxs.h5"
+    with h5py.File(raw_nxs, "w") as f:
+        f.create_dataset("entry/title", data=np.array([b"Beta-Lac crystal, Omega = 110 degrees"]))
+        f.create_group("entry/DASlogs")
+
+    axes, angles, names = get_rotation_data_from_nexus(str(raw_nxs), "CG4D")
+    assert names == [
+        "CG4D:Mot:omega",
+        "CG4D:Mot:alpha",
+        "CG4D:Mot:kappa",
+        "CG4D:Mot:alpha",
+        "CG4D:Mot:phi",
+    ]
+    assert angles == pytest.approx([110.0, 45.0, 0.0, 45.0, 0.0])
+    assert len(axes) == 5
+
+    # 3. Verify merged.h5 (detector images + unit cell + space group + goniometer, no U) -> artifact_kind="merged", pending_stage="solve"
+    merged_h5 = tmp_path / "merged.h5"
+    with h5py.File(merged_h5, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f.create_dataset("sample/a", data=68.7)
+        f.create_dataset("sample/b", data=69.8)
+        f.create_dataset("sample/c", data=156.9)
+        f.create_dataset("sample/alpha", data=90.0)
+        f.create_dataset("sample/beta", data=90.0)
+        f.create_dataset("sample/gamma", data=90.0)
+        f.create_dataset("sample/space_group", data=b"P 21 21 21")
+        f.create_dataset("instrument/wavelength", data=np.array([2.8, 4.5]))
+        f.create_dataset(
+            "images", data=np.zeros((2, 1, 32, 32), dtype=np.float32)
+        )
+        f.create_dataset(
+            "goniometer/angles",
+            data=np.array(
+                [
+                    [110.0, 45.0, 0.0, 45.0, 0.0],
+                    [130.0, 45.0, 0.0, 45.0, 0.0],
+                ]
+            ),
+        )
+        f.create_dataset(
+            "goniometer/names",
+            data=np.array(
+                [
+                    b"CG4D:Mot:omega",
+                    b"CG4D:Mot:alpha",
+                    b"CG4D:Mot:kappa",
+                    b"CG4D:Mot:alpha",
+                    b"CG4D:Mot:phi",
+                ]
+            ),
+        )
+
+    p_merged = build_rainbow_zone_payload(replay_h5=merged_h5)
+    assert p_merged["artifact_kind"] == "merged"
+    assert p_merged["pending_stage"] == "solve"
+    assert p_merged["pipeline_stages"][0]["status"] == "completed"
+    assert p_merged["pipeline_stages"][1]["status"] == "pending"
+    assert len(p_merged["frames"]) == 2
+    assert "ω=110" in p_merged["goniometer_summary"]
+
 
 
 

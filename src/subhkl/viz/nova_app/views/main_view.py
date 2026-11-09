@@ -62,6 +62,23 @@ class MainApp:
             return web.json_response(doc)
 
         async def handle_payload(request: web.Request) -> web.Response:
+            fp_q = request.rel_url.query.get("file_path")
+            if fp_q is not None and str(fp_q).strip() != "":
+                try:
+                    local_h5 = os.path.abspath(str(fp_q).strip())
+                    if os.path.isfile(local_h5):
+                        ds_name = os.path.basename(local_h5).lower()
+                        if any(k in ds_name for k in ("merged", "scan", "image")):
+                            self.view_model.model.subhkl.data.images_file = local_h5
+                            self.view_model.model.subhkl.data.peaks_file = local_h5
+                        else:
+                            self.view_model.model.subhkl.data.peaks_file = local_h5
+                        self.view_model.model.subhkl.refresh_payload()
+                except Exception as exc:
+                    return web.json_response(
+                        {"status": "error", "error": str(exc)}, status=404
+                    )
+
             ds_id_q = request.rel_url.query.get("dataset_id")
             if ds_id_q is not None and str(ds_id_q).strip() != "":
                 try:
@@ -83,6 +100,7 @@ class MainApp:
                     ).lower()
                     if any(k in ds_name for k in ("merged", "scan", "image")):
                         self.view_model.model.subhkl.data.images_file = local_h5
+                        self.view_model.model.subhkl.data.peaks_file = local_h5
                     else:
                         self.view_model.model.subhkl.data.peaks_file = local_h5
                     self.view_model.model.subhkl.refresh_payload()
@@ -143,7 +161,26 @@ class MainApp:
             params.setdefault("images_file", data.images_file)
 
             def _on_complete(new_h5_path: str) -> None:
-                self.view_model.model.subhkl.data.peaks_file = new_h5_path
+                try:
+                    for attr in ("a", "b", "c", "alpha", "beta", "gamma"):
+                        if attr in params:
+                            setattr(data, attr, float(params[attr]))
+                    if "space_group" in params:
+                        data.space_group = str(params["space_group"])
+                    if "wavelength_min" in params:
+                        data.wavelength_min = float(params["wavelength_min"])
+                    if "wavelength_max" in params:
+                        data.wavelength_max = float(params["wavelength_max"])
+                except Exception:
+                    pass
+                if (
+                    stage_id == "reduce"
+                    or "merged" in os.path.basename(new_h5_path).lower()
+                ):
+                    self.view_model.model.subhkl.data.images_file = new_h5_path
+                    self.view_model.model.subhkl.data.peaks_file = new_h5_path
+                else:
+                    self.view_model.model.subhkl.data.peaks_file = new_h5_path
                 self.view_model.model.subhkl.refresh_payload()
 
             try:
@@ -156,12 +193,54 @@ class MainApp:
                     {"status": "error", "error": str(exc)}, status=400
                 )
 
+        async def handle_upload_h5(request: web.Request) -> web.Response:
+            import tempfile
+
+            try:
+                cur_peaks = self.view_model.model.subhkl.data.peaks_file
+                cur_imgs = self.view_model.model.subhkl.data.images_file
+                fb_dir = tempfile.gettempdir()
+                for p in (cur_peaks, cur_imgs):
+                    if p and os.path.isfile(p):
+                        fb_dir = os.path.dirname(os.path.abspath(p))
+                        break
+                reader = await request.multipart()
+                saved_paths: list[str] = []
+                while True:
+                    part = await reader.next()
+                    if part is None:
+                        break
+                    fname = part.filename
+                    if not fname:
+                        continue
+                    safe_name = os.path.basename(fname)
+                    dest_path = os.path.join(fb_dir, safe_name)
+                    with open(dest_path, "wb") as f_out:
+                        while True:
+                            chunk = await part.read_chunk()
+                            if not chunk:
+                                break
+                            f_out.write(chunk)
+                    saved_paths.append(dest_path)
+                if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(".nxs.h5"):
+                    sp = saved_paths[0]
+                    if "merged" in os.path.basename(sp).lower():
+                        self.view_model.model.subhkl.data.images_file = sp
+                    self.view_model.model.subhkl.data.peaks_file = sp
+                    self.view_model.model.subhkl.refresh_payload()
+                return web.json_response({"status": "ok", "saved_paths": saved_paths})
+            except Exception as exc:
+                return web.json_response(
+                    {"status": "error", "error": str(exc)}, status=400
+                )
+
         app.add_routes(
             [
                 web.get("/api/pipeline/status", handle_status),
                 web.get("/api/payload", handle_payload),
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
+                web.post("/api/pipeline/upload_h5", handle_upload_h5),
                 web.get("/subhkl_parallax.html", handle_standalone_html),
             ]
         )

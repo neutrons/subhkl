@@ -557,6 +557,16 @@ def _extract_from_h5(
         if gonio_angles_nom is None:
             gonio_angles_nom = gonio_angles_ref
 
+        if (
+            gonio_angles_nom is not None
+            and gonio_angles_nom.ndim == 2
+            and len(gonio_angles_nom) > 0
+        ):
+            if n_frames_total == 0:
+                n_frames_total = len(gonio_angles_nom)
+            if offsets is None:
+                offsets = np.arange(len(gonio_angles_nom), dtype=int)
+
         sym_map = {
             "omega": "ω",
             "phi": "φ",
@@ -799,6 +809,12 @@ def _extract_from_h5(
         elif "peaks/pixel_r" in f:
             artifact_kind = "finder"
             peak_shape_mode = "isotropic_circle"
+        elif "images" in f and U is None and "banks" not in f:
+            artifact_kind = "merged"
+            peak_shape_mode = "none"
+        elif "entry" in f and U is None:
+            artifact_kind = "raw_nexus"
+            peak_shape_mode = "none"
 
         # If multi-frame dataset has per-run peaks (e.g. integrated.h5), filter to active_frame
         if (
@@ -1437,6 +1453,18 @@ def _build_lattice_ladder_steps(
     return steps
 
 
+def _pending_stage_for_artifact_kind(artifact_kind: str | None) -> str:
+    """Return the pending pipeline stage ID given the currently loaded HDF5 artifact kind."""
+    kind = (artifact_kind or "solve").lower()
+    if kind == "raw_nexus":
+        return "reduce"
+    if kind == "merged":
+        return "solve"
+    if kind == "integrator":
+        return "merge"
+    return "integrate"
+
+
 def _build_ndip_pipeline_stages(
     peaks_list: list[dict[str, Any]],
     zones: list[dict[str, Any]],
@@ -1445,6 +1473,7 @@ def _build_ndip_pipeline_stages(
     space_group: str = "P 1",
     cell: list[float] | None = None,
     solve_diagnostics: dict[str, Any] | None = None,
+    artifact_kind: str = "solve",
 ) -> list[dict[str, Any]]:
     """Build the 4-stage coarse NDIP/Galaxy workflow pipeline descriptors."""
     n_peaks = len(peaks_list)
@@ -1456,25 +1485,41 @@ def _build_ndip_pipeline_stages(
         else space_group
     )
     is_finderless = bool(
-        solve_diagnostics and solve_diagnostics.get("stable_observations")
+        (solve_diagnostics and solve_diagnostics.get("stable_observations"))
+        or artifact_kind in ("merged", "raw_nexus")
     )
+    pending_stage = _pending_stage_for_artifact_kind(artifact_kind)
+    stage_order = ["reduce", "solve", "integrate", "merge"]
+    pending_idx = (
+        stage_order.index(pending_stage)
+        if pending_stage in stage_order
+        else 1
+    )
+
+    def _stage_status(idx: int) -> str:
+        if idx < pending_idx:
+            return "completed"
+        if idx == pending_idx:
+            return "pending"
+        return "ready"
+
     return [
         {
             "stage_id": "reduce",
             "step_num": 1,
             "name": "1. REDUCE & MERGE" if is_finderless else "1. REDUCE & FIND",
             "tool_ids": (
-                ["imaginex_subhkl_prepare_peaks"]
+                ["neutrons_load_data", "imaginex_subhkl_prepare_peaks"]
                 if is_finderless
                 else ["imaginex_subhkl_prepare_peaks", "imaginex_subhkl_peak_fit"]
             ),
             "container": "ghcr.io/neutrons/subhkl:1.4.0",
             "artifact": (
                 f"merged.h5 ({solve_diagnostics['stable_observations']:,} count bins)"
-                if is_finderless and solve_diagnostics
-                else f"scan_master.h5 → finder.h5 ({n_peaks} peaks)"
+                if is_finderless and solve_diagnostics and solve_diagnostics.get("stable_observations")
+                else ("merged.h5 (detector image stack)" if artifact_kind == "merged" else f"scan_master.h5 → finder.h5 ({n_peaks} peaks)")
             ),
-            "status": "completed",
+            "status": _stage_status(0),
             "ladder_rung_idx": 0,
             "summary": (
                 f"NDIP Image Reduction & Merge ({instrument}): "
@@ -1488,7 +1533,7 @@ def _build_ndip_pipeline_stages(
             "tool_ids": ["imaginex_subhkl_solve", "imaginex_subhkl"],
             "container": "ghcr.io/neutrons/subhkl:1.4.0",
             "artifact": f"solve.h5 ({n_indexed}/{n_peaks} spots • {n_zones_ord1} ord-1 zones)",
-            "status": "active",
+            "status": _stage_status(1),
             "ladder_rung_idx": 4,
             "summary": (
                 f"NDIP Finder-Less Solve (imaginex_subhkl_solve): steps 1–5 below run "
@@ -1505,7 +1550,7 @@ def _build_ndip_pipeline_stages(
             ],
             "container": "ghcr.io/neutrons/subhkl:1.4.0",
             "artifact": "predictor.h5 → integrated.h5",
-            "status": "ready",
+            "status": _stage_status(2),
             "ladder_rung_idx": 4,
             "summary": (
                 "NDIP Peak Prediction & Matrix-Free Integration: forward-projects reflections using "
@@ -1519,7 +1564,7 @@ def _build_ndip_pipeline_stages(
             "tool_ids": ["imaginex_subhkl_mtz", "imaginex_merge", "imaginex_analysis"],
             "container": "ghcr.io/neutrons/subhkl:1.4.0",
             "artifact": "reflections.mtz + completeness report",
-            "status": "ready",
+            "status": _stage_status(3),
             "ladder_rung_idx": 4,
             "summary": (
                 "NDIP Multi-Orientation Merge & MTZ Export: merges integrated reflections across "
@@ -2138,7 +2183,9 @@ def build_rainbow_zone_payload(
         space_group=str(space_group),
         cell=cell,
         solve_diagnostics=solve_diagnostics,
+        artifact_kind=artifact_kind,
     )
+    pending_stage = _pending_stage_for_artifact_kind(artifact_kind)
 
     resolved_proj = (
         str(projection).lower()
@@ -2160,6 +2207,7 @@ def build_rainbow_zone_payload(
         "intensity_source": intensity_source,
         "artifact_kind": artifact_kind,
         "peak_shape_mode": peak_shape_mode,
+        "pending_stage": pending_stage,
         "wavelength_range": [round(wl_min, 3), round(wl_max, 3)],
         "d_min": round(d_min_use, 3),
         "frame_index": int(active_frame),
@@ -2746,11 +2794,13 @@ def render_rainbow_html(
     </div>
 
     <div class="controls-cluster">
-      <select id="sel-galaxy-h5" title="Load solve.h5 / indexer.h5 dataset directly from active Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:5px;padding:3px 6px;font-size:0.68rem;font-family:var(--font-display);max-width:145px;">
-        <option value="">📂 Galaxy (.h5)...</option>
+      <select id="sel-galaxy-h5" title="Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus files, or select from Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:5px;padding:3px 6px;font-size:0.68rem;font-family:var(--font-display);max-width:175px;">
+        <option value="">📂 Data Source...</option>
+        <option value="__action_neutron_data__">⚛ + Neutron data (SNS/HFIR)...</option>
+        <option value="__action_local_file__">💻 + From local computer...</option>
       </select>
-      <input type="file" id="inp-local-h5" accept=".h5,.hdf5" multiple style="display:none;" />
-      <button id="btn-local-h5" title="Open local solve.h5 + merged.h5 files directly in the browser (via h5wasm)">
+      <input type="file" id="inp-local-h5" accept=".h5,.hdf5,.nxs" multiple style="display:none;" />
+      <button id="btn-local-h5" style="display:none;" title="Open local .h5 / .nxs.h5 files">
         📂 Local .h5
       </button>
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
@@ -2914,6 +2964,116 @@ def render_rainbow_html(
     <div class="ladder-rungs" id="ladder-rungs"></div>
   </footer>
 
+  <!-- Modal Dialog: Load Neutron Data (NDIP neutrons_load_data + Auto-Reduce/Merge) -->
+  <div id="modal-neutron-data" style="display:none;position:fixed;inset:0;z-index:9000;background:rgba(4,6,14,0.82);backdrop-filter:blur(4px);align-items:center;justify-content:center;">
+    <div style="width:min(620px,94vw);background:var(--bg-panel);border:1px solid var(--accent-cyan);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,0.75);padding:14px 16px;color:var(--text-main);font-size:0.76rem;">
+      <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-color);padding-bottom:8px;margin-bottom:10px;">
+        <div>
+          <strong style="font-family:var(--font-display);font-size:0.86rem;color:var(--accent-cyan);">⚛ LOAD NEUTRON DATA (SNS / HFIR → NDIP GALAXY)</strong>
+          <div style="font-size:0.66rem;color:var(--text-dim);margin-top:2px;">
+            Uses NDIP <code>neutrons_load_data</code> permission pass-through; raw NeXus runs automatically trigger Step 1 (Reduce + Merge Images) into <code>merged.h5</code>.
+          </div>
+        </div>
+        <button id="btn-nd-close" style="padding:2px 8px;font-size:0.72rem;">✕</button>
+      </div>
+
+      <div style="display:flex;gap:8px;margin-bottom:10px;">
+        <button id="btn-nd-mode-ipts" class="active-btn" style="flex:1;padding:5px 8px;font-family:var(--font-display);font-size:0.7rem;">
+          🔢 IPTS + Run (or Run Range)
+        </button>
+        <button id="btn-nd-mode-paths" style="flex:1;padding:5px 8px;font-family:var(--font-display);font-size:0.7rem;">
+          📁 Explicit File Path(s) (/HFIR, /SNS)
+        </button>
+      </div>
+
+      <div id="nd-pane-ipts" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px;">
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);">
+          FACILITY
+          <select id="nd-facility" style="background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
+            <option value="HFIR" selected>HFIR</option>
+            <option value="SNS">SNS</option>
+          </select>
+        </label>
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);">
+          INSTRUMENT
+          <select id="nd-instrument" style="background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
+            <option value="CG4D" selected>CG4D (IMAGINE-X)</option>
+            <option value="IMAGINE">IMAGINE (HFIR)</option>
+            <option value="MANDI">MANDI (SNS)</option>
+            <option value="TOPAZ">TOPAZ (SNS)</option>
+          </select>
+        </label>
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);">
+          IPTS NUMBER
+          <input id="nd-ipts" type="text" value="37331" placeholder="e.g. 37331" style="background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+        </label>
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);">
+          RUN OR RANGE
+          <input id="nd-runs" type="text" value="2625-2638" placeholder="e.g. 2625-2638" style="background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+        </label>
+      </div>
+
+      <div id="nd-pane-paths" style="display:none;margin-bottom:10px;">
+        <label style="display:flex;flex-direction:column;gap:4px;font-size:0.66rem;color:var(--text-dim);">
+          EXPLICIT NEXUS OR HDF5 PATH(S) ON /HFIR OR /SNS (ONE PER LINE, COMMA-SEPARATED, OR WILDCARD GLOB)
+          <textarea id="nd-filepaths" rows="3" placeholder="/HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5&#10;/HFIR/CG4D/IPTS-37331/nexus/CG4D_2626.nxs.h5" style="width:100%;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:6px;font-family:var(--font-display);font-size:0.7rem;resize:vertical;"></textarea>
+        </label>
+      </div>
+
+      <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;padding:8px 10px;margin-bottom:10px;">
+        <div style="font-family:var(--font-display);font-size:0.66rem;color:var(--accent-gold);margin-bottom:6px;">
+          SAMPLE UNIT CELL, SPACE GROUP & WAVELENGTH BAND (REQUIRED FOR STEP 1 MERGE-IMAGES)
+        </div>
+        <div style="display:grid;grid-template-columns:1.3fr repeat(6,1fr);gap:6px;margin-bottom:6px;">
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+            SPACE GROUP
+            <input id="nd-sg" type="text" value="{sg}" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+            a (Å)
+            <input id="nd-a" type="number" step="0.01" value="69.07" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+            b (Å)
+            <input id="nd-b" type="number" step="0.01" value="98.00" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+            c (Å)
+            <input id="nd-c" type="number" step="0.01" value="90.92" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+            α (°)
+            <input id="nd-alpha" type="number" step="0.01" value="90.07" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+            β (°)
+            <input id="nd-beta" type="number" step="0.01" value="106.14" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+            γ (°)
+            <input id="nd-gamma" type="number" step="0.01" value="90.01" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+          </label>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+          <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+            Preview: /HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5 … CG4D_2638.nxs.h5 (14 runs)
+          </div>
+          <div style="display:flex;gap:6px;align-items:center;font-size:0.64rem;color:var(--text-dim);white-space:nowrap;">
+            <span>λ_min <input id="nd-wl-min" type="number" step="0.1" value="{init_wl_min:.1f}" style="width:46px;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:2px 4px;font-family:var(--font-display);" /></span>
+            <span>λ_max <input id="nd-wl-max" type="number" step="0.1" value="{init_wl_max:.1f}" style="width:46px;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:2px 4px;font-family:var(--font-display);" /></span>
+          </div>
+        </div>
+      </div>
+
+      <div style="display:flex;justify-content:flex-end;gap:8px;">
+        <button id="btn-nd-cancel" style="padding:5px 12px;font-size:0.72rem;">Cancel</button>
+        <button id="btn-nd-submit" class="active-btn" style="padding:5px 14px;font-size:0.72rem;font-family:var(--font-display);font-weight:700;">
+          ▶ Load Neutron Data &amp; Reduce to merged.h5
+        </button>
+      </div>
+    </div>
+  </div>
+
 <script>
 window.RAINBOW_ZONES_DATA = {payload_json};
 
@@ -2931,6 +3091,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ? order1ZoneIds
     : ZONES.slice(0, Math.min(6, ZONES.length)).map(z => z.zone_id);
 
+  function pipelineIdxForArtifactKind(artKind) {{
+    const k = String(artKind || "solve").toLowerCase();
+    if (k === "raw_nexus") return 0; // Pending step: 1. Reduce & Merge
+    if (k === "merged") return 1;    // Pending step: 2. Solve
+    if (k === "integrator") return 3; // Completed 1..3, Pending step: 4. Merge
+    return 2; // solve / predictor / finder -> Completed 1..2, Pending step: 3. Integrate
+  }}
+
   const state = {{
     projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
@@ -2946,8 +3114,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     selectedZoneId: null,
     hoveredPeakId: null,
     selectedPeakId: null,
-    currentPipelineIdx: 1,        // 0: Reduce, 1: Solve, 2: Integrate, 3: Merge
-    currentRungIdx: Math.max(0, LADDER.length - 1),
+    currentPipelineIdx: pipelineIdxForArtifactKind(DATA.artifact_kind), // 0: Reduce, 1: Solve, 2: Integrate, 3: Merge
+    currentRungIdx: DATA.artifact_kind === "merged" ? 0 : Math.max(0, LADDER.length - 1),
     ladderTimer: null,
     parallaxX: 0.0,
     parallaxY: 0.0,
@@ -4076,6 +4244,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const shapeMode = newPayload.peak_shape_mode || DATA.peak_shape_mode || "solved_circle";
     DATA.artifact_kind = artKind;
     DATA.peak_shape_mode = shapeMode;
+    DATA.pending_stage = newPayload.pending_stage || (artKind === "merged" ? "solve" : (artKind === "raw_nexus" ? "reduce" : (artKind === "integrator" ? "merge" : "integrate")));
     let artBadge = "SOLVED ORIENTATION";
     if (artKind === "integrator") {{
       artBadge = shapeMode === "anisotropic_ellipse"
@@ -4083,24 +4252,53 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         : "INTEGRATED • ISOTROPIC 2σ CIRCLES";
     }} else if (artKind === "predictor") {{
       artBadge = "PREDICTOR • PREDICTED PEAKS";
+    }} else if (artKind === "merged") {{
+      artBadge = "MERGED.H5 • PENDING: 2. SOLVE";
+    }} else if (artKind === "raw_nexus") {{
+      artBadge = "RAW NEXUS • PENDING: 1. REDUCE";
     }} else if (newPayload.intensity_source === "raw_h5") {{
       artBadge = "RAW DETECTOR COUNTS";
     }}
     if (subEl) {{
       subEl.textContent = `${{DATA.instrument || "CG4D"}} • ${{DATA.space_group || "P 1"}} • ${{artBadge}}`;
     }}
+    if (DATA.space_group) {{
+      const sgEl = document.getElementById("inp-sg");
+      if (sgEl) sgEl.value = DATA.space_group;
+      const ndSgEl = document.getElementById("nd-sg");
+      if (ndSgEl) ndSgEl.value = DATA.space_group;
+    }}
     if (DATA.cell && DATA.cell.length === 6) {{
       const c = DATA.cell;
       document.getElementById("cell-summary").textContent = `${{c[0].toFixed(1)}}, ${{c[1].toFixed(1)}}, ${{c[2].toFixed(1)}} Å`;
+      const ids = ["inp-a", "inp-b", "inp-c", "inp-alpha", "inp-beta", "inp-gamma"];
+      const ndIds = ["nd-a", "nd-b", "nd-c", "nd-alpha", "nd-beta", "nd-gamma"];
+      ids.forEach((id, i) => {{
+        const el = document.getElementById(id);
+        if (el && typeof c[i] === "number") el.value = c[i].toFixed(2);
+      }});
+      ndIds.forEach((id, i) => {{
+        const el = document.getElementById(id);
+        if (el && typeof c[i] === "number") el.value = c[i].toFixed(2);
+      }});
     }}
     const ord1 = ZONES.filter(z => (z.order || 1) <= 1).map(z => z.zone_id);
     state.maxZoneOrder = ord1.length > 0 ? 1 : 2;
     state.activeZones = new Set(ord1.length > 0 ? ord1 : ZONES.map(z => z.zone_id));
-    state.currentRungIdx = Math.max(0, LADDER.length - 1);
+    state.currentPipelineIdx = pipelineIdxForArtifactKind(artKind);
+    state.currentRungIdx = artKind === "merged" ? 0 : Math.max(0, LADDER.length - 1);
     renderPipeline();
     if (LADDER.length > 0) selectLadderRung(state.currentRungIdx, false);
     else {{ renderZoneList(); updateHUD(); }}
-    if (artKind === "integrator" || artKind === "predictor") {{
+    if (artKind === "merged") {{
+      const cStr = (DATA.cell && DATA.cell.length === 6)
+        ? `${{DATA.space_group || "P 1"}} (${{DATA.cell[0].toFixed(1)}}, ${{DATA.cell[1].toFixed(1)}}, ${{DATA.cell[2].toFixed(1)}} Å)`
+        : (DATA.space_group || "P 1");
+      setStatusLine(
+        `[MERGED.H5]`,
+        `<strong style="color:var(--accent-cyan);">Merged detector stack loaded</strong> (${{(DATA.frames || []).length || 1}} frames • ${{cStr}}) — Pending step: <strong style="color:var(--accent-pink);">▶ 2. Solve (Lattice Ladder)</strong>.`
+      );
+    }} else if (artKind === "integrator" || artKind === "predictor") {{
       const nEll = PEAKS.filter(p => Array.isArray(p.ellipse)).length;
       setStatusLine(
         `[${{artBadge}}]`,
@@ -4313,6 +4511,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }});
       }}
     }}
+    if (panelsOut.length === 0 && PANELS.length > 0) {{
+      PANELS.forEach(p => {{
+        panelsOut.push({{
+          ...p,
+          _grayCanvas: bankGrayCanvases.get(p.bank) || p._grayCanvas || null,
+        }});
+      }});
+    }}
 
     // Read sample U, B, R_run and forward-project reflections
     let sg = "P 21 21 21";
@@ -4321,18 +4527,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     let U = [[1,0,0],[0,1,0],[0,0,1]], B = null, Rrun = [[1,0,0],[0,1,0],[0,0,1]];
     if (f.keys().includes("sample")) {{
       const sGrp = f.get("sample");
-      if (sGrp.keys().includes("U")) {{
+      const sKeys = sGrp.keys();
+      if (["a", "b", "c", "alpha", "beta", "gamma"].every(k => sKeys.includes(k))) {{
+        cell = [
+          Number(sGrp.get("a").value),
+          Number(sGrp.get("b").value),
+          Number(sGrp.get("c").value),
+          Number(sGrp.get("alpha").value),
+          Number(sGrp.get("beta").value),
+          Number(sGrp.get("gamma").value),
+        ];
+      }}
+      if (sKeys.includes("U")) {{
         const uRaw = Array.from(sGrp.get("U").value).map(Number);
         U = [[uRaw[0],uRaw[1],uRaw[2]],[uRaw[3],uRaw[4],uRaw[5]],[uRaw[6],uRaw[7],uRaw[8]]];
       }}
-      if (sGrp.keys().includes("B")) {{
+      if (sKeys.includes("B")) {{
         const bRaw = Array.from(sGrp.get("B").value).map(Number);
         B = [[bRaw[0],bRaw[1],bRaw[2]],[bRaw[3],bRaw[4],bRaw[5]],[bRaw[6],bRaw[7],bRaw[8]]];
         const invB = mat3Inv(B);
         const aLen = Math.hypot(invB[0][0], invB[1][0], invB[2][0]);
         const bLen = Math.hypot(invB[0][1], invB[1][1], invB[2][1]);
         const cLen = Math.hypot(invB[0][2], invB[1][2], invB[2][2]);
-        cell = [aLen, bLen, cLen, 90, 90, 90];
+        cell = [aLen, bLen, cLen, cell[3] || 90, cell[4] || 90, cell[5] || 90];
       }}
     }}
     if (f.keys().includes("goniometer") && f.get("goniometer").keys().includes("R")) {{
@@ -4345,6 +4562,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const zonesOut = [];
     let artifactKind = "solve";
     let peakShapeMode = "solved_circle";
+    if (f.keys().includes("images") && !f.keys().includes("peaks") && !f.keys().includes("banks") && !B) {{
+      artifactKind = "merged";
+      peakShapeMode = "none";
+    }} else if (f.keys().includes("entry") && !f.keys().includes("images")) {{
+      artifactKind = "raw_nexus";
+      peakShapeMode = "none";
+    }}
     if (B && detMap.size > 0) {{
       const UB = mat3Mul(U, B);
       const RUB = mat3Mul(Rrun, UB);
@@ -4649,20 +4873,298 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const h5s = (galaxyBridge.datasets || []).filter(
       d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
     );
-    selGalaxyH5.innerHTML = `<option value="">📂 Galaxy History (${{h5s.length}} .h5)...</option>`;
-    h5s.forEach(d => {{
-      const opt = document.createElement("option");
-      opt.value = d.id;
-      opt.textContent = `#${{d.hid || ""}} ${{d.name}}`;
-      selGalaxyH5.appendChild(opt);
+    selGalaxyH5.innerHTML = "";
+    const optHeader = document.createElement("option");
+    optHeader.value = "";
+    optHeader.textContent = h5s.length > 0
+      ? `📂 Data Source (${{h5s.length}} in History)...`
+      : "📂 Data Source...";
+    selGalaxyH5.appendChild(optHeader);
+
+    const grpIngest = document.createElement("optgroup");
+    grpIngest.label = "Ingest / Open Data";
+    const optNeutron = document.createElement("option");
+    optNeutron.value = "__action_neutron_data__";
+    optNeutron.textContent = "⚛ + Neutron data (SNS / HFIR)...";
+    grpIngest.appendChild(optNeutron);
+
+    const optLocal = document.createElement("option");
+    optLocal.value = "__action_local_file__";
+    optLocal.textContent = "💻 + From local computer...";
+    grpIngest.appendChild(optLocal);
+    selGalaxyH5.appendChild(grpIngest);
+
+    if (h5s.length > 0) {{
+      const grpHist = document.createElement("optgroup");
+      grpHist.label = "Galaxy History (.h5)";
+      h5s.forEach(d => {{
+        const opt = document.createElement("option");
+        opt.value = d.id;
+        opt.textContent = `#${{d.hid || ""}} ${{d.name}}`;
+        grpHist.appendChild(opt);
+      }});
+      selGalaxyH5.appendChild(grpHist);
+    }}
+  }}
+
+  // Modal Dialog: Load Neutron Data (IPTS+run range or explicit file paths)
+  const modalNeutronData = document.getElementById("modal-neutron-data");
+  const btnNdClose = document.getElementById("btn-nd-close");
+  const btnNdCancel = document.getElementById("btn-nd-cancel");
+  const btnNdSubmit = document.getElementById("btn-nd-submit");
+  const btnNdModeIpts = document.getElementById("btn-nd-mode-ipts");
+  const btnNdModePaths = document.getElementById("btn-nd-mode-paths");
+  const ndPaneIpts = document.getElementById("nd-pane-ipts");
+  const ndPanePaths = document.getElementById("nd-pane-paths");
+  let ndIngestMode = "ipts"; // "ipts" | "paths"
+  let pendingLocalNexusFiles = null;
+
+  function parseRunRangeSpec(specStr) {{
+    const runs = [];
+    String(specStr || "").split(/[,\\s]+/).forEach(tok => {{
+      const t = tok.trim();
+      if (!t) return;
+      const m = t.match(/^(\\d+)\\s*[-–:]\\s*(\\d+)$/);
+      if (m) {{
+        const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+        const lo = Math.min(a, b), hi = Math.max(a, b);
+        for (let r = lo; r <= Math.min(hi, lo + 500); r++) runs.push(r);
+      }} else if (/^\\d+$/.test(t)) {{
+        runs.push(parseInt(t, 10));
+      }}
     }});
+    return runs;
+  }}
+
+  function buildNeutronFilePathsFromDialog() {{
+    const fac = (document.getElementById("nd-facility")?.value || "HFIR").trim();
+    const inst = (document.getElementById("nd-instrument")?.value || "CG4D").trim();
+    const iptsRaw = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
+    const runsSpec = (document.getElementById("nd-runs")?.value || "").trim();
+    if (ndIngestMode === "paths") {{
+      const rawTxt = document.getElementById("nd-filepaths")?.value || "";
+      return rawTxt.split(/[\\r\\n,]+/).map(s => s.trim()).filter(Boolean);
+    }}
+    const runs = parseRunRangeSpec(runsSpec);
+    if (!iptsRaw || runs.length === 0) return [];
+    return runs.map(r => `/${{fac}}/${{inst}}/IPTS-${{iptsRaw}}/nexus/${{inst}}_${{r}}.nxs.h5`);
+  }}
+
+  function updateNeutronDialogPreview() {{
+    const prevEl = document.getElementById("nd-preview-path");
+    if (!prevEl) return;
+    if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
+      prevEl.textContent = `Local NeXus files (${{pendingLocalNexusFiles.length}}): ${{pendingLocalNexusFiles.map(f => f.name).join(", ")}}`;
+      return;
+    }}
+    const paths = buildNeutronFilePathsFromDialog();
+    if (paths.length === 0) {{
+      prevEl.textContent = "Preview: specify IPTS + run range or explicit file path(s)";
+    }} else if (paths.length === 1) {{
+      prevEl.textContent = `Preview: ${{paths[0]}}`;
+    }} else {{
+      const lastBase = paths[paths.length - 1].split("/").pop();
+      prevEl.textContent = `Preview: ${{paths[0]}} … ${{lastBase}} (${{paths.length}} runs)`;
+    }}
+  }}
+
+  function openNeutronDataModal(localNexusFiles = null) {{
+    pendingLocalNexusFiles = localNexusFiles;
+    const params = collectWorkflowParams();
+    const setVal = (id, v) => {{ const el = document.getElementById(id); if (el && v !== undefined) el.value = v; }};
+    setVal("nd-sg", params.space_group);
+    setVal("nd-a", Number(params.a).toFixed(2));
+    setVal("nd-b", Number(params.b).toFixed(2));
+    setVal("nd-c", Number(params.c).toFixed(2));
+    setVal("nd-alpha", Number(params.alpha).toFixed(2));
+    setVal("nd-beta", Number(params.beta).toFixed(2));
+    setVal("nd-gamma", Number(params.gamma).toFixed(2));
+    setVal("nd-wl-min", Number(params.wavelength_min).toFixed(1));
+    setVal("nd-wl-max", Number(params.wavelength_max).toFixed(1));
+    updateNeutronDialogPreview();
+    if (modalNeutronData) modalNeutronData.style.display = "flex";
+  }}
+
+  function closeNeutronDataModal() {{
+    pendingLocalNexusFiles = null;
+    if (modalNeutronData) modalNeutronData.style.display = "none";
+  }}
+
+  if (btnNdClose) btnNdClose.addEventListener("click", closeNeutronDataModal);
+  if (btnNdCancel) btnNdCancel.addEventListener("click", closeNeutronDataModal);
+  if (btnNdModeIpts && btnNdModePaths && ndPaneIpts && ndPanePaths) {{
+    btnNdModeIpts.addEventListener("click", () => {{
+      ndIngestMode = "ipts";
+      btnNdModeIpts.classList.add("active-btn");
+      btnNdModePaths.classList.remove("active-btn");
+      ndPaneIpts.style.display = "grid";
+      ndPanePaths.style.display = "none";
+      updateNeutronDialogPreview();
+    }});
+    btnNdModePaths.addEventListener("click", () => {{
+      ndIngestMode = "paths";
+      btnNdModePaths.classList.add("active-btn");
+      btnNdModeIpts.classList.remove("active-btn");
+      ndPaneIpts.style.display = "none";
+      ndPanePaths.style.display = "block";
+      updateNeutronDialogPreview();
+    }});
+  }}
+  ["nd-facility", "nd-instrument", "nd-ipts", "nd-runs", "nd-filepaths"].forEach(id => {{
+    const el = document.getElementById(id);
+    if (el) {{
+      el.addEventListener("input", updateNeutronDialogPreview);
+      el.addEventListener("change", updateNeutronDialogPreview);
+    }}
+  }});
+  const ndInstEl = document.getElementById("nd-instrument");
+  if (ndInstEl) {{
+    ndInstEl.addEventListener("change", () => {{
+      const facEl = document.getElementById("nd-facility");
+      if (facEl) {{
+        facEl.value = (ndInstEl.value === "MANDI" || ndInstEl.value === "TOPAZ") ? "SNS" : "HFIR";
+      }}
+      updateNeutronDialogPreview();
+    }});
+  }}
+
+  if (btnNdSubmit) {{
+    btnNdSubmit.addEventListener("click", async () => {{
+      // Sync sample unit cell, space group, and wavelength band back to the main parameters bar
+      const syncPair = [
+        ["nd-sg", "inp-sg"], ["nd-a", "inp-a"], ["nd-b", "inp-b"], ["nd-c", "inp-c"],
+        ["nd-alpha", "inp-alpha"], ["nd-beta", "inp-beta"], ["nd-gamma", "inp-gamma"],
+      ];
+      syncPair.forEach(([srcId, dstId]) => {{
+        const s = document.getElementById(srcId), d = document.getElementById(dstId);
+        if (s && d) d.value = s.value;
+      }});
+      const wlMinV = parseFloat(document.getElementById("nd-wl-min")?.value || "");
+      const wlMaxV = parseFloat(document.getElementById("nd-wl-max")?.value || "");
+      if (Number.isFinite(wlMinV) && Number.isFinite(wlMaxV)) {{
+        state.lamMin = wlMinV; state.lamMax = wlMaxV;
+        if (slLamMin) slLamMin.value = wlMinV.toFixed(2);
+        if (slLamMax) slLamMax.value = wlMaxV.toFixed(2);
+        updateWavelengthLabels();
+      }}
+      const instVal = (document.getElementById("nd-instrument")?.value || DATA.instrument || "CG4D").trim();
+      DATA.instrument = instVal;
+
+      if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
+        const filesToUpload = pendingLocalNexusFiles;
+        closeNeutronDataModal();
+        await uploadLocalFilesToServer(filesToUpload, true);
+        return;
+      }}
+
+      const fac = (document.getElementById("nd-facility")?.value || "HFIR").trim();
+      const iptsRaw = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
+      const runsSpec = (document.getElementById("nd-runs")?.value || "").trim();
+      const paths = buildNeutronFilePathsFromDialog();
+      closeNeutronDataModal();
+      if (paths.length === 0) {{
+        setStatusLine("[⚠️ NEUTRON DATA]", `<span style="color:#f87171;">No NeXus / HDF5 file paths specified.</span>`);
+        return;
+      }}
+      // If a single already-merged .h5 was specified, load it directly and set pending stage to 2. Solve
+      if (paths.length === 1 && !/\\.nxs(\\.h5)?$/i.test(paths[0]) && /merged|scan|solve|integrat|predict/i.test(paths[0])) {{
+        try {{
+          const r = await fetch(`api/payload?file_path=${{encodeURIComponent(paths[0])}}`, {{ cache: "no-store" }});
+          if (r.ok) {{
+            const p = await r.json();
+            recomputeBoundsAndReload(p);
+            return;
+          }}
+        }} catch (_e) {{}}
+      }}
+      // Otherwise trigger Step 1 (neutrons_load_data + Reduce & Merge Images -> merged.h5 -> pending stage = Solve)
+      selectPipelineStage(0, true);
+      await executeWorkflowStage(0, {{
+        ingest_mode: ndIngestMode === "ipts" ? "oncat" : "file",
+        facility: fac,
+        instrument: instVal,
+        ipts: iptsRaw,
+        runs: runsSpec,
+        nexus_files: paths,
+      }});
+    }});
+  }}
+
+  async function uploadLocalFilesToServer(files, forceReduce = false) {{
+    const params = collectWorkflowParams();
+    const isRawNexus = forceReduce || files.some(f => /\\.nxs(\\.h5)?$/i.test(f.name));
+    try {{
+      const fd = new FormData();
+      files.forEach(f => fd.append("files", f, f.name));
+      fd.append("params", JSON.stringify(params));
+      setStatusLine(
+        "[⏳ LOCAL HDF5]",
+        isRawNexus
+          ? `Uploading ${{files.length}} raw NeXus file(s) and triggering <strong>1. Reduce + Merge Images</strong>...`
+          : `Loading <strong>${{files.map(f => f.name).join(", ")}}</strong>...`
+      );
+      const r = await fetch("api/pipeline/upload_h5", {{
+        method: "POST",
+        body: fd,
+      }});
+      if (r.ok) {{
+        const res = await r.json();
+        const savedPaths = res.saved_paths || res.uploaded_paths || [];
+        if (isRawNexus && savedPaths.length > 0) {{
+          selectPipelineStage(0, true);
+          await executeWorkflowStage(0, {{
+            ingest_mode: "file",
+            nexus_files: savedPaths,
+          }});
+          return;
+        }}
+        if (savedPaths.length === 1) {{
+          const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(savedPaths[0])}}`, {{ cache: "no-store" }});
+          if (pr.ok) {{
+            const srvPayload = await pr.json();
+            if (srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
+              recomputeBoundsAndReload(srvPayload);
+              return;
+            }}
+          }}
+        }}
+      }}
+    }} catch (_uploadErr) {{
+      // Fall through to client-side h5wasm parsing when running as standalone static file
+    }}
+    try {{
+      while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));
+      let solveFile = files.find(f => /solve|index|integ/i.test(f.name)) || files[0];
+      let imgFile = files.find(f => f !== solveFile && /merged|image|scan/i.test(f.name)) || (files.length > 1 ? files[1] : null);
+      const buf1 = await solveFile.arrayBuffer();
+      const buf2 = imgFile ? await imgFile.arrayBuffer() : null;
+      const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
+      recomputeBoundsAndReload(newPayload);
+    }} catch (err) {{
+      setStatusLine("[⚠️ LOCAL HDF5]", `<span style="color:#f87171;">Local HDF5 error: ${{err.message}}</span>`);
+    }}
   }}
 
   async function loadFromGalaxyDatasetId(dsId) {{
     if (!dsId) return;
-    setStatusLine("[⏳ GALAXY HDF5]", `Loading dataset <strong>${{dsId}}</strong> from NDIP / Galaxy History...`);
+    const dsMeta = (galaxyBridge.datasets || []).find(d => d.id === dsId);
+    const dsName = (dsMeta && dsMeta.name) ? String(dsMeta.name) : "";
+    // If a raw NeXus file in Galaxy History is selected, automatically trigger Step 1 (Reduce + Merge Images)
+    if (/\\.nxs(\\.h5)?$/i.test(dsName)) {{
+      setStatusLine(
+        "[⏳ AUTO-REDUCE]",
+        `Raw NeXus dataset <strong>${{dsName}}</strong> selected — triggering <strong>Step 1 (Reduce + Merge Images)</strong>...`
+      );
+      selectPipelineStage(0, true);
+      await executeWorkflowStage(0, {{
+        ingest_mode: "galaxy_dataset",
+        galaxy_dataset_id: dsId,
+      }});
+      return;
+    }}
+    setStatusLine("[⏳ GALAXY HDF5]", `Loading dataset <strong>${{dsName || dsId}}</strong> from NDIP / Galaxy History...`);
     try {{
-      // 1. Prefer server-side HDF5 extraction via NOVA/HTTP backend (handles solve.h5, predictor.h5, integrated.h5 with ellipses & multi-frame)
+      // 1. Prefer server-side HDF5 extraction via NOVA/HTTP backend (handles merged.h5, solve.h5, predictor.h5, integrated.h5 with ellipses & multi-frame)
       try {{
         const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}`, {{
           cache: "no-store",
@@ -4704,28 +5206,37 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   if (selGalaxyH5) {{
     selGalaxyH5.addEventListener("change", () => {{
-      if (selGalaxyH5.value) loadFromGalaxyDatasetId(selGalaxyH5.value);
+      const val = selGalaxyH5.value;
+      if (!val) return;
+      if (val === "__action_neutron_data__") {{
+        selGalaxyH5.value = "";
+        openNeutronDataModal(null);
+        return;
+      }}
+      if (val === "__action_local_file__") {{
+        selGalaxyH5.value = "";
+        if (inpLocalH5) {{
+          inpLocalH5.value = "";
+          inpLocalH5.click();
+        }}
+        return;
+      }}
+      loadFromGalaxyDatasetId(val);
     }});
   }}
 
-  if (btnLocalH5 && inpLocalH5) {{
-    btnLocalH5.addEventListener("click", () => inpLocalH5.click());
+  if (inpLocalH5) {{
+    if (btnLocalH5) btnLocalH5.addEventListener("click", () => inpLocalH5.click());
     inpLocalH5.addEventListener("change", async () => {{
       const files = Array.from(inpLocalH5.files || []);
       if (files.length === 0) return;
-      const ladderDesc = document.getElementById("ladder-desc");
-      if (ladderDesc) ladderDesc.textContent = "⏳ Parsing local HDF5 file(s) in browser via h5wasm...";
-      try {{
-        while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));
-        let solveFile = files.find(f => /solve|index|integ/i.test(f.name)) || files[0];
-        let imgFile = files.find(f => f !== solveFile && /merged|image|scan/i.test(f.name)) || (files.length > 1 ? files[1] : null);
-        const buf1 = await solveFile.arrayBuffer();
-        const buf2 = imgFile ? await imgFile.arrayBuffer() : null;
-        const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
-        recomputeBoundsAndReload(newPayload);
-      }} catch (err) {{
-        if (ladderDesc) ladderDesc.textContent = `⚠️ Local HDF5 error: ${{err.message}}`;
+      const isRawNexus = files.some(f => /\\.nxs(\\.h5)?$/i.test(f.name));
+      if (isRawNexus) {{
+        // Open Neutron Data modal pre-populated with local NeXus files so user can confirm Unit Cell + Space Group for merge-images
+        openNeutronDataModal(files);
+        return;
       }}
+      await uploadLocalFilesToServer(files, false);
     }});
   }}
 
@@ -4795,10 +5306,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
   probeGalaxyConnection();
 
-  async function executeWorkflowStage(stageIdx) {{
+  async function executeWorkflowStage(stageIdx, extraParams = null) {{
     const st = PIPELINE[stageIdx] || PIPELINE[state.currentPipelineIdx] || PIPELINE[1] || {{ stage_id: "solve", name: "2. SOLVE" }};
     const stageId = st.stage_id || "solve";
-    const params = collectWorkflowParams();
+    if (stageId === "reduce" && !extraParams) {{
+      openNeutronDataModal(null);
+      return;
+    }}
+    const params = {{ ...collectWorkflowParams(), ...(extraParams || {{}}) }};
     state.runningStageIdx = stageIdx;
     renderPipeline();
     const cellSummary = document.getElementById("cell-summary");
@@ -4845,13 +5360,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               state.runningStageIdx = -1;
               renderPipeline();
               if (cellSummary) cellSummary.textContent = aj.state === "ok" ? "DONE ✓" : "ERROR ✗";
+              await probeGalaxyConnection();
               if (aj.state === "ok" && aj.updated_payload_ready) {{
                 try {{
                   const pr = await fetch("api/payload", {{ cache: "no-store" }});
                   if (pr.ok) {{
                     const newPayload = await pr.json();
                     recomputeBoundsAndReload(newPayload);
-                    appendTerminalLog("\\n✓ Reloaded updated orientation & Bragg reflections into viewport.");
+                    appendTerminalLog(
+                      stageId === "reduce"
+                        ? "\\n✓ Loaded merged.h5 into viewport — Pending step: 2. Solve (Lattice Ladder)."
+                        : "\\n✓ Reloaded updated orientation & Bragg reflections into viewport."
+                    );
                   }}
                 }} catch (_re) {{}}
               }}

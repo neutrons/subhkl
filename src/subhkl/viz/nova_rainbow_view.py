@@ -484,13 +484,35 @@ class NovaGalaxyPipelineRunner:
                     "space": sg,
                 }
             elif stage_id == "reduce":
-                import glob as _glob
-
-                raw_nxs = sorted(_glob.glob(os.path.join(work_dir, "*.nxs.h5")))
+                raw_nxs = self._resolve_raw_nexus_inputs(params, work_dir)
                 if not raw_nxs:
                     raise RuntimeError(
-                        f"Using pre-merged scan {os.path.basename(merged_path)} (no raw *.nxs.h5 in {work_dir})"
+                        f"Using pre-merged scan {os.path.basename(merged_path)} (no raw *.nxs.h5 specified or in {work_dir})"
                     )
+                if self._has_tool_on_galaxy("neutrons_load_data") and params.get("ingest_mode") in (
+                    "oncat",
+                    "file",
+                    "ipts",
+                    "paths",
+                ):
+                    try:
+                        nld_inputs: dict[str, Any] = {
+                            "series_0|source_select": "file",
+                            "series_0|file_list": ",".join(raw_nxs),
+                        }
+                        nld_res = gi.tools.run_tool(
+                            history_id=store.history_id,
+                            tool_id="neutrons_load_data",
+                            tool_inputs=nld_inputs,
+                        )
+                        nld_jid = (nld_res.get("jobs") or [{}])[0].get("id")
+                        job_record["stdout"] += (
+                            f"[galaxy -> ndip] Dispatched neutrons_load_data ({len(raw_nxs)} NeXus runs, job_id={nld_jid})\n"
+                        )
+                    except Exception as nld_exc:
+                        job_record["stdout"] += (
+                            f"[galaxy -> ndip] neutrons_load_data note: {self._clean_err_msg(nld_exc)}\n"
+                        )
                 primary_tool = "imaginex_subhkl_prepare_peaks"
                 tool_inputs = {
                     "instrument": inst,
@@ -602,6 +624,41 @@ class NovaGalaxyPipelineRunner:
                 existing_job_record=job_record,
             )
 
+    def _resolve_raw_nexus_inputs(self, params: dict[str, Any], work_dir: str) -> list[str]:
+        """Resolve raw .nxs.h5 paths from explicit nexus_files, galaxy_dataset_id, IPTS+runs, or work_dir."""
+        import glob as _glob
+
+        resolved: list[str] = []
+        raw_list = params.get("nexus_files")
+        if isinstance(raw_list, str):
+            raw_list = [s.strip() for s in raw_list.replace("\n", ",").split(",") if s.strip()]
+        if isinstance(raw_list, list) and raw_list:
+            for item in raw_list:
+                p_str = str(item).strip()
+                if not p_str:
+                    continue
+                if any(ch in p_str for ch in ("*", "?", "[")):
+                    matches = sorted(_glob.glob(p_str))
+                    if matches:
+                        resolved.extend(matches)
+                        continue
+                resolved.append(os.path.abspath(p_str))
+            if resolved:
+                return resolved
+
+        ds_id = params.get("galaxy_dataset_id")
+        if ds_id:
+            try:
+                local_p, _ = self.resolve_dataset_to_local_h5(str(ds_id), fallback_dir=work_dir)
+                if local_p and os.path.isfile(local_p):
+                    return [local_p]
+            except Exception:
+                pass
+
+        if work_dir and os.path.isdir(work_dir):
+            return sorted(_glob.glob(os.path.join(work_dir, "*.nxs.h5")))
+        return []
+
     def _submit_local_subhkl_stage(
         self,
         stage_id: str,
@@ -652,8 +709,98 @@ class NovaGalaxyPipelineRunner:
         out_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_{stage_id}_{ts}.h5")
         pred_tmp_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_pred_{ts}.h5")
         mtz_tmp_path = os.path.join(tempfile.gettempdir(), f"subhkl_refl_{ts}.mtz")
+        reduce_tmp_dir = os.path.join(tempfile.gettempdir(), f"subhkl_reduce_{ts}")
+        raw_nxs_local: list[str] = []
+        if stage_id == "reduce":
+            raw_nxs_local = [
+                p for p in self._resolve_raw_nexus_inputs(params, work_dir) if os.path.isfile(p)
+            ]
 
-        if stage_id == "reduce" and os.path.isfile(merged_path):
+        if stage_id == "reduce" and raw_nxs_local:
+            os.makedirs(reduce_tmp_dir, exist_ok=True)
+            sitecustomize_path = os.path.join(reduce_tmp_dir, "sitecustomize.py")
+            with open(sitecustomize_path, "w", encoding="utf-8") as sc_f:
+                sc_f.write(
+                    "import re, h5py, numpy as np\n"
+                    "try:\n"
+                    "    import subhkl.instrument.goniometer as _gonio\n"
+                    "    _orig_get_rot = _gonio.get_rotation_data_from_nexus\n"
+                    "    _PATS = {\n"
+                    "        'phi': re.compile(r'(?:axis0|phi)\\s*=\\s*([-+]?[0-9]*\\.?[0-9]+)', re.I),\n"
+                    "        'kappa': re.compile(r'(?:axis1|kappa)\\s*=\\s*([-+]?[0-9]*\\.?[0-9]+)', re.I),\n"
+                    "        'omega': re.compile(r'(?:axis2|omega)\\s*=\\s*([-+]?[0-9]*\\.?[0-9]+)', re.I),\n"
+                    "        'chi': re.compile(r'(?:chi)\\s*=\\s*([-+]?[0-9]*\\.?[0-9]+)', re.I),\n"
+                    "        'alpha': re.compile(r'(?:alpha)\\s*=\\s*([-+]?[0-9]*\\.?[0-9]+)', re.I),\n"
+                    "    }\n"
+                    "    _DEF = {'omega': 0.0, 'alpha': 45.0, 'kappa': 0.0, 'phi': 0.0, 'chi': 0.0}\n"
+                    "    def _patched_get_rot(filename, instrument):\n"
+                    "        settings = _gonio.reduction_settings[instrument]\n"
+                    "        with h5py.File(filename, 'r') as f:\n"
+                    "            das = f['entry/DASlogs'] if 'entry/DASlogs' in f else {}\n"
+                    "            has_all = all(k.split('#')[0] in das and 'average_value' in das[k.split('#')[0]] for k in settings['Goniometer'])\n"
+                    "            if has_all:\n"
+                    "                return _orig_get_rot(filename, instrument)\n"
+                    "            t = ''\n"
+                    "            if 'entry/title' in f:\n"
+                    "                raw = f['entry/title'][()]\n"
+                    "                if isinstance(raw, np.ndarray) and raw.size > 0: raw = raw.flat[0]\n"
+                    "                t = raw.decode('utf-8', 'replace') if isinstance(raw, (bytes, np.bytes_)) else str(raw)\n"
+                    "            parsed = {k: float(m.group(1)) for k, p in _PATS.items() if (m := p.search(t))}\n"
+                    "            axes, angles, names = [], [], []\n"
+                    "            for ax_name, ax_spec in settings['Goniometer'].items():\n"
+                    "                ln = ax_name.split('#')[0]\n"
+                    "                sk = ln.split(':')[-1].lower()\n"
+                    "                val = float(das[ln]['average_value'][0]) if (ln in das and 'average_value' in das[ln]) else parsed.get(sk, _DEF.get(sk))\n"
+                    "                if val is not None:\n"
+                    "                    axes.append(np.array(ax_spec, dtype=float))\n"
+                    "                    angles.append(float(val))\n"
+                    "                    names.append(ln)\n"
+                    "            return axes, angles, names\n"
+                    "    _gonio.get_rotation_data_from_nexus = _patched_get_rot\n"
+                    "except Exception:\n"
+                    "    pass\n"
+                )
+            reduce_cmds: list[str] = []
+            for i_nxs, nxs_p in enumerate(raw_nxs_local):
+                red_out = os.path.join(reduce_tmp_dir, f"run_{i_nxs:03d}.reduce.h5")
+                r_cmd = [
+                    "python",
+                    "-u",
+                    "-m",
+                    "subhkl.io.parser",
+                    "reduce",
+                    nxs_p,
+                    red_out,
+                    str(inst),
+                    "--wavelength-min",
+                    str(wl[0]),
+                    "--wavelength-max",
+                    str(wl[1]),
+                ]
+                reduce_cmds.append(shlex.join(r_cmd))
+            merge_cmd = [
+                "python",
+                "-u",
+                "-m",
+                "subhkl.io.parser",
+                "merge-images",
+                os.path.join(reduce_tmp_dir, "*.reduce.h5"),
+                out_h5,
+                str(float(raw_cell[0])),
+                str(float(raw_cell[1])),
+                str(float(raw_cell[2])),
+                str(float(raw_cell[3])),
+                str(float(raw_cell[4])),
+                str(float(raw_cell[5])),
+                str(sg),
+            ]
+            reduce_cmds.append(shlex.join(merge_cmd))
+            chained_reduce = (
+                f"set -e; export PYTHONPATH={shlex.quote(reduce_tmp_dir)}:${{PYTHONPATH:-}}; "
+                + " && ".join(reduce_cmds)
+            )
+            inner_cmd = ["bash", "-c", chained_reduce]
+        elif stage_id == "reduce" and os.path.isfile(merged_path):
             inner_cmd = [
                 "python",
                 "-u",
@@ -775,8 +922,14 @@ class NovaGalaxyPipelineRunner:
 
         container_image = "ghcr.io/neutrons/subhkl:feat-rainbow-zones"
         if shutil.which("podman"):
+            raw_dirs = {os.path.dirname(os.path.abspath(p)) for p in raw_nxs_local}
             mount_dirs = sorted(
-                {os.path.dirname(merged_path), os.path.dirname(solve_path), tempfile.gettempdir()}
+                {
+                    os.path.dirname(merged_path),
+                    os.path.dirname(solve_path),
+                    tempfile.gettempdir(),
+                    *raw_dirs,
+                }
             )
             cmd = [
                 "podman",
@@ -881,9 +1034,28 @@ class NovaGalaxyPipelineRunner:
                             job_record["ladder_rung_idx"] = max(job_record["ladder_rung_idx"], 3)
                 rc = proc.wait()
                 if rc == 0:
-                    job_record["ladder_rung_idx"] = 4
+                    job_record["ladder_rung_idx"] = 0 if stage_id == "reduce" else 4
                     final_h5 = out_h5
-                    if stage_id == "solve" and os.path.isfile(out_h5):
+                    if stage_id == "reduce" and os.path.isfile(out_h5):
+                        merged_dest = os.path.join(work_dir, "merged.h5")
+                        try:
+                            shutil.copy2(out_h5, merged_dest)
+                            final_h5 = merged_dest
+                            job_record["stdout"] += f"\n[subhkl] Saved merged.h5 -> {merged_dest}\n"
+                        except Exception as copy_exc:
+                            job_record["stdout"] += f"\n[subhkl] Warning saving {merged_dest}: {copy_exc}\n"
+
+                        if self.is_connected and os.path.isfile(final_h5):
+                            try:
+                                store = self.get_datastore("IMAGINE-X SubHKL")
+                                self._ensure_galaxy_h5_dataset(
+                                    store, final_h5, job_record, force_upload=True, file_ext="h5"
+                                )
+                            except Exception as up_exc:
+                                job_record["stdout"] += (
+                                    f"[nova -> galaxy] Warning uploading merged.h5: {self._clean_err_msg(up_exc)}\n"
+                                )
+                    elif stage_id == "solve" and os.path.isfile(out_h5):
                         try:
                             shutil.copy2(out_h5, solve_dest)
                             for suffix in (".stages.h5", ".blind.h5"):
@@ -1076,7 +1248,9 @@ class NovaGalaxyPipelineRunner:
                     job_record["ladder_rung_idx"] = step_counter
                 if state in ("ok", "error", "deleted", "paused"):
                     if state == "ok":
-                        job_record["ladder_rung_idx"] = 4
+                        job_record["ladder_rung_idx"] = (
+                            0 if job_record.get("stage_id") == "reduce" else 4
+                        )
                         job_record["stdout"] += (
                             f"\n[galaxy -> pulsar] Job {job_id} finished (state=ok).\n"
                         )
@@ -1104,6 +1278,8 @@ class NovaGalaxyPipelineRunner:
                                     target_path = os.path.join(work_dir, "integrated.h5")
                                 elif job_record.get("stage_id") == "solve":
                                     target_path = os.path.join(work_dir, "solve.h5")
+                                elif job_record.get("stage_id") == "reduce":
+                                    target_path = os.path.join(work_dir, "merged.h5")
                             if target_path:
                                 with open(target_path, "wb") as f:
                                     f.write(raw_bytes)
@@ -1332,6 +1508,20 @@ def serve_rainbow_zones(
                 req_path = req_path[len(ep_path) :] or "/"
 
             if req_path in ("/api/payload", "/payload.json"):
+                if "file_path" in qs and qs["file_path"]:
+                    try:
+                        fp = os.path.abspath(str(qs["file_path"][0]).strip())
+                        if os.path.isfile(fp):
+                            fp_low = os.path.basename(fp).lower()
+                            if any(k in fp_low for k in ("merged", "scan", "image")):
+                                vm.payload_kwargs["images_h5"] = fp
+                                vm.replay_h5 = fp
+                                vm.reload(images_h5=fp)
+                            else:
+                                vm.replay_h5 = fp
+                                vm.reload()
+                    except Exception:
+                        pass
                 if "dataset_id" in qs and qs["dataset_id"]:
                     try:
                         ds_id = str(qs["dataset_id"][0]).strip()
@@ -1347,7 +1537,8 @@ def serve_rainbow_zones(
                         )
                         ds_name = str(ds_info.get("name") or os.path.basename(local_h5)).lower()
                         if any(k in ds_name for k in ("merged", "scan", "image")):
-                            vm.payload_kwargs["images_file"] = local_h5
+                            vm.payload_kwargs["images_h5"] = local_h5
+                            vm.replay_h5 = local_h5
                             vm.reload(images_h5=local_h5)
                         else:
                             vm.replay_h5 = local_h5
@@ -1441,12 +1632,60 @@ def serve_rainbow_zones(
                         params.setdefault("wavelength_range", vm.payload.get("wavelength_range"))
 
                     def _on_complete(new_h5_path: str) -> None:
+                        if stage_id == "reduce" or "merged" in os.path.basename(new_h5_path).lower():
+                            vm.payload_kwargs["images_h5"] = new_h5_path
                         vm.replay_h5 = new_h5_path
                         vm.reload()
 
                     result = vm.pipeline_runner.submit_galaxy_stage(
                         stage_id, params=params, on_complete_h5=_on_complete
                     )
+                    code = 200
+                except Exception as exc:
+                    result = {"status": "error", "error": str(exc)}
+                    code = 400
+                body = json.dumps(result).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if req_path == "/api/pipeline/upload_h5":
+                import email.parser
+
+                content_len = int(self.headers.get("Content-Length", "0") or 0)
+                ctype = self.headers.get("Content-Type", "")
+                raw_body = self.rfile.read(content_len) if content_len > 0 else b""
+                try:
+                    fb_dir = (
+                        os.path.dirname(os.path.abspath(vm.replay_h5))
+                        if vm.replay_h5 and os.path.isfile(vm.replay_h5)
+                        else tempfile.gettempdir()
+                    )
+                    saved_paths: list[str] = []
+                    header_bytes = f"Content-Type: {ctype}\r\n\r\n".encode("utf-8")
+                    msg = email.parser.BytesParser().parsebytes(header_bytes + raw_body)
+                    for part in msg.walk():
+                        fname = part.get_filename()
+                        if not fname:
+                            continue
+                        safe_name = os.path.basename(fname)
+                        payload_bytes = part.get_payload(decode=True)
+                        if payload_bytes is None:
+                            continue
+                        dest_path = os.path.join(fb_dir, safe_name)
+                        with open(dest_path, "wb") as f_out:
+                            f_out.write(payload_bytes)
+                        saved_paths.append(dest_path)
+                    if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(".nxs.h5"):
+                        sp = saved_paths[0]
+                        if "merged" in os.path.basename(sp).lower():
+                            vm.payload_kwargs["images_h5"] = sp
+                        vm.replay_h5 = sp
+                        vm.reload()
+                    result = {"status": "ok", "saved_paths": saved_paths}
                     code = 200
                 except Exception as exc:
                     result = {"status": "error", "error": str(exc)}

@@ -35,6 +35,7 @@ Notes
   See here if you are interested: https://en.wikipedia.org/wiki/Quaternions_and_spatial_rotation#Rotation_identity
 """
 
+import re
 import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -42,30 +43,116 @@ from dataclasses import dataclass, field
 from typing import Union, List
 from subhkl.config import reduction_settings
 
+_TITLE_ANGLE_PATTERNS = {
+    "phi": re.compile(r"(?:axis0|phi)\s*=\s*([-+]?[0-9]*\.?[0-9]+)", re.IGNORECASE),
+    "kappa": re.compile(r"(?:axis1|kappa)\s*=\s*([-+]?[0-9]*\.?[0-9]+)", re.IGNORECASE),
+    "omega": re.compile(r"(?:axis2|omega)\s*=\s*([-+]?[0-9]*\.?[0-9]+)", re.IGNORECASE),
+    "chi": re.compile(r"(?:chi)\s*=\s*([-+]?[0-9]*\.?[0-9]+)", re.IGNORECASE),
+    "alpha": re.compile(r"(?:alpha)\s*=\s*([-+]?[0-9]*\.?[0-9]+)", re.IGNORECASE),
+}
+
+# CG4D Attocube goniometer PV mapping (outer XYZ translation + Omega/Kappa/Phi rotation;
+# underlying controllers: CG4D:SE:AMC300One and CG4D:SE:AMC300Two).
+# Note: Until these PVs are synced in CG4D NeXus DASlogs, rotation angles are harvested
+# from /entry/title first, with nominal 0° (and alpha=45° kappa-arm inclination) defaults.
+_ATTOCUBE_TRANS_PVS = {
+    "x": "CG4D:Mot:AttocubeGoni:Trans:ReadPosition0",
+    "y": "CG4D:Mot:AttocubeGoni:Trans:ReadPosition1",
+    "z": "CG4D:Mot:AttocubeGoni:Trans:ReadPosition2",
+}
+
+_ATTOCUBE_ROT_PVS = {
+    "phi": "CG4D:Mot:AttocubeGoni:Rot:ReadPosition0",
+    "kappa": "CG4D:Mot:AttocubeGoni:Rot:ReadPosition1",
+    "omega": "CG4D:Mot:AttocubeGoni:Rot:ReadPosition2",
+}
+
+_CG4D_NOMINAL_DEFAULTS = {
+    "omega": 0.0,
+    "alpha": 45.0,
+    "kappa": 0.0,
+    "phi": 0.0,
+    "chi": 0.0,
+}
+
+
+def harvest_goniometer_angles_from_title(title: str) -> dict[str, float]:
+    """Harvest goniometer angles (phi/axis0, kappa/axis1, omega/axis2, chi, alpha) from a NeXus run title."""
+    if not title:
+        return {}
+    parsed: dict[str, float] = {}
+    for key, pat in _TITLE_ANGLE_PATTERNS.items():
+        m = pat.search(str(title))
+        if m:
+            try:
+                parsed[key] = float(m.group(1))
+            except ValueError:
+                pass
+    return parsed
+
+
+def _read_nexus_title(f: h5py.File) -> str:
+    if "entry/title" not in f:
+        return ""
+    raw = f["entry/title"][()]
+    if isinstance(raw, np.ndarray) and raw.size > 0:
+        raw = raw.flat[0]
+    if isinstance(raw, (bytes, np.bytes_)):
+        return raw.decode("utf-8", errors="replace")
+    return str(raw)
+
 
 def get_rotation_data_from_nexus(filename, instrument):
     settings = reduction_settings[instrument]
     axes, angles, names = [], [], []
     with h5py.File(filename, "r") as f:
-        if "entry/DASlogs" not in f:
-            return axes, angles, names
-
-        das_logs = f["entry/DASlogs"]
+        das_logs = f["entry/DASlogs"] if "entry/DASlogs" in f else {}
+        title_str = _read_nexus_title(f)
+        title_angles = harvest_goniometer_angles_from_title(title_str)
 
         for axis_name, axis_spec in settings["Goniometer"].items():
-            try:
-                # Strip the suffix to get the real NeXus log name
-                log_name = axis_name.split("#")[0]
+            # Strip the suffix to get the real NeXus log name
+            log_name = axis_name.split("#")[0]
+            short_key = log_name.split(":")[-1].lower()
+            angle_deg = None
 
-                angle_deg = float(das_logs[log_name]["average_value"][0])
+            if log_name in das_logs and "average_value" in das_logs[log_name]:
+                try:
+                    angle_deg = float(das_logs[log_name]["average_value"][0])
+                except Exception:
+                    angle_deg = None
+
+            if angle_deg is None and short_key in title_angles:
+                angle_deg = float(title_angles[short_key])
+
+            if (
+                angle_deg is None
+                and title_angles
+                and str(instrument).upper() in ("CG4D", "IMAGINE")
+                and short_key in _CG4D_NOMINAL_DEFAULTS
+            ):
+                angle_deg = float(_CG4D_NOMINAL_DEFAULTS[short_key])
+
+            if angle_deg is None and short_key in _ATTOCUBE_ROT_PVS:
+                atto_pv = _ATTOCUBE_ROT_PVS[short_key]
+                if atto_pv in das_logs and "average_value" in das_logs[atto_pv]:
+                    try:
+                        angle_deg = float(das_logs[atto_pv]["average_value"][0])
+                    except Exception:
+                        angle_deg = None
+
+            if angle_deg is None and str(instrument).upper() in ("CG4D", "IMAGINE"):
+                if short_key in _CG4D_NOMINAL_DEFAULTS:
+                    angle_deg = float(_CG4D_NOMINAL_DEFAULTS[short_key])
+
+            if angle_deg is not None:
                 axis = np.array(axis_spec, dtype=float)
-
                 angles.append(angle_deg)
                 axes.append(axis)
                 names.append(log_name)
-            except Exception as e:
+            else:
                 print(
-                    f"Warning: Could not load goniometer axis {axis_name} from {filename}: {e}"
+                    f"Warning: Could not load goniometer axis {axis_name} from {filename} (title={title_str!r})"
                 )
 
     return axes, angles, names
