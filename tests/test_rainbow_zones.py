@@ -182,7 +182,9 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert "showZoneArcs: true" in content
     assert "drawSingleZoneArc" in content
     assert "const OVERLAY_PARALLAX_LAYER = 0.45;" in content
-    assert "detToScreen(pt[0], pt[1], w, h, OVERLAY_PARALLAX_LAYER)" in content
+    assert (
+        "detToScreen(pt[0] + shiftAz, pt[1], w, h, OVERLAY_PARALLAX_LAYER)" in content
+    )
     assert "pipeline-stages" in content
     assert "parseH5BuffersInBrowser" in content
     assert "btn-new-tab" in content
@@ -342,6 +344,172 @@ def test_finderless_solve_h5_forward_projection_and_stages(tmp_path):
     assert "Converged Solve UB" in payload["ladder_steps"][4]["stage"]
     assert payload["pipeline_stages"][0]["name"] == "1. REDUCE & MERGE"
     assert "imaginex_subhkl_solve" in payload["pipeline_stages"][1]["tool_ids"]
+
+
+def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
+    """Careless merge HDF5 stamping populates ASU orbits, residuals, scales, and multi-run sample_peaks."""
+    import gemmi
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    h5_path = tmp_path / "integrated.h5"
+    with h5py.File(h5_path, "w") as hf:
+        hf["instrument"] = np.bytes_("MANDI")
+        hf["space_group"] = np.bytes_("Ia-3d")
+        sgrp = hf.create_group("sample")
+        for k, v in [
+            ("a", 11.93),
+            ("b", 11.93),
+            ("c", 11.93),
+            ("alpha", 90.0),
+            ("beta", 90.0),
+            ("gamma", 90.0),
+        ]:
+            sgrp[k] = v
+        hf["wavelength_A"] = np.array([2.0, 4.0])
+        hf["B"] = np.eye(3) / 11.93
+        hf["U"] = np.eye(3)
+        hf["files"] = np.array([b"MANDI_12737.nxs.h5", b"MANDI_12739.nxs.h5"])
+        hf["bank_ids"] = np.array([10, 10])
+        hf["file_offsets"] = np.array([0, 1, 2])
+        ggrp = hf.create_group("goniometer")
+        R0 = np.eye(3)
+        ang = np.deg2rad(25.0)
+        R1 = np.array(
+            [
+                [np.cos(ang), 0.0, np.sin(ang)],
+                [0.0, 1.0, 0.0],
+                [-np.sin(ang), 0.0, np.cos(ang)],
+            ]
+        )
+        ggrp["R"] = np.stack([R0, R1], axis=0)
+        pgrp = hf.create_group("peaks")
+        pgrp["xyz"] = np.array(
+            [
+                [0.3, 0.1, -0.2],
+                [0.3, 0.1, -0.2],
+                [-0.25, 0.15, -0.1],
+                [0.2, -0.1, 0.25],
+            ]
+        )
+        pgrp["h"] = np.array([1, 2, -1, 1], dtype=np.int32)
+        pgrp["k"] = np.array([2, 4, 2, -2], dtype=np.int32)
+        pgrp["l"] = np.array([3, 6, 3, 3], dtype=np.int32)
+        pgrp["run_index"] = np.array([0, 0, 0, 1], dtype=np.int32)
+        pgrp["bank"] = np.array([10, 10, 11, 10], dtype=np.int32)
+        pgrp["pixel_r"] = np.array([64.0, 64.0, 80.0, 72.0])
+        pgrp["pixel_c"] = np.array([64.0, 64.0, 90.0, 50.0])
+        pgrp["intensity"] = np.array([120.0, 85.0, 115.0, 130.0])
+        pgrp["sigma"] = np.array([10.0, 9.0, 10.0, 11.0])
+        pgrp["wavelength"] = np.array([2.8, 1.4, 2.8, 2.8])
+        pgrp["var_u"] = np.array([1.5, 1.5, 1.5, 1.5])
+        pgrp["var_v"] = np.array([1.5, 1.5, 1.5, 1.5])
+        pgrp["cov_uv"] = np.array([0.0, 0.0, 0.0, 0.0])
+
+    sg = gemmi.find_spacegroup_by_name("Ia-3d")
+    asu = gemmi.ReciprocalAsu(sg)
+    ops = sg.operations()
+    h_asu1, _ = asu.to_asu([1, 2, 3], ops)
+    h_asu2, _ = asu.to_asu([2, 4, 6], ops)
+
+    mtz_m = gemmi.Mtz(with_base=True)
+    mtz_m.spacegroup = sg
+    mtz_m.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90, 90, 90))
+    mtz_m.add_dataset("crystal")
+    mtz_m.add_column("I", "J")
+    mtz_m.add_column("SigI", "Q")
+    mtz_m.set_data(
+        np.array(
+            [
+                [h_asu1[0], h_asu1[1], h_asu1[2], 122.0, 6.0],
+                [h_asu2[0], h_asu2[1], h_asu2[2], 84.0, 5.0],
+            ],
+            dtype=np.float32,
+        )
+    )
+    mtz_m.write_to_file(str(tmp_path / "merged.mtz"))
+
+    mtz_p = gemmi.Mtz(with_base=True)
+    mtz_p.spacegroup = sg
+    mtz_p.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90, 90, 90))
+    mtz_p.add_dataset("crystal")
+    for col, ctype in [
+        ("Iobs", "J"),
+        ("SigIobs", "Q"),
+        ("Ipred", "J"),
+        ("SigIpred", "Q"),
+        ("Scale", "R"),
+    ]:
+        mtz_p.add_column(col, ctype)
+    mtz_p.set_data(
+        np.array(
+            [
+                [h_asu1[0], h_asu1[1], h_asu1[2], 120.0, 10.0, 122.0, 6.0, 1.02],
+                [h_asu2[0], h_asu2[1], h_asu2[2], 85.0, 9.0, 84.0, 5.0, 0.98],
+                [h_asu1[0], h_asu1[1], h_asu1[2], 115.0, 10.0, 122.0, 6.0, 1.01],
+                [h_asu1[0], h_asu1[1], h_asu1[2], 130.0, 11.0, 122.0, 6.0, 1.06],
+            ],
+            dtype=np.float32,
+        )
+    )
+    mtz_p.write_to_file(str(tmp_path / "predictions.mtz"))
+
+    (tmp_path / "careless_metrics.json").write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "n_merged_asu": 2,
+                "n_observations": 4,
+                "mean_isigi": 18.6,
+                "mean_multiplicity": 2.0,
+                "completeness_pct": 42.5,
+                "cc_half": 0.962,
+                "cc_half_spearman": 0.951,
+                "resolution_bins": [
+                    {
+                        "bin": i,
+                        "d_max": 5.0 - i * 0.3,
+                        "d_min": 4.7 - i * 0.3,
+                        "n_refl": 10,
+                        "cc_half": 0.98 - i * 0.02,
+                    }
+                    for i in range(10)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    runner = NovaGalaxyPipelineRunner.__new__(NovaGalaxyPipelineRunner)
+    job_rec = {"stdout": ""}
+    runner._stamp_careless_merge_into_h5(str(h5_path), str(tmp_path), job_rec)
+
+    payload = build_rainbow_zone_payload(replay_h5=h5_path, frame_index=0)
+    assert payload["artifact_kind"] == "merged_careless"
+    assert payload["pending_stage"] == "done"
+    assert payload["merge_metrics"]["cc_half_overall"] == 0.962
+    assert payload["merge_metrics"]["completeness_pct"] == 42.5
+    assert len(payload["peaks"]) == 3
+    assert len(payload["sample_peaks"]) == 4
+    # Symmetry mates (1,2,3), (-1,2,3), (1,-2,3) in Ia-3d share the same canonical ASU orbit
+    assert (
+        payload["sample_peaks"][0]["asu_orbit_id"]
+        == payload["sample_peaks"][2]["asu_orbit_id"]
+        == payload["sample_peaks"][3]["asu_orbit_id"]
+    )
+    # Harmonic pair (1,2,3) and (2,4,6) on the same ray have harmonic_multiplicity == 2
+    assert payload["sample_peaks"][0]["harmonic_multiplicity"] == 2
+    assert payload["sample_peaks"][1]["harmonic_multiplicity"] == 2
+    assert "careless_residual" in payload["sample_peaks"][0]
+    assert "careless_scale" in payload["sample_peaks"][0]
+
+    html = render_rainbow_html(payload)
+    assert "btn-wulff-scope" in html
+    assert "btn-wulff-couple" in html
+    assert "sel-wulff-color" in html
+    assert "wulff-merge-bar" in html
+    assert payload["pipeline_stages"][3]["name"] == "4. MERGE (CARELESS)"
+    assert "imaginex_subhkl_merge" in payload["pipeline_stages"][3]["tool_ids"]
 
 
 def test_nova_mvvm_pydantic_and_view_model(tmp_path):

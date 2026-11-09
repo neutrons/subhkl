@@ -56,7 +56,7 @@ class NovaGalaxyPipelineRunner:
             "imaginex_subhkl_predict",
             "imaginex_subhkl_integrate",
         ],
-        "merge": ["imaginex_subhkl_mtz", "imaginex_merge", "imaginex_analysis"],
+        "merge": ["imaginex_subhkl_merge"],
     }
 
     def __init__(
@@ -475,6 +475,155 @@ class NovaGalaxyPipelineRunner:
         except Exception:
             pass
 
+    def _stamp_careless_merge_into_h5(
+        self,
+        integrated_h5_path: str,
+        work_dir: str,
+        job_record: dict[str, Any],
+    ) -> None:
+        """Persist Careless merge metrics and per-observation residuals/scales into ``integrated.h5``."""
+        import h5py
+        import gemmi
+        import numpy as np
+
+        metrics_path = os.path.join(work_dir, "careless_metrics.json")
+        pred_mtz_path = os.path.join(work_dir, "predictions.mtz")
+        merged_mtz_path = os.path.join(work_dir, "merged.mtz")
+        metrics_raw = "{}"
+        metrics_doc: dict[str, Any] = {}
+        if os.path.isfile(metrics_path):
+            with open(metrics_path, "r", encoding="utf-8") as fh:
+                metrics_raw = fh.read()
+                try:
+                    metrics_doc = json.loads(metrics_raw)
+                except Exception:
+                    metrics_doc = {}
+
+        with h5py.File(integrated_h5_path, "r+") as hf:
+            cgrp = hf.require_group("careless")
+            if "metrics_json" in cgrp:
+                del cgrp["metrics_json"]
+            cgrp.create_dataset(
+                "metrics_json",
+                data=np.bytes_(metrics_raw.encode("utf-8")),
+            )
+
+            if "peaks" in hf and os.path.isfile(pred_mtz_path):
+                pgrp = hf["peaks"]
+                ph = np.asarray(pgrp["h"][()], dtype=int)
+                pk = np.asarray(pgrp["k"][()], dtype=int)
+                pl = np.asarray(pgrp["l"][()], dtype=int)
+                pI = np.asarray(pgrp["intensity"][()], dtype=float)
+                pS = np.asarray(pgrp["sigma"][()], dtype=float)
+                n_peaks = len(ph)
+
+                mtz_pred = gemmi.read_mtz_file(pred_mtz_path)
+                sg = mtz_pred.spacegroup or gemmi.find_spacegroup_by_name("P 1")
+                asu = gemmi.ReciprocalAsu(sg)
+                ops = sg.operations()
+                pcols = {
+                    c.label: np.array(c, dtype=np.float64) for c in mtz_pred.columns
+                }
+                pred_map: dict[
+                    tuple[int, int, int],
+                    list[tuple[float, float, float, float, float]],
+                ] = {}
+                for j in range(mtz_pred.nreflections):
+                    key = (
+                        int(pcols["H"][j]),
+                        int(pcols["K"][j]),
+                        int(pcols["L"][j]),
+                    )
+                    pred_map.setdefault(key, []).append(
+                        (
+                            float(
+                                pcols.get("Iobs", np.zeros(mtz_pred.nreflections))[j]
+                            ),
+                            float(
+                                pcols.get("SigIobs", np.ones(mtz_pred.nreflections))[j]
+                            ),
+                            float(
+                                pcols.get("Ipred", np.zeros(mtz_pred.nreflections))[j]
+                            ),
+                            float(
+                                pcols.get("SigIpred", np.ones(mtz_pred.nreflections))[j]
+                            ),
+                            float(
+                                pcols.get("Scale", np.ones(mtz_pred.nreflections))[j]
+                            ),
+                        )
+                    )
+
+                merged_map: dict[tuple[int, int, int], tuple[float, float]] = {}
+                if os.path.isfile(merged_mtz_path):
+                    mtz_m = gemmi.read_mtz_file(merged_mtz_path)
+                    mcols = {
+                        c.label: np.array(c, dtype=np.float64) for c in mtz_m.columns
+                    }
+                    mI = mcols.get("I", mcols.get("I(+)", np.zeros(mtz_m.nreflections)))
+                    mS = mcols.get(
+                        "SigI", mcols.get("SigI(+)", np.ones(mtz_m.nreflections))
+                    )
+                    for j in range(mtz_m.nreflections):
+                        mkey = (
+                            int(mcols["H"][j]),
+                            int(mcols["K"][j]),
+                            int(mcols["L"][j]),
+                        )
+                        merged_map[mkey] = (float(mI[j]), float(mS[j]))
+
+                residuals = np.full(n_peaks, np.nan, dtype=np.float64)
+                scales = np.full(n_peaks, np.nan, dtype=np.float64)
+                ipreds = np.full(n_peaks, np.nan, dtype=np.float64)
+                merged_i = np.full(n_peaks, np.nan, dtype=np.float64)
+                merged_sigi = np.full(n_peaks, np.nan, dtype=np.float64)
+                asu_hkl_arr = np.zeros((n_peaks, 3), dtype=np.int32)
+
+                for i in range(n_peaks):
+                    h_asu, _ = asu.to_asu([int(ph[i]), int(pk[i]), int(pl[i])], ops)
+                    key = (int(h_asu[0]), int(h_asu[1]), int(h_asu[2]))
+                    asu_hkl_arr[i] = key
+                    if key in merged_map:
+                        merged_i[i], merged_sigi[i] = merged_map[key]
+                    cands = pred_map.get(key)
+                    if cands:
+                        best = min(
+                            cands,
+                            key=lambda c: abs(c[0] - pI[i]) + abs(c[1] - pS[i]),
+                        )
+                        iobs, sigiobs, ipred, sigipred, scale = best
+                        denom = max(float(np.hypot(sigiobs, 0.5 * sigipred)), 1e-6)
+                        residuals[i] = (iobs - ipred) / denom
+                        scales[i] = scale
+                        ipreds[i] = ipred
+
+                for ds_name, arr in (
+                    ("careless_residual", residuals),
+                    ("careless_scale", scales),
+                    ("careless_ipred", ipreds),
+                    ("merged_i", merged_i),
+                    ("merged_sigi", merged_sigi),
+                    ("asu_hkl", asu_hkl_arr),
+                ):
+                    if ds_name in pgrp:
+                        del pgrp[ds_name]
+                    pgrp.create_dataset(ds_name, data=arr)
+
+        if metrics_doc:
+            cc_val = metrics_doc.get("cc_half")
+            cc_str = f"{cc_val:.4f}" if isinstance(cc_val, (int, float)) else "N/A"
+            comp_val = metrics_doc.get("completeness_pct")
+            comp_str = (
+                f"{comp_val:.1f}%" if isinstance(comp_val, (int, float)) else "N/A"
+            )
+            job_record["stdout"] += (
+                f"\n[careless] Merged {metrics_doc.get('n_merged_asu', 0)} ASU reflections "
+                f"from {metrics_doc.get('n_observations', 0)} observations | "
+                f"CC1/2={cc_str} | <I/sigma>={metrics_doc.get('mean_isigi', 0.0):.2f} | "
+                f"Multiplicity={metrics_doc.get('mean_multiplicity', 0.0):.2f}x | "
+                f"Completeness={comp_str}\n"
+            )
+
     def _ensure_galaxy_h5_dataset(
         self,
         store: Any,
@@ -603,11 +752,15 @@ class NovaGalaxyPipelineRunner:
                     solve_path = cand_solve
 
             tool_inputs: dict[str, Any] = {}
-            if stage_id in ("reduce", "solve", "integrate"):
+            if stage_id in ("reduce", "solve", "integrate", "merge"):
                 required_tool = (
                     "imaginex_subhkl_prepare_peaks"
                     if stage_id == "reduce"
-                    else "imaginex_subhkl_solve"
+                    else (
+                        "imaginex_subhkl_merge"
+                        if stage_id == "merge"
+                        else "imaginex_subhkl_solve"
+                    )
                 )
                 if not self._has_tool_on_galaxy(required_tool):
                     if (
@@ -788,6 +941,27 @@ class NovaGalaxyPipelineRunner:
                 }
                 for i_nxs, nxs_p in enumerate(raw_nxs):
                     tool_inputs[f"inputs_{i_nxs}|input"] = nxs_p
+            elif stage_id == "merge":
+                primary_tool = "imaginex_subhkl_merge"
+                mtz_in_path = os.path.join(work_dir, "reflections.mtz")
+                if not os.path.isfile(mtz_in_path):
+                    raise RuntimeError(
+                        f"Unmerged reflections.mtz not found in {work_dir}; run Integrate first."
+                    )
+                mtz_id = self._ensure_galaxy_h5_dataset(
+                    store,
+                    mtz_in_path,
+                    job_record,
+                    force_upload=True,
+                    file_ext="mtz",
+                )
+                tool_inputs = {
+                    "reflections": {"src": "hda", "id": mtz_id},
+                    "iterations": int(params.get("iterations") or 10000),
+                    "studenttDof": float(params.get("studentt_dof") or 4.0),
+                    "mergeHalfDatasets": True,
+                    "anomalous": bool(params.get("anomalous", False)),
+                }
             else:
                 primary_tool = "imaginex_subhkl_metrics"
                 idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
@@ -1502,23 +1676,138 @@ class NovaGalaxyPipelineRunner:
                 f"{shlex.join(mtz_cmd)}"
             )
             inner_cmd = ["bash", "-c", chained]
-        elif stage_id == "merge" and os.path.isfile(
-            integrated_dest if os.path.isfile(integrated_dest) else solve_path
-        ):
-            target_h5 = (
-                integrated_dest if os.path.isfile(integrated_dest) else solve_path
+        elif stage_id == "merge":
+            if not os.path.isfile(mtz_dest):
+                alt_mtz = os.path.join(
+                    os.path.dirname(os.path.abspath(self.replay_h5)),
+                    "reflections.mtz",
+                )
+                if os.path.isfile(alt_mtz):
+                    shutil.copy2(alt_mtz, mtz_dest)
+                else:
+                    src_int = (
+                        integrated_dest
+                        if os.path.isfile(integrated_dest)
+                        else self.replay_h5
+                    )
+                    if os.path.isfile(src_int):
+                        try:
+                            from subhkl.io.export import MTZExporter
+
+                            exp = MTZExporter(
+                                src_int,
+                                space_group_name=str(sg),
+                                predictions_file=(
+                                    pred_dest if os.path.isfile(pred_dest) else None
+                                ),
+                                corrections_file=(
+                                    solve_path if os.path.isfile(solve_path) else None
+                                ),
+                            )
+                            exp.write_mtz(mtz_dest)
+                        except Exception:
+                            pass
+            careless_iters = int(params.get("iterations") or 10000)
+            studentt_dof = float(params.get("studentt_dof") or 4.0)
+            merge_work = os.path.join(work_dir, "careless_work")
+            os.makedirs(merge_work, exist_ok=True)
+            unmerged_mtz = os.path.join(merge_work, "input_unmerged.mtz")
+            out_prefix = os.path.join(merge_work, "careless")
+            merged_mtz_out = os.path.join(work_dir, "merged.mtz")
+            pred_mtz_out = os.path.join(work_dir, "predictions.mtz")
+            xval_mtz_out = os.path.join(work_dir, "xval.mtz")
+            metrics_json_out = os.path.join(work_dir, "careless_metrics.json")
+            prep_py = (
+                "import gemmi, reciprocalspaceship as rs\n"
+                f"mtz = gemmi.read_mtz_file({mtz_dest!r})\n"
+                "c = mtz.cell\n"
+                "na = 90.0 if abs(c.alpha - 90) < 0.2 else (120.0 if abs(c.alpha - 120) < 0.2 else c.alpha)\n"
+                "nb = 90.0 if abs(c.beta - 90) < 0.2 else (120.0 if abs(c.beta - 120) < 0.2 else c.beta)\n"
+                "ng = 90.0 if abs(c.gamma - 90) < 0.2 else (120.0 if abs(c.gamma - 120) < 0.2 else c.gamma)\n"
+                "mtz.cell.set(c.a, c.b, c.c, na, nb, ng)\n"
+                f"cell_mtz = {os.path.join(merge_work, 'input_cell.mtz')!r}\n"
+                "mtz.write_to_file(cell_mtz)\n"
+                "ds = rs.read_mtz(cell_mtz)\n"
+                "if 'SIGI' in ds:\n"
+                "    ds = ds[ds['SIGI'] > 0]\n"
+                "if not ds.get_m_isym_keys():\n"
+                "    ds = ds.hkl_to_asu()\n"
+                "ds.merged = False\n"
+                f"ds.write_mtz({unmerged_mtz!r})\n"
+                "cols = {col.label for col in mtz.columns}\n"
+                "keys = ['WAVEL','THETA','PHI','dHKL','H_0','K_0','L_0','H','K','L','image_id','file_id','asu_id','harmonic_id']\n"
+                "for extra in ('SIGEFF', 'SNAPD', 'DPHI', 'DTX', 'DTY', 'DTZ'):\n"
+                "    if extra in cols:\n"
+                "        keys.append(extra)\n"
+                "print(','.join(keys))\n"
             )
-            inner_cmd = [
-                "python",
-                "-u",
-                "-m",
-                "subhkl.io.parser",
-                "metrics",
-                target_h5,
-                "--instrument",
-                str(inst),
-                "--per-run",
-            ]
+            post_py = (
+                "import json, os, shutil, gemmi, numpy as np\n"
+                "import reciprocalspaceship as rs\n"
+                "from scipy.stats import pearsonr, spearmanr\n"
+                f"shutil.copy2({(out_prefix + '_0.mtz')!r}, {merged_mtz_out!r})\n"
+                f"shutil.copy2({(out_prefix + '_predictions_0.mtz')!r}, {pred_mtz_out!r})\n"
+                f"if os.path.exists({(out_prefix + '_xval_0.mtz')!r}):\n"
+                f"    shutil.copy2({(out_prefix + '_xval_0.mtz')!r}, {xval_mtz_out!r})\n"
+                "summary = {'status': 'ok'}\n"
+                f"mtz = gemmi.read_mtz_file({merged_mtz_out!r})\n"
+                "cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}\n"
+                "I = cols.get('I', cols.get('I(+)', np.array([])))\n"
+                "SigI = cols.get('SigI', cols.get('SigI(+)', np.array([])))\n"
+                "valid = np.isfinite(I) & np.isfinite(SigI) & (SigI > 0)\n"
+                "summary['n_merged_asu'] = int(np.sum(valid))\n"
+                "summary['mean_isigi'] = float(np.mean(I[valid] / SigI[valid])) if np.any(valid) else 0.0\n"
+                f"pmtz = gemmi.read_mtz_file({pred_mtz_out!r})\n"
+                "n_obs = int(pmtz.nreflections)\n"
+                "summary['n_observations'] = n_obs\n"
+                "summary['mean_multiplicity'] = float(n_obs / max(1, summary['n_merged_asu'])) if summary['n_merged_asu'] > 0 else 0.0\n"
+                "try:\n"
+                "    h_m = cols['H'][valid].astype(int); k_m = cols['K'][valid].astype(int); l_m = cols['L'][valid].astype(int)\n"
+                "    d_m = np.array([mtz.cell.calculate_d([int(hh), int(kk), int(ll)]) for hh, kk, ll in zip(h_m, k_m, l_m)])\n"
+                "    dmin_obs = float(np.min(d_m)) if len(d_m) else 2.0\n"
+                "    theo_asu = rs.utils.generate_reciprocal_asu(mtz.cell, mtz.spacegroup, dmin_obs)\n"
+                "    summary['n_theoretical_asu'] = int(len(theo_asu))\n"
+                "    summary['completeness_pct'] = float(100.0 * summary['n_merged_asu'] / max(1, len(theo_asu)))\n"
+                "    summary['d_min'] = round(dmin_obs, 3)\n"
+                "    summary['d_max'] = round(float(np.max(d_m)), 3) if len(d_m) else 10.0\n"
+                "except Exception as e:\n"
+                "    summary['completeness_error'] = str(e)\n"
+                f"if os.path.exists({xval_mtz_out!r}):\n"
+                f"    xv = gemmi.read_mtz_file({xval_mtz_out!r})\n"
+                "    xcols = {c.label: np.array(c, dtype=np.float64) for c in xv.columns}\n"
+                "    h = xcols['H'].astype(int); k = xcols['K'].astype(int); l = xcols['L'].astype(int)\n"
+                "    half = xcols.get('half', np.zeros_like(h)).astype(int)\n"
+                "    xI = xcols.get('I', xcols.get('F', np.zeros_like(xcols['H'])))\n"
+                "    d_arr = np.array([xv.cell.calculate_d([int(hh), int(kk), int(ll)]) for hh, kk, ll in zip(h, k, l)])\n"
+                "    m0 = half == 0; m1 = half == 1\n"
+                "    map0 = {(int(hh), int(kk), int(ll)): (float(val), float(dd)) for hh, kk, ll, val, dd in zip(h[m0], k[m0], l[m0], xI[m0], d_arr[m0]) if np.isfinite(val)}\n"
+                "    map1 = {(int(hh), int(kk), int(ll)): float(val) for hh, kk, ll, val in zip(h[m1], k[m1], l[m1], xI[m1]) if np.isfinite(val)}\n"
+                "    common = [key for key in map0 if key in map1]\n"
+                "    if len(common) >= 3:\n"
+                "        v0 = np.array([map0[k][0] for k in common]); v1 = np.array([map1[k] for k in common]); d_c = np.array([map0[k][1] for k in common])\n"
+                "        summary['cc_half'] = float(pearsonr(v0, v1)[0])\n"
+                "        summary['cc_half_spearman'] = float(spearmanr(v0, v1)[0])\n"
+                "        inv_d2 = 1.0 / np.maximum(d_c ** 2, 1e-6)\n"
+                "        edges = np.linspace(inv_d2.min(), inv_d2.max(), 11)\n"
+                "        bins = []\n"
+                "        for b in range(10):\n"
+                "            bm = (inv_d2 >= edges[b]) & (inv_d2 <= edges[b+1] if b == 9 else inv_d2 < edges[b+1])\n"
+                "            cc_b = float(pearsonr(v0[bm], v1[bm])[0]) if np.sum(bm) >= 3 else float('nan')\n"
+                "            d_hi = float(1.0 / np.sqrt(max(edges[b+1], 1e-6)))\n"
+                "            d_lo = float(1.0 / np.sqrt(max(edges[b], 1e-6)))\n"
+                "            bins.append({'bin': b, 'd_max': round(d_lo, 2), 'd_min': round(d_hi, 2), 'n_refl': int(np.sum(bm)), 'cc_half': round(cc_b, 4) if np.isfinite(cc_b) else None})\n"
+                "        summary['resolution_bins'] = bins\n"
+                f"with open({metrics_json_out!r}, 'w') as fh:\n"
+                "    json.dump(summary, fh, indent=2)\n"
+                "print('[careless] Merge summary:', json.dumps(summary))\n"
+            )
+            chained_merge = (
+                f"set -e; "
+                f"MKEYS=$(python -c {shlex.quote(prep_py)}) && "
+                f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
+                f"python -c {shlex.quote(post_py)}"
+            )
+            inner_cmd = ["bash", "-c", chained_merge]
         else:
             inner_cmd = [
                 "python",
@@ -1535,13 +1824,18 @@ class NovaGalaxyPipelineRunner:
                 "72",
             ]
 
-        container_image = "ghcr.io/neutrons/subhkl:feat-rainbow-zones"
+        container_image = (
+            "ghcr.io/jglaser/careless:cuda"
+            if stage_id == "merge"
+            else "ghcr.io/neutrons/subhkl:feat-rainbow-zones"
+        )
         if shutil.which("podman"):
             raw_dirs = {os.path.dirname(os.path.abspath(p)) for p in raw_nxs_local}
             mount_dirs = sorted(
                 {
                     os.path.dirname(merged_path),
                     os.path.dirname(solve_path),
+                    work_dir,
                     tempfile.gettempdir(),
                     *raw_dirs,
                 }
@@ -1572,7 +1866,7 @@ class NovaGalaxyPipelineRunner:
             local_subhkl_pkg = os.path.dirname(
                 os.path.dirname(os.path.abspath(__file__))
             )
-            if os.path.isdir(local_subhkl_pkg):
+            if os.path.isdir(local_subhkl_pkg) and stage_id != "merge":
                 cmd.extend(
                     [
                         "-v",
@@ -1903,6 +2197,54 @@ class NovaGalaxyPipelineRunner:
                                 job_record["stdout"] += (
                                     f"[nova -> galaxy] Warning uploading integrated outputs: {self._clean_err_msg(up_exc)}\n"
                                 )
+                    elif stage_id == "merge":
+                        target_int = (
+                            integrated_dest
+                            if os.path.isfile(integrated_dest)
+                            else self.replay_h5
+                        )
+                        try:
+                            if os.path.isfile(target_int):
+                                self._stamp_careless_merge_into_h5(
+                                    target_int, work_dir, job_record
+                                )
+                                final_h5 = target_int
+                        except Exception as merge_exc:
+                            job_record["stdout"] += (
+                                f"\n[careless] Warning stamping merge results into HDF5: {merge_exc}\n"
+                            )
+                        if self.is_connected:
+                            try:
+                                store = self.get_datastore("IMAGINE-X SubHKL")
+                                outs_up = []
+                                for fn, ext in (
+                                    ("merged.mtz", "binary"),
+                                    ("predictions.mtz", "binary"),
+                                    ("xval.mtz", "binary"),
+                                    ("careless_metrics.json", "json"),
+                                ):
+                                    fp = os.path.join(work_dir, fn)
+                                    if os.path.isfile(fp):
+                                        did = self._ensure_galaxy_h5_dataset(
+                                            store,
+                                            fp,
+                                            job_record,
+                                            force_upload=True,
+                                            file_ext=ext,
+                                        )
+                                        outs_up.append(
+                                            {
+                                                "id": did,
+                                                "name": fn,
+                                                "extension": ext,
+                                            }
+                                        )
+                                if outs_up:
+                                    job_record["outputs"] = outs_up
+                            except Exception as up_exc:
+                                job_record["stdout"] += (
+                                    f"[nova -> galaxy] Warning uploading Careless outputs: {self._clean_err_msg(up_exc)}\n"
+                                )
 
                     if os.path.isfile(final_h5):
                         job_record["output_h5_path"] = final_h5
@@ -2213,6 +2555,54 @@ class NovaGalaxyPipelineRunner:
                                         on_complete_h5(tmp_path)
                                         job_record["updated_payload_ready"] = True
                             if (
+                                final_step
+                                and job_record.get("stage_id") == "merge"
+                                and work_dir
+                                and os.path.isdir(work_dir)
+                            ):
+                                for out_d in job_record.get("outputs", []):
+                                    oid = out_d.get("id")
+                                    oname = str(out_d.get("name") or "")
+                                    if not oid:
+                                        continue
+                                    dest_name = None
+                                    for cand in (
+                                        "merged.mtz",
+                                        "predictions.mtz",
+                                        "xval.mtz",
+                                        "careless_metrics.json",
+                                    ):
+                                        if cand in oname or oname == cand.replace(
+                                            ".", "_"
+                                        ):
+                                            dest_name = cand
+                                            break
+                                    if dest_name:
+                                        try:
+                                            bdata = self._api_request(
+                                                "GET",
+                                                f"/api/datasets/{oid}/display",
+                                                raw=True,
+                                                timeout=180.0,
+                                            )
+                                            dest_p = os.path.join(work_dir, dest_name)
+                                            with open(dest_p, "wb") as f:
+                                                f.write(bdata)
+                                            job_record["stdout"] += (
+                                                f"[careless] Saved {dest_name} -> {dest_p}\n"
+                                            )
+                                        except Exception:
+                                            pass
+                                int_target = os.path.join(work_dir, "integrated.h5")
+                                if os.path.isfile(int_target):
+                                    self._stamp_careless_merge_into_h5(
+                                        int_target, work_dir, job_record
+                                    )
+                                    job_record["output_h5_path"] = int_target
+                                    if callable(on_complete_h5):
+                                        on_complete_h5(int_target)
+                                        job_record["updated_payload_ready"] = True
+                            elif (
                                 final_step
                                 and mtz_outs
                                 and work_dir

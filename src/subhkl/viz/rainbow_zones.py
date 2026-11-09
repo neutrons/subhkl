@@ -532,11 +532,12 @@ def _extract_from_h5(
 
         U = np.asarray(f["sample/U"][()], dtype=float) if "sample/U" in f else None
         B = np.asarray(f["sample/B"][()], dtype=float) if "sample/B" in f else None
-        space_group = (
-            _decode_str(f["sample/space_group"][()], "P 1")
-            if "sample/space_group" in f
-            else "P 1"
-        )
+        if "sample/space_group" in f:
+            space_group = _decode_str(f["sample/space_group"][()], "P 1")
+        elif "space_group" in f:
+            space_group = _decode_str(f["space_group"][()], "P 1")
+        else:
+            space_group = "P 1"
 
         cell = None
         if all(f"sample/{k}" in f for k in ("a", "b", "c", "alpha", "beta", "gamma")):
@@ -955,11 +956,67 @@ def _extract_from_h5(
             if "peaks/run_index" in f
             else None
         )
+        careless_residual = (
+            np.asarray(f["peaks/careless_residual"][()], dtype=float)
+            if "peaks/careless_residual" in f
+            else None
+        )
+        careless_scale = (
+            np.asarray(f["peaks/careless_scale"][()], dtype=float)
+            if "peaks/careless_scale" in f
+            else None
+        )
+        merged_i = (
+            np.asarray(f["peaks/merged_i"][()], dtype=float)
+            if "peaks/merged_i" in f
+            else None
+        )
+        merged_sigi = (
+            np.asarray(f["peaks/merged_sigi"][()], dtype=float)
+            if "peaks/merged_sigi" in f
+            else None
+        )
+
+        def _normalize_merge_metrics(doc_m: dict[str, Any]) -> dict[str, Any]:
+            out = dict(doc_m)
+            if "cc_half_overall" not in out and "cc_half" in out:
+                out["cc_half_overall"] = out["cc_half"]
+            if "mean_i_over_sigi" not in out and "mean_isigi" in out:
+                out["mean_i_over_sigi"] = out["mean_isigi"]
+            if "multiplicity" not in out and "mean_multiplicity" in out:
+                out["multiplicity"] = out["mean_multiplicity"]
+            if "cc_half_bins" not in out and isinstance(
+                out.get("resolution_bins"), list
+            ):
+                out["cc_half_bins"] = out["resolution_bins"]
+            return out
+
+        merge_metrics: dict[str, Any] | None = None
+        if "careless/metrics_json" in f:
+            try:
+                raw_m = _decode_str(f["careless/metrics_json"][()], "{}")
+                doc_m = json.loads(raw_m)
+                if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
+                    merge_metrics = _normalize_merge_metrics(doc_m)
+            except Exception:
+                pass
+        elif "peaks" in f:
+            sib_m = Path(h5_path).parent / "careless_metrics.json"
+            if sib_m.is_file():
+                try:
+                    with open(sib_m, "r", encoding="utf-8") as mfh:
+                        doc_m = json.load(mfh)
+                        if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
+                            merge_metrics = _normalize_merge_metrics(doc_m)
+                except Exception:
+                    pass
 
         artifact_kind = "solve"
         peak_shape_mode = "solved_circle"
         if var_u is not None and var_v is not None:
-            artifact_kind = "integrator"
+            artifact_kind = (
+                "merged_careless" if merge_metrics is not None else "integrator"
+            )
             is_iso = bool(
                 np.allclose(var_u, var_v)
                 and (cov_uv is None or np.allclose(cov_uv, 0.0))
@@ -974,6 +1031,92 @@ def _extract_from_h5(
         elif "entry" in f and U is None:
             artifact_kind = "raw_nexus"
             peak_shape_mode = "none"
+
+        # Capture all-runs sample-space peak arrays before filtering to active_frame
+        all_runs_data: dict[str, Any] | None = None
+        if (
+            peaks_xyz is not None
+            and len(peaks_xyz) > 0
+            and hkl is not None
+            and len(hkl) == len(peaks_xyz)
+        ):
+            mask_all_snr = np.ones(len(peaks_xyz), dtype=bool)
+            if (
+                intensity is not None
+                and sigma is not None
+                and len(intensity) == len(peaks_xyz)
+                and len(sigma) == len(peaks_xyz)
+            ):
+                cand_snr = (sigma > 0) & (intensity / np.maximum(sigma, 1e-9) >= 2.5)
+                if int(np.sum(cand_snr)) >= 20:
+                    mask_all_snr = cand_snr
+            idx_all = np.flatnonzero(mask_all_snr)
+            if len(idx_all) > 3500:
+                if intensity is not None and len(intensity) == len(peaks_xyz):
+                    top_k = np.argsort(-intensity[idx_all])[:3500]
+                    idx_all = np.sort(idx_all[top_k])
+                else:
+                    idx_all = idx_all[:3500]
+            r_idx_all = (
+                run_index[idx_all]
+                if run_index is not None and len(run_index) == len(peaks_xyz)
+                else np.zeros(len(idx_all), dtype=int)
+            )
+            R_per_run: dict[int, np.ndarray] = {}
+            for ur in np.unique(r_idx_all):
+                ur_i = int(ur)
+                f0_r = (
+                    int(offsets[ur_i])
+                    if offsets is not None and 0 <= ur_i < len(offsets)
+                    else ur_i
+                )
+                if R_all is not None and R_all.ndim == 3 and len(R_all) > 0:
+                    if 0 <= f0_r < len(R_all):
+                        R_per_run[ur_i] = R_all[f0_r]
+                    elif 0 <= ur_i < len(R_all):
+                        R_per_run[ur_i] = R_all[ur_i]
+                if (
+                    ur_i not in R_per_run
+                    and gonio_axes is not None
+                    and gonio_angles_nom is not None
+                    and gonio_angles_nom.ndim == 2
+                    and 0 <= f0_r < len(gonio_angles_nom)
+                ):
+                    try:
+                        from subhkl.instrument.goniometer import (
+                            calc_goniometer_rotation_matrix,
+                        )
+
+                        R_per_run[ur_i] = calc_goniometer_rotation_matrix(
+                            gonio_axes, gonio_angles_nom[f0_r]
+                        )
+                    except Exception:
+                        pass
+            all_runs_data = {
+                "peaks_xyz": peaks_xyz[idx_all],
+                "hkl": hkl[idx_all],
+                "wavelength": lam[idx_all]
+                if lam is not None and len(lam) == len(peaks_xyz)
+                else None,
+                "intensity": intensity[idx_all]
+                if intensity is not None and len(intensity) == len(peaks_xyz)
+                else None,
+                "sigma": sigma[idx_all]
+                if sigma is not None and len(sigma) == len(peaks_xyz)
+                else None,
+                "bank": bank[idx_all]
+                if bank is not None and len(bank) == len(peaks_xyz)
+                else None,
+                "run_index": r_idx_all,
+                "careless_residual": careless_residual[idx_all]
+                if careless_residual is not None
+                and len(careless_residual) == len(peaks_xyz)
+                else None,
+                "careless_scale": careless_scale[idx_all]
+                if careless_scale is not None and len(careless_scale) == len(peaks_xyz)
+                else None,
+                "R_per_run": R_per_run,
+            }
 
         # If multi-frame dataset has per-run peaks (e.g. integrated.h5), filter to active_frame
         if (
@@ -1005,6 +1148,16 @@ def _extract_from_h5(
                     var_v = var_v[mask_run]
                 if cov_uv is not None and len(cov_uv) == len(mask_run):
                     cov_uv = cov_uv[mask_run]
+                if careless_residual is not None and len(careless_residual) == len(
+                    mask_run
+                ):
+                    careless_residual = careless_residual[mask_run]
+                if careless_scale is not None and len(careless_scale) == len(mask_run):
+                    careless_scale = careless_scale[mask_run]
+                if merged_i is not None and len(merged_i) == len(mask_run):
+                    merged_i = merged_i[mask_run]
+                if merged_sigi is not None and len(merged_sigi) == len(mask_run):
+                    merged_sigi = merged_sigi[mask_run]
                 run_index = run_index[mask_run]
 
         # Filter out zero/noise predictions in integrated.h5 (keep significant reflections I/sigma >= 2.5)
@@ -1036,6 +1189,16 @@ def _extract_from_h5(
                     var_v = var_v[snr_mask]
                 if cov_uv is not None and len(cov_uv) == len(snr_mask):
                     cov_uv = cov_uv[snr_mask]
+                if careless_residual is not None and len(careless_residual) == len(
+                    snr_mask
+                ):
+                    careless_residual = careless_residual[snr_mask]
+                if careless_scale is not None and len(careless_scale) == len(snr_mask):
+                    careless_scale = careless_scale[snr_mask]
+                if merged_i is not None and len(merged_i) == len(snr_mask):
+                    merged_i = merged_i[snr_mask]
+                if merged_sigi is not None and len(merged_sigi) == len(snr_mask):
+                    merged_sigi = merged_sigi[snr_mask]
                 if run_index is not None and len(run_index) == len(snr_mask):
                     run_index = run_index[snr_mask]
 
@@ -1490,6 +1653,12 @@ def _extract_from_h5(
             "run_index": run_index,
             "hkl": hkl,
             "wavelength": lam,
+            "careless_residual": careless_residual,
+            "careless_scale": careless_scale,
+            "merged_i": merged_i,
+            "merged_sigi": merged_sigi,
+            "merge_metrics": merge_metrics,
+            "all_runs_data": all_runs_data,
             "R_gonio": R_gonio,
             "solve_diagnostics": solve_diagnostics,
             "frame_slice": frame_slice,
@@ -1714,6 +1883,8 @@ def _pending_stage_for_artifact_kind(artifact_kind: str | None) -> str:
         return "solve"
     if kind == "integrator":
         return "merge"
+    if kind == "merged_careless":
+        return "done"
     return "integrate"
 
 
@@ -1726,6 +1897,7 @@ def _build_ndip_pipeline_stages(
     cell: list[float] | None = None,
     solve_diagnostics: dict[str, Any] | None = None,
     artifact_kind: str = "solve",
+    merge_metrics: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build the 4-stage coarse NDIP/Galaxy workflow pipeline descriptors."""
     n_peaks = len(peaks_list)
@@ -1742,9 +1914,12 @@ def _build_ndip_pipeline_stages(
     )
     pending_stage = _pending_stage_for_artifact_kind(artifact_kind)
     stage_order = ["reduce", "solve", "integrate", "merge"]
-    pending_idx = (
-        stage_order.index(pending_stage) if pending_stage in stage_order else 1
-    )
+    if pending_stage == "done":
+        pending_idx = len(stage_order)
+    else:
+        pending_idx = (
+            stage_order.index(pending_stage) if pending_stage in stage_order else 1
+        )
 
     def _stage_status(idx: int) -> str:
         if idx < pending_idx:
@@ -1752,6 +1927,13 @@ def _build_ndip_pipeline_stages(
         if idx == pending_idx:
             return "pending"
         return "ready"
+
+    merge_artifact_str = "merged.mtz + predictions.mtz + careless_metrics.json"
+    if isinstance(merge_metrics, dict) and merge_metrics.get("n_merged_asu"):
+        cc_val = merge_metrics.get("cc_half_overall")
+        n_asu = int(merge_metrics.get("n_merged_asu", 0))
+        cc_txt = f"CC1/2={float(cc_val):.3f} • " if cc_val is not None else ""
+        merge_artifact_str = f"merged.mtz ({cc_txt}{n_asu:,} ASU)"
 
     return [
         {
@@ -1816,15 +1998,15 @@ def _build_ndip_pipeline_stages(
         {
             "stage_id": "merge",
             "step_num": 4,
-            "name": "4. MERGE & MTZ",
-            "tool_ids": ["imaginex_subhkl_mtz", "imaginex_merge", "imaginex_analysis"],
-            "container": "ghcr.io/neutrons/subhkl:1.4.0",
-            "artifact": "reflections.mtz + completeness report",
+            "name": "4. MERGE (CARELESS)",
+            "tool_ids": ["imaginex_subhkl_merge"],
+            "container": "ghcr.io/jglaser/careless:cuda",
+            "artifact": merge_artifact_str,
             "status": _stage_status(3),
             "ladder_rung_idx": 4,
             "summary": (
-                "NDIP Multi-Orientation Merge & MTZ Export: merges integrated reflections across "
-                "goniometer settings into a structure-factor MTZ dataset."
+                "NDIP Careless Variational Poly-Laue Merge (imaginex_subhkl_merge): scales and merges "
+                "multi-orientation reflections into ASU structure-factor amplitudes with half-dataset CC1/2 and per-spot residuals."
             ),
         },
     ]
@@ -1878,6 +2060,12 @@ def build_rainbow_zone_payload(
     peak_shape_mode = "solved_circle"
     hkl_arr = None
     lam_arr = None
+    careless_residual_arr = None
+    careless_scale_arr = None
+    merged_i_arr = None
+    merged_sigi_arr = None
+    merge_metrics: dict[str, Any] | None = None
+    all_runs_data: dict[str, Any] | None = None
     solve_diagnostics = None
     frame_slice = None
     frames_meta: list[dict[str, Any]] = []
@@ -1921,6 +2109,12 @@ def build_rainbow_zone_payload(
         peak_shape_mode = extracted.get("peak_shape_mode") or peak_shape_mode
         hkl_arr = extracted["hkl"]
         lam_arr = extracted["wavelength"]
+        careless_residual_arr = extracted.get("careless_residual")
+        careless_scale_arr = extracted.get("careless_scale")
+        merged_i_arr = extracted.get("merged_i")
+        merged_sigi_arr = extracted.get("merged_sigi")
+        merge_metrics = extracted.get("merge_metrics")
+        all_runs_data = extracted.get("all_runs_data")
         solve_diagnostics = extracted.get("solve_diagnostics")
         frame_slice = extracted.get("frame_slice")
         frames_meta = extracted.get("frames") or []
@@ -1977,6 +2171,14 @@ def build_rainbow_zone_payload(
             hkl_arr = hkl_arr[order]
         if lam_arr is not None and len(lam_arr) == n_raw:
             lam_arr = lam_arr[order]
+        if careless_residual_arr is not None and len(careless_residual_arr) == n_raw:
+            careless_residual_arr = careless_residual_arr[order]
+        if careless_scale_arr is not None and len(careless_scale_arr) == n_raw:
+            careless_scale_arr = careless_scale_arr[order]
+        if merged_i_arr is not None and len(merged_i_arr) == n_raw:
+            merged_i_arr = merged_i_arr[order]
+        if merged_sigi_arr is not None and len(merged_sigi_arr) == n_raw:
+            merged_sigi_arr = merged_sigi_arr[order]
         if (
             isinstance(R_gonio, np.ndarray)
             and R_gonio.ndim == 3
@@ -2010,6 +2212,11 @@ def build_rainbow_zone_payload(
 
     sx, sy, hemi = (
         stereographic_projection(g_crystal)
+        if n_peaks > 0
+        else (np.zeros(0), np.zeros(0), np.zeros(0, dtype=np.int8))
+    )
+    sx_lab, sy_lab, hemi_lab = (
+        stereographic_projection(g_hat)
         if n_peaks > 0
         else (np.zeros(0), np.zeros(0), np.zeros(0, dtype=np.int8))
     )
@@ -2216,6 +2423,43 @@ def build_rainbow_zone_payload(
             except Exception:
                 pass
 
+    # Compute canonical ASU symmetry orbits and Laue harmonic ray multiplicity
+    sg_obj = None
+    asu_obj = None
+    sg_ops = None
+    try:
+        import gemmi
+
+        sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
+            gemmi.find_spacegroup_by_name("P 1")
+        )
+        if sg_obj is not None:
+            asu_obj = gemmi.ReciprocalAsu(sg_obj)
+            sg_ops = sg_obj.operations()
+    except Exception:
+        pass
+
+    def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int]:
+        if asu_obj is not None and sg_ops is not None and (h_v or k_v or l_v):
+            try:
+                ha, _ = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
+                return (int(ha[0]), int(ha[1]), int(ha[2]))
+            except Exception:
+                pass
+        return (h_v, k_v, l_v)
+
+    base_ray_counts: dict[tuple[int, int, int], int] = {}
+    for i in range(n_peaks):
+        h_i, k_i, l_i = (
+            int(hkl_arr[i, 0]),
+            int(hkl_arr[i, 1]),
+            int(hkl_arr[i, 2]),
+        )
+        if h_i or k_i or l_i:
+            g_c = max(1, int(np.gcd.reduce(np.abs([h_i, k_i, l_i]))))
+            b_ray = (h_i // g_c, k_i // g_c, l_i // g_c)
+            base_ray_counts[b_ray] = base_ray_counts.get(b_ray, 0) + 1
+
     peaks_list: list[dict[str, Any]] = []
     for i in range(n_peaks):
         h_i, k_i, l_i = (
@@ -2225,6 +2469,20 @@ def build_rainbow_zone_payload(
         )
         g_gcd = (
             int(np.gcd.reduce(np.abs([h_i, k_i, l_i]))) if (h_i or k_i or l_i) else 1
+        )
+        b_ray = (
+            (h_i // max(1, g_gcd), k_i // max(1, g_gcd), l_i // max(1, g_gcd))
+            if (h_i or k_i or l_i)
+            else (0, 0, 0)
+        )
+        harm_mult = max(
+            int(base_ray_counts.get(b_ray, 1)),
+            2 if g_gcd > 1 else 1,
+        )
+        asu_h, asu_k, asu_l = _to_asu_hkl(h_i, k_i, l_i)
+        orbit_id = f"{asu_h},{asu_k},{asu_l}"
+        orbit_color_idx = (
+            abs(asu_h * 73856093 ^ asu_k * 19349663 ^ asu_l * 83492791) % 12
         )
         d_val = float(d_spacing[i]) if i < len(d_spacing) else 2.0
         lam_val = float(lam_arr[i]) if i < len(lam_arr) else 0.5 * (wl_min + wl_max)
@@ -2242,6 +2500,7 @@ def build_rainbow_zone_payload(
 
         pk_entry: dict[str, Any] = {
             "id": i,
+            "run_index": int(active_frame),
             "bank": (
                 int(bank_arr[i]) if bank_arr is not None and i < len(bank_arr) else 1
             ),
@@ -2259,11 +2518,17 @@ def build_rainbow_zone_payload(
             "det_y": round(float(det_y[i]), 4),
             "det_el": round(float(det_el[i]), 3),
             "q_hat": [round(float(x), 5) for x in g_crystal[i]],
+            "q_hat_lab": [round(float(x), 5) for x in g_hat[i]],
             "stereographic": [
                 round(float(sx[i]), 5),
                 round(float(sy[i]), 5),
             ],
             "hemisphere": int(hemi[i]),
+            "stereo_lab": [
+                round(float(sx_lab[i]), 5),
+                round(float(sy_lab[i]), 5),
+                int(hemi_lab[i]),
+            ],
             "intensity": (
                 round(float(intensity_arr[i]), 2)
                 if intensity_arr is not None and i < len(intensity_arr)
@@ -2277,12 +2542,40 @@ def build_rainbow_zone_payload(
             "wavelength": round(float(np.clip(lam_val, wl_min * 0.5, wl_max * 1.5)), 4),
             "d_spacing": round(d_val, 4),
             "harmonic_order": max(1, g_gcd),
+            "harmonic_multiplicity": harm_mult,
             "parallax_depth": round(parallax_depth, 4),
             "hkl": [h_i, k_i, l_i],
+            "asu_hkl": [asu_h, asu_k, asu_l],
+            "asu_orbit_id": orbit_id,
+            "orbit_color_idx": int(orbit_color_idx),
             "zone_ids": peak_zones[i],
             "indexed": is_indexed,
             "angular_error_deg": round(err_val, 4),
         }
+        if (
+            careless_residual_arr is not None
+            and i < len(careless_residual_arr)
+            and np.isfinite(careless_residual_arr[i])
+        ):
+            pk_entry["careless_residual"] = round(float(careless_residual_arr[i]), 3)
+        if (
+            careless_scale_arr is not None
+            and i < len(careless_scale_arr)
+            and np.isfinite(careless_scale_arr[i])
+        ):
+            pk_entry["careless_scale"] = round(float(careless_scale_arr[i]), 4)
+        if (
+            merged_i_arr is not None
+            and i < len(merged_i_arr)
+            and np.isfinite(merged_i_arr[i])
+        ):
+            pk_entry["merged_i"] = round(float(merged_i_arr[i]), 2)
+        if (
+            merged_sigi_arr is not None
+            and i < len(merged_sigi_arr)
+            and np.isfinite(merged_sigi_arr[i])
+        ):
+            pk_entry["merged_sigi"] = round(float(merged_sigi_arr[i]), 2)
         if i in ellipse_cyl_by_idx:
             s_maj = sigma_major_by_idx[i]
             s_min = sigma_minor_by_idx[i]
@@ -2295,6 +2588,117 @@ def build_rainbow_zone_payload(
                 "ellipse" if abs(s_maj - s_min) > 0.05 else "isotropic_circle"
             )
         peaks_list.append(pk_entry)
+
+    # Build all-runs sample-space peak list (for Wulff Net 'All Runs (Sample)' mode)
+    sample_peaks: list[dict[str, Any]] = []
+    if (
+        all_runs_data is not None
+        and len(all_runs_data.get("peaks_xyz", [])) > 0
+        and len(frames_meta) > 1
+    ):
+        pts_all = np.asarray(all_runs_data["peaks_xyz"], dtype=float)
+        hkl_all = np.asarray(all_runs_data["hkl"], dtype=int)
+        r_idx_all = np.asarray(all_runs_data["run_index"], dtype=int)
+        lam_all = all_runs_data.get("wavelength")
+        int_all = all_runs_data.get("intensity")
+        sig_all = all_runs_data.get("sigma")
+        bnk_all = all_runs_data.get("bank")
+        res_all = all_runs_data.get("careless_residual")
+        scl_all = all_runs_data.get("careless_scale")
+        R_per_run = all_runs_data.get("R_per_run") or {}
+
+        norms_all = np.linalg.norm(pts_all, axis=1, keepdims=True)
+        kf_all = pts_all / np.maximum(norms_all, 1e-12)
+        q_all = kf_all - ki_hat[None, :]
+        qn_all = np.linalg.norm(q_all, axis=1, keepdims=True)
+        g_lab_all = np.where(qn_all > 1e-6, q_all / np.maximum(qn_all, 1e-12), kf_all)
+        g_samp_all = np.copy(g_lab_all)
+        for ur in np.unique(r_idx_all):
+            R_u = R_per_run.get(int(ur), R_single)
+            m_u = r_idx_all == ur
+            g_samp_all[m_u] = g_lab_all[m_u] @ R_u
+
+        sx_all, sy_all, hm_all = stereographic_projection(g_samp_all)
+        ray_counts_all: dict[tuple[int, int, int, int], int] = {}
+        for j in range(len(pts_all)):
+            hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
+            if hj or kj or lj:
+                gc = max(1, int(np.gcd.reduce(np.abs([hj, kj, lj]))))
+                rk = (int(r_idx_all[j]), hj // gc, kj // gc, lj // gc)
+                ray_counts_all[rk] = ray_counts_all.get(rk, 0) + 1
+
+        for j in range(len(pts_all)):
+            hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
+            gc = int(np.gcd.reduce(np.abs([hj, kj, lj]))) if (hj or kj or lj) else 1
+            rk = (
+                (
+                    int(r_idx_all[j]),
+                    hj // max(1, gc),
+                    kj // max(1, gc),
+                    lj // max(1, gc),
+                )
+                if (hj or kj or lj)
+                else (int(r_idx_all[j]), 0, 0, 0)
+            )
+            h_mult = max(int(ray_counts_all.get(rk, 1)), 2 if gc > 1 else 1)
+            ah, ak, al = _to_asu_hkl(hj, kj, lj)
+            orb_id = f"{ah},{ak},{al}"
+            orb_c = abs(ah * 73856093 ^ ak * 19349663 ^ al * 83492791) % 12
+            lv = (
+                float(lam_all[j])
+                if lam_all is not None and j < len(lam_all)
+                else 0.5 * (wl_min + wl_max)
+            )
+            st_j = float(np.clip(0.5 * qn_all[j, 0], 1e-4, 0.9999))
+            dv = lv / max(2.0 * st_j, 1e-4)
+            sp_item: dict[str, Any] = {
+                "id": j,
+                "run_index": int(r_idx_all[j]),
+                "bank": int(bnk_all[j])
+                if bnk_all is not None and j < len(bnk_all)
+                else 1,
+                "q_hat": [round(float(x), 5) for x in g_samp_all[j]],
+                "stereographic": [
+                    round(float(sx_all[j]), 5),
+                    round(float(sy_all[j]), 5),
+                ],
+                "hemisphere": int(hm_all[j]),
+                "intensity": round(float(int_all[j]), 2)
+                if int_all is not None and j < len(int_all)
+                else 100.0,
+                "sigma": round(float(sig_all[j]), 2)
+                if sig_all is not None and j < len(sig_all)
+                else 3.0,
+                "wavelength": round(float(np.clip(lv, wl_min * 0.5, wl_max * 1.5)), 4),
+                "d_spacing": round(dv, 4),
+                "harmonic_order": max(1, gc),
+                "harmonic_multiplicity": h_mult,
+                "hkl": [hj, kj, lj],
+                "asu_hkl": [ah, ak, al],
+                "asu_orbit_id": orb_id,
+                "orbit_color_idx": int(orb_c),
+                "zone_ids": [],
+                "indexed": bool(hj or kj or lj),
+            }
+            if res_all is not None and j < len(res_all) and np.isfinite(res_all[j]):
+                sp_item["careless_residual"] = round(float(res_all[j]), 3)
+            if scl_all is not None and j < len(scl_all) and np.isfinite(scl_all[j]):
+                sp_item["careless_scale"] = round(float(scl_all[j]), 4)
+            sample_peaks.append(sp_item)
+    else:
+        sample_peaks = peaks_list
+
+    if (
+        isinstance(merge_metrics, dict)
+        and "harmonic_overlap_fraction" not in merge_metrics
+    ):
+        if len(sample_peaks) > 0:
+            n_harm = sum(
+                1 for p in sample_peaks if int(p.get("harmonic_multiplicity", 1)) > 1
+            )
+            merge_metrics["harmonic_overlap_fraction"] = round(
+                float(n_harm) / float(len(sample_peaks)), 4
+            )
 
     zones_payload: list[dict[str, Any]] = []
     for zi, z in enumerate(raw_zones):
@@ -2456,6 +2860,7 @@ def build_rainbow_zone_payload(
         cell=cell,
         solve_diagnostics=solve_diagnostics,
         artifact_kind=artifact_kind,
+        merge_metrics=merge_metrics,
     )
     pending_stage = _pending_stage_for_artifact_kind(artifact_kind)
 
@@ -2516,7 +2921,10 @@ def build_rainbow_zone_payload(
             else None
         ),
         "beamline_detectors": beamline_detectors,
+        "solve_diagnostics": solve_diagnostics,
+        "merge_metrics": merge_metrics,
         "peaks": peaks_list,
+        "sample_peaks": sample_peaks,
         "zones": zones_payload,
         "panels": panels_payload,
         "ladder_steps": ladder_steps,
@@ -2749,22 +3157,35 @@ def render_rainbow_html(
     cursor: grabbing;
   }}
 
-  /* Floating Stereogram Mini-HUD in Bottom-Left of Detector Canvas */
+  /* Floating / Expandable Stereogram Wulff Net HUD */
   .stereo-inset {{
     position: absolute;
     bottom: 10px;
     left: 10px;
-    width: 165px;
-    height: 165px;
-    background: rgba(10, 14, 28, 0.9);
+    width: 230px;
+    height: 250px;
+    background: rgba(10, 14, 28, 0.94);
     border: 1px solid var(--border-color);
     border-radius: 8px;
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.65);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.72);
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    backdrop-filter: blur(6px);
-    transition: opacity 0.2s ease, transform 0.2s ease;
+    backdrop-filter: blur(8px);
+    z-index: 35;
+    transition: opacity 0.18s ease, transform 0.18s ease, width 0.18s ease, height 0.18s ease;
+  }}
+
+  .stereo-inset.expanded {{
+    width: min(80vw, 760px);
+    height: min(78vh, 700px);
+    left: 50%;
+    top: 50%;
+    bottom: auto;
+    transform: translate(-50%, -50%);
+    border-color: var(--accent-cyan);
+    box-shadow: 0 22px 64px rgba(0, 0, 0, 0.88);
+    z-index: 75;
   }}
 
   .stereo-inset.hidden {{
@@ -2775,13 +3196,48 @@ def render_rainbow_html(
 
   .stereo-inset-header {{
     font-family: var(--font-display);
-    font-size: 0.6rem;
-    padding: 3px 6px;
+    font-size: 0.62rem;
+    padding: 4px 7px;
     background: rgba(255, 255, 255, 0.05);
-    color: var(--text-dim);
+    border-bottom: 1px solid var(--border-color);
+    color: var(--text-main);
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+  }}
+
+  .stereo-toolbar {{
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    flex-wrap: wrap;
+  }}
+
+  .stereo-toolbar button, .stereo-toolbar select {{
+    font-size: 0.58rem;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--bg-card);
+    color: var(--text-main);
+    border: 1px solid var(--border-color);
+    font-family: var(--font-display);
+    cursor: pointer;
+  }}
+
+  .stereo-merge-bar {{
+    display: none;
+    padding: 4px 8px;
+    background: rgba(7, 9, 19, 0.92);
+    border-top: 1px solid var(--border-color);
+    font-family: var(--font-display);
+    font-size: 0.62rem;
+    color: var(--text-main);
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
   }}
 
   /* Hidden legend overlay so it never obscures the detector canvas */
@@ -3165,13 +3621,25 @@ def render_rainbow_html(
           </div>
         </div>
 
-        <!-- Optional Corner Stereogram Inset (hidden by default so detector banks are unobstructed) -->
+        <!-- Interactive Stereogram Wulff Net (Corner Inset or Expanded Popout) -->
         <div class="stereo-inset hidden" id="stereo-inset">
           <div class="stereo-inset-header">
-            <span>WULFF NET</span>
-            <span id="stereo-hint">G</span>
+            <span id="stereo-title" style="color:var(--accent-cyan);font-weight:700;">WULFF NET</span>
+            <div class="stereo-toolbar">
+              <button id="btn-wulff-scope" title="Toggle between Single Frame (Lab space) and All Runs Aggregated (Sample space)">1-Frame (Lab)</button>
+              <button id="btn-wulff-couple" class="active-btn" title="Google-Earth 360° coupling: link horizontal detector pan to azimuthal Wulff rotation with periodic wraparound (Single Frame mode)">Couple 360°</button>
+              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, or Careless Merge Residual">
+                <option value="wavelength">Color: λ/Zone</option>
+                <option value="orbit">Color: ASU Orbit</option>
+                <option value="residual">Color: ΔI/σ Residual</option>
+                <option value="scale">Color: Scale</option>
+              </select>
+              <button id="btn-wulff-expand" title="Expand or dock the Wulff Net view">Expand</button>
+              <button id="btn-wulff-close" title="Hide Wulff Net">X</button>
+            </div>
           </div>
-          <canvas id="canvas-stereo"></canvas>
+          <canvas id="canvas-stereo" style="flex:1;width:100%;min-height:0;cursor:grab;"></canvas>
+          <div class="stereo-merge-bar" id="wulff-merge-bar"></div>
         </div>
       </div>
     </section>
@@ -3394,8 +3862,9 @@ def render_rainbow_html(
 window.RAINBOW_ZONES_DATA = {payload_json};
 
 (function() {{
-  const DATA = window.RAINBOW_ZONES_DATA || {{ peaks: [], zones: [], panels: [], ladder_steps: [], pipeline_stages: [] }};
+  const DATA = window.RAINBOW_ZONES_DATA || {{ peaks: [], sample_peaks: [], zones: [], panels: [], ladder_steps: [], pipeline_stages: [] }};
   const PEAKS = DATA.peaks || [];
+  const SAMPLE_PEAKS = DATA.sample_peaks || [];
   const ZONES = DATA.zones || [];
   const PANELS = DATA.panels || [];
   const LADDER = DATA.ladder_steps || [];
@@ -3412,16 +3881,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (k === "raw_nexus") return 0; // Pending step: 1. Reduce & Merge
     if (k === "merged") return 1;    // Pending step: 2. Solve
     if (k === "integrator") return 3; // Completed 1..3, Pending step: 4. Merge
+    if (k === "merged_careless") return 4; // Completed 1..4
     return 2; // solve / predictor / finder -> Completed 1..2, Pending step: 3. Integrate
   }}
 
+  const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" || Boolean(DATA.merge_metrics);
   const state = {{
     projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
     showZoneArcs: true,           // single vibrant arc per zone (not multi-band rainbow)
     heatmapStyle: "magma",        // "magma" | "cyan" | "gray"
     detAlpha: 0.85,
-    showStereo: false,
+    showStereo: isMergedInit,
+    wulffExpanded: isMergedInit,
+    wulffScope: isMergedInit ? "all_runs" : "single_frame", // "single_frame" (Lab) | "all_runs" (Sample)
+    wulffCoupled: true,           // Google-Earth 360° periodic detector pan <-> Wulff yaw coupling (in single_frame mode)
+    wulffColorMode: isMergedInit ? "residual" : "wavelength", // "wavelength" | "orbit" | "residual" | "scale"
+    wulffYawDeg: 0.0,
+    wulffPitchDeg: 0.0,
+    wulffZoom: 1.0,
     lamMin: wlRange[0],
     lamMax: wlRange[1],
     zoneTolDeg: 0.75,
@@ -3430,7 +3908,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     selectedZoneId: null,
     hoveredPeakId: null,
     selectedPeakId: null,
-    currentPipelineIdx: pipelineIdxForArtifactKind(DATA.artifact_kind), // 0: Reduce, 1: Solve, 2: Integrate, 3: Merge
+    activeOrbitId: null,
+    currentPipelineIdx: pipelineIdxForArtifactKind(DATA.artifact_kind), // 0: Reduce, 1: Solve, 2: Integrate, 3: Merge, 4: Done
     currentRungIdx: DATA.artifact_kind === "merged" ? 0 : Math.max(0, LADDER.length - 1),
     ladderTimer: null,
     parallaxX: 0.0,
@@ -3588,6 +4067,119 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return `hsla(${{hue.toFixed(1)}}, 95%, 60%, ${{alpha}})`;
   }}
 
+  const ORBIT_PALETTE = [
+    "#ff38b4", "#00e5ff", "#fbbf24", "#10b981", "#a855f7", "#f97316",
+    "#38bdf8", "#84cc16", "#f43f5e", "#14b8a6", "#eab308", "#6366f1"
+  ];
+
+  // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma
+  function residualToColor(resVal, alpha = 1.0) {{
+    if (typeof resVal !== "number" || !Number.isFinite(resVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
+    const clamped = Math.max(-3.0, Math.min(3.0, resVal));
+    if (clamped < 0) {{
+      const u = Math.min(1.0, -clamped / 3.0);
+      const r = Math.round(248 * (1 - u) + 30 * u);
+      const g = Math.round(250 * (1 - u) + 170 * u);
+      const b = Math.round(252 * (1 - u) + 255 * u);
+      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha}})`;
+    }} else {{
+      const u = Math.min(1.0, clamped / 3.0);
+      const r = Math.round(248 * (1 - u) + 244 * u);
+      const g = Math.round(250 * (1 - u) + 63 * u);
+      const b = Math.round(252 * (1 - u) + 94 * u);
+      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha}})`;
+    }}
+  }}
+
+  function scaleToColor(scaleVal, alpha = 1.0) {{
+    if (typeof scaleVal !== "number" || !Number.isFinite(scaleVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
+    const t = Math.max(0.0, Math.min(1.0, (Math.log10(Math.max(1e-4, scaleVal)) + 2.0) / 3.0));
+    const hue = (1.0 - t) * 195 + t * 45;
+    return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{alpha}})`;
+  }}
+
+  function peakStrokeColor(p, alpha = 0.95) {{
+    const mode = state.wulffColorMode || "wavelength";
+    if (mode === "orbit") {{
+      const idx = typeof p.orbit_color_idx === "number"
+        ? ((p.orbit_color_idx % ORBIT_PALETTE.length) + ORBIT_PALETTE.length) % ORBIT_PALETTE.length
+        : 0;
+      const hex = ORBIT_PALETTE[idx];
+      return alpha >= 0.9 ? hex : `${{hex}}99`;
+    }}
+    if (mode === "residual" && typeof p.careless_residual === "number") {{
+      return residualToColor(p.careless_residual, alpha);
+    }}
+    if (mode === "scale" && typeof p.careless_scale === "number") {{
+      return scaleToColor(p.careless_scale, alpha);
+    }}
+    return wavelengthToColor(p.wavelength, alpha);
+  }}
+
+  function syncWulffUI() {{
+    const stereoEl = document.getElementById("stereo-inset");
+    const btnTop = document.getElementById("btn-stereo-toggle");
+    const btnScope = document.getElementById("btn-wulff-scope");
+    const btnCouple = document.getElementById("btn-wulff-couple");
+    const btnExpand = document.getElementById("btn-wulff-expand");
+    const selColor = document.getElementById("sel-wulff-color");
+    const titleEl = document.getElementById("stereo-title");
+    if (stereoEl) {{
+      stereoEl.classList.toggle("hidden", !state.showStereo);
+      stereoEl.classList.toggle("expanded", Boolean(state.wulffExpanded));
+    }}
+    if (btnTop) btnTop.classList.toggle("active-btn", Boolean(state.showStereo));
+    if (btnScope) {{
+      const isAll = state.wulffScope === "all_runs";
+      btnScope.textContent = isAll ? "All Runs (Sample)" : "1-Frame (Lab)";
+      btnScope.classList.toggle("active-btn", isAll);
+    }}
+    if (btnCouple) {{
+      const canCouple = state.wulffScope === "single_frame";
+      btnCouple.disabled = !canCouple;
+      btnCouple.style.opacity = canCouple ? "1.0" : "0.45";
+      btnCouple.classList.toggle("active-btn", canCouple && Boolean(state.wulffCoupled));
+    }}
+    if (btnExpand) {{
+      btnExpand.textContent = state.wulffExpanded ? "Dock" : "Expand";
+      btnExpand.classList.toggle("active-btn", Boolean(state.wulffExpanded));
+    }}
+    if (selColor) selColor.value = state.wulffColorMode || "wavelength";
+    if (titleEl) {{
+      titleEl.textContent = state.wulffScope === "all_runs"
+        ? "WULFF NET · ALL RUNS (SAMPLE)"
+        : "WULFF NET · 1-FRAME (LAB)";
+    }}
+    updateMergeScoreboard();
+  }}
+
+  function updateMergeScoreboard() {{
+    const bar = document.getElementById("wulff-merge-bar");
+    const m = DATA.merge_metrics;
+    if (!bar) return;
+    if (!m || !m.n_merged_asu) {{
+      bar.style.display = "none";
+      return;
+    }}
+    bar.style.display = "flex";
+    const cc = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
+    const ccs = typeof m.cc_half_spearman === "number" ? m.cc_half_spearman.toFixed(3) : null;
+    const isig = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
+    const comp = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
+    const mult = typeof m.multiplicity === "number" ? `${{m.multiplicity.toFixed(2)}}×` : "—";
+    const nAsu = Number(m.n_merged_asu || 0).toLocaleString();
+    const nObs = Number(m.n_observations || 0).toLocaleString();
+    const harmPct = typeof m.harmonic_overlap_fraction === "number"
+      ? `${{(m.harmonic_overlap_fraction * 100).toFixed(1)}}%`
+      : "—";
+    bar.innerHTML = `
+      <span><strong style="color:var(--accent-cyan);">CARELESS MERGE:</strong> CC½=<strong style="color:var(--accent-gold);">${{cc}}</strong>${{ccs ? ` (ρ=${{ccs}})` : ""}}</span>
+      <span>⟨I/σ⟩=<strong style="color:var(--accent-gold);">${{isig}}</strong></span>
+      <span>Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{nAsu}} ASU / ${{nObs}} obs)</span>
+      <span>Multiplicity=<strong>${{mult}}</strong> • Harmonics=<strong>${{harmPct}}</strong></span>
+    `;
+  }}
+
   function syncProjectionUI() {{
     const isSph = state.projection === "spherical";
     const btn = document.getElementById("btn-proj-toggle");
@@ -3692,6 +4284,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       `[STAGE ${{st.step_num}}]`,
       `<strong style="color:var(--accent-pink);">${{st.name}}</strong> → <strong style="color:var(--accent-cyan);">${{st.artifact}}</strong> • Tools: <code>${{(st.tool_ids || []).join(", ")}}</code>`
     );
+    if (pIdx === 3) {{
+      state.showStereo = true;
+      syncWulffUI();
+    }}
     if (syncLadder && typeof st.ladder_rung_idx === "number") {{
       selectLadderRung(st.ladder_rung_idx, false);
     }}
@@ -3756,9 +4352,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         shapeStr = ` • 2σ=<strong style="color:#38bdf8;">${{(2 * p.sigma_major_px).toFixed(1)}}px (iso)</strong>`;
       }}
     }}
+    const asuStr = Array.isArray(p.asu_hkl) ? ` → ASU <strong style="color:#38bdf8;">(${{p.asu_hkl.join(",")}})</strong>` : "";
+    let mergeStr = "";
+    if (typeof p.careless_residual === "number") {{
+      const rCol = p.careless_residual >= 0 ? "#f43f5e" : "#38bdf8";
+      mergeStr = ` • ΔI/σ=<strong style="color:${{rCol}};">${{p.careless_residual >= 0 ? "+" : ""}}${{p.careless_residual.toFixed(2)}}σ</strong>`;
+      if (typeof p.merged_i === "number" && typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
+        mergeStr += ` (I_asu=${{p.merged_i.toFixed(1)}}±${{p.merged_sigi.toFixed(1)}})`;
+      }}
+    }}
+    const detXVal = typeof p.det_x === "number" ? p.det_x : 0.0;
+    const detYVal = typeof p.det_y === "number" ? p.det_y : 0.0;
+    const errDeg = typeof p.angular_error_deg === "number" ? p.angular_error_deg : 0.0;
+    const harmMult = p.harmonic_multiplicity || p.harmonic_order || 1;
     setStatusLine(
-      `[BANK #${{p.bank}} • #${{p.id}}]`,
-      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong> (n=${{p.harmonic_order}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}${{shapeStr}} • φ=${{p.det_x.toFixed(1)}}°, Y=${{p.det_y.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{p.angular_error_deg.toFixed(3)}}°)`
+      `[BANK #${{p.bank || 1}} • RUN #${{(p.run_index || 0) + 1}}]`,
+      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
     );
   }}
 
@@ -3840,7 +4449,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   const histCanvas = document.getElementById("canvas-hist");
   function drawHistogram(visiblePeaks) {{
+    const m = DATA.merge_metrics;
+    const hasMergeBins = Boolean(m && Array.isArray(m.cc_half_bins) && m.cc_half_bins.length > 0);
+    if (histCanvas) {{
+      histCanvas.style.display = hasMergeBins ? "block" : "none";
+      histCanvas.style.height = hasMergeBins ? "50px" : "40px";
+    }}
     const rect = histCanvas.getBoundingClientRect();
+    if (rect.width < 20 || rect.height < 15) return;
     const dpr = window.devicePixelRatio || 1;
     histCanvas.width = Math.max(100, rect.width * dpr);
     histCanvas.height = Math.max(45, rect.height * dpr);
@@ -3849,6 +4465,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const w = rect.width;
     const h = rect.height;
     ctx.clearRect(0, 0, w, h);
+
+    if (hasMergeBins) {{
+      const bins = m.cc_half_bins;
+      const nBins = bins.length;
+      const barW = (w - 16) / Math.max(1, nBins);
+      for (let i = 0; i < nBins; i++) {{
+        const ccVal = Math.max(0, Math.min(1, Number(bins[i].cc_half || 0)));
+        const bh = ccVal * (h - 20);
+        const x = 8 + i * barW;
+        const y = h - 14 - bh;
+        ctx.fillStyle = ccVal >= 0.8 ? "#34d399" : (ccVal >= 0.5 ? "#fbbf24" : "#f43f5e");
+        ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+      }}
+      ctx.fillStyle = "#94a3b8";
+      ctx.font = "9px monospace";
+      const d0 = bins[0] && bins[0].d_max ? `${{Number(bins[0].d_max).toFixed(1)}}Å` : "low-q";
+      const d1 = bins[nBins - 1] && bins[nBins - 1].d_min ? `${{Number(bins[nBins - 1].d_min).toFixed(2)}}Å` : "d_min";
+      const ccOv = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "";
+      ctx.fillText(d0, 6, h - 3);
+      ctx.fillStyle = "#38bdf8";
+      ctx.fillText(`CC½ vs d (${{ccOv}})`, Math.max(38, w * 0.28), h - 3);
+      ctx.fillStyle = "#94a3b8";
+      ctx.fillText(d1, Math.max(w - 36, 60), h - 3);
+      return;
+    }}
 
     const nBins = 20;
     const maxDeg = 1.5;
@@ -3990,28 +4631,34 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     const bounds = getActiveBounds();
     const isSph = state.projection === "spherical";
+    const isCoupled360 = Boolean(state.wulffScope === "single_frame" && state.wulffCoupled);
+    const azShifts = isCoupled360 ? [-360.0, 0.0, 360.0] : [0.0];
 
     // 1. Coordinate Grid (Azimuth deg vs Height [m] or Elevation [deg])
     ctx.save();
     ctx.strokeStyle = "rgba(148, 163, 184, 0.12)";
     ctx.fillStyle = "#94a3b8";
     ctx.font = "10px monospace";
-    for (let az = -180; az <= 180; az += 45) {{
-      const [gx, gy0] = detToScreen(az, bounds.minY, w, h, -0.35);
-      const [, gy1] = detToScreen(az, bounds.maxY, w, h, -0.35);
-      ctx.beginPath();
-      ctx.moveTo(gx, gy0);
-      ctx.lineTo(gx, gy1);
-      ctx.stroke();
-      ctx.fillText(`${{az}}°`, gx - 12, h - 8);
-    }}
+    azShifts.forEach(shiftAz => {{
+      for (let az = -180; az <= 180; az += 45) {{
+        if (shiftAz !== 0 && (az === -180 || az === 180)) continue;
+        const [gx, gy0] = detToScreen(az + shiftAz, bounds.minY, w, h, -0.35);
+        if (gx < -40 || gx > w + 40) continue;
+        const [, gy1] = detToScreen(az + shiftAz, bounds.maxY, w, h, -0.35);
+        ctx.beginPath();
+        ctx.moveTo(gx, gy0);
+        ctx.lineTo(gx, gy1);
+        ctx.stroke();
+        ctx.fillText(`${{az}}°`, gx - 12, h - 8);
+      }}
+    }});
     const yStep = Number(((bounds.maxY - bounds.minY) / 4).toFixed(isSph ? 0 : 2)) || (isSph ? 30 : 0.15);
     for (let yv = bounds.minY; yv <= bounds.maxY + 1e-4; yv += yStep) {{
-      const [gx0, gy] = detToScreen(bounds.minX, yv, w, h, -0.35);
-      const [gx1] = detToScreen(bounds.maxX, yv, w, h, -0.35);
+      const [gx0, gy] = detToScreen(bounds.minX - (isCoupled360 ? 360 : 0), yv, w, h, -0.35);
+      const [gx1] = detToScreen(bounds.maxX + (isCoupled360 ? 360 : 0), yv, w, h, -0.35);
       ctx.beginPath();
-      ctx.moveTo(gx0, gy);
-      ctx.lineTo(gx1, gy);
+      ctx.moveTo(Math.max(0, gx0), gy);
+      ctx.lineTo(Math.min(w, gx1), gy);
       ctx.stroke();
       const lbl = isSph ? `${{yv.toFixed(0)}}°` : `${{yv.toFixed(2)}}m`;
       ctx.fillText(lbl, 4, gy + 3);
@@ -4020,273 +4667,305 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     // 2. LAYER 0 (BACK): Detector Bank Pixel Intensity Heatmaps + Panel Outlines
     ctx.save();
-    PANELS.forEach(panel => {{
-      const [vMin, vMax] = getPanelVertRange(panel);
-      const [x0, y0] = detToScreen(panel.az_min, vMax, w, h, -0.35);
-      const [x1, y1] = detToScreen(panel.az_max, vMin, w, h, -0.35);
-      const pw = x1 - x0;
-      const ph = y1 - y0;
+    azShifts.forEach(shiftAz => {{
+      PANELS.forEach(panel => {{
+        const [vMin, vMax] = getPanelVertRange(panel);
+        const [x0, y0] = detToScreen(panel.az_min + shiftAz, vMax, w, h, -0.35);
+        const [x1, y1] = detToScreen(panel.az_max + shiftAz, vMin, w, h, -0.35);
+        if (Math.max(x0, x1) < -80 || Math.min(x0, x1) > w + 80) return;
+        const pw = x1 - x0;
+        const ph = y1 - y0;
 
-      const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
-      const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+        const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
+        const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
 
-      ctx.save();
-      if (outlinePts && outlinePts.length >= 4) {{
-        ctx.beginPath();
-        outlinePts.forEach((pt, idx) => {{
-          const [ox, oy] = detToScreen(pt[0], pt[1], w, h, -0.35);
-          if (idx === 0) ctx.moveTo(ox, oy);
-          else ctx.lineTo(ox, oy);
-        }});
-        ctx.closePath();
-        ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-        ctx.fill();
-        ctx.clip();
-      }} else {{
-        ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-        ctx.fillRect(x0, y0, pw, ph);
-      }}
+        ctx.save();
+        if (outlinePts && outlinePts.length >= 4) {{
+          ctx.beginPath();
+          outlinePts.forEach((pt, idx) => {{
+            const [ox, oy] = detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35);
+            if (idx === 0) ctx.moveTo(ox, oy);
+            else ctx.lineTo(ox, oy);
+          }});
+          ctx.closePath();
+          ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+          ctx.fill();
+          ctx.clip();
+        }} else {{
+          ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+          ctx.fillRect(x0, y0, pw, ph);
+        }}
 
-      const texCanvas = bankCanvases.get(panel.bank);
-      if (texCanvas && state.detAlpha > 0.01) {{
-        ctx.globalAlpha = state.detAlpha;
-        ctx.imageSmoothingEnabled = true;
-        if (cornersPts && cornersPts.length === 4) {{
-          // True 2-triangle affine texture projection from (r, c) corners C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
-          const S0 = detToScreen(cornersPts[0][0], cornersPts[0][1], w, h, -0.35);
-          const S1 = detToScreen(cornersPts[1][0], cornersPts[1][1], w, h, -0.35);
-          const S2 = detToScreen(cornersPts[2][0], cornersPts[2][1], w, h, -0.35);
-          const S3 = detToScreen(cornersPts[3][0], cornersPts[3][1], w, h, -0.35);
-          const W = Math.max(1, texCanvas.width);
-          const H = Math.max(1, texCanvas.height);
-          const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
-          if (nonPara < 2.2) {{
-            const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
-            const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
-            const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
-            const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
-            const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
-            const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
-            ctx.save();
-            ctx.transform(ax, ay, cx, cy, ex, ey);
-            ctx.drawImage(texCanvas, 0, 0, W, H);
-            ctx.restore();
+        const texCanvas = bankCanvases.get(panel.bank);
+        if (texCanvas && state.detAlpha > 0.01) {{
+          ctx.globalAlpha = state.detAlpha;
+          ctx.imageSmoothingEnabled = true;
+          if (cornersPts && cornersPts.length === 4) {{
+            // True 2-triangle affine texture projection from (r, c) corners C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
+            const S0 = detToScreen(cornersPts[0][0] + shiftAz, cornersPts[0][1], w, h, -0.35);
+            const S1 = detToScreen(cornersPts[1][0] + shiftAz, cornersPts[1][1], w, h, -0.35);
+            const S2 = detToScreen(cornersPts[2][0] + shiftAz, cornersPts[2][1], w, h, -0.35);
+            const S3 = detToScreen(cornersPts[3][0] + shiftAz, cornersPts[3][1], w, h, -0.35);
+            const W = Math.max(1, texCanvas.width);
+            const H = Math.max(1, texCanvas.height);
+            const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
+            if (nonPara < 2.2) {{
+              const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
+              const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
+              const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
+              const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
+              const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
+              const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
+              ctx.save();
+              ctx.transform(ax, ay, cx, cy, ex, ey);
+              ctx.drawImage(texCanvas, 0, 0, W, H);
+              ctx.restore();
+            }} else {{
+              // Triangle A: (0,0)->S0, (W,0)->S3, (0,H)->S1
+              ctx.save();
+              ctx.beginPath();
+              ctx.moveTo(S0[0], S0[1]);
+              ctx.lineTo(S3[0], S3[1]);
+              ctx.lineTo(S1[0], S1[1]);
+              ctx.closePath();
+              ctx.clip();
+              ctx.transform(
+                (S3[0] - S0[0]) / W, (S3[1] - S0[1]) / W,
+                (S1[0] - S0[0]) / H, (S1[1] - S0[1]) / H,
+                S0[0], S0[1]
+              );
+              ctx.drawImage(texCanvas, 0, 0, W, H);
+              ctx.restore();
+
+              // Triangle B: (W,0)->S3, (W,H)->S2, (0,H)->S1
+              ctx.save();
+              ctx.beginPath();
+              ctx.moveTo(S3[0], S3[1]);
+              ctx.lineTo(S2[0], S2[1]);
+              ctx.lineTo(S1[0], S1[1]);
+              ctx.closePath();
+              ctx.clip();
+              ctx.transform(
+                (S2[0] - S1[0]) / W, (S2[1] - S1[1]) / W,
+                (S2[0] - S3[0]) / H, (S2[1] - S3[1]) / H,
+                S3[0] + S1[0] - S2[0], S3[1] + S1[1] - S2[1]
+              );
+              ctx.drawImage(texCanvas, 0, 0, W, H);
+              ctx.restore();
+            }}
           }} else {{
-            // Triangle A: (0,0)->S0, (W,0)->S3, (0,H)->S1
-            ctx.save();
-            ctx.beginPath();
-            ctx.moveTo(S0[0], S0[1]);
-            ctx.lineTo(S3[0], S3[1]);
-            ctx.lineTo(S1[0], S1[1]);
-            ctx.closePath();
-            ctx.clip();
-            ctx.transform(
-              (S3[0] - S0[0]) / W, (S3[1] - S0[1]) / W,
-              (S1[0] - S0[0]) / H, (S1[1] - S0[1]) / H,
-              S0[0], S0[1]
-            );
-            ctx.drawImage(texCanvas, 0, 0, W, H);
-            ctx.restore();
-
-            // Triangle B: (W,0)->S3, (W,H)->S2, (0,H)->S1
-            ctx.save();
-            ctx.beginPath();
-            ctx.moveTo(S3[0], S3[1]);
-            ctx.lineTo(S2[0], S2[1]);
-            ctx.lineTo(S1[0], S1[1]);
-            ctx.closePath();
-            ctx.clip();
-            ctx.transform(
-              (S2[0] - S1[0]) / W, (S2[1] - S1[1]) / W,
-              (S2[0] - S3[0]) / H, (S2[1] - S3[1]) / H,
-              S3[0] + S1[0] - S2[0], S3[1] + S1[1] - S2[1]
-            );
-            ctx.drawImage(texCanvas, 0, 0, W, H);
-            ctx.restore();
+            ctx.drawImage(texCanvas, x0, y0, pw, ph);
           }}
-        }} else {{
-          ctx.drawImage(texCanvas, x0, y0, pw, ph);
         }}
-      }}
-      ctx.restore();
+        ctx.restore();
 
-      // True panel polygon border (shows curved elevation edges in Spherical MANDI view)
-      ctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
-      ctx.lineWidth = texCanvas ? 1.1 : 0.7;
-      if (outlinePts && outlinePts.length >= 4) {{
-        ctx.beginPath();
-        outlinePts.forEach((pt, idx) => {{
-          const [ox, oy] = detToScreen(pt[0], pt[1], w, h, -0.35);
-          if (idx === 0) ctx.moveTo(ox, oy);
-          else ctx.lineTo(ox, oy);
-        }});
-        ctx.closePath();
-        ctx.stroke();
-      }} else {{
-        ctx.strokeRect(x0, y0, pw, ph);
-      }}
-
-      // Only show bank labels when zoomed in so default view is clean
-      if (state.detZoom > 1.35 && Math.abs(pw) > 34 && Math.abs(ph) > 24) {{
-        ctx.fillStyle = "rgba(148, 163, 184, 0.42)";
-        ctx.font = "8px monospace";
-        if (cornersPts && cornersPts.length === 4) {{
-          const cScreen = cornersPts.map(pt => detToScreen(pt[0], pt[1], w, h, -0.35));
-          const cxLbl = 0.25 * (cScreen[0][0] + cScreen[1][0] + cScreen[2][0] + cScreen[3][0]);
-          const cyLbl = 0.25 * (cScreen[0][1] + cScreen[1][1] + cScreen[2][1] + cScreen[3][1]);
-          ctx.fillText(`b${{panel.bank}}`, cxLbl - 7, cyLbl + 3);
+        // True panel polygon border (shows curved elevation edges in Spherical MANDI view)
+        ctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
+        ctx.lineWidth = texCanvas ? 1.1 : 0.7;
+        if (outlinePts && outlinePts.length >= 4) {{
+          ctx.beginPath();
+          outlinePts.forEach((pt, idx) => {{
+            const [ox, oy] = detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35);
+            if (idx === 0) ctx.moveTo(ox, oy);
+            else ctx.lineTo(ox, oy);
+          }});
+          ctx.closePath();
+          ctx.stroke();
         }} else {{
-          ctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 9);
+          ctx.strokeRect(x0, y0, pw, ph);
         }}
-      }}
+
+        // Only show bank labels when zoomed in so default view is clean
+        if (state.detZoom > 1.35 && Math.abs(pw) > 34 && Math.abs(ph) > 24) {{
+          ctx.fillStyle = "rgba(148, 163, 184, 0.42)";
+          ctx.font = "8px monospace";
+          if (cornersPts && cornersPts.length === 4) {{
+            const cScreen = cornersPts.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35));
+            const cxLbl = 0.25 * (cScreen[0][0] + cScreen[1][0] + cScreen[2][0] + cScreen[3][0]);
+            const cyLbl = 0.25 * (cScreen[0][1] + cScreen[1][1] + cScreen[2][1] + cScreen[3][1]);
+            ctx.fillText(`b${{panel.bank}}`, cxLbl - 7, cyLbl + 3);
+          }} else {{
+            ctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 9);
+          }}
+        }}
+      }});
     }});
     ctx.restore();
 
     const OVERLAY_PARALLAX_LAYER = 0.45;
 
     // 3. LAYER 1 (FOREGROUND OVERLAY): Single-Arc Laue Zone Conics [uvw] clipped to detector panels
-    // Moves together with the predicted Bragg circles in parallax above the detector heatmap
     if (state.showZoneArcs) {{
       const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
-      ZONES.forEach(zone => {{
-        if (!state.activeZones.has(zone.zone_id)) return;
-        const contSegs = isSph
-          ? (zone.continuous_segments_sph || [])
-          : (zone.continuous_segments || []);
-        const panelSegs = isSph
-          ? (hasPanels ? (zone.detector_segments_sph || []) : (zone.detector_segments_sph || contSegs))
-          : (hasPanels ? (zone.detector_segments || []) : (zone.detector_segments || contSegs));
-        panelSegs.forEach((seg, sIdx) => {{
-          const screenPts = seg.map(pt => detToScreen(pt[0], pt[1], w, h, OVERLAY_PARALLAX_LAYER));
-          drawSingleZoneArc(ctx, screenPts, zone, false);
-          if (sIdx === 0 && screenPts.length > 2 && (state.selectedZoneId === zone.zone_id || state.detZoom > 1.35)) {{
-            const mid = screenPts[Math.floor(screenPts.length * 0.5)];
-            ctx.save();
-            ctx.font = "bold 9px monospace";
-            ctx.fillStyle = "#070913";
-            ctx.fillText(zone.label, mid[0] + 6, mid[1] - 4);
-            ctx.fillStyle = zone.rainbow_color;
-            ctx.fillText(zone.label, mid[0] + 5, mid[1] - 5);
-            ctx.restore();
-          }}
+      azShifts.forEach(shiftAz => {{
+        ZONES.forEach(zone => {{
+          if (!state.activeZones.has(zone.zone_id)) return;
+          const contSegs = isSph
+            ? (zone.continuous_segments_sph || [])
+            : (zone.continuous_segments || []);
+          const panelSegs = isSph
+            ? (hasPanels ? (zone.detector_segments_sph || []) : (zone.detector_segments_sph || contSegs))
+            : (hasPanels ? (zone.detector_segments || []) : (zone.detector_segments || contSegs));
+          panelSegs.forEach((seg, sIdx) => {{
+            const screenPts = seg.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, OVERLAY_PARALLAX_LAYER));
+            drawSingleZoneArc(ctx, screenPts, zone, false);
+            if (shiftAz === 0 && sIdx === 0 && screenPts.length > 2 && (state.selectedZoneId === zone.zone_id || state.detZoom > 1.35)) {{
+              const mid = screenPts[Math.floor(screenPts.length * 0.5)];
+              ctx.save();
+              ctx.font = "bold 9px monospace";
+              ctx.fillStyle = "#070913";
+              ctx.fillText(zone.label, mid[0] + 6, mid[1] - 4);
+              ctx.fillStyle = zone.rainbow_color;
+              ctx.fillText(zone.label, mid[0] + 5, mid[1] - 5);
+              ctx.restore();
+            }}
+          }});
         }});
       }});
     }}
 
     // 4. FOREGROUND LAYER: Predicted Bragg Rings hovering together with Laue zone circles
-    // Moving the mouse shifts both Laue zones and peak rings together relative to the back detector plate!
     const visiblePeaks = PEAKS.filter(isPeakVisible)
       .slice()
       .sort((a, b) => b.parallax_depth - a.parallax_depth);
 
-    visiblePeaks.forEach(p => {{
-      const py = getPeakVert(p);
-      const fgLayer = OVERLAY_PARALLAX_LAYER;
-      const [x, y] = detToScreen(p.det_x, py, w, h, fgLayer);
-      const [bx, by] = detToScreen(p.det_x, py, w, h, -0.35);
+    azShifts.forEach(shiftAz => {{
+      visiblePeaks.forEach(p => {{
+        const py = getPeakVert(p);
+        const fgLayer = OVERLAY_PARALLAX_LAYER;
+        const [x, y] = detToScreen(p.det_x + shiftAz, py, w, h, fgLayer);
+        if (x < -30 || x > w + 30) return;
+        const [bx, by] = detToScreen(p.det_x + shiftAz, py, w, h, -0.35);
 
-      const captured = isPeakCapturedByActiveZone(p);
-      const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
-      if (!captured && !isHovered && state.activeZones.size === 0) {{
-        // Step 1 (Raw Detector Counts): don't clutter raw spots unless hovered
-        return;
-      }}
-
-      const baseR = Math.max(1.2, Math.min(20.0, 1.85 * state.detZoom));
-      const r = isHovered ? baseR + 1.8 : baseR;
-
-      ctx.save();
-      // Subtle depth tether connecting the floating Bragg ring to its physical spot on the detector panel
-      if (Math.hypot(x - bx, y - by) > 2.0 && (captured || isHovered)) {{
-        ctx.beginPath();
-        ctx.moveTo(bx, by);
-        ctx.lineTo(x, y);
-        ctx.strokeStyle = "rgba(244, 63, 133, 0.38)";
-        ctx.lineWidth = 1.0;
-        ctx.stroke();
-      }}
-
-      // Integrated peak 2-sigma contour (anisotropic 3D tensor ellipse or isotropic circle)
-      // or predicted/solved Bragg ring (scaled by zoom factor)
-      const ellPtsRaw = isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse;
-      const strokeCol = isHovered
-        ? "#f43f85"
-        : wavelengthToColor(p.wavelength, captured ? 0.95 : 0.42);
-      ctx.strokeStyle = strokeCol;
-      ctx.lineWidth = isHovered ? 2.4 : (captured ? 1.85 : 1.05);
-
-      if (Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6) {{
-        const scrPts = ellPtsRaw.map(pt => detToScreen(pt[0], pt[1], w, h, fgLayer));
-        let maxDist = 0.0, minDist = 1e9;
-        for (let m = 0; m < scrPts.length; m++) {{
-          const d = Math.hypot(scrPts[m][0] - x, scrPts[m][1] - y);
-          if (d > maxDist) maxDist = d;
-          if (d < minDist) minDist = d;
+        const captured = isPeakCapturedByActiveZone(p);
+        const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
+        const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
+        if (!captured && !isHovered && !isOrbitMate && state.activeZones.size === 0) {{
+          return;
         }}
-        // Keep physical 2-sigma contour scaling with zoom, with a legible floor at 1x zoom
-        // that preserves the fitted major/minor aspect ratio and orientation angle
-        const minTarget = isHovered ? baseR + 1.5 : baseR * 0.9;
-        const scale = minDist > 1e-3 && minDist < minTarget ? (minTarget / minDist) : 1.0;
-        ctx.beginPath();
-        for (let m = 0; m < scrPts.length; m++) {{
-          const sx = x + (scrPts[m][0] - x) * scale;
-          const sy = y + (scrPts[m][1] - y) * scale;
-          if (m === 0) ctx.moveTo(sx, sy);
-          else ctx.lineTo(sx, sy);
-        }}
-        ctx.closePath();
-        ctx.stroke();
 
-        // When hovered or zoomed in on an anisotropic ellipse, draw subtle principal-axis ticks
-        if (p.shape_kind === "ellipse" && (isHovered || state.detZoom > 2.2) && scrPts.length >= 16) {{
-          const nHalf = Math.floor(scrPts.length / 2);
-          const nQuarter = Math.floor(scrPts.length / 4);
-          const p0 = [x + (scrPts[0][0] - x) * scale, y + (scrPts[0][1] - y) * scale];
-          const pHalf = [x + (scrPts[nHalf][0] - x) * scale, y + (scrPts[nHalf][1] - y) * scale];
-          const pQ1 = [x + (scrPts[nQuarter][0] - x) * scale, y + (scrPts[nQuarter][1] - y) * scale];
-          const pQ3 = [x + (scrPts[nQuarter + nHalf][0] - x) * scale, y + (scrPts[nQuarter + nHalf][1] - y) * scale];
-          ctx.save();
-          ctx.strokeStyle = isHovered ? "rgba(251, 191, 36, 0.75)" : "rgba(56, 189, 248, 0.42)";
-          ctx.lineWidth = 0.85;
+        const baseR = Math.max(1.2, Math.min(20.0, 1.85 * state.detZoom));
+        const r = isHovered ? baseR + 1.8 : (isOrbitMate ? baseR + 1.2 : baseR);
+
+        ctx.save();
+        if (Math.hypot(x - bx, y - by) > 2.0 && (captured || isHovered || isOrbitMate)) {{
           ctx.beginPath();
-          ctx.moveTo(p0[0], p0[1]); ctx.lineTo(pHalf[0], pHalf[1]);
-          ctx.moveTo(pQ1[0], pQ1[1]); ctx.lineTo(pQ3[0], pQ3[1]);
+          ctx.moveTo(bx, by);
+          ctx.lineTo(x, y);
+          ctx.strokeStyle = isOrbitMate ? "rgba(251, 191, 36, 0.55)" : "rgba(244, 63, 133, 0.38)";
+          ctx.lineWidth = 1.0;
           ctx.stroke();
-          ctx.restore();
         }}
-      }} else {{
-        ctx.beginPath();
-        ctx.arc(x, y, r, 0, Math.PI * 2);
-        ctx.stroke();
-      }}
 
-      if (state.detAlpha < 0.2) {{
-        ctx.fillStyle = wavelengthToColor(p.wavelength, 0.85);
-        ctx.fill();
-      }}
+        const ellPtsRaw = isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse;
+        const strokeCol = isHovered
+          ? "#f43f85"
+          : (isOrbitMate ? "#fbbf24" : peakStrokeColor(p, captured ? 0.95 : 0.42));
+        ctx.strokeStyle = strokeCol;
+        ctx.lineWidth = isHovered ? 2.4 : (isOrbitMate ? 2.1 : (captured ? 1.85 : 1.05));
 
-      if (isHovered) {{
-        const shapeTag = (typeof p.sigma_major_px === "number" && typeof p.sigma_minor_px === "number")
-          ? (p.shape_kind === "ellipse"
-              ? ` 2σ=${{(2 * p.sigma_major_px).toFixed(1)}}×${{(2 * p.sigma_minor_px).toFixed(1)}}px`
-              : ` 2σ=${{(2 * p.sigma_major_px).toFixed(1)}}px`)
-          : "";
-        const tag = `(${{p.hkl.join(",")}}) λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{shapeTag}}`;
-        ctx.font = "bold 11px monospace";
-        const tw = ctx.measureText(tag).width + 10;
-        ctx.fillStyle = "rgba(11, 15, 23, 0.92)";
-        ctx.fillRect(x + 8, y - 20, tw, 18);
-        ctx.strokeStyle = "#fbbf24";
-        ctx.lineWidth = 1.0;
-        ctx.strokeRect(x + 8, y - 20, tw, 18);
-        ctx.fillStyle = "#fbbf24";
-        ctx.fillText(tag, x + 13, y - 7);
-      }}
-      ctx.restore();
+        if (Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6) {{
+          const scrPts = ellPtsRaw.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, fgLayer));
+          let maxDist = 0.0, minDist = 1e9;
+          for (let m = 0; m < scrPts.length; m++) {{
+            const d = Math.hypot(scrPts[m][0] - x, scrPts[m][1] - y);
+            if (d > maxDist) maxDist = d;
+            if (d < minDist) minDist = d;
+          }}
+          const minTarget = isHovered ? baseR + 1.5 : baseR * 0.9;
+          const scale = minDist > 1e-3 && minDist < minTarget ? (minTarget / minDist) : 1.0;
+          ctx.beginPath();
+          for (let m = 0; m < scrPts.length; m++) {{
+            const sx = x + (scrPts[m][0] - x) * scale;
+            const sy = y + (scrPts[m][1] - y) * scale;
+            if (m === 0) ctx.moveTo(sx, sy);
+            else ctx.lineTo(sx, sy);
+          }}
+          ctx.closePath();
+          ctx.stroke();
+
+          if (p.shape_kind === "ellipse" && (isHovered || state.detZoom > 2.2) && scrPts.length >= 16) {{
+            const nHalf = Math.floor(scrPts.length / 2);
+            const nQuarter = Math.floor(scrPts.length / 4);
+            const p0 = [x + (scrPts[0][0] - x) * scale, y + (scrPts[0][1] - y) * scale];
+            const pHalf = [x + (scrPts[nHalf][0] - x) * scale, y + (scrPts[nHalf][1] - y) * scale];
+            const pQ1 = [x + (scrPts[nQuarter][0] - x) * scale, y + (scrPts[nQuarter][1] - y) * scale];
+            const pQ3 = [x + (scrPts[nQuarter + nHalf][0] - x) * scale, y + (scrPts[nQuarter + nHalf][1] - y) * scale];
+            ctx.save();
+            ctx.strokeStyle = isHovered ? "rgba(251, 191, 36, 0.75)" : "rgba(56, 189, 248, 0.42)";
+            ctx.lineWidth = 0.85;
+            ctx.beginPath();
+            ctx.moveTo(p0[0], p0[1]); ctx.lineTo(pHalf[0], pHalf[1]);
+            ctx.moveTo(pQ1[0], pQ1[1]); ctx.lineTo(pQ3[0], pQ3[1]);
+            ctx.stroke();
+            ctx.restore();
+          }}
+        }} else {{
+          ctx.beginPath();
+          ctx.arc(x, y, r, 0, Math.PI * 2);
+          ctx.stroke();
+        }}
+
+        // Highlight symmetry-orbit mates or Laue harmonic overlaps on detector
+        if (isOrbitMate && !isHovered) {{
+          ctx.beginPath();
+          ctx.arc(x, y, r + 3.2, 0, Math.PI * 2);
+          ctx.strokeStyle = "rgba(0, 229, 255, 0.82)";
+          ctx.lineWidth = 1.2;
+          ctx.stroke();
+        }}
+
+        if (state.detAlpha < 0.2) {{
+          ctx.fillStyle = peakStrokeColor(p, 0.85);
+          ctx.fill();
+        }}
+
+        if (isHovered && shiftAz === 0) {{
+          const resBadge = typeof p.careless_residual === "number"
+            ? ` ΔI/σ=${{p.careless_residual >= 0 ? "+" : ""}}${{p.careless_residual.toFixed(1)}}σ`
+            : "";
+          const tag = `(${{p.hkl.join(",")}}) λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{resBadge}}`;
+          ctx.font = "bold 11px monospace";
+          const tw = ctx.measureText(tag).width + 10;
+          ctx.fillStyle = "rgba(11, 15, 23, 0.92)";
+          ctx.fillRect(x + 8, y - 20, tw, 18);
+          ctx.strokeStyle = "#fbbf24";
+          ctx.lineWidth = 1.0;
+          ctx.strokeRect(x + 8, y - 20, tw, 18);
+          ctx.fillStyle = "#fbbf24";
+          ctx.fillText(tag, x + 13, y - 7);
+        }}
+        ctx.restore();
+      }});
     }});
   }}
 
-  // Render Corner Stereographic Wulff Net Inset
+  // Rotate 3D unit vector g=[gx, gy, gz] by wulffYawDeg (around Y) and wulffPitchDeg (around X)
+  // and project onto stereographic Wulff disc
+  function projectToWulff(g, cx, cy, R) {{
+    if (!Array.isArray(g) || g.length < 3) return [cx, cy, 1];
+    const yawRad = (state.wulffYawDeg || 0.0) * Math.PI / 180.0;
+    const pitchRad = (state.wulffPitchDeg || 0.0) * Math.PI / 180.0;
+    const cyaw = Math.cos(yawRad), syaw = Math.sin(yawRad);
+    const cp = Math.cos(pitchRad), sp = Math.sin(pitchRad);
+    const x1 = g[0] * cyaw + g[2] * syaw;
+    const y1 = g[1];
+    const z1 = -g[0] * syaw + g[2] * cyaw;
+    const x2 = x1;
+    const y2 = y1 * cp - z1 * sp;
+    const z2 = y1 * sp + z1 * cp;
+    const hemi = z2 >= 0 ? 1 : -1;
+    const denom = 1.0 + Math.abs(z2);
+    const scale = R * (state.wulffZoom || 1.0);
+    return [cx + (x2 / denom) * scale, cy - (y2 / denom) * scale, hemi];
+  }}
+
+  function getActiveWulffPeaks() {{
+    const src = (state.wulffScope === "all_runs" && SAMPLE_PEAKS.length > 0) ? SAMPLE_PEAKS : PEAKS;
+    return src.filter(isPeakVisible);
+  }}
+
+  // Render Stereographic Wulff Net (Corner Inset or Expanded Popout)
   function renderStereoInset() {{
     if (!state.showStereo) return;
     const rect = stereoCanvas.getBoundingClientRect();
@@ -4303,36 +4982,47 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const cx = w * 0.5;
     const cy = h * 0.5;
     const R = Math.min(w, h) * 0.43;
+    const isExp = Boolean(state.wulffExpanded);
 
     ctx.save();
     ctx.beginPath();
     ctx.arc(cx, cy, R, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(7, 9, 19, 0.92)";
+    ctx.fillStyle = "rgba(7, 9, 19, 0.94)";
     ctx.fill();
-    ctx.strokeStyle = "#334155";
-    ctx.lineWidth = 1.5;
+    ctx.strokeStyle = isExp ? "#00e5ff" : "#334155";
+    ctx.lineWidth = isExp ? 1.8 : 1.5;
     ctx.stroke();
     ctx.clip();
 
+    // Wulff Net latitude/longitude graticule circles
     ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
     ctx.lineWidth = 1.0;
+    [Math.PI / 12, Math.PI / 6, Math.PI / 4].forEach(ang => {{
+      ctx.beginPath();
+      ctx.arc(cx, cy, R * Math.tan(ang) * (state.wulffZoom || 1.0), 0, Math.PI * 2);
+      ctx.stroke();
+    }});
     ctx.beginPath();
-    ctx.arc(cx, cy, R * Math.tan(Math.PI / 8), 0, Math.PI * 2);
     ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
     ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R);
     ctx.stroke();
 
+    // Draw zone great-circle conics (in Sample space or rotated Lab space)
     if (state.showZoneArcs) {{
       ZONES.forEach(zone => {{
         if (!state.activeZones.has(zone.zone_id)) return;
         ctx.strokeStyle = zone.rainbow_color;
-        ctx.lineWidth = state.selectedZoneId === zone.zone_id ? 2.0 : 1.2;
-        ctx.globalAlpha = 0.72;
+        ctx.lineWidth = state.selectedZoneId === zone.zone_id ? (isExp ? 2.4 : 2.0) : (isExp ? 1.4 : 1.1);
+        ctx.globalAlpha = 0.68;
         (zone.stereo_segments || []).forEach(seg => {{
           ctx.beginPath();
           seg.forEach((pt, idx) => {{
-            const sx = cx + pt[0] * R;
-            const sy = cy - pt[1] * R;
+            // Reconstruct unit vector from stereographic (sx, sy, hemi) and apply Wulff yaw/pitch
+            const r2 = pt[0] * pt[0] + pt[1] * pt[1];
+            const gz = (pt[2] >= 0 ? 1 : -1) * (1.0 - r2) / Math.max(1e-6, 1.0 + r2);
+            const f = 1.0 + Math.abs(gz);
+            const gVec = [pt[0] * f, pt[1] * f, gz];
+            const [sx, sy] = projectToWulff(gVec, cx, cy, R);
             if (idx === 0) ctx.moveTo(sx, sy);
             else ctx.lineTo(sx, sy);
           }});
@@ -4341,16 +5031,91 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
     }}
 
-    PEAKS.filter(isPeakVisible).forEach(p => {{
-      const sx = cx + p.stereographic[0] * R;
-      const sy = cy - p.stereographic[1] * R;
-      const captured = isPeakCapturedByActiveZone(p);
-      const isHovered = state.hoveredPeakId === p.id;
+    const wPeaks = getActiveWulffPeaks();
+    const orbitMates = [];
+
+    wPeaks.forEach(p => {{
+      const gVec = (state.wulffScope === "single_frame" && Array.isArray(p.q_hat_lab))
+        ? p.q_hat_lab
+        : (p.q_hat || [0, 0, 1]);
+      const [sx, sy, hemi] = projectToWulff(gVec, cx, cy, R);
+      p._wulff_sx = sx;
+      p._wulff_sy = sy;
+      p._wulff_hemi = hemi;
+
+      const captured = isPeakCapturedByActiveZone(p) || state.wulffScope === "all_runs";
+      const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
+      const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
+      if (isOrbitMate) orbitMates.push([sx, sy, p]);
+
+      const baseDot = isExp ? (captured ? 4.0 : 2.8) : (captured ? 2.6 : 1.8);
+      const rDot = isHovered ? baseDot + 2.5 : (isOrbitMate ? baseDot + 1.6 : baseDot);
+      const col = isHovered ? "#fbbf24" : peakStrokeColor(p, captured ? 0.92 : 0.45);
+
+      ctx.save();
       ctx.beginPath();
-      ctx.arc(sx, sy, isHovered ? 4.5 : (captured ? 2.6 : 1.8), 0, Math.PI * 2);
-      ctx.fillStyle = isHovered ? "#fbbf24" : wavelengthToColor(p.wavelength, captured ? 0.95 : 0.35);
-      ctx.fill();
+      ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
+      if (hemi < 0) {{
+        // Southern hemisphere: open hollow circle
+        ctx.strokeStyle = col;
+        ctx.lineWidth = isExp ? 1.6 : 1.2;
+        ctx.stroke();
+      }} else {{
+        ctx.fillStyle = col;
+        ctx.fill();
+      }}
+
+      // Harmonic Overlap Bullseye: concentric outer ring when harmonic_multiplicity > 1 or harmonic_order > 1
+      const harmMult = p.harmonic_multiplicity || p.harmonic_order || 1;
+      if (harmMult > 1) {{
+        ctx.beginPath();
+        ctx.arc(sx, sy, rDot + (isExp ? 3.2 : 2.2), 0, Math.PI * 2);
+        ctx.strokeStyle = isOrbitMate ? "#fbbf24" : col;
+        ctx.lineWidth = isExp ? 1.3 : 0.95;
+        ctx.stroke();
+      }}
+      ctx.restore();
     }});
+
+    // Symmetry Starburst: connect all symmetry-equivalent observations sharing activeOrbitId
+    if (orbitMates.length > 0) {{
+      ctx.save();
+      orbitMates.forEach(([mx, my, mp]) => {{
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(mx, my);
+        ctx.strokeStyle = "rgba(251, 191, 36, 0.58)";
+        ctx.lineWidth = isExp ? 1.5 : 1.1;
+        ctx.setLineDash([3, 3]);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        ctx.beginPath();
+        ctx.arc(mx, my, isExp ? 6.5 : 4.5, 0, Math.PI * 2);
+        ctx.strokeStyle = "#00e5ff";
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+
+        if (isExp) {{
+          const resTxt = typeof mp.careless_residual === "number"
+            ? ` ${{mp.careless_residual >= 0 ? "+" : ""}}${{mp.careless_residual.toFixed(1)}}σ`
+            : "";
+          const lbl = `(${{mp.hkl.join(",")}})${{resTxt}}`;
+          ctx.font = "bold 10px monospace";
+          ctx.fillStyle = "#070913";
+          ctx.fillText(lbl, mx + 8, my - 4);
+          ctx.fillStyle = "#fbbf24";
+          ctx.fillText(lbl, mx + 7, my - 5);
+        }}
+      }});
+      if (isExp && state.activeOrbitId) {{
+        ctx.font = "bold 11px monospace";
+        ctx.fillStyle = "#00e5ff";
+        ctx.fillText(`ASU Orbit [${{state.activeOrbitId}}] • ${{orbitMates.length}} symmetry mates`, 14, h - 12);
+      }}
+      ctx.restore();
+    }}
+
     ctx.restore();
   }}
 
@@ -4359,12 +5124,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     let best = null;
     let bestDist = 14.0;
     const fgLayer = 0.45;
+    const isCoupled360 = Boolean(state.wulffScope === "single_frame" && state.wulffCoupled);
+    const azShifts = isCoupled360 ? [-360.0, 0.0, 360.0] : [0.0];
     PEAKS.forEach(p => {{
       if (!isPeakVisible(p)) return;
       const py = getPeakVert(p);
-      const [x, y] = detToScreen(p.det_x, py, rect.width, rect.height, fgLayer);
-      const [bx, by] = detToScreen(p.det_x, py, rect.width, rect.height, -0.35);
-      const d = Math.min(Math.hypot(mx - x, my - y), Math.hypot(mx - bx, my - by));
+      azShifts.forEach(shiftAz => {{
+        const [x, y] = detToScreen(p.det_x + shiftAz, py, rect.width, rect.height, fgLayer);
+        const [bx, by] = detToScreen(p.det_x + shiftAz, py, rect.width, rect.height, -0.35);
+        const d = Math.min(Math.hypot(mx - x, my - y), Math.hypot(mx - bx, my - by));
+        if (d < bestDist) {{
+          bestDist = d;
+          best = p;
+        }}
+      }});
+    }});
+    return best;
+  }}
+
+  function findNearestPeakWulff(mx, my) {{
+    let best = null;
+    let bestDist = state.wulffExpanded ? 14.0 : 10.0;
+    const wPeaks = getActiveWulffPeaks();
+    wPeaks.forEach(p => {{
+      if (typeof p._wulff_sx !== "number" || typeof p._wulff_sy !== "number") return;
+      const d = Math.hypot(mx - p._wulff_sx, my - p._wulff_sy);
       if (d < bestDist) {{
         bestDist = d;
         best = p;
@@ -4373,14 +5157,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return best;
   }}
 
-  // Mouse & Wheel interactions on Detector Canvas
+  // Mouse & Wheel interactions on Detector Canvas (with Google-Earth 360° periodic coupling)
   let isPanningDet = false;
   let panStart = [0, 0];
   detCanvas.addEventListener("mousedown", (ev) => {{
     isPanningDet = true;
     panStart = [ev.clientX - state.detPanX, ev.clientY - state.detPanY];
   }});
-  window.addEventListener("mouseup", () => {{ isPanningDet = false; }});
+  window.addEventListener("mouseup", () => {{ isPanningDet = false; isDraggingWulff = false; }});
 
   detCanvas.addEventListener("mousemove", (ev) => {{
     const rect = detCanvas.getBoundingClientRect();
@@ -4390,13 +5174,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.targetParallaxY = ((my / rect.height) - 0.5) * 2.0;
 
     if (isPanningDet) {{
-      state.detPanX = ev.clientX - panStart[0];
+      let nextPanX = ev.clientX - panStart[0];
+      const plotW = Math.max(50, rect.width - 54);
+      const span360 = plotW * state.detZoom;
+      if (state.wulffScope === "single_frame" && state.wulffCoupled && span360 > 10) {{
+        while (nextPanX > 0.5 * span360) {{ nextPanX -= span360; panStart[0] += span360; }}
+        while (nextPanX < -0.5 * span360) {{ nextPanX += span360; panStart[0] -= span360; }}
+        state.wulffYawDeg = -(nextPanX / span360) * 360.0;
+      }}
+      state.detPanX = nextPanX;
       state.detPanY = ev.clientY - panStart[1];
       return;
     }}
     const hit = findNearestPeakDetector(mx, my);
     state.hoveredPeakId = hit ? hit.id : null;
-    if (hit) updatePeakInspector(hit);
+    if (hit) {{
+      state.activeOrbitId = hit.asu_orbit_id || null;
+      updatePeakInspector(hit);
+    }}
   }});
 
   detCanvas.addEventListener("mouseleave", () => {{
@@ -4415,9 +5210,60 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const hit = findNearestPeakDetector(ev.clientX - rect.left, ev.clientY - rect.top);
     if (hit) {{
       state.selectedPeakId = hit.id;
+      state.activeOrbitId = hit.asu_orbit_id || null;
       updatePeakInspector(hit);
+    }} else {{
+      state.selectedPeakId = null;
+      state.activeOrbitId = null;
     }}
   }});
+
+  // Interactive 3D Yaw/Pitch Drag + Wheel Zoom + Symmetry Starburst Selection on Wulff Net Canvas
+  let isDraggingWulff = false;
+  let wulffDragStart = [0, 0, 0, 0];
+  if (stereoCanvas) {{
+    stereoCanvas.addEventListener("mousedown", (ev) => {{
+      isDraggingWulff = true;
+      wulffDragStart = [ev.clientX, ev.clientY, state.wulffYawDeg, state.wulffPitchDeg];
+    }});
+    stereoCanvas.addEventListener("mousemove", (ev) => {{
+      const rect = stereoCanvas.getBoundingClientRect();
+      const mx = ev.clientX - rect.left;
+      const my = ev.clientY - rect.top;
+      if (isDraggingWulff) {{
+        const dx = ev.clientX - wulffDragStart[0];
+        const dy = ev.clientY - wulffDragStart[1];
+        state.wulffYawDeg = ((wulffDragStart[2] + dx * 0.55 + 540) % 360) - 180;
+        state.wulffPitchDeg = Math.max(-85, Math.min(85, wulffDragStart[3] + dy * 0.45));
+        if (state.wulffScope === "single_frame" && state.wulffCoupled) {{
+          const detRect = detCanvas.getBoundingClientRect();
+          const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
+          state.detPanX = -(state.wulffYawDeg / 360.0) * span360;
+        }}
+        return;
+      }}
+      const hit = findNearestPeakWulff(mx, my);
+      if (hit) {{
+        state.hoveredPeakId = hit.id;
+        state.activeOrbitId = hit.asu_orbit_id || null;
+        updatePeakInspector(hit);
+      }}
+    }});
+    stereoCanvas.addEventListener("wheel", (ev) => {{
+      ev.preventDefault();
+      const factor = ev.deltaY < 0 ? 1.12 : 0.89;
+      state.wulffZoom = Math.max(0.6, Math.min(5.0, (state.wulffZoom || 1.0) * factor));
+    }}, {{ passive: false }});
+    stereoCanvas.addEventListener("click", (ev) => {{
+      const rect = stereoCanvas.getBoundingClientRect();
+      const hit = findNearestPeakWulff(ev.clientX - rect.left, ev.clientY - rect.top);
+      if (hit) {{
+        state.selectedPeakId = hit.id;
+        state.activeOrbitId = hit.asu_orbit_id || null;
+        updatePeakInspector(hit);
+      }}
+    }});
+  }}
 
   // Controls bindings
   slDetAlpha.addEventListener("input", () => {{
@@ -4473,18 +5319,79 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     rebuildBankColorMaps();
   }});
 
-  document.getElementById("btn-stereo-toggle").addEventListener("click", (ev) => {{
+  document.getElementById("btn-stereo-toggle").addEventListener("click", () => {{
     state.showStereo = !state.showStereo;
-    ev.currentTarget.classList.toggle("active-btn", state.showStereo);
-    document.getElementById("stereo-inset").classList.toggle("hidden", !state.showStereo);
+    syncWulffUI();
   }});
+
+  const btnWulffScope = document.getElementById("btn-wulff-scope");
+  if (btnWulffScope) {{
+    btnWulffScope.addEventListener("click", () => {{
+      state.wulffScope = state.wulffScope === "all_runs" ? "single_frame" : "all_runs";
+      if (state.wulffScope === "all_runs") {{
+        state.wulffYawDeg = 0.0;
+        state.wulffPitchDeg = 0.0;
+      }} else if (state.wulffCoupled) {{
+        const detRect = detCanvas.getBoundingClientRect();
+        const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
+        state.wulffYawDeg = -(state.detPanX / Math.max(1, span360)) * 360.0;
+      }}
+      syncWulffUI();
+    }});
+  }}
+
+  const btnWulffCouple = document.getElementById("btn-wulff-couple");
+  if (btnWulffCouple) {{
+    btnWulffCouple.addEventListener("click", () => {{
+      if (state.wulffScope !== "single_frame") return;
+      state.wulffCoupled = !state.wulffCoupled;
+      if (state.wulffCoupled) {{
+        const detRect = detCanvas.getBoundingClientRect();
+        const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
+        state.wulffYawDeg = -(state.detPanX / Math.max(1, span360)) * 360.0;
+      }}
+      syncWulffUI();
+    }});
+  }}
+
+  const selWulffColor = document.getElementById("sel-wulff-color");
+  if (selWulffColor) {{
+    selWulffColor.addEventListener("change", () => {{
+      state.wulffColorMode = selWulffColor.value || "wavelength";
+      syncWulffUI();
+    }});
+  }}
+
+  const btnWulffExpand = document.getElementById("btn-wulff-expand");
+  if (btnWulffExpand) {{
+    btnWulffExpand.addEventListener("click", () => {{
+      state.wulffExpanded = !state.wulffExpanded;
+      syncWulffUI();
+    }});
+  }}
+
+  const btnWulffClose = document.getElementById("btn-wulff-close");
+  if (btnWulffClose) {{
+    btnWulffClose.addEventListener("click", () => {{
+      state.showStereo = false;
+      state.wulffExpanded = false;
+      syncWulffUI();
+    }});
+  }}
 
   document.getElementById("btn-reset-view").addEventListener("click", () => {{
     state.detZoom = 1.0;
     state.detPanX = 0.0;
     state.detPanY = 0.0;
+    state.wulffYawDeg = 0.0;
+    state.wulffPitchDeg = 0.0;
+    state.wulffZoom = 1.0;
+    state.selectedPeakId = null;
+    state.activeOrbitId = null;
     setMaxZoneOrder(1);
   }});
+
+  syncWulffUI();
 
   document.getElementById("btn-zones-all").addEventListener("click", () => {{
     state.activeZones = new Set(
@@ -4600,6 +5507,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     const nextPeaks = Array.isArray(newPayload.peaks) ? [...newPayload.peaks] : [];
+    const nextSamplePeaks = Array.isArray(newPayload.sample_peaks) ? [...newPayload.sample_peaks] : nextPeaks;
     const nextZones = Array.isArray(newPayload.zones) ? [...newPayload.zones] : [];
     const nextPanels = Array.isArray(newPayload.panels) ? [...newPayload.panels] : [];
     const nextLadder = Array.isArray(newPayload.ladder_steps) && newPayload.ladder_steps.length > 0 ? [...newPayload.ladder_steps] : [...LADDER];
@@ -4607,6 +5515,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     PEAKS.length = 0;
     nextPeaks.forEach(p => PEAKS.push(p));
+    SAMPLE_PEAKS.length = 0;
+    nextSamplePeaks.forEach(p => SAMPLE_PEAKS.push(p));
+    DATA.merge_metrics = newPayload.merge_metrics || null;
     ZONES.length = 0;
     nextZones.forEach(z => ZONES.push(z));
     PANELS.length = 0;
@@ -4650,9 +5561,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const shapeMode = newPayload.peak_shape_mode || DATA.peak_shape_mode || "solved_circle";
     DATA.artifact_kind = artKind;
     DATA.peak_shape_mode = shapeMode;
-    DATA.pending_stage = newPayload.pending_stage || (artKind === "merged" ? "solve" : (artKind === "raw_nexus" ? "reduce" : (artKind === "integrator" ? "merge" : "integrate")));
+    DATA.pending_stage = newPayload.pending_stage || (artKind === "merged" ? "solve" : (artKind === "raw_nexus" ? "reduce" : (artKind === "integrator" ? "merge" : (artKind === "merged_careless" ? "done" : "integrate"))));
     let artBadge = "SOLVED ORIENTATION";
-    if (artKind === "integrator") {{
+    if (artKind === "merged_careless") {{
+      const ccVal = DATA.merge_metrics && typeof DATA.merge_metrics.cc_half_overall === "number"
+        ? `CC½=${{DATA.merge_metrics.cc_half_overall.toFixed(3)}}`
+        : "CARELESS MERGED";
+      artBadge = `CARELESS MERGE • ${{ccVal}}`;
+    }} else if (artKind === "integrator") {{
       artBadge = shapeMode === "anisotropic_ellipse"
         ? "INTEGRATED • 3D TENSOR ELLIPSES"
         : "INTEGRATED • ISOTROPIC 2σ CIRCLES";
@@ -4693,10 +5609,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.activeZones = new Set(ord1.length > 0 ? ord1 : ZONES.map(z => z.zone_id));
     state.currentPipelineIdx = pipelineIdxForArtifactKind(artKind);
     state.currentRungIdx = artKind === "merged" ? 0 : Math.max(0, LADDER.length - 1);
+    if (artKind === "merged_careless" || Boolean(DATA.merge_metrics)) {{
+      state.showStereo = true;
+      state.wulffExpanded = true;
+      state.wulffScope = "all_runs";
+      state.wulffColorMode = "residual";
+    }}
+    syncWulffUI();
     renderPipeline();
     if (LADDER.length > 0) selectLadderRung(state.currentRungIdx, false);
     else {{ renderZoneList(); updateHUD(); }}
-    if (artKind === "merged") {{
+    if (artKind === "merged_careless" && DATA.merge_metrics) {{
+      const m = DATA.merge_metrics;
+      const cc = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
+      const isig = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
+      const comp = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
+      const mult = typeof m.multiplicity === "number" ? `${{m.multiplicity.toFixed(2)}}×` : "—";
+      setStatusLine(
+        `[4. MERGE COMPLETE]`,
+        `<strong style="color:var(--accent-gold);">Careless Variational Merge</strong> • CC½=<strong style="color:var(--accent-cyan);">${{cc}}</strong> • ⟨I/σ⟩=<strong>${{isig}}</strong> • Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{m.n_merged_asu || 0}} ASU, mult=${{mult}}) — Click any reflection to inspect its ASU symmetry starburst &amp; ΔI/σ residual.`
+      );
+    }} else if (artKind === "merged") {{
       const cStr = (DATA.cell && DATA.cell.length === 6)
         ? `${{DATA.space_group || "P 1"}} (${{DATA.cell[0].toFixed(1)}}, ${{DATA.cell[1].toFixed(1)}}, ${{DATA.cell[2].toFixed(1)}} Å)`
         : (DATA.space_group || "P 1");
