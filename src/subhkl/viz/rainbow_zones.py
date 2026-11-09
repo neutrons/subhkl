@@ -2446,7 +2446,18 @@ def build_rainbow_zone_payload(
                 return (int(ha[0]), int(ha[1]), int(ha[2]))
             except Exception:
                 pass
-        return (h_v, k_v, l_v)
+        ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
+        sg_u = str(space_group or "").upper()
+        is_cubic = "3" in sg_u or (
+            cell is not None
+            and len(cell) >= 6
+            and abs(float(cell[0]) - float(cell[1])) < 0.05
+            and abs(float(cell[1]) - float(cell[2])) < 0.05
+        )
+        if is_cubic:
+            s3 = sorted((ah, ak, al), reverse=True)
+            return (s3[0], s3[1], s3[2])
+        return (ah, ak, al)
 
     base_ray_counts: dict[tuple[int, int, int], int] = {}
     for i in range(n_peaks):
@@ -5079,8 +5090,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const visiblePeaks = PEAKS.filter(isPeakVisible)
       .slice()
       .sort((a, b) => b.parallax_depth - a.parallax_depth);
+    const pendingTooltips = [];
+    const queuedTooltipPeakIds = new Set();
 
-    azShifts.forEach(shiftAz => {{
+    [0.0, -360.0, 360.0].forEach(shiftAz => {{
       visiblePeaks.forEach(p => {{
         const py = getPeakVert(p);
         const fgLayer = OVERLAY_PARALLAX_LAYER;
@@ -5135,7 +5148,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ctx.closePath();
           ctx.stroke();
 
-          if (p.shape_kind === "ellipse" && (isHovered || state.detZoom > 2.2) && scrPts.length >= 16) {{
+          if (p.shape_kind === "ellipse" && (isHovered || isOrbitMate || state.detZoom > 2.2) && scrPts.length >= 16) {{
             const nHalf = Math.floor(scrPts.length / 2);
             const nQuarter = Math.floor(scrPts.length / 4);
             const p0 = [x + (scrPts[0][0] - x) * scale, y + (scrPts[0][1] - y) * scale];
@@ -5143,7 +5156,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const pQ1 = [x + (scrPts[nQuarter][0] - x) * scale, y + (scrPts[nQuarter][1] - y) * scale];
             const pQ3 = [x + (scrPts[nQuarter + nHalf][0] - x) * scale, y + (scrPts[nQuarter + nHalf][1] - y) * scale];
             ctx.save();
-            ctx.strokeStyle = isHovered ? "rgba(251, 191, 36, 0.75)" : "rgba(56, 189, 248, 0.42)";
+            ctx.strokeStyle = (isHovered || isOrbitMate) ? "rgba(251, 191, 36, 0.75)" : "rgba(56, 189, 248, 0.42)";
             ctx.lineWidth = 0.85;
             ctx.beginPath();
             ctx.moveTo(p0[0], p0[1]); ctx.lineTo(pHalf[0], pHalf[1]);
@@ -5171,23 +5184,33 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ctx.fill();
         }}
 
-        if (isHovered && shiftAz === 0) {{
-          const resBadge = typeof p.careless_residual === "number"
-            ? ` ΔI/σ=${{p.careless_residual >= 0 ? "+" : ""}}${{p.careless_residual.toFixed(1)}}σ`
-            : "";
-          const tag = `(${{p.hkl.join(",")}}) λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{resBadge}}`;
-          ctx.font = "bold 11px monospace";
-          const tw = ctx.measureText(tag).width + 10;
-          ctx.fillStyle = "rgba(11, 15, 23, 0.92)";
-          ctx.fillRect(x + 8, y - 20, tw, 18);
-          ctx.strokeStyle = "#fbbf24";
-          ctx.lineWidth = 1.0;
-          ctx.strokeRect(x + 8, y - 20, tw, 18);
-          ctx.fillStyle = "#fbbf24";
-          ctx.fillText(tag, x + 13, y - 7);
+        if ((isHovered || isOrbitMate) && !queuedTooltipPeakIds.has(p.id) && x >= 0 && x <= w) {{
+          queuedTooltipPeakIds.add(p.id);
+          pendingTooltips.push({{ p, x, y, isHovered }});
         }}
         ctx.restore();
       }});
+    }});
+
+    // Render tooltips for all hovered + symmetry-equivalent reflections on top of rings
+    pendingTooltips.forEach(({{ p, x, y, isHovered }}) => {{
+      const resBadge = typeof p.careless_residual === "number"
+        ? ` ΔI/σ=${{p.careless_residual >= 0 ? "+" : ""}}${{p.careless_residual.toFixed(1)}}σ`
+        : "";
+      const tag = `(${{p.hkl.join(",")}}) λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{resBadge}}`;
+      ctx.save();
+      ctx.font = "bold 11px monospace";
+      const tw = ctx.measureText(tag).width + 10;
+      const tx = Math.min(Math.max(4, x + 8), Math.max(4, w - tw - 4));
+      const ty = Math.max(20, y);
+      ctx.fillStyle = "rgba(11, 15, 23, 0.92)";
+      ctx.fillRect(tx, ty - 20, tw, 18);
+      ctx.strokeStyle = isHovered ? "#fbbf24" : "#00e5ff";
+      ctx.lineWidth = 1.0;
+      ctx.strokeRect(tx, ty - 20, tw, 18);
+      ctx.fillStyle = isHovered ? "#fbbf24" : "#38bdf8";
+      ctx.fillText(tag, tx + 5, ty - 7);
+      ctx.restore();
     }});
   }}
 
@@ -5464,12 +5487,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (hit) {{
       state.activeOrbitId = hit.asu_orbit_id || null;
       updatePeakInspector(hit);
+    }} else if (state.selectedPeakId === null) {{
+      state.activeOrbitId = null;
     }}
   }});
 
   detCanvas.addEventListener("mouseleave", () => {{
     state.targetParallaxX = 0.0;
     state.targetParallaxY = 0.0;
+    state.hoveredPeakId = null;
+    if (state.selectedPeakId === null) state.activeOrbitId = null;
   }});
 
   detCanvas.addEventListener("wheel", (ev) => {{
@@ -5518,7 +5545,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         state.hoveredPeakId = hit.id;
         state.activeOrbitId = hit.asu_orbit_id || null;
         updatePeakInspector(hit);
+      }} else {{
+        state.hoveredPeakId = null;
+        if (state.selectedPeakId === null) state.activeOrbitId = null;
       }}
+    }});
+    stereoCanvas.addEventListener("mouseleave", () => {{
+      state.hoveredPeakId = null;
+      if (state.selectedPeakId === null) state.activeOrbitId = null;
     }});
     stereoCanvas.addEventListener("wheel", (ev) => {{
       ev.preventDefault();
@@ -6474,7 +6508,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
       }}
       candPeaks.sort((a, b) => b.intensity - a.intensity);
-      candPeaks.slice(0, 1200).forEach((p, idx) => {{ p.id = idx; peaksOut.push(p); }});
+      candPeaks.slice(0, 1200).forEach((p, idx) => {{
+        p.id = idx;
+        if (!p.asu_orbit_id && Array.isArray(p.hkl)) {{
+          const s3 = [Math.abs(p.hkl[0]), Math.abs(p.hkl[1]), Math.abs(p.hkl[2])].sort((a, b) => b - a);
+          p.asu_hkl = s3;
+          p.asu_orbit_id = s3.join(",");
+          p.orbit_color_idx = Math.abs(s3[0] * 73856093 ^ s3[1] * 19349663 ^ s3[2] * 83492791) % 12;
+        }}
+        peaksOut.push(p);
+      }});
 
       // Build Laue zones [u v w] with A_real = inv(UB)
       const A_real = mat3Inv(UB);
