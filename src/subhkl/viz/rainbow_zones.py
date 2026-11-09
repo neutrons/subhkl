@@ -3748,8 +3748,8 @@ def render_rainbow_html(
     <div class="controls-cluster">
       <select id="sel-galaxy-h5" title="Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus files, or select from Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:5px;padding:3px 6px;font-size:0.68rem;font-family:var(--font-display);max-width:175px;">
         <option value="">Data Source...</option>
-        <option value="__action_neutron_data__">+ Neutron data (SNS/HFIR)...</option>
-        <option value="__action_local_file__">+ From local computer...</option>
+        <option value="__action_neutron_data__">Neutron data (SNS/HFIR)...</option>
+        <option value="__action_local_file__">From local computer...</option>
       </select>
       <input type="file" id="inp-local-h5" accept=".h5,.hdf5,.nxs" multiple style="display:none;" />
       <button id="btn-local-h5" style="display:none;" title="Open local .h5 / .nxs.h5 files">
@@ -3934,51 +3934,86 @@ def render_rainbow_html(
 
   <!-- Modal Dialog: Load Neutron Data (NDIP neutrons_load_data + Auto-Reduce/Merge) -->
   <div id="modal-neutron-data" style="display:none;position:fixed;inset:0;z-index:9000;background:rgba(4,6,14,0.82);backdrop-filter:blur(4px);align-items:center;justify-content:center;">
-    <div style="width:min(620px,94vw);background:var(--bg-panel);border:1px solid var(--accent-cyan);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,0.75);padding:14px 16px;color:var(--text-main);font-size:0.76rem;">
-      <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-color);padding-bottom:8px;margin-bottom:10px;">
+    <div style="width:min(760px,95vw);max-height:92vh;overflow-y:auto;background:var(--bg-panel);border:1px solid var(--accent-cyan);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,0.75);padding:12px 15px;color:var(--text-main);font-size:0.76rem;">
+      <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-color);padding-bottom:7px;margin-bottom:8px;">
         <div>
           <strong style="font-family:var(--font-display);font-size:0.86rem;color:var(--accent-cyan);">LOAD NEUTRON DATA (SNS / HFIR → NDIP GALAXY)</strong>
-          <div style="font-size:0.66rem;color:var(--text-dim);margin-top:2px;">
-            Uses NDIP <code>neutrons_load_data</code> permission pass-through; raw NeXus runs automatically trigger Step 1 (Reduce + Merge Images) into <code>merged.h5</code>.
+          <div style="font-size:0.65rem;color:var(--text-dim);margin-top:2px;">
+            Browse ONCat projects &amp; runs with title previews; raw NeXus runs trigger Step 1 (Reduce + Merge Images) into <code>merged.h5</code>.
           </div>
         </div>
         <button id="btn-nd-close" style="padding:2px 8px;font-size:0.72rem;">X</button>
       </div>
 
-      <div style="display:flex;gap:8px;margin-bottom:10px;">
+      <div style="display:flex;gap:8px;margin-bottom:8px;">
         <button id="btn-nd-mode-ipts" class="active-btn" style="flex:1;padding:5px 8px;font-family:var(--font-display);font-size:0.7rem;">
-          IPTS + Run (or Run Range)
+          IPTS + Run Browser (ONCat)
         </button>
         <button id="btn-nd-mode-paths" style="flex:1;padding:5px 8px;font-family:var(--font-display);font-size:0.7rem;">
           Explicit File Path(s) (/HFIR, /SNS)
         </button>
       </div>
 
-      <div id="nd-pane-ipts" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:10px;">
-        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);min-width:0;">
-          FACILITY
-          <select id="nd-facility" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
-            <option value="HFIR" selected>HFIR</option>
-            <option value="SNS">SNS</option>
-          </select>
-        </label>
-        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);min-width:0;">
-          INSTRUMENT
-          <select id="nd-instrument" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
-            <option value="CG4D" selected>CG4D (IMAGINE-X)</option>
-            <option value="IMAGINE">IMAGINE (HFIR)</option>
-            <option value="MANDI">MANDI (SNS)</option>
-            <option value="TOPAZ">TOPAZ (SNS)</option>
-          </select>
-        </label>
-        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);min-width:0;">
-          IPTS NUMBER
-          <input id="nd-ipts" type="text" value="37331" placeholder="e.g. 37331" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
-        </label>
-        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);min-width:0;">
-          RUN OR RANGE
-          <input id="nd-runs" type="text" value="2625-2638" placeholder="e.g. 2625-2638" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
-        </label>
+      <div id="nd-pane-ipts" style="display:flex;flex-direction:column;gap:8px;margin-bottom:8px;">
+        <div style="display:grid;grid-template-columns:0.8fr 1.1fr 0.9fr 1.4fr;gap:8px;">
+          <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
+            FACILITY
+            <select id="nd-facility" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
+              <option value="HFIR" selected>HFIR</option>
+              <option value="SNS">SNS</option>
+            </select>
+          </label>
+          <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
+            INSTRUMENT
+            <select id="nd-instrument" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
+              <option value="CG4D" selected>CG4D (IMAGINE-X)</option>
+              <option value="IMAGINE">IMAGINE (HFIR)</option>
+              <option value="MANDI">MANDI (SNS)</option>
+              <option value="TOPAZ">TOPAZ (SNS)</option>
+            </select>
+          </label>
+          <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
+            IPTS NUMBER
+            <input id="nd-ipts" type="text" value="37331" placeholder="e.g. 37331" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
+            <span style="display:flex;align-items:center;justify-content:space-between;">
+              <span>RUN OR RANGE</span>
+              <span id="nd-multirun-badge" style="font-size:0.58rem;color:var(--accent-cyan);">Multi-run</span>
+            </span>
+            <input id="nd-runs" type="text" value="2625-2638" placeholder="e.g. 2625-2638 or 12737,12739" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          </label>
+        </div>
+
+        <!-- Scrollable ONCat Project & Run Browser -->
+        <div id="nd-oncat-browser" style="display:grid;grid-template-columns:0.95fr 1.85fr;gap:8px;background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;padding:7px 8px;">
+          <!-- Left column: Scrollable IPTS Projects -->
+          <div style="display:flex;flex-direction:column;gap:4px;min-width:0;">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
+              <span style="font-family:var(--font-display);font-size:0.63rem;color:var(--accent-gold);">PROJECTS (IPTS)</span>
+              <span id="nd-ipts-count" style="font-family:var(--font-display);font-size:0.6rem;color:var(--text-dim);">…</span>
+            </div>
+            <input id="nd-ipts-filter" type="text" placeholder="Filter IPTS or sample..." style="width:100%;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 6px;font-family:var(--font-display);font-size:0.65rem;" />
+            <div id="nd-ipts-list" style="height:150px;overflow-y:auto;border:1px solid rgba(255,255,255,0.07);border-radius:4px;background:#070913;display:flex;flex-direction:column;gap:1px;padding:2px;">
+              <div style="padding:8px;color:var(--text-dim);font-size:0.65rem;">Loading IPTS projects from ONCat…</div>
+            </div>
+          </div>
+
+          <!-- Right column: Scrollable Runs with Title & Angle Previews -->
+          <div style="display:flex;flex-direction:column;gap:4px;min-width:0;">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;">
+              <span id="nd-runs-header" style="font-family:var(--font-display);font-size:0.63rem;color:var(--accent-gold);">RUNS &amp; TITLES</span>
+              <div style="display:flex;align-items:center;gap:6px;">
+                <span id="nd-runs-hint" style="font-family:var(--font-display);font-size:0.59rem;color:var(--text-dim);">Click / Shift-click to select runs</span>
+                <button id="btn-nd-clear-runs" type="button" style="padding:1px 6px;font-size:0.6rem;font-family:var(--font-display);">Clear</button>
+              </div>
+            </div>
+            <input id="nd-runs-filter" type="text" placeholder="Filter run #, title, sample, or angle (e.g. garnet, beta lac, omega)..." style="width:100%;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 6px;font-family:var(--font-display);font-size:0.65rem;" />
+            <div id="nd-runs-list" style="height:150px;overflow-y:auto;border:1px solid rgba(255,255,255,0.07);border-radius:4px;background:#070913;display:flex;flex-direction:column;gap:1px;padding:2px;">
+              <div style="padding:8px;color:var(--text-dim);font-size:0.65rem;">Select an IPTS project to browse runs…</div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div id="nd-pane-paths" style="display:none;margin-bottom:10px;">
@@ -4034,9 +4069,10 @@ def render_rainbow_html(
             <input id="nd-wl-max" type="number" step="0.1" value="{init_wl_max:.1f}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
-        <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:4px;">
+        <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px;">
           Preview: /HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5 … CG4D_2638.nxs.h5 (14 runs)
         </div>
+        <div id="nd-preview-title" style="font-family:var(--font-display);font-size:0.63rem;color:var(--accent-gold);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:4px;"></div>
         <div id="nd-validation-status" style="font-family:var(--font-display);font-size:0.66rem;min-height:18px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 6px;border-radius:4px;background:rgba(7,9,19,0.65);border:1px solid rgba(56,189,248,0.2);">
           <span id="nd-validation-msg" style="color:var(--text-dim);">Ready to verify via NDIP Load Neutron Data (`neutrons_load_data`)</span>
           <div style="display:flex;align-items:center;gap:6px;">
@@ -6722,12 +6758,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     grpIngest.label = "Ingest / Open Data";
     const optNeutron = document.createElement("option");
     optNeutron.value = "__action_neutron_data__";
-    optNeutron.textContent = "+ Neutron data (SNS / HFIR)...";
+    optNeutron.textContent = "Neutron data (SNS / HFIR)...";
     grpIngest.appendChild(optNeutron);
 
     const optLocal = document.createElement("option");
     optLocal.value = "__action_local_file__";
-    optLocal.textContent = "+ From local computer...";
+    optLocal.textContent = "From local computer...";
     grpIngest.appendChild(optLocal);
     selGalaxyH5.appendChild(grpIngest);
 
@@ -6757,6 +6793,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   let pendingLocalNexusFiles = null;
   let ndValidateTimer = null;
   let lastNdValidationResult = null;
+  let ndOncatCatalog = {{
+    experiments: [],
+    runs: [],
+    multi_run_supported: true,
+    multi_run_note: "",
+    lastClickedRun: null,
+    loading: false,
+  }};
 
   function parseRunRangeSpec(specStr) {{
     const runs = [];
@@ -6775,6 +6819,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return runs;
   }}
 
+  function formatRunListToSpec(runNumbers) {{
+    const uniq = Array.from(new Set(runNumbers.map(n => parseInt(n, 10)).filter(Number.isFinite))).sort((a, b) => a - b);
+    if (uniq.length === 0) return "";
+    const parts = [];
+    let start = uniq[0], prev = uniq[0];
+    for (let i = 1; i <= uniq.length; i++) {{
+      const cur = uniq[i];
+      if (cur === prev + 1) {{
+        prev = cur;
+      }} else {{
+        if (prev === start) parts.push(String(start));
+        else if (prev === start + 1) parts.push(`${{start}},${{prev}}`);
+        else parts.push(`${{start}}-${{prev}}`);
+        start = prev = cur;
+      }}
+    }}
+    return parts.join(",");
+  }}
+
   function buildNeutronFilePathsFromDialog() {{
     const fac = (document.getElementById("nd-facility")?.value || "HFIR").trim();
     const inst = (document.getElementById("nd-instrument")?.value || "CG4D").trim();
@@ -6784,9 +6847,228 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const rawTxt = document.getElementById("nd-filepaths")?.value || "";
       return rawTxt.split(/[\\r\\n,]+/).map(s => s.trim()).filter(Boolean);
     }}
-    const runs = parseRunRangeSpec(runsSpec);
+    let runs = parseRunRangeSpec(runsSpec);
+    if (!ndOncatCatalog.multi_run_supported && runs.length > 1) {{
+      runs = [runs[0]];
+    }}
     if (!iptsRaw || runs.length === 0) return [];
-    return runs.map(r => `/${{fac}}/${{inst}}/IPTS-${{iptsRaw}}/nexus/${{inst}}_${{r}}.nxs.h5`);
+    const runLocMap = new Map((ndOncatCatalog.runs || []).map(r => [Number(r.run), r.location]));
+    return runs.map(r => runLocMap.get(Number(r)) || `/${{fac}}/${{inst}}/IPTS-${{iptsRaw}}/nexus/${{inst}}_${{r}}.nxs.h5`);
+  }}
+
+  function renderOncatProjectsList() {{
+    const listEl = document.getElementById("nd-ipts-list");
+    const countEl = document.getElementById("nd-ipts-count");
+    const filterVal = (document.getElementById("nd-ipts-filter")?.value || "").trim().toLowerCase();
+    const curIpts = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
+    if (!listEl) return;
+    const exps = (ndOncatCatalog.experiments || []).filter(e => {{
+      if (!filterVal) return true;
+      const hay = `${{e.ipts}} ${{e.id}} ${{e.title || ""}} ${{e.run_ranges || ""}} ${{e.latest_date || ""}}`.toLowerCase();
+      return hay.includes(filterVal);
+    }});
+    if (countEl) countEl.textContent = `${{exps.length}} IPTS`;
+    listEl.innerHTML = "";
+    if (exps.length === 0) {{
+      const empty = document.createElement("div");
+      empty.style.cssText = "padding:8px;color:var(--text-dim);font-size:0.64rem;";
+      empty.textContent = ndOncatCatalog.loading ? "Loading IPTS projects…" : "No matching IPTS projects";
+      listEl.appendChild(empty);
+      return;
+    }}
+    let activeRow = null;
+    exps.forEach(exp => {{
+      const isSel = String(exp.ipts) === String(curIpts);
+      const row = document.createElement("div");
+      row.style.cssText = `padding:4px 6px;border-radius:4px;cursor:pointer;display:flex;flex-direction:column;gap:1px;border:1px solid ${{isSel ? "var(--accent-cyan)" : "transparent"}};background:${{isSel ? "rgba(56,189,248,0.16)" : "rgba(255,255,255,0.02)"}};`;
+      const top = document.createElement("div");
+      top.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:4px;";
+      const lbl = document.createElement("span");
+      lbl.style.cssText = `font-family:var(--font-display);font-size:0.68rem;font-weight:700;color:${{isSel ? "var(--accent-cyan)" : "var(--text-main)"}};`;
+      lbl.textContent = `IPTS-${{exp.ipts}}`;
+      const badge = document.createElement("span");
+      badge.style.cssText = "font-family:var(--font-display);font-size:0.59rem;color:var(--accent-gold);";
+      badge.textContent = `${{exp.n_runs || 0}} runs`;
+      top.appendChild(lbl);
+      top.appendChild(badge);
+      row.appendChild(top);
+
+      const sub = document.createElement("div");
+      sub.style.cssText = "font-size:0.6rem;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      const metaBits = [];
+      if (exp.title) metaBits.push(exp.title);
+      if (exp.min_run != null && exp.max_run != null) metaBits.push(`#${{exp.min_run}}–${{exp.max_run}}`);
+      if (exp.latest_date) metaBits.push(exp.latest_date);
+      sub.textContent = metaBits.join(" • ") || (exp.run_ranges || "No runs indexed");
+      row.title = `IPTS-${{exp.ipts}} (${{exp.n_runs || 0}} runs)\\n${{exp.title ? "Samples: " + exp.title + "\\n" : ""}}Ranges: ${{exp.run_ranges || "—"}}`;
+      row.appendChild(sub);
+
+      row.addEventListener("click", () => {{
+        const iptsInput = document.getElementById("nd-ipts");
+        if (iptsInput) iptsInput.value = String(exp.ipts);
+        fetchOncatCatalog(String(exp.ipts), true);
+      }});
+      if (isSel) activeRow = row;
+      listEl.appendChild(row);
+    }});
+    if (activeRow && typeof activeRow.scrollIntoView === "function") {{
+      activeRow.scrollIntoView({{ block: "nearest" }});
+    }}
+  }}
+
+  function renderOncatRunsList(scrollToSelected = false) {{
+    const listEl = document.getElementById("nd-runs-list");
+    const hdrEl = document.getElementById("nd-runs-header");
+    const hintEl = document.getElementById("nd-runs-hint");
+    const badgeEl = document.getElementById("nd-multirun-badge");
+    const filterVal = (document.getElementById("nd-runs-filter")?.value || "").trim().toLowerCase();
+    const curIpts = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
+    if (!listEl) return;
+
+    const multiOk = Boolean(ndOncatCatalog.multi_run_supported);
+    if (badgeEl) {{
+      badgeEl.textContent = multiOk ? "Multi-run supported" : "Single run only";
+      badgeEl.style.color = multiOk ? "var(--accent-cyan)" : "var(--accent-gold)";
+      badgeEl.title = ndOncatCatalog.multi_run_note || "";
+    }}
+    if (hintEl) {{
+      hintEl.textContent = multiOk ? "Click / Shift-click to select multiple runs" : "Click to select a run";
+    }}
+
+    const selectedSet = new Set(parseRunRangeSpec(document.getElementById("nd-runs")?.value || ""));
+    const allRuns = ndOncatCatalog.runs || [];
+    const filtered = allRuns.filter(r => {{
+      if (!filterVal) return true;
+      const hay = `${{r.run}} ${{r.title || ""}} ${{r.sample_name || ""}} ${{r.angles || ""}} ${{r.created || ""}}`.toLowerCase();
+      return hay.includes(filterVal);
+    }});
+    if (hdrEl) {{
+      hdrEl.textContent = `RUNS IN IPTS-${{curIpts || "?"}} (${{filtered.length}}/${{allRuns.length}}, ${{selectedSet.size}} selected)`;
+    }}
+    listEl.innerHTML = "";
+    if (filtered.length === 0) {{
+      const empty = document.createElement("div");
+      empty.style.cssText = "padding:8px;color:var(--text-dim);font-size:0.64rem;";
+      empty.textContent = ndOncatCatalog.loading ? "Loading runs & titles from ONCat…" : "No matching runs in this IPTS";
+      listEl.appendChild(empty);
+      return;
+    }}
+
+    let firstSelRow = null;
+    filtered.forEach(r => {{
+      const rNum = Number(r.run);
+      const isSel = selectedSet.has(rNum);
+      const row = document.createElement("div");
+      row.style.cssText = `padding:3px 6px;border-radius:4px;cursor:pointer;display:grid;grid-template-columns:auto 54px 1fr auto;align-items:center;gap:6px;border:1px solid ${{isSel ? "var(--accent-cyan)" : "transparent"}};background:${{isSel ? "rgba(56,189,248,0.16)" : "rgba(255,255,255,0.015)"}};`;
+
+      const cb = document.createElement("input");
+      cb.type = multiOk ? "checkbox" : "radio";
+      cb.checked = isSel;
+      cb.style.cssText = "margin:0;cursor:pointer;accent-color:var(--accent-cyan);";
+
+      const runSpan = document.createElement("span");
+      runSpan.style.cssText = `font-family:var(--font-display);font-size:0.67rem;font-weight:700;color:${{isSel ? "var(--accent-cyan)" : "var(--text-main)"}};`;
+      runSpan.textContent = `#${{rNum}}`;
+
+      const titleSpan = document.createElement("span");
+      titleSpan.style.cssText = "font-size:0.65rem;color:var(--text-main);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+      const primaryTitle = r.title || r.sample_name || r.location?.split("/").pop() || `Run ${{rNum}}`;
+      titleSpan.textContent = (r.title && r.sample_name && !r.title.toLowerCase().includes(r.sample_name.toLowerCase()))
+        ? `${{r.title}} (${{r.sample_name}})`
+        : primaryTitle;
+
+      const metaSpan = document.createElement("span");
+      metaSpan.style.cssText = "font-family:var(--font-display);font-size:0.59rem;color:var(--accent-gold);white-space:nowrap;";
+      metaSpan.textContent = r.angles || (r.size_mb ? `${{r.size_mb}} MB` : "");
+
+      const tipLines = [`Run #${{rNum}} (${{r.location || ""}})`];
+      if (r.title) tipLines.push(`Title: ${{r.title}}`);
+      if (r.sample_name) tipLines.push(`Sample: ${{r.sample_name}}`);
+      if (r.angles) tipLines.push(`Goniometer: ${{r.angles}}`);
+      if (r.created) tipLines.push(`Created: ${{r.created}}`);
+      if (r.size_mb) tipLines.push(`Size: ${{r.size_mb}} MB`);
+      row.title = tipLines.join("\\n");
+
+      const handleSelect = (ev) => {{
+        ev.stopPropagation();
+        let nextSet = new Set(selectedSet);
+        if (!multiOk) {{
+          nextSet = new Set([rNum]);
+        }} else if (ev.shiftKey && ndOncatCatalog.lastClickedRun != null) {{
+          const visibleNums = filtered.map(x => Number(x.run));
+          const iA = visibleNums.indexOf(Number(ndOncatCatalog.lastClickedRun));
+          const iB = visibleNums.indexOf(rNum);
+          if (iA >= 0 && iB >= 0) {{
+            const [lo, hi] = iA < iB ? [iA, iB] : [iB, iA];
+            for (let k = lo; k <= hi; k++) nextSet.add(visibleNums[k]);
+          }} else {{
+            if (nextSet.has(rNum)) nextSet.delete(rNum); else nextSet.add(rNum);
+          }}
+        }} else {{
+          if (nextSet.has(rNum)) nextSet.delete(rNum);
+          else nextSet.add(rNum);
+        }}
+        ndOncatCatalog.lastClickedRun = rNum;
+        const runsInput = document.getElementById("nd-runs");
+        if (runsInput) runsInput.value = formatRunListToSpec(Array.from(nextSet));
+        renderOncatRunsList(false);
+        updateNeutronDialogPreview();
+      }};
+
+      cb.addEventListener("click", handleSelect);
+      row.addEventListener("click", handleSelect);
+      row.appendChild(cb);
+      row.appendChild(runSpan);
+      row.appendChild(titleSpan);
+      row.appendChild(metaSpan);
+      if (isSel && !firstSelRow) firstSelRow = row;
+      listEl.appendChild(row);
+    }});
+
+    if (scrollToSelected && firstSelRow && typeof firstSelRow.scrollIntoView === "function") {{
+      firstSelRow.scrollIntoView({{ block: "center" }});
+    }}
+  }}
+
+  async function fetchOncatCatalog(iptsOverride = null, autoSelectLatestRun = false) {{
+    const fac = (document.getElementById("nd-facility")?.value || "HFIR").trim();
+    const inst = (document.getElementById("nd-instrument")?.value || "CG4D").trim();
+    const iptsEl = document.getElementById("nd-ipts");
+    const iptsRaw = (iptsOverride !== null ? String(iptsOverride) : (iptsEl?.value || "")).trim().replace(/^IPTS-/i, "");
+    ndOncatCatalog.loading = true;
+    renderOncatProjectsList();
+    renderOncatRunsList(false);
+    try {{
+      const qs = new URLSearchParams({{ facility: fac, instrument: inst, ipts: iptsRaw }});
+      const r = await fetch(`api/pipeline/oncat_catalog?${{qs.toString()}}`);
+      if (!r.ok) throw new Error(`HTTP ${{r.status}}`);
+      const data = await r.json();
+      ndOncatCatalog.experiments = data.experiments || [];
+      ndOncatCatalog.runs = data.runs || [];
+      ndOncatCatalog.multi_run_supported = data.multi_run_supported !== false;
+      ndOncatCatalog.multi_run_note = data.multi_run_note || "";
+      ndOncatCatalog.loading = false;
+      if (data.ipts && iptsEl && (!iptsEl.value.trim() || iptsOverride !== null)) {{
+        iptsEl.value = String(data.ipts);
+      }}
+      const runsEl = document.getElementById("nd-runs");
+      if (runsEl && ndOncatCatalog.runs.length > 0) {{
+        const curSelected = parseRunRangeSpec(runsEl.value);
+        const runSet = new Set(ndOncatCatalog.runs.map(x => Number(x.run)));
+        const hasOverlap = curSelected.some(n => runSet.has(Number(n)));
+        if (autoSelectLatestRun || !hasOverlap) {{
+          const lastRun = ndOncatCatalog.runs[ndOncatCatalog.runs.length - 1].run;
+          runsEl.value = String(lastRun);
+        }}
+      }}
+      renderOncatProjectsList();
+      renderOncatRunsList(true);
+      updateNeutronDialogPreview();
+    }} catch (_err) {{
+      ndOncatCatalog.loading = false;
+      renderOncatProjectsList();
+      renderOncatRunsList(false);
+    }}
   }}
 
   async function verifyNeutronPathsInDialog() {{
@@ -6874,6 +7156,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function updateNeutronDialogPreview() {{
     const prevEl = document.getElementById("nd-preview-path");
+    const titlePrevEl = document.getElementById("nd-preview-title");
     const statusBox = document.getElementById("nd-validation-status");
     const msgEl = document.getElementById("nd-validation-msg");
     const sugBtn = document.getElementById("btn-nd-use-suggested-ipts");
@@ -6882,6 +7165,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!prevEl) return;
     if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
       prevEl.textContent = `Local NeXus files (${{pendingLocalNexusFiles.length}}): ${{pendingLocalNexusFiles.map(f => f.name).join(", ")}}`;
+      if (titlePrevEl) titlePrevEl.textContent = "";
       if (statusBox) statusBox.style.borderColor = "rgba(52,211,153,0.5)";
       if (msgEl) {{
         msgEl.style.color = "#34d399";
@@ -6890,6 +7174,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return;
     }}
     const paths = buildNeutronFilePathsFromDialog();
+    if (titlePrevEl) {{
+      const selRuns = parseRunRangeSpec(document.getElementById("nd-runs")?.value || "");
+      const runMap = new Map((ndOncatCatalog.runs || []).map(r => [Number(r.run), r]));
+      const previews = selRuns
+        .map(n => runMap.get(Number(n)))
+        .filter(Boolean)
+        .map(r => `#${{r.run}}: ${{r.title || r.sample_name || "—"}}${{r.angles ? " [" + r.angles + "]" : ""}}`);
+      titlePrevEl.textContent = previews.length > 0
+        ? `Title Preview: ${{previews.slice(0, 3).join("  |  ")}}${{previews.length > 3 ? ` (+${{previews.length - 3}} more)` : ""}}`
+        : "";
+    }}
     if (paths.length === 0) {{
       prevEl.textContent = "Preview: specify IPTS + run range or explicit file path(s)";
       if (statusBox) statusBox.style.borderColor = "rgba(248,113,113,0.45)";
@@ -6931,6 +7226,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     setVal("nd-wl-max", Number(params.wavelength_max).toFixed(1));
     updateNeutronDialogPreview();
     if (modalNeutronData) modalNeutronData.style.display = "flex";
+    fetchOncatCatalog();
   }}
 
   function closeNeutronDataModal() {{
@@ -6951,7 +7247,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ndIngestMode = "ipts";
       btnNdModeIpts.classList.add("active-btn");
       btnNdModePaths.classList.remove("active-btn");
-      ndPaneIpts.style.display = "grid";
+      ndPaneIpts.style.display = "flex";
       ndPanePaths.style.display = "none";
       updateNeutronDialogPreview();
     }});
@@ -6967,10 +7263,30 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   ["nd-facility", "nd-instrument", "nd-ipts", "nd-runs", "nd-filepaths"].forEach(id => {{
     const el = document.getElementById(id);
     if (el) {{
-      el.addEventListener("input", updateNeutronDialogPreview);
-      el.addEventListener("change", updateNeutronDialogPreview);
+      el.addEventListener("input", () => {{
+        if (id === "nd-runs") renderOncatRunsList(false);
+        updateNeutronDialogPreview();
+      }});
+      el.addEventListener("change", () => {{
+        if (id === "nd-ipts") fetchOncatCatalog(el.value);
+        else if (id === "nd-facility") fetchOncatCatalog(null, true);
+        updateNeutronDialogPreview();
+      }});
     }}
   }});
+  const ndIptsFilterEl = document.getElementById("nd-ipts-filter");
+  if (ndIptsFilterEl) ndIptsFilterEl.addEventListener("input", renderOncatProjectsList);
+  const ndRunsFilterEl = document.getElementById("nd-runs-filter");
+  if (ndRunsFilterEl) ndRunsFilterEl.addEventListener("input", () => renderOncatRunsList(false));
+  const btnNdClearRuns = document.getElementById("btn-nd-clear-runs");
+  if (btnNdClearRuns) {{
+    btnNdClearRuns.addEventListener("click", () => {{
+      const runsEl = document.getElementById("nd-runs");
+      if (runsEl) runsEl.value = "";
+      renderOncatRunsList(false);
+      updateNeutronDialogPreview();
+    }});
+  }}
   const ndInstEl = document.getElementById("nd-instrument");
   if (ndInstEl) {{
     ndInstEl.addEventListener("change", () => {{
@@ -6978,6 +7294,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (facEl) {{
         facEl.value = (ndInstEl.value === "MANDI" || ndInstEl.value === "TOPAZ") ? "SNS" : "HFIR";
       }}
+      fetchOncatCatalog(null, true);
       updateNeutronDialogPreview();
     }});
   }}

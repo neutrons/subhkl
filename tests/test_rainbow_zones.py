@@ -894,3 +894,17 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     html_merged = render_rainbow_html(p_merged)
     assert "Number(sub[rowOff + dc])" in html_merged
     assert "api/pipeline/resolve_local_files" in html_merged
+    assert "api/pipeline/oncat_catalog" in html_merged
+    assert "nd-oncat-browser" in html_merged
+    assert "+ Neutron data" not in html_merged
+    assert "+ From local computer" not in html_merged
+    assert ">Neutron data (SNS/HFIR)...</option>" in html_merged
+    assert ">From local computer...</option>" in html_merged
+
+    cat_res = runner_no_ndip.browse_oncat_catalog(
+        {"facility": "HFIR", "instrument": "CG4D", "ipts": "37331"}
+    )
+    assert cat_res["ok"] is True
+    assert cat_res["multi_run_supported"] is True
+    assert isinstance(cat_res["experiments"], list)
+    assert isinstance(cat_res["runs"], list)

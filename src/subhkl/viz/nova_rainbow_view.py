@@ -1572,10 +1572,52 @@ class NovaGalaxyPipelineRunner:
         ndip_checked = False
         verified_dataset_ids: list[str] = []
         msg = ""
+        sample_title = ""
+        sample_goniometer = ""
+        oncat_existing: list[str] = []
+        oncat_missing: list[str] = []
 
         if self.is_connected and self._has_tool_on_galaxy("neutrons_load_data"):
             try:
                 ndip_checked = True
+                # Enrich titles and check multi-run availability via ONCat catalog when in oncat mode
+                if ipts_raw and str(body.get("ingest_mode") or "oncat") != "file":
+                    try:
+                        cat = self.browse_oncat_catalog(
+                            {"facility": fac, "instrument": inst, "ipts": ipts_raw}
+                        )
+                        run_map = {
+                            int(r["run"]): r
+                            for r in (cat.get("runs") or [])
+                            if r.get("run") is not None
+                        }
+                        if run_map:
+                            titles_seen: list[str] = []
+                            gonio_seen: list[str] = []
+                            for p in expanded:
+                                m_r = _re.search(
+                                    r"_([0-9]+)\.nxs", os.path.basename(p), _re.I
+                                )
+                                if m_r:
+                                    r_num = int(m_r.group(1))
+                                    info = run_map.get(r_num)
+                                    if info:
+                                        oncat_existing.append(
+                                            info.get("location") or p
+                                        )
+                                        t_str = str(info.get("title") or "").strip()
+                                        g_str = str(info.get("angles") or "").strip()
+                                        if t_str and t_str not in titles_seen:
+                                            titles_seen.append(t_str)
+                                        if g_str and g_str not in gonio_seen:
+                                            gonio_seen.append(g_str)
+                                    else:
+                                        oncat_missing.append(p)
+                            sample_title = "; ".join(titles_seen[:3])
+                            sample_goniometer = "; ".join(gonio_seen[:3])
+                    except Exception:
+                        pass
+
                 store = self.get_datastore("IMAGINE-X SubHKL")
                 gi = store.nova_connection.galaxy_instance
                 first_p = expanded[0]
@@ -1618,10 +1660,23 @@ class NovaGalaxyPipelineRunner:
                     j = self._api_request("GET", f"/api/jobs/{jid}?full=true")
                     st = j.get("state")
                     if st == "ok":
-                        ok = True
-                        if len(expanded) == 1:
-                            verified_dataset_ids = out_ids
+                        if oncat_missing:
+                            ok = False
+                            msg = (
+                                f"ONCat: {len(oncat_existing)} found, {len(oncat_missing)} missing "
+                                f"({', '.join(os.path.basename(x) for x in oncat_missing[:4])})"
+                            )
                         else:
+                            ok = True
+                            if len(expanded) == 1:
+                                verified_dataset_ids = out_ids
+                            msg = (
+                                f"Verified {len(expanded)} run(s) via NDIP Load Neutron Data "
+                                f"({inst} IPTS-{ipts_raw or '?'})"
+                            )
+                            if sample_title:
+                                msg += f" — {sample_title[:60]}"
+                        if len(expanded) > 1 or not ok:
                             for oid in out_ids:
                                 try:
                                     self._api_request(
@@ -1631,10 +1686,6 @@ class NovaGalaxyPipelineRunner:
                                     )
                                 except Exception:
                                     pass
-                        msg = (
-                            f"Verified {len(expanded)} run(s) via NDIP Load Neutron Data "
-                            f"({inst} IPTS-{ipts_raw or '?'})"
-                        )
                         break
                     if st in ("error", "deleted"):
                         err_out = (
@@ -1670,15 +1721,414 @@ class NovaGalaxyPipelineRunner:
             "checked_via": "ndip_neutrons_load_data"
             if ndip_checked
             else "ndip_unavailable",
-            "existing": list(expanded) if ok else [],
-            "missing": [] if ok else list(expanded),
+            "existing": oncat_existing
+            if oncat_existing and ok
+            else (list(expanded) if ok else []),
+            "missing": oncat_missing
+            if oncat_missing
+            else ([] if ok else list(expanded)),
             "ipts_exists": ok,
             "suggested_ipts": None,
             "suggested_paths": [],
             "verified_dataset_ids": verified_dataset_ids,
-            "sample_title": "",
-            "sample_goniometer": "",
+            "sample_title": sample_title,
+            "sample_goniometer": sample_goniometer,
             "message": msg,
+        }
+
+    def _get_oncat_client(self) -> Any:
+        """Return a pyoncat.ONCat client (authenticated if env vars exist, else anonymous)."""
+        import pyoncat  # type: ignore[import-untyped]
+
+        url = os.environ.get("ONCAT_URL", "https://oncat.ornl.gov")
+        client_id = os.environ.get("ONCAT_CLIENT_ID")
+        token = os.environ.get("ONCAT_TOKEN")
+        username = os.environ.get("ONCAT_USERNAME")
+        password = os.environ.get("ONCAT_PASSWORD")
+        if client_id and token:
+            return pyoncat.ONCat(url, client_id=client_id, token=token)
+        if client_id and username and password:
+            client = pyoncat.ONCat(
+                url,
+                client_id=client_id,
+                flow=pyoncat.RESOURCE_OWNER_CREDENTIALS_FLOW,
+            )
+            client.login(username, password)
+            return client
+        return pyoncat.ONCat(url)
+
+    def _load_inventory_csv(
+        self, instrument: str, ipts: str
+    ) -> dict[int, dict[str, Any]]:
+        """Load pre-indexed run metadata (titles, sample names, angles) from inventory CSVs if available."""
+        import csv
+
+        cache: dict[str, dict[int, dict[str, Any]]] = getattr(
+            self, "_inventory_csv_cache", {}
+        )
+        key = f"{instrument.upper()}-IPTS-{ipts}"
+        if key in cache:
+            return cache[key]
+
+        candidates = [
+            os.environ.get("SUBHKL_INVENTORY_DIR", ""),
+            "/home/xvg/subhkl-benchmarks/inventory",
+            os.path.abspath(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "../../../../subhkl-benchmarks/inventory",
+                )
+            ),
+        ]
+        records: dict[int, dict[str, Any]] = {}
+        for base in candidates:
+            if not base:
+                continue
+            csv_path = os.path.join(base, f"{key}.csv")
+            if not os.path.isfile(csv_path):
+                continue
+            try:
+                with open(csv_path, newline="", encoding="utf-8") as fh:
+                    reader = csv.DictReader(fh)
+                    for row in reader:
+                        try:
+                            r_num = int(row.get("run") or row.get("ID") or -1)
+                        except (TypeError, ValueError):
+                            continue
+                        if r_num < 0:
+                            continue
+                        angles = (
+                            str(row.get("log_angles") or "").strip()
+                            or str(row.get("axis_angles") or "").strip()
+                        )
+                        records[r_num] = {
+                            "run": r_num,
+                            "filename": str(row.get("filename") or ""),
+                            "size_bytes": int(float(row.get("size_bytes") or 0)),
+                            "title": str(
+                                row.get("title") or row.get("Title") or ""
+                            ).strip(),
+                            "sample_name": str(row.get("sample_name") or "").strip(),
+                            "start_time": str(row.get("start_time") or "").strip(),
+                            "duration_s": float(row.get("duration_s") or 0.0),
+                            "total_counts": int(float(row.get("total_counts") or 0)),
+                            "angles": angles,
+                        }
+                break
+            except Exception:
+                continue
+        cache[key] = records
+        self._inventory_csv_cache = cache
+        return records
+
+    def _read_nexus_header_meta(self, path: str) -> dict[str, str]:
+        """Fast HDF5 header lookup for entry/title and entry/sample/name when readable."""
+        title_cache: dict[str, dict[str, str]] = getattr(
+            self, "_nexus_header_cache", {}
+        )
+        if path in title_cache:
+            return title_cache[path]
+        meta = {"title": "", "sample_name": "", "angles": ""}
+        if not path or not os.path.isfile(path):
+            return meta
+        try:
+            import re as _re
+
+            with h5py.File(path, "r") as f:
+                entry = f.get("entry")
+                if entry is not None:
+                    if "title" in entry:
+                        v = entry["title"][()]
+                        if hasattr(v, "flat") and getattr(v, "size", 0) > 0:
+                            v = v.flat[0]
+                        meta["title"] = (
+                            v.decode("utf-8", "replace")
+                            if isinstance(v, (bytes, bytearray))
+                            else str(v)
+                        ).strip()
+                    if "sample" in entry and "name" in entry["sample"]:
+                        v = entry["sample"]["name"][()]
+                        if hasattr(v, "flat") and getattr(v, "size", 0) > 0:
+                            v = v.flat[0]
+                        meta["sample_name"] = (
+                            v.decode("utf-8", "replace")
+                            if isinstance(v, (bytes, bytearray))
+                            else str(v)
+                        ).strip()
+            if meta["title"]:
+                ax_matches = _re.findall(
+                    r"(axis\s*\d+|omega|phi|chi|kappa)\s*=?\s*([-+]?\d+(?:\.\d+)?)",
+                    meta["title"],
+                    flags=_re.I,
+                )
+                if ax_matches:
+                    meta["angles"] = ";".join(
+                        f"{k.replace(' ', '').lower()}={v}" for k, v in ax_matches
+                    )
+        except Exception:
+            pass
+        title_cache[path] = meta
+        self._nexus_header_cache = title_cache
+        return meta
+
+    def browse_oncat_catalog(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Browse IPTS projects and runs via pyoncat with run title & angle previews."""
+        import re as _re
+        from concurrent.futures import ThreadPoolExecutor
+
+        fac = str(params.get("facility") or "HFIR").strip().upper()
+        inst = str(params.get("instrument") or "CG4D").strip().upper()
+        if inst in ("MANDI", "TOPAZ") and fac == "HFIR":
+            fac = "SNS"
+        elif inst in ("CG4D", "IMAGINE") and fac == "SNS":
+            fac = "HFIR"
+        ipts_raw = _re.sub(
+            r"^IPTS-", "", str(params.get("ipts") or "").strip(), flags=_re.I
+        )
+
+        # Multi-run support:
+        # NDIP's raw `neutrons_load_data` (oncat mode) accepts 1 integer run per tool invocation,
+        # whereas `imaginex_subhkl_prepare_peaks` (and local GPU container reduction) accepts
+        # multiple run locations resolved by pyoncat and merges them via `subhkl merge-images`.
+        has_prepare_peaks = (
+            not self.is_connected
+            or self._has_tool_on_galaxy("imaginex_subhkl_prepare_peaks")
+        )
+        multi_run_supported = bool(has_prepare_peaks)
+        multi_run_note = (
+            "Multi-run selection supported via pyoncat + subhkl merge-images"
+            if multi_run_supported
+            else "Single run only (NDIP neutrons_load_data integer run limit)"
+        )
+
+        exp_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = getattr(
+            self, "_oncat_exp_cache", {}
+        )
+        now = time.time()
+        experiments: list[dict[str, Any]] = []
+        cached_exp = exp_cache.get((fac, inst))
+        if cached_exp and (now - cached_exp[0]) < 300.0:
+            experiments = cached_exp[1]
+        else:
+            try:
+                oncat = self._get_oncat_client()
+                raw_exps = oncat.Experiment.list(facility=fac, instrument=inst)
+                for e in raw_exps:
+                    eid = str(e.get("id") or "")
+                    m_ip = _re.search(r"IPTS-(\d+)", eid, _re.I)
+                    ip_num = m_ip.group(1) if m_ip else eid
+                    n_runs = int(e.get("size") or 0)
+                    r_info = (e.get("indexed") or {}).get("run_number") or {}
+                    ranges_str = str(r_info.get("ranges") or "")
+                    latest_dt = str(
+                        ((e.get("latest") or {}).get("created") or "")
+                    )[:10]
+                    title_str = str(e.get("title") or "").strip()
+                    inv = self._load_inventory_csv(inst, ip_num)
+                    if not title_str and inv:
+                        samples: list[str] = []
+                        for rec in inv.values():
+                            s_nm = rec.get("sample_name") or ""
+                            if s_nm and s_nm not in samples:
+                                samples.append(s_nm)
+                            if len(samples) >= 4:
+                                break
+                        if samples:
+                            title_str = ", ".join(samples)
+                    experiments.append(
+                        {
+                            "ipts": ip_num,
+                            "id": f"IPTS-{ip_num}",
+                            "n_runs": n_runs,
+                            "run_ranges": ranges_str,
+                            "min_run": r_info.get("min"),
+                            "max_run": r_info.get("max"),
+                            "latest_date": latest_dt,
+                            "title": title_str,
+                        }
+                    )
+                experiments.sort(
+                    key=lambda x: (
+                        1 if (x.get("n_runs") or 0) > 0 else 0,
+                        int(x["ipts"]) if str(x.get("ipts", "")).isdigit() else 0,
+                    ),
+                    reverse=True,
+                )
+                exp_cache[(fac, inst)] = (now, experiments)
+                self._oncat_exp_cache = exp_cache
+            except Exception:
+                # Fallback to local inventory CSVs if ONCat is unreachable
+                for fallback_ip in ("37331", "34720", "33429"):
+                    inv = self._load_inventory_csv(inst, fallback_ip)
+                    if inv:
+                        r_keys = sorted(inv.keys())
+                        experiments.append(
+                            {
+                                "ipts": fallback_ip,
+                                "id": f"IPTS-{fallback_ip}",
+                                "n_runs": len(r_keys),
+                                "run_ranges": f"{r_keys[0]}-{r_keys[-1]}",
+                                "min_run": r_keys[0],
+                                "max_run": r_keys[-1],
+                                "latest_date": str(
+                                    inv[r_keys[-1]].get("start_time") or ""
+                                )[:10],
+                                "title": "Cached inventory",
+                            }
+                        )
+
+        if not ipts_raw and experiments:
+            ipts_raw = str(experiments[0]["ipts"])
+
+        runs: list[dict[str, Any]] = []
+        if ipts_raw:
+            runs_cache: dict[
+                tuple[str, str, str], tuple[float, list[dict[str, Any]]]
+            ] = getattr(self, "_oncat_runs_cache", {})
+            cached_runs = runs_cache.get((fac, inst, ipts_raw))
+            if cached_runs and (now - cached_runs[0]) < 300.0:
+                runs = cached_runs[1]
+            else:
+                inv = self._load_inventory_csv(inst, ipts_raw)
+                by_run: dict[int, dict[str, Any]] = {}
+                try:
+                    oncat = self._get_oncat_client()
+                    dfs = oncat.Datafile.list(
+                        facility=fac,
+                        instrument=inst,
+                        experiment=f"IPTS-{ipts_raw}",
+                        projection=[
+                            "indexed.run_number",
+                            "location",
+                            "size",
+                            "created",
+                            "indexed.sample_id",
+                            "metadata.entry.title",
+                            "metadata.entry.sample.name",
+                        ],
+                        exts=[".nxs.h5"],
+                    )
+                    for d in dfs:
+                        idx_d = d.get("indexed") or {}
+                        r_val = idx_d.get("run_number")
+                        if r_val is None:
+                            m_r = _re.search(
+                                r"_([0-9]+)\.nxs",
+                                str(d.get("location") or ""),
+                                _re.I,
+                            )
+                            if m_r:
+                                r_val = int(m_r.group(1))
+                        if r_val is None:
+                            continue
+                        r_num = int(r_val)
+                        meta_entry = (d.get("metadata") or {}).get("entry") or {}
+                        inv_rec = inv.get(r_num) or {}
+                        loc = str(
+                            d.get("location")
+                            or f"/{fac}/{inst}/IPTS-{ipts_raw}/nexus/{inst}_{r_num}.nxs.h5"
+                        )
+                        title = (
+                            str(meta_entry.get("title") or "").strip()
+                            or str(inv_rec.get("title") or "").strip()
+                        )
+                        sample_name = (
+                            str(
+                                (meta_entry.get("sample") or {}).get("name") or ""
+                            ).strip()
+                            or str(inv_rec.get("sample_name") or "").strip()
+                            or str(idx_d.get("sample_id") or "").strip()
+                        )
+                        angles = str(inv_rec.get("angles") or "").strip()
+                        if not angles and title:
+                            ax_m = _re.findall(
+                                r"(axis\s*\d+|omega|phi|chi|kappa)\s*=?\s*([-+]?\d+(?:\.\d+)?)",
+                                title,
+                                flags=_re.I,
+                            )
+                            if ax_m:
+                                angles = ";".join(
+                                    f"{k.replace(' ', '').lower()}={v}"
+                                    for k, v in ax_m
+                                )
+                        sz_bytes = int(
+                            d.get("size") or inv_rec.get("size_bytes") or 0
+                        )
+                        created_str = str(
+                            d.get("created") or inv_rec.get("start_time") or ""
+                        )[:16].replace("T", " ")
+                        by_run[r_num] = {
+                            "run": r_num,
+                            "location": loc,
+                            "title": title,
+                            "sample_name": sample_name,
+                            "angles": angles,
+                            "size_mb": round(sz_bytes / (1024.0 * 1024.0), 1),
+                            "created": created_str,
+                            "duration_s": inv_rec.get("duration_s") or 0.0,
+                            "total_counts": inv_rec.get("total_counts") or 0,
+                        }
+                except Exception:
+                    pass
+
+                if not by_run and inv:
+                    for r_num, inv_rec in inv.items():
+                        loc = f"/{fac}/{inst}/IPTS-{ipts_raw}/nexus/{inst}_{r_num}.nxs.h5"
+                        sz_bytes = int(inv_rec.get("size_bytes") or 0)
+                        by_run[r_num] = {
+                            "run": r_num,
+                            "location": loc,
+                            "title": str(inv_rec.get("title") or ""),
+                            "sample_name": str(inv_rec.get("sample_name") or ""),
+                            "angles": str(inv_rec.get("angles") or ""),
+                            "size_mb": round(sz_bytes / (1024.0 * 1024.0), 1),
+                            "created": str(inv_rec.get("start_time") or "")[
+                                :16
+                            ].replace("T", " "),
+                            "duration_s": inv_rec.get("duration_s") or 0.0,
+                            "total_counts": inv_rec.get("total_counts") or 0,
+                        }
+
+                # Enrich missing titles from local NeXus headers for the latest up to 200 runs
+                missing_title_runs = [
+                    r_info
+                    for r_num, r_info in sorted(
+                        by_run.items(), key=lambda kv: kv[0], reverse=True
+                    )[:200]
+                    if not r_info.get("title")
+                    and os.path.isfile(str(r_info.get("location") or ""))
+                ]
+                if missing_title_runs:
+                    with ThreadPoolExecutor(max_workers=16) as pool:
+                        metas = list(
+                            pool.map(
+                                lambda item: self._read_nexus_header_meta(
+                                    str(item["location"])
+                                ),
+                                missing_title_runs,
+                            )
+                        )
+                    for item, meta in zip(missing_title_runs, metas):
+                        if meta.get("title"):
+                            item["title"] = meta["title"]
+                        if meta.get("sample_name") and not item.get("sample_name"):
+                            item["sample_name"] = meta["sample_name"]
+                        if meta.get("angles") and not item.get("angles"):
+                            item["angles"] = meta["angles"]
+
+                runs = [by_run[k] for k in sorted(by_run.keys())]
+                runs_cache[(fac, inst, ipts_raw)] = (now, runs)
+                self._oncat_runs_cache = runs_cache
+
+        return {
+            "ok": True,
+            "facility": fac,
+            "instrument": inst,
+            "ipts": ipts_raw,
+            "multi_run_supported": multi_run_supported,
+            "multi_run_note": multi_run_note,
+            "experiments": experiments,
+            "runs": runs,
         }
 
     def _resolve_raw_nexus_inputs(
@@ -3290,6 +3740,22 @@ def serve_rainbow_zones(
                     self.send_header("Content-Length", str(len(err_body)))
                     self.end_headers()
                     self.wfile.write(err_body)
+                return
+
+            if req_path == "/api/pipeline/oncat_catalog":
+                cat_doc = vm.pipeline_runner.browse_oncat_catalog(
+                    {
+                        "facility": str(qs.get("facility", ["HFIR"])[0]).strip(),
+                        "instrument": str(qs.get("instrument", ["CG4D"])[0]).strip(),
+                        "ipts": str(qs.get("ipts", [""])[0]).strip(),
+                    }
+                )
+                body = json.dumps(cat_doc).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
 
             if req_path == "/api/pipeline/status":
