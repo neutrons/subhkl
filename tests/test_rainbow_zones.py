@@ -361,7 +361,14 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
     assert '<span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span>' in html
     assert "executeWorkflowStage" in html
     assert 'id="terminal-box"' in html
-    assert "2.8 * state.detZoom" in html
+    assert "1.85 * state.detZoom" in html
+    assert 'id="val-gonio"' in html
+    assert 'id="sel-frame"' in html
+    payload = app.view_model.model.subhkl.payload or {}
+    if payload.get("frames"):
+        assert "ω=" in payload.get("goniometer_summary", "")
+        p_f2 = app.view_model.model.subhkl.refresh_payload(frame_index=2) or {}
+        assert p_f2.get("frame_index") == 2
 
     # 3. Verify embedded JavaScript has zero syntax errors
     import re

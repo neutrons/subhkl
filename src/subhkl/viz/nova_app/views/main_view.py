@@ -60,7 +60,13 @@ class MainApp:
             }
             return web.json_response(doc)
 
-        async def handle_payload(_request: web.Request) -> web.Response:
+        async def handle_payload(request: web.Request) -> web.Response:
+            frame_q = request.rel_url.query.get("frame")
+            if frame_q is not None and str(frame_q).strip() != "":
+                try:
+                    self.view_model.model.subhkl.refresh_payload(frame_index=int(frame_q))
+                except Exception:
+                    pass
             return web.json_response(self.view_model.model.subhkl.payload or {})
 
         async def handle_standalone_html(_request: web.Request) -> web.Response:

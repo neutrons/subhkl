@@ -372,8 +372,17 @@ def _encode_panel_textures(
 def _extract_from_h5(
     h5_path: str | os.PathLike,
     images_h5: str | os.PathLike | None = None,
+    frame_index: int | None = None,
 ) -> dict[str, Any]:
-    """Extract peaks, detectors, UB, wavelength range, and metadata from a subhkl HDF5 file."""
+    """Extract peaks, detectors, UB, wavelength range, goniometer frames, and metadata from a subhkl HDF5 file."""
+    src_h5 = (
+        str(images_h5)
+        if images_h5 is not None and os.path.exists(images_h5)
+        else _discover_images_h5(h5_path)
+    )
+    sib_solve = Path(h5_path).parent / "solve.h5"
+    sib_solve_path = str(sib_solve) if sib_solve.is_file() and sib_solve != Path(h5_path) else None
+
     with h5py.File(h5_path, "r") as f:
         instrument = _decode_str(f.attrs.get("instrument"), "IMAGINE")
         ki = (0.0, 0.0, 1.0)
@@ -402,10 +411,9 @@ def _extract_from_h5(
                     abs(wavelength_range[0] - 2.0) < 1e-3
                     and abs(wavelength_range[1] - 10.0) < 1e-3
                 ):
-                    sib_solve = Path(h5_path).parent / "solve.h5"
-                    if sib_solve.is_file() and sib_solve != Path(h5_path):
+                    if sib_solve_path:
                         try:
-                            with h5py.File(sib_solve, "r") as sf:
+                            with h5py.File(sib_solve_path, "r") as sf:
                                 for wk in (
                                     "scan_refinement/band_wavelength",
                                     "instrument/wavelength",
@@ -420,6 +428,20 @@ def _extract_from_h5(
                                             break
                         except Exception:
                             pass
+        elif sib_solve_path:
+            try:
+                with h5py.File(sib_solve_path, "r") as sf:
+                    for wk in (
+                        "scan_refinement/band_wavelength",
+                        "instrument/wavelength",
+                    ):
+                        if wk in sf:
+                            swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                            if len(swl) >= 2:
+                                wavelength_range = (float(swl[0]), float(swl[1]))
+                                break
+            except Exception:
+                pass
 
         U = (
             np.asarray(f["sample/U"][()], dtype=float)
@@ -477,6 +499,182 @@ def _extract_from_h5(
             else None
         )
 
+        # Extract multi-frame offsets, file names, and goniometer motor angles
+        offsets = (
+            np.asarray(f["file_offsets"][()], dtype=int)
+            if "file_offsets" in f
+            else None
+        )
+        n_frames_total = len(f["bank_ids"]) if "bank_ids" in f else 0
+        files_raw = list(f["files"][()]) if "files" in f else None
+        gonio_names_raw = (
+            list(f["goniometer/names"][()]) if "goniometer/names" in f else None
+        )
+        gonio_angles_ref = (
+            np.asarray(f["goniometer/angles"][()], dtype=float)
+            if "goniometer/angles" in f
+            else None
+        )
+        gonio_angles_nom = None
+        R_all = (
+            np.asarray(f["goniometer/R"][()], dtype=float)
+            if "goniometer/R" in f
+            else None
+        )
+
+        for aux_path in (src_h5, sib_solve_path):
+            if not aux_path or not os.path.isfile(aux_path):
+                continue
+            try:
+                with h5py.File(aux_path, "r") as af:
+                    if offsets is None and "file_offsets" in af:
+                        offsets = np.asarray(af["file_offsets"][()], dtype=int)
+                    if n_frames_total == 0 and "bank_ids" in af:
+                        n_frames_total = len(af["bank_ids"])
+                    if files_raw is None and "files" in af:
+                        files_raw = list(af["files"][()])
+                    if gonio_names_raw is None and "goniometer/names" in af:
+                        gonio_names_raw = list(af["goniometer/names"][()])
+                    if aux_path == src_h5 and "goniometer/angles" in af:
+                        gonio_angles_nom = np.asarray(
+                            af["goniometer/angles"][()], dtype=float
+                        )
+                    elif gonio_angles_ref is None and "goniometer/angles" in af:
+                        gonio_angles_ref = np.asarray(
+                            af["goniometer/angles"][()], dtype=float
+                        )
+                    if R_all is None and "goniometer/R" in af:
+                        R_all = np.asarray(af["goniometer/R"][()], dtype=float)
+            except Exception:
+                pass
+
+        if gonio_angles_nom is None:
+            gonio_angles_nom = gonio_angles_ref
+
+        sym_map = {
+            "omega": "ω",
+            "phi": "φ",
+            "kappa": "κ",
+            "chi": "χ",
+            "alpha": "α",
+            "twotheta": "2θ",
+            "2theta": "2θ",
+        }
+        motor_names: list[str] = []
+        if gonio_names_raw:
+            for nm in gonio_names_raw:
+                s_nm = _decode_str(nm, "motor").split(":")[-1].strip()
+                motor_names.append(sym_map.get(s_nm.lower(), s_nm))
+
+        frames_meta: list[dict[str, Any]] = []
+        active_frame = 0
+        frame_slice: tuple[int, int] | None = None
+        if offsets is not None and len(offsets) >= 1 and n_frames_total > 0:
+            counts = np.diff(np.append(offsets, n_frames_total))
+            # Identify which motor columns vary across frames
+            varying_cols: set[int] = set()
+            if (
+                gonio_angles_nom is not None
+                and gonio_angles_nom.ndim == 2
+                and len(offsets) > 1
+            ):
+                valid_offs = [o for o in offsets if 0 <= int(o) < len(gonio_angles_nom)]
+                if len(valid_offs) > 1:
+                    sub_ang = gonio_angles_nom[valid_offs]
+                    for col_i in range(sub_ang.shape[1]):
+                        if float(np.ptp(sub_ang[:, col_i])) > 1e-2:
+                            varying_cols.add(col_i)
+
+            for r_idx in range(len(offsets)):
+                f0 = int(offsets[r_idx])
+                f1 = int(offsets[r_idx] + counts[r_idx])
+                file_label = f"Frame {r_idx + 1}"
+                if files_raw and r_idx < len(files_raw):
+                    raw_fn = os.path.basename(_decode_str(files_raw[r_idx], file_label))
+                    for ext in (".nxs.h5.img.h5", ".nxs.h5.im.h5", ".nxs.h5", ".img.h5", ".h5"):
+                        if raw_fn.endswith(ext):
+                            raw_fn = raw_fn[: -len(ext)]
+                            break
+                    file_label = raw_fn
+
+                motors_list: list[dict[str, Any]] = []
+                seen_static: set[tuple[str, float]] = set()
+                if (
+                    gonio_angles_nom is not None
+                    and gonio_angles_nom.ndim == 2
+                    and f0 < len(gonio_angles_nom)
+                ):
+                    row_nom = gonio_angles_nom[f0]
+                    row_ref = (
+                        gonio_angles_ref[f0]
+                        if gonio_angles_ref is not None
+                        and gonio_angles_ref.ndim == 2
+                        and f0 < len(gonio_angles_ref)
+                        else row_nom
+                    )
+                    col_order = sorted(
+                        range(len(row_nom)),
+                        key=lambda ci: (0 if ci in varying_cols else 1, ci),
+                    )
+                    for ci in col_order:
+                        m_sym = (
+                            motor_names[ci]
+                            if ci < len(motor_names)
+                            else f"M{ci + 1}"
+                        )
+                        v_nom = round(float(row_nom[ci]), 2)
+                        v_ref = round(float(row_ref[ci]), 2)
+                        if ci not in varying_cols:
+                            key_st = (m_sym, round(v_nom, 1))
+                            if key_st in seen_static:
+                                continue
+                            seen_static.add(key_st)
+                        motors_list.append(
+                            {
+                                "name": m_sym,
+                                "angle_deg": v_nom,
+                                "refined_deg": v_ref,
+                                "scanned": ci in varying_cols,
+                            }
+                        )
+
+                motor_str = " ".join(
+                    f"{m['name']}={m['angle_deg']:.1f}°" for m in motors_list
+                )
+                primary_str = " ".join(
+                    f"{m['name']}={m['angle_deg']:.1f}°"
+                    for m in motors_list
+                    if m.get("scanned")
+                ) or (
+                    f"{motors_list[0]['name']}={motors_list[0]['angle_deg']:.1f}°"
+                    if motors_list
+                    else ""
+                )
+                opt_label = (
+                    f"{r_idx + 1}/{len(offsets)} · {file_label}"
+                    + (f" ({primary_str})" if primary_str else "")
+                )
+                frames_meta.append(
+                    {
+                        "frame_index": r_idx,
+                        "f0": f0,
+                        "f1": f1,
+                        "file": file_label,
+                        "label": opt_label,
+                        "motor_summary": motor_str or f"Frame {r_idx + 1}",
+                        "motors": motors_list,
+                    }
+                )
+
+            if frame_index is not None and 0 <= int(frame_index) < len(frames_meta):
+                active_frame = int(frame_index)
+            else:
+                active_frame = int(np.argmax(counts))
+            frame_slice = (
+                int(frames_meta[active_frame]["f0"]),
+                int(frames_meta[active_frame]["f1"]),
+            )
+
         if (
             peaks_xyz is None
             and pixel_r is not None
@@ -504,17 +702,6 @@ def _extract_from_h5(
 
         # Extract finder-less solve / lattice-ladder / staged-band diagnostics if present
         solve_diagnostics: dict[str, Any] | None = None
-        frame_slice: tuple[int, int] | None = None
-        if "file_offsets" in f and "bank_ids" in f:
-            offsets = np.asarray(f["file_offsets"][()], dtype=int)
-            n_frames_total = len(f["bank_ids"])
-            if len(offsets) >= 1:
-                counts = np.diff(np.append(offsets, n_frames_total))
-                best_run = int(np.argmax(counts))
-                f0 = int(offsets[best_run])
-                f1 = int(offsets[best_run] + counts[best_run])
-                frame_slice = (f0, f1)
-
         if any(k in f for k in ("blind_search", "scan_refinement", "solve", "search")):
             solve_diagnostics = {}
             bs_grp = f["blind_search"] if "blind_search" in f else (f["search"] if "search" in f else None)
@@ -577,11 +764,66 @@ def _extract_from_h5(
             else None
         )
 
+        # If multi-frame dataset has per-run peaks (e.g. integrated.h5), filter to active_frame
+        if (
+            len(frames_meta) > 1
+            and peaks_xyz is not None
+            and run_index is not None
+            and len(run_index) == len(peaks_xyz)
+        ):
+            mask_run = run_index == active_frame
+            if np.any(mask_run):
+                peaks_xyz = peaks_xyz[mask_run]
+                if bank is not None and len(bank) == len(mask_run):
+                    bank = bank[mask_run]
+                if pixel_r is not None and len(pixel_r) == len(mask_run):
+                    pixel_r = pixel_r[mask_run]
+                if pixel_c is not None and len(pixel_c) == len(mask_run):
+                    pixel_c = pixel_c[mask_run]
+                if hkl is not None and len(hkl) == len(mask_run):
+                    hkl = hkl[mask_run]
+                if lam is not None and len(lam) == len(mask_run):
+                    lam = lam[mask_run]
+                if intensity is not None and len(intensity) == len(mask_run):
+                    intensity = intensity[mask_run]
+                if sigma is not None and len(sigma) == len(mask_run):
+                    sigma = sigma[mask_run]
+                run_index = run_index[mask_run]
+
+        # Filter out zero/noise predictions in integrated.h5 (keep significant reflections I/sigma >= 2.5)
+        if (
+            peaks_xyz is not None
+            and intensity is not None
+            and sigma is not None
+            and len(intensity) == len(peaks_xyz)
+            and len(sigma) == len(peaks_xyz)
+        ):
+            snr_mask = (sigma > 0) & (
+                intensity / np.maximum(sigma, 1e-9) >= 2.5
+            )
+            if int(np.sum(snr_mask)) >= 20 and int(np.sum(snr_mask)) < len(peaks_xyz):
+                peaks_xyz = peaks_xyz[snr_mask]
+                if bank is not None and len(bank) == len(snr_mask):
+                    bank = bank[snr_mask]
+                if pixel_r is not None and len(pixel_r) == len(snr_mask):
+                    pixel_r = pixel_r[snr_mask]
+                if pixel_c is not None and len(pixel_c) == len(snr_mask):
+                    pixel_c = pixel_c[snr_mask]
+                if hkl is not None and len(hkl) == len(snr_mask):
+                    hkl = hkl[snr_mask]
+                if lam is not None and len(lam) == len(snr_mask):
+                    lam = lam[snr_mask]
+                intensity = intensity[snr_mask]
+                sigma = sigma[snr_mask]
+                if run_index is not None and len(run_index) == len(snr_mask):
+                    run_index = run_index[snr_mask]
+
         R_gonio = None
-        if "goniometer/R" in f:
-            R_all = np.asarray(f["goniometer/R"][()], dtype=float)
+        if R_all is not None:
             if R_all.ndim == 3 and len(R_all) > 0:
-                if peaks_xyz is not None and len(R_all) == len(peaks_xyz):
+                if frame_slice is not None and frame_slice[0] < len(R_all):
+                    R_gonio = R_all[frame_slice[0]]
+                elif peaks_xyz is not None and len(R_all) == len(peaks_xyz):
                     R_gonio = R_all
                 elif (
                     run_index is not None
@@ -589,8 +831,6 @@ def _extract_from_h5(
                     and np.max(run_index, initial=0) < len(R_all)
                 ):
                     R_gonio = R_all[run_index]
-                elif frame_slice is not None and frame_slice[0] < len(R_all):
-                    R_gonio = R_all[frame_slice[0]]
                 else:
                     R_gonio = R_all[0]
             elif R_all.ndim == 2:
@@ -795,6 +1035,8 @@ def _extract_from_h5(
             "R_gonio": R_gonio,
             "solve_diagnostics": solve_diagnostics,
             "frame_slice": frame_slice,
+            "frames": frames_meta,
+            "frame_index": active_frame,
         }
 
 
@@ -1129,6 +1371,7 @@ def build_rainbow_zone_payload(
     n_arc: int = 720,
     max_peaks: int = 2500,
     render_binning: int = 4,
+    frame_index: int | None = None,
 ) -> dict[str, Any]:
     """Build the JSON-serializable data contract for the Rainbow Zones widget.
 
@@ -1147,9 +1390,13 @@ def build_rainbow_zone_payload(
     lam_arr = None
     solve_diagnostics = None
     frame_slice = None
+    frames_meta: list[dict[str, Any]] = []
+    active_frame = int(frame_index) if frame_index is not None else 0
 
     if replay_h5 is not None:
-        extracted = _extract_from_h5(replay_h5, images_h5=images_h5)
+        extracted = _extract_from_h5(
+            replay_h5, images_h5=images_h5, frame_index=frame_index
+        )
         instrument = extracted["instrument"] or instrument
         ki = extracted["ki"]
         wavelength_range = extracted["wavelength_range"]
@@ -1171,6 +1418,8 @@ def build_rainbow_zone_payload(
         lam_arr = extracted["wavelength"]
         solve_diagnostics = extracted.get("solve_diagnostics")
         frame_slice = extracted.get("frame_slice")
+        frames_meta = extracted.get("frames") or []
+        active_frame = int(extracted.get("frame_index", active_frame))
         if R_gonio is None:
             R_gonio = extracted["R_gonio"]
         if images_h5 is None:
@@ -1614,6 +1863,11 @@ def build_rainbow_zone_payload(
     )
 
     d_min_use = float((solve_diagnostics or {}).get("d_min", 2.8))
+    gonio_summary = (
+        frames_meta[active_frame].get("motor_summary", "—")
+        if 0 <= active_frame < len(frames_meta)
+        else "—"
+    )
 
     return {
         "instrument": str(instrument),
@@ -1622,6 +1876,9 @@ def build_rainbow_zone_payload(
         "intensity_source": intensity_source,
         "wavelength_range": [round(wl_min, 3), round(wl_max, 3)],
         "d_min": round(d_min_use, 3),
+        "frame_index": int(active_frame),
+        "goniometer_summary": gonio_summary,
+        "frames": frames_meta,
         "cell": [round(float(x), 4) for x in cell] if cell else None,
         "ub_matrix": (
             [[round(float(v), 6) for v in row] for row in ub_matrix]
@@ -2184,6 +2441,18 @@ def render_rainbow_html(
         <span class="hud-label">ZONES</span>
         <span class="hud-value" id="val-zones">0</span>
       </div>
+      <div class="hud-pill" id="hud-gonio-pill" title="Goniometer motor angles for the active frame">
+        <span class="hud-label">GONIO</span>
+        <span class="hud-value" id="val-gonio">—</span>
+      </div>
+      <div class="hud-pill" id="hud-frame-ctrl" style="gap:3px;padding:1px 5px;" title="Select goniometer frame / run orientation">
+        <span class="hud-label">FRAME</span>
+        <button id="btn-frame-prev" style="padding:1px 5px;font-size:0.62rem;" title="Previous frame">◀</button>
+        <select id="sel-frame" style="background:transparent;color:var(--accent-pink);border:none;font-family:var(--font-display);font-size:0.68rem;font-weight:700;outline:none;cursor:pointer;max-width:190px;">
+          <option value="0">1 / 1</option>
+        </select>
+        <button id="btn-frame-next" style="padding:1px 5px;font-size:0.62rem;" title="Next frame">▶</button>
+      </div>
       <div class="hud-pill" style="display:none;">
         <span class="hud-label">PROJ</span>
         <span class="hud-value" id="val-proj">CYL</span>
@@ -2742,7 +3011,46 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     document.getElementById("val-rms").textContent = `${{rms.toFixed(3)}}°`;
     const elZones = document.getElementById("val-zones");
     if (elZones) elZones.textContent = `${{state.activeZones.size}} (≤${{state.maxZoneOrder}})`;
+    const elGonio = document.getElementById("val-gonio");
+    if (elGonio) {{
+      const frames = DATA.frames || [];
+      const fIdx = typeof DATA.frame_index === "number" ? DATA.frame_index : 0;
+      const curF = frames[fIdx];
+      elGonio.textContent = (curF && curF.motor_summary) || DATA.goniometer_summary || "—";
+    }}
     drawHistogram(visiblePeaks);
+  }}
+
+  function renderFrameSelector() {{
+    const selFrame = document.getElementById("sel-frame");
+    const ctrlPill = document.getElementById("hud-frame-ctrl");
+    const gonioPill = document.getElementById("hud-gonio-pill");
+    const frames = DATA.frames || [];
+    const fIdx = typeof DATA.frame_index === "number" ? DATA.frame_index : 0;
+    if (selFrame) {{
+      selFrame.innerHTML = "";
+      if (frames.length === 0) {{
+        const opt = document.createElement("option");
+        opt.value = "0";
+        opt.textContent = "1 / 1";
+        selFrame.appendChild(opt);
+      }} else {{
+        frames.forEach((f, idx) => {{
+          const opt = document.createElement("option");
+          opt.value = String(idx);
+          opt.textContent = f.label || `${{idx + 1}}/${{frames.length}}`;
+          if (idx === fIdx) opt.selected = true;
+          selFrame.appendChild(opt);
+        }});
+      }}
+    }}
+    if (ctrlPill) {{
+      ctrlPill.style.display = frames.length > 0 ? "flex" : "none";
+    }}
+    if (gonioPill) {{
+      const hasGonio = frames.length > 0 || (DATA.goniometer_summary && DATA.goniometer_summary !== "—");
+      gonioPill.style.display = hasGonio ? "flex" : "none";
+    }}
   }}
 
   const histCanvas = document.getElementById("canvas-hist");
@@ -3033,8 +3341,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         return;
       }}
 
-      const baseR = Math.max(1.6, Math.min(28.0, 2.8 * state.detZoom));
-      const r = isHovered ? baseR + 2.2 : baseR;
+      const baseR = Math.max(1.2, Math.min(20.0, 1.85 * state.detZoom));
+      const r = isHovered ? baseR + 1.8 : baseR;
 
       ctx.save();
       // Subtle depth tether connecting the floating Bragg ring to its physical spot on the detector panel
@@ -3358,6 +3666,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     DATA.wavelength_range = newPayload.wavelength_range || DATA.wavelength_range;
     DATA.d_min = newPayload.d_min || DATA.d_min;
     DATA.cell = newPayload.cell || DATA.cell;
+    if (Array.isArray(newPayload.frames)) DATA.frames = newPayload.frames;
+    if (typeof newPayload.frame_index === "number") DATA.frame_index = newPayload.frame_index;
+    if (newPayload.goniometer_summary) DATA.goniometer_summary = newPayload.goniometer_summary;
+    renderFrameSelector();
 
     if (DATA.wavelength_range && DATA.wavelength_range.length >= 2) {{
       state.lamMin = Number(DATA.wavelength_range[0]);
@@ -4176,6 +4488,52 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     requestAnimationFrame(animate);
   }}
 
+  async function selectFrame(frameIdx) {{
+    const frames = DATA.frames || [];
+    if (frames.length === 0) return;
+    const clamped = ((frameIdx % frames.length) + frames.length) % frames.length;
+    DATA.frame_index = clamped;
+    renderFrameSelector();
+    updateHUD();
+    const curF = frames[clamped];
+    if (curF) {{
+      setStatusLine(
+        `[FRAME ${{clamped + 1}}/${{frames.length}}]`,
+        `<strong style="color:var(--accent-pink);">${{curF.file || "Frame"}}</strong> • Goniometer: <strong style="color:var(--accent-cyan);">${{curF.motor_summary || "—"}}</strong>`
+      );
+    }}
+    try {{
+      const resp = await fetch(`api/payload?frame=${{clamped}}`, {{ cache: "no-store" }});
+      if (resp.ok) {{
+        const newPayload = await resp.json();
+        recomputeBoundsAndReload(newPayload);
+      }}
+    }} catch (_e) {{}}
+  }}
+
+  const selFrameEl = document.getElementById("sel-frame");
+  if (selFrameEl) {{
+    selFrameEl.addEventListener("change", () => {{
+      const idx = parseInt(selFrameEl.value, 10);
+      if (!Number.isNaN(idx)) selectFrame(idx);
+    }});
+  }}
+  const btnFramePrev = document.getElementById("btn-frame-prev");
+  if (btnFramePrev) {{
+    btnFramePrev.addEventListener("click", () => {{
+      const cur = typeof DATA.frame_index === "number" ? DATA.frame_index : 0;
+      selectFrame(cur - 1);
+    }});
+  }}
+  const btnFrameNext = document.getElementById("btn-frame-next");
+  if (btnFrameNext) {{
+    btnFrameNext.addEventListener("click", () => {{
+      const cur = typeof DATA.frame_index === "number" ? DATA.frame_index : 0;
+      selectFrame(cur + 1);
+    }});
+  }}
+
+  renderFrameSelector();
   renderZoneList();
   renderPipeline();
   renderLadder();

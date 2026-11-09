@@ -81,18 +81,39 @@ class NovaGalaxyPipelineRunner:
         self.active_job: dict[str, Any] | None = None
         self._auto_discover_local_galaxy()
 
+    @staticmethod
+    def _is_galaxy_server(url: str) -> bool:
+        """Return True only if ``url`` responds with a valid Galaxy JSON ``/api/version`` payload."""
+        try:
+            req = urllib.request.Request(
+                f"{url.rstrip('/')}/api/version",
+                headers={"Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                if resp.status != 200:
+                    return False
+                doc = json.loads(resp.read().decode("utf-8"))
+                return isinstance(doc, dict) and "version_major" in doc
+        except Exception:
+            return False
+
+    @staticmethod
+    def _clean_err_msg(exc: Exception) -> str:
+        """Strip any HTML/XML/SVG body or multi-line traceback from an exception message."""
+        msg = str(exc).strip()
+        for marker in ("<!doctype", "<html", "<?xml", "<svg", "\n"):
+            idx = msg.lower().find(marker)
+            if idx > 0:
+                msg = msg[:idx].strip().rstrip(":,;")
+        return msg[:220]
+
     def _auto_discover_local_galaxy(self) -> None:
         """Auto-discover local Planemo / Galaxy server if env vars were not injected."""
         if not self.galaxy_url:
             for candidate in ("http://127.0.0.1:9090", "http://localhost:9090"):
-                try:
-                    req = urllib.request.Request(f"{candidate}/api/version")
-                    with urllib.request.urlopen(req, timeout=1.0) as resp:
-                        if resp.status == 200:
-                            self.galaxy_url = candidate
-                            break
-                except Exception:
-                    continue
+                if self._is_galaxy_server(candidate):
+                    self.galaxy_url = candidate
+                    break
 
         if self.galaxy_url and not self.galaxy_api_key:
             # Check if Planemo's default master_api_key ('test_key') can mint/fetch a user key
@@ -266,45 +287,49 @@ class NovaGalaxyPipelineRunner:
         store: Any,
         local_path: str,
         job_record: dict[str, Any],
+        *,
+        force_upload: bool = False,
+        file_ext: str = "h5",
     ) -> str:
-        """Link an existing 'ok' dataset in the Galaxy history or upload with file_type='h5', to_posix_lines=False."""
+        """Link an existing 'ok' dataset in the Galaxy history or upload with file_type=file_ext, to_posix_lines=False."""
         fname = os.path.basename(local_path)
         gi = store.nova_connection.galaxy_instance
-        existing = gi.datasets.get_datasets(history_id=store.history_id, name=fname)
-        for ds in existing:
-            ds_id = ds.get("id")
-            if not ds_id:
-                continue
-            info = gi.datasets.show_dataset(ds_id)
-            st = info.get("state")
-            if st == "ok":
-                job_record["stdout"] += f"[nova -> galaxy] Linked existing dataset '{fname}' (id={ds_id}, state=ok)\n"
-                return ds_id
-            if st in ("queued", "running", "new", "upload"):
-                job_record["stdout"] += (
-                    f"[nova -> galaxy] Waiting for in-progress upload of '{fname}' (id={ds_id}, state={st})...\n"
-                )
-                gi.datasets.wait_for_dataset(ds_id, maxwait=120, interval=2.0, check=True)
-                return ds_id
+        if not force_upload:
+            existing = gi.datasets.get_datasets(history_id=store.history_id, name=fname)
+            for ds in existing:
+                ds_id = ds.get("id")
+                if not ds_id:
+                    continue
+                info = gi.datasets.show_dataset(ds_id)
+                st = info.get("state")
+                if st == "ok":
+                    job_record["stdout"] += f"[nova -> galaxy] Linked existing dataset '{fname}' (id={ds_id}, state=ok)\n"
+                    return ds_id
+                if st in ("queued", "running", "new", "upload"):
+                    job_record["stdout"] += (
+                        f"[nova -> galaxy] Waiting for in-progress upload of '{fname}' (id={ds_id}, state={st})...\n"
+                    )
+                    gi.datasets.wait_for_dataset(ds_id, maxwait=120, interval=2.0, check=True)
+                    return ds_id
 
         is_local_gx = any(
-            h in (getattr(gi, "base_url", "") or self.galaxy_url)
+            h in (getattr(gi, "base_url", "") or self.galaxy_url or "")
             for h in ("127.0.0.1", "localhost")
         )
         job_record["stdout"] += (
-            f"[nova -> galaxy] Uploading/linking '{fname}' (file_type=h5, link_to_files={is_local_gx})...\n"
+            f"[nova -> galaxy] Uploading '{fname}' to Galaxy history (file_type={file_ext})...\n"
         )
         up_info = gi.tools.upload_file(
             path=local_path,
             history_id=store.history_id,
             file_name=fname,
-            file_type="h5",
+            file_type=file_ext,
             to_posix_lines=False,
             link_to_files=is_local_gx,
         )
         ds_id = up_info["outputs"][0]["id"]
         gi.datasets.wait_for_dataset(ds_id, maxwait=180, interval=2.0, check=True)
-        job_record["stdout"] += f"[nova -> galaxy] Upload of '{fname}' ready (id={ds_id})\n"
+        job_record["stdout"] += f"[nova -> galaxy] Saved '{fname}' in Galaxy history (id={ds_id})\n"
         return ds_id
 
     def _dispatch_nova_galaxy_thread(
@@ -341,48 +366,54 @@ class NovaGalaxyPipelineRunner:
             inst = str(params.get("instrument", "CG4D"))
             sg = str(params.get("space_group", "P 21 21 21"))
             merged_path = params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
-            solve_path = params.get("peaks_file") or "/home/xvg/subhkl-examples/betalac-7/solve.h5"
+            work_dir = os.path.dirname(os.path.abspath(merged_path))
+            solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
+            if not os.path.isfile(solve_path) or os.path.basename(solve_path) in ("merged.h5", "integrated.h5"):
+                cand_solve = os.path.join(work_dir, "solve.h5")
+                if os.path.isfile(cand_solve):
+                    solve_path = cand_solve
 
             tool_inputs: dict[str, Any] = {}
-            if stage_id == "solve":
+            if stage_id in ("solve", "integrate"):
                 if not self._has_tool_on_galaxy("imaginex_subhkl_solve"):
-                    # Check if local Planemo Galaxy (http://127.0.0.1:9090) has imaginex_subhkl_solve deployed
-                    from nova.galaxy import Connection
+                    if self._is_galaxy_server("http://127.0.0.1:9090"):
+                        from nova.galaxy import Connection
 
-                    job_record["stdout"] += (
-                        f"[nova -> galaxy] 'imaginex_subhkl_solve' not yet merged on {self.galaxy_url}; "
-                        f"switching to local Galaxy instance http://127.0.0.1:9090 (GPU container runner)...\n"
-                    )
-                    local_conn = Connection(galaxy_url="http://127.0.0.1:9090", galaxy_key="test_key")
-                    store = local_conn.connect().create_data_store("IMAGINE-X SubHKL")
-                    gi = store.nova_connection.galaxy_instance
-                    self.galaxy_url = "http://127.0.0.1:9090"
-                    self.api_key = gi.key
-                    self.history_id = store.history_id
+                        job_record["stdout"] += (
+                            f"[nova -> galaxy] 'imaginex_subhkl_solve' not yet merged on {self.galaxy_url}; "
+                            f"switching to local Galaxy instance http://127.0.0.1:9090 (GPU container runner)...\n"
+                        )
+                        local_conn = Connection(galaxy_url="http://127.0.0.1:9090", galaxy_key="test_key")
+                        store = local_conn.connect().create_data_store("IMAGINE-X SubHKL")
+                        gi = store.nova_connection.galaxy_instance
+                        self.galaxy_url = "http://127.0.0.1:9090"
+                        self.api_key = gi.key
+                        self.history_id = store.history_id
 
-                if self._has_tool_on_galaxy("imaginex_subhkl_solve"):
-                    primary_tool = "imaginex_subhkl_solve"
-                    scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
-                    tool_inputs = {
-                        "scan": {"src": "hda", "id": scan_id},
-                        "instrument": inst,
-                        "spaceGroup": sg,
-                        "a": float(raw_cell[0]),
-                        "b": float(raw_cell[1]),
-                        "c": float(raw_cell[2]),
-                        "alpha": float(raw_cell[3]),
-                        "beta": float(raw_cell[4]),
-                        "gamma": float(raw_cell[5]),
-                        "wavelengthMin": float(wl[0]),
-                        "wavelengthMax": float(wl[1]),
-                        "refinement": str(params.get("objective", "band")),
-                        "dMin": float(params.get("d_min", 2.8)),
-                    }
-                else:
+                if not self._has_tool_on_galaxy("imaginex_subhkl_solve"):
                     raise RuntimeError(
-                        f"'imaginex_subhkl_solve' is not yet deployed on {self.galaxy_url} "
+                        f"subhkl 0.2.0 GPU tools not yet deployed on {self.galaxy_url} "
                         f"(awaiting MR merge on ndip/galaxy-tools)"
                     )
+
+            if stage_id == "solve":
+                primary_tool = "imaginex_subhkl_solve"
+                scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
+                tool_inputs = {
+                    "scan": {"src": "hda", "id": scan_id},
+                    "instrument": inst,
+                    "spaceGroup": sg,
+                    "a": float(raw_cell[0]),
+                    "b": float(raw_cell[1]),
+                    "c": float(raw_cell[2]),
+                    "alpha": float(raw_cell[3]),
+                    "beta": float(raw_cell[4]),
+                    "gamma": float(raw_cell[5]),
+                    "wavelengthMin": float(wl[0]),
+                    "wavelengthMax": float(wl[1]),
+                    "refinement": str(params.get("objective", "band")),
+                    "dMin": float(params.get("d_min", 2.8)),
+                }
             elif stage_id == "integrate":
                 primary_tool = "imaginex_subhkl_predict"
                 scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
@@ -439,12 +470,13 @@ class NovaGalaxyPipelineRunner:
             )
             self._poll_galaxy_job(job_record, on_complete_h5)
         except Exception as exc:
-            job_record["stdout"] += f"[nova -> galaxy] {exc}; running GPU container on IMAGINEX-1...\n"
+            clean_msg = self._clean_err_msg(exc)
+            job_record["stdout"] += f"[nova -> galaxy] {clean_msg}; running GPU container on IMAGINEX-1...\n"
             self._submit_local_subhkl_stage(
                 stage_id,
                 params,
                 on_complete_h5,
-                fallback_reason=str(exc),
+                fallback_reason=clean_msg,
                 existing_job_record=job_record,
             )
 
@@ -457,6 +489,7 @@ class NovaGalaxyPipelineRunner:
         existing_job_record: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run subhkl stage inside the GPU Docker/Podman container on IMAGINEX-1 and stream live stdout/stderr."""
+        import shlex
         import shutil
         import socket
         import subprocess
@@ -483,10 +516,20 @@ class NovaGalaxyPipelineRunner:
         merged_path = os.path.abspath(
             params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
         )
-        solve_path = os.path.abspath(
-            params.get("peaks_file") or "/home/xvg/subhkl-examples/betalac-7/solve.h5"
-        )
-        out_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_{stage_id}_{int(time.time())}.h5")
+        work_dir = os.path.dirname(merged_path)
+        solve_dest = os.path.join(work_dir, "solve.h5")
+        pred_dest = os.path.join(work_dir, "predictor.h5")
+        integrated_dest = os.path.join(work_dir, "integrated.h5")
+        mtz_dest = os.path.join(work_dir, "reflections.mtz")
+
+        solve_path = os.path.abspath(params.get("peaks_file") or solve_dest)
+        if os.path.basename(solve_path) in ("merged.h5", "integrated.h5", "predictor.h5") and os.path.isfile(solve_dest):
+            solve_path = solve_dest
+
+        ts = int(time.time())
+        out_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_{stage_id}_{ts}.h5")
+        pred_tmp_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_pred_{ts}.h5")
+        mtz_tmp_path = os.path.join(tempfile.gettempdir(), f"subhkl_refl_{ts}.mtz")
 
         if stage_id == "reduce" and os.path.isfile(merged_path):
             inner_cmd = [
@@ -523,7 +566,8 @@ class NovaGalaxyPipelineRunner:
                 str(params.get("objective", "band")),
             ]
         elif stage_id == "integrate" and os.path.isfile(merged_path) and os.path.isfile(solve_path):
-            inner_cmd = [
+            d_min_val = str(params.get("d_min", 2.8))
+            pred_cmd = [
                 "python",
                 "-u",
                 "-m",
@@ -532,15 +576,63 @@ class NovaGalaxyPipelineRunner:
                 merged_path,
                 str(inst),
                 solve_path,
-                out_h5,
+                pred_tmp_h5,
                 "--d-min",
-                str(params.get("d_min", 2.2)),
+                d_min_val,
                 "--wavel-min",
                 str(wl[0]),
                 "--wavel-max",
                 str(wl[1]),
                 "--space-group",
                 str(sg),
+            ]
+            int_cmd = [
+                "python",
+                "-u",
+                "-m",
+                "subhkl.io.parser",
+                "integrator",
+                merged_path,
+                str(inst),
+                pred_tmp_h5,
+                out_h5,
+                "--fit-mosaicity",
+                "--shape-fit-normalized",
+                "--matrix-free",
+                "--show-progress",
+            ]
+            mtz_cmd = [
+                "python",
+                "-u",
+                "-m",
+                "subhkl.io.parser",
+                "mtz-exporter",
+                out_h5,
+                mtz_tmp_path,
+                "--predictions-file",
+                pred_tmp_h5,
+                "--corrections-file",
+                solve_path,
+            ]
+            chained = (
+                f"set -e; "
+                f"{shlex.join(pred_cmd)} && "
+                f"{shlex.join(int_cmd)} && "
+                f"{shlex.join(mtz_cmd)}"
+            )
+            inner_cmd = ["bash", "-c", chained]
+        elif stage_id == "merge" and os.path.isfile(integrated_dest if os.path.isfile(integrated_dest) else solve_path):
+            target_h5 = integrated_dest if os.path.isfile(integrated_dest) else solve_path
+            inner_cmd = [
+                "python",
+                "-u",
+                "-m",
+                "subhkl.io.parser",
+                "metrics",
+                target_h5,
+                "--instrument",
+                str(inst),
+                "--per-run",
             ]
         else:
             inner_cmd = [
@@ -580,7 +672,10 @@ class NovaGalaxyPipelineRunner:
             cmd.append(container_image)
             cmd.extend(inner_cmd)
         else:
-            cmd = [sys.executable] + inner_cmd[1:]
+            if inner_cmd[0] == "bash":
+                cmd = inner_cmd
+            else:
+                cmd = [sys.executable] + inner_cmd[1:]
 
         gpu_env = os.environ.copy()
         gpu_env.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -595,7 +690,7 @@ class NovaGalaxyPipelineRunner:
 
         host_tag = socket.gethostname()
         header_lines = []
-        if fallback_reason:
+        if fallback_reason and existing_job_record is None:
             header_lines.append(f"[ndip] Note: {fallback_reason}")
         header_lines.append(
             f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
@@ -610,7 +705,7 @@ class NovaGalaxyPipelineRunner:
             job_record["mode"] = "container_gpu"
             job_record["state"] = "running"
             job_record["command_line"] = cmd_str
-            job_record["stdout"] = (job_record.get("stdout", "") + "\n" + "\n".join(header_lines))[-24000:]
+            job_record["stdout"] = (job_record.get("stdout", "") + "\n".join(header_lines))[-24000:]
         else:
             job_record = {
                 "job_id": job_id,
@@ -651,11 +746,69 @@ class NovaGalaxyPipelineRunner:
                             job_record["ladder_rung_idx"] = max(job_record["ladder_rung_idx"], 3)
                 rc = proc.wait()
                 if rc == 0:
-                    job_record["state"] = "ok"
                     job_record["ladder_rung_idx"] = 4
-                    job_record["stdout"] += f"\n[subhkl] Stage '{stage_id}' completed (exit 0).\n"
-                    if os.path.isfile(out_h5) and callable(on_complete_h5):
-                        on_complete_h5(out_h5)
+                    final_h5 = out_h5
+                    if stage_id == "solve" and os.path.isfile(out_h5):
+                        try:
+                            shutil.copy2(out_h5, solve_dest)
+                            for suffix in (".stages.h5", ".blind.h5"):
+                                src_sub = out_h5[:-3] + suffix
+                                dst_sub = solve_dest[:-3] + suffix
+                                if os.path.isfile(src_sub):
+                                    shutil.copy2(src_sub, dst_sub)
+                            final_h5 = solve_dest
+                            job_record["stdout"] += f"\n[subhkl] Saved solve.h5 -> {solve_dest}\n"
+                        except Exception as copy_exc:
+                            job_record["stdout"] += f"\n[subhkl] Warning saving {solve_dest}: {copy_exc}\n"
+
+                        if self.is_connected and os.path.isfile(final_h5):
+                            try:
+                                store = self.get_datastore("IMAGINE-X SubHKL")
+                                self._ensure_galaxy_h5_dataset(
+                                    store, final_h5, job_record, force_upload=True, file_ext="h5"
+                                )
+                            except Exception as up_exc:
+                                job_record["stdout"] += (
+                                    f"[nova -> galaxy] Warning uploading solve.h5: {self._clean_err_msg(up_exc)}\n"
+                                )
+                    elif stage_id == "integrate" and os.path.isfile(out_h5):
+                        try:
+                            if os.path.isfile(pred_tmp_h5):
+                                shutil.copy2(pred_tmp_h5, pred_dest)
+                                job_record["stdout"] += f"\n[subhkl] Saved predictor.h5 -> {pred_dest}\n"
+                            shutil.copy2(out_h5, integrated_dest)
+                            final_h5 = integrated_dest
+                            job_record["stdout"] += f"[subhkl] Saved integrated.h5 -> {integrated_dest}\n"
+                            if os.path.isfile(mtz_tmp_path):
+                                shutil.copy2(mtz_tmp_path, mtz_dest)
+                                job_record["stdout"] += f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
+                        except Exception as copy_exc:
+                            job_record["stdout"] += f"\n[subhkl] Warning saving integrated outputs: {copy_exc}\n"
+
+                        if self.is_connected:
+                            try:
+                                store = self.get_datastore("IMAGINE-X SubHKL")
+                                if os.path.isfile(pred_dest):
+                                    self._ensure_galaxy_h5_dataset(
+                                        store, pred_dest, job_record, force_upload=True, file_ext="h5"
+                                    )
+                                if os.path.isfile(final_h5):
+                                    self._ensure_galaxy_h5_dataset(
+                                        store, final_h5, job_record, force_upload=True, file_ext="h5"
+                                    )
+                                if os.path.isfile(mtz_dest):
+                                    self._ensure_galaxy_h5_dataset(
+                                        store, mtz_dest, job_record, force_upload=True, file_ext="mtz"
+                                    )
+                            except Exception as up_exc:
+                                job_record["stdout"] += (
+                                    f"[nova -> galaxy] Warning uploading integrated outputs: {self._clean_err_msg(up_exc)}\n"
+                                )
+
+                    job_record["state"] = "ok"
+                    job_record["stdout"] += f"[subhkl] Stage '{stage_id}' completed (exit 0).\n"
+                    if os.path.isfile(final_h5) and callable(on_complete_h5):
+                        on_complete_h5(final_h5)
                         job_record["updated_payload_ready"] = True
                 else:
                     job_record["state"] = "error"
@@ -1003,6 +1156,11 @@ def serve_rainbow_zones(
                 req_path = req_path[len(ep_path) :] or "/"
 
             if req_path in ("/api/payload", "/payload.json"):
+                if "frame" in qs and qs["frame"]:
+                    try:
+                        vm.reload(frame_index=int(qs["frame"][0]))
+                    except Exception:
+                        pass
                 body = json.dumps(vm.payload).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")

@@ -205,11 +205,14 @@ class SubhklGalaxyModel:
             images_file=resolved_images,
         )
         self.payload: dict[str, Any] | None = None
+        self.frame_index: int | None = None
         self.last_job_result: dict[str, Any] = {}
         self.refresh_payload()
 
-    def refresh_payload(self) -> dict[str, Any] | None:
+    def refresh_payload(self, frame_index: int | None = None) -> dict[str, Any] | None:
         """Rebuild the Diffraction Parallax & Lattice Ladder payload from current HDF5 files."""
+        if frame_index is not None:
+            self.frame_index = int(frame_index)
         if not self.data.peaks_file or not os.path.isfile(self.data.peaks_file):
             return self.payload
 
@@ -223,6 +226,7 @@ class SubhklGalaxyModel:
             instrument=self.data.instrument.value,
             max_zone_index=self.data.max_zone_index,
             images_h5=img_path,
+            frame_index=self.frame_index,
         )
         # Synchronize unit cell parameters from HDF5 if available
         cell = self.payload.get("cell") or []
