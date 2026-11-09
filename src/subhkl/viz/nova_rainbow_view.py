@@ -219,6 +219,43 @@ class NovaGalaxyPipelineRunner:
         except Exception:
             return []
 
+    def resolve_dataset_to_local_h5(
+        self, ds_id: str, fallback_dir: str | None = None
+    ) -> tuple[str, dict[str, Any]]:
+        """Resolve a Galaxy dataset ID to a local HDF5 path (via local file_name, sibling dir, or /display download)."""
+        info = self._api_request("GET", f"/api/datasets/{ds_id}")
+        if not isinstance(info, dict):
+            raise RuntimeError(f"Dataset {ds_id} not found on {self.galaxy_url}")
+        name = str(info.get("name") or f"{ds_id}.h5")
+        file_name = str(info.get("file_name") or "")
+        if file_name and os.path.isfile(file_name) and os.path.getsize(file_name) > 0:
+            return file_name, info
+        if fallback_dir and os.path.isdir(fallback_dir):
+            cand = os.path.join(fallback_dir, os.path.basename(name))
+            if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                return cand, info
+        safe_name = "".join(
+            ch if (ch.isalnum() or ch in "._-") else "_"
+            for ch in os.path.basename(name)
+        )
+        if not safe_name.endswith((".h5", ".hdf5")):
+            safe_name += ".h5"
+        tmp_dest = os.path.join(
+            tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}"
+        )
+        if os.path.isfile(tmp_dest) and os.path.getsize(tmp_dest) > 0:
+            return tmp_dest, info
+        url = f"{self.galaxy_url}/api/datasets/{ds_id}/display"
+        headers: dict[str, str] = {}
+        if self.galaxy_api_key:
+            headers["x-api-key"] = self.galaxy_api_key
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=60.0) as resp:
+            data = resp.read()
+        with open(tmp_dest, "wb") as fh:
+            fh.write(data)
+        return tmp_dest, info
+
     def connect(self) -> Any:
         if self._conn_helper is not None:
             return self._conn_helper
@@ -615,6 +652,7 @@ class NovaGalaxyPipelineRunner:
                 str(inst),
                 pred_tmp_h5,
                 out_h5,
+                "--anisotropic",
                 "--fit-mosaicity",
                 "--shape-fit-normalized",
                 "--matrix-free",
@@ -1187,6 +1225,28 @@ def serve_rainbow_zones(
                 req_path = req_path[len(ep_path) :] or "/"
 
             if req_path in ("/api/payload", "/payload.json"):
+                if "dataset_id" in qs and qs["dataset_id"]:
+                    try:
+                        ds_id = str(qs["dataset_id"][0]).strip()
+                        fb_dir = (
+                            os.path.dirname(os.path.abspath(vm.replay_h5))
+                            if vm.replay_h5
+                            else None
+                        )
+                        local_h5, ds_info = (
+                            vm.pipeline_runner.resolve_dataset_to_local_h5(
+                                ds_id, fallback_dir=fb_dir
+                            )
+                        )
+                        ds_name = str(ds_info.get("name") or os.path.basename(local_h5)).lower()
+                        if any(k in ds_name for k in ("merged", "scan", "image")):
+                            vm.payload_kwargs["images_file"] = local_h5
+                            vm.reload(images_h5=local_h5)
+                        else:
+                            vm.replay_h5 = local_h5
+                            vm.reload()
+                    except Exception:
+                        pass
                 if "frame" in qs and qs["frame"]:
                     try:
                         vm.reload(frame_index=int(qs["frame"][0]))
@@ -1198,6 +1258,33 @@ def serve_rainbow_zones(
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+
+            if req_path.startswith("/api/datasets/") and req_path.endswith("/display"):
+                ds_id = req_path.split("/")[3]
+                try:
+                    fb_dir = (
+                        os.path.dirname(os.path.abspath(vm.replay_h5))
+                        if vm.replay_h5
+                        else None
+                    )
+                    local_h5, _ = vm.pipeline_runner.resolve_dataset_to_local_h5(
+                        ds_id, fallback_dir=fb_dir
+                    )
+                    with open(local_h5, "rb") as fh:
+                        h5_bytes = fh.read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/x-hdf5")
+                    self.send_header("Content-Length", str(len(h5_bytes)))
+                    self.end_headers()
+                    self.wfile.write(h5_bytes)
+                except Exception as exc:
+                    err_body = str(exc).encode("utf-8")
+                    self.send_response(404)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
                 return
 
             if req_path == "/api/pipeline/status":

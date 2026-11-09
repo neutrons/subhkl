@@ -381,7 +381,13 @@ def _extract_from_h5(
         else _discover_images_h5(h5_path)
     )
     sib_solve = Path(h5_path).parent / "solve.h5"
-    sib_solve_path = str(sib_solve) if sib_solve.is_file() and sib_solve != Path(h5_path) else None
+    if (not sib_solve.is_file() or sib_solve == Path(h5_path)) and src_h5:
+        sib_solve = Path(src_h5).parent / "solve.h5"
+    sib_solve_path = (
+        str(sib_solve)
+        if sib_solve.is_file() and sib_solve.resolve() != Path(h5_path).resolve()
+        else None
+    )
 
     with h5py.File(h5_path, "r") as f:
         instrument = _decode_str(f.attrs.get("instrument"), "IMAGINE")
@@ -758,11 +764,41 @@ def _extract_from_h5(
             if "peaks/sigma" in f
             else None
         )
+        var_u = (
+            np.asarray(f["peaks/var_u"][()], dtype=float)
+            if "peaks/var_u" in f
+            else None
+        )
+        var_v = (
+            np.asarray(f["peaks/var_v"][()], dtype=float)
+            if "peaks/var_v" in f
+            else None
+        )
+        cov_uv = (
+            np.asarray(f["peaks/cov_uv"][()], dtype=float)
+            if "peaks/cov_uv" in f
+            else None
+        )
         run_index = (
             np.asarray(f["peaks/run_index"][()], dtype=int)
             if "peaks/run_index" in f
             else None
         )
+
+        artifact_kind = "solve"
+        peak_shape_mode = "solved_circle"
+        if var_u is not None and var_v is not None:
+            artifact_kind = "integrator"
+            is_iso = bool(
+                np.allclose(var_u, var_v)
+                and (cov_uv is None or np.allclose(cov_uv, 0.0))
+            )
+            peak_shape_mode = (
+                "isotropic_circle" if is_iso else "anisotropic_ellipse"
+            )
+        elif "peaks/pixel_r" in f:
+            artifact_kind = "finder"
+            peak_shape_mode = "isotropic_circle"
 
         # If multi-frame dataset has per-run peaks (e.g. integrated.h5), filter to active_frame
         if (
@@ -788,6 +824,12 @@ def _extract_from_h5(
                     intensity = intensity[mask_run]
                 if sigma is not None and len(sigma) == len(mask_run):
                     sigma = sigma[mask_run]
+                if var_u is not None and len(var_u) == len(mask_run):
+                    var_u = var_u[mask_run]
+                if var_v is not None and len(var_v) == len(mask_run):
+                    var_v = var_v[mask_run]
+                if cov_uv is not None and len(cov_uv) == len(mask_run):
+                    cov_uv = cov_uv[mask_run]
                 run_index = run_index[mask_run]
 
         # Filter out zero/noise predictions in integrated.h5 (keep significant reflections I/sigma >= 2.5)
@@ -815,8 +857,140 @@ def _extract_from_h5(
                     lam = lam[snr_mask]
                 intensity = intensity[snr_mask]
                 sigma = sigma[snr_mask]
+                if var_u is not None and len(var_u) == len(snr_mask):
+                    var_u = var_u[snr_mask]
+                if var_v is not None and len(var_v) == len(snr_mask):
+                    var_v = var_v[snr_mask]
+                if cov_uv is not None and len(cov_uv) == len(snr_mask):
+                    cov_uv = cov_uv[snr_mask]
                 if run_index is not None and len(run_index) == len(snr_mask):
                     run_index = run_index[snr_mask]
+
+        # Recognize predictor.h5 format: banks/<img_idx>/(i, j, h, k, l, wavelength)
+        if (peaks_xyz is None or len(peaks_xyz) == 0) and "banks" in f:
+            try:
+                artifact_kind = "predictor"
+                peak_shape_mode = "predicted_circle"
+                b_ids_pred = (
+                    np.asarray(f["bank_ids"][()], dtype=int)
+                    if "bank_ids" in f
+                    else None
+                )
+                n_bank_entries = (
+                    len(b_ids_pred)
+                    if b_ids_pred is not None
+                    else len(f["banks"])
+                )
+                f0_p, f1_p = (
+                    frame_slice
+                    if frame_slice is not None
+                    else (0, n_bank_entries)
+                )
+
+                bank_imgs_pred: dict[int, np.ndarray] = {}
+                if src_h5 and os.path.exists(src_h5):
+                    try:
+                        with h5py.File(src_h5, "r") as mf:
+                            if "images" in mf and "bank_ids" in mf:
+                                b_ids_s = np.asarray(
+                                    mf["bank_ids"][f0_p:f1_p], dtype=int
+                                )
+                                ims_s = np.asarray(
+                                    mf["images"][f0_p:f1_p], dtype=np.float32
+                                )
+                                for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                    bank_imgs_pred[int(b_id_s)] = im_s
+                    except Exception:
+                        pass
+
+                xyz_p, hkl_p, lam_p, bank_p, pr_p, pc_p, inten_p = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                banks_grp = f["banks"]
+                for img_idx in range(f0_p, f1_p):
+                    key_s = str(img_idx)
+                    if key_s not in banks_grp:
+                        continue
+                    grp = banks_grp[key_s]
+                    if "i" not in grp or "j" not in grp:
+                        continue
+                    pr_i = np.asarray(grp["i"][()], dtype=float).ravel()
+                    pc_i = np.asarray(grp["j"][()], dtype=float).ravel()
+                    if len(pr_i) == 0:
+                        continue
+                    bid = (
+                        int(b_ids_pred[img_idx])
+                        if b_ids_pred is not None and img_idx < len(b_ids_pred)
+                        else int(img_idx)
+                    )
+                    det = detectors.get(bid)
+                    h_i = np.asarray(grp["h"][()], dtype=int).ravel()
+                    k_i = np.asarray(grp["k"][()], dtype=int).ravel()
+                    l_i = np.asarray(grp["l"][()], dtype=int).ravel()
+                    wl_i = np.asarray(grp["wavelength"][()], dtype=float).ravel()
+
+                    im_b = bank_imgs_pred.get(bid)
+                    if im_b is not None:
+                        r_idx = np.clip(
+                            np.round(pr_i).astype(int), 2, im_b.shape[0] - 3
+                        )
+                        c_idx = np.clip(
+                            np.round(pc_i).astype(int), 2, im_b.shape[1] - 3
+                        )
+                        pk_val = np.maximum.reduce(
+                            [
+                                im_b[r_idx + dr, c_idx + dc]
+                                for dr in (-1, 0, 1)
+                                for dc in (-1, 0, 1)
+                            ]
+                        )
+                        bg_val = float(np.median(im_b))
+                        snr_val = (pk_val - bg_val) / np.sqrt(max(bg_val, 1.0))
+                        keep_p = snr_val >= 2.5
+                        if not np.any(keep_p):
+                            continue
+                        pr_i = pr_i[keep_p]
+                        pc_i = pc_i[keep_p]
+                        h_i, k_i, l_i = h_i[keep_p], k_i[keep_p], l_i[keep_p]
+                        wl_i = wl_i[keep_p]
+                        pk_val = pk_val[keep_p]
+                    else:
+                        pk_val = np.full(len(pr_i), 150.0, dtype=float)
+
+                    if det is not None:
+                        xyz_i = det.pixel_to_lab(pr_i, pc_i)
+                    else:
+                        az = (int(bid) * 37.0 % 360.0 - 180.0) + (
+                            pc_i - 128.0
+                        ) * 0.12
+                        rad = np.deg2rad(az)
+                        y_c = (pr_i - 128.0) * 0.002
+                        xyz_i = np.column_stack([np.sin(rad), y_c, np.cos(rad)])
+                    xyz_p.append(xyz_i)
+                    hkl_p.append(np.column_stack([h_i, k_i, l_i]))
+                    lam_p.append(wl_i)
+                    bank_p.append(np.full(len(pr_i), bid, dtype=int))
+                    pr_p.append(pr_i)
+                    pc_p.append(pc_i)
+                    inten_p.append(pk_val)
+
+                if xyz_p:
+                    peaks_xyz = np.concatenate(xyz_p, axis=0)
+                    hkl = np.concatenate(hkl_p, axis=0)
+                    lam = np.concatenate(lam_p, axis=0)
+                    bank = np.concatenate(bank_p, axis=0)
+                    pixel_r = np.concatenate(pr_p, axis=0)
+                    pixel_c = np.concatenate(pc_p, axis=0)
+                    intensity = np.concatenate(inten_p, axis=0)
+                    sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
+            except Exception:
+                pass
 
         R_gonio = None
         if R_all is not None:
@@ -1029,6 +1203,11 @@ def _extract_from_h5(
             "pixel_c": pixel_c,
             "intensity": intensity,
             "sigma": sigma,
+            "var_u": var_u,
+            "var_v": var_v,
+            "cov_uv": cov_uv,
+            "artifact_kind": artifact_kind,
+            "peak_shape_mode": peak_shape_mode,
             "run_index": run_index,
             "hkl": hkl,
             "wavelength": lam,
@@ -1386,6 +1565,11 @@ def build_rainbow_zone_payload(
     pixel_c_arr = None
     intensity_arr = None
     sigma_arr = None
+    var_u_arr = None
+    var_v_arr = None
+    cov_uv_arr = None
+    artifact_kind = "solve"
+    peak_shape_mode = "solved_circle"
     hkl_arr = None
     lam_arr = None
     solve_diagnostics = None
@@ -1414,6 +1598,11 @@ def build_rainbow_zone_payload(
         pixel_c_arr = extracted["pixel_c"]
         intensity_arr = extracted["intensity"]
         sigma_arr = extracted["sigma"]
+        var_u_arr = extracted.get("var_u")
+        var_v_arr = extracted.get("var_v")
+        cov_uv_arr = extracted.get("cov_uv")
+        artifact_kind = extracted.get("artifact_kind") or artifact_kind
+        peak_shape_mode = extracted.get("peak_shape_mode") or peak_shape_mode
         hkl_arr = extracted["hkl"]
         lam_arr = extracted["wavelength"]
         solve_diagnostics = extracted.get("solve_diagnostics")
@@ -1460,6 +1649,12 @@ def build_rainbow_zone_payload(
             intensity_arr = intensity_arr[order]
         if sigma_arr is not None and len(sigma_arr) == n_raw:
             sigma_arr = sigma_arr[order]
+        if var_u_arr is not None and len(var_u_arr) == n_raw:
+            var_u_arr = var_u_arr[order]
+        if var_v_arr is not None and len(var_v_arr) == n_raw:
+            var_v_arr = var_v_arr[order]
+        if cov_uv_arr is not None and len(cov_uv_arr) == n_raw:
+            cov_uv_arr = cov_uv_arr[order]
         if hkl_arr is not None and len(hkl_arr) == n_raw:
             hkl_arr = hkl_arr[order]
         if lam_arr is not None and len(lam_arr) == n_raw:
@@ -1613,6 +1808,85 @@ def build_rainbow_zone_payload(
             if 0 <= pid < n_peaks:
                 peak_zones[pid].append(zid)
 
+    # Precompute 2-sigma detector-projected peak contours (ellipses or isotropic circles)
+    # when covariance parameters (var_u, var_v, cov_uv) are present from integrator/finder
+    ellipse_cyl_by_idx: dict[int, list[list[float]]] = {}
+    ellipse_sph_by_idx: dict[int, list[list[float]]] = {}
+    sigma_major_by_idx: dict[int, float] = {}
+    sigma_minor_by_idx: dict[int, float] = {}
+    ellipse_ang_by_idx: dict[int, float] = {}
+    if (
+        n_peaks > 0
+        and var_u_arr is not None
+        and var_v_arr is not None
+        and len(var_u_arr) == n_peaks
+        and len(var_v_arr) == n_peaks
+        and pixel_r_arr is not None
+        and pixel_c_arr is not None
+        and bank_arr is not None
+        and detectors
+    ):
+        cuv_use = (
+            np.asarray(cov_uv_arr, dtype=float)
+            if cov_uv_arr is not None and len(cov_uv_arr) == n_peaks
+            else np.zeros(n_peaks, dtype=float)
+        )
+        vu_use = np.asarray(var_u_arr, dtype=float)
+        vv_use = np.asarray(var_v_arr, dtype=float)
+        diff_uv = vu_use - vv_use
+        sq_uv = np.sqrt(diff_uv**2 + 4.0 * cuv_use**2)
+        s1_all = np.sqrt(np.maximum((vu_use + vv_use + sq_uv) / 2.0, 1e-6))
+        s2_all = np.sqrt(np.maximum((vu_use + vv_use - sq_uv) / 2.0, 1e-6))
+        phi_all = 0.5 * np.arctan2(2.0 * cuv_use, diff_uv)
+
+        n_ell_pts = 16
+        theta_ell = np.linspace(0.0, 2.0 * np.pi, n_ell_pts, endpoint=False)
+        cos_t = np.cos(theta_ell)[None, :]
+        sin_t = np.sin(theta_ell)[None, :]
+        n_sigma_contour = 2.0
+
+        for bk in np.unique(bank_arr):
+            det = detectors.get(int(bk))
+            if det is None:
+                continue
+            idxs = np.flatnonzero(bank_arr == bk)
+            if len(idxs) == 0:
+                continue
+            a_bk = (n_sigma_contour * s1_all[idxs])[:, None]
+            b_bk = (n_sigma_contour * s2_all[idxs])[:, None]
+            phi_bk = phi_all[idxs][:, None]
+            c_phi = np.cos(phi_bk)
+            s_phi = np.sin(phi_bk)
+            r0 = pixel_r_arr[idxs][:, None]
+            c0 = pixel_c_arr[idxs][:, None]
+            cols_ell = c0 + a_bk * cos_t * c_phi - b_bk * sin_t * s_phi
+            rows_ell = r0 + a_bk * cos_t * s_phi + b_bk * sin_t * c_phi
+            try:
+                xyz_ell = det.pixel_to_lab(rows_ell.ravel(), cols_ell.ravel())
+                az_ell, y_ell = _unrolled(xyz_ell)
+                _, el_ell = _spherical_angles(xyz_ell)
+                az_mat = az_ell.reshape(len(idxs), n_ell_pts)
+                y_mat = y_ell.reshape(len(idxs), n_ell_pts)
+                el_mat = el_ell.reshape(len(idxs), n_ell_pts)
+                for k_local, p_idx in enumerate(idxs):
+                    p_i = int(p_idx)
+                    az_row = az_mat[k_local]
+                    if float(np.ptp(az_row)) > 90.0:
+                        continue
+                    ellipse_cyl_by_idx[p_i] = [
+                        [round(float(az_row[m]), 3), round(float(y_mat[k_local, m]), 4)]
+                        for m in range(n_ell_pts)
+                    ]
+                    ellipse_sph_by_idx[p_i] = [
+                        [round(float(az_row[m]), 3), round(float(el_mat[k_local, m]), 3)]
+                        for m in range(n_ell_pts)
+                    ]
+                    sigma_major_by_idx[p_i] = round(float(s1_all[p_i]), 2)
+                    sigma_minor_by_idx[p_i] = round(float(s2_all[p_i]), 2)
+                    ellipse_ang_by_idx[p_i] = round(float(np.rad2deg(phi_all[p_i])), 1)
+            except Exception:
+                pass
+
     peaks_list: list[dict[str, Any]] = []
     for i in range(n_peaks):
         h_i, k_i, l_i = (
@@ -1641,55 +1915,65 @@ def build_rainbow_zone_payload(
             np.clip(1.0 / (1.0 + 0.35 * max(d_val, 0.2)), 0.05, 0.98)
         )
 
-        peaks_list.append(
-            {
-                "id": i,
-                "bank": (
-                    int(bank_arr[i])
-                    if bank_arr is not None and i < len(bank_arr)
-                    else 1
-                ),
-                "row": (
-                    round(float(pixel_r_arr[i]), 2)
-                    if pixel_r_arr is not None and i < len(pixel_r_arr)
-                    else 0.0
-                ),
-                "col": (
-                    round(float(pixel_c_arr[i]), 2)
-                    if pixel_c_arr is not None and i < len(pixel_c_arr)
-                    else 0.0
-                ),
-                "det_x": round(float(det_x[i]), 3),
-                "det_y": round(float(det_y[i]), 4),
-                "det_el": round(float(det_el[i]), 3),
-                "q_hat": [round(float(x), 5) for x in g_crystal[i]],
-                "stereographic": [
-                    round(float(sx[i]), 5),
-                    round(float(sy[i]), 5),
-                ],
-                "hemisphere": int(hemi[i]),
-                "intensity": (
-                    round(float(intensity_arr[i]), 2)
-                    if intensity_arr is not None and i < len(intensity_arr)
-                    else 100.0
-                ),
-                "sigma": (
-                    round(float(sigma_arr[i]), 2)
-                    if sigma_arr is not None and i < len(sigma_arr)
-                    else 3.0
-                ),
-                "wavelength": round(
-                    float(np.clip(lam_val, wl_min * 0.5, wl_max * 1.5)), 4
-                ),
-                "d_spacing": round(d_val, 4),
-                "harmonic_order": max(1, g_gcd),
-                "parallax_depth": round(parallax_depth, 4),
-                "hkl": [h_i, k_i, l_i],
-                "zone_ids": peak_zones[i],
-                "indexed": is_indexed,
-                "angular_error_deg": round(err_val, 4),
-            }
-        )
+        pk_entry: dict[str, Any] = {
+            "id": i,
+            "bank": (
+                int(bank_arr[i])
+                if bank_arr is not None and i < len(bank_arr)
+                else 1
+            ),
+            "row": (
+                round(float(pixel_r_arr[i]), 2)
+                if pixel_r_arr is not None and i < len(pixel_r_arr)
+                else 0.0
+            ),
+            "col": (
+                round(float(pixel_c_arr[i]), 2)
+                if pixel_c_arr is not None and i < len(pixel_c_arr)
+                else 0.0
+            ),
+            "det_x": round(float(det_x[i]), 3),
+            "det_y": round(float(det_y[i]), 4),
+            "det_el": round(float(det_el[i]), 3),
+            "q_hat": [round(float(x), 5) for x in g_crystal[i]],
+            "stereographic": [
+                round(float(sx[i]), 5),
+                round(float(sy[i]), 5),
+            ],
+            "hemisphere": int(hemi[i]),
+            "intensity": (
+                round(float(intensity_arr[i]), 2)
+                if intensity_arr is not None and i < len(intensity_arr)
+                else 100.0
+            ),
+            "sigma": (
+                round(float(sigma_arr[i]), 2)
+                if sigma_arr is not None and i < len(sigma_arr)
+                else 3.0
+            ),
+            "wavelength": round(
+                float(np.clip(lam_val, wl_min * 0.5, wl_max * 1.5)), 4
+            ),
+            "d_spacing": round(d_val, 4),
+            "harmonic_order": max(1, g_gcd),
+            "parallax_depth": round(parallax_depth, 4),
+            "hkl": [h_i, k_i, l_i],
+            "zone_ids": peak_zones[i],
+            "indexed": is_indexed,
+            "angular_error_deg": round(err_val, 4),
+        }
+        if i in ellipse_cyl_by_idx:
+            s_maj = sigma_major_by_idx[i]
+            s_min = sigma_minor_by_idx[i]
+            pk_entry["ellipse"] = ellipse_cyl_by_idx[i]
+            pk_entry["ellipse_sph"] = ellipse_sph_by_idx[i]
+            pk_entry["sigma_major_px"] = s_maj
+            pk_entry["sigma_minor_px"] = s_min
+            pk_entry["ellipse_angle_deg"] = ellipse_ang_by_idx[i]
+            pk_entry["shape_kind"] = (
+                "ellipse" if abs(s_maj - s_min) > 0.05 else "isotropic_circle"
+            )
+        peaks_list.append(pk_entry)
 
     zones_payload: list[dict[str, Any]] = []
     for zi, z in enumerate(raw_zones):
@@ -1874,6 +2158,8 @@ def build_rainbow_zone_payload(
         "default_projection": resolved_proj,
         "space_group": str(space_group),
         "intensity_source": intensity_source,
+        "artifact_kind": artifact_kind,
+        "peak_shape_mode": peak_shape_mode,
         "wavelength_range": [round(wl_min, 3), round(wl_max, 3)],
         "d_min": round(d_min_use, 3),
         "frame_index": int(active_frame),
@@ -2971,9 +3257,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       .map(z => z.label)
       .join(", ") || "None";
     const elVal = typeof p.det_el === "number" ? p.det_el : 0.0;
+    const snrStr = p.sigma && p.sigma > 0 ? ` (I/σ=${{(p.intensity / p.sigma).toFixed(1)}})` : "";
+    let shapeStr = "";
+    if (typeof p.sigma_major_px === "number" && typeof p.sigma_minor_px === "number") {{
+      if (p.shape_kind === "ellipse") {{
+        shapeStr = ` • 2σ=<strong style="color:#38bdf8;">${{(2 * p.sigma_major_px).toFixed(1)}}×${{(2 * p.sigma_minor_px).toFixed(1)}}px ∠${{(p.ellipse_angle_deg || 0).toFixed(0)}}°</strong>`;
+      }} else {{
+        shapeStr = ` • 2σ=<strong style="color:#38bdf8;">${{(2 * p.sigma_major_px).toFixed(1)}}px (iso)</strong>`;
+      }}
+    }}
     setStatusLine(
       `[BANK #${{p.bank}} • #${{p.id}}]`,
-      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong> (n=${{p.harmonic_order}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong> • φ=${{p.det_x.toFixed(1)}}°, Y=${{p.det_y.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{p.angular_error_deg.toFixed(3)}}°)`
+      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong> (n=${{p.harmonic_order}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}${{shapeStr}} • φ=${{p.det_x.toFixed(1)}}°, Y=${{p.det_y.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{p.angular_error_deg.toFixed(3)}}°)`
     );
   }}
 
@@ -3358,14 +3653,59 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.stroke();
       }}
 
-      // Open ring around the spot (uniform radius scaled by zoom factor)
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.strokeStyle = isHovered
+      // Integrated peak 2-sigma contour (anisotropic 3D tensor ellipse or isotropic circle)
+      // or predicted/solved Bragg ring (scaled by zoom factor)
+      const ellPtsRaw = isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse;
+      const strokeCol = isHovered
         ? "#f43f85"
-        : wavelengthToColor(p.wavelength, captured ? 0.95 : 0.38);
+        : wavelengthToColor(p.wavelength, captured ? 0.95 : 0.42);
+      ctx.strokeStyle = strokeCol;
       ctx.lineWidth = isHovered ? 2.4 : (captured ? 1.85 : 1.05);
-      ctx.stroke();
+
+      if (Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6) {{
+        const scrPts = ellPtsRaw.map(pt => detToScreen(pt[0], pt[1], w, h, fgLayer));
+        let maxDist = 0.0, minDist = 1e9;
+        for (let m = 0; m < scrPts.length; m++) {{
+          const d = Math.hypot(scrPts[m][0] - x, scrPts[m][1] - y);
+          if (d > maxDist) maxDist = d;
+          if (d < minDist) minDist = d;
+        }}
+        // Keep physical 2-sigma contour scaling with zoom, with a legible floor at 1x zoom
+        // that preserves the fitted major/minor aspect ratio and orientation angle
+        const minTarget = isHovered ? baseR + 1.5 : baseR * 0.9;
+        const scale = minDist > 1e-3 && minDist < minTarget ? (minTarget / minDist) : 1.0;
+        ctx.beginPath();
+        for (let m = 0; m < scrPts.length; m++) {{
+          const sx = x + (scrPts[m][0] - x) * scale;
+          const sy = y + (scrPts[m][1] - y) * scale;
+          if (m === 0) ctx.moveTo(sx, sy);
+          else ctx.lineTo(sx, sy);
+        }}
+        ctx.closePath();
+        ctx.stroke();
+
+        // When hovered or zoomed in on an anisotropic ellipse, draw subtle principal-axis ticks
+        if (p.shape_kind === "ellipse" && (isHovered || state.detZoom > 2.2) && scrPts.length >= 16) {{
+          const nHalf = Math.floor(scrPts.length / 2);
+          const nQuarter = Math.floor(scrPts.length / 4);
+          const p0 = [x + (scrPts[0][0] - x) * scale, y + (scrPts[0][1] - y) * scale];
+          const pHalf = [x + (scrPts[nHalf][0] - x) * scale, y + (scrPts[nHalf][1] - y) * scale];
+          const pQ1 = [x + (scrPts[nQuarter][0] - x) * scale, y + (scrPts[nQuarter][1] - y) * scale];
+          const pQ3 = [x + (scrPts[nQuarter + nHalf][0] - x) * scale, y + (scrPts[nQuarter + nHalf][1] - y) * scale];
+          ctx.save();
+          ctx.strokeStyle = isHovered ? "rgba(251, 191, 36, 0.75)" : "rgba(56, 189, 248, 0.42)";
+          ctx.lineWidth = 0.85;
+          ctx.beginPath();
+          ctx.moveTo(p0[0], p0[1]); ctx.lineTo(pHalf[0], pHalf[1]);
+          ctx.moveTo(pQ1[0], pQ1[1]); ctx.lineTo(pQ3[0], pQ3[1]);
+          ctx.stroke();
+          ctx.restore();
+        }}
+      }} else {{
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.stroke();
+      }}
 
       if (state.detAlpha < 0.2) {{
         ctx.fillStyle = wavelengthToColor(p.wavelength, 0.85);
@@ -3373,7 +3713,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
 
       if (isHovered) {{
-        const tag = `(${{p.hkl.join(",")}}) λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å`;
+        const shapeTag = (typeof p.sigma_major_px === "number" && typeof p.sigma_minor_px === "number")
+          ? (p.shape_kind === "ellipse"
+              ? ` 2σ=${{(2 * p.sigma_major_px).toFixed(1)}}×${{(2 * p.sigma_minor_px).toFixed(1)}}px`
+              : ` 2σ=${{(2 * p.sigma_major_px).toFixed(1)}}px`)
+          : "";
+        const tag = `(${{p.hkl.join(",")}}) λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{shapeTag}}`;
         ctx.font = "bold 11px monospace";
         const tw = ctx.measureText(tag).width + 10;
         ctx.fillStyle = "rgba(11, 15, 23, 0.92)";
@@ -3727,8 +4072,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
 
     const subEl = document.querySelector(".subtitle-tag");
+    const artKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
+    const shapeMode = newPayload.peak_shape_mode || DATA.peak_shape_mode || "solved_circle";
+    DATA.artifact_kind = artKind;
+    DATA.peak_shape_mode = shapeMode;
+    let artBadge = "SOLVED ORIENTATION";
+    if (artKind === "integrator") {{
+      artBadge = shapeMode === "anisotropic_ellipse"
+        ? "INTEGRATED • 3D TENSOR ELLIPSES"
+        : "INTEGRATED • ISOTROPIC 2σ CIRCLES";
+    }} else if (artKind === "predictor") {{
+      artBadge = "PREDICTOR • PREDICTED PEAKS";
+    }} else if (newPayload.intensity_source === "raw_h5") {{
+      artBadge = "RAW DETECTOR COUNTS";
+    }}
     if (subEl) {{
-      subEl.textContent = `${{DATA.instrument || "CG4D"}} • ${{DATA.space_group || "P 1"}} • ${{newPayload.intensity_source === "raw_h5" ? "RAW DETECTOR COUNTS" : "SOLVED ORIENTATION"}}`;
+      subEl.textContent = `${{DATA.instrument || "CG4D"}} • ${{DATA.space_group || "P 1"}} • ${{artBadge}}`;
     }}
     if (DATA.cell && DATA.cell.length === 6) {{
       const c = DATA.cell;
@@ -3741,6 +4100,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     renderPipeline();
     if (LADDER.length > 0) selectLadderRung(state.currentRungIdx, false);
     else {{ renderZoneList(); updateHUD(); }}
+    if (artKind === "integrator" || artKind === "predictor") {{
+      const nEll = PEAKS.filter(p => Array.isArray(p.ellipse)).length;
+      setStatusLine(
+        `[${{artBadge}}]`,
+        `<strong style="color:var(--accent-gold);">${{artBadge}}</strong> — Loaded <strong>${{PEAKS.length}}</strong> reflections${{nEll > 0 ? ` with <strong>${{nEll}}</strong> detector-projected 2σ ${{shapeMode === "anisotropic_ellipse" ? "anisotropic 3D tensor ellipses" : "isotropic circles"}}` : ""}}.`
+      );
+    }}
   }}
 
   // Pure Client-Side HDF5 Parser + Crystallographic Forward Projector via h5wasm
@@ -3977,15 +4343,150 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     const peaksOut = [];
     const zonesOut = [];
+    let artifactKind = "solve";
+    let peakShapeMode = "solved_circle";
     if (B && detMap.size > 0) {{
       const UB = mat3Mul(U, B);
       const RUB = mat3Mul(Rrun, UB);
       const R_T = mat3T(Rrun);
+      const candPeaks = [];
+
+      // 1. Check if f is an integrator / finder HDF5 with a 'peaks' group
+      if (f.keys().includes("peaks")) {{
+        const pGrp = f.get("peaks");
+        const pKeys = pGrp.keys();
+        if (pKeys.includes("pixel_r") && pKeys.includes("pixel_c") && pKeys.includes("bank")) {{
+          const prArr = Array.from(pGrp.get("pixel_r").value).map(Number);
+          const pcArr = Array.from(pGrp.get("pixel_c").value).map(Number);
+          const bkArr = Array.from(pGrp.get("bank").value).map(Number);
+          const hArr = pKeys.includes("h") ? Array.from(pGrp.get("h").value).map(Number) : null;
+          const kArr = pKeys.includes("k") ? Array.from(pGrp.get("k").value).map(Number) : null;
+          const lArr = pKeys.includes("l") ? Array.from(pGrp.get("l").value).map(Number) : null;
+          const lamArr = pKeys.includes("lambda") ? Array.from(pGrp.get("lambda").value).map(Number) : null;
+          const intArr = pKeys.includes("intensity") ? Array.from(pGrp.get("intensity").value).map(Number) : null;
+          const sigArr = pKeys.includes("sigma") ? Array.from(pGrp.get("sigma").value).map(Number) : null;
+          const vuArr = pKeys.includes("var_u") ? Array.from(pGrp.get("var_u").value).map(Number) : null;
+          const vvArr = pKeys.includes("var_v") ? Array.from(pGrp.get("var_v").value).map(Number) : null;
+          const cuvArr = pKeys.includes("cov_uv") ? Array.from(pGrp.get("cov_uv").value).map(Number) : null;
+          const runArr = pKeys.includes("run_index") ? Array.from(pGrp.get("run_index").value).map(Number) : null;
+
+          if (vuArr && vvArr) {{
+            artifactKind = "integrator";
+            const anyAniso = vuArr.some((vu, idx) => Math.abs(vu - vvArr[idx]) > 1e-2 || (cuvArr && Math.abs(cuvArr[idx]) > 1e-3));
+            peakShapeMode = anyAniso ? "anisotropic_ellipse" : "isotropic_circle";
+          }} else {{
+            artifactKind = "finder";
+            peakShapeMode = "isotropic_circle";
+          }}
+
+          for (let i = 0; i < prArr.length; i++) {{
+            if (runArr && runArr[i] !== 0) continue;
+            const inten = intArr ? intArr[i] : 120.0;
+            const sig = sigArr ? sigArr[i] : 3.0;
+            if (intArr && sigArr && (sig <= 0 || inten / Math.max(sig, 1e-9) < 2.5)) continue;
+            const bid = bkArr[i];
+            const det = detMap.get(bid);
+            if (!det) continue;
+            const rPix = prArr[i], cPix = pcArr[i];
+            const pt = pixelToLab(det, rPix, cPix);
+            const [az, dy, el] = labToCyl(pt);
+            const kf = vecUnit(pt);
+            const qLab = vecUnit([kf[0], kf[1], kf[2] - 1.0]);
+            const gCryst = mat3Vec(R_T, qLab);
+            const [sx, sy, hemi] = stereoProj(gCryst);
+            const h = hArr ? Math.round(hArr[i]) : 1;
+            const k = kArr ? Math.round(kArr[i]) : 0;
+            const l = lArr ? Math.round(lArr[i]) : 0;
+            const G = mat3Vec(RUB, [h, k, l]);
+            const qn = Math.max(vecNorm(G), 0.1);
+            const dVal = 1.0 / qn;
+            const lam = lamArr ? lamArr[i] : 2.5;
+            const pkObj = {{
+              bank: bid, row: Number(rPix.toFixed(1)), col: Number(cPix.toFixed(1)),
+              det_x: az, det_y: dy, det_el: el, q_hat: gCryst,
+              stereographic: [sx, sy], hemisphere: hemi, intensity: inten, sigma: sig,
+              wavelength: lam, d_spacing: dVal, harmonic_order: Math.max(1, gcd3(h, k, l)),
+              parallax_depth: Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * dVal))),
+              hkl: [h, k, l], zone_ids: [], indexed: true, angular_error_deg: 0.02,
+            }};
+            if (vuArr && vvArr) {{
+              const vu = vuArr[i], vv = vvArr[i], cuv = cuvArr ? cuvArr[i] : 0.0;
+              const diff = vu - vv;
+              const sq = Math.sqrt(diff * diff + 4.0 * cuv * cuv);
+              const s1 = Math.sqrt(Math.max((vu + vv + sq) * 0.5, 1e-6));
+              const s2 = Math.sqrt(Math.max((vu + vv - sq) * 0.5, 1e-6));
+              const phi = 0.5 * Math.atan2(2.0 * cuv, diff);
+              const a = 2.0 * s1, b = 2.0 * s2;
+              const ellCyl = [], ellSph = [];
+              for (let m = 0; m < 16; m++) {{
+                const th = (m / 16) * 2.0 * Math.PI;
+                const ct = Math.cos(th), st = Math.sin(th);
+                const cE = cPix + a * ct * Math.cos(phi) - b * st * Math.sin(phi);
+                const rE = rPix + a * ct * Math.sin(phi) + b * st * Math.cos(phi);
+                const [azE, dyE, elE] = labToCyl(pixelToLab(det, rE, cE));
+                ellCyl.push([azE, dyE]); ellSph.push([azE, elE]);
+              }}
+              pkObj.ellipse = ellCyl;
+              pkObj.ellipse_sph = ellSph;
+              pkObj.sigma_major_px = Number(s1.toFixed(2));
+              pkObj.sigma_minor_px = Number(s2.toFixed(2));
+              pkObj.ellipse_angle_deg = Number((phi * 180 / Math.PI).toFixed(1));
+              pkObj.shape_kind = Math.abs(s1 - s2) > 0.05 ? "ellipse" : "isotropic_circle";
+            }}
+            candPeaks.push(pkObj);
+          }}
+        }}
+      }} else if (f.keys().includes("banks")) {{
+        // 2. Recognize predictor.h5 format: banks/<img_idx>/(i, j, h, k, l, wavelength)
+        artifactKind = "predictor";
+        peakShapeMode = "predicted_circle";
+        const bGrp = f.get("banks");
+        const bAll = f.keys().includes("bank_ids") ? Array.from(f.get("bank_ids").value).map(Number) : [];
+        for (let imgIdx = f0; imgIdx < (f1 || bGrp.keys().length); imgIdx++) {{
+          const kStr = String(imgIdx);
+          if (!bGrp.keys().includes(kStr)) continue;
+          const g = bGrp.get(kStr);
+          if (!g.keys().includes("i") || !g.keys().includes("j")) continue;
+          const prArr = Array.from(g.get("i").value).map(Number);
+          const pcArr = Array.from(g.get("j").value).map(Number);
+          const hArr = Array.from(g.get("h").value).map(Number);
+          const kArr = Array.from(g.get("k").value).map(Number);
+          const lArr = Array.from(g.get("l").value).map(Number);
+          const wlArr = Array.from(g.get("wavelength").value).map(Number);
+          const bid = bAll[imgIdx] !== undefined ? bAll[imgIdx] : imgIdx;
+          const det = detMap.get(bid);
+          if (!det) continue;
+          for (let i = 0; i < prArr.length; i++) {{
+            const rPix = prArr[i], cPix = pcArr[i];
+            const h = Math.round(hArr[i]), k = Math.round(kArr[i]), l = Math.round(lArr[i]);
+            const lam = wlArr[i];
+            const pt = pixelToLab(det, rPix, cPix);
+            const [az, dy, el] = labToCyl(pt);
+            const kf = vecUnit(pt);
+            const qLab = vecUnit([kf[0], kf[1], kf[2] - 1.0]);
+            const gCryst = mat3Vec(R_T, qLab);
+            const [sx, sy, hemi] = stereoProj(gCryst);
+            const G = mat3Vec(RUB, [h, k, l]);
+            const qn = Math.max(vecNorm(G), 0.1);
+            const dVal = 1.0 / qn;
+            candPeaks.push({{
+              bank: bid, row: Number(rPix.toFixed(1)), col: Number(cPix.toFixed(1)),
+              det_x: az, det_y: dy, det_el: el, q_hat: gCryst,
+              stereographic: [sx, sy], hemisphere: hemi, intensity: 150.0, sigma: 3.0,
+              wavelength: lam, d_spacing: dVal, harmonic_order: Math.max(1, gcd3(h, k, l)),
+              parallax_depth: Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * dVal))),
+              hkl: [h, k, l], zone_ids: [], indexed: true, angular_error_deg: 0.02,
+            }});
+          }}
+        }}
+      }}
+
+      // 3. Fallback to forward-projection from solved U, B if no peaks were read above
+      if (candPeaks.length === 0) {{
       const dMin = 2.6;
       const hMax = Math.min(18, Math.floor(cell[0] / dMin));
       const kMax = Math.min(18, Math.floor(cell[1] / dMin));
       const lMax = Math.min(28, Math.floor(cell[2] / dMin));
-      const candPeaks = [];
       for (let h = -hMax; h <= hMax; h++) {{
         for (let k = -kMax; k <= kMax; k++) {{
           for (let l = -lMax; l <= lMax; l++) {{
@@ -4047,6 +4548,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
           }}
         }}
+      }}
       }}
       candPeaks.sort((a, b) => b.intensity - a.intensity);
       candPeaks.slice(0, 1200).forEach((p, idx) => {{ p.id = idx; peaksOut.push(p); }});
@@ -4122,6 +4624,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     try {{ f.close(); if (mf && mf !== f) mf.close(); }} catch (_e) {{}}
     return {{
       instrument: inst, space_group: sg, intensity_source: bankImgs.size > 0 ? "raw_h5" : "reconstructed",
+      artifact_kind: artifactKind, peak_shape_mode: peakShapeMode,
       wavelength_range: wlRangeNew, d_min: dMinNew, cell, peaks: peaksOut, zones: zonesOut, panels: panelsOut,
       ladder_steps: ladderOut, pipeline_stages: PIPELINE,
     }};
@@ -4157,9 +4660,26 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   async function loadFromGalaxyDatasetId(dsId) {{
     if (!dsId) return;
-    const ladderDesc = document.getElementById("ladder-desc");
-    if (ladderDesc) ladderDesc.textContent = "⏳ Loading HDF5 from Galaxy History via h5wasm...";
+    setStatusLine("[⏳ GALAXY HDF5]", `Loading dataset <strong>${{dsId}}</strong> from NDIP / Galaxy History...`);
     try {{
+      // 1. Prefer server-side HDF5 extraction via NOVA/HTTP backend (handles solve.h5, predictor.h5, integrated.h5 with ellipses & multi-frame)
+      try {{
+        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}`, {{
+          cache: "no-store",
+          credentials: "same-origin",
+        }});
+        if (rServer.ok) {{
+          const serverPayload = await rServer.json();
+          if (serverPayload && (Array.isArray(serverPayload.peaks) || Array.isArray(serverPayload.panels))) {{
+            recomputeBoundsAndReload(serverPayload);
+            return;
+          }}
+        }}
+      }} catch (_srvErr) {{
+        // Fall through to client-side h5wasm fetch
+      }}
+
+      // 2. Fallback: fetch raw HDF5 via /api/datasets/<id>/display and parse in browser via h5wasm
       while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));
       const h5s = (galaxyBridge.datasets || []).filter(
         d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
@@ -4178,7 +4698,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
       recomputeBoundsAndReload(newPayload);
     }} catch (err) {{
-      if (ladderDesc) ladderDesc.textContent = `⚠️ Failed to load HDF5: ${{err.message}}`;
+      setStatusLine("[⚠️ GALAXY HDF5]", `<span style="color:#f87171;">Failed to load HDF5: ${{err.message}}</span>`);
     }}
   }}
 

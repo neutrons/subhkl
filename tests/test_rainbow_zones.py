@@ -388,3 +388,94 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
         assert proc.returncode == 0, f"JS syntax error: {proc.stderr}"
 
 
+def test_predictor_and_integrator_ellipses_and_galaxy_dataset_loading(tmp_path):
+    """Verify predictor.h5 and integrated.h5 (isotropic circles & anisotropic ellipses) are recognized and rendered."""
+    import h5py
+    import pytest
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    # 1. Create a synthetic predictor.h5 with banks/<img_idx>/(i, j, h, k, l, wavelength)
+    pred_h5 = tmp_path / "predictor.h5"
+    with h5py.File(pred_h5, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f.create_dataset("bank_ids", data=np.array([21], dtype=int))
+        f.create_dataset("sample/U", data=np.eye(3))
+        f.create_dataset("sample/B", data=np.diag([1 / 60.0, 1 / 70.0, 1 / 80.0]))
+        f.create_dataset("sample/space_group", data=b"P 21 21 21")
+        g = f.create_group("banks/0")
+        g.create_dataset("i", data=np.array([120.0, 180.0, 240.0]))
+        g.create_dataset("j", data=np.array([150.0, 210.0, 260.0]))
+        g.create_dataset("h", data=np.array([1, 2, 1], dtype=int))
+        g.create_dataset("k", data=np.array([2, 1, 3], dtype=int))
+        g.create_dataset("l", data=np.array([3, 4, 2], dtype=int))
+        g.create_dataset("wavelength", data=np.array([2.9, 3.2, 3.6]))
+
+    p_pred = build_rainbow_zone_payload(replay_h5=pred_h5)
+    assert p_pred["artifact_kind"] == "predictor"
+    assert p_pred["peak_shape_mode"] == "predicted_circle"
+    assert len(p_pred["peaks"]) == 3
+
+    # 2. Create a synthetic anisotropic integrated.h5 with peaks/(var_u, var_v, cov_uv)
+    int_aniso_h5 = tmp_path / "integrated_aniso.h5"
+    with h5py.File(int_aniso_h5, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f.create_dataset("sample/U", data=np.eye(3))
+        f.create_dataset("sample/B", data=np.diag([1 / 60.0, 1 / 70.0, 1 / 80.0]))
+        f.create_dataset("sample/space_group", data=b"P 21 21 21")
+        pk = f.create_group("peaks")
+        pk.create_dataset("bank", data=np.array([21, 21], dtype=int))
+        pk.create_dataset("pixel_r", data=np.array([140.0, 220.0]))
+        pk.create_dataset("pixel_c", data=np.array([160.0, 240.0]))
+        pk.create_dataset("h", data=np.array([1, 2], dtype=int))
+        pk.create_dataset("k", data=np.array([2, 3], dtype=int))
+        pk.create_dataset("l", data=np.array([3, 1], dtype=int))
+        pk.create_dataset("lambda", data=np.array([3.0, 3.4]))
+        pk.create_dataset("intensity", data=np.array([500.0, 800.0]))
+        pk.create_dataset("sigma", data=np.array([25.0, 30.0]))
+        pk.create_dataset("var_u", data=np.array([12.0, 10.0]))
+        pk.create_dataset("var_v", data=np.array([36.0, 42.0]))
+        pk.create_dataset("cov_uv", data=np.array([5.5, -6.2]))
+
+    p_aniso = build_rainbow_zone_payload(replay_h5=int_aniso_h5)
+    assert p_aniso["artifact_kind"] == "integrator"
+    assert p_aniso["peak_shape_mode"] == "anisotropic_ellipse"
+    assert len(p_aniso["peaks"]) == 2
+    pk0 = p_aniso["peaks"][0]
+    assert pk0["shape_kind"] == "ellipse"
+    assert len(pk0["ellipse"]) == 16
+    assert len(pk0["ellipse_sph"]) == 16
+    assert pk0["sigma_major_px"] > pk0["sigma_minor_px"]
+
+    # 3. Create a synthetic isotropic integrated.h5 with var_u == var_v and cov_uv == 0
+    int_iso_h5 = tmp_path / "integrated_iso.h5"
+    with h5py.File(int_iso_h5, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f.create_dataset("sample/U", data=np.eye(3))
+        f.create_dataset("sample/B", data=np.diag([1 / 60.0, 1 / 70.0, 1 / 80.0]))
+        pk = f.create_group("peaks")
+        pk.create_dataset("bank", data=np.array([21], dtype=int))
+        pk.create_dataset("pixel_r", data=np.array([200.0]))
+        pk.create_dataset("pixel_c", data=np.array([200.0]))
+        pk.create_dataset("h", data=np.array([1], dtype=int))
+        pk.create_dataset("k", data=np.array([1], dtype=int))
+        pk.create_dataset("l", data=np.array([1], dtype=int))
+        pk.create_dataset("lambda", data=np.array([3.1]))
+        pk.create_dataset("intensity", data=np.array([400.0]))
+        pk.create_dataset("sigma", data=np.array([20.0]))
+        pk.create_dataset("var_u", data=np.array([16.0]))
+        pk.create_dataset("var_v", data=np.array([16.0]))
+        pk.create_dataset("cov_uv", data=np.array([0.0]))
+
+    p_iso = build_rainbow_zone_payload(replay_h5=int_iso_h5)
+    assert p_iso["artifact_kind"] == "integrator"
+    assert p_iso["peak_shape_mode"] == "isotropic_circle"
+    assert p_iso["peaks"][0]["shape_kind"] == "isotropic_circle"
+    assert p_iso["peaks"][0]["sigma_major_px"] == pytest.approx(4.0)
+    assert p_iso["peaks"][0]["sigma_minor_px"] == pytest.approx(4.0)
+
+    html = render_rainbow_html(p_aniso)
+    assert "api/payload?dataset_id=" in html
+    assert "INTEGRATED • 3D TENSOR ELLIPSES" in html
+
+
+

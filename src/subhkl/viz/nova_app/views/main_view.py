@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,35 @@ class MainApp:
             return web.json_response(doc)
 
         async def handle_payload(request: web.Request) -> web.Response:
+            ds_id_q = request.rel_url.query.get("dataset_id")
+            if ds_id_q is not None and str(ds_id_q).strip() != "":
+                try:
+                    ds_id = str(ds_id_q).strip()
+                    cur_peaks = self.view_model.model.subhkl.data.peaks_file
+                    cur_imgs = self.view_model.model.subhkl.data.images_file
+                    fb_dir = None
+                    for p in (cur_peaks, cur_imgs):
+                        if p and os.path.isfile(p):
+                            fb_dir = os.path.dirname(os.path.abspath(p))
+                            break
+                    local_h5, ds_info = (
+                        self.pipeline_runner.resolve_dataset_to_local_h5(
+                            ds_id, fallback_dir=fb_dir
+                        )
+                    )
+                    ds_name = str(
+                        ds_info.get("name") or os.path.basename(local_h5)
+                    ).lower()
+                    if any(k in ds_name for k in ("merged", "scan", "image")):
+                        self.view_model.model.subhkl.data.images_file = local_h5
+                    else:
+                        self.view_model.model.subhkl.data.peaks_file = local_h5
+                    self.view_model.model.subhkl.refresh_payload()
+                except Exception as exc:
+                    return web.json_response(
+                        {"status": "error", "error": str(exc)}, status=404
+                    )
+
             frame_q = request.rel_url.query.get("frame")
             if frame_q is not None and str(frame_q).strip() != "":
                 try:
@@ -68,6 +98,23 @@ class MainApp:
                 except Exception:
                     pass
             return web.json_response(self.view_model.model.subhkl.payload or {})
+
+        async def handle_dataset_display(request: web.Request) -> web.Response:
+            ds_id = request.match_info.get("ds_id", "")
+            try:
+                cur_peaks = self.view_model.model.subhkl.data.peaks_file
+                cur_imgs = self.view_model.model.subhkl.data.images_file
+                fb_dir = None
+                for p in (cur_peaks, cur_imgs):
+                    if p and os.path.isfile(p):
+                        fb_dir = os.path.dirname(os.path.abspath(p))
+                        break
+                local_h5, _ = self.pipeline_runner.resolve_dataset_to_local_h5(
+                    ds_id, fallback_dir=fb_dir
+                )
+                return web.FileResponse(path=local_h5)
+            except Exception as exc:
+                return web.Response(text=str(exc), status=404)
 
         async def handle_standalone_html(_request: web.Request) -> web.Response:
             html_doc = self.view_model.model.subhkl.get_widget_html()
@@ -113,6 +160,7 @@ class MainApp:
             [
                 web.get("/api/pipeline/status", handle_status),
                 web.get("/api/payload", handle_payload),
+                web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
                 web.get("/subhkl_parallax.html", handle_standalone_html),
             ]
