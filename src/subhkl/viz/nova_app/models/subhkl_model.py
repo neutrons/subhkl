@@ -259,7 +259,12 @@ class SubhklGalaxyModel:
         if len(wl_range) >= 2 and float(wl_range[1]) > float(wl_range[0]) > 0:
             self.data.wavelength_min = round(float(wl_range[0]), 3)
             self.data.wavelength_max = round(float(wl_range[1]), 3)
-        if self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
+        if (
+            self.payload.get("artifact_kind") in ("merged", "raw_nexus")
+            and len(wl_range) >= 2
+        ):
+            self.data.d_min = round(float(wl_range[0]), 3)
+        elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
             self.data.d_min = round(float(self.payload["d_min"]), 3)
         return self.payload
 

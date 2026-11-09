@@ -543,11 +543,23 @@ def _extract_from_h5(
             instrument = explicit_h5_inst
         else:
             found_by_name = False
-            name_cands = [os.path.basename(str(h5_path)).upper()]
+            name_cands = [str(h5_path).upper()]
+            if src_h5:
+                name_cands.append(str(src_h5).upper())
             if "files" in f:
                 name_cands.extend(
                     _decode_str(x, "").upper() for x in list(f["files"][()])
                 )
+            elif src_h5 and os.path.isfile(src_h5):
+                try:
+                    with h5py.File(src_h5, "r") as sf_inst:
+                        if "files" in sf_inst:
+                            name_cands.extend(
+                                _decode_str(x, "").upper()
+                                for x in list(sf_inst["files"][()])
+                            )
+                except Exception:
+                    pass
             for fn_s in name_cands:
                 for known_inst in ("MANDI", "TOPAZ", "CG4D", "IMAGINE"):
                     if known_inst in fn_s:
@@ -617,6 +629,11 @@ def _extract_from_h5(
         gonio_names_raw = (
             list(f["goniometer/names"][()]) if "goniometer/names" in f else None
         )
+        gonio_axes = (
+            np.asarray(f["goniometer/axes"][()], dtype=float)
+            if "goniometer/axes" in f
+            else None
+        )
         gonio_angles_ref = (
             np.asarray(f["goniometer/angles"][()], dtype=float)
             if "goniometer/angles" in f
@@ -642,6 +659,8 @@ def _extract_from_h5(
                         files_raw = list(af["files"][()])
                     if gonio_names_raw is None and "goniometer/names" in af:
                         gonio_names_raw = list(af["goniometer/names"][()])
+                    if gonio_axes is None and "goniometer/axes" in af:
+                        gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
                     if aux_path == src_h5 and "goniometer/angles" in af:
                         gonio_angles_nom = np.asarray(
                             af["goniometer/angles"][()], dtype=float
@@ -849,7 +868,9 @@ def _extract_from_h5(
                     )
             if "scan_refinement" in f:
                 sr_grp = f["scan_refinement"]
-                solve_diagnostics["d_min"] = float(sr_grp.attrs.get("d_min", 2.8))
+                solve_diagnostics["d_min"] = float(
+                    sr_grp.attrs.get("d_min", wavelength_range[0])
+                )
                 solve_diagnostics["n_zones"] = int(sr_grp.attrs.get("n_zones", 400))
                 solve_diagnostics["modes"] = _decode_str(sr_grp.attrs.get("modes"), "")
                 solve_diagnostics["status"] = _decode_str(
@@ -1140,6 +1161,29 @@ def _extract_from_h5(
                     R_gonio = R_all[0]
             elif R_all.ndim == 2:
                 R_gonio = R_all
+        if (
+            R_gonio is None
+            and gonio_axes is not None
+            and gonio_angles_nom is not None
+            and gonio_angles_nom.ndim == 2
+            and len(gonio_angles_nom) > 0
+        ):
+            try:
+                from subhkl.instrument.goniometer import (
+                    calc_goniometer_rotation_matrix,
+                )
+
+                f0_ang = (
+                    frame_slice[0]
+                    if frame_slice is not None
+                    and 0 <= frame_slice[0] < len(gonio_angles_nom)
+                    else 0
+                )
+                R_gonio = calc_goniometer_rotation_matrix(
+                    gonio_axes, gonio_angles_nom[f0_ang]
+                )
+            except Exception:
+                pass
 
         # Finder-less solve.h5 forward projection onto calibrated detector banks
         if (
@@ -1166,9 +1210,9 @@ def _extract_from_h5(
                     cell if cell and len(cell) == 6 else list(_cell_from_B(B_mat))
                 )
                 d_min_use = (
-                    float(solve_diagnostics.get("d_min", 2.5))
+                    float(solve_diagnostics.get("d_min", wavelength_range[0]))
                     if solve_diagnostics and "d_min" in solve_diagnostics
-                    else 2.5
+                    else float(wavelength_range[0])
                 )
                 max_cell_edge = (
                     max(float(x) for x in cell_use[:3])
@@ -2373,7 +2417,7 @@ def build_rainbow_zone_payload(
         else default_projection_for_instrument(instrument)
     )
 
-    d_min_use = float((solve_diagnostics or {}).get("d_min", 2.8))
+    d_min_use = float((solve_diagnostics or {}).get("d_min", wl_min))
     gonio_summary = (
         frames_meta[active_frame].get("motor_summary", "—")
         if 0 <= active_frame < len(frames_meta)
@@ -2450,7 +2494,7 @@ def render_rainbow_html(
     init_wl = payload.get("wavelength_range") or [2.8, 4.5]
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
     init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
-    init_dmin = float(payload.get("d_min") or 2.8)
+    init_dmin = float(payload.get("d_min") or init_wl_min)
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -3468,7 +3512,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       alpha: getNum("inp-alpha", cell[3]),
       beta: getNum("inp-beta", cell[4]),
       gamma: getNum("inp-gamma", cell[5]),
-      d_min: getNum("inp-dmin", DATA.d_min || 2.8),
+      d_min: getNum("inp-dmin", state.lamMin || DATA.d_min || 2.0),
       steps: Math.round(getNum("inp-steps", 120)),
       wavelength_min: state.lamMin,
       wavelength_max: state.lamMax,
@@ -4454,7 +4498,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   // Dynamic payload hot-reload + Client-Side h5wasm HDF5 Parser (for truly static HTML usage)
-  function recomputeBoundsAndReload(newPayload) {{
+  function recomputeBoundsAndReload(newPayload, isPartial = false) {{
     if (!newPayload) return;
     const prevInst = DATA.instrument;
     DATA.instrument = newPayload.instrument || DATA.instrument;
@@ -4468,7 +4512,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     DATA.space_group = newPayload.space_group || DATA.space_group;
     DATA.wavelength_range = newPayload.wavelength_range || DATA.wavelength_range;
-    DATA.d_min = newPayload.d_min || DATA.d_min;
+    const nextArtKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
+    if (nextArtKind === "merged" || nextArtKind === "raw_nexus") {{
+      DATA.d_min = Number((DATA.wavelength_range && DATA.wavelength_range[0]) || newPayload.d_min || state.lamMin || 2.0);
+    }} else {{
+      DATA.d_min = Number(newPayload.d_min || (DATA.wavelength_range && DATA.wavelength_range[0]) || DATA.d_min || state.lamMin || 2.0);
+    }}
     DATA.cell = newPayload.cell || DATA.cell;
     if (Array.isArray(newPayload.frames)) DATA.frames = newPayload.frames;
     if (typeof newPayload.frame_index === "number") DATA.frame_index = newPayload.frame_index;
@@ -4684,23 +4733,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (!inst) inst = DATA.instrument || "CG4D";
 
-    let wlRangeNew = [2.8, 4.5];
-    let dMinNew = 2.8;
+    let wlRangeNew = (inst === "MANDI" || inst === "TOPAZ") ? [2.0, 4.0] : [2.8, 4.5];
+    let dMinNew = Number(wlRangeNew[0]);
     try {{
+      if (f.keys().includes("instrument")) {{
+        const wl = f.get("instrument/wavelength").value;
+        if (wl && wl.length >= 2 && !(Math.abs(Number(wl[0]) - 2.0) < 1e-3 && Math.abs(Number(wl[1]) - 10.0) < 1e-3)) {{
+          wlRangeNew = [Number(wl[0]), Number(wl[1])];
+          dMinNew = Number(wlRangeNew[0]);
+        }}
+      }}
       if (f.keys().includes("scan_refinement")) {{
         const srGrp = f.get("scan_refinement");
         if (srGrp.keys().includes("band_wavelength")) {{
           const bwl = srGrp.get("band_wavelength").value;
-          if (bwl && bwl.length >= 2) wlRangeNew = [Number(bwl[0]), Number(bwl[1])];
+          if (bwl && bwl.length >= 2) {{
+            wlRangeNew = [Number(bwl[0]), Number(bwl[1])];
+            dMinNew = Number(wlRangeNew[0]);
+          }}
         }}
-        if (srGrp.attrs && srGrp.attrs["d_min"]) {{
-          dMinNew = Number(srGrp.attrs["d_min"].value) || 2.8;
-        }}
-      }}
-      if (wlRangeNew[0] === 2.8 && f.keys().includes("instrument")) {{
-        const wl = f.get("instrument/wavelength").value;
-        if (wl && wl.length >= 2 && !(Math.abs(Number(wl[0]) - 2.0) < 1e-3 && Math.abs(Number(wl[1]) - 10.0) < 1e-3)) {{
-          wlRangeNew = [Number(wl[0]), Number(wl[1])];
+        if (srGrp && srGrp.attrs && srGrp.attrs["d_min"]) {{
+          dMinNew = Number(srGrp.attrs["d_min"].value) || dMinNew;
         }}
       }}
     }} catch (_e) {{}}
@@ -5862,6 +5915,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
         if (stageId === "solve") selectLadderRung(0, false);
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
+        let lastPartialSeq = 0;
+        let partialFetchBusy = false;
         galaxyBridge.pollTimer = setInterval(async () => {{
           try {{
             const sr = await fetch("api/pipeline/status", {{ cache: "no-store" }});
@@ -5871,6 +5926,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (!aj) return;
             const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");
             if (outText) appendTerminalLog(outText, true);
+            if (
+              stageId === "solve" &&
+              aj.state !== "ok" &&
+              (aj.partial_seq || 0) > lastPartialSeq &&
+              aj.output_h5_path &&
+              !partialFetchBusy
+            ) {{
+              partialFetchBusy = true;
+              lastPartialSeq = aj.partial_seq;
+              try {{
+                const pUrl = `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}`;
+                const pRes = await fetch(pUrl, {{ cache: "no-store" }});
+                if (pRes.ok) {{
+                  const pPart = await pRes.json();
+                  if (pPart && Array.isArray(pPart.zones) && pPart.zones.length > 0) {{
+                    recomputeBoundsAndReload(pPart, true);
+                  }}
+                }}
+              }} catch (_pePart) {{}}
+              partialFetchBusy = false;
+            }}
             if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
