@@ -263,9 +263,9 @@ class SubhklGalaxyModel:
             self.payload.get("artifact_kind") in ("merged", "raw_nexus")
             and len(wl_range) >= 2
         ):
-            self.data.d_min = round(float(wl_range[0]), 3)
+            self.data.d_min = round(0.9 * float(wl_range[0]), 2)
         elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
-            self.data.d_min = round(float(self.payload["d_min"]), 3)
+            self.data.d_min = round(float(self.payload["d_min"]), 2)
         return self.payload
 
     def render_html(self) -> str:

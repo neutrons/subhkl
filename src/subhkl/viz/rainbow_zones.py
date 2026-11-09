@@ -868,8 +868,9 @@ def _extract_from_h5(
                     )
             if "scan_refinement" in f:
                 sr_grp = f["scan_refinement"]
+                default_d_min = round(0.9 * float(wavelength_range[0]), 2)
                 solve_diagnostics["d_min"] = float(
-                    sr_grp.attrs.get("d_min", wavelength_range[0])
+                    sr_grp.attrs.get("d_min", default_d_min)
                 )
                 solve_diagnostics["n_zones"] = int(sr_grp.attrs.get("n_zones", 400))
                 solve_diagnostics["modes"] = _decode_str(sr_grp.attrs.get("modes"), "")
@@ -1209,10 +1210,11 @@ def _extract_from_h5(
                 cell_use = (
                     cell if cell and len(cell) == 6 else list(_cell_from_B(B_mat))
                 )
+                default_d_min = round(0.9 * float(wavelength_range[0]), 2)
                 d_min_use = (
-                    float(solve_diagnostics.get("d_min", wavelength_range[0]))
+                    float(solve_diagnostics.get("d_min", default_d_min))
                     if solve_diagnostics and "d_min" in solve_diagnostics
-                    else float(wavelength_range[0])
+                    else default_d_min
                 )
                 max_cell_edge = (
                     max(float(x) for x in cell_use[:3])
@@ -2417,7 +2419,8 @@ def build_rainbow_zone_payload(
         else default_projection_for_instrument(instrument)
     )
 
-    d_min_use = float((solve_diagnostics or {}).get("d_min", wl_min))
+    default_d_min = round(0.9 * float(wl_min), 2)
+    d_min_use = float((solve_diagnostics or {}).get("d_min", default_d_min))
     gonio_summary = (
         frames_meta[active_frame].get("motor_summary", "—")
         if 0 <= active_frame < len(frames_meta)
@@ -2494,7 +2497,7 @@ def render_rainbow_html(
     init_wl = payload.get("wavelength_range") or [2.8, 4.5]
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
     init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
-    init_dmin = float(payload.get("d_min") or init_wl_min)
+    init_dmin = float(payload.get("d_min") or round(0.9 * init_wl_min, 2))
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -3512,7 +3515,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       alpha: getNum("inp-alpha", cell[3]),
       beta: getNum("inp-beta", cell[4]),
       gamma: getNum("inp-gamma", cell[5]),
-      d_min: getNum("inp-dmin", state.lamMin || DATA.d_min || 2.0),
+      d_min: getNum("inp-dmin", Number(((state.lamMin || 2.0) * 0.9).toFixed(2))),
       steps: Math.round(getNum("inp-steps", 120)),
       wavelength_min: state.lamMin,
       wavelength_max: state.lamMax,
@@ -4498,7 +4501,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   // Dynamic payload hot-reload + Client-Side h5wasm HDF5 Parser (for truly static HTML usage)
-  function recomputeBoundsAndReload(newPayload, isPartial = false) {{
+  function recomputeBoundsAndReload(newPayload) {{
     if (!newPayload) return;
     const prevInst = DATA.instrument;
     DATA.instrument = newPayload.instrument || DATA.instrument;
@@ -4513,10 +4516,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     DATA.space_group = newPayload.space_group || DATA.space_group;
     DATA.wavelength_range = newPayload.wavelength_range || DATA.wavelength_range;
     const nextArtKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
+    const wl0 = Number((DATA.wavelength_range && DATA.wavelength_range[0]) || state.lamMin || 2.0);
     if (nextArtKind === "merged" || nextArtKind === "raw_nexus") {{
-      DATA.d_min = Number((DATA.wavelength_range && DATA.wavelength_range[0]) || newPayload.d_min || state.lamMin || 2.0);
+      DATA.d_min = Number((0.9 * wl0).toFixed(2));
     }} else {{
-      DATA.d_min = Number(newPayload.d_min || (DATA.wavelength_range && DATA.wavelength_range[0]) || DATA.d_min || state.lamMin || 2.0);
+      DATA.d_min = Number(newPayload.d_min || (0.9 * wl0).toFixed(2));
     }}
     DATA.cell = newPayload.cell || DATA.cell;
     if (Array.isArray(newPayload.frames)) DATA.frames = newPayload.frames;
@@ -4734,13 +4738,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!inst) inst = DATA.instrument || "CG4D";
 
     let wlRangeNew = (inst === "MANDI" || inst === "TOPAZ") ? [2.0, 4.0] : [2.8, 4.5];
-    let dMinNew = Number(wlRangeNew[0]);
+    let dMinNew = Number((0.9 * Number(wlRangeNew[0])).toFixed(2));
     try {{
       if (f.keys().includes("instrument")) {{
         const wl = f.get("instrument/wavelength").value;
         if (wl && wl.length >= 2 && !(Math.abs(Number(wl[0]) - 2.0) < 1e-3 && Math.abs(Number(wl[1]) - 10.0) < 1e-3)) {{
           wlRangeNew = [Number(wl[0]), Number(wl[1])];
-          dMinNew = Number(wlRangeNew[0]);
+          dMinNew = Number((0.9 * Number(wlRangeNew[0])).toFixed(2));
         }}
       }}
       if (f.keys().includes("scan_refinement")) {{
@@ -4749,7 +4753,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const bwl = srGrp.get("band_wavelength").value;
           if (bwl && bwl.length >= 2) {{
             wlRangeNew = [Number(bwl[0]), Number(bwl[1])];
-            dMinNew = Number(wlRangeNew[0]);
+            dMinNew = Number((0.9 * Number(wlRangeNew[0])).toFixed(2));
           }}
         }}
         if (srGrp && srGrp.attrs && srGrp.attrs["d_min"]) {{
@@ -5558,15 +5562,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const s = document.getElementById(srcId), d = document.getElementById(dstId);
         if (s && d) d.value = s.value;
       }});
-      const cellA = parseFloat(document.getElementById("nd-a")?.value || "68.7");
-      const cellB = parseFloat(document.getElementById("nd-b")?.value || "69.8");
-      const cellC = parseFloat(document.getElementById("nd-c")?.value || "156.9");
-      const maxEdge = Math.max(cellA || 68.7, cellB || 69.8, cellC || 156.9);
-      const minEdge = Math.min(cellA || 68.7, cellB || 69.8, cellC || 156.9);
-      const inpDmin = document.getElementById("inp-dmin");
-      if (inpDmin && maxEdge < 35.0 && parseFloat(inpDmin.value || "2.8") >= 2.0) {{
-        inpDmin.value = Math.max(0.8, Math.round(minEdge * 0.085 * 100) / 100).toFixed(2);
-      }}
       const wlMinV = parseFloat(document.getElementById("nd-wl-min")?.value || "");
       const wlMaxV = parseFloat(document.getElementById("nd-wl-max")?.value || "");
       if (Number.isFinite(wlMinV) && Number.isFinite(wlMaxV)) {{
@@ -5574,6 +5569,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (slLamMin) slLamMin.value = wlMinV.toFixed(2);
         if (slLamMax) slLamMax.value = wlMaxV.toFixed(2);
         updateWavelengthLabels();
+      }}
+      const inpDmin = document.getElementById("inp-dmin");
+      if (inpDmin) {{
+        const autoD = Number((0.9 * (Number.isFinite(wlMinV) ? wlMinV : (state.lamMin || 2.0))).toFixed(2));
+        inpDmin.value = autoD.toFixed(1);
+        DATA.d_min = autoD;
       }}
       const instVal = (document.getElementById("nd-instrument")?.value || DATA.instrument || "CG4D").trim();
       DATA.instrument = instVal;
@@ -5915,8 +5916,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
         if (stageId === "solve") selectLadderRung(0, false);
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
-        let lastPartialSeq = 0;
-        let partialFetchBusy = false;
         galaxyBridge.pollTimer = setInterval(async () => {{
           try {{
             const sr = await fetch("api/pipeline/status", {{ cache: "no-store" }});
@@ -5926,27 +5925,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (!aj) return;
             const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");
             if (outText) appendTerminalLog(outText, true);
-            if (
-              stageId === "solve" &&
-              aj.state !== "ok" &&
-              (aj.partial_seq || 0) > lastPartialSeq &&
-              aj.output_h5_path &&
-              !partialFetchBusy
-            ) {{
-              partialFetchBusy = true;
-              lastPartialSeq = aj.partial_seq;
-              try {{
-                const pUrl = `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}`;
-                const pRes = await fetch(pUrl, {{ cache: "no-store" }});
-                if (pRes.ok) {{
-                  const pPart = await pRes.json();
-                  if (pPart && Array.isArray(pPart.zones) && pPart.zones.length > 0) {{
-                    recomputeBoundsAndReload(pPart, true);
-                  }}
-                }}
-              }} catch (_pePart) {{}}
-              partialFetchBusy = false;
-            }}
             if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
               selectLadderRung(aj.ladder_rung_idx, false);
             }}

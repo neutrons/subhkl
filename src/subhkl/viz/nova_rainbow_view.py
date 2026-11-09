@@ -295,6 +295,55 @@ class NovaGalaxyPipelineRunner:
         os.makedirs(work_d, exist_ok=True)
         return work_d, f"{safe_tag}_merged.h5"
 
+    def _resolve_work_dir_and_merged(self, merged_path: str) -> tuple[str, str]:
+        """Ensure a merged HDF5 file inside /tmp (such as /tmp/subhkl_gx_<id>_...) uses a dedicated /tmp/subhkl_work_<tag> directory."""
+        import re as _re
+        import shutil as _shutil
+
+        abs_m = os.path.abspath(merged_path)
+        parent_d = os.path.dirname(abs_m)
+        tmp_root = os.path.abspath(tempfile.gettempdir())
+        if parent_d != tmp_root:
+            return parent_d, abs_m
+
+        tag = ""
+        if os.path.isfile(abs_m):
+            try:
+                import h5py
+
+                with h5py.File(abs_m, "r") as hf:
+                    if "files" in hf:
+                        raw_f = [
+                            (
+                                x.decode("utf-8", "ignore")
+                                if isinstance(x, bytes)
+                                else str(x)
+                            )
+                            for x in list(hf["files"][()])
+                        ]
+                        raw_f = [x for x in raw_f if x]
+                        if raw_f:
+                            s0 = os.path.basename(raw_f[0]).split(".")[0]
+                            s1 = os.path.basename(raw_f[-1]).split(".")[0]
+                            tag = s0 if s0 == s1 else f"{s0}_{s1}"
+            except Exception:
+                pass
+        if not tag:
+            bn = os.path.basename(abs_m)
+            bn = _re.sub(r"^subhkl_gx_[0-9a-fA-F]+_", "", bn)
+            bn = _re.sub(r"(_merged)?\.h5$", "", bn, flags=_re.I)
+            tag = bn or "dataset"
+        safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
+        work_d = os.path.join(tmp_root, f"subhkl_work_{safe_tag}")
+        os.makedirs(work_d, exist_ok=True)
+        dest_m = os.path.join(work_d, "merged.h5")
+        if os.path.isfile(abs_m) and not os.path.isfile(dest_m):
+            try:
+                _shutil.copy2(abs_m, dest_m)
+            except Exception:
+                return work_d, abs_m
+        return work_d, (dest_m if os.path.isfile(dest_m) else abs_m)
+
     def connect(self) -> Any:
         if self._conn_helper is not None:
             return self._conn_helper
@@ -543,7 +592,7 @@ class NovaGalaxyPipelineRunner:
                 params.get("images_file")
                 or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
             )
-            work_dir = os.path.dirname(os.path.abspath(merged_path))
+            work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
             solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
             if not os.path.isfile(solve_path) or os.path.basename(solve_path) in (
                 "merged.h5",
@@ -607,7 +656,7 @@ class NovaGalaxyPipelineRunner:
                     "wavelengthMin": float(wl[0]),
                     "wavelengthMax": float(wl[1]),
                     "refinement": str(params.get("objective", "band")),
-                    "dMin": float(params.get("d_min") or wl[0]),
+                    "dMin": float(params.get("d_min") or round(0.9 * float(wl[0]), 2)),
                 }
             elif stage_id == "integrate":
                 primary_tool = "imaginex_subhkl_predict"
@@ -615,7 +664,7 @@ class NovaGalaxyPipelineRunner:
                 idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
                 max_edge = max(float(x) for x in raw_cell[:3])
                 min_edge = min(float(x) for x in raw_cell[:3])
-                d_min_req = float(params.get("d_min") or wl[0])
+                d_min_req = float(params.get("d_min") or round(0.9 * float(wl[0]), 2))
                 d_min_int = (
                     min(d_min_req, max(0.75, min_edge * 0.085))
                     if max_edge < 35.0
@@ -1230,7 +1279,7 @@ class NovaGalaxyPipelineRunner:
         merged_path = os.path.abspath(
             params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
         )
-        work_dir = os.path.dirname(merged_path)
+        work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
         solve_dest = os.path.join(work_dir, "solve.h5")
         pred_dest = os.path.join(work_dir, "predictor.h5")
         integrated_dest = os.path.join(work_dir, "integrated.h5")
@@ -1380,7 +1429,7 @@ class NovaGalaxyPipelineRunner:
                 "--wavelength-max",
                 str(wl[1]),
                 "--d-min",
-                str(params.get("d_min") or wl[0]),
+                str(params.get("d_min") or round(0.9 * float(wl[0]), 2)),
                 "--refinement",
                 str(params.get("objective", "band")),
             ]
@@ -1391,7 +1440,7 @@ class NovaGalaxyPipelineRunner:
         ):
             max_edge = max(float(x) for x in raw_cell[:3])
             min_edge = min(float(x) for x in raw_cell[:3])
-            d_min_req = float(params.get("d_min") or wl[0])
+            d_min_req = float(params.get("d_min") or round(0.9 * float(wl[0]), 2))
             d_min_int = (
                 min(d_min_req, max(0.75, min_edge * 0.085))
                 if max_edge < 35.0
@@ -1600,9 +1649,6 @@ class NovaGalaxyPipelineRunner:
                     env=gpu_env,
                 )
                 assert proc.stdout is not None
-                blind_src = out_h5[:-3] + ".blind.h5"
-                blind_dst = solve_dest[:-3] + ".blind.h5"
-                blind_synced = False
                 for line in proc.stdout:
                     job_record["stdout"] = (job_record.get("stdout", "") + line)[
                         -24000:
@@ -1626,26 +1672,6 @@ class NovaGalaxyPipelineRunner:
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 3
                             )
-                        if (
-                            not blind_synced
-                            and (
-                                "selected" in low
-                                or "stage 0" in low
-                                or "60-zone" in low
-                            )
-                            and os.path.isfile(blind_src)
-                        ):
-                            try:
-                                shutil.copy2(blind_src, blind_dst)
-                                blind_synced = True
-                                job_record["output_h5_path"] = blind_dst
-                                if callable(on_complete_h5):
-                                    on_complete_h5(blind_dst)
-                                job_record["partial_seq"] = (
-                                    int(job_record.get("partial_seq", 0)) + 1
-                                )
-                            except Exception:
-                                pass
                 rc = proc.wait()
                 if rc == 0:
                     job_record["ladder_rung_idx"] = 0 if stage_id == "reduce" else 4
@@ -2514,6 +2540,15 @@ def serve_rainbow_zones(
                         params.setdefault(
                             "wavelength_range", vm.payload.get("wavelength_range")
                         )
+                    cur_imgs = (
+                        vm.payload_kwargs.get("images_h5")
+                        or vm.payload.get("images_h5")
+                        or vm.replay_h5
+                    )
+                    if cur_imgs:
+                        params.setdefault("images_file", str(cur_imgs))
+                    if vm.replay_h5:
+                        params.setdefault("peaks_file", str(vm.replay_h5))
 
                     def _on_complete(new_h5_path: str) -> None:
                         if (
