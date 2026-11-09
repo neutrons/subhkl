@@ -61,9 +61,7 @@ class SubhklConfig(BaseModel):
     """
 
     galaxy_url: str = Field(
-        default_factory=lambda: os.getenv(
-            "GALAXY_URL", "https://ndip-test.ornl.gov"
-        ),
+        default_factory=lambda: os.getenv("GALAXY_URL", "https://ndip-test.ornl.gov"),
         title="NDIP / Galaxy URL",
         description="Remote NDIP server (https://ndip-test.ornl.gov) or local Galaxy URL",
     )
@@ -216,18 +214,32 @@ class SubhklGalaxyModel:
         if not self.data.peaks_file or not os.path.isfile(self.data.peaks_file):
             return self.payload
 
-        img_path = (
-            self.data.images_file
-            if self.data.images_file and os.path.isfile(self.data.images_file)
-            else None
-        )
+        img_path = None
+        if self.data.images_file and os.path.isfile(self.data.images_file):
+            if os.path.dirname(
+                os.path.abspath(self.data.images_file)
+            ) == os.path.dirname(os.path.abspath(self.data.peaks_file)):
+                img_path = self.data.images_file
         self.payload = build_rainbow_zone_payload(
             replay_h5=self.data.peaks_file,
             instrument=self.data.instrument.value,
+            space_group=self.data.space_group,
+            cell=[
+                float(self.data.a),
+                float(self.data.b),
+                float(self.data.c),
+                float(self.data.alpha),
+                float(self.data.beta),
+                float(self.data.gamma),
+            ],
             max_zone_index=self.data.max_zone_index,
             images_h5=img_path,
             frame_index=self.frame_index,
         )
+        if self.payload.get("images_h5") and os.path.isfile(
+            str(self.payload["images_h5"])
+        ):
+            self.data.images_file = str(self.payload["images_h5"])
         # Synchronize instrument and unit cell parameters from HDF5 if available
         inst_str = str(self.payload.get("instrument") or "")
         if inst_str in InstrumentOptions.__members__:
@@ -258,9 +270,7 @@ class SubhklGalaxyModel:
         with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            export_static_app_html(
-                tmp_path, instrument=self.data.instrument.value
-            )
+            export_static_app_html(tmp_path, instrument=self.data.instrument.value)
             return Path(tmp_path).read_text(encoding="utf-8")
         finally:
             if os.path.exists(tmp_path):

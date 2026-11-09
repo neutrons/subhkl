@@ -26,6 +26,7 @@ import glob
 import io
 import json
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -158,6 +159,29 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                                     return str(cand_src.resolve())
                         except Exception:
                             pass
+            if "files" in f:
+                try:
+                    raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
+                    raw_files = [x for x in raw_files if x]
+                    if raw_files:
+                        first_stem = os.path.basename(raw_files[0]).split(".")[0]
+                        last_stem = os.path.basename(raw_files[-1]).split(".")[0]
+                        for tag in (
+                            first_stem,
+                            f"{first_stem}_{last_stem}",
+                        ):
+                            safe_tag = "".join(
+                                c if (c.isalnum() or c in "._-") else "_" for c in tag
+                            )
+                            work_cand = (
+                                Path(tempfile.gettempdir())
+                                / f"subhkl_work_{safe_tag}"
+                                / "merged.h5"
+                            )
+                            if work_cand.is_file():
+                                return str(work_cand.resolve())
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -1140,9 +1164,24 @@ def _extract_from_h5(
                     if solve_diagnostics and "d_min" in solve_diagnostics
                     else 2.5
                 )
+                max_cell_edge = (
+                    max(float(x) for x in cell_use[:3])
+                    if cell_use and len(cell_use) >= 3
+                    else 68.7
+                )
+                min_cell_edge = (
+                    min(float(x) for x in cell_use[:3])
+                    if cell_use and len(cell_use) >= 3
+                    else 68.7
+                )
+                d_min_pred = (
+                    min(d_min_use, max(0.75, min_cell_edge * 0.085))
+                    if max_cell_edge < 35.0
+                    else d_min_use
+                )
                 hkl_all = np.stack(
                     generate_reflections(
-                        *cell_use, space_group=space_group, d_min=d_min_use
+                        *cell_use, space_group=space_group, d_min=d_min_pred
                     ),
                     axis=1,
                 ).astype(int)
@@ -1164,11 +1203,6 @@ def _extract_from_h5(
                 kf /= np.linalg.norm(kf, axis=1, keepdims=True)
 
                 bank_imgs: dict[int, np.ndarray] = {}
-                src_h5 = (
-                    str(images_h5)
-                    if images_h5 is not None and os.path.exists(images_h5)
-                    else _discover_images_h5(h5_path)
-                )
                 if src_h5 and os.path.exists(src_h5):
                     try:
                         with h5py.File(src_h5, "r") as mf:
@@ -1184,21 +1218,50 @@ def _extract_from_h5(
                                 ims_s = np.asarray(
                                     mf["images"][f0_s:f1_s], dtype=np.float32
                                 )
-                                for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                    bank_imgs[int(b_id_s)] = im_s
+                                sample_det = (
+                                    next(iter(detectors.values()))
+                                    if detectors
+                                    else None
+                                )
+                                det_n = int(getattr(sample_det, "n", 0))
+                                compat = True
+                                if (
+                                    ims_s.ndim >= 3
+                                    and det_n > 0
+                                    and int(ims_s.shape[1]) != det_n
+                                ):
+                                    compat = False
+                                if compat:
+                                    for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                        if int(b_id_s) in detectors:
+                                            bank_imgs[int(b_id_s)] = im_s
                     except Exception:
                         pass
 
-                xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l, inten_l = (
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
+                cal_bids_set: set[int] = set()
+                if "detector_calibration" in f:
+                    for b_nm in f["detector_calibration"]:
+                        if b_nm.startswith("bank_"):
+                            try:
+                                cal_bids_set.add(int(b_nm.split("_", 1)[1]))
+                            except ValueError:
+                                pass
+
+                active_bids = (
+                    set(bank_imgs.keys())
+                    if bank_imgs
+                    else (
+                        cal_bids_set
+                        if cal_bids_set
+                        else set(int(k) for k in detectors.keys())
+                    )
                 )
+
+                raw_hits: list[dict[str, Any]] = []
+                total_geom_hits = 0
                 for bid, det in sorted(detectors.items()):
+                    if int(bid) not in active_bids:
+                        continue
                     cen = np.asarray(det.center, dtype=float)
                     uh = np.asarray(det.uhat, dtype=float)
                     vh = np.asarray(det.vhat, dtype=float)
@@ -1228,39 +1291,75 @@ def _extract_from_h5(
                     im_b = bank_imgs.get(int(bid))
                     if im_b is not None:
                         r_i = np.clip(
-                            np.round(pr_hit).astype(int), 2, im_b.shape[0] - 3
+                            np.round(pr_hit).astype(int), 3, im_b.shape[0] - 4
                         )
                         c_i = np.clip(
-                            np.round(pc_hit).astype(int), 2, im_b.shape[1] - 3
+                            np.round(pc_hit).astype(int), 3, im_b.shape[1] - 4
                         )
                         peak_val = np.maximum.reduce(
                             [
                                 im_b[r_i + dr, c_i + dc]
-                                for dr in (-1, 0, 1)
-                                for dc in (-1, 0, 1)
+                                for dr in range(-3, 4)
+                                for dc in range(-3, 4)
                             ]
                         )
                         bg_val = float(np.median(im_b))
                         snr = (peak_val - bg_val) / np.sqrt(max(bg_val, 1.0))
-                        keep_snr = snr >= 3.0
-                        if not np.any(keep_snr):
-                            continue
-                        idx_h = idx_h[keep_snr]
-                        um, vm = um[keep_snr], vm[keep_snr]
-                        pr_hit, pc_hit = pr_hit[keep_snr], pc_hit[keep_snr]
-                        peak_val = peak_val[keep_snr]
                     else:
                         peak_val = np.full(len(idx_h), 150.0, dtype=float)
+                        snr = np.full(len(idx_h), 10.0, dtype=float)
 
                     xyz_hit = (
                         cen[None, :]
                         + um[:, None] * uh[None, :]
                         + vm[:, None] * vh[None, :]
                     )
+                    total_geom_hits += len(idx_h)
+                    raw_hits.append(
+                        {
+                            "bid": int(bid),
+                            "idx_h": idx_h,
+                            "xyz_hit": xyz_hit,
+                            "pr_hit": pr_hit,
+                            "pc_hit": pc_hit,
+                            "peak_val": peak_val,
+                            "snr": snr,
+                            "has_img": im_b is not None,
+                        }
+                    )
+
+                xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l, inten_l = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                use_strict_snr = total_geom_hits > 400
+                for rh in raw_hits:
+                    idx_h = rh["idx_h"]
+                    xyz_hit = rh["xyz_hit"]
+                    pr_hit = rh["pr_hit"]
+                    pc_hit = rh["pc_hit"]
+                    peak_val = rh["peak_val"]
+                    snr = rh["snr"]
+                    if rh["has_img"]:
+                        keep_mask = (snr >= 3.0) if use_strict_snr else (peak_val > 0.0)
+                        if not np.any(keep_mask) and not use_strict_snr:
+                            keep_mask = np.ones(len(idx_h), dtype=bool)
+                        if not np.any(keep_mask):
+                            continue
+                        idx_h = idx_h[keep_mask]
+                        xyz_hit = xyz_hit[keep_mask]
+                        pr_hit = pr_hit[keep_mask]
+                        pc_hit = pc_hit[keep_mask]
+                        peak_val = np.maximum(peak_val[keep_mask], 1.0)
                     xyz_l.append(xyz_hit)
                     hkl_l.append(hkl_b[idx_h])
                     lam_l.append(lam_b[idx_h])
-                    bank_l.append(np.full(len(idx_h), int(bid), dtype=int))
+                    bank_l.append(np.full(len(idx_h), rh["bid"], dtype=int))
                     pr_l.append(pr_hit)
                     pc_l.append(pc_hit)
                     inten_l.append(peak_val)
@@ -1303,6 +1402,7 @@ def _extract_from_h5(
             "space_group": space_group,
             "cell": cell,
             "detectors": detectors,
+            "images_h5": src_h5,
             "peaks_xyz": peaks_xyz,
             "bank": bank,
             "pixel_r": pixel_r,
@@ -1663,6 +1763,7 @@ def build_rainbow_zone_payload(
     wavelength_range: tuple[float, float] = (1.8, 4.5),
     instrument: str = "IMAGINE",
     space_group: str = "P 1",
+    cell: list[float] | None = None,
     max_zone_index: int = 3,
     zone_tolerance_deg: float = 0.75,
     min_zone_peaks: int = 2,
@@ -1679,7 +1780,9 @@ def build_rainbow_zone_payload(
     peak reflections, and Lattice Ladder steps.
     """
     detectors: dict[int, Any] = {}
-    cell: list[float] | None = None
+    fallback_cell = list(cell) if cell and len(cell) == 6 else None
+    fallback_sg = space_group
+    cell = None
     bank_arr = None
     pixel_r_arr = None
     pixel_c_arr = None
@@ -1708,8 +1811,14 @@ def build_rainbow_zone_payload(
             U = extracted["U"]
         if B is None:
             B = extracted["B"]
-        space_group = extracted["space_group"] or space_group
-        cell = extracted["cell"]
+        ex_sg = extracted.get("space_group")
+        if ex_sg and ex_sg not in ("P 1", "Unknown"):
+            space_group = ex_sg
+        elif fallback_sg and fallback_sg not in ("P 1", "Unknown"):
+            space_group = fallback_sg
+        else:
+            space_group = ex_sg or space_group
+        cell = extracted["cell"] or fallback_cell
         detectors = extracted["detectors"]
         if peaks_xyz is None:
             peaks_xyz = extracted["peaks_xyz"]
@@ -1731,7 +1840,9 @@ def build_rainbow_zone_payload(
         active_frame = int(extracted.get("frame_index", active_frame))
         if R_gonio is None:
             R_gonio = extracted["R_gonio"]
-        if images_h5 is None:
+        if extracted.get("images_h5"):
+            images_h5 = extracted["images_h5"]
+        elif images_h5 is None:
             images_h5 = _discover_images_h5(replay_h5)
 
     if peaks_xyz is None:
@@ -2298,6 +2409,7 @@ def build_rainbow_zone_payload(
         "frame_index": int(active_frame),
         "goniometer_summary": gonio_summary,
         "frames": frames_meta,
+        "images_h5": str(images_h5) if images_h5 else None,
         "cell": [round(float(x), 4) for x in cell] if cell else None,
         "ub_matrix": (
             [[round(float(v), 6) for v in row] for row in ub_matrix]
@@ -2328,11 +2440,6 @@ def render_rainbow_html(
         str(projection).lower()
         if projection in ("cylindrical", "spherical")
         else payload.get("default_projection", default_projection_for_instrument(inst))
-    )
-    src_badge = (
-        "RAW DETECTOR COUNTS"
-        if payload.get("intensity_source") == "raw_h5"
-        else "RECONSTRUCTED SPOT INTENSITY"
     )
     init_wl = payload.get("wavelength_range") or [2.8, 4.5]
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
@@ -2865,11 +2972,11 @@ def render_rainbow_html(
       </div>
       <div class="hud-pill" id="hud-frame-ctrl" style="gap:3px;padding:1px 5px;" title="Select goniometer frame / run orientation">
         <span class="hud-label">FRAME</span>
-        <button id="btn-frame-prev" style="padding:1px 5px;font-size:0.62rem;" title="Previous frame">◀</button>
+        <button id="btn-frame-prev" style="padding:1px 5px;font-size:0.62rem;" title="Previous frame">&lt;</button>
         <select id="sel-frame" style="background:transparent;color:var(--accent-pink);border:none;font-family:var(--font-display);font-size:0.68rem;font-weight:700;outline:none;cursor:pointer;max-width:190px;">
           <option value="0">1 / 1</option>
         </select>
-        <button id="btn-frame-next" style="padding:1px 5px;font-size:0.62rem;" title="Next frame">▶</button>
+        <button id="btn-frame-next" style="padding:1px 5px;font-size:0.62rem;" title="Next frame">&gt;</button>
       </div>
       <div class="hud-pill" style="display:none;">
         <span class="hud-label">PROJ</span>
@@ -2879,16 +2986,16 @@ def render_rainbow_html(
 
     <div class="controls-cluster">
       <select id="sel-galaxy-h5" title="Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus files, or select from Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:5px;padding:3px 6px;font-size:0.68rem;font-family:var(--font-display);max-width:175px;">
-        <option value="">📂 Data Source...</option>
-        <option value="__action_neutron_data__">⚛ + Neutron data (SNS/HFIR)...</option>
-        <option value="__action_local_file__">💻 + From local computer...</option>
+        <option value="">Data Source...</option>
+        <option value="__action_neutron_data__">+ Neutron data (SNS/HFIR)...</option>
+        <option value="__action_local_file__">+ From local computer...</option>
       </select>
       <input type="file" id="inp-local-h5" accept=".h5,.hdf5,.nxs" multiple style="display:none;" />
       <button id="btn-local-h5" style="display:none;" title="Open local .h5 / .nxs.h5 files">
-        📂 Local .h5
+        Local .h5
       </button>
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
-        🥫 Cyl
+        Cyl
       </button>
       <button id="btn-zone-order" class="active-btn" title="Cycle maximum Laue zone index order: |u,v,w| ≤ 1 (fundamental) → ≤ 2 → ≤ 3 (higher-order)">
         |uvw|≤1
@@ -2903,20 +3010,20 @@ def render_rainbow_html(
         Wulff
       </button>
       <button id="btn-reset-view" title="Reset Zoom, Pan, and Parallax">
-        ⟲
+        Reset
       </button>
       <button id="btn-new-tab" style="border-color:var(--accent-gold);color:var(--accent-gold);" title="Open this view in its own full-screen browser tab">
-        ↗
+        Tab
       </button>
     </div>
   </header>
 
   <div id="iframe-popout-banner" class="iframe-popout-banner" style="display:none;">
-    <span>📐 Running inside an embedded frame —</span>
+    <span>Running inside an embedded frame —</span>
     <button id="btn-popout-now" style="border-color:var(--accent-gold);color:var(--accent-gold);">
-      ↗ Open Full-Screen in New Browser Tab
+      Open Full-Screen in New Browser Tab
     </button>
-    <button id="btn-popout-dismiss" style="padding:2px 7px;font-size:0.68rem;color:var(--text-dim);">✕</button>
+    <button id="btn-popout-dismiss" style="padding:2px 7px;font-size:0.68rem;color:var(--text-dim);">X</button>
   </div>
 
   <!-- MAIN WORKSPACE -->
@@ -2924,7 +3031,7 @@ def render_rainbow_html(
     <!-- Hero View: Unrolled Detector with Grounded Pixel Intensity + Parallax Layers -->
     <section class="canvas-card">
       <div class="card-header">
-        <span id="detector-header-title">🎯 DETECTOR ASSEMBLY — LOG(INTENSITY) + PARALLAX BRAGG RINGS</span>
+        <span id="detector-header-title">DETECTOR ASSEMBLY — LOG(INTENSITY) + PARALLAX BRAGG RINGS</span>
         <span class="hint">Move mouse to peek behind predicted rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
       </div>
       <div class="canvas-wrap">
@@ -2950,7 +3057,7 @@ def render_rainbow_html(
         <div class="stereo-inset hidden" id="stereo-inset">
           <div class="stereo-inset-header">
             <span>WULFF NET</span>
-            <span id="stereo-hint">Ĝ</span>
+            <span id="stereo-hint">G</span>
           </div>
           <canvas id="canvas-stereo"></canvas>
         </div>
@@ -2961,7 +3068,7 @@ def render_rainbow_html(
     <aside class="side-panel">
       <div>
         <div class="section-title">
-          <span>🎛️ Detector &amp; Parallax Controls</span>
+          <span>Detector &amp; Parallax Controls</span>
           <span id="wl-readout">λ: {init_wl_min:.1f}–{init_wl_max:.1f} Å</span>
         </div>
         <div class="slider-group">
@@ -2990,7 +3097,7 @@ def render_rainbow_html(
 
       <div>
         <div class="section-title">
-          <span>🧬 Laue Zone Arcs [uvw]</span>
+          <span>Laue Zone Arcs [uvw]</span>
           <div style="display:flex;gap:4px;">
             <button id="btn-order-1" class="active-btn" style="padding:2px 6px;font-size:0.65rem;" title="Fundamental zones |u|,|v|,|w| ≤ 1">≤1</button>
             <button id="btn-order-2" style="padding:2px 6px;font-size:0.65rem;" title="Include 2nd-order zones |u|,|v|,|w| ≤ 2">≤2</button>
@@ -3007,7 +3114,7 @@ def render_rainbow_html(
           <span>&gt;_ Terminal // Stdio</span>
           <span id="cell-summary" style="font-size:0.62rem;color:var(--accent-pink);">IDLE</span>
         </div>
-        <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [▶ 1. Reduce], [▶ 2. Solve], [▶ 3. Integrate], or [▶ 4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
+        <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
         <canvas id="canvas-hist" style="display:none;width:100%;height:40px;"></canvas>
       </div>
     </aside>
@@ -3023,15 +3130,15 @@ def render_rainbow_html(
         <span style="font-size:0.62rem;color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
         <div id="pipeline-stages" style="display:flex;align-items:center;gap:4px;"></div>
         <button id="btn-params-toggle" title="Configure unit cell, space group, and wavelength parameters for Solve/Integrate">
-          ⚙ Params
+          Params
         </button>
         <span id="galaxy-status-badge" style="font-size:0.62rem;font-family:var(--font-display);padding:2px 6px;border-radius:4px;border:1px solid #334155;color:var(--text-dim);">
-          ⚪ LOCAL
+          LOCAL
         </span>
         <button id="btn-galaxy-dispatch" style="display:none;">Run</button>
-        <button id="btn-ladder-prev" style="padding:2px 7px;font-size:0.66rem;">◀</button>
-        <button id="btn-ladder-play" class="active-btn" style="padding:2px 8px;font-size:0.66rem;">▶ Walk</button>
-        <button id="btn-ladder-next" style="padding:2px 7px;font-size:0.66rem;">▶</button>
+        <button id="btn-ladder-prev" style="padding:2px 7px;font-size:0.66rem;">&lt;</button>
+        <button id="btn-ladder-play" class="active-btn" style="padding:2px 8px;font-size:0.66rem;">Walk</button>
+        <button id="btn-ladder-next" style="padding:2px 7px;font-size:0.66rem;">&gt;</button>
       </div>
     </div>
     <div id="params-drawer" class="params-drawer">
@@ -3053,20 +3160,20 @@ def render_rainbow_html(
     <div style="width:min(620px,94vw);background:var(--bg-panel);border:1px solid var(--accent-cyan);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,0.75);padding:14px 16px;color:var(--text-main);font-size:0.76rem;">
       <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-color);padding-bottom:8px;margin-bottom:10px;">
         <div>
-          <strong style="font-family:var(--font-display);font-size:0.86rem;color:var(--accent-cyan);">⚛ LOAD NEUTRON DATA (SNS / HFIR → NDIP GALAXY)</strong>
+          <strong style="font-family:var(--font-display);font-size:0.86rem;color:var(--accent-cyan);">LOAD NEUTRON DATA (SNS / HFIR → NDIP GALAXY)</strong>
           <div style="font-size:0.66rem;color:var(--text-dim);margin-top:2px;">
             Uses NDIP <code>neutrons_load_data</code> permission pass-through; raw NeXus runs automatically trigger Step 1 (Reduce + Merge Images) into <code>merged.h5</code>.
           </div>
         </div>
-        <button id="btn-nd-close" style="padding:2px 8px;font-size:0.72rem;">✕</button>
+        <button id="btn-nd-close" style="padding:2px 8px;font-size:0.72rem;">X</button>
       </div>
 
       <div style="display:flex;gap:8px;margin-bottom:10px;">
         <button id="btn-nd-mode-ipts" class="active-btn" style="flex:1;padding:5px 8px;font-family:var(--font-display);font-size:0.7rem;">
-          🔢 IPTS + Run (or Run Range)
+          IPTS + Run (or Run Range)
         </button>
         <button id="btn-nd-mode-paths" style="flex:1;padding:5px 8px;font-family:var(--font-display);font-size:0.7rem;">
-          📁 Explicit File Path(s) (/HFIR, /SNS)
+          Explicit File Path(s) (/HFIR, /SNS)
         </button>
       </div>
 
@@ -3165,7 +3272,7 @@ def render_rainbow_html(
       <div style="display:flex;justify-content:flex-end;gap:8px;">
         <button id="btn-nd-cancel" style="padding:5px 12px;font-size:0.72rem;">Cancel</button>
         <button id="btn-nd-submit" class="active-btn" style="padding:5px 14px;font-size:0.72rem;font-family:var(--font-display);font-weight:700;">
-          ▶ Load Neutron Data &amp; Reduce to merged.h5
+          Load Neutron Data &amp; Reduce to merged.h5
         </button>
       </div>
     </div>
@@ -3372,11 +3479,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function syncProjectionUI() {{
     const isSph = state.projection === "spherical";
     const btn = document.getElementById("btn-proj-toggle");
-    btn.textContent = isSph ? "🌐 Sph" : "🥫 Cyl";
+    btn.textContent = isSph ? "Sph" : "Cyl";
     document.getElementById("val-proj").textContent = isSph ? "SPH" : "CYL";
     document.getElementById("detector-header-title").textContent = isSph
-      ? "🎯 SPHERICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs ELEVATION ψ [deg])"
-      : "🎯 CYLINDRICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs LAB HEIGHT Y [m])";
+      ? "SPHERICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs ELEVATION ψ [deg])"
+      : "CYLINDRICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs LAB HEIGHT Y [m])";
   }}
   syncProjectionUI();
 
@@ -3440,9 +3547,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const isDone = idx < state.currentPipelineIdx;
       const pill = document.createElement("button");
       pill.className = "stage-pill" + (isAct ? " stage-active" : (isDone ? " stage-done" : ""));
-      const icon = (state.runningStageIdx === idx) ? "⏳" : (isDone ? "✓" : "▶");
+      const prefix = (state.runningStageIdx === idx) ? "[...] " : "";
       pill.title = `Click to execute ${{st.name}} (${{(st.tool_ids || []).join(" + ")}}) → ${{st.artifact}}`;
-      pill.textContent = `${{icon}} ${{shortLabels[idx] || st.name}}`;
+      pill.textContent = `${{prefix}}${{shortLabels[idx] || st.name}}`;
       pill.addEventListener("click", () => {{
         selectPipelineStage(idx, true);
         executeWorkflowStage(idx);
@@ -3512,7 +3619,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.activeZones = new Set(step.active_zones);
     }}
     setStatusLine(
-      `[🪜 STEP ${{step.rung}}]`,
+      `[STEP ${{step.rung}}]`,
       `<strong style="color:var(--accent-gold);">${{step.stage}}</strong> — <span>${{step.description}}</span>`
     );
     renderZoneList();
@@ -4293,19 +4400,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (state.ladderTimer) {{
       clearInterval(state.ladderTimer);
       state.ladderTimer = null;
-      ev.currentTarget.textContent = "▶ WALK SOLVE STEPS";
+      ev.currentTarget.textContent = "WALK SOLVE STEPS";
       return;
     }}
     selectPipelineStage(1, false);
     selectLadderRung(0, false);
-    ev.currentTarget.textContent = "⏹ STOP";
+    ev.currentTarget.textContent = "STOP";
     state.ladderTimer = setInterval(() => {{
       if (state.currentRungIdx + 1 < LADDER.length) {{
         selectLadderRung(state.currentRungIdx + 1, false);
       }} else {{
         clearInterval(state.ladderTimer);
         state.ladderTimer = null;
-        document.getElementById("btn-ladder-play").textContent = "▶ WALK SOLVE STEPS";
+        document.getElementById("btn-ladder-play").textContent = "WALK SOLVE STEPS";
       }}
     }}, 1800);
   }});
@@ -4477,7 +4584,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         : (DATA.space_group || "P 1");
       setStatusLine(
         `[MERGED.H5]`,
-        `<strong style="color:var(--accent-cyan);">Merged detector stack loaded</strong> (${{(DATA.frames || []).length || 1}} frames • ${{cStr}}) — Pending step: <strong style="color:var(--accent-pink);">▶ 2. Solve (Lattice Ladder)</strong>.`
+        `<strong style="color:var(--accent-cyan);">Merged detector stack loaded</strong> (${{(DATA.frames || []).length || 1}} frames • ${{cStr}}) — Pending step: <strong style="color:var(--accent-pink);">2. Solve (Lattice Ladder)</strong>.`
       );
     }} else if (artKind === "integrator" || artKind === "predictor") {{
       const nEll = PEAKS.filter(p => Array.isArray(p.ellipse)).length;
@@ -4689,11 +4796,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
     }}
 
-    // Build panel outlines and 4 corners from detMap
+    // Build panel outlines and 4 corners from detMap (det.center is the (0,0) corner in subhkl Detector.pixel_to_lab)
     const panelsOut = [];
     const pixelToLab = (det, r, c) => {{
-      const u = ((det.m - 1 - c) / (det.m - 1) - 0.5) * det.width;
-      const v = ((r / (det.n - 1)) - 0.5) * det.height;
+      const u = (c / Math.max(1, det.m - 1)) * det.width;
+      const v = (r / Math.max(1, det.n - 1)) * det.height;
       return [
         det.center[0] + u * det.uhat[0] + v * det.vhat[0],
         det.center[1] + u * det.uhat[1] + v * det.vhat[1],
@@ -4918,14 +5025,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
       // 3. Fallback to forward-projection from solved U, B if no peaks were read above
       if (candPeaks.length === 0) {{
-      const dMin = 2.6;
-      const hMax = Math.min(18, Math.floor(cell[0] / dMin));
-      const kMax = Math.min(18, Math.floor(cell[1] / dMin));
+      const maxCell = Math.max(cell[0] || 68.7, cell[1] || 69.8, cell[2] || 156.9);
+      const minCell = Math.min(cell[0] || 68.7, cell[1] || 69.8, cell[2] || 156.9);
+      const dMin = maxCell < 35.0 ? Math.max(0.75, minCell * 0.085) : 2.6;
+      const hMax = Math.min(20, Math.floor(cell[0] / dMin));
+      const kMax = Math.min(20, Math.floor(cell[1] / dMin));
       const lMax = Math.min(28, Math.floor(cell[2] / dMin));
+      const sgClean = String(sg || "").trim().toUpperCase();
+      const isBodyCentered = sgClean.startsWith("I");
+      const isFaceCentered = sgClean.startsWith("F");
+      const isCCentered = sgClean.startsWith("C");
+      const geomHits = [];
       for (let h = -hMax; h <= hMax; h++) {{
         for (let k = -kMax; k <= kMax; k++) {{
           for (let l = -lMax; l <= lMax; l++) {{
             if (h === 0 && k === 0 && l === 0) continue;
+            if (isBodyCentered && ((h + k + l) & 1) !== 0) continue;
+            if (isFaceCentered && (((h + k) & 1) !== 0 || ((k + l) & 1) !== 0 || ((h + l) & 1) !== 0)) continue;
+            if (isCCentered && ((h + k) & 1) !== 0) continue;
             const G = mat3Vec(RUB, [h, k, l]);
             const qn = vecNorm(G);
             if (qn < 1e-8 || (1.0 / qn) < dMin) continue;
@@ -4935,6 +5052,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (lam < wlRangeNew[0] || lam > wlRangeNew[1]) continue;
             const kf = vecUnit([lam * G[0], lam * G[1], 1.0 + lam * G[2]]);
             for (const [bid, det] of detMap.entries()) {{
+              if (bankImgs.size > 0 && !bankImgs.has(bid)) continue;
               const nVec = vecCross(det.uhat, det.vhat);
               const denom = vecDot(kf, nVec);
               if (Math.abs(denom) <= 1e-6) continue;
@@ -4943,12 +5061,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               const pt = [kf[0]*tRay, kf[1]*tRay, kf[2]*tRay];
               const rel = [pt[0]-det.center[0], pt[1]-det.center[1], pt[2]-det.center[2]];
               const u = vecDot(rel, det.uhat), v = vecDot(rel, det.vhat);
-              if (Math.abs(u) > 0.49 * det.width || Math.abs(v) > 0.49 * det.height) continue;
-              const cPix = (det.m - 1) * (1.0 - (u / det.width + 0.5));
-              const rPix = (det.n - 1) * (v / det.height + 0.5);
-              let inten = 120.0, keep = true;
+              if (u < 0.02 * det.width || u > 0.98 * det.width || v < 0.02 * det.height || v > 0.98 * det.height) continue;
+              const cPix = (det.m - 1) * (u / det.width);
+              const rPix = (det.n - 1) * (v / det.height);
+              let inten = 120.0, snr = 10.0, hasImg = false;
               const bIm = bankImgs.get(bid);
               if (bIm) {{
+                hasImg = true;
                 const ri = Math.round(rPix), ci = Math.round(cPix);
                 let pkMax = 0, bgSum = 0, bgN = 0;
                 for (let dr = -9; dr <= 9; dr++) {{
@@ -4956,33 +5075,36 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                   for (let dc = -9; dc <= 9; dc++) {{
                     const cc = ci + dc; if (cc < 0 || cc >= bIm.W) continue;
                     const val = Number(bIm.data[rr * bIm.W + cc]);
-                    if (Math.abs(dr) <= 4 && Math.abs(dc) <= 4) {{ if (val > pkMax) pkMax = val; }}
+                    if (Math.abs(dr) <= 3 && Math.abs(dc) <= 3) {{ if (val > pkMax) pkMax = val; }}
                     bgSum += val; bgN++;
                   }}
                 }}
                 const bgMean = bgSum / Math.max(1, bgN);
-                const snr = (pkMax - bgMean) / Math.max(Math.sqrt(Math.max(bgMean, 1.0)), 1.0);
-                if (snr < 3.0) keep = false;
-                inten = pkMax;
+                snr = (pkMax - bgMean) / Math.max(Math.sqrt(Math.max(bgMean, 1.0)), 1.0);
+                inten = Math.max(pkMax, 1.0);
               }}
-              if (!keep) break;
-              const [az, dy, el] = labToCyl(pt);
-              const qLab = vecUnit([kf[0], kf[1], kf[2] - 1.0]);
-              const gCryst = mat3Vec(R_T, qLab);
-              const [sx, sy, hemi] = stereoProj(gCryst);
-              const dVal = 1.0 / qn;
-              candPeaks.push({{
-                bank: bid, row: Number(rPix.toFixed(1)), col: Number(cPix.toFixed(1)),
-                det_x: az, det_y: dy, det_el: el, q_hat: gCryst,
-                stereographic: [sx, sy], hemisphere: hemi, intensity: inten, sigma: 3.0,
-                wavelength: lam, d_spacing: dVal, harmonic_order: Math.max(1, gcd3(h, k, l)),
-                parallax_depth: Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * dVal))),
-                hkl: [h, k, l], zone_ids: [], indexed: true, angular_error_deg: 0.02,
-              }});
+              geomHits.push({{ bid, rPix, cPix, pt, kf, h, k, l, lam, qn, inten, snr, hasImg }});
               break;
             }}
           }}
         }}
+      }}
+      const strictSnr = geomHits.length > 400;
+      for (const gh of geomHits) {{
+        if (gh.hasImg && strictSnr && gh.snr < 3.0) continue;
+        const [az, dy, el] = labToCyl(gh.pt);
+        const qLab = vecUnit([gh.kf[0], gh.kf[1], gh.kf[2] - 1.0]);
+        const gCryst = mat3Vec(R_T, qLab);
+        const [sx, sy, hemi] = stereoProj(gCryst);
+        const dVal = 1.0 / gh.qn;
+        candPeaks.push({{
+          bank: gh.bid, row: Number(gh.rPix.toFixed(1)), col: Number(gh.cPix.toFixed(1)),
+          det_x: az, det_y: dy, det_el: el, q_hat: gCryst,
+          stereographic: [sx, sy], hemisphere: hemi, intensity: gh.inten, sigma: 3.0,
+          wavelength: gh.lam, d_spacing: dVal, harmonic_order: Math.max(1, gcd3(gh.h, gh.k, gh.l)),
+          parallax_depth: Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * dVal))),
+          hkl: [gh.h, gh.k, gh.l], zone_ids: [], indexed: true, angular_error_deg: 0.02,
+        }});
       }}
       }}
       candPeaks.sort((a, b) => b.intensity - a.intensity);
@@ -5098,20 +5220,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const optHeader = document.createElement("option");
     optHeader.value = "";
     optHeader.textContent = h5s.length > 0
-      ? `📂 Data Source (${{h5s.length}} in History)...`
-      : "📂 Data Source...";
+      ? `Data Source (${{h5s.length}} in History)...`
+      : "Data Source...";
     selGalaxyH5.appendChild(optHeader);
 
     const grpIngest = document.createElement("optgroup");
     grpIngest.label = "Ingest / Open Data";
     const optNeutron = document.createElement("option");
     optNeutron.value = "__action_neutron_data__";
-    optNeutron.textContent = "⚛ + Neutron data (SNS / HFIR)...";
+    optNeutron.textContent = "+ Neutron data (SNS / HFIR)...";
     grpIngest.appendChild(optNeutron);
 
     const optLocal = document.createElement("option");
     optLocal.value = "__action_local_file__";
-    optLocal.textContent = "💻 + From local computer...";
+    optLocal.textContent = "+ From local computer...";
     grpIngest.appendChild(optLocal);
     selGalaxyH5.appendChild(grpIngest);
 
@@ -5181,7 +5303,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
       statusBox.style.borderColor = "rgba(52,211,153,0.45)";
       msgEl.style.color = "#34d399";
-      msgEl.textContent = `✓ Ready to upload ${{pendingLocalNexusFiles.length}} local file(s)`;
+      msgEl.textContent = `Ready to upload ${{pendingLocalNexusFiles.length}} local file(s)`;
       if (sugBtn) sugBtn.style.display = "none";
       lastNdValidationResult = {{ ok: true }};
       return lastNdValidationResult;
@@ -5194,14 +5316,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (paths.length === 0) {{
       statusBox.style.borderColor = "rgba(248,113,113,0.45)";
       msgEl.style.color = "#f87171";
-      msgEl.textContent = "⚠️ Enter a valid IPTS number and run (or explicit file path).";
+      msgEl.textContent = "Enter a valid IPTS number and run (or explicit file path).";
       if (sugBtn) sugBtn.style.display = "none";
       lastNdValidationResult = {{ ok: false, message: msgEl.textContent }};
       return lastNdValidationResult;
     }}
     statusBox.style.borderColor = "rgba(56,189,248,0.45)";
     msgEl.style.color = "#38bdf8";
-    msgEl.textContent = `⏳ Verifying ${{paths.length}} run(s) via NDIP Load Neutron Data…`;
+    msgEl.textContent = `Verifying ${{paths.length}} run(s) via NDIP Load Neutron Data...`;
     if (sugBtn) sugBtn.style.display = "none";
     try {{
       const r = await fetch("api/pipeline/check_neutron_paths", {{
@@ -5222,12 +5344,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (res.ok) {{
         statusBox.style.borderColor = "rgba(52,211,153,0.5)";
         msgEl.style.color = "#34d399";
-        msgEl.textContent = res.message || `✓ Verified ${{res.existing?.length || paths.length}} file(s)`;
+        msgEl.textContent = res.message || `Verified ${{res.existing?.length || paths.length}} file(s)`;
         if (sugBtn) sugBtn.style.display = "none";
       }} else {{
         statusBox.style.borderColor = "rgba(248,113,113,0.6)";
         msgEl.style.color = "#f87171";
-        msgEl.textContent = `⚠️ ${{res.message || "File not found on /SNS or /HFIR"}}`;
+        msgEl.textContent = res.message || "File not found on /SNS or /HFIR";
         if (sugBtn && res.suggested_ipts) {{
           sugBtn.style.display = "inline-block";
           sugBtn.textContent = `Switch to IPTS-${{res.suggested_ipts}}`;
@@ -5269,7 +5391,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (statusBox) statusBox.style.borderColor = "rgba(52,211,153,0.5)";
       if (msgEl) {{
         msgEl.style.color = "#34d399";
-        msgEl.textContent = `✓ ${{pendingLocalNexusFiles.length}} local NeXus file(s) staged for upload`;
+        msgEl.textContent = `${{pendingLocalNexusFiles.length}} local NeXus file(s) staged for upload`;
       }}
       return;
     }}
@@ -5279,14 +5401,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (statusBox) statusBox.style.borderColor = "rgba(248,113,113,0.45)";
       if (msgEl) {{
         msgEl.style.color = "#f87171";
-        msgEl.textContent = "⚠️ Enter a valid IPTS number and run (or explicit file path).";
+        msgEl.textContent = "Enter a valid IPTS number and run (or explicit file path).";
       }}
     }} else {{
       if (paths.length === 1) {{
         prevEl.textContent = `Preview: ${{paths[0]}}`;
       }} else {{
         const lastBase = paths[paths.length - 1].split("/").pop();
-        prevEl.textContent = `Preview: ${{paths[0]}} … ${{lastBase}} (${{paths.length}} runs)`;
+        prevEl.textContent = `Preview: ${{paths[0]}} ... ${{lastBase}} (${{paths.length}} runs)`;
       }}
       if (statusBox) statusBox.style.borderColor = "rgba(56,189,248,0.25)";
       if (msgEl) {{
@@ -5377,6 +5499,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const s = document.getElementById(srcId), d = document.getElementById(dstId);
         if (s && d) d.value = s.value;
       }});
+      const cellA = parseFloat(document.getElementById("nd-a")?.value || "68.7");
+      const cellB = parseFloat(document.getElementById("nd-b")?.value || "69.8");
+      const cellC = parseFloat(document.getElementById("nd-c")?.value || "156.9");
+      const maxEdge = Math.max(cellA || 68.7, cellB || 69.8, cellC || 156.9);
+      const minEdge = Math.min(cellA || 68.7, cellB || 69.8, cellC || 156.9);
+      const inpDmin = document.getElementById("inp-dmin");
+      if (inpDmin && maxEdge < 35.0 && parseFloat(inpDmin.value || "2.8") >= 2.0) {{
+        inpDmin.value = Math.max(0.8, Math.round(minEdge * 0.085 * 100) / 100).toFixed(2);
+      }}
       const wlMinV = parseFloat(document.getElementById("nd-wl-min")?.value || "");
       const wlMaxV = parseFloat(document.getElementById("nd-wl-max")?.value || "");
       if (Number.isFinite(wlMinV) && Number.isFinite(wlMaxV)) {{
@@ -5446,7 +5577,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const isRawNexus = forceReduce || files.some(f => /\\.nxs(\\.h5)?$/i.test(f.name));
     try {{
       setStatusLine(
-        "[⏳ LOCAL HDF5]",
+        "[LOCAL HDF5]",
         isRawNexus
           ? `Opening ${{files.length}} raw NeXus file(s) and triggering <strong>1. Reduce + Merge Images</strong>...`
           : `Loading <strong>${{files.map(f => f.name).join(", ")}}</strong>...`
@@ -5525,7 +5656,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
       recomputeBoundsAndReload(newPayload);
     }} catch (err) {{
-      setStatusLine("[⚠️ LOCAL HDF5]", `<span style="color:#f87171;">Local HDF5 error: ${{err.message}}</span>`);
+      setStatusLine("[LOCAL HDF5]", `<span style="color:#f87171;">Local HDF5 error: ${{err.message}}</span>`);
     }}
   }}
 
@@ -5536,7 +5667,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     // If a raw NeXus file in Galaxy History is selected, automatically trigger Step 1 (Reduce + Merge Images)
     if (/\\.nxs(\\.h5)?$/i.test(dsName)) {{
       setStatusLine(
-        "[⏳ AUTO-REDUCE]",
+        "[AUTO-REDUCE]",
         `Raw NeXus dataset <strong>${{dsName}}</strong> selected — triggering <strong>Step 1 (Reduce + Merge Images)</strong>...`
       );
       selectPipelineStage(0, true);
@@ -5546,7 +5677,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
       return;
     }}
-    setStatusLine("[⏳ GALAXY HDF5]", `Loading dataset <strong>${{dsName || dsId}}</strong> from NDIP / Galaxy History...`);
+    setStatusLine("[GALAXY HDF5]", `Loading dataset <strong>${{dsName || dsId}}</strong> from NDIP / Galaxy History...`);
     try {{
       // 1. Prefer server-side HDF5 extraction via NOVA/HTTP backend (handles merged.h5, solve.h5, predictor.h5, integrated.h5 with ellipses & multi-frame)
       try {{
@@ -5584,7 +5715,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
       recomputeBoundsAndReload(newPayload);
     }} catch (err) {{
-      setStatusLine("[⚠️ GALAXY HDF5]", `<span style="color:#f87171;">Failed to load HDF5: ${{err.message}}</span>`);
+      setStatusLine("[GALAXY HDF5]", `<span style="color:#f87171;">Failed to load HDF5: ${{err.message}}</span>`);
     }}
   }}
 
@@ -5637,8 +5768,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           populateGalaxyH5Selector();
           if (elGalaxyBadge) {{
             elGalaxyBadge.textContent = doc.galaxy_connected
-              ? `🟢 NOVA → GALAXY (${{galaxyBridge.datasets.length}} H5s)`
-              : "🟡 NOVA LOCAL";
+              ? `NOVA → GALAXY (${{galaxyBridge.datasets.length}} H5s)`
+              : "NOVA LOCAL";
             elGalaxyBadge.style.borderColor = doc.galaxy_connected ? "#34d399" : "#fbbf24";
             elGalaxyBadge.style.color = doc.galaxy_connected ? "#34d399" : "#fbbf24";
           }}
@@ -5669,7 +5800,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           }}
           populateGalaxyH5Selector();
           if (elGalaxyBadge) {{
-            elGalaxyBadge.textContent = `🟢 GALAXY (${{galaxyBridge.datasets.length}} items)`;
+            elGalaxyBadge.textContent = `GALAXY (${{galaxyBridge.datasets.length}} items)`;
             elGalaxyBadge.style.borderColor = "#34d399";
             elGalaxyBadge.style.color = "#34d399";
           }}
@@ -5738,34 +5869,43 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
             if (cellSummary) cellSummary.textContent = `${{aj.mode === "galaxy" ? "PULSAR" : "SUBHKL"}} [${{(aj.state || "running").toUpperCase()}}]`;
-            const finishedOk = aj.state === "ok" || (aj.stdout && /Job [0-9a-f]+ finished \\(state=ok\\)/i.test(aj.stdout) && !!aj.error);
+            const finishedOk = aj.state === "ok";
             const finishedErr = aj.state === "error" || aj.state === "deleted" || aj.state === "paused" || (!finishedOk && !!aj.error);
             if (finishedOk || finishedErr) {{
               clearInterval(galaxyBridge.pollTimer);
               galaxyBridge.pollTimer = null;
               state.runningStageIdx = -1;
               renderPipeline();
-              if (cellSummary) cellSummary.textContent = finishedOk ? "DONE ✓" : "ERROR ✗";
+              if (cellSummary) cellSummary.textContent = finishedOk ? "DONE" : "ERROR";
               await probeGalaxyConnection();
               if (finishedOk) {{
+                const h5Outs = Array.isArray(aj.outputs)
+                  ? aj.outputs.filter(o => o && o.id && (!o.extension || o.extension === "h5" || o.extension === "hdf5"))
+                  : [];
+                if (selGalaxyH5 && h5Outs.length > 0) {{
+                  selGalaxyH5.value = h5Outs[0].id;
+                }}
                 let loadedOk = false;
-                if (aj.updated_payload_ready) {{
-                  try {{
-                    const pr = await fetch("api/payload", {{ cache: "no-store" }});
-                    if (pr.ok) {{
-                      const newPayload = await pr.json();
+                try {{
+                  const payloadUrl = aj.output_h5_path
+                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}`
+                    : "api/payload";
+                  const pr = await fetch(payloadUrl, {{ cache: "no-store" }});
+                  if (pr.ok) {{
+                    const newPayload = await pr.json();
+                    if (newPayload && (Array.isArray(newPayload.panels) || Array.isArray(newPayload.peaks))) {{
                       recomputeBoundsAndReload(newPayload);
                       loadedOk = true;
                       appendTerminalLog(
                         stageId === "reduce"
-                          ? "\\n✓ Loaded merged.h5 into viewport — Pending step: 2. Solve (Lattice Ladder)."
-                          : "\\n✓ Reloaded updated orientation & Bragg reflections into viewport."
+                          ? "\\nLoaded merged.h5 into viewport — Pending step: 2. Solve (Lattice Ladder)."
+                          : "\\nReloaded updated orientation, Laue zones, and Bragg reflections into viewport."
                       );
                     }}
-                  }} catch (_re) {{}}
-                }}
-                if (!loadedOk && Array.isArray(aj.outputs) && aj.outputs.length > 0 && aj.outputs[0].id) {{
-                  await loadFromGalaxyDatasetId(aj.outputs[0].id);
+                  }}
+                }} catch (_re) {{}}
+                if (!loadedOk && h5Outs.length > 0) {{
+                  await loadFromGalaxyDatasetId(h5Outs[0].id);
                 }}
               }} else if (aj.error) {{
                 appendTerminalLog(`\\n[error] ${{aj.error}}`);
@@ -5877,15 +6017,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               renderPipeline();
               if (jstate === "ok") {{
                 selectLadderRung(4, false);
-                if (cellSummary) cellSummary.textContent = "DONE ✓";
+                if (cellSummary) cellSummary.textContent = "DONE";
                 await probeGalaxyConnection();
                 const outs = (tres.outputs || []).filter(o => o.extension === "h5" || o.extension === "hdf5");
                 if (outs.length > 0) {{
-                  appendTerminalLog(`\\n✓ Loading output dataset ${{outs[0].id}} into viewport...`);
+                  appendTerminalLog(`\\nLoading output dataset ${{outs[0].id}} into viewport...`);
                   await loadFromGalaxyDatasetId(outs[0].id);
                 }}
               }} else {{
-                if (cellSummary) cellSummary.textContent = "ERROR ✗";
+                if (cellSummary) cellSummary.textContent = "ERROR";
               }}
             }}
           }} catch (_je) {{}}
@@ -6046,7 +6186,7 @@ def export_static_app_html(
                 "subtitle": "Finder-less Poisson deviance bins",
                 "active_zones": [],
                 "n_captured": 0,
-                "description": "Select a Galaxy History .h5 dataset (top bar) or click 📂 Load .h5 to inspect or dispatch a GPU solve.",
+                "description": "Select a Galaxy History .h5 dataset (top bar) or open a local .h5 to inspect or dispatch a GPU solve.",
             },
             {
                 "rung": 2,

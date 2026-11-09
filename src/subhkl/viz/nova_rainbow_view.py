@@ -17,6 +17,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import shutil
 import socketserver
 import tempfile
 import threading
@@ -374,6 +375,48 @@ class NovaGalaxyPipelineRunner:
             "status": "submitted",
         }
 
+    def _stamp_merged_metadata(self, h5_path: str, job_record: dict[str, Any]) -> None:
+        if not h5_path or not os.path.isfile(h5_path):
+            return
+        try:
+            import h5py
+            import numpy as np
+
+            params = job_record.get("params") or {}
+            inst_val = str(
+                job_record.get("instrument") or params.get("instrument") or ""
+            ).strip()
+            sg_val = str(params.get("space_group") or "").strip()
+            raw_cell = params.get("cell")
+            if not (isinstance(raw_cell, (list, tuple)) and len(raw_cell) == 6):
+                if all(k in params for k in ("a", "b", "c", "alpha", "beta", "gamma")):
+                    raw_cell = [
+                        float(params["a"]),
+                        float(params["b"]),
+                        float(params["c"]),
+                        float(params["alpha"]),
+                        float(params["beta"]),
+                        float(params["gamma"]),
+                    ]
+            with h5py.File(h5_path, "r+") as hf:
+                if inst_val and "instrument" not in hf:
+                    hf["instrument"] = np.bytes_(inst_val)
+                if sg_val and "space_group" not in hf:
+                    hf["space_group"] = np.bytes_(sg_val)
+                if (
+                    isinstance(raw_cell, (list, tuple))
+                    and len(raw_cell) == 6
+                    and "sample/a" not in hf
+                ):
+                    grp = hf.require_group("sample")
+                    for idx_c, k_c in enumerate(
+                        ("a", "b", "c", "alpha", "beta", "gamma")
+                    ):
+                        if k_c not in grp:
+                            grp[k_c] = float(raw_cell[idx_c])
+        except Exception:
+            pass
+
     def _ensure_galaxy_h5_dataset(
         self,
         store: Any,
@@ -427,6 +470,18 @@ class NovaGalaxyPipelineRunner:
         )
         ds_id = up_info["outputs"][0]["id"]
         gi.datasets.wait_for_dataset(ds_id, maxwait=180, interval=2.0, check=True)
+        try:
+            safe_name = "".join(
+                ch if (ch.isalnum() or ch in "._-") else "_"
+                for ch in os.path.basename(fname)
+            )
+            cache_dest = os.path.join(
+                tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}"
+            )
+            if os.path.isfile(local_path) and not os.path.exists(cache_dest):
+                shutil.copy2(local_path, cache_dest)
+        except Exception:
+            pass
         job_record["stdout"] += (
             f"[nova -> galaxy] Saved '{fname}' in Galaxy history (id={ds_id})\n"
         )
@@ -549,11 +604,19 @@ class NovaGalaxyPipelineRunner:
                 primary_tool = "imaginex_subhkl_predict"
                 scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
                 idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
+                max_edge = max(float(x) for x in raw_cell[:3])
+                min_edge = min(float(x) for x in raw_cell[:3])
+                d_min_req = float(params.get("d_min", 2.8))
+                d_min_int = (
+                    min(d_min_req, max(0.75, min_edge * 0.085))
+                    if max_edge < 35.0
+                    else d_min_req
+                )
                 tool_inputs = {
                     "scan": {"src": "hda", "id": scan_id},
                     "indexer": {"src": "hda", "id": idx_id},
                     "instrument": inst,
-                    "dMin": float(params.get("d_min", 2.8)),
+                    "dMin": round(d_min_int, 3),
                     "wavelengthMin": float(wl[0]),
                     "wavelengthMax": float(wl[1]),
                     "space": sg,
@@ -872,7 +935,7 @@ class NovaGalaxyPipelineRunner:
                                 except Exception:
                                     pass
                         msg = (
-                            f"✓ Verified {len(expanded)} run(s) via NDIP Load Neutron Data "
+                            f"Verified {len(expanded)} run(s) via NDIP Load Neutron Data "
                             f"({inst} IPTS-{ipts_raw or '?'})"
                         )
                         break
@@ -1167,7 +1230,15 @@ class NovaGalaxyPipelineRunner:
             and os.path.isfile(merged_path)
             and os.path.isfile(solve_path)
         ):
-            d_min_val = str(params.get("d_min", 2.8))
+            max_edge = max(float(x) for x in raw_cell[:3])
+            min_edge = min(float(x) for x in raw_cell[:3])
+            d_min_req = float(params.get("d_min", 2.8))
+            d_min_int = (
+                min(d_min_req, max(0.75, min_edge * 0.085))
+                if max_edge < 35.0
+                else d_min_req
+            )
+            d_min_val = str(round(d_min_int, 3))
             pred_cmd = [
                 "python",
                 "-u",
@@ -1396,6 +1467,7 @@ class NovaGalaxyPipelineRunner:
                         merged_dest = os.path.join(work_dir, merged_label)
                         merged_link = os.path.join(work_dir, "merged.h5")
                         try:
+                            self._stamp_merged_metadata(out_h5, job_record)
                             shutil.copy2(out_h5, merged_dest)
                             if os.path.abspath(merged_dest) != os.path.abspath(
                                 merged_link
@@ -1413,13 +1485,20 @@ class NovaGalaxyPipelineRunner:
                         if self.is_connected and os.path.isfile(final_h5):
                             try:
                                 store = self.get_datastore("IMAGINE-X SubHKL")
-                                self._ensure_galaxy_h5_dataset(
+                                up_id = self._ensure_galaxy_h5_dataset(
                                     store,
                                     final_h5,
                                     job_record,
                                     force_upload=True,
                                     file_ext="h5",
                                 )
+                                job_record["outputs"] = [
+                                    {
+                                        "id": up_id,
+                                        "name": os.path.basename(final_h5),
+                                        "extension": "h5",
+                                    }
+                                ]
                             except Exception as up_exc:
                                 job_record["stdout"] += (
                                     f"[nova -> galaxy] Warning uploading {merged_label}: {self._clean_err_msg(up_exc)}\n"
@@ -1444,13 +1523,20 @@ class NovaGalaxyPipelineRunner:
                         if self.is_connected and os.path.isfile(final_h5):
                             try:
                                 store = self.get_datastore("IMAGINE-X SubHKL")
-                                self._ensure_galaxy_h5_dataset(
+                                up_id = self._ensure_galaxy_h5_dataset(
                                     store,
                                     final_h5,
                                     job_record,
                                     force_upload=True,
                                     file_ext="h5",
                                 )
+                                job_record["outputs"] = [
+                                    {
+                                        "id": up_id,
+                                        "name": "solve.h5",
+                                        "extension": "h5",
+                                    }
+                                ]
                             except Exception as up_exc:
                                 job_record["stdout"] += (
                                     f"[nova -> galaxy] Warning uploading solve.h5: {self._clean_err_msg(up_exc)}\n"
@@ -1480,42 +1566,68 @@ class NovaGalaxyPipelineRunner:
                         if self.is_connected:
                             try:
                                 store = self.get_datastore("IMAGINE-X SubHKL")
-                                if os.path.isfile(pred_dest):
-                                    self._ensure_galaxy_h5_dataset(
-                                        store,
-                                        pred_dest,
-                                        job_record,
-                                        force_upload=True,
-                                        file_ext="h5",
-                                    )
+                                outs_up = []
                                 if os.path.isfile(final_h5):
-                                    self._ensure_galaxy_h5_dataset(
+                                    int_id = self._ensure_galaxy_h5_dataset(
                                         store,
                                         final_h5,
                                         job_record,
                                         force_upload=True,
                                         file_ext="h5",
                                     )
+                                    outs_up.append(
+                                        {
+                                            "id": int_id,
+                                            "name": "integrated.h5",
+                                            "extension": "h5",
+                                        }
+                                    )
+                                if os.path.isfile(pred_dest):
+                                    pred_id = self._ensure_galaxy_h5_dataset(
+                                        store,
+                                        pred_dest,
+                                        job_record,
+                                        force_upload=True,
+                                        file_ext="h5",
+                                    )
+                                    outs_up.append(
+                                        {
+                                            "id": pred_id,
+                                            "name": "predictor.h5",
+                                            "extension": "h5",
+                                        }
+                                    )
                                 if os.path.isfile(mtz_dest):
-                                    self._ensure_galaxy_h5_dataset(
+                                    mtz_id = self._ensure_galaxy_h5_dataset(
                                         store,
                                         mtz_dest,
                                         job_record,
                                         force_upload=True,
                                         file_ext="binary",
                                     )
+                                    outs_up.append(
+                                        {
+                                            "id": mtz_id,
+                                            "name": "reflections.mtz",
+                                            "extension": "binary",
+                                        }
+                                    )
+                                if outs_up:
+                                    job_record["outputs"] = outs_up
                             except Exception as up_exc:
                                 job_record["stdout"] += (
                                     f"[nova -> galaxy] Warning uploading integrated outputs: {self._clean_err_msg(up_exc)}\n"
                                 )
 
-                    job_record["state"] = "ok"
+                    if os.path.isfile(final_h5):
+                        job_record["output_h5_path"] = final_h5
+                        if callable(on_complete_h5):
+                            on_complete_h5(final_h5)
+                            job_record["updated_payload_ready"] = True
                     job_record["stdout"] += (
                         f"[subhkl] Stage '{stage_id}' completed (exit 0).\n"
                     )
-                    if os.path.isfile(final_h5) and callable(on_complete_h5):
-                        on_complete_h5(final_h5)
-                        job_record["updated_payload_ready"] = True
+                    job_record["state"] = "ok"
                 else:
                     job_record["state"] = "error"
                     job_record["stderr"] += (
@@ -1605,13 +1717,19 @@ class NovaGalaxyPipelineRunner:
                             job_record["ladder_rung_idx"] = (
                                 0 if job_record.get("stage_id") == "reduce" else 4
                             )
-                            job_record["stdout"] += (
-                                f"\n[galaxy -> pulsar] Job {job_id} finished (state=ok).\n"
-                            )
+                            if not final_step:
+                                job_record["stdout"] += (
+                                    f"\n[galaxy -> pulsar] Step job {job_id} finished.\n"
+                                )
                             h5_outs = [
                                 o
                                 for o in job_record.get("outputs", [])
-                                if o.get("extension") in ("h5", "hdf5")
+                                if o.get("extension")
+                                in ("h5", "hdf5", "data", "auto", "binary", None)
+                                and not str(o.get("name", ""))
+                                .lower()
+                                .endswith((".mtz", ".png", ".pdf", ".log"))
+                                and "mtz" not in str(o.get("name", "")).lower()
                             ]
                             mtz_outs = [
                                 o
@@ -1621,8 +1739,22 @@ class NovaGalaxyPipelineRunner:
                             ]
                             if h5_outs:
                                 ds_id = h5_outs[0]["id"]
+                                st_id = str(job_record.get("stage_id") or "")
+                                default_lbl = (
+                                    "merged.h5"
+                                    if st_id == "reduce"
+                                    else (
+                                        "solve.h5"
+                                        if st_id == "solve"
+                                        else (
+                                            "predictor.h5"
+                                            if (st_id == "integrate" and not final_step)
+                                            else "integrated.h5"
+                                        )
+                                    )
+                                )
                                 merged_label = str(
-                                    job_record.get("merged_label") or "merged.h5"
+                                    job_record.get("merged_label") or default_lbl
                                 )
                                 if (
                                     job_record.get("stage_id") == "reduce"
@@ -1666,7 +1798,7 @@ class NovaGalaxyPipelineRunner:
                                     f"subhkl_gx_{ds_id}_{merged_label}",
                                 )
                                 raw_bytes = None
-                                for attempt in range(4):
+                                for attempt in range(6):
                                     try:
                                         raw_bytes = self._api_request(
                                             "GET",
@@ -1677,9 +1809,9 @@ class NovaGalaxyPipelineRunner:
                                         if raw_bytes:
                                             break
                                     except Exception as dl_exc:
-                                        if attempt == 3:
+                                        if attempt == 5:
                                             raise dl_exc
-                                        time.sleep(2.0)
+                                    time.sleep(2.0)
                                 if raw_bytes:
                                     if target_path:
                                         with open(target_path, "wb") as f:
@@ -1773,13 +1905,21 @@ class NovaGalaxyPipelineRunner:
                                         pass
 
                                 if (
-                                    final_step
-                                    and tmp_path
+                                    tmp_path
                                     and os.path.isfile(tmp_path)
-                                    and callable(on_complete_h5)
+                                    and job_record.get("stage_id") == "reduce"
                                 ):
-                                    on_complete_h5(tmp_path)
-                                    job_record["updated_payload_ready"] = True
+                                    self._stamp_merged_metadata(tmp_path, job_record)
+                                    if os.path.isfile(cache_gx_path):
+                                        self._stamp_merged_metadata(
+                                            cache_gx_path, job_record
+                                        )
+
+                                if final_step and tmp_path and os.path.isfile(tmp_path):
+                                    job_record["output_h5_path"] = tmp_path
+                                    if callable(on_complete_h5):
+                                        on_complete_h5(tmp_path)
+                                        job_record["updated_payload_ready"] = True
                             if (
                                 final_step
                                 and mtz_outs
@@ -1808,6 +1948,9 @@ class NovaGalaxyPipelineRunner:
                             )
                         finally:
                             if final_step:
+                                job_record["stdout"] += (
+                                    f"\n[galaxy -> pulsar] Job {job_id} finished (state=ok).\n"
+                                )
                                 job_record["state"] = "ok"
                     else:
                         job_record["state"] = state
