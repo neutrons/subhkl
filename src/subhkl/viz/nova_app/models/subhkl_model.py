@@ -228,7 +228,10 @@ class SubhklGalaxyModel:
             images_h5=img_path,
             frame_index=self.frame_index,
         )
-        # Synchronize unit cell parameters from HDF5 if available
+        # Synchronize instrument and unit cell parameters from HDF5 if available
+        inst_str = str(self.payload.get("instrument") or "")
+        if inst_str in InstrumentOptions.__members__:
+            self.data.instrument = InstrumentOptions(inst_str)
         cell = self.payload.get("cell") or []
         if len(cell) == 6 and all(float(v) > 0 for v in cell):
             self.data.a = round(float(cell[0]), 3)

@@ -166,6 +166,7 @@ class NovaGalaxyPipelineRunner:
         *,
         api_key: str | None = None,
         raw: bool = False,
+        timeout: float | None = None,
     ) -> Any:
         if not self.galaxy_url:
             raise RuntimeError("GALAXY_URL is not configured.")
@@ -174,15 +175,16 @@ class NovaGalaxyPipelineRunner:
         url = f"{self.galaxy_url}{path}"
         if key:
             url = f"{url}{sep}key={urllib.parse.quote(key)}"
-        headers = {"Accept": "application/json"}
+        headers = {"Accept": "*/*" if raw else "application/json"}
         if key:
             headers["x-api-key"] = key
         data = None
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
+        req_timeout = timeout if timeout is not None else (180.0 if raw else 30.0)
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=15.0) as resp:
+        with urllib.request.urlopen(req, timeout=req_timeout) as resp:
             body = resp.read()
             if raw:
                 return body
@@ -404,14 +406,24 @@ class NovaGalaxyPipelineRunner:
                 f"[nova -> galaxy] Attached to Galaxy history_id={store.history_id} on {self.galaxy_url}\n"
             )
 
-            raw_cell = params.get("cell") or [
-                params.get("a", 68.7),
-                params.get("b", 69.8),
-                params.get("c", 156.9),
-                params.get("alpha", 90.0),
-                params.get("beta", 90.0),
-                params.get("gamma", 90.0),
-            ]
+            if all(k in params for k in ("a", "b", "c", "alpha", "beta", "gamma")):
+                raw_cell = [
+                    params["a"],
+                    params["b"],
+                    params["c"],
+                    params["alpha"],
+                    params["beta"],
+                    params["gamma"],
+                ]
+            else:
+                raw_cell = params.get("cell") or [
+                    params.get("a", 68.7),
+                    params.get("b", 69.8),
+                    params.get("c", 156.9),
+                    params.get("alpha", 90.0),
+                    params.get("beta", 90.0),
+                    params.get("gamma", 90.0),
+                ]
             if "wavelength_min" in params or "wavelength_max" in params:
                 wl = [
                     float(params.get("wavelength_min", 2.8)),
@@ -430,27 +442,37 @@ class NovaGalaxyPipelineRunner:
                     solve_path = cand_solve
 
             tool_inputs: dict[str, Any] = {}
-            if stage_id in ("solve", "integrate"):
-                if not self._has_tool_on_galaxy("imaginex_subhkl_solve"):
-                    if self._is_galaxy_server("http://127.0.0.1:9090"):
-                        from nova.galaxy import Connection
+            if stage_id in ("reduce", "solve", "integrate"):
+                required_tool = (
+                    "imaginex_subhkl_prepare_peaks"
+                    if stage_id == "reduce"
+                    else "imaginex_subhkl_solve"
+                )
+                if not self._has_tool_on_galaxy(required_tool):
+                    if (
+                        self.galaxy_url
+                        and "127.0.0.1" not in self.galaxy_url
+                        and "localhost" not in self.galaxy_url
+                    ):
+                        if self._is_galaxy_server("http://127.0.0.1:9090"):
+                            from nova.galaxy import Connection
 
-                        job_record["stdout"] += (
-                            f"[nova -> galaxy] 'imaginex_subhkl_solve' not yet merged on {self.galaxy_url}; "
-                            f"switching to local Galaxy instance http://127.0.0.1:9090 (GPU container runner)...\n"
+                            job_record["stdout"] += (
+                                f"[nova -> galaxy] '{required_tool}' not yet merged on {self.galaxy_url}; "
+                                f"switching to local Galaxy instance http://127.0.0.1:9090 (GPU container runner)...\n"
+                            )
+                            local_conn = Connection(galaxy_url="http://127.0.0.1:9090", galaxy_key="test_key")
+                            store = local_conn.connect().create_data_store("IMAGINE-X SubHKL")
+                            gi = store.nova_connection.galaxy_instance
+                            self.galaxy_url = "http://127.0.0.1:9090"
+                            self.api_key = gi.key
+                            self.history_id = store.history_id
+
+                    if not self._has_tool_on_galaxy(required_tool):
+                        raise RuntimeError(
+                            f"subhkl GPU tool '{required_tool}' not yet deployed on {self.galaxy_url} "
+                            f"(awaiting MR merge on ndip/galaxy-tools)"
                         )
-                        local_conn = Connection(galaxy_url="http://127.0.0.1:9090", galaxy_key="test_key")
-                        store = local_conn.connect().create_data_store("IMAGINE-X SubHKL")
-                        gi = store.nova_connection.galaxy_instance
-                        self.galaxy_url = "http://127.0.0.1:9090"
-                        self.api_key = gi.key
-                        self.history_id = store.history_id
-
-                if not self._has_tool_on_galaxy("imaginex_subhkl_solve"):
-                    raise RuntimeError(
-                        f"subhkl 0.2.0 GPU tools not yet deployed on {self.galaxy_url} "
-                        f"(awaiting MR merge on ndip/galaxy-tools)"
-                    )
 
             if stage_id == "solve":
                 primary_tool = "imaginex_subhkl_solve"
@@ -489,30 +511,19 @@ class NovaGalaxyPipelineRunner:
                     raise RuntimeError(
                         f"Using pre-merged scan {os.path.basename(merged_path)} (no raw *.nxs.h5 specified or in {work_dir})"
                     )
-                if self._has_tool_on_galaxy("neutrons_load_data") and params.get("ingest_mode") in (
-                    "oncat",
-                    "file",
-                    "ipts",
-                    "paths",
-                ):
-                    try:
-                        nld_inputs: dict[str, Any] = {
-                            "series_0|source_select": "file",
-                            "series_0|file_list": ",".join(raw_nxs),
+                missing_nxs = [p for p in raw_nxs if p.startswith("/") and not os.path.isfile(p)]
+                if missing_nxs:
+                    chk = self.check_neutron_paths(
+                        {
+                            "facility": params.get("facility", "SNS" if missing_nxs[0].startswith("/SNS/") else "HFIR"),
+                            "instrument": inst,
+                            "ipts": params.get("ipts", ""),
+                            "paths": raw_nxs,
                         }
-                        nld_res = gi.tools.run_tool(
-                            history_id=store.history_id,
-                            tool_id="neutrons_load_data",
-                            tool_inputs=nld_inputs,
-                        )
-                        nld_jid = (nld_res.get("jobs") or [{}])[0].get("id")
-                        job_record["stdout"] += (
-                            f"[galaxy -> ndip] Dispatched neutrons_load_data ({len(raw_nxs)} NeXus runs, job_id={nld_jid})\n"
-                        )
-                    except Exception as nld_exc:
-                        job_record["stdout"] += (
-                            f"[galaxy -> ndip] neutrons_load_data note: {self._clean_err_msg(nld_exc)}\n"
-                        )
+                    )
+                    raise FileNotFoundError(chk.get("message") or f"File not found: {missing_nxs[0]}")
+                job_record["raw_nxs"] = raw_nxs
+                job_record["instrument"] = inst
                 primary_tool = "imaginex_subhkl_prepare_peaks"
                 tool_inputs = {
                     "instrument": inst,
@@ -624,6 +635,115 @@ class NovaGalaxyPipelineRunner:
                 existing_job_record=job_record,
             )
 
+    def check_neutron_paths(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Validate NeXus / HDF5 file paths for the Load Neutron Data modal and suggest IPTS if mismatched."""
+        import glob as _glob
+        import re as _re
+
+        fac = str(body.get("facility") or "HFIR").strip()
+        inst = str(body.get("instrument") or "CG4D").strip()
+        ipts_raw = _re.sub(r"^IPTS-", "", str(body.get("ipts") or "").strip(), flags=_re.I)
+        raw_paths = body.get("paths") or []
+        if isinstance(raw_paths, str):
+            raw_paths = [s.strip() for s in raw_paths.replace("\n", ",").split(",") if s.strip()]
+
+        expanded: list[str] = []
+        for p in raw_paths:
+            p_str = str(p).strip()
+            if not p_str:
+                continue
+            if any(ch in p_str for ch in ("*", "?", "[")):
+                matches = sorted(_glob.glob(p_str))
+                if matches:
+                    expanded.extend(matches)
+                    continue
+            expanded.append(p_str)
+
+        existing = [p for p in expanded if os.path.isfile(p)]
+        missing = [p for p in expanded if not os.path.isfile(p)]
+        ipts_dir = f"/{fac}/{inst}/IPTS-{ipts_raw}" if ipts_raw else ""
+        ipts_exists = bool(ipts_dir and os.path.isdir(ipts_dir))
+
+        suggested_ipts: str | None = None
+        suggested_paths: list[str] = []
+        if missing:
+            # Try to locate the first missing run across /<facility>/<instrument>/IPTS-*/nexus/
+            first_missing_base = os.path.basename(missing[0])
+            candidates = sorted(_glob.glob(f"/{fac}/{inst}/IPTS-*/nexus/{first_missing_base}"))
+            if not candidates:
+                alt_fac = "SNS" if fac == "HFIR" else "HFIR"
+                candidates = sorted(_glob.glob(f"/{alt_fac}/{inst}/IPTS-*/nexus/{first_missing_base}"))
+            if candidates:
+                m_ipts = _re.search(r"/IPTS-([^/]+)/", candidates[0])
+                if m_ipts:
+                    suggested_ipts = m_ipts.group(1)
+                    sug_fac = "SNS" if candidates[0].startswith("/SNS/") else "HFIR"
+                    for p in expanded:
+                        bn = os.path.basename(p)
+                        sp = f"/{sug_fac}/{inst}/IPTS-{suggested_ipts}/nexus/{bn}"
+                        if os.path.isfile(sp):
+                            suggested_paths.append(sp)
+
+        sample_title = ""
+        sample_goniometer = ""
+        probe_file = existing[0] if existing else (suggested_paths[0] if suggested_paths else None)
+        if probe_file and os.path.isfile(probe_file):
+            try:
+                import h5py
+                from subhkl.instrument.goniometer import (
+                    _read_nexus_title,
+                    get_rotation_data_from_nexus,
+                )
+
+                with h5py.File(probe_file, "r") as f:
+                    sample_title = _read_nexus_title(f).strip()
+                _, angs, nms = get_rotation_data_from_nexus(probe_file, inst)
+                seen_m: set[str] = set()
+                parts_g: list[str] = []
+                for nm, ang in zip(nms, angs):
+                    short_m = nm.split(":")[-1]
+                    if short_m not in seen_m:
+                        seen_m.add(short_m)
+                        parts_g.append(f"{short_m}={ang:.1f}°")
+                sample_goniometer = " ".join(parts_g)
+            except Exception:
+                pass
+
+        ok = len(existing) > 0 and len(missing) == 0
+        if ok:
+            msg = f"✓ Verified {len(existing)} file(s)"
+            if sample_title:
+                msg += f' · "{sample_title}"'
+            if sample_goniometer:
+                msg += f" ({sample_goniometer})"
+        elif suggested_ipts:
+            msg = (
+                f"Not found in IPTS-{ipts_raw or '?'} — "
+                f"found {len(suggested_paths)}/{len(expanded)} run(s) in IPTS-{suggested_ipts}"
+            )
+            if sample_title:
+                msg += f' ("{sample_title}")'
+        elif ipts_raw and not ipts_exists:
+            msg = f"Directory /{fac}/{inst}/IPTS-{ipts_raw} does not exist"
+        elif missing:
+            msg = f"File not found: {missing[0]}" + (
+                f" (+{len(missing) - 1} more)" if len(missing) > 1 else ""
+            )
+        else:
+            msg = "No NeXus / HDF5 file paths specified"
+
+        return {
+            "ok": ok,
+            "existing": existing,
+            "missing": missing,
+            "ipts_exists": ipts_exists,
+            "suggested_ipts": suggested_ipts,
+            "suggested_paths": suggested_paths,
+            "sample_title": sample_title,
+            "sample_goniometer": sample_goniometer,
+            "message": msg,
+        }
+
     def _resolve_raw_nexus_inputs(self, params: dict[str, Any], work_dir: str) -> list[str]:
         """Resolve raw .nxs.h5 paths from explicit nexus_files, galaxy_dataset_id, IPTS+runs, or work_dir."""
         import glob as _glob
@@ -674,14 +794,24 @@ class NovaGalaxyPipelineRunner:
         import subprocess
         import sys
 
-        raw_cell = params.get("cell") or [
-            params.get("a", 68.7),
-            params.get("b", 69.8),
-            params.get("c", 156.9),
-            params.get("alpha", 90.0),
-            params.get("beta", 90.0),
-            params.get("gamma", 90.0),
-        ]
+        if all(k in params for k in ("a", "b", "c", "alpha", "beta", "gamma")):
+            raw_cell = [
+                params["a"],
+                params["b"],
+                params["c"],
+                params["alpha"],
+                params["beta"],
+                params["gamma"],
+            ]
+        else:
+            raw_cell = params.get("cell") or [
+                params.get("a", 68.7),
+                params.get("b", 69.8),
+                params.get("c", 156.9),
+                params.get("alpha", 90.0),
+                params.get("beta", 90.0),
+                params.get("gamma", 90.0),
+            ]
         cell_str = ",".join(str(float(x)) for x in raw_cell[:6])
         if "wavelength_min" in params or "wavelength_max" in params:
             wl = [
@@ -1147,8 +1277,10 @@ class NovaGalaxyPipelineRunner:
         if not job_id:
             return
         step_counter = 0
+        poll_errors = 0
         base_log = job_record.get("stdout", "")
         seen_pulsar_dirs: set[str] = set()
+        latest_pulsar_dir: str | None = None
         for droot in ("/data/staging_test", "/data/staging"):
             if os.path.isdir(droot):
                 try:
@@ -1172,6 +1304,7 @@ class NovaGalaxyPipelineRunner:
                                     continue
                                 if full_dir not in seen_pulsar_dirs:
                                     seen_pulsar_dirs.add(full_dir)
+                                    latest_pulsar_dir = full_dir
                                     pid_path = os.path.join(full_dir, "pid")
                                     ctr_path = os.path.join(
                                         full_dir, "metadata", "__instrument_core_container"
@@ -1201,6 +1334,7 @@ class NovaGalaxyPipelineRunner:
 
                 # 2. Fetch job status & live Pulsar console_output stream from NDIP Galaxy
                 jinfo = self._api_request("GET", f"/api/jobs/{job_id}?full=true")
+                poll_errors = 0
                 state = jinfo.get("state", "running")
                 if state != "ok":
                     job_record["state"] = state
@@ -1248,67 +1382,165 @@ class NovaGalaxyPipelineRunner:
                     job_record["ladder_rung_idx"] = step_counter
                 if state in ("ok", "error", "deleted", "paused"):
                     if state == "ok":
-                        job_record["ladder_rung_idx"] = (
-                            0 if job_record.get("stage_id") == "reduce" else 4
-                        )
-                        job_record["stdout"] += (
-                            f"\n[galaxy -> pulsar] Job {job_id} finished (state=ok).\n"
-                        )
-                        h5_outs = [
-                            o
-                            for o in job_record.get("outputs", [])
-                            if o.get("extension") in ("h5", "hdf5")
-                        ]
-                        mtz_outs = [
-                            o
-                            for o in job_record.get("outputs", [])
-                            if o.get("extension") == "mtz"
-                            or "mtz" in str(o.get("name", "")).lower()
-                        ]
-                        if h5_outs:
-                            ds_id = h5_outs[0]["id"]
-                            raw_bytes = self._api_request(
-                                "GET", f"/api/datasets/{ds_id}/display", raw=True
+                        try:
+                            job_record["ladder_rung_idx"] = (
+                                0 if job_record.get("stage_id") == "reduce" else 4
                             )
-                            target_path = None
-                            if work_dir and os.path.isdir(work_dir):
-                                if not final_step and job_record.get("stage_id") == "integrate":
-                                    target_path = os.path.join(work_dir, "predictor.h5")
-                                elif job_record.get("stage_id") == "integrate":
-                                    target_path = os.path.join(work_dir, "integrated.h5")
-                                elif job_record.get("stage_id") == "solve":
-                                    target_path = os.path.join(work_dir, "solve.h5")
-                                elif job_record.get("stage_id") == "reduce":
-                                    target_path = os.path.join(work_dir, "merged.h5")
-                            if target_path:
-                                with open(target_path, "wb") as f:
-                                    f.write(raw_bytes)
-                                tmp_path = target_path
-                                job_record["stdout"] += f"[subhkl] Saved {os.path.basename(target_path)} -> {target_path}\n"
-                            else:
-                                fd, tmp_path = tempfile.mkstemp(suffix=".h5", prefix="galaxy_solve_")
-                                with os.fdopen(fd, "wb") as f:
-                                    f.write(raw_bytes)
-                            if final_step and callable(on_complete_h5):
-                                on_complete_h5(tmp_path)
-                                job_record["updated_payload_ready"] = True
-                        if final_step and mtz_outs and work_dir and os.path.isdir(work_dir):
-                            try:
-                                mtz_id = mtz_outs[0]["id"]
-                                mtz_bytes = self._api_request(
-                                    "GET", f"/api/datasets/{mtz_id}/display", raw=True
-                                )
-                                mtz_dest = os.path.join(work_dir, "reflections.mtz")
-                                with open(mtz_dest, "wb") as f:
-                                    f.write(mtz_bytes)
-                                job_record["stdout"] += f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
-                            except Exception:
-                                pass
-                        if final_step:
-                            job_record["state"] = "ok"
+                            job_record["stdout"] += (
+                                f"\n[galaxy -> pulsar] Job {job_id} finished (state=ok).\n"
+                            )
+                            h5_outs = [
+                                o
+                                for o in job_record.get("outputs", [])
+                                if o.get("extension") in ("h5", "hdf5")
+                            ]
+                            mtz_outs = [
+                                o
+                                for o in job_record.get("outputs", [])
+                                if o.get("extension") == "mtz"
+                                or "mtz" in str(o.get("name", "")).lower()
+                            ]
+                            if h5_outs:
+                                ds_id = h5_outs[0]["id"]
+                                target_path = None
+                                if work_dir and os.path.isdir(work_dir):
+                                    if not final_step and job_record.get("stage_id") == "integrate":
+                                        target_path = os.path.join(work_dir, "predictor.h5")
+                                    elif job_record.get("stage_id") == "integrate":
+                                        target_path = os.path.join(work_dir, "integrated.h5")
+                                    elif job_record.get("stage_id") == "solve":
+                                        target_path = os.path.join(work_dir, "solve.h5")
+                                    elif job_record.get("stage_id") == "reduce":
+                                        target_path = os.path.join(work_dir, "merged.h5")
+
+                                # Check if Pulsar staging still has the output file locally before downloading over HTTPS
+                                local_staged_h5 = None
+                                if latest_pulsar_dir and os.path.isdir(latest_pulsar_dir):
+                                    for rel_cand in (
+                                        "working/out/scan_master.h5",
+                                        "working/out/solve.h5",
+                                        "working/out/peak_predictor.h5",
+                                        "working/out/integrated.h5",
+                                    ):
+                                        cand_p = os.path.join(latest_pulsar_dir, rel_cand)
+                                        if os.path.isfile(cand_p) and os.path.getsize(cand_p) > 0:
+                                            local_staged_h5 = cand_p
+                                            break
+
+                                tmp_path = None
+                                if local_staged_h5:
+                                    import shutil as _shutil
+
+                                    if target_path:
+                                        _shutil.copyfile(local_staged_h5, target_path)
+                                        tmp_path = target_path
+                                        job_record["stdout"] += f"[subhkl] Saved {os.path.basename(target_path)} -> {target_path}\n"
+                                    else:
+                                        fd, tmp_path = tempfile.mkstemp(suffix=".h5", prefix="galaxy_solve_")
+                                        os.close(fd)
+                                        _shutil.copyfile(local_staged_h5, tmp_path)
+                                else:
+                                    raw_bytes = None
+                                    for attempt in range(3):
+                                        try:
+                                            raw_bytes = self._api_request(
+                                                "GET",
+                                                f"/api/datasets/{ds_id}/display",
+                                                raw=True,
+                                                timeout=180.0,
+                                            )
+                                            if raw_bytes:
+                                                break
+                                        except Exception as dl_exc:
+                                            if attempt == 2:
+                                                raise dl_exc
+                                            time.sleep(2.0)
+                                    if raw_bytes:
+                                        if target_path:
+                                            with open(target_path, "wb") as f:
+                                                f.write(raw_bytes)
+                                            tmp_path = target_path
+                                            job_record["stdout"] += f"[subhkl] Saved {os.path.basename(target_path)} -> {target_path}\n"
+                                        else:
+                                            fd, tmp_path = tempfile.mkstemp(suffix=".h5", prefix="galaxy_solve_")
+                                            with os.fdopen(fd, "wb") as f:
+                                                f.write(raw_bytes)
+
+                                # If reduce ran inside a container without CG4D title goniometer fallback, patch angles in merged.h5
+                                if (
+                                    tmp_path
+                                    and os.path.isfile(tmp_path)
+                                    and job_record.get("stage_id") == "reduce"
+                                    and job_record.get("raw_nxs")
+                                ):
+                                    try:
+                                        import h5py
+                                        import numpy as np
+                                        from subhkl.instrument.goniometer import get_rotation_data_from_nexus
+
+                                        raw_nxs_list = job_record["raw_nxs"]
+                                        inst_name = str(job_record.get("instrument") or "CG4D")
+                                        with h5py.File(tmp_path, "r+") as hf:
+                                            if "goniometer/angles" in hf:
+                                                cur_ang = np.asarray(hf["goniometer/angles"][()])
+                                                if np.allclose(cur_ang, 0.0):
+                                                    new_axes, new_angles, new_names = [], [], []
+                                                    for nxs_f in raw_nxs_list:
+                                                        if os.path.isfile(nxs_f):
+                                                            ax, ang, nms = get_rotation_data_from_nexus(nxs_f, inst_name)
+                                                            new_axes.append(ax)
+                                                            new_angles.append(ang)
+                                                            new_names.append(nms)
+                                                    if new_angles and not np.allclose(new_angles, 0.0):
+                                                        del hf["goniometer/angles"]
+                                                        hf["goniometer/angles"] = np.asarray(new_angles, dtype=np.float64)
+                                                        if "goniometer/axes" in hf:
+                                                            del hf["goniometer/axes"]
+                                                        hf["goniometer/axes"] = np.asarray(new_axes, dtype=np.float64)
+                                                        if "goniometer/names" in hf:
+                                                            del hf["goniometer/names"]
+                                                        hf["goniometer/names"] = np.asarray(new_names, dtype="S")
+                                                        job_record["stdout"] += (
+                                                            f"[subhkl] Patched goniometer angles from NeXus title into {os.path.basename(tmp_path)}\n"
+                                                        )
+                                    except Exception:
+                                        pass
+
+                                if final_step and tmp_path and os.path.isfile(tmp_path) and callable(on_complete_h5):
+                                    on_complete_h5(tmp_path)
+                                    job_record["updated_payload_ready"] = True
+                            if final_step and mtz_outs and work_dir and os.path.isdir(work_dir):
+                                try:
+                                    mtz_id = mtz_outs[0]["id"]
+                                    mtz_bytes = self._api_request(
+                                        "GET",
+                                        f"/api/datasets/{mtz_id}/display",
+                                        raw=True,
+                                        timeout=180.0,
+                                    )
+                                    mtz_dest = os.path.join(work_dir, "reflections.mtz")
+                                    with open(mtz_dest, "wb") as f:
+                                        f.write(mtz_bytes)
+                                    job_record["stdout"] += f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
+                                except Exception:
+                                    pass
+                        except Exception as post_exc:
+                            job_record["stdout"] += (
+                                f"[nova -> galaxy] Warning fetching job output: {self._clean_err_msg(post_exc)}\n"
+                            )
+                        finally:
+                            if final_step:
+                                job_record["state"] = "ok"
+                    else:
+                        job_record["state"] = state
                     break
             except Exception as exc:
+                poll_errors += 1
+                if poll_errors < 5:
+                    continue
                 job_record["error"] = str(exc)
+                if job_record.get("state") in ("queued", "running", None):
+                    job_record["state"] = "error"
                 break
 
     def run_stage(
@@ -1617,6 +1849,24 @@ def serve_rainbow_zones(
             if ep_path and req_path.startswith(ep_path):
                 req_path = req_path[len(ep_path) :] or "/"
 
+            if req_path == "/api/pipeline/check_neutron_paths":
+                content_len = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                try:
+                    req_json = json.loads(raw_body.decode("utf-8") or "{}")
+                    result = vm.pipeline_runner.check_neutron_paths(req_json)
+                    code = 200
+                except Exception as exc:
+                    result = {"ok": False, "error": str(exc), "message": str(exc)}
+                    code = 400
+                body = json.dumps(result).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if req_path == "/api/pipeline/run":
                 content_len = int(self.headers.get("Content-Length", "0") or 0)
                 raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
@@ -1626,7 +1876,16 @@ def serve_rainbow_zones(
                     params = dict(req_json.get("params") or {})
                     params.setdefault("instrument", vm.payload.get("instrument", "CG4D"))
                     params.setdefault("space_group", vm.payload.get("space_group", "P 1"))
-                    if vm.payload.get("cell"):
+                    if all(k in params for k in ("a", "b", "c", "alpha", "beta", "gamma")):
+                        params["cell"] = [
+                            float(params["a"]),
+                            float(params["b"]),
+                            float(params["c"]),
+                            float(params["alpha"]),
+                            float(params["beta"]),
+                            float(params["gamma"]),
+                        ]
+                    elif vm.payload.get("cell"):
                         params.setdefault("cell", vm.payload.get("cell"))
                     if vm.payload.get("wavelength_range"):
                         params.setdefault("wavelength_range", vm.payload.get("wavelength_range"))

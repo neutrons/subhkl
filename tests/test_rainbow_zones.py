@@ -563,6 +563,44 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     assert len(p_merged["frames"]) == 2
     assert "ω=110" in p_merged["goniometer_summary"]
 
+    # 4. Verify check_neutron_paths catches wrong IPTS and suggests the right IPTS
+    import os
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+
+    runner = NovaGalaxyPipelineRunner(galaxy_url="")
+    chk_ok = runner.check_neutron_paths(
+        {
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "37331",
+            "paths": [str(raw_nxs)],
+        }
+    )
+    assert chk_ok["ok"] is True
+    assert "Beta-Lac crystal" in chk_ok["sample_title"]
+
+    chk_missing = runner.check_neutron_paths(
+        {
+            "facility": "SNS",
+            "instrument": "MANDI",
+            "ipts": "99999",
+            "paths": [str(tmp_path / "nonexistent_run.nxs.h5")],
+        }
+    )
+    assert chk_missing["ok"] is False
+    if os.path.isfile("/SNS/MANDI/IPTS-34720/nexus/MANDI_12737.nxs.h5"):
+        chk_mandi = runner.check_neutron_paths(
+            {
+                "facility": "SNS",
+                "instrument": "MANDI",
+                "ipts": "37331",
+                "paths": ["/SNS/MANDI/IPTS-37331/nexus/MANDI_12737.nxs.h5"],
+            }
+        )
+        assert chk_mandi["ok"] is False
+        assert chk_mandi["suggested_ipts"] == "34720"
+
+
 
 
 

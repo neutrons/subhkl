@@ -148,9 +148,14 @@ class MainApp:
             data = self.view_model.model.subhkl.data
             params.setdefault("instrument", data.instrument.value)
             params.setdefault("space_group", data.space_group)
-            params.setdefault(
-                "cell", [data.a, data.b, data.c, data.alpha, data.beta, data.gamma]
-            )
+            params["cell"] = [
+                float(params.get("a", data.a)),
+                float(params.get("b", data.b)),
+                float(params.get("c", data.c)),
+                float(params.get("alpha", data.alpha)),
+                float(params.get("beta", data.beta)),
+                float(params.get("gamma", data.gamma)),
+            ]
             wl_min = float(params.get("wavelength_min", data.wavelength_min))
             wl_max = float(params.get("wavelength_max", data.wavelength_max))
             params["wavelength_range"] = [wl_min, wl_max]
@@ -161,7 +166,14 @@ class MainApp:
             params.setdefault("images_file", data.images_file)
 
             def _on_complete(new_h5_path: str) -> None:
+                from subhkl.viz.nova_app.models.subhkl_model import InstrumentOptions
+
                 try:
+                    if (
+                        "instrument" in params
+                        and str(params["instrument"]) in InstrumentOptions.__members__
+                    ):
+                        data.instrument = InstrumentOptions(str(params["instrument"]))
                     for attr in ("a", "b", "c", "alpha", "beta", "gamma"):
                         if attr in params:
                             setattr(data, attr, float(params[attr]))
@@ -177,6 +189,7 @@ class MainApp:
                     stage_id == "reduce"
                     or "merged" in os.path.basename(new_h5_path).lower()
                 ):
+                    self.view_model.model.subhkl.frame_index = 0
                     self.view_model.model.subhkl.data.images_file = new_h5_path
                     self.view_model.model.subhkl.data.peaks_file = new_h5_path
                 else:
@@ -234,6 +247,14 @@ class MainApp:
                     {"status": "error", "error": str(exc)}, status=400
                 )
 
+        async def handle_check_neutron_paths(request: web.Request) -> web.Response:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            res = self.pipeline_runner.check_neutron_paths(body)
+            return web.json_response(res)
+
         app.add_routes(
             [
                 web.get("/api/pipeline/status", handle_status),
@@ -241,6 +262,7 @@ class MainApp:
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
                 web.post("/api/pipeline/upload_h5", handle_upload_h5),
+                web.post("/api/pipeline/check_neutron_paths", handle_check_neutron_paths),
                 web.get("/subhkl_parallax.html", handle_standalone_html),
             ]
         )

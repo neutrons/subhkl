@@ -481,6 +481,25 @@ def _extract_from_h5(
         elif B is not None:
             cell = list(_cell_from_B(B))
 
+        # Auto-detect instrument from embedded file paths or bank count when loading merged/scan HDF5
+        explicit_h5_inst = _decode_str(f.attrs.get("instrument"), "").strip()
+        for cand_f_list in (
+            (list(f["files"][()]) if "files" in f else []),
+        ):
+            for fn_item in cand_f_list:
+                fn_s = _decode_str(fn_item, "").upper()
+                for known_inst in ("MANDI", "TOPAZ", "IMAGINE", "CG4D"):
+                    if known_inst in fn_s:
+                        instrument = known_inst
+                        break
+        if not explicit_h5_inst and instrument == "CG4D" and "detector_calibration" not in f:
+            for b_key in ("bank_ids", "peaks/bank", "bank"):
+                if b_key in f:
+                    b_arr_chk = np.asarray(f[b_key][()], dtype=int)
+                    if len(np.unique(b_arr_chk)) > 8:
+                        instrument = "MANDI"
+                        break
+
         detectors = _load_detectors_from_h5(f, instrument)
 
         bank = (
@@ -2986,82 +3005,92 @@ def render_rainbow_html(
         </button>
       </div>
 
-      <div id="nd-pane-ipts" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px;">
-        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);">
+      <div id="nd-pane-ipts" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:10px;">
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);min-width:0;">
           FACILITY
-          <select id="nd-facility" style="background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
+          <select id="nd-facility" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
             <option value="HFIR" selected>HFIR</option>
             <option value="SNS">SNS</option>
           </select>
         </label>
-        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);">
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);min-width:0;">
           INSTRUMENT
-          <select id="nd-instrument" style="background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
+          <select id="nd-instrument" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
             <option value="CG4D" selected>CG4D (IMAGINE-X)</option>
             <option value="IMAGINE">IMAGINE (HFIR)</option>
             <option value="MANDI">MANDI (SNS)</option>
             <option value="TOPAZ">TOPAZ (SNS)</option>
           </select>
         </label>
-        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);">
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);min-width:0;">
           IPTS NUMBER
-          <input id="nd-ipts" type="text" value="37331" placeholder="e.g. 37331" style="background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          <input id="nd-ipts" type="text" value="37331" placeholder="e.g. 37331" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
         </label>
-        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);">
+        <label style="display:flex;flex-direction:column;gap:3px;font-size:0.66rem;color:var(--text-dim);min-width:0;">
           RUN OR RANGE
-          <input id="nd-runs" type="text" value="2625-2638" placeholder="e.g. 2625-2638" style="background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          <input id="nd-runs" type="text" value="2625-2638" placeholder="e.g. 2625-2638" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
         </label>
       </div>
 
       <div id="nd-pane-paths" style="display:none;margin-bottom:10px;">
         <label style="display:flex;flex-direction:column;gap:4px;font-size:0.66rem;color:var(--text-dim);">
           EXPLICIT NEXUS OR HDF5 PATH(S) ON /HFIR OR /SNS (ONE PER LINE, COMMA-SEPARATED, OR WILDCARD GLOB)
-          <textarea id="nd-filepaths" rows="3" placeholder="/HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5&#10;/HFIR/CG4D/IPTS-37331/nexus/CG4D_2626.nxs.h5" style="width:100%;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:6px;font-family:var(--font-display);font-size:0.7rem;resize:vertical;"></textarea>
+          <textarea id="nd-filepaths" rows="3" placeholder="/HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5&#10;/HFIR/CG4D/IPTS-37331/nexus/CG4D_2626.nxs.h5" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:6px;font-family:var(--font-display);font-size:0.7rem;resize:vertical;"></textarea>
         </label>
       </div>
 
       <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;padding:8px 10px;margin-bottom:10px;">
         <div style="font-family:var(--font-display);font-size:0.66rem;color:var(--accent-gold);margin-bottom:6px;">
-          SAMPLE UNIT CELL, SPACE GROUP & WAVELENGTH BAND (REQUIRED FOR STEP 1 MERGE-IMAGES)
+          SAMPLE UNIT CELL (LENGTHS &amp; ANGLES), SPACE GROUP &amp; WAVELENGTH BAND
         </div>
-        <div style="display:grid;grid-template-columns:1.3fr repeat(6,1fr);gap:6px;margin-bottom:6px;">
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+        <!-- Row 1: Space group + Unit cell lengths a, b, c -->
+        <div style="display:grid;grid-template-columns:1.3fr repeat(3,minmax(0,1fr));gap:8px;margin-bottom:6px;">
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             SPACE GROUP
-            <input id="nd-sg" type="text" value="{sg}" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+            <input id="nd-sg" type="text" value="{sg}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             a (Å)
-            <input id="nd-a" type="number" step="0.01" value="69.07" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+            <input id="nd-a" type="number" step="0.01" value="69.07" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             b (Å)
-            <input id="nd-b" type="number" step="0.01" value="98.00" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+            <input id="nd-b" type="number" step="0.01" value="98.00" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             c (Å)
-            <input id="nd-c" type="number" step="0.01" value="90.92" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
-            α (°)
-            <input id="nd-alpha" type="number" step="0.01" value="90.07" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
-            β (°)
-            <input id="nd-beta" type="number" step="0.01" value="106.14" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);">
-            γ (°)
-            <input id="nd-gamma" type="number" step="0.01" value="90.01" style="background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
+            <input id="nd-c" type="number" step="0.01" value="90.92" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
-        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
-          <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
-            Preview: /HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5 … CG4D_2638.nxs.h5 (14 runs)
-          </div>
-          <div style="display:flex;gap:6px;align-items:center;font-size:0.64rem;color:var(--text-dim);white-space:nowrap;">
-            <span>λ_min <input id="nd-wl-min" type="number" step="0.1" value="{init_wl_min:.1f}" style="width:46px;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:2px 4px;font-family:var(--font-display);" /></span>
-            <span>λ_max <input id="nd-wl-max" type="number" step="0.1" value="{init_wl_max:.1f}" style="width:46px;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:2px 4px;font-family:var(--font-display);" /></span>
-          </div>
+        <!-- Row 2: Unit cell angles alpha, beta, gamma + wavelength band -->
+        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) 0.85fr 0.85fr;gap:8px;margin-bottom:8px;">
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
+            α (°)
+            <input id="nd-alpha" type="number" step="0.01" value="90.07" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
+            β (°)
+            <input id="nd-beta" type="number" step="0.01" value="106.14" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
+            γ (°)
+            <input id="nd-gamma" type="number" step="0.01" value="90.01" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
+            λ_min (Å)
+            <input id="nd-wl-min" type="number" step="0.1" value="{init_wl_min:.1f}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          </label>
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
+            λ_max (Å)
+            <input id="nd-wl-max" type="number" step="0.1" value="{init_wl_max:.1f}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          </label>
+        </div>
+        <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:4px;">
+          Preview: /HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5 … CG4D_2638.nxs.h5 (14 runs)
+        </div>
+        <div id="nd-validation-status" style="font-family:var(--font-display);font-size:0.66rem;min-height:18px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 6px;border-radius:4px;background:rgba(7,9,19,0.65);border:1px solid rgba(56,189,248,0.2);">
+          <span id="nd-validation-msg" style="color:var(--text-dim);">Checking path availability on /SNS &amp; /HFIR…</span>
+          <button id="btn-nd-use-suggested-ipts" type="button" style="display:none;padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(251,191,36,0.18);border:1px solid var(--accent-gold);color:var(--accent-gold);border-radius:4px;cursor:pointer;white-space:nowrap;"></button>
         </div>
       </div>
 
@@ -4177,7 +4206,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   // Dynamic payload hot-reload + Client-Side h5wasm HDF5 Parser (for truly static HTML usage)
   function recomputeBoundsAndReload(newPayload) {{
     if (!newPayload) return;
+    const prevInst = DATA.instrument;
     DATA.instrument = newPayload.instrument || DATA.instrument;
+    if (newPayload.default_projection || (DATA.instrument && DATA.instrument !== prevInst)) {{
+      const nextProj = newPayload.default_projection || ((DATA.instrument === "MANDI" || DATA.instrument === "TOPAZ") ? "spherical" : "cylindrical");
+      state.projection = nextProj;
+      if (btnProjCyl && btnProjSph) {{
+        btnProjCyl.classList.toggle("active-btn", nextProj === "cylindrical");
+        btnProjSph.classList.toggle("active-btn", nextProj === "spherical");
+      }}
+      if (lblDetectorView) {{
+        lblDetectorView.textContent = nextProj === "spherical"
+          ? "DETECTOR VIEW // SPHERICAL (AZIMUTH vs ELEVATION)"
+          : "DETECTOR VIEW // CYLINDRICAL UNROLLED (γ vs Y)";
+      }}
+    }}
     DATA.space_group = newPayload.space_group || DATA.space_group;
     DATA.wavelength_range = newPayload.wavelength_range || DATA.wavelength_range;
     DATA.d_min = newPayload.d_min || DATA.d_min;
@@ -4918,6 +4961,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const ndPanePaths = document.getElementById("nd-pane-paths");
   let ndIngestMode = "ipts"; // "ipts" | "paths"
   let pendingLocalNexusFiles = null;
+  let ndValidateTimer = null;
+  let lastNdValidationResult = null;
 
   function parseRunRangeSpec(specStr) {{
     const runs = [];
@@ -4950,11 +4995,88 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return runs.map(r => `/${{fac}}/${{inst}}/IPTS-${{iptsRaw}}/nexus/${{inst}}_${{r}}.nxs.h5`);
   }}
 
+  async function verifyNeutronPathsInDialog() {{
+    const statusBox = document.getElementById("nd-validation-status");
+    const msgEl = document.getElementById("nd-validation-msg");
+    const sugBtn = document.getElementById("btn-nd-use-suggested-ipts");
+    if (!statusBox || !msgEl) return null;
+    if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
+      statusBox.style.borderColor = "rgba(52,211,153,0.45)";
+      msgEl.style.color = "#34d399";
+      msgEl.textContent = `✓ Ready to upload ${{pendingLocalNexusFiles.length}} local file(s)`;
+      if (sugBtn) sugBtn.style.display = "none";
+      lastNdValidationResult = {{ ok: true }};
+      return lastNdValidationResult;
+    }}
+    const fac = (document.getElementById("nd-facility")?.value || "HFIR").trim();
+    const inst = (document.getElementById("nd-instrument")?.value || "CG4D").trim();
+    const iptsRaw = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
+    const paths = buildNeutronFilePathsFromDialog();
+    if (paths.length === 0) {{
+      statusBox.style.borderColor = "rgba(248,113,113,0.45)";
+      msgEl.style.color = "#f87171";
+      msgEl.textContent = "⚠️ Enter a valid IPTS number and run (or explicit file path).";
+      if (sugBtn) sugBtn.style.display = "none";
+      lastNdValidationResult = {{ ok: false, message: msgEl.textContent }};
+      return lastNdValidationResult;
+    }}
+    try {{
+      const r = await fetch("api/pipeline/check_neutron_paths", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          facility: fac,
+          instrument: inst,
+          ipts: iptsRaw,
+          paths: paths,
+        }}),
+      }});
+      if (!r.ok) return null;
+      const res = await r.json();
+      lastNdValidationResult = res;
+      if (res.ok) {{
+        statusBox.style.borderColor = "rgba(52,211,153,0.5)";
+        msgEl.style.color = "#34d399";
+        msgEl.textContent = res.message || `✓ Verified ${{res.existing?.length || paths.length}} file(s)`;
+        if (sugBtn) sugBtn.style.display = "none";
+      }} else {{
+        statusBox.style.borderColor = "rgba(248,113,113,0.6)";
+        msgEl.style.color = "#f87171";
+        msgEl.textContent = `⚠️ ${{res.message || "File not found on /SNS or /HFIR"}}`;
+        if (sugBtn && res.suggested_ipts) {{
+          sugBtn.style.display = "inline-block";
+          sugBtn.textContent = `Switch to IPTS-${{res.suggested_ipts}}`;
+          sugBtn.onclick = () => {{
+            const iptsEl = document.getElementById("nd-ipts");
+            if (iptsEl) iptsEl.value = String(res.suggested_ipts);
+            if (Array.isArray(res.suggested_paths) && res.suggested_paths.length > 0) {{
+              const firstP = res.suggested_paths[0];
+              const facEl = document.getElementById("nd-facility");
+              if (facEl && firstP.startsWith("/SNS/")) facEl.value = "SNS";
+              if (facEl && firstP.startsWith("/HFIR/")) facEl.value = "HFIR";
+              if (ndIngestMode === "paths") {{
+                const fpEl = document.getElementById("nd-filepaths");
+                if (fpEl) fpEl.value = res.suggested_paths.join("\\n");
+              }}
+            }}
+            updateNeutronDialogPreview();
+          }};
+        }} else if (sugBtn) {{
+          sugBtn.style.display = "none";
+        }}
+      }}
+      return res;
+    }} catch (_e) {{
+      return null;
+    }}
+  }}
+
   function updateNeutronDialogPreview() {{
     const prevEl = document.getElementById("nd-preview-path");
     if (!prevEl) return;
     if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
       prevEl.textContent = `Local NeXus files (${{pendingLocalNexusFiles.length}}): ${{pendingLocalNexusFiles.map(f => f.name).join(", ")}}`;
+      verifyNeutronPathsInDialog();
       return;
     }}
     const paths = buildNeutronFilePathsFromDialog();
@@ -4966,12 +5088,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const lastBase = paths[paths.length - 1].split("/").pop();
       prevEl.textContent = `Preview: ${{paths[0]}} … ${{lastBase}} (${{paths.length}} runs)`;
     }}
+    if (ndValidateTimer) clearTimeout(ndValidateTimer);
+    ndValidateTimer = setTimeout(() => {{
+      verifyNeutronPathsInDialog();
+    }}, 180);
   }}
 
   function openNeutronDataModal(localNexusFiles = null) {{
     pendingLocalNexusFiles = localNexusFiles;
     const params = collectWorkflowParams();
     const setVal = (id, v) => {{ const el = document.getElementById(id); if (el && v !== undefined) el.value = v; }};
+    if (params.instrument) {{
+      setVal("nd-instrument", params.instrument);
+      setVal("nd-facility", (params.instrument === "MANDI" || params.instrument === "TOPAZ") ? "SNS" : "HFIR");
+    }}
     setVal("nd-sg", params.space_group);
     setVal("nd-a", Number(params.a).toFixed(2));
     setVal("nd-b", Number(params.b).toFixed(2));
@@ -5061,11 +5191,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const iptsRaw = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
       const runsSpec = (document.getElementById("nd-runs")?.value || "").trim();
       const paths = buildNeutronFilePathsFromDialog();
-      closeNeutronDataModal();
       if (paths.length === 0) {{
-        setStatusLine("[⚠️ NEUTRON DATA]", `<span style="color:#f87171;">No NeXus / HDF5 file paths specified.</span>`);
+        await verifyNeutronPathsInDialog();
         return;
       }}
+      // Pre-submit path check inside the dialog before closing or dispatching a job
+      const chk = await verifyNeutronPathsInDialog();
+      if (chk && chk.ok === false) {{
+        const statusBox = document.getElementById("nd-validation-status");
+        if (statusBox) {{
+          statusBox.style.boxShadow = "0 0 0 2px rgba(248,113,113,0.55)";
+          setTimeout(() => {{ statusBox.style.boxShadow = "none"; }}, 1200);
+        }}
+        return;
+      }}
+      closeNeutronDataModal();
       // If a single already-merged .h5 was specified, load it directly and set pending stage to 2. Solve
       if (paths.length === 1 && !/\\.nxs(\\.h5)?$/i.test(paths[0]) && /merged|scan|solve|integrat|predict/i.test(paths[0])) {{
         try {{
@@ -5077,7 +5217,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           }}
         }} catch (_e) {{}}
       }}
-      // Otherwise trigger Step 1 (neutrons_load_data + Reduce & Merge Images -> merged.h5 -> pending stage = Solve)
+      // Otherwise trigger Step 1 (Reduce & Merge Images -> merged.h5 -> pending stage = Solve)
       selectPipelineStage(0, true);
       await executeWorkflowStage(0, {{
         ingest_mode: ndIngestMode === "ipts" ? "oncat" : "file",
@@ -5354,26 +5494,37 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
             if (cellSummary) cellSummary.textContent = `${{aj.mode === "galaxy" ? "PULSAR" : "SUBHKL"}} [${{(aj.state || "running").toUpperCase()}}]`;
-            if (aj.state === "ok" || aj.state === "error") {{
+            const finishedOk = aj.state === "ok" || (aj.stdout && /Job [0-9a-f]+ finished \\(state=ok\\)/i.test(aj.stdout) && !!aj.error);
+            const finishedErr = aj.state === "error" || aj.state === "deleted" || aj.state === "paused" || (!finishedOk && !!aj.error);
+            if (finishedOk || finishedErr) {{
               clearInterval(galaxyBridge.pollTimer);
               galaxyBridge.pollTimer = null;
               state.runningStageIdx = -1;
               renderPipeline();
-              if (cellSummary) cellSummary.textContent = aj.state === "ok" ? "DONE ✓" : "ERROR ✗";
+              if (cellSummary) cellSummary.textContent = finishedOk ? "DONE ✓" : "ERROR ✗";
               await probeGalaxyConnection();
-              if (aj.state === "ok" && aj.updated_payload_ready) {{
-                try {{
-                  const pr = await fetch("api/payload", {{ cache: "no-store" }});
-                  if (pr.ok) {{
-                    const newPayload = await pr.json();
-                    recomputeBoundsAndReload(newPayload);
-                    appendTerminalLog(
-                      stageId === "reduce"
-                        ? "\\n✓ Loaded merged.h5 into viewport — Pending step: 2. Solve (Lattice Ladder)."
-                        : "\\n✓ Reloaded updated orientation & Bragg reflections into viewport."
-                    );
-                  }}
-                }} catch (_re) {{}}
+              if (finishedOk) {{
+                let loadedOk = false;
+                if (aj.updated_payload_ready) {{
+                  try {{
+                    const pr = await fetch("api/payload", {{ cache: "no-store" }});
+                    if (pr.ok) {{
+                      const newPayload = await pr.json();
+                      recomputeBoundsAndReload(newPayload);
+                      loadedOk = true;
+                      appendTerminalLog(
+                        stageId === "reduce"
+                          ? "\\n✓ Loaded merged.h5 into viewport — Pending step: 2. Solve (Lattice Ladder)."
+                          : "\\n✓ Reloaded updated orientation & Bragg reflections into viewport."
+                      );
+                    }}
+                  }} catch (_re) {{}}
+                }}
+                if (!loadedOk && Array.isArray(aj.outputs) && aj.outputs.length > 0 && aj.outputs[0].id) {{
+                  await loadFromGalaxyDatasetId(aj.outputs[0].id);
+                }}
+              }} else if (aj.error) {{
+                appendTerminalLog(`\\n[error] ${{aj.error}}`);
               }}
             }}
           }} catch (_pe) {{}}
