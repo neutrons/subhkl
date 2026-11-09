@@ -808,6 +808,9 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     mock_store.nova_connection.galaxy_instance = mock_gi
     runner_ndip.get_datastore = MagicMock(return_value=mock_store)
     runner_ndip._has_tool_on_galaxy = MagicMock(return_value=True)
+    runner_ndip.browse_oncat_catalog = MagicMock(
+        return_value={"ok": False, "runs": [], "auth_status": {"authenticated": False}}
+    )
     runner_ndip._api_request = MagicMock(
         return_value={
             "state": "ok",
@@ -833,7 +836,39 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     call_kwargs = mock_gi.tools.run_tool.call_args.kwargs
     assert call_kwargs["tool_id"] == "neutrons_load_data"
 
+    # Verify ONCat-first fast path skips neutrons_load_data file fetch completely
+    mock_gi.tools.run_tool.reset_mock()
+    runner_ndip.browse_oncat_catalog = MagicMock(
+        return_value={
+            "ok": True,
+            "runs": [
+                {
+                    "run": 2625,
+                    "location": "/HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5",
+                    "title": "Beta-Lac Omega=110",
+                    "angles": "ω=110°",
+                }
+            ],
+            "auth_status": {"authenticated": True},
+        }
+    )
+    chk_oncat_fast = runner_ndip.check_neutron_paths(
+        {
+            "ingest_mode": "file",
+            "facility": "SNS",
+            "instrument": "MANDI",
+            "ipts": "34720",
+            "paths": ["/HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5"],
+        }
+    )
+    assert chk_oncat_fast["ok"] is True
+    assert chk_oncat_fast["verified_dataset_ids"] == ["oncat:HFIR:CG4D:IPTS-37331:1"]
+    mock_gi.tools.run_tool.assert_not_called()
+
     # Mock NDIP failure when wrong IPTS is given
+    runner_ndip.browse_oncat_catalog = MagicMock(
+        return_value={"ok": False, "runs": [], "auth_status": {"authenticated": False}}
+    )
     runner_ndip._api_request = MagicMock(
         return_value={
             "state": "error",

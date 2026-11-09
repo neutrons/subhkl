@@ -1386,11 +1386,60 @@ class NovaGalaxyPipelineRunner:
                 job_record["raw_nxs"] = raw_nxs
                 job_record["instrument"] = inst
                 job_record["merged_label"] = merged_label
-                # Route NeXus verification & ingestion through NDIP neutrons_load_data tool
-                verified_ids = params.get("verified_dataset_ids") or []
+                # Route NeXus verification through ONCat OAuth first (instant, no file copy),
+                # falling back to NDIP neutrons_load_data only when ONCat is unavailable.
+                verified_ids = list(params.get("verified_dataset_ids") or [])
+                if not verified_ids and params.get("ingest_mode") in ("oncat", "file", None):
+                    import re as _re
+
+                    first_p = raw_nxs[0]
+                    ipts_str = _re.sub(
+                        r"^IPTS-",
+                        "",
+                        str(params.get("ipts") or "").strip(),
+                        flags=_re.I,
+                    )
+                    if not ipts_str:
+                        m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.I)
+                        if m_ip:
+                            ipts_str = m_ip.group(1)
+                    fac_str = str(
+                        params.get("facility")
+                        or ("SNS" if first_p.startswith("/SNS/") else "HFIR")
+                    )
+                    if ipts_str:
+                        try:
+                            cat = self.browse_oncat_catalog(
+                                {"facility": fac_str, "instrument": inst, "ipts": ipts_str}
+                            )
+                            run_map = {
+                                int(r["run"]): r
+                                for r in (cat.get("runs") or [])
+                                if r.get("run") is not None
+                            }
+                            if run_map:
+                                missing_r = []
+                                for p_chk in raw_nxs:
+                                    m_rc = _re.search(
+                                        r"_([0-9]+)\.nxs", os.path.basename(p_chk), _re.I
+                                    )
+                                    if m_rc and int(m_rc.group(1)) not in run_map:
+                                        missing_r.append(os.path.basename(p_chk))
+                                if missing_r:
+                                    raise FileNotFoundError(
+                                        f"ONCat IPTS-{ipts_str}: run(s) not found ({', '.join(missing_r[:4])})"
+                                    )
+                                verified_ids = [
+                                    f"oncat:{inst}:IPTS-{ipts_str}:{len(raw_nxs)}"
+                                ]
+                        except FileNotFoundError:
+                            raise
+                        except Exception:
+                            pass
+
                 if verified_ids:
                     job_record["stdout"] += (
-                        f"[galaxy -> ndip] Reusing NDIP neutrons_load_data dataset(s): {', '.join(str(x) for x in verified_ids)}\n"
+                        f"[galaxy -> ndip] Verified dataset(s): {', '.join(str(x) for x in verified_ids)}\n"
                     )
                 elif self._has_tool_on_galaxy("neutrons_load_data") and params.get(
                     "ingest_mode"
@@ -1906,11 +1955,30 @@ class NovaGalaxyPipelineRunner:
         if self.is_connected and self._has_tool_on_galaxy("neutrons_load_data"):
             try:
                 ndip_checked = True
-                # Enrich titles and check multi-run availability via ONCat catalog when in oncat mode
-                if ipts_raw and str(body.get("ingest_mode") or "oncat") != "file":
+                m_p0 = _re.match(
+                    r"^/(SNS|HFIR)/([^/]+)/IPTS-([^/]+)/", expanded[0], _re.I
+                )
+                if m_p0 and (
+                    str(body.get("ingest_mode") or "oncat") == "file"
+                    or not ipts_raw
+                ):
+                    fac = m_p0.group(1).upper()
+                    inst = m_p0.group(2).upper()
+                    ipts_raw = m_p0.group(3)
+                elif not ipts_raw:
+                    m_ip0 = _re.search(r"/IPTS-([^/]+)/", expanded[0], _re.I)
+                    if m_ip0:
+                        ipts_raw = m_ip0.group(1)
+                # Verify via authenticated pyoncat catalog first (instant metadata check, no file fetch)
+                if ipts_raw:
                     try:
                         cat = self.browse_oncat_catalog(
-                            {"facility": fac, "instrument": inst, "ipts": ipts_raw}
+                            {
+                                "facility": fac,
+                                "instrument": inst,
+                                "ipts": ipts_raw,
+                                "skip_experiments": True,
+                            }
                         )
                         run_map = {
                             int(r["run"]): r
@@ -1939,50 +2007,66 @@ class NovaGalaxyPipelineRunner:
                                         oncat_missing.append(p)
                             sample_title = "; ".join(titles_seen[:3])
                             sample_goniometer = "; ".join(gonio_seen[:3])
+                            if oncat_existing or oncat_missing:
+                                if oncat_missing:
+                                    ok = False
+                                    msg = (
+                                        f"ONCat: {len(oncat_existing)} found, {len(oncat_missing)} missing "
+                                        f"({', '.join(os.path.basename(x) for x in oncat_missing[:4])})"
+                                    )
+                                else:
+                                    ok = True
+                                    verified_dataset_ids = [
+                                        f"oncat:{fac}:{inst}:IPTS-{ipts_raw}:{len(oncat_existing)}"
+                                    ]
+                                    msg = (
+                                        f"Verified {len(oncat_existing)} run(s) via ONCat "
+                                        f"({inst} IPTS-{ipts_raw})"
+                                    )
+                                    if sample_title:
+                                        msg += f" — {sample_title[:60]}"
+                        elif (cat.get("auth_status") or {}).get("authenticated"):
+                            oncat_missing = list(expanded)
+                            ok = False
+                            msg = (
+                                f"ONCat: No accessible runs found for {inst} IPTS-{ipts_raw}"
+                            )
                     except Exception:
                         pass
 
-                store = self.get_datastore("IMAGINE-X SubHKL")
-                gi = store.nova_connection.galaxy_instance
-                first_p = oncat_existing[0] if oncat_existing else expanded[0]
-                m_run = _re.search(r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.I)
-                if not ipts_raw:
-                    m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.I)
-                    if m_ip:
-                        ipts_raw = m_ip.group(1)
-                nld_in = self._build_neutrons_load_data_inputs(
-                    ingest_mode=str(body.get("ingest_mode") or "oncat"),
-                    fac=fac,
-                    inst=inst,
-                    ipts_raw=ipts_raw,
-                    run_num=int(m_run.group(1)) if m_run else None,
-                    filepath=first_p,
-                )
-                nld_res = self._run_neutrons_load_data_tool(
-                    gi=gi,
-                    history_id=store.history_id,
-                    nld_inputs=nld_in,
-                    filepath=first_p,
-                )
-                jid = (nld_res.get("jobs") or [{}])[0].get("id")
-                out_ids = [
-                    o.get("id")
-                    for o in (nld_res.get("outputs") or [])
-                    if isinstance(o, dict) and o.get("id")
-                ]
-                for _ in range(18):
-                    if not jid:
-                        break
-                    j = self._api_request("GET", f"/api/jobs/{jid}?full=true")
-                    st = j.get("state")
-                    if st == "ok":
-                        if oncat_missing:
-                            ok = False
-                            msg = (
-                                f"ONCat: {len(oncat_existing)} found, {len(oncat_missing)} missing "
-                                f"({', '.join(os.path.basename(x) for x in oncat_missing[:4])})"
-                            )
-                        else:
+                if not ok and not msg:
+                    store = self.get_datastore("IMAGINE-X SubHKL")
+                    gi = store.nova_connection.galaxy_instance
+                    first_p = oncat_existing[0] if oncat_existing else expanded[0]
+                    m_run = _re.search(
+                        r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.I
+                    )
+                    nld_in = self._build_neutrons_load_data_inputs(
+                        ingest_mode=str(body.get("ingest_mode") or "oncat"),
+                        fac=fac,
+                        inst=inst,
+                        ipts_raw=ipts_raw,
+                        run_num=int(m_run.group(1)) if m_run else None,
+                        filepath=first_p,
+                    )
+                    nld_res = self._run_neutrons_load_data_tool(
+                        gi=gi,
+                        history_id=store.history_id,
+                        nld_inputs=nld_in,
+                        filepath=first_p,
+                    )
+                    jid = (nld_res.get("jobs") or [{}])[0].get("id")
+                    out_ids = [
+                        o.get("id")
+                        for o in (nld_res.get("outputs") or [])
+                        if isinstance(o, dict) and o.get("id")
+                    ]
+                    for _ in range(45):
+                        if not jid:
+                            break
+                        j = self._api_request("GET", f"/api/jobs/{jid}?full=true")
+                        st = j.get("state")
+                        if st == "ok":
                             ok = True
                             verified_dataset_ids = out_ids or [
                                 f"verified:{len(expanded)}"
@@ -1993,7 +2077,27 @@ class NovaGalaxyPipelineRunner:
                             )
                             if sample_title:
                                 msg += f" — {sample_title[:60]}"
-                        if len(expanded) > 1 or not ok:
+                            if len(expanded) > 1 or not ok:
+                                for oid in out_ids:
+                                    try:
+                                        self._api_request(
+                                            "PUT",
+                                            f"/api/histories/{store.history_id}/contents/{oid}",
+                                            payload={"deleted": True},
+                                        )
+                                    except Exception:
+                                        pass
+                            break
+                        if st in ("error", "deleted"):
+                            err_out = (
+                                j.get("tool_stdout") or j.get("tool_stderr") or ""
+                            ).strip()
+                            first_line = (
+                                err_out.splitlines()[0]
+                                if err_out
+                                else "File or run not found"
+                            )
+                            msg = f"NDIP Load Neutron Data: {first_line} ({inst} IPTS-{ipts_raw or '?'})"
                             for oid in out_ids:
                                 try:
                                     self._api_request(
@@ -2003,30 +2107,10 @@ class NovaGalaxyPipelineRunner:
                                     )
                                 except Exception:
                                     pass
-                        break
-                    if st in ("error", "deleted"):
-                        err_out = (
-                            j.get("tool_stdout") or j.get("tool_stderr") or ""
-                        ).strip()
-                        first_line = (
-                            err_out.splitlines()[0]
-                            if err_out
-                            else "File or run not found"
-                        )
-                        msg = f"NDIP Load Neutron Data: {first_line} ({inst} IPTS-{ipts_raw or '?'})"
-                        for oid in out_ids:
-                            try:
-                                self._api_request(
-                                    "PUT",
-                                    f"/api/histories/{store.history_id}/contents/{oid}",
-                                    payload={"deleted": True},
-                                )
-                            except Exception:
-                                pass
-                        break
-                    time.sleep(1.0)
-                if not ok and not msg:
-                    msg = f"NDIP Load Neutron Data check timed out for {first_p}"
+                            break
+                        time.sleep(1.0)
+                    if not ok and not msg:
+                        msg = f"NDIP Load Neutron Data check timed out for {first_p}"
             except Exception as exc:
                 msg = f"NDIP Load Neutron Data error: {self._clean_err_msg(exc)}"
         else:
@@ -2442,10 +2526,11 @@ class NovaGalaxyPipelineRunner:
         )
         now = time.time()
         experiments: list[dict[str, Any]] = []
+        skip_exps = bool(params.get("skip_experiments")) and bool(ipts_raw)
         cached_exp = exp_cache.get((fac, inst, is_auth))
         if cached_exp and (now - cached_exp[0]) < 300.0:
             experiments = cached_exp[1]
-        else:
+        elif not skip_exps:
             try:
                 try:
                     raw_exps = oncat.Experiment.list(
