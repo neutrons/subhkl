@@ -150,6 +150,10 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
             if "images" in f:
                 return str(p)
             src_attr = _decode_str(f.attrs.get("source"), "")
+            if not src_attr and "scan_refinement" in f:
+                src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
+            if not src_attr and "search" in f:
+                src_attr = _decode_str(f["search"].attrs.get("source"), "")
             if src_attr:
                 for cand_src in (Path(src_attr), p.parent / Path(src_attr).name):
                     if cand_src.exists():
@@ -186,6 +190,8 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
         pass
 
     parent = p.parent
+    if parent.resolve() == Path(tempfile.gettempdir()).resolve():
+        return None
     candidates = sorted(glob.glob(str(parent / "*.im.h5"))) + sorted(
         glob.glob(str(parent / "*merged*.h5"))
     )
@@ -5916,6 +5922,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
         if (stageId === "solve") selectLadderRung(0, false);
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
+        let lastPartialSeq = 0;
         galaxyBridge.pollTimer = setInterval(async () => {{
           try {{
             const sr = await fetch("api/pipeline/status", {{ cache: "no-store" }});
@@ -5925,6 +5932,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (!aj) return;
             const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");
             if (outText) appendTerminalLog(outText, true);
+            if (
+              stageId === "solve" &&
+              aj.state !== "ok" &&
+              aj.partial_overlay &&
+              (aj.partial_overlay.seq || 0) > lastPartialSeq
+            ) {{
+              lastPartialSeq = aj.partial_overlay.seq;
+              if (Array.isArray(aj.partial_overlay.zones) && aj.partial_overlay.zones.length > 0) {{
+                ZONES = aj.partial_overlay.zones;
+              }}
+              if (Array.isArray(aj.partial_overlay.peaks) && aj.partial_overlay.peaks.length > 0) {{
+                PEAKS = aj.partial_overlay.peaks;
+              }}
+              if (Array.isArray(aj.partial_overlay.ladder_steps) && aj.partial_overlay.ladder_steps.length > 0) {{
+                LADDER = aj.partial_overlay.ladder_steps;
+              }}
+              renderZoneList();
+              renderLadder();
+            }}
             if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
               selectLadderRung(aj.ladder_rung_idx, false);
             }}

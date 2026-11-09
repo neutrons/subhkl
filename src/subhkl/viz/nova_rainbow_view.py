@@ -1649,13 +1649,16 @@ class NovaGalaxyPipelineRunner:
                     env=gpu_env,
                 )
                 assert proc.stdout is not None
+                blind_src = out_h5[:-3] + ".blind.h5"
+                blind_dst = solve_dest[:-3] + ".blind.h5"
+                blind_synced = False
                 for line in proc.stdout:
                     job_record["stdout"] = (job_record.get("stdout", "") + line)[
                         -24000:
                     ]
                     low = line.lower()
                     if stage_id == "solve":
-                        if "ladder" in low or "blind" in low:
+                        if "full-data scores" in low or "joint band refinement" in low:
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 1
                             )
@@ -1672,6 +1675,39 @@ class NovaGalaxyPipelineRunner:
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 3
                             )
+                        if (
+                            not blind_synced
+                            and (
+                                "band fit:" in low
+                                or "stage 0" in low
+                                or "60-zone" in low
+                            )
+                            and os.path.isfile(blind_src)
+                            and os.path.getsize(blind_src) > 0
+                        ):
+                            try:
+                                shutil.copy2(blind_src, blind_dst)
+                                blind_synced = True
+                                from subhkl.viz.rainbow_zones import (
+                                    build_rainbow_zone_payload,
+                                )
+
+                                p_blind = build_rainbow_zone_payload(
+                                    replay_h5=blind_dst,
+                                    images_h5=merged_path,
+                                    instrument=str(inst),
+                                    space_group=str(sg),
+                                    cell=[float(x) for x in raw_cell[:6]],
+                                )
+                                if p_blind.get("zones"):
+                                    job_record["partial_overlay"] = {
+                                        "seq": 1,
+                                        "zones": p_blind.get("zones", []),
+                                        "peaks": p_blind.get("peaks", []),
+                                        "ladder_steps": p_blind.get("ladder_steps", []),
+                                    }
+                            except Exception:
+                                pass
                 rc = proc.wait()
                 if rc == 0:
                     job_record["ladder_rung_idx"] = 0 if stage_id == "reduce" else 4
