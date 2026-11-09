@@ -310,9 +310,24 @@ def test_finderless_solve_h5_forward_projection_and_stages(tmp_path):
         sr.attrs["status"] = "converged"
         sr.attrs["stages"] = json.dumps(
             [
-                {"stage": "global", "objective": -0.513, "iterations": 97, "success": True},
-                {"stage": "120-zones", "objective": -1.101, "iterations": 192, "success": True},
-                {"stage": "cell", "objective": -2.011, "iterations": 235, "success": True},
+                {
+                    "stage": "global",
+                    "objective": -0.513,
+                    "iterations": 97,
+                    "success": True,
+                },
+                {
+                    "stage": "120-zones",
+                    "objective": -1.101,
+                    "iterations": 192,
+                    "success": True,
+                },
+                {
+                    "stage": "cell",
+                    "objective": -2.011,
+                    "iterations": 235,
+                    "success": True,
+                },
             ]
         )
 
@@ -494,9 +509,9 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     assert harvest_goniometer_angles_from_title(
         "Beta-Lac crystal, Omega = 110 degrees"
     ) == {"omega": 110.0}
-    assert harvest_goniometer_angles_from_title(
-        "beta lac axis2 = 92 degrees"
-    ) == {"omega": 92.0}
+    assert harvest_goniometer_angles_from_title("beta lac axis2 = 92 degrees") == {
+        "omega": 92.0
+    }
     assert harvest_goniometer_angles_from_title(
         "Garnet axis0 = 82 degrees, axis1 = -15.5 degrees"
     ) == {"phi": 82.0, "kappa": -15.5}
@@ -504,7 +519,9 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     # 2. Verify get_rotation_data_from_nexus harvests /entry/title when CG4D:Mot:... is absent from DASlogs
     raw_nxs = tmp_path / "CG4D_2625.nxs.h5"
     with h5py.File(raw_nxs, "w") as f:
-        f.create_dataset("entry/title", data=np.array([b"Beta-Lac crystal, Omega = 110 degrees"]))
+        f.create_dataset(
+            "entry/title", data=np.array([b"Beta-Lac crystal, Omega = 110 degrees"])
+        )
         f.create_group("entry/DASlogs")
 
     axes, angles, names = get_rotation_data_from_nexus(str(raw_nxs), "CG4D")
@@ -530,9 +547,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
         f.create_dataset("sample/gamma", data=90.0)
         f.create_dataset("sample/space_group", data=b"P 21 21 21")
         f.create_dataset("instrument/wavelength", data=np.array([2.8, 4.5]))
-        f.create_dataset(
-            "images", data=np.zeros((2, 1, 32, 32), dtype=np.float32)
-        )
+        f.create_dataset("images", data=np.zeros((2, 1, 32, 32), dtype=np.float32))
         f.create_dataset(
             "goniometer/angles",
             data=np.array(
@@ -558,50 +573,123 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     p_merged = build_rainbow_zone_payload(replay_h5=merged_h5)
     assert p_merged["artifact_kind"] == "merged"
     assert p_merged["pending_stage"] == "solve"
+    assert len(p_merged["pipeline_stages"]) == 4
+    assert [s["stage_id"] for s in p_merged["pipeline_stages"]] == [
+        "reduce",
+        "solve",
+        "integrate",
+        "merge",
+    ]
     assert p_merged["pipeline_stages"][0]["status"] == "completed"
     assert p_merged["pipeline_stages"][1]["status"] == "pending"
     assert len(p_merged["frames"]) == 2
     assert "ω=110" in p_merged["goniometer_summary"]
 
-    # 4. Verify check_neutron_paths catches wrong IPTS and suggests the right IPTS
-    import os
+    # 4. Verify check_neutron_paths never touches the host filesystem directly and routes strictly through NDIP
+    from unittest.mock import MagicMock
     from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
 
-    runner = NovaGalaxyPipelineRunner(galaxy_url="")
-    chk_ok = runner.check_neutron_paths(
+    runner_no_ndip = NovaGalaxyPipelineRunner(galaxy_url="")
+    chk_unavail = runner_no_ndip.check_neutron_paths(
         {
             "facility": "HFIR",
             "instrument": "CG4D",
             "ipts": "37331",
-            "paths": [str(raw_nxs)],
+            "paths": ["/HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5"],
+        }
+    )
+    assert chk_unavail["ok"] is False
+    assert chk_unavail["checked_via"] == "ndip_unavailable"
+
+    # Mock NDIP Galaxy connection to verify routing through neutrons_load_data
+    runner_ndip = NovaGalaxyPipelineRunner(
+        galaxy_url="https://ndip-test.ornl.gov",
+        galaxy_api_key="mock_key",
+    )
+    mock_gi = MagicMock()
+    mock_gi.tools.run_tool.return_value = {
+        "jobs": [{"id": "job_ndip_1"}],
+        "outputs": [{"id": "ds_ndip_1"}],
+    }
+    mock_store = MagicMock()
+    mock_store.history_id = "hist_1"
+    mock_store.nova_connection.galaxy_instance = mock_gi
+    runner_ndip.get_datastore = MagicMock(return_value=mock_store)
+    runner_ndip._has_tool_on_galaxy = MagicMock(return_value=True)
+    runner_ndip._api_request = MagicMock(
+        return_value={
+            "state": "ok",
+            "exit_code": 0,
+            "tool_stdout": "",
+            "tool_stderr": "",
+        }
+    )
+    chk_ok = runner_ndip.check_neutron_paths(
+        {
+            "ingest_mode": "oncat",
+            "facility": "SNS",
+            "instrument": "MANDI",
+            "ipts": "34720",
+            "runs": "12737",
+            "paths": ["/SNS/MANDI/IPTS-34720/nexus/MANDI_12737.nxs.h5"],
         }
     )
     assert chk_ok["ok"] is True
-    assert "Beta-Lac crystal" in chk_ok["sample_title"]
+    assert chk_ok["checked_via"] == "ndip_neutrons_load_data"
+    assert chk_ok["verified_dataset_ids"] == ["ds_ndip_1"]
+    mock_gi.tools.run_tool.assert_called_once()
+    call_kwargs = mock_gi.tools.run_tool.call_args.kwargs
+    assert call_kwargs["tool_id"] == "neutrons_load_data"
 
-    chk_missing = runner.check_neutron_paths(
+    # Mock NDIP failure when wrong IPTS is given
+    runner_ndip._api_request = MagicMock(
+        return_value={
+            "state": "error",
+            "exit_code": 1,
+            "tool_stdout": "",
+            "tool_stderr": "FileNotFoundError: /SNS/MANDI/IPTS-37331/nexus/MANDI_12737.nxs.h5: No such file or directory",
+        }
+    )
+    chk_missing = runner_ndip.check_neutron_paths(
         {
+            "ingest_mode": "oncat",
             "facility": "SNS",
             "instrument": "MANDI",
-            "ipts": "99999",
-            "paths": [str(tmp_path / "nonexistent_run.nxs.h5")],
+            "ipts": "37331",
+            "runs": "12737",
+            "paths": ["/SNS/MANDI/IPTS-37331/nexus/MANDI_12737.nxs.h5"],
         }
     )
     assert chk_missing["ok"] is False
-    if os.path.isfile("/SNS/MANDI/IPTS-34720/nexus/MANDI_12737.nxs.h5"):
-        chk_mandi = runner.check_neutron_paths(
-            {
-                "facility": "SNS",
-                "instrument": "MANDI",
-                "ipts": "37331",
-                "paths": ["/SNS/MANDI/IPTS-37331/nexus/MANDI_12737.nxs.h5"],
-            }
-        )
-        assert chk_mandi["ok"] is False
-        assert chk_mandi["suggested_ipts"] == "34720"
+    assert chk_missing["checked_via"] == "ndip_neutrons_load_data"
+
+    # 4b. Verify MANDI spherical panel geometry has 4-corner diamond coordinates and 48-point outline
+    mandi_merged = tmp_path / "MANDI_12737_merged.h5"
+    with h5py.File(mandi_merged, "w") as f:
+        f.attrs["instrument"] = "MANDI"
+        f.create_dataset("images", data=np.ones((2, 256, 256), dtype=np.float32) * 20.0)
+        f.create_dataset("bank_ids", data=np.array([11, 32], dtype=np.int32))
+        f.create_dataset("file_offsets", data=np.array([0], dtype=np.int32))
+        f.create_dataset("files", data=np.array([b"MANDI_12737.nxs.h5"]))
+    p_mandi = build_rainbow_zone_payload(replay_h5=mandi_merged)
+    assert p_mandi["instrument"] == "MANDI"
+    assert p_mandi["default_projection"] == "spherical"
+    assert len(p_mandi["pipeline_stages"]) == 4
+    b11 = next(p for p in p_mandi["panels"] if p["bank"] == 11)
+    assert len(b11["corners_sph"]) == 4
+    assert len(b11["outline_sph"]) == 48
+    # Bank 11 on MANDI is a 45-deg diamond: C0=(0,0) and C2=(255,255) share nearly the same azimuth, while C1 and C3 span azimuth
+    c0_az, c0_el = b11["corners_sph"][0]
+    c1_az, c1_el = b11["corners_sph"][1]
+    c2_az, c2_el = b11["corners_sph"][2]
+    c3_az, c3_el = b11["corners_sph"][3]
+    assert abs(c0_az - c2_az) < 2.0
+    assert abs(c1_el - c3_el) < 2.0
+    assert abs(c1_az - c3_az) > 15.0
+    assert abs(c2_el - c0_el) > 15.0
 
     # 5. Verify _work_dir_for_reduce isolates reduction outputs from existing directories
-    red_dir, red_label = runner._work_dir_for_reduce(
+    red_dir, red_label = runner_no_ndip._work_dir_for_reduce(
         ["/SNS/MANDI/IPTS-34720/nexus/MANDI_12737.nxs.h5"],
         "/home/xvg/subhkl-examples/betalac-7",
     )
@@ -614,9 +702,3 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     html_merged = render_rainbow_html(p_merged)
     assert "Number(sub[rowOff + dc])" in html_merged
     assert "api/pipeline/resolve_local_files" in html_merged
-
-
-
-
-
-

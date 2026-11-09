@@ -121,9 +121,7 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
                 continue
             g = cal_grp[name]
             cfg = dict(
-                base_configs.get(
-                    bank_id, {"panel_type": "flat", "m": 256, "n": 256}
-                )
+                base_configs.get(bank_id, {"panel_type": "flat", "m": 256, "n": 256})
             )
             for field in ("center", "uhat", "vhat"):
                 if field in g:
@@ -208,40 +206,55 @@ def _encode_panel_textures(
                         if "bank_ids" in f
                         else np.arange(1, n_total_frames + 1)
                     )
-                    f0, f1 = 0, n_total_frames
-                    if frame_slice is not None:
-                        f0 = max(0, min(int(frame_slice[0]), n_total_frames))
-                        f1 = max(f0, min(int(frame_slice[1]), n_total_frames))
-                    elif "file_offsets" in f:
-                        offsets = np.asarray(f["file_offsets"][()], dtype=int)
-                        if len(offsets) > 1:
-                            counts = np.diff(np.append(offsets, n_total_frames))
-                            best_r = int(np.argmax(counts))
-                            f0 = int(offsets[best_r])
-                            f1 = int(offsets[best_r] + counts[best_r])
-                    b = max(1, int(render_binning))
-                    for idx in range(f0, f1):
-                        bk = int(b_ids_all[idx])
-                        im = np.asarray(ims[idx], dtype=np.float32)
-                        if im.ndim != 2:
-                            continue
-                        n2, m2 = (im.shape[0] // b) * b, (im.shape[1] // b) * b
-                        if n2 > 0 and m2 > 0:
-                            imb = (
-                                im[:n2, :m2]
-                                .reshape(n2 // b, b, m2 // b, b)
-                                .mean(axis=(1, 3))
-                            )
-                        else:
-                            imb = im
-                        if bk in raw_bank_images:
-                            raw_bank_images[bk] = np.maximum(
-                                raw_bank_images[bk], imb
-                            )
-                        else:
-                            raw_bank_images[bk] = imb
-                    if raw_bank_images:
-                        intensity_source = "raw_h5"
+                    # Guard against mixing an images_h5 from a different instrument (e.g. CG4D 512x512 vs MANDI 256x256)
+                    det_compat = True
+                    if detectors:
+                        sample_det = next(iter(detectors.values()))
+                        det_n = int(getattr(sample_det, "n", 0))
+                        if len(ims.shape) >= 3 and (
+                            (int(ims.shape[1]) == 512 and det_n == 256)
+                            or (int(ims.shape[1]) == 256 and det_n == 512)
+                        ):
+                            det_compat = False
+                        uniq_b = set(int(x) for x in np.unique(b_ids_all))
+                        if uniq_b and not uniq_b.issubset(set(detectors.keys())):
+                            if len(uniq_b - set(detectors.keys())) > 2:
+                                det_compat = False
+                    if det_compat:
+                        f0, f1 = 0, n_total_frames
+                        if frame_slice is not None:
+                            f0 = max(0, min(int(frame_slice[0]), n_total_frames))
+                            f1 = max(f0, min(int(frame_slice[1]), n_total_frames))
+                        elif "file_offsets" in f:
+                            offsets = np.asarray(f["file_offsets"][()], dtype=int)
+                            if len(offsets) > 1:
+                                counts = np.diff(np.append(offsets, n_total_frames))
+                                best_r = int(np.argmax(counts))
+                                f0 = int(offsets[best_r])
+                                f1 = int(offsets[best_r] + counts[best_r])
+                        b = max(1, int(render_binning))
+                        for idx in range(f0, f1):
+                            bk = int(b_ids_all[idx])
+                            im = np.asarray(ims[idx], dtype=np.float32)
+                            if im.ndim != 2:
+                                continue
+                            n2, m2 = (im.shape[0] // b) * b, (im.shape[1] // b) * b
+                            if n2 > 0 and m2 > 0:
+                                imb = (
+                                    im[:n2, :m2]
+                                    .reshape(n2 // b, b, m2 // b, b)
+                                    .mean(axis=(1, 3))
+                                )
+                            else:
+                                imb = im
+                            if bk in raw_bank_images:
+                                raw_bank_images[bk] = np.maximum(
+                                    raw_bank_images[bk], imb
+                                )
+                            else:
+                                raw_bank_images[bk] = imb
+                        if raw_bank_images:
+                            intensity_source = "raw_h5"
         except Exception:
             pass
 
@@ -278,9 +291,7 @@ def _encode_panel_textures(
                 else np.full(np.sum(mask), 200.0)
             )
             sig_b = (
-                sigma_arr[mask]
-                if sigma_arr is not None
-                else np.full(np.sum(mask), 3.5)
+                sigma_arr[mask] if sigma_arr is not None else np.full(np.sum(mask), 3.5)
             )
             for r0, c0, amp, sig in zip(pr_b, pc_b, inten_b, sig_b):
                 ry = float(r0) / max(n_det, 1.0) * (grid_size - 1)
@@ -298,9 +309,7 @@ def _encode_panel_textures(
     # Compute global log1p normalization across all bank images for consistent contrast
     vmin, vmax = 0.0, 1.0
     if raw_bank_images:
-        all_logs = [
-            np.log1p(np.maximum(im, 0.0)) for im in raw_bank_images.values()
-        ]
+        all_logs = [np.log1p(np.maximum(im, 0.0)) for im in raw_bank_images.values()]
         flat = np.concatenate([a.ravel() for a in all_logs])
         if len(flat) > 0:
             vmin = float(np.percentile(flat, 10.0))
@@ -309,38 +318,54 @@ def _encode_panel_textures(
                 vmax = float(np.max(flat)) + 1.0
 
     panels_payload: list[dict[str, Any]] = []
+    t_edge = np.linspace(0.0, 1.0, 12, endpoint=False)
     for bk, det in sorted(detectors.items()):
         try:
-            rr = np.array([0, det.n - 1, det.n - 1, 0, 0], dtype=float)
-            cc = np.array([0, 0, det.m - 1, det.m - 1, 0], dtype=float)
-            xyz_corners = det.pixel_to_lab(rr, cc)
-            x, y = _unrolled(xyz_corners)
-            _, el = _spherical_angles(xyz_corners)
-            if np.ptp(x) > 180.0:
+            # 4 canonical corners: C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
+            rr_c = np.array([0, det.n - 1, det.n - 1, 0], dtype=float)
+            cc_c = np.array([0, 0, det.m - 1, det.m - 1], dtype=float)
+            xyz_corners = det.pixel_to_lab(rr_c, cc_c)
+            x_c, y_c = _unrolled(xyz_corners)
+            _, el_c = _spherical_angles(xyz_corners)
+            if np.ptp(x_c) > 180.0:
                 continue
 
-            az_min, az_max = float(np.min(x[:4])), float(np.max(x[:4]))
-            y_min, y_max = float(np.min(y[:4])), float(np.max(y[:4]))
-            el_min, el_max = float(np.min(el[:4])), float(np.max(el[:4]))
+            # Dense 48-point perimeter along all 4 edges for curved spherical/cylindrical borders
+            rr_e = np.concatenate(
+                [
+                    t_edge * (det.n - 1),
+                    np.full_like(t_edge, det.n - 1),
+                    (1.0 - t_edge) * (det.n - 1),
+                    np.zeros_like(t_edge),
+                ]
+            )
+            cc_e = np.concatenate(
+                [
+                    np.zeros_like(t_edge),
+                    t_edge * (det.m - 1),
+                    np.full_like(t_edge, det.m - 1),
+                    (1.0 - t_edge) * (det.m - 1),
+                ]
+            )
+            xyz_edge = det.pixel_to_lab(rr_e, cc_e)
+            x_e, y_e = _unrolled(xyz_edge)
+            _, el_e = _spherical_angles(xyz_edge)
+            if np.ptp(x_e) > 180.0:
+                continue
+
+            az_min, az_max = float(np.min(x_e)), float(np.max(x_e))
+            y_min, y_max = float(np.min(y_e)), float(np.max(y_e))
+            el_min, el_max = float(np.min(el_e)), float(np.max(el_e))
 
             tex_b64 = None
             im = raw_bank_images.get(int(bk))
             if im is not None:
-                im_oriented = im.copy()
-                if y[1] > y[0]:
-                    im_oriented = im_oriented[::-1, :]
-                if x[3] < x[0]:
-                    im_oriented = im_oriented[:, ::-1]
-
-                log_im = np.log1p(np.maximum(im_oriented, 0.0))
-                norm = np.clip(
-                    (log_im - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0
-                )
+                # Keep canonical (r, c) orientation: row r=0..n-1 is C0->C1, col c=0..m-1 is C0->C3
+                log_im = np.log1p(np.maximum(im, 0.0))
+                norm = np.clip((log_im - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
                 u8 = (norm * 255.0).astype(np.uint8)
                 buf = io.BytesIO()
-                Image.fromarray(u8, mode="L").save(
-                    buf, format="PNG", optimize=True
-                )
+                Image.fromarray(u8, mode="L").save(buf, format="PNG", optimize=True)
                 tex_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
             panels_payload.append(
@@ -352,13 +377,21 @@ def _encode_panel_textures(
                     "y_max": round(y_max, 4),
                     "el_min": round(el_min, 3),
                     "el_max": round(el_max, 3),
+                    "corners": [
+                        [round(float(x_c[j]), 3), round(float(y_c[j]), 4)]
+                        for j in range(4)
+                    ],
+                    "corners_sph": [
+                        [round(float(x_c[j]), 3), round(float(el_c[j]), 3)]
+                        for j in range(4)
+                    ],
                     "outline": [
-                        [round(float(x[j]), 2), round(float(y[j]), 4)]
-                        for j in range(len(x))
+                        [round(float(x_e[j]), 2), round(float(y_e[j]), 4)]
+                        for j in range(len(x_e))
                     ],
                     "outline_sph": [
-                        [round(float(x[j]), 2), round(float(el[j]), 3)]
-                        for j in range(len(x))
+                        [round(float(x_e[j]), 2), round(float(el_e[j]), 3)]
+                        for j in range(len(x_e))
                     ],
                     "texture_b64": tex_b64,
                 }
@@ -375,11 +408,13 @@ def _extract_from_h5(
     frame_index: int | None = None,
 ) -> dict[str, Any]:
     """Extract peaks, detectors, UB, wavelength range, goniometer frames, and metadata from a subhkl HDF5 file."""
-    src_h5 = (
-        str(images_h5)
-        if images_h5 is not None and os.path.exists(images_h5)
-        else _discover_images_h5(h5_path)
-    )
+    disc_h5 = _discover_images_h5(h5_path)
+    if disc_h5 and os.path.exists(disc_h5):
+        src_h5 = str(disc_h5)
+    elif images_h5 is not None and os.path.exists(images_h5):
+        src_h5 = str(images_h5)
+    else:
+        src_h5 = None
     sib_solve = Path(h5_path).parent / "solve.h5"
     if (not sib_solve.is_file() or sib_solve == Path(h5_path)) and src_h5:
         sib_solve = Path(src_h5).parent / "solve.h5"
@@ -403,9 +438,7 @@ def _extract_from_h5(
         if "beam/ki_vec" in f:
             ki = tuple(
                 float(x)
-                for x in np.asarray(f["beam/ki_vec"][()], dtype=float).ravel()[
-                    :3
-                ]
+                for x in np.asarray(f["beam/ki_vec"][()], dtype=float).ravel()[:3]
             )
 
         wavelength_range = (1.8, 4.5)
@@ -416,9 +449,7 @@ def _extract_from_h5(
             if len(wl) >= 2:
                 wavelength_range = (float(wl[0]), float(wl[1]))
         elif "instrument/wavelength" in f:
-            wl = np.asarray(
-                f["instrument/wavelength"][()], dtype=float
-            ).ravel()
+            wl = np.asarray(f["instrument/wavelength"][()], dtype=float).ravel()
             if len(wl) >= 2:
                 wavelength_range = (float(wl[0]), float(wl[1]))
                 if (
@@ -433,7 +464,9 @@ def _extract_from_h5(
                                     "instrument/wavelength",
                                 ):
                                     if wk in sf:
-                                        swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                                        swl = np.asarray(
+                                            sf[wk][()], dtype=float
+                                        ).ravel()
                                         if len(swl) >= 2:
                                             wavelength_range = (
                                                 float(swl[0]),
@@ -457,16 +490,8 @@ def _extract_from_h5(
             except Exception:
                 pass
 
-        U = (
-            np.asarray(f["sample/U"][()], dtype=float)
-            if "sample/U" in f
-            else None
-        )
-        B = (
-            np.asarray(f["sample/B"][()], dtype=float)
-            if "sample/B" in f
-            else None
-        )
+        U = np.asarray(f["sample/U"][()], dtype=float) if "sample/U" in f else None
+        B = np.asarray(f["sample/B"][()], dtype=float) if "sample/B" in f else None
         space_group = (
             _decode_str(f["sample/space_group"][()], "P 1")
             if "sample/space_group" in f
@@ -474,10 +499,7 @@ def _extract_from_h5(
         )
 
         cell = None
-        if all(
-            f"sample/{k}" in f
-            for k in ("a", "b", "c", "alpha", "beta", "gamma")
-        ):
+        if all(f"sample/{k}" in f for k in ("a", "b", "c", "alpha", "beta", "gamma")):
             cell = [
                 float(f["sample/a"][()]),
                 float(f["sample/b"][()]),
@@ -489,36 +511,60 @@ def _extract_from_h5(
         elif B is not None:
             cell = list(_cell_from_B(B))
 
-        # Auto-detect instrument from embedded file paths or bank count when loading merged/scan HDF5
+        # Auto-detect instrument from filename, embedded files, detector_calibration, or bank/image dimensions
         explicit_h5_inst = _decode_str(f.attrs.get("instrument"), "").strip()
-        for cand_f_list in (
-            (list(f["files"][()]) if "files" in f else []),
-        ):
-            for fn_item in cand_f_list:
-                fn_s = _decode_str(fn_item, "").upper()
-                for known_inst in ("MANDI", "TOPAZ", "IMAGINE", "CG4D"):
+        if not explicit_h5_inst and "instrument/name" in f:
+            explicit_h5_inst = _decode_str(f["instrument/name"][()], "").strip()
+        if explicit_h5_inst:
+            instrument = explicit_h5_inst
+        else:
+            found_by_name = False
+            name_cands = [os.path.basename(str(h5_path)).upper()]
+            if "files" in f:
+                name_cands.extend(
+                    _decode_str(x, "").upper() for x in list(f["files"][()])
+                )
+            for fn_s in name_cands:
+                for known_inst in ("MANDI", "TOPAZ", "CG4D", "IMAGINE"):
                     if known_inst in fn_s:
                         instrument = known_inst
+                        found_by_name = True
                         break
-        if not explicit_h5_inst and instrument in ("CG4D", "IMAGINE") and "detector_calibration" not in f:
-            if "images" in f and len(f["images"].shape) >= 3 and int(f["images"].shape[1]) == 256:
-                instrument = "MANDI"
-            else:
-                for b_key in ("bank_ids", "peaks/bank", "bank"):
-                    if b_key in f:
-                        b_arr_chk = np.asarray(f[b_key][()], dtype=int)
-                        if len(b_arr_chk) > 0 and int(np.max(b_arr_chk)) > 60:
+                if found_by_name:
+                    break
+            if not found_by_name:
+                if "detector_calibration" in f:
+                    cal_bids = []
+                    for b_nm in f["detector_calibration"]:
+                        if b_nm.startswith("bank_"):
+                            try:
+                                cal_bids.append(int(b_nm.split("_", 1)[1]))
+                            except ValueError:
+                                pass
+                    if cal_bids:
+                        if max(cal_bids) > 60:
                             instrument = "CG4D"
-                            break
-                        if 8 < len(np.unique(b_arr_chk)) <= 45:
+                        elif min(cal_bids) < 10 or len(cal_bids) <= 45:
                             instrument = "MANDI"
-                            break
+                elif "images" in f and len(f["images"].shape) >= 3:
+                    instrument = "MANDI" if int(f["images"].shape[1]) == 256 else "CG4D"
+                else:
+                    for b_key in ("bank_ids", "peaks/bank", "bank"):
+                        if b_key in f:
+                            b_arr_chk = np.asarray(f[b_key][()], dtype=int)
+                            if len(b_arr_chk) > 0:
+                                if int(np.max(b_arr_chk)) > 60:
+                                    instrument = "CG4D"
+                                    break
+                                if int(np.min(b_arr_chk)) < 10 or (
+                                    8 < len(np.unique(b_arr_chk)) <= 45
+                                ):
+                                    instrument = "MANDI"
+                                    break
 
         detectors = _load_detectors_from_h5(f, instrument)
 
-        bank = (
-            np.asarray(f["bank"][()], dtype=int) if "bank" in f else None
-        )
+        bank = np.asarray(f["bank"][()], dtype=int) if "bank" in f else None
         if "peaks/bank" in f and bank is None:
             bank = np.asarray(f["peaks/bank"][()], dtype=int)
 
@@ -533,9 +579,7 @@ def _extract_from_h5(
             else None
         )
         peaks_xyz = (
-            np.asarray(f["peaks/xyz"][()], dtype=float)
-            if "peaks/xyz" in f
-            else None
+            np.asarray(f["peaks/xyz"][()], dtype=float) if "peaks/xyz" in f else None
         )
 
         # Extract multi-frame offsets, file names, and goniometer motor angles
@@ -640,7 +684,13 @@ def _extract_from_h5(
                 file_label = f"Frame {r_idx + 1}"
                 if files_raw and r_idx < len(files_raw):
                     raw_fn = os.path.basename(_decode_str(files_raw[r_idx], file_label))
-                    for ext in (".nxs.h5.img.h5", ".nxs.h5.im.h5", ".nxs.h5", ".img.h5", ".h5"):
+                    for ext in (
+                        ".nxs.h5.img.h5",
+                        ".nxs.h5.im.h5",
+                        ".nxs.h5",
+                        ".img.h5",
+                        ".h5",
+                    ):
                         if raw_fn.endswith(ext):
                             raw_fn = raw_fn[: -len(ext)]
                             break
@@ -667,9 +717,7 @@ def _extract_from_h5(
                     )
                     for ci in col_order:
                         m_sym = (
-                            motor_names[ci]
-                            if ci < len(motor_names)
-                            else f"M{ci + 1}"
+                            motor_names[ci] if ci < len(motor_names) else f"M{ci + 1}"
                         )
                         v_nom = round(float(row_nom[ci]), 2)
                         v_ref = round(float(row_ref[ci]), 2)
@@ -699,9 +747,8 @@ def _extract_from_h5(
                     if motors_list
                     else ""
                 )
-                opt_label = (
-                    f"{r_idx + 1}/{len(offsets)} · {file_label}"
-                    + (f" ({primary_str})" if primary_str else "")
+                opt_label = f"{r_idx + 1}/{len(offsets)} · {file_label}" + (
+                    f" ({primary_str})" if primary_str else ""
                 )
                 frames_meta.append(
                     {
@@ -735,44 +782,55 @@ def _extract_from_h5(
                 mask = bank == bk
                 det = detectors.get(int(bk))
                 if det is not None:
-                    xyz_list[mask] = det.pixel_to_lab(
-                        pixel_r[mask], pixel_c[mask]
-                    )
+                    xyz_list[mask] = det.pixel_to_lab(pixel_r[mask], pixel_c[mask])
                 else:
                     az = (int(bk) * 37.0 % 360.0 - 180.0) + (
                         pixel_c[mask] - 128.0
                     ) * 0.12
                     rad = np.deg2rad(az)
                     y = (pixel_r[mask] - 128.0) * 0.002
-                    xyz_list[mask] = np.column_stack(
-                        [np.sin(rad), y, np.cos(rad)]
-                    )
+                    xyz_list[mask] = np.column_stack([np.sin(rad), y, np.cos(rad)])
             peaks_xyz = xyz_list
 
         # Extract finder-less solve / lattice-ladder / staged-band diagnostics if present
         solve_diagnostics: dict[str, Any] | None = None
         if any(k in f for k in ("blind_search", "scan_refinement", "solve", "search")):
             solve_diagnostics = {}
-            bs_grp = f["blind_search"] if "blind_search" in f else (f["search"] if "search" in f else None)
+            bs_grp = (
+                f["blind_search"]
+                if "blind_search" in f
+                else (f["search"] if "search" in f else None)
+            )
             if bs_grp is not None:
-                solve_diagnostics["stable_observations"] = int(bs_grp.attrs.get("stable_observations", 0))
-                solve_diagnostics["samples_requested"] = int(bs_grp.attrs.get("samples_requested", 0))
+                solve_diagnostics["stable_observations"] = int(
+                    bs_grp.attrs.get("stable_observations", 0)
+                )
+                solve_diagnostics["samples_requested"] = int(
+                    bs_grp.attrs.get("samples_requested", 0)
+                )
                 solve_diagnostics["weighting"] = _decode_str(
-                    bs_grp.attrs.get("weighting"), "smooth chi2-suppressed bin Poisson deviance"
+                    bs_grp.attrs.get("weighting"),
+                    "smooth chi2-suppressed bin Poisson deviance",
                 )
                 if "proposal_scores" in bs_grp:
                     ps = np.asarray(bs_grp["proposal_scores"][()], dtype=float).ravel()
                     solve_diagnostics["n_candidates"] = int(len(ps))
-                    solve_diagnostics["top_proposal_score"] = float(np.max(ps)) if len(ps) else 0.0
+                    solve_diagnostics["top_proposal_score"] = (
+                        float(np.max(ps)) if len(ps) else 0.0
+                    )
                 if "full_scores" in bs_grp:
                     fs = np.asarray(bs_grp["full_scores"][()], dtype=float).ravel()
-                    solve_diagnostics["top_full_score"] = float(np.max(fs)) if len(fs) else 0.0
+                    solve_diagnostics["top_full_score"] = (
+                        float(np.max(fs)) if len(fs) else 0.0
+                    )
             if "scan_refinement" in f:
                 sr_grp = f["scan_refinement"]
                 solve_diagnostics["d_min"] = float(sr_grp.attrs.get("d_min", 2.8))
                 solve_diagnostics["n_zones"] = int(sr_grp.attrs.get("n_zones", 400))
                 solve_diagnostics["modes"] = _decode_str(sr_grp.attrs.get("modes"), "")
-                solve_diagnostics["status"] = _decode_str(sr_grp.attrs.get("status"), "converged")
+                solve_diagnostics["status"] = _decode_str(
+                    sr_grp.attrs.get("status"), "converged"
+                )
                 stages_raw = _decode_str(sr_grp.attrs.get("stages"), "[]")
                 try:
                     solve_diagnostics["stages"] = json.loads(stages_raw)
@@ -780,8 +838,12 @@ def _extract_from_h5(
                     solve_diagnostics["stages"] = []
             elif "solve" in f:
                 s_grp = f["solve"]
-                solve_diagnostics["objective"] = _decode_str(s_grp.attrs.get("objective"), "poisson")
-                solve_diagnostics["status"] = _decode_str(s_grp.attrs.get("status"), "converged")
+                solve_diagnostics["objective"] = _decode_str(
+                    s_grp.attrs.get("objective"), "poisson"
+                )
+                solve_diagnostics["status"] = _decode_str(
+                    s_grp.attrs.get("status"), "converged"
+                )
 
         hkl = None
         if all(f"peaks/{k}" in f for k in ("h", "k", "l")):
@@ -836,9 +898,7 @@ def _extract_from_h5(
                 np.allclose(var_u, var_v)
                 and (cov_uv is None or np.allclose(cov_uv, 0.0))
             )
-            peak_shape_mode = (
-                "isotropic_circle" if is_iso else "anisotropic_ellipse"
-            )
+            peak_shape_mode = "isotropic_circle" if is_iso else "anisotropic_ellipse"
         elif "peaks/pixel_r" in f:
             artifact_kind = "finder"
             peak_shape_mode = "isotropic_circle"
@@ -889,9 +949,7 @@ def _extract_from_h5(
             and len(intensity) == len(peaks_xyz)
             and len(sigma) == len(peaks_xyz)
         ):
-            snr_mask = (sigma > 0) & (
-                intensity / np.maximum(sigma, 1e-9) >= 2.5
-            )
+            snr_mask = (sigma > 0) & (intensity / np.maximum(sigma, 1e-9) >= 2.5)
             if int(np.sum(snr_mask)) >= 20 and int(np.sum(snr_mask)) < len(peaks_xyz):
                 peaks_xyz = peaks_xyz[snr_mask]
                 if bank is not None and len(bank) == len(snr_mask):
@@ -926,14 +984,10 @@ def _extract_from_h5(
                     else None
                 )
                 n_bank_entries = (
-                    len(b_ids_pred)
-                    if b_ids_pred is not None
-                    else len(f["banks"])
+                    len(b_ids_pred) if b_ids_pred is not None else len(f["banks"])
                 )
                 f0_p, f1_p = (
-                    frame_slice
-                    if frame_slice is not None
-                    else (0, n_bank_entries)
+                    frame_slice if frame_slice is not None else (0, n_bank_entries)
                 )
 
                 bank_imgs_pred: dict[int, np.ndarray] = {}
@@ -1015,9 +1069,7 @@ def _extract_from_h5(
                     if det is not None:
                         xyz_i = det.pixel_to_lab(pr_i, pc_i)
                     else:
-                        az = (int(bid) * 37.0 % 360.0 - 180.0) + (
-                            pc_i - 128.0
-                        ) * 0.12
+                        az = (int(bid) * 37.0 % 360.0 - 180.0) + (pc_i - 128.0) * 0.12
                         rad = np.deg2rad(az)
                         y_c = (pr_i - 128.0) * 0.002
                         xyz_i = np.column_stack([np.sin(rad), y_c, np.cos(rad)])
@@ -1060,7 +1112,12 @@ def _extract_from_h5(
                 R_gonio = R_all
 
         # Finder-less solve.h5 forward projection onto calibrated detector banks
-        if (peaks_xyz is None or len(peaks_xyz) == 0) and U is not None and B is not None and detectors:
+        if (
+            (peaks_xyz is None or len(peaks_xyz) == 0)
+            and U is not None
+            and B is not None
+            and detectors
+        ):
             try:
                 from subhkl.core.crystallography import generate_reflections
 
@@ -1075,7 +1132,9 @@ def _extract_from_h5(
                     else np.eye(3)
                 )
                 RUB = R_run @ U_mat @ B_mat
-                cell_use = cell if cell and len(cell) == 6 else list(_cell_from_B(B_mat))
+                cell_use = (
+                    cell if cell and len(cell) == 6 else list(_cell_from_B(B_mat))
+                )
                 d_min_use = (
                     float(solve_diagnostics.get("d_min", 2.5))
                     if solve_diagnostics and "d_min" in solve_diagnostics
@@ -1146,9 +1205,7 @@ def _extract_from_h5(
                     w_d, h_d = float(det.width), float(det.height)
                     nrm = np.cross(uh, vh)
                     dn = kf @ nrm
-                    t_ray = np.dot(cen, nrm) / np.where(
-                        np.abs(dn) < 1e-9, -1.0, dn
-                    )
+                    t_ray = np.dot(cen, nrm) / np.where(np.abs(dn) < 1e-9, -1.0, dn)
                     hit = t_ray > 0
                     if not np.any(hit):
                         continue
@@ -1279,11 +1336,7 @@ def _build_lattice_ladder_steps(
     n_total = max(len(peaks_list), 1)
     indexed_peaks = [p for p in peaks_list if p["indexed"]]
     overall_rms = (
-        float(
-            np.sqrt(
-                np.mean([p["angular_error_deg"] ** 2 for p in indexed_peaks])
-            )
-        )
+        float(np.sqrt(np.mean([p["angular_error_deg"] ** 2 for p in indexed_peaks])))
         if indexed_peaks
         else 0.0
     )
@@ -1363,16 +1416,12 @@ def _build_lattice_ladder_steps(
     )
 
     z12_ids = [z["zone_id"] for z in zones[:2]]
-    z12_peaks = sorted(
-        {pid for z in zones[:2] for pid in z["member_peak_ids"]}
-    )
+    z12_peaks = sorted({pid for z in zones[:2] for pid in z["member_peak_ids"]})
     psi_deg = 90.0
     if len(zones) >= 2:
         a0 = np.asarray(zones[0]["axis_crystal_xyz"], dtype=float)
         a1 = np.asarray(zones[1]["axis_crystal_xyz"], dtype=float)
-        psi_deg = float(
-            np.rad2deg(np.arccos(np.clip(np.dot(a0, a1), -1.0, 1.0)))
-        )
+        psi_deg = float(np.rad2deg(np.arccos(np.clip(np.dot(a0, a1), -1.0, 1.0))))
     z1_label = zones[1]["label"] if len(zones) >= 2 else "[0 1 0]"
     if "global" in stages_map:
         st_g = stages_map["global"]
@@ -1408,11 +1457,7 @@ def _build_lattice_ladder_steps(
 
     z_const_ids = [z["zone_id"] for z in zones[: min(6, len(zones))]]
     z_const_peaks = sorted(
-        {
-            pid
-            for z in zones[: min(6, len(zones))]
-            for pid in z["member_peak_ids"]
-        }
+        {pid for z in zones[: min(6, len(zones))] for pid in z["member_peak_ids"]}
     )
     if "cell" in stages_map or "120-zones" in stages_map:
         st_c = stages_map.get("cell", stages_map.get("120-zones", {}))
@@ -1433,12 +1478,7 @@ def _build_lattice_ladder_steps(
             "fraction_indexed": round(len(z_const_peaks) / n_total, 4),
             "rms_deg": round(
                 float(
-                    np.mean(
-                        [
-                            z["angular_rms_deg"]
-                            for z in zones[: min(6, len(zones))]
-                        ]
-                    )
+                    np.mean([z["angular_rms_deg"] for z in zones[: min(6, len(zones))]])
                 )
                 if zones
                 else overall_rms,
@@ -1459,9 +1499,7 @@ def _build_lattice_ladder_steps(
         else "Refined UB Matrix"
     )
     s5_stage = (
-        "5. Converged Solve UB"
-        if solve_diagnostics
-        else "5. Indexed UB Solution"
+        "5. Converged Solve UB" if solve_diagnostics else "5. Indexed UB Solution"
     )
     steps.append(
         {
@@ -1524,9 +1562,7 @@ def _build_ndip_pipeline_stages(
     pending_stage = _pending_stage_for_artifact_kind(artifact_kind)
     stage_order = ["reduce", "solve", "integrate", "merge"]
     pending_idx = (
-        stage_order.index(pending_stage)
-        if pending_stage in stage_order
-        else 1
+        stage_order.index(pending_stage) if pending_stage in stage_order else 1
     )
 
     def _stage_status(idx: int) -> str:
@@ -1549,8 +1585,14 @@ def _build_ndip_pipeline_stages(
             "container": "ghcr.io/neutrons/subhkl:1.4.0",
             "artifact": (
                 f"merged.h5 ({solve_diagnostics['stable_observations']:,} count bins)"
-                if is_finderless and solve_diagnostics and solve_diagnostics.get("stable_observations")
-                else ("merged.h5 (detector image stack)" if artifact_kind == "merged" else f"scan_master.h5 → finder.h5 ({n_peaks} peaks)")
+                if is_finderless
+                and solve_diagnostics
+                and solve_diagnostics.get("stable_observations")
+                else (
+                    "merged.h5 (detector image stack)"
+                    if artifact_kind == "merged"
+                    else f"scan_master.h5 → finder.h5 ({n_peaks} peaks)"
+                )
             ),
             "status": _stage_status(0),
             "ladder_rung_idx": 0,
@@ -1803,9 +1845,7 @@ def build_rainbow_zone_payload(
         G_pred_cryst = hkl_arr @ ub_matrix.T
         G_norm = np.linalg.norm(G_pred_cryst, axis=1)
         valid_hkl = G_norm > 1e-8
-        G_pred_hat = np.divide(
-            G_pred_cryst, np.maximum(G_norm[:, None], 1e-12)
-        )
+        G_pred_hat = np.divide(G_pred_cryst, np.maximum(G_norm[:, None], 1e-12))
         cos_err = np.clip(np.sum(g_crystal * G_pred_hat, axis=1), -1.0, 1.0)
         ang_err_deg = np.where(valid_hkl, np.rad2deg(np.arccos(cos_err)), 90.0)
         d_spacing = np.where(valid_hkl, 1.0 / np.maximum(G_norm, 1e-8), 0.0)
@@ -1819,9 +1859,7 @@ def build_rainbow_zone_payload(
         if hkl_arr is None:
             hkl_arr = np.zeros((n_peaks, 3), dtype=int)
         sin_theta = (
-            np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999)
-            if n_peaks > 0
-            else np.zeros(0)
+            np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999) if n_peaks > 0 else np.zeros(0)
         )
         if lam_arr is None:
             lam_arr = np.full(n_peaks, 0.5 * (wl_min + wl_max), dtype=float)
@@ -1840,7 +1878,9 @@ def build_rainbow_zone_payload(
             ki=ki_hat,
             max_index=max_zone_index,
             tolerance_deg=zone_tolerance_deg,
-            min_peaks=0 if ub_matrix is not None else min(min_zone_peaks, max(1, n_peaks)),
+            min_peaks=0
+            if ub_matrix is not None
+            else min(min_zone_peaks, max(1, n_peaks)),
             n_arc=n_arc,
         )
         if n_peaks > 0
@@ -1853,29 +1893,31 @@ def build_rainbow_zone_payload(
     # Keep all fundamental Order 1 zones (|u|,|v|,|w| <= 1) plus populated Order 2 and Order 3 zones
     selected_zones: list[dict[str, Any]] = []
     z_ord1 = [
-        z for z in raw_zones
+        z
+        for z in raw_zones
         if z["order"] == 1 and (z["n_peaks"] >= 1 or len(z["conic"]["det_x"]) > 0)
     ][:13]
     z_ord2 = [
-        z for z in raw_zones
+        z
+        for z in raw_zones
         if z["order"] == 2 and z["n_peaks"] >= max(1, min_zone_peaks)
     ][:14]
     z_ord3 = [
-        z for z in raw_zones
+        z
+        for z in raw_zones
         if z["order"] == 3 and z["n_peaks"] >= max(2, min_zone_peaks)
     ][:16]
     selected_zones.extend(z_ord1)
     selected_zones.extend(z_ord2)
     selected_zones.extend(z_ord3)
     other_zones = [
-        z for z in raw_zones
+        z
+        for z in raw_zones
         if z["order"] > 3 and z["n_peaks"] >= max(2, min_zone_peaks)
     ][:8]
     selected_zones.extend(other_zones)
-    selected_zones.sort(
-        key=lambda z: (z["order"], -z["n_peaks"], -z["score"])
-    )
-    raw_zones = selected_zones[:max(max_zones, len(z_ord1) + len(z_ord2))]
+    selected_zones.sort(key=lambda z: (z["order"], -z["n_peaks"], -z["score"]))
+    raw_zones = selected_zones[: max(max_zones, len(z_ord1) + len(z_ord2))]
     for new_zid, z in enumerate(raw_zones):
         z["zone_id"] = new_zid
 
@@ -1956,7 +1998,10 @@ def build_rainbow_zone_payload(
                         for m in range(n_ell_pts)
                     ]
                     ellipse_sph_by_idx[p_i] = [
-                        [round(float(az_row[m]), 3), round(float(el_mat[k_local, m]), 3)]
+                        [
+                            round(float(az_row[m]), 3),
+                            round(float(el_mat[k_local, m]), 3),
+                        ]
                         for m in range(n_ell_pts)
                     ]
                     sigma_major_by_idx[p_i] = round(float(s1_all[p_i]), 2)
@@ -1973,14 +2018,10 @@ def build_rainbow_zone_payload(
             int(hkl_arr[i, 2]),
         )
         g_gcd = (
-            int(np.gcd.reduce(np.abs([h_i, k_i, l_i])))
-            if (h_i or k_i or l_i)
-            else 1
+            int(np.gcd.reduce(np.abs([h_i, k_i, l_i]))) if (h_i or k_i or l_i) else 1
         )
         d_val = float(d_spacing[i]) if i < len(d_spacing) else 2.0
-        lam_val = (
-            float(lam_arr[i]) if i < len(lam_arr) else 0.5 * (wl_min + wl_max)
-        )
+        lam_val = float(lam_arr[i]) if i < len(lam_arr) else 0.5 * (wl_min + wl_max)
         err_val = float(ang_err_deg[i]) if i < len(ang_err_deg) else 0.0
         is_indexed = bool(
             (
@@ -1996,9 +2037,7 @@ def build_rainbow_zone_payload(
         pk_entry: dict[str, Any] = {
             "id": i,
             "bank": (
-                int(bank_arr[i])
-                if bank_arr is not None and i < len(bank_arr)
-                else 1
+                int(bank_arr[i]) if bank_arr is not None and i < len(bank_arr) else 1
             ),
             "row": (
                 round(float(pixel_r_arr[i]), 2)
@@ -2029,9 +2068,7 @@ def build_rainbow_zone_payload(
                 if sigma_arr is not None and i < len(sigma_arr)
                 else 3.0
             ),
-            "wavelength": round(
-                float(np.clip(lam_val, wl_min * 0.5, wl_max * 1.5)), 4
-            ),
+            "wavelength": round(float(np.clip(lam_val, wl_min * 0.5, wl_max * 1.5)), 4),
             "d_spacing": round(d_val, 4),
             "harmonic_order": max(1, g_gcd),
             "parallax_depth": round(parallax_depth, 4),
@@ -2066,9 +2103,7 @@ def build_rainbow_zone_payload(
         if detectors:
             for bk, det in sorted(detectors.items()):
                 try:
-                    mask, row, col = det.reflections_mask(
-                        kf[:, 0], kf[:, 1], kf[:, 2]
-                    )
+                    mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
                     if not np.any(mask):
                         continue
                     idx_hits = np.where(mask)[0]
@@ -2122,9 +2157,7 @@ def build_rainbow_zone_payload(
                 cur_seg = []
                 cur_seg_sph = []
             cur_seg.append([round(float(dx[k]), 2), round(float(dy[k]), 4)])
-            cur_seg_sph.append(
-                [round(float(dx[k]), 2), round(float(del_deg[k]), 3)]
-            )
+            cur_seg_sph.append([round(float(dx[k]), 2), round(float(del_deg[k]), 3)])
         if len(cur_seg) >= 2:
             continuous_segments.append(cur_seg)
             continuous_segments_sph.append(cur_seg_sph)
@@ -2141,8 +2174,7 @@ def build_rainbow_zone_payload(
         for k in range(0, len(sx_z), 2):
             if cur_s and (
                 hm_z[k] != cur_s[-1][2]
-                or np.hypot(sx_z[k] - cur_s[-1][0], sy_z[k] - cur_s[-1][1])
-                > 0.35
+                or np.hypot(sx_z[k] - cur_s[-1][0], sy_z[k] - cur_s[-1][1]) > 0.35
             ):
                 if len(cur_s) >= 2:
                     stereo_segments.append(cur_s)
@@ -2177,9 +2209,7 @@ def build_rainbow_zone_payload(
                 "n_peaks": z["n_peaks"],
                 "angular_rms_deg": z["angular_rms_deg"],
                 "member_peak_ids": z["member_peak_ids"],
-                "rainbow_color": RAINBOW_SPECTRAL_HEX[
-                    zi % len(RAINBOW_SPECTRAL_HEX)
-                ],
+                "rainbow_color": RAINBOW_SPECTRAL_HEX[zi % len(RAINBOW_SPECTRAL_HEX)],
                 "pro_color": PRO_PALETTE_HEX[zi % len(PRO_PALETTE_HEX)],
                 "stereo_segments": stereo_segments,
                 "detector_segments": det_segments,
@@ -2233,6 +2263,28 @@ def build_rainbow_zone_payload(
         else "—"
     )
 
+    from subhkl.config import beamlines as _cfg_beamlines
+
+    beamline_detectors: dict[str, dict[str, Any]] = {}
+    for _inst_k in ("CG4D", "MANDI", "IMAGINE"):
+        if _inst_k in _cfg_beamlines:
+            beamline_detectors[_inst_k] = {
+                str(bk): {
+                    "center": [round(float(x), 5) for x in cfg["center"]],
+                    "uhat": [round(float(x), 5) for x in cfg["uhat"]],
+                    "vhat": [round(float(x), 5) for x in cfg["vhat"]],
+                    "width": round(float(cfg["width"]), 5),
+                    "height": round(float(cfg["height"]), 5),
+                    "m": int(cfg.get("m", 256)),
+                    "n": int(cfg.get("n", 256)),
+                }
+                for bk, cfg in _cfg_beamlines[_inst_k].items()
+                if isinstance(cfg, dict)
+                and "center" in cfg
+                and "uhat" in cfg
+                and "vhat" in cfg
+            }
+
     return {
         "instrument": str(instrument),
         "default_projection": resolved_proj,
@@ -2252,6 +2304,7 @@ def build_rainbow_zone_payload(
             if ub_matrix is not None
             else None
         ),
+        "beamline_detectors": beamline_detectors,
         "peaks": peaks_list,
         "zones": zones_payload,
         "panels": panels_payload,
@@ -2274,9 +2327,7 @@ def render_rainbow_html(
     initial_proj = (
         str(projection).lower()
         if projection in ("cylindrical", "spherical")
-        else payload.get(
-            "default_projection", default_projection_for_instrument(inst)
-        )
+        else payload.get("default_projection", default_projection_for_instrument(inst))
     )
     src_badge = (
         "RAW DETECTOR COUNTS"
@@ -3103,8 +3154,11 @@ def render_rainbow_html(
           Preview: /HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5 … CG4D_2638.nxs.h5 (14 runs)
         </div>
         <div id="nd-validation-status" style="font-family:var(--font-display);font-size:0.66rem;min-height:18px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 6px;border-radius:4px;background:rgba(7,9,19,0.65);border:1px solid rgba(56,189,248,0.2);">
-          <span id="nd-validation-msg" style="color:var(--text-dim);">Checking path availability on /SNS &amp; /HFIR…</span>
-          <button id="btn-nd-use-suggested-ipts" type="button" style="display:none;padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(251,191,36,0.18);border:1px solid var(--accent-gold);color:var(--accent-gold);border-radius:4px;cursor:pointer;white-space:nowrap;"></button>
+          <span id="nd-validation-msg" style="color:var(--text-dim);">Ready to verify via NDIP Load Neutron Data (`neutrons_load_data`)</span>
+          <div style="display:flex;align-items:center;gap:6px;">
+            <button id="btn-nd-use-suggested-ipts" type="button" style="display:none;padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(251,191,36,0.18);border:1px solid var(--accent-gold);color:var(--accent-gold);border-radius:4px;cursor:pointer;white-space:nowrap;"></button>
+            <button id="btn-nd-verify" type="button" style="padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(56,189,248,0.14);border:1px solid rgba(56,189,248,0.45);color:var(--accent-cyan);border-radius:4px;cursor:pointer;white-space:nowrap;">Check via NDIP</button>
+          </div>
         </div>
       </div>
 
@@ -3755,6 +3809,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const ph = y1 - y0;
 
       const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
+      const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
 
       ctx.save();
       if (outlinePts && outlinePts.length >= 4) {{
@@ -3777,7 +3832,62 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (texCanvas && state.detAlpha > 0.01) {{
         ctx.globalAlpha = state.detAlpha;
         ctx.imageSmoothingEnabled = true;
-        ctx.drawImage(texCanvas, x0, y0, pw, ph);
+        if (cornersPts && cornersPts.length === 4) {{
+          // True 2-triangle affine texture projection from (r, c) corners C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
+          const S0 = detToScreen(cornersPts[0][0], cornersPts[0][1], w, h, -0.35);
+          const S1 = detToScreen(cornersPts[1][0], cornersPts[1][1], w, h, -0.35);
+          const S2 = detToScreen(cornersPts[2][0], cornersPts[2][1], w, h, -0.35);
+          const S3 = detToScreen(cornersPts[3][0], cornersPts[3][1], w, h, -0.35);
+          const W = Math.max(1, texCanvas.width);
+          const H = Math.max(1, texCanvas.height);
+          const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
+          if (nonPara < 2.2) {{
+            const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
+            const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
+            const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
+            const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
+            const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
+            const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
+            ctx.save();
+            ctx.transform(ax, ay, cx, cy, ex, ey);
+            ctx.drawImage(texCanvas, 0, 0, W, H);
+            ctx.restore();
+          }} else {{
+            // Triangle A: (0,0)->S0, (W,0)->S3, (0,H)->S1
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(S0[0], S0[1]);
+            ctx.lineTo(S3[0], S3[1]);
+            ctx.lineTo(S1[0], S1[1]);
+            ctx.closePath();
+            ctx.clip();
+            ctx.transform(
+              (S3[0] - S0[0]) / W, (S3[1] - S0[1]) / W,
+              (S1[0] - S0[0]) / H, (S1[1] - S0[1]) / H,
+              S0[0], S0[1]
+            );
+            ctx.drawImage(texCanvas, 0, 0, W, H);
+            ctx.restore();
+
+            // Triangle B: (W,0)->S3, (W,H)->S2, (0,H)->S1
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(S3[0], S3[1]);
+            ctx.lineTo(S2[0], S2[1]);
+            ctx.lineTo(S1[0], S1[1]);
+            ctx.closePath();
+            ctx.clip();
+            ctx.transform(
+              (S2[0] - S1[0]) / W, (S2[1] - S1[1]) / W,
+              (S2[0] - S3[0]) / H, (S2[1] - S3[1]) / H,
+              S3[0] + S1[0] - S2[0], S3[1] + S1[1] - S2[1]
+            );
+            ctx.drawImage(texCanvas, 0, 0, W, H);
+            ctx.restore();
+          }}
+        }} else {{
+          ctx.drawImage(texCanvas, x0, y0, pw, ph);
+        }}
       }}
       ctx.restore();
 
@@ -3797,11 +3907,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.strokeRect(x0, y0, pw, ph);
       }}
 
-    // Only show bank labels when zoomed in so default view is clean
-      if (state.detZoom > 1.35 && pw > 34 && ph > 24) {{
+      // Only show bank labels when zoomed in so default view is clean
+      if (state.detZoom > 1.35 && Math.abs(pw) > 34 && Math.abs(ph) > 24) {{
         ctx.fillStyle = "rgba(148, 163, 184, 0.42)";
         ctx.font = "8px monospace";
-        ctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 9);
+        if (cornersPts && cornersPts.length === 4) {{
+          const cScreen = cornersPts.map(pt => detToScreen(pt[0], pt[1], w, h, -0.35));
+          const cxLbl = 0.25 * (cScreen[0][0] + cScreen[1][0] + cScreen[2][0] + cScreen[3][0]);
+          const cyLbl = 0.25 * (cScreen[0][1] + cScreen[1][1] + cScreen[2][1] + cScreen[3][1]);
+          ctx.fillText(`b${{panel.bank}}`, cxLbl - 7, cyLbl + 3);
+        }} else {{
+          ctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 9);
+        }}
       }}
     }});
     ctx.restore();
@@ -4228,18 +4345,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!newPayload) return;
     const prevInst = DATA.instrument;
     DATA.instrument = newPayload.instrument || DATA.instrument;
+    if (newPayload.beamline_detectors) {{
+      DATA.beamline_detectors = newPayload.beamline_detectors;
+    }}
     if (newPayload.default_projection || (DATA.instrument && DATA.instrument !== prevInst)) {{
       const nextProj = newPayload.default_projection || ((DATA.instrument === "MANDI" || DATA.instrument === "TOPAZ") ? "spherical" : "cylindrical");
       state.projection = nextProj;
-      if (btnProjCyl && btnProjSph) {{
-        btnProjCyl.classList.toggle("active-btn", nextProj === "cylindrical");
-        btnProjSph.classList.toggle("active-btn", nextProj === "spherical");
-      }}
-      if (lblDetectorView) {{
-        lblDetectorView.textContent = nextProj === "spherical"
-          ? "DETECTOR VIEW // SPHERICAL (AZIMUTH vs ELEVATION)"
-          : "DETECTOR VIEW // CYLINDRICAL UNROLLED (γ vs Y)";
-      }}
+      syncProjectionUI();
     }}
     DATA.space_group = newPayload.space_group || DATA.space_group;
     DATA.wavelength_range = newPayload.wavelength_range || DATA.wavelength_range;
@@ -4262,16 +4374,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (dEl) dEl.value = Number(DATA.d_min).toFixed(1);
     }}
 
+    const nextPeaks = Array.isArray(newPayload.peaks) ? [...newPayload.peaks] : [];
+    const nextZones = Array.isArray(newPayload.zones) ? [...newPayload.zones] : [];
+    const nextPanels = Array.isArray(newPayload.panels) ? [...newPayload.panels] : [];
+    const nextLadder = Array.isArray(newPayload.ladder_steps) && newPayload.ladder_steps.length > 0 ? [...newPayload.ladder_steps] : [...LADDER];
+    const nextPipeline = Array.isArray(newPayload.pipeline_stages) && newPayload.pipeline_stages.length > 0 ? [...newPayload.pipeline_stages] : [...PIPELINE];
+
     PEAKS.length = 0;
-    (newPayload.peaks || []).forEach(p => PEAKS.push(p));
+    nextPeaks.forEach(p => PEAKS.push(p));
     ZONES.length = 0;
-    (newPayload.zones || []).forEach(z => ZONES.push(z));
+    nextZones.forEach(z => ZONES.push(z));
     PANELS.length = 0;
-    (newPayload.panels || []).forEach(p => PANELS.push(p));
+    nextPanels.forEach(p => PANELS.push(p));
     LADDER.length = 0;
-    (newPayload.ladder_steps || []).forEach(s => LADDER.push(s));
+    nextLadder.forEach(s => LADDER.push(s));
     PIPELINE.length = 0;
-    (newPayload.pipeline_stages || []).forEach(s => PIPELINE.push(s));
+    nextPipeline.forEach(s => PIPELINE.push(s));
 
     if (PANELS.length > 0) {{
       const allY = [], allEl = [];
@@ -4435,7 +4553,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         return String(a.value || defVal);
       }} catch (_e) {{ return defVal; }}
     }};
-    const inst = getAttrStr(f, "instrument", DATA.instrument || "CG4D");
+    let inst = getAttrStr(f, "instrument", "");
+    if (!inst) {{
+      try {{
+        if (f.keys().includes("files")) {{
+          const fl = Array.from(f.get("files").value || []).map(String).join(" ").toUpperCase();
+          if (fl.includes("MANDI")) inst = "MANDI";
+          else if (fl.includes("CG4D")) inst = "CG4D";
+          else if (fl.includes("IMAGINE")) inst = "IMAGINE";
+        }}
+      }} catch (_e) {{}}
+    }}
+    if (!inst && mf && mf.keys().includes("images")) {{
+      const sh = Array.from(mf.get("images").shape || []).map(Number);
+      if (sh[1] === 256) inst = "MANDI";
+      else if (sh[1] === 512) inst = "CG4D";
+    }}
+    if (!inst) inst = DATA.instrument || "CG4D";
+
     let wlRangeNew = [2.8, 4.5];
     let dMinNew = 2.8;
     try {{
@@ -4474,22 +4609,39 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
       }}
       bankIdsRun = bAll.slice(f0, f1);
+      if (bankIdsRun.some(b => b > 60)) inst = "CG4D";
+      else if (bankIdsRun.some(b => b < 10) || (bankIdsRun.length > 0 && bankIdsRun.length <= 45)) inst = "MANDI";
     }}
 
-    // Read calibrated detector banks from detector_calibration/bank_*
+    // Seed nominal detector banks from DATA.beamline_detectors[inst], then override with detector_calibration/bank_*
     const detMap = new Map();
+    const nomBanks = (DATA.beamline_detectors && DATA.beamline_detectors[inst]) || {{}};
+    Object.entries(nomBanks).forEach(([bkStr, cfg]) => {{
+      const bid = parseInt(bkStr, 10);
+      detMap.set(bid, {{
+        bid,
+        center: [...cfg.center],
+        uhat: [...cfg.uhat],
+        vhat: [...cfg.vhat],
+        width: Number(cfg.width),
+        height: Number(cfg.height),
+        m: Number(cfg.m || (inst === "MANDI" ? 256 : 512)),
+        n: Number(cfg.n || (inst === "MANDI" ? 256 : 512)),
+      }});
+    }});
     if (f.keys().includes("detector_calibration")) {{
       const calGrp = f.get("detector_calibration");
       for (const bName of calGrp.keys()) {{
         if (!bName.startsWith("bank_")) continue;
         const bid = parseInt(bName.slice(5), 10);
         const g = calGrp.get(bName);
+        const baseDet = detMap.get(bid) || {{ m: inst === "MANDI" ? 256 : 512, n: inst === "MANDI" ? 256 : 512 }};
         const center = Array.from(g.get("center").value).map(Number);
         const uhat = Array.from(g.get("uhat").value).map(Number);
         const vhat = Array.from(g.get("vhat").value).map(Number);
         const width = Number(g.get("width").value);
         const height = Number(g.get("height").value);
-        detMap.set(bid, {{ bid, center, uhat, vhat, width, height, m: 512, n: 512 }});
+        detMap.set(bid, {{ bid, center, uhat, vhat, width, height, m: baseDet.m, n: baseDet.n }});
       }}
     }}
 
@@ -4507,7 +4659,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const sub = imDs.slice([[f0 + i, f0 + i + 1], [0, H], [0, W]]);
         bankImgs.set(bid, {{ data: sub, H, W }});
 
-        // Downsample and log1p-scale into offscreen canvas
+        // Downsample and log1p-scale into offscreen canvas (canonical r, c order matching C0..C3)
         const logBuf = new Float32Array(Hb * Wb);
         for (let rb = 0; rb < Hb; rb++) {{
           for (let cb = 0; cb < Wb; cb++) {{
@@ -4527,8 +4679,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const idata = gctx.createImageData(Wb, Hb);
         for (let rb = 0; rb < Hb; rb++) {{
           for (let cb = 0; cb < Wb; cb++) {{
-            // Flip horizontally so column 0..W maps left-to-right in azimuth
-            const v = Math.min(255, Math.round((logBuf[rb * Wb + (Wb - 1 - cb)] / vmax) * 255));
+            const v = Math.min(255, Math.round((logBuf[rb * Wb + cb] / vmax) * 255));
             const pIdx = (rb * Wb + cb) * 4;
             idata.data[pIdx] = v; idata.data[pIdx+1] = v; idata.data[pIdx+2] = v; idata.data[pIdx+3] = 255;
           }}
@@ -4538,7 +4689,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
     }}
 
-    // Build panel outlines from detMap
+    // Build panel outlines and 4 corners from detMap
     const panelsOut = [];
     const pixelToLab = (det, r, c) => {{
       const u = ((det.m - 1 - c) / (det.m - 1) - 0.5) * det.width;
@@ -4550,13 +4701,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ];
     }};
     for (const [bid, det] of detMap.entries()) {{
+      const corners = [], cornersSph = [];
+      [[0, 0], [det.n - 1, 0], [det.n - 1, det.m - 1], [0, det.m - 1]].forEach(([rc, cc]) => {{
+        const [azC, yC, elC] = labToCyl(pixelToLab(det, rc, cc));
+        corners.push([azC, yC]);
+        cornersSph.push([azC, elC]);
+      }});
       const outline = [], outlineSph = [];
       const nPts = 12;
       const edges = [];
-      for (let k=0;k<nPts;k++) edges.push([0, (k/(nPts-1))*(det.m-1)]);
-      for (let k=0;k<nPts;k++) edges.push([(k/(nPts-1))*(det.n-1), det.m-1]);
-      for (let k=0;k<nPts;k++) edges.push([det.n-1, ((nPts-1-k)/(nPts-1))*(det.m-1)]);
-      for (let k=0;k<nPts;k++) edges.push([((nPts-1-k)/(nPts-1))*(det.n-1), 0]);
+      for (let k=0;k<nPts;k++) edges.push([(k/nPts)*(det.n-1), 0]);
+      for (let k=0;k<nPts;k++) edges.push([det.n-1, (k/nPts)*(det.m-1)]);
+      for (let k=0;k<nPts;k++) edges.push([((nPts-k)/nPts)*(det.n-1), det.m-1]);
+      for (let k=0;k<nPts;k++) edges.push([0, ((nPts-k)/nPts)*(det.m-1)]);
       let azMin=180, azMax=-180, yMin=10, yMax=-10, elMin=90, elMax=-90;
       edges.forEach(([r, c]) => {{
         const [az, y, el] = labToCyl(pixelToLab(det, r, c));
@@ -4568,19 +4725,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (azMax - azMin <= 180) {{
         panelsOut.push({{
           bank: bid, az_min: azMin, az_max: azMax, y_min: yMin, y_max: yMax, el_min: elMin, el_max: elMax,
+          corners, corners_sph: cornersSph,
           outline, outline_sph: outlineSph, _grayCanvas: bankGrayCanvases.get(bid) || null,
         }});
       }}
-    }}
-    if (panelsOut.length === 0 && PANELS.length > 0) {{
-      PANELS.forEach(p => {{
-        const gc = bankGrayCanvases.get(p.bank) || p._grayCanvas || null;
-        panelsOut.push({{
-          ...p,
-          texture_b64: gc ? null : p.texture_b64,
-          _grayCanvas: gc,
-        }});
-      }});
     }}
 
     // Read sample U, B, R_run and forward-project reflections
@@ -4910,10 +5058,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ];
     try {{ f.close(); if (mf && mf !== f) mf.close(); }} catch (_e) {{}}
     return {{
-      instrument: inst, space_group: sg, intensity_source: bankImgs.size > 0 ? "raw_h5" : "reconstructed",
-      artifact_kind: artifactKind, peak_shape_mode: peakShapeMode,
-      wavelength_range: wlRangeNew, d_min: dMinNew, cell, peaks: peaksOut, zones: zonesOut, panels: panelsOut,
-      ladder_steps: ladderOut, pipeline_stages: PIPELINE,
+      instrument: inst,
+      default_projection: (inst === "MANDI" || inst === "TOPAZ") ? "spherical" : "cylindrical",
+      space_group: sg,
+      intensity_source: bankImgs.size > 0 ? "raw_h5" : "reconstructed",
+      artifact_kind: artifactKind,
+      peak_shape_mode: peakShapeMode,
+      wavelength_range: wlRangeNew,
+      d_min: dMinNew,
+      cell,
+      peaks: peaksOut,
+      zones: zonesOut,
+      panels: panelsOut,
+      ladder_steps: ladderOut,
+      pipeline_stages: PIPELINE.map(s => ({{ ...s }})),
     }};
   }}
 
@@ -5031,6 +5189,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const fac = (document.getElementById("nd-facility")?.value || "HFIR").trim();
     const inst = (document.getElementById("nd-instrument")?.value || "CG4D").trim();
     const iptsRaw = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
+    const runsSpec = (document.getElementById("nd-runs")?.value || "").trim();
     const paths = buildNeutronFilePathsFromDialog();
     if (paths.length === 0) {{
       statusBox.style.borderColor = "rgba(248,113,113,0.45)";
@@ -5040,14 +5199,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       lastNdValidationResult = {{ ok: false, message: msgEl.textContent }};
       return lastNdValidationResult;
     }}
+    statusBox.style.borderColor = "rgba(56,189,248,0.45)";
+    msgEl.style.color = "#38bdf8";
+    msgEl.textContent = `⏳ Verifying ${{paths.length}} run(s) via NDIP Load Neutron Data…`;
+    if (sugBtn) sugBtn.style.display = "none";
     try {{
       const r = await fetch("api/pipeline/check_neutron_paths", {{
         method: "POST",
         headers: {{ "Content-Type": "application/json" }},
         body: JSON.stringify({{
+          ingest_mode: ndIngestMode === "ipts" ? "oncat" : "file",
           facility: fac,
           instrument: inst,
           ipts: iptsRaw,
+          runs: runsSpec,
           paths: paths,
         }}),
       }});
@@ -5093,25 +5258,42 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function updateNeutronDialogPreview() {{
     const prevEl = document.getElementById("nd-preview-path");
+    const statusBox = document.getElementById("nd-validation-status");
+    const msgEl = document.getElementById("nd-validation-msg");
+    const sugBtn = document.getElementById("btn-nd-use-suggested-ipts");
+    lastNdValidationResult = null;
+    if (sugBtn) sugBtn.style.display = "none";
     if (!prevEl) return;
     if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
       prevEl.textContent = `Local NeXus files (${{pendingLocalNexusFiles.length}}): ${{pendingLocalNexusFiles.map(f => f.name).join(", ")}}`;
-      verifyNeutronPathsInDialog();
+      if (statusBox) statusBox.style.borderColor = "rgba(52,211,153,0.5)";
+      if (msgEl) {{
+        msgEl.style.color = "#34d399";
+        msgEl.textContent = `✓ ${{pendingLocalNexusFiles.length}} local NeXus file(s) staged for upload`;
+      }}
       return;
     }}
     const paths = buildNeutronFilePathsFromDialog();
     if (paths.length === 0) {{
       prevEl.textContent = "Preview: specify IPTS + run range or explicit file path(s)";
-    }} else if (paths.length === 1) {{
-      prevEl.textContent = `Preview: ${{paths[0]}}`;
+      if (statusBox) statusBox.style.borderColor = "rgba(248,113,113,0.45)";
+      if (msgEl) {{
+        msgEl.style.color = "#f87171";
+        msgEl.textContent = "⚠️ Enter a valid IPTS number and run (or explicit file path).";
+      }}
     }} else {{
-      const lastBase = paths[paths.length - 1].split("/").pop();
-      prevEl.textContent = `Preview: ${{paths[0]}} … ${{lastBase}} (${{paths.length}} runs)`;
+      if (paths.length === 1) {{
+        prevEl.textContent = `Preview: ${{paths[0]}}`;
+      }} else {{
+        const lastBase = paths[paths.length - 1].split("/").pop();
+        prevEl.textContent = `Preview: ${{paths[0]}} … ${{lastBase}} (${{paths.length}} runs)`;
+      }}
+      if (statusBox) statusBox.style.borderColor = "rgba(56,189,248,0.25)";
+      if (msgEl) {{
+        msgEl.style.color = "var(--text-dim)";
+        msgEl.textContent = `Ready to verify ${{paths.length}} run(s) via NDIP Load Neutron Data`;
+      }}
     }}
-    if (ndValidateTimer) clearTimeout(ndValidateTimer);
-    ndValidateTimer = setTimeout(() => {{
-      verifyNeutronPathsInDialog();
-    }}, 180);
   }}
 
   function openNeutronDataModal(localNexusFiles = null) {{
@@ -5142,6 +5324,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   if (btnNdClose) btnNdClose.addEventListener("click", closeNeutronDataModal);
   if (btnNdCancel) btnNdCancel.addEventListener("click", closeNeutronDataModal);
+  const btnNdVerify = document.getElementById("btn-nd-verify");
+  if (btnNdVerify) {{
+    btnNdVerify.addEventListener("click", () => {{
+      verifyNeutronPathsInDialog();
+    }});
+  }}
   if (btnNdModeIpts && btnNdModePaths && ndPaneIpts && ndPanePaths) {{
     btnNdModeIpts.addEventListener("click", () => {{
       ndIngestMode = "ipts";
@@ -5216,7 +5404,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         return;
       }}
       // Pre-submit path check inside the dialog before closing or dispatching a job
-      const chk = await verifyNeutronPathsInDialog();
+      const chk = (lastNdValidationResult && lastNdValidationResult.ok)
+        ? lastNdValidationResult
+        : await verifyNeutronPathsInDialog();
       if (chk && chk.ok === false) {{
         const statusBox = document.getElementById("nd-validation-status");
         if (statusBox) {{
@@ -5246,6 +5436,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ipts: iptsRaw,
         runs: runsSpec,
         nexus_files: paths,
+        verified_dataset_ids: (chk && Array.isArray(chk.verified_dataset_ids)) ? chk.verified_dataset_ids : [],
       }});
     }});
   }}
@@ -5900,4 +6091,3 @@ def export_static_app_html(
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(html)
     return out_path
-

@@ -267,9 +267,7 @@ class NovaGalaxyPipelineRunner:
         )
         if not safe_name.endswith((".h5", ".hdf5")):
             safe_name += ".h5"
-        tmp_dest = os.path.join(
-            tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}"
-        )
+        tmp_dest = os.path.join(tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}")
         if os.path.isfile(tmp_dest) and os.path.getsize(tmp_dest) > 0:
             return tmp_dest, info
         data = self._api_request(
@@ -397,13 +395,17 @@ class NovaGalaxyPipelineRunner:
                 info = gi.datasets.show_dataset(ds_id)
                 st = info.get("state")
                 if st == "ok":
-                    job_record["stdout"] += f"[nova -> galaxy] Linked existing dataset '{fname}' (id={ds_id}, state=ok)\n"
+                    job_record["stdout"] += (
+                        f"[nova -> galaxy] Linked existing dataset '{fname}' (id={ds_id}, state=ok)\n"
+                    )
                     return ds_id
                 if st in ("queued", "running", "new", "upload"):
                     job_record["stdout"] += (
                         f"[nova -> galaxy] Waiting for in-progress upload of '{fname}' (id={ds_id}, state={st})...\n"
                     )
-                    gi.datasets.wait_for_dataset(ds_id, maxwait=120, interval=2.0, check=True)
+                    gi.datasets.wait_for_dataset(
+                        ds_id, maxwait=120, interval=2.0, check=True
+                    )
                     return ds_id
 
         if file_ext == "mtz":
@@ -425,7 +427,9 @@ class NovaGalaxyPipelineRunner:
         )
         ds_id = up_info["outputs"][0]["id"]
         gi.datasets.wait_for_dataset(ds_id, maxwait=180, interval=2.0, check=True)
-        job_record["stdout"] += f"[nova -> galaxy] Saved '{fname}' in Galaxy history (id={ds_id})\n"
+        job_record["stdout"] += (
+            f"[nova -> galaxy] Saved '{fname}' in Galaxy history (id={ds_id})\n"
+        )
         return ds_id
 
     def _dispatch_nova_galaxy_thread(
@@ -471,10 +475,16 @@ class NovaGalaxyPipelineRunner:
                 wl = params.get("wavelength_range") or [2.8, 4.5]
             inst = str(params.get("instrument", "CG4D"))
             sg = str(params.get("space_group", "P 21 21 21"))
-            merged_path = params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
+            merged_path = (
+                params.get("images_file")
+                or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
+            )
             work_dir = os.path.dirname(os.path.abspath(merged_path))
             solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
-            if not os.path.isfile(solve_path) or os.path.basename(solve_path) in ("merged.h5", "integrated.h5"):
+            if not os.path.isfile(solve_path) or os.path.basename(solve_path) in (
+                "merged.h5",
+                "integrated.h5",
+            ):
                 cand_solve = os.path.join(work_dir, "solve.h5")
                 if os.path.isfile(cand_solve):
                     solve_path = cand_solve
@@ -499,8 +509,13 @@ class NovaGalaxyPipelineRunner:
                                 f"[nova -> galaxy] '{required_tool}' not yet merged on {self.galaxy_url}; "
                                 f"switching to local Galaxy instance http://127.0.0.1:9090 (GPU container runner)...\n"
                             )
-                            local_conn = Connection(galaxy_url="http://127.0.0.1:9090", galaxy_key="test_key")
-                            store = local_conn.connect().create_data_store("IMAGINE-X SubHKL")
+                            local_conn = Connection(
+                                galaxy_url="http://127.0.0.1:9090",
+                                galaxy_key="test_key",
+                            )
+                            store = local_conn.connect().create_data_store(
+                                "IMAGINE-X SubHKL"
+                            )
                             gi = store.nova_connection.galaxy_instance
                             self.galaxy_url = "http://127.0.0.1:9090"
                             self.api_key = gi.key
@@ -549,60 +564,94 @@ class NovaGalaxyPipelineRunner:
                     raise RuntimeError(
                         f"Using pre-merged scan {os.path.basename(merged_path)} (no raw *.nxs.h5 specified or in {work_dir})"
                     )
-                missing_nxs = [p for p in raw_nxs if p.startswith("/") and not os.path.isfile(p)]
-                if missing_nxs and (os.path.isdir("/SNS") or os.path.isdir("/HFIR")):
-                    chk = self.check_neutron_paths(
-                        {
-                            "facility": params.get("facility", "SNS" if missing_nxs[0].startswith("/SNS/") else "HFIR"),
-                            "instrument": inst,
-                            "ipts": params.get("ipts", ""),
-                            "paths": raw_nxs,
-                        }
-                    )
-                    raise FileNotFoundError(chk.get("message") or f"File not found: {missing_nxs[0]}")
                 work_dir, merged_label = self._work_dir_for_reduce(raw_nxs, work_dir)
                 job_record["raw_nxs"] = raw_nxs
                 job_record["instrument"] = inst
                 job_record["merged_label"] = merged_label
-                # Optional NDIP neutrons_load_data pass-through ingestion step
-                if self._has_tool_on_galaxy("neutrons_load_data") and params.get("ingest_mode") in ("oncat", "file"):
-                    try:
-                        import re as _re
+                # Route NeXus verification & ingestion through NDIP neutrons_load_data tool
+                verified_ids = params.get("verified_dataset_ids") or []
+                if verified_ids:
+                    job_record["stdout"] += (
+                        f"[galaxy -> ndip] Reusing NDIP neutrons_load_data dataset(s): {', '.join(str(x) for x in verified_ids)}\n"
+                    )
+                elif self._has_tool_on_galaxy("neutrons_load_data") and params.get(
+                    "ingest_mode"
+                ) in ("oncat", "file"):
+                    import re as _re
 
-                        nld_inputs: dict[str, Any] = {}
-                        first_p = raw_nxs[0]
-                        m_run = _re.search(r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.I)
-                        ipts_str = _re.sub(r"^IPTS-", "", str(params.get("ipts") or "").strip(), flags=_re.I)
-                        if not ipts_str:
-                            m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.I)
-                            if m_ip:
-                                ipts_str = m_ip.group(1)
-                        if params.get("ingest_mode") == "oncat" and ipts_str and m_run:
-                            nld_inputs = {
-                                "params|ingest_mode": "oncat",
-                                "params|facility": str(params.get("facility") or ("SNS" if first_p.startswith("/SNS/") else "HFIR")),
-                                "params|instrument": inst,
-                                "params|ipts": ipts_str,
-                                "params|run": int(m_run.group(1)),
-                            }
-                        else:
-                            nld_inputs = {
-                                "params|ingest_mode": "file",
-                                "params|filepath": first_p,
-                            }
-                        nld_res = gi.tools.run_tool(
-                            history_id=store.history_id,
-                            tool_id="neutrons_load_data",
-                            tool_inputs=nld_inputs,
+                    nld_inputs: dict[str, Any] = {}
+                    first_p = raw_nxs[0]
+                    m_run = _re.search(
+                        r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.I
+                    )
+                    ipts_str = _re.sub(
+                        r"^IPTS-",
+                        "",
+                        str(params.get("ipts") or "").strip(),
+                        flags=_re.I,
+                    )
+                    if not ipts_str:
+                        m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.I)
+                        if m_ip:
+                            ipts_str = m_ip.group(1)
+                    if params.get("ingest_mode") == "oncat" and ipts_str and m_run:
+                        nld_inputs = {
+                            "params|ingest_mode": "oncat",
+                            "params|facility": str(
+                                params.get("facility")
+                                or ("SNS" if first_p.startswith("/SNS/") else "HFIR")
+                            ),
+                            "params|instrument": inst,
+                            "params|ipts": ipts_str,
+                            "params|run": int(m_run.group(1)),
+                        }
+                    else:
+                        nld_inputs = {
+                            "params|ingest_mode": "file",
+                            "params|filepath": first_p,
+                        }
+                    nld_res = gi.tools.run_tool(
+                        history_id=store.history_id,
+                        tool_id="neutrons_load_data",
+                        tool_inputs=nld_inputs,
+                    )
+                    nld_jid = (nld_res.get("jobs") or [{}])[0].get("id")
+                    nld_outs = [
+                        o.get("id")
+                        for o in (nld_res.get("outputs") or [])
+                        if isinstance(o, dict) and o.get("id")
+                    ]
+                    job_record["stdout"] += (
+                        f"[galaxy -> ndip] Dispatched neutrons_load_data ({nld_inputs.get('params|ingest_mode')}, job_id={nld_jid})\n"
+                    )
+                    for _ in range(18):
+                        if not nld_jid:
+                            break
+                        j_nld = self._api_request(
+                            "GET", f"/api/jobs/{nld_jid}?full=true"
                         )
-                        nld_jid = (nld_res.get("jobs") or [{}])[0].get("id")
-                        job_record["stdout"] += (
-                            f"[galaxy -> ndip] Dispatched neutrons_load_data ({ nld_inputs.get('params|ingest_mode') }, job_id={nld_jid})\n"
-                        )
-                    except Exception as nld_exc:
-                        job_record["stdout"] += (
-                            f"[galaxy -> ndip] Note: neutrons_load_data skipped ({self._clean_err_msg(nld_exc)})\n"
-                        )
+                        st_nld = j_nld.get("state")
+                        if st_nld == "ok":
+                            break
+                        if st_nld in ("error", "deleted"):
+                            err_out = (
+                                j_nld.get("tool_stdout")
+                                or j_nld.get("tool_stderr")
+                                or "File not found"
+                            ).strip()
+                            for oid in nld_outs:
+                                try:
+                                    self._api_request(
+                                        "PUT",
+                                        f"/api/histories/{store.history_id}/contents/{oid}",
+                                        payload={"deleted": True},
+                                    )
+                                except Exception:
+                                    pass
+                            raise FileNotFoundError(
+                                f"NDIP neutrons_load_data failed: {err_out.splitlines()[0]}"
+                            )
+                        time.sleep(1.0)
                 primary_tool = "imaginex_subhkl_prepare_peaks"
                 tool_inputs = {
                     "instrument": inst,
@@ -625,8 +674,9 @@ class NovaGalaxyPipelineRunner:
                     "peaks": {"src": "hda", "id": idx_id},
                 }
 
-            is_two_step_integrate = stage_id == "integrate" and self._has_tool_on_galaxy(
-                "imaginex_subhkl_integrate"
+            is_two_step_integrate = (
+                stage_id == "integrate"
+                and self._has_tool_on_galaxy("imaginex_subhkl_integrate")
             )
             job_record["tool_id"] = primary_tool
             results = gi.tools.run_tool(
@@ -663,7 +713,9 @@ class NovaGalaxyPipelineRunner:
                 and job_record.get("outputs")
             ):
                 pred_ds_id = job_record["outputs"][0]["id"]
-                gi.datasets.wait_for_dataset(pred_ds_id, maxwait=60, interval=1.5, check=True)
+                gi.datasets.wait_for_dataset(
+                    pred_ds_id, maxwait=60, interval=1.5, check=True
+                )
                 int_tool = "imaginex_subhkl_integrate"
                 int_inputs = {
                     "scan": {"src": "hda", "id": scan_id},
@@ -703,9 +755,16 @@ class NovaGalaxyPipelineRunner:
                     final_step=True,
                     work_dir=work_dir,
                 )
+        except FileNotFoundError as fnf_exc:
+            clean_msg = self._clean_err_msg(fnf_exc)
+            job_record["state"] = "error"
+            job_record["stderr"] = f"{clean_msg}\n"
+            job_record["stdout"] += f"\n[galaxy -> ndip] Error: {clean_msg}\n"
         except Exception as exc:
             clean_msg = self._clean_err_msg(exc)
-            job_record["stdout"] += f"[nova -> galaxy] {clean_msg}; running GPU container on IMAGINEX-1...\n"
+            job_record["stdout"] += (
+                f"[nova -> galaxy] {clean_msg}; running GPU container on IMAGINEX-1...\n"
+            )
             self._submit_local_subhkl_stage(
                 stage_id,
                 params,
@@ -715,100 +774,61 @@ class NovaGalaxyPipelineRunner:
             )
 
     def check_neutron_paths(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Validate NeXus / HDF5 file paths for the Load Neutron Data modal and suggest IPTS if mismatched."""
-        import glob as _glob
+        """Validate NeXus / HDF5 file paths strictly via NDIP's ``neutrons_load_data`` tool.
+
+        Never probes ``/SNS`` or ``/HFIR`` directly on the host/container filesystem so
+        user permissions are always enforced by NDIP / Galaxy.
+        """
         import re as _re
 
         fac = str(body.get("facility") or "HFIR").strip()
         inst = str(body.get("instrument") or "CG4D").strip()
-        ipts_raw = _re.sub(r"^IPTS-", "", str(body.get("ipts") or "").strip(), flags=_re.I)
+        ipts_raw = _re.sub(
+            r"^IPTS-", "", str(body.get("ipts") or "").strip(), flags=_re.I
+        )
         raw_paths = body.get("paths") or []
         if isinstance(raw_paths, str):
-            raw_paths = [s.strip() for s in raw_paths.replace("\n", ",").split(",") if s.strip()]
+            raw_paths = [
+                s.strip() for s in raw_paths.replace("\n", ",").split(",") if s.strip()
+            ]
 
-        expanded: list[str] = []
-        for p in raw_paths:
-            p_str = str(p).strip()
-            if not p_str:
-                continue
-            if any(ch in p_str for ch in ("*", "?", "[")):
-                matches = sorted(_glob.glob(p_str))
-                if matches:
-                    expanded.extend(matches)
-                    continue
-            expanded.append(p_str)
+        expanded: list[str] = [str(p).strip() for p in raw_paths if str(p).strip()]
+        if not expanded:
+            return {
+                "ok": False,
+                "ndip_checked": False,
+                "existing": [],
+                "missing": [],
+                "ipts_exists": False,
+                "suggested_ipts": None,
+                "suggested_paths": [],
+                "verified_dataset_ids": [],
+                "sample_title": "",
+                "sample_goniometer": "",
+                "message": "No NeXus / HDF5 file paths specified",
+            }
 
-        existing = [p for p in expanded if os.path.isfile(p)]
-        missing = [p for p in expanded if not os.path.isfile(p)]
-        ipts_dir = f"/{fac}/{inst}/IPTS-{ipts_raw}" if ipts_raw else ""
-        ipts_exists = bool(ipts_dir and os.path.isdir(ipts_dir))
-
-        suggested_ipts: str | None = None
-        suggested_paths: list[str] = []
-        if missing:
-            # Try to locate the first missing run across /<facility>/<instrument>/IPTS-*/nexus/
-            first_missing_base = os.path.basename(missing[0])
-            candidates = sorted(_glob.glob(f"/{fac}/{inst}/IPTS-*/nexus/{first_missing_base}"))
-            if not candidates:
-                alt_fac = "SNS" if fac == "HFIR" else "HFIR"
-                candidates = sorted(_glob.glob(f"/{alt_fac}/{inst}/IPTS-*/nexus/{first_missing_base}"))
-            if candidates:
-                m_ipts = _re.search(r"/IPTS-([^/]+)/", candidates[0])
-                if m_ipts:
-                    suggested_ipts = m_ipts.group(1)
-                    sug_fac = "SNS" if candidates[0].startswith("/SNS/") else "HFIR"
-                    for p in expanded:
-                        bn = os.path.basename(p)
-                        sp = f"/{sug_fac}/{inst}/IPTS-{suggested_ipts}/nexus/{bn}"
-                        if os.path.isfile(sp):
-                            suggested_paths.append(sp)
-
-        sample_title = ""
-        sample_goniometer = ""
-        probe_file = existing[0] if existing else (suggested_paths[0] if suggested_paths else None)
-        if probe_file and os.path.isfile(probe_file):
-            try:
-                import h5py
-                from subhkl.instrument.goniometer import (
-                    _read_nexus_title,
-                    get_rotation_data_from_nexus,
-                )
-
-                with h5py.File(probe_file, "r") as f:
-                    sample_title = _read_nexus_title(f).strip()
-                _, angs, nms = get_rotation_data_from_nexus(probe_file, inst)
-                seen_m: set[str] = set()
-                parts_g: list[str] = []
-                for nm, ang in zip(nms, angs):
-                    short_m = nm.split(":")[-1]
-                    if short_m not in seen_m:
-                        seen_m.add(short_m)
-                        parts_g.append(f"{short_m}={ang:.1f}°")
-                sample_goniometer = " ".join(parts_g)
-            except Exception:
-                pass
-
-        ok = len(existing) > 0 and len(missing) == 0
+        ok = False
         ndip_checked = False
-        # When requested or when /SNS & /HFIR are not locally mounted, verify via NDIP's neutrons_load_data tool
-        if (
-            not ok
-            and not suggested_ipts
-            and expanded
-            and (
-                bool(body.get("use_ndip_tool"))
-                or (not os.path.isdir("/SNS") and not os.path.isdir("/HFIR"))
-            )
-            and self.is_connected
-            and self._has_tool_on_galaxy("neutrons_load_data")
-        ):
+        verified_dataset_ids: list[str] = []
+        msg = ""
+
+        if self.is_connected and self._has_tool_on_galaxy("neutrons_load_data"):
             try:
                 ndip_checked = True
                 store = self.get_datastore("IMAGINE-X SubHKL")
                 gi = store.nova_connection.galaxy_instance
                 first_p = expanded[0]
                 m_run = _re.search(r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.I)
-                if ipts_raw and m_run:
+                if not ipts_raw:
+                    m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.I)
+                    if m_ip:
+                        ipts_raw = m_ip.group(1)
+                if (
+                    ipts_raw
+                    and m_run
+                    and str(body.get("ingest_mode") or "oncat") != "file"
+                ):
                     nld_in: dict[str, Any] = {
                         "params|ingest_mode": "oncat",
                         "params|facility": fac,
@@ -827,68 +847,92 @@ class NovaGalaxyPipelineRunner:
                     tool_inputs=nld_in,
                 )
                 jid = (nld_res.get("jobs") or [{}])[0].get("id")
-                for _ in range(8):
+                out_ids = [
+                    o.get("id")
+                    for o in (nld_res.get("outputs") or [])
+                    if isinstance(o, dict) and o.get("id")
+                ]
+                for _ in range(18):
                     if not jid:
                         break
                     j = self._api_request("GET", f"/api/jobs/{jid}?full=true")
                     st = j.get("state")
                     if st == "ok":
                         ok = True
-                        existing = list(expanded)
-                        missing = []
+                        if len(expanded) == 1:
+                            verified_dataset_ids = out_ids
+                        else:
+                            for oid in out_ids:
+                                try:
+                                    self._api_request(
+                                        "PUT",
+                                        f"/api/histories/{store.history_id}/contents/{oid}",
+                                        payload={"deleted": True},
+                                    )
+                                except Exception:
+                                    pass
+                        msg = (
+                            f"✓ Verified {len(expanded)} run(s) via NDIP Load Neutron Data "
+                            f"({inst} IPTS-{ipts_raw or '?'})"
+                        )
                         break
                     if st in ("error", "deleted"):
-                        err_out = (j.get("tool_stdout") or j.get("tool_stderr") or "").strip()
-                        if err_out:
-                            msg = f"NDIP neutrons_load_data: {err_out.splitlines()[0]}"
+                        err_out = (
+                            j.get("tool_stdout") or j.get("tool_stderr") or ""
+                        ).strip()
+                        first_line = (
+                            err_out.splitlines()[0]
+                            if err_out
+                            else "File or run not found"
+                        )
+                        msg = f"NDIP Load Neutron Data: {first_line} ({inst} IPTS-{ipts_raw or '?'})"
+                        for oid in out_ids:
+                            try:
+                                self._api_request(
+                                    "PUT",
+                                    f"/api/histories/{store.history_id}/contents/{oid}",
+                                    payload={"deleted": True},
+                                )
+                            except Exception:
+                                pass
                         break
-                    time.sleep(1.2)
-            except Exception:
-                pass
-
-        if ok:
-            msg = f"✓ Verified {len(existing)} file(s)" + (" via NDIP Load Neutron Data" if ndip_checked else "")
-            if sample_title:
-                msg += f' · "{sample_title}"'
-            if sample_goniometer:
-                msg += f" ({sample_goniometer})"
-        elif suggested_ipts:
-            msg = (
-                f"Not found in IPTS-{ipts_raw or '?'} — "
-                f"found {len(suggested_paths)}/{len(expanded)} run(s) in IPTS-{suggested_ipts}"
-            )
-            if sample_title:
-                msg += f' ("{sample_title}")'
-        elif ipts_raw and not ipts_exists and (os.path.isdir("/SNS") or os.path.isdir("/HFIR")):
-            msg = f"Directory /{fac}/{inst}/IPTS-{ipts_raw} does not exist"
-        elif missing:
-            msg = f"File not found: {missing[0]}" + (
-                f" (+{len(missing) - 1} more)" if len(missing) > 1 else ""
-            )
+                    time.sleep(1.0)
+                if not ok and not msg:
+                    msg = f"NDIP Load Neutron Data check timed out for {first_p}"
+            except Exception as exc:
+                msg = f"NDIP Load Neutron Data error: {self._clean_err_msg(exc)}"
         else:
-            msg = "No NeXus / HDF5 file paths specified"
+            msg = "NDIP Galaxy connection required to verify /SNS or /HFIR paths via neutrons_load_data"
 
         return {
             "ok": ok,
             "ndip_checked": ndip_checked,
-            "existing": existing,
-            "missing": missing,
-            "ipts_exists": ipts_exists,
-            "suggested_ipts": suggested_ipts,
-            "suggested_paths": suggested_paths,
-            "sample_title": sample_title,
-            "sample_goniometer": sample_goniometer,
+            "checked_via": "ndip_neutrons_load_data"
+            if ndip_checked
+            else "ndip_unavailable",
+            "existing": list(expanded) if ok else [],
+            "missing": [] if ok else list(expanded),
+            "ipts_exists": ok,
+            "suggested_ipts": None,
+            "suggested_paths": [],
+            "verified_dataset_ids": verified_dataset_ids,
+            "sample_title": "",
+            "sample_goniometer": "",
             "message": msg,
         }
 
-    def _resolve_raw_nexus_inputs(self, params: dict[str, Any], work_dir: str) -> list[str]:
+    def _resolve_raw_nexus_inputs(
+        self, params: dict[str, Any], work_dir: str
+    ) -> list[str]:
         """Resolve raw .nxs.h5 paths from explicit nexus_files, galaxy_dataset_id, IPTS+runs, or work_dir."""
         import glob as _glob
 
         resolved: list[str] = []
         raw_list = params.get("nexus_files")
         if isinstance(raw_list, str):
-            raw_list = [s.strip() for s in raw_list.replace("\n", ",").split(",") if s.strip()]
+            raw_list = [
+                s.strip() for s in raw_list.replace("\n", ",").split(",") if s.strip()
+            ]
         if isinstance(raw_list, list) and raw_list:
             for item in raw_list:
                 p_str = str(item).strip()
@@ -906,7 +950,9 @@ class NovaGalaxyPipelineRunner:
         ds_id = params.get("galaxy_dataset_id")
         if ds_id:
             try:
-                local_p, _ = self.resolve_dataset_to_local_h5(str(ds_id), fallback_dir=work_dir)
+                local_p, _ = self.resolve_dataset_to_local_h5(
+                    str(ds_id), fallback_dir=work_dir
+                )
                 if local_p and os.path.isfile(local_p):
                     return [local_p]
             except Exception:
@@ -969,7 +1015,11 @@ class NovaGalaxyPipelineRunner:
         mtz_dest = os.path.join(work_dir, "reflections.mtz")
 
         solve_path = os.path.abspath(params.get("peaks_file") or solve_dest)
-        if os.path.basename(solve_path) in ("merged.h5", "integrated.h5", "predictor.h5") and os.path.isfile(solve_dest):
+        if os.path.basename(solve_path) in (
+            "merged.h5",
+            "integrated.h5",
+            "predictor.h5",
+        ) and os.path.isfile(solve_dest):
             solve_path = solve_dest
 
         ts = int(time.time())
@@ -981,10 +1031,14 @@ class NovaGalaxyPipelineRunner:
         merged_label = "merged.h5"
         if stage_id == "reduce":
             raw_nxs_local = [
-                p for p in self._resolve_raw_nexus_inputs(params, work_dir) if os.path.isfile(p)
+                p
+                for p in self._resolve_raw_nexus_inputs(params, work_dir)
+                if os.path.isfile(p)
             ]
             if raw_nxs_local:
-                work_dir, merged_label = self._work_dir_for_reduce(raw_nxs_local, work_dir)
+                work_dir, merged_label = self._work_dir_for_reduce(
+                    raw_nxs_local, work_dir
+                )
                 solve_dest = os.path.join(work_dir, "solve.h5")
                 pred_dest = os.path.join(work_dir, "predictor.h5")
                 integrated_dest = os.path.join(work_dir, "integrated.h5")
@@ -1108,7 +1162,11 @@ class NovaGalaxyPipelineRunner:
                 "--refinement",
                 str(params.get("objective", "band")),
             ]
-        elif stage_id == "integrate" and os.path.isfile(merged_path) and os.path.isfile(solve_path):
+        elif (
+            stage_id == "integrate"
+            and os.path.isfile(merged_path)
+            and os.path.isfile(solve_path)
+        ):
             d_min_val = str(params.get("d_min", 2.8))
             pred_cmd = [
                 "python",
@@ -1165,8 +1223,12 @@ class NovaGalaxyPipelineRunner:
                 f"{shlex.join(mtz_cmd)}"
             )
             inner_cmd = ["bash", "-c", chained]
-        elif stage_id == "merge" and os.path.isfile(integrated_dest if os.path.isfile(integrated_dest) else solve_path):
-            target_h5 = integrated_dest if os.path.isfile(integrated_dest) else solve_path
+        elif stage_id == "merge" and os.path.isfile(
+            integrated_dest if os.path.isfile(integrated_dest) else solve_path
+        ):
+            target_h5 = (
+                integrated_dest if os.path.isfile(integrated_dest) else solve_path
+            )
             inner_cmd = [
                 "python",
                 "-u",
@@ -1242,11 +1304,19 @@ class NovaGalaxyPipelineRunner:
         gpu_env.setdefault("OMP_NUM_THREADS", "1")
         gpu_env.setdefault("MKL_NUM_THREADS", "1")
         try:
-            gpu_info = subprocess.check_output(
-                ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"],
-                text=True,
-                timeout=2.0,
-            ).strip().splitlines()[0]
+            gpu_info = (
+                subprocess.check_output(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=index,name,memory.total",
+                        "--format=csv,noheader",
+                    ],
+                    text=True,
+                    timeout=2.0,
+                )
+                .strip()
+                .splitlines()[0]
+            )
         except Exception:
             gpu_info = "CPU fallback"
 
@@ -1267,7 +1337,9 @@ class NovaGalaxyPipelineRunner:
             job_record["mode"] = "container_gpu"
             job_record["state"] = "running"
             job_record["command_line"] = cmd_str
-            job_record["stdout"] = (job_record.get("stdout", "") + "\n".join(header_lines))[-24000:]
+            job_record["stdout"] = (
+                job_record.get("stdout", "") + "\n".join(header_lines)
+            )[-24000:]
         else:
             job_record = {
                 "job_id": job_id,
@@ -1279,7 +1351,9 @@ class NovaGalaxyPipelineRunner:
                 "stdout": "\n".join(header_lines),
                 "stderr": "",
                 "ladder_rung_idx": 0 if stage_id == "solve" else 4,
-                "outputs": [{"id": job_id, "name": os.path.basename(out_h5), "extension": "h5"}],
+                "outputs": [
+                    {"id": job_id, "name": os.path.basename(out_h5), "extension": "h5"}
+                ],
                 "updated_payload_ready": False,
                 "started_at": time.time(),
             }
@@ -1297,15 +1371,23 @@ class NovaGalaxyPipelineRunner:
                 )
                 assert proc.stdout is not None
                 for line in proc.stdout:
-                    job_record["stdout"] = (job_record.get("stdout", "") + line)[-24000:]
+                    job_record["stdout"] = (job_record.get("stdout", "") + line)[
+                        -24000:
+                    ]
                     low = line.lower()
                     if stage_id == "solve":
                         if "ladder" in low or "blind" in low:
-                            job_record["ladder_rung_idx"] = max(job_record["ladder_rung_idx"], 1)
+                            job_record["ladder_rung_idx"] = max(
+                                job_record["ladder_rung_idx"], 1
+                            )
                         elif "global" in low or "60-zone" in low:
-                            job_record["ladder_rung_idx"] = max(job_record["ladder_rung_idx"], 2)
+                            job_record["ladder_rung_idx"] = max(
+                                job_record["ladder_rung_idx"], 2
+                            )
                         elif "120" in low or "cell" in low or "stage" in low:
-                            job_record["ladder_rung_idx"] = max(job_record["ladder_rung_idx"], 3)
+                            job_record["ladder_rung_idx"] = max(
+                                job_record["ladder_rung_idx"], 3
+                            )
                 rc = proc.wait()
                 if rc == 0:
                     job_record["ladder_rung_idx"] = 0 if stage_id == "reduce" else 4
@@ -1315,18 +1397,28 @@ class NovaGalaxyPipelineRunner:
                         merged_link = os.path.join(work_dir, "merged.h5")
                         try:
                             shutil.copy2(out_h5, merged_dest)
-                            if os.path.abspath(merged_dest) != os.path.abspath(merged_link):
+                            if os.path.abspath(merged_dest) != os.path.abspath(
+                                merged_link
+                            ):
                                 shutil.copy2(out_h5, merged_link)
                             final_h5 = merged_dest
-                            job_record["stdout"] += f"\n[subhkl] Saved {merged_label} -> {merged_dest}\n"
+                            job_record["stdout"] += (
+                                f"\n[subhkl] Saved {merged_label} -> {merged_dest}\n"
+                            )
                         except Exception as copy_exc:
-                            job_record["stdout"] += f"\n[subhkl] Warning saving {merged_dest}: {copy_exc}\n"
+                            job_record["stdout"] += (
+                                f"\n[subhkl] Warning saving {merged_dest}: {copy_exc}\n"
+                            )
 
                         if self.is_connected and os.path.isfile(final_h5):
                             try:
                                 store = self.get_datastore("IMAGINE-X SubHKL")
                                 self._ensure_galaxy_h5_dataset(
-                                    store, final_h5, job_record, force_upload=True, file_ext="h5"
+                                    store,
+                                    final_h5,
+                                    job_record,
+                                    force_upload=True,
+                                    file_ext="h5",
                                 )
                             except Exception as up_exc:
                                 job_record["stdout"] += (
@@ -1341,15 +1433,23 @@ class NovaGalaxyPipelineRunner:
                                 if os.path.isfile(src_sub):
                                     shutil.copy2(src_sub, dst_sub)
                             final_h5 = solve_dest
-                            job_record["stdout"] += f"\n[subhkl] Saved solve.h5 -> {solve_dest}\n"
+                            job_record["stdout"] += (
+                                f"\n[subhkl] Saved solve.h5 -> {solve_dest}\n"
+                            )
                         except Exception as copy_exc:
-                            job_record["stdout"] += f"\n[subhkl] Warning saving {solve_dest}: {copy_exc}\n"
+                            job_record["stdout"] += (
+                                f"\n[subhkl] Warning saving {solve_dest}: {copy_exc}\n"
+                            )
 
                         if self.is_connected and os.path.isfile(final_h5):
                             try:
                                 store = self.get_datastore("IMAGINE-X SubHKL")
                                 self._ensure_galaxy_h5_dataset(
-                                    store, final_h5, job_record, force_upload=True, file_ext="h5"
+                                    store,
+                                    final_h5,
+                                    job_record,
+                                    force_upload=True,
+                                    file_ext="h5",
                                 )
                             except Exception as up_exc:
                                 job_record["stdout"] += (
@@ -1359,30 +1459,50 @@ class NovaGalaxyPipelineRunner:
                         try:
                             if os.path.isfile(pred_tmp_h5):
                                 shutil.copy2(pred_tmp_h5, pred_dest)
-                                job_record["stdout"] += f"\n[subhkl] Saved predictor.h5 -> {pred_dest}\n"
+                                job_record["stdout"] += (
+                                    f"\n[subhkl] Saved predictor.h5 -> {pred_dest}\n"
+                                )
                             shutil.copy2(out_h5, integrated_dest)
                             final_h5 = integrated_dest
-                            job_record["stdout"] += f"[subhkl] Saved integrated.h5 -> {integrated_dest}\n"
+                            job_record["stdout"] += (
+                                f"[subhkl] Saved integrated.h5 -> {integrated_dest}\n"
+                            )
                             if os.path.isfile(mtz_tmp_path):
                                 shutil.copy2(mtz_tmp_path, mtz_dest)
-                                job_record["stdout"] += f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
+                                job_record["stdout"] += (
+                                    f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
+                                )
                         except Exception as copy_exc:
-                            job_record["stdout"] += f"\n[subhkl] Warning saving integrated outputs: {copy_exc}\n"
+                            job_record["stdout"] += (
+                                f"\n[subhkl] Warning saving integrated outputs: {copy_exc}\n"
+                            )
 
                         if self.is_connected:
                             try:
                                 store = self.get_datastore("IMAGINE-X SubHKL")
                                 if os.path.isfile(pred_dest):
                                     self._ensure_galaxy_h5_dataset(
-                                        store, pred_dest, job_record, force_upload=True, file_ext="h5"
+                                        store,
+                                        pred_dest,
+                                        job_record,
+                                        force_upload=True,
+                                        file_ext="h5",
                                     )
                                 if os.path.isfile(final_h5):
                                     self._ensure_galaxy_h5_dataset(
-                                        store, final_h5, job_record, force_upload=True, file_ext="h5"
+                                        store,
+                                        final_h5,
+                                        job_record,
+                                        force_upload=True,
+                                        file_ext="h5",
                                     )
                                 if os.path.isfile(mtz_dest):
                                     self._ensure_galaxy_h5_dataset(
-                                        store, mtz_dest, job_record, force_upload=True, file_ext="binary"
+                                        store,
+                                        mtz_dest,
+                                        job_record,
+                                        force_upload=True,
+                                        file_ext="binary",
                                     )
                             except Exception as up_exc:
                                 job_record["stdout"] += (
@@ -1390,13 +1510,17 @@ class NovaGalaxyPipelineRunner:
                                 )
 
                     job_record["state"] = "ok"
-                    job_record["stdout"] += f"[subhkl] Stage '{stage_id}' completed (exit 0).\n"
+                    job_record["stdout"] += (
+                        f"[subhkl] Stage '{stage_id}' completed (exit 0).\n"
+                    )
                     if os.path.isfile(final_h5) and callable(on_complete_h5):
                         on_complete_h5(final_h5)
                         job_record["updated_payload_ready"] = True
                 else:
                     job_record["state"] = "error"
-                    job_record["stderr"] += f"\n[subhkl] Process exited with code {rc}\n"
+                    job_record["stderr"] += (
+                        f"\n[subhkl] Process exited with code {rc}\n"
+                    )
             except Exception as exc:
                 job_record["state"] = "error"
                 job_record["stderr"] += f"\n[subhkl] Error: {exc}\n"
@@ -1426,60 +1550,11 @@ class NovaGalaxyPipelineRunner:
         step_counter = 0
         poll_errors = 0
         base_log = job_record.get("stdout", "")
-        seen_pulsar_dirs: set[str] = set()
-        latest_pulsar_dir: str | None = None
-        for droot in ("/data/staging_test", "/data/staging"):
-            if os.path.isdir(droot):
-                try:
-                    for entry in os.listdir(droot):
-                        seen_pulsar_dirs.add(os.path.join(droot, entry))
-                except Exception:
-                    pass
 
         while True:
             time.sleep(1.5)
             try:
-                # 1. Detect live Pulsar staging directory on this GPU node (IMAGINEX-1)
-                pulsar_live_out = ""
-                pulsar_live_err = ""
-                for droot in ("/data/staging_test", "/data/staging"):
-                    if os.path.isdir(droot):
-                        try:
-                            for entry in os.listdir(droot):
-                                full_dir = os.path.join(droot, entry)
-                                if not os.path.isdir(full_dir):
-                                    continue
-                                if full_dir not in seen_pulsar_dirs:
-                                    seen_pulsar_dirs.add(full_dir)
-                                    latest_pulsar_dir = full_dir
-                                    pid_path = os.path.join(full_dir, "pid")
-                                    ctr_path = os.path.join(
-                                        full_dir, "metadata", "__instrument_core_container"
-                                    )
-                                    pid_str = (
-                                        open(pid_path).read().strip()
-                                        if os.path.isfile(pid_path)
-                                        else "?"
-                                    )
-                                    ctr_str = (
-                                        open(ctr_path).read().strip()
-                                        if os.path.isfile(ctr_path)
-                                        else "docker"
-                                    )
-                                    base_log += (
-                                        f"[pulsar] Staged on IMAGINEX-1: {full_dir} "
-                                        f"(PID={pid_str}, container={ctr_str})\n"
-                                    )
-                                p_out = os.path.join(full_dir, "metadata", "job_stdout")
-                                p_err = os.path.join(full_dir, "metadata", "job_stderr")
-                                if os.path.isfile(p_out):
-                                    pulsar_live_out = open(p_out, errors="replace").read()
-                                if os.path.isfile(p_err):
-                                    pulsar_live_err = open(p_err, errors="replace").read()
-                        except Exception:
-                            pass
-
-                # 2. Fetch job status & live Pulsar console_output stream from NDIP Galaxy
+                # Fetch job status & live Pulsar console_output stream from NDIP Galaxy API
                 jinfo = self._api_request("GET", f"/api/jobs/{job_id}?full=true")
                 poll_errors = 0
                 state = jinfo.get("state", "running")
@@ -1504,27 +1579,24 @@ class NovaGalaxyPipelineRunner:
                     pass
 
                 out_txt = (
-                    console_out
-                    or pulsar_live_out
-                    or jinfo.get("tool_stdout")
-                    or jinfo.get("stdout")
-                    or ""
+                    console_out or jinfo.get("tool_stdout") or jinfo.get("stdout") or ""
                 )
                 err_txt = (
-                    console_err
-                    or pulsar_live_err
-                    or jinfo.get("tool_stderr")
-                    or jinfo.get("stderr")
-                    or ""
+                    console_err or jinfo.get("tool_stderr") or jinfo.get("stderr") or ""
                 )
                 cmd_header = (
-                    f"$ {job_record['command_line']}\n" if job_record.get("command_line") else ""
+                    f"$ {job_record['command_line']}\n"
+                    if job_record.get("command_line")
+                    else ""
                 )
                 job_record["stdout"] = f"{base_log}{cmd_header}{out_txt}"[-24000:]
                 if err_txt:
                     job_record["stderr"] = err_txt[-16000:]
 
-                if job_record.get("stage_id") == "solve" and state in ("queued", "running"):
+                if job_record.get("stage_id") == "solve" and state in (
+                    "queued",
+                    "running",
+                ):
                     step_counter = min(3, step_counter + 1)
                     job_record["ladder_rung_idx"] = step_counter
                 if state in ("ok", "error", "deleted", "paused"):
@@ -1549,8 +1621,13 @@ class NovaGalaxyPipelineRunner:
                             ]
                             if h5_outs:
                                 ds_id = h5_outs[0]["id"]
-                                merged_label = str(job_record.get("merged_label") or "merged.h5")
-                                if job_record.get("stage_id") == "reduce" and self.history_id:
+                                merged_label = str(
+                                    job_record.get("merged_label") or "merged.h5"
+                                )
+                                if (
+                                    job_record.get("stage_id") == "reduce"
+                                    and self.history_id
+                                ):
                                     try:
                                         self._api_request(
                                             "PUT",
@@ -1565,83 +1642,63 @@ class NovaGalaxyPipelineRunner:
                                         pass
                                 target_path = None
                                 if work_dir and os.path.isdir(work_dir):
-                                    if not final_step and job_record.get("stage_id") == "integrate":
-                                        target_path = os.path.join(work_dir, "predictor.h5")
+                                    if (
+                                        not final_step
+                                        and job_record.get("stage_id") == "integrate"
+                                    ):
+                                        target_path = os.path.join(
+                                            work_dir, "predictor.h5"
+                                        )
                                     elif job_record.get("stage_id") == "integrate":
-                                        target_path = os.path.join(work_dir, "integrated.h5")
+                                        target_path = os.path.join(
+                                            work_dir, "integrated.h5"
+                                        )
                                     elif job_record.get("stage_id") == "solve":
                                         target_path = os.path.join(work_dir, "solve.h5")
                                     elif job_record.get("stage_id") == "reduce":
-                                        target_path = os.path.join(work_dir, "merged.h5")
-
-                                # Check if Pulsar staging still has the output file locally before downloading over HTTPS
-                                local_staged_h5 = None
-                                if latest_pulsar_dir and os.path.isdir(latest_pulsar_dir):
-                                    for rel_cand in (
-                                        "working/out/scan_master.h5",
-                                        "working/out/solve.h5",
-                                        "working/out/peak_predictor.h5",
-                                        "working/out/integrated.h5",
-                                    ):
-                                        cand_p = os.path.join(latest_pulsar_dir, rel_cand)
-                                        if os.path.isfile(cand_p) and os.path.getsize(cand_p) > 0:
-                                            local_staged_h5 = cand_p
-                                            break
+                                        target_path = os.path.join(
+                                            work_dir, "merged.h5"
+                                        )
 
                                 tmp_path = None
                                 cache_gx_path = os.path.join(
-                                    tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{merged_label}"
+                                    tempfile.gettempdir(),
+                                    f"subhkl_gx_{ds_id}_{merged_label}",
                                 )
-                                if local_staged_h5:
-                                    import shutil as _shutil
-
+                                raw_bytes = None
+                                for attempt in range(4):
+                                    try:
+                                        raw_bytes = self._api_request(
+                                            "GET",
+                                            f"/api/datasets/{ds_id}/display",
+                                            raw=True,
+                                            timeout=180.0,
+                                        )
+                                        if raw_bytes:
+                                            break
+                                    except Exception as dl_exc:
+                                        if attempt == 3:
+                                            raise dl_exc
+                                        time.sleep(2.0)
+                                if raw_bytes:
                                     if target_path:
-                                        _shutil.copyfile(local_staged_h5, target_path)
+                                        with open(target_path, "wb") as f:
+                                            f.write(raw_bytes)
                                         tmp_path = target_path
                                         try:
-                                            _shutil.copyfile(local_staged_h5, cache_gx_path)
+                                            with open(cache_gx_path, "wb") as cf:
+                                                cf.write(raw_bytes)
                                         except Exception:
                                             pass
                                         job_record["stdout"] += (
                                             f"[nova <- galaxy] Synced '{merged_label}' (id={ds_id}) -> {target_path}\n"
                                         )
                                     else:
-                                        fd, tmp_path = tempfile.mkstemp(suffix=".h5", prefix="galaxy_solve_")
-                                        os.close(fd)
-                                        _shutil.copyfile(local_staged_h5, tmp_path)
-                                else:
-                                    raw_bytes = None
-                                    for attempt in range(3):
-                                        try:
-                                            raw_bytes = self._api_request(
-                                                "GET",
-                                                f"/api/datasets/{ds_id}/display",
-                                                raw=True,
-                                                timeout=180.0,
-                                            )
-                                            if raw_bytes:
-                                                break
-                                        except Exception as dl_exc:
-                                            if attempt == 2:
-                                                raise dl_exc
-                                            time.sleep(2.0)
-                                    if raw_bytes:
-                                        if target_path:
-                                            with open(target_path, "wb") as f:
-                                                f.write(raw_bytes)
-                                            tmp_path = target_path
-                                            try:
-                                                with open(cache_gx_path, "wb") as cf:
-                                                    cf.write(raw_bytes)
-                                            except Exception:
-                                                pass
-                                            job_record["stdout"] += (
-                                                f"[nova <- galaxy] Synced '{merged_label}' (id={ds_id}) -> {target_path}\n"
-                                            )
-                                        else:
-                                            fd, tmp_path = tempfile.mkstemp(suffix=".h5", prefix="galaxy_solve_")
-                                            with os.fdopen(fd, "wb") as f:
-                                                f.write(raw_bytes)
+                                        fd, tmp_path = tempfile.mkstemp(
+                                            suffix=".h5", prefix="galaxy_solve_"
+                                        )
+                                        with os.fdopen(fd, "wb") as f:
+                                            f.write(raw_bytes)
 
                                 # If reduce ran inside a container without CG4D title goniometer fallback, patch angles in merged.h5
                                 if (
@@ -1653,40 +1710,82 @@ class NovaGalaxyPipelineRunner:
                                     try:
                                         import h5py
                                         import numpy as np
-                                        from subhkl.instrument.goniometer import get_rotation_data_from_nexus
+                                        from subhkl.instrument.goniometer import (
+                                            get_rotation_data_from_nexus,
+                                        )
 
                                         raw_nxs_list = job_record["raw_nxs"]
-                                        inst_name = str(job_record.get("instrument") or "CG4D")
+                                        inst_name = str(
+                                            job_record.get("instrument") or "CG4D"
+                                        )
                                         with h5py.File(tmp_path, "r+") as hf:
                                             if "goniometer/angles" in hf:
-                                                cur_ang = np.asarray(hf["goniometer/angles"][()])
+                                                cur_ang = np.asarray(
+                                                    hf["goniometer/angles"][()]
+                                                )
                                                 if np.allclose(cur_ang, 0.0):
-                                                    new_axes, new_angles, new_names = [], [], []
+                                                    new_axes, new_angles, new_names = (
+                                                        [],
+                                                        [],
+                                                        [],
+                                                    )
                                                     for nxs_f in raw_nxs_list:
-                                                        if os.path.isfile(nxs_f):
-                                                            ax, ang, nms = get_rotation_data_from_nexus(nxs_f, inst_name)
+                                                        if nxs_f.startswith(
+                                                            tempfile.gettempdir()
+                                                        ) and os.path.isfile(nxs_f):
+                                                            ax, ang, nms = (
+                                                                get_rotation_data_from_nexus(
+                                                                    nxs_f, inst_name
+                                                                )
+                                                            )
                                                             new_axes.append(ax)
                                                             new_angles.append(ang)
                                                             new_names.append(nms)
-                                                    if new_angles and not np.allclose(new_angles, 0.0):
+                                                    if new_angles and not np.allclose(
+                                                        new_angles, 0.0
+                                                    ):
                                                         del hf["goniometer/angles"]
-                                                        hf["goniometer/angles"] = np.asarray(new_angles, dtype=np.float64)
+                                                        hf["goniometer/angles"] = (
+                                                            np.asarray(
+                                                                new_angles,
+                                                                dtype=np.float64,
+                                                            )
+                                                        )
                                                         if "goniometer/axes" in hf:
                                                             del hf["goniometer/axes"]
-                                                        hf["goniometer/axes"] = np.asarray(new_axes, dtype=np.float64)
+                                                        hf["goniometer/axes"] = (
+                                                            np.asarray(
+                                                                new_axes,
+                                                                dtype=np.float64,
+                                                            )
+                                                        )
                                                         if "goniometer/names" in hf:
                                                             del hf["goniometer/names"]
-                                                        hf["goniometer/names"] = np.asarray(new_names, dtype="S")
+                                                        hf["goniometer/names"] = (
+                                                            np.asarray(
+                                                                new_names, dtype="S"
+                                                            )
+                                                        )
                                                         job_record["stdout"] += (
                                                             f"[subhkl] Patched goniometer angles from NeXus title into {os.path.basename(tmp_path)}\n"
                                                         )
                                     except Exception:
                                         pass
 
-                                if final_step and tmp_path and os.path.isfile(tmp_path) and callable(on_complete_h5):
+                                if (
+                                    final_step
+                                    and tmp_path
+                                    and os.path.isfile(tmp_path)
+                                    and callable(on_complete_h5)
+                                ):
                                     on_complete_h5(tmp_path)
                                     job_record["updated_payload_ready"] = True
-                            if final_step and mtz_outs and work_dir and os.path.isdir(work_dir):
+                            if (
+                                final_step
+                                and mtz_outs
+                                and work_dir
+                                and os.path.isdir(work_dir)
+                            ):
                                 try:
                                     mtz_id = mtz_outs[0]["id"]
                                     mtz_bytes = self._api_request(
@@ -1698,7 +1797,9 @@ class NovaGalaxyPipelineRunner:
                                     mtz_dest = os.path.join(work_dir, "reflections.mtz")
                                     with open(mtz_dest, "wb") as f:
                                         f.write(mtz_bytes)
-                                    job_record["stdout"] += f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
+                                    job_record["stdout"] += (
+                                        f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
+                                    )
                                 except Exception:
                                     pass
                         except Exception as post_exc:
@@ -1944,7 +2045,9 @@ def serve_rainbow_zones(
                                 ds_id, fallback_dir=fb_dir
                             )
                         )
-                        ds_name = str(ds_info.get("name") or os.path.basename(local_h5)).lower()
+                        ds_name = str(
+                            ds_info.get("name") or os.path.basename(local_h5)
+                        ).lower()
                         if any(k in ds_name for k in ("merged", "scan", "image")):
                             vm.payload_kwargs["images_h5"] = local_h5
                             vm.replay_h5 = local_h5
@@ -2051,9 +2154,15 @@ def serve_rainbow_zones(
                     req_json = json.loads(raw_body.decode("utf-8") or "{}")
                     stage_id = req_json.get("stage_id", "solve")
                     params = dict(req_json.get("params") or {})
-                    params.setdefault("instrument", vm.payload.get("instrument", "CG4D"))
-                    params.setdefault("space_group", vm.payload.get("space_group", "P 1"))
-                    if all(k in params for k in ("a", "b", "c", "alpha", "beta", "gamma")):
+                    params.setdefault(
+                        "instrument", vm.payload.get("instrument", "CG4D")
+                    )
+                    params.setdefault(
+                        "space_group", vm.payload.get("space_group", "P 1")
+                    )
+                    if all(
+                        k in params for k in ("a", "b", "c", "alpha", "beta", "gamma")
+                    ):
                         params["cell"] = [
                             float(params["a"]),
                             float(params["b"]),
@@ -2065,10 +2174,15 @@ def serve_rainbow_zones(
                     elif vm.payload.get("cell"):
                         params.setdefault("cell", vm.payload.get("cell"))
                     if vm.payload.get("wavelength_range"):
-                        params.setdefault("wavelength_range", vm.payload.get("wavelength_range"))
+                        params.setdefault(
+                            "wavelength_range", vm.payload.get("wavelength_range")
+                        )
 
                     def _on_complete(new_h5_path: str) -> None:
-                        if stage_id == "reduce" or "merged" in os.path.basename(new_h5_path).lower():
+                        if (
+                            stage_id == "reduce"
+                            or "merged" in os.path.basename(new_h5_path).lower()
+                        ):
                             vm.payload_kwargs["images_h5"] = new_h5_path
                         vm.replay_h5 = new_h5_path
                         vm.reload()
@@ -2115,7 +2229,9 @@ def serve_rainbow_zones(
                         with open(dest_path, "wb") as f_out:
                             f_out.write(payload_bytes)
                         saved_paths.append(dest_path)
-                    if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(".nxs.h5"):
+                    if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(
+                        ".nxs.h5"
+                    ):
                         sp = saved_paths[0]
                         if "merged" in os.path.basename(sp).lower():
                             vm.payload_kwargs["images_h5"] = sp
