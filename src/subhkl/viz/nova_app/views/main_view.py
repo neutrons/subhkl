@@ -361,11 +361,33 @@ class MainApp:
             )
             return web.json_response(res)
 
+        async def handle_oncat_auth_get(request: web.Request) -> web.Response:
+            import asyncio
+
+            res = await asyncio.to_thread(
+                self.pipeline_runner.get_oncat_auth_status
+            )
+            return web.json_response(res)
+
+        async def handle_oncat_auth_post(request: web.Request) -> web.Response:
+            import asyncio
+
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            res = await asyncio.to_thread(
+                self.pipeline_runner.handle_oncat_auth, body
+            )
+            return web.json_response(res)
+
         app._client_max_size = 4 * 1024**3
         app.add_routes(
             [
                 web.get("/api/pipeline/status", handle_status),
                 web.get("/api/pipeline/oncat_catalog", handle_oncat_catalog),
+                web.get("/api/pipeline/oncat_auth", handle_oncat_auth_get),
+                web.post("/api/pipeline/oncat_auth", handle_oncat_auth_post),
                 web.get("/api/artifacts/download", handle_artifact_download),
                 web.get("/api/payload", handle_payload),
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),

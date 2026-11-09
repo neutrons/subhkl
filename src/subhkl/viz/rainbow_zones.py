@@ -3987,6 +3987,24 @@ def render_rainbow_html(
 
         <!-- Scrollable ONCat Project & Run Browser -->
         <div id="nd-oncat-browser" style="display:grid;grid-template-columns:0.95fr 1.85fr;gap:8px;background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;padding:7px 8px;">
+          <!-- ONCat OAuth / OIDC Status & Device Authorization Sign-In Bar -->
+          <div id="nd-oncat-auth-bar" style="grid-column:1 / -1;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 6px;border-radius:4px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.07);">
+            <span id="nd-oncat-auth-msg" style="font-family:var(--font-display);font-size:0.61rem;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+              ONCat: Checking OAuth session…
+            </span>
+            <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+              <a id="link-nd-oncat-verify" href="#" target="_blank" rel="noopener noreferrer" style="display:none;padding:2px 8px;border-radius:4px;background:var(--accent-cyan);color:#060719;font-family:var(--font-display);font-size:0.61rem;font-weight:700;text-decoration:none;">
+                Approve in Browser ↗
+              </a>
+              <button id="btn-nd-oncat-login" type="button" style="padding:2px 8px;font-size:0.61rem;font-family:var(--font-display);border-color:var(--accent-cyan);color:var(--accent-cyan);">
+                Sign in to ONCat
+              </button>
+              <button id="btn-nd-oncat-cancel" type="button" style="display:none;padding:2px 6px;font-size:0.6rem;font-family:var(--font-display);">
+                Cancel
+              </button>
+            </div>
+          </div>
+
           <!-- Left column: Scrollable IPTS Projects -->
           <div style="display:flex;flex-direction:column;gap:4px;min-width:0;">
             <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;">
@@ -6796,11 +6814,121 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   let ndOncatCatalog = {{
     experiments: [],
     runs: [],
+    oncat_authenticated: false,
+    oncat_auth: null,
     multi_run_supported: true,
     multi_run_note: "",
     lastClickedRun: null,
     loading: false,
   }};
+  let ndOncatAuthPollTimer = null;
+
+  function renderOncatAuthBar() {{
+    const msgEl = document.getElementById("nd-oncat-auth-msg");
+    const loginBtn = document.getElementById("btn-nd-oncat-login");
+    const cancelBtn = document.getElementById("btn-nd-oncat-cancel");
+    const verifyLink = document.getElementById("link-nd-oncat-verify");
+    if (!msgEl || !loginBtn) return;
+    const auth = ndOncatCatalog.oncat_auth || {{}};
+    const isAuth = Boolean(ndOncatCatalog.oncat_authenticated || auth.authenticated);
+    if (isAuth) {{
+      msgEl.style.color = "#34d399";
+      msgEl.textContent = `ONCat OAuth: Signed in as ${{auth.user || "ORNL User"}} (run titles & sample metadata active)`;
+      loginBtn.textContent = "Sign out";
+      loginBtn.style.display = "inline-block";
+      if (cancelBtn) cancelBtn.style.display = "none";
+      if (verifyLink) verifyLink.style.display = "none";
+    }} else if (auth.status === "pending_verification") {{
+      msgEl.style.color = "var(--accent-gold)";
+      const codeTxt = auth.user_code ? `Code: ${{auth.user_code}}` : "waiting for code…";
+      msgEl.textContent = `ONCat OAuth (ORNL PingFed) — ${{codeTxt}}`;
+      loginBtn.style.display = "none";
+      if (cancelBtn) cancelBtn.style.display = "inline-block";
+      if (verifyLink) {{
+        const targetUri = auth.verification_uri_complete || auth.verification_uri || "#";
+        verifyLink.href = targetUri;
+        verifyLink.textContent = auth.user_code
+          ? `Open ORNL Login (${{auth.user_code}}) ↗`
+          : "Open ORNL Login ↗";
+        verifyLink.style.display = targetUri !== "#" ? "inline-block" : "none";
+      }}
+    }} else {{
+      msgEl.style.color = "var(--text-dim)";
+      msgEl.textContent = auth.message || "ONCat: Public catalog (sign in via ORNL PingFed for run titles & sample metadata)";
+      loginBtn.textContent = "Sign in to ONCat";
+      loginBtn.style.display = "inline-block";
+      if (cancelBtn) cancelBtn.style.display = "none";
+      if (verifyLink) verifyLink.style.display = "none";
+    }}
+  }}
+
+  async function pollOncatAuthStatus() {{
+    try {{
+      const r = await fetch("api/pipeline/oncat_auth");
+      if (!r.ok) return;
+      const auth = await r.json();
+      const wasAuth = Boolean(ndOncatCatalog.oncat_authenticated);
+      ndOncatCatalog.oncat_auth = auth;
+      ndOncatCatalog.oncat_authenticated = Boolean(auth.authenticated);
+      renderOncatAuthBar();
+      if (auth.authenticated && !wasAuth) {{
+        if (ndOncatAuthPollTimer) {{
+          clearInterval(ndOncatAuthPollTimer);
+          ndOncatAuthPollTimer = null;
+        }}
+        fetchOncatCatalog();
+      }} else if (auth.status !== "pending_verification" && ndOncatAuthPollTimer) {{
+        clearInterval(ndOncatAuthPollTimer);
+        ndOncatAuthPollTimer = null;
+      }}
+    }} catch (_e) {{}}
+  }}
+
+  async function handleOncatAuthButtonClick() {{
+    const isAuth = Boolean(ndOncatCatalog.oncat_authenticated || ndOncatCatalog.oncat_auth?.authenticated);
+    const action = isAuth ? "logout" : "start";
+    try {{
+      const r = await fetch("api/pipeline/oncat_auth", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ action }}),
+      }});
+      if (!r.ok) return;
+      const auth = await r.json();
+      ndOncatCatalog.oncat_auth = auth;
+      ndOncatCatalog.oncat_authenticated = Boolean(auth.authenticated);
+      renderOncatAuthBar();
+      if (action === "start" && auth.status === "pending_verification") {{
+        if (auth.verification_uri_complete) {{
+          window.open(auth.verification_uri_complete, "_blank", "noopener,noreferrer");
+        }}
+        if (ndOncatAuthPollTimer) clearInterval(ndOncatAuthPollTimer);
+        ndOncatAuthPollTimer = setInterval(pollOncatAuthStatus, 1500);
+      }} else if (action === "logout") {{
+        fetchOncatCatalog();
+      }}
+    }} catch (_e) {{}}
+  }}
+
+  async function cancelOncatAuthClick() {{
+    if (ndOncatAuthPollTimer) {{
+      clearInterval(ndOncatAuthPollTimer);
+      ndOncatAuthPollTimer = null;
+    }}
+    try {{
+      const r = await fetch("api/pipeline/oncat_auth", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{ action: "cancel" }}),
+      }});
+      if (r.ok) {{
+        const auth = await r.json();
+        ndOncatCatalog.oncat_auth = auth;
+        ndOncatCatalog.oncat_authenticated = Boolean(auth.authenticated);
+        renderOncatAuthBar();
+      }}
+    }} catch (_e) {{}}
+  }}
 
   function parseRunRangeSpec(specStr) {{
     const runs = [];
@@ -7045,9 +7173,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const data = await r.json();
       ndOncatCatalog.experiments = data.experiments || [];
       ndOncatCatalog.runs = data.runs || [];
+      ndOncatCatalog.oncat_authenticated = Boolean(data.oncat_authenticated);
+      ndOncatCatalog.oncat_auth = data.oncat_auth || null;
       ndOncatCatalog.multi_run_supported = data.multi_run_supported !== false;
       ndOncatCatalog.multi_run_note = data.multi_run_note || "";
       ndOncatCatalog.loading = false;
+      renderOncatAuthBar();
       if (data.ipts && iptsEl && (!iptsEl.value.trim() || iptsOverride !== null)) {{
         iptsEl.value = String(data.ipts);
       }}
@@ -7231,6 +7362,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function closeNeutronDataModal() {{
     pendingLocalNexusFiles = null;
+    if (ndOncatAuthPollTimer) {{
+      clearInterval(ndOncatAuthPollTimer);
+      ndOncatAuthPollTimer = null;
+    }}
     if (modalNeutronData) modalNeutronData.style.display = "none";
   }}
 
@@ -7286,6 +7421,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       renderOncatRunsList(false);
       updateNeutronDialogPreview();
     }});
+  }}
+  const btnNdOncatLogin = document.getElementById("btn-nd-oncat-login");
+  if (btnNdOncatLogin) {{
+    btnNdOncatLogin.addEventListener("click", handleOncatAuthButtonClick);
+  }}
+  const btnNdOncatCancel = document.getElementById("btn-nd-oncat-cancel");
+  if (btnNdOncatCancel) {{
+    btnNdOncatCancel.addEventListener("click", cancelOncatAuthClick);
   }}
   const ndInstEl = document.getElementById("nd-instrument");
   if (ndInstEl) {{

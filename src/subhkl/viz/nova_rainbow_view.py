@@ -1736,146 +1736,367 @@ class NovaGalaxyPipelineRunner:
             "message": msg,
         }
 
-    def _get_oncat_client(self) -> Any:
-        """Return a pyoncat.ONCat client (authenticated if env vars exist, else anonymous)."""
+    ONCAT_DEFAULT_URL = "https://oncat.ornl.gov"
+    # Public human-user device-authorization client ID published by ONCat docs.
+    ONCAT_DEFAULT_CLIENT_ID = "eaeb036a-2602-4bb9-8530-0bb5812da7a1"
+    ONCAT_DEFAULT_SCOPES = ["api:read", "openid"]
+
+    def _get_oncat_token_path(self) -> str:
+        return os.path.expanduser(
+            os.environ.get("ONCAT_TOKEN_PATH", "~/.oncat/token.json")
+        )
+
+    def _seed_oidc_token_if_available(self) -> None:
+        """If an outer NDIP/Galaxy OIDC token or token_endpoint is present in env, seed pyoncat's token store."""
         import pyoncat  # type: ignore[import-untyped]
 
-        url = os.environ.get("ONCAT_URL", "https://oncat.ornl.gov")
-        client_id = os.environ.get("ONCAT_CLIENT_ID")
-        token = os.environ.get("ONCAT_TOKEN")
+        token_path = self._get_oncat_token_path()
+        os.makedirs(os.path.dirname(token_path), exist_ok=True)
+        store = pyoncat.FileSystemTokenStore(token_path)
+        if store.read_token():
+            return
+
+        raw_token = (
+            os.environ.get("ONCAT_TOKEN")
+            or os.environ.get("NDIP_OIDC_TOKEN")
+            or ""
+        ).strip()
+        if not raw_token:
+            token_ep = (
+                os.environ.get("GALAXY_TOKEN_ENDPOINT")
+                or os.environ.get("PULSAR_TOKEN_ENDPOINT")
+                or os.environ.get("TOKEN_ENDPOINT")
+                or ""
+            ).strip()
+            if token_ep:
+                provider = os.environ.get("OIDC_PROVIDER", "pingfed").strip()
+                try:
+                    import urllib.request
+
+                    sep = "&" if "?" in token_ep else "?"
+                    with urllib.request.urlopen(
+                        f"{token_ep}{sep}provider={provider}", timeout=5
+                    ) as resp:
+                        raw_token = resp.read().decode("utf-8").strip().strip('"')
+                except Exception:
+                    raw_token = ""
+
+        if raw_token:
+            try:
+                if raw_token.startswith("{"):
+                    tok_obj = json.loads(raw_token)
+                else:
+                    tok_obj = {
+                        "access_token": raw_token,
+                        "token_type": "Bearer",
+                    }
+                store.write_token(tok_obj)
+            except Exception:
+                pass
+
+    def _build_oauth_oncat_client(
+        self, verification_handler: Any = None
+    ) -> Any:
+        """Build a pyoncat.ONCat client configured with FileSystemTokenStore and OAuth flow."""
+        import pyoncat  # type: ignore[import-untyped]
+
+        self._seed_oidc_token_if_available()
+        url = os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
+        client_id = os.environ.get(
+            "ONCAT_CLIENT_ID", self.ONCAT_DEFAULT_CLIENT_ID
+        )
+        client_secret = os.environ.get("ONCAT_CLIENT_SECRET")
         username = os.environ.get("ONCAT_USERNAME")
         password = os.environ.get("ONCAT_PASSWORD")
-        if client_id and token:
-            return pyoncat.ONCat(url, client_id=client_id, token=token)
+        token_path = self._get_oncat_token_path()
+        os.makedirs(os.path.dirname(token_path), exist_ok=True)
+        store = pyoncat.FileSystemTokenStore(token_path)
+
+        if client_id and client_secret:
+            client = pyoncat.ONCat(
+                url,
+                client_id=client_id,
+                client_secret=client_secret,
+                flow=pyoncat.CLIENT_CREDENTIALS_FLOW,
+                token_getter=store.read_token,
+                token_setter=store.write_token,
+            )
+            if not client.has_stored_token():
+                client.login()
+            return client
+
         if client_id and username and password:
             client = pyoncat.ONCat(
                 url,
                 client_id=client_id,
                 flow=pyoncat.RESOURCE_OWNER_CREDENTIALS_FLOW,
+                token_getter=store.read_token,
+                token_setter=store.write_token,
             )
-            client.login(username, password)
+            if not client.has_stored_token():
+                client.login(username, password)
             return client
-        return pyoncat.ONCat(url)
 
-    def _load_inventory_csv(
-        self, instrument: str, ipts: str
-    ) -> dict[int, dict[str, Any]]:
-        """Load pre-indexed run metadata (titles, sample names, angles) from inventory CSVs if available."""
-        import csv
-
-        cache: dict[str, dict[int, dict[str, Any]]] = getattr(
-            self, "_inventory_csv_cache", {}
+        return pyoncat.ONCat(
+            url,
+            client_id=client_id,
+            flow=pyoncat.DEVICE_AUTHORIZATION_FLOW,
+            scopes=list(self.ONCAT_DEFAULT_SCOPES),
+            token_getter=store.read_token,
+            token_setter=store.write_token,
+            reauth_on_expired=pyoncat.REAUTH_INTERACTION_REQUIRED,
+            verification_handler=verification_handler,
         )
-        key = f"{instrument.upper()}-IPTS-{ipts}"
-        if key in cache:
-            return cache[key]
 
-        candidates = [
-            os.environ.get("SUBHKL_INVENTORY_DIR", ""),
-            "/home/xvg/subhkl-benchmarks/inventory",
-            os.path.abspath(
-                os.path.join(
-                    os.path.dirname(__file__),
-                    "../../../../subhkl-benchmarks/inventory",
-                )
-            ),
-        ]
-        records: dict[int, dict[str, Any]] = {}
-        for base in candidates:
-            if not base:
-                continue
-            csv_path = os.path.join(base, f"{key}.csv")
-            if not os.path.isfile(csv_path):
-                continue
-            try:
-                with open(csv_path, newline="", encoding="utf-8") as fh:
-                    reader = csv.DictReader(fh)
-                    for row in reader:
-                        try:
-                            r_num = int(row.get("run") or row.get("ID") or -1)
-                        except (TypeError, ValueError):
-                            continue
-                        if r_num < 0:
-                            continue
-                        angles = (
-                            str(row.get("log_angles") or "").strip()
-                            or str(row.get("axis_angles") or "").strip()
-                        )
-                        records[r_num] = {
-                            "run": r_num,
-                            "filename": str(row.get("filename") or ""),
-                            "size_bytes": int(float(row.get("size_bytes") or 0)),
-                            "title": str(
-                                row.get("title") or row.get("Title") or ""
-                            ).strip(),
-                            "sample_name": str(row.get("sample_name") or "").strip(),
-                            "start_time": str(row.get("start_time") or "").strip(),
-                            "duration_s": float(row.get("duration_s") or 0.0),
-                            "total_counts": int(float(row.get("total_counts") or 0)),
-                            "angles": angles,
-                        }
-                break
-            except Exception:
-                continue
-        cache[key] = records
-        self._inventory_csv_cache = cache
-        return records
+    def _get_oncat_client(self) -> tuple[Any, bool]:
+        """Return (pyoncat.ONCat client, is_authenticated).
 
-    def _read_nexus_header_meta(self, path: str) -> dict[str, str]:
-        """Fast HDF5 header lookup for entry/title and entry/sample/name when readable."""
-        title_cache: dict[str, dict[str, str]] = getattr(
-            self, "_nexus_header_cache", {}
-        )
-        if path in title_cache:
-            return title_cache[path]
-        meta = {"title": "", "sample_name": "", "angles": ""}
-        if not path or not os.path.isfile(path):
-            return meta
+        Uses stored OAuth/OIDC token via pyoncat when available; falls back to
+        anonymous pyoncat client for public catalog fields when not signed in.
+        """
+        import pyoncat  # type: ignore[import-untyped]
+
+        url = os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
         try:
-            import re as _re
-            import h5py
-
-            with h5py.File(path, "r") as f:
-                entry = f.get("entry")
-                if entry is not None:
-                    if "title" in entry:
-                        v = entry["title"][()]
-                        if hasattr(v, "flat") and getattr(v, "size", 0) > 0:
-                            v = v.flat[0]
-                        meta["title"] = (
-                            v.decode("utf-8", "replace")
-                            if isinstance(v, (bytes, bytearray))
-                            else str(v)
-                        ).strip()
-                    if "sample" in entry and "name" in entry["sample"]:
-                        v = entry["sample"]["name"][()]
-                        if hasattr(v, "flat") and getattr(v, "size", 0) > 0:
-                            v = v.flat[0]
-                        meta["sample_name"] = (
-                            v.decode("utf-8", "replace")
-                            if isinstance(v, (bytes, bytearray))
-                            else str(v)
-                        ).strip()
-            if meta["title"]:
-                ax_matches = _re.findall(
-                    r"(axis\s*\d+|omega|phi|chi|kappa)\s*=?\s*([-+]?\d+(?:\.\d+)?)",
-                    meta["title"],
-                    flags=_re.I,
-                )
-                if ax_matches:
-                    meta["angles"] = ";".join(
-                        f"{k.replace(' ', '').lower()}={v}" for k, v in ax_matches
-                    )
+            oauth_client = self._build_oauth_oncat_client()
+            if oauth_client.has_stored_token():
+                return oauth_client, True
         except Exception:
             pass
-        title_cache[path] = meta
-        self._nexus_header_cache = title_cache
-        return meta
+        return pyoncat.ONCat(url), False
+
+    def _invalidate_oncat_caches(self) -> None:
+        self._oncat_exp_cache = {}
+        self._oncat_runs_cache = {}
+
+    def get_oncat_auth_status(self) -> dict[str, Any]:
+        """Return current pyoncat OAuth session state and any active device-flow challenge."""
+        state: dict[str, Any] = getattr(self, "_oncat_auth_state", {})
+        try:
+            oauth_client = self._build_oauth_oncat_client()
+            has_tok = bool(oauth_client.has_stored_token())
+        except Exception:
+            oauth_client = None
+            has_tok = False
+
+        if has_tok and oauth_client is not None:
+            user_name = state.get("user")
+            if not user_name:
+                try:
+                    u = oauth_client.User.retrieve("me")
+                    if isinstance(u, dict):
+                        user_name = u.get("name")
+                        if not user_name or user_name == "Unknown":
+                            user_name = u.get("id")
+                    state["user"] = user_name or "ORNL User"
+                    self._oncat_auth_state = state
+                except Exception as exc:
+                    import pyoncat  # type: ignore[import-untyped]
+
+                    if isinstance(exc, pyoncat.InteractionRequiredError):
+                        try:
+                            tp = self._get_oncat_token_path()
+                            if os.path.isfile(tp):
+                                os.remove(tp)
+                        except Exception:
+                            pass
+                        has_tok = False
+                    else:
+                        user_name = "ORNL User"
+            if has_tok:
+                return {
+                    "ok": True,
+                    "authenticated": True,
+                    "status": "signed_in",
+                    "user": user_name or "ORNL User",
+                    "verification_uri": None,
+                    "verification_uri_complete": None,
+                    "user_code": None,
+                    "expires_in": None,
+                    "message": f"Signed in to ONCat as {user_name or 'ORNL User'}",
+                }
+
+        if state.get("status") == "pending_verification":
+            return {
+                "ok": True,
+                "authenticated": False,
+                "status": "pending_verification",
+                "user": None,
+                "verification_uri": state.get("verification_uri"),
+                "verification_uri_complete": state.get(
+                    "verification_uri_complete"
+                ),
+                "user_code": state.get("user_code"),
+                "expires_in": state.get("expires_in"),
+                "message": state.get("message")
+                or "Waiting for browser approval via ORNL PingFed...",
+            }
+
+        return {
+            "ok": True,
+            "authenticated": False,
+            "status": state.get("status") or "signed_out",
+            "user": None,
+            "verification_uri": None,
+            "verification_uri_complete": None,
+            "user_code": None,
+            "expires_in": None,
+            "message": state.get("message")
+            or "Anonymous mode (sign in to ONCat for run titles & sample metadata)",
+        }
+
+    def handle_oncat_auth(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Start/cancel pyoncat Device Authorization sign-in, accept forwarded OIDC token, or sign out."""
+        import pyoncat  # type: ignore[import-untyped]
+
+        action = str(body.get("action") or "status").strip().lower()
+        if action == "status":
+            return self.get_oncat_auth_status()
+
+        if action == "logout":
+            cancel_ev = getattr(self, "_oncat_login_cancel_event", None)
+            if cancel_ev is not None:
+                cancel_ev.set()
+            tp = self._get_oncat_token_path()
+            try:
+                if os.path.isfile(tp):
+                    os.remove(tp)
+            except Exception:
+                pass
+            self._oncat_auth_state = {
+                "status": "signed_out",
+                "user": None,
+                "message": "Signed out of ONCat.",
+            }
+            self._invalidate_oncat_caches()
+            return self.get_oncat_auth_status()
+
+        if action == "cancel":
+            cancel_ev = getattr(self, "_oncat_login_cancel_event", None)
+            if cancel_ev is not None:
+                cancel_ev.set()
+            self._oncat_auth_state = {
+                "status": "signed_out",
+                "user": None,
+                "message": "Sign-in cancelled.",
+            }
+            return self.get_oncat_auth_status()
+
+        if action == "token":
+            raw_tok = str(body.get("access_token") or "").strip()
+            if not raw_tok:
+                return {
+                    "ok": False,
+                    "authenticated": False,
+                    "status": "error",
+                    "message": "No access_token provided",
+                }
+            tp = self._get_oncat_token_path()
+            os.makedirs(os.path.dirname(tp), exist_ok=True)
+            store = pyoncat.FileSystemTokenStore(tp)
+            store.write_token(
+                {"access_token": raw_tok, "token_type": "Bearer"}
+            )
+            self._oncat_auth_state = {"status": "signed_in", "user": None}
+            self._invalidate_oncat_caches()
+            return self.get_oncat_auth_status()
+
+        if action == "start":
+            prev_cancel = getattr(self, "_oncat_login_cancel_event", None)
+            if prev_cancel is not None:
+                prev_cancel.set()
+
+            cancel_ev = threading.Event()
+            ready_ev = threading.Event()
+            self._oncat_login_cancel_event = cancel_ev
+            state: dict[str, Any] = {
+                "status": "pending_verification",
+                "user": None,
+                "verification_uri": None,
+                "verification_uri_complete": None,
+                "user_code": None,
+                "expires_in": None,
+                "message": "Requesting device code from ORNL PingFed...",
+            }
+            self._oncat_auth_state = state
+
+            def _on_challenge(challenge: Any) -> None:
+                uri = getattr(challenge, "verification_uri", None)
+                uri_complete = (
+                    getattr(challenge, "verification_uri_complete", None) or uri
+                )
+                code = getattr(challenge, "user_code", None)
+                exp = getattr(challenge, "expires_in", None)
+                state.update(
+                    {
+                        "status": "pending_verification",
+                        "verification_uri": uri,
+                        "verification_uri_complete": uri_complete,
+                        "user_code": code,
+                        "expires_in": exp,
+                        "message": f"Approve in browser (Code: {code})",
+                    }
+                )
+                ready_ev.set()
+
+            def _worker() -> None:
+                try:
+                    client = self._build_oauth_oncat_client(
+                        verification_handler=_on_challenge
+                    )
+                    client.login(
+                        cancel_event=cancel_ev,
+                        device_authorization_timeout=300.0,
+                    )
+                    user_name = "ORNL User"
+                    try:
+                        u = client.User.retrieve("me")
+                        if isinstance(u, dict):
+                            user_name = (
+                                u.get("name")
+                                if u.get("name") and u.get("name") != "Unknown"
+                                else (u.get("id") or "ORNL User")
+                            )
+                    except Exception:
+                        pass
+                    state.update(
+                        {
+                            "status": "signed_in",
+                            "user": user_name,
+                            "verification_uri": None,
+                            "verification_uri_complete": None,
+                            "user_code": None,
+                            "expires_in": None,
+                            "message": f"Signed in to ONCat as {user_name}",
+                        }
+                    )
+                    self._invalidate_oncat_caches()
+                except Exception as exc:
+                    if not cancel_ev.is_set():
+                        state.update(
+                            {
+                                "status": "signed_out",
+                                "user": None,
+                                "verification_uri": None,
+                                "verification_uri_complete": None,
+                                "user_code": None,
+                                "expires_in": None,
+                                "message": f"ONCat sign-in ended: {self._clean_err_msg(exc)}",
+                            }
+                        )
+                finally:
+                    ready_ev.set()
+
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+            ready_ev.wait(timeout=3.0)
+            return self.get_oncat_auth_status()
+
+        return self.get_oncat_auth_status()
 
     def browse_oncat_catalog(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Browse IPTS projects and runs via pyoncat with run title & angle previews."""
+        """Browse IPTS projects and runs via pyoncat (using OAuth token when signed in)."""
         import re as _re
-        from concurrent.futures import ThreadPoolExecutor
 
         fac = str(params.get("facility") or "HFIR").strip().upper()
         inst = str(params.get("instrument") or "CG4D").strip().upper()
@@ -1902,18 +2123,40 @@ class NovaGalaxyPipelineRunner:
             else "Single run only (NDIP neutrons_load_data integer run limit)"
         )
 
-        exp_cache: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = getattr(
-            self, "_oncat_exp_cache", {}
-        )
+        raw_client = self._get_oncat_client()
+        if isinstance(raw_client, tuple):
+            oncat, is_auth = raw_client
+        else:
+            oncat, is_auth = raw_client, False
+        auth_status = self.get_oncat_auth_status()
+        is_auth = bool(auth_status.get("authenticated") or is_auth)
+
+        exp_cache: dict[
+            tuple[str, str, bool], tuple[float, list[dict[str, Any]]]
+        ] = getattr(self, "_oncat_exp_cache", {})
         now = time.time()
         experiments: list[dict[str, Any]] = []
-        cached_exp = exp_cache.get((fac, inst))
+        cached_exp = exp_cache.get((fac, inst, is_auth))
         if cached_exp and (now - cached_exp[0]) < 300.0:
             experiments = cached_exp[1]
         else:
             try:
-                oncat = self._get_oncat_client()
-                raw_exps = oncat.Experiment.list(facility=fac, instrument=inst)
+                try:
+                    raw_exps = oncat.Experiment.list(
+                        facility=fac,
+                        instrument=inst,
+                    )
+                except Exception:
+                    import pyoncat as _pyoncat  # type: ignore[import-untyped]
+
+                    oncat = _pyoncat.ONCat(
+                        os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
+                    )
+                    is_auth = False
+                    raw_exps = oncat.Experiment.list(
+                        facility=fac, instrument=inst
+                    )
+
                 for e in raw_exps:
                     eid = str(e.get("id") or "")
                     m_ip = _re.search(r"IPTS-(\d+)", eid, _re.I)
@@ -1925,17 +2168,6 @@ class NovaGalaxyPipelineRunner:
                         ((e.get("latest") or {}).get("created") or "")
                     )[:10]
                     title_str = str(e.get("title") or "").strip()
-                    inv = self._load_inventory_csv(inst, ip_num)
-                    if not title_str and inv:
-                        samples: list[str] = []
-                        for rec in inv.values():
-                            s_nm = rec.get("sample_name") or ""
-                            if s_nm and s_nm not in samples:
-                                samples.append(s_nm)
-                            if len(samples) >= 4:
-                                break
-                        if samples:
-                            title_str = ", ".join(samples)
                     experiments.append(
                         {
                             "ipts": ip_num,
@@ -1955,28 +2187,10 @@ class NovaGalaxyPipelineRunner:
                     ),
                     reverse=True,
                 )
-                exp_cache[(fac, inst)] = (now, experiments)
+                exp_cache[(fac, inst, is_auth)] = (now, experiments)
                 self._oncat_exp_cache = exp_cache
             except Exception:
-                # Fallback to local inventory CSVs if ONCat is unreachable
-                for fallback_ip in ("37331", "34720", "33429"):
-                    inv = self._load_inventory_csv(inst, fallback_ip)
-                    if inv:
-                        r_keys = sorted(inv.keys())
-                        experiments.append(
-                            {
-                                "ipts": fallback_ip,
-                                "id": f"IPTS-{fallback_ip}",
-                                "n_runs": len(r_keys),
-                                "run_ranges": f"{r_keys[0]}-{r_keys[-1]}",
-                                "min_run": r_keys[0],
-                                "max_run": r_keys[-1],
-                                "latest_date": str(
-                                    inv[r_keys[-1]].get("start_time") or ""
-                                )[:10],
-                                "title": "Cached inventory",
-                            }
-                        )
+                pass
 
         if not ipts_raw and experiments:
             ipts_raw = str(experiments[0]["ipts"])
@@ -1984,31 +2198,51 @@ class NovaGalaxyPipelineRunner:
         runs: list[dict[str, Any]] = []
         if ipts_raw:
             runs_cache: dict[
-                tuple[str, str, str], tuple[float, list[dict[str, Any]]]
+                tuple[str, str, str, bool], tuple[float, list[dict[str, Any]]]
             ] = getattr(self, "_oncat_runs_cache", {})
-            cached_runs = runs_cache.get((fac, inst, ipts_raw))
+            cached_runs = runs_cache.get((fac, inst, ipts_raw, is_auth))
             if cached_runs and (now - cached_runs[0]) < 300.0:
                 runs = cached_runs[1]
             else:
-                inv = self._load_inventory_csv(inst, ipts_raw)
                 by_run: dict[int, dict[str, Any]] = {}
                 try:
-                    oncat = self._get_oncat_client()
-                    dfs = oncat.Datafile.list(
-                        facility=fac,
-                        instrument=inst,
-                        experiment=f"IPTS-{ipts_raw}",
-                        projection=[
-                            "indexed.run_number",
-                            "location",
-                            "size",
-                            "created",
-                            "indexed.sample_id",
-                            "metadata.entry.title",
-                            "metadata.entry.sample.name",
-                        ],
-                        exts=[".nxs.h5"],
-                    )
+                    proj = [
+                        "indexed.run_number",
+                        "location",
+                        "size",
+                        "created",
+                        "indexed.sample_id",
+                        "metadata.entry.title",
+                        "metadata.entry.sample.name",
+                        "metadata.entry.daslogs.omega.average_value",
+                        "metadata.entry.daslogs.chi.average_value",
+                        "metadata.entry.daslogs.phi.average_value",
+                        "metadata.entry.duration",
+                        "metadata.entry.total_counts",
+                    ]
+                    try:
+                        dfs = oncat.Datafile.list(
+                            facility=fac,
+                            instrument=inst,
+                            experiment=f"IPTS-{ipts_raw}",
+                            projection=proj,
+                            exts=[".nxs.h5"],
+                        )
+                    except Exception:
+                        import pyoncat as _pyoncat  # type: ignore[import-untyped]
+
+                        oncat = _pyoncat.ONCat(
+                            os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
+                        )
+                        is_auth = False
+                        dfs = oncat.Datafile.list(
+                            facility=fac,
+                            instrument=inst,
+                            experiment=f"IPTS-{ipts_raw}",
+                            projection=proj,
+                            exts=[".nxs.h5"],
+                        )
+
                     for d in dfs:
                         idx_d = d.get("indexed") or {}
                         r_val = idx_d.get("run_number")
@@ -2024,22 +2258,27 @@ class NovaGalaxyPipelineRunner:
                             continue
                         r_num = int(r_val)
                         meta_entry = (d.get("metadata") or {}).get("entry") or {}
-                        inv_rec = inv.get(r_num) or {}
                         loc = str(
                             d.get("location")
                             or f"/{fac}/{inst}/IPTS-{ipts_raw}/nexus/{inst}_{r_num}.nxs.h5"
                         )
-                        title = (
-                            str(meta_entry.get("title") or "").strip()
-                            or str(inv_rec.get("title") or "").strip()
-                        )
-                        sample_name = (
-                            str(
-                                (meta_entry.get("sample") or {}).get("name") or ""
-                            ).strip()
-                            or str(inv_rec.get("sample_name") or "").strip()
-                        )
-                        angles = str(inv_rec.get("angles") or "").strip()
+                        title = str(meta_entry.get("title") or "").strip()
+                        sample_name = str(
+                            (meta_entry.get("sample") or {}).get("name") or ""
+                        ).strip()
+                        daslogs = meta_entry.get("daslogs") or {}
+                        angle_parts: list[str] = []
+                        for ax_name in ("omega", "chi", "phi"):
+                            ax_obj = daslogs.get(ax_name)
+                            if isinstance(ax_obj, dict) and ax_obj.get(
+                                "average_value"
+                            ) is not None:
+                                try:
+                                    val_f = float(ax_obj["average_value"])
+                                    angle_parts.append(f"{ax_name}={val_f:.1f}")
+                                except (TypeError, ValueError):
+                                    pass
+                        angles = ";".join(angle_parts)
                         if not angles and title:
                             ax_m = _re.findall(
                                 r"(axis\s*\d+|omega|phi|chi|kappa)\s*=?\s*([-+]?\d+(?:\.\d+)?)",
@@ -2051,12 +2290,10 @@ class NovaGalaxyPipelineRunner:
                                     f"{k.replace(' ', '').lower()}={v}"
                                     for k, v in ax_m
                                 )
-                        sz_bytes = int(
-                            d.get("size") or inv_rec.get("size_bytes") or 0
+                        sz_bytes = int(d.get("size") or 0)
+                        created_str = str(d.get("created") or "")[:16].replace(
+                            "T", " "
                         )
-                        created_str = str(
-                            d.get("created") or inv_rec.get("start_time") or ""
-                        )[:16].replace("T", " ")
                         by_run[r_num] = {
                             "run": r_num,
                             "location": loc,
@@ -2065,59 +2302,18 @@ class NovaGalaxyPipelineRunner:
                             "angles": angles,
                             "size_mb": round(sz_bytes / (1024.0 * 1024.0), 1),
                             "created": created_str,
-                            "duration_s": inv_rec.get("duration_s") or 0.0,
-                            "total_counts": inv_rec.get("total_counts") or 0,
+                            "duration_s": float(
+                                meta_entry.get("duration") or 0.0
+                            ),
+                            "total_counts": int(
+                                float(meta_entry.get("total_counts") or 0)
+                            ),
                         }
                 except Exception:
                     pass
 
-                if not by_run and inv:
-                    for r_num, inv_rec in inv.items():
-                        loc = f"/{fac}/{inst}/IPTS-{ipts_raw}/nexus/{inst}_{r_num}.nxs.h5"
-                        sz_bytes = int(inv_rec.get("size_bytes") or 0)
-                        by_run[r_num] = {
-                            "run": r_num,
-                            "location": loc,
-                            "title": str(inv_rec.get("title") or ""),
-                            "sample_name": str(inv_rec.get("sample_name") or ""),
-                            "angles": str(inv_rec.get("angles") or ""),
-                            "size_mb": round(sz_bytes / (1024.0 * 1024.0), 1),
-                            "created": str(inv_rec.get("start_time") or "")[
-                                :16
-                            ].replace("T", " "),
-                            "duration_s": inv_rec.get("duration_s") or 0.0,
-                            "total_counts": inv_rec.get("total_counts") or 0,
-                        }
-
-                # Enrich missing titles from local NeXus headers for the latest up to 200 runs
-                missing_title_runs = [
-                    r_info
-                    for r_num, r_info in sorted(
-                        by_run.items(), key=lambda kv: kv[0], reverse=True
-                    )[:200]
-                    if not r_info.get("title")
-                    and os.path.isfile(str(r_info.get("location") or ""))
-                ]
-                if missing_title_runs:
-                    with ThreadPoolExecutor(max_workers=16) as pool:
-                        metas = list(
-                            pool.map(
-                                lambda item: self._read_nexus_header_meta(
-                                    str(item["location"])
-                                ),
-                                missing_title_runs,
-                            )
-                        )
-                    for item, meta in zip(missing_title_runs, metas):
-                        if meta.get("title"):
-                            item["title"] = meta["title"]
-                        if meta.get("sample_name") and not item.get("sample_name"):
-                            item["sample_name"] = meta["sample_name"]
-                        if meta.get("angles") and not item.get("angles"):
-                            item["angles"] = meta["angles"]
-
                 runs = [by_run[k] for k in sorted(by_run.keys())]
-                runs_cache[(fac, inst, ipts_raw)] = (now, runs)
+                runs_cache[(fac, inst, ipts_raw, is_auth)] = (now, runs)
                 self._oncat_runs_cache = runs_cache
 
         return {
@@ -2125,6 +2321,8 @@ class NovaGalaxyPipelineRunner:
             "facility": fac,
             "instrument": inst,
             "ipts": ipts_raw,
+            "oncat_authenticated": is_auth,
+            "oncat_auth": auth_status,
             "multi_run_supported": multi_run_supported,
             "multi_run_note": multi_run_note,
             "experiments": experiments,
@@ -3758,6 +3956,16 @@ def serve_rainbow_zones(
                 self.wfile.write(body)
                 return
 
+            if req_path == "/api/pipeline/oncat_auth":
+                auth_doc = vm.pipeline_runner.get_oncat_auth_status()
+                body = json.dumps(auth_doc).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
             if req_path == "/api/pipeline/status":
                 hist_ds = vm.pipeline_runner.list_history_datasets()
                 status_doc = {
@@ -3794,6 +4002,24 @@ def serve_rainbow_zones(
             req_path = parsed.path
             if ep_path and req_path.startswith(ep_path):
                 req_path = req_path[len(ep_path) :] or "/"
+
+            if req_path == "/api/pipeline/oncat_auth":
+                content_len = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                try:
+                    req_json = json.loads(raw_body.decode("utf-8") or "{}")
+                    result = vm.pipeline_runner.handle_oncat_auth(req_json)
+                    code = 200
+                except Exception as exc:
+                    result = {"ok": False, "error": str(exc), "message": str(exc)}
+                    code = 400
+                body = json.dumps(result).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
 
             if req_path == "/api/pipeline/check_neutron_paths":
                 content_len = int(self.headers.get("Content-Length", "0") or 0)

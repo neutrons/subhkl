@@ -895,16 +895,63 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     assert "Number(sub[rowOff + dc])" in html_merged
     assert "api/pipeline/resolve_local_files" in html_merged
     assert "api/pipeline/oncat_catalog" in html_merged
+    assert "api/pipeline/oncat_auth" in html_merged
     assert "nd-oncat-browser" in html_merged
+    assert "nd-oncat-auth-bar" in html_merged
     assert "+ Neutron data" not in html_merged
     assert "+ From local computer" not in html_merged
     assert ">Neutron data (SNS/HFIR)...</option>" in html_merged
     assert ">From local computer...</option>" in html_merged
 
-    cat_res = runner_no_ndip.browse_oncat_catalog(
-        {"facility": "HFIR", "instrument": "CG4D", "ipts": "37331"}
-    )
-    assert cat_res["ok"] is True
-    assert cat_res["multi_run_supported"] is True
-    assert isinstance(cat_res["experiments"], list)
-    assert isinstance(cat_res["runs"], list)
+    # Verify ONCat browser uses pyoncat (no direct local /SNS or /HFIR header reads)
+    import os
+
+    assert not hasattr(runner_no_ndip, "_read_nexus_header_meta")
+    assert not hasattr(runner_no_ndip, "_load_inventory_csv")
+
+    tok_file = tmp_path / "test_oncat_token.json"
+    monkeypatch_prev = os.environ.get("ONCAT_TOKEN_PATH")
+    os.environ["ONCAT_TOKEN_PATH"] = str(tok_file)
+    try:
+        auth_init = runner_no_ndip.get_oncat_auth_status()
+        assert auth_init["ok"] is True
+        assert auth_init["authenticated"] is False
+
+        real_build = runner_no_ndip._build_oauth_oncat_client
+
+        def _build_with_mock_user(*args, **kwargs):
+            client = real_build(*args, **kwargs)
+            client.User = MagicMock()
+            client.User.retrieve.return_value = {
+                "name": "Test Scientist",
+                "id": "xvg",
+            }
+            return client
+
+        runner_no_ndip._build_oauth_oncat_client = _build_with_mock_user
+        auth_seeded = runner_no_ndip.handle_oncat_auth(
+            {"action": "token", "access_token": "mock_oidc_jwt_token"}
+        )
+        assert auth_seeded["ok"] is True
+        assert auth_seeded["authenticated"] is True
+        assert auth_seeded["user"] == "Test Scientist"
+        assert tok_file.is_file()
+
+        auth_out = runner_no_ndip.handle_oncat_auth({"action": "logout"})
+        assert auth_out["ok"] is True
+        assert auth_out["authenticated"] is False
+        assert not tok_file.exists()
+
+        cat_res = runner_no_ndip.browse_oncat_catalog(
+            {"facility": "HFIR", "instrument": "CG4D", "ipts": "37331"}
+        )
+        assert cat_res["ok"] is True
+        assert cat_res["multi_run_supported"] is True
+        assert isinstance(cat_res["experiments"], list)
+        assert isinstance(cat_res["runs"], list)
+    finally:
+        runner_no_ndip._build_oauth_oncat_client = real_build
+        if monkeypatch_prev is None:
+            os.environ.pop("ONCAT_TOKEN_PATH", None)
+        else:
+            os.environ["ONCAT_TOKEN_PATH"] = monkeypatch_prev
