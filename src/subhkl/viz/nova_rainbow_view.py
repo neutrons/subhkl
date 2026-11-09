@@ -659,12 +659,21 @@ class NovaGalaxyPipelineRunner:
                 "podman",
                 "run",
                 "--rm",
+                "--pids-limit=-1",
                 "--security-opt",
                 "label=disable",
                 "--device",
                 "nvidia.com/gpu=all",
                 "-e",
                 f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '0')}",
+                "-e",
+                "XLA_PYTHON_CLIENT_PREALLOCATE=false",
+                "-e",
+                "OPENBLAS_NUM_THREADS=1",
+                "-e",
+                "OMP_NUM_THREADS=1",
+                "-e",
+                "MKL_NUM_THREADS=1",
             ]
             for d in mount_dirs:
                 if os.path.isdir(d):
@@ -679,6 +688,9 @@ class NovaGalaxyPipelineRunner:
 
         gpu_env = os.environ.copy()
         gpu_env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        gpu_env.setdefault("OPENBLAS_NUM_THREADS", "1")
+        gpu_env.setdefault("OMP_NUM_THREADS", "1")
+        gpu_env.setdefault("MKL_NUM_THREADS", "1")
         try:
             gpu_info = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader"],

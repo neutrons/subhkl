@@ -181,6 +181,8 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert "btn-zone-arcs" in content
     assert "showZoneArcs: true" in content
     assert "drawSingleZoneArc" in content
+    assert "const OVERLAY_PARALLAX_LAYER = 0.45;" in content
+    assert "detToScreen(pt[0], pt[1], w, h, OVERLAY_PARALLAX_LAYER)" in content
     assert "pipeline-stages" in content
     assert "parseH5BuffersInBrowser" in content
     assert "btn-new-tab" in content

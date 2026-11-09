@@ -3294,7 +3294,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
     ctx.restore();
 
-    // 3. LAYER 1 (MID): Single-Arc Laue Zone Conics [uvw] clipped to detector panels
+    const OVERLAY_PARALLAX_LAYER = 0.45;
+
+    // 3. LAYER 1 (FOREGROUND OVERLAY): Single-Arc Laue Zone Conics [uvw] clipped to detector panels
+    // Moves together with the predicted Bragg circles in parallax above the detector heatmap
     if (state.showZoneArcs) {{
       const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
       ZONES.forEach(zone => {{
@@ -3306,7 +3309,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ? (hasPanels ? (zone.detector_segments_sph || []) : (zone.detector_segments_sph || contSegs))
           : (hasPanels ? (zone.detector_segments || []) : (zone.detector_segments || contSegs));
         panelSegs.forEach((seg, sIdx) => {{
-          const screenPts = seg.map(pt => detToScreen(pt[0], pt[1], w, h, 0.0));
+          const screenPts = seg.map(pt => detToScreen(pt[0], pt[1], w, h, OVERLAY_PARALLAX_LAYER));
           drawSingleZoneArc(ctx, screenPts, zone, false);
           if (sIdx === 0 && screenPts.length > 2 && (state.selectedZoneId === zone.zone_id || state.detZoom > 1.35)) {{
             const mid = screenPts[Math.floor(screenPts.length * 0.5)];
@@ -3322,15 +3325,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
     }}
 
-    // 4. FOREGROUND LAYER: Predicted Bragg Rings floating by d-spacing
-    // Moving the mouse shifts these rings relative to the back detector plate so you can look "behind" them!
+    // 4. FOREGROUND LAYER: Predicted Bragg Rings hovering together with Laue zone circles
+    // Moving the mouse shifts both Laue zones and peak rings together relative to the back detector plate!
     const visiblePeaks = PEAKS.filter(isPeakVisible)
       .slice()
       .sort((a, b) => b.parallax_depth - a.parallax_depth);
 
     visiblePeaks.forEach(p => {{
       const py = getPeakVert(p);
-      const fgLayer = 0.25 + (1.0 - p.parallax_depth) * 0.65;
+      const fgLayer = OVERLAY_PARALLAX_LAYER;
       const [x, y] = detToScreen(p.det_x, py, w, h, fgLayer);
       const [bx, by] = detToScreen(p.det_x, py, w, h, -0.35);
 
@@ -3457,10 +3460,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const rect = detCanvas.getBoundingClientRect();
     let best = null;
     let bestDist = 14.0;
+    const fgLayer = 0.45;
     PEAKS.forEach(p => {{
       if (!isPeakVisible(p)) return;
       const py = getPeakVert(p);
-      const fgLayer = 0.25 + (1.0 - p.parallax_depth) * 0.65;
       const [x, y] = detToScreen(p.det_x, py, rect.width, rect.height, fgLayer);
       const [bx, by] = detToScreen(p.det_x, py, rect.width, rect.height, -0.35);
       const d = Math.min(Math.hypot(mx - x, my - y), Math.hypot(mx - bx, my - by));
