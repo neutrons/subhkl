@@ -259,6 +259,8 @@ def _make_ewald_polisher(
     wl,
     b2,
     s_samp=None,
+    chunk_size=8192,
+    max_reflections=40000,
 ):
     import jax
     import jax.numpy as jnp
@@ -275,6 +277,36 @@ def _make_ewald_polisher(
         if r_ in r_map and bk in b_map:
             E[r_map[r_], b_map[bk], : e.shape[0], : e.shape[1]] = e
 
+    G_c_np = np.asarray(G_c, np.float32)
+    qn_np = np.linalg.norm(G_c_np, axis=1)
+    q_max_kin = np.float32(2.0 / max(float(wl[0]), 1e-6))
+    valid_q = (qn_np > 1e-7) & (qn_np <= q_max_kin)
+    if np.any(valid_q):
+        G_c_np = G_c_np[valid_q]
+        qn_np = qn_np[valid_q]
+        if max_reflections and len(G_c_np) > int(max_reflections):
+            keep = np.argpartition(qn_np, int(max_reflections))[: int(max_reflections)]
+            G_c_np = G_c_np[keep]
+            qn_np = qn_np[keep]
+    else:
+        G_c_np = np.zeros((1, 3), np.float32)
+        qn_np = np.zeros((1,), np.float32)
+    inv_qn_np = np.where(qn_np > 1e-7, 1.0 / np.maximum(qn_np, 1e-7), 0.0).astype(
+        np.float32
+    )
+    n_refl = len(G_c_np)
+    chunk_sz = int(max(1024, chunk_size))
+    if n_refl > chunk_sz:
+        pad = (-n_refl) % chunk_sz
+        if pad:
+            G_c_np = np.pad(G_c_np, ((0, pad), (0, 0)))
+            inv_qn_np = np.pad(inv_qn_np, (0, pad))
+        Gc_chunks = jnp.asarray(G_c_np.reshape(-1, chunk_sz, 3))
+        inv_qn_chunks = jnp.asarray(inv_qn_np.reshape(-1, chunk_sz))
+    else:
+        Gc_chunks = None
+        inv_qn_chunks = None
+
     cen = jnp.asarray(np.asarray(C_corners, np.float32))
     uh = jnp.asarray(np.asarray(uhats, np.float32))
     vh = jnp.asarray(np.asarray(vhats, np.float32))
@@ -284,7 +316,8 @@ def _make_ewald_polisher(
     nrow = jnp.asarray(np.asarray(N_bank + 1.0, np.float32))
     ncol = jnp.asarray(np.asarray(M_bank + 1.0, np.float32))
     Rr = jnp.asarray(np.array([R_runs[r_] for r_ in runs], np.float32))
-    Gc = jnp.asarray(np.asarray(G_c, np.float32))
+    Gc = jnp.asarray(G_c_np)
+    inv_qn = jnp.asarray(inv_qn_np)
     kih = jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
     s_samp_j = jnp.asarray(
         np.zeros(3, np.float32) if s_samp is None else np.asarray(s_samp, np.float32)
@@ -293,19 +326,17 @@ def _make_ewald_polisher(
     lo_l, hi_l = np.float32(wl[0]), np.float32(wl[1])
     b2f = np.float32(b2)
 
-    def score_single_run(Ej_r, R_r, U):
-        G = (Gc @ U.T) @ R_r.T
-        qn = jnp.linalg.norm(G, axis=1)
-        sth = -(G @ kih) / jnp.maximum(qn, 1e-12)
-        lam = 2.0 * sth / jnp.maximum(qn, 1e-12)
-        band = (lam >= lo_l) & (lam <= hi_l) & (sth > 0)
+    def _score_chunk(Ej_r, RU, cen_r, cn_dot, cv_dot, cu_dot, Gc_k, inv_qn_k):
+        G = Gc_k @ RU.T
+        sth = -(G[:, 2]) * inv_qn_k
+        lam = 2.0 * sth * inv_qn_k
+        band = (lam >= lo_l) & (lam <= hi_l) & (sth > 0) & (inv_qn_k > 0)
         kf = kih[None, :] + lam[:, None] * G
         kf = kf / jnp.linalg.norm(kf, axis=1, keepdims=True)
-        cen_r = cen - (R_r @ s_samp_j)[None, :]
         dn = kf @ nrm.T
-        t = (cen_r * nrm).sum(1)[None, :] / jnp.where(jnp.abs(dn) < 1e-9, 1e-9, dn)
-        row = (t * (kf @ vh.T) - (cen_r * vh).sum(1)[None, :]) / dh[None]
-        col = (t * (kf @ uh.T) - (cen_r * uh).sum(1)[None, :]) / dw[None]
+        t = cn_dot[None, :] / jnp.where(jnp.abs(dn) < 1e-9, 1e-9, dn)
+        row = (t * (kf @ vh.T) - cv_dot[None, :]) / dh[None]
+        col = (t * (kf @ uh.T) - cu_dot[None, :]) / dw[None]
         ok = (
             band[:, None]
             & (t > 0)
@@ -334,6 +365,32 @@ def _make_ewald_polisher(
             + fu * fv * gat(1, 1)
         )
         return jnp.where(ok, vals, 0.0).sum()
+
+    def score_single_run(Ej_r, R_r, U):
+        RU = R_r @ U
+        cen_r = cen - (R_r @ s_samp_j)[None, :]
+        cn_dot = (cen_r * nrm).sum(1)
+        cv_dot = (cen_r * vh).sum(1)
+        cu_dot = (cen_r * uh).sum(1)
+        if Gc_chunks is None:
+            return _score_chunk(
+                Ej_r, RU, cen_r, cn_dot, cv_dot, cu_dot, Gc, inv_qn
+            )
+
+        def _body(acc, pair):
+            gc_k, iq_k = pair
+            return (
+                acc
+                + _score_chunk(
+                    Ej_r, RU, cen_r, cn_dot, cv_dot, cu_dot, gc_k, iq_k
+                ),
+                None,
+            )
+
+        tot, _ = jax.lax.scan(
+            _body, jnp.float32(0.0), (Gc_chunks, inv_qn_chunks)
+        )
+        return tot
 
     @jax.jit
     def score_batch_runs(Us):
@@ -447,6 +504,14 @@ def _make_ewald_polisher(
     return eval_runs, polish_joint, polish_per_run
 
 
+def _ewald_d_min(cell, d_min, max_p1_refl=120000):
+    vol_est = max(float(cell[0]) * float(cell[1]) * float(cell[2]), 1.0)
+    d_floor = float(
+        (4.0 * np.pi * vol_est / (3.0 * float(max_p1_refl))) ** (1.0 / 3.0)
+    )
+    return max(float(d_min), d_floor)
+
+
 def _polish_per_run_translations(
     args,
     U_opt,
@@ -471,11 +536,12 @@ def _polish_per_run_translations(
     from scipy.spatial.transform import Rotation as Rot
 
     bank_to_idx = {b: i for i, b in enumerate(bank_ids)}
+    d_min_ew = _ewald_d_min(cell_opt, args.d_min)
     hkl = np.stack(
         generate_reflections(
             *cell_opt,
             space_group=args.space_group,
-            d_min=args.d_min,
+            d_min=d_min_ew,
         ),
         axis=1,
     ).astype(np.float64)
@@ -849,11 +915,12 @@ def refine_scan(args):
     if not args.pixel_polish and args.maxiter > 2:
         exc_maps, b2_ew, has_ew_signal = _build_ewald_excess_maps(args)
         if has_ew_signal:
+            d_min_ew = _ewald_d_min(cell0, args.d_min)
             hkl_ew = np.stack(
                 generate_reflections(
                     *cell0,
                     space_group=args.space_group,
-                    d_min=args.d_min,
+                    d_min=d_min_ew,
                 ),
                 axis=1,
             ).astype(np.float64)
