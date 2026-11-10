@@ -1145,3 +1145,21 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert chk_multi["ok"] is True
     assert chk_multi["verified_dataset_ids"] == ["ds_ndip_m"]
 
+    # 5. Terminal carriage-return (\r) and ANSI CSI emulation for in-place tqdm progress bars
+    raw_tqdm = (
+        "Starting integration...\n"
+        "\rBatching Images:   0%|          | 0/600 [00:00<?, ?it/s]"
+        "\r                                                        \r"
+        "\rBatching Images:  50%|█████     | 300/600 [00:01<00:01, 250it/s]"
+        "\rBatching Images: 100%|██████████| 600/600 [00:02<00:00, 280it/s]\n"
+        "Done."
+    )
+    formatted_tqdm = NovaGalaxyPipelineRunner._format_terminal_stream(raw_tqdm)
+    assert formatted_tqdm.splitlines() == [
+        "Starting integration...",
+        "Batching Images: 100%|██████████| 600/600 [00:02<00:00, 280it/s]",
+        "Done.",
+    ]
+    assert "formatTerminalStdio" in html
+
+

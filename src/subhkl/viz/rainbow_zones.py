@@ -4344,13 +4344,79 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  function formatTerminalStdio(rawText) {{
+    if (!rawText) return "";
+    const text = String(rawText).replace(/\\r\\n/g, "\\n");
+    const tokens = text.split(/(\\x1b\\[[0-9;?]*[A-Za-z]|\\r|\\n)/);
+    const lines = [""];
+    let row = 0;
+    let col = 0;
+    for (let i = 0; i < tokens.length; i++) {{
+      const tok = tokens[i];
+      if (!tok) continue;
+      if (tok === "\\n") {{
+        lines[row] = (lines[row] || "").replace(/\\s+$/, "");
+        row += 1;
+        if (row >= lines.length) lines.push("");
+        col = 0;
+      }} else if (tok === "\\r") {{
+        col = 0;
+      }} else if (tok.charCodeAt(0) === 27 && tok[1] === "[") {{
+        const cmdCh = tok[tok.length - 1];
+        const paramStr = tok.slice(2, -1).replace(/^[?;]+/, "");
+        const firstPart = paramStr.split(";")[0];
+        const n = /^\\d+$/.test(firstPart) ? parseInt(firstPart, 10) : 1;
+        if (cmdCh === "A") {{
+          row = Math.max(0, row - Math.max(1, n));
+          col = 0;
+        }} else if (cmdCh === "B") {{
+          row = Math.min(lines.length - 1, row + Math.max(1, n));
+          col = 0;
+        }} else if (cmdCh === "G") {{
+          col = Math.max(0, n - 1);
+        }} else if (cmdCh === "K") {{
+          const modeK = /^\\d+$/.test(paramStr) ? parseInt(paramStr, 10) : 0;
+          if (modeK === 2) {{
+            lines[row] = "";
+            col = 0;
+          }} else if (modeK === 1) {{
+            lines[row] = " ".repeat(col) + (lines[row] || "").slice(col);
+          }} else {{
+            lines[row] = (lines[row] || "").slice(0, col);
+          }}
+        }}
+      }} else {{
+        let cur = lines[row] || "";
+        if (col > cur.length) cur += " ".repeat(col - cur.length);
+        lines[row] = cur.slice(0, col) + tok + cur.slice(col + tok.length);
+        col += tok.length;
+      }}
+    }}
+    const tqdmRe = /^\\s*([^%|]*?)\\s*\\d{{1,3}}%\\|.*\\|/;
+    const collapsed = [];
+    for (let i = 0; i < lines.length; i++) {{
+      const cleanLn = (lines[i] || "").replace(/\\s+$/, "");
+      const mCur = tqdmRe.exec(cleanLn);
+      if (mCur && collapsed.length > 0) {{
+        const mPrev = tqdmRe.exec(collapsed[collapsed.length - 1]);
+        if (mPrev && mPrev[1].trim() === mCur[1].trim()) {{
+          collapsed[collapsed.length - 1] = cleanLn;
+          continue;
+        }}
+      }}
+      collapsed.push(cleanLn);
+    }}
+    return collapsed.join("\\n");
+  }}
+
   function appendTerminalLog(text, replace = false) {{
     const box = document.getElementById("terminal-box");
     if (!box) return;
     if (replace) {{
-      box.textContent = text;
+      box.textContent = formatTerminalStdio(text);
     }} else {{
-      box.textContent += (box.textContent.endsWith("\\n") ? "" : "\\n") + text;
+      const combined = box.textContent + (box.textContent.endsWith("\\n") ? "" : "\\n") + text;
+      box.textContent = formatTerminalStdio(combined);
     }}
     box.scrollTop = box.scrollHeight;
   }}

@@ -326,6 +326,78 @@ class NovaGalaxyPipelineRunner:
                 msg = msg[:idx].strip().rstrip(":,;")
         return msg[:220]
 
+    @staticmethod
+    def _format_terminal_stream(raw_text: str) -> str:
+        """Emulate terminal carriage-return (\\r) and ANSI line-erase/cursor-up for tqdm progress bars."""
+        if not raw_text:
+            return ""
+        import re as _re
+
+        text = raw_text.replace("\r\n", "\n")
+        tokens = _re.split(r"(\x1b\[[0-9;?]*[A-Za-z]|\r|\n)", text)
+        lines: list[str] = [""]
+        row = 0
+        col = 0
+        for tok in tokens:
+            if not tok:
+                continue
+            if tok == "\n":
+                lines[row] = lines[row].rstrip()
+                row += 1
+                if row >= len(lines):
+                    lines.append("")
+                col = 0
+            elif tok == "\r":
+                col = 0
+            elif tok.startswith("\x1b["):
+                cmd_ch = tok[-1]
+                params_s = tok[2:-1].lstrip("?;")
+                first_num = (
+                    int(params_s.split(";")[0])
+                    if params_s and params_s.split(";")[0].isdigit()
+                    else 1
+                )
+                if cmd_ch == "A":
+                    row = max(0, row - max(1, first_num))
+                    col = 0
+                elif cmd_ch == "B":
+                    row = min(len(lines) - 1, row + max(1, first_num))
+                    col = 0
+                elif cmd_ch == "G":
+                    col = max(0, first_num - 1)
+                elif cmd_ch == "K":
+                    mode_k = (
+                        int(params_s)
+                        if params_s and params_s.isdigit()
+                        else 0
+                    )
+                    if mode_k == 2:
+                        lines[row] = ""
+                        col = 0
+                    elif mode_k == 1:
+                        lines[row] = (" " * col) + lines[row][col:]
+                    else:
+                        lines[row] = lines[row][:col]
+            else:
+                cur = lines[row]
+                if col > len(cur):
+                    cur = cur + (" " * (col - len(cur)))
+                lines[row] = cur[:col] + tok + cur[col + len(tok) :]
+                col += len(tok)
+
+        tqdm_re = _re.compile(r"^\s*(?P<pfx>[^%|]*?)\s*\d{1,3}%\|.*\|")
+        collapsed: list[str] = []
+        for ln in lines:
+            clean_ln = ln.rstrip()
+            m_cur = tqdm_re.match(clean_ln)
+            if m_cur and collapsed:
+                m_prev = tqdm_re.match(collapsed[-1])
+                if m_prev and m_prev.group("pfx").strip() == m_cur.group("pfx").strip():
+                    collapsed[-1] = clean_ln
+                    continue
+            collapsed.append(clean_ln)
+        return "\n".join(collapsed)
+
     def _auto_discover_local_galaxy(self) -> None:
         """Auto-discover local Planemo / Galaxy server if env vars were not injected."""
         if self.galaxy_url and self.galaxy_url.startswith("https://"):
@@ -3384,8 +3456,7 @@ class NovaGalaxyPipelineRunner:
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
+                    bufsize=0,
                     env=gpu_env,
                 )
                 assert proc.stdout is not None
@@ -3393,11 +3464,30 @@ class NovaGalaxyPipelineRunner:
                 blind_dst = solve_dest[:-3] + ".blind.h5"
                 last_blind_mtime = 0.0
                 partial_seq = 0
-                for line in proc.stdout:
-                    job_record["stdout"] = (job_record.get("stdout", "") + line)[
+                initial_prefix = job_record.get("stdout", "")
+                if initial_prefix and not initial_prefix.endswith("\n"):
+                    initial_prefix += "\n"
+                raw_stream = ""
+                fd = proc.stdout.fileno()
+                while True:
+                    chunk_bytes = os.read(fd, 4096)
+                    if not chunk_bytes:
+                        break
+                    chunk_str = chunk_bytes.decode("utf-8", errors="replace")
+                    raw_stream += chunk_str
+                    if len(raw_stream) > 96000 and "\n" in raw_stream[:-8192]:
+                        cut_nl = raw_stream.rfind("\n", 0, len(raw_stream) - 8192)
+                        if cut_nl > 0:
+                            raw_stream = (
+                                self._format_terminal_stream(raw_stream[:cut_nl])
+                                + "\n"
+                                + raw_stream[cut_nl + 1 :]
+                            )
+                    formatted_stream = self._format_terminal_stream(raw_stream)
+                    job_record["stdout"] = (initial_prefix + formatted_stream)[
                         -24000:
                     ]
-                    low = line.lower()
+                    low = chunk_str.lower()
                     if stage_id == "solve":
                         trigger_blind_sync = False
                         if (
@@ -3781,10 +3871,10 @@ class NovaGalaxyPipelineRunner:
                 except Exception:
                     pass
 
-                out_txt = (
+                out_txt = self._format_terminal_stream(
                     console_out or jinfo.get("tool_stdout") or jinfo.get("stdout") or ""
                 )
-                err_txt = (
+                err_txt = self._format_terminal_stream(
                     console_err or jinfo.get("tool_stderr") or jinfo.get("stderr") or ""
                 )
                 if job_record.get("stage_id") == "merge":
