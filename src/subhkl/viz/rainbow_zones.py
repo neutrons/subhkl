@@ -6275,7 +6275,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.currentPipelineIdx = pipelineIdxForArtifactKind(artKind);
       state.currentRungIdx = artKind === "merged" ? 0 : Math.max(0, LADDER.length - 1);
     }}
-    if (artKind === "merged_careless" || Boolean(DATA.merge_metrics)) {{
+    if (!isFrameSwitch && (artKind === "merged_careless" || Boolean(DATA.merge_metrics))) {{
       state.showStereo = true;
       state.wulffExpanded = true;
       state.wulffScope = "all_runs";
