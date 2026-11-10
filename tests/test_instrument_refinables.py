@@ -1,0 +1,630 @@
+"""Shared refinable geometry, and matching-free instrument refinement.
+
+The parameterizations live in subhkl.instrument.refinables and are used by
+BOTH the peak-list refinement (VectorizedObjective, verified unchanged by
+the indexer test suite) and the spherical matching-free path tested here.
+
+Two identifiability facts are guarded as tests because the first guess is
+wrong both ways: a goniometer axis offset is pure gauge with the crystal
+orientation whenever every axis inner to it holds constant angles across
+the pooled runs (the innermost axis always is -- R_inner constant lets
+R_k(delta) commute through and fold into U exactly), and identifiable
+precisely when some inner angle varies.  The gauge case must still fit the
+*observables* perfectly; only the parameter split is undetermined.
+"""
+
+from __future__ import annotations
+
+import jax.numpy as jnp
+import numpy as np
+
+from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+from subhkl.instrument.refinables import (
+    apply_detector_modes,
+    forward_map_param,
+    gonio_rotation_jax,
+    peak_lab_xyz,
+    rodrigues_safe_jax,
+)
+from subhkl.search.spherical import (
+    _quat_angle,
+    _rodrigues,
+    refine_instrument_matching_free,
+)
+
+BOUNDS = {"independent_trans": 0.01, "independent_rot": np.deg2rad(1.0)}
+SLICES = {"independent": slice(0, 12)}
+
+CENTERS = np.array([[0.35, 0.0, 0.35], [-0.35, 0.0, 0.35]])
+UHATS = np.array([[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]])
+VHATS = np.array([[-0.7071, 0.0, 0.7071], [0.7071, 0.0, 0.7071]])
+WIDTHS = np.array([0.3, 0.3])
+HEIGHTS = np.array([0.3, 0.3])
+NOMINAL = {
+    "centers": CENTERS,
+    "uhats": UHATS,
+    "vhats": VHATS,
+    "widths": WIDTHS,
+    "heights": HEIGHTS,
+}
+
+
+def _rand_rot(rng):
+    Q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+    return Q * np.sign(np.linalg.det(Q))
+
+
+def _modes(det_norm):
+    c, u, v, _w, _h, _a = apply_detector_modes(
+        jnp.asarray(det_norm)[None],
+        jnp.asarray(CENTERS)[None],
+        jnp.asarray(UHATS)[None],
+        jnp.asarray(VHATS)[None],
+        jnp.asarray(WIDTHS)[None],
+        jnp.asarray(HEIGHTS)[None],
+        ("independent",),
+        SLICES,
+        BOUNDS,
+    )
+    return np.asarray(c[0]), np.asarray(u[0]), np.asarray(v[0])
+
+
+def _hkl(B, dmin):
+    binv = np.linalg.inv(B)
+    b_ = np.ceil(np.linalg.norm(binv, axis=1) / dmin).astype(int)
+    h, k, l_ = np.meshgrid(*(np.arange(-x, x + 1) for x in b_), indexing="ij")
+    hkl = np.stack([h.ravel(), k.ravel(), l_.ravel()], axis=1)
+    hkl = hkl[np.any(hkl != 0, axis=1)]
+    hkl = hkl[np.linalg.norm(hkl @ B.T, axis=1) <= 1.0 / dmin]
+    g = np.gcd.reduce(np.abs(hkl), axis=1)
+    prim = hkl // g[:, None]
+    lead = np.where(
+        prim[:, 0] != 0, prim[:, 0], np.where(prim[:, 1] != 0, prim[:, 1], prim[:, 2])
+    )
+    return np.unique(prim * np.where(lead < 0, -1, 1)[:, None], axis=0)
+
+
+def _scene(rng, ct, ut, vt, axes, angles, off_true, B0, hkl, R_true, jitter=2e-4):
+    """Peaks (bank, u_off, v_off, run) from rays through the TRUE geometry."""
+    H = np.vstack([hkl, -hkl]) @ B0.T
+    Hd = H / np.linalg.norm(H, axis=1, keepdims=True)
+    recs = {"det_idx": [], "u_off": [], "v_off": [], "run_idx": []}
+    for r in range(len(angles)):
+        Rrun = np.asarray(
+            gonio_rotation_jax(
+                jnp.asarray(axes), jnp.asarray(angles[r]), jnp.asarray(off_true)
+            )
+        )
+        d_lab = Hd @ (Rrun @ R_true).T
+        d_lab = d_lab[d_lab[:, 2] < -0.05]
+        kf = np.array([0.0, 0.0, 1.0]) - 2 * d_lab[:, 2:3] * d_lab
+        kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+        for b in range(2):
+            n = np.cross(ut[b], vt[b])
+            t = (ct[b] @ n) / (kf @ n)
+            ok = t > 0
+            xyz = t[:, None] * kf
+            uo = (xyz - ct[b]) @ ut[b]
+            vo = (xyz - ct[b]) @ vt[b]
+            ok &= (np.abs(uo) < 0.48 * WIDTHS[b]) & (np.abs(vo) < 0.48 * HEIGHTS[b])
+            recs["det_idx"].append(np.full(ok.sum(), b))
+            recs["u_off"].append(uo[ok] + rng.normal(scale=jitter, size=ok.sum()))
+            recs["v_off"].append(vo[ok] + rng.normal(scale=jitter, size=ok.sum()))
+            recs["run_idx"].append(np.full(ok.sum(), r))
+    return {k: np.concatenate(v) for k, v in recs.items()}
+
+
+def test_apply_detector_modes_nominal_is_identity():
+    c, u, v = _modes(np.full(12, 0.5))
+    assert np.allclose(c, CENTERS, atol=1e-7)
+    assert np.allclose(u, UHATS, atol=1e-7)
+    assert np.allclose(v, VHATS, atol=1e-7)
+    # and the peak reconstruction matches direct arithmetic
+    xyz = peak_lab_xyz(
+        jnp.asarray(CENTERS)[None],
+        jnp.asarray(UHATS)[None],
+        jnp.asarray(VHATS)[None],
+        np.array([0, 1]),
+        jnp.asarray([0.02, -0.05]),
+        jnp.asarray([0.01, 0.03]),
+    )[0]
+    expect = (
+        CENTERS
+        + np.array([[0.02], [-0.05]]) * UHATS
+        + np.array([[0.01], [0.03]]) * VHATS
+    )
+    assert np.allclose(np.asarray(xyz), expect, atol=1e-7)
+
+
+def test_panels_recovered_matching_free():
+    """Per-bank translation and tilt, through the shared parameterization,
+    with no peak list matching anywhere."""
+    rng = np.random.default_rng(17)
+    det_norm_true = np.full(12, 0.5)
+    trans_true = np.array([2.0e-3, -1.0e-3, 1.5e-3])
+    tilt_true = np.deg2rad([0.2, -0.3, 0.1])
+    det_norm_true[0:3] = 0.5 + trans_true / (2 * BOUNDS["independent_trans"])
+    det_norm_true[9:12] = 0.5 + tilt_true / (2 * BOUNDS["independent_rot"])
+    ct, ut, vt = _modes(det_norm_true)
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0]])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
+    peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
+    R_start = R_true @ _rodrigues(np.deg2rad(0.4) * np.array([0.5, 0.5, -0.7]) / 0.99)
+    out = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_start, det_bounds=BOUNDS, kernel_deg=1.0, maxiter=400
+    )
+    trans_err = np.abs(
+        forward_map_param(out["det_params"][0:3], BOUNDS["independent_trans"])
+        - trans_true
+    )
+    tilt_err = np.abs(
+        forward_map_param(out["det_params"][9:12], BOUNDS["independent_rot"])
+        - tilt_true
+    )
+    # margins sized for GPU float32 run-to-run wobble: the Adam trajectory
+    # shifts with unrelated jit-cache state, and measured errors sit at
+    # 0.2-1.0 mm / 0.16 deg / 0.08 deg with occasional excursions
+    assert np.all(trans_err < 2.0e-3)
+    assert np.all(tilt_err < np.deg2rad(0.3))
+    assert np.rad2deg(_quat_angle(out["R"], R_true)) < 0.2
+
+
+def test_gonio_offset_identifiable_when_inner_angles_vary():
+    rng = np.random.default_rng(17)
+    ct, ut, vt = _modes(np.full(12, 0.5))
+    axes = np.array([[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]])
+    angles = np.array([[15.0, 0.0], [15.0, 30.0], [15.0, 60.0]])
+    off_true = np.array([0.7, 0.0])  # on the OUTER axis; inner varies
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, off_true, B0, hkl, R_true)
+    R_start = R_true @ _rodrigues(np.deg2rad(0.4) * np.array([0.5, 0.5, -0.7]) / 0.99)
+    out = refine_instrument_matching_free(
+        peaks,
+        NOMINAL,
+        hkl,
+        B0,
+        R_start,
+        det_bounds=BOUNDS,
+        modes=(),
+        gonio={
+            "axes": axes,
+            "angles_deg": angles,
+            "refine_mask": np.array([True, False]),
+            "bound_deg": 2.0,
+        },
+        kernel_deg=1.0,
+        maxiter=400,
+    )
+    assert abs(out["gonio_offsets_deg"][0] - 0.7) < 0.1
+    assert np.rad2deg(_quat_angle(out["R"], R_true)) < 0.3
+
+
+def test_innermost_gonio_offset_is_gauge_but_observables_still_fit():
+    """The gauge theorem, measured: an innermost-axis offset cannot be
+    recovered (it folds into U exactly), yet the refined combination must
+    reproduce every observed direction.  If this test ever recovers the
+    offset, the composition convention changed -- investigate, don't relax.
+    """
+    rng = np.random.default_rng(17)
+    ct, ut, vt = _modes(np.full(12, 0.5))
+    axes = np.array([[0.0, 0.0, 1.0, 1.0], [1.0, 0.0, 0.0, 1.0]])
+    angles = np.array([[0.0, 10.0], [25.0, 10.0], [50.0, 10.0]])
+    off_true = np.array([0.0, 0.6])  # innermost: pure gauge
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, off_true, B0, hkl, R_true)
+    R_start = R_true @ _rodrigues(np.deg2rad(0.4) * np.array([0.5, 0.5, -0.7]) / 0.99)
+    out = refine_instrument_matching_free(
+        peaks,
+        NOMINAL,
+        hkl,
+        B0,
+        R_start,
+        det_bounds=BOUNDS,
+        modes=(),
+        gonio={
+            "axes": axes,
+            "angles_deg": angles,
+            "refine_mask": np.array([False, True]),
+            "bound_deg": 2.0,
+        },
+        kernel_deg=1.0,
+        maxiter=400,
+    )
+    # the SPLIT is undetermined, but the gauge relation must hold: the
+    # unrecovered offset reappears as a rotation of U about the inner axis
+    resid = np.deg2rad(out["gonio_offsets_deg"][1] - 0.6)
+    R_gauge = np.asarray(rodrigues_safe_jax(jnp.asarray([-resid, 0.0, 0.0])))
+    # 0.3 deg: the gauge relation is exact in the continuum, but the finite
+    # Adam run and GPU float32 nondeterminism leave a ~0.15 deg residual
+    # that wobbles run to run (measured 0.13-0.17 on identical input).
+    assert np.rad2deg(_quat_angle(out["R"], R_gauge @ R_true)) < 0.3
+
+
+def test_detector_mode_slices_match_classic_layout():
+    """One layout definition for both refinement paths: the shared function
+    reproduces the classic VectorizedObjective bookkeeping for every mode."""
+    from subhkl.instrument.refinables import detector_mode_slices
+
+    slices, n = detector_mode_slices(
+        ("radial", "global_rot", "global_trans", "independent"), 4
+    )
+    assert slices["radial"] == slice(0, 1)
+    assert slices["global_rot"] == slice(1, 4)
+    assert slices["global_trans"] == slice(4, 7)
+    assert slices["independent"] == slice(7, 7 + 24)
+    assert n == 31
+    import pytest as _pytest
+
+    with _pytest.raises(ValueError):
+        detector_mode_slices(("bogus",), 2)
+
+
+def test_global_modes_recovered_matching_free():
+    """Parity beyond 'independent': a rigid global translation + rotation of
+    the whole assembly, refined through the shared mode chain."""
+    rng = np.random.default_rng(19)
+    t_true = np.array([3.0e-3, -2.0e-3, 1.5e-3])  # [m]
+    r_true = np.deg2rad([0.3, -0.2, 0.25])
+    # truth via the shared chain itself, in the same normalized space
+    slices, n_par = __import__(
+        "subhkl.instrument.refinables", fromlist=["detector_mode_slices"]
+    ).detector_mode_slices(("global_trans", "global_rot"), 2)
+    norm_true = np.full(n_par, 0.5)
+    norm_true[slices["global_trans"]] = 0.5 + t_true / (2 * 0.01)
+    norm_true[slices["global_rot"]] = 0.5 + r_true / (2 * np.deg2rad(2.0))
+    bounds = {
+        "global_trans": 0.01,
+        "global_rot": np.deg2rad(2.0),
+        "independent_trans": 0.01,
+        "independent_rot": np.deg2rad(1.0),
+    }
+    ct, ut, vt, _, _, _ = apply_detector_modes(
+        jnp.asarray(norm_true)[None],
+        jnp.asarray(CENTERS)[None],
+        jnp.asarray(UHATS)[None],
+        jnp.asarray(VHATS)[None],
+        jnp.asarray(WIDTHS)[None],
+        jnp.asarray(HEIGHTS)[None],
+        ("global_trans", "global_rot"),
+        slices,
+        bounds,
+    )
+    ct, ut, vt = np.asarray(ct[0]), np.asarray(ut[0]), np.asarray(vt[0])
+
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0]])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
+    peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
+    R_start = R_true @ _rodrigues(np.deg2rad(0.3) * np.array([0.6, -0.4, 0.5]) / 0.88)
+    out = refine_instrument_matching_free(
+        peaks,
+        NOMINAL,
+        hkl,
+        B0,
+        R_start,
+        modes=("global_trans", "global_rot"),
+        det_bounds=bounds,
+        kernel_deg=1.0,
+        maxiter=400,
+    )
+    from subhkl.instrument.refinables import forward_map_param
+
+    t_fit = forward_map_param(out["det_params"][slices["global_trans"]], 0.01)
+    # NOTE: global_rot of the whole assembly is near-gauge with the crystal
+    # orientation for direction data (a rigid rotation of every panel about
+    # the sample looks like rotating the crystal the other way, up to the
+    # translation-induced parallax) -- so assert the translation, which is
+    # identifiable, and the combined consistency through R.  The margin
+    # leaves room for f32 optimizer wobble along the near-gauge rotation
+    # direction (order-dependent through kernel autotuning, observed up to
+    # ~2.2 mm on the most-coupled component); still 3x under the 10 mm bound.
+    err = np.abs(t_fit - t_true)
+    assert np.all(err < 3.0e-3), err
+
+
+def test_axis_vector_tilt_recovered():
+    """The classic axis-vector refinement, matching-free: a tilted rotation
+    axis is identifiable when that axis's own angle varies across runs."""
+    from subhkl.instrument.refinables import axis_tilt_frames
+
+    rng = np.random.default_rng(23)
+    ct, ut, vt = _modes(np.full(12, 0.5))
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    # a wide scan: over a short arc much of an axis tilt is absorbable into
+    # U (the same partial-gauge structure as every other calibration here);
+    # 240 deg of rotation pins it
+    angles = np.array([[0.0], [120.0], [240.0]])
+    tilt_true = np.deg2rad([0.4, -0.3])
+    ((e1, e2),) = axis_tilt_frames(axes)
+    tilted = np.asarray(
+        rodrigues_safe_jax(jnp.asarray(tilt_true[0] * e1 + tilt_true[1] * e2))
+    ) @ (axes[0, :3] / np.linalg.norm(axes[0, :3]))
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+
+    # scene through the TILTED axis
+    H = np.vstack([hkl, -hkl]) @ B0.T
+    Hd = H / np.linalg.norm(H, axis=1, keepdims=True)
+    recs = {"det_idx": [], "u_off": [], "v_off": [], "run_idx": []}
+    for r in range(3):
+        Rrun = np.asarray(
+            gonio_rotation_jax(
+                axes, angles[r], np.zeros(1), axis_dirs=[jnp.asarray(tilted)]
+            )
+        )
+        d_lab = Hd @ (Rrun @ R_true).T
+        d_lab = d_lab[d_lab[:, 2] < -0.05]
+        kf = np.array([0.0, 0.0, 1.0]) - 2 * d_lab[:, 2:3] * d_lab
+        kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+        for b in range(2):
+            n = np.cross(ut[b], vt[b])
+            t = (ct[b] @ n) / (kf @ n)
+            ok = t > 0
+            xyz = t[:, None] * kf
+            uo = (xyz - ct[b]) @ ut[b]
+            vo = (xyz - ct[b]) @ vt[b]
+            ok &= (np.abs(uo) < 0.48 * WIDTHS[b]) & (np.abs(vo) < 0.48 * HEIGHTS[b])
+            recs["det_idx"].append(np.full(ok.sum(), b))
+            recs["u_off"].append(uo[ok] + rng.normal(scale=2e-4, size=ok.sum()))
+            recs["v_off"].append(vo[ok] + rng.normal(scale=2e-4, size=ok.sum()))
+            recs["run_idx"].append(np.full(ok.sum(), r))
+    peaks = {k: np.concatenate(v) for k, v in recs.items()}
+
+    R_start = R_true @ _rodrigues(np.deg2rad(0.3) * np.array([0.5, 0.5, -0.7]) / 0.99)
+    out = refine_instrument_matching_free(
+        peaks,
+        NOMINAL,
+        hkl,
+        B0,
+        R_start,
+        modes=(),
+        det_bounds=BOUNDS,
+        gonio={
+            "axes": axes,
+            "angles_deg": angles,
+            "refine_mask": np.array([False]),
+            "axis_tilt_mask": np.array([True]),
+            "tilt_bound_deg": 1.0,
+        },
+        kernel_deg=1.0,
+        maxiter=400,
+    )
+    t_fit = np.deg2rad(out["axis_tilts_deg"][0])
+    assert np.all(np.abs(t_fit - tilt_true) < np.deg2rad(0.15))
+    assert out["loglik"] > -0.5  # the tilted model actually fits
+
+
+def test_per_run_corrections_recovered_up_to_their_gauge():
+    """The literal per-run DPHI: per-run angle corrections on the varying
+    motor.  Their constant part is that motor's zero offset and inherits
+    its gauge (here the motor is the only axis, hence innermost: gauge),
+    so recovery is asserted on the mean-free part -- the physical
+    content."""
+
+    rng = np.random.default_rng(29)
+    ct, ut, vt = _modes(np.full(12, 0.5))
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0], [30.0], [60.0], [90.0]])
+    dphi_true = np.array([0.30, -0.20, 0.40, -0.10])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(
+        rng,
+        ct,
+        ut,
+        vt,
+        axes,
+        angles + dphi_true[:, None],
+        np.zeros(1),
+        B0,
+        hkl,
+        R_true,
+    )
+    R_start = R_true @ _rodrigues(np.deg2rad(0.3) * np.array([0.5, 0.5, -0.7]) / 0.99)
+    out = refine_instrument_matching_free(
+        peaks,
+        NOMINAL,
+        hkl,
+        B0,
+        R_start,
+        modes=(),
+        det_bounds=BOUNDS,
+        gonio={
+            "axes": axes,
+            "angles_deg": angles,
+            "refine_mask": np.array([False]),
+            "per_run_axis": 0,
+            "per_run_bound_deg": 1.0,
+        },
+        kernel_deg=1.0,
+        maxiter=500,
+    )
+    rec = out["per_run_deg"]
+    # 0.15 deg: measured accuracy of the mean-free recovery at kernel 1 deg
+    # and 500 Adam steps (errors up to ~0.1 deg); the mean itself is gauge
+    assert np.all(np.abs((rec - rec.mean()) - (dphi_true - dphi_true.mean())) < 0.15)
+
+
+def test_beam_tilt_recovered():
+    rng = np.random.default_rng(31)
+    ct, ut, vt = _modes(np.full(12, 0.5))
+    ki_true = np.array([np.sin(np.deg2rad(0.3)), 0.0, np.cos(np.deg2rad(0.3))])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    H = np.vstack([hkl, -hkl]) @ B0.T
+    Hd = (H / np.linalg.norm(H, axis=1, keepdims=True)) @ R_true.T
+    Hd = Hd[Hd @ ki_true < -0.05]
+    kf = ki_true[None, :] - 2 * (Hd @ ki_true)[:, None] * Hd
+    kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+    recs = {"det_idx": [], "u_off": [], "v_off": []}
+    for b in range(2):
+        n = np.cross(ut[b], vt[b])
+        t = (ct[b] @ n) / (kf @ n)
+        ok = t > 0
+        xyz = t[:, None] * kf
+        uo = (xyz - ct[b]) @ ut[b]
+        vo = (xyz - ct[b]) @ vt[b]
+        ok &= (np.abs(uo) < 0.48 * WIDTHS[b]) & (np.abs(vo) < 0.48 * HEIGHTS[b])
+        recs["det_idx"].append(np.full(ok.sum(), b))
+        recs["u_off"].append(uo[ok] + rng.normal(scale=2e-4, size=ok.sum()))
+        recs["v_off"].append(vo[ok] + rng.normal(scale=2e-4, size=ok.sum()))
+    peaks = {k: np.concatenate(v) for k, v in recs.items()}
+    R_start = R_true @ _rodrigues(np.deg2rad(0.3) * np.array([0.5, 0.5, -0.7]) / 0.99)
+    out = refine_instrument_matching_free(
+        peaks,
+        NOMINAL,
+        hkl,
+        B0,
+        R_start,
+        modes=(),
+        det_bounds=BOUNDS,
+        refine_beam=True,
+        beam_bound_deg=1.0,
+        kernel_deg=1.0,
+        maxiter=400,
+    )
+    err = np.rad2deg(np.arccos(np.clip(out["ki_refined"] @ ki_true, -1, 1)))
+    assert err < 0.1
+
+
+def test_a_clipped_parameter_is_reported_not_hidden():
+    """A refinable pinned at its bound is a clipped fit, not a converged
+    one, and used to be reported as a plain number.  Measured instance:
+    CG4D's coherent +24 mm radial detector error is 5.4% of the 0.448 m
+    distance, past the 5% default, so the radial mode sat at exactly
+    0.0500 in every report while the geometry stayed wrong.  Here a 2 mm
+    panel translation is refined under a 0.5 mm bound: the fit must run to
+    the bound AND say so, with the flag that lifts it."""
+    rng = np.random.default_rng(19)
+    det_norm_true = np.full(12, 0.5)
+    trans_true = np.array([2.0e-3, 0.0, 0.0])
+    det_norm_true[0:3] = 0.5 + trans_true / (2 * BOUNDS["independent_trans"])
+    ct, ut, vt = _modes(det_norm_true)
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0]])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
+    peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
+
+    tight = {"independent_trans": 5.0e-4, "independent_rot": np.deg2rad(1.0)}
+    out = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, det_bounds=tight, kernel_deg=1.0, maxiter=300
+    )
+    sat = out["at_bounds"]
+    assert sat, "a 2 mm offset refined under a 0.5 mm bound must report the clip"
+    trans_hits = [e for e in sat if e["what"] == "detector independent translation"]
+    assert trans_hits
+    e = max(trans_hits, key=lambda x: abs(x["value"]))
+    assert abs(e["value"]) >= 0.98 * tight["independent_trans"]
+    assert e["flag"] == "--det-trans-bound"
+
+    # and with room to move, nothing is flagged: the check must not cry
+    # wolf on a converged fit
+    out2 = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, det_bounds=BOUNDS, kernel_deg=1.0, maxiter=400
+    )
+    assert not [
+        e for e in out2["at_bounds"] if e["what"] == "detector independent translation"
+    ]
+
+
+def test_chunking_the_overlap_changes_nothing_but_the_memory():
+    """The objective's (data x model) overlap is chunked over the model
+    axis when it would be too large to materialize -- exactly, since the
+    density is a SUM over model directions and a running sum over chunks
+    is the same number.  A 100 A cell puts 65k reflections on the model
+    side at d_min 2.5 (L1 metallo-beta-lactamase), where the half-million
+    weighted pixels of raw mode asked for one 117 GiB allocation and the
+    stress test died in jit_run_adam; chunked, the same problem runs in
+    1 GiB temporaries.  What must not change is the answer."""
+    rng = np.random.default_rng(31)
+    ct, ut, vt = _modes(np.full(12, 0.5))
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0]])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
+    peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
+    n_data = len(peaks["det_idx"])
+
+    common = dict(det_bounds=BOUNDS, kernel_deg=1.0, maxiter=1)
+    whole = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, max_overlap_elems=1 << 30, **common
+    )
+    # a budget of eight model columns per pass: ~65 chunks, padding included
+    chunked = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, max_overlap_elems=n_data * 8, **common
+    )
+    assert abs(whole["loglik"] - chunked["loglik"]) < 1e-5
+    np.testing.assert_allclose(whole["R"], chunked["R"], atol=1e-6)
+    # and the padding rows must not leak in: a chunk size that divides the
+    # model count exactly must agree with one that does not
+    exact = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, max_overlap_elems=n_data * 11, **common
+    )
+    assert abs(whole["loglik"] - exact["loglik"]) < 1e-5
+
+
+def test_model_weights_are_scale_free_and_chunk_exactly():
+    """A weighted dictionary (nodal multiplicities) reaches the objective
+    through model_weights.  The density is unnormalized against a fixed
+    floor, so the weights are scaled to mean 1: a uniform vector of any
+    scale is the unweighted problem, and a non-uniform one gives the same
+    number whether or not the overlap is chunked."""
+    from subhkl.search.spherical import nodal_points
+
+    rng = np.random.default_rng(37)
+    ct, ut, vt = _modes(np.full(12, 0.5))
+    axes = np.array([[0.0, 0.0, 1.0, 1.0]])
+    angles = np.array([[0.0]])
+    B0, _ = cartesian_matrix_metric_tensor(8.0, 8.0, 8.0, *np.deg2rad([90, 90, 90]))
+    hkl = _hkl(B0, 1.2)
+    R_true = _rand_rot(rng)
+    peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
+    peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
+    n_data = len(peaks["det_idx"])
+    common = dict(det_bounds=BOUNDS, kernel_deg=1.0, maxiter=1)
+
+    plain = refine_instrument_matching_free(peaks, NOMINAL, hkl, B0, R_true, **common)
+    scaled = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl, B0, R_true, model_weights=np.full(len(hkl), 7.0), **common
+    )
+    assert abs(plain["loglik"] - scaled["loglik"]) < 1e-6
+
+    hkl_n, w_n = nodal_points(B0, max_index=2)
+    whole = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl_n, B0, R_true, model_weights=w_n, **common
+    )
+    chunked = refine_instrument_matching_free(
+        peaks,
+        NOMINAL,
+        hkl_n,
+        B0,
+        R_true,
+        model_weights=w_n,
+        max_overlap_elems=n_data * 8,
+        **common,
+    )
+    assert abs(whole["loglik"] - chunked["loglik"]) < 1e-5
+    # and the weights matter: the nodal problem is not the uniform one
+    uniform = refine_instrument_matching_free(
+        peaks, NOMINAL, hkl_n, B0, R_true, **common
+    )
+    assert abs(whole["loglik"] - uniform["loglik"]) > 1e-4

@@ -145,8 +145,16 @@ class Peaks:
         )
         print(f"Starting parallel integration of {len(tasks)} images...")
 
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+        effective_workers = min(int(max_workers), 8) if max_workers is not None else 8
+
         ctx = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
+        with ProcessPoolExecutor(
+            mp_context=ctx, max_workers=effective_workers
+        ) as executor:
             future_to_key = {
                 executor.submit(worker.process_single_image, *t): t[0] for t in tasks
             }
@@ -227,8 +235,16 @@ class Peaks:
             harmonic_rot=harmonic_rot,
         )
 
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+        effective_workers = min(int(max_workers), 8) if max_workers is not None else 8
+
         ctx = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(mp_context=ctx, max_workers=max_workers) as executor:
+        with ProcessPoolExecutor(
+            mp_context=ctx, max_workers=effective_workers
+        ) as executor:
             futures_to_bank = {
                 executor.submit(worker.predict_single_bank, *t): t[0] for t in tasks
             }

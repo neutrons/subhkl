@@ -2,20 +2,17 @@ import os
 import warnings
 from functools import partial
 
-
-import jax
-import jax.numpy as jnp
-import jax.lax as lax
-import jax.scipy.linalg as jscipy_linalg
-from evosax.algorithms import CMA_ES, PSO, DifferentialEvolution, GuidedES
-
-import numpy as np
 import h5py
+import numpy as np
 import scipy.linalg
 
-from subhkl.instrument.detector import scattering_vector_from_angles
-from subhkl.utils import devices as device_util
 from subhkl.core.spacegroup import get_space_group_object
+from subhkl.instrument.detector import scattering_vector_from_angles
+from subhkl.instrument.refinables import (
+    apply_detector_modes,
+    detector_mode_slices,
+)
+from subhkl.utils import devices as device_util
 
 try:
     from tqdm import trange
@@ -235,6 +232,8 @@ def get_lattice_system(
 
 
 def rotation_matrix_from_axis_angle_jax(axis, angle_rad):
+    import jax.numpy as jnp
+
     u = axis / jnp.linalg.norm(axis)
     ux, uy, uz = u
     K = jnp.array([[0.0, -uz, uy], [uz, 0.0, -ux], [-uy, ux, 0.0]])
@@ -245,6 +244,8 @@ def rotation_matrix_from_axis_angle_jax(axis, angle_rad):
 
 
 def rotation_matrix_from_rodrigues_jax(w):
+    import jax.numpy as jnp
+
     theta = jnp.linalg.norm(w) + 1e-9
     k = w / theta
     K = jnp.array([[0.0, -k[2], k[1]], [k[2], 0.0, -k[0]], [-k[1], k[0], 0.0]])
@@ -308,6 +309,9 @@ class VectorizedObjective:
         hkl_metric="isotropic",
         hkl_metric_floor=0.1,
     ):
+        import jax.numpy as jnp
+
+        self._jit_cache = {}
         self.no_index = no_index
         if self.no_index:
             self.hkl_fixed = jnp.array(hkl_fixed)  # Shape: (3, N)
@@ -721,24 +725,10 @@ class VectorizedObjective:
                 "independent_rot": jnp.deg2rad(detector_rot_bound_deg),
             }
 
-            for mode in self.det_modes:
-                if mode in ("radial", "cylindrical", "axial_stretch", "area"):
-                    size = 1
-                elif mode == "global_rot":
-                    size = 3
-                elif mode == "global_rot_axis":
-                    size = 1
-                elif mode == "global_trans":
-                    size = 3
-                elif mode == "independent":
-                    size = self.num_banks * 6
-                else:
-                    raise ValueError(f"Unknown detector refinement mode: {mode}")
-
-                self.det_param_slices[mode] = slice(
-                    self.num_det_params, self.num_det_params + size
-                )
-                self.num_det_params += size
+            # one layout definition for both refinement paths
+            self.det_param_slices, self.num_det_params = detector_mode_slices(
+                self.det_modes, self.num_banks
+            )
 
             self.det_widths = jnp.array(
                 [pw * m for pw, m in zip(detector_params["pw"], detector_params["m"])]
@@ -776,10 +766,14 @@ class VectorizedObjective:
         self.M_prim_inv = jnp.linalg.inv(self.M_prim)
 
     def orientation_U_jax(self, param):
+        import jax
+
         U = jax.vmap(rotation_matrix_from_rodrigues_jax)(param)
         return U
 
     def reconstruct_cell_params(self, params_norm):
+        import jax.numpy as jnp
+
         p_free = _forward_map_lattice(
             params_norm, self.free_params_init, self.lattice_bound_frac
         )
@@ -809,6 +803,10 @@ class VectorizedObjective:
         return p_free
 
     def _get_physical_params_jax(self, x):
+        import jax
+        import jax.numpy as jnp
+        import jax.scipy.linalg as jscipy_linalg
+
         idx = 0
         if self.freeze_orientation:
             rot_params = self.fixed_rot_params[None, :].repeat(x.shape[0], axis=0)
@@ -1040,103 +1038,23 @@ class VectorizedObjective:
 
             w = self.det_widths[None, :].repeat(S, axis=0)
             h = self.det_heights[None, :].repeat(S, axis=0)
-            area_scale = jnp.zeros((S, 1))
 
-            if "radial" in self.det_modes:
-                slc = self.det_param_slices["radial"]
-                scale_norm = det_params[:, slc]
-                scale = _forward_map_param(scale_norm, self.bounds["radial"])
-                c = c * (1.0 + scale[:, :, None])
-
-            if "cylindrical" in self.det_modes:
-                slc = self.det_param_slices["cylindrical"]
-                scale_norm = det_params[:, slc]
-                scale = _forward_map_param(scale_norm, self.bounds["radial"])
-
-                c_dot_a = jnp.sum(c * self.cylinder_axis, axis=-1, keepdims=True)
-
-                c_parallel = c_dot_a * self.cylinder_axis
-                c_perp = c - c_parallel
-
-                c = c_parallel + c_perp * (1.0 + scale[:, :, None])
-
-            if "area" in self.det_modes:
-                slc = self.det_param_slices["area"]
-                scale_norm = det_params[:, slc]
-                scale = _forward_map_param(scale_norm, self.bounds["area"])
-                area_scale = scale
-
-                # Pin the physical center of the panel ---
-                # Shift the corner backwards to counteract the area expansion
-                c = (
-                    c
-                    - (w / 2.0)[:, :, None] * scale[:, :, None] * u
-                    - (h / 2.0)[:, :, None] * scale[:, :, None] * v
-                )
-
-                w = w * (1.0 + scale)
-                h = h * (1.0 + scale)
-
-            if "axial_stretch" in self.det_modes:
-                slc = self.det_param_slices["axial_stretch"]
-                scale_norm = det_params[:, slc]
-                scale = _forward_map_param(scale_norm, self.bounds["radial"])
-
-                c_dot_a = jnp.sum(c * self.cylinder_axis, axis=-1, keepdims=True)
-                c_parallel = c_dot_a * self.cylinder_axis
-                c_perp = c - c_parallel
-
-                c = c_parallel * (1.0 + scale[:, :, None]) + c_perp
-
-            if "global_rot" in self.det_modes:
-                slc = self.det_param_slices["global_rot"]
-                rot_norm = det_params[:, slc]
-                rot_vec = _forward_map_param(rot_norm, self.bounds["global_rot"])
-                R_global = jax.vmap(rotation_matrix_from_rodrigues_jax)(rot_vec)
-
-                c = jnp.einsum("sij,snj->sni", R_global, c)
-                u = jnp.einsum("sij,snj->sni", R_global, u)
-                v = jnp.einsum("sij,snj->sni", R_global, v)
-
-            if "global_rot_axis" in self.det_modes:
-                slc = self.det_param_slices["global_rot_axis"]
-                angle_norm = det_params[:, slc].reshape(-1)
-                angle_rad = _forward_map_param(
-                    angle_norm, self.bounds["global_rot_axis"]
-                )
-
-                R_global = jax.vmap(
-                    rotation_matrix_from_axis_angle_jax, in_axes=(None, 0)
-                )(self.det_global_rot_axis, angle_rad)
-
-                c = jnp.einsum("sij,snj->sni", R_global, c)
-                u = jnp.einsum("sij,snj->sni", R_global, u)
-                v = jnp.einsum("sij,snj->sni", R_global, v)
-
-            if "global_trans" in self.det_modes:
-                slc = self.det_param_slices["global_trans"]
-                trans_norm = det_params[:, slc]
-                trans_vec = _forward_map_param(trans_norm, self.bounds["global_trans"])
-                c = c + trans_vec[:, None, :]
-
-            if "independent" in self.det_modes:
-                slc = self.det_param_slices["independent"]
-                indep_params = det_params[:, slc]
-
-                t_norm = indep_params[:, : self.num_banks * 3].reshape(
-                    -1, self.num_banks, 3
-                )
-                t_vec = _forward_map_param(t_norm, self.bounds["independent_trans"])
-                c = c + t_vec
-
-                r_norm = indep_params[:, self.num_banks * 3 :].reshape(
-                    -1, self.num_banks, 3
-                )
-                r_vec = _forward_map_param(r_norm, self.bounds["independent_rot"])
-                R_local = jax.vmap(jax.vmap(rotation_matrix_from_rodrigues_jax))(r_vec)
-
-                u = jnp.einsum("snij,snj->sni", R_local, u)
-                v = jnp.einsum("snij,snj->sni", R_local, v)
+            # The mode chain lives in subhkl.instrument.refinables so the
+            # spherical matching-free refinement applies *exactly* the same
+            # parameterization; extracted verbatim, behavior-identical.
+            c, u, v, w, h, area_scale = apply_detector_modes(
+                det_params,
+                c,
+                u,
+                v,
+                w,
+                h,
+                self.det_modes,
+                self.det_param_slices,
+                self.bounds,
+                cylinder_axis=getattr(self, "cylinder_axis", None),
+                global_rot_axis=getattr(self, "det_global_rot_axis", None),
+            )
 
             dyn_centers, dyn_uhats, dyn_vhats = c, u, v
             dyn_widths, dyn_heights = w, h
@@ -1182,6 +1100,8 @@ class VectorizedObjective:
         per-peak isotropic floor, set to 1 where the frame is degenerate
         (near-forward peaks) so those keep the plain fractional distance.
         """
+        import jax.numpy as jnp
+
         k_norm = jnp.sqrt(jnp.maximum(k_sq, 1e-12))
         q_hat = kf_ki_sample / k_norm[:, None, :]
         kf_s = kf_ki_sample + ki_sample
@@ -1241,6 +1161,10 @@ class VectorizedObjective:
     def indexer_dynamic_soft_jax(
         self, ub_mat, kf_ki_sample, k_sq_override=None, pos_metric=None
     ):
+        import jax
+        import jax.numpy as jnp
+        from jax import lax
+
         ub_inv = jnp.linalg.inv(ub_mat)
         v = jnp.matmul(ub_inv, kf_ki_sample)
 
@@ -1393,7 +1317,11 @@ class VectorizedObjective:
         the plain chord exactly; w = 0 fits tangential-only, at which
         point purely radial parameter directions become gauge.
         """
-        G = jnp.matmul(ub_mat, self.hkl_fixed)  # (S, 3, N)
+        import jax
+        import jax.numpy as jnp
+
+        with jax.default_matmul_precision("float32"):
+            G = jnp.matmul(ub_mat, self.hkl_fixed)  # (S, 3, N)
         G_sq = jnp.sum(G * G, axis=1)
         lam = -2.0 * jnp.sum(ki_sample * G, axis=1) / jnp.where(G_sq == 0.0, 1.0, G_sq)
         kf_pred = ki_sample + lam[:, None, :] * G
@@ -1439,8 +1367,25 @@ class VectorizedObjective:
         hkl_ret = jnp.tile(self.hkl_fixed.T[None, :, :], (S, 1, 1))
         return loss, dist, hkl_ret, lam
 
-    @partial(jax.jit, static_argnames="self")
+    def _get_jit(self, key, fn):
+        if key not in self._jit_cache:
+            import jax
+
+            self._jit_cache[key] = partial(jax.jit, static_argnames="self")(fn)
+        return self._jit_cache[key]
+
     def get_results(self, x):
+        import jax
+
+        with jax.default_matmul_precision("float32"):
+            return self._get_jit("get_results", VectorizedObjective._get_results_impl)(
+                self, x
+            )
+
+    def _get_results_impl(self, x):
+        import jax
+        import jax.numpy as jnp
+
         original_S = x.shape[0]
         pad_size = max(0, 2 - original_S)
         x_pad = jnp.pad(x, ((0, pad_size), (0, 0)), mode="edge") if pad_size > 0 else x
@@ -1562,8 +1507,10 @@ class VectorizedObjective:
             res,
         )
 
-    @partial(jax.jit, static_argnames="self")
     def __call__(self, x):
+        return self._get_jit("__call__", VectorizedObjective._call_impl)(self, x)
+
+    def _call_impl(self, x):
         score, _, _, _ = self.get_results(x)
         return score
 
@@ -1909,6 +1856,10 @@ class FindUB:
         multi_gpu: bool = False,
         **kwargs,
     ):
+        import jax
+        import jax.numpy as jnp
+        from evosax.algorithms import CMA_ES, PSO, DifferentialEvolution, GuidedES
+
         if goniometer_axes is None and self.goniometer_axes is not None:
             goniometer_axes = self.goniometer_axes
         if goniometer_angles is None and self.goniometer_angles is not None:

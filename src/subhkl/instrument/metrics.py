@@ -10,7 +10,6 @@ import scipy.spatial
 from subhkl.config import beamlines
 from subhkl.instrument.detector import Detector
 from subhkl.instrument.physics import calculate_angular_error
-from subhkl.optimization import FindUB
 
 
 def _get_safe_R_stack(R_file_in, run_indices_in, target_len):
@@ -216,6 +215,8 @@ def compute_metrics(
     return_per_peak: bool = False,
 ) -> dict:
     try:
+        from subhkl.optimization import FindUB
+
         with h5py.File(file1, "r") as f:
             ub_helper = FindUB()
             ub_helper.a = f["sample/a"][()]
@@ -267,6 +268,16 @@ def compute_metrics(
                 )
 
             R_file = f["goniometer/R"][()] if "goniometer/R" in f else None
+            per_run_trans = (
+                f["goniometer/per_run/trans_m"][()]
+                if "goniometer/per_run/trans_m" in f
+                else None
+            )
+            frame_to_run = (
+                f["goniometer/per_run/frame_to_run"][()]
+                if "goniometer/per_run/frame_to_run" in f
+                else None
+            )
 
             if instrument is None:
                 instrument = f.attrs.get("instrument")
@@ -472,6 +483,18 @@ def compute_metrics(
             gonio_axes=gonio_axes,
             gonio_angles=gonio_angles_mapped,
             gonio_offsets=gonio_offsets,  # <-- Pass Down
+            per_run_trans=(
+                per_run_trans[frame_to_run[run_index]]
+                if per_run_trans is not None
+                and frame_to_run is not None
+                and np.max(run_index) < len(frame_to_run)
+                else (
+                    per_run_trans[run_index]
+                    if per_run_trans is not None
+                    and np.max(run_index) < len(per_run_trans)
+                    else None
+                )
+            ),
         )
 
         result = {
