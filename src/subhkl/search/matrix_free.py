@@ -6,9 +6,6 @@ from functools import partial
 import numpy as np
 
 from subhkl.search.profiles import (
-    measure_radial_profile as _measure_radial_profile,
-)
-from subhkl.search.profiles import (
     measure_whitened_profile as _measure_whitened_profile,
 )
 from subhkl.utils import devices as device_util
