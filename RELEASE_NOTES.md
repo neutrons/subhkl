@@ -4,10 +4,15 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.5.0]
 
 ### Changed
 
+- new UI based on nova-trame, launch with
+```
+   GALAXY_URL=https://ndip-test.ornl.gov/ GALAXY_API_KEY=<your api key> \
+   uv run --extra nova subhkl-nova-app
+```
 - Band mode can discover a single-crystal orientation without `--bootstrap`
   either from finder observations or directly from raw detector counts using
   smooth $\chi^2$-null-suppressed Poisson bin deviance weights, then jointly
