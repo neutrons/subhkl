@@ -1,0 +1,136 @@
+<tool id="imaginex_subhkl_solve" name="IMAGINE-X subhkl Finder-Less Solve (Lattice Ladder)" profile="22.05" version="0.2.0" python_template_version="3.5">
+    <description>Threshold-free Lattice-Ladder orientation search and staged zone-band / Poisson geometry refinement</description>
+    <requirements>
+        <container type="docker">ghcr.io/neutrons/subhkl:1.4.0</container>
+    </requirements>
+    <command detect_errors="exit_code"><![CDATA[
+        mkdir -p out &&
+        export CUDA_VISIBLE_DEVICES=0 &&
+
+        ln -sf "$scan" "$scan.element_identifier" &&
+
+        #set $options = " --refinement " + str($refinement) + " --instrument " + str($instrument) + " --d-min " + str($dMin) + " --seed " + str($seed) + " "
+
+        #if str($a) != "":
+            #set $options = $options + " --a " + str($a) + " "
+        #end if
+        #if str($b) != "":
+            #set $options = $options + " --b " + str($b) + " "
+        #end if
+        #if str($c) != "":
+            #set $options = $options + " --c " + str($c) + " "
+        #end if
+        #if str($alpha) != "":
+            #set $options = $options + " --alpha " + str($alpha) + " "
+        #end if
+        #if str($beta) != "":
+            #set $options = $options + " --beta " + str($beta) + " "
+        #end if
+        #if str($gamma) != "":
+            #set $options = $options + " --gamma " + str($gamma) + " "
+        #end if
+        #if str($spaceGroup) != "":
+            #set $options = $options + " --space-group '" + str($spaceGroup) + "' "
+        #end if
+        #if str($wavelengthMin) != "":
+            #set $options = $options + " --wavelength-min " + str($wavelengthMin) + " "
+        #end if
+        #if str($wavelengthMax) != "":
+            #set $options = $options + " --wavelength-max " + str($wavelengthMax) + " "
+        #end if
+        #if str($runs) != "":
+            #set $options = $options + " --runs '" + str($runs) + "' "
+        #end if
+        #if str($stableRuns) != "":
+            #set $options = $options + " --stable-runs '" + str($stableRuns) + "' "
+        #end if
+        #if $staticMaskFile:
+            ln -sf "$staticMaskFile" "$staticMaskFile.element_identifier" &&
+            #set $options = $options + " --static-mask '" + str($staticMaskFile.element_identifier) + "' "
+        #end if
+        #if $finderFile:
+            ln -sf "$finderFile" "$finderFile.element_identifier" &&
+            #set $options = $options + " --finder '" + str($finderFile.element_identifier) + "' "
+        #end if
+
+        #if str($refinement) == "band":
+            #set $options = $options + " --modes '" + str($modes) + "' --n-zones " + str($nZones) + " --binning " + str($bandBinning) + " --samples " + str($samples) + " --candidates " + str($candidates) + " --maxiter " + str($maxiter) + " "
+            #if $pixelPolish:
+                #set $options = $options + " --pixel-polish "
+            #else:
+                #set $options = $options + " --no-pixel-polish "
+            #end if
+        #else:
+            #set $options = $options + " --binning " + str($poissonBinning) + " --proposal-binning " + str($proposalBinning) + " --n-orientations " + str($nOrientations) + " --n-shortlist " + str($nShortlist) + " --grid-deg " + str($gridDeg) + " "
+            #if $refineGeometry:
+                #set $options = $options + " --refine-geometry "
+            #end if
+            #if $refineCell:
+                #set $options = $options + " --refine-cell "
+            #end if
+            #if $refineGoniometer:
+                #set $options = $options + " --refine-goniometer "
+            #end if
+        #end if
+
+        python -m subhkl.io.parser solve "$scan.element_identifier" out/solve.h5 $options &&
+        python -m subhkl.io.parser rainbow-visualize out/solve.h5 --images "$scan.element_identifier" --instrument "$instrument" -o out/rainbow_zones.html
+    ]]></command>
+    <inputs>
+        <param format="h5" name="scan" type="data" label="Reduced / Merged Image Stack (scan.h5 / merged.h5)" />
+        <param name="instrument" type="select" optional="false" value="CG4D" label="Instrument">
+            <option value="CG4D">IMAGINE-X (CG4D)</option>
+            <option value="IMAGINE">IMAGINE (HFIR)</option>
+            <option value="MANDI">MANDI (SNS)</option>
+        </param>
+        <param name="refinement" type="select" optional="false" value="band" label="Refinement Mode">
+            <option value="band">Staged Zone-Band &amp; Detector Geometry Refinement (band)</option>
+            <option value="poisson">Joint Threshold-Free Poisson Count Refinement (poisson)</option>
+        </param>
+        <param name="dMin" type="float" value="2.5" label="Resolution Limit d_min (Å)" />
+        <param name="wavelengthMin" type="float" value="" optional="true" label="Override Min Wavelength (Å)" />
+        <param name="wavelengthMax" type="float" value="" optional="true" label="Override Max Wavelength (Å)" />
+        <param name="spaceGroup" type="text" value="" optional="true" label="Override Space Group (e.g. P 1 21 1)" />
+        <param name="a" type="float" value="" optional="true" label="Override Unit Cell a (Å)" />
+        <param name="b" type="float" value="" optional="true" label="Override Unit Cell b (Å)" />
+        <param name="c" type="float" value="" optional="true" label="Override Unit Cell c (Å)" />
+        <param name="alpha" type="float" value="" optional="true" label="Override Unit Cell alpha (deg)" />
+        <param name="beta" type="float" value="" optional="true" label="Override Unit Cell beta (deg)" />
+        <param name="gamma" type="float" value="" optional="true" label="Override Unit Cell gamma (deg)" />
+        <param name="runs" type="text" value="" optional="true" label="Selected Run Indices (comma-separated, blank for all)" />
+        <param name="stableRuns" type="text" value="" optional="true" label="Stable Drift-Free Run Indices for Blind Search (blank for all)" />
+        <param name="modes" type="text" value="cylindrical,axial_stretch,area,global_rot,global_trans,sample,cell,per_run" label="Band Refinement Modes" help="Comma-separated: cylindrical,axial_stretch,area,global_rot,global_trans,sample,cell,per_run,panels" />
+        <param name="nZones" type="integer" value="400" label="Number of Direct-Lattice Zones in Fine Band Stage" />
+        <param name="bandBinning" type="integer" value="16" label="Band Observation Spatial Binning" />
+        <param name="samples" type="integer" value="16384" label="Blind Search Quadrature Samples" />
+        <param name="candidates" type="integer" value="4" label="Distinct Lattice-Ladder Orientation Candidates" />
+        <param name="maxiter" type="integer" value="400" label="Max L-BFGS-B Iterations per Band Stage" />
+        <param name="pixelPolish" type="boolean" checked="false" label="Enable Assigned-Reflection Pixel Polish" />
+        <param name="poissonBinning" type="integer" value="8" label="Poisson Solve Spatial Binning" />
+        <param name="proposalBinning" type="integer" value="32" label="Poisson Proposal Spatial Binning" />
+        <param name="nOrientations" type="integer" value="8" label="Poisson Retained Candidate Orientations" />
+        <param name="nShortlist" type="integer" value="1000" label="Coarse Funk Shortlist Size" />
+        <param name="gridDeg" type="float" value="2.0" label="Coarse SO(3) Grid Spacing (deg)" />
+        <param name="refineGeometry" type="boolean" checked="true" label="Refine Detector Geometry (Poisson mode)" />
+        <param name="refineCell" type="boolean" checked="false" label="Refine Unit Cell (Poisson mode)" />
+        <param name="refineGoniometer" type="boolean" checked="false" label="Refine Per-Run Goniometer (Poisson mode)" />
+        <param format="h5" name="staticMaskFile" type="data" optional="true" label="Optional Static Mask File (mask.h5)" />
+        <param format="h5" name="finderFile" type="data" optional="true" label="Optional Peak Finder File (leave empty for finder-less solve)" />
+        <param name="seed" type="integer" value="0" label="Random Seed" />
+    </inputs>
+    <outputs>
+        <data format="h5" name="output" label="solve.h5 (${on_string})" from_work_dir="out/solve.h5" />
+        <data format="html" name="rainbow_html" label="SubHKL Diffraction Parallax &amp; Lattice Ladder (${on_string})" from_work_dir="out/rainbow_zones.html" />
+    </outputs>
+    <help><![CDATA[
+**IMAGINE-X subhkl Finder-Less Solve (`lattice_ladder` + Staged Zone-Band / Poisson Refinement)**
+
+Determines crystal orientation `U`, reciprocal-lattice metric `B`, per-run goniometer corrections, and calibrated detector bank geometry directly from reduced/merged detector images (`scan.h5` / `merged.h5`) without requiring a peak-finder threshold:
+
+1. **Step 1 — Binned Count Excess**: Smooth $\chi^2$-suppressed Poisson deviance weights on detector count bins.
+2. **Step 2 — 13→145 Zone Lattice Ladder**: Coarse SO(3) Funk table on 13 fundamental zones followed by zoom-and-prune rungs across 30, 60, and 145 zones.
+3. **Step 3 — 60-Zone Global Band**: Co-refines global detector geometry (`cylindrical`, `axial_stretch`, `global_rot`, `global_trans`) and 3D orientation.
+4. **Step 4 — 120→400 Zone + Cell**: Multi-run band refinement with per-run $\omega$ drift and unit-cell ratios.
+5. **Step 5 — Converged Solve UB**: Final Ewald reflection polish and interactive HTML5 Diffraction Parallax diagnostic.
+    ]]></help>
+</tool>

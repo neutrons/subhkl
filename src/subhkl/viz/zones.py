@@ -48,9 +48,343 @@ def zone_axes_uvw(max_index=1):
 
 
 def _unrolled(xyz):
-    """Lab position -> (azimuth [deg], height [m]) of the unrolled view."""
+    """Lab position -> (azimuth [deg], height [m]) of the cylindrical unrolled view."""
     roty = np.rad2deg(np.arctan2(xyz[..., 0], xyz[..., 2]))
     return roty, xyz[..., 1]
+
+
+def _spherical_angles(xyz):
+    """Lab position or direction -> (azimuth [deg], elevation [deg]) of the spherical view."""
+    v = np.asarray(xyz, dtype=float)
+    r = np.linalg.norm(v, axis=-1)
+    roty = np.rad2deg(np.arctan2(v[..., 0], v[..., 2]))
+    el = np.rad2deg(np.arcsin(np.clip(v[..., 1] / np.maximum(r, 1e-12), -1.0, 1.0)))
+    return roty, el
+
+
+def stereographic_projection(dirs, pole=(0.0, 0.0, 1.0)):
+    """Project unit directions on S^2 onto the stereographic disk (sx, sy, hemisphere).
+
+    Parameters
+    ----------
+    dirs : array-like of shape (..., 3)
+        3D vectors (automatically normalized along the last axis).
+    pole : length-3 sequence
+        Reference pole direction (default +z, i.e., incident beam axis).
+        Points in the +pole hemisphere map inside the unit disk r <= 1;
+        antipodal points are projected from the opposite pole with hemisphere = -1.
+
+    Returns
+    -------
+    sx, sy : ndarray of shape (...)
+        Stereographic coordinates in [-1, 1] inside the unit disk.
+    hemisphere : ndarray of shape (...), int8
+        +1 for points with dir . pole >= 0, -1 for dir . pole < 0.
+    """
+    v = np.asarray(dirs, dtype=float)
+    norm = np.linalg.norm(v, axis=-1, keepdims=True)
+    v_hat = np.divide(v, np.maximum(norm, 1e-12))
+
+    p = np.asarray(pole, dtype=float)
+    p = p / np.linalg.norm(p)
+
+    # Build a right-handed orthonormal frame (e1, e2, p)
+    if np.allclose(p, [0.0, 0.0, 1.0]):
+        e1 = np.array([1.0, 0.0, 0.0])
+        e2 = np.array([0.0, 1.0, 0.0])
+    elif np.allclose(p, [0.0, 0.0, -1.0]):
+        e1 = np.array([1.0, 0.0, 0.0])
+        e2 = np.array([0.0, -1.0, 0.0])
+    else:
+        up = np.array([0.0, 1.0, 0.0]) if abs(p[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        e1 = np.cross(up, p)
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(p, e1)
+
+    x = v_hat @ e1
+    y = v_hat @ e2
+    z = v_hat @ p
+
+    hemi = np.where(z >= 0.0, 1, -1).astype(np.int8)
+    denom = 1.0 + np.abs(z)
+    sx = x / np.maximum(denom, 1e-12)
+    sy = y / np.maximum(denom, 1e-12)
+    return sx, sy, hemi
+
+
+def get_zone_conic_points(
+    t_lab,
+    ki=(0.0, 0.0, 1.0),
+    n_arc=360,
+):
+    """Compute great-circle scattering directions G_hat and Laue diffracted rays kf_hat for a zone axis.
+
+    Parameters
+    ----------
+    t_lab : array-like of shape (3,)
+        Zone axis vector in lab frame.
+    ki : array-like of shape (3,)
+        Incident beam direction.
+    n_arc : int
+        Number of angular samples along the great circle.
+
+    Returns
+    -------
+    dict with keys:
+        "t_hat": (3,) unit zone axis in lab frame
+        "g_hat": (M, 3) unit scattering vectors in the diffracting hemisphere (G . ki < 0)
+        "kf_hat": (M, 3) unit diffracted ray directions
+        "sx", "sy", "hemisphere": stereographic projection of g_hat
+        "det_x", "det_y": unrolled detector coordinates (azimuth [deg], y [m] at unit cylinder R=1m)
+    """
+    t_arr = np.asarray(t_lab, dtype=float)
+    t_norm = np.linalg.norm(t_arr)
+    if t_norm < 1e-12:
+        raise ValueError("Zone axis vector t_lab must be non-zero")
+    t_hat = t_arr / t_norm
+
+    ki_hat = np.asarray(ki, dtype=float)
+    ki_hat = ki_hat / np.linalg.norm(ki_hat)
+
+    e1 = np.cross(t_hat, ki_hat)
+    if np.linalg.norm(e1) < 1e-9:
+        e1 = np.cross(t_hat, [1.0, 0.0, 0.0])
+        if np.linalg.norm(e1) < 1e-9:
+            e1 = np.cross(t_hat, [0.0, 1.0, 0.0])
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(t_hat, e1)
+
+    theta = np.linspace(0.0, 2.0 * np.pi, int(n_arc), endpoint=False)
+    G = np.outer(np.cos(theta), e1) + np.outer(np.sin(theta), e2)
+    keep = (G @ ki_hat) < -1e-3
+    G = G[keep]
+    kf = ki_hat[None, :] - 2.0 * (G @ ki_hat)[:, None] * G
+    kf_norm = np.linalg.norm(kf, axis=1, keepdims=True)
+    kf = kf / np.maximum(kf_norm, 1e-12)
+
+    sx, sy, hemi = stereographic_projection(G)
+    # Cylindrical projection at unit radius R_cyl = 1.0 m for detector-agnostic conic
+    horiz = np.hypot(kf[:, 0], kf[:, 2])
+    det_x = np.rad2deg(np.arctan2(kf[:, 0], kf[:, 2]))
+    det_y = kf[:, 1] / np.maximum(horiz, 0.15)
+    det_el = np.rad2deg(np.arcsin(np.clip(kf[:, 1], -1.0, 1.0)))
+
+    return {
+        "t_hat": t_hat,
+        "g_hat": G,
+        "kf_hat": kf,
+        "sx": sx,
+        "sy": sy,
+        "hemisphere": hemi,
+        "det_x": det_x,
+        "det_y": det_y,
+        "det_el": det_el,
+    }
+
+
+def identify_zones(
+    peaks_xyz,
+    U=None,
+    B=None,
+    ub_matrix=None,
+    R_gonio=None,
+    ki=(0.0, 0.0, 1.0),
+    max_index=2,
+    tolerance_deg=0.75,
+    min_peaks=3,
+    n_arc=360,
+):
+    """Identify populated Laue zones from observed peak positions or scattering vectors.
+
+    Parameters
+    ----------
+    peaks_xyz : array-like of shape (N, 3)
+        Lab-frame detector positions (or scattering directions if already unit vectors)
+        of observed peaks.
+    U, B : (3, 3) arrays, optional
+        Orientation and B matrices. Alternatively pass `ub_matrix = U @ B`.
+    ub_matrix : (3, 3) array, optional
+        Combined UB matrix. If neither (U, B) nor ub_matrix is supplied, candidate
+        zone axes are discovered blind via cross-product great-circle clustering on S^2.
+    R_gonio : (3, 3) or (N, 3, 3) array, optional
+        Goniometer rotation matrix.
+    ki : length-3 sequence
+        Incident beam direction (default (0, 0, 1)).
+    max_index : int
+        Maximum Miller zone index |u|, |v|, |w| <= max_index when UB is provided.
+    tolerance_deg : float
+        Angular half-width [deg] for assigning a peak to a zone plane |g_hat . t_hat| <= sin(tol).
+    min_peaks : int
+        Minimum number of captured peaks required to include a zone.
+    n_arc : int
+        Number of points along each zone arc.
+
+    Returns
+    -------
+    list of dict
+        Sorted by captured peak count (descending), then zone norm (ascending).
+    """
+    pts = np.asarray(peaks_xyz, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("peaks_xyz must have shape (N, 3)")
+
+    ki_hat = np.asarray(ki, dtype=float)
+    ki_hat = ki_hat / np.linalg.norm(ki_hat)
+
+    # Convert lab positions to unit diffracted rays kf_hat and scattering directions g_hat
+    norms = np.linalg.norm(pts, axis=1, keepdims=True)
+    kf_hat = pts / np.maximum(norms, 1e-12)
+    q_vec = kf_hat - ki_hat[None, :]
+    q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True)
+    # If points were already passed as reciprocal vectors G with G . ki < 0 and |pts| ~ 1,
+    # check whether pts are lab detector positions or direct G vectors:
+    g_hat = np.where(q_norm > 1e-6, q_vec / np.maximum(q_norm, 1e-12), kf_hat)
+
+    if ub_matrix is None and U is not None and B is not None:
+        ub_matrix = np.asarray(U, dtype=float) @ np.asarray(B, dtype=float)
+
+    R_single = np.eye(3)
+    if R_gonio is not None:
+        R_arr = np.asarray(R_gonio, dtype=float)
+        if R_arr.ndim == 2:
+            R_single = R_arr
+            g_crystal = g_hat @ R_single
+        elif R_arr.ndim == 3 and len(R_arr) == len(g_hat):
+            g_crystal = np.einsum("ni,nij->nj", g_hat, R_arr)
+            R_single = R_arr[0]
+        else:
+            g_crystal = g_hat
+    else:
+        g_crystal = g_hat
+
+    sin_tol = np.sin(np.deg2rad(float(tolerance_deg)))
+    zones = []
+
+    if ub_matrix is not None:
+        UB = np.asarray(ub_matrix, dtype=float)
+        # Since G_crystal = UB @ hkl, the dual direct-lattice basis vectors in crystal
+        # frame (satisfying G_crystal . t_crystal = hkl . uvw) are the rows of inv(UB),
+        # which equals (U @ inv(B).T).T when U is orthogonal.
+        A_real = np.linalg.inv(UB)
+        uvw_list = zone_axes_uvw(max_index=max_index)
+
+        for zi, z in enumerate(uvw_list):
+            t_cryst = z @ A_real
+            d_direct = float(np.linalg.norm(t_cryst))
+            if d_direct < 1e-12:
+                continue
+            t_cryst_hat = t_cryst / d_direct
+            t_lab_hat = R_single @ t_cryst_hat
+
+            dots = np.abs(g_crystal @ t_cryst_hat)
+            ang_deg = np.rad2deg(np.arcsin(np.clip(dots, 0.0, 1.0)))
+            member_mask = dots <= sin_tol
+            member_ids = np.where(member_mask)[0]
+            if len(member_ids) < min_peaks:
+                continue
+
+            rms_deg = (
+                float(np.sqrt(np.mean(ang_deg[member_ids] ** 2)))
+                if len(member_ids)
+                else 0.0
+            )
+            score = float(
+                np.sum(
+                    np.exp(-0.5 * (ang_deg[member_ids] / max(tolerance_deg, 1e-3)) ** 2)
+                )
+            )
+            conic = get_zone_conic_points(t_lab_hat, ki=ki_hat, n_arc=n_arc)
+
+            zones.append(
+                {
+                    "zone_id": int(zi),
+                    "uvw": [int(z[0]), int(z[1]), int(z[2])],
+                    "label": f"[{int(z[0])} {int(z[1])} {int(z[2])}]",
+                    "axis_xyz": [float(x) for x in t_lab_hat],
+                    "axis_crystal_xyz": [float(x) for x in t_cryst_hat],
+                    "d_direct": round(d_direct, 4),
+                    "score": round(score, 3),
+                    "n_peaks": int(len(member_ids)),
+                    "angular_rms_deg": round(rms_deg, 4),
+                    "member_peak_ids": [int(i) for i in member_ids],
+                    "conic": conic,
+                }
+            )
+    else:
+        # Blind discovery of great-circle zones from pairwise cross products of g_crystal
+        n_pts = len(g_crystal)
+        if n_pts >= max(2, min_peaks):
+            max_pairs = min(n_pts, 64)
+            idx_a, idx_b = np.triu_indices(max_pairs, k=1)
+            cross = np.cross(g_crystal[idx_a], g_crystal[idx_b])
+            cnorm = np.linalg.norm(cross, axis=1)
+            valid = cnorm > 0.15
+            cand = cross[valid] / cnorm[valid, None]
+            # Canonicalize sign
+            lead = np.where(
+                np.abs(cand[:, 0]) > 1e-6,
+                cand[:, 0],
+                np.where(np.abs(cand[:, 1]) > 1e-6, cand[:, 1], cand[:, 2]),
+            )
+            cand = cand * np.where(lead < 0, -1.0, 1.0)[:, None]
+
+            used_axes = []
+            dots_all = np.abs(cand @ g_crystal.T)
+            counts = np.sum(dots_all <= sin_tol, axis=1)
+            order = np.argsort(-counts)
+            for idx in order:
+                if counts[idx] < min_peaks:
+                    break
+                t_cand = cand[idx]
+                if any(
+                    abs(np.dot(t_cand, u)) > np.cos(np.deg2rad(3.0)) for u in used_axes
+                ):
+                    continue
+                # Refine normal via SVD of inlier g_crystal vectors
+                inliers = dots_all[idx] <= sin_tol
+                if np.sum(inliers) >= 3:
+                    _, _, vh = np.linalg.svd(g_crystal[inliers], full_matrices=False)
+                    t_cand = vh[-1]
+                    t_cand /= np.linalg.norm(t_cand)
+                used_axes.append(t_cand)
+                dots = np.abs(g_crystal @ t_cand)
+                ang_deg = np.rad2deg(np.arcsin(np.clip(dots, 0.0, 1.0)))
+                member_ids = np.where(dots <= sin_tol)[0]
+                if len(member_ids) < min_peaks:
+                    continue
+                t_lab_hat = R_single @ t_cand
+                rms_deg = float(np.sqrt(np.mean(ang_deg[member_ids] ** 2)))
+                score = float(
+                    np.sum(
+                        np.exp(
+                            -0.5 * (ang_deg[member_ids] / max(tolerance_deg, 1e-3)) ** 2
+                        )
+                    )
+                )
+                conic = get_zone_conic_points(t_lab_hat, ki=ki_hat, n_arc=n_arc)
+                zi = len(zones)
+                zones.append(
+                    {
+                        "zone_id": int(zi),
+                        "uvw": [0, 0, zi + 1],
+                        "label": f"Zone #{zi + 1}",
+                        "axis_xyz": [float(x) for x in t_lab_hat],
+                        "axis_crystal_xyz": [float(x) for x in t_cand],
+                        "d_direct": 0.0,
+                        "score": round(score, 3),
+                        "n_peaks": int(len(member_ids)),
+                        "angular_rms_deg": round(rms_deg, 4),
+                        "member_peak_ids": [int(i) for i in member_ids],
+                        "conic": conic,
+                    }
+                )
+                if len(zones) >= 20:
+                    break
+
+    zones.sort(key=lambda z: (-z["n_peaks"], -z["score"], sum(x * x for x in z["uvw"])))
+    for new_id, z in enumerate(zones):
+        z["zone_id"] = new_id
+    return zones
 
 
 def _cell_from_B(B):

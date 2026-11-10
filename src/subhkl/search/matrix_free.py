@@ -3645,6 +3645,7 @@ def integrate_reflections_matrix_free(
     profile="gaussian",
     profile_min_peaks=50,
     fp_target=None,
+    border_width=0,
     rate_chunk_size=64,
     show_progress=False,
 ):
@@ -3709,7 +3710,16 @@ def integrate_reflections_matrix_free(
     var_vs = np.asarray(var_vs, dtype=np.float32)
     cov_uvs = np.asarray(cov_uvs, dtype=np.float32)
 
-    filter_size = max(15, int(max_sigma * 5))
+    # Scale the background box window so its span exceeds the 3.5*sigma
+    # footprint exclusion diameter even when fitted 3D shape/mosaicity
+    # produces broader ellipses than the nominal CLI max_sigma.
+    fitted_sigma_p90 = (
+        float(np.percentile(np.sqrt(np.maximum(var_us, var_vs)), 90))
+        if len(var_us) > 0
+        else 0.0
+    )
+    eff_max_sigma = max(float(max_sigma), fitted_sigma_p90 * 1.5)
+    filter_size = max(15, int(eff_max_sigma * 5))
     if filter_size % 2 == 0:
         filter_size += 1
 
@@ -3725,6 +3735,12 @@ def integrate_reflections_matrix_free(
     rate_valid = static_valid * _footprint_mask(
         B, H, W, frames, rs, cs, var_us, var_vs, cov_uvs
     )
+    edge_pad = min(int(border_width), 5, H // 8, W // 8)
+    if edge_pad > 0:
+        rate_valid[:, :edge_pad, :] = 0.0
+        rate_valid[:, H - edge_pad :, :] = 0.0
+        rate_valid[:, :, :edge_pad] = 0.0
+        rate_valid[:, :, W - edge_pad :] = 0.0
 
     images_jax = jnp.array(images_batch, dtype=jnp.float32)
     static_valid_jax = jnp.array(static_valid)

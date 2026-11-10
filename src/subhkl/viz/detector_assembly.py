@@ -448,7 +448,7 @@ def plot_unrolled_detector(
             valid_ticks = np.array(valid_ticks)
             tick_pos = compress_roty(valid_ticks)
             ax.set_xticks(tick_pos)
-            ax.set_xticklabels([f"{int(t) % 360}$^\circ$" for t in valid_ticks])
+            ax.set_xticklabels([rf"{int(t) % 360}$^\circ$" for t in valid_ticks])
 
     if gaps:
         ax.spines["bottom"].set_visible(False)

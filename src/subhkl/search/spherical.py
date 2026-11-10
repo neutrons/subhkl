@@ -1737,6 +1737,7 @@ def lattice_ladder(
     table_sin_theta=None,
     space_group=None,
     dedup_deg=3.0,
+    on_rung=None,
 ):
     """Orientation search on the direct lattice, coarse to fine.
 
@@ -1847,9 +1848,31 @@ def lattice_ladder(
                 qbar = float(np.max(0.5 * (qlt + qht)))
                 sp = np.degrees(1.0 / max(4.0 * float(xlen[:nz].max()) * qbar, 1e-9))
                 tables["band"] = band_table(Dt, wt, qlt, qht, xlen[:nz], min(sp, 5.0))
+                if on_rung is not None:
+                    try:
+                        tab_p, off_p, nph_p, nth_p = tables["band"]
+                        a_c = np.radians(np.arange(0, 360, 6.0))
+                        b_c = np.radians(np.arange(3.0, 180, 6.0))
+                        grid_c = (
+                            np.array(np.meshgrid(a_c, b_c, a_c, indexing="ij"))
+                            .reshape(3, -1)
+                            .T.astype(np.float32)
+                        )
+                        Rs_c = kern["euler_zyz"](jnp.asarray(grid_c))
+                        out_c = kern["score_band_table"](
+                            Rs_c, Zj[:nz], wz, tab_p, off_p, nph_p, nth_p
+                        )
+                        best_c = int(jnp.argmax(out_c))
+                        on_rung(
+                            "band_table",
+                            int(nz),
+                            _orthonormalize(np.asarray(Rs_c[best_c])),
+                        )
+                    except Exception:
+                        pass
                 _mark(
                     f"band table ({int(tables['band'][0].shape[1]):,} poles, "
-                    f"{len(Dt):,} bins)"
+                    f"{len(Dt):,} bins, exhaustive rung preview)"
                 )
             tab, off, nph, nth = tables["band"]
             return "band_table", (Zj[:nz], wz, tab, off, nph, nth), 262144
@@ -1916,6 +1939,11 @@ def lattice_ladder(
                     if len(kept) >= int(n_shortlist):
                         break
             cands = np.asarray(kept)
+        if on_rung is not None and len(cands) > 0:
+            try:
+                on_rung("exhaustive", int(coarse_zones), _orthonormalize(cands[0]))
+            except Exception:
+                pass
         _mark(f"exhaustive rung ({len(grid):,} orientations)")
 
     def zoom_all(cands, nz, tol, span, n):
@@ -1960,6 +1988,11 @@ def lattice_ladder(
         else:
             o = o[: int(keep)]
         cands, scores = R_[o], s_[o]
+        if on_rung is not None and len(cands) > 0:
+            try:
+                on_rung(f"rung_{int(nz)}", int(nz), _orthonormalize(cands[0]))
+            except Exception:
+                pass
         _mark(f"rung {nz} zones @ {tol:g} deg, {len(R_)} -> {len(o)}")
     nz, tol = rungs[-1][0], rungs[-1][1]
     kind, args, _ = (
