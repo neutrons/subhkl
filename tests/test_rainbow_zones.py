@@ -953,7 +953,13 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
         real_build = runner_no_ndip._build_oauth_oncat_client
 
         def _build_with_mock_user(*args, **kwargs):
-            client = real_build(*args, **kwargs)
+            try:
+                client = real_build(*args, **kwargs)
+            except ImportError:
+                client = MagicMock()
+                client.has_stored_token.side_effect = lambda: os.path.isfile(
+                    runner_no_ndip._get_oncat_token_path()
+                )
             client.User = MagicMock()
             client.User.retrieve.return_value = {
                 "name": "Test Scientist",

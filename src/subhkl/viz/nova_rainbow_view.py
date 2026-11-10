@@ -2338,16 +2338,20 @@ class NovaGalaxyPipelineRunner:
         Uses stored OAuth/OIDC token via pyoncat when available; falls back to
         anonymous pyoncat client for public catalog fields when not signed in.
         """
-        import pyoncat  # type: ignore[import-untyped]
-
         url = os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
+        oauth_client = None
         try:
             oauth_client = self._build_oauth_oncat_client()
             if oauth_client.has_stored_token():
                 return oauth_client, True
         except Exception:
             pass
-        return pyoncat.ONCat(url), False
+        try:
+            import pyoncat  # type: ignore[import-untyped]
+
+            return pyoncat.ONCat(url), False
+        except Exception:
+            return oauth_client, False
 
     def _invalidate_oncat_caches(self) -> None:
         self._oncat_exp_cache = {}
@@ -2429,8 +2433,6 @@ class NovaGalaxyPipelineRunner:
 
     def handle_oncat_auth(self, body: dict[str, Any]) -> dict[str, Any]:
         """Start/cancel pyoncat Device Authorization sign-in, accept forwarded OIDC token, or sign out."""
-        import pyoncat  # type: ignore[import-untyped]
-
         action = str(body.get("action") or "status").strip().lower()
         if action == "status":
             return self.get_oncat_auth_status()
@@ -2475,8 +2477,14 @@ class NovaGalaxyPipelineRunner:
                 }
             tp = self._get_oncat_token_path()
             os.makedirs(os.path.dirname(tp), exist_ok=True)
-            store = pyoncat.FileSystemTokenStore(tp)
-            store.write_token({"access_token": raw_tok, "token_type": "Bearer"})
+            try:
+                import pyoncat  # type: ignore[import-untyped]
+
+                store = pyoncat.FileSystemTokenStore(tp)
+                store.write_token({"access_token": raw_tok, "token_type": "Bearer"})
+            except ImportError:
+                with open(tp, "w", encoding="utf-8") as fh:
+                    json.dump({"access_token": raw_tok, "token_type": "Bearer"}, fh)
             self._oncat_auth_state = {"status": "signed_in", "user": None}
             self._invalidate_oncat_caches()
             return self.get_oncat_auth_status()
