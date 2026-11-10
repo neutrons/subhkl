@@ -1078,8 +1078,8 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     from unittest.mock import MagicMock
     from subhkl.commands import run_merge_images
 
-    r1 = tmp_path / "run_001.reduce.h5"
-    r2 = tmp_path / "run_002.reduce.h5"
+    r1 = tmp_path / "CG4D_2625.reduce.h5"
+    r2 = tmp_path / "CG4D_2626.reduce.h5"
     for rp, ang in ((r1, 10.0), (r2, 20.0)):
         with h5py.File(rp, "w") as hf:
             hf.attrs["instrument"] = "CG4D"
@@ -1111,6 +1111,8 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         assert hf["images"].compression == "lzf"
         assert hf["images"].chunks == (1, 16, 16)
         assert hf["images"].shape == (4, 16, 16)
+    p_lzf = build_rainbow_zone_payload(replay_h5=merged_lzf)
+    assert [fr["file"] for fr in p_lzf["frames"]] == ["CG4D_2625", "CG4D_2626"]
 
     runner_multi = NovaGalaxyPipelineRunner(
         galaxy_url="https://ndip-test.ornl.gov",

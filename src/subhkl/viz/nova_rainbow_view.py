@@ -827,6 +827,22 @@ class NovaGalaxyPipelineRunner:
                     hf["instrument"] = np.bytes_(inst_val)
                 if sg_val and "space_group" not in hf:
                     hf["space_group"] = np.bytes_(sg_val)
+                raw_nxs_list = job_record.get("raw_nxs") or params.get("nexus_files") or []
+                if isinstance(raw_nxs_list, str):
+                    raw_nxs_list = [
+                        s.strip() for s in raw_nxs_list.split(",") if s.strip()
+                    ]
+                if (
+                    raw_nxs_list
+                    and "files" in hf
+                    and len(hf["files"]) == len(raw_nxs_list)
+                ):
+                    orig_names = [
+                        os.path.basename(str(p).strip()) for p in raw_nxs_list
+                    ]
+                    del hf["files"]
+                    dt_str = h5py.string_dtype(encoding="utf-8")
+                    hf.create_dataset("files", data=orig_names, dtype=dt_str)
                 if (
                     isinstance(raw_cell, (list, tuple))
                     and len(raw_cell) == 6
@@ -2909,7 +2925,7 @@ class NovaGalaxyPipelineRunner:
                     "    wl_min, wl_max = float(sys.argv[2]), float(sys.argv[3])\n"
                     "    out_dir = sys.argv[4]\n"
                     "    nxs_files = sys.argv[5:]\n"
-                    "    tasks = [(p, os.path.join(out_dir, f'run_{i:03d}.reduce.h5'), inst, wl_min, wl_max) for i, p in enumerate(nxs_files)]\n"
+                    "    tasks = [(p, os.path.join(out_dir, f\"{os.path.basename(p).split('.')[0] or f'run_{i:03d}'}.reduce.h5\"), inst, wl_min, wl_max) for i, p in enumerate(nxs_files)]\n"
                     "    if len(tasks) == 1:\n"
                     "        _w(tasks[0])\n"
                     "    else:\n"
@@ -2919,6 +2935,13 @@ class NovaGalaxyPipelineRunner:
                     "        with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:\n"
                     "            list(ex.map(_w, tasks))\n"
                 )
+            reduced_parts_ordered = [
+                os.path.join(
+                    reduce_tmp_dir,
+                    f"{os.path.basename(p).split('.')[0] or f'run_{i:03d}'}.reduce.h5",
+                )
+                for i, p in enumerate(raw_nxs_local)
+            ]
             r_cmd = [
                 "python",
                 "-u",
@@ -2935,7 +2958,7 @@ class NovaGalaxyPipelineRunner:
                 "-m",
                 "subhkl.io.parser",
                 "merge-images",
-                os.path.join(reduce_tmp_dir, "*.reduce.h5"),
+                " ".join(reduced_parts_ordered),
                 out_h5,
                 str(float(raw_cell[0])),
                 str(float(raw_cell[1])),

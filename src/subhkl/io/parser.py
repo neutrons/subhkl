@@ -1269,9 +1269,9 @@ def reduce_batch(
 @app.command()
 def merge_images(
     input_pattern: Annotated[
-        list[str],
+        str,
         typer.Argument(
-            help="Glob pattern or list of reduced .h5 files (e.g. 'reduced/*.h5')"
+            help="Glob pattern or space-separated list of reduced .h5 files (e.g. 'reduced/*.h5')"
         ),
     ],
     output_filename: Annotated[str, typer.Argument(help="Output master .h5 file")],
@@ -1284,13 +1284,8 @@ def merge_images(
     space_group: str = typer.Argument(..., help="Space group (e.g. 'P 1')"),
 ):
     try:
-        joined_pattern = (
-            " ".join(str(p) for p in input_pattern)
-            if isinstance(input_pattern, (list, tuple))
-            else str(input_pattern)
-        )
         run_merge_images(
-            joined_pattern, output_filename, a, b, c, alpha, beta, gamma, space_group
+            input_pattern, output_filename, a, b, c, alpha, beta, gamma, space_group
         )
 
     except ValueError as e:

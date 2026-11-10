@@ -796,6 +796,8 @@ def _extract_from_h5(
                     for ext in (
                         ".nxs.h5.img.h5",
                         ".nxs.h5.im.h5",
+                        ".nxs.h5.reduce.h5",
+                        ".reduce.h5",
                         ".nxs.h5",
                         ".img.h5",
                         ".h5",

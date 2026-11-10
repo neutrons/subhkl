@@ -1673,11 +1673,10 @@ def run_merge_images(
     if " " in input_pattern:
         h5_files = []
         for p in input_pattern.split():
-            h5_files.extend(glob.glob(p))
+            h5_files.extend(sorted(glob.glob(p)))
+        h5_files = list(dict.fromkeys(h5_files))
     else:
-        h5_files = glob.glob(input_pattern)
-
-    h5_files = sorted(list(set(h5_files)))
+        h5_files = sorted(list(set(glob.glob(input_pattern))))
 
     if not h5_files:
         raise ValueError(f"No files found matching: {input_pattern}")
