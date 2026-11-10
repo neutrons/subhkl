@@ -24,7 +24,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
       - name: Run linting
         run: |
           uv run ruff format --diff
@@ -57,6 +57,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
-        run: uv sync
+        run: uv sync --locked
       - name: Run tests
         run: uv run pytest -v -m "not slow and not integration and not mesolite"
