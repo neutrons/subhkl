@@ -1231,10 +1231,13 @@ def reduce(
 def reduce_batch(
     nexus_filenames: Annotated[
         list[str],
-        typer.Argument(help="List of input NeXus (.nxs.h5) files to reduce in parallel"),
+        typer.Argument(
+            help="List of input NeXus (.nxs.h5) files to reduce in parallel"
+        ),
     ],
     output_dir: Annotated[
-        str, typer.Option("--output-dir", "-o", help="Directory for *.reduce.h5 outputs")
+        str,
+        typer.Option("--output-dir", "-o", help="Directory for *.reduce.h5 outputs"),
     ] = "out",
     instrument: Annotated[
         str, typer.Option("--instrument", "-i", help="Instrument name")
@@ -1254,7 +1257,7 @@ def reduce_batch(
     for idx, nxs_p in enumerate(nexus_filenames):
         bn = os.path.basename(nxs_p).split(".")[0] or f"run_{idx:03d}"
         out_p = os.path.join(output_dir, f"{bn}.reduce.h5")
-        if any( existing_out == out_p for _, existing_out in tasks ):
+        if any(existing_out == out_p for _, existing_out in tasks):
             out_p = os.path.join(output_dir, f"{idx:03d}_{bn}.reduce.h5")
         tasks.append((nxs_p, out_p))
     run_reduce_batch(

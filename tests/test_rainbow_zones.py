@@ -543,11 +543,8 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
     pytest.importorskip("pydantic")
     pytest.importorskip("nova.mvvm")
     from pydantic import ValidationError
-    from nova.mvvm.trame_binding import TrameBinding
-    from trame.app import get_server
 
     from subhkl.viz.nova_app.models.subhkl_model import InstrumentOptions, SubhklConfig
-    from subhkl.viz.nova_app.mvvm_factory import create_viewmodels
 
     # 1. Verify Pydantic validation & defaults
     cfg = SubhklConfig(instrument=InstrumentOptions.MANDI, a=70.0)
@@ -1161,5 +1158,3 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         "Done.",
     ]
     assert "formatTerminalStdio" in html
-
-

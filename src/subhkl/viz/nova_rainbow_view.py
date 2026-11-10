@@ -366,11 +366,7 @@ class NovaGalaxyPipelineRunner:
                 elif cmd_ch == "G":
                     col = max(0, first_num - 1)
                 elif cmd_ch == "K":
-                    mode_k = (
-                        int(params_s)
-                        if params_s and params_s.isdigit()
-                        else 0
-                    )
+                    mode_k = int(params_s) if params_s and params_s.isdigit() else 0
                     if mode_k == 2:
                         lines[row] = ""
                         col = 0
@@ -899,7 +895,9 @@ class NovaGalaxyPipelineRunner:
                     hf["instrument"] = np.bytes_(inst_val)
                 if sg_val and "space_group" not in hf:
                     hf["space_group"] = np.bytes_(sg_val)
-                raw_nxs_list = job_record.get("raw_nxs") or params.get("nexus_files") or []
+                raw_nxs_list = (
+                    job_record.get("raw_nxs") or params.get("nexus_files") or []
+                )
                 if isinstance(raw_nxs_list, str):
                     raw_nxs_list = [
                         s.strip() for s in raw_nxs_list.split(",") if s.strip()
@@ -1477,7 +1475,11 @@ class NovaGalaxyPipelineRunner:
                 # Route NeXus verification through ONCat OAuth first (instant, no file copy),
                 # falling back to NDIP neutrons_load_data only when ONCat is unavailable.
                 verified_ids = list(params.get("verified_dataset_ids") or [])
-                if not verified_ids and params.get("ingest_mode") in ("oncat", "file", None):
+                if not verified_ids and params.get("ingest_mode") in (
+                    "oncat",
+                    "file",
+                    None,
+                ):
                     import re as _re
 
                     first_p = raw_nxs[0]
@@ -1498,7 +1500,11 @@ class NovaGalaxyPipelineRunner:
                     if ipts_str:
                         try:
                             cat = self.browse_oncat_catalog(
-                                {"facility": fac_str, "instrument": inst, "ipts": ipts_str}
+                                {
+                                    "facility": fac_str,
+                                    "instrument": inst,
+                                    "ipts": ipts_str,
+                                }
                             )
                             run_map = {
                                 int(r["run"]): r
@@ -1509,7 +1515,9 @@ class NovaGalaxyPipelineRunner:
                                 missing_r = []
                                 for p_chk in raw_nxs:
                                     m_rc = _re.search(
-                                        r"_([0-9]+)\.nxs", os.path.basename(p_chk), _re.I
+                                        r"_([0-9]+)\.nxs",
+                                        os.path.basename(p_chk),
+                                        _re.I,
                                     )
                                     if m_rc and int(m_rc.group(1)) not in run_map:
                                         missing_r.append(os.path.basename(p_chk))
@@ -1743,9 +1751,7 @@ class NovaGalaxyPipelineRunner:
                     max_workers=submit_workers
                 ) as sub_pool:
                     submitted_indexed = list(
-                        sub_pool.map(
-                            _submit_one_part, list(enumerate(raw_nxs_all))
-                        )
+                        sub_pool.map(_submit_one_part, list(enumerate(raw_nxs_all)))
                     )
                 submitted_indexed.sort(key=lambda item: item[0])
                 submitted_parts = [
@@ -1807,9 +1813,7 @@ class NovaGalaxyPipelineRunner:
                     max_workers=poll_workers
                 ) as poll_pool:
                     polled_results = list(
-                        poll_pool.map(
-                            _poll_one_part, list(enumerate(submitted_parts))
-                        )
+                        poll_pool.map(_poll_one_part, list(enumerate(submitted_parts)))
                     )
                 polled_results.sort(key=lambda item: item[0])
                 part_paths: list[str] = []
@@ -2047,8 +2051,7 @@ class NovaGalaxyPipelineRunner:
                     r"^/(SNS|HFIR)/([^/]+)/IPTS-([^/]+)/", expanded[0], _re.I
                 )
                 if m_p0 and (
-                    str(body.get("ingest_mode") or "oncat") == "file"
-                    or not ipts_raw
+                    str(body.get("ingest_mode") or "oncat") == "file" or not ipts_raw
                 ):
                     fac = m_p0.group(1).upper()
                     inst = m_p0.group(2).upper()
@@ -2116,9 +2119,7 @@ class NovaGalaxyPipelineRunner:
                         elif (cat.get("auth_status") or {}).get("authenticated"):
                             oncat_missing = list(expanded)
                             ok = False
-                            msg = (
-                                f"ONCat: No accessible runs found for {inst} IPTS-{ipts_raw}"
-                            )
+                            msg = f"ONCat: No accessible runs found for {inst} IPTS-{ipts_raw}"
                     except Exception:
                         pass
 
@@ -3484,9 +3485,7 @@ class NovaGalaxyPipelineRunner:
                                 + raw_stream[cut_nl + 1 :]
                             )
                     formatted_stream = self._format_terminal_stream(raw_stream)
-                    job_record["stdout"] = (initial_prefix + formatted_stream)[
-                        -24000:
-                    ]
+                    job_record["stdout"] = (initial_prefix + formatted_stream)[-24000:]
                     low = chunk_str.lower()
                     if stage_id == "solve":
                         trigger_blind_sync = False
@@ -3595,6 +3594,7 @@ class NovaGalaxyPipelineRunner:
                             )
 
                         if self.is_connected and os.path.isfile(final_h5):
+
                             def _bg_upload_reduced(
                                 _f_h5: str = final_h5,
                                 _lbl: str = merged_label,

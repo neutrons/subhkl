@@ -58,9 +58,7 @@ def _spherical_angles(xyz):
     v = np.asarray(xyz, dtype=float)
     r = np.linalg.norm(v, axis=-1)
     roty = np.rad2deg(np.arctan2(v[..., 0], v[..., 2]))
-    el = np.rad2deg(
-        np.arcsin(np.clip(v[..., 1] / np.maximum(r, 1e-12), -1.0, 1.0))
-    )
+    el = np.rad2deg(np.arcsin(np.clip(v[..., 1] / np.maximum(r, 1e-12), -1.0, 1.0)))
     return roty, el
 
 
@@ -285,8 +283,16 @@ def identify_zones(
             if len(member_ids) < min_peaks:
                 continue
 
-            rms_deg = float(np.sqrt(np.mean(ang_deg[member_ids] ** 2))) if len(member_ids) else 0.0
-            score = float(np.sum(np.exp(-0.5 * (ang_deg[member_ids] / max(tolerance_deg, 1e-3)) ** 2)))
+            rms_deg = (
+                float(np.sqrt(np.mean(ang_deg[member_ids] ** 2)))
+                if len(member_ids)
+                else 0.0
+            )
+            score = float(
+                np.sum(
+                    np.exp(-0.5 * (ang_deg[member_ids] / max(tolerance_deg, 1e-3)) ** 2)
+                )
+            )
             conic = get_zone_conic_points(t_lab_hat, ki=ki_hat, n_arc=n_arc)
 
             zones.append(
@@ -330,7 +336,9 @@ def identify_zones(
                 if counts[idx] < min_peaks:
                     break
                 t_cand = cand[idx]
-                if any(abs(np.dot(t_cand, u)) > np.cos(np.deg2rad(3.0)) for u in used_axes):
+                if any(
+                    abs(np.dot(t_cand, u)) > np.cos(np.deg2rad(3.0)) for u in used_axes
+                ):
                     continue
                 # Refine normal via SVD of inlier g_crystal vectors
                 inliers = dots_all[idx] <= sin_tol
@@ -347,7 +355,11 @@ def identify_zones(
                 t_lab_hat = R_single @ t_cand
                 rms_deg = float(np.sqrt(np.mean(ang_deg[member_ids] ** 2)))
                 score = float(
-                    np.sum(np.exp(-0.5 * (ang_deg[member_ids] / max(tolerance_deg, 1e-3)) ** 2))
+                    np.sum(
+                        np.exp(
+                            -0.5 * (ang_deg[member_ids] / max(tolerance_deg, 1e-3)) ** 2
+                        )
+                    )
                 )
                 conic = get_zone_conic_points(t_lab_hat, ki=ki_hat, n_arc=n_arc)
                 zi = len(zones)
