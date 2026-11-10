@@ -3672,7 +3672,7 @@ class NovaGalaxyPipelineRunner:
         container_image = (
             "ghcr.io/jglaser/careless:cuda"
             if stage_id == "merge"
-            else "ghcr.io/neutrons/subhkl:feat-rainbow-zones"
+            else "ghcr.io/neutrons/subhkl:1.5.0"
         )
         if shutil.which("podman"):
             raw_dirs = {os.path.dirname(os.path.abspath(p)) for p in raw_nxs_local}
