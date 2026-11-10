@@ -1,0 +1,119 @@
+{
+  "dataset": "CG4D garnet run 2022, single still",
+  "inputs": {
+    "solve-frames-2022.h5": "ba1f001f80a59b16b71c8bcb27cc7da40c8ad90cfd9d0a0023fc973c4e4176ab",
+    "boot-truth.h5": "3a0fc4c57c05019712b9f1516fdf8345dc7e29df3aeb1f61ac3eba226b6d2655"
+  },
+  "probes": {
+    "default": {
+      "g": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "active": [],
+      "group_norms": [
+        0.0
+      ],
+      "objective_initial": 2833857.5073147872,
+      "objective_final": 2833857.5073147872,
+      "stationarity_residual": 1.30292629592077e-05,
+      "stationarity_tolerance": 1.317490157327751e-05,
+      "inner_converged": true,
+      "status": "no_orientation",
+      "d_min": 3.2,
+      "n_hkl": 36,
+      "orientation_error_deg": [
+        43.846537148319655
+      ]
+    },
+    "blind": {
+      "g": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "active": [
+        0
+      ],
+      "group_norms": [
+        4346.338788670541
+      ],
+      "objective_initial": 1920532.9657714851,
+      "objective_final": 1920532.9657714851,
+      "stationarity_residual": 4.8557602383425547e-11,
+      "stationarity_tolerance": 1.9524704719832526e-05,
+      "inner_converged": true,
+      "status": "converged",
+      "d_min": 1.5,
+      "n_hkl": 782,
+      "orientation_error_deg": [
+        0.5711925517516788
+      ]
+    },
+    "refine": {
+      "g": [
+        0.028935463437603382,
+        -0.0097883276425581,
+        6.593670728073731e-05,
+        0.0004773402830788392,
+        0.0018211497752983147,
+        0.00010629453656867226
+      ],
+      "active": [
+        0
+      ],
+      "group_norms": [
+        1981.053931639429
+      ],
+      "objective_initial": 2766728.9498758065,
+      "objective_final": 2634274.0180472983,
+      "stationarity_residual": 3.915506113782996e-11,
+      "stationarity_tolerance": 2.2939387691339815e-05,
+      "inner_converged": true,
+      "status": "converged",
+      "d_min": 3.2,
+      "n_hkl": 36,
+      "orientation_error_deg": [
+        0.49203996064013994
+      ],
+      "n_evaluations": 430,
+      "optimizer_message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH"
+    },
+    "blind-refined": {
+      "g": [
+        0.06301198879642744,
+        0.003250959503058577,
+        -0.038065023203014095,
+        -0.0025188874639146415,
+        0.010743419939595315,
+        0.0011915802508860765
+      ],
+      "active": [
+        0
+      ],
+      "group_norms": [
+        6069.068767638967
+      ],
+      "objective_initial": 1920532.9657714851,
+      "objective_final": 669248.6093675448,
+      "stationarity_residual": 2.460818162337841e-05,
+      "stationarity_tolerance": 2.952470471983253e-05,
+      "inner_converged": true,
+      "status": "not_converged",
+      "d_min": 1.5,
+      "n_hkl": 782,
+      "orientation_error_deg": [
+        1.3136049675680073
+      ],
+      "n_evaluations": 790,
+      "optimizer_message": "STOP: TOTAL NO. OF F,G EVALUATIONS EXCEEDS LIMIT"
+    }
+  }
+}

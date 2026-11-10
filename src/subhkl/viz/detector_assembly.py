@@ -79,6 +79,8 @@ def plot_unrolled_detector(
     overlay_color="cyan",
     overlay_alpha=0.45,
     overlay_label="Static mask",
+    zone_curves=None,
+    zone_alpha=0.5,
 ):
     fig, ax = plt.subplots(figsize=(16, 6))
 
@@ -279,6 +281,55 @@ def plot_unrolled_detector(
                 label=label,
             )
             added_finder_label = True
+
+    # 2.6 Zone Bragg peak circles (indexer-visualize): each entry carries
+    # per-panel isotropic Bragg peak circles (or fallback curve points) of
+    # one crystallographic zone [uvw], color-coded by zone so predicted
+    # reflections surround rather than cover the raw detector spots.
+    if zone_curves is not None:
+        for zc in zone_curves:
+            first = True
+            z_peaks = zc.get("peaks")
+            if z_peaks:
+                for img_key, pk_arr in z_peaks.items():
+                    det = detectors.get(img_key)
+                    if det is None or len(pk_arr) == 0:
+                        continue
+                    s_lab = get_s_lab_for_image(img_key)
+                    pk_arr = np.atleast_2d(pk_arr)
+                    _draw_outlines(
+                        ax,
+                        det,
+                        s_lab,
+                        zip(pk_arr[:, 0], pk_arr[:, 1], pk_arr[:, 2], strict=False),
+                        n_sigma=n_sigma,
+                        color=zc["color"],
+                        label=zc["label"] if first and zc.get("label") else "",
+                        wrapped=img_key in wrapped_panels,
+                        compress=compress_roty,
+                    )
+                    first = False
+                continue
+            for img_key, xyz in zc["points"].items():
+                det = detectors.get(img_key)
+                if det is None or len(xyz) == 0:
+                    continue
+                s_lab = get_s_lab_for_image(img_key)
+                v = np.asarray(xyz) - s_lab
+                z_roty = np.rad2deg(np.arctan2(v[:, 0], v[:, 2]))
+                if img_key in wrapped_panels:
+                    z_roty = np.where(z_roty < 0, z_roty + 360, z_roty)
+                z_roty = compress_roty(z_roty)
+                ax.scatter(
+                    z_roty,
+                    v[:, 1],
+                    s=0.5,
+                    color=zc["color"],
+                    alpha=zone_alpha,
+                    zorder=4,
+                    label=zc["label"] if first else None,
+                )
+                first = False
 
     # 3. Plot the Projected 3D Ellipsoids
     if (
@@ -511,6 +562,8 @@ def plot_unrolled_detector(
     if instrument is not None:
         title_str = f"{instrument} | {title_str}"
 
+    if getattr(peaks, "diagnostic_status", None):
+        title_str += f" | DIAGNOSTIC: {peaks.diagnostic_status}"
     ax.set_title(title_str)
 
     if mesh_handle is not None:
@@ -529,13 +582,17 @@ def plot_unrolled_detector(
         labels.append(overlay_label)
     if handles:
         by_label = dict(zip(labels, handles))
-        ax.legend(
+        leg = ax.legend(
             by_label.values(),
             by_label.keys(),
             loc="upper right",
             fontsize=6,
             markerscale=0.5,
         )
+        # the curves are drawn semi-transparent so they do not hide the
+        # spots they land on; the legend keys stay opaque to read
+        for lh in getattr(leg, "legend_handles", getattr(leg, "legendHandles", [])):
+            lh.set_alpha(1.0)
 
     plt.savefig(out_name, dpi=dpi, bbox_inches="tight", pad_inches=0.05)
     plt.close(fig)

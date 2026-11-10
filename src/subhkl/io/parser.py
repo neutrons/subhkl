@@ -1,33 +1,278 @@
 # src/subhkl/io/command_line_parser.py
-from typing import Annotated
-from typing import Optional
-
-import sys
-import typer
-import h5py
 import os
+import sys
+from typing import Annotated
 
+import h5py
+import typer
+
+from subhkl.commands import (
+    run_finder,
+    run_finder_visualize,
+    run_index,
+    run_indexer_visualize,
+    run_integrator_visualize,
+    run_mask_visualize,
+    run_merge_images,
+    run_metrics,
+    run_mtz_exporter,
+    run_peak_predictor,
+    run_rbf_integrator,
+    run_reduce,
+    run_static_mask,
+    run_sum_images,
+)
 from subhkl.utils.devices import restrict_to_first_device
 from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
 
-from subhkl.commands import (
-    run_index,
-    run_rbf_integrator,
-    run_finder,
-    run_metrics,
-    run_peak_predictor,
-    run_mtz_exporter,
-    run_reduce,
-    run_merge_images,
-    run_finder_visualize,
-    run_integrator_visualize,
-    run_static_mask,
-    run_sum_images,
-    run_mask_visualize,
-)
-
-
 app = typer.Typer()
+
+
+@app.command()
+def solve(
+    frames_filename: Annotated[
+        str,
+        typer.Argument(help="Still or rotation-scan HDF5 counts (images + bank_ids)"),
+    ],
+    output_filename: Annotated[
+        str, typer.Argument(help="Joint orientation/geometry result HDF5")
+    ],
+    metadata: Annotated[
+        str | None, typer.Option(help="Cell, instrument and setting metadata HDF5")
+    ] = None,
+    instrument: Annotated[
+        str | None, typer.Option(help="Instrument name; defaults to metadata")
+    ] = None,
+    cell: Annotated[
+        str | None, typer.Option(help="a,b,c,alpha,beta,gamma in Angstrom/degrees")
+    ] = None,
+    space_group: Annotated[str | None, typer.Option(help="Space group symbol")] = None,
+    wavelength_min: Annotated[
+        float | None, typer.Option(help="Lower wavelength in Angstrom")
+    ] = None,
+    wavelength_max: Annotated[
+        float | None, typer.Option(help="Upper wavelength in Angstrom")
+    ] = None,
+    d_min: Annotated[
+        float, typer.Option(min=0.0001, help="Reflection resolution in Angstrom")
+    ] = 3.2,
+    binning: Annotated[int, typer.Option(min=1, help="Sum count pixels into bins")] = 8,
+    proposal_binning: Annotated[
+        int,
+        typer.Option(min=1, help="Spatial binning for global orientation proposals"),
+    ] = 32,
+    n_candidates: Annotated[
+        int,
+        typer.Option(
+            min=1, help="Maximum distinct proposed orientations in the sparse fit"
+        ),
+    ] = 4,
+    penalty: Annotated[
+        float,
+        typer.Option(
+            min=0.0,
+            help="Group regularization across orientations; no spot detection threshold",
+        ),
+    ] = 1.2,
+    sigma_px: Annotated[
+        float,
+        typer.Option(min=0.0001, help="Profile sigma in original detector pixels"),
+    ] = 6.0,
+    max_evals: Annotated[
+        int, typer.Option(min=1, help="Joint refinement evaluation budget")
+    ] = 1500,
+    bootstrap: Annotated[
+        str | None,
+        typer.Option(
+            help="Previous solve, or HDF5 orientations (N,3,3) in lab coordinates"
+        ),
+    ] = None,
+    profile_file: Annotated[
+        str | None,
+        typer.Option(help="Measured shape prior HDF5 with profile/u and profile/f"),
+    ] = None,
+    background_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Positive expected-count images plus bank_ids; panel scales are fitted"
+        ),
+    ] = None,
+    static_mask_file: Annotated[
+        str | None,
+        typer.Option(
+            help="Instrument validity mask; all remaining count bins are retained"
+        ),
+    ] = None,
+    fixed_geometry: Annotated[
+        bool,
+        typer.Option(
+            help="Fit orientations/intensities while holding detector geometry fixed"
+        ),
+    ] = False,
+    refine: Annotated[
+        bool,
+        typer.Option(
+            "--refine/--no-refine",
+            help="Jointly refine orientations and geometry after support fitting",
+        ),
+    ] = True,
+    refinement: Annotated[
+        str, typer.Option(help="Refinement objective: poisson or staged band")
+    ] = "poisson",
+    finder_peaks: Annotated[
+        str | None,
+        typer.Option(help="Optional finder observations for band comparison"),
+    ] = None,
+    refine_modes: Annotated[
+        str | None,
+        typer.Option(
+            help="Band modes: cylindrical,axial_stretch,area,global_rot,global_trans,sample,cell,per_run,per_run_trans,panels"
+        ),
+    ] = None,
+    runs: Annotated[
+        str | None, typer.Option(help="Zero-based run indices for band refinement")
+    ] = None,
+    stable_runs: Annotated[
+        str | None, typer.Option(help="Drift-free subset for initial band geometry")
+    ] = None,
+    band_zones: Annotated[
+        int, typer.Option(min=60, help="Final band zone count")
+    ] = 400,
+    band_maxiter: Annotated[
+        int, typer.Option(min=1, help="Iteration limit per band/pixel stage")
+    ] = 600,
+    min_deviance: Annotated[
+        float,
+        typer.Option(
+            min=0, help="Finder comparison selection only; never applied to counts"
+        ),
+    ] = 100.0,
+    pixel_polish: Annotated[
+        bool,
+        typer.Option(
+            help="Fixed-assignment robust polish after band fit; requires finder peaks"
+        ),
+    ] = False,
+    assignment_wavelength_min: Annotated[
+        float | None, typer.Option(help="Prediction/pixel-polish band lower bound")
+    ] = None,
+    assignment_wavelength_max: Annotated[
+        float | None, typer.Option(help="Prediction/pixel-polish band upper bound")
+    ] = None,
+    search_samples: Annotated[
+        int,
+        typer.Option(
+            min=1,
+            help="Observation budget for blind band proposals; smaller lists use all observations",
+        ),
+    ] = 16384,
+    search_seed: Annotated[
+        int, typer.Option(min=0, help="Reproducible blind band sampling seed")
+    ] = 0,
+    global_rot_axis: Annotated[
+        str | None,
+        typer.Option(
+            "--global-rot-axis",
+            "--detector-global-rot-axis",
+            help="Axis vector for global detector rotation (e.g. '0,1,0', or 'none' for unconstrained 3D rotation)",
+        ),
+    ] = "0,1,0",
+    border_width: Annotated[
+        int,
+        typer.Option(
+            "--border-width",
+            min=0,
+            help="Detector panel border width in pixels to mask during band refinement (0 disables border masking)",
+        ),
+    ] = 4,
+):
+    """Solve orientation support and detector geometry from counts together.
+
+    Replaces calibrate and spherical-index. The default count path uses all
+    valid bins. Band refinement can index finder observations blindly, or
+    refine count data with an explicit orientation seed.
+    """
+    from subhkl.solve import run_solve
+
+    try:
+        values = [float(v.strip()) for v in cell.split(",")] if cell else None
+        if refinement not in ("poisson", "band"):
+            raise ValueError("refinement must be poisson or band")
+        if refinement == "band":
+            from subhkl.scan_refine import run_scan_refinement
+
+            if not refine or fixed_geometry:
+                raise ValueError(
+                    "band uses --refine-modes to select free geometry; omit --no-refine/--fixed-geometry"
+                )
+            band_result = run_scan_refinement(
+                frames_filename,
+                output_filename,
+                bootstrap=bootstrap,
+                finder=finder_peaks,
+                instrument=instrument,
+                cell=values,
+                space_group=space_group,
+                wavelength=(wavelength_min, wavelength_max),
+                assignment_wavelength=(
+                    assignment_wavelength_min,
+                    assignment_wavelength_max,
+                ),
+                runs=[int(x) for x in runs.split(",")] if runs else None,
+                stable_runs=[int(x) for x in stable_runs.split(",")]
+                if stable_runs
+                else None,
+                modes=refine_modes.split(",") if refine_modes is not None else None,
+                n_zones=band_zones,
+                d_min=d_min,
+                min_deviance=min_deviance,
+                pixel_polish=pixel_polish,
+                binning=binning,
+                maxiter=band_maxiter,
+                static_mask_file=static_mask_file,
+                search_samples=search_samples,
+                search_seed=search_seed,
+                search_candidates=n_candidates,
+                global_rot_axis=global_rot_axis,
+                border_width=border_width,
+            )
+            if band_result["status"] != "converged":
+                raise typer.Exit(1)
+            return
+        if finder_peaks or refine_modes or runs or stable_runs or pixel_polish:
+            raise ValueError("finder/mode/run/pixel options require --refinement band")
+        result = run_solve(
+            frames_filename,
+            output_filename,
+            metadata=metadata,
+            instrument=instrument,
+            cell=values,
+            space_group=space_group,
+            wavelength_min=wavelength_min,
+            wavelength_max=wavelength_max,
+            d_min=d_min,
+            binning=binning,
+            proposal_binning=proposal_binning,
+            n_candidates=n_candidates,
+            penalty=penalty,
+            sigma_px=sigma_px,
+            max_evals=max_evals,
+            bootstrap=bootstrap,
+            profile_file=profile_file,
+            background_file=background_file,
+            static_mask_file=static_mask_file,
+            fixed_geometry=fixed_geometry,
+            do_refine=refine,
+        )
+    except typer.Exit:
+        raise
+    except (ValueError, KeyError, OSError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except RuntimeError as exc:
+        typer.echo(f"solve failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if result["status"] != "converged":
+        raise typer.Exit(1)
 
 
 def apply_detector_calibration(hdf5_filename: str, instrument: str):
@@ -61,9 +306,6 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
                     count += 1
             if count > 0:
                 print(f"Successfully applied calibration to {count} detector panels.")
-
-
-app = typer.Typer()
 
 
 @app.command()
@@ -324,7 +566,7 @@ def indexer(
         ),
     ] = "1.0",
     refine_goniometer_per_run: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--refine-goniometer-per-run",
             help="Motor name (e.g. 'phi') to refine one bounded angle "
@@ -361,7 +603,7 @@ def indexer(
         ),
     ] = 0.002,
     refine_goniometer_harmonics: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--refine-goniometer-harmonics",
             help="Scan motor name (e.g. 'phi') to refine a Fourier-in-phi "
@@ -374,7 +616,7 @@ def indexer(
         ),
     ] = None,
     goniometer_harmonics_orders: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--goniometer-harmonics-orders",
             help="Comma-separated harmonic orders m (default '1,2,3,4,5,6'). "
@@ -405,7 +647,7 @@ def indexer(
         ),
     ] = 0.5,
     refine_goniometer_trans_axes: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--refine-goniometer-trans-axes",
             help="Comma-separated motor names whose lever-arm translations "
@@ -477,7 +719,7 @@ def indexer(
     num_candidates: Annotated[
         int | None, typer.Option(help="Number of lambda candidates (default: 64)")
     ] = None,
-    index: Annotated[Optional[bool], typer.Option("--index/--no-index")] = None,
+    index: Annotated[bool | None, typer.Option("--index/--no-index")] = None,
     radial_weight: Annotated[
         float,
         typer.Option(
@@ -489,7 +731,7 @@ def indexer(
         ),
     ] = 1.0,
     radial_weight_poly: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             help="Comma-separated polynomial coefficients for w(lambda) "
             "in Angstrom, highest degree first; overrides --radial-weight."
@@ -1016,13 +1258,27 @@ _DPI_HELP = (
 
 @app.command()
 def finder_visualize(
-    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
-    peaks_filename: Annotated[str, typer.Argument(help="Finder output HDF5 file")],
-    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
-    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    images_filename: Annotated[
+        str,
+        typer.Argument(
+            help="Finder output HDF5 file (or reduced/merged images HDF5 if two positional arguments are given)"
+        ),
+    ],
+    peaks_filename: Annotated[
+        str | None,
+        typer.Argument(
+            help="Finder output HDF5 file (optional when images are resolved from source or --images)"
+        ),
+    ] = None,
+    images: Annotated[
+        str | None,
+        typer.Option("--images", help=_IMAGES_HELP),
+    ] = None,
+    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
     n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
-    max_workers: Optional[int] = None,
+    max_workers: int | None = None,
     show_progress: bool = True,
 ):
     """
@@ -1034,6 +1290,9 @@ def finder_visualize(
     finder without visualizations, keep the two HDF5 files, and come back to
     the pictures later.
     """
+    if peaks_filename is None and images is not None:
+        peaks_filename = images_filename
+        images_filename = images
     run_finder_visualize(
         images_filename=images_filename,
         peaks_filename=peaks_filename,
@@ -1048,13 +1307,27 @@ def finder_visualize(
 
 @app.command()
 def integrator_visualize(
-    images_filename: Annotated[str, typer.Argument(help=_IMAGES_HELP)],
-    peaks_filename: Annotated[str, typer.Argument(help="integrator output HDF5 file")],
-    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
-    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    images_filename: Annotated[
+        str,
+        typer.Argument(
+            help="Integrator output HDF5 file (or reduced/merged images HDF5 if two positional arguments are given)"
+        ),
+    ],
+    peaks_filename: Annotated[
+        str | None,
+        typer.Argument(
+            help="Integrator output HDF5 file (optional when images are resolved from source or --images)"
+        ),
+    ] = None,
+    images: Annotated[
+        str | None,
+        typer.Option("--images", help=_IMAGES_HELP),
+    ] = None,
+    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 150,
     n_sigma: Annotated[float, typer.Option(help=_N_SIGMA_HELP)] = DEFAULT_N_SIGMA,
-    max_workers: Optional[int] = None,
+    max_workers: int | None = None,
     show_progress: bool = True,
 ):
     """
@@ -1064,6 +1337,9 @@ def integrator_visualize(
     --create-visualizations' would have, drawing each peak at the shape the
     integrator fitted it, without repeating the integration.
     """
+    if peaks_filename is None and images is not None:
+        peaks_filename = images_filename
+        images_filename = images
     run_integrator_visualize(
         images_filename=images_filename,
         peaks_filename=peaks_filename,
@@ -1102,7 +1378,7 @@ def static_mask(
         ),
     ] = None,
     pooled_peaks: Annotated[
-        Optional[str],
+        str | None,
         typer.Option(
             "--pooled-peaks",
             help="Finder output from a run on the per-bank *summed* stack "
@@ -1276,10 +1552,10 @@ def mask_visualize(
     mask_filename: Annotated[
         str, typer.Argument(help="Static mask HDF5 (from `static-mask`)")
     ],
-    instrument: Annotated[Optional[str], typer.Option(help=_INSTRUMENT_HELP)] = None,
-    output_dir: Annotated[Optional[str], typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
     dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 600,
-    max_workers: Optional[int] = None,
+    max_workers: int | None = None,
     show_progress: bool = True,
 ):
     """
@@ -1297,6 +1573,59 @@ def mask_visualize(
         dpi=dpi,
         max_workers=max_workers,
         show_progress=show_progress,
+    )
+
+
+@app.command()
+def indexer_visualize(
+    peaks_filename: Annotated[
+        str, typer.Argument(help="Indexer (or spherical-index) output HDF5 file")
+    ],
+    instrument: Annotated[str | None, typer.Option(help=_INSTRUMENT_HELP)] = None,
+    output_dir: Annotated[str | None, typer.Option(help=_OUTPUT_DIR_HELP)] = None,
+    max_index: Annotated[
+        int, typer.Option("--max-index", help="Draw zones [uvw] up to this index")
+    ] = 1,
+    dpi: Annotated[int, typer.Option(help=_DPI_HELP)] = 600,
+    image_index: Annotated[
+        int | None,
+        typer.Option("--image-index", help="Frame to draw (default: each run's first)"),
+    ] = None,
+    images: Annotated[
+        str | None,
+        typer.Option(
+            "--images",
+            help="Merged images HDF5: render the raw detector counts underneath the zone conics -- the strongest visual check, no peak finder in the loop",
+        ),
+    ] = None,
+    zone_alpha: Annotated[
+        float,
+        typer.Option(
+            "--zone-alpha",
+            help="Opacity of the zone conics (0-1).  A good solution puts "
+            "the curves ON the spots, where an opaque curve hides the very "
+            "agreement it is drawn to show.",
+        ),
+    ] = 0.5,
+):
+    """
+    Draw the low-index Laue zone conics over the measured peaks.
+
+    A zone [uvw] is a great circle of Q directions, hence a conic of spot
+    positions per panel: with a correct (U, B) every strong row of spots
+    rides a drawn curve, and a systematic offset points at the refinable
+    that is wrong -- orientation, a panel, or the goniometer.  One
+    unrolled-detector figure per run.
+    """
+    run_indexer_visualize(
+        peaks_filename=peaks_filename,
+        instrument=instrument,
+        output_dir=output_dir,
+        max_index=max_index,
+        dpi=dpi,
+        image_index=image_index,
+        images_filename=images,
+        zone_alpha=zone_alpha,
     )
 
 

@@ -8,11 +8,12 @@ count.  The convolution-structured (H*W-scale) solver lives with the
 finder in ``matrix_free._solve_ssn_cg_global``.
 """
 
-import jax.numpy as jnp
-from jax import lax, jit
 from functools import partial
 
 from scipy.special import ndtri
+
+
+_SOLVE_SSN_UNIFIED_JIT = None
 
 
 def calibrated_admission_z(n_tests, fp_target):
@@ -38,8 +39,7 @@ def calibrated_admission_z(n_tests, fp_target):
     return float(ndtri(1.0 - q))
 
 
-@partial(jit, static_argnames=["max_iter", "loss_type", "force_target", "per_atom_var"])
-def solve_ssn_unified(
+def _solve_ssn_unified_impl(
     A,
     y,
     bg_flat,
@@ -51,6 +51,9 @@ def solve_ssn_unified(
     active_override=None,
     per_atom_var=False,
 ):
+    import jax.numpy as jnp
+    from jax import lax
+
     N_peaks = A.shape[1]
     N_params = N_peaks
     q_init = c_warm.astype(jnp.float32)
@@ -216,3 +219,37 @@ def solve_ssn_unified(
     _, c_final, _ = debias_state
 
     return c_final.astype(jnp.float32)
+
+
+def solve_ssn_unified(
+    A,
+    y,
+    bg_flat,
+    alpha_vec,
+    loss_type,
+    c_warm,
+    max_iter=20,
+    force_target=False,
+    active_override=None,
+    per_atom_var=False,
+):
+    global _SOLVE_SSN_UNIFIED_JIT
+    if _SOLVE_SSN_UNIFIED_JIT is None:
+        from jax import jit
+
+        _SOLVE_SSN_UNIFIED_JIT = partial(
+            jit,
+            static_argnames=["max_iter", "loss_type", "force_target", "per_atom_var"],
+        )(_solve_ssn_unified_impl)
+    return _SOLVE_SSN_UNIFIED_JIT(
+        A,
+        y,
+        bg_flat,
+        alpha_vec,
+        loss_type,
+        c_warm,
+        max_iter=max_iter,
+        force_target=force_target,
+        active_override=active_override,
+        per_atom_var=per_atom_var,
+    )

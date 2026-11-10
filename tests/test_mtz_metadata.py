@@ -119,3 +119,23 @@ def test_metadata_columns_carry_the_right_values(files, tmp_path):
     np.testing.assert_allclose(cols["DPHI"][3:], 0.3, rtol=1e-5)
     np.testing.assert_allclose(cols["DTX"][:3], 1.0, rtol=1e-5)
     np.testing.assert_allclose(cols["DTZ"][3:], -1.0, rtol=1e-5)
+
+
+def test_translation_only_corrections_export(files, tmp_path):
+    """A translation-only refinement writes trans_m and no delta_deg.  The
+    exporter used to size its run axis off delta_deg *before* testing for
+    it, so its own guard was dead code and the export died with KeyError;
+    DTX/DTY/DTZ must come through and DPHI simply be absent."""
+    peaks, predictions, corrections = files
+    with h5py.File(corrections, "r+") as f:
+        del f["goniometer/per_run/delta_deg"]
+    out = tmp_path / "trans_only.mtz"
+    MTZExporter(
+        str(peaks),
+        predictions_file=str(predictions),
+        corrections_file=str(corrections),
+    ).write_mtz(str(out))
+    cols = _columns(out)
+    assert "DPHI" not in cols
+    np.testing.assert_allclose(cols["DTX"][:3], 1.0, rtol=1e-5)
+    np.testing.assert_allclose(cols["DTZ"][3:], -1.0, rtol=1e-5)
