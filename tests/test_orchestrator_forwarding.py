@@ -26,7 +26,7 @@ class _RecordingFinder:
     def __init__(self, **kwargs):
         _RecordingFinder.received = kwargs
 
-    def find_peaks_batch(self, stack):
+    def find_peaks_batch(self, stack, two_theta=None):
         return [np.zeros((0, 4)) for _ in range(stack.shape[0])]
 
 
