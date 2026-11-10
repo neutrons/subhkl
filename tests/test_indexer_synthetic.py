@@ -117,7 +117,14 @@ def test_synthetic_indexing(tmp_path):
         mock_detector.return_value = mock_det_instance
 
         # Configure Metrics Mock
-        mock_extract.return_value = (xyz_mock, run_idx_mock)
+        # (xyz, slot_index, panel_index, frame_index); all synthetic peaks
+        # sit on bank 1 and each run is its own frame.
+        mock_extract.return_value = (
+            xyz_mock,
+            run_idx_mock,
+            np.ones_like(run_idx_mock),
+            run_idx_mock,
+        )
 
         # Run indexer using standard positional file arguments
         index(
