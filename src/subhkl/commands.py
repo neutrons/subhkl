@@ -1370,7 +1370,7 @@ def run_rbf_integrator(
     matrix_free_profile: str = "gaussian",
     matrix_free_fp_target: float | None = None,
     static_mask_file: str | None = None,
-    rel_border_width: float = 0.0,
+    rel_border_width: float = 0.03,
     show_progress: bool = True,
     create_visualizations: bool = False,
     chunk_size: int = 256,

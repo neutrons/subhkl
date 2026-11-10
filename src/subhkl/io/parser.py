@@ -1027,7 +1027,7 @@ def integrator(
     ] = None,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
-    ] = 0.0,
+    ] = 0.03,
     show_progress: Annotated[bool, typer.Option("--show-progress")] = True,
     create_visualizations: bool = False,
     chunk_size: int = 256,

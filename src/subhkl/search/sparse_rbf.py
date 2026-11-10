@@ -267,7 +267,8 @@ def _compute_rate_batch_impl(imgs, filter_size, valid=None):
 
     def process_one(inputs):
         img, v = inputs
-        v_frac = jnp.maximum(_box_mean_2d(v, filter_size), 1e-3)
+        v_raw = _box_mean_2d(v, filter_size)
+        v_frac = jnp.maximum(v_raw, 1e-3)
 
         F = jnp.stack(
             [
@@ -300,10 +301,27 @@ def _compute_rate_batch_impl(imgs, filter_size, valid=None):
         lo, hi = lax.fori_loop(0, 30, bisect, (lo, hi))
         mu = 0.5 * (lo + hi)
 
-        bright = _box_mean_2d(v * img, filter_size) / v_frac
+        m0 = _box_mean_2d(v * img, filter_size) / v_frac
+        img_clipped = jnp.minimum(img, m0 + 2.5 * jnp.sqrt(jnp.maximum(m0, 1.0)))
+        bright = _box_mean_2d(v * img_clipped, filter_size) / v_frac
         rate = jnp.where(any_hit, mu, bright)
 
-        blur = jax_gaussian_blur_2d(rate)  # [photons/Pixel]
+        # Confidence-weighted (normalized convolution) Gaussian inpainting:
+        # Windows whose unmasked pixel fraction v_raw collapses to 0 inside
+        # broad or overlapping peak footprints otherwise evaluate to rate = 0
+        # and carve deep artificial craters under the peaks after blurring.
+        w = jnp.square(jnp.clip((v_raw - 0.05) / 0.45, 0.0, 1.0))
+        wide_size = (filter_size * 3) | 1
+        num_wide = _box_mean_2d(w * rate, wide_size)
+        den_wide = _box_mean_2d(w, wide_size)
+        global_rate = jnp.sum(w * rate) / jnp.maximum(jnp.sum(w), 1e-6)
+        rate_wide = jnp.where(
+            den_wide > 1e-4, num_wide / jnp.maximum(den_wide, 1e-4), global_rate
+        )
+        blur_sigma = max(3.0, float(filter_size) / 4.0)
+        num_fine = jax_gaussian_blur_2d(w * rate, sigma=blur_sigma)
+        den_fine = jax_gaussian_blur_2d(w, sigma=blur_sigma)
+        blur = (num_fine + 1e-3 * rate_wide) / (den_fine + 1e-3)
         # Numerical guard only.  Unlike the median path this never binds on
         # counted data: any region with any exposure has mu >> 1e-3, and
         # regions with none are masked upstream.
@@ -1244,6 +1262,7 @@ def integrate_peaks_rbf_ssn(
         static_valid=static_valid,
         profile=matrix_free_profile,
         fp_target=matrix_free_fp_target,
+        border_width=border_width,
         show_progress=show_progress,
     )
 
@@ -1289,10 +1308,20 @@ def integrate_peaks_rbf_ssn(
         valid_global_indices = []
         valid_local_indices = []
 
+        hi_r = (H - 1 - bw) if bw > 0 else H
+        hi_c = (W - 1 - bw) if bw > 0 else W
+
         for local_idx, global_idx in enumerate(indices):
             r = float(integrated_results[global_idx, 1])
             c = float(integrated_results[global_idx, 2])
-            if (bw <= r < H - bw) and (bw <= c < W - bw):
+            r_pred = float(all_rs[global_idx])
+            c_pred = float(all_cs[global_idx])
+            if (
+                (bw <= r < hi_r)
+                and (bw <= c < hi_c)
+                and (bw <= r_pred < hi_r)
+                and (bw <= c_pred < hi_c)
+            ):
                 valid_global_indices.append(global_idx)
                 valid_local_indices.append(local_idx)
 

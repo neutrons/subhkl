@@ -359,6 +359,67 @@ def test_auto_profile_falls_back_to_gaussian_when_starved():
     np.testing.assert_allclose(out_a[:, 0], out_g[:, 0], rtol=1e-6)
 
 
+def test_broad_footprint_does_not_crater_background_rate_map():
+    """When fitted peak widths are ~4 px (3.5*sigma footprint diameter ~28 px,
+    wider than a 21x21 nominal box window) on a bright CG4D-like background
+    (~30 photons/px), the masked rate map must inpaint from the surrounding
+    ring instead of collapsing toward zero and injecting thousands of fake
+    background photons into peak amplitudes."""
+    import jax.numpy as jnp
+
+    from subhkl.search.matrix_free import _footprint_mask
+    from subhkl.search.sparse_rbf import compute_rate_batch
+
+    H_b, W_b = 96, 96
+    bg_bright = 30.0
+    broad_var = 16.0  # sigma = 4.0 px -> 3.5*sigma = 14 px radius (28 px diameter)
+    rng = np.random.default_rng(901)
+    yy, xx = np.mgrid[0:H_b, 0:W_b].astype(np.float64)
+    rate = np.full((H_b, W_b), bg_bright)
+    # Cluster of two broad reflections (one real, one zero-flux neighbor)
+    positions = [(48.0, 44.0), (48.0, 52.0)]
+    truth = np.array([1500.0, 0.0])
+    for (r, c), flux in zip(positions, truth):
+        g = np.exp(-0.5 * ((yy - r) ** 2 + (xx - c) ** 2) / broad_var)
+        rate += flux * g / (2.0 * np.pi * broad_var)
+    image = rng.poisson(rate).astype(np.float32)
+
+    valid = _footprint_mask(
+        1,
+        H_b,
+        W_b,
+        np.zeros(2, dtype=int),
+        np.array([p[0] for p in positions]),
+        np.array([p[1] for p in positions]),
+        np.full(2, broad_var),
+        np.full(2, broad_var),
+        np.zeros(2),
+    )
+    rm = np.array(
+        compute_rate_batch(jnp.array(image[None]), 21, valid=jnp.array(valid))
+    )[0]
+    # Rate map under the broad footprint cluster must stay close to bg_bright (30.0),
+    # never cratering to <15 photons/px.
+    assert abs(rm[48, 44] - bg_bright) < 2.5, rm[48, 44]
+    assert abs(rm[48, 52] - bg_bright) < 2.5, rm[48, 52]
+
+    out = integrate_reflections_matrix_free(
+        image[None],
+        np.zeros(2, dtype=int),
+        np.array([p[0] for p in positions]),
+        np.array([p[1] for p in positions]),
+        np.full(2, broad_var),
+        np.full(2, broad_var),
+        np.zeros(2),
+        ref_sigma=1.0,
+        max_sigma=4.0,
+        border_width=10,
+    )
+    # The zero-flux neighbor must not absorb a ~2000-photon background crater
+    assert out[1, 0] < 3.0 * max(out[1, 4], 90.0), out[1]
+
+
+
 def test_empty_input_returns_empty():
     out = integrate_reflections_matrix_free(
         np.zeros((1, H, W)),

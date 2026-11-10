@@ -3126,6 +3126,7 @@ class NovaGalaxyPipelineRunner:
                 "--space-group",
                 str(sg),
             ]
+            rel_border = float(params.get("rel_border_width", 0.03))
             int_cmd = [
                 "python",
                 "-u",
@@ -3140,6 +3141,8 @@ class NovaGalaxyPipelineRunner:
                 "--fit-mosaicity",
                 "--shape-fit-normalized",
                 "--matrix-free",
+                "--rel-border-width",
+                str(round(rel_border, 4)),
                 "--show-progress",
             ]
             mtz_cmd = [
