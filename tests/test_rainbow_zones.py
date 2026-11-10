@@ -1229,3 +1229,29 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert len(p_live["panels"]) > 0
     assert all(p.get("texture_b64") is None for p in p_live["panels"])
     assert p_live["ladder_steps"][3]["stage"] == "4. 120→400 Zone + Cell"
+
+    # 7. Verify frame selection persistence during live solve overlay & per-run R_all indexing
+    runner.active_job = {
+        "stage_id": "solve",
+        "state": "running",
+        "ladder_rung_idx": 3,
+        "partial_h5_path": str(stages_h5),
+        "images_h5_path": str(merged_lzf),
+        "solve_params": {
+            "instrument": "CG4D",
+            "space_group": "I a -3 d",
+            "wavelength_range": [2.8, 4.5],
+        },
+        "partial_overlay": {
+            "seq": 2,
+            "frame_index": 0,
+            "zones": [{"zone_id": "z_old", "uvw": [1, 0, 0]}],
+            "ladder_steps": [],
+        },
+    }
+    runner.sync_frame_index(1)
+    assert runner.current_frame_index == 1
+    assert runner.active_job["partial_overlay"]["frame_index"] == 1
+    assert runner.active_job["partial_overlay"]["seq"] == 3
+    assert "state.selectedFrameIndex = clamped" in html
+    assert "api/pipeline/status?frame=${curFrame}" in html

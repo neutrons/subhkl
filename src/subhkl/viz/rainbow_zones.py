@@ -1125,7 +1125,13 @@ def _extract_from_h5(
                     else ur_i
                 )
                 if R_all is not None and R_all.ndim == 3 and len(R_all) > 0:
-                    if 0 <= f0_r < len(R_all):
+                    if (
+                        offsets is not None
+                        and len(R_all) == len(offsets)
+                        and 0 <= ur_i < len(R_all)
+                    ):
+                        R_per_run[ur_i] = R_all[ur_i]
+                    elif 0 <= f0_r < len(R_all):
                         R_per_run[ur_i] = R_all[f0_r]
                     elif 0 <= ur_i < len(R_all):
                         R_per_run[ur_i] = R_all[ur_i]
@@ -1379,14 +1385,14 @@ def _extract_from_h5(
         R_gonio = None
         if R_all is not None:
             if R_all.ndim == 3 and len(R_all) > 0:
-                if frame_slice is not None and frame_slice[0] < len(R_all):
-                    R_gonio = R_all[frame_slice[0]]
-                elif (
+                if (
                     offsets is not None
                     and len(R_all) == len(offsets)
                     and active_frame < len(R_all)
                 ):
                     R_gonio = R_all[active_frame]
+                elif frame_slice is not None and frame_slice[0] < len(R_all):
+                    R_gonio = R_all[frame_slice[0]]
                 elif peaks_xyz is not None and len(R_all) == len(peaks_xyz):
                     R_gonio = R_all
                 elif (
@@ -4223,6 +4229,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     detZoom: 1.0,
     detPanX: 0.0,
     detPanY: 0.0,
+    selectedFrameIndex: typeof DATA.frame_index === "number" ? DATA.frame_index : 0,
+    frameRequestSeq: 0,
+    frameAbortController: null,
   }};
 
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
@@ -6157,6 +6166,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function recomputeBoundsAndReload(newPayload, opts) {{
     if (!newPayload) return;
     const isFrameSwitch = Boolean(opts && opts.isFrameSwitch);
+    const resetSelectedFrame = Boolean(opts && opts.resetSelectedFrame);
+    if (
+      isFrameSwitch &&
+      typeof state.selectedFrameIndex === "number" &&
+      typeof newPayload.frame_index === "number" &&
+      newPayload.frame_index !== state.selectedFrameIndex
+    ) {{
+      return;
+    }}
     const isSolveRunning = state.runningStageIdx === 1 || typeof newPayload.active_rung_idx === "number";
     const prevZones = [...ZONES];
     const prevPeaks = [...PEAKS];
@@ -6185,7 +6203,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     DATA.cell = newPayload.cell || DATA.cell;
     if (Array.isArray(newPayload.frames)) DATA.frames = newPayload.frames;
-    if (typeof newPayload.frame_index === "number") DATA.frame_index = newPayload.frame_index;
+    const nFrames = Array.isArray(DATA.frames) ? DATA.frames.length : 0;
+    if (resetSelectedFrame) {{
+      const nextF = typeof newPayload.frame_index === "number" ? newPayload.frame_index : 0;
+      state.selectedFrameIndex = nextF;
+      DATA.frame_index = nextF;
+    }} else if (
+      typeof state.selectedFrameIndex === "number" &&
+      (nFrames === 0 || (state.selectedFrameIndex >= 0 && state.selectedFrameIndex < nFrames))
+    ) {{
+      DATA.frame_index = state.selectedFrameIndex;
+    }} else if (typeof newPayload.frame_index === "number") {{
+      state.selectedFrameIndex = newPayload.frame_index;
+      DATA.frame_index = newPayload.frame_index;
+    }}
     if (newPayload.goniometer_summary) DATA.goniometer_summary = newPayload.goniometer_summary;
     if (Array.isArray(newPayload.goniometer_R)) DATA.goniometer_R = newPayload.goniometer_R;
     renderFrameSelector();
@@ -8018,7 +8049,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     try {{
       // 1. Prefer server-side HDF5 extraction via NOVA/HTTP backend (handles merged.h5, solve.h5, predictor.h5, integrated.h5 with ellipses & multi-frame)
       try {{
-        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}`, {{
+        const curFrame = typeof state.selectedFrameIndex === "number"
+          ? state.selectedFrameIndex
+          : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{curFrame}}`, {{
           cache: "no-store",
           credentials: "same-origin",
         }});
@@ -8194,6 +8228,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (jobObj.stdout || jobObj.stderr) {{
           appendTerminalLog((jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : ""), true);
         }}
+        if (stageId === "reduce") {{
+          state.selectedFrameIndex = 0;
+          DATA.frame_index = 0;
+        }}
         if (stageId === "solve") {{
           PEAKS.length = 0;
           ZONES.length = 0;
@@ -8204,9 +8242,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
         let lastPartialSeq = 0;
+        let lastPartialFrame = -1;
         galaxyBridge.pollTimer = setInterval(async () => {{
           try {{
-            const sr = await fetch("api/pipeline/status", {{ cache: "no-store" }});
+            const curFrame = typeof state.selectedFrameIndex === "number"
+              ? state.selectedFrameIndex
+              : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+            const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}`, {{ cache: "no-store" }});
             if (!sr.ok) return;
             const sdoc = await sr.json();
             if (sdoc.step_artifacts) {{
@@ -8217,13 +8259,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (!aj) return;
             const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");
             if (outText) appendTerminalLog(outText, true);
+            const ovFrame = (aj.partial_overlay && typeof aj.partial_overlay.frame_index === "number")
+              ? aj.partial_overlay.frame_index
+              : curFrame;
             if (
               stageId === "solve" &&
               aj.state !== "ok" &&
               aj.partial_overlay &&
-              (aj.partial_overlay.seq || 0) > lastPartialSeq
+              ovFrame === curFrame &&
+              ((aj.partial_overlay.seq || 0) > lastPartialSeq || lastPartialFrame !== curFrame)
             ) {{
-              lastPartialSeq = aj.partial_overlay.seq;
+              lastPartialSeq = aj.partial_overlay.seq || 0;
+              lastPartialFrame = curFrame;
               if (Array.isArray(aj.partial_overlay.zones) && aj.partial_overlay.zones.length > 0) {{
                 ZONES.length = 0;
                 aj.partial_overlay.zones.forEach(z => ZONES.push(z));
@@ -8290,14 +8337,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 }}
                 let loadedOk = false;
                 try {{
+                  const targetFrame = stageId === "reduce"
+                    ? 0
+                    : (typeof state.selectedFrameIndex === "number"
+                      ? state.selectedFrameIndex
+                      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0));
                   const payloadUrl = aj.output_h5_path
-                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}`
-                    : "api/payload";
+                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}`
+                    : `api/payload?frame=${{targetFrame}}`;
                   const pr = await fetch(payloadUrl, {{ cache: "no-store" }});
                   if (pr.ok) {{
                     const newPayload = await pr.json();
                     if (newPayload && (Array.isArray(newPayload.panels) || Array.isArray(newPayload.peaks))) {{
-                      recomputeBoundsAndReload(newPayload);
+                      recomputeBoundsAndReload(newPayload, {{ resetSelectedFrame: stageId === "reduce" }});
                       loadedOk = true;
                       appendTerminalLog(
                         stageId === "reduce"
@@ -8475,7 +8527,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const frames = DATA.frames || [];
     if (frames.length === 0) return;
     const clamped = ((frameIdx % frames.length) + frames.length) % frames.length;
+    state.selectedFrameIndex = clamped;
     DATA.frame_index = clamped;
+    const reqSeq = (state.frameRequestSeq = (state.frameRequestSeq || 0) + 1);
+    if (state.frameAbortController) {{
+      try {{ state.frameAbortController.abort(); }} catch (_ab) {{}}
+    }}
+    const abortCtrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    state.frameAbortController = abortCtrl;
     renderFrameSelector();
     updateHUD();
     const curF = frames[clamped];
@@ -8486,9 +8545,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       );
     }}
     try {{
-      const resp = await fetch(`api/payload?frame=${{clamped}}`, {{ cache: "no-store" }});
+      const fetchOpts = {{ cache: "no-store" }};
+      if (abortCtrl) fetchOpts.signal = abortCtrl.signal;
+      const resp = await fetch(`api/payload?frame=${{clamped}}`, fetchOpts);
+      if (reqSeq !== state.frameRequestSeq || clamped !== state.selectedFrameIndex) return;
       if (resp.ok) {{
         const newPayload = await resp.json();
+        if (reqSeq !== state.frameRequestSeq || clamped !== state.selectedFrameIndex) return;
         recomputeBoundsAndReload(newPayload, {{ isFrameSwitch: true }});
       }}
     }} catch (_e) {{}}
@@ -8504,14 +8567,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const btnFramePrev = document.getElementById("btn-frame-prev");
   if (btnFramePrev) {{
     btnFramePrev.addEventListener("click", () => {{
-      const cur = typeof DATA.frame_index === "number" ? DATA.frame_index : 0;
+      const cur = typeof state.selectedFrameIndex === "number"
+        ? state.selectedFrameIndex
+        : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
       selectFrame(cur - 1);
     }});
   }}
   const btnFrameNext = document.getElementById("btn-frame-next");
   if (btnFrameNext) {{
     btnFrameNext.addEventListener("click", () => {{
-      const cur = typeof DATA.frame_index === "number" ? DATA.frame_index : 0;
+      const cur = typeof state.selectedFrameIndex === "number"
+        ? state.selectedFrameIndex
+        : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
       selectFrame(cur + 1);
     }});
   }}

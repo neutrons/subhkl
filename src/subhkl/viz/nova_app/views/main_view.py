@@ -48,7 +48,15 @@ class MainApp:
         if app is None:
             return
 
-        async def handle_status(_request: web.Request) -> web.Response:
+        async def handle_status(request: web.Request) -> web.Response:
+            frame_q = request.rel_url.query.get("frame")
+            if frame_q is not None and str(frame_q).strip() != "":
+                try:
+                    f_idx_st = int(frame_q)
+                    self.view_model.model.subhkl.frame_index = f_idx_st
+                    self.pipeline_runner.sync_frame_index(f_idx_st)
+                except Exception:
+                    pass
             payload = self.view_model.model.subhkl.payload or {}
             hist_ds = self.pipeline_runner.list_history_datasets()
             cur_h5 = (
@@ -94,6 +102,17 @@ class MainApp:
                 return web.Response(text=str(exc), status=404)
 
         async def handle_payload(request: web.Request) -> web.Response:
+            frame_q = request.rel_url.query.get("frame")
+            f_idx: int | None = None
+            if frame_q is not None and str(frame_q).strip() != "":
+                try:
+                    f_idx = int(frame_q)
+                    self.view_model.model.subhkl.frame_index = f_idx
+                    self.pipeline_runner.current_frame_index = f_idx
+                except Exception:
+                    f_idx = None
+
+            refreshed = False
             fp_q = request.rel_url.query.get("file_path")
             if fp_q is not None and str(fp_q).strip() != "":
                 try:
@@ -105,7 +124,8 @@ class MainApp:
                             self.view_model.model.subhkl.data.peaks_file = local_h5
                         else:
                             self.view_model.model.subhkl.data.peaks_file = local_h5
-                        self.view_model.model.subhkl.refresh_payload()
+                        self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                        refreshed = True
                 except Exception as exc:
                     return web.json_response(
                         {"status": "error", "error": str(exc)}, status=404
@@ -135,28 +155,23 @@ class MainApp:
                         self.view_model.model.subhkl.data.peaks_file = local_h5
                     else:
                         self.view_model.model.subhkl.data.peaks_file = local_h5
-                    self.view_model.model.subhkl.refresh_payload()
+                    self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                    refreshed = True
                 except Exception as exc:
                     return web.json_response(
                         {"status": "error", "error": str(exc)}, status=404
                     )
 
-            frame_q = request.rel_url.query.get("frame")
-            if frame_q is not None and str(frame_q).strip() != "":
+            if f_idx is not None and not refreshed:
                 try:
-                    f_idx = int(frame_q)
                     self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
-                    if isinstance(self.view_model.model.subhkl.payload, dict):
-                        self.pipeline_runner.apply_active_solve_overlay(
-                            self.view_model.model.subhkl.payload,
-                            frame_index=f_idx,
-                        )
                 except Exception:
                     pass
-            elif isinstance(self.view_model.model.subhkl.payload, dict):
+            if isinstance(self.view_model.model.subhkl.payload, dict):
                 try:
                     self.pipeline_runner.apply_active_solve_overlay(
-                        self.view_model.model.subhkl.payload
+                        self.view_model.model.subhkl.payload,
+                        frame_index=f_idx,
                     )
                 except Exception:
                     pass
@@ -234,11 +249,17 @@ class MainApp:
                     or "merged" in os.path.basename(new_h5_path).lower()
                 ):
                     self.view_model.model.subhkl.frame_index = 0
+                    self.pipeline_runner.current_frame_index = 0
                     self.view_model.model.subhkl.data.images_file = new_h5_path
                     self.view_model.model.subhkl.data.peaks_file = new_h5_path
                 else:
+                    self.view_model.model.subhkl.frame_index = int(
+                        self.pipeline_runner.current_frame_index or 0
+                    )
                     self.view_model.model.subhkl.data.peaks_file = new_h5_path
-                self.view_model.model.subhkl.refresh_payload()
+                self.view_model.model.subhkl.refresh_payload(
+                    frame_index=self.view_model.model.subhkl.frame_index
+                )
 
             try:
                 res = self.pipeline_runner.submit_galaxy_stage(

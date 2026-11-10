@@ -233,6 +233,9 @@ class NovaGalaxyPipelineRunner:
         overlay its zones and ladder steps projected for ``frame_index`` onto ``payload``."""
         if frame_index is not None:
             self.current_frame_index = int(frame_index)
+        target_frame = int(
+            frame_index if frame_index is not None else (self.current_frame_index or 0)
+        )
         aj = self.active_job
         if not isinstance(aj, dict):
             return payload
@@ -275,11 +278,7 @@ class NovaGalaxyPipelineRunner:
                     include_panel_images=False,
                     include_peaks=True,
                     n_arc=720,
-                    frame_index=(
-                        frame_index
-                        if frame_index is not None
-                        else self.current_frame_index
-                    ),
+                    frame_index=target_frame,
                 )
                 if p_blind.get("zones"):
                     payload["zones"] = p_blind["zones"]
@@ -319,11 +318,41 @@ class NovaGalaxyPipelineRunner:
                     if p_blind.get("ladder_steps"):
                         payload["ladder_steps"] = p_blind["ladder_steps"]
                     payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
+                    prev_ov = aj.get("partial_overlay")
+                    next_seq = (
+                        int(prev_ov.get("seq", 0)) + 1
+                        if isinstance(prev_ov, dict)
+                        and prev_ov.get("frame_index") != target_frame
+                        else (
+                            int(prev_ov.get("seq", 1))
+                            if isinstance(prev_ov, dict)
+                            else 1
+                        )
+                    )
+                    aj["partial_overlay"] = {
+                        "seq": next_seq,
+                        "frame_index": target_frame,
+                        "zones": p_blind.get("zones", []),
+                        "peaks": p_blind.get("peaks", []),
+                        "sample_peaks": p_blind.get("sample_peaks", []),
+                        "panels": p_blind.get("panels", []),
+                        "cell": p_blind.get("cell"),
+                        "ub_matrix": p_blind.get("ub_matrix"),
+                        "goniometer_R": p_blind.get("goniometer_R"),
+                        "ladder_steps": p_blind.get("ladder_steps", []),
+                    }
                     return payload
             except Exception:
                 pass
         ov = aj.get("partial_overlay")
-        if isinstance(ov, dict) and ov.get("zones") and not payload.get("zones"):
+        if (
+            isinstance(ov, dict)
+            and ov.get("zones")
+            and not payload.get("zones")
+            and (
+                ov.get("frame_index") is None or int(ov["frame_index"]) == target_frame
+            )
+        ):
             payload["zones"] = ov["zones"]
             if ov.get("peaks"):
                 payload["peaks"] = ov["peaks"]
@@ -333,6 +362,23 @@ class NovaGalaxyPipelineRunner:
                 payload["ladder_steps"] = ov["ladder_steps"]
             payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
         return payload
+
+    def sync_frame_index(self, frame_index: int | None) -> None:
+        """Update ``current_frame_index`` and ensure any active live solve overlay matches."""
+        if frame_index is None:
+            return
+        self.current_frame_index = int(frame_index)
+        aj = self.active_job
+        if not isinstance(aj, dict):
+            return
+        if aj.get("stage_id") != "solve" or aj.get("state") not in (
+            "queued",
+            "running",
+        ):
+            return
+        ov = aj.get("partial_overlay")
+        if isinstance(ov, dict) and ov.get("frame_index") != self.current_frame_index:
+            self.apply_active_solve_overlay({}, frame_index=self.current_frame_index)
 
     @staticmethod
     def _is_galaxy_server(url: str) -> bool:
@@ -3589,6 +3635,7 @@ class NovaGalaxyPipelineRunner:
                                         build_rainbow_zone_payload,
                                     )
 
+                                    ov_frame = int(self.current_frame_index or 0)
                                     p_blind = build_rainbow_zone_payload(
                                         replay_h5=blind_dst,
                                         images_h5=merged_path,
@@ -3605,12 +3652,15 @@ class NovaGalaxyPipelineRunner:
                                         include_panel_images=False,
                                         include_peaks=True,
                                         n_arc=720,
-                                        frame_index=self.current_frame_index,
+                                        frame_index=ov_frame,
                                     )
                                     if p_blind.get("zones"):
                                         partial_seq += 1
                                         job_record["partial_overlay"] = {
                                             "seq": partial_seq,
+                                            "frame_index": int(
+                                                p_blind.get("frame_index", ov_frame)
+                                            ),
                                             "zones": p_blind.get("zones", []),
                                             "peaks": p_blind.get("peaks", []),
                                             "sample_peaks": p_blind.get(
@@ -4391,6 +4441,8 @@ class RainbowZonesViewModel:
             self.payload = build_rainbow_zone_payload(**self.payload_kwargs)
 
     def reload(self, **overrides: Any) -> dict[str, Any]:
+        if "frame_index" in overrides and overrides["frame_index"] is not None:
+            self.payload_kwargs["frame_index"] = int(overrides["frame_index"])
         kwargs = {**self.payload_kwargs, **overrides}
         if self.replay_h5 is not None:
             self.payload = build_rainbow_zone_payload(
@@ -4512,6 +4564,15 @@ def serve_rainbow_zones(
                 req_path = req_path[len(ep_path) :] or "/"
 
             if req_path in ("/api/payload", "/payload.json"):
+                f_idx: int | None = None
+                if "frame" in qs and qs["frame"]:
+                    try:
+                        f_idx = int(qs["frame"][0])
+                        vm.payload_kwargs["frame_index"] = f_idx
+                        vm.pipeline_runner.current_frame_index = f_idx
+                    except Exception:
+                        f_idx = None
+                reloaded = False
                 if "file_path" in qs and qs["file_path"]:
                     try:
                         fp = os.path.abspath(str(qs["file_path"][0]).strip())
@@ -4520,10 +4581,11 @@ def serve_rainbow_zones(
                             if any(k in fp_low for k in ("merged", "scan", "image")):
                                 vm.payload_kwargs["images_h5"] = fp
                                 vm.replay_h5 = fp
-                                vm.reload(images_h5=fp)
+                                vm.reload(images_h5=fp, frame_index=f_idx)
                             else:
                                 vm.replay_h5 = fp
-                                vm.reload()
+                                vm.reload(frame_index=f_idx)
+                            reloaded = True
                     except Exception:
                         pass
                 if "dataset_id" in qs and qs["dataset_id"]:
@@ -4545,26 +4607,24 @@ def serve_rainbow_zones(
                         if any(k in ds_name for k in ("merged", "scan", "image")):
                             vm.payload_kwargs["images_h5"] = local_h5
                             vm.replay_h5 = local_h5
-                            vm.reload(images_h5=local_h5)
+                            vm.reload(images_h5=local_h5, frame_index=f_idx)
                         else:
                             vm.replay_h5 = local_h5
-                            vm.reload()
+                            vm.reload(frame_index=f_idx)
+                        reloaded = True
                     except Exception:
                         pass
-                if "frame" in qs and qs["frame"]:
+                if f_idx is not None and not reloaded:
                     try:
-                        f_idx = int(qs["frame"][0])
                         vm.reload(frame_index=f_idx)
-                        vm.pipeline_runner.apply_active_solve_overlay(
-                            vm.payload, frame_index=f_idx
-                        )
                     except Exception:
                         pass
-                else:
-                    try:
-                        vm.pipeline_runner.apply_active_solve_overlay(vm.payload)
-                    except Exception:
-                        pass
+                try:
+                    vm.pipeline_runner.apply_active_solve_overlay(
+                        vm.payload, frame_index=f_idx
+                    )
+                except Exception:
+                    pass
                 body = json.dumps(vm.payload).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -4659,6 +4719,13 @@ def serve_rainbow_zones(
                 return
 
             if req_path == "/api/pipeline/status":
+                if "frame" in qs and qs["frame"]:
+                    try:
+                        f_idx_st = int(qs["frame"][0])
+                        vm.payload_kwargs["frame_index"] = f_idx_st
+                        vm.pipeline_runner.sync_frame_index(f_idx_st)
+                    except Exception:
+                        pass
                 hist_ds = vm.pipeline_runner.list_history_datasets()
                 status_doc = {
                     "galaxy_connected": vm.pipeline_runner.is_connected,
@@ -4777,6 +4844,11 @@ def serve_rainbow_zones(
                             or "merged" in os.path.basename(new_h5_path).lower()
                         ):
                             vm.payload_kwargs["images_h5"] = new_h5_path
+                            vm.payload_kwargs["frame_index"] = 0
+                        else:
+                            vm.payload_kwargs["frame_index"] = int(
+                                vm.pipeline_runner.current_frame_index or 0
+                            )
                         vm.replay_h5 = new_h5_path
                         vm.reload()
 
