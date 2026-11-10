@@ -34,6 +34,8 @@ import h5py
 import numpy as np
 from PIL import Image
 
+from subhkl import get_version as get_subhkl_version
+
 from subhkl.viz.zones import (
     _cell_from_B,
     _spherical_angles,
@@ -3129,6 +3131,7 @@ def build_rainbow_zone_payload(
             }
 
     return {
+        "subhkl_version": get_subhkl_version(),
         "instrument": str(instrument),
         "default_projection": resolved_proj,
         "space_group": str(space_group),
@@ -3170,6 +3173,7 @@ def render_rainbow_html(
 ) -> str:
     """Render a unified, self-contained HTML5/Canvas/JS diffraction parallax widget."""
     payload_json = json.dumps(payload, separators=(",", ":"))
+    subhkl_ver = str(payload.get("subhkl_version") or get_subhkl_version()).lstrip("v")
     inst = payload.get("instrument", "IMAGINE")
     sg = payload.get("space_group", "P 1")
     initial_proj = (
@@ -3270,6 +3274,15 @@ def render_rainbow_html(
     font-style: italic;
     margin-left: 1px;
     text-shadow: 0 0 12px rgba(244, 63, 133, 0.38);
+  }}
+
+  .logo-version {{
+    font-family: var(--font-display);
+    font-size: 0.62rem;
+    font-weight: 600;
+    color: var(--text-dim);
+    margin-left: 5px;
+    letter-spacing: 0.2px;
   }}
 
   .subtitle-tag {{
@@ -3801,7 +3814,7 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></div>
+      <div class="rainbow-logo" id="app-title"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span><span class="logo-version" id="app-version">v{subhkl_ver}</span></div>
       <span class="subtitle-tag">{inst} · {sg}</span>
     </div>
 
@@ -6393,6 +6406,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
 
     const subEl = document.querySelector(".subtitle-tag");
+    const verEl = document.getElementById("app-version");
+    if (verEl && newPayload.subhkl_version) {{
+      verEl.textContent = "v" + String(newPayload.subhkl_version).replace(/^v/i, "");
+    }}
     const artKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
     const shapeMode = newPayload.peak_shape_mode || DATA.peak_shape_mode || "solved_circle";
     DATA.artifact_kind = artKind;

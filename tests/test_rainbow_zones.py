@@ -1357,3 +1357,7 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         include_peaks=True,
     )
     assert len(p_mat["zones"]) > 0
+    from subhkl import get_version
+
+    assert p_mat["subhkl_version"] == get_version()
+    assert f'id="app-version">v{get_version().lstrip("v")}</span>' in html
