@@ -271,6 +271,18 @@ class MainApp:
                     {"status": "error", "error": str(exc)}, status=400
                 )
 
+        async def handle_cancel(request: web.Request) -> web.Response:
+            import asyncio
+
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            res = await asyncio.to_thread(
+                self.pipeline_runner.cancel_active_job, body.get("stage_id")
+            )
+            return web.json_response(res)
+
         async def handle_upload_h5(request: web.Request) -> web.Response:
             import tempfile
             import time
@@ -419,6 +431,7 @@ class MainApp:
                 web.get("/api/payload", handle_payload),
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
+                web.post("/api/pipeline/cancel", handle_cancel),
                 web.post("/api/pipeline/upload_h5", handle_upload_h5),
                 web.post(
                     "/api/pipeline/resolve_local_files", handle_resolve_local_files

@@ -1270,3 +1270,90 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
             os.environ.pop("EP_PATH", None)
         else:
             os.environ["EP_PATH"] = old_ep
+
+    # 8. Verify newest-first dataset lookup in _ensure_galaxy_h5_dataset, live-state stdio materialization,
+    #    tape-recorder Play/Stop job cancellation, and persistent terminal scroll position
+    assert "stage-tape-btn" in html
+    assert "cancelWorkflowStage" in html
+    assert "api/pipeline/cancel" in html
+    assert "savedScrollTop" in html
+    assert "box.scrollTop = box.scrollHeight" not in html
+
+    # Verify _ensure_galaxy_h5_dataset picks newer 'ok' dataset over older stuck 'running' dataset
+    mock_store_ds = MagicMock()
+    mock_store_ds.history_id = "hist_3969"
+    mock_gi_ds = MagicMock()
+    mock_gi_ds.datasets.get_datasets.return_value = [
+        {"id": "50f189cd8eed6da2", "name": "merged_lzf.h5", "state": "running"},
+        {"id": "99aabbccddeeff00", "name": "merged_lzf.h5", "state": "ok"},
+    ]
+    mock_store_ds.nova_connection.galaxy_instance = mock_gi_ds
+    ds_job_rec: dict = {"stdout": ""}
+    linked_id = runner._ensure_galaxy_h5_dataset(
+        mock_store_ds, str(merged_lzf), ds_job_rec
+    )
+    assert linked_id == "99aabbccddeeff00"
+    mock_gi_ds.datasets.wait_for_dataset.assert_not_called()
+    assert (
+        "Linked existing dataset 'merged_lzf.h5' (id=99aabbccddeeff00, state=ok)"
+        in ds_job_rec["stdout"]
+    )
+
+    # Verify cancel_active_job deletes active Galaxy jobs and marks job as deleted
+    del_calls: list[tuple[str, str]] = []
+    runner._api_request = MagicMock(
+        side_effect=lambda method, path, **kw: del_calls.append((method, path)) or {}
+    )
+    runner.active_job = {
+        "job_id": "gx_job_42",
+        "galaxy_job_ids": ["gx_job_41", "gx_job_42"],
+        "stage_id": "solve",
+        "mode": "galaxy",
+        "state": "running",
+        "stdout": "",
+        "stderr": "",
+    }
+    cancel_res = runner.cancel_active_job("solve")
+    assert cancel_res["ok"] is True
+    assert cancel_res["cancelled_job_id"] == "gx_job_42"
+    assert runner.active_job["state"] == "deleted"
+    assert runner.active_job["cancel_requested"] is True
+    assert ("DELETE", "/api/jobs/gx_job_41") in del_calls
+    assert ("DELETE", "/api/jobs/gx_job_42") in del_calls
+
+    # Verify [subhkl-live-state] stdout emission, terminal stripping, and HDF5 materialization
+    import base64
+    import json
+    import zlib
+
+    live_doc = {
+        "kind": "stages",
+        "stage": "120-zones",
+        "instrument": "CG4D",
+        "space_group": "I a -3 d",
+        "wavelength": [2.8, 4.5],
+        "d_min": 1.2,
+        "U": np.eye(3).tolist(),
+        "B": (np.eye(3) * 0.0838).tolist(),
+        "cell": [11.93, 11.93, 11.93, 90.0, 90.0, 90.0],
+        "R_all": np.eye(3)[None, :, :].tolist(),
+    }
+    b64_tok = base64.b64encode(
+        zlib.compress(json.dumps(live_doc).encode("utf-8"), level=6)
+    ).decode("ascii")
+    raw_with_live = f"Step 1...\n[subhkl-live-state] {b64_tok}\nStep 2..."
+    stripped = NovaGalaxyPipelineRunner._format_terminal_stream(raw_with_live)
+    assert "[subhkl-live-state]" not in stripped
+    assert stripped.splitlines() == ["Step 1...", "Step 2..."]
+
+    mat_h5 = tmp_path / "materialized.blind.h5"
+    assert NovaGalaxyPipelineRunner._materialize_live_state_h5(b64_tok, str(mat_h5))
+    assert mat_h5.is_file()
+    p_mat = build_rainbow_zone_payload(
+        replay_h5=mat_h5,
+        max_zone_index=2,
+        max_zones=20,
+        include_panels=False,
+        include_peaks=True,
+    )
+    assert len(p_mat["zones"]) > 0
