@@ -215,6 +215,8 @@ def _encode_panel_textures(
     images_h5: str | os.PathLike | None = None,
     render_binning: int = 4,
     frame_slice: tuple[int, int] | None = None,
+    *,
+    encode_images: bool = True,
 ) -> tuple[list[dict[str, Any]], str]:
     """Build cylindrical + spherical detector panel geometries and base64 log-intensity PNG textures.
 
@@ -225,7 +227,7 @@ def _encode_panel_textures(
     raw_bank_images: dict[int, np.ndarray] = {}
     intensity_source = "synthesized_peaks"
 
-    if images_h5 is not None and os.path.exists(images_h5):
+    if encode_images and images_h5 is not None and os.path.exists(images_h5):
         try:
             with h5py.File(images_h5, "r") as f:
                 if "images" in f:
@@ -289,7 +291,12 @@ def _encode_panel_textures(
             pass
 
     # If no raw images were loaded, synthesize clean 2D Gaussian spot maps on each populated bank
-    if not raw_bank_images and bank_arr is not None and len(bank_arr) > 0:
+    if (
+        encode_images
+        and not raw_bank_images
+        and bank_arr is not None
+        and len(bank_arr) > 0
+    ):
         grid_size = 96
         yy, xx = np.meshgrid(
             np.arange(grid_size, dtype=np.float32),
@@ -936,7 +943,7 @@ def _extract_from_h5(
                     )
             if "scan_refinement" in f:
                 sr_grp = f["scan_refinement"]
-                default_d_min = round(0.9 * float(wavelength_range[0]), 2)
+                default_d_min = round(0.5 * float(wavelength_range[0]), 2)
                 solve_diagnostics["d_min"] = float(
                     sr_grp.attrs.get("d_min", default_d_min)
                 )
@@ -1441,30 +1448,15 @@ def _extract_from_h5(
                 cell_use = (
                     cell if cell and len(cell) == 6 else list(_cell_from_B(B_mat))
                 )
-                default_d_min = round(0.9 * float(wavelength_range[0]), 2)
+                default_d_min = round(0.5 * float(wavelength_range[0]), 2)
                 d_min_use = (
                     float(solve_diagnostics.get("d_min", default_d_min))
                     if solve_diagnostics and "d_min" in solve_diagnostics
                     else default_d_min
                 )
-                max_cell_edge = (
-                    max(float(x) for x in cell_use[:3])
-                    if cell_use and len(cell_use) >= 3
-                    else 68.7
-                )
-                min_cell_edge = (
-                    min(float(x) for x in cell_use[:3])
-                    if cell_use and len(cell_use) >= 3
-                    else 68.7
-                )
-                d_min_pred = (
-                    min(d_min_use, max(0.75, min_cell_edge * 0.085))
-                    if max_cell_edge < 35.0
-                    else d_min_use
-                )
                 hkl_all = np.stack(
                     generate_reflections(
-                        *cell_use, space_group=space_group, d_min=d_min_pred
+                        *cell_use, space_group=space_group, d_min=d_min_use
                     ),
                     axis=1,
                 ).astype(int)
@@ -1851,18 +1843,29 @@ def _build_lattice_ladder_steps(
     )
 
     ord1_zones = [z for z in zones if z.get("order", 1) <= 1]
-    z_const_slice = ord1_zones if ord1_zones else zones[: min(13, len(zones))]
-    z_const_ids = [z["zone_id"] for z in z_const_slice]
-    z_const_peaks = sorted({pid for z in z_const_slice for pid in z["member_peak_ids"]})
-    if "cell" in stages_map or "120-zones" in stages_map:
-        st_c = stages_map.get("cell", stages_map.get("120-zones", {}))
+    ord2_zones = [
+        z for z in zones if z.get("order", 1) == 2 and z.get("n_peaks", 0) > 0
+    ]
+    if "cell" in stages_map or "120-zones" in stages_map or "panels" in stages_map:
+        z_const_slice = (
+            (ord1_zones + ord2_zones)
+            if (ord1_zones or ord2_zones)
+            else zones[: min(30, len(zones))]
+        )
+        st_c = stages_map.get(
+            "panels", stages_map.get("cell", stages_map.get("120-zones", {}))
+        )
         s4_stage = "4. 120→400 Zone + Cell"
         s4_sub = f"Staged band + cell/per-run • score={-float(st_c.get('objective', 0.0)):.3f} ({int(st_c.get('iterations', 0))} iters)"
     else:
+        z_const_slice = ord1_zones if ord1_zones else zones[: min(13, len(zones))]
         s4_stage = "4. Multi-Zone Refinement"
         s4_sub = (
-            f"{len(z_const_ids)} fundamental zones capture {len(z_const_peaks)} spots"
+            f"{len(z_const_slice)} fundamental zones capture "
+            f"{len({pid for z in z_const_slice for pid in z['member_peak_ids']})} spots"
         )
+    z_const_ids = [z["zone_id"] for z in z_const_slice]
+    z_const_peaks = sorted({pid for z in z_const_slice for pid in z["member_peak_ids"]})
     steps.append(
         {
             "rung": 4,
@@ -2083,6 +2086,7 @@ def build_rainbow_zone_payload(
     render_binning: int = 4,
     frame_index: int | None = None,
     include_panels: bool = True,
+    include_panel_images: bool = True,
     include_peaks: bool = True,
 ) -> dict[str, Any]:
     """Build the JSON-serializable data contract for the Rainbow Zones widget.
@@ -3057,6 +3061,7 @@ def build_rainbow_zone_payload(
             images_h5=images_h5,
             render_binning=render_binning,
             frame_slice=frame_slice,
+            encode_images=include_panel_images,
         )
     else:
         panels_payload, intensity_source = [], "raw_h5"
@@ -3087,7 +3092,7 @@ def build_rainbow_zone_payload(
         else default_projection_for_instrument(instrument)
     )
 
-    default_d_min = round(0.9 * float(wl_min), 2)
+    default_d_min = round(0.5 * float(wl_min), 2)
     d_min_use = float((solve_diagnostics or {}).get("d_min", default_d_min))
     gonio_summary = (
         frames_meta[active_frame].get("motor_summary", "—")
@@ -3169,7 +3174,7 @@ def render_rainbow_html(
     init_wl = payload.get("wavelength_range") or [2.8, 4.5]
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
     init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
-    init_dmin = float(payload.get("d_min") or round(0.9 * init_wl_min, 2))
+    init_dmin = float(payload.get("d_min") or round(0.5 * init_wl_min, 2))
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -4438,7 +4443,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       alpha: getNum("inp-alpha", cell[3]),
       beta: getNum("inp-beta", cell[4]),
       gamma: getNum("inp-gamma", cell[5]),
-      d_min: getNum("inp-dmin", Number(((state.lamMin || 2.0) * 0.9).toFixed(2))),
+      d_min: getNum("inp-dmin", Number(((state.lamMin || 2.0) * 0.5).toFixed(2))),
       steps: Math.round(getNum("inp-steps", 120)),
       rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", 0.03))),
       wavelength_min: state.lamMin,
@@ -4502,6 +4507,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return wavelengthToColor(p.wavelength, alpha);
   }}
 
+  function hasMergedCarelessData() {{
+    if (DATA && DATA.artifact_kind === "merged_careless") return true;
+    if (DATA && DATA.merge_metrics && Number(DATA.merge_metrics.n_merged_asu) > 0) return true;
+    const checkArr = arr => Array.isArray(arr) && arr.some(
+      p => p && (typeof p.careless_residual === "number" || typeof p.careless_scale === "number")
+    );
+    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+  }}
+
   function syncWulffUI() {{
     const stereoEl = document.getElementById("stereo-inset");
     const btnTop = document.getElementById("btn-stereo-toggle");
@@ -4509,6 +4523,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const btnExpand = document.getElementById("btn-wulff-expand");
     const selColor = document.getElementById("sel-wulff-color");
     const titleEl = document.getElementById("stereo-title");
+    const hasMerge = hasMergedCarelessData();
+    if (!hasMerge && (state.wulffColorMode === "residual" || state.wulffColorMode === "scale")) {{
+      state.wulffColorMode = "wavelength";
+    }}
     if (stereoEl) {{
       stereoEl.classList.toggle("hidden", !state.showStereo);
       stereoEl.classList.toggle("expanded", Boolean(state.wulffExpanded));
@@ -4523,7 +4541,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       btnExpand.textContent = state.wulffExpanded ? "Dock" : "Expand";
       btnExpand.classList.toggle("active-btn", Boolean(state.wulffExpanded));
     }}
-    if (selColor) selColor.value = state.wulffColorMode || "wavelength";
+    if (selColor) {{
+      Array.from(selColor.options).forEach(opt => {{
+        if (opt.value === "residual" || opt.value === "scale") {{
+          opt.disabled = !hasMerge;
+          opt.style.color = hasMerge ? "" : "#64748b";
+        }}
+      }});
+      selColor.value = state.wulffColorMode || "wavelength";
+    }}
     if (titleEl) {{
       const scopeLbl = state.wulffScope === "all_runs" ? "ALL-RUNS" : "1-FRAME";
       titleEl.textContent = `WULFF NET · ${{scopeLbl}}`;
@@ -4973,6 +4999,26 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const maxAbsEl = Math.min(88.0, Math.max(45.0, ...allEl) * 1.18);
     sphBounds.minY = -maxAbsEl;
     sphBounds.maxY = maxAbsEl;
+  }}
+
+  function recomputeProjectionBounds() {{
+    if (PANELS.length > 0) {{
+      const allY = [], allEl = [];
+      PANELS.forEach(p => {{
+        allY.push(p.y_min, p.y_max);
+        if (typeof p.el_min === "number") allEl.push(p.el_min, p.el_max);
+      }});
+      if (allY.length > 0) {{
+        const padY = Math.max(0.03, (Math.max(...allY) - Math.min(...allY)) * 0.08);
+        cylBounds.minY = Math.min(...allY) - padY;
+        cylBounds.maxY = Math.max(...allY) + padY;
+      }}
+      if (allEl.length > 0) {{
+        const padEl = Math.max(4.0, (Math.max(...allEl) - Math.min(...allEl)) * 0.08);
+        sphBounds.minY = Math.max(-90.0, Math.min(...allEl) - padEl);
+        sphBounds.maxY = Math.min(90.0, Math.max(...allEl) + padEl);
+      }}
+    }}
   }}
 
   function getActiveBounds() {{
@@ -5951,7 +5997,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const selWulffColor = document.getElementById("sel-wulff-color");
   if (selWulffColor) {{
     selWulffColor.addEventListener("change", () => {{
-      state.wulffColorMode = selWulffColor.value || "wavelength";
+      const nextMode = selWulffColor.value || "wavelength";
+      if ((nextMode === "residual" || nextMode === "scale") && !hasMergedCarelessData()) {{
+        state.wulffColorMode = "wavelength";
+      }} else {{
+        state.wulffColorMode = nextMode;
+      }}
       syncWulffUI();
     }});
   }}
@@ -6130,9 +6181,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const nextArtKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
     const wl0 = Number((DATA.wavelength_range && DATA.wavelength_range[0]) || state.lamMin || 2.0);
     if (nextArtKind === "merged" || nextArtKind === "raw_nexus") {{
-      DATA.d_min = Number((0.9 * wl0).toFixed(2));
+      DATA.d_min = Number((0.5 * wl0).toFixed(2));
     }} else {{
-      DATA.d_min = Number(newPayload.d_min || (0.9 * wl0).toFixed(2));
+      DATA.d_min = Number(newPayload.d_min || (0.5 * wl0).toFixed(2));
     }}
     DATA.cell = newPayload.cell || DATA.cell;
     if (Array.isArray(newPayload.frames)) DATA.frames = newPayload.frames;
@@ -6404,13 +6455,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!inst) inst = DATA.instrument || "CG4D";
 
     let wlRangeNew = (inst === "MANDI" || inst === "TOPAZ") ? [2.0, 4.0] : [2.8, 4.5];
-    let dMinNew = Number((0.9 * Number(wlRangeNew[0])).toFixed(2));
+    let dMinNew = Number((0.5 * Number(wlRangeNew[0])).toFixed(2));
     try {{
       if (f.keys().includes("instrument")) {{
         const wl = f.get("instrument/wavelength").value;
         if (wl && wl.length >= 2 && !(Math.abs(Number(wl[0]) - 2.0) < 1e-3 && Math.abs(Number(wl[1]) - 10.0) < 1e-3)) {{
           wlRangeNew = [Number(wl[0]), Number(wl[1])];
-          dMinNew = Number((0.9 * Number(wlRangeNew[0])).toFixed(2));
+          dMinNew = Number((0.5 * Number(wlRangeNew[0])).toFixed(2));
         }}
       }}
       if (f.keys().includes("scan_refinement")) {{
@@ -6419,7 +6470,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const bwl = srGrp.get("band_wavelength").value;
           if (bwl && bwl.length >= 2) {{
             wlRangeNew = [Number(bwl[0]), Number(bwl[1])];
-            dMinNew = Number((0.9 * Number(wlRangeNew[0])).toFixed(2));
+            dMinNew = Number((0.5 * Number(wlRangeNew[0])).toFixed(2));
           }}
         }}
         if (srGrp && srGrp.attrs && srGrp.attrs["d_min"]) {{
@@ -7800,7 +7851,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
       const inpDmin = document.getElementById("inp-dmin");
       if (inpDmin) {{
-        const autoD = Number((0.9 * (Number.isFinite(wlMinV) ? wlMinV : (state.lamMin || 2.0))).toFixed(2));
+        const autoD = Number((0.5 * (Number.isFinite(wlMinV) ? wlMinV : (state.lamMin || 2.0))).toFixed(2));
         inpDmin.value = autoD.toFixed(1);
         DATA.d_min = autoD;
       }}
@@ -8182,6 +8233,33 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               if (Array.isArray(aj.partial_overlay.peaks)) {{
                 PEAKS.length = 0;
                 aj.partial_overlay.peaks.forEach(p => PEAKS.push(p));
+              }}
+              if (Array.isArray(aj.partial_overlay.sample_peaks) && aj.partial_overlay.sample_peaks.length > 0) {{
+                SAMPLE_PEAKS.length = 0;
+                aj.partial_overlay.sample_peaks.forEach(p => SAMPLE_PEAKS.push(p));
+              }} else if (Array.isArray(aj.partial_overlay.peaks) && aj.partial_overlay.peaks.length > 0) {{
+                SAMPLE_PEAKS.length = 0;
+                aj.partial_overlay.peaks.forEach(p => SAMPLE_PEAKS.push(p));
+              }}
+              if (Array.isArray(aj.partial_overlay.panels) && aj.partial_overlay.panels.length > 0) {{
+                const pByBank = new Map(aj.partial_overlay.panels.map(p => [Number(p.bank), p]));
+                PANELS.forEach(curP => {{
+                  const updP = pByBank.get(Number(curP.bank));
+                  if (!updP) return;
+                  ["az_min", "az_max", "y_min", "y_max", "el_min", "el_max", "corners", "corners_sph", "outline", "outline_sph", "mesh", "mesh_sph"].forEach(k => {{
+                    if (updP[k] !== undefined) curP[k] = updP[k];
+                  }});
+                }});
+                recomputeProjectionBounds();
+              }}
+              if (Array.isArray(aj.partial_overlay.cell) && aj.partial_overlay.cell.length === 6) {{
+                DATA.cell = aj.partial_overlay.cell;
+              }}
+              if (Array.isArray(aj.partial_overlay.ub_matrix)) {{
+                DATA.ub_matrix = aj.partial_overlay.ub_matrix;
+              }}
+              if (Array.isArray(aj.partial_overlay.goniometer_R)) {{
+                DATA.goniometer_R = aj.partial_overlay.goniometer_R;
               }}
               if (Array.isArray(aj.partial_overlay.ladder_steps) && aj.partial_overlay.ladder_steps.length > 0) {{
                 LADDER.length = 0;

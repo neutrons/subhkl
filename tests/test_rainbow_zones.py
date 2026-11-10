@@ -1164,3 +1164,58 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         "Done.",
     ]
     assert "formatTerminalStdio" in html
+    assert "hasMergedCarelessData()" in html
+    assert "opt.disabled = !hasMerge" in html
+
+    # 6. Verify checkpoint(..., snapshot=...) writes a live Step 4 .stages.h5 loadable with include_panel_images=False
+    from types import SimpleNamespace
+    from subhkl.scan_refine import checkpoint
+
+    stage_out = tmp_path / "live_solve.h5"
+    args_ns = SimpleNamespace(
+        output=str(stage_out),
+        instrument="CG4D",
+        assign_wavelength=(2.8, 4.5),
+        wl_min=2.8,
+        wl_max=4.5,
+        space_group="I a -3 d",
+        n_zones=120,
+        d_min=1.2,
+    )
+    cg4d_banks = sorted(int(k) for k in beamlines["CG4D"])
+    dets_cg4d = [Detector(dict(beamlines["CG4D"][str(b)])) for b in cg4d_banks]
+    snap = {
+        "U": np.eye(3),
+        "B": np.eye(3) * 0.0838,
+        "cell": [11.93, 11.93, 11.93, 90.0, 90.0, 90.0],
+        "banks": cg4d_banks,
+        "centers": np.asarray([d.center + np.array([0.005, 0.0, 0.0]) for d in dets_cg4d]),
+        "uhats": np.asarray([d.uhat for d in dets_cg4d]),
+        "vhats": np.asarray([d.vhat for d in dets_cg4d]),
+        "widths": np.asarray([d.width for d in dets_cg4d]),
+        "heights": np.asarray([d.height for d in dets_cg4d]),
+        "R": np.eye(3)[None, :, :],
+        "n_zones": 120,
+    }
+    checkpoint(
+        args_ns,
+        "120-zones",
+        np.zeros(10),
+        [{"stage": "120-zones", "objective": -0.42, "iterations": 12, "success": True, "message": "OK"}],
+        snapshot=snap,
+    )
+    stages_h5 = tmp_path / "live_solve.stages.h5"
+    assert stages_h5.is_file()
+    p_live = build_rainbow_zone_payload(
+        replay_h5=stages_h5,
+        max_zone_index=2,
+        max_zones=30,
+        include_panels=True,
+        include_panel_images=False,
+        include_peaks=True,
+    )
+    assert len(p_live["zones"]) > 0
+    assert len(p_live["peaks"]) > 0
+    assert len(p_live["panels"]) > 0
+    assert all(p.get("texture_b64") is None for p in p_live["panels"])
+    assert p_live["ladder_steps"][3]["stage"] == "4. 120→400 Zone + Cell"

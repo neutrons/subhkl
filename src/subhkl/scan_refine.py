@@ -30,6 +30,8 @@ MODES = frozenset(
     ]
 )
 
+DEFAULT_MODES = MODES - {"panels"}
+
 
 def _frame_offsets(f, n_frames):
     if "file_offsets" not in f:
@@ -198,7 +200,7 @@ def run_scan_refinement(
             raise ValueError("output cannot overwrite an input")
     if pixel_polish and not finder:
         raise ValueError("pixel polish needs finder observations; omit it for counts")
-    chosen = MODES if modes is None else frozenset(modes)
+    chosen = DEFAULT_MODES if modes is None else frozenset(modes)
     if chosen - MODES:
         raise ValueError(f"unknown band refinement modes: {sorted(chosen - MODES)}")
     if (
@@ -489,14 +491,86 @@ def load_observations(args, *, return_kinematics=False):
     return result
 
 
-def checkpoint(args, name, parameters, diagnostics):
+def checkpoint(args, name, parameters, diagnostics, snapshot=None):
+    import shutil
+
     path = Path(args.output).with_suffix(".stages.h5")
-    with h5py.File(path, "a") as f:
-        if name in f:
-            del f[name]
-        group = f.create_group(name)
-        group["parameters"] = parameters
-        group.attrs["diagnostics"] = json.dumps(diagnostics[-1])
+    tmp_path = path.with_suffix(".stages.tmp.h5")
+    try:
+        if path.is_file():
+            shutil.copy2(path, tmp_path)
+        with h5py.File(tmp_path, "a") as f:
+            if name in f:
+                del f[name]
+            group = f.create_group(name)
+            group["parameters"] = parameters
+            group.attrs["diagnostics"] = json.dumps(diagnostics[-1])
+
+            if snapshot is not None:
+                def _put(key, val):
+                    if key in f:
+                        del f[key]
+                    f[key] = val
+
+                f.attrs["instrument"] = str(args.instrument)
+                _put("instrument/name", str(args.instrument))
+                _put(
+                    "instrument/wavelength",
+                    np.asarray(args.assign_wavelength, dtype=float),
+                )
+                cell_vals = [float(v) for v in snapshot["cell"][:6]]
+                _put("sample/cell", np.asarray(cell_vals, dtype=float))
+                for k_c, v_c in zip(
+                    ("a", "b", "c", "alpha", "beta", "gamma"), cell_vals
+                ):
+                    _put(f"sample/{k_c}", float(v_c))
+                _put("sample/space_group", str(args.space_group))
+                _put("sample/U", np.asarray(snapshot["U"], dtype=float))
+                _put("sample/B", np.asarray(snapshot["B"], dtype=float))
+                if snapshot.get("R") is not None:
+                    _put("goniometer/R", np.asarray(snapshot["R"], dtype=float))
+                for i_b, b_id in enumerate(snapshot.get("banks", [])):
+                    for k_d, v_d in (
+                        ("center", snapshot["centers"][i_b]),
+                        ("uhat", snapshot["uhats"][i_b]),
+                        ("vhat", snapshot["vhats"][i_b]),
+                        ("width", float(snapshot["widths"][i_b])),
+                        ("height", float(snapshot["heights"][i_b])),
+                    ):
+                        _put(f"detector_calibration/bank_{b_id}/{k_d}", v_d)
+                if "scan_refinement" in f:
+                    del f["scan_refinement"]
+                rep = f.create_group("scan_refinement")
+                rep["parameters"] = np.asarray(parameters, dtype=float)
+                rep["U"] = np.asarray(snapshot["U"], dtype=float)
+                rep["B"] = np.asarray(snapshot["B"], dtype=float)
+                rep["band_wavelength"] = np.asarray(
+                    [args.wl_min, args.wl_max], dtype=float
+                )
+                rep.attrs["stages"] = json.dumps(diagnostics)
+                rep.attrs["status"] = "running"
+                rep.attrs["n_zones"] = int(
+                    snapshot.get("n_zones", getattr(args, "n_zones", 120))
+                )
+                rep.attrs["d_min"] = float(args.d_min)
+                if (
+                    hasattr(args, "blind_search")
+                    and "blind_search" not in f
+                    and os.path.isfile(str(args.blind_search))
+                ):
+                    try:
+                        with h5py.File(args.blind_search, "r") as sf:
+                            if "search" in sf:
+                                sf.copy("search", f, name="blind_search")
+                    except Exception:
+                        pass
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 
 def _decompose_R_to_angles(axes, ang_nom, R_target):

@@ -748,6 +748,7 @@ def refine_scan(args):
     from subhkl.scan_refine import load_observations, write_result, checkpoint
 
     diagnostics = []
+    _snapshot_builder = None
 
     def record(name, result):
         if not np.isfinite(result.fun) or not np.isfinite(result.x).all():
@@ -763,7 +764,13 @@ def refine_scan(args):
                 message=str(result.message),
             )
         )
-        checkpoint(args, name, result.x, diagnostics)
+        snap = None
+        if callable(_snapshot_builder):
+            try:
+                snap = _snapshot_builder(name, result.x)
+            except Exception:
+                snap = None
+        checkpoint(args, name, result.x, diagnostics, snapshot=snap)
 
     with h5py.File(args.bootstrap, "r") as f:
         U0 = np.array(f["sample/U"][()], dtype=np.float64)
@@ -957,6 +964,99 @@ def refine_scan(args):
         du = p[18 + n_runs : 18 + n_runs + n_banks]
         dv = p[18 + n_runs + n_banks : 18 + n_runs + 2 * n_banks]
         return rv, s_rad, s_ax, s_area, rg, T, s_samp, da, db, dbeta, dom, du, dv
+
+    def _build_stage_snapshot(stage_name, p_vec):
+        rv_s, sr_s, sa_s, sar_s, rg_s, T_s, _ss_s, da_s, db_s, dbe_s, dom_s, du_s, dv_s = unpack(
+            jnp.asarray(p_vec, dtype=jnp.float64)
+        )
+        Rg_s = np.asarray(rodrigues_jax(rg_s))
+        U_s = np.asarray(rodrigues_jax(rv_s) @ Uj)
+        a_s, b_s, c_s, al_sr, be_sr, ga_sr = [
+            float(v) for v in _apply_cell_jax(cell0, symmetry_kind, da_s, db_s, dbe_s)
+        ]
+        al_sd, be_sd, ga_sd = np.degrees([al_sr, be_sr, ga_sr]).tolist()
+        B_s = np.asarray(build_B_jax(a_s, b_s, c_s, al_sr, be_sr, ga_sr))
+        C_sc_s = np.stack(
+            [
+                C_bank[:, 0] * (1.0 + float(sr_s)),
+                C_bank[:, 1] * (1.0 + float(sa_s)),
+                C_bank[:, 2] * (1.0 + float(sr_s)),
+            ],
+            axis=-1,
+        )
+        W_s = W_bank * (1.0 + float(sar_s))
+        H_s = H_bank * (1.0 + float(sar_s))
+        uh_s = uhat_bank @ Rg_s.T
+        vh_s = vhat_bank @ Rg_s.T
+        C_mid_s = (
+            C_sc_s
+            + np.asarray(du_s)[:, None] * uhat_bank
+            + np.asarray(dv_s)[:, None] * vhat_bank
+        ) @ Rg_s.T + np.asarray(T_s)[None, :]
+        C_fin_s = (
+            C_mid_s - 0.5 * W_s[:, None] * uh_s - 0.5 * H_s[:, None] * vh_s
+        )
+        R_runs_ref = getattr(args, "R_runs_refined", None)
+        if R_runs_ref is not None:
+            R_list_s = [np.asarray(R_runs_ref[r], dtype=float) for r in range(n_runs)]
+        else:
+            R_base_s = (
+                ewald_ctx["R_runs_band_base"]
+                if (ewald_ctx is not None and "R_runs_band_base" in ewald_ctx)
+                else R_runs_nom
+            )
+            R_list_s = []
+            for r in range(n_runs):
+                idx_r = np.flatnonzero(runs == r)
+                if len(idx_r):
+                    dR_r = np.asarray(
+                        rodrigues_jax(
+                            float(dom_s[r]) * jnp.asarray(scan_axes_obs[idx_r[0]])
+                        )
+                    )
+                    R_list_s.append(dR_r @ R_base_s[r])
+                else:
+                    R_list_s.append(np.asarray(R_base_s[r], dtype=float))
+        nz_stage = (
+            60
+            if stage_name in ("global", "ewald-pre")
+            else (120 if stage_name == "120-zones" else int(args.n_zones))
+        )
+        return {
+            "U": U_s,
+            "B": B_s,
+            "cell": [a_s, b_s, c_s, al_sd, be_sd, ga_sd],
+            "banks": bank_ids,
+            "centers": C_fin_s,
+            "uhats": uh_s,
+            "vhats": vh_s,
+            "widths": W_s,
+            "heights": H_s,
+            "R": np.stack(R_list_s, axis=0),
+            "n_zones": nz_stage,
+        }
+
+    _snapshot_builder = _build_stage_snapshot
+    if ewald_ctx is not None:
+        try:
+            p_pre = np.zeros(18 + n_runs + 2 * n_banks, dtype=np.float64)
+            checkpoint(
+                args,
+                "ewald-pre",
+                p_pre,
+                [
+                    dict(
+                        stage="ewald-pre",
+                        objective=float(-ewald_ctx.get("ew_nom", 0.0)),
+                        iterations=1,
+                        success=True,
+                        message="EWALD_PRE_POLISH",
+                    )
+                ],
+                snapshot=_build_stage_snapshot("ewald-pre", p_pre),
+            )
+        except Exception:
+            pass
 
     def loss_band(p, n_z=400, reg_panel=200.0, use_r29=False, inv_len_weight=False):
         rv, s_rad, s_ax, s_area, rg, T, s_samp, da, db, dbeta, dom, du, dv = unpack(p)

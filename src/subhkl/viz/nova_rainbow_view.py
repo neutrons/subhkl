@@ -263,20 +263,17 @@ class NovaGalaxyPipelineRunner:
                     space_group=str(
                         sp.get("space_group") or payload.get("space_group") or "P 1"
                     ),
-                    cell=list(
-                        sp.get("cell")
-                        or payload.get("cell")
-                        or [10, 10, 10, 90, 90, 90]
-                    ),
+                    cell=None,
                     wavelength_range=tuple(
                         sp.get("wavelength_range")
                         or payload.get("wavelength_range")
                         or (2.0, 4.5)
                     ),
-                    max_zone_index=1,
-                    max_zones=13,
-                    include_panels=False,
-                    include_peaks=False,
+                    max_zone_index=3,
+                    max_zones=60,
+                    include_panels=True,
+                    include_panel_images=False,
+                    include_peaks=True,
                     n_arc=720,
                     frame_index=(
                         frame_index
@@ -286,6 +283,41 @@ class NovaGalaxyPipelineRunner:
                 )
                 if p_blind.get("zones"):
                     payload["zones"] = p_blind["zones"]
+                    if p_blind.get("peaks"):
+                        payload["peaks"] = p_blind["peaks"]
+                    if p_blind.get("sample_peaks"):
+                        payload["sample_peaks"] = p_blind["sample_peaks"]
+                    if p_blind.get("panels") and payload.get("panels"):
+                        p_by_b = {
+                            int(p["bank"]): p
+                            for p in p_blind["panels"]
+                            if "bank" in p
+                        }
+                        for cur_p in payload["panels"]:
+                            upd_p = p_by_b.get(int(cur_p.get("bank", -1)))
+                            if upd_p:
+                                for k_g in (
+                                    "az_min",
+                                    "az_max",
+                                    "y_min",
+                                    "y_max",
+                                    "el_min",
+                                    "el_max",
+                                    "corners",
+                                    "corners_sph",
+                                    "outline",
+                                    "outline_sph",
+                                    "mesh",
+                                    "mesh_sph",
+                                ):
+                                    if k_g in upd_p:
+                                        cur_p[k_g] = upd_p[k_g]
+                    if p_blind.get("cell"):
+                        payload["cell"] = p_blind["cell"]
+                    if p_blind.get("ub_matrix"):
+                        payload["ub_matrix"] = p_blind["ub_matrix"]
+                    if p_blind.get("goniometer_R"):
+                        payload["goniometer_R"] = p_blind["goniometer_R"]
                     if p_blind.get("ladder_steps"):
                         payload["ladder_steps"] = p_blind["ladder_steps"]
                     payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
@@ -295,6 +327,10 @@ class NovaGalaxyPipelineRunner:
         ov = aj.get("partial_overlay")
         if isinstance(ov, dict) and ov.get("zones") and not payload.get("zones"):
             payload["zones"] = ov["zones"]
+            if ov.get("peaks"):
+                payload["peaks"] = ov["peaks"]
+            if ov.get("sample_peaks"):
+                payload["sample_peaks"] = ov["sample_peaks"]
             if ov.get("ladder_steps"):
                 payload["ladder_steps"] = ov["ladder_steps"]
             payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
@@ -1439,25 +1475,18 @@ class NovaGalaxyPipelineRunner:
                     "wavelengthMin": float(wl[0]),
                     "wavelengthMax": float(wl[1]),
                     "refinement": str(params.get("objective", "band")),
-                    "dMin": float(params.get("d_min") or round(0.9 * float(wl[0]), 2)),
+                    "dMin": float(params.get("d_min") or round(0.5 * float(wl[0]), 2)),
                 }
             elif stage_id == "integrate":
                 primary_tool = "imaginex_subhkl_predict"
                 scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
                 idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
-                max_edge = max(float(x) for x in raw_cell[:3])
-                min_edge = min(float(x) for x in raw_cell[:3])
-                d_min_req = float(params.get("d_min") or round(0.9 * float(wl[0]), 2))
-                d_min_int = (
-                    min(d_min_req, max(0.75, min_edge * 0.085))
-                    if max_edge < 35.0
-                    else d_min_req
-                )
+                d_min_req = float(params.get("d_min") or round(0.5 * float(wl[0]), 2))
                 tool_inputs = {
                     "scan": {"src": "hda", "id": scan_id},
                     "indexer": {"src": "hda", "id": idx_id},
                     "instrument": inst,
-                    "dMin": round(d_min_int, 3),
+                    "dMin": round(d_min_req, 3),
                     "wavelengthMin": float(wl[0]),
                     "wavelengthMax": float(wl[1]),
                     "space": sg,
@@ -3070,6 +3099,12 @@ class NovaGalaxyPipelineRunner:
                 merged_path,
             ]
         elif stage_id == "solve" and os.path.isfile(merged_path):
+            refine_modes_str = str(
+                params.get(
+                    "refine_modes",
+                    "cylindrical,axial_stretch,area,global_rot,global_trans,sample,cell,per_run,per_run_trans",
+                )
+            )
             inner_cmd = [
                 "python",
                 "-u",
@@ -3089,24 +3124,19 @@ class NovaGalaxyPipelineRunner:
                 "--wavelength-max",
                 str(wl[1]),
                 "--d-min",
-                str(params.get("d_min") or round(0.9 * float(wl[0]), 2)),
+                str(params.get("d_min") or round(0.5 * float(wl[0]), 2)),
                 "--refinement",
                 str(params.get("objective", "band")),
             ]
+            if str(params.get("objective", "band")) == "band" and refine_modes_str:
+                inner_cmd.extend(["--refine-modes", refine_modes_str])
         elif (
             stage_id == "integrate"
             and os.path.isfile(merged_path)
             and os.path.isfile(solve_path)
         ):
-            max_edge = max(float(x) for x in raw_cell[:3])
-            min_edge = min(float(x) for x in raw_cell[:3])
-            d_min_req = float(params.get("d_min") or round(0.9 * float(wl[0]), 2))
-            d_min_int = (
-                min(d_min_req, max(0.75, min_edge * 0.085))
-                if max_edge < 35.0
-                else d_min_req
-            )
-            d_min_val = str(round(d_min_int, 3))
+            d_min_req = float(params.get("d_min") or round(0.5 * float(wl[0]), 2))
+            d_min_val = str(round(d_min_req, 3))
             pred_cmd = [
                 "python",
                 "-u",
@@ -3473,8 +3503,9 @@ class NovaGalaxyPipelineRunner:
                 )
                 assert proc.stdout is not None
                 blind_src = out_h5[:-3] + ".blind.h5"
+                stages_src = out_h5[:-3] + ".stages.h5"
                 blind_dst = solve_dest[:-3] + ".blind.h5"
-                last_blind_mtime = 0.0
+                last_live_key: tuple[str, int] = ("", 0)
                 partial_seq = 0
                 initial_prefix = job_record.get("stdout", "")
                 if initial_prefix and not initial_prefix.endswith("\n"):
@@ -3499,7 +3530,6 @@ class NovaGalaxyPipelineRunner:
                     job_record["stdout"] = (initial_prefix + formatted_stream)[-24000:]
                     low = chunk_str.lower()
                     if stage_id == "solve":
-                        trigger_blind_sync = False
                         if (
                             "blind band search" in low
                             or "band table" in low
@@ -3509,39 +3539,48 @@ class NovaGalaxyPipelineRunner:
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 1
                             )
-                            trigger_blind_sync = True
-                        elif "rung 30 zones" in low or "rung 60 zones" in low:
+                        if "rung 30 zones" in low or "rung 60 zones" in low:
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 2
                             )
-                            trigger_blind_sync = True
-                        elif (
+                        if (
                             "rung 145 zones" in low
                             or "joint band refinement" in low
                             or "candidate " in low
                             or "full-data scores" in low
+                            or "ewald pre-polish" in low
                             or "global" in low
                             or "60-zone" in low
-                            or "stage 0" in low
+                            or "[stage 0" in low
                             or "120" in low
                             or "cell" in low
-                            or "stage 1" in low
-                            or "stage 3" in low
+                            or "[stage 1" in low
+                            or "[stage 2" in low
+                            or "[stage 3" in low
+                            or "[stage 4" in low
                         ):
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 3
                             )
-                            trigger_blind_sync = True
-                        if (
-                            trigger_blind_sync
-                            and os.path.isfile(blind_src)
-                            and os.path.getsize(blind_src) > 0
-                        ):
+                        if "band refinement: converged" in low:
+                            job_record["ladder_rung_idx"] = max(
+                                job_record["ladder_rung_idx"], 4
+                            )
+                        active_live_src = None
+                        if os.path.isfile(stages_src) and os.path.getsize(stages_src) > 0:
+                            active_live_src = stages_src
+                            job_record["ladder_rung_idx"] = max(
+                                job_record["ladder_rung_idx"], 3
+                            )
+                        elif os.path.isfile(blind_src) and os.path.getsize(blind_src) > 0:
+                            active_live_src = blind_src
+                        if active_live_src is not None:
                             try:
-                                cur_mtime = os.path.getmtime(blind_src)
-                                if cur_mtime >= last_blind_mtime:
-                                    last_blind_mtime = cur_mtime
-                                    shutil.copy2(blind_src, blind_dst)
+                                cur_mtime_ns = int(os.stat(active_live_src).st_mtime_ns)
+                                cur_key = (active_live_src, cur_mtime_ns)
+                                if cur_key != last_live_key:
+                                    last_live_key = cur_key
+                                    shutil.copy2(active_live_src, blind_dst)
                                     job_record["partial_h5_path"] = blind_dst
                                     from subhkl.viz.rainbow_zones import (
                                         build_rainbow_zone_payload,
@@ -3552,15 +3591,16 @@ class NovaGalaxyPipelineRunner:
                                         images_h5=merged_path,
                                         instrument=str(inst),
                                         space_group=str(sg),
-                                        cell=[float(x) for x in raw_cell[:6]],
+                                        cell=None,
                                         wavelength_range=(
                                             float(wl[0]),
                                             float(wl[1]),
                                         ),
-                                        max_zone_index=1,
-                                        max_zones=13,
-                                        include_panels=False,
-                                        include_peaks=False,
+                                        max_zone_index=3,
+                                        max_zones=60,
+                                        include_panels=True,
+                                        include_panel_images=False,
+                                        include_peaks=True,
                                         n_arc=720,
                                         frame_index=self.current_frame_index,
                                     )
@@ -3569,7 +3609,14 @@ class NovaGalaxyPipelineRunner:
                                         job_record["partial_overlay"] = {
                                             "seq": partial_seq,
                                             "zones": p_blind.get("zones", []),
-                                            "peaks": [],
+                                            "peaks": p_blind.get("peaks", []),
+                                            "sample_peaks": p_blind.get(
+                                                "sample_peaks", []
+                                            ),
+                                            "panels": p_blind.get("panels", []),
+                                            "cell": p_blind.get("cell"),
+                                            "ub_matrix": p_blind.get("ub_matrix"),
+                                            "goniometer_R": p_blind.get("goniometer_R"),
                                             "ladder_steps": p_blind.get(
                                                 "ladder_steps", []
                                             ),
@@ -3651,26 +3698,30 @@ class NovaGalaxyPipelineRunner:
                             )
 
                         if self.is_connected and os.path.isfile(final_h5):
-                            try:
-                                store = self.get_datastore("IMAGINE-X SubHKL")
-                                up_id = self._ensure_galaxy_h5_dataset(
-                                    store,
-                                    final_h5,
-                                    job_record,
-                                    force_upload=True,
-                                    file_ext="h5",
-                                )
-                                job_record["outputs"] = [
-                                    {
-                                        "id": up_id,
-                                        "name": "solve.h5",
-                                        "extension": "h5",
-                                    }
-                                ]
-                            except Exception as up_exc:
-                                job_record["stdout"] += (
-                                    f"[nova -> galaxy] Warning uploading solve.h5: {self._clean_err_msg(up_exc)}\n"
-                                )
+                            def _bg_upload_solve(_f_h5: str = final_h5) -> None:
+                                try:
+                                    store = self.get_datastore("IMAGINE-X SubHKL")
+                                    bg_rec: dict[str, Any] = {"stdout": ""}
+                                    up_id = self._ensure_galaxy_h5_dataset(
+                                        store,
+                                        _f_h5,
+                                        bg_rec,
+                                        force_upload=True,
+                                        file_ext="h5",
+                                    )
+                                    job_record["outputs"] = [
+                                        {
+                                            "id": up_id,
+                                            "name": "solve.h5",
+                                            "extension": "h5",
+                                        }
+                                    ]
+                                except Exception:
+                                    pass
+
+                            threading.Thread(
+                                target=_bg_upload_solve, daemon=True
+                            ).start()
                     elif stage_id == "integrate" and os.path.isfile(out_h5):
                         try:
                             if os.path.isfile(pred_tmp_h5):
@@ -3694,60 +3745,68 @@ class NovaGalaxyPipelineRunner:
                             )
 
                         if self.is_connected:
-                            try:
-                                store = self.get_datastore("IMAGINE-X SubHKL")
-                                outs_up = []
-                                if os.path.isfile(final_h5):
-                                    int_id = self._ensure_galaxy_h5_dataset(
-                                        store,
-                                        final_h5,
-                                        job_record,
-                                        force_upload=True,
-                                        file_ext="h5",
-                                    )
-                                    outs_up.append(
-                                        {
-                                            "id": int_id,
-                                            "name": "integrated.h5",
-                                            "extension": "h5",
-                                        }
-                                    )
-                                if os.path.isfile(pred_dest):
-                                    pred_id = self._ensure_galaxy_h5_dataset(
-                                        store,
-                                        pred_dest,
-                                        job_record,
-                                        force_upload=True,
-                                        file_ext="h5",
-                                    )
-                                    outs_up.append(
-                                        {
-                                            "id": pred_id,
-                                            "name": "predictor.h5",
-                                            "extension": "h5",
-                                        }
-                                    )
-                                if os.path.isfile(mtz_dest):
-                                    mtz_id = self._ensure_galaxy_h5_dataset(
-                                        store,
-                                        mtz_dest,
-                                        job_record,
-                                        force_upload=True,
-                                        file_ext="binary",
-                                    )
-                                    outs_up.append(
-                                        {
-                                            "id": mtz_id,
-                                            "name": "reflections.mtz",
-                                            "extension": "binary",
-                                        }
-                                    )
-                                if outs_up:
-                                    job_record["outputs"] = outs_up
-                            except Exception as up_exc:
-                                job_record["stdout"] += (
-                                    f"[nova -> galaxy] Warning uploading integrated outputs: {self._clean_err_msg(up_exc)}\n"
-                                )
+                            def _bg_upload_integrate(
+                                _f_h5: str = final_h5,
+                                _p_h5: str = pred_dest,
+                                _m_mtz: str = mtz_dest,
+                            ) -> None:
+                                try:
+                                    store = self.get_datastore("IMAGINE-X SubHKL")
+                                    bg_rec: dict[str, Any] = {"stdout": ""}
+                                    outs_up = []
+                                    if os.path.isfile(_f_h5):
+                                        int_id = self._ensure_galaxy_h5_dataset(
+                                            store,
+                                            _f_h5,
+                                            bg_rec,
+                                            force_upload=True,
+                                            file_ext="h5",
+                                        )
+                                        outs_up.append(
+                                            {
+                                                "id": int_id,
+                                                "name": "integrated.h5",
+                                                "extension": "h5",
+                                            }
+                                        )
+                                    if os.path.isfile(_p_h5):
+                                        pred_id = self._ensure_galaxy_h5_dataset(
+                                            store,
+                                            _p_h5,
+                                            bg_rec,
+                                            force_upload=True,
+                                            file_ext="h5",
+                                        )
+                                        outs_up.append(
+                                            {
+                                                "id": pred_id,
+                                                "name": "predictor.h5",
+                                                "extension": "h5",
+                                            }
+                                        )
+                                    if os.path.isfile(_m_mtz):
+                                        mtz_id = self._ensure_galaxy_h5_dataset(
+                                            store,
+                                            _m_mtz,
+                                            bg_rec,
+                                            force_upload=True,
+                                            file_ext="binary",
+                                        )
+                                        outs_up.append(
+                                            {
+                                                "id": mtz_id,
+                                                "name": "reflections.mtz",
+                                                "extension": "binary",
+                                            }
+                                        )
+                                    if outs_up:
+                                        job_record["outputs"] = outs_up
+                                except Exception:
+                                    pass
+
+                            threading.Thread(
+                                target=_bg_upload_integrate, daemon=True
+                            ).start()
                     elif stage_id == "merge":
                         target_int = (
                             integrated_dest
@@ -3765,37 +3824,41 @@ class NovaGalaxyPipelineRunner:
                                 f"\n[careless] Warning stamping merge results into HDF5: {merge_exc}\n"
                             )
                         if self.is_connected:
-                            try:
-                                store = self.get_datastore("IMAGINE-X SubHKL")
-                                outs_up = []
-                                for fn, ext in (
-                                    ("merged.mtz", "binary"),
-                                    ("predictions.mtz", "binary"),
-                                    ("xval.mtz", "binary"),
-                                    ("careless_metrics.json", "json"),
-                                ):
-                                    fp = os.path.join(work_dir, fn)
-                                    if os.path.isfile(fp):
-                                        did = self._ensure_galaxy_h5_dataset(
-                                            store,
-                                            fp,
-                                            job_record,
-                                            force_upload=True,
-                                            file_ext=ext,
-                                        )
-                                        outs_up.append(
-                                            {
-                                                "id": did,
-                                                "name": fn,
-                                                "extension": ext,
-                                            }
-                                        )
-                                if outs_up:
-                                    job_record["outputs"] = outs_up
-                            except Exception as up_exc:
-                                job_record["stdout"] += (
-                                    f"[nova -> galaxy] Warning uploading Careless outputs: {self._clean_err_msg(up_exc)}\n"
-                                )
+                            def _bg_upload_merge(_wdir: str = work_dir) -> None:
+                                try:
+                                    store = self.get_datastore("IMAGINE-X SubHKL")
+                                    bg_rec: dict[str, Any] = {"stdout": ""}
+                                    outs_up = []
+                                    for fn, ext in (
+                                        ("merged.mtz", "binary"),
+                                        ("predictions.mtz", "binary"),
+                                        ("xval.mtz", "binary"),
+                                        ("careless_metrics.json", "json"),
+                                    ):
+                                        fp = os.path.join(_wdir, fn)
+                                        if os.path.isfile(fp):
+                                            did = self._ensure_galaxy_h5_dataset(
+                                                store,
+                                                fp,
+                                                bg_rec,
+                                                force_upload=True,
+                                                file_ext=ext,
+                                            )
+                                            outs_up.append(
+                                                {
+                                                    "id": did,
+                                                    "name": fn,
+                                                    "extension": ext,
+                                                }
+                                            )
+                                    if outs_up:
+                                        job_record["outputs"] = outs_up
+                                except Exception:
+                                    pass
+
+                            threading.Thread(
+                                target=_bg_upload_merge, daemon=True
+                            ).start()
 
                     if os.path.isfile(final_h5):
                         job_record["output_h5_path"] = final_h5
