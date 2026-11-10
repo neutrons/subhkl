@@ -35,7 +35,7 @@ COPY --from=build /build/dist /app/dist
 
 RUN python -m pip install jax[cuda13] evosax
 
-# Let pip naturally find and install whatever version wheel was built
-RUN python -m pip install /app/dist/*.whl \
+# Let pip naturally find and install whatever version wheel was built (including NOVA Trame GUI extras)
+RUN WHL=$(ls /app/dist/*.whl) && python -m pip install "${WHL}[nova]" \
     && rm -rf /app/dist
 

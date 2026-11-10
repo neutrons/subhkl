@@ -3181,13 +3181,17 @@ def render_rainbow_html(
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
     init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
     init_dmin = float(payload.get("d_min") or round(0.5 * init_wl_min, 2))
+    ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
+    base_tag_html = (
+        f'<base href="{ep_env}/" />\n' if ep_env and ep_env.startswith("/") else ""
+    )
 
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>{title}</title>
+{base_tag_html}<title>{title}</title>
 <script src="https://cdn.jsdelivr.net/npm/h5wasm@0.7.8/dist/iife/h5wasm.js" async></script>
 <style>
   :root {{

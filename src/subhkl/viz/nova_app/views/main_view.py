@@ -430,6 +430,56 @@ class MainApp:
             ]
         )
 
+        orig_handle = app._handle
+
+        async def _ep_handle(request: web.Request) -> web.StreamResponse:
+            ep_path = os.environ.get("EP_PATH", "").strip().rstrip("/")
+            req_path = request.rel_url.path
+            served_index_under_ep = False
+            if ep_path and ep_path.startswith("/"):
+                ep_parent = os.path.dirname(ep_path)
+                if req_path == ep_path or req_path == ep_path + "/":
+                    request = request.clone(
+                        rel_url=request.rel_url.with_path("/index.html")
+                    )
+                    served_index_under_ep = True
+                elif req_path.startswith(ep_path + "/"):
+                    sub_path = req_path[len(ep_path) :] or "/"
+                    if sub_path == "/":
+                        sub_path = "/index.html"
+                        served_index_under_ep = True
+                    elif sub_path == "/index.html":
+                        served_index_under_ep = True
+                    request = request.clone(rel_url=request.rel_url.with_path(sub_path))
+                elif ep_parent not in ("", "/") and req_path.startswith(
+                    ep_parent + "/"
+                ):
+                    sub_path = req_path[len(ep_parent) :] or "/"
+                    request = request.clone(rel_url=request.rel_url.with_path(sub_path))
+            elif req_path == "/":
+                request = request.clone(
+                    rel_url=request.rel_url.with_path("/index.html")
+                )
+
+            resp = await orig_handle(request)
+            if served_index_under_ep and ep_path and isinstance(resp, web.FileResponse):
+                try:
+                    idx_fp = getattr(resp, "_path", None)
+                    if idx_fp and os.path.isfile(idx_fp):
+                        with open(idx_fp, encoding="utf-8") as f_in:
+                            html_txt = f_in.read()
+                        html_txt = html_txt.replace(
+                            '<base href="." />',
+                            f'<base href="{ep_path}/" />',
+                            1,
+                        )
+                        return web.Response(text=html_txt, content_type="text/html")
+                except Exception:
+                    pass
+            return resp
+
+        app._handle = _ep_handle
+
     def create_vm(self) -> None:
         binding = TrameBinding(self.server.state)
         self.local_view_models = create_viewmodels(

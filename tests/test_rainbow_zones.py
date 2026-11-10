@@ -1255,3 +1255,18 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert runner.active_job["partial_overlay"]["seq"] == 3
     assert "state.selectedFrameIndex = clamped" in html
     assert "api/pipeline/status?frame=${curFrame}" in html
+
+    import os
+
+    old_ep = os.environ.get("EP_PATH")
+    try:
+        os.environ["EP_PATH"] = "/interactivetool/ep/test/subhkl"
+        out_ep_html = tmp_path / "ep_test.html"
+        export_rainbow_widget(p_live, output_html=out_ep_html)
+        html_ep = out_ep_html.read_text()
+        assert '<base href="/interactivetool/ep/test/subhkl/" />' in html_ep
+    finally:
+        if old_ep is None:
+            os.environ.pop("EP_PATH", None)
+        else:
+            os.environ["EP_PATH"] = old_ep
