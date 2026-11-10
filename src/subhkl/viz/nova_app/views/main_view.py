@@ -206,7 +206,6 @@ class MainApp:
             params["wavelength_range"] = [wl_min, wl_max]
             params.setdefault("d_min", data.d_min)
             params.setdefault("n_zones", data.n_zones)
-            params.setdefault("steps", data.steps)
             params.setdefault("peaks_file", data.peaks_file)
             params.setdefault("images_file", data.images_file)
 

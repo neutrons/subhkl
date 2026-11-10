@@ -139,13 +139,6 @@ class SubhklConfig(BaseModel):
         title="Zones",
         description="Number of zone axes sampled during finder-less solve",
     )
-    steps: int = Field(
-        default=250,
-        ge=10,
-        le=5000,
-        title="Steps",
-        description="Number of refinement steps per stage",
-    )
     max_zone_index: int = Field(
         default=3,
         ge=1,
@@ -297,7 +290,6 @@ class SubhklGalaxyModel:
                 "wavelength_max": self.data.wavelength_max,
                 "d_min": self.data.d_min,
                 "n_zones": self.data.n_zones,
-                "steps": self.data.steps,
             }
         return {
             "instrument": self.data.instrument.value,

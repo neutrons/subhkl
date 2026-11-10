@@ -3977,7 +3977,6 @@ def render_rainbow_html(
       <span>β <input id="inp-beta" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>γ <input id="inp-gamma" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>d_min <input id="inp-dmin" type="number" step="0.1" value="{init_dmin:.1f}" style="width:44px;" /></span>
-      <span>steps <input id="inp-steps" type="number" step="10" value="120" style="width:48px;" /></span>
       <span title="Panel border rejection width (fraction of image size)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="0.03" style="width:52px;" /></span>
     </div>
     <div id="files-drawer" class="params-drawer"></div>
@@ -4444,7 +4443,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       beta: getNum("inp-beta", cell[4]),
       gamma: getNum("inp-gamma", cell[5]),
       d_min: getNum("inp-dmin", Number(((state.lamMin || 2.0) * 0.5).toFixed(2))),
-      steps: Math.round(getNum("inp-steps", 120)),
       rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", 0.03))),
       wavelength_min: state.lamMin,
       wavelength_max: state.lamMax,
@@ -8356,7 +8354,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             objective: "band",
             d_min: params.d_min,
             n_zones: 120,
-            steps: params.steps,
           }};
         }} else if (stageId === "integrate") {{
           if (!mergedDs || !solveDs) throw new Error("Need merged.h5 and solve.h5 in Galaxy History");
