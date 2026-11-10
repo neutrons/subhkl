@@ -3,6 +3,12 @@ import os
 import sys
 from typing import Annotated
 
+if any(
+    cmd in sys.argv
+    for cmd in ("rainbow-visualize", "reduce", "reduce-batch", "merge-images")
+):
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+
 import h5py
 import typer
 
@@ -19,6 +25,7 @@ from subhkl.commands import (
     run_peak_predictor,
     run_rbf_integrator,
     run_reduce,
+    run_reduce_batch,
     run_static_mask,
     run_sum_images,
 )
@@ -56,7 +63,13 @@ def solve(
     d_min: Annotated[
         float, typer.Option(min=0.0001, help="Reflection resolution in Angstrom")
     ] = 3.2,
-    binning: Annotated[int, typer.Option(min=1, help="Sum count pixels into bins")] = 8,
+    binning: Annotated[
+        int | None,
+        typer.Option(
+            min=1,
+            help="Sum count pixels into bins (default: 8 for poisson, 16 for band)",
+        ),
+    ] = None,
     proposal_binning: Annotated[
         int,
         typer.Option(min=1, help="Spatial binning for global orientation proposals"),
@@ -227,7 +240,7 @@ def solve(
                 d_min=d_min,
                 min_deviance=min_deviance,
                 pixel_polish=pixel_polish,
-                binning=binning,
+                binning=16 if binning is None else binning,
                 maxiter=band_maxiter,
                 static_mask_file=static_mask_file,
                 search_samples=search_samples,
@@ -251,7 +264,7 @@ def solve(
             wavelength_min=wavelength_min,
             wavelength_max=wavelength_max,
             d_min=d_min,
-            binning=binning,
+            binning=8 if binning is None else binning,
             proposal_binning=proposal_binning,
             n_candidates=n_candidates,
             penalty=penalty,
@@ -1014,7 +1027,7 @@ def integrator(
     ] = None,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
-    ] = 0.0,
+    ] = 0.03,
     show_progress: Annotated[bool, typer.Option("--show-progress")] = True,
     create_visualizations: bool = False,
     chunk_size: int = 256,
@@ -1215,10 +1228,54 @@ def reduce(
 
 
 @app.command()
+def reduce_batch(
+    nexus_filenames: Annotated[
+        list[str],
+        typer.Argument(
+            help="List of input NeXus (.nxs.h5) files to reduce in parallel"
+        ),
+    ],
+    output_dir: Annotated[
+        str,
+        typer.Option("--output-dir", "-o", help="Directory for *.reduce.h5 outputs"),
+    ] = "out",
+    instrument: Annotated[
+        str, typer.Option("--instrument", "-i", help="Instrument name")
+    ] = "CG4D",
+    wavelength_min: Annotated[
+        float | None, typer.Option(help="Override min wavelength")
+    ] = None,
+    wavelength_max: Annotated[
+        float | None, typer.Option(help="Override max wavelength")
+    ] = None,
+    workers: Annotated[
+        int | None, typer.Option(help="Max parallel CPU worker processes")
+    ] = None,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    tasks: list[tuple[str, str]] = []
+    for idx, nxs_p in enumerate(nexus_filenames):
+        bn = os.path.basename(nxs_p).split(".")[0] or f"run_{idx:03d}"
+        out_p = os.path.join(output_dir, f"{bn}.reduce.h5")
+        if any(existing_out == out_p for _, existing_out in tasks):
+            out_p = os.path.join(output_dir, f"{idx:03d}_{bn}.reduce.h5")
+        tasks.append((nxs_p, out_p))
+    run_reduce_batch(
+        tasks,
+        instrument,
+        wavelength_min=wavelength_min,
+        wavelength_max=wavelength_max,
+        max_workers=workers,
+    )
+
+
+@app.command()
 def merge_images(
     input_pattern: Annotated[
         str,
-        typer.Argument(help="Glob pattern for reduced .h5 files (e.g. 'reduced/*.h5')"),
+        typer.Argument(
+            help="Glob pattern or space-separated list of reduced .h5 files (e.g. 'reduced/*.h5')"
+        ),
     ],
     output_filename: Annotated[str, typer.Argument(help="Output master .h5 file")],
     a: float = typer.Argument(..., help="Unit cell parameter a"),
@@ -1607,6 +1664,13 @@ def indexer_visualize(
             "agreement it is drawn to show.",
         ),
     ] = 0.5,
+    rainbow_html: Annotated[
+        str | None,
+        typer.Option(
+            "--rainbow-html",
+            help="Export interactive HTML5/Canvas Rainbow Zones diagnostic widget (Arcade + Pro View)",
+        ),
+    ] = None,
 ):
     """
     Draw the low-index Laue zone conics over the measured peaks.
@@ -1626,7 +1690,131 @@ def indexer_visualize(
         image_index=image_index,
         images_filename=images,
         zone_alpha=zone_alpha,
+        rainbow_html=rainbow_html,
     )
+
+
+@app.command("rainbow-visualize")
+def rainbow_visualize(
+    peaks_filename: Annotated[
+        str | None,
+        typer.Argument(
+            help="Indexer, spherical-index, solve, finder, or merged images HDF5 (optional in --serve mode)"
+        ),
+    ] = None,
+    output_html: Annotated[
+        str,
+        typer.Option(
+            "--output-html",
+            "-o",
+            help="Destination path for standalone interactive HTML widget",
+        ),
+    ] = "rainbow_zones.html",
+    images: Annotated[
+        str | None,
+        typer.Option(
+            "--images",
+            help="Optional merged images HDF5 (*.im.h5) to render raw detector counts on the panels",
+        ),
+    ] = None,
+    projection: Annotated[
+        str | None,
+        typer.Option(
+            "--projection",
+            help="Detector projection: 'cylindrical' (CG4D default), 'spherical' (MANDI default), or auto from instrument",
+        ),
+    ] = None,
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help="Initial UI mode: 'arcade' (Rainbow Islands / 80s parallax) or 'pro' (Pro View)",
+        ),
+    ] = "arcade",
+    instrument: Annotated[
+        str | None,
+        typer.Option("--instrument", help="Override instrument name from HDF5"),
+    ] = None,
+    max_zone_index: Annotated[
+        int,
+        typer.Option(
+            "--max-zone-index",
+            min=1,
+            help="Generate primitive zones [uvw] with |u|,|v|,|w| <= max-zone-index",
+        ),
+    ] = 3,
+    zone_tolerance_deg: Annotated[
+        float,
+        typer.Option(
+            "--zone-tolerance-deg",
+            "--tolerance-deg",
+            min=0.05,
+            help="Angular half-width [deg] for assigning reflections to a Laue zone",
+        ),
+    ] = 0.75,
+    serve: Annotated[
+        bool,
+        typer.Option(
+            "--serve",
+            help="Start live HTTP / Trame server (for NDIP Galaxy / NOVA interactive tools)",
+        ),
+    ] = False,
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Bind address when --serve is enabled"),
+    ] = "0.0.0.0",
+    port: Annotated[
+        int,
+        typer.Option("--port", help="Bind port when --serve is enabled"),
+    ] = 8080,
+):
+    """Export or serve the interactive 'Rainbow Zones' Laue zone GUI (Arcade + Pro View)."""
+    from subhkl.viz.rainbow_zones import export_rainbow_widget
+
+    extra = {"instrument": instrument} if instrument else {}
+    replay_target = peaks_filename or images
+    if output_html and replay_target:
+        export_rainbow_widget(
+            replay_target,
+            output_html=output_html,
+            images_h5=images,
+            projection=projection,
+            default_mode=mode,
+            max_zone_index=max_zone_index,
+            zone_tolerance_deg=zone_tolerance_deg,
+            **extra,
+        )
+    if serve:
+        from subhkl.viz.nova_rainbow_view import serve_rainbow_zones
+
+        serve_rainbow_zones(
+            replay_h5=replay_target,
+            images_h5=images,
+            projection=projection,
+            host=host,
+            port=port,
+            default_mode=mode,
+            max_zone_index=max_zone_index,
+            zone_tolerance_deg=zone_tolerance_deg,
+            **extra,
+        )
+        return None
+
+    out = export_rainbow_widget(
+        replay_target,
+        output_html,
+        images_h5=images,
+        projection=projection,
+        default_mode=mode,
+        max_zone_index=max_zone_index,
+        zone_tolerance_deg=zone_tolerance_deg,
+        **extra,
+    )
+    print(f"wrote {out}")
+    return out
+
+
+app.command("parallax-visualize")(rainbow_visualize)
 
 
 if __name__ == "__main__":

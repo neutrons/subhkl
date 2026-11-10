@@ -1,0 +1,41 @@
+<tool id="nova_subhkl_diffraction_parallax_prototype" tool_type="interactive" name="IMAGINE-X subhkl Diffraction Parallax (NOVA Interactive)" profile="22.05" version="0.1.0">
+  <description>Interactive Laue diffraction parallax &amp; NDIP workflow dashboard for IMAGINE / MANDI</description>
+  <requirements>
+    <container type="docker" shell="/bin/bash">ghcr.io/neutrons/subhkl:1.4.0</container>
+  </requirements>
+  <entry_points>
+    <entry_point name="SubHKL Diffraction Parallax" label="app_entry" requires_domain="False" requires_path_in_url="True">
+      <port>8081</port>
+    </entry_point>
+  </entry_points>
+  <environment_variables>
+    <environment_variable name="GALAXY_URL">$__galaxy_url__</environment_variable>
+    <environment_variable name="GALAXY_API_KEY" inject="api_key"/>
+    <environment_variable name="HISTORY_ID">$__history_id__</environment_variable>
+    <environment_variable name="EP_PATH" inject="entry_point_path_for_label">app_entry</environment_variable>
+  </environment_variables>
+  <command detect_errors="exit_code"><![CDATA[
+    mv "$peaks_h5" "$peaks_h5.element_identifier" ;
+    python -m subhkl.io.parser rainbow-visualize "$peaks_h5.element_identifier"
+      --serve
+      --host 0.0.0.0
+      --port 8081
+      --max-zone-index $max_zone_index
+      --zone-tolerance-deg $zone_tolerance_deg
+      > >(tee -a $output_status) 2> >(tee -a $output_status >&2)
+  ]]></command>
+  <inputs>
+    <param format="h5" name="peaks_h5" type="data" label="Indexed or Found Peaks HDF5 (indexer.h5 / solve.h5 / finder.h5)" />
+    <param name="max_zone_index" type="integer" value="3" min="1" max="4" label="Max Zone Axis Miller Index |u|,|v|,|w|" />
+    <param name="zone_tolerance_deg" type="float" value="0.75" min="0.05" max="3.0" label="Zone Capture Angular Tolerance (deg)" />
+  </inputs>
+  <outputs>
+    <data name="output_status" format="txt" label="SubHKL Diffraction Parallax Session Log" />
+  </outputs>
+  <help><![CDATA[
+    Launches the interactive **SubHKL Diffraction Parallax** GUI inside NDIP / Galaxy / NOVA on port 8081,
+    coupling the 4-stage NDIP workflow pipeline (`imaginex_subhkl_prepare_peaks`, `imaginex_subhkl_peak_fit`,
+    `imaginex_subhkl`, `imaginex_subhkl_predict`, `imaginex_subhkl_integrate`, `imaginex_merge`) with the
+    5-step Solve Lattice Ladder and detector parallax view.
+  ]]></help>
+</tool>
