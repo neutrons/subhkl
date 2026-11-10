@@ -3867,7 +3867,6 @@ def render_rainbow_html(
             <span id="stereo-title" style="color:var(--accent-cyan);font-weight:700;">WULFF NET</span>
             <div class="stereo-toolbar">
               <button id="btn-wulff-scope" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
-              <button id="btn-wulff-frame" title="Toggle between Sample frame (coupled through goniometer rotation matrix R) and Lab frame (coupled through identity I)">Sample</button>
               <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, or Careless Merge Residual">
                 <option value="wavelength">Color: λ/Zone</option>
                 <option value="orbit">Color: ASU Orbit</option>
@@ -4193,7 +4192,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     showStereo: isMergedInit,
     wulffExpanded: isMergedInit,
     wulffScope: isMergedInit ? "all_runs" : "single_frame", // "single_frame" (1-Frame) | "all_runs" (All-Runs)
-    wulffFrame: isMergedInit ? "sample" : "lab",            // "sample" (coupled via goniometer R) | "lab" (coupled via identity I)
+    wulffFrame: "sample",         // always project in Sample frame (coupled via goniometer R)
     wulffCoupled: true,           // 360° periodic detector pan <-> Wulff yaw always coupled
     wulffColorMode: isMergedInit ? "residual" : "wavelength", // "wavelength" | "orbit" | "residual" | "scale"
     wulffYawDeg: 0.0,
@@ -4505,7 +4504,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const stereoEl = document.getElementById("stereo-inset");
     const btnTop = document.getElementById("btn-stereo-toggle");
     const btnScope = document.getElementById("btn-wulff-scope");
-    const btnFrame = document.getElementById("btn-wulff-frame");
     const btnExpand = document.getElementById("btn-wulff-expand");
     const selColor = document.getElementById("sel-wulff-color");
     const titleEl = document.getElementById("stereo-title");
@@ -4519,11 +4517,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       btnScope.textContent = isAll ? "All-Runs" : "1-Frame";
       btnScope.classList.toggle("active-btn", isAll);
     }}
-    if (btnFrame) {{
-      const isSample = state.wulffFrame === "sample";
-      btnFrame.textContent = isSample ? "Sample" : "Lab";
-      btnFrame.classList.toggle("active-btn", isSample);
-    }}
     if (btnExpand) {{
       btnExpand.textContent = state.wulffExpanded ? "Dock" : "Expand";
       btnExpand.classList.toggle("active-btn", Boolean(state.wulffExpanded));
@@ -4531,8 +4524,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (selColor) selColor.value = state.wulffColorMode || "wavelength";
     if (titleEl) {{
       const scopeLbl = state.wulffScope === "all_runs" ? "ALL-RUNS" : "1-FRAME";
-      const frameLbl = state.wulffFrame === "sample" ? "SAMPLE" : "LAB";
-      titleEl.textContent = `WULFF NET · ${{scopeLbl}} (${{frameLbl}})`;
+      titleEl.textContent = `WULFF NET · ${{scopeLbl}}`;
     }}
     updateMergeScoreboard();
   }}
@@ -5479,9 +5471,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
   }}
 
-  // Rotate 3D unit vector g=[gx, gy, gz] by lab-coupled wulffYawDeg (around lab Y) and wulffPitchDeg (around lab X),
-  // coupled through the goniometer rotation matrix R (in Sample mode) or the identity I (in Lab mode),
-  // and project onto a convex 3D perspective Wulff sphere (camera in front at +D along +z_cam).
+  // Rotate 3D Sample-frame unit vector g=[gx, gy, gz] by lab-coupled wulffYawDeg (around lab Y) and wulffPitchDeg (around lab X),
+  // coupled through the active goniometer rotation matrix R, and project onto a convex 3D perspective Wulff sphere.
   function projectToWulff(g, cx, cy, R) {{
     if (!Array.isArray(g) || g.length < 3) return [cx, cy, 1, 0.0, 1.0];
     const yawRad = (state.wulffYawDeg || 0.0) * Math.PI / 180.0;
@@ -5489,9 +5480,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const cyaw = Math.cos(yawRad), syaw = Math.sin(yawRad);
     const cp = Math.cos(pitchRad), sp = Math.sin(pitchRad);
 
-    // Normalize input unit vector; in Sample mode, orient crystal sphere by active goniometer R_gonio
-    const isSample = state.wulffFrame === "sample";
-    const Rg = isSample ? getActiveGoniometerR() : null;
+    // Normalize Sample-frame unit vector and orient crystal sphere by active goniometer R_gonio
+    const Rg = getActiveGoniometerR();
     const gn = Math.hypot(g[0], g[1], g[2]) || 1.0;
     const gUnit = [g[0] / gn, g[1] / gn, g[2] / gn];
     const vBase = Rg ? mat3Vec(Rg, gUnit) : gUnit;
@@ -5547,7 +5537,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const isExp = Boolean(state.wulffExpanded);
     const Rg = getActiveGoniometerR();
     const RgT = mat3T(Rg);
-    const isLabFrame = state.wulffFrame === "lab";
 
     ctx.save();
     ctx.beginPath();
@@ -5607,7 +5596,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
     ctx.restore();
 
-    // Draw zone great-circle conics directly from 3D zone axis normal (in Sample or Lab space)
+    // Draw zone great-circle conics directly from 3D Sample-frame zone axis normal
     if (state.showZoneArcs) {{
       ctx.save();
       ZONES.forEach(zone => {{
@@ -5618,7 +5607,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ? zone.axis_crystal_xyz
           : (Array.isArray(zone.axis_xyz) && zone.axis_xyz.length === 3 ? mat3Vec(RgT, zone.axis_xyz) : null);
         if (tCryst) {{
-          const tAxis = vecUnit(isLabFrame ? (Array.isArray(zone.axis_xyz) ? zone.axis_xyz : mat3Vec(Rg, tCryst)) : tCryst);
+          const tAxis = vecUnit(tCryst);
           const ref = Math.abs(tAxis[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
           const e1 = vecUnit(vecCross(tAxis, ref));
           const e2 = vecUnit(vecCross(tAxis, e1));
@@ -5637,11 +5626,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const wPeaks = getActiveWulffPeaks();
     const orbitMates = [];
 
-    // Project all peaks and sort back-to-front by camera depth zCam so closer peaks render on top
+    // Project all peaks in Sample frame and sort back-to-front by camera depth zCam so closer peaks render on top
     const projectedPeaks = wPeaks.map(p => {{
-      const gVec = isLabFrame
-        ? (Array.isArray(p.q_hat_lab) ? p.q_hat_lab : mat3Vec(Rg, p.q_hat || [0, 0, 1]))
-        : (Array.isArray(p.q_hat) ? p.q_hat : mat3Vec(RgT, p.q_hat_lab || [0, 0, 1]));
+      const gVec = Array.isArray(p.q_hat) ? p.q_hat : mat3Vec(RgT, p.q_hat_lab || [0, 0, 1]);
       const [sx, sy, hemi, zCam, dotScale] = projectToWulff(gVec, cx, cy, R);
       p._wulff_sx = sx;
       p._wulff_sy = sy;
@@ -5952,17 +5939,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   if (btnWulffScope) {{
     btnWulffScope.addEventListener("click", () => {{
       state.wulffScope = state.wulffScope === "all_runs" ? "single_frame" : "all_runs";
-      const detRect = detCanvas.getBoundingClientRect();
-      const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
-      state.wulffYawDeg = -(state.detPanX / Math.max(1, span360)) * 360.0;
-      syncWulffUI();
-    }});
-  }}
-
-  const btnWulffFrame = document.getElementById("btn-wulff-frame");
-  if (btnWulffFrame) {{
-    btnWulffFrame.addEventListener("click", () => {{
-      state.wulffFrame = state.wulffFrame === "sample" ? "lab" : "sample";
       const detRect = detCanvas.getBoundingClientRect();
       const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
       state.wulffYawDeg = -(state.detPanX / Math.max(1, span360)) * 360.0;

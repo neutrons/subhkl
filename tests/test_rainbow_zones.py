@@ -507,7 +507,7 @@ def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
 
     html = render_rainbow_html(payload)
     assert "btn-wulff-scope" in html
-    assert "btn-wulff-frame" in html
+    assert "btn-wulff-frame" not in html
     assert "btn-wulff-couple" not in html
     assert "sel-wulff-color" in html
     assert "wulff-merge-bar" in html
