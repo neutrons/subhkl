@@ -5481,33 +5481,43 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   // Rotate 3D unit vector g=[gx, gy, gz] by lab-coupled wulffYawDeg (around lab Y) and wulffPitchDeg (around lab X),
   // coupled through the goniometer rotation matrix R (in Sample mode) or the identity I (in Lab mode),
-  // and project onto stereographic Wulff disc
+  // and project onto a convex 3D perspective Wulff sphere (camera in front at +D along +z_cam).
   function projectToWulff(g, cx, cy, R) {{
-    if (!Array.isArray(g) || g.length < 3) return [cx, cy, 1];
+    if (!Array.isArray(g) || g.length < 3) return [cx, cy, 1, 0.0, 1.0];
     const yawRad = (state.wulffYawDeg || 0.0) * Math.PI / 180.0;
     const pitchRad = (state.wulffPitchDeg || 0.0) * Math.PI / 180.0;
     const cyaw = Math.cos(yawRad), syaw = Math.sin(yawRad);
     const cp = Math.cos(pitchRad), sp = Math.sin(pitchRad);
 
-    // Map vector from active Wulff frame (Sample via R_gonio, or Lab via Identity) into Lab frame
+    // Normalize input unit vector; in Sample mode, orient crystal sphere by active goniometer R_gonio
     const isSample = state.wulffFrame === "sample";
     const Rg = isSample ? getActiveGoniometerR() : null;
-    const vLab = Rg ? mat3Vec(Rg, g) : g;
+    const gn = Math.hypot(g[0], g[1], g[2]) || 1.0;
+    const gUnit = [g[0] / gn, g[1] / gn, g[2] / gn];
+    const vBase = Rg ? mat3Vec(Rg, gUnit) : gUnit;
 
-    // Apply 360° lab-frame detector view rotation (yaw around lab Y, pitch around lab X)
-    const x1 = vLab[0] * cyaw + vLab[2] * syaw;
-    const y1 = vLab[1];
-    const z1 = -vLab[0] * syaw + vLab[2] * cyaw;
-    const x2 = x1;
-    const y2 = y1 * cp - z1 * sp;
-    const z2 = y1 * sp + z1 * cp;
+    // Apply 360° lab-frame detector view rotation (yaw around lab Y, then screen-space pitch around camera X)
+    // Flip -z_lab -> +z_cam so the Ewald diffraction hemisphere (q_z < 0) faces the viewer (+z_cam > 0) at yaw=0
+    const vx = vBase[0];
+    const vy = vBase[1];
+    const vz = -vBase[2];
+    const x1 = vx * cyaw + vz * syaw;
+    const y1 = vy;
+    const z1 = -vx * syaw + vz * cyaw;
+    const xCam = x1;
+    const yCam = y1 * cp - z1 * sp;
+    const zCam = y1 * sp + z1 * cp;
 
-    // Map back from Lab frame to active Wulff frame (R_gonio^T for Sample, Identity for Lab)
-    const vDisp = Rg ? mat3Vec(mat3T(Rg), [x2, y2, z2]) : [x2, y2, z2];
-    const hemi = vDisp[2] >= 0 ? 1 : -1;
-    const denom = 1.0 + Math.abs(vDisp[2]);
+    // Convex 3D sphere perspective projection from camera at z = +D (D > 1):
+    // As a feature moves closer to the viewer (zCam -> +1), distance (D - zCam) decreases so apparent size GROWS.
+    const D = 2.6;
+    const kD = Math.sqrt(D * D - 1.0); // maps tangent horizon limb of unit sphere to radius 1.0
+    const dist = Math.max(0.5, D - zCam);
+    const persp = kD / dist;
+    const dotScale = (D - 0.2) / dist; // ~1.5x at front pole (zCam=+1), ~0.67x at back pole (zCam=-1)
+    const hemi = zCam >= 0 ? 1 : -1;
     const scale = R * (state.wulffZoom || 1.0);
-    return [cx + (vDisp[0] / denom) * scale, cy - (vDisp[1] / denom) * scale, hemi];
+    return [cx + xCam * persp * scale, cy - yCam * persp * scale, hemi, zCam, dotScale];
   }}
 
   function getActiveWulffPeaks() {{
@@ -5515,7 +5525,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return src.filter(isPeakVisible);
   }}
 
-  // Render Stereographic Wulff Net (Corner Inset or Expanded Popout)
+  // Render Convex 3D Wulff Sphere (Corner Inset or Expanded Popout)
   function renderStereoInset() {{
     if (!state.showStereo) return;
     const rect = stereoCanvas.getBoundingClientRect();
@@ -5532,6 +5542,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const cx = w * 0.5;
     const cy = h * 0.5;
     const R = Math.min(w, h) * 0.43;
+    const zoom = state.wulffZoom || 1.0;
+    const rSphere = R * Math.min(zoom, 1.35);
     const isExp = Boolean(state.wulffExpanded);
     const Rg = getActiveGoniometerR();
     const RgT = mat3T(Rg);
@@ -5539,82 +5551,126 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     ctx.save();
     ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(7, 9, 19, 0.94)";
+    ctx.arc(cx, cy, rSphere, 0, Math.PI * 2);
+    const grad = ctx.createRadialGradient(
+      cx - rSphere * 0.22, cy - rSphere * 0.22, rSphere * 0.05,
+      cx, cy, rSphere
+    );
+    grad.addColorStop(0, "rgba(18, 25, 48, 0.95)");
+    grad.addColorStop(0.72, "rgba(9, 13, 26, 0.95)");
+    grad.addColorStop(1, "rgba(4, 6, 14, 0.98)");
+    ctx.fillStyle = grad;
     ctx.fill();
     ctx.strokeStyle = isExp ? "#00e5ff" : "#334155";
     ctx.lineWidth = isExp ? 1.8 : 1.5;
     ctx.stroke();
     ctx.clip();
 
-    // Wulff Net latitude/longitude graticule circles
-    ctx.strokeStyle = "rgba(148, 163, 184, 0.16)";
-    ctx.lineWidth = 1.0;
-    [Math.PI / 12, Math.PI / 6, Math.PI / 4].forEach(ang => {{
-      ctx.beginPath();
-      ctx.arc(cx, cy, R * Math.tan(ang) * (state.wulffZoom || 1.0), 0, Math.PI * 2);
-      ctx.stroke();
-    }});
-    ctx.beginPath();
-    ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy);
-    ctx.moveTo(cx, cy - R); ctx.lineTo(cx, cy + R);
-    ctx.stroke();
+    // Helper to stroke a 3D circle on S^2 with front/back hemisphere depth styling
+    function strokeSphereCircle(sampleFn, nSteps, frontAlpha, backAlpha, color, lineW, dashBack) {{
+      let prevSx = 0, prevSy = 0, prevHemi = 0;
+      for (let s = 0; s <= nSteps; s++) {{
+        const ang = (s / nSteps) * Math.PI * 2.0;
+        const gVec = sampleFn(ang);
+        const [sx, sy, hemi] = projectToWulff(gVec, cx, cy, R);
+        if (s > 0) {{
+          ctx.beginPath();
+          ctx.moveTo(prevSx, prevSy);
+          ctx.lineTo(sx, sy);
+          ctx.strokeStyle = color;
+          ctx.lineWidth = lineW * (hemi >= 0 ? 1.0 : 0.75);
+          ctx.globalAlpha = (hemi >= 0 && prevHemi >= 0) ? frontAlpha : backAlpha;
+          if (dashBack && (hemi < 0 || prevHemi < 0)) ctx.setLineDash([2, 3]);
+          else ctx.setLineDash([]);
+          ctx.stroke();
+        }}
+        prevSx = sx; prevSy = sy; prevHemi = hemi;
+      }}
+      ctx.setLineDash([]);
+    }}
 
-    // Draw zone great-circle conics (in Sample space or Lab space via R_gonio)
+    // 3D Wulff Net latitude & meridian graticule circles that rotate with the sphere
+    ctx.save();
+    [-Math.PI / 4, 0.0, Math.PI / 4].forEach(lat => {{
+      const cl = Math.cos(lat), sl = Math.sin(lat);
+      strokeSphereCircle(
+        ang => [cl * Math.cos(ang), sl, cl * Math.sin(ang)],
+        72, 0.22, 0.08, "#94a3b8", 0.9, false
+      );
+    }});
+    [0.0, Math.PI / 4, Math.PI / 2, (3 * Math.PI) / 4].forEach(lon => {{
+      const clon = Math.cos(lon), slon = Math.sin(lon);
+      strokeSphereCircle(
+        ang => [Math.cos(ang) * clon, Math.sin(ang), Math.cos(ang) * slon],
+        72, 0.20, 0.07, "#94a3b8", 0.9, false
+      );
+    }});
+    ctx.restore();
+
+    // Draw zone great-circle conics directly from 3D zone axis normal (in Sample or Lab space)
     if (state.showZoneArcs) {{
+      ctx.save();
       ZONES.forEach(zone => {{
         if (!state.activeZones.has(zone.zone_id)) return;
-        ctx.strokeStyle = zone.rainbow_color;
-        ctx.lineWidth = state.selectedZoneId === zone.zone_id ? (isExp ? 2.4 : 2.0) : (isExp ? 1.4 : 1.1);
-        ctx.globalAlpha = 0.68;
-        (zone.stereo_segments || []).forEach(seg => {{
-          ctx.beginPath();
-          seg.forEach((pt, idx) => {{
-            // Reconstruct Sample unit vector from stereographic (sx, sy, hemi) and convert to Lab if in Lab mode
-            const r2 = pt[0] * pt[0] + pt[1] * pt[1];
-            const gz = (pt[2] >= 0 ? 1 : -1) * (1.0 - r2) / Math.max(1e-6, 1.0 + r2);
-            const f = 1.0 + Math.abs(gz);
-            const gSample = [pt[0] * f, pt[1] * f, gz];
-            const gVec = isLabFrame ? mat3Vec(Rg, gSample) : gSample;
-            const [sx, sy] = projectToWulff(gVec, cx, cy, R);
-            if (idx === 0) ctx.moveTo(sx, sy);
-            else ctx.lineTo(sx, sy);
-          }});
-          ctx.stroke();
-        }});
+        const isSel = state.selectedZoneId === zone.zone_id;
+        const lw = isSel ? (isExp ? 2.5 : 2.1) : (isExp ? 1.45 : 1.15);
+        const tCryst = Array.isArray(zone.axis_crystal_xyz) && zone.axis_crystal_xyz.length === 3
+          ? zone.axis_crystal_xyz
+          : (Array.isArray(zone.axis_xyz) && zone.axis_xyz.length === 3 ? mat3Vec(RgT, zone.axis_xyz) : null);
+        if (tCryst) {{
+          const tAxis = vecUnit(isLabFrame ? (Array.isArray(zone.axis_xyz) ? zone.axis_xyz : mat3Vec(Rg, tCryst)) : tCryst);
+          const ref = Math.abs(tAxis[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+          const e1 = vecUnit(vecCross(tAxis, ref));
+          const e2 = vecUnit(vecCross(tAxis, e1));
+          strokeSphereCircle(
+            ang => {{
+              const ca = Math.cos(ang), sa = Math.sin(ang);
+              return [ca * e1[0] + sa * e2[0], ca * e1[1] + sa * e2[1], ca * e1[2] + sa * e2[2]];
+            }},
+            96, isSel ? 0.92 : 0.72, isSel ? 0.35 : 0.20, zone.rainbow_color, lw, true
+          );
+        }}
       }});
+      ctx.restore();
     }}
 
     const wPeaks = getActiveWulffPeaks();
     const orbitMates = [];
 
-    wPeaks.forEach(p => {{
+    // Project all peaks and sort back-to-front by camera depth zCam so closer peaks render on top
+    const projectedPeaks = wPeaks.map(p => {{
       const gVec = isLabFrame
         ? (Array.isArray(p.q_hat_lab) ? p.q_hat_lab : mat3Vec(Rg, p.q_hat || [0, 0, 1]))
         : (Array.isArray(p.q_hat) ? p.q_hat : mat3Vec(RgT, p.q_hat_lab || [0, 0, 1]));
-      const [sx, sy, hemi] = projectToWulff(gVec, cx, cy, R);
+      const [sx, sy, hemi, zCam, dotScale] = projectToWulff(gVec, cx, cy, R);
       p._wulff_sx = sx;
       p._wulff_sy = sy;
       p._wulff_hemi = hemi;
+      return {{ p, sx, sy, hemi, zCam, dotScale }};
+    }});
+    projectedPeaks.sort((a, b) => a.zCam - b.zCam);
 
+    projectedPeaks.forEach(({{ p, sx, sy, hemi, dotScale }}) => {{
       const captured = isPeakCapturedByActiveZone(p) || state.wulffScope === "all_runs";
       const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
       const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
-      if (isOrbitMate) orbitMates.push([sx, sy, p]);
+      if (isOrbitMate) orbitMates.push([sx, sy, p, dotScale]);
 
-      const baseDot = isExp ? (captured ? 4.0 : 2.8) : (captured ? 2.6 : 1.8);
+      const baseDot = (isExp ? (captured ? 3.8 : 2.6) : (captured ? 2.5 : 1.75)) * dotScale;
       const rDot = isHovered ? baseDot + 2.5 : (isOrbitMate ? baseDot + 1.6 : baseDot);
-      const col = isHovered ? "#fbbf24" : peakStrokeColor(p, captured ? 0.92 : 0.45);
+      const alphaBase = hemi >= 0 ? (captured ? 0.94 : 0.52) : (captured ? 0.55 : 0.28);
+      const col = isHovered ? "#fbbf24" : peakStrokeColor(p, alphaBase);
 
       ctx.save();
       ctx.beginPath();
       ctx.arc(sx, sy, rDot, 0, Math.PI * 2);
       if (hemi < 0) {{
-        // Southern hemisphere: open hollow circle
+        // Back hemisphere (further from viewer): smaller open hollow circle
         ctx.strokeStyle = col;
-        ctx.lineWidth = isExp ? 1.6 : 1.2;
+        ctx.lineWidth = (isExp ? 1.45 : 1.1) * Math.max(0.75, dotScale);
         ctx.stroke();
       }} else {{
+        // Front hemisphere (closer to viewer): larger filled circle
         ctx.fillStyle = col;
         ctx.fill();
       }}
@@ -5623,9 +5679,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const harmMult = p.harmonic_multiplicity || p.harmonic_order || 1;
       if (harmMult > 1) {{
         ctx.beginPath();
-        ctx.arc(sx, sy, rDot + (isExp ? 3.2 : 2.2), 0, Math.PI * 2);
+        ctx.arc(sx, sy, rDot + (isExp ? 3.0 : 2.1) * dotScale, 0, Math.PI * 2);
         ctx.strokeStyle = isOrbitMate ? "#fbbf24" : col;
-        ctx.lineWidth = isExp ? 1.3 : 0.95;
+        ctx.lineWidth = (isExp ? 1.25 : 0.9) * Math.max(0.75, dotScale);
         ctx.stroke();
       }}
       ctx.restore();
@@ -6887,8 +6943,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const ang = (s / nArc) * 2.0 * Math.PI;
           const gLab = [Math.cos(ang)*e1[0] + Math.sin(ang)*e2[0], Math.cos(ang)*e1[1] + Math.sin(ang)*e2[1], Math.cos(ang)*e1[2] + Math.sin(ang)*e2[2]];
           const gC = mat3Vec(R_T, gLab);
-          const [sx, sy] = stereoProj(gC);
-          if (s % 4 === 0) stereoSegs[0].push([sx, sy]);
+          const [sx, sy, sHemi] = stereoProj(gC);
+          if (s % 4 === 0) stereoSegs[0].push([sx, sy, sHemi]);
           const kiDotG = gLab[2];
           if (kiDotG >= -1e-4) {{
             if (curCyl.length > 1) {{ detSegs.push(curCyl); detSegsSph.push(curSph); }}
@@ -6906,6 +6962,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (curCyl.length > 1) {{ detSegs.push(curCyl); detSegsSph.push(curSph); }}
         zonesOut.push({{
           zone_id: zi, uvw: z.uvw, order: z.order, label: `[${{z.uvw[0]}} ${{z.uvw[1]}} ${{z.uvw[2]}}]`,
+          axis_xyz: z.tLab, axis_crystal_xyz: mat3Vec(R_T, z.tLab),
           n_peaks: z.n_peaks, angular_rms_deg: 0.02, rainbow_color: ZONE_COLORS[zi % ZONE_COLORS.length],
           detector_segments: detSegs, detector_segments_sph: detSegsSph, stereo_segments: stereoSegs,
         }});
