@@ -289,9 +289,7 @@ class NovaGalaxyPipelineRunner:
                         payload["sample_peaks"] = p_blind["sample_peaks"]
                     if p_blind.get("panels") and payload.get("panels"):
                         p_by_b = {
-                            int(p["bank"]): p
-                            for p in p_blind["panels"]
-                            if "bank" in p
+                            int(p["bank"]): p for p in p_blind["panels"] if "bank" in p
                         }
                         for cur_p in payload["panels"]:
                             upd_p = p_by_b.get(int(cur_p.get("bank", -1)))
@@ -3567,12 +3565,17 @@ class NovaGalaxyPipelineRunner:
                                 job_record["ladder_rung_idx"], 4
                             )
                         active_live_src = None
-                        if os.path.isfile(stages_src) and os.path.getsize(stages_src) > 0:
+                        if (
+                            os.path.isfile(stages_src)
+                            and os.path.getsize(stages_src) > 0
+                        ):
                             active_live_src = stages_src
                             job_record["ladder_rung_idx"] = max(
                                 job_record["ladder_rung_idx"], 3
                             )
-                        elif os.path.isfile(blind_src) and os.path.getsize(blind_src) > 0:
+                        elif (
+                            os.path.isfile(blind_src) and os.path.getsize(blind_src) > 0
+                        ):
                             active_live_src = blind_src
                         if active_live_src is not None:
                             try:
@@ -3698,6 +3701,7 @@ class NovaGalaxyPipelineRunner:
                             )
 
                         if self.is_connected and os.path.isfile(final_h5):
+
                             def _bg_upload_solve(_f_h5: str = final_h5) -> None:
                                 try:
                                     store = self.get_datastore("IMAGINE-X SubHKL")
@@ -3745,6 +3749,7 @@ class NovaGalaxyPipelineRunner:
                             )
 
                         if self.is_connected:
+
                             def _bg_upload_integrate(
                                 _f_h5: str = final_h5,
                                 _p_h5: str = pred_dest,
@@ -3824,6 +3829,7 @@ class NovaGalaxyPipelineRunner:
                                 f"\n[careless] Warning stamping merge results into HDF5: {merge_exc}\n"
                             )
                         if self.is_connected:
+
                             def _bg_upload_merge(_wdir: str = work_dir) -> None:
                                 try:
                                     store = self.get_datastore("IMAGINE-X SubHKL")

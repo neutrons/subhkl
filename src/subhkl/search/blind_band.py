@@ -300,9 +300,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
         f["sample/U"] = U_shared[selected]
         f["sample/B"] = B
         f["sample/cell"] = np.asarray(args.cell, dtype=float)
-        for k_c, v_c in zip(
-            ("a", "b", "c", "alpha", "beta", "gamma"), args.cell[:6]
-        ):
+        for k_c, v_c in zip(("a", "b", "c", "alpha", "beta", "gamma"), args.cell[:6]):
             f[f"sample/{k_c}"] = float(v_c)
         f["sample/space_group"] = str(args.space_group)
         f["instrument/name"] = str(args.instrument)
@@ -324,11 +322,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
             mid_cal = mid_b * (1.0 + r_sc) @ rot.T + t_vec
             uh_cal = det_b.uhat @ rot.T
             vh_cal = det_b.vhat @ rot.T
-            cen_cal = (
-                mid_cal
-                - 0.5 * det_b.width * uh_cal
-                - 0.5 * det_b.height * vh_cal
-            )
+            cen_cal = mid_cal - 0.5 * det_b.width * uh_cal - 0.5 * det_b.height * vh_cal
             bg = cal_g.create_group(f"bank_{b_id}")
             bg["center"] = np.asarray(cen_cal, dtype=float)
             bg["uhat"] = np.asarray(uh_cal, dtype=float)

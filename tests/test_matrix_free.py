@@ -419,7 +419,6 @@ def test_broad_footprint_does_not_crater_background_rate_map():
     assert out[1, 0] < 3.0 * max(out[1, 4], 90.0), out[1]
 
 
-
 def test_empty_input_returns_empty():
     out = integrate_reflections_matrix_free(
         np.zeros((1, H, W)),

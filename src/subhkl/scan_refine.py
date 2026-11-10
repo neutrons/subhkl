@@ -507,6 +507,7 @@ def checkpoint(args, name, parameters, diagnostics, snapshot=None):
             group.attrs["diagnostics"] = json.dumps(diagnostics[-1])
 
             if snapshot is not None:
+
                 def _put(key, val):
                     if key in f:
                         del f[key]

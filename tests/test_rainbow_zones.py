@@ -1189,7 +1189,9 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         "B": np.eye(3) * 0.0838,
         "cell": [11.93, 11.93, 11.93, 90.0, 90.0, 90.0],
         "banks": cg4d_banks,
-        "centers": np.asarray([d.center + np.array([0.005, 0.0, 0.0]) for d in dets_cg4d]),
+        "centers": np.asarray(
+            [d.center + np.array([0.005, 0.0, 0.0]) for d in dets_cg4d]
+        ),
         "uhats": np.asarray([d.uhat for d in dets_cg4d]),
         "vhats": np.asarray([d.vhat for d in dets_cg4d]),
         "widths": np.asarray([d.width for d in dets_cg4d]),
@@ -1201,7 +1203,15 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         args_ns,
         "120-zones",
         np.zeros(10),
-        [{"stage": "120-zones", "objective": -0.42, "iterations": 12, "success": True, "message": "OK"}],
+        [
+            {
+                "stage": "120-zones",
+                "objective": -0.42,
+                "iterations": 12,
+                "success": True,
+                "message": "OK",
+            }
+        ],
         snapshot=snap,
     )
     stages_h5 = tmp_path / "live_solve.stages.h5"

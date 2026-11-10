@@ -373,23 +373,16 @@ def _make_ewald_polisher(
         cv_dot = (cen_r * vh).sum(1)
         cu_dot = (cen_r * uh).sum(1)
         if Gc_chunks is None:
-            return _score_chunk(
-                Ej_r, RU, cen_r, cn_dot, cv_dot, cu_dot, Gc, inv_qn
-            )
+            return _score_chunk(Ej_r, RU, cen_r, cn_dot, cv_dot, cu_dot, Gc, inv_qn)
 
         def _body(acc, pair):
             gc_k, iq_k = pair
             return (
-                acc
-                + _score_chunk(
-                    Ej_r, RU, cen_r, cn_dot, cv_dot, cu_dot, gc_k, iq_k
-                ),
+                acc + _score_chunk(Ej_r, RU, cen_r, cn_dot, cv_dot, cu_dot, gc_k, iq_k),
                 None,
             )
 
-        tot, _ = jax.lax.scan(
-            _body, jnp.float32(0.0), (Gc_chunks, inv_qn_chunks)
-        )
+        tot, _ = jax.lax.scan(_body, jnp.float32(0.0), (Gc_chunks, inv_qn_chunks))
         return tot
 
     @jax.jit
@@ -506,9 +499,7 @@ def _make_ewald_polisher(
 
 def _ewald_d_min(cell, d_min, max_p1_refl=120000):
     vol_est = max(float(cell[0]) * float(cell[1]) * float(cell[2]), 1.0)
-    d_floor = float(
-        (4.0 * np.pi * vol_est / (3.0 * float(max_p1_refl))) ** (1.0 / 3.0)
-    )
+    d_floor = float((4.0 * np.pi * vol_est / (3.0 * float(max_p1_refl))) ** (1.0 / 3.0))
     return max(float(d_min), d_floor)
 
 
@@ -1033,9 +1024,21 @@ def refine_scan(args):
         return rv, s_rad, s_ax, s_area, rg, T, s_samp, da, db, dbeta, dom, du, dv
 
     def _build_stage_snapshot(stage_name, p_vec):
-        rv_s, sr_s, sa_s, sar_s, rg_s, T_s, _ss_s, da_s, db_s, dbe_s, dom_s, du_s, dv_s = unpack(
-            jnp.asarray(p_vec, dtype=jnp.float64)
-        )
+        (
+            rv_s,
+            sr_s,
+            sa_s,
+            sar_s,
+            rg_s,
+            T_s,
+            _ss_s,
+            da_s,
+            db_s,
+            dbe_s,
+            dom_s,
+            du_s,
+            dv_s,
+        ) = unpack(jnp.asarray(p_vec, dtype=jnp.float64))
         Rg_s = np.asarray(rodrigues_jax(rg_s))
         U_s = np.asarray(rodrigues_jax(rv_s) @ Uj)
         a_s, b_s, c_s, al_sr, be_sr, ga_sr = [
@@ -1060,9 +1063,7 @@ def refine_scan(args):
             + np.asarray(du_s)[:, None] * uhat_bank
             + np.asarray(dv_s)[:, None] * vhat_bank
         ) @ Rg_s.T + np.asarray(T_s)[None, :]
-        C_fin_s = (
-            C_mid_s - 0.5 * W_s[:, None] * uh_s - 0.5 * H_s[:, None] * vh_s
-        )
+        C_fin_s = C_mid_s - 0.5 * W_s[:, None] * uh_s - 0.5 * H_s[:, None] * vh_s
         R_runs_ref = getattr(args, "R_runs_refined", None)
         if R_runs_ref is not None:
             R_list_s = [np.asarray(R_runs_ref[r], dtype=float) for r in range(n_runs)]
