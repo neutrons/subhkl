@@ -219,7 +219,13 @@ def prepare_harvest_tasks(
                     dev = np.zeros(len(coords))
                 if res is None or len(res) != len(coords):
                     res = np.zeros(len(coords))
-                pre_coords = (coords[:, 1], coords[:, 2], coords[:, 3], dev, res)
+                pre_coords = (
+                    np.asarray(coords[:, 1]),
+                    np.asarray(coords[:, 2]),
+                    np.asarray(coords[:, 3]),
+                    np.asarray(dev),
+                    np.asarray(res),
+                )
             else:
                 empty = np.array([])
                 pre_coords = (empty, empty, empty, empty, empty)
@@ -340,11 +346,13 @@ def prepare_predict_tasks(
             per_run_trans is not None
             and frame_to_run is not None
             and sample_offset is not None
-            and np.ndim(sample_offset) == 2
             and img_index < len(frame_to_run)
         ):
             so_eff = np.array(sample_offset, dtype=float, copy=True)
-            so_eff[-1] = so_eff[-1] + per_run_trans[int(frame_to_run[img_index])]
+            if so_eff.ndim == 2:
+                so_eff[-1] = so_eff[-1] + per_run_trans[int(frame_to_run[img_index])]
+            elif so_eff.ndim == 1:
+                so_eff = so_eff + per_run_trans[int(frame_to_run[img_index])]
 
         # Fourier rocking: a lab-frame q-steering rotation per image.
         extra_rot = None

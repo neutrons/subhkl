@@ -1,16 +1,7 @@
 import numpy as np
 from tqdm import tqdm
 
-from jax import jit
-from jax import lax
-from jax import vmap
-import jax
-import jax.numpy as jnp
-
-import jax.scipy.optimize
-import jax.scipy.signal
 import scipy
-
 
 from dataclasses import dataclass
 
@@ -53,10 +44,17 @@ import os
 # nondeterminism already present, and across three seeds the recovered
 # amplitudes came out no worse, and on one seed substantially better.
 MEDIAN_MAX_SAMPLES = 31 * 31
+_JAX_MEDIAN_2D_JIT = None
+_JAX_GAUSSIAN_BLUR_2D_JIT = None
+_COMPUTE_BG_BATCH_JIT = None
+_BOX_MEAN_2D_JIT = None
+_COMPUTE_RATE_BATCH_JIT = None
+_BUILD_3D_COV_JIT = None
+_GLOBAL_SHAPE_OBJECTIVE_JIT = None
+_VAL_AND_GRAD_FN_JIT = None
 
 
-@partial(jit, static_argnames=["window_size", "max_samples"])
-def jax_median_2d(img, window_size, max_samples=None):
+def _jax_median_2d_impl(img, window_size, max_samples=None):
     """
     Args:
         img: [photons/Pixel]
@@ -65,6 +63,9 @@ def jax_median_2d(img, window_size, max_samples=None):
     Returns:
         [photons/Pixel]
     """
+    import jax.numpy as jnp
+    from jax import lax
+
     if max_samples is None:
         dilation = 1
         n_taps = window_size
@@ -92,8 +93,18 @@ def jax_median_2d(img, window_size, max_samples=None):
     return med[: img.shape[0], : img.shape[1]]
 
 
-@partial(jit, static_argnames=["sigma"])
-def jax_gaussian_blur_2d(img, sigma=3.0):
+def jax_median_2d(img, window_size, max_samples=None):
+    global _JAX_MEDIAN_2D_JIT
+    if _JAX_MEDIAN_2D_JIT is None:
+        from jax import jit
+
+        _JAX_MEDIAN_2D_JIT = partial(
+            jit, static_argnames=["window_size", "max_samples"]
+        )(_jax_median_2d_impl)
+    return _JAX_MEDIAN_2D_JIT(img, window_size, max_samples=max_samples)
+
+
+def _jax_gaussian_blur_2d_impl(img, sigma=3.0):
     """
     Args:
         img: [photons/Pixel]
@@ -101,6 +112,9 @@ def jax_gaussian_blur_2d(img, sigma=3.0):
     Returns:
         [photons/Pixel]
     """
+    import jax.numpy as jnp
+    import jax.scipy.signal
+
     radius = int(4.0 * sigma + 0.5)  # [Pixel^0.5]
     x = jnp.arange(-radius, radius + 1)  # [Pixel^0.5]
     k_1d = jnp.exp(-0.5 * (x / sigma) ** 2)  # [-]
@@ -115,8 +129,18 @@ def jax_gaussian_blur_2d(img, sigma=3.0):
     return blurred  # [photons/Pixel]
 
 
-@partial(jit, static_argnames=["filter_size", "max_samples"])
-def compute_bg_batch(imgs, filter_size, max_samples=None):
+def jax_gaussian_blur_2d(img, sigma=3.0):
+    global _JAX_GAUSSIAN_BLUR_2D_JIT
+    if _JAX_GAUSSIAN_BLUR_2D_JIT is None:
+        from jax import jit
+
+        _JAX_GAUSSIAN_BLUR_2D_JIT = partial(jit, static_argnames=["sigma"])(
+            _jax_gaussian_blur_2d_impl
+        )
+    return _JAX_GAUSSIAN_BLUR_2D_JIT(img, sigma=sigma)
+
+
+def _compute_bg_batch_impl(imgs, filter_size, max_samples=None):
     """
     Args:
         imgs: [photons/Pixel]
@@ -125,6 +149,8 @@ def compute_bg_batch(imgs, filter_size, max_samples=None):
     Returns:
         [photons/Pixel]
     """
+    import jax.numpy as jnp
+    from jax import lax
 
     def process_one(img):
         med = jax_median_2d(img, filter_size, max_samples)  # [photons/Pixel]
@@ -134,15 +160,39 @@ def compute_bg_batch(imgs, filter_size, max_samples=None):
     return lax.map(process_one, imgs)  # [photons/Pixel]
 
 
-@partial(jit, static_argnames=["window_size"])
-def _box_mean_2d(img, window_size):
+def compute_bg_batch(imgs, filter_size, max_samples=None):
+    global _COMPUTE_BG_BATCH_JIT
+    if _COMPUTE_BG_BATCH_JIT is None:
+        from jax import jit
+
+        _COMPUTE_BG_BATCH_JIT = partial(
+            jit, static_argnames=["filter_size", "max_samples"]
+        )(_compute_bg_batch_impl)
+    return _COMPUTE_BG_BATCH_JIT(imgs, filter_size, max_samples=max_samples)
+
+
+def _box_mean_2d_impl(img, window_size):
     """Uniform box average, two separable 1D passes.  [same units as img]"""
+    import jax.numpy as jnp
+    import jax.scipy.signal
+
     w = window_size | 1  # odd, so the window is centred
     k_1d = jnp.full((w,), 1.0 / w, dtype=img.dtype)
     pad = w // 2
     padded = jnp.pad(img, pad, mode="reflect")
     temp = jax.scipy.signal.correlate2d(padded, k_1d[:, None], mode="valid")
     return jax.scipy.signal.correlate2d(temp, k_1d[None, :], mode="valid")
+
+
+def _box_mean_2d(img, window_size):
+    global _BOX_MEAN_2D_JIT
+    if _BOX_MEAN_2D_JIT is None:
+        from jax import jit
+
+        _BOX_MEAN_2D_JIT = partial(jit, static_argnames=["window_size"])(
+            _box_mean_2d_impl
+        )
+    return _BOX_MEAN_2D_JIT(img, window_size)
 
 
 # Highest count level the quantile inversion resolves directly; brighter
@@ -152,8 +202,7 @@ def _box_mean_2d(img, window_size):
 RATE_K_MAX = 16
 
 
-@partial(jit, static_argnames=["filter_size"])
-def compute_rate_batch(imgs, filter_size, valid=None):
+def _compute_rate_batch_impl(imgs, filter_size, valid=None):
     """Local Poisson rate by exact quantile inversion -- the sparse-regime
     replacement for the median background.
 
@@ -212,10 +261,14 @@ def compute_rate_batch(imgs, filter_size, valid=None):
     Returns:
         [photons/Pixel]
     """
+    import jax.numpy as jnp
+    import jax.scipy.special
+    from jax import lax
 
     def process_one(inputs):
         img, v = inputs
-        v_frac = jnp.maximum(_box_mean_2d(v, filter_size), 1e-3)
+        v_raw = _box_mean_2d(v, filter_size)
+        v_frac = jnp.maximum(v_raw, 1e-3)
 
         F = jnp.stack(
             [
@@ -248,10 +301,27 @@ def compute_rate_batch(imgs, filter_size, valid=None):
         lo, hi = lax.fori_loop(0, 30, bisect, (lo, hi))
         mu = 0.5 * (lo + hi)
 
-        bright = _box_mean_2d(v * img, filter_size) / v_frac
+        m0 = _box_mean_2d(v * img, filter_size) / v_frac
+        img_clipped = jnp.minimum(img, m0 + 2.5 * jnp.sqrt(jnp.maximum(m0, 1.0)))
+        bright = _box_mean_2d(v * img_clipped, filter_size) / v_frac
         rate = jnp.where(any_hit, mu, bright)
 
-        blur = jax_gaussian_blur_2d(rate)  # [photons/Pixel]
+        # Confidence-weighted (normalized convolution) Gaussian inpainting:
+        # Windows whose unmasked pixel fraction v_raw collapses to 0 inside
+        # broad or overlapping peak footprints otherwise evaluate to rate = 0
+        # and carve deep artificial craters under the peaks after blurring.
+        w = jnp.square(jnp.clip((v_raw - 0.05) / 0.45, 0.0, 1.0))
+        wide_size = (filter_size * 3) | 1
+        num_wide = _box_mean_2d(w * rate, wide_size)
+        den_wide = _box_mean_2d(w, wide_size)
+        global_rate = jnp.sum(w * rate) / jnp.maximum(jnp.sum(w), 1e-6)
+        rate_wide = jnp.where(
+            den_wide > 1e-4, num_wide / jnp.maximum(den_wide, 1e-4), global_rate
+        )
+        blur_sigma = max(3.0, float(filter_size) / 4.0)
+        num_fine = jax_gaussian_blur_2d(w * rate, sigma=blur_sigma)
+        den_fine = jax_gaussian_blur_2d(w, sigma=blur_sigma)
+        blur = (num_fine + 1e-3 * rate_wide) / (den_fine + 1e-3)
         # Numerical guard only.  Unlike the median path this never binds on
         # counted data: any region with any exposure has mu >> 1e-3, and
         # regions with none are masked upstream.
@@ -262,8 +332,20 @@ def compute_rate_batch(imgs, filter_size, valid=None):
     return lax.map(process_one, (imgs, valid.astype(imgs.dtype)))  # [photons/Pixel]
 
 
-@jit
-def build_3d_cov(params):
+def compute_rate_batch(imgs, filter_size, valid=None):
+    global _COMPUTE_RATE_BATCH_JIT
+    if _COMPUTE_RATE_BATCH_JIT is None:
+        from jax import jit
+
+        _COMPUTE_RATE_BATCH_JIT = partial(jit, static_argnames=["filter_size"])(
+            _compute_rate_batch_impl
+        )
+    return _COMPUTE_RATE_BATCH_JIT(imgs, filter_size, valid=valid)
+
+
+def _build_3d_cov_impl(params):
+    import jax.numpy as jnp
+
     # params: [L11, L21, L22, L31, L32, L33]
     L = jnp.array(
         [
@@ -280,17 +362,16 @@ def build_3d_cov(params):
     return L @ L.T
 
 
-@partial(
-    jit,
-    static_argnames=[
-        "patch_size",
-        "fit_mosaicity",
-        "mosaicity_radial",
-        "shape_spherical",
-        "shape_fit_normalized",
-    ],
-)
-def global_shape_objective(
+def build_3d_cov(params):
+    global _BUILD_3D_COV_JIT
+    if _BUILD_3D_COV_JIT is None:
+        from jax import jit
+
+        _BUILD_3D_COV_JIT = jit(_build_3d_cov_impl)
+    return _BUILD_3D_COV_JIT(params)
+
+
+def _global_shape_objective_impl(
     params,
     patches,
     bgs,
@@ -306,6 +387,9 @@ def global_shape_objective(
     shape_spherical=False,
     shape_fit_normalized=False,
 ):
+    import jax.numpy as jnp
+    from jax import vmap
+
     # 1. Build the crystal shape tensor.  The spherical constraint is the
     # hypothesis test that the anisotropy is streak physics, not sample
     # volume: a sphere is rotation-invariant, so it also removes any
@@ -395,17 +479,71 @@ def global_shape_objective(
     return jnp.mean(mses)
 
 
-# Bind the val_and_grad wrapper to recognize the new static argument
-val_and_grad_fn = jit(
-    jax.value_and_grad(global_shape_objective),
-    static_argnames=[
-        "patch_size",
-        "fit_mosaicity",
-        "mosaicity_radial",
-        "shape_spherical",
-        "shape_fit_normalized",
-    ],
-)
+def global_shape_objective(
+    params,
+    patches,
+    bgs,
+    drs,
+    dcs,
+    P_mats,
+    distances,
+    R_mats,
+    streak_dirs,
+    patch_size,
+    fit_mosaicity,
+    mosaicity_radial=False,
+    shape_spherical=False,
+    shape_fit_normalized=False,
+):
+    global _GLOBAL_SHAPE_OBJECTIVE_JIT
+    if _GLOBAL_SHAPE_OBJECTIVE_JIT is None:
+        from jax import jit
+
+        _GLOBAL_SHAPE_OBJECTIVE_JIT = partial(
+            jit,
+            static_argnames=[
+                "patch_size",
+                "fit_mosaicity",
+                "mosaicity_radial",
+                "shape_spherical",
+                "shape_fit_normalized",
+            ],
+        )(_global_shape_objective_impl)
+    return _GLOBAL_SHAPE_OBJECTIVE_JIT(
+        params,
+        patches,
+        bgs,
+        drs,
+        dcs,
+        P_mats,
+        distances,
+        R_mats,
+        streak_dirs,
+        patch_size,
+        fit_mosaicity,
+        mosaicity_radial=mosaicity_radial,
+        shape_spherical=shape_spherical,
+        shape_fit_normalized=shape_fit_normalized,
+    )
+
+
+def val_and_grad_fn(*args, **kwargs):
+    global _VAL_AND_GRAD_FN_JIT
+    if _VAL_AND_GRAD_FN_JIT is None:
+        import jax
+        from jax import jit
+
+        _VAL_AND_GRAD_FN_JIT = jit(
+            jax.value_and_grad(_global_shape_objective_impl),
+            static_argnames=[
+                "patch_size",
+                "fit_mosaicity",
+                "mosaicity_radial",
+                "shape_spherical",
+                "shape_fit_normalized",
+            ],
+        )
+    return _VAL_AND_GRAD_FN_JIT(*args, **kwargs)
 
 
 def optimize_global_crystal(
@@ -423,6 +561,8 @@ def optimize_global_crystal(
     mosaicity_bound_rad=0.010,
     shape_fit_normalized=False,
 ):
+    import jax.numpy as jnp
+
     # 1. Dynamically size the optimizer state based on the configuration
     if fit_mosaicity:
         scales = np.array([1e-3] * 7)
@@ -575,6 +715,8 @@ def integrate_peaks_rbf_ssn(
     gonio_axes: np.ndarray = None,
     gonio_angles: np.ndarray = None,
     gonio_offsets: np.ndarray = None,
+    per_run_trans: np.ndarray = None,
+    frame_to_run: np.ndarray = None,
 ):
     """
     Args:
@@ -603,13 +745,23 @@ def integrate_peaks_rbf_ssn(
         ki_vec = np.array([0, 0, 1.0])
 
     img_keys_ordered = sorted(peak_dict.keys())
-    total_images = len(img_keys_ordered)
+    total_images = len(peaks_obj.image.ims)
+
+    def _frame_idx(img_key, seq_idx):
+        if isinstance(img_key, (int, np.integer)):
+            return int(img_key)
+        if str(img_key).isdigit():
+            return int(str(img_key))
+        return seq_idx
 
     def get_safe_R(img_key, seq_idx, run_id):
+        f_idx = _frame_idx(img_key, seq_idx)
         if all_R is not None:
             if all_R.ndim == 3:
                 # Safely handle uncompressed (per-image) vs compressed (per-run) arrays
-                if len(all_R) == total_images:
+                if len(all_R) == total_images and f_idx < len(all_R):
+                    return all_R[f_idx]
+                elif len(all_R) == len(img_keys_ordered):
                     return all_R[seq_idx]
                 else:
                     return all_R[run_id] if run_id < len(all_R) else all_R[0]
@@ -617,21 +769,33 @@ def integrate_peaks_rbf_ssn(
 
         # Dynamic fallback using exact goniometer kinematics
         if gonio_axes is not None and gonio_angles is not None:
-            # 1. Extract the specific angle array for this run
+            # 1. Extract the specific angle array for this frame or run
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes)
                 if gonio_angles.shape[1] == num_axes:
-                    ang = (
-                        gonio_angles[run_id, :]
-                        if run_id < gonio_angles.shape[0]
-                        else gonio_angles[0, :]
-                    )
+                    if (
+                        gonio_angles.shape[0] == total_images
+                        and f_idx < gonio_angles.shape[0]
+                    ):
+                        ang = gonio_angles[f_idx, :]
+                    else:
+                        ang = (
+                            gonio_angles[run_id, :]
+                            if run_id < gonio_angles.shape[0]
+                            else gonio_angles[0, :]
+                        )
                 else:
-                    ang = (
-                        gonio_angles[:, run_id]
-                        if run_id < gonio_angles.shape[1]
-                        else gonio_angles[:, 0]
-                    )
+                    if (
+                        gonio_angles.shape[1] == total_images
+                        and f_idx < gonio_angles.shape[1]
+                    ):
+                        ang = gonio_angles[:, f_idx]
+                    else:
+                        ang = (
+                            gonio_angles[:, run_id]
+                            if run_id < gonio_angles.shape[1]
+                            else gonio_angles[:, 0]
+                        )
             else:
                 ang = gonio_angles
 
@@ -667,22 +831,35 @@ def integrate_peaks_rbf_ssn(
     from subhkl.instrument.goniometer import sample_to_lab
 
     def get_s_lab_for_img(img_key_str, run_id, R_val):
+        f_idx = _frame_idx(img_key_str, run_id)
         # 1. Use exact dynamic kinematics if available
         if gonio_axes is not None and gonio_angles is not None:
             if gonio_angles.ndim == 2:
                 num_axes = len(gonio_axes)
                 if gonio_angles.shape[1] == num_axes:
-                    ang = (
-                        gonio_angles[run_id, :]
-                        if run_id < gonio_angles.shape[0]
-                        else gonio_angles[0, :]
-                    )
+                    if (
+                        gonio_angles.shape[0] == total_images
+                        and f_idx < gonio_angles.shape[0]
+                    ):
+                        ang = gonio_angles[f_idx, :]
+                    else:
+                        ang = (
+                            gonio_angles[run_id, :]
+                            if run_id < gonio_angles.shape[0]
+                            else gonio_angles[0, :]
+                        )
                 else:
-                    ang = (
-                        gonio_angles[:, run_id]
-                        if run_id < gonio_angles.shape[1]
-                        else gonio_angles[:, 0]
-                    )
+                    if (
+                        gonio_angles.shape[1] == total_images
+                        and f_idx < gonio_angles.shape[1]
+                    ):
+                        ang = gonio_angles[:, f_idx]
+                    else:
+                        ang = (
+                            gonio_angles[:, run_id]
+                            if run_id < gonio_angles.shape[1]
+                            else gonio_angles[:, 0]
+                        )
             else:
                 ang = gonio_angles
 
@@ -693,7 +870,16 @@ def integrate_peaks_rbf_ssn(
             elif offsets is None:
                 offsets_full = np.zeros((len(gonio_axes), 3))
             else:
-                offsets_full = offsets
+                offsets_full = np.array(offsets, dtype=float, copy=True)
+            if per_run_trans is not None:
+                r_id = (
+                    int(frame_to_run[f_idx])
+                    if frame_to_run is not None and f_idx < len(frame_to_run)
+                    else int(run_id)
+                )
+                if 0 <= r_id < len(per_run_trans):
+                    offsets_full = np.array(offsets_full, dtype=float, copy=True)
+                    offsets_full[-1] = offsets_full[-1] + per_run_trans[r_id]
 
             return sample_to_lab(
                 np.array([0.0, 0.0, 0.0]),
@@ -709,6 +895,14 @@ def integrate_peaks_rbf_ssn(
             if sample_offset is not None and sample_offset.ndim == 1
             else (sample_offset[-1] if sample_offset is not None else np.zeros(3))
         )
+        if per_run_trans is not None:
+            r_id = (
+                int(frame_to_run[f_idx])
+                if frame_to_run is not None and f_idx < len(frame_to_run)
+                else int(run_id)
+            )
+            if 0 <= r_id < len(per_run_trans):
+                s_off = s_off + per_run_trans[r_id]
         return R_val @ s_off if R_val is not None else s_off
 
     max_sigma = max(sigmas)
@@ -977,6 +1171,9 @@ def integrate_peaks_rbf_ssn(
         all_var_v = np.full(len(all_rs), nominal_sigma**2, dtype=np.float32)
         all_cov_uv = np.zeros(len(all_rs), dtype=np.float32)
     else:
+        import jax.numpy as jnp
+        from jax import jit, vmap
+
         # ==========================================
         # 4. Run the Global Optimizer
         # ==========================================
@@ -1065,6 +1262,7 @@ def integrate_peaks_rbf_ssn(
         static_valid=static_valid,
         profile=matrix_free_profile,
         fp_target=matrix_free_fp_target,
+        border_width=border_width,
         show_progress=show_progress,
     )
 
@@ -1110,10 +1308,20 @@ def integrate_peaks_rbf_ssn(
         valid_global_indices = []
         valid_local_indices = []
 
+        hi_r = (H - 1 - bw) if bw > 0 else H
+        hi_c = (W - 1 - bw) if bw > 0 else W
+
         for local_idx, global_idx in enumerate(indices):
             r = float(integrated_results[global_idx, 1])
             c = float(integrated_results[global_idx, 2])
-            if (bw <= r < H - bw) and (bw <= c < W - bw):
+            r_pred = float(all_rs[global_idx])
+            c_pred = float(all_cs[global_idx])
+            if (
+                (bw <= r < hi_r)
+                and (bw <= c < hi_c)
+                and (bw <= r_pred < hi_r)
+                and (bw <= c_pred < hi_c)
+            ):
                 valid_global_indices.append(global_idx)
                 valid_local_indices.append(local_idx)
 

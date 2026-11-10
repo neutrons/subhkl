@@ -20,8 +20,6 @@ of the batch on different devices.
 
 from __future__ import annotations
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 
 
@@ -35,6 +33,8 @@ def restrict_to_first_device() -> None:
     already been claimed.
     """
     try:
+        import jax
+
         jax.config.update("jax_cuda_visible_devices", "0")
     except Exception:
         pass
@@ -42,12 +42,16 @@ def restrict_to_first_device() -> None:
 
 def batch_devices(multi_gpu: bool) -> list:
     """The devices one batched computation may spread over."""
+    import jax
+
     devices = list(jax.devices())
     return devices if multi_gpu else devices[:1]
 
 
 def batch_sharding(devices: list):
     """A sharding that splits an array's leading axis across ``devices``."""
+    import jax
+
     mesh = jax.sharding.Mesh(np.asarray(devices), ("batch",))
     return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("batch"))
 
@@ -61,6 +65,8 @@ def pad_to_multiple(array, multiple: int):
     discard the padded tail, so the only cost is redundant work on at most
     ``multiple - 1`` items.
     """
+    import jax.numpy as jnp
+
     n = int(array.shape[0])
     pad = (-n) % int(multiple)
     if pad == 0:

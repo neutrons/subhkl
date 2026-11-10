@@ -9,7 +9,7 @@ dependencies = [
     "matplotlib>=3.8.4",
     "scikit-image>=0.23.2",
     "evosax>=0.2.0",
-    "jax[cpu]>=0.9.1",
+    "jax[cpu]>=0.9.1,<0.12",  # 0.12 breaks the mesolite indexing test, see #89
     "typer>=0.12.3",
     "opencv-python>=4.11.0",
     "gemmi>=0.7.3",
@@ -42,6 +42,17 @@ rocm = [
   "jax[rocm]",
 ]
 
+# ORNL NDIP / NOVA Trame MVVM web application dependencies
+nova = [
+  "pydantic>=2.0",
+  "nova-galaxy>=0.11.0",
+  "nova-mvvm>=1.0.0",
+  "nova-trame>=1.10.0",
+]
+
+[project.scripts]
+subhkl-nova-app = "subhkl.viz.nova_app.main:main"
+
 [tool.versioningit.vcs]
 method = "git"
 match = ["*"]
@@ -63,7 +74,7 @@ where = ["src"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
-"*" = ["*.yml","*.yaml","*.ini","*.json"]
+"*" = ["*.yml","*.yaml","*.ini","*.json","*.html"]
 
 [tool.pylint]
 max-line-length = 80

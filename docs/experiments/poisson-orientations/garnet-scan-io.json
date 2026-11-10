@@ -1,0 +1,27 @@
+{
+  "dataset": "CG4D garnet, runs 2022\u20132062, 21 settings",
+  "command": "solve merged.h5 solution.h5 --bootstrap blind.h5 --d-min 1.5 --binning 16 --no-refine",
+  "status": "not_converged",
+  "frames": 1114,
+  "settings": 21,
+  "geometry_parameters": [
+    "scale",
+    "tilt_x",
+    "tilt_y",
+    "roll_z",
+    "tx",
+    "ty",
+    "tz"
+  ],
+  "orientation_shape": [
+    21,
+    1,
+    3,
+    3
+  ],
+  "stationarity_residual": 0.0002204107941578548,
+  "stationarity_tolerance": 5.369713949447949e-05,
+  "inner_converged": false,
+  "usable_sample_U": false,
+  "rendered_overlays": 21
+}

@@ -1,15 +1,18 @@
+from subhkl.search.profiles import (
+    measure_radial_profile as _measure_radial_profile,
+    measure_whitened_profile as _measure_whitened_profile,
+)
+
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-import jax
-import jax.numpy as jnp
-import jax.scipy.signal
-import jax.scipy.sparse.linalg
 import numpy as np
-from jax import jit, lax, vmap
 
 from subhkl.utils import devices as device_util
+
+_SNAP_POSITIONS_JIT = None
+_SOLVE_IMAGE_AMPLITUDES_JIT = None
 
 # --- Carpet-fragmentation control --------------------------------------------
 #
@@ -341,133 +344,6 @@ def _moment_census(images, bg_map, bg_hi, counting=False, valid=None):
                     continue
                 amps.append(flux / (2.0 * np.pi * (0.5 * m2)))  # 2D: m2 = 2 sigma^2
     return np.asarray(amps, dtype=np.float64)
-
-
-def _measure_radial_profile(
-    images, bg_map, bg_hi, max_sigma, min_windows=8, u_max=4.0, du=0.1, valid=None
-):
-    """The peak family's radial profile, measured from the frames themselves.
-
-    The low-rank result that motivates this: stacking bright isolated peaks
-    (recentred on moment centroids, rescaled by moment widths) leaves the mean
-    profile carrying ~95% of the family's energy, so one measured trunk is the
-    family up to anisotropy.  Measuring it is the same box arithmetic as the
-    amplitude census -- no solve, no fit, no functional form:
-
-      per qualifying window: float centroid, m2 -> sigma_w; bin the
-      background-subtracted counts by u = r/sigma_w; normalise to unit flux;
-      average windows weighted by flux.
-
-    Binning around the *float* centroid handles sub-pixel centring without
-    interpolation.  Windows are the Voronoi (counting) census, so each peak
-    contributes once; the flux floor already clears 8 sigma of window-sum
-    noise, so a peak-free frame contributes nothing rather than a noise
-    profile.  Returns ``(u, f)`` with ``f[0] = 1``, or ``None`` when fewer
-    than ``min_windows`` qualify -- the caller then stays on the Gaussian,
-    which is the safe default rather than a profile made of too few peaks.
-    """
-    excess = np.asarray(images, dtype=np.float64) - np.asarray(bg_map, dtype=np.float64)
-    if excess.ndim == 2:
-        excess = excess[None, ...]
-    if valid is not None:
-        valid = np.asarray(valid)
-        if valid.ndim == 2:
-            valid = valid[None, ...]
-    edges = np.arange(0.0, u_max + du, du)
-    centres = 0.5 * (edges[1:] + edges[:-1])
-    acc = np.zeros(centres.size)
-    wgt = np.zeros(centres.size)
-    n_used = 0
-    for fi, frame in enumerate(excess):
-        H, W = frame.shape
-        # The window must hold a max_sigma peak out to ~2.5 sigma, or its
-        # second moment is so truncated that every measured width -- and with
-        # it the u = r/sigma axis -- is wrong.  Measured cost of the census
-        # default (17 px on a 512 frame, sigma up to 6.5): a pure-Gaussian
-        # synthetic read 43% too broad at u = 1.5.
-        step = max(8, int(np.ceil(2.5 * float(max_sigma))))
-        yy, xx = np.mgrid[-step : step + 1, -step : step + 1].astype(float)
-        for r0 in range(step, H - step, step):
-            for c0 in range(step, W - step, step):
-                # See _moment_census: masked structure must not become the
-                # measured peak profile.
-                if (
-                    valid is not None
-                    and valid[
-                        fi, r0 - step : r0 + step + 1, c0 - step : c0 + step + 1
-                    ].min()
-                    < 1.0
-                ):
-                    continue
-                win = frame[r0 - step : r0 + step + 1, c0 - step : c0 + step + 1]
-                flux = float(win.sum())
-                area = win.size
-                if flux < max(
-                    20.0 * bg_hi, 50.0, 8.0 * np.sqrt(max(bg_hi, 0.05) * area)
-                ):
-                    continue
-                # Centroid from clipped weights (stability); everything after
-                # from *unclipped* values inside a *circular* mask.  Clipping
-                # rectifies background noise into a pedestal that inflates m2,
-                # and a square window's corners do the same relative to the
-                # circular truncation model inverted below -- together they
-                # read a pure-Gaussian synthetic 20-40% wrong in width.
-                w = np.maximum(win, 0.0)
-                tot = w.sum()
-                if tot <= 0:
-                    continue
-                dr = (w * yy).sum() / tot
-                dc = (w * xx).sum() / tot
-                # Voronoi ownership: only the window that owns its centroid.
-                if abs(dr) > step / 2 or abs(dc) > step / 2:
-                    continue
-                d2 = (yy - dr) ** 2 + (xx - dc) ** 2
-                disk = d2 <= step**2
-                flux_d = float(win[disk].sum())
-                if flux_d <= 0:
-                    continue
-                m2 = float((win[disk] * d2[disk]).sum()) / flux_d
-                # Invert the truncation: inside radius R a Gaussian returns
-                # m2 = sigma^2 * 2(1 - (1+x)e^-x)/(1 - e^-x), x = R^2/2sigma^2.
-                # A damped fixed point converges in a few steps and needs no
-                # bracketing solver.
-                sigma_w = np.sqrt(max(m2, 1e-9) / 2.0)
-                for _ in range(8):
-                    x = step**2 / (2.0 * sigma_w**2)
-                    ex = np.exp(-min(x, 60.0))
-                    ratio = 2.0 * (1.0 - (1.0 + x) * ex) / max(1.0 - ex, 1e-9)
-                    new_sigma = np.sqrt(max(m2, 1e-9) / max(ratio, 1e-9))
-                    if abs(new_sigma - sigma_w) < 0.005:
-                        sigma_w = new_sigma
-                        break
-                    sigma_w = 0.5 * (sigma_w + new_sigma)
-                # A width at the window scale was never bracketed.
-                if sigma_w < 0.5 or sigma_w > step / 2.5:
-                    continue
-                u = np.sqrt(d2[disk]).ravel() / sigma_w
-                v = win[disk].ravel() / flux_d
-                which = np.clip((u / du).astype(int), 0, centres.size - 1)
-                inside = u < u_max
-                # Flux-weighted mean of the unit-flux pixel values per u bin:
-                # acc/wgt is then the average profile, bright peaks weighted by
-                # their better statistics.
-                np.add.at(acc, which[inside], flux * v[inside])
-                counts = np.bincount(which[inside], minlength=centres.size).astype(
-                    float
-                )
-                wgt += flux * counts
-                n_used += 1
-    if n_used < min_windows:
-        return None
-    ok = wgt > 0
-    f = np.zeros(centres.size)
-    f[ok] = acc[ok] / wgt[ok]
-    # Per-bin averages of per-pixel values: convert back to a profile by
-    # normalising the centre to 1; the kernel builder only needs the shape.
-    if f[0] <= 0:
-        return None
-    f = np.maximum(f / f[0], 0.0)
-    return centres[ok], f[ok]
 
 
 def _moment_peak_amplitude(images, bg_map, bg_hi, quantile=90.0, valid=None):
@@ -996,6 +872,8 @@ class MatrixFreeSparseRBFPeakFinder:
         Auto-sized banks call this again from find_peaks_batch when the real
         frame and measured background imply a different grid than the
         construction-time assumptions did."""
+        import jax.numpy as jnp
+
         self.num_sigmas = len(sigma_grid)
         self.sigmas = jnp.asarray(np.asarray(sigma_grid), dtype=jnp.float32)
         # Per-channel scale.  ``sigmas`` is the public scale grid and never
@@ -1024,10 +902,23 @@ class MatrixFreeSparseRBFPeakFinder:
         # stale traces silently -- _extract_peaks_all would read widths off
         # the old grid.  Resizing is rare, so drop every cached trace and
         # let the next call retrace against the new bank.
+        self._jit_cache = {}
         for name in dir(type(self)):
             fn = getattr(type(self), name, None)
             if hasattr(fn, "clear_cache"):
                 fn.clear_cache()
+
+    def _get_jit(self, name, impl, static_argnames=()):
+        cache = self.__dict__.setdefault("_jit_cache", {})
+        if name not in cache:
+            from jax import jit
+
+            cache[name] = (
+                partial(jit, static_argnames=list(static_argnames))(impl)
+                if static_argnames
+                else jit(impl)
+            )
+        return cache[name]
 
     def effective_alpha(self, height, width):
         """Per-scale significance threshold, in units of the dual's noise.
@@ -1079,6 +970,10 @@ class MatrixFreeSparseRBFPeakFinder:
         ``max(alpha, z*) * w_k``, so a user can demand more evidence than
         false-alarm control requires but not less.
         """
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import lax
+
         # The calibration sums over *scales*, not channels.  Shape variants at
         # one (site, scale) are the same statistical test -- their kernels
         # correlate at ~0.99 -- so counting each channel would solve z against
@@ -1142,6 +1037,8 @@ class MatrixFreeSparseRBFPeakFinder:
         uses its FFT path; the separable erf fast path stays for the default
         Gaussian bank.
         """
+        import jax.numpy as jnp
+
         mode = self.profile_file
         gaussian_trunk = mode in (None, "gaussian", "none") or (
             mode == "auto" and self._measured_trunk is None
@@ -1222,6 +1119,10 @@ class MatrixFreeSparseRBFPeakFinder:
         return kernels_2d[:, None, :, :], sq_norms
 
     def _build_gaussian_bank(self):
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import vmap
+
         k_grid = jnp.arange(-self.max_k_rad, self.max_k_rad + 1)
         yy, xx = jnp.meshgrid(k_grid, k_grid, indexing="ij")
 
@@ -1267,6 +1168,8 @@ class MatrixFreeSparseRBFPeakFinder:
     @staticmethod
     def _sep_depthwise(x, rows, cols):
         """Two 1D depthwise passes; rows [K,1,t,1], cols [K,1,1,t]."""
+        from jax import lax
+
         K = rows.shape[0]
         y = lax.conv_general_dilated(
             x,
@@ -1410,6 +1313,9 @@ class MatrixFreeSparseRBFPeakFinder:
         return getattr(self, "use_sm_precond", False) and self._use_fft(self.K_weights)
 
     def _forward_op(self, c, weights):
+        import jax.numpy as jnp
+        from jax import lax
+
         if self._use_fft(weights):
             H, W = c.shape[-2:]
             nf = self._fft_len(max(H, W) + 2 * self.max_k_rad)
@@ -1431,6 +1337,9 @@ class MatrixFreeSparseRBFPeakFinder:
         )
 
     def _adjoint_op(self, u, weights):
+        import jax.numpy as jnp
+        from jax import lax
+
         if self._use_fft(weights):
             H, W = u.shape[-2:]
             nf = self._fft_len(max(H, W) + 2 * self.max_k_rad)
@@ -1451,8 +1360,19 @@ class MatrixFreeSparseRBFPeakFinder:
             dimension_numbers=("NCHW", "OIHW", "NCHW"),
         )
 
-    @partial(jit, static_argnames=["self", "max_iter"])
     def _solve_ssn_cg_global(self, y_img, bg_img, valid_img=None, max_iter=100):
+        fn = self._get_jit(
+            "_solve_ssn_cg_global",
+            self._solve_ssn_cg_global_impl,
+            static_argnames=("max_iter",),
+        )
+        return fn(y_img, bg_img, valid_img=valid_img, max_iter=max_iter)
+
+    def _solve_ssn_cg_global_impl(self, y_img, bg_img, valid_img=None, max_iter=100):
+        import jax.numpy as jnp
+        import jax.scipy.sparse.linalg
+        from jax import lax
+
         H, W = y_img.shape
         y = y_img[None, None, :, :]
         bg = bg_img[None, None, :, :]
@@ -1935,8 +1855,15 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return c_l1[0]
 
-    @partial(jit, static_argnames=["self", "border"])
     def _rank_support(self, c_tensor, border=0, valid=None):
+        fn = self._get_jit(
+            "_rank_support",
+            self._rank_support_impl,
+            static_argnames=("border",),
+        )
+        return fn(c_tensor, border=border, valid=valid)
+
+    def _rank_support_impl(self, c_tensor, border=0, valid=None):
         """Rank the significance-gated support of one image, capacity-free.
 
         Everything here is independent of how many peaks there are -- the
@@ -1947,6 +1874,12 @@ class MatrixFreeSparseRBFPeakFinder:
         exact support count; the capacity-dependent work (measuring and
         refining candidates) happens downstream in fixed-size chunks.
         """
+        import jax
+        import jax.numpy as jnp
+        import jax.scipy.signal
+        import jax.scipy.special
+        from jax import lax
+
         c_tot = jnp.sum(c_tensor, axis=0)  # [H, W]
 
         # Smooth the discrete L1 coefficients to recover true continuous center
@@ -2007,11 +1940,17 @@ class MatrixFreeSparseRBFPeakFinder:
         order = jnp.argsort(c_flat)[::-1]
         return order, jnp.sum(is_max)
 
-    @partial(jit, static_argnames=["self"])
     def _measure_candidates(self, c_tensor, idx):
+        fn = self._get_jit("_measure_candidates", self._measure_candidates_impl)
+        return fn(c_tensor, idx)
+
+    def _measure_candidates_impl(self, c_tensor, idx):
         """Read (amplitude, row, column, sigma) for one fixed-size chunk of
         ranked candidate indices.  Shapes depend only on the image and the
         chunk length, never on the support size, so this compiles once."""
+        import jax.numpy as jnp
+        from jax import lax, vmap
+
         H, W = c_tensor.shape[1], c_tensor.shape[2]
 
         def process_peak(idx):
@@ -2072,10 +2011,16 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return vmap(process_peak)(idx)
 
-    @partial(jit, static_argnames=["self"])
     def _render_atoms(self, y_img, peaks, active):
+        fn = self._get_jit("_render_atoms", self._render_atoms_impl)
+        return fn(y_img, peaks, active)
+
+    def _render_atoms_impl(self, y_img, peaks, active):
         """Render one chunk of atoms into an [H, W] image, boxes clipped at
         the borders exactly as ``_refine_peaks`` renders them."""
+        import jax.numpy as jnp
+        import jax.scipy.special
+
         H, W = y_img.shape
         P = 2 * self.max_k_rad + 1
         off = jnp.arange(P, dtype=jnp.float32)
@@ -2163,6 +2108,8 @@ class MatrixFreeSparseRBFPeakFinder:
     def _extract_dispatch(self, c_tensor, y_img, bg_img, ranked):
         """Dispatch one image's measurement and refinement; sync only on the
         support count.  Returns opaque state for :meth:`_extract_finalize`."""
+        import jax.numpy as jnp
+
         order, count = ranked
         n = int(count)
         if n == 0:
@@ -2208,8 +2155,15 @@ class MatrixFreeSparseRBFPeakFinder:
         mask_all = np.concatenate(masks)
         return peaks_all[mask_all].astype(np.float32)
 
-    @partial(jit, static_argnames=["self", "n_steps"])
     def _refine_peaks(self, y_img, bg_img, peaks, active, n_steps=200):
+        fn = self._get_jit(
+            "_refine_peaks",
+            self._refine_peaks_impl,
+            static_argnames=("n_steps",),
+        )
+        return fn(y_img, bg_img, peaks, active, n_steps=n_steps)
+
+    def _refine_peaks_impl(self, y_img, bg_img, peaks, active, n_steps=200):
         """Continuous ("sliding") refinement of the selected support.
 
         The convex solve picks *which* atoms are present, but it can only place
@@ -2225,6 +2179,11 @@ class MatrixFreeSparseRBFPeakFinder:
         model, so cost is O(n_peaks * patch^2) rather than O(n_peaks * H * W)
         and this stays affordable on full detector images.
         """
+        import jax
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import lax
+
         H, W = y_img.shape
         P = 2 * self.max_k_rad + 1
         off = jnp.arange(P, dtype=jnp.float32)
@@ -2352,6 +2311,10 @@ class MatrixFreeSparseRBFPeakFinder:
         the batched hot path.  Returns (eig_total, eig_silence), each of
         shape [N, 2], ascending.
         """
+        import jax
+        import jax.numpy as jnp
+        import jax.scipy.special
+
         y = jnp.asarray(y_img)
         bg = jnp.asarray(bg_img)
         peaks = jnp.asarray(peaks)
@@ -2399,6 +2362,9 @@ class MatrixFreeSparseRBFPeakFinder:
         return eig_total, eig_silence
 
     def find_peaks_batch(self, images_batch, valid=None):
+        import jax
+        import jax.numpy as jnp
+
         # Detector frames arrive as integer counts.  Everything below is a
         # convolution, and cuDNN will not lower an integer convolution, so the
         # cast is required rather than cosmetic: without it the background
@@ -3017,8 +2983,11 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return results
 
-    @partial(jit, static_argnames=["self"])
     def _peak_metrics_image(self, peaks, target, bg):
+        fn = self._get_jit("_peak_metrics_image", self._peak_metrics_image_impl)
+        return fn(peaks, target, bg)
+
+    def _peak_metrics_image_impl(self, peaks, target, bg):
         """Leave-one-out and local residual deviance for every atom of one image.
 
         **Leave-one-out deviance.**
@@ -3086,6 +3055,9 @@ class MatrixFreeSparseRBFPeakFinder:
         116.8 on the sigma = 1 case above) because it averages the mismatch
         against a large annulus of pure background.
         """
+        import jax.numpy as jnp
+        import jax.scipy.special
+
         R = self.max_k_rad
         d = jnp.arange(-R, R + 1)
         dy, dx = jnp.meshgrid(d, d, indexing="ij")
@@ -3227,6 +3199,8 @@ class MatrixFreeSparseRBFPeakFinder:
             ``compute_metrics``, whose per-atom parameter penalty is the
             anti-tiling term the local metrics lack.
         """
+        import jax.numpy as jnp
+
         B = images_raw.shape[0]
         max_k = max([len(p) for p in peaks_list] + [1])
 
@@ -3274,8 +3248,15 @@ class MatrixFreeSparseRBFPeakFinder:
 
         return out, out_res
 
-    @partial(jit, static_argnames=["self"])
     def _predict_batch_scan(self, peaks, x_grid):
+        fn = self._get_jit("_predict_batch_scan", self._predict_batch_scan_impl)
+        return fn(peaks, x_grid)
+
+    def _predict_batch_scan_impl(self, peaks, x_grid):
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import vmap
+
         def render_peak(p):
             total_I, r, c, sigma = p[0], p[1], p[2], p[3]
             sig_sq2 = sigma * jnp.sqrt(2.0) + 1e-6
@@ -3298,6 +3279,10 @@ class MatrixFreeSparseRBFPeakFinder:
             images_raw, bg_map: [photons/Pixel]
             global_max: [photons/Pixel]
         """
+        import jax.numpy as jnp
+        import jax.scipy.special
+        from jax import jit
+
         B, H, W = images_raw.shape
         yy, xx = np.indices((H, W))  # [Pixel^0.5]
         x_grid = jnp.array([yy, xx])  # [Pixel^0.5]
@@ -3444,8 +3429,7 @@ def _footprint_mask(B, H, W, frames, rs, cs, var_us, var_vs, cov_uvs):
     return valid
 
 
-@partial(jit, static_argnames=["patch_size"])
-def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
+def _snap_positions_impl(images, bg_maps, valid, frames, rs, cs, patch_size=15):
     """Log-parabolic sub-pixel snap, the patch integrator's estimator.
 
     Args:
@@ -3456,6 +3440,11 @@ def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
     Returns:
         snapped (rs, cs), each clamped to +-MAX_SNAP_SHIFT of the input
     """
+    import jax.numpy as jnp
+    import jax.scipy.signal
+    import jax.scipy.special
+    from jax import lax, vmap
+
     P = patch_size
     half = P // 2
     pad = P
@@ -3499,128 +3488,20 @@ def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
     return vmap(snap_one)(frames, rs, cs)
 
 
-def _measure_whitened_profile(
-    images,
-    rate_maps,
-    valid,
-    frames,
-    rs,
-    cs,
-    var_us,
-    var_vs,
-    cov_uvs,
-    min_peaks=50,
-    u_max=4.0,
-    du=0.1,
-):
-    """The reflection family's radial profile, measured in model sigmas.
+def _snap_positions(images, bg_maps, valid, frames, rs, cs, patch_size=15):
+    global _SNAP_POSITIONS_JIT
+    if _SNAP_POSITIONS_JIT is None:
+        from jax import jit
 
-    The finder's ``_measure_radial_profile`` census, upgraded with what
-    the integrator knows and the finder had to estimate: centroids come
-    from the predicted (snapped) positions instead of window moments,
-    the u axis is the MAHALANOBIS radius of each peak's projected
-    covariance instead of an isotropic moment width -- so anisotropy is
-    divided out exactly, and the rank-1-after-scale result the finder
-    measured on cg4d-garnet (mean profile = 95.5% of family energy)
-    holds a fortiori: on cg4d-t4-lysozyme the whitened mean peak is
-    round to the eye at 3 sigma -- and the background under each window
-    is the footprint-masked rate map instead of a local ring, so the
-    profile's own tails cannot subtract themselves.
-
-    Same guards as the finder: a window flux floor at 8 sigma of the
-    background noise, one vote per peak, windows overlapping another
-    footprint or a masked pixel are skipped, flux-weighted averaging,
-    and ``None`` (caller stays on the Gaussian) when fewer than
-    ``min_peaks`` qualify.  No functional form is fitted anywhere.
-
-    Returns:
-        (u, f) with f[0] = 1, or None.
-    """
-    edges = np.arange(0.0, u_max + du, du)
-    centres = 0.5 * (edges[1:] + edges[:-1])
-    acc = np.zeros(centres.size)
-    wgt = np.zeros(centres.size)
-    n_used = 0
-
-    sig_maj = np.sqrt(
-        0.5 * (var_us + var_vs)
-        + np.sqrt(np.maximum(0.25 * (var_us - var_vs) ** 2 + cov_uvs**2, 0.0))
+        _SNAP_POSITIONS_JIT = partial(jit, static_argnames=["patch_size"])(
+            _snap_positions_impl
+        )
+    return _SNAP_POSITIONS_JIT(
+        images, bg_maps, valid, frames, rs, cs, patch_size=patch_size
     )
-    B, H, W = images.shape
-    by_frame = [np.where(frames == f)[0] for f in range(B)]
-
-    for f in range(B):
-        idx = by_frame[f]
-        if len(idx) == 0:
-            continue
-        img = np.asarray(images[f], dtype=np.float64)
-        bg = np.asarray(rate_maps[f], dtype=np.float64)
-        v = np.asarray(valid[f], dtype=np.float64)
-        for i in idx:
-            half = int(np.ceil(u_max * sig_maj[i])) + 1
-            r0, c0 = int(round(rs[i])), int(round(cs[i]))
-            if not (half <= r0 < H - half and half <= c0 < W - half):
-                continue
-            # one vote per peak: skip windows contaminated by a
-            # neighbouring footprint (3 sigma_major each)
-            others = idx[idx != i]
-            if len(others):
-                d = np.hypot(rs[others] - rs[i], cs[others] - cs[i])
-                if np.any(d < 3.0 * (sig_maj[others] + sig_maj[i])):
-                    continue
-            win_v = v[r0 - half : r0 + half + 1, c0 - half : c0 + half + 1]
-            if win_v.min() < 1.0:
-                continue
-            win = (
-                img[r0 - half : r0 + half + 1, c0 - half : c0 + half + 1]
-                - bg[r0 - half : r0 + half + 1, c0 - half : c0 + half + 1]
-            )
-            dv, dr = np.mgrid[-half : half + 1, -half : half + 1].astype(float)
-            dv += r0 - rs[i]
-            dr += c0 - cs[i]
-            det = max(var_us[i] * var_vs[i] - cov_uvs[i] ** 2, 1e-6)
-            m = np.sqrt(
-                (var_vs[i] * dr**2 - 2.0 * cov_uvs[i] * dr * dv + var_us[i] * dv**2)
-                / det
-            )
-            disk = m < u_max
-            flux = float(win[disk].sum())
-            bg_hi = float(np.median(bg[r0, c0 - half : c0 + half + 1]))
-            area = int(disk.sum())
-            if flux < max(50.0, 8.0 * np.sqrt(max(bg_hi, 0.05) * area)):
-                continue
-            u = m[disk].ravel()
-            val = win[disk].ravel() / flux
-            # Linear bin sharing: each pixel splits its vote between the
-            # two nearest bin centres.  A hard assignment aliases against
-            # the pixel lattice -- peaks near-integer positions sample m
-            # at discrete radii, and when several peaks are in phase the
-            # binned profile turns into a comb (measured on a synthetic
-            # integer grid: non-monotone by 40%).  Sharing is the same
-            # census with a triangular kernel one bin wide, not a fit.
-            t = np.clip(u / du - 0.5, 0.0, centres.size - 1.0)
-            lo = np.floor(t).astype(int)
-            hi = np.minimum(lo + 1, centres.size - 1)
-            w_hi = t - lo
-            np.add.at(acc, lo, flux * val * (1.0 - w_hi))
-            np.add.at(acc, hi, flux * val * w_hi)
-            np.add.at(wgt, lo, flux * (1.0 - w_hi))
-            np.add.at(wgt, hi, flux * w_hi)
-            n_used += 1
-
-    if n_used < min_peaks:
-        return None
-    ok = wgt > 0
-    f_prof = np.zeros(centres.size)
-    f_prof[ok] = acc[ok] / wgt[ok]
-    if f_prof[0] <= 0:
-        return None
-    f_prof = np.maximum(f_prof / f_prof[0], 0.0)
-    return centres, f_prof
 
 
-@jit
-def _solve_image_amplitudes(
+def _solve_image_amplitudes_impl(
     image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, admission_z, profile=None
 ):
     """One image, all its reflections: L1-admitted, debiased Poisson solve.
@@ -3667,6 +3548,9 @@ def _solve_image_amplitudes(
     Returns:
         (flux [photons], sigma [photons]) per atom
     """
+    import jax.numpy as jnp
+    from jax import vmap
+
     H, W = image.shape
     yy, xx = jnp.indices((H, W), dtype=jnp.float32)
     v_flat = valid.flatten()
@@ -3724,6 +3608,29 @@ def _solve_image_amplitudes(
     return c, sigma
 
 
+def _solve_image_amplitudes(
+    image, bg, valid, rs, cs, var_u, var_v, cov_uv, atom_ok, admission_z, profile=None
+):
+    global _SOLVE_IMAGE_AMPLITUDES_JIT
+    if _SOLVE_IMAGE_AMPLITUDES_JIT is None:
+        from jax import jit
+
+        _SOLVE_IMAGE_AMPLITUDES_JIT = jit(_solve_image_amplitudes_impl)
+    return _SOLVE_IMAGE_AMPLITUDES_JIT(
+        image,
+        bg,
+        valid,
+        rs,
+        cs,
+        var_u,
+        var_v,
+        cov_uv,
+        atom_ok,
+        admission_z,
+        profile=profile,
+    )
+
+
 def integrate_reflections_matrix_free(
     images_batch,
     frames,
@@ -3738,6 +3645,7 @@ def integrate_reflections_matrix_free(
     profile="gaussian",
     profile_min_peaks=50,
     fp_target=None,
+    border_width=0,
     rate_chunk_size=64,
     show_progress=False,
 ):
@@ -3787,6 +3695,7 @@ def integrate_reflections_matrix_free(
     """
     # Local import: sparse_rbf imports this function lazily at its call
     # site, so a top-level import there would be circular.
+    import jax.numpy as jnp
     from subhkl.search.sparse_rbf import compute_rate_batch
 
     B, H, W = images_batch.shape
@@ -3801,7 +3710,16 @@ def integrate_reflections_matrix_free(
     var_vs = np.asarray(var_vs, dtype=np.float32)
     cov_uvs = np.asarray(cov_uvs, dtype=np.float32)
 
-    filter_size = max(15, int(max_sigma * 5))
+    # Scale the background box window so its span exceeds the 3.5*sigma
+    # footprint exclusion diameter even when fitted 3D shape/mosaicity
+    # produces broader ellipses than the nominal CLI max_sigma.
+    fitted_sigma_p90 = (
+        float(np.percentile(np.sqrt(np.maximum(var_us, var_vs)), 90))
+        if len(var_us) > 0
+        else 0.0
+    )
+    eff_max_sigma = max(float(max_sigma), fitted_sigma_p90 * 1.5)
+    filter_size = max(15, int(eff_max_sigma * 5))
     if filter_size % 2 == 0:
         filter_size += 1
 
@@ -3817,6 +3735,12 @@ def integrate_reflections_matrix_free(
     rate_valid = static_valid * _footprint_mask(
         B, H, W, frames, rs, cs, var_us, var_vs, cov_uvs
     )
+    edge_pad = min(int(border_width), 5, H // 8, W // 8)
+    if edge_pad > 0:
+        rate_valid[:, :edge_pad, :] = 0.0
+        rate_valid[:, H - edge_pad :, :] = 0.0
+        rate_valid[:, :, :edge_pad] = 0.0
+        rate_valid[:, :, W - edge_pad :] = 0.0
 
     images_jax = jnp.array(images_batch, dtype=jnp.float32)
     static_valid_jax = jnp.array(static_valid)

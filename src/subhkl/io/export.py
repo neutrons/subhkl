@@ -84,9 +84,19 @@ class BaseConcatenateMerger:
 
                 for merge_key in self.merge_keys:
                     # Use the shape from the typical file
-                    shape = (total_peaks,) + f_typical[merge_key].shape[1:]
+                    tail_shape = f_typical[merge_key].shape[1:]
+                    shape = (total_peaks,) + tail_shape
                     dtype = f_typical[merge_key].dtype
-                    f_out.create_dataset(merge_key, shape, dtype)
+                    if len(shape) >= 3 and total_peaks > 0:
+                        f_out.create_dataset(
+                            merge_key,
+                            shape,
+                            dtype,
+                            chunks=(1,) + tail_shape,
+                            compression="lzf",
+                        )
+                    else:
+                        f_out.create_dataset(merge_key, shape, dtype)
 
                 for per_file_key in self.per_file_keys:
                     if per_file_key in f_typical:
@@ -271,8 +281,16 @@ class MTZExporter:
             if corrections_file is not None:
                 with h5py.File(corrections_file) as fc:
                     g = fc.get("goniometer/per_run")
+                    # Either correction can be present alone (an angle-only
+                    # or a translation-only refinement), so size the run
+                    # axis off whichever exists -- reading delta_deg to get
+                    # n_runs BEFORE testing for it made its own guard dead
+                    # code and raised KeyError on a translation-only file.
+                    sizer = None
                     if g is not None:
-                        n_runs = len(g["delta_deg"])
+                        sizer = g["delta_deg"] if "delta_deg" in g else g.get("trans_m")
+                    if sizer is not None:
+                        n_runs = len(sizer)
                         run_c = np.clip(run_raw, 0, n_runs - 1)
                         if "delta_deg" in g:
                             self.extra["DPHI"] = (
