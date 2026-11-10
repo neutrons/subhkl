@@ -3,7 +3,10 @@ import os
 import sys
 from typing import Annotated
 
-if "rainbow-visualize" in sys.argv:
+if any(
+    cmd in sys.argv
+    for cmd in ("rainbow-visualize", "reduce", "reduce-batch", "merge-images")
+):
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import h5py
@@ -22,6 +25,7 @@ from subhkl.commands import (
     run_peak_predictor,
     run_rbf_integrator,
     run_reduce,
+    run_reduce_batch,
     run_static_mask,
     run_sum_images,
 )
@@ -1023,7 +1027,7 @@ def integrator(
     ] = None,
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
-    ] = 0.0,
+    ] = 0.03,
     show_progress: Annotated[bool, typer.Option("--show-progress")] = True,
     create_visualizations: bool = False,
     chunk_size: int = 256,
@@ -1224,11 +1228,53 @@ def reduce(
 
 
 @app.command()
-def merge_images(
-    input_pattern: Annotated[
+def reduce_batch(
+    nexus_filenames: Annotated[
         list[str],
         typer.Argument(
-            help="Glob pattern or list of reduced .h5 files (e.g. 'reduced/*.h5')"
+            help="List of input NeXus (.nxs.h5) files to reduce in parallel"
+        ),
+    ],
+    output_dir: Annotated[
+        str,
+        typer.Option("--output-dir", "-o", help="Directory for *.reduce.h5 outputs"),
+    ] = "out",
+    instrument: Annotated[
+        str, typer.Option("--instrument", "-i", help="Instrument name")
+    ] = "CG4D",
+    wavelength_min: Annotated[
+        float | None, typer.Option(help="Override min wavelength")
+    ] = None,
+    wavelength_max: Annotated[
+        float | None, typer.Option(help="Override max wavelength")
+    ] = None,
+    workers: Annotated[
+        int | None, typer.Option(help="Max parallel CPU worker processes")
+    ] = None,
+):
+    os.makedirs(output_dir, exist_ok=True)
+    tasks: list[tuple[str, str]] = []
+    for idx, nxs_p in enumerate(nexus_filenames):
+        bn = os.path.basename(nxs_p).split(".")[0] or f"run_{idx:03d}"
+        out_p = os.path.join(output_dir, f"{bn}.reduce.h5")
+        if any(existing_out == out_p for _, existing_out in tasks):
+            out_p = os.path.join(output_dir, f"{idx:03d}_{bn}.reduce.h5")
+        tasks.append((nxs_p, out_p))
+    run_reduce_batch(
+        tasks,
+        instrument,
+        wavelength_min=wavelength_min,
+        wavelength_max=wavelength_max,
+        max_workers=workers,
+    )
+
+
+@app.command()
+def merge_images(
+    input_pattern: Annotated[
+        str,
+        typer.Argument(
+            help="Glob pattern or space-separated list of reduced .h5 files (e.g. 'reduced/*.h5')"
         ),
     ],
     output_filename: Annotated[str, typer.Argument(help="Output master .h5 file")],
@@ -1241,13 +1287,8 @@ def merge_images(
     space_group: str = typer.Argument(..., help="Space group (e.g. 'P 1')"),
 ):
     try:
-        joined_pattern = (
-            " ".join(str(p) for p in input_pattern)
-            if isinstance(input_pattern, (list, tuple))
-            else str(input_pattern)
-        )
         run_merge_images(
-            joined_pattern, output_filename, a, b, c, alpha, beta, gamma, space_group
+            input_pattern, output_filename, a, b, c, alpha, beta, gamma, space_group
         )
 
     except ValueError as e:

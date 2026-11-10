@@ -120,7 +120,12 @@ def discover(args, samples=16384, candidates=6, seed=0):
     blind_path = Path(args.output).with_suffix(".blind.h5")
     src_nexus = getattr(args, "nexus", getattr(args, "input", ""))
 
-    def _write_blind_rung(stage_label: str, nz_val: int, u_cand: np.ndarray) -> None:
+    def _write_blind_rung(
+        stage_label: str,
+        nz_val: int,
+        u_cand: np.ndarray,
+        geom_fit: dict | None = None,
+    ) -> None:
         tmp_path = blind_path.with_suffix(".blind.tmp.h5")
         try:
             with h5py.File(tmp_path, "w") as bf:
@@ -128,11 +133,50 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 bf["sample/U"] = np.asarray(u_cand, dtype=float)
                 bf["sample/B"] = np.asarray(B, dtype=float)
                 bf["sample/cell"] = np.asarray(args.cell, dtype=float)
+                for k_c, v_c in zip(
+                    ("a", "b", "c", "alpha", "beta", "gamma"), args.cell[:6]
+                ):
+                    bf[f"sample/{k_c}"] = float(v_c)
                 bf["sample/space_group"] = str(args.space_group)
                 bf["instrument/name"] = str(args.instrument)
                 bf["instrument/wavelength"] = np.asarray(
                     [args.wl_min, args.wl_max], dtype=float
                 )
+                if geom_fit is not None:
+                    r_sc = float(geom_fit.get("radial_scale", 0.0))
+                    r_vec = np.asarray(
+                        geom_fit.get("global_rot_vec", np.zeros(3)), dtype=float
+                    )
+                    t_vec = np.asarray(
+                        geom_fit.get("global_trans_m", np.zeros(3)), dtype=float
+                    )
+                    rot_m = Rotation.from_rotvec(r_vec).as_matrix()
+                    cal_g = bf.create_group("detector_calibration")
+                    for b_k, b_cfg in beamlines[args.instrument].items():
+                        try:
+                            b_id = int(b_k)
+                        except (ValueError, TypeError):
+                            continue
+                        det_b = Detector(dict(b_cfg))
+                        mid_b = (
+                            det_b.center
+                            + 0.5 * det_b.width * det_b.uhat
+                            + 0.5 * det_b.height * det_b.vhat
+                        )
+                        mid_cal = mid_b * (1.0 + r_sc) @ rot_m.T + t_vec
+                        uh_cal = det_b.uhat @ rot_m.T
+                        vh_cal = det_b.vhat @ rot_m.T
+                        cen_cal = (
+                            mid_cal
+                            - 0.5 * det_b.width * uh_cal
+                            - 0.5 * det_b.height * vh_cal
+                        )
+                        bg = cal_g.create_group(f"bank_{b_id}")
+                        bg["center"] = np.asarray(cen_cal, dtype=float)
+                        bg["uhat"] = np.asarray(uh_cal, dtype=float)
+                        bg["vhat"] = np.asarray(vh_cal, dtype=float)
+                        bg["width"] = float(det_b.width)
+                        bg["height"] = float(det_b.height)
                 sg = bf.create_group("search")
                 sg.attrs["source"] = str(Path(src_nexus).resolve()) if src_nexus else ""
                 sg.attrs["instrument"] = str(args.instrument)
@@ -143,7 +187,6 @@ def discover(args, samples=16384, candidates=6, seed=0):
         except Exception:
             pass
 
-    _write_blind_rung("init", 13, np.eye(3))
     print(
         f"Blind band search: {len(weights)} stable-run observations, {len(idx)} search observations (exhaustive rung init)",
         flush=True,
@@ -195,7 +238,9 @@ def discover(args, samples=16384, candidates=6, seed=0):
         )
         fits.append(fit)
         best_fit_so_far = max(fits, key=lambda f_it: f_it["score"])
-        _write_blind_rung(f"joint_{i}", 60, best_fit_so_far["U"])
+        _write_blind_rung(
+            f"joint_{i}", 60, best_fit_so_far["U"], geom_fit=best_fit_so_far
+        )
         print(
             f"  candidate {i}: score {fit['score']:.6g}, radial {fit['radial_scale']:+.4f}",
             flush=True,
@@ -255,9 +300,35 @@ def discover(args, samples=16384, candidates=6, seed=0):
         f["sample/U"] = U_shared[selected]
         f["sample/B"] = B
         f["sample/cell"] = np.asarray(args.cell, dtype=float)
+        for k_c, v_c in zip(("a", "b", "c", "alpha", "beta", "gamma"), args.cell[:6]):
+            f[f"sample/{k_c}"] = float(v_c)
         f["sample/space_group"] = str(args.space_group)
         f["instrument/name"] = str(args.instrument)
         f["instrument/wavelength"] = np.asarray([args.wl_min, args.wl_max], dtype=float)
+        r_sc = float(geometry.get("radial_scale", 0.0))
+        t_vec = np.asarray(geometry.get("global_trans_m", np.zeros(3)), dtype=float)
+        cal_g = f.create_group("detector_calibration")
+        for b_k, b_cfg in beamlines[args.instrument].items():
+            try:
+                b_id = int(b_k)
+            except (ValueError, TypeError):
+                continue
+            det_b = Detector(dict(b_cfg))
+            mid_b = (
+                det_b.center
+                + 0.5 * det_b.width * det_b.uhat
+                + 0.5 * det_b.height * det_b.vhat
+            )
+            mid_cal = mid_b * (1.0 + r_sc) @ rot.T + t_vec
+            uh_cal = det_b.uhat @ rot.T
+            vh_cal = det_b.vhat @ rot.T
+            cen_cal = mid_cal - 0.5 * det_b.width * uh_cal - 0.5 * det_b.height * vh_cal
+            bg = cal_g.create_group(f"bank_{b_id}")
+            bg["center"] = np.asarray(cen_cal, dtype=float)
+            bg["uhat"] = np.asarray(uh_cal, dtype=float)
+            bg["vhat"] = np.asarray(vh_cal, dtype=float)
+            bg["width"] = float(det_b.width)
+            bg["height"] = float(det_b.height)
         g = f.create_group("search")
         g["orientations"] = U_shared
         g["full_scores"] = scores

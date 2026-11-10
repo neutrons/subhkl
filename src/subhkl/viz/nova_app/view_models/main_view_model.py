@@ -48,7 +48,12 @@ class MainViewModel:
             return
 
         updated_fields = set(results.get("updated", []))
-        if updated_fields & {"peaks_file", "images_file", "instrument", "max_zone_index"}:
+        if updated_fields & {
+            "peaks_file",
+            "images_file",
+            "instrument",
+            "max_zone_index",
+        }:
             self.model.subhkl.refresh_payload()
             self.update_view()
 
@@ -75,9 +80,7 @@ class MainViewModel:
         """Dispatch `imaginex_subhkl_solve` to NDIP in a background worker thread (`binding.new_worker`)."""
         self.view_state.running = True
         self.view_state.active_stage = PipelineStageOptions.solve
-        self.view_state.status_text = (
-            f"Running {self.view_state.active_stage.value} on {self.model.subhkl.data.galaxy_url}..."
-        )
+        self.view_state.status_text = f"Running {self.view_state.active_stage.value} on {self.model.subhkl.data.galaxy_url}..."
         self.view_state_bind.update_in_view(self.view_state)
 
         worker = self.binding.new_worker(

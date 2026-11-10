@@ -139,13 +139,6 @@ class SubhklConfig(BaseModel):
         title="Zones",
         description="Number of zone axes sampled during finder-less solve",
     )
-    steps: int = Field(
-        default=250,
-        ge=10,
-        le=5000,
-        title="Steps",
-        description="Number of refinement steps per stage",
-    )
     max_zone_index: int = Field(
         default=3,
         ge=1,
@@ -216,9 +209,12 @@ class SubhklGalaxyModel:
 
         img_path = None
         if self.data.images_file and os.path.isfile(self.data.images_file):
-            if os.path.dirname(
-                os.path.abspath(self.data.images_file)
-            ) == os.path.dirname(os.path.abspath(self.data.peaks_file)):
+            img_dir = os.path.dirname(os.path.abspath(self.data.images_file))
+            pk_dir = os.path.dirname(os.path.abspath(self.data.peaks_file))
+            tmp_root = os.path.abspath(tempfile.gettempdir())
+            if img_dir == pk_dir or (
+                img_dir.startswith(tmp_root) and pk_dir.startswith(tmp_root)
+            ):
                 img_path = self.data.images_file
         self.payload = build_rainbow_zone_payload(
             replay_h5=self.data.peaks_file,
@@ -263,7 +259,7 @@ class SubhklGalaxyModel:
             self.payload.get("artifact_kind") in ("merged", "raw_nexus")
             and len(wl_range) >= 2
         ):
-            self.data.d_min = round(0.9 * float(wl_range[0]), 2)
+            self.data.d_min = round(0.5 * float(wl_range[0]), 2)
         elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
             self.data.d_min = round(float(self.payload["d_min"]), 2)
         return self.payload
@@ -297,7 +293,6 @@ class SubhklGalaxyModel:
                 "wavelength_max": self.data.wavelength_max,
                 "d_min": self.data.d_min,
                 "n_zones": self.data.n_zones,
-                "steps": self.data.steps,
             }
         return {
             "instrument": self.data.instrument.value,

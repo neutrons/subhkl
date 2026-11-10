@@ -48,20 +48,71 @@ class MainApp:
         if app is None:
             return
 
-        async def handle_status(_request: web.Request) -> web.Response:
+        async def handle_status(request: web.Request) -> web.Response:
+            frame_q = request.rel_url.query.get("frame")
+            if frame_q is not None and str(frame_q).strip() != "":
+                try:
+                    f_idx_st = int(frame_q)
+                    self.view_model.model.subhkl.frame_index = f_idx_st
+                    self.pipeline_runner.sync_frame_index(f_idx_st)
+                except Exception:
+                    pass
             payload = self.view_model.model.subhkl.payload or {}
+            hist_ds = self.pipeline_runner.list_history_datasets()
+            cur_h5 = (
+                self.view_model.model.subhkl.data.peaks_file
+                or self.view_model.model.subhkl.data.images_file
+            )
             doc = {
                 "galaxy_connected": self.pipeline_runner.is_connected,
                 "galaxy_url": self.pipeline_runner.galaxy_url,
                 "history_id": self.pipeline_runner.history_id,
-                "history_datasets": self.pipeline_runner.list_history_datasets(),
+                "history_datasets": hist_ds,
+                "step_artifacts": self.pipeline_runner.list_step_artifacts(
+                    current_h5=cur_h5,
+                    history_datasets=hist_ds,
+                ),
                 "active_job": self.pipeline_runner.active_job,
                 "pipeline_stages": payload.get("pipeline_stages", []),
                 "ladder_steps": payload.get("ladder_steps", []),
             }
             return web.json_response(doc)
 
+        async def handle_artifact_download(request: web.Request) -> web.Response:
+            ds_id = str(request.rel_url.query.get("dataset_id") or "").strip()
+            fname = str(request.rel_url.query.get("name") or "").strip()
+            cur_h5 = (
+                self.view_model.model.subhkl.data.peaks_file
+                or self.view_model.model.subhkl.data.images_file
+            )
+            try:
+                local_fp, dl_name = self.pipeline_runner.resolve_artifact_for_download(
+                    dataset_id=ds_id,
+                    name=fname,
+                    current_h5=cur_h5,
+                )
+                safe_dl = dl_name.replace('"', "")
+                return web.FileResponse(
+                    path=local_fp,
+                    headers={
+                        "Content-Disposition": f'attachment; filename="{safe_dl}"'
+                    },
+                )
+            except Exception as exc:
+                return web.Response(text=str(exc), status=404)
+
         async def handle_payload(request: web.Request) -> web.Response:
+            frame_q = request.rel_url.query.get("frame")
+            f_idx: int | None = None
+            if frame_q is not None and str(frame_q).strip() != "":
+                try:
+                    f_idx = int(frame_q)
+                    self.view_model.model.subhkl.frame_index = f_idx
+                    self.pipeline_runner.current_frame_index = f_idx
+                except Exception:
+                    f_idx = None
+
+            refreshed = False
             fp_q = request.rel_url.query.get("file_path")
             if fp_q is not None and str(fp_q).strip() != "":
                 try:
@@ -73,7 +124,8 @@ class MainApp:
                             self.view_model.model.subhkl.data.peaks_file = local_h5
                         else:
                             self.view_model.model.subhkl.data.peaks_file = local_h5
-                        self.view_model.model.subhkl.refresh_payload()
+                        self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                        refreshed = True
                 except Exception as exc:
                     return web.json_response(
                         {"status": "error", "error": str(exc)}, status=404
@@ -103,17 +155,23 @@ class MainApp:
                         self.view_model.model.subhkl.data.peaks_file = local_h5
                     else:
                         self.view_model.model.subhkl.data.peaks_file = local_h5
-                    self.view_model.model.subhkl.refresh_payload()
+                    self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                    refreshed = True
                 except Exception as exc:
                     return web.json_response(
                         {"status": "error", "error": str(exc)}, status=404
                     )
 
-            frame_q = request.rel_url.query.get("frame")
-            if frame_q is not None and str(frame_q).strip() != "":
+            if f_idx is not None and not refreshed:
                 try:
-                    self.view_model.model.subhkl.refresh_payload(
-                        frame_index=int(frame_q)
+                    self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                except Exception:
+                    pass
+            if isinstance(self.view_model.model.subhkl.payload, dict):
+                try:
+                    self.pipeline_runner.apply_active_solve_overlay(
+                        self.view_model.model.subhkl.payload,
+                        frame_index=f_idx,
                     )
                 except Exception:
                     pass
@@ -163,7 +221,6 @@ class MainApp:
             params["wavelength_range"] = [wl_min, wl_max]
             params.setdefault("d_min", data.d_min)
             params.setdefault("n_zones", data.n_zones)
-            params.setdefault("steps", data.steps)
             params.setdefault("peaks_file", data.peaks_file)
             params.setdefault("images_file", data.images_file)
 
@@ -192,11 +249,17 @@ class MainApp:
                     or "merged" in os.path.basename(new_h5_path).lower()
                 ):
                     self.view_model.model.subhkl.frame_index = 0
+                    self.pipeline_runner.current_frame_index = 0
                     self.view_model.model.subhkl.data.images_file = new_h5_path
                     self.view_model.model.subhkl.data.peaks_file = new_h5_path
                 else:
+                    self.view_model.model.subhkl.frame_index = int(
+                        self.pipeline_runner.current_frame_index or 0
+                    )
                     self.view_model.model.subhkl.data.peaks_file = new_h5_path
-                self.view_model.model.subhkl.refresh_payload()
+                self.view_model.model.subhkl.refresh_payload(
+                    frame_index=self.view_model.model.subhkl.frame_index
+                )
 
             try:
                 res = self.pipeline_runner.submit_galaxy_stage(
@@ -315,10 +378,44 @@ class MainApp:
             res = self.pipeline_runner.check_neutron_paths(body)
             return web.json_response(res)
 
+        async def handle_oncat_catalog(request: web.Request) -> web.Response:
+            import asyncio
+
+            q = request.rel_url.query
+            params = {
+                "facility": str(q.get("facility") or "HFIR").strip(),
+                "instrument": str(q.get("instrument") or "CG4D").strip(),
+                "ipts": str(q.get("ipts") or "").strip(),
+            }
+            res = await asyncio.to_thread(
+                self.pipeline_runner.browse_oncat_catalog, params
+            )
+            return web.json_response(res)
+
+        async def handle_oncat_auth_get(request: web.Request) -> web.Response:
+            import asyncio
+
+            res = await asyncio.to_thread(self.pipeline_runner.get_oncat_auth_status)
+            return web.json_response(res)
+
+        async def handle_oncat_auth_post(request: web.Request) -> web.Response:
+            import asyncio
+
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            res = await asyncio.to_thread(self.pipeline_runner.handle_oncat_auth, body)
+            return web.json_response(res)
+
         app._client_max_size = 4 * 1024**3
         app.add_routes(
             [
                 web.get("/api/pipeline/status", handle_status),
+                web.get("/api/pipeline/oncat_catalog", handle_oncat_catalog),
+                web.get("/api/pipeline/oncat_auth", handle_oncat_auth_get),
+                web.post("/api/pipeline/oncat_auth", handle_oncat_auth_post),
+                web.get("/api/artifacts/download", handle_artifact_download),
                 web.get("/api/payload", handle_payload),
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
@@ -332,6 +429,56 @@ class MainApp:
                 web.get("/subhkl_parallax.html", handle_standalone_html),
             ]
         )
+
+        orig_handle = app._handle
+
+        async def _ep_handle(request: web.Request) -> web.StreamResponse:
+            ep_path = os.environ.get("EP_PATH", "").strip().rstrip("/")
+            req_path = request.rel_url.path
+            served_index_under_ep = False
+            if ep_path and ep_path.startswith("/"):
+                ep_parent = os.path.dirname(ep_path)
+                if req_path == ep_path or req_path == ep_path + "/":
+                    request = request.clone(
+                        rel_url=request.rel_url.with_path("/index.html")
+                    )
+                    served_index_under_ep = True
+                elif req_path.startswith(ep_path + "/"):
+                    sub_path = req_path[len(ep_path) :] or "/"
+                    if sub_path == "/":
+                        sub_path = "/index.html"
+                        served_index_under_ep = True
+                    elif sub_path == "/index.html":
+                        served_index_under_ep = True
+                    request = request.clone(rel_url=request.rel_url.with_path(sub_path))
+                elif ep_parent not in ("", "/") and req_path.startswith(
+                    ep_parent + "/"
+                ):
+                    sub_path = req_path[len(ep_parent) :] or "/"
+                    request = request.clone(rel_url=request.rel_url.with_path(sub_path))
+            elif req_path == "/":
+                request = request.clone(
+                    rel_url=request.rel_url.with_path("/index.html")
+                )
+
+            resp = await orig_handle(request)
+            if served_index_under_ep and ep_path and isinstance(resp, web.FileResponse):
+                try:
+                    idx_fp = getattr(resp, "_path", None)
+                    if idx_fp and os.path.isfile(idx_fp):
+                        with open(idx_fp, encoding="utf-8") as f_in:
+                            html_txt = f_in.read()
+                        html_txt = html_txt.replace(
+                            '<base href="." />',
+                            f'<base href="{ep_path}/" />',
+                            1,
+                        )
+                        return web.Response(text=html_txt, content_type="text/html")
+                except Exception:
+                    pass
+            return resp
+
+        app._handle = _ep_handle
 
     def create_vm(self) -> None:
         binding = TrameBinding(self.server.state)

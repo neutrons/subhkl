@@ -16,11 +16,17 @@ def main(
     **kwargs: Any,
 ) -> None:
     """Launch the NOVA Trame application server (`MainApp().server.start(**kwargs)`)."""
+    import os
+
     args = sys.argv[1:]
+    remaining_argv = [sys.argv[0]]
     i = 0
     while i < len(args):
         arg = args[i]
-        if arg in ("--peaks", "-p") and i + 1 < len(args):
+        if (
+            arg == "--peaks"
+            or (arg == "-p" and i + 1 < len(args) and not args[i + 1].isdigit())
+        ) and i + 1 < len(args):
             peaks_h5 = args[i + 1]
             i += 2
             continue
@@ -36,9 +42,17 @@ def main(
             try:
                 key, value = arg.split("=", 1)
                 kwargs[key] = int(value)
+                i += 1
+                continue
             except Exception:
                 pass
+        remaining_argv.append(arg)
         i += 1
+
+    sys.argv = remaining_argv
+    if os.environ.get("EP_PATH") or os.environ.get("GALAXY_URL"):
+        kwargs.setdefault("timeout", 0)
+        kwargs.setdefault("open_browser", False)
 
     app = MainApp(
         peaks_h5=peaks_h5,
