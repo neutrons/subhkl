@@ -566,6 +566,66 @@ def checkpoint(args, name, parameters, diagnostics, snapshot=None):
                     except Exception:
                         pass
         os.replace(tmp_path, path)
+        if snapshot is not None and (
+            os.environ.get("SUBHKL_LIVE_STDIO") == "1"
+            or "PYTEST_CURRENT_TEST" not in os.environ
+        ):
+            try:
+                import base64
+                import zlib
+
+                live_banks = {}
+                for i_b, b_id in enumerate(snapshot.get("banks", [])):
+                    live_banks[str(int(b_id))] = {
+                        "center": [
+                            round(float(x), 6)
+                            for x in np.asarray(snapshot["centers"][i_b]).ravel()[:3]
+                        ],
+                        "uhat": [
+                            round(float(x), 6)
+                            for x in np.asarray(snapshot["uhats"][i_b]).ravel()[:3]
+                        ],
+                        "vhat": [
+                            round(float(x), 6)
+                            for x in np.asarray(snapshot["vhats"][i_b]).ravel()[:3]
+                        ],
+                        "width": round(float(snapshot["widths"][i_b]), 6),
+                        "height": round(float(snapshot["heights"][i_b]), 6),
+                    }
+                live_doc = {
+                    "kind": "stages",
+                    "instrument": str(args.instrument),
+                    "space_group": str(args.space_group),
+                    "wavelength": [
+                        float(args.assign_wavelength[0]),
+                        float(args.assign_wavelength[1]),
+                    ],
+                    "band_wavelength": [float(args.wl_min), float(args.wl_max)],
+                    "d_min": float(args.d_min),
+                    "stage": str(name),
+                    "n_zones": int(
+                        snapshot.get("n_zones", getattr(args, "n_zones", 120))
+                    ),
+                    "cell": [round(float(v), 5) for v in snapshot["cell"][:6]],
+                    "U": np.round(np.asarray(snapshot["U"], dtype=float), 6).tolist(),
+                    "B": np.round(np.asarray(snapshot["B"], dtype=float), 6).tolist(),
+                    "R": (
+                        np.round(np.asarray(snapshot["R"], dtype=float), 6).tolist()
+                        if snapshot.get("R") is not None
+                        else None
+                    ),
+                    "stages": diagnostics,
+                    "banks": live_banks,
+                }
+                b64 = base64.b64encode(
+                    zlib.compress(
+                        json.dumps(live_doc, separators=(",", ":")).encode("utf-8"),
+                        level=9,
+                    )
+                ).decode("ascii")
+                print(f"[subhkl-live-state] {b64}", flush=True)
+            except Exception:
+                pass
     finally:
         if tmp_path.exists():
             try:

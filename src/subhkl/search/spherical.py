@@ -2999,10 +2999,19 @@ def refine_instrument_matching_free(
         B = (jnp.eye(3) + A) @ jnp.asarray(B0)
         g_vec = hkl_j @ B.T
         dirs = g_vec / jnp.linalg.norm(g_vec, axis=1, keepdims=True)
+
+        def _dot_abs(a, b):
+            # Explicit 3-component inner product so accumulation order over K=3
+            # is invariant to chunk width M (unlike BLAS sgemm microkernels,
+            # whose SIMD FMA grouping varies with M and shifts 1.0 - dot by 1 ULP).
+            return jnp.abs(
+                a[:, None, 0] * b[None, :, 0]
+                + a[:, None, 1] * b[None, :, 1]
+                + a[:, None, 2] * b[None, :, 2]
+            )
+
         if n_chunks == 1:
-            # the small case, untouched: one matmul, bit-identical to
-            # every result measured before chunking existed
-            dots = jnp.abs(d_lab @ (dirs @ R.T).T)  # lines: +- are one direction
+            dots = _dot_abs(d_lab, dirs @ R.T)  # lines: +- are one direction
             ang2 = 2.0 * (1.0 - jnp.clip(dots, 0.0, 1.0))
             dens = jnp.sum(
                 w_model[None, :] * jnp.exp(-ang2 / (2.0 * sigma * sigma)), axis=1
@@ -3014,7 +3023,7 @@ def refine_instrument_matching_free(
             @jax.checkpoint
             def _acc(carry, packed):
                 d_c, w_c = packed
-                dots_c = jnp.abs(d_lab @ d_c.T)
+                dots_c = _dot_abs(d_lab, d_c)
                 ang2_c = 2.0 * (1.0 - jnp.clip(dots_c, 0.0, 1.0))
                 return (
                     carry

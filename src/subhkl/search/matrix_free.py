@@ -3753,7 +3753,10 @@ def integrate_reflections_matrix_free(
     for i in rate_pbar:
         chunk = images_jax[i : i + rate_chunk_size]
         rates = compute_rate_batch(
-            chunk, filter_size, valid=jnp.array(rate_valid[i : i + rate_chunk_size])
+            chunk,
+            filter_size,
+            valid=jnp.array(rate_valid[i : i + rate_chunk_size]),
+            inpaint_footprints=True,
         )
         rates.block_until_ready()
         rate_maps.append(rates)

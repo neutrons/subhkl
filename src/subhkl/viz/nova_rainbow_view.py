@@ -465,6 +465,8 @@ class NovaGalaxyPipelineRunner:
         collapsed: list[str] = []
         for ln in lines:
             clean_ln = ln.rstrip()
+            if clean_ln.lstrip().startswith("[subhkl-live-state]"):
+                continue
             m_cur = tqdm_re.match(clean_ln)
             if m_cur and collapsed:
                 m_prev = tqdm_re.match(collapsed[-1])
@@ -473,6 +475,118 @@ class NovaGalaxyPipelineRunner:
                     continue
             collapsed.append(clean_ln)
         return "\n".join(collapsed)
+
+    @staticmethod
+    def _materialize_live_state_h5(b64_token: str, dest_h5_path: str) -> bool:
+        """Decode a ``[subhkl-live-state] <b64>`` stdout snapshot into an HDF5 file for live zone rendering."""
+        import base64
+        import zlib
+        import h5py
+        import numpy as np
+        from scipy.spatial.transform import Rotation
+        from subhkl.config import beamlines
+        from subhkl.instrument.detector import Detector
+
+        raw_json = zlib.decompress(base64.b64decode(b64_token.strip())).decode("utf-8")
+        doc = json.loads(raw_json)
+        if not isinstance(doc, dict) or "U" not in doc or "B" not in doc:
+            return False
+        inst = str(doc.get("instrument") or "CG4D")
+        sg = str(doc.get("space_group") or "P 1")
+        wl = doc.get("wavelength") or [2.8, 4.5]
+        cell_vals = [
+            float(x) for x in (doc.get("cell") or [68.7, 69.8, 156.9, 90.0, 90.0, 90.0])
+        ]
+        tmp_p = dest_h5_path + ".tmp.h5"
+        try:
+            with h5py.File(tmp_p, "w") as hf:
+                hf.attrs["instrument"] = inst
+                hf["instrument/name"] = inst
+                hf["instrument/wavelength"] = np.asarray(wl[:2], dtype=float)
+                hf["sample/cell"] = np.asarray(cell_vals[:6], dtype=float)
+                for k_c, v_c in zip(
+                    ("a", "b", "c", "alpha", "beta", "gamma"), cell_vals[:6]
+                ):
+                    hf[f"sample/{k_c}"] = float(v_c)
+                hf["sample/space_group"] = sg
+                hf["sample/U"] = np.asarray(doc["U"], dtype=float)
+                hf["sample/B"] = np.asarray(doc["B"], dtype=float)
+                if doc.get("R") is not None:
+                    hf["goniometer/R"] = np.asarray(doc["R"], dtype=float)
+                banks_map = doc.get("banks")
+                if isinstance(banks_map, dict) and banks_map:
+                    cal_g = hf.create_group("detector_calibration")
+                    for b_id, b_info in banks_map.items():
+                        bg = cal_g.create_group(f"bank_{b_id}")
+                        bg["center"] = np.asarray(b_info["center"], dtype=float)
+                        bg["uhat"] = np.asarray(b_info["uhat"], dtype=float)
+                        bg["vhat"] = np.asarray(b_info["vhat"], dtype=float)
+                        bg["width"] = float(b_info["width"])
+                        bg["height"] = float(b_info["height"])
+                elif (
+                    "radial_scale" in doc
+                    or "global_rot_vec" in doc
+                    or "global_trans_m" in doc
+                ) and inst in beamlines:
+                    r_sc = float(doc.get("radial_scale", 0.0))
+                    r_vec = np.asarray(
+                        doc.get("global_rot_vec", [0.0, 0.0, 0.0]), dtype=float
+                    )
+                    t_vec = np.asarray(
+                        doc.get("global_trans_m", [0.0, 0.0, 0.0]), dtype=float
+                    )
+                    rot_m = Rotation.from_rotvec(r_vec).as_matrix()
+                    cal_g = hf.create_group("detector_calibration")
+                    for b_k, b_cfg in beamlines[inst].items():
+                        try:
+                            b_id_int = int(b_k)
+                        except (ValueError, TypeError):
+                            continue
+                        det_b = Detector(dict(b_cfg))
+                        mid_b = (
+                            det_b.center
+                            + 0.5 * det_b.width * det_b.uhat
+                            + 0.5 * det_b.height * det_b.vhat
+                        )
+                        mid_cal = mid_b * (1.0 + r_sc) @ rot_m.T + t_vec
+                        uh_cal = det_b.uhat @ rot_m.T
+                        vh_cal = det_b.vhat @ rot_m.T
+                        cen_cal = (
+                            mid_cal
+                            - 0.5 * det_b.width * uh_cal
+                            - 0.5 * det_b.height * vh_cal
+                        )
+                        bg = cal_g.create_group(f"bank_{b_id_int}")
+                        bg["center"] = np.asarray(cen_cal, dtype=float)
+                        bg["uhat"] = np.asarray(uh_cal, dtype=float)
+                        bg["vhat"] = np.asarray(vh_cal, dtype=float)
+                        bg["width"] = float(det_b.width)
+                        bg["height"] = float(det_b.height)
+                if doc.get("kind") == "stages":
+                    rep = hf.create_group("scan_refinement")
+                    rep["U"] = np.asarray(doc["U"], dtype=float)
+                    rep["B"] = np.asarray(doc["B"], dtype=float)
+                    rep["band_wavelength"] = np.asarray(
+                        doc.get("band_wavelength") or wl[:2], dtype=float
+                    )
+                    rep.attrs["stages"] = json.dumps(doc.get("stages") or [])
+                    rep.attrs["status"] = "running"
+                    rep.attrs["n_zones"] = int(doc.get("n_zones", 120))
+                    rep.attrs["d_min"] = float(doc.get("d_min", 1.5))
+                else:
+                    sg_grp = hf.create_group("search")
+                    sg_grp.attrs["instrument"] = inst
+                    sg_grp.attrs["d_min"] = float(doc.get("d_min", 1.5))
+                    sg_grp.attrs["ladder_stage"] = str(doc.get("stage") or "blind")
+                    sg_grp.attrs["ladder_zones"] = int(doc.get("n_zones", 60))
+            os.replace(tmp_p, dest_h5_path)
+            return True
+        finally:
+            if os.path.exists(tmp_p):
+                try:
+                    os.unlink(tmp_p)
+                except Exception:
+                    pass
 
     def _auto_discover_local_galaxy(self) -> None:
         """Auto-discover local Planemo / Galaxy server if env vars were not injected."""
@@ -947,6 +1061,75 @@ class NovaGalaxyPipelineRunner:
             "status": "submitted",
         }
 
+    def cancel_active_job(self, stage_id: str | None = None) -> dict[str, Any]:
+        """Cancel the currently running NDIP Galaxy or local container job."""
+        import signal
+        import subprocess
+
+        aj = self.active_job
+        if not isinstance(aj, dict):
+            return {"ok": True, "status": "idle", "message": "No active job to cancel"}
+
+        aj["cancel_requested"] = True
+        prev_state = str(aj.get("state") or "")
+        aj["state"] = "deleted"
+        aj["stdout"] = (
+            aj.get("stdout", "")
+            + "\n[subhkl] Stop requested by user — cancelling job...\n"
+        )[-24000:]
+
+        cancelled_galaxy_ids: list[str] = []
+        gx_ids: list[str] = list(aj.get("galaxy_job_ids") or [])
+        cur_jid = str(aj.get("job_id") or "")
+        if (
+            cur_jid
+            and not cur_jid.startswith(("nova-", "gpu-"))
+            and cur_jid not in gx_ids
+        ):
+            gx_ids.append(cur_jid)
+
+        for jid in gx_ids:
+            try:
+                self._api_request("DELETE", f"/api/jobs/{jid}")
+                cancelled_galaxy_ids.append(jid)
+            except Exception:
+                pass
+
+        proc = getattr(self, "_active_proc", None)
+        if proc is not None:
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                else:
+                    proc.terminate()
+            except Exception:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+        cname = getattr(self, "_active_container_name", None)
+        if cname:
+            try:
+                subprocess.run(
+                    ["podman", "rm", "-f", str(cname)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5.0,
+                )
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "status": "cancelled",
+            "stage_id": aj.get("stage_id") or stage_id,
+            "previous_state": prev_state,
+            "cancelled_job_id": cur_jid,
+            "cancelled_galaxy_jobs": cancelled_galaxy_ids,
+            "job": aj,
+        }
+
     def _stamp_merged_metadata(self, h5_path: str, job_record: dict[str, Any]) -> None:
         if not h5_path or not os.path.isfile(h5_path):
             return
@@ -1335,27 +1518,78 @@ class NovaGalaxyPipelineRunner:
         """Link an existing 'ok' dataset in the Galaxy history or upload with file_type=file_ext, to_posix_lines=False."""
         fname = os.path.basename(local_path)
         gi = store.nova_connection.galaxy_instance
+        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
         if not force_upload:
-            existing = gi.datasets.get_datasets(history_id=store.history_id, name=fname)
-            for ds in existing:
-                ds_id = ds.get("id")
-                if not ds_id:
-                    continue
-                info = gi.datasets.show_dataset(ds_id)
-                st = info.get("state")
-                if st == "ok":
-                    job_record["stdout"] += (
-                        f"[nova -> galaxy] Linked existing dataset '{fname}' (id={ds_id}, state=ok)\n"
+            for cand_p in (
+                os.path.abspath(local_path),
+                os.path.realpath(local_path),
+            ):
+                known_id = known_map.get(cand_p)
+                if known_id:
+                    try:
+                        k_info = gi.datasets.show_dataset(known_id)
+                        if k_info.get("state") == "ok" and not k_info.get("deleted"):
+                            job_record["stdout"] += (
+                                f"[nova -> galaxy] Linked cached dataset '{fname}' (id={known_id}, state=ok)\n"
+                            )
+                            return known_id
+                    except Exception:
+                        pass
+
+            search_names = [fname]
+            if fname != "merged.h5" and fname.endswith("_merged.h5"):
+                search_names.append("merged.h5")
+            in_prog_candidates: list[tuple[str, str]] = []
+            for sname in search_names:
+                existing = gi.datasets.get_datasets(
+                    history_id=store.history_id, name=sname
+                )
+                # Pass 1: Newest-first search for any dataset already in state='ok'
+                for ds in reversed(existing):
+                    ds_id = ds.get("id")
+                    if not ds_id:
+                        continue
+                    info: dict[str, Any] = {}
+                    try:
+                        raw_info = gi.datasets.show_dataset(ds_id)
+                        if isinstance(raw_info, dict):
+                            info = raw_info
+                    except Exception:
+                        pass
+                    if info.get("deleted") is True or ds.get("deleted") is True:
+                        continue
+                    st = (
+                        info.get("state")
+                        if isinstance(info.get("state"), str)
+                        else ds.get("state")
                     )
-                    return ds_id
-                if st in ("queued", "running", "new", "upload"):
-                    job_record["stdout"] += (
-                        f"[nova -> galaxy] Waiting for in-progress upload of '{fname}' (id={ds_id}, state={st})...\n"
-                    )
+                    if st == "ok":
+                        known_map[os.path.abspath(local_path)] = ds_id
+                        self._dataset_id_by_path = known_map
+                        job_record["stdout"] += (
+                            f"[nova -> galaxy] Linked existing dataset '{sname}' (id={ds_id}, state=ok)\n"
+                        )
+                        return ds_id
+                    if st in ("queued", "running", "new", "upload"):
+                        in_prog_candidates.append((ds_id, str(st)))
+
+            # Pass 2: If no 'ok' dataset exists yet, briefly check the newest in-progress dataset
+            if in_prog_candidates:
+                ds_id, st = in_prog_candidates[0]
+                job_record["stdout"] += (
+                    f"[nova -> galaxy] Waiting up to 15s for in-progress dataset '{fname}' (id={ds_id}, state={st})...\n"
+                )
+                try:
                     gi.datasets.wait_for_dataset(
-                        ds_id, maxwait=120, interval=2.0, check=True
+                        ds_id, maxwait=15, interval=2.0, check=False
                     )
-                    return ds_id
+                    info = gi.datasets.show_dataset(ds_id)
+                    if info.get("state") == "ok" and not info.get("deleted"):
+                        known_map[os.path.abspath(local_path)] = ds_id
+                        self._dataset_id_by_path = known_map
+                        return ds_id
+                except Exception:
+                    pass
 
         if file_ext == "mtz":
             file_ext = "binary"
@@ -1375,7 +1609,12 @@ class NovaGalaxyPipelineRunner:
             link_to_files=is_local_gx,
         )
         ds_id = up_info["outputs"][0]["id"]
-        gi.datasets.wait_for_dataset(ds_id, maxwait=180, interval=2.0, check=True)
+        try:
+            gi.datasets.wait_for_dataset(ds_id, maxwait=30, interval=2.0, check=False)
+        except Exception:
+            pass
+        known_map[os.path.abspath(local_path)] = ds_id
+        self._dataset_id_by_path = known_map
         try:
             safe_name = "".join(
                 ch if (ch.isalnum() or ch in "._-") else "_"
@@ -1504,6 +1743,13 @@ class NovaGalaxyPipelineRunner:
                         )
 
             if stage_id == "solve":
+                job_record["images_h5_path"] = merged_path
+                job_record["solve_params"] = {
+                    "instrument": str(inst),
+                    "space_group": str(sg),
+                    "cell": [float(x) for x in raw_cell[:6]],
+                    "wavelength_range": (float(wl[0]), float(wl[1])),
+                }
                 primary_tool = "imaginex_subhkl_solve"
                 scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
                 tool_inputs = {
@@ -1978,6 +2224,9 @@ class NovaGalaxyPipelineRunner:
                 threading.Thread(target=_bg_preupload, daemon=True).start()
                 return
 
+            if job_record.get("cancel_requested"):
+                job_record["state"] = "deleted"
+                return
             job_record["tool_id"] = primary_tool
             results = gi.tools.run_tool(
                 history_id=store.history_id,
@@ -1986,6 +2235,7 @@ class NovaGalaxyPipelineRunner:
             )
             job_id = results["jobs"][0]["id"]
             job_record["job_id"] = job_id
+            job_record.setdefault("galaxy_job_ids", []).append(job_id)
             job_record["outputs"] = [
                 {
                     "id": d.get("id"),
@@ -2009,6 +2259,7 @@ class NovaGalaxyPipelineRunner:
             # Chain Step 2/2: imaginex_subhkl_integrate (integrator + mtz-exporter)
             if (
                 is_two_step_integrate
+                and not job_record.get("cancel_requested")
                 and job_record.get("state") not in ("error", "deleted", "paused")
                 and job_record.get("outputs")
             ):
@@ -2037,6 +2288,7 @@ class NovaGalaxyPipelineRunner:
                 )
                 int_job_id = int_results["jobs"][0]["id"]
                 job_record["job_id"] = int_job_id
+                job_record.setdefault("galaxy_job_ids", []).append(int_job_id)
                 job_record["outputs"] = [
                     {
                         "id": d.get("id"),
@@ -2061,7 +2313,22 @@ class NovaGalaxyPipelineRunner:
             job_record["stderr"] = f"{clean_msg}\n"
             job_record["stdout"] += f"\n[galaxy -> ndip] Error: {clean_msg}\n"
         except Exception as exc:
+            if job_record.get("cancel_requested"):
+                job_record["state"] = "deleted"
+                return
+            import shutil as _shutil
+
             clean_msg = self._clean_err_msg(exc)
+            is_remote_galaxy = bool(
+                self.galaxy_url
+                and not any(h in self.galaxy_url for h in ("127.0.0.1", "localhost"))
+            )
+            has_podman = bool(_shutil.which("podman"))
+            if is_remote_galaxy and not has_podman:
+                job_record["state"] = "error"
+                job_record["stderr"] = f"{clean_msg}\n"
+                job_record["stdout"] += f"\n[nova -> galaxy] Error: {clean_msg}\n"
+                return
             job_record["stdout"] += (
                 f"[nova -> galaxy] {clean_msg}; running GPU container on IMAGINEX-1...\n"
             )
@@ -3405,7 +3672,7 @@ class NovaGalaxyPipelineRunner:
         container_image = (
             "ghcr.io/jglaser/careless:cuda"
             if stage_id == "merge"
-            else "ghcr.io/neutrons/subhkl:feat-rainbow-zones"
+            else "ghcr.io/neutrons/subhkl:1.5.0"
         )
         if shutil.which("podman"):
             raw_dirs = {os.path.dirname(os.path.abspath(p)) for p in raw_nxs_local}
@@ -3483,6 +3750,13 @@ class NovaGalaxyPipelineRunner:
             )
         except Exception:
             gpu_info = "CPU fallback"
+            gpu_env["JAX_PLATFORMS"] = "cpu"
+
+        job_id = f"gpu-{int(time.time())}"
+        container_name: str | None = None
+        if cmd and cmd[0] == "podman":
+            container_name = f"subhkl-{job_id}"
+            cmd.insert(3, f"--name={container_name}")
 
         host_tag = socket.gethostname()
         cmd_str = " ".join(cmd)
@@ -3495,7 +3769,6 @@ class NovaGalaxyPipelineRunner:
             )
             header_lines.append(f"$ {cmd_str}\n")
 
-        job_id = f"gpu-{int(time.time())}"
         if existing_job_record is not None:
             job_record = existing_job_record
             job_record["job_id"] = job_id
@@ -3538,13 +3811,16 @@ class NovaGalaxyPipelineRunner:
 
         def _stream_proc() -> None:
             try:
+                self._active_container_name = container_name
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     bufsize=0,
                     env=gpu_env,
+                    start_new_session=True,
                 )
+                self._active_proc = proc
                 assert proc.stdout is not None
                 blind_src = out_h5[:-3] + ".blind.h5"
                 stages_src = out_h5[:-3] + ".stages.h5"
@@ -3925,14 +4201,22 @@ class NovaGalaxyPipelineRunner:
                         f"[subhkl] Stage '{stage_id}' completed (exit 0).\n"
                     )
                     job_record["state"] = "ok"
+                elif job_record.get("cancel_requested"):
+                    job_record["state"] = "deleted"
                 else:
                     job_record["state"] = "error"
                     job_record["stderr"] += (
                         f"\n[subhkl] Process exited with code {rc}\n"
                     )
             except Exception as exc:
-                job_record["state"] = "error"
-                job_record["stderr"] += f"\n[subhkl] Error: {exc}\n"
+                if job_record.get("cancel_requested"):
+                    job_record["state"] = "deleted"
+                else:
+                    job_record["state"] = "error"
+                    job_record["stderr"] += f"\n[subhkl] Error: {exc}\n"
+            finally:
+                self._active_proc = None
+                self._active_container_name = None
 
         threading.Thread(target=_stream_proc, daemon=True).start()
         return {
@@ -3959,10 +4243,22 @@ class NovaGalaxyPipelineRunner:
         step_counter = 0
         poll_errors = 0
         new_state_ticks = 0
+        last_live_token = ""
+        partial_seq = 0
         base_log = job_record.get("stdout", "")
+        is_localhost_galaxy = bool(
+            self.galaxy_url
+            and any(h in self.galaxy_url for h in ("127.0.0.1", "localhost"))
+        )
 
         while True:
+            if job_record.get("cancel_requested"):
+                job_record["state"] = "deleted"
+                break
             time.sleep(1.5)
+            if job_record.get("cancel_requested"):
+                job_record["state"] = "deleted"
+                break
             try:
                 # Fetch job status & live Pulsar console_output stream from NDIP Galaxy API
                 jinfo = self._api_request("GET", f"/api/jobs/{job_id}?full=true")
@@ -3970,7 +4266,7 @@ class NovaGalaxyPipelineRunner:
                 state = jinfo.get("state", "running")
                 if state == "new":
                     new_state_ticks += 1
-                    if new_state_ticks >= 10:
+                    if is_localhost_galaxy and new_state_ticks >= 10:
                         self._pulsar_queue_stalled_until = time.time() + 300.0
                         try:
                             self._api_request("DELETE", f"/api/jobs/{job_id}")
@@ -4001,9 +4297,10 @@ class NovaGalaxyPipelineRunner:
                 except Exception:
                     pass
 
-                out_txt = self._format_terminal_stream(
+                raw_stdout_src = (
                     console_out or jinfo.get("tool_stdout") or jinfo.get("stdout") or ""
                 )
+                out_txt = self._format_terminal_stream(raw_stdout_src)
                 err_txt = self._format_terminal_stream(
                     console_err or jinfo.get("tool_stderr") or jinfo.get("stderr") or ""
                 )
@@ -4024,8 +4321,62 @@ class NovaGalaxyPipelineRunner:
                     "queued",
                     "running",
                 ):
-                    step_counter = min(3, step_counter + 1)
-                    job_record["ladder_rung_idx"] = step_counter
+                    low_out = out_txt.lower()
+                    cur_rung = int(job_record.get("ladder_rung_idx") or 0)
+                    if (
+                        "blind band search" in low_out
+                        or "band table" in low_out
+                        or "exhaustive rung" in low_out
+                        or "rung 13 zones" in low_out
+                    ):
+                        cur_rung = max(cur_rung, 1)
+                    if "rung 30 zones" in low_out or "rung 60 zones" in low_out:
+                        cur_rung = max(cur_rung, 2)
+                    if (
+                        "rung 145 zones" in low_out
+                        or "joint band refinement" in low_out
+                        or "candidate " in low_out
+                        or "full-data scores" in low_out
+                        or "[stage " in low_out
+                    ):
+                        cur_rung = max(cur_rung, 3)
+                    if "band refinement: converged" in low_out:
+                        cur_rung = max(cur_rung, 4)
+                    if cur_rung == 0 and state == "running":
+                        step_counter = min(3, step_counter + 1)
+                        cur_rung = step_counter
+                    job_record["ladder_rung_idx"] = cur_rung
+
+                    if "[subhkl-live-state]" in raw_stdout_src:
+                        live_tokens = [
+                            ln.strip().split("[subhkl-live-state]", 1)[1].strip()
+                            for ln in raw_stdout_src.splitlines()
+                            if "[subhkl-live-state]" in ln
+                        ]
+                        if live_tokens and live_tokens[-1] != last_live_token:
+                            last_live_token = live_tokens[-1]
+                            try:
+                                blind_dst = os.path.join(
+                                    work_dir or tempfile.gettempdir(),
+                                    "solve.blind.h5",
+                                )
+                                if self._materialize_live_state_h5(
+                                    last_live_token, blind_dst
+                                ):
+                                    job_record["partial_h5_path"] = blind_dst
+                                    partial_seq += 1
+                                    self.apply_active_solve_overlay(
+                                        {},
+                                        frame_index=int(self.current_frame_index or 0),
+                                    )
+                                    if isinstance(
+                                        job_record.get("partial_overlay"), dict
+                                    ):
+                                        job_record["partial_overlay"]["seq"] = (
+                                            partial_seq
+                                        )
+                            except Exception:
+                                pass
                 if state in ("ok", "error", "deleted", "paused"):
                     if state == "ok":
                         try:
@@ -4267,6 +4618,27 @@ class NovaGalaxyPipelineRunner:
                                         )
 
                                 if final_step and tmp_path and os.path.isfile(tmp_path):
+                                    known_map = getattr(self, "_dataset_id_by_path", {})
+                                    known_map[os.path.abspath(tmp_path)] = ds_id
+                                    if (
+                                        work_dir
+                                        and job_record.get("stage_id") == "reduce"
+                                    ):
+                                        lbl_path = os.path.join(work_dir, merged_label)
+                                        known_map[os.path.abspath(lbl_path)] = ds_id
+                                        if os.path.abspath(lbl_path) != os.path.abspath(
+                                            tmp_path
+                                        ):
+                                            try:
+                                                if os.path.lexists(lbl_path):
+                                                    os.remove(lbl_path)
+                                                os.link(tmp_path, lbl_path)
+                                            except Exception:
+                                                try:
+                                                    shutil.copy2(tmp_path, lbl_path)
+                                                except Exception:
+                                                    pass
+                                    self._dataset_id_by_path = known_map
                                     job_record["output_h5_path"] = tmp_path
                                     if callable(on_complete_h5):
                                         on_complete_h5(tmp_path)
@@ -4789,6 +5161,26 @@ def serve_rainbow_zones(
                     code = 200
                 except Exception as exc:
                     result = {"ok": False, "error": str(exc), "message": str(exc)}
+                    code = 400
+                body = json.dumps(result).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if req_path == "/api/pipeline/cancel":
+                content_len = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                try:
+                    req_json = json.loads(raw_body.decode("utf-8") or "{}")
+                    result = vm.pipeline_runner.cancel_active_job(
+                        req_json.get("stage_id")
+                    )
+                    code = 200
+                except Exception as exc:
+                    result = {"ok": False, "error": str(exc)}
                     code = 400
                 body = json.dumps(result).encode("utf-8")
                 self.send_response(code)

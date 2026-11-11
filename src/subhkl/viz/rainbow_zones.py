@@ -34,6 +34,8 @@ import h5py
 import numpy as np
 from PIL import Image
 
+from subhkl import get_version as get_subhkl_version
+
 from subhkl.viz.zones import (
     _cell_from_B,
     _spherical_angles,
@@ -2001,7 +2003,7 @@ def _build_ndip_pipeline_stages(
                 if is_finderless
                 else ["imaginex_subhkl_prepare_peaks", "imaginex_subhkl_peak_fit"]
             ),
-            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "container": "ghcr.io/neutrons/subhkl:1.5.0",
             "artifact": (
                 f"merged.h5 ({solve_diagnostics['stable_observations']:,} count bins)"
                 if is_finderless
@@ -2025,7 +2027,7 @@ def _build_ndip_pipeline_stages(
             "step_num": 2,
             "name": "2. SOLVE (LATTICE LADDER)",
             "tool_ids": ["imaginex_subhkl_solve", "imaginex_subhkl"],
-            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "container": "ghcr.io/neutrons/subhkl:1.5.0",
             "artifact": f"solve.h5 ({n_indexed}/{n_peaks} spots • {n_zones_ord1} ord-1 zones)",
             "status": _stage_status(1),
             "ladder_rung_idx": 4,
@@ -2042,7 +2044,7 @@ def _build_ndip_pipeline_stages(
                 "imaginex_subhkl_predict",
                 "imaginex_subhkl_integrate",
             ],
-            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "container": "ghcr.io/neutrons/subhkl:1.5.0",
             "artifact": "predictor.h5 → integrated.h5",
             "status": _stage_status(2),
             "ladder_rung_idx": 4,
@@ -3129,6 +3131,7 @@ def build_rainbow_zone_payload(
             }
 
     return {
+        "subhkl_version": get_subhkl_version(),
         "instrument": str(instrument),
         "default_projection": resolved_proj,
         "space_group": str(space_group),
@@ -3170,6 +3173,7 @@ def render_rainbow_html(
 ) -> str:
     """Render a unified, self-contained HTML5/Canvas/JS diffraction parallax widget."""
     payload_json = json.dumps(payload, separators=(",", ":"))
+    subhkl_ver = str(payload.get("subhkl_version") or get_subhkl_version()).lstrip("v")
     inst = payload.get("instrument", "IMAGINE")
     sg = payload.get("space_group", "P 1")
     initial_proj = (
@@ -3270,6 +3274,15 @@ def render_rainbow_html(
     font-style: italic;
     margin-left: 1px;
     text-shadow: 0 0 12px rgba(244, 63, 133, 0.38);
+  }}
+
+  .logo-version {{
+    font-family: var(--font-display);
+    font-size: 0.62rem;
+    font-weight: 600;
+    color: var(--text-dim);
+    margin-left: 5px;
+    letter-spacing: 0.2px;
   }}
 
   .subtitle-tag {{
@@ -3598,7 +3611,7 @@ def render_rainbow_html(
   .stage-pill {{
     font-family: var(--font-display);
     font-size: 0.65rem;
-    padding: 3px 9px;
+    padding: 2px 8px 2px 5px;
     border-radius: 5px;
     border: 1px solid var(--border-color);
     background: var(--bg-card);
@@ -3607,7 +3620,7 @@ def render_rainbow_html(
     transition: all 0.12s ease;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
   }}
 
   .stage-pill:hover {{
@@ -3623,9 +3636,38 @@ def render_rainbow_html(
     font-weight: 700;
   }}
 
+  .stage-pill.stage-running {{
+    border-color: #f43f5e;
+    color: #ffe4e6;
+    background: rgba(244, 63, 94, 0.24);
+    font-weight: 700;
+  }}
+
   .stage-pill.stage-done {{
     border-color: rgba(52, 211, 153, 0.5);
     color: var(--accent-green);
+  }}
+
+  .stage-tape-btn {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 15px;
+    height: 15px;
+    border-radius: 3px;
+    font-size: 0.56rem;
+    line-height: 1;
+    background: rgba(56, 189, 248, 0.16);
+    border: 1px solid rgba(56, 189, 248, 0.45);
+    color: var(--accent-cyan);
+    flex-shrink: 0;
+  }}
+
+  .stage-pill.stage-running .stage-tape-btn,
+  .stage-tape-btn.tape-stop {{
+    background: rgba(244, 63, 94, 0.28);
+    border-color: #fb7185;
+    color: #fda4af;
   }}
 
   .terminal-box {{
@@ -3772,7 +3814,7 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></div>
+      <div class="rainbow-logo" id="app-title"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span><span class="logo-version" id="app-version">v{subhkl_ver}</span></div>
       <span class="subtitle-tag">{inst} · {sg}</span>
     </div>
 
@@ -4413,6 +4455,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const collapsed = [];
     for (let i = 0; i < lines.length; i++) {{
       const cleanLn = (lines[i] || "").replace(/\\s+$/, "");
+      if (cleanLn.includes("[subhkl-live-state]")) continue;
       const mCur = tqdmRe.exec(cleanLn);
       if (mCur && collapsed.length > 0) {{
         const mPrev = tqdmRe.exec(collapsed[collapsed.length - 1]);
@@ -4426,16 +4469,58 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return collapsed.join("\\n");
   }}
 
+  const terminalBoxEl = document.getElementById("terminal-box");
+  if (terminalBoxEl) {{
+    terminalBoxEl.addEventListener("scroll", () => {{
+      state.terminalScrollTop = terminalBoxEl.scrollTop;
+    }});
+  }}
+
   function appendTerminalLog(text, replace = false) {{
     const box = document.getElementById("terminal-box");
     if (!box) return;
-    if (replace) {{
-      box.textContent = formatTerminalStdio(text);
-    }} else {{
-      const combined = box.textContent + (box.textContent.endsWith("\\n") ? "" : "\\n") + text;
-      box.textContent = formatTerminalStdio(combined);
+    const savedScrollTop = typeof state.terminalScrollTop === "number"
+      ? state.terminalScrollTop
+      : box.scrollTop;
+    const nextText = replace
+      ? formatTerminalStdio(text)
+      : formatTerminalStdio(box.textContent + (box.textContent.endsWith("\\n") ? "" : "\\n") + text);
+    if (box.textContent === nextText) {{
+      box.scrollTop = savedScrollTop;
+      return;
     }}
-    box.scrollTop = box.scrollHeight;
+    const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
+    const hasSelectionInBox = Boolean(
+      sel && !sel.isCollapsed && sel.anchorNode && box.contains(sel.anchorNode)
+    );
+    if (hasSelectionInBox) {{
+      box._pendingTerminalText = nextText;
+      if (!box._selectionFlushBound) {{
+        box._selectionFlushBound = true;
+        const flushPending = () => {{
+          const curSel = typeof window.getSelection === "function" ? window.getSelection() : null;
+          const stillSelected = Boolean(
+            curSel && !curSel.isCollapsed && curSel.anchorNode && box.contains(curSel.anchorNode)
+          );
+          if (!stillSelected && typeof box._pendingTerminalText === "string") {{
+            const keepScroll = typeof state.terminalScrollTop === "number"
+              ? state.terminalScrollTop
+              : box.scrollTop;
+            box.textContent = box._pendingTerminalText;
+            box._pendingTerminalText = null;
+            box.scrollTop = keepScroll;
+          }}
+        }};
+        document.addEventListener("selectionchange", flushPending);
+        box.addEventListener("mouseup", () => setTimeout(flushPending, 50));
+      }}
+      box.scrollTop = savedScrollTop;
+      return;
+    }}
+    box._pendingTerminalText = null;
+    box.textContent = nextText;
+    box.scrollTop = savedScrollTop;
+    state.terminalScrollTop = box.scrollTop;
   }}
 
   function collectWorkflowParams() {{
@@ -4662,14 +4747,36 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     container.innerHTML = "";
     const shortLabels = ["1. Reduce", "2. Solve", "3. Integrate", "4. Merge"];
     PIPELINE.forEach((st, idx) => {{
+      const isRunning = state.runningStageIdx === idx;
       const isAct = idx === state.currentPipelineIdx;
       const isDone = idx < state.currentPipelineIdx;
       const pill = document.createElement("button");
-      pill.className = "stage-pill" + (isAct ? " stage-active" : (isDone ? " stage-done" : ""));
-      const prefix = (state.runningStageIdx === idx) ? "[...] " : "";
-      pill.title = `Click to execute ${{st.name}} (${{(st.tool_ids || []).join(" + ")}}) → ${{st.artifact}}`;
-      pill.textContent = `${{prefix}}${{shortLabels[idx] || st.name}}`;
-      pill.addEventListener("click", () => {{
+      pill.type = "button";
+      pill.dataset.stageId = st.stage_id || "";
+      pill.dataset.tapeState = isRunning ? "stop" : "play";
+      pill.className = "stage-pill"
+        + (isRunning ? " stage-running" : "")
+        + (isAct ? " stage-active" : (isDone ? " stage-done" : ""));
+      pill.title = isRunning
+        ? `Stop / cancel running ${{st.name}} job`
+        : `Play / execute ${{st.name}} (${{(st.tool_ids || []).join(" + ")}}) → ${{st.artifact}}`;
+
+      const tapeSpan = document.createElement("span");
+      tapeSpan.className = "stage-tape-btn" + (isRunning ? " tape-stop" : " tape-play");
+      tapeSpan.setAttribute("aria-label", isRunning ? "Stop stage" : "Play stage");
+      tapeSpan.textContent = isRunning ? "■" : "▶";
+
+      const lblSpan = document.createElement("span");
+      lblSpan.textContent = shortLabels[idx] || st.name;
+
+      pill.appendChild(tapeSpan);
+      pill.appendChild(lblSpan);
+      pill.addEventListener("click", (ev) => {{
+        ev.stopPropagation();
+        if (state.runningStageIdx === idx) {{
+          cancelWorkflowStage(idx);
+          return;
+        }}
         selectPipelineStage(idx, true);
         executeWorkflowStage(idx);
       }});
@@ -6299,6 +6406,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
 
     const subEl = document.querySelector(".subtitle-tag");
+    const verEl = document.getElementById("app-version");
+    if (verEl && newPayload.subhkl_version) {{
+      verEl.textContent = "v" + String(newPayload.subhkl_version).replace(/^v/i, "");
+    }}
     const artKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
     const shapeMode = newPayload.peak_shape_mode || DATA.peak_shape_mode || "solved_circle";
     DATA.artifact_kind = artKind;
@@ -8199,6 +8310,60 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
   probeGalaxyConnection();
 
+  async function cancelWorkflowStage(stageIdx = state.runningStageIdx) {{
+    const idx = typeof stageIdx === "number" && stageIdx >= 0 ? stageIdx : state.runningStageIdx;
+    const st = PIPELINE[idx] || PIPELINE[state.currentPipelineIdx] || {{ stage_id: "solve", name: "STAGE" }};
+    const stageId = st.stage_id || "solve";
+    state.workflowRunSeq = (state.workflowRunSeq || 0) + 1;
+    if (galaxyBridge.pollTimer) {{
+      clearInterval(galaxyBridge.pollTimer);
+      galaxyBridge.pollTimer = null;
+    }}
+    state.runningStageIdx = -1;
+    renderPipeline();
+    const cellSummary = document.getElementById("cell-summary");
+    if (cellSummary) cellSummary.textContent = "STOPPED";
+    setStatusLine(
+      `[STOPPED]`,
+      `<strong style="color:#fb7185;">Cancelled ${{st.name || stageId.toUpperCase()}}</strong> — NDIP / Pulsar job termination requested.`
+    );
+    if (galaxyBridge.mode === "nova") {{
+      try {{
+        const resp = await fetch("api/pipeline/cancel", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ stage_id: stageId }}),
+        }});
+        if (resp.ok) {{
+          const doc = await resp.json();
+          const jobObj = doc.job || {{}};
+          const outText = (jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : "");
+          if (outText) appendTerminalLog(outText, true);
+          else appendTerminalLog(`\\n[ndip] Cancelled stage '${{stageId}}'.\\n`, false);
+        }} else {{
+          appendTerminalLog(`\\n[ndip] Cancelled stage '${{stageId}}'.\\n`, false);
+        }}
+      }} catch (_e) {{
+        appendTerminalLog(`\\n[ndip] Cancelled stage '${{stageId}}'.\\n`, false);
+      }}
+      await probeGalaxyConnection();
+      return;
+    }}
+    if (galaxyBridge.mode === "galaxy_iframe" && galaxyBridge.activeGalaxyJobId) {{
+      const jid = galaxyBridge.activeGalaxyJobId;
+      galaxyBridge.activeGalaxyJobId = null;
+      try {{
+        await fetch(`/api/jobs/${{encodeURIComponent(jid)}}`, {{
+          method: "DELETE",
+          credentials: "same-origin",
+        }});
+      }} catch (_e) {{}}
+      appendTerminalLog(`\\n[galaxy] Cancelled job ${{jid}} (${{stageId}}).\\n`, false);
+      return;
+    }}
+    appendTerminalLog(`\\n[subhkl] Stopped stage '${{stageId}}'.\\n`, false);
+  }}
+
   async function executeWorkflowStage(stageIdx, extraParams = null) {{
     const st = PIPELINE[stageIdx] || PIPELINE[state.currentPipelineIdx] || PIPELINE[1] || {{ stage_id: "solve", name: "2. SOLVE" }};
     const stageId = st.stage_id || "solve";
@@ -8206,6 +8371,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       openNeutronDataModal(null);
       return;
     }}
+    if (state.runningStageIdx >= 0 && state.runningStageIdx !== stageIdx) {{
+      await cancelWorkflowStage(state.runningStageIdx);
+    }}
+    const runSeq = (state.workflowRunSeq = (state.workflowRunSeq || 0) + 1);
     const params = {{ ...collectWorkflowParams(), ...(extraParams || {{}}) }};
     state.runningStageIdx = stageIdx;
     renderPipeline();
@@ -8224,6 +8393,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           body: JSON.stringify({{ stage_id: stageId, params: params }}),
         }});
         const res = await resp.json();
+        if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) {{
+          try {{
+            await fetch("api/pipeline/cancel", {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/json" }},
+              body: JSON.stringify({{ stage_id: stageId }}),
+            }});
+          }} catch (_ce) {{}}
+          return;
+        }}
         if (!resp.ok || res.status === "error") {{
           throw new Error(res.error || "Failed to dispatch job");
         }}
@@ -8248,6 +8427,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         let lastPartialSeq = 0;
         let lastPartialFrame = -1;
         galaxyBridge.pollTimer = setInterval(async () => {{
+          if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) {{
+            clearInterval(galaxyBridge.pollTimer);
+            galaxyBridge.pollTimer = null;
+            return;
+          }}
           try {{
             const curFrame = typeof state.selectedFrameIndex === "number"
               ? state.selectedFrameIndex
@@ -8255,6 +8439,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}`, {{ cache: "no-store" }});
             if (!sr.ok) return;
             const sdoc = await sr.json();
+            if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) return;
             if (sdoc.step_artifacts) {{
               galaxyBridge.stepArtifacts = sdoc.step_artifacts;
               renderFilesDrawer();
@@ -8322,15 +8507,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }} else if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
+            const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
             if (cellSummary) cellSummary.textContent = `${{aj.mode === "galaxy" ? "PULSAR" : "SUBHKL"}} [${{(aj.state || "running").toUpperCase()}}]`;
             const finishedOk = aj.state === "ok";
-            const finishedErr = aj.state === "error" || aj.state === "deleted" || aj.state === "paused" || (!finishedOk && !!aj.error);
+            const finishedErr = isCancelled || aj.state === "error" || aj.state === "paused" || (!finishedOk && !!aj.error);
             if (finishedOk || finishedErr) {{
               clearInterval(galaxyBridge.pollTimer);
               galaxyBridge.pollTimer = null;
               state.runningStageIdx = -1;
               renderPipeline();
-              if (cellSummary) cellSummary.textContent = finishedOk ? "DONE" : "ERROR";
+              if (cellSummary) cellSummary.textContent = finishedOk ? "DONE" : (isCancelled ? "STOPPED" : "ERROR");
               await probeGalaxyConnection();
               if (finishedOk) {{
                 const h5Outs = Array.isArray(aj.outputs)
@@ -8444,11 +8630,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           throw new Error((tres && tres.err_msg) || "Galaxy /api/tools error");
         }}
         const jobId = tres.jobs && tres.jobs[0] && tres.jobs[0].id;
+        galaxyBridge.activeGalaxyJobId = jobId;
         appendTerminalLog(`Dispatched Galaxy / Pulsar job ${{jobId}} (${{toolId}}). Polling stdio...`);
         if (stageId === "solve") selectLadderRung(0, false);
         let rungStep = 0;
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
         galaxyBridge.pollTimer = setInterval(async () => {{
+          if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) {{
+            clearInterval(galaxyBridge.pollTimer);
+            galaxyBridge.pollTimer = null;
+            return;
+          }}
           try {{
             const jr = await fetch(`/api/jobs/${{jobId}}?full=true`, {{ credentials: "same-origin" }});
             if (!jr.ok) return;
@@ -8471,9 +8663,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               rungStep = Math.min(3, rungStep + 1);
               selectLadderRung(rungStep, false);
             }}
-            if (jstate === "ok" || jstate === "error") {{
+            if (jstate === "ok" || jstate === "error" || jstate === "deleted") {{
               clearInterval(galaxyBridge.pollTimer);
               galaxyBridge.pollTimer = null;
+              galaxyBridge.activeGalaxyJobId = null;
               state.runningStageIdx = -1;
               renderPipeline();
               if (jstate === "ok") {{
@@ -8486,12 +8679,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                   await loadFromGalaxyDatasetId(outs[0].id);
                 }}
               }} else {{
-                if (cellSummary) cellSummary.textContent = "ERROR";
+                if (cellSummary) cellSummary.textContent = jstate === "deleted" ? "STOPPED" : "ERROR";
               }}
             }}
           }} catch (_je) {{}}
         }}, 1200);
       }} catch (err) {{
+        galaxyBridge.activeGalaxyJobId = null;
         state.runningStageIdx = -1;
         renderPipeline();
         appendTerminalLog(`\\n[error] ${{err.message}}`);
