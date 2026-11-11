@@ -17,8 +17,10 @@ from scipy.special import erf
 from subhkl.search.matrix_free import (
     MatrixFreeSparseRBFPeakFinder,
     _ceiling_from_widths,
-    _filter_widths_by_prior,
     _moment_width_census,
+)
+from subhkl.search.profiles import (
+    _filter_widths_by_prior,
     _sigma_from_truncated_m2,
     _truncated_m2_ratio,
 )
@@ -150,7 +152,7 @@ def test_functional_prior_rejects_halo_and_non_monotonic_artifacts():
     widths = np.concatenate([w_bragg, w_outliers])
     two_theta = np.concatenate([tt_bragg, tt_outliers])
 
-    filtered, keep, pred = _filter_widths_by_prior(widths, two_theta)
+    filtered, keep, _pred = _filter_widths_by_prior(widths, two_theta)
     # All 20 artifact outliers are rejected while >=95% of genuine peaks survive
     assert keep[:150].mean() >= 0.95
     assert not np.any(keep[150:])

@@ -153,7 +153,7 @@ def prepare_harvest_tasks(
 
         from subhkl.instrument.detector import Detector
 
-        det_cache: Dict[str, Detector] = {}
+        det_cache: dict[str, Detector] = {}
         phys_banks = [str(bank_mapping.get(k, k)) for k in img_keys]
         inst_cfg = beamlines.get(instrument, {})
 
