@@ -81,8 +81,8 @@ def _proposal_data(model, proposal_bin, g=None):
 
 def propose(model, cell, n_candidates=4, proposal_bin=32, g=None):
     """Joint signed count proposals in the sample frame for multiple settings."""
-    from subhkl.search.spherical import lattice_ladder
     from subhkl.search.multi_setting import MultiSettingModel
+    from subhkl.search.spherical import lattice_ladder
 
     if isinstance(model, MultiSettingModel):
         directions, residuals, angles = [], [], []
@@ -571,4 +571,10 @@ def run_solve(
         log(
             "All components are in solve/; sample/U selects the primary for existing single-crystal consumers."
         )
-    return dict(status=status, active=active, g=g, orientations=orientations, fit=fit)
+    return {
+        "status": status,
+        "active": active,
+        "g": g,
+        "orientations": orientations,
+        "fit": fit,
+    }

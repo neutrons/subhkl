@@ -4,8 +4,9 @@ The measurement routines retain their bright-window qualification rules.
 They estimate a shape prior; they do not select pixels for the count solver.
 """
 
-import numpy as np
 from dataclasses import dataclass
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -253,7 +254,7 @@ def measure_whitened_profile(
         v = np.asarray(valid[f], dtype=np.float64)
         for i in idx:
             half = int(np.ceil(u_max * sig_maj[i])) + 1
-            r0, c0 = int(round(rs[i])), int(round(cs[i]))
+            r0, c0 = round(rs[i]), round(cs[i])
             if not (half <= r0 < H - half and half <= c0 < W - half):
                 continue
             # one vote per peak: skip windows contaminated by a

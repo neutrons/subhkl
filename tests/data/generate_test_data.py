@@ -33,7 +33,9 @@ refl_cond_dict = {
 seed = 13
 
 
-def generate_peaks(instrument, cif_file, wavelength_band=[2, 4], min_d=1):
+def generate_peaks(instrument, cif_file, wavelength_band=None, min_d=1):
+    if wavelength_band is None:
+        wavelength_band = [2, 4]
     wl_min, wl_max = wavelength_band
 
     LoadEmptyInstrument(InstrumentName="MANDI", OutputWorkspace="instrument")
@@ -82,9 +84,8 @@ def generate_peaks(instrument, cif_file, wavelength_band=[2, 4], min_d=1):
 
     centering = symbol[0]
 
-    if centering == "R":
-        if symbol[-1] != "r":
-            centering += "obv"
+    if centering == "R" and symbol[-1] != "r":
+        centering += "obv"
 
     PredictPeaks(
         InputWorkspace="instrument",
@@ -101,7 +102,7 @@ def generate_peaks(instrument, cif_file, wavelength_band=[2, 4], min_d=1):
     az_phi = []
     h = []
     k = []
-    l = []  # noqa: E741
+    l = []
     lamda = []
 
     for peak in mtd["peaks"]:

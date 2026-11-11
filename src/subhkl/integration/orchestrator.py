@@ -1,11 +1,13 @@
-from dataclasses import dataclass, astuple
-import numpy as np
-from typing import List, Any, Optional, Dict, Tuple
+from dataclasses import astuple, dataclass
+from typing import Any
 
-from .image_data import ImageData
+import numpy as np
+
 from subhkl.config import beamlines
 from subhkl.instrument.goniometer import Goniometer
 from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
+
+from .image_data import ImageData
 
 
 @dataclass(frozen=True)
@@ -19,33 +21,33 @@ class Wavelength:
 
 @dataclass(frozen=True)
 class DetectorPeaks:
-    R: List[Any]
-    two_theta: List[float]
-    az_phi: List[float]
-    wavelength_mins: List[float]
-    wavelength_maxes: List[float]
+    R: list[Any]
+    two_theta: list[float]
+    az_phi: list[float]
+    wavelength_mins: list[float]
+    wavelength_maxes: list[float]
     # No intensity: the finder reports positions, shape and validation
     # metrics; amplitude measurement belongs to the integrator.
-    sigma: List[float]
-    radii: List[float]
-    xyz: List[List[float]]
-    bank: List[int]
-    image_index: List[int]
-    run_id: List[int]
-    gonio_axes: Optional[List[List[float]]]
-    gonio_angles: List[List[float]]
-    gonio_names: Optional[List[str]]
-    peak_rows: Optional[List[int]]
-    peak_cols: Optional[List[int]]
+    sigma: list[float]
+    radii: list[float]
+    xyz: list[list[float]]
+    bank: list[int]
+    image_index: list[int]
+    run_id: list[int]
+    gonio_axes: list[list[float]] | None
+    gonio_angles: list[list[float]]
+    gonio_names: list[str] | None
+    peak_rows: list[int] | None
+    peak_cols: list[int] | None
     # Per-peak quality metrics from the finder, when it reports them.
     # Trailing and defaulted so that positional construction and unpacking of
     # the fields above are unaffected.
-    deviance: Optional[List[float]] = None
-    residual_deviance: Optional[List[float]] = None
+    deviance: list[float] | None = None
+    residual_deviance: list[float] | None = None
     # The per-peak Gaussian width, for the finders that fit one.  None when no
     # width was measured, which is the difference from `sigma` above: that one
     # always holds a number, but only sometimes a width.
-    width: Optional[List[float]] = None
+    width: list[float] | None = None
 
     def __iter__(self):
         """Allows tuple unpacking"""
@@ -61,9 +63,9 @@ def prepare_harvest_tasks(
     instrument: str,
     goniometer: Goniometer,
     wavelength: Wavelength,
-    harvest_peaks_kwargs: Dict[str, Any],
-    integration_params: Dict[str, Any],
-) -> List[Tuple[Any, ...]]:
+    harvest_peaks_kwargs: dict[str, Any],
+    integration_params: dict[str, Any],
+) -> list[tuple[Any, ...]]:
     ims = image_data.ims
     bank_mapping = image_data.bank_mapping
 
@@ -274,16 +276,16 @@ def prepare_predict_tasks(
     d_min: float,
     UB: np.ndarray,
     space_group: str = "P 1",
-    sample_offset: Optional[np.ndarray] = None,
-    ki_vec: Optional[np.ndarray] = None,
-    R_all: Optional[np.ndarray] = None,
-    gonio_axes: Optional[Any] = None,
-    gonio_angles: Optional[np.ndarray] = None,
-    gonio_offsets: Optional[np.ndarray] = None,
-    per_run_trans: Optional[np.ndarray] = None,
-    frame_to_run: Optional[np.ndarray] = None,
-    harmonic_rot: Optional[np.ndarray] = None,
-) -> List[Tuple[Any, ...]]:
+    sample_offset: np.ndarray | None = None,
+    ki_vec: np.ndarray | None = None,
+    R_all: np.ndarray | None = None,
+    gonio_axes: Any | None = None,
+    gonio_angles: np.ndarray | None = None,
+    gonio_offsets: np.ndarray | None = None,
+    per_run_trans: np.ndarray | None = None,
+    frame_to_run: np.ndarray | None = None,
+    harmonic_rot: np.ndarray | None = None,
+) -> list[tuple[Any, ...]]:
     bank_mapping = image_data.bank_mapping
     tasks = []
 

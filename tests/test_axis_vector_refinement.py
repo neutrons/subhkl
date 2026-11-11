@@ -120,7 +120,7 @@ def test_true_tilt_indexes_what_the_nominal_axis_cannot():
 
 
 def test_the_refinement_is_off_by_default_and_costs_nothing():
-    obj, x_truth, _, _, _ = _make_fixture()
+    obj, _x_truth, _, _, _ = _make_fixture()
     off = VectorizedObjective(
         np.eye(3) / 6.0,
         np.array(obj.kf_ki_dir_init),

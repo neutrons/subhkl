@@ -1,20 +1,20 @@
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import h5py
-import PIL.Image
 import numpy as np
+import PIL.Image
 from tqdm import tqdm
 
 from subhkl.config import beamlines, reduction_settings
-from subhkl.io import loader
 from subhkl.instrument.detector import Detector
 from subhkl.instrument.goniometer import Goniometer
-from subhkl.integration import worker, orchestrator
+from subhkl.integration import orchestrator, worker
 from subhkl.integration.image_data import ImageData
 from subhkl.integration.orchestrator import DetectorPeaks, Wavelength
 from subhkl.integration.worker import _RunPeaksFinder, _safe_plot_wrapper
+from subhkl.io import loader
 
 
 def _init_goniometer(
@@ -22,14 +22,24 @@ def _init_goniometer(
 ) -> Goniometer:
     if ext == ".h5" and is_merged:
         with h5py.File(filename, "r") as f:
-            if axes is None or angles is None:
-                if "goniometer/axes" in f and "goniometer/angles" in f:
-                    return Goniometer.from_h5_file(f)
+            if (
+                (axes is None or angles is None)
+                and "goniometer/axes" in f
+                and "goniometer/angles" in f
+            ):
+                return Goniometer.from_h5_file(f)
 
     if ext == ".h5" and not is_merged:
         try:
             return Goniometer.from_nexus(filename, instrument)
-        except Exception as e:
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            IndexError,
+        ) as e:
             print(f"Warning: Failed to extract goniometer from nexus file: {e}")
 
     if axes is not None and angles is not None:
@@ -92,7 +102,7 @@ class Peaks:
         wavelength_min: float | None = None,
         wavelength_max: float | None = None,
     ):
-        name, ext = os.path.splitext(filename)
+        _name, ext = os.path.splitext(filename)
         self.filename = filename
         self.instrument = instrument
 
@@ -130,10 +140,10 @@ class Peaks:
         show_progress: bool = False,
         visualize: bool = False,
         file_prefix: str | None = None,
-        max_workers: int = None,
+        max_workers: int | None = None,
     ) -> DetectorPeaks:
         if not self.image.ims:
-            raise Exception("ERROR: Must have images for Peaks first...")
+            raise RuntimeError("ERROR: Must have images for Peaks first...")
 
         tasks, precomputed_peaks = orchestrator.prepare_harvest_tasks(
             self.image,
@@ -173,7 +183,14 @@ class Peaks:
                         tqdm.write(msg)
                     if res:
                         results_by_key[img_key] = res
-                except Exception as e:
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    IndexError,
+                ) as e:
                     print(f"Worker failed for image {img_key}: {e}")
 
         show_candidates = harvest_peaks_kwargs.get("show_candidates", False)
@@ -200,7 +217,7 @@ class Peaks:
         sample_offset=None,
         ki_vec=None,
         R_all=None,
-        max_workers: int = None,
+        max_workers: int | None = None,
         show_progress: bool = False,
         gonio_axes=None,
         gonio_angles=None,
@@ -261,7 +278,14 @@ class Peaks:
                     _, res = future.result()
                     if res:
                         results_by_bank[bank_id] = res
-                except Exception as e:
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    IndexError,
+                ) as e:
                     print(f"Prediction failed for bank {bank_id}: {e}")
 
         for bank_id in sorted(results_by_bank.keys()):
@@ -498,7 +522,14 @@ class Peaks:
                     try:
                         out_path = future.result()
                         tqdm.write(f"Saved: {out_path}")
-                    except Exception:
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        IndexError,
+                    ):
                         import traceback
 
                         print(f"Visualization failed for {futures[future]}:")

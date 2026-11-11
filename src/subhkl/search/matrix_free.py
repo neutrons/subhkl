@@ -1,14 +1,16 @@
-from subhkl.search.profiles import (
-    measure_radial_profile as _measure_radial_profile,
-    measure_whitened_profile as _measure_whitened_profile,
-)
-
+import itertools
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import numpy as np
 
+from subhkl.search.profiles import (
+    measure_radial_profile as _measure_radial_profile,
+)
+from subhkl.search.profiles import (
+    measure_whitened_profile as _measure_whitened_profile,
+)
 from subhkl.utils import devices as device_util
 
 _SNAP_POSITIONS_JIT = None
@@ -157,7 +159,7 @@ def _width_at_aperture(frame, bg_patch_src, row, col, guess, max_half, k):
     for _ in range(12):
         aperture = min(k * sigma, max_half)
         half = int(np.ceil(aperture)) + 1
-        r0, c0 = int(round(row)), int(round(col))
+        r0, c0 = round(row), round(col)
         if not (half < r0 < height - half and half < c0 < width - half):
             return float("nan")
         sl = (slice(r0 - half, r0 + half + 1), slice(c0 - half, c0 + half + 1))
@@ -447,7 +449,7 @@ def _frag_bank_ratio(
     sigmas = np.unique(np.round(np.asarray(sigmas, dtype=float), 6))
     z = _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width)
     worst, where = 0.0, float(sigmas[0])
-    for sa, sb in zip(sigmas[:-1], sigmas[1:]):
+    for sa, sb in itertools.pairwise(sigmas):
         ratio = _frag_pair_ratio(
             float(sa), float(sb), gamma, ref_sigma, z, bg, amp, fid_res
         )
@@ -466,7 +468,7 @@ def _required_uniform_num_sigmas(
         z = _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, side, side)
         if all(
             _frag_pair_ratio(float(sa), float(sb), gamma, ref_sigma, z, bg, amp) <= 1.0
-            for sa, sb in zip(sigmas[:-1], sigmas[1:])
+            for sa, sb in itertools.pairwise(sigmas)
         ):
             return n
     return None
@@ -556,7 +558,7 @@ def _auto_sigma_grid(
                 relaxed[i] = float(np.sqrt(lo * hi))
         ok = all(
             _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp, fid_res) <= 1.0
-            for sa, sb in zip(relaxed[:-1], relaxed[1:])
+            for sa, sb in itertools.pairwise(relaxed)
         )
         if ok:
             grid = relaxed
@@ -3393,9 +3395,9 @@ class MatrixFreeSparseRBFPeakFinder:
 # constrained optimum, inverted over the image's full dictionary, so crowded
 # reflections report their mutual covariance penalty.
 
-from tqdm import tqdm  # noqa: E402
+from tqdm import tqdm
 
-from subhkl.search.ssn import calibrated_admission_z, solve_ssn_unified  # noqa: E402
+from subhkl.search.ssn import calibrated_admission_z, solve_ssn_unified
 
 # Same clamp the patch integrator puts on its log-parabolic snap.
 MAX_SNAP_SHIFT = 1.5  # [Pixel]
@@ -3696,6 +3698,7 @@ def integrate_reflections_matrix_free(
     # Local import: sparse_rbf imports this function lazily at its call
     # site, so a top-level import there would be circular.
     import jax.numpy as jnp
+
     from subhkl.search.sparse_rbf import compute_rate_batch
 
     B, H, W = images_batch.shape
@@ -3852,9 +3855,9 @@ def integrate_reflections_matrix_free(
             continue
         k = len(idx)
 
-        def padded(arr, fill=0.0):
+        def padded(arr, fill=0.0, _k=k, _idx=idx):
             buf = np.full(k_pad, fill, dtype=np.float32)
-            buf[:k] = arr[idx]
+            buf[:_k] = arr[_idx]
             return jnp.array(buf)
 
         atom_ok = jnp.array(

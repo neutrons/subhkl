@@ -27,7 +27,7 @@ def test_u_absorbs_gonio_offset(tmp_path):
     R_true = R_nom @ delta_R
 
     # Create synthetic peaks
-    h, k, l = np.meshgrid(  # noqa: E741
+    h, k, l = np.meshgrid(
         np.arange(-5, 6), np.arange(-5, 5), np.arange(-5, 6), indexing="ij"
     )
     hkls = np.stack([h.flatten(), k.flatten(), l.flatten()], axis=1)
@@ -83,7 +83,7 @@ def test_u_absorbs_gonio_offset(tmp_path):
     fu = FindUB(data=data)
 
     # --- Run 1: WITH goniometer refinement ---
-    score1, hkl1, lamda1, U1 = fu.minimize(
+    _score1, _hkl1, _lamda1, U1 = fu.minimize(
         strategy_name="DE",
         population_size=100,  # Dropped from 500 so test runs instantly
         num_generations=50,  # Dropped from 150

@@ -1,6 +1,8 @@
 import re
+
 import h5py
 import numpy as np
+
 from subhkl.config import beamlines, reduction_settings
 from subhkl.integration.image_data import ImageData
 
@@ -13,7 +15,7 @@ class ImageLoader:
         with h5py.File(filename, "r") as f:
             keys = []
             banks = []
-            for key in f["/entry/"].keys():
+            for key in f["/entry/"]:
                 match = re.match(r"bank(\d+).*", key)
                 if match is not None:
                     keys.append(key)

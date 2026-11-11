@@ -108,7 +108,7 @@ def test_zone_conic_orthogonality():
 
 def test_identify_zones_and_payload_schema():
     """build_rainbow_zone_payload identifies [100] and [010] zones and builds Lattice Ladder."""
-    peaks_xyz, U, B, UB, _, _ = _synthetic_orthorhombic_peaks()
+    peaks_xyz, _U, _B, UB, _, _ = _synthetic_orthorhombic_peaks()
 
     zones = identify_zones(peaks_xyz, ub_matrix=UB, max_index=1, tolerance_deg=0.5)
     labels = {z["label"] for z in zones}
@@ -191,7 +191,9 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert "LATTICE LADDER" in content
 
     # Extract embedded JSON and validate it parses cleanly
-    match = re.search(r"window\.RAINBOW_ZONES_DATA\s*=\s*(\{.*?\});\n", content, re.S)
+    match = re.search(
+        r"window\.RAINBOW_ZONES_DATA\s*=\s*(\{.*?\});\n", content, re.DOTALL
+    )
     assert match is not None
     embedded = json.loads(match.group(1))
     assert len(embedded["peaks"]) == len(peaks_xyz)
@@ -349,6 +351,7 @@ def test_finderless_solve_h5_forward_projection_and_stages(tmp_path):
 def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     """Careless merge HDF5 stamping populates ASU orbits, residuals, scales, and multi-run sample_peaks."""
     import gemmi
+
     from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
     from subhkl.viz.rainbow_zones import render_rainbow_html
 
@@ -582,12 +585,15 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
     import subprocess
 
     if shutil.which("node"):
-        scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+        scripts = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
         assert scripts
         js_file = tmp_path / "embedded_check.js"
         js_file.write_text(scripts[-1], encoding="utf-8")
         proc = subprocess.run(
-            ["node", "--check", str(js_file)], capture_output=True, text=True
+            ["node", "--check", str(js_file)],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         assert proc.returncode == 0, f"JS syntax error: {proc.stderr}"
 
@@ -596,6 +602,7 @@ def test_predictor_and_integrator_ellipses_and_galaxy_dataset_loading(tmp_path):
     """Verify predictor.h5 and integrated.h5 (isotropic circles & anisotropic ellipses) are recognized and rendered."""
     import h5py
     import pytest
+
     from subhkl.viz.rainbow_zones import render_rainbow_html
 
     # 1. Create a synthetic predictor.h5 with banks/<img_idx>/(i, j, h, k, l, wavelength)
@@ -689,6 +696,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     """Verify merged.h5 sets pending_stage='solve' and CG4D /entry/title goniometer angles are harvested."""
     import h5py
     import pytest
+
     from subhkl.instrument.goniometer import (
         get_rotation_data_from_nexus,
         harvest_goniometer_angles_from_title,
@@ -776,6 +784,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
 
     # 4. Verify check_neutron_paths never touches the host filesystem directly and routes strictly through NDIP
     from unittest.mock import MagicMock
+
     from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
 
     runner_no_ndip = NovaGalaxyPipelineRunner(galaxy_url="")
@@ -999,6 +1008,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
 def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     """Verify CG4D neutrons_load_data file-mode routing, active-solve frame overlay, and MANDI curvilinear panel mesh."""
     import numpy as np
+
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
     from subhkl.instrument.goniometer import get_rotation_data_from_title
@@ -1031,7 +1041,7 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert mandi_in["params|ingest_mode"] == "oncat"
     assert mandi_in["params|instrument"] == "MANDI"
 
-    axes, angles, names = get_rotation_data_from_title("CaTiO3 phi=-59.0", "CG4D")
+    _axes, angles, names = get_rotation_data_from_title("CaTiO3 phi=-59.0", "CG4D")
     assert len(angles) == 5
     assert angles[-1] == -59.0
     assert "CG4D:Mot:phi" in names
@@ -1077,8 +1087,10 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert "isFrameSwitch" in html
 
     # 4. ImageStackMerger writes LZF-compressed 3D image stacks and multi-run check_neutron_paths returns verified_dataset_ids
-    import h5py
     from unittest.mock import MagicMock
+
+    import h5py
+
     from subhkl.commands import run_merge_images
 
     r1 = tmp_path / "CG4D_2625.reduce.h5"
@@ -1169,6 +1181,7 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
 
     # 6. Verify checkpoint(..., snapshot=...) writes a live Step 4 .stages.h5 loadable with include_panel_images=False
     from types import SimpleNamespace
+
     from subhkl.scan_refine import checkpoint
 
     stage_out = tmp_path / "live_solve.h5"

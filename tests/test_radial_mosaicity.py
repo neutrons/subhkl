@@ -12,8 +12,8 @@ per-peak radial direction, eta^2 (D P r)(D P r)^T.
 
 from __future__ import annotations
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
 from subhkl.search.sparse_rbf import build_3d_cov, optimize_global_crystal
 
@@ -106,8 +106,9 @@ def test_radial_mode_recovers_the_streak_where_isotropic_cannot():
 def test_spherical_shape_plus_streak_matches_the_full_model():
     """The hypothesis test: if the data are core + streak, constraining
     the sample tensor to a sphere must cost nothing."""
-    from subhkl.search.sparse_rbf import val_and_grad_fn
     import jax.numpy as jnp_
+
+    from subhkl.search.sparse_rbf import val_and_grad_fn
 
     phis = np.deg2rad(np.linspace(10, 170, 16))
     args = _make_patches(phis)

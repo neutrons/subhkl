@@ -32,12 +32,12 @@ def restrict_to_first_device() -> None:
     this quietly does nothing rather than fail a run over memory that has
     already been claimed.
     """
-    try:
+    import contextlib
+
+    with contextlib.suppress(ImportError, AttributeError, RuntimeError, ValueError):
         import jax
 
         jax.config.update("jax_cuda_visible_devices", "0")
-    except Exception:
-        pass
 
 
 def batch_devices(multi_gpu: bool) -> list:

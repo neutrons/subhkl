@@ -15,8 +15,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import sparse
 from scipy.optimize import OptimizeResult, minimize
-from scipy.special import ndtr, xlogy
 from scipy.spatial.transform import Rotation
+from scipy.special import ndtr, xlogy
 
 from subhkl.calibrate import geometry_detectors, reciprocal_lattice
 
@@ -61,8 +61,8 @@ class CountData:
                 raise ValueError("image dimensions must be divisible by bin_px")
             shape = (h // bin_px, w // bin_px)
 
-            def blocks(a):
-                return a.reshape(shape[0], bin_px, shape[1], bin_px)
+            def blocks(a, _shape=shape):
+                return a.reshape(_shape[0], bin_px, _shape[1], bin_px)
 
             keep = blocks(valid).all(axis=(1, 3))
             y = blocks(np.where(valid, im, 0)).sum(axis=(1, 3))[keep]

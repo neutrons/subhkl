@@ -18,15 +18,23 @@ from pathlib import Path
 import h5py
 import pytest
 
-from subhkl.io.parser import indexer
 from subhkl.commands import (
-    run_reduce as reduce,
     run_finder as finder,
-    run_rbf_integrator as integrator,
+)
+from subhkl.commands import (
     run_mtz_exporter as mtz_exporter,
+)
+from subhkl.commands import (
     run_peak_predictor as peak_predictor,
 )
+from subhkl.commands import (
+    run_rbf_integrator as integrator,
+)
+from subhkl.commands import (
+    run_reduce as reduce,
+)
 from subhkl.instrument.metrics import compute_metrics
+from subhkl.io.parser import indexer
 
 # Test data configuration
 MESOLITE_FILE = "MANDI_11613.nxs.h5"  # Use the first file from the Zenodo dataset

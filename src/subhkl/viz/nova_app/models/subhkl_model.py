@@ -349,8 +349,17 @@ class SubhklGalaxyModel:
             outputs = tool.run(data_store, params, wait=True)
             downloaded_path = None
             if outputs is not None:
+                import contextlib
+
                 for out_name in ("output_solved", "output_peaks", "output"):
-                    try:
+                    with contextlib.suppress(
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        AttributeError,
+                    ):
                         ds = outputs.get_dataset(out_name)
                         target = os.path.join(
                             tempfile.gettempdir(),
@@ -359,8 +368,6 @@ class SubhklGalaxyModel:
                         ds.download(target)
                         downloaded_path = target
                         break
-                    except Exception:
-                        continue
 
             if downloaded_path and os.path.isfile(downloaded_path):
                 self.data.peaks_file = downloaded_path

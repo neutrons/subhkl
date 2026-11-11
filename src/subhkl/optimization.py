@@ -115,7 +115,7 @@ def get_lattice_system(
         sg = get_space_group_object(space_group_name)
         sys_str = str(sg.crystal_system()).split(".")[-1].lower()
         centering = sg.centring_type()
-    except Exception:
+    except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
         sys_str = "triclinic"
         centering = "P"
 
@@ -1401,8 +1401,8 @@ class VectorizedObjective:
             dyn_centers,
             dyn_uhats,
             dyn_vhats,
-            dyn_widths,
-            dyn_heights,
+            _dyn_widths,
+            _dyn_heights,
             area_scale,
             _,
             _,
@@ -1710,7 +1710,7 @@ class FindUB:
             if "goniometer/offsets" in f:
                 off_data = f["goniometer/offsets"]
                 if isinstance(off_data, h5py.Group):
-                    b_gonio_offsets = {k: off_data[k][()] for k in off_data.keys()}
+                    b_gonio_offsets = {k: off_data[k][()] for k in off_data}
                 else:
                     b_gonio_offsets = off_data[()]
 
@@ -2108,12 +2108,12 @@ class FindUB:
             for i, name in enumerate(unique_motors):
                 for req_idx, req in enumerate(refine_goniometer_axes):
                     # --- FIX: Case-insensitive match ---
-                    if req.lower() in name.lower():
-                        if len(gonio_trans_bounds_list) == len(refine_goniometer_axes):
-                            bounds_array_trans[i] = gonio_trans_bounds_list[req_idx]
-        elif refine_sample:
-            if len(gonio_trans_bounds_list) == len(unique_motors):
-                bounds_array_trans = np.array(gonio_trans_bounds_list)
+                    if req.lower() in name.lower() and len(
+                        gonio_trans_bounds_list
+                    ) == len(refine_goniometer_axes):
+                        bounds_array_trans[i] = gonio_trans_bounds_list[req_idx]
+        elif refine_sample and len(gonio_trans_bounds_list) == len(unique_motors):
+            bounds_array_trans = np.array(gonio_trans_bounds_list)
 
         cell_params_init = np.array(
             [self.a, self.b, self.c, self.alpha, self.beta, self.gamma]
@@ -2122,11 +2122,10 @@ class FindUB:
             self.a, self.b, self.c, self.alpha, self.beta, self.gamma, self.space_group
         )
 
-        if refine_detector:
-            if detector_params is None or peak_pixel_coords is None:
-                raise ValueError(
-                    "To use --refine-detector, detector_params and peak_pixel_coords must be passed from parser.py"
-                )
+        if refine_detector and (detector_params is None or peak_pixel_coords is None):
+            raise ValueError(
+                "To use --refine-detector, detector_params and peak_pixel_coords must be passed from parser.py"
+            )
 
         objective = VectorizedObjective(
             self.reciprocal_lattice_B(),
@@ -2226,10 +2225,10 @@ class FindUB:
             self.x = np.array([])
             x_batch = jnp.zeros((1, 0))
             (
-                UB_final_batch,
-                B_new_batch,
+                _UB_final_batch,
+                _B_new_batch,
                 t_axes_batch,
-                sample_origin_lab_batch,
+                _sample_origin_lab_batch,
                 ki_vec_batch,
                 offsets_total_batch,
                 R_batch,
@@ -2238,7 +2237,7 @@ class FindUB:
                 dyn_vhats,
                 dyn_widths,
                 dyn_heights,
-                area_scale,
+                _area_scale,
                 axes_refined_batch,
                 axis_tilts_batch,
                 per_run_delta_batch,
@@ -2255,7 +2254,7 @@ class FindUB:
             rot_params = self.fixed_rot_params if freeze_orientation else np.zeros(3)
             U = objective.orientation_U_jax(rot_params[None])[0]
 
-            loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
+            _loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
             dist_min_final = np.array(dist_min[0])
             # Soft indexing measures fractional-hkl distance; the fixed-hkl
             # geometric loss measures an angular chord, cut at the 1 degree
@@ -2499,10 +2498,10 @@ class FindUB:
         self.x = np.array(best_overall_member)
         x_batch = jnp.array(self.x[None, :])
         (
-            UB_final_batch,
-            B_new_batch,
+            _UB_final_batch,
+            _B_new_batch,
             t_axes_batch,
-            sample_origin_lab_batch,
+            _sample_origin_lab_batch,
             ki_vec_batch,
             offsets_total_batch,
             R_batch,
@@ -2511,7 +2510,7 @@ class FindUB:
             dyn_vhats,
             dyn_widths,
             dyn_heights,
-            area_scale,
+            _area_scale,
             axes_refined_batch,
             axis_tilts_batch,
             per_run_delta_batch,
@@ -2628,7 +2627,7 @@ class FindUB:
             print("--- Refined Detector Geometry ---")
             print(f"Max Center Translation: {max_drift:.3f} mm")
 
-        loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
+        _loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
         dist_min_final = np.array(dist_min[0])
 
         threshold = np.deg2rad(1.0) if objective.no_index else 0.15

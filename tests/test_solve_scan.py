@@ -139,8 +139,8 @@ def test_scan_cli_and_corrected_metadata_round_trip(scan, tmp_path):
 
 
 def test_scan_visualizer_without_peak_table(scan, tmp_path, monkeypatch):
-    from subhkl.commands import run_indexer_visualize
     import subhkl.viz.solve as viz
+    from subhkl.commands import run_indexer_visualize
 
     frame, boot, bg, *_ = scan
     output = tmp_path / "solve.h5"
@@ -176,9 +176,9 @@ def test_scan_visualizer_without_peak_table(scan, tmp_path, monkeypatch):
 def test_scan_joint_proposals_transform_q_but_preserve_bragg_angle(
     scan, monkeypatch, tmp_path
 ):
-    import subhkl.search.spherical as spherical
+    from subhkl.search import spherical
 
-    frame, boot, bg, U, R, _ = scan
+    frame, _boot, bg, U, _R, _ = scan
     captured = []
 
     def ladder(D, w, B, **kwargs):
@@ -247,8 +247,8 @@ def test_seven_parameter_refinement_retains_budget_diagnostics(scan, tmp_path):
 
 
 def test_unconverged_visualizations_are_labeled(scan, tmp_path, monkeypatch):
-    from subhkl.commands import run_indexer_visualize
     import subhkl.viz.solve as viz
+    from subhkl.commands import run_indexer_visualize
 
     frame, boot, bg, *_ = scan
     output = tmp_path / "failed.h5"

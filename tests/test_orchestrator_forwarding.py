@@ -11,6 +11,7 @@ CLI takes.
 """
 
 import inspect
+from typing import ClassVar
 
 import numpy as np
 
@@ -20,7 +21,7 @@ from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
 
 class _RecordingFinder:
-    received: dict = {}
+    received: ClassVar[dict] = {}
 
     def __init__(self, **kwargs):
         _RecordingFinder.received = kwargs

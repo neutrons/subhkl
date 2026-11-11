@@ -97,7 +97,7 @@ def test_multi_run_indexing_refinement():
     rotations = [[0.0], [45.0]]
     data = generate_synthetic_data(a, b, c, 90, 90, 90, U_true, rotations, gonio_axes)
     fu = FindUB(data=data)
-    num_peaks, hkl_res, lam_res, U_res = fu.minimize(
+    _num_peaks, _hkl_res, _lam_res, U_res = fu.minimize(
         strategy_name="DE",
         population_size=200,
         num_generations=100,
@@ -131,7 +131,7 @@ def test_sample_offset_refinement_multirun():
         sample_offset_true=s_true,
     )
     fu = FindUB(data=data)
-    num_peaks, hkl_res, lam_res, U_res = fu.minimize(
+    _num_peaks, _hkl_res, _lam_res, _U_res = fu.minimize(
         strategy_name="DE",
         population_size=100,
         num_generations=500,
@@ -221,7 +221,7 @@ def test_multirun_peaks_per_image_vulnerability():
     # THIS SHOULD CRASH if mapping is missing
     try:
         obj(x)
-    except Exception as e:
+    except (RuntimeError, ValueError, TypeError, KeyError, IndexError) as e:
         pytest.fail(f"Indexer CRASHED on multi-peak-per-run mapping: {e}")
 
     assert hasattr(obj, "peak_run_indices"), (

@@ -1,7 +1,8 @@
-import pytest
-import numpy as np
 import h5py
+import numpy as np
+import pytest
 import scipy.special
+
 from subhkl.io.parser import finder
 
 

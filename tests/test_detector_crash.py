@@ -1,6 +1,7 @@
+import h5py
 import numpy as np
 import pytest
-import h5py
+
 from subhkl.integration import Peaks
 
 
@@ -38,9 +39,9 @@ def test_integration_bank_alignment_crash(tmp_path):
             pytest.fail(
                 f"Bug Reproduced: Peaks.get_detector_peaks crashed on invalid bank ID! {e}"
             )
-        raise e
+        raise
     except Exception as e:
         # Worker might fail with a different message
         if "999" in str(e):
             pytest.fail(f"Bug Reproduced: Worker failed due to bank ID 999! {e}")
-        raise e
+        raise

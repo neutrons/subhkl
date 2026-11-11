@@ -22,6 +22,7 @@ Key features:
 from __future__ import annotations
 
 import base64
+import contextlib
 import glob
 import io
 import json
@@ -35,7 +36,6 @@ import numpy as np
 from PIL import Image
 
 from subhkl import get_version as get_subhkl_version
-
 from subhkl.viz.zones import (
     _cell_from_B,
     _spherical_angles,
@@ -108,10 +108,10 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
                 pass
 
     for bank_id, cfg in base_configs.items():
-        try:
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError
+        ):
             detectors[bank_id] = Detector(cfg)
-        except Exception:
-            pass
 
     if "detector_calibration" in f:
         cal_grp = f["detector_calibration"]
@@ -132,10 +132,10 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
             for field in ("width", "height"):
                 if field in g:
                     cfg[field] = float(g[field][()])
-            try:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
                 detectors[bank_id] = Detector(cfg)
-            except Exception:
-                pass
 
     return detectors
 
@@ -147,10 +147,12 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
     p = Path(replay_h5).resolve()
     if not p.exists():
         return None
-    try:
-        with h5py.File(p, "r") as f:
-            if "images" in f:
-                return str(p)
+    with (
+        contextlib.suppress(OSError, RuntimeError, ValueError, TypeError, KeyError),
+        h5py.File(p, "r") as f,
+    ):
+        if "images" in f:
+            return str(p)
             src_attr = _decode_str(f.attrs.get("source"), "")
             if not src_attr and "scan_refinement" in f:
                 src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
@@ -159,14 +161,16 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
             if src_attr:
                 for cand_src in (Path(src_attr), p.parent / Path(src_attr).name):
                     if cand_src.exists():
-                        try:
-                            with h5py.File(cand_src, "r") as sf:
-                                if "images" in sf:
-                                    return str(cand_src.resolve())
-                        except Exception:
-                            pass
+                        with (
+                            contextlib.suppress(OSError, RuntimeError, KeyError),
+                            h5py.File(cand_src, "r") as sf,
+                        ):
+                            if "images" in sf:
+                                return str(cand_src.resolve())
             if "files" in f:
-                try:
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
                     raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
                     raw_files = [x for x in raw_files if x]
                     if raw_files:
@@ -186,10 +190,6 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                             )
                             if work_cand.is_file():
                                 return str(work_cand.resolve())
-                except Exception:
-                    pass
-    except Exception:
-        pass
 
     parent = p.parent
     if parent.resolve() == Path(tempfile.gettempdir()).resolve():
@@ -198,12 +198,12 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
         glob.glob(str(parent / "*merged*.h5"))
     )
     for cand in candidates:
-        try:
-            with h5py.File(cand, "r") as f:
-                if "images" in f and "bank_ids" in f:
-                    return cand
-        except Exception:
-            continue
+        with (
+            contextlib.suppress(OSError, RuntimeError, KeyError),
+            h5py.File(cand, "r") as f,
+        ):
+            if "images" in f and "bank_ids" in f:
+                return cand
     return None
 
 
@@ -250,10 +250,13 @@ def _encode_panel_textures(
                             or (int(ims.shape[1]) == 256 and det_n == 512)
                         ):
                             det_compat = False
-                        uniq_b = set(int(x) for x in np.unique(b_ids_all))
-                        if uniq_b and not uniq_b.issubset(set(detectors.keys())):
-                            if len(uniq_b - set(detectors.keys())) > 2:
-                                det_compat = False
+                        uniq_b = {int(x) for x in np.unique(b_ids_all)}
+                        if (
+                            uniq_b
+                            and not uniq_b.issubset(set(detectors.keys()))
+                            and len(uniq_b - set(detectors.keys())) > 2
+                        ):
+                            det_compat = False
                     if det_compat:
                         f0, f1 = 0, n_total_frames
                         if frame_slice is not None:
@@ -289,8 +292,8 @@ def _encode_panel_textures(
                                 raw_bank_images[bk] = imb
                         if raw_bank_images:
                             intensity_source = "raw_h5"
-        except Exception:
-            pass
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
+            intensity_source = "synthesized_peaks"
 
     # If no raw images were loaded, synthesize clean 2D Gaussian spot maps on each populated bank
     if (
@@ -480,8 +483,16 @@ def _encode_panel_textures(
                     "texture_b64": tex_b64,
                 }
             )
-        except Exception:
-            pass
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            IndexError,
+            AttributeError,
+        ):
+            continue
 
     return panels_payload, intensity_source
 
@@ -549,40 +560,41 @@ def _extract_from_h5(
                 if (
                     abs(wavelength_range[0] - 2.0) < 1e-3
                     and abs(wavelength_range[1] - 10.0) < 1e-3
-                ):
-                    if sib_solve_path:
-                        try:
-                            with h5py.File(sib_solve_path, "r") as sf:
-                                for wk in (
-                                    "scan_refinement/band_wavelength",
-                                    "instrument/wavelength",
-                                ):
-                                    if wk in sf:
-                                        swl = np.asarray(
-                                            sf[wk][()], dtype=float
-                                        ).ravel()
-                                        if len(swl) >= 2:
-                                            wavelength_range = (
-                                                float(swl[0]),
-                                                float(swl[1]),
-                                            )
-                                            break
-                        except Exception:
-                            pass
-        elif sib_solve_path:
-            try:
-                with h5py.File(sib_solve_path, "r") as sf:
-                    for wk in (
-                        "scan_refinement/band_wavelength",
-                        "instrument/wavelength",
+                ) and sib_solve_path:
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(sib_solve_path, "r") as sf,
                     ):
-                        if wk in sf:
-                            swl = np.asarray(sf[wk][()], dtype=float).ravel()
-                            if len(swl) >= 2:
-                                wavelength_range = (float(swl[0]), float(swl[1]))
-                                break
-            except Exception:
-                pass
+                        for wk in (
+                            "scan_refinement/band_wavelength",
+                            "instrument/wavelength",
+                        ):
+                            if wk in sf:
+                                swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                                if len(swl) >= 2:
+                                    wavelength_range = (
+                                        float(swl[0]),
+                                        float(swl[1]),
+                                    )
+                                    break
+        elif sib_solve_path:
+            with (
+                contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ),
+                h5py.File(sib_solve_path, "r") as sf,
+            ):
+                for wk in (
+                    "scan_refinement/band_wavelength",
+                    "instrument/wavelength",
+                ):
+                    if wk in sf:
+                        swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                        if len(swl) >= 2:
+                            wavelength_range = (float(swl[0]), float(swl[1]))
+                            break
 
         U = np.asarray(f["sample/U"][()], dtype=float) if "sample/U" in f else None
         B = np.asarray(f["sample/B"][()], dtype=float) if "sample/B" in f else None
@@ -626,15 +638,17 @@ def _extract_from_h5(
                     _decode_str(x, "").upper() for x in list(f["files"][()])
                 )
             elif src_h5 and os.path.isfile(src_h5):
-                try:
-                    with h5py.File(src_h5, "r") as sf_inst:
-                        if "files" in sf_inst:
-                            name_cands.extend(
-                                _decode_str(x, "").upper()
-                                for x in list(sf_inst["files"][()])
-                            )
-                except Exception:
-                    pass
+                with (
+                    contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ),
+                    h5py.File(src_h5, "r") as sf_inst,
+                ):
+                    if "files" in sf_inst:
+                        name_cands.extend(
+                            _decode_str(x, "").upper()
+                            for x in list(sf_inst["files"][()])
+                        )
             for fn_s in name_cands:
                 for known_inst in ("MANDI", "TOPAZ", "CG4D", "IMAGINE"):
                     if known_inst in fn_s:
@@ -724,30 +738,32 @@ def _extract_from_h5(
         for aux_path in (src_h5, sib_solve_path):
             if not aux_path or not os.path.isfile(aux_path):
                 continue
-            try:
-                with h5py.File(aux_path, "r") as af:
-                    if offsets is None and "file_offsets" in af:
-                        offsets = np.asarray(af["file_offsets"][()], dtype=int)
-                    if n_frames_total == 0 and "bank_ids" in af:
-                        n_frames_total = len(af["bank_ids"])
-                    if files_raw is None and "files" in af:
-                        files_raw = list(af["files"][()])
-                    if gonio_names_raw is None and "goniometer/names" in af:
-                        gonio_names_raw = list(af["goniometer/names"][()])
-                    if gonio_axes is None and "goniometer/axes" in af:
-                        gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
-                    if aux_path == src_h5 and "goniometer/angles" in af:
-                        gonio_angles_nom = np.asarray(
-                            af["goniometer/angles"][()], dtype=float
-                        )
-                    elif gonio_angles_ref is None and "goniometer/angles" in af:
-                        gonio_angles_ref = np.asarray(
-                            af["goniometer/angles"][()], dtype=float
-                        )
-                    if R_all is None and "goniometer/R" in af:
-                        R_all = np.asarray(af["goniometer/R"][()], dtype=float)
-            except Exception:
-                pass
+            with (
+                contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ),
+                h5py.File(aux_path, "r") as af,
+            ):
+                if offsets is None and "file_offsets" in af:
+                    offsets = np.asarray(af["file_offsets"][()], dtype=int)
+                if n_frames_total == 0 and "bank_ids" in af:
+                    n_frames_total = len(af["bank_ids"])
+                if files_raw is None and "files" in af:
+                    files_raw = list(af["files"][()])
+                if gonio_names_raw is None and "goniometer/names" in af:
+                    gonio_names_raw = list(af["goniometer/names"][()])
+                if gonio_axes is None and "goniometer/axes" in af:
+                    gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
+                if aux_path == src_h5 and "goniometer/angles" in af:
+                    gonio_angles_nom = np.asarray(
+                        af["goniometer/angles"][()], dtype=float
+                    )
+                elif gonio_angles_ref is None and "goniometer/angles" in af:
+                    gonio_angles_ref = np.asarray(
+                        af["goniometer/angles"][()], dtype=float
+                    )
+                if R_all is None and "goniometer/R" in af:
+                    R_all = np.asarray(af["goniometer/R"][()], dtype=float)
 
         if gonio_angles_nom is None:
             gonio_angles_nom = gonio_angles_ref
@@ -917,9 +933,7 @@ def _extract_from_h5(
         if any(k in f for k in ("blind_search", "scan_refinement", "solve", "search")):
             solve_diagnostics = {}
             bs_grp = (
-                f["blind_search"]
-                if "blind_search" in f
-                else (f["search"] if "search" in f else None)
+                f["blind_search"] if "blind_search" in f else (f.get("search", None))
             )
             if bs_grp is not None:
                 solve_diagnostics["stable_observations"] = int(
@@ -934,7 +948,7 @@ def _extract_from_h5(
                 )
                 if "proposal_scores" in bs_grp:
                     ps = np.asarray(bs_grp["proposal_scores"][()], dtype=float).ravel()
-                    solve_diagnostics["n_candidates"] = int(len(ps))
+                    solve_diagnostics["n_candidates"] = len(ps)
                     solve_diagnostics["top_proposal_score"] = (
                         float(np.max(ps)) if len(ps) else 0.0
                     )
@@ -957,7 +971,7 @@ def _extract_from_h5(
                 stages_raw = _decode_str(sr_grp.attrs.get("stages"), "[]")
                 try:
                     solve_diagnostics["stages"] = json.loads(stages_raw)
-                except Exception:
+                except (ValueError, TypeError):
                     solve_diagnostics["stages"] = []
             elif "solve" in f:
                 s_grp = f["solve"]
@@ -1049,23 +1063,23 @@ def _extract_from_h5(
 
         merge_metrics: dict[str, Any] | None = None
         if "careless/metrics_json" in f:
-            try:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
                 raw_m = _decode_str(f["careless/metrics_json"][()], "{}")
                 doc_m = json.loads(raw_m)
                 if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
                     merge_metrics = _normalize_merge_metrics(doc_m)
-            except Exception:
-                pass
         elif "peaks" in f:
             sib_m = Path(h5_path).parent / "careless_metrics.json"
             if sib_m.is_file():
-                try:
-                    with open(sib_m, "r", encoding="utf-8") as mfh:
-                        doc_m = json.load(mfh)
-                        if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
-                            merge_metrics = _normalize_merge_metrics(doc_m)
-                except Exception:
-                    pass
+                with (
+                    contextlib.suppress(OSError, ValueError, TypeError, KeyError),
+                    open(sib_m, encoding="utf-8") as mfh,
+                ):
+                    doc_m = json.load(mfh)
+                    if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
+                        merge_metrics = _normalize_merge_metrics(doc_m)
 
         artifact_kind = "solve"
         peak_shape_mode = "solved_circle"
@@ -1144,7 +1158,9 @@ def _extract_from_h5(
                     and gonio_angles_nom.ndim == 2
                     and 0 <= f0_r < len(gonio_angles_nom)
                 ):
-                    try:
+                    with contextlib.suppress(
+                        ImportError, RuntimeError, ValueError, TypeError, IndexError
+                    ):
                         from subhkl.instrument.goniometer import (
                             calc_goniometer_rotation_matrix,
                         )
@@ -1152,8 +1168,6 @@ def _extract_from_h5(
                         R_per_run[ur_i] = calc_goniometer_rotation_matrix(
                             gonio_axes, gonio_angles_nom[f0_r]
                         )
-                    except Exception:
-                        pass
             all_runs_data = {
                 "peaks_xyz": peaks_xyz[idx_all],
                 "hkl": hkl[idx_all],
@@ -1266,7 +1280,14 @@ def _extract_from_h5(
 
         # Recognize predictor.h5 format: banks/<img_idx>/(i, j, h, k, l, wavelength)
         if (peaks_xyz is None or len(peaks_xyz) == 0) and "banks" in f:
-            try:
+            with contextlib.suppress(
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 artifact_kind = "predictor"
                 peak_shape_mode = "predicted_circle"
                 b_ids_pred = (
@@ -1283,19 +1304,19 @@ def _extract_from_h5(
 
                 bank_imgs_pred: dict[int, np.ndarray] = {}
                 if src_h5 and os.path.exists(src_h5):
-                    try:
-                        with h5py.File(src_h5, "r") as mf:
-                            if "images" in mf and "bank_ids" in mf:
-                                b_ids_s = np.asarray(
-                                    mf["bank_ids"][f0_p:f1_p], dtype=int
-                                )
-                                ims_s = np.asarray(
-                                    mf["images"][f0_p:f1_p], dtype=np.float32
-                                )
-                                for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                    bank_imgs_pred[int(b_id_s)] = im_s
-                    except Exception:
-                        pass
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(src_h5, "r") as mf,
+                    ):
+                        if "images" in mf and "bank_ids" in mf:
+                            b_ids_s = np.asarray(mf["bank_ids"][f0_p:f1_p], dtype=int)
+                            ims_s = np.asarray(
+                                mf["images"][f0_p:f1_p], dtype=np.float32
+                            )
+                            for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                bank_imgs_pred[int(b_id_s)] = im_s
 
                 xyz_p, hkl_p, lam_p, bank_p, pr_p, pc_p, inten_p = (
                     [],
@@ -1381,8 +1402,6 @@ def _extract_from_h5(
                     pixel_c = np.concatenate(pc_p, axis=0)
                     intensity = np.concatenate(inten_p, axis=0)
                     sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
-            except Exception:
-                pass
 
         R_gonio = None
         if R_all is not None:
@@ -1414,7 +1433,9 @@ def _extract_from_h5(
             and gonio_angles_nom.ndim == 2
             and len(gonio_angles_nom) > 0
         ):
-            try:
+            with contextlib.suppress(
+                ImportError, RuntimeError, ValueError, TypeError, IndexError
+            ):
                 from subhkl.instrument.goniometer import (
                     calc_goniometer_rotation_matrix,
                 )
@@ -1428,8 +1449,6 @@ def _extract_from_h5(
                 R_gonio = calc_goniometer_rotation_matrix(
                     gonio_axes, gonio_angles_nom[f0_ang]
                 )
-            except Exception:
-                pass
 
         # Finder-less solve.h5 forward projection onto calibrated detector banks
         if (
@@ -1439,7 +1458,15 @@ def _extract_from_h5(
             and B is not None
             and detectors
         ):
-            try:
+            with contextlib.suppress(
+                ImportError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 from subhkl.core.crystallography import generate_reflections
 
                 U_mat = np.asarray(U, dtype=float)
@@ -1487,39 +1514,37 @@ def _extract_from_h5(
 
                 bank_imgs: dict[int, np.ndarray] = {}
                 if src_h5 and os.path.exists(src_h5):
-                    try:
-                        with h5py.File(src_h5, "r") as mf:
-                            if "images" in mf and "bank_ids" in mf:
-                                f0_s, f1_s = (
-                                    frame_slice
-                                    if frame_slice is not None
-                                    else (0, len(mf["bank_ids"]))
-                                )
-                                b_ids_s = np.asarray(
-                                    mf["bank_ids"][f0_s:f1_s], dtype=int
-                                )
-                                ims_s = np.asarray(
-                                    mf["images"][f0_s:f1_s], dtype=np.float32
-                                )
-                                sample_det = (
-                                    next(iter(detectors.values()))
-                                    if detectors
-                                    else None
-                                )
-                                det_n = int(getattr(sample_det, "n", 0))
-                                compat = True
-                                if (
-                                    ims_s.ndim >= 3
-                                    and det_n > 0
-                                    and int(ims_s.shape[1]) != det_n
-                                ):
-                                    compat = False
-                                if compat:
-                                    for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                        if int(b_id_s) in detectors:
-                                            bank_imgs[int(b_id_s)] = im_s
-                    except Exception:
-                        pass
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(src_h5, "r") as mf,
+                    ):
+                        if "images" in mf and "bank_ids" in mf:
+                            f0_s, f1_s = (
+                                frame_slice
+                                if frame_slice is not None
+                                else (0, len(mf["bank_ids"]))
+                            )
+                            b_ids_s = np.asarray(mf["bank_ids"][f0_s:f1_s], dtype=int)
+                            ims_s = np.asarray(
+                                mf["images"][f0_s:f1_s], dtype=np.float32
+                            )
+                            sample_det = (
+                                next(iter(detectors.values())) if detectors else None
+                            )
+                            det_n = int(getattr(sample_det, "n", 0))
+                            compat = True
+                            if (
+                                ims_s.ndim >= 3
+                                and det_n > 0
+                                and int(ims_s.shape[1]) != det_n
+                            ):
+                                compat = False
+                            if compat:
+                                for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                    if int(b_id_s) in detectors:
+                                        bank_imgs[int(b_id_s)] = im_s
 
                 cal_bids_set: set[int] = set()
                 if "detector_calibration" in f:
@@ -1533,11 +1558,7 @@ def _extract_from_h5(
                 active_bids = (
                     set(bank_imgs.keys())
                     if bank_imgs
-                    else (
-                        cal_bids_set
-                        if cal_bids_set
-                        else set(int(k) for k in detectors.keys())
-                    )
+                    else (cal_bids_set if cal_bids_set else {int(k) for k in detectors})
                 )
 
                 raw_hits: list[dict[str, Any]] = []
@@ -1656,8 +1677,6 @@ def _extract_from_h5(
                     pixel_c = np.concatenate(pc_l, axis=0)
                     intensity = np.concatenate(inten_l, axis=0)
                     sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
-            except Exception:
-                pass
 
         if peaks_xyz is None:
             peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -2453,7 +2472,9 @@ def build_rainbow_zone_payload(
             c0 = pixel_c_arr[idxs][:, None]
             cols_ell = c0 + a_bk * cos_t * c_phi - b_bk * sin_t * s_phi
             rows_ell = r0 + a_bk * cos_t * s_phi + b_bk * sin_t * c_phi
-            try:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+            ):
                 xyz_ell = det.pixel_to_lab(rows_ell.ravel(), cols_ell.ravel())
                 az_ell, y_ell = _unrolled(xyz_ell)
                 _, el_ell = _spherical_angles(xyz_ell)
@@ -2479,14 +2500,12 @@ def build_rainbow_zone_payload(
                     sigma_major_by_idx[p_i] = round(float(s1_all[p_i]), 2)
                     sigma_minor_by_idx[p_i] = round(float(s2_all[p_i]), 2)
                     ellipse_ang_by_idx[p_i] = round(float(np.rad2deg(phi_all[p_i])), 1)
-            except Exception:
-                pass
 
     # Compute canonical ASU symmetry orbits and Laue harmonic ray multiplicity
     sg_obj = None
     asu_obj = None
     sg_ops = None
-    try:
+    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
         import gemmi
 
         sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
@@ -2495,16 +2514,12 @@ def build_rainbow_zone_payload(
         if sg_obj is not None:
             asu_obj = gemmi.ReciprocalAsu(sg_obj)
             sg_ops = sg_obj.operations()
-    except Exception:
-        pass
 
     def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int]:
         if asu_obj is not None and sg_ops is not None and (h_v or k_v or l_v):
-            try:
+            with contextlib.suppress(RuntimeError, ValueError, TypeError, IndexError):
                 ha, _ = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
                 return (int(ha[0]), int(ha[1]), int(ha[2]))
-            except Exception:
-                pass
         ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
         sg_u = str(space_group or "").upper()
         is_cubic = "3" in sg_u or (
@@ -2788,7 +2803,14 @@ def build_rainbow_zone_payload(
             )
         )
         if needs_bin_enrich and len(sample_peaks) > 0:
-            try:
+            with contextlib.suppress(
+                ImportError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 import gemmi as _gm
 
                 asu_obs_map: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
@@ -2926,8 +2948,6 @@ def build_rainbow_zone_payload(
                         )
                     merge_metrics["cc_half_bins"] = enriched_bins
                     merge_metrics["resolution_bins"] = enriched_bins
-            except Exception:
-                pass
 
     zones_payload: list[dict[str, Any]] = []
     for zi, z in enumerate(raw_zones):
@@ -2941,7 +2961,14 @@ def build_rainbow_zone_payload(
         kf = conic_lab["kf_hat"]
         if detectors:
             for bk, det in sorted(detectors.items()):
-                try:
+                with contextlib.suppress(
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    IndexError,
+                ):
                     mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
                     if not np.any(mask):
                         continue
@@ -2973,8 +3000,6 @@ def build_rainbow_zone_payload(
                                     for j in range(0, len(px), step_s)
                                 ]
                             )
-                except Exception:
-                    pass
 
         dx = np.asarray(conic_lab["det_x"], dtype=float)
         dy = np.asarray(conic_lab["det_y"], dtype=float)

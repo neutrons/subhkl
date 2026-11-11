@@ -1,7 +1,7 @@
 """Single-crystal discovery by band search, shared geometry, and full-data ranking."""
 
-from pathlib import Path
 import time
+from pathlib import Path
 
 import h5py
 import numpy as np
@@ -231,8 +231,15 @@ def discover(args, samples=16384, candidates=6, seed=0):
                     )
                 ).decode("ascii")
                 print(f"[subhkl-live-state] {b64}", flush=True)
-        except Exception:
-            pass
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            IndexError,
+        ):
+            tmp_path.unlink(missing_ok=True)
 
     print(
         f"Blind band search: {len(weights)} stable-run observations, {len(idx)} search observations (exhaustive rung init)",

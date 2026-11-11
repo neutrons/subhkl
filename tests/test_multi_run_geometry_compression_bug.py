@@ -1,6 +1,7 @@
-import numpy as np
+from unittest.mock import MagicMock, patch
+
 import h5py
-from unittest.mock import patch, MagicMock
+import numpy as np
 
 try:
     from subhkl.io.command_line_parser import indexer

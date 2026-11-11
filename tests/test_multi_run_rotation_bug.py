@@ -80,5 +80,5 @@ if __name__ == "__main__":
         print("Test PASSED")
     except AssertionError as e:
         print(f"Test FAILED: {e}")
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError) as e:
         print(f"An error occurred: {e}")

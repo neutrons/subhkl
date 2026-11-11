@@ -7,7 +7,6 @@ install should ever do, so the tests that need the dataset are marked
 
 import subprocess
 import sys
-
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +21,7 @@ def _pytest(*arguments):
         capture_output=True,
         text=True,
         timeout=600,
+        check=False,
     )
 
 

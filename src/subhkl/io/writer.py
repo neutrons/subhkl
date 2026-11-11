@@ -15,12 +15,12 @@ def write_hdf5(
     radii: list[float],
     xyz: list[list[float]],
     bank: list[int],
-    image_index: list[int] = None,
-    run_id: list[int] = None,
-    gonio_axes: list[list[float]] = None,
-    gonio_angles: list[list[float]] = None,
-    gonio_names: list[str] = None,
-    instrument_wavelength: tuple[float, float] = None,
+    image_index: list[int] | None = None,
+    run_id: list[int] | None = None,
+    gonio_axes: list[list[float]] | None = None,
+    gonio_angles: list[list[float]] | None = None,
+    gonio_names: list[str] | None = None,
+    instrument_wavelength: tuple[float, float] | None = None,
 ):
     with h5py.File(output_filename, "w") as f:
         f.attrs["instrument"] = peaks.instrument

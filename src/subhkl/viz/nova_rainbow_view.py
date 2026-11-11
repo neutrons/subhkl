@@ -14,6 +14,7 @@ Supports three execution modes for NDIP / Galaxy / NOVA and local beamline works
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import json
 import os
@@ -25,12 +26,24 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
 from subhkl.viz.rainbow_zones import (
     build_rainbow_zone_payload,
     render_rainbow_html,
+)
+
+_NOVA_RECOVERABLE_ERRORS = (
+    OSError,
+    RuntimeError,
+    ValueError,
+    TypeError,
+    KeyError,
+    IndexError,
+    AttributeError,
+    ImportError,
+    ArithmeticError,
 )
 
 
@@ -47,7 +60,7 @@ class NovaGalaxyPipelineRunner:
       - Stage 4 (Merge & MTZ): ``imaginex_subhkl_integrate`` (MTZ export)
     """
 
-    STAGE_TOOLS: dict[str, list[str]] = {
+    STAGE_TOOLS: ClassVar[dict[str, list[str]]] = {
         "reduce": [
             "imaginex_subhkl_prepare_peaks",
         ],
@@ -63,7 +76,7 @@ class NovaGalaxyPipelineRunner:
     # options when ``params|ingest_mode == "oncat"``, omitting instruments such as
     # ``CG4D`` / ``IMAGINE``. When an instrument is not in this allow-list, we pass
     # the ONCat-resolved path via ``params|ingest_mode == "file"`` (``params|filepath``).
-    NEUTRONS_LOAD_DATA_ONCAT_INSTRUMENTS: dict[str, set[str]] = {
+    NEUTRONS_LOAD_DATA_ONCAT_INSTRUMENTS: ClassVar[dict[str, set[str]]] = {
         "SNS": {
             "ARCS",
             "BL0",
@@ -197,15 +210,15 @@ class NovaGalaxyPipelineRunner:
         import re as _re
 
         p_str = str(nxs_path or "")
-        m_loc = _re.search(r"/(SNS|HFIR)/([^/]+)/IPTS-([^/]+)/", p_str, _re.I)
-        m_run = _re.search(r"_([0-9]+)\.nxs", os.path.basename(p_str), _re.I)
+        m_loc = _re.search(r"/(SNS|HFIR)/([^/]+)/IPTS-([^/]+)/", p_str, _re.IGNORECASE)
+        m_run = _re.search(r"_([0-9]+)\.nxs", os.path.basename(p_str), _re.IGNORECASE)
         if not m_loc:
             return ""
         fac_u = m_loc.group(1).upper()
         inst_u = m_loc.group(2).upper()
         ipts_num = m_loc.group(3)
         run_num = int(m_run.group(1)) if m_run else None
-        try:
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             cat = self.browse_oncat_catalog(
                 {
                     "facility": fac_u,
@@ -220,8 +233,6 @@ class NovaGalaxyPipelineRunner:
                     t_part = str(r.get("title") or "").strip()
                     g_part = str(r.get("angles") or "").strip()
                     return f"{t_part} {g_part}".strip()
-        except Exception:
-            pass
         return ""
 
     def apply_active_solve_overlay(
@@ -252,7 +263,7 @@ class NovaGalaxyPipelineRunner:
             and os.path.isfile(partial_h5)
             and os.path.getsize(partial_h5) > 0
         ):
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 from subhkl.viz.rainbow_zones import build_rainbow_zone_payload
 
                 p_blind = build_rainbow_zone_payload(
@@ -342,8 +353,6 @@ class NovaGalaxyPipelineRunner:
                         "ladder_steps": p_blind.get("ladder_steps", []),
                     }
                     return payload
-            except Exception:
-                pass
         ov = aj.get("partial_overlay")
         if (
             isinstance(ov, dict)
@@ -393,7 +402,7 @@ class NovaGalaxyPipelineRunner:
                     return False
                 doc = json.loads(resp.read().decode("utf-8"))
                 return isinstance(doc, dict) and "version_major" in doc
-        except Exception:
+        except _NOVA_RECOVERABLE_ERRORS:
             return False
 
     @staticmethod
@@ -481,9 +490,11 @@ class NovaGalaxyPipelineRunner:
         """Decode a ``[subhkl-live-state] <b64>`` stdout snapshot into an HDF5 file for live zone rendering."""
         import base64
         import zlib
+
         import h5py
         import numpy as np
         from scipy.spatial.transform import Rotation
+
         from subhkl.config import beamlines
         from subhkl.instrument.detector import Detector
 
@@ -583,10 +594,8 @@ class NovaGalaxyPipelineRunner:
             return True
         finally:
             if os.path.exists(tmp_p):
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(tmp_p)
-                except Exception:
-                    pass
 
     def _auto_discover_local_galaxy(self) -> None:
         """Auto-discover local Planemo / Galaxy server if env vars were not injected."""
@@ -609,7 +618,7 @@ class NovaGalaxyPipelineRunner:
             not self.galaxy_api_key or self.galaxy_api_key == "test_key"
         ):
             # Check if Planemo's default master_api_key ('test_key') can mint/fetch a user key
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 users = self._api_request("GET", "/api/users", api_key="test_key")
                 if isinstance(users, list) and users:
                     uid = users[0]["id"]
@@ -624,16 +633,12 @@ class NovaGalaxyPipelineRunner:
                         self.galaxy_api_key = ukey
                     elif not self.galaxy_api_key:
                         self.galaxy_api_key = "test_key"
-            except Exception:
-                pass
 
         if self.galaxy_url and self.galaxy_api_key and not self.history_id:
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 histories = self._api_request("GET", "/api/histories")
                 if isinstance(histories, list) and histories:
                     self.history_id = histories[0]["id"]
-            except Exception:
-                pass
 
     @property
     def is_connected(self) -> bool:
@@ -699,7 +704,7 @@ class NovaGalaxyPipelineRunner:
                 and it.get("history_content_type") == "dataset"
                 and not it.get("deleted")
             ]
-        except Exception:
+        except _NOVA_RECOVERABLE_ERRORS:
             return []
 
     def resolve_dataset_to_local_h5(
@@ -710,7 +715,7 @@ class NovaGalaxyPipelineRunner:
 
         info = self._api_request("GET", f"/api/datasets/{ds_id}")
         if not isinstance(info, dict):
-            raise RuntimeError(f"Dataset {ds_id} not found on {self.galaxy_url}")
+            raise TypeError(f"Dataset {ds_id} not found on {self.galaxy_url}")
         name = str(info.get("name") or f"{ds_id}.h5")
         file_name = str(info.get("file_name") or "")
         if file_name and os.path.isfile(file_name) and os.path.getsize(file_name) > 0:
@@ -736,11 +741,15 @@ class NovaGalaxyPipelineRunner:
         expected_size = int(info.get("file_size") or 0)
         if fallback_dir and os.path.isdir(fallback_dir):
             cand = os.path.join(fallback_dir, os.path.basename(name))
-            if os.path.isfile(cand) and os.path.getsize(cand) > 0:
-                if (expected_size > 0 and os.path.getsize(cand) == expected_size) or (
-                    expected_size == 0 and not self.is_connected
-                ):
-                    return cand, info
+            if (
+                os.path.isfile(cand)
+                and os.path.getsize(cand) > 0
+                and (
+                    (expected_size > 0 and os.path.getsize(cand) == expected_size)
+                    or (expected_size == 0 and not self.is_connected)
+                )
+            ):
+                return cand, info
 
         safe_name = "".join(
             ch if (ch.isalnum() or ch in "._-") else "_"
@@ -846,7 +855,7 @@ class NovaGalaxyPipelineRunner:
 
         work_dir = self._active_work_dir(current_h5)
         if work_dir and os.path.isdir(work_dir):
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 for fn in sorted(os.listdir(work_dir)):
                     fp = os.path.join(work_dir, fn)
                     if not os.path.isfile(fp) or os.path.getsize(fp) <= 0:
@@ -866,8 +875,6 @@ class NovaGalaxyPipelineRunner:
                         m_entry = dict(entry)
                         m_entry["stage_id"] = "merge"
                         stages["merge"][fn] = m_entry
-            except Exception:
-                pass
 
         return {k: list(v.values()) for k, v in stages.items()}
 
@@ -936,7 +943,7 @@ class NovaGalaxyPipelineRunner:
 
         tag = ""
         if os.path.isfile(abs_m):
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 import h5py
 
                 with h5py.File(abs_m, "r") as hf:
@@ -954,12 +961,10 @@ class NovaGalaxyPipelineRunner:
                             s0 = os.path.basename(raw_f[0]).split(".")[0]
                             s1 = os.path.basename(raw_f[-1]).split(".")[0]
                             tag = s0 if s0 == s1 else f"{s0}_{s1}"
-            except Exception:
-                pass
         if not tag:
             bn = os.path.basename(abs_m)
             bn = _re.sub(r"^subhkl_gx_[0-9a-fA-F]+_", "", bn)
-            bn = _re.sub(r"(_merged)?\.h5$", "", bn, flags=_re.I)
+            bn = _re.sub(r"(_merged)?\.h5$", "", bn, flags=_re.IGNORECASE)
             tag = bn or "dataset"
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
         work_d = os.path.join(tmp_root, f"subhkl_work_{safe_tag}")
@@ -968,7 +973,7 @@ class NovaGalaxyPipelineRunner:
         if os.path.isfile(abs_m) and not os.path.isfile(dest_m):
             try:
                 _shutil.copy2(abs_m, dest_m)
-            except Exception:
+            except OSError:
                 return work_d, abs_m
         return work_d, (dest_m if os.path.isfile(dest_m) else abs_m)
 
@@ -996,16 +1001,14 @@ class NovaGalaxyPipelineRunner:
         try:
             doc = self._api_request("GET", f"/api/tools/{tool_id}")
             return isinstance(doc, dict) and doc.get("id") == tool_id
-        except Exception:
+        except _NOVA_RECOVERABLE_ERRORS:
             return False
 
     def _get_tool_version(self, tool_id: str) -> str:
-        try:
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             doc = self._api_request("GET", f"/api/tools/{tool_id}")
             if isinstance(doc, dict):
                 return str(doc.get("version") or "")
-        except Exception:
-            pass
         return ""
 
     def submit_galaxy_stage(
@@ -1089,11 +1092,9 @@ class NovaGalaxyPipelineRunner:
             gx_ids.append(cur_jid)
 
         for jid in gx_ids:
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 self._api_request("DELETE", f"/api/jobs/{jid}")
                 cancelled_galaxy_ids.append(jid)
-            except Exception:
-                pass
 
         proc = getattr(self, "_active_proc", None)
         if proc is not None:
@@ -1102,23 +1103,22 @@ class NovaGalaxyPipelineRunner:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 else:
                     proc.terminate()
-            except Exception:
-                try:
+            except OSError:
+                with contextlib.suppress(OSError):
                     proc.terminate()
-                except Exception:
-                    pass
 
         cname = getattr(self, "_active_container_name", None)
         if cname:
-            try:
+            with contextlib.suppress(
+                OSError, subprocess.SubprocessError, ValueError, TypeError
+            ):
                 subprocess.run(
                     ["podman", "rm", "-f", str(cname)],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=5.0,
+                    check=False,
                 )
-            except Exception:
-                pass
 
         return {
             "ok": True,
@@ -1133,7 +1133,7 @@ class NovaGalaxyPipelineRunner:
     def _stamp_merged_metadata(self, h5_path: str, job_record: dict[str, Any]) -> None:
         if not h5_path or not os.path.isfile(h5_path):
             return
-        try:
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             import h5py
             import numpy as np
 
@@ -1143,16 +1143,17 @@ class NovaGalaxyPipelineRunner:
             ).strip()
             sg_val = str(params.get("space_group") or "").strip()
             raw_cell = params.get("cell")
-            if not (isinstance(raw_cell, (list, tuple)) and len(raw_cell) == 6):
-                if all(k in params for k in ("a", "b", "c", "alpha", "beta", "gamma")):
-                    raw_cell = [
-                        float(params["a"]),
-                        float(params["b"]),
-                        float(params["c"]),
-                        float(params["alpha"]),
-                        float(params["beta"]),
-                        float(params["gamma"]),
-                    ]
+            if not (isinstance(raw_cell, (list, tuple)) and len(raw_cell) == 6) and all(
+                k in params for k in ("a", "b", "c", "alpha", "beta", "gamma")
+            ):
+                raw_cell = [
+                    float(params["a"]),
+                    float(params["b"]),
+                    float(params["c"]),
+                    float(params["alpha"]),
+                    float(params["beta"]),
+                    float(params["gamma"]),
+                ]
             with h5py.File(h5_path, "r+") as hf:
                 if inst_val and "instrument" not in hf:
                     hf["instrument"] = np.bytes_(inst_val)
@@ -1187,8 +1188,6 @@ class NovaGalaxyPipelineRunner:
                     ):
                         if k_c not in grp:
                             grp[k_c] = float(raw_cell[idx_c])
-        except Exception:
-            pass
 
     def _stamp_careless_merge_into_h5(
         self,
@@ -1197,8 +1196,8 @@ class NovaGalaxyPipelineRunner:
         job_record: dict[str, Any],
     ) -> None:
         """Persist Careless merge metrics and per-observation residuals/scales into ``integrated.h5``."""
-        import h5py
         import gemmi
+        import h5py
         import numpy as np
 
         metrics_path = os.path.join(work_dir, "careless_metrics.json")
@@ -1212,11 +1211,11 @@ class NovaGalaxyPipelineRunner:
                 metrics_raw = fh.read()
                 try:
                     metrics_doc = json.loads(metrics_raw)
-                except Exception:
+                except ValueError:
                     metrics_doc = {}
 
         if os.path.isfile(merged_mtz_path):
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 mtz_m = gemmi.read_mtz_file(merged_mtz_path)
                 mcols = {c.label: np.array(c, dtype=np.float64) for c in mtz_m.columns}
                 mI = mcols.get("I", mcols.get("I(+)", np.array([])))
@@ -1378,8 +1377,6 @@ class NovaGalaxyPipelineRunner:
                     metrics_raw = json.dumps(metrics_doc, indent=2)
                     with open(metrics_path, "w", encoding="utf-8") as fh_out:
                         fh_out.write(metrics_raw)
-            except Exception:
-                pass
 
         with h5py.File(integrated_h5_path, "r+") as hf:
             cgrp = hf.require_group("careless")
@@ -1526,15 +1523,13 @@ class NovaGalaxyPipelineRunner:
             ):
                 known_id = known_map.get(cand_p)
                 if known_id:
-                    try:
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         k_info = gi.datasets.show_dataset(known_id)
                         if k_info.get("state") == "ok" and not k_info.get("deleted"):
                             job_record["stdout"] += (
                                 f"[nova -> galaxy] Linked cached dataset '{fname}' (id={known_id}, state=ok)\n"
                             )
                             return known_id
-                    except Exception:
-                        pass
 
             search_names = [fname]
             if fname != "merged.h5" and fname.endswith("_merged.h5"):
@@ -1550,12 +1545,10 @@ class NovaGalaxyPipelineRunner:
                     if not ds_id:
                         continue
                     info: dict[str, Any] = {}
-                    try:
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         raw_info = gi.datasets.show_dataset(ds_id)
                         if isinstance(raw_info, dict):
                             info = raw_info
-                    except Exception:
-                        pass
                     if info.get("deleted") is True or ds.get("deleted") is True:
                         continue
                     st = (
@@ -1579,7 +1572,7 @@ class NovaGalaxyPipelineRunner:
                 job_record["stdout"] += (
                     f"[nova -> galaxy] Waiting up to 15s for in-progress dataset '{fname}' (id={ds_id}, state={st})...\n"
                 )
-                try:
+                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                     gi.datasets.wait_for_dataset(
                         ds_id, maxwait=15, interval=2.0, check=False
                     )
@@ -1588,8 +1581,6 @@ class NovaGalaxyPipelineRunner:
                         known_map[os.path.abspath(local_path)] = ds_id
                         self._dataset_id_by_path = known_map
                         return ds_id
-                except Exception:
-                    pass
 
         if file_ext == "mtz":
             file_ext = "binary"
@@ -1609,13 +1600,11 @@ class NovaGalaxyPipelineRunner:
             link_to_files=is_local_gx,
         )
         ds_id = up_info["outputs"][0]["id"]
-        try:
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             gi.datasets.wait_for_dataset(ds_id, maxwait=30, interval=2.0, check=False)
-        except Exception:
-            pass
         known_map[os.path.abspath(local_path)] = ds_id
         self._dataset_id_by_path = known_map
-        try:
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             safe_name = "".join(
                 ch if (ch.isalnum() or ch in "._-") else "_"
                 for ch in os.path.basename(fname)
@@ -1626,10 +1615,8 @@ class NovaGalaxyPipelineRunner:
             if os.path.isfile(local_path) and not os.path.exists(cache_dest):
                 try:
                     os.link(local_path, cache_dest)
-                except Exception:
+                except OSError:
                     shutil.copy2(local_path, cache_dest)
-        except Exception:
-            pass
         job_record["stdout"] += (
             f"[nova -> galaxy] Saved '{fname}' in Galaxy history (id={ds_id})\n"
         )
@@ -1708,25 +1695,25 @@ class NovaGalaxyPipelineRunner:
                         self.galaxy_url
                         and "127.0.0.1" not in self.galaxy_url
                         and "localhost" not in self.galaxy_url
+                        and self._is_galaxy_server("http://127.0.0.1:9090")
                     ):
-                        if self._is_galaxy_server("http://127.0.0.1:9090"):
-                            from nova.galaxy import Connection
+                        from nova.galaxy import Connection
 
-                            job_record["stdout"] += (
-                                f"[nova -> galaxy] '{required_tool}' not yet merged on {self.galaxy_url}; "
-                                f"switching to local Galaxy instance http://127.0.0.1:9090 (GPU container runner)...\n"
-                            )
-                            local_conn = Connection(
-                                galaxy_url="http://127.0.0.1:9090",
-                                galaxy_key="test_key",
-                            )
-                            store = local_conn.connect().create_data_store(
-                                "IMAGINE-X SubHKL"
-                            )
-                            gi = store.nova_connection.galaxy_instance
-                            self.galaxy_url = "http://127.0.0.1:9090"
-                            self.api_key = gi.key
-                            self.history_id = store.history_id
+                        job_record["stdout"] += (
+                            f"[nova -> galaxy] '{required_tool}' not yet merged on {self.galaxy_url}; "
+                            f"switching to local Galaxy instance http://127.0.0.1:9090 (GPU container runner)...\n"
+                        )
+                        local_conn = Connection(
+                            galaxy_url="http://127.0.0.1:9090",
+                            galaxy_key="test_key",
+                        )
+                        store = local_conn.connect().create_data_store(
+                            "IMAGINE-X SubHKL"
+                        )
+                        gi = store.nova_connection.galaxy_instance
+                        self.galaxy_url = "http://127.0.0.1:9090"
+                        self.api_key = gi.key
+                        self.history_id = store.history_id
 
                     if not self._has_tool_on_galaxy(required_tool):
                         raise RuntimeError(
@@ -1806,10 +1793,10 @@ class NovaGalaxyPipelineRunner:
                         r"^IPTS-",
                         "",
                         str(params.get("ipts") or "").strip(),
-                        flags=_re.I,
+                        flags=_re.IGNORECASE,
                     )
                     if not ipts_str:
-                        m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.I)
+                        m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.IGNORECASE)
                         if m_ip:
                             ipts_str = m_ip.group(1)
                     fac_str = str(
@@ -1836,7 +1823,7 @@ class NovaGalaxyPipelineRunner:
                                     m_rc = _re.search(
                                         r"_([0-9]+)\.nxs",
                                         os.path.basename(p_chk),
-                                        _re.I,
+                                        _re.IGNORECASE,
                                     )
                                     if m_rc and int(m_rc.group(1)) not in run_map:
                                         missing_r.append(os.path.basename(p_chk))
@@ -1849,7 +1836,7 @@ class NovaGalaxyPipelineRunner:
                                 ]
                         except FileNotFoundError:
                             raise
-                        except Exception:
+                        except _NOVA_RECOVERABLE_ERRORS:
                             pass
 
                 if verified_ids:
@@ -1864,16 +1851,16 @@ class NovaGalaxyPipelineRunner:
                     nld_inputs: dict[str, Any] = {}
                     first_p = raw_nxs[0]
                     m_run = _re.search(
-                        r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.I
+                        r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.IGNORECASE
                     )
                     ipts_str = _re.sub(
                         r"^IPTS-",
                         "",
                         str(params.get("ipts") or "").strip(),
-                        flags=_re.I,
+                        flags=_re.IGNORECASE,
                     )
                     if not ipts_str:
-                        m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.I)
+                        m_ip = _re.search(r"/IPTS-([^/]+)/", first_p, _re.IGNORECASE)
                         if m_ip:
                             ipts_str = m_ip.group(1)
                     nld_inputs = self._build_neutrons_load_data_inputs(
@@ -1918,14 +1905,12 @@ class NovaGalaxyPipelineRunner:
                                 or "File not found"
                             ).strip()
                             for oid in nld_outs:
-                                try:
+                                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                     self._api_request(
                                         "PUT",
                                         f"/api/histories/{store.history_id}/contents/{oid}",
                                         payload={"deleted": True},
                                     )
-                                except Exception:
-                                    pass
                             raise FileNotFoundError(
                                 f"NDIP neutrons_load_data failed: {err_out.splitlines()[0]}"
                             )
@@ -2001,8 +1986,10 @@ class NovaGalaxyPipelineRunner:
                 out_sub = os.path.join(work_dir, "out")
                 os.makedirs(out_sub, exist_ok=True)
                 # Pre-warm ONCat catalog cache once for the sweep so parallel workers don't re-fetch it per run
-                try:
-                    m_ip = _re.search(r"/IPTS-([0-9]+)/", raw_nxs_all[0], _re.I)
+                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                    m_ip = _re.search(
+                        r"/IPTS-([0-9]+)/", raw_nxs_all[0], _re.IGNORECASE
+                    )
                     if m_ip:
                         fac_pre = (
                             "HFIR"
@@ -2019,8 +2006,6 @@ class NovaGalaxyPipelineRunner:
                                 "ipts": m_ip.group(1),
                             }
                         )
-                except Exception:
-                    pass
 
                 job_record["stdout"] += (
                     f"[galaxy -> pulsar] Multi-run reduction ({len(raw_nxs_all)} runs): "
@@ -2111,14 +2096,12 @@ class NovaGalaxyPipelineRunner:
                     )
                     for po in p_outs:
                         if po.get("id") and self.history_id:
-                            try:
+                            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                 self._api_request(
                                     "PUT",
                                     f"/api/histories/{self.history_id}/contents/{po['id']}",
                                     payload={"deleted": True, "purged": True},
                                 )
-                            except Exception:
-                                pass
                     st_part = str(part_rec.get("state") or "ok")
                     with log_lock:
                         job_record["stdout"] += (
@@ -2154,9 +2137,10 @@ class NovaGalaxyPipelineRunner:
                 merged_label = str(job_record.get("merged_label") or "merged.h5")
                 merged_dest = os.path.join(work_dir, merged_label)
                 merged_link = os.path.join(work_dir, "merged.h5")
-                from subhkl.commands import run_merge_images
                 import h5py
                 import numpy as np
+
+                from subhkl.commands import run_merge_images
 
                 job_record["stdout"] += (
                     f"\n[subhkl] Merging {len(part_paths)} reduced runs (LZF compressed) -> {merged_dest}...\n"
@@ -2172,25 +2156,22 @@ class NovaGalaxyPipelineRunner:
                     float(raw_cell[5]),
                     sg,
                 )
-                try:
-                    with h5py.File(merged_dest, "r+") as hf:
-                        if "files" in hf:
-                            del hf["files"]
-                        hf["files"] = np.array(
-                            [
-                                f"out/{os.path.basename(p)}".encode("utf-8")
-                                for p in part_paths
-                            ]
-                        )
-                except Exception:
-                    pass
+                with (
+                    contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS),
+                    h5py.File(merged_dest, "r+") as hf,
+                ):
+                    if "files" in hf:
+                        del hf["files"]
+                    hf["files"] = np.array(
+                        [f"out/{os.path.basename(p)}".encode() for p in part_paths]
+                    )
                 self._stamp_merged_metadata(merged_dest, job_record)
                 if os.path.abspath(merged_dest) != os.path.abspath(merged_link):
                     try:
                         if os.path.exists(merged_link):
                             os.remove(merged_link)
                         os.link(merged_dest, merged_link)
-                    except Exception:
+                    except OSError:
                         shutil.copy2(merged_dest, merged_link)
                 job_record["output_h5_path"] = merged_dest
                 if callable(on_complete_h5):
@@ -2202,7 +2183,7 @@ class NovaGalaxyPipelineRunner:
                 job_record["state"] = "ok"
 
                 def _bg_preupload() -> None:
-                    try:
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         bg_rec: dict[str, Any] = {"stdout": ""}
                         up_id = self._ensure_galaxy_h5_dataset(
                             store,
@@ -2218,8 +2199,6 @@ class NovaGalaxyPipelineRunner:
                                 "extension": "h5",
                             }
                         ]
-                    except Exception:
-                        pass
 
                 threading.Thread(target=_bg_preupload, daemon=True).start()
                 return
@@ -2312,7 +2291,7 @@ class NovaGalaxyPipelineRunner:
             job_record["state"] = "error"
             job_record["stderr"] = f"{clean_msg}\n"
             job_record["stdout"] += f"\n[galaxy -> ndip] Error: {clean_msg}\n"
-        except Exception as exc:
+        except _NOVA_RECOVERABLE_ERRORS as exc:
             if job_record.get("cancel_requested"):
                 job_record["state"] = "deleted"
                 return
@@ -2351,7 +2330,7 @@ class NovaGalaxyPipelineRunner:
         fac = str(body.get("facility") or "HFIR").strip()
         inst = str(body.get("instrument") or "CG4D").strip()
         ipts_raw = _re.sub(
-            r"^IPTS-", "", str(body.get("ipts") or "").strip(), flags=_re.I
+            r"^IPTS-", "", str(body.get("ipts") or "").strip(), flags=_re.IGNORECASE
         )
         raw_paths = body.get("paths") or []
         if isinstance(raw_paths, str):
@@ -2388,7 +2367,7 @@ class NovaGalaxyPipelineRunner:
             try:
                 ndip_checked = True
                 m_p0 = _re.match(
-                    r"^/(SNS|HFIR)/([^/]+)/IPTS-([^/]+)/", expanded[0], _re.I
+                    r"^/(SNS|HFIR)/([^/]+)/IPTS-([^/]+)/", expanded[0], _re.IGNORECASE
                 )
                 if m_p0 and (
                     str(body.get("ingest_mode") or "oncat") == "file" or not ipts_raw
@@ -2397,12 +2376,12 @@ class NovaGalaxyPipelineRunner:
                     inst = m_p0.group(2).upper()
                     ipts_raw = m_p0.group(3)
                 elif not ipts_raw:
-                    m_ip0 = _re.search(r"/IPTS-([^/]+)/", expanded[0], _re.I)
+                    m_ip0 = _re.search(r"/IPTS-([^/]+)/", expanded[0], _re.IGNORECASE)
                     if m_ip0:
                         ipts_raw = m_ip0.group(1)
                 # Verify via authenticated pyoncat catalog first (instant metadata check, no file fetch)
                 if ipts_raw:
-                    try:
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         cat = self.browse_oncat_catalog(
                             {
                                 "facility": fac,
@@ -2421,7 +2400,9 @@ class NovaGalaxyPipelineRunner:
                             gonio_seen: list[str] = []
                             for p in expanded:
                                 m_r = _re.search(
-                                    r"_([0-9]+)\.nxs", os.path.basename(p), _re.I
+                                    r"_([0-9]+)\.nxs",
+                                    os.path.basename(p),
+                                    _re.IGNORECASE,
                                 )
                                 if m_r:
                                     r_num = int(m_r.group(1))
@@ -2460,15 +2441,13 @@ class NovaGalaxyPipelineRunner:
                             oncat_missing = list(expanded)
                             ok = False
                             msg = f"ONCat: No accessible runs found for {inst} IPTS-{ipts_raw}"
-                    except Exception:
-                        pass
 
                 if not ok and not msg:
                     store = self.get_datastore("IMAGINE-X SubHKL")
                     gi = store.nova_connection.galaxy_instance
                     first_p = oncat_existing[0] if oncat_existing else expanded[0]
                     m_run = _re.search(
-                        r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.I
+                        r"_([0-9]+)\.nxs", os.path.basename(first_p), _re.IGNORECASE
                     )
                     nld_in = self._build_neutrons_load_data_inputs(
                         ingest_mode=str(body.get("ingest_mode") or "oncat"),
@@ -2508,14 +2487,12 @@ class NovaGalaxyPipelineRunner:
                                 msg += f" — {sample_title[:60]}"
                             if len(expanded) > 1 or not ok:
                                 for oid in out_ids:
-                                    try:
+                                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                         self._api_request(
                                             "PUT",
                                             f"/api/histories/{store.history_id}/contents/{oid}",
                                             payload={"deleted": True},
                                         )
-                                    except Exception:
-                                        pass
                             break
                         if st in ("error", "deleted"):
                             err_out = (
@@ -2528,19 +2505,17 @@ class NovaGalaxyPipelineRunner:
                             )
                             msg = f"NDIP Load Neutron Data: {first_line} ({inst} IPTS-{ipts_raw or '?'})"
                             for oid in out_ids:
-                                try:
+                                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                     self._api_request(
                                         "PUT",
                                         f"/api/histories/{store.history_id}/contents/{oid}",
                                         payload={"deleted": True},
                                     )
-                                except Exception:
-                                    pass
                             break
                         time.sleep(1.0)
                     if not ok and not msg:
                         msg = f"NDIP Load Neutron Data check timed out for {first_p}"
-            except Exception as exc:
+            except _NOVA_RECOVERABLE_ERRORS as exc:
                 msg = f"NDIP Load Neutron Data error: {self._clean_err_msg(exc)}"
         else:
             msg = "NDIP Galaxy connection required to verify /SNS or /HFIR paths via neutrons_load_data"
@@ -2569,7 +2544,7 @@ class NovaGalaxyPipelineRunner:
     ONCAT_DEFAULT_URL = "https://oncat.ornl.gov"
     # Public human-user device-authorization client ID published by ONCat docs.
     ONCAT_DEFAULT_CLIENT_ID = "eaeb036a-2602-4bb9-8530-0bb5812da7a1"
-    ONCAT_DEFAULT_SCOPES = ["api:read", "openid"]
+    ONCAT_DEFAULT_SCOPES: ClassVar[list[str]] = ["api:read", "openid"]
 
     def _get_oncat_token_path(self) -> str:
         return os.path.expanduser(
@@ -2606,11 +2581,11 @@ class NovaGalaxyPipelineRunner:
                         f"{token_ep}{sep}provider={provider}", timeout=5
                     ) as resp:
                         raw_token = resp.read().decode("utf-8").strip().strip('"')
-                except Exception:
+                except _NOVA_RECOVERABLE_ERRORS:
                     raw_token = ""
 
         if raw_token:
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 if raw_token.startswith("{"):
                     tok_obj = json.loads(raw_token)
                 else:
@@ -2619,8 +2594,6 @@ class NovaGalaxyPipelineRunner:
                         "token_type": "Bearer",
                     }
                 store.write_token(tok_obj)
-            except Exception:
-                pass
 
     def _build_oauth_oncat_client(self, verification_handler: Any = None) -> Any:
         """Build a pyoncat.ONCat client configured with FileSystemTokenStore and OAuth flow."""
@@ -2680,17 +2653,15 @@ class NovaGalaxyPipelineRunner:
         """
         url = os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
         oauth_client = None
-        try:
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             oauth_client = self._build_oauth_oncat_client()
             if oauth_client.has_stored_token():
                 return oauth_client, True
-        except Exception:
-            pass
         try:
             import pyoncat  # type: ignore[import-untyped]
 
             return pyoncat.ONCat(url), False
-        except Exception:
+        except _NOVA_RECOVERABLE_ERRORS:
             return oauth_client, False
 
     def _invalidate_oncat_caches(self) -> None:
@@ -2703,7 +2674,7 @@ class NovaGalaxyPipelineRunner:
         try:
             oauth_client = self._build_oauth_oncat_client()
             has_tok = bool(oauth_client.has_stored_token())
-        except Exception:
+        except _NOVA_RECOVERABLE_ERRORS:
             oauth_client = None
             has_tok = False
 
@@ -2718,16 +2689,14 @@ class NovaGalaxyPipelineRunner:
                             user_name = u.get("id")
                     state["user"] = user_name or "ORNL User"
                     self._oncat_auth_state = state
-                except Exception as exc:
+                except _NOVA_RECOVERABLE_ERRORS as exc:
                     import pyoncat  # type: ignore[import-untyped]
 
                     if isinstance(exc, pyoncat.InteractionRequiredError):
-                        try:
+                        with contextlib.suppress(OSError):
                             tp = self._get_oncat_token_path()
                             if os.path.isfile(tp):
                                 os.remove(tp)
-                        except Exception:
-                            pass
                         has_tok = False
                     else:
                         user_name = "ORNL User"
@@ -2782,11 +2751,9 @@ class NovaGalaxyPipelineRunner:
             if cancel_ev is not None:
                 cancel_ev.set()
             tp = self._get_oncat_token_path()
-            try:
+            with contextlib.suppress(OSError):
                 if os.path.isfile(tp):
                     os.remove(tp)
-            except Exception:
-                pass
             self._oncat_auth_state = {
                 "status": "signed_out",
                 "user": None,
@@ -2877,7 +2844,7 @@ class NovaGalaxyPipelineRunner:
                         device_authorization_timeout=300.0,
                     )
                     user_name = "ORNL User"
-                    try:
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         u = client.User.retrieve("me")
                         if isinstance(u, dict):
                             user_name = (
@@ -2885,8 +2852,6 @@ class NovaGalaxyPipelineRunner:
                                 if u.get("name") and u.get("name") != "Unknown"
                                 else (u.get("id") or "ORNL User")
                             )
-                    except Exception:
-                        pass
                     state.update(
                         {
                             "status": "signed_in",
@@ -2899,7 +2864,7 @@ class NovaGalaxyPipelineRunner:
                         }
                     )
                     self._invalidate_oncat_caches()
-                except Exception as exc:
+                except _NOVA_RECOVERABLE_ERRORS as exc:
                     if not cancel_ev.is_set():
                         state.update(
                             {
@@ -2933,7 +2898,7 @@ class NovaGalaxyPipelineRunner:
         elif inst in ("CG4D", "IMAGINE") and fac == "SNS":
             fac = "HFIR"
         ipts_raw = _re.sub(
-            r"^IPTS-", "", str(params.get("ipts") or "").strip(), flags=_re.I
+            r"^IPTS-", "", str(params.get("ipts") or "").strip(), flags=_re.IGNORECASE
         )
 
         # Multi-run support:
@@ -2968,13 +2933,13 @@ class NovaGalaxyPipelineRunner:
         if cached_exp and (now - cached_exp[0]) < 300.0:
             experiments = cached_exp[1]
         elif not skip_exps:
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 try:
                     raw_exps = oncat.Experiment.list(
                         facility=fac,
                         instrument=inst,
                     )
-                except Exception:
+                except _NOVA_RECOVERABLE_ERRORS:
                     import pyoncat as _pyoncat  # type: ignore[import-untyped]
 
                     oncat = _pyoncat.ONCat(
@@ -2985,12 +2950,12 @@ class NovaGalaxyPipelineRunner:
 
                 for e in raw_exps:
                     eid = str(e.get("id") or "")
-                    m_ip = _re.search(r"IPTS-(\d+)", eid, _re.I)
+                    m_ip = _re.search(r"IPTS-(\d+)", eid, _re.IGNORECASE)
                     ip_num = m_ip.group(1) if m_ip else eid
                     n_runs = int(e.get("size") or 0)
                     r_info = (e.get("indexed") or {}).get("run_number") or {}
                     ranges_str = str(r_info.get("ranges") or "")
-                    latest_dt = str(((e.get("latest") or {}).get("created") or ""))[:10]
+                    latest_dt = str((e.get("latest") or {}).get("created") or "")[:10]
                     title_str = str(e.get("title") or "").strip()
                     experiments.append(
                         {
@@ -3013,8 +2978,6 @@ class NovaGalaxyPipelineRunner:
                 )
                 exp_cache[(fac, inst, is_auth)] = (now, experiments)
                 self._oncat_exp_cache = exp_cache
-            except Exception:
-                pass
 
         if not ipts_raw and experiments:
             ipts_raw = str(experiments[0]["ipts"])
@@ -3029,7 +2992,7 @@ class NovaGalaxyPipelineRunner:
                 runs = cached_runs[1]
             else:
                 by_run: dict[int, dict[str, Any]] = {}
-                try:
+                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                     proj = [
                         "indexed.run_number",
                         "location",
@@ -3052,7 +3015,7 @@ class NovaGalaxyPipelineRunner:
                             projection=proj,
                             exts=[".nxs.h5"],
                         )
-                    except Exception:
+                    except _NOVA_RECOVERABLE_ERRORS:
                         import pyoncat as _pyoncat  # type: ignore[import-untyped]
 
                         oncat = _pyoncat.ONCat(
@@ -3074,7 +3037,7 @@ class NovaGalaxyPipelineRunner:
                             m_r = _re.search(
                                 r"_([0-9]+)\.nxs",
                                 str(d.get("location") or ""),
-                                _re.I,
+                                _re.IGNORECASE,
                             )
                             if m_r:
                                 r_val = int(m_r.group(1))
@@ -3108,7 +3071,7 @@ class NovaGalaxyPipelineRunner:
                             ax_m = _re.findall(
                                 r"(axis\s*\d+|omega|phi|chi|kappa)\s*=?\s*([-+]?\d+(?:\.\d+)?)",
                                 title,
-                                flags=_re.I,
+                                flags=_re.IGNORECASE,
                             )
                             if ax_m:
                                 angles = ";".join(
@@ -3118,7 +3081,7 @@ class NovaGalaxyPipelineRunner:
                         created_str = str(d.get("created") or "")[:16].replace("T", " ")
                         dur_s = float(meta_entry.get("duration") or 0.0)
                         if dur_s > 0:
-                            tot_sec = int(round(dur_s))
+                            tot_sec = round(dur_s)
                             hh, rem = divmod(tot_sec, 3600)
                             mm, ss = divmod(rem, 60)
                             dur_hms = f"{hh:02d}:{mm:02d}:{ss:02d}"
@@ -3138,8 +3101,6 @@ class NovaGalaxyPipelineRunner:
                                 float(meta_entry.get("total_counts") or 0)
                             ),
                         }
-                except Exception:
-                    pass
 
                 runs = [by_run[k] for k in sorted(by_run.keys())]
                 runs_cache[(fac, inst, ipts_raw, is_auth)] = (now, runs)
@@ -3186,14 +3147,12 @@ class NovaGalaxyPipelineRunner:
 
         ds_id = params.get("galaxy_dataset_id")
         if ds_id:
-            try:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 local_p, _ = self.resolve_dataset_to_local_h5(
                     str(ds_id), fallback_dir=work_dir
                 )
                 if local_p and os.path.isfile(local_p):
                     return [local_p]
-            except Exception:
-                pass
 
         if work_dir and os.path.isdir(work_dir):
             return sorted(_glob.glob(os.path.join(work_dir, "*.nxs.h5")))
@@ -3521,7 +3480,7 @@ class NovaGalaxyPipelineRunner:
                         else self.replay_h5
                     )
                     if os.path.isfile(src_int):
-                        try:
+                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                             from subhkl.io.export import MTZExporter
 
                             exp = MTZExporter(
@@ -3535,8 +3494,6 @@ class NovaGalaxyPipelineRunner:
                                 ),
                             )
                             exp.write_mtz(mtz_dest)
-                        except Exception:
-                            pass
             careless_iters = int(params.get("iterations") or 10000)
             studentt_dof = float(params.get("studentt_dof") or 4.0)
             merge_work = os.path.join(work_dir, "careless_work")
@@ -3641,11 +3598,9 @@ class NovaGalaxyPipelineRunner:
                 fh.write(prep_py)
             with open(post_script, "w", encoding="utf-8") as fh:
                 fh.write(post_py)
-            try:
+            with contextlib.suppress(OSError):
                 os.chmod(prep_script, 0o666)
                 os.chmod(post_script, 0o666)
-            except Exception:
-                pass
             chained_merge = (
                 f"set -e; "
                 f"MKEYS=$(python {shlex.quote(prep_script)}) && "
@@ -3748,7 +3703,7 @@ class NovaGalaxyPipelineRunner:
                 .strip()
                 .splitlines()[0]
             )
-        except Exception:
+        except (OSError, subprocess.SubprocessError, IndexError):
             gpu_info = "CPU fallback"
             gpu_env["JAX_PLATFORMS"] = "cpu"
 
@@ -3900,7 +3855,7 @@ class NovaGalaxyPipelineRunner:
                         ):
                             active_live_src = blind_src
                         if active_live_src is not None:
-                            try:
+                            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                 cur_mtime_ns = int(os.stat(active_live_src).st_mtime_ns)
                                 cur_key = (active_live_src, cur_mtime_ns)
                                 if cur_key != last_live_key:
@@ -3950,8 +3905,6 @@ class NovaGalaxyPipelineRunner:
                                                 "ladder_steps", []
                                             ),
                                         }
-                            except Exception:
-                                pass
                 rc = proc.wait()
                 if rc == 0:
                     job_record["ladder_rung_idx"] = 0 if stage_id == "reduce" else 4
@@ -3969,13 +3922,13 @@ class NovaGalaxyPipelineRunner:
                                     if os.path.lexists(merged_link):
                                         os.remove(merged_link)
                                     os.link(merged_dest, merged_link)
-                                except Exception:
+                                except OSError:
                                     shutil.copy2(merged_dest, merged_link)
                             final_h5 = merged_dest
                             job_record["stdout"] += (
                                 f"\n[subhkl] Saved {merged_label} -> {merged_dest}\n"
                             )
-                        except Exception as copy_exc:
+                        except _NOVA_RECOVERABLE_ERRORS as copy_exc:
                             job_record["stdout"] += (
                                 f"\n[subhkl] Warning saving {merged_dest}: {copy_exc}\n"
                             )
@@ -3986,7 +3939,7 @@ class NovaGalaxyPipelineRunner:
                                 _f_h5: str = final_h5,
                                 _lbl: str = merged_label,
                             ) -> None:
-                                try:
+                                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                     store = self.get_datastore("IMAGINE-X SubHKL")
                                     bg_rec: dict[str, Any] = {"stdout": ""}
                                     up_id = self._ensure_galaxy_h5_dataset(
@@ -4003,8 +3956,6 @@ class NovaGalaxyPipelineRunner:
                                             "extension": "h5",
                                         }
                                     ]
-                                except Exception:
-                                    pass
 
                             threading.Thread(
                                 target=_bg_upload_reduced, daemon=True
@@ -4021,7 +3972,7 @@ class NovaGalaxyPipelineRunner:
                             job_record["stdout"] += (
                                 f"\n[subhkl] Saved solve.h5 -> {solve_dest}\n"
                             )
-                        except Exception as copy_exc:
+                        except _NOVA_RECOVERABLE_ERRORS as copy_exc:
                             job_record["stdout"] += (
                                 f"\n[subhkl] Warning saving {solve_dest}: {copy_exc}\n"
                             )
@@ -4029,7 +3980,7 @@ class NovaGalaxyPipelineRunner:
                         if self.is_connected and os.path.isfile(final_h5):
 
                             def _bg_upload_solve(_f_h5: str = final_h5) -> None:
-                                try:
+                                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                     store = self.get_datastore("IMAGINE-X SubHKL")
                                     bg_rec: dict[str, Any] = {"stdout": ""}
                                     up_id = self._ensure_galaxy_h5_dataset(
@@ -4046,8 +3997,6 @@ class NovaGalaxyPipelineRunner:
                                             "extension": "h5",
                                         }
                                     ]
-                                except Exception:
-                                    pass
 
                             threading.Thread(
                                 target=_bg_upload_solve, daemon=True
@@ -4069,7 +4018,7 @@ class NovaGalaxyPipelineRunner:
                                 job_record["stdout"] += (
                                     f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
                                 )
-                        except Exception as copy_exc:
+                        except _NOVA_RECOVERABLE_ERRORS as copy_exc:
                             job_record["stdout"] += (
                                 f"\n[subhkl] Warning saving integrated outputs: {copy_exc}\n"
                             )
@@ -4081,7 +4030,7 @@ class NovaGalaxyPipelineRunner:
                                 _p_h5: str = pred_dest,
                                 _m_mtz: str = mtz_dest,
                             ) -> None:
-                                try:
+                                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                     store = self.get_datastore("IMAGINE-X SubHKL")
                                     bg_rec: dict[str, Any] = {"stdout": ""}
                                     outs_up = []
@@ -4132,8 +4081,6 @@ class NovaGalaxyPipelineRunner:
                                         )
                                     if outs_up:
                                         job_record["outputs"] = outs_up
-                                except Exception:
-                                    pass
 
                             threading.Thread(
                                 target=_bg_upload_integrate, daemon=True
@@ -4150,14 +4097,14 @@ class NovaGalaxyPipelineRunner:
                                     target_int, work_dir, job_record
                                 )
                                 final_h5 = target_int
-                        except Exception as merge_exc:
+                        except _NOVA_RECOVERABLE_ERRORS as merge_exc:
                             job_record["stdout"] += (
                                 f"\n[careless] Warning stamping merge results into HDF5: {merge_exc}\n"
                             )
                         if self.is_connected:
 
                             def _bg_upload_merge(_wdir: str = work_dir) -> None:
-                                try:
+                                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                     store = self.get_datastore("IMAGINE-X SubHKL")
                                     bg_rec: dict[str, Any] = {"stdout": ""}
                                     outs_up = []
@@ -4185,8 +4132,6 @@ class NovaGalaxyPipelineRunner:
                                             )
                                     if outs_up:
                                         job_record["outputs"] = outs_up
-                                except Exception:
-                                    pass
 
                             threading.Thread(
                                 target=_bg_upload_merge, daemon=True
@@ -4208,7 +4153,7 @@ class NovaGalaxyPipelineRunner:
                     job_record["stderr"] += (
                         f"\n[subhkl] Process exited with code {rc}\n"
                     )
-            except Exception as exc:
+            except _NOVA_RECOVERABLE_ERRORS as exc:
                 if job_record.get("cancel_requested"):
                     job_record["state"] = "deleted"
                 else:
@@ -4268,10 +4213,8 @@ class NovaGalaxyPipelineRunner:
                     new_state_ticks += 1
                     if is_localhost_galaxy and new_state_ticks >= 10:
                         self._pulsar_queue_stalled_until = time.time() + 300.0
-                        try:
+                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                             self._api_request("DELETE", f"/api/jobs/{job_id}")
-                        except Exception:
-                            pass
                         raise TimeoutError(
                             f"Galaxy Pulsar queue did not pick up job {job_id} after 15s (stuck in state=new)"
                         )
@@ -4286,7 +4229,7 @@ class NovaGalaxyPipelineRunner:
 
                 console_out = ""
                 console_err = ""
-                try:
+                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                     cinfo = self._api_request(
                         "GET",
                         f"/api/jobs/{job_id}/console_output?stdout_position=0&stdout_length=65536&stderr_position=0&stderr_length=65536",
@@ -4294,8 +4237,6 @@ class NovaGalaxyPipelineRunner:
                     if isinstance(cinfo, dict):
                         console_out = cinfo.get("stdout") or ""
                         console_err = cinfo.get("stderr") or ""
-                except Exception:
-                    pass
 
                 raw_stdout_src = (
                     console_out or jinfo.get("tool_stdout") or jinfo.get("stdout") or ""
@@ -4355,7 +4296,7 @@ class NovaGalaxyPipelineRunner:
                         ]
                         if live_tokens and live_tokens[-1] != last_live_token:
                             last_live_token = live_tokens[-1]
-                            try:
+                            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                 blind_dst = os.path.join(
                                     work_dir or tempfile.gettempdir(),
                                     "solve.blind.h5",
@@ -4375,8 +4316,6 @@ class NovaGalaxyPipelineRunner:
                                         job_record["partial_overlay"]["seq"] = (
                                             partial_seq
                                         )
-                            except Exception:
-                                pass
                 if state in ("ok", "error", "deleted", "paused"):
                     if state == "ok":
                         try:
@@ -4427,7 +4366,7 @@ class NovaGalaxyPipelineRunner:
                                     and final_step
                                     and self.history_id
                                 ):
-                                    try:
+                                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                         self._api_request(
                                             "PUT",
                                             f"/api/histories/{self.history_id}/contents/{ds_id}",
@@ -4437,8 +4376,6 @@ class NovaGalaxyPipelineRunner:
                                         job_record["stdout"] += (
                                             f"[galaxy -> history] Created dataset '{merged_label}' (id={ds_id}) in Galaxy history\n"
                                         )
-                                    except Exception:
-                                        pass
                                 target_path = None
                                 if (
                                     not final_step
@@ -4481,9 +4418,9 @@ class NovaGalaxyPipelineRunner:
                                         )
                                         if raw_bytes:
                                             break
-                                    except Exception as dl_exc:
+                                    except _NOVA_RECOVERABLE_ERRORS:
                                         if attempt == 5:
-                                            raise dl_exc
+                                            raise
                                     time.sleep(2.0)
                                 if raw_bytes:
                                     if target_path:
@@ -4491,11 +4428,13 @@ class NovaGalaxyPipelineRunner:
                                             f.write(raw_bytes)
                                         tmp_path = target_path
                                         if not job_record.get("reduce_part_path"):
-                                            try:
-                                                with open(cache_gx_path, "wb") as cf:
-                                                    cf.write(raw_bytes)
-                                            except Exception:
-                                                pass
+                                            with (
+                                                contextlib.suppress(
+                                                    *_NOVA_RECOVERABLE_ERRORS
+                                                ),
+                                                open(cache_gx_path, "wb") as cf,
+                                            ):
+                                                cf.write(raw_bytes)
                                         job_record["stdout"] += (
                                             f"[nova <- galaxy] Synced '{merged_label}' (id={ds_id}) -> {target_path}\n"
                                         )
@@ -4513,9 +4452,10 @@ class NovaGalaxyPipelineRunner:
                                     and job_record.get("stage_id") == "reduce"
                                     and job_record.get("raw_nxs")
                                 ):
-                                    try:
+                                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                         import h5py
                                         import numpy as np
+
                                         from subhkl.instrument.goniometer import (
                                             calc_goniometer_rotation_matrix,
                                             get_rotation_data_from_nexus,
@@ -4603,8 +4543,6 @@ class NovaGalaxyPipelineRunner:
                                                         )
                                         if os.path.isfile(cache_gx_path):
                                             shutil.copy2(tmp_path, cache_gx_path)
-                                    except Exception:
-                                        pass
 
                                 if (
                                     tmp_path
@@ -4633,11 +4571,11 @@ class NovaGalaxyPipelineRunner:
                                                 if os.path.lexists(lbl_path):
                                                     os.remove(lbl_path)
                                                 os.link(tmp_path, lbl_path)
-                                            except Exception:
-                                                try:
+                                            except _NOVA_RECOVERABLE_ERRORS:
+                                                with contextlib.suppress(
+                                                    *_NOVA_RECOVERABLE_ERRORS
+                                                ):
                                                     shutil.copy2(tmp_path, lbl_path)
-                                                except Exception:
-                                                    pass
                                     self._dataset_id_by_path = known_map
                                     job_record["output_h5_path"] = tmp_path
                                     if callable(on_complete_h5):
@@ -4667,7 +4605,9 @@ class NovaGalaxyPipelineRunner:
                                             dest_name = cand
                                             break
                                     if dest_name:
-                                        try:
+                                        with contextlib.suppress(
+                                            *_NOVA_RECOVERABLE_ERRORS
+                                        ):
                                             bdata = self._api_request(
                                                 "GET",
                                                 f"/api/datasets/{oid}/display",
@@ -4680,8 +4620,6 @@ class NovaGalaxyPipelineRunner:
                                             job_record["stdout"] += (
                                                 f"[careless] Saved {dest_name} -> {dest_p}\n"
                                             )
-                                        except Exception:
-                                            pass
                                 int_target = os.path.join(work_dir, "integrated.h5")
                                 if os.path.isfile(int_target):
                                     self._stamp_careless_merge_into_h5(
@@ -4697,7 +4635,7 @@ class NovaGalaxyPipelineRunner:
                                 and work_dir
                                 and os.path.isdir(work_dir)
                             ):
-                                try:
+                                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                     mtz_id = mtz_outs[0]["id"]
                                     mtz_bytes = self._api_request(
                                         "GET",
@@ -4711,9 +4649,7 @@ class NovaGalaxyPipelineRunner:
                                     job_record["stdout"] += (
                                         f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
                                     )
-                                except Exception:
-                                    pass
-                        except Exception as post_exc:
+                        except _NOVA_RECOVERABLE_ERRORS as post_exc:
                             job_record["stdout"] += (
                                 f"[nova -> galaxy] Warning fetching job output: {self._clean_err_msg(post_exc)}\n"
                             )
@@ -4728,7 +4664,7 @@ class NovaGalaxyPipelineRunner:
                     break
             except TimeoutError:
                 raise
-            except Exception as exc:
+            except _NOVA_RECOVERABLE_ERRORS as exc:
                 poll_errors += 1
                 if poll_errors < 5:
                     continue
@@ -4917,7 +4853,7 @@ def serve_rainbow_zones(
                 timeout=0,
             )
             return
-        except Exception:
+        except (ImportError, *_NOVA_RECOVERABLE_ERRORS):
             try:
                 app = RainbowZonesTrameApp(vm)
                 app.start(host=host, port=port)
@@ -4928,7 +4864,7 @@ def serve_rainbow_zones(
     ep_path = os.environ.get("EP_PATH", "").rstrip("/")
 
     class _Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802
+        def do_GET(self) -> None:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
             req_path = parsed.path
@@ -4937,16 +4873,16 @@ def serve_rainbow_zones(
 
             if req_path in ("/api/payload", "/payload.json"):
                 f_idx: int | None = None
-                if "frame" in qs and qs["frame"]:
+                if qs.get("frame"):
                     try:
                         f_idx = int(qs["frame"][0])
                         vm.payload_kwargs["frame_index"] = f_idx
                         vm.pipeline_runner.current_frame_index = f_idx
-                    except Exception:
+                    except (ValueError, TypeError, IndexError):
                         f_idx = None
                 reloaded = False
-                if "file_path" in qs and qs["file_path"]:
-                    try:
+                if qs.get("file_path"):
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         fp = os.path.abspath(str(qs["file_path"][0]).strip())
                         if os.path.isfile(fp):
                             fp_low = os.path.basename(fp).lower()
@@ -4958,10 +4894,8 @@ def serve_rainbow_zones(
                                 vm.replay_h5 = fp
                                 vm.reload(frame_index=f_idx)
                             reloaded = True
-                    except Exception:
-                        pass
-                if "dataset_id" in qs and qs["dataset_id"]:
-                    try:
+                if qs.get("dataset_id"):
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         ds_id = str(qs["dataset_id"][0]).strip()
                         fb_dir = (
                             os.path.dirname(os.path.abspath(vm.replay_h5))
@@ -4984,19 +4918,13 @@ def serve_rainbow_zones(
                             vm.replay_h5 = local_h5
                             vm.reload(frame_index=f_idx)
                         reloaded = True
-                    except Exception:
-                        pass
                 if f_idx is not None and not reloaded:
-                    try:
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         vm.reload(frame_index=f_idx)
-                    except Exception:
-                        pass
-                try:
+                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                     vm.pipeline_runner.apply_active_solve_overlay(
                         vm.payload, frame_index=f_idx
                     )
-                except Exception:
-                    pass
                 body = json.dumps(vm.payload).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -5023,7 +4951,7 @@ def serve_rainbow_zones(
                     self.send_header("Content-Length", str(len(h5_bytes)))
                     self.end_headers()
                     self.wfile.write(h5_bytes)
-                except Exception as exc:
+                except _NOVA_RECOVERABLE_ERRORS as exc:
                     err_body = str(exc).encode("utf-8")
                     self.send_response(404)
                     self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -5055,7 +4983,7 @@ def serve_rainbow_zones(
                     self.send_header("Content-Length", str(len(raw_bytes)))
                     self.end_headers()
                     self.wfile.write(raw_bytes)
-                except Exception as exc:
+                except _NOVA_RECOVERABLE_ERRORS as exc:
                     err_body = str(exc).encode("utf-8")
                     self.send_response(404)
                     self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -5091,13 +5019,11 @@ def serve_rainbow_zones(
                 return
 
             if req_path == "/api/pipeline/status":
-                if "frame" in qs and qs["frame"]:
-                    try:
+                if qs.get("frame"):
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         f_idx_st = int(qs["frame"][0])
                         vm.payload_kwargs["frame_index"] = f_idx_st
                         vm.pipeline_runner.sync_frame_index(f_idx_st)
-                    except Exception:
-                        pass
                 hist_ds = vm.pipeline_runner.list_history_datasets()
                 status_doc = {
                     "galaxy_connected": vm.pipeline_runner.is_connected,
@@ -5128,7 +5054,7 @@ def serve_rainbow_zones(
             self.end_headers()
             self.wfile.write(body)
 
-        def do_POST(self) -> None:  # noqa: N802
+        def do_POST(self) -> None:
             parsed = urlparse(self.path)
             req_path = parsed.path
             if ep_path and req_path.startswith(ep_path):
@@ -5141,7 +5067,7 @@ def serve_rainbow_zones(
                     req_json = json.loads(raw_body.decode("utf-8") or "{}")
                     result = vm.pipeline_runner.handle_oncat_auth(req_json)
                     code = 200
-                except Exception as exc:
+                except _NOVA_RECOVERABLE_ERRORS as exc:
                     result = {"ok": False, "error": str(exc), "message": str(exc)}
                     code = 400
                 body = json.dumps(result).encode("utf-8")
@@ -5159,7 +5085,7 @@ def serve_rainbow_zones(
                     req_json = json.loads(raw_body.decode("utf-8") or "{}")
                     result = vm.pipeline_runner.check_neutron_paths(req_json)
                     code = 200
-                except Exception as exc:
+                except _NOVA_RECOVERABLE_ERRORS as exc:
                     result = {"ok": False, "error": str(exc), "message": str(exc)}
                     code = 400
                 body = json.dumps(result).encode("utf-8")
@@ -5179,7 +5105,7 @@ def serve_rainbow_zones(
                         req_json.get("stage_id")
                     )
                     code = 200
-                except Exception as exc:
+                except _NOVA_RECOVERABLE_ERRORS as exc:
                     result = {"ok": False, "error": str(exc)}
                     code = 400
                 body = json.dumps(result).encode("utf-8")
@@ -5248,7 +5174,7 @@ def serve_rainbow_zones(
                         stage_id, params=params, on_complete_h5=_on_complete
                     )
                     code = 200
-                except Exception as exc:
+                except _NOVA_RECOVERABLE_ERRORS as exc:
                     result = {"status": "error", "error": str(exc)}
                     code = 400
                 body = json.dumps(result).encode("utf-8")
@@ -5272,7 +5198,7 @@ def serve_rainbow_zones(
                         else tempfile.gettempdir()
                     )
                     saved_paths: list[str] = []
-                    header_bytes = f"Content-Type: {ctype}\r\n\r\n".encode("utf-8")
+                    header_bytes = f"Content-Type: {ctype}\r\n\r\n".encode()
                     msg = email.parser.BytesParser().parsebytes(header_bytes + raw_body)
                     for part in msg.walk():
                         fname = part.get_filename()
@@ -5296,7 +5222,7 @@ def serve_rainbow_zones(
                         vm.reload()
                     result = {"status": "ok", "saved_paths": saved_paths}
                     code = 200
-                except Exception as exc:
+                except _NOVA_RECOVERABLE_ERRORS as exc:
                     result = {"status": "error", "error": str(exc)}
                     code = 400
                 body = json.dumps(result).encode("utf-8")
