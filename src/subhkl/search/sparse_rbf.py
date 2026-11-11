@@ -338,7 +338,7 @@ def _compute_rate_batch_impl(imgs, filter_size, valid=None, inpaint_footprints=F
     return lax.map(process_one, (imgs, valid.astype(imgs.dtype)))  # [photons/Pixel]
 
 
-def compute_rate_batch(imgs, filter_size, valid=None, inpaint_footprints=False):
+def compute_rate_batch(imgs, filter_size, valid=None, inpaint_footprints=None):
     global _COMPUTE_RATE_BATCH_JIT
     if _COMPUTE_RATE_BATCH_JIT is None:
         from jax import jit
@@ -346,6 +346,8 @@ def compute_rate_batch(imgs, filter_size, valid=None, inpaint_footprints=False):
         _COMPUTE_RATE_BATCH_JIT = partial(
             jit, static_argnames=["filter_size", "inpaint_footprints"]
         )(_compute_rate_batch_impl)
+    if inpaint_footprints is None:
+        inpaint_footprints = valid is not None
     return _COMPUTE_RATE_BATCH_JIT(
         imgs,
         filter_size,
