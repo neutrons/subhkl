@@ -29,6 +29,7 @@ import urllib.request
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
+from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
 from subhkl.viz.rainbow_zones import (
     build_rainbow_zone_payload,
     render_rainbow_html,
@@ -4794,6 +4795,8 @@ class RainbowZonesTrameApp:
             self.server = get_server(client_type="vue3")
 
         state = self.server.state
+        state.trame__title = "SUBHKL // Diffraction Parallax"
+        state.trame__favicon = SUBHKL_FAVICON_DATA_URI
         state.rainbow_mode = self.vm.default_mode
         state.rainbow_payload = self.vm.payload
         state.rainbow_iframe_srcdoc = self.vm.to_html()
@@ -4870,6 +4873,15 @@ def serve_rainbow_zones(
             req_path = parsed.path
             if ep_path and req_path.startswith(ep_path):
                 req_path = req_path[len(ep_path) :] or "/"
+
+            if req_path in ("/favicon.ico", "/favicon.svg", "/logo.png"):
+                fav_bytes = SUBHKL_FAVICON_SVG.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "image/svg+xml; charset=utf-8")
+                self.send_header("Content-Length", str(len(fav_bytes)))
+                self.end_headers()
+                self.wfile.write(fav_bytes)
+                return
 
             if req_path in ("/api/payload", "/payload.json"):
                 f_idx: int | None = None

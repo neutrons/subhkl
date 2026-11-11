@@ -14,6 +14,7 @@ from trame.ui.html import DivLayout
 from trame.widgets import html
 from trame_server import Server
 
+from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
 from subhkl.viz.nova_app.mvvm_factory import create_viewmodels
 from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
 
@@ -450,41 +451,56 @@ class MainApp:
         async def _ep_handle(request: web.Request) -> web.StreamResponse:
             ep_path = os.environ.get("EP_PATH", "").strip().rstrip("/")
             req_path = request.rel_url.path
-            served_index_under_ep = False
+            if req_path.endswith(("/logo.png", "/favicon.ico", "/favicon.svg")):
+                return web.Response(
+                    text=SUBHKL_FAVICON_SVG, content_type="image/svg+xml"
+                )
+            served_index = False
             if ep_path and ep_path.startswith("/"):
                 ep_parent = os.path.dirname(ep_path)
                 if req_path == ep_path or req_path == ep_path + "/":
                     request = request.clone(
                         rel_url=request.rel_url.with_path("/index.html")
                     )
-                    served_index_under_ep = True
+                    served_index = True
                 elif req_path.startswith(ep_path + "/"):
                     sub_path = req_path[len(ep_path) :] or "/"
                     if sub_path == "/":
                         sub_path = "/index.html"
-                        served_index_under_ep = True
+                        served_index = True
                     elif sub_path == "/index.html":
-                        served_index_under_ep = True
+                        served_index = True
                     request = request.clone(rel_url=request.rel_url.with_path(sub_path))
                 elif ep_parent not in ("", "/") and req_path.startswith(
                     ep_parent + "/"
                 ):
                     sub_path = req_path[len(ep_parent) :] or "/"
                     request = request.clone(rel_url=request.rel_url.with_path(sub_path))
-            elif req_path == "/":
+            elif req_path in ("/", "/index.html"):
                 request = request.clone(
                     rel_url=request.rel_url.with_path("/index.html")
                 )
+                served_index = True
 
             resp = await orig_handle(request)
-            if served_index_under_ep and ep_path and isinstance(resp, web.FileResponse):
+            if served_index and isinstance(resp, web.FileResponse):
                 with contextlib.suppress(OSError, RuntimeError, ValueError, TypeError):
                     idx_fp = getattr(resp, "_path", None)
                     if idx_fp and os.path.isfile(idx_fp):
                         html_txt = Path(idx_fp).read_text(encoding="utf-8")
+                        if ep_path:
+                            html_txt = html_txt.replace(
+                                '<base href="." />',
+                                f'<base href="{ep_path}/" />',
+                                1,
+                            )
                         html_txt = html_txt.replace(
-                            '<base href="." />',
-                            f'<base href="{ep_path}/" />',
+                            '<link rel="icon" href="logo.png" />',
+                            f'<link rel="icon" type="image/svg+xml" href="{SUBHKL_FAVICON_DATA_URI}" />',
+                            1,
+                        ).replace(
+                            "<title>trame is built by Kitware</title>",
+                            "<title>SUBHKL // Diffraction Parallax</title>",
                             1,
                         )
                         return web.Response(text=html_txt, content_type="text/html")
@@ -504,6 +520,7 @@ class MainApp:
 
     def create_ui(self) -> None:
         self.state.trame__title = "SUBHKL // Diffraction Parallax"
+        self.state.trame__favicon = SUBHKL_FAVICON_DATA_URI
         with DivLayout(self.server) as layout:
             layout.root.style = (
                 "position: fixed; inset: 0; margin: 0; padding: 0; "

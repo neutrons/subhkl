@@ -36,6 +36,7 @@ import numpy as np
 from PIL import Image
 
 from subhkl import get_version as get_subhkl_version
+from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_LOGO_SVG
 from subhkl.viz.zones import (
     _cell_from_B,
     _spherical_angles,
@@ -3220,7 +3221,8 @@ def render_rainbow_html(
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-{base_tag_html}<title>{title}</title>
+{base_tag_html}<link rel="icon" type="image/svg+xml" href="{SUBHKL_FAVICON_DATA_URI}" />
+<title>{title}</title>
 <script src="https://cdn.jsdelivr.net/npm/h5wasm@0.7.8/dist/iife/h5wasm.js" async></script>
 <style>
   :root {{
@@ -3286,7 +3288,27 @@ def render_rainbow_html(
     font-size: 1.05rem;
     letter-spacing: 0.3px;
     display: inline-flex;
-    align-items: baseline;
+    align-items: center;
+    gap: 4px;
+  }}
+
+  .subhkl-logo-img {{
+    height: 24px;
+    width: 90px;
+    display: block;
+    flex-shrink: 0;
+  }}
+
+  .sr-only {{
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }}
 
   .logo-sub {{
@@ -3306,8 +3328,10 @@ def render_rainbow_html(
     font-size: 0.62rem;
     font-weight: 600;
     color: var(--text-dim);
-    margin-left: 5px;
+    margin-left: 2px;
     letter-spacing: 0.2px;
+    align-self: flex-end;
+    margin-bottom: 3px;
   }}
 
   .subtitle-tag {{
@@ -3839,7 +3863,7 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span><span class="logo-version" id="app-version">v{subhkl_ver}</span></div>
+      <div class="rainbow-logo" id="app-title">{SUBHKL_LOGO_SVG}<span class="sr-only"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></span><span class="logo-version" id="app-version">v{subhkl_ver}</span></div>
       <span class="subtitle-tag">{inst} · {sg}</span>
     </div>
 

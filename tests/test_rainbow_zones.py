@@ -559,14 +559,23 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
         SubhklConfig(wavelength_min=5.0, wavelength_max=2.0)
 
     # 2. Verify MainApp(server=None) initializes ThemedApp, TrameBinding, ViewModel & UI cleanly
+    from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
     from subhkl.viz.nova_app.views.main_view import MainApp
 
     app = MainApp(instrument="CG4D")
     assert app.server is not None
+    assert app.server.state.trame__favicon == SUBHKL_FAVICON_DATA_URI
+    assert 'class="favicon-laue-zones"' in SUBHKL_FAVICON_SVG
+    assert "<rect" not in SUBHKL_FAVICON_SVG
     assert app.view_model.view_state.running is False
     assert app.view_model.model.subhkl.data.instrument == InstrumentOptions.CG4D
     html = app.server.state.parallax_html
     assert "DIFFRACTION PARALLAX" in html
+    assert '<img class="subhkl-logo-img" src="data:image/png;base64,' in html
+    assert (
+        f'<link rel="icon" type="image/svg+xml" href="{SUBHKL_FAVICON_DATA_URI}" />'
+        in html
+    )
     assert '<span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span>' in html
     assert "executeWorkflowStage" in html
     assert 'id="terminal-box"' in html
