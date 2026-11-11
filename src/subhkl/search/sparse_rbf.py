@@ -202,7 +202,7 @@ def _box_mean_2d(img, window_size):
 RATE_K_MAX = 16
 
 
-def _compute_rate_batch_impl(imgs, filter_size, valid=None):
+def _compute_rate_batch_impl(imgs, filter_size, valid=None, inpaint_footprints=False):
     """Local Poisson rate by exact quantile inversion -- the sparse-regime
     replacement for the median background.
 
@@ -301,6 +301,12 @@ def _compute_rate_batch_impl(imgs, filter_size, valid=None):
         lo, hi = lax.fori_loop(0, 30, bisect, (lo, hi))
         mu = 0.5 * (lo + hi)
 
+        if not inpaint_footprints:
+            bright = _box_mean_2d(v * img, filter_size) / v_frac
+            rate = jnp.where(any_hit, mu, bright)
+            blur = jax_gaussian_blur_2d(rate)
+            return jnp.maximum(blur, 1e-3)  # [photons/Pixel]
+
         m0 = _box_mean_2d(v * img, filter_size) / v_frac
         img_clipped = jnp.minimum(img, m0 + 2.5 * jnp.sqrt(jnp.maximum(m0, 1.0)))
         bright = _box_mean_2d(v * img_clipped, filter_size) / v_frac
@@ -332,15 +338,20 @@ def _compute_rate_batch_impl(imgs, filter_size, valid=None):
     return lax.map(process_one, (imgs, valid.astype(imgs.dtype)))  # [photons/Pixel]
 
 
-def compute_rate_batch(imgs, filter_size, valid=None):
+def compute_rate_batch(imgs, filter_size, valid=None, inpaint_footprints=False):
     global _COMPUTE_RATE_BATCH_JIT
     if _COMPUTE_RATE_BATCH_JIT is None:
         from jax import jit
 
-        _COMPUTE_RATE_BATCH_JIT = partial(jit, static_argnames=["filter_size"])(
-            _compute_rate_batch_impl
-        )
-    return _COMPUTE_RATE_BATCH_JIT(imgs, filter_size, valid=valid)
+        _COMPUTE_RATE_BATCH_JIT = partial(
+            jit, static_argnames=["filter_size", "inpaint_footprints"]
+        )(_compute_rate_batch_impl)
+    return _COMPUTE_RATE_BATCH_JIT(
+        imgs,
+        filter_size,
+        valid=valid,
+        inpaint_footprints=bool(inpaint_footprints),
+    )
 
 
 def _build_3d_cov_impl(params):
