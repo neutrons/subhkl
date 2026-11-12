@@ -951,17 +951,21 @@ class NovaGalaxyPipelineRunner:
         return work_d, f"{safe_tag}_merged.h5"
 
     def _resolve_work_dir_and_merged(self, merged_path: str) -> tuple[str, str]:
-        """Ensure a merged HDF5 file inside /tmp (such as /tmp/subhkl_gx_<id>_...) uses a dedicated /tmp/subhkl_work_<tag> directory."""
+        """Ensure a merged HDF5 file inside /tmp or Pulsar staging uses a dedicated /tmp/subhkl_work_<tag> directory."""
+        import glob as _glob
         import re as _re
         import shutil as _shutil
 
         abs_m = os.path.abspath(merged_path)
         parent_d = os.path.dirname(abs_m)
+        orig_bn = os.path.basename(abs_m)
         tmp_root = os.path.abspath(tempfile.gettempdir())
-        if parent_d != tmp_root:
+        is_staging_dat = "/staging" in abs_m or (
+            orig_bn.startswith("dataset_") and orig_bn.endswith(".dat")
+        )
+        if parent_d != tmp_root and not is_staging_dat:
             return parent_d, abs_m
 
-        orig_bn = os.path.basename(abs_m)
         m_gx = _re.match(r"^subhkl_gx_([0-9a-fA-F]+)_(.+)$", orig_bn)
         gx_ds_id = m_gx.group(1) if m_gx else None
         clean_bn = m_gx.group(2) if m_gx else orig_bn
@@ -987,7 +991,7 @@ class NovaGalaxyPipelineRunner:
                             s1 = os.path.basename(raw_f[-1]).split(".")[0]
                             tag = s0 if s0 == s1 else f"{s0}_{s1}"
         if not tag:
-            bn = _re.sub(r"(_merged)?\.h5$", "", clean_bn, flags=_re.IGNORECASE)
+            bn = _re.sub(r"(_merged)?\.(h5|dat)$", "", clean_bn, flags=_re.IGNORECASE)
             tag = bn or "dataset"
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
         work_d = os.path.join(tmp_root, f"subhkl_work_{safe_tag}")
@@ -1017,6 +1021,16 @@ class NovaGalaxyPipelineRunner:
         mapped_id = (
             known_map.get(abs_m) or known_map.get(os.path.realpath(abs_m)) or gx_ds_id
         )
+        if not mapped_id:
+            for gx_f in _glob.glob(
+                os.path.join(tmp_root, f"subhkl_gx_*_{safe_tag}_merged.h5")
+            ):
+                m_cand = _re.match(
+                    r"^subhkl_gx_([0-9a-fA-F]+)_", os.path.basename(gx_f)
+                )
+                if m_cand:
+                    mapped_id = m_cand.group(1)
+                    break
         if mapped_id:
             for p_alias in (abs_m, final_m, legacy_m):
                 known_map[os.path.abspath(p_alias)] = mapped_id
@@ -1691,7 +1705,7 @@ class NovaGalaxyPipelineRunner:
                 job_record["stdout"] += (
                     f"[nova -> galaxy] Waiting up to 15s for in-progress dataset '{fname}' (id={ds_id}, state={st})...\n"
                 )
-                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                with contextlib.suppress(Exception):
                     gi.datasets.wait_for_dataset(
                         ds_id, maxwait=15, interval=2.0, check=False
                     )
@@ -1724,8 +1738,8 @@ class NovaGalaxyPipelineRunner:
             link_to_files=is_local_gx,
         )
         ds_id = up_info["outputs"][0]["id"]
-        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-            gi.datasets.wait_for_dataset(ds_id, maxwait=30, interval=2.0, check=False)
+        with contextlib.suppress(Exception):
+            gi.datasets.wait_for_dataset(ds_id, maxwait=120, interval=2.0, check=False)
         known_map[os.path.abspath(local_path)] = ds_id
         self._dataset_id_by_path = known_map
         with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
@@ -1789,10 +1803,23 @@ class NovaGalaxyPipelineRunner:
                 wl = params.get("wavelength_range") or [2.8, 4.5]
             inst = str(params.get("instrument", "CG4D"))
             sg = str(params.get("space_group", "P 21 21 21"))
-            merged_path = (
-                params.get("images_file")
-                or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
-            )
+            merged_path = params.get("images_file") or ""
+            if (
+                not merged_path
+                or not os.path.isfile(merged_path)
+                or "/staging" in str(merged_path)
+                or (
+                    os.path.basename(str(merged_path)).startswith("dataset_")
+                    and str(merged_path).endswith(".dat")
+                )
+            ) and params.get("peaks_file"):
+                from subhkl.viz.rainbow_zones import _discover_images_h5
+
+                disc_m = _discover_images_h5(params.get("peaks_file"))
+                if disc_m:
+                    merged_path = disc_m
+            if not merged_path:
+                merged_path = "/home/xvg/subhkl-examples/betalac-7/merged.h5"
             work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
             solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
             solve_bn = os.path.basename(solve_path).lower()
@@ -3324,8 +3351,23 @@ class NovaGalaxyPipelineRunner:
             wl = params.get("wavelength_range") or [2.8, 4.5]
         inst = params.get("instrument", "CG4D")
         sg = params.get("space_group", "P 21 21 21")
+        raw_img = params.get("images_file") or ""
+        if (
+            not raw_img
+            or not os.path.isfile(raw_img)
+            or "/staging" in str(raw_img)
+            or (
+                os.path.basename(str(raw_img)).startswith("dataset_")
+                and str(raw_img).endswith(".dat")
+            )
+        ) and params.get("peaks_file"):
+            from subhkl.viz.rainbow_zones import _discover_images_h5
+
+            disc_m = _discover_images_h5(params.get("peaks_file"))
+            if disc_m:
+                raw_img = disc_m
         merged_path = os.path.abspath(
-            params.get("images_file") or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
+            raw_img or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
         )
         work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
         solve_dest = os.path.join(work_dir, "solve.h5")

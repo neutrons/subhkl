@@ -207,8 +207,14 @@ class SubhklGalaxyModel:
         if not self.data.peaks_file or not os.path.isfile(self.data.peaks_file):
             return self.payload
 
-        img_path = None
-        if self.data.images_file and os.path.isfile(self.data.images_file):
+        from subhkl.viz.rainbow_zones import _discover_images_h5
+
+        img_path = _discover_images_h5(self.data.peaks_file)
+        if (
+            not img_path
+            and self.data.images_file
+            and os.path.isfile(self.data.images_file)
+        ):
             img_dir = os.path.dirname(os.path.abspath(self.data.images_file))
             pk_dir = os.path.dirname(os.path.abspath(self.data.peaks_file))
             if img_dir == pk_dir or os.path.abspath(

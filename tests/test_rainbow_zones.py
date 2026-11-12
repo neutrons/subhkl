@@ -1563,9 +1563,16 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     linked_id = runner._ensure_galaxy_h5_dataset(fake_store, work_merged, job_rec)
     assert linked_id == mandi_gx_id
 
-    # Verify _discover_images_h5 locates <tag>_merged.h5 from a solve.h5 that has 'files' but no 'images'
+    # Verify _discover_images_h5 locates <tag>_merged.h5 from a solve.h5 that has 'files'
+    # even when attrs['source'] points to an existing Pulsar staging dataset_*.dat file
+    staging_dir = tmp_path / "staging_test" / "279969" / "inputs"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staging_dat = staging_dir / "dataset_c0662c36-e1a2-4cf3-8d04-233deadc86c9.dat"
+    with h5py.File(staging_dat, "w") as hf:
+        hf.create_dataset("images", data=np.zeros((2, 8, 8), dtype=np.float32))
     solve_h5 = tmp_path / "subhkl_gx_999999_solve.h5"
     with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["source"] = str(staging_dat)
         dt_s = h5py.string_dtype(encoding="utf-8")
         hf.create_dataset(
             "files",

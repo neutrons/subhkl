@@ -160,20 +160,6 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
     ):
         if "images" in f:
             return str(p)
-        src_attr = _decode_str(f.attrs.get("source"), "")
-        if not src_attr and "scan_refinement" in f:
-            src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
-        if not src_attr and "search" in f:
-            src_attr = _decode_str(f["search"].attrs.get("source"), "")
-        if src_attr:
-            for cand_src in (Path(src_attr), p.parent / Path(src_attr).name):
-                if cand_src.exists():
-                    with (
-                        contextlib.suppress(OSError, RuntimeError, KeyError),
-                        h5py.File(cand_src, "r") as sf,
-                    ):
-                        if "images" in sf:
-                            return str(cand_src.resolve())
         if "files" in f:
             with contextlib.suppress(
                 OSError, RuntimeError, ValueError, TypeError, KeyError
@@ -184,8 +170,8 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                     first_stem = os.path.basename(raw_files[0]).split(".")[0]
                     last_stem = os.path.basename(raw_files[-1]).split(".")[0]
                     for tag in (
-                        first_stem,
                         f"{first_stem}_{last_stem}",
+                        first_stem,
                     ):
                         safe_tag = "".join(
                             c if (c.isalnum() or c in "._-") else "_" for c in tag
@@ -198,6 +184,37 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                             )
                             if work_cand.is_file():
                                 return str(work_cand.resolve())
+                        for gx_cand in sorted(
+                            glob.glob(
+                                os.path.join(
+                                    tempfile.gettempdir(),
+                                    f"subhkl_gx_*_{safe_tag}_merged.h5",
+                                )
+                            )
+                        ):
+                            if os.path.isfile(gx_cand):
+                                return str(Path(gx_cand).resolve())
+        src_attr = _decode_str(f.attrs.get("source"), "")
+        if not src_attr and "scan_refinement" in f:
+            src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
+        if not src_attr and "search" in f:
+            src_attr = _decode_str(f["search"].attrs.get("source"), "")
+        if src_attr:
+            src_p = Path(src_attr)
+            is_staging_dat = "/staging" in str(src_attr) or (
+                src_p.name.startswith("dataset_") and src_p.suffix == ".dat"
+            )
+            cand_srcs = [p.parent / src_p.name]
+            if not is_staging_dat:
+                cand_srcs.append(src_p)
+            for cand_src in cand_srcs:
+                if cand_src.exists():
+                    with (
+                        contextlib.suppress(OSError, RuntimeError, KeyError),
+                        h5py.File(cand_src, "r") as sf,
+                    ):
+                        if "images" in sf:
+                            return str(cand_src.resolve())
 
     parent = p.parent
     if parent.resolve() == Path(tempfile.gettempdir()).resolve():
