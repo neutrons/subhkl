@@ -524,6 +524,15 @@ def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     assert "wulff-merge-bar" in html
     assert "btn-files-toggle" in html
     assert "files-drawer" in html
+    assert "--top-bar-scale" in html
+    assert "--bottom-bar-scale" in html
+    assert "repeat(5, minmax(0, 1fr))" in html
+    assert "fitHorizontalBars" in html
+    assert "getDetectorDataAspect" in html
+    assert "getDetectorPlotBox" in html
+    assert "getWarpedPanelCanvas" in html
+    assert 'id="detector-pane"' in html
+    assert "isPeakHighlightedTarget" in html
     assert "Compl. vs d" in html
     assert "⟨I/σ⟩ vs d" in html
     assert len(payload["merge_metrics"]["cc_half_bins"]) == 10

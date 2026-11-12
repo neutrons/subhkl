@@ -3269,40 +3269,48 @@ def render_rainbow_html(
     user-select: none;
   }}
 
-  /* Top Header Bar — single compact row */
+  /* Top Header Bar — single compact row, dynamically scaled to fit viewport width */
   .top-bar {{
+    --top-bar-scale: 1;
     display: flex;
     flex-wrap: nowrap;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
-    padding: 3px 10px;
+    gap: calc(6px * var(--top-bar-scale, 1));
+    padding: 3px calc(8px * var(--top-bar-scale, 1));
     background: var(--bg-panel);
     border-bottom: 1px solid var(--border-color);
-    min-height: 32px;
+    min-height: calc(30px * var(--top-bar-scale, 1));
+    width: 100%;
+    max-width: 100vw;
+    overflow: hidden;
     flex-shrink: 0;
   }}
 
   .brand-block {{
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: calc(6px * var(--top-bar-scale, 1));
     white-space: nowrap;
+    min-width: 0;
+    flex-shrink: 1;
   }}
 
   .rainbow-logo {{
     font-family: var(--font-body);
     font-weight: 800;
-    font-size: 1.05rem;
+    font-size: calc(1.05rem * var(--top-bar-scale, 1));
     letter-spacing: 0.3px;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: calc(4px * var(--top-bar-scale, 1));
+    min-width: 0;
+    flex-shrink: 0;
   }}
 
   .subhkl-logo-img {{
-    height: 24px;
-    width: 90px;
+    height: calc(24px * var(--top-bar-scale, 1));
+    width: calc(90px * var(--top-bar-scale, 1));
     display: block;
     flex-shrink: 0;
   }}
@@ -3333,61 +3341,100 @@ def render_rainbow_html(
 
   .logo-version {{
     font-family: var(--font-display);
-    font-size: 0.62rem;
+    font-size: calc(0.62rem * var(--top-bar-scale, 1));
     font-weight: 600;
     color: var(--text-dim);
     margin-left: 2px;
     letter-spacing: 0.2px;
     align-self: flex-end;
     margin-bottom: 3px;
+    max-width: calc(115px * var(--top-bar-scale, 1));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }}
 
   .subtitle-tag {{
-    font-size: 0.68rem;
-    padding: 2px 6px;
+    font-size: calc(0.68rem * var(--top-bar-scale, 1));
+    padding: 2px calc(6px * var(--top-bar-scale, 1));
     border-radius: 4px;
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     color: var(--accent-cyan);
     font-family: var(--font-display);
+    max-width: calc(210px * var(--top-bar-scale, 1));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex-shrink: 0;
   }}
 
   .hud-metrics {{
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: calc(5px * var(--top-bar-scale, 1));
     white-space: nowrap;
+    min-width: 0;
+    flex-shrink: 1;
   }}
 
   .hud-pill {{
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: 4px;
-    padding: 2px 7px;
+    padding: 2px calc(6px * var(--top-bar-scale, 1));
     display: flex;
     align-items: baseline;
-    gap: 5px;
+    gap: calc(4px * var(--top-bar-scale, 1));
+    min-width: 0;
+    flex-shrink: 0;
   }}
 
   .hud-label {{
-    font-size: 0.58rem;
+    font-size: calc(0.58rem * var(--top-bar-scale, 1));
     text-transform: uppercase;
     color: var(--text-dim);
     font-family: var(--font-display);
   }}
 
   .hud-value {{
-    font-size: 0.74rem;
+    font-size: calc(0.74rem * var(--top-bar-scale, 1));
     font-weight: 700;
     color: var(--accent-gold);
     font-family: var(--font-display);
   }}
 
+  #val-gonio {{
+    max-width: calc(175px * var(--top-bar-scale, 1));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+
   .controls-cluster {{
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: calc(4px * var(--top-bar-scale, 1));
     flex-wrap: nowrap;
+    min-width: 0;
+    flex-shrink: 0;
+  }}
+
+  .top-bar button {{
+    padding: calc(3px * var(--top-bar-scale, 1)) calc(7px * var(--top-bar-scale, 1));
+    font-size: calc(0.68rem * var(--top-bar-scale, 1));
+  }}
+
+  #sel-frame {{
+    font-size: calc(0.68rem * var(--top-bar-scale, 1)) !important;
+    max-width: calc(170px * var(--top-bar-scale, 1)) !important;
+  }}
+
+  #sel-galaxy-h5 {{
+    font-size: calc(0.68rem * var(--top-bar-scale, 1)) !important;
+    padding: calc(3px * var(--top-bar-scale, 1)) calc(6px * var(--top-bar-scale, 1)) !important;
+    max-width: calc(165px * var(--top-bar-scale, 1)) !important;
   }}
 
   button {{
@@ -3447,6 +3494,18 @@ def render_rainbow_html(
     width: 100%;
     height: 100%;
     overflow: hidden;
+    display: flex;
+    flex-direction: row;
+    min-width: 0;
+    min-height: 0;
+  }}
+
+  .detector-pane {{
+    position: relative;
+    flex: 1 1 0;
+    min-width: 0;
+    height: 100%;
+    overflow: hidden;
   }}
 
   canvas {{
@@ -3460,7 +3519,7 @@ def render_rainbow_html(
     cursor: grabbing;
   }}
 
-  /* Floating / Expandable Stereogram Wulff Net HUD */
+  /* Floating Corner Inset or Side-by-Side Split Stereogram Wulff Net HUD */
   .stereo-inset {{
     position: absolute;
     bottom: 10px;
@@ -3476,25 +3535,33 @@ def render_rainbow_html(
     overflow: hidden;
     backdrop-filter: blur(8px);
     z-index: 35;
-    transition: opacity 0.18s ease, transform 0.18s ease, width 0.18s ease, height 0.18s ease;
+    transition: opacity 0.18s ease, width 0.18s ease, height 0.18s ease;
   }}
 
   .stereo-inset.expanded {{
-    width: min(80vw, 760px);
-    height: min(78vh, 700px);
-    left: 50%;
-    top: 50%;
+    position: relative;
+    left: auto;
+    top: auto;
     bottom: auto;
-    transform: translate(-50%, -50%);
-    border-color: var(--accent-cyan);
-    box-shadow: 0 22px 64px rgba(0, 0, 0, 0.88);
-    z-index: 75;
+    transform: none;
+    flex: 0 0 clamp(280px, 43%, 560px);
+    width: clamp(280px, 43%, 560px);
+    height: 100%;
+    border-radius: 0;
+    border: none;
+    border-left: 1px solid var(--accent-cyan);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.55);
+    z-index: 35;
   }}
 
   .stereo-inset.hidden {{
     opacity: 0;
     pointer-events: none;
     transform: scale(0.9);
+  }}
+
+  .stereo-inset.expanded.hidden {{
+    display: none;
   }}
 
   .stereo-inset-header {{
@@ -3654,21 +3721,25 @@ def render_rainbow_html(
     font-family: var(--font-display);
   }}
 
-  /* Single-Row Solve Lattice Ladder Footer */
+  /* Single-Row Solve Lattice Ladder Footer, dynamically scaled to fit viewport width */
   .ladder-bar {{
+    --bottom-bar-scale: 1;
     background: var(--bg-panel);
     border-top: 1px solid var(--border-color);
-    padding: 3px 8px 4px 8px;
+    padding: 3px calc(8px * var(--bottom-bar-scale, 1)) 4px calc(8px * var(--bottom-bar-scale, 1));
     display: flex;
     flex-direction: column;
     gap: 3px;
+    width: 100%;
+    max-width: 100vw;
+    overflow: hidden;
     flex-shrink: 0;
   }}
 
   .stage-pill {{
     font-family: var(--font-display);
-    font-size: 0.65rem;
-    padding: 2px 8px 2px 5px;
+    font-size: calc(0.65rem * var(--bottom-bar-scale, 1));
+    padding: 2px calc(8px * var(--bottom-bar-scale, 1)) 2px calc(5px * var(--bottom-bar-scale, 1));
     border-radius: 5px;
     border: 1px solid var(--border-color);
     background: var(--bg-card);
@@ -3677,7 +3748,8 @@ def render_rainbow_html(
     transition: all 0.12s ease;
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: calc(5px * var(--bottom-bar-scale, 1));
+    white-space: nowrap;
   }}
 
   .stage-pill:hover {{
@@ -3709,10 +3781,10 @@ def render_rainbow_html(
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 15px;
-    height: 15px;
+    width: calc(15px * var(--bottom-bar-scale, 1));
+    height: calc(15px * var(--bottom-bar-scale, 1));
     border-radius: 3px;
-    font-size: 0.56rem;
+    font-size: calc(0.56rem * var(--bottom-bar-scale, 1));
     line-height: 1;
     background: rgba(56, 189, 248, 0.16);
     border: 1px solid rgba(56, 189, 248, 0.45);
@@ -3803,11 +3875,14 @@ def render_rainbow_html(
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: calc(6px * var(--bottom-bar-scale, 1));
+    width: 100%;
+    min-width: 0;
   }}
 
   .ladder-title {{
     font-family: var(--font-display);
-    font-size: 0.72rem;
+    font-size: calc(0.72rem * var(--bottom-bar-scale, 1));
     font-weight: 700;
     color: var(--accent-gold);
     white-space: nowrap;
@@ -3815,19 +3890,37 @@ def render_rainbow_html(
     text-overflow: ellipsis;
   }}
 
+  .ladder-actions {{
+    display: flex;
+    align-items: center;
+    gap: calc(5px * var(--bottom-bar-scale, 1));
+    flex-wrap: nowrap;
+    flex-shrink: 0;
+    min-width: 0;
+  }}
+
+  .ladder-actions button {{
+    font-size: calc(0.66rem * var(--bottom-bar-scale, 1));
+    padding: 2px calc(7px * var(--bottom-bar-scale, 1));
+  }}
+
   .ladder-rungs {{
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 6px;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: calc(6px * var(--bottom-bar-scale, 1));
+    width: 100%;
+    min-width: 0;
   }}
 
   .rung-card {{
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: 5px;
-    padding: 4px 8px;
+    padding: calc(4px * var(--bottom-bar-scale, 1)) calc(8px * var(--bottom-bar-scale, 1));
     cursor: pointer;
     transition: all 0.12s ease;
+    min-width: 0;
+    overflow: hidden;
   }}
 
   .rung-card:hover {{
@@ -3842,15 +3935,19 @@ def render_rainbow_html(
   .rung-top {{
     display: flex;
     justify-content: space-between;
+    gap: 4px;
     font-family: var(--font-display);
-    font-size: 0.62rem;
+    font-size: calc(0.62rem * var(--bottom-bar-scale, 1));
     color: var(--accent-cyan);
+    white-space: nowrap;
+    overflow: hidden;
+    min-width: 0;
   }}
 
   .rung-name {{
     font-family: var(--font-display);
     font-weight: 700;
-    font-size: 0.7rem;
+    font-size: calc(0.7rem * var(--bottom-bar-scale, 1));
     margin: 1px 0;
     white-space: nowrap;
     overflow: hidden;
@@ -3858,7 +3955,7 @@ def render_rainbow_html(
   }}
 
   .rung-sub {{
-    font-size: 0.62rem;
+    font-size: calc(0.62rem * var(--bottom-bar-scale, 1));
     color: var(--text-dim);
     white-space: nowrap;
     overflow: hidden;
@@ -3953,26 +4050,28 @@ def render_rainbow_html(
         <span id="detector-header-title">DETECTOR ASSEMBLY — LOG(INTENSITY) + PARALLAX BRAGG RINGS</span>
         <span class="hint">Move mouse to peek behind predicted rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
       </div>
-      <div class="canvas-wrap">
-        <canvas id="canvas-detector"></canvas>
+      <div class="canvas-wrap" id="canvas-wrap">
+        <div class="detector-pane" id="detector-pane">
+          <canvas id="canvas-detector"></canvas>
 
-        <!-- Clear 3-Layer Depth Legend -->
-        <div class="layer-legend">
-          <div class="legend-item">
-            <span style="display:inline-block;width:10px;height:10px;background:#f97316;border-radius:2px;"></span>
-            <span>Back Layer: Detector Pixel Counts</span>
-          </div>
-          <div class="legend-item">
-            <span style="display:inline-block;width:14px;height:3px;background:#00e5ff;border-radius:2px;"></span>
-            <span>Mid Layer: Single-Arc Zone Conics [uvw]</span>
-          </div>
-          <div class="legend-item">
-            <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
-            <span>Front Layer: Predicted Bragg Rings (parallax peeks behind spots)</span>
+          <!-- Clear 3-Layer Depth Legend -->
+          <div class="layer-legend">
+            <div class="legend-item">
+              <span style="display:inline-block;width:10px;height:10px;background:#f97316;border-radius:2px;"></span>
+              <span>Back Layer: Detector Pixel Counts</span>
+            </div>
+            <div class="legend-item">
+              <span style="display:inline-block;width:14px;height:3px;background:#00e5ff;border-radius:2px;"></span>
+              <span>Mid Layer: Single-Arc Zone Conics [uvw]</span>
+            </div>
+            <div class="legend-item">
+              <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
+              <span>Front Layer: Predicted Bragg Rings (parallax peeks behind spots)</span>
+            </div>
           </div>
         </div>
 
-        <!-- Interactive Stereogram Wulff Net (Corner Inset or Expanded Popout) -->
+        <!-- Interactive Stereogram Wulff Net (Corner Inset or Side-by-Side Split View) -->
         <div class="stereo-inset hidden" id="stereo-inset">
           <div class="stereo-inset-header">
             <span id="stereo-title" style="color:var(--accent-cyan);font-weight:700;">WULFF NET</span>
@@ -3984,7 +4083,7 @@ def render_rainbow_html(
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
               </select>
-              <button id="btn-wulff-expand" title="Expand or dock the Wulff Net view">Expand</button>
+              <button id="btn-wulff-expand" title="Toggle between side-by-side Split View and docked Corner Inset">Split</button>
               <button id="btn-wulff-close" title="Hide Wulff Net">X</button>
             </div>
           </div>
@@ -4056,22 +4155,22 @@ def render_rainbow_html(
       <div class="ladder-title" id="ladder-desc" style="flex:1;min-width:0;margin-right:8px;">
         <span id="combo-badge" style="color:var(--accent-cyan);margin-right:6px;">[INSPECTOR]</span><span id="inspector-box">Hover or click a Bragg spot to inspect (hkl), λ, d, and bank • Step through Lattice Ladder below</span>
       </div>
-      <div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap;">
-        <span style="font-size:0.62rem;color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
-        <div id="pipeline-stages" style="display:flex;align-items:center;gap:4px;"></div>
+      <div class="ladder-actions" id="ladder-actions">
+        <span id="lbl-execute" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
+        <div id="pipeline-stages" style="display:flex;align-items:center;gap:calc(4px * var(--bottom-bar-scale, 1));"></div>
         <button id="btn-params-toggle" title="Configure unit cell, space group, and wavelength parameters for Solve/Integrate">
           Params
         </button>
         <button id="btn-files-toggle" title="Download NDIP / workflow artifacts for the current step (switch steps with < Walk > arrows)">
           Files
         </button>
-        <span id="galaxy-status-badge" style="font-size:0.62rem;font-family:var(--font-display);padding:2px 6px;border-radius:4px;border:1px solid #334155;color:var(--text-dim);">
+        <span id="galaxy-status-badge" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));font-family:var(--font-display);padding:2px calc(6px * var(--bottom-bar-scale, 1));border-radius:4px;border:1px solid #334155;color:var(--text-dim);white-space:nowrap;">
           LOCAL
         </span>
         <button id="btn-galaxy-dispatch" style="display:none;">Run</button>
-        <button id="btn-ladder-prev" style="padding:2px 7px;font-size:0.66rem;">&lt;</button>
-        <button id="btn-ladder-play" class="active-btn" style="padding:2px 8px;font-size:0.66rem;">Walk</button>
-        <button id="btn-ladder-next" style="padding:2px 7px;font-size:0.66rem;">&gt;</button>
+        <button id="btn-ladder-prev">&lt;</button>
+        <button id="btn-ladder-play" class="active-btn">Walk</button>
+        <button id="btn-ladder-next">&gt;</button>
       </div>
     </div>
     <div id="params-drawer" class="params-drawer">
@@ -4317,6 +4416,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     selectedZoneId: null,
     hoveredPeakId: null,
     selectedPeakId: null,
+    hoveredPeakObj: null,
+    selectedPeakObj: null,
     activeOrbitId: null,
     currentPipelineIdx: pipelineIdxForArtifactKind(DATA.artifact_kind), // 0: Reduce, 1: Solve, 2: Integrate, 3: Merge, 4: Done
     currentRungIdx: DATA.artifact_kind === "merged" ? 0 : Math.max(0, LADDER.length - 1),
@@ -4335,6 +4436,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
   const bankCanvases = new Map();
+  const warpedBankCanvases = new Map();
 
   function colorizeGrayscaleImage(img, style) {{
     const c = document.createElement("canvas");
@@ -4378,6 +4480,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       img.onload = () => {{
         rawBankImages.set(p.bank, img);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(img, state.heatmapStyle));
+        warpedBankCanvases.clear();
         pending--;
         if (pending <= 0 || pending % 8 === 0) {{
           renderDetector();
@@ -4391,6 +4494,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     rawBankImages.forEach((img, bank) => {{
       bankCanvases.set(bank, colorizeGrayscaleImage(img, state.heatmapStyle));
     }});
+    warpedBankCanvases.clear();
   }}
 
   decodeAllBankTextures();
@@ -4687,8 +4791,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       btnScope.classList.toggle("active-btn", isAll);
     }}
     if (btnExpand) {{
-      btnExpand.textContent = state.wulffExpanded ? "Dock" : "Expand";
+      btnExpand.textContent = state.wulffExpanded ? "Corner" : "Split";
       btnExpand.classList.toggle("active-btn", Boolean(state.wulffExpanded));
+    }}
+    if (typeof _cachedPlotBox !== "undefined") {{
+      _cachedPlotBox = null;
+      _cachedPlotBoxKey = "";
     }}
     if (selColor) {{
       Array.from(selColor.options).forEach(opt => {{
@@ -4833,6 +4941,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
       container.appendChild(pill);
     }});
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
 
   function setStatusLine(badgeText, contentHtml) {{
@@ -4885,6 +4994,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       card.addEventListener("click", () => selectLadderRung(idx));
       container.appendChild(card);
     }});
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
 
   function selectLadderRung(idx, setSolveStage = true) {{
@@ -4958,6 +5068,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return p.wavelength >= state.lamMin && p.wavelength <= state.lamMax;
   }}
 
+  function isSameReflection(a, b) {{
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (Array.isArray(a.hkl) && Array.isArray(b.hkl) &&
+        a.hkl[0] === b.hkl[0] && a.hkl[1] === b.hkl[1] && a.hkl[2] === b.hkl[2]) {{
+      const ra = typeof a.run_index === "number" ? a.run_index : 0;
+      const rb = typeof b.run_index === "number" ? b.run_index : 0;
+      return ra === rb;
+    }}
+    return false;
+  }}
+
+  function isPeakHighlightedTarget(p) {{
+    const hov = state.hoveredPeakObj;
+    const sel = state.selectedPeakObj;
+    if (hov && isSameReflection(p, hov)) return true;
+    if (sel && isSameReflection(p, sel)) return true;
+    if (!hov && state.hoveredPeakId !== null && p.id === state.hoveredPeakId) return true;
+    if (!sel && state.selectedPeakId !== null && p.id === state.selectedPeakId) return true;
+    return false;
+  }}
+
   function isPeakCapturedByActiveZone(p) {{
     if (!p.zone_ids || p.zone_ids.length === 0) return false;
     for (let i = 0; i < p.zone_ids.length; i++) {{
@@ -4988,6 +5120,66 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       elGonio.textContent = (curF && curF.motor_summary) || DATA.goniometer_summary || "—";
     }}
     drawHistogram(visiblePeaks);
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
+  }}
+
+  let _lastBarViewportW = 0;
+  function fitHorizontalBars(force = false) {{
+    const vw = document.documentElement.clientWidth || window.innerWidth || 0;
+    if (!force && vw > 0 && Math.abs(vw - _lastBarViewportW) < 0.5) return;
+    _lastBarViewportW = vw;
+
+    const topBar = document.querySelector(".top-bar");
+    if (topBar) {{
+      topBar.style.setProperty("--top-bar-scale", "1");
+      const availW = Math.max(0, topBar.clientWidth - 16);
+      const brand = topBar.querySelector(".brand-block");
+      const hud = topBar.querySelector(".hud-metrics");
+      const ctrls = topBar.querySelector(".controls-cluster");
+      const naturalW =
+        (brand ? brand.scrollWidth : 0) +
+        (hud ? hud.scrollWidth : 0) +
+        (ctrls ? ctrls.scrollWidth : 0) +
+        16;
+      if (availW > 0 && naturalW > availW) {{
+        let scale = Math.max(0.45, Math.min(1.0, (availW / naturalW) * 0.985));
+        topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
+        if (topBar.scrollWidth > topBar.clientWidth) {{
+          scale = Math.max(0.40, scale * (topBar.clientWidth / topBar.scrollWidth) * 0.985);
+          topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
+        }}
+      }}
+    }}
+
+    const ladderBar = document.querySelector(".ladder-bar");
+    if (ladderBar) {{
+      ladderBar.style.setProperty("--bottom-bar-scale", "1");
+      const availW = Math.max(0, ladderBar.clientWidth - 16);
+      const ladderActions = document.getElementById("ladder-actions");
+      const actionsW = ladderActions ? ladderActions.scrollWidth : 0;
+      const minDescW = Math.min(220, Math.max(120, availW * 0.24));
+      const neededHeaderW = actionsW + minDescW + 14;
+
+      let maxRungTopW = 0;
+      const rungTops = ladderBar.querySelectorAll(".rung-top");
+      rungTops.forEach(rt => {{
+        const spans = rt.querySelectorAll("span");
+        let w = 18;
+        spans.forEach(s => {{ w += s.scrollWidth; }});
+        if (w > maxRungTopW) maxRungTopW = w;
+      }});
+      const neededRungsW = maxRungTopW > 0 ? maxRungTopW * 5 + 24 : 0;
+      const naturalW = Math.max(neededHeaderW, neededRungsW);
+      if (availW > 0 && naturalW > availW) {{
+        let scale = Math.max(0.45, Math.min(1.0, (availW / naturalW) * 0.985));
+        ladderBar.style.setProperty("--bottom-bar-scale", scale.toFixed(3));
+        const ladderHeader = ladderBar.querySelector(".ladder-header");
+        if (ladderHeader && ladderHeader.scrollWidth > ladderHeader.clientWidth) {{
+          scale = Math.max(0.40, scale * (ladderHeader.clientWidth / ladderHeader.scrollWidth) * 0.985);
+          ladderBar.style.setProperty("--bottom-bar-scale", scale.toFixed(3));
+        }}
+      }}
+    }}
   }}
 
   function renderFrameSelector() {{
@@ -5020,6 +5212,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const hasGonio = frames.length > 0 || (DATA.goniometer_summary && DATA.goniometer_summary !== "—");
       gonioPill.style.display = hasGonio ? "flex" : "none";
     }}
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
 
   const histCanvas = document.getElementById("canvas-hist");
@@ -5170,7 +5363,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     sphBounds.maxY = maxAbsEl;
   }}
 
+  let _cachedCylRadiusM = null;
+  let _cachedPlotBox = null;
+  let _cachedPlotBoxKey = "";
+
+  function invalidateDetectorGeometryCache() {{
+    _cachedCylRadiusM = null;
+    _cachedPlotBox = null;
+    _cachedPlotBoxKey = "";
+    if (typeof warpedBankCanvases !== "undefined") warpedBankCanvases.clear();
+  }}
+
   function recomputeProjectionBounds() {{
+    invalidateDetectorGeometryCache();
     if (PANELS.length > 0) {{
       const allY = [], allEl = [];
       PANELS.forEach(p => {{
@@ -5208,18 +5413,70 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return [panel.y_min, panel.y_max];
   }}
 
+  function getDetectorDataAspect() {{
+    const bounds = getActiveBounds();
+    const spanX = Math.max(10.0, bounds.maxX - bounds.minX);
+    const spanY = Math.max(1e-4, bounds.maxY - bounds.minY);
+    if (state.projection === "spherical") {{
+      return spanX / Math.max(10.0, spanY);
+    }}
+    if (_cachedCylRadiusM === null) {{
+      const radii = [];
+      for (let i = 0; i < PANELS.length; i++) {{
+        const p = PANELS[i];
+        if (typeof p.y_max === "number" && typeof p.el_max === "number" && Math.abs(p.el_max) > 1.5 && Math.abs(p.el_max) < 80.0) {{
+          const r = Math.abs(p.y_max) / Math.tan((Math.abs(p.el_max) * Math.PI) / 180.0);
+          if (Number.isFinite(r) && r > 0.05 && r < 5.0) radii.push(r);
+        }}
+        if (typeof p.y_min === "number" && typeof p.el_min === "number" && Math.abs(p.el_min) > 1.5 && Math.abs(p.el_min) < 80.0) {{
+          const r = Math.abs(p.y_min) / Math.tan((Math.abs(p.el_min) * Math.PI) / 180.0);
+          if (Number.isFinite(r) && r > 0.05 && r < 5.0) radii.push(r);
+        }}
+      }}
+      if (radii.length > 0) {{
+        radii.sort((a, b) => a - b);
+        _cachedCylRadiusM = radii[Math.floor(radii.length / 2)];
+      }} else {{
+        _cachedCylRadiusM = 0.40;
+      }}
+    }}
+    const metersPerDeg = (_cachedCylRadiusM * Math.PI) / 180.0;
+    return (spanX * metersPerDeg) / Math.max(0.05, spanY);
+  }}
+
+  function getDetectorPlotBox(w, h) {{
+    const bounds = getActiveBounds();
+    const key = `${{w}}_${{h}}_${{state.projection}}_${{bounds.minX}}_${{bounds.maxX}}_${{bounds.minY}}_${{bounds.maxY}}`;
+    if (_cachedPlotBox && _cachedPlotBoxKey === key) {{
+      return _cachedPlotBox;
+    }}
+    const padL = 42, padR = 12, padT = 14, padB = 22;
+    const availW = Math.max(50, w - padL - padR);
+    const availH = Math.max(50, h - padT - padB);
+    const dataAspect = Math.max(0.25, Math.min(12.0, getDetectorDataAspect()));
+    let plotW = availW;
+    let plotH = availW / dataAspect;
+    if (plotH > availH) {{
+      plotH = availH;
+      plotW = availH * dataAspect;
+    }}
+    const originX = padL + (availW - plotW) * 0.5;
+    const originY = padT + (availH - plotH) * 0.5;
+    _cachedPlotBoxKey = key;
+    _cachedPlotBox = {{ originX, originY, plotW, plotH, padL, padR, padT, padB }};
+    return _cachedPlotBox;
+  }}
+
   // Physical Parallax Transform:
   // layerOffset = -0.35 (Back: Detector Intensity Panels)
   // layerOffset = +0.25..+0.90 (Front: Predicted Bragg Rings floating by d-spacing)
   function detToScreen(dx, dy, w, h, layerOffset = 0.0) {{
     const bounds = getActiveBounds();
-    const padL = 42, padR = 12, padT = 14, padB = 22;
-    const plotW = Math.max(50, w - padL - padR);
-    const plotH = Math.max(50, h - padT - padB);
+    const box = getDetectorPlotBox(w, h);
     const u = (dx - bounds.minX) / (bounds.maxX - bounds.minX);
     const v = (dy - bounds.minY) / (bounds.maxY - bounds.minY);
-    const x0 = padL + u * plotW;
-    const y0 = padT + (1.0 - v) * plotH;
+    const x0 = box.originX + u * box.plotW;
+    const y0 = box.originY + (1.0 - v) * box.plotH;
     const cx = w * 0.5;
     const cy = h * 0.5;
     const shiftX = state.parallaxX * state.parallaxStrength * layerOffset * 18.0;
@@ -5256,13 +5513,165 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.restore();
   }}
 
+  function getWarpedPanelCanvas(panel, isSph) {{
+    const texCanvas = bankCanvases.get(panel.bank);
+    if (!texCanvas) return null;
+    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{state.heatmapStyle}}`;
+    if (warpedBankCanvases.has(cacheKey)) {{
+      return warpedBankCanvases.get(cacheKey);
+    }}
+    const [vMin, vMax] = getPanelVertRange(panel);
+    const azSpan = Math.max(1e-5, panel.az_max - panel.az_min);
+    const vSpan = Math.max(1e-5, vMax - vMin);
+    const W = Math.max(1, texCanvas.width);
+    const H = Math.max(1, texCanvas.height);
+    const spW = W > 512 ? Math.min(2048, W) : Math.min(384, Math.max(192, W * 2));
+    const spH = H > 512 ? Math.min(1024, H) : Math.min(384, Math.max(192, H * 2));
+
+    const wc = document.createElement("canvas");
+    wc.width = spW;
+    wc.height = spH;
+    const wctx = wc.getContext("2d");
+    wctx.imageSmoothingEnabled = true;
+
+    const toSp = pt => [
+      ((pt[0] - panel.az_min) / azSpan) * spW,
+      ((vMax - pt[1]) / vSpan) * spH,
+    ];
+
+    const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
+    const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+    const meshPts = isSph && panel.mesh_sph ? panel.mesh_sph : panel.mesh;
+
+    wctx.save();
+    if (outlinePts && outlinePts.length >= 4) {{
+      wctx.beginPath();
+      outlinePts.forEach((pt, idx) => {{
+        const [ox, oy] = toSp(pt);
+        if (idx === 0) wctx.moveTo(ox, oy);
+        else wctx.lineTo(ox, oy);
+      }});
+      wctx.closePath();
+      wctx.clip();
+    }}
+
+    if (Array.isArray(meshPts) && meshPts.length >= 2 && Array.isArray(meshPts[0]) && meshPts[0].length >= 2) {{
+      const nRows = meshPts.length - 1;
+      const nCols = meshPts[0].length - 1;
+      const SGrid = meshPts.map(row => row.map(toSp));
+      const S0 = SGrid[0][0], S1 = SGrid[nRows][0], S2 = SGrid[nRows][nCols], S3 = SGrid[0][nCols];
+      const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
+      const midR = Math.floor(nRows / 2), midC = Math.floor(nCols / 2);
+      const topBow = Math.hypot(SGrid[0][midC][0] - 0.5 * (S0[0] + S3[0]), SGrid[0][midC][1] - 0.5 * (S0[1] + S3[1]));
+      const botBow = Math.hypot(SGrid[nRows][midC][0] - 0.5 * (S1[0] + S2[0]), SGrid[nRows][midC][1] - 0.5 * (S1[1] + S2[1]));
+      const lftBow = Math.hypot(SGrid[midR][0][0] - 0.5 * (S0[0] + S1[0]), SGrid[midR][0][1] - 0.5 * (S0[1] + S1[1]));
+      const rgtBow = Math.hypot(SGrid[midR][nCols][0] - 0.5 * (S3[0] + S2[0]), SGrid[midR][nCols][1] - 0.5 * (S3[1] + S2[1]));
+      const maxBow = Math.max(topBow, botBow, lftBow, rgtBow);
+      if (nonPara < 1.5 && maxBow < 1.2) {{
+        const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
+        const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
+        const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
+        const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
+        const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
+        const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
+        wctx.save();
+        wctx.transform(ax, ay, cx, cy, ex, ey);
+        wctx.drawImage(texCanvas, 0, 0, W, H);
+        wctx.restore();
+      }} else {{
+        const du = W / nCols;
+        const dv = H / nRows;
+        const expandTri = (A, B, C) => {{
+          const mx = (A[0] + B[0] + C[0]) / 3;
+          const my = (A[1] + B[1] + C[1]) / 3;
+          const pad = 0.65;
+          return [A, B, C].map(P => {{
+            const dx = P[0] - mx, dy = P[1] - my;
+            const len = Math.hypot(dx, dy) || 1;
+            return [P[0] + (dx / len) * pad, P[1] + (dy / len) * pad];
+          }});
+        }};
+        for (let ir = 0; ir < nRows; ir++) {{
+          const v0 = ir * dv;
+          const v1 = (ir + 1) * dv;
+          for (let ic = 0; ic < nCols; ic++) {{
+            const u0 = ic * du;
+            const u1 = (ic + 1) * du;
+            const P00 = SGrid[ir][ic];
+            const P01 = SGrid[ir][ic + 1];
+            const P11 = SGrid[ir + 1][ic + 1];
+            const P10 = SGrid[ir + 1][ic];
+
+            const [T1A, T1B, T1C] = expandTri(P00, P01, P10);
+            const a1 = (P01[0] - P00[0]) / du;
+            const b1 = (P01[1] - P00[1]) / du;
+            const c1 = (P10[0] - P00[0]) / dv;
+            const d1 = (P10[1] - P00[1]) / dv;
+            const e1 = P00[0] - a1 * u0 - c1 * v0;
+            const f1 = P00[1] - b1 * u0 - d1 * v0;
+            wctx.save();
+            wctx.beginPath();
+            wctx.moveTo(T1A[0], T1A[1]);
+            wctx.lineTo(T1B[0], T1B[1]);
+            wctx.lineTo(T1C[0], T1C[1]);
+            wctx.closePath();
+            wctx.clip();
+            wctx.transform(a1, b1, c1, d1, e1, f1);
+            wctx.drawImage(texCanvas, 0, 0, W, H);
+            wctx.restore();
+
+            const [T2A, T2B, T2C] = expandTri(P01, P11, P10);
+            const a2 = (P11[0] - P10[0]) / du;
+            const b2 = (P11[1] - P10[1]) / du;
+            const c2 = (P11[0] - P01[0]) / dv;
+            const d2 = (P11[1] - P01[1]) / dv;
+            const e2 = P11[0] - a2 * u1 - c2 * v1;
+            const f2 = P11[1] - b2 * u1 - d2 * v1;
+            wctx.save();
+            wctx.beginPath();
+            wctx.moveTo(T2A[0], T2A[1]);
+            wctx.lineTo(T2B[0], T2B[1]);
+            wctx.lineTo(T2C[0], T2C[1]);
+            wctx.closePath();
+            wctx.clip();
+            wctx.transform(a2, b2, c2, d2, e2, f2);
+            wctx.drawImage(texCanvas, 0, 0, W, H);
+            wctx.restore();
+          }}
+        }}
+      }}
+    }} else if (cornersPts && cornersPts.length === 4) {{
+      const [S0, S1, S2, S3] = cornersPts.map(toSp);
+      const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
+      const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
+      const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
+      const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
+      const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
+      const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
+      wctx.save();
+      wctx.transform(ax, ay, cx, cy, ex, ey);
+      wctx.drawImage(texCanvas, 0, 0, W, H);
+      wctx.restore();
+    }} else {{
+      wctx.drawImage(texCanvas, 0, 0, spW, spH);
+    }}
+    wctx.restore();
+
+    warpedBankCanvases.set(cacheKey, wc);
+    return wc;
+  }}
+
   function renderDetectorCanvas() {{
     const rect = detCanvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
-    detCanvas.width = Math.max(200, rect.width * dpr);
-    detCanvas.height = Math.max(200, rect.height * dpr);
+    const targetW = Math.max(200, Math.round(rect.width * dpr));
+    const targetH = Math.max(200, Math.round(rect.height * dpr));
+    if (detCanvas.width !== targetW || detCanvas.height !== targetH) {{
+      detCanvas.width = targetW;
+      detCanvas.height = targetH;
+    }}
     const ctx = detCanvas.getContext("2d");
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const w = rect.width;
     const h = rect.height;
     ctx.clearRect(0, 0, w, h);
@@ -5287,15 +5696,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.moveTo(gx, gy0);
         ctx.lineTo(gx, gy1);
         ctx.stroke();
-        ctx.fillText(`${{az}}°`, gx - 12, h - 8);
+        ctx.fillText(`${{az}}°`, gx - 12, Math.min(h - 6, Math.max(18, gy0 + 14)));
       }}
     }});
     const yStep = Number(((bounds.maxY - bounds.minY) / 4).toFixed(isSph ? 0 : 2)) || (isSph ? 30 : 0.15);
     for (let yv = bounds.minY; yv <= bounds.maxY + 1e-4; yv += yStep) {{
       const [gx0, gy] = detToScreen(bounds.minX - (isCoupled360 ? 360 : 0), yv, w, h, -0.35);
-      const [gx1] = detToScreen(bounds.maxX + (isCoupled360 ? 360 : 0), yv, w, h, -0.35);
+      const [gx1] = detToScreen(bounds.minX + (bounds.maxX - bounds.minX) + (isCoupled360 ? 360 : 0), yv, w, h, -0.35);
       ctx.beginPath();
-      ctx.moveTo(Math.max(0, gx0), gy);
+      ctx.moveTo(Math.max(40, gx0), gy);
       ctx.lineTo(Math.min(w, gx1), gy);
       ctx.stroke();
       const lbl = isSph ? `${{yv.toFixed(0)}}°` : `${{yv.toFixed(2)}}m`;
@@ -5310,15 +5719,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const [vMin, vMax] = getPanelVertRange(panel);
         const [x0, y0] = detToScreen(panel.az_min + shiftAz, vMax, w, h, -0.35);
         const [x1, y1] = detToScreen(panel.az_max + shiftAz, vMin, w, h, -0.35);
-        if (Math.max(x0, x1) < -80 || Math.min(x0, x1) > w + 80) return;
+        if (
+          Math.max(x0, x1) < -80 ||
+          Math.min(x0, x1) > w + 80 ||
+          Math.max(y0, y1) < -80 ||
+          Math.min(y0, y1) > h + 80
+        ) return;
         const pw = x1 - x0;
         const ph = y1 - y0;
 
         const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
         const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
-        const meshPts = isSph && panel.mesh_sph ? panel.mesh_sph : panel.mesh;
 
-        ctx.save();
+        const texCanvas = bankCanvases.get(panel.bank);
+        ctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
+        ctx.lineWidth = texCanvas ? 1.1 : 0.7;
+
         if (outlinePts && outlinePts.length >= 4) {{
           ctx.beginPath();
           outlinePts.forEach((pt, idx) => {{
@@ -5329,177 +5745,30 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ctx.closePath();
           ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
           ctx.fill();
-          ctx.clip();
+          if (texCanvas && state.detAlpha > 0.01) {{
+            const warpedCanvas = getWarpedPanelCanvas(panel, isSph);
+            if (warpedCanvas) {{
+              ctx.save();
+              ctx.globalAlpha = state.detAlpha;
+              ctx.imageSmoothingEnabled = true;
+              ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
+              ctx.restore();
+            }}
+          }}
+          ctx.stroke();
         }} else {{
           ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
           ctx.fillRect(x0, y0, pw, ph);
-        }}
-
-        const texCanvas = bankCanvases.get(panel.bank);
-        if (texCanvas && state.detAlpha > 0.01) {{
-          ctx.globalAlpha = state.detAlpha;
-          ctx.imageSmoothingEnabled = true;
-          const W = Math.max(1, texCanvas.width);
-          const H = Math.max(1, texCanvas.height);
-          if (Array.isArray(meshPts) && meshPts.length >= 2 && Array.isArray(meshPts[0]) && meshPts[0].length >= 2) {{
-            // Curvilinear mesh warping (Nr x Nc grid of sub-quads) so high-latitude / tilted panels
-            // (e.g. MANDI bottom-plane panels) fill their curved outlines accurately
-            const nRows = meshPts.length - 1;
-            const nCols = meshPts[0].length - 1;
-            const SGrid = meshPts.map(row => row.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35)));
-            const S0 = SGrid[0][0], S1 = SGrid[nRows][0], S2 = SGrid[nRows][nCols], S3 = SGrid[0][nCols];
-            const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
-            const midR = Math.floor(nRows / 2), midC = Math.floor(nCols / 2);
-            const topBow = Math.hypot(SGrid[0][midC][0] - 0.5 * (S0[0] + S3[0]), SGrid[0][midC][1] - 0.5 * (S0[1] + S3[1]));
-            const botBow = Math.hypot(SGrid[nRows][midC][0] - 0.5 * (S1[0] + S2[0]), SGrid[nRows][midC][1] - 0.5 * (S1[1] + S2[1]));
-            const lftBow = Math.hypot(SGrid[midR][0][0] - 0.5 * (S0[0] + S1[0]), SGrid[midR][0][1] - 0.5 * (S0[1] + S1[1]));
-            const rgtBow = Math.hypot(SGrid[midR][nCols][0] - 0.5 * (S3[0] + S2[0]), SGrid[midR][nCols][1] - 0.5 * (S3[1] + S2[1]));
-            const maxBow = Math.max(topBow, botBow, lftBow, rgtBow);
-            if (nonPara < 1.5 && maxBow < 1.2) {{
-              const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
-              const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
-              const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
-              const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
-              const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
-              const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
+          if (texCanvas && state.detAlpha > 0.01) {{
+            const warpedCanvas = getWarpedPanelCanvas(panel, isSph);
+            if (warpedCanvas) {{
               ctx.save();
-              ctx.transform(ax, ay, cx, cy, ex, ey);
-              ctx.drawImage(texCanvas, 0, 0, W, H);
-              ctx.restore();
-            }} else {{
-              const du = W / nCols;
-              const dv = H / nRows;
-              const expandTri = (A, B, C) => {{
-                const mx = (A[0] + B[0] + C[0]) / 3;
-                const my = (A[1] + B[1] + C[1]) / 3;
-                const pad = 0.45;
-                return [A, B, C].map(P => {{
-                  const dx = P[0] - mx, dy = P[1] - my;
-                  const len = Math.hypot(dx, dy) || 1;
-                  return [P[0] + (dx / len) * pad, P[1] + (dy / len) * pad];
-                }});
-              }};
-              for (let ir = 0; ir < nRows; ir++) {{
-                const v0 = ir * dv;
-                const v1 = (ir + 1) * dv;
-                for (let ic = 0; ic < nCols; ic++) {{
-                  const u0 = ic * du;
-                  const u1 = (ic + 1) * du;
-                  const P00 = SGrid[ir][ic];
-                  const P01 = SGrid[ir][ic + 1];
-                  const P11 = SGrid[ir + 1][ic + 1];
-                  const P10 = SGrid[ir + 1][ic];
-
-                  // Sub-triangle 1: (u0, v0)->P00, (u1, v0)->P01, (u0, v1)->P10
-                  const [T1A, T1B, T1C] = expandTri(P00, P01, P10);
-                  const a1 = (P01[0] - P00[0]) / du;
-                  const b1 = (P01[1] - P00[1]) / du;
-                  const c1 = (P10[0] - P00[0]) / dv;
-                  const d1 = (P10[1] - P00[1]) / dv;
-                  const e1 = P00[0] - a1 * u0 - c1 * v0;
-                  const f1 = P00[1] - b1 * u0 - d1 * v0;
-                  ctx.save();
-                  ctx.beginPath();
-                  ctx.moveTo(T1A[0], T1A[1]);
-                  ctx.lineTo(T1B[0], T1B[1]);
-                  ctx.lineTo(T1C[0], T1C[1]);
-                  ctx.closePath();
-                  ctx.clip();
-                  ctx.transform(a1, b1, c1, d1, e1, f1);
-                  ctx.drawImage(texCanvas, 0, 0, W, H);
-                  ctx.restore();
-
-                  // Sub-triangle 2: (u1, v0)->P01, (u1, v1)->P11, (u0, v1)->P10
-                  const [T2A, T2B, T2C] = expandTri(P01, P11, P10);
-                  const a2 = (P11[0] - P10[0]) / du;
-                  const b2 = (P11[1] - P10[1]) / du;
-                  const c2 = (P11[0] - P01[0]) / dv;
-                  const d2 = (P11[1] - P01[1]) / dv;
-                  const e2 = P11[0] - a2 * u1 - c2 * v1;
-                  const f2 = P11[1] - b2 * u1 - d2 * v1;
-                  ctx.save();
-                  ctx.beginPath();
-                  ctx.moveTo(T2A[0], T2A[1]);
-                  ctx.lineTo(T2B[0], T2B[1]);
-                  ctx.lineTo(T2C[0], T2C[1]);
-                  ctx.closePath();
-                  ctx.clip();
-                  ctx.transform(a2, b2, c2, d2, e2, f2);
-                  ctx.drawImage(texCanvas, 0, 0, W, H);
-                  ctx.restore();
-                }}
-              }}
-            }}
-          }} else if (cornersPts && cornersPts.length === 4) {{
-            // True 2-triangle affine texture projection from (r, c) corners C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
-            const S0 = detToScreen(cornersPts[0][0] + shiftAz, cornersPts[0][1], w, h, -0.35);
-            const S1 = detToScreen(cornersPts[1][0] + shiftAz, cornersPts[1][1], w, h, -0.35);
-            const S2 = detToScreen(cornersPts[2][0] + shiftAz, cornersPts[2][1], w, h, -0.35);
-            const S3 = detToScreen(cornersPts[3][0] + shiftAz, cornersPts[3][1], w, h, -0.35);
-            const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
-            if (nonPara < 2.2) {{
-              const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
-              const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
-              const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
-              const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
-              const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
-              const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
-              ctx.save();
-              ctx.transform(ax, ay, cx, cy, ex, ey);
-              ctx.drawImage(texCanvas, 0, 0, W, H);
-              ctx.restore();
-            }} else {{
-              // Triangle A: (0,0)->S0, (W,0)->S3, (0,H)->S1
-              ctx.save();
-              ctx.beginPath();
-              ctx.moveTo(S0[0], S0[1]);
-              ctx.lineTo(S3[0], S3[1]);
-              ctx.lineTo(S1[0], S1[1]);
-              ctx.closePath();
-              ctx.clip();
-              ctx.transform(
-                (S3[0] - S0[0]) / W, (S3[1] - S0[1]) / W,
-                (S1[0] - S0[0]) / H, (S1[1] - S0[1]) / H,
-                S0[0], S0[1]
-              );
-              ctx.drawImage(texCanvas, 0, 0, W, H);
-              ctx.restore();
-
-              // Triangle B: (W,0)->S3, (W,H)->S2, (0,H)->S1
-              ctx.save();
-              ctx.beginPath();
-              ctx.moveTo(S3[0], S3[1]);
-              ctx.lineTo(S2[0], S2[1]);
-              ctx.lineTo(S1[0], S1[1]);
-              ctx.closePath();
-              ctx.clip();
-              ctx.transform(
-                (S2[0] - S1[0]) / W, (S2[1] - S1[1]) / W,
-                (S2[0] - S3[0]) / H, (S2[1] - S3[1]) / H,
-                S3[0] + S1[0] - S2[0], S3[1] + S1[1] - S2[1]
-              );
-              ctx.drawImage(texCanvas, 0, 0, W, H);
+              ctx.globalAlpha = state.detAlpha;
+              ctx.imageSmoothingEnabled = true;
+              ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
               ctx.restore();
             }}
-          }} else {{
-            ctx.drawImage(texCanvas, x0, y0, pw, ph);
           }}
-        }}
-        ctx.restore();
-
-        // True panel polygon border (shows curved elevation edges in Spherical MANDI view)
-        ctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
-        ctx.lineWidth = texCanvas ? 1.1 : 0.7;
-        if (outlinePts && outlinePts.length >= 4) {{
-          ctx.beginPath();
-          outlinePts.forEach((pt, idx) => {{
-            const [ox, oy] = detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35);
-            if (idx === 0) ctx.moveTo(ox, oy);
-            else ctx.lineTo(ox, oy);
-          }});
-          ctx.closePath();
-          ctx.stroke();
-        }} else {{
           ctx.strokeRect(x0, y0, pw, ph);
         }}
 
@@ -5568,7 +5837,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const [bx, by] = detToScreen(p.det_x + shiftAz, py, w, h, -0.35);
 
         const captured = isPeakCapturedByActiveZone(p);
-        const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
+        const isHovered = isPeakHighlightedTarget(p);
         const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
         if (!captured && !isHovered && !isOrbitMate && state.activeZones.size === 0) {{
           return;
@@ -5738,10 +6007,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const rect = stereoCanvas.getBoundingClientRect();
     if (rect.width < 20 || rect.height < 20) return;
     const dpr = window.devicePixelRatio || 1;
-    stereoCanvas.width = rect.width * dpr;
-    stereoCanvas.height = rect.height * dpr;
+    const targetW = Math.round(rect.width * dpr);
+    const targetH = Math.round(rect.height * dpr);
+    if (stereoCanvas.width !== targetW || stereoCanvas.height !== targetH) {{
+      stereoCanvas.width = targetW;
+      stereoCanvas.height = targetH;
+    }}
     const ctx = stereoCanvas.getContext("2d");
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const w = rect.width;
     const h = rect.height;
     ctx.clearRect(0, 0, w, h);
@@ -5842,6 +6115,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     const wPeaks = getActiveWulffPeaks();
     const orbitMates = [];
+    const hoveredTargets = [];
 
     // Project all peaks in Sample frame and sort back-to-front by camera depth zCam so closer peaks render on top
     const projectedPeaks = wPeaks.map(p => {{
@@ -5856,14 +6130,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     projectedPeaks.forEach(({{ p, sx, sy, hemi, dotScale }}) => {{
       const captured = isPeakCapturedByActiveZone(p) || state.wulffScope === "all_runs";
-      const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
+      const isHovered = isPeakHighlightedTarget(p);
       const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
       if (isOrbitMate) orbitMates.push([sx, sy, p, dotScale]);
+      if (isHovered) hoveredTargets.push([sx, sy, p, dotScale, hemi]);
 
       const baseDot = (isExp ? (captured ? 3.8 : 2.6) : (captured ? 2.5 : 1.75)) * dotScale;
-      const rDot = isHovered ? baseDot + 2.5 : (isOrbitMate ? baseDot + 1.6 : baseDot);
+      const rDot = isHovered ? baseDot + 2.8 : (isOrbitMate ? baseDot + 1.6 : baseDot);
       const alphaBase = hemi >= 0 ? (captured ? 0.94 : 0.52) : (captured ? 0.55 : 0.28);
-      const col = isHovered ? "#fbbf24" : peakStrokeColor(p, alphaBase);
+      const col = isHovered ? "#f43f85" : peakStrokeColor(p, alphaBase);
 
       ctx.save();
       ctx.beginPath();
@@ -5930,6 +6205,38 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ctx.restore();
     }}
 
+    // Coupled Hover Target Reticle: prominently highlight the exact peak hovered in Detector or Wulff view
+    if (hoveredTargets.length > 0) {{
+      ctx.save();
+      hoveredTargets.forEach(([tx, ty, tp]) => {{
+        const rRet = isExp ? 10.0 : 7.5;
+        ctx.beginPath();
+        ctx.arc(tx, ty, rRet, 0, Math.PI * 2);
+        ctx.strokeStyle = "#f43f85";
+        ctx.lineWidth = 2.2;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(tx - rRet - 4, ty); ctx.lineTo(tx - rRet + 2, ty);
+        ctx.moveTo(tx + rRet - 2, ty); ctx.lineTo(tx + rRet + 4, ty);
+        ctx.moveTo(tx, ty - rRet - 4); ctx.lineTo(tx, ty - rRet + 2);
+        ctx.moveTo(tx, ty + rRet - 2); ctx.lineTo(tx, ty + rRet + 4);
+        ctx.strokeStyle = "#fbbf24";
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+
+        if (!isExp && Array.isArray(tp.hkl)) {{
+          const lbl = `(${{tp.hkl.join(",")}})`;
+          ctx.font = "bold 9px monospace";
+          ctx.fillStyle = "#070913";
+          ctx.fillText(lbl, tx + 9, ty - 5);
+          ctx.fillStyle = "#fbbf24";
+          ctx.fillText(lbl, tx + 8, ty - 6);
+        }}
+      }});
+      ctx.restore();
+    }}
+
     ctx.restore();
   }}
 
@@ -5988,7 +6295,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     if (isPanningDet) {{
       let nextPanX = ev.clientX - panStart[0];
-      const plotW = Math.max(50, rect.width - 54);
+      const plotW = getDetectorPlotBox(rect.width, rect.height).plotW;
       const span360 = plotW * state.detZoom;
       if (span360 > 10) {{
         while (nextPanX > 0.5 * span360) {{ nextPanX -= span360; panStart[0] += span360; }}
@@ -6000,10 +6307,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return;
     }}
     const hit = findNearestPeakDetector(mx, my);
-    state.hoveredPeakId = hit ? hit.id : null;
+    const nextHoverId = hit ? hit.id : null;
+    const hoverChanged = hit !== state.hoveredPeakObj;
+    state.hoveredPeakId = nextHoverId;
+    state.hoveredPeakObj = hit || null;
     if (hit) {{
       state.activeOrbitId = hit.asu_orbit_id || null;
-      updatePeakInspector(hit);
+      if (hoverChanged) updatePeakInspector(hit);
     }} else if (state.selectedPeakId === null) {{
       state.activeOrbitId = null;
     }}
@@ -6013,6 +6323,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.targetParallaxX = 0.0;
     state.targetParallaxY = 0.0;
     state.hoveredPeakId = null;
+    state.hoveredPeakObj = null;
     if (state.selectedPeakId === null) state.activeOrbitId = null;
   }});
 
@@ -6030,10 +6341,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const hit = findNearestPeakDetector(ev.clientX - rect.left, ev.clientY - rect.top);
     if (hit) {{
       state.selectedPeakId = hit.id;
+      state.selectedPeakObj = hit;
       state.activeOrbitId = hit.asu_orbit_id || null;
       updatePeakInspector(hit);
     }} else {{
       state.selectedPeakId = null;
+      state.selectedPeakObj = null;
       state.activeOrbitId = null;
     }}
   }});
@@ -6050,28 +6363,34 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const rect = stereoCanvas.getBoundingClientRect();
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
+      state.targetParallaxX = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
+      state.targetParallaxY = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
       if (isDraggingWulff) {{
         const dx = ev.clientX - wulffDragStart[0];
         const dy = ev.clientY - wulffDragStart[1];
         state.wulffYawDeg = ((wulffDragStart[2] + dx * 0.55 + 540) % 360) - 180;
         state.wulffPitchDeg = Math.max(-85, Math.min(85, wulffDragStart[3] + dy * 0.45));
         const detRect = detCanvas.getBoundingClientRect();
-        const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
+        const span360 = getDetectorPlotBox(detRect.width, detRect.height).plotW * state.detZoom;
         state.detPanX = -(state.wulffYawDeg / 360.0) * span360;
         return;
       }}
       const hit = findNearestPeakWulff(mx, my);
+      const hoverChanged = hit !== state.hoveredPeakObj;
+      state.hoveredPeakId = hit ? hit.id : null;
+      state.hoveredPeakObj = hit || null;
       if (hit) {{
-        state.hoveredPeakId = hit.id;
         state.activeOrbitId = hit.asu_orbit_id || null;
-        updatePeakInspector(hit);
-      }} else {{
-        state.hoveredPeakId = null;
-        if (state.selectedPeakId === null) state.activeOrbitId = null;
+        if (hoverChanged) updatePeakInspector(hit);
+      }} else if (state.selectedPeakId === null) {{
+        state.activeOrbitId = null;
       }}
     }});
     stereoCanvas.addEventListener("mouseleave", () => {{
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
       state.hoveredPeakId = null;
+      state.hoveredPeakObj = null;
       if (state.selectedPeakId === null) state.activeOrbitId = null;
     }});
     stereoCanvas.addEventListener("wheel", (ev) => {{
@@ -6087,6 +6406,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const hit = findNearestPeakWulff(ev.clientX - rect.left, ev.clientY - rect.top);
       if (hit) {{
         state.selectedPeakId = hit.id;
+        state.selectedPeakObj = hit;
         state.activeOrbitId = hit.asu_orbit_id || null;
         updatePeakInspector(hit);
       }}
@@ -6152,7 +6472,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     btnWulffScope.addEventListener("click", () => {{
       state.wulffScope = state.wulffScope === "all_runs" ? "single_frame" : "all_runs";
       const detRect = detCanvas.getBoundingClientRect();
-      const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
+      const span360 = getDetectorPlotBox(detRect.width, detRect.height).plotW * state.detZoom;
       state.wulffYawDeg = -(state.detPanX / Math.max(1, span360)) * 360.0;
       syncWulffUI();
     }});
@@ -6196,6 +6516,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.wulffPitchDeg = 0.0;
     state.wulffZoom = 1.0;
     state.selectedPeakId = null;
+    state.selectedPeakObj = null;
+    state.hoveredPeakId = null;
+    state.hoveredPeakObj = null;
     state.activeOrbitId = null;
     setMaxZoneOrder(1);
   }});
@@ -6442,6 +6765,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     rawBankImages.clear();
     bankCanvases.clear();
+    invalidateDetectorGeometryCache();
     decodeAllBankTextures();
     // Support direct canvas textures generated by client-side h5wasm
     PANELS.forEach(p => {{
@@ -7352,6 +7676,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
       selGalaxyH5.appendChild(grpHist);
     }}
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
 
   // Modal Dialog: Load Neutron Data (IPTS+run range or explicit file paths)
@@ -8826,11 +9151,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  window.addEventListener("resize", () => fitHorizontalBars(false));
+  if (typeof ResizeObserver !== "undefined") {{
+    const barResizeObserver = new ResizeObserver(() => fitHorizontalBars(false));
+    barResizeObserver.observe(document.body);
+  }}
+
   renderFrameSelector();
   renderZoneList();
   renderPipeline();
   renderLadder();
   updateHUD();
+  fitHorizontalBars(true);
   requestAnimationFrame(animate);
 }})();
 </script>
