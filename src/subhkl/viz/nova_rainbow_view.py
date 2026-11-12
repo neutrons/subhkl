@@ -3726,9 +3726,8 @@ class NovaGalaxyPipelineRunner:
                 os.chmod(post_script, 0o666)
             chained_merge = (
                 f"set -e; "
-                f'export PYTHONPATH="/opt/venv/lib/python3.13/site-packages:${{PYTHONPATH:-}}"; '
                 f"MKEYS=$(python {shlex.quote(prep_script)}) && "
-                f'python /opt/venv/bin/careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
+                f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
                 f"python {shlex.quote(post_script)}"
             )
             inner_cmd = ["bash", "-c", chained_merge]
