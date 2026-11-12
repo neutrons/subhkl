@@ -4630,7 +4630,7 @@ def render_rainbow_html(
           <span id="nd-validation-msg" style="color:var(--text-dim);">Ready to verify via NDIP Load Neutron Data (`neutrons_load_data`)</span>
           <div style="display:flex;align-items:center;gap:6px;">
             <button id="btn-nd-use-suggested-ipts" type="button" style="display:none;padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(251,191,36,0.18);border:1px solid var(--accent-gold);color:var(--accent-gold);border-radius:4px;cursor:pointer;white-space:nowrap;"></button>
-            <button id="btn-nd-verify" type="button" style="padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(56,189,248,0.14);border:1px solid rgba(56,189,248,0.45);color:var(--accent-cyan);border-radius:4px;cursor:pointer;white-space:nowrap;">Check via NDIP</button>
+            <button id="btn-nd-verify" type="button" style="padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(56,189,248,0.14);border:1px solid rgba(56,189,248,0.45);color:var(--accent-cyan);border-radius:4px;cursor:pointer;white-space:nowrap;">Check via ONcat</button>
           </div>
         </div>
       </div>
