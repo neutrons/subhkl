@@ -4,6 +4,43 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.1]
+
+### Added
+
+- Calibrated TOPAZ detector geometry (`instruments/topaz_detector.json`, 24 panels)
+  and ISAW `.DetCal` converter script (`scripts/detcal_to_json.py`).
+- Per-peak angular and $d$-spacing error export in `metrics` (`--per-peak` written
+  to a separate HDF5 file, distinct `frame` and `panel` columns, `--bins`, and
+  default `metrics.csv` / `metrics.png` filenames for bare `--csv` / `--plot`).
+- Finder-free `solve --refinement band` integration test for multi-run mesolite.
+
+### Changed
+
+- `subhkl-nova-app` UI improvements:
+  - Side-by-side split view for the Wulff stereogram and detector assembly after
+    merge, with coupled reflection target reticles and parallax across both views.
+  - Window-independent detector panel aspect ratio, pre-warped offscreen panel
+    texture caching for smooth pan/zoom, and dynamic horizontal scaling of the top
+    and bottom bars.
+  - Per-step Play/Stop job cancellation, Galaxy scheduler `misc_info` error
+    reporting, blank-by-default Load Neutron Data dialog (with retired IMAGINE
+    image-plate entry removed), new `sUBhkl` logo/favicon, and dynamic version
+    and container tag resolution.
+
+### Fixed
+
+- Blind zone-pair orientation proposal in `solve` now includes primitive lattice
+  generators so centered cells ($F$, $I$, $C$, $R$) with long axes are not missed
+  by the conventional $|u|,|v|,|w| \le 4$ cap.
+- `FindUB.minimize` wraps DE Rodrigues vectors into the principal ball before
+  L-BFGS-B polish and uses a two-stage wide-to-tight Gaussian funnel for
+  long-axis cells.
+- Radial peak-profile width estimation filters outlier widths with a monotonic
+  $2\theta$ prior.
+- Indexer preserves `peaks/run_index` instead of overwriting it with
+  `peaks/image_index`.
+
 ## [1.5.0]
 
 ### Changed
