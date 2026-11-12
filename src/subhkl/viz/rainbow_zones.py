@@ -3494,6 +3494,18 @@ def render_rainbow_html(
     width: 100%;
     height: 100%;
     overflow: hidden;
+    display: flex;
+    flex-direction: row;
+    min-width: 0;
+    min-height: 0;
+  }}
+
+  .detector-pane {{
+    position: relative;
+    flex: 1 1 0;
+    min-width: 0;
+    height: 100%;
+    overflow: hidden;
   }}
 
   canvas {{
@@ -3507,7 +3519,7 @@ def render_rainbow_html(
     cursor: grabbing;
   }}
 
-  /* Floating / Expandable Stereogram Wulff Net HUD */
+  /* Floating Corner Inset or Side-by-Side Split Stereogram Wulff Net HUD */
   .stereo-inset {{
     position: absolute;
     bottom: 10px;
@@ -3523,25 +3535,33 @@ def render_rainbow_html(
     overflow: hidden;
     backdrop-filter: blur(8px);
     z-index: 35;
-    transition: opacity 0.18s ease, transform 0.18s ease, width 0.18s ease, height 0.18s ease;
+    transition: opacity 0.18s ease, width 0.18s ease, height 0.18s ease;
   }}
 
   .stereo-inset.expanded {{
-    width: min(80vw, 760px);
-    height: min(78vh, 700px);
-    left: 50%;
-    top: 50%;
+    position: relative;
+    left: auto;
+    top: auto;
     bottom: auto;
-    transform: translate(-50%, -50%);
-    border-color: var(--accent-cyan);
-    box-shadow: 0 22px 64px rgba(0, 0, 0, 0.88);
-    z-index: 75;
+    transform: none;
+    flex: 0 0 clamp(280px, 43%, 560px);
+    width: clamp(280px, 43%, 560px);
+    height: 100%;
+    border-radius: 0;
+    border: none;
+    border-left: 1px solid var(--accent-cyan);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.55);
+    z-index: 35;
   }}
 
   .stereo-inset.hidden {{
     opacity: 0;
     pointer-events: none;
     transform: scale(0.9);
+  }}
+
+  .stereo-inset.expanded.hidden {{
+    display: none;
   }}
 
   .stereo-inset-header {{
@@ -4030,26 +4050,28 @@ def render_rainbow_html(
         <span id="detector-header-title">DETECTOR ASSEMBLY — LOG(INTENSITY) + PARALLAX BRAGG RINGS</span>
         <span class="hint">Move mouse to peek behind predicted rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
       </div>
-      <div class="canvas-wrap">
-        <canvas id="canvas-detector"></canvas>
+      <div class="canvas-wrap" id="canvas-wrap">
+        <div class="detector-pane" id="detector-pane">
+          <canvas id="canvas-detector"></canvas>
 
-        <!-- Clear 3-Layer Depth Legend -->
-        <div class="layer-legend">
-          <div class="legend-item">
-            <span style="display:inline-block;width:10px;height:10px;background:#f97316;border-radius:2px;"></span>
-            <span>Back Layer: Detector Pixel Counts</span>
-          </div>
-          <div class="legend-item">
-            <span style="display:inline-block;width:14px;height:3px;background:#00e5ff;border-radius:2px;"></span>
-            <span>Mid Layer: Single-Arc Zone Conics [uvw]</span>
-          </div>
-          <div class="legend-item">
-            <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
-            <span>Front Layer: Predicted Bragg Rings (parallax peeks behind spots)</span>
+          <!-- Clear 3-Layer Depth Legend -->
+          <div class="layer-legend">
+            <div class="legend-item">
+              <span style="display:inline-block;width:10px;height:10px;background:#f97316;border-radius:2px;"></span>
+              <span>Back Layer: Detector Pixel Counts</span>
+            </div>
+            <div class="legend-item">
+              <span style="display:inline-block;width:14px;height:3px;background:#00e5ff;border-radius:2px;"></span>
+              <span>Mid Layer: Single-Arc Zone Conics [uvw]</span>
+            </div>
+            <div class="legend-item">
+              <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
+              <span>Front Layer: Predicted Bragg Rings (parallax peeks behind spots)</span>
+            </div>
           </div>
         </div>
 
-        <!-- Interactive Stereogram Wulff Net (Corner Inset or Expanded Popout) -->
+        <!-- Interactive Stereogram Wulff Net (Corner Inset or Side-by-Side Split View) -->
         <div class="stereo-inset hidden" id="stereo-inset">
           <div class="stereo-inset-header">
             <span id="stereo-title" style="color:var(--accent-cyan);font-weight:700;">WULFF NET</span>
@@ -4061,7 +4083,7 @@ def render_rainbow_html(
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
               </select>
-              <button id="btn-wulff-expand" title="Expand or dock the Wulff Net view">Expand</button>
+              <button id="btn-wulff-expand" title="Toggle between side-by-side Split View and docked Corner Inset">Split</button>
               <button id="btn-wulff-close" title="Hide Wulff Net">X</button>
             </div>
           </div>
@@ -4394,6 +4416,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     selectedZoneId: null,
     hoveredPeakId: null,
     selectedPeakId: null,
+    hoveredPeakObj: null,
+    selectedPeakObj: null,
     activeOrbitId: null,
     currentPipelineIdx: pipelineIdxForArtifactKind(DATA.artifact_kind), // 0: Reduce, 1: Solve, 2: Integrate, 3: Merge, 4: Done
     currentRungIdx: DATA.artifact_kind === "merged" ? 0 : Math.max(0, LADDER.length - 1),
@@ -4767,8 +4791,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       btnScope.classList.toggle("active-btn", isAll);
     }}
     if (btnExpand) {{
-      btnExpand.textContent = state.wulffExpanded ? "Dock" : "Expand";
+      btnExpand.textContent = state.wulffExpanded ? "Corner" : "Split";
       btnExpand.classList.toggle("active-btn", Boolean(state.wulffExpanded));
+    }}
+    if (typeof _cachedPlotBox !== "undefined") {{
+      _cachedPlotBox = null;
+      _cachedPlotBoxKey = "";
     }}
     if (selColor) {{
       Array.from(selColor.options).forEach(opt => {{
@@ -5038,6 +5066,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function isPeakVisible(p) {{
     return p.wavelength >= state.lamMin && p.wavelength <= state.lamMax;
+  }}
+
+  function isSameReflection(a, b) {{
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (Array.isArray(a.hkl) && Array.isArray(b.hkl) &&
+        a.hkl[0] === b.hkl[0] && a.hkl[1] === b.hkl[1] && a.hkl[2] === b.hkl[2]) {{
+      const ra = typeof a.run_index === "number" ? a.run_index : 0;
+      const rb = typeof b.run_index === "number" ? b.run_index : 0;
+      return ra === rb;
+    }}
+    return false;
+  }}
+
+  function isPeakHighlightedTarget(p) {{
+    const hov = state.hoveredPeakObj;
+    const sel = state.selectedPeakObj;
+    if (hov && isSameReflection(p, hov)) return true;
+    if (sel && isSameReflection(p, sel)) return true;
+    if (!hov && state.hoveredPeakId !== null && p.id === state.hoveredPeakId) return true;
+    if (!sel && state.selectedPeakId !== null && p.id === state.selectedPeakId) return true;
+    return false;
   }}
 
   function isPeakCapturedByActiveZone(p) {{
@@ -5787,7 +5837,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const [bx, by] = detToScreen(p.det_x + shiftAz, py, w, h, -0.35);
 
         const captured = isPeakCapturedByActiveZone(p);
-        const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
+        const isHovered = isPeakHighlightedTarget(p);
         const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
         if (!captured && !isHovered && !isOrbitMate && state.activeZones.size === 0) {{
           return;
@@ -6065,6 +6115,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     const wPeaks = getActiveWulffPeaks();
     const orbitMates = [];
+    const hoveredTargets = [];
 
     // Project all peaks in Sample frame and sort back-to-front by camera depth zCam so closer peaks render on top
     const projectedPeaks = wPeaks.map(p => {{
@@ -6079,14 +6130,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     projectedPeaks.forEach(({{ p, sx, sy, hemi, dotScale }}) => {{
       const captured = isPeakCapturedByActiveZone(p) || state.wulffScope === "all_runs";
-      const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
+      const isHovered = isPeakHighlightedTarget(p);
       const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
       if (isOrbitMate) orbitMates.push([sx, sy, p, dotScale]);
+      if (isHovered) hoveredTargets.push([sx, sy, p, dotScale, hemi]);
 
       const baseDot = (isExp ? (captured ? 3.8 : 2.6) : (captured ? 2.5 : 1.75)) * dotScale;
-      const rDot = isHovered ? baseDot + 2.5 : (isOrbitMate ? baseDot + 1.6 : baseDot);
+      const rDot = isHovered ? baseDot + 2.8 : (isOrbitMate ? baseDot + 1.6 : baseDot);
       const alphaBase = hemi >= 0 ? (captured ? 0.94 : 0.52) : (captured ? 0.55 : 0.28);
-      const col = isHovered ? "#fbbf24" : peakStrokeColor(p, alphaBase);
+      const col = isHovered ? "#f43f85" : peakStrokeColor(p, alphaBase);
 
       ctx.save();
       ctx.beginPath();
@@ -6150,6 +6202,38 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.fillStyle = "#00e5ff";
         ctx.fillText(`ASU Orbit [${{state.activeOrbitId}}] • ${{orbitMates.length}} symmetry mates`, 14, h - 12);
       }}
+      ctx.restore();
+    }}
+
+    // Coupled Hover Target Reticle: prominently highlight the exact peak hovered in Detector or Wulff view
+    if (hoveredTargets.length > 0) {{
+      ctx.save();
+      hoveredTargets.forEach(([tx, ty, tp]) => {{
+        const rRet = isExp ? 10.0 : 7.5;
+        ctx.beginPath();
+        ctx.arc(tx, ty, rRet, 0, Math.PI * 2);
+        ctx.strokeStyle = "#f43f85";
+        ctx.lineWidth = 2.2;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(tx - rRet - 4, ty); ctx.lineTo(tx - rRet + 2, ty);
+        ctx.moveTo(tx + rRet - 2, ty); ctx.lineTo(tx + rRet + 4, ty);
+        ctx.moveTo(tx, ty - rRet - 4); ctx.lineTo(tx, ty - rRet + 2);
+        ctx.moveTo(tx, ty + rRet - 2); ctx.lineTo(tx, ty + rRet + 4);
+        ctx.strokeStyle = "#fbbf24";
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+
+        if (!isExp && Array.isArray(tp.hkl)) {{
+          const lbl = `(${{tp.hkl.join(",")}})`;
+          ctx.font = "bold 9px monospace";
+          ctx.fillStyle = "#070913";
+          ctx.fillText(lbl, tx + 9, ty - 5);
+          ctx.fillStyle = "#fbbf24";
+          ctx.fillText(lbl, tx + 8, ty - 6);
+        }}
+      }});
       ctx.restore();
     }}
 
@@ -6224,8 +6308,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     const hit = findNearestPeakDetector(mx, my);
     const nextHoverId = hit ? hit.id : null;
-    const hoverChanged = nextHoverId !== state.hoveredPeakId;
+    const hoverChanged = hit !== state.hoveredPeakObj;
     state.hoveredPeakId = nextHoverId;
+    state.hoveredPeakObj = hit || null;
     if (hit) {{
       state.activeOrbitId = hit.asu_orbit_id || null;
       if (hoverChanged) updatePeakInspector(hit);
@@ -6238,6 +6323,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.targetParallaxX = 0.0;
     state.targetParallaxY = 0.0;
     state.hoveredPeakId = null;
+    state.hoveredPeakObj = null;
     if (state.selectedPeakId === null) state.activeOrbitId = null;
   }});
 
@@ -6255,10 +6341,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const hit = findNearestPeakDetector(ev.clientX - rect.left, ev.clientY - rect.top);
     if (hit) {{
       state.selectedPeakId = hit.id;
+      state.selectedPeakObj = hit;
       state.activeOrbitId = hit.asu_orbit_id || null;
       updatePeakInspector(hit);
     }} else {{
       state.selectedPeakId = null;
+      state.selectedPeakObj = null;
       state.activeOrbitId = null;
     }}
   }});
@@ -6275,6 +6363,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const rect = stereoCanvas.getBoundingClientRect();
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
+      state.targetParallaxX = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
+      state.targetParallaxY = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
       if (isDraggingWulff) {{
         const dx = ev.clientX - wulffDragStart[0];
         const dy = ev.clientY - wulffDragStart[1];
@@ -6286,17 +6376,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         return;
       }}
       const hit = findNearestPeakWulff(mx, my);
+      const hoverChanged = hit !== state.hoveredPeakObj;
+      state.hoveredPeakId = hit ? hit.id : null;
+      state.hoveredPeakObj = hit || null;
       if (hit) {{
-        state.hoveredPeakId = hit.id;
         state.activeOrbitId = hit.asu_orbit_id || null;
-        updatePeakInspector(hit);
-      }} else {{
-        state.hoveredPeakId = null;
-        if (state.selectedPeakId === null) state.activeOrbitId = null;
+        if (hoverChanged) updatePeakInspector(hit);
+      }} else if (state.selectedPeakId === null) {{
+        state.activeOrbitId = null;
       }}
     }});
     stereoCanvas.addEventListener("mouseleave", () => {{
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
       state.hoveredPeakId = null;
+      state.hoveredPeakObj = null;
       if (state.selectedPeakId === null) state.activeOrbitId = null;
     }});
     stereoCanvas.addEventListener("wheel", (ev) => {{
@@ -6312,6 +6406,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const hit = findNearestPeakWulff(ev.clientX - rect.left, ev.clientY - rect.top);
       if (hit) {{
         state.selectedPeakId = hit.id;
+        state.selectedPeakObj = hit;
         state.activeOrbitId = hit.asu_orbit_id || null;
         updatePeakInspector(hit);
       }}
@@ -6377,7 +6472,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     btnWulffScope.addEventListener("click", () => {{
       state.wulffScope = state.wulffScope === "all_runs" ? "single_frame" : "all_runs";
       const detRect = detCanvas.getBoundingClientRect();
-      const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
+      const span360 = getDetectorPlotBox(detRect.width, detRect.height).plotW * state.detZoom;
       state.wulffYawDeg = -(state.detPanX / Math.max(1, span360)) * 360.0;
       syncWulffUI();
     }});
@@ -6421,6 +6516,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.wulffPitchDeg = 0.0;
     state.wulffZoom = 1.0;
     state.selectedPeakId = null;
+    state.selectedPeakObj = null;
+    state.hoveredPeakId = null;
+    state.hoveredPeakObj = null;
     state.activeOrbitId = null;
     setMaxZoneOrder(1);
   }});

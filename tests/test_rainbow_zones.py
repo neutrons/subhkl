@@ -530,6 +530,9 @@ def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     assert "fitHorizontalBars" in html
     assert "getDetectorDataAspect" in html
     assert "getDetectorPlotBox" in html
+    assert "getWarpedPanelCanvas" in html
+    assert 'id="detector-pane"' in html
+    assert "isPeakHighlightedTarget" in html
     assert "Compl. vs d" in html
     assert "⟨I/σ⟩ vs d" in html
     assert len(payload["merge_metrics"]["cc_half_bins"]) == 10
