@@ -7988,7 +7988,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (filtered.length === 0) {{
       const empty = document.createElement("div");
       empty.style.cssText = "padding:8px;color:var(--text-dim);font-size:0.64rem;";
-      empty.textContent = ndOncatCatalog.loading ? "Loading runs & titles from ONCat…" : "No matching runs in this IPTS";
+      empty.textContent = ndOncatCatalog.loading
+        ? "Loading runs & titles from ONCat…"
+        : (!curIpts ? "Select an IPTS project on the left to list runs" : "No matching runs in this IPTS");
       listEl.appendChild(empty);
       return;
     }}

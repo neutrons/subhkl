@@ -1316,6 +1316,35 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         export_rainbow_widget(p_live, output_html=out_ep_html)
         html_ep = out_ep_html.read_text()
         assert '<base href="/interactivetool/ep/test/subhkl/" />' in html_ep
+
+        import asyncio
+
+        from aiohttp.test_utils import make_mocked_request
+
+        from subhkl.viz.nova_app.views.main_view import MainApp
+
+        app_inst = object.__new__(MainApp)
+        app_inst.pipeline_runner = MagicMock()
+        app_inst.pipeline_runner.browse_oncat_catalog.return_value = {
+            "ok": True,
+            "ipts": "34720",
+            "experiments": [],
+            "runs": [{"run": 12737}],
+        }
+        from aiohttp import web
+
+        aio_app = web.Application()
+        app_inst._bind_routes(SimpleNamespace(app=aio_app))
+        req = make_mocked_request(
+            "GET",
+            "/interactivetool/ep/test/subhkl/api/pipeline/oncat_catalog?facility=SNS&instrument=MANDI&ipts=34720",
+            app=aio_app,
+        )
+        resp = asyncio.run(aio_app._handle(req))
+        assert resp.status == 200
+        app_inst.pipeline_runner.browse_oncat_catalog.assert_called_once_with(
+            {"facility": "SNS", "instrument": "MANDI", "ipts": "34720"}
+        )
     finally:
         if old_ep is None:
             os.environ.pop("EP_PATH", None)

@@ -460,7 +460,9 @@ class MainApp:
                 ep_parent = os.path.dirname(ep_path)
                 if req_path == ep_path or req_path == ep_path + "/":
                     request = request.clone(
-                        rel_url=request.rel_url.with_path("/index.html")
+                        rel_url=request.rel_url.with_path(
+                            "/index.html", keep_query=True, keep_fragment=True
+                        )
                     )
                     served_index = True
                 elif req_path.startswith(ep_path + "/"):
@@ -470,15 +472,25 @@ class MainApp:
                         served_index = True
                     elif sub_path == "/index.html":
                         served_index = True
-                    request = request.clone(rel_url=request.rel_url.with_path(sub_path))
+                    request = request.clone(
+                        rel_url=request.rel_url.with_path(
+                            sub_path, keep_query=True, keep_fragment=True
+                        )
+                    )
                 elif ep_parent not in ("", "/") and req_path.startswith(
                     ep_parent + "/"
                 ):
                     sub_path = req_path[len(ep_parent) :] or "/"
-                    request = request.clone(rel_url=request.rel_url.with_path(sub_path))
+                    request = request.clone(
+                        rel_url=request.rel_url.with_path(
+                            sub_path, keep_query=True, keep_fragment=True
+                        )
+                    )
             elif req_path in ("/", "/index.html"):
                 request = request.clone(
-                    rel_url=request.rel_url.with_path("/index.html")
+                    rel_url=request.rel_url.with_path(
+                        "/index.html", keep_query=True, keep_fragment=True
+                    )
                 )
                 served_index = True
 
