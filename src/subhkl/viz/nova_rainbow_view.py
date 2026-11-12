@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import UTC
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
@@ -688,8 +689,34 @@ class NovaGalaxyPipelineRunner:
                 return body
             return json.loads(body.decode("utf-8"))
 
+    def touch_dataset(self, ds_id: str | None) -> None:
+        """Record that a Galaxy dataset ID was just accessed, created, or linked."""
+        if not ds_id:
+            return
+        touch_map: dict[str, float] = getattr(self, "_dataset_touch_times", {})
+        touch_map[str(ds_id)] = time.time()
+        self._dataset_touch_times = touch_map
+
+    @staticmethod
+    def _parse_galaxy_timestamp(ts_str: str | None) -> float:
+        if not ts_str:
+            return 0.0
+        s = str(ts_str).strip()
+        if not s:
+            return 0.0
+        with contextlib.suppress(ValueError, TypeError):
+            from datetime import datetime
+
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            return float(dt.timestamp())
+        return 0.0
+
     def list_history_datasets(self) -> list[dict[str, Any]]:
-        """Return active HDF5/MTZ datasets in the current Galaxy history."""
+        """Return active datasets in the current Galaxy history, sorted most-recently-touched first."""
         if not self.is_connected:
             return []
         if not self.history_id:
@@ -703,19 +730,38 @@ class NovaGalaxyPipelineRunner:
             )
             if not isinstance(items, list):
                 return []
-            return [
-                {
-                    "id": it.get("id"),
-                    "hid": it.get("hid"),
-                    "name": it.get("name"),
-                    "state": it.get("state"),
-                    "extension": it.get("extension"),
-                }
-                for it in items
-                if isinstance(it, dict)
-                and it.get("history_content_type") == "dataset"
-                and not it.get("deleted")
-            ]
+            touch_map: dict[str, float] = getattr(self, "_dataset_touch_times", {})
+            out: list[dict[str, Any]] = []
+            for it in items:
+                if (
+                    not isinstance(it, dict)
+                    or it.get("history_content_type") != "dataset"
+                    or it.get("deleted")
+                ):
+                    continue
+                ds_id = str(it.get("id") or "")
+                ut_str = str(it.get("update_time") or it.get("create_time") or "")
+                ut_epoch = self._parse_galaxy_timestamp(ut_str)
+                touched_at = max(ut_epoch, float(touch_map.get(ds_id, 0.0)))
+                out.append(
+                    {
+                        "id": it.get("id"),
+                        "hid": it.get("hid"),
+                        "name": it.get("name"),
+                        "state": it.get("state"),
+                        "extension": it.get("extension"),
+                        "update_time": ut_str,
+                        "touched_at": round(touched_at, 3),
+                    }
+                )
+            out.sort(
+                key=lambda d: (
+                    float(d.get("touched_at") or 0.0),
+                    int(d.get("hid") or 0),
+                ),
+                reverse=True,
+            )
+            return out
         except _NOVA_RECOVERABLE_ERRORS:
             return []
 
@@ -729,12 +775,20 @@ class NovaGalaxyPipelineRunner:
         if not isinstance(info, dict):
             raise TypeError(f"Dataset {ds_id} not found on {self.galaxy_url}")
         name = str(info.get("name") or f"{ds_id}.h5")
+        state = str(info.get("state") or "ok")
+        if state != "ok":
+            hid = info.get("hid")
+            lbl = f"#{hid} '{name}'" if hid else f"'{name}'"
+            raise ValueError(
+                f"Cannot ingest Galaxy dataset {lbl}: dataset state is '{state}' (must be 'ok')."
+            )
         known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
 
         def _remember(path: str) -> str:
             known_map[os.path.abspath(path)] = ds_id
             known_map[os.path.realpath(path)] = ds_id
             self._dataset_id_by_path = known_map
+            self.touch_dataset(ds_id)
             return path
 
         file_name = str(info.get("file_name") or "")
@@ -863,7 +917,7 @@ class NovaGalaxyPipelineRunner:
             raw_name = str(ds.get("name") or "")
             base_name = os.path.basename(raw_name)
             st = self._classify_artifact_stage(base_name)
-            if not st:
+            if not st or base_name in stages[st]:
                 continue
             stages[st][base_name] = {
                 "name": base_name,
@@ -915,7 +969,7 @@ class NovaGalaxyPipelineRunner:
 
         ds_id = dataset_id.strip()
         if not ds_id and clean_name:
-            for ds in reversed(self.list_history_datasets()):
+            for ds in self.list_history_datasets():
                 if (
                     ds.get("state") == "ok"
                     and os.path.basename(str(ds.get("name") or "")) == clean_name
@@ -1634,6 +1688,7 @@ class NovaGalaxyPipelineRunner:
                         ):
                             known_map[os.path.abspath(local_path)] = known_id
                             self._dataset_id_by_path = known_map
+                            self.touch_dataset(known_id)
                             job_record["stdout"] += (
                                 f"[nova -> galaxy] Linked cached dataset '{fname}' (id={known_id}, state=ok)\n"
                             )
@@ -1710,6 +1765,7 @@ class NovaGalaxyPipelineRunner:
                             continue
                         known_map[os.path.abspath(local_path)] = ds_id
                         self._dataset_id_by_path = known_map
+                        self.touch_dataset(ds_id)
                         job_record["stdout"] += (
                             f"[nova -> galaxy] Linked existing dataset '{info.get('name') or sname}' (id={ds_id}, state=ok)\n"
                         )
@@ -4769,6 +4825,7 @@ class NovaGalaxyPipelineRunner:
                                         )
 
                                 if final_step and tmp_path and os.path.isfile(tmp_path):
+                                    self.touch_dataset(ds_id)
                                     known_map = getattr(self, "_dataset_id_by_path", {})
                                     known_map[os.path.abspath(tmp_path)] = ds_id
                                     if (
@@ -5150,7 +5207,12 @@ def serve_rainbow_zones(
                                 vm.reload(frame_index=f_idx)
                             reloaded = True
                 if qs.get("dataset_id"):
-                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                    try:
+                        from subhkl.viz.rainbow_zones import (
+                            _discover_images_h5,
+                            validate_subhkl_ingestible_dataset,
+                        )
+
                         ds_id = str(qs["dataset_id"][0]).strip()
                         fb_dir = (
                             os.path.dirname(os.path.abspath(vm.replay_h5))
@@ -5162,6 +5224,26 @@ def serve_rainbow_zones(
                                 ds_id, fallback_dir=fb_dir
                             )
                         )
+                        ingest_kind = validate_subhkl_ingestible_dataset(
+                            local_h5, ds_info
+                        )
+                        if ingest_kind == "raw_nexus":
+                            raw_body = json.dumps(
+                                {
+                                    "status": "raw_nexus",
+                                    "dataset_id": ds_id,
+                                    "name": ds_info.get("name")
+                                    or os.path.basename(local_h5),
+                                }
+                            ).encode("utf-8")
+                            self.send_response(200)
+                            self.send_header(
+                                "Content-Type", "application/json; charset=utf-8"
+                            )
+                            self.send_header("Content-Length", str(len(raw_body)))
+                            self.end_headers()
+                            self.wfile.write(raw_body)
+                            return
                         ds_name = str(
                             ds_info.get("name") or os.path.basename(local_h5)
                         ).lower()
@@ -5175,8 +5257,6 @@ def serve_rainbow_zones(
                             vm.replay_h5 = local_h5
                             vm.reload(images_h5=local_h5, frame_index=f_idx)
                         else:
-                            from subhkl.viz.rainbow_zones import _discover_images_h5
-
                             disc_img = _discover_images_h5(local_h5)
                             vm.payload_kwargs["images_h5"] = (
                                 str(disc_img) if disc_img else None
@@ -5187,6 +5267,18 @@ def serve_rainbow_zones(
                                 frame_index=f_idx,
                             )
                         reloaded = True
+                    except _NOVA_RECOVERABLE_ERRORS as exc:
+                        err_body = json.dumps(
+                            {"status": "error", "error": str(exc)}
+                        ).encode("utf-8")
+                        self.send_response(400)
+                        self.send_header(
+                            "Content-Type", "application/json; charset=utf-8"
+                        )
+                        self.send_header("Content-Length", str(len(err_body)))
+                        self.end_headers()
+                        self.wfile.write(err_body)
+                        return
                 if f_idx is not None and not reloaded:
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         vm.reload(frame_index=f_idx)

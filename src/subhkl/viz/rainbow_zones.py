@@ -524,6 +524,61 @@ def _encode_panel_textures(
     return panels_payload, intensity_source
 
 
+def validate_subhkl_ingestible_dataset(
+    local_path: str | os.PathLike,
+    ds_info: dict[str, Any] | None = None,
+) -> str:
+    """Validate that a local file or Galaxy dataset can be ingested by SubHKL.
+
+    Returns ``"subhkl_h5"`` for reduced/indexed/predicted/integrated SubHKL HDF5 files
+    or ``"raw_nexus"`` for raw NeXus files (``/entry``). Raises ``ValueError`` with an
+    explanatory message if the dataset cannot be ingested.
+    """
+    info = ds_info or {}
+    ds_name = str(info.get("name") or os.path.basename(str(local_path)))
+    ds_hid = info.get("hid")
+    ds_label = f"#{ds_hid} '{ds_name}'" if ds_hid else f"'{ds_name}'"
+    state = str(info.get("state") or "ok")
+    ext = str(
+        info.get("extension") or os.path.splitext(ds_name)[1].lstrip(".") or "unknown"
+    )
+    if state != "ok":
+        raise ValueError(
+            f"Cannot ingest Galaxy dataset {ds_label}: dataset state is '{state}' (must be 'ok')."
+        )
+    p = Path(local_path)
+    if not p.is_file() or p.stat().st_size <= 0:
+        raise ValueError(
+            f"Cannot ingest Galaxy dataset {ds_label}: dataset file is empty or missing."
+        )
+    try:
+        with h5py.File(p, "r") as f:
+            if any(
+                k in f
+                for k in (
+                    "images",
+                    "peaks",
+                    "banks",
+                    "hkl",
+                    "sample",
+                    "search",
+                    "scan_refinement",
+                )
+            ):
+                return "subhkl_h5"
+            if "entry" in f or ds_name.lower().endswith((".nxs", ".nxs.h5")):
+                return "raw_nexus"
+            top_keys = ", ".join(list(f.keys())[:6]) or "none"
+            raise ValueError(
+                f"Cannot ingest Galaxy dataset {ds_label}: HDF5 file does not contain SubHKL diffraction data "
+                f"(images/peaks/hkl) or raw NeXus (/entry) data (found keys: {top_keys})."
+            )
+    except OSError as exc:
+        raise ValueError(
+            f"Cannot ingest Galaxy dataset {ds_label} (format '{ext}'): not a valid HDF5 or NeXus file."
+        ) from exc
+
+
 def _extract_from_h5(
     h5_path: str | os.PathLike,
     images_h5: str | os.PathLike | None = None,
@@ -4389,6 +4444,42 @@ def render_rainbow_html(
     </div>
   </div>
 
+  <!-- Modal Dialog: Select Any Dataset From Galaxy History -->
+  <div id="modal-galaxy-dataset" style="display:none;position:fixed;inset:0;z-index:9000;background:rgba(4,6,14,0.82);backdrop-filter:blur(4px);align-items:center;justify-content:center;">
+    <div style="width:min(680px,95vw);max-height:90vh;overflow-y:auto;background:var(--bg-panel);border:1px solid var(--accent-cyan);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,0.75);padding:12px 15px;color:var(--text-main);font-size:0.76rem;">
+      <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-color);padding-bottom:7px;margin-bottom:8px;">
+        <div>
+          <strong style="font-family:var(--font-display);font-size:0.86rem;color:var(--accent-cyan);">SELECT DATASET FROM GALAXY</strong>
+          <div style="font-size:0.65rem;color:var(--text-dim);margin-top:2px;">
+            Ordered by most recently touched first. Select any Galaxy dataset (SubHKL <code>.h5</code> or raw NeXus <code>.nxs.h5</code>; unsupported datasets report an error).
+          </div>
+        </div>
+        <button id="btn-gx-ds-close" style="padding:2px 8px;font-size:0.72rem;">X</button>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+        <input id="gx-ds-filter" type="text" placeholder="Filter by #hid, filename, extension, or state..." style="flex:1;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:5px 8px;font-family:var(--font-display);font-size:0.72rem;" />
+        <button id="btn-gx-ds-refresh" type="button" style="padding:4px 10px;font-size:0.68rem;font-family:var(--font-display);">Refresh</button>
+      </div>
+
+      <div id="gx-ds-list" style="height:280px;overflow-y:auto;border:1px solid var(--border-color);border-radius:6px;background:#070913;display:flex;flex-direction:column;gap:2px;padding:4px;margin-bottom:8px;">
+        <div style="padding:10px;color:var(--text-dim);font-size:0.68rem;">No Galaxy datasets loaded yet.</div>
+      </div>
+
+      <div id="gx-ds-error" style="display:none;margin-bottom:8px;padding:6px 10px;border-radius:5px;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.5);color:#f87171;font-family:var(--font-display);font-size:0.68rem;"></div>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+        <span id="gx-ds-count" style="font-family:var(--font-display);font-size:0.64rem;color:var(--text-dim);">0 datasets</span>
+        <div style="display:flex;gap:8px;">
+          <button id="btn-gx-ds-cancel" type="button" style="padding:5px 12px;font-size:0.72rem;">Cancel</button>
+          <button id="btn-gx-ds-submit" type="button" class="active-btn" style="padding:5px 14px;font-size:0.72rem;font-family:var(--font-display);font-weight:700;">
+            Open Selected Dataset
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
 <script>
 window.RAINBOW_ZONES_DATA = {payload_json};
 
@@ -7617,8 +7708,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (!bname) return;
       if (classifyArtifactStageClient(bname) !== stageId) return;
       const cur = byName.get(bname) || {{ name: bname, stage_id: stageId }};
-      if (ds.id) cur.dataset_id = ds.id;
-      if (ds.hid) cur.hid = ds.hid;
+      if (ds.id && !cur.dataset_id) cur.dataset_id = ds.id;
+      if (ds.hid && !cur.hid) cur.hid = ds.hid;
       byName.set(bname, cur);
     }});
 
@@ -7672,16 +7763,50 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const btnLocalH5 = document.getElementById("btn-local-h5");
   const inpLocalH5 = document.getElementById("inp-local-h5");
 
+  const MAX_RECENT_HISTORY_ITEMS = 10;
+  galaxyBridge.touchedTimes = galaxyBridge.touchedTimes || {{}};
+
+  function getDatasetTouchScore(d) {{
+    if (!d) return 0;
+    const clientTouch = Number((galaxyBridge.touchedTimes && galaxyBridge.touchedTimes[d.id]) || 0);
+    const srvTouch = Number(d.touched_at || 0);
+    const utMs = d.update_time ? Date.parse(String(d.update_time).endsWith("Z") ? d.update_time : `${{d.update_time}}Z`) : 0;
+    const utSec = Number.isFinite(utMs) && utMs > 0 ? utMs / 1000.0 : 0;
+    return Math.max(clientTouch, srvTouch, utSec);
+  }}
+
+  function sortDatasetsMostRecentFirst(list) {{
+    return [...(list || [])].sort((a, b) => {{
+      const ta = getDatasetTouchScore(a);
+      const tb = getDatasetTouchScore(b);
+      if (Math.abs(tb - ta) > 1e-3) return tb - ta;
+      return (Number(b && b.hid) || 0) - (Number(a && a.hid) || 0);
+    }});
+  }}
+
+  function markDatasetTouchedClient(dsId) {{
+    if (!dsId) return;
+    galaxyBridge.touchedTimes = galaxyBridge.touchedTimes || {{}};
+    galaxyBridge.touchedTimes[dsId] = Date.now() / 1000.0;
+    populateGalaxyH5Selector();
+  }}
+
   function populateGalaxyH5Selector() {{
     if (!selGalaxyH5) return;
-    const h5s = (galaxyBridge.datasets || []).filter(
-      d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
+    const prevVal = selGalaxyH5.value;
+    const allSorted = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []);
+    const h5s = allSorted.filter(
+      d =>
+        d.state === "ok" &&
+        !/^dataset_[0-9a-f-]+\\.dat$/i.test(String(d.name || "")) &&
+        (d.extension === "h5" || d.extension === "hdf5" || /\\.(nxs\\.)?h5$/i.test(String(d.name || "")))
     );
+    const recentH5s = h5s.slice(0, MAX_RECENT_HISTORY_ITEMS);
     selGalaxyH5.innerHTML = "";
     const optHeader = document.createElement("option");
     optHeader.value = "";
     optHeader.textContent = h5s.length > 0
-      ? `Data Source (${{h5s.length}} in History)...`
+      ? `Data Source (${{recentH5s.length}}${{h5s.length > recentH5s.length ? "/" + h5s.length : ""}} recent)...`
       : "Data Source...";
     selGalaxyH5.appendChild(optHeader);
 
@@ -7692,22 +7817,32 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     optNeutron.textContent = "Neutron data (SNS / HFIR)...";
     grpIngest.appendChild(optNeutron);
 
+    const optFromGalaxy = document.createElement("option");
+    optFromGalaxy.value = "__action_galaxy_dataset__";
+    optFromGalaxy.textContent = "From Galaxy...";
+    grpIngest.appendChild(optFromGalaxy);
+
     const optLocal = document.createElement("option");
     optLocal.value = "__action_local_file__";
     optLocal.textContent = "From local computer...";
     grpIngest.appendChild(optLocal);
     selGalaxyH5.appendChild(grpIngest);
 
-    if (h5s.length > 0) {{
+    if (recentH5s.length > 0) {{
       const grpHist = document.createElement("optgroup");
-      grpHist.label = "Galaxy History (.h5)";
-      h5s.forEach(d => {{
+      grpHist.label = h5s.length > MAX_RECENT_HISTORY_ITEMS
+        ? `Galaxy History (Recent ${{recentH5s.length}} of ${{h5s.length}})`
+        : `Galaxy History (Recent ${{recentH5s.length}})`;
+      recentH5s.forEach(d => {{
         const opt = document.createElement("option");
         opt.value = d.id;
         opt.textContent = `#${{d.hid || ""}} ${{d.name}}`;
         grpHist.appendChild(opt);
       }});
       selGalaxyH5.appendChild(grpHist);
+    }}
+    if (prevVal && !prevVal.startsWith("__action_") && recentH5s.some(d => d.id === prevVal)) {{
+      selGalaxyH5.value = prevVal;
     }}
     if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
@@ -8562,12 +8697,140 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }}
 
-  async function loadFromGalaxyDatasetId(dsId) {{
+  const modalGalaxyDataset = document.getElementById("modal-galaxy-dataset");
+  const btnGxDsClose = document.getElementById("btn-gx-ds-close");
+  const btnGxDsCancel = document.getElementById("btn-gx-ds-cancel");
+  const btnGxDsSubmit = document.getElementById("btn-gx-ds-submit");
+  const btnGxDsRefresh = document.getElementById("btn-gx-ds-refresh");
+  const inpGxDsFilter = document.getElementById("gx-ds-filter");
+  const elGxDsList = document.getElementById("gx-ds-list");
+  const elGxDsError = document.getElementById("gx-ds-error");
+  const elGxDsCount = document.getElementById("gx-ds-count");
+  let selectedGalaxyModalDsId = "";
+
+  function showGalaxyModalError(msg) {{
+    if (!elGxDsError) return;
+    if (!msg) {{
+      elGxDsError.style.display = "none";
+      elGxDsError.textContent = "";
+    }} else {{
+      elGxDsError.style.display = "block";
+      elGxDsError.textContent = msg;
+    }}
+  }}
+
+  function closeGalaxyDatasetModal() {{
+    if (modalGalaxyDataset) modalGalaxyDataset.style.display = "none";
+    showGalaxyModalError("");
+  }}
+
+  function renderGalaxyDatasetModalList() {{
+    if (!elGxDsList) return;
+    const q = String((inpGxDsFilter && inpGxDsFilter.value) || "").trim().toLowerCase();
+    const allSorted = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []);
+    const filtered = allSorted.filter(d => {{
+      if (!q) return true;
+      const hay = `#${{d.hid || ""}} ${{d.name || ""}} ${{d.extension || ""}} ${{d.state || ""}}`.toLowerCase();
+      return hay.includes(q);
+    }});
+    if (elGxDsCount) {{
+      elGxDsCount.textContent = `${{filtered.length}} of ${{allSorted.length}} dataset${{allSorted.length === 1 ? "" : "s"}} (most recently touched first)`;
+    }}
+    elGxDsList.innerHTML = "";
+    if (filtered.length === 0) {{
+      const emptyDiv = document.createElement("div");
+      emptyDiv.style.cssText = "padding:10px;color:var(--text-dim);font-size:0.68rem;";
+      emptyDiv.textContent = allSorted.length === 0
+        ? "No Galaxy history datasets found."
+        : "No datasets match the current filter.";
+      elGxDsList.appendChild(emptyDiv);
+      return;
+    }}
+    if (!selectedGalaxyModalDsId || !filtered.some(d => d.id === selectedGalaxyModalDsId)) {{
+      selectedGalaxyModalDsId = filtered[0].id;
+    }}
+    filtered.forEach(d => {{
+      const row = document.createElement("div");
+      const isSel = d.id === selectedGalaxyModalDsId;
+      const st = String(d.state || "ok");
+      const stColor = st === "ok" ? "#34d399" : (st === "running" || st === "queued" ? "#fbbf24" : "#f87171");
+      const ext = String(d.extension || "data");
+      row.style.cssText = `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:4px;cursor:pointer;font-family:var(--font-display);font-size:0.68rem;border:1px solid ${{isSel ? "var(--accent-cyan)" : "rgba(255,255,255,0.05)"}};background:${{isSel ? "rgba(56,189,248,0.16)" : "rgba(255,255,255,0.02)"}};`;
+      const leftSpan = document.createElement("span");
+      leftSpan.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-main);";
+      leftSpan.textContent = `#${{d.hid || "?"}} ${{d.name || d.id}}`;
+      const rightSpan = document.createElement("span");
+      rightSpan.style.cssText = "display:flex;align-items:center;gap:6px;flex-shrink:0;font-size:0.6rem;";
+      const extBadge = document.createElement("span");
+      extBadge.style.cssText = "padding:1px 5px;border-radius:3px;background:rgba(255,255,255,0.07);color:var(--text-dim);";
+      extBadge.textContent = ext;
+      const stBadge = document.createElement("span");
+      stBadge.style.cssText = `padding:1px 5px;border-radius:3px;border:1px solid ${{stColor}};color:${{stColor}};`;
+      stBadge.textContent = st;
+      rightSpan.appendChild(extBadge);
+      rightSpan.appendChild(stBadge);
+      row.appendChild(leftSpan);
+      row.appendChild(rightSpan);
+      row.addEventListener("click", () => {{
+        selectedGalaxyModalDsId = d.id;
+        showGalaxyModalError("");
+        renderGalaxyDatasetModalList();
+      }});
+      row.addEventListener("dblclick", () => {{
+        selectedGalaxyModalDsId = d.id;
+        loadFromGalaxyDatasetId(d.id, {{ fromModal: true }});
+      }});
+      elGxDsList.appendChild(row);
+    }});
+  }}
+
+  async function openGalaxyDatasetModal() {{
+    if (!modalGalaxyDataset) return;
+    showGalaxyModalError("");
+    modalGalaxyDataset.style.display = "flex";
+    renderGalaxyDatasetModalList();
+    if (inpGxDsFilter) inpGxDsFilter.focus();
+    await probeGalaxyConnection();
+    renderGalaxyDatasetModalList();
+  }}
+
+  if (btnGxDsClose) btnGxDsClose.addEventListener("click", closeGalaxyDatasetModal);
+  if (btnGxDsCancel) btnGxDsCancel.addEventListener("click", closeGalaxyDatasetModal);
+  if (inpGxDsFilter) inpGxDsFilter.addEventListener("input", renderGalaxyDatasetModalList);
+  if (btnGxDsRefresh) {{
+    btnGxDsRefresh.addEventListener("click", async () => {{
+      showGalaxyModalError("");
+      await probeGalaxyConnection();
+      renderGalaxyDatasetModalList();
+    }});
+  }}
+  if (btnGxDsSubmit) {{
+    btnGxDsSubmit.addEventListener("click", () => {{
+      if (!selectedGalaxyModalDsId) {{
+        showGalaxyModalError("Select a Galaxy dataset first.");
+        return;
+      }}
+      loadFromGalaxyDatasetId(selectedGalaxyModalDsId, {{ fromModal: true }});
+    }});
+  }}
+
+  async function loadFromGalaxyDatasetId(dsId, opts) {{
     if (!dsId) return;
+    const fromModal = Boolean(opts && opts.fromModal);
     const dsMeta = (galaxyBridge.datasets || []).find(d => d.id === dsId);
     const dsName = (dsMeta && dsMeta.name) ? String(dsMeta.name) : "";
+    const dsHid = (dsMeta && dsMeta.hid) ? `#${{dsMeta.hid}} ` : "";
+    const dsState = (dsMeta && dsMeta.state) ? String(dsMeta.state) : "ok";
+    if (dsState !== "ok") {{
+      const stErr = `Cannot ingest Galaxy dataset ${{dsHid}}'${{dsName || dsId}}': dataset state is '${{dsState}}' (must be 'ok').`;
+      if (fromModal) showGalaxyModalError(stErr);
+      setStatusLine("[GALAXY ERROR]", `<span style="color:#f87171;">${{stErr}}</span>`);
+      return;
+    }}
     // If a raw NeXus file in Galaxy History is selected, automatically trigger Step 1 (Reduce + Merge Images)
     if (/\\.nxs(\\.h5)?$/i.test(dsName)) {{
+      markDatasetTouchedClient(dsId);
+      if (fromModal) closeGalaxyDatasetModal();
       setStatusLine(
         "[AUTO-REDUCE]",
         `Raw NeXus dataset <strong>${{dsName}}</strong> selected — triggering <strong>Step 1 (Reduce + Merge Images)</strong>...`
@@ -8579,9 +8842,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
       return;
     }}
-    setStatusLine("[GALAXY HDF5]", `Loading dataset <strong>${{dsName || dsId}}</strong> from NDIP / Galaxy History...`);
+    setStatusLine("[GALAXY HDF5]", `Loading dataset <strong>${{dsHid}}${{dsName || dsId}}</strong> from NDIP / Galaxy History...`);
     try {{
       // 1. Prefer server-side HDF5 extraction via NOVA/HTTP backend (handles merged.h5, solve.h5, predictor.h5, integrated.h5 with ellipses & multi-frame)
+      let serverResponded = false;
       try {{
         state.selectedFrameIndex = 0;
         DATA.frame_index = 0;
@@ -8589,23 +8853,50 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           cache: "no-store",
           credentials: "same-origin",
         }});
-        if (rServer.ok) {{
-          const serverPayload = await rServer.json();
-          if (serverPayload && (Array.isArray(serverPayload.peaks) || Array.isArray(serverPayload.panels))) {{
-            recomputeBoundsAndReload(serverPayload);
-            return;
-          }}
+        serverResponded = true;
+        if (!rServer.ok) {{
+          let errMsg = `HTTP ${{rServer.status}} loading dataset ${{dsHid}}${{dsName || dsId}}`;
+          try {{
+            const errDoc = await rServer.json();
+            if (errDoc && errDoc.error) errMsg = String(errDoc.error);
+          }} catch (_je) {{}}
+          throw new Error(errMsg);
         }}
-      }} catch (_srvErr) {{
-        // Fall through to client-side h5wasm fetch
+        const serverPayload = await rServer.json();
+        if (serverPayload && serverPayload.status === "error") {{
+          throw new Error(String(serverPayload.error || "Dataset cannot be ingested."));
+        }}
+        if (serverPayload && serverPayload.status === "raw_nexus") {{
+          markDatasetTouchedClient(dsId);
+          if (fromModal) closeGalaxyDatasetModal();
+          setStatusLine(
+            "[AUTO-REDUCE]",
+            `Raw NeXus dataset <strong>${{serverPayload.name || dsName || dsId}}</strong> selected — triggering <strong>Step 1 (Reduce + Merge Images)</strong>...`
+          );
+          selectPipelineStage(0, true);
+          await executeWorkflowStage(0, {{
+            ingest_mode: "galaxy_dataset",
+            galaxy_dataset_id: dsId,
+          }});
+          return;
+        }}
+        if (serverPayload && (Array.isArray(serverPayload.peaks) || Array.isArray(serverPayload.panels))) {{
+          markDatasetTouchedClient(dsId);
+          if (fromModal) closeGalaxyDatasetModal();
+          recomputeBoundsAndReload(serverPayload);
+          return;
+        }}
+      }} catch (srvErr) {{
+        if (serverResponded) throw srvErr;
+        // Fall through to client-side h5wasm fetch only when NOVA server endpoint is unreachable
       }}
 
       // 2. Fallback: fetch raw HDF5 via /api/datasets/<id>/display and parse in browser via h5wasm
       while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));
-      const h5s = (galaxyBridge.datasets || []).filter(
+      const h5s = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []).filter(
         d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
       );
-      const mergedDs = [...h5s].reverse().find(
+      const mergedDs = h5s.find(
         d => d.id !== dsId && /merged|image|scan|prepare/i.test(d.name || "")
       );
       const r1 = await fetch(`/api/datasets/${{dsId}}/display`, {{ credentials: "same-origin" }});
@@ -8617,9 +8908,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (r2.ok) buf2 = await r2.arrayBuffer();
       }}
       const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
+      markDatasetTouchedClient(dsId);
+      if (fromModal) closeGalaxyDatasetModal();
       recomputeBoundsAndReload(newPayload);
     }} catch (err) {{
-      setStatusLine("[GALAXY HDF5]", `<span style="color:#f87171;">Failed to load HDF5: ${{err.message}}</span>`);
+      if (fromModal) showGalaxyModalError(err.message);
+      setStatusLine("[GALAXY ERROR]", `<span style="color:#f87171;">${{err.message}}</span>`);
     }}
   }}
 
@@ -8630,6 +8924,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (val === "__action_neutron_data__") {{
         selGalaxyH5.value = "";
         openNeutronDataModal(null);
+        return;
+      }}
+      if (val === "__action_galaxy_dataset__") {{
+        selGalaxyH5.value = "";
+        openGalaxyDatasetModal();
         return;
       }}
       if (val === "__action_local_file__") {{

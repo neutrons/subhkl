@@ -147,6 +147,11 @@ class MainApp:
             ds_id_q = request.rel_url.query.get("dataset_id")
             if ds_id_q is not None and str(ds_id_q).strip() != "":
                 try:
+                    from subhkl.viz.rainbow_zones import (
+                        _discover_images_h5,
+                        validate_subhkl_ingestible_dataset,
+                    )
+
                     ds_id = str(ds_id_q).strip()
                     cur_peaks = self.view_model.model.subhkl.data.peaks_file
                     cur_imgs = self.view_model.model.subhkl.data.images_file
@@ -160,6 +165,16 @@ class MainApp:
                             ds_id, fallback_dir=fb_dir
                         )
                     )
+                    ingest_kind = validate_subhkl_ingestible_dataset(local_h5, ds_info)
+                    if ingest_kind == "raw_nexus":
+                        return web.json_response(
+                            {
+                                "status": "raw_nexus",
+                                "dataset_id": ds_id,
+                                "name": ds_info.get("name")
+                                or os.path.basename(local_h5),
+                            }
+                        )
                     ds_name = str(
                         ds_info.get("name") or os.path.basename(local_h5)
                     ).lower()
@@ -170,8 +185,6 @@ class MainApp:
                         self.view_model.model.subhkl.data.images_file = local_h5
                         self.view_model.model.subhkl.data.peaks_file = local_h5
                     else:
-                        from subhkl.viz.rainbow_zones import _discover_images_h5
-
                         self.view_model.model.subhkl.data.peaks_file = local_h5
                         disc_img = _discover_images_h5(local_h5)
                         self.view_model.model.subhkl.data.images_file = (
@@ -181,7 +194,7 @@ class MainApp:
                     refreshed = True
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                     return web.json_response(
-                        {"status": "error", "error": str(exc)}, status=404
+                        {"status": "error", "error": str(exc)}, status=400
                     )
 
             if f_idx is not None and not refreshed:

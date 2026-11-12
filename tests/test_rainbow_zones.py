@@ -1596,6 +1596,107 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert empty_model.payload.get("pending_stage") == "reduce"
     assert len(empty_model.payload.get("panels") or []) > 0
 
+    # Verify list_history_datasets orders most recently touched first and touch_dataset promotes older items
+    from subhkl.viz.rainbow_zones import (
+        render_rainbow_html,
+        validate_subhkl_ingestible_dataset,
+    )
+
+    runner.galaxy_api_key = "fake_key"
+    runner.history_id = "hist_1"
+    runner._dataset_touch_times = {}
+    raw_history = [
+        {
+            "id": "ds_old",
+            "hid": 10,
+            "name": "old_merged.h5",
+            "state": "ok",
+            "extension": "h5",
+            "history_content_type": "dataset",
+            "deleted": False,
+            "update_time": "2026-01-10T10:00:00.000000",
+        },
+        {
+            "id": "ds_new",
+            "hid": 20,
+            "name": "new_solve.h5",
+            "state": "ok",
+            "extension": "h5",
+            "history_content_type": "dataset",
+            "deleted": False,
+            "update_time": "2026-01-12T10:00:00.000000",
+        },
+    ]
+    runner._api_request = lambda method, path, **kw: raw_history
+    ordered = runner.list_history_datasets()
+    assert [d["id"] for d in ordered] == ["ds_new", "ds_old"]
+
+    runner.touch_dataset("ds_old")
+    ordered_after_touch = runner.list_history_datasets()
+    assert [d["id"] for d in ordered_after_touch] == ["ds_old", "ds_new"]
+
+    # Verify validate_subhkl_ingestible_dataset accepts SubHKL .h5 / raw NeXus and errors on unsupported datasets
+    assert (
+        validate_subhkl_ingestible_dataset(
+            work_solve,
+            {
+                "name": "integrator.h5",
+                "hid": 279,
+                "state": "ok",
+                "extension": "png",
+            },
+        )
+        == "subhkl_h5"
+    )
+    raw_nxs = tmp_path / "CG4D_2625.nxs.h5"
+    with h5py.File(raw_nxs, "w") as hf:
+        hf.create_group("entry")
+    assert (
+        validate_subhkl_ingestible_dataset(
+            raw_nxs,
+            {
+                "name": "CG4D_2625.nxs.h5",
+                "hid": 280,
+                "state": "ok",
+                "extension": "h5",
+            },
+        )
+        == "raw_nexus"
+    )
+    bad_mtz = tmp_path / "reflections.mtz"
+    bad_mtz.write_bytes(b"MTZ \x00\x00\x00\x00")
+    try:
+        validate_subhkl_ingestible_dataset(
+            bad_mtz,
+            {
+                "name": "reflections.mtz",
+                "hid": 278,
+                "state": "ok",
+                "extension": "mtz",
+            },
+        )
+        raise AssertionError("Expected ValueError for non-HDF5 MTZ file")
+    except ValueError as exc:
+        assert "Cannot ingest Galaxy dataset" in str(exc)
+
+    bad_h5 = tmp_path / "unrelated.h5"
+    with h5py.File(bad_h5, "w") as hf:
+        hf.create_dataset("foo", data=np.array([1, 2, 3]))
+    try:
+        validate_subhkl_ingestible_dataset(
+            bad_h5,
+            {"name": "unrelated.h5", "hid": 281, "state": "ok", "extension": "h5"},
+        )
+        raise AssertionError("Expected ValueError for unrelated HDF5 file")
+    except ValueError as exc:
+        assert "does not contain SubHKL diffraction data" in str(exc)
+
+    html_doc = render_rainbow_html(empty_model.payload)
+    assert "__action_galaxy_dataset__" in html_doc
+    assert "From Galaxy..." in html_doc
+    assert 'id="modal-galaxy-dataset"' in html_doc
+    assert "MAX_RECENT_HISTORY_ITEMS" in html_doc
+
     # Verify _discover_images_h5 locates <tag>_merged.h5 from a solve.h5 that has 'files'
     # even when attrs['source'] points to an existing Pulsar staging dataset_*.dat file
     staging_dir = tmp_path / "staging_test" / "279969" / "inputs"
