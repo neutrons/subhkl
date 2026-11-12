@@ -1023,6 +1023,18 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
         assert cat_res["multi_run_supported"] is True
         assert isinstance(cat_res["experiments"], list)
         assert isinstance(cat_res["runs"], list)
+
+        runner_no_ndip._oncat_exp_cache = {
+            ("HFIR", "CG4D", False): (
+                9e12,
+                [{"ipts": "37331", "id": "IPTS-37331", "n_runs": 10}],
+            )
+        }
+        cat_empty = runner_no_ndip.browse_oncat_catalog(
+            {"facility": "HFIR", "instrument": "CG4D", "ipts": ""}
+        )
+        assert cat_empty["ipts"] == ""
+        assert cat_empty["runs"] == []
     finally:
         runner_no_ndip._build_oauth_oncat_client = real_build
         if monkeypatch_prev is None:

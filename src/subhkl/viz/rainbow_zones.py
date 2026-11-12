@@ -7701,6 +7701,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     multi_run_note: "",
     lastClickedRun: null,
     loading: false,
+    reqSeq: 0,
   }};
   let ndOncatAuthPollTimer = null;
 
@@ -7865,12 +7866,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return runs.map(r => runLocMap.get(Number(r)) || `/${{fac}}/${{inst}}/IPTS-${{iptsRaw}}/nexus/${{inst}}_${{r}}.nxs.h5`);
   }}
 
-  function renderOncatProjectsList() {{
+  function renderOncatProjectsList(scrollToSelected = false) {{
     const listEl = document.getElementById("nd-ipts-list");
     const countEl = document.getElementById("nd-ipts-count");
     const filterVal = (document.getElementById("nd-ipts-filter")?.value || "").trim().toLowerCase();
     const curIpts = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
     if (!listEl) return;
+    const prevScrollTop = listEl.scrollTop;
     const exps = (ndOncatCatalog.experiments || []).filter(e => {{
       if (!filterVal) return true;
       const hay = `${{e.ipts}} ${{e.id}} ${{e.title || ""}} ${{e.run_ranges || ""}} ${{e.latest_date || ""}}`.toLowerCase();
@@ -7912,19 +7914,30 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       row.title = `IPTS-${{exp.ipts}} (${{exp.n_runs || 0}} runs)\\n${{exp.title ? "Samples: " + exp.title + "\\n" : ""}}Ranges: ${{exp.run_ranges || "—"}}`;
       row.appendChild(sub);
 
-      row.addEventListener("click", () => {{
+      const selectExp = () => {{
         const iptsInput = document.getElementById("nd-ipts");
-        if (iptsInput && iptsInput.value !== String(exp.ipts)) {{
+        const nextIpts = String(exp.ipts);
+        if (iptsInput && iptsInput.value.trim().replace(/^IPTS-/i, "") === nextIpts && !ndOncatCatalog.loading) {{
+          return;
+        }}
+        if (iptsInput && iptsInput.value !== nextIpts) {{
           const runsInput = document.getElementById("nd-runs");
           if (runsInput) runsInput.value = "";
         }}
-        if (iptsInput) iptsInput.value = String(exp.ipts);
-        fetchOncatCatalog(String(exp.ipts), false);
+        if (iptsInput) iptsInput.value = nextIpts;
+        fetchOncatCatalog(nextIpts, false);
+      }};
+      row.addEventListener("mousedown", (ev) => {{
+        if (ev.button !== 0) return;
+        ev.preventDefault();
+        selectExp();
       }});
+      row.addEventListener("click", selectExp);
       if (isSel) activeRow = row;
       listEl.appendChild(row);
     }});
-    if (activeRow && typeof activeRow.scrollIntoView === "function") {{
+    listEl.scrollTop = prevScrollTop;
+    if (scrollToSelected && activeRow && typeof activeRow.scrollIntoView === "function") {{
       activeRow.scrollIntoView({{ block: "nearest" }});
     }}
   }}
@@ -8068,14 +8081,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const inst = (document.getElementById("nd-instrument")?.value || "CG4D").trim();
     const iptsEl = document.getElementById("nd-ipts");
     const iptsRaw = (iptsOverride !== null ? String(iptsOverride) : (iptsEl?.value || "")).trim().replace(/^IPTS-/i, "");
+    const reqId = ++ndOncatCatalog.reqSeq;
     ndOncatCatalog.loading = true;
-    renderOncatProjectsList();
+    renderOncatProjectsList(false);
     renderOncatRunsList(false);
     try {{
       const qs = new URLSearchParams({{ facility: fac, instrument: inst, ipts: iptsRaw }});
       const r = await fetch(`api/pipeline/oncat_catalog?${{qs.toString()}}`);
       if (!r.ok) throw new Error(`HTTP ${{r.status}}`);
       const data = await r.json();
+      if (reqId !== ndOncatCatalog.reqSeq) return;
       ndOncatCatalog.experiments = data.experiments || [];
       ndOncatCatalog.runs = data.runs || [];
       ndOncatCatalog.oncat_authenticated = Boolean(data.oncat_authenticated);
@@ -8084,20 +8099,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ndOncatCatalog.multi_run_note = data.multi_run_note || "";
       ndOncatCatalog.loading = false;
       renderOncatAuthBar();
-      if (data.ipts && iptsEl && iptsOverride !== null) {{
-        iptsEl.value = String(data.ipts);
-      }}
       const runsEl = document.getElementById("nd-runs");
       if (runsEl && autoSelectLatestRun && ndOncatCatalog.runs.length > 0 && !runsEl.value.trim()) {{
         const lastRun = ndOncatCatalog.runs[ndOncatCatalog.runs.length - 1].run;
         runsEl.value = String(lastRun);
       }}
-      renderOncatProjectsList();
+      renderOncatProjectsList(false);
       renderOncatRunsList(true);
       updateNeutronDialogPreview();
     }} catch (_err) {{
+      if (reqId !== ndOncatCatalog.reqSeq) return;
       ndOncatCatalog.loading = false;
-      renderOncatProjectsList();
+      renderOncatProjectsList(false);
       renderOncatRunsList(false);
     }}
   }}
@@ -8287,18 +8300,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const el = document.getElementById(id);
     if (el) {{
       el.addEventListener("input", () => {{
-        if (id === "nd-runs") renderOncatRunsList(false);
+        if (id === "nd-ipts") renderOncatProjectsList(true);
+        else if (id === "nd-runs") renderOncatRunsList(false);
         updateNeutronDialogPreview();
       }});
       el.addEventListener("change", () => {{
-        if (id === "nd-ipts") fetchOncatCatalog(el.value);
-        else if (id === "nd-facility") fetchOncatCatalog(null, true);
+        if (id === "nd-ipts") fetchOncatCatalog(null, false);
+        else if (id === "nd-facility") fetchOncatCatalog(null, false);
         updateNeutronDialogPreview();
       }});
     }}
   }});
   const ndIptsFilterEl = document.getElementById("nd-ipts-filter");
-  if (ndIptsFilterEl) ndIptsFilterEl.addEventListener("input", renderOncatProjectsList);
+  if (ndIptsFilterEl) ndIptsFilterEl.addEventListener("input", () => renderOncatProjectsList(false));
   const ndRunsFilterEl = document.getElementById("nd-runs-filter");
   if (ndRunsFilterEl) ndRunsFilterEl.addEventListener("input", () => renderOncatRunsList(false));
   const btnNdClearRuns = document.getElementById("btn-nd-clear-runs");
@@ -8325,7 +8339,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (facEl) {{
         facEl.value = (ndInstEl.value === "MANDI" || ndInstEl.value === "TOPAZ") ? "SNS" : "HFIR";
       }}
-      fetchOncatCatalog(null, true);
+      fetchOncatCatalog(null, false);
       updateNeutronDialogPreview();
     }});
   }}

@@ -2981,9 +2981,6 @@ class NovaGalaxyPipelineRunner:
                 exp_cache[(fac, inst, is_auth)] = (now, experiments)
                 self._oncat_exp_cache = exp_cache
 
-        if not ipts_raw and experiments:
-            ipts_raw = str(experiments[0]["ipts"])
-
         runs: list[dict[str, Any]] = []
         if ipts_raw:
             runs_cache: dict[
