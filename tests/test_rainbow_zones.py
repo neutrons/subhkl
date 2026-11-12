@@ -182,6 +182,10 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert 'id="nd-ipts" type="text" value=""' in content
     assert 'id="nd-runs" type="text" value=""' in content
     assert 'id="nd-sg" type="text" value=""' in content
+    assert '<option value="IMAGINE">' not in content
+    assert '<option value="TOPAZ">TOPAZ (SNS)</option>' in content
+    assert "TOPAZ" in payload_cg4d["beamline_detectors"]
+    assert len(payload_cg4d["beamline_detectors"]["TOPAZ"]) == 25
     assert "btn-zone-arcs" in content
     assert "showZoneArcs: true" in content
     assert "drawSingleZoneArc" in content

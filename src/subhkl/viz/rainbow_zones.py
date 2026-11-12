@@ -3143,7 +3143,7 @@ def build_rainbow_zone_payload(
     from subhkl.config import beamlines as _cfg_beamlines
 
     beamline_detectors: dict[str, dict[str, Any]] = {}
-    for _inst_k in ("CG4D", "MANDI", "IMAGINE"):
+    for _inst_k in ("CG4D", "MANDI", "TOPAZ", "IMAGINE"):
         if _inst_k in _cfg_beamlines:
             beamline_detectors[_inst_k] = {
                 str(bk): {
@@ -4124,7 +4124,6 @@ def render_rainbow_html(
             INSTRUMENT
             <select id="nd-instrument" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
               <option value="CG4D" selected>CG4D (IMAGINE-X)</option>
-              <option value="IMAGINE">IMAGINE (HFIR)</option>
               <option value="MANDI">MANDI (SNS)</option>
               <option value="TOPAZ">TOPAZ (SNS)</option>
             </select>
@@ -6629,6 +6628,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (f.keys().includes("files")) {{
           const fl = Array.from(f.get("files").value || []).map(String).join(" ").toUpperCase();
           if (fl.includes("MANDI")) inst = "MANDI";
+          else if (fl.includes("TOPAZ")) inst = "TOPAZ";
           else if (fl.includes("CG4D")) inst = "CG4D";
           else if (fl.includes("IMAGINE")) inst = "IMAGINE";
         }}
@@ -6639,9 +6639,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (sh[1] === 256) inst = "MANDI";
       else if (sh[1] === 512) inst = "CG4D";
     }}
-    if (!inst) inst = DATA.instrument || "CG4D";
 
-    let wlRangeNew = (inst === "MANDI" || inst === "TOPAZ") ? [2.0, 4.0] : [2.8, 4.5];
+    let wlRangeNew = (inst === "TOPAZ") ? [0.4, 3.5] : ((inst === "MANDI") ? [2.0, 4.0] : [2.8, 4.5]);
     let dMinNew = Number((0.5 * Number(wlRangeNew[0])).toFixed(2));
     try {{
       if (f.keys().includes("instrument")) {{
@@ -6683,13 +6682,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
       }}
       bankIdsRun = bAll.slice(f0, f1);
-      if (bankIdsRun.some(b => b > 60)) inst = "CG4D";
-      else if (bankIdsRun.some(b => b < 10) || (bankIdsRun.length > 0 && bankIdsRun.length <= 45)) inst = "MANDI";
+      if (!inst) {{
+        if (bankIdsRun.some(b => b > 60)) inst = "CG4D";
+        else if (bankIdsRun.length > 0 && bankIdsRun.length <= 25 && bankIdsRun.every(b => b >= 13 && b <= 59)) inst = "TOPAZ";
+        else if (bankIdsRun.some(b => b < 10) || (bankIdsRun.length > 0 && bankIdsRun.length <= 45)) inst = "MANDI";
+      }}
     }}
+    if (!inst) inst = DATA.instrument || "CG4D";
 
     // Seed nominal detector banks from DATA.beamline_detectors[inst], then override with detector_calibration/bank_*
     const detMap = new Map();
     const nomBanks = (DATA.beamline_detectors && DATA.beamline_detectors[inst]) || {{}};
+    const defaultDim = (inst === "MANDI" || inst === "TOPAZ") ? 256 : 512;
     Object.entries(nomBanks).forEach(([bkStr, cfg]) => {{
       const bid = parseInt(bkStr, 10);
       detMap.set(bid, {{
@@ -6699,8 +6703,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         vhat: [...cfg.vhat],
         width: Number(cfg.width),
         height: Number(cfg.height),
-        m: Number(cfg.m || (inst === "MANDI" ? 256 : 512)),
-        n: Number(cfg.n || (inst === "MANDI" ? 256 : 512)),
+        m: Number(cfg.m || defaultDim),
+        n: Number(cfg.n || defaultDim),
       }});
     }});
     if (f.keys().includes("detector_calibration")) {{
@@ -6709,7 +6713,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (!bName.startsWith("bank_")) continue;
         const bid = parseInt(bName.slice(5), 10);
         const g = calGrp.get(bName);
-        const baseDet = detMap.get(bid) || {{ m: inst === "MANDI" ? 256 : 512, n: inst === "MANDI" ? 256 : 512 }};
+        const baseDet = detMap.get(bid) || {{ m: defaultDim, n: defaultDim }};
         const center = Array.from(g.get("center").value).map(Number);
         const uhat = Array.from(g.get("uhat").value).map(Number);
         const vhat = Array.from(g.get("vhat").value).map(Number);

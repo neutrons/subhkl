@@ -2304,8 +2304,8 @@ class NovaGalaxyPipelineRunner:
                 self.galaxy_url
                 and not any(h in self.galaxy_url for h in ("127.0.0.1", "localhost"))
             )
-            has_podman = bool(_shutil.which("podman"))
-            if is_remote_galaxy and not has_podman:
+            has_container_rt = bool(_shutil.which("podman") or _shutil.which("docker"))
+            if is_remote_galaxy and not has_container_rt:
                 job_record["state"] = "error"
                 job_record["stderr"] = f"{clean_msg}\n"
                 job_record["stdout"] += f"\n[nova -> galaxy] Error: {clean_msg}\n"
