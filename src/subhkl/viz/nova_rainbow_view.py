@@ -4662,6 +4662,37 @@ class NovaGalaxyPipelineRunner:
                                 )
                                 job_record["state"] = "ok"
                     else:
+                        misc_info = ""
+                        for out_d in job_record.get("outputs", []):
+                            oid = out_d.get("id")
+                            if not oid:
+                                continue
+                            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                                dmeta = self._api_request("GET", f"/api/datasets/{oid}")
+                                if isinstance(dmeta, dict) and dmeta.get("misc_info"):
+                                    misc_info = str(dmeta["misc_info"]).strip()
+                                    break
+                        if not misc_info and jinfo.get("job_messages"):
+                            misc_info = "; ".join(
+                                str(m.get("desc") or m)
+                                if isinstance(m, dict)
+                                else str(m)
+                                for m in jinfo["job_messages"]
+                            ).strip()
+                        if misc_info:
+                            if misc_info not in job_record.get("stderr", ""):
+                                job_record["stderr"] = (
+                                    f"{job_record.get('stderr', '')}{misc_info}\n"
+                                )[-16000:]
+                            if misc_info not in job_record.get("stdout", ""):
+                                job_record["stdout"] += (
+                                    f"\n[galaxy -> error] {misc_info}\n"
+                                )
+                        if state == "error" and not jinfo.get("command_line"):
+                            raise RuntimeError(
+                                misc_info
+                                or f"Galaxy job {job_id} failed before command execution"
+                            )
                         job_record["state"] = state
                     break
             except TimeoutError:

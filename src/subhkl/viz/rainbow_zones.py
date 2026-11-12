@@ -3919,9 +3919,6 @@ def render_rainbow_html(
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
         Cyl
       </button>
-      <button id="btn-zone-order" class="active-btn" title="Cycle maximum Laue zone index order: |u,v,w| ≤ 1 (fundamental) → ≤ 2 → ≤ 3 (higher-order)">
-        |uvw|≤1
-      </button>
       <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
         Arcs
       </button>
@@ -4134,14 +4131,14 @@ def render_rainbow_html(
           </label>
           <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
             IPTS NUMBER
-            <input id="nd-ipts" type="text" value="37331" placeholder="e.g. 37331" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-ipts" type="text" value="" placeholder="e.g. 37331" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
             <span style="display:flex;align-items:center;justify-content:space-between;">
               <span>RUN OR RANGE</span>
               <span id="nd-multirun-badge" style="font-size:0.58rem;color:var(--accent-cyan);">Multi-run</span>
             </span>
-            <input id="nd-runs" type="text" value="2625-2638" placeholder="e.g. 2625-2638 or 12737,12739" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-runs" type="text" value="" placeholder="e.g. 2625-2638 or 12737,12739" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
 
@@ -4209,46 +4206,46 @@ def render_rainbow_html(
         <div style="display:grid;grid-template-columns:1.3fr repeat(3,minmax(0,1fr));gap:8px;margin-bottom:6px;">
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             SPACE GROUP
-            <input id="nd-sg" type="text" value="{sg}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-sg" type="text" value="" placeholder="e.g. P 21 21 21 or F d d 2" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             a (Å)
-            <input id="nd-a" type="number" step="0.01" value="69.07" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-a" type="number" step="0.01" value="" placeholder="a" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             b (Å)
-            <input id="nd-b" type="number" step="0.01" value="98.00" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-b" type="number" step="0.01" value="" placeholder="b" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             c (Å)
-            <input id="nd-c" type="number" step="0.01" value="90.92" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-c" type="number" step="0.01" value="" placeholder="c" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
         <!-- Row 2: Unit cell angles alpha, beta, gamma + wavelength band -->
         <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) 0.85fr 0.85fr;gap:8px;margin-bottom:8px;">
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             α (°)
-            <input id="nd-alpha" type="number" step="0.01" value="90.07" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-alpha" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             β (°)
-            <input id="nd-beta" type="number" step="0.01" value="106.14" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-beta" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             γ (°)
-            <input id="nd-gamma" type="number" step="0.01" value="90.01" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-gamma" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             λ_min (Å)
-            <input id="nd-wl-min" type="number" step="0.1" value="{init_wl_min:.1f}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-wl-min" type="number" step="0.1" value="" placeholder="e.g. 2.0" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             λ_max (Å)
-            <input id="nd-wl-max" type="number" step="0.1" value="{init_wl_max:.1f}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-wl-max" type="number" step="0.1" value="" placeholder="e.g. 4.5" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
         <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px;">
-          Preview: /HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5 … CG4D_2638.nxs.h5 (14 runs)
+          Preview: specify IPTS + run range or explicit file path(s)
         </div>
         <div id="nd-preview-title" style="font-family:var(--font-display);font-size:0.63rem;color:var(--accent-gold);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:4px;"></div>
         <div id="nd-validation-status" style="font-family:var(--font-display);font-size:0.66rem;min-height:18px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 6px;border-radius:4px;background:rgba(7,9,19,0.65);border:1px solid rgba(56,189,248,0.2);">
@@ -4752,8 +4749,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.maxZoneOrder = ordLevel;
     const matching = ZONES.filter(z => (z.order || 1) <= ordLevel).map(z => z.zone_id);
     state.activeZones = new Set(matching);
-    const btnTop = document.getElementById("btn-zone-order");
-    if (btnTop) btnTop.textContent = `|uvw|≤${{ordLevel}}`;
     [1, 2, 3].forEach(k => {{
       const b = document.getElementById(`btn-order-${{k}}`);
       if (b) b.classList.toggle("active-btn", k === ordLevel);
@@ -6129,11 +6124,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     syncProjectionUI();
   }});
 
-  document.getElementById("btn-zone-order").addEventListener("click", () => {{
-    const nextOrder = state.maxZoneOrder >= 3 ? 1 : state.maxZoneOrder + 1;
-    setMaxZoneOrder(nextOrder);
-  }});
-
   [1, 2, 3].forEach(ordLevel => {{
     const b = document.getElementById(`btn-order-${{ordLevel}}`);
     if (b) b.addEventListener("click", () => setMaxZoneOrder(ordLevel));
@@ -6500,19 +6490,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (DATA.space_group) {{
       const sgEl = document.getElementById("inp-sg");
       if (sgEl) sgEl.value = DATA.space_group;
-      const ndSgEl = document.getElementById("nd-sg");
-      if (ndSgEl) ndSgEl.value = DATA.space_group;
     }}
     if (DATA.cell && DATA.cell.length === 6) {{
       const c = DATA.cell;
       document.getElementById("cell-summary").textContent = `${{c[0].toFixed(1)}}, ${{c[1].toFixed(1)}}, ${{c[2].toFixed(1)}} Å`;
       const ids = ["inp-a", "inp-b", "inp-c", "inp-alpha", "inp-beta", "inp-gamma"];
-      const ndIds = ["nd-a", "nd-b", "nd-c", "nd-alpha", "nd-beta", "nd-gamma"];
       ids.forEach((id, i) => {{
-        const el = document.getElementById(id);
-        if (el && typeof c[i] === "number") el.value = c[i].toFixed(2);
-      }});
-      ndIds.forEach((id, i) => {{
         const el = document.getElementById(id);
         if (el && typeof c[i] === "number") el.value = c[i].toFixed(2);
       }});
@@ -7602,8 +7585,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
       row.addEventListener("click", () => {{
         const iptsInput = document.getElementById("nd-ipts");
+        if (iptsInput && iptsInput.value !== String(exp.ipts)) {{
+          const runsInput = document.getElementById("nd-runs");
+          if (runsInput) runsInput.value = "";
+        }}
         if (iptsInput) iptsInput.value = String(exp.ipts);
-        fetchOncatCatalog(String(exp.ipts), true);
+        fetchOncatCatalog(String(exp.ipts), false);
       }});
       if (isSel) activeRow = row;
       listEl.appendChild(row);
@@ -7768,18 +7755,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ndOncatCatalog.multi_run_note = data.multi_run_note || "";
       ndOncatCatalog.loading = false;
       renderOncatAuthBar();
-      if (data.ipts && iptsEl && (!iptsEl.value.trim() || iptsOverride !== null)) {{
+      if (data.ipts && iptsEl && iptsOverride !== null) {{
         iptsEl.value = String(data.ipts);
       }}
       const runsEl = document.getElementById("nd-runs");
-      if (runsEl && ndOncatCatalog.runs.length > 0) {{
-        const curSelected = parseRunRangeSpec(runsEl.value);
-        const runSet = new Set(ndOncatCatalog.runs.map(x => Number(x.run)));
-        const hasOverlap = curSelected.some(n => runSet.has(Number(n)));
-        if (autoSelectLatestRun || !hasOverlap) {{
-          const lastRun = ndOncatCatalog.runs[ndOncatCatalog.runs.length - 1].run;
-          runsEl.value = String(lastRun);
-        }}
+      if (runsEl && autoSelectLatestRun && ndOncatCatalog.runs.length > 0 && !runsEl.value.trim()) {{
+        const lastRun = ndOncatCatalog.runs[ndOncatCatalog.runs.length - 1].run;
+        runsEl.value = String(lastRun);
       }}
       renderOncatProjectsList();
       renderOncatRunsList(true);
@@ -7932,21 +7914,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function openNeutronDataModal(localNexusFiles = null) {{
     pendingLocalNexusFiles = localNexusFiles;
-    const params = collectWorkflowParams();
-    const setVal = (id, v) => {{ const el = document.getElementById(id); if (el && v !== undefined) el.value = v; }};
-    if (params.instrument) {{
-      setVal("nd-instrument", params.instrument);
-      setVal("nd-facility", (params.instrument === "MANDI" || params.instrument === "TOPAZ") ? "SNS" : "HFIR");
-    }}
-    setVal("nd-sg", params.space_group);
-    setVal("nd-a", Number(params.a).toFixed(2));
-    setVal("nd-b", Number(params.b).toFixed(2));
-    setVal("nd-c", Number(params.c).toFixed(2));
-    setVal("nd-alpha", Number(params.alpha).toFixed(2));
-    setVal("nd-beta", Number(params.beta).toFixed(2));
-    setVal("nd-gamma", Number(params.gamma).toFixed(2));
-    setVal("nd-wl-min", Number(params.wavelength_min).toFixed(1));
-    setVal("nd-wl-max", Number(params.wavelength_max).toFixed(1));
     updateNeutronDialogPreview();
     if (modalNeutronData) modalNeutronData.style.display = "flex";
     fetchOncatCatalog();
@@ -8036,6 +8003,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   if (btnNdSubmit) {{
     btnNdSubmit.addEventListener("click", async () => {{
+      const sgVal = (document.getElementById("nd-sg")?.value || "").trim();
+      const cellVals = ["nd-a", "nd-b", "nd-c", "nd-alpha", "nd-beta", "nd-gamma"].map(
+        id => parseFloat(document.getElementById(id)?.value || "")
+      );
+      if (!sgVal || cellVals.some(v => !Number.isFinite(v) || v <= 0)) {{
+        const statusBox = document.getElementById("nd-validation-status");
+        const msgEl = document.getElementById("nd-validation-msg");
+        if (statusBox) statusBox.style.borderColor = "rgba(248,113,113,0.6)";
+        if (msgEl) {{
+          msgEl.style.color = "#f87171";
+          msgEl.textContent = "Enter space group and unit cell parameters (a, b, c, α, β, γ).";
+        }}
+        return;
+      }}
       // Sync sample unit cell, space group, and wavelength band back to the main parameters bar
       const syncPair = [
         ["nd-sg", "inp-sg"], ["nd-a", "inp-a"], ["nd-b", "inp-b"], ["nd-c", "inp-c"],
@@ -8043,7 +8024,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ];
       syncPair.forEach(([srcId, dstId]) => {{
         const s = document.getElementById(srcId), d = document.getElementById(dstId);
-        if (s && d) d.value = s.value;
+        if (s && d && s.value.trim() !== "") d.value = s.value;
       }});
       const wlMinV = parseFloat(document.getElementById("nd-wl-min")?.value || "");
       const wlMaxV = parseFloat(document.getElementById("nd-wl-max")?.value || "");

@@ -177,7 +177,11 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert "canvas-detector" in content
     assert "canvas-stereo" in content
     assert "btn-proj-toggle" in content
-    assert "btn-zone-order" in content
+    assert "btn-zone-order" not in content
+    assert "btn-order-1" in content
+    assert 'id="nd-ipts" type="text" value=""' in content
+    assert 'id="nd-runs" type="text" value=""' in content
+    assert 'id="nd-sg" type="text" value=""' in content
     assert "btn-zone-arcs" in content
     assert "showZoneArcs: true" in content
     assert "drawSingleZoneArc" in content
