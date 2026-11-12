@@ -1224,7 +1224,8 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     ]
     assert "formatTerminalStdio" in html
     assert "hasMergedCarelessData()" in html
-    assert "opt.disabled = !hasMerge" in html
+    assert "opt.disabled = !hasRes" in html
+    assert "opt.disabled = !hasScl" in html
 
     # 6. Verify checkpoint(..., snapshot=...) writes a live Step 4 .stages.h5 loadable with include_panel_images=False
     from types import SimpleNamespace
@@ -1663,6 +1664,15 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
         )
         == "raw_nexus"
     )
+    from subhkl.viz.rainbow_zones import (
+        _extract_from_h5,
+        infer_dataset_extension,
+    )
+
+    assert infer_dataset_extension("integrator.h5", "png") == "h5"
+    assert infer_dataset_extension("reflections.mtz", "png") == "mtz"
+    assert infer_dataset_extension("dataset_abc-123.dat", "h5") == "dat"
+
     bad_mtz = tmp_path / "reflections.mtz"
     bad_mtz.write_bytes(b"MTZ \x00\x00\x00\x00")
     try:
@@ -1674,10 +1684,59 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
                 "state": "ok",
                 "extension": "mtz",
             },
+            has_active_geometry=False,
         )
-        raise AssertionError("Expected ValueError for non-HDF5 MTZ file")
+        raise AssertionError("Expected ValueError for standalone MTZ file")
     except ValueError as exc:
-        assert "Cannot ingest Galaxy dataset" in str(exc)
+        assert "Cannot load MTZ dataset" in str(exc)
+
+    # Verify _extract_from_h5 ignores stale sibling careless_metrics.json when peaks/careless_residual is absent
+    # and reconstructs peaks_xyz from pixel_r/pixel_c without triggering finder-less solve forward projection
+    stale_dir = tmp_path / "stale_integ"
+    stale_dir.mkdir(exist_ok=True)
+    (stale_dir / "careless_metrics.json").write_text(
+        json.dumps({"n_merged_asu": 500, "cc_half_overall": 0.95}),
+        encoding="utf-8",
+    )
+    integ_no_xyz = stale_dir / "integrated.h5"
+    with h5py.File(integ_no_xyz, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = np.diag([1.0 / 68.7, 1.0 / 69.8, 1.0 / 156.9])
+        hf["peaks/h"] = np.array([1, 2, 3], dtype=int)
+        hf["peaks/k"] = np.array([0, 1, 1], dtype=int)
+        hf["peaks/l"] = np.array([1, 0, 2], dtype=int)
+        hf["peaks/lambda"] = np.array([3.1, 3.4, 3.8], dtype=float)
+        hf["peaks/intensity"] = np.array([120.0, 95.0, 80.0], dtype=float)
+        hf["peaks/sigma"] = np.array([5.0, 4.0, 4.0], dtype=float)
+        hf["peaks/bank"] = np.array([20, 20, 20], dtype=int)
+        hf["peaks/pixel_r"] = np.array([120.0, 140.0, 160.0], dtype=float)
+        hf["peaks/pixel_c"] = np.array([130.0, 150.0, 170.0], dtype=float)
+        hf["peaks/two_theta"] = np.array([0.8, 0.9, 1.0], dtype=float)
+        hf["peaks/azimuthal"] = np.array([0.2, 0.3, 0.4], dtype=float)
+        hf["peaks/var_u"] = np.array([2.5, 2.5, 2.5], dtype=float)
+        hf["peaks/var_v"] = np.array([1.8, 1.8, 1.8], dtype=float)
+        hf["peaks/cov_uv"] = np.array([0.1, 0.1, 0.1], dtype=float)
+
+    ext_integ = _extract_from_h5(integ_no_xyz)
+    assert ext_integ["artifact_kind"] == "integrator"
+    assert ext_integ["merge_metrics"] is None
+    assert len(ext_integ["peaks_xyz"]) == 3
+
+    # Verify invalidate_subsequent_stages removes stale careless_metrics.json and hides subsequent stages
+    runner.invalidate_subsequent_stages("solve", str(stale_dir))
+    assert not (stale_dir / "careless_metrics.json").exists()
+    step_arts = runner.list_step_artifacts(
+        current_h5=str(integ_no_xyz),
+        history_datasets=[
+            {"id": "ds_s", "hid": 10, "name": "solve.h5", "state": "ok"},
+            {"id": "ds_i", "hid": 11, "name": "integrated.h5", "state": "ok"},
+            {"id": "ds_m", "hid": 12, "name": "merged.mtz", "state": "ok"},
+        ],
+    )
+    assert len(step_arts["solve"]) == 1
+    assert step_arts["integrate"] == []
+    assert step_arts["merge"] == []
 
     bad_h5 = tmp_path / "unrelated.h5"
     with h5py.File(bad_h5, "w") as hf:

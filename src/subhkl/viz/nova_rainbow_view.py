@@ -730,6 +730,8 @@ class NovaGalaxyPipelineRunner:
             )
             if not isinstance(items, list):
                 return []
+            from subhkl.viz.rainbow_zones import infer_dataset_extension
+
             touch_map: dict[str, float] = getattr(self, "_dataset_touch_times", {})
             out: list[dict[str, Any]] = []
             for it in items:
@@ -743,13 +745,14 @@ class NovaGalaxyPipelineRunner:
                 ut_str = str(it.get("update_time") or it.get("create_time") or "")
                 ut_epoch = self._parse_galaxy_timestamp(ut_str)
                 touched_at = max(ut_epoch, float(touch_map.get(ds_id, 0.0)))
+                ext_norm = infer_dataset_extension(it.get("name"), it.get("extension"))
                 out.append(
                     {
                         "id": it.get("id"),
                         "hid": it.get("hid"),
                         "name": it.get("name"),
                         "state": it.get("state"),
-                        "extension": it.get("extension"),
+                        "extension": ext_norm,
                         "update_time": ut_str,
                         "touched_at": round(touched_at, 3),
                     }
@@ -896,6 +899,86 @@ class NovaGalaxyPipelineRunner:
                 return parent
         return None
 
+    STAGE_ORDER: ClassVar[tuple[str, ...]] = (
+        "reduce",
+        "solve",
+        "integrate",
+        "merge",
+    )
+
+    @classmethod
+    def _stage_for_kind_or_stage(cls, val: str | None) -> str | None:
+        k = str(val or "").strip().lower()
+        if k in cls.STAGE_ORDER:
+            return k
+        if k in ("merged", "raw_nexus"):
+            return "reduce"
+        if k in ("solve", "finder"):
+            return "solve"
+        if k in ("integrator", "predictor"):
+            return "integrate"
+        if k == "merged_careless":
+            return "merge"
+        return None
+
+    def invalidate_subsequent_stages(
+        self,
+        current_stage_or_kind: str | None,
+        work_dir: str | None = None,
+    ) -> None:
+        """Invalidate artifacts and cached state for pipeline stages after ``current_stage_or_kind``."""
+        mapped = self._stage_for_kind_or_stage(current_stage_or_kind)
+        self._max_valid_stage = mapped
+        if not mapped or mapped == "merge":
+            return
+
+        wd = work_dir or self._active_work_dir()
+        if not wd or not os.path.isdir(wd):
+            return
+
+        is_tmp_wd = os.path.abspath(wd).startswith(
+            os.path.abspath(tempfile.gettempdir())
+        )
+        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+
+        to_remove: list[str] = [
+            "careless_metrics.json",
+            "merged.mtz",
+            "predictions.mtz",
+            "xval.mtz",
+            "careless_0.mtz",
+            "careless_predictions_0.mtz",
+            "careless_xval_0.mtz",
+        ]
+        if is_tmp_wd and mapped in ("reduce", "solve"):
+            to_remove.extend(
+                [
+                    "predictor.h5",
+                    "peak_predictor.h5",
+                    "integrated.h5",
+                    "integrator.h5",
+                    "reflections.mtz",
+                ]
+            )
+        if is_tmp_wd and mapped == "reduce":
+            to_remove.extend(
+                [
+                    "solve.h5",
+                    "peaks.h5",
+                    "indexer.h5",
+                    "solve.blind.h5",
+                    "solve.stages.h5",
+                ]
+            )
+
+        for fn in to_remove:
+            fp = os.path.join(wd, fn)
+            for p_key in (os.path.abspath(fp), os.path.realpath(fp)):
+                known_map.pop(p_key, None)
+            if os.path.isfile(fp):
+                with contextlib.suppress(OSError):
+                    os.remove(fp)
+
     def list_step_artifacts(
         self,
         current_h5: str | None = None,
@@ -949,6 +1032,20 @@ class NovaGalaxyPipelineRunner:
                         m_entry = dict(entry)
                         m_entry["stage_id"] = "merge"
                         stages["merge"][fn] = m_entry
+
+        max_stage = getattr(self, "_max_valid_stage", None)
+        if not max_stage and current_h5:
+            max_stage = self._classify_artifact_stage(os.path.basename(str(current_h5)))
+            if (
+                max_stage == "integrate"
+                and work_dir
+                and os.path.isfile(os.path.join(work_dir, "careless_metrics.json"))
+            ):
+                max_stage = "merge"
+        if max_stage in self.STAGE_ORDER:
+            max_idx = self.STAGE_ORDER.index(max_stage)
+            for st_k in self.STAGE_ORDER[max_idx + 1 :]:
+                stages[st_k] = {}
 
         return {k: list(v.values()) for k, v in stages.items()}
 
@@ -1902,6 +1999,7 @@ class NovaGalaxyPipelineRunner:
                 if merged_path
                 else (tempfile.gettempdir(), "")
             )
+            self.invalidate_subsequent_stages(stage_id, work_dir)
             solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
             solve_bn = os.path.basename(solve_path).lower()
             cand_solve = os.path.join(work_dir, "solve.h5")
@@ -3465,6 +3563,7 @@ class NovaGalaxyPipelineRunner:
             raw_img or os.path.join(tempfile.gettempdir(), "merged.h5")
         )
         work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
+        self.invalidate_subsequent_stages(stage_id, work_dir)
         solve_dest = os.path.join(work_dir, "solve.h5")
         pred_dest = os.path.join(work_dir, "predictor.h5")
         integrated_dest = os.path.join(work_dir, "integrated.h5")
@@ -5205,11 +5304,16 @@ def serve_rainbow_zones(
                             else:
                                 vm.replay_h5 = fp
                                 vm.reload(frame_index=f_idx)
+                            vm.pipeline_runner.invalidate_subsequent_stages(
+                                (vm._payload or {}).get("artifact_kind"),
+                                os.path.dirname(fp),
+                            )
                             reloaded = True
                 if qs.get("dataset_id"):
                     try:
                         from subhkl.viz.rainbow_zones import (
                             _discover_images_h5,
+                            apply_mtz_to_payload,
                             validate_subhkl_ingestible_dataset,
                         )
 
@@ -5224,9 +5328,31 @@ def serve_rainbow_zones(
                                 ds_id, fallback_dir=fb_dir
                             )
                         )
-                        ingest_kind = validate_subhkl_ingestible_dataset(
-                            local_h5, ds_info
+                        cur_p = vm._payload or {}
+                        has_active_geom = bool(
+                            (
+                                cur_p.get("artifact_kind") != "empty"
+                                and cur_p.get("panels")
+                                and (cur_p.get("peaks") or cur_p.get("ub_matrix"))
+                            )
+                            or qs.get("has_active_geometry", ["0"])[0] == "1"
                         )
+                        ingest_kind = validate_subhkl_ingestible_dataset(
+                            local_h5,
+                            ds_info,
+                            has_active_geometry=has_active_geom,
+                        )
+                        if ingest_kind == "mtz_overlay":
+                            vm._payload = apply_mtz_to_payload(cur_p, local_h5, ds_info)
+                            body = json.dumps(vm._payload).encode("utf-8")
+                            self.send_response(200)
+                            self.send_header(
+                                "Content-Type", "application/json; charset=utf-8"
+                            )
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                            return
                         if ingest_kind == "raw_nexus":
                             raw_body = json.dumps(
                                 {
@@ -5266,6 +5392,10 @@ def serve_rainbow_zones(
                                 images_h5=(str(disc_img) if disc_img else None),
                                 frame_index=f_idx,
                             )
+                        vm.pipeline_runner.invalidate_subsequent_stages(
+                            (vm._payload or {}).get("artifact_kind"),
+                            os.path.dirname(os.path.abspath(local_h5)),
+                        )
                         reloaded = True
                     except _NOVA_RECOVERABLE_ERRORS as exc:
                         err_body = json.dumps(

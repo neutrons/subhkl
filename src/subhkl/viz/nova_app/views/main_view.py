@@ -149,6 +149,7 @@ class MainApp:
                 try:
                     from subhkl.viz.rainbow_zones import (
                         _discover_images_h5,
+                        apply_mtz_to_payload,
                         validate_subhkl_ingestible_dataset,
                     )
 
@@ -165,7 +166,25 @@ class MainApp:
                             ds_id, fallback_dir=fb_dir
                         )
                     )
-                    ingest_kind = validate_subhkl_ingestible_dataset(local_h5, ds_info)
+                    cur_p = self.view_model.model.subhkl.payload or {}
+                    has_active_geom = bool(
+                        (
+                            cur_p.get("artifact_kind") != "empty"
+                            and cur_p.get("panels")
+                            and (cur_p.get("peaks") or cur_p.get("ub_matrix"))
+                        )
+                        or request.rel_url.query.get("has_active_geometry") == "1"
+                    )
+                    ingest_kind = validate_subhkl_ingestible_dataset(
+                        local_h5,
+                        ds_info,
+                        has_active_geometry=has_active_geom,
+                    )
+                    if ingest_kind == "mtz_overlay":
+                        self.view_model.model.subhkl.payload = apply_mtz_to_payload(
+                            cur_p, local_h5, ds_info
+                        )
+                        return web.json_response(self.view_model.model.subhkl.payload)
                     if ingest_kind == "raw_nexus":
                         return web.json_response(
                             {
@@ -191,6 +210,12 @@ class MainApp:
                             str(disc_img) if disc_img else ""
                         )
                     self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                    self.pipeline_runner.invalidate_subsequent_stages(
+                        (self.view_model.model.subhkl.payload or {}).get(
+                            "artifact_kind"
+                        ),
+                        os.path.dirname(os.path.abspath(local_h5)),
+                    )
                     refreshed = True
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                     return web.json_response(
