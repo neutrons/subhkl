@@ -1,7 +1,6 @@
-import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as colors
-
+import numpy as np
+from matplotlib import colors
 
 #: How many standard deviations out the drawn peak outline sits.  A peak has
 #: no edge, only a width, so any outline is a choice of contour; 2 sigma is

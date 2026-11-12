@@ -80,7 +80,7 @@ def test_rotating_sample_offset():
 
     # 4. Run Indexer (Stage 2 style: refine_sample=False)
     print("\n--- Running Indexer with Rotating Sample Offset ---")
-    score, hkl, lam, U = fu.minimize(
+    score, _hkl, _lam, _U = fu.minimize(
         strategy_name="DE",
         population_size=100,
         num_generations=50,

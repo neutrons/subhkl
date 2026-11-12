@@ -75,7 +75,7 @@ def extract_xyz_from_file(file_path, instrument=None):
         calibration_dict = {}
         if "detector_calibration" in f:
             calib_grp = f["detector_calibration"]
-            for b_key in calib_grp.keys():
+            for b_key in calib_grp:
                 calib = {
                     "center": calib_grp[b_key]["center"][()],
                     "uhat": calib_grp[b_key]["uhat"][()],
@@ -165,7 +165,7 @@ def extract_xyz_from_file(file_path, instrument=None):
                         seen_rows[row_bytes] = len(seen_rows)
                     frame_by_slot[key] = seen_rows[row_bytes]
 
-            for img_key_str in f["banks"].keys():
+            for img_key_str in f["banks"]:
                 img_idx = int(img_key_str)
                 grp = f[f"banks/{img_key_str}"]
                 i_p, j_p = grp["i"][()], grp["j"][()]
@@ -313,7 +313,7 @@ def compute_metrics(
                 }
 
             xyz_1, run_1, panel_1, frame_1 = extract_xyz_from_file(file1, instrument)
-            xyz_2, run_2, panel_2, frame_2 = extract_xyz_from_file(file2, instrument)
+            xyz_2, run_2, _panel_2, _frame_2 = extract_xyz_from_file(file2, instrument)
 
             if xyz_1 is None or xyz_2 is None:
                 return {
@@ -322,7 +322,7 @@ def compute_metrics(
 
             with h5py.File(file1, "r") as f1:
                 if "banks" in f1:
-                    for img_key_str in f1["banks"].keys():
+                    for img_key_str in f1["banks"]:
                         img_idx = int(img_key_str)
                         grp = f1[f"banks/{img_key_str}"]
                         h_p, k_p, l_p, lam_p = (
@@ -573,7 +573,15 @@ def compute_metrics(
 
         return result  # hkl_table if per_hkl else None
 
-    except Exception as e:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+        AttributeError,
+    ) as e:
         import traceback
 
         traceback.print_exc()

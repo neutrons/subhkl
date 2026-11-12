@@ -108,7 +108,7 @@ def test_zone_conic_orthogonality():
 
 def test_identify_zones_and_payload_schema():
     """build_rainbow_zone_payload identifies [100] and [010] zones and builds Lattice Ladder."""
-    peaks_xyz, U, B, UB, _, _ = _synthetic_orthorhombic_peaks()
+    peaks_xyz, _U, _B, UB, _, _ = _synthetic_orthorhombic_peaks()
 
     zones = identify_zones(peaks_xyz, ub_matrix=UB, max_index=1, tolerance_deg=0.5)
     labels = {z["label"] for z in zones}
@@ -177,7 +177,15 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert "canvas-detector" in content
     assert "canvas-stereo" in content
     assert "btn-proj-toggle" in content
-    assert "btn-zone-order" in content
+    assert "btn-zone-order" not in content
+    assert "btn-order-1" in content
+    assert 'id="nd-ipts" type="text" value=""' in content
+    assert 'id="nd-runs" type="text" value=""' in content
+    assert 'id="nd-sg" type="text" value=""' in content
+    assert '<option value="IMAGINE">' not in content
+    assert '<option value="TOPAZ">TOPAZ (SNS)</option>' in content
+    assert "TOPAZ" in payload_cg4d["beamline_detectors"]
+    assert len(payload_cg4d["beamline_detectors"]["TOPAZ"]) == 25
     assert "btn-zone-arcs" in content
     assert "showZoneArcs: true" in content
     assert "drawSingleZoneArc" in content
@@ -191,7 +199,9 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert "LATTICE LADDER" in content
 
     # Extract embedded JSON and validate it parses cleanly
-    match = re.search(r"window\.RAINBOW_ZONES_DATA\s*=\s*(\{.*?\});\n", content, re.S)
+    match = re.search(
+        r"window\.RAINBOW_ZONES_DATA\s*=\s*(\{.*?\});\n", content, re.DOTALL
+    )
     assert match is not None
     embedded = json.loads(match.group(1))
     assert len(embedded["peaks"]) == len(peaks_xyz)
@@ -349,6 +359,7 @@ def test_finderless_solve_h5_forward_projection_and_stages(tmp_path):
 def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     """Careless merge HDF5 stamping populates ASU orbits, residuals, scales, and multi-run sample_peaks."""
     import gemmi
+
     from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
     from subhkl.viz.rainbow_zones import render_rainbow_html
 
@@ -556,14 +567,23 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
         SubhklConfig(wavelength_min=5.0, wavelength_max=2.0)
 
     # 2. Verify MainApp(server=None) initializes ThemedApp, TrameBinding, ViewModel & UI cleanly
+    from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
     from subhkl.viz.nova_app.views.main_view import MainApp
 
     app = MainApp(instrument="CG4D")
     assert app.server is not None
+    assert app.server.state.trame__favicon == SUBHKL_FAVICON_DATA_URI
+    assert 'class="favicon-laue-zones"' in SUBHKL_FAVICON_SVG
+    assert "<rect" not in SUBHKL_FAVICON_SVG
     assert app.view_model.view_state.running is False
     assert app.view_model.model.subhkl.data.instrument == InstrumentOptions.CG4D
     html = app.server.state.parallax_html
     assert "DIFFRACTION PARALLAX" in html
+    assert '<img class="subhkl-logo-img" src="data:image/png;base64,' in html
+    assert (
+        f'<link rel="icon" type="image/svg+xml" href="{SUBHKL_FAVICON_DATA_URI}" />'
+        in html
+    )
     assert '<span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span>' in html
     assert "executeWorkflowStage" in html
     assert 'id="terminal-box"' in html
@@ -582,12 +602,15 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
     import subprocess
 
     if shutil.which("node"):
-        scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+        scripts = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
         assert scripts
         js_file = tmp_path / "embedded_check.js"
         js_file.write_text(scripts[-1], encoding="utf-8")
         proc = subprocess.run(
-            ["node", "--check", str(js_file)], capture_output=True, text=True
+            ["node", "--check", str(js_file)],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         assert proc.returncode == 0, f"JS syntax error: {proc.stderr}"
 
@@ -596,6 +619,7 @@ def test_predictor_and_integrator_ellipses_and_galaxy_dataset_loading(tmp_path):
     """Verify predictor.h5 and integrated.h5 (isotropic circles & anisotropic ellipses) are recognized and rendered."""
     import h5py
     import pytest
+
     from subhkl.viz.rainbow_zones import render_rainbow_html
 
     # 1. Create a synthetic predictor.h5 with banks/<img_idx>/(i, j, h, k, l, wavelength)
@@ -689,6 +713,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     """Verify merged.h5 sets pending_stage='solve' and CG4D /entry/title goniometer angles are harvested."""
     import h5py
     import pytest
+
     from subhkl.instrument.goniometer import (
         get_rotation_data_from_nexus,
         harvest_goniometer_angles_from_title,
@@ -776,6 +801,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
 
     # 4. Verify check_neutron_paths never touches the host filesystem directly and routes strictly through NDIP
     from unittest.mock import MagicMock
+
     from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
 
     runner_no_ndip = NovaGalaxyPipelineRunner(galaxy_url="")
@@ -999,6 +1025,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
 def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     """Verify CG4D neutrons_load_data file-mode routing, active-solve frame overlay, and MANDI curvilinear panel mesh."""
     import numpy as np
+
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
     from subhkl.instrument.goniometer import get_rotation_data_from_title
@@ -1031,7 +1058,7 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert mandi_in["params|ingest_mode"] == "oncat"
     assert mandi_in["params|instrument"] == "MANDI"
 
-    axes, angles, names = get_rotation_data_from_title("CaTiO3 phi=-59.0", "CG4D")
+    _axes, angles, names = get_rotation_data_from_title("CaTiO3 phi=-59.0", "CG4D")
     assert len(angles) == 5
     assert angles[-1] == -59.0
     assert "CG4D:Mot:phi" in names
@@ -1077,8 +1104,10 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert "isFrameSwitch" in html
 
     # 4. ImageStackMerger writes LZF-compressed 3D image stacks and multi-run check_neutron_paths returns verified_dataset_ids
-    import h5py
     from unittest.mock import MagicMock
+
+    import h5py
+
     from subhkl.commands import run_merge_images
 
     r1 = tmp_path / "CG4D_2625.reduce.h5"
@@ -1169,6 +1198,7 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
 
     # 6. Verify checkpoint(..., snapshot=...) writes a live Step 4 .stages.h5 loadable with include_panel_images=False
     from types import SimpleNamespace
+
     from subhkl.scan_refine import checkpoint
 
     stage_out = tmp_path / "live_solve.h5"
@@ -1357,7 +1387,22 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         include_peaks=True,
     )
     assert len(p_mat["zones"]) > 0
-    from subhkl import get_version
+    from subhkl import (
+        format_version_badge,
+        get_container_image,
+        get_container_tag,
+        get_version,
+    )
 
     assert p_mat["subhkl_version"] == get_version()
-    assert f'id="app-version">v{get_version().lstrip("v")}</span>' in html
+    assert f'id="app-version">{format_version_badge(get_version())}</span>' in html
+    assert format_version_badge("1.5.0") == "v1.5.0"
+    assert format_version_badge("v1.5.0") == "v1.5.0"
+    assert (
+        format_version_badge("feat/ui-logo-and-favicon") == "feat/ui-logo-and-favicon"
+    )
+    assert get_container_tag("feat/ui-logo-and-favicon") == "feat-ui-logo-and-favicon"
+    assert get_container_tag("v1.5.0") == "1.5.0"
+    assert p_mat["pipeline_stages"][0]["container"] == get_container_image()
+    assert p_mat["pipeline_stages"][1]["container"] == get_container_image()
+    assert p_mat["pipeline_stages"][2]["container"] == get_container_image()

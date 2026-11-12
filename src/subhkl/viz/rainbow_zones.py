@@ -22,6 +22,7 @@ Key features:
 from __future__ import annotations
 
 import base64
+import contextlib
 import glob
 import io
 import json
@@ -34,8 +35,14 @@ import h5py
 import numpy as np
 from PIL import Image
 
-from subhkl import get_version as get_subhkl_version
-
+from subhkl import (
+    format_version_badge,
+    get_container_image,
+)
+from subhkl import (
+    get_version as get_subhkl_version,
+)
+from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_LOGO_SVG
 from subhkl.viz.zones import (
     _cell_from_B,
     _spherical_angles,
@@ -108,10 +115,10 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
                 pass
 
     for bank_id, cfg in base_configs.items():
-        try:
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError
+        ):
             detectors[bank_id] = Detector(cfg)
-        except Exception:
-            pass
 
     if "detector_calibration" in f:
         cal_grp = f["detector_calibration"]
@@ -132,10 +139,10 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
             for field in ("width", "height"):
                 if field in g:
                     cfg[field] = float(g[field][()])
-            try:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
                 detectors[bank_id] = Detector(cfg)
-            except Exception:
-                pass
 
     return detectors
 
@@ -147,10 +154,12 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
     p = Path(replay_h5).resolve()
     if not p.exists():
         return None
-    try:
-        with h5py.File(p, "r") as f:
-            if "images" in f:
-                return str(p)
+    with (
+        contextlib.suppress(OSError, RuntimeError, ValueError, TypeError, KeyError),
+        h5py.File(p, "r") as f,
+    ):
+        if "images" in f:
+            return str(p)
             src_attr = _decode_str(f.attrs.get("source"), "")
             if not src_attr and "scan_refinement" in f:
                 src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
@@ -159,14 +168,16 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
             if src_attr:
                 for cand_src in (Path(src_attr), p.parent / Path(src_attr).name):
                     if cand_src.exists():
-                        try:
-                            with h5py.File(cand_src, "r") as sf:
-                                if "images" in sf:
-                                    return str(cand_src.resolve())
-                        except Exception:
-                            pass
+                        with (
+                            contextlib.suppress(OSError, RuntimeError, KeyError),
+                            h5py.File(cand_src, "r") as sf,
+                        ):
+                            if "images" in sf:
+                                return str(cand_src.resolve())
             if "files" in f:
-                try:
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
                     raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
                     raw_files = [x for x in raw_files if x]
                     if raw_files:
@@ -186,10 +197,6 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                             )
                             if work_cand.is_file():
                                 return str(work_cand.resolve())
-                except Exception:
-                    pass
-    except Exception:
-        pass
 
     parent = p.parent
     if parent.resolve() == Path(tempfile.gettempdir()).resolve():
@@ -198,12 +205,12 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
         glob.glob(str(parent / "*merged*.h5"))
     )
     for cand in candidates:
-        try:
-            with h5py.File(cand, "r") as f:
-                if "images" in f and "bank_ids" in f:
-                    return cand
-        except Exception:
-            continue
+        with (
+            contextlib.suppress(OSError, RuntimeError, KeyError),
+            h5py.File(cand, "r") as f,
+        ):
+            if "images" in f and "bank_ids" in f:
+                return cand
     return None
 
 
@@ -250,10 +257,13 @@ def _encode_panel_textures(
                             or (int(ims.shape[1]) == 256 and det_n == 512)
                         ):
                             det_compat = False
-                        uniq_b = set(int(x) for x in np.unique(b_ids_all))
-                        if uniq_b and not uniq_b.issubset(set(detectors.keys())):
-                            if len(uniq_b - set(detectors.keys())) > 2:
-                                det_compat = False
+                        uniq_b = {int(x) for x in np.unique(b_ids_all)}
+                        if (
+                            uniq_b
+                            and not uniq_b.issubset(set(detectors.keys()))
+                            and len(uniq_b - set(detectors.keys())) > 2
+                        ):
+                            det_compat = False
                     if det_compat:
                         f0, f1 = 0, n_total_frames
                         if frame_slice is not None:
@@ -289,8 +299,8 @@ def _encode_panel_textures(
                                 raw_bank_images[bk] = imb
                         if raw_bank_images:
                             intensity_source = "raw_h5"
-        except Exception:
-            pass
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
+            intensity_source = "synthesized_peaks"
 
     # If no raw images were loaded, synthesize clean 2D Gaussian spot maps on each populated bank
     if (
@@ -480,8 +490,16 @@ def _encode_panel_textures(
                     "texture_b64": tex_b64,
                 }
             )
-        except Exception:
-            pass
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            IndexError,
+            AttributeError,
+        ):
+            continue
 
     return panels_payload, intensity_source
 
@@ -549,40 +567,41 @@ def _extract_from_h5(
                 if (
                     abs(wavelength_range[0] - 2.0) < 1e-3
                     and abs(wavelength_range[1] - 10.0) < 1e-3
-                ):
-                    if sib_solve_path:
-                        try:
-                            with h5py.File(sib_solve_path, "r") as sf:
-                                for wk in (
-                                    "scan_refinement/band_wavelength",
-                                    "instrument/wavelength",
-                                ):
-                                    if wk in sf:
-                                        swl = np.asarray(
-                                            sf[wk][()], dtype=float
-                                        ).ravel()
-                                        if len(swl) >= 2:
-                                            wavelength_range = (
-                                                float(swl[0]),
-                                                float(swl[1]),
-                                            )
-                                            break
-                        except Exception:
-                            pass
-        elif sib_solve_path:
-            try:
-                with h5py.File(sib_solve_path, "r") as sf:
-                    for wk in (
-                        "scan_refinement/band_wavelength",
-                        "instrument/wavelength",
+                ) and sib_solve_path:
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(sib_solve_path, "r") as sf,
                     ):
-                        if wk in sf:
-                            swl = np.asarray(sf[wk][()], dtype=float).ravel()
-                            if len(swl) >= 2:
-                                wavelength_range = (float(swl[0]), float(swl[1]))
-                                break
-            except Exception:
-                pass
+                        for wk in (
+                            "scan_refinement/band_wavelength",
+                            "instrument/wavelength",
+                        ):
+                            if wk in sf:
+                                swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                                if len(swl) >= 2:
+                                    wavelength_range = (
+                                        float(swl[0]),
+                                        float(swl[1]),
+                                    )
+                                    break
+        elif sib_solve_path:
+            with (
+                contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ),
+                h5py.File(sib_solve_path, "r") as sf,
+            ):
+                for wk in (
+                    "scan_refinement/band_wavelength",
+                    "instrument/wavelength",
+                ):
+                    if wk in sf:
+                        swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                        if len(swl) >= 2:
+                            wavelength_range = (float(swl[0]), float(swl[1]))
+                            break
 
         U = np.asarray(f["sample/U"][()], dtype=float) if "sample/U" in f else None
         B = np.asarray(f["sample/B"][()], dtype=float) if "sample/B" in f else None
@@ -626,15 +645,17 @@ def _extract_from_h5(
                     _decode_str(x, "").upper() for x in list(f["files"][()])
                 )
             elif src_h5 and os.path.isfile(src_h5):
-                try:
-                    with h5py.File(src_h5, "r") as sf_inst:
-                        if "files" in sf_inst:
-                            name_cands.extend(
-                                _decode_str(x, "").upper()
-                                for x in list(sf_inst["files"][()])
-                            )
-                except Exception:
-                    pass
+                with (
+                    contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ),
+                    h5py.File(src_h5, "r") as sf_inst,
+                ):
+                    if "files" in sf_inst:
+                        name_cands.extend(
+                            _decode_str(x, "").upper()
+                            for x in list(sf_inst["files"][()])
+                        )
             for fn_s in name_cands:
                 for known_inst in ("MANDI", "TOPAZ", "CG4D", "IMAGINE"):
                     if known_inst in fn_s:
@@ -724,30 +745,32 @@ def _extract_from_h5(
         for aux_path in (src_h5, sib_solve_path):
             if not aux_path or not os.path.isfile(aux_path):
                 continue
-            try:
-                with h5py.File(aux_path, "r") as af:
-                    if offsets is None and "file_offsets" in af:
-                        offsets = np.asarray(af["file_offsets"][()], dtype=int)
-                    if n_frames_total == 0 and "bank_ids" in af:
-                        n_frames_total = len(af["bank_ids"])
-                    if files_raw is None and "files" in af:
-                        files_raw = list(af["files"][()])
-                    if gonio_names_raw is None and "goniometer/names" in af:
-                        gonio_names_raw = list(af["goniometer/names"][()])
-                    if gonio_axes is None and "goniometer/axes" in af:
-                        gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
-                    if aux_path == src_h5 and "goniometer/angles" in af:
-                        gonio_angles_nom = np.asarray(
-                            af["goniometer/angles"][()], dtype=float
-                        )
-                    elif gonio_angles_ref is None and "goniometer/angles" in af:
-                        gonio_angles_ref = np.asarray(
-                            af["goniometer/angles"][()], dtype=float
-                        )
-                    if R_all is None and "goniometer/R" in af:
-                        R_all = np.asarray(af["goniometer/R"][()], dtype=float)
-            except Exception:
-                pass
+            with (
+                contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ),
+                h5py.File(aux_path, "r") as af,
+            ):
+                if offsets is None and "file_offsets" in af:
+                    offsets = np.asarray(af["file_offsets"][()], dtype=int)
+                if n_frames_total == 0 and "bank_ids" in af:
+                    n_frames_total = len(af["bank_ids"])
+                if files_raw is None and "files" in af:
+                    files_raw = list(af["files"][()])
+                if gonio_names_raw is None and "goniometer/names" in af:
+                    gonio_names_raw = list(af["goniometer/names"][()])
+                if gonio_axes is None and "goniometer/axes" in af:
+                    gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
+                if aux_path == src_h5 and "goniometer/angles" in af:
+                    gonio_angles_nom = np.asarray(
+                        af["goniometer/angles"][()], dtype=float
+                    )
+                elif gonio_angles_ref is None and "goniometer/angles" in af:
+                    gonio_angles_ref = np.asarray(
+                        af["goniometer/angles"][()], dtype=float
+                    )
+                if R_all is None and "goniometer/R" in af:
+                    R_all = np.asarray(af["goniometer/R"][()], dtype=float)
 
         if gonio_angles_nom is None:
             gonio_angles_nom = gonio_angles_ref
@@ -917,9 +940,7 @@ def _extract_from_h5(
         if any(k in f for k in ("blind_search", "scan_refinement", "solve", "search")):
             solve_diagnostics = {}
             bs_grp = (
-                f["blind_search"]
-                if "blind_search" in f
-                else (f["search"] if "search" in f else None)
+                f["blind_search"] if "blind_search" in f else (f.get("search", None))
             )
             if bs_grp is not None:
                 solve_diagnostics["stable_observations"] = int(
@@ -934,7 +955,7 @@ def _extract_from_h5(
                 )
                 if "proposal_scores" in bs_grp:
                     ps = np.asarray(bs_grp["proposal_scores"][()], dtype=float).ravel()
-                    solve_diagnostics["n_candidates"] = int(len(ps))
+                    solve_diagnostics["n_candidates"] = len(ps)
                     solve_diagnostics["top_proposal_score"] = (
                         float(np.max(ps)) if len(ps) else 0.0
                     )
@@ -957,7 +978,7 @@ def _extract_from_h5(
                 stages_raw = _decode_str(sr_grp.attrs.get("stages"), "[]")
                 try:
                     solve_diagnostics["stages"] = json.loads(stages_raw)
-                except Exception:
+                except (ValueError, TypeError):
                     solve_diagnostics["stages"] = []
             elif "solve" in f:
                 s_grp = f["solve"]
@@ -1049,23 +1070,23 @@ def _extract_from_h5(
 
         merge_metrics: dict[str, Any] | None = None
         if "careless/metrics_json" in f:
-            try:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
                 raw_m = _decode_str(f["careless/metrics_json"][()], "{}")
                 doc_m = json.loads(raw_m)
                 if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
                     merge_metrics = _normalize_merge_metrics(doc_m)
-            except Exception:
-                pass
         elif "peaks" in f:
             sib_m = Path(h5_path).parent / "careless_metrics.json"
             if sib_m.is_file():
-                try:
-                    with open(sib_m, "r", encoding="utf-8") as mfh:
-                        doc_m = json.load(mfh)
-                        if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
-                            merge_metrics = _normalize_merge_metrics(doc_m)
-                except Exception:
-                    pass
+                with (
+                    contextlib.suppress(OSError, ValueError, TypeError, KeyError),
+                    open(sib_m, encoding="utf-8") as mfh,
+                ):
+                    doc_m = json.load(mfh)
+                    if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
+                        merge_metrics = _normalize_merge_metrics(doc_m)
 
         artifact_kind = "solve"
         peak_shape_mode = "solved_circle"
@@ -1144,7 +1165,9 @@ def _extract_from_h5(
                     and gonio_angles_nom.ndim == 2
                     and 0 <= f0_r < len(gonio_angles_nom)
                 ):
-                    try:
+                    with contextlib.suppress(
+                        ImportError, RuntimeError, ValueError, TypeError, IndexError
+                    ):
                         from subhkl.instrument.goniometer import (
                             calc_goniometer_rotation_matrix,
                         )
@@ -1152,8 +1175,6 @@ def _extract_from_h5(
                         R_per_run[ur_i] = calc_goniometer_rotation_matrix(
                             gonio_axes, gonio_angles_nom[f0_r]
                         )
-                    except Exception:
-                        pass
             all_runs_data = {
                 "peaks_xyz": peaks_xyz[idx_all],
                 "hkl": hkl[idx_all],
@@ -1266,7 +1287,14 @@ def _extract_from_h5(
 
         # Recognize predictor.h5 format: banks/<img_idx>/(i, j, h, k, l, wavelength)
         if (peaks_xyz is None or len(peaks_xyz) == 0) and "banks" in f:
-            try:
+            with contextlib.suppress(
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 artifact_kind = "predictor"
                 peak_shape_mode = "predicted_circle"
                 b_ids_pred = (
@@ -1283,19 +1311,19 @@ def _extract_from_h5(
 
                 bank_imgs_pred: dict[int, np.ndarray] = {}
                 if src_h5 and os.path.exists(src_h5):
-                    try:
-                        with h5py.File(src_h5, "r") as mf:
-                            if "images" in mf and "bank_ids" in mf:
-                                b_ids_s = np.asarray(
-                                    mf["bank_ids"][f0_p:f1_p], dtype=int
-                                )
-                                ims_s = np.asarray(
-                                    mf["images"][f0_p:f1_p], dtype=np.float32
-                                )
-                                for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                    bank_imgs_pred[int(b_id_s)] = im_s
-                    except Exception:
-                        pass
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(src_h5, "r") as mf,
+                    ):
+                        if "images" in mf and "bank_ids" in mf:
+                            b_ids_s = np.asarray(mf["bank_ids"][f0_p:f1_p], dtype=int)
+                            ims_s = np.asarray(
+                                mf["images"][f0_p:f1_p], dtype=np.float32
+                            )
+                            for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                bank_imgs_pred[int(b_id_s)] = im_s
 
                 xyz_p, hkl_p, lam_p, bank_p, pr_p, pc_p, inten_p = (
                     [],
@@ -1381,8 +1409,6 @@ def _extract_from_h5(
                     pixel_c = np.concatenate(pc_p, axis=0)
                     intensity = np.concatenate(inten_p, axis=0)
                     sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
-            except Exception:
-                pass
 
         R_gonio = None
         if R_all is not None:
@@ -1414,7 +1440,9 @@ def _extract_from_h5(
             and gonio_angles_nom.ndim == 2
             and len(gonio_angles_nom) > 0
         ):
-            try:
+            with contextlib.suppress(
+                ImportError, RuntimeError, ValueError, TypeError, IndexError
+            ):
                 from subhkl.instrument.goniometer import (
                     calc_goniometer_rotation_matrix,
                 )
@@ -1428,8 +1456,6 @@ def _extract_from_h5(
                 R_gonio = calc_goniometer_rotation_matrix(
                     gonio_axes, gonio_angles_nom[f0_ang]
                 )
-            except Exception:
-                pass
 
         # Finder-less solve.h5 forward projection onto calibrated detector banks
         if (
@@ -1439,7 +1465,15 @@ def _extract_from_h5(
             and B is not None
             and detectors
         ):
-            try:
+            with contextlib.suppress(
+                ImportError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 from subhkl.core.crystallography import generate_reflections
 
                 U_mat = np.asarray(U, dtype=float)
@@ -1487,39 +1521,37 @@ def _extract_from_h5(
 
                 bank_imgs: dict[int, np.ndarray] = {}
                 if src_h5 and os.path.exists(src_h5):
-                    try:
-                        with h5py.File(src_h5, "r") as mf:
-                            if "images" in mf and "bank_ids" in mf:
-                                f0_s, f1_s = (
-                                    frame_slice
-                                    if frame_slice is not None
-                                    else (0, len(mf["bank_ids"]))
-                                )
-                                b_ids_s = np.asarray(
-                                    mf["bank_ids"][f0_s:f1_s], dtype=int
-                                )
-                                ims_s = np.asarray(
-                                    mf["images"][f0_s:f1_s], dtype=np.float32
-                                )
-                                sample_det = (
-                                    next(iter(detectors.values()))
-                                    if detectors
-                                    else None
-                                )
-                                det_n = int(getattr(sample_det, "n", 0))
-                                compat = True
-                                if (
-                                    ims_s.ndim >= 3
-                                    and det_n > 0
-                                    and int(ims_s.shape[1]) != det_n
-                                ):
-                                    compat = False
-                                if compat:
-                                    for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                        if int(b_id_s) in detectors:
-                                            bank_imgs[int(b_id_s)] = im_s
-                    except Exception:
-                        pass
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(src_h5, "r") as mf,
+                    ):
+                        if "images" in mf and "bank_ids" in mf:
+                            f0_s, f1_s = (
+                                frame_slice
+                                if frame_slice is not None
+                                else (0, len(mf["bank_ids"]))
+                            )
+                            b_ids_s = np.asarray(mf["bank_ids"][f0_s:f1_s], dtype=int)
+                            ims_s = np.asarray(
+                                mf["images"][f0_s:f1_s], dtype=np.float32
+                            )
+                            sample_det = (
+                                next(iter(detectors.values())) if detectors else None
+                            )
+                            det_n = int(getattr(sample_det, "n", 0))
+                            compat = True
+                            if (
+                                ims_s.ndim >= 3
+                                and det_n > 0
+                                and int(ims_s.shape[1]) != det_n
+                            ):
+                                compat = False
+                            if compat:
+                                for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                    if int(b_id_s) in detectors:
+                                        bank_imgs[int(b_id_s)] = im_s
 
                 cal_bids_set: set[int] = set()
                 if "detector_calibration" in f:
@@ -1533,11 +1565,7 @@ def _extract_from_h5(
                 active_bids = (
                     set(bank_imgs.keys())
                     if bank_imgs
-                    else (
-                        cal_bids_set
-                        if cal_bids_set
-                        else set(int(k) for k in detectors.keys())
-                    )
+                    else (cal_bids_set if cal_bids_set else {int(k) for k in detectors})
                 )
 
                 raw_hits: list[dict[str, Any]] = []
@@ -1656,8 +1684,6 @@ def _extract_from_h5(
                     pixel_c = np.concatenate(pc_l, axis=0)
                     intensity = np.concatenate(inten_l, axis=0)
                     sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
-            except Exception:
-                pass
 
         if peaks_xyz is None:
             peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -2003,7 +2029,7 @@ def _build_ndip_pipeline_stages(
                 if is_finderless
                 else ["imaginex_subhkl_prepare_peaks", "imaginex_subhkl_peak_fit"]
             ),
-            "container": "ghcr.io/neutrons/subhkl:1.5.0",
+            "container": get_container_image(),
             "artifact": (
                 f"merged.h5 ({solve_diagnostics['stable_observations']:,} count bins)"
                 if is_finderless
@@ -2027,7 +2053,7 @@ def _build_ndip_pipeline_stages(
             "step_num": 2,
             "name": "2. SOLVE (LATTICE LADDER)",
             "tool_ids": ["imaginex_subhkl_solve", "imaginex_subhkl"],
-            "container": "ghcr.io/neutrons/subhkl:1.5.0",
+            "container": get_container_image(),
             "artifact": f"solve.h5 ({n_indexed}/{n_peaks} spots • {n_zones_ord1} ord-1 zones)",
             "status": _stage_status(1),
             "ladder_rung_idx": 4,
@@ -2044,7 +2070,7 @@ def _build_ndip_pipeline_stages(
                 "imaginex_subhkl_predict",
                 "imaginex_subhkl_integrate",
             ],
-            "container": "ghcr.io/neutrons/subhkl:1.5.0",
+            "container": get_container_image(),
             "artifact": "predictor.h5 → integrated.h5",
             "status": _stage_status(2),
             "ladder_rung_idx": 4,
@@ -2453,7 +2479,9 @@ def build_rainbow_zone_payload(
             c0 = pixel_c_arr[idxs][:, None]
             cols_ell = c0 + a_bk * cos_t * c_phi - b_bk * sin_t * s_phi
             rows_ell = r0 + a_bk * cos_t * s_phi + b_bk * sin_t * c_phi
-            try:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+            ):
                 xyz_ell = det.pixel_to_lab(rows_ell.ravel(), cols_ell.ravel())
                 az_ell, y_ell = _unrolled(xyz_ell)
                 _, el_ell = _spherical_angles(xyz_ell)
@@ -2479,14 +2507,12 @@ def build_rainbow_zone_payload(
                     sigma_major_by_idx[p_i] = round(float(s1_all[p_i]), 2)
                     sigma_minor_by_idx[p_i] = round(float(s2_all[p_i]), 2)
                     ellipse_ang_by_idx[p_i] = round(float(np.rad2deg(phi_all[p_i])), 1)
-            except Exception:
-                pass
 
     # Compute canonical ASU symmetry orbits and Laue harmonic ray multiplicity
     sg_obj = None
     asu_obj = None
     sg_ops = None
-    try:
+    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
         import gemmi
 
         sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
@@ -2495,16 +2521,12 @@ def build_rainbow_zone_payload(
         if sg_obj is not None:
             asu_obj = gemmi.ReciprocalAsu(sg_obj)
             sg_ops = sg_obj.operations()
-    except Exception:
-        pass
 
     def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int]:
         if asu_obj is not None and sg_ops is not None and (h_v or k_v or l_v):
-            try:
+            with contextlib.suppress(RuntimeError, ValueError, TypeError, IndexError):
                 ha, _ = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
                 return (int(ha[0]), int(ha[1]), int(ha[2]))
-            except Exception:
-                pass
         ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
         sg_u = str(space_group or "").upper()
         is_cubic = "3" in sg_u or (
@@ -2788,7 +2810,14 @@ def build_rainbow_zone_payload(
             )
         )
         if needs_bin_enrich and len(sample_peaks) > 0:
-            try:
+            with contextlib.suppress(
+                ImportError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 import gemmi as _gm
 
                 asu_obs_map: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
@@ -2926,8 +2955,6 @@ def build_rainbow_zone_payload(
                         )
                     merge_metrics["cc_half_bins"] = enriched_bins
                     merge_metrics["resolution_bins"] = enriched_bins
-            except Exception:
-                pass
 
     zones_payload: list[dict[str, Any]] = []
     for zi, z in enumerate(raw_zones):
@@ -2941,7 +2968,14 @@ def build_rainbow_zone_payload(
         kf = conic_lab["kf_hat"]
         if detectors:
             for bk, det in sorted(detectors.items()):
-                try:
+                with contextlib.suppress(
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    IndexError,
+                ):
                     mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
                     if not np.any(mask):
                         continue
@@ -2973,8 +3007,6 @@ def build_rainbow_zone_payload(
                                     for j in range(0, len(px), step_s)
                                 ]
                             )
-                except Exception:
-                    pass
 
         dx = np.asarray(conic_lab["det_x"], dtype=float)
         dy = np.asarray(conic_lab["det_y"], dtype=float)
@@ -3111,7 +3143,7 @@ def build_rainbow_zone_payload(
     from subhkl.config import beamlines as _cfg_beamlines
 
     beamline_detectors: dict[str, dict[str, Any]] = {}
-    for _inst_k in ("CG4D", "MANDI", "IMAGINE"):
+    for _inst_k in ("CG4D", "MANDI", "TOPAZ", "IMAGINE"):
         if _inst_k in _cfg_beamlines:
             beamline_detectors[_inst_k] = {
                 str(bk): {
@@ -3173,7 +3205,9 @@ def render_rainbow_html(
 ) -> str:
     """Render a unified, self-contained HTML5/Canvas/JS diffraction parallax widget."""
     payload_json = json.dumps(payload, separators=(",", ":"))
-    subhkl_ver = str(payload.get("subhkl_version") or get_subhkl_version()).lstrip("v")
+    subhkl_ver_badge = format_version_badge(
+        str(payload.get("subhkl_version") or get_subhkl_version())
+    )
     inst = payload.get("instrument", "IMAGINE")
     sg = payload.get("space_group", "P 1")
     initial_proj = (
@@ -3195,7 +3229,8 @@ def render_rainbow_html(
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-{base_tag_html}<title>{title}</title>
+{base_tag_html}<link rel="icon" type="image/svg+xml" href="{SUBHKL_FAVICON_DATA_URI}" />
+<title>{title}</title>
 <script src="https://cdn.jsdelivr.net/npm/h5wasm@0.7.8/dist/iife/h5wasm.js" async></script>
 <style>
   :root {{
@@ -3261,7 +3296,27 @@ def render_rainbow_html(
     font-size: 1.05rem;
     letter-spacing: 0.3px;
     display: inline-flex;
-    align-items: baseline;
+    align-items: center;
+    gap: 4px;
+  }}
+
+  .subhkl-logo-img {{
+    height: 24px;
+    width: 90px;
+    display: block;
+    flex-shrink: 0;
+  }}
+
+  .sr-only {{
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }}
 
   .logo-sub {{
@@ -3281,8 +3336,10 @@ def render_rainbow_html(
     font-size: 0.62rem;
     font-weight: 600;
     color: var(--text-dim);
-    margin-left: 5px;
+    margin-left: 2px;
     letter-spacing: 0.2px;
+    align-self: flex-end;
+    margin-bottom: 3px;
   }}
 
   .subtitle-tag {{
@@ -3814,7 +3871,7 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span><span class="logo-version" id="app-version">v{subhkl_ver}</span></div>
+      <div class="rainbow-logo" id="app-title">{SUBHKL_LOGO_SVG}<span class="sr-only"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></span><span class="logo-version" id="app-version">{subhkl_ver_badge}</span></div>
       <span class="subtitle-tag">{inst} · {sg}</span>
     </div>
 
@@ -3861,9 +3918,6 @@ def render_rainbow_html(
       </button>
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
         Cyl
-      </button>
-      <button id="btn-zone-order" class="active-btn" title="Cycle maximum Laue zone index order: |u,v,w| ≤ 1 (fundamental) → ≤ 2 → ≤ 3 (higher-order)">
-        |uvw|≤1
       </button>
       <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
         Arcs
@@ -4070,21 +4124,20 @@ def render_rainbow_html(
             INSTRUMENT
             <select id="nd-instrument" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
               <option value="CG4D" selected>CG4D (IMAGINE-X)</option>
-              <option value="IMAGINE">IMAGINE (HFIR)</option>
               <option value="MANDI">MANDI (SNS)</option>
               <option value="TOPAZ">TOPAZ (SNS)</option>
             </select>
           </label>
           <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
             IPTS NUMBER
-            <input id="nd-ipts" type="text" value="37331" placeholder="e.g. 37331" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-ipts" type="text" value="" placeholder="e.g. 37331" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
             <span style="display:flex;align-items:center;justify-content:space-between;">
               <span>RUN OR RANGE</span>
               <span id="nd-multirun-badge" style="font-size:0.58rem;color:var(--accent-cyan);">Multi-run</span>
             </span>
-            <input id="nd-runs" type="text" value="2625-2638" placeholder="e.g. 2625-2638 or 12737,12739" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-runs" type="text" value="" placeholder="e.g. 2625-2638 or 12737,12739" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
 
@@ -4152,46 +4205,46 @@ def render_rainbow_html(
         <div style="display:grid;grid-template-columns:1.3fr repeat(3,minmax(0,1fr));gap:8px;margin-bottom:6px;">
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             SPACE GROUP
-            <input id="nd-sg" type="text" value="{sg}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-sg" type="text" value="" placeholder="e.g. P 21 21 21 or F d d 2" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             a (Å)
-            <input id="nd-a" type="number" step="0.01" value="69.07" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-a" type="number" step="0.01" value="" placeholder="a" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             b (Å)
-            <input id="nd-b" type="number" step="0.01" value="98.00" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-b" type="number" step="0.01" value="" placeholder="b" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             c (Å)
-            <input id="nd-c" type="number" step="0.01" value="90.92" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-c" type="number" step="0.01" value="" placeholder="c" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
         <!-- Row 2: Unit cell angles alpha, beta, gamma + wavelength band -->
         <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) 0.85fr 0.85fr;gap:8px;margin-bottom:8px;">
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             α (°)
-            <input id="nd-alpha" type="number" step="0.01" value="90.07" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-alpha" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             β (°)
-            <input id="nd-beta" type="number" step="0.01" value="106.14" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-beta" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             γ (°)
-            <input id="nd-gamma" type="number" step="0.01" value="90.01" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-gamma" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             λ_min (Å)
-            <input id="nd-wl-min" type="number" step="0.1" value="{init_wl_min:.1f}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-wl-min" type="number" step="0.1" value="" placeholder="e.g. 2.0" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             λ_max (Å)
-            <input id="nd-wl-max" type="number" step="0.1" value="{init_wl_max:.1f}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-wl-max" type="number" step="0.1" value="" placeholder="e.g. 4.5" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
         <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px;">
-          Preview: /HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5 … CG4D_2638.nxs.h5 (14 runs)
+          Preview: specify IPTS + run range or explicit file path(s)
         </div>
         <div id="nd-preview-title" style="font-family:var(--font-display);font-size:0.63rem;color:var(--accent-gold);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:4px;"></div>
         <div id="nd-validation-status" style="font-family:var(--font-display);font-size:0.66rem;min-height:18px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 6px;border-radius:4px;background:rgba(7,9,19,0.65);border:1px solid rgba(56,189,248,0.2);">
@@ -4695,8 +4748,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.maxZoneOrder = ordLevel;
     const matching = ZONES.filter(z => (z.order || 1) <= ordLevel).map(z => z.zone_id);
     state.activeZones = new Set(matching);
-    const btnTop = document.getElementById("btn-zone-order");
-    if (btnTop) btnTop.textContent = `|uvw|≤${{ordLevel}}`;
     [1, 2, 3].forEach(k => {{
       const b = document.getElementById(`btn-order-${{k}}`);
       if (b) b.classList.toggle("active-btn", k === ordLevel);
@@ -6072,11 +6123,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     syncProjectionUI();
   }});
 
-  document.getElementById("btn-zone-order").addEventListener("click", () => {{
-    const nextOrder = state.maxZoneOrder >= 3 ? 1 : state.maxZoneOrder + 1;
-    setMaxZoneOrder(nextOrder);
-  }});
-
   [1, 2, 3].forEach(ordLevel => {{
     const b = document.getElementById(`btn-order-${{ordLevel}}`);
     if (b) b.addEventListener("click", () => setMaxZoneOrder(ordLevel));
@@ -6408,7 +6454,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const subEl = document.querySelector(".subtitle-tag");
     const verEl = document.getElementById("app-version");
     if (verEl && newPayload.subhkl_version) {{
-      verEl.textContent = "v" + String(newPayload.subhkl_version).replace(/^v/i, "");
+      const rawVer = String(newPayload.subhkl_version).trim();
+      verEl.textContent = /^[vV]?[0-9]+[.][0-9]+/.test(rawVer)
+        ? ("v" + rawVer.replace(/^[vV]/, ""))
+        : rawVer;
     }}
     const artKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
     const shapeMode = newPayload.peak_shape_mode || DATA.peak_shape_mode || "solved_circle";
@@ -6440,19 +6489,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (DATA.space_group) {{
       const sgEl = document.getElementById("inp-sg");
       if (sgEl) sgEl.value = DATA.space_group;
-      const ndSgEl = document.getElementById("nd-sg");
-      if (ndSgEl) ndSgEl.value = DATA.space_group;
     }}
     if (DATA.cell && DATA.cell.length === 6) {{
       const c = DATA.cell;
       document.getElementById("cell-summary").textContent = `${{c[0].toFixed(1)}}, ${{c[1].toFixed(1)}}, ${{c[2].toFixed(1)}} Å`;
       const ids = ["inp-a", "inp-b", "inp-c", "inp-alpha", "inp-beta", "inp-gamma"];
-      const ndIds = ["nd-a", "nd-b", "nd-c", "nd-alpha", "nd-beta", "nd-gamma"];
       ids.forEach((id, i) => {{
-        const el = document.getElementById(id);
-        if (el && typeof c[i] === "number") el.value = c[i].toFixed(2);
-      }});
-      ndIds.forEach((id, i) => {{
         const el = document.getElementById(id);
         if (el && typeof c[i] === "number") el.value = c[i].toFixed(2);
       }});
@@ -6586,6 +6628,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (f.keys().includes("files")) {{
           const fl = Array.from(f.get("files").value || []).map(String).join(" ").toUpperCase();
           if (fl.includes("MANDI")) inst = "MANDI";
+          else if (fl.includes("TOPAZ")) inst = "TOPAZ";
           else if (fl.includes("CG4D")) inst = "CG4D";
           else if (fl.includes("IMAGINE")) inst = "IMAGINE";
         }}
@@ -6596,9 +6639,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (sh[1] === 256) inst = "MANDI";
       else if (sh[1] === 512) inst = "CG4D";
     }}
-    if (!inst) inst = DATA.instrument || "CG4D";
 
-    let wlRangeNew = (inst === "MANDI" || inst === "TOPAZ") ? [2.0, 4.0] : [2.8, 4.5];
+    let wlRangeNew = (inst === "TOPAZ") ? [0.4, 3.5] : ((inst === "MANDI") ? [2.0, 4.0] : [2.8, 4.5]);
     let dMinNew = Number((0.5 * Number(wlRangeNew[0])).toFixed(2));
     try {{
       if (f.keys().includes("instrument")) {{
@@ -6640,13 +6682,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
       }}
       bankIdsRun = bAll.slice(f0, f1);
-      if (bankIdsRun.some(b => b > 60)) inst = "CG4D";
-      else if (bankIdsRun.some(b => b < 10) || (bankIdsRun.length > 0 && bankIdsRun.length <= 45)) inst = "MANDI";
+      if (!inst) {{
+        if (bankIdsRun.some(b => b > 60)) inst = "CG4D";
+        else if (bankIdsRun.length > 0 && bankIdsRun.length <= 25 && bankIdsRun.every(b => b >= 13 && b <= 59)) inst = "TOPAZ";
+        else if (bankIdsRun.some(b => b < 10) || (bankIdsRun.length > 0 && bankIdsRun.length <= 45)) inst = "MANDI";
+      }}
     }}
+    if (!inst) inst = DATA.instrument || "CG4D";
 
     // Seed nominal detector banks from DATA.beamline_detectors[inst], then override with detector_calibration/bank_*
     const detMap = new Map();
     const nomBanks = (DATA.beamline_detectors && DATA.beamline_detectors[inst]) || {{}};
+    const defaultDim = (inst === "MANDI" || inst === "TOPAZ") ? 256 : 512;
     Object.entries(nomBanks).forEach(([bkStr, cfg]) => {{
       const bid = parseInt(bkStr, 10);
       detMap.set(bid, {{
@@ -6656,8 +6703,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         vhat: [...cfg.vhat],
         width: Number(cfg.width),
         height: Number(cfg.height),
-        m: Number(cfg.m || (inst === "MANDI" ? 256 : 512)),
-        n: Number(cfg.n || (inst === "MANDI" ? 256 : 512)),
+        m: Number(cfg.m || defaultDim),
+        n: Number(cfg.n || defaultDim),
       }});
     }});
     if (f.keys().includes("detector_calibration")) {{
@@ -6666,7 +6713,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (!bName.startsWith("bank_")) continue;
         const bid = parseInt(bName.slice(5), 10);
         const g = calGrp.get(bName);
-        const baseDet = detMap.get(bid) || {{ m: inst === "MANDI" ? 256 : 512, n: inst === "MANDI" ? 256 : 512 }};
+        const baseDet = detMap.get(bid) || {{ m: defaultDim, n: defaultDim }};
         const center = Array.from(g.get("center").value).map(Number);
         const uhat = Array.from(g.get("uhat").value).map(Number);
         const vhat = Array.from(g.get("vhat").value).map(Number);
@@ -7542,8 +7589,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
       row.addEventListener("click", () => {{
         const iptsInput = document.getElementById("nd-ipts");
+        if (iptsInput && iptsInput.value !== String(exp.ipts)) {{
+          const runsInput = document.getElementById("nd-runs");
+          if (runsInput) runsInput.value = "";
+        }}
         if (iptsInput) iptsInput.value = String(exp.ipts);
-        fetchOncatCatalog(String(exp.ipts), true);
+        fetchOncatCatalog(String(exp.ipts), false);
       }});
       if (isSel) activeRow = row;
       listEl.appendChild(row);
@@ -7708,18 +7759,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ndOncatCatalog.multi_run_note = data.multi_run_note || "";
       ndOncatCatalog.loading = false;
       renderOncatAuthBar();
-      if (data.ipts && iptsEl && (!iptsEl.value.trim() || iptsOverride !== null)) {{
+      if (data.ipts && iptsEl && iptsOverride !== null) {{
         iptsEl.value = String(data.ipts);
       }}
       const runsEl = document.getElementById("nd-runs");
-      if (runsEl && ndOncatCatalog.runs.length > 0) {{
-        const curSelected = parseRunRangeSpec(runsEl.value);
-        const runSet = new Set(ndOncatCatalog.runs.map(x => Number(x.run)));
-        const hasOverlap = curSelected.some(n => runSet.has(Number(n)));
-        if (autoSelectLatestRun || !hasOverlap) {{
-          const lastRun = ndOncatCatalog.runs[ndOncatCatalog.runs.length - 1].run;
-          runsEl.value = String(lastRun);
-        }}
+      if (runsEl && autoSelectLatestRun && ndOncatCatalog.runs.length > 0 && !runsEl.value.trim()) {{
+        const lastRun = ndOncatCatalog.runs[ndOncatCatalog.runs.length - 1].run;
+        runsEl.value = String(lastRun);
       }}
       renderOncatProjectsList();
       renderOncatRunsList(true);
@@ -7872,21 +7918,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function openNeutronDataModal(localNexusFiles = null) {{
     pendingLocalNexusFiles = localNexusFiles;
-    const params = collectWorkflowParams();
-    const setVal = (id, v) => {{ const el = document.getElementById(id); if (el && v !== undefined) el.value = v; }};
-    if (params.instrument) {{
-      setVal("nd-instrument", params.instrument);
-      setVal("nd-facility", (params.instrument === "MANDI" || params.instrument === "TOPAZ") ? "SNS" : "HFIR");
-    }}
-    setVal("nd-sg", params.space_group);
-    setVal("nd-a", Number(params.a).toFixed(2));
-    setVal("nd-b", Number(params.b).toFixed(2));
-    setVal("nd-c", Number(params.c).toFixed(2));
-    setVal("nd-alpha", Number(params.alpha).toFixed(2));
-    setVal("nd-beta", Number(params.beta).toFixed(2));
-    setVal("nd-gamma", Number(params.gamma).toFixed(2));
-    setVal("nd-wl-min", Number(params.wavelength_min).toFixed(1));
-    setVal("nd-wl-max", Number(params.wavelength_max).toFixed(1));
     updateNeutronDialogPreview();
     if (modalNeutronData) modalNeutronData.style.display = "flex";
     fetchOncatCatalog();
@@ -7976,6 +8007,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   if (btnNdSubmit) {{
     btnNdSubmit.addEventListener("click", async () => {{
+      const sgVal = (document.getElementById("nd-sg")?.value || "").trim();
+      const cellVals = ["nd-a", "nd-b", "nd-c", "nd-alpha", "nd-beta", "nd-gamma"].map(
+        id => parseFloat(document.getElementById(id)?.value || "")
+      );
+      if (!sgVal || cellVals.some(v => !Number.isFinite(v) || v <= 0)) {{
+        const statusBox = document.getElementById("nd-validation-status");
+        const msgEl = document.getElementById("nd-validation-msg");
+        if (statusBox) statusBox.style.borderColor = "rgba(248,113,113,0.6)";
+        if (msgEl) {{
+          msgEl.style.color = "#f87171";
+          msgEl.textContent = "Enter space group and unit cell parameters (a, b, c, α, β, γ).";
+        }}
+        return;
+      }}
       // Sync sample unit cell, space group, and wavelength band back to the main parameters bar
       const syncPair = [
         ["nd-sg", "inp-sg"], ["nd-a", "inp-a"], ["nd-b", "inp-b"], ["nd-c", "inp-c"],
@@ -7983,7 +8028,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ];
       syncPair.forEach(([srcId, dstId]) => {{
         const s = document.getElementById(srcId), d = document.getElementById(dstId);
-        if (s && d) d.value = s.value;
+        if (s && d && s.value.trim() !== "") d.value = s.value;
       }});
       const wlMinV = parseFloat(document.getElementById("nd-wl-min")?.value || "");
       const wlMaxV = parseFloat(document.getElementById("nd-wl-max")?.value || "");

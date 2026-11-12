@@ -39,12 +39,12 @@ def main(
             i += 2
             continue
         if "=" in arg and not arg.startswith("--"):
+            key, value = arg.split("=", 1)
             try:
-                key, value = arg.split("=", 1)
                 kwargs[key] = int(value)
                 i += 1
                 continue
-            except Exception:
+            except ValueError:
                 pass
         remaining_argv.append(arg)
         i += 1

@@ -16,10 +16,10 @@ def test_generate_reflections_none_sg_crash():
     # This should NOT crash with AttributeError: 'NoneType' has no attribute 'upper'
     # or similar in is_systematically_absent.
     try:
-        h, k, l = generate_reflections(a, b, c, alpha, beta, gamma, space_group=None)
+        _h, _k, _l = generate_reflections(a, b, c, alpha, beta, gamma, space_group=None)
     except Exception as e:
         if "'NoneType' object has no attribute" in str(e):
             pytest.fail(
                 f"Bug Reproduced: generate_reflections crashed with space_group=None! {e}"
             )
-        raise e
+        raise

@@ -1,14 +1,24 @@
-from subhkl.search.profiles import (
-    measure_radial_profile as _measure_radial_profile,
-    measure_whitened_profile as _measure_whitened_profile,
-)
-
+import itertools
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 import numpy as np
 
+from subhkl.search.profiles import (
+    _WIDTH_CONSISTENCY_TOL,
+    _WIDTH_TIGHT_APERTURE,
+    _WIDTH_WIDE_APERTURE,
+    _filter_widths_by_prior,
+    _lookup_two_theta,
+    _width_at_aperture,
+)
+from subhkl.search.profiles import (
+    measure_radial_profile as _measure_radial_profile,
+)
+from subhkl.search.profiles import (
+    measure_whitened_profile as _measure_whitened_profile,
+)
 from subhkl.utils import devices as device_util
 
 _SNAP_POSITIONS_JIT = None
@@ -111,89 +121,18 @@ def _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width):
 #: measurement lands above it.
 _PROVISIONAL_MAX_SIGMA = 5.0
 
-#: Two-aperture consistency (see the width census): a neighbour strong enough
-#: to inflate the wide aperture inflates the tight one differently, and 6%
-#: keeps every clean synthetic peak while removing the runaway tail.
-_WIDTH_TIGHT_APERTURE = 2.5
-_WIDTH_WIDE_APERTURE = 3.5
-_WIDTH_CONSISTENCY_TOL = 0.06
 
-
-def _truncated_m2_ratio(x):
-    """``m2(R)/sigma**2`` for a 2D Gaussian truncated at R, ``x = R**2/(2 sigma**2)``."""
-    if x <= 0:
-        return 0.0
-    if x > 60:
-        return 2.0
-    ex = np.exp(-x)
-    return 2.0 * (1.0 - (1.0 + x) * ex) / (1.0 - ex)
-
-
-def _sigma_from_truncated_m2(m2, aperture):
-    """Invert the truncation: the sigma whose truncated m2 matches."""
-    from scipy.optimize import brentq
-
-    if m2 <= 0 or aperture <= 0:
-        return float("nan")
-
-    def resid(sigma):
-        return sigma**2 * _truncated_m2_ratio(aperture**2 / (2 * sigma**2)) - m2
-
-    try:
-        if resid(0.05) * resid(60.0) > 0:
-            return float("nan")
-        return float(brentq(resid, 0.05, 60.0, xtol=1e-6))
-    except (ValueError, ZeroDivisionError):
-        return float("nan")
-
-
-def _width_at_aperture(frame, bg_patch_src, row, col, guess, max_half, k):
-    """Truncation-corrected sigma at an aperture of ``k`` sigma, iterated
-    with damping so it cannot oscillate.  Centroid from clipped weights
-    (stability), moments from *unclipped* values inside a circular aperture:
-    clipping rectifies background noise into a pedestal that inflates m2."""
-    height, width = frame.shape
-    sigma = guess
-    for _ in range(12):
-        aperture = min(k * sigma, max_half)
-        half = int(np.ceil(aperture)) + 1
-        r0, c0 = int(round(row)), int(round(col))
-        if not (half < r0 < height - half and half < c0 < width - half):
-            return float("nan")
-        sl = (slice(r0 - half, r0 + half + 1), slice(c0 - half, c0 + half + 1))
-        patch = frame[sl] - bg_patch_src[sl]
-        rr, cc = np.mgrid[sl].astype(float)
-        pos = np.maximum(patch, 0.0)
-        if pos.sum() <= 0:
-            return float("nan")
-        cr = (pos * rr).sum() / pos.sum()
-        cq = (pos * cc).sum() / pos.sum()
-        d2 = (rr - cr) ** 2 + (cc - cq) ** 2
-        inside = d2 <= aperture**2
-        flux = patch[inside].sum()
-        if flux <= 0:
-            return float("nan")
-        m2 = (patch[inside] * d2[inside]).sum() / flux
-        if not np.isfinite(m2) or m2 <= 0:
-            return float("nan")
-        new = _sigma_from_truncated_m2(m2, aperture)
-        if not np.isfinite(new):
-            return float("nan")
-        if abs(new - sigma) < 0.01:
-            return float(new)
-        sigma = 0.5 * (sigma + new)
-    return float(sigma)
-
-
-def _moment_width_census(images, bg_map, bg_hi, window_sigma, valid=None):
+def _moment_width_census(
+    images, bg_map, bg_hi, window_sigma, valid=None, two_theta=None
+):
     """Trustworthy peak widths from the frames themselves, no solve involved.
 
     The bright-window census supplies the candidate positions (Voronoi-owned
     centroids, flux floor already 8 sigma above window-sum noise); each is
-    then measured at two apertures with the truncated-moment inversion, and
-    kept only when the apertures agree -- the guard that stopped neighbour
-    contamination running the upper percentiles from 6.6 to 15 px on real
-    data when this estimator lived in the benchmark harness.
+    then measured at two apertures with the truncated-moment inversion,
+    kept only when the apertures agree, and filtered against a monotonic
+    functional prior vs. ``two_theta`` / resolution to reject shadow and
+    beam-flare outliers.
     """
     frames = np.asarray(images, dtype=np.float32)
     if frames.ndim == 2:
@@ -209,6 +148,7 @@ def _moment_width_census(images, bg_map, bg_hi, window_sigma, valid=None):
     excess = frames - bgs
     step = max(8, int(np.ceil(2.5 * float(window_sigma))))
     widths = []
+    tts = []
     for fi, frame in enumerate(excess):
         H, W = frame.shape
         for r0 in range(step, H - step, step):
@@ -249,7 +189,14 @@ def _moment_width_census(images, bg_map, bg_hi, window_sigma, valid=None):
                 if abs(wide - tight) / tight > _WIDTH_CONSISTENCY_TOL:
                     continue
                 widths.append(wide)
-    return np.asarray(widths)
+                tts.append(_lookup_two_theta(two_theta, fi, row, col, H, W))
+    widths_arr = np.asarray(widths, dtype=float)
+    if widths_arr.size < 8:
+        return widths_arr
+    filtered, _, _ = _filter_widths_by_prior(
+        widths_arr, np.asarray(tts, dtype=float) if two_theta is not None else None
+    )
+    return filtered
 
 
 def _ceiling_from_widths(widths, min_sigma):
@@ -447,7 +394,7 @@ def _frag_bank_ratio(
     sigmas = np.unique(np.round(np.asarray(sigmas, dtype=float), 6))
     z = _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, height, width)
     worst, where = 0.0, float(sigmas[0])
-    for sa, sb in zip(sigmas[:-1], sigmas[1:]):
+    for sa, sb in itertools.pairwise(sigmas):
         ratio = _frag_pair_ratio(
             float(sa), float(sb), gamma, ref_sigma, z, bg, amp, fid_res
         )
@@ -466,7 +413,7 @@ def _required_uniform_num_sigmas(
         z = _frag_calibrated_z(sigmas, gamma, ref_sigma, m0, side, side)
         if all(
             _frag_pair_ratio(float(sa), float(sb), gamma, ref_sigma, z, bg, amp) <= 1.0
-            for sa, sb in zip(sigmas[:-1], sigmas[1:])
+            for sa, sb in itertools.pairwise(sigmas)
         ):
             return n
     return None
@@ -556,7 +503,7 @@ def _auto_sigma_grid(
                 relaxed[i] = float(np.sqrt(lo * hi))
         ok = all(
             _frag_pair_ratio(sa, sb, gamma, ref_sigma, z, bg, amp, fid_res) <= 1.0
-            for sa, sb in zip(relaxed[:-1], relaxed[1:])
+            for sa, sb in itertools.pairwise(relaxed)
         )
         if ok:
             grid = relaxed
@@ -2361,7 +2308,7 @@ class MatrixFreeSparseRBFPeakFinder:
             eig_silence[n] = np.linalg.eigvalsh(0.5 * (h_sil + h_sil.T))
         return eig_total, eig_silence
 
-    def find_peaks_batch(self, images_batch, valid=None):
+    def find_peaks_batch(self, images_batch, valid=None, two_theta=None):
         import jax
         import jax.numpy as jnp
 
@@ -2468,7 +2415,12 @@ class MatrixFreeSparseRBFPeakFinder:
                 widths = np.zeros(0)
                 for _ in range(2):
                     widths = _moment_width_census(
-                        images_batch, bg_map, bg_hi, self.max_sigma, valid=valid
+                        images_batch,
+                        bg_map,
+                        bg_hi,
+                        self.max_sigma,
+                        valid=valid,
+                        two_theta=two_theta,
                     )
                     measured = _ceiling_from_widths(widths, self.min_sigma)
                     if measured is None or measured <= self.max_sigma * 1.02:
@@ -2521,7 +2473,12 @@ class MatrixFreeSparseRBFPeakFinder:
             # place, stated rather than silent.
             if self.profile_file == "auto" and self._measured_trunk is None:
                 measured_trunk = _measure_radial_profile(
-                    images_batch, bg_map, bg_hi, self.max_sigma, valid=valid
+                    images_batch,
+                    bg_map,
+                    bg_hi,
+                    self.max_sigma,
+                    valid=valid,
+                    two_theta=two_theta,
                 )
                 if measured_trunk is not None:
                     self._measured_trunk = measured_trunk
@@ -3393,9 +3350,9 @@ class MatrixFreeSparseRBFPeakFinder:
 # constrained optimum, inverted over the image's full dictionary, so crowded
 # reflections report their mutual covariance penalty.
 
-from tqdm import tqdm  # noqa: E402
+from tqdm import tqdm
 
-from subhkl.search.ssn import calibrated_admission_z, solve_ssn_unified  # noqa: E402
+from subhkl.search.ssn import calibrated_admission_z, solve_ssn_unified
 
 # Same clamp the patch integrator puts on its log-parabolic snap.
 MAX_SNAP_SHIFT = 1.5  # [Pixel]
@@ -3696,6 +3653,7 @@ def integrate_reflections_matrix_free(
     # Local import: sparse_rbf imports this function lazily at its call
     # site, so a top-level import there would be circular.
     import jax.numpy as jnp
+
     from subhkl.search.sparse_rbf import compute_rate_batch
 
     B, H, W = images_batch.shape
@@ -3852,9 +3810,9 @@ def integrate_reflections_matrix_free(
             continue
         k = len(idx)
 
-        def padded(arr, fill=0.0):
+        def padded(arr, fill=0.0, _k=k, _idx=idx):
             buf = np.full(k_pad, fill, dtype=np.float32)
-            buf[:k] = arr[idx]
+            buf[:_k] = arr[_idx]
             return jnp.array(buf)
 
         atom_ok = jnp.array(

@@ -58,6 +58,7 @@ def test_symmetry_equivalents_do_not_fill_shortlist():
 
 def test_signed_band_geometry_is_invariant_to_positive_weight_rescaling():
     import jax
+
     from subhkl.search.spherical import refine_band_geometry
 
     C = np.array([[0.2, 0.1, 0.2], [-0.2, 0.2, 0.3]])
@@ -105,6 +106,7 @@ def test_count_search_weights_are_threshold_free_and_suppress_null_noise():
 
 def test_refine_band_geometry_arbitrary_and_unconstrained_rot_axis():
     import jax
+
     from subhkl.search.spherical import refine_band_geometry
 
     C = np.array([[0.2, 0.1, 0.2], [-0.2, 0.2, 0.3], [0.1, -0.2, 0.25]])

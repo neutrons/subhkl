@@ -113,7 +113,7 @@ def test_positional_metric_recovers_the_truth():
 
 
 def test_radial_errors_cost_less_than_tangential_under_the_metric():
-    B, ki, hkls, lams, kfs = _make_peaks()
+    B, ki, _hkls, _lams, kfs = _make_peaks()
     delta = np.deg2rad(0.4)
     losses = {}
     for metric in ("isotropic", "positional"):
@@ -133,7 +133,7 @@ def test_radial_errors_cost_less_than_tangential_under_the_metric():
 
 
 def test_the_default_metric_is_the_previous_loss_bit_for_bit():
-    B, ki, hkls, lams, kfs = _make_peaks()
+    B, ki, _hkls, _lams, kfs = _make_peaks()
     moved = _rotate_each(kfs, ki, "radial", np.deg2rad(0.7))
     ref = _objective(B, ki, moved)
     iso = _objective(B, ki, moved, hkl_metric="isotropic", hkl_metric_floor=0.5)

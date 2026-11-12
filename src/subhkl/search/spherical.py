@@ -86,7 +86,9 @@ no 2 pi).
 
 from __future__ import annotations
 
-from functools import partial
+import itertools
+import operator
+from functools import partial, reduce
 
 import numpy as np
 from scipy.special import gammaln
@@ -405,7 +407,7 @@ def band_masks(g0, sin_edges, wavelength_band, d_min, n_sub=7):
     lam_lo, lam_hi = float(wavelength_band[0]), float(wavelength_band[1])
     gmax = 1.0 / float(d_min)
     masks = []
-    for lo, hi in zip(sin_edges[:-1], sin_edges[1:]):
+    for lo, hi in itertools.pairwise(sin_edges):
         m = np.zeros(len(g0), dtype=bool)
         for s in np.linspace(lo, hi, n_sub)[1:]:
             q_lo, q_hi = 2.0 * s / lam_hi, min(2.0 * s / lam_lo, gmax)
@@ -808,7 +810,7 @@ def nearest_line_stats(
             jnp.zeros(n, dtype=jnp.float32),
             jnp.int32(0),
         )
-        (best, arg, dens, _), _ = lax.scan(body, init, (D_r, v_r))
+        (_best, arg, dens, _), _ = lax.scan(body, init, (D_r, v_r))
         return arg, dens
 
     arg, dens = run(Pj, D_r, v_r)
@@ -1849,7 +1851,16 @@ def lattice_ladder(
                 sp = np.degrees(1.0 / max(4.0 * float(xlen[:nz].max()) * qbar, 1e-9))
                 tables["band"] = band_table(Dt, wt, qlt, qht, xlen[:nz], min(sp, 5.0))
                 if on_rung is not None:
-                    try:
+                    import contextlib
+
+                    with contextlib.suppress(
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        IndexError,
+                    ):
                         tab_p, off_p, nph_p, nth_p = tables["band"]
                         a_c = np.radians(np.arange(0, 360, 6.0))
                         b_c = np.radians(np.arange(3.0, 180, 6.0))
@@ -1868,8 +1879,6 @@ def lattice_ladder(
                             int(nz),
                             _orthonormalize(np.asarray(Rs_c[best_c])),
                         )
-                    except Exception:
-                        pass
                 _mark(
                     f"band table ({int(tables['band'][0].shape[1]):,} poles, "
                     f"{len(Dt):,} bins, exhaustive rung preview)"
@@ -1940,10 +1949,17 @@ def lattice_ladder(
                         break
             cands = np.asarray(kept)
         if on_rung is not None and len(cands) > 0:
-            try:
+            import contextlib
+
+            with contextlib.suppress(
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 on_rung("exhaustive", int(coarse_zones), _orthonormalize(cands[0]))
-            except Exception:
-                pass
         _mark(f"exhaustive rung ({len(grid):,} orientations)")
 
     def zoom_all(cands, nz, tol, span, n):
@@ -1989,10 +2005,17 @@ def lattice_ladder(
             o = o[: int(keep)]
         cands, scores = R_[o], s_[o]
         if on_rung is not None and len(cands) > 0:
-            try:
+            import contextlib
+
+            with contextlib.suppress(
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 on_rung(f"rung_{int(nz)}", int(nz), _orthonormalize(cands[0]))
-            except Exception:
-                pass
         _mark(f"rung {nz} zones @ {tol:g} deg, {len(R_)} -> {len(o)}")
     nz, tol = rungs[-1][0], rungs[-1][1]
     kind, args, _ = (
@@ -2322,7 +2345,7 @@ def find_orientations(
         masks = band_masks(model_g0, edges, wavelength_band, d_min)
         dd = np.asarray(data_dirs, float)
         f_bands = []
-        for lo, hi in zip(edges[:-1], edges[1:]):
+        for lo, hi in itertools.pairwise(edges):
             m = (sth > lo) & (sth <= hi)
             w_m = None if data_weights is None else np.asarray(data_weights, float)[m]
             f_bands.append(project_points(dd[m], w_m, L, sigma) if m.any() else None)
@@ -2828,7 +2851,11 @@ def refine_instrument_matching_free(
         if harmonics_axis is not None:
             th_h = np.deg2rad(angles_deg[:, int(harmonics_axis)])
             harm_basis = np.stack(
-                sum(([np.cos(o * th_h), np.sin(o * th_h)] for o in harm_orders), []),
+                reduce(
+                    operator.iadd,
+                    ([np.cos(o * th_h), np.sin(o * th_h)] for o in harm_orders),
+                    [],
+                ),
                 axis=1,
             )  # [n_runs, 2 n_orders]
     else:

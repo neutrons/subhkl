@@ -36,11 +36,12 @@ Notes
 """
 
 import re
+from dataclasses import dataclass, field
+
 import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation
-from dataclasses import dataclass, field
-from typing import Union, List
+
 from subhkl.config import reduction_settings
 
 _TITLE_ANGLE_PATTERNS = {
@@ -129,7 +130,7 @@ def get_rotation_data_from_nexus(filename, instrument):
     settings = reduction_settings[instrument]
     axes, angles, names = [], [], []
     with h5py.File(filename, "r") as f:
-        das_logs = f["entry/DASlogs"] if "entry/DASlogs" in f else {}
+        das_logs = f.get("entry/DASlogs", {})
         title_str = _read_nexus_title(f)
         title_angles = harvest_goniometer_angles_from_title(title_str)
 
@@ -142,7 +143,7 @@ def get_rotation_data_from_nexus(filename, instrument):
             if log_name in das_logs and "average_value" in das_logs[log_name]:
                 try:
                     angle_deg = float(das_logs[log_name]["average_value"][0])
-                except Exception:
+                except (ValueError, TypeError, KeyError, IndexError):
                     angle_deg = None
 
             if angle_deg is None and short_key in title_angles:
@@ -161,12 +162,15 @@ def get_rotation_data_from_nexus(filename, instrument):
                 if atto_pv in das_logs and "average_value" in das_logs[atto_pv]:
                     try:
                         angle_deg = float(das_logs[atto_pv]["average_value"][0])
-                    except Exception:
+                    except (ValueError, TypeError, KeyError, IndexError):
                         angle_deg = None
 
-            if angle_deg is None and str(instrument).upper() in ("CG4D", "IMAGINE"):
-                if short_key in _CG4D_NOMINAL_DEFAULTS:
-                    angle_deg = float(_CG4D_NOMINAL_DEFAULTS[short_key])
+            if (
+                angle_deg is None
+                and str(instrument).upper() in ("CG4D", "IMAGINE")
+                and short_key in _CG4D_NOMINAL_DEFAULTS
+            ):
+                angle_deg = float(_CG4D_NOMINAL_DEFAULTS[short_key])
 
             if angle_deg is not None:
                 axis = np.array(axis_spec, dtype=float)
@@ -304,9 +308,9 @@ def lab_to_sample(p_lab, axes, angles, offsets, zero_offsets=None, is_vector=Fal
 
 @dataclass
 class Goniometer:
-    axes_raw: List[np.ndarray] = None
-    angles_raw: Union[List[float], np.ndarray] = None
-    names_raw: List[str] = None
+    axes_raw: list[np.ndarray] = None
+    angles_raw: list[float] | np.ndarray = None
+    names_raw: list[str] = None
     rotation: np.ndarray = field(default_factory=lambda: np.eye(3))
 
     @classmethod

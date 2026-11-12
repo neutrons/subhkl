@@ -396,7 +396,7 @@ class SphereGrid:
 
     def __init__(self, cell_deg: float):
         self.cell_deg = float(cell_deg)
-        self.nth = int(round(180.0 / cell_deg))
+        self.nth = round(180.0 / cell_deg)
         self.nph = 2 * self.nth
         self.n_cells = self.nth * self.nph
 
@@ -496,9 +496,10 @@ def orientation_atom(
 def _enable_compilation_cache():
     """Persist XLA compilations across runs (the same cache spherical-index
     uses); a calibration is hundreds of ladder calls."""
-    try:
-        import os
+    import contextlib
+    import os
 
+    with contextlib.suppress(ImportError, AttributeError, RuntimeError, OSError):
         import jax
 
         if jax.config.jax_compilation_cache_dir is None:
@@ -510,8 +511,6 @@ def _enable_compilation_cache():
                     "jax",
                 ),
             )
-    except Exception:
-        pass
 
 
 def blind_orientation(
@@ -553,7 +552,7 @@ def blind_orientation(
     return (
         _orthonormalize(np.asarray(res[0][0], float)),
         float(res[0][1]),
-        int(len(sel)),
+        len(sel),
     )
 
 
@@ -601,9 +600,9 @@ def raw_explained(
     _, pdir = predicted_reflections(dets, U, G_c, wavelength)
     D = dmap.direction[dmap.detected]
     if len(pdir) == 0 or len(D) == 0:
-        return 0.0, int(len(pdir))
+        return 0.0, len(pdir)
     ang = np.degrees(np.arccos(np.clip(D @ pdir.T, -1.0, 1.0))).min(axis=1)
-    return float((ang < tol_deg).mean()), int(len(pdir))
+    return float((ang < tol_deg).mean()), len(pdir)
 
 
 # --------------------------------------------------------------------------

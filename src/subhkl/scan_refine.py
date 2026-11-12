@@ -322,8 +322,9 @@ def run_scan_refinement(
         global_rot_axis=rot_axis,
         border_width=int(border_width),
     )
-    from subhkl.search.scan_band import refine_scan
     import jax
+
+    from subhkl.search.scan_band import refine_scan
 
     with jax.enable_x64(), jax.default_matmul_precision("highest"):
         if bootstrap is None:
@@ -559,18 +560,31 @@ def checkpoint(args, name, parameters, diagnostics, snapshot=None):
                     and "blind_search" not in f
                     and os.path.isfile(str(args.blind_search))
                 ):
-                    try:
-                        with h5py.File(args.blind_search, "r") as sf:
-                            if "search" in sf:
-                                sf.copy("search", f, name="blind_search")
-                    except Exception:
-                        pass
+                    import contextlib
+
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, KeyError, ValueError
+                        ),
+                        h5py.File(args.blind_search, "r") as sf,
+                    ):
+                        if "search" in sf:
+                            sf.copy("search", f, name="blind_search")
         os.replace(tmp_path, path)
         if snapshot is not None and (
             os.environ.get("SUBHKL_LIVE_STDIO") == "1"
             or "PYTEST_CURRENT_TEST" not in os.environ
         ):
-            try:
+            import contextlib
+
+            with contextlib.suppress(
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 import base64
                 import zlib
 
@@ -624,14 +638,12 @@ def checkpoint(args, name, parameters, diagnostics, snapshot=None):
                     )
                 ).decode("ascii")
                 print(f"[subhkl-live-state] {b64}", flush=True)
-            except Exception:
-                pass
     finally:
         if tmp_path.exists():
-            try:
+            import contextlib
+
+            with contextlib.suppress(OSError):
                 tmp_path.unlink()
-            except Exception:
-                pass
 
 
 def _decompose_R_to_angles(axes, ang_nom, R_target):

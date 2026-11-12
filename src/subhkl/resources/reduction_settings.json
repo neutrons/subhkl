@@ -117,6 +117,11 @@
             "BL12:Mot:chi": [0, 0, 1, 1],
             "BL12:Mot:phi": [0, 1, 0, 1]
         },
+        "GoniometerAxisNames": [
+            "BL12:Mot:omega",
+            "BL12:Mot:chi",
+            "BL12:Mot:phi"
+        ],
         "GoniometerEntry": "metadata.entry.daslogs",
         "Scale": "metadata.entry.proton_charge",
         "Title": "metadata.entry.title",
@@ -127,6 +132,7 @@
         "Groupings": ["1x1", "2x2", "4x4"],
         "RawFile": "nexus/TOPAZ_{}.nxs.h5",
         "BankPixels": [256, 256],
+        "YAxisIsFastVaryingIndex": true,
         "DeltaTheta": 0.044,
         "Processes": 8
     },

@@ -1,11 +1,13 @@
 import os
+from unittest.mock import MagicMock, patch
+
 import h5py
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
-from unittest.mock import patch, MagicMock
 
-from subhkl.commands import run_index as index, run_metrics as metrics
+from subhkl.commands import run_index as index
+from subhkl.commands import run_metrics as metrics
 
 
 def create_synthetic_finder(filename):

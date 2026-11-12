@@ -2,7 +2,7 @@
 
 import h5py
 import numpy as np
-from scipy.optimize import minimize, least_squares, OptimizeResult
+from scipy.optimize import OptimizeResult, least_squares, minimize
 
 from subhkl.config import beamlines
 from subhkl.core.crystallography import (
@@ -179,6 +179,7 @@ def _build_ewald_excess_maps(args):
     """Build winsorized fine-binned local-median-subtracted excess maps per (run, bank)."""
     import jax
     import jax.numpy as jnp
+
     from subhkl.scan_refine import _frame_offsets
 
     with h5py.File(args.nexus, "r") as f:
@@ -434,13 +435,19 @@ def _make_ewald_polisher(
                     R_ref = Rr_np[r_ref]
                     U_ref = Urs[r_ref]
 
-                    def res_fn(x):
+                    def res_fn(x, _U_ref=U_ref, _good=good, _R_ref=R_ref):
                         D = Rot.from_rotvec(x[:3]).as_matrix()
-                        U0 = Rot.from_rotvec(x[3:]).as_matrix() @ U_ref
+                        U0 = Rot.from_rotvec(x[3:]).as_matrix() @ _U_ref
                         errs = []
-                        for ir in np.where(good)[0]:
+                        for ir in np.where(_good)[0]:
                             U_p = (
-                                Rr_np[ir].T @ D @ Rr_np[ir] @ R_ref.T @ D.T @ R_ref @ U0
+                                Rr_np[ir].T
+                                @ D
+                                @ Rr_np[ir]
+                                @ _R_ref.T
+                                @ D.T
+                                @ _R_ref
+                                @ U0
                             )
                             errs.append(Rot.from_matrix(U_p @ Urs[ir].T).as_rotvec())
                         return np.concatenate(errs)
@@ -647,10 +654,10 @@ def _polish_per_run_translations(
         R_r0 = R_runs_out[r]
         xs0 = R_r0 @ s_samp_vec
 
-        def project_reflections(x_val):
+        def project_reflections(x_val, _R_r0=R_r0, _xs0=xs0):
             rv0, ds0 = x_val[:3], x_val[3:6]
             dR0 = Rot.from_rotvec(rv0).as_matrix()
-            G0 = (Gc @ (dR0 @ U_opt).T) @ R_r0.T
+            G0 = (Gc @ (dR0 @ U_opt).T) @ _R_r0.T
             qn = np.linalg.norm(G0, axis=1)
             sth = -(G0 @ kih) / np.maximum(qn, 1e-12)
             lam = 2.0 * sth / np.maximum(qn, 1e-12)
@@ -666,7 +673,7 @@ def _polish_per_run_translations(
             G_b, lam_b = G0[band], lam[band]
             kf = kih[None, :] + lam_b[:, None] * G_b
             kf /= np.linalg.norm(kf, axis=1, keepdims=True)
-            cen_r = C_final - (xs0 + ds0)[None, :]
+            cen_r = C_final - (_xs0 + ds0)[None, :]
             dn = kf @ nh_final.T
             t = (cen_r * nh_final).sum(1)[None, :] / np.where(
                 np.abs(dn) < 1e-9, 1e-9, dn
@@ -683,18 +690,25 @@ def _polish_per_run_translations(
             )
             return idx_band, row, col, ok
 
-        def get_matches(x_val, radius):
-            idx_band, row, col, ok = project_reflections(x_val)
+        def get_matches(
+            x_val,
+            radius,
+            _project_reflections=project_reflections,
+            _b_r=b_r,
+            _pr_r=pr_r,
+            _pc_r=pc_r,
+        ):
+            idx_band, row, col, ok = _project_reflections(x_val)
             m_obs, m_hkl = [], []
             if len(idx_band) == 0:
                 return np.array([], dtype=np.int32), np.array([], dtype=np.int32)
-            for i_obs in range(len(b_r)):
-                bi = b_r[i_obs]
+            for i_obs in range(len(_b_r)):
+                bi = _b_r[i_obs]
                 valid_h = np.flatnonzero(ok[:, bi])
                 if not len(valid_h):
                     continue
-                d2 = (row[valid_h, bi] - pr_r[i_obs]) ** 2 + (
-                    col[valid_h, bi] - pc_r[i_obs]
+                d2 = (row[valid_h, bi] - _pr_r[i_obs]) ** 2 + (
+                    col[valid_h, bi] - _pc_r[i_obs]
                 ) ** 2
                 k = int(np.argmin(d2))
                 if d2[k] < radius**2:
@@ -702,13 +716,25 @@ def _polish_per_run_translations(
                     m_hkl.append(idx_band[valid_h[k]])
             return np.array(m_obs, dtype=np.int32), np.array(m_hkl, dtype=np.int32)
 
-        def fit_matches(x_init, m_obs, m_hkl, f_sc=2.5, prior_ds=0.45):
+        def fit_matches(
+            x_init,
+            m_obs,
+            m_hkl,
+            f_sc=2.5,
+            prior_ds=0.45,
+            _b_r=b_r,
+            _pr_r=pr_r,
+            _pc_r=pc_r,
+            _w_r=w_r,
+            _R_r0=R_r0,
+            _xs0=xs0,
+        ):
             if len(m_obs) < 8:
                 return x_init
-            b_m = b_r[m_obs]
-            rm = pr_r[m_obs]
-            cm = pc_r[m_obs]
-            wm = w_r[m_obs]
+            b_m = _b_r[m_obs]
+            rm = _pr_r[m_obs]
+            cm = _pc_r[m_obs]
+            wm = _w_r[m_obs]
             Gc_m = Gc[m_hkl]
             C_m = C_final[b_m]
             uh_m = uh_final[b_m]
@@ -717,16 +743,16 @@ def _polish_per_run_translations(
             dw_m = dw[b_m]
             dh_m = dh[b_m]
 
-            def res_fn(x):
-                rv, ds = x[:3], x[3:6]
+            def res_fn(x_vec):
+                rv, ds = x_vec[:3], x_vec[3:6]
                 dR = Rot.from_rotvec(rv).as_matrix()
-                G = (Gc_m @ (dR @ U_opt).T) @ R_r0.T
+                G = (Gc_m @ (dR @ U_opt).T) @ _R_r0.T
                 q = np.linalg.norm(G, axis=1)
                 st = -(G @ kih) / np.maximum(q, 1e-12)
                 lm = 2.0 * st / np.maximum(q, 1e-12)
                 kf = kih[None, :] + lm[:, None] * G
                 kf /= np.linalg.norm(kf, axis=1, keepdims=True)
-                cen_m = C_m - (xs0 + ds)[None, :]
+                cen_m = C_m - (_xs0 + ds)[None, :]
                 denom = np.sum(kf * nh_m, axis=1)
                 denom = np.where(np.abs(denom) < 1e-9, 1e-9, denom)
                 t = (cen_m * nh_m).sum(1) / denom
@@ -754,26 +780,35 @@ def _polish_per_run_translations(
             )
             return sol.x
 
-        def eval_med_dist(x_val, m_obs, m_hkl):
+        def eval_med_dist(
+            x_val,
+            m_obs,
+            m_hkl,
+            _R_r0=R_r0,
+            _b_r=b_r,
+            _xs0=xs0,
+            _pr_r=pr_r,
+            _pc_r=pc_r,
+        ):
             if len(m_obs) == 0:
                 return 999.0
             rv, ds = x_val[:3], x_val[3:6]
             dR = Rot.from_rotvec(rv).as_matrix()
-            G = (Gc[m_hkl] @ (dR @ U_opt).T) @ R_r0.T
+            G = (Gc[m_hkl] @ (dR @ U_opt).T) @ _R_r0.T
             q = np.linalg.norm(G, axis=1)
             st = -(G @ kih) / np.maximum(q, 1e-12)
             lm = 2.0 * st / np.maximum(q, 1e-12)
             kf = kih[None, :] + lm[:, None] * G
             kf /= np.linalg.norm(kf, axis=1, keepdims=True)
-            b_m = b_r[m_obs]
-            cen_m = C_final[b_m] - (xs0 + ds)[None, :]
+            b_m = _b_r[m_obs]
+            cen_m = C_final[b_m] - (_xs0 + ds)[None, :]
             denom = np.sum(kf * nh_final[b_m], axis=1)
             denom = np.where(np.abs(denom) < 1e-9, 1e-9, denom)
             t = (cen_m * nh_final[b_m]).sum(1) / denom
             p = t[:, None] * kf - cen_m
             rp = np.sum(p * vh_final[b_m], axis=1) / dh[b_m]
             cp = np.sum(p * uh_final[b_m], axis=1) / dw[b_m]
-            return float(np.median(np.hypot(pr_r[m_obs] - rp, pc_r[m_obs] - cp)))
+            return float(np.median(np.hypot(_pr_r[m_obs] - rp, _pc_r[m_obs] - cp)))
 
         mo0, mh0 = get_matches(np.zeros(6), 18.0)
         if len(mo0) < 8:
@@ -802,7 +837,8 @@ def refine_scan(args):
     """Staged band refinement; configuration and input validation live in scan_refine."""
     import jax
     import jax.numpy as jnp
-    from subhkl.scan_refine import load_observations, write_result, checkpoint
+
+    from subhkl.scan_refine import checkpoint, load_observations, write_result
 
     diagnostics = []
     _snapshot_builder = None
@@ -813,19 +849,26 @@ def refine_scan(args):
                 f"{name} refinement returned nonfinite objective or parameters"
             )
         diagnostics.append(
-            dict(
-                stage=name,
-                objective=float(result.fun),
-                iterations=int(result.nit),
-                success=bool(result.success),
-                message=str(result.message),
-            )
+            {
+                "stage": name,
+                "objective": float(result.fun),
+                "iterations": int(result.nit),
+                "success": bool(result.success),
+                "message": str(result.message),
+            }
         )
         snap = None
         if callable(_snapshot_builder):
             try:
                 snap = _snapshot_builder(name, result.x)
-            except Exception:
+            except (
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 snap = None
         checkpoint(args, name, result.x, diagnostics, snapshot=snap)
 
@@ -856,7 +899,7 @@ def refine_scan(args):
     obs = load_observations(args, return_kinematics=True)
     banks, pr, pc, dev, sig_px, runs, _angs, spot_weights, R_obs, scan_axes_obs = obs
     n_runs = args.n_runs
-    bank_ids = sorted(int(k) for k in beamlines[args.instrument].keys())
+    bank_ids = sorted(int(k) for k in beamlines[args.instrument])
     bank_to_idx = {b: i for i, b in enumerate(bank_ids)}
     n_banks = len(bank_ids)
 
@@ -915,7 +958,7 @@ def refine_scan(args):
                 ),
                 axis=1,
             ).astype(np.float64)
-            eval_nom, polish_joint_nom, polish_per_run_nom = _make_ewald_polisher(
+            _eval_nom, polish_joint_nom, polish_per_run_nom = _make_ewald_polisher(
                 hkl_ew @ B0.T,
                 args.runs,
                 R_runs_nom,
@@ -961,16 +1004,16 @@ def refine_scan(args):
                 )
                 if used_pre_polish:
                     U0 = U_nom_joint
-            ewald_ctx = dict(
-                exc_maps=exc_maps,
-                b2=b2_ew,
-                hkl_ew=hkl_ew,
-                U_nom_joint=U_nom_joint,
-                Urs_nom=Urs_nom,
-                ew_nom=ew_nom,
-                R_runs_pre=R_runs_pre,
-                R_runs_band_base=R_runs_pre if used_pre_polish else R_runs_nom,
-            )
+            ewald_ctx = {
+                "exc_maps": exc_maps,
+                "b2": b2_ew,
+                "hkl_ew": hkl_ew,
+                "U_nom_joint": U_nom_joint,
+                "Urs_nom": Urs_nom,
+                "ew_nom": ew_nom,
+                "R_runs_pre": R_runs_pre,
+                "R_runs_band_base": R_runs_pre if used_pre_polish else R_runs_nom,
+            }
 
     b_idx = jnp.asarray(b_idx_all[sel], dtype=jnp.int32)
     u_off = jnp.asarray(u_off_all[sel], dtype=jnp.float64)
@@ -1106,25 +1149,32 @@ def refine_scan(args):
 
     _snapshot_builder = _build_stage_snapshot
     if ewald_ctx is not None:
-        try:
+        import contextlib
+
+        with contextlib.suppress(
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            IndexError,
+        ):
             p_pre = np.zeros(18 + n_runs + 2 * n_banks, dtype=np.float64)
             checkpoint(
                 args,
                 "ewald-pre",
                 p_pre,
                 [
-                    dict(
-                        stage="ewald-pre",
-                        objective=float(-ewald_ctx.get("ew_nom", 0.0)),
-                        iterations=1,
-                        success=True,
-                        message="EWALD_PRE_POLISH",
-                    )
+                    {
+                        "stage": "ewald-pre",
+                        "objective": float(-ewald_ctx.get("ew_nom", 0.0)),
+                        "iterations": 1,
+                        "success": True,
+                        "message": "EWALD_PRE_POLISH",
+                    }
                 ],
                 snapshot=_build_stage_snapshot("ewald-pre", p_pre),
             )
-        except Exception:
-            pass
 
     def loss_band(p, n_z=400, reg_panel=200.0, use_r29=False, inv_len_weight=False):
         rv, s_rad, s_ax, s_area, rg, T, s_samp, da, db, dbeta, dom, du, dv = unpack(p)
@@ -1332,26 +1382,39 @@ def refine_scan(args):
         p_base_j = jnp.asarray(best_p)
 
         @jax.jit
-        def eval_dom(d_val):
-            p_try = p_base_j.at[18 + r].set(d_val)
-            rv, s_rad, s_ax, s_area, rg, T, s_samp, da, db, dbeta, dom, du, dv = unpack(
-                p_try
+        def eval_dom(
+            d_val,
+            _p_base_j=p_base_j,
+            _r=r,
+            _Cr=Cr,
+            _uor=uor,
+            _ur=ur,
+            _vor=vor,
+            _vr=vr,
+            _rid=rid,
+            _er=er,
+            _R0r=R0r,
+            _w_r=w_r,
+        ):
+            p_try = _p_base_j.at[18 + _r].set(d_val)
+            rv, s_rad, s_ax, s_area, rg, T, s_samp, _da, _db, _dbeta, dom, _du, _dv = (
+                unpack(p_try)
             )
             Rg = rodrigues_jax(rg)
             C_scaled = jnp.stack(
                 [
-                    Cr[:, 0] * (1.0 + s_rad),
-                    Cr[:, 1] * (1.0 + s_ax),
-                    Cr[:, 2] * (1.0 + s_rad),
+                    _Cr[:, 0] * (1.0 + s_rad),
+                    _Cr[:, 1] * (1.0 + s_ax),
+                    _Cr[:, 2] * (1.0 + s_rad),
                 ],
                 axis=-1,
             )
-            O_scaled = (uor * (1.0 + s_area))[:, None] * ur + (vor * (1.0 + s_area))[
+            O_scaled = (_uor * (1.0 + s_area))[:, None] * _ur + (_vor * (1.0 + s_area))[
                 :, None
-            ] * vr
+            ] * _vr
             xyz_det = (C_scaled + O_scaled) @ Rg.T + T[None, :]
-            dR = rodrigues_batch_jax(dom[rid][:, None] * er)
-            R_run = jnp.einsum("nij,njk->nik", dR, R0r)
+            dR = rodrigues_batch_jax(dom[_rid][:, None] * _er)
+            R_run = jnp.einsum("nij,njk->nik", dR, _R0r)
             xyz = xyz_det - jnp.einsum("nij,j->ni", R_run, s_samp)
             kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
             g = kf - kij[None, :]
@@ -1367,7 +1430,7 @@ def refine_scan(args):
             X0 = uvw_j[:120] @ A_cur.T
             wz = jnp.ones(len(X0))
             Rm = rodrigues_jax(rv) @ Uj
-            return band_sum(X0 @ Rm.T, d, q_lo, q_hi, w_r, wz)
+            return band_sum(X0 @ Rm.T, d, q_lo, q_hi, _w_r, wz)
 
         scores_r = np.asarray(
             [float(eval_dom(d)) - 5.0 * float(d) ** 2 for d in dom_grid]
@@ -1794,7 +1857,7 @@ def refine_scan(args):
                     rodrigues_jax(float(dom[r]) * jnp.asarray(scan_axes_obs[idx_r[0]]))
                 )
                 R_runs_band[r] = dR_r @ R_runs_band[r]
-        eval_cal, polish_joint_cal, polish_per_run_cal = _make_ewald_polisher(
+        _eval_cal, polish_joint_cal, polish_per_run_cal = _make_ewald_polisher(
             ewald_ctx["hkl_ew"] @ B_opt.T,
             args.runs,
             R_runs_band,
@@ -1960,4 +2023,4 @@ def refine_scan(args):
         flush=True,
     )
     print(f"  per-run offsets (deg): {np.round(dom_deg, 3).tolist()}", flush=True)
-    return dict(status=status, stages=diagnostics)
+    return {"status": status, "stages": diagnostics}

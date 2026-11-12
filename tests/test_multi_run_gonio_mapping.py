@@ -59,7 +59,7 @@ def test_multi_run_mapping_fix_via_minimize():
     run_indices = ub.run_indices
 
     if run_indices is not None:
-        unique_runs, first_indices = np.unique(run_indices, return_index=True)
+        _unique_runs, first_indices = np.unique(run_indices, return_index=True)
         if goniometer_angles is not None and goniometer_angles.shape[1] == num_obs:
             goniometer_angles_reduced = goniometer_angles[:, first_indices]
 
@@ -79,5 +79,5 @@ if __name__ == "__main__":
         print("Test PASSED")
     except AssertionError as e:
         print(f"Test FAILED: {e}")
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError) as e:
         print(f"An error occurred: {e}")

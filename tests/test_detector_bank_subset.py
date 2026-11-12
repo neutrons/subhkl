@@ -52,12 +52,12 @@ def _make_objectives():
     kf = xyz / np.linalg.norm(xyz, axis=1, keepdims=True)
     kf_ki = (kf - ki).T  # (3, N)
 
-    common = dict(
-        cell_params=None,
-        beam_nominal=ki,
-        kf_lab_fixed_vectors=kf_ki,
-        peak_run_indices=np.zeros(len(xyz), dtype=int),
-    )
+    common = {
+        "cell_params": None,
+        "beam_nominal": ki,
+        "kf_lab_fixed_vectors": kf_ki,
+        "peak_run_indices": np.zeros(len(xyz), dtype=int),
+    }
     B = np.eye(3) / 6.0
     wavelength = np.array([1.0, 4.0])
 

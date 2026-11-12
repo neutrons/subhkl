@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from trame.ui.html import DivLayout
 from trame.widgets import html
 from trame_server import Server
 
+from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
 from subhkl.viz.nova_app.mvvm_factory import create_viewmodels
 from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
 
@@ -51,12 +53,12 @@ class MainApp:
         async def handle_status(request: web.Request) -> web.Response:
             frame_q = request.rel_url.query.get("frame")
             if frame_q is not None and str(frame_q).strip() != "":
-                try:
+                with contextlib.suppress(
+                    ValueError, TypeError, RuntimeError, AttributeError
+                ):
                     f_idx_st = int(frame_q)
                     self.view_model.model.subhkl.frame_index = f_idx_st
                     self.pipeline_runner.sync_frame_index(f_idx_st)
-                except Exception:
-                    pass
             payload = self.view_model.model.subhkl.payload or {}
             hist_ds = self.pipeline_runner.list_history_datasets()
             cur_h5 = (
@@ -98,7 +100,7 @@ class MainApp:
                         "Content-Disposition": f'attachment; filename="{safe_dl}"'
                     },
                 )
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                 return web.Response(text=str(exc), status=404)
 
         async def handle_payload(request: web.Request) -> web.Response:
@@ -109,7 +111,7 @@ class MainApp:
                     f_idx = int(frame_q)
                     self.view_model.model.subhkl.frame_index = f_idx
                     self.pipeline_runner.current_frame_index = f_idx
-                except Exception:
+                except (ValueError, TypeError):
                     f_idx = None
 
             refreshed = False
@@ -126,7 +128,7 @@ class MainApp:
                             self.view_model.model.subhkl.data.peaks_file = local_h5
                         self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
                         refreshed = True
-                except Exception as exc:
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                     return web.json_response(
                         {"status": "error", "error": str(exc)}, status=404
                     )
@@ -157,24 +159,24 @@ class MainApp:
                         self.view_model.model.subhkl.data.peaks_file = local_h5
                     self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
                     refreshed = True
-                except Exception as exc:
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                     return web.json_response(
                         {"status": "error", "error": str(exc)}, status=404
                     )
 
             if f_idx is not None and not refreshed:
-                try:
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
                     self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
-                except Exception:
-                    pass
             if isinstance(self.view_model.model.subhkl.payload, dict):
-                try:
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
                     self.pipeline_runner.apply_active_solve_overlay(
                         self.view_model.model.subhkl.payload,
                         frame_index=f_idx,
                     )
-                except Exception:
-                    pass
             return web.json_response(self.view_model.model.subhkl.payload or {})
 
         async def handle_dataset_display(request: web.Request) -> web.Response:
@@ -191,7 +193,7 @@ class MainApp:
                     ds_id, fallback_dir=fb_dir
                 )
                 return web.FileResponse(path=local_h5)
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                 return web.Response(text=str(exc), status=404)
 
         async def handle_standalone_html(_request: web.Request) -> web.Response:
@@ -201,7 +203,7 @@ class MainApp:
         async def handle_run(request: web.Request) -> web.Response:
             try:
                 body = await request.json()
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError):
                 body = {}
             stage_id = body.get("stage_id", "solve")
             params = dict(body.get("params") or {})
@@ -227,7 +229,9 @@ class MainApp:
             def _on_complete(new_h5_path: str) -> None:
                 from subhkl.viz.nova_app.models.subhkl_model import InstrumentOptions
 
-                try:
+                with contextlib.suppress(
+                    ValueError, TypeError, KeyError, AttributeError
+                ):
                     if (
                         "instrument" in params
                         and str(params["instrument"]) in InstrumentOptions.__members__
@@ -242,8 +246,6 @@ class MainApp:
                         data.wavelength_min = float(params["wavelength_min"])
                     if "wavelength_max" in params:
                         data.wavelength_max = float(params["wavelength_max"])
-                except Exception:
-                    pass
                 if (
                     stage_id == "reduce"
                     or "merged" in os.path.basename(new_h5_path).lower()
@@ -266,7 +268,7 @@ class MainApp:
                     stage_id, params=params, on_complete_h5=_on_complete
                 )
                 return web.json_response(res)
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                 return web.json_response(
                     {"status": "error", "error": str(exc)}, status=400
                 )
@@ -276,7 +278,7 @@ class MainApp:
 
             try:
                 body = await request.json()
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError):
                 body = {}
             res = await asyncio.to_thread(
                 self.pipeline_runner.cancel_active_job, body.get("stage_id")
@@ -303,14 +305,15 @@ class MainApp:
                         await part.read()
                         continue
                     safe_name = os.path.basename(fname)
-                    dest_path = os.path.join(upload_dir, safe_name)
-                    with open(dest_path, "wb") as f_out:
-                        while True:
-                            chunk = await part.read_chunk()
-                            if not chunk:
-                                break
-                            f_out.write(chunk)
-                    saved_paths.append(dest_path)
+                    dest_path = Path(upload_dir) / safe_name
+                    payload_bytes = bytearray()
+                    while True:
+                        chunk = await part.read_chunk()
+                        if not chunk:
+                            break
+                        payload_bytes.extend(chunk)
+                    dest_path.write_bytes(payload_bytes)
+                    saved_paths.append(str(dest_path))
                 if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(
                     ".nxs.h5"
                 ):
@@ -323,7 +326,7 @@ class MainApp:
                     self.view_model.model.subhkl.data.peaks_file = sp
                     self.view_model.model.subhkl.refresh_payload()
                 return web.json_response({"status": "ok", "saved_paths": saved_paths})
-            except Exception as exc:
+            except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                 return web.json_response(
                     {"status": "error", "error": str(exc)}, status=400
                 )
@@ -334,7 +337,7 @@ class MainApp:
 
             try:
                 body = await request.json()
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError):
                 body = {}
             req_files = body.get("files") or []
             matched_paths: list[str] = []
@@ -385,7 +388,7 @@ class MainApp:
         async def handle_check_neutron_paths(request: web.Request) -> web.Response:
             try:
                 body = await request.json()
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError):
                 body = {}
             res = self.pipeline_runner.check_neutron_paths(body)
             return web.json_response(res)
@@ -415,7 +418,7 @@ class MainApp:
 
             try:
                 body = await request.json()
-            except Exception:
+            except (OSError, RuntimeError, ValueError, TypeError):
                 body = {}
             res = await asyncio.to_thread(self.pipeline_runner.handle_oncat_auth, body)
             return web.json_response(res)
@@ -448,47 +451,59 @@ class MainApp:
         async def _ep_handle(request: web.Request) -> web.StreamResponse:
             ep_path = os.environ.get("EP_PATH", "").strip().rstrip("/")
             req_path = request.rel_url.path
-            served_index_under_ep = False
+            if req_path.endswith(("/logo.png", "/favicon.ico", "/favicon.svg")):
+                return web.Response(
+                    text=SUBHKL_FAVICON_SVG, content_type="image/svg+xml"
+                )
+            served_index = False
             if ep_path and ep_path.startswith("/"):
                 ep_parent = os.path.dirname(ep_path)
                 if req_path == ep_path or req_path == ep_path + "/":
                     request = request.clone(
                         rel_url=request.rel_url.with_path("/index.html")
                     )
-                    served_index_under_ep = True
+                    served_index = True
                 elif req_path.startswith(ep_path + "/"):
                     sub_path = req_path[len(ep_path) :] or "/"
                     if sub_path == "/":
                         sub_path = "/index.html"
-                        served_index_under_ep = True
+                        served_index = True
                     elif sub_path == "/index.html":
-                        served_index_under_ep = True
+                        served_index = True
                     request = request.clone(rel_url=request.rel_url.with_path(sub_path))
                 elif ep_parent not in ("", "/") and req_path.startswith(
                     ep_parent + "/"
                 ):
                     sub_path = req_path[len(ep_parent) :] or "/"
                     request = request.clone(rel_url=request.rel_url.with_path(sub_path))
-            elif req_path == "/":
+            elif req_path in ("/", "/index.html"):
                 request = request.clone(
                     rel_url=request.rel_url.with_path("/index.html")
                 )
+                served_index = True
 
             resp = await orig_handle(request)
-            if served_index_under_ep and ep_path and isinstance(resp, web.FileResponse):
-                try:
+            if served_index and isinstance(resp, web.FileResponse):
+                with contextlib.suppress(OSError, RuntimeError, ValueError, TypeError):
                     idx_fp = getattr(resp, "_path", None)
                     if idx_fp and os.path.isfile(idx_fp):
-                        with open(idx_fp, encoding="utf-8") as f_in:
-                            html_txt = f_in.read()
+                        html_txt = Path(idx_fp).read_text(encoding="utf-8")
+                        if ep_path:
+                            html_txt = html_txt.replace(
+                                '<base href="." />',
+                                f'<base href="{ep_path}/" />',
+                                1,
+                            )
                         html_txt = html_txt.replace(
-                            '<base href="." />',
-                            f'<base href="{ep_path}/" />',
+                            '<link rel="icon" href="logo.png" />',
+                            f'<link rel="icon" type="image/svg+xml" href="{SUBHKL_FAVICON_DATA_URI}" />',
+                            1,
+                        ).replace(
+                            "<title>trame is built by Kitware</title>",
+                            "<title>SUBHKL // Diffraction Parallax</title>",
                             1,
                         )
                         return web.Response(text=html_txt, content_type="text/html")
-                except Exception:
-                    pass
             return resp
 
         app._handle = _ep_handle
@@ -505,6 +520,7 @@ class MainApp:
 
     def create_ui(self) -> None:
         self.state.trame__title = "SUBHKL // Diffraction Parallax"
+        self.state.trame__favicon = SUBHKL_FAVICON_DATA_URI
         with DivLayout(self.server) as layout:
             layout.root.style = (
                 "position: fixed; inset: 0; margin: 0; padding: 0; "

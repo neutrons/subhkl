@@ -115,7 +115,7 @@ def get_lattice_system(
         sg = get_space_group_object(space_group_name)
         sys_str = str(sg.crystal_system()).split(".")[-1].lower()
         centering = sg.centring_type()
-    except Exception:
+    except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
         sys_str = "triclinic"
         centering = "P"
 
@@ -1401,8 +1401,8 @@ class VectorizedObjective:
             dyn_centers,
             dyn_uhats,
             dyn_vhats,
-            dyn_widths,
-            dyn_heights,
+            _dyn_widths,
+            _dyn_heights,
             area_scale,
             _,
             _,
@@ -1710,7 +1710,7 @@ class FindUB:
             if "goniometer/offsets" in f:
                 off_data = f["goniometer/offsets"]
                 if isinstance(off_data, h5py.Group):
-                    b_gonio_offsets = {k: off_data[k][()] for k in off_data.keys()}
+                    b_gonio_offsets = {k: off_data[k][()] for k in off_data}
                 else:
                     b_gonio_offsets = off_data[()]
 
@@ -2108,12 +2108,12 @@ class FindUB:
             for i, name in enumerate(unique_motors):
                 for req_idx, req in enumerate(refine_goniometer_axes):
                     # --- FIX: Case-insensitive match ---
-                    if req.lower() in name.lower():
-                        if len(gonio_trans_bounds_list) == len(refine_goniometer_axes):
-                            bounds_array_trans[i] = gonio_trans_bounds_list[req_idx]
-        elif refine_sample:
-            if len(gonio_trans_bounds_list) == len(unique_motors):
-                bounds_array_trans = np.array(gonio_trans_bounds_list)
+                    if req.lower() in name.lower() and len(
+                        gonio_trans_bounds_list
+                    ) == len(refine_goniometer_axes):
+                        bounds_array_trans[i] = gonio_trans_bounds_list[req_idx]
+        elif refine_sample and len(gonio_trans_bounds_list) == len(unique_motors):
+            bounds_array_trans = np.array(gonio_trans_bounds_list)
 
         cell_params_init = np.array(
             [self.a, self.b, self.c, self.alpha, self.beta, self.gamma]
@@ -2122,11 +2122,10 @@ class FindUB:
             self.a, self.b, self.c, self.alpha, self.beta, self.gamma, self.space_group
         )
 
-        if refine_detector:
-            if detector_params is None or peak_pixel_coords is None:
-                raise ValueError(
-                    "To use --refine-detector, detector_params and peak_pixel_coords must be passed from parser.py"
-                )
+        if refine_detector and (detector_params is None or peak_pixel_coords is None):
+            raise ValueError(
+                "To use --refine-detector, detector_params and peak_pixel_coords must be passed from parser.py"
+            )
 
         objective = VectorizedObjective(
             self.reciprocal_lattice_B(),
@@ -2226,10 +2225,10 @@ class FindUB:
             self.x = np.array([])
             x_batch = jnp.zeros((1, 0))
             (
-                UB_final_batch,
-                B_new_batch,
+                _UB_final_batch,
+                _B_new_batch,
                 t_axes_batch,
-                sample_origin_lab_batch,
+                _sample_origin_lab_batch,
                 ki_vec_batch,
                 offsets_total_batch,
                 R_batch,
@@ -2238,7 +2237,7 @@ class FindUB:
                 dyn_vhats,
                 dyn_widths,
                 dyn_heights,
-                area_scale,
+                _area_scale,
                 axes_refined_batch,
                 axis_tilts_batch,
                 per_run_delta_batch,
@@ -2255,7 +2254,7 @@ class FindUB:
             rot_params = self.fixed_rot_params if freeze_orientation else np.zeros(3)
             U = objective.orientation_U_jax(rot_params[None])[0]
 
-            loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
+            _loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
             dist_min_final = np.array(dist_min[0])
             # Soft indexing measures fractional-hkl distance; the fixed-hkl
             # geometric loss measures an angular chord, cut at the 1 degree
@@ -2310,6 +2309,20 @@ class FindUB:
 
         es_params = strategy.default_params
 
+        def _wrap_rodrigues(w):
+            theta = jnp.linalg.norm(w, axis=-1, keepdims=True)
+            theta_wrapped = jnp.mod(theta + jnp.pi, 2.0 * jnp.pi) - jnp.pi
+            scale = jnp.where(theta > 1e-8, theta_wrapped / theta, 1.0)
+            return w * scale
+
+        def _sanitize_params(x):
+            if freeze_orientation:
+                return jnp.clip(x, 0.0, 1.0)
+            w_wrapped = _wrap_rodrigues(x[..., :3])
+            if num_dims == 3:
+                return w_wrapped
+            return jnp.concatenate([w_wrapped, jnp.clip(x[..., 3:], 0.0, 1.0)], axis=-1)
+
         def init_single_run(rng, start_sol):
             rng, rng_pop, rng_init = jax.random.split(rng, 3)
 
@@ -2319,23 +2332,14 @@ class FindUB:
                         jax.random.normal(rng_pop, (population_size, num_dims))
                         * target_sigma
                     )
-                    if freeze_orientation:
-                        population_init = jnp.clip(start_sol + noise, 0.0, 1.0)
-                    else:
-                        population_init = jnp.concatenate(
-                            [
-                                start_sol[:3] + noise[:, :3],
-                                jnp.clip(start_sol[3:] + noise[:, 3:], 0.0, 1.0),
-                            ],
-                            axis=1,
-                        )
+                    population_init = _sanitize_params(start_sol + noise)
                     state = strategy.init(
                         rng_init, population_init, objective(population_init), es_params
                     )
                 else:
-                    state = strategy.init(rng_init, start_sol, es_params).replace(
-                        std=target_sigma
-                    )
+                    state = strategy.init(
+                        rng_init, _sanitize_params(start_sol), es_params
+                    ).replace(std=target_sigma)
             else:
                 if strategy_type == "population_based":
                     if freeze_orientation:
@@ -2343,7 +2347,7 @@ class FindUB:
                             rng_pop, (population_size, num_dims)
                         )
                     else:
-                        pop_orient = (
+                        pop_orient = _wrap_rodrigues(
                             jax.random.normal(rng_pop, (population_size, 3))
                             * target_sigma
                         )
@@ -2369,17 +2373,12 @@ class FindUB:
                     )
             return state
 
-        def step_single_run(rng, state):
+        def step_single_run(rng, state, use_elitism):
             rng, rng_ask, rng_tell = jax.random.split(rng, 3)
 
             if strategy_name.lower() == "guided_es":
                 # Ensure the mean respects your clipping logic before evaluating gradient
-                if freeze_orientation:
-                    mean_valid = jnp.clip(state.mean, 0.0, 1.0)
-                else:
-                    mean_valid = jnp.concatenate(
-                        [state.mean[:3], jnp.clip(state.mean[3:], 0.0, 1.0)]
-                    )
+                mean_valid = _sanitize_params(state.mean)
 
                 # Compute gradient (matches your existing BFGS logic)
                 grad_fn = jax.grad(lambda x_flat: objective(x_flat[None, :])[0])
@@ -2388,21 +2387,53 @@ class FindUB:
                 # Feed the gradient into the GuidedES state
                 state = state.replace(grad=g)
 
-            x, state_ask = strategy.ask(rng_ask, state, es_params)
-            if freeze_orientation:
-                x_valid = jnp.clip(x, 0.0, 1.0)
-            else:
-                x_valid = jnp.concatenate(
-                    [x[:, :3], jnp.clip(x[:, 3:], 0.0, 1.0)], axis=1
-                )
+            params_step = (
+                es_params.replace(elitism=use_elitism)
+                if strategy_name.lower() == "de"
+                else es_params
+            )
+            x, state_ask = strategy.ask(rng_ask, state, params_step)
+            x_valid = _sanitize_params(x)
 
             state_tell, metrics = strategy.tell(
-                rng_tell, x_valid, objective(x_valid), state_ask, es_params
+                rng_tell, x_valid, objective(x_valid), state_ask, params_step
             )
             return rng, state_tell, metrics
 
+        val_grad_batch = jax.value_and_grad(lambda xb: jnp.sum(objective(xb), axis=0))
+
+        def polish_single_run(state):
+            def body(i, carry):
+                pop, fit = carry
+                _, g = val_grad_batch(pop)
+                g_norm = jnp.linalg.norm(g, axis=-1, keepdims=True)
+                lr = 0.015 * (0.75**i)
+                pop_next = _sanitize_params(pop - (g / jnp.maximum(g_norm, 1e-8)) * lr)
+                fit_next = objective(pop_next)
+                imp = fit_next < fit
+                pop = jnp.where(imp[:, None], pop_next, pop)
+                fit = jnp.where(imp, fit_next, fit)
+                return (pop, fit)
+
+            pop, fit = jax.lax.fori_loop(0, 6, body, (state.population, state.fitness))
+            best_idx = jnp.argmin(fit)
+            best_f = fit[best_idx]
+            best_s = jnp.where(
+                best_f < state.best_fitness,
+                pop[best_idx],
+                state.best_solution,
+            )
+            best_f = jnp.minimum(best_f, state.best_fitness)
+            return state.replace(
+                population=pop,
+                fitness=fit,
+                best_solution=best_s,
+                best_fitness=best_f,
+            )
+
         init_batch_jit = jax.jit(jax.vmap(init_single_run, in_axes=(0, None)))
-        step_batch_jit = jax.jit(jax.vmap(step_single_run, in_axes=(0, 0)))
+        step_batch_jit = jax.jit(jax.vmap(step_single_run, in_axes=(0, 0, None)))
+        polish_batch_jit = jax.jit(jax.vmap(polish_single_run, in_axes=0))
 
         exec_batch_size = batch_size if batch_size is not None else n_runs
 
@@ -2447,17 +2478,34 @@ class FindUB:
                 init_batch_jit(batch_keys_list[-1], start_sol_processed)
             )
 
+        polish_checkpoints = (
+            {num_generations // 2, num_generations}
+            if (
+                strategy_name.lower() == "de"
+                and not freeze_orientation
+                and not has_start_sol
+                and num_generations >= 20
+            )
+            else set()
+        )
         pbar = (
             trange(num_generations, desc="Optimizing")
             if trange
             else range(num_generations)
         )
         for gen in pbar:
+            use_elitism = (
+                True
+                if (has_start_sol or num_generations < 20)
+                else (gen >= num_generations // 2)
+            )
             current_gen_best = np.inf
             for b_i in range(len(batch_keys_list)):
                 batch_keys_list[b_i], batch_states_list[b_i], _ = step_batch_jit(
-                    batch_keys_list[b_i], batch_states_list[b_i]
+                    batch_keys_list[b_i], batch_states_list[b_i], use_elitism
                 )
+                if (gen + 1) in polish_checkpoints:
+                    batch_states_list[b_i] = polish_batch_jit(batch_states_list[b_i])
                 current_gen_best = min(
                     current_gen_best, jnp.min(batch_states_list[b_i].best_fitness)
                 )
@@ -2493,16 +2541,17 @@ class FindUB:
             options={"maxiter": 50},
         )
 
-        if res_ref.success and res_ref.fun < best_overall_loss:
-            best_overall_member, best_overall_loss = res_ref.x, res_ref.fun
+        if np.isfinite(res_ref.fun) and res_ref.fun < best_overall_loss:
+            best_overall_member = np.array(_sanitize_params(jnp.array(res_ref.x)))
+            best_overall_loss = res_ref.fun
 
         self.x = np.array(best_overall_member)
         x_batch = jnp.array(self.x[None, :])
         (
-            UB_final_batch,
-            B_new_batch,
+            _UB_final_batch,
+            _B_new_batch,
             t_axes_batch,
-            sample_origin_lab_batch,
+            _sample_origin_lab_batch,
             ki_vec_batch,
             offsets_total_batch,
             R_batch,
@@ -2511,7 +2560,7 @@ class FindUB:
             dyn_vhats,
             dyn_widths,
             dyn_heights,
-            area_scale,
+            _area_scale,
             axes_refined_batch,
             axis_tilts_batch,
             per_run_delta_batch,
@@ -2628,7 +2677,7 @@ class FindUB:
             print("--- Refined Detector Geometry ---")
             print(f"Max Center Translation: {max_drift:.3f} mm")
 
-        loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
+        _loss_score, dist_min, hkl, lamb = objective.get_results(x_batch)
         dist_min_final = np.array(dist_min[0])
 
         threshold = np.deg2rad(1.0) if objective.no_index else 0.15

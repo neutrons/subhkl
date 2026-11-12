@@ -235,7 +235,13 @@ def solve(
                 stable_runs=[int(x) for x in stable_runs.split(",")]
                 if stable_runs
                 else None,
-                modes=refine_modes.split(",") if refine_modes is not None else None,
+                modes=[
+                    m.strip()
+                    for m in refine_modes.split(",")
+                    if m.strip() and m.strip().lower() != "none"
+                ]
+                if refine_modes is not None
+                else None,
                 n_zones=band_zones,
                 d_min=d_min,
                 min_deviance=min_deviance,
@@ -304,7 +310,7 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
             print(f"Loading calibrated detector geometry from {hdf5_filename}...")
             calib_grp = f["detector_calibration"]
             count = 0
-            for bank_key in calib_grp.keys():
+            for bank_key in calib_grp:
                 bank_id = bank_key.replace("bank_", "")
                 if instrument in beamlines and bank_id in beamlines[instrument]:
                     beamlines[instrument][bank_id]["center"] = calib_grp[bank_key][
@@ -705,14 +711,14 @@ def indexer(
         float, typer.Option("--detector-global-rot-bound-deg")
     ] = 2.0,
     detector_global_rot_axis: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--detector-global-rot-axis",
             help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",
         ),
     ] = None,
     cylinder_axis: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--cylinder-axis",
             help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",

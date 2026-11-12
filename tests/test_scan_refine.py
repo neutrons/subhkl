@@ -140,6 +140,7 @@ def test_bad_modes_and_finderless_pixel_polish_rejected(inputs, tmp_path):
 
 def test_solve_cli_routes_band_options_and_failure_status(monkeypatch):
     from typer.testing import CliRunner
+
     from subhkl.io.parser import app
 
     captured = {}
@@ -491,7 +492,7 @@ def test_per_run_trans_polish_recovers_shift_and_writes_trans_m(tmp_path):
     R_runs_init = [calc_goniometer_rotation_matrix(axes, a) for a in angles_run]
     # Run 0 has zero shift; Run 1 has a +3 mm z / -2 mm y lab-frame sample displacement
     ds_lab_true = [np.zeros(3), np.array([0.0, -0.002, 0.003])]
-    bank_ids = sorted(int(k_) for k_ in beamlines["CG4D"].keys())
+    bank_ids = sorted(int(k_) for k_ in beamlines["CG4D"])
     dets = {b: Detector(dict(beamlines["CG4D"][str(b)])) for b in bank_ids}
     C_final = np.array([dets[b].center for b in bank_ids])
     uh_final = np.array([dets[b].uhat for b in bank_ids])
