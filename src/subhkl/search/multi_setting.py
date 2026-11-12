@@ -30,6 +30,7 @@ class MultiSettingModel:
         first = self.models[0]
         self.geometry_size = 7 if free_roll else 6
         self.B, self.G = first.B, first.G
+        self.space_group = getattr(first, "space_group", None)
         self.d_min, self.wavelength = first.d_min, first.wavelength
         for model in self.models:
             if (

@@ -235,7 +235,13 @@ def solve(
                 stable_runs=[int(x) for x in stable_runs.split(",")]
                 if stable_runs
                 else None,
-                modes=refine_modes.split(",") if refine_modes is not None else None,
+                modes=[
+                    m.strip()
+                    for m in refine_modes.split(",")
+                    if m.strip() and m.strip().lower() != "none"
+                ]
+                if refine_modes is not None
+                else None,
                 n_zones=band_zones,
                 d_min=d_min,
                 min_deviance=min_deviance,

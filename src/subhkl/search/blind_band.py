@@ -274,6 +274,10 @@ def discover(args, samples=16384, candidates=6, seed=0):
         f"Joint band refinement of {len(found)} distinct blind candidates", flush=True
     )
     rot_axis_only = getattr(args, "global_rot_axis", (0.0, 1.0, 0.0))
+    modes = getattr(args, "modes", None)
+    r_bound = 0.08 if (modes is None or "cylindrical" in modes) else 0.0
+    rot_bound = 2.0 if (modes is None or "global_rot" in modes) else 0.0
+    t_bound = 0.02 if (modes is None or "global_trans" in modes) else 0.0
     fits = []
     for i, item in enumerate(found):
         U = item[0]
@@ -286,6 +290,9 @@ def discover(args, samples=16384, candidates=6, seed=0):
             U,
             wavelength,
             args.d_min,
+            radial_bound=r_bound,
+            rot_bound_deg=rot_bound,
+            trans_bound_m=t_bound,
             maxiter=150,
             rot_axis_only=rot_axis_only,
             space_group=args.space_group,
