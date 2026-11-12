@@ -29,13 +29,14 @@ def test_tests_needing_the_dataset_are_deselected_by_default():
     result = _pytest("--collect-only", "-q", *DATA_TEST_FILES)
 
     assert "no tests collected" in result.stdout, result.stdout
-    assert "3 deselected" in result.stdout, result.stdout
+    assert "4 deselected" in result.stdout, result.stdout
 
 
 def test_tests_needing_the_dataset_can_be_asked_for():
     result = _pytest("--collect-only", "-q", "-m", "mesolite", *DATA_TEST_FILES)
 
     assert "test_full_workflow" in result.stdout, result.stdout
+    assert "test_solve_workflow" in result.stdout, result.stdout
     assert "test_mandi_multi_run_finder_merger" in result.stdout, result.stdout
 
 
