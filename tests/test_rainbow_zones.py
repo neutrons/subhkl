@@ -1465,3 +1465,113 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert p_mat["pipeline_stages"][0]["container"] == get_container_image()
     assert p_mat["pipeline_stages"][1]["container"] == get_container_image()
     assert p_mat["pipeline_stages"][2]["container"] == get_container_image()
+
+
+def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
+    tmp_path, monkeypatch
+) -> None:
+    import os
+    import tempfile as _tempfile
+    from types import SimpleNamespace
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import _discover_images_h5
+
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmp_path))
+
+    mandi_gx_id = "70f27733988683c0"
+    cg4d_gx_id = "1805ca028e2eaa6f"
+    mandi_cached = (
+        tmp_path / f"subhkl_gx_{mandi_gx_id}_MANDI_12737_MANDI_12743_merged.h5"
+    )
+    with h5py.File(mandi_cached, "w") as hf:
+        dt_s = h5py.string_dtype(encoding="utf-8")
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_12737.nxs.h5", "MANDI_12743.nxs.h5"], dtype=object),
+            dtype=dt_s,
+        )
+        hf.create_dataset("images", data=np.zeros((2, 8, 8), dtype=np.float32))
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.0, 4.0], dtype=np.float32)
+        )
+    mandi_size = mandi_cached.stat().st_size
+
+    runner = NovaGalaxyPipelineRunner.__new__(NovaGalaxyPipelineRunner)
+    runner.galaxy_url = "https://ndip-test.ornl.gov"
+    runner.api_key = "fake_key"
+    runner._dataset_id_by_path = {}
+    runner._api_request = lambda method, path, **kw: {
+        "id": mandi_gx_id,
+        "name": "MANDI_12737_MANDI_12743_merged.h5",
+        "state": "ok",
+        "file_size": mandi_size,
+    }
+
+    resolved_local, _ = runner.resolve_dataset_to_local_h5(mandi_gx_id)
+    _work_dir, work_merged = runner._resolve_work_dir_and_merged(resolved_local)
+    assert os.path.basename(work_merged) == "MANDI_12737_MANDI_12743_merged.h5"
+    assert runner._dataset_id_by_path.get(os.path.abspath(work_merged)) == mandi_gx_id
+
+    # Stamp instrument metadata onto merged.h5 that already has an 'instrument' group
+    runner._stamp_merged_metadata(
+        work_merged, {"instrument": "MANDI", "params": {"space_group": "P 21 21 21"}}
+    )
+    with h5py.File(work_merged, "r") as hf:
+        assert hf.attrs.get("instrument") == "MANDI"
+        assert hf["instrument/name"][()].decode("utf-8") == "MANDI"
+
+    # Simulate a Galaxy history containing both an old CG4D 'merged.h5' and the MANDI dataset
+    datasets_by_id = {
+        cg4d_gx_id: {
+            "id": cg4d_gx_id,
+            "name": "merged.h5",
+            "state": "ok",
+            "deleted": False,
+            "file_size": mandi_size + 99999,
+        },
+        mandi_gx_id: {
+            "id": mandi_gx_id,
+            "name": "MANDI_12737_MANDI_12743_merged.h5",
+            "state": "ok",
+            "deleted": False,
+            "file_size": mandi_size,
+        },
+    }
+
+    class _FakeDatasetsClient:
+        def show_dataset(self, ds_id: str):
+            return datasets_by_id[ds_id]
+
+        def get_datasets(self, history_id: str, name: str | None = None):
+            all_ds = list(datasets_by_id.values())
+            if name is None:
+                return all_ds
+            return [d for d in all_ds if d["name"] == name]
+
+    fake_store = SimpleNamespace(
+        history_id="hist_1",
+        nova_connection=SimpleNamespace(
+            galaxy_instance=SimpleNamespace(
+                datasets=_FakeDatasetsClient(),
+                base_url="https://ndip-test.ornl.gov",
+            )
+        ),
+    )
+
+    job_rec = {"stdout": ""}
+    linked_id = runner._ensure_galaxy_h5_dataset(fake_store, work_merged, job_rec)
+    assert linked_id == mandi_gx_id
+
+    # Verify _discover_images_h5 locates <tag>_merged.h5 from a solve.h5 that has 'files' but no 'images'
+    solve_h5 = tmp_path / "subhkl_gx_999999_solve.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        dt_s = h5py.string_dtype(encoding="utf-8")
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_12737.nxs.h5", "MANDI_12743.nxs.h5"], dtype=object),
+            dtype=dt_s,
+        )
+    disc = _discover_images_h5(solve_h5)
+    assert disc is not None
+    assert os.path.abspath(disc) == os.path.abspath(work_merged)

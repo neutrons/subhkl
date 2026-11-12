@@ -211,10 +211,9 @@ class SubhklGalaxyModel:
         if self.data.images_file and os.path.isfile(self.data.images_file):
             img_dir = os.path.dirname(os.path.abspath(self.data.images_file))
             pk_dir = os.path.dirname(os.path.abspath(self.data.peaks_file))
-            tmp_root = os.path.abspath(tempfile.gettempdir())
-            if img_dir == pk_dir or (
-                img_dir.startswith(tmp_root) and pk_dir.startswith(tmp_root)
-            ):
+            if img_dir == pk_dir or os.path.abspath(
+                self.data.images_file
+            ) == os.path.abspath(self.data.peaks_file):
                 img_path = self.data.images_file
         self.payload = build_rainbow_zone_payload(
             replay_h5=self.data.peaks_file,

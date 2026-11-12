@@ -160,40 +160,41 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
     ):
         if "images" in f:
             return str(p)
-            src_attr = _decode_str(f.attrs.get("source"), "")
-            if not src_attr and "scan_refinement" in f:
-                src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
-            if not src_attr and "search" in f:
-                src_attr = _decode_str(f["search"].attrs.get("source"), "")
-            if src_attr:
-                for cand_src in (Path(src_attr), p.parent / Path(src_attr).name):
-                    if cand_src.exists():
-                        with (
-                            contextlib.suppress(OSError, RuntimeError, KeyError),
-                            h5py.File(cand_src, "r") as sf,
-                        ):
-                            if "images" in sf:
-                                return str(cand_src.resolve())
-            if "files" in f:
-                with contextlib.suppress(
-                    OSError, RuntimeError, ValueError, TypeError, KeyError
-                ):
-                    raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
-                    raw_files = [x for x in raw_files if x]
-                    if raw_files:
-                        first_stem = os.path.basename(raw_files[0]).split(".")[0]
-                        last_stem = os.path.basename(raw_files[-1]).split(".")[0]
-                        for tag in (
-                            first_stem,
-                            f"{first_stem}_{last_stem}",
-                        ):
-                            safe_tag = "".join(
-                                c if (c.isalnum() or c in "._-") else "_" for c in tag
-                            )
+        src_attr = _decode_str(f.attrs.get("source"), "")
+        if not src_attr and "scan_refinement" in f:
+            src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
+        if not src_attr and "search" in f:
+            src_attr = _decode_str(f["search"].attrs.get("source"), "")
+        if src_attr:
+            for cand_src in (Path(src_attr), p.parent / Path(src_attr).name):
+                if cand_src.exists():
+                    with (
+                        contextlib.suppress(OSError, RuntimeError, KeyError),
+                        h5py.File(cand_src, "r") as sf,
+                    ):
+                        if "images" in sf:
+                            return str(cand_src.resolve())
+        if "files" in f:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
+                raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
+                raw_files = [x for x in raw_files if x]
+                if raw_files:
+                    first_stem = os.path.basename(raw_files[0]).split(".")[0]
+                    last_stem = os.path.basename(raw_files[-1]).split(".")[0]
+                    for tag in (
+                        first_stem,
+                        f"{first_stem}_{last_stem}",
+                    ):
+                        safe_tag = "".join(
+                            c if (c.isalnum() or c in "._-") else "_" for c in tag
+                        )
+                        for m_fn in (f"{safe_tag}_merged.h5", "merged.h5"):
                             work_cand = (
                                 Path(tempfile.gettempdir())
                                 / f"subhkl_work_{safe_tag}"
-                                / "merged.h5"
+                                / m_fn
                             )
                             if work_cand.is_file():
                                 return str(work_cand.resolve())
@@ -8558,10 +8559,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     try {{
       // 1. Prefer server-side HDF5 extraction via NOVA/HTTP backend (handles merged.h5, solve.h5, predictor.h5, integrated.h5 with ellipses & multi-frame)
       try {{
-        const curFrame = typeof state.selectedFrameIndex === "number"
-          ? state.selectedFrameIndex
-          : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
-        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{curFrame}}`, {{
+        state.selectedFrameIndex = 0;
+        DATA.frame_index = 0;
+        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=0`, {{
           cache: "no-store",
           credentials: "same-origin",
         }});

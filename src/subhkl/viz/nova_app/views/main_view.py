@@ -122,10 +122,21 @@ class MainApp:
                     if os.path.isfile(local_h5):
                         ds_name = os.path.basename(local_h5).lower()
                         if any(k in ds_name for k in ("merged", "scan", "image")):
+                            _, local_h5 = (
+                                self.pipeline_runner._resolve_work_dir_and_merged(
+                                    local_h5
+                                )
+                            )
                             self.view_model.model.subhkl.data.images_file = local_h5
                             self.view_model.model.subhkl.data.peaks_file = local_h5
                         else:
+                            from subhkl.viz.rainbow_zones import _discover_images_h5
+
                             self.view_model.model.subhkl.data.peaks_file = local_h5
+                            disc_img = _discover_images_h5(local_h5)
+                            self.view_model.model.subhkl.data.images_file = (
+                                str(disc_img) if disc_img else ""
+                            )
                         self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
                         refreshed = True
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
@@ -153,10 +164,19 @@ class MainApp:
                         ds_info.get("name") or os.path.basename(local_h5)
                     ).lower()
                     if any(k in ds_name for k in ("merged", "scan", "image")):
+                        _, local_h5 = self.pipeline_runner._resolve_work_dir_and_merged(
+                            local_h5
+                        )
                         self.view_model.model.subhkl.data.images_file = local_h5
                         self.view_model.model.subhkl.data.peaks_file = local_h5
                     else:
+                        from subhkl.viz.rainbow_zones import _discover_images_h5
+
                         self.view_model.model.subhkl.data.peaks_file = local_h5
+                        disc_img = _discover_images_h5(local_h5)
+                        self.view_model.model.subhkl.data.images_file = (
+                            str(disc_img) if disc_img else ""
+                        )
                     self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
                     refreshed = True
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:

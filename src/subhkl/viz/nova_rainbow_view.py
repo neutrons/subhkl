@@ -729,9 +729,17 @@ class NovaGalaxyPipelineRunner:
         if not isinstance(info, dict):
             raise TypeError(f"Dataset {ds_id} not found on {self.galaxy_url}")
         name = str(info.get("name") or f"{ds_id}.h5")
+        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+
+        def _remember(path: str) -> str:
+            known_map[os.path.abspath(path)] = ds_id
+            known_map[os.path.realpath(path)] = ds_id
+            self._dataset_id_by_path = known_map
+            return path
+
         file_name = str(info.get("file_name") or "")
         if file_name and os.path.isfile(file_name) and os.path.getsize(file_name) > 0:
-            return file_name, info
+            return _remember(file_name), info
 
         # 1. Check cached dataset file in /tmp by exact ds_id first
         cached_matches = sorted(
@@ -739,15 +747,15 @@ class NovaGalaxyPipelineRunner:
         )
         for cm in cached_matches:
             if os.path.isfile(cm) and os.path.getsize(cm) > 0:
-                return cm, info
+                return _remember(cm), info
 
         # 2. If dataset name includes a relative folder (e.g. 'betalac-7/merged.h5'), check /home/xvg/subhkl-examples/
         if "/" in name:
             if os.path.isfile(name) and os.path.getsize(name) > 0:
-                return name, info
+                return _remember(name), info
             ex_cand = os.path.join("/home/xvg/subhkl-examples", name.lstrip("/"))
             if os.path.isfile(ex_cand) and os.path.getsize(ex_cand) > 0:
-                return ex_cand, info
+                return _remember(ex_cand), info
 
         # 3. Only fall back to fallback_dir if file_size matches (prevents generic 'scan.h5'/'merged.h5' collisions)
         expected_size = int(info.get("file_size") or 0)
@@ -761,7 +769,7 @@ class NovaGalaxyPipelineRunner:
                     or (expected_size == 0 and not self.is_connected)
                 )
             ):
-                return cand, info
+                return _remember(cand), info
 
         safe_name = "".join(
             ch if (ch.isalnum() or ch in "._-") else "_"
@@ -771,7 +779,7 @@ class NovaGalaxyPipelineRunner:
             safe_name += ".h5"
         tmp_dest = os.path.join(tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}")
         if os.path.isfile(tmp_dest) and os.path.getsize(tmp_dest) > 0:
-            return tmp_dest, info
+            return _remember(tmp_dest), info
         data = self._api_request(
             "GET",
             f"/api/datasets/{ds_id}/display",
@@ -780,7 +788,7 @@ class NovaGalaxyPipelineRunner:
         )
         with open(tmp_dest, "wb") as fh:
             fh.write(data)
-        return tmp_dest, info
+        return _remember(tmp_dest), info
 
     @staticmethod
     def _classify_artifact_stage(filename: str) -> str | None:
@@ -953,6 +961,11 @@ class NovaGalaxyPipelineRunner:
         if parent_d != tmp_root:
             return parent_d, abs_m
 
+        orig_bn = os.path.basename(abs_m)
+        m_gx = _re.match(r"^subhkl_gx_([0-9a-fA-F]+)_(.+)$", orig_bn)
+        gx_ds_id = m_gx.group(1) if m_gx else None
+        clean_bn = m_gx.group(2) if m_gx else orig_bn
+
         tag = ""
         if os.path.isfile(abs_m):
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
@@ -974,20 +987,42 @@ class NovaGalaxyPipelineRunner:
                             s1 = os.path.basename(raw_f[-1]).split(".")[0]
                             tag = s0 if s0 == s1 else f"{s0}_{s1}"
         if not tag:
-            bn = os.path.basename(abs_m)
-            bn = _re.sub(r"^subhkl_gx_[0-9a-fA-F]+_", "", bn)
-            bn = _re.sub(r"(_merged)?\.h5$", "", bn, flags=_re.IGNORECASE)
+            bn = _re.sub(r"(_merged)?\.h5$", "", clean_bn, flags=_re.IGNORECASE)
             tag = bn or "dataset"
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
         work_d = os.path.join(tmp_root, f"subhkl_work_{safe_tag}")
         os.makedirs(work_d, exist_ok=True)
-        dest_m = os.path.join(work_d, "merged.h5")
-        if os.path.isfile(abs_m) and not os.path.isfile(dest_m):
-            try:
-                _shutil.copy2(abs_m, dest_m)
-            except OSError:
-                return work_d, abs_m
-        return work_d, (dest_m if os.path.isfile(dest_m) else abs_m)
+        dest_name = (
+            clean_bn
+            if clean_bn.lower().endswith("_merged.h5")
+            else f"{safe_tag}_merged.h5"
+        )
+        dest_m = os.path.join(work_d, dest_name)
+        legacy_m = os.path.join(work_d, "merged.h5")
+        if os.path.isfile(abs_m):
+            src_sz = os.path.getsize(abs_m)
+            if not os.path.isfile(dest_m) or os.path.getsize(dest_m) != src_sz:
+                try:
+                    _shutil.copy2(abs_m, dest_m)
+                except OSError:
+                    return work_d, abs_m
+            if dest_m != legacy_m and (
+                not os.path.isfile(legacy_m) or os.path.getsize(legacy_m) != src_sz
+            ):
+                with contextlib.suppress(OSError):
+                    _shutil.copy2(abs_m, legacy_m)
+
+        final_m = dest_m if os.path.isfile(dest_m) else abs_m
+        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+        mapped_id = (
+            known_map.get(abs_m) or known_map.get(os.path.realpath(abs_m)) or gx_ds_id
+        )
+        if mapped_id:
+            for p_alias in (abs_m, final_m, legacy_m):
+                known_map[os.path.abspath(p_alias)] = mapped_id
+                known_map[os.path.realpath(p_alias)] = mapped_id
+            self._dataset_id_by_path = known_map
+        return work_d, final_m
 
     def connect(self) -> Any:
         if self._conn_helper is not None:
@@ -1167,8 +1202,15 @@ class NovaGalaxyPipelineRunner:
                     float(params["gamma"]),
                 ]
             with h5py.File(h5_path, "r+") as hf:
-                if inst_val and "instrument" not in hf:
-                    hf["instrument"] = np.bytes_(inst_val)
+                if inst_val:
+                    hf.attrs["instrument"] = inst_val
+                    if "instrument" not in hf:
+                        hf["instrument"] = np.bytes_(inst_val)
+                    elif (
+                        isinstance(hf["instrument"], h5py.Group)
+                        and "name" not in hf["instrument"]
+                    ):
+                        hf["instrument/name"] = np.bytes_(inst_val)
                 if sg_val and "space_group" not in hf:
                     hf["space_group"] = np.bytes_(sg_val)
                 raw_nxs_list = (
@@ -1525,32 +1567,89 @@ class NovaGalaxyPipelineRunner:
         file_ext: str = "h5",
     ) -> str:
         """Link an existing 'ok' dataset in the Galaxy history or upload with file_type=file_ext, to_posix_lines=False."""
+        import glob as _glob
+        import re as _re
+
         fname = os.path.basename(local_path)
+        local_size = os.path.getsize(local_path) if os.path.isfile(local_path) else 0
         gi = store.nova_connection.galaxy_instance
         known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
         if not force_upload:
-            for cand_p in (
+            cand_paths = [
                 os.path.abspath(local_path),
                 os.path.realpath(local_path),
-            ):
+            ]
+            parent_d = os.path.dirname(os.path.abspath(local_path))
+            parent_bn = os.path.basename(parent_d)
+            if parent_bn.startswith("subhkl_work_"):
+                tag_part = parent_bn[len("subhkl_work_") :]
+                cand_paths.append(os.path.join(parent_d, f"{tag_part}_merged.h5"))
+                cand_paths.append(os.path.join(parent_d, "merged.h5"))
+                for gx_f in _glob.glob(
+                    os.path.join(
+                        tempfile.gettempdir(),
+                        f"subhkl_gx_*_{tag_part}_merged.h5",
+                    )
+                ):
+                    cand_paths.append(os.path.abspath(gx_f))
+
+            for cand_p in cand_paths:
                 known_id = known_map.get(cand_p)
+                if not known_id:
+                    m_gx = _re.match(
+                        r"^subhkl_gx_([0-9a-fA-F]+)_",
+                        os.path.basename(cand_p),
+                    )
+                    if m_gx:
+                        known_id = m_gx.group(1)
                 if known_id:
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         k_info = gi.datasets.show_dataset(known_id)
                         if k_info.get("state") == "ok" and not k_info.get("deleted"):
+                            known_map[os.path.abspath(local_path)] = known_id
+                            self._dataset_id_by_path = known_map
                             job_record["stdout"] += (
                                 f"[nova -> galaxy] Linked cached dataset '{fname}' (id={known_id}, state=ok)\n"
                             )
                             return known_id
 
             search_names = [fname]
-            if fname != "merged.h5" and fname.endswith("_merged.h5"):
-                search_names.append("merged.h5")
+            if (
+                fname == "merged.h5"
+                and parent_bn.startswith("subhkl_work_")
+                and len(parent_bn) > len("subhkl_work_")
+            ):
+                tag_part = parent_bn[len("subhkl_work_") :]
+                search_names = [f"{tag_part}_merged.h5", "merged.h5"]
+
+            generic_names = {
+                "merged.h5",
+                "solve.h5",
+                "integrated.h5",
+                "predictor.h5",
+                "merged.mtz",
+                "scan.h5",
+            }
             in_prog_candidates: list[tuple[str, str]] = []
+            all_hist_ds: list[dict[str, Any]] | None = None
             for sname in search_names:
-                existing = gi.datasets.get_datasets(
-                    history_id=store.history_id, name=sname
+                is_generic = sname.lower() in generic_names
+                existing = list(
+                    gi.datasets.get_datasets(history_id=store.history_id, name=sname)
+                    or []
                 )
+                if sname in ("solve.h5", "integrated.h5", "merged.mtz"):
+                    if all_hist_ds is None:
+                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                            all_hist_ds = list(
+                                gi.datasets.get_datasets(history_id=store.history_id)
+                                or []
+                            )
+                    for d_item in all_hist_ds or []:
+                        d_nm = str(d_item.get("name") or "")
+                        if d_nm.startswith(f"{sname} (") and d_item not in existing:
+                            existing.append(d_item)
+                existing.sort(key=lambda d: int(d.get("hid") or 0))
                 # Pass 1: Newest-first search for any dataset already in state='ok'
                 for ds in reversed(existing):
                     ds_id = ds.get("id")
@@ -1568,11 +1667,19 @@ class NovaGalaxyPipelineRunner:
                         if isinstance(info.get("state"), str)
                         else ds.get("state")
                     )
+                    ds_sz = int(info.get("file_size") or 0)
                     if st == "ok":
+                        if (
+                            is_generic
+                            and local_size > 0
+                            and ds_sz > 0
+                            and ds_sz != local_size
+                        ):
+                            continue
                         known_map[os.path.abspath(local_path)] = ds_id
                         self._dataset_id_by_path = known_map
                         job_record["stdout"] += (
-                            f"[nova -> galaxy] Linked existing dataset '{sname}' (id={ds_id}, state=ok)\n"
+                            f"[nova -> galaxy] Linked existing dataset '{info.get('name') or sname}' (id={ds_id}, state=ok)\n"
                         )
                         return ds_id
                     if st in ("queued", "running", "new", "upload"):
@@ -1589,7 +1696,12 @@ class NovaGalaxyPipelineRunner:
                         ds_id, maxwait=15, interval=2.0, check=False
                     )
                     info = gi.datasets.show_dataset(ds_id)
-                    if info.get("state") == "ok" and not info.get("deleted"):
+                    ds_sz = int(info.get("file_size") or 0)
+                    if (
+                        info.get("state") == "ok"
+                        and not info.get("deleted")
+                        and (local_size <= 0 or ds_sz <= 0 or ds_sz == local_size)
+                    ):
                         known_map[os.path.abspath(local_path)] = ds_id
                         self._dataset_id_by_path = known_map
                         return ds_id
@@ -1683,9 +1795,11 @@ class NovaGalaxyPipelineRunner:
             )
             work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
             solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
-            if not os.path.isfile(solve_path) or os.path.basename(solve_path) in (
-                "merged.h5",
-                "integrated.h5",
+            solve_bn = os.path.basename(solve_path).lower()
+            if (
+                not os.path.isfile(solve_path)
+                or solve_bn in ("merged.h5", "integrated.h5", "predictor.h5")
+                or solve_bn.endswith("_merged.h5")
             ):
                 cand_solve = os.path.join(work_dir, "solve.h5")
                 if os.path.isfile(cand_solve):
@@ -3220,10 +3334,10 @@ class NovaGalaxyPipelineRunner:
         mtz_dest = os.path.join(work_dir, "reflections.mtz")
 
         solve_path = os.path.abspath(params.get("peaks_file") or solve_dest)
-        if os.path.basename(solve_path) in (
-            "merged.h5",
-            "integrated.h5",
-            "predictor.h5",
+        solve_bn = os.path.basename(solve_path).lower()
+        if (
+            solve_bn in ("merged.h5", "integrated.h5", "predictor.h5")
+            or solve_bn.endswith("_merged.h5")
         ) and os.path.isfile(solve_dest):
             solve_path = solve_dest
 
@@ -4963,12 +5077,26 @@ def serve_rainbow_zones(
                             ds_info.get("name") or os.path.basename(local_h5)
                         ).lower()
                         if any(k in ds_name for k in ("merged", "scan", "image")):
+                            _, local_h5 = (
+                                vm.pipeline_runner._resolve_work_dir_and_merged(
+                                    local_h5
+                                )
+                            )
                             vm.payload_kwargs["images_h5"] = local_h5
                             vm.replay_h5 = local_h5
                             vm.reload(images_h5=local_h5, frame_index=f_idx)
                         else:
+                            from subhkl.viz.rainbow_zones import _discover_images_h5
+
+                            disc_img = _discover_images_h5(local_h5)
+                            vm.payload_kwargs["images_h5"] = (
+                                str(disc_img) if disc_img else None
+                            )
                             vm.replay_h5 = local_h5
-                            vm.reload(frame_index=f_idx)
+                            vm.reload(
+                                images_h5=(str(disc_img) if disc_img else None),
+                                frame_index=f_idx,
+                            )
                         reloaded = True
                 if f_idx is not None and not reloaded:
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
