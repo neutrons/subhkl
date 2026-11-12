@@ -122,10 +122,21 @@ class MainApp:
                     if os.path.isfile(local_h5):
                         ds_name = os.path.basename(local_h5).lower()
                         if any(k in ds_name for k in ("merged", "scan", "image")):
+                            _, local_h5 = (
+                                self.pipeline_runner._resolve_work_dir_and_merged(
+                                    local_h5
+                                )
+                            )
                             self.view_model.model.subhkl.data.images_file = local_h5
                             self.view_model.model.subhkl.data.peaks_file = local_h5
                         else:
+                            from subhkl.viz.rainbow_zones import _discover_images_h5
+
                             self.view_model.model.subhkl.data.peaks_file = local_h5
+                            disc_img = _discover_images_h5(local_h5)
+                            self.view_model.model.subhkl.data.images_file = (
+                                str(disc_img) if disc_img else ""
+                            )
                         self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
                         refreshed = True
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
@@ -136,6 +147,12 @@ class MainApp:
             ds_id_q = request.rel_url.query.get("dataset_id")
             if ds_id_q is not None and str(ds_id_q).strip() != "":
                 try:
+                    from subhkl.viz.rainbow_zones import (
+                        _discover_images_h5,
+                        apply_mtz_to_payload,
+                        validate_subhkl_ingestible_dataset,
+                    )
+
                     ds_id = str(ds_id_q).strip()
                     cur_peaks = self.view_model.model.subhkl.data.peaks_file
                     cur_imgs = self.view_model.model.subhkl.data.images_file
@@ -149,19 +166,60 @@ class MainApp:
                             ds_id, fallback_dir=fb_dir
                         )
                     )
+                    cur_p = self.view_model.model.subhkl.payload or {}
+                    has_active_geom = bool(
+                        (
+                            cur_p.get("artifact_kind") != "empty"
+                            and cur_p.get("panels")
+                            and (cur_p.get("peaks") or cur_p.get("ub_matrix"))
+                        )
+                        or request.rel_url.query.get("has_active_geometry") == "1"
+                    )
+                    ingest_kind = validate_subhkl_ingestible_dataset(
+                        local_h5,
+                        ds_info,
+                        has_active_geometry=has_active_geom,
+                    )
+                    if ingest_kind == "mtz_overlay":
+                        self.view_model.model.subhkl.payload = apply_mtz_to_payload(
+                            cur_p, local_h5, ds_info
+                        )
+                        return web.json_response(self.view_model.model.subhkl.payload)
+                    if ingest_kind == "raw_nexus":
+                        return web.json_response(
+                            {
+                                "status": "raw_nexus",
+                                "dataset_id": ds_id,
+                                "name": ds_info.get("name")
+                                or os.path.basename(local_h5),
+                            }
+                        )
                     ds_name = str(
                         ds_info.get("name") or os.path.basename(local_h5)
                     ).lower()
                     if any(k in ds_name for k in ("merged", "scan", "image")):
+                        _, local_h5 = self.pipeline_runner._resolve_work_dir_and_merged(
+                            local_h5
+                        )
                         self.view_model.model.subhkl.data.images_file = local_h5
                         self.view_model.model.subhkl.data.peaks_file = local_h5
                     else:
                         self.view_model.model.subhkl.data.peaks_file = local_h5
+                        disc_img = _discover_images_h5(local_h5)
+                        self.view_model.model.subhkl.data.images_file = (
+                            str(disc_img) if disc_img else ""
+                        )
                     self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                    self.pipeline_runner.invalidate_subsequent_stages(
+                        (self.view_model.model.subhkl.payload or {}).get(
+                            "artifact_kind"
+                        ),
+                        os.path.dirname(os.path.abspath(local_h5)),
+                    )
                     refreshed = True
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                     return web.json_response(
-                        {"status": "error", "error": str(exc)}, status=404
+                        {"status": "error", "error": str(exc)}, status=400
                     )
 
             if f_idx is not None and not refreshed:
@@ -460,7 +518,9 @@ class MainApp:
                 ep_parent = os.path.dirname(ep_path)
                 if req_path == ep_path or req_path == ep_path + "/":
                     request = request.clone(
-                        rel_url=request.rel_url.with_path("/index.html")
+                        rel_url=request.rel_url.with_path(
+                            "/index.html", keep_query=True, keep_fragment=True
+                        )
                     )
                     served_index = True
                 elif req_path.startswith(ep_path + "/"):
@@ -470,15 +530,25 @@ class MainApp:
                         served_index = True
                     elif sub_path == "/index.html":
                         served_index = True
-                    request = request.clone(rel_url=request.rel_url.with_path(sub_path))
+                    request = request.clone(
+                        rel_url=request.rel_url.with_path(
+                            sub_path, keep_query=True, keep_fragment=True
+                        )
+                    )
                 elif ep_parent not in ("", "/") and req_path.startswith(
                     ep_parent + "/"
                 ):
                     sub_path = req_path[len(ep_parent) :] or "/"
-                    request = request.clone(rel_url=request.rel_url.with_path(sub_path))
+                    request = request.clone(
+                        rel_url=request.rel_url.with_path(
+                            sub_path, keep_query=True, keep_fragment=True
+                        )
+                    )
             elif req_path in ("/", "/index.html"):
                 request = request.clone(
-                    rel_url=request.rel_url.with_path("/index.html")
+                    rel_url=request.rel_url.with_path(
+                        "/index.html", keep_query=True, keep_fragment=True
+                    )
                 )
                 served_index = True
 

@@ -1213,9 +1213,19 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         "Batching Images: 100%|██████████| 600/600 [00:02<00:00, 280it/s]",
         "Done.",
     ]
+    # Also verify collapsing when Galaxy console_output converts \r to \n (universal newlines)
+    formatted_tqdm_univ = NovaGalaxyPipelineRunner._format_terminal_stream(
+        raw_tqdm.replace("\r", "\n")
+    )
+    assert formatted_tqdm_univ.splitlines() == [
+        "Starting integration...",
+        "Batching Images: 100%|██████████| 600/600 [00:02<00:00, 280it/s]",
+        "Done.",
+    ]
     assert "formatTerminalStdio" in html
     assert "hasMergedCarelessData()" in html
-    assert "opt.disabled = !hasMerge" in html
+    assert "opt.disabled = !hasRes" in html
+    assert "opt.disabled = !hasScl" in html
 
     # 6. Verify checkpoint(..., snapshot=...) writes a live Step 4 .stages.h5 loadable with include_panel_images=False
     from types import SimpleNamespace
@@ -1316,6 +1326,35 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         export_rainbow_widget(p_live, output_html=out_ep_html)
         html_ep = out_ep_html.read_text()
         assert '<base href="/interactivetool/ep/test/subhkl/" />' in html_ep
+
+        import asyncio
+
+        from aiohttp.test_utils import make_mocked_request
+
+        from subhkl.viz.nova_app.views.main_view import MainApp
+
+        app_inst = object.__new__(MainApp)
+        app_inst.pipeline_runner = MagicMock()
+        app_inst.pipeline_runner.browse_oncat_catalog.return_value = {
+            "ok": True,
+            "ipts": "34720",
+            "experiments": [],
+            "runs": [{"run": 12737}],
+        }
+        from aiohttp import web
+
+        aio_app = web.Application()
+        app_inst._bind_routes(SimpleNamespace(app=aio_app))
+        req = make_mocked_request(
+            "GET",
+            "/interactivetool/ep/test/subhkl/api/pipeline/oncat_catalog?facility=SNS&instrument=MANDI&ipts=34720",
+            app=aio_app,
+        )
+        resp = asyncio.run(aio_app._handle(req))
+        assert resp.status == 200
+        app_inst.pipeline_runner.browse_oncat_catalog.assert_called_once_with(
+            {"facility": "SNS", "instrument": "MANDI", "ipts": "34720"}
+        )
     finally:
         if old_ep is None:
             os.environ.pop("EP_PATH", None)
@@ -1427,3 +1466,312 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert p_mat["pipeline_stages"][0]["container"] == get_container_image()
     assert p_mat["pipeline_stages"][1]["container"] == get_container_image()
     assert p_mat["pipeline_stages"][2]["container"] == get_container_image()
+
+
+def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
+    tmp_path, monkeypatch
+) -> None:
+    import os
+    import tempfile as _tempfile
+    from types import SimpleNamespace
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import _discover_images_h5
+
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmp_path))
+
+    mandi_gx_id = "70f27733988683c0"
+    cg4d_gx_id = "1805ca028e2eaa6f"
+    mandi_cached = (
+        tmp_path / f"subhkl_gx_{mandi_gx_id}_MANDI_12737_MANDI_12743_merged.h5"
+    )
+    with h5py.File(mandi_cached, "w") as hf:
+        dt_s = h5py.string_dtype(encoding="utf-8")
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_12737.nxs.h5", "MANDI_12743.nxs.h5"], dtype=object),
+            dtype=dt_s,
+        )
+        hf.create_dataset("images", data=np.zeros((2, 8, 8), dtype=np.float32))
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.0, 4.0], dtype=np.float32)
+        )
+    mandi_size = mandi_cached.stat().st_size
+
+    runner = NovaGalaxyPipelineRunner.__new__(NovaGalaxyPipelineRunner)
+    runner.galaxy_url = "https://ndip-test.ornl.gov"
+    runner.api_key = "fake_key"
+    runner._dataset_id_by_path = {}
+    runner._api_request = lambda method, path, **kw: {
+        "id": mandi_gx_id,
+        "name": "MANDI_12737_MANDI_12743_merged.h5",
+        "state": "ok",
+        "file_size": mandi_size,
+    }
+
+    resolved_local, _ = runner.resolve_dataset_to_local_h5(mandi_gx_id)
+    _work_dir, work_merged = runner._resolve_work_dir_and_merged(resolved_local)
+    assert os.path.basename(work_merged) == "MANDI_12737_MANDI_12743_merged.h5"
+    assert runner._dataset_id_by_path.get(os.path.abspath(work_merged)) == mandi_gx_id
+
+    # Stamp instrument metadata onto merged.h5 that already has an 'instrument' group
+    runner._stamp_merged_metadata(
+        work_merged, {"instrument": "MANDI", "params": {"space_group": "P 21 21 21"}}
+    )
+    with h5py.File(work_merged, "r") as hf:
+        assert hf.attrs.get("instrument") == "MANDI"
+        assert hf["instrument/name"][()].decode("utf-8") == "MANDI"
+
+    # Simulate a Galaxy history containing both an old CG4D 'merged.h5' and the MANDI dataset
+    datasets_by_id = {
+        cg4d_gx_id: {
+            "id": cg4d_gx_id,
+            "name": "merged.h5",
+            "state": "ok",
+            "deleted": False,
+            "file_size": mandi_size + 99999,
+        },
+        mandi_gx_id: {
+            "id": mandi_gx_id,
+            "name": "MANDI_12737_MANDI_12743_merged.h5",
+            "state": "ok",
+            "deleted": False,
+            "file_size": mandi_size,
+        },
+    }
+
+    class _FakeDatasetsClient:
+        def show_dataset(self, ds_id: str):
+            return datasets_by_id[ds_id]
+
+        def get_datasets(self, history_id: str, name: str | None = None):
+            all_ds = list(datasets_by_id.values())
+            if name is None:
+                return all_ds
+            return [d for d in all_ds if name in d["name"]]
+
+    fake_store = SimpleNamespace(
+        history_id="hist_1",
+        nova_connection=SimpleNamespace(
+            galaxy_instance=SimpleNamespace(
+                datasets=_FakeDatasetsClient(),
+                base_url="https://ndip-test.ornl.gov",
+            )
+        ),
+    )
+
+    job_rec = {"stdout": ""}
+    linked_id = runner._ensure_galaxy_h5_dataset(fake_store, work_merged, job_rec)
+    assert linked_id == mandi_gx_id
+
+    # Verify _ensure_galaxy_h5_dataset for solve.h5 does not link 'betalac-7/solve.h5'
+    # or conflate <tag>_merged.h5 candidate paths with solve.h5
+    work_solve = os.path.join(_work_dir, "solve.h5")
+    with h5py.File(work_solve, "w") as hf:
+        hf.create_dataset("hkl", data=np.zeros((4, 3), dtype=np.float32))
+    solve_size = os.path.getsize(work_solve)
+    datasets_by_id["fc00dcb17c606557"] = {
+        "id": "fc00dcb17c606557",
+        "name": "betalac-7/solve.h5",
+        "state": "ok",
+        "deleted": False,
+        "file_size": solve_size,
+    }
+    datasets_by_id["c0662c36e1a24cf3"] = {
+        "id": "c0662c36e1a24cf3",
+        "name": "solve.h5 (subhkl_solve)",
+        "state": "ok",
+        "deleted": False,
+        "file_size": solve_size,
+    }
+    linked_solve_id = runner._ensure_galaxy_h5_dataset(fake_store, work_solve, job_rec)
+    assert linked_solve_id == "c0662c36e1a24cf3"
+
+    # Verify SubhklGalaxyModel() starts with no preloaded local dataset and pending_stage='reduce'
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+
+    empty_model = SubhklGalaxyModel()
+    assert empty_model.data.peaks_file == ""
+    assert empty_model.data.images_file == ""
+    assert empty_model.payload.get("artifact_kind") == "empty"
+    assert empty_model.payload.get("pending_stage") == "reduce"
+    assert len(empty_model.payload.get("panels") or []) > 0
+
+    # Verify list_history_datasets orders most recently touched first and touch_dataset promotes older items
+    from subhkl.viz.rainbow_zones import (
+        render_rainbow_html,
+        validate_subhkl_ingestible_dataset,
+    )
+
+    runner.galaxy_api_key = "fake_key"
+    runner.history_id = "hist_1"
+    runner._dataset_touch_times = {}
+    raw_history = [
+        {
+            "id": "ds_old",
+            "hid": 10,
+            "name": "old_merged.h5",
+            "state": "ok",
+            "extension": "h5",
+            "history_content_type": "dataset",
+            "deleted": False,
+            "update_time": "2026-01-10T10:00:00.000000",
+        },
+        {
+            "id": "ds_new",
+            "hid": 20,
+            "name": "new_solve.h5",
+            "state": "ok",
+            "extension": "h5",
+            "history_content_type": "dataset",
+            "deleted": False,
+            "update_time": "2026-01-12T10:00:00.000000",
+        },
+    ]
+    runner._api_request = lambda method, path, **kw: raw_history
+    ordered = runner.list_history_datasets()
+    assert [d["id"] for d in ordered] == ["ds_new", "ds_old"]
+
+    runner.touch_dataset("ds_old")
+    ordered_after_touch = runner.list_history_datasets()
+    assert [d["id"] for d in ordered_after_touch] == ["ds_old", "ds_new"]
+
+    # Verify validate_subhkl_ingestible_dataset accepts SubHKL .h5 / raw NeXus and errors on unsupported datasets
+    assert (
+        validate_subhkl_ingestible_dataset(
+            work_solve,
+            {
+                "name": "integrator.h5",
+                "hid": 279,
+                "state": "ok",
+                "extension": "png",
+            },
+        )
+        == "subhkl_h5"
+    )
+    raw_nxs = tmp_path / "CG4D_2625.nxs.h5"
+    with h5py.File(raw_nxs, "w") as hf:
+        hf.create_group("entry")
+    assert (
+        validate_subhkl_ingestible_dataset(
+            raw_nxs,
+            {
+                "name": "CG4D_2625.nxs.h5",
+                "hid": 280,
+                "state": "ok",
+                "extension": "h5",
+            },
+        )
+        == "raw_nexus"
+    )
+    from subhkl.viz.rainbow_zones import (
+        _extract_from_h5,
+        infer_dataset_extension,
+    )
+
+    assert infer_dataset_extension("integrator.h5", "png") == "h5"
+    assert infer_dataset_extension("reflections.mtz", "png") == "mtz"
+    assert infer_dataset_extension("dataset_abc-123.dat", "h5") == "dat"
+
+    bad_mtz = tmp_path / "reflections.mtz"
+    bad_mtz.write_bytes(b"MTZ \x00\x00\x00\x00")
+    try:
+        validate_subhkl_ingestible_dataset(
+            bad_mtz,
+            {
+                "name": "reflections.mtz",
+                "hid": 278,
+                "state": "ok",
+                "extension": "mtz",
+            },
+            has_active_geometry=False,
+        )
+        raise AssertionError("Expected ValueError for standalone MTZ file")
+    except ValueError as exc:
+        assert "Cannot load MTZ dataset" in str(exc)
+
+    # Verify _extract_from_h5 ignores stale sibling careless_metrics.json when peaks/careless_residual is absent
+    # and reconstructs peaks_xyz from pixel_r/pixel_c without triggering finder-less solve forward projection
+    stale_dir = tmp_path / "stale_integ"
+    stale_dir.mkdir(exist_ok=True)
+    (stale_dir / "careless_metrics.json").write_text(
+        json.dumps({"n_merged_asu": 500, "cc_half_overall": 0.95}),
+        encoding="utf-8",
+    )
+    integ_no_xyz = stale_dir / "integrated.h5"
+    with h5py.File(integ_no_xyz, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = np.diag([1.0 / 68.7, 1.0 / 69.8, 1.0 / 156.9])
+        hf["peaks/h"] = np.array([1, 2, 3], dtype=int)
+        hf["peaks/k"] = np.array([0, 1, 1], dtype=int)
+        hf["peaks/l"] = np.array([1, 0, 2], dtype=int)
+        hf["peaks/lambda"] = np.array([3.1, 3.4, 3.8], dtype=float)
+        hf["peaks/intensity"] = np.array([120.0, 95.0, 80.0], dtype=float)
+        hf["peaks/sigma"] = np.array([5.0, 4.0, 4.0], dtype=float)
+        hf["peaks/bank"] = np.array([20, 20, 20], dtype=int)
+        hf["peaks/pixel_r"] = np.array([120.0, 140.0, 160.0], dtype=float)
+        hf["peaks/pixel_c"] = np.array([130.0, 150.0, 170.0], dtype=float)
+        hf["peaks/two_theta"] = np.array([0.8, 0.9, 1.0], dtype=float)
+        hf["peaks/azimuthal"] = np.array([0.2, 0.3, 0.4], dtype=float)
+        hf["peaks/var_u"] = np.array([2.5, 2.5, 2.5], dtype=float)
+        hf["peaks/var_v"] = np.array([1.8, 1.8, 1.8], dtype=float)
+        hf["peaks/cov_uv"] = np.array([0.1, 0.1, 0.1], dtype=float)
+
+    ext_integ = _extract_from_h5(integ_no_xyz)
+    assert ext_integ["artifact_kind"] == "integrator"
+    assert ext_integ["merge_metrics"] is None
+    assert len(ext_integ["peaks_xyz"]) == 3
+
+    # Verify invalidate_subsequent_stages removes stale careless_metrics.json and hides subsequent stages
+    runner.invalidate_subsequent_stages("solve", str(stale_dir))
+    assert not (stale_dir / "careless_metrics.json").exists()
+    step_arts = runner.list_step_artifacts(
+        current_h5=str(integ_no_xyz),
+        history_datasets=[
+            {"id": "ds_s", "hid": 10, "name": "solve.h5", "state": "ok"},
+            {"id": "ds_i", "hid": 11, "name": "integrated.h5", "state": "ok"},
+            {"id": "ds_m", "hid": 12, "name": "merged.mtz", "state": "ok"},
+        ],
+    )
+    assert len(step_arts["solve"]) == 1
+    assert step_arts["integrate"] == []
+    assert step_arts["merge"] == []
+
+    bad_h5 = tmp_path / "unrelated.h5"
+    with h5py.File(bad_h5, "w") as hf:
+        hf.create_dataset("foo", data=np.array([1, 2, 3]))
+    try:
+        validate_subhkl_ingestible_dataset(
+            bad_h5,
+            {"name": "unrelated.h5", "hid": 281, "state": "ok", "extension": "h5"},
+        )
+        raise AssertionError("Expected ValueError for unrelated HDF5 file")
+    except ValueError as exc:
+        assert "does not contain SubHKL diffraction data" in str(exc)
+
+    html_doc = render_rainbow_html(empty_model.payload)
+    assert "__action_galaxy_dataset__" in html_doc
+    assert "From Galaxy..." in html_doc
+    assert 'id="modal-galaxy-dataset"' in html_doc
+    assert "MAX_RECENT_HISTORY_ITEMS" in html_doc
+
+    # Verify _discover_images_h5 locates <tag>_merged.h5 from a solve.h5 that has 'files'
+    # even when attrs['source'] points to an existing Pulsar staging dataset_*.dat file
+    staging_dir = tmp_path / "staging_test" / "279969" / "inputs"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staging_dat = staging_dir / "dataset_c0662c36-e1a2-4cf3-8d04-233deadc86c9.dat"
+    with h5py.File(staging_dat, "w") as hf:
+        hf.create_dataset("images", data=np.zeros((2, 8, 8), dtype=np.float32))
+    solve_h5 = tmp_path / "subhkl_gx_999999_solve.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["source"] = str(staging_dat)
+        dt_s = h5py.string_dtype(encoding="utf-8")
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_12737.nxs.h5", "MANDI_12743.nxs.h5"], dtype=object),
+            dtype=dt_s,
+        )
+    disc = _discover_images_h5(solve_h5)
+    assert disc is not None
+    assert os.path.abspath(disc) == os.path.abspath(work_merged)

@@ -100,7 +100,9 @@ def _decode_str(val: Any, default: str = "") -> str:
     return str(val)
 
 
-def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, Any]:
+def _load_detectors_from_h5(
+    f: h5py.File | None, instrument: str | None
+) -> dict[int, Any]:
     """Load calibrated or nominal detector banks from ``subhkl.config.beamlines`` + HDF5 calibration."""
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
@@ -120,7 +122,7 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
         ):
             detectors[bank_id] = Detector(cfg)
 
-    if "detector_calibration" in f:
+    if f is not None and "detector_calibration" in f:
         cal_grp = f["detector_calibration"]
         for name in cal_grp:
             if not name.startswith("bank_"):
@@ -160,43 +162,61 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
     ):
         if "images" in f:
             return str(p)
-            src_attr = _decode_str(f.attrs.get("source"), "")
-            if not src_attr and "scan_refinement" in f:
-                src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
-            if not src_attr and "search" in f:
-                src_attr = _decode_str(f["search"].attrs.get("source"), "")
-            if src_attr:
-                for cand_src in (Path(src_attr), p.parent / Path(src_attr).name):
-                    if cand_src.exists():
-                        with (
-                            contextlib.suppress(OSError, RuntimeError, KeyError),
-                            h5py.File(cand_src, "r") as sf,
-                        ):
-                            if "images" in sf:
-                                return str(cand_src.resolve())
-            if "files" in f:
-                with contextlib.suppress(
-                    OSError, RuntimeError, ValueError, TypeError, KeyError
-                ):
-                    raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
-                    raw_files = [x for x in raw_files if x]
-                    if raw_files:
-                        first_stem = os.path.basename(raw_files[0]).split(".")[0]
-                        last_stem = os.path.basename(raw_files[-1]).split(".")[0]
-                        for tag in (
-                            first_stem,
-                            f"{first_stem}_{last_stem}",
-                        ):
-                            safe_tag = "".join(
-                                c if (c.isalnum() or c in "._-") else "_" for c in tag
-                            )
+        if "files" in f:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
+                raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
+                raw_files = [x for x in raw_files if x]
+                if raw_files:
+                    first_stem = os.path.basename(raw_files[0]).split(".")[0]
+                    last_stem = os.path.basename(raw_files[-1]).split(".")[0]
+                    for tag in (
+                        f"{first_stem}_{last_stem}",
+                        first_stem,
+                    ):
+                        safe_tag = "".join(
+                            c if (c.isalnum() or c in "._-") else "_" for c in tag
+                        )
+                        for m_fn in (f"{safe_tag}_merged.h5", "merged.h5"):
                             work_cand = (
                                 Path(tempfile.gettempdir())
                                 / f"subhkl_work_{safe_tag}"
-                                / "merged.h5"
+                                / m_fn
                             )
                             if work_cand.is_file():
                                 return str(work_cand.resolve())
+                        for gx_cand in sorted(
+                            glob.glob(
+                                os.path.join(
+                                    tempfile.gettempdir(),
+                                    f"subhkl_gx_*_{safe_tag}_merged.h5",
+                                )
+                            )
+                        ):
+                            if os.path.isfile(gx_cand):
+                                return str(Path(gx_cand).resolve())
+        src_attr = _decode_str(f.attrs.get("source"), "")
+        if not src_attr and "scan_refinement" in f:
+            src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
+        if not src_attr and "search" in f:
+            src_attr = _decode_str(f["search"].attrs.get("source"), "")
+        if src_attr:
+            src_p = Path(src_attr)
+            is_staging_dat = "/staging" in str(src_attr) or (
+                src_p.name.startswith("dataset_") and src_p.suffix == ".dat"
+            )
+            cand_srcs = [p.parent / src_p.name]
+            if not is_staging_dat:
+                cand_srcs.append(src_p)
+            for cand_src in cand_srcs:
+                if cand_src.exists():
+                    with (
+                        contextlib.suppress(OSError, RuntimeError, KeyError),
+                        h5py.File(cand_src, "r") as sf,
+                    ):
+                        if "images" in sf:
+                            return str(cand_src.resolve())
 
     parent = p.parent
     if parent.resolve() == Path(tempfile.gettempdir()).resolve():
@@ -504,6 +524,207 @@ def _encode_panel_textures(
     return panels_payload, intensity_source
 
 
+def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str:
+    """Infer canonical dataset file extension from filename first, falling back to Galaxy metadata."""
+    import re as _re
+
+    clean_name = _re.sub(r"\s*\([^)]*\)\s*$", "", str(name or "")).strip()
+    base = os.path.basename(clean_name).lower()
+    if base.endswith((".nxs.h5", ".nxs")):
+        return "nxs.h5"
+    if base.endswith((".h5", ".hdf5")):
+        return "h5"
+    if base.endswith(".mtz"):
+        return "mtz"
+    if base.endswith(".json"):
+        return "json"
+    if base.endswith((".html", ".htm")):
+        return "html"
+    if base.endswith(".png"):
+        return "png"
+    if base.endswith((".jpg", ".jpeg")):
+        return "jpg"
+    if base.endswith(".svg"):
+        return "svg"
+    if base.endswith(".dat"):
+        return "dat"
+    if base.endswith((".log", ".txt")):
+        return "txt"
+    ext = str(raw_ext or "").strip().lower().lstrip(".")
+    return ext or "data"
+
+
+def validate_subhkl_ingestible_dataset(
+    local_path: str | os.PathLike,
+    ds_info: dict[str, Any] | None = None,
+    *,
+    has_active_geometry: bool = False,
+) -> str:
+    """Validate that a local file or Galaxy dataset can be ingested by SubHKL.
+
+    Returns ``"subhkl_h5"`` for reduced/indexed/predicted/integrated SubHKL HDF5 files,
+    ``"raw_nexus"`` for raw NeXus files (``/entry``), or ``"mtz_overlay"`` for MTZ files
+    when ``has_active_geometry`` is True. Raises ``ValueError`` with an explanatory
+    message if the dataset cannot be ingested.
+    """
+    info = ds_info or {}
+    ds_name = str(info.get("name") or os.path.basename(str(local_path)))
+    ds_hid = info.get("hid")
+    ds_label = f"#{ds_hid} '{ds_name}'" if ds_hid else f"'{ds_name}'"
+    state = str(info.get("state") or "ok")
+    ext = infer_dataset_extension(ds_name, info.get("extension"))
+    if state != "ok":
+        raise ValueError(
+            f"Cannot ingest Galaxy dataset {ds_label}: dataset state is '{state}' (must be 'ok')."
+        )
+    p = Path(local_path)
+    if not p.is_file() or p.stat().st_size <= 0:
+        raise ValueError(
+            f"Cannot ingest Galaxy dataset {ds_label}: dataset file is empty or missing."
+        )
+    if ext == "mtz" or str(p).lower().endswith(".mtz"):
+        if not has_active_geometry:
+            raise ValueError(
+                f"Cannot load MTZ dataset {ds_label} by itself: load a solved or integrated HDF5 dataset with detector geometry first."
+            )
+        try:
+            import gemmi
+
+            mtz_obj = gemmi.read_mtz_file(str(p))
+            if mtz_obj.nreflections <= 0:
+                raise ValueError(
+                    f"Cannot ingest MTZ dataset {ds_label}: MTZ file contains 0 reflections."
+                )
+            return "mtz_overlay"
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot ingest MTZ dataset {ds_label}: not a valid MTZ reflection file ({exc})."
+            ) from exc
+    try:
+        with h5py.File(p, "r") as f:
+            if any(
+                k in f
+                for k in (
+                    "images",
+                    "peaks",
+                    "banks",
+                    "hkl",
+                    "sample",
+                    "search",
+                    "scan_refinement",
+                )
+            ):
+                return "subhkl_h5"
+            if "entry" in f or ext == "nxs.h5":
+                return "raw_nexus"
+            top_keys = ", ".join(list(f.keys())[:6]) or "none"
+            raise ValueError(
+                f"Cannot ingest Galaxy dataset {ds_label}: HDF5 file does not contain SubHKL diffraction data "
+                f"(images/peaks/hkl) or raw NeXus (/entry) data (found keys: {top_keys})."
+            )
+    except OSError as exc:
+        raise ValueError(
+            f"Cannot ingest Galaxy dataset {ds_label} (format '{ext}'): not a valid HDF5 or NeXus file."
+        ) from exc
+
+
+def apply_mtz_to_payload(
+    payload: dict[str, Any],
+    mtz_path: str | os.PathLike,
+    ds_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Overlay reference spots / merged intensities from an MTZ file onto an existing detector geometry payload."""
+    import gemmi
+
+    mtz = gemmi.read_mtz_file(str(mtz_path))
+    sg = mtz.spacegroup or gemmi.find_spacegroup_by_name(
+        str(payload.get("space_group") or "P 1")
+    )
+    asu = gemmi.ReciprocalAsu(sg)
+    ops = sg.operations()
+    cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}
+    if not all(k in cols for k in ("H", "K", "L")):
+        raise ValueError("MTZ file does not contain H, K, L columns.")
+
+    h_col = cols["H"].astype(int)
+    k_col = cols["K"].astype(int)
+    l_col = cols["L"].astype(int)
+    i_col = None
+    s_col = None
+    for ic, sc in (
+        ("I", "SigI"),
+        ("IMEAN", "SIGIMEAN"),
+        ("Iobs", "SigIobs"),
+        ("Ipred", "SigIpred"),
+        ("I(+)", "SIGI(+)"),
+        ("F", "SIGF"),
+    ):
+        if ic in cols:
+            i_col = cols[ic]
+            s_col = cols.get(sc, np.ones_like(i_col))
+            break
+    if i_col is None:
+        val_cols = [
+            c.label
+            for c in mtz.columns
+            if c.label not in ("H", "K", "L", "M/ISYM", "BATCH", "half")
+        ]
+        if val_cols:
+            i_col = cols[val_cols[0]]
+            s_col = cols[val_cols[1]] if len(val_cols) > 1 else np.ones_like(i_col)
+        else:
+            i_col = np.full(len(h_col), 100.0, dtype=np.float64)
+            s_col = np.ones(len(h_col), dtype=np.float64)
+
+    asu_map: dict[tuple[int, int, int], tuple[float, float]] = {}
+    raw_hkl_list: list[tuple[int, int, int, float, float]] = []
+    for idx in range(len(h_col)):
+        iv = float(i_col[idx])
+        sv = float(s_col[idx]) if s_col is not None else 1.0
+        if not np.isfinite(iv):
+            continue
+        hh, kk, ll = int(h_col[idx]), int(k_col[idx]), int(l_col[idx])
+        if hh == 0 and kk == 0 and ll == 0:
+            continue
+        asu_hkl, _ = asu.to_asu([hh, kk, ll], ops)
+        key = (int(asu_hkl[0]), int(asu_hkl[1]), int(asu_hkl[2]))
+        if key not in asu_map or iv > asu_map[key][0]:
+            asu_map[key] = (iv, max(sv, 1e-3))
+        raw_hkl_list.append((hh, kk, ll, iv, max(sv, 1e-3)))
+
+    out = dict(payload)
+    matched_count = 0
+    for list_key in ("peaks", "sample_peaks"):
+        pk_list = out.get(list_key)
+        if not isinstance(pk_list, list):
+            continue
+        new_list = []
+        for pk in pk_list:
+            pk_copy = dict(pk)
+            hkl_v = pk_copy.get("hkl")
+            if isinstance(hkl_v, list) and len(hkl_v) == 3:
+                asu_k, _ = asu.to_asu(
+                    [int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2])], ops
+                )
+                hit = asu_map.get((int(asu_k[0]), int(asu_k[1]), int(asu_k[2])))
+                if hit is not None:
+                    pk_copy["merged_i"] = round(hit[0], 2)
+                    pk_copy["merged_sigi"] = round(hit[1], 2)
+                    if list_key == "peaks":
+                        matched_count += 1
+            new_list.append(pk_copy)
+        out[list_key] = new_list
+
+    info = ds_info or {}
+    mtz_name = str(info.get("name") or os.path.basename(str(mtz_path)))
+    out["mtz_overlay_name"] = mtz_name
+    out["mtz_overlay_reflections"] = len(asu_map)
+    out["mtz_overlay_matched"] = matched_count
+    return out
+
+
 def _extract_from_h5(
     h5_path: str | os.PathLike,
     images_h5: str | os.PathLike | None = None,
@@ -713,6 +934,50 @@ def _extract_from_h5(
         peaks_xyz = (
             np.asarray(f["peaks/xyz"][()], dtype=float) if "peaks/xyz" in f else None
         )
+        if (
+            peaks_xyz is None
+            and pixel_r is not None
+            and pixel_c is not None
+            and len(pixel_r) > 0
+            and len(pixel_c) == len(pixel_r)
+        ):
+            n_pk_raw = len(pixel_r)
+            xyz_rec = np.zeros((n_pk_raw, 3), dtype=float)
+            filled_mask = np.zeros(n_pk_raw, dtype=bool)
+            if bank is not None and len(bank) == n_pk_raw and detectors:
+                for ub_id in np.unique(bank):
+                    det_b = detectors.get(int(ub_id))
+                    if det_b is None:
+                        continue
+                    mb = bank == ub_id
+                    with contextlib.suppress(
+                        RuntimeError, ValueError, TypeError, IndexError
+                    ):
+                        xyz_rec[mb] = det_b.pixel_to_lab(pixel_r[mb], pixel_c[mb])
+                        filled_mask[mb] = True
+            if (
+                not np.all(filled_mask)
+                and "peaks/two_theta" in f
+                and "peaks/azimuthal" in f
+            ):
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, IndexError
+                ):
+                    tt_arr = np.asarray(f["peaks/two_theta"][()], dtype=float)
+                    az_arr = np.asarray(f["peaks/azimuthal"][()], dtype=float)
+                    if len(tt_arr) == n_pk_raw and len(az_arr) == n_pk_raw:
+                        rem = ~filled_mask
+                        st = np.sin(tt_arr[rem])
+                        xyz_rec[rem] = np.column_stack(
+                            [
+                                st * np.cos(az_arr[rem]),
+                                st * np.sin(az_arr[rem]),
+                                np.cos(tt_arr[rem]),
+                            ]
+                        )
+                        filled_mask[rem] = True
+            if np.any(filled_mask):
+                peaks_xyz = xyz_rec
 
         # Extract multi-frame offsets, file names, and goniometer motor angles
         offsets = (
@@ -1068,31 +1333,39 @@ def _extract_from_h5(
                 out["cc_half_bins"] = out["resolution_bins"]
             return out
 
+        has_careless_peak_data = bool(
+            (careless_residual is not None and np.any(np.isfinite(careless_residual)))
+            or (careless_scale is not None and np.any(np.isfinite(careless_scale)))
+        )
+
         merge_metrics: dict[str, Any] | None = None
-        if "careless/metrics_json" in f:
-            with contextlib.suppress(
-                OSError, RuntimeError, ValueError, TypeError, KeyError
-            ):
-                raw_m = _decode_str(f["careless/metrics_json"][()], "{}")
-                doc_m = json.loads(raw_m)
-                if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
-                    merge_metrics = _normalize_merge_metrics(doc_m)
-        elif "peaks" in f:
-            sib_m = Path(h5_path).parent / "careless_metrics.json"
-            if sib_m.is_file():
-                with (
-                    contextlib.suppress(OSError, ValueError, TypeError, KeyError),
-                    open(sib_m, encoding="utf-8") as mfh,
+        if has_careless_peak_data:
+            if "careless/metrics_json" in f:
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
                 ):
-                    doc_m = json.load(mfh)
+                    raw_m = _decode_str(f["careless/metrics_json"][()], "{}")
+                    doc_m = json.loads(raw_m)
                     if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
                         merge_metrics = _normalize_merge_metrics(doc_m)
+            elif "peaks" in f:
+                sib_m = Path(h5_path).parent / "careless_metrics.json"
+                if sib_m.is_file():
+                    with (
+                        contextlib.suppress(OSError, ValueError, TypeError, KeyError),
+                        open(sib_m, encoding="utf-8") as mfh,
+                    ):
+                        doc_m = json.load(mfh)
+                        if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
+                            merge_metrics = _normalize_merge_metrics(doc_m)
 
         artifact_kind = "solve"
         peak_shape_mode = "solved_circle"
         if var_u is not None and var_v is not None:
             artifact_kind = (
-                "merged_careless" if merge_metrics is not None else "integrator"
+                "merged_careless"
+                if (merge_metrics is not None and has_careless_peak_data)
+                else "integrator"
             )
             is_iso = bool(
                 np.allclose(var_u, var_v)
@@ -1461,6 +1734,8 @@ def _extract_from_h5(
         if (
             include_peaks
             and (peaks_xyz is None or len(peaks_xyz) == 0)
+            and "peaks" not in f
+            and "banks" not in f
             and U is not None
             and B is not None
             and detectors
@@ -1961,7 +2236,7 @@ def _build_lattice_ladder_steps(
 def _pending_stage_for_artifact_kind(artifact_kind: str | None) -> str:
     """Return the pending pipeline stage ID given the currently loaded HDF5 artifact kind."""
     kind = (artifact_kind or "solve").lower()
-    if kind == "raw_nexus":
+    if kind in ("raw_nexus", "empty"):
         return "reduce"
     if kind == "merged":
         return "solve"
@@ -2210,6 +2485,11 @@ def build_rainbow_zone_payload(
             images_h5 = extracted["images_h5"]
         elif images_h5 is None:
             images_h5 = _discover_images_h5(replay_h5)
+    elif not detectors:
+        detectors = _load_detectors_from_h5(None, instrument)
+        cell = fallback_cell
+        if peaks_xyz is None and ub_matrix is None and U is None:
+            artifact_kind = "empty"
 
     if peaks_xyz is None:
         peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -4350,7 +4630,7 @@ def render_rainbow_html(
           <span id="nd-validation-msg" style="color:var(--text-dim);">Ready to verify via NDIP Load Neutron Data (`neutrons_load_data`)</span>
           <div style="display:flex;align-items:center;gap:6px;">
             <button id="btn-nd-use-suggested-ipts" type="button" style="display:none;padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(251,191,36,0.18);border:1px solid var(--accent-gold);color:var(--accent-gold);border-radius:4px;cursor:pointer;white-space:nowrap;"></button>
-            <button id="btn-nd-verify" type="button" style="padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(56,189,248,0.14);border:1px solid rgba(56,189,248,0.45);color:var(--accent-cyan);border-radius:4px;cursor:pointer;white-space:nowrap;">Check via NDIP</button>
+            <button id="btn-nd-verify" type="button" style="padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(56,189,248,0.14);border:1px solid rgba(56,189,248,0.45);color:var(--accent-cyan);border-radius:4px;cursor:pointer;white-space:nowrap;">Check via ONcat</button>
           </div>
         </div>
       </div>
@@ -4360,6 +4640,46 @@ def render_rainbow_html(
         <button id="btn-nd-submit" class="active-btn" style="padding:5px 14px;font-size:0.72rem;font-family:var(--font-display);font-weight:700;">
           Load Neutron Data &amp; Reduce to merged.h5
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Dialog: Select Any Dataset From Galaxy History -->
+  <div id="modal-galaxy-dataset" style="display:none;position:fixed;inset:0;z-index:9000;background:rgba(4,6,14,0.82);backdrop-filter:blur(4px);align-items:center;justify-content:center;">
+    <div style="width:min(680px,95vw);max-height:90vh;overflow-y:auto;background:var(--bg-panel);border:1px solid var(--accent-cyan);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,0.75);padding:12px 15px;color:var(--text-main);font-size:0.76rem;">
+      <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-color);padding-bottom:7px;margin-bottom:8px;">
+        <div>
+          <strong style="font-family:var(--font-display);font-size:0.86rem;color:var(--accent-cyan);">SELECT DATASET FROM GALAXY</strong>
+          <div style="font-size:0.65rem;color:var(--text-dim);margin-top:2px;">
+            Ordered by most recently touched first. SubHKL <code>.h5</code> and raw NeXus <code>.nxs.h5</code> datasets are active; <code>.mtz</code> reference spots unlock when detector geometry is loaded; other files are grayed out.
+          </div>
+        </div>
+        <button id="btn-gx-ds-close" style="padding:2px 8px;font-size:0.72rem;">X</button>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+        <input id="gx-ds-filter" type="text" placeholder="Filter by #hid, filename, extension, or state..." style="flex:1;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:5px 8px;font-family:var(--font-display);font-size:0.72rem;" />
+        <button id="btn-gx-ds-refresh" type="button" style="padding:4px 10px;font-size:0.68rem;font-family:var(--font-display);">Refresh</button>
+      </div>
+
+      <div id="gx-ds-loading" style="display:none;margin-bottom:8px;padding:7px 10px;border-radius:5px;background:rgba(56,189,248,0.14);border:1px solid var(--accent-cyan);color:var(--accent-cyan);font-family:var(--font-display);font-size:0.7rem;font-weight:700;">
+        Downloading dataset from Galaxy… Please wait.
+      </div>
+
+      <div id="gx-ds-list" style="height:280px;overflow-y:auto;border:1px solid var(--border-color);border-radius:6px;background:#070913;display:flex;flex-direction:column;gap:2px;padding:4px;margin-bottom:8px;">
+        <div style="padding:10px;color:var(--text-dim);font-size:0.68rem;">No Galaxy datasets loaded yet.</div>
+      </div>
+
+      <div id="gx-ds-error" style="display:none;margin-bottom:8px;padding:6px 10px;border-radius:5px;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.5);color:#f87171;font-family:var(--font-display);font-size:0.68rem;"></div>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+        <span id="gx-ds-count" style="font-family:var(--font-display);font-size:0.64rem;color:var(--text-dim);">0 datasets</span>
+        <div style="display:flex;gap:8px;">
+          <button id="btn-gx-ds-cancel" type="button" style="padding:5px 12px;font-size:0.72rem;">Cancel</button>
+          <button id="btn-gx-ds-submit" type="button" class="active-btn" style="padding:5px 14px;font-size:0.72rem;font-family:var(--font-display);font-weight:700;">
+            Open Selected Dataset
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -4384,14 +4704,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function pipelineIdxForArtifactKind(artKind) {{
     const k = String(artKind || "solve").toLowerCase();
-    if (k === "raw_nexus") return 0; // Pending step: 1. Reduce & Merge
+    if (k === "empty" || k === "raw_nexus") return 0; // Pending step: 1. Reduce & Merge
     if (k === "merged") return 1;    // Pending step: 2. Solve
     if (k === "integrator") return 3; // Completed 1..3, Pending step: 4. Merge
     if (k === "merged_careless") return 4; // Completed 1..4
     return 2; // solve / predictor / finder -> Completed 1..2, Pending step: 3. Integrate
   }}
 
-  const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" || Boolean(DATA.merge_metrics);
+  const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" &&
+    Array.isArray(PEAKS) &&
+    PEAKS.some(p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual));
   const state = {{
     projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
@@ -4614,14 +4936,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const cleanLn = (lines[i] || "").replace(/\\s+$/, "");
       if (cleanLn.includes("[subhkl-live-state]")) continue;
       const mCur = tqdmRe.exec(cleanLn);
-      if (mCur && collapsed.length > 0) {{
-        const mPrev = tqdmRe.exec(collapsed[collapsed.length - 1]);
-        if (mPrev && mPrev[1].trim() === mCur[1].trim()) {{
-          collapsed[collapsed.length - 1] = cleanLn;
-          continue;
+      if (mCur) {{
+        while (collapsed.length > 0 && collapsed[collapsed.length - 1] === "") {{
+          collapsed.pop();
+        }}
+        if (collapsed.length > 0) {{
+          const mPrev = tqdmRe.exec(collapsed[collapsed.length - 1]);
+          if (mPrev && mPrev[1].trim() === mCur[1].trim()) {{
+            collapsed[collapsed.length - 1] = cleanLn;
+            continue;
+          }}
         }}
       }}
       collapsed.push(cleanLn);
+    }}
+    while (collapsed.length >= 2 && collapsed[collapsed.length - 1] === "" && tqdmRe.test(collapsed[collapsed.length - 2])) {{
+      collapsed.pop();
     }}
     return collapsed.join("\\n");
   }}
@@ -4742,6 +5072,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{alpha}})`;
   }}
 
+  function hasCarelessResiduals() {{
+    const checkArr = arr => Array.isArray(arr) && arr.some(
+      p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)
+    );
+    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+  }}
+
+  function hasCarelessScales() {{
+    const checkArr = arr => Array.isArray(arr) && arr.some(
+      p => p && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)
+    );
+    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+  }}
+
+  function hasMergedCarelessData() {{
+    return hasCarelessResiduals() || hasCarelessScales();
+  }}
+
   function peakStrokeColor(p, alpha = 0.95) {{
     const mode = state.wulffColorMode || "wavelength";
     if (mode === "orbit") {{
@@ -4751,22 +5099,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const hex = ORBIT_PALETTE[idx];
       return alpha >= 0.9 ? hex : `${{hex}}99`;
     }}
-    if (mode === "residual" && typeof p.careless_residual === "number") {{
+    if (mode === "residual") {{
       return residualToColor(p.careless_residual, alpha);
     }}
-    if (mode === "scale" && typeof p.careless_scale === "number") {{
+    if (mode === "scale") {{
       return scaleToColor(p.careless_scale, alpha);
     }}
     return wavelengthToColor(p.wavelength, alpha);
-  }}
-
-  function hasMergedCarelessData() {{
-    if (DATA && DATA.artifact_kind === "merged_careless") return true;
-    if (DATA && DATA.merge_metrics && Number(DATA.merge_metrics.n_merged_asu) > 0) return true;
-    const checkArr = arr => Array.isArray(arr) && arr.some(
-      p => p && (typeof p.careless_residual === "number" || typeof p.careless_scale === "number")
-    );
-    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
   }}
 
   function syncWulffUI() {{
@@ -4776,8 +5115,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const btnExpand = document.getElementById("btn-wulff-expand");
     const selColor = document.getElementById("sel-wulff-color");
     const titleEl = document.getElementById("stereo-title");
-    const hasMerge = hasMergedCarelessData();
-    if (!hasMerge && (state.wulffColorMode === "residual" || state.wulffColorMode === "scale")) {{
+    const hasRes = hasCarelessResiduals();
+    const hasScl = hasCarelessScales();
+    if ((state.wulffColorMode === "residual" && !hasRes) || (state.wulffColorMode === "scale" && !hasScl)) {{
       state.wulffColorMode = "wavelength";
     }}
     if (stereoEl) {{
@@ -4800,9 +5140,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (selColor) {{
       Array.from(selColor.options).forEach(opt => {{
-        if (opt.value === "residual" || opt.value === "scale") {{
-          opt.disabled = !hasMerge;
-          opt.style.color = hasMerge ? "" : "#64748b";
+        if (opt.value === "residual") {{
+          opt.disabled = !hasRes;
+          opt.style.color = hasRes ? "" : "#64748b";
+        }} else if (opt.value === "scale") {{
+          opt.disabled = !hasScl;
+          opt.style.color = hasScl ? "" : "#64748b";
         }}
       }});
       selColor.value = state.wulffColorMode || "wavelength";
@@ -4817,8 +5160,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function updateMergeScoreboard() {{
     const bar = document.getElementById("wulff-merge-bar");
     const m = DATA.merge_metrics;
+    const hasMerge = hasMergedCarelessData();
     if (!bar) return;
-    if (!m || !m.n_merged_asu) {{
+    if (!hasMerge || !m || !m.n_merged_asu) {{
       bar.style.display = "none";
       return;
     }}
@@ -6837,8 +7181,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }} else {{
       state.currentPipelineIdx = pipelineIdxForArtifactKind(artKind);
       state.currentRungIdx = artKind === "merged" ? 0 : Math.max(0, LADDER.length - 1);
+      // Invalidate any subsequent pipeline stages when data for an earlier step is loaded or processed
+      const completedSteps = state.currentPipelineIdx; // 0..4
+      galaxyBridge.maxValidCompletedSteps = completedSteps;
+      const stageKeysOrder = ["reduce", "solve", "integrate", "merge"];
+      if (galaxyBridge.stepArtifacts && typeof galaxyBridge.stepArtifacts === "object") {{
+        stageKeysOrder.forEach((sKey, sIdx) => {{
+          if (sIdx >= completedSteps) {{
+            delete galaxyBridge.stepArtifacts[sKey];
+          }}
+        }});
+      }}
     }}
-    if (!isFrameSwitch && (artKind === "merged_careless" || Boolean(DATA.merge_metrics))) {{
+    const hasActualMerge = hasMergedCarelessData();
+    if (!hasActualMerge) {{
+      DATA.merge_metrics = null;
+      if (state.wulffColorMode === "residual" || state.wulffColorMode === "scale") {{
+        state.wulffColorMode = "wavelength";
+      }}
+    }} else if (!isFrameSwitch && artKind === "merged_careless" && hasCarelessResiduals()) {{
       state.showStereo = true;
       state.wulffExpanded = true;
       state.wulffScope = "all_runs";
@@ -6854,7 +7215,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (isFrameSwitch) {{
       return;
     }}
-    if (artKind === "merged_careless" && DATA.merge_metrics) {{
+    if (newPayload.mtz_overlay_name) {{
+      setStatusLine(
+        `[MTZ REFERENCE SPOTS]`,
+        `Overlaid <strong>${{Number(newPayload.mtz_overlay_reflections || 0).toLocaleString()}}</strong> ASU reflections from <strong>${{newPayload.mtz_overlay_name}}</strong> (<strong>${{Number(newPayload.mtz_overlay_matched || 0).toLocaleString()}}</strong> spots matched on active detector geometry).`
+      );
+      return;
+    }}
+    if (artKind === "merged_careless" && hasActualMerge && DATA.merge_metrics) {{
       const m = DATA.merge_metrics;
       const cc = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
       const isig = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
@@ -7572,22 +7940,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const pIdx = Math.min(3, Math.max(0, state.currentPipelineIdx));
     const stageId = (PIPELINE[pIdx] && PIPELINE[pIdx].stage_id) || stageKeys[pIdx] || "solve";
     const stageTitle = stageTitles[pIdx] || (PIPELINE[pIdx] && PIPELINE[pIdx].name) || stageId.toUpperCase();
+    const maxValidCompleted = typeof galaxyBridge.maxValidCompletedSteps === "number"
+      ? galaxyBridge.maxValidCompletedSteps
+      : pipelineIdxForArtifactKind(DATA.artifact_kind);
+    const isStageInvalidated = pIdx >= maxValidCompleted;
 
     const byName = new Map();
-    const srvList = (galaxyBridge.stepArtifacts && galaxyBridge.stepArtifacts[stageId]) || [];
-    srvList.forEach(it => {{
-      if (it && it.name) byName.set(it.name, {{ ...it }});
-    }});
-    (galaxyBridge.datasets || []).forEach(ds => {{
-      if (ds.state && ds.state !== "ok") return;
-      const bname = String(ds.name || "").split("/").pop();
-      if (!bname) return;
-      if (classifyArtifactStageClient(bname) !== stageId) return;
-      const cur = byName.get(bname) || {{ name: bname, stage_id: stageId }};
-      if (ds.id) cur.dataset_id = ds.id;
-      if (ds.hid) cur.hid = ds.hid;
-      byName.set(bname, cur);
-    }});
+    if (!isStageInvalidated) {{
+      const srvList = (galaxyBridge.stepArtifacts && galaxyBridge.stepArtifacts[stageId]) || [];
+      srvList.forEach(it => {{
+        if (it && it.name) byName.set(it.name, {{ ...it }});
+      }});
+      (galaxyBridge.datasets || []).forEach(ds => {{
+        if (ds.state && ds.state !== "ok") return;
+        const bname = String(ds.name || "").split("/").pop();
+        if (!bname) return;
+        if (classifyArtifactStageClient(bname) !== stageId) return;
+        const cur = byName.get(bname) || {{ name: bname, stage_id: stageId }};
+        if (ds.id && !cur.dataset_id) cur.dataset_id = ds.id;
+        if (ds.hid && !cur.hid) cur.hid = ds.hid;
+        byName.set(bname, cur);
+      }});
+    }}
 
     filesDrawer.innerHTML = "";
     const lbl = document.createElement("span");
@@ -7639,16 +8013,92 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const btnLocalH5 = document.getElementById("btn-local-h5");
   const inpLocalH5 = document.getElementById("inp-local-h5");
 
+  const MAX_RECENT_HISTORY_ITEMS = 10;
+  galaxyBridge.touchedTimes = galaxyBridge.touchedTimes || {{}};
+
+  function getDatasetTouchScore(d) {{
+    if (!d) return 0;
+    const clientTouch = Number((galaxyBridge.touchedTimes && galaxyBridge.touchedTimes[d.id]) || 0);
+    const srvTouch = Number(d.touched_at || 0);
+    const utMs = d.update_time ? Date.parse(String(d.update_time).endsWith("Z") ? d.update_time : `${{d.update_time}}Z`) : 0;
+    const utSec = Number.isFinite(utMs) && utMs > 0 ? utMs / 1000.0 : 0;
+    return Math.max(clientTouch, srvTouch, utSec);
+  }}
+
+  function sortDatasetsMostRecentFirst(list) {{
+    return [...(list || [])].sort((a, b) => {{
+      const ta = getDatasetTouchScore(a);
+      const tb = getDatasetTouchScore(b);
+      if (Math.abs(tb - ta) > 1e-3) return tb - ta;
+      return (Number(b && b.hid) || 0) - (Number(a && a.hid) || 0);
+    }});
+  }}
+
+  function markDatasetTouchedClient(dsId) {{
+    if (!dsId) return;
+    galaxyBridge.touchedTimes = galaxyBridge.touchedTimes || {{}};
+    galaxyBridge.touchedTimes[dsId] = Date.now() / 1000.0;
+    populateGalaxyH5Selector();
+  }}
+
+  function inferDatasetExtensionClient(d) {{
+    const rawName = String((d && d.name) || "").replace(/\\s*\\([^)]*\\)\\s*$/, "").trim();
+    const base = rawName.split("/").pop().toLowerCase();
+    if (/^dataset_[0-9a-f-]+\\.dat$/i.test(base) || base.endsWith(".dat")) return "dat";
+    if (base.endsWith(".nxs.h5") || base.endsWith(".nxs")) return "nxs.h5";
+    if (base.endsWith(".h5") || base.endsWith(".hdf5")) return "h5";
+    if (base.endsWith(".mtz")) return "mtz";
+    if (base.endsWith(".json")) return "json";
+    if (base.endsWith(".html") || base.endsWith(".htm")) return "html";
+    if (base.endsWith(".png")) return "png";
+    if (base.endsWith(".jpg") || base.endsWith(".jpeg")) return "jpg";
+    if (base.endsWith(".svg")) return "svg";
+    if (base.endsWith(".log") || base.endsWith(".txt")) return "txt";
+    return String((d && d.extension) || "data").toLowerCase();
+  }}
+
+  function hasActiveDetectorGeometryForMtz() {{
+    if (!DATA || DATA.artifact_kind === "empty") return false;
+    const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
+    const hasPeaksOrUb =
+      (Array.isArray(PEAKS) && PEAKS.length > 0) ||
+      (Array.isArray(SAMPLE_PEAKS) && SAMPLE_PEAKS.length > 0) ||
+      (Array.isArray(DATA.ub_matrix) && DATA.ub_matrix.length === 3);
+    return hasPanels && hasPeaksOrUb;
+  }}
+
+  function classifyGalaxyDatasetLoadability(d) {{
+    const st = String((d && d.state) || "ok").toLowerCase();
+    const ext = inferDatasetExtensionClient(d);
+    if (st !== "ok") {{
+      return {{ canLoad: false, ext, hint: st }};
+    }}
+    if (ext === "h5" || ext === "hdf5" || ext === "nxs.h5" || ext === "nxs") {{
+      return {{ canLoad: true, ext, hint: "" }};
+    }}
+    if (ext === "mtz") {{
+      if (hasActiveDetectorGeometryForMtz()) {{
+        return {{ canLoad: true, ext: "mtz", hint: "ref spots" }};
+      }}
+      return {{ canLoad: false, ext: "mtz", hint: "needs geometry" }};
+    }}
+    return {{ canLoad: false, ext, hint: "" }};
+  }}
+
   function populateGalaxyH5Selector() {{
     if (!selGalaxyH5) return;
-    const h5s = (galaxyBridge.datasets || []).filter(
-      d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
-    );
+    const prevVal = selGalaxyH5.value;
+    const allSorted = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []);
+    const h5s = allSorted.filter(d => {{
+      const ext = inferDatasetExtensionClient(d);
+      return d.state === "ok" && (ext === "h5" || ext === "hdf5" || ext === "nxs.h5" || ext === "nxs");
+    }});
+    const recentH5s = h5s.slice(0, MAX_RECENT_HISTORY_ITEMS);
     selGalaxyH5.innerHTML = "";
     const optHeader = document.createElement("option");
     optHeader.value = "";
     optHeader.textContent = h5s.length > 0
-      ? `Data Source (${{h5s.length}} in History)...`
+      ? `Data Source (${{recentH5s.length}}${{h5s.length > recentH5s.length ? "/" + h5s.length : ""}} recent)...`
       : "Data Source...";
     selGalaxyH5.appendChild(optHeader);
 
@@ -7659,22 +8109,32 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     optNeutron.textContent = "Neutron data (SNS / HFIR)...";
     grpIngest.appendChild(optNeutron);
 
+    const optFromGalaxy = document.createElement("option");
+    optFromGalaxy.value = "__action_galaxy_dataset__";
+    optFromGalaxy.textContent = "From Galaxy...";
+    grpIngest.appendChild(optFromGalaxy);
+
     const optLocal = document.createElement("option");
     optLocal.value = "__action_local_file__";
     optLocal.textContent = "From local computer...";
     grpIngest.appendChild(optLocal);
     selGalaxyH5.appendChild(grpIngest);
 
-    if (h5s.length > 0) {{
+    if (recentH5s.length > 0) {{
       const grpHist = document.createElement("optgroup");
-      grpHist.label = "Galaxy History (.h5)";
-      h5s.forEach(d => {{
+      grpHist.label = h5s.length > MAX_RECENT_HISTORY_ITEMS
+        ? `Galaxy History (Recent ${{recentH5s.length}} of ${{h5s.length}})`
+        : `Galaxy History (Recent ${{recentH5s.length}})`;
+      recentH5s.forEach(d => {{
         const opt = document.createElement("option");
         opt.value = d.id;
         opt.textContent = `#${{d.hid || ""}} ${{d.name}}`;
         grpHist.appendChild(opt);
       }});
       selGalaxyH5.appendChild(grpHist);
+    }}
+    if (prevVal && !prevVal.startsWith("__action_") && recentH5s.some(d => d.id === prevVal)) {{
+      selGalaxyH5.value = prevVal;
     }}
     if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
@@ -7988,7 +8448,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (filtered.length === 0) {{
       const empty = document.createElement("div");
       empty.style.cssText = "padding:8px;color:var(--text-dim);font-size:0.64rem;";
-      empty.textContent = ndOncatCatalog.loading ? "Loading runs & titles from ONCat…" : "No matching runs in this IPTS";
+      empty.textContent = ndOncatCatalog.loading
+        ? "Loading runs & titles from ONCat…"
+        : (!curIpts ? "Select an IPTS project on the left to list runs" : "No matching runs in this IPTS");
       listEl.appendChild(empty);
       return;
     }}
@@ -8527,12 +8989,199 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }}
 
-  async function loadFromGalaxyDatasetId(dsId) {{
-    if (!dsId) return;
+  const modalGalaxyDataset = document.getElementById("modal-galaxy-dataset");
+  const btnGxDsClose = document.getElementById("btn-gx-ds-close");
+  const btnGxDsCancel = document.getElementById("btn-gx-ds-cancel");
+  const btnGxDsSubmit = document.getElementById("btn-gx-ds-submit");
+  const btnGxDsRefresh = document.getElementById("btn-gx-ds-refresh");
+  const inpGxDsFilter = document.getElementById("gx-ds-filter");
+  const elGxDsList = document.getElementById("gx-ds-list");
+  const elGxDsError = document.getElementById("gx-ds-error");
+  const elGxDsLoading = document.getElementById("gx-ds-loading");
+  const elGxDsCount = document.getElementById("gx-ds-count");
+  let selectedGalaxyModalDsId = "";
+  let isGalaxyDatasetLoading = false;
+
+  function showGalaxyModalError(msg) {{
+    if (!elGxDsError) return;
+    if (!msg) {{
+      elGxDsError.style.display = "none";
+      elGxDsError.textContent = "";
+    }} else {{
+      elGxDsError.style.display = "block";
+      elGxDsError.textContent = msg;
+    }}
+  }}
+
+  function setGalaxyDatasetLoadingState(loading, labelText = "") {{
+    isGalaxyDatasetLoading = Boolean(loading);
+    if (elGxDsLoading) {{
+      if (isGalaxyDatasetLoading) {{
+        elGxDsLoading.style.display = "block";
+        elGxDsLoading.textContent = `Downloading & opening ${{labelText || "dataset"}} from Galaxy… Please wait.`;
+      }} else {{
+        elGxDsLoading.style.display = "none";
+      }}
+    }}
+    if (elGxDsList) {{
+      elGxDsList.style.pointerEvents = isGalaxyDatasetLoading ? "none" : "auto";
+      elGxDsList.style.opacity = isGalaxyDatasetLoading ? "0.45" : "1";
+    }}
+    if (inpGxDsFilter) inpGxDsFilter.disabled = isGalaxyDatasetLoading;
+    if (btnGxDsRefresh) btnGxDsRefresh.disabled = isGalaxyDatasetLoading;
+    if (btnGxDsCancel) btnGxDsCancel.disabled = isGalaxyDatasetLoading;
+    if (btnGxDsClose) btnGxDsClose.disabled = isGalaxyDatasetLoading;
+    if (btnGxDsSubmit) {{
+      btnGxDsSubmit.disabled = isGalaxyDatasetLoading;
+      btnGxDsSubmit.textContent = isGalaxyDatasetLoading
+        ? "Downloading from Galaxy…"
+        : "Open Selected Dataset";
+    }}
+    if (selGalaxyH5) selGalaxyH5.disabled = isGalaxyDatasetLoading;
+    if (modalGalaxyDataset) {{
+      modalGalaxyDataset.style.cursor = isGalaxyDatasetLoading ? "wait" : "";
+    }}
+    document.body.style.cursor = isGalaxyDatasetLoading ? "wait" : "";
+    if (isGalaxyDatasetLoading && document.activeElement && typeof document.activeElement.blur === "function") {{
+      document.activeElement.blur();
+    }}
+  }}
+
+  function closeGalaxyDatasetModal() {{
+    if (isGalaxyDatasetLoading) return;
+    if (modalGalaxyDataset) modalGalaxyDataset.style.display = "none";
+    showGalaxyModalError("");
+  }}
+
+  function renderGalaxyDatasetModalList() {{
+    if (!elGxDsList) return;
+    const q = String((inpGxDsFilter && inpGxDsFilter.value) || "").trim().toLowerCase();
+    const allSorted = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []);
+    const filtered = allSorted.filter(d => {{
+      if (!q) return true;
+      const extInf = inferDatasetExtensionClient(d);
+      const hay = `#${{d.hid || ""}} ${{d.name || ""}} ${{extInf}} ${{d.state || ""}}`.toLowerCase();
+      return hay.includes(q);
+    }});
+    const loadableFiltered = filtered.filter(d => classifyGalaxyDatasetLoadability(d).canLoad);
+    if (elGxDsCount) {{
+      elGxDsCount.textContent = `${{loadableFiltered.length}} loadable of ${{filtered.length}} dataset${{filtered.length === 1 ? "" : "s"}} (most recently touched first)`;
+    }}
+    elGxDsList.innerHTML = "";
+    if (filtered.length === 0) {{
+      const emptyDiv = document.createElement("div");
+      emptyDiv.style.cssText = "padding:10px;color:var(--text-dim);font-size:0.68rem;";
+      emptyDiv.textContent = allSorted.length === 0
+        ? "No Galaxy history datasets found."
+        : "No datasets match the current filter.";
+      elGxDsList.appendChild(emptyDiv);
+      return;
+    }}
+    if (
+      !selectedGalaxyModalDsId ||
+      !loadableFiltered.some(d => d.id === selectedGalaxyModalDsId)
+    ) {{
+      selectedGalaxyModalDsId = loadableFiltered.length > 0 ? loadableFiltered[0].id : "";
+    }}
+    filtered.forEach(d => {{
+      const row = document.createElement("div");
+      const info = classifyGalaxyDatasetLoadability(d);
+      const canLoad = info.canLoad;
+      const isSel = canLoad && d.id === selectedGalaxyModalDsId;
+      const ext = info.ext;
+      row.style.cssText = `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:4px;cursor:${{canLoad ? "pointer" : "default"}};font-family:var(--font-display);font-size:0.68rem;opacity:${{canLoad ? "1" : "0.42"}};border:1px solid ${{isSel ? "var(--accent-cyan)" : "rgba(255,255,255,0.05)"}};background:${{isSel ? "rgba(56,189,248,0.16)" : "rgba(255,255,255,0.02)"}};`;
+      const leftSpan = document.createElement("span");
+      leftSpan.style.cssText = `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${{canLoad ? "var(--text-main)" : "rgba(148,163,184,0.65)"}};`;
+      leftSpan.textContent = `#${{d.hid || "?"}} ${{d.name || d.id}}`;
+      const rightSpan = document.createElement("span");
+      rightSpan.style.cssText = "display:flex;align-items:center;gap:6px;flex-shrink:0;font-size:0.6rem;";
+      const extBadge = document.createElement("span");
+      extBadge.style.cssText = "padding:1px 5px;border-radius:3px;background:rgba(255,255,255,0.07);color:var(--text-dim);";
+      extBadge.textContent = info.hint && !canLoad && ext === "mtz" ? "mtz (needs geometry)" : ext;
+      rightSpan.appendChild(extBadge);
+      if (canLoad) {{
+        const stBadge = document.createElement("span");
+        const badgeColor = ext === "mtz" ? "var(--accent-cyan)" : "#34d399";
+        stBadge.style.cssText = `padding:1px 5px;border-radius:3px;border:1px solid ${{badgeColor}};color:${{badgeColor}};`;
+        stBadge.textContent = ext === "mtz" ? "ref spots" : "ok";
+        rightSpan.appendChild(stBadge);
+      }}
+      row.appendChild(leftSpan);
+      row.appendChild(rightSpan);
+      if (canLoad) {{
+        row.addEventListener("click", () => {{
+          if (isGalaxyDatasetLoading) return;
+          selectedGalaxyModalDsId = d.id;
+          showGalaxyModalError("");
+          renderGalaxyDatasetModalList();
+        }});
+        row.addEventListener("dblclick", () => {{
+          if (isGalaxyDatasetLoading) return;
+          selectedGalaxyModalDsId = d.id;
+          loadFromGalaxyDatasetId(d.id, {{ fromModal: true }});
+        }});
+      }}
+      elGxDsList.appendChild(row);
+    }});
+  }}
+
+  async function openGalaxyDatasetModal() {{
+    if (!modalGalaxyDataset || isGalaxyDatasetLoading) return;
+    showGalaxyModalError("");
+    modalGalaxyDataset.style.display = "flex";
+    renderGalaxyDatasetModalList();
+    if (inpGxDsFilter) inpGxDsFilter.focus();
+    await probeGalaxyConnection();
+    renderGalaxyDatasetModalList();
+  }}
+
+  if (btnGxDsClose) btnGxDsClose.addEventListener("click", closeGalaxyDatasetModal);
+  if (btnGxDsCancel) btnGxDsCancel.addEventListener("click", closeGalaxyDatasetModal);
+  if (inpGxDsFilter) inpGxDsFilter.addEventListener("input", renderGalaxyDatasetModalList);
+  if (btnGxDsRefresh) {{
+    btnGxDsRefresh.addEventListener("click", async () => {{
+      if (isGalaxyDatasetLoading) return;
+      showGalaxyModalError("");
+      await probeGalaxyConnection();
+      renderGalaxyDatasetModalList();
+    }});
+  }}
+  if (btnGxDsSubmit) {{
+    btnGxDsSubmit.addEventListener("click", () => {{
+      if (isGalaxyDatasetLoading) return;
+      if (!selectedGalaxyModalDsId) {{
+        showGalaxyModalError("Select an active Galaxy dataset first.");
+        return;
+      }}
+      loadFromGalaxyDatasetId(selectedGalaxyModalDsId, {{ fromModal: true }});
+    }});
+  }}
+
+  async function loadFromGalaxyDatasetId(dsId, opts) {{
+    if (!dsId || isGalaxyDatasetLoading) return;
+    const fromModal = Boolean(opts && opts.fromModal);
     const dsMeta = (galaxyBridge.datasets || []).find(d => d.id === dsId);
     const dsName = (dsMeta && dsMeta.name) ? String(dsMeta.name) : "";
+    const dsHid = (dsMeta && dsMeta.hid) ? `#${{dsMeta.hid}} ` : "";
+    const dsState = (dsMeta && dsMeta.state) ? String(dsMeta.state) : "ok";
+    const dsExt = inferDatasetExtensionClient(dsMeta || {{ name: dsName }});
+    if (dsState !== "ok") {{
+      const stErr = `Cannot ingest Galaxy dataset ${{dsHid}}'${{dsName || dsId}}': dataset state is '${{dsState}}' (must be 'ok').`;
+      if (fromModal) showGalaxyModalError(stErr);
+      setStatusLine("[GALAXY ERROR]", `<span style="color:#f87171;">${{stErr}}</span>`);
+      return;
+    }}
+    if (dsExt === "mtz" && !hasActiveDetectorGeometryForMtz()) {{
+      const mtzErr = `Cannot load MTZ dataset ${{dsHid}}'${{dsName || dsId}}' by itself: load a solved or integrated HDF5 dataset with detector geometry first.`;
+      if (fromModal) showGalaxyModalError(mtzErr);
+      setStatusLine("[GALAXY ERROR]", `<span style="color:#f87171;">${{mtzErr}}</span>`);
+      return;
+    }}
     // If a raw NeXus file in Galaxy History is selected, automatically trigger Step 1 (Reduce + Merge Images)
-    if (/\\.nxs(\\.h5)?$/i.test(dsName)) {{
+    if (dsExt === "nxs.h5" || dsExt === "nxs" || /\\.nxs(\\.h5)?$/i.test(dsName)) {{
+      markDatasetTouchedClient(dsId);
+      setGalaxyDatasetLoadingState(false);
+      if (fromModal) closeGalaxyDatasetModal();
       setStatusLine(
         "[AUTO-REDUCE]",
         `Raw NeXus dataset <strong>${{dsName}}</strong> selected — triggering <strong>Step 1 (Reduce + Merge Images)</strong>...`
@@ -8544,34 +9193,68 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
       return;
     }}
-    setStatusLine("[GALAXY HDF5]", `Loading dataset <strong>${{dsName || dsId}}</strong> from NDIP / Galaxy History...`);
+    setGalaxyDatasetLoadingState(true, `${{dsHid}}${{dsName || dsId}}`);
+    setStatusLine("[GALAXY HDF5]", `Downloading & loading dataset <strong>${{dsHid}}${{dsName || dsId}}</strong> from NDIP / Galaxy History…`);
     try {{
-      // 1. Prefer server-side HDF5 extraction via NOVA/HTTP backend (handles merged.h5, solve.h5, predictor.h5, integrated.h5 with ellipses & multi-frame)
+      // 1. Prefer server-side HDF5/MTZ extraction via NOVA/HTTP backend (handles merged.h5, solve.h5, predictor.h5, integrated.h5, and .mtz reference spot overlays)
+      let serverResponded = false;
       try {{
-        const curFrame = typeof state.selectedFrameIndex === "number"
-          ? state.selectedFrameIndex
-          : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
-        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{curFrame}}`, {{
+        if (dsExt !== "mtz") {{
+          state.selectedFrameIndex = 0;
+          DATA.frame_index = 0;
+        }}
+        const hasGeomFlag = hasActiveDetectorGeometryForMtz() ? "1" : "0";
+        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{state.selectedFrameIndex || 0}}&has_active_geometry=${{hasGeomFlag}}`, {{
           cache: "no-store",
           credentials: "same-origin",
         }});
-        if (rServer.ok) {{
-          const serverPayload = await rServer.json();
-          if (serverPayload && (Array.isArray(serverPayload.peaks) || Array.isArray(serverPayload.panels))) {{
-            recomputeBoundsAndReload(serverPayload);
-            return;
-          }}
+        serverResponded = true;
+        if (!rServer.ok) {{
+          let errMsg = `HTTP ${{rServer.status}} loading dataset ${{dsHid}}${{dsName || dsId}}`;
+          try {{
+            const errDoc = await rServer.json();
+            if (errDoc && errDoc.error) errMsg = String(errDoc.error);
+          }} catch (_je) {{}}
+          throw new Error(errMsg);
         }}
-      }} catch (_srvErr) {{
-        // Fall through to client-side h5wasm fetch
+        const serverPayload = await rServer.json();
+        if (serverPayload && serverPayload.status === "error") {{
+          throw new Error(String(serverPayload.error || "Dataset cannot be ingested."));
+        }}
+        if (serverPayload && serverPayload.status === "raw_nexus") {{
+          markDatasetTouchedClient(dsId);
+          setGalaxyDatasetLoadingState(false);
+          if (fromModal) closeGalaxyDatasetModal();
+          setStatusLine(
+            "[AUTO-REDUCE]",
+            `Raw NeXus dataset <strong>${{serverPayload.name || dsName || dsId}}</strong> selected — triggering <strong>Step 1 (Reduce + Merge Images)</strong>...`
+          );
+          selectPipelineStage(0, true);
+          await executeWorkflowStage(0, {{
+            ingest_mode: "galaxy_dataset",
+            galaxy_dataset_id: dsId,
+          }});
+          return;
+        }}
+        if (serverPayload && (Array.isArray(serverPayload.peaks) || Array.isArray(serverPayload.panels))) {{
+          markDatasetTouchedClient(dsId);
+          setGalaxyDatasetLoadingState(false);
+          if (fromModal) closeGalaxyDatasetModal();
+          recomputeBoundsAndReload(serverPayload);
+          return;
+        }}
+      }} catch (srvErr) {{
+        if (serverResponded) throw srvErr;
+        // Fall through to client-side h5wasm fetch only when NOVA server endpoint is unreachable
       }}
 
       // 2. Fallback: fetch raw HDF5 via /api/datasets/<id>/display and parse in browser via h5wasm
       while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));
-      const h5s = (galaxyBridge.datasets || []).filter(
-        d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
-      );
-      const mergedDs = [...h5s].reverse().find(
+      const h5s = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []).filter(d => {{
+        const ext = inferDatasetExtensionClient(d);
+        return d.state === "ok" && (ext === "h5" || ext === "hdf5");
+      }});
+      const mergedDs = h5s.find(
         d => d.id !== dsId && /merged|image|scan|prepare/i.test(d.name || "")
       );
       const r1 = await fetch(`/api/datasets/${{dsId}}/display`, {{ credentials: "same-origin" }});
@@ -8583,9 +9266,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (r2.ok) buf2 = await r2.arrayBuffer();
       }}
       const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
+      markDatasetTouchedClient(dsId);
+      setGalaxyDatasetLoadingState(false);
+      if (fromModal) closeGalaxyDatasetModal();
       recomputeBoundsAndReload(newPayload);
     }} catch (err) {{
-      setStatusLine("[GALAXY HDF5]", `<span style="color:#f87171;">Failed to load HDF5: ${{err.message}}</span>`);
+      setGalaxyDatasetLoadingState(false);
+      if (fromModal) showGalaxyModalError(err.message);
+      setStatusLine("[GALAXY ERROR]", `<span style="color:#f87171;">${{err.message}}</span>`);
+    }} finally {{
+      setGalaxyDatasetLoadingState(false);
     }}
   }}
 
@@ -8596,6 +9286,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (val === "__action_neutron_data__") {{
         selGalaxyH5.value = "";
         openNeutronDataModal(null);
+        return;
+      }}
+      if (val === "__action_galaxy_dataset__") {{
+        selGalaxyH5.value = "";
+        openGalaxyDatasetModal();
         return;
       }}
       if (val === "__action_local_file__") {{

@@ -178,18 +178,8 @@ class SubhklGalaxyModel:
             if instrument in InstrumentOptions.__members__
             else InstrumentOptions.CG4D
         )
-        default_peaks = "/home/xvg/subhkl-examples/betalac-7/solve.h5"
-        default_images = "/home/xvg/subhkl-examples/betalac-7/merged.h5"
-        resolved_peaks = (
-            str(peaks_h5)
-            if peaks_h5
-            else (default_peaks if os.path.isfile(default_peaks) else "")
-        )
-        resolved_images = (
-            str(images_h5)
-            if images_h5
-            else (default_images if os.path.isfile(default_images) else "")
-        )
+        resolved_peaks = str(peaks_h5) if peaks_h5 else ""
+        resolved_images = str(images_h5) if images_h5 else ""
         self.data = SubhklConfig(
             instrument=inst,
             peaks_file=resolved_peaks,
@@ -204,20 +194,26 @@ class SubhklGalaxyModel:
         """Rebuild the Diffraction Parallax & Lattice Ladder payload from current HDF5 files."""
         if frame_index is not None:
             self.frame_index = int(frame_index)
-        if not self.data.peaks_file or not os.path.isfile(self.data.peaks_file):
-            return self.payload
+        has_peaks = bool(self.data.peaks_file and os.path.isfile(self.data.peaks_file))
+        from subhkl.viz.rainbow_zones import _discover_images_h5
 
-        img_path = None
-        if self.data.images_file and os.path.isfile(self.data.images_file):
-            img_dir = os.path.dirname(os.path.abspath(self.data.images_file))
-            pk_dir = os.path.dirname(os.path.abspath(self.data.peaks_file))
-            tmp_root = os.path.abspath(tempfile.gettempdir())
-            if img_dir == pk_dir or (
-                img_dir.startswith(tmp_root) and pk_dir.startswith(tmp_root)
-            ):
+        img_path = _discover_images_h5(self.data.peaks_file) if has_peaks else None
+        if (
+            not img_path
+            and self.data.images_file
+            and os.path.isfile(self.data.images_file)
+        ):
+            if not has_peaks:
                 img_path = self.data.images_file
+            else:
+                img_dir = os.path.dirname(os.path.abspath(self.data.images_file))
+                pk_dir = os.path.dirname(os.path.abspath(self.data.peaks_file))
+                if img_dir == pk_dir or os.path.abspath(
+                    self.data.images_file
+                ) == os.path.abspath(self.data.peaks_file):
+                    img_path = self.data.images_file
         self.payload = build_rainbow_zone_payload(
-            replay_h5=self.data.peaks_file,
+            replay_h5=(self.data.peaks_file if has_peaks else None),
             instrument=self.data.instrument.value,
             space_group=self.data.space_group,
             cell=[
