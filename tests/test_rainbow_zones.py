@@ -1213,6 +1213,15 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         "Batching Images: 100%|██████████| 600/600 [00:02<00:00, 280it/s]",
         "Done.",
     ]
+    # Also verify collapsing when Galaxy console_output converts \r to \n (universal newlines)
+    formatted_tqdm_univ = NovaGalaxyPipelineRunner._format_terminal_stream(
+        raw_tqdm.replace("\r", "\n")
+    )
+    assert formatted_tqdm_univ.splitlines() == [
+        "Starting integration...",
+        "Batching Images: 100%|██████████| 600/600 [00:02<00:00, 280it/s]",
+        "Done.",
+    ]
     assert "formatTerminalStdio" in html
     assert "hasMergedCarelessData()" in html
     assert "opt.disabled = !hasMerge" in html

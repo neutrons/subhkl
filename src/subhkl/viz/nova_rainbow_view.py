@@ -479,12 +479,22 @@ class NovaGalaxyPipelineRunner:
             if clean_ln.lstrip().startswith("[subhkl-live-state]"):
                 continue
             m_cur = tqdm_re.match(clean_ln)
-            if m_cur and collapsed:
-                m_prev = tqdm_re.match(collapsed[-1])
-                if m_prev and m_prev.group("pfx").strip() == m_cur.group("pfx").strip():
-                    collapsed[-1] = clean_ln
-                    continue
+            if m_cur:
+                while collapsed and collapsed[-1] == "":
+                    collapsed.pop()
+                if collapsed:
+                    m_prev = tqdm_re.match(collapsed[-1])
+                    if (
+                        m_prev
+                        and m_prev.group("pfx").strip() == m_cur.group("pfx").strip()
+                    ):
+                        collapsed[-1] = clean_ln
+                        continue
             collapsed.append(clean_ln)
+        while (
+            len(collapsed) >= 2 and collapsed[-1] == "" and tqdm_re.match(collapsed[-2])
+        ):
+            collapsed.pop()
         return "\n".join(collapsed)
 
     @staticmethod
@@ -3602,8 +3612,9 @@ class NovaGalaxyPipelineRunner:
                 os.chmod(post_script, 0o666)
             chained_merge = (
                 f"set -e; "
+                f'export PYTHONPATH="/opt/venv/lib/python3.13/site-packages:${{PYTHONPATH:-}}"; '
                 f"MKEYS=$(python {shlex.quote(prep_script)}) && "
-                f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
+                f'python /opt/venv/bin/careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
                 f"python {shlex.quote(post_script)}"
             )
             inner_cmd = ["bash", "-c", chained_merge]

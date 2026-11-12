@@ -4614,14 +4614,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const cleanLn = (lines[i] || "").replace(/\\s+$/, "");
       if (cleanLn.includes("[subhkl-live-state]")) continue;
       const mCur = tqdmRe.exec(cleanLn);
-      if (mCur && collapsed.length > 0) {{
-        const mPrev = tqdmRe.exec(collapsed[collapsed.length - 1]);
-        if (mPrev && mPrev[1].trim() === mCur[1].trim()) {{
-          collapsed[collapsed.length - 1] = cleanLn;
-          continue;
+      if (mCur) {{
+        while (collapsed.length > 0 && collapsed[collapsed.length - 1] === "") {{
+          collapsed.pop();
+        }}
+        if (collapsed.length > 0) {{
+          const mPrev = tqdmRe.exec(collapsed[collapsed.length - 1]);
+          if (mPrev && mPrev[1].trim() === mCur[1].trim()) {{
+            collapsed[collapsed.length - 1] = cleanLn;
+            continue;
+          }}
         }}
       }}
       collapsed.push(cleanLn);
+    }}
+    while (collapsed.length >= 2 && collapsed[collapsed.length - 1] === "" && tqdmRe.test(collapsed[collapsed.length - 2])) {{
+      collapsed.pop();
     }}
     return collapsed.join("\\n");
   }}
