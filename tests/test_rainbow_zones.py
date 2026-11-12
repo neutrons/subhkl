@@ -1379,7 +1379,22 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         include_peaks=True,
     )
     assert len(p_mat["zones"]) > 0
-    from subhkl import get_version
+    from subhkl import (
+        format_version_badge,
+        get_container_image,
+        get_container_tag,
+        get_version,
+    )
 
     assert p_mat["subhkl_version"] == get_version()
-    assert f'id="app-version">v{get_version().lstrip("v")}</span>' in html
+    assert f'id="app-version">{format_version_badge(get_version())}</span>' in html
+    assert format_version_badge("1.5.0") == "v1.5.0"
+    assert format_version_badge("v1.5.0") == "v1.5.0"
+    assert (
+        format_version_badge("feat/ui-logo-and-favicon") == "feat/ui-logo-and-favicon"
+    )
+    assert get_container_tag("feat/ui-logo-and-favicon") == "feat-ui-logo-and-favicon"
+    assert get_container_tag("v1.5.0") == "1.5.0"
+    assert p_mat["pipeline_stages"][0]["container"] == get_container_image()
+    assert p_mat["pipeline_stages"][1]["container"] == get_container_image()
+    assert p_mat["pipeline_stages"][2]["container"] == get_container_image()

@@ -35,7 +35,13 @@ import h5py
 import numpy as np
 from PIL import Image
 
-from subhkl import get_version as get_subhkl_version
+from subhkl import (
+    format_version_badge,
+    get_container_image,
+)
+from subhkl import (
+    get_version as get_subhkl_version,
+)
 from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_LOGO_SVG
 from subhkl.viz.zones import (
     _cell_from_B,
@@ -2023,7 +2029,7 @@ def _build_ndip_pipeline_stages(
                 if is_finderless
                 else ["imaginex_subhkl_prepare_peaks", "imaginex_subhkl_peak_fit"]
             ),
-            "container": "ghcr.io/neutrons/subhkl:1.5.0",
+            "container": get_container_image(),
             "artifact": (
                 f"merged.h5 ({solve_diagnostics['stable_observations']:,} count bins)"
                 if is_finderless
@@ -2047,7 +2053,7 @@ def _build_ndip_pipeline_stages(
             "step_num": 2,
             "name": "2. SOLVE (LATTICE LADDER)",
             "tool_ids": ["imaginex_subhkl_solve", "imaginex_subhkl"],
-            "container": "ghcr.io/neutrons/subhkl:1.5.0",
+            "container": get_container_image(),
             "artifact": f"solve.h5 ({n_indexed}/{n_peaks} spots • {n_zones_ord1} ord-1 zones)",
             "status": _stage_status(1),
             "ladder_rung_idx": 4,
@@ -2064,7 +2070,7 @@ def _build_ndip_pipeline_stages(
                 "imaginex_subhkl_predict",
                 "imaginex_subhkl_integrate",
             ],
-            "container": "ghcr.io/neutrons/subhkl:1.5.0",
+            "container": get_container_image(),
             "artifact": "predictor.h5 → integrated.h5",
             "status": _stage_status(2),
             "ladder_rung_idx": 4,
@@ -3199,7 +3205,9 @@ def render_rainbow_html(
 ) -> str:
     """Render a unified, self-contained HTML5/Canvas/JS diffraction parallax widget."""
     payload_json = json.dumps(payload, separators=(",", ":"))
-    subhkl_ver = str(payload.get("subhkl_version") or get_subhkl_version()).lstrip("v")
+    subhkl_ver_badge = format_version_badge(
+        str(payload.get("subhkl_version") or get_subhkl_version())
+    )
     inst = payload.get("instrument", "IMAGINE")
     sg = payload.get("space_group", "P 1")
     initial_proj = (
@@ -3863,7 +3871,7 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title">{SUBHKL_LOGO_SVG}<span class="sr-only"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></span><span class="logo-version" id="app-version">v{subhkl_ver}</span></div>
+      <div class="rainbow-logo" id="app-title">{SUBHKL_LOGO_SVG}<span class="sr-only"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></span><span class="logo-version" id="app-version">{subhkl_ver_badge}</span></div>
       <span class="subtitle-tag">{inst} · {sg}</span>
     </div>
 
@@ -6457,7 +6465,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const subEl = document.querySelector(".subtitle-tag");
     const verEl = document.getElementById("app-version");
     if (verEl && newPayload.subhkl_version) {{
-      verEl.textContent = "v" + String(newPayload.subhkl_version).replace(/^v/i, "");
+      const rawVer = String(newPayload.subhkl_version).trim();
+      verEl.textContent = /^[vV]?[0-9]+[.][0-9]+/.test(rawVer)
+        ? ("v" + rawVer.replace(/^[vV]/, ""))
+        : rawVer;
     }}
     const artKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
     const shapeMode = newPayload.peak_shape_mode || DATA.peak_shape_mode || "solved_circle";

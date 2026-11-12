@@ -29,6 +29,7 @@ import urllib.request
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
+from subhkl import get_container_image
 from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
 from subhkl.viz.rainbow_zones import (
     build_rainbow_zone_payload,
@@ -3628,7 +3629,7 @@ class NovaGalaxyPipelineRunner:
         container_image = (
             "ghcr.io/jglaser/careless:cuda"
             if stage_id == "merge"
-            else "ghcr.io/neutrons/subhkl:1.5.0"
+            else get_container_image()
         )
         if shutil.which("podman"):
             raw_dirs = {os.path.dirname(os.path.abspath(p)) for p in raw_nxs_local}
