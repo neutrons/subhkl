@@ -1585,7 +1585,12 @@ class NovaGalaxyPipelineRunner:
         import re as _re
 
         fname = os.path.basename(local_path)
-        local_size = os.path.getsize(local_path) if os.path.isfile(local_path) else 0
+        if not os.path.isfile(local_path):
+            raise RuntimeError(
+                f"Required input file '{fname}' was not found at {local_path}; "
+                "run the previous pipeline stage first or select it from History."
+            )
+        local_size = os.path.getsize(local_path)
         gi = store.nova_connection.galaxy_instance
         known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
         if not force_upload:
@@ -1595,7 +1600,9 @@ class NovaGalaxyPipelineRunner:
             ]
             parent_d = os.path.dirname(os.path.abspath(local_path))
             parent_bn = os.path.basename(parent_d)
-            if parent_bn.startswith("subhkl_work_"):
+            if parent_bn.startswith("subhkl_work_") and (
+                fname == "merged.h5" or fname.lower().endswith("_merged.h5")
+            ):
                 tag_part = parent_bn[len("subhkl_work_") :]
                 cand_paths.append(os.path.join(parent_d, f"{tag_part}_merged.h5"))
                 cand_paths.append(os.path.join(parent_d, "merged.h5"))
@@ -1619,7 +1626,12 @@ class NovaGalaxyPipelineRunner:
                 if known_id:
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         k_info = gi.datasets.show_dataset(known_id)
-                        if k_info.get("state") == "ok" and not k_info.get("deleted"):
+                        k_name = str(k_info.get("name") or "")
+                        if (
+                            k_info.get("state") == "ok"
+                            and not k_info.get("deleted")
+                            and "/" not in k_name
+                        ):
                             known_map[os.path.abspath(local_path)] = known_id
                             self._dataset_id_by_path = known_map
                             job_record["stdout"] += (
@@ -1675,6 +1687,12 @@ class NovaGalaxyPipelineRunner:
                         if isinstance(raw_info, dict):
                             info = raw_info
                     if info.get("deleted") is True or ds.get("deleted") is True:
+                        continue
+                    ds_actual_name = str(info.get("name") or ds.get("name") or "")
+                    if "/" in ds_actual_name or not (
+                        ds_actual_name == sname
+                        or ds_actual_name.startswith(f"{sname} (")
+                    ):
                         continue
                     st = (
                         info.get("state")
@@ -1818,18 +1836,34 @@ class NovaGalaxyPipelineRunner:
                 disc_m = _discover_images_h5(params.get("peaks_file"))
                 if disc_m:
                     merged_path = disc_m
-            if not merged_path:
-                merged_path = "/home/xvg/subhkl-examples/betalac-7/merged.h5"
-            work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
+            if not merged_path and stage_id != "reduce":
+                raise RuntimeError(
+                    "No merged scan HDF5 file is loaded; run Step 1 (Reduce & Merge) "
+                    "or select a merged.h5 dataset from History first."
+                )
+            work_dir, merged_path = (
+                self._resolve_work_dir_and_merged(merged_path)
+                if merged_path
+                else (tempfile.gettempdir(), "")
+            )
             solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
             solve_bn = os.path.basename(solve_path).lower()
+            cand_solve = os.path.join(work_dir, "solve.h5")
             if (
                 not os.path.isfile(solve_path)
                 or solve_bn in ("merged.h5", "integrated.h5", "predictor.h5")
                 or solve_bn.endswith("_merged.h5")
             ):
-                cand_solve = os.path.join(work_dir, "solve.h5")
-                if os.path.isfile(cand_solve):
+                solve_path = cand_solve
+            elif os.path.dirname(os.path.abspath(solve_path)) != os.path.abspath(
+                work_dir
+            ):
+                from subhkl.viz.rainbow_zones import _discover_images_h5
+
+                disc_for_solve = _discover_images_h5(solve_path)
+                if not disc_for_solve or os.path.abspath(
+                    disc_for_solve
+                ) != os.path.abspath(merged_path):
                     solve_path = cand_solve
 
             tool_inputs: dict[str, Any] = {}
@@ -3366,8 +3400,13 @@ class NovaGalaxyPipelineRunner:
             disc_m = _discover_images_h5(params.get("peaks_file"))
             if disc_m:
                 raw_img = disc_m
+        if not raw_img and stage_id != "reduce":
+            raise RuntimeError(
+                "No merged scan HDF5 file is loaded; run Step 1 (Reduce & Merge) "
+                "or select a merged.h5 dataset from History first."
+            )
         merged_path = os.path.abspath(
-            raw_img or "/home/xvg/subhkl-examples/betalac-7/merged.h5"
+            raw_img or os.path.join(tempfile.gettempdir(), "merged.h5")
         )
         work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
         solve_dest = os.path.join(work_dir, "solve.h5")
@@ -3378,10 +3417,19 @@ class NovaGalaxyPipelineRunner:
         solve_path = os.path.abspath(params.get("peaks_file") or solve_dest)
         solve_bn = os.path.basename(solve_path).lower()
         if (
-            solve_bn in ("merged.h5", "integrated.h5", "predictor.h5")
+            not os.path.isfile(solve_path)
+            or solve_bn in ("merged.h5", "integrated.h5", "predictor.h5")
             or solve_bn.endswith("_merged.h5")
-        ) and os.path.isfile(solve_dest):
+        ):
             solve_path = solve_dest
+        elif os.path.dirname(os.path.abspath(solve_path)) != os.path.abspath(work_dir):
+            from subhkl.viz.rainbow_zones import _discover_images_h5
+
+            disc_for_solve = _discover_images_h5(solve_path)
+            if not disc_for_solve or os.path.abspath(disc_for_solve) != os.path.abspath(
+                merged_path
+            ):
+                solve_path = solve_dest
 
         ts = int(time.time())
         out_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_{stage_id}_{ts}.h5")

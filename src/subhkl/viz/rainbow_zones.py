@@ -100,7 +100,9 @@ def _decode_str(val: Any, default: str = "") -> str:
     return str(val)
 
 
-def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, Any]:
+def _load_detectors_from_h5(
+    f: h5py.File | None, instrument: str | None
+) -> dict[int, Any]:
     """Load calibrated or nominal detector banks from ``subhkl.config.beamlines`` + HDF5 calibration."""
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
@@ -120,7 +122,7 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
         ):
             detectors[bank_id] = Detector(cfg)
 
-    if "detector_calibration" in f:
+    if f is not None and "detector_calibration" in f:
         cal_grp = f["detector_calibration"]
         for name in cal_grp:
             if not name.startswith("bank_"):
@@ -1979,7 +1981,7 @@ def _build_lattice_ladder_steps(
 def _pending_stage_for_artifact_kind(artifact_kind: str | None) -> str:
     """Return the pending pipeline stage ID given the currently loaded HDF5 artifact kind."""
     kind = (artifact_kind or "solve").lower()
-    if kind == "raw_nexus":
+    if kind in ("raw_nexus", "empty"):
         return "reduce"
     if kind == "merged":
         return "solve"
@@ -2228,6 +2230,11 @@ def build_rainbow_zone_payload(
             images_h5 = extracted["images_h5"]
         elif images_h5 is None:
             images_h5 = _discover_images_h5(replay_h5)
+    elif not detectors:
+        detectors = _load_detectors_from_h5(None, instrument)
+        cell = fallback_cell
+        if peaks_xyz is None and ub_matrix is None and U is None:
+            artifact_kind = "empty"
 
     if peaks_xyz is None:
         peaks_xyz = np.zeros((0, 3), dtype=float)

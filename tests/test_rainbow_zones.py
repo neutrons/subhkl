@@ -1547,7 +1547,7 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
             all_ds = list(datasets_by_id.values())
             if name is None:
                 return all_ds
-            return [d for d in all_ds if d["name"] == name]
+            return [d for d in all_ds if name in d["name"]]
 
     fake_store = SimpleNamespace(
         history_id="hist_1",
@@ -1562,6 +1562,39 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     job_rec = {"stdout": ""}
     linked_id = runner._ensure_galaxy_h5_dataset(fake_store, work_merged, job_rec)
     assert linked_id == mandi_gx_id
+
+    # Verify _ensure_galaxy_h5_dataset for solve.h5 does not link 'betalac-7/solve.h5'
+    # or conflate <tag>_merged.h5 candidate paths with solve.h5
+    work_solve = os.path.join(_work_dir, "solve.h5")
+    with h5py.File(work_solve, "w") as hf:
+        hf.create_dataset("hkl", data=np.zeros((4, 3), dtype=np.float32))
+    solve_size = os.path.getsize(work_solve)
+    datasets_by_id["fc00dcb17c606557"] = {
+        "id": "fc00dcb17c606557",
+        "name": "betalac-7/solve.h5",
+        "state": "ok",
+        "deleted": False,
+        "file_size": solve_size,
+    }
+    datasets_by_id["c0662c36e1a24cf3"] = {
+        "id": "c0662c36e1a24cf3",
+        "name": "solve.h5 (subhkl_solve)",
+        "state": "ok",
+        "deleted": False,
+        "file_size": solve_size,
+    }
+    linked_solve_id = runner._ensure_galaxy_h5_dataset(fake_store, work_solve, job_rec)
+    assert linked_solve_id == "c0662c36e1a24cf3"
+
+    # Verify SubhklGalaxyModel() starts with no preloaded local dataset and pending_stage='reduce'
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+
+    empty_model = SubhklGalaxyModel()
+    assert empty_model.data.peaks_file == ""
+    assert empty_model.data.images_file == ""
+    assert empty_model.payload.get("artifact_kind") == "empty"
+    assert empty_model.payload.get("pending_stage") == "reduce"
+    assert len(empty_model.payload.get("panels") or []) > 0
 
     # Verify _discover_images_h5 locates <tag>_merged.h5 from a solve.h5 that has 'files'
     # even when attrs['source'] points to an existing Pulsar staging dataset_*.dat file
