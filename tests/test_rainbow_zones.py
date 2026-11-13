@@ -1837,7 +1837,13 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
 
     assert _get_instrument_default_wavelength("MANDI") == (2.0, 4.0)
     assert _get_instrument_default_wavelength("TOPAZ") == (0.4, 3.5)
-    assert _get_instrument_default_wavelength("CG4D") == (2.0, 10.0)
+    assert _get_instrument_default_wavelength("CG4D") == (2.8, 4.5)
+    fresh_cg4d = SubhklGalaxyModel()
+    assert fresh_cg4d.data.wavelength_min == 2.8
+    assert fresh_cg4d.data.wavelength_max == 4.5
+    assert fresh_cg4d.data.d_min == 1.4
+    assert fresh_cg4d.payload["wavelength_range"] == [2.8, 4.5]
+    assert fresh_cg4d.payload["d_min"] == 1.4
     assert 'id="inp-lmin"' in html_doc
     assert 'id="inp-lmax"' in html_doc
     assert 'id="slider-dmin"' in html_doc

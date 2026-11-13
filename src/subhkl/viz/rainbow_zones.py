@@ -81,7 +81,7 @@ SPHERICAL_INSTRUMENTS = {"MANDI", "TOPAZ", "SNS_MANDI", "CORELLI"}
 
 _FALLBACK_INSTRUMENT_WAVELENGTHS: dict[str, tuple[float, float]] = {
     "IMAGINE": (2.0, 4.0),
-    "CG4D": (2.0, 10.0),
+    "CG4D": (2.8, 4.5),
     "SNAP": (1.0, 4.0),
     "CORELLI": (0.6, 2.5),
     "TOPAZ": (0.4, 3.5),
@@ -855,29 +855,31 @@ def _extract_from_h5(
         elif "instrument/wavelength" in f:
             wl = np.asarray(f["instrument/wavelength"][()], dtype=float).ravel()
             if len(wl) >= 2:
-                wavelength_range = (float(wl[0]), float(wl[1]))
-                if (
-                    abs(wavelength_range[0] - 2.0) < 1e-3
-                    and abs(wavelength_range[1] - 10.0) < 1e-3
-                ) and sib_solve_path:
-                    with (
-                        contextlib.suppress(
-                            OSError, RuntimeError, ValueError, TypeError, KeyError
-                        ),
-                        h5py.File(sib_solve_path, "r") as sf,
-                    ):
-                        for wk in (
-                            "scan_refinement/band_wavelength",
-                            "instrument/wavelength",
+                if abs(float(wl[0]) - 2.0) < 1e-3 and abs(float(wl[1]) - 10.0) < 1e-3:
+                    if sib_solve_path:
+                        with (
+                            contextlib.suppress(
+                                OSError, RuntimeError, ValueError, TypeError, KeyError
+                            ),
+                            h5py.File(sib_solve_path, "r") as sf,
                         ):
-                            if wk in sf:
-                                swl = np.asarray(sf[wk][()], dtype=float).ravel()
-                                if len(swl) >= 2:
-                                    wavelength_range = (
-                                        float(swl[0]),
-                                        float(swl[1]),
-                                    )
-                                    break
+                            for wk in (
+                                "scan_refinement/band_wavelength",
+                                "instrument/wavelength",
+                            ):
+                                if wk in sf:
+                                    swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                                    if len(swl) >= 2 and not (
+                                        abs(float(swl[0]) - 2.0) < 1e-3
+                                        and abs(float(swl[1]) - 10.0) < 1e-3
+                                    ):
+                                        wavelength_range = (
+                                            float(swl[0]),
+                                            float(swl[1]),
+                                        )
+                                        break
+                else:
+                    wavelength_range = (float(wl[0]), float(wl[1]))
         elif sib_solve_path:
             with (
                 contextlib.suppress(
@@ -2586,7 +2588,7 @@ def build_rainbow_zone_payload(
         if peaks_xyz is None and ub_matrix is None and U is None:
             artifact_kind = "empty"
     if wavelength_range is None:
-        wavelength_range = (1.8, 4.5)
+        wavelength_range = _get_instrument_default_wavelength(instrument)
 
     if peaks_xyz is None:
         peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -4798,7 +4800,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   const INSTRUMENT_WAVELENGTH_DEFAULTS = {{
     IMAGINE: [2.0, 4.0],
-    CG4D: [2.0, 10.0],
+    CG4D: [2.8, 4.5],
     SNAP: [1.0, 4.0],
     CORELLI: [0.6, 2.5],
     TOPAZ: [0.4, 3.5],
@@ -10207,11 +10209,13 @@ def export_static_app_html(
     """Export a truly static HTML5/Canvas web app (not generated per-dataset by an XML tool)
     that connects directly to Galaxy / NOVA REST APIs and parses .h5 datasets client-side via h5wasm.
     """
+    def_wl = _get_instrument_default_wavelength(instrument)
     empty_payload: dict[str, Any] = {
         "instrument": instrument,
         "space_group": "P 21 21 21",
         "intensity_source": "static_app",
-        "wavelength_range": [1.8, 4.5],
+        "wavelength_range": [float(def_wl[0]), float(def_wl[1])],
+        "d_min": round(0.5 * float(def_wl[0]), 2),
         "cell": [68.7, 69.8, 156.9, 90.0, 90.0, 90.0],
         "peaks": [],
         "zones": [],

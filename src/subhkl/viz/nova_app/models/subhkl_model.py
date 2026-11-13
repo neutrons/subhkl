@@ -126,7 +126,7 @@ class SubhklConfig(BaseModel):
         description="Maximum incident wavelength (Å)",
     )
     d_min: float = Field(
-        default=2.8,
+        default=1.4,
         gt=0.3,
         le=20.0,
         title="d_min (Å)",
@@ -178,10 +178,16 @@ class SubhklGalaxyModel:
             if instrument in InstrumentOptions.__members__
             else InstrumentOptions.CG4D
         )
+        from subhkl.viz.rainbow_zones import _get_instrument_default_wavelength
+
+        def_wl = _get_instrument_default_wavelength(inst.value)
         resolved_peaks = str(peaks_h5) if peaks_h5 else ""
         resolved_images = str(images_h5) if images_h5 else ""
         self.data = SubhklConfig(
             instrument=inst,
+            wavelength_min=round(float(def_wl[0]), 3),
+            wavelength_max=round(float(def_wl[1]), 3),
+            d_min=round(0.5 * float(def_wl[0]), 2),
             peaks_file=resolved_peaks,
             images_file=resolved_images,
         )
@@ -272,7 +278,7 @@ class SubhklGalaxyModel:
                 self.data.wavelength_min = round(float(wl_range[0]), 3)
                 self.data.wavelength_max = round(float(wl_range[1]), 3)
             if (
-                self.payload.get("artifact_kind") in ("merged", "raw_nexus")
+                self.payload.get("artifact_kind") in ("empty", "merged", "raw_nexus")
                 and len(wl_range) >= 2
             ):
                 self.data.d_min = round(0.5 * float(wl_range[0]), 2)

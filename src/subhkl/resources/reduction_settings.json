@@ -33,7 +33,7 @@
         "Name": "IMAGINE-X",
         "InstrumentName": "IMAGINE-X",
         "FancyName": "IMAGINE-X",
-        "Wavelength": [2, 10],
+        "Wavelength": [2.8, 4.5],
         "Goniometer": {
             "CG4D:Mot:omega": [0.0, 1.0, 0.0, -1.0],
             "CG4D:Mot:alpha#tilt": [0.0, 0.0, 1.0, -1.0],
