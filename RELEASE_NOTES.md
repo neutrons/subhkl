@@ -4,6 +4,83 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.5]
+
+### Added
+
+- Unit cell metadata history on Galaxy datasets in `subhkl-nova-app`:
+  - Unit cell parameters ($a, b, c, \alpha, \beta, \gamma$) and space group are
+    persisted as dataset annotations/tags when datasets are loaded or produced
+    and retrieved alongside Galaxy history.
+  - Per-field hoverable autocomplete dropdown in the Load Neutron Data dialog
+    that tentatively previews matching sibling unit cell and space group values
+    in gray on hover/arrow navigation and commits them in white on selection.
+  - Flexible clipboard paste parser in all unit cell and space group inputs
+    (accepts `a b c alpha beta gamma` with space group at the front, at the end,
+    or omitted).
+  - Crystal-system symmetry proposals when selecting a space group (automatically
+    linking/proposing constrained lengths and angles such as $a=b=c$ and
+    $\alpha=\beta=\gamma=90^\circ$ for cubic, while remaining manually
+    overrideable).
+
+### Changed
+
+- Condensed Space Group and unit cell inputs ($a, b, c, \alpha, \beta, \gamma$)
+  in the Load Neutron Data dialog into a compact single row.
+- Updated HFIR `CG4D` default wavelength range in `reduction_settings.json` to
+  `[2.8, 4.5]` Å (with initial $d_{\min} = 1.4$ Å).
+
+### Fixed
+
+- Preserved UI-configured $d_{\min}$, $\lambda_{\min}$, and $\lambda_{\max}$
+  when running or re-running `solve` instead of resetting $d_{\min}$ to
+  $\lambda_{\min} / 2$.
+- Guarded optional `nova.mvvm` and `trame` imports in `MainApp` so base unit
+  tests pass when the `nova` extra is not installed.
+
+## [1.5.4]
+
+### Added
+
+- Emitted runner hostname from CLI commands and displayed `[hostname] RUNNING`
+  in the `subhkl-nova-app` pipeline status badge to distinguish load-balanced
+  NDIP Pulsar workers.
+- Added a synchronized $d_{\min}$ resolution slider in the sidebar coupled to
+  the Params bar, auto-populated $\lambda_{\min}$ / $\lambda_{\max}$ in the
+  Params bar with instrument defaults from `reduction_settings.json`, and added
+  unscaled $I/\sigma$ reflection coloring after integration.
+
+### Fixed
+
+- Fixed Galaxy `solve.h5` $\rightarrow$ `integrate` image dataset resolution so
+  `peak_predictor` receives the underlying `merged.h5` detector image stack
+  rather than `solve.h5`.
+- Restored post-merge Careless resolution-bin sparklines ($\mathrm{CC}_{1/2}$,
+  $\langle I/\sigma \rangle$, completeness) and downloadable step artifacts.
+
+## [1.5.3]
+
+### Added
+
+- "From Galaxy..." dataset selector modal in `subhkl-nova-app`, sorting Galaxy
+  history by most-recently-touched first and truncating the recent dropdown list.
+
+### Fixed
+
+- Refined Galaxy dataset validation and classification, loading cues, Careless
+  residual extraction, and downstream stage invalidation when re-running earlier
+  stages.
+- Avoided resolving Pulsar staging `dataset_*.dat` paths as local `images_file`
+  and started `subhkl-nova-app` without a preloaded local dataset.
+
+## [1.5.2]
+
+### Fixed
+
+- Prevented the Load Neutron Data IPTS selector from flipping back to the first
+  entry while typing or selecting an experiment, and preserved query parameters
+  when rewriting `EP_PATH` in `MainApp`.
+
 ## [1.5.1]
 
 ### Added
