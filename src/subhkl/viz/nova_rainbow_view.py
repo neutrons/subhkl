@@ -1122,11 +1122,13 @@ class NovaGalaxyPipelineRunner:
         clean_bn = m_gx.group(2) if m_gx else orig_bn
 
         tag = ""
+        is_images_h5 = False
         if os.path.isfile(abs_m):
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 import h5py
 
                 with h5py.File(abs_m, "r") as hf:
+                    is_images_h5 = "images" in hf
                     if "files" in hf:
                         raw_f = [
                             (
@@ -1142,7 +1144,12 @@ class NovaGalaxyPipelineRunner:
                             s1 = os.path.basename(raw_f[-1]).split(".")[0]
                             tag = s0 if s0 == s1 else f"{s0}_{s1}"
         if not tag:
-            bn = _re.sub(r"(_merged)?\.(h5|dat)$", "", clean_bn, flags=_re.IGNORECASE)
+            bn = _re.sub(
+                r"(_merged|_solve|_integrated|_predictor)?\.(h5|dat)$",
+                "",
+                clean_bn,
+                flags=_re.IGNORECASE,
+            )
             tag = bn or "dataset"
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
         work_d = os.path.join(tmp_root, f"subhkl_work_{safe_tag}")
@@ -1154,40 +1161,180 @@ class NovaGalaxyPipelineRunner:
         )
         dest_m = os.path.join(work_d, dest_name)
         legacy_m = os.path.join(work_d, "merged.h5")
-        if os.path.isfile(abs_m):
+        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+
+        def _has_h5_images(path_cand: str) -> bool:
+            if not os.path.isfile(path_cand):
+                return False
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py
+
+                with h5py.File(path_cand, "r") as hf_c:
+                    return "images" in hf_c
+            return False
+
+        if os.path.isfile(abs_m) and is_images_h5:
             src_sz = os.path.getsize(abs_m)
-            if not os.path.isfile(dest_m) or os.path.getsize(dest_m) != src_sz:
+            if (
+                not os.path.isfile(dest_m)
+                or os.path.getsize(dest_m) != src_sz
+                or not _has_h5_images(dest_m)
+            ):
                 try:
                     _shutil.copy2(abs_m, dest_m)
                 except OSError:
                     return work_d, abs_m
             if dest_m != legacy_m and (
-                not os.path.isfile(legacy_m) or os.path.getsize(legacy_m) != src_sz
+                not os.path.isfile(legacy_m)
+                or os.path.getsize(legacy_m) != src_sz
+                or not _has_h5_images(legacy_m)
             ):
                 with contextlib.suppress(OSError):
                     _shutil.copy2(abs_m, legacy_m)
+            final_m = dest_m if os.path.isfile(dest_m) else abs_m
+            mapped_id = (
+                known_map.get(abs_m)
+                or known_map.get(os.path.realpath(abs_m))
+                or gx_ds_id
+            )
+            if not mapped_id:
+                for gx_f in _glob.glob(
+                    os.path.join(tmp_root, f"subhkl_gx_*_{safe_tag}_merged.h5")
+                ):
+                    if not _has_h5_images(gx_f):
+                        continue
+                    m_cand = _re.match(
+                        r"^subhkl_gx_([0-9a-fA-F]+)_", os.path.basename(gx_f)
+                    )
+                    if m_cand:
+                        mapped_id = m_cand.group(1)
+                        break
+            if mapped_id:
+                for p_alias in (abs_m, final_m, legacy_m):
+                    known_map[os.path.abspath(p_alias)] = mapped_id
+                    known_map[os.path.realpath(p_alias)] = mapped_id
+                self._dataset_id_by_path = known_map
+            return work_d, final_m
 
-        final_m = dest_m if os.path.isfile(dest_m) else abs_m
-        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
-        mapped_id = (
-            known_map.get(abs_m) or known_map.get(os.path.realpath(abs_m)) or gx_ds_id
-        )
-        if not mapped_id:
-            for gx_f in _glob.glob(
-                os.path.join(tmp_root, f"subhkl_gx_*_{safe_tag}_merged.h5")
-            ):
-                m_cand = _re.match(
-                    r"^subhkl_gx_([0-9a-fA-F]+)_", os.path.basename(gx_f)
-                )
-                if m_cand:
-                    mapped_id = m_cand.group(1)
-                    break
-        if mapped_id:
-            for p_alias in (abs_m, final_m, legacy_m):
-                known_map[os.path.abspath(p_alias)] = mapped_id
-                known_map[os.path.realpath(p_alias)] = mapped_id
+        # Non-image HDF5 (e.g. solve.h5, integrated.h5, predictor.h5):
+        # Never overwrite <tag>_merged.h5 or merged.h5 with it!
+        if gx_ds_id and os.path.isfile(abs_m):
+            known_map[os.path.abspath(abs_m)] = gx_ds_id
+            known_map[os.path.realpath(abs_m)] = gx_ds_id
+            low_c = clean_bn.lower()
+            stage_copy = None
+            if "solve" in low_c and low_c.endswith(".h5"):
+                stage_copy = os.path.join(work_d, "solve.h5")
+            elif "integrat" in low_c and low_c.endswith(".h5"):
+                stage_copy = os.path.join(work_d, "integrated.h5")
+            elif "predict" in low_c and low_c.endswith(".h5"):
+                stage_copy = os.path.join(work_d, "predictor.h5")
+            if stage_copy:
+                if not os.path.isfile(stage_copy) or os.path.getsize(
+                    stage_copy
+                ) != os.path.getsize(abs_m):
+                    with contextlib.suppress(OSError):
+                        _shutil.copy2(abs_m, stage_copy)
+                known_map[os.path.abspath(stage_copy)] = gx_ds_id
+                known_map[os.path.realpath(stage_copy)] = gx_ds_id
             self._dataset_id_by_path = known_map
+
+        # Self-heal dest_m / legacy_m if missing or previously overwritten by a non-image HDF5
+        if not _has_h5_images(dest_m):
+            for bad_p in (dest_m, legacy_m):
+                if os.path.isfile(bad_p) and not _has_h5_images(bad_p):
+                    with contextlib.suppress(OSError):
+                        os.remove(bad_p)
+                known_map.pop(os.path.abspath(bad_p), None)
+                known_map.pop(os.path.realpath(bad_p), None)
+            for gx_f in sorted(
+                _glob.glob(os.path.join(tmp_root, f"subhkl_gx_*_{safe_tag}_merged.h5")),
+                key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0.0,
+                reverse=True,
+            ):
+                if _has_h5_images(gx_f):
+                    with contextlib.suppress(OSError):
+                        _shutil.copy2(gx_f, dest_m)
+                        if dest_m != legacy_m:
+                            _shutil.copy2(gx_f, legacy_m)
+                    m_cand = _re.match(
+                        r"^subhkl_gx_([0-9a-fA-F]+)_", os.path.basename(gx_f)
+                    )
+                    if m_cand:
+                        cid = m_cand.group(1)
+                        for p_alias in (gx_f, dest_m, legacy_m):
+                            known_map[os.path.abspath(p_alias)] = cid
+                            known_map[os.path.realpath(p_alias)] = cid
+                        self._dataset_id_by_path = known_map
+                    break
+
+        final_m = dest_m if _has_h5_images(dest_m) else abs_m
         return work_d, final_m
+
+    def _discover_or_fetch_galaxy_images_h5(
+        self, peaks_h5_path: str | None
+    ) -> str | None:
+        """Locate the companion merged scan HDF5 (containing ``images``) on disk or fetch it from Galaxy history."""
+        if not peaks_h5_path or not os.path.isfile(str(peaks_h5_path)):
+            return None
+        from subhkl.viz.rainbow_zones import _discover_images_h5
+
+        # First allow _resolve_work_dir_and_merged to self-heal any local /tmp/subhkl_gx_*_<tag>_merged.h5
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            self._resolve_work_dir_and_merged(str(peaks_h5_path))
+
+        disc = _discover_images_h5(str(peaks_h5_path))
+        if disc and os.path.isfile(str(disc)):
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py
+
+                with h5py.File(str(disc), "r") as hf_d:
+                    if "images" in hf_d:
+                        _, resolved_m = self._resolve_work_dir_and_merged(str(disc))
+                        return resolved_m
+
+        # Not found locally — inspect `files` in peaks_h5_path and look up <tag>_merged.h5 in Galaxy history
+        tag = ""
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            import h5py
+
+            with h5py.File(str(peaks_h5_path), "r") as hf:
+                if "files" in hf:
+                    raw_f = [
+                        (
+                            x.decode("utf-8", "ignore")
+                            if isinstance(x, bytes)
+                            else str(x)
+                        )
+                        for x in list(hf["files"][()])
+                    ]
+                    raw_f = [x for x in raw_f if x]
+                    if raw_f:
+                        s0 = os.path.basename(raw_f[0]).split(".")[0]
+                        s1 = os.path.basename(raw_f[-1]).split(".")[0]
+                        tag = s0 if s0 == s1 else f"{s0}_{s1}"
+        if not tag or not self.is_connected:
+            return None
+        safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
+        target_names = {
+            f"{safe_tag}_merged.h5".lower(),
+            f"{tag}_merged.h5".lower(),
+        }
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            hist_items = self.list_history_datasets(limit=200)
+            for ds in hist_items:
+                if ds.get("state") != "ok":
+                    continue
+                dname = str(ds.get("name") or "").strip().lower()
+                if dname in target_names or (
+                    safe_tag.lower() in dname and dname.endswith("_merged.h5")
+                ):
+                    ds_id = str(ds.get("id") or "").strip()
+                    if ds_id:
+                        local_m, _ = self.resolve_dataset_to_local_h5(ds_id)
+                        _, final_m = self._resolve_work_dir_and_merged(local_m)
+                        return final_m
+        return None
 
     def connect(self) -> Any:
         if self._conn_helper is not None:
@@ -1592,6 +1739,29 @@ class NovaGalaxyPipelineRunner:
                                 "cc_half": cc_b,
                             }
                         )
+                    metrics_doc.setdefault("n_merged_asu", len(hm_v))
+                    metrics_doc.setdefault(
+                        "mean_isigi", round(float(np.mean(isigi_v)), 2)
+                    )
+                    metrics_doc.setdefault(
+                        "median_isigi", round(float(np.median(isigi_v)), 2)
+                    )
+                    if theo_set:
+                        metrics_doc.setdefault(
+                            "completeness_pct",
+                            round(
+                                float(100.0 * len(hm_v) / max(1, len(theo_set))),
+                                2,
+                            ),
+                        )
+                    if (
+                        len(xv_v0) >= 2
+                        and np.std(xv_v0) > 1e-12
+                        and np.std(xv_v1) > 1e-12
+                    ):
+                        r_all = float(np.corrcoef(xv_v0, xv_v1)[0, 1])
+                        if np.isfinite(r_all):
+                            metrics_doc.setdefault("cc_half", round(r_all, 4))
                     metrics_doc["resolution_bins"] = bins
                     metrics_raw = json.dumps(metrics_doc, indent=2)
                     with open(metrics_path, "w", encoding="utf-8") as fh_out:
@@ -1778,10 +1948,18 @@ class NovaGalaxyPipelineRunner:
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         k_info = gi.datasets.show_dataset(known_id)
                         k_name = str(k_info.get("name") or "")
+                        is_merged_req = fname == "merged.h5" or fname.lower().endswith(
+                            "_merged.h5"
+                        )
+                        is_wrong_stage = is_merged_req and any(
+                            w in k_name.lower()
+                            for w in ("solve", "integrat", "predict", ".mtz")
+                        )
                         if (
                             k_info.get("state") == "ok"
                             and not k_info.get("deleted")
                             and "/" not in k_name
+                            and not is_wrong_stage
                         ):
                             known_map[os.path.abspath(local_path)] = known_id
                             self._dataset_id_by_path = known_map
@@ -1975,21 +2153,31 @@ class NovaGalaxyPipelineRunner:
             inst = str(params.get("instrument", "CG4D"))
             sg = str(params.get("space_group", "P 21 21 21"))
             merged_path = params.get("images_file") or ""
+            merged_has_images = False
+            if merged_path and os.path.isfile(str(merged_path)):
+                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                    import h5py
+
+                    with h5py.File(str(merged_path), "r") as hf_chk:
+                        merged_has_images = "images" in hf_chk
             if (
                 not merged_path
                 or not os.path.isfile(merged_path)
+                or not merged_has_images
                 or "/staging" in str(merged_path)
                 or (
                     os.path.basename(str(merged_path)).startswith("dataset_")
                     and str(merged_path).endswith(".dat")
                 )
             ) and params.get("peaks_file"):
-                from subhkl.viz.rainbow_zones import _discover_images_h5
-
-                disc_m = _discover_images_h5(params.get("peaks_file"))
+                disc_m = self._discover_or_fetch_galaxy_images_h5(
+                    params.get("peaks_file")
+                )
                 if disc_m:
                     merged_path = disc_m
-            if not merged_path and stage_id != "reduce":
+                elif not merged_has_images:
+                    merged_path = ""
+            if not merged_path and stage_id not in ("reduce", "merge"):
                 raise RuntimeError(
                     "No merged scan HDF5 file is loaded; run Step 1 (Reduce & Merge) "
                     "or select a merged.h5 dataset from History first."
@@ -2277,7 +2465,34 @@ class NovaGalaxyPipelineRunner:
                     tool_inputs[f"inputs_{i_nxs}|input"] = nxs_p
             elif stage_id == "merge":
                 primary_tool = "imaginex_subhkl_merge"
+                if (
+                    work_dir == os.path.abspath(tempfile.gettempdir())
+                    and params.get("peaks_file")
+                    and os.path.isfile(str(params.get("peaks_file")))
+                ):
+                    work_dir, _ = self._resolve_work_dir_and_merged(
+                        str(params.get("peaks_file"))
+                    )
                 mtz_in_path = os.path.join(work_dir, "reflections.mtz")
+                if not os.path.isfile(mtz_in_path) and self.is_connected:
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                        for ds in self.list_history_datasets(limit=100):
+                            if ds.get("state") != "ok":
+                                continue
+                            dname = str(ds.get("name") or "").lower()
+                            if "reflections.mtz" in dname or (
+                                "unmerged" in dname and dname.endswith(".mtz")
+                            ):
+                                ds_id = str(ds.get("id") or "").strip()
+                                if ds_id:
+                                    dl_p, _ = self.resolve_dataset_to_local_h5(
+                                        ds_id, fallback_dir=work_dir
+                                    )
+                                    if os.path.isfile(dl_p):
+                                        import shutil as _shutil
+
+                                        _shutil.copy2(dl_p, mtz_in_path)
+                                        break
                 if not os.path.isfile(mtz_in_path):
                     raise RuntimeError(
                         f"Unmerged reflections.mtz not found in {work_dir}; run Integrate first."
@@ -4962,17 +5177,24 @@ class NovaGalaxyPipelineRunner:
                                     if not oid:
                                         continue
                                     dest_name = None
-                                    for cand in (
-                                        "merged.mtz",
-                                        "predictions.mtz",
-                                        "xval.mtz",
-                                        "careless_metrics.json",
+                                    if (
+                                        oname
+                                        in ("metrics_json", "careless_metrics_json")
+                                        or "careless_metrics" in oname
                                     ):
-                                        if cand in oname or oname == cand.replace(
-                                            ".", "_"
+                                        dest_name = "careless_metrics.json"
+                                    else:
+                                        for cand in (
+                                            "merged.mtz",
+                                            "predictions.mtz",
+                                            "xval.mtz",
+                                            "careless_metrics.json",
                                         ):
-                                            dest_name = cand
-                                            break
+                                            if cand in oname or oname == cand.replace(
+                                                ".", "_"
+                                            ):
+                                                dest_name = cand
+                                                break
                                     if dest_name:
                                         with contextlib.suppress(
                                             *_NOVA_RECOVERABLE_ERRORS
@@ -4986,10 +5208,28 @@ class NovaGalaxyPipelineRunner:
                                             dest_p = os.path.join(work_dir, dest_name)
                                             with open(dest_p, "wb") as f:
                                                 f.write(bdata)
+                                            known_map = getattr(
+                                                self, "_dataset_id_by_path", {}
+                                            )
+                                            known_map[os.path.abspath(dest_p)] = oid
+                                            known_map[os.path.realpath(dest_p)] = oid
+                                            self._dataset_id_by_path = known_map
                                             job_record["stdout"] += (
                                                 f"[careless] Saved {dest_name} -> {dest_p}\n"
                                             )
                                 int_target = os.path.join(work_dir, "integrated.h5")
+                                if not os.path.isfile(int_target):
+                                    pf_cand = str(
+                                        (job_record.get("params") or {}).get(
+                                            "peaks_file"
+                                        )
+                                        or ""
+                                    )
+                                    if pf_cand and os.path.isfile(pf_cand):
+                                        import shutil as _shutil
+
+                                        with contextlib.suppress(OSError):
+                                            _shutil.copy2(pf_cand, int_target)
                                 if os.path.isfile(int_target):
                                     self._stamp_careless_merge_into_h5(
                                         int_target, work_dir, job_record
@@ -5298,12 +5538,23 @@ def serve_rainbow_zones(
                         if os.path.isfile(fp):
                             fp_low = os.path.basename(fp).lower()
                             if any(k in fp_low for k in ("merged", "scan", "image")):
+                                _, fp = vm.pipeline_runner._resolve_work_dir_and_merged(
+                                    fp
+                                )
                                 vm.payload_kwargs["images_h5"] = fp
                                 vm.replay_h5 = fp
                                 vm.reload(images_h5=fp, frame_index=f_idx)
                             else:
+                                disc_img = vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                    fp
+                                )
+                                if disc_img:
+                                    vm.payload_kwargs["images_h5"] = str(disc_img)
                                 vm.replay_h5 = fp
-                                vm.reload(frame_index=f_idx)
+                                vm.reload(
+                                    images_h5=vm.payload_kwargs.get("images_h5"),
+                                    frame_index=f_idx,
+                                )
                             vm.pipeline_runner.invalidate_subsequent_stages(
                                 (vm._payload or {}).get("artifact_kind"),
                                 os.path.dirname(fp),
@@ -5383,7 +5634,12 @@ def serve_rainbow_zones(
                             vm.replay_h5 = local_h5
                             vm.reload(images_h5=local_h5, frame_index=f_idx)
                         else:
-                            disc_img = _discover_images_h5(local_h5)
+                            disc_img = (
+                                vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                    local_h5
+                                )
+                                or _discover_images_h5(local_h5)
+                            )
                             vm.payload_kwargs["images_h5"] = (
                                 str(disc_img) if disc_img else None
                             )
@@ -5637,11 +5893,15 @@ def serve_rainbow_zones(
                         params.setdefault(
                             "wavelength_range", vm.payload.get("wavelength_range")
                         )
-                    cur_imgs = (
-                        vm.payload_kwargs.get("images_h5")
-                        or vm.payload.get("images_h5")
-                        or vm.replay_h5
+                    cur_imgs = vm.payload_kwargs.get("images_h5") or vm.payload.get(
+                        "images_h5"
                     )
+                    if not cur_imgs and vm.replay_h5:
+                        cur_imgs = (
+                            vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                vm.replay_h5
+                            )
+                        )
                     if cur_imgs:
                         params.setdefault("images_file", str(cur_imgs))
                     if vm.replay_h5:

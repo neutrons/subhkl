@@ -1775,3 +1775,73 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     disc = _discover_images_h5(solve_h5)
     assert disc is not None
     assert os.path.abspath(disc) == os.path.abspath(work_merged)
+
+    # Verify _resolve_work_dir_and_merged on solve.h5 NEVER overwrites <tag>_merged.h5 or its dataset ID
+    _wd_s, _resolved_s = runner._resolve_work_dir_and_merged(str(solve_h5))
+    with h5py.File(work_merged, "r") as hf_chk:
+        assert "images" in hf_chk
+    assert runner._dataset_id_by_path.get(os.path.abspath(work_merged)) == mandi_gx_id
+    assert runner._dataset_id_by_path.get(os.path.abspath(str(solve_h5))) == "999999"
+
+    # Verify _extract_from_h5 sets artifact_kind="merged_careless" when careless/metrics_json has resolution_bins
+    merged_careless_h5 = tmp_path / "merged_careless_bins_only.h5"
+    with h5py.File(merged_careless_h5, "w") as hf_mc:
+        hf_mc.attrs["instrument"] = "CG4D"
+        hf_mc["sample/U"] = np.eye(3)
+        hf_mc["sample/B"] = np.diag([1.0 / 68.7, 1.0 / 69.8, 1.0 / 156.9])
+        hf_mc["peaks/h"] = np.array([1, 2, 3], dtype=int)
+        hf_mc["peaks/k"] = np.array([0, 1, 1], dtype=int)
+        hf_mc["peaks/l"] = np.array([1, 0, 2], dtype=int)
+        hf_mc["peaks/lambda"] = np.array([3.1, 3.4, 3.8], dtype=float)
+        hf_mc["peaks/intensity"] = np.array([120.0, 95.0, 80.0], dtype=float)
+        hf_mc["peaks/sigma"] = np.array([5.0, 4.0, 4.0], dtype=float)
+        hf_mc["peaks/bank"] = np.array([20, 20, 20], dtype=int)
+        hf_mc["peaks/pixel_r"] = np.array([120.0, 140.0, 160.0], dtype=float)
+        hf_mc["peaks/pixel_c"] = np.array([130.0, 150.0, 170.0], dtype=float)
+        hf_mc["peaks/var_u"] = np.array([2.5, 2.5, 2.5], dtype=float)
+        hf_mc["peaks/var_v"] = np.array([1.8, 1.8, 1.8], dtype=float)
+        hf_mc["peaks/cov_uv"] = np.array([0.1, 0.1, 0.1], dtype=float)
+        hf_mc["peaks/careless_residual"] = np.array([0.2, -0.4, 0.1], dtype=float)
+        hf_mc["peaks/careless_scale"] = np.array([1.0, 1.1, 0.9], dtype=float)
+        cgrp = hf_mc.require_group("careless")
+        cgrp.create_dataset(
+            "metrics_json",
+            data=np.bytes_(
+                json.dumps(
+                    {
+                        "resolution_bins": [
+                            {
+                                "bin": 0,
+                                "d_max": 5.0,
+                                "d_min": 2.0,
+                                "n_refl": 42,
+                                "n_theo": 50,
+                                "completeness_pct": 84.0,
+                                "mean_isigi": 12.5,
+                                "cc_half": 0.985,
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+            ),
+        )
+    ext_mc = _extract_from_h5(merged_careless_h5)
+    assert ext_mc["artifact_kind"] == "merged_careless"
+    assert ext_mc["merge_metrics"] is not None
+    assert ext_mc["merge_metrics"]["n_merged_asu"] == 42
+    assert len(ext_mc["merge_metrics"]["cc_half_bins"]) == 1
+
+    # Verify reduction_settings.json wavelength defaults, Params λ_min/λ_max inputs, synchronized d_min slider,
+    # and unscaled I/sigma color mode in rendered HTML
+    from subhkl.viz.rainbow_zones import _get_instrument_default_wavelength
+
+    assert _get_instrument_default_wavelength("MANDI") == (2.0, 4.0)
+    assert _get_instrument_default_wavelength("TOPAZ") == (0.4, 3.5)
+    assert _get_instrument_default_wavelength("CG4D") == (2.0, 10.0)
+    assert 'id="inp-lmin"' in html_doc
+    assert 'id="inp-lmax"' in html_doc
+    assert 'id="slider-dmin"' in html_doc
+    assert 'id="sel-spot-color"' in html_doc
+    assert '<option value="isigi">Color: I/σ (Unscaled)</option>' in html_doc
+    assert "hasIntegratedIsigi" in html_doc
+    assert "syncDminControls" in html_doc
