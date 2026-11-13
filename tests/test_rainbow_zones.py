@@ -1837,7 +1837,13 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
 
     assert _get_instrument_default_wavelength("MANDI") == (2.0, 4.0)
     assert _get_instrument_default_wavelength("TOPAZ") == (0.4, 3.5)
-    assert _get_instrument_default_wavelength("CG4D") == (2.0, 10.0)
+    assert _get_instrument_default_wavelength("CG4D") == (2.8, 4.5)
+    fresh_cg4d = SubhklGalaxyModel()
+    assert fresh_cg4d.data.wavelength_min == 2.8
+    assert fresh_cg4d.data.wavelength_max == 4.5
+    assert fresh_cg4d.data.d_min == 1.4
+    assert fresh_cg4d.payload["wavelength_range"] == [2.8, 4.5]
+    assert fresh_cg4d.payload["d_min"] == 1.4
     assert 'id="inp-lmin"' in html_doc
     assert 'id="inp-lmax"' in html_doc
     assert 'id="slider-dmin"' in html_doc
@@ -1849,3 +1855,174 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     from subhkl.io.parser import detect_runner_hostname
 
     assert detect_runner_hostname()
+
+    # Verify d_min, lambda_min, and lambda_max preservation across solve/blind_search/search HDF5 groups,
+    # frame switches, active solve overlays, and UI stage reloads
+    blind_h5 = tmp_path / "solve.blind.h5"
+    with h5py.File(blind_h5, "w") as hf_b:
+        hf_b.attrs["instrument"] = "CG4D"
+        hf_b["sample/U"] = np.eye(3)
+        hf_b["sample/B"] = np.diag([1.0 / 68.7, 1.0 / 69.8, 1.0 / 156.9])
+        hf_b.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.85, 4.35], dtype=np.float64)
+        )
+        sgrp = hf_b.create_group("search")
+        sgrp.attrs["d_min"] = 1.95
+    ext_blind = _extract_from_h5(blind_h5)
+    assert np.allclose(ext_blind["wavelength_range"], (2.85, 4.35))
+    assert np.isclose(ext_blind["solve_diagnostics"]["d_min"], 1.95)
+
+    empty_model.data.peaks_file = str(work_merged)
+    empty_model.data.images_file = str(work_merged)
+    empty_model.refresh_payload()
+    # User sets custom UI parameters before running / re-running solve
+    empty_model.data.wavelength_min = 2.85
+    empty_model.data.wavelength_max = 4.35
+    empty_model.data.d_min = 1.95
+    p_kept = empty_model.refresh_payload(frame_index=1, preserve_params=True)
+    assert p_kept["wavelength_range"] == [2.85, 4.35]
+    assert p_kept["d_min"] == 1.95
+    assert empty_model.data.wavelength_min == 2.85
+    assert empty_model.data.wavelength_max == 4.35
+    assert empty_model.data.d_min == 1.95
+
+    runner.active_job = {
+        "stage_id": "solve",
+        "state": "running",
+        "solve_params": {
+            "instrument": "CG4D",
+            "space_group": "P 21 21 21",
+            "wavelength_range": (2.85, 4.35),
+            "d_min": 1.95,
+        },
+    }
+    ov_payload = {"wavelength_range": [2.0, 10.0], "d_min": 1.0}
+    runner.apply_active_solve_overlay(ov_payload, frame_index=0)
+    assert ov_payload["wavelength_range"] == [2.85, 4.35]
+    assert ov_payload["d_min"] == 1.95
+    assert 'preserveParams: stageId !== "reduce"' in html_doc
+    assert (
+        "const keepUserParams = isFrameSwitch || preserveParams || isSolveRunning;"
+        in html_doc
+    )
+
+    # Verify flexible unit-cell clipboard parser (space group at end, front, or omitted)
+    from subhkl.viz.rainbow_zones import (
+        parse_unit_cell_text,
+        resolve_space_group_symmetry,
+    )
+
+    p_end = parse_unit_cell_text(
+        "68.84174 98.06962 90.91568 90.07304 106.11396 90.0088 P21"
+    )
+    assert p_end is not None
+    assert np.allclose(
+        p_end["cell"],
+        [68.84174, 98.06962, 90.91568, 90.07304, 106.11396, 90.0088],
+    )
+    assert p_end["space_group"] == "P21"
+
+    p_front = parse_unit_cell_text("P 21 21 21 68.7 69.8 156.9 90.0 90.0 90.0")
+    assert p_front is not None
+    assert np.allclose(p_front["cell"], [68.7, 69.8, 156.9, 90.0, 90.0, 90.0])
+    assert p_front["space_group"] == "P 21 21 21"
+
+    p_none = parse_unit_cell_text(
+        "68.84174, 98.06962, 90.91568, 90.07304, 106.11396, 90.0088"
+    )
+    assert p_none is not None
+    assert p_none["space_group"] == ""
+    assert np.allclose(
+        p_none["cell"],
+        [68.84174, 98.06962, 90.91568, 90.07304, 106.11396, 90.0088],
+    )
+
+    p_rhomb = parse_unit_cell_text("R -3 m :R 8.5 8.5 8.5 55.2 55.2 55.2")
+    assert p_rhomb is not None
+    assert p_rhomb["space_group"] == "R -3 m :R"
+    assert np.allclose(p_rhomb["cell"], [8.5, 8.5, 8.5, 55.2, 55.2, 55.2])
+
+    # Verify crystal-system symmetry constraints for space groups
+    sym_cubic = resolve_space_group_symmetry("I a -3 d")
+    assert sym_cubic["crystal_system"] == "cubic"
+    assert sym_cubic["linked_lengths"] == {"b": "a", "c": "a"}
+    assert sym_cubic["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+    }
+
+    sym_tet = resolve_space_group_symmetry("P 41 21 2")
+    assert sym_tet["crystal_system"] == "tetragonal"
+    assert sym_tet["linked_lengths"] == {"b": "a"}
+    assert sym_tet["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+    }
+
+    sym_hex = resolve_space_group_symmetry("P 61 2 2")
+    assert sym_hex["crystal_system"] == "hexagonal"
+    assert sym_hex["linked_lengths"] == {"b": "a"}
+    assert sym_hex["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 120.0,
+    }
+
+    sym_rhomb = resolve_space_group_symmetry("R -3 m :R")
+    assert sym_rhomb["setting"] == "trigonal_r"
+    assert sym_rhomb["linked_lengths"] == {"b": "a", "c": "a"}
+    assert sym_rhomb["linked_angles"] == {"beta": "alpha", "gamma": "alpha"}
+    assert sym_rhomb["fixed_angles"] == {}
+
+    sym_ortho = resolve_space_group_symmetry("P 21 21 21")
+    assert sym_ortho["crystal_system"] == "orthorhombic"
+    assert sym_ortho["linked_lengths"] == {}
+    assert sym_ortho["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+    }
+
+    sym_mono = resolve_space_group_symmetry("P21")
+    assert sym_mono["crystal_system"] == "monoclinic"
+    assert sym_mono["setting"] == "monoclinic_b"
+    assert sym_mono["fixed_angles"] == {"alpha": 90.0, "gamma": 90.0}
+
+    # Verify Galaxy dataset unit-cell metadata extraction & annotation parsing
+    runner.attach_dataset_cell_metadata(
+        "ds_test_betalac",
+        [68.8417, 98.0696, 90.9157, 90.073, 106.114, 90.0088],
+        "P 1 21 1",
+        "CG4D",
+        sync_remote=False,
+    )
+    assert runner._dataset_cell_meta["ds_test_betalac"]["space_group"] == "P 1 21 1"
+    assert np.allclose(
+        runner._dataset_cell_meta["ds_test_betalac"]["cell"],
+        [68.8417, 98.0696, 90.9157, 90.073, 106.114, 90.0088],
+    )
+    parsed_ann = runner._parse_dataset_annotation_meta(
+        {
+            "annotation": '{"subhkl_cell":[11.93,11.93,11.93,90,90,90],"space_group":"I a -3 d","instrument":"MANDI"}',
+            "tags": [],
+        }
+    )
+    assert parsed_ann is not None
+    assert parsed_ann["space_group"] == "I a -3 d"
+    assert parsed_ann["cell"] == [11.93, 11.93, 11.93, 90.0, 90.0, 90.0]
+
+    # Verify UI elements & JS helpers for per-field hoverable autocomplete dropdown, tentative gray preview, paste, and overrideable symmetry proposals
+    assert 'id="nd-symmetry-badge"' in html_doc
+    assert 'id="nd-cell-suggestions"' in html_doc
+    assert 'id="subhkl-sg-datalist"' in html_doc
+    assert "parseUnitCellClipboardText" in html_doc
+    assert "resolveSpaceGroupSymmetry" in html_doc
+    assert "applyUnitCellSymmetryConstraints" in html_doc
+    assert "getKnownUnitCellHistory" in html_doc
+    assert "renderUnitCellHistoryDropdown" in html_doc
+    assert "highlightAutocompleteOption" in html_doc
+    assert "previewTentativeUnitCellEntry" in html_doc
+    assert "confirmTentativeUnitCellPreview" in html_doc
+    assert "updateUnitCellFieldSuggestions" in html_doc

@@ -214,6 +214,8 @@ def run_scan_refinement(
             "invalid band refinement budget, zones, resolution, deviance or border_width"
         )
     wl_low, wl_high = (None, None) if wavelength is None else wavelength
+    wl_low_explicit = wl_low is not None
+    wl_high_explicit = wl_high is not None
     if wl_low is None:
         wl_low = file_wl[0] if file_wl is not None else 2.85
     if wl_high is None:
@@ -224,17 +226,19 @@ def run_scan_refinement(
         (None, None) if assignment_wavelength is None else assignment_wavelength
     )
     if awl_low is None:
-        awl_low = (
-            file_wl[0]
-            if file_wl is not None
-            else (2.8 if wavelength == (2.85, 4.35) else wavelength[0])
-        )
+        if wl_low_explicit:
+            awl_low = wavelength[0]
+        elif file_wl is not None:
+            awl_low = file_wl[0]
+        else:
+            awl_low = 2.8 if wavelength == (2.85, 4.35) else wavelength[0]
     if awl_high is None:
-        awl_high = (
-            file_wl[1]
-            if file_wl is not None
-            else (4.5 if wavelength == (2.85, 4.35) else wavelength[1])
-        )
+        if wl_high_explicit:
+            awl_high = wavelength[1]
+        elif file_wl is not None:
+            awl_high = file_wl[1]
+        else:
+            awl_high = 4.5 if wavelength == (2.85, 4.35) else wavelength[1]
     assignment_wavelength = (float(awl_low), float(awl_high))
     for band in (wavelength, assignment_wavelength):
         if not 0 < band[0] < band[1]:

@@ -417,6 +417,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
         g.attrs["selected"] = selected
         g.attrs["samples_requested"] = samples
         g.attrs["seed"] = seed
+        g.attrs["d_min"] = float(args.d_min)
         g.attrs["stable_observations"] = len(weights)
         g.attrs["seconds"] = time.monotonic() - start
         g.attrs["source"] = str(Path(src_nexus).resolve()) if src_nexus else ""
