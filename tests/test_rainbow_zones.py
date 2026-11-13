@@ -2013,17 +2013,16 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert parsed_ann["space_group"] == "I a -3 d"
     assert parsed_ann["cell"] == [11.93, 11.93, 11.93, 90.0, 90.0, 90.0]
 
-    # Verify UI elements & JS helpers for per-dimension browser datalists, tentative preview, paste, and overrideable symmetry proposals
+    # Verify UI elements & JS helpers for per-field hoverable autocomplete dropdown, tentative gray preview, paste, and overrideable symmetry proposals
     assert 'id="nd-symmetry-badge"' in html_doc
+    assert 'id="nd-cell-suggestions"' in html_doc
     assert 'id="subhkl-sg-datalist"' in html_doc
-    for dim in ("a", "b", "c", "alpha", "beta", "gamma"):
-        assert f'id="subhkl-datalist-{dim}"' in html_doc
-        assert f'list="subhkl-datalist-{dim}"' in html_doc
     assert "parseUnitCellClipboardText" in html_doc
     assert "resolveSpaceGroupSymmetry" in html_doc
     assert "applyUnitCellSymmetryConstraints" in html_doc
     assert "getKnownUnitCellHistory" in html_doc
-    assert "populateUnitCellDatalists" in html_doc
+    assert "renderUnitCellHistoryDropdown" in html_doc
+    assert "highlightAutocompleteOption" in html_doc
     assert "previewTentativeUnitCellEntry" in html_doc
     assert "confirmTentativeUnitCellPreview" in html_doc
     assert "updateUnitCellFieldSuggestions" in html_doc
