@@ -1886,6 +1886,13 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert empty_model.data.wavelength_max == 4.35
     assert empty_model.data.d_min == 1.95
 
+    # Subsequent solve with a different d_min in the UI must not revert to the previous solve.h5's d_min (1.95)
+    empty_model.data.peaks_file = str(blind_h5)
+    empty_model.data.d_min = 1.50
+    p_subsequent = empty_model.refresh_payload(frame_index=0, preserve_params=True)
+    assert p_subsequent["d_min"] == 1.50
+    assert empty_model.data.d_min == 1.50
+
     runner.active_job = {
         "stage_id": "solve",
         "state": "running",
@@ -2026,3 +2033,25 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert "previewTentativeUnitCellEntry" in html_doc
     assert "confirmTentativeUnitCellPreview" in html_doc
     assert "updateUnitCellFieldSuggestions" in html_doc
+
+    # Verify stepped run interval parsing (e.g. 2632-2638/2, 2623:26238:2, 2632-2638..2)
+    from subhkl.viz.rainbow_zones import parse_run_range_spec
+
+    assert parse_run_range_spec("2632-2638/2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2632:2638:2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2632-2638..2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2632..2638..2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2632..2638/2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2623:26238:2") == list(range(2623, 26239, 2))
+    assert parse_run_range_spec("2632-2638/2, 2645, 2650:2656:3") == [
+        2632,
+        2634,
+        2636,
+        2638,
+        2645,
+        2650,
+        2653,
+        2656,
+    ]
+    assert "dMinSeqAtStart" in html_doc
+    assert "pollInFlight" in html_doc

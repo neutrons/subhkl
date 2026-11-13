@@ -802,6 +802,52 @@ def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str
     return ext or "data"
 
 
+def parse_run_range_spec(spec_str: str | None) -> list[int]:
+    """Parse a run specification string supporting single runs, ranges, and stepped intervals.
+
+    Supported formats (comma or whitespace separated):
+    - Single run: ``2632``
+    - Inclusive range: ``2632-2638``, ``2632:2638``, ``2632..2638``
+    - Stepped interval: ``2632-2638/2``, ``2623:26238:2``, ``2632-2638..2``,
+      ``2632..2638/2``, ``2632:2638/2``, ``2632-2638:2``, ``2632..2638..2``
+    """
+    import re as _re
+
+    runs: list[int] = []
+    seen: set[int] = set()
+    norm = _re.sub(r"\s*(\.\.|[-–:/])\s*", r"\1", str(spec_str or ""))
+    for tok in _re.split(r"[,\s]+", norm):
+        t = tok.strip()
+        if not t:
+            continue
+        m = _re.match(
+            r"^(\d+)(?:\.\.|[-–:])(\d+)(?:(?:\.\.|[/:])(\d+)?)?$",
+            t,
+        )
+        if m:
+            a = int(m.group(1))
+            b = int(m.group(2))
+            step_s = m.group(3)
+            step = int(step_s) if step_s is not None and step_s != "" else 1
+            if step <= 0:
+                continue
+            lo, hi = min(a, b), max(a, b)
+            r = lo
+            count = 0
+            while r <= hi and count < 20000:
+                if r not in seen:
+                    seen.add(r)
+                    runs.append(r)
+                r += step
+                count += 1
+        elif t.isdigit():
+            r = int(t)
+            if r not in seen:
+                seen.add(r)
+                runs.append(r)
+    return runs
+
+
 def validate_subhkl_ingestible_dataset(
     local_path: str | os.PathLike,
     ds_info: dict[str, Any] | None = None,
@@ -980,6 +1026,7 @@ def _extract_from_h5(
     *,
     include_peaks: bool = True,
     default_instrument: str = "IMAGINE",
+    d_min: float | None = None,
 ) -> dict[str, Any]:
     """Extract peaks, detectors, UB, wavelength range, goniometer frames, and metadata from a subhkl HDF5 file."""
     disc_h5 = _discover_images_h5(h5_path)
@@ -2040,9 +2087,13 @@ def _extract_from_h5(
                 )
                 default_d_min = round(0.5 * float(wavelength_range[0]), 2)
                 d_min_use = (
-                    float(solve_diagnostics.get("d_min", default_d_min))
-                    if solve_diagnostics and "d_min" in solve_diagnostics
-                    else default_d_min
+                    float(d_min)
+                    if d_min is not None and float(d_min) > 0
+                    else (
+                        float(solve_diagnostics.get("d_min", default_d_min))
+                        if solve_diagnostics and "d_min" in solve_diagnostics
+                        else default_d_min
+                    )
                 )
                 hkl_all = np.stack(
                     generate_reflections(
@@ -2656,6 +2707,7 @@ def build_rainbow_zone_payload(
     R_gonio: np.ndarray | None = None,
     ki: tuple[float, float, float] = (0.0, 0.0, 1.0),
     wavelength_range: tuple[float, float] | None = None,
+    d_min: float | None = None,
     instrument: str = "IMAGINE",
     space_group: str = "P 1",
     cell: list[float] | None = None,
@@ -2711,6 +2763,7 @@ def build_rainbow_zone_payload(
             frame_index=frame_index,
             include_peaks=include_peaks,
             default_instrument=instrument or "IMAGINE",
+            d_min=d_min,
         )
         instrument = extracted["instrument"] or instrument
         ki = extracted["ki"]
@@ -3689,7 +3742,11 @@ def build_rainbow_zone_payload(
     )
 
     default_d_min = round(0.5 * float(wl_min), 2)
-    d_min_use = float((solve_diagnostics or {}).get("d_min", default_d_min))
+    d_min_use = (
+        float(d_min)
+        if d_min is not None and float(d_min) > 0
+        else float((solve_diagnostics or {}).get("d_min", default_d_min))
+    )
     gonio_summary = (
         frames_meta[active_frame].get("motor_summary", "—")
         if 0 <= active_frame < len(frames_meta)
@@ -4804,7 +4861,7 @@ def render_rainbow_html(
               <span>RUN OR RANGE</span>
               <span id="nd-multirun-badge" style="font-size:0.58rem;color:var(--accent-cyan);">Multi-run</span>
             </span>
-            <input id="nd-runs" type="text" value="" placeholder="e.g. 2625-2638 or 12737,12739" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-runs" type="text" value="" placeholder="e.g. 2625-2638, 2632-2638/2, or 12737,12739" title="Enter run numbers, ranges (2632-2638, 2632:2638, 2632..2638), or stepped intervals (2632-2638/2, 2623:26238:2, 2632-2638..2)" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
 
@@ -5289,6 +5346,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const v = Math.max(0.2, Math.min(10.0, Number(nextDmin) || 1.0));
     state.dMin = v;
     DATA.d_min = v;
+    if (sourceEl) {{
+      state.dMinUserSeq = (state.dMinUserSeq || 0) + 1;
+    }}
     const lblD = document.getElementById("lbl-dmin-val");
     if (lblD) lblD.textContent = `${{v.toFixed(2)}} Å`;
     if (slDmin && sourceEl !== slDmin) {{
@@ -5484,7 +5544,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const lmaxVal = Math.max(lminVal + 0.05, getNum("inp-lmax", state.lamMax || defWl[1]));
     state.lamMin = lminVal;
     state.lamMax = lmaxVal;
-    const dminVal = getNum("inp-dmin", state.dMin || Number((lminVal * 0.5).toFixed(2)));
+    const rawInpDmin = inpDminEl ? parseFloat(inpDminEl.value) : NaN;
+    const rawSlDmin = slDmin ? parseFloat(slDmin.value) : NaN;
+    const dminVal = (typeof document !== "undefined" && document.activeElement === slDmin && Number.isFinite(rawSlDmin) && rawSlDmin > 0)
+      ? rawSlDmin
+      : ((Number.isFinite(rawInpDmin) && rawInpDmin > 0)
+        ? rawInpDmin
+        : ((Number.isFinite(state.dMin) && state.dMin > 0) ? state.dMin : Number((lminVal * 0.5).toFixed(2))));
     syncDminControls(dminVal);
     return {{
       instrument: DATA.instrument || "CG4D",
@@ -8851,16 +8917,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function parseRunRangeSpec(specStr) {{
     const runs = [];
-    String(specStr || "").split(/[,\\s]+/).forEach(tok => {{
+    const seen = new Set();
+    const norm = String(specStr || "").replace(/\\s*(\\.\\.|[-–:/])\\s*/g, "$1");
+    norm.split(/[,\\s]+/).forEach(tok => {{
       const t = tok.trim();
       if (!t) return;
-      const m = t.match(/^(\\d+)\\s*[-–:]\\s*(\\d+)$/);
+      const m = t.match(/^(\\d+)(?:\\.\\.|[-–:])(\\d+)(?:(?:\\.\\.|[/:])(\\d+)?)?$/);
       if (m) {{
         const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+        const step = (m[3] !== undefined && m[3] !== "") ? parseInt(m[3], 10) : 1;
+        if (!Number.isFinite(step) || step <= 0) return;
         const lo = Math.min(a, b), hi = Math.max(a, b);
-        for (let r = lo; r <= Math.min(hi, lo + 500); r++) runs.push(r);
+        for (let r = lo, count = 0; r <= hi && count < 20000; r += step, count++) {{
+          if (!seen.has(r)) {{
+            seen.add(r);
+            runs.push(r);
+          }}
+        }}
       }} else if (/^\\d+$/.test(t)) {{
-        runs.push(parseInt(t, 10));
+        const r = parseInt(t, 10);
+        if (!seen.has(r)) {{
+          seen.add(r);
+          runs.push(r);
+        }}
       }}
     }});
     return runs;
@@ -9011,9 +9090,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     const selectedSet = new Set(parseRunRangeSpec(document.getElementById("nd-runs")?.value || ""));
+    const filterRangeRuns = (filterVal && /^[\\d\\s,.:/–-]+$/.test(filterVal))
+      ? new Set(parseRunRangeSpec(filterVal))
+      : null;
     const allRuns = ndOncatCatalog.runs || [];
     const filtered = allRuns.filter(r => {{
       if (!filterVal) return true;
+      if (filterRangeRuns && filterRangeRuns.size > 0 && filterRangeRuns.has(Number(r.run))) return true;
       const durHms = formatRunDurationHMS(r);
       const hay = `${{r.run}} ${{r.title || ""}} ${{r.sample_name || ""}} ${{r.angles || ""}} ${{durHms}} ${{r.created || ""}}`.toLowerCase();
       return hay.includes(filterVal);
@@ -10961,12 +11044,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     const runSeq = (state.workflowRunSeq = (state.workflowRunSeq || 0) + 1);
     const params = {{ ...collectWorkflowParams(), ...(extraParams || {{}}) }};
+    const dMinSeqAtStart = state.dMinUserSeq || 0;
     state.runningStageIdx = stageIdx;
     renderPipeline();
     const cellSummary = document.getElementById("cell-summary");
     if (cellSummary) cellSummary.textContent = `RUNNING ${{stageId.toUpperCase()}}...`;
     appendTerminalLog(
-      `$ subhkl [${{st.name}}] — dispatching (SG=${{params.space_group}}, cell=${{params.a}},${{params.b}},${{params.c}}, λ=${{params.wavelength_min.toFixed(2)}}–${{params.wavelength_max.toFixed(2)}} Å)...\\n`,
+      `$ subhkl [${{st.name}}] — dispatching (SG=${{params.space_group}}, cell=${{params.a}},${{params.b}},${{params.c}}, λ=${{params.wavelength_min.toFixed(2)}}–${{params.wavelength_max.toFixed(2)}} Å, d_min=${{Number(params.d_min).toFixed(2)}} Å)...\\n`,
       true
     );
 
@@ -11011,17 +11095,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
         let lastPartialSeq = 0;
         let lastPartialFrame = -1;
+        let pollInFlight = false;
         galaxyBridge.pollTimer = setInterval(async () => {{
           if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) {{
             clearInterval(galaxyBridge.pollTimer);
             galaxyBridge.pollTimer = null;
             return;
           }}
+          if (pollInFlight) return;
+          pollInFlight = true;
           try {{
             const curFrame = typeof state.selectedFrameIndex === "number"
               ? state.selectedFrameIndex
               : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
-            const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}`, {{ cache: "no-store" }});
+            const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}&poll=1`, {{ cache: "no-store" }});
             if (!sr.ok) return;
             const sdoc = await sr.json();
             if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) return;
@@ -11105,10 +11192,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (finishedOk || finishedErr) {{
               clearInterval(galaxyBridge.pollTimer);
               galaxyBridge.pollTimer = null;
-              state.runningStageIdx = -1;
-              renderPipeline();
-              if (cellSummary) cellSummary.textContent = finishedOk ? "DONE" : (isCancelled ? "STOPPED" : "ERROR");
-              await probeGalaxyConnection();
               if (finishedOk) {{
                 const h5Outs = Array.isArray(aj.outputs)
                   ? aj.outputs.filter(o => o && o.id && (!o.extension || o.extension === "h5" || o.extension === "hdf5"))
@@ -11117,18 +11200,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                   selGalaxyH5.value = h5Outs[0].id;
                 }}
                 let loadedOk = false;
+                const userChangedDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart;
+                const targetDmin = userChangedDmin
+                  ? Number(state.dMin)
+                  : (Number.isFinite(params.d_min) && params.d_min > 0 ? Number(params.d_min) : Number(state.dMin));
                 try {{
                   const targetFrame = stageId === "reduce"
                     ? 0
                     : (typeof state.selectedFrameIndex === "number"
                       ? state.selectedFrameIndex
                       : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0));
-                  const payloadUrl = aj.output_h5_path
-                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}`
-                    : `api/payload?frame=${{targetFrame}}`;
+                  const dminParam = (stageId !== "reduce" && Number.isFinite(targetDmin) && targetDmin > 0)
+                    ? `&preserve_params=1&d_min=${{encodeURIComponent(targetDmin)}}`
+                    : "";
+                  const payloadUrl = (!aj.updated_payload_ready && aj.output_h5_path)
+                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}${{dminParam}}`
+                    : `api/payload?frame=${{targetFrame}}${{dminParam}}`;
                   const pr = await fetch(payloadUrl, {{ cache: "no-store" }});
+                  if (runSeq !== state.workflowRunSeq) return;
                   if (pr.ok) {{
                     const newPayload = await pr.json();
+                    if (runSeq !== state.workflowRunSeq) return;
                     if (newPayload && (Array.isArray(newPayload.panels) || Array.isArray(newPayload.peaks))) {{
                       recomputeBoundsAndReload(newPayload, {{
                         resetSelectedFrame: stageId === "reduce",
@@ -11140,8 +11232,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                           state.lamMax = Number(params.wavelength_max);
                           updateWavelengthLabels();
                         }}
-                        if (Number.isFinite(params.d_min) && params.d_min > 0) {{
-                          syncDminControls(Number(params.d_min));
+                        const finalDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart
+                          ? Number(state.dMin)
+                          : targetDmin;
+                        if (Number.isFinite(finalDmin) && finalDmin > 0) {{
+                          syncDminControls(finalDmin);
                         }}
                         updateHUD();
                       }}
@@ -11154,16 +11249,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                     }}
                   }}
                 }} catch (_re) {{}}
-                if (!loadedOk && h5Outs.length > 0) {{
+                if (!loadedOk && h5Outs.length > 0 && runSeq === state.workflowRunSeq) {{
                   await loadFromGalaxyDatasetId(h5Outs[0].id);
+                  if (runSeq !== state.workflowRunSeq) return;
                   if (stageId !== "reduce") {{
                     if (Number.isFinite(params.wavelength_min) && Number.isFinite(params.wavelength_max) && params.wavelength_max > params.wavelength_min) {{
                       state.lamMin = Number(params.wavelength_min);
                       state.lamMax = Number(params.wavelength_max);
                       updateWavelengthLabels();
                     }}
-                    if (Number.isFinite(params.d_min) && params.d_min > 0) {{
-                      syncDminControls(Number(params.d_min));
+                    const finalDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart
+                      ? Number(state.dMin)
+                      : targetDmin;
+                    if (Number.isFinite(finalDmin) && finalDmin > 0) {{
+                      syncDminControls(finalDmin);
                     }}
                     updateHUD();
                   }}
@@ -11171,8 +11270,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               }} else if (aj.error) {{
                 appendTerminalLog(`\\n[error] ${{aj.error}}`);
               }}
+              if (runSeq === state.workflowRunSeq) {{
+                state.runningStageIdx = -1;
+                renderPipeline();
+                if (cellSummary) cellSummary.textContent = finishedOk ? "DONE" : (isCancelled ? "STOPPED" : "ERROR");
+              }}
+              await probeGalaxyConnection();
             }}
-          }} catch (_pe) {{}}
+          }} catch (_pe) {{
+          }} finally {{
+            pollInFlight = false;
+          }}
         }}, 700);
       }} catch (err) {{
         state.runningStageIdx = -1;
@@ -11364,7 +11472,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     try {{
       const fetchOpts = {{ cache: "no-store" }};
       if (abortCtrl) fetchOpts.signal = abortCtrl.signal;
-      const resp = await fetch(`api/payload?frame=${{clamped}}`, fetchOpts);
+      const dminQ = (Number.isFinite(state.dMin) && state.dMin > 0) ? `&d_min=${{encodeURIComponent(state.dMin)}}` : "";
+      const resp = await fetch(`api/payload?frame=${{clamped}}${{dminQ}}`, fetchOpts);
       if (reqSeq !== state.frameRequestSeq || clamped !== state.selectedFrameIndex) return;
       if (resp.ok) {{
         const newPayload = await resp.json();

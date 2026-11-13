@@ -71,7 +71,15 @@ class MainApp:
                     self.view_model.model.subhkl.frame_index = f_idx_st
                     self.pipeline_runner.sync_frame_index(f_idx_st)
             payload = self.view_model.model.subhkl.payload or {}
-            hist_ds = self.pipeline_runner.list_history_datasets()
+            is_poll = request.rel_url.query.get("poll") == "1"
+            aj_now = self.pipeline_runner.active_job
+            aj_running = isinstance(aj_now, dict) and aj_now.get("state") in (
+                "queued",
+                "running",
+            )
+            hist_ds = self.pipeline_runner.list_history_datasets(
+                use_cached=bool(is_poll and aj_running)
+            )
             cur_h5 = (
                 self.view_model.model.subhkl.data.peaks_file
                 or self.view_model.model.subhkl.data.images_file
@@ -126,13 +134,26 @@ class MainApp:
                     f_idx = None
 
             refreshed = False
+            preserve_q = request.rel_url.query.get("preserve_params") == "1"
+            d_min_q = request.rel_url.query.get("d_min")
+            d_min_val: float | None = None
+            if d_min_q is not None and str(d_min_q).strip() != "":
+                with contextlib.suppress(ValueError, TypeError):
+                    parsed_dmin = float(d_min_q)
+                    if 0.2 <= parsed_dmin <= 20.0:
+                        d_min_val = parsed_dmin
+                        self.view_model.model.subhkl.data.d_min = parsed_dmin
+
             fp_q = request.rel_url.query.get("file_path")
             if fp_q is not None and str(fp_q).strip() != "":
                 try:
                     local_h5 = os.path.abspath(str(fp_q).strip())
                     if os.path.isfile(local_h5):
                         ds_name = os.path.basename(local_h5).lower()
-                        if any(k in ds_name for k in ("merged", "scan", "image")):
+                        is_reduce_file = any(
+                            k in ds_name for k in ("merged", "scan", "image")
+                        )
+                        if is_reduce_file:
                             _, local_h5 = (
                                 self.pipeline_runner._resolve_work_dir_and_merged(
                                     local_h5
@@ -145,15 +166,21 @@ class MainApp:
 
                             self.view_model.model.subhkl.data.peaks_file = local_h5
                             disc_img = (
-                                self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                _discover_images_h5(local_h5)
+                                or self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
                                     local_h5
                                 )
-                                or _discover_images_h5(local_h5)
                             )
                             self.view_model.model.subhkl.data.images_file = (
                                 str(disc_img) if disc_img else ""
                             )
-                        self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                        self.view_model.model.subhkl.refresh_payload(
+                            frame_index=f_idx,
+                            preserve_params=bool(
+                                (preserve_q or d_min_val is not None)
+                                and not is_reduce_file
+                            ),
+                        )
                         refreshed = True
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                     return web.json_response(
@@ -243,13 +270,39 @@ class MainApp:
                         {"status": "error", "error": str(exc)}, status=400
                     )
 
-            if f_idx is not None and not refreshed:
-                with contextlib.suppress(
-                    OSError, RuntimeError, ValueError, TypeError, KeyError
-                ):
-                    self.view_model.model.subhkl.refresh_payload(
-                        frame_index=f_idx, preserve_params=True
+            if not refreshed:
+                cur_payload = self.view_model.model.subhkl.payload
+                cur_f = (
+                    cur_payload.get("frame_index")
+                    if isinstance(cur_payload, dict)
+                    else None
+                )
+                cur_dmin = (
+                    cur_payload.get("d_min") if isinstance(cur_payload, dict) else None
+                )
+                needs_refresh = (
+                    not isinstance(cur_payload, dict)
+                    or (f_idx is not None and cur_f != f_idx)
+                    or (
+                        d_min_val is not None
+                        and (
+                            cur_dmin is None or abs(float(cur_dmin) - d_min_val) > 1e-3
+                        )
                     )
+                )
+                if needs_refresh and (f_idx is not None or d_min_val is not None):
+                    with contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ):
+                        self.view_model.model.subhkl.refresh_payload(
+                            frame_index=f_idx, preserve_params=True
+                        )
+                elif (
+                    isinstance(cur_payload, dict)
+                    and d_min_val is not None
+                    and preserve_q
+                ):
+                    cur_payload["d_min"] = round(d_min_val, 3)
             if isinstance(self.view_model.model.subhkl.payload, dict):
                 with contextlib.suppress(
                     OSError, RuntimeError, ValueError, TypeError, KeyError

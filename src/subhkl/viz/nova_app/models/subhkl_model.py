@@ -229,17 +229,22 @@ class SubhklGalaxyModel:
             replay_h5=(self.data.peaks_file if has_peaks else None),
             instrument=self.data.instrument.value,
             space_group=self.data.space_group,
-            cell=[
-                float(self.data.a),
-                float(self.data.b),
-                float(self.data.c),
-                float(self.data.alpha),
-                float(self.data.beta),
-                float(self.data.gamma),
-            ],
+            cell=(
+                None
+                if has_peaks
+                else [
+                    float(self.data.a),
+                    float(self.data.b),
+                    float(self.data.c),
+                    float(self.data.alpha),
+                    float(self.data.beta),
+                    float(self.data.gamma),
+                ]
+            ),
             wavelength_range=(
                 (saved_wl_min, saved_wl_max) if preserve_params else None
             ),
+            d_min=(saved_d_min if preserve_params else None),
             max_zone_index=self.data.max_zone_index,
             images_h5=img_path,
             frame_index=self.frame_index,
