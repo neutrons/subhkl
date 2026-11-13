@@ -5,18 +5,29 @@ from __future__ import annotations
 import contextlib
 import os
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from aiohttp import web
-from nova.mvvm.trame_binding import TrameBinding
-from trame.app import get_server
-from trame.ui.html import DivLayout
-from trame.widgets import html
-from trame_server import Server
+
+try:
+    from nova.mvvm.trame_binding import TrameBinding
+    from trame.app import get_server
+    from trame.ui.html import DivLayout
+    from trame.widgets import html
+
+    from subhkl.viz.nova_app.mvvm_factory import create_viewmodels
+except ModuleNotFoundError:  # pragma: no cover - optional `nova` extra
+    TrameBinding = None  # type: ignore[assignment,misc]
+    get_server = None  # type: ignore[assignment]
+    DivLayout = None  # type: ignore[assignment,misc]
+    html = None  # type: ignore[assignment]
+    create_viewmodels = None  # type: ignore[assignment]
 
 from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
-from subhkl.viz.nova_app.mvvm_factory import create_viewmodels
 from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+
+if TYPE_CHECKING:
+    from trame_server import Server
 
 
 class MainApp:
