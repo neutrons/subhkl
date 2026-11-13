@@ -236,7 +236,9 @@ class MainApp:
                 with contextlib.suppress(
                     OSError, RuntimeError, ValueError, TypeError, KeyError
                 ):
-                    self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
+                    self.view_model.model.subhkl.refresh_payload(
+                        frame_index=f_idx, preserve_params=True
+                    )
             if isinstance(self.view_model.model.subhkl.payload, dict):
                 with contextlib.suppress(
                     OSError, RuntimeError, ValueError, TypeError, KeyError
@@ -290,6 +292,20 @@ class MainApp:
             wl_max = float(params.get("wavelength_max", data.wavelength_max))
             params["wavelength_range"] = [wl_min, wl_max]
             params.setdefault("d_min", data.d_min)
+            d_min_req = float(params.get("d_min", data.d_min))
+            if stage_id != "reduce":
+                with contextlib.suppress(
+                    ValueError, TypeError, KeyError, AttributeError
+                ):
+                    data.wavelength_min = wl_min
+                    data.wavelength_max = wl_max
+                    data.d_min = d_min_req
+                    if isinstance(self.view_model.model.subhkl.payload, dict):
+                        self.view_model.model.subhkl.payload["wavelength_range"] = [
+                            wl_min,
+                            wl_max,
+                        ]
+                        self.view_model.model.subhkl.payload["d_min"] = d_min_req
             params.setdefault("n_zones", data.n_zones)
             params.setdefault("peaks_file", data.peaks_file)
             params.setdefault("images_file", data.images_file)
@@ -314,10 +330,13 @@ class MainApp:
                         data.wavelength_min = float(params["wavelength_min"])
                     if "wavelength_max" in params:
                         data.wavelength_max = float(params["wavelength_max"])
-                if (
+                    if "d_min" in params:
+                        data.d_min = float(params["d_min"])
+                is_reduce_out = (
                     stage_id == "reduce"
                     or "merged" in os.path.basename(new_h5_path).lower()
-                ):
+                )
+                if is_reduce_out:
                     self.view_model.model.subhkl.frame_index = 0
                     self.pipeline_runner.current_frame_index = 0
                     self.view_model.model.subhkl.data.images_file = new_h5_path
@@ -328,7 +347,8 @@ class MainApp:
                     )
                     self.view_model.model.subhkl.data.peaks_file = new_h5_path
                 self.view_model.model.subhkl.refresh_payload(
-                    frame_index=self.view_model.model.subhkl.frame_index
+                    frame_index=self.view_model.model.subhkl.frame_index,
+                    preserve_params=not is_reduce_out,
                 )
 
             try:

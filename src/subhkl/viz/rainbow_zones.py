@@ -845,7 +845,7 @@ def _extract_from_h5(
                 for x in np.asarray(f["beam/ki_vec"][()], dtype=float).ravel()[:3]
             )
 
-        wavelength_range = _get_instrument_default_wavelength(instrument)
+        wavelength_range: tuple[float, float] | None = None
         if "scan_refinement/band_wavelength" in f:
             wl = np.asarray(
                 f["scan_refinement/band_wavelength"][()], dtype=float
@@ -985,6 +985,9 @@ def _extract_from_h5(
                                 ):
                                     instrument = "MANDI"
                                     break
+
+        if wavelength_range is None:
+            wavelength_range = _get_instrument_default_wavelength(instrument)
 
         detectors = _load_detectors_from_h5(f, instrument)
 
@@ -1275,10 +1278,13 @@ def _extract_from_h5(
         solve_diagnostics: dict[str, Any] | None = None
         if any(k in f for k in ("blind_search", "scan_refinement", "solve", "search")):
             solve_diagnostics = {}
+            default_d_min = round(0.5 * float(wavelength_range[0]), 2)
             bs_grp = (
                 f["blind_search"] if "blind_search" in f else (f.get("search", None))
             )
             if bs_grp is not None:
+                if "d_min" in bs_grp.attrs:
+                    solve_diagnostics["d_min"] = float(bs_grp.attrs["d_min"])
                 solve_diagnostics["stable_observations"] = int(
                     bs_grp.attrs.get("stable_observations", 0)
                 )
@@ -1302,9 +1308,10 @@ def _extract_from_h5(
                     )
             if "scan_refinement" in f:
                 sr_grp = f["scan_refinement"]
-                default_d_min = round(0.5 * float(wavelength_range[0]), 2)
                 solve_diagnostics["d_min"] = float(
-                    sr_grp.attrs.get("d_min", default_d_min)
+                    sr_grp.attrs.get(
+                        "d_min", solve_diagnostics.get("d_min", default_d_min)
+                    )
                 )
                 solve_diagnostics["n_zones"] = int(sr_grp.attrs.get("n_zones", 400))
                 solve_diagnostics["modes"] = _decode_str(sr_grp.attrs.get("modes"), "")
@@ -1318,6 +1325,8 @@ def _extract_from_h5(
                     solve_diagnostics["stages"] = []
             elif "solve" in f:
                 s_grp = f["solve"]
+                if "d_min" in s_grp.attrs:
+                    solve_diagnostics["d_min"] = float(s_grp.attrs["d_min"])
                 solve_diagnostics["objective"] = _decode_str(
                     s_grp.attrs.get("objective"), "poisson"
                 )
@@ -2467,7 +2476,7 @@ def build_rainbow_zone_payload(
     B: np.ndarray | None = None,
     R_gonio: np.ndarray | None = None,
     ki: tuple[float, float, float] = (0.0, 0.0, 1.0),
-    wavelength_range: tuple[float, float] = (1.8, 4.5),
+    wavelength_range: tuple[float, float] | None = None,
     instrument: str = "IMAGINE",
     space_group: str = "P 1",
     cell: list[float] | None = None,
@@ -2526,7 +2535,8 @@ def build_rainbow_zone_payload(
         )
         instrument = extracted["instrument"] or instrument
         ki = extracted["ki"]
-        wavelength_range = extracted["wavelength_range"]
+        if wavelength_range is None:
+            wavelength_range = extracted["wavelength_range"]
         if U is None:
             U = extracted["U"]
         if B is None:
@@ -2575,6 +2585,8 @@ def build_rainbow_zone_payload(
         cell = fallback_cell
         if peaks_xyz is None and ub_matrix is None and U is None:
             artifact_kind = "empty"
+    if wavelength_range is None:
+        wavelength_range = (1.8, 4.5)
 
     if peaks_xyz is None:
         peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -4937,6 +4949,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const inpLmaxEl = document.getElementById("inp-lmax");
 
   function updateWavelengthLabels() {{
+    DATA.wavelength_range = [state.lamMin, state.lamMax];
     const wlReadEl = document.getElementById("wl-readout");
     if (wlReadEl) {{
       wlReadEl.textContent = `λ: ${{state.lamMin.toFixed(1)}}–${{state.lamMax.toFixed(1)}} Å`;
@@ -7207,6 +7220,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!newPayload) return;
     const isFrameSwitch = Boolean(opts && opts.isFrameSwitch);
     const resetSelectedFrame = Boolean(opts && opts.resetSelectedFrame);
+    const preserveParams = Boolean(opts && opts.preserveParams);
     if (
       isFrameSwitch &&
       typeof state.selectedFrameIndex === "number" &&
@@ -7216,6 +7230,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return;
     }}
     const isSolveRunning = state.runningStageIdx === 1 || typeof newPayload.active_rung_idx === "number";
+    const keepUserParams = isFrameSwitch || preserveParams || isSolveRunning;
     const prevZones = [...ZONES];
     const prevPeaks = [...PEAKS];
     const prevSamplePeaks = [...SAMPLE_PEAKS];
@@ -7234,12 +7249,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     DATA.space_group = newPayload.space_group || DATA.space_group;
     const defInstWl = getDefaultWavelengthForInstrument(DATA.instrument);
-    DATA.wavelength_range = (Array.isArray(newPayload.wavelength_range) && newPayload.wavelength_range.length >= 2)
-      ? newPayload.wavelength_range
-      : (Array.isArray(DATA.wavelength_range) && DATA.wavelength_range.length >= 2 ? DATA.wavelength_range : defInstWl);
     const nextArtKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
+    if (keepUserParams && Number.isFinite(state.lamMin) && Number.isFinite(state.lamMax) && state.lamMax > state.lamMin && state.lamMin > 0) {{
+      DATA.wavelength_range = [state.lamMin, state.lamMax];
+    }} else {{
+      DATA.wavelength_range = (Array.isArray(newPayload.wavelength_range) && newPayload.wavelength_range.length >= 2)
+        ? newPayload.wavelength_range
+        : (Array.isArray(DATA.wavelength_range) && DATA.wavelength_range.length >= 2 ? DATA.wavelength_range : defInstWl);
+    }}
     const wl0 = Number((DATA.wavelength_range && DATA.wavelength_range[0]) || state.lamMin || defInstWl[0]);
-    if (nextArtKind === "merged" || nextArtKind === "raw_nexus") {{
+    if (keepUserParams && Number.isFinite(state.dMin) && state.dMin > 0) {{
+      DATA.d_min = Number(state.dMin);
+    }} else if (nextArtKind === "merged" || nextArtKind === "raw_nexus") {{
       DATA.d_min = Number((0.5 * wl0).toFixed(2));
     }} else {{
       DATA.d_min = Number(newPayload.d_min || (0.5 * wl0).toFixed(2));
@@ -7548,7 +7569,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       else if (sh[1] === 512) inst = "CG4D";
     }}
 
-    let wlRangeNew = (inst === "TOPAZ") ? [0.4, 3.5] : ((inst === "MANDI") ? [2.0, 4.0] : [2.8, 4.5]);
+    let wlRangeNew = getDefaultWavelengthForInstrument(inst || DATA.instrument || "CG4D");
     let dMinNew = Number((0.5 * Number(wlRangeNew[0])).toFixed(2));
     try {{
       if (f.keys().includes("instrument")) {{
@@ -7556,6 +7577,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (wl && wl.length >= 2 && !(Math.abs(Number(wl[0]) - 2.0) < 1e-3 && Math.abs(Number(wl[1]) - 10.0) < 1e-3)) {{
           wlRangeNew = [Number(wl[0]), Number(wl[1])];
           dMinNew = Number((0.5 * Number(wlRangeNew[0])).toFixed(2));
+        }}
+      }}
+      for (const gk of ["blind_search", "search", "solve"]) {{
+        if (f.keys().includes(gk)) {{
+          const grp = f.get(gk);
+          if (grp && grp.attrs && grp.attrs["d_min"]) {{
+            dMinNew = Number(grp.attrs["d_min"].value) || dMinNew;
+          }}
         }}
       }}
       if (f.keys().includes("scan_refinement")) {{
@@ -9048,15 +9077,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const s = document.getElementById(srcId), d = document.getElementById(dstId);
         if (s && d && s.value.trim() !== "") d.value = s.value;
       }});
+      const prevInst = (DATA.instrument || "").trim();
       const instVal = (document.getElementById("nd-instrument")?.value || DATA.instrument || "CG4D").trim();
       DATA.instrument = instVal;
       const defWl = getDefaultWavelengthForInstrument(instVal);
-      state.lamMin = Number(defWl[0]);
-      state.lamMax = Number(defWl[1]);
-      DATA.wavelength_range = [state.lamMin, state.lamMax];
-      updateWavelengthLabels();
-      const autoD = Number((0.5 * state.lamMin).toFixed(2));
-      syncDminControls(autoD);
+      if (instVal !== prevInst || !Number.isFinite(state.lamMin) || !Number.isFinite(state.lamMax) || state.lamMax <= state.lamMin || state.lamMin <= 0) {{
+        state.lamMin = Number(defWl[0]);
+        state.lamMax = Number(defWl[1]);
+        DATA.wavelength_range = [state.lamMin, state.lamMax];
+        updateWavelengthLabels();
+        const autoD = Number((0.5 * state.lamMin).toFixed(2));
+        syncDminControls(autoD);
+      }} else {{
+        updateWavelengthLabels();
+        if (!Number.isFinite(state.dMin) || state.dMin <= 0) {{
+          syncDminControls(Number((0.5 * state.lamMin).toFixed(2)));
+        }}
+      }}
 
       if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
         const filesToUpload = pendingLocalNexusFiles;
@@ -9834,7 +9871,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                   if (pr.ok) {{
                     const newPayload = await pr.json();
                     if (newPayload && (Array.isArray(newPayload.panels) || Array.isArray(newPayload.peaks))) {{
-                      recomputeBoundsAndReload(newPayload, {{ resetSelectedFrame: stageId === "reduce" }});
+                      recomputeBoundsAndReload(newPayload, {{
+                        resetSelectedFrame: stageId === "reduce",
+                        preserveParams: stageId !== "reduce",
+                      }});
+                      if (stageId !== "reduce") {{
+                        if (Number.isFinite(params.wavelength_min) && Number.isFinite(params.wavelength_max) && params.wavelength_max > params.wavelength_min) {{
+                          state.lamMin = Number(params.wavelength_min);
+                          state.lamMax = Number(params.wavelength_max);
+                          updateWavelengthLabels();
+                        }}
+                        if (Number.isFinite(params.d_min) && params.d_min > 0) {{
+                          syncDminControls(Number(params.d_min));
+                        }}
+                        updateHUD();
+                      }}
                       loadedOk = true;
                       appendTerminalLog(
                         stageId === "reduce"
@@ -9846,6 +9897,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 }} catch (_re) {{}}
                 if (!loadedOk && h5Outs.length > 0) {{
                   await loadFromGalaxyDatasetId(h5Outs[0].id);
+                  if (stageId !== "reduce") {{
+                    if (Number.isFinite(params.wavelength_min) && Number.isFinite(params.wavelength_max) && params.wavelength_max > params.wavelength_min) {{
+                      state.lamMin = Number(params.wavelength_min);
+                      state.lamMax = Number(params.wavelength_max);
+                      updateWavelengthLabels();
+                    }}
+                    if (Number.isFinite(params.d_min) && params.d_min > 0) {{
+                      syncDminControls(Number(params.d_min));
+                    }}
+                    updateHUD();
+                  }}
                 }}
               }} else if (aj.error) {{
                 appendTerminalLog(`\\n[error] ${{aj.error}}`);

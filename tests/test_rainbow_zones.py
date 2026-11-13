@@ -1849,3 +1849,53 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     from subhkl.io.parser import detect_runner_hostname
 
     assert detect_runner_hostname()
+
+    # Verify d_min, lambda_min, and lambda_max preservation across solve/blind_search/search HDF5 groups,
+    # frame switches, active solve overlays, and UI stage reloads
+    blind_h5 = tmp_path / "solve.blind.h5"
+    with h5py.File(blind_h5, "w") as hf_b:
+        hf_b.attrs["instrument"] = "CG4D"
+        hf_b["sample/U"] = np.eye(3)
+        hf_b["sample/B"] = np.diag([1.0 / 68.7, 1.0 / 69.8, 1.0 / 156.9])
+        hf_b.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.85, 4.35], dtype=np.float64)
+        )
+        sgrp = hf_b.create_group("search")
+        sgrp.attrs["d_min"] = 1.95
+    ext_blind = _extract_from_h5(blind_h5)
+    assert np.allclose(ext_blind["wavelength_range"], (2.85, 4.35))
+    assert np.isclose(ext_blind["solve_diagnostics"]["d_min"], 1.95)
+
+    empty_model.data.peaks_file = str(work_merged)
+    empty_model.data.images_file = str(work_merged)
+    empty_model.refresh_payload()
+    # User sets custom UI parameters before running / re-running solve
+    empty_model.data.wavelength_min = 2.85
+    empty_model.data.wavelength_max = 4.35
+    empty_model.data.d_min = 1.95
+    p_kept = empty_model.refresh_payload(frame_index=1, preserve_params=True)
+    assert p_kept["wavelength_range"] == [2.85, 4.35]
+    assert p_kept["d_min"] == 1.95
+    assert empty_model.data.wavelength_min == 2.85
+    assert empty_model.data.wavelength_max == 4.35
+    assert empty_model.data.d_min == 1.95
+
+    runner.active_job = {
+        "stage_id": "solve",
+        "state": "running",
+        "solve_params": {
+            "instrument": "CG4D",
+            "space_group": "P 21 21 21",
+            "wavelength_range": (2.85, 4.35),
+            "d_min": 1.95,
+        },
+    }
+    ov_payload = {"wavelength_range": [2.0, 10.0], "d_min": 1.0}
+    runner.apply_active_solve_overlay(ov_payload, frame_index=0)
+    assert ov_payload["wavelength_range"] == [2.85, 4.35]
+    assert ov_payload["d_min"] == 1.95
+    assert 'preserveParams: stageId !== "reduce"' in html_doc
+    assert (
+        "const keepUserParams = isFrameSwitch || preserveParams || isSolveRunning;"
+        in html_doc
+    )

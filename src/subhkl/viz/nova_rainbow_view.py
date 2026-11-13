@@ -261,6 +261,13 @@ class NovaGalaxyPipelineRunner:
         partial_h5 = aj.get("partial_h5_path")
         images_h5 = aj.get("images_h5_path")
         sp = aj.get("solve_params") or {}
+        if sp.get("wavelength_range") and len(sp["wavelength_range"]) >= 2:
+            payload["wavelength_range"] = [
+                float(sp["wavelength_range"][0]),
+                float(sp["wavelength_range"][1]),
+            ]
+        if sp.get("d_min"):
+            payload["d_min"] = float(sp["d_min"])
         if (
             partial_h5
             and os.path.isfile(partial_h5)
@@ -2257,12 +2264,14 @@ class NovaGalaxyPipelineRunner:
                         )
 
             if stage_id == "solve":
+                d_min_solve = float(params.get("d_min") or round(0.5 * float(wl[0]), 2))
                 job_record["images_h5_path"] = merged_path
                 job_record["solve_params"] = {
                     "instrument": str(inst),
                     "space_group": str(sg),
                     "cell": [float(x) for x in raw_cell[:6]],
                     "wavelength_range": (float(wl[0]), float(wl[1])),
+                    "d_min": d_min_solve,
                 }
                 primary_tool = "imaginex_subhkl_solve"
                 scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
@@ -2279,7 +2288,7 @@ class NovaGalaxyPipelineRunner:
                     "wavelengthMin": float(wl[0]),
                     "wavelengthMax": float(wl[1]),
                     "refinement": str(params.get("objective", "band")),
-                    "dMin": float(params.get("d_min") or round(0.5 * float(wl[0]), 2)),
+                    "dMin": d_min_solve,
                 }
             elif stage_id == "integrate":
                 primary_tool = "imaginex_subhkl_predict"
@@ -4350,6 +4359,7 @@ class NovaGalaxyPipelineRunner:
                 "space_group": str(sg),
                 "cell": [float(x) for x in raw_cell[:6]],
                 "wavelength_range": (float(wl[0]), float(wl[1])),
+                "d_min": float(params.get("d_min") or round(0.5 * float(wl[0]), 2)),
             }
 
         def _stream_proc() -> None:
@@ -5905,10 +5915,30 @@ def serve_rainbow_zones(
                         ]
                     elif vm.payload.get("cell"):
                         params.setdefault("cell", vm.payload.get("cell"))
-                    if vm.payload.get("wavelength_range"):
+                    if "wavelength_min" in params and "wavelength_max" in params:
+                        params["wavelength_range"] = [
+                            float(params["wavelength_min"]),
+                            float(params["wavelength_max"]),
+                        ]
+                    elif vm.payload.get("wavelength_range"):
                         params.setdefault(
                             "wavelength_range", vm.payload.get("wavelength_range")
                         )
+                    if vm.payload.get("d_min"):
+                        params.setdefault("d_min", vm.payload.get("d_min"))
+                    if stage_id != "reduce":
+                        if params.get("wavelength_range"):
+                            wl_r = params["wavelength_range"]
+                            vm.payload["wavelength_range"] = [
+                                float(wl_r[0]),
+                                float(wl_r[1]),
+                            ]
+                            vm.payload_kwargs["wavelength_range"] = (
+                                float(wl_r[0]),
+                                float(wl_r[1]),
+                            )
+                        if params.get("d_min"):
+                            vm.payload["d_min"] = float(params["d_min"])
                     cur_imgs = vm.payload_kwargs.get("images_h5") or vm.payload.get(
                         "images_h5"
                     )
@@ -5930,12 +5960,22 @@ def serve_rainbow_zones(
                         ):
                             vm.payload_kwargs["images_h5"] = new_h5_path
                             vm.payload_kwargs["frame_index"] = 0
+                            vm.payload_kwargs.pop("wavelength_range", None)
                         else:
                             vm.payload_kwargs["frame_index"] = int(
                                 vm.pipeline_runner.current_frame_index or 0
                             )
                         vm.replay_h5 = new_h5_path
                         vm.reload()
+                        if stage_id != "reduce":
+                            if params.get("wavelength_range"):
+                                wl_r = params["wavelength_range"]
+                                vm.payload["wavelength_range"] = [
+                                    float(wl_r[0]),
+                                    float(wl_r[1]),
+                                ]
+                            if params.get("d_min"):
+                                vm.payload["d_min"] = float(params["d_min"])
 
                     result = vm.pipeline_runner.submit_galaxy_stage(
                         stage_id, params=params, on_complete_h5=_on_complete

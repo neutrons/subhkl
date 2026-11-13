@@ -190,10 +190,17 @@ class SubhklGalaxyModel:
         self.last_job_result: dict[str, Any] = {}
         self.refresh_payload()
 
-    def refresh_payload(self, frame_index: int | None = None) -> dict[str, Any] | None:
+    def refresh_payload(
+        self,
+        frame_index: int | None = None,
+        preserve_params: bool = False,
+    ) -> dict[str, Any] | None:
         """Rebuild the Diffraction Parallax & Lattice Ladder payload from current HDF5 files."""
         if frame_index is not None:
             self.frame_index = int(frame_index)
+        saved_wl_min = float(self.data.wavelength_min)
+        saved_wl_max = float(self.data.wavelength_max)
+        saved_d_min = float(self.data.d_min)
         has_peaks = bool(self.data.peaks_file and os.path.isfile(self.data.peaks_file))
         from subhkl.viz.rainbow_zones import _discover_images_h5
 
@@ -224,6 +231,9 @@ class SubhklGalaxyModel:
                 float(self.data.beta),
                 float(self.data.gamma),
             ],
+            wavelength_range=(
+                (saved_wl_min, saved_wl_max) if preserve_params else None
+            ),
             max_zone_index=self.data.max_zone_index,
             images_h5=img_path,
             frame_index=self.frame_index,
@@ -247,17 +257,27 @@ class SubhklGalaxyModel:
         sg = self.payload.get("space_group")
         if sg and sg not in ("Unknown", "P 1"):
             self.data.space_group = str(sg)
-        wl_range = self.payload.get("wavelength_range") or []
-        if len(wl_range) >= 2 and float(wl_range[1]) > float(wl_range[0]) > 0:
-            self.data.wavelength_min = round(float(wl_range[0]), 3)
-            self.data.wavelength_max = round(float(wl_range[1]), 3)
-        if (
-            self.payload.get("artifact_kind") in ("merged", "raw_nexus")
-            and len(wl_range) >= 2
-        ):
-            self.data.d_min = round(0.5 * float(wl_range[0]), 2)
-        elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
-            self.data.d_min = round(float(self.payload["d_min"]), 2)
+        if preserve_params:
+            self.data.wavelength_min = round(saved_wl_min, 3)
+            self.data.wavelength_max = round(saved_wl_max, 3)
+            self.data.d_min = round(saved_d_min, 2)
+            self.payload["wavelength_range"] = [
+                self.data.wavelength_min,
+                self.data.wavelength_max,
+            ]
+            self.payload["d_min"] = self.data.d_min
+        else:
+            wl_range = self.payload.get("wavelength_range") or []
+            if len(wl_range) >= 2 and float(wl_range[1]) > float(wl_range[0]) > 0:
+                self.data.wavelength_min = round(float(wl_range[0]), 3)
+                self.data.wavelength_max = round(float(wl_range[1]), 3)
+            if (
+                self.payload.get("artifact_kind") in ("merged", "raw_nexus")
+                and len(wl_range) >= 2
+            ):
+                self.data.d_min = round(0.5 * float(wl_range[0]), 2)
+            elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
+                self.data.d_min = round(float(self.payload["d_min"]), 2)
         return self.payload
 
     def render_html(self) -> str:
