@@ -30,6 +30,8 @@ from datetime import UTC
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
+import numpy as np
+
 from subhkl import get_container_image
 from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
 from subhkl.viz.rainbow_zones import (
@@ -705,6 +707,299 @@ class NovaGalaxyPipelineRunner:
         self._dataset_touch_times = touch_map
 
     @staticmethod
+    def _normalize_cell_meta(
+        cell: Any,
+        space_group: Any = "",
+        instrument: Any = "",
+    ) -> dict[str, Any] | None:
+        if not isinstance(cell, (list, tuple)) or len(cell) < 6:
+            return None
+        try:
+            vals = [round(float(x), 5) for x in cell[:6]]
+        except (TypeError, ValueError):
+            return None
+        if any(not np.isfinite(v) or v <= 0.0 for v in vals):
+            return None
+        if any(v >= 180.0 for v in vals[3:6]):
+            return None
+        sg_str = str(space_group or "").strip()
+        inst_str = str(instrument or "").strip()
+        res: dict[str, Any] = {
+            "cell": vals,
+            "space_group": sg_str,
+        }
+        if inst_str:
+            res["instrument"] = inst_str
+        return res
+
+    @classmethod
+    def _parse_dataset_annotation_meta(
+        cls, annotation: Any, tags: Any = None
+    ) -> dict[str, Any] | None:
+        if isinstance(annotation, dict):
+            if "annotation" in annotation or "tags" in annotation:
+                if tags is None:
+                    tags = annotation.get("tags")
+                annotation = annotation.get("annotation")
+            else:
+                cand = cls._normalize_cell_meta(
+                    annotation.get("subhkl_cell") or annotation.get("cell"),
+                    annotation.get("space_group"),
+                    annotation.get("instrument"),
+                )
+                if cand:
+                    return cand
+        if isinstance(annotation, str):
+            s = annotation.strip()
+            if s.startswith("{") and s.endswith("}"):
+                with contextlib.suppress(ValueError, TypeError):
+                    doc = json.loads(s)
+                    if isinstance(doc, dict):
+                        cand = cls._normalize_cell_meta(
+                            doc.get("subhkl_cell") or doc.get("cell"),
+                            doc.get("space_group"),
+                            doc.get("instrument"),
+                        )
+                        if cand:
+                            return cand
+        if isinstance(tags, list):
+            for t in tags:
+                ts = str(t or "").strip()
+                if ts.startswith("subhkl_cell:"):
+                    parts = ts[len("subhkl_cell:") :].split(":")
+                    if len(parts) >= 1:
+                        with contextlib.suppress(ValueError, TypeError):
+                            c_vals = [
+                                float(x) for x in parts[0].split(",") if x.strip()
+                            ]
+                            sg_tag = (
+                                parts[1].replace("_", " ") if len(parts) > 1 else ""
+                            )
+                            inst_tag = parts[2] if len(parts) > 2 else ""
+                            cand = cls._normalize_cell_meta(c_vals, sg_tag, inst_tag)
+                            if cand:
+                                return cand
+        return None
+
+    @classmethod
+    def _extract_cell_meta_from_local_file(
+        cls, path: str | None
+    ) -> dict[str, Any] | None:
+        if not path or not os.path.isfile(str(path)):
+            return None
+        p_str = str(path)
+        low = p_str.lower()
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            if low.endswith(".mtz"):
+                import gemmi
+
+                mtz = gemmi.read_mtz_file(p_str)
+                c_params = list(mtz.cell.parameters)
+                sg_hm = mtz.spacegroup.hm if mtz.spacegroup else ""
+                return cls._normalize_cell_meta(c_params, sg_hm, "")
+            import h5py
+
+            with h5py.File(p_str, "r") as hf:
+                raw_cell: list[float] | None = None
+                if all(
+                    f"sample/{k}" in hf
+                    for k in ("a", "b", "c", "alpha", "beta", "gamma")
+                ):
+                    raw_cell = [
+                        float(np.asarray(hf[f"sample/{k}"][()]).flat[0])
+                        for k in ("a", "b", "c", "alpha", "beta", "gamma")
+                    ]
+                elif "sample/B" in hf:
+                    from subhkl.viz.rainbow_zones import cell_params_from_B
+
+                    B = np.asarray(hf["sample/B"][()], dtype=np.float64)
+                    if B.shape == (3, 3):
+                        raw_cell = list(cell_params_from_B(B))
+                if not raw_cell:
+                    return None
+                sg_val = ""
+                for sk in ("space_group", "sample/space_group"):
+                    if sk in hf:
+                        v = hf[sk][()]
+                        if hasattr(v, "flat") and v.size > 0:
+                            v = v.flat[0]
+                        sg_val = (
+                            v.decode("utf-8", "replace")
+                            if isinstance(v, (bytes, np.bytes_))
+                            else str(v)
+                        ).strip()
+                        if sg_val:
+                            break
+                if not sg_val and "space_group" in hf.attrs:
+                    av = hf.attrs["space_group"]
+                    sg_val = (
+                        av.decode("utf-8", "replace")
+                        if isinstance(av, (bytes, np.bytes_))
+                        else str(av)
+                    ).strip()
+                inst_val = ""
+                if "instrument" in hf.attrs:
+                    iv = hf.attrs["instrument"]
+                    inst_val = (
+                        iv.decode("utf-8", "replace")
+                        if isinstance(iv, (bytes, np.bytes_))
+                        else str(iv)
+                    ).strip()
+                elif "instrument/name" in hf:
+                    iv = hf["instrument/name"][()]
+                    if hasattr(iv, "flat") and iv.size > 0:
+                        iv = iv.flat[0]
+                    inst_val = (
+                        iv.decode("utf-8", "replace")
+                        if isinstance(iv, (bytes, np.bytes_))
+                        else str(iv)
+                    ).strip()
+                elif "instrument" in hf and isinstance(hf["instrument"], h5py.Dataset):
+                    iv = hf["instrument"][()]
+                    if hasattr(iv, "flat") and iv.size > 0:
+                        iv = iv.flat[0]
+                    inst_val = (
+                        iv.decode("utf-8", "replace")
+                        if isinstance(iv, (bytes, np.bytes_))
+                        else str(iv)
+                    ).strip()
+                return cls._normalize_cell_meta(raw_cell, sg_val, inst_val)
+        return None
+
+    def attach_dataset_cell_metadata(
+        self,
+        ds_id: str | None,
+        cell: Any,
+        space_group: str | None = "",
+        instrument: str | None = "",
+        *,
+        sync_remote: bool = True,
+    ) -> dict[str, Any] | None:
+        """Attach unit cell + space group metadata to a Galaxy dataset ID (in-memory + Galaxy HDA annotation)."""
+        import re as _re
+
+        if not ds_id:
+            return None
+        meta = self._normalize_cell_meta(cell, space_group, instrument)
+        if not meta:
+            return None
+        ds_key = str(ds_id).strip()
+        cell_map: dict[str, dict[str, Any]] = getattr(self, "_dataset_cell_meta", {})
+        prev = cell_map.get(ds_key)
+        if prev and not meta.get("space_group") and prev.get("space_group"):
+            meta["space_group"] = prev["space_group"]
+        if prev and not meta.get("instrument") and prev.get("instrument"):
+            meta["instrument"] = prev["instrument"]
+        cell_map[ds_key] = meta
+        self._dataset_cell_meta = cell_map
+
+        if (
+            sync_remote
+            and self.is_connected
+            and self.history_id
+            and _re.match(r"^[0-9a-fA-F]{8,}$", ds_key)
+        ):
+            synced_map: dict[str, dict[str, Any]] = getattr(
+                self, "_dataset_remote_synced_meta", {}
+            )
+            if synced_map.get(ds_key) != meta:
+                synced_map[ds_key] = dict(meta)
+                self._dataset_remote_synced_meta = synced_map
+                ann_doc: dict[str, Any] = {
+                    "subhkl_cell": meta["cell"],
+                    "space_group": meta.get("space_group") or "",
+                }
+                if meta.get("instrument"):
+                    ann_doc["instrument"] = meta["instrument"]
+                ann_str = json.dumps(ann_doc, separators=(",", ":"))
+                hist_id = str(self.history_id)
+
+                def _push_ann() -> None:
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                        self._api_request(
+                            "PUT",
+                            f"/api/histories/{hist_id}/contents/{ds_key}",
+                            payload={"annotation": ann_str},
+                            timeout=5.0,
+                        )
+
+                threading.Thread(target=_push_ann, daemon=True).start()
+        return meta
+
+    def attach_dataset_cell_metadata_from_file(
+        self,
+        ds_id: str | None,
+        local_path: str | None,
+        fallback_params: dict[str, Any] | None = None,
+        *,
+        sync_remote: bool = True,
+    ) -> dict[str, Any] | None:
+        if not ds_id:
+            return None
+        meta = self._extract_cell_meta_from_local_file(local_path)
+        params = fallback_params or {}
+        if not meta and params:
+            raw_cell = params.get("cell")
+            if not (isinstance(raw_cell, (list, tuple)) and len(raw_cell) >= 6) and all(
+                k in params for k in ("a", "b", "c", "alpha", "beta", "gamma")
+            ):
+                with contextlib.suppress(TypeError, ValueError):
+                    raw_cell = [
+                        float(params["a"]),
+                        float(params["b"]),
+                        float(params["c"]),
+                        float(params["alpha"]),
+                        float(params["beta"]),
+                        float(params["gamma"]),
+                    ]
+            meta = self._normalize_cell_meta(
+                raw_cell,
+                params.get("space_group"),
+                params.get("instrument"),
+            )
+        elif meta and params:
+            if not meta.get("space_group") and params.get("space_group"):
+                meta["space_group"] = str(params["space_group"]).strip()
+            if not meta.get("instrument") and params.get("instrument"):
+                meta["instrument"] = str(params["instrument"]).strip()
+        if not meta:
+            return None
+        return self.attach_dataset_cell_metadata(
+            ds_id,
+            meta["cell"],
+            meta.get("space_group"),
+            meta.get("instrument"),
+            sync_remote=sync_remote,
+        )
+
+    def _local_cached_files_by_ds_id(self) -> dict[str, str]:
+        """Return a fast mapping of ds_id -> cached local file path in /tmp."""
+        import re as _re
+
+        tmp_dir = tempfile.gettempdir()
+        with contextlib.suppress(OSError):
+            mtime = os.stat(tmp_dir).st_mtime_ns
+            cached_pair = getattr(self, "_tmp_gx_index_cache", None)
+            if (
+                isinstance(cached_pair, tuple)
+                and len(cached_pair) == 2
+                and cached_pair[0] == mtime
+            ):
+                return cached_pair[1]
+            mapping: dict[str, str] = {}
+            for fn in os.listdir(tmp_dir):
+                if not fn.startswith("subhkl_gx_"):
+                    continue
+                m = _re.match(r"^subhkl_gx_([0-9a-fA-F]{8,})_", fn)
+                if m:
+                    ds_id = m.group(1)
+                    if ds_id not in mapping or fn.endswith((".h5", ".mtz")):
+                        mapping[ds_id] = os.path.join(tmp_dir, fn)
+            self._tmp_gx_index_cache = (mtime, mapping)
+            return mapping
+        return {}
+
+    @staticmethod
     def _parse_galaxy_timestamp(ts_str: str | None) -> float:
         if not ts_str:
             return 0.0
@@ -722,7 +1017,7 @@ class NovaGalaxyPipelineRunner:
             return float(dt.timestamp())
         return 0.0
 
-    def list_history_datasets(self) -> list[dict[str, Any]]:
+    def list_history_datasets(self, limit: int | None = None) -> list[dict[str, Any]]:
         """Return active datasets in the current Galaxy history, sorted most-recently-touched first."""
         if not self.is_connected:
             return []
@@ -733,13 +1028,25 @@ class NovaGalaxyPipelineRunner:
         try:
             items = self._api_request(
                 "GET",
-                f"/api/histories/{self.history_id}/contents?v=dev&q=deleted&qv=false",
+                (
+                    f"/api/histories/{self.history_id}/contents"
+                    "?v=dev&q=deleted&qv=false"
+                    "&keys=id,name,hid,state,extension,deleted,history_content_type,update_time,create_time,tags,annotation"
+                ),
             )
             if not isinstance(items, list):
                 return []
             from subhkl.viz.rainbow_zones import infer_dataset_extension
 
             touch_map: dict[str, float] = getattr(self, "_dataset_touch_times", {})
+            cell_map: dict[str, dict[str, Any]] = getattr(
+                self, "_dataset_cell_meta", {}
+            )
+            probed_local: set[str] = getattr(self, "_probed_local_cell_ds_ids", set())
+            local_by_id = self._local_cached_files_by_ds_id()
+            synced_map: dict[str, dict[str, Any]] = getattr(
+                self, "_dataset_remote_synced_meta", {}
+            )
             out: list[dict[str, Any]] = []
             for it in items:
                 if (
@@ -753,17 +1060,37 @@ class NovaGalaxyPipelineRunner:
                 ut_epoch = self._parse_galaxy_timestamp(ut_str)
                 touched_at = max(ut_epoch, float(touch_map.get(ds_id, 0.0)))
                 ext_norm = infer_dataset_extension(it.get("name"), it.get("extension"))
-                out.append(
-                    {
-                        "id": it.get("id"),
-                        "hid": it.get("hid"),
-                        "name": it.get("name"),
-                        "state": it.get("state"),
-                        "extension": ext_norm,
-                        "update_time": ut_str,
-                        "touched_at": round(touched_at, 3),
-                    }
+                cell_meta = self._parse_dataset_annotation_meta(
+                    it.get("annotation"), it.get("tags")
                 )
+                if cell_meta and ds_id:
+                    cell_map[ds_id] = cell_meta
+                    synced_map[ds_id] = dict(cell_meta)
+                elif ds_id in cell_map:
+                    cell_meta = cell_map[ds_id]
+                elif ds_id and ds_id in local_by_id and ds_id not in probed_local:
+                    probed_local.add(ds_id)
+                    cell_meta = self.attach_dataset_cell_metadata_from_file(
+                        ds_id, local_by_id[ds_id], sync_remote=True
+                    )
+                entry: dict[str, Any] = {
+                    "id": it.get("id"),
+                    "hid": it.get("hid"),
+                    "name": it.get("name"),
+                    "state": it.get("state"),
+                    "extension": ext_norm,
+                    "update_time": ut_str,
+                    "touched_at": round(touched_at, 3),
+                }
+                if cell_meta:
+                    entry["cell"] = cell_meta["cell"]
+                    entry["space_group"] = cell_meta.get("space_group") or ""
+                    if cell_meta.get("instrument"):
+                        entry["instrument"] = cell_meta["instrument"]
+                out.append(entry)
+            self._dataset_cell_meta = cell_map
+            self._probed_local_cell_ds_ids = probed_local
+            self._dataset_remote_synced_meta = synced_map
             out.sort(
                 key=lambda d: (
                     float(d.get("touched_at") or 0.0),
@@ -771,6 +1098,8 @@ class NovaGalaxyPipelineRunner:
                 ),
                 reverse=True,
             )
+            if isinstance(limit, int) and limit > 0:
+                return out[:limit]
             return out
         except _NOVA_RECOVERABLE_ERRORS:
             return []
@@ -799,6 +1128,7 @@ class NovaGalaxyPipelineRunner:
             known_map[os.path.realpath(path)] = ds_id
             self._dataset_id_by_path = known_map
             self.touch_dataset(ds_id)
+            self.attach_dataset_cell_metadata_from_file(ds_id, path, sync_remote=True)
             return path
 
         file_name = str(info.get("file_name") or "")
@@ -1969,6 +2299,11 @@ class NovaGalaxyPipelineRunner:
                             known_map[os.path.abspath(local_path)] = known_id
                             self._dataset_id_by_path = known_map
                             self.touch_dataset(known_id)
+                            self.attach_dataset_cell_metadata_from_file(
+                                known_id,
+                                local_path,
+                                fallback_params=job_record.get("params"),
+                            )
                             job_record["stdout"] += (
                                 f"[nova -> galaxy] Linked cached dataset '{fname}' (id={known_id}, state=ok)\n"
                             )
@@ -2046,6 +2381,11 @@ class NovaGalaxyPipelineRunner:
                         known_map[os.path.abspath(local_path)] = ds_id
                         self._dataset_id_by_path = known_map
                         self.touch_dataset(ds_id)
+                        self.attach_dataset_cell_metadata_from_file(
+                            ds_id,
+                            local_path,
+                            fallback_params=job_record.get("params"),
+                        )
                         job_record["stdout"] += (
                             f"[nova -> galaxy] Linked existing dataset '{info.get('name') or sname}' (id={ds_id}, state=ok)\n"
                         )
@@ -2109,6 +2449,12 @@ class NovaGalaxyPipelineRunner:
                     os.link(local_path, cache_dest)
                 except OSError:
                     shutil.copy2(local_path, cache_dest)
+        self.touch_dataset(ds_id)
+        self.attach_dataset_cell_metadata_from_file(
+            ds_id,
+            local_path,
+            fallback_params=job_record.get("params"),
+        )
         job_record["stdout"] += (
             f"[nova -> galaxy] Saved '{fname}' in Galaxy history (id={ds_id})\n"
         )
@@ -5166,6 +5512,11 @@ class NovaGalaxyPipelineRunner:
 
                                 if final_step and tmp_path and os.path.isfile(tmp_path):
                                     self.touch_dataset(ds_id)
+                                    self.attach_dataset_cell_metadata_from_file(
+                                        ds_id,
+                                        tmp_path,
+                                        fallback_params=job_record.get("params"),
+                                    )
                                     known_map = getattr(self, "_dataset_id_by_path", {})
                                     known_map[os.path.abspath(tmp_path)] = ds_id
                                     if (

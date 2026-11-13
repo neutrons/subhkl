@@ -27,6 +27,7 @@ import glob
 import io
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -142,6 +143,182 @@ def default_projection_for_instrument(instrument: str | None) -> str:
     if instrument and str(instrument).strip().upper() in SPHERICAL_INSTRUMENTS:
         return "spherical"
     return "cylindrical"
+
+
+_UNIT_CELL_NUM_PAT = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?"
+_UNIT_CELL_SIX_FRONT_RE = re.compile(
+    rf"^\s*((?:{_UNIT_CELL_NUM_PAT}[\s,;]+){{5}}{_UNIT_CELL_NUM_PAT})(?:\s*[,;|]?\s*(.*))?$",
+    re.IGNORECASE,
+)
+_UNIT_CELL_SIX_BACK_RE = re.compile(
+    rf"^(.*?)(?:[\s,;|]+)((?:{_UNIT_CELL_NUM_PAT}[\s,;]+){{5}}{_UNIT_CELL_NUM_PAT})\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_unit_cell_text(text: str | None) -> dict[str, Any] | None:
+    """Parse clipboard or freeform unit-cell text into ``{'cell': [a,b,c,alpha,beta,gamma], 'space_group': str}``.
+
+    Supports:
+    - 6 numbers followed by space group (e.g. ``'68.84174 98.06962 90.91568 90.07304 106.11396 90.0088 P21'``)
+    - Space group followed by 6 numbers (e.g. ``'P 21 21 21 68.7 69.8 156.9 90 90 90'``)
+    - 6 numbers alone (e.g. ``'68.84 98.07 90.92 90.07 106.11 90.0'``)
+    """
+    if not text or not isinstance(text, str):
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    s = re.sub(r"^[\[\(\{]+|[\]\)\}]+$", "", s).strip()
+    s = re.sub(
+        r"\b(?:a|b|c|alpha|beta|gamma|sg|space_group|spacegroup)\s*=\s*",
+        " ",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"[αβγ]\s*=\s*", " ", s)
+    s = re.sub(r"(?<=\d)\s*(?:°|deg|Å|angstrom)\b", "", s, flags=re.IGNORECASE)
+    s = s.replace("°", " ").strip()
+
+    def _validate_six(nums_str: str) -> list[float] | None:
+        try:
+            vals = [float(x) for x in re.findall(_UNIT_CELL_NUM_PAT, nums_str)]
+        except ValueError:
+            return None
+        if len(vals) != 6:
+            return None
+        if any(not np.isfinite(v) or v <= 0.0 for v in vals[:3]):
+            return None
+        if any(not np.isfinite(v) or v <= 10.0 or v >= 180.0 for v in vals[3:6]):
+            return None
+        return vals
+
+    m_front = _UNIT_CELL_SIX_FRONT_RE.match(s)
+    if m_front:
+        cell = _validate_six(m_front.group(1))
+        if cell is not None:
+            sg = (m_front.group(2) or "").strip(" ,;|\t\r\n")
+            return {"cell": cell, "space_group": sg}
+
+    m_back = _UNIT_CELL_SIX_BACK_RE.match(s)
+    if m_back:
+        cell = _validate_six(m_back.group(2))
+        if cell is not None:
+            sg = (m_back.group(1) or "").strip(" ,;|\t\r\n")
+            return {"cell": cell, "space_group": sg}
+
+    return None
+
+
+def _symmetry_rules_for_setting(
+    crystal_system: str,
+    setting: str,
+    hm: str = "",
+    number: int | None = None,
+) -> dict[str, Any]:
+    linked_lengths: dict[str, str] = {}
+    linked_angles: dict[str, str] = {}
+    fixed_angles: dict[str, float] = {}
+
+    if setting == "cubic":
+        linked_lengths = {"b": "a", "c": "a"}
+        fixed_angles = {"alpha": 90.0, "beta": 90.0, "gamma": 90.0}
+    elif setting == "tetragonal":
+        linked_lengths = {"b": "a"}
+        fixed_angles = {"alpha": 90.0, "beta": 90.0, "gamma": 90.0}
+    elif setting in ("hexagonal", "trigonal"):
+        linked_lengths = {"b": "a"}
+        fixed_angles = {"alpha": 90.0, "beta": 90.0, "gamma": 120.0}
+    elif setting == "trigonal_r":
+        linked_lengths = {"b": "a", "c": "a"}
+        linked_angles = {"beta": "alpha", "gamma": "alpha"}
+    elif setting == "orthorhombic":
+        fixed_angles = {"alpha": 90.0, "beta": 90.0, "gamma": 90.0}
+    elif setting == "monoclinic_b":
+        fixed_angles = {"alpha": 90.0, "gamma": 90.0}
+    elif setting == "monoclinic_c":
+        fixed_angles = {"alpha": 90.0, "beta": 90.0}
+    elif setting == "monoclinic_a":
+        fixed_angles = {"beta": 90.0, "gamma": 90.0}
+
+    return {
+        "crystal_system": crystal_system,
+        "setting": setting,
+        "hm": hm,
+        "number": number,
+        "linked_lengths": linked_lengths,
+        "linked_angles": linked_angles,
+        "fixed_angles": fixed_angles,
+    }
+
+
+def resolve_space_group_symmetry(space_group: str | None) -> dict[str, Any]:
+    """Resolve crystal system and unit-cell parameter constraints for ``space_group``."""
+    raw = str(space_group or "").strip()
+    if not raw:
+        return _symmetry_rules_for_setting("triclinic", "triclinic", "", None)
+    with contextlib.suppress(Exception):
+        import gemmi
+
+        sg = None
+        if raw.isdigit():
+            num = int(raw)
+            if 1 <= num <= 230:
+                sg = gemmi.find_spacegroup_by_number(num)
+        if sg is None:
+            sg = gemmi.find_spacegroup_by_name(raw)
+        if sg is not None:
+            cs = sg.crystal_system_str()
+            if cs == "trigonal" and (sg.ext == "R" or raw.lower().endswith(":r")):
+                setting = "trigonal_r"
+            elif cs == "monoclinic":
+                parts = sg.hm.split()
+                if len(parts) == 4 and parts[1] == "1" and parts[3] != "1":
+                    setting = "monoclinic_c"
+                elif len(parts) == 4 and parts[1] != "1" and parts[3] == "1":
+                    setting = "monoclinic_a"
+                else:
+                    setting = "monoclinic_b"
+            else:
+                setting = cs
+            return _symmetry_rules_for_setting(cs, setting, sg.xhm(), sg.number)
+    return _symmetry_rules_for_setting("triclinic", "triclinic", raw, None)
+
+
+_CACHED_SG_SYMMETRY_JSON: str | None = None
+
+
+def _build_space_group_symmetry_lookup_json() -> str:
+    """Build a compact JSON mapping of crystal-system settings to normalized space-group keys."""
+    global _CACHED_SG_SYMMETRY_JSON
+    if _CACHED_SG_SYMMETRY_JSON is not None:
+        return _CACHED_SG_SYMMETRY_JSON
+    groups: dict[str, set[str]] = {}
+    with contextlib.suppress(Exception):
+        import gemmi
+
+        for sg in gemmi.spacegroup_table():
+            cs = sg.crystal_system_str()
+            if cs == "trigonal" and sg.ext == "R":
+                code = "trigonal_r"
+            elif cs == "monoclinic":
+                parts = sg.hm.split()
+                if len(parts) == 4 and parts[1] == "1" and parts[3] != "1":
+                    code = "monoclinic_c"
+                elif len(parts) == 4 and parts[1] != "1" and parts[3] == "1":
+                    code = "monoclinic_a"
+                else:
+                    code = "monoclinic_b"
+            else:
+                code = cs
+            for k in (sg.xhm(), sg.hm, sg.short_name()):
+                norm = k.lower().replace(" ", "")
+                if norm:
+                    groups.setdefault(code, set()).add(norm)
+    _CACHED_SG_SYMMETRY_JSON = json.dumps(
+        {k: sorted(v) for k, v in groups.items()}, separators=(",", ":")
+    )
+    return _CACHED_SG_SYMMETRY_JSON
 
 
 def _decode_str(val: Any, default: str = "") -> str:
@@ -3598,6 +3775,7 @@ def render_rainbow_html(
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
     init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
     init_dmin = float(payload.get("d_min") or round(0.5 * init_wl_min, 2))
+    sg_symmetry_groups_json = _build_space_group_symmetry_lookup_json()
     ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
     base_tag_html = (
         f'<base href="{ep_env}/" />\n' if ep_env and ep_env.startswith("/") else ""
@@ -4562,7 +4740,7 @@ def render_rainbow_html(
       </div>
     </div>
     <div id="params-drawer" class="params-drawer">
-      <span>SG <input id="inp-sg" type="text" value="{sg}" style="width:78px;" /></span>
+      <span>SG <input id="inp-sg" type="text" list="subhkl-sg-datalist" value="{sg}" style="width:78px;" title="Space group (determines crystal system symmetry constraints for unit cell parameters; paste full unit cell in any field)" /></span>
       <span>a <input id="inp-a" type="number" step="0.1" value="68.7" /></span>
       <span>b <input id="inp-b" type="number" step="0.1" value="69.8" /></span>
       <span>c <input id="inp-c" type="number" step="0.1" value="156.9" /></span>
@@ -4687,43 +4865,79 @@ def render_rainbow_html(
       </div>
 
       <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;padding:8px 10px;margin-bottom:10px;">
-        <div style="font-family:var(--font-display);font-size:0.66rem;color:var(--accent-gold);margin-bottom:6px;">
-          SAMPLE UNIT CELL (LENGTHS &amp; ANGLES) &amp; SPACE GROUP
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:6px;">
+          <div style="display:flex;align-items:center;gap:8px;min-width:0;">
+            <span style="font-family:var(--font-display);font-size:0.66rem;color:var(--accent-gold);">
+              SAMPLE UNIT CELL (LENGTHS &amp; ANGLES) &amp; SPACE GROUP
+            </span>
+            <span id="nd-symmetry-badge" style="font-family:var(--font-display);font-size:0.58rem;padding:1px 6px;border-radius:4px;border:1px solid rgba(56,189,248,0.35);background:rgba(56,189,248,0.1);color:var(--accent-cyan);white-space:nowrap;" title="Crystal system symmetry constraints automatically lock/mirror linked lengths and fixed angles">
+              Paste cell in any field
+            </span>
+          </div>
+          <select id="nd-cell-history-select" title="Auto-fill unit cell &amp; space group from previously touched Galaxy datasets or recent history" style="max-width:300px;background:#070913;color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:2px 6px;font-family:var(--font-display);font-size:0.63rem;">
+            <option value="">Recent Unit Cells (Galaxy History)…</option>
+          </select>
         </div>
+        <datalist id="subhkl-sg-datalist">
+          <option value="P 1"></option>
+          <option value="P 21"></option>
+          <option value="C 2"></option>
+          <option value="P 21 21 21"></option>
+          <option value="P 21 21 2"></option>
+          <option value="C 2 2 21"></option>
+          <option value="F d d 2"></option>
+          <option value="P 41 21 2"></option>
+          <option value="P 43 21 2"></option>
+          <option value="I 41/a"></option>
+          <option value="P 31 2 1"></option>
+          <option value="P 32 2 1"></option>
+          <option value="R 3 :H"></option>
+          <option value="R 3 :R"></option>
+          <option value="R -3 m :R"></option>
+          <option value="P 61 2 2"></option>
+          <option value="P 65 2 2"></option>
+          <option value="P 63/m m c"></option>
+          <option value="I 2 3"></option>
+          <option value="P 21 3"></option>
+          <option value="F d -3 m"></option>
+          <option value="I a -3 d"></option>
+          <option value="F m -3 m"></option>
+        </datalist>
         <!-- Row 1: Space group + Unit cell lengths a, b, c -->
         <div style="display:grid;grid-template-columns:1.3fr repeat(3,minmax(0,1fr));gap:8px;margin-bottom:6px;">
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             SPACE GROUP
-            <input id="nd-sg" type="text" value="" placeholder="e.g. P 21 21 21 or F d d 2" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-sg" type="text" value="" list="subhkl-sg-datalist" placeholder="e.g. P 21 21 21 or Ia-3d" title="Enter space group or paste full unit cell (e.g. '68.84 98.07 90.92 90.07 106.11 90.01 P21')" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            a (Å)
+            <span id="nd-lbl-a">a (Å)</span>
             <input id="nd-a" type="number" step="0.01" value="" placeholder="a" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            b (Å)
+            <span id="nd-lbl-b">b (Å)</span>
             <input id="nd-b" type="number" step="0.01" value="" placeholder="b" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            c (Å)
+            <span id="nd-lbl-c">c (Å)</span>
             <input id="nd-c" type="number" step="0.01" value="" placeholder="c" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
         <!-- Row 2: Unit cell angles alpha, beta, gamma -->
-        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:8px;">
+        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:6px;">
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            α (°)
+            <span id="nd-lbl-alpha">α (°)</span>
             <input id="nd-alpha" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            β (°)
+            <span id="nd-lbl-beta">β (°)</span>
             <input id="nd-beta" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            γ (°)
+            <span id="nd-lbl-gamma">γ (°)</span>
             <input id="nd-gamma" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
+        <div id="nd-cell-suggestions" style="display:none;flex-wrap:wrap;align-items:center;gap:5px;margin-bottom:6px;padding:4px 6px;border-radius:4px;background:rgba(7,9,19,0.75);border:1px dashed rgba(56,189,248,0.35);"></div>
         <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px;">
           Preview: specify IPTS + run range or explicit file path(s)
         </div>
@@ -4808,6 +5022,145 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     "WAND²": [1.44, 1.54],
     DEMAND: [1.50, 1.60],
   }};
+  const SG_SYMMETRY_GROUPS = {sg_symmetry_groups_json};
+  const SG_SYMMETRY_LOOKUP = (() => {{
+    const map = Object.create(null);
+    Object.entries(SG_SYMMETRY_GROUPS || {{}}).forEach(([setting, list]) => {{
+      if (Array.isArray(list)) {{
+        list.forEach(k => {{
+          if (k) map[String(k).toLowerCase()] = setting;
+        }});
+      }}
+    }});
+    return map;
+  }})();
+
+  function symmetryRulesForSetting(crystalSystem, setting) {{
+    let linked_lengths = {{}};
+    let linked_angles = {{}};
+    let fixed_angles = {{}};
+    let summary = crystalSystem.toUpperCase();
+    if (setting === "cubic") {{
+      linked_lengths = {{ b: "a", c: "a" }};
+      fixed_angles = {{ alpha: 90, beta: 90, gamma: 90 }};
+      summary = "CUBIC • a=b=c, α=β=γ=90°";
+    }} else if (setting === "tetragonal") {{
+      linked_lengths = {{ b: "a" }};
+      fixed_angles = {{ alpha: 90, beta: 90, gamma: 90 }};
+      summary = "TETRAGONAL • a=b, α=β=γ=90°";
+    }} else if (setting === "hexagonal" || setting === "trigonal") {{
+      linked_lengths = {{ b: "a" }};
+      fixed_angles = {{ alpha: 90, beta: 90, gamma: 120 }};
+      summary = `${{crystalSystem.toUpperCase()}} • a=b, α=β=90°, γ=120°`;
+    }} else if (setting === "trigonal_r") {{
+      linked_lengths = {{ b: "a", c: "a" }};
+      linked_angles = {{ beta: "alpha", gamma: "alpha" }};
+      summary = "RHOMBOHEDRAL (:R) • a=b=c, α=β=γ";
+    }} else if (setting === "orthorhombic") {{
+      fixed_angles = {{ alpha: 90, beta: 90, gamma: 90 }};
+      summary = "ORTHORHOMBIC • α=β=γ=90°";
+    }} else if (setting === "monoclinic_b") {{
+      fixed_angles = {{ alpha: 90, gamma: 90 }};
+      summary = "MONOCLINIC • α=γ=90°";
+    }} else if (setting === "monoclinic_c") {{
+      fixed_angles = {{ alpha: 90, beta: 90 }};
+      summary = "MONOCLINIC (c-unique) • α=β=90°";
+    }} else if (setting === "monoclinic_a") {{
+      fixed_angles = {{ beta: 90, gamma: 90 }};
+      summary = "MONOCLINIC (a-unique) • β=γ=90°";
+    }} else {{
+      summary = "TRICLINIC • all 6 free";
+    }}
+    return {{
+      crystal_system: crystalSystem,
+      setting,
+      linked_lengths,
+      linked_angles,
+      fixed_angles,
+      summary,
+    }};
+  }}
+
+  function resolveSpaceGroupSymmetry(sgRaw) {{
+    const raw = String(sgRaw || "").trim();
+    if (!raw) {{
+      return {{
+        crystal_system: "unknown",
+        setting: "triclinic",
+        linked_lengths: {{}},
+        linked_angles: {{}},
+        fixed_angles: {{}},
+        summary: "Paste cell in any field",
+      }};
+    }}
+    const norm = raw.toLowerCase().replace(/\\s+/g, "");
+    if (/^\\d+$/.test(norm)) {{
+      const num = parseInt(norm, 10);
+      if (num >= 1 && num <= 2) return symmetryRulesForSetting("triclinic", "triclinic");
+      if (num >= 3 && num <= 15) return symmetryRulesForSetting("monoclinic", "monoclinic_b");
+      if (num >= 16 && num <= 74) return symmetryRulesForSetting("orthorhombic", "orthorhombic");
+      if (num >= 75 && num <= 142) return symmetryRulesForSetting("tetragonal", "tetragonal");
+      if (num >= 143 && num <= 167) {{
+        return norm.endsWith(":r")
+          ? symmetryRulesForSetting("trigonal", "trigonal_r")
+          : symmetryRulesForSetting("trigonal", "trigonal");
+      }}
+      if (num >= 168 && num <= 194) return symmetryRulesForSetting("hexagonal", "hexagonal");
+      if (num >= 195 && num <= 230) return symmetryRulesForSetting("cubic", "cubic");
+    }}
+    let setting = SG_SYMMETRY_LOOKUP[norm] || null;
+    if (!setting && norm.endsWith(":h")) {{
+      setting = SG_SYMMETRY_LOOKUP[norm.slice(0, -2)] || "trigonal";
+    }} else if (!setting && norm.endsWith(":r")) {{
+      setting = "trigonal_r";
+    }}
+    if (setting) {{
+      const cs = setting.startsWith("monoclinic")
+        ? "monoclinic"
+        : (setting === "trigonal_r" ? "trigonal" : setting);
+      return symmetryRulesForSetting(cs, setting);
+    }}
+    return symmetryRulesForSetting("triclinic", "triclinic");
+  }}
+
+  function parseUnitCellClipboardText(text) {{
+    if (!text || typeof text !== "string") return null;
+    let s = text.trim();
+    if (!s) return null;
+    s = s.replace(/^[\\[\\(\\{{]+|[\\]\\)\\}}]+$/g, "").trim();
+    s = s.replace(/\\b(?:a|b|c|alpha|beta|gamma|sg|space_group|spacegroup)\\s*=\\s*/gi, " ");
+    s = s.replace(/[αβγ]\\s*=\\s*/g, " ");
+    s = s.replace(/(?<=\\d)\\s*(?:°|deg|Å|angstrom)\\b/gi, "");
+    s = s.replace(/°/g, " ").trim();
+    const sixFrontRe = /^\\s*((?:[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?[\\s,;]+){{5}}[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)(?:\\s*[,;|]?\\s*(.*))?$/i;
+    const sixBackRe = /^(.*?)(?:[\\s,;|]+)((?:[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?[\\s,;]+){{5}}[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)\\s*$/i;
+    const numExtractRe = /[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?/g;
+    const validateSix = (numsStr) => {{
+      const matches = numsStr.match(numExtractRe);
+      if (!matches || matches.length !== 6) return null;
+      const vals = matches.map(Number);
+      if (vals.slice(0, 3).some(v => !Number.isFinite(v) || v <= 0)) return null;
+      if (vals.slice(3, 6).some(v => !Number.isFinite(v) || v <= 10 || v >= 180)) return null;
+      return vals;
+    }};
+    const mFront = s.match(sixFrontRe);
+    if (mFront) {{
+      const cell = validateSix(mFront[1]);
+      if (cell) {{
+        const sg = String(mFront[2] || "").replace(/^[\\s,;|]+|[\\s,;|]+$/g, "");
+        return {{ cell, space_group: sg }};
+      }}
+    }}
+    const mBack = s.match(sixBackRe);
+    if (mBack) {{
+      const cell = validateSix(mBack[2]);
+      if (cell) {{
+        const sg = String(mBack[1] || "").replace(/^[\\s,;|]+|[\\s,;|]+$/g, "");
+        return {{ cell, space_group: sg }};
+      }}
+    }}
+    return null;
+  }}
   function getDefaultWavelengthForInstrument(instName) {{
     const key = String(instName || DATA.instrument || "CG4D").trim().toUpperCase();
     return INSTRUMENT_WAVELENGTH_DEFAULTS[key] || [2.0, 4.5];
@@ -7405,6 +7758,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const el = document.getElementById(id);
         if (el && typeof c[i] === "number") el.value = c[i].toFixed(2);
       }});
+      if (typeof recordUnitCellInLocalStorage === "function" && DATA.artifact_kind !== "empty") {{
+        recordUnitCellInLocalStorage(c, DATA.space_group || "P 1", DATA.images_h5 ? String(DATA.images_h5).split("/").pop() : "Active dataset");
+      }}
+    }}
+    if (typeof applyUnitCellSymmetryConstraints === "function") {{
+      applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: true }});
+    }}
+    if (typeof renderUnitCellHistoryDropdown === "function") {{
+      renderUnitCellHistoryDropdown();
     }}
     const ord1 = ZONES.filter(z => (z.order || 1) <= 1).map(z => z.zone_id);
     state.maxZoneOrder = ord1.length > 0 ? 1 : 2;
@@ -8963,8 +9325,495 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }}
 
+  const UNIT_CELL_STORAGE_KEY = "subhkl_unit_cell_history_v1";
+
+  function extractDatasetUnitCellMeta(d) {{
+    if (!d || typeof d !== "object") return null;
+    if (Array.isArray(d.cell) && d.cell.length === 6) {{
+      const nums = d.cell.map(Number);
+      if (nums.slice(0, 3).every(v => Number.isFinite(v) && v > 0) && nums.slice(3, 6).every(v => Number.isFinite(v) && v > 10 && v < 180)) {{
+        return {{
+          cell: nums.map(v => Number(v.toFixed(4))),
+          space_group: String(d.space_group || "").trim(),
+          instrument: String(d.instrument || "").trim(),
+        }};
+      }}
+    }}
+    if (typeof d.annotation === "string" && d.annotation.trim().startsWith("{{")) {{
+      try {{
+        const obj = JSON.parse(d.annotation);
+        const rawC = obj && (obj.subhkl_cell || obj.cell);
+        if (Array.isArray(rawC) && rawC.length === 6) {{
+          const nums = rawC.map(Number);
+          if (nums.slice(0, 3).every(v => Number.isFinite(v) && v > 0) && nums.slice(3, 6).every(v => Number.isFinite(v) && v > 10 && v < 180)) {{
+            return {{
+              cell: nums.map(v => Number(v.toFixed(4))),
+              space_group: String(obj.space_group || obj.sg || "").trim(),
+              instrument: String(obj.instrument || "").trim(),
+            }};
+          }}
+        }}
+      }} catch (_e) {{}}
+    }}
+    return null;
+  }}
+
+  function recordUnitCellInLocalStorage(cell, spaceGroup, label = "") {{
+    if (!Array.isArray(cell) || cell.length !== 6) return;
+    const nums = cell.map(Number);
+    if (nums.slice(0, 3).some(v => !Number.isFinite(v) || v <= 0)) return;
+    if (nums.slice(3, 6).some(v => !Number.isFinite(v) || v <= 10 || v >= 180)) return;
+    const sg = String(spaceGroup || "").trim();
+    try {{
+      const raw = localStorage.getItem(UNIT_CELL_STORAGE_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      const arr = Array.isArray(list) ? list : [];
+      const sig = `${{nums.map(v => v.toFixed(2)).join(",")}}|${{sg.toLowerCase().replace(/\\s+/g, "")}}`;
+      const filtered = arr.filter(it => it && it.sig !== sig);
+      filtered.unshift({{
+        sig,
+        cell: nums.map(v => Number(v.toFixed(4))),
+        space_group: sg,
+        label: String(label || "Recent").trim(),
+        ts: Date.now(),
+      }});
+      localStorage.setItem(UNIT_CELL_STORAGE_KEY, JSON.stringify(filtered.slice(0, 25)));
+    }} catch (_e) {{}}
+  }}
+
+  function getKnownUnitCellHistory() {{
+    const out = [];
+    const seen = new Set();
+    const addEntry = (cell, spaceGroup, label, hid = null, dsId = "") => {{
+      if (!Array.isArray(cell) || cell.length !== 6) return;
+      const nums = cell.map(Number);
+      if (nums.slice(0, 3).some(v => !Number.isFinite(v) || v <= 0)) return;
+      if (nums.slice(3, 6).some(v => !Number.isFinite(v) || v <= 10 || v >= 180)) return;
+      const sg = String(spaceGroup || "").trim();
+      const sig = `${{nums.map(v => v.toFixed(2)).join(",")}}|${{sg.toLowerCase().replace(/\\s+/g, "")}}`;
+      if (seen.has(sig)) return;
+      seen.add(sig);
+      out.push({{
+        sig,
+        cell: nums.map(v => Number(v.toFixed(4))),
+        space_group: sg,
+        label: String(label || "History").trim(),
+        hid,
+        dataset_id: dsId,
+      }});
+    }};
+
+    // 1. Galaxy history datasets (ordered most recently touched first)
+    const sortedDs = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []);
+    sortedDs.forEach(d => {{
+      const meta = extractDatasetUnitCellMeta(d);
+      if (meta && meta.cell) {{
+        const dsLabel = `${{d.hid ? "#" + d.hid + " " : ""}}${{d.name || d.id || "Galaxy dataset"}}`;
+        addEntry(meta.cell, meta.space_group, dsLabel, d.hid || null, d.id || "");
+      }}
+    }});
+
+    // 2. LocalStorage recent unit cells
+    try {{
+      const raw = localStorage.getItem(UNIT_CELL_STORAGE_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(list)) {{
+        list.forEach(it => {{
+          if (it && Array.isArray(it.cell)) {{
+            addEntry(it.cell, it.space_group, it.label || "Recent entry");
+          }}
+        }});
+      }}
+    }} catch (_e) {{}}
+
+    // 3. Currently loaded dataset cell (if non-empty)
+    if (DATA && DATA.artifact_kind !== "empty" && Array.isArray(DATA.cell) && DATA.cell.length === 6) {{
+      addEntry(DATA.cell, DATA.space_group || "", "Active session");
+    }}
+    return out;
+  }}
+
+  function formatUnitCellEntrySummary(entry) {{
+    if (!entry || !Array.isArray(entry.cell) || entry.cell.length !== 6) return "";
+    const c = entry.cell.map(v => Number(v).toFixed(2).replace(/\\.00$/, ""));
+    const sgTxt = entry.space_group ? `${{entry.space_group}} — ` : "";
+    const srcTxt = entry.label ? ` (${{entry.label}})` : "";
+    return `${{sgTxt}}${{c[0]}}, ${{c[1]}}, ${{c[2]}} Å | ${{c[3]}}, ${{c[4]}}, ${{c[5]}}°${{srcTxt}}`;
+  }}
+
+  function applyUnitCellSymmetryConstraints(prefix = "nd", opts = {{}}) {{
+    const sgEl = document.getElementById(`${{prefix}}-sg`);
+    const sgVal = (sgEl && sgEl.value) ? sgEl.value.trim() : "";
+    const sym = resolveSpaceGroupSymmetry(sgVal);
+    if (prefix === "nd") {{
+      const badgeEl = document.getElementById("nd-symmetry-badge");
+      if (badgeEl) {{
+        badgeEl.textContent = sym.summary;
+        const isConstrained = Object.keys(sym.linked_lengths).length > 0 ||
+          Object.keys(sym.linked_angles).length > 0 ||
+          Object.keys(sym.fixed_angles).length > 0;
+        badgeEl.style.borderColor = isConstrained ? "rgba(52,211,153,0.55)" : "rgba(56,189,248,0.35)";
+        badgeEl.style.color = isConstrained ? "#34d399" : "var(--accent-cyan)";
+      }}
+    }}
+
+    const labelMap = {{
+      a: "a (Å)",
+      b: sym.linked_lengths.b ? `b = ${{sym.linked_lengths.b}} (Å)` : "b (Å)",
+      c: sym.linked_lengths.c ? `c = ${{sym.linked_lengths.c}} (Å)` : "c (Å)",
+      alpha: sym.fixed_angles.alpha !== undefined ? `α = ${{sym.fixed_angles.alpha}}°` : "α (°)",
+      beta: sym.fixed_angles.beta !== undefined
+        ? `β = ${{sym.fixed_angles.beta}}°`
+        : (sym.linked_angles.beta ? `β = ${{sym.linked_angles.beta}} (°)` : "β (°)"),
+      gamma: sym.fixed_angles.gamma !== undefined
+        ? `γ = ${{sym.fixed_angles.gamma}}°`
+        : (sym.linked_angles.gamma ? `γ = ${{sym.linked_angles.gamma}} (°)` : "γ (°)"),
+    }};
+    if (prefix === "nd") {{
+      Object.entries(labelMap).forEach(([k, txt]) => {{
+        const lblEl = document.getElementById(`nd-lbl-${{k}}`);
+        if (lblEl) lblEl.textContent = txt;
+      }});
+    }}
+
+    ["a", "b", "c"].forEach(k => {{
+      const el = document.getElementById(`${{prefix}}-${{k}}`);
+      if (!el) return;
+      const masterKey = sym.linked_lengths[k];
+      if (masterKey) {{
+        const srcEl = document.getElementById(`${{prefix}}-${{masterKey}}`);
+        if (srcEl && srcEl.value.trim() !== "" && (!opts.preserveExplicitValues || el.value.trim() === "")) {{
+          el.value = srcEl.value;
+        }}
+        el.readOnly = true;
+        el.dataset.symmetryLocked = "linked";
+        el.dataset.symmetryMaster = masterKey;
+        el.style.opacity = "0.58";
+        el.style.background = "rgba(15,23,42,0.72)";
+        el.style.color = "var(--accent-cyan)";
+        el.style.cursor = "not-allowed";
+        el.title = `Mirrored to ${{masterKey}} by ${{sym.crystal_system}} symmetry (${{k}} = ${{masterKey}})`;
+      }} else {{
+        el.readOnly = false;
+        delete el.dataset.symmetryLocked;
+        delete el.dataset.symmetryMaster;
+        el.style.opacity = "1";
+        el.style.background = prefix === "nd" ? "#070913" : "";
+        el.style.color = prefix === "nd" ? "var(--text-main)" : "";
+        el.style.cursor = "";
+        el.title = "";
+      }}
+    }});
+
+    ["alpha", "beta", "gamma"].forEach(k => {{
+      const el = document.getElementById(`${{prefix}}-${{k}}`);
+      if (!el) return;
+      const fixedVal = sym.fixed_angles[k];
+      const masterKey = sym.linked_angles[k];
+      if (fixedVal !== undefined) {{
+        if (!opts.preserveExplicitValues || el.value.trim() === "") {{
+          el.value = String(fixedVal);
+        }}
+        el.readOnly = true;
+        el.dataset.symmetryLocked = "fixed";
+        delete el.dataset.symmetryMaster;
+        el.style.opacity = "0.45";
+        el.style.background = "rgba(15,23,42,0.55)";
+        el.style.color = "var(--text-dim)";
+        el.style.cursor = "not-allowed";
+        el.title = `Fixed at ${{fixedVal}}° by ${{sym.crystal_system}} symmetry`;
+      }} else if (masterKey) {{
+        const srcEl = document.getElementById(`${{prefix}}-${{masterKey}}`);
+        if (srcEl && srcEl.value.trim() !== "" && (!opts.preserveExplicitValues || el.value.trim() === "")) {{
+          el.value = srcEl.value;
+        }}
+        el.readOnly = true;
+        el.dataset.symmetryLocked = "linked";
+        el.dataset.symmetryMaster = masterKey;
+        el.style.opacity = "0.58";
+        el.style.background = "rgba(15,23,42,0.72)";
+        el.style.color = "var(--accent-cyan)";
+        el.style.cursor = "not-allowed";
+        el.title = `Mirrored to ${{masterKey}} by ${{sym.crystal_system}} symmetry (${{k}} = ${{masterKey}})`;
+      }} else {{
+        el.readOnly = false;
+        delete el.dataset.symmetryLocked;
+        delete el.dataset.symmetryMaster;
+        el.style.opacity = "1";
+        el.style.background = prefix === "nd" ? "#070913" : "";
+        el.style.color = prefix === "nd" ? "var(--text-main)" : "";
+        el.style.cursor = "";
+        el.title = "";
+      }}
+    }});
+    return sym;
+  }}
+
+  function mirrorLinkedUnitCellFields(prefix, changedKey) {{
+    const sgEl = document.getElementById(`${{prefix}}-sg`);
+    const sym = resolveSpaceGroupSymmetry(sgEl ? sgEl.value : "");
+    const srcEl = document.getElementById(`${{prefix}}-${{changedKey}}`);
+    if (!srcEl) return;
+    Object.entries(sym.linked_lengths).forEach(([targetKey, masterKey]) => {{
+      if (masterKey === changedKey) {{
+        const dstEl = document.getElementById(`${{prefix}}-${{targetKey}}`);
+        if (dstEl) dstEl.value = srcEl.value;
+      }}
+    }});
+    Object.entries(sym.linked_angles).forEach(([targetKey, masterKey]) => {{
+      if (masterKey === changedKey) {{
+        const dstEl = document.getElementById(`${{prefix}}-${{targetKey}}`);
+        if (dstEl) dstEl.value = srcEl.value;
+      }}
+    }});
+  }}
+
+  function applyUnitCellEntryToDialog(entry, prefix = "nd") {{
+    if (!entry || !Array.isArray(entry.cell) || entry.cell.length !== 6) return;
+    const keys = ["a", "b", "c", "alpha", "beta", "gamma"];
+    if (entry.space_group) {{
+      const sgEl = document.getElementById(`${{prefix}}-sg`);
+      if (sgEl) sgEl.value = entry.space_group;
+    }}
+    keys.forEach((k, idx) => {{
+      const el = document.getElementById(`${{prefix}}-${{k}}`);
+      if (el && Number.isFinite(Number(entry.cell[idx]))) {{
+        el.value = String(Number(Number(entry.cell[idx]).toFixed(4)));
+      }}
+    }});
+    applyUnitCellSymmetryConstraints(prefix, {{ preserveExplicitValues: false }});
+    if (prefix === "nd") {{
+      updateUnitCellFieldSuggestions(null);
+    }}
+  }}
+
+  function renderUnitCellHistoryDropdown() {{
+    const selEl = document.getElementById("nd-cell-history-select");
+    const history = getKnownUnitCellHistory();
+    if (selEl) {{
+      selEl.innerHTML = "";
+      const defOpt = document.createElement("option");
+      defOpt.value = "";
+      defOpt.textContent = history.length > 0
+        ? `Recent Unit Cells (${{history.length}} from Galaxy History)…`
+        : "Recent Unit Cells (none in history yet)…";
+      selEl.appendChild(defOpt);
+      history.forEach((entry, idx) => {{
+        const opt = document.createElement("option");
+        opt.value = String(idx);
+        opt.textContent = formatUnitCellEntrySummary(entry);
+        selEl.appendChild(opt);
+      }});
+    }}
+  }}
+
+  function updateUnitCellFieldSuggestions(activeFieldKey = null) {{
+    const sugBox = document.getElementById("nd-cell-suggestions");
+    const history = getKnownUnitCellHistory();
+    const fieldKeys = ["a", "b", "c", "alpha", "beta", "gamma"];
+    const defaultPlaceholders = {{ a: "a", b: "b", c: "c", alpha: "90", beta: "90", gamma: "90" }};
+
+    // Reset placeholders to default first
+    fieldKeys.forEach(k => {{
+      const el = document.getElementById(`nd-${{k}}`);
+      if (el) el.placeholder = defaultPlaceholders[k];
+    }});
+    const sgEl = document.getElementById("nd-sg");
+    if (sgEl) sgEl.placeholder = "e.g. P 21 21 21 or Ia-3d";
+
+    if (history.length === 0) {{
+      if (sugBox) sugBox.style.display = "none";
+      return;
+    }}
+
+    // Score history entries against any non-empty fields currently in #nd-*
+    const currentVals = {{}};
+    fieldKeys.forEach((k, idx) => {{
+      const el = document.getElementById(`nd-${{k}}`);
+      const raw = el ? el.value.trim() : "";
+      if (raw !== "" && (!el.dataset.symmetryLocked || k === activeFieldKey)) {{
+        currentVals[k] = {{ raw, num: parseFloat(raw), idx }};
+      }}
+    }});
+    const sgRaw = sgEl ? sgEl.value.trim() : "";
+    const sgNorm = sgRaw.toLowerCase().replace(/\\s+/g, "");
+
+    const scored = [];
+    history.forEach(entry => {{
+      let score = 0;
+      let matchedActive = false;
+      if (sgNorm) {{
+        const entrySgNorm = String(entry.space_group || "").toLowerCase().replace(/\\s+/g, "");
+        if (entrySgNorm === sgNorm) {{
+          score += 5;
+          if (activeFieldKey === "sg") matchedActive = true;
+        }} else if (entrySgNorm.includes(sgNorm) || sgNorm.includes(entrySgNorm)) {{
+          score += 2.5;
+          if (activeFieldKey === "sg") matchedActive = true;
+        }}
+      }}
+      Object.entries(currentVals).forEach(([k, info]) => {{
+        const targetVal = Number(entry.cell[info.idx]);
+        const targetStr = String(targetVal);
+        const targetFixed = targetVal.toFixed(2);
+        if (targetStr.startsWith(info.raw) || targetFixed.startsWith(info.raw)) {{
+          score += 4;
+          if (k === activeFieldKey) matchedActive = true;
+        }} else if (Number.isFinite(info.num) && Math.abs(targetVal - info.num) <= 0.6) {{
+          score += 3 - Math.abs(targetVal - info.num);
+          if (k === activeFieldKey) matchedActive = true;
+        }}
+      }});
+      if (!activeFieldKey || matchedActive || (Object.keys(currentVals).length === 0 && !sgNorm)) {{
+        scored.push({{ entry, score }});
+      }}
+    }});
+
+    scored.sort((a, b) => b.score - a.score);
+    const topMatches = scored.slice(0, 3).map(x => x.entry);
+
+    // Simultaneously update ghost placeholders on empty fields from the #1 matching unit cell
+    if (topMatches.length > 0) {{
+      const best = topMatches[0];
+      fieldKeys.forEach((k, idx) => {{
+        const el = document.getElementById(`nd-${{k}}`);
+        if (el && el.value.trim() === "") {{
+          el.placeholder = String(Number(Number(best.cell[idx]).toFixed(2)));
+        }}
+      }});
+      if (sgEl && sgEl.value.trim() === "" && best.space_group) {{
+        sgEl.placeholder = best.space_group;
+      }}
+    }}
+
+    if (!sugBox) return;
+    if (topMatches.length === 0) {{
+      sugBox.style.display = "none";
+      sugBox.innerHTML = "";
+      return;
+    }}
+    sugBox.style.display = "flex";
+    sugBox.innerHTML = "";
+    const hdr = document.createElement("span");
+    hdr.style.cssText = "font-family:var(--font-display);font-size:0.59rem;color:var(--text-dim);margin-right:2px;";
+    hdr.textContent = (activeFieldKey && (Object.keys(currentVals).length > 0 || sgNorm))
+      ? "Auto-complete matching unit cell:"
+      : "Recent Galaxy unit cells (click to fill all fields):";
+    sugBox.appendChild(hdr);
+
+    topMatches.forEach(entry => {{
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.style.cssText = "padding:2px 7px;font-size:0.61rem;font-family:var(--font-display);border-radius:4px;border:1px solid rgba(56,189,248,0.45);background:rgba(56,189,248,0.12);color:var(--accent-cyan);cursor:pointer;white-space:nowrap;";
+      btn.textContent = `↳ ${{formatUnitCellEntrySummary(entry)}}`;
+      btn.title = "Click to simultaneously populate a, b, c, α, β, γ, and space group";
+      btn.addEventListener("click", () => {{
+        applyUnitCellEntryToDialog(entry, "nd");
+      }});
+      sugBox.appendChild(btn);
+    }});
+  }}
+
+  function handleUnitCellPasteEvent(ev, prefix = "nd") {{
+    const clip = (ev.clipboardData || window.clipboardData);
+    if (!clip) return;
+    const pastedText = clip.getData("text");
+    const parsed = parseUnitCellClipboardText(pastedText);
+    if (!parsed || !Array.isArray(parsed.cell) || parsed.cell.length !== 6) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    applyUnitCellEntryToDialog(
+      {{
+        cell: parsed.cell,
+        space_group: parsed.space_group || (document.getElementById(`${{prefix}}-sg`)?.value || ""),
+        label: "Clipboard",
+      }},
+      prefix
+    );
+    if (prefix === "nd") {{
+      const badgeEl = document.getElementById("nd-symmetry-badge");
+      if (badgeEl) {{
+        const sym = resolveSpaceGroupSymmetry(document.getElementById("nd-sg")?.value || "");
+        badgeEl.textContent = `PASTED • ${{sym.summary}}`;
+      }}
+    }} else {{
+      setStatusLine(
+        "[UNIT CELL PASTED]",
+        `Filled unit cell <strong>${{parsed.cell.map(v => Number(v).toFixed(2)).join(", ")}}</strong>${{parsed.space_group ? ` (SG: <strong>${{parsed.space_group}}</strong>)` : ""}} from clipboard.`
+      );
+    }}
+  }}
+
+  const selCellHistoryEl = document.getElementById("nd-cell-history-select");
+  if (selCellHistoryEl) {{
+    selCellHistoryEl.addEventListener("change", () => {{
+      const idx = parseInt(selCellHistoryEl.value, 10);
+      const history = getKnownUnitCellHistory();
+      if (!Number.isNaN(idx) && history[idx]) {{
+        applyUnitCellEntryToDialog(history[idx], "nd");
+      }}
+      selCellHistoryEl.value = "";
+    }});
+  }}
+
+  ["sg", "a", "b", "c", "alpha", "beta", "gamma"].forEach(fieldKey => {{
+    const ndEl = document.getElementById(`nd-${{fieldKey}}`);
+    if (ndEl) {{
+      ndEl.addEventListener("paste", ev => handleUnitCellPasteEvent(ev, "nd"));
+      ndEl.addEventListener("input", () => {{
+        if (fieldKey === "sg") {{
+          // Support typing/selecting a full unit cell string into the text input as well
+          const maybeFull = parseUnitCellClipboardText(ndEl.value);
+          if (maybeFull) {{
+            applyUnitCellEntryToDialog(maybeFull, "nd");
+            return;
+          }}
+          applyUnitCellSymmetryConstraints("nd", {{ preserveExplicitValues: false }});
+        }} else {{
+          mirrorLinkedUnitCellFields("nd", fieldKey);
+        }}
+        updateUnitCellFieldSuggestions(fieldKey);
+      }});
+      ndEl.addEventListener("focus", () => updateUnitCellFieldSuggestions(fieldKey));
+      ndEl.addEventListener("change", () => {{
+        if (fieldKey === "sg") {{
+          applyUnitCellSymmetryConstraints("nd", {{ preserveExplicitValues: false }});
+        }} else {{
+          mirrorLinkedUnitCellFields("nd", fieldKey);
+        }}
+      }});
+    }}
+
+    const inpEl = document.getElementById(`inp-${{fieldKey}}`);
+    if (inpEl) {{
+      inpEl.addEventListener("paste", ev => handleUnitCellPasteEvent(ev, "inp"));
+      inpEl.addEventListener("input", () => {{
+        if (fieldKey === "sg") {{
+          const maybeFull = parseUnitCellClipboardText(inpEl.value);
+          if (maybeFull) {{
+            applyUnitCellEntryToDialog(maybeFull, "inp");
+            return;
+          }}
+          applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: false }});
+        }} else {{
+          mirrorLinkedUnitCellFields("inp", fieldKey);
+        }}
+      }});
+      inpEl.addEventListener("change", () => {{
+        if (fieldKey === "sg") {{
+          applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: false }});
+        }} else {{
+          mirrorLinkedUnitCellFields("inp", fieldKey);
+        }}
+      }});
+    }}
+  }});
+
   function openNeutronDataModal(localNexusFiles = null) {{
     pendingLocalNexusFiles = localNexusFiles;
+    renderUnitCellHistoryDropdown();
+    applyUnitCellSymmetryConstraints("nd", {{ preserveExplicitValues: true }});
+    updateUnitCellFieldSuggestions(null);
     updateNeutronDialogPreview();
     if (modalNeutronData) modalNeutronData.style.display = "flex";
     fetchOncatCatalog();
@@ -9079,6 +9928,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const s = document.getElementById(srcId), d = document.getElementById(dstId);
         if (s && d && s.value.trim() !== "") d.value = s.value;
       }});
+      applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: true }});
+      const iptsForHist = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
+      const runsForHist = (document.getElementById("nd-runs")?.value || "").trim();
+      const histLbl = iptsForHist ? `IPTS-${{iptsForHist}}${{runsForHist ? " #" + runsForHist : ""}}` : "Load Neutron Data";
+      recordUnitCellInLocalStorage(cellVals, sgVal, histLbl);
+      renderUnitCellHistoryDropdown();
       const prevInst = (DATA.instrument || "").trim();
       const instVal = (document.getElementById("nd-instrument")?.value || DATA.instrument || "CG4D").trim();
       DATA.instrument = instVal;
@@ -9309,7 +10164,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const filtered = allSorted.filter(d => {{
       if (!q) return true;
       const extInf = inferDatasetExtensionClient(d);
-      const hay = `#${{d.hid || ""}} ${{d.name || ""}} ${{extInf}} ${{d.state || ""}}`.toLowerCase();
+      const cellMeta = extractDatasetUnitCellMeta(d);
+      const cellStr = cellMeta ? `${{cellMeta.space_group || ""}} ${{cellMeta.cell.join(" ")}}` : "";
+      const hay = `#${{d.hid || ""}} ${{d.name || ""}} ${{extInf}} ${{d.state || ""}} ${{cellStr}}`.toLowerCase();
       return hay.includes(q);
     }});
     const loadableFiltered = filtered.filter(d => classifyGalaxyDatasetLoadability(d).canLoad);
@@ -9344,6 +10201,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       leftSpan.textContent = `#${{d.hid || "?"}} ${{d.name || d.id}}`;
       const rightSpan = document.createElement("span");
       rightSpan.style.cssText = "display:flex;align-items:center;gap:6px;flex-shrink:0;font-size:0.6rem;";
+      const cellMeta = extractDatasetUnitCellMeta(d);
+      if (cellMeta && Array.isArray(cellMeta.cell) && cellMeta.cell.length === 6) {{
+        const cellBadge = document.createElement("span");
+        cellBadge.style.cssText = "padding:1px 5px;border-radius:3px;background:rgba(56,189,248,0.12);border:1px solid rgba(56,189,248,0.35);color:var(--accent-cyan);max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+        const cShort = cellMeta.cell.slice(0, 3).map(v => Number(v).toFixed(1)).join(",");
+        cellBadge.textContent = `${{cellMeta.space_group ? cellMeta.space_group + " " : ""}}${{cShort}}Å`;
+        cellBadge.title = formatUnitCellEntrySummary({{ cell: cellMeta.cell, space_group: cellMeta.space_group, label: "" }});
+        rightSpan.appendChild(cellBadge);
+      }}
       const extBadge = document.createElement("span");
       extBadge.style.cssText = "padding:1px 5px;border-radius:3px;background:rgba(255,255,255,0.07);color:var(--text-dim);";
       extBadge.textContent = info.hint && !canLoad && ext === "mtz" ? "mtz (needs geometry)" : ext;
@@ -9581,6 +10447,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           galaxyBridge.datasets = doc.history_datasets || [];
           galaxyBridge.stepArtifacts = doc.step_artifacts || {{}};
           populateGalaxyH5Selector();
+          renderUnitCellHistoryDropdown();
+          updateUnitCellFieldSuggestions(null);
           renderFilesDrawer();
           if (elGalaxyBadge) {{
             elGalaxyBadge.textContent = doc.galaxy_connected
@@ -9603,7 +10471,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           galaxyBridge.mode = "galaxy_iframe";
           galaxyBridge.historyId = hists[0].id;
           const cr = await fetch(
-            `/api/histories/${{galaxyBridge.historyId}}/contents?v=dev&q=deleted&qv=false`,
+            `/api/histories/${{galaxyBridge.historyId}}/contents?v=dev&q=deleted&qv=false&keys=id,name,hid,state,extension,deleted,history_content_type,update_time,create_time,tags,annotation`,
             {{ credentials: "same-origin" }}
           );
           if (cr.ok) {{
@@ -9615,6 +10483,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
           }}
           populateGalaxyH5Selector();
+          renderUnitCellHistoryDropdown();
+          updateUnitCellFieldSuggestions(null);
           renderFilesDrawer();
           if (elGalaxyBadge) {{
             elGalaxyBadge.textContent = `GALAXY (${{galaxyBridge.datasets.length}} items)`;
@@ -10153,6 +11023,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   renderZoneList();
   renderPipeline();
   renderLadder();
+  applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: true }});
+  renderUnitCellHistoryDropdown();
   updateHUD();
   fitHorizontalBars(true);
   requestAnimationFrame(animate);
