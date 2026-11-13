@@ -79,6 +79,63 @@ PRO_PALETTE_HEX = [
 # Instruments whose native detector arrangement is spherical rather than cylindrical
 SPHERICAL_INSTRUMENTS = {"MANDI", "TOPAZ", "SNS_MANDI", "CORELLI"}
 
+_FALLBACK_INSTRUMENT_WAVELENGTHS: dict[str, tuple[float, float]] = {
+    "IMAGINE": (2.0, 4.0),
+    "CG4D": (2.0, 10.0),
+    "SNAP": (1.0, 4.0),
+    "CORELLI": (0.6, 2.5),
+    "TOPAZ": (0.4, 3.5),
+    "MANDI": (2.0, 4.0),
+    "WAND²": (1.44, 1.54),
+    "DEMAND": (1.50, 1.60),
+}
+
+
+def _load_reduction_wavelength_defaults() -> dict[str, list[float]]:
+    """Load default [lambda_min, lambda_max] per instrument from ``reduction_settings.json``."""
+    out: dict[str, list[float]] = {
+        k: [float(v[0]), float(v[1])]
+        for k, v in _FALLBACK_INSTRUMENT_WAVELENGTHS.items()
+    }
+    res_path = (
+        Path(__file__).resolve().parent.parent / "resources" / "reduction_settings.json"
+    )
+    if res_path.is_file():
+        with (
+            contextlib.suppress(OSError, ValueError, TypeError, KeyError),
+            open(res_path, encoding="utf-8") as fh,
+        ):
+            doc = json.load(fh)
+            if isinstance(doc, dict):
+                for inst_k, cfg in doc.items():
+                    if not isinstance(cfg, dict) or "Wavelength" not in cfg:
+                        continue
+                    wl_val = cfg["Wavelength"]
+                    if isinstance(wl_val, (list, tuple)) and len(wl_val) >= 2:
+                        w0, w1 = float(wl_val[0]), float(wl_val[1])
+                        if w0 > 0 and w1 > w0:
+                            out[str(inst_k).strip().upper()] = [
+                                round(w0, 3),
+                                round(w1, 3),
+                            ]
+                    elif isinstance(wl_val, (int, float)) and float(wl_val) > 0:
+                        w_c = float(wl_val)
+                        out[str(inst_k).strip().upper()] = [
+                            round(max(0.1, w_c - 0.05), 3),
+                            round(w_c + 0.05, 3),
+                        ]
+    return out
+
+
+def _get_instrument_default_wavelength(instrument: str | None) -> tuple[float, float]:
+    """Return ``(wavelength_min, wavelength_max)`` from ``reduction_settings.json`` for ``instrument``."""
+    defaults = _load_reduction_wavelength_defaults()
+    key = str(instrument or "CG4D").strip().upper()
+    if key in defaults:
+        pair = defaults[key]
+        return (float(pair[0]), float(pair[1]))
+    return _FALLBACK_INSTRUMENT_WAVELENGTHS.get(key, (2.0, 4.5))
+
 
 def default_projection_for_instrument(instrument: str | None) -> str:
     """Return ``'spherical'`` for spherical instruments (e.g. MANDI) and ``'cylindrical'`` for cylindrical ones (e.g. CG4D)."""
@@ -185,7 +242,14 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                                 / m_fn
                             )
                             if work_cand.is_file():
-                                return str(work_cand.resolve())
+                                with (
+                                    contextlib.suppress(
+                                        OSError, RuntimeError, KeyError
+                                    ),
+                                    h5py.File(work_cand, "r") as wf,
+                                ):
+                                    if "images" in wf:
+                                        return str(work_cand.resolve())
                         for gx_cand in sorted(
                             glob.glob(
                                 os.path.join(
@@ -195,7 +259,14 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                             )
                         ):
                             if os.path.isfile(gx_cand):
-                                return str(Path(gx_cand).resolve())
+                                with (
+                                    contextlib.suppress(
+                                        OSError, RuntimeError, KeyError
+                                    ),
+                                    h5py.File(gx_cand, "r") as gf,
+                                ):
+                                    if "images" in gf:
+                                        return str(Path(gx_cand).resolve())
         src_attr = _decode_str(f.attrs.get("source"), "")
         if not src_attr and "scan_refinement" in f:
             src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
@@ -774,7 +845,7 @@ def _extract_from_h5(
                 for x in np.asarray(f["beam/ki_vec"][()], dtype=float).ravel()[:3]
             )
 
-        wavelength_range = (1.8, 4.5)
+        wavelength_range = _get_instrument_default_wavelength(instrument)
         if "scan_refinement/band_wavelength" in f:
             wl = np.asarray(
                 f["scan_refinement/band_wavelength"][()], dtype=float
@@ -1331,6 +1402,12 @@ def _extract_from_h5(
                 out.get("resolution_bins"), list
             ):
                 out["cc_half_bins"] = out["resolution_bins"]
+            if not out.get("n_merged_asu") and isinstance(
+                out.get("cc_half_bins"), list
+            ):
+                out["n_merged_asu"] = sum(
+                    int(b.get("n_refl") or 0) for b in out["cc_half_bins"]
+                )
             return out
 
         has_careless_peak_data = bool(
@@ -1346,9 +1423,13 @@ def _extract_from_h5(
                 ):
                     raw_m = _decode_str(f["careless/metrics_json"][()], "{}")
                     doc_m = json.loads(raw_m)
-                    if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
+                    if isinstance(doc_m, dict) and (
+                        doc_m.get("n_merged_asu")
+                        or doc_m.get("resolution_bins")
+                        or doc_m.get("cc_half_bins")
+                    ):
                         merge_metrics = _normalize_merge_metrics(doc_m)
-            elif "peaks" in f:
+            if merge_metrics is None and "peaks" in f:
                 sib_m = Path(h5_path).parent / "careless_metrics.json"
                 if sib_m.is_file():
                     with (
@@ -1356,7 +1437,11 @@ def _extract_from_h5(
                         open(sib_m, encoding="utf-8") as mfh,
                     ):
                         doc_m = json.load(mfh)
-                        if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
+                        if isinstance(doc_m, dict) and (
+                            doc_m.get("n_merged_asu")
+                            or doc_m.get("resolution_bins")
+                            or doc_m.get("cc_half_bins")
+                        ):
                             merge_metrics = _normalize_merge_metrics(doc_m)
 
         artifact_kind = "solve"
@@ -4357,9 +4442,10 @@ def render_rainbow_html(
             <span id="stereo-title" style="color:var(--accent-cyan);font-weight:700;">WULFF NET</span>
             <div class="stereo-toolbar">
               <button id="btn-wulff-scope" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
-              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, or Careless Merge Residual">
+              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, Unscaled I/σ, or Careless Merge Residual">
                 <option value="wavelength">Color: λ/Zone</option>
                 <option value="orbit">Color: ASU Orbit</option>
+                <option value="isigi">Color: I/σ (Unscaled)</option>
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
               </select>
@@ -4394,12 +4480,20 @@ def render_rainbow_html(
           <input type="range" id="slider-parallax" min="0.0" max="2.5" step="0.05" value="1.00" />
 
           <div class="slider-row">
-            <span>Wavelength Band λ [Å]</span>
-            <span id="lbl-lam-band">{init_wl_min:.2f}–{init_wl_max:.2f}</span>
+            <span>Resolution Cutoff d_min [Å]</span>
+            <span id="lbl-dmin-val">{init_dmin:.2f} Å</span>
           </div>
-          <div style="display:flex;gap:6px;">
-            <input type="range" id="slider-lam-min" min="0.5" max="6.0" step="0.05" value="{init_wl_min:.2f}" title="Min Wavelength" />
-            <input type="range" id="slider-lam-max" min="1.0" max="10.0" step="0.05" value="{init_wl_max:.2f}" title="Max Wavelength" />
+          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å] (synchronized with Params bar)" />
+
+          <div class="slider-row" style="margin-top:2px;">
+            <span>Spot Color</span>
+            <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Unscaled I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
+              <option value="wavelength">Color: λ/Zone</option>
+              <option value="orbit">Color: ASU Orbit</option>
+              <option value="isigi">Color: I/σ (Unscaled)</option>
+              <option value="residual">Color: ΔI/σ Residual</option>
+              <option value="scale">Color: Scale</option>
+            </select>
           </div>
         </div>
       </div>
@@ -4461,7 +4555,9 @@ def render_rainbow_html(
       <span>α <input id="inp-alpha" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>β <input id="inp-beta" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>γ <input id="inp-gamma" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
-      <span>d_min <input id="inp-dmin" type="number" step="0.1" value="{init_dmin:.1f}" style="width:44px;" /></span>
+      <span title="Minimum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_min <input id="inp-lmin" type="number" step="0.05" value="{init_wl_min:.2f}" style="width:48px;" /></span>
+      <span title="Maximum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_max <input id="inp-lmax" type="number" step="0.05" value="{init_wl_max:.2f}" style="width:48px;" /></span>
+      <span title="High-resolution cutoff d_min [Å] (synchronized with sidebar slider)">d_min <input id="inp-dmin" type="number" step="0.05" value="{init_dmin:.2f}" style="width:48px;" /></span>
       <span title="Panel border rejection width (fraction of image size)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="0.03" style="width:52px;" /></span>
     </div>
     <div id="files-drawer" class="params-drawer"></div>
@@ -4578,7 +4674,7 @@ def render_rainbow_html(
 
       <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;padding:8px 10px;margin-bottom:10px;">
         <div style="font-family:var(--font-display);font-size:0.66rem;color:var(--accent-gold);margin-bottom:6px;">
-          SAMPLE UNIT CELL (LENGTHS &amp; ANGLES), SPACE GROUP &amp; WAVELENGTH BAND
+          SAMPLE UNIT CELL (LENGTHS &amp; ANGLES) &amp; SPACE GROUP
         </div>
         <!-- Row 1: Space group + Unit cell lengths a, b, c -->
         <div style="display:grid;grid-template-columns:1.3fr repeat(3,minmax(0,1fr));gap:8px;margin-bottom:6px;">
@@ -4599,8 +4695,8 @@ def render_rainbow_html(
             <input id="nd-c" type="number" step="0.01" value="" placeholder="c" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
-        <!-- Row 2: Unit cell angles alpha, beta, gamma + wavelength band -->
-        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) 0.85fr 0.85fr;gap:8px;margin-bottom:8px;">
+        <!-- Row 2: Unit cell angles alpha, beta, gamma -->
+        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin-bottom:8px;">
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             α (°)
             <input id="nd-alpha" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
@@ -4612,14 +4708,6 @@ def render_rainbow_html(
           <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
             γ (°)
             <input id="nd-gamma" type="number" step="0.01" value="" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            λ_min (Å)
-            <input id="nd-wl-min" type="number" step="0.1" value="" placeholder="e.g. 2.0" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            λ_max (Å)
-            <input id="nd-wl-max" type="number" step="0.1" value="" placeholder="e.g. 4.5" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
         <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px;">
@@ -4696,7 +4784,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const LADDER = DATA.ladder_steps || [];
   const PIPELINE = DATA.pipeline_stages || [];
 
-  const wlRange = DATA.wavelength_range || [2.8, 4.5];
+  const INSTRUMENT_WAVELENGTH_DEFAULTS = {{
+    IMAGINE: [2.0, 4.0],
+    CG4D: [2.0, 10.0],
+    SNAP: [1.0, 4.0],
+    CORELLI: [0.6, 2.5],
+    TOPAZ: [0.4, 3.5],
+    MANDI: [2.0, 4.0],
+    "WAND²": [1.44, 1.54],
+    DEMAND: [1.50, 1.60],
+  }};
+  function getDefaultWavelengthForInstrument(instName) {{
+    const key = String(instName || DATA.instrument || "CG4D").trim().toUpperCase();
+    return INSTRUMENT_WAVELENGTH_DEFAULTS[key] || [2.0, 4.5];
+  }}
+
+  const wlRange = (Array.isArray(DATA.wavelength_range) && DATA.wavelength_range.length >= 2)
+    ? DATA.wavelength_range
+    : getDefaultWavelengthForInstrument(DATA.instrument);
+  const initDminVal = Number(DATA.d_min || (0.5 * Number(wlRange[0] || 2.0)).toFixed(2));
   const order1ZoneIds = ZONES.filter(z => (z.order || 1) <= 1).map(z => z.zone_id);
   const initialZoneIds = order1ZoneIds.length > 0
     ? order1ZoneIds
@@ -4725,13 +4831,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     wulffScope: isMergedInit ? "all_runs" : "single_frame", // "single_frame" (1-Frame) | "all_runs" (All-Runs)
     wulffFrame: "sample",         // always project in Sample frame (coupled via goniometer R)
     wulffCoupled: true,           // 360° periodic detector pan <-> Wulff yaw always coupled
-    wulffColorMode: isMergedInit ? "residual" : "wavelength", // "wavelength" | "orbit" | "residual" | "scale"
+    wulffColorMode: isMergedInit ? "residual" : "wavelength", // "wavelength" | "orbit" | "isigi" | "residual" | "scale"
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
     histMetric: "cc_half",        // "cc_half" | "completeness" | "isigi"
-    lamMin: wlRange[0],
-    lamMax: wlRange[1],
+    lamMin: Number(wlRange[0]),
+    lamMax: Number(wlRange[1]),
+    dMin: initDminVal,
     zoneTolDeg: 0.75,
     parallaxStrength: 1.0,
     activeZones: new Set(initialZoneIds),
@@ -4821,27 +4928,45 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   decodeAllBankTextures();
 
-  // Initialize sliders
+  // Initialize sliders & synchronized Params inputs
   const slDetAlpha = document.getElementById("slider-det-alpha");
   const slParallax = document.getElementById("slider-parallax");
-  const slLamMin = document.getElementById("slider-lam-min");
-  const slLamMax = document.getElementById("slider-lam-max");
-
-  slLamMin.min = Math.max(0.2, (wlRange[0] * 0.5)).toFixed(2);
-  slLamMin.max = (wlRange[1] * 1.2).toFixed(2);
-  slLamMin.value = wlRange[0].toFixed(2);
-
-  slLamMax.min = Math.max(0.3, (wlRange[0] * 0.6)).toFixed(2);
-  slLamMax.max = (wlRange[1] * 1.5).toFixed(2);
-  slLamMax.value = wlRange[1].toFixed(2);
+  const slDmin = document.getElementById("slider-dmin");
+  const inpDminEl = document.getElementById("inp-dmin");
+  const inpLminEl = document.getElementById("inp-lmin");
+  const inpLmaxEl = document.getElementById("inp-lmax");
 
   function updateWavelengthLabels() {{
-    document.getElementById("lbl-lam-band").textContent =
-      `${{state.lamMin.toFixed(2)}}–${{state.lamMax.toFixed(2)}}`;
-    document.getElementById("wl-readout").textContent =
-      `λ: ${{state.lamMin.toFixed(1)}}–${{state.lamMax.toFixed(1)}} Å`;
+    const wlReadEl = document.getElementById("wl-readout");
+    if (wlReadEl) {{
+      wlReadEl.textContent = `λ: ${{state.lamMin.toFixed(1)}}–${{state.lamMax.toFixed(1)}} Å`;
+    }}
+    if (inpLminEl && document.activeElement !== inpLminEl) {{
+      inpLminEl.value = state.lamMin.toFixed(2);
+    }}
+    if (inpLmaxEl && document.activeElement !== inpLmaxEl) {{
+      inpLmaxEl.value = state.lamMax.toFixed(2);
+    }}
   }}
+
+  function syncDminControls(nextDmin, sourceEl = null) {{
+    const v = Math.max(0.2, Math.min(10.0, Number(nextDmin) || 1.0));
+    state.dMin = v;
+    DATA.d_min = v;
+    const lblD = document.getElementById("lbl-dmin-val");
+    if (lblD) lblD.textContent = `${{v.toFixed(2)}} Å`;
+    if (slDmin && sourceEl !== slDmin) {{
+      if (v < parseFloat(slDmin.min)) slDmin.min = Math.max(0.2, v - 0.2).toFixed(2);
+      if (v > parseFloat(slDmin.max)) slDmin.max = (v + 1.0).toFixed(2);
+      slDmin.value = v.toFixed(2);
+    }}
+    if (inpDminEl && sourceEl !== inpDminEl) {{
+      inpDminEl.value = v.toFixed(2);
+    }}
+  }}
+
   updateWavelengthLabels();
+  syncDminControls(state.dMin);
 
   if (DATA.cell && DATA.cell.length === 6) {{
     const c = DATA.cell;
@@ -5018,6 +5143,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return Number.isFinite(v) ? v : fb;
     }};
     const sgEl = document.getElementById("inp-sg");
+    const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
+    const lminVal = getNum("inp-lmin", state.lamMin || defWl[0]);
+    const lmaxVal = Math.max(lminVal + 0.05, getNum("inp-lmax", state.lamMax || defWl[1]));
+    state.lamMin = lminVal;
+    state.lamMax = lmaxVal;
+    const dminVal = getNum("inp-dmin", state.dMin || Number((lminVal * 0.5).toFixed(2)));
+    syncDminControls(dminVal);
     return {{
       instrument: DATA.instrument || "CG4D",
       space_group: (sgEl && sgEl.value.trim()) || DATA.space_group || "P 21 21 21",
@@ -5027,10 +5159,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       alpha: getNum("inp-alpha", cell[3]),
       beta: getNum("inp-beta", cell[4]),
       gamma: getNum("inp-gamma", cell[5]),
-      d_min: getNum("inp-dmin", Number(((state.lamMin || 2.0) * 0.5).toFixed(2))),
+      d_min: dminVal,
       rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", 0.03))),
-      wavelength_min: state.lamMin,
-      wavelength_max: state.lamMax,
+      wavelength_min: lminVal,
+      wavelength_max: lmaxVal,
     }};
   }}
 
@@ -5072,6 +5204,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{alpha}})`;
   }}
 
+  function peakUnscaledIsigi(p) {{
+    if (!p || typeof p.intensity !== "number" || typeof p.sigma !== "number" || p.sigma <= 0) return NaN;
+    return p.intensity / Math.max(p.sigma, 1e-6);
+  }}
+
+  function isigiToColor(isigiVal, alpha = 1.0) {{
+    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
+    const t = Math.max(0.0, Math.min(1.0, Math.log10(Math.max(1.0, isigiVal)) / Math.log10(40.0)));
+    const hue = (1.0 - t) * 215 + t * 48;
+    const light = 50 + t * 14;
+    return `hsla(${{hue.toFixed(1)}}, 95%, ${{light.toFixed(1)}}%, ${{alpha}})`;
+  }}
+
+  function hasIntegratedIsigi() {{
+    const art = String(DATA.artifact_kind || "").toLowerCase();
+    if (art === "integrator" || art === "merged_careless") return true;
+    const checkArr = arr => Array.isArray(arr) && arr.some(
+      p => p && Array.isArray(p.ellipse) && typeof p.intensity === "number" && typeof p.sigma === "number" && p.sigma > 0
+    );
+    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+  }}
+
   function hasCarelessResiduals() {{
     const checkArr = arr => Array.isArray(arr) && arr.some(
       p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)
@@ -5099,6 +5253,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const hex = ORBIT_PALETTE[idx];
       return alpha >= 0.9 ? hex : `${{hex}}99`;
     }}
+    if (mode === "isigi") {{
+      return isigiToColor(peakUnscaledIsigi(p), alpha);
+    }}
     if (mode === "residual") {{
       return residualToColor(p.careless_residual, alpha);
     }}
@@ -5114,10 +5271,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const btnScope = document.getElementById("btn-wulff-scope");
     const btnExpand = document.getElementById("btn-wulff-expand");
     const selColor = document.getElementById("sel-wulff-color");
+    const selSpotColor = document.getElementById("sel-spot-color");
     const titleEl = document.getElementById("stereo-title");
+    const hasIsigi = hasIntegratedIsigi();
     const hasRes = hasCarelessResiduals();
     const hasScl = hasCarelessScales();
-    if ((state.wulffColorMode === "residual" && !hasRes) || (state.wulffColorMode === "scale" && !hasScl)) {{
+    if (
+      (state.wulffColorMode === "isigi" && !hasIsigi) ||
+      (state.wulffColorMode === "residual" && !hasRes) ||
+      (state.wulffColorMode === "scale" && !hasScl)
+    ) {{
       state.wulffColorMode = "wavelength";
     }}
     if (stereoEl) {{
@@ -5138,9 +5301,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       _cachedPlotBox = null;
       _cachedPlotBoxKey = "";
     }}
-    if (selColor) {{
-      Array.from(selColor.options).forEach(opt => {{
-        if (opt.value === "residual") {{
+    [selColor, selSpotColor].forEach(sel => {{
+      if (!sel) return;
+      Array.from(sel.options).forEach(opt => {{
+        if (opt.value === "isigi") {{
+          opt.disabled = !hasIsigi;
+          opt.style.color = hasIsigi ? "" : "#64748b";
+        }} else if (opt.value === "residual") {{
           opt.disabled = !hasRes;
           opt.style.color = hasRes ? "" : "#64748b";
         }} else if (opt.value === "scale") {{
@@ -5148,8 +5315,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           opt.style.color = hasScl ? "" : "#64748b";
         }}
       }});
-      selColor.value = state.wulffColorMode || "wavelength";
-    }}
+      sel.value = state.wulffColorMode || "wavelength";
+    }});
     if (titleEl) {{
       const scopeLbl = state.wulffScope === "all_runs" ? "ALL-RUNS" : "1-FRAME";
       titleEl.textContent = `WULFF NET · ${{scopeLbl}}`;
@@ -5409,7 +5576,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function isPeakVisible(p) {{
-    return p.wavelength >= state.lamMin && p.wavelength <= state.lamMax;
+    if (p.wavelength < state.lamMin || p.wavelength > state.lamMax) return false;
+    if (typeof p.d_spacing === "number" && p.d_spacing > 0 && typeof state.dMin === "number" && state.dMin > 0) {{
+      if (p.d_spacing < state.dMin - 1e-4) return false;
+    }}
+    return true;
   }}
 
   function isSameReflection(a, b) {{
@@ -5575,15 +5746,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       histCanvas.style.display = hasMergeBins ? "block" : "none";
       histCanvas.style.height = hasMergeBins ? "50px" : "40px";
     }}
+    if (!histCanvas || !hasMergeBins) return;
     const rect = histCanvas.getBoundingClientRect();
-    if (rect.width < 20 || rect.height < 15) return;
+    const w = Math.max(200, rect.width || (histCanvas.parentElement ? histCanvas.parentElement.clientWidth : 260));
+    const h = Math.max(45, rect.height || 50);
     const dpr = window.devicePixelRatio || 1;
-    histCanvas.width = Math.max(100, rect.width * dpr);
-    histCanvas.height = Math.max(45, rect.height * dpr);
+    histCanvas.width = Math.max(100, w * dpr);
+    histCanvas.height = Math.max(45, h * dpr);
     const ctx = histCanvas.getContext("2d");
     ctx.scale(dpr, dpr);
-    const w = rect.width;
-    const h = rect.height;
     ctx.clearRect(0, 0, w, h);
 
     if (hasMergeBins) {{
@@ -6768,19 +6939,53 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     document.getElementById("lbl-parallax").textContent = state.parallaxStrength.toFixed(2) + "×";
   }});
 
-  slLamMin.addEventListener("input", () => {{
-    state.lamMin = Math.min(parseFloat(slLamMin.value), state.lamMax - 0.05);
-    slLamMin.value = state.lamMin;
-    updateWavelengthLabels();
-    updateHUD();
-  }});
+  if (slDmin) {{
+    slDmin.addEventListener("input", () => {{
+      const v = parseFloat(slDmin.value);
+      if (Number.isFinite(v) && v > 0) {{
+        syncDminControls(v, slDmin);
+        updateHUD();
+      }}
+    }});
+  }}
 
-  slLamMax.addEventListener("input", () => {{
-    state.lamMax = Math.max(parseFloat(slLamMax.value), state.lamMin + 0.05);
-    slLamMax.value = state.lamMax;
-    updateWavelengthLabels();
-    updateHUD();
-  }});
+  if (inpDminEl) {{
+    const onInpDmin = () => {{
+      const v = parseFloat(inpDminEl.value);
+      if (Number.isFinite(v) && v > 0) {{
+        syncDminControls(v, inpDminEl);
+        updateHUD();
+      }}
+    }};
+    inpDminEl.addEventListener("input", onInpDmin);
+    inpDminEl.addEventListener("change", onInpDmin);
+  }}
+
+  if (inpLminEl) {{
+    const onInpLmin = () => {{
+      const v = parseFloat(inpLminEl.value);
+      if (Number.isFinite(v) && v > 0) {{
+        state.lamMin = Math.min(v, state.lamMax - 0.05);
+        updateWavelengthLabels();
+        updateHUD();
+      }}
+    }};
+    inpLminEl.addEventListener("input", onInpLmin);
+    inpLminEl.addEventListener("change", onInpLmin);
+  }}
+
+  if (inpLmaxEl) {{
+    const onInpLmax = () => {{
+      const v = parseFloat(inpLmaxEl.value);
+      if (Number.isFinite(v) && v > 0) {{
+        state.lamMax = Math.max(v, state.lamMin + 0.05);
+        updateWavelengthLabels();
+        updateHUD();
+      }}
+    }};
+    inpLmaxEl.addEventListener("input", onInpLmax);
+    inpLmaxEl.addEventListener("change", onInpLmax);
+  }}
 
   document.getElementById("btn-proj-toggle").addEventListener("click", () => {{
     state.projection = state.projection === "cylindrical" ? "spherical" : "cylindrical";
@@ -6822,16 +7027,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  function applySpotColorMode(nextMode) {{
+    if ((nextMode === "residual" || nextMode === "scale") && !hasMergedCarelessData()) {{
+      state.wulffColorMode = "wavelength";
+    }} else if (nextMode === "isigi" && !hasIntegratedIsigi()) {{
+      state.wulffColorMode = "wavelength";
+    }} else {{
+      state.wulffColorMode = nextMode || "wavelength";
+    }}
+    syncWulffUI();
+  }}
+
   const selWulffColor = document.getElementById("sel-wulff-color");
   if (selWulffColor) {{
     selWulffColor.addEventListener("change", () => {{
-      const nextMode = selWulffColor.value || "wavelength";
-      if ((nextMode === "residual" || nextMode === "scale") && !hasMergedCarelessData()) {{
-        state.wulffColorMode = "wavelength";
-      }} else {{
-        state.wulffColorMode = nextMode;
-      }}
-      syncWulffUI();
+      applySpotColorMode(selWulffColor.value || "wavelength");
+    }});
+  }}
+  const selSpotColor = document.getElementById("sel-spot-color");
+  if (selSpotColor) {{
+    selSpotColor.addEventListener("change", () => {{
+      applySpotColorMode(selSpotColor.value || "wavelength");
     }});
   }}
 
@@ -7017,9 +7233,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       syncProjectionUI();
     }}
     DATA.space_group = newPayload.space_group || DATA.space_group;
-    DATA.wavelength_range = newPayload.wavelength_range || DATA.wavelength_range;
+    const defInstWl = getDefaultWavelengthForInstrument(DATA.instrument);
+    DATA.wavelength_range = (Array.isArray(newPayload.wavelength_range) && newPayload.wavelength_range.length >= 2)
+      ? newPayload.wavelength_range
+      : (Array.isArray(DATA.wavelength_range) && DATA.wavelength_range.length >= 2 ? DATA.wavelength_range : defInstWl);
     const nextArtKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
-    const wl0 = Number((DATA.wavelength_range && DATA.wavelength_range[0]) || state.lamMin || 2.0);
+    const wl0 = Number((DATA.wavelength_range && DATA.wavelength_range[0]) || state.lamMin || defInstWl[0]);
     if (nextArtKind === "merged" || nextArtKind === "raw_nexus") {{
       DATA.d_min = Number((0.5 * wl0).toFixed(2));
     }} else {{
@@ -7048,13 +7267,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (DATA.wavelength_range && DATA.wavelength_range.length >= 2) {{
       state.lamMin = Number(DATA.wavelength_range[0]);
       state.lamMax = Number(DATA.wavelength_range[1]);
-      if (slLamMin) slLamMin.value = state.lamMin.toFixed(2);
-      if (slLamMax) slLamMax.value = state.lamMax.toFixed(2);
       updateWavelengthLabels();
     }}
     if (DATA.d_min) {{
-      const dEl = document.getElementById("inp-dmin");
-      if (dEl) dEl.value = Number(DATA.d_min).toFixed(1);
+      syncDminControls(Number(DATA.d_min));
     }}
 
     let nextPeaks = Array.isArray(newPayload.peaks) ? [...newPayload.peaks] : [];
@@ -8822,7 +9038,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
         return;
       }}
-      // Sync sample unit cell, space group, and wavelength band back to the main parameters bar
+      // Sync sample unit cell and space group back to the main parameters bar,
+      // and auto-populate λ_min / λ_max from reduction_settings.json defaults for the chosen instrument
       const syncPair = [
         ["nd-sg", "inp-sg"], ["nd-a", "inp-a"], ["nd-b", "inp-b"], ["nd-c", "inp-c"],
         ["nd-alpha", "inp-alpha"], ["nd-beta", "inp-beta"], ["nd-gamma", "inp-gamma"],
@@ -8831,22 +9048,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const s = document.getElementById(srcId), d = document.getElementById(dstId);
         if (s && d && s.value.trim() !== "") d.value = s.value;
       }});
-      const wlMinV = parseFloat(document.getElementById("nd-wl-min")?.value || "");
-      const wlMaxV = parseFloat(document.getElementById("nd-wl-max")?.value || "");
-      if (Number.isFinite(wlMinV) && Number.isFinite(wlMaxV)) {{
-        state.lamMin = wlMinV; state.lamMax = wlMaxV;
-        if (slLamMin) slLamMin.value = wlMinV.toFixed(2);
-        if (slLamMax) slLamMax.value = wlMaxV.toFixed(2);
-        updateWavelengthLabels();
-      }}
-      const inpDmin = document.getElementById("inp-dmin");
-      if (inpDmin) {{
-        const autoD = Number((0.5 * (Number.isFinite(wlMinV) ? wlMinV : (state.lamMin || 2.0))).toFixed(2));
-        inpDmin.value = autoD.toFixed(1);
-        DATA.d_min = autoD;
-      }}
       const instVal = (document.getElementById("nd-instrument")?.value || DATA.instrument || "CG4D").trim();
       DATA.instrument = instVal;
+      const defWl = getDefaultWavelengthForInstrument(instVal);
+      state.lamMin = Number(defWl[0]);
+      state.lamMax = Number(defWl[1]);
+      DATA.wavelength_range = [state.lamMin, state.lamMax];
+      updateWavelengthLabels();
+      const autoD = Number((0.5 * state.lamMin).toFixed(2));
+      syncDminControls(autoD);
 
       if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
         const filesToUpload = pendingLocalNexusFiles;

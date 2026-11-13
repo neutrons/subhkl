@@ -103,6 +103,10 @@ class Peaks:
         wavelength_max: float | None = None,
     ):
         _name, ext = os.path.splitext(filename)
+        if ext not in (".h5", ".hdf5") and (
+            ".h5" in filename.lower() or h5py.is_hdf5(filename)
+        ):
+            ext = ".h5"
         self.filename = filename
         self.instrument = instrument
 

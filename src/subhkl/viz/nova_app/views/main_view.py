@@ -133,7 +133,12 @@ class MainApp:
                             from subhkl.viz.rainbow_zones import _discover_images_h5
 
                             self.view_model.model.subhkl.data.peaks_file = local_h5
-                            disc_img = _discover_images_h5(local_h5)
+                            disc_img = (
+                                self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                    local_h5
+                                )
+                                or _discover_images_h5(local_h5)
+                            )
                             self.view_model.model.subhkl.data.images_file = (
                                 str(disc_img) if disc_img else ""
                             )
@@ -205,7 +210,12 @@ class MainApp:
                         self.view_model.model.subhkl.data.peaks_file = local_h5
                     else:
                         self.view_model.model.subhkl.data.peaks_file = local_h5
-                        disc_img = _discover_images_h5(local_h5)
+                        disc_img = (
+                            self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                local_h5
+                            )
+                            or _discover_images_h5(local_h5)
+                        )
                         self.view_model.model.subhkl.data.images_file = (
                             str(disc_img) if disc_img else ""
                         )
