@@ -1397,8 +1397,6 @@ class NovaGalaxyPipelineRunner:
             "command_line": f"nova-galaxy -> {self.galaxy_url}",
             "stdout": (
                 f"[nova -> galaxy] Connecting to {self.galaxy_url} (datastore: 'IMAGINE-X SubHKL')...\n"
-                f"[pulsar] Target GPU worker queue on this node (IMAGINEX-1): imaginex1-test / imaginex1\n"
-                f"[pulsar] Staging dir on IMAGINEX-1: /data/staging_test/ (or /data/staging/)\n"
             ),
             "stderr": "",
             "ladder_rung_idx": 0 if stage_id == "solve" else 4,
@@ -2782,7 +2780,7 @@ class NovaGalaxyPipelineRunner:
             ]
             step_lbl = "Step 1/2 " if is_two_step_integrate else ""
             job_record["stdout"] += (
-                f"[galaxy -> pulsar] Dispatched {step_lbl}{primary_tool} (Galaxy job_id={job_id}) -> Pulsar queue on IMAGINEX-1\n"
+                f"[galaxy -> pulsar] Dispatched {step_lbl}{primary_tool} (Galaxy job_id={job_id}) -> Pulsar GPU queue\n"
             )
             self._poll_galaxy_job(
                 job_record,
@@ -2834,7 +2832,7 @@ class NovaGalaxyPipelineRunner:
                     if isinstance(d, dict)
                 ]
                 job_record["stdout"] += (
-                    f"\n[galaxy -> pulsar] Dispatched Step 2/2 {int_tool} (Galaxy job_id={int_job_id}) -> Pulsar queue on IMAGINEX-1\n"
+                    f"\n[galaxy -> pulsar] Dispatched Step 2/2 {int_tool} (Galaxy job_id={int_job_id}) -> Pulsar GPU queue\n"
                 )
                 self._poll_galaxy_job(
                     job_record,
@@ -2864,8 +2862,11 @@ class NovaGalaxyPipelineRunner:
                 job_record["stderr"] = f"{clean_msg}\n"
                 job_record["stdout"] += f"\n[nova -> galaxy] Error: {clean_msg}\n"
                 return
+            from subhkl.io.parser import detect_runner_hostname
+
+            local_host = detect_runner_hostname()
             job_record["stdout"] += (
-                f"[nova -> galaxy] {clean_msg}; running GPU container on IMAGINEX-1...\n"
+                f"[nova -> galaxy] {clean_msg}; running GPU container on {local_host}...\n"
             )
             self._submit_local_subhkl_stage(
                 stage_id,
@@ -3722,7 +3723,6 @@ class NovaGalaxyPipelineRunner:
         """Run subhkl stage inside the GPU Docker/Podman container on IMAGINEX-1 and stream live stdout/stderr."""
         import shlex
         import shutil
-        import socket
         import subprocess
         import sys
 
@@ -4296,12 +4296,15 @@ class NovaGalaxyPipelineRunner:
             container_name = f"subhkl-{job_id}"
             cmd.insert(3, f"--name={container_name}")
 
-        host_tag = socket.gethostname()
+        from subhkl.io.parser import detect_runner_hostname
+
+        host_tag = detect_runner_hostname()
         cmd_str = " ".join(cmd)
         header_lines: list[str] = []
         if stage_id != "merge":
             if fallback_reason and existing_job_record is None:
                 header_lines.append(f"[ndip] Note: {fallback_reason}")
+            header_lines.append(f"[pulsar] Runner host: {host_tag}")
             header_lines.append(
                 f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
             )
@@ -4312,6 +4315,7 @@ class NovaGalaxyPipelineRunner:
             job_record["job_id"] = job_id
             job_record["mode"] = "container_gpu"
             job_record["state"] = "running"
+            job_record["runner_host"] = host_tag
             job_record["command_line"] = cmd_str
             if stage_id == "merge":
                 job_record["stdout"] = ""
@@ -4326,6 +4330,7 @@ class NovaGalaxyPipelineRunner:
                 "stage_id": stage_id,
                 "mode": "container_gpu",
                 "state": "running",
+                "runner_host": host_tag,
                 "command_line": cmd_str,
                 "stdout": "" if stage_id == "merge" else "\n".join(header_lines),
                 "stderr": "",
@@ -4828,6 +4833,17 @@ class NovaGalaxyPipelineRunner:
                 err_txt = self._format_terminal_stream(
                     console_err or jinfo.get("tool_stderr") or jinfo.get("stderr") or ""
                 )
+                import re as _re_h
+
+                m_host = _re_h.search(
+                    r"\[(?:pulsar|subhkl)\]\s*Runner host:\s*([A-Za-z0-9._-]+)",
+                    f"{raw_stdout_src}\n{console_err}",
+                    _re_h.IGNORECASE,
+                )
+                if m_host:
+                    r_host = m_host.group(1).strip()
+                    if r_host:
+                        job_record["runner_host"] = r_host
                 if job_record.get("stage_id") == "merge":
                     job_record["stdout"] = out_txt[-24000:]
                 else:

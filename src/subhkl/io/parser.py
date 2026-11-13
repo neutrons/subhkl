@@ -1,5 +1,7 @@
 # src/subhkl/io/command_line_parser.py
 import os
+import re
+import socket
 import sys
 from typing import Annotated
 
@@ -33,6 +35,36 @@ from subhkl.utils.devices import restrict_to_first_device
 from subhkl.viz.detector_assembly import DEFAULT_N_SIGMA
 
 app = typer.Typer()
+
+
+def detect_runner_hostname() -> str:
+    """Detect the execution host name (including inside GPU Docker containers)."""
+    for env_k in ("PULSAR_HOSTNAME", "HOST_HOSTNAME", "SLURM_NODELIST"):
+        val = os.environ.get(env_k, "").strip()
+        if val:
+            return val.split(".")[0]
+    nv_ver = "/proc/driver/nvidia/version"
+    if os.path.isfile(nv_ver):
+        try:
+            with open(nv_ver, encoding="utf-8", errors="ignore") as f:
+                head = f.readline()
+            m = re.search(r"\((?:[^@()\s]+@)([A-Za-z0-9._-]+)\)", head)
+            if m:
+                cand = m.group(1).split(".")[0]
+                if (
+                    cand.lower() not in {"localhost", "build", "mockbuild"}
+                    and "releng" not in cand.lower()
+                ):
+                    return cand
+        except OSError:
+            pass
+    host = socket.gethostname().strip()
+    return host.split(".")[0] if host else "PULSAR"
+
+
+@app.callback()
+def _main_callback() -> None:
+    print(f"[pulsar] Runner host: {detect_runner_hostname()}", flush=True)
 
 
 @app.command()

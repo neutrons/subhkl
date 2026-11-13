@@ -9797,7 +9797,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
             const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
-            if (cellSummary) cellSummary.textContent = `${{aj.mode === "galaxy" ? "PULSAR" : "SUBHKL"}} [${{(aj.state || "running").toUpperCase()}}]`;
+            if (cellSummary) {{
+              const rHost = (aj.runner_host && String(aj.runner_host).trim())
+                ? String(aj.runner_host).trim().toUpperCase()
+                : ((String(`${{aj.stdout || ""}}\n${{aj.stderr || ""}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
+              const hostTag = rHost || (aj.mode === "galaxy" ? "PULSAR" : "SUBHKL");
+              cellSummary.textContent = `[${{hostTag}}] ${{(aj.state || "running").toUpperCase()}}`;
+            }}
             const finishedOk = aj.state === "ok";
             const finishedErr = isCancelled || aj.state === "error" || aj.state === "paused" || (!finishedOk && !!aj.error);
             if (finishedOk || finishedErr) {{
@@ -9947,7 +9953,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 true
               );
             }}
-            if (cellSummary) cellSummary.textContent = `GALAXY [${{jstate.toUpperCase()}}]`;
+            if (cellSummary) {{
+              const rHost = ((String(`${{stdOut}}\n${{stdErr}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "GALAXY").toUpperCase();
+              cellSummary.textContent = `[${{rHost}}] ${{jstate.toUpperCase()}}`;
+            }}
             if (stageId === "solve" && (jstate === "queued" || jstate === "running")) {{
               rungStep = Math.min(3, rungStep + 1);
               selectLadderRung(rungStep, false);

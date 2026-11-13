@@ -1845,3 +1845,7 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert '<option value="isigi">Color: I/σ (Unscaled)</option>' in html_doc
     assert "hasIntegratedIsigi" in html_doc
     assert "syncDminControls" in html_doc
+    assert "Runner host:" in html_doc
+    from subhkl.io.parser import detect_runner_hostname
+
+    assert detect_runner_hostname()
