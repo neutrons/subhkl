@@ -295,6 +295,11 @@ class NovaGalaxyPipelineRunner:
                         or payload.get("wavelength_range")
                         or (2.0, 4.5)
                     ),
+                    d_min=(
+                        float(sp["d_min"])
+                        if sp.get("d_min")
+                        else (float(payload["d_min"]) if payload.get("d_min") else None)
+                    ),
                     max_zone_index=3,
                     max_zones=60,
                     include_panels=True,
@@ -1017,7 +1022,9 @@ class NovaGalaxyPipelineRunner:
             return float(dt.timestamp())
         return 0.0
 
-    def list_history_datasets(self, limit: int | None = None) -> list[dict[str, Any]]:
+    def list_history_datasets(
+        self, limit: int | None = None, *, use_cached: bool = False
+    ) -> list[dict[str, Any]]:
         """Return active datasets in the current Galaxy history, sorted most-recently-touched first."""
         if not self.is_connected:
             return []
@@ -1025,6 +1032,13 @@ class NovaGalaxyPipelineRunner:
             self._auto_discover_local_galaxy()
         if not self.history_id:
             return []
+        cached_list = getattr(self, "_cached_history_datasets", None)
+        if use_cached and isinstance(cached_list, list) and cached_list:
+            return (
+                cached_list[:limit]
+                if isinstance(limit, int) and limit > 0
+                else list(cached_list)
+            )
         try:
             items = self._api_request(
                 "GET",
@@ -1098,6 +1112,7 @@ class NovaGalaxyPipelineRunner:
                 ),
                 reverse=True,
             )
+            self._cached_history_datasets = list(out)
             if isinstance(limit, int) and limit > 0:
                 return out[:limit]
             return out
@@ -1295,6 +1310,13 @@ class NovaGalaxyPipelineRunner:
                     "integrated.h5",
                     "integrator.h5",
                     "reflections.mtz",
+                ]
+            )
+        if is_tmp_wd and mapped == "solve":
+            to_remove.extend(
+                [
+                    "solve.blind.h5",
+                    "solve.stages.h5",
                 ]
             )
         if is_tmp_wd and mapped == "reduce":
@@ -1741,6 +1763,21 @@ class NovaGalaxyPipelineRunner:
             "updated_payload_ready": False,
             "started_at": time.time(),
         }
+        if stage_id == "solve":
+            wl_r = params.get("wavelength_range")
+            job_record["solve_params"] = {
+                "instrument": str(params.get("instrument") or "CG4D"),
+                "space_group": str(params.get("space_group") or "P 1"),
+                "cell": params.get("cell"),
+                "wavelength_range": (
+                    (float(wl_r[0]), float(wl_r[1]))
+                    if isinstance(wl_r, (list, tuple)) and len(wl_r) >= 2
+                    else None
+                ),
+                "d_min": (
+                    float(params["d_min"]) if params.get("d_min") is not None else None
+                ),
+            }
         self.active_job = job_record
 
         threading.Thread(
@@ -5908,6 +5945,14 @@ def serve_rainbow_zones(
                         vm.pipeline_runner.current_frame_index = f_idx
                     except (ValueError, TypeError, IndexError):
                         f_idx = None
+                preserve_q = qs.get("preserve_params", ["0"])[0] == "1"
+                d_min_val: float | None = None
+                if qs.get("d_min"):
+                    with contextlib.suppress(ValueError, TypeError, IndexError):
+                        parsed_dmin = float(qs["d_min"][0])
+                        if 0.2 <= parsed_dmin <= 20.0:
+                            d_min_val = parsed_dmin
+                            vm.payload_kwargs["d_min"] = parsed_dmin
                 reloaded = False
                 if qs.get("file_path"):
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
@@ -5919,9 +5964,12 @@ def serve_rainbow_zones(
                                     fp
                                 )
                                 vm.payload_kwargs["images_h5"] = fp
+                                vm.payload_kwargs.pop("d_min", None)
                                 vm.replay_h5 = fp
                                 vm.reload(images_h5=fp, frame_index=f_idx)
                             else:
+                                if not preserve_q and d_min_val is None:
+                                    vm.payload_kwargs.pop("d_min", None)
                                 disc_img = vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
                                     fp
                                 )
@@ -6042,9 +6090,29 @@ def serve_rainbow_zones(
                         self.end_headers()
                         self.wfile.write(err_body)
                         return
-                if f_idx is not None and not reloaded:
-                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                        vm.reload(frame_index=f_idx)
+                if not reloaded:
+                    cur_p = vm._payload
+                    cur_f = (
+                        cur_p.get("frame_index") if isinstance(cur_p, dict) else None
+                    )
+                    cur_dmin = cur_p.get("d_min") if isinstance(cur_p, dict) else None
+                    if (
+                        not isinstance(cur_p, dict)
+                        or (f_idx is not None and cur_f != f_idx)
+                        or (
+                            d_min_val is not None
+                            and (
+                                cur_dmin is None
+                                or abs(float(cur_dmin) - d_min_val) > 1e-3
+                            )
+                        )
+                    ):
+                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                            vm.reload(frame_index=f_idx)
+                    elif (
+                        isinstance(cur_p, dict) and d_min_val is not None and preserve_q
+                    ):
+                        cur_p["d_min"] = round(d_min_val, 3)
                 with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                     vm.pipeline_runner.apply_active_solve_overlay(
                         vm.payload, frame_index=f_idx
@@ -6148,7 +6216,15 @@ def serve_rainbow_zones(
                         f_idx_st = int(qs["frame"][0])
                         vm.payload_kwargs["frame_index"] = f_idx_st
                         vm.pipeline_runner.sync_frame_index(f_idx_st)
-                hist_ds = vm.pipeline_runner.list_history_datasets()
+                is_poll = qs.get("poll", ["0"])[0] == "1"
+                aj_now = vm.pipeline_runner.active_job
+                aj_running = isinstance(aj_now, dict) and aj_now.get("state") in (
+                    "queued",
+                    "running",
+                )
+                hist_ds = vm.pipeline_runner.list_history_datasets(
+                    use_cached=bool(is_poll and aj_running)
+                )
                 status_doc = {
                     "galaxy_connected": vm.pipeline_runner.is_connected,
                     "galaxy_url": vm.pipeline_runner.galaxy_url,
@@ -6290,6 +6366,7 @@ def serve_rainbow_zones(
                             )
                         if params.get("d_min"):
                             vm.payload["d_min"] = float(params["d_min"])
+                            vm.payload_kwargs["d_min"] = float(params["d_min"])
                     cur_imgs = vm.payload_kwargs.get("images_h5") or vm.payload.get(
                         "images_h5"
                     )
@@ -6312,10 +6389,13 @@ def serve_rainbow_zones(
                             vm.payload_kwargs["images_h5"] = new_h5_path
                             vm.payload_kwargs["frame_index"] = 0
                             vm.payload_kwargs.pop("wavelength_range", None)
+                            vm.payload_kwargs.pop("d_min", None)
                         else:
                             vm.payload_kwargs["frame_index"] = int(
                                 vm.pipeline_runner.current_frame_index or 0
                             )
+                            if params.get("d_min"):
+                                vm.payload_kwargs["d_min"] = float(params["d_min"])
                         vm.replay_h5 = new_h5_path
                         vm.reload()
                         if stage_id != "reduce":
@@ -6327,6 +6407,7 @@ def serve_rainbow_zones(
                                 ]
                             if params.get("d_min"):
                                 vm.payload["d_min"] = float(params["d_min"])
+                                vm.payload_kwargs["d_min"] = float(params["d_min"])
 
                     result = vm.pipeline_runner.submit_galaxy_stage(
                         stage_id, params=params, on_complete_h5=_on_complete
