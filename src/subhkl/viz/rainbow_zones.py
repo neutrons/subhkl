@@ -8556,6 +8556,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   // Live Galaxy / NOVA / Pulsar GPU job orchestration
   const galaxyBridge = {{
     mode: "none", // "nova" | "galaxy_iframe" | "none"
+    galaxyConnected: false,
     historyId: null,
     datasets: [],
     stepArtifacts: {{}},
@@ -9265,7 +9266,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     statusBox.style.borderColor = "rgba(56,189,248,0.45)";
     msgEl.style.color = "#38bdf8";
-    msgEl.textContent = `Verifying ${{paths.length}} run(s) via NDIP Load Neutron Data...`;
+    msgEl.textContent = `Verifying ${{paths.length}} run(s) (NDIP / local /SNS, /HFIR)...`;
     if (sugBtn) sugBtn.style.display = "none";
     try {{
       const r = await fetch("api/pipeline/check_neutron_paths", {{
@@ -9371,7 +9372,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (statusBox) statusBox.style.borderColor = "rgba(56,189,248,0.25)";
       if (msgEl) {{
         msgEl.style.color = "var(--text-dim)";
-        msgEl.textContent = `Ready to verify ${{paths.length}} run(s) via NDIP Load Neutron Data`;
+        msgEl.textContent = `Ready to verify ${{paths.length}} run(s) (NDIP or local /SNS, /HFIR)`;
       }}
     }}
   }}
@@ -10913,9 +10914,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const doc = await r.json();
         if (doc && typeof doc.galaxy_connected === "boolean") {{
           galaxyBridge.mode = "nova";
+          galaxyBridge.galaxyConnected = Boolean(doc.galaxy_connected);
           galaxyBridge.historyId = doc.history_id;
           galaxyBridge.datasets = doc.history_datasets || [];
           galaxyBridge.stepArtifacts = doc.step_artifacts || {{}};
+          if (
+            state.runningStageIdx < 0 &&
+            doc.active_job &&
+            (doc.active_job.state === "running" || doc.active_job.state === "queued")
+          ) {{
+            const activeStageIdx = PIPELINE.findIndex(
+              p => p.stage_id === doc.active_job.stage_id
+            );
+            if (activeStageIdx >= 0) {{
+              state.runningStageIdx = activeStageIdx;
+              renderPipeline();
+            }}
+          }}
           populateGalaxyH5Selector();
           renderUnitCellHistoryDropdown();
           updateUnitCellFieldSuggestions(null);
@@ -10991,11 +11006,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     renderPipeline();
     const cellSummary = document.getElementById("cell-summary");
     if (cellSummary) cellSummary.textContent = "STOPPED";
+    const stopRunnerLabel = (galaxyBridge.mode === "nova" && !galaxyBridge.galaxyConnected)
+      ? "local GPU container termination requested."
+      : "NDIP / Pulsar job termination requested.";
     setStatusLine(
       `[STOPPED]`,
-      `<strong style="color:#fb7185;">Cancelled ${{st.name || stageId.toUpperCase()}}</strong> — NDIP / Pulsar job termination requested.`
+      `<strong style="color:#fb7185;">Cancelled ${{st.name || stageId.toUpperCase()}}</strong> — ${{stopRunnerLabel}}`
     );
-    if (galaxyBridge.mode === "nova") {{
+    if (galaxyBridge.mode === "nova" || galaxyBridge.mode === "none") {{
       try {{
         const resp = await fetch("api/pipeline/cancel", {{
           method: "POST",
@@ -11007,12 +11025,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const jobObj = doc.job || {{}};
           const outText = (jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : "");
           if (outText) appendTerminalLog(outText, true);
-          else appendTerminalLog(`\\n[ndip] Cancelled stage '${{stageId}}'.\\n`, false);
+          else appendTerminalLog(`\\n[subhkl] Cancelled stage '${{stageId}}'.\\n`, false);
         }} else {{
-          appendTerminalLog(`\\n[ndip] Cancelled stage '${{stageId}}'.\\n`, false);
+          appendTerminalLog(`\\n[subhkl] Cancelled stage '${{stageId}}'.\\n`, false);
         }}
       }} catch (_e) {{
-        appendTerminalLog(`\\n[ndip] Cancelled stage '${{stageId}}'.\\n`, false);
+        appendTerminalLog(`\\n[subhkl] Cancelled stage '${{stageId}}'.\\n`, false);
       }}
       await probeGalaxyConnection();
       return;
