@@ -808,12 +808,19 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     assert len(p_merged["frames"]) == 2
     assert "ω=110" in p_merged["goniometer_summary"]
 
-    # 4. Verify check_neutron_paths never touches the host filesystem directly and routes strictly through NDIP
+    # 4. Verify check_neutron_paths falls back cleanly to local /SNS and /HFIR when Galaxy is unavailable,
+    #    and returns ndip_unavailable only when neither Galaxy nor local facility mounts exist.
     from unittest.mock import MagicMock
 
     from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
 
     runner_no_ndip = NovaGalaxyPipelineRunner(galaxy_url="")
+    unmounted_sns = tmp_path / "no_sns"
+    unmounted_hfir = tmp_path / "no_hfir"
+    runner_no_ndip.SNS_HFIR_ROOTS = {
+        "SNS": str(unmounted_sns),
+        "HFIR": str(unmounted_hfir),
+    }
     chk_unavail = runner_no_ndip.check_neutron_paths(
         {
             "facility": "HFIR",
@@ -824,6 +831,215 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     )
     assert chk_unavail["ok"] is False
     assert chk_unavail["checked_via"] == "ndip_unavailable"
+
+    # Now mount a synthetic local /HFIR and /SNS tree and verify offline check_neutron_paths,
+    # wrong-IPTS auto-suggestion, browse_oncat_catalog fallback, and _resolve_raw_nexus_inputs.
+    mock_hfir = tmp_path / "mock_HFIR"
+    mock_sns = tmp_path / "mock_SNS"
+    nxs_dir_37331 = mock_hfir / "CG4D" / "IPTS-37331" / "nexus"
+    nxs_dir_37331.mkdir(parents=True)
+    for r_num, om_deg in ((2625, 110.0), (2627, 114.0)):
+        nxs_file = nxs_dir_37331 / f"CG4D_{r_num}.nxs.h5"
+        with h5py.File(nxs_file, "w") as nf:
+            nf["entry/title"] = f"Beta-Lactamase omega={om_deg}"
+            nf["entry/sample/name"] = "Beta-Lac"
+            nf["entry/duration"] = np.array([125.0], dtype=np.float64)
+            nf["entry/total_counts"] = np.array([45000.0], dtype=np.float64)
+            nf["entry/DASlogs/omega/average_value"] = np.array(
+                [om_deg], dtype=np.float64
+            )
+    mock_sns.mkdir(parents=True)
+
+    runner_local_fs = NovaGalaxyPipelineRunner(galaxy_url="")
+    runner_local_fs.SNS_HFIR_ROOTS = {
+        "SNS": str(mock_sns),
+        "HFIR": str(mock_hfir),
+    }
+    chk_local_ok = runner_local_fs.check_neutron_paths(
+        {
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "37331",
+            "runs": "2625-2627/2",
+        }
+    )
+    assert chk_local_ok["ok"] is True
+    assert chk_local_ok["checked_via"] == "local_filesystem"
+    assert len(chk_local_ok["existing"]) == 2
+    assert "Beta-Lactamase" in chk_local_ok["sample_title"]
+    assert "omega=110.0" in chk_local_ok["sample_goniometer"]
+
+    # Wrong IPTS suggests the sibling IPTS where the run actually lives on /HFIR
+    chk_local_wrong_ipts = runner_local_fs.check_neutron_paths(
+        {
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "99999",
+            "paths": ["/HFIR/CG4D/IPTS-99999/nexus/CG4D_2625.nxs.h5"],
+        }
+    )
+    assert chk_local_wrong_ipts["ok"] is False
+    assert chk_local_wrong_ipts["checked_via"] == "local_filesystem"
+    assert chk_local_wrong_ipts["suggested_ipts"] == "37331"
+
+    # Also falls back to local /HFIR when Galaxy is configured in env but unreachable
+    runner_down_galaxy = NovaGalaxyPipelineRunner(
+        galaxy_url="https://ndip-down.example.gov",
+        galaxy_api_key="expired_or_unreachable",
+    )
+    runner_down_galaxy.SNS_HFIR_ROOTS = {
+        "SNS": str(mock_sns),
+        "HFIR": str(mock_hfir),
+    }
+    runner_down_galaxy._has_tool_on_galaxy = MagicMock(return_value=False)
+    chk_down_fallback = runner_down_galaxy.check_neutron_paths(
+        {
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "37331",
+            "paths": ["/HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5"],
+        }
+    )
+    assert chk_down_fallback["ok"] is True
+    assert chk_down_fallback["checked_via"] == "local_filesystem"
+
+    # Catalog browser falls back to local /HFIR directory & header scan when ONCat is unavailable
+    import pyoncat  # type: ignore[import-untyped]
+
+    mock_broken_oncat = MagicMock()
+    mock_broken_oncat.Experiment.list.side_effect = RuntimeError("ONCat offline")
+    mock_broken_oncat.Datafile.list.side_effect = RuntimeError("ONCat offline")
+    runner_local_fs._get_oncat_client = MagicMock(
+        return_value=(mock_broken_oncat, False)
+    )
+    orig_pyoncat_cls = pyoncat.ONCat
+    pyoncat.ONCat = MagicMock(return_value=mock_broken_oncat)
+    try:
+        cat_local = runner_local_fs.browse_oncat_catalog(
+            {"facility": "HFIR", "instrument": "CG4D", "ipts": "37331"}
+        )
+    finally:
+        pyoncat.ONCat = orig_pyoncat_cls
+    assert cat_local["ok"] is True
+    assert cat_local["catalog_source"] == "local_filesystem"
+    assert [e["ipts"] for e in cat_local["experiments"]] == ["37331"]
+    assert [r["run"] for r in cat_local["runs"]] == [2625, 2627]
+    assert cat_local["runs"][0]["duration_hms"] == "00:02:05"
+
+    # _resolve_raw_nexus_inputs resolves IPTS + stepped run range directly on local /HFIR
+    resolved_local_nxs = runner_local_fs._resolve_raw_nexus_inputs(
+        {
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "37331",
+            "runs": "2625:2627:2",
+        },
+        str(tmp_path),
+    )
+    assert [p.split("/")[-1] for p in resolved_local_nxs] == [
+        "CG4D_2625.nxs.h5",
+        "CG4D_2627.nxs.h5",
+    ]
+
+    # _resolve_local_podman_image falls back from unbuilt git-branch tags to cached :main (or :main pull)
+    import os as _os
+    from unittest.mock import patch
+
+    def _fake_podman_run(cmd: list[str], **_kwargs: object) -> object:
+        from types import SimpleNamespace
+
+        if cmd[1:3] == ["image", "exists"]:
+            target = cmd[3]
+            return SimpleNamespace(
+                returncode=0 if target == "ghcr.io/neutrons/subhkl:main" else 1
+            )
+        if cmd[1] == "images":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "ghcr.io/neutrons/subhkl:pr-113\n"
+                    "ghcr.io/neutrons/subhkl:main\n"
+                    "ghcr.io/neutrons/subhkl:1.5.0\n"
+                ),
+            )
+        if cmd[1:3] == ["manifest", "inspect"]:
+            return SimpleNamespace(returncode=1)
+        return SimpleNamespace(returncode=1, stdout="")
+
+    clean_env = {
+        k: v
+        for k, v in _os.environ.items()
+        if k not in ("SUBHKL_CONTAINER_IMAGE", "SUBHKL_CONTAINER_TAG")
+    }
+    with (
+        patch.dict(_os.environ, clean_env, clear=True),
+        patch("subprocess.run", side_effect=_fake_podman_run),
+    ):
+        resolved_img, note_branch = (
+            NovaGalaxyPipelineRunner._resolve_local_podman_image(
+                "ghcr.io/neutrons/subhkl:feat-local-sns-hfir-fallback"
+            )
+        )
+        assert resolved_img == "ghcr.io/neutrons/subhkl:main"
+        assert note_branch is not None and "bind-mounted subhkl" in note_branch
+
+        exact_img, note_exact = NovaGalaxyPipelineRunner._resolve_local_podman_image(
+            "ghcr.io/neutrons/subhkl:main"
+        )
+        assert exact_img == "ghcr.io/neutrons/subhkl:main"
+        assert note_exact is None
+
+        offline_rel_img, note_rel = (
+            NovaGalaxyPipelineRunner._resolve_local_podman_image(
+                "ghcr.io/neutrons/subhkl:9.9.9"
+            )
+        )
+        assert offline_rel_img == "ghcr.io/neutrons/subhkl:main"
+        assert note_rel is not None and "unreachable" in note_rel
+
+    # cancel_active_job immediately kills (podman kill) and force-removes (-f -i -t 0) local container
+    podman_cancel_cmds: list[list[str]] = []
+
+    def _record_podman_cancel(cmd: list[str], **_kwargs: object) -> object:
+        from types import SimpleNamespace
+
+        podman_cancel_cmds.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    runner_local_fs.active_job = {
+        "job_id": "gpu-12345-1",
+        "container_name": "subhkl-gpu-12345-1",
+        "stage_id": "solve",
+        "mode": "container_gpu",
+        "state": "running",
+        "stdout": "",
+        "stderr": "",
+    }
+    mock_proc = MagicMock()
+    mock_proc.pid = 999999
+    mock_proc.poll.side_effect = [None, 0]
+    runner_local_fs._active_procs = {"gpu-12345-1": mock_proc}
+    with (
+        patch("shutil.which", return_value="/usr/bin/podman"),
+        patch("subprocess.run", side_effect=_record_podman_cancel),
+        patch("os.killpg"),
+        patch("os.getpgid", return_value=999999),
+    ):
+        cancel_res = runner_local_fs.cancel_active_job("solve")
+    assert cancel_res["ok"] is True
+    assert cancel_res["status"] == "cancelled"
+    assert cancel_res["cancelled_container"] == "subhkl-gpu-12345-1"
+    assert ["/usr/bin/podman", "kill", "subhkl-gpu-12345-1"] in podman_cancel_cmds
+    assert [
+        "/usr/bin/podman",
+        "rm",
+        "-f",
+        "-i",
+        "-t",
+        "0",
+        "subhkl-gpu-12345-1",
+    ] in podman_cancel_cmds
+    assert "Stopped container subhkl-gpu-12345-1" in cancel_res["job"]["stdout"]
 
     # Mock NDIP Galaxy connection to verify routing through neutrons_load_data
     runner_ndip = NovaGalaxyPipelineRunner(

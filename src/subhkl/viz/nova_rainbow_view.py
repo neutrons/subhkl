@@ -18,8 +18,10 @@ import contextlib
 import http.server
 import json
 import os
+import re
 import shutil
 import socketserver
+import subprocess
 import tempfile
 import threading
 import time
@@ -1795,11 +1797,59 @@ class NovaGalaxyPipelineRunner:
             "status": "submitted",
         }
 
+    @staticmethod
+    def _terminate_local_container_or_proc(
+        container_name: str | None,
+        proc: subprocess.Popen[bytes] | None,
+    ) -> bool:
+        """Immediately kill and force-remove a local Podman container and/or subprocess."""
+        import signal
+
+        killed_container = False
+        podman_bin = shutil.which("podman")
+        if container_name and podman_bin:
+            for subcmd, t_out in (
+                ([podman_bin, "kill", str(container_name)], 5.0),
+                ([podman_bin, "rm", "-f", "-i", "-t", "0", str(container_name)], 10.0),
+            ):
+                with contextlib.suppress(
+                    OSError, subprocess.SubprocessError, ValueError, TypeError
+                ):
+                    res = subprocess.run(
+                        subcmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=t_out,
+                        check=False,
+                    )
+                    if res.returncode == 0:
+                        killed_container = True
+
+        if proc is not None and proc.poll() is None:
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                else:
+                    proc.terminate()
+            except OSError:
+                with contextlib.suppress(OSError):
+                    proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=0.3)
+            if proc.poll() is None:
+                try:
+                    if hasattr(os, "killpg"):
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        proc.kill()
+
+        return killed_container
+
     def cancel_active_job(self, stage_id: str | None = None) -> dict[str, Any]:
         """Cancel the currently running NDIP Galaxy or local container job."""
-        import signal
-        import subprocess
-
         aj = self.active_job
         if not isinstance(aj, dict):
             return {"ok": True, "status": "idle", "message": "No active job to cancel"}
@@ -1827,29 +1877,24 @@ class NovaGalaxyPipelineRunner:
                 self._api_request("DELETE", f"/api/jobs/{jid}")
                 cancelled_galaxy_ids.append(jid)
 
-        proc = getattr(self, "_active_proc", None)
-        if proc is not None:
-            try:
-                if hasattr(os, "killpg"):
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                else:
-                    proc.terminate()
-            except OSError:
-                with contextlib.suppress(OSError):
-                    proc.terminate()
+        procs_map: dict[str, subprocess.Popen[bytes]] = getattr(
+            self, "_active_procs", {}
+        )
+        proc = procs_map.get(cur_jid) or getattr(self, "_active_proc", None)
+        cname = (
+            str(
+                aj.get("container_name")
+                or getattr(self, "_active_container_name", None)
+                or ""
+            ).strip()
+            or None
+        )
 
-        cname = getattr(self, "_active_container_name", None)
+        killed_container = self._terminate_local_container_or_proc(cname, proc)
         if cname:
-            with contextlib.suppress(
-                OSError, subprocess.SubprocessError, ValueError, TypeError
-            ):
-                subprocess.run(
-                    ["podman", "rm", "-f", str(cname)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5.0,
-                    check=False,
-                )
+            aj["stdout"] = (
+                aj.get("stdout", "") + f"[container] Stopped container {cname}\n"
+            )[-24000:]
 
         return {
             "ok": True,
@@ -1858,6 +1903,7 @@ class NovaGalaxyPipelineRunner:
             "previous_state": prev_state,
             "cancelled_job_id": cur_jid,
             "cancelled_galaxy_jobs": cancelled_galaxy_ids,
+            "cancelled_container": cname if killed_container else None,
             "job": aj,
         }
 
@@ -3268,12 +3314,398 @@ class NovaGalaxyPipelineRunner:
                 existing_job_record=job_record,
             )
 
-    def check_neutron_paths(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Validate NeXus / HDF5 file paths strictly via NDIP's ``neutrons_load_data`` tool.
+    SNS_HFIR_ROOTS: ClassVar[dict[str, str]] = {"SNS": "/SNS", "HFIR": "/HFIR"}
 
-        Never probes ``/SNS`` or ``/HFIR`` directly on the host/container filesystem so
-        user permissions are always enforced by NDIP / Galaxy.
+    @staticmethod
+    def _resolve_local_podman_image(
+        preferred_image: str,
+        *,
+        podman_bin: str = "podman",
+    ) -> tuple[str, str | None]:
+        """Resolve a usable Podman base image when ``preferred_image`` is an unbuilt branch tag or offline."""
+        if (
+            os.environ.get("SUBHKL_CONTAINER_IMAGE", "").strip()
+            or os.environ.get("SUBHKL_CONTAINER_TAG", "").strip()
+        ):
+            return preferred_image, None
+
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            exists_res = subprocess.run(
+                [podman_bin, "image", "exists", preferred_image],
+                capture_output=True,
+                timeout=3.0,
+                check=False,
+            )
+            if exists_res.returncode == 0:
+                return preferred_image, None
+
+        repo, sep, tag = preferred_image.rpartition(":")
+        if not sep or "/" in tag:
+            repo, tag = preferred_image, "latest"
+
+        local_images: list[str] = []
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            list_res = subprocess.run(
+                [
+                    podman_bin,
+                    "images",
+                    "--format",
+                    "{{.Repository}}:{{.Tag}}",
+                    repo,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            if list_res.returncode == 0:
+                for raw_line in list_res.stdout.splitlines():
+                    img = raw_line.strip()
+                    if (
+                        img
+                        and img.startswith(f"{repo}:")
+                        and not img.endswith(":<none>")
+                        and img not in local_images
+                    ):
+                        local_images.append(img)
+
+        local_fallback: str | None = None
+        for candidate in (f"{repo}:main", f"{repo}:latest"):
+            if candidate in local_images:
+                local_fallback = candidate
+                break
+        if local_fallback is None and local_images:
+            local_fallback = local_images[0]
+
+        is_published_tag = bool(
+            tag in ("main", "latest")
+            or re.match(r"^[vV]?\d+\.\d+", tag)
+            or re.match(r"^pr-\d+$", tag)
+        )
+        if not is_published_tag:
+            if local_fallback is not None:
+                return (
+                    local_fallback,
+                    f"{preferred_image} not built locally; using cached {local_fallback} with bind-mounted subhkl",
+                )
+            return (
+                f"{repo}:main",
+                f"{preferred_image} is a git branch tag; falling back to {repo}:main with bind-mounted subhkl",
+            )
+
+        if local_fallback is not None:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                manifest_res = subprocess.run(
+                    [podman_bin, "manifest", "inspect", preferred_image],
+                    capture_output=True,
+                    timeout=4.0,
+                    check=False,
+                )
+                if manifest_res.returncode != 0:
+                    return (
+                        local_fallback,
+                        f"{preferred_image} unreachable in registry; using cached {local_fallback} with bind-mounted subhkl",
+                    )
+
+        return preferred_image, None
+
+    @staticmethod
+    def _parse_run_range_spec(spec_str: str) -> list[int]:
+        """Parse run specifications such as '2625-2638', '2632-2638/2', '2632:2638:2', or '2632..2638..2'."""
+        import re as _re
+
+        runs: list[int] = []
+        seen: set[int] = set()
+        norm = _re.sub(r"\s*(\.\.|[-–:/])\s*", r"\1", str(spec_str or ""))
+        for tok in _re.split(r"[,\s]+", norm):
+            t = tok.strip()
+            if not t:
+                continue
+            m = _re.match(r"^(\d+)(?:\.\.|[-–:])(\d+)(?:(?:\.\.|[/:])(\d+)?)?$", t)
+            if m:
+                a, b = int(m.group(1)), int(m.group(2))
+                step = int(m.group(3)) if m.group(3) else 1
+                if step <= 0:
+                    continue
+                lo, hi = min(a, b), max(a, b)
+                for r in range(lo, hi + 1, step):
+                    if len(runs) >= 20000:
+                        break
+                    if r not in seen:
+                        seen.add(r)
+                        runs.append(r)
+            elif t.isdigit():
+                r = int(t)
+                if r not in seen:
+                    seen.add(r)
+                    runs.append(r)
+        return runs
+
+    @staticmethod
+    def _format_run_list_to_spec(run_numbers: list[int]) -> str:
+        uniq = sorted({int(n) for n in run_numbers})
+        if not uniq:
+            return ""
+        parts: list[str] = []
+        start = prev = uniq[0]
+        for cur in uniq[1:]:
+            if cur == prev + 1:
+                prev = cur
+            else:
+                if prev == start:
+                    parts.append(str(start))
+                elif prev == start + 1:
+                    parts.append(f"{start},{prev}")
+                else:
+                    parts.append(f"{start}-{prev}")
+                start = prev = cur
+        if prev == start:
+            parts.append(str(start))
+        elif prev == start + 1:
+            parts.append(f"{start},{prev}")
+        else:
+            parts.append(f"{start}-{prev}")
+        return ",".join(parts)
+
+    def _facility_mount_root(self, fac: str) -> str:
+        key = str(fac or "HFIR").strip().upper()
+        return self.SNS_HFIR_ROOTS.get(key, "/HFIR")
+
+    def _has_local_sns_hfir_fs(self) -> bool:
+        return any(
+            os.path.isdir(root)
+            for root in (
+                self._facility_mount_root("SNS"),
+                self._facility_mount_root("HFIR"),
+            )
+        )
+
+    @staticmethod
+    def _read_local_nexus_summary(path: str) -> dict[str, Any]:
+        """Lightweight read of NeXus HDF5 header metadata (title, sample, angles, duration) without touching event/image arrays."""
+        import datetime as _dt
+        import re as _re
+
+        info: dict[str, Any] = {
+            "title": "",
+            "sample_name": "",
+            "angles": "",
+            "duration_s": 0.0,
+            "duration_hms": "",
+            "total_counts": 0,
+            "size_mb": 0.0,
+            "created": "",
+        }
+        with contextlib.suppress(OSError):
+            st = os.stat(path)
+            info["size_mb"] = round(st.st_size / (1024.0 * 1024.0), 1)
+            info["created"] = _dt.datetime.fromtimestamp(
+                st.st_mtime, tz=_dt.UTC
+            ).strftime("%Y-%m-%d %H:%M")
+
+        def _read_str(h5_obj: Any, ds_path: str) -> str:
+            if ds_path not in h5_obj:
+                return ""
+            raw = h5_obj[ds_path][()]
+            if hasattr(raw, "size") and getattr(raw, "size", 0) > 0:
+                raw = raw.flat[0]
+            if isinstance(raw, (bytes, bytearray)):
+                return raw.decode("utf-8", "replace").strip()
+            return str(raw).strip()
+
+        with contextlib.suppress(Exception):
+            import h5py
+
+            with h5py.File(path, "r") as f:
+                title = _read_str(f, "entry/title")
+                sample_name = _read_str(f, "entry/sample/name")
+                info["title"] = title
+                info["sample_name"] = sample_name
+                if "entry/duration" in f:
+                    dur_raw = f["entry/duration"][()]
+                    dur_s = float(
+                        dur_raw.flat[0] if hasattr(dur_raw, "flat") else dur_raw
+                    )
+                    if dur_s > 0:
+                        info["duration_s"] = dur_s
+                        tot_sec = round(dur_s)
+                        hh, rem = divmod(tot_sec, 3600)
+                        mm, ss = divmod(rem, 60)
+                        info["duration_hms"] = f"{hh:02d}:{mm:02d}:{ss:02d}"
+                if "entry/total_counts" in f:
+                    tc_raw = f["entry/total_counts"][()]
+                    info["total_counts"] = int(
+                        float(tc_raw.flat[0] if hasattr(tc_raw, "flat") else tc_raw)
+                    )
+                angle_parts: list[str] = []
+                if "entry/DASlogs" in f:
+                    das = f["entry/DASlogs"]
+                    for ax_key, label in (
+                        ("omega", "omega"),
+                        ("BL11B:Mot:omega", "omega"),
+                        ("HB2C:Mot:s1", "omega"),
+                        ("chi", "chi"),
+                        ("BL11B:Mot:chi", "chi"),
+                        ("phi", "phi"),
+                        ("BL11B:Mot:phi", "phi"),
+                    ):
+                        if ax_key in das and "average_value" in das[ax_key]:
+                            av = das[ax_key]["average_value"][()]
+                            val_f = float(av.flat[0] if hasattr(av, "flat") else av)
+                            tag = f"{label}={val_f:.1f}"
+                            if not any(p.startswith(f"{label}=") for p in angle_parts):
+                                angle_parts.append(tag)
+                angles = ";".join(angle_parts)
+                if not angles and title:
+                    ax_m = _re.findall(
+                        r"(axis\s*\d+|omega|phi|chi|kappa)\s*=?\s*([-+]?\d+(?:\.\d+)?)",
+                        title,
+                        flags=_re.IGNORECASE,
+                    )
+                    if ax_m:
+                        angles = ";".join(
+                            f"{k.replace(' ', '').lower()}={v}" for k, v in ax_m
+                        )
+                info["angles"] = angles
+        return info
+
+    def _browse_local_sns_hfir_catalog(
+        self,
+        fac: str,
+        inst: str,
+        ipts_raw: str,
+        *,
+        skip_experiments: bool = False,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Scan mounted ``/SNS/<INST>`` or ``/HFIR/<INST>`` directories when Galaxy / ONCat is unavailable."""
+        import datetime as _dt
+        import re as _re
+
+        fac_root = self._facility_mount_root(fac)
+        inst_dir = os.path.join(fac_root, inst)
+        experiments: list[dict[str, Any]] = []
+        runs: list[dict[str, Any]] = []
+        if not os.path.isdir(inst_dir):
+            return experiments, runs
+
+        if not skip_experiments:
+            with contextlib.suppress(OSError):
+                for entry in os.scandir(inst_dir):
+                    m_ip = _re.match(r"^IPTS-(\d+)$", entry.name, _re.IGNORECASE)
+                    if not m_ip or not entry.is_dir():
+                        continue
+                    ip_num = m_ip.group(1)
+                    nxs_dir = os.path.join(entry.path, "nexus")
+                    run_nums: list[int] = []
+                    latest_mtime = 0.0
+                    if os.path.isdir(nxs_dir) and os.access(nxs_dir, os.R_OK | os.X_OK):
+                        with contextlib.suppress(OSError):
+                            for nf in os.scandir(nxs_dir):
+                                if not nf.name.endswith((".nxs.h5", ".nxs")):
+                                    continue
+                                m_r = _re.search(
+                                    r"_([0-9]+)\.nxs", nf.name, _re.IGNORECASE
+                                )
+                                if m_r:
+                                    run_nums.append(int(m_r.group(1)))
+                                with contextlib.suppress(OSError):
+                                    latest_mtime = max(latest_mtime, nf.stat().st_mtime)
+                    else:
+                        continue
+                    run_nums_sorted = sorted(set(run_nums))
+                    latest_dt = (
+                        _dt.datetime.fromtimestamp(latest_mtime, tz=_dt.UTC).strftime(
+                            "%Y-%m-%d"
+                        )
+                        if latest_mtime > 0
+                        else ""
+                    )
+                    experiments.append(
+                        {
+                            "ipts": ip_num,
+                            "id": f"IPTS-{ip_num}",
+                            "n_runs": len(run_nums_sorted),
+                            "run_ranges": self._format_run_list_to_spec(
+                                run_nums_sorted
+                            ),
+                            "min_run": run_nums_sorted[0] if run_nums_sorted else None,
+                            "max_run": run_nums_sorted[-1] if run_nums_sorted else None,
+                            "latest_date": latest_dt,
+                            "title": "",
+                        }
+                    )
+            experiments.sort(
+                key=lambda x: (
+                    1 if (x.get("n_runs") or 0) > 0 else 0,
+                    int(x["ipts"]) if str(x.get("ipts", "")).isdigit() else 0,
+                ),
+                reverse=True,
+            )
+
+        if ipts_raw:
+            nxs_dir = os.path.join(inst_dir, f"IPTS-{ipts_raw}", "nexus")
+            if os.path.isdir(nxs_dir) and os.access(nxs_dir, os.R_OK | os.X_OK):
+                entries_by_run: list[tuple[int, str]] = []
+                with contextlib.suppress(OSError):
+                    for nf in os.scandir(nxs_dir):
+                        if (
+                            not nf.name.endswith((".nxs.h5", ".nxs"))
+                            or not nf.is_file()
+                        ):
+                            continue
+                        m_r = _re.search(r"_([0-9]+)\.nxs", nf.name, _re.IGNORECASE)
+                        if m_r:
+                            entries_by_run.append((int(m_r.group(1)), nf.path))
+                entries_by_run.sort(key=lambda t: t[0])
+                read_headers = len(entries_by_run) <= 250
+                for r_num, r_path in entries_by_run:
+                    if read_headers:
+                        meta = self._read_local_nexus_summary(r_path)
+                    else:
+                        meta = {
+                            "title": "",
+                            "sample_name": "",
+                            "angles": "",
+                            "duration_s": 0.0,
+                            "duration_hms": "",
+                            "total_counts": 0,
+                            "size_mb": 0.0,
+                            "created": "",
+                        }
+                        with contextlib.suppress(OSError):
+                            st = os.stat(r_path)
+                            meta["size_mb"] = round(st.st_size / (1024.0 * 1024.0), 1)
+                    runs.append(
+                        {
+                            "run": r_num,
+                            "location": r_path,
+                            "title": meta["title"],
+                            "sample_name": meta["sample_name"],
+                            "angles": meta["angles"],
+                            "size_mb": meta["size_mb"],
+                            "created": meta["created"],
+                            "duration_s": meta["duration_s"],
+                            "duration_hms": meta["duration_hms"],
+                            "total_counts": meta["total_counts"],
+                        }
+                    )
+        return experiments, runs
+
+    def _remap_to_facility_root(self, p_str: str) -> str:
+        import re as _re
+
+        m = _re.match(r"^/(SNS|HFIR)(/.*)$", p_str, _re.IGNORECASE)
+        if m:
+            fac_key = m.group(1).upper()
+            root = self._facility_mount_root(fac_key)
+            return root.rstrip("/") + m.group(2)
+        return p_str
+
+    def check_neutron_paths(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Validate NeXus / HDF5 file paths via NDIP ``neutrons_load_data`` when Galaxy is available,
+        falling back to direct local ``/SNS`` / ``/HFIR`` filesystem inspection when Galaxy is unavailable.
         """
+        import glob as _glob
         import re as _re
 
         fac = str(body.get("facility") or "HFIR").strip()
@@ -3288,6 +3720,18 @@ class NovaGalaxyPipelineRunner:
             ]
 
         expanded: list[str] = [str(p).strip() for p in raw_paths if str(p).strip()]
+        if not expanded and ipts_raw and body.get("runs"):
+            fac_norm = fac.upper()
+            inst_norm = inst.upper()
+            if inst_norm in ("MANDI", "TOPAZ") and fac_norm == "HFIR":
+                fac_norm = "SNS"
+            elif inst_norm in ("CG4D", "IMAGINE") and fac_norm == "SNS":
+                fac_norm = "HFIR"
+            root_dir = self._facility_mount_root(fac_norm).rstrip("/")
+            expanded = [
+                f"{root_dir}/{inst_norm}/IPTS-{ipts_raw}/nexus/{inst_norm}_{r}.nxs.h5"
+                for r in self._parse_run_range_spec(str(body.get("runs") or ""))
+            ]
         if not expanded:
             return {
                 "ok": False,
@@ -3305,16 +3749,21 @@ class NovaGalaxyPipelineRunner:
 
         ok = False
         ndip_checked = False
+        checked_via = "ndip_unavailable"
         verified_dataset_ids: list[str] = []
         msg = ""
         sample_title = ""
         sample_goniometer = ""
+        suggested_ipts: str | None = None
+        suggested_paths: list[str] = []
         oncat_existing: list[str] = []
         oncat_missing: list[str] = []
+        galaxy_unreachable = not self.is_connected
 
         if self.is_connected and self._has_tool_on_galaxy("neutrons_load_data"):
             try:
                 ndip_checked = True
+                checked_via = "ndip_neutrons_load_data"
                 m_p0 = _re.match(
                     r"^/(SNS|HFIR)/([^/]+)/IPTS-([^/]+)/", expanded[0], _re.IGNORECASE
                 )
@@ -3465,16 +3914,125 @@ class NovaGalaxyPipelineRunner:
                     if not ok and not msg:
                         msg = f"NDIP Load Neutron Data check timed out for {first_p}"
             except _NOVA_RECOVERABLE_ERRORS as exc:
+                galaxy_unreachable = True
+                ndip_checked = False
                 msg = f"NDIP Load Neutron Data error: {self._clean_err_msg(exc)}"
         else:
-            msg = "NDIP Galaxy connection required to verify /SNS or /HFIR paths via neutrons_load_data"
+            galaxy_unreachable = True
+
+        # Fallback: when NDIP Galaxy is unconfigured or unreachable, inspect local /SNS and /HFIR directly
+        if galaxy_unreachable and not ok:
+            if self._has_local_sns_hfir_fs() or any(
+                os.path.exists(self._remap_to_facility_root(p)) for p in expanded
+            ):
+                checked_via = "local_filesystem"
+                fs_existing: list[str] = []
+                fs_missing: list[str] = []
+                titles_local: list[str] = []
+                gonio_local: list[str] = []
+                for p in expanded:
+                    p_loc = self._remap_to_facility_root(p)
+                    if any(ch in p_loc for ch in ("*", "?", "[")):
+                        matches = sorted(
+                            m
+                            for m in _glob.glob(p_loc)
+                            if os.path.isfile(m) and os.access(m, os.R_OK)
+                        )
+                        if matches:
+                            fs_existing.extend(matches)
+                        else:
+                            fs_missing.append(p_loc)
+                    elif os.path.isfile(p_loc) and os.access(p_loc, os.R_OK):
+                        fs_existing.append(p_loc)
+                    else:
+                        fs_missing.append(p_loc)
+
+                for p_ok in fs_existing[:6]:
+                    meta = self._read_local_nexus_summary(p_ok)
+                    t_str = str(meta.get("title") or "").strip()
+                    g_str = str(meta.get("angles") or "").strip()
+                    if t_str and t_str not in titles_local:
+                        titles_local.append(t_str)
+                    if g_str and g_str not in gonio_local:
+                        gonio_local.append(g_str)
+                if titles_local:
+                    sample_title = "; ".join(titles_local[:3])
+                if gonio_local:
+                    sample_goniometer = "; ".join(gonio_local[:3])
+
+                oncat_existing = fs_existing
+                oncat_missing = fs_missing
+                if fs_existing and not fs_missing:
+                    ok = True
+                    verified_dataset_ids = [
+                        f"local_fs:{fac.upper()}:{inst.upper()}:IPTS-{ipts_raw or '?'}:{len(fs_existing)}"
+                    ]
+                    msg = (
+                        f"Verified {len(fs_existing)} file(s) on local /SNS or /HFIR filesystem "
+                        f"({inst} IPTS-{ipts_raw or '?'})"
+                    )
+                    if sample_title:
+                        msg += f" — {sample_title[:60]}"
+                else:
+                    ok = False
+                    # If the user entered the wrong IPTS, scan sibling IPTS-*/nexus for the missing run filename
+                    if fs_missing:
+                        first_miss_bn = os.path.basename(fs_missing[0])
+                        fac_guess = (
+                            "SNS"
+                            if inst.upper() in ("MANDI", "TOPAZ")
+                            else (
+                                "HFIR"
+                                if inst.upper() in ("CG4D", "IMAGINE")
+                                else fac.upper()
+                            )
+                        )
+                        inst_root = os.path.join(
+                            self._facility_mount_root(fac_guess), inst.upper()
+                        )
+                        if os.path.isdir(inst_root):
+                            with contextlib.suppress(OSError):
+                                for ip_ent in os.scandir(inst_root):
+                                    m_ip = _re.match(
+                                        r"^IPTS-(\d+)$", ip_ent.name, _re.IGNORECASE
+                                    )
+                                    if not m_ip or not ip_ent.is_dir():
+                                        continue
+                                    cand_f = os.path.join(
+                                        ip_ent.path, "nexus", first_miss_bn
+                                    )
+                                    if os.path.isfile(cand_f) and os.access(
+                                        cand_f, os.R_OK
+                                    ):
+                                        suggested_ipts = m_ip.group(1)
+                                        suggested_paths = [
+                                            os.path.join(
+                                                ip_ent.path,
+                                                "nexus",
+                                                os.path.basename(mp),
+                                            )
+                                            for mp in expanded
+                                        ]
+                                        break
+                    if fs_existing:
+                        msg = (
+                            f"Local filesystem: {len(fs_existing)} found, {len(fs_missing)} missing "
+                            f"({', '.join(os.path.basename(x) for x in fs_missing[:4])})"
+                        )
+                    else:
+                        msg = (
+                            f"Local filesystem: file not found or permission denied "
+                            f"({', '.join(os.path.basename(x) for x in fs_missing[:3])})"
+                        )
+                        if suggested_ipts:
+                            msg += f" — found in IPTS-{suggested_ipts}"
+            elif not msg:
+                msg = "NDIP Galaxy connection or local /SNS, /HFIR mount required to verify neutron data paths"
 
         return {
             "ok": ok,
             "ndip_checked": ndip_checked,
-            "checked_via": "ndip_neutrons_load_data"
-            if ndip_checked
-            else "ndip_unavailable",
+            "checked_via": checked_via,
             "existing": oncat_existing
             if oncat_existing and ok
             else (list(expanded) if ok else []),
@@ -3482,8 +4040,8 @@ class NovaGalaxyPipelineRunner:
             if oncat_missing
             else ([] if ok else list(expanded)),
             "ipts_exists": ok,
-            "suggested_ipts": None,
-            "suggested_paths": [],
+            "suggested_ipts": suggested_ipts,
+            "suggested_paths": suggested_paths,
             "verified_dataset_ids": verified_dataset_ids,
             "sample_title": sample_title,
             "sample_goniometer": sample_goniometer,
@@ -3889,13 +4447,16 @@ class NovaGalaxyPipelineRunner:
                         instrument=inst,
                     )
                 except _NOVA_RECOVERABLE_ERRORS:
-                    import pyoncat as _pyoncat  # type: ignore[import-untyped]
+                    if is_auth:
+                        import pyoncat as _pyoncat  # type: ignore[import-untyped]
 
-                    oncat = _pyoncat.ONCat(
-                        os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
-                    )
-                    is_auth = False
-                    raw_exps = oncat.Experiment.list(facility=fac, instrument=inst)
+                        oncat = _pyoncat.ONCat(
+                            os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
+                        )
+                        is_auth = False
+                        raw_exps = oncat.Experiment.list(facility=fac, instrument=inst)
+                    else:
+                        raise
 
                 for e in raw_exps:
                     eid = str(e.get("id") or "")
@@ -3962,19 +4523,22 @@ class NovaGalaxyPipelineRunner:
                             exts=[".nxs.h5"],
                         )
                     except _NOVA_RECOVERABLE_ERRORS:
-                        import pyoncat as _pyoncat  # type: ignore[import-untyped]
+                        if is_auth:
+                            import pyoncat as _pyoncat  # type: ignore[import-untyped]
 
-                        oncat = _pyoncat.ONCat(
-                            os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
-                        )
-                        is_auth = False
-                        dfs = oncat.Datafile.list(
-                            facility=fac,
-                            instrument=inst,
-                            experiment=f"IPTS-{ipts_raw}",
-                            projection=proj,
-                            exts=[".nxs.h5"],
-                        )
+                            oncat = _pyoncat.ONCat(
+                                os.environ.get("ONCAT_URL", self.ONCAT_DEFAULT_URL)
+                            )
+                            is_auth = False
+                            dfs = oncat.Datafile.list(
+                                facility=fac,
+                                instrument=inst,
+                                experiment=f"IPTS-{ipts_raw}",
+                                projection=proj,
+                                exts=[".nxs.h5"],
+                            )
+                        else:
+                            raise
 
                     for d in dfs:
                         idx_d = d.get("indexed") or {}
@@ -4052,11 +4616,27 @@ class NovaGalaxyPipelineRunner:
                 runs_cache[(fac, inst, ipts_raw, is_auth)] = (now, runs)
                 self._oncat_runs_cache = runs_cache
 
+        catalog_source = "oncat"
+        if (not experiments and not skip_exps) or (ipts_raw and not runs):
+            fs_exps, fs_runs = self._browse_local_sns_hfir_catalog(
+                fac,
+                inst,
+                ipts_raw,
+                skip_experiments=bool(experiments or skip_exps),
+            )
+            if not experiments and fs_exps:
+                experiments = fs_exps
+                catalog_source = "local_filesystem"
+            if ipts_raw and not runs and fs_runs:
+                runs = fs_runs
+                catalog_source = "local_filesystem"
+
         return {
             "ok": True,
             "facility": fac,
             "instrument": inst,
             "ipts": ipts_raw,
+            "catalog_source": catalog_source,
             "oncat_authenticated": is_auth,
             "oncat_auth": auth_status,
             "multi_run_supported": multi_run_supported,
@@ -4070,6 +4650,7 @@ class NovaGalaxyPipelineRunner:
     ) -> list[str]:
         """Resolve raw .nxs.h5 paths from explicit nexus_files, galaxy_dataset_id, IPTS+runs, or work_dir."""
         import glob as _glob
+        import re as _re
 
         resolved: list[str] = []
         raw_list = params.get("nexus_files")
@@ -4079,7 +4660,7 @@ class NovaGalaxyPipelineRunner:
             ]
         if isinstance(raw_list, list) and raw_list:
             for item in raw_list:
-                p_str = str(item).strip()
+                p_str = self._remap_to_facility_root(str(item).strip())
                 if not p_str:
                     continue
                 if any(ch in p_str for ch in ("*", "?", "[")):
@@ -4088,6 +4669,29 @@ class NovaGalaxyPipelineRunner:
                         resolved.extend(matches)
                         continue
                 resolved.append(os.path.abspath(p_str))
+            if resolved:
+                return resolved
+
+        ipts_raw = _re.sub(
+            r"^IPTS-", "", str(params.get("ipts") or "").strip(), flags=_re.IGNORECASE
+        )
+        runs_spec = str(params.get("runs") or "").strip()
+        if ipts_raw and runs_spec:
+            inst_norm = str(params.get("instrument") or "CG4D").strip().upper()
+            fac_norm = str(params.get("facility") or "HFIR").strip().upper()
+            if inst_norm in ("MANDI", "TOPAZ") and fac_norm == "HFIR":
+                fac_norm = "SNS"
+            elif inst_norm in ("CG4D", "IMAGINE") and fac_norm == "SNS":
+                fac_norm = "HFIR"
+            root_dir = self._facility_mount_root(fac_norm).rstrip("/")
+            nxs_dir = os.path.join(root_dir, inst_norm, f"IPTS-{ipts_raw}", "nexus")
+            for r_num in self._parse_run_range_spec(runs_spec):
+                cand_h5 = os.path.join(nxs_dir, f"{inst_norm}_{r_num}.nxs.h5")
+                cand_nxs = os.path.join(nxs_dir, f"{inst_norm}_{r_num}.nxs")
+                if os.path.isfile(cand_nxs) and not os.path.isfile(cand_h5):
+                    resolved.append(cand_nxs)
+                else:
+                    resolved.append(cand_h5)
             if resolved:
                 return resolved
 
@@ -4201,11 +4805,19 @@ class NovaGalaxyPipelineRunner:
         raw_nxs_local: list[str] = []
         merged_label = "merged.h5"
         if stage_id == "reduce":
+            resolved_candidates = self._resolve_raw_nexus_inputs(params, work_dir)
             raw_nxs_local = [
                 p
-                for p in self._resolve_raw_nexus_inputs(params, work_dir)
-                if os.path.isfile(p)
+                for p in resolved_candidates
+                if os.path.isfile(p) and os.access(p, os.R_OK)
             ]
+            if resolved_candidates and not raw_nxs_local:
+                missing_sample = ", ".join(
+                    os.path.basename(p) for p in resolved_candidates[:4]
+                )
+                raise FileNotFoundError(
+                    f"Local NeXus file(s) not found or unreadable on /SNS or /HFIR: {missing_sample}"
+                )
             if raw_nxs_local:
                 work_dir, merged_label = self._work_dir_for_reduce(
                     raw_nxs_local, work_dir
@@ -4604,8 +5216,22 @@ class NovaGalaxyPipelineRunner:
             if stage_id == "merge"
             else get_container_image()
         )
-        if shutil.which("podman"):
-            raw_dirs = {os.path.dirname(os.path.abspath(p)) for p in raw_nxs_local}
+        image_fallback_note: str | None = None
+        podman_bin = shutil.which("podman")
+        if podman_bin:
+            if stage_id != "merge":
+                container_image, image_fallback_note = self._resolve_local_podman_image(
+                    container_image,
+                    podman_bin=podman_bin,
+                )
+            raw_dirs = {
+                d
+                for p in raw_nxs_local
+                for d in (
+                    os.path.dirname(os.path.abspath(p)),
+                    os.path.dirname(os.path.realpath(p)),
+                )
+            }
             mount_dirs = sorted(
                 {
                     os.path.dirname(merged_path),
@@ -4682,7 +5308,9 @@ class NovaGalaxyPipelineRunner:
             gpu_info = "CPU fallback"
             gpu_env["JAX_PLATFORMS"] = "cpu"
 
-        job_id = f"gpu-{int(time.time())}"
+        seq = int(getattr(self, "_local_job_seq", 0)) + 1
+        self._local_job_seq = seq
+        job_id = f"gpu-{int(time.time() * 1000)}-{seq}"
         container_name: str | None = None
         if cmd and cmd[0] == "podman":
             container_name = f"subhkl-{job_id}"
@@ -4696,6 +5324,8 @@ class NovaGalaxyPipelineRunner:
         if stage_id != "merge":
             if fallback_reason and existing_job_record is None:
                 header_lines.append(f"[ndip] Note: {fallback_reason}")
+            if image_fallback_note:
+                header_lines.append(f"[container] Note: {image_fallback_note}")
             header_lines.append(f"[pulsar] Runner host: {host_tag}")
             header_lines.append(
                 f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"
@@ -4705,6 +5335,7 @@ class NovaGalaxyPipelineRunner:
         if existing_job_record is not None:
             job_record = existing_job_record
             job_record["job_id"] = job_id
+            job_record["container_name"] = container_name
             job_record["mode"] = "container_gpu"
             job_record["state"] = "running"
             job_record["runner_host"] = host_tag
@@ -4718,6 +5349,7 @@ class NovaGalaxyPipelineRunner:
         else:
             job_record = {
                 "job_id": job_id,
+                "container_name": container_name,
                 "tool_id": f"subhkl::{stage_id}",
                 "stage_id": stage_id,
                 "mode": "container_gpu",
@@ -4735,6 +5367,11 @@ class NovaGalaxyPipelineRunner:
             }
             self.active_job = job_record
 
+        if container_name:
+            self._active_container_name = container_name
+        if not hasattr(self, "_active_procs"):
+            self._active_procs = {}
+
         if stage_id == "solve":
             job_record["images_h5_path"] = merged_path
             job_record["solve_params"] = {
@@ -4746,8 +5383,11 @@ class NovaGalaxyPipelineRunner:
             }
 
         def _stream_proc() -> None:
+            proc: subprocess.Popen[bytes] | None = None
             try:
-                self._active_container_name = container_name
+                if job_record.get("cancel_requested"):
+                    job_record["state"] = "deleted"
+                    return
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -4756,7 +5396,12 @@ class NovaGalaxyPipelineRunner:
                     env=gpu_env,
                     start_new_session=True,
                 )
+                self._active_procs[job_id] = proc
                 self._active_proc = proc
+                if job_record.get("cancel_requested"):
+                    self._terminate_local_container_or_proc(container_name, proc)
+                    job_record["state"] = "deleted"
+                    return
                 assert proc.stdout is not None
                 blind_src = out_h5[:-3] + ".blind.h5"
                 stages_src = out_h5[:-3] + ".stages.h5"
@@ -4887,7 +5532,7 @@ class NovaGalaxyPipelineRunner:
                                             ),
                                         }
                 rc = proc.wait()
-                if rc == 0:
+                if rc == 0 and not job_record.get("cancel_requested"):
                     job_record["ladder_rung_idx"] = 0 if stage_id == "reduce" else 4
                     final_h5 = out_h5
                     if stage_id == "reduce" and os.path.isfile(out_h5):
@@ -5141,8 +5786,14 @@ class NovaGalaxyPipelineRunner:
                     job_record["state"] = "error"
                     job_record["stderr"] += f"\n[subhkl] Error: {exc}\n"
             finally:
-                self._active_proc = None
-                self._active_container_name = None
+                if job_record.get("cancel_requested") and container_name:
+                    self._terminate_local_container_or_proc(container_name, proc)
+                if hasattr(self, "_active_procs"):
+                    self._active_procs.pop(job_id, None)
+                if getattr(self, "_active_proc", None) is proc:
+                    self._active_proc = None
+                if getattr(self, "_active_container_name", None) == container_name:
+                    self._active_container_name = None
 
         threading.Thread(target=_stream_proc, daemon=True).start()
         return {
