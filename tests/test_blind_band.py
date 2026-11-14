@@ -152,3 +152,127 @@ def test_refine_band_geometry_arbitrary_and_unconstrained_rot_axis():
             maxiter=2,
         )
         assert fit_free["global_rot_vec"].shape == (3,)
+
+
+def test_laue_order_stencil_and_band_envelope_recover_scissored_still():
+    import jax
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.search.spherical import (
+        _quat_angle,
+        direct_lattice_vectors,
+        ghat_from_kf,
+        lattice_ladder,
+        laue_order_stencil,
+        refine_band_geometry,
+    )
+
+    B, _ = cartesian_matrix_metric_tensor(35.0, 45.0, 40.0, 90.0, 102.0, 90.0)
+    B = np.asarray(B, dtype=float)
+    wl = (2.8, 4.5)
+    d_min = 2.0
+    st = laue_order_stencil(B, wl, d_min, orders=(-1, 0, 1))
+    assert st.shape == (27, 3, 3)
+    # Identity shift (0, 0, 0) is present and all matrices are proper rotations
+    dets = np.linalg.det(st)
+    np.testing.assert_allclose(dets, 1.0, atol=1e-12)
+    assert any(np.allclose(R, np.eye(3), atol=1e-12) for R in st)
+
+    # Synthetic Laue reflections under +5.5% radial / +4.2% axial detector scissor
+    rng = np.random.default_rng(42)
+    U_true = Rotation.from_rotvec([0.25, -0.35, 0.45]).as_matrix()
+    hkls = rng.integers(-12, 13, size=(4000, 3))
+    hkls = hkls[np.any(hkls != 0, axis=1)]
+    g_cryst = (B @ hkls.T).T
+    g_norm = np.linalg.norm(g_cryst, axis=1)
+    hkls = hkls[(g_norm > 0.05) & (g_norm <= 1.0 / d_min)]
+    g_lab = (U_true @ B @ hkls.T).T
+    g2 = np.sum(g_lab**2, axis=1)
+    # Ewald sphere condition: lambda = -2 * g_z / |g|^2
+    lam = -2.0 * g_lab[:, 2] / np.maximum(g2, 1e-12)
+    valid = (lam >= wl[0]) & (lam <= wl[1]) & (g_lab[:, 2] < -0.02)
+    g_lab = g_lab[valid]
+    lam = lam[valid]
+    kf_true = g_lab + np.array([0.0, 0.0, 1.0]) / lam[:, None]
+    kf_true /= np.linalg.norm(kf_true, axis=1, keepdims=True)
+    # Project onto flat detector banks (nominal midpoints C_nom + within-panel offsets O_nom)
+    xz_norm = np.hypot(kf_true[:, 0], kf_true[:, 2])
+    valid_cyl = xz_norm > 0.25
+    kf_true = kf_true[valid_cyl]
+    scale_cyl = 0.40 / np.hypot(kf_true[:, 0], kf_true[:, 2])
+    pos_true = kf_true * scale_cyl[:, None]
+    s_rad_true, s_ax_true = 0.055, 0.042
+    # Quantize panel midpoints to 8 azimuthal x 3 axial flat detector banks so
+    # rigid-size panel offsets O_nom separate radial/axial scale from uniform zoom.
+    phi = np.arctan2(pos_true[:, 0], pos_true[:, 2])
+    phi_bank = np.round(phi / (np.pi / 4.0)) * (np.pi / 4.0)
+    y_bank_true = np.round(np.clip(pos_true[:, 1], -0.25, 0.25) / 0.25) * 0.25
+    mid_true = np.column_stack(
+        [0.40 * np.sin(phi_bank), y_bank_true, 0.40 * np.cos(phi_bank)]
+    )
+    O_nom = pos_true - mid_true
+    C_nom = np.column_stack(
+        [
+            mid_true[:, 0] / (1.0 + s_rad_true),
+            mid_true[:, 1] / (1.0 + s_ax_true),
+            mid_true[:, 2] / (1.0 + s_rad_true),
+        ]
+    )
+    pos_nom = C_nom + O_nom
+    kf_nom = pos_nom / np.linalg.norm(pos_nom, axis=1, keepdims=True)
+    dirs_nom = ghat_from_kf(kf_nom)
+    ki = np.array([0.0, 0.0, 1.0])
+    sin_th_nom = np.linalg.norm(kf_nom - ki, axis=1) / 2.0
+    weights = np.ones(len(C_nom), dtype=np.float64)
+
+    with jax.enable_x64():
+        found = lattice_ladder(
+            dirs_nom,
+            weights / weights.sum(),
+            B,
+            grid_deg=2.0,
+            n_shortlist=200,
+            coarse_zones=25,
+            rungs=((25, 0.9, 1.0, 32, 4),),
+            sin_theta=sin_th_nom,
+            wavelength=wl,
+            d_min=d_min,
+            n_null=0,
+            verbose=False,
+            space_group="P21",
+            band_envelope_deg=1.1,
+            band_table_min_spacing_deg=0.30,
+            table_tol_deg=0.8,
+        )
+        assert len(found) > 0
+        cand_Us = np.stack([u for u, _, _ in found[:16]], axis=0)
+        fit = refine_band_geometry(
+            C_nom,
+            O_nom,
+            weights,
+            B,
+            np.eye(3),
+            cand_Us,
+            wl,
+            d_min,
+            n_zones=40,
+            radial_bound=0.08,
+            axial_bound=0.08,
+            rot_bound_deg=1.0,
+            trans_bound_m=0.0,
+            orient_bound_deg=3.0,
+            maxiter=60,
+            space_group="P21",
+            laue_order_search=True,
+        )
+    zd, _, _ = direct_lattice_vectors(B, space_group="P21")
+    from subhkl.commands import _lattice_proper_rotations
+
+    err_deg = min(
+        np.degrees(_quat_angle(fit["U"], U_true @ S))
+        for S in _lattice_proper_rotations(zd)
+    )
+    assert err_deg < 0.25
+    assert abs(fit["radial_scale"] - s_rad_true) < 0.015
+    assert abs(fit["axial_scale"] - s_ax_true) < 0.015

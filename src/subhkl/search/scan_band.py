@@ -888,6 +888,15 @@ def refine_scan(args):
             if "search/shared_geometry" in f
             else None
         )
+        shared_axial = (
+            float(np.asarray(f["search/shared_axial_scale"][()]))
+            if "search/shared_axial_scale" in f
+            else (
+                float(shared_geom[0])
+                if shared_geom is not None and len(shared_geom) >= 1
+                else None
+            )
+        )
 
     cell0 = [float(v) for v in args.cell]
     symmetry_kind, active_cell_slots = _cell_symmetry_spec(cell0, args.space_group)
@@ -1053,7 +1062,7 @@ def refine_scan(args):
     def unpack(p):
         rv = p[0:3]
         s_rad = p[3]
-        s_ax = s_rad if is_single_setting and "axial_stretch" in args.modes else p[4]
+        s_ax = p[4] if "axial_stretch" in args.modes else s_rad
         s_area = p[5]
         rg = p[6 + rot_dom_idx] * rot_axis_j if rot_axis_j is not None else p[6:9]
         T = p[9:12]
@@ -1211,13 +1220,15 @@ def refine_scan(args):
         w_spots = w_r29 if use_r29 else w_j
         wz = 1.0 / jnp.linalg.norm(X0, axis=1) if inv_len_weight else jnp.ones(len(X0))
         score = band_sum(X0 @ Rm.T, d, q_lo, q_hi, w_spots, wz)
-        reg_geom = 0.1 if is_single_setting else 5.0
+        reg_geom = 5.0
         reg_cell = 1000.0 if is_single_setting else 20.0
+        reg_aniso = 15.0 * (s_rad - s_ax) ** 2 if "axial_stretch" in args.modes else 0.0
         reg = (
             reg_panel * (jnp.sum(du**2) + jnp.sum(dv**2))
             + reg_cell * (da**2 + db**2 + dbeta**2)
             + 500.0 * s_area**2
             + 5.0 * jnp.sum(dom**2)
+            + reg_aniso
             + reg_geom
             * (
                 jnp.sum(rg**2)
@@ -1289,7 +1300,6 @@ def refine_scan(args):
         # indistinguishable from global detector translation; for a multi-run
         # scan, fix the component along the dominant sample-frame rotation axis.
         if is_single_setting:
-            bounds[4] = (0.0, 0.0)
             bounds[5] = (0.0, 0.0)
             for idx_s in (12, 13, 14):
                 bounds[idx_s] = (0.0, 0.0)
@@ -1317,13 +1327,54 @@ def refine_scan(args):
         jax.value_and_grad(lambda p: loss_band(p, args.n_zones, 200.0, False, False))
     )
 
+    units = parameter_units(n_runs, n_banks)
+
+    def _minimize_band(vg_fn, p_init, stage_bounds, maxcor=20):
+        def _obj(z):
+            value, gradient = vg_fn(jnp.asarray(z * units))
+            return float(value), np.asarray(gradient, np.float64) * units
+
+        res_s = minimize(
+            _obj,
+            np.asarray(p_init, np.float64) / units,
+            method="L-BFGS-B",
+            jac=True,
+            bounds=np.asarray(stage_bounds, np.float64) / units[:, None],
+            options={
+                "maxiter": args.maxiter,
+                "ftol": 1e-11,
+                "gtol": 1e-8,
+                "maxcor": maxcor,
+            },
+        )
+        res_s.x = np.asarray(res_s.x, np.float64) * units
+        return res_s
+
+    has_calibrated_shared_geom = (
+        shared_geom is not None
+        and len(shared_geom) == 7
+        and (
+            abs(float(shared_geom[0])) >= 0.015
+            or np.linalg.norm(shared_geom[1:4]) >= np.deg2rad(0.2)
+            or np.linalg.norm(shared_geom[4:7]) >= 0.002
+        )
+    )
+    if has_calibrated_shared_geom:
+        ob_tight = np.deg2rad(1.5)
+        for b_stage in (bounds_0, bounds_120, bounds_global, bounds_panel):
+            for j_rv in range(3):
+                b_stage[j_rv] = (-ob_tight, ob_tight)
+
     # Stage 0: coarse global geometry on the caller's stable-run subset.
     best_p, best_v, best_result = None, 1e9, None
-    s_inits = (
-        (-0.05, 0.0, 0.055)
-        if ("cylindrical" in args.modes or "axial_stretch" in args.modes)
-        else (0.0,)
-    )
+    if has_calibrated_shared_geom:
+        s_inits = (float(shared_geom[0]),)
+    else:
+        s_inits = (
+            (-0.05, 0.0, 0.055)
+            if ("cylindrical" in args.modes or "axial_stretch" in args.modes)
+            else (0.0,)
+        )
     for s_init in s_inits:
         p0 = np.zeros(18 + n_runs + 2 * n_banks)
         p0[3] = s_init
@@ -1334,23 +1385,17 @@ def refine_scan(args):
             and abs(s_init - float(shared_geom[0])) <= 0.03
         ):
             p0[3] = float(shared_geom[0])
-            p0[4] = float(shared_geom[0])
+            p0[4] = (
+                float(shared_axial)
+                if shared_axial is not None
+                else float(shared_geom[0])
+            )
             if "global_rot" in args.modes:
                 p0[6:9] = shared_geom[1:4]
             if "global_trans" in args.modes:
                 p0[9:12] = shared_geom[4:7]
         p0 = np.clip(p0, *np.asarray(bounds_0).T)
-        res = minimize(
-            lambda x: (
-                float(vg_band_60(jnp.asarray(x))[0]),
-                np.asarray(vg_band_60(jnp.asarray(x))[1], np.float64),
-            ),
-            p0,
-            method="L-BFGS-B",
-            jac=True,
-            bounds=bounds_0,
-            options={"maxiter": args.maxiter, "ftol": 1e-9},
-        )
+        res = _minimize_band(vg_band_60, p0, bounds_0)
         if res.fun < best_v:
             best_v, best_p, best_result = res.fun, res.x.copy(), res
     record("global", best_result)
@@ -1439,33 +1484,13 @@ def refine_scan(args):
     best_p[18 : 18 + n_runs] -= best_p[18 + args.anchor_run]
 
     # Stage 1a: 120-zone band across all selected runs, including scan drift.
-    res_1a = minimize(
-        lambda x: (
-            float(vg_band_120(jnp.asarray(x))[0]),
-            np.asarray(vg_band_120(jnp.asarray(x))[1], np.float64),
-        ),
-        best_p,
-        method="L-BFGS-B",
-        jac=True,
-        bounds=bounds_120,
-        options={"maxiter": args.maxiter, "ftol": 1e-9},
-    )
+    res_1a = _minimize_band(vg_band_120, best_p, bounds_120)
     best_p = res_1a.x.copy()
     record("120-zones", res_1a)
     print(f"[Stage 1a: 120-Zone Band (All Runs)] band_score = {-res_1a.fun:.4f}")
 
     # Stage 1b: Fine 400-zone band + monoclinic cell ratios
-    res_1b = minimize(
-        lambda x: (
-            float(vg_band_400(jnp.asarray(x))[0]),
-            np.asarray(vg_band_400(jnp.asarray(x))[1], np.float64),
-        ),
-        best_p,
-        method="L-BFGS-B",
-        jac=True,
-        bounds=bounds_global,
-        options={"maxiter": args.maxiter, "ftol": 1e-9},
-    )
+    res_1b = _minimize_band(vg_band_400, best_p, bounds_global)
     best_p = res_1b.x.copy()
     record("cell", res_1b)
     print(
@@ -1474,26 +1499,7 @@ def refine_scan(args):
 
     # Stage 2: Regularized per-bank (du, dv) shifts on 400-zone band objective
     if "panels" in args.modes and not is_single_setting:
-        units = parameter_units(n_runs, n_banks)
-
-        def panel_objective(z):
-            value, gradient = vg_band_p(jnp.asarray(z * units))
-            return float(value), np.asarray(gradient, float) * units
-
-        res_p = minimize(
-            panel_objective,
-            best_p / units,
-            method="L-BFGS-B",
-            jac=True,
-            bounds=np.asarray(bounds_panel) / units[:, None],
-            options={
-                "maxiter": args.maxiter,
-                "ftol": 1e-12,
-                "gtol": 1e-8,
-                "maxcor": 30,
-            },
-        )
-        res_p.x *= units
+        res_p = _minimize_band(vg_band_p, best_p, bounds_panel, maxcor=30)
         p_cur = res_p.x.copy()
         record("panels", res_p)
         print(f"[Stage 2: +Regularized Per-Bank Shifts] loss = {res_p.fun:.4f}")

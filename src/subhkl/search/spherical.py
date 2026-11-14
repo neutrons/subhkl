@@ -1347,6 +1347,46 @@ def _lattice_kernels():
         vals = tab[jnp.arange(tab.shape[0])[None, :], idx]
         return (vals * wz[None, :]).sum(1)
 
+    def score_band_table_env(Rs, Zj, wz, tab, off, nph, nth, alpha_rad):
+        """Per-zone spherical-cap max-envelope lookup over radius ``alpha_rad``.
+
+        Bridges narrow high-order Laue carrier lobes (``1 / (2 |x| q_cut)``,
+        e.g. ~0.3 deg at 100 A) across coarse SO(3) grid steps AND non-rigid
+        uncalibrated detector scissor distortions between zones.
+        """
+        P0 = jnp.einsum("nij,kj->nki", Rs, Zj)
+        P0 = P0 / jnp.maximum(jnp.linalg.norm(P0, axis=-1, keepdims=True), 1e-12)
+        up = jnp.where(
+            jnp.abs(P0[..., 2:3]) < 0.9,
+            jnp.array([0.0, 0.0, 1.0], jnp.float32),
+            jnp.array([1.0, 0.0, 0.0], jnp.float32),
+        )
+        e1 = jnp.cross(up, P0)
+        e1 = e1 / jnp.maximum(jnp.linalg.norm(e1, axis=-1, keepdims=True), 1e-12)
+        e2 = jnp.cross(P0, e1)
+        s2 = jnp.float32(1.0 / np.sqrt(2.0))
+        dirs2d = (
+            (1.0, 0.0),
+            (-1.0, 0.0),
+            (0.0, 1.0),
+            (0.0, -1.0),
+            (s2, s2),
+            (s2, -s2),
+            (-s2, s2),
+            (-s2, -s2),
+        )
+        pts = [P0]
+        for r_scale in (0.45, 0.95):
+            cr = jnp.cos(r_scale * alpha_rad)
+            sr = jnp.sin(r_scale * alpha_rad)
+            for dx, dy in dirs2d:
+                pts.append(cr * P0 + sr * (dx * e1 + dy * e2))
+        P_all = jnp.stack(pts, axis=0)  # [17, B, K, 3]
+        idx = _funk_lookup(P_all, off, nph, nth)
+        k_idx = jnp.arange(tab.shape[0], dtype=jnp.int32)[None, None, :]
+        vals = jnp.max(tab[k_idx, idx], axis=0)
+        return (vals * wz[None, :]).sum(1)
+
     def score_exact(Rs, Zj, wz, Dj, wj, thr):
         Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
         on = jnp.abs(jnp.einsum("nki,mi->nkm", Zl, Dj)) < thr
@@ -1356,15 +1396,29 @@ def _lattice_kernels():
         Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
         return (tab[_funk_lookup(Zl, off, nph, nth)] * wz[None, :]).sum(1)
 
-    def zoom_b(Uc, dR, *score_args):
+    def zoom_b_exact(Uc, dR, *score_args):
         Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
         n = Uc.shape[0]
         flat = Rs_.reshape(-1, 3, 3)
-        s_ = (
-            score_band_table(flat, *score_args)
-            if len(score_args) == 6
-            else score_band(flat, *score_args)
-        ).reshape(n, -1)
+        s_ = score_band(flat, *score_args).reshape(n, -1)
+        k = jnp.argmax(s_, axis=1)
+        idx = jnp.arange(n)
+        return s_[idx, k], Rs_[idx, k]
+
+    def zoom_b_table(Uc, dR, *score_args):
+        Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
+        n = Uc.shape[0]
+        flat = Rs_.reshape(-1, 3, 3)
+        s_ = score_band_table(flat, *score_args).reshape(n, -1)
+        k = jnp.argmax(s_, axis=1)
+        idx = jnp.arange(n)
+        return s_[idx, k], Rs_[idx, k]
+
+    def zoom_b_table_env(Uc, dR, *score_args):
+        Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
+        n = Uc.shape[0]
+        flat = Rs_.reshape(-1, 3, 3)
+        s_ = score_band_table_env(flat, *score_args).reshape(n, -1)
         k = jnp.argmax(s_, axis=1)
         idx = jnp.arange(n)
         return s_[idx, k], Rs_[idx, k]
@@ -1388,8 +1442,10 @@ def _lattice_kernels():
         band_chunk=jax.jit(band_chunk),
         score_band=jax.jit(score_band),
         score_band_table=jax.jit(score_band_table, static_argnums=(6,)),
-        zoom_band=jax.jit(zoom_b),
-        zoom_band_table=jax.jit(zoom_b, static_argnums=(8,)),
+        score_band_table_env=jax.jit(score_band_table_env, static_argnums=(6,)),
+        zoom_band=jax.jit(zoom_b_exact),
+        zoom_band_table=jax.jit(zoom_b_table, static_argnums=(7,)),
+        zoom_band_table_env=jax.jit(zoom_b_table_env, static_argnums=(7,)),
         score_exact=jax.jit(score_exact),
         score_table=jax.jit(score_table, static_argnums=(6,)),
         zoom_table=jax.jit(zoom, static_argnums=(8,)),
@@ -1505,6 +1561,37 @@ def band_table(dirs, weights, q_lo, q_hi, lengths, spacing_deg):
     )
 
 
+def laue_order_stencil(B, wavelength, d_min, orders=(-1, 0, 1)):
+    """Deterministic crystal-frame rotations stepping by integer Laue orders.
+
+    Along each primitive direct-cell vector ``a_i`` (rows of ``B^{-1}``),
+    shifting the pole ``a_i / |a_i|`` by ``1 / (|a_i| * q_cut)`` radians
+    advances its reflection condition ``q * (a_i . d) = m`` by exactly one
+    integer Laue order ``Delta m = 1`` at the dominant resolution carrier
+    ``q_cut = 0.5 * (1 + wl_min / wl_max) / d_min``.  Returns ``[N, 3, 3]``
+    crystal-frame rotation matrices ``dU`` (applied as ``U @ dU``) with the
+    identity ``(0, 0, 0)`` placed first.
+    """
+    from scipy.spatial.transform import Rotation as Rot
+
+    A_cell = np.linalg.inv(np.asarray(B, np.float64))
+    a_lens = np.maximum(np.linalg.norm(A_cell, axis=1), 1e-9)
+    a_dirs = A_cell / a_lens[:, None]
+    wl_lo, wl_hi = float(wavelength[0]), float(wavelength[1])
+    q_cut = max(0.5 * (1.0 + wl_lo / max(wl_hi, 1e-9)) / max(float(d_min), 1e-9), 1e-6)
+    dtheta = np.minimum(1.0 / (a_lens * q_cut), np.deg2rad(6.0))
+    ords = [int(m) for m in orders]
+    dm_grid = np.array(np.meshgrid(ords, ords, ords, indexing="ij")).reshape(3, -1).T
+    norms = np.sum(np.abs(dm_grid), axis=1)
+    dm_grid = dm_grid[np.argsort(norms, kind="stable")]
+    rvs = (
+        dm_grid[:, 0:1] * dtheta[0] * a_dirs[0:1]
+        + dm_grid[:, 1:2] * dtheta[1] * a_dirs[1:2]
+        + dm_grid[:, 2:3] * dtheta[2] * a_dirs[2:3]
+    )
+    return Rot.from_rotvec(rvs).as_matrix()
+
+
 @_precise
 def refine_band_geometry(
     centers,
@@ -1518,6 +1605,7 @@ def refine_band_geometry(
     n_zones=60,
     ki=(0.0, 0.0, 1.0),
     radial_bound=0.15,
+    axial_bound=None,
     rot_bound_deg=3.5,
     trans_bound_m=0.02,
     orient_bound_deg=11.5,
@@ -1525,53 +1613,37 @@ def refine_band_geometry(
     zone_weight="uniform",
     rot_axis_only=None,
     space_group=None,
+    laue_order_search=False,
+    reg_weight=0.015,
 ):
-    """Co-refine the orientation AND the global detector geometry on the
-    band objective.
+    """Co-refine orientation(s) AND global detector geometry on the band
+    objective, optionally branching over integer Laue-order shifts.
 
-    The objective sum_x sum_j w_j <cos(2 pi q (x.d_j))> is differentiable
-    in the spot directions d_j, and d_j is a differentiable function of
-    where the detector is.  So co-refinement is the same objective with
-    seven more parameters -- radial scale, a global rotation of the whole
-    assembly about the sample, a global translation -- and not a second
-    machine; no matching, no assignment.  The three modes are the harness's
-    ``radial``, ``global_rot``, ``global_trans``, applied exactly as
-    refinables.forward_map does, so the result is a ``panels`` block
-    _calibrated_dets can consume.
-
-    Why it is needed at all: the ladder searches on nominal geometry.  On
-    IMAGINE-X (CG4D) the nominal assembly is off by a radial ~5% and ~2 deg
-    (its classic calibration absorbs the same error as a 44 mm centre shift
-    and a +5% cell), which displaces the band objective's maximum by ~1
-    deg -- outside the exact Ewald basin -- and, with orientation alone,
-    leaves the true basin nearly tied with a false one (0.826 vs 0.794 on
-    cg4d-l1-mbl run 1996).  Co-refined, the true basin doubles (1.677) and
-    the false one barely moves (1.099): the geometry discriminates.  The
-    fraction of the finder's 149 peaks within 0.3 deg of a prediction goes
-    30.9% -> 61.7%.
-
-    centers, offsets: per-spot bank centre and in-panel offset [m], lab
-    frame (xyz = centre + offset, flat panels).  R_spots: goniometer
-    rotation per spot [n, 3, 3] or one [3, 3].  Returns a dict with U,
-    radial_scale, global_rot_vec [rad], global_trans_m, score, score0, and
-    a callable panels(banks_centers, banks_uhats, banks_vhats) that maps a
-    bank's nominal geometry to the refined one.
+    ``U0`` may be a single ``[3, 3]`` orientation or a ``[K, 3, 3]`` candidate
+    pool.  When ``laue_order_search=True`` and geometry bounds are active,
+    each candidate is deterministically branched across the 27 crystal-frame
+    integer Laue-order shifts ``Delta m in {-1, 0, +1}^3`` (`laue_order_stencil`)
+    and opposite initial scale signs so uncalibrated detector scissor
+    distortions cannot trap local refinement on an adjacent ``Delta m = +-1``
+    cosine carrier fringe.
     """
     import jax
     import jax.numpy as jnp
     from scipy.optimize import minimize
 
-    C = jnp.asarray(np.asarray(centers, np.float64))
-    O = jnp.asarray(np.asarray(offsets, np.float64))
-    w = jnp.asarray(np.asarray(weights, np.float64))
-    w = w / jnp.maximum(jnp.abs(w).sum(), 1e-12)
+    C_np = np.asarray(centers, np.float64)
+    O_np = np.asarray(offsets, np.float64)
+    w_np = np.asarray(weights, np.float64)
+    w_np = w_np / max(np.abs(w_np).sum(), 1e-12)
     Rs = np.asarray(R_spots, np.float64)
     if Rs.ndim == 2:
-        Rs = np.broadcast_to(Rs, (len(centers), 3, 3))
+        Rs = np.broadcast_to(Rs, (len(C_np), 3, 3))
+    C = jnp.asarray(C_np)
+    O = jnp.asarray(O_np)
+    w = jnp.asarray(w_np)
     Rj = jnp.asarray(Rs)
     kij = jnp.asarray(np.asarray(ki, np.float64))
     kij = kij / jnp.linalg.norm(kij)
-    Uj = jnp.asarray(np.asarray(U0, np.float64))
     zd, zl, _ = direct_lattice_vectors(B, space_group=space_group)
     nz = int(n_zones)
     X0 = jnp.asarray((zl[:nz, None] * zd[:nz]).astype(np.float64))
@@ -1580,8 +1652,15 @@ def refine_band_geometry(
     )
     lam_lo, lam_hi = float(wavelength[0]), float(wavelength[1])
     gmax = 1.0 / float(d_min)
+    rb_rad = float(radial_bound)
+    ab_rad = rb_rad if axial_bound is None else float(axial_bound)
+    use_cyl_axial = axial_bound is not None and ab_rad > 0.0
     ob = np.deg2rad(float(orient_bound_deg))
     rb = np.deg2rad(float(rot_bound_deg))
+    tb = float(trans_bound_m)
+    geom_active = rb_rad > 0.0 or ab_rad > 0.0 or rb > 0.0 or tb > 0.0
+    reg_w = float(reg_weight) if geom_active else 0.0
+
     if rot_axis_only is not None:
         ax_arr = np.asarray(rot_axis_only, np.float64)
         if (
@@ -1602,20 +1681,51 @@ def refine_band_geometry(
         rot_axis_j = None
         rot_bounds = [(-rb, rb)] * 3
 
-    def objective(p):
-        rv, scale, T = p[:3], p[3], p[7:10]
-        rg = p[4 + rot_dom_idx] * rot_axis_j if rot_axis_j is not None else p[4:7]
+    # Natural physical step units so rotational, fractional-scale, and metric
+    # translation gradients have balanced magnitudes in L-BFGS-B and Adam.
+    p_units = np.array(
+        [
+            np.deg2rad(1.0),
+            np.deg2rad(1.0),
+            np.deg2rad(1.0),
+            0.02,
+            0.02,
+            np.deg2rad(0.5),
+            np.deg2rad(0.5),
+            np.deg2rad(0.5),
+            0.005,
+            0.005,
+            0.005,
+        ],
+        dtype=np.float64,
+    )
+    p_units_j = jnp.asarray(p_units)
+
+    def _eval_band(u_vec, U_base, C_in, O_in, R_in, w_in, X_in, wz_in):
+        p = u_vec * p_units_j
+        rv, s_rad = p[:3], p[3]
+        s_ax = p[4] if use_cyl_axial else s_rad
+        rg = p[5 + rot_dom_idx] * rot_axis_j if rot_axis_j is not None else p[5:8]
+        T = p[8:11]
         Rg = _rodrigues_jax(rg)
-        xyz = (C * (1.0 + scale) + O) @ Rg.T + T[None, :]
+        C_sc = jnp.stack(
+            [
+                C_in[:, 0] * (1.0 + s_rad),
+                C_in[:, 1] * (1.0 + s_ax),
+                C_in[:, 2] * (1.0 + s_rad),
+            ],
+            axis=-1,
+        )
+        xyz = (C_sc + O_in) @ Rg.T + T[None, :]
         kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
         g = kf - kij[None, :]
         d_lab = g / jnp.linalg.norm(g, axis=1, keepdims=True)
         s_ = -(d_lab @ kij)
         q_lo = 2.0 * s_ / lam_hi
         q_hi = jnp.maximum(jnp.minimum(2.0 * s_ / lam_lo, gmax), q_lo)
-        d = jnp.einsum("nji,nj->ni", Rj, d_lab)  # sample frame: R^T d
-        Rm = _rodrigues_jax(rv) @ Uj
-        t = (X0 @ Rm.T) @ d.T  # [zones, spots]
+        d = jnp.einsum("nji,nj->ni", R_in, d_lab)
+        Rm = _rodrigues_jax(rv) @ U_base
+        t = (X_in @ Rm.T) @ d.T
         two_pi = 2.0 * jnp.pi
         valid = (q_hi > q_lo)[None, :]
         hi_safe = jnp.where(q_hi > q_lo, q_hi, q_lo + 1.0)[None, :]
@@ -1628,70 +1738,239 @@ def refine_band_geometry(
         K = jnp.where(
             valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
         )
-        return -jnp.einsum("km,k,m->", K, wz, w)
-
-    vg = jax.jit(jax.value_and_grad(objective))
-
-    def f(p):
-        v, gr = vg(jnp.asarray(p))
-        return float(v), np.asarray(gr, np.float64)
-
-    bounds = (
-        [(-ob, ob)] * 3
-        + [(-float(radial_bound), float(radial_bound))]
-        + rot_bounds
-        + [(-float(trans_bound_m), float(trans_bound_m))] * 3
-    )
-    p0 = np.zeros(10)
-    s0 = -f(p0)[0]
-    # The geometry landscape is bimodal along the radial direction: on
-    # cg4d-l1-mbl the true basin started at nominal rolls to -12% (score
-    # 2.31) while starts at -6, -3, +3% all reach +5.5% (3.25 / 3.42 /
-    # 2.90), and which mode L-BFGS finds turns on a tenth of a degree of
-    # orientation.  A multistart over the dominant nuisance is the honest
-    # answer; the other six parameters follow from each start.
-    starts = (
-        np.linspace(-float(radial_bound), float(radial_bound), 5)
-        if radial_bound > 0
-        else np.array([0.0])
-    )
-    res = None
-    for s_ in starts:
-        q0 = p0.copy()
-        q0[3] = float(np.clip(s_ * 0.6, -radial_bound, radial_bound))
-        r_ = minimize(
-            f,
-            q0,
-            jac=True,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": int(maxiter)},
+        score = jnp.einsum("km,k,m->", K, wz_in, w_in)
+        reg = reg_w * (
+            (s_rad / 0.08) ** 2
+            + (
+                (s_ax / 0.08) ** 2 + ((s_rad - s_ax) / 0.025) ** 2
+                if use_cyl_axial
+                else 0.0
+            )
+            + jnp.sum((rg / np.deg2rad(2.0)) ** 2)
+            + jnp.sum((T / 0.015) ** 2)
         )
-        if res is None or r_.fun < res.fun:
-            res = r_
-    p = np.asarray(res.x, np.float64)
+        return -score + reg, score
+
+    U0_arr = np.asarray(U0, np.float64)
+    if U0_arr.ndim == 2:
+        U_pool = U0_arr[None, :, :]
+    else:
+        U_pool = U0_arr.reshape(-1, 3, 3)
+
+    phys_bounds = (
+        [(-ob, ob)] * 3
+        + [(-rb_rad, rb_rad)]
+        + ([(-ab_rad, ab_rad)] if use_cyl_axial else [(0.0, 0.0)])
+        + rot_bounds
+        + [(-tb, tb)] * 3
+    )
+    u_bounds = [(lo / u, hi / u) for (lo, hi), u in zip(phys_bounds, p_units)]
+    u_lo_j = jnp.asarray([b[0] for b in u_bounds], jnp.float64)
+    u_hi_j = jnp.asarray([b[1] for b in u_bounds], jnp.float64)
+
+    vg_full = jax.jit(
+        jax.value_and_grad(
+            lambda u, Ub: _eval_band(u, Ub, C, O, Rj, w, X0, wz), has_aux=True
+        )
+    )
+    _, s0_j = _eval_band(
+        jnp.zeros(11, jnp.float64), jnp.asarray(U_pool[0]), C, O, Rj, w, X0, wz
+    )
+    s0 = float(s0_j)
+
+    if laue_order_search and geom_active:
+        dU_ord = laue_order_stencil(B, wavelength, d_min)
+        U_27 = np.einsum("kij,mjl->kmil", U_pool, dU_ord).reshape(-1, 3, 3)
+        s_pair = (
+            [-min(0.04, 0.6 * rb_rad), +min(0.04, 0.6 * rb_rad)]
+            if rb_rad > 0
+            else [0.0]
+        )
+        U_all = np.repeat(U_27, len(s_pair), axis=0)
+        u0_all = np.zeros((len(U_all), 11), np.float64)
+        for is_, sv in enumerate(s_pair):
+            u0_all[is_ :: len(s_pair), 3] = sv / p_units[3]
+            if use_cyl_axial:
+                u0_all[is_ :: len(s_pair), 4] = (
+                    np.clip(sv, -ab_rad, ab_rad) / p_units[4]
+                )
+
+        # Stage 1: fast coarse-zone screening across all Laue-order branches
+        n_sub = min(len(C_np), 4096)
+        ord_w = np.argsort(-np.abs(w_np))[:n_sub]
+        C_sub = jnp.asarray(C_np[ord_w])
+        O_sub = jnp.asarray(O_np[ord_w])
+        R_sub = jnp.asarray(Rs[ord_w])
+        w_sub = jnp.asarray(w_np[ord_w] / max(np.abs(w_np[ord_w]).sum(), 1e-12))
+        nz_s1 = min(30, nz)
+        X_s1 = X0[:nz_s1]
+        wz_s1 = wz[:nz_s1]
+
+        def _make_adam_stage(Cc, Oo, Rr, ww, Xx, wzz, n_steps, lr):
+            vg_b = jax.jit(
+                jax.vmap(
+                    jax.value_and_grad(
+                        lambda u, Ub: _eval_band(u, Ub, Cc, Oo, Rr, ww, Xx, wzz),
+                        has_aux=True,
+                    ),
+                    in_axes=(0, 0),
+                )
+            )
+
+            @jax.jit
+            def _run(uj, U_b):
+                m = jnp.zeros_like(uj)
+                v = jnp.zeros_like(uj)
+
+                def body(i, carry):
+                    u_c, m_c, v_c = carry
+                    (_, _), g = vg_b(u_c, U_b)
+                    t = i + 1
+                    m_c = 0.9 * m_c + 0.1 * g
+                    v_c = 0.999 * v_c + 0.001 * (g * g)
+                    mh = m_c / (1.0 - 0.9**t)
+                    vh = v_c / (1.0 - 0.999**t)
+                    u_c = jnp.clip(
+                        u_c - lr * mh / (jnp.sqrt(vh) + 1e-8), u_lo_j, u_hi_j
+                    )
+                    return u_c, m_c, v_c
+
+                u_f, _, _ = jax.lax.fori_loop(0, n_steps, body, (uj, m, v))
+                (lf, sf), _ = vg_b(u_f, U_b)
+                return u_f, sf, lf
+
+            return _run
+
+        run_s1 = _make_adam_stage(C_sub, O_sub, R_sub, w_sub, X_s1, wz_s1, 30, 0.12)
+        run_s2 = _make_adam_stage(C, O, Rj, w, X0, wz, 40, 0.08)
+
+        ch_b = 512
+        uf_list, lf_list = [], []
+        for bi in range(0, len(U_all), ch_b):
+            U_c = U_all[bi : bi + ch_b]
+            u_c = u0_all[bi : bi + ch_b]
+            if len(U_c) < ch_b:
+                pad_n = ch_b - len(U_c)
+                U_cp = np.concatenate([U_c, np.repeat(U_c[:1], pad_n, axis=0)], axis=0)
+                u_cp = np.concatenate([u_c, np.zeros((pad_n, 11))], axis=0)
+                uf_, _, lf_ = run_s1(jnp.asarray(u_cp), jnp.asarray(U_cp))
+                uf_list.append(np.asarray(uf_)[: len(U_c)])
+                lf_list.append(np.asarray(lf_)[: len(U_c)])
+            else:
+                uf_, _, lf_ = run_s1(jnp.asarray(u_c), jnp.asarray(U_c))
+                uf_list.append(np.asarray(uf_))
+                lf_list.append(np.asarray(lf_))
+        uf_1 = np.concatenate(uf_list, axis=0)
+        lf_1 = np.concatenate(lf_list, axis=0)
+
+        n_keep2 = min(32, len(U_all))
+        top2 = np.argsort(lf_1)[:n_keep2]
+        uf_2, _, lf_2 = run_s2(jnp.asarray(uf_1[top2]), jnp.asarray(U_all[top2]))
+        uf_2, lf_2 = np.asarray(uf_2), np.asarray(lf_2)
+
+        # Stage 3: tight trust-boxed L-BFGS-B polish on the winning carrier lobes
+        best_res = None
+        best_U_base = U_pool[0]
+        for kk in np.argsort(lf_2)[: min(4, len(lf_2))]:
+            Ub_k = U_all[top2[kk]]
+            u_init = uf_2[kk]
+            bnds_k = [
+                (
+                    max(u_bounds[j][0], float(u_init[j] - 0.8)),
+                    min(u_bounds[j][1], float(u_init[j] + 0.8)),
+                )
+                if j < 3
+                else u_bounds[j]
+                for j in range(11)
+            ]
+
+            ub_jnp = jnp.asarray(Ub_k)
+
+            def f_k(u_vec, _Ub=ub_jnp):
+                (lv, _), gv = vg_full(jnp.asarray(u_vec), _Ub)
+                return float(lv), np.asarray(gv, np.float64)
+
+            r_ = minimize(
+                f_k,
+                u_init,
+                jac=True,
+                method="L-BFGS-B",
+                bounds=bnds_k,
+                options={"maxiter": int(maxiter)},
+            )
+            if best_res is None or r_.fun < best_res.fun:
+                best_res = r_
+                best_U_base = Ub_k
+        res = best_res
+        U_win_base = best_U_base
+    else:
+        U_win_base = U_pool[0]
+        Ub_j = jnp.asarray(U_win_base)
+
+        def f(u_vec):
+            (v, _), gr = vg_full(jnp.asarray(u_vec), Ub_j)
+            return float(v), np.asarray(gr, np.float64)
+
+        starts = np.linspace(-rb_rad, rb_rad, 5) if rb_rad > 0 else np.array([0.0])
+        res = None
+        for s_ in starts:
+            q0 = np.zeros(11, np.float64)
+            sv = float(np.clip(s_ * 0.6, -rb_rad, rb_rad))
+            q0[3] = sv / p_units[3]
+            if use_cyl_axial:
+                q0[4] = np.clip(sv, -ab_rad, ab_rad) / p_units[4]
+            r_ = minimize(
+                f,
+                q0,
+                jac=True,
+                method="L-BFGS-B",
+                bounds=u_bounds,
+                options={"maxiter": int(maxiter)},
+            )
+            if res is None or r_.fun < res.fun:
+                res = r_
+
+    u_opt = np.asarray(res.x, np.float64)
+    _, raw_score_j = _eval_band(
+        jnp.asarray(u_opt), jnp.asarray(U_win_base), C, O, Rj, w, X0, wz
+    )
+    p = u_opt * p_units
+    s_rad_val = float(p[3])
+    s_ax_val = float(p[4]) if use_cyl_axial else s_rad_val
     rg_vec = (
-        float(p[4 + rot_dom_idx]) * rot_axis_unit
+        float(p[5 + rot_dom_idx]) * rot_axis_unit
         if rot_axis_unit is not None
-        else p[4:7].copy()
+        else p[5:8].copy()
     )
     Rg = np.asarray(_rodrigues_jax(jnp.asarray(rg_vec)))
-    U = np.asarray(_rodrigues_jax(jnp.asarray(p[:3]))) @ np.asarray(U0, np.float64)
+    U = np.asarray(_rodrigues_jax(jnp.asarray(p[:3]))) @ np.asarray(
+        U_win_base, np.float64
+    )
 
     def panels(bank_centers, bank_uhats, bank_vhats):
-        c = np.asarray(bank_centers, np.float64) * (1.0 + p[3])
+        bc = np.asarray(bank_centers, np.float64)
+        c = np.stack(
+            [
+                bc[:, 0] * (1.0 + s_rad_val),
+                bc[:, 1] * (1.0 + s_ax_val),
+                bc[:, 2] * (1.0 + s_rad_val),
+            ],
+            axis=-1,
+        )
         return {
-            "centers": c @ Rg.T + p[7:10][None, :],
+            "centers": c @ Rg.T + p[8:11][None, :],
             "uhats": np.asarray(bank_uhats, np.float64) @ Rg.T,
             "vhats": np.asarray(bank_vhats, np.float64) @ Rg.T,
         }
 
     return {
         "U": _orthonormalize(U),
-        "radial_scale": float(p[3]),
+        "radial_scale": s_rad_val,
+        "axial_scale": s_ax_val,
         "global_rot_vec": rg_vec.copy(),
-        "global_trans_m": p[7:10].copy(),
-        "score": float(-res.fun),
+        "global_trans_m": p[8:11].copy(),
+        "score": float(raw_score_j),
+        "loss": float(res.fun),
         "score0": float(s0),
         "panels": panels,
         "n_iter": int(res.nit),
@@ -1740,6 +2019,8 @@ def lattice_ladder(
     space_group=None,
     dedup_deg=3.0,
     on_rung=None,
+    band_envelope_deg=0.0,
+    band_table_min_spacing_deg=0.0,
 ):
     """Orientation search on the direct lattice, coarse to fine.
 
@@ -1820,25 +2101,42 @@ def lattice_ladder(
 
     xl_j = jnp.asarray(xlen[:K_all].astype(np.float32))
 
-    def band_args(nz, exhaustive):
-        """The band objective's args.  No tolerance: the band sets the
-        window, so a rung is a zone count and nothing else.  The table is
-        built for the exhaustive rung alone -- the zoom rungs are cheap and
-        a tabulated zoom moved solutions by a degree when it was tried for
-        the Funk objective."""
+    def band_args(nz, exhaustive, tol_deg=0.0):
+        """The band objective's args.  By default no tolerance is used on zoom
+        rungs (exact band sum).  When ``band_envelope_deg > 0`` (exhaustive)
+        or ``tol_deg >= table_tol_deg`` on a tabulated band rung, each zone
+        pole is evaluated via its spherical-cap max envelope on ``band_table``
+        so coarse grid steps and uncalibrated detector scissor do not drop the
+        narrow Laue-order carrier lobes."""
         nz = int(nz)
         wz = zone_weights(nz)[:nz]
-        if exhaustive:
-            if "band" not in tables:
-                # resolve the phase: it turns once per 1 / (|x| qbar) in
-                # n.d, so four samples per turn on the longest zone
-                # The table is the one place the data side can be dense at
-                # no search cost: given, every live bin with its signed
-                # excess goes in here (the zoom rungs take the sparse set).
-                # Measured on MANDI L1 run 0: z at the truth 10.9 -> 17.8
-                # (13 zones), 16.0 -> 26.0 (60 zones) against the 5 sigma
-                # bins, because the threshold had dropped two thirds of the
-                # real spots and the zero-mean excess adds variance, not bias.
+        env_deg = (
+            float(band_envelope_deg)
+            if exhaustive
+            else (
+                float(tol_deg)
+                if float(band_envelope_deg) > 0
+                and float(tol_deg) >= float(table_tol_deg)
+                else 0.0
+            )
+        )
+        use_table = exhaustive or env_deg > 0.0
+        if use_table:
+            tab_nz = max(
+                int(coarse_zones),
+                max(
+                    [
+                        int(r[0])
+                        for r in rungs
+                        if float(band_envelope_deg) > 0
+                        and float(r[1]) >= float(table_tol_deg)
+                    ]
+                    or [nz]
+                ),
+                nz,
+            )
+            if "band" not in tables or int(tables["band"][0].shape[0]) < nz:
+                tab_nz = max(tab_nz, nz)
                 if table_dirs is not None:
                     Dt = np.asarray(table_dirs, np.float64)
                     Dt = Dt / np.linalg.norm(Dt, axis=1, keepdims=True)
@@ -1848,8 +2146,11 @@ def lattice_ladder(
                 else:
                     Dt, wt, qlt, qht = D, w, q_lo, q_hi
                 qbar = float(np.max(0.5 * (qlt + qht)))
-                sp = np.degrees(1.0 / max(4.0 * float(xlen[:nz].max()) * qbar, 1e-9))
-                tables["band"] = band_table(Dt, wt, qlt, qht, xlen[:nz], min(sp, 5.0))
+                sp = np.degrees(
+                    1.0 / max(4.0 * float(xlen[:tab_nz].max()) * qbar, 1e-9)
+                )
+                sp_use = max(min(sp, 5.0), float(band_table_min_spacing_deg))
+                tables["band"] = band_table(Dt, wt, qlt, qht, xlen[:tab_nz], sp_use)
                 if on_rung is not None:
                     import contextlib
 
@@ -1870,8 +2171,21 @@ def lattice_ladder(
                             .T.astype(np.float32)
                         )
                         Rs_c = kern["euler_zyz"](jnp.asarray(grid_c))
-                        out_c = kern["score_band_table"](
-                            Rs_c, Zj[:nz], wz, tab_p, off_p, nph_p, nth_p
+                        out_c = (
+                            kern["score_band_table_env"](
+                                Rs_c,
+                                Zj[:nz],
+                                wz,
+                                tab_p[:nz],
+                                off_p,
+                                nph_p,
+                                nth_p,
+                                np.float32(np.deg2rad(env_deg)),
+                            )
+                            if env_deg > 0.0
+                            else kern["score_band_table"](
+                                Rs_c, Zj[:nz], wz, tab_p[:nz], off_p, nph_p, nth_p
+                            )
                         )
                         best_c = int(jnp.argmax(out_c))
                         on_rung(
@@ -1884,7 +2198,21 @@ def lattice_ladder(
                     f"{len(Dt):,} bins, exhaustive rung preview)"
                 )
             tab, off, nph, nth = tables["band"]
-            return "band_table", (Zj[:nz], wz, tab, off, nph, nth), 262144
+            if env_deg > 0.0:
+                return (
+                    "band_table_env",
+                    (
+                        Zj[:nz],
+                        wz,
+                        tab[:nz],
+                        off,
+                        nph,
+                        nth,
+                        np.float32(np.deg2rad(env_deg)),
+                    ),
+                    131072,
+                )
+            return "band_table", (Zj[:nz], wz, tab[:nz], off, nph, nth), 262144
         return (
             "band",
             (Zj[:nz], xl_j[:nz], wz, Dj, wj, qlo_j, qhi_j),
@@ -1973,7 +2301,7 @@ def lattice_ladder(
             .T
         )
         dR = jnp.asarray(Rot.from_rotvec(rv).as_matrix().astype(np.float32))
-        kind, args, ch_ = band_args(nz, False) if band else score_args(nz, tol)
+        kind, args, ch_ = band_args(nz, False, tol) if band else score_args(nz, tol)
         zoom = kern["zoom_" + kind]
         bsz = int(max(1, ch_ // len(rv)))
         bs, bR = [], []
@@ -2017,13 +2345,18 @@ def lattice_ladder(
             ):
                 on_rung(f"rung_{int(nz)}", int(nz), _orthonormalize(cands[0]))
         _mark(f"rung {nz} zones @ {tol:g} deg, {len(R_)} -> {len(o)}")
-    nz, tol = rungs[-1][0], rungs[-1][1]
-    kind, args, _ = (
-        band_args(int(nz), False) if band else score_args(int(nz), float(tol))
-    )
-    rnd = Rot.random(int(n_null), random_state=seed).as_matrix().astype(np.float32)
-    null = np.asarray(kern["score_" + kind](jnp.asarray(rnd), *args))
-    z = (scores - null.mean()) / max(null.std(), 1e-12)
+    if int(n_null) > 0:
+        nz, tol = rungs[-1][0], rungs[-1][1]
+        kind, args, _ = (
+            band_args(int(nz), False, float(tol))
+            if band
+            else score_args(int(nz), float(tol))
+        )
+        rnd = Rot.random(int(n_null), random_state=seed).as_matrix().astype(np.float32)
+        null = np.asarray(kern["score_" + kind](jnp.asarray(rnd), *args))
+        z = (scores - null.mean()) / max(null.std(), 1e-12)
+    else:
+        z = np.zeros_like(scores, dtype=np.float64)
     return [
         (_orthonormalize(R), float(sv), float(zv))
         for R, sv, zv in zip(cands, scores, z)
