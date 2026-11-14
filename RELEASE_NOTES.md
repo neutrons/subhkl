@@ -4,6 +4,46 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.6]
+
+### Added
+
+- Laue-order-aware $S^2$ spherical-cap max-envelope `lattice_ladder`
+  (`score_band_table_env`) and crystallographic $\Delta\mathbf{m} \in
+  \{-1,0,+1\}^3$ Laue-order stencil co-refinement (`laue_order_stencil`,
+  `refine_band_geometry`) to solve single-frame stills and multi-frame scans
+  under uncalibrated detector geometry scissor.
+- Automatic local `/SNS` and `/HFIR` filesystem fallback in `subhkl-nova-app`
+  when NDIP Galaxy or ONCat is unconfigured or unreachable:
+  - Direct NeXus/HDF5 path verification, lightweight HDF5 header metadata
+    harvesting (`title`, `DASlogs` goniometer angles, `duration`), and sibling
+    `IPTS-*` auto-suggestion on typos.
+  - Offline `/SNS/<INST>/IPTS-*/nexus` and `/HFIR/<INST>/IPTS-*/nexus`
+    experiment and run catalog browsing.
+- Stepped run-interval syntax in the Load Neutron Data run selector (for
+  example `2632-2638/2`, `2632:2638:2`, or `2632-2638..2`).
+
+### Changed
+
+- Unified $N \ge 1$ `scan_band` preconditioning and geometry regularization so
+  single-frame solves retain anisotropic axial scale (`s_ax`), `parameter_units`
+  preconditioning across Stages `0`–`1b`, and `reg_geom = 5.0`.
+- Switched uncalibrated count-mode `blind_band` search to deterministic
+  top-positive deviance bin selection and capped multi-frame `band_table`
+  construction at `131,072` bins.
+
+### Fixed
+
+- Fixed an async polling race in `subhkl-nova-app` where finishing `solve` runs
+  could overwrite a newly entered UI $d_{\min}$ with an earlier solve's
+  $d_{\min}$.
+- Automatic Podman base-image fallback to cached `:main` / `:latest` (with
+  bind-mounted `subhkl`) when launching local GPU stages from an unbuilt git
+  branch checkout or offline registry.
+- Immediate local Podman GPU container termination on Stop (`podman kill` +
+  `podman rm -f -i -t 0`) instead of timing out against Podman's 10-second
+  `SIGTERM` grace period.
+
 ## [1.5.5]
 
 ### Added
