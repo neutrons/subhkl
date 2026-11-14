@@ -18,8 +18,10 @@ import contextlib
 import http.server
 import json
 import os
+import re
 import shutil
 import socketserver
+import subprocess
 import tempfile
 import threading
 import time
@@ -3271,6 +3273,99 @@ class NovaGalaxyPipelineRunner:
     SNS_HFIR_ROOTS: ClassVar[dict[str, str]] = {"SNS": "/SNS", "HFIR": "/HFIR"}
 
     @staticmethod
+    def _resolve_local_podman_image(
+        preferred_image: str,
+        *,
+        podman_bin: str = "podman",
+    ) -> tuple[str, str | None]:
+        """Resolve a usable Podman base image when ``preferred_image`` is an unbuilt branch tag or offline."""
+        if (
+            os.environ.get("SUBHKL_CONTAINER_IMAGE", "").strip()
+            or os.environ.get("SUBHKL_CONTAINER_TAG", "").strip()
+        ):
+            return preferred_image, None
+
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            exists_res = subprocess.run(
+                [podman_bin, "image", "exists", preferred_image],
+                capture_output=True,
+                timeout=3.0,
+                check=False,
+            )
+            if exists_res.returncode == 0:
+                return preferred_image, None
+
+        repo, sep, tag = preferred_image.rpartition(":")
+        if not sep or "/" in tag:
+            repo, tag = preferred_image, "latest"
+
+        local_images: list[str] = []
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            list_res = subprocess.run(
+                [
+                    podman_bin,
+                    "images",
+                    "--format",
+                    "{{.Repository}}:{{.Tag}}",
+                    repo,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            if list_res.returncode == 0:
+                for raw_line in list_res.stdout.splitlines():
+                    img = raw_line.strip()
+                    if (
+                        img
+                        and img.startswith(f"{repo}:")
+                        and not img.endswith(":<none>")
+                        and img not in local_images
+                    ):
+                        local_images.append(img)
+
+        local_fallback: str | None = None
+        for candidate in (f"{repo}:main", f"{repo}:latest"):
+            if candidate in local_images:
+                local_fallback = candidate
+                break
+        if local_fallback is None and local_images:
+            local_fallback = local_images[0]
+
+        is_published_tag = bool(
+            tag in ("main", "latest")
+            or re.match(r"^[vV]?\d+\.\d+", tag)
+            or re.match(r"^pr-\d+$", tag)
+        )
+        if not is_published_tag:
+            if local_fallback is not None:
+                return (
+                    local_fallback,
+                    f"{preferred_image} not built locally; using cached {local_fallback} with bind-mounted subhkl",
+                )
+            return (
+                f"{repo}:main",
+                f"{preferred_image} is a git branch tag; falling back to {repo}:main with bind-mounted subhkl",
+            )
+
+        if local_fallback is not None:
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                manifest_res = subprocess.run(
+                    [podman_bin, "manifest", "inspect", preferred_image],
+                    capture_output=True,
+                    timeout=4.0,
+                    check=False,
+                )
+                if manifest_res.returncode != 0:
+                    return (
+                        local_fallback,
+                        f"{preferred_image} unreachable in registry; using cached {local_fallback} with bind-mounted subhkl",
+                    )
+
+        return preferred_image, None
+
+    @staticmethod
     def _parse_run_range_spec(spec_str: str) -> list[int]:
         """Parse run specifications such as '2625-2638', '2632-2638/2', '2632:2638:2', or '2632..2638..2'."""
         import re as _re
@@ -5077,8 +5172,22 @@ class NovaGalaxyPipelineRunner:
             if stage_id == "merge"
             else get_container_image()
         )
-        if shutil.which("podman"):
-            raw_dirs = {os.path.dirname(os.path.abspath(p)) for p in raw_nxs_local}
+        image_fallback_note: str | None = None
+        podman_bin = shutil.which("podman")
+        if podman_bin:
+            if stage_id != "merge":
+                container_image, image_fallback_note = self._resolve_local_podman_image(
+                    container_image,
+                    podman_bin=podman_bin,
+                )
+            raw_dirs = {
+                d
+                for p in raw_nxs_local
+                for d in (
+                    os.path.dirname(os.path.abspath(p)),
+                    os.path.dirname(os.path.realpath(p)),
+                )
+            }
             mount_dirs = sorted(
                 {
                     os.path.dirname(merged_path),
@@ -5169,6 +5278,8 @@ class NovaGalaxyPipelineRunner:
         if stage_id != "merge":
             if fallback_reason and existing_job_record is None:
                 header_lines.append(f"[ndip] Note: {fallback_reason}")
+            if image_fallback_note:
+                header_lines.append(f"[container] Note: {image_fallback_note}")
             header_lines.append(f"[pulsar] Runner host: {host_tag}")
             header_lines.append(
                 f"[container] Host={host_tag} | GPU={gpu_info} | Image={container_image}"

@@ -941,6 +941,62 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
         "CG4D_2627.nxs.h5",
     ]
 
+    # _resolve_local_podman_image falls back from unbuilt git-branch tags to cached :main (or :main pull)
+    import os as _os
+    from unittest.mock import patch
+
+    def _fake_podman_run(cmd: list[str], **_kwargs: object) -> object:
+        from types import SimpleNamespace
+
+        if cmd[1:3] == ["image", "exists"]:
+            target = cmd[3]
+            return SimpleNamespace(
+                returncode=0 if target == "ghcr.io/neutrons/subhkl:main" else 1
+            )
+        if cmd[1] == "images":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "ghcr.io/neutrons/subhkl:pr-113\n"
+                    "ghcr.io/neutrons/subhkl:main\n"
+                    "ghcr.io/neutrons/subhkl:1.5.0\n"
+                ),
+            )
+        if cmd[1:3] == ["manifest", "inspect"]:
+            return SimpleNamespace(returncode=1)
+        return SimpleNamespace(returncode=1, stdout="")
+
+    clean_env = {
+        k: v
+        for k, v in _os.environ.items()
+        if k not in ("SUBHKL_CONTAINER_IMAGE", "SUBHKL_CONTAINER_TAG")
+    }
+    with (
+        patch.dict(_os.environ, clean_env, clear=True),
+        patch("subprocess.run", side_effect=_fake_podman_run),
+    ):
+        resolved_img, note_branch = (
+            NovaGalaxyPipelineRunner._resolve_local_podman_image(
+                "ghcr.io/neutrons/subhkl:feat-local-sns-hfir-fallback"
+            )
+        )
+        assert resolved_img == "ghcr.io/neutrons/subhkl:main"
+        assert note_branch is not None and "bind-mounted subhkl" in note_branch
+
+        exact_img, note_exact = NovaGalaxyPipelineRunner._resolve_local_podman_image(
+            "ghcr.io/neutrons/subhkl:main"
+        )
+        assert exact_img == "ghcr.io/neutrons/subhkl:main"
+        assert note_exact is None
+
+        offline_rel_img, note_rel = (
+            NovaGalaxyPipelineRunner._resolve_local_podman_image(
+                "ghcr.io/neutrons/subhkl:9.9.9"
+            )
+        )
+        assert offline_rel_img == "ghcr.io/neutrons/subhkl:main"
+        assert note_rel is not None and "unreachable" in note_rel
+
     # Mock NDIP Galaxy connection to verify routing through neutrons_load_data
     runner_ndip = NovaGalaxyPipelineRunner(
         galaxy_url="https://ndip-test.ornl.gov",
