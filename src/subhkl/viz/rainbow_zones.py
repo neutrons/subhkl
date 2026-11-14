@@ -9265,7 +9265,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     statusBox.style.borderColor = "rgba(56,189,248,0.45)";
     msgEl.style.color = "#38bdf8";
-    msgEl.textContent = `Verifying ${{paths.length}} run(s) via NDIP Load Neutron Data...`;
+    msgEl.textContent = `Verifying ${{paths.length}} run(s) (NDIP / local /SNS, /HFIR)...`;
     if (sugBtn) sugBtn.style.display = "none";
     try {{
       const r = await fetch("api/pipeline/check_neutron_paths", {{
@@ -9371,7 +9371,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (statusBox) statusBox.style.borderColor = "rgba(56,189,248,0.25)";
       if (msgEl) {{
         msgEl.style.color = "var(--text-dim)";
-        msgEl.textContent = `Ready to verify ${{paths.length}} run(s) via NDIP Load Neutron Data`;
+        msgEl.textContent = `Ready to verify ${{paths.length}} run(s) (NDIP or local /SNS, /HFIR)`;
       }}
     }}
   }}
