@@ -100,7 +100,32 @@ def discover(args, samples=16384, candidates=6, seed=0):
         weighting_desc = "smooth chi2-suppressed bin Poisson deviance"
     banks, rows, cols, Rs = [v[use] for v in (banks, rows, cols, R_obs)]
     weights = search_weights
-    idx, sampled_weights = sample_signed(weights, samples, seed)
+    rot_axis_only = getattr(args, "global_rot_axis", (0.0, 1.0, 0.0))
+    modes = getattr(args, "modes", None)
+    r_bound = 0.08 if (modes is None or "cylindrical" in modes) else 0.0
+    a_bound = (
+        0.08
+        if (modes is None or ("cylindrical" in modes and "axial_stretch" in modes))
+        else (0.0 if (modes is not None and "axial_stretch" not in modes) else None)
+    )
+    rot_bound = 2.0 if (modes is None or "global_rot" in modes) else 0.0
+    t_bound = 0.02 if (modes is None or "global_trans" in modes) else 0.0
+    geom_uncalibrated = r_bound > 0.0 or rot_bound > 0.0 or t_bound > 0.0
+    if geom_uncalibrated and not args.finder:
+        pos_idx = np.flatnonzero(weights > 0)
+        if len(pos_idx) > samples:
+            top_pos = pos_idx[np.argsort(-weights[pos_idx])[:samples]]
+            idx = np.sort(top_pos)
+            sampled_weights = weights[idx] / max(np.abs(weights[idx]).sum(), 1e-12)
+        elif len(weights) <= samples:
+            idx = np.arange(len(weights))
+            sampled_weights = weights / max(np.abs(weights).sum(), 1e-12)
+        else:
+            top_abs = np.argsort(-np.abs(weights))[:samples]
+            idx = np.sort(top_abs)
+            sampled_weights = weights[idx] / max(np.abs(weights[idx]).sum(), 1e-12)
+    else:
+        idx, sampled_weights = sample_signed(weights, samples, seed)
     C, O = np.empty((len(weights), 3)), np.empty((len(weights), 3))
     for bank in np.unique(banks):
         m = banks == bank
@@ -113,12 +138,26 @@ def discover(args, samples=16384, candidates=6, seed=0):
     B = np.asarray(build_B_jax(*args.cell[:3], *np.deg2rad(args.cell[3:])))
     wavelength = (args.wl_min, args.wl_max)
     pool = max(24, 4 * candidates)
+    xyz_all = C + O
+    q_all = xyz_all / np.linalg.norm(xyz_all, axis=1, keepdims=True) - [0, 0, 1]
+    lab_all = q_all / np.linalg.norm(q_all, axis=1, keepdims=True)
+    all_directions = np.einsum("nji,nj->ni", Rs, lab_all)
     xyz = Cs + Os
     q = xyz / np.linalg.norm(xyz, axis=1, keepdims=True) - [0, 0, 1]
     lab = q / np.linalg.norm(q, axis=1, keepdims=True)
     directions = np.einsum("nji,nj->ni", rotations, lab)
     blind_path = Path(args.output).with_suffix(".blind.h5")
     src_nexus = getattr(args, "nexus", getattr(args, "input", ""))
+
+    def _scaled_midpoint(mid_vec: np.ndarray, r_sc: float, a_sc: float) -> np.ndarray:
+        return np.stack(
+            [
+                mid_vec[..., 0] * (1.0 + r_sc),
+                mid_vec[..., 1] * (1.0 + a_sc),
+                mid_vec[..., 2] * (1.0 + r_sc),
+            ],
+            axis=-1,
+        )
 
     def _write_blind_rung(
         stage_label: str,
@@ -144,6 +183,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 )
                 if geom_fit is not None:
                     r_sc = float(geom_fit.get("radial_scale", 0.0))
+                    a_sc = float(geom_fit.get("axial_scale", r_sc))
                     r_vec = np.asarray(
                         geom_fit.get("global_rot_vec", np.zeros(3)), dtype=float
                     )
@@ -163,7 +203,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
                             + 0.5 * det_b.width * det_b.uhat
                             + 0.5 * det_b.height * det_b.vhat
                         )
-                        mid_cal = mid_b * (1.0 + r_sc) @ rot_m.T + t_vec
+                        mid_cal = _scaled_midpoint(mid_b, r_sc, a_sc) @ rot_m.T + t_vec
                         uh_cal = det_b.uhat @ rot_m.T
                         vh_cal = det_b.vhat @ rot_m.T
                         cen_cal = (
@@ -210,6 +250,14 @@ def discover(args, samples=16384, candidates=6, seed=0):
                     live_doc["radial_scale"] = round(
                         float(geom_fit.get("radial_scale", 0.0)), 6
                     )
+                    live_doc["axial_scale"] = round(
+                        float(
+                            geom_fit.get(
+                                "axial_scale", geom_fit.get("radial_scale", 0.0)
+                            )
+                        ),
+                        6,
+                    )
                     live_doc["global_rot_vec"] = [
                         round(float(x), 6)
                         for x in np.asarray(
@@ -246,70 +294,167 @@ def discover(args, samples=16384, candidates=6, seed=0):
         flush=True,
     )
 
+    env_pool = max(128, 12 * int(candidates))
+
+    if geom_uncalibrated:
+        coarse_nz = 30
+        ladder_rungs = ((30, 0.9, 1.0, env_pool * 2, 5),)
+        band_env_deg = 1.1
+    else:
+        coarse_nz = 13
+        ladder_rungs = (
+            (13, 0.5, 1.5, 300, 5),
+            (30, 0.5, 1.0, 80, 5),
+            (60, 0.3, 0.5, pool, 5),
+            (145, 0.3, 0.25, pool, 5),
+        )
+        band_env_deg = 0.0
+
+    if len(weights) > 131_072:
+        table_cap = min(len(weights), 131_072)
+        if args.finder:
+            t_idx = np.argpartition(np.abs(weights), -table_cap)[-table_cap:]
+        else:
+            pos_all = np.flatnonzero(weights > 0.0)
+            if len(pos_all) >= table_cap:
+                t_idx = pos_all[
+                    np.argpartition(weights[pos_all], -table_cap)[-table_cap:]
+                ]
+            else:
+                t_idx = np.argpartition(np.abs(weights), -table_cap)[-table_cap:]
+        t_idx = np.sort(t_idx)
+        table_dirs = all_directions[t_idx]
+        table_weights = weights[t_idx] * (len(weights) / len(t_idx))
+        table_sin_theta = -lab_all[t_idx, 2]
+    else:
+        table_dirs = all_directions
+        table_weights = weights
+        table_sin_theta = -lab_all[:, 2]
+
     found = lattice_ladder(
         directions,
         sampled_weights,
         B,
         grid_deg=2.0,
         n_shortlist=1000,
-        rungs=(
-            (13, 0.5, 1.5, 300, 5),
-            (30, 0.5, 1.0, 80, 5),
-            (60, 0.3, 0.5, pool, 5),
-            (145, 0.3, 0.25, pool, 5),
-        ),
+        coarse_zones=coarse_nz,
+        rungs=ladder_rungs,
         sin_theta=-lab[:, 2],
         wavelength=wavelength,
         d_min=args.d_min,
+        table_dirs=table_dirs,
+        table_weights=table_weights,
+        table_sin_theta=table_sin_theta,
         n_null=32,
         seed=seed,
         verbose=True,
         space_group=args.space_group,
+        dedup_deg=3.0,
         on_rung=_write_blind_rung,
+        band_envelope_deg=band_env_deg,
+        band_table_min_spacing_deg=0.22 if geom_uncalibrated else 0.0,
+        table_tol_deg=0.8 if geom_uncalibrated else 1.0,
     )
-    found = distinct_orientations(found, B, args.space_group, candidates)
+    found = distinct_orientations(
+        found,
+        B,
+        args.space_group,
+        env_pool if geom_uncalibrated else candidates,
+        separation_deg=3.0 if geom_uncalibrated else 1.0,
+    )
     if not found:
         raise ValueError("blind band search found no orientation candidates")
     print(
         f"Joint band refinement of {len(found)} distinct blind candidates", flush=True
     )
-    rot_axis_only = getattr(args, "global_rot_axis", (0.0, 1.0, 0.0))
-    modes = getattr(args, "modes", None)
-    r_bound = 0.08 if (modes is None or "cylindrical" in modes) else 0.0
-    rot_bound = 2.0 if (modes is None or "global_rot" in modes) else 0.0
-    t_bound = 0.02 if (modes is None or "global_trans" in modes) else 0.0
     fits = []
-    for i, item in enumerate(found):
-        U = item[0]
-        fit = refine_band_geometry(
+    if geom_uncalibrated:
+        stencil_fit = refine_band_geometry(
             Cs,
             Os,
             sampled_weights,
             B,
             rotations,
-            U,
+            np.asarray([item[0] for item in found], dtype=np.float64),
             wavelength,
             args.d_min,
+            n_zones=60,
             radial_bound=r_bound,
+            axial_bound=a_bound if (a_bound is not None and a_bound > 0.0) else None,
             rot_bound_deg=rot_bound,
             trans_bound_m=t_bound,
-            maxiter=150,
+            maxiter=200,
             rot_axis_only=rot_axis_only,
             space_group=args.space_group,
+            laue_order_search=True,
         )
-        fits.append(fit)
-        best_fit_so_far = max(fits, key=lambda f_it: f_it["score"])
-        _write_blind_rung(
-            f"joint_{i}", 60, best_fit_so_far["U"], geom_fit=best_fit_so_far
-        )
+        fits.append(stencil_fit)
+        _write_blind_rung("joint_stencil", 60, stencil_fit["U"], geom_fit=stencil_fit)
         print(
-            f"  candidate {i}: score {fit['score']:.6g}, radial {fit['radial_scale']:+.4f}",
+            f"  laue-order stencil winner: score {stencil_fit['score']:.6g}, "
+            f"radial {stencil_fit['radial_scale']:+.4f}, "
+            f"axial {stencil_fit.get('axial_scale', stencil_fit['radial_scale']):+.4f}",
             flush=True,
         )
-    winner = int(np.argmax([fit["score"] for fit in fits]))
+        found = found[:candidates]
+        for i, item in enumerate(found[: max(0, int(candidates) - 1)]):
+            U = item[0]
+            fit = refine_band_geometry(
+                Cs,
+                Os,
+                sampled_weights,
+                B,
+                rotations,
+                U,
+                wavelength,
+                args.d_min,
+                radial_bound=r_bound,
+                axial_bound=a_bound
+                if (a_bound is not None and a_bound > 0.0)
+                else None,
+                rot_bound_deg=rot_bound,
+                trans_bound_m=t_bound,
+                maxiter=120,
+                rot_axis_only=rot_axis_only,
+                space_group=args.space_group,
+            )
+            fits.append(fit)
+    else:
+        for i, item in enumerate(found):
+            U = item[0]
+            fit = refine_band_geometry(
+                Cs,
+                Os,
+                sampled_weights,
+                B,
+                rotations,
+                U,
+                wavelength,
+                args.d_min,
+                radial_bound=r_bound,
+                rot_bound_deg=rot_bound,
+                trans_bound_m=t_bound,
+                maxiter=150,
+                rot_axis_only=rot_axis_only,
+                space_group=args.space_group,
+            )
+            fits.append(fit)
+            best_fit_so_far = max(fits, key=lambda f_it: f_it["score"])
+            _write_blind_rung(
+                f"joint_{i}", 60, best_fit_so_far["U"], geom_fit=best_fit_so_far
+            )
+            print(
+                f"  candidate {i}: score {fit['score']:.6g}, radial {fit['radial_scale']:+.4f}",
+                flush=True,
+            )
+    winner = int(np.argmin([fit.get("loss", -fit["score"]) for fit in fits]))
     geometry = fits[winner]
+    r_sc_win = float(geometry["radial_scale"])
+    a_sc_win = float(geometry.get("axial_scale", r_sc_win))
     rot = Rotation.from_rotvec(geometry["global_rot_vec"]).as_matrix()
-    C_shared = C * (1 + geometry["radial_scale"]) @ rot.T + geometry["global_trans_m"]
+    C_shared = (
+        _scaled_midpoint(C, r_sc_win, a_sc_win) @ rot.T + geometry["global_trans_m"]
+    )
     O_shared = O @ rot.T
     U_shared = []
     for fit in fits:
@@ -322,11 +467,12 @@ def discover(args, samples=16384, candidates=6, seed=0):
             fit["U"],
             wavelength,
             args.d_min,
+            n_zones=145 if geom_uncalibrated else 60,
             radial_bound=0,
             rot_bound_deg=0,
             trans_bound_m=0,
-            orient_bound_deg=2.0,
-            maxiter=100,
+            orient_bound_deg=1.0 if geom_uncalibrated else 2.0,
+            maxiter=120,
             space_group=args.space_group,
         )
         U_shared.append(local["U"])
@@ -335,7 +481,9 @@ def discover(args, samples=16384, candidates=6, seed=0):
     lab = q / np.linalg.norm(q, axis=1, keepdims=True)
     D = np.einsum("nji,nj->ni", Rs, lab)
     lo, hi = band_q_range(-lab[:, 2], wavelength, args.d_min)
-    uvw = direct_lattice_uvw(B, space_group=args.space_group)[:60]
+    uvw = direct_lattice_uvw(B, space_group=args.space_group)[
+        : (145 if geom_uncalibrated else 60)
+    ]
     X = uvw @ np.linalg.inv(B)
     w = weights / np.abs(weights).sum()
     import jax.numpy as jnp
@@ -367,6 +515,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
         f["instrument/name"] = str(args.instrument)
         f["instrument/wavelength"] = np.asarray([args.wl_min, args.wl_max], dtype=float)
         r_sc = float(geometry.get("radial_scale", 0.0))
+        a_sc = float(geometry.get("axial_scale", r_sc))
         t_vec = np.asarray(geometry.get("global_trans_m", np.zeros(3)), dtype=float)
         cal_g = f.create_group("detector_calibration")
         for b_k, b_cfg in beamlines[args.instrument].items():
@@ -380,7 +529,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 + 0.5 * det_b.width * det_b.uhat
                 + 0.5 * det_b.height * det_b.vhat
             )
-            mid_cal = mid_b * (1.0 + r_sc) @ rot.T + t_vec
+            mid_cal = _scaled_midpoint(mid_b, r_sc, a_sc) @ rot.T + t_vec
             uh_cal = det_b.uhat @ rot.T
             vh_cal = det_b.vhat @ rot.T
             cen_cal = mid_cal - 0.5 * det_b.width * uh_cal - 0.5 * det_b.height * vh_cal
@@ -399,10 +548,11 @@ def discover(args, samples=16384, candidates=6, seed=0):
         g["sample_indices"] = idx
         g["sample_weights"] = sampled_weights
         g["shared_geometry"] = np.r_[
-            geometry["radial_scale"],
+            r_sc,
             geometry["global_rot_vec"],
             geometry["global_trans_m"],
         ]
+        g["shared_axial_scale"] = a_sc
         g["candidate_geometries"] = np.array(
             [
                 np.r_[
