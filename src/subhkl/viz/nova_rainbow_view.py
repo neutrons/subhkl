@@ -1797,11 +1797,59 @@ class NovaGalaxyPipelineRunner:
             "status": "submitted",
         }
 
+    @staticmethod
+    def _terminate_local_container_or_proc(
+        container_name: str | None,
+        proc: subprocess.Popen[bytes] | None,
+    ) -> bool:
+        """Immediately kill and force-remove a local Podman container and/or subprocess."""
+        import signal
+
+        killed_container = False
+        podman_bin = shutil.which("podman")
+        if container_name and podman_bin:
+            for subcmd, t_out in (
+                ([podman_bin, "kill", str(container_name)], 5.0),
+                ([podman_bin, "rm", "-f", "-i", "-t", "0", str(container_name)], 10.0),
+            ):
+                with contextlib.suppress(
+                    OSError, subprocess.SubprocessError, ValueError, TypeError
+                ):
+                    res = subprocess.run(
+                        subcmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=t_out,
+                        check=False,
+                    )
+                    if res.returncode == 0:
+                        killed_container = True
+
+        if proc is not None and proc.poll() is None:
+            try:
+                if hasattr(os, "killpg"):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                else:
+                    proc.terminate()
+            except OSError:
+                with contextlib.suppress(OSError):
+                    proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired, OSError):
+                proc.wait(timeout=0.3)
+            if proc.poll() is None:
+                try:
+                    if hasattr(os, "killpg"):
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    else:
+                        proc.kill()
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        proc.kill()
+
+        return killed_container
+
     def cancel_active_job(self, stage_id: str | None = None) -> dict[str, Any]:
         """Cancel the currently running NDIP Galaxy or local container job."""
-        import signal
-        import subprocess
-
         aj = self.active_job
         if not isinstance(aj, dict):
             return {"ok": True, "status": "idle", "message": "No active job to cancel"}
@@ -1829,29 +1877,24 @@ class NovaGalaxyPipelineRunner:
                 self._api_request("DELETE", f"/api/jobs/{jid}")
                 cancelled_galaxy_ids.append(jid)
 
-        proc = getattr(self, "_active_proc", None)
-        if proc is not None:
-            try:
-                if hasattr(os, "killpg"):
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                else:
-                    proc.terminate()
-            except OSError:
-                with contextlib.suppress(OSError):
-                    proc.terminate()
+        procs_map: dict[str, subprocess.Popen[bytes]] = getattr(
+            self, "_active_procs", {}
+        )
+        proc = procs_map.get(cur_jid) or getattr(self, "_active_proc", None)
+        cname = (
+            str(
+                aj.get("container_name")
+                or getattr(self, "_active_container_name", None)
+                or ""
+            ).strip()
+            or None
+        )
 
-        cname = getattr(self, "_active_container_name", None)
+        killed_container = self._terminate_local_container_or_proc(cname, proc)
         if cname:
-            with contextlib.suppress(
-                OSError, subprocess.SubprocessError, ValueError, TypeError
-            ):
-                subprocess.run(
-                    ["podman", "rm", "-f", str(cname)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=5.0,
-                    check=False,
-                )
+            aj["stdout"] = (
+                aj.get("stdout", "") + f"[container] Stopped container {cname}\n"
+            )[-24000:]
 
         return {
             "ok": True,
@@ -1860,6 +1903,7 @@ class NovaGalaxyPipelineRunner:
             "previous_state": prev_state,
             "cancelled_job_id": cur_jid,
             "cancelled_galaxy_jobs": cancelled_galaxy_ids,
+            "cancelled_container": cname if killed_container else None,
             "job": aj,
         }
 
@@ -5264,7 +5308,9 @@ class NovaGalaxyPipelineRunner:
             gpu_info = "CPU fallback"
             gpu_env["JAX_PLATFORMS"] = "cpu"
 
-        job_id = f"gpu-{int(time.time())}"
+        seq = int(getattr(self, "_local_job_seq", 0)) + 1
+        self._local_job_seq = seq
+        job_id = f"gpu-{int(time.time() * 1000)}-{seq}"
         container_name: str | None = None
         if cmd and cmd[0] == "podman":
             container_name = f"subhkl-{job_id}"
@@ -5289,6 +5335,7 @@ class NovaGalaxyPipelineRunner:
         if existing_job_record is not None:
             job_record = existing_job_record
             job_record["job_id"] = job_id
+            job_record["container_name"] = container_name
             job_record["mode"] = "container_gpu"
             job_record["state"] = "running"
             job_record["runner_host"] = host_tag
@@ -5302,6 +5349,7 @@ class NovaGalaxyPipelineRunner:
         else:
             job_record = {
                 "job_id": job_id,
+                "container_name": container_name,
                 "tool_id": f"subhkl::{stage_id}",
                 "stage_id": stage_id,
                 "mode": "container_gpu",
@@ -5319,6 +5367,11 @@ class NovaGalaxyPipelineRunner:
             }
             self.active_job = job_record
 
+        if container_name:
+            self._active_container_name = container_name
+        if not hasattr(self, "_active_procs"):
+            self._active_procs = {}
+
         if stage_id == "solve":
             job_record["images_h5_path"] = merged_path
             job_record["solve_params"] = {
@@ -5330,8 +5383,11 @@ class NovaGalaxyPipelineRunner:
             }
 
         def _stream_proc() -> None:
+            proc: subprocess.Popen[bytes] | None = None
             try:
-                self._active_container_name = container_name
+                if job_record.get("cancel_requested"):
+                    job_record["state"] = "deleted"
+                    return
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -5340,7 +5396,12 @@ class NovaGalaxyPipelineRunner:
                     env=gpu_env,
                     start_new_session=True,
                 )
+                self._active_procs[job_id] = proc
                 self._active_proc = proc
+                if job_record.get("cancel_requested"):
+                    self._terminate_local_container_or_proc(container_name, proc)
+                    job_record["state"] = "deleted"
+                    return
                 assert proc.stdout is not None
                 blind_src = out_h5[:-3] + ".blind.h5"
                 stages_src = out_h5[:-3] + ".stages.h5"
@@ -5471,7 +5532,7 @@ class NovaGalaxyPipelineRunner:
                                             ),
                                         }
                 rc = proc.wait()
-                if rc == 0:
+                if rc == 0 and not job_record.get("cancel_requested"):
                     job_record["ladder_rung_idx"] = 0 if stage_id == "reduce" else 4
                     final_h5 = out_h5
                     if stage_id == "reduce" and os.path.isfile(out_h5):
@@ -5725,8 +5786,14 @@ class NovaGalaxyPipelineRunner:
                     job_record["state"] = "error"
                     job_record["stderr"] += f"\n[subhkl] Error: {exc}\n"
             finally:
-                self._active_proc = None
-                self._active_container_name = None
+                if job_record.get("cancel_requested") and container_name:
+                    self._terminate_local_container_or_proc(container_name, proc)
+                if hasattr(self, "_active_procs"):
+                    self._active_procs.pop(job_id, None)
+                if getattr(self, "_active_proc", None) is proc:
+                    self._active_proc = None
+                if getattr(self, "_active_container_name", None) == container_name:
+                    self._active_container_name = None
 
         threading.Thread(target=_stream_proc, daemon=True).start()
         return {

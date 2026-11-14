@@ -997,6 +997,50 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
         assert offline_rel_img == "ghcr.io/neutrons/subhkl:main"
         assert note_rel is not None and "unreachable" in note_rel
 
+    # cancel_active_job immediately kills (podman kill) and force-removes (-f -i -t 0) local container
+    podman_cancel_cmds: list[list[str]] = []
+
+    def _record_podman_cancel(cmd: list[str], **_kwargs: object) -> object:
+        from types import SimpleNamespace
+
+        podman_cancel_cmds.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    runner_local_fs.active_job = {
+        "job_id": "gpu-12345-1",
+        "container_name": "subhkl-gpu-12345-1",
+        "stage_id": "solve",
+        "mode": "container_gpu",
+        "state": "running",
+        "stdout": "",
+        "stderr": "",
+    }
+    mock_proc = MagicMock()
+    mock_proc.pid = 999999
+    mock_proc.poll.side_effect = [None, 0]
+    runner_local_fs._active_procs = {"gpu-12345-1": mock_proc}
+    with (
+        patch("shutil.which", return_value="/usr/bin/podman"),
+        patch("subprocess.run", side_effect=_record_podman_cancel),
+        patch("os.killpg"),
+        patch("os.getpgid", return_value=999999),
+    ):
+        cancel_res = runner_local_fs.cancel_active_job("solve")
+    assert cancel_res["ok"] is True
+    assert cancel_res["status"] == "cancelled"
+    assert cancel_res["cancelled_container"] == "subhkl-gpu-12345-1"
+    assert ["/usr/bin/podman", "kill", "subhkl-gpu-12345-1"] in podman_cancel_cmds
+    assert [
+        "/usr/bin/podman",
+        "rm",
+        "-f",
+        "-i",
+        "-t",
+        "0",
+        "subhkl-gpu-12345-1",
+    ] in podman_cancel_cmds
+    assert "Stopped container subhkl-gpu-12345-1" in cancel_res["job"]["stdout"]
+
     # Mock NDIP Galaxy connection to verify routing through neutrons_load_data
     runner_ndip = NovaGalaxyPipelineRunner(
         galaxy_url="https://ndip-test.ornl.gov",
