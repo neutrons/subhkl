@@ -904,7 +904,9 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     assert chk_down_fallback["checked_via"] == "local_filesystem"
 
     # Catalog browser falls back to local /HFIR directory & header scan when ONCat is unavailable
-    import pyoncat  # type: ignore[import-untyped]
+    # (including when optional `pyoncat` is not installed in base CI environments)
+    import sys as _sys
+    from unittest.mock import patch
 
     mock_broken_oncat = MagicMock()
     mock_broken_oncat.Experiment.list.side_effect = RuntimeError("ONCat offline")
@@ -912,14 +914,13 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     runner_local_fs._get_oncat_client = MagicMock(
         return_value=(mock_broken_oncat, False)
     )
-    orig_pyoncat_cls = pyoncat.ONCat
-    pyoncat.ONCat = MagicMock(return_value=mock_broken_oncat)
-    try:
+    runner_local_fs.get_oncat_auth_status = MagicMock(
+        return_value={"ok": True, "authenticated": False}
+    )
+    with patch.dict(_sys.modules, {"pyoncat": None}):
         cat_local = runner_local_fs.browse_oncat_catalog(
             {"facility": "HFIR", "instrument": "CG4D", "ipts": "37331"}
         )
-    finally:
-        pyoncat.ONCat = orig_pyoncat_cls
     assert cat_local["ok"] is True
     assert cat_local["catalog_source"] == "local_filesystem"
     assert [e["ipts"] for e in cat_local["experiments"]] == ["37331"]
