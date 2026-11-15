@@ -181,6 +181,12 @@ class MainApp:
                                 and not is_reduce_file
                             ),
                         )
+                        self.pipeline_runner.invalidate_subsequent_stages(
+                            (self.view_model.model.subhkl.payload or {}).get(
+                                "artifact_kind"
+                            ),
+                            os.path.dirname(os.path.abspath(local_h5)),
+                        )
                         refreshed = True
                 except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                     return web.json_response(

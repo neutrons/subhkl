@@ -8968,16 +8968,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const stageKeys = ["reduce", "solve", "integrate", "merge"];
     const stageTitles = ["1. Reduce", "2. Solve", "3. Integrate", "4. Merge"];
     const pIdx = Math.min(3, Math.max(0, state.currentPipelineIdx));
-    const stageId = (PIPELINE[pIdx] && PIPELINE[pIdx].stage_id) || stageKeys[pIdx] || "solve";
-    const stageTitle = stageTitles[pIdx] || (PIPELINE[pIdx] && PIPELINE[pIdx].name) || stageId.toUpperCase();
     const maxValidCompleted = typeof galaxyBridge.maxValidCompletedSteps === "number"
       ? galaxyBridge.maxValidCompletedSteps
       : pipelineIdxForArtifactKind(DATA.artifact_kind);
-    const isStageInvalidated = pIdx >= maxValidCompleted;
 
-    const byName = new Map();
-    if (!isStageInvalidated) {{
-      const srvList = (galaxyBridge.stepArtifacts && galaxyBridge.stepArtifacts[stageId]) || [];
+    const groups = [];
+    for (let sIdx = 0; sIdx < Math.min(stageKeys.length, maxValidCompleted); sIdx++) {{
+      const sId = (PIPELINE[sIdx] && PIPELINE[sIdx].stage_id) || stageKeys[sIdx];
+      const sTitle = stageTitles[sIdx] || (PIPELINE[sIdx] && PIPELINE[sIdx].name) || sId.toUpperCase();
+      const byName = new Map();
+      const srvList = (galaxyBridge.stepArtifacts && galaxyBridge.stepArtifacts[sId]) || [];
       srvList.forEach(it => {{
         if (it && it.name) byName.set(it.name, {{ ...it }});
       }});
@@ -8985,56 +8985,67 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (ds.state && ds.state !== "ok") return;
         const bname = String(ds.name || "").split("/").pop();
         if (!bname) return;
-        if (classifyArtifactStageClient(bname) !== stageId) return;
-        const cur = byName.get(bname) || {{ name: bname, stage_id: stageId }};
+        if (classifyArtifactStageClient(bname) !== sId) return;
+        const cur = byName.get(bname) || {{ name: bname, stage_id: sId }};
         if (ds.id && !cur.dataset_id) cur.dataset_id = ds.id;
         if (ds.hid && !cur.hid) cur.hid = ds.hid;
         byName.set(bname, cur);
       }});
+      if (byName.size > 0) {{
+        groups.push({{ sIdx, sId, sTitle, items: Array.from(byName.values()) }});
+      }}
     }}
 
     filesDrawer.innerHTML = "";
-    const lbl = document.createElement("span");
-    lbl.style.color = "var(--accent-gold)";
-    lbl.style.fontWeight = "700";
-    lbl.textContent = `${{stageTitle.toUpperCase()}} FILES:`;
-    filesDrawer.appendChild(lbl);
-
-    const items = Array.from(byName.values());
-    if (items.length === 0) {{
+    if (groups.length === 0) {{
+      const lbl = document.createElement("span");
+      lbl.style.color = "var(--accent-gold)";
+      lbl.style.fontWeight = "700";
+      lbl.textContent = "FILES:";
+      filesDrawer.appendChild(lbl);
       const emptyEl = document.createElement("span");
       emptyEl.style.color = "var(--text-dim)";
-      emptyEl.textContent = `No stored artifacts yet for ${{stageTitle}} (use < Walk > arrows to switch steps).`;
+      const nextTitle = stageTitles[pIdx] || "1. Reduce";
+      emptyEl.textContent = `No stored artifacts yet (pending step: ${{nextTitle}}).`;
       filesDrawer.appendChild(emptyEl);
       return;
     }}
 
-    items.forEach(item => {{
-      const a = document.createElement("a");
-      a.className = "file-dl-pill";
-      const qs = new URLSearchParams();
-      if (item.name) qs.set("name", item.name);
-      if (item.dataset_id) qs.set("dataset_id", item.dataset_id);
-      if (galaxyBridge.mode === "galaxy_iframe" && item.dataset_id && !item.has_local) {{
-        a.href = `/api/datasets/${{encodeURIComponent(item.dataset_id)}}/display?to_ext=${{encodeURIComponent(item.name.split(".").pop() || "h5")}}`;
-      }} else {{
-        a.href = `api/artifacts/download?${{qs.toString()}}`;
+    groups.forEach((grp, gIdx) => {{
+      if (gIdx > 0) {{
+        const sep = document.createElement("span");
+        sep.style.color = "rgba(148, 163, 184, 0.35)";
+        sep.style.margin = "0 4px";
+        sep.textContent = "│";
+        filesDrawer.appendChild(sep);
       }}
-      a.setAttribute("download", item.name);
-      const sizeStr = typeof item.size_bytes === "number" && item.size_bytes > 0
-        ? ` (${{item.size_bytes >= 1048576 ? (item.size_bytes / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(item.size_bytes / 1024)) + " KB"}})`
-        : (item.hid ? ` (#${{item.hid}})` : "");
-      a.textContent = `↓ ${{item.name}}${{sizeStr}}`;
-      a.title = `Download ${{item.name}} (${{stageTitle}}) to local computer`;
-      filesDrawer.appendChild(a);
-    }});
+      const isFocusStage = grp.sIdx === pIdx || (pIdx >= maxValidCompleted && grp.sIdx === maxValidCompleted - 1);
+      const lbl = document.createElement("span");
+      lbl.style.color = isFocusStage ? "var(--accent-gold)" : "var(--text-dim)";
+      lbl.style.fontWeight = "700";
+      lbl.textContent = `${{grp.sTitle.toUpperCase()}}:`;
+      filesDrawer.appendChild(lbl);
 
-    const hintEl = document.createElement("span");
-    hintEl.style.color = "var(--text-dim)";
-    hintEl.style.marginLeft = "auto";
-    hintEl.style.fontSize = "0.58rem";
-    hintEl.textContent = "Switch step with < Walk >";
-    filesDrawer.appendChild(hintEl);
+      grp.items.forEach(item => {{
+        const a = document.createElement("a");
+        a.className = "file-dl-pill";
+        const qs = new URLSearchParams();
+        if (item.name) qs.set("name", item.name);
+        if (item.dataset_id) qs.set("dataset_id", item.dataset_id);
+        if (galaxyBridge.mode === "galaxy_iframe" && item.dataset_id && !item.has_local) {{
+          a.href = `/api/datasets/${{encodeURIComponent(item.dataset_id)}}/display?to_ext=${{encodeURIComponent(item.name.split(".").pop() || "h5")}}`;
+        }} else {{
+          a.href = `api/artifacts/download?${{qs.toString()}}`;
+        }}
+        a.setAttribute("download", item.name);
+        const sizeStr = typeof item.size_bytes === "number" && item.size_bytes > 0
+          ? ` (${{item.size_bytes >= 1048576 ? (item.size_bytes / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(item.size_bytes / 1024)) + " KB"}})`
+          : (item.hid ? ` (#${{item.hid}})` : "");
+        a.textContent = `↓ ${{item.name}}${{sizeStr}}`;
+        a.title = `Download ${{item.name}} (${{grp.sTitle}}) to local computer`;
+        filesDrawer.appendChild(a);
+      }});
+    }});
   }}
 
   const elGalaxyBadge = document.getElementById("galaxy-status-badge");
@@ -11596,6 +11607,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (finishedOk || finishedErr) {{
               clearInterval(galaxyBridge.pollTimer);
               galaxyBridge.pollTimer = null;
+              if (runSeq === state.workflowRunSeq) {{
+                state.runningStageIdx = -1;
+              }}
               if (finishedOk) {{
                 const h5Outs = Array.isArray(aj.outputs)
                   ? aj.outputs.filter(o => o && o.id && (!o.extension || o.extension === "h5" || o.extension === "hdf5"))

@@ -2339,6 +2339,10 @@ def test_em_pixel_mask_two_color_overlay_and_srcdoc_tab_handling(tmp_path):
     assert "resolveStandaloneTabUrl" in html
     assert "isEmbeddedInOuterFrame" in html
     assert 'selfHref.startsWith("about:srcdoc")' in html
+    assert (
+        "for (let sIdx = 0; sIdx < Math.min(stageKeys.length, maxValidCompleted); sIdx++)"
+        in html
+    )
 
     scripts = re.findall(
         r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, flags=re.S
