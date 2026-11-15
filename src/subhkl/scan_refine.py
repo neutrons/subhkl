@@ -837,6 +837,27 @@ def write_result(
             if hasattr(args, "pixel_diagnostics"):
                 for name, values in args.pixel_diagnostics.items():
                     report[f"pixel_polish/{name}"] = values
+            em_mask_res = getattr(args, "em_pixel_result", None)
+            if em_mask_res is not None:
+                put("detector/mask_bank_ids", em_mask_res.bank_ids)
+                out.create_dataset(
+                    "detector/pixel_mask",
+                    data=em_mask_res.pixel_mask,
+                    compression="gzip",
+                    compression_opts=1,
+                )
+                out.create_dataset(
+                    "detector/pixel_class",
+                    data=em_mask_res.pixel_class,
+                    compression="gzip",
+                    compression_opts=1,
+                )
+                report.attrs["em_valid_fraction"] = float(em_mask_res.valid_fraction)
+                report.attrs["em_dark_fraction"] = float(em_mask_res.dark_fraction)
+                report.attrs["em_bright_fraction"] = float(em_mask_res.bright_fraction)
+                report.attrs["em_dead_banks"] = json.dumps(em_mask_res.dead_banks)
+                report.attrs["em_dark_bins"] = int(em_mask_res.n_dark_bins)
+                report.attrs["em_bright_bins"] = int(em_mask_res.n_bright_bins)
             # Shared visualization contract; this is a band objective, not a
             # Poisson fit, so no Poisson deviance or stationarity is invented.
             view = out.create_group("solve")

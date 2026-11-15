@@ -2272,3 +2272,81 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     ]
     assert "dMinSeqAtStart" in html_doc
     assert "pollInFlight" in html_doc
+
+
+def test_em_pixel_mask_two_color_overlay_and_srcdoc_tab_handling(tmp_path):
+    """Verify two-color EM pixel_class PNG encoding, masked solve peak filtering, and srcdoc Tab popout logic."""
+    import base64
+    import io
+    import re
+    import subprocess
+
+    from PIL import Image
+
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    mask_solve_h5 = tmp_path / "solve_with_em_mask.h5"
+    p_cls = np.zeros((2, 512, 512), dtype=np.uint8)
+    # Bank 21: dead/shadowed top half (1=dark) + bright magnet flare patch (2=bright)
+    p_cls[0, :256, :] = 1
+    p_cls[0, 320:336, 320:336] = 2
+    # Bank 22: completely valid (0) -> should emit mask_b64=None (zero payload bloat)
+    p_mask = (p_cls == 0).astype(np.uint8)
+
+    with h5py.File(mask_solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = np.diag([1.0 / 25.0, 1.0 / 30.0, 1.0 / 35.0])
+        hf["sample/space_group"] = "P 2 2 2"
+        hf["scan_refinement/band_wavelength"] = np.array([2.8, 4.5], dtype=float)
+        dgrp = hf.create_group("detector")
+        dgrp.create_dataset("mask_bank_ids", data=np.array([21, 22], dtype=np.int32))
+        dgrp.create_dataset("pixel_mask", data=p_mask)
+        dgrp.create_dataset("pixel_class", data=p_cls)
+
+    payload = build_rainbow_zone_payload(replay_h5=mask_solve_h5, instrument="CG4D")
+    em_sum = payload["em_mask_summary"]
+    assert em_sum["available"] is True
+    assert em_sum["n_dark_pixels"] == 256 * 512
+    assert em_sum["n_bright_pixels"] == 16 * 16
+    assert em_sum["dark_fraction"] > 0.20
+    assert em_sum["bright_fraction"] > 0.0
+
+    panels_by_bank = {p["bank"]: p for p in payload["panels"]}
+    assert panels_by_bank[22]["mask_b64"] is None
+    b21_mask_b64 = panels_by_bank[21]["mask_b64"]
+    assert isinstance(b21_mask_b64, str) and len(b21_mask_b64) > 0
+
+    mask_img = np.asarray(
+        Image.open(io.BytesIO(base64.b64decode(b21_mask_b64))), dtype=np.uint8
+    )
+    assert mask_img.shape == (128, 128)
+    assert set(np.unique(mask_img).tolist()) == {0, 128, 255}
+    assert np.all(mask_img[:64, :] == 128)
+    assert np.all(mask_img[80:84, 80:84] == 255)
+
+    # No forward-projected solve peaks should land on masked pixels of bank 21
+    for pk in payload["peaks"]:
+        if pk["bank"] == 21:
+            ri = int(np.clip(round(pk["row"]), 0, 511))
+            ci = int(np.clip(round(pk["col"]), 0, 511))
+            assert p_cls[0, ri, ci] == 0
+
+    html = render_rainbow_html(payload)
+    assert 'id="btn-pixel-mask"' in html
+    assert 'id="mask-legend-row"' in html
+    assert "getWarpedMaskCanvas" in html
+    assert "resolveStandaloneTabUrl" in html
+    assert "isEmbeddedInOuterFrame" in html
+    assert 'selfHref.startsWith("about:srcdoc")' in html
+
+    scripts = re.findall(
+        r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, flags=re.S
+    )
+    assert scripts
+    js_file = tmp_path / "rainbow_mask_check.js"
+    js_file.write_text("\n;\n".join(scripts), encoding="utf-8")
+    proc = subprocess.run(
+        ["node", "--check", str(js_file)], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr

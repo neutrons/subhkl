@@ -88,16 +88,36 @@ def discover(args, samples=16384, candidates=6, seed=0):
     start = time.monotonic()
     observations = load_observations(args, return_kinematics=True)
     banks, rows, cols, dev, _, runs, _angles, weights, R_obs, _scan_axes = observations
+    from subhkl.search.pixel_em import PixelEMClassifier, wilson_search_weights
+
+    pixel_em = getattr(args, "_pixel_em", None)
+    if pixel_em is None and not args.finder:
+        pixel_em = PixelEMClassifier.from_args(args)
+        args._pixel_em = pixel_em
+    if pixel_em is not None:
+        dev, weights, gv_obs = pixel_em.map_to_observations(
+            banks, rows, cols, runs, dev, weights
+        )
+    else:
+        gv_obs = np.ones(len(dev), dtype=np.float64)
+
     use = np.isin(runs, args.stable_runs)
     if args.finder:
         use &= dev >= args.min_deviance
         search_weights = weights[use]
         weighting_desc = "sqrt finder deviance"
     else:
-        search_weights = count_search_weights(
-            dev[use], max_quantile=0.999, max_factor=3.0
+        search_weights = (
+            count_search_weights(dev[use], max_quantile=0.999, max_factor=3.0)
+            * gv_obs[use]
         )
-        weighting_desc = "smooth chi2-suppressed bin Poisson deviance"
+        weighting_desc = (
+            "EM-masked chi2-suppressed bin Poisson deviance"
+            if pixel_em is not None
+            else "chi2-suppressed bin Poisson deviance"
+        )
+    dev_stable = dev[use]
+    runs_stable = runs[use]
     banks, rows, cols, Rs = [v[use] for v in (banks, rows, cols, R_obs)]
     weights = search_weights
     rot_axis_only = getattr(args, "global_rot_axis", (0.0, 1.0, 0.0))
@@ -447,7 +467,117 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 f"  candidate {i}: score {fit['score']:.6g}, radial {fit['radial_scale']:+.4f}",
                 flush=True,
             )
-    winner = int(np.argmin([fit.get("loss", -fit["score"]) for fit in fits]))
+
+    if pixel_em is not None and len(fits) > 0:
+        # Coarse candidate EM reweighting:
+        # E-step evaluates each candidate's (valid, dark, bright) pixel posteriors
+        # and null-subtracted Wilson reflection likelihood; M-step re-polishes top
+        # finalists with bright/dark artifacts suppressed before selecting winner.
+        em_evals = [
+            pixel_em.evaluate_candidate(
+                fit["U"],
+                B,
+                radial_scale=float(fit["radial_scale"]),
+                axial_scale=float(fit.get("axial_scale", fit["radial_scale"])),
+                global_rot_vec=fit["global_rot_vec"],
+                global_trans_m=fit["global_trans_m"],
+                match_sigma_px=5.0,
+            )
+            for fit in fits
+        ]
+        top_em_order = np.argsort([-ev["em_score"] for ev in em_evals])
+        for k_idx in top_em_order[: min(3, len(fits))]:
+            ev_k = em_evals[int(k_idx)]
+            pixel_em.apply_responsibilities(
+                ev_k["gamma_valid"], ev_k["gamma_dark"], ev_k["gamma_bright"]
+            )
+            dev_k, _, gv_k = pixel_em.map_to_observations(
+                banks, rows, cols, runs_stable, dev_stable, weights
+            )
+            w_k = count_search_weights(dev_k, max_quantile=0.999, max_factor=3.0) * gv_k
+            if np.any(w_k[idx] > 0.0):
+                w_k_sub = w_k[idx] / max(np.abs(w_k[idx]).sum(), 1e-12)
+                fk = fits[int(k_idx)]
+                rb_k = r_bound
+                ab_k = a_bound if (a_bound is not None and a_bound > 0.0) else None
+                ref_k = refine_band_geometry(
+                    Cs,
+                    Os,
+                    w_k_sub,
+                    B,
+                    rotations,
+                    fk["U"],
+                    wavelength,
+                    args.d_min,
+                    n_zones=145 if geom_uncalibrated else 60,
+                    radial_bound=rb_k,
+                    axial_bound=ab_k,
+                    rot_bound_deg=rot_bound,
+                    trans_bound_m=t_bound,
+                    orient_bound_deg=2.5,
+                    maxiter=100,
+                    rot_axis_only=rot_axis_only,
+                    space_group=args.space_group,
+                )
+                ev_ref = pixel_em.evaluate_candidate(
+                    ref_k["U"],
+                    B,
+                    radial_scale=float(ref_k["radial_scale"]),
+                    axial_scale=float(ref_k.get("axial_scale", ref_k["radial_scale"])),
+                    global_rot_vec=ref_k["global_rot_vec"],
+                    global_trans_m=ref_k["global_trans_m"],
+                    match_sigma_px=4.5,
+                )
+                if ev_ref["em_score"] >= ev_k["em_score"] - 1.0:
+                    fits[int(k_idx)] = ref_k
+                    em_evals[int(k_idx)] = ev_ref
+
+        # Deduplicate symmetry-identical / near-duplicate refined candidates,
+        # keeping highest EM score first and trimming to `candidates`.
+        ranked_idx = list(np.argsort([-ev["em_score"] for ev in em_evals]))
+        kept_idx: list[int] = []
+        kept_list: list[tuple[np.ndarray, float, float]] = []
+        for ki in ranked_idx:
+            cand_u = fits[int(ki)]["U"]
+            trial = kept_list + [(cand_u, float(em_evals[int(ki)]["em_score"]), 0.0)]
+            dedup = distinct_orientations(
+                trial, B, args.space_group, len(trial), separation_deg=1.0
+            )
+            if len(dedup) == len(trial):
+                kept_idx.append(int(ki))
+                kept_list = trial
+            if len(kept_idx) >= int(candidates):
+                break
+        if not kept_idx:
+            kept_idx = ranked_idx[: int(candidates)]
+        fits = [fits[i] for i in kept_idx]
+        em_evals = [em_evals[i] for i in kept_idx]
+        winner = 0
+        win_ev = em_evals[winner]
+        pixel_em.apply_responsibilities(
+            win_ev["gamma_valid"], win_ev["gamma_dark"], win_ev["gamma_bright"]
+        )
+        dev_win, _, gv_win = pixel_em.map_to_observations(
+            banks, rows, cols, runs_stable, dev_stable, weights
+        )
+        weights = (
+            wilson_search_weights(dev_win, gv_win)
+            if pixel_em.n_orient_clusters < 2
+            else count_search_weights(dev_win, max_quantile=0.999, max_factor=3.0)
+        )
+        if np.any(weights[idx] > 0.0):
+            sampled_weights = weights[idx] / max(np.abs(weights[idx]).sum(), 1e-12)
+        n_dk = sum(int(np.sum(v > 0.5)) for v in win_ev["gamma_dark"].values())
+        n_br = sum(int(np.sum(v > 0.5)) for v in win_ev["gamma_bright"].values())
+        print(
+            f"  EM candidate selection: winner=0/{len(fits)} "
+            f"(em_score={win_ev['em_score']:.1f}, matched={win_ev['n_matched']}, "
+            f"radial={fits[winner]['radial_scale']:+.4f}, "
+            f"dark_bins={n_dk}, bright_bins={n_br})",
+            flush=True,
+        )
+    else:
+        winner = int(np.argmin([fit.get("loss", -fit["score"]) for fit in fits]))
     geometry = fits[winner]
     r_sc_win = float(geometry["radial_scale"])
     a_sc_win = float(geometry.get("axial_scale", r_sc_win))
@@ -488,19 +618,33 @@ def discover(args, samples=16384, candidates=6, seed=0):
     w = weights / np.abs(weights).sum()
     import jax.numpy as jnp
 
-    scores = [
-        float(
-            band_sum(
-                jnp.asarray(X @ U.T),
-                jnp.asarray(D),
-                jnp.asarray(lo),
-                jnp.asarray(hi),
-                jnp.asarray(w),
-                jnp.ones(len(X)),
+    if pixel_em is not None:
+        scores = []
+        for U in U_shared:
+            ev_s = pixel_em.evaluate_candidate(
+                U,
+                B,
+                radial_scale=r_sc_win,
+                axial_scale=a_sc_win,
+                global_rot_vec=geometry["global_rot_vec"],
+                global_trans_m=geometry["global_trans_m"],
+                match_sigma_px=4.5,
             )
-        )
-        for U in U_shared
-    ]
+            scores.append(float(ev_s["em_score"]))
+    else:
+        scores = [
+            float(
+                band_sum(
+                    jnp.asarray(X @ U.T),
+                    jnp.asarray(D),
+                    jnp.asarray(lo),
+                    jnp.asarray(hi),
+                    jnp.asarray(w),
+                    jnp.ones(len(X)),
+                )
+            )
+            for U in U_shared
+        ]
     selected = int(np.argmax(scores))
     path = Path(args.output).with_suffix(".blind.h5")
     tmp_final = path.with_suffix(".blind.tmp.h5")
@@ -562,6 +706,10 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 ]
                 for v in fits
             ],
+            dtype=np.float64,
+        )
+        g["candidate_axial_scales"] = np.array(
+            [float(v.get("axial_scale", v["radial_scale"])) for v in fits],
             dtype=np.float64,
         )
         g.attrs["selected"] = selected

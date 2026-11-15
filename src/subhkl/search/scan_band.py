@@ -877,12 +877,21 @@ def refine_scan(args):
         if U0.ndim == 3:
             U0 = U0[0]
         cand_Us = [U0]
-        if "blind_search/candidate_U" in f:
-            for Uc in np.asarray(f["blind_search/candidate_U"][()], dtype=np.float64)[
-                :6
-            ]:
-                if not any(np.allclose(Uc, Uprev, atol=1e-4) for Uprev in cand_Us):
-                    cand_Us.append(Uc)
+        for cand_key in ("search/orientations", "blind_search/candidate_U"):
+            if cand_key in f:
+                for Uc in np.asarray(f[cand_key][()], dtype=np.float64)[:6]:
+                    if not any(np.allclose(Uc, Uprev, atol=1e-4) for Uprev in cand_Us):
+                        cand_Us.append(Uc)
+        cand_geoms_boot = (
+            np.asarray(f["search/candidate_geometries"][()], dtype=np.float64)
+            if "search/candidate_geometries" in f
+            else None
+        )
+        cand_axials_boot = (
+            np.asarray(f["search/candidate_axial_scales"][()], dtype=np.float64)
+            if "search/candidate_axial_scales" in f
+            else None
+        )
         shared_geom = (
             np.asarray(f["search/shared_geometry"][()], dtype=np.float64)
             if "search/shared_geometry" in f
@@ -907,6 +916,19 @@ def refine_scan(args):
 
     obs = load_observations(args, return_kinematics=True)
     banks, pr, pc, dev, sig_px, runs, _angs, spot_weights, R_obs, scan_axes_obs = obs
+    raw_dev_obs = dev.copy()
+    raw_spot_weights = spot_weights.copy()
+
+    from subhkl.search.pixel_em import PixelEMClassifier
+
+    pixel_em = getattr(args, "_pixel_em", None)
+    if pixel_em is None and not args.finder:
+        pixel_em = PixelEMClassifier.from_args(args)
+        args._pixel_em = pixel_em
+    if pixel_em is not None:
+        dev, spot_weights, _gv_obs = pixel_em.map_to_observations(
+            banks, pr, pc, runs, raw_dev_obs, raw_spot_weights
+        )
     n_runs = args.n_runs
     bank_ids = sorted(int(k) for k in beamlines[args.instrument])
     bank_to_idx = {b: i for i, b in enumerate(bank_ids)}
@@ -934,16 +956,6 @@ def refine_scan(args):
     v_off_all = H_bank[b_idx_all] * (pr / N_bank[b_idx_all] - 0.5)
 
     sel = np.isin(runs, args.runs)
-    if args.finder:
-        sel &= dev >= args.min_deviance
-        weights_sel = spot_weights[sel]
-    else:
-        from subhkl.search.blind_band import count_search_weights
-
-        weights_sel = count_search_weights(dev[sel], max_quantile=0.999, max_factor=3.0)
-        if not np.any(weights_sel > 0):
-            weights_sel = spot_weights[sel]
-
     is_single_setting = len(args.runs) <= 1 or np.allclose(
         R_obs[sel], R_obs[sel][0:1], atol=1e-6
     )
@@ -954,9 +966,113 @@ def refine_scan(args):
         idx_r = np.flatnonzero(runs == r)
         R_runs_nom[r] = R_obs[idx_r[0]].copy() if len(idx_r) else np.eye(3)
 
+    from subhkl.search.blind_band import count_search_weights
+
+    # Multi-run EM candidate re-evaluation across bootstrap pool (if present)
+    if pixel_em is not None and len(cand_Us) >= 1:
+        best_em_score = -1e30
+        best_em_ev = None
+        best_em_u = U0
+        best_em_geom = shared_geom
+        best_em_ax = shared_axial
+        for ic, Uc in enumerate(cand_Us):
+            geom_trials: list[tuple[np.ndarray | None, float | None]] = [
+                (shared_geom, shared_axial)
+            ]
+            if (
+                cand_geoms_boot is not None
+                and ic < len(cand_geoms_boot)
+                and (
+                    shared_geom is None
+                    or not np.allclose(cand_geoms_boot[ic], shared_geom, atol=1e-5)
+                )
+            ):
+                ax_ic = (
+                    float(cand_axials_boot[ic])
+                    if cand_axials_boot is not None and ic < len(cand_axials_boot)
+                    else float(cand_geoms_boot[ic, 0])
+                )
+                geom_trials.append((cand_geoms_boot[ic], ax_ic))
+            if shared_geom is not None and abs(float(shared_geom[0])) > 1e-4:
+                geom_trials.append((np.zeros(7, dtype=np.float64), 0.0))
+
+            for g_try, ax_try in geom_trials:
+                r_try = (
+                    float(g_try[0]) if g_try is not None and len(g_try) >= 1 else 0.0
+                )
+                a_try = float(ax_try) if ax_try is not None else r_try
+                rv_try = (
+                    g_try[1:4]
+                    if g_try is not None and len(g_try) == 7
+                    else np.zeros(3, dtype=np.float64)
+                )
+                tv_try = (
+                    g_try[4:7]
+                    if g_try is not None and len(g_try) == 7
+                    else np.zeros(3, dtype=np.float64)
+                )
+                ev_c = pixel_em.evaluate_candidate(
+                    Uc,
+                    B0,
+                    R_runs=R_runs_nom,
+                    radial_scale=r_try,
+                    axial_scale=a_try,
+                    global_rot_vec=rv_try,
+                    global_trans_m=tv_try,
+                    match_sigma_px=5.0,
+                )
+                if ev_c["em_score"] > best_em_score:
+                    best_em_score = float(ev_c["em_score"])
+                    best_em_ev = ev_c
+                    best_em_u = Uc
+                    best_em_geom = g_try
+                    best_em_ax = ax_try
+
+        if best_em_ev is not None:
+            U0 = best_em_u
+            shared_geom = best_em_geom
+            shared_axial = best_em_ax
+            pixel_em.apply_responsibilities(
+                best_em_ev["gamma_valid"],
+                best_em_ev["gamma_dark"],
+                best_em_ev["gamma_bright"],
+            )
+            dev, spot_weights, _gv_obs = pixel_em.map_to_observations(
+                banks, pr, pc, runs, raw_dev_obs, raw_spot_weights
+            )
+
+    def _compute_band_weights(dev_arr, sw_arr, gv_arr=None):
+        if args.finder:
+            w_s = sw_arr[sel]
+        else:
+            w_s = count_search_weights(dev_arr[sel], max_quantile=0.999, max_factor=3.0)
+            if gv_arr is not None:
+                w_s = w_s * gv_arr[sel]
+            if not np.any(w_s > 0):
+                w_s = sw_arr[sel]
+        wj = jnp.asarray(w_s / np.maximum(np.abs(w_s).sum(), 1e-12), dtype=jnp.float64)
+        wr = jnp.where(
+            jnp.isin(
+                jnp.asarray(runs[sel], dtype=jnp.int32), jnp.asarray(args.stable_runs)
+            ),
+            wj,
+            0.0,
+        )
+        wr = wr / jnp.maximum(jnp.abs(wr).sum(), 1e-12)
+        return wj, wr
+
+    if args.finder:
+        sel &= dev >= args.min_deviance
+
     ewald_ctx = None
+    raw_exc_maps = None
     if not args.pixel_polish and args.maxiter > 2:
-        exc_maps, b2_ew, has_ew_signal = _build_ewald_excess_maps(args)
+        raw_exc_maps, b2_ew, has_ew_signal = _build_ewald_excess_maps(args)
+        exc_maps = (
+            pixel_em.filter_ewald_excess_maps(raw_exc_maps, b2_ew)
+            if (pixel_em is not None and has_ew_signal)
+            else raw_exc_maps
+        )
         if has_ew_signal:
             d_min_ew = _ewald_d_min(cell0, args.d_min)
             hkl_ew = np.stack(
@@ -1014,6 +1130,7 @@ def refine_scan(args):
                 if used_pre_polish:
                     U0 = U_nom_joint
             ewald_ctx = {
+                "raw_exc_maps": raw_exc_maps,
                 "exc_maps": exc_maps,
                 "b2": b2_ew,
                 "hkl_ew": hkl_ew,
@@ -1030,9 +1147,7 @@ def refine_scan(args):
     R0_j = jnp.asarray(R_obs[sel], dtype=jnp.float64)
     e_scan_j = jnp.asarray(scan_axes_obs[sel], dtype=jnp.float64)
     r_idx = jnp.asarray(runs[sel], dtype=jnp.int32)
-    w_j = jnp.asarray(
-        weights_sel / np.maximum(np.abs(weights_sel).sum(), 1e-12), dtype=jnp.float64
-    )
+    w_j, w_r29 = _compute_band_weights(dev, spot_weights)
 
     C_j = jnp.asarray(C_bank[b_idx_all[sel]], dtype=jnp.float64)
     uh_j = jnp.asarray(uhat_bank[b_idx_all[sel]], dtype=jnp.float64)
@@ -1044,8 +1159,6 @@ def refine_scan(args):
         : args.n_zones
     ]
     uvw_j = jnp.asarray(uvw, dtype=jnp.float64)
-    w_r29 = jnp.where(jnp.isin(r_idx, jnp.asarray(args.stable_runs)), w_j, 0.0)
-    w_r29 = w_r29 / jnp.maximum(jnp.abs(w_r29).sum(), 1e-12)
     rot_axis = getattr(args, "global_rot_axis", (0.0, 1.0, 0.0))
     if rot_axis is not None:
         ax_arr = np.asarray(rot_axis, dtype=np.float64)
@@ -1185,7 +1298,7 @@ def refine_scan(args):
                 snapshot=_build_stage_snapshot("ewald-pre", p_pre),
             )
 
-    def loss_band(p, n_z=400, reg_panel=200.0, use_r29=False, inv_len_weight=False):
+    def loss_band(p, w_spots, n_z=400, reg_panel=200.0, inv_len_weight=False):
         rv, s_rad, s_ax, s_area, rg, T, s_samp, da, db, dbeta, dom, du, dv = unpack(p)
         Rg = rodrigues_jax(rg)
         C_scaled = jnp.stack(
@@ -1217,7 +1330,6 @@ def refine_scan(args):
         A_cur = jnp.linalg.inv(B_cur).T
         X0 = uvw_j[:n_z] @ A_cur.T
         Rm = rodrigues_jax(rv) @ Uj
-        w_spots = w_r29 if use_r29 else w_j
         wz = 1.0 / jnp.linalg.norm(X0, axis=1) if inv_len_weight else jnp.ones(len(X0))
         score = band_sum(X0 @ Rm.T, d, q_lo, q_hi, w_spots, wz)
         reg_geom = 5.0
@@ -1315,23 +1427,23 @@ def refine_scan(args):
             bounds[18 + r] = (0.0, 0.0)
 
     vg_band_60 = jax.jit(
-        jax.value_and_grad(lambda p: loss_band(p, 60, 0.0, True, False))
+        jax.value_and_grad(lambda p, ws: loss_band(p, ws, 60, 0.0, False))
     )
     vg_band_120 = jax.jit(
-        jax.value_and_grad(lambda p: loss_band(p, 120, 0.0, False, False))
+        jax.value_and_grad(lambda p, ws: loss_band(p, ws, 120, 0.0, False))
     )
     vg_band_400 = jax.jit(
-        jax.value_and_grad(lambda p: loss_band(p, args.n_zones, 0.0, False, False))
+        jax.value_and_grad(lambda p, ws: loss_band(p, ws, args.n_zones, 0.0, False))
     )
     vg_band_p = jax.jit(
-        jax.value_and_grad(lambda p: loss_band(p, args.n_zones, 200.0, False, False))
+        jax.value_and_grad(lambda p, ws: loss_band(p, ws, args.n_zones, 200.0, False))
     )
 
     units = parameter_units(n_runs, n_banks)
 
-    def _minimize_band(vg_fn, p_init, stage_bounds, maxcor=20):
+    def _minimize_band(vg_fn, p_init, stage_bounds, w_spots_arg, maxcor=20):
         def _obj(z):
-            value, gradient = vg_fn(jnp.asarray(z * units))
+            value, gradient = vg_fn(jnp.asarray(z * units), w_spots_arg)
             return float(value), np.asarray(gradient, np.float64) * units
 
         res_s = minimize(
@@ -1349,6 +1461,83 @@ def refine_scan(args):
         )
         res_s.x = np.asarray(res_s.x, np.float64) * units
         return res_s
+
+    def _run_em_e_step_from_p(p_vec, match_sigma_px=5.5):
+        nonlocal dev, spot_weights, w_j, w_r29
+        if pixel_em is None:
+            return None
+        (
+            rv_e,
+            sr_e,
+            sa_e,
+            sar_e,
+            rg_e,
+            T_e,
+            ss_e,
+            da_e,
+            db_e,
+            dbe_e,
+            dom_e,
+            du_e,
+            dv_e,
+        ) = unpack(jnp.asarray(p_vec, dtype=jnp.float64))
+        Rg_e = np.asarray(rodrigues_jax(rg_e))
+        U_e = np.asarray(rodrigues_jax(rv_e) @ Uj)
+        B_e = np.asarray(
+            build_B_jax(*_apply_cell_jax(cell0, symmetry_kind, da_e, db_e, dbe_e))
+        )
+        C_sc_e = np.stack(
+            [
+                C_bank[:, 0] * (1.0 + float(sr_e)),
+                C_bank[:, 1] * (1.0 + float(sa_e)),
+                C_bank[:, 2] * (1.0 + float(sr_e)),
+            ],
+            axis=-1,
+        )
+        W_e = W_bank * (1.0 + float(sar_e))
+        H_e = H_bank * (1.0 + float(sar_e))
+        uh_e = uhat_bank @ Rg_e.T
+        vh_e = vhat_bank @ Rg_e.T
+        C_mid_e = (
+            C_sc_e
+            + np.asarray(du_e)[:, None] * uhat_bank
+            + np.asarray(dv_e)[:, None] * vhat_bank
+        ) @ Rg_e.T + np.asarray(T_e)[None, :]
+        C_fin_e = C_mid_e - 0.5 * W_e[:, None] * uh_e - 0.5 * H_e[:, None] * vh_e
+        panel_cal_e = {
+            bank_ids[i]: (C_fin_e[i], uh_e[i], vh_e[i], float(W_e[i]), float(H_e[i]))
+            for i in range(n_banks)
+        }
+        R_base_e = (
+            ewald_ctx["R_runs_band_base"]
+            if (ewald_ctx is not None and "R_runs_band_base" in ewald_ctx)
+            else R_runs_nom
+        )
+        R_runs_e = {}
+        for r in args.runs:
+            idx_r = np.flatnonzero(runs == r)
+            if len(idx_r):
+                dR_r = np.asarray(
+                    rodrigues_jax(
+                        float(dom_e[r]) * jnp.asarray(scan_axes_obs[idx_r[0]])
+                    )
+                )
+                R_runs_e[r] = dR_r @ R_base_e[r]
+            else:
+                R_runs_e[r] = R_base_e[r]
+        stats_e = pixel_em.update_e_step(
+            U_e,
+            B_e,
+            R_runs=R_runs_e,
+            panel_cal=panel_cal_e,
+            sample_shift_m=np.asarray(ss_e),
+            match_sigma_px=match_sigma_px,
+        )
+        dev, spot_weights, gv_e = pixel_em.map_to_observations(
+            banks, pr, pc, runs, raw_dev_obs, raw_spot_weights
+        )
+        w_j, w_r29 = _compute_band_weights(dev, spot_weights, gv_e)
+        return stats_e
 
     has_calibrated_shared_geom = (
         shared_geom is not None
@@ -1395,7 +1584,7 @@ def refine_scan(args):
             if "global_trans" in args.modes:
                 p0[9:12] = shared_geom[4:7]
         p0 = np.clip(p0, *np.asarray(bounds_0).T)
-        res = _minimize_band(vg_band_60, p0, bounds_0)
+        res = _minimize_band(vg_band_60, p0, bounds_0, w_r29)
         if res.fun < best_v:
             best_v, best_p, best_result = res.fun, res.x.copy(), res
     record("global", best_result)
@@ -1403,6 +1592,7 @@ def refine_scan(args):
         f"[Stage 0: 60-zone stable runs {args.stable_runs}] band_score = {-best_v:.4f}",
         flush=True,
     )
+    _run_em_e_step_from_p(best_p, match_sigma_px=6.0)
 
     # Initialize per-run omega drift via 1D scan on 120-zone band score
     dom_grid = np.deg2rad(np.linspace(-5.0, 5.0, 201))
@@ -1484,13 +1674,14 @@ def refine_scan(args):
     best_p[18 : 18 + n_runs] -= best_p[18 + args.anchor_run]
 
     # Stage 1a: 120-zone band across all selected runs, including scan drift.
-    res_1a = _minimize_band(vg_band_120, best_p, bounds_120)
+    res_1a = _minimize_band(vg_band_120, best_p, bounds_120, w_j)
     best_p = res_1a.x.copy()
     record("120-zones", res_1a)
     print(f"[Stage 1a: 120-Zone Band (All Runs)] band_score = {-res_1a.fun:.4f}")
+    _run_em_e_step_from_p(best_p, match_sigma_px=5.0)
 
     # Stage 1b: Fine 400-zone band + monoclinic cell ratios
-    res_1b = _minimize_band(vg_band_400, best_p, bounds_global)
+    res_1b = _minimize_band(vg_band_400, best_p, bounds_global, w_j)
     best_p = res_1b.x.copy()
     record("cell", res_1b)
     print(
@@ -1499,12 +1690,14 @@ def refine_scan(args):
 
     # Stage 2: Regularized per-bank (du, dv) shifts on 400-zone band objective
     if "panels" in args.modes and not is_single_setting:
-        res_p = _minimize_band(vg_band_p, best_p, bounds_panel, maxcor=30)
+        _run_em_e_step_from_p(best_p, match_sigma_px=4.5)
+        res_p = _minimize_band(vg_band_p, best_p, bounds_panel, w_j, maxcor=30)
         p_cur = res_p.x.copy()
         record("panels", res_p)
         print(f"[Stage 2: +Regularized Per-Bank Shifts] loss = {res_p.fun:.4f}")
     else:
         p_cur = best_p.copy()
+    _run_em_e_step_from_p(p_cur, match_sigma_px=4.5)
 
     if args.pixel_polish:
         # Stage 3: 2-step median-trimmed pixel residual polish on assigned reflections
@@ -1855,6 +2048,35 @@ def refine_scan(args):
     if ewald_ctx is not None:
         from scipy.spatial.transform import Rotation as Rot
 
+        if pixel_em is not None and ewald_ctx.get("raw_exc_maps") is not None:
+            ewald_ctx["exc_maps"] = pixel_em.filter_ewald_excess_maps(
+                ewald_ctx["raw_exc_maps"], ewald_ctx["b2"]
+            )
+            _ev_nf, pol_j_nf, pol_pr_nf = _make_ewald_polisher(
+                ewald_ctx["hkl_ew"] @ B0.T,
+                args.runs,
+                R_runs_nom,
+                bank_ids,
+                C_bank_corner,
+                uhat_bank,
+                vhat_bank,
+                W_bank,
+                H_bank,
+                M_bank,
+                N_bank,
+                ewald_ctx["exc_maps"],
+                args.assign_wavelength,
+                ewald_ctx["b2"],
+            )
+            U_nf, ew_nf_j = pol_j_nf(ewald_ctx["U_nom_joint"], spans=(0.12, 0.04), n=5)
+            ewald_ctx["U_nom_joint"] = U_nf
+            if per_run_active and not is_single_setting:
+                Urs_nf, s_nf_r = pol_pr_nf(U_nf)
+                ewald_ctx["Urs_nom"] = Urs_nf
+                ewald_ctx["ew_nom"] = float(s_nf_r.sum())
+            else:
+                ewald_ctx["ew_nom"] = float(ew_nf_j)
+
         R_runs_band = dict(ewald_ctx["R_runs_band_base"])
         for r in args.runs:
             idx_r = np.flatnonzero(runs == r)
@@ -2005,6 +2227,52 @@ def refine_scan(args):
                 | (upper - p_cur < 1e-4 * (upper - lower))
             )
         )
+    if pixel_em is not None:
+        panel_cal_final = {
+            bank_ids[i]: (
+                C_final[i],
+                uh_final[i],
+                vh_final[i],
+                float(W_final[i]),
+                float(H_final[i]),
+            )
+            for i in range(n_banks)
+        }
+        R_runs_final_em = {}
+        R_ref_list = getattr(args, "R_runs_refined", None)
+        for r in args.runs:
+            if R_ref_list is not None and r < len(R_ref_list):
+                R_runs_final_em[r] = np.asarray(R_ref_list[r], dtype=np.float64)
+            else:
+                idx_r = np.flatnonzero(runs == r)
+                if len(idx_r):
+                    dR_r = np.asarray(
+                        rodrigues_jax(
+                            float(dom[r]) * jnp.asarray(scan_axes_obs[idx_r[0]])
+                        )
+                    )
+                    R_runs_final_em[r] = dR_r @ R_obs[idx_r[0]]
+                else:
+                    R_runs_final_em[r] = R_runs_nom[r]
+        final_em_stats = pixel_em.update_e_step(
+            U_opt,
+            B_opt,
+            R_runs=R_runs_final_em,
+            panel_cal=panel_cal_final,
+            sample_shift_m=np.asarray(s_samp),
+            match_sigma_px=4.5,
+        )
+        em_export = pixel_em.export_pixel_masks()
+        args.em_pixel_result = em_export
+        print(
+            f"[EM Pixel Classifier] valid={em_export.valid_fraction * 100:.2f}%, "
+            f"dark={em_export.dark_fraction * 100:.2f}% "
+            f"(dead_banks={em_export.dead_banks}), "
+            f"bright={em_export.bright_fraction * 100:.3f}% "
+            f"(bright_bins={em_export.n_bright_bins}, tau={final_em_stats['tau_cryst']:.1f})",
+            flush=True,
+        )
+
     p_out = p_cur.copy()
     p_out[6:9] = np.asarray(rg, dtype=np.float64)
     status = write_result(

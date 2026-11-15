@@ -482,6 +482,88 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
     return None
 
 
+def _load_pixel_class_from_h5(
+    f: h5py.File,
+    sib_solve_path: str | os.PathLike | None = None,
+) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
+    """Load per-bank ``pixel_class`` (0=valid, 1=dark, 2=bright) from ``f`` or sibling ``solve.h5``."""
+
+    def _read_one(hf: h5py.File) -> tuple[dict[int, np.ndarray], list[int]]:
+        out: dict[int, np.ndarray] = {}
+        dead_list: list[int] = []
+        if "detector" in hf:
+            dgrp = hf["detector"]
+            b_ids: np.ndarray | None = None
+            if "mask_bank_ids" in dgrp:
+                b_ids = np.asarray(dgrp["mask_bank_ids"][()], dtype=int).ravel()
+            elif "bank_ids" in hf:
+                b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            arr_cls: np.ndarray | None = None
+            if "pixel_class" in dgrp:
+                arr_cls = np.asarray(dgrp["pixel_class"][()], dtype=np.uint8)
+            elif "pixel_mask" in dgrp:
+                pm = np.asarray(dgrp["pixel_mask"][()], dtype=np.uint8)
+                arr_cls = np.where(pm == 0, np.uint8(1), np.uint8(0))
+            if arr_cls is not None and arr_cls.ndim == 3:
+                if b_ids is None or len(b_ids) != arr_cls.shape[0]:
+                    b_ids = np.arange(1, arr_cls.shape[0] + 1, dtype=int)
+                for b_id, c2d in zip(b_ids, arr_cls):
+                    out[int(b_id)] = c2d
+        elif "valid" in hf and "bank_ids" in hf:
+            # Legacy static-mask HDF5 fallback (`valid`: 1=keep, 0=masked -> dark=1)
+            val_arr = np.asarray(hf["valid"][()], dtype=np.uint8)
+            b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            if val_arr.ndim == 3 and len(b_ids) == val_arr.shape[0]:
+                for b_id, v2d in zip(b_ids, val_arr):
+                    out[int(b_id)] = np.where(v2d == 0, np.uint8(1), np.uint8(0))
+        if "scan_refinement" in hf and "em_dead_banks" in hf["scan_refinement"].attrs:
+            with contextlib.suppress(ValueError, TypeError):
+                dead_list = [
+                    int(x)
+                    for x in np.asarray(
+                        hf["scan_refinement"].attrs["em_dead_banks"]
+                    ).ravel()
+                ]
+        return out, dead_list
+
+    by_bank: dict[int, np.ndarray] = {}
+    dead_banks: list[int] = []
+    with contextlib.suppress(
+        OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+    ):
+        by_bank, dead_banks = _read_one(f)
+    if not by_bank and sib_solve_path and os.path.isfile(sib_solve_path):
+        with (
+            contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+            ),
+            h5py.File(sib_solve_path, "r") as sf,
+        ):
+            by_bank, dead_banks = _read_one(sf)
+
+    if not by_bank:
+        return {}, {"available": False}
+
+    n_total = sum(int(a.size) for a in by_bank.values())
+    n_dark = sum(int(np.count_nonzero(a == 1)) for a in by_bank.values())
+    n_bright = sum(int(np.count_nonzero(a == 2)) for a in by_bank.values())
+    if not dead_banks:
+        dead_banks = sorted(
+            int(bk)
+            for bk, a in by_bank.items()
+            if a.size > 0 and float(np.count_nonzero(a == 1)) / float(a.size) >= 0.90
+        )
+    summary = {
+        "available": True,
+        "dark_fraction": round(n_dark / max(n_total, 1), 6),
+        "bright_fraction": round(n_bright / max(n_total, 1), 6),
+        "n_dark_pixels": int(n_dark),
+        "n_bright_pixels": int(n_bright),
+        "dead_banks": dead_banks,
+    }
+    return by_bank, summary
+
+
 def _encode_panel_textures(
     detectors: dict[int, Any],
     bank_arr: np.ndarray | None,
@@ -494,6 +576,7 @@ def _encode_panel_textures(
     frame_slice: tuple[int, int] | None = None,
     *,
     encode_images: bool = True,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Build cylindrical + spherical detector panel geometries and base64 log-intensity PNG textures.
 
@@ -710,6 +793,38 @@ def _encode_panel_textures(
                 Image.fromarray(u8, mode="L").save(buf, format="PNG", optimize=True)
                 tex_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
+            mask_b64 = None
+            if encode_images and pixel_class_by_bank:
+                cls_im = pixel_class_by_bank.get(int(bk))
+                if (
+                    cls_im is not None
+                    and cls_im.ndim == 2
+                    and cls_im.size > 0
+                    and int(np.max(cls_im)) > 0
+                ):
+                    b_m = max(1, int(render_binning))
+                    nh, mw = cls_im.shape
+                    nh2, mw2 = (nh // b_m) * b_m, (mw // b_m) * b_m
+                    if b_m > 1 and nh2 > 0 and mw2 > 0:
+                        cls_ds = (
+                            cls_im[:nh2, :mw2]
+                            .reshape(nh2 // b_m, b_m, mw2 // b_m, b_m)
+                            .max(axis=(1, 3))
+                        )
+                    else:
+                        cls_ds = cls_im
+                    # Encode 0=valid -> 0, 1=dark -> 128, 2=bright -> 255 in compact 8-bit PNG
+                    m_u8 = np.where(
+                        cls_ds >= 2,
+                        np.uint8(255),
+                        np.where(cls_ds == 1, np.uint8(128), np.uint8(0)),
+                    )
+                    mbuf = io.BytesIO()
+                    Image.fromarray(m_u8, mode="L").save(
+                        mbuf, format="PNG", optimize=True
+                    )
+                    mask_b64 = base64.b64encode(mbuf.getvalue()).decode("ascii")
+
             panels_payload.append(
                 {
                     "bank": int(bk),
@@ -756,6 +871,7 @@ def _encode_panel_textures(
                         for j in range(len(x_e))
                     ],
                     "texture_b64": tex_b64,
+                    "mask_b64": mask_b64,
                 }
             )
         except (
@@ -1059,6 +1175,9 @@ def _extract_from_h5(
         )
         if is_pure_merged:
             sib_solve_path = None
+        pixel_class_by_bank, em_mask_summary = _load_pixel_class_from_h5(
+            f, sib_solve_path=None if is_pure_merged else sib_solve_path
+        )
         instrument = _decode_str(
             f.attrs.get("instrument"), default_instrument or "IMAGINE"
         )
@@ -2198,6 +2317,20 @@ def _extract_from_h5(
                     um, vm = um[in_b], vm[in_b]
                     pr_hit = vm / max(h_d, 1e-6) * (det.n - 1)
                     pc_hit = um / max(w_d, 1e-6) * (det.m - 1)
+                    cls_b = pixel_class_by_bank.get(int(bid))
+                    if cls_b is not None and cls_b.ndim == 2:
+                        rm = np.clip(
+                            np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1
+                        )
+                        cm = np.clip(
+                            np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1
+                        )
+                        valid_m = cls_b[rm, cm] == 0
+                        if not np.any(valid_m):
+                            continue
+                        idx_h = idx_h[valid_m]
+                        um, vm = um[valid_m], vm[valid_m]
+                        pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
                     im_b = bank_imgs.get(int(bid))
                     if im_b is not None:
                         r_i = np.clip(
@@ -2333,6 +2466,8 @@ def _extract_from_h5(
             "all_runs_data": all_runs_data,
             "R_gonio": R_gonio,
             "solve_diagnostics": solve_diagnostics,
+            "pixel_class_by_bank": pixel_class_by_bank,
+            "em_mask_summary": em_mask_summary,
             "frame_slice": frame_slice,
             "frames": frames_meta,
             "frame_index": active_frame,
@@ -2752,6 +2887,8 @@ def build_rainbow_zone_payload(
     merge_metrics: dict[str, Any] | None = None
     all_runs_data: dict[str, Any] | None = None
     solve_diagnostics = None
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None
+    em_mask_summary: dict[str, Any] = {"available": False}
     frame_slice = None
     frames_meta: list[dict[str, Any]] = []
     active_frame = int(frame_index) if frame_index is not None else 0
@@ -2803,6 +2940,8 @@ def build_rainbow_zone_payload(
         merge_metrics = extracted.get("merge_metrics")
         all_runs_data = extracted.get("all_runs_data")
         solve_diagnostics = extracted.get("solve_diagnostics")
+        pixel_class_by_bank = extracted.get("pixel_class_by_bank")
+        em_mask_summary = extracted.get("em_mask_summary") or {"available": False}
         frame_slice = extracted.get("frame_slice")
         frames_meta = extracted.get("frames") or []
         active_frame = int(extracted.get("frame_index", active_frame))
@@ -3711,6 +3850,7 @@ def build_rainbow_zone_payload(
             render_binning=render_binning,
             frame_slice=frame_slice,
             encode_images=include_panel_images,
+            pixel_class_by_bank=pixel_class_by_bank,
         )
     else:
         panels_payload, intensity_source = [], "raw_h5"
@@ -3799,6 +3939,7 @@ def build_rainbow_zone_payload(
         ),
         "beamline_detectors": beamline_detectors,
         "solve_diagnostics": solve_diagnostics,
+        "em_mask_summary": em_mask_summary,
         "merge_metrics": merge_metrics,
         "peaks": peaks_list,
         "sample_peaks": sample_peaks,
@@ -4633,6 +4774,9 @@ def render_rainbow_html(
       <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
         Arcs
       </button>
+      <button id="btn-pixel-mask" title="Show/Hide translucent two-color EM pixel mask overlay (Cyan = Dark/Shadowed, Lime = Static Bright)">
+        Mask
+      </button>
       <button id="btn-heatmap-cmap" title="Cycle Detector Intensity Heatmap Colormap (Magma / Cyan Glow / Film)">
         Magma
       </button>
@@ -4743,6 +4887,16 @@ def render_rainbow_html(
               <option value="residual">Color: ΔI/σ Residual</option>
               <option value="scale">Color: Scale</option>
             </select>
+          </div>
+          <div id="mask-legend-row" class="slider-row" style="display:none;margin-top:3px;padding-top:3px;border-top:1px solid rgba(38,49,79,0.75);font-size:0.61rem;gap:6px;">
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Dead detector banks and cryostat/panel shadows ignored during solve &amp; prediction">
+              <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(56,189,248,0.62);border:1px solid #38bdf8;"></span>
+              <span id="lbl-mask-dark">Dark 0.0%</span>
+            </span>
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Static bright enclosure flares &amp; hot strips ignored during solve &amp; prediction">
+              <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(180,255,20,0.88);border:1px solid #b4ff14;"></span>
+              <span id="lbl-mask-bright">Bright 0.00%</span>
+            </span>
           </div>
         </div>
       </div>
@@ -5216,6 +5370,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
     showZoneArcs: true,           // single vibrant arc per zone (not multi-band rainbow)
+    showPixelMask: false,         // translucent two-color EM pixel mask overlay (dark=cyan, bright=lime)
     heatmapStyle: "magma",        // "magma" | "cyan" | "gray"
     detAlpha: 0.85,
     showStereo: isMergedInit,
@@ -5258,6 +5413,62 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
   const bankCanvases = new Map();
   const warpedBankCanvases = new Map();
+  const maskBankCanvases = new Map();
+  const warpedMaskCanvases = new Map();
+
+  function colorizeMaskImage(img) {{
+    const c = document.createElement("canvas");
+    c.width = img.width || 64;
+    c.height = img.height || 64;
+    const ctx = c.getContext("2d");
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, 0, 0);
+    const imgData = ctx.getImageData(0, 0, c.width, c.height);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {{
+      const v = d[i];
+      if (v >= 192) {{
+        // Class 2 (static bright): vivid translucent electric lime-gold
+        d[i] = 180; d[i + 1] = 255; d[i + 2] = 20; d[i + 3] = 224;
+      }} else if (v >= 64) {{
+        // Class 1 (dark / shadowed / dead panel): translucent cool sky-cyan
+        d[i] = 56; d[i + 1] = 189; d[i + 2] = 248; d[i + 3] = 132;
+      }} else {{
+        d[i] = 0; d[i + 1] = 0; d[i + 2] = 0; d[i + 3] = 0;
+      }}
+    }}
+    ctx.putImageData(imgData, 0, 0);
+    return c;
+  }}
+
+  function hasPixelMask() {{
+    if (maskBankCanvases.size > 0) return true;
+    if (DATA.em_mask_summary && DATA.em_mask_summary.available) return true;
+    return Array.isArray(PANELS) && PANELS.some(p => Boolean(p && (p.mask_b64 || p._maskCanvas)));
+  }}
+
+  function syncPixelMaskUI() {{
+    const btnMask = document.getElementById("btn-pixel-mask");
+    const rowEl = document.getElementById("mask-legend-row");
+    const darkEl = document.getElementById("lbl-mask-dark");
+    const brightEl = document.getElementById("lbl-mask-bright");
+    const avail = hasPixelMask();
+    const sum = (DATA && DATA.em_mask_summary) || {{}};
+    const darkPct = typeof sum.dark_fraction === "number" ? (sum.dark_fraction * 100) : 0;
+    const brightPct = typeof sum.bright_fraction === "number" ? (sum.bright_fraction * 100) : 0;
+    if (btnMask) {{
+      btnMask.classList.toggle("active-btn", Boolean(state.showPixelMask));
+      btnMask.style.opacity = avail || state.showPixelMask ? "1" : "0.52";
+      btnMask.title = avail
+        ? `Show/Hide translucent EM pixel mask overlay (Dark: ${{darkPct.toFixed(1)}}%, Static Bright: ${{brightPct.toFixed(2)}}%)`
+        : "EM pixel mask not available in current dataset — run 2. Solve or load a solved HDF5";
+    }}
+    if (rowEl) {{
+      rowEl.style.display = state.showPixelMask ? "flex" : "none";
+      if (darkEl) darkEl.textContent = avail ? `Dark ${{darkPct.toFixed(1)}}%` : "No EM mask";
+      if (brightEl) brightEl.textContent = avail ? `Bright ${{brightPct.toFixed(2)}}%` : "Run Solve";
+    }}
+  }}
 
   function colorizeGrayscaleImage(img, style) {{
     const c = document.createElement("canvas");
@@ -5309,6 +5520,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }};
       img.src = "data:image/png;base64," + p.texture_b64;
     }});
+    PANELS.forEach(p => {{
+      if (p._maskCanvas) {{
+        maskBankCanvases.set(p.bank, p._maskCanvas);
+        warpedMaskCanvases.clear();
+        return;
+      }}
+      if (!p.mask_b64) return;
+      const mimg = new Image();
+      mimg.onload = () => {{
+        maskBankCanvases.set(p.bank, colorizeMaskImage(mimg));
+        warpedMaskCanvases.clear();
+        syncPixelMaskUI();
+        if (state.showPixelMask) renderDetector();
+      }};
+      mimg.src = "data:image/png;base64," + p.mask_b64;
+    }});
+    syncPixelMaskUI();
   }}
 
   function rebuildBankColorMaps() {{
@@ -6289,6 +6517,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     _cachedPlotBox = null;
     _cachedPlotBoxKey = "";
     if (typeof warpedBankCanvases !== "undefined") warpedBankCanvases.clear();
+    if (typeof warpedMaskCanvases !== "undefined") warpedMaskCanvases.clear();
   }}
 
   function recomputeProjectionBounds() {{
@@ -6430,13 +6659,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.restore();
   }}
 
-  function getWarpedPanelCanvas(panel, isSph) {{
-    const texCanvas = bankCanvases.get(panel.bank);
-    if (!texCanvas) return null;
-    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{state.heatmapStyle}}`;
-    if (warpedBankCanvases.has(cacheKey)) {{
-      return warpedBankCanvases.get(cacheKey);
-    }}
+  function warpTextureOntoPanel(texCanvas, panel, isSph, smooth) {{
     const [vMin, vMax] = getPanelVertRange(panel);
     const azSpan = Math.max(1e-5, panel.az_max - panel.az_min);
     const vSpan = Math.max(1e-5, vMax - vMin);
@@ -6449,7 +6672,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     wc.width = spW;
     wc.height = spH;
     const wctx = wc.getContext("2d");
-    wctx.imageSmoothingEnabled = true;
+    wctx.imageSmoothingEnabled = Boolean(smooth);
 
     const toSp = pt => [
       ((pt[0] - panel.az_min) / azSpan) * spW,
@@ -6573,8 +6796,30 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       wctx.drawImage(texCanvas, 0, 0, spW, spH);
     }}
     wctx.restore();
+    return wc;
+  }}
 
+  function getWarpedPanelCanvas(panel, isSph) {{
+    const texCanvas = bankCanvases.get(panel.bank);
+    if (!texCanvas) return null;
+    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{state.heatmapStyle}}`;
+    if (warpedBankCanvases.has(cacheKey)) {{
+      return warpedBankCanvases.get(cacheKey);
+    }}
+    const wc = warpTextureOntoPanel(texCanvas, panel, isSph, true);
     warpedBankCanvases.set(cacheKey, wc);
+    return wc;
+  }}
+
+  function getWarpedMaskCanvas(panel, isSph) {{
+    const mCanvas = maskBankCanvases.get(panel.bank);
+    if (!mCanvas) return null;
+    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}`;
+    if (warpedMaskCanvases.has(cacheKey)) {{
+      return warpedMaskCanvases.get(cacheKey);
+    }}
+    const wc = warpTextureOntoPanel(mCanvas, panel, isSph, false);
+    warpedMaskCanvases.set(cacheKey, wc);
     return wc;
   }}
 
@@ -6672,6 +6917,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               ctx.restore();
             }}
           }}
+          if (state.showPixelMask) {{
+            const warpedMask = getWarpedMaskCanvas(panel, isSph);
+            if (warpedMask) {{
+              ctx.save();
+              ctx.imageSmoothingEnabled = state.detZoom < 2.0;
+              ctx.drawImage(warpedMask, x0, y0, pw, ph);
+              ctx.restore();
+            }}
+          }}
           ctx.stroke();
         }} else {{
           ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
@@ -6683,6 +6937,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               ctx.globalAlpha = state.detAlpha;
               ctx.imageSmoothingEnabled = true;
               ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
+              ctx.restore();
+            }}
+          }}
+          if (state.showPixelMask) {{
+            const warpedMask = getWarpedMaskCanvas(panel, isSph);
+            if (warpedMask) {{
+              ctx.save();
+              ctx.imageSmoothingEnabled = state.detZoom < 2.0;
+              ctx.drawImage(warpedMask, x0, y0, pw, ph);
               ctx.restore();
             }}
           }}
@@ -7405,6 +7668,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ev.currentTarget.textContent = "Arcs";
   }});
 
+  const btnPixelMask = document.getElementById("btn-pixel-mask");
+  if (btnPixelMask) {{
+    btnPixelMask.addEventListener("click", () => {{
+      state.showPixelMask = !state.showPixelMask;
+      syncPixelMaskUI();
+      renderDetector();
+    }});
+  }}
+
   document.getElementById("btn-heatmap-cmap").addEventListener("click", (ev) => {{
     const order = ["magma", "cyan", "gray"];
     const labels = {{ magma: "Magma", cyan: "Cyan", gray: "Film" }};
@@ -7574,20 +7846,54 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}, 1800);
   }});
 
-  // Open in its own full-screen browser tab (button + auto-detect when inside Galaxy iframe)
+  // Open in its own full-screen browser tab when embedded inside an outer host iframe (e.g. Galaxy).
+  // Inside Trame/NOVA, the widget runs inside an internal full-bleed `<iframe srcdoc>` (`about:srcdoc`)
+  // whose `window.parent` is the real HTTP document; hide the button when already in a top-level tab.
+  function resolveStandaloneTabUrl() {{
+    const selfHref = String((window.location && window.location.href) || "");
+    if (/^https?:/i.test(selfHref)) return selfHref;
+    try {{
+      const parentHref = String((window.parent && window.parent.location && window.parent.location.href) || "");
+      if (/^https?:/i.test(parentHref)) return parentHref;
+    }} catch (_e) {{}}
+    if (document.baseURI && /^https?:/i.test(document.baseURI)) {{
+      return document.baseURI;
+    }}
+    return "";
+  }}
+  function isEmbeddedInOuterFrame() {{
+    try {{
+      const selfHref = String((window.location && window.location.href) || "");
+      const isSrcdoc = selfHref.startsWith("about:srcdoc");
+      const hostWin = isSrcdoc ? window.parent : window.self;
+      return Boolean(hostWin && hostWin !== window.top);
+    }} catch (_e) {{
+      return true;
+    }}
+  }}
   function openInOwnTab() {{
-    const targetUrl = window.location.href;
-    window.open(targetUrl, "_blank", "noopener");
+    const targetUrl = resolveStandaloneTabUrl();
+    if (targetUrl) {{
+      return window.open(targetUrl, "_blank", "noopener");
+    }}
+    const blob = new Blob([document.documentElement.outerHTML], {{ type: "text/html" }});
+    return window.open(URL.createObjectURL(blob), "_blank");
   }}
   const btnNewTab = document.getElementById("btn-new-tab");
-  if (btnNewTab) btnNewTab.addEventListener("click", openInOwnTab);
+  const embeddedOuter = isEmbeddedInOuterFrame();
+  if (btnNewTab) {{
+    if (!embeddedOuter) {{
+      btnNewTab.style.display = "none";
+    }} else {{
+      btnNewTab.addEventListener("click", openInOwnTab);
+    }}
+  }}
 
-  if (window.self !== window.top) {{
+  if (embeddedOuter) {{
     const banner = document.getElementById("iframe-popout-banner");
     const btnPopNow = document.getElementById("btn-popout-now");
     const btnPopDismiss = document.getElementById("btn-popout-dismiss");
-    // Attempt immediate popout; if popup-blocked, show 1-click banner
-    const w = window.open(window.location.href, "_blank");
+    const w = openInOwnTab();
     if (!w && banner) {{
       banner.style.display = "flex";
     }}
@@ -7706,6 +8012,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     SAMPLE_PEAKS.length = 0;
     nextSamplePeaks.forEach(p => SAMPLE_PEAKS.push(p));
     DATA.merge_metrics = newPayload.merge_metrics || null;
+    DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
     ZONES.length = 0;
     nextZones.forEach(z => ZONES.push(z));
     PANELS.length = 0;
@@ -7735,6 +8042,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     rawBankImages.clear();
     bankCanvases.clear();
+    maskBankCanvases.clear();
     invalidateDetectorGeometryCache();
     decodeAllBankTextures();
     // Support direct canvas textures generated by client-side h5wasm
@@ -7743,7 +8051,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         rawBankImages.set(p.bank, p._grayCanvas);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(p._grayCanvas, state.heatmapStyle));
       }}
+      if (p._maskCanvas) {{
+        maskBankCanvases.set(p.bank, p._maskCanvas);
+      }}
     }});
+    syncPixelMaskUI();
 
     const subEl = document.querySelector(".subtitle-tag");
     const verEl = document.getElementById("app-version");
@@ -8061,6 +8373,77 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     // Read raw detector images for the active run slice and build grayscale texture canvases
     const bankImgs = new Map();
     const bankGrayCanvases = new Map();
+    const bankMaskCanvases = new Map();
+    const bankMaskRaw = new Map();
+    let emMaskSummary = {{ available: false }};
+    if (f.keys().includes("detector")) {{
+      try {{
+        const dGrp = f.get("detector");
+        const dKeys = dGrp.keys();
+        const mDs = dKeys.includes("pixel_class")
+          ? dGrp.get("pixel_class")
+          : (dKeys.includes("pixel_mask") ? dGrp.get("pixel_mask") : null);
+        const isBinaryMask = !dKeys.includes("pixel_class") && dKeys.includes("pixel_mask");
+        if (mDs) {{
+          const mShape = Array.from(mDs.shape || []).map(Number);
+          const nBanksM = mShape[0] || 0, Hm = mShape[1] || 512, Wm = mShape[2] || 512;
+          const mBankIds = dKeys.includes("mask_bank_ids")
+            ? Array.from(dGrp.get("mask_bank_ids").value).map(Number)
+            : Array.from({{ length: nBanksM }}, (_, idx) => idx + 1);
+          const bStepM = 4;
+          const Hbm = Math.max(1, Math.floor(Hm / bStepM)), Wbm = Math.max(1, Math.floor(Wm / bStepM));
+          let nTotM = 0, nDarkM = 0, nBrightM = 0;
+          for (let bi = 0; bi < Math.min(nBanksM, mBankIds.length); bi++) {{
+            const bidM = Number(mBankIds[bi]);
+            const rawM = mDs.slice([[bi, bi + 1], [0, Hm], [0, Wm]]);
+            const clsArr = new Uint8Array(Hm * Wm);
+            let hasMasked = false;
+            for (let k = 0; k < clsArr.length; k++) {{
+              const cv = isBinaryMask ? (Number(rawM[k]) === 0 ? 1 : 0) : Number(rawM[k]);
+              clsArr[k] = cv;
+              nTotM++;
+              if (cv === 1) {{ nDarkM++; hasMasked = true; }}
+              else if (cv >= 2) {{ nBrightM++; hasMasked = true; }}
+            }}
+            bankMaskRaw.set(bidM, {{ data: clsArr, H: Hm, W: Wm }});
+            if (hasMasked) {{
+              const mc = document.createElement("canvas");
+              mc.width = Wbm; mc.height = Hbm;
+              const mctx = mc.getContext("2d");
+              const midata = mctx.createImageData(Wbm, Hbm);
+              for (let rb = 0; rb < Hbm; rb++) {{
+                for (let cb = 0; cb < Wbm; cb++) {{
+                  let mx = 0;
+                  for (let dr = 0; dr < bStepM; dr++) {{
+                    const rOff = (rb * bStepM + dr) * Wm + cb * bStepM;
+                    for (let dc = 0; dc < bStepM; dc++) {{
+                      if (clsArr[rOff + dc] > mx) mx = clsArr[rOff + dc];
+                    }}
+                  }}
+                  const pIdx = (rb * Wbm + cb) * 4;
+                  if (mx >= 2) {{
+                    midata.data[pIdx] = 180; midata.data[pIdx+1] = 255; midata.data[pIdx+2] = 20; midata.data[pIdx+3] = 224;
+                  }} else if (mx === 1) {{
+                    midata.data[pIdx] = 56; midata.data[pIdx+1] = 189; midata.data[pIdx+2] = 248; midata.data[pIdx+3] = 132;
+                  }}
+                }}
+              }}
+              mctx.putImageData(midata, 0, 0);
+              bankMaskCanvases.set(bidM, mc);
+            }}
+          }}
+          if (nTotM > 0) {{
+            emMaskSummary = {{
+              available: true,
+              dark_fraction: nDarkM / nTotM,
+              bright_fraction: nBrightM / nTotM,
+              n_dark_pixels: nDarkM,
+              n_bright_pixels: nBrightM,
+            }};
+          }}
+        }}
+      }} catch (_me) {{}}
+    }}
     if (mf && mf.keys().includes("images")) {{
       const imDs = mf.get("images");
       const shape = Array.from(imDs.shape || []).map(Number); // [N, H, W]
@@ -8177,7 +8560,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           bank: bid, az_min: azMin, az_max: azMax, y_min: yMin, y_max: yMax, el_min: elMin, el_max: elMax,
           corners, corners_sph: cornersSph,
           mesh, mesh_sph: meshSph,
-          outline, outline_sph: outlineSph, _grayCanvas: bankGrayCanvases.get(bid) || null,
+          outline, outline_sph: outlineSph,
+          _grayCanvas: bankGrayCanvases.get(bid) || null,
+          _maskCanvas: bankMaskCanvases.get(bid) || null,
         }});
       }}
     }}
@@ -8544,6 +8929,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       d_min: dMinNew,
       goniometer_R: Rrun,
       cell,
+      em_mask_summary: emMaskSummary,
       peaks: peaksOut,
       sample_peaks: peaksOut,
       zones: zonesOut,
