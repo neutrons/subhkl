@@ -2345,12 +2345,15 @@ def test_em_pixel_mask_two_color_overlay_and_srcdoc_tab_handling(tmp_path):
     )
 
     scripts = re.findall(
-        r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, flags=re.S
+        r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, flags=re.DOTALL
     )
     assert scripts
     js_file = tmp_path / "rainbow_mask_check.js"
     js_file.write_text("\n;\n".join(scripts), encoding="utf-8")
     proc = subprocess.run(
-        ["node", "--check", str(js_file)], capture_output=True, text=True
+        ["node", "--check", str(js_file)],
+        check=False,
+        capture_output=True,
+        text=True,
     )
     assert proc.returncode == 0, proc.stderr
