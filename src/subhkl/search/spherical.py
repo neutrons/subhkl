@@ -1531,10 +1531,25 @@ def band_table(dirs, weights, q_lo, q_hi, lengths, spacing_deg):
 
     D = np.asarray(dirs, np.float32)
     w = np.asarray(weights, np.float32)
+    qlo_np = np.asarray(q_lo, np.float32)
+    qhi_np = np.asarray(q_hi, np.float32)
     nth = int(np.ceil(180.0 / spacing_deg))
     th = (np.arange(nth) + 0.5) * np.pi / nth
     nph = np.maximum(1, np.ceil(360.0 * np.sin(th) / spacing_deg)).astype(int)
     off = np.concatenate([[0], np.cumsum(nph)])
+    act = (w != 0.0) & (qhi_np > qlo_np + 1e-7)
+    if not np.any(act):
+        return (
+            jnp.zeros((len(lengths), int(off[-1])), dtype=jnp.float32),
+            jnp.asarray(off[:-1]),
+            jnp.asarray(nph),
+            int(nth),
+        )
+    if not np.all(act):
+        D = D[act]
+        w = w[act]
+        qlo_np = qlo_np[act]
+        qhi_np = qhi_np[act]
     it = np.repeat(np.arange(nth), nph)
     ph = (np.arange(off[-1]) - np.repeat(off[:-1], nph) + 0.5) * (2 * np.pi / nph[it])
     st, ct = np.sin(th[it]), np.cos(th[it])
@@ -1542,19 +1557,13 @@ def band_table(dirs, weights, q_lo, q_hi, lengths, spacing_deg):
     kern = _lattice_kernels()["band_chunk"]
     xl = jnp.asarray(np.asarray(lengths, np.float32))
     Dj, wj = jnp.asarray(D), jnp.asarray(w)
-    qlo, qhi = (
-        jnp.asarray(np.asarray(q_lo, np.float32)),
-        jnp.asarray(np.asarray(q_hi, np.float32)),
-    )
-    ch = int(max(64, 5e8 // max(len(D) * len(lengths), 1)))
-    table = np.concatenate(
-        [
-            np.asarray(kern(jnp.asarray(P[i : i + ch]), xl, Dj, wj, qlo, qhi))
-            for i in range(0, len(P), ch)
-        ]
-    )
+    qlo, qhi = jnp.asarray(qlo_np), jnp.asarray(qhi_np)
+    Pj = jnp.asarray(P)
+    ch = int(max(256, 2_000_000_000 // max(4 * len(D) * len(lengths), 1)))
+    chunks = [kern(Pj[i : i + ch], xl, Dj, wj, qlo, qhi) for i in range(0, len(P), ch)]
+    table_t = jnp.concatenate(chunks, axis=0).T if len(chunks) > 1 else chunks[0].T
     return (
-        jnp.asarray(table.T.copy()),  # [zone lengths, poles]
+        table_t,  # [zone lengths, poles]
         jnp.asarray(off[:-1]),
         jnp.asarray(nph),
         int(nth),

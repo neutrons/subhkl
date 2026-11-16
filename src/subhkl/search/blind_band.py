@@ -86,7 +86,11 @@ def discover(args, samples=16384, candidates=6, seed=0):
     same winning global geometry, not each candidate's preferred detector.
     """
     start = time.monotonic()
-    observations = load_observations(args, return_kinematics=True)
+    observations = getattr(args, "_cached_obs_kin", None)
+    if observations is None:
+        observations = load_observations(args, return_kinematics=True)
+        if set(getattr(args, "runs", [])) == set(getattr(args, "stable_runs", [])):
+            args._cached_obs_kin = observations
     banks, rows, cols, dev, _, runs, _angles, weights, R_obs, _scan_axes = observations
     from subhkl.search.pixel_em import PixelEMClassifier, wilson_search_weights
 
@@ -131,21 +135,6 @@ def discover(args, samples=16384, candidates=6, seed=0):
     rot_bound = 2.0 if (modes is None or "global_rot" in modes) else 0.0
     t_bound = 0.02 if (modes is None or "global_trans" in modes) else 0.0
     geom_uncalibrated = r_bound > 0.0 or rot_bound > 0.0 or t_bound > 0.0
-    if geom_uncalibrated and not args.finder:
-        pos_idx = np.flatnonzero(weights > 0)
-        if len(pos_idx) > samples:
-            top_pos = pos_idx[np.argsort(-weights[pos_idx])[:samples]]
-            idx = np.sort(top_pos)
-            sampled_weights = weights[idx] / max(np.abs(weights[idx]).sum(), 1e-12)
-        elif len(weights) <= samples:
-            idx = np.arange(len(weights))
-            sampled_weights = weights / max(np.abs(weights).sum(), 1e-12)
-        else:
-            top_abs = np.argsort(-np.abs(weights))[:samples]
-            idx = np.sort(top_abs)
-            sampled_weights = weights[idx] / max(np.abs(weights[idx]).sum(), 1e-12)
-    else:
-        idx, sampled_weights = sample_signed(weights, samples, seed)
     C, O = np.empty((len(weights), 3)), np.empty((len(weights), 3))
     for bank in np.unique(banks):
         m = banks == bank
@@ -154,7 +143,6 @@ def discover(args, samples=16384, candidates=6, seed=0):
         O[m] = ((cols[m] / (det.m - 1) - 0.5) * det.width)[:, None] * det.uhat + (
             (rows[m] / (det.n - 1) - 0.5) * det.height
         )[:, None] * det.vhat
-    Cs, Os, rotations = C[idx], O[idx], Rs[idx]
     B = np.asarray(build_B_jax(*args.cell[:3], *np.deg2rad(args.cell[3:])))
     wavelength = (args.wl_min, args.wl_max)
     pool = max(24, 4 * candidates)
@@ -162,6 +150,35 @@ def discover(args, samples=16384, candidates=6, seed=0):
     q_all = xyz_all / np.linalg.norm(xyz_all, axis=1, keepdims=True) - [0, 0, 1]
     lab_all = q_all / np.linalg.norm(q_all, axis=1, keepdims=True)
     all_directions = np.einsum("nji,nj->ni", Rs, lab_all)
+    sin_th_all = -lab_all[:, 2]
+    # Kinematic reachability mask (with 6% slack for uncalibrated geometry scale)
+    kin_active = (2.0 * sin_th_all / max(wavelength[1], 1e-6)) < (
+        1.06 / max(float(args.d_min), 1e-6)
+    )
+    if not np.any(kin_active):
+        kin_active = np.ones(len(weights), dtype=bool)
+    if geom_uncalibrated and not args.finder:
+        pos_idx = np.flatnonzero((weights > 0) & kin_active)
+        if len(pos_idx) == 0:
+            pos_idx = np.flatnonzero(weights > 0)
+        if len(pos_idx) > samples:
+            top_pos = pos_idx[np.argsort(-weights[pos_idx])[:samples]]
+            idx = np.sort(top_pos)
+            sampled_weights = weights[idx] / max(np.abs(weights[idx]).sum(), 1e-12)
+        elif int(kin_active.sum()) <= samples:
+            idx = np.flatnonzero(kin_active)
+            sampled_weights = weights[idx] / max(np.abs(weights[idx]).sum(), 1e-12)
+        else:
+            act_idx = np.flatnonzero(kin_active)
+            top_abs = act_idx[np.argsort(-np.abs(weights[act_idx]))[:samples]]
+            idx = np.sort(top_abs)
+            sampled_weights = weights[idx] / max(np.abs(weights[idx]).sum(), 1e-12)
+    else:
+        w_kin = np.where(kin_active, weights, 0.0)
+        if not np.any(w_kin != 0.0):
+            w_kin = weights
+        idx, sampled_weights = sample_signed(w_kin, samples, seed)
+    Cs, Os, rotations = C[idx], O[idx], Rs[idx]
     xyz = Cs + Os
     q = xyz / np.linalg.norm(xyz, axis=1, keepdims=True) - [0, 0, 1]
     lab = q / np.linalg.norm(q, axis=1, keepdims=True)
@@ -330,26 +347,34 @@ def discover(args, samples=16384, candidates=6, seed=0):
         )
         band_env_deg = 0.0
 
-    if len(weights) > 131_072:
-        table_cap = min(len(weights), 131_072)
+    table_limit = 131_072 if args.finder else 49_152
+    act_pool = np.flatnonzero((weights != 0.0) & kin_active)
+    if len(act_pool) == 0:
+        act_pool = np.arange(len(weights))
+    if len(act_pool) > table_limit:
+        table_cap = min(len(act_pool), table_limit)
         if args.finder:
-            t_idx = np.argpartition(np.abs(weights), -table_cap)[-table_cap:]
+            t_idx = act_pool[
+                np.argpartition(np.abs(weights[act_pool]), -table_cap)[-table_cap:]
+            ]
         else:
-            pos_all = np.flatnonzero(weights > 0.0)
+            pos_all = np.flatnonzero((weights > 0.0) & kin_active)
             if len(pos_all) >= table_cap:
                 t_idx = pos_all[
                     np.argpartition(weights[pos_all], -table_cap)[-table_cap:]
                 ]
             else:
-                t_idx = np.argpartition(np.abs(weights), -table_cap)[-table_cap:]
+                t_idx = act_pool[
+                    np.argpartition(np.abs(weights[act_pool]), -table_cap)[-table_cap:]
+                ]
         t_idx = np.sort(t_idx)
         table_dirs = all_directions[t_idx]
-        table_weights = weights[t_idx] * (len(weights) / len(t_idx))
+        table_weights = weights[t_idx] * (len(act_pool) / len(t_idx))
         table_sin_theta = -lab_all[t_idx, 2]
     else:
-        table_dirs = all_directions
-        table_weights = weights
-        table_sin_theta = -lab_all[:, 2]
+        table_dirs = all_directions[act_pool]
+        table_weights = weights[act_pool]
+        table_sin_theta = -lab_all[act_pool, 2]
 
     found = lattice_ladder(
         directions,
@@ -417,8 +442,23 @@ def discover(args, samples=16384, candidates=6, seed=0):
             flush=True,
         )
         found = found[:candidates]
-        for i, item in enumerate(found[: max(0, int(candidates) - 1)]):
+        n_backup_target = min(2, max(0, int(candidates) - 1))
+        seeded_backups: list[tuple[np.ndarray, float, float]] = [
+            (np.asarray(stencil_fit["U"], dtype=np.float64), 1.0, 0.0)
+        ]
+        n_backups_done = 0
+        for item in found:
+            if n_backups_done >= n_backup_target:
+                break
             U = item[0]
+            trial_b = seeded_backups + [(np.asarray(U, dtype=np.float64), 0.5, 0.0)]
+            if len(
+                distinct_orientations(
+                    trial_b, B, args.space_group, len(trial_b), separation_deg=2.0
+                )
+            ) < len(trial_b):
+                continue
+            seeded_backups = trial_b
             fit = refine_band_geometry(
                 Cs,
                 Os,
@@ -434,11 +474,12 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 else None,
                 rot_bound_deg=rot_bound,
                 trans_bound_m=t_bound,
-                maxiter=120,
+                maxiter=80,
                 rot_axis_only=rot_axis_only,
                 space_group=args.space_group,
             )
             fits.append(fit)
+            n_backups_done += 1
     else:
         for i, item in enumerate(found):
             U = item[0]
@@ -486,8 +527,25 @@ def discover(args, samples=16384, candidates=6, seed=0):
             for fit in fits
         ]
         top_em_order = np.argsort([-ev["em_score"] for ev in em_evals])
-        for k_idx in top_em_order[: min(3, len(fits))]:
+        m_step_limit = 1
+        if len(top_em_order) >= 2:
+            s0_em = float(em_evals[int(top_em_order[0])]["em_score"])
+            s1_em = float(em_evals[int(top_em_order[1])]["em_score"])
+            if s0_em < 2.0 * max(s1_em, 10.0):
+                m_step_limit = 2
+        for k_idx in top_em_order[: min(m_step_limit, len(fits))]:
             ev_k = em_evals[int(k_idx)]
+            n_bright_k = sum(
+                int(np.sum(v > 0.5)) for v in ev_k["gamma_bright"].values()
+            )
+            n_dark_k = sum(int(np.sum(v > 0.5)) for v in ev_k["gamma_dark"].values())
+            if n_bright_k == 0 and n_dark_k == 0:
+                continue
+            # Only re-run nonlinear band M-step in blind discovery if bright
+            # parasitic reflections were newly flagged (static dark panels are
+            # already down-weighted in E-step 0 prior).
+            if n_bright_k == 0:
+                continue
             pixel_em.apply_responsibilities(
                 ev_k["gamma_valid"], ev_k["gamma_dark"], ev_k["gamma_bright"]
             )
@@ -509,13 +567,13 @@ def discover(args, samples=16384, candidates=6, seed=0):
                     fk["U"],
                     wavelength,
                     args.d_min,
-                    n_zones=145 if geom_uncalibrated else 60,
+                    n_zones=60,
                     radial_bound=rb_k,
                     axial_bound=ab_k,
                     rot_bound_deg=rot_bound,
                     trans_bound_m=t_bound,
                     orient_bound_deg=2.5,
-                    maxiter=100,
+                    maxiter=80,
                     rot_axis_only=rot_axis_only,
                     space_group=args.space_group,
                 )
@@ -587,7 +645,10 @@ def discover(args, samples=16384, candidates=6, seed=0):
     )
     O_shared = O @ rot.T
     U_shared = []
-    for fit in fits:
+    for i_f, fit in enumerate(fits):
+        if pixel_em is not None and i_f == winner:
+            U_shared.append(np.asarray(fit["U"], dtype=np.float64))
+            continue
         local = refine_band_geometry(
             C_shared[idx],
             O_shared[idx],
@@ -597,12 +658,12 @@ def discover(args, samples=16384, candidates=6, seed=0):
             fit["U"],
             wavelength,
             args.d_min,
-            n_zones=145 if geom_uncalibrated else 60,
+            n_zones=60,
             radial_bound=0,
             rot_bound_deg=0,
             trans_bound_m=0,
             orient_bound_deg=1.0 if geom_uncalibrated else 2.0,
-            maxiter=120,
+            maxiter=60 if pixel_em is not None else 120,
             space_group=args.space_group,
         )
         U_shared.append(local["U"])
@@ -620,17 +681,21 @@ def discover(args, samples=16384, candidates=6, seed=0):
 
     if pixel_em is not None:
         scores = []
-        for U in U_shared:
-            ev_s = pixel_em.evaluate_candidate(
-                U,
-                B,
-                radial_scale=r_sc_win,
-                axial_scale=a_sc_win,
-                global_rot_vec=geometry["global_rot_vec"],
-                global_trans_m=geometry["global_trans_m"],
-                match_sigma_px=4.5,
-            )
-            scores.append(float(ev_s["em_score"]))
+        for i_u, U in enumerate(U_shared):
+            if i_u == winner:
+                scores.append(float(em_evals[winner]["em_score"]))
+            else:
+                ev_s = pixel_em.evaluate_candidate(
+                    U,
+                    B,
+                    radial_scale=r_sc_win,
+                    axial_scale=a_sc_win,
+                    global_rot_vec=geometry["global_rot_vec"],
+                    global_trans_m=geometry["global_trans_m"],
+                    match_sigma_px=4.5,
+                )
+                scores.append(float(ev_s["em_score"]))
+        args._em_bootstrapped = True
     else:
         scores = [
             float(

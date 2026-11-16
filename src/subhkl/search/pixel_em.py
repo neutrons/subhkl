@@ -30,7 +30,6 @@ from scipy.ndimage import (
     percentile_filter,
     uniform_filter,
 )
-from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 from subhkl.config import beamlines
@@ -62,6 +61,7 @@ def inpainted_median_bg(
     dark_mask: np.ndarray,
     bright_mask: np.ndarray | None,
     size: int,
+    bg_raw: np.ndarray | None = None,
 ) -> np.ndarray:
     """2D median background with monotone dark fill and EDT bright removal.
 
@@ -71,7 +71,8 @@ def inpainted_median_bg(
     background. Masking localized static-bright bins then prevents parasitic
     enclosure reflections from inflating neighboring background.
     """
-    bg_raw = median_filter(y2d, size=size, mode="nearest")
+    if bg_raw is None:
+        bg_raw = median_filter(y2d, size=size, mode="nearest")
     if np.any(dark_mask):
         bg_dark = np.maximum(bg_raw, masked_median_bg(y2d, ~dark_mask, size=size))
     else:
@@ -220,9 +221,16 @@ class PixelEMClassifier:
         self.rot_clusters = _distinct_rotation_clusters(self.sel_runs, self.R_by_run)
         self.n_orient_clusters = len(self.rot_clusters)
 
-        # Generate lattice reflections slightly beyond d_min so genuine higher-
-        # resolution Bragg peaks just past user d_min are still protected in E-step.
-        d_min_em = max(0.82 * self.d_min, min(self.d_min, 1.7))
+        # Protect higher-resolution crystal reflections down to the kinematic
+        # wavelength floor (bounded by a 280k reflection budget on large cells)
+        # so genuine high-Q Bragg peaks are never misclassified as bright when
+        # the user specifies a coarser solver d_min (e.g. d_min=2.8).
+        ca, cb, cg = np.cos(np.deg2rad(self.cell[3:]))
+        vol_fac = max(1.0 - ca * ca - cb * cb - cg * cg + 2.0 * ca * cb * cg, 1e-6)
+        v_cell = float(self.cell[0] * self.cell[1] * self.cell[2] * np.sqrt(vol_fac))
+        d_kin = max(0.54 * self.wavelength[0], 1.50)
+        d_cap = float(((2.0 * np.pi * v_cell) / (3.0 * 280_000.0)) ** (1.0 / 3.0))
+        d_min_em = min(self.d_min, max(d_kin, d_cap))
         hkl_em = np.stack(
             generate_reflections(
                 *self.cell, space_group=self.space_group, d_min=d_min_em
@@ -230,10 +238,35 @@ class PixelEMClassifier:
             axis=1,
         ).astype(np.float64)
         self._hkl_em = hkl_em
-        d_inv_sq = None
-        self._hkl_d_min_mask: np.ndarray | None = None
         self._d_min_em = d_min_em
-        _ = d_inv_sq
+
+        # Pre-index bank positions and per-run centroid grids for fast stencil splat
+        self._bank_to_bi = {bk: i for i, bk in enumerate(self.obs_banks)}
+        n_b = len(self.obs_banks)
+        centers_r = np.arange(self.hb) * self.b + (self.b - 1) / 2.0
+        centers_c = np.arange(self.wb) * self.b + (self.b - 1) / 2.0
+        rr_def, cc_def = np.meshgrid(centers_r, centers_c, indexing="ij")
+        self._rr_run: dict[int, np.ndarray] = {}
+        self._cc_run: dict[int, np.ndarray] = {}
+        self._present_run: dict[int, np.ndarray] = {}
+        for r in self.sel_runs:
+            rr_s = np.empty((n_b, self.hb, self.wb), dtype=np.float64)
+            cc_s = np.empty((n_b, self.hb, self.wb), dtype=np.float64)
+            pres = np.zeros(n_b, dtype=bool)
+            for bi, bk in enumerate(self.obs_banks):
+                if (r, bk) in self.rr_rb:
+                    rr_s[bi] = self.rr_rb[(r, bk)]
+                    cc_s[bi] = self.cc_rb[(r, bk)]
+                    pres[bi] = True
+                else:
+                    rr_s[bi] = rr_def
+                    cc_s[bi] = cc_def
+            self._rr_run[r] = rr_s
+            self._cc_run[r] = cc_s
+            self._present_run[r] = pres
+
+        inst_cfg = beamlines[self.instrument]
+        self._det_nom = [Detector(dict(inst_cfg[str(bk)])) for bk in self.obs_banks]
 
         # Exposure scale per run (median = 1.0 across active panels)
         run_totals = {}
@@ -284,7 +317,17 @@ class PixelEMClassifier:
             bk: np.ones((self.hb, self.wb), dtype=np.float64) for bk in self.obs_banks
         }
 
-        # Masked background residuals per (r, bk)
+        # Masked background residuals & cached clean median filters per (r, bk)
+        self._bg5_clean: dict[tuple[int, int], np.ndarray] = {
+            k: median_filter(y, size=5, mode="nearest") for k, y in self.y_rb.items()
+        }
+        self._bg7_clean: dict[tuple[int, int], np.ndarray] = {
+            k: median_filter(y, size=7, mode="nearest") for k, y in self.y_rb.items()
+        }
+        self._bg7_cur: dict[tuple[int, int], np.ndarray] = {}
+        self._last_masks_bank: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self.raw_dev_rb: dict[tuple[int, int], np.ndarray] = {}
+        self.bright_dev_rb: dict[tuple[int, int], np.ndarray] = {}
         self.dev_rb: dict[tuple[int, int], np.ndarray] = {}
         self.weight_rb: dict[tuple[int, int], np.ndarray] = {}
 
@@ -363,74 +406,103 @@ class PixelEMClassifier:
             mask_file = h5py.File(mask_path, "r") if mask_path else None
             try:
                 sel_set = set(sel_runs)
-                for i in range(n_frames):
-                    r = int(run_ids[i])
-                    if r not in sel_set:
+                mask_ids = None
+                mask_key = None
+                if mask_file is not None:
+                    mask_key = "masks" if "masks" in mask_file else "images"
+                    mask_ids = mask_file["bank_ids"][()]
+                slab_sz = 64
+                for s0 in range(0, n_frames, slab_sz):
+                    s1 = min(s0 + slab_sz, n_frames)
+                    if not any(int(run_ids[j]) in sel_set for j in range(s0, s1)):
                         continue
-                    bk = int(frame_banks[i])
-                    obs_banks_set.add(bk)
-                    if r not in R_by_run:
-                        R_by_run[r] = np.asarray(R_frames[i], dtype=np.float64)
-                    raw = np.asarray(f["images"][i], dtype=np.float64)
-                    valid = np.isfinite(raw) & (raw >= 0.0)
-                    if mask_file is not None:
-                        key = "masks" if "masks" in mask_file else "images"
-                        ids = mask_file["bank_ids"][()]
-                        matches = np.flatnonzero(ids == bk)
-                        if len(matches) == 1:
-                            valid &= np.asarray(mask_file[key][matches[0]], dtype=bool)
-                    if bk not in bad_px_bank:
-                        bad_px_bank[bk] = ~valid
-                    else:
-                        bad_px_bank[bk] |= ~valid
-                    if bw > 0 and n_rows > 4 * max(b, bw) and n_cols > 4 * max(b, bw):
-                        raw = np.pad(raw[bw:-bw, bw:-bw], bw, mode="edge")
-                        if bw >= b:
-                            cut = (bw // b) * b
-                            valid[:cut, :] = False
-                            valid[-cut:, :] = False
-                            valid[:, :cut] = False
-                            valid[:, -cut:] = False
-                    raw_blocks = np.where(valid, raw, 0.0).reshape(hb, b, wb, b)
-                    y = raw_blocks.sum((1, 3))
-                    good = valid.reshape(hb, b, wb, b).all((1, 3))
-                    bg_5_init = median_filter(y, size=5, mode="nearest")
-                    excess_sq = (
-                        np.maximum(
-                            raw_blocks - (bg_5_init / (b * b))[:, None, :, None], 0.0
-                        )
-                        ** 2
-                    )
-                    excess_sum = excess_sq.sum((1, 3))
-                    rr = np.where(
-                        excess_sum > 0.0,
-                        (excess_sq * rows_bin).sum((1, 3))
-                        / np.maximum(excess_sum, 1e-12),
-                        rr_0,
-                    )
-                    cc = np.where(
-                        excess_sum > 0.0,
-                        (excess_sq * cols_bin).sum((1, 3))
-                        / np.maximum(excess_sum, 1e-12),
-                        cc_0,
-                    )
-                    y_rb[(r, bk)] = y
-                    good_rb[(r, bk)] = good
-                    rr_rb[(r, bk)] = rr
-                    cc_rb[(r, bk)] = cc
-                    if k_sub > 1:
-                        y_sub = (
-                            np.where(valid, raw, 0.0)
-                            .reshape(hs, b_sub, ws, b_sub)
-                            .sum((1, 3))
-                        )
-                        bg_sub = median_filter(y_sub, size=7, mode="nearest")
-                        d_sub = overdispersed_upward_deviance(
-                            y_sub, bg_sub, rel_sigma=0.09
-                        )
-                        sub_peak_dev_rb[(r, bk)] = d_sub.reshape(
-                            hb, k_sub, wb, k_sub
-                        ).max((1, 3))
+                    slab = np.asarray(f["images"][s0:s1], dtype=np.float32)
+                    for i in range(s0, s1):
+                        r = int(run_ids[i])
+                        if r not in sel_set:
+                            continue
+                        bk = int(frame_banks[i])
+                        obs_banks_set.add(bk)
+                        if r not in R_by_run:
+                            R_by_run[r] = np.asarray(R_frames[i], dtype=np.float64)
+                        raw_f32 = slab[i - s0]
+                        valid = np.isfinite(raw_f32) & (raw_f32 >= 0.0)
+                        if mask_file is not None and mask_ids is not None:
+                            matches = np.flatnonzero(mask_ids == bk)
+                            if len(matches) == 1:
+                                valid &= np.asarray(
+                                    mask_file[mask_key][matches[0]], dtype=bool
+                                )
+                        if bk not in bad_px_bank:
+                            bad_px_bank[bk] = ~valid
+                        else:
+                            bad_px_bank[bk] |= ~valid
+                        if (
+                            bw > 0
+                            and n_rows > 4 * max(b, bw)
+                            and n_cols > 4 * max(b, bw)
+                        ):
+                            raw_f32 = np.pad(raw_f32[bw:-bw, bw:-bw], bw, mode="edge")
+                            if bw >= b:
+                                cut = (bw // b) * b
+                                valid[:cut, :] = False
+                                valid[-cut:, :] = False
+                                valid[:, :cut] = False
+                                valid[:, -cut:] = False
+                        clean_f32 = np.where(valid, raw_f32, np.float32(0.0))
+                        raw_blocks = clean_f32.reshape(hb, b, wb, b)
+                        y = raw_blocks.sum((1, 3), dtype=np.float64)
+                        good = valid.reshape(hb, b, wb, b).all((1, 3))
+                        if float(y.max()) > 0.0:
+                            bg_5_init = median_filter(
+                                y.astype(np.float32), size=5, mode="nearest"
+                            )
+                            excess_sq = (
+                                np.maximum(
+                                    raw_blocks
+                                    - (bg_5_init / np.float32(b * b))[:, None, :, None],
+                                    0.0,
+                                ).astype(np.float64)
+                                ** 2
+                            )
+                            excess_sum = excess_sq.sum((1, 3))
+                            rr = np.where(
+                                excess_sum > 0.0,
+                                (excess_sq * rows_bin).sum((1, 3))
+                                / np.maximum(excess_sum, 1e-12),
+                                rr_0,
+                            )
+                            cc = np.where(
+                                excess_sum > 0.0,
+                                (excess_sq * cols_bin).sum((1, 3))
+                                / np.maximum(excess_sum, 1e-12),
+                                cc_0,
+                            )
+                        else:
+                            rr = rr_0.copy()
+                            cc = cc_0.copy()
+                        y_rb[(r, bk)] = y
+                        good_rb[(r, bk)] = good
+                        rr_rb[(r, bk)] = rr
+                        cc_rb[(r, bk)] = cc
+                        if k_sub > 1:
+                            if float(y.max()) > 0.0:
+                                y_sub = clean_f32.reshape(hs, b_sub, ws, b_sub).sum(
+                                    (1, 3), dtype=np.float32
+                                )
+                                bg_sub = median_filter(y_sub, size=7, mode="nearest")
+                                d_sub = overdispersed_upward_deviance(
+                                    y_sub.astype(np.float64),
+                                    bg_sub.astype(np.float64),
+                                    rel_sigma=0.09,
+                                )
+                                sub_peak_dev_rb[(r, bk)] = d_sub.reshape(
+                                    hb, k_sub, wb, k_sub
+                                ).max((1, 3))
+                            else:
+                                sub_peak_dev_rb[(r, bk)] = np.zeros(
+                                    (hb, wb), dtype=np.float64
+                                )
             finally:
                 if mask_file is not None:
                     mask_file.close()
@@ -527,6 +599,23 @@ class PixelEMClassifier:
 
         self.gamma_dark = {bk: v.copy() for bk, v in self.gamma_dark_prior.items()}
 
+        # Precompute immutable static-bright outlier deviance per (r, bk) once
+        for (r, bk), y in self.y_rb.items():
+            gd0 = self.gamma_dark_prior[bk]
+            if np.all(gd0 > 0.85):
+                self.bright_dev_rb[(r, bk)] = np.zeros_like(y)
+                continue
+            dark_mask0 = (gd0 > 0.5) | (~self.good_rb[(r, bk)])
+            bg_5_0 = inpainted_median_bg(
+                y, dark_mask0, None, size=5, bg_raw=self._bg5_clean[(r, bk)]
+            )
+            d_bin0 = overdispersed_upward_deviance(y, bg_5_0, rel_sigma=0.09)
+            if (r, bk) in self.sub_peak_dev_rb:
+                d_sub0 = np.where(dark_mask0, 0.0, self.sub_peak_dev_rb[(r, bk)])
+                self.bright_dev_rb[(r, bk)] = np.maximum(d_bin0, 0.65 * d_sub0)
+            else:
+                self.bright_dev_rb[(r, bk)] = d_bin0
+
         # First pass of dark-masked residuals so shadow cliffs cannot mimic static bright
         self._recompute_residuals()
 
@@ -576,50 +665,95 @@ class PixelEMClassifier:
 
     def _recompute_residuals(self) -> None:
         """Recompute local background, signed excess, and upward deviance."""
-        for (r, bk), y in self.y_rb.items():
+        for bk in self.obs_banks:
             gd = self.gamma_dark[bk]
             gb = self.gamma_bright[bk]
             gv = self.gamma_valid[bk]
-            if np.all(gd > 0.85):
-                self.dev_rb[(r, bk)] = np.zeros_like(y)
-                self.weight_rb[(r, bk)] = np.zeros_like(y)
-                continue
-            dark_mask = (gd > 0.5) | (~self.good_rb[(r, bk)])
-            bright_mask = gb >= 0.5
-            bg_7 = inpainted_median_bg(y, dark_mask, bright_mask, size=7)
-            bg_5 = inpainted_median_bg(y, dark_mask, bright_mask, size=5)
-            dev_raw = poisson_upward_deviance(y, bg_5)
-            self.dev_rb[(r, bk)] = np.where(gd > 0.85, 0.0, dev_raw)
-            self.weight_rb[(r, bk)] = (y - bg_7) * gv
+            all_dead = bool(np.all(gd > 0.85))
+            d_mask_b = gd > 0.5
+            b_mask_b = gb >= 0.5
+            prev = self._last_masks_bank.get(bk)
+            masks_same = (
+                prev is not None
+                and np.array_equal(d_mask_b, prev[0])
+                and np.array_equal(b_mask_b, prev[1])
+            )
+            if not masks_same:
+                self._last_masks_bank[bk] = (d_mask_b.copy(), b_mask_b.copy())
+
+            for r in self.sel_runs:
+                key = (r, bk)
+                if key not in self.y_rb:
+                    continue
+                y = self.y_rb[key]
+                if all_dead:
+                    z = np.zeros_like(y)
+                    self.raw_dev_rb[key] = z
+                    self._bg7_cur[key] = z
+                    self.dev_rb[key] = z
+                    self.weight_rb[key] = z
+                    continue
+                if not masks_same or key not in self.raw_dev_rb:
+                    dark_mask = d_mask_b | (~self.good_rb[key])
+                    bg_7 = inpainted_median_bg(
+                        y,
+                        dark_mask,
+                        b_mask_b,
+                        size=7,
+                        bg_raw=self._bg7_clean[key],
+                    )
+                    bg_5 = inpainted_median_bg(
+                        y,
+                        dark_mask,
+                        b_mask_b,
+                        size=5,
+                        bg_raw=self._bg5_clean[key],
+                    )
+                    self._bg7_cur[key] = bg_7
+                    self.raw_dev_rb[key] = poisson_upward_deviance(y, bg_5)
+                dev_raw = self.raw_dev_rb[key]
+                self.dev_rb[key] = np.where(gd > 0.85, 0.0, dev_raw)
+                self.weight_rb[key] = (y - self._bg7_cur[key]) * gv
 
     def raw_unweighted_deviance(self, r: int, bk: int) -> np.ndarray:
         """Dark/bright-inpainted upward deviance before multiplying by gamma_valid."""
-        y = self.y_rb[(r, bk)]
+        key = (r, bk)
+        if key in self.raw_dev_rb:
+            prev = self._last_masks_bank.get(bk)
+            if (
+                prev is not None
+                and np.array_equal(self.gamma_dark[bk] > 0.5, prev[0])
+                and np.array_equal(self.gamma_bright[bk] >= 0.5, prev[1])
+            ):
+                return self.raw_dev_rb[key]
+        y = self.y_rb[key]
         gd = self.gamma_dark[bk]
         gb = self.gamma_bright[bk]
         if np.all(gd > 0.85):
             return np.zeros_like(y)
-        dark_mask = (gd > 0.5) | (~self.good_rb[(r, bk)])
+        dark_mask = (gd > 0.5) | (~self.good_rb[key])
         bright_mask = gb >= 0.5
-        bg_5 = inpainted_median_bg(y, dark_mask, bright_mask, size=5)
+        bg_5 = inpainted_median_bg(
+            y, dark_mask, bright_mask, size=5, bg_raw=self._bg5_clean.get(key)
+        )
         return poisson_upward_deviance(y, bg_5)
 
     def bright_outlier_deviance(self, r: int, bk: int) -> np.ndarray:
-        """Localized overdispersed upward deviance for static-bright testing.
-
-        Suppresses smooth ~10% diffuse scattering gradients on high-background
-        panels while retaining full sensitivity to sharp static hot pixels,
-        hot columns, and bright Al powder/enclosure spots.
-        """
-        y = self.y_rb[(r, bk)]
+        """Localized overdispersed upward deviance for static-bright testing."""
+        key = (r, bk)
+        if key in self.bright_dev_rb:
+            return self.bright_dev_rb[key]
+        y = self.y_rb[key]
         gd = self.gamma_dark_prior[bk]
         if np.all(gd > 0.85):
             return np.zeros_like(y)
-        dark_mask = (gd > 0.5) | (~self.good_rb[(r, bk)])
-        bg_5 = inpainted_median_bg(y, dark_mask, None, size=5)
+        dark_mask = (gd > 0.5) | (~self.good_rb[key])
+        bg_5 = inpainted_median_bg(
+            y, dark_mask, None, size=5, bg_raw=self._bg5_clean.get(key)
+        )
         d_bin = overdispersed_upward_deviance(y, bg_5, rel_sigma=0.09)
-        if (r, bk) in self.sub_peak_dev_rb:
-            d_sub = np.where(dark_mask, 0.0, self.sub_peak_dev_rb[(r, bk)])
+        if key in self.sub_peak_dev_rb:
+            d_sub = np.where(dark_mask, 0.0, self.sub_peak_dev_rb[key])
             return np.maximum(d_bin, 0.65 * d_sub)
         return d_bin
 
@@ -652,33 +786,89 @@ class PixelEMClassifier:
             out_gv[m] = self.gamma_valid[bk][rr_m, cc_m]
         return out_dev, out_w, out_gv
 
-    def _predict_occupancy(
+    def _splat_hits_to_grid(
         self,
-        U: np.ndarray,
-        B: np.ndarray,
-        *,
-        R_runs: dict[int, np.ndarray] | None = None,
+        r: int,
+        bi_hit: np.ndarray,
+        pr_hit: np.ndarray,
+        pc_hit: np.ndarray,
+        sigma_hit: np.ndarray | float,
+    ) -> np.ndarray:
+        """Vectorized 2D stencil Gaussian splat matching exact cKDTree nearest-spot M."""
+        n_b = len(self.obs_banks)
+        M_run = np.zeros((n_b, self.hb, self.wb), dtype=np.float64)
+        if len(bi_hit) == 0:
+            return M_run
+        rr_run = self._rr_run[r]
+        cc_run = self._cc_run[r]
+        if np.ndim(sigma_hit) == 0:
+            sig = float(sigma_hit)
+            max_dist = 3.5 * sig
+            max_d2_arr = max_dist * max_dist
+            inv_2s2_arr = 0.5 / max(sig * sig, 1e-6)
+        else:
+            sig_arr = np.asarray(sigma_hit, dtype=np.float64)
+            max_dist = float(3.5 * np.max(sig_arr))
+            max_d2_arr = (3.5 * sig_arr) ** 2
+            inv_2s2_arr = 0.5 / np.maximum(sig_arr * sig_arr, 1e-6)
+
+        r_sten = int(np.ceil(max_dist / self.b)) + 1
+        br0 = np.floor(pr_hit / self.b).astype(np.int32)
+        bc0 = np.floor(pc_hit / self.b).astype(np.int32)
+
+        for dr in range(-r_sten, r_sten + 1):
+            br_t = br0 + dr
+            m_r = (br_t >= 0) & (br_t < self.hb)
+            if not np.any(m_r):
+                continue
+            idx_r = np.flatnonzero(m_r)
+            bi_r = bi_hit[idx_r]
+            br_r = br_t[idx_r]
+            bc0_r = bc0[idx_r]
+            pr_r = pr_hit[idx_r]
+            pc_r = pc_hit[idx_r]
+            md2_r = max_d2_arr if np.ndim(max_d2_arr) == 0 else max_d2_arr[idx_r]
+            i2s_r = inv_2s2_arr if np.ndim(inv_2s2_arr) == 0 else inv_2s2_arr[idx_r]
+            for dc in range(-r_sten, r_sten + 1):
+                bc_t = bc0_r + dc
+                m_c = (bc_t >= 0) & (bc_t < self.wb)
+                if not np.any(m_c):
+                    continue
+                bi_g = bi_r[m_c]
+                br_g = br_r[m_c]
+                bc_g = bc_t[m_c]
+                dr_px = pr_r[m_c] - rr_run[bi_g, br_g, bc_g]
+                dc_px = pc_r[m_c] - cc_run[bi_g, br_g, bc_g]
+                d2 = dr_px * dr_px + dc_px * dc_px
+                md2_c = md2_r if np.ndim(md2_r) == 0 else md2_r[m_c]
+                within = d2 <= md2_c
+                if not np.any(within):
+                    continue
+                i2s_c = i2s_r if np.ndim(i2s_r) == 0 else i2s_r[m_c][within]
+                val = np.exp(-d2[within] * i2s_c)
+                np.maximum.at(M_run, (bi_g[within], br_g[within], bc_g[within]), val)
+        return M_run
+
+    def _build_bank_arrays(
+        self,
         panel_cal: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]
-        | None = None,
-        radial_scale: float = 0.0,
-        axial_scale: float | None = None,
-        global_rot_vec: np.ndarray | None = None,
-        global_trans_m: np.ndarray | None = None,
-        sample_shift_m: np.ndarray | None = None,
-        match_sigma_px: float = 5.0,
-        only_d_min: bool = False,
-    ) -> dict[tuple[int, int], np.ndarray]:
-        """Compute predicted reflection proximity M_{r,bk} in [0, 1] per bin."""
-        UB = np.asarray(U, dtype=np.float64) @ np.asarray(B, dtype=np.float64)
-        G_cryst = self._hkl_em @ UB.T
-        if only_d_min:
-            gn = np.linalg.norm(G_cryst, axis=1)
-            G_cryst = G_cryst[(gn > 1e-7) & (gn <= 1.0 / self.d_min + 1e-7)]
-
-        wl_pad = 0.06 if not only_d_min else 0.0
-        wl_lo = max(0.1, self.wavelength[0] - wl_pad)
-        wl_hi = self.wavelength[1] + wl_pad
-
+        | None,
+        radial_scale: float,
+        axial_scale: float | None,
+        global_rot_vec: np.ndarray | None,
+        global_trans_m: np.ndarray | None,
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
         a_sc = float(radial_scale if axial_scale is None else axial_scale)
         r_sc = float(radial_scale)
         rot_m = (
@@ -693,33 +883,25 @@ class PixelEMClassifier:
             if global_trans_m is not None
             else np.zeros(3, dtype=np.float64)
         )
-        s_samp = (
-            np.asarray(sample_shift_m, dtype=np.float64)
-            if sample_shift_m is not None
-            else np.zeros(3, dtype=np.float64)
-        )
+        n_b = len(self.obs_banks)
+        cen_b = np.empty((n_b, 3), dtype=np.float64)
+        uh_b = np.empty((n_b, 3), dtype=np.float64)
+        vh_b = np.empty((n_b, 3), dtype=np.float64)
+        nh_b = np.empty((n_b, 3), dtype=np.float64)
+        mid_b = np.empty((n_b, 3), dtype=np.float64)
+        half_diag_b = np.empty(n_b, dtype=np.float64)
+        scale_r = np.empty(n_b, dtype=np.float64)
+        scale_c = np.empty(n_b, dtype=np.float64)
+        n_max_b = np.empty(n_b, dtype=np.float64)
+        m_max_b = np.empty(n_b, dtype=np.float64)
 
-        # Resolve per-bank geometry once across runs
-        bank_geom: dict[
-            int,
-            tuple[
-                np.ndarray,
-                np.ndarray,
-                np.ndarray,
-                np.ndarray,
-                float,
-                float,
-                float,
-                float,
-            ],
-        ] = {}
-        inst_cfg = beamlines[self.instrument]
-        for bk in self.obs_banks:
-            det_b = Detector(dict(inst_cfg[str(bk)]))
+        for bi, bk in enumerate(self.obs_banks):
+            det_b = self._det_nom[bi]
             m_max = float(det_b.m - 1)
             n_max = float(det_b.n - 1)
             if panel_cal is not None and bk in panel_cal:
                 cen, uh, vh, W, H = panel_cal[bk]
+                mid_sc = cen + 0.5 * W * uh + 0.5 * H * vh
             else:
                 mid = (
                     det_b.center
@@ -742,15 +924,93 @@ class PixelEMClassifier:
                 vh = det_b.vhat @ rot_m.T
                 W, H = float(det_b.width), float(det_b.height)
                 cen = mid_sc - 0.5 * W * uh - 0.5 * H * vh
-            nh = np.cross(uh, vh)
-            bank_geom[bk] = (cen, uh, vh, nh, W, H, m_max, n_max)
+            cen_b[bi] = cen
+            uh_b[bi] = uh
+            vh_b[bi] = vh
+            nh_b[bi] = np.cross(uh, vh)
+            mid_b[bi] = mid_sc
+            half_diag_b[bi] = 0.58 * np.hypot(W, H)
+            scale_r[bi] = n_max / max(float(H), 1e-12)
+            scale_c[bi] = m_max / max(float(W), 1e-12)
+            n_max_b[bi] = n_max
+            m_max_b[bi] = m_max
+        return (
+            cen_b,
+            uh_b,
+            vh_b,
+            nh_b,
+            mid_b,
+            half_diag_b,
+            scale_r,
+            scale_c,
+            n_max_b,
+            m_max_b,
+        )
+
+    def _project_and_splat(
+        self,
+        U: np.ndarray,
+        B: np.ndarray,
+        *,
+        R_runs: dict[int, np.ndarray] | None = None,
+        panel_cal: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]
+        | None = None,
+        radial_scale: float = 0.0,
+        axial_scale: float | None = None,
+        global_rot_vec: np.ndarray | None = None,
+        global_trans_m: np.ndarray | None = None,
+        sample_shift_m: np.ndarray | None = None,
+        match_sigma_px: float = 5.0,
+        only_d_min: bool = False,
+        dual_tight_sigma_px: float | None = None,
+    ) -> (
+        dict[tuple[int, int], np.ndarray]
+        | tuple[dict[tuple[int, int], np.ndarray], dict[tuple[int, int], np.ndarray]]
+    ):
+        UB = np.asarray(U, dtype=np.float64) @ np.asarray(B, dtype=np.float64)
+        G_cryst = self._hkl_em @ UB.T
+        gn = np.linalg.norm(G_cryst, axis=1)
+        in_core = (gn > 1e-7) & (gn <= 1.0 / self.d_min + 1e-7)
+        if only_d_min:
+            G_cryst = G_cryst[in_core]
+            in_core = np.ones(len(G_cryst), dtype=bool)
+
+        wl_pad = 0.05 if not only_d_min else 0.0
+        wl_lo_em = max(0.1, self.wavelength[0] - wl_pad)
+        wl_hi_em = self.wavelength[1] + wl_pad
+        wl_lo_core = self.wavelength[0]
+        wl_hi_core = self.wavelength[1]
+
+        s_samp = (
+            np.asarray(sample_shift_m, dtype=np.float64)
+            if sample_shift_m is not None
+            else np.zeros(3, dtype=np.float64)
+        )
+        (
+            cen_b,
+            uh_b,
+            vh_b,
+            nh_b,
+            mid_b,
+            half_diag_b,
+            scale_r,
+            scale_c,
+            n_max_b,
+            m_max_b,
+        ) = self._build_bank_arrays(
+            panel_cal, radial_scale, axial_scale, global_rot_vec, global_trans_m
+        )
 
         M_out: dict[tuple[int, int], np.ndarray] = {}
+        M_tight_out: dict[tuple[int, int], np.ndarray] = {}
         ki = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        max_dist = float(3.5 * match_sigma_px)
-        inv_2s2 = 0.5 / max(float(match_sigma_px) ** 2, 1e-6)
+        sig_core = float(match_sigma_px)
+        sig_hi = min(sig_core, 3.2)
 
         for r in self.sel_runs:
+            pres = self._present_run[r]
+            if not np.any(pres):
+                continue
             Rr = np.asarray(
                 (
                     R_runs[r]
@@ -763,48 +1023,125 @@ class PixelEMClassifier:
             G_lab = G_cryst @ Rr.T
             g2 = np.sum(G_lab * G_lab, axis=1)
             lam = -2.0 * G_lab[:, 2] / np.maximum(g2, 1e-12)
-            m_wl = (g2 > 1e-12) & (lam >= wl_lo) & (lam <= wl_hi)
+            m_wl = (g2 > 1e-12) & (lam >= wl_lo_em) & (lam <= wl_hi_em)
             if not np.any(m_wl):
-                for bk in self.obs_banks:
-                    if (r, bk) in self.y_rb:
-                        M_out[(r, bk)] = np.zeros((self.hb, self.wb), dtype=np.float64)
+                for bi, bk in enumerate(self.obs_banks):
+                    if pres[bi]:
+                        z = np.zeros((self.hb, self.wb), dtype=np.float64)
+                        M_out[(r, bk)] = z
+                        if dual_tight_sigma_px is not None:
+                            M_tight_out[(r, bk)] = z
                 continue
-            kfp = ki[None, :] + lam[m_wl, None] * G_lab[m_wl]
+
+            lam_w = lam[m_wl]
+            core_w = in_core[m_wl]
+            kfp = ki[None, :] + lam_w[:, None] * G_lab[m_wl]
             kfp /= np.linalg.norm(kfp, axis=1, keepdims=True)
 
-            for bk in self.obs_banks:
-                if (r, bk) not in self.y_rb:
-                    continue
-                cen, uh, vh, nh, W, H, m_max, n_max = bank_geom[bk]
-                c_eff = cen - xs
-                dn = kfp @ nh
-                t_ray = np.dot(c_eff, nh) / np.where(
-                    np.abs(dn) < 1e-12, np.where(dn < 0, -1e-12, 1e-12), dn
-                )
-                ph = t_ray[:, None] * kfp - c_eff[None, :]
-                pr = (ph @ vh) * (n_max / max(H, 1e-12))
-                pc = (ph @ uh) * (m_max / max(W, 1e-12))
-                ok = (
-                    (t_ray > 0.0)
-                    & (pr >= -self.b)
-                    & (pr <= n_max + self.b)
-                    & (pc >= -self.b)
-                    & (pc <= m_max + self.b)
-                )
-                if not np.any(ok):
-                    M_out[(r, bk)] = np.zeros((self.hb, self.wb), dtype=np.float64)
-                    continue
-                tree = cKDTree(np.column_stack([pr[ok], pc[ok]]))
-                pts_obs = np.column_stack(
-                    [self.rr_rb[(r, bk)].ravel(), self.cc_rb[(r, bk)].ravel()]
-                )
-                d_near, _ = tree.query(pts_obs, k=1, distance_upper_bound=max_dist)
-                M_grid = np.where(
-                    np.isfinite(d_near), np.exp(-(d_near * d_near) * inv_2s2), 0.0
-                ).reshape(self.hb, self.wb)
-                M_out[(r, bk)] = M_grid
+            c_eff = cen_b - xs[None, :]
+            mid_eff = mid_b - xs[None, :]
+            mid_dist = np.maximum(np.linalg.norm(mid_eff, axis=1), 1e-6)
+            mid_hat = mid_eff / mid_dist[:, None]
+            cos_cone = np.cos(
+                np.minimum(np.arctan2(half_diag_b, mid_dist) + 0.08, np.pi)
+            )
 
+            num_b = np.einsum("bi,bi->b", c_eff, nh_b)
+            dn = kfp @ nh_b.T
+            cone_ok = (
+                ((dn * num_b[None, :]) > 1e-9)
+                & ((kfp @ mid_hat.T) >= cos_cone[None, :])
+                & pres[None, :]
+            )
+            ray_i, bi_cand = np.nonzero(cone_ok)
+            if len(ray_i) == 0:
+                for bi, bk in enumerate(self.obs_banks):
+                    if pres[bi]:
+                        z = np.zeros((self.hb, self.wb), dtype=np.float64)
+                        M_out[(r, bk)] = z
+                        if dual_tight_sigma_px is not None:
+                            M_tight_out[(r, bk)] = z
+                continue
+
+            t_ray = num_b[bi_cand] / dn[ray_i, bi_cand]
+            ph = t_ray[:, None] * kfp[ray_i] - c_eff[bi_cand]
+            pr = np.einsum("ij,ij->i", ph, vh_b[bi_cand]) * scale_r[bi_cand]
+            pc = np.einsum("ij,ij->i", ph, uh_b[bi_cand]) * scale_c[bi_cand]
+            ok = (
+                (t_ray > 0.0)
+                & (pr >= -self.b)
+                & (pr <= n_max_b[bi_cand] + self.b)
+                & (pc >= -self.b)
+                & (pc <= m_max_b[bi_cand] + self.b)
+            )
+            bi_h = bi_cand[ok]
+            pr_h = pr[ok]
+            pc_h = pc[ok]
+            ray_h = ray_i[ok]
+
+            if only_d_min:
+                M_run = self._splat_hits_to_grid(r, bi_h, pr_h, pc_h, sig_core)
+            else:
+                sig_h = np.where(core_w[ray_h], sig_core, sig_hi)
+                M_run = self._splat_hits_to_grid(r, bi_h, pr_h, pc_h, sig_h)
+            for bi, bk in enumerate(self.obs_banks):
+                if pres[bi]:
+                    M_out[(r, bk)] = M_run[bi]
+
+            if dual_tight_sigma_px is not None:
+                m_t = (
+                    core_w[ray_h]
+                    & (lam_w[ray_h] >= wl_lo_core)
+                    & (lam_w[ray_h] <= wl_hi_core)
+                )
+                M_t_run = self._splat_hits_to_grid(
+                    r,
+                    bi_h[m_t],
+                    pr_h[m_t],
+                    pc_h[m_t],
+                    float(dual_tight_sigma_px),
+                )
+                for bi, bk in enumerate(self.obs_banks):
+                    if pres[bi]:
+                        M_tight_out[(r, bk)] = M_t_run[bi]
+
+        if dual_tight_sigma_px is not None:
+            return M_out, M_tight_out
         return M_out
+
+    def _predict_occupancy(
+        self,
+        U: np.ndarray,
+        B: np.ndarray,
+        *,
+        R_runs: dict[int, np.ndarray] | None = None,
+        panel_cal: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]
+        | None = None,
+        radial_scale: float = 0.0,
+        axial_scale: float | None = None,
+        global_rot_vec: np.ndarray | None = None,
+        global_trans_m: np.ndarray | None = None,
+        sample_shift_m: np.ndarray | None = None,
+        match_sigma_px: float = 5.0,
+        only_d_min: bool = False,
+    ) -> dict[tuple[int, int], np.ndarray]:
+        """Compute predicted reflection proximity M_{r,bk} in [0, 1] per bin."""
+        res = self._project_and_splat(
+            U,
+            B,
+            R_runs=R_runs,
+            panel_cal=panel_cal,
+            radial_scale=radial_scale,
+            axial_scale=axial_scale,
+            global_rot_vec=global_rot_vec,
+            global_trans_m=global_trans_m,
+            sample_shift_m=sample_shift_m,
+            match_sigma_px=match_sigma_px,
+            only_d_min=only_d_min,
+            dual_tight_sigma_px=None,
+        )
+        assert isinstance(res, dict)
+        return res
 
     def _posteriors_from_occupancy(
         self, M_occ: dict[tuple[int, int], np.ndarray]
@@ -846,12 +1183,14 @@ class PixelEMClassifier:
             tau_cryst_b = 45.0
 
         tau_bright_b = max(8.0 * tau_cryst_b, 400.0)
-        # Single-orientation gate on overdispersed bright deviance so weak
-        # diffuse ripples or minor satellites are never over-masked on N=1;
-        # multi-frame scans accumulate likelihood across independent orientation
-        # clusters and penalize transient spots that turn off in other frames.
+        scale_pred_b = 2.0 * tau_cryst_b
+        scale_unmod_b = 1.4 * tau_cryst_b
+        # On a single goniometer setting (N=1), goniometer persistence cannot
+        # distinguish moving Bragg spots from static bright defects; include a
+        # small Wilson-exponential unmodeled-reflection component and require a
+        # clear outlier floor so real crystal Bragg peaks are never over-masked.
         single_setting_floor = (
-            max(2.5 * tau_cryst_b, 65.0) if self.n_orient_clusters < 2 else 22.0
+            max(5.5 * tau_cryst_b, 220.0) if self.n_orient_clusters < 2 else 22.0
         )
 
         new_dark: dict[int, np.ndarray] = {}
@@ -898,7 +1237,7 @@ class PixelEMClassifier:
             # goniometer orientation clusters (no double-counting of persistence).
             ll_valid_sum = np.zeros((self.hb, self.wb), dtype=np.float64)
             ll_bright_sum = np.zeros((self.hb, self.wb), dtype=np.float64)
-            max_off_dev = np.zeros((self.hb, self.wb), dtype=np.float64)
+            max_bdev_grid = np.zeros((self.hb, self.wb), dtype=np.float64)
             n_active_cl = 0
             for cl in self.rot_clusters:
                 ms_cl = [M_occ[(r, bk)] for r in cl if (r, bk) in M_occ]
@@ -908,13 +1247,24 @@ class PixelEMClassifier:
                 n_active_cl += 1
                 Mc = np.clip(np.max(np.stack(ms_cl, axis=0), axis=0), 1e-5, 1.0 - 1e-5)
                 dvc = np.mean(np.stack(ds_cl, axis=0), axis=0)
-                max_off_dev = np.maximum(max_off_dev, (1.0 - Mc) * dvc)
-                ll_bragg = (
-                    np.log(Mc) - np.log(tau_cryst_b) - 1.5 * np.log1p(dvc / tau_cryst_b)
-                )
-                ll_bg = np.log(1.0 - Mc) - 0.5 * dvc
-                ll_valid_sum += np.logaddexp(ll_bragg, ll_bg)
-                # Static bright pixels stay bright across goniometer frames;
+                max_bdev_grid = np.maximum(max_bdev_grid, dvc)
+                # Crystallographic Wilson exponential intensity law for Bragg spots
+                ll_bragg = np.log(Mc) - np.log(scale_pred_b) - dvc / scale_pred_b
+                if self.n_orient_clusters < 2:
+                    eps_u = 0.015
+                    ll_unmod = (
+                        np.log((1.0 - Mc) * eps_u)
+                        - np.log(scale_unmod_b)
+                        - dvc / scale_unmod_b
+                    )
+                    ll_bg = np.log((1.0 - Mc) * (1.0 - eps_u)) - 0.5 * dvc
+                    ll_valid_sum += np.logaddexp(
+                        ll_bragg, np.logaddexp(ll_unmod, ll_bg)
+                    )
+                else:
+                    ll_bg = np.log(1.0 - Mc) - 0.5 * dvc
+                    ll_valid_sum += np.logaddexp(ll_bragg, ll_bg)
+                # Heavy Cauchy tail for parasitic static bright artifacts;
                 # penalize near-zero deviance in frames where pixel turns off.
                 ll_bright_sum += (
                     -np.log(tau_bright_b)
@@ -923,7 +1273,7 @@ class PixelEMClassifier:
                 )
 
             lo_bright_model = np.log(5e-4) + (ll_bright_sum - ll_valid_sum)
-            eligible_bright = max_off_dev >= single_setting_floor
+            eligible_bright = max_bdev_grid >= single_setting_floor
             if n_active_cl >= 2:
                 eligible_bright &= self.log_odds_bright_persist[bk] > 0.0
             lo_bright = np.where(
@@ -962,7 +1312,7 @@ class PixelEMClassifier:
         bin's learned ``gamma_valid`` and Wilson log-deviance ``log(1 + D+/80)``,
         eliminating panel solid-angle magnification bias and Al-flare hijacking.
         """
-        M_em = self._predict_occupancy(
+        dual = self._project_and_splat(
             U,
             B,
             R_runs=R_runs,
@@ -970,22 +1320,13 @@ class PixelEMClassifier:
             axial_scale=axial_scale,
             global_rot_vec=global_rot_vec,
             global_trans_m=global_trans_m,
-            match_sigma_px=max(float(match_sigma_px) * 1.6, 7.0),
+            match_sigma_px=max(float(match_sigma_px) * 1.15, 5.0),
             only_d_min=False,
+            dual_tight_sigma_px=float(match_sigma_px),
         )
+        assert isinstance(dual, tuple)
+        M_em, M_tight = dual
         gv_map, gd_map, gb_map, tau_cryst = self._posteriors_from_occupancy(M_em)
-
-        M_tight = self._predict_occupancy(
-            U,
-            B,
-            R_runs=R_runs,
-            radial_scale=radial_scale,
-            axial_scale=axial_scale,
-            global_rot_vec=global_rot_vec,
-            global_trans_m=global_trans_m,
-            match_sigma_px=match_sigma_px,
-            only_d_min=True,
-        )
 
         llr_excess = 0.0
         n_matched = 0
@@ -1190,9 +1531,16 @@ class PixelEMClassifier:
                 continue
 
             if dilate_bright_bins > 0 and np.any(bright_b):
-                bright_b_dil = binary_dilation(
+                max_bdev_bk = np.zeros((self.hb, self.wb), dtype=np.float64)
+                for r in self.sel_runs:
+                    if (r, bk) in self.bright_dev_rb:
+                        max_bdev_bk = np.maximum(
+                            max_bdev_bk, self.bright_dev_rb[(r, bk)]
+                        )
+                halo_cand = binary_dilation(
                     bright_b, iterations=int(dilate_bright_bins)
                 ) & (~dark_b)
+                bright_b_dil = bright_b | (halo_cand & (max_bdev_bk >= 15.0))
             else:
                 bright_b_dil = bright_b
 

@@ -405,3 +405,102 @@ def test_overdispersed_diffuse_gradient_not_flagged_bright(tmp_path):
     assert float(np.max(gb[11:14, 11:14])) > 0.85
     # Smooth diffuse halo center around (32, 32) has zero false bright bins
     assert int(np.sum(gb[20:44, 20:44] > 0.5)) == 0
+
+
+def test_single_frame_coarse_dmin_protects_high_q_bragg_spots_and_masks_flare(tmp_path):
+    """Single-frame coarse d_min=2.8 protects real d<2.8 A Bragg peaks while masking Al flares."""
+    rng = np.random.default_rng(2523)
+    banks = [12, 62]
+    cell = [28.0, 32.0, 36.0, 90.0, 90.0, 90.0]
+    B = _build_B_orthorhombic(*cell[:3])
+    U_true = np.eye(3)
+    wl = (2.8, 4.5)
+    axes = np.array([[0.0, 1.0, 0.0, 1.0]], dtype=np.float64)
+    R_gon = calc_goniometer_rotation_matrix(axes, [11.0])
+
+    counts = {bk: np.full((512, 512), 14.0, dtype=np.float64) for bk in banks}
+    spots_all = _project_crystal_spots(
+        counts,
+        U_true,
+        B,
+        R_gon,
+        banks,
+        wl,
+        d_min=1.75,
+        peak_amp=52.0,
+        sigma_px=1.6,
+    )
+    spots_coarse = set(
+        _project_crystal_spots(
+            {bk: np.zeros((512, 512), dtype=np.float64) for bk in banks},
+            U_true,
+            B,
+            R_gon,
+            banks,
+            wl,
+            d_min=2.8,
+        )
+    )
+    high_q_spots = [s for s in spots_all if s not in spots_coarse]
+    assert len(high_q_spots) >= 5
+
+    # Choose an off-lattice flare site on bank 62 at least 30 px from every crystal spot
+    flare_rc = (88, 424)
+    b62_spots = [(r, c) for (bk, r, c) in spots_all if bk == 62]
+    if b62_spots:
+        min_d = min(np.hypot(r - flare_rc[0], c - flare_rc[1]) for (r, c) in b62_spots)
+        assert min_d > 28.0
+    counts[62][
+        flare_rc[0] - 2 : flare_rc[0] + 2, flare_rc[1] - 2 : flare_rc[1] + 2
+    ] += 1400.0
+
+    imgs = [rng.poisson(counts[bk]).astype(np.float32) for bk in banks]
+    fpath = tmp_path / "single_frame_d28.h5"
+    with h5py.File(fpath, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f["images"] = np.asarray(imgs, dtype=np.float32)
+        f["bank_ids"] = np.asarray(banks, dtype=np.int32)
+        f["file_offsets"] = np.asarray([0], dtype=np.int64)
+        f["goniometer/axes"] = axes
+        f["goniometer/angles"] = np.asarray([[11.0], [11.0]], dtype=np.float64)
+        f["goniometer/names"] = [b"omega"]
+        f["instrument/wavelength"] = np.asarray(wl, dtype=np.float64)
+        for k, v in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            f[f"sample/{k}"] = float(v)
+        f["sample/space_group"] = "P 2 2 2"
+
+    args = SimpleNamespace(
+        nexus=str(fpath),
+        instrument="CG4D",
+        runs=[0],
+        stable_runs=[0],
+        binning=8,
+        border_width=4,
+        static_mask_file=None,
+        wl_min=wl[0],
+        wl_max=wl[1],
+        assign_wavelength=wl,
+        d_min=2.8,
+        cell=cell,
+        space_group="P 2 2 2",
+    )
+    em = PixelEMClassifier.from_args(args)
+    assert em is not None
+    assert em._d_min_em < 2.0
+    em.update_e_step(U_true, B)
+    exported = em.export_pixel_masks()
+    b_to_idx = {int(b): i for i, b in enumerate(exported.bank_ids)}
+    p_cls = exported.pixel_class
+
+    # Off-lattice Al flare is classified bright (class 2)
+    assert np.any(
+        p_cls[
+            b_to_idx[62],
+            flare_rc[0] - 6 : flare_rc[0] + 6,
+            flare_rc[1] - 6 : flare_rc[1] + 6,
+        ]
+        == 2
+    )
+    # Every real crystal Bragg reflection (including d < 2.8 A high-Q spots) stays valid (class 0)
+    for bk, r0, c0 in high_q_spots:
+        assert p_cls[b_to_idx[bk], r0, c0] == 0
