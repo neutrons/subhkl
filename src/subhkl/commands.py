@@ -905,6 +905,8 @@ def run_index(
             with h5py.File(bootstrap_filename, "r") as b_f:
                 if "detector_calibration" in b_f:
                     b_f.copy("detector_calibration", f)
+                if "detector" in b_f and "detector" not in f:
+                    b_f.copy("detector", f)
 
         import json
 
@@ -1306,6 +1308,20 @@ def run_peak_predictor(
             print(
                 f"Applying 3D per-run goniometer R from indexer ({R_all.shape[0]} frames)."
             )
+        em_mask_by_bank: dict[int, np.ndarray] = {}
+        em_class_by_bank: dict[int, np.ndarray] = {}
+        if "detector/pixel_mask" in f_idx and "detector/mask_bank_ids" in f_idx:
+            m_bids = np.asarray(f_idx["detector/mask_bank_ids"][()], dtype=int)
+            p_masks = np.asarray(f_idx["detector/pixel_mask"][()], dtype=np.uint8)
+            p_classes = (
+                np.asarray(f_idx["detector/pixel_class"][()], dtype=np.uint8)
+                if "detector/pixel_class" in f_idx
+                else None
+            )
+            for idx_m, bid_m in enumerate(m_bids):
+                em_mask_by_bank[int(bid_m)] = p_masks[idx_m] > 0
+                if p_classes is not None:
+                    em_class_by_bank[int(bid_m)] = p_classes[idx_m]
 
     # Pass the Base UB matrix. The predictor will apply dynamic R_gonio internally!
     UB = U @ B
@@ -1332,6 +1348,46 @@ def run_peak_predictor(
         frame_to_run=frame_to_run,
         harmonic_rot=harmonic_rot,
     )
+
+    if em_mask_by_bank:
+        n_rej_dark = 0
+        n_rej_bright = 0
+        n_rej_other = 0
+        filtered_map = {}
+        for img_key, (i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr) in results_map.items():
+            phys_bank = int(peaks.image.bank_mapping.get(img_key, img_key))
+            if phys_bank not in em_mask_by_bank or len(i_arr) == 0:
+                filtered_map[img_key] = (i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr)
+                continue
+            valid_px = em_mask_by_bank[phys_bank]
+            n_r_px, n_c_px = valid_px.shape
+            ri = np.clip(np.round(i_arr).astype(int), 0, n_r_px - 1)
+            ci = np.clip(np.round(j_arr).astype(int), 0, n_c_px - 1)
+            keep = valid_px[ri, ci]
+            if not np.all(keep):
+                rej = ~keep
+                if phys_bank in em_class_by_bank:
+                    rej_cls = em_class_by_bank[phys_bank][ri[rej], ci[rej]]
+                    n_rej_dark += int(np.sum(rej_cls == 1))
+                    n_rej_bright += int(np.sum(rej_cls == 2))
+                    n_rej_other += int(np.sum((rej_cls != 1) & (rej_cls != 2)))
+                else:
+                    n_rej_other += int(np.sum(rej))
+            if np.any(keep):
+                filtered_map[img_key] = (
+                    i_arr[keep],
+                    j_arr[keep],
+                    h_arr[keep],
+                    k_arr[keep],
+                    l_arr[keep],
+                    wl_arr[keep],
+                )
+        n_rej_tot = n_rej_dark + n_rej_bright + n_rej_other
+        print(
+            f"Filtered {n_rej_tot} predicted peaks via detector/pixel_mask "
+            f"({n_rej_dark} dark/shadowed, {n_rej_bright} static-bright)."
+        )
+        results_map = filtered_map
 
     print(f"Saving predictions to {integration_peaks_filename}")
     with h5py.File(integration_peaks_filename, "w") as f:
@@ -1379,6 +1435,8 @@ def run_peak_predictor(
         with h5py.File(indexed_hdf5_filename, "r") as f_in:
             if "detector_calibration" in f_in:
                 f_in.copy("detector_calibration", f)
+            if "detector" in f_in:
+                f_in.copy("detector", f)
             if "goniometer/per_run" in f_in:
                 if "goniometer/per_run" in f:
                     del f["goniometer/per_run"]
@@ -1544,6 +1602,8 @@ def run_rbf_integrator(
             # coordinates belong to.
             if "detector_calibration" in f_in:
                 f_in.copy("detector_calibration", f)
+            if "detector" in f_in and "detector" not in f:
+                f_in.copy("detector", f)
             if "goniometer/per_run" in f_in:
                 if "goniometer/per_run" in f:
                     del f["goniometer/per_run"]
