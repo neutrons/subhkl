@@ -664,6 +664,13 @@ def _decompose_R_to_angles(axes, ang_nom, R_target):
             np.array([0.0, 2.0, 0.0]),
             np.array([0.0, -2.0, 0.0]),
             np.zeros(3),
+            np.array([0.0, 180.0, 0.0]),
+            np.array([0.0, -180.0, 0.0]),
+            np.array([0.0, 90.0, 0.0]),
+            np.array([0.0, -90.0, 0.0]),
+            np.array([-90.0, 180.0, 0.0]),
+            np.array([90.0, 180.0, 0.0]),
+            np.array([180.0, 180.0, 0.0]),
         ]
     else:
         free_cols = list(range(min(K, 3)))

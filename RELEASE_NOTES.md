@@ -35,9 +35,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   multi-run scans) and gated `blind_band` quadrature/table bins to
   kinematically active $2\theta$ angles so coarse $d_{\min}$ single-frame
   solves resolve closely spaced zones.
-- Vectorized multi-bank EM reflection projection and 2D grid-stencil splatting,
+  - Vectorized multi-bank EM reflection projection and 2D grid-stencil splatting,
   cached clean median backgrounds and module-level `@jax.jit` Ewald/omega scan
   kernels, and concatenated active-bin `band_table` chunks on-device.
+- Added model-free outer-goniometer motor validation and recovery
+  (`recover_unlogged_outer_goniometer`) for multi-run inner-axis scans where
+  outer goniometer motors (for example `omega`, `kappa`) were omitted from raw
+  NeXus DASlogs, together with multi-branch `kappa` angle decomposition when
+  writing `goniometer/angles`.
+- Improved 3D band indexing on strongly anisotropic and streaky crystals
+  (such as Mesolite, $b = 56.55\,\text{\AA}$ vs. $c = 6.54\,\text{\AA}$):
+  - Fixed `laue_order_stencil` rotation step sizes to use perpendicular
+    direct-space lever arms $\max_{j \ne i} |\hat{\mathbf{a}}_i \times
+    \mathbf{a}_j|$, added `float32` coarse-zone Adam stencil screening and
+    Laue-proper symmetry deduplication across `refine_band_geometry` and
+    `distinct_orientations`, and widened coarse zone coverage and Ewald
+    background pooling ($56 \times 56\,\text{px}$) so streaky reflections are
+    not self-subtracted.
 
 ### Fixed
 

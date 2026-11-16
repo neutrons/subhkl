@@ -276,3 +276,217 @@ def test_laue_order_stencil_and_band_envelope_recover_scissored_still():
     assert err_deg < 0.25
     assert abs(fit["radial_scale"] - s_rad_true) < 0.015
     assert abs(fit["axial_scale"] - s_ax_true) < 0.015
+
+
+def test_noncentrosymmetric_laue_mirror_twins_are_deduplicated():
+    from scipy.spatial.transform import Rotation
+
+    B = np.diag([1.0 / 18.39, 1.0 / 56.55, 1.0 / 6.54])
+    U = Rotation.from_rotvec([0.2, -0.3, 0.1]).as_matrix()
+    # In Fdd2 (mm2), 2_a = diag(1, -1, -1) comes from negating det=-1 mirror (-1, 1, 1)
+    laue_twin = U @ np.diag([1.0, -1.0, -1.0])
+    other = Rotation.from_rotvec([-0.5, 0.4, 0.3]).as_matrix()
+    chosen = distinct_orientations(
+        [(U, 5.0, 9.0), (laue_twin, 4.9, 8.9), (other, 3.0, 6.0)],
+        B,
+        "Fdd2",
+        2,
+    )
+    assert len(chosen) == 2
+    np.testing.assert_allclose(chosen[0][0], U)
+    np.testing.assert_allclose(chosen[1][0], other)
+
+
+def test_laue_order_stencil_uses_perpendicular_lever_arm_on_anisotropic_cell():
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.search.spherical import laue_order_stencil
+
+    # Strongly anisotropic orthorhombic cell (b = 56.55 A >> c = 6.54 A)
+    B = np.diag([1.0 / 18.39, 1.0 / 56.55, 1.0 / 6.54])
+    st = laue_order_stencil(B, (2.8, 4.5), 2.0, orders=(-1, 0, 1))
+    rotvecs = Rotation.from_matrix(st).as_rotvec()
+    # Single-order shifts have exactly one non-zero Cartesian component for orthorhombic B;
+    # rotation around c (z) tilts b (56.55 A), so its step must be ~2 deg, not ~17 deg.
+    pure_z = [
+        np.linalg.norm(rv)
+        for rv in rotvecs
+        if abs(rv[2]) > 1e-6 and np.hypot(rv[0], rv[1]) < 1e-6
+    ]
+    assert len(pure_z) == 2
+    assert np.rad2deg(max(pure_z)) < 4.0
+    assert np.rad2deg(max(pure_z)) > 0.8
+
+
+def test_decompose_R_to_angles_handles_kappa_180_branch():
+    from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
+    from subhkl.scan_refine import _decompose_R_to_angles
+
+    axes = np.array(
+        [
+            [0.0, 1.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0, -1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 1.0, 0.0, -1.0],
+        ],
+        dtype=float,
+    )
+    ang_true = np.array([-39.0, 45.0, 180.0, 45.0, 70.0], dtype=float)
+    R_target = calc_goniometer_rotation_matrix(axes, ang_true)
+    ang_nom = np.array([0.0, 45.0, 0.0, 45.0, 70.0], dtype=float)
+    ang_rec = _decompose_R_to_angles(axes, ang_nom, R_target)
+    R_rec = calc_goniometer_rotation_matrix(axes, ang_rec)
+    np.testing.assert_allclose(R_rec, R_target, atol=1e-12)
+    np.testing.assert_allclose(ang_rec[[1, 3, 4]], ang_nom[[1, 3, 4]], atol=1e-12)
+
+
+def test_recover_unlogged_outer_goniometer_recovers_kappa_stage_and_skips_nominal(
+    tmp_path,
+):
+    from types import SimpleNamespace
+
+    import h5py
+
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
+    from subhkl.search.blind_band import recover_unlogged_outer_goniometer
+
+    axes = np.array(
+        [
+            [0.0, 1.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0, -1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [0.0, 1.0, 0.0, -1.0],
+        ],
+        dtype=float,
+    )
+    phis = [70.0, 74.0, 78.0, 82.0, 86.0]
+    n_runs = len(phis)
+
+    # Pick synthetic crystal scattering directions and project onto CG4D panels
+    rng = np.random.default_rng(123)
+    q_cryst = rng.normal(size=(60, 3))
+    q_cryst /= np.linalg.norm(q_cryst, axis=1, keepdims=True)
+    dets = {int(k): Detector(dict(v)) for k, v in beamlines["CG4D"].items()}
+
+    banks_l, rows_l, cols_l, dev_l, runs_l = [], [], [], [], []
+    R_true_runs = []
+    for r, phi in enumerate(phis):
+        ang_true = np.array([-40.0, 45.0, 180.0, 45.0, phi], dtype=float)
+        R_true = calc_goniometer_rotation_matrix(axes, ang_true)
+        R_true_runs.append(R_true)
+        q_lab = (R_true @ q_cryst.T).T
+        # Valid Bragg scattering requires q_z < 0 and unit kf = ki + 2*|sin th|*qhat
+        q_lab = q_lab[q_lab[:, 2] < -0.15]
+        kf = np.array([0.0, 0.0, 1.0]) - 2.0 * q_lab[:, 2:3] * q_lab
+        for d_kf in kf:
+            for bk_id, det in dets.items():
+                denom = float(np.dot(d_kf, np.cross(det.uhat, det.vhat)))
+                if abs(denom) < 1e-6:
+                    continue
+                t_hit = float(np.dot(det.center, np.cross(det.uhat, det.vhat)) / denom)
+                if t_hit <= 0:
+                    continue
+                rel = t_hit * d_kf - det.center
+                u_m = float(np.dot(rel, det.uhat))
+                v_m = float(np.dot(rel, det.vhat))
+                if 0.02 * det.width < u_m < 0.98 * det.width and (
+                    0.02 * det.height < v_m < 0.98 * det.height
+                ):
+                    banks_l.append(bk_id)
+                    cols_l.append(u_m / det.width * (det.m - 1))
+                    rows_l.append(v_m / det.height * (det.n - 1))
+                    dev_l.append(150.0)
+                    runs_l.append(r)
+                    break
+        # Inject static sample-environment flare at fixed detector pixel in every run
+        static_bk = next(iter(dets))
+        banks_l.append(static_bk)
+        cols_l.append(128.0)
+        rows_l.append(128.0)
+        dev_l.append(800.0)
+        runs_l.append(r)
+
+    banks_a = np.asarray(banks_l, dtype=int)
+    rows_a = np.asarray(rows_l, dtype=float)
+    cols_a = np.asarray(cols_l, dtype=float)
+    dev_a = np.asarray(dev_l, dtype=float)
+    runs_a = np.asarray(runs_l, dtype=int)
+    n_obs = len(banks_a)
+
+    # Case 1: unlogged omega=0, kappa=0 in HDF5
+    unlogged_h5 = tmp_path / "unlogged.h5"
+    ang_unlogged = np.array([[0.0, 45.0, 0.0, 45.0, p] for p in phis], dtype=float)
+    with h5py.File(unlogged_h5, "w") as f:
+        f.create_dataset("images", shape=(n_runs, 8, 8), dtype=np.float32)
+        f["file_offsets"] = np.arange(n_runs, dtype=int)
+        f["goniometer/axes"] = axes
+        f["goniometer/angles"] = ang_unlogged
+
+    R_nom_runs = [
+        calc_goniometer_rotation_matrix(axes, ang_unlogged[r]) for r in range(n_runs)
+    ]
+    R_obs_nom = np.stack([R_nom_runs[r] for r in runs_a], axis=0)
+    scan_nom = np.tile(np.array([[0.0, -1.0, 0.0]]), (n_obs, 1))
+    obs_nom = (
+        banks_a,
+        rows_a,
+        cols_a,
+        dev_a,
+        np.zeros(n_obs),
+        runs_a,
+        ang_unlogged[runs_a],
+        np.ones(n_obs),
+        R_obs_nom,
+        scan_nom,
+    )
+    args1 = SimpleNamespace(
+        nexus=str(unlogged_h5),
+        instrument="CG4D",
+        runs=list(range(n_runs)),
+        finder=None,
+    )
+    obs_rec = recover_unlogged_outer_goniometer(args1, obs_nom)
+    assert hasattr(args1, "_recovered_outer_R_runs")
+    true_axis = calc_goniometer_rotation_matrix(
+        axes[:4], [-40.0, 45.0, 180.0, 45.0]
+    ) @ np.array([0.0, -1.0, 0.0])
+    rec_axis = obs_rec[9][0]
+    cos_ax = abs(float(np.dot(true_axis, rec_axis)))
+    assert np.rad2deg(np.arccos(np.clip(cos_ax, 0.0, 1.0))) < 1.0
+
+    # Case 2: properly logged outer angles -> recovery must not override
+    logged_h5 = tmp_path / "logged.h5"
+    ang_logged = np.array([[-40.0, 45.0, 180.0, 45.0, p] for p in phis], dtype=float)
+    with h5py.File(logged_h5, "w") as f:
+        f.create_dataset("images", shape=(n_runs, 8, 8), dtype=np.float32)
+        f["file_offsets"] = np.arange(n_runs, dtype=int)
+        f["goniometer/axes"] = axes
+        f["goniometer/angles"] = ang_logged
+
+    R_obs_true = np.stack([R_true_runs[r] for r in runs_a], axis=0)
+    scan_true = np.tile(true_axis[None, :], (n_obs, 1))
+    obs_true = (
+        banks_a,
+        rows_a,
+        cols_a,
+        dev_a,
+        np.zeros(n_obs),
+        runs_a,
+        ang_logged[runs_a],
+        np.ones(n_obs),
+        R_obs_true,
+        scan_true,
+    )
+    args2 = SimpleNamespace(
+        nexus=str(logged_h5),
+        instrument="CG4D",
+        runs=list(range(n_runs)),
+        finder=None,
+    )
+    obs_same = recover_unlogged_outer_goniometer(args2, obs_true)
+    assert not hasattr(args2, "_recovered_outer_R_runs")
+    assert obs_same is obs_true

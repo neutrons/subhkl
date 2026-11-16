@@ -198,15 +198,51 @@ def _build_ewald_excess_maps(args):
     def _gpu_excess(raw_batch):
         nb = raw_batch.shape[0]
         y = raw_batch[:, : hb * b2, : wb * b2].reshape(nb, hb, b2, wb, b2).sum((2, 4))
-        yp = jnp.pad(y, ((0, 0), (2, 2), (2, 2)), mode="edge")
-        patches = jax.lax.conv_general_dilated_patches(
-            yp[:, None, :, :],
-            (5, 5),
-            (1, 1),
-            "VALID",
-            dimension_numbers=("NCHW", "OIHW", "NCHW"),
-        )
-        bg = jnp.median(patches, axis=1)
+        hb2 = hb // 2
+        wb2 = wb // 2
+        if hb2 >= 8 and wb2 >= 8:
+            # Pool 2x2 to 8-px scale and take a 7x7 median (~56x56 px support) so
+            # broad or streaky Bragg spots (~35-45 px) are not self-subtracted,
+            # while computing 4x fewer patch medians.
+            yc = y[:, : hb2 * 2, : wb2 * 2].reshape(nb, hb2, 2, wb2, 2).mean((2, 4))
+            ycp = jnp.pad(yc, ((0, 0), (3, 3), (3, 3)), mode="edge")
+            patches = jax.lax.conv_general_dilated_patches(
+                ycp[:, None, :, :],
+                (7, 7),
+                (1, 1),
+                "VALID",
+                dimension_numbers=("NCHW", "OIHW", "NCHW"),
+            )
+            bgc = jnp.median(patches, axis=1)
+            bgcp = jnp.pad(bgc, ((0, 0), (1, 1), (1, 1)), mode="edge")
+            bgc = (
+                bgcp[:, :-2, :-2]
+                + bgcp[:, :-2, 1:-1]
+                + bgcp[:, :-2, 2:]
+                + bgcp[:, 1:-1, :-2]
+                + bgcp[:, 1:-1, 1:-1]
+                + bgcp[:, 1:-1, 2:]
+                + bgcp[:, 2:, :-2]
+                + bgcp[:, 2:, 1:-1]
+                + bgcp[:, 2:, 2:]
+            ) / 9.0
+            bg = jnp.repeat(jnp.repeat(bgc, 2, axis=1), 2, axis=2)
+            if bg.shape[1] < hb or bg.shape[2] < wb:
+                bg = jnp.pad(
+                    bg,
+                    ((0, 0), (0, hb - bg.shape[1]), (0, wb - bg.shape[2])),
+                    mode="edge",
+                )
+        else:
+            yp = jnp.pad(y, ((0, 0), (2, 2), (2, 2)), mode="edge")
+            patches = jax.lax.conv_general_dilated_patches(
+                yp[:, None, :, :],
+                (5, 5),
+                (1, 1),
+                "VALID",
+                dimension_numbers=("NCHW", "OIHW", "NCHW"),
+            )
+            bg = jnp.median(patches, axis=1)
         ex = y - bg
         if rim_bins > 0 and hb > 4 * rim_bins and wb > 4 * rim_bins:
             ex = (
@@ -1071,16 +1107,21 @@ def refine_scan(args):
     obs = getattr(args, "_cached_obs_kin", None)
     if obs is None:
         obs = load_observations(args, return_kinematics=True)
-    banks, pr, pc, dev, sig_px, runs, _angs, spot_weights, R_obs, scan_axes_obs = obs
-    raw_dev_obs = dev.copy()
-    raw_spot_weights = spot_weights.copy()
 
+    from subhkl.search.blind_band import (
+        count_search_weights,
+        recover_unlogged_outer_goniometer,
+    )
     from subhkl.search.pixel_em import PixelEMClassifier
 
     pixel_em = getattr(args, "_pixel_em", None)
     if pixel_em is None and not args.finder:
         pixel_em = PixelEMClassifier.from_args(args)
         args._pixel_em = pixel_em
+    obs = recover_unlogged_outer_goniometer(args, obs, pixel_em)
+    banks, pr, pc, dev, sig_px, runs, _angs, spot_weights, R_obs, scan_axes_obs = obs
+    raw_dev_obs = dev.copy()
+    raw_spot_weights = spot_weights.copy()
     if pixel_em is not None:
         dev, spot_weights, _gv_obs = pixel_em.map_to_observations(
             banks, pr, pc, runs, raw_dev_obs, raw_spot_weights
@@ -1117,12 +1158,16 @@ def refine_scan(args):
     )
     per_run_active = "per_run" in args.modes or "per_run_trans" in args.modes
 
+    rec_R_runs = getattr(args, "_recovered_outer_R_runs", None) or {}
     R_runs_nom = {}
     for r in range(n_runs):
         idx_r = np.flatnonzero(runs == r)
-        R_runs_nom[r] = R_obs[idx_r[0]].copy() if len(idx_r) else np.eye(3)
-
-    from subhkl.search.blind_band import count_search_weights
+        if len(idx_r):
+            R_runs_nom[r] = R_obs[idx_r[0]].copy()
+        elif r in rec_R_runs:
+            R_runs_nom[r] = np.asarray(rec_R_runs[r], dtype=np.float64).copy()
+        else:
+            R_runs_nom[r] = np.eye(3)
 
     # Multi-run EM candidate re-evaluation across bootstrap pool (if present)
     if (
@@ -1201,13 +1246,45 @@ def refine_scan(args):
                 banks, pr, pc, runs, raw_dev_obs, raw_spot_weights
             )
 
+    if args.finder:
+        sel &= dev >= args.min_deviance
+    sel_full = sel.copy()
+    keep_mask_loc = None
+    if not args.finder:
+        idx_full = np.flatnonzero(sel_full)
+        if len(idx_full) > 4096:
+            dev_rank = np.maximum(raw_dev_obs[idx_full], dev[idx_full])
+            w_rank = count_search_weights(dev_rank, max_quantile=0.999, max_factor=3.0)
+            w_rmax = float(w_rank.max()) if len(w_rank) else 0.0
+            sig_loc = np.flatnonzero(w_rank > max(1e-4 * w_rmax, 0.0))
+            top_cap = 32_768
+            bg_cap = 2_048
+            if len(sig_loc) > top_cap:
+                sig_loc = sig_loc[np.argpartition(w_rank[sig_loc], -top_cap)[-top_cap:]]
+            keep_mask_loc = np.zeros(len(idx_full), dtype=bool)
+            keep_mask_loc[sig_loc] = True
+            rem_loc = np.flatnonzero(~keep_mask_loc)
+            if len(rem_loc) > bg_cap:
+                stride_idx = np.linspace(0, len(rem_loc) - 1, bg_cap, dtype=np.int64)
+                keep_mask_loc[rem_loc[stride_idx]] = True
+            else:
+                keep_mask_loc[rem_loc] = True
+            if not np.all(keep_mask_loc):
+                sel = np.zeros(len(banks), dtype=bool)
+                sel[idx_full[keep_mask_loc]] = True
+            else:
+                keep_mask_loc = None
+
     def _compute_band_weights(dev_arr, sw_arr, gv_arr=None):
         if args.finder:
             w_s = sw_arr[sel]
         else:
-            w_s = count_search_weights(dev_arr[sel], max_quantile=0.999, max_factor=3.0)
+            w_full = count_search_weights(
+                dev_arr[sel_full], max_quantile=0.999, max_factor=3.0
+            )
             if gv_arr is not None:
-                w_s = w_s * gv_arr[sel]
+                w_full = w_full * gv_arr[sel_full]
+            w_s = w_full[keep_mask_loc] if keep_mask_loc is not None else w_full
             if not np.any(w_s > 0):
                 w_s = sw_arr[sel]
         wj = jnp.asarray(w_s / np.maximum(np.abs(w_s).sum(), 1e-12), dtype=jnp.float64)
@@ -1220,26 +1297,6 @@ def refine_scan(args):
         )
         wr = wr / jnp.maximum(jnp.abs(wr).sum(), 1e-12)
         return wj, wr
-
-    if args.finder:
-        sel &= dev >= args.min_deviance
-    sel_full = sel.copy()
-    if not args.finder and int(sel_full.sum()) > 262_144:
-        idx_full = np.flatnonzero(sel_full)
-        top_cap = 229_376
-        bg_cap = 32_768
-        dev_rank = np.maximum(raw_dev_obs[idx_full], dev[idx_full])
-        top_loc = np.argpartition(dev_rank, -top_cap)[-top_cap:]
-        keep_mask_loc = np.zeros(len(idx_full), dtype=bool)
-        keep_mask_loc[top_loc] = True
-        rem_loc = np.flatnonzero(~keep_mask_loc)
-        if len(rem_loc) > bg_cap:
-            stride_idx = np.linspace(0, len(rem_loc) - 1, bg_cap, dtype=np.int64)
-            keep_mask_loc[rem_loc[stride_idx]] = True
-        else:
-            keep_mask_loc[rem_loc] = True
-        sel = np.zeros(len(banks), dtype=bool)
-        sel[idx_full[keep_mask_loc]] = True
 
     ewald_ctx = None
     raw_exc_maps = None
@@ -2444,6 +2501,22 @@ def refine_scan(args):
                 f"max_trans = {max_t_mm:.2f} mm",
                 flush=True,
             )
+
+    if (
+        getattr(args, "_recovered_outer_R_runs", None) is not None
+        and getattr(args, "R_runs_refined", None) is None
+    ):
+        R_rec_list = []
+        for r in range(n_runs):
+            idx_r = np.flatnonzero(runs == r)
+            if len(idx_r) and r < len(dom):
+                dR_r = np.asarray(
+                    rodrigues_jax(float(dom[r]) * jnp.asarray(scan_axes_obs[idx_r[0]]))
+                )
+                R_rec_list.append(dR_r @ R_obs[idx_r[0]])
+            else:
+                R_rec_list.append(np.asarray(R_runs_nom[r], dtype=np.float64))
+        args.R_runs_refined = np.asarray(R_rec_list, dtype=np.float64)
 
     lower, upper = np.asarray(bounds_panel).T
     args.parameter_bounds = np.asarray(bounds_panel)

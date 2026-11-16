@@ -12,7 +12,12 @@ from subhkl.core.spacegroup import get_space_group_object
 from subhkl.instrument.detector import Detector
 from subhkl.scan_refine import load_observations
 from subhkl.search.scan_band import band_sum, build_B_jax, direct_lattice_uvw
-from subhkl.search.spherical import band_q_range, lattice_ladder, refine_band_geometry
+from subhkl.search.spherical import (
+    band_q_range,
+    direct_lattice_vectors,
+    lattice_ladder,
+    refine_band_geometry,
+)
 
 
 def sample_signed(weights, size, seed=0):
@@ -37,11 +42,15 @@ def sample_signed(weights, size, seed=0):
 
 
 def distinct_orientations(candidates, B, space_group, count, separation_deg=1.0):
-    """Remove duplicates under proper crystallographic rotations."""
+    """Remove duplicates under Laue proper crystallographic rotations."""
     operations = []
+    B_arr = np.asarray(B, float)
+    B_inv = np.linalg.inv(B_arr)
     for op in get_space_group_object(space_group).operations().sym_ops:
-        S = B @ np.linalg.inv(np.asarray(op.rot) / op.DEN).T @ np.linalg.inv(B)
-        if np.linalg.det(S) > 0:
+        S = B_arr @ np.linalg.inv(np.asarray(op.rot, float) / op.DEN).T @ B_inv
+        if np.linalg.det(S) < 0:
+            S = -S
+        if not any(np.allclose(S, Sp, atol=1e-5) for Sp in operations):
             operations.append(S)
     selected = []
     for candidate in candidates:
@@ -78,6 +87,291 @@ def count_search_weights(deviance, scale=25.0, max_quantile=None, max_factor=3.0
     return w
 
 
+def recover_unlogged_outer_goniometer(args, observations, pixel_em=None):
+    """Validate and recover unlogged outer goniometer motor angles on multi-run scans.
+
+    When an inner motor (``scan_col > 0``, e.g. ``phi`` on a 5-axis kappa stage)
+    is scanned while outer motors (``omega, kappa``) were omitted from raw NeXus
+    logs (defaulting to ``0``), the nominal lab scan axis can be tens of degrees
+    off, scrambling cross-run de-rotation.  This model-free check tests whether
+    observed Bragg spot directions de-rotate into coincidence across run pairs
+    ``1 <= |Delta phi| <= 45 deg`` under reachable outer motor angles, without
+    requiring a unit cell or orientation.  Activates only when ``scan_col > 0``
+    and a distinct outer configuration achieves overwhelming significance
+    (``z >= 8``, ``> 5 deg`` from nominal, and ``>= 3x`` nominal coincidence).
+    """
+    if getattr(args, "_outer_goniometer_checked", False):
+        return observations
+    args._outer_goniometer_checked = True
+    if getattr(args, "finder", None):
+        return observations
+    nexus_path = getattr(args, "nexus", None)
+    active_runs = sorted(set(getattr(args, "runs", [])))
+    if not nexus_path or len(active_runs) < 2:
+        return observations
+
+    from scipy.optimize import minimize
+
+    from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
+    from subhkl.scan_refine import _frame_offsets, _frame_rotations_and_scan_axes
+
+    with h5py.File(nexus_path, "r") as f:
+        n_frames = int(f["images"].shape[0])
+        offsets = _frame_offsets(f, n_frames)
+        _, axes, angles, scan_col, _ = _frame_rotations_and_scan_axes(f, n_frames)
+
+    if (
+        axes is None
+        or angles is None
+        or scan_col is None
+        or int(scan_col) <= 0
+        or len(offsets) < 2
+    ):
+        return observations
+    scan_col = int(scan_col)
+    n_runs_total = len(offsets)
+    valid_runs = [r for r in active_runs if 0 <= r < n_runs_total]
+    if len(valid_runs) < 2:
+        return observations
+
+    r_ref = valid_runs[0]
+    phi_deg = {
+        r: float(angles[offsets[r], scan_col] - angles[offsets[r_ref], scan_col])
+        for r in valid_runs
+    }
+    has_pair = any(
+        1.0 <= abs(phi_deg[r2] - phi_deg[r1]) <= 45.0
+        for i1, r1 in enumerate(valid_runs)
+        for r2 in valid_runs[i1 + 1 :]
+    )
+    if not has_pair:
+        return observations
+
+    banks, rows, cols, dev, sig_px, runs, ang_obs, weights, R_obs, scan_axes = (
+        observations
+    )
+    if pixel_em is not None:
+        dev_use, _, gv_use = pixel_em.map_to_observations(
+            banks, rows, cols, runs, dev, weights
+        )
+    else:
+        dev_use = dev
+        gv_use = np.ones(len(dev), dtype=np.float64)
+    sw_all = count_search_weights(dev_use, max_quantile=0.999, max_factor=3.0) * gv_use
+
+    # Build lab-frame scattering unit directions only for top spots per run
+    run_dirs: dict[int, np.ndarray] = {}
+    run_w: dict[int, np.ndarray] = {}
+    det_cache: dict[int, Detector] = {}
+    for r in valid_runs:
+        mr = np.flatnonzero((runs == r) & (dev_use >= 20.0) & (sw_all > 0.0))
+        if len(mr) < 3:
+            continue
+        if len(mr) > 48:
+            mr = mr[np.argsort(-sw_all[mr])[:48]]
+        xyz = np.empty((len(mr), 3), dtype=np.float64)
+        b_sub = banks[mr]
+        for bk in np.unique(b_sub):
+            bk_i = int(bk)
+            if bk_i not in det_cache:
+                det_cache[bk_i] = Detector(dict(beamlines[args.instrument][str(bk_i)]))
+            det_b = det_cache[bk_i]
+            mb = b_sub == bk
+            mid = (
+                det_b.center
+                + 0.5 * det_b.width * det_b.uhat
+                + 0.5 * det_b.height * det_b.vhat
+            )
+            off = ((cols[mr[mb]] / (det_b.m - 1) - 0.5) * det_b.width)[
+                :, None
+            ] * det_b.uhat + ((rows[mr[mb]] / (det_b.n - 1) - 0.5) * det_b.height)[
+                :, None
+            ] * det_b.vhat
+            xyz[mb] = mid + off
+        q = xyz / np.linalg.norm(xyz, axis=1, keepdims=True) - np.array([0.0, 0.0, 1.0])
+        run_dirs[r] = q / np.linalg.norm(q, axis=1, keepdims=True)
+        wr = sw_all[mr].astype(np.float64)
+        run_w[r] = wr / max(float(wr.sum()), 1e-12)
+
+    usable_runs = [r for r in valid_runs if r in run_dirs]
+    pairs = [
+        (r1, r2)
+        for i1, r1 in enumerate(usable_runs)
+        for r2 in usable_runs[i1 + 1 :]
+        if 1.0 <= abs(phi_deg[r2] - phi_deg[r1]) <= 45.0
+    ]
+    if not pairs:
+        return observations
+
+    # Identify variable outer motor columns outside `scan_col`
+    if (
+        scan_col == 4
+        and np.allclose(axes[1, :3], axes[3, :3], atol=1e-5)
+        and abs(float(axes[1, 3]) + float(axes[3, 3])) < 1e-5
+    ):
+        free_outer = [0, 2]
+    else:
+        free_outer = list(range(min(scan_col, 2)))
+
+    u_scan = float(axes[scan_col, 3]) * (
+        axes[scan_col, :3] / max(float(np.linalg.norm(axes[scan_col, :3])), 1e-12)
+    )
+    base_outer = angles[offsets[r_ref], :scan_col].astype(np.float64).copy()
+    n_nom = calc_goniometer_rotation_matrix(axes[:scan_col], base_outer) @ u_scan
+    n_nom = n_nom / max(float(np.linalg.norm(n_nom)), 1e-12)
+
+    axes_list = [n_nom]
+    cfg_list = [tuple(float(base_outer[c]) for c in free_outer)]
+    cos_dedup = float(np.cos(np.deg2rad(3.5)))
+    if len(free_outer) == 1:
+        g0 = np.linspace(-180.0, 180.0, 108, endpoint=False)
+        raw_cfgs = [(float(v),) for v in g0]
+    else:
+        g0 = np.linspace(-180.0, 180.0, 60, endpoint=False)
+        g1 = np.linspace(-180.0, 180.0, 61)
+        raw_cfgs = [
+            (float(v0), float(v1))
+            for v0, v1 in np.array(np.meshgrid(g0, g1, indexing="ij")).reshape(2, -1).T
+        ]
+    for cfg in raw_cfgs:
+        ao = base_outer.copy()
+        for idx_c, col_c in enumerate(free_outer):
+            ao[col_c] = cfg[idx_c]
+        nv = calc_goniometer_rotation_matrix(axes[:scan_col], ao) @ u_scan
+        nv = nv / max(float(np.linalg.norm(nv)), 1e-12)
+        if float(np.max(np.asarray(axes_list) @ nv)) < cos_dedup:
+            axes_list.append(nv)
+            cfg_list.append(cfg)
+    axes_s2 = np.asarray(axes_list, dtype=np.float64)
+
+    dphi_rad = {r: np.deg2rad(phi_deg[r]) for r in usable_runs}
+    derot = {
+        r: np.einsum(
+            "mij,nj->mni",
+            Rotation.from_rotvec(-dphi_rad[r] * axes_s2).as_matrix(),
+            run_dirs[r],
+        )
+        for r in usable_runs
+    }
+    inv_s2 = 1.0 / (np.deg2rad(0.9) ** 2)
+    cos_static = float(np.cos(np.deg2rad(1.2)))
+    pair_masks = {
+        (r1, r2): ((run_dirs[r1] @ run_dirs[r2].T) < cos_static).astype(np.float64)
+        * (run_w[r1][:, None] * run_w[r2][None, :])
+        for r1, r2 in pairs
+    }
+    scores = np.zeros(len(axes_s2), dtype=np.float64)
+    for r1, r2 in pairs:
+        dots = np.einsum("mni,mki->mnk", derot[r1], derot[r2])
+        scores += np.einsum(
+            "mnk,nk->m",
+            np.exp(np.clip((dots - 1.0) * inv_s2, -30.0, 0.0)),
+            pair_masks[(r1, r2)],
+        )
+
+    best_m = int(np.argmax(scores))
+    score_nom = float(scores[0])
+
+    def _neg_score_cfg(x_cfg):
+        ao = base_outer.copy()
+        for idx_c, col_c in enumerate(free_outer):
+            ao[col_c] = float(x_cfg[idx_c])
+        nh = calc_goniometer_rotation_matrix(axes[:scan_col], ao) @ u_scan
+        nh = nh / max(float(np.linalg.norm(nh)), 1e-12)
+        dr = {
+            r: Rotation.from_rotvec(-dphi_rad[r] * nh).apply(run_dirs[r])
+            for r in usable_runs
+        }
+        tot = 0.0
+        for r1, r2 in pairs:
+            dots = dr[r1] @ dr[r2].T
+            tot += float(
+                np.sum(
+                    np.exp(np.clip((dots - 1.0) * inv_s2, -30.0, 0.0))
+                    * pair_masks[(r1, r2)]
+                )
+            )
+        return -tot
+
+    res_opt = minimize(
+        _neg_score_cfg,
+        np.asarray(cfg_list[best_m], dtype=np.float64),
+        method="Nelder-Mead",
+        options={"maxiter": 60, "xatol": 0.05},
+    )
+    ao_fit = base_outer.copy()
+    for idx_c, col_c in enumerate(free_outer):
+        ao_fit[col_c] = float(((res_opt.x[idx_c] + 180.0) % 360.0) - 180.0)
+    n_fit = calc_goniometer_rotation_matrix(axes[:scan_col], ao_fit) @ u_scan
+    n_fit = n_fit / max(float(np.linalg.norm(n_fit)), 1e-12)
+    score_fit = float(-res_opt.fun)
+
+    far_mask = (axes_s2 @ n_fit) < float(np.cos(np.deg2rad(20.0)))
+    if not np.any(far_mask):
+        return observations
+    bg_mean = float(scores[far_mask].mean())
+    bg_std = max(float(scores[far_mask].std()), 1e-9)
+    z_fit = (score_fit - bg_mean) / bg_std
+    z_nom = (score_nom - bg_mean) / bg_std
+    ang_diff_deg = float(
+        np.degrees(np.arccos(np.clip(float(n_fit @ n_nom), -1.0, 1.0)))
+    )
+
+    if not (
+        ang_diff_deg > 5.0
+        and z_fit >= 8.0
+        and z_nom < 3.0
+        and score_fit >= 3.0 * max(score_nom, 1e-6)
+    ):
+        return observations
+
+    outer_desc = ", ".join(f"axis[{c}]={ao_fit[c]:+.2f} deg" for c in free_outer)
+    print(
+        f"Outer goniometer recovery: nominal lab scan axis {np.round(n_nom, 4).tolist()} "
+        f"(z={z_nom:+.2f}) inconsistent across runs; recovered {outer_desc} -> "
+        f"lab scan axis {np.round(n_fit, 4).tolist()} (z={z_fit:+.2f}, diff={ang_diff_deg:.1f} deg)",
+        flush=True,
+    )
+
+    R_runs_fit: dict[int, np.ndarray] = {}
+    ang_by_run: dict[int, np.ndarray] = {}
+    for r in range(n_runs_total):
+        ar = angles[offsets[r]].astype(np.float64).copy()
+        for col_c in free_outer:
+            ar[col_c] = ao_fit[col_c]
+        ang_by_run[r] = ar
+        R_runs_fit[r] = calc_goniometer_rotation_matrix(axes, ar)
+
+    R_obs_new = np.array(R_obs, dtype=np.float64, copy=True)
+    scan_axes_new = np.broadcast_to(n_fit, scan_axes.shape).copy()
+    ang_obs_new = np.array(ang_obs, dtype=np.float64, copy=True)
+    for r, R_r in R_runs_fit.items():
+        mr = runs == r
+        if np.any(mr):
+            R_obs_new[mr] = R_r
+            if ang_obs_new.ndim == 2 and ang_obs_new.shape[1] == len(ang_by_run[r]):
+                ang_obs_new[mr] = ang_by_run[r]
+
+    new_obs = (
+        banks,
+        rows,
+        cols,
+        dev,
+        sig_px,
+        runs,
+        ang_obs_new,
+        weights,
+        R_obs_new,
+        scan_axes_new,
+    )
+    args._recovered_outer_R_runs = R_runs_fit
+    if getattr(args, "_cached_obs_kin", None) is not None:
+        args._cached_obs_kin = new_obs
+    if pixel_em is not None:
+        pixel_em.R_by_run.update(R_runs_fit)
+    return new_obs
+
+
 def discover(args, samples=16384, candidates=6, seed=0):
     """Find a seed without reading any reference orientation or calibration.
 
@@ -91,13 +385,14 @@ def discover(args, samples=16384, candidates=6, seed=0):
         observations = load_observations(args, return_kinematics=True)
         if set(getattr(args, "runs", [])) == set(getattr(args, "stable_runs", [])):
             args._cached_obs_kin = observations
-    banks, rows, cols, dev, _, runs, _angles, weights, R_obs, _scan_axes = observations
     from subhkl.search.pixel_em import PixelEMClassifier, wilson_search_weights
 
     pixel_em = getattr(args, "_pixel_em", None)
     if pixel_em is None and not args.finder:
         pixel_em = PixelEMClassifier.from_args(args)
         args._pixel_em = pixel_em
+    observations = recover_unlogged_outer_goniometer(args, observations, pixel_em)
+    banks, rows, cols, dev, _, runs, _angles, weights, R_obs, _scan_axes = observations
     if pixel_em is not None:
         dev, weights, gv_obs = pixel_em.map_to_observations(
             banks, rows, cols, runs, dev, weights
@@ -334,9 +629,26 @@ def discover(args, samples=16384, candidates=6, seed=0):
     env_pool = max(128, 12 * int(candidates))
 
     if geom_uncalibrated:
-        coarse_nz = 30
-        ladder_rungs = ((30, 0.9, 1.0, env_pool * 2, 5),)
-        band_env_deg = 1.1
+        _, xlen_chk, _ = direct_lattice_vectors(B, space_group=args.space_group)
+        max_cell_len = float(max(args.cell[:3]))
+        coarse_nz = (
+            60 if float(xlen_chk[min(29, len(xlen_chk) - 1)]) < max_cell_len else 30
+        )
+        ladder_rungs = ((coarse_nz, 0.9, 1.0, env_pool * 2, 5),)
+        qlo_chk, qhi_chk = band_q_range(sin_th_all[kin_active], wavelength, args.d_min)
+        qbar_med = max(float(np.median(0.5 * (qlo_chk + qhi_chk))), 1e-6)
+        med_lobe_deg = float(
+            np.median(
+                np.degrees(
+                    1.0 / np.maximum(4.0 * xlen_chk[:coarse_nz] * qbar_med, 1e-9)
+                )
+            )
+        )
+        # Macromolecular cells whose Laue carrier lobes are narrower than half
+        # the 2 deg SO(3) grid step need spherical-cap max bridging; smaller or
+        # anisotropic mineral cells already resolve their carrier lobes on the
+        # grid and avoid equatorial belt inflation when band_env_deg == 0.
+        band_env_deg = 1.1 if med_lobe_deg < 0.85 else 0.0
     else:
         coarse_nz = 13
         ladder_rungs = (
@@ -347,8 +659,14 @@ def discover(args, samples=16384, candidates=6, seed=0):
         )
         band_env_deg = 0.0
 
-    table_limit = 131_072 if args.finder else 49_152
-    act_pool = np.flatnonzero((weights != 0.0) & kin_active)
+    table_limit = 131_072 if args.finder else 16_384
+    if args.finder:
+        act_pool = np.flatnonzero((weights != 0.0) & kin_active)
+    else:
+        w_pos_max = float(np.max(weights[kin_active])) if np.any(kin_active) else 0.0
+        act_pool = np.flatnonzero((weights > max(1e-4 * w_pos_max, 0.0)) & kin_active)
+        if len(act_pool) == 0:
+            act_pool = np.flatnonzero((weights != 0.0) & kin_active)
     if len(act_pool) == 0:
         act_pool = np.arange(len(weights))
     if len(act_pool) > table_limit:
@@ -432,8 +750,9 @@ def discover(args, samples=16384, candidates=6, seed=0):
             rot_axis_only=rot_axis_only,
             space_group=args.space_group,
             laue_order_search=True,
+            return_top_k=max(int(candidates), 4),
         )
-        fits.append(stencil_fit)
+        fits.extend(stencil_fit.get("top_fits", [stencil_fit]))
         _write_blind_rung("joint_stencil", 60, stencil_fit["U"], geom_fit=stencil_fit)
         print(
             f"  laue-order stencil winner: score {stencil_fit['score']:.6g}, "
@@ -442,9 +761,9 @@ def discover(args, samples=16384, candidates=6, seed=0):
             flush=True,
         )
         found = found[:candidates]
-        n_backup_target = min(2, max(0, int(candidates) - 1))
+        n_backup_target = max(0, min(3, int(candidates)) - len(fits))
         seeded_backups: list[tuple[np.ndarray, float, float]] = [
-            (np.asarray(stencil_fit["U"], dtype=np.float64), 1.0, 0.0)
+            (np.asarray(f_it["U"], dtype=np.float64), 1.0, 0.0) for f_it in fits
         ]
         n_backups_done = 0
         for item in found:
@@ -509,6 +828,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 flush=True,
             )
 
+    R_em_override = getattr(args, "_recovered_outer_R_runs", None)
     if pixel_em is not None and len(fits) > 0:
         # Coarse candidate EM reweighting:
         # E-step evaluates each candidate's (valid, dark, bright) pixel posteriors
@@ -518,6 +838,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
             pixel_em.evaluate_candidate(
                 fit["U"],
                 B,
+                R_runs=R_em_override,
                 radial_scale=float(fit["radial_scale"]),
                 axial_scale=float(fit.get("axial_scale", fit["radial_scale"])),
                 global_rot_vec=fit["global_rot_vec"],
@@ -580,6 +901,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 ev_ref = pixel_em.evaluate_candidate(
                     ref_k["U"],
                     B,
+                    R_runs=R_em_override,
                     radial_scale=float(ref_k["radial_scale"]),
                     axial_scale=float(ref_k.get("axial_scale", ref_k["radial_scale"])),
                     global_rot_vec=ref_k["global_rot_vec"],
@@ -688,6 +1010,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 ev_s = pixel_em.evaluate_candidate(
                     U,
                     B,
+                    R_runs=R_em_override,
                     radial_scale=r_sc_win,
                     axial_scale=a_sc_win,
                     global_rot_vec=geometry["global_rot_vec"],
