@@ -4,6 +4,50 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.7]
+
+### Added
+
+- 3-state Expectation-Maximization (`valid=0`, `dark=1`, `bright=2`) static
+  detector pixel classifier (`PixelEMClassifier`) integrated across blind band
+  discovery, staged band/Ewald refinement, and peak prediction:
+  - Identifies static dark regions (dead detector banks, cryostat/panel
+    shadows) via ambient-deficit and missing-predicted-reflection likelihoods
+    with nearest-valid EDT background fill, and static bright artifacts
+    (parasitic Al magnet/sample-environment flares, hot pixels) via a
+    crystallographic Wilson Bragg exponential model and multi-orientation
+    persistence across $N \ge 1$ goniometer frames.
+  - Reweights and M-step re-polishes coarse orientation candidates in
+    `blind_band`, updates per-stage observation weights and Ewald excess maps
+    in `scan_band` without JAX recompilation, persists
+    `detector/{mask_bank_ids,pixel_mask,pixel_class}` in `solve.h5`, and
+    filters masked reflections in `peak-predictor` while propagating the
+    `detector` mask group downstream.
+- Two-color translucent `Mask` overlay in Rainbow Zones (`subhkl-nova-app` and
+  `rainbow-visualize`) rendering classified `Dark` and `Bright` detector
+  regions on curvilinear warped panels (including browser-side `h5wasm` loading)
+  with sidebar pixel class percentages.
+
+### Changed
+
+- Auto-selected CLI `solve --refinement band` default binning (`binning=8` for
+  single/few-frame runs with $\le 240$ panel images, `binning=16` for larger
+  multi-run scans) and gated `blind_band` quadrature/table bins to
+  kinematically active $2\theta$ angles so coarse $d_{\min}$ single-frame
+  solves resolve closely spaced zones.
+- Vectorized multi-bank EM reflection projection and 2D grid-stencil splatting,
+  cached clean median backgrounds and module-level `@jax.jit` Ewald/omega scan
+  kernels, and concatenated active-bin `band_table` chunks on-device.
+
+### Fixed
+
+- Fixed post-solve `Files` drawer and `Mask` reload state in `subhkl-nova-app`
+  where `runningStageIdx` remained set during completion reload and hid newly
+  produced stage artifacts.
+- Fixed the upper-right `Tab` button inside `<iframe srcdoc>` views by hiding
+  it in standalone top-level tabs and resolving `window.parent.location.href`
+  when embedded in a host page.
+
 ## [1.5.6]
 
 ### Added
