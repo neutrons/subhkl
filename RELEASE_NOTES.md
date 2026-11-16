@@ -38,6 +38,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Vectorized multi-bank EM reflection projection and 2D grid-stencil splatting,
   cached clean median backgrounds and module-level `@jax.jit` Ewald/omega scan
   kernels, and concatenated active-bin `band_table` chunks on-device.
+- Accelerated `solve --refinement band` startup, blind band discovery, and EM
+  scoring on GPU, eliminated redundant per-run XLA recompilations, and resolved
+  CPU OOMs on dense raw-pixel `band_table` searches:
+  - Enabled persistent on-disk JAX compilation caching (`~/.cache/subhkl/jax`)
+    in `solve` (`enable_jax_compilation_cache`), hoisted nested
+    `refine_band_geometry` Adam/L-BFGS-B closures to module-level bucket-padded
+    `@jax.jit` kernels so observation arrays are passed dynamically rather than
+    baked as HLO constants, and decomposed `band_table` into fixed 2D
+    `[2048, <=16384]` dot/zone kernels with $S^2 \times (q_{\text{lo}},
+    q_{\text{hi}})$ quadrature coalescing for $>65\text{k}$-bin pixel clouds.
+  - Shared single-pass HDF5 slab loading (`load_binned_nexus_panels`) and
+    batched JAX GPU 2D `median`/`75th`-percentile background filters,
+    mask-cached EDT fill, and `jax.vmap` IEEE FP32 (`Precision.HIGHEST`)
+    multi-run reflection splatting across `load_observations` and
+    `PixelEMClassifier`, plus a `@jax.jit` $S^2$ outer-goniometer scan-axis
+    recovery sweep.
 - Added model-free outer-goniometer motor validation and recovery
   (`recover_unlogged_outer_goniometer`) for multi-run inner-axis scans where
   outer goniometer motors (for example `omega`, `kappa`) were omitted from raw

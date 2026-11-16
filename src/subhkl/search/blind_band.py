@@ -15,9 +15,63 @@ from subhkl.search.scan_band import band_sum, build_B_jax, direct_lattice_uvw
 from subhkl.search.spherical import (
     band_q_range,
     direct_lattice_vectors,
+    enable_jax_compilation_cache,
     lattice_ladder,
     refine_band_geometry,
 )
+
+_OUTER_GONIO_JITS = {}
+
+
+def _outer_gonio_grid_scorer():
+    """Compiled GPU/CPU scorer for the S^2 outer-goniometer scan-axis sweep."""
+    if "score_grid" in _OUTER_GONIO_JITS:
+        return _OUTER_GONIO_JITS["score_grid"]
+    enable_jax_compilation_cache()
+    import jax
+    import jax.numpy as jnp
+
+    @jax.jit
+    def _score_grid(
+        axes_s2, dirs_stack, w_stack, dphi_arr, pair_i, pair_j, n_pairs, inv_s2, cos_st
+    ):
+        # axes_s2: [M, 3], dirs_stack: [R, K, 3], w_stack: [R, K], dphi_arr: [R]
+        # Rodrigues rotation of dirs_stack[r] around axes_s2[m] by theta = -dphi_arr[r]
+        theta = -dphi_arr[None, :, None]  # [1, R, 1]
+        ct = jnp.cos(theta)[..., None]  # [1, R, 1, 1]
+        st = jnp.sin(theta)[..., None]  # [1, R, 1, 1]
+        a = axes_s2[:, None, None, :]  # [M, 1, 1, 3]
+        v = dirs_stack[None, :, :, :]  # [1, R, K, 3]
+        av = jnp.sum(a * v, axis=-1, keepdims=True)  # [M, R, K, 1]
+        axv = jnp.cross(a, v)  # [M, R, K, 3]
+        derot = ct * v + st * axv + (jnp.float32(1.0) - ct) * av * a  # [M, R, K, 3]
+
+        scores0 = jnp.zeros((axes_s2.shape[0],), dtype=jnp.float32)
+
+        def _pair_body(ip, sc):
+            i1 = pair_i[ip]
+            i2 = pair_j[ip]
+            raw_dots = jnp.matmul(
+                dirs_stack[i1], dirs_stack[i2].T, precision=jax.lax.Precision.HIGHEST
+            )
+            pmask = (raw_dots < cos_st).astype(jnp.float32) * (
+                w_stack[i1][:, None] * w_stack[i2][None, :]
+            )
+            dots = jnp.einsum(
+                "mni,mki->mnk",
+                derot[:, i1],
+                derot[:, i2],
+                precision=jax.lax.Precision.HIGHEST,
+            )
+            kern = jnp.exp(jnp.clip((dots - jnp.float32(1.0)) * inv_s2, -30.0, 0.0))
+            return sc + jnp.einsum(
+                "mnk,nk->m", kern, pmask, precision=jax.lax.Precision.HIGHEST
+            )
+
+        return jax.lax.fori_loop(0, n_pairs, _pair_body, scores0)
+
+    _OUTER_GONIO_JITS["score_grid"] = _score_grid
+    return _score_grid
 
 
 def sample_signed(weights, size, seed=0):
@@ -220,7 +274,6 @@ def recover_unlogged_outer_goniometer(args, observations, pixel_em=None):
     n_nom = calc_goniometer_rotation_matrix(axes[:scan_col], base_outer) @ u_scan
     n_nom = n_nom / max(float(np.linalg.norm(n_nom)), 1e-12)
 
-    axes_list = [n_nom]
     cfg_list = [tuple(float(base_outer[c]) for c in free_outer)]
     cos_dedup = float(np.cos(np.deg2rad(3.5)))
     if len(free_outer) == 1:
@@ -233,26 +286,29 @@ def recover_unlogged_outer_goniometer(args, observations, pixel_em=None):
             (float(v0), float(v1))
             for v0, v1 in np.array(np.meshgrid(g0, g1, indexing="ij")).reshape(2, -1).T
         ]
-    for cfg in raw_cfgs:
-        ao = base_outer.copy()
-        for idx_c, col_c in enumerate(free_outer):
-            ao[col_c] = cfg[idx_c]
-        nv = calc_goniometer_rotation_matrix(axes[:scan_col], ao) @ u_scan
-        nv = nv / max(float(np.linalg.norm(nv)), 1e-12)
-        if float(np.max(np.asarray(axes_list) @ nv)) < cos_dedup:
-            axes_list.append(nv)
-            cfg_list.append(cfg)
-    axes_s2 = np.asarray(axes_list, dtype=np.float64)
+    # Batch-evaluate outer motor configurations instead of 3,660 scalar calls
+    raw_arr = np.asarray(raw_cfgs, dtype=np.float64)
+    ao_batch = np.broadcast_to(base_outer, (len(raw_arr), scan_col)).copy()
+    for idx_c, col_c in enumerate(free_outer):
+        ao_batch[:, col_c] = raw_arr[:, idx_c]
+    nv_batch = np.broadcast_to(u_scan, (len(raw_arr), 3)).copy()
+    for col_m in range(scan_col - 1, -1, -1):
+        ax_m = axes[col_m, :3] * float(axes[col_m, 3])
+        ax_m = ax_m / max(float(np.linalg.norm(ax_m)), 1e-12)
+        rv_m = np.deg2rad(ao_batch[:, col_m])[:, None] * ax_m[None, :]
+        nv_batch = Rotation.from_rotvec(rv_m).apply(nv_batch)
+    nv_batch /= np.maximum(np.linalg.norm(nv_batch, axis=1, keepdims=True), 1e-12)
+    axes_arr = np.empty((len(raw_cfgs) + 1, 3), dtype=np.float64)
+    axes_arr[0] = n_nom
+    n_ax = 1
+    for icfg, nv in enumerate(nv_batch):
+        if float(np.max(axes_arr[:n_ax] @ nv)) < cos_dedup:
+            axes_arr[n_ax] = nv
+            cfg_list.append(raw_cfgs[icfg])
+            n_ax += 1
+    axes_s2 = axes_arr[:n_ax]
 
     dphi_rad = {r: np.deg2rad(phi_deg[r]) for r in usable_runs}
-    derot = {
-        r: np.einsum(
-            "mij,nj->mni",
-            Rotation.from_rotvec(-dphi_rad[r] * axes_s2).as_matrix(),
-            run_dirs[r],
-        )
-        for r in usable_runs
-    }
     inv_s2 = 1.0 / (np.deg2rad(0.9) ** 2)
     cos_static = float(np.cos(np.deg2rad(1.2)))
     pair_masks = {
@@ -260,14 +316,47 @@ def recover_unlogged_outer_goniometer(args, observations, pixel_em=None):
         * (run_w[r1][:, None] * run_w[r2][None, :])
         for r1, r2 in pairs
     }
-    scores = np.zeros(len(axes_s2), dtype=np.float64)
-    for r1, r2 in pairs:
-        dots = np.einsum("mni,mki->mnk", derot[r1], derot[r2])
-        scores += np.einsum(
-            "mnk,nk->m",
-            np.exp(np.clip((dots - 1.0) * inv_s2, -30.0, 0.0)),
-            pair_masks[(r1, r2)],
-        )
+
+    import jax.numpy as jnp
+
+    n_u = len(usable_runs)
+    r_to_u = {r: iu for iu, r in enumerate(usable_runs)}
+    r_bucket = int(((n_u + 7) // 8) * 8)
+    dirs_stack = np.zeros((r_bucket, 48, 3), dtype=np.float32)
+    dirs_stack[:, :, 0] = 1.0
+    w_stack = np.zeros((r_bucket, 48), dtype=np.float32)
+    dphi_arr = np.zeros((r_bucket,), dtype=np.float32)
+    for iu, r in enumerate(usable_runs):
+        kd = len(run_dirs[r])
+        dirs_stack[iu, :kd] = run_dirs[r].astype(np.float32)
+        w_stack[iu, :kd] = run_w[r].astype(np.float32)
+        dphi_arr[iu] = np.float32(dphi_rad[r])
+
+    m_bucket = int(((len(axes_s2) + 511) // 512) * 512)
+    axes_pad = np.zeros((m_bucket, 3), dtype=np.float32)
+    axes_pad[:, 0] = 1.0
+    axes_pad[: len(axes_s2)] = axes_s2.astype(np.float32)
+
+    p_bucket = int(((len(pairs) + 31) // 32) * 32)
+    pair_i_np = np.zeros((p_bucket,), dtype=np.int32)
+    pair_j_np = np.zeros((p_bucket,), dtype=np.int32)
+    for ip, (r1, r2) in enumerate(pairs):
+        pair_i_np[ip] = r_to_u[r1]
+        pair_j_np[ip] = r_to_u[r2]
+
+    grid_kern = _outer_gonio_grid_scorer()
+    scores_j = grid_kern(
+        jnp.asarray(axes_pad),
+        jnp.asarray(dirs_stack),
+        jnp.asarray(w_stack),
+        jnp.asarray(dphi_arr),
+        jnp.asarray(pair_i_np),
+        jnp.asarray(pair_j_np),
+        jnp.int32(len(pairs)),
+        jnp.float32(inv_s2),
+        jnp.float32(cos_static),
+    )
+    scores = np.asarray(scores_j, dtype=np.float64)[: len(axes_s2)]
 
     best_m = int(np.argmax(scores))
     score_nom = float(scores[0])

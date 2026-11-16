@@ -19,6 +19,7 @@ geometry refinement across N >= 1 goniometer frames:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import h5py
@@ -27,7 +28,6 @@ from scipy.ndimage import (
     binary_dilation,
     distance_transform_edt,
     median_filter,
-    percentile_filter,
     uniform_filter,
 )
 from scipy.spatial.transform import Rotation
@@ -35,6 +35,677 @@ from scipy.spatial.transform import Rotation
 from subhkl.config import beamlines
 from subhkl.core.crystallography import generate_reflections
 from subhkl.instrument.detector import Detector
+from subhkl.search.spherical import enable_jax_compilation_cache
+
+_PIXEL_EM_JITS: dict[str, Any] = {}
+
+
+def _pixel_em_kernels() -> dict[str, Any]:
+    """Lazily compiled JAX GPU/CPU kernels for 2D rank filters, HDF5 slab
+    binning/centroiding, and multi-run candidate reflection projection/splat."""
+    if _PIXEL_EM_JITS:
+        return _PIXEL_EM_JITS
+    enable_jax_compilation_cache()
+    import functools
+
+    import jax
+    import jax.numpy as jnp
+
+    def _patch_median_2d(stack_f32, size: int):
+        pad = size // 2
+        xp = jnp.pad(stack_f32, ((0, 0), (pad, pad), (pad, pad)), mode="edge")[
+            :, None, :, :
+        ]
+        patches = jax.lax.conv_general_dilated_patches(
+            xp,
+            filter_shape=(size, size),
+            window_strides=(1, 1),
+            padding="VALID",
+        )
+        return jnp.median(patches, axis=1)
+
+    @functools.partial(jax.jit, static_argnames=("size",))
+    def batch_median_2d(stack_f32, size: int):
+        return _patch_median_2d(stack_f32, size)
+
+    @functools.partial(jax.jit, static_argnames=("win",))
+    def batch_pct75_2d(stack_f32, win: int):
+        pad = win // 2
+        xp = jnp.pad(stack_f32, ((0, 0), (pad, pad), (pad, pad)), mode="edge")[
+            :, None, :, :
+        ]
+        patches = jax.lax.conv_general_dilated_patches(
+            xp,
+            filter_shape=(win, win),
+            window_strides=(1, 1),
+            padding="VALID",
+        )
+        idx = int(0.75 * (win * win))
+        return jnp.sort(patches, axis=1)[:, idx]
+
+    @functools.partial(jax.jit, static_argnames=("b", "bw", "b_sub"))
+    def slab_bin_stats(
+        slab_raw_f32,
+        slab_ext_mask,
+        rows_bin_f32,
+        cols_bin_f32,
+        rr_0_f32,
+        cc_0_f32,
+        b: int,
+        bw: int,
+        b_sub: int,
+    ):
+        s_len, n_rows, n_cols = slab_raw_f32.shape
+        hb = n_rows // b
+        wb = n_cols // b
+        valid_orig = jnp.isfinite(slab_raw_f32) & (slab_raw_f32 >= 0.0) & slab_ext_mask
+        valid = valid_orig
+        raw = slab_raw_f32
+        if bw > 0 and n_rows > 4 * max(b, bw) and n_cols > 4 * max(b, bw):
+            raw = jnp.pad(
+                raw[:, bw:-bw, bw:-bw],
+                ((0, 0), (bw, bw), (bw, bw)),
+                mode="edge",
+            )
+            if bw >= b:
+                cut = (bw // b) * b
+                valid = valid.at[:, :cut, :].set(False)
+                valid = valid.at[:, -cut:, :].set(False)
+                valid = valid.at[:, :, :cut].set(False)
+                valid = valid.at[:, :, -cut:].set(False)
+        clean = jnp.where(valid, raw, jnp.float32(0.0))
+        raw_blocks = clean.reshape(s_len, hb, b, wb, b)
+        y = raw_blocks.sum(axis=(2, 4))
+        good = valid.reshape(s_len, hb, b, wb, b).all(axis=(2, 4))
+        bg_5 = _patch_median_2d(y, 5)
+        bg_7 = _patch_median_2d(y, 7)
+        bg_safe = jnp.maximum(bg_5, jnp.float32(1.0))
+        y_safe = jnp.maximum(y, bg_safe)
+        dev_bin = jnp.where(
+            y > bg_safe,
+            jnp.float32(2.0)
+            * (y_safe * jnp.log(y_safe / bg_safe) - (y_safe - bg_safe)),
+            jnp.float32(0.0),
+        )
+        excess_sq = (
+            jnp.maximum(
+                raw_blocks - (bg_5 / jnp.float32(b * b))[:, :, None, :, None],
+                jnp.float32(0.0),
+            )
+            ** 2
+        )
+        excess_sum = excess_sq.sum(axis=(2, 4))
+        has_pos = (y.max(axis=(1, 2), keepdims=True) > 0.0) & (excess_sum > 0.0)
+        denom = jnp.maximum(excess_sum, jnp.float32(1e-12))
+        rr = jnp.where(
+            has_pos,
+            (excess_sq * rows_bin_f32[None]).sum(axis=(2, 4)) / denom,
+            rr_0_f32[None],
+        )
+        cc = jnp.where(
+            has_pos,
+            (excess_sq * cols_bin_f32[None]).sum(axis=(2, 4)) / denom,
+            cc_0_f32[None],
+        )
+        k_sub = b // b_sub
+        if k_sub > 1:
+            hs = n_rows // b_sub
+            ws = n_cols // b_sub
+            y_sub = clean.reshape(s_len, hs, b_sub, ws, b_sub).sum(axis=(2, 4))
+            bg_sub = _patch_median_2d(y_sub, 7)
+            bgs_safe = jnp.maximum(bg_sub, jnp.float32(1.0))
+            ys_safe = jnp.maximum(y_sub, bgs_safe)
+            d_pois = jnp.where(
+                y_sub > bgs_safe,
+                jnp.float32(2.0)
+                * (ys_safe * jnp.log(ys_safe / bgs_safe) - (ys_safe - bgs_safe)),
+                jnp.float32(0.0),
+            )
+            d_sub = d_pois / (
+                jnp.float32(1.0)
+                + jnp.float32(0.09 * 0.09) * jnp.maximum(bg_sub, jnp.float32(0.0))
+            )
+            sub_peak = jnp.where(
+                y.max(axis=(1, 2), keepdims=True) > 0.0,
+                d_sub.reshape(s_len, hb, k_sub, wb, k_sub).max(axis=(2, 4)),
+                jnp.float32(0.0),
+            )
+        else:
+            sub_peak = jnp.zeros((1, 1, 1), dtype=jnp.float32)
+        return valid_orig, y, good, bg_5, bg_7, dev_bin, rr, cc, sub_peak
+
+    @functools.partial(
+        jax.jit,
+        static_argnames=("hb", "wb", "k_bank", "r_sten", "dual_mode"),
+    )
+    def splat_runs_vmap(
+        hkl_chunks,
+        valid_chunks,
+        n_active_chunks,
+        UB,
+        q_core_max,
+        only_d_min,
+        R_all,
+        pres_all,
+        rr_all,
+        cc_all,
+        cen_b,
+        uh_b,
+        vh_b,
+        nh_b,
+        mid_b,
+        half_diag_b,
+        scale_r,
+        scale_c,
+        n_max_b,
+        m_max_b,
+        s_samp,
+        wl_lo_em,
+        wl_hi_em,
+        wl_lo_core,
+        wl_hi_core,
+        sig_core,
+        sig_hi,
+        sig_tight,
+        b_f,
+        hb: int,
+        wb: int,
+        k_bank: int,
+        r_sten: int,
+        dual_mode: bool,
+    ):
+        hp = jax.lax.Precision.HIGHEST
+        n_banks = cen_b.shape[0]
+        n_tot = n_banks * hb * wb
+        ki = jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
+
+        md2_core = (jnp.float32(3.5) * sig_core) ** 2
+        md2_hi = (jnp.float32(3.5) * sig_hi) ** 2
+        i2s_core = jnp.float32(0.5) / jnp.maximum(
+            sig_core * sig_core, jnp.float32(1e-6)
+        )
+        i2s_hi = jnp.float32(0.5) / jnp.maximum(sig_hi * sig_hi, jnp.float32(1e-6))
+        md2_t = (jnp.float32(3.5) * sig_tight) ** 2
+        i2s_t = jnp.float32(0.5) / jnp.maximum(sig_tight * sig_tight, jnp.float32(1e-6))
+
+        side = 2 * r_sten + 1
+        n_sten = side * side
+
+        def one_run(Rr, pres, rr_flat, cc_flat):
+            RUB_T = jnp.matmul(Rr, UB, precision=hp).T
+            xs = jnp.matmul(Rr, s_samp, precision=hp)
+            c_eff = cen_b - xs[None, :]
+            mid_eff = mid_b - xs[None, :]
+            mid_dist = jnp.maximum(jnp.linalg.norm(mid_eff, axis=1), jnp.float32(1e-6))
+            mid_hat = mid_eff / mid_dist[:, None]
+            cos_cone = jnp.cos(
+                jnp.minimum(
+                    jnp.arctan2(half_diag_b, mid_dist) + jnp.float32(0.08),
+                    jnp.float32(np.pi),
+                )
+            )
+            num_b = jnp.einsum("bi,bi->b", c_eff, nh_b, precision=hp)
+
+            M_flat0 = jnp.zeros((n_tot,), dtype=jnp.float32)
+            Mt_flat0 = (
+                jnp.zeros((n_tot,), dtype=jnp.float32)
+                if dual_mode
+                else jnp.zeros((1,), dtype=jnp.float32)
+            )
+
+            def body_chunk(ic, carry_m):
+                M_f, Mt_f = carry_m
+                G_lab = jnp.matmul(hkl_chunks[ic], RUB_T, precision=hp)
+                g2 = jnp.sum(G_lab * G_lab, axis=1)
+                gn = jnp.sqrt(jnp.maximum(g2, jnp.float32(0.0)))
+                core_c = (gn > jnp.float32(1e-7)) & (gn <= q_core_max)
+                active_c = valid_chunks[ic] & jnp.where(
+                    only_d_min, core_c, jnp.bool_(True)
+                )
+                lam = (
+                    jnp.float32(-2.0)
+                    * G_lab[:, 2]
+                    / jnp.maximum(g2, jnp.float32(1e-12))
+                )
+                m_wl = (
+                    active_c
+                    & (g2 > jnp.float32(1e-12))
+                    & (lam >= wl_lo_em)
+                    & (lam <= wl_hi_em)
+                )
+
+                kfp = ki[None, :] + lam[:, None] * G_lab
+                kfp = kfp / jnp.maximum(
+                    jnp.linalg.norm(kfp, axis=1, keepdims=True), jnp.float32(1e-12)
+                )
+
+                dn = jnp.matmul(kfp, nh_b.T, precision=hp)
+                dots_mid = jnp.matmul(kfp, mid_hat.T, precision=hp)
+                cone_ok = (
+                    m_wl[:, None]
+                    & pres[None, :]
+                    & ((dn * num_b[None, :]) > jnp.float32(1e-9))
+                    & (dots_mid >= cos_cone[None, :])
+                )
+                score_b = jnp.where(cone_ok, dots_mid, jnp.float32(-2.0))
+                top_sc, top_bi = jax.lax.top_k(score_b, k_bank)
+                cand_ok = top_sc > jnp.float32(-1.5)
+
+                dn_c = jnp.take_along_axis(dn, top_bi, axis=1)
+                t_ray = num_b[top_bi] / jnp.where(
+                    jnp.abs(dn_c) > jnp.float32(1e-9), dn_c, jnp.float32(1.0)
+                )
+                ph = t_ray[:, :, None] * kfp[:, None, :] - c_eff[top_bi]
+                pr = jnp.sum(ph * vh_b[top_bi], axis=-1) * scale_r[top_bi]
+                pc = jnp.sum(ph * uh_b[top_bi], axis=-1) * scale_c[top_bi]
+                ok = (
+                    cand_ok
+                    & (t_ray > 0.0)
+                    & (pr >= -b_f)
+                    & (pr <= n_max_b[top_bi] + b_f)
+                    & (pc >= -b_f)
+                    & (pc <= m_max_b[top_bi] + b_f)
+                )
+
+                ok_flat = ok.reshape(-1)
+                bi_flat = top_bi.reshape(-1)
+                pr_flat = pr.reshape(-1)
+                pc_flat = pc.reshape(-1)
+                core_use = jnp.where(only_d_min, jnp.bool_(True), core_c)
+                core_flat = jnp.broadcast_to(core_use[:, None], ok.shape).reshape(-1)
+                lam_flat = jnp.broadcast_to(lam[:, None], ok.shape).reshape(-1)
+
+                md2_flat = jnp.where(core_flat, md2_core, md2_hi)
+                i2s_flat = jnp.where(core_flat, i2s_core, i2s_hi)
+                ok_t_flat = (
+                    ok_flat
+                    & core_flat
+                    & (lam_flat >= wl_lo_core)
+                    & (lam_flat <= wl_hi_core)
+                )
+
+                br0 = jnp.floor(pr_flat / b_f).astype(jnp.int32)
+                bc0 = jnp.floor(pc_flat / b_f).astype(jnp.int32)
+
+                def body_sten(ist, cm):
+                    Mf, Mtf = cm
+                    dr = (ist // side) - r_sten
+                    dc = (ist % side) - r_sten
+                    br_t = br0 + dr
+                    bc_t = bc0 + dc
+                    in_g = (
+                        ok_flat & (br_t >= 0) & (br_t < hb) & (bc_t >= 0) & (bc_t < wb)
+                    )
+                    g_idx = bi_flat * (hb * wb) + br_t * wb + bc_t
+                    r_idx = jnp.where(in_g, g_idx, 0)
+                    d_r = pr_flat - rr_flat[r_idx]
+                    d_c = pc_flat - cc_flat[r_idx]
+                    d2 = d_r * d_r + d_c * d_c
+                    w_m = in_g & (d2 <= md2_flat)
+                    s_idx = jnp.where(w_m, g_idx, n_tot)
+                    v = jnp.where(w_m, jnp.exp(-d2 * i2s_flat), jnp.float32(0.0))
+                    Mf = Mf.at[s_idx].max(v, mode="drop")
+                    if dual_mode:
+                        w_t = in_g & ok_t_flat & (d2 <= md2_t)
+                        st_idx = jnp.where(w_t, g_idx, n_tot)
+                        vt = jnp.where(w_t, jnp.exp(-d2 * i2s_t), jnp.float32(0.0))
+                        Mtf = Mtf.at[st_idx].max(vt, mode="drop")
+                    return Mf, Mtf
+
+                return jax.lax.fori_loop(0, n_sten, body_sten, (M_f, Mt_f))
+
+            Mf_run, Mtf_run = jax.lax.fori_loop(
+                0, n_active_chunks, body_chunk, (M_flat0, Mt_flat0)
+            )
+            return (
+                Mf_run.reshape(n_banks, hb, wb),
+                Mtf_run.reshape(n_banks, hb, wb) if dual_mode else Mtf_run,
+            )
+
+        return jax.vmap(one_run)(R_all, pres_all, rr_all, cc_all)
+
+    _PIXEL_EM_JITS.update(
+        batch_median_2d=batch_median_2d,
+        batch_pct75_2d=batch_pct75_2d,
+        slab_bin_stats=slab_bin_stats,
+        splat_runs_vmap=splat_runs_vmap,
+    )
+    return _PIXEL_EM_JITS
+
+
+def _run_batch_median_2d(stack: np.ndarray, size: int) -> np.ndarray:
+    """Evaluate 2D nearest-edge median filter over [N, H, W] stack on GPU/JAX."""
+    import jax.numpy as jnp
+
+    n = len(stack)
+    if n == 0:
+        return stack.copy()
+    kern = _pixel_em_kernels()["batch_median_2d"]
+    st_f32 = np.asarray(stack, dtype=np.float32)
+    slab = 16 if n <= 16 else (64 if n <= 64 else 256)
+    outs = []
+    for i0 in range(0, n, slab):
+        ch = st_f32[i0 : i0 + slab]
+        clen = len(ch)
+        if clen < slab:
+            ch = np.concatenate([ch, np.repeat(ch[:1], slab - clen, axis=0)], axis=0)
+        res = np.asarray(kern(jnp.asarray(ch), int(size)), dtype=np.float64)
+        outs.append(res[:clen])
+    return np.concatenate(outs, axis=0) if len(outs) > 1 else outs[0]
+
+
+def _run_batch_pct75_2d(stack: np.ndarray, win: int) -> np.ndarray:
+    """Evaluate 2D nearest-edge 75th-percentile filter over [N, H, W] stack."""
+    import jax.numpy as jnp
+
+    n = len(stack)
+    if n == 0:
+        return stack.copy()
+    kern = _pixel_em_kernels()["batch_pct75_2d"]
+    st_f32 = np.asarray(stack, dtype=np.float32)
+    slab = 16 if n <= 16 else 64
+    outs = []
+    for i0 in range(0, n, slab):
+        ch = st_f32[i0 : i0 + slab]
+        clen = len(ch)
+        if clen < slab:
+            ch = np.concatenate([ch, np.repeat(ch[:1], slab - clen, axis=0)], axis=0)
+        res = np.asarray(kern(jnp.asarray(ch), int(win)), dtype=np.float64)
+        outs.append(res[:clen])
+    return np.concatenate(outs, axis=0) if len(outs) > 1 else outs[0]
+
+
+def _batch_inpainted_median_bg(
+    keys: list[tuple[int, int]],
+    y_rb: dict[tuple[int, int], np.ndarray],
+    dark_masks: dict[tuple[int, int], np.ndarray],
+    bright_masks: dict[tuple[int, int], np.ndarray] | None,
+    size: int,
+    bg_raw_rb: dict[tuple[int, int], np.ndarray],
+) -> dict[tuple[int, int], np.ndarray]:
+    """Batched GPU equivalent of ``inpainted_median_bg`` across ``(r, bk)`` panels,
+    deduplicating ``distance_transform_edt`` across runs sharing identical masks."""
+    bg_dark: dict[tuple[int, int], np.ndarray] = {}
+    edt_cache: dict[bytes, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _edt_fill(arr2d: np.ndarray, invalid_mask: np.ndarray) -> np.ndarray:
+        mbytes = invalid_mask.tobytes()
+        idxs = edt_cache.get(mbytes)
+        if idxs is None:
+            _, idxs_raw = distance_transform_edt(invalid_mask, return_indices=True)
+            idxs = (idxs_raw[0], idxs_raw[1])
+            edt_cache[mbytes] = idxs
+        return arr2d[idxs[0], idxs[1]]
+
+    d_keys: list[tuple[int, int]] = []
+    d_filled: list[np.ndarray] = []
+    for k in keys:
+        y = y_rb[k]
+        dm = dark_masks[k]
+        if not np.any(dm):
+            bg_dark[k] = bg_raw_rb[k]
+        elif np.all(dm):
+            bg_dark[k] = np.maximum(bg_raw_rb[k], 0.0)
+        else:
+            d_keys.append(k)
+            d_filled.append(_edt_fill(y, dm))
+
+    if d_keys:
+        med_d = _run_batch_median_2d(np.stack(d_filled, axis=0), size)
+        for idx_k, k in enumerate(d_keys):
+            bg_dark[k] = np.maximum(bg_raw_rb[k], med_d[idx_k])
+
+    if bright_masks is None:
+        return bg_dark
+
+    out: dict[tuple[int, int], np.ndarray] = {}
+    b_keys: list[tuple[int, int]] = []
+    b_filled: list[np.ndarray] = []
+    for k in keys:
+        bm = bright_masks.get(k)
+        if bm is None or not np.any(bm):
+            out[k] = bg_dark[k]
+            continue
+        dm = dark_masks[k]
+        invalid_both = dm | bm
+        if np.all(invalid_both):
+            out[k] = np.zeros_like(y_rb[k])
+        else:
+            y_cd = np.where(dm, bg_dark[k], y_rb[k])
+            b_keys.append(k)
+            b_filled.append(_edt_fill(y_cd, invalid_both))
+
+    if b_keys:
+        med_b = _run_batch_median_2d(np.stack(b_filled, axis=0), size)
+        for idx_k, k in enumerate(b_keys):
+            out[k] = med_b[idx_k]
+    return out
+
+
+def load_binned_nexus_panels(
+    nexus_path: str | Path,
+    *,
+    sel_runs: list[int],
+    binning: int,
+    border_width: int = 4,
+    static_mask_file: str | Path | None = None,
+    strict_mask_check: bool = False,
+) -> dict[str, Any] | None:
+    """Single-pass HDF5 slab reader + batched JAX GPU binning/median/centroiding
+    shared between ``scan_refine.load_observations`` and ``PixelEMClassifier``."""
+    import jax.numpy as jnp
+
+    from subhkl.scan_refine import (
+        _frame_offsets,
+        _frame_rotations_and_scan_axes,
+    )
+
+    b = int(binning)
+    bw = int(border_width)
+    sel_set = {int(r) for r in sel_runs}
+    b_sub = 4 if (b >= 4 and b % 4 == 0) else (2 if (b >= 2 and b % 2 == 0) else 1)
+    k_sub = b // b_sub
+
+    with h5py.File(nexus_path, "r") as f:
+        if "images" not in f or "bank_ids" not in f:
+            return None
+        img_shape = f["images"].shape
+        n_frames, n_rows, n_cols = (
+            int(img_shape[0]),
+            int(img_shape[1]),
+            int(img_shape[2]),
+        )
+        if n_rows % b or n_cols % b:
+            if strict_mask_check:
+                raise ValueError(
+                    f"band binning ({b}) must divide the detector size ({n_rows}x{n_cols})"
+                )
+            return None
+        offsets = _frame_offsets(f, n_frames)
+        R_frames, _, angles, _, scan_axes_lab = _frame_rotations_and_scan_axes(
+            f, n_frames
+        )
+        if angles is None:
+            angles = np.zeros((n_frames, 1), dtype=np.float64)
+        frame_banks = np.asarray(f["bank_ids"], int)
+        run_ids = np.searchsorted(offsets, np.arange(n_frames), side="right") - 1
+
+        sel_indices = np.flatnonzero(np.isin(run_ids, list(sel_set)))
+        n_sel = len(sel_indices)
+
+        hb, wb = n_rows // b, n_cols // b
+        centers_r = np.arange(hb, dtype=np.float32) * b + np.float32((b - 1) / 2.0)
+        centers_c = np.arange(wb, dtype=np.float32) * b + np.float32((b - 1) / 2.0)
+        rr_0, cc_0 = np.meshgrid(centers_r, centers_c, indexing="ij")
+        rows_full, cols_full = np.meshgrid(
+            np.arange(n_rows, dtype=np.float32),
+            np.arange(n_cols, dtype=np.float32),
+            indexing="ij",
+        )
+        rows_bin_j = jnp.asarray(rows_full.reshape(hb, b, wb, b))
+        cols_bin_j = jnp.asarray(cols_full.reshape(hb, b, wb, b))
+        rr_0_j = jnp.asarray(rr_0)
+        cc_0_j = jnp.asarray(cc_0)
+
+        ext_mask_by_bank: dict[int, np.ndarray] = {}
+        if static_mask_file:
+            with h5py.File(static_mask_file, "r") as mf:
+                m_key = "masks" if "masks" in mf else "images"
+                m_ids = np.asarray(mf["bank_ids"][()])
+                for bk_u in np.unique(frame_banks[sel_indices]):
+                    matches = np.flatnonzero(m_ids == bk_u)
+                    if len(matches) != 1:
+                        if strict_mask_check:
+                            raise ValueError("mask must have one entry per bank")
+                        continue
+                    ext_mask_by_bank[int(bk_u)] = np.asarray(
+                        mf[m_key][matches[0]], dtype=bool
+                    )
+
+        slab_kern = _pixel_em_kernels()["slab_bin_stats"]
+        slab_sz = 8 if n_sel <= 8 else (32 if n_sel <= 32 else 64)
+
+        y_frames = np.empty((n_sel, hb, wb), dtype=np.float64)
+        good_frames = np.empty((n_sel, hb, wb), dtype=bool)
+        bg5_frames = np.empty((n_sel, hb, wb), dtype=np.float64)
+        bg7_frames = np.empty((n_sel, hb, wb), dtype=np.float64)
+        dev_frames = np.empty((n_sel, hb, wb), dtype=np.float64)
+        rr_frames = np.empty((n_sel, hb, wb), dtype=np.float64)
+        cc_frames = np.empty((n_sel, hb, wb), dtype=np.float64)
+        sub_frames = np.empty((n_sel, hb, wb), dtype=np.float64) if k_sub > 1 else None
+        bad_px_bank: dict[int, np.ndarray] = {}
+
+        # Read contiguous HDF5 slices and process in fixed-shape GPU slabs
+        raw_buf = np.zeros((slab_sz, n_rows, n_cols), dtype=np.float32)
+        msk_buf = np.ones((slab_sz, n_rows, n_cols), dtype=bool)
+        pos = 0
+        while pos < n_sel:
+            end = min(pos + slab_sz, n_sel)
+            cnt = end - pos
+            idx_chunk = sel_indices[pos:end]
+            # Fast contiguous read when indices are contiguous in the HDF5 dataset
+            if cnt > 1 and (idx_chunk[-1] - idx_chunk[0] == cnt - 1):
+                raw_buf[:cnt] = np.asarray(
+                    f["images"][int(idx_chunk[0]) : int(idx_chunk[-1]) + 1],
+                    dtype=np.float32,
+                )
+            else:
+                for loc_i, fi in enumerate(idx_chunk):
+                    raw_buf[loc_i] = np.asarray(f["images"][int(fi)], dtype=np.float32)
+            if cnt < slab_sz:
+                raw_buf[cnt:] = 0.0
+            if ext_mask_by_bank:
+                msk_buf[:] = True
+                for loc_i, fi in enumerate(idx_chunk):
+                    bk_i = int(frame_banks[fi])
+                    if bk_i in ext_mask_by_bank:
+                        msk_buf[loc_i] = ext_mask_by_bank[bk_i]
+            else:
+                msk_buf[:] = True
+
+            (
+                valid_orig_j,
+                y_j,
+                good_j,
+                bg5_j,
+                bg7_j,
+                dev_j,
+                rr_j,
+                cc_j,
+                sub_j,
+            ) = slab_kern(
+                jnp.asarray(raw_buf),
+                jnp.asarray(msk_buf),
+                rows_bin_j,
+                cols_bin_j,
+                rr_0_j,
+                cc_0_j,
+                b=b,
+                bw=bw,
+                b_sub=b_sub,
+            )
+            valid_orig_np = np.asarray(valid_orig_j[:cnt], dtype=bool)
+            y_frames[pos:end] = np.asarray(y_j[:cnt], dtype=np.float64)
+            good_frames[pos:end] = np.asarray(good_j[:cnt], dtype=bool)
+            bg5_frames[pos:end] = np.asarray(bg5_j[:cnt], dtype=np.float64)
+            bg7_frames[pos:end] = np.asarray(bg7_j[:cnt], dtype=np.float64)
+            dev_frames[pos:end] = np.asarray(dev_j[:cnt], dtype=np.float64)
+            rr_frames[pos:end] = np.asarray(rr_j[:cnt], dtype=np.float64)
+            cc_frames[pos:end] = np.asarray(cc_j[:cnt], dtype=np.float64)
+            if sub_frames is not None:
+                sub_frames[pos:end] = np.asarray(sub_j[:cnt], dtype=np.float64)
+            for loc_i, fi in enumerate(idx_chunk):
+                bk_i = int(frame_banks[fi])
+                inv_px = ~valid_orig_np[loc_i]
+                if bk_i not in bad_px_bank:
+                    bad_px_bank[bk_i] = inv_px.copy()
+                else:
+                    bad_px_bank[bk_i] |= inv_px
+            pos = end
+
+    y_rb: dict[tuple[int, int], np.ndarray] = {}
+    good_rb: dict[tuple[int, int], np.ndarray] = {}
+    rr_rb: dict[tuple[int, int], np.ndarray] = {}
+    cc_rb: dict[tuple[int, int], np.ndarray] = {}
+    bg5_clean: dict[tuple[int, int], np.ndarray] = {}
+    bg7_clean: dict[tuple[int, int], np.ndarray] = {}
+    sub_peak_dev_rb: dict[tuple[int, int], np.ndarray] = {}
+    R_by_run: dict[int, np.ndarray] = {}
+    obs_banks_set: set[int] = set()
+
+    for k, fi in enumerate(sel_indices):
+        r = int(run_ids[fi])
+        bk = int(frame_banks[fi])
+        obs_banks_set.add(bk)
+        if r not in R_by_run:
+            R_by_run[r] = np.asarray(R_frames[fi], dtype=np.float64)
+        y_rb[(r, bk)] = y_frames[k]
+        good_rb[(r, bk)] = good_frames[k]
+        rr_rb[(r, bk)] = rr_frames[k]
+        cc_rb[(r, bk)] = cc_frames[k]
+        bg5_clean[(r, bk)] = bg5_frames[k]
+        bg7_clean[(r, bk)] = bg7_frames[k]
+        if sub_frames is not None:
+            sub_peak_dev_rb[(r, bk)] = sub_frames[k]
+
+    mask_resolved = str(Path(static_mask_file).resolve()) if static_mask_file else None
+    cache_key = (
+        str(Path(nexus_path).resolve()),
+        b,
+        bw,
+        tuple(sorted(sel_set)),
+        mask_resolved,
+    )
+    return {
+        "key": cache_key,
+        "n_frames": n_frames,
+        "n_rows": n_rows,
+        "n_cols": n_cols,
+        "binning": b,
+        "border_width": bw,
+        "sel_indices": sel_indices,
+        "frame_banks_sel": frame_banks[sel_indices],
+        "run_ids_sel": run_ids[sel_indices],
+        "angles_sel": angles[sel_indices],
+        "R_frames_sel": R_frames[sel_indices],
+        "scan_axes_sel": scan_axes_lab[sel_indices],
+        "y_frames": y_frames,
+        "good_frames": good_frames,
+        "bg7_frames": bg7_frames,
+        "dev_frames": dev_frames,
+        "rr_frames": rr_frames,
+        "cc_frames": cc_frames,
+        "obs_banks": sorted(obs_banks_set),
+        "y_rb": y_rb,
+        "good_rb": good_rb,
+        "rr_rb": rr_rb,
+        "cc_rb": cc_rb,
+        "bg5_clean": bg5_clean,
+        "bg7_clean": bg7_clean,
+        "sub_peak_dev_rb": sub_peak_dev_rb,
+        "bad_px_bank": bad_px_bank,
+        "R_by_run": R_by_run,
+    }
 
 
 def masked_median_bg(
@@ -196,6 +867,8 @@ class PixelEMClassifier:
         wavelength: tuple[float, float],
         d_min: float,
         sub_peak_dev_rb: dict[tuple[int, int], np.ndarray] | None = None,
+        bg5_clean: dict[tuple[int, int], np.ndarray] | None = None,
+        bg7_clean: dict[tuple[int, int], np.ndarray] | None = None,
     ) -> None:
         self.instrument = str(instrument)
         self.n_rows = int(n_rows)
@@ -318,12 +991,21 @@ class PixelEMClassifier:
         }
 
         # Masked background residuals & cached clean median filters per (r, bk)
-        self._bg5_clean: dict[tuple[int, int], np.ndarray] = {
-            k: median_filter(y, size=5, mode="nearest") for k, y in self.y_rb.items()
-        }
-        self._bg7_clean: dict[tuple[int, int], np.ndarray] = {
-            k: median_filter(y, size=7, mode="nearest") for k, y in self.y_rb.items()
-        }
+        if bg5_clean is not None and bg7_clean is not None:
+            self._bg5_clean = bg5_clean
+            self._bg7_clean = bg7_clean
+        else:
+            keys_all = list(self.y_rb.keys())
+            if keys_all:
+                y_stack = np.stack([self.y_rb[k] for k in keys_all], axis=0)
+                m5 = _run_batch_median_2d(y_stack, 5)
+                m7 = _run_batch_median_2d(y_stack, 7)
+                self._bg5_clean = {k: m5[i] for i, k in enumerate(keys_all)}
+                self._bg7_clean = {k: m7[i] for i, k in enumerate(keys_all)}
+            else:
+                self._bg5_clean = {}
+                self._bg7_clean = {}
+        self._gpu_splat_cache: dict[str, Any] | None = None
         self._bg7_cur: dict[tuple[int, int], np.ndarray] = {}
         self._last_masks_bank: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         self.raw_dev_rb: dict[tuple[int, int], np.ndarray] = {}
@@ -337,7 +1019,10 @@ class PixelEMClassifier:
     def from_args(cls, args: Any) -> PixelEMClassifier | None:
         """Build classifier from ``run_scan_refinement`` / ``discover`` args.
 
-        Returns ``None`` in peak-finder mode or if image frames are absent.
+        Reuses ``args._prebinned_panel_cache`` when populated by
+        ``load_observations`` so HDF5 frames and 2D median filters are never
+        computed twice. Returns ``None`` in peak-finder mode or if image frames
+        are absent.
         """
         if getattr(args, "finder", None):
             return None
@@ -345,14 +1030,10 @@ class PixelEMClassifier:
         if not nexus_path:
             return None
 
-        from subhkl.scan_refine import (
-            _frame_offsets,
-            _frame_rotations_and_scan_axes,
-        )
-
         b = int(getattr(args, "binning", 8))
         bw = int(getattr(args, "border_width", 4))
         sel_runs = [int(r) for r in getattr(args, "runs", [0])]
+        mask_path = getattr(args, "static_mask_file", None)
         wl_raw = getattr(
             args,
             "assign_wavelength",
@@ -360,175 +1041,56 @@ class PixelEMClassifier:
         )
         wavelength = (float(wl_raw[0]), float(wl_raw[1]))
 
-        with h5py.File(nexus_path, "r") as f:
-            if "images" not in f or "bank_ids" not in f:
-                return None
-            img_shape = f["images"].shape
-            n_frames, n_rows, n_cols = (
-                int(img_shape[0]),
-                int(img_shape[1]),
-                int(img_shape[2]),
+        expected_key = (
+            str(Path(nexus_path).resolve()),
+            b,
+            bw,
+            tuple(sorted({int(r) for r in sel_runs})),
+            str(Path(mask_path).resolve()) if mask_path else None,
+        )
+        cached = getattr(args, "_prebinned_panel_cache", None)
+        if isinstance(cached, dict) and cached.get("key") == expected_key:
+            data = cached
+        else:
+            data = load_binned_nexus_panels(
+                nexus_path,
+                sel_runs=sel_runs,
+                binning=b,
+                border_width=bw,
+                static_mask_file=mask_path,
+                strict_mask_check=False,
             )
-            if n_rows % b or n_cols % b:
-                return None
-            offsets = _frame_offsets(f, n_frames)
-            R_frames, _, _, _, _ = _frame_rotations_and_scan_axes(f, n_frames)
-            frame_banks = np.asarray(f["bank_ids"], int)
-            run_ids = np.searchsorted(offsets, np.arange(n_frames), side="right") - 1
+            if data is not None:
+                with np.errstate(all="ignore"):
+                    try:
+                        args._prebinned_panel_cache = data
+                    except AttributeError:
+                        pass
 
-            hb, wb = n_rows // b, n_cols // b
-            centers_r = np.arange(hb) * b + (b - 1) / 2.0
-            centers_c = np.arange(wb) * b + (b - 1) / 2.0
-            rr_0, cc_0 = np.meshgrid(centers_r, centers_c, indexing="ij")
-            rows_full, cols_full = np.meshgrid(
-                np.arange(n_rows, dtype=np.float64),
-                np.arange(n_cols, dtype=np.float64),
-                indexing="ij",
-            )
-            rows_bin = rows_full.reshape(hb, b, wb, b)
-            cols_bin = cols_full.reshape(hb, b, wb, b)
-
-            y_rb: dict[tuple[int, int], np.ndarray] = {}
-            good_rb: dict[tuple[int, int], np.ndarray] = {}
-            rr_rb: dict[tuple[int, int], np.ndarray] = {}
-            cc_rb: dict[tuple[int, int], np.ndarray] = {}
-            sub_peak_dev_rb: dict[tuple[int, int], np.ndarray] = {}
-            bad_px_bank: dict[int, np.ndarray] = {}
-            R_by_run: dict[int, np.ndarray] = {}
-            obs_banks_set: set[int] = set()
-            b_sub = (
-                4 if (b >= 4 and b % 4 == 0) else (2 if (b >= 2 and b % 2 == 0) else 1)
-            )
-            k_sub = b // b_sub
-            hs, ws = n_rows // b_sub, n_cols // b_sub
-
-            mask_path = getattr(args, "static_mask_file", None)
-            mask_file = h5py.File(mask_path, "r") if mask_path else None
-            try:
-                sel_set = set(sel_runs)
-                mask_ids = None
-                mask_key = None
-                if mask_file is not None:
-                    mask_key = "masks" if "masks" in mask_file else "images"
-                    mask_ids = mask_file["bank_ids"][()]
-                slab_sz = 64
-                for s0 in range(0, n_frames, slab_sz):
-                    s1 = min(s0 + slab_sz, n_frames)
-                    if not any(int(run_ids[j]) in sel_set for j in range(s0, s1)):
-                        continue
-                    slab = np.asarray(f["images"][s0:s1], dtype=np.float32)
-                    for i in range(s0, s1):
-                        r = int(run_ids[i])
-                        if r not in sel_set:
-                            continue
-                        bk = int(frame_banks[i])
-                        obs_banks_set.add(bk)
-                        if r not in R_by_run:
-                            R_by_run[r] = np.asarray(R_frames[i], dtype=np.float64)
-                        raw_f32 = slab[i - s0]
-                        valid = np.isfinite(raw_f32) & (raw_f32 >= 0.0)
-                        if mask_file is not None and mask_ids is not None:
-                            matches = np.flatnonzero(mask_ids == bk)
-                            if len(matches) == 1:
-                                valid &= np.asarray(
-                                    mask_file[mask_key][matches[0]], dtype=bool
-                                )
-                        if bk not in bad_px_bank:
-                            bad_px_bank[bk] = ~valid
-                        else:
-                            bad_px_bank[bk] |= ~valid
-                        if (
-                            bw > 0
-                            and n_rows > 4 * max(b, bw)
-                            and n_cols > 4 * max(b, bw)
-                        ):
-                            raw_f32 = np.pad(raw_f32[bw:-bw, bw:-bw], bw, mode="edge")
-                            if bw >= b:
-                                cut = (bw // b) * b
-                                valid[:cut, :] = False
-                                valid[-cut:, :] = False
-                                valid[:, :cut] = False
-                                valid[:, -cut:] = False
-                        clean_f32 = np.where(valid, raw_f32, np.float32(0.0))
-                        raw_blocks = clean_f32.reshape(hb, b, wb, b)
-                        y = raw_blocks.sum((1, 3), dtype=np.float64)
-                        good = valid.reshape(hb, b, wb, b).all((1, 3))
-                        if float(y.max()) > 0.0:
-                            bg_5_init = median_filter(
-                                y.astype(np.float32), size=5, mode="nearest"
-                            )
-                            excess_sq = (
-                                np.maximum(
-                                    raw_blocks
-                                    - (bg_5_init / np.float32(b * b))[:, None, :, None],
-                                    0.0,
-                                ).astype(np.float64)
-                                ** 2
-                            )
-                            excess_sum = excess_sq.sum((1, 3))
-                            rr = np.where(
-                                excess_sum > 0.0,
-                                (excess_sq * rows_bin).sum((1, 3))
-                                / np.maximum(excess_sum, 1e-12),
-                                rr_0,
-                            )
-                            cc = np.where(
-                                excess_sum > 0.0,
-                                (excess_sq * cols_bin).sum((1, 3))
-                                / np.maximum(excess_sum, 1e-12),
-                                cc_0,
-                            )
-                        else:
-                            rr = rr_0.copy()
-                            cc = cc_0.copy()
-                        y_rb[(r, bk)] = y
-                        good_rb[(r, bk)] = good
-                        rr_rb[(r, bk)] = rr
-                        cc_rb[(r, bk)] = cc
-                        if k_sub > 1:
-                            if float(y.max()) > 0.0:
-                                y_sub = clean_f32.reshape(hs, b_sub, ws, b_sub).sum(
-                                    (1, 3), dtype=np.float32
-                                )
-                                bg_sub = median_filter(y_sub, size=7, mode="nearest")
-                                d_sub = overdispersed_upward_deviance(
-                                    y_sub.astype(np.float64),
-                                    bg_sub.astype(np.float64),
-                                    rel_sigma=0.09,
-                                )
-                                sub_peak_dev_rb[(r, bk)] = d_sub.reshape(
-                                    hb, k_sub, wb, k_sub
-                                ).max((1, 3))
-                            else:
-                                sub_peak_dev_rb[(r, bk)] = np.zeros(
-                                    (hb, wb), dtype=np.float64
-                                )
-            finally:
-                if mask_file is not None:
-                    mask_file.close()
-
-        if not obs_banks_set:
+        if data is None or not data["obs_banks"]:
             return None
 
         return cls(
             instrument=args.instrument,
-            n_rows=n_rows,
-            n_cols=n_cols,
+            n_rows=data["n_rows"],
+            n_cols=data["n_cols"],
             binning=b,
             border_width=bw,
             sel_runs=sel_runs,
-            obs_banks=sorted(obs_banks_set),
-            y_rb=y_rb,
-            good_rb=good_rb,
-            rr_rb=rr_rb,
-            cc_rb=cc_rb,
-            bad_px_bank=bad_px_bank,
-            R_by_run=R_by_run,
+            obs_banks=data["obs_banks"],
+            y_rb=data["y_rb"],
+            good_rb=data["good_rb"],
+            rr_rb=data["rr_rb"],
+            cc_rb=data["cc_rb"],
+            bad_px_bank=data["bad_px_bank"],
+            R_by_run=data["R_by_run"],
             cell=list(args.cell),
             space_group=args.space_group,
             wavelength=wavelength,
             d_min=float(args.d_min),
-            sub_peak_dev_rb=sub_peak_dev_rb,
+            sub_peak_dev_rb=data["sub_peak_dev_rb"],
+            bg5_clean=data["bg5_clean"],
+            bg7_clean=data["bg7_clean"],
         )
 
     def _compute_prior(self) -> None:
@@ -536,7 +1098,11 @@ class PixelEMClassifier:
         # Minimum ambient counts per bin (~0.4 counts/px on an 8x8 bin) required
         # before pure ambient deficit alone can flag shadows/dead panels.
         min_ambient_bin = max(25.0, 0.35 * (self.b * self.b))
+        win = max(5, min(21, (min(self.hb, self.wb) // 3) | 1))
 
+        active_bks: list[int] = []
+        yh_ints: list[np.ndarray] = []
+        a_pans: list[float] = []
         for bk in self.obs_banks:
             yh = self.y_hi[bk]
             if self.A_det < min_ambient_bin:
@@ -569,52 +1135,62 @@ class PixelEMClassifier:
                 yh_int[:, 0] = np.minimum(yh_int[:, 0], yh_int[:, 1])
                 yh_int[:, -1] = np.minimum(yh_int[:, -1], yh_int[:, -2])
             q75_int = float(np.percentile(yh_int, 75.0))
-            A_pan = max(q75_int, 0.25 * self.A_det)
-            win = max(5, min(21, (min(self.hb, self.wb) // 3) | 1))
-            env = np.maximum(
-                percentile_filter(yh_int, percentile=75.0, size=win, mode="nearest"),
-                0.80 * A_pan,
-            )
-            floor_0 = 0.50 * env
-            def_dev = np.zeros((self.hb, self.wb), dtype=np.float64)
-            for r in self.sel_runs:
-                if (r, bk) not in self.y_rb:
-                    continue
-                yt = self.y_rb[(r, bk)]
-                mu = np.maximum(floor_0 * self.exp_scale[r], 1.0)
-                ys = np.maximum(yt, 1e-6)
-                def_dev += np.where(
-                    yt < mu, 2.0 * (mu - yt + yt * np.log(ys / mu)), 0.0
+            active_bks.append(bk)
+            yh_ints.append(yh_int)
+            a_pans.append(max(q75_int, 0.25 * self.A_det))
+
+        if active_bks:
+            pct75_stack = _run_batch_pct75_2d(np.stack(yh_ints, axis=0), win)
+            for idx_b, bk in enumerate(active_bks):
+                env = np.maximum(pct75_stack[idx_b], 0.80 * a_pans[idx_b])
+                floor_0 = 0.50 * env
+                def_dev = np.zeros((self.hb, self.wb), dtype=np.float64)
+                for r in self.sel_runs:
+                    if (r, bk) not in self.y_rb:
+                        continue
+                    yt = self.y_rb[(r, bk)]
+                    mu = np.maximum(floor_0 * self.exp_scale[r], 1.0)
+                    ys = np.maximum(yt, 1e-6)
+                    def_dev += np.where(
+                        yt < mu, 2.0 * (mu - yt + yt * np.log(ys / mu)), 0.0
+                    )
+                def_cap = np.minimum(def_dev, 80.0)
+                def_smooth = uniform_filter(def_cap, size=3, mode="nearest")
+                eff_def = np.where(
+                    def_dev > 1.0,
+                    np.maximum(def_dev, 0.5 * def_dev + 0.5 * def_smooth),
+                    0.0,
                 )
-            def_cap = np.minimum(def_dev, 80.0)
-            def_smooth = uniform_filter(def_cap, size=3, mode="nearest")
-            eff_def = np.where(
-                def_dev > 1.0,
-                np.maximum(def_dev, 0.5 * def_dev + 0.5 * def_smooth),
-                0.0,
-            )
-            lo_dark = np.clip(0.25 * eff_def - 9.0, -25.0, 25.0)
-            self.log_odds_dark_prior[bk] = lo_dark
-            self.gamma_dark_prior[bk] = 1.0 / (1.0 + np.exp(-lo_dark))
+                lo_dark = np.clip(0.25 * eff_def - 9.0, -25.0, 25.0)
+                self.log_odds_dark_prior[bk] = lo_dark
+                self.gamma_dark_prior[bk] = 1.0 / (1.0 + np.exp(-lo_dark))
 
         self.gamma_dark = {bk: v.copy() for bk, v in self.gamma_dark_prior.items()}
 
         # Precompute immutable static-bright outlier deviance per (r, bk) once
+        bdev_keys: list[tuple[int, int]] = []
+        bdev_dmasks: dict[tuple[int, int], np.ndarray] = {}
         for (r, bk), y in self.y_rb.items():
             gd0 = self.gamma_dark_prior[bk]
             if np.all(gd0 > 0.85):
                 self.bright_dev_rb[(r, bk)] = np.zeros_like(y)
                 continue
-            dark_mask0 = (gd0 > 0.5) | (~self.good_rb[(r, bk)])
-            bg_5_0 = inpainted_median_bg(
-                y, dark_mask0, None, size=5, bg_raw=self._bg5_clean[(r, bk)]
+            bdev_keys.append((r, bk))
+            bdev_dmasks[(r, bk)] = (gd0 > 0.5) | (~self.good_rb[(r, bk)])
+
+        if bdev_keys:
+            bg5_map = _batch_inpainted_median_bg(
+                bdev_keys, self.y_rb, bdev_dmasks, None, 5, self._bg5_clean
             )
-            d_bin0 = overdispersed_upward_deviance(y, bg_5_0, rel_sigma=0.09)
-            if (r, bk) in self.sub_peak_dev_rb:
-                d_sub0 = np.where(dark_mask0, 0.0, self.sub_peak_dev_rb[(r, bk)])
-                self.bright_dev_rb[(r, bk)] = np.maximum(d_bin0, 0.65 * d_sub0)
-            else:
-                self.bright_dev_rb[(r, bk)] = d_bin0
+            for key in bdev_keys:
+                y = self.y_rb[key]
+                dm0 = bdev_dmasks[key]
+                d_bin0 = overdispersed_upward_deviance(y, bg5_map[key], rel_sigma=0.09)
+                if key in self.sub_peak_dev_rb:
+                    d_sub0 = np.where(dm0, 0.0, self.sub_peak_dev_rb[key])
+                    self.bright_dev_rb[key] = np.maximum(d_bin0, 0.65 * d_sub0)
+                else:
+                    self.bright_dev_rb[key] = d_bin0
 
         # First pass of dark-masked residuals so shadow cliffs cannot mimic static bright
         self._recompute_residuals()
@@ -665,10 +1241,14 @@ class PixelEMClassifier:
 
     def _recompute_residuals(self) -> None:
         """Recompute local background, signed excess, and upward deviance."""
+        dirty_keys: list[tuple[int, int]] = []
+        dirty_dmasks: dict[tuple[int, int], np.ndarray] = {}
+        dirty_bmasks: dict[tuple[int, int], np.ndarray] = {}
+        live_keys: list[tuple[int, int]] = []
+
         for bk in self.obs_banks:
             gd = self.gamma_dark[bk]
             gb = self.gamma_bright[bk]
-            gv = self.gamma_valid[bk]
             all_dead = bool(np.all(gd > 0.85))
             d_mask_b = gd > 0.5
             b_mask_b = gb >= 0.5
@@ -693,27 +1273,31 @@ class PixelEMClassifier:
                     self.dev_rb[key] = z
                     self.weight_rb[key] = z
                     continue
+                live_keys.append(key)
                 if not masks_same or key not in self.raw_dev_rb:
-                    dark_mask = d_mask_b | (~self.good_rb[key])
-                    bg_7 = inpainted_median_bg(
-                        y,
-                        dark_mask,
-                        b_mask_b,
-                        size=7,
-                        bg_raw=self._bg7_clean[key],
-                    )
-                    bg_5 = inpainted_median_bg(
-                        y,
-                        dark_mask,
-                        b_mask_b,
-                        size=5,
-                        bg_raw=self._bg5_clean[key],
-                    )
-                    self._bg7_cur[key] = bg_7
-                    self.raw_dev_rb[key] = poisson_upward_deviance(y, bg_5)
-                dev_raw = self.raw_dev_rb[key]
-                self.dev_rb[key] = np.where(gd > 0.85, 0.0, dev_raw)
-                self.weight_rb[key] = (y - self._bg7_cur[key]) * gv
+                    dirty_keys.append(key)
+                    dirty_dmasks[key] = d_mask_b | (~self.good_rb[key])
+                    dirty_bmasks[key] = b_mask_b
+
+        if dirty_keys:
+            bg7_map = _batch_inpainted_median_bg(
+                dirty_keys, self.y_rb, dirty_dmasks, dirty_bmasks, 7, self._bg7_clean
+            )
+            bg5_map = _batch_inpainted_median_bg(
+                dirty_keys, self.y_rb, dirty_dmasks, dirty_bmasks, 5, self._bg5_clean
+            )
+            for key in dirty_keys:
+                self._bg7_cur[key] = bg7_map[key]
+                self.raw_dev_rb[key] = poisson_upward_deviance(
+                    self.y_rb[key], bg5_map[key]
+                )
+
+        for key in live_keys:
+            _, bk = key
+            gd = self.gamma_dark[bk]
+            gv = self.gamma_valid[bk]
+            self.dev_rb[key] = np.where(gd > 0.85, 0.0, self.raw_dev_rb[key])
+            self.weight_rb[key] = (self.y_rb[key] - self._bg7_cur[key]) * gv
 
     def raw_unweighted_deviance(self, r: int, bk: int) -> np.ndarray:
         """Dark/bright-inpainted upward deviance before multiplying by gamma_valid."""
@@ -947,7 +1531,191 @@ class PixelEMClassifier:
             m_max_b,
         )
 
+    def _ensure_gpu_splat_cache(self) -> dict[str, Any]:
+        if self._gpu_splat_cache is not None:
+            return self._gpu_splat_cache
+        import jax.numpy as jnp
+
+        c_sz = 16384
+        n_hkl = len(self._hkl_em)
+        n_act = max(1, (n_hkl + c_sz - 1) // c_sz)
+        if n_act <= 1:
+            n_cap = 1
+        elif n_act <= 4:
+            n_cap = 4
+        elif n_act <= 8:
+            n_cap = 8
+        elif n_act <= 18:
+            n_cap = 18
+        else:
+            n_cap = n_act
+        tot_len = n_cap * c_sz
+        hkl_pad = np.zeros((tot_len, 3), dtype=np.float32)
+        val_pad = np.zeros((tot_len,), dtype=bool)
+        if n_hkl > 0:
+            hkl_pad[:n_hkl] = self._hkl_em.astype(np.float32)
+            val_pad[:n_hkl] = True
+
+        active_runs = [r for r in self.sel_runs if np.any(self._present_run[r])]
+        if active_runs:
+            r_def = np.stack(
+                [
+                    np.asarray(self.R_by_run.get(r, np.eye(3)), dtype=np.float32)
+                    for r in active_runs
+                ],
+                axis=0,
+            )
+            pres_a = np.stack([self._present_run[r] for r in active_runs], axis=0)
+            rr_a = np.stack(
+                [self._rr_run[r].ravel().astype(np.float32) for r in active_runs],
+                axis=0,
+            )
+            cc_a = np.stack(
+                [self._cc_run[r].ravel().astype(np.float32) for r in active_runs],
+                axis=0,
+            )
+            self._gpu_splat_cache = {
+                "active_runs": active_runs,
+                "n_active_chunks": jnp.int32(n_act if n_hkl > 0 else 0),
+                "hkl_chunks_j": jnp.asarray(hkl_pad.reshape(n_cap, c_sz, 3)),
+                "val_chunks_j": jnp.asarray(val_pad.reshape(n_cap, c_sz)),
+                "R_def_j": jnp.asarray(r_def),
+                "pres_j": jnp.asarray(pres_a),
+                "rr_j": jnp.asarray(rr_a),
+                "cc_j": jnp.asarray(cc_a),
+            }
+        else:
+            self._gpu_splat_cache = {"active_runs": []}
+        return self._gpu_splat_cache
+
     def _project_and_splat(
+        self,
+        U: np.ndarray,
+        B: np.ndarray,
+        *,
+        R_runs: dict[int, np.ndarray] | None = None,
+        panel_cal: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, float, float]]
+        | None = None,
+        radial_scale: float = 0.0,
+        axial_scale: float | None = None,
+        global_rot_vec: np.ndarray | None = None,
+        global_trans_m: np.ndarray | None = None,
+        sample_shift_m: np.ndarray | None = None,
+        match_sigma_px: float = 5.0,
+        only_d_min: bool = False,
+        dual_tight_sigma_px: float | None = None,
+    ) -> (
+        dict[tuple[int, int], np.ndarray]
+        | tuple[dict[tuple[int, int], np.ndarray], dict[tuple[int, int], np.ndarray]]
+    ):
+        import jax.numpy as jnp
+
+        M_out: dict[tuple[int, int], np.ndarray] = {}
+        M_tight_out: dict[tuple[int, int], np.ndarray] = {}
+        dual_mode = dual_tight_sigma_px is not None
+        if not self.obs_banks or not self.sel_runs:
+            return (M_out, M_tight_out) if dual_mode else M_out
+
+        cache = self._ensure_gpu_splat_cache()
+        active_runs: list[int] = cache["active_runs"]
+        if not active_runs or len(self._hkl_em) == 0:
+            for r in active_runs:
+                pres = self._present_run[r]
+                for bi, bk in enumerate(self.obs_banks):
+                    if pres[bi]:
+                        z = np.zeros((self.hb, self.wb), dtype=np.float64)
+                        M_out[(r, bk)] = z
+                        if dual_mode:
+                            M_tight_out[(r, bk)] = z
+            return (M_out, M_tight_out) if dual_mode else M_out
+
+        UB = (np.asarray(U, dtype=np.float64) @ np.asarray(B, dtype=np.float64)).astype(
+            np.float32
+        )
+        wl_pad = 0.05 if not only_d_min else 0.0
+        wl_lo_em = max(0.1, self.wavelength[0] - wl_pad)
+        wl_hi_em = self.wavelength[1] + wl_pad
+        wl_lo_core = self.wavelength[0]
+        wl_hi_core = self.wavelength[1]
+        sig_core = float(match_sigma_px)
+        sig_hi = min(sig_core, 3.2)
+        sig_tight = float(dual_tight_sigma_px) if dual_mode else sig_core
+        max_sig = max(sig_core, sig_tight)
+        r_sten = int(np.ceil(3.5 * max_sig / self.b)) + 1
+        k_bank = min(6, len(self.obs_banks))
+
+        s_samp = (
+            np.asarray(sample_shift_m, dtype=np.float32)
+            if sample_shift_m is not None
+            else np.zeros(3, dtype=np.float32)
+        )
+        b_arrs = self._build_bank_arrays(
+            panel_cal, radial_scale, axial_scale, global_rot_vec, global_trans_m
+        )
+        b_arrs_j = [jnp.asarray(a.astype(np.float32)) for a in b_arrs]
+
+        if R_runs is None:
+            R_all_j = cache["R_def_j"]
+        else:
+            R_all_j = jnp.asarray(
+                np.stack(
+                    [
+                        np.asarray(
+                            R_runs[r]
+                            if r in R_runs
+                            else self.R_by_run.get(r, np.eye(3)),
+                            dtype=np.float32,
+                        )
+                        for r in active_runs
+                    ],
+                    axis=0,
+                )
+            )
+
+        splat_kern = _pixel_em_kernels()["splat_runs_vmap"]
+        M_j, Mt_j = splat_kern(
+            cache["hkl_chunks_j"],
+            cache["val_chunks_j"],
+            cache["n_active_chunks"],
+            jnp.asarray(UB),
+            jnp.float32(1.0 / self.d_min + 1e-7),
+            jnp.bool_(only_d_min),
+            R_all_j,
+            cache["pres_j"],
+            cache["rr_j"],
+            cache["cc_j"],
+            *b_arrs_j,
+            jnp.asarray(s_samp),
+            jnp.float32(wl_lo_em),
+            jnp.float32(wl_hi_em),
+            jnp.float32(wl_lo_core),
+            jnp.float32(wl_hi_core),
+            jnp.float32(sig_core),
+            jnp.float32(sig_hi),
+            jnp.float32(sig_tight),
+            jnp.float32(self.b),
+            hb=self.hb,
+            wb=self.wb,
+            k_bank=k_bank,
+            r_sten=r_sten,
+            dual_mode=dual_mode,
+        )
+        M_np = np.asarray(M_j, dtype=np.float64)
+        Mt_np = np.asarray(Mt_j, dtype=np.float64) if dual_mode else None
+
+        for ir, r in enumerate(active_runs):
+            pres = self._present_run[r]
+            for bi, bk in enumerate(self.obs_banks):
+                if pres[bi]:
+                    M_out[(r, bk)] = M_np[ir, bi]
+                    if dual_mode and Mt_np is not None:
+                        M_tight_out[(r, bk)] = Mt_np[ir, bi]
+
+        if dual_mode:
+            return M_out, M_tight_out
+        return M_out
+
+    def _project_and_splat_cpu(
         self,
         U: np.ndarray,
         B: np.ndarray,
