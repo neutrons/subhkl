@@ -2404,9 +2404,14 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
         )
         assert proc.returncode == 0, proc.stderr
 
-        # Extract and execute stageStopwatchMeta + formatStopwatchParts in Node
+        # Extract and execute stageStopwatchMeta + formatStopwatchParts + getCompletionStopwatchQuip in Node
         m_meta = re.search(
             r"const SHORT_STAGE_STOPWATCH_LABELS\s*=.*?function stageStopwatchMeta\(stageIdOrIdx\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_quip = re.search(
+            r"function getCompletionStopwatchQuip\(stageId, finalStatus, elapsedMs\)\s*\{.*?\n  \}",
             js_src,
             flags=re.DOTALL,
         )
@@ -2415,16 +2420,21 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
             js_src,
             flags=re.DOTALL,
         )
-        assert m_meta and m_fmt
+        assert m_meta and m_quip and m_fmt
+        assert "flashStopwatchQuip" in js_src
         eval_script = (
+            f'const UI_MODE = "{mode}";\n'
             f"const PIPELINE = {json.dumps(payload['pipeline_stages'])};\n"
             f"{m_meta.group(0)}\n"
+            f"{m_quip.group(0)}\n"
             f"{m_fmt.group(0)}\n"
             "console.log(JSON.stringify({"
             "labels: [0, 1, 2, 3].map(i => stageStopwatchMeta(i).label),"
             "z: formatStopwatchParts(0).full,"
             "s: formatStopwatchParts(55984).full,"
-            "m: formatStopwatchParts(125007).full"
+            "m: formatStopwatchParts(125007).full,"
+            'qFast: getCompletionStopwatchQuip("reduce", "done", 3200),'
+            'qSolve: getCompletionStopwatchQuip("solve", "done", 55984)'
             "}));\n"
         )
         res = subprocess.run(
@@ -2443,6 +2453,12 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
         assert out["z"] == "00:00.000"
         assert out["s"] == "00:55.984"
         assert out["m"] == "02:05.007"
+        if mode == "arcade":
+            assert out["qFast"] == "SPEED BONUS!"
+            assert out["qSolve"] == "STAGE CLEAR!"
+        else:
+            assert out["qFast"] == ""
+            assert out["qSolve"] == ""
 
     # Verify backend per-step millisecond timing lifecycle on NovaGalaxyPipelineRunner
     runner = NovaGalaxyPipelineRunner()

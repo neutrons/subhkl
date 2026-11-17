@@ -4661,6 +4661,25 @@ def render_rainbow_html(
     opacity: 0.82;
   }}
 
+  @keyframes swQuipBlink {{
+    0% {{ opacity: 0.35; transform: translateY(1px); }}
+    18% {{ opacity: 1; transform: translateY(0); }}
+    34% {{ opacity: 0.45; }}
+    52% {{ opacity: 1; }}
+    100% {{ opacity: 1; }}
+  }}
+
+  .stdio-stopwatch.sw-quip-flash {{
+    border-color: rgba(244, 114, 182, 0.90);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 11px rgba(244, 114, 182, 0.35);
+  }}
+
+  .stdio-stopwatch.sw-quip-flash .sw-stage {{
+    color: #fbbf24;
+    text-shadow: 0 0 8px rgba(251, 191, 36, 0.45);
+    animation: swQuipBlink 0.55s ease-out 1;
+  }}
+
   .stdio-stopwatch.sw-running {{
     color: #f8fafc;
     animation: swNeonPulse 1.8s ease-in-out infinite;
@@ -5870,6 +5889,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const stopwatchStageEl = document.getElementById("stdio-stopwatch-stage");
   const stopwatchTimeEl = document.getElementById("stdio-stopwatch-time");
   let lastStopwatchRenderKey = "";
+  const stopwatchFlash = {{ text: "", untilPerf: 0, timerId: null }};
 
   const SHORT_STAGE_STOPWATCH_LABELS = {{
     reduce: "1. REDUCE",
@@ -5877,6 +5897,38 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     integrate: "3. INTEGRATE",
     merge: "4. MERGE",
   }};
+
+  function getCompletionStopwatchQuip(stageId, finalStatus, elapsedMs) {{
+    if (UI_MODE === "pro") return "";
+    const sec = (Number(elapsedMs) || 0) / 1000;
+    if (finalStatus === "done") {{
+      if (sec < 8) return "SPEED BONUS!";
+      if (sec < 60) return "STAGE CLEAR!";
+      if (sec < 180) return stageId === "solve" ? "NICE SOLVE!" : "ALL CLEAR!";
+      return "FINALLY!";
+    }}
+    if (finalStatus === "stopped") return "ABORTED!";
+    if (finalStatus === "error") return "UH-OH!";
+    return "";
+  }}
+
+  function flashStopwatchQuip(text, durationMs = 1900) {{
+    if (UI_MODE === "pro" || !text) return;
+    if (stopwatchFlash.timerId) {{
+      clearTimeout(stopwatchFlash.timerId);
+      stopwatchFlash.timerId = null;
+    }}
+    stopwatchFlash.text = String(text);
+    stopwatchFlash.untilPerf = performance.now() + Math.max(400, Number(durationMs) || 1900);
+    renderStepStopwatch(true);
+    stopwatchFlash.timerId = setTimeout(() => {{
+      stopwatchFlash.timerId = null;
+      if (performance.now() >= stopwatchFlash.untilPerf) {{
+        stopwatchFlash.text = "";
+      }}
+      renderStepStopwatch(true);
+    }}, Math.max(400, Number(durationMs) || 1900) + 30);
+  }}
 
   function stageStopwatchMeta(stageIdOrIdx) {{
     let st = null;
@@ -5989,6 +6041,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         stageText = meta.label;
         status = ent.status;
         elapsedMs = getEntryLiveMs(ent, nowPerf);
+        if (status === "running" && UI_MODE !== "pro") {{
+          const mMask = ent.milestoneMask || 0;
+          if (elapsedMs >= 30000 && elapsedMs < 32000 && !(mMask & 1)) {{
+            ent.milestoneMask = mMask | 1;
+            flashStopwatchQuip("WARMING UP!", 1600);
+          }} else if (elapsedMs >= 60000 && elapsedMs < 62000 && !(mMask & 2)) {{
+            ent.milestoneMask = mMask | 2;
+            flashStopwatchQuip("HURRY UP!", 1800);
+          }} else if (elapsedMs >= 120000 && elapsedMs < 122000 && !(mMask & 4)) {{
+            ent.milestoneMask = mMask | 4;
+            flashStopwatchQuip("STILL AT IT!", 1800);
+          }}
+        }}
       }} else {{
         const anyRecorded = Object.values(state.stepTimings).some(e => e && e.status !== "idle");
         stageText = anyRecorded ? meta.label : "READY";
@@ -5997,13 +6062,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
     }}
 
+    const isFlashing = Boolean(stopwatchFlash.text) && nowPerf < stopwatchFlash.untilPerf;
+    if (!isFlashing && stopwatchFlash.text) {{
+      stopwatchFlash.text = "";
+    }}
+    const shownStageText = isFlashing ? stopwatchFlash.text : stageText;
     const parts = formatStopwatchParts(elapsedMs);
-    const renderKey = `${{status}}|${{stageText}}|${{parts.full}}`;
+    const renderKey = `${{status}}|${{isFlashing ? "1" : "0"}}|${{shownStageText}}|${{parts.full}}`;
     if (!force && renderKey === lastStopwatchRenderKey) return;
     lastStopwatchRenderKey = renderKey;
 
-    stopwatchEl.className = `stdio-stopwatch sw-${{status}}`;
-    stopwatchStageEl.textContent = stageText;
+    stopwatchEl.className = `stdio-stopwatch sw-${{status}}${{isFlashing ? " sw-quip-flash" : ""}}`;
+    stopwatchStageEl.textContent = shownStageText;
     stopwatchTimeEl.innerHTML = `${{parts.mmss}}<span class="sw-ms">${{parts.dotMs}}</span>`;
     if (force || status !== "running" || (parts.clamped % 500) < 25) {{
       stopwatchEl.title = buildStopwatchTooltip(nowPerf);
@@ -6019,6 +6089,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ent.status = "stopped";
       }}
     }});
+    const initMask = (baseMs >= 30000 ? 1 : 0) | (baseMs >= 60000 ? 2 : 0) | (baseMs >= 120000 ? 4 : 0);
     state.stepTimings[meta.stageId] = {{
       stageId: meta.stageId,
       label: meta.label,
@@ -6026,9 +6097,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       startPerfMs: performance.now(),
       baseElapsedMs: baseMs,
       elapsedMs: baseMs,
+      milestoneMask: initMask,
     }};
     state.stopwatchInspectKey = meta.stageId;
-    renderStepStopwatch(true);
+    if (baseMs < 500) {{
+      flashStopwatchQuip("HERE WE GO!", 1400);
+    }} else {{
+      renderStepStopwatch(true);
+    }}
   }}
 
   function finishStepStopwatch(stageIdOrIdx, finalStatus = "done", exactElapsedMs = null) {{
@@ -6045,9 +6121,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       startPerfMs: 0,
       baseElapsedMs: resolvedMs,
       elapsedMs: resolvedMs,
+      milestoneMask: 7,
     }};
     state.stopwatchInspectKey = meta.stageId;
-    renderStepStopwatch(true);
+    const quip = getCompletionStopwatchQuip(meta.stageId, finalStatus, resolvedMs);
+    if (quip) {{
+      flashStopwatchQuip(quip, 2100);
+    }} else {{
+      renderStepStopwatch(true);
+    }}
   }}
 
   function hydrateStepTimingsFromServer(doc) {{
@@ -6104,6 +6186,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   if (stopwatchEl) {{
     stopwatchEl.addEventListener("click", () => {{
       if (activeRunningStageId()) return;
+      if (stopwatchFlash.timerId) {{
+        clearTimeout(stopwatchFlash.timerId);
+        stopwatchFlash.timerId = null;
+      }}
+      stopwatchFlash.text = "";
+      stopwatchFlash.untilPerf = 0;
       const keys = (PIPELINE.length > 0 ? PIPELINE.map(p => p.stage_id) : ["reduce", "solve", "integrate", "merge"]);
       const recorded = keys.filter(k => state.stepTimings[k] && state.stepTimings[k].status !== "idle");
       const cycle = recorded.length >= 2 ? [...keys, "__total__"] : keys;
