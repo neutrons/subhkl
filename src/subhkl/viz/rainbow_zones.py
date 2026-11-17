@@ -4580,24 +4580,88 @@ def render_rainbow_html(
     margin: 0;
   }}
 
-  @keyframes swRainbowCycle {{
-    0%   {{ stroke: #ff3b6b; }}
-    17%  {{ stroke: #ff922b; }}
-    33%  {{ stroke: #ffd43b; }}
-    50%  {{ stroke: #38d9a9; }}
-    67%  {{ stroke: #38bdf8; }}
-    83%  {{ stroke: #c084fc; }}
-    100% {{ stroke: #ff3b6b; }}
+  @keyframes swRainbowShoot {{
+    0% {{
+      stroke-dashoffset: 100;
+      opacity: 0;
+    }}
+    3% {{
+      stroke-dashoffset: 95;
+      opacity: 1;
+    }}
+    44%, 72% {{
+      stroke-dashoffset: 0;
+      opacity: 1;
+    }}
+    96% {{
+      stroke-dashoffset: -95;
+      opacity: 0.85;
+    }}
+    99%, 100% {{
+      stroke-dashoffset: -100;
+      opacity: 0;
+    }}
   }}
 
-  @keyframes swRainbowFloat {{
+  @keyframes swRainbow8BitGlow {{
     0%, 100% {{
-      transform: translateY(0px);
-      filter: saturate(1.18) drop-shadow(0 0 2.5px rgba(244, 114, 182, 0.48));
+      filter: saturate(1.15) drop-shadow(0 0 2.2px rgba(244, 114, 182, 0.45));
     }}
     50% {{
-      transform: translateY(-0.6px);
-      filter: saturate(1.22) drop-shadow(0 0 3.2px rgba(56, 189, 248, 0.55));
+      filter: saturate(1.30) brightness(1.10) drop-shadow(0 0 3.0px rgba(56, 189, 248, 0.55));
+    }}
+  }}
+
+  @keyframes swRainbowTipSparkle {{
+    0% {{
+      opacity: 0;
+      transform: translate(1.94px, 10.6px) scale(0.3);
+    }}
+    3% {{
+      opacity: 0.92;
+      transform: translate(2.55px, 9.4px) scale(0.72);
+    }}
+    11% {{
+      opacity: 1;
+      transform: translate(5.96px, 5.73px) scale(0.85);
+    }}
+    22% {{
+      opacity: 1;
+      transform: translate(12.0px, 3.9px) scale(0.95);
+    }}
+    33% {{
+      opacity: 1;
+      transform: translate(18.04px, 5.73px) scale(0.85);
+    }}
+    44% {{
+      opacity: 0.9;
+      transform: translate(22.06px, 10.6px) scale(0.75);
+    }}
+    47%, 100% {{
+      opacity: 0;
+      transform: translate(22.06px, 10.6px) scale(0.2);
+    }}
+  }}
+
+  @keyframes swRainbowFormOnce {{
+    0% {{
+      stroke-dashoffset: 100;
+      opacity: 0.4;
+    }}
+    100% {{
+      stroke-dashoffset: 0;
+      opacity: 1;
+    }}
+  }}
+
+  @keyframes swStarTwinkle {{
+    0%, 100% {{
+      opacity: 0.18;
+      transform: scale(0.55);
+    }}
+    50% {{
+      opacity: 1;
+      transform: scale(1.12);
     }}
   }}
 
@@ -4646,12 +4710,27 @@ def render_rainbow_html(
 
   .stdio-stopwatch .sw-icon {{
     width: 18px;
-    height: 8.5px;
+    height: 9px;
     flex-shrink: 0;
     overflow: visible;
     opacity: 0.48;
     filter: saturate(0.55);
     transition: opacity 0.2s ease, filter 0.2s ease;
+  }}
+
+  .stdio-stopwatch .sw-rb {{
+    stroke-dasharray: 100;
+    stroke-dashoffset: 0;
+  }}
+
+  .stdio-stopwatch .sw-sp-tip,
+  .stdio-stopwatch .sw-sp-end path {{
+    opacity: 0;
+  }}
+
+  .stdio-stopwatch .sw-sp-end path {{
+    transform-box: fill-box;
+    transform-origin: center;
   }}
 
   .stdio-stopwatch .sw-stage {{
@@ -4702,18 +4781,23 @@ def render_rainbow_html(
 
   .stdio-stopwatch.sw-running .sw-icon {{
     opacity: 1;
-    animation: swRainbowFloat 1.4s ease-in-out infinite;
+    animation: swRainbow8BitGlow 0.8s steps(2, end) infinite;
   }}
 
   .stdio-stopwatch.sw-running .sw-rb {{
-    animation: swRainbowCycle 0.9s linear infinite;
+    animation: swRainbowShoot 1.5s linear infinite;
   }}
 
   .stdio-stopwatch.sw-running .sw-rb-1 {{ animation-delay: 0s; }}
-  .stdio-stopwatch.sw-running .sw-rb-2 {{ animation-delay: -0.15s; }}
-  .stdio-stopwatch.sw-running .sw-rb-3 {{ animation-delay: -0.30s; }}
-  .stdio-stopwatch.sw-running .sw-rb-4 {{ animation-delay: -0.45s; }}
-  .stdio-stopwatch.sw-running .sw-rb-5 {{ animation-delay: -0.60s; }}
+  .stdio-stopwatch.sw-running .sw-rb-2 {{ animation-delay: 0.02s; }}
+  .stdio-stopwatch.sw-running .sw-rb-3 {{ animation-delay: 0.04s; }}
+  .stdio-stopwatch.sw-running .sw-rb-4 {{ animation-delay: 0.06s; }}
+  .stdio-stopwatch.sw-running .sw-rb-5 {{ animation-delay: 0.08s; }}
+
+  .stdio-stopwatch.sw-running .sw-sp-tip {{
+    animation: swRainbowTipSparkle 1.5s linear infinite;
+    animation-delay: 0.04s;
+  }}
 
   .stdio-stopwatch.sw-running .sw-stage {{
     color: var(--accent-cyan);
@@ -4731,6 +4815,22 @@ def render_rainbow_html(
   .stdio-stopwatch.sw-done .sw-icon {{
     opacity: 1;
     filter: saturate(1.1) drop-shadow(0 0 2.5px rgba(56, 189, 248, 0.38));
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-rb {{
+    animation: swRainbowFormOnce 0.42s ease-out 1 both;
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-sp-end path {{
+    animation: swStarTwinkle 0.44s steps(2, end) infinite;
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-sp-end-2 path {{
+    animation-delay: 0.14s;
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-sp-end-3 path {{
+    animation-delay: 0.28s;
   }}
 
   .stdio-stopwatch.sw-done .sw-stage {{
@@ -5114,12 +5214,24 @@ def render_rainbow_html(
         <div class="terminal-wrap">
           <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
           <div class="stdio-stopwatch sw-idle" id="stdio-stopwatch" role="timer" aria-live="off" title="Step stopwatch (mm:ss.ms) — counts time spent in each pipeline step">
-            <svg class="sw-icon" viewBox="0 0 24 11" aria-hidden="true">
-              <path class="sw-rb sw-rb-1" d="M 0.55 9.8 A 12.2 12.2 0 0 1 23.45 9.8" fill="none" stroke="#ff3b6b" stroke-width="0.68" stroke-linecap="round"></path>
-              <path class="sw-rb sw-rb-2" d="M 1.24 9.8 A 11.55 11.55 0 0 1 22.76 9.8" fill="none" stroke="#ff922b" stroke-width="0.68" stroke-linecap="round"></path>
-              <path class="sw-rb sw-rb-3" d="M 1.94 9.8 A 10.9 10.9 0 0 1 22.06 9.8" fill="none" stroke="#ffd43b" stroke-width="0.68" stroke-linecap="round"></path>
-              <path class="sw-rb sw-rb-4" d="M 2.65 9.8 A 10.25 10.25 0 0 1 21.35 9.8" fill="none" stroke="#38d9a9" stroke-width="0.68" stroke-linecap="round"></path>
-              <path class="sw-rb sw-rb-5" d="M 3.37 9.8 A 9.6 9.6 0 0 1 20.63 9.8" fill="none" stroke="#38bdf8" stroke-width="0.68" stroke-linecap="round"></path>
+            <svg class="sw-icon" viewBox="0 0 24 12" aria-hidden="true">
+              <path class="sw-rb sw-rb-1" pathLength="100" d="M 0.55 10.6 A 12.2 12.2 0 0 1 23.45 10.6" fill="none" stroke="#ff3b6b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-2" pathLength="100" d="M 1.24 10.6 A 11.55 11.55 0 0 1 22.76 10.6" fill="none" stroke="#ff922b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-3" pathLength="100" d="M 1.94 10.6 A 10.9 10.9 0 0 1 22.06 10.6" fill="none" stroke="#ffd43b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-4" pathLength="100" d="M 2.65 10.6 A 10.25 10.25 0 0 1 21.35 10.6" fill="none" stroke="#38d9a9" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-5" pathLength="100" d="M 3.37 10.6 A 9.6 9.6 0 0 1 20.63 10.6" fill="none" stroke="#38bdf8" stroke-width="0.68" stroke-linecap="round"></path>
+              <g class="sw-sp-tip">
+                <path d="M 0 -1.8 L 0.45 -0.45 L 1.8 0 L 0.45 0.45 L 0 1.8 L -0.45 0.45 L -1.8 0 L -0.45 -0.45 Z" fill="#fef08a"></path>
+              </g>
+              <g class="sw-sp-end sw-sp-end-1" transform="translate(5.2 3.8)">
+                <path d="M 0 -1.7 L 0.42 -0.42 L 1.7 0 L 0.42 0.42 L 0 1.7 L -0.42 0.42 L -1.7 0 L -0.42 -0.42 Z" fill="#fde047"></path>
+              </g>
+              <g class="sw-sp-end sw-sp-end-2" transform="translate(12.0 1.4)">
+                <path d="M 0 -2.0 L 0.5 -0.5 L 2.0 0 L 0.5 0.5 L 0 2.0 L -0.5 0.5 L -2.0 0 L -0.5 -0.5 Z" fill="#ffffff"></path>
+              </g>
+              <g class="sw-sp-end sw-sp-end-3" transform="translate(19.0 4.0)">
+                <path d="M 0 -1.7 L 0.42 -0.42 L 1.7 0 L 0.42 0.42 L 0 1.7 L -0.42 0.42 L -1.7 0 L -0.42 -0.42 Z" fill="#67e8f9"></path>
+              </g>
             </svg>
             <span class="sw-stage" id="stdio-stopwatch-stage">READY</span>
             <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>
