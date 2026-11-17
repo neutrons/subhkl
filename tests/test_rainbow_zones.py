@@ -2357,3 +2357,127 @@ def test_em_pixel_mask_two_color_overlay_and_srcdoc_tab_handling(tmp_path):
         text=True,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
+    """Verify lower-right stdio mm:ss.ms step stopwatch rendering, JS state transitions, and backend step_timings."""
+    import subprocess
+    import time
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    peaks_xyz, _U, _B, UB, _hkls, _lams = _synthetic_orthorhombic_peaks()
+    payload = build_rainbow_zone_payload(
+        peaks_xyz=peaks_xyz,
+        ub_matrix=UB,
+        wavelength_range=(1.8, 4.5),
+        instrument="CG4D",
+        space_group="P 2 2 2",
+    )
+
+    for mode in ("arcade", "pro"):
+        html = render_rainbow_html(payload, default_mode=mode)
+        assert 'class="terminal-wrap"' in html
+        assert 'id="stdio-stopwatch"' in html
+        assert 'id="stdio-stopwatch-stage"' in html
+        assert 'id="stdio-stopwatch-time"' in html
+        assert 'id="stdio-stopwatch-quip"' in html
+        assert "formatStopwatchParts" in html
+        assert "startStepStopwatch" in html
+        assert "finishStepStopwatch" in html
+        assert "hydrateStepTimingsFromServer" in html
+
+        scripts = re.findall(
+            r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, flags=re.DOTALL
+        )
+        assert scripts
+        js_src = "\n;\n".join(scripts)
+        js_file = tmp_path / f"rainbow_stopwatch_{mode}.js"
+        js_file.write_text(js_src, encoding="utf-8")
+        proc = subprocess.run(
+            ["node", "--check", str(js_file)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+        # Extract and execute formatStopwatchParts + getStopwatchSassyQuip in Node
+        m_fmt = re.search(
+            r"function formatStopwatchParts\(ms\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_quip = re.search(
+            r"function getStopwatchSassyQuip\(status, ms\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        assert m_fmt and m_quip
+        eval_script = (
+            f'const UI_MODE = "{mode}";\n'
+            f"{m_fmt.group(0)}\n"
+            f"{m_quip.group(0)}\n"
+            "console.log(JSON.stringify({"
+            "z: formatStopwatchParts(0).full,"
+            "s: formatStopwatchParts(55984).full,"
+            "m: formatStopwatchParts(125007).full,"
+            'qRun: getStopwatchSassyQuip("running", 12000),'
+            'qDone: getStopwatchSassyQuip("done", 55984)'
+            "}));\n"
+        )
+        res = subprocess.run(
+            ["node", "-e", eval_script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(res.stdout.strip())
+        assert out["z"] == "00:00.000"
+        assert out["s"] == "00:55.984"
+        assert out["m"] == "02:05.007"
+        if mode == "arcade":
+            assert out["qRun"] == "COOKING"
+            assert out["qDone"] == "DIALED"
+        else:
+            assert out["qRun"] == ""
+            assert out["qDone"] == ""
+
+    # Verify backend per-step millisecond timing lifecycle on NovaGalaxyPipelineRunner
+    runner = NovaGalaxyPipelineRunner()
+    t0 = time.time() - 55.984
+    runner.active_job = {
+        "job_id": "test-solve-1",
+        "stage_id": "solve",
+        "state": "running",
+        "started_at": t0,
+    }
+    snap_running = runner.get_step_timings_snapshot()
+    assert "solve" in snap_running
+    assert snap_running["solve"]["state"] == "running"
+    assert snap_running["solve"]["finished_at"] is None
+    assert snap_running["solve"]["elapsed_ms"] >= 55900
+
+    # Stamp exact finish time and verify frozen elapsed_ms persists when switching steps
+    runner.active_job["state"] = "ok"
+    runner.active_job["finished_at"] = t0 + 55.984
+    snap_done = runner.get_step_timings_snapshot()
+    assert snap_done["solve"]["state"] == "ok"
+    assert snap_done["solve"]["elapsed_ms"] == 55984
+
+    # Start next stage (integrate) and cancel it; both stages must remain in step_timings
+    t1 = time.time() - 3.215
+    runner.active_job = {
+        "job_id": "test-int-1",
+        "stage_id": "integrate",
+        "state": "running",
+        "started_at": t1,
+        "stdout": "",
+    }
+    runner.cancel_active_job("integrate")
+    snap_both = runner.get_step_timings_snapshot()
+    assert snap_both["solve"]["elapsed_ms"] == 55984
+    assert snap_both["integrate"]["state"] == "deleted"
+    assert snap_both["integrate"]["finished_at"] is not None
+    assert snap_both["integrate"]["elapsed_ms"] >= 3200

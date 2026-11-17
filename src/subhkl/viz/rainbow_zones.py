@@ -4554,11 +4554,19 @@ def render_rainbow_html(
     color: #fda4af;
   }}
 
+  .terminal-wrap {{
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 0;
+    min-height: 0;
+  }}
+
   .terminal-box {{
     background: #04060c;
     border: 1px solid #1e293b;
     border-radius: 5px;
-    padding: 5px 7px;
+    padding: 5px 7px 26px 7px;
     font-size: 0.6rem;
     line-height: 1.32;
     font-family: var(--font-display);
@@ -4570,6 +4578,151 @@ def render_rainbow_html(
     word-break: break-all;
     user-select: text;
     margin: 0;
+  }}
+
+  @keyframes swHandSpin {{
+    from {{ transform: rotate(0deg); }}
+    to {{ transform: rotate(360deg); }}
+  }}
+
+  @keyframes swNeonPulse {{
+    0%, 100% {{
+      border-color: rgba(56, 189, 248, 0.72);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 9px rgba(56, 189, 248, 0.24);
+    }}
+    50% {{
+      border-color: rgba(244, 63, 133, 0.82);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 12px rgba(244, 63, 133, 0.30);
+    }}
+  }}
+
+  .stdio-stopwatch {{
+    position: absolute;
+    right: 11px;
+    bottom: 5px;
+    z-index: 4;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 7px 2px 6px;
+    border-radius: 999px;
+    background: rgba(8, 12, 24, 0.88);
+    backdrop-filter: blur(5px);
+    border: 1px solid rgba(51, 65, 85, 0.78);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.50);
+    font-family: var(--font-display);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.6rem;
+    line-height: 1.15;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 0.16s ease, color 0.16s ease, transform 0.12s ease;
+    max-width: calc(100% - 18px);
+    white-space: nowrap;
+  }}
+
+  .stdio-stopwatch:hover {{
+    border-color: var(--accent-cyan);
+    transform: translateY(-0.5px);
+  }}
+
+  .stdio-stopwatch .sw-icon {{
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+    color: var(--text-dim);
+  }}
+
+  .stdio-stopwatch .sw-hand {{
+    transform-origin: 8px 9.2px;
+  }}
+
+  .stdio-stopwatch .sw-stage {{
+    font-size: 0.54rem;
+    font-weight: 700;
+    letter-spacing: 0.35px;
+    text-transform: uppercase;
+    color: #94a3b8;
+  }}
+
+  .stdio-stopwatch .sw-time {{
+    font-weight: 700;
+    letter-spacing: 0.25px;
+    color: #e2e8f0;
+  }}
+
+  .stdio-stopwatch .sw-ms {{
+    font-size: 0.53rem;
+    opacity: 0.82;
+  }}
+
+  .stdio-stopwatch .sw-quip {{
+    font-size: 0.52rem;
+    font-weight: 700;
+    letter-spacing: 0.25px;
+    color: var(--accent-gold);
+    padding-left: 2px;
+    border-left: 1px solid rgba(148, 163, 184, 0.25);
+  }}
+
+  .stdio-stopwatch .sw-quip:empty {{
+    display: none;
+  }}
+
+  .stdio-stopwatch.sw-running {{
+    color: #f8fafc;
+    animation: swNeonPulse 1.8s ease-in-out infinite;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-icon {{
+    color: var(--accent-cyan);
+  }}
+
+  .stdio-stopwatch.sw-running .sw-hand {{
+    animation: swHandSpin 1.0s linear infinite;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-stage {{
+    color: var(--accent-cyan);
+  }}
+
+  .stdio-stopwatch.sw-running .sw-time {{
+    color: #ffffff;
+  }}
+
+  .stdio-stopwatch.sw-done {{
+    border-color: rgba(52, 211, 153, 0.62);
+    color: #ecfdf5;
+  }}
+
+  .stdio-stopwatch.sw-done .sw-icon,
+  .stdio-stopwatch.sw-done .sw-stage {{
+    color: var(--accent-green);
+  }}
+
+  .stdio-stopwatch.sw-done .sw-quip {{
+    color: #6ee7b7;
+  }}
+
+  .stdio-stopwatch.sw-stopped {{
+    border-color: rgba(251, 191, 36, 0.60);
+  }}
+
+  .stdio-stopwatch.sw-stopped .sw-icon,
+  .stdio-stopwatch.sw-stopped .sw-stage,
+  .stdio-stopwatch.sw-stopped .sw-quip {{
+    color: #fbbf24;
+  }}
+
+  .stdio-stopwatch.sw-error {{
+    border-color: rgba(248, 113, 113, 0.68);
+  }}
+
+  .stdio-stopwatch.sw-error .sw-icon,
+  .stdio-stopwatch.sw-error .sw-stage,
+  .stdio-stopwatch.sw-error .sw-quip {{
+    color: #f87171;
   }}
 
   .params-drawer {{
@@ -4920,7 +5073,21 @@ def render_rainbow_html(
           <span>&gt;_ Terminal // Stdio</span>
           <span id="cell-summary" style="font-size:0.62rem;color:var(--accent-pink);">IDLE</span>
         </div>
-        <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
+        <div class="terminal-wrap">
+          <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
+          <div class="stdio-stopwatch sw-idle" id="stdio-stopwatch" role="timer" aria-live="off" title="Step stopwatch (mm:ss.ms) — counts time spent in each pipeline step">
+            <svg class="sw-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <line x1="5.8" y1="1.3" x2="10.2" y2="1.3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></line>
+              <line x1="8" y1="1.3" x2="8" y2="3.1" stroke="currentColor" stroke-width="1.3"></line>
+              <line x1="12.1" y1="3.6" x2="13.4" y2="2.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"></line>
+              <circle cx="8" cy="9.2" r="5.4" fill="none" stroke="currentColor" stroke-width="1.35"></circle>
+              <line class="sw-hand" x1="8" y1="9.2" x2="8" y2="5.4" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"></line>
+            </svg>
+            <span class="sw-stage" id="stdio-stopwatch-stage">READY</span>
+            <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>
+            <span class="sw-quip" id="stdio-stopwatch-quip"></span>
+          </div>
+        </div>
         <canvas id="canvas-hist" title="Click to cycle resolution sparkline: CC½ vs d → Completeness vs d → ⟨I/σ⟩ vs d" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
       </div>
     </aside>
@@ -5363,6 +5530,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return 2; // solve / predictor / finder -> Completed 1..2, Pending step: 3. Integrate
   }}
 
+  const UI_MODE = "{default_mode}".toLowerCase();
   const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" &&
     Array.isArray(PEAKS) &&
     PEAKS.some(p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual));
@@ -5408,6 +5576,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     selectedFrameIndex: typeof DATA.frame_index === "number" ? DATA.frame_index : 0,
     frameRequestSeq: 0,
     frameAbortController: null,
+    stepTimings: Object.create(null),
+    stopwatchInspectKey: null,
   }};
 
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
@@ -5710,6 +5880,266 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     terminalBoxEl.addEventListener("scroll", () => {{
       state.terminalScrollTop = terminalBoxEl.scrollTop;
     }});
+  }}
+
+  const stopwatchEl = document.getElementById("stdio-stopwatch");
+  const stopwatchStageEl = document.getElementById("stdio-stopwatch-stage");
+  const stopwatchTimeEl = document.getElementById("stdio-stopwatch-time");
+  const stopwatchQuipEl = document.getElementById("stdio-stopwatch-quip");
+  let lastStopwatchRenderKey = "";
+
+  function stageStopwatchMeta(stageIdOrIdx) {{
+    let st = null;
+    if (typeof stageIdOrIdx === "number" && PIPELINE[stageIdOrIdx]) {{
+      st = PIPELINE[stageIdOrIdx];
+    }} else if (typeof stageIdOrIdx === "string") {{
+      st = PIPELINE.find(p => p && p.stage_id === stageIdOrIdx) || null;
+    }}
+    const sid = (st && st.stage_id) || (typeof stageIdOrIdx === "string" ? stageIdOrIdx : "solve");
+    const stepNum = st && st.step_num ? `${{st.step_num}}. ` : "";
+    const shortName = st && st.name
+      ? String(st.name).replace(/^\\d+\\.\\s*/, "").toUpperCase()
+      : String(sid).toUpperCase();
+    return {{ stageId: sid, label: `${{stepNum}}${{shortName}}`, shortName }};
+  }}
+
+  function formatStopwatchParts(ms) {{
+    const clamped = Math.max(0, Math.round(Number(ms) || 0));
+    const totalSec = Math.floor(clamped / 1000);
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    const millis = clamped % 1000;
+    const mmss = `${{String(mins).padStart(2, "0")}}:${{String(secs).padStart(2, "0")}}`;
+    const dotMs = `.${{String(millis).padStart(3, "0")}}`;
+    return {{ mmss, dotMs, full: `${{mmss}}${{dotMs}}`, clamped }};
+  }}
+
+  function getStopwatchSassyQuip(status, ms) {{
+    if (UI_MODE === "pro") return "";
+    const sec = (Number(ms) || 0) / 1000;
+    if (status === "running") {{
+      if (sec < 5) return "GO!";
+      if (sec < 25) return "COOKING";
+      if (sec < 75) return "CRUNCHING";
+      return "DEEP SPACE";
+    }}
+    if (status === "done") {{
+      if (sec < 8) return "BLINK!";
+      if (sec < 40) return "ZIPPY";
+      if (sec < 120) return "DIALED";
+      return "MARATHON";
+    }}
+    if (status === "stopped") return "HALT";
+    if (status === "error") return "OOPS";
+    return "";
+  }}
+
+  function getEntryLiveMs(entry, nowPerf = performance.now()) {{
+    if (!entry) return 0;
+    if (entry.status === "running") {{
+      const delta = Math.max(0, nowPerf - (Number(entry.startPerfMs) || nowPerf));
+      return Math.max(0, (Number(entry.baseElapsedMs) || 0) + delta);
+    }}
+    return Math.max(0, Number(entry.elapsedMs) || 0);
+  }}
+
+  function buildStopwatchTooltip(nowPerf = performance.now()) {{
+    const lines = ["Step Stopwatch (mm:ss.ms)"];
+    let totalMs = 0;
+    let recordedCount = 0;
+    const order = PIPELINE.length > 0
+      ? PIPELINE.map(p => p.stage_id)
+      : ["reduce", "solve", "integrate", "merge"];
+    order.forEach(sid => {{
+      const meta = stageStopwatchMeta(sid);
+      const entry = state.stepTimings[sid];
+      if (!entry || entry.status === "idle") {{
+        lines.push(`• ${{meta.label}}: —`);
+      }} else {{
+        const ms = getEntryLiveMs(entry, nowPerf);
+        totalMs += ms;
+        recordedCount++;
+        lines.push(`• ${{meta.label}}: ${{formatStopwatchParts(ms).full}} (${{entry.status}})`);
+      }}
+    }});
+    if (recordedCount > 0) {{
+      lines.push(`Σ Total: ${{formatStopwatchParts(totalMs).full}} (click badge to cycle splits)`);
+    }} else {{
+      lines.push("Run a workflow step below to time it in mm:ss.ms");
+    }}
+    return lines.join("\\n");
+  }}
+
+  function activeRunningStageId() {{
+    if (state.runningStageIdx >= 0 && PIPELINE[state.runningStageIdx]) {{
+      return PIPELINE[state.runningStageIdx].stage_id;
+    }}
+    const keys = Object.keys(state.stepTimings);
+    for (let i = 0; i < keys.length; i++) {{
+      if (state.stepTimings[keys[i]] && state.stepTimings[keys[i]].status === "running") {{
+        return keys[i];
+      }}
+    }}
+    return null;
+  }}
+
+  function renderStepStopwatch(force = false) {{
+    if (!stopwatchEl || !stopwatchStageEl || !stopwatchTimeEl) return;
+    const nowPerf = performance.now();
+    const runSid = activeRunningStageId();
+    let viewKey = runSid || state.stopwatchInspectKey;
+    if (!viewKey && PIPELINE[state.currentPipelineIdx]) {{
+      viewKey = PIPELINE[state.currentPipelineIdx].stage_id;
+    }}
+
+    let stageText = "READY";
+    let status = "idle";
+    let elapsedMs = 0;
+
+    if (viewKey === "__total__") {{
+      let sumMs = 0;
+      let anyDone = false;
+      Object.values(state.stepTimings).forEach(ent => {{
+        if (ent && ent.status !== "idle") {{
+          sumMs += getEntryLiveMs(ent, nowPerf);
+          anyDone = true;
+        }}
+      }});
+      stageText = "Σ TOTAL";
+      status = anyDone ? "done" : "idle";
+      elapsedMs = sumMs;
+    }} else if (viewKey) {{
+      const meta = stageStopwatchMeta(viewKey);
+      const ent = state.stepTimings[viewKey];
+      if (ent && ent.status !== "idle") {{
+        stageText = meta.label;
+        status = ent.status;
+        elapsedMs = getEntryLiveMs(ent, nowPerf);
+      }} else {{
+        const anyRecorded = Object.values(state.stepTimings).some(e => e && e.status !== "idle");
+        stageText = anyRecorded ? meta.label : "READY";
+        status = "idle";
+        elapsedMs = 0;
+      }}
+    }}
+
+    const parts = formatStopwatchParts(elapsedMs);
+    const quip = getStopwatchSassyQuip(status, parts.clamped);
+    const renderKey = `${{status}}|${{stageText}}|${{parts.full}}|${{quip}}`;
+    if (!force && renderKey === lastStopwatchRenderKey) return;
+    lastStopwatchRenderKey = renderKey;
+
+    stopwatchEl.className = `stdio-stopwatch sw-${{status}}`;
+    stopwatchStageEl.textContent = stageText;
+    stopwatchTimeEl.innerHTML = `${{parts.mmss}}<span class="sw-ms">${{parts.dotMs}}</span>`;
+    if (stopwatchQuipEl) stopwatchQuipEl.textContent = quip;
+    if (force || status !== "running" || (parts.clamped % 500) < 25) {{
+      stopwatchEl.title = buildStopwatchTooltip(nowPerf);
+    }}
+  }}
+
+  function startStepStopwatch(stageIdOrIdx, initialElapsedMs = 0) {{
+    const meta = stageStopwatchMeta(stageIdOrIdx);
+    const baseMs = Math.max(0, Number(initialElapsedMs) || 0);
+    Object.values(state.stepTimings).forEach(ent => {{
+      if (ent && ent.status === "running" && ent.stageId !== meta.stageId) {{
+        ent.elapsedMs = getEntryLiveMs(ent);
+        ent.status = "stopped";
+      }}
+    }});
+    state.stepTimings[meta.stageId] = {{
+      stageId: meta.stageId,
+      label: meta.label,
+      status: "running",
+      startPerfMs: performance.now(),
+      baseElapsedMs: baseMs,
+      elapsedMs: baseMs,
+    }};
+    state.stopwatchInspectKey = meta.stageId;
+    renderStepStopwatch(true);
+  }}
+
+  function finishStepStopwatch(stageIdOrIdx, finalStatus = "done", exactElapsedMs = null) {{
+    const meta = stageStopwatchMeta(stageIdOrIdx);
+    const prev = state.stepTimings[meta.stageId];
+    const localMs = prev ? getEntryLiveMs(prev) : 0;
+    const resolvedMs = (typeof exactElapsedMs === "number" && Number.isFinite(exactElapsedMs) && exactElapsedMs >= 0)
+      ? exactElapsedMs
+      : localMs;
+    state.stepTimings[meta.stageId] = {{
+      stageId: meta.stageId,
+      label: meta.label,
+      status: finalStatus,
+      startPerfMs: 0,
+      baseElapsedMs: resolvedMs,
+      elapsedMs: resolvedMs,
+    }};
+    state.stopwatchInspectKey = meta.stageId;
+    renderStepStopwatch(true);
+  }}
+
+  function hydrateStepTimingsFromServer(doc) {{
+    if (!doc || typeof doc !== "object") return;
+    const srvNow = typeof doc.server_time === "number" ? doc.server_time : null;
+    const timings = doc.step_timings && typeof doc.step_timings === "object" ? doc.step_timings : null;
+    if (timings) {{
+      Object.entries(timings).forEach(([sid, rec]) => {{
+        if (!rec || typeof rec !== "object") return;
+        const stState = String(rec.state || "");
+        const cur = state.stepTimings[sid];
+        if (stState === "running" || stState === "queued") {{
+          if (!cur || cur.status !== "running") {{
+            const srvMs = typeof rec.elapsed_ms === "number"
+              ? rec.elapsed_ms
+              : ((srvNow && typeof rec.started_at === "number") ? Math.max(0, (srvNow - rec.started_at) * 1000) : 0);
+            startStepStopwatch(sid, srvMs);
+          }}
+        }} else if (!cur || cur.status === "idle") {{
+          const mapped = stState === "ok"
+            ? "done"
+            : (stState === "deleted" ? "stopped" : "error");
+          if (typeof rec.elapsed_ms === "number" && rec.elapsed_ms >= 0) {{
+            const meta = stageStopwatchMeta(sid);
+            state.stepTimings[sid] = {{
+              stageId: sid,
+              label: meta.label,
+              status: mapped,
+              startPerfMs: 0,
+              baseElapsedMs: rec.elapsed_ms,
+              elapsedMs: rec.elapsed_ms,
+            }};
+            if (!state.stopwatchInspectKey) state.stopwatchInspectKey = sid;
+          }}
+        }}
+      }});
+    }} else if (
+      doc.active_job &&
+      (doc.active_job.state === "running" || doc.active_job.state === "queued") &&
+      doc.active_job.stage_id
+    ) {{
+      const aj = doc.active_job;
+      const cur = state.stepTimings[aj.stage_id];
+      if (!cur || cur.status !== "running") {{
+        const srvMs = typeof aj.elapsed_ms === "number"
+          ? aj.elapsed_ms
+          : ((srvNow && typeof aj.started_at === "number") ? Math.max(0, (srvNow - aj.started_at) * 1000) : 0);
+        startStepStopwatch(aj.stage_id, srvMs);
+      }}
+    }}
+    renderStepStopwatch(true);
+  }}
+
+  if (stopwatchEl) {{
+    stopwatchEl.addEventListener("click", () => {{
+      if (activeRunningStageId()) return;
+      const keys = (PIPELINE.length > 0 ? PIPELINE.map(p => p.stage_id) : ["reduce", "solve", "integrate", "merge"]);
+      const recorded = keys.filter(k => state.stepTimings[k] && state.stepTimings[k].status !== "idle");
+      const cycle = recorded.length >= 2 ? [...keys, "__total__"] : keys;
+      const curIdx = cycle.indexOf(state.stopwatchInspectKey || (PIPELINE[state.currentPipelineIdx] && PIPELINE[state.currentPipelineIdx].stage_id));
+      state.stopwatchInspectKey = cycle[(curIdx + 1) % cycle.length];
+      renderStepStopwatch(true);
+    }});
+    renderStepStopwatch(true);
   }}
 
   function appendTerminalLog(text, replace = false) {{
@@ -6113,6 +6543,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (syncLadder && typeof st.ladder_rung_idx === "number") {{
       selectLadderRung(st.ladder_rung_idx, false);
+    }}
+    if (!activeRunningStageId() && st && st.stage_id) {{
+      state.stopwatchInspectKey = st.stage_id;
+      renderStepStopwatch(true);
     }}
     renderPipeline();
     if (typeof renderFilesDrawer === "function") renderFilesDrawer();
@@ -11315,6 +11749,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           galaxyBridge.historyId = doc.history_id;
           galaxyBridge.datasets = doc.history_datasets || [];
           galaxyBridge.stepArtifacts = doc.step_artifacts || {{}};
+          hydrateStepTimingsFromServer(doc);
           if (
             state.runningStageIdx < 0 &&
             doc.active_job &&
@@ -11400,6 +11835,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       galaxyBridge.pollTimer = null;
     }}
     state.runningStageIdx = -1;
+    finishStepStopwatch(stageId, "stopped");
     renderPipeline();
     const cellSummary = document.getElementById("cell-summary");
     if (cellSummary) cellSummary.textContent = "STOPPED";
@@ -11420,6 +11856,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (resp.ok) {{
           const doc = await resp.json();
           const jobObj = doc.job || {{}};
+          if (typeof jobObj.elapsed_ms === "number" && jobObj.elapsed_ms >= 0) {{
+            finishStepStopwatch(stageId, "stopped", jobObj.elapsed_ms);
+          }}
           const outText = (jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : "");
           if (outText) appendTerminalLog(outText, true);
           else appendTerminalLog(`\\n[subhkl] Cancelled stage '${{stageId}}'.\\n`, false);
@@ -11461,6 +11900,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const params = {{ ...collectWorkflowParams(), ...(extraParams || {{}}) }};
     const dMinSeqAtStart = state.dMinUserSeq || 0;
     state.runningStageIdx = stageIdx;
+    startStepStopwatch(stageIdx);
     renderPipeline();
     const cellSummary = document.getElementById("cell-summary");
     if (cellSummary) cellSummary.textContent = `RUNNING ${{stageId.toUpperCase()}}...`;
@@ -11609,6 +12049,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               galaxyBridge.pollTimer = null;
               if (runSeq === state.workflowRunSeq) {{
                 state.runningStageIdx = -1;
+                finishStepStopwatch(
+                  stageId,
+                  finishedOk ? "done" : (isCancelled ? "stopped" : "error"),
+                  typeof aj.elapsed_ms === "number" ? aj.elapsed_ms : null
+                );
               }}
               if (finishedOk) {{
                 const h5Outs = Array.isArray(aj.outputs)
@@ -11702,6 +12147,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}, 700);
       }} catch (err) {{
         state.runningStageIdx = -1;
+        finishStepStopwatch(stageId, "error");
         renderPipeline();
         appendTerminalLog(`\\n[error] ${{err.message}}`);
       }}
@@ -11813,6 +12259,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               galaxyBridge.pollTimer = null;
               galaxyBridge.activeGalaxyJobId = null;
               state.runningStageIdx = -1;
+              finishStepStopwatch(
+                stageId,
+                jstate === "ok" ? "done" : (jstate === "deleted" ? "stopped" : "error")
+              );
               renderPipeline();
               if (jstate === "ok") {{
                 selectLadderRung(4, false);
@@ -11832,6 +12282,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }} catch (err) {{
         galaxyBridge.activeGalaxyJobId = null;
         state.runningStageIdx = -1;
+        finishStepStopwatch(stageId, "error");
         renderPipeline();
         appendTerminalLog(`\\n[error] ${{err.message}}`);
       }}
@@ -11839,18 +12290,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     // Standalone static file fallback: step through the Lattice Ladder rungs with diagnostic output
-    state.runningStageIdx = -1;
-    renderPipeline();
-    if (stageId === "solve") {{
+    if (stageId === "solve" && LADDER.length > 0) {{
       let r = 0;
       selectLadderRung(0, false);
       const t = setInterval(() => {{
+        if (runSeq !== state.workflowRunSeq) {{
+          clearInterval(t);
+          return;
+        }}
         const rung = LADDER[r];
         if (rung) appendTerminalLog(`[step ${{rung.step_num}}] ${{rung.name}} — ${{rung.metric_label}}`);
         r++;
-        if (r < LADDER.length) selectLadderRung(r, false);
-        else clearInterval(t);
+        if (r < LADDER.length) {{
+          selectLadderRung(r, false);
+        }} else {{
+          clearInterval(t);
+          state.runningStageIdx = -1;
+          finishStepStopwatch(stageId, "done");
+          renderPipeline();
+          if (cellSummary) cellSummary.textContent = "DONE";
+        }}
       }}, 650);
+    }} else {{
+      state.runningStageIdx = -1;
+      finishStepStopwatch(stageId, "done");
+      renderPipeline();
     }}
   }}
 
@@ -11863,6 +12327,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.parallaxY += (state.targetParallaxY - state.parallaxY) * 0.14;
     renderDetectorCanvas();
     renderStereoInset();
+    if (activeRunningStageId()) renderStepStopwatch(false);
     requestAnimationFrame(animate);
   }}
 

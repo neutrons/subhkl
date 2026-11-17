@@ -144,8 +144,52 @@ class NovaGalaxyPipelineRunner:
         self.history_id = raw_hid or None
         self._conn_helper: Any = None
         self.active_job: dict[str, Any] | None = None
+        self.step_timings: dict[str, dict[str, Any]] = {}
         self.current_frame_index: int | None = None
         self._auto_discover_local_galaxy()
+
+    def _sync_job_timing(self, job_record: dict[str, Any] | None) -> None:
+        """Update per-step elapsed millisecond timing metadata on ``job_record`` and ``self.step_timings``."""
+        if not isinstance(job_record, dict):
+            return
+        stage_id = str(job_record.get("stage_id") or "").strip()
+        if not stage_id:
+            return
+        now_ts = time.time()
+        raw_started = job_record.get("started_at")
+        started_at = (
+            float(raw_started)
+            if isinstance(raw_started, (int, float)) and raw_started > 0
+            else now_ts
+        )
+        job_record["started_at"] = started_at
+        st = str(job_record.get("state") or "running")
+        if st in ("ok", "error", "deleted", "paused"):
+            raw_finished = job_record.get("finished_at")
+            finished_at = (
+                float(raw_finished)
+                if isinstance(raw_finished, (int, float)) and raw_finished >= started_at
+                else max(started_at, now_ts)
+            )
+            job_record["finished_at"] = finished_at
+            elapsed_ms = round(max(0.0, (finished_at - started_at) * 1000.0))
+        else:
+            job_record.pop("finished_at", None)
+            finished_at = None
+            elapsed_ms = round(max(0.0, (now_ts - started_at) * 1000.0))
+        job_record["elapsed_ms"] = elapsed_ms
+        self.step_timings[stage_id] = {
+            "stage_id": stage_id,
+            "state": st,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "elapsed_ms": elapsed_ms,
+        }
+
+    def get_step_timings_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return a snapshot of per-stage stopwatch timings (in ms), refreshing any active job."""
+        self._sync_job_timing(self.active_job)
+        return {k: dict(v) for k, v in self.step_timings.items()}
 
     def _build_neutrons_load_data_inputs(
         self,
@@ -1781,6 +1825,7 @@ class NovaGalaxyPipelineRunner:
                 ),
             }
         self.active_job = job_record
+        self._sync_job_timing(job_record)
 
         threading.Thread(
             target=self._dispatch_nova_galaxy_thread,
@@ -1857,6 +1902,7 @@ class NovaGalaxyPipelineRunner:
         aj["cancel_requested"] = True
         prev_state = str(aj.get("state") or "")
         aj["state"] = "deleted"
+        self._sync_job_timing(aj)
         aj["stdout"] = (
             aj.get("stdout", "")
             + "\n[subhkl] Stop requested by user — cancelling job...\n"
@@ -3313,6 +3359,9 @@ class NovaGalaxyPipelineRunner:
                 fallback_reason=clean_msg,
                 existing_job_record=job_record,
             )
+        finally:
+            if job_record.get("state") in ("ok", "error", "deleted", "paused"):
+                self._sync_job_timing(job_record)
 
     SNS_HFIR_ROOTS: ClassVar[dict[str, str]] = {"SNS": "/SNS", "HFIR": "/HFIR"}
 
@@ -5366,6 +5415,7 @@ class NovaGalaxyPipelineRunner:
                 "started_at": time.time(),
             }
             self.active_job = job_record
+        self._sync_job_timing(job_record)
 
         if container_name:
             self._active_container_name = container_name
@@ -5786,6 +5836,7 @@ class NovaGalaxyPipelineRunner:
                     job_record["state"] = "error"
                     job_record["stderr"] += f"\n[subhkl] Error: {exc}\n"
             finally:
+                self._sync_job_timing(job_record)
                 if job_record.get("cancel_requested") and container_name:
                     self._terminate_local_container_or_proc(container_name, proc)
                 if hasattr(self, "_active_procs"):
@@ -6876,6 +6927,7 @@ def serve_rainbow_zones(
                 hist_ds = vm.pipeline_runner.list_history_datasets(
                     use_cached=bool(is_poll and aj_running)
                 )
+                step_timings_snap = vm.pipeline_runner.get_step_timings_snapshot()
                 status_doc = {
                     "galaxy_connected": vm.pipeline_runner.is_connected,
                     "galaxy_url": vm.pipeline_runner.galaxy_url,
@@ -6886,6 +6938,8 @@ def serve_rainbow_zones(
                         history_datasets=hist_ds,
                     ),
                     "active_job": vm.pipeline_runner.active_job,
+                    "step_timings": step_timings_snap,
+                    "server_time": time.time(),
                     "pipeline_stages": vm.payload.get("pipeline_stages", []),
                     "ladder_steps": vm.payload.get("ladder_steps", []),
                 }
