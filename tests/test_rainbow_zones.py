@@ -1584,7 +1584,8 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert "cancelWorkflowStage" in html
     assert "api/pipeline/cancel" in html
     assert "savedScrollTop" in html
-    assert "box.scrollTop = box.scrollHeight" not in html
+    assert "terminalFollowTail" in html
+    assert "handleTerminalUserScroll" in html
 
     # Verify _ensure_galaxy_h5_dataset picks newer 'ok' dataset over older stuck 'running' dataset
     mock_store_ds = MagicMock()
@@ -2430,21 +2431,106 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
             js_src,
             flags=re.DOTALL,
         )
-        assert m_meta and m_quip and m_fmt
+        m_term_scroll = re.search(
+            r"let _lastAutoTerminalScrollTop = -1;.*?function handleTerminalUserScroll\(box\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_append_term = re.search(
+            r"function appendTerminalLog\(text, replace = false, resetFollow = false\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_fmt_stdio = re.search(
+            r"function formatTerminalStdio\(rawText\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        assert (
+            m_meta
+            and m_quip
+            and m_fmt
+            and m_term_scroll
+            and m_append_term
+            and m_fmt_stdio
+        )
         assert "flashStopwatchQuip" in js_src
         eval_script = (
             f'const UI_MODE = "{mode}";\n'
             f"const PIPELINE = {json.dumps(payload['pipeline_stages'])};\n"
+            "const state = { terminalFollowTail: true, terminalScrollTop: 0 };\n"
+            "let _selActive = false;\n"
+            "const _docListeners = {};\n"
+            "const mockNode = {};\n"
+            "const mockBox = {\n"
+            '  textContent: "",\n'
+            "  clientHeight: 100,\n"
+            "  scrollHeight: 100,\n"
+            "  _scrollTop: 0,\n"
+            "  get scrollTop() { return this._scrollTop; },\n"
+            "  set scrollTop(v) {\n"
+            "    const maxS = Math.max(0, this.scrollHeight - this.clientHeight);\n"
+            "    this._scrollTop = Math.max(0, Math.min(maxS, v));\n"
+            "  },\n"
+            "  contains(n) { return n === mockNode; },\n"
+            "  addEventListener() {},\n"
+            "};\n"
+            "globalThis.document = {\n"
+            "  getElementById(id) { return id === 'terminal-box' ? mockBox : null; },\n"
+            "  addEventListener(ev, fn) { _docListeners[ev] = fn; },\n"
+            "};\n"
+            "globalThis.window = {\n"
+            "  getSelection() {\n"
+            "    return _selActive\n"
+            "      ? { isCollapsed: false, anchorNode: mockNode, focusNode: mockNode }\n"
+            "      : { isCollapsed: true, anchorNode: null, focusNode: null };\n"
+            "  },\n"
+            "};\n"
+            f"{m_fmt_stdio.group(0)}\n"
+            f"{m_term_scroll.group(0)}\n"
+            f"{m_append_term.group(0)}\n"
             f"{m_meta.group(0)}\n"
             f"{m_quip.group(0)}\n"
             f"{m_fmt.group(0)}\n"
+            "mockBox.scrollHeight = 400;\n"
+            'appendTerminalLog("line 1\\nline 2", true, true);\n'
+            "handleTerminalUserScroll(mockBox);\n"
+            "const tailTop1 = mockBox.scrollTop;\n"
+            "mockBox.scrollHeight = 650;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3", true);\n'
+            "handleTerminalUserScroll(mockBox);\n"
+            "const tailTop2 = mockBox.scrollTop;\n"
+            "mockBox.scrollTop = 120;\n"
+            "handleTerminalUserScroll(mockBox);\n"
+            "const followAfterScrollUp = state.terminalFollowTail;\n"
+            "mockBox.scrollHeight = 900;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4", true);\n'
+            "const pinnedTopAfterAppend = mockBox.scrollTop;\n"
+            "_selActive = true;\n"
+            "mockBox.scrollHeight = 1100;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4\\nline 5", true);\n'
+            "const textDuringSel = mockBox.textContent;\n"
+            "_selActive = false;\n"
+            "if (_docListeners.selectionchange) _docListeners.selectionchange();\n"
+            "const textAfterClearSel = mockBox.textContent;\n"
+            "const pinnedTopAfterClearSel = mockBox.scrollTop;\n"
+            "mockBox.scrollTop = 1000;\n"
+            "handleTerminalUserScroll(mockBox);\n"
+            "const followAfterBottom = state.terminalFollowTail;\n"
+            "mockBox.scrollHeight = 1300;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4\\nline 5\\nline 6", true);\n'
+            "const tailTopResumed = mockBox.scrollTop;\n"
             "console.log(JSON.stringify({"
             "labels: [0, 1, 2, 3].map(i => stageStopwatchMeta(i).label),"
             "z: formatStopwatchParts(0).full,"
             "s: formatStopwatchParts(55984).full,"
             "m: formatStopwatchParts(125007).full,"
             'qFast: getCompletionStopwatchQuip("reduce", "done", 3200),'
-            'qSolve: getCompletionStopwatchQuip("solve", "done", 55984)'
+            'qSolve: getCompletionStopwatchQuip("solve", "done", 55984),'
+            "tailTop1, tailTop2, followAfterScrollUp, pinnedTopAfterAppend,"
+            "hasLine5DuringSel: textDuringSel.includes('line 5'),"
+            "hasLine5AfterClear: textAfterClearSel.includes('line 5'),"
+            "pinnedTopAfterClearSel, followAfterBottom, tailTopResumed"
             "}));\n"
         )
         res = subprocess.run(
@@ -2463,6 +2549,15 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
         assert out["z"] == "00:00.000"
         assert out["s"] == "00:55.984"
         assert out["m"] == "02:05.007"
+        assert out["tailTop1"] == 300
+        assert out["tailTop2"] == 550
+        assert out["followAfterScrollUp"] is False
+        assert out["pinnedTopAfterAppend"] == 120
+        assert out["hasLine5DuringSel"] is False
+        assert out["hasLine5AfterClear"] is True
+        assert out["pinnedTopAfterClearSel"] == 120
+        assert out["followAfterBottom"] is True
+        assert out["tailTopResumed"] == 1200
         if mode == "arcade":
             assert out["qFast"] == "SPEED BONUS!"
             assert out["qSolve"] == "STAGE CLEAR!"

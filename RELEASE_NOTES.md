@@ -35,6 +35,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Auto-scrolled the `Terminal // Stdio` log pane as live output appends
+  (`tail -f` behavior), automatically pausing auto-scroll to keep selected or
+  scrolled-up log content steady until the user scrolls back to the bottom.
 - Removed parallax tether lines connecting predicted Bragg peak rings to
   detector spots in Rainbow Zones so shifting the parallax view leaves raw
   detector pixels completely unoccluded.

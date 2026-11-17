@@ -4560,6 +4560,7 @@ def render_rainbow_html(
     flex-direction: column;
     flex: 1 1 0;
     min-height: 0;
+    overflow: hidden;
   }}
 
   .terminal-box {{
@@ -4578,6 +4579,11 @@ def render_rainbow_html(
     word-break: break-all;
     user-select: text;
     margin: 0;
+    outline: none;
+  }}
+
+  .terminal-box:focus {{
+    border-color: #334155;
   }}
 
   @keyframes swRainbowShoot {{
@@ -5212,7 +5218,7 @@ def render_rainbow_html(
           <span id="cell-summary" style="font-size:0.62rem;color:var(--accent-pink);">IDLE</span>
         </div>
         <div class="terminal-wrap">
-          <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
+          <pre class="terminal-box" id="terminal-box" tabindex="0">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
           <div class="stdio-stopwatch sw-idle" id="stdio-stopwatch" role="timer" aria-live="off" title="Step stopwatch (mm:ss.ms) — counts time spent in each pipeline step">
             <svg class="sw-icon" viewBox="0 0 24 12" aria-hidden="true">
               <path class="sw-rb sw-rb-1" pathLength="100" d="M 0.55 10.6 A 12.2 12.2 0 0 1 23.45 10.6" fill="none" stroke="#ff3b6b" stroke-width="0.68" stroke-linecap="round"></path>
@@ -5727,6 +5733,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     frameAbortController: null,
     stepTimings: Object.create(null),
     stopwatchInspectKey: null,
+    terminalFollowTail: true,
+    terminalScrollTop: 0,
   }};
 
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
@@ -6024,10 +6032,63 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return collapsed.join("\\n");
   }}
 
+  let _lastAutoTerminalScrollTop = -1;
+
+  function isTerminalAtBottom(box, slackPx = 10) {{
+    if (!box) return true;
+    const maxScroll = Math.max(0, (Number(box.scrollHeight) || 0) - (Number(box.clientHeight) || 0));
+    return maxScroll <= 0 || (maxScroll - (Number(box.scrollTop) || 0)) <= slackPx;
+  }}
+
+  function hasTerminalSelection(box) {{
+    if (!box || typeof window === "undefined" || typeof window.getSelection !== "function") return false;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return false;
+    return Boolean(
+      (sel.anchorNode && box.contains(sel.anchorNode)) ||
+      (sel.focusNode && box.contains(sel.focusNode))
+    );
+  }}
+
+  function handleTerminalUserScroll(box) {{
+    if (!box) return;
+    const curTop = Number(box.scrollTop) || 0;
+    const prevTop = typeof state.terminalScrollTop === "number" ? state.terminalScrollTop : curTop;
+    state.terminalScrollTop = curTop;
+    if (_lastAutoTerminalScrollTop >= 0 && Math.abs(curTop - _lastAutoTerminalScrollTop) <= 2) {{
+      return;
+    }}
+    _lastAutoTerminalScrollTop = -1;
+    if (curTop < prevTop - 0.5) {{
+      state.terminalFollowTail = false;
+    }} else if (curTop > prevTop && isTerminalAtBottom(box, 10) && !hasTerminalSelection(box)) {{
+      state.terminalFollowTail = true;
+    }} else if (!isTerminalAtBottom(box, 16)) {{
+      state.terminalFollowTail = false;
+    }}
+  }}
+
   const terminalBoxEl = document.getElementById("terminal-box");
   if (terminalBoxEl) {{
+    terminalBoxEl.addEventListener("wheel", (ev) => {{
+      if (ev.deltaY < 0) {{
+        _lastAutoTerminalScrollTop = -1;
+        state.terminalFollowTail = false;
+        state.terminalScrollTop = terminalBoxEl.scrollTop;
+      }} else if (ev.deltaY > 0 && isTerminalAtBottom(terminalBoxEl, 10) && !hasTerminalSelection(terminalBoxEl)) {{
+        state.terminalFollowTail = true;
+      }}
+    }}, {{ passive: true }});
+    terminalBoxEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "PageUp" || ev.key === "ArrowUp" || ev.key === "Home") {{
+        _lastAutoTerminalScrollTop = -1;
+        state.terminalFollowTail = false;
+      }} else if (ev.key === "End" && !hasTerminalSelection(terminalBoxEl)) {{
+        state.terminalFollowTail = true;
+      }}
+    }});
     terminalBoxEl.addEventListener("scroll", () => {{
-      state.terminalScrollTop = terminalBoxEl.scrollTop;
+      handleTerminalUserScroll(terminalBoxEl);
     }});
   }}
 
@@ -6348,9 +6409,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     renderStepStopwatch(true);
   }}
 
-  function appendTerminalLog(text, replace = false) {{
+  function appendTerminalLog(text, replace = false, resetFollow = false) {{
     const box = document.getElementById("terminal-box");
     if (!box) return;
+    if (resetFollow) {{
+      state.terminalFollowTail = true;
+      state.terminalScrollTop = 0;
+      _lastAutoTerminalScrollTop = -1;
+    }}
+    const followTail = state.terminalFollowTail !== false;
     const savedScrollTop = typeof state.terminalScrollTop === "number"
       ? state.terminalScrollTop
       : box.scrollTop;
@@ -6358,29 +6425,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ? formatTerminalStdio(text)
       : formatTerminalStdio(box.textContent + (box.textContent.endsWith("\\n") ? "" : "\\n") + text);
     if (box.textContent === nextText) {{
-      box.scrollTop = savedScrollTop;
       return;
     }}
-    const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
-    const hasSelectionInBox = Boolean(
-      sel && !sel.isCollapsed && sel.anchorNode && box.contains(sel.anchorNode)
-    );
-    if (hasSelectionInBox) {{
+    if (hasTerminalSelection(box)) {{
+      state.terminalFollowTail = false;
       box._pendingTerminalText = nextText;
       if (!box._selectionFlushBound) {{
         box._selectionFlushBound = true;
         const flushPending = () => {{
-          const curSel = typeof window.getSelection === "function" ? window.getSelection() : null;
-          const stillSelected = Boolean(
-            curSel && !curSel.isCollapsed && curSel.anchorNode && box.contains(curSel.anchorNode)
-          );
-          if (!stillSelected && typeof box._pendingTerminalText === "string") {{
+          if (!hasTerminalSelection(box) && typeof box._pendingTerminalText === "string") {{
             const keepScroll = typeof state.terminalScrollTop === "number"
               ? state.terminalScrollTop
               : box.scrollTop;
             box.textContent = box._pendingTerminalText;
             box._pendingTerminalText = null;
-            box.scrollTop = keepScroll;
+            if (state.terminalFollowTail !== false) {{
+              box.scrollTop = box.scrollHeight;
+              _lastAutoTerminalScrollTop = box.scrollTop;
+            }} else {{
+              box.scrollTop = keepScroll;
+            }}
+            state.terminalScrollTop = box.scrollTop;
           }}
         }};
         document.addEventListener("selectionchange", flushPending);
@@ -6391,7 +6456,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     box._pendingTerminalText = null;
     box.textContent = nextText;
-    box.scrollTop = savedScrollTop;
+    if (followTail) {{
+      box.scrollTop = box.scrollHeight;
+      _lastAutoTerminalScrollTop = box.scrollTop;
+    }} else {{
+      box.scrollTop = savedScrollTop;
+    }}
     state.terminalScrollTop = box.scrollTop;
   }}
 
@@ -12102,6 +12172,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (cellSummary) cellSummary.textContent = `RUNNING ${{stageId.toUpperCase()}}...`;
     appendTerminalLog(
       `$ subhkl [${{st.name}}] — dispatching (SG=${{params.space_group}}, cell=${{params.a}},${{params.b}},${{params.c}}, λ=${{params.wavelength_min.toFixed(2)}}–${{params.wavelength_max.toFixed(2)}} Å, d_min=${{Number(params.d_min).toFixed(2)}} Å)...\\n`,
+      true,
       true
     );
 
