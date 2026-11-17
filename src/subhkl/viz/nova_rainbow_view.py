@@ -1741,6 +1741,61 @@ class NovaGalaxyPipelineRunner:
                         return final_m
         return None
 
+    def _discover_or_fetch_galaxy_predictor_h5(
+        self, peaks_h5_path: str | os.PathLike, *, target_hid: int | None = None
+    ) -> str | None:
+        """Ensure companion `predictor.h5` from `subhkl peak-predictor` is cached locally when loading `integrated.h5`."""
+        from subhkl.viz.rainbow_zones import _discover_predictor_h5
+
+        existing = _discover_predictor_h5(peaks_h5_path)
+        if existing and os.path.isfile(existing):
+            return existing
+        if not self.is_connected:
+            return None
+
+        is_integrated = False
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            import h5py
+
+            with h5py.File(str(peaks_h5_path), "r") as hf:
+                is_integrated = bool(
+                    "peaks" in hf
+                    and isinstance(hf["peaks"], h5py.Group)
+                    and ("var_u" in hf["peaks"] or "intensity" in hf["peaks"])
+                )
+        if not is_integrated:
+            return None
+
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            hist_items = self.list_history_datasets(limit=200)
+            pred_cands: list[tuple[int, dict[str, Any]]] = []
+            for ds in hist_items:
+                if ds.get("state") != "ok":
+                    continue
+                dname = str(ds.get("name") or "").strip().lower()
+                ext = str(ds.get("extension") or "").strip().lower()
+                if "predict" in dname and (
+                    dname.endswith((".h5", ".hdf5")) or ext in ("h5", "hdf5")
+                ):
+                    hid_v = int(ds.get("hid") or 0)
+                    # Prefer predictor datasets created at or just before target_hid, then newer datasets
+                    rank = (
+                        (target_hid - hid_v)
+                        if (target_hid is not None and hid_v <= target_hid)
+                        else (100000 + abs((target_hid or 0) - hid_v))
+                    )
+                    pred_cands.append((rank if target_hid is not None else -hid_v, ds))
+            pred_cands.sort(key=lambda kv: kv[0])
+            for _, cand_ds in pred_cands[:4]:
+                cand_id = str(cand_ds.get("id") or "").strip()
+                if not cand_id:
+                    continue
+                self.resolve_dataset_to_local_h5(cand_id)
+                found = _discover_predictor_h5(peaks_h5_path)
+                if found and os.path.isfile(found):
+                    return found
+        return None
+
     def connect(self) -> Any:
         if self._conn_helper is not None:
             return self._conn_helper
@@ -6750,6 +6805,9 @@ def serve_rainbow_zones(
                                 disc_img = vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
                                     fp
                                 )
+                                vm.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
+                                    fp
+                                )
                                 if disc_img:
                                     vm.payload_kwargs["images_h5"] = str(disc_img)
                                 vm.replay_h5 = fp
@@ -6845,6 +6903,16 @@ def serve_rainbow_zones(
                                     local_h5
                                 )
                                 or _discover_images_h5(local_h5)
+                            )
+                            ds_hid_raw = (ds_info or {}).get("hid")
+                            ds_hid = (
+                                int(ds_hid_raw)
+                                if isinstance(ds_hid_raw, (int, str))
+                                and str(ds_hid_raw).isdigit()
+                                else None
+                            )
+                            vm.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
+                                local_h5, target_hid=ds_hid
                             )
                             vm.payload_kwargs["images_h5"] = (
                                 str(disc_img) if disc_img else None

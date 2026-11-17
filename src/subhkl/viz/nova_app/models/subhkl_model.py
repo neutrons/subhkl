@@ -306,17 +306,6 @@ class SubhklGalaxyModel:
                 self.mtz_overlay_path,
                 self.mtz_overlay_info,
             )
-            mtz_cell = self.payload.get("cell") or []
-            if len(mtz_cell) == 6 and all(float(v) > 0 for v in mtz_cell):
-                self.data.a = round(float(mtz_cell[0]), 3)
-                self.data.b = round(float(mtz_cell[1]), 3)
-                self.data.c = round(float(mtz_cell[2]), 3)
-                self.data.alpha = round(float(mtz_cell[3]), 2)
-                self.data.beta = round(float(mtz_cell[4]), 2)
-                self.data.gamma = round(float(mtz_cell[5]), 2)
-            mtz_sg = self.payload.get("space_group")
-            if mtz_sg:
-                self.data.space_group = str(mtz_sg)
         return self.payload
 
     def render_html(self) -> str:

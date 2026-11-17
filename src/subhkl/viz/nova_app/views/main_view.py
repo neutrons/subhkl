@@ -170,18 +170,6 @@ class MainApp:
                         )
                         sub_model.mtz_overlay_path = local_fp_raw
                         sub_model.mtz_overlay_info = ds_info_mtz
-                        mtz_cell = sub_model.payload.get("cell") or []
-                        if len(mtz_cell) == 6 and all(float(v) > 0 for v in mtz_cell):
-                            sub_model.data.a = round(float(mtz_cell[0]), 3)
-                            sub_model.data.b = round(float(mtz_cell[1]), 3)
-                            sub_model.data.c = round(float(mtz_cell[2]), 3)
-                            sub_model.data.alpha = round(float(mtz_cell[3]), 2)
-                            sub_model.data.beta = round(float(mtz_cell[4]), 2)
-                            sub_model.data.gamma = round(float(mtz_cell[5]), 2)
-                        if sub_model.payload.get("space_group"):
-                            sub_model.data.space_group = str(
-                                sub_model.payload["space_group"]
-                            )
                         return web.json_response(sub_model.payload)
                     except (
                         OSError,
@@ -219,6 +207,9 @@ class MainApp:
                                 or self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
                                     local_h5
                                 )
+                            )
+                            self.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
+                                local_h5
                             )
                             self.view_model.model.subhkl.data.images_file = (
                                 str(disc_img) if disc_img else ""
@@ -285,18 +276,6 @@ class MainApp:
                         )
                         sub_model.mtz_overlay_path = local_h5
                         sub_model.mtz_overlay_info = ds_info
-                        mtz_cell = sub_model.payload.get("cell") or []
-                        if len(mtz_cell) == 6 and all(float(v) > 0 for v in mtz_cell):
-                            sub_model.data.a = round(float(mtz_cell[0]), 3)
-                            sub_model.data.b = round(float(mtz_cell[1]), 3)
-                            sub_model.data.c = round(float(mtz_cell[2]), 3)
-                            sub_model.data.alpha = round(float(mtz_cell[3]), 2)
-                            sub_model.data.beta = round(float(mtz_cell[4]), 2)
-                            sub_model.data.gamma = round(float(mtz_cell[5]), 2)
-                        if sub_model.payload.get("space_group"):
-                            sub_model.data.space_group = str(
-                                sub_model.payload["space_group"]
-                            )
                         return web.json_response(sub_model.payload)
                     self.view_model.model.subhkl.mtz_overlay_path = None
                     self.view_model.model.subhkl.mtz_overlay_info = None
@@ -325,6 +304,16 @@ class MainApp:
                                 local_h5
                             )
                             or _discover_images_h5(local_h5)
+                        )
+                        ds_hid_raw = (ds_info or {}).get("hid")
+                        ds_hid = (
+                            int(ds_hid_raw)
+                            if isinstance(ds_hid_raw, (int, str))
+                            and str(ds_hid_raw).isdigit()
+                            else None
+                        )
+                        self.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
+                            local_h5, target_hid=ds_hid
                         )
                         self.view_model.model.subhkl.data.images_file = (
                             str(disc_img) if disc_img else ""

@@ -2066,7 +2066,7 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert 'id="inp-lmax"' in html_doc
     assert 'id="slider-dmin"' in html_doc
     assert 'id="sel-spot-color"' in html_doc
-    assert '<option value="isigi">Color: I/σ (Unscaled)</option>' in html_doc
+    assert '<option value="isigi">Color: I/σ (Diverging)</option>' in html_doc
     assert "hasIntegratedIsigi" in html_doc
     assert "syncDminControls" in html_doc
     assert "Runner host:" in html_doc
@@ -2671,11 +2671,13 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
 
 
 def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> None:
-    """Verify Wulff chi alignment, Pred/Integ/.mtz peak toggle + shapes, and local .mtz B/SG update preserving U."""
+    """Verify exact θ vs 2θ Wulff alignment + Friedel mates, predictor.h5 discovery, MTZ projection preserving B, and diverging I/σ."""
     import asyncio
     import json
+    import os
     import re
     import subprocess
+    from pathlib import Path
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
@@ -2693,6 +2695,8 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     from subhkl.viz.nova_app.views.main_view import MainApp
     from subhkl.viz.nova_rainbow_view import RainbowZonesViewModel
     from subhkl.viz.rainbow_zones import (
+        _discover_predictor_h5,
+        _raycast_hkl_on_detectors,
         _u_from_ub,
         apply_mtz_to_payload,
         build_rainbow_zone_payload,
@@ -2714,10 +2718,10 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     first_bk_key = min(beamlines["CG4D"], key=int)
     first_bk = int(first_bk_key)
     det1 = Detector(dict(beamlines["CG4D"][first_bk_key]))
-    # Pick two pixels on first bank for run 0 (one integrated, one predicted-only with sigma=0) and one for run 1
     xyz_a = np.asarray(det1.pixel_to_lab(110.0, 120.0), dtype=float)
     xyz_b = np.asarray(det1.pixel_to_lab(140.0, 150.0), dtype=float)
     xyz_c = np.asarray(det1.pixel_to_lab(125.0, 135.0), dtype=float)
+    unique_tag = f"CG4D_testpred_{os.getpid()}"
     integ_h5 = tmp_path / "integrated.h5"
     with h5py.File(integ_h5, "w") as hf:
         hf.attrs["instrument"] = "CG4D"
@@ -2736,7 +2740,9 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
         )
         hf.create_dataset(
             "files",
-            data=np.array(["CG4D_2523_0.nxs.h5", "CG4D_2523_1.nxs.h5"], dtype="S32"),
+            data=np.array(
+                [f"{unique_tag}0.nxs.h5", f"{unique_tag}1.nxs.h5"], dtype="S64"
+            ),
         )
         hf.create_group("instrument").create_dataset(
             "wavelength", data=np.array([2.8, 4.5], dtype=float)
@@ -2753,9 +2759,9 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
         pk.create_dataset("var_u", data=np.array([1.2e-4, 1.0e-4, 1.2e-4], dtype=float))
         pk.create_dataset("var_v", data=np.array([0.6e-4, 1.0e-4, 0.6e-4], dtype=float))
         pk.create_dataset("cov_uv", data=np.array([0.1e-4, 0.0, 0.1e-4], dtype=float))
-        pk.create_dataset("h", data=np.array([2, 3, 1], dtype=np.int32))
+        pk.create_dataset("h", data=np.array([2, -2, 1], dtype=np.int32))
         pk.create_dataset("k", data=np.array([1, -1, 2], dtype=np.int32))
-        pk.create_dataset("l", data=np.array([-3, -2, -3], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([-3, 3, -3], dtype=np.int32))
         pk.create_dataset("lambda", data=np.array([3.2, 3.6, 3.4], dtype=float))
         pk.create_dataset("run_index", data=np.array([0, 0, 1], dtype=np.int32))
 
@@ -2766,20 +2772,31 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     )
     assert payload0["artifact_kind"] == "integrator"
     assert payload0["default_peak_source"] == "integrated"
-    # Frame 0 has 1 integrated peak (with ellipse) and 2 total predicted peaks!
     assert len(payload0["integrated_peaks"]) == 1
-    assert len(payload0["predicted_peaks"]) == 2
     assert isinstance(payload0["integrated_peaks"][0].get("ellipse"), list)
     assert len(payload0["integrated_peaks"][0]["ellipse"]) >= 6
-    # All-runs sample_peaks: 2 integrated across runs 0 & 1, 3 predicted across runs 0 & 1
     assert len(payload0["integrated_sample_peaks"]) == 2
-    assert len(payload0["predicted_sample_peaks"]) == 3
     assert np.allclose(np.asarray(payload0["u_matrix"]), U_true, atol=1e-5)
 
-    # Also verify sibling predictor.h5 (banks/* format) supplies full predicted_peaks when integrated.h5 is pre-filtered
-    sib_dir = tmp_path / "with_sibling_pred"
+    # Verify Friedel parity flag on non-centrosymmetric P 21 21 21: (2,1,-3) and (-2,-1,3) share ASU orbit with opposite asu_friedel!
+    from subhkl.viz.rainbow_zones import _make_asu_mapper
+
+    mapper_p212121 = _make_asu_mapper("P 21 21 21", cell_orig)
+    asu_pos = mapper_p212121(2, 1, -3)
+    asu_neg = mapper_p212121(-2, -1, 3)
+    asu_rot = mapper_p212121(
+        -2, 1, 3
+    )  # 2-fold rotation around y: (h,k,l) -> (-h, k, -l)
+    assert asu_pos[:3] == asu_neg[:3] == asu_rot[:3]
+    assert asu_pos[3] != asu_neg[3]  # Friedel pair has opposite parity
+    assert asu_pos[3] == asu_rot[3]  # Proper 2-fold rotation has identical parity
+
+    # Verify pre-filtered integrated.h5 (containing ONLY integrated peaks):
+    # (a) without predictor.h5 -> theoretical fallback generates full Laue predictions (> integrated count)
+    # (b) with companion predictor.h5 in /tmp/subhkl_work_<tag>/predictor.h5 -> discovers exact peak-predictor output!
+    sib_dir = tmp_path / "gx_downloaded_integ"
     sib_dir.mkdir()
-    integ_only_h5 = sib_dir / "integrated.h5"
+    integ_only_h5 = sib_dir / "subhkl_gx_test_integrated.h5"
     with h5py.File(integ_h5, "r") as src_f, h5py.File(integ_only_h5, "w") as dst_f:
         for k_top in src_f:
             if k_top != "peaks":
@@ -2787,47 +2804,68 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
         for ak, av in src_f.attrs.items():
             dst_f.attrs[ak] = av
         pk_dst = dst_f.create_group("peaks")
-        # Keep only the 2 integrated peaks (drop index 1)
         keep_idx = np.array([0, 2], dtype=int)
         for pk_k in src_f["peaks"]:
             pk_dst.create_dataset(pk_k, data=np.asarray(src_f["peaks"][pk_k])[keep_idx])
-    pred_sib_h5 = sib_dir / "predictor.h5"
-    with h5py.File(pred_sib_h5, "w") as pf:
-        pf.create_dataset(
-            "bank_ids", data=np.array([first_bk, first_bk], dtype=np.int32)
-        )
-        pf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
-        b_grp = pf.create_group("banks")
-        g0 = b_grp.create_group("0")
-        g0.create_dataset("i", data=np.array([110.0, 140.0, 160.0], dtype=float))
-        g0.create_dataset("j", data=np.array([120.0, 150.0, 170.0], dtype=float))
-        g0.create_dataset("h", data=np.array([2, 3, 4], dtype=np.int32))
-        g0.create_dataset("k", data=np.array([1, -1, 0], dtype=np.int32))
-        g0.create_dataset("l", data=np.array([-3, -2, -1], dtype=np.int32))
-        g0.create_dataset("wavelength", data=np.array([3.2, 3.6, 3.9], dtype=float))
-        g1 = b_grp.create_group("1")
-        g1.create_dataset("i", data=np.array([125.0, 155.0], dtype=float))
-        g1.create_dataset("j", data=np.array([135.0, 165.0], dtype=float))
-        g1.create_dataset("h", data=np.array([1, 2], dtype=np.int32))
-        g1.create_dataset("k", data=np.array([2, 2], dtype=np.int32))
-        g1.create_dataset("l", data=np.array([-3, -2], dtype=np.int32))
-        g1.create_dataset("wavelength", data=np.array([3.4, 3.8], dtype=float))
-    payload_sib = build_rainbow_zone_payload(
+
+    payload_fb = build_rainbow_zone_payload(
         replay_h5=integ_only_h5,
         frame_index=0,
+        d_min=4.0,
         include_panel_images=False,
     )
-    assert len(payload_sib["integrated_peaks"]) == 1
-    assert len(payload_sib["predicted_peaks"]) == 3
-    assert len(payload_sib["integrated_sample_peaks"]) == 2
-    assert len(payload_sib["predicted_sample_peaks"]) == 5
+    assert len(payload_fb["integrated_peaks"]) == 1
+    assert len(payload_fb["predicted_peaks"]) > len(payload_fb["integrated_peaks"])
 
-    # 2. Create a custom local .mtz with an intentionally different space group & unit cell (e.g. P 32 2 1)
+    work_tag = f"{unique_tag}0_{unique_tag}1"
+    work_dir_tmp = Path(f"/tmp/subhkl_work_{work_tag}")
+    work_dir_tmp.mkdir(parents=True, exist_ok=True)
+    pred_work_h5 = work_dir_tmp / "predictor.h5"
+    try:
+        with h5py.File(pred_work_h5, "w") as pf:
+            smp_p = pf.create_group("sample")
+            smp_p.create_dataset("U", data=U_true)
+            smp_p.create_dataset("B", data=B_orig)
+            pf.create_dataset(
+                "bank_ids", data=np.array([first_bk, first_bk], dtype=np.int32)
+            )
+            pf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+            b_grp = pf.create_group("banks")
+            g0 = b_grp.create_group("0")
+            g0.create_dataset("i", data=np.array([110.0, 140.0, 160.0], dtype=float))
+            g0.create_dataset("j", data=np.array([120.0, 150.0, 170.0], dtype=float))
+            g0.create_dataset("h", data=np.array([2, 3, 4], dtype=np.int32))
+            g0.create_dataset("k", data=np.array([1, -1, 0], dtype=np.int32))
+            g0.create_dataset("l", data=np.array([-3, -2, -1], dtype=np.int32))
+            g0.create_dataset("wavelength", data=np.array([3.2, 3.6, 3.9], dtype=float))
+            g1 = b_grp.create_group("1")
+            g1.create_dataset("i", data=np.array([125.0, 155.0], dtype=float))
+            g1.create_dataset("j", data=np.array([135.0, 165.0], dtype=float))
+            g1.create_dataset("h", data=np.array([1, 2], dtype=np.int32))
+            g1.create_dataset("k", data=np.array([2, 2], dtype=np.int32))
+            g1.create_dataset("l", data=np.array([-3, -2], dtype=np.int32))
+            g1.create_dataset("wavelength", data=np.array([3.4, 3.8], dtype=float))
+
+        assert _discover_predictor_h5(integ_only_h5) == str(pred_work_h5.resolve())
+        payload_sib = build_rainbow_zone_payload(
+            replay_h5=integ_only_h5,
+            frame_index=0,
+            include_panel_images=False,
+        )
+        assert len(payload_sib["integrated_peaks"]) == 1
+        assert len(payload_sib["predicted_peaks"]) == 3
+        assert len(payload_sib["integrated_sample_peaks"]) == 2
+        assert len(payload_sib["predicted_sample_peaks"]) == 5
+    finally:
+        if pred_work_h5.exists():
+            pred_work_h5.unlink()
+        if work_dir_tmp.exists():
+            work_dir_tmp.rmdir()
+
+    # 2. Create a custom local .mtz with a DIFFERENT unit cell & space group (e.g. P 32 2 1)
+    #    and verify that loading the .mtz projects its HKLs into the CURRENT active (U_true, B_orig) geometry
+    #    WITHOUT modifying B, UB, cell, or space_group!
     mtz_cell = [59.8, 59.8, 96.4, 90.0, 90.0, 120.0]
-    B_mtz_raw, _ = cartesian_matrix_metric_tensor(
-        *mtz_cell[:3], *np.deg2rad(mtz_cell[3:])
-    )
-    B_mtz_expected = np.asarray(B_mtz_raw, dtype=float)
     mtz = gemmi.Mtz(with_base=True)
     mtz.spacegroup = gemmi.find_spacegroup_by_name("P 32 2 1")
     mtz.set_cell_for_all(gemmi.UnitCell(*mtz_cell))
@@ -2835,14 +2873,12 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     mtz.add_column("I", "J")
     mtz.add_column("SIGI", "Q")
 
-    # Seed ASU reflections whose rays under U_true @ B_mtz_expected hit CG4D cylindrical/flat detectors in [2.8, 4.5] A
+    # Seed ASU reflections whose rays under the ACTIVE geometry (U_true @ B_orig) hit CG4D in [2.8, 4.5] A
     cg4d_dets = {int(bk): Detector(dict(cfg)) for bk, cfg in beamlines["CG4D"].items()}
-    from subhkl.viz.rainbow_zones import _raycast_hkl_on_detectors
-
     grid = np.mgrid[-8:9, -8:9, -8:9].reshape(3, -1).T
     grid = grid[np.any(grid != 0, axis=1)]
     cast_seed = _raycast_hkl_on_detectors(
-        grid, U_true, B_mtz_expected, R0, cg4d_dets, (2.8, 4.5)
+        grid, U_true, B_orig, R0, cg4d_dets, (2.8, 4.5)
     )
     assert len(cast_seed["hkl"]) >= 5
     asu_mtz = gemmi.ReciprocalAsu(mtz.spacegroup)
@@ -2870,33 +2906,30 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     payload_mtz = apply_mtz_to_payload(
         payload0, mtz_path, {"name": "custom_reflections.mtz"}
     )
-    # U must remain strictly preserved while B, UB, cell, and space_group update to the MTZ's values!
+    # U, B, UB, cell, and space_group MUST remain strictly unchanged!
     assert np.allclose(np.asarray(payload_mtz["u_matrix"]), U_true, atol=1e-5)
+    assert np.allclose(np.asarray(payload_mtz["b_matrix"]), B_orig, atol=1e-5)
+    assert np.allclose(np.asarray(payload_mtz["ub_matrix"]), U_true @ B_orig, atol=1e-5)
     assert np.allclose(
         _u_from_ub(np.asarray(payload_mtz["ub_matrix"])), U_true, atol=1e-4
     )
-    assert np.allclose(np.asarray(payload_mtz["b_matrix"]), B_mtz_expected, atol=1e-5)
-    assert np.allclose(
-        np.asarray(payload_mtz["ub_matrix"]), U_true @ B_mtz_expected, atol=1e-5
-    )
-    assert payload_mtz["space_group"] == mtz.spacegroup.hm
-    assert np.allclose(payload_mtz["cell"], mtz_cell, atol=1e-3)
+    assert payload_mtz["space_group"] == "P 21 21 21"
+    assert np.allclose(payload_mtz["cell"], cell_orig, atol=1e-3)
     assert payload_mtz["default_peak_source"] == "mtz"
     assert len(payload_mtz["mtz_peaks"]) >= len(mtz_rows)
     assert len(payload_mtz["mtz_sample_peaks"]) >= len(payload_mtz["mtz_peaks"])
-    # Existing predicted and integrated peaks remain preserved for toggle switching
     assert len(payload_mtz["integrated_peaks"]) == 1
-    assert len(payload_mtz["predicted_peaks"]) == 2
+    assert len(payload_mtz["predicted_peaks"]) == len(payload0["predicted_peaks"])
 
-    # Loading an MTZ when no U matrix is present must raise a clear ValueError
+    # Loading an MTZ when no UB geometry is present must raise a clear ValueError
     empty_payload = {"artifact_kind": "empty", "panels": payload0["panels"]}
     try:
         apply_mtz_to_payload(empty_payload, mtz_path)
-        raise AssertionError("Expected ValueError when loading MTZ without U matrix")
+        raise AssertionError("Expected ValueError when loading MTZ without UB geometry")
     except ValueError as exc:
-        assert "U orientation matrix" in str(exc)
+        assert "UB geometry" in str(exc)
 
-    # 3. Verify HTTP ViewModel & Trame MainApp local .mtz loading + persistence across frame switches
+    # 3. Verify HTTP ViewModel & Trame MainApp local .mtz loading + persistence across frame switches (preserving cell/SG!)
     vm = RainbowZonesViewModel(replay_h5=integ_h5, include_panel_images=False)
     vm.payload = apply_mtz_to_payload(
         vm.payload, mtz_path, {"name": "custom_reflections.mtz"}
@@ -2906,9 +2939,10 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     reloaded_f1 = vm.reload(frame_index=1)
     assert reloaded_f1["frame_index"] == 1
     assert reloaded_f1["mtz_overlay_name"] == "custom_reflections.mtz"
-    assert reloaded_f1["space_group"] == mtz.spacegroup.hm
+    assert reloaded_f1["space_group"] == "P 21 21 21"
+    assert np.allclose(np.asarray(reloaded_f1["b_matrix"]), B_orig, atol=1e-5)
     assert len(reloaded_f1["mtz_peaks"]) > 0
-    assert len(reloaded_f1["integrated_peaks"]) == 1  # run 1 integrated peak preserved!
+    assert len(reloaded_f1["integrated_peaks"]) == 1
 
     app_inst = object.__new__(MainApp)
     app_inst.pipeline_runner = MagicMock()
@@ -2918,7 +2952,6 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     aio_app = web.Application()
     app_inst._bind_routes(SimpleNamespace(app=aio_app))
 
-    # Before U is solved, /api/payload?file_path=...mtz returns HTTP 400
     req_no_u = make_mocked_request(
         "GET",
         f"/api/payload?file_path={mtz_path}",
@@ -2927,7 +2960,6 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     resp_no_u = asyncio.run(aio_app._handle(req_no_u))
     assert resp_no_u.status == 400
 
-    # Load integrated.h5, then load local .mtz, then switch to frame=1
     req_h5 = make_mocked_request(
         "GET",
         f"/api/payload?file_path={integ_h5}",
@@ -2936,6 +2968,8 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     resp_h5 = asyncio.run(aio_app._handle(req_h5))
     assert resp_h5.status == 200
     assert sub_m.data.peaks_file == str(integ_h5)
+    orig_model_a = float(sub_m.data.a)
+    orig_model_sg = str(sub_m.data.space_group)
 
     req_mtz = make_mocked_request(
         "GET",
@@ -2946,10 +2980,11 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     assert resp_mtz.status == 200
     doc_mtz = json.loads(resp_mtz.body.decode("utf-8"))
     assert doc_mtz["default_peak_source"] == "mtz"
-    assert doc_mtz["space_group"] == mtz.spacegroup.hm
-    assert sub_m.data.peaks_file == str(integ_h5)  # peaks_file not clobbered!
-    assert sub_m.data.space_group == mtz.spacegroup.hm
-    assert abs(sub_m.data.a - mtz_cell[0]) < 1e-2
+    assert doc_mtz["space_group"] == "P 21 21 21"
+    assert np.allclose(np.asarray(doc_mtz["b_matrix"]), B_orig, atol=1e-5)
+    assert sub_m.data.peaks_file == str(integ_h5)
+    assert sub_m.data.space_group == orig_model_sg
+    assert abs(float(sub_m.data.a) - orig_model_a) < 1e-6
 
     req_f1 = make_mocked_request("GET", "/api/payload?frame=1", app=aio_app)
     resp_f1 = asyncio.run(aio_app._handle(req_f1))
@@ -2960,16 +2995,18 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     assert len(doc_f1["mtz_peaks"]) > 0
 
     # 4. Execute rendered HTML/JS helpers in Node.js to verify:
-    #    - Wulff azimuth alignment: centering detector on chi=+45 deg rotates chi=+45 deg reflection to FRONT
-    #      of Wulff sphere (zCam > 0.9) and chi=-45 deg reflection to BACK (zCam < 0), at both zoom=1 and zoom=2.4!
-    #    - Peak toggle ('predicted' | 'integrated' | 'mtz') switches PEAKS + SAMPLE_PEAKS + getActiveWulffPeaks()
-    #      and only renders ellipses when peakSource === 'integrated' (circles for 'predicted' and 'mtz').
+    #    - Exact θ (k_f - k_i) vs 2θ (k_f) Wulff azimuth alignment & right-handed SO(3) camera:
+    #      centering detector on ANY chi (+45°, -45°, +135°, -135°) places that reflection DEAD-CENTER (sx == 100, zCam == 1.0),
+    #      upright (+y -> sy < 100), and left-to-right monotonic (+d_chi -> sx > 100), while its antipodal Friedel mate (-g)
+    #      populates the |az| < 90° hemisphere smoothly across chi = 0°!
+    #    - Diverging Blue-White-Red isigiToColor colormap.
+    #    - Peak toggle ('predicted' | 'integrated' | 'mtz') switches PEAKS + SAMPLE_PEAKS + getActiveWulffPeaks().
     html_doc = render_rainbow_html(payload_mtz)
     assert 'accept=".h5,.hdf5,.nxs,.mtz"' in html_doc
     assert 'id="peak-source-group"' in html_doc
-    assert 'id="btn-peaks-pred"' in html_doc
-    assert 'id="btn-peaks-integ"' in html_doc
-    assert 'id="btn-peaks-mtz"' in html_doc
+    assert 'id="btn-wulff-friedel"' in html_doc
+    assert "Color: I/σ (Diverging)" in html_doc
+    assert "#e879f9" in html_doc  # distinct violet Friedel symmetry link color
     assert (
         'state.peakSource === "integrated" && Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6'
         in html_doc
@@ -2983,9 +3020,14 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
 
     fn_names = [
         "extractPeakBucketsFromPayload",
+        "peakUnscaledIsigi",
+        "activePeaksHaveNegativeIsigi",
+        "isigiToColor",
         "detToScreen",
         "getCenteredDetectorAzimuthDeg",
         "setDetectorCenterAzimuthDeg",
+        "detectorChiToWulffAzimuthDeg",
+        "wulffAzimuthToDetectorChiDeg",
         "syncWulffYawFromDetector",
         "resolveAvailablePeakSource",
         "syncPeakSourceButtons",
@@ -3018,6 +3060,7 @@ const state = {{
   projection: "cylindrical",
   peakSource: DATA.default_peak_source || "mtz",
   wulffScope: "all_runs",
+  showWulffFriedel: true,
   wulffColorMode: "wavelength",
   wulffYawDeg: 0.0,
   wulffPitchDeg: 0.0,
@@ -3055,34 +3098,65 @@ function updateHUD() {{}}
 function renderDetector() {{}}
 {extracted_fns}
 
-// Test 1: Center detector at chi = +45 deg (at zoom=1.0 and zoom=2.4)
-DATA.goniometer_R = [[1,0,0],[0,1,0],[0,0,1]];
-setDetectorCenterAzimuthDeg(45.0);
-syncWulffYawFromDetector();
-const box = getDetectorPlotBox(900, 520);
-const viewCenterX = box.originX + 0.5 * box.plotW;
-const screenXAt45 = detToScreen(45.0, 0.0, 900, 520, 0.0)[0];
-const chiRecovered1 = getCenteredDetectorAzimuthDeg();
-const yawAt45 = state.wulffYawDeg;
-// Scattering vector g = normalize(kf(chi) - [0,0,1]) for equatorial reflections at chi=+45 deg and chi=-45 deg
-function gForChiDeg(chiDeg) {{
+function gForChiElDeg(chiDeg, elDeg = 0.0) {{
   const rad = chiDeg * Math.PI / 180.0;
-  const qx = Math.sin(rad), qy = 0.0, qz = Math.cos(rad) - 1.0;
+  const el = elDeg * Math.PI / 180.0;
+  const kx = Math.cos(el) * Math.sin(rad);
+  const ky = Math.sin(el);
+  const kz = Math.cos(el) * Math.cos(rad);
+  const qx = kx, qy = ky, qz = kz - 1.0;
   const n = Math.hypot(qx, qy, qz);
   return [qx / n, qy / n, qz / n];
 }}
-const wPos45 = projectToWulff(gForChiDeg(45.0), 100, 100, 80);
-const wNeg45 = projectToWulff(gForChiDeg(-45.0), 100, 100, 80);
 
-state.detZoom = 2.4;
-setDetectorCenterAzimuthDeg(-45.0);
+DATA.goniometer_R = [[1,0,0],[0,1,0],[0,0,1]];
+const box = getDetectorPlotBox(900, 520);
+const viewCenterX = box.originX + 0.5 * box.plotW;
+
+const chiChecks = [];
+for (const [chiTarget, zoomVal] of [[45.0, 1.0], [-45.0, 2.4], [135.0, 1.5], [-135.0, 1.5]]) {{
+  state.detZoom = zoomVal;
+  setDetectorCenterAzimuthDeg(chiTarget);
+  syncWulffYawFromDetector();
+  const screenX = detToScreen(chiTarget, 0.0, 900, 520, 0.0)[0];
+  const chiRec = getCenteredDetectorAzimuthDeg();
+  const chiRoundTrip = wulffAzimuthToDetectorChiDeg(state.wulffYawDeg);
+  const wCenter = projectToWulff(gForChiElDeg(chiTarget, 0.0), 100, 100, 80);
+  const wUp = projectToWulff(gForChiElDeg(chiTarget, 12.0), 100, 100, 80);
+  const wRight = projectToWulff(gForChiElDeg(chiTarget + 10.0, 0.0), 100, 100, 80);
+  const wLeft = projectToWulff(gForChiElDeg(chiTarget - 10.0, 0.0), 100, 100, 80);
+  // Also check Friedel mate (-g) of an opposite-side reflection at -chiTarget:
+  // when looking near chi = +0° (wulffYaw = +90°), -g of chi = -20° sits at az = +80° on the SAME front hemisphere!
+  chiChecks.push({{
+    chiTarget,
+    screenXErr: Math.abs(screenX - viewCenterX),
+    chiRecErr: Math.abs(chiRec - chiTarget),
+    chiRoundTripErr: Math.abs(chiRoundTrip - chiTarget),
+    wSx: wCenter[0],
+    wSy: wCenter[1],
+    wHemi: wCenter[2],
+    wZ: wCenter[3],
+    upSy: wUp[1],
+    rightSx: wRight[0],
+    leftSx: wLeft[0],
+  }});
+}}
+
+// Check continuity across chi = 0° via Friedel mate (-g):
+// Looking at chi = +10° (yaw = +95°), a reflection at chi = -10° has direct +g at -95° (back),
+// while its Friedel mate -g sits at +85° (just 10° to the LEFT on the FRONT hemisphere)!
+state.detZoom = 1.0;
+setDetectorCenterAzimuthDeg(10.0);
 syncWulffYawFromDetector();
-const screenXAtNeg45Zoom = detToScreen(-45.0, 0.0, 900, 520, 0.0)[0];
-const chiRecoveredZoom = getCenteredDetectorAzimuthDeg();
-const wNeg45WhenCentered = projectToWulff(gForChiDeg(-45.0), 100, 100, 80);
-const wPos45WhenNegCentered = projectToWulff(gForChiDeg(45.0), 100, 100, 80);
+const gNeg10 = gForChiElDeg(-10.0, 0.0);
+const friedelNeg10AtPos10 = projectToWulff([-gNeg10[0], -gNeg10[1], -gNeg10[2]], 100, 100, 80);
 
-// Test 2: Peak source toggle ('mtz' -> 'predicted' -> 'integrated')
+// Diverging I/SIGI colors: weak (0.5σ -> blue: B > R), threshold (3.0σ -> neutral white: R≈G≈B>240), strong (24σ -> red: R > B)
+const colWeak = isigiToColor(0.5, 1.0);
+const colMid = isigiToColor(3.0, 1.0);
+const colStrong = isigiToColor(24.0, 1.0);
+
+// Peak source toggle ('mtz' -> 'predicted' -> 'integrated')
 applyPeakSource("mtz", false);
 const nMtzFrame = PEAKS.length;
 const nMtzWulff = getActiveWulffPeaks().length;
@@ -3099,12 +3173,9 @@ const nIntegWulff = getActiveWulffPeaks().length;
 const integShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse) && PEAKS[0].ellipse.length >= 6) ? "ellipse" : "circle";
 
 console.log(JSON.stringify({{
-  viewCenterX, screenXAt45, chiRecovered1, yawAt45,
-  pos45Hemi: wPos45[2], pos45Z: wPos45[3],
-  neg45Hemi: wNeg45[2], neg45Z: wNeg45[3],
-  screenXAtNeg45Zoom, chiRecoveredZoom,
-  neg45WhenCenteredHemi: wNeg45WhenCentered[2], neg45WhenCenteredZ: wNeg45WhenCentered[3],
-  pos45WhenNegCenteredHemi: wPos45WhenNegCentered[2],
+  chiChecks,
+  friedelNeg10AtPos10,
+  colWeak, colMid, colStrong,
   nMtzFrame, nMtzWulff, mtzShape,
   nPredFrame, nPredWulff, predShape,
   nIntegFrame, nIntegWulff, integShape,
@@ -3118,7 +3189,6 @@ console.log(JSON.stringify({{
     import shutil
 
     if shutil.which("node"):
-        # Syntax-check the entire inline application <script> block
         script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
         assert len(script_blocks) >= 1
         full_js_check = tmp_path / "full_inline_script.js"
@@ -3132,25 +3202,38 @@ console.log(JSON.stringify({{
             text=True,
         )
         js_out = json.loads(js_res.stdout.strip())
-        assert abs(js_out["screenXAt45"] - js_out["viewCenterX"]) < 1e-6
-        assert abs(js_out["chiRecovered1"] - 45.0) < 1e-6
-        assert abs(js_out["yawAt45"] - (-45.0)) < 1e-6
-        # When detector centers on chi=+45 deg, chi=+45 deg reflection is on bright FRONT hemisphere (z > 0.9)
-        # and chi=-45 deg reflection is on BACK hemisphere (hemi == -1, z < 0)!
-        assert js_out["pos45Hemi"] == 1 and js_out["pos45Z"] > 0.9
-        assert js_out["neg45Hemi"] == -1 and js_out["neg45Z"] < -0.3
-        # Symmetric check at chi=-45 deg with zoom=2.4
-        assert abs(js_out["screenXAtNeg45Zoom"] - js_out["viewCenterX"]) < 1e-6
-        assert abs(js_out["chiRecoveredZoom"] - (-45.0)) < 1e-6
-        assert (
-            js_out["neg45WhenCenteredHemi"] == 1 and js_out["neg45WhenCenteredZ"] > 0.9
-        )
-        assert js_out["pos45WhenNegCenteredHemi"] == -1
-        # Peak source toggle counts, Wulff projections, and circle-vs-ellipse rendering
+        for chk in js_out["chiChecks"]:
+            assert chk["screenXErr"] < 1e-6
+            assert chk["chiRecErr"] < 1e-6
+            assert chk["chiRoundTripErr"] < 1e-6
+            # Exact dead-center alignment on Wulff sphere (no θ vs 2θ offset, no mirror inversion!)
+            assert abs(chk["wSx"] - 100.0) < 1e-6
+            assert abs(chk["wSy"] - 100.0) < 1e-6
+            assert chk["wHemi"] == 1 and chk["wZ"] > 0.9999
+            # Positive elevation is upright (sy < 100) and +Δχ is to the right (rightSx > 100 > leftSx)
+            assert chk["upSy"] < 95.0
+            assert chk["rightSx"] > 102.0 and chk["leftSx"] < 98.0
+
+        # Friedel mate (-g) of chi=-10° sits smoothly to the left (sx < 100) on the FRONT hemisphere when viewing chi=+10°
+        fr_proj = js_out["friedelNeg10AtPos10"]
+        assert fr_proj[2] == 1 and fr_proj[3] > 0.98 and fr_proj[0] < 95.0
+
+        def _parse_rgba(s: str) -> tuple[int, int, int]:
+            nums = [int(x) for x in re.findall(r"\d+", s)[:3]]
+            return (nums[0], nums[1], nums[2])
+
+        rw, _gw, bw = _parse_rgba(js_out["colWeak"])
+        rm, gm, bm = _parse_rgba(js_out["colMid"])
+        rs, gs, bs = _parse_rgba(js_out["colStrong"])
+        assert bw > rw + 120  # weak I/σ -> cool blue
+        assert rm > 240 and gm > 240 and bm > 240  # 3σ pivot -> crisp neutral white
+        assert rs > bs + 120 and rs > gs + 120  # strong I/σ -> warm crimson red
+
         assert js_out["nMtzFrame"] == len(payload_mtz["mtz_peaks"])
         assert js_out["nMtzWulff"] == len(payload_mtz["mtz_sample_peaks"])
         assert js_out["mtzShape"] == "circle"
-        assert js_out["nPredFrame"] == 2 and js_out["nPredWulff"] == 3
+        assert js_out["nPredFrame"] == len(payload_mtz["predicted_peaks"])
+        assert js_out["nPredWulff"] == len(payload_mtz["predicted_sample_peaks"])
         assert js_out["predShape"] == "circle"
         assert js_out["nIntegFrame"] == 1 and js_out["nIntegWulff"] == 2
         assert js_out["integShape"] == "ellipse"
