@@ -13,10 +13,10 @@ Key features:
      to switch between Cylindrical and Spherical views at any time.
 3. **2-Layer Depth Parallax ("Look Behind the Predicted Spots")**:
    - *Back Layer (Detector Plate)*: Physical detector bank panels & log1p pixel intensity heatmaps.
-   - *Front Layer (Bragg Reflections)*: Vibrant spectral Bragg peak rings floating by
-     resolution ($d$-spacing) with subtle depth tethers to their physical spots on the
-     detector plate — moving the mouse shifts the predicted rings aside so you can
-     inspect the raw detector spot morphology directly underneath!
+   - *Front Layer (Bragg Reflections)*: Vibrant spectral Bragg peak rings floating
+     above the detector plate — moving the mouse shifts the predicted rings aside
+     without tether lines so you can inspect the unoccluded raw detector spot
+     morphology directly underneath!
 """
 
 from __future__ import annotations
@@ -4580,27 +4580,24 @@ def render_rainbow_html(
     margin: 0;
   }}
 
-  @keyframes swRainbowShoot {{
-    0% {{
-      stroke-dashoffset: 100;
-      opacity: 0.35;
-    }}
-    38%, 72% {{
-      stroke-dashoffset: 0;
-      opacity: 1;
-    }}
-    100% {{
-      stroke-dashoffset: -100;
-      opacity: 0.35;
-    }}
+  @keyframes swRainbowCycle {{
+    0%   {{ stroke: #ff3b6b; }}
+    17%  {{ stroke: #ff922b; }}
+    33%  {{ stroke: #ffd43b; }}
+    50%  {{ stroke: #38d9a9; }}
+    67%  {{ stroke: #38bdf8; }}
+    83%  {{ stroke: #c084fc; }}
+    100% {{ stroke: #ff3b6b; }}
   }}
 
-  @keyframes swRainbowShimmer {{
+  @keyframes swRainbowFloat {{
     0%, 100% {{
-      filter: hue-rotate(0deg) drop-shadow(0 0 2.5px rgba(244, 114, 182, 0.45));
+      transform: translateY(0px);
+      filter: saturate(1.18) drop-shadow(0 0 2.5px rgba(244, 114, 182, 0.48));
     }}
     50% {{
-      filter: hue-rotate(38deg) drop-shadow(0 0 3.5px rgba(56, 189, 248, 0.55));
+      transform: translateY(-0.6px);
+      filter: saturate(1.22) drop-shadow(0 0 3.2px rgba(56, 189, 248, 0.55));
     }}
   }}
 
@@ -4648,18 +4645,13 @@ def render_rainbow_html(
   }}
 
   .stdio-stopwatch .sw-icon {{
-    width: 16px;
-    height: 10px;
+    width: 18px;
+    height: 8.5px;
     flex-shrink: 0;
     overflow: visible;
-    opacity: 0.46;
+    opacity: 0.48;
     filter: saturate(0.55);
     transition: opacity 0.2s ease, filter 0.2s ease;
-  }}
-
-  .stdio-stopwatch .sw-rb {{
-    stroke-dasharray: 100;
-    stroke-dashoffset: 0;
   }}
 
   .stdio-stopwatch .sw-stage {{
@@ -4710,18 +4702,18 @@ def render_rainbow_html(
 
   .stdio-stopwatch.sw-running .sw-icon {{
     opacity: 1;
-    filter: saturate(1.15);
-    animation: swRainbowShimmer 1.8s ease-in-out infinite;
+    animation: swRainbowFloat 1.4s ease-in-out infinite;
   }}
 
   .stdio-stopwatch.sw-running .sw-rb {{
-    animation: swRainbowShoot 1.35s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+    animation: swRainbowCycle 0.9s linear infinite;
   }}
 
-  .stdio-stopwatch.sw-running .sw-rb-2 {{ animation-delay: 0.06s; }}
-  .stdio-stopwatch.sw-running .sw-rb-3 {{ animation-delay: 0.12s; }}
-  .stdio-stopwatch.sw-running .sw-rb-4 {{ animation-delay: 0.18s; }}
-  .stdio-stopwatch.sw-running .sw-rb-5 {{ animation-delay: 0.24s; }}
+  .stdio-stopwatch.sw-running .sw-rb-1 {{ animation-delay: 0s; }}
+  .stdio-stopwatch.sw-running .sw-rb-2 {{ animation-delay: -0.15s; }}
+  .stdio-stopwatch.sw-running .sw-rb-3 {{ animation-delay: -0.30s; }}
+  .stdio-stopwatch.sw-running .sw-rb-4 {{ animation-delay: -0.45s; }}
+  .stdio-stopwatch.sw-running .sw-rb-5 {{ animation-delay: -0.60s; }}
 
   .stdio-stopwatch.sw-running .sw-stage {{
     color: var(--accent-cyan);
@@ -5122,12 +5114,12 @@ def render_rainbow_html(
         <div class="terminal-wrap">
           <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
           <div class="stdio-stopwatch sw-idle" id="stdio-stopwatch" role="timer" aria-live="off" title="Step stopwatch (mm:ss.ms) — counts time spent in each pipeline step">
-            <svg class="sw-icon" viewBox="0 0 22 13" aria-hidden="true">
-              <path class="sw-rb sw-rb-1" pathLength="100" d="M 1.6 11.6 A 9.4 9.4 0 0 1 20.4 11.6" fill="none" stroke="#ff477e" stroke-width="1.35" stroke-linecap="round"></path>
-              <path class="sw-rb sw-rb-2" pathLength="100" d="M 3.3 11.6 A 7.7 7.7 0 0 1 18.7 11.6" fill="none" stroke="#ff922b" stroke-width="1.35" stroke-linecap="round"></path>
-              <path class="sw-rb sw-rb-3" pathLength="100" d="M 5.0 11.6 A 6.0 6.0 0 0 1 17.0 11.6" fill="none" stroke="#ffd43b" stroke-width="1.35" stroke-linecap="round"></path>
-              <path class="sw-rb sw-rb-4" pathLength="100" d="M 6.7 11.6 A 4.3 4.3 0 0 1 15.3 11.6" fill="none" stroke="#38d9a9" stroke-width="1.35" stroke-linecap="round"></path>
-              <path class="sw-rb sw-rb-5" pathLength="100" d="M 8.4 11.6 A 2.6 2.6 0 0 1 13.6 11.6" fill="none" stroke="#38bdf8" stroke-width="1.35" stroke-linecap="round"></path>
+            <svg class="sw-icon" viewBox="0 0 24 11" aria-hidden="true">
+              <path class="sw-rb sw-rb-1" d="M 0.55 9.8 A 12.2 12.2 0 0 1 23.45 9.8" fill="none" stroke="#ff3b6b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-2" d="M 1.24 9.8 A 11.55 11.55 0 0 1 22.76 9.8" fill="none" stroke="#ff922b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-3" d="M 1.94 9.8 A 10.9 10.9 0 0 1 22.06 9.8" fill="none" stroke="#ffd43b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-4" d="M 2.65 9.8 A 10.25 10.25 0 0 1 21.35 9.8" fill="none" stroke="#38d9a9" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-5" d="M 3.37 9.8 A 9.6 9.6 0 0 1 20.63 9.8" fill="none" stroke="#38bdf8" stroke-width="0.68" stroke-linecap="round"></path>
             </svg>
             <span class="sw-stage" id="stdio-stopwatch-stage">READY</span>
             <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>
@@ -7550,7 +7542,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const fgLayer = OVERLAY_PARALLAX_LAYER;
         const [x, y] = detToScreen(p.det_x + shiftAz, py, w, h, fgLayer);
         if (x < -30 || x > w + 30) return;
-        const [bx, by] = detToScreen(p.det_x + shiftAz, py, w, h, -0.35);
 
         const captured = isPeakCapturedByActiveZone(p);
         const isHovered = isPeakHighlightedTarget(p);
@@ -7563,15 +7554,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const r = isHovered ? baseR + 1.8 : (isOrbitMate ? baseR + 1.2 : baseR);
 
         ctx.save();
-        if (Math.hypot(x - bx, y - by) > 2.0 && (captured || isHovered || isOrbitMate)) {{
-          ctx.beginPath();
-          ctx.moveTo(bx, by);
-          ctx.lineTo(x, y);
-          ctx.strokeStyle = isOrbitMate ? "rgba(251, 191, 36, 0.55)" : "rgba(244, 63, 133, 0.38)";
-          ctx.lineWidth = 1.0;
-          ctx.stroke();
-        }}
-
         const ellPtsRaw = isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse;
         const strokeCol = isHovered
           ? "#f43f85"

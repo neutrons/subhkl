@@ -2383,7 +2383,11 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
         assert 'id="stdio-stopwatch-stage"' in html
         assert 'id="stdio-stopwatch-time"' in html
         assert 'class="sw-rb sw-rb-1"' in html
-        assert "swRainbowShoot" in html
+        assert 'viewBox="0 0 24 11"' in html
+        assert "swRainbowCycle" in html
+        assert "swRainbowShoot" not in html
+        assert "ctx.moveTo(bx, by)" not in html
+        assert "detToScreen(p.det_x + shiftAz, py, w, h, -0.35)" not in html
         assert "sw-hand" not in html
         assert "stdio-stopwatch-quip" not in html
         assert "BLINK" not in html

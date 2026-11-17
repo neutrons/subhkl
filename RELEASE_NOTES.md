@@ -35,6 +35,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Removed parallax tether lines connecting predicted Bragg peak rings to
+  detector spots in Rainbow Zones so shifting the parallax view leaves raw
+  detector pixels completely unoccluded.
 - Auto-selected CLI `solve --refinement band` default binning (`binning=8` for
   single/few-frame runs with $\le 240$ panel images, `binning=16` for larger
   multi-run scans) and gated `blind_band` quadrature/table bins to
