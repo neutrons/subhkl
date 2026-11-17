@@ -2382,7 +2382,8 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
         assert 'id="stdio-stopwatch"' in html
         assert 'id="stdio-stopwatch-stage"' in html
         assert 'id="stdio-stopwatch-time"' in html
-        assert 'id="stdio-stopwatch-quip"' in html
+        assert "stdio-stopwatch-quip" not in html
+        assert "BLINK" not in html
         assert "formatStopwatchParts" in html
         assert "startStepStopwatch" in html
         assert "finishStepStopwatch" in html
@@ -2403,28 +2404,27 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
         )
         assert proc.returncode == 0, proc.stderr
 
-        # Extract and execute formatStopwatchParts + getStopwatchSassyQuip in Node
+        # Extract and execute stageStopwatchMeta + formatStopwatchParts in Node
+        m_meta = re.search(
+            r"const SHORT_STAGE_STOPWATCH_LABELS\s*=.*?function stageStopwatchMeta\(stageIdOrIdx\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
         m_fmt = re.search(
             r"function formatStopwatchParts\(ms\)\s*\{.*?\n  \}",
             js_src,
             flags=re.DOTALL,
         )
-        m_quip = re.search(
-            r"function getStopwatchSassyQuip\(status, ms\)\s*\{.*?\n  \}",
-            js_src,
-            flags=re.DOTALL,
-        )
-        assert m_fmt and m_quip
+        assert m_meta and m_fmt
         eval_script = (
-            f'const UI_MODE = "{mode}";\n'
+            f"const PIPELINE = {json.dumps(payload['pipeline_stages'])};\n"
+            f"{m_meta.group(0)}\n"
             f"{m_fmt.group(0)}\n"
-            f"{m_quip.group(0)}\n"
             "console.log(JSON.stringify({"
+            "labels: [0, 1, 2, 3].map(i => stageStopwatchMeta(i).label),"
             "z: formatStopwatchParts(0).full,"
             "s: formatStopwatchParts(55984).full,"
-            "m: formatStopwatchParts(125007).full,"
-            'qRun: getStopwatchSassyQuip("running", 12000),'
-            'qDone: getStopwatchSassyQuip("done", 55984)'
+            "m: formatStopwatchParts(125007).full"
             "}));\n"
         )
         res = subprocess.run(
@@ -2434,15 +2434,15 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
             text=True,
         )
         out = json.loads(res.stdout.strip())
+        assert out["labels"] == [
+            "1. REDUCE",
+            "2. SOLVE",
+            "3. INTEGRATE",
+            "4. MERGE",
+        ]
         assert out["z"] == "00:00.000"
         assert out["s"] == "00:55.984"
         assert out["m"] == "02:05.007"
-        if mode == "arcade":
-            assert out["qRun"] == "COOKING"
-            assert out["qDone"] == "DIALED"
-        else:
-            assert out["qRun"] == ""
-            assert out["qDone"] == ""
 
     # Verify backend per-step millisecond timing lifecycle on NovaGalaxyPipelineRunner
     runner = NovaGalaxyPipelineRunner()

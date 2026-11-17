@@ -4598,27 +4598,28 @@ def render_rainbow_html(
 
   .stdio-stopwatch {{
     position: absolute;
-    right: 11px;
+    right: 9px;
     bottom: 5px;
     z-index: 4;
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    padding: 2px 7px 2px 6px;
+    gap: 4px;
+    padding: 2px 6px 2px 5px;
     border-radius: 999px;
-    background: rgba(8, 12, 24, 0.88);
+    background: rgba(8, 12, 24, 0.90);
     backdrop-filter: blur(5px);
     border: 1px solid rgba(51, 65, 85, 0.78);
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.50);
     font-family: var(--font-display);
     font-variant-numeric: tabular-nums;
-    font-size: 0.6rem;
+    font-size: 0.58rem;
     line-height: 1.15;
     color: var(--text-dim);
     cursor: pointer;
     user-select: none;
     transition: border-color 0.16s ease, color 0.16s ease, transform 0.12s ease;
-    max-width: calc(100% - 18px);
+    max-width: calc(100% - 14px);
+    overflow: hidden;
     white-space: nowrap;
   }}
 
@@ -4628,8 +4629,8 @@ def render_rainbow_html(
   }}
 
   .stdio-stopwatch .sw-icon {{
-    width: 12px;
-    height: 12px;
+    width: 11px;
+    height: 11px;
     flex-shrink: 0;
     color: var(--text-dim);
   }}
@@ -4639,35 +4640,25 @@ def render_rainbow_html(
   }}
 
   .stdio-stopwatch .sw-stage {{
-    font-size: 0.54rem;
+    font-size: 0.53rem;
     font-weight: 700;
-    letter-spacing: 0.35px;
+    letter-spacing: 0.25px;
     text-transform: uppercase;
     color: #94a3b8;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }}
 
   .stdio-stopwatch .sw-time {{
     font-weight: 700;
-    letter-spacing: 0.25px;
+    letter-spacing: 0.2px;
     color: #e2e8f0;
+    flex-shrink: 0;
   }}
 
   .stdio-stopwatch .sw-ms {{
-    font-size: 0.53rem;
+    font-size: 0.51rem;
     opacity: 0.82;
-  }}
-
-  .stdio-stopwatch .sw-quip {{
-    font-size: 0.52rem;
-    font-weight: 700;
-    letter-spacing: 0.25px;
-    color: var(--accent-gold);
-    padding-left: 2px;
-    border-left: 1px solid rgba(148, 163, 184, 0.25);
-  }}
-
-  .stdio-stopwatch .sw-quip:empty {{
-    display: none;
   }}
 
   .stdio-stopwatch.sw-running {{
@@ -4701,17 +4692,12 @@ def render_rainbow_html(
     color: var(--accent-green);
   }}
 
-  .stdio-stopwatch.sw-done .sw-quip {{
-    color: #6ee7b7;
-  }}
-
   .stdio-stopwatch.sw-stopped {{
     border-color: rgba(251, 191, 36, 0.60);
   }}
 
   .stdio-stopwatch.sw-stopped .sw-icon,
-  .stdio-stopwatch.sw-stopped .sw-stage,
-  .stdio-stopwatch.sw-stopped .sw-quip {{
+  .stdio-stopwatch.sw-stopped .sw-stage {{
     color: #fbbf24;
   }}
 
@@ -4720,8 +4706,7 @@ def render_rainbow_html(
   }}
 
   .stdio-stopwatch.sw-error .sw-icon,
-  .stdio-stopwatch.sw-error .sw-stage,
-  .stdio-stopwatch.sw-error .sw-quip {{
+  .stdio-stopwatch.sw-error .sw-stage {{
     color: #f87171;
   }}
 
@@ -5085,7 +5070,6 @@ def render_rainbow_html(
             </svg>
             <span class="sw-stage" id="stdio-stopwatch-stage">READY</span>
             <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>
-            <span class="sw-quip" id="stdio-stopwatch-quip"></span>
           </div>
         </div>
         <canvas id="canvas-hist" title="Click to cycle resolution sparkline: CC½ vs d → Completeness vs d → ⟨I/σ⟩ vs d" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
@@ -5885,8 +5869,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const stopwatchEl = document.getElementById("stdio-stopwatch");
   const stopwatchStageEl = document.getElementById("stdio-stopwatch-stage");
   const stopwatchTimeEl = document.getElementById("stdio-stopwatch-time");
-  const stopwatchQuipEl = document.getElementById("stdio-stopwatch-quip");
   let lastStopwatchRenderKey = "";
+
+  const SHORT_STAGE_STOPWATCH_LABELS = {{
+    reduce: "1. REDUCE",
+    solve: "2. SOLVE",
+    integrate: "3. INTEGRATE",
+    merge: "4. MERGE",
+  }};
 
   function stageStopwatchMeta(stageIdOrIdx) {{
     let st = null;
@@ -5896,9 +5886,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       st = PIPELINE.find(p => p && p.stage_id === stageIdOrIdx) || null;
     }}
     const sid = (st && st.stage_id) || (typeof stageIdOrIdx === "string" ? stageIdOrIdx : "solve");
+    if (SHORT_STAGE_STOPWATCH_LABELS[sid]) {{
+      const lbl = SHORT_STAGE_STOPWATCH_LABELS[sid];
+      return {{ stageId: sid, label: lbl, shortName: lbl.replace(/^\\d+\\.\\s*/, "") }};
+    }}
     const stepNum = st && st.step_num ? `${{st.step_num}}. ` : "";
     const shortName = st && st.name
-      ? String(st.name).replace(/^\\d+\\.\\s*/, "").toUpperCase()
+      ? String(st.name).replace(/^\\d+\\.\\s*/, "").replace(/\\s*\\([^)]*\\)/g, "").replace(/\\s*&.*$/, "").trim().toUpperCase()
       : String(sid).toUpperCase();
     return {{ stageId: sid, label: `${{stepNum}}${{shortName}}`, shortName }};
   }}
@@ -5912,26 +5906,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const mmss = `${{String(mins).padStart(2, "0")}}:${{String(secs).padStart(2, "0")}}`;
     const dotMs = `.${{String(millis).padStart(3, "0")}}`;
     return {{ mmss, dotMs, full: `${{mmss}}${{dotMs}}`, clamped }};
-  }}
-
-  function getStopwatchSassyQuip(status, ms) {{
-    if (UI_MODE === "pro") return "";
-    const sec = (Number(ms) || 0) / 1000;
-    if (status === "running") {{
-      if (sec < 5) return "GO!";
-      if (sec < 25) return "COOKING";
-      if (sec < 75) return "CRUNCHING";
-      return "DEEP SPACE";
-    }}
-    if (status === "done") {{
-      if (sec < 8) return "BLINK!";
-      if (sec < 40) return "ZIPPY";
-      if (sec < 120) return "DIALED";
-      return "MARATHON";
-    }}
-    if (status === "stopped") return "HALT";
-    if (status === "error") return "OOPS";
-    return "";
   }}
 
   function getEntryLiveMs(entry, nowPerf = performance.now()) {{
@@ -6024,15 +5998,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     const parts = formatStopwatchParts(elapsedMs);
-    const quip = getStopwatchSassyQuip(status, parts.clamped);
-    const renderKey = `${{status}}|${{stageText}}|${{parts.full}}|${{quip}}`;
+    const renderKey = `${{status}}|${{stageText}}|${{parts.full}}`;
     if (!force && renderKey === lastStopwatchRenderKey) return;
     lastStopwatchRenderKey = renderKey;
 
     stopwatchEl.className = `stdio-stopwatch sw-${{status}}`;
     stopwatchStageEl.textContent = stageText;
     stopwatchTimeEl.innerHTML = `${{parts.mmss}}<span class="sw-ms">${{parts.dotMs}}</span>`;
-    if (stopwatchQuipEl) stopwatchQuipEl.textContent = quip;
     if (force || status !== "running" || (parts.clamped % 500) < 25) {{
       stopwatchEl.title = buildStopwatchTooltip(nowPerf);
     }}
