@@ -2668,3 +2668,492 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
     assert snap_both["integrate"]["state"] == "deleted"
     assert snap_both["integrate"]["finished_at"] is not None
     assert snap_both["integrate"]["elapsed_ms"] >= 3200
+
+
+def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> None:
+    """Verify Wulff chi alignment, Pred/Integ/.mtz peak toggle + shapes, and local .mtz B/SG update preserving U."""
+    import asyncio
+    import json
+    import re
+    import subprocess
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import gemmi
+    import h5py
+    import numpy as np
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.nova_app.views.main_view import MainApp
+    from subhkl.viz.nova_rainbow_view import RainbowZonesViewModel
+    from subhkl.viz.rainbow_zones import (
+        _u_from_ub,
+        apply_mtz_to_payload,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # 1. Build multi-frame CG4D integrated.h5 with both integrated peaks (with u/v variances -> ellipses)
+    #    and unintegrated predicted reflections (sigma == 0), plus a non-trivial orientation matrix U.
+    U_true = Rotation.from_euler("zyx", [27.0, -14.0, 38.0], degrees=True).as_matrix()
+    cell_orig = [54.0, 54.0, 54.0, 90.0, 90.0, 90.0]
+    B_orig_raw, _ = cartesian_matrix_metric_tensor(
+        *cell_orig[:3], *np.deg2rad(cell_orig[3:])
+    )
+    B_orig = np.asarray(B_orig_raw, dtype=float)
+    R0 = np.eye(3)
+    R1 = Rotation.from_euler("y", 25.0, degrees=True).as_matrix()
+    R_runs = np.stack([R0, R1], axis=0)
+
+    first_bk_key = min(beamlines["CG4D"], key=int)
+    first_bk = int(first_bk_key)
+    det1 = Detector(dict(beamlines["CG4D"][first_bk_key]))
+    # Pick two pixels on first bank for run 0 (one integrated, one predicted-only with sigma=0) and one for run 1
+    xyz_a = np.asarray(det1.pixel_to_lab(110.0, 120.0), dtype=float)
+    xyz_b = np.asarray(det1.pixel_to_lab(140.0, 150.0), dtype=float)
+    xyz_c = np.asarray(det1.pixel_to_lab(125.0, 135.0), dtype=float)
+    integ_h5 = tmp_path / "integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        smp = hf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 21 21 21")
+        smp.create_dataset("cell", data=np.array(cell_orig, dtype=float))
+        smp.create_dataset("U", data=U_true)
+        smp.create_dataset("B", data=B_orig)
+        gon = hf.create_group("goniometer")
+        gon.create_dataset("R", data=R_runs)
+        gon.create_dataset("angles", data=np.array([[0.0], [25.0]], dtype=float))
+        gon.create_dataset("axes", data=np.array([[0.0, 1.0, 0.0]], dtype=float))
+        hf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        hf.create_dataset(
+            "bank_ids", data=np.array([first_bk, first_bk], dtype=np.int32)
+        )
+        hf.create_dataset(
+            "files",
+            data=np.array(["CG4D_2523_0.nxs.h5", "CG4D_2523_1.nxs.h5"], dtype="S32"),
+        )
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.8, 4.5], dtype=float)
+        )
+        pk = hf.create_group("peaks")
+        pk.create_dataset("xyz", data=np.vstack([xyz_a, xyz_b, xyz_c]))
+        pk.create_dataset(
+            "bank", data=np.array([first_bk, first_bk, first_bk], dtype=np.int32)
+        )
+        pk.create_dataset("pixel_r", data=np.array([110.0, 140.0, 125.0], dtype=float))
+        pk.create_dataset("pixel_c", data=np.array([120.0, 150.0, 135.0], dtype=float))
+        pk.create_dataset("intensity", data=np.array([180.0, 0.0, 140.0], dtype=float))
+        pk.create_dataset("sigma", data=np.array([12.0, 0.0, 10.0], dtype=float))
+        pk.create_dataset("var_u", data=np.array([1.2e-4, 1.0e-4, 1.2e-4], dtype=float))
+        pk.create_dataset("var_v", data=np.array([0.6e-4, 1.0e-4, 0.6e-4], dtype=float))
+        pk.create_dataset("cov_uv", data=np.array([0.1e-4, 0.0, 0.1e-4], dtype=float))
+        pk.create_dataset("h", data=np.array([2, 3, 1], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([1, -1, 2], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([-3, -2, -3], dtype=np.int32))
+        pk.create_dataset("lambda", data=np.array([3.2, 3.6, 3.4], dtype=float))
+        pk.create_dataset("run_index", data=np.array([0, 0, 1], dtype=np.int32))
+
+    payload0 = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        frame_index=0,
+        include_panel_images=False,
+    )
+    assert payload0["artifact_kind"] == "integrator"
+    assert payload0["default_peak_source"] == "integrated"
+    # Frame 0 has 1 integrated peak (with ellipse) and 2 total predicted peaks!
+    assert len(payload0["integrated_peaks"]) == 1
+    assert len(payload0["predicted_peaks"]) == 2
+    assert isinstance(payload0["integrated_peaks"][0].get("ellipse"), list)
+    assert len(payload0["integrated_peaks"][0]["ellipse"]) >= 6
+    # All-runs sample_peaks: 2 integrated across runs 0 & 1, 3 predicted across runs 0 & 1
+    assert len(payload0["integrated_sample_peaks"]) == 2
+    assert len(payload0["predicted_sample_peaks"]) == 3
+    assert np.allclose(np.asarray(payload0["u_matrix"]), U_true, atol=1e-5)
+
+    # Also verify sibling predictor.h5 (banks/* format) supplies full predicted_peaks when integrated.h5 is pre-filtered
+    sib_dir = tmp_path / "with_sibling_pred"
+    sib_dir.mkdir()
+    integ_only_h5 = sib_dir / "integrated.h5"
+    with h5py.File(integ_h5, "r") as src_f, h5py.File(integ_only_h5, "w") as dst_f:
+        for k_top in src_f:
+            if k_top != "peaks":
+                src_f.copy(k_top, dst_f)
+        for ak, av in src_f.attrs.items():
+            dst_f.attrs[ak] = av
+        pk_dst = dst_f.create_group("peaks")
+        # Keep only the 2 integrated peaks (drop index 1)
+        keep_idx = np.array([0, 2], dtype=int)
+        for pk_k in src_f["peaks"]:
+            pk_dst.create_dataset(pk_k, data=np.asarray(src_f["peaks"][pk_k])[keep_idx])
+    pred_sib_h5 = sib_dir / "predictor.h5"
+    with h5py.File(pred_sib_h5, "w") as pf:
+        pf.create_dataset(
+            "bank_ids", data=np.array([first_bk, first_bk], dtype=np.int32)
+        )
+        pf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        b_grp = pf.create_group("banks")
+        g0 = b_grp.create_group("0")
+        g0.create_dataset("i", data=np.array([110.0, 140.0, 160.0], dtype=float))
+        g0.create_dataset("j", data=np.array([120.0, 150.0, 170.0], dtype=float))
+        g0.create_dataset("h", data=np.array([2, 3, 4], dtype=np.int32))
+        g0.create_dataset("k", data=np.array([1, -1, 0], dtype=np.int32))
+        g0.create_dataset("l", data=np.array([-3, -2, -1], dtype=np.int32))
+        g0.create_dataset("wavelength", data=np.array([3.2, 3.6, 3.9], dtype=float))
+        g1 = b_grp.create_group("1")
+        g1.create_dataset("i", data=np.array([125.0, 155.0], dtype=float))
+        g1.create_dataset("j", data=np.array([135.0, 165.0], dtype=float))
+        g1.create_dataset("h", data=np.array([1, 2], dtype=np.int32))
+        g1.create_dataset("k", data=np.array([2, 2], dtype=np.int32))
+        g1.create_dataset("l", data=np.array([-3, -2], dtype=np.int32))
+        g1.create_dataset("wavelength", data=np.array([3.4, 3.8], dtype=float))
+    payload_sib = build_rainbow_zone_payload(
+        replay_h5=integ_only_h5,
+        frame_index=0,
+        include_panel_images=False,
+    )
+    assert len(payload_sib["integrated_peaks"]) == 1
+    assert len(payload_sib["predicted_peaks"]) == 3
+    assert len(payload_sib["integrated_sample_peaks"]) == 2
+    assert len(payload_sib["predicted_sample_peaks"]) == 5
+
+    # 2. Create a custom local .mtz with an intentionally different space group & unit cell (e.g. P 32 2 1)
+    mtz_cell = [59.8, 59.8, 96.4, 90.0, 90.0, 120.0]
+    B_mtz_raw, _ = cartesian_matrix_metric_tensor(
+        *mtz_cell[:3], *np.deg2rad(mtz_cell[3:])
+    )
+    B_mtz_expected = np.asarray(B_mtz_raw, dtype=float)
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.find_spacegroup_by_name("P 32 2 1")
+    mtz.set_cell_for_all(gemmi.UnitCell(*mtz_cell))
+    mtz.add_dataset("custom")
+    mtz.add_column("I", "J")
+    mtz.add_column("SIGI", "Q")
+
+    # Seed ASU reflections whose rays under U_true @ B_mtz_expected hit CG4D cylindrical/flat detectors in [2.8, 4.5] A
+    cg4d_dets = {int(bk): Detector(dict(cfg)) for bk, cfg in beamlines["CG4D"].items()}
+    from subhkl.viz.rainbow_zones import _raycast_hkl_on_detectors
+
+    grid = np.mgrid[-8:9, -8:9, -8:9].reshape(3, -1).T
+    grid = grid[np.any(grid != 0, axis=1)]
+    cast_seed = _raycast_hkl_on_detectors(
+        grid, U_true, B_mtz_expected, R0, cg4d_dets, (2.8, 4.5)
+    )
+    assert len(cast_seed["hkl"]) >= 5
+    asu_mtz = gemmi.ReciprocalAsu(mtz.spacegroup)
+    ops_mtz = mtz.spacegroup.operations()
+    seen_asu: set[tuple[int, int, int]] = set()
+    mtz_rows: list[list[float]] = []
+    for idx_h, h_hit in enumerate(cast_seed["hkl"][:20]):
+        ha, _ = asu_mtz.to_asu([int(h_hit[0]), int(h_hit[1]), int(h_hit[2])], ops_mtz)
+        key_a = (int(ha[0]), int(ha[1]), int(ha[2]))
+        if key_a not in seen_asu:
+            seen_asu.add(key_a)
+            mtz_rows.append(
+                [
+                    float(key_a[0]),
+                    float(key_a[1]),
+                    float(key_a[2]),
+                    250.0 + 10.0 * idx_h,
+                    8.0,
+                ]
+            )
+    mtz.set_data(np.asarray(mtz_rows, dtype=np.float32))
+    mtz_path = tmp_path / "custom_reflections.mtz"
+    mtz.write_to_file(str(mtz_path))
+
+    payload_mtz = apply_mtz_to_payload(
+        payload0, mtz_path, {"name": "custom_reflections.mtz"}
+    )
+    # U must remain strictly preserved while B, UB, cell, and space_group update to the MTZ's values!
+    assert np.allclose(np.asarray(payload_mtz["u_matrix"]), U_true, atol=1e-5)
+    assert np.allclose(
+        _u_from_ub(np.asarray(payload_mtz["ub_matrix"])), U_true, atol=1e-4
+    )
+    assert np.allclose(np.asarray(payload_mtz["b_matrix"]), B_mtz_expected, atol=1e-5)
+    assert np.allclose(
+        np.asarray(payload_mtz["ub_matrix"]), U_true @ B_mtz_expected, atol=1e-5
+    )
+    assert payload_mtz["space_group"] == mtz.spacegroup.hm
+    assert np.allclose(payload_mtz["cell"], mtz_cell, atol=1e-3)
+    assert payload_mtz["default_peak_source"] == "mtz"
+    assert len(payload_mtz["mtz_peaks"]) >= len(mtz_rows)
+    assert len(payload_mtz["mtz_sample_peaks"]) >= len(payload_mtz["mtz_peaks"])
+    # Existing predicted and integrated peaks remain preserved for toggle switching
+    assert len(payload_mtz["integrated_peaks"]) == 1
+    assert len(payload_mtz["predicted_peaks"]) == 2
+
+    # Loading an MTZ when no U matrix is present must raise a clear ValueError
+    empty_payload = {"artifact_kind": "empty", "panels": payload0["panels"]}
+    try:
+        apply_mtz_to_payload(empty_payload, mtz_path)
+        raise AssertionError("Expected ValueError when loading MTZ without U matrix")
+    except ValueError as exc:
+        assert "U orientation matrix" in str(exc)
+
+    # 3. Verify HTTP ViewModel & Trame MainApp local .mtz loading + persistence across frame switches
+    vm = RainbowZonesViewModel(replay_h5=integ_h5, include_panel_images=False)
+    vm.payload = apply_mtz_to_payload(
+        vm.payload, mtz_path, {"name": "custom_reflections.mtz"}
+    )
+    vm.mtz_overlay_path = str(mtz_path)
+    vm.mtz_overlay_info = {"name": "custom_reflections.mtz"}
+    reloaded_f1 = vm.reload(frame_index=1)
+    assert reloaded_f1["frame_index"] == 1
+    assert reloaded_f1["mtz_overlay_name"] == "custom_reflections.mtz"
+    assert reloaded_f1["space_group"] == mtz.spacegroup.hm
+    assert len(reloaded_f1["mtz_peaks"]) > 0
+    assert len(reloaded_f1["integrated_peaks"]) == 1  # run 1 integrated peak preserved!
+
+    app_inst = object.__new__(MainApp)
+    app_inst.pipeline_runner = MagicMock()
+    app_inst.pipeline_runner.current_frame_index = 0
+    sub_m = SubhklGalaxyModel()
+    app_inst.view_model = SimpleNamespace(model=SimpleNamespace(subhkl=sub_m))
+    aio_app = web.Application()
+    app_inst._bind_routes(SimpleNamespace(app=aio_app))
+
+    # Before U is solved, /api/payload?file_path=...mtz returns HTTP 400
+    req_no_u = make_mocked_request(
+        "GET",
+        f"/api/payload?file_path={mtz_path}",
+        app=aio_app,
+    )
+    resp_no_u = asyncio.run(aio_app._handle(req_no_u))
+    assert resp_no_u.status == 400
+
+    # Load integrated.h5, then load local .mtz, then switch to frame=1
+    req_h5 = make_mocked_request(
+        "GET",
+        f"/api/payload?file_path={integ_h5}",
+        app=aio_app,
+    )
+    resp_h5 = asyncio.run(aio_app._handle(req_h5))
+    assert resp_h5.status == 200
+    assert sub_m.data.peaks_file == str(integ_h5)
+
+    req_mtz = make_mocked_request(
+        "GET",
+        f"/api/payload?file_path={mtz_path}",
+        app=aio_app,
+    )
+    resp_mtz = asyncio.run(aio_app._handle(req_mtz))
+    assert resp_mtz.status == 200
+    doc_mtz = json.loads(resp_mtz.body.decode("utf-8"))
+    assert doc_mtz["default_peak_source"] == "mtz"
+    assert doc_mtz["space_group"] == mtz.spacegroup.hm
+    assert sub_m.data.peaks_file == str(integ_h5)  # peaks_file not clobbered!
+    assert sub_m.data.space_group == mtz.spacegroup.hm
+    assert abs(sub_m.data.a - mtz_cell[0]) < 1e-2
+
+    req_f1 = make_mocked_request("GET", "/api/payload?frame=1", app=aio_app)
+    resp_f1 = asyncio.run(aio_app._handle(req_f1))
+    assert resp_f1.status == 200
+    doc_f1 = json.loads(resp_f1.body.decode("utf-8"))
+    assert doc_f1["frame_index"] == 1
+    assert doc_f1["mtz_overlay_name"] == "custom_reflections.mtz"
+    assert len(doc_f1["mtz_peaks"]) > 0
+
+    # 4. Execute rendered HTML/JS helpers in Node.js to verify:
+    #    - Wulff azimuth alignment: centering detector on chi=+45 deg rotates chi=+45 deg reflection to FRONT
+    #      of Wulff sphere (zCam > 0.9) and chi=-45 deg reflection to BACK (zCam < 0), at both zoom=1 and zoom=2.4!
+    #    - Peak toggle ('predicted' | 'integrated' | 'mtz') switches PEAKS + SAMPLE_PEAKS + getActiveWulffPeaks()
+    #      and only renders ellipses when peakSource === 'integrated' (circles for 'predicted' and 'mtz').
+    html_doc = render_rainbow_html(payload_mtz)
+    assert 'accept=".h5,.hdf5,.nxs,.mtz"' in html_doc
+    assert 'id="peak-source-group"' in html_doc
+    assert 'id="btn-peaks-pred"' in html_doc
+    assert 'id="btn-peaks-integ"' in html_doc
+    assert 'id="btn-peaks-mtz"' in html_doc
+    assert (
+        'state.peakSource === "integrated" && Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6'
+        in html_doc
+    )
+
+    def _extract_js_fn(name: str) -> str:
+        pat = rf"function {name}\b[\s\S]*?\n  \}}"
+        m = re.search(pat, html_doc)
+        assert m is not None, f"Missing JS function {name}"
+        return m.group(0)
+
+    fn_names = [
+        "extractPeakBucketsFromPayload",
+        "detToScreen",
+        "getCenteredDetectorAzimuthDeg",
+        "setDetectorCenterAzimuthDeg",
+        "syncWulffYawFromDetector",
+        "resolveAvailablePeakSource",
+        "syncPeakSourceButtons",
+        "applyPeakSource",
+        "getActiveGoniometerR",
+        "projectToWulff",
+        "getActiveWulffPeaks",
+    ]
+    extracted_fns = "\n".join(_extract_js_fn(fn) for fn in fn_names)
+
+    js_harness = f"""
+const DATA = {json.dumps(payload_mtz)};
+const initBuckets = extractPeakBucketsFromPayload(DATA);
+let PREDICTED_PEAKS = initBuckets.predPeaks;
+let PREDICTED_SAMPLE_PEAKS = initBuckets.predSample;
+let INTEGRATED_PEAKS = initBuckets.integPeaks;
+let INTEGRATED_SAMPLE_PEAKS = initBuckets.integSample;
+let MTZ_PEAKS = initBuckets.mtzPeaks;
+let MTZ_SAMPLE_PEAKS = initBuckets.mtzSample;
+const PEAKS = [...(DATA.peaks || [])];
+const SAMPLE_PEAKS = [...(DATA.sample_peaks || PEAKS)];
+const detCanvas = {{ getBoundingClientRect: () => ({{ width: 900, height: 520 }}) }};
+const btns = {{
+  "btn-peaks-pred": {{ disabled: false, title: "", _cls: new Set(), classList: {{ toggle(c, on) {{ if (on) btns["btn-peaks-pred"]._cls.add(c); else btns["btn-peaks-pred"]._cls.delete(c); }} }} }},
+  "btn-peaks-integ": {{ disabled: false, title: "", _cls: new Set(), classList: {{ toggle(c, on) {{ if (on) btns["btn-peaks-integ"]._cls.add(c); else btns["btn-peaks-integ"]._cls.delete(c); }} }} }},
+  "btn-peaks-mtz": {{ disabled: false, title: "", _cls: new Set(), classList: {{ toggle(c, on) {{ if (on) btns["btn-peaks-mtz"]._cls.add(c); else btns["btn-peaks-mtz"]._cls.delete(c); }} }} }},
+}};
+globalThis.document = {{ getElementById: (id) => btns[id] || null }};
+const state = {{
+  projection: "cylindrical",
+  peakSource: DATA.default_peak_source || "mtz",
+  wulffScope: "all_runs",
+  wulffColorMode: "wavelength",
+  wulffYawDeg: 0.0,
+  wulffPitchDeg: 0.0,
+  wulffZoom: 1.0,
+  parallaxX: 0.0,
+  parallaxY: 0.0,
+  parallaxStrength: 1.0,
+  detZoom: 1.0,
+  detPanX: 0.0,
+  detPanY: 0.0,
+  hoveredPeakId: null,
+  hoveredPeakObj: null,
+  selectedPeakId: null,
+  selectedPeakObj: null,
+  activeOrbitId: null,
+}};
+function getActiveBounds() {{ return {{ minX: -180.0, maxX: 180.0, minY: -0.25, maxY: 0.25 }}; }}
+function getDetectorPlotBox(w, h) {{
+  const padL = 42, padR = 12, padT = 10, padB = 22;
+  return {{ originX: padL, originY: padT, plotW: Math.max(40, w - padL - padR), plotH: Math.max(40, h - padT - padB) }};
+}}
+function mat3Vec(M, v) {{
+  return [
+    M[0][0]*v[0] + M[0][1]*v[1] + M[0][2]*v[2],
+    M[1][0]*v[0] + M[1][1]*v[1] + M[1][2]*v[2],
+    M[2][0]*v[0] + M[2][1]*v[1] + M[2][2]*v[2],
+  ];
+}}
+function hasMergedCarelessData() {{ return false; }}
+function hasIntegratedIsigi() {{ return true; }}
+function isPeakVisible() {{ return true; }}
+function syncWulffUI() {{}}
+function renderZoneList() {{}}
+function updateHUD() {{}}
+function renderDetector() {{}}
+{extracted_fns}
+
+// Test 1: Center detector at chi = +45 deg (at zoom=1.0 and zoom=2.4)
+DATA.goniometer_R = [[1,0,0],[0,1,0],[0,0,1]];
+setDetectorCenterAzimuthDeg(45.0);
+syncWulffYawFromDetector();
+const box = getDetectorPlotBox(900, 520);
+const viewCenterX = box.originX + 0.5 * box.plotW;
+const screenXAt45 = detToScreen(45.0, 0.0, 900, 520, 0.0)[0];
+const chiRecovered1 = getCenteredDetectorAzimuthDeg();
+const yawAt45 = state.wulffYawDeg;
+// Scattering vector g = normalize(kf(chi) - [0,0,1]) for equatorial reflections at chi=+45 deg and chi=-45 deg
+function gForChiDeg(chiDeg) {{
+  const rad = chiDeg * Math.PI / 180.0;
+  const qx = Math.sin(rad), qy = 0.0, qz = Math.cos(rad) - 1.0;
+  const n = Math.hypot(qx, qy, qz);
+  return [qx / n, qy / n, qz / n];
+}}
+const wPos45 = projectToWulff(gForChiDeg(45.0), 100, 100, 80);
+const wNeg45 = projectToWulff(gForChiDeg(-45.0), 100, 100, 80);
+
+state.detZoom = 2.4;
+setDetectorCenterAzimuthDeg(-45.0);
+syncWulffYawFromDetector();
+const screenXAtNeg45Zoom = detToScreen(-45.0, 0.0, 900, 520, 0.0)[0];
+const chiRecoveredZoom = getCenteredDetectorAzimuthDeg();
+const wNeg45WhenCentered = projectToWulff(gForChiDeg(-45.0), 100, 100, 80);
+const wPos45WhenNegCentered = projectToWulff(gForChiDeg(45.0), 100, 100, 80);
+
+// Test 2: Peak source toggle ('mtz' -> 'predicted' -> 'integrated')
+applyPeakSource("mtz", false);
+const nMtzFrame = PEAKS.length;
+const nMtzWulff = getActiveWulffPeaks().length;
+const mtzShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse)) ? "ellipse" : "circle";
+
+applyPeakSource("predicted", false);
+const nPredFrame = PEAKS.length;
+const nPredWulff = getActiveWulffPeaks().length;
+const predShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse)) ? "ellipse" : "circle";
+
+applyPeakSource("integrated", false);
+const nIntegFrame = PEAKS.length;
+const nIntegWulff = getActiveWulffPeaks().length;
+const integShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse) && PEAKS[0].ellipse.length >= 6) ? "ellipse" : "circle";
+
+console.log(JSON.stringify({{
+  viewCenterX, screenXAt45, chiRecovered1, yawAt45,
+  pos45Hemi: wPos45[2], pos45Z: wPos45[3],
+  neg45Hemi: wNeg45[2], neg45Z: wNeg45[3],
+  screenXAtNeg45Zoom, chiRecoveredZoom,
+  neg45WhenCenteredHemi: wNeg45WhenCentered[2], neg45WhenCenteredZ: wNeg45WhenCentered[3],
+  pos45WhenNegCenteredHemi: wPos45WhenNegCentered[2],
+  nMtzFrame, nMtzWulff, mtzShape,
+  nPredFrame, nPredWulff, predShape,
+  nIntegFrame, nIntegWulff, integShape,
+  btnPredDisabled: btns["btn-peaks-pred"].disabled,
+  btnIntegDisabled: btns["btn-peaks-integ"].disabled,
+  btnMtzDisabled: btns["btn-peaks-mtz"].disabled,
+}}));
+"""
+    harness_path = tmp_path / "wulff_peaks_mtz_harness.js"
+    harness_path.write_text(js_harness, encoding="utf-8")
+    import shutil
+
+    if shutil.which("node"):
+        # Syntax-check the entire inline application <script> block
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        assert len(script_blocks) >= 1
+        full_js_check = tmp_path / "full_inline_script.js"
+        full_js_check.write_text(script_blocks[-1], encoding="utf-8")
+        subprocess.run(["node", "--check", str(full_js_check)], check=True)
+
+        js_res = subprocess.run(
+            ["node", str(harness_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        js_out = json.loads(js_res.stdout.strip())
+        assert abs(js_out["screenXAt45"] - js_out["viewCenterX"]) < 1e-6
+        assert abs(js_out["chiRecovered1"] - 45.0) < 1e-6
+        assert abs(js_out["yawAt45"] - (-45.0)) < 1e-6
+        # When detector centers on chi=+45 deg, chi=+45 deg reflection is on bright FRONT hemisphere (z > 0.9)
+        # and chi=-45 deg reflection is on BACK hemisphere (hemi == -1, z < 0)!
+        assert js_out["pos45Hemi"] == 1 and js_out["pos45Z"] > 0.9
+        assert js_out["neg45Hemi"] == -1 and js_out["neg45Z"] < -0.3
+        # Symmetric check at chi=-45 deg with zoom=2.4
+        assert abs(js_out["screenXAtNeg45Zoom"] - js_out["viewCenterX"]) < 1e-6
+        assert abs(js_out["chiRecoveredZoom"] - (-45.0)) < 1e-6
+        assert (
+            js_out["neg45WhenCenteredHemi"] == 1 and js_out["neg45WhenCenteredZ"] > 0.9
+        )
+        assert js_out["pos45WhenNegCenteredHemi"] == -1
+        # Peak source toggle counts, Wulff projections, and circle-vs-ellipse rendering
+        assert js_out["nMtzFrame"] == len(payload_mtz["mtz_peaks"])
+        assert js_out["nMtzWulff"] == len(payload_mtz["mtz_sample_peaks"])
+        assert js_out["mtzShape"] == "circle"
+        assert js_out["nPredFrame"] == 2 and js_out["nPredWulff"] == 3
+        assert js_out["predShape"] == "circle"
+        assert js_out["nIntegFrame"] == 1 and js_out["nIntegWulff"] == 2
+        assert js_out["integShape"] == "ellipse"
+        assert js_out["btnPredDisabled"] is False
+        assert js_out["btnIntegDisabled"] is False
+        assert js_out["btnMtzDisabled"] is False

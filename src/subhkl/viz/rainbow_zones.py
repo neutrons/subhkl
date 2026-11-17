@@ -1040,18 +1040,301 @@ def validate_subhkl_ingestible_dataset(
         ) from exc
 
 
+def _u_from_ub(ub_matrix: Any) -> np.ndarray:
+    """Extract proper orthogonal orientation matrix U from UB = U @ B (B upper-triangular, diag > 0)."""
+    ub = np.asarray(ub_matrix, dtype=float)
+    if ub.shape != (3, 3):
+        raise ValueError("ub_matrix must have shape (3, 3)")
+    q_mat, r_mat = np.linalg.qr(ub)
+    signs = np.sign(np.diag(r_mat))
+    signs[signs == 0.0] = 1.0
+    u_mat = q_mat * signs[None, :]
+    if np.linalg.det(u_mat) < 0.0:
+        u_mat[:, -1] *= -1.0
+    return u_mat
+
+
+def _reconstruct_detectors_from_payload(payload: dict[str, Any]) -> dict[int, Any]:
+    """Rebuild active Detector objects from payload['detector_configs'] or instrument defaults."""
+    from subhkl.instrument.detector import Detector
+
+    panel_banks = {
+        int(p["bank"])
+        for p in (payload.get("panels") or [])
+        if isinstance(p, dict) and "bank" in p
+    }
+    detectors: dict[int, Any] = {}
+    det_cfgs = payload.get("detector_configs")
+    if isinstance(det_cfgs, dict) and det_cfgs:
+        for bk_s, cfg in det_cfgs.items():
+            try:
+                bid = int(bk_s)
+            except (ValueError, TypeError):
+                continue
+            if panel_banks and bid not in panel_banks:
+                continue
+            if isinstance(cfg, dict) and (
+                all(k in cfg for k in ("center", "uhat", "vhat", "width", "height"))
+                or str(cfg.get("panel_type")) == "cylindrical"
+            ):
+                full_cfg = {"panel_type": "flat", "m": 256, "n": 256, **cfg}
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
+                    detectors[bid] = Detector(full_cfg)
+    if not detectors:
+        inst = str(payload.get("instrument") or "CG4D")
+        bl_map = (payload.get("beamline_detectors") or {}).get(inst)
+        if isinstance(bl_map, dict) and bl_map:
+            for bk_s, cfg in bl_map.items():
+                try:
+                    bid = int(bk_s)
+                except (ValueError, TypeError):
+                    continue
+                if panel_banks and bid not in panel_banks:
+                    continue
+                full_cfg = {"panel_type": "flat", "m": 256, "n": 256, **cfg}
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
+                    detectors[bid] = Detector(full_cfg)
+        if not detectors:
+            loaded = _load_detectors_from_h5(None, inst)
+            for bid, det in loaded.items():
+                if not panel_banks or int(bid) in panel_banks:
+                    detectors[int(bid)] = det
+    return detectors
+
+
+def _raycast_hkl_on_detectors(
+    hkl_cand: np.ndarray,
+    U_mat: np.ndarray,
+    B_mat: np.ndarray,
+    R_run: np.ndarray,
+    detectors: dict[int, Any],
+    wavelength_range: tuple[float, float] | list[float],
+    *,
+    ki: Any = (0.0, 0.0, 1.0),
+    active_bids: set[int] | None = None,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+    inten_cand: np.ndarray | None = None,
+    sigma_cand: np.ndarray | None = None,
+    bank_imgs: dict[int, np.ndarray] | None = None,
+    margin_frac: float = 0.01,
+) -> dict[str, np.ndarray]:
+    """Forward-project candidate Miller indices onto calibrated detector panels in Laue geometry."""
+    empty = {
+        "peaks_xyz": np.zeros((0, 3), dtype=float),
+        "hkl": np.zeros((0, 3), dtype=int),
+        "wavelength": np.zeros(0, dtype=float),
+        "bank": np.zeros(0, dtype=int),
+        "pixel_r": np.zeros(0, dtype=float),
+        "pixel_c": np.zeros(0, dtype=float),
+        "intensity": np.zeros(0, dtype=float),
+        "sigma": np.zeros(0, dtype=float),
+    }
+    if hkl_cand is None or len(hkl_cand) == 0 or not detectors:
+        return empty
+
+    hkl_arr = np.asarray(hkl_cand, dtype=int)
+    ki_vec = np.asarray(ki, dtype=float)
+    ki_vec = ki_vec / max(float(np.linalg.norm(ki_vec)), 1e-12)
+    wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
+
+    RUB = (
+        np.asarray(R_run, dtype=float)
+        @ np.asarray(U_mat, dtype=float)
+        @ np.asarray(B_mat, dtype=float)
+    )
+    G = hkl_arr.astype(float) @ RUB.T
+    qn = np.linalg.norm(G, axis=1)
+    sth = -(G @ ki_vec) / np.maximum(qn, 1e-12)
+    lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
+    keep_wl = (qn > 1e-8) & (sth > 1e-5) & (lam_pred >= wl_min) & (lam_pred <= wl_max)
+    if not np.any(keep_wl):
+        return empty
+
+    hkl_b = hkl_arr[keep_wl]
+    lam_b = lam_pred[keep_wl]
+    G_b = G[keep_wl]
+    inten_b = (
+        np.asarray(inten_cand, dtype=float)[keep_wl]
+        if inten_cand is not None and len(inten_cand) == len(hkl_arr)
+        else None
+    )
+    sig_b = (
+        np.asarray(sigma_cand, dtype=float)[keep_wl]
+        if sigma_cand is not None and len(sigma_cand) == len(hkl_arr)
+        else None
+    )
+    kf = ki_vec[None, :] + lam_b[:, None] * G_b
+    kf /= np.maximum(np.linalg.norm(kf, axis=1, keepdims=True), 1e-12)
+
+    xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l, inten_l, sig_l = (
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
+    lo_f = float(margin_frac)
+    hi_f = 1.0 - float(margin_frac)
+    for bid, det in sorted(detectors.items()):
+        bid_i = int(bid)
+        if active_bids is not None and bid_i not in active_bids:
+            continue
+        if (
+            getattr(det, "panel_type", "flat") == "flat"
+            and getattr(det, "uhat", None) is not None
+            and getattr(det, "vhat", None) is not None
+        ):
+            cen = np.asarray(det.center, dtype=float)
+            uh = np.asarray(det.uhat, dtype=float)
+            vh = np.asarray(det.vhat, dtype=float)
+            w_d, h_d = float(det.width), float(det.height)
+            nrm = np.cross(uh, vh)
+            dn = kf @ nrm
+            t_ray = np.dot(cen, nrm) / np.where(np.abs(dn) < 1e-9, -1.0, dn)
+            hit = t_ray > 0
+            if not np.any(hit):
+                continue
+            idx_h = np.flatnonzero(hit)
+            p_hit = t_ray[idx_h, None] * kf[idx_h] - cen[None, :]
+            um = p_hit @ uh
+            vm = p_hit @ vh
+            in_b = (
+                (um >= w_d * lo_f)
+                & (um <= w_d * hi_f)
+                & (vm >= h_d * lo_f)
+                & (vm <= h_d * hi_f)
+            )
+            if not np.any(in_b):
+                continue
+            idx_h = idx_h[in_b]
+            um, vm = um[in_b], vm[in_b]
+            pr_hit = vm / max(h_d, 1e-6) * (det.n - 1)
+            pc_hit = um / max(w_d, 1e-6) * (det.m - 1)
+            xyz_hit = (
+                cen[None, :] + um[:, None] * uh[None, :] + vm[:, None] * vh[None, :]
+            )
+        else:
+            idx_h = np.zeros(0, dtype=int)
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+            ):
+                mask_c, row_c, col_c = det.reflections_mask(
+                    kf[:, 0], kf[:, 1], kf[:, 2]
+                )
+                if np.any(mask_c):
+                    idx_h = np.flatnonzero(mask_c)
+                    pr_hit = np.asarray(row_c[idx_h], dtype=float)
+                    pc_hit = np.asarray(col_c[idx_h], dtype=float)
+                    xyz_hit = det.pixel_to_lab(pr_hit, pc_hit)
+            if len(idx_h) == 0:
+                continue
+        if pixel_class_by_bank is not None:
+            cls_b = pixel_class_by_bank.get(bid_i)
+            if cls_b is not None and cls_b.ndim == 2:
+                rm = np.clip(np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1)
+                cm = np.clip(np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1)
+                valid_m = cls_b[rm, cm] == 0
+                if not np.any(valid_m):
+                    continue
+                idx_h = idx_h[valid_m]
+                xyz_hit = xyz_hit[valid_m]
+                pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
+        if inten_b is not None:
+            iv_hit = inten_b[idx_h]
+        elif bank_imgs is not None and bid_i in bank_imgs:
+            im_b = bank_imgs[bid_i]
+            r_i = np.clip(np.round(pr_hit).astype(int), 2, max(2, im_b.shape[0] - 3))
+            c_i = np.clip(np.round(pc_hit).astype(int), 2, max(2, im_b.shape[1] - 3))
+            iv_hit = np.maximum(
+                np.maximum.reduce(
+                    [im_b[r_i + dr, c_i + dc] for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
+                ),
+                1.0,
+            )
+        else:
+            iv_hit = np.full(len(idx_h), 150.0, dtype=float)
+        sv_hit = (
+            sig_b[idx_h] if sig_b is not None else np.full(len(idx_h), 3.0, dtype=float)
+        )
+
+        xyz_l.append(xyz_hit)
+        hkl_l.append(hkl_b[idx_h])
+        lam_l.append(lam_b[idx_h])
+        bank_l.append(np.full(len(idx_h), bid_i, dtype=int))
+        pr_l.append(pr_hit)
+        pc_l.append(pc_hit)
+        inten_l.append(iv_hit)
+        sig_l.append(sv_hit)
+
+    if not xyz_l:
+        return empty
+    return {
+        "peaks_xyz": np.concatenate(xyz_l, axis=0),
+        "hkl": np.concatenate(hkl_l, axis=0),
+        "wavelength": np.concatenate(lam_l, axis=0),
+        "bank": np.concatenate(bank_l, axis=0),
+        "pixel_r": np.concatenate(pr_l, axis=0),
+        "pixel_c": np.concatenate(pc_l, axis=0),
+        "intensity": np.concatenate(inten_l, axis=0),
+        "sigma": np.concatenate(sig_l, axis=0),
+    }
+
+
 def apply_mtz_to_payload(
     payload: dict[str, Any],
     mtz_path: str | os.PathLike,
     ds_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Overlay reference spots / merged intensities from an MTZ file onto an existing detector geometry payload."""
+    """Load custom MTZ reflections into an active geometry, updating B & space group from the MTZ."""
     import gemmi
+
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
 
     mtz = gemmi.read_mtz_file(str(mtz_path))
     sg = mtz.spacegroup or gemmi.find_spacegroup_by_name(
         str(payload.get("space_group") or "P 1")
     )
+    if sg is None:
+        sg = gemmi.SpaceGroup("P 1")
+    sg_name = str(sg.hm)
+
+    if mtz.cell and mtz.cell.a > 0 and mtz.cell.b > 0 and mtz.cell.c > 0:
+        cell_new = [
+            float(mtz.cell.a),
+            float(mtz.cell.b),
+            float(mtz.cell.c),
+            float(mtz.cell.alpha),
+            float(mtz.cell.beta),
+            float(mtz.cell.gamma),
+        ]
+    elif payload.get("cell") and len(payload["cell"]) == 6:
+        cell_new = [float(x) for x in payload["cell"]]
+    else:
+        raise ValueError("MTZ file does not contain valid unit cell parameters.")
+
+    B_new, _ = cartesian_matrix_metric_tensor(
+        cell_new[0],
+        cell_new[1],
+        cell_new[2],
+        *np.deg2rad(cell_new[3:6]),
+    )
+    if payload.get("u_matrix") is not None:
+        U_mat = np.asarray(payload["u_matrix"], dtype=float)
+    elif payload.get("ub_matrix") is not None:
+        U_mat = _u_from_ub(payload["ub_matrix"])
+    else:
+        raise ValueError(
+            "Cannot load MTZ without an active U orientation matrix: run Solve or load an indexed HDF5 dataset first."
+        )
+    UB_new = U_mat @ B_new
+
     asu = gemmi.ReciprocalAsu(sg)
     ops = sg.operations()
     cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}
@@ -1064,11 +1347,13 @@ def apply_mtz_to_payload(
     i_col = None
     s_col = None
     for ic, sc in (
+        ("I", "SIGI"),
         ("I", "SigI"),
         ("IMEAN", "SIGIMEAN"),
         ("Iobs", "SigIobs"),
         ("Ipred", "SigIpred"),
         ("I(+)", "SIGI(+)"),
+        ("FP", "SIGFP"),
         ("F", "SIGF"),
     ):
         if ic in cols:
@@ -1079,7 +1364,8 @@ def apply_mtz_to_payload(
         val_cols = [
             c.label
             for c in mtz.columns
-            if c.label not in ("H", "K", "L", "M/ISYM", "BATCH", "half")
+            if c.label
+            not in ("H", "K", "L", "M/ISYM", "BATCH", "half", "WAVEL", "THETA", "PHI")
         ]
         if val_cols:
             i_col = cols[val_cols[0]]
@@ -1089,7 +1375,7 @@ def apply_mtz_to_payload(
             s_col = np.ones(len(h_col), dtype=np.float64)
 
     asu_map: dict[tuple[int, int, int], tuple[float, float]] = {}
-    raw_hkl_list: list[tuple[int, int, int, float, float]] = []
+    literal_map: dict[tuple[int, int, int], tuple[float, float]] = {}
     for idx in range(len(h_col)):
         iv = float(i_col[idx])
         sv = float(s_col[idx]) if s_col is not None else 1.0
@@ -1098,15 +1384,203 @@ def apply_mtz_to_payload(
         hh, kk, ll = int(h_col[idx]), int(k_col[idx]), int(l_col[idx])
         if hh == 0 and kk == 0 and ll == 0:
             continue
+        sv_clean = max(sv if np.isfinite(sv) else 1.0, 1e-3)
+        lit_key = (hh, kk, ll)
+        if lit_key not in literal_map or iv > literal_map[lit_key][0]:
+            literal_map[lit_key] = (iv, sv_clean)
         asu_hkl, _ = asu.to_asu([hh, kk, ll], ops)
         key = (int(asu_hkl[0]), int(asu_hkl[1]), int(asu_hkl[2]))
         if key not in asu_map or iv > asu_map[key][0]:
-            asu_map[key] = (iv, max(sv, 1e-3))
-        raw_hkl_list.append((hh, kk, ll, iv, max(sv, 1e-3)))
+            asu_map[key] = (iv, sv_clean)
+
+    # Expand MTZ ASU reflections by the MTZ space-group symmetry (+ Friedel mates + literal HKL rows)
+    expanded_hkl_blocks: list[np.ndarray] = []
+    if asu_map:
+        asu_arr = np.asarray(list(asu_map.keys()), dtype=int)
+        for op in ops.sym_ops:
+            rot_m = np.asarray(op.rot, dtype=float) / float(op.DEN)
+            # Reciprocal Miller indices transform by h' = h @ R (and Friedel -h')
+            h_rot = np.rint(asu_arr @ rot_m).astype(int)
+            expanded_hkl_blocks.append(h_rot)
+            expanded_hkl_blocks.append(-h_rot)
+    if literal_map:
+        expanded_hkl_blocks.append(np.asarray(list(literal_map.keys()), dtype=int))
+
+    if expanded_hkl_blocks:
+        hkl_exp = np.unique(np.concatenate(expanded_hkl_blocks, axis=0), axis=0)
+        nonzero_m = np.any(hkl_exp != 0, axis=1)
+        hkl_exp = hkl_exp[nonzero_m]
+    else:
+        hkl_exp = np.zeros((0, 3), dtype=int)
+
+    inten_exp = np.full(len(hkl_exp), 100.0, dtype=float)
+    sigma_exp = np.full(len(hkl_exp), 1.0, dtype=float)
+    for m_idx in range(len(hkl_exp)):
+        hh, kk, ll = (
+            int(hkl_exp[m_idx, 0]),
+            int(hkl_exp[m_idx, 1]),
+            int(hkl_exp[m_idx, 2]),
+        )
+        hit_v = literal_map.get((hh, kk, ll))
+        if hit_v is None:
+            ak, _ = asu.to_asu([hh, kk, ll], ops)
+            hit_v = asu_map.get((int(ak[0]), int(ak[1]), int(ak[2])))
+        if hit_v is not None:
+            inten_exp[m_idx] = hit_v[0]
+            sigma_exp[m_idx] = hit_v[1]
+
+    detectors = _reconstruct_detectors_from_payload(payload)
+    wl_range = payload.get("wavelength_range") or [1.5, 4.5]
+    wl_min, wl_max = float(wl_range[0]), float(wl_range[1])
+    R_single = (
+        np.asarray(payload["goniometer_R"], dtype=float)
+        if payload.get("goniometer_R") is not None
+        else np.eye(3)
+    )
+    active_frame = int(payload.get("frame_index") or 0)
+    ki_hat = np.asarray(payload.get("ki") or [0.0, 0.0, 1.0], dtype=float)
+    ki_hat = ki_hat / max(float(np.linalg.norm(ki_hat)), 1e-12)
+
+    cast_frame = _raycast_hkl_on_detectors(
+        hkl_exp,
+        U_mat,
+        B_new,
+        R_single,
+        detectors,
+        (wl_min, wl_max),
+        ki=ki_hat,
+        inten_cand=inten_exp,
+        sigma_cand=sigma_exp,
+    )
+    pts_mtz = cast_frame["peaks_xyz"]
+    if len(pts_mtz) > 2500:
+        ord_m = np.sort(np.argsort(-cast_frame["intensity"])[:2500])
+        for k_c in cast_frame:
+            cast_frame[k_c] = cast_frame[k_c][ord_m]
+        pts_mtz = cast_frame["peaks_xyz"]
+
+    raw_zones_new, zones_new = _compute_zones_payload_for_geometry(
+        pts_mtz,
+        ub_matrix=UB_new,
+        R_gonio=R_single,
+        R_single=R_single,
+        ki_hat=ki_hat,
+        detectors=detectors,
+    )
+    mtz_peaks = _serialize_peak_entries(
+        pts_mtz,
+        bank_arr=cast_frame["bank"],
+        pixel_r_arr=cast_frame["pixel_r"],
+        pixel_c_arr=cast_frame["pixel_c"],
+        intensity_arr=cast_frame["intensity"],
+        sigma_arr=cast_frame["sigma"],
+        var_u_arr=None,
+        var_v_arr=None,
+        cov_uv_arr=None,
+        hkl_arr=cast_frame["hkl"],
+        lam_arr=cast_frame["wavelength"],
+        ub_matrix=UB_new,
+        R_gonio=R_single,
+        ki_hat=ki_hat,
+        wavelength_range=(wl_min, wl_max),
+        space_group=sg_name,
+        cell=cell_new,
+        detectors=detectors,
+        raw_zones=raw_zones_new,
+        active_frame=active_frame,
+        merged_i_arr=cast_frame["intensity"],
+        merged_sigi_arr=cast_frame["sigma"],
+        peak_source="mtz",
+    )
+
+    frames_meta = payload.get("frames") or []
+    r_per_run_raw = payload.get("goniometer_R_per_run") or {}
+    if len(frames_meta) > 1 and isinstance(r_per_run_raw, dict) and r_per_run_raw:
+        all_xyz, all_hkl, all_lam, all_bnk, all_int, all_sig, all_run = (
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
+        r_per_run_np: dict[int, np.ndarray] = {}
+        for r_k, r_mat_v in sorted(r_per_run_raw.items(), key=lambda kv: int(kv[0])):
+            r_i = int(r_k)
+            R_r = np.asarray(r_mat_v, dtype=float)
+            r_per_run_np[r_i] = R_r
+            c_r = _raycast_hkl_on_detectors(
+                hkl_exp,
+                U_mat,
+                B_new,
+                R_r,
+                detectors,
+                (wl_min, wl_max),
+                ki=ki_hat,
+                inten_cand=inten_exp,
+                sigma_cand=sigma_exp,
+            )
+            if len(c_r["peaks_xyz"]) > 0:
+                all_xyz.append(c_r["peaks_xyz"])
+                all_hkl.append(c_r["hkl"])
+                all_lam.append(c_r["wavelength"])
+                all_bnk.append(c_r["bank"])
+                all_int.append(c_r["intensity"])
+                all_sig.append(c_r["sigma"])
+                all_run.append(np.full(len(c_r["peaks_xyz"]), r_i, dtype=int))
+        if all_xyz:
+            pts_all_m = np.concatenate(all_xyz, axis=0)
+            hkl_all_m = np.concatenate(all_hkl, axis=0)
+            lam_all_m = np.concatenate(all_lam, axis=0)
+            bnk_all_m = np.concatenate(all_bnk, axis=0)
+            int_all_m = np.concatenate(all_int, axis=0)
+            sig_all_m = np.concatenate(all_sig, axis=0)
+            run_all_m = np.concatenate(all_run, axis=0)
+            if len(pts_all_m) > 3500:
+                top_m = np.sort(np.argsort(-int_all_m)[:3500])
+                pts_all_m = pts_all_m[top_m]
+                hkl_all_m = hkl_all_m[top_m]
+                lam_all_m = lam_all_m[top_m]
+                bnk_all_m = bnk_all_m[top_m]
+                int_all_m = int_all_m[top_m]
+                sig_all_m = sig_all_m[top_m]
+                run_all_m = run_all_m[top_m]
+            mtz_sample_peaks = _serialize_sample_peaks(
+                {
+                    "peaks_xyz": pts_all_m,
+                    "hkl": hkl_all_m,
+                    "wavelength": lam_all_m,
+                    "intensity": int_all_m,
+                    "sigma": sig_all_m,
+                    "bank": bnk_all_m,
+                    "run_index": run_all_m,
+                    "R_per_run": r_per_run_np,
+                },
+                fallback_peaks=mtz_peaks,
+                n_frames=len(frames_meta),
+                ki_hat=ki_hat,
+                R_single=R_single,
+                wavelength_range=(wl_min, wl_max),
+                space_group=sg_name,
+                cell=cell_new,
+                merged_i_arr=int_all_m,
+                merged_sigi_arr=sig_all_m,
+                peak_source="mtz",
+            )
+        else:
+            mtz_sample_peaks = mtz_peaks
+    else:
+        mtz_sample_peaks = mtz_peaks
 
     out = dict(payload)
-    matched_count = 0
-    for list_key in ("peaks", "sample_peaks"):
+    # Annotate existing predicted / integrated peak sets with merged_i/sigi where matching ASU HKL exists
+    for list_key in (
+        "predicted_peaks",
+        "predicted_sample_peaks",
+        "integrated_peaks",
+        "integrated_sample_peaks",
+    ):
         pk_list = out.get(list_key)
         if not isinstance(pk_list, list):
             continue
@@ -1118,20 +1592,50 @@ def apply_mtz_to_payload(
                 asu_k, _ = asu.to_asu(
                     [int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2])], ops
                 )
-                hit = asu_map.get((int(asu_k[0]), int(asu_k[1]), int(asu_k[2])))
+                ak_t = (int(asu_k[0]), int(asu_k[1]), int(asu_k[2]))
+                pk_copy["asu_hkl"] = [ak_t[0], ak_t[1], ak_t[2]]
+                pk_copy["asu_orbit_id"] = f"{ak_t[0]},{ak_t[1]},{ak_t[2]}"
+                hit = asu_map.get(ak_t)
                 if hit is not None:
                     pk_copy["merged_i"] = round(hit[0], 2)
                     pk_copy["merged_sigi"] = round(hit[1], 2)
-                    if list_key == "peaks":
-                        matched_count += 1
             new_list.append(pk_copy)
         out[list_key] = new_list
+
+    out["u_matrix"] = [[round(float(v), 6) for v in row] for row in U_mat]
+    out["b_matrix"] = [[round(float(v), 6) for v in row] for row in B_new]
+    out["ub_matrix"] = [[round(float(v), 6) for v in row] for row in UB_new]
+    out["cell"] = [round(float(x), 4) for x in cell_new]
+    out["space_group"] = sg_name
+    out["zones"] = zones_new
+    out["mtz_peaks"] = mtz_peaks
+    out["mtz_sample_peaks"] = mtz_sample_peaks
+    out["peaks"] = mtz_peaks
+    out["sample_peaks"] = mtz_sample_peaks
+    out["default_peak_source"] = "mtz"
+    out["ladder_steps"] = _build_lattice_ladder_steps(
+        zones_new,
+        mtz_peaks,
+        cell=[round(float(x), 4) for x in cell_new],
+        space_group=sg_name,
+        solve_diagnostics=out.get("solve_diagnostics"),
+    )
+    out["pipeline_stages"] = _build_ndip_pipeline_stages(
+        mtz_peaks,
+        zones_new,
+        instrument=str(out.get("instrument") or "CG4D"),
+        space_group=sg_name,
+        cell=[round(float(x), 4) for x in cell_new],
+        solve_diagnostics=out.get("solve_diagnostics"),
+        artifact_kind=str(out.get("artifact_kind") or "solve"),
+        merge_metrics=out.get("merge_metrics"),
+    )
 
     info = ds_info or {}
     mtz_name = str(info.get("name") or os.path.basename(str(mtz_path)))
     out["mtz_overlay_name"] = mtz_name
     out["mtz_overlay_reflections"] = len(asu_map)
-    out["mtz_overlay_matched"] = matched_count
+    out["mtz_overlay_matched"] = len(mtz_peaks)
     return out
 
 
@@ -1821,6 +2325,295 @@ def _extract_from_h5(
             artifact_kind = "raw_nexus"
             peak_shape_mode = "none"
 
+        # Build goniometer rotation matrix lookup per run across all frames
+        R_per_run_all: dict[int, np.ndarray] = {}
+        n_runs_total = max(1, len(frames_meta))
+        for ur_i in range(n_runs_total):
+            f0_r = (
+                int(offsets[ur_i])
+                if offsets is not None and 0 <= ur_i < len(offsets)
+                else ur_i
+            )
+            if R_all is not None and R_all.ndim == 3 and len(R_all) > 0:
+                if (
+                    offsets is not None
+                    and len(R_all) == len(offsets)
+                    and 0 <= ur_i < len(R_all)
+                ):
+                    R_per_run_all[ur_i] = R_all[ur_i]
+                elif 0 <= f0_r < len(R_all):
+                    R_per_run_all[ur_i] = R_all[f0_r]
+                elif 0 <= ur_i < len(R_all):
+                    R_per_run_all[ur_i] = R_all[ur_i]
+            elif R_all is not None and R_all.ndim == 2:
+                R_per_run_all[ur_i] = R_all
+            if (
+                ur_i not in R_per_run_all
+                and gonio_axes is not None
+                and gonio_angles_nom is not None
+                and gonio_angles_nom.ndim == 2
+                and 0 <= f0_r < len(gonio_angles_nom)
+            ):
+                with contextlib.suppress(
+                    ImportError, RuntimeError, ValueError, TypeError, IndexError
+                ):
+                    from subhkl.instrument.goniometer import (
+                        calc_goniometer_rotation_matrix,
+                    )
+
+                    R_per_run_all[ur_i] = calc_goniometer_rotation_matrix(
+                        gonio_axes, gonio_angles_nom[f0_r]
+                    )
+
+        def _read_predictor_banks_group(
+            pf: h5py.File,
+        ) -> tuple[dict[str, np.ndarray] | None, dict[str, Any] | None]:
+            if "banks" not in pf:
+                return None, None
+            b_ids_pred = (
+                np.asarray(pf["bank_ids"][()], dtype=int) if "bank_ids" in pf else None
+            )
+            n_bank_entries = (
+                len(b_ids_pred) if b_ids_pred is not None else len(pf["banks"])
+            )
+            f0_p, f1_p = frame_slice if frame_slice is not None else (0, n_bank_entries)
+            bank_imgs_pred: dict[int, np.ndarray] = {}
+            if src_h5 and os.path.exists(src_h5):
+                with (
+                    contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ),
+                    h5py.File(src_h5, "r") as mf,
+                ):
+                    if "images" in mf and "bank_ids" in mf:
+                        b_ids_s = np.asarray(mf["bank_ids"][f0_p:f1_p], dtype=int)
+                        ims_s = np.asarray(mf["images"][f0_p:f1_p], dtype=np.float32)
+                        for b_id_s, im_s in zip(b_ids_s, ims_s):
+                            bank_imgs_pred[int(b_id_s)] = im_s
+
+            def _collect_slice(
+                s0: int, s1: int, r_idx_val: int, use_imgs: bool
+            ) -> dict[str, np.ndarray] | None:
+                xyz_p, hkl_p, lam_p, bank_p, pr_p, pc_p, inten_p = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                banks_grp = pf["banks"]
+                for img_idx in range(s0, s1):
+                    key_s = str(img_idx)
+                    if key_s not in banks_grp:
+                        continue
+                    grp = banks_grp[key_s]
+                    if "i" not in grp or "j" not in grp:
+                        continue
+                    pr_i = np.asarray(grp["i"][()], dtype=float).ravel()
+                    pc_i = np.asarray(grp["j"][()], dtype=float).ravel()
+                    if len(pr_i) == 0:
+                        continue
+                    bid = (
+                        int(b_ids_pred[img_idx])
+                        if b_ids_pred is not None and img_idx < len(b_ids_pred)
+                        else int(img_idx)
+                    )
+                    det = detectors.get(bid)
+                    h_i = np.asarray(grp["h"][()], dtype=int).ravel()
+                    k_i = np.asarray(grp["k"][()], dtype=int).ravel()
+                    l_i = np.asarray(grp["l"][()], dtype=int).ravel()
+                    wl_i = np.asarray(grp["wavelength"][()], dtype=float).ravel()
+                    im_b = bank_imgs_pred.get(bid) if use_imgs else None
+                    if im_b is not None:
+                        r_idx = np.clip(
+                            np.round(pr_i).astype(int), 2, max(2, im_b.shape[0] - 3)
+                        )
+                        c_idx = np.clip(
+                            np.round(pc_i).astype(int), 2, max(2, im_b.shape[1] - 3)
+                        )
+                        pk_val = np.maximum(
+                            np.maximum.reduce(
+                                [
+                                    im_b[r_idx + dr, c_idx + dc]
+                                    for dr in (-1, 0, 1)
+                                    for dc in (-1, 0, 1)
+                                ]
+                            ),
+                            1.0,
+                        )
+                    else:
+                        pk_val = np.full(len(pr_i), 150.0, dtype=float)
+                    if det is not None:
+                        xyz_i = det.pixel_to_lab(pr_i, pc_i)
+                    else:
+                        az = (int(bid) * 37.0 % 360.0 - 180.0) + (pc_i - 128.0) * 0.12
+                        rad = np.deg2rad(az)
+                        y_c = (pr_i - 128.0) * 0.002
+                        xyz_i = np.column_stack([np.sin(rad), y_c, np.cos(rad)])
+                    xyz_p.append(xyz_i)
+                    hkl_p.append(np.column_stack([h_i, k_i, l_i]))
+                    lam_p.append(wl_i)
+                    bank_p.append(np.full(len(pr_i), bid, dtype=int))
+                    pr_p.append(pr_i)
+                    pc_p.append(pc_i)
+                    inten_p.append(pk_val)
+                if not xyz_p:
+                    return None
+                pts_c = np.concatenate(xyz_p, axis=0)
+                return {
+                    "peaks_xyz": pts_c,
+                    "hkl": np.concatenate(hkl_p, axis=0),
+                    "wavelength": np.concatenate(lam_p, axis=0),
+                    "bank": np.concatenate(bank_p, axis=0),
+                    "pixel_r": np.concatenate(pr_p, axis=0),
+                    "pixel_c": np.concatenate(pc_p, axis=0),
+                    "intensity": np.concatenate(inten_p, axis=0),
+                    "sigma": np.full(len(pts_c), 3.0, dtype=float),
+                    "run_index": np.full(len(pts_c), int(r_idx_val), dtype=int),
+                }
+
+            frame_pred = _collect_slice(f0_p, f1_p, active_frame, True)
+            all_pred: dict[str, Any] | None = None
+            if len(frames_meta) > 1 and offsets is not None and len(offsets) > 1:
+                run_slices = []
+                for r_i in range(len(frames_meta)):
+                    s0_r = int(offsets[r_i]) if r_i < len(offsets) else 0
+                    s1_r = (
+                        int(offsets[r_i + 1])
+                        if (r_i + 1) < len(offsets)
+                        else n_bank_entries
+                    )
+                    c_r = _collect_slice(s0_r, s1_r, r_i, r_i == active_frame)
+                    if c_r is not None:
+                        run_slices.append(c_r)
+                if run_slices:
+                    pts_a = np.concatenate([c["peaks_xyz"] for c in run_slices], axis=0)
+                    hkl_a = np.concatenate([c["hkl"] for c in run_slices], axis=0)
+                    lam_a = np.concatenate(
+                        [c["wavelength"] for c in run_slices], axis=0
+                    )
+                    int_a = np.concatenate([c["intensity"] for c in run_slices], axis=0)
+                    sig_a = np.concatenate([c["sigma"] for c in run_slices], axis=0)
+                    bnk_a = np.concatenate([c["bank"] for c in run_slices], axis=0)
+                    run_a = np.concatenate([c["run_index"] for c in run_slices], axis=0)
+                    if len(pts_a) > 4500:
+                        idx_sub = np.linspace(0, len(pts_a) - 1, 4500, dtype=int)
+                        pts_a = pts_a[idx_sub]
+                        hkl_a = hkl_a[idx_sub]
+                        lam_a = lam_a[idx_sub]
+                        int_a = int_a[idx_sub]
+                        sig_a = sig_a[idx_sub]
+                        bnk_a = bnk_a[idx_sub]
+                        run_a = run_a[idx_sub]
+                    all_pred = {
+                        "peaks_xyz": pts_a,
+                        "hkl": hkl_a,
+                        "wavelength": lam_a,
+                        "intensity": int_a,
+                        "sigma": sig_a,
+                        "bank": bnk_a,
+                        "run_index": run_a,
+                        "R_per_run": R_per_run_all,
+                    }
+            return frame_pred, all_pred
+
+        predicted_frame_data: dict[str, np.ndarray] | None = None
+        predicted_all_runs_data: dict[str, Any] | None = None
+
+        # When loading integrated.h5 / merged_careless, capture unfiltered predicted reflections too
+        if include_peaks and artifact_kind in ("integrator", "merged_careless"):
+            # 1. Prefer sibling predictor.h5 / peak_predictor.h5 in the same working directory
+            h5_dir = Path(h5_path).resolve().parent
+            for sib_name in ("predictor.h5", "peak_predictor.h5"):
+                sib_p = h5_dir / sib_name
+                if sib_p.is_file() and sib_p != Path(h5_path).resolve():
+                    with (
+                        contextlib.suppress(
+                            OSError,
+                            RuntimeError,
+                            ValueError,
+                            TypeError,
+                            KeyError,
+                            IndexError,
+                        ),
+                        h5py.File(sib_p, "r") as spf,
+                    ):
+                        predicted_frame_data, predicted_all_runs_data = (
+                            _read_predictor_banks_group(spf)
+                        )
+                    if predicted_frame_data is not None:
+                        break
+            # 2. Fallback: preserve unfiltered candidate peaks stored in integrated.h5 prior to SNR filtering
+            if (
+                predicted_frame_data is None
+                and peaks_xyz is not None
+                and len(peaks_xyz) > 0
+                and hkl is not None
+                and len(hkl) == len(peaks_xyz)
+            ):
+                if (
+                    len(frames_meta) > 1
+                    and run_index is not None
+                    and len(run_index) == len(peaks_xyz)
+                ):
+                    idx_pred_all = np.arange(len(peaks_xyz))
+                    if len(idx_pred_all) > 4500:
+                        idx_pred_all = np.linspace(
+                            0, len(peaks_xyz) - 1, 4500, dtype=int
+                        )
+                    predicted_all_runs_data = {
+                        "peaks_xyz": peaks_xyz[idx_pred_all],
+                        "hkl": hkl[idx_pred_all],
+                        "wavelength": lam[idx_pred_all]
+                        if lam is not None and len(lam) == len(peaks_xyz)
+                        else None,
+                        "intensity": np.maximum(intensity[idx_pred_all], 1.0)
+                        if intensity is not None and len(intensity) == len(peaks_xyz)
+                        else None,
+                        "sigma": np.where(
+                            sigma[idx_pred_all] > 0, sigma[idx_pred_all], 3.0
+                        )
+                        if sigma is not None and len(sigma) == len(peaks_xyz)
+                        else None,
+                        "bank": bank[idx_pred_all]
+                        if bank is not None and len(bank) == len(peaks_xyz)
+                        else None,
+                        "run_index": run_index[idx_pred_all],
+                        "R_per_run": R_per_run_all,
+                    }
+                    m_fr = run_index == active_frame
+                else:
+                    m_fr = np.ones(len(peaks_xyz), dtype=bool)
+                if np.any(m_fr):
+                    predicted_frame_data = {
+                        "peaks_xyz": peaks_xyz[m_fr],
+                        "hkl": hkl[m_fr],
+                        "wavelength": lam[m_fr]
+                        if lam is not None and len(lam) == len(peaks_xyz)
+                        else np.full(
+                            int(np.sum(m_fr)),
+                            0.5 * sum(wavelength_range),
+                            dtype=float,
+                        ),
+                        "bank": bank[m_fr]
+                        if bank is not None and len(bank) == len(peaks_xyz)
+                        else np.ones(int(np.sum(m_fr)), dtype=int),
+                        "pixel_r": pixel_r[m_fr]
+                        if pixel_r is not None and len(pixel_r) == len(peaks_xyz)
+                        else np.zeros(int(np.sum(m_fr)), dtype=float),
+                        "pixel_c": pixel_c[m_fr]
+                        if pixel_c is not None and len(pixel_c) == len(peaks_xyz)
+                        else np.zeros(int(np.sum(m_fr)), dtype=float),
+                        "intensity": np.maximum(intensity[m_fr], 1.0)
+                        if intensity is not None and len(intensity) == len(peaks_xyz)
+                        else np.full(int(np.sum(m_fr)), 100.0, dtype=float),
+                        "sigma": np.where(sigma[m_fr] > 0, sigma[m_fr], 3.0)
+                        if sigma is not None and len(sigma) == len(peaks_xyz)
+                        else np.full(int(np.sum(m_fr)), 3.0, dtype=float),
+                    }
+
         # Capture all-runs sample-space peak arrays before filtering to active_frame
         all_runs_data: dict[str, Any] | None = None
         if (
@@ -1839,6 +2632,8 @@ def _extract_from_h5(
                 cand_snr = (sigma > 0) & (intensity / np.maximum(sigma, 1e-9) >= 2.5)
                 if int(np.sum(cand_snr)) >= 20:
                     mask_all_snr = cand_snr
+                elif np.any(sigma > 0):
+                    mask_all_snr = sigma > 0
             idx_all = np.flatnonzero(mask_all_snr)
             if len(idx_all) > 3500:
                 if intensity is not None and len(intensity) == len(peaks_xyz):
@@ -1851,42 +2646,11 @@ def _extract_from_h5(
                 if run_index is not None and len(run_index) == len(peaks_xyz)
                 else np.zeros(len(idx_all), dtype=int)
             )
-            R_per_run: dict[int, np.ndarray] = {}
+            R_per_run = dict(R_per_run_all)
             for ur in np.unique(r_idx_all):
                 ur_i = int(ur)
-                f0_r = (
-                    int(offsets[ur_i])
-                    if offsets is not None and 0 <= ur_i < len(offsets)
-                    else ur_i
-                )
-                if R_all is not None and R_all.ndim == 3 and len(R_all) > 0:
-                    if (
-                        offsets is not None
-                        and len(R_all) == len(offsets)
-                        and 0 <= ur_i < len(R_all)
-                    ):
-                        R_per_run[ur_i] = R_all[ur_i]
-                    elif 0 <= f0_r < len(R_all):
-                        R_per_run[ur_i] = R_all[f0_r]
-                    elif 0 <= ur_i < len(R_all):
-                        R_per_run[ur_i] = R_all[ur_i]
-                if (
-                    ur_i not in R_per_run
-                    and gonio_axes is not None
-                    and gonio_angles_nom is not None
-                    and gonio_angles_nom.ndim == 2
-                    and 0 <= f0_r < len(gonio_angles_nom)
-                ):
-                    with contextlib.suppress(
-                        ImportError, RuntimeError, ValueError, TypeError, IndexError
-                    ):
-                        from subhkl.instrument.goniometer import (
-                            calc_goniometer_rotation_matrix,
-                        )
-
-                        R_per_run[ur_i] = calc_goniometer_rotation_matrix(
-                            gonio_axes, gonio_angles_nom[f0_r]
-                        )
+                if ur_i not in R_per_run:
+                    R_per_run[ur_i] = np.eye(3)
             all_runs_data = {
                 "peaks_xyz": peaks_xyz[idx_all],
                 "hkl": hkl[idx_all],
@@ -1964,7 +2728,9 @@ def _extract_from_h5(
             and len(sigma) == len(peaks_xyz)
         ):
             snr_mask = (sigma > 0) & (intensity / np.maximum(sigma, 1e-9) >= 2.5)
-            if int(np.sum(snr_mask)) >= 20 and int(np.sum(snr_mask)) < len(peaks_xyz):
+            if int(np.sum(snr_mask)) < 20 and np.any(sigma > 0):
+                snr_mask = sigma > 0
+            if int(np.sum(snr_mask)) > 0 and int(np.sum(snr_mask)) < len(peaks_xyz):
                 peaks_xyz = peaks_xyz[snr_mask]
                 if bank is not None and len(bank) == len(snr_mask):
                     bank = bank[snr_mask]
@@ -2009,118 +2775,19 @@ def _extract_from_h5(
             ):
                 artifact_kind = "predictor"
                 peak_shape_mode = "predicted_circle"
-                b_ids_pred = (
-                    np.asarray(f["bank_ids"][()], dtype=int)
-                    if "bank_ids" in f
-                    else None
-                )
-                n_bank_entries = (
-                    len(b_ids_pred) if b_ids_pred is not None else len(f["banks"])
-                )
-                f0_p, f1_p = (
-                    frame_slice if frame_slice is not None else (0, n_bank_entries)
-                )
-
-                bank_imgs_pred: dict[int, np.ndarray] = {}
-                if src_h5 and os.path.exists(src_h5):
-                    with (
-                        contextlib.suppress(
-                            OSError, RuntimeError, ValueError, TypeError, KeyError
-                        ),
-                        h5py.File(src_h5, "r") as mf,
-                    ):
-                        if "images" in mf and "bank_ids" in mf:
-                            b_ids_s = np.asarray(mf["bank_ids"][f0_p:f1_p], dtype=int)
-                            ims_s = np.asarray(
-                                mf["images"][f0_p:f1_p], dtype=np.float32
-                            )
-                            for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                bank_imgs_pred[int(b_id_s)] = im_s
-
-                xyz_p, hkl_p, lam_p, bank_p, pr_p, pc_p, inten_p = (
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                )
-                banks_grp = f["banks"]
-                for img_idx in range(f0_p, f1_p):
-                    key_s = str(img_idx)
-                    if key_s not in banks_grp:
-                        continue
-                    grp = banks_grp[key_s]
-                    if "i" not in grp or "j" not in grp:
-                        continue
-                    pr_i = np.asarray(grp["i"][()], dtype=float).ravel()
-                    pc_i = np.asarray(grp["j"][()], dtype=float).ravel()
-                    if len(pr_i) == 0:
-                        continue
-                    bid = (
-                        int(b_ids_pred[img_idx])
-                        if b_ids_pred is not None and img_idx < len(b_ids_pred)
-                        else int(img_idx)
-                    )
-                    det = detectors.get(bid)
-                    h_i = np.asarray(grp["h"][()], dtype=int).ravel()
-                    k_i = np.asarray(grp["k"][()], dtype=int).ravel()
-                    l_i = np.asarray(grp["l"][()], dtype=int).ravel()
-                    wl_i = np.asarray(grp["wavelength"][()], dtype=float).ravel()
-
-                    im_b = bank_imgs_pred.get(bid)
-                    if im_b is not None:
-                        r_idx = np.clip(
-                            np.round(pr_i).astype(int), 2, im_b.shape[0] - 3
-                        )
-                        c_idx = np.clip(
-                            np.round(pc_i).astype(int), 2, im_b.shape[1] - 3
-                        )
-                        pk_val = np.maximum.reduce(
-                            [
-                                im_b[r_idx + dr, c_idx + dc]
-                                for dr in (-1, 0, 1)
-                                for dc in (-1, 0, 1)
-                            ]
-                        )
-                        bg_val = float(np.median(im_b))
-                        snr_val = (pk_val - bg_val) / np.sqrt(max(bg_val, 1.0))
-                        keep_p = snr_val >= 2.5
-                        if not np.any(keep_p):
-                            continue
-                        pr_i = pr_i[keep_p]
-                        pc_i = pc_i[keep_p]
-                        h_i, k_i, l_i = h_i[keep_p], k_i[keep_p], l_i[keep_p]
-                        wl_i = wl_i[keep_p]
-                        pk_val = pk_val[keep_p]
-                    else:
-                        pk_val = np.full(len(pr_i), 150.0, dtype=float)
-
-                    if det is not None:
-                        xyz_i = det.pixel_to_lab(pr_i, pc_i)
-                    else:
-                        az = (int(bid) * 37.0 % 360.0 - 180.0) + (pc_i - 128.0) * 0.12
-                        rad = np.deg2rad(az)
-                        y_c = (pr_i - 128.0) * 0.002
-                        xyz_i = np.column_stack([np.sin(rad), y_c, np.cos(rad)])
-                    xyz_p.append(xyz_i)
-                    hkl_p.append(np.column_stack([h_i, k_i, l_i]))
-                    lam_p.append(wl_i)
-                    bank_p.append(np.full(len(pr_i), bid, dtype=int))
-                    pr_p.append(pr_i)
-                    pc_p.append(pc_i)
-                    inten_p.append(pk_val)
-
-                if xyz_p:
-                    peaks_xyz = np.concatenate(xyz_p, axis=0)
-                    hkl = np.concatenate(hkl_p, axis=0)
-                    lam = np.concatenate(lam_p, axis=0)
-                    bank = np.concatenate(bank_p, axis=0)
-                    pixel_r = np.concatenate(pr_p, axis=0)
-                    pixel_c = np.concatenate(pc_p, axis=0)
-                    intensity = np.concatenate(inten_p, axis=0)
-                    sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
+                pred_f, pred_all = _read_predictor_banks_group(f)
+                if pred_f is not None:
+                    peaks_xyz = pred_f["peaks_xyz"]
+                    hkl = pred_f["hkl"]
+                    lam = pred_f["wavelength"]
+                    bank = pred_f["bank"]
+                    pixel_r = pred_f["pixel_r"]
+                    pixel_c = pred_f["pixel_c"]
+                    intensity = pred_f["intensity"]
+                    sigma = pred_f["sigma"]
+                    run_index = pred_f["run_index"]
+                if pred_all is not None:
+                    all_runs_data = pred_all
 
         R_gonio = None
         if R_all is not None:
@@ -2464,6 +3131,9 @@ def _extract_from_h5(
             "merged_sigi": merged_sigi,
             "merge_metrics": merge_metrics,
             "all_runs_data": all_runs_data,
+            "predicted_frame_data": predicted_frame_data,
+            "predicted_all_runs_data": predicted_all_runs_data,
+            "R_per_run_all": R_per_run_all,
             "R_gonio": R_gonio,
             "solve_diagnostics": solve_diagnostics,
             "pixel_class_by_bank": pixel_class_by_bank,
@@ -2830,151 +3500,284 @@ def _build_ndip_pipeline_stages(
     ]
 
 
-def build_rainbow_zone_payload(
-    peaks_xyz: np.ndarray | None = None,
-    ub_matrix: np.ndarray | None = None,
-    replay_h5: str | os.PathLike | None = None,
+def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
+    """Return a function ``(h, k, l) -> (asu_h, asu_k, asu_l)`` for ``space_group``."""
+    sg_obj = None
+    asu_obj = None
+    sg_ops = None
+    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
+        import gemmi
+
+        sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
+            gemmi.find_spacegroup_by_name("P 1")
+        )
+        if sg_obj is not None:
+            asu_obj = gemmi.ReciprocalAsu(sg_obj)
+            sg_ops = sg_obj.operations()
+
+    def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int]:
+        if asu_obj is not None and sg_ops is not None and (h_v or k_v or l_v):
+            with contextlib.suppress(RuntimeError, ValueError, TypeError, IndexError):
+                ha, _ = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
+                return (int(ha[0]), int(ha[1]), int(ha[2]))
+        ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
+        sg_u = str(space_group or "").upper()
+        is_cubic = "3" in sg_u or (
+            cell is not None
+            and len(cell) >= 6
+            and abs(float(cell[0]) - float(cell[1])) < 0.05
+            and abs(float(cell[1]) - float(cell[2])) < 0.05
+        )
+        if is_cubic:
+            s3 = sorted((ah, ak, al), reverse=True)
+            return (s3[0], s3[1], s3[2])
+        return (ah, ak, al)
+
+    return _to_asu_hkl
+
+
+def _compute_zones_payload_for_geometry(
+    pts: np.ndarray,
     *,
-    images_h5: str | os.PathLike | None = None,
-    projection: str | None = None,
-    U: np.ndarray | None = None,
-    B: np.ndarray | None = None,
-    R_gonio: np.ndarray | None = None,
-    ki: tuple[float, float, float] = (0.0, 0.0, 1.0),
-    wavelength_range: tuple[float, float] | None = None,
-    d_min: float | None = None,
-    instrument: str = "IMAGINE",
-    space_group: str = "P 1",
-    cell: list[float] | None = None,
+    ub_matrix: np.ndarray | None,
+    R_gonio: np.ndarray | None,
+    R_single: np.ndarray,
+    ki_hat: np.ndarray,
+    detectors: dict[int, Any],
     max_zone_index: int = 3,
     zone_tolerance_deg: float = 0.75,
     min_zone_peaks: int = 2,
     max_zones: int = 36,
     n_arc: int = 720,
-    max_peaks: int = 2500,
-    render_binning: int = 4,
-    frame_index: int | None = None,
-    include_panels: bool = True,
-    include_panel_images: bool = True,
-    include_peaks: bool = True,
-) -> dict[str, Any]:
-    """Build the JSON-serializable data contract for the Rainbow Zones widget.
-
-    Includes detector bank outlines in both Cylindrical ``(az, y)`` and Spherical
-    ``(az, elevation)`` coordinates, log-scaled detector intensity heatmaps,
-    peak reflections, and Lattice Ladder steps.
-    """
-    detectors: dict[int, Any] = {}
-    fallback_cell = list(cell) if cell and len(cell) == 6 else None
-    fallback_sg = space_group
-    cell = None
-    bank_arr = None
-    pixel_r_arr = None
-    pixel_c_arr = None
-    intensity_arr = None
-    sigma_arr = None
-    var_u_arr = None
-    var_v_arr = None
-    cov_uv_arr = None
-    artifact_kind = "solve"
-    peak_shape_mode = "solved_circle"
-    hkl_arr = None
-    lam_arr = None
-    careless_residual_arr = None
-    careless_scale_arr = None
-    merged_i_arr = None
-    merged_sigi_arr = None
-    merge_metrics: dict[str, Any] | None = None
-    all_runs_data: dict[str, Any] | None = None
-    solve_diagnostics = None
-    pixel_class_by_bank: dict[int, np.ndarray] | None = None
-    em_mask_summary: dict[str, Any] = {"available": False}
-    frame_slice = None
-    frames_meta: list[dict[str, Any]] = []
-    active_frame = int(frame_index) if frame_index is not None else 0
-
-    if replay_h5 is not None:
-        extracted = _extract_from_h5(
-            replay_h5,
-            images_h5=images_h5,
-            frame_index=frame_index,
-            include_peaks=include_peaks,
-            default_instrument=instrument or "IMAGINE",
-            d_min=d_min,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Identify and serialize detector/stereographic Laue zone arcs."""
+    n_peaks = len(pts)
+    raw_zones = (
+        identify_zones(
+            pts,
+            ub_matrix=ub_matrix,
+            R_gonio=R_gonio,
+            ki=ki_hat,
+            max_index=max_zone_index,
+            tolerance_deg=zone_tolerance_deg,
+            min_peaks=0
+            if ub_matrix is not None
+            else min(min_zone_peaks, max(1, n_peaks)),
+            n_arc=n_arc,
         )
-        instrument = extracted["instrument"] or instrument
-        ki = extracted["ki"]
-        if wavelength_range is None:
-            wavelength_range = extracted["wavelength_range"]
-        if U is None:
-            U = extracted["U"]
-        if B is None:
-            B = extracted["B"]
-        ex_sg = extracted.get("space_group")
-        if ex_sg and ex_sg not in ("P 1", "Unknown"):
-            space_group = ex_sg
-        elif fallback_sg and fallback_sg not in ("P 1", "Unknown"):
-            space_group = fallback_sg
-        else:
-            space_group = ex_sg or space_group
-        cell = extracted["cell"] or fallback_cell
-        detectors = extracted["detectors"]
-        if peaks_xyz is None:
-            peaks_xyz = extracted["peaks_xyz"]
-        bank_arr = extracted["bank"]
-        pixel_r_arr = extracted["pixel_r"]
-        pixel_c_arr = extracted["pixel_c"]
-        intensity_arr = extracted["intensity"]
-        sigma_arr = extracted["sigma"]
-        var_u_arr = extracted.get("var_u")
-        var_v_arr = extracted.get("var_v")
-        cov_uv_arr = extracted.get("cov_uv")
-        artifact_kind = extracted.get("artifact_kind") or artifact_kind
-        peak_shape_mode = extracted.get("peak_shape_mode") or peak_shape_mode
-        hkl_arr = extracted["hkl"]
-        lam_arr = extracted["wavelength"]
-        careless_residual_arr = extracted.get("careless_residual")
-        careless_scale_arr = extracted.get("careless_scale")
-        merged_i_arr = extracted.get("merged_i")
-        merged_sigi_arr = extracted.get("merged_sigi")
-        merge_metrics = extracted.get("merge_metrics")
-        all_runs_data = extracted.get("all_runs_data")
-        solve_diagnostics = extracted.get("solve_diagnostics")
-        pixel_class_by_bank = extracted.get("pixel_class_by_bank")
-        em_mask_summary = extracted.get("em_mask_summary") or {"available": False}
-        frame_slice = extracted.get("frame_slice")
-        frames_meta = extracted.get("frames") or []
-        active_frame = int(extracted.get("frame_index", active_frame))
-        if R_gonio is None:
-            R_gonio = extracted["R_gonio"]
-        if extracted.get("images_h5"):
-            images_h5 = extracted["images_h5"]
-        elif images_h5 is None:
-            images_h5 = _discover_images_h5(replay_h5)
-    elif not detectors:
-        detectors = _load_detectors_from_h5(None, instrument)
-        cell = fallback_cell
-        if peaks_xyz is None and ub_matrix is None and U is None:
-            artifact_kind = "empty"
-    if wavelength_range is None:
-        wavelength_range = _get_instrument_default_wavelength(instrument)
+        if (n_peaks > 0 or ub_matrix is not None)
+        else []
+    )
+    for z in raw_zones:
+        uvw_vals = [abs(int(x)) for x in z.get("uvw", [1, 0, 0])]
+        z["order"] = max(uvw_vals) if any(uvw_vals) else 1
 
-    if peaks_xyz is None:
-        peaks_xyz = np.zeros((0, 3), dtype=float)
-    pts = np.asarray(peaks_xyz, dtype=float)
-    if pts.ndim != 2 or pts.shape[1] != 3:
-        raise ValueError("peaks_xyz must have shape (N, 3)")
+    selected_zones: list[dict[str, Any]] = []
+    z_ord1 = [
+        z
+        for z in raw_zones
+        if z["order"] == 1 and (z["n_peaks"] >= 1 or len(z["conic"]["det_x"]) > 0)
+    ][:13]
+    z_ord2 = [
+        z
+        for z in raw_zones
+        if z["order"] == 2
+        and (
+            z["n_peaks"] >= max(1, min_zone_peaks)
+            or (n_peaks == 0 and len(z["conic"]["det_x"]) > 0)
+        )
+    ][:14]
+    z_ord3 = [
+        z
+        for z in raw_zones
+        if z["order"] == 3
+        and (
+            z["n_peaks"] >= max(2, min_zone_peaks)
+            or (n_peaks == 0 and len(z["conic"]["det_x"]) > 0)
+        )
+    ][:16]
+    selected_zones.extend(z_ord1)
+    selected_zones.extend(z_ord2)
+    selected_zones.extend(z_ord3)
+    other_zones = [
+        z
+        for z in raw_zones
+        if z["order"] > 3 and z["n_peaks"] >= max(2, min_zone_peaks)
+    ][:8]
+    selected_zones.extend(other_zones)
+    selected_zones.sort(key=lambda z: (z["order"], -z["n_peaks"], -z["score"]))
+    raw_zones = selected_zones[: max(max_zones, len(z_ord1) + len(z_ord2))]
+    for new_zid, z in enumerate(raw_zones):
+        z["zone_id"] = new_zid
 
-    if ub_matrix is None and U is not None and B is not None:
-        ub_matrix = np.asarray(U, dtype=float) @ np.asarray(B, dtype=float)
-    elif ub_matrix is not None:
-        ub_matrix = np.asarray(ub_matrix, dtype=float)
-        if B is None:
-            cell = list(_cell_from_B(ub_matrix))
+    zones_payload: list[dict[str, Any]] = []
+    for zi, z in enumerate(raw_zones):
+        t_cryst = np.asarray(z["axis_crystal_xyz"], dtype=float)
+        t_lab = R_single @ t_cryst
+        conic_cryst = get_zone_conic_points(t_cryst, ki=ki_hat, n_arc=n_arc)
+        conic_lab = get_zone_conic_points(t_lab, ki=ki_hat, n_arc=n_arc)
 
-    if cell is None and B is not None:
-        cell = list(_cell_from_B(B))
+        det_segments: list[list[list[float]]] = []
+        det_segments_sph: list[list[list[float]]] = []
+        kf = conic_lab["kf_hat"]
+        if detectors:
+            for bk, det in sorted(detectors.items()):
+                with contextlib.suppress(
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    IndexError,
+                ):
+                    mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
+                    if not np.any(mask):
+                        continue
+                    idx_hits = np.where(mask)[0]
+                    splits = np.where(np.diff(idx_hits) > 2)[0] + 1
+                    for chunk in np.split(idx_hits, splits):
+                        if len(chunk) < 2:
+                            continue
+                        xyz_seg = det.pixel_to_lab(row[chunk], col[chunk])
+                        px, py = _unrolled(xyz_seg)
+                        _, pel = _spherical_angles(xyz_seg)
+                        if np.ptp(px) <= 90.0:
+                            step_s = max(1, len(px) // 32)
+                            det_segments.append(
+                                [
+                                    [
+                                        round(float(px[j]), 2),
+                                        round(float(py[j]), 4),
+                                    ]
+                                    for j in range(0, len(px), step_s)
+                                ]
+                            )
+                            det_segments_sph.append(
+                                [
+                                    [
+                                        round(float(px[j]), 2),
+                                        round(float(pel[j]), 3),
+                                    ]
+                                    for j in range(0, len(px), step_s)
+                                ]
+                            )
 
+        dx = np.asarray(conic_lab["det_x"], dtype=float)
+        dy = np.asarray(conic_lab["det_y"], dtype=float)
+        del_deg = np.asarray(conic_lab["det_el"], dtype=float)
+        if n_peaks > 0:
+            med_r_xz = float(np.median(np.hypot(pts[:, 0], pts[:, 2])))
+            if med_r_xz > 0.05:
+                dy = dy * med_r_xz
+
+        continuous_segments: list[list[list[float]]] = []
+        continuous_segments_sph: list[list[list[float]]] = []
+        cur_seg: list[list[float]] = []
+        cur_seg_sph: list[list[float]] = []
+        for k in range(0, len(dx), 2):
+            if cur_seg and abs(dx[k] - cur_seg[-1][0]) > 45.0:
+                if len(cur_seg) >= 2:
+                    continuous_segments.append(cur_seg)
+                    continuous_segments_sph.append(cur_seg_sph)
+                cur_seg = []
+                cur_seg_sph = []
+            cur_seg.append([round(float(dx[k]), 2), round(float(dy[k]), 4)])
+            cur_seg_sph.append([round(float(dx[k]), 2), round(float(del_deg[k]), 3)])
+        if len(cur_seg) >= 2:
+            continuous_segments.append(cur_seg)
+            continuous_segments_sph.append(cur_seg_sph)
+
+        if not detectors and not det_segments:
+            det_segments = continuous_segments
+            det_segments_sph = continuous_segments_sph
+
+        sx_z = np.asarray(conic_cryst["sx"], dtype=float)
+        sy_z = np.asarray(conic_cryst["sy"], dtype=float)
+        hm_z = np.asarray(conic_cryst["hemisphere"], dtype=int)
+        stereo_segments: list[list[list[float]]] = []
+        cur_s: list[list[float]] = []
+        for k in range(0, len(sx_z), 2):
+            if cur_s and (
+                hm_z[k] != cur_s[-1][2]
+                or np.hypot(sx_z[k] - cur_s[-1][0], sy_z[k] - cur_s[-1][1]) > 0.35
+            ):
+                if len(cur_s) >= 2:
+                    stereo_segments.append(cur_s)
+                cur_s = []
+            cur_s.append(
+                [
+                    round(float(sx_z[k]), 4),
+                    round(float(sy_z[k]), 4),
+                    int(hm_z[k]),
+                ]
+            )
+        if len(cur_s) >= 2:
+            stereo_segments.append(cur_s)
+
+        pole_sx, pole_sy, pole_hemi = stereographic_projection(t_cryst)
+
+        zones_payload.append(
+            {
+                "zone_id": int(z["zone_id"]),
+                "uvw": z["uvw"],
+                "order": int(z.get("order", max(abs(int(x)) for x in z["uvw"]))),
+                "label": z["label"],
+                "axis_xyz": z["axis_xyz"],
+                "axis_crystal_xyz": z["axis_crystal_xyz"],
+                "pole_stereo": [
+                    round(float(pole_sx), 4),
+                    round(float(pole_sy), 4),
+                    int(pole_hemi),
+                ],
+                "d_direct": z["d_direct"],
+                "score": z["score"],
+                "n_peaks": z["n_peaks"],
+                "angular_rms_deg": z["angular_rms_deg"],
+                "member_peak_ids": z["member_peak_ids"],
+                "rainbow_color": RAINBOW_SPECTRAL_HEX[zi % len(RAINBOW_SPECTRAL_HEX)],
+                "pro_color": PRO_PALETTE_HEX[zi % len(PRO_PALETTE_HEX)],
+                "stereo_segments": stereo_segments,
+                "detector_segments": det_segments,
+                "detector_segments_sph": det_segments_sph,
+                "continuous_segments": continuous_segments,
+                "continuous_segments_sph": continuous_segments_sph,
+            }
+        )
+    return raw_zones, zones_payload
+
+
+def _serialize_peak_entries(
+    pts: np.ndarray,
+    *,
+    bank_arr: np.ndarray | None,
+    pixel_r_arr: np.ndarray | None,
+    pixel_c_arr: np.ndarray | None,
+    intensity_arr: np.ndarray | None,
+    sigma_arr: np.ndarray | None,
+    var_u_arr: np.ndarray | None,
+    var_v_arr: np.ndarray | None,
+    cov_uv_arr: np.ndarray | None,
+    hkl_arr: np.ndarray | None,
+    lam_arr: np.ndarray | None,
+    careless_residual_arr: np.ndarray | None = None,
+    careless_scale_arr: np.ndarray | None = None,
+    merged_i_arr: np.ndarray | None = None,
+    merged_sigi_arr: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None,
+    R_gonio: np.ndarray | None,
+    ki_hat: np.ndarray,
+    wavelength_range: tuple[float, float],
+    space_group: str,
+    cell: list[float] | None,
+    detectors: dict[int, Any],
+    raw_zones: list[dict[str, Any]],
+    active_frame: int = 0,
+    zone_tolerance_deg: float = 0.75,
+    max_peaks: int = 2500,
+    peak_source: str = "predicted",
+) -> list[dict[str, Any]]:
+    """Serialize a set of detector peak observations for the active frame."""
+    pts = np.asarray(pts, dtype=float)
     n_raw = len(pts)
     if n_raw > max_peaks:
         order = (
@@ -3020,8 +3823,8 @@ def build_rainbow_zone_payload(
             R_gonio = R_gonio[order]
 
     n_peaks = len(pts)
-    ki_hat = np.asarray(ki, dtype=float)
-    ki_hat = ki_hat / np.linalg.norm(ki_hat)
+    if n_peaks == 0:
+        return []
 
     norms = np.linalg.norm(pts, axis=1, keepdims=True)
     kf_hat = pts / np.maximum(norms, 1e-12)
@@ -3029,43 +3832,24 @@ def build_rainbow_zone_payload(
     q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True)
     g_hat = np.where(q_norm > 1e-6, q_vec / np.maximum(q_norm, 1e-12), kf_hat)
 
-    R_single = np.eye(3)
     if R_gonio is not None:
         R_arr = np.asarray(R_gonio, dtype=float)
         if R_arr.ndim == 2:
-            R_single = R_arr
-            g_crystal = g_hat @ R_single
+            g_crystal = g_hat @ R_arr
         elif R_arr.ndim == 3 and len(R_arr) == n_peaks:
             g_crystal = np.einsum("ni,nij->nj", g_hat, R_arr)
-            R_single = R_arr[0]
         else:
             g_crystal = g_hat
     else:
         g_crystal = g_hat
 
-    sx, sy, hemi = (
-        stereographic_projection(g_crystal)
-        if n_peaks > 0
-        else (np.zeros(0), np.zeros(0), np.zeros(0, dtype=np.int8))
-    )
-    sx_lab, sy_lab, hemi_lab = (
-        stereographic_projection(g_hat)
-        if n_peaks > 0
-        else (np.zeros(0), np.zeros(0), np.zeros(0, dtype=np.int8))
-    )
-    det_x, det_y = (
-        _unrolled(pts)
-        if n_peaks > 0
-        else (np.zeros(0, dtype=float), np.zeros(0, dtype=float))
-    )
-    _, det_el = (
-        _spherical_angles(pts)
-        if n_peaks > 0
-        else (np.zeros(0, dtype=float), np.zeros(0, dtype=float))
-    )
+    sx, sy, hemi = stereographic_projection(g_crystal)
+    sx_lab, sy_lab, hemi_lab = stereographic_projection(g_hat)
+    det_x, det_y = _unrolled(pts)
+    _, det_el = _spherical_angles(pts)
 
     wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
-    if n_peaks > 0 and ub_matrix is not None:
+    if ub_matrix is not None:
         inv_ub = np.linalg.inv(ub_matrix)
         hkl_dir = g_crystal @ inv_ub.T
         sin_theta = np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999)
@@ -3096,94 +3880,31 @@ def build_rainbow_zone_payload(
     else:
         if hkl_arr is None:
             hkl_arr = np.zeros((n_peaks, 3), dtype=int)
-        sin_theta = (
-            np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999) if n_peaks > 0 else np.zeros(0)
-        )
+        sin_theta = np.clip(0.5 * q_norm.ravel(), 1e-4, 0.9999)
         if lam_arr is None:
             lam_arr = np.full(n_peaks, 0.5 * (wl_min + wl_max), dtype=float)
-        d_spacing = (
-            lam_arr / np.maximum(2.0 * sin_theta, 1e-4)
-            if n_peaks > 0
-            else np.zeros(0, dtype=float)
-        )
+        d_spacing = lam_arr / np.maximum(2.0 * sin_theta, 1e-4)
         ang_err_deg = np.zeros(n_peaks, dtype=float)
 
-    raw_zones = (
-        identify_zones(
-            pts,
-            ub_matrix=ub_matrix,
-            R_gonio=R_gonio,
-            ki=ki_hat,
-            max_index=max_zone_index,
-            tolerance_deg=zone_tolerance_deg,
-            min_peaks=0
-            if ub_matrix is not None
-            else min(min_zone_peaks, max(1, n_peaks)),
-            n_arc=n_arc,
-        )
-        if (n_peaks > 0 or ub_matrix is not None)
-        else []
-    )
-    for z in raw_zones:
-        uvw_vals = [abs(int(x)) for x in z.get("uvw", [1, 0, 0])]
-        z["order"] = max(uvw_vals) if any(uvw_vals) else 1
-
-    # Keep all fundamental Order 1 zones (|u|,|v|,|w| <= 1) plus populated Order 2 and Order 3 zones
-    selected_zones: list[dict[str, Any]] = []
-    z_ord1 = [
-        z
-        for z in raw_zones
-        if z["order"] == 1 and (z["n_peaks"] >= 1 or len(z["conic"]["det_x"]) > 0)
-    ][:13]
-    z_ord2 = [
-        z
-        for z in raw_zones
-        if z["order"] == 2
-        and (
-            z["n_peaks"] >= max(1, min_zone_peaks)
-            or (n_peaks == 0 and len(z["conic"]["det_x"]) > 0)
-        )
-    ][:14]
-    z_ord3 = [
-        z
-        for z in raw_zones
-        if z["order"] == 3
-        and (
-            z["n_peaks"] >= max(2, min_zone_peaks)
-            or (n_peaks == 0 and len(z["conic"]["det_x"]) > 0)
-        )
-    ][:16]
-    selected_zones.extend(z_ord1)
-    selected_zones.extend(z_ord2)
-    selected_zones.extend(z_ord3)
-    other_zones = [
-        z
-        for z in raw_zones
-        if z["order"] > 3 and z["n_peaks"] >= max(2, min_zone_peaks)
-    ][:8]
-    selected_zones.extend(other_zones)
-    selected_zones.sort(key=lambda z: (z["order"], -z["n_peaks"], -z["score"]))
-    raw_zones = selected_zones[: max(max_zones, len(z_ord1) + len(z_ord2))]
-    for new_zid, z in enumerate(raw_zones):
-        z["zone_id"] = new_zid
-
     peak_zones: list[list[int]] = [[] for _ in range(n_peaks)]
+    sin_tol = float(np.sin(np.deg2rad(max(zone_tolerance_deg, 0.25))))
     for z in raw_zones:
-        zid = z["zone_id"]
-        for pid in z["member_peak_ids"]:
-            if 0 <= pid < n_peaks:
-                peak_zones[pid].append(zid)
+        zid = int(z["zone_id"])
+        ax_c = np.asarray(z["axis_crystal_xyz"], dtype=float)
+        ax_n = float(np.linalg.norm(ax_c))
+        if ax_n > 1e-9:
+            ax_u = ax_c / ax_n
+            in_z = np.abs(g_crystal @ ax_u) <= sin_tol
+            for pid in np.flatnonzero(in_z):
+                peak_zones[int(pid)].append(zid)
 
-    # Precompute 2-sigma detector-projected peak contours (ellipses or isotropic circles)
-    # when covariance parameters (var_u, var_v, cov_uv) are present from integrator/finder
     ellipse_cyl_by_idx: dict[int, list[list[float]]] = {}
     ellipse_sph_by_idx: dict[int, list[list[float]]] = {}
     sigma_major_by_idx: dict[int, float] = {}
     sigma_minor_by_idx: dict[int, float] = {}
     ellipse_ang_by_idx: dict[int, float] = {}
     if (
-        n_peaks > 0
-        and var_u_arr is not None
+        var_u_arr is not None
         and var_v_arr is not None
         and len(var_u_arr) == n_peaks
         and len(var_v_arr) == n_peaks
@@ -3242,7 +3963,10 @@ def build_rainbow_zone_payload(
                     if float(np.ptp(az_row)) > 90.0:
                         continue
                     ellipse_cyl_by_idx[p_i] = [
-                        [round(float(az_row[m]), 3), round(float(y_mat[k_local, m]), 4)]
+                        [
+                            round(float(az_row[m]), 3),
+                            round(float(y_mat[k_local, m]), 4),
+                        ]
                         for m in range(n_ell_pts)
                     ]
                     ellipse_sph_by_idx[p_i] = [
@@ -3256,37 +3980,7 @@ def build_rainbow_zone_payload(
                     sigma_minor_by_idx[p_i] = round(float(s2_all[p_i]), 2)
                     ellipse_ang_by_idx[p_i] = round(float(np.rad2deg(phi_all[p_i])), 1)
 
-    # Compute canonical ASU symmetry orbits and Laue harmonic ray multiplicity
-    sg_obj = None
-    asu_obj = None
-    sg_ops = None
-    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
-        import gemmi
-
-        sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
-            gemmi.find_spacegroup_by_name("P 1")
-        )
-        if sg_obj is not None:
-            asu_obj = gemmi.ReciprocalAsu(sg_obj)
-            sg_ops = sg_obj.operations()
-
-    def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int]:
-        if asu_obj is not None and sg_ops is not None and (h_v or k_v or l_v):
-            with contextlib.suppress(RuntimeError, ValueError, TypeError, IndexError):
-                ha, _ = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
-                return (int(ha[0]), int(ha[1]), int(ha[2]))
-        ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
-        sg_u = str(space_group or "").upper()
-        is_cubic = "3" in sg_u or (
-            cell is not None
-            and len(cell) >= 6
-            and abs(float(cell[0]) - float(cell[1])) < 0.05
-            and abs(float(cell[1]) - float(cell[2])) < 0.05
-        )
-        if is_cubic:
-            s3 = sorted((ah, ak, al), reverse=True)
-            return (s3[0], s3[1], s3[2])
-        return (ah, ak, al)
+    _to_asu_hkl = _make_asu_mapper(space_group, cell)
 
     base_ray_counts: dict[tuple[int, int, int], int] = {}
     for i in range(n_peaks):
@@ -3340,6 +4034,7 @@ def build_rainbow_zone_payload(
 
         pk_entry: dict[str, Any] = {
             "id": i,
+            "peak_source": peak_source,
             "run_index": int(active_frame),
             "bank": (
                 int(bank_arr[i]) if bank_arr is not None and i < len(bank_arr) else 1
@@ -3427,119 +4122,553 @@ def build_rainbow_zone_payload(
             pk_entry["shape_kind"] = (
                 "ellipse" if abs(s_maj - s_min) > 0.05 else "isotropic_circle"
             )
+        else:
+            pk_entry["shape_kind"] = "circle"
         peaks_list.append(pk_entry)
+    return peaks_list
 
-    # Build all-runs sample-space peak list (for Wulff Net 'All Runs (Sample)' mode)
-    sample_peaks: list[dict[str, Any]] = []
+
+def _serialize_sample_peaks(
+    all_runs_data: dict[str, Any] | None,
+    *,
+    fallback_peaks: list[dict[str, Any]],
+    n_frames: int,
+    ki_hat: np.ndarray,
+    R_single: np.ndarray,
+    wavelength_range: tuple[float, float],
+    space_group: str,
+    cell: list[float] | None,
+    merged_i_arr: np.ndarray | None = None,
+    merged_sigi_arr: np.ndarray | None = None,
+    peak_source: str = "predicted",
+) -> list[dict[str, Any]]:
+    """Serialize multi-run sample-space reflections for the Wulff Net."""
     if (
-        all_runs_data is not None
-        and len(all_runs_data.get("peaks_xyz", [])) > 0
-        and len(frames_meta) > 1
+        all_runs_data is None
+        or len(all_runs_data.get("peaks_xyz", [])) == 0
+        or n_frames <= 1
     ):
-        pts_all = np.asarray(all_runs_data["peaks_xyz"], dtype=float)
-        hkl_all = np.asarray(all_runs_data["hkl"], dtype=int)
-        r_idx_all = np.asarray(all_runs_data["run_index"], dtype=int)
-        lam_all = all_runs_data.get("wavelength")
-        int_all = all_runs_data.get("intensity")
-        sig_all = all_runs_data.get("sigma")
-        bnk_all = all_runs_data.get("bank")
-        res_all = all_runs_data.get("careless_residual")
-        scl_all = all_runs_data.get("careless_scale")
-        R_per_run = all_runs_data.get("R_per_run") or {}
+        return fallback_peaks
 
-        norms_all = np.linalg.norm(pts_all, axis=1, keepdims=True)
-        kf_all = pts_all / np.maximum(norms_all, 1e-12)
-        q_all = kf_all - ki_hat[None, :]
-        qn_all = np.linalg.norm(q_all, axis=1, keepdims=True)
-        g_lab_all = np.where(qn_all > 1e-6, q_all / np.maximum(qn_all, 1e-12), kf_all)
-        g_samp_all = np.copy(g_lab_all)
-        for ur in np.unique(r_idx_all):
-            R_u = R_per_run.get(int(ur), R_single)
-            m_u = r_idx_all == ur
-            g_samp_all[m_u] = g_lab_all[m_u] @ R_u
+    pts_all = np.asarray(all_runs_data["peaks_xyz"], dtype=float)
+    hkl_all = np.asarray(all_runs_data["hkl"], dtype=int)
+    r_idx_all = np.asarray(all_runs_data["run_index"], dtype=int)
+    lam_all = all_runs_data.get("wavelength")
+    int_all = all_runs_data.get("intensity")
+    sig_all = all_runs_data.get("sigma")
+    bnk_all = all_runs_data.get("bank")
+    res_all = all_runs_data.get("careless_residual")
+    scl_all = all_runs_data.get("careless_scale")
+    R_per_run = all_runs_data.get("R_per_run") or {}
 
-        sx_all, sy_all, hm_all = stereographic_projection(g_samp_all)
-        ray_counts_all: dict[tuple[int, int, int, int], int] = {}
-        for j in range(len(pts_all)):
-            hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
-            if hj or kj or lj:
-                gc = max(1, int(np.gcd.reduce(np.abs([hj, kj, lj]))))
-                rk = (int(r_idx_all[j]), hj // gc, kj // gc, lj // gc)
-                ray_counts_all[rk] = ray_counts_all.get(rk, 0) + 1
+    norms_all = np.linalg.norm(pts_all, axis=1, keepdims=True)
+    kf_all = pts_all / np.maximum(norms_all, 1e-12)
+    q_all = kf_all - ki_hat[None, :]
+    qn_all = np.linalg.norm(q_all, axis=1, keepdims=True)
+    g_lab_all = np.where(qn_all > 1e-6, q_all / np.maximum(qn_all, 1e-12), kf_all)
+    g_samp_all = np.copy(g_lab_all)
+    for ur in np.unique(r_idx_all):
+        R_u = R_per_run.get(int(ur), R_single)
+        m_u = r_idx_all == ur
+        g_samp_all[m_u] = g_lab_all[m_u] @ R_u
 
-        for j in range(len(pts_all)):
-            hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
-            gc = int(np.gcd.reduce(np.abs([hj, kj, lj]))) if (hj or kj or lj) else 1
-            rk = (
-                (
-                    int(r_idx_all[j]),
-                    hj // max(1, gc),
-                    kj // max(1, gc),
-                    lj // max(1, gc),
+    _to_asu_hkl = _make_asu_mapper(space_group, cell)
+    wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
+
+    sx_all, sy_all, hm_all = stereographic_projection(g_samp_all)
+    ray_counts_all: dict[tuple[int, int, int, int], int] = {}
+    for j in range(len(pts_all)):
+        hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
+        if hj or kj or lj:
+            gc = max(1, int(np.gcd.reduce(np.abs([hj, kj, lj]))))
+            rk = (int(r_idx_all[j]), hj // gc, kj // gc, lj // gc)
+            ray_counts_all[rk] = ray_counts_all.get(rk, 0) + 1
+
+    sample_peaks: list[dict[str, Any]] = []
+    for j in range(len(pts_all)):
+        hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
+        gc = int(np.gcd.reduce(np.abs([hj, kj, lj]))) if (hj or kj or lj) else 1
+        rk = (
+            (
+                int(r_idx_all[j]),
+                hj // max(1, gc),
+                kj // max(1, gc),
+                lj // max(1, gc),
+            )
+            if (hj or kj or lj)
+            else (int(r_idx_all[j]), 0, 0, 0)
+        )
+        h_mult = max(int(ray_counts_all.get(rk, 1)), 2 if gc > 1 else 1)
+        ah, ak, al = _to_asu_hkl(hj, kj, lj)
+        orb_id = f"{ah},{ak},{al}"
+        orb_c = abs(ah * 73856093 ^ ak * 19349663 ^ al * 83492791) % 12
+        lv = (
+            float(lam_all[j])
+            if lam_all is not None and j < len(lam_all)
+            else 0.5 * (wl_min + wl_max)
+        )
+        st_j = float(np.clip(0.5 * qn_all[j, 0], 1e-4, 0.9999))
+        dv = lv / max(2.0 * st_j, 1e-4)
+        sp_item: dict[str, Any] = {
+            "id": j,
+            "peak_source": peak_source,
+            "run_index": int(r_idx_all[j]),
+            "bank": int(bnk_all[j]) if bnk_all is not None and j < len(bnk_all) else 1,
+            "q_hat": [round(float(x), 5) for x in g_samp_all[j]],
+            "q_hat_lab": [round(float(x), 5) for x in g_lab_all[j]],
+            "stereographic": [
+                round(float(sx_all[j]), 5),
+                round(float(sy_all[j]), 5),
+            ],
+            "hemisphere": int(hm_all[j]),
+            "intensity": round(float(int_all[j]), 2)
+            if int_all is not None and j < len(int_all)
+            else 100.0,
+            "sigma": round(float(sig_all[j]), 2)
+            if sig_all is not None and j < len(sig_all)
+            else 3.0,
+            "wavelength": round(float(np.clip(lv, wl_min * 0.5, wl_max * 1.5)), 4),
+            "d_spacing": round(dv, 4),
+            "harmonic_order": max(1, gc),
+            "harmonic_multiplicity": h_mult,
+            "hkl": [hj, kj, lj],
+            "asu_hkl": [ah, ak, al],
+            "asu_orbit_id": orb_id,
+            "orbit_color_idx": int(orb_c),
+            "zone_ids": [],
+            "indexed": bool(hj or kj or lj),
+            "shape_kind": "circle",
+        }
+        if res_all is not None and j < len(res_all) and np.isfinite(res_all[j]):
+            sp_item["careless_residual"] = round(float(res_all[j]), 3)
+        if scl_all is not None and j < len(scl_all) and np.isfinite(scl_all[j]):
+            sp_item["careless_scale"] = round(float(scl_all[j]), 4)
+        if (
+            merged_i_arr is not None
+            and j < len(merged_i_arr)
+            and np.isfinite(merged_i_arr[j])
+        ):
+            sp_item["merged_i"] = round(float(merged_i_arr[j]), 2)
+        if (
+            merged_sigi_arr is not None
+            and j < len(merged_sigi_arr)
+            and np.isfinite(merged_sigi_arr[j])
+        ):
+            sp_item["merged_sigi"] = round(float(merged_sigi_arr[j]), 2)
+        sample_peaks.append(sp_item)
+    return sample_peaks
+
+
+def build_rainbow_zone_payload(
+    peaks_xyz: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None = None,
+    replay_h5: str | os.PathLike | None = None,
+    *,
+    images_h5: str | os.PathLike | None = None,
+    projection: str | None = None,
+    U: np.ndarray | None = None,
+    B: np.ndarray | None = None,
+    R_gonio: np.ndarray | None = None,
+    ki: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    wavelength_range: tuple[float, float] | None = None,
+    d_min: float | None = None,
+    instrument: str = "IMAGINE",
+    space_group: str = "P 1",
+    cell: list[float] | None = None,
+    max_zone_index: int = 3,
+    zone_tolerance_deg: float = 0.75,
+    min_zone_peaks: int = 2,
+    max_zones: int = 36,
+    n_arc: int = 720,
+    max_peaks: int = 2500,
+    render_binning: int = 4,
+    frame_index: int | None = None,
+    include_panels: bool = True,
+    include_panel_images: bool = True,
+    include_peaks: bool = True,
+) -> dict[str, Any]:
+    """Build the JSON-serializable data contract for the Rainbow Zones widget.
+
+    Includes detector bank outlines in both Cylindrical ``(az, y)`` and Spherical
+    ``(az, elevation)`` coordinates, log-scaled detector intensity heatmaps,
+    peak reflections, and Lattice Ladder steps.
+    """
+    detectors: dict[int, Any] = {}
+    fallback_cell = list(cell) if cell and len(cell) == 6 else None
+    fallback_sg = space_group
+    cell = None
+    bank_arr = None
+    pixel_r_arr = None
+    pixel_c_arr = None
+    intensity_arr = None
+    sigma_arr = None
+    var_u_arr = None
+    var_v_arr = None
+    cov_uv_arr = None
+    artifact_kind = "solve"
+    peak_shape_mode = "solved_circle"
+    hkl_arr = None
+    lam_arr = None
+    careless_residual_arr = None
+    careless_scale_arr = None
+    merged_i_arr = None
+    merged_sigi_arr = None
+    merge_metrics: dict[str, Any] | None = None
+    all_runs_data: dict[str, Any] | None = None
+    predicted_frame_data: dict[str, np.ndarray] | None = None
+    predicted_all_runs_data: dict[str, Any] | None = None
+    R_per_run_all: dict[int, np.ndarray] = {}
+    solve_diagnostics = None
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None
+    em_mask_summary: dict[str, Any] = {"available": False}
+    frame_slice = None
+    frames_meta: list[dict[str, Any]] = []
+    active_frame = int(frame_index) if frame_index is not None else 0
+
+    if replay_h5 is not None:
+        extracted = _extract_from_h5(
+            replay_h5,
+            images_h5=images_h5,
+            frame_index=frame_index,
+            include_peaks=include_peaks,
+            default_instrument=instrument or "IMAGINE",
+            d_min=d_min,
+        )
+        instrument = extracted["instrument"] or instrument
+        ki = extracted["ki"]
+        if wavelength_range is None:
+            wavelength_range = extracted["wavelength_range"]
+        if U is None:
+            U = extracted["U"]
+        if B is None:
+            B = extracted["B"]
+        ex_sg = extracted.get("space_group")
+        if ex_sg and ex_sg not in ("P 1", "Unknown"):
+            space_group = ex_sg
+        elif fallback_sg and fallback_sg not in ("P 1", "Unknown"):
+            space_group = fallback_sg
+        else:
+            space_group = ex_sg or space_group
+        cell = extracted["cell"] or fallback_cell
+        detectors = extracted["detectors"]
+        if peaks_xyz is None:
+            peaks_xyz = extracted["peaks_xyz"]
+        bank_arr = extracted["bank"]
+        pixel_r_arr = extracted["pixel_r"]
+        pixel_c_arr = extracted["pixel_c"]
+        intensity_arr = extracted["intensity"]
+        sigma_arr = extracted["sigma"]
+        var_u_arr = extracted.get("var_u")
+        var_v_arr = extracted.get("var_v")
+        cov_uv_arr = extracted.get("cov_uv")
+        artifact_kind = extracted.get("artifact_kind") or artifact_kind
+        peak_shape_mode = extracted.get("peak_shape_mode") or peak_shape_mode
+        hkl_arr = extracted["hkl"]
+        lam_arr = extracted["wavelength"]
+        careless_residual_arr = extracted.get("careless_residual")
+        careless_scale_arr = extracted.get("careless_scale")
+        merged_i_arr = extracted.get("merged_i")
+        merged_sigi_arr = extracted.get("merged_sigi")
+        merge_metrics = extracted.get("merge_metrics")
+        all_runs_data = extracted.get("all_runs_data")
+        predicted_frame_data = extracted.get("predicted_frame_data")
+        predicted_all_runs_data = extracted.get("predicted_all_runs_data")
+        R_per_run_all = dict(extracted.get("R_per_run_all") or {})
+        solve_diagnostics = extracted.get("solve_diagnostics")
+        pixel_class_by_bank = extracted.get("pixel_class_by_bank")
+        em_mask_summary = extracted.get("em_mask_summary") or {"available": False}
+        frame_slice = extracted.get("frame_slice")
+        frames_meta = extracted.get("frames") or []
+        active_frame = int(extracted.get("frame_index", active_frame))
+        if R_gonio is None:
+            R_gonio = extracted["R_gonio"]
+        if extracted.get("images_h5"):
+            images_h5 = extracted["images_h5"]
+        elif images_h5 is None:
+            images_h5 = _discover_images_h5(replay_h5)
+    elif not detectors:
+        detectors = _load_detectors_from_h5(None, instrument)
+        cell = fallback_cell
+        if peaks_xyz is None and ub_matrix is None and U is None:
+            artifact_kind = "empty"
+    if wavelength_range is None:
+        wavelength_range = _get_instrument_default_wavelength(instrument)
+
+    if peaks_xyz is None:
+        peaks_xyz = np.zeros((0, 3), dtype=float)
+    pts = np.asarray(peaks_xyz, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError("peaks_xyz must have shape (N, 3)")
+
+    if ub_matrix is None and U is not None and B is not None:
+        ub_matrix = np.asarray(U, dtype=float) @ np.asarray(B, dtype=float)
+    elif ub_matrix is not None:
+        ub_matrix = np.asarray(ub_matrix, dtype=float)
+        if U is None:
+            U = _u_from_ub(ub_matrix)
+        if B is None:
+            cell = list(_cell_from_B(ub_matrix))
+
+    if cell is None and B is not None:
+        cell = list(_cell_from_B(B))
+
+    ki_hat = np.asarray(ki, dtype=float)
+    ki_hat = ki_hat / np.linalg.norm(ki_hat)
+    wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
+
+    R_single = np.eye(3)
+    if R_gonio is not None:
+        R_arr = np.asarray(R_gonio, dtype=float)
+        if R_arr.ndim == 2:
+            R_single = R_arr
+        elif R_arr.ndim == 3 and len(R_arr) > 0:
+            R_single = R_arr[0]
+
+    raw_zones, zones_payload = _compute_zones_payload_for_geometry(
+        pts,
+        ub_matrix=ub_matrix,
+        R_gonio=R_gonio,
+        R_single=R_single,
+        ki_hat=ki_hat,
+        detectors=detectors,
+        max_zone_index=max_zone_index,
+        zone_tolerance_deg=zone_tolerance_deg,
+        min_zone_peaks=min_zone_peaks,
+        max_zones=max_zones,
+        n_arc=n_arc,
+    )
+
+    is_integrated_artifact = artifact_kind in ("integrator", "merged_careless")
+    primary_source = "integrated" if is_integrated_artifact else "predicted"
+
+    peaks_list = _serialize_peak_entries(
+        pts,
+        bank_arr=bank_arr,
+        pixel_r_arr=pixel_r_arr,
+        pixel_c_arr=pixel_c_arr,
+        intensity_arr=intensity_arr,
+        sigma_arr=sigma_arr,
+        var_u_arr=var_u_arr,
+        var_v_arr=var_v_arr,
+        cov_uv_arr=cov_uv_arr,
+        hkl_arr=hkl_arr,
+        lam_arr=lam_arr,
+        careless_residual_arr=careless_residual_arr,
+        careless_scale_arr=careless_scale_arr,
+        merged_i_arr=merged_i_arr,
+        merged_sigi_arr=merged_sigi_arr,
+        ub_matrix=ub_matrix,
+        R_gonio=R_gonio,
+        ki_hat=ki_hat,
+        wavelength_range=(wl_min, wl_max),
+        space_group=space_group,
+        cell=cell,
+        detectors=detectors,
+        raw_zones=raw_zones,
+        active_frame=active_frame,
+        zone_tolerance_deg=zone_tolerance_deg,
+        max_peaks=max_peaks,
+        peak_source=primary_source,
+    )
+
+    sample_peaks = _serialize_sample_peaks(
+        all_runs_data,
+        fallback_peaks=peaks_list,
+        n_frames=len(frames_meta),
+        ki_hat=ki_hat,
+        R_single=R_single,
+        wavelength_range=(wl_min, wl_max),
+        space_group=space_group,
+        cell=cell,
+        merged_i_arr=merged_i_arr,
+        merged_sigi_arr=merged_sigi_arr,
+        peak_source=primary_source,
+    )
+
+    default_d_min = round(0.5 * float(wl_min), 2)
+    d_min_use = (
+        float(d_min)
+        if d_min is not None and float(d_min) > 0
+        else float((solve_diagnostics or {}).get("d_min", default_d_min))
+    )
+
+    if is_integrated_artifact:
+        integrated_peaks = peaks_list
+        integrated_sample_peaks = sample_peaks
+
+        # If integrated.h5 was pre-filtered and had no extra unintegrated candidates,
+        # forward-project theoretical Laue reflections from (U, B, space_group).
+        if (
+            (
+                predicted_frame_data is None
+                or len(predicted_frame_data.get("peaks_xyz", []))
+                <= len(integrated_peaks)
+            )
+            and ub_matrix is not None
+            and cell is not None
+            and len(cell) >= 6
+            and detectors
+        ):
+            with contextlib.suppress(
+                ImportError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
+                from subhkl.core.spacegroup import generate_reflections
+
+                h_gen, k_gen, l_gen = generate_reflections(
+                    float(cell[0]),
+                    float(cell[1]),
+                    float(cell[2]),
+                    float(cell[3]),
+                    float(cell[4]),
+                    float(cell[5]),
+                    str(space_group),
+                    max(0.5, float(d_min_use)),
                 )
-                if (hj or kj or lj)
-                else (int(r_idx_all[j]), 0, 0, 0)
+                hkl_theo = np.column_stack([h_gen, k_gen, l_gen]).astype(np.int32)
+                U_fb = (
+                    np.asarray(U, dtype=float)
+                    if U is not None
+                    else _u_from_ub(ub_matrix)
+                )
+                B_fb = (
+                    np.asarray(B, dtype=float)
+                    if B is not None
+                    else U_fb.T @ np.asarray(ub_matrix, dtype=float)
+                )
+                ray_fr = _raycast_hkl_on_detectors(
+                    hkl_theo,
+                    U_fb,
+                    B_fb,
+                    R_single,
+                    detectors,
+                    (wl_min, wl_max),
+                    ki=ki_hat,
+                )
+                if len(ray_fr["peaks_xyz"]) > len(
+                    (predicted_frame_data or {}).get("peaks_xyz", [])
+                ):
+                    predicted_frame_data = {
+                        "peaks_xyz": ray_fr["peaks_xyz"],
+                        "hkl": ray_fr["hkl"],
+                        "wavelength": ray_fr["wavelength"],
+                        "bank": ray_fr["bank"],
+                        "pixel_r": ray_fr["pixel_r"],
+                        "pixel_c": ray_fr["pixel_c"],
+                        "intensity": np.full(
+                            len(ray_fr["peaks_xyz"]), 150.0, dtype=float
+                        ),
+                        "sigma": np.full(len(ray_fr["peaks_xyz"]), 3.0, dtype=float),
+                    }
+                    if len(frames_meta) > 1:
+                        all_xyz_p, all_hkl_p, all_lam_p, all_bnk_p, all_run_p = (
+                            [],
+                            [],
+                            [],
+                            [],
+                            [],
+                        )
+                        for r_i in range(len(frames_meta)):
+                            R_ri = R_per_run_all.get(r_i, R_single)
+                            ray_r = (
+                                ray_fr
+                                if r_i == active_frame
+                                else _raycast_hkl_on_detectors(
+                                    hkl_theo,
+                                    U_fb,
+                                    B_fb,
+                                    R_ri,
+                                    detectors,
+                                    (wl_min, wl_max),
+                                    ki=ki_hat,
+                                )
+                            )
+                            n_rr = len(ray_r["peaks_xyz"])
+                            if n_rr > 0:
+                                all_xyz_p.append(ray_r["peaks_xyz"])
+                                all_hkl_p.append(ray_r["hkl"])
+                                all_lam_p.append(ray_r["wavelength"])
+                                all_bnk_p.append(ray_r["bank"])
+                                all_run_p.append(np.full(n_rr, int(r_i), dtype=int))
+                        if all_xyz_p:
+                            pts_pa = np.concatenate(all_xyz_p, axis=0)
+                            hkl_pa = np.concatenate(all_hkl_p, axis=0)
+                            lam_pa = np.concatenate(all_lam_p, axis=0)
+                            bnk_pa = np.concatenate(all_bnk_p, axis=0)
+                            run_pa = np.concatenate(all_run_p, axis=0)
+                            if len(pts_pa) > 4500:
+                                sub_i = np.linspace(0, len(pts_pa) - 1, 4500, dtype=int)
+                                pts_pa = pts_pa[sub_i]
+                                hkl_pa = hkl_pa[sub_i]
+                                lam_pa = lam_pa[sub_i]
+                                bnk_pa = bnk_pa[sub_i]
+                                run_pa = run_pa[sub_i]
+                            predicted_all_runs_data = {
+                                "peaks_xyz": pts_pa,
+                                "hkl": hkl_pa,
+                                "wavelength": lam_pa,
+                                "intensity": np.full(len(pts_pa), 150.0, dtype=float),
+                                "sigma": np.full(len(pts_pa), 3.0, dtype=float),
+                                "bank": bnk_pa,
+                                "run_index": run_pa,
+                                "R_per_run": R_per_run_all,
+                            }
+
+        if (
+            predicted_frame_data is not None
+            and len(predicted_frame_data.get("peaks_xyz", [])) > 0
+        ):
+            predicted_peaks = _serialize_peak_entries(
+                predicted_frame_data["peaks_xyz"],
+                bank_arr=predicted_frame_data.get("bank"),
+                pixel_r_arr=predicted_frame_data.get("pixel_r"),
+                pixel_c_arr=predicted_frame_data.get("pixel_c"),
+                intensity_arr=predicted_frame_data.get("intensity"),
+                sigma_arr=predicted_frame_data.get("sigma"),
+                var_u_arr=None,
+                var_v_arr=None,
+                cov_uv_arr=None,
+                hkl_arr=predicted_frame_data.get("hkl"),
+                lam_arr=predicted_frame_data.get("wavelength"),
+                ub_matrix=ub_matrix,
+                R_gonio=R_single,
+                ki_hat=ki_hat,
+                wavelength_range=(wl_min, wl_max),
+                space_group=space_group,
+                cell=cell,
+                detectors=detectors,
+                raw_zones=raw_zones,
+                active_frame=active_frame,
+                zone_tolerance_deg=zone_tolerance_deg,
+                max_peaks=max_peaks,
+                peak_source="predicted",
             )
-            h_mult = max(int(ray_counts_all.get(rk, 1)), 2 if gc > 1 else 1)
-            ah, ak, al = _to_asu_hkl(hj, kj, lj)
-            orb_id = f"{ah},{ak},{al}"
-            orb_c = abs(ah * 73856093 ^ ak * 19349663 ^ al * 83492791) % 12
-            lv = (
-                float(lam_all[j])
-                if lam_all is not None and j < len(lam_all)
-                else 0.5 * (wl_min + wl_max)
+            predicted_sample_peaks = _serialize_sample_peaks(
+                predicted_all_runs_data,
+                fallback_peaks=predicted_peaks,
+                n_frames=len(frames_meta),
+                ki_hat=ki_hat,
+                R_single=R_single,
+                wavelength_range=(wl_min, wl_max),
+                space_group=space_group,
+                cell=cell,
+                peak_source="predicted",
             )
-            st_j = float(np.clip(0.5 * qn_all[j, 0], 1e-4, 0.9999))
-            dv = lv / max(2.0 * st_j, 1e-4)
-            sp_item: dict[str, Any] = {
-                "id": j,
-                "run_index": int(r_idx_all[j]),
-                "bank": int(bnk_all[j])
-                if bnk_all is not None and j < len(bnk_all)
-                else 1,
-                "q_hat": [round(float(x), 5) for x in g_samp_all[j]],
-                "q_hat_lab": [round(float(x), 5) for x in g_lab_all[j]],
-                "stereographic": [
-                    round(float(sx_all[j]), 5),
-                    round(float(sy_all[j]), 5),
-                ],
-                "hemisphere": int(hm_all[j]),
-                "intensity": round(float(int_all[j]), 2)
-                if int_all is not None and j < len(int_all)
-                else 100.0,
-                "sigma": round(float(sig_all[j]), 2)
-                if sig_all is not None and j < len(sig_all)
-                else 3.0,
-                "wavelength": round(float(np.clip(lv, wl_min * 0.5, wl_max * 1.5)), 4),
-                "d_spacing": round(dv, 4),
-                "harmonic_order": max(1, gc),
-                "harmonic_multiplicity": h_mult,
-                "hkl": [hj, kj, lj],
-                "asu_hkl": [ah, ak, al],
-                "asu_orbit_id": orb_id,
-                "orbit_color_idx": int(orb_c),
-                "zone_ids": [],
-                "indexed": bool(hj or kj or lj),
-            }
-            if res_all is not None and j < len(res_all) and np.isfinite(res_all[j]):
-                sp_item["careless_residual"] = round(float(res_all[j]), 3)
-            if scl_all is not None and j < len(scl_all) and np.isfinite(scl_all[j]):
-                sp_item["careless_scale"] = round(float(scl_all[j]), 4)
-            if (
-                merged_i_arr is not None
-                and j < len(merged_i_arr)
-                and np.isfinite(merged_i_arr[j])
-            ):
-                sp_item["merged_i"] = round(float(merged_i_arr[j]), 2)
-            if (
-                merged_sigi_arr is not None
-                and j < len(merged_sigi_arr)
-                and np.isfinite(merged_sigi_arr[j])
-            ):
-                sp_item["merged_sigi"] = round(float(merged_sigi_arr[j]), 2)
-            sample_peaks.append(sp_item)
+        else:
+            predicted_peaks = []
+            predicted_sample_peaks = []
+        default_peak_source = "integrated" if len(integrated_peaks) > 0 else "predicted"
     else:
-        sample_peaks = peaks_list
+        predicted_peaks = peaks_list
+        predicted_sample_peaks = sample_peaks
+        integrated_peaks = []
+        integrated_sample_peaks = []
+        default_peak_source = "predicted"
 
     if isinstance(merge_metrics, dict):
         if "harmonic_overlap_fraction" not in merge_metrics and len(sample_peaks) > 0:
@@ -3704,140 +4833,6 @@ def build_rainbow_zone_payload(
                     merge_metrics["cc_half_bins"] = enriched_bins
                     merge_metrics["resolution_bins"] = enriched_bins
 
-    zones_payload: list[dict[str, Any]] = []
-    for zi, z in enumerate(raw_zones):
-        t_cryst = np.asarray(z["axis_crystal_xyz"], dtype=float)
-        t_lab = R_single @ t_cryst
-        conic_cryst = get_zone_conic_points(t_cryst, ki=ki_hat, n_arc=n_arc)
-        conic_lab = get_zone_conic_points(t_lab, ki=ki_hat, n_arc=n_arc)
-
-        det_segments: list[list[list[float]]] = []
-        det_segments_sph: list[list[list[float]]] = []
-        kf = conic_lab["kf_hat"]
-        if detectors:
-            for bk, det in sorted(detectors.items()):
-                with contextlib.suppress(
-                    OSError,
-                    RuntimeError,
-                    ValueError,
-                    TypeError,
-                    KeyError,
-                    IndexError,
-                ):
-                    mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
-                    if not np.any(mask):
-                        continue
-                    idx_hits = np.where(mask)[0]
-                    splits = np.where(np.diff(idx_hits) > 2)[0] + 1
-                    for chunk in np.split(idx_hits, splits):
-                        if len(chunk) < 2:
-                            continue
-                        xyz_seg = det.pixel_to_lab(row[chunk], col[chunk])
-                        px, py = _unrolled(xyz_seg)
-                        _, pel = _spherical_angles(xyz_seg)
-                        if np.ptp(px) <= 90.0:
-                            step_s = max(1, len(px) // 32)
-                            det_segments.append(
-                                [
-                                    [
-                                        round(float(px[j]), 2),
-                                        round(float(py[j]), 4),
-                                    ]
-                                    for j in range(0, len(px), step_s)
-                                ]
-                            )
-                            det_segments_sph.append(
-                                [
-                                    [
-                                        round(float(px[j]), 2),
-                                        round(float(pel[j]), 3),
-                                    ]
-                                    for j in range(0, len(px), step_s)
-                                ]
-                            )
-
-        dx = np.asarray(conic_lab["det_x"], dtype=float)
-        dy = np.asarray(conic_lab["det_y"], dtype=float)
-        del_deg = np.asarray(conic_lab["det_el"], dtype=float)
-        if n_peaks > 0:
-            med_r_xz = float(np.median(np.hypot(pts[:, 0], pts[:, 2])))
-            if med_r_xz > 0.05:
-                dy = dy * med_r_xz
-
-        continuous_segments: list[list[list[float]]] = []
-        continuous_segments_sph: list[list[list[float]]] = []
-        cur_seg: list[list[float]] = []
-        cur_seg_sph: list[list[float]] = []
-        for k in range(0, len(dx), 2):
-            if cur_seg and abs(dx[k] - cur_seg[-1][0]) > 45.0:
-                if len(cur_seg) >= 2:
-                    continuous_segments.append(cur_seg)
-                    continuous_segments_sph.append(cur_seg_sph)
-                cur_seg = []
-                cur_seg_sph = []
-            cur_seg.append([round(float(dx[k]), 2), round(float(dy[k]), 4)])
-            cur_seg_sph.append([round(float(dx[k]), 2), round(float(del_deg[k]), 3)])
-        if len(cur_seg) >= 2:
-            continuous_segments.append(cur_seg)
-            continuous_segments_sph.append(cur_seg_sph)
-
-        if not detectors and not det_segments:
-            det_segments = continuous_segments
-            det_segments_sph = continuous_segments_sph
-
-        sx_z = np.asarray(conic_cryst["sx"], dtype=float)
-        sy_z = np.asarray(conic_cryst["sy"], dtype=float)
-        hm_z = np.asarray(conic_cryst["hemisphere"], dtype=int)
-        stereo_segments: list[list[list[float]]] = []
-        cur_s: list[list[float]] = []
-        for k in range(0, len(sx_z), 2):
-            if cur_s and (
-                hm_z[k] != cur_s[-1][2]
-                or np.hypot(sx_z[k] - cur_s[-1][0], sy_z[k] - cur_s[-1][1]) > 0.35
-            ):
-                if len(cur_s) >= 2:
-                    stereo_segments.append(cur_s)
-                cur_s = []
-            cur_s.append(
-                [
-                    round(float(sx_z[k]), 4),
-                    round(float(sy_z[k]), 4),
-                    int(hm_z[k]),
-                ]
-            )
-        if len(cur_s) >= 2:
-            stereo_segments.append(cur_s)
-
-        pole_sx, pole_sy, pole_hemi = stereographic_projection(t_cryst)
-
-        zones_payload.append(
-            {
-                "zone_id": int(z["zone_id"]),
-                "uvw": z["uvw"],
-                "order": int(z.get("order", max(abs(int(x)) for x in z["uvw"]))),
-                "label": z["label"],
-                "axis_xyz": z["axis_xyz"],
-                "axis_crystal_xyz": z["axis_crystal_xyz"],
-                "pole_stereo": [
-                    round(float(pole_sx), 4),
-                    round(float(pole_sy), 4),
-                    int(pole_hemi),
-                ],
-                "d_direct": z["d_direct"],
-                "score": z["score"],
-                "n_peaks": z["n_peaks"],
-                "angular_rms_deg": z["angular_rms_deg"],
-                "member_peak_ids": z["member_peak_ids"],
-                "rainbow_color": RAINBOW_SPECTRAL_HEX[zi % len(RAINBOW_SPECTRAL_HEX)],
-                "pro_color": PRO_PALETTE_HEX[zi % len(PRO_PALETTE_HEX)],
-                "stereo_segments": stereo_segments,
-                "detector_segments": det_segments,
-                "detector_segments_sph": det_segments_sph,
-                "continuous_segments": continuous_segments,
-                "continuous_segments_sph": continuous_segments_sph,
-            }
-        )
-
     if include_panels:
         panels_payload, intensity_source = _encode_panel_textures(
             detectors=detectors,
@@ -3881,17 +4876,46 @@ def build_rainbow_zone_payload(
         else default_projection_for_instrument(instrument)
     )
 
-    default_d_min = round(0.5 * float(wl_min), 2)
-    d_min_use = (
-        float(d_min)
-        if d_min is not None and float(d_min) > 0
-        else float((solve_diagnostics or {}).get("d_min", default_d_min))
-    )
     gonio_summary = (
         frames_meta[active_frame].get("motor_summary", "—")
         if 0 <= active_frame < len(frames_meta)
         else "—"
     )
+
+    detector_configs: dict[str, dict[str, Any]] = {}
+    for bk_k, det_v in sorted(detectors.items()):
+        cfg_d = getattr(det_v, "config", None)
+        if isinstance(cfg_d, dict):
+            det_entry: dict[str, Any] = {
+                "panel_type": str(cfg_d.get("panel_type", "flat")),
+                "m": int(cfg_d.get("m", getattr(det_v, "m", 256))),
+                "n": int(cfg_d.get("n", getattr(det_v, "n", 256))),
+            }
+            for vec_k in ("center", "uhat", "vhat", "axis_offset", "axis_direction"):
+                if vec_k in cfg_d and cfg_d[vec_k] is not None:
+                    det_entry[vec_k] = [round(float(x), 6) for x in cfg_d[vec_k]]
+            for scl_k in (
+                "width",
+                "height",
+                "radius",
+                "angular_width",
+                "theta_min",
+                "theta_max",
+                "y_min",
+                "y_max",
+            ):
+                if scl_k in cfg_d and cfg_d[scl_k] is not None:
+                    det_entry[scl_k] = round(float(cfg_d[scl_k]), 6)
+            detector_configs[str(bk_k)] = det_entry
+
+    gonio_R_per_run_payload = {
+        str(int(rk)): [[round(float(v), 6) for v in row] for row in rm]
+        for rk, rm in sorted(R_per_run_all.items())
+    }
+    if str(int(active_frame)) not in gonio_R_per_run_payload:
+        gonio_R_per_run_payload[str(int(active_frame))] = [
+            [round(float(v), 6) for v in row] for row in R_single
+        ]
 
     from subhkl.config import beamlines as _cfg_beamlines
 
@@ -3923,26 +4947,46 @@ def build_rainbow_zone_payload(
         "intensity_source": intensity_source,
         "artifact_kind": artifact_kind,
         "peak_shape_mode": peak_shape_mode,
+        "default_peak_source": default_peak_source,
         "pending_stage": pending_stage,
+        "ki": [round(float(x), 6) for x in ki_hat],
         "wavelength_range": [round(wl_min, 3), round(wl_max, 3)],
         "d_min": round(d_min_use, 3),
         "frame_index": int(active_frame),
         "goniometer_summary": gonio_summary,
         "goniometer_R": [[round(float(v), 6) for v in row] for row in R_single],
+        "goniometer_R_per_run": gonio_R_per_run_payload,
         "frames": frames_meta,
         "images_h5": str(images_h5) if images_h5 else None,
         "cell": [round(float(x), 4) for x in cell] if cell else None,
+        "u_matrix": (
+            [[round(float(v), 6) for v in row] for row in np.asarray(U, dtype=float)]
+            if U is not None
+            else None
+        ),
+        "b_matrix": (
+            [[round(float(v), 6) for v in row] for row in np.asarray(B, dtype=float)]
+            if B is not None
+            else None
+        ),
         "ub_matrix": (
             [[round(float(v), 6) for v in row] for row in ub_matrix]
             if ub_matrix is not None
             else None
         ),
+        "detector_configs": detector_configs,
         "beamline_detectors": beamline_detectors,
         "solve_diagnostics": solve_diagnostics,
         "em_mask_summary": em_mask_summary,
         "merge_metrics": merge_metrics,
         "peaks": peaks_list,
         "sample_peaks": sample_peaks,
+        "predicted_peaks": predicted_peaks,
+        "predicted_sample_peaks": predicted_sample_peaks,
+        "integrated_peaks": integrated_peaks,
+        "integrated_sample_peaks": integrated_sample_peaks,
+        "mtz_peaks": [],
+        "mtz_sample_peaks": [],
         "zones": zones_payload,
         "panels": panels_payload,
         "ladder_steps": ladder_steps,
@@ -5074,6 +6118,41 @@ def render_rainbow_html(
     overflow: hidden;
     text-overflow: ellipsis;
   }}
+
+  .seg-toggle {{
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    overflow: hidden;
+    background: var(--bg-card);
+  }}
+
+  .seg-toggle button {{
+    border: none;
+    border-right: 1px solid var(--border-color);
+    border-radius: 0;
+    padding: 3px 7px;
+    font-size: 0.66rem;
+    margin: 0;
+    box-shadow: none;
+  }}
+
+  .seg-toggle button:last-child {{
+    border-right: none;
+  }}
+
+  .seg-toggle button:disabled {{
+    opacity: 0.34;
+    cursor: not-allowed;
+    pointer-events: none;
+  }}
+
+  .seg-toggle button[data-peak-src="mtz"].active-btn {{
+    background: rgba(251, 191, 36, 0.22);
+    color: var(--accent-gold);
+    text-shadow: 0 0 6px rgba(251, 191, 36, 0.35);
+  }}
 </style>
 </head>
 <body>
@@ -5117,18 +6196,23 @@ def render_rainbow_html(
     </div>
 
     <div class="controls-cluster">
-      <select id="sel-galaxy-h5" title="Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus files, or select from Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:5px;padding:3px 6px;font-size:0.68rem;font-family:var(--font-display);max-width:175px;">
+      <select id="sel-galaxy-h5" title="Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus/.mtz files, or select from Galaxy History" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:5px;padding:3px 6px;font-size:0.68rem;font-family:var(--font-display);max-width:175px;">
         <option value="">Data Source...</option>
         <option value="__action_neutron_data__">Neutron data (SNS/HFIR)...</option>
         <option value="__action_local_file__">From local computer...</option>
       </select>
-      <input type="file" id="inp-local-h5" accept=".h5,.hdf5,.nxs" multiple style="display:none;" />
-      <button id="btn-local-h5" style="display:none;" title="Open local .h5 / .nxs.h5 files">
+      <input type="file" id="inp-local-h5" accept=".h5,.hdf5,.nxs,.mtz" multiple style="display:none;" />
+      <button id="btn-local-h5" style="display:none;" title="Open local .h5 / .nxs.h5 / .mtz files">
         Local .h5
       </button>
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
         Cyl
       </button>
+      <div id="peak-source-group" class="seg-toggle" title="Toggle displayed &amp; Wulff-projected reflections: Predicted (circles), Integrated (2σ ellipses), or custom .mtz">
+        <button id="btn-peaks-pred" type="button" data-peak-src="predicted" class="active-btn" title="Predicted reflections (circles)">○ Pred</button>
+        <button id="btn-peaks-integ" type="button" data-peak-src="integrated" disabled title="Successfully integrated reflections (2σ ellipses)">⬭ Integ</button>
+        <button id="btn-peaks-mtz" type="button" data-peak-src="mtz" disabled title="Custom .mtz reflections using MTZ unit cell B &amp; space group with active U">.mtz</button>
+      </div>
       <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
         Arcs
       </button>
@@ -5567,8 +6651,37 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
 (function() {{
   const DATA = window.RAINBOW_ZONES_DATA || {{ peaks: [], sample_peaks: [], zones: [], panels: [], ladder_steps: [], pipeline_stages: [] }};
-  const PEAKS = DATA.peaks || [];
-  const SAMPLE_PEAKS = DATA.sample_peaks || [];
+  function extractPeakBucketsFromPayload(payload) {{
+    const pObj = payload || {{}};
+    const art = String(pObj.artifact_kind || "").toLowerCase();
+    const isIntegPayload = art === "integrator" || art === "merged_careless";
+    const basePeaks = Array.isArray(pObj.peaks) ? pObj.peaks : [];
+    const baseSample = Array.isArray(pObj.sample_peaks) ? pObj.sample_peaks : basePeaks;
+    const predPeaks = Array.isArray(pObj.predicted_peaks)
+      ? [...pObj.predicted_peaks]
+      : (isIntegPayload ? [] : [...basePeaks]);
+    const predSample = Array.isArray(pObj.predicted_sample_peaks)
+      ? [...pObj.predicted_sample_peaks]
+      : (isIntegPayload ? predPeaks : [...baseSample]);
+    const integPeaks = Array.isArray(pObj.integrated_peaks)
+      ? [...pObj.integrated_peaks]
+      : (isIntegPayload ? [...basePeaks] : []);
+    const integSample = Array.isArray(pObj.integrated_sample_peaks)
+      ? [...pObj.integrated_sample_peaks]
+      : (isIntegPayload ? [...baseSample] : integPeaks);
+    const mtzPeaks = Array.isArray(pObj.mtz_peaks) ? [...pObj.mtz_peaks] : [];
+    const mtzSample = Array.isArray(pObj.mtz_sample_peaks) ? [...pObj.mtz_sample_peaks] : mtzPeaks;
+    return {{ predPeaks, predSample, integPeaks, integSample, mtzPeaks, mtzSample }};
+  }}
+  const initBuckets = extractPeakBucketsFromPayload(DATA);
+  let PREDICTED_PEAKS = initBuckets.predPeaks;
+  let PREDICTED_SAMPLE_PEAKS = initBuckets.predSample;
+  let INTEGRATED_PEAKS = initBuckets.integPeaks;
+  let INTEGRATED_SAMPLE_PEAKS = initBuckets.integSample;
+  let MTZ_PEAKS = initBuckets.mtzPeaks;
+  let MTZ_SAMPLE_PEAKS = initBuckets.mtzSample;
+  const PEAKS = [...(DATA.peaks || [])];
+  const SAMPLE_PEAKS = [...(DATA.sample_peaks || PEAKS)];
   const ZONES = DATA.zones || [];
   const PANELS = DATA.panels || [];
   const LADDER = DATA.ladder_steps || [];
@@ -5756,6 +6869,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     showZoneArcs: true,           // single vibrant arc per zone (not multi-band rainbow)
     showPixelMask: false,         // translucent two-color EM pixel mask overlay (dark=cyan, bright=lime)
     heatmapStyle: "magma",        // "magma" | "cyan" | "gray"
+    peakSource: String(DATA.default_peak_source || ((String(DATA.artifact_kind || "").toLowerCase() === "integrator" || String(DATA.artifact_kind || "").toLowerCase() === "merged_careless") ? "integrated" : "predicted")), // "predicted" | "integrated" | "mtz"
     detAlpha: 0.85,
     showStereo: isMergedInit,
     wulffExpanded: isMergedInit,
@@ -6804,10 +7918,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function hasIntegratedIsigi() {{
-    const art = String(DATA.artifact_kind || "").toLowerCase();
-    if (art === "integrator" || art === "merged_careless") return true;
     const checkArr = arr => Array.isArray(arr) && arr.some(
-      p => p && Array.isArray(p.ellipse) && typeof p.intensity === "number" && typeof p.sigma === "number" && p.sigma > 0
+      p => p && typeof p.intensity === "number" && Number.isFinite(p.intensity) && typeof p.sigma === "number" && p.sigma > 0
     );
     return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
   }}
@@ -7593,6 +8705,127 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ];
   }}
 
+  function getCenteredDetectorAzimuthDeg() {{
+    if (!detCanvas) return 0.0;
+    const rect = detCanvas.getBoundingClientRect();
+    const w = rect.width || 800;
+    const h = rect.height || 500;
+    const bounds = getActiveBounds();
+    const box = getDetectorPlotBox(w, h);
+    const cx = w * 0.5;
+    const viewCenterX = box.originX + 0.5 * box.plotW;
+    const zoom = Math.max(1e-6, state.detZoom || 1.0);
+    const x0 = cx + (viewCenterX - cx - (state.detPanX || 0.0)) / zoom;
+    const u = (x0 - box.originX) / Math.max(1.0, box.plotW);
+    const rawChi = bounds.minX + u * (bounds.maxX - bounds.minX);
+    return ((((rawChi + 180.0) % 360.0) + 360.0) % 360.0) - 180.0;
+  }}
+
+  function setDetectorCenterAzimuthDeg(chiDeg) {{
+    if (!detCanvas) return;
+    const rect = detCanvas.getBoundingClientRect();
+    const w = rect.width || 800;
+    const h = rect.height || 500;
+    const bounds = getActiveBounds();
+    const box = getDetectorPlotBox(w, h);
+    const cx = w * 0.5;
+    const viewCenterX = box.originX + 0.5 * box.plotW;
+    const zoom = Math.max(1e-6, state.detZoom || 1.0);
+    const wrappedChi = ((((Number(chiDeg) || 0.0) + 180.0) % 360.0) + 360.0) % 360.0 - 180.0;
+    const u = (wrappedChi - bounds.minX) / Math.max(1e-6, bounds.maxX - bounds.minX);
+    const x0 = box.originX + u * box.plotW;
+    state.detPanX = (viewCenterX - cx) - (x0 - cx) * zoom;
+  }}
+
+  function syncWulffYawFromDetector() {{
+    state.wulffYawDeg = -getCenteredDetectorAzimuthDeg();
+  }}
+
+  function resolveAvailablePeakSource(preferredSource) {{
+    const hasPred = Array.isArray(PREDICTED_PEAKS) && PREDICTED_PEAKS.length > 0;
+    const hasInteg = Array.isArray(INTEGRATED_PEAKS) && INTEGRATED_PEAKS.length > 0;
+    const hasMtz = (Array.isArray(MTZ_PEAKS) && MTZ_PEAKS.length > 0) || Boolean(DATA.mtz_overlay_name);
+    const req = String(preferredSource || "").toLowerCase();
+    if (req === "mtz" && hasMtz) return "mtz";
+    if (req === "integrated" && hasInteg) return "integrated";
+    if (req === "predicted" && hasPred) return "predicted";
+    const defSrc = String(DATA.default_peak_source || "").toLowerCase();
+    if (defSrc === "mtz" && hasMtz) return "mtz";
+    if (defSrc === "integrated" && hasInteg) return "integrated";
+    if (defSrc === "predicted" && hasPred) return "predicted";
+    if (hasInteg) return "integrated";
+    if (hasPred) return "predicted";
+    if (hasMtz) return "mtz";
+    return req === "integrated" || req === "mtz" ? req : "predicted";
+  }}
+
+  function syncPeakSourceButtons() {{
+    const btnPred = document.getElementById("btn-peaks-pred");
+    const btnInteg = document.getElementById("btn-peaks-integ");
+    const btnMtz = document.getElementById("btn-peaks-mtz");
+    const nPred = Array.isArray(PREDICTED_PEAKS) ? PREDICTED_PEAKS.length : 0;
+    const nInteg = Array.isArray(INTEGRATED_PEAKS) ? INTEGRATED_PEAKS.length : 0;
+    const nMtz = Array.isArray(MTZ_PEAKS) ? MTZ_PEAKS.length : 0;
+    const art = String(DATA.artifact_kind || "").toLowerCase();
+    const hasPred = nPred > 0 || (nInteg === 0 && nMtz === 0 && art !== "integrator" && art !== "merged_careless");
+    const hasInteg = nInteg > 0 || (nPred === 0 && nMtz === 0 && (art === "integrator" || art === "merged_careless"));
+    const hasMtz = nMtz > 0 || Boolean(DATA.mtz_overlay_name);
+    if (btnPred) {{
+      btnPred.disabled = !hasPred;
+      btnPred.classList.toggle("active-btn", state.peakSource === "predicted");
+      btnPred.title = `Show predicted reflections as circles (${{nPred}} on frame; also projected on Wulff map)`;
+    }}
+    if (btnInteg) {{
+      btnInteg.disabled = !hasInteg;
+      btnInteg.classList.toggle("active-btn", state.peakSource === "integrated");
+      btnInteg.title = `Show successfully integrated reflections as 2σ ellipses (${{nInteg}} on frame; also projected on Wulff map)`;
+    }}
+    if (btnMtz) {{
+      btnMtz.disabled = !hasMtz;
+      btnMtz.classList.toggle("active-btn", state.peakSource === "mtz");
+      const mtzLabel = DATA.mtz_overlay_name ? ` (${{DATA.mtz_overlay_name}}: ${{nMtz}} on frame)` : ` (${{nMtz}} on frame)`;
+      btnMtz.title = `Show custom .mtz reflections as circles using MTZ B & space group with active U${{mtzLabel}}`;
+    }}
+  }}
+
+  function applyPeakSource(preferredSource, shouldRender = true) {{
+    const resolved = resolveAvailablePeakSource(preferredSource);
+    const prevSource = state.peakSource;
+    state.peakSource = resolved;
+    let srcPeaks = PREDICTED_PEAKS;
+    let srcSample = PREDICTED_SAMPLE_PEAKS;
+    if (resolved === "integrated") {{
+      srcPeaks = INTEGRATED_PEAKS;
+      srcSample = INTEGRATED_SAMPLE_PEAKS;
+    }} else if (resolved === "mtz") {{
+      srcPeaks = MTZ_PEAKS;
+      srcSample = MTZ_SAMPLE_PEAKS;
+    }}
+    PEAKS.length = 0;
+    (srcPeaks || []).forEach(p => PEAKS.push(p));
+    SAMPLE_PEAKS.length = 0;
+    (srcSample && srcSample.length > 0 ? srcSample : PEAKS).forEach(p => SAMPLE_PEAKS.push(p));
+    if (prevSource !== resolved) {{
+      state.hoveredPeakId = null;
+      state.hoveredPeakObj = null;
+      state.selectedPeakId = null;
+      state.selectedPeakObj = null;
+      state.activeOrbitId = null;
+    }}
+    if ((state.wulffColorMode === "residual" || state.wulffColorMode === "scale") && !hasMergedCarelessData()) {{
+      state.wulffColorMode = "wavelength";
+    }} else if (state.wulffColorMode === "isigi" && !hasIntegratedIsigi()) {{
+      state.wulffColorMode = "wavelength";
+    }}
+    syncPeakSourceButtons();
+    if (shouldRender) {{
+      syncWulffUI();
+      renderZoneList();
+      updateHUD();
+      renderDetector();
+    }}
+  }}
+
   function drawSingleZoneArc(ctx, pts, zone, isContinuousGap = false) {{
     if (!pts || pts.length < 2) return;
     const isSelected = state.selectedZoneId === zone.zone_id;
@@ -7993,7 +9226,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.strokeStyle = strokeCol;
         ctx.lineWidth = isHovered ? 2.4 : (isOrbitMate ? 2.1 : (captured ? 1.85 : 1.05));
 
-        if (Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6) {{
+        if (state.peakSource === "integrated" && Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6) {{
           const scrPts = ellPtsRaw.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, fgLayer));
           let maxDist = 0.0, minDist = 1e9;
           for (let m = 0; m < scrPts.length; m++) {{
@@ -8430,10 +9663,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (span360 > 10) {{
         while (nextPanX > 0.5 * span360) {{ nextPanX -= span360; panStart[0] += span360; }}
         while (nextPanX < -0.5 * span360) {{ nextPanX += span360; panStart[0] -= span360; }}
-        state.wulffYawDeg = -(nextPanX / span360) * 360.0;
       }}
       state.detPanX = nextPanX;
       state.detPanY = ev.clientY - panStart[1];
+      syncWulffYawFromDetector();
       return;
     }}
     const hit = findNearestPeakDetector(mx, my);
@@ -8464,6 +9697,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const sensitivity = ev.ctrlKey ? 0.0035 : 0.0016;
     const factor = Math.exp(-clampedDy * sensitivity);
     state.detZoom = Math.max(0.7, Math.min(10.0, state.detZoom * factor));
+    syncWulffYawFromDetector();
   }}, {{ passive: false }});
 
   detCanvas.addEventListener("click", (ev) => {{
@@ -8500,9 +9734,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const dy = ev.clientY - wulffDragStart[1];
         state.wulffYawDeg = ((wulffDragStart[2] + dx * 0.55 + 540) % 360) - 180;
         state.wulffPitchDeg = Math.max(-85, Math.min(85, wulffDragStart[3] + dy * 0.45));
-        const detRect = detCanvas.getBoundingClientRect();
-        const span360 = getDetectorPlotBox(detRect.width, detRect.height).plotW * state.detZoom;
-        state.detPanX = -(state.wulffYawDeg / 360.0) * span360;
+        setDetectorCenterAzimuthDeg(-state.wulffYawDeg);
         return;
       }}
       const hit = findNearestPeakWulff(mx, my);
@@ -8644,12 +9876,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   if (btnWulffScope) {{
     btnWulffScope.addEventListener("click", () => {{
       state.wulffScope = state.wulffScope === "all_runs" ? "single_frame" : "all_runs";
-      const detRect = detCanvas.getBoundingClientRect();
-      const span360 = getDetectorPlotBox(detRect.width, detRect.height).plotW * state.detZoom;
-      state.wulffYawDeg = -(state.detPanX / Math.max(1, span360)) * 360.0;
+      syncWulffYawFromDetector();
       syncWulffUI();
     }});
   }}
+
+  ["btn-peaks-pred", "btn-peaks-integ", "btn-peaks-mtz"].forEach((btnId) => {{
+    const el = document.getElementById(btnId);
+    if (!el) return;
+    el.addEventListener("click", () => {{
+      const src = el.getAttribute("data-peak-src") || "predicted";
+      applyPeakSource(src, true);
+    }});
+  }});
 
   function applySpotColorMode(nextMode) {{
     if ((nextMode === "residual" || nextMode === "scale") && !hasMergedCarelessData()) {{
@@ -8707,6 +9946,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     setMaxZoneOrder(1);
   }});
 
+  applyPeakSource(state.peakSource, false);
+  syncWulffYawFromDetector();
   syncWulffUI();
 
   document.getElementById("btn-zones-all").addEventListener("click", () => {{
@@ -8928,6 +10169,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (newPayload.goniometer_summary) DATA.goniometer_summary = newPayload.goniometer_summary;
     if (Array.isArray(newPayload.goniometer_R)) DATA.goniometer_R = newPayload.goniometer_R;
+    if (newPayload.goniometer_R_per_run && typeof newPayload.goniometer_R_per_run === "object") DATA.goniometer_R_per_run = newPayload.goniometer_R_per_run;
+    if (newPayload.u_matrix) DATA.u_matrix = newPayload.u_matrix;
+    if (newPayload.b_matrix) DATA.b_matrix = newPayload.b_matrix;
+    if (newPayload.ub_matrix) DATA.ub_matrix = newPayload.ub_matrix;
+    if (newPayload.detector_configs) DATA.detector_configs = newPayload.detector_configs;
+    if (Array.isArray(newPayload.ki)) DATA.ki = newPayload.ki;
+    DATA.mtz_overlay_name = newPayload.mtz_overlay_name || null;
+    DATA.mtz_overlay_reflections = newPayload.mtz_overlay_reflections || 0;
+    DATA.mtz_overlay_matched = newPayload.mtz_overlay_matched || 0;
+    DATA.default_peak_source = newPayload.default_peak_source || null;
     renderFrameSelector();
 
     if (DATA.wavelength_range && DATA.wavelength_range.length >= 2) {{
@@ -8939,8 +10190,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       syncDminControls(Number(DATA.d_min));
     }}
 
-    let nextPeaks = Array.isArray(newPayload.peaks) ? [...newPayload.peaks] : [];
-    let nextSamplePeaks = Array.isArray(newPayload.sample_peaks) ? [...newPayload.sample_peaks] : nextPeaks;
+    const nextBuckets = extractPeakBucketsFromPayload(newPayload);
     let nextZones = Array.isArray(newPayload.zones) ? [...newPayload.zones] : [];
     const nextPanels = Array.isArray(newPayload.panels) ? [...newPayload.panels] : [];
     let nextLadder = Array.isArray(newPayload.ladder_steps) && newPayload.ladder_steps.length > 0 ? [...newPayload.ladder_steps] : [...LADDER];
@@ -8951,18 +10201,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         nextZones = prevZones;
         nextLadder = prevLadder;
       }}
-      if (nextPeaks.length === 0 && prevPeaks.length > 0) {{
-        nextPeaks = prevPeaks;
-        nextSamplePeaks = prevSamplePeaks;
+      if (nextBuckets.predPeaks.length === 0 && nextBuckets.integPeaks.length === 0 && prevPeaks.length > 0) {{
+        nextBuckets.predPeaks = prevPeaks;
+        nextBuckets.predSample = prevSamplePeaks;
       }}
     }}
 
-    PEAKS.length = 0;
-    nextPeaks.forEach(p => PEAKS.push(p));
-    SAMPLE_PEAKS.length = 0;
-    nextSamplePeaks.forEach(p => SAMPLE_PEAKS.push(p));
+    PREDICTED_PEAKS = nextBuckets.predPeaks;
+    PREDICTED_SAMPLE_PEAKS = nextBuckets.predSample;
+    INTEGRATED_PEAKS = nextBuckets.integPeaks;
+    INTEGRATED_SAMPLE_PEAKS = nextBuckets.integSample;
+    MTZ_PEAKS = nextBuckets.mtzPeaks;
+    MTZ_SAMPLE_PEAKS = nextBuckets.mtzSample;
     DATA.merge_metrics = newPayload.merge_metrics || null;
     DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
+    const preferredSrc = isFrameSwitch
+      ? state.peakSource
+      : (newPayload.default_peak_source || state.peakSource);
+    applyPeakSource(preferredSrc, false);
     ZONES.length = 0;
     nextZones.forEach(z => ZONES.push(z));
     PANELS.length = 0;
@@ -9038,6 +10294,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       artBadge = "RAW NEXUS • PENDING: 1. REDUCE";
     }} else if (newPayload.intensity_source === "raw_h5") {{
       artBadge = "RAW DETECTOR COUNTS";
+    }}
+    if (newPayload.mtz_overlay_name) {{
+      artBadge = `MTZ • ${{newPayload.mtz_overlay_name}}`;
     }}
     if (subEl) {{
       subEl.textContent = `${{DATA.instrument || "CG4D"}} • ${{DATA.space_group || "P 1"}} • ${{artBadge}}`;
@@ -11825,13 +13084,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   async function uploadLocalFilesToServer(files, forceReduce = false) {{
     const params = collectWorkflowParams();
-    const isRawNexus = forceReduce || files.some(f => /\\.nxs(\\.h5)?$/i.test(f.name));
+    const isMtzFile = files.length === 1 && /\\.mtz$/i.test(files[0].name);
+    const isRawNexus = !isMtzFile && (forceReduce || files.some(f => /\\.nxs(\\.h5)?$/i.test(f.name)));
+    const statusTag = isMtzFile ? "[LOCAL MTZ]" : "[LOCAL HDF5]";
     try {{
       setStatusLine(
-        "[LOCAL HDF5]",
+        statusTag,
         isRawNexus
           ? `Opening ${{files.length}} raw NeXus file(s) and triggering <strong>1. Reduce + Merge Images</strong>...`
-          : `Loading <strong>${{files.map(f => f.name).join(", ")}}</strong>...`
+          : (isMtzFile
+              ? `Loading custom reflections &amp; unit cell from <strong>${{files[0].name}}</strong>...`
+              : `Loading <strong>${{files.map(f => f.name).join(", ")}}</strong>...`)
       );
       // Fast path: check if the selected local file(s) already exist on the server filesystem by (name, size)
       try {{
@@ -11855,12 +13118,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               return;
             }}
             const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(matchedPaths[0])}}`, {{ cache: "no-store" }});
-            if (pr.ok) {{
-              const srvPayload = await pr.json();
-              if (srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
-                recomputeBoundsAndReload(srvPayload);
-                return;
-              }}
+            const srvPayload = await pr.json().catch(() => null);
+            if (pr.ok && srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
+              recomputeBoundsAndReload(srvPayload);
+              return;
+            }}
+            if (isMtzFile && srvPayload && srvPayload.error) {{
+              setStatusLine(statusTag, `<span style="color:#f87171;">${{srvPayload.error}}</span>`);
+              return;
             }}
           }}
         }}
@@ -11886,17 +13151,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
         if (savedPaths.length === 1) {{
           const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(savedPaths[0])}}`, {{ cache: "no-store" }});
-          if (pr.ok) {{
-            const srvPayload = await pr.json();
-            if (srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
-              recomputeBoundsAndReload(srvPayload);
-              return;
-            }}
+          const srvPayload = await pr.json().catch(() => null);
+          if (pr.ok && srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
+            recomputeBoundsAndReload(srvPayload);
+            return;
+          }}
+          if (isMtzFile) {{
+            const errMsg = (srvPayload && srvPayload.error) || `HTTP ${{pr.status}} loading ${{files[0].name}}`;
+            setStatusLine(statusTag, `<span style="color:#f87171;">${{errMsg}}</span>`);
+            return;
           }}
         }}
+      }} else if (isMtzFile) {{
+        const errDoc = await r.json().catch(() => null);
+        const errMsg = (errDoc && errDoc.error) || `HTTP ${{r.status}} uploading ${{files[0].name}}`;
+        setStatusLine(statusTag, `<span style="color:#f87171;">${{errMsg}}</span>`);
+        return;
       }}
     }} catch (_uploadErr) {{
       // Fall through to client-side h5wasm parsing when running as standalone static file
+    }}
+    if (isMtzFile) {{
+      setStatusLine(statusTag, `<span style="color:#f87171;">Loading local .mtz files requires an active SubHKL backend server and determined U matrix.</span>`);
+      return;
     }}
     try {{
       while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));

@@ -150,9 +150,54 @@ class MainApp:
 
             fp_q = request.rel_url.query.get("file_path")
             if fp_q is not None and str(fp_q).strip() != "":
+                local_fp_raw = os.path.abspath(str(fp_q).strip())
+                if local_fp_raw.lower().endswith(".mtz"):
+                    if not os.path.isfile(local_fp_raw):
+                        return web.json_response(
+                            {
+                                "status": "error",
+                                "error": f"MTZ file not found: {local_fp_raw}",
+                            },
+                            status=404,
+                        )
+                    try:
+                        from subhkl.viz.rainbow_zones import apply_mtz_to_payload
+
+                        ds_info_mtz = {"name": os.path.basename(local_fp_raw)}
+                        sub_model = self.view_model.model.subhkl
+                        sub_model.payload = apply_mtz_to_payload(
+                            sub_model.payload or {}, local_fp_raw, ds_info_mtz
+                        )
+                        sub_model.mtz_overlay_path = local_fp_raw
+                        sub_model.mtz_overlay_info = ds_info_mtz
+                        mtz_cell = sub_model.payload.get("cell") or []
+                        if len(mtz_cell) == 6 and all(float(v) > 0 for v in mtz_cell):
+                            sub_model.data.a = round(float(mtz_cell[0]), 3)
+                            sub_model.data.b = round(float(mtz_cell[1]), 3)
+                            sub_model.data.c = round(float(mtz_cell[2]), 3)
+                            sub_model.data.alpha = round(float(mtz_cell[3]), 2)
+                            sub_model.data.beta = round(float(mtz_cell[4]), 2)
+                            sub_model.data.gamma = round(float(mtz_cell[5]), 2)
+                        if sub_model.payload.get("space_group"):
+                            sub_model.data.space_group = str(
+                                sub_model.payload["space_group"]
+                            )
+                        return web.json_response(sub_model.payload)
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                    ) as exc:
+                        return web.json_response(
+                            {"status": "error", "error": str(exc)}, status=400
+                        )
                 try:
-                    local_h5 = os.path.abspath(str(fp_q).strip())
+                    local_h5 = local_fp_raw
                     if os.path.isfile(local_h5):
+                        self.view_model.model.subhkl.mtz_overlay_path = None
+                        self.view_model.model.subhkl.mtz_overlay_info = None
                         ds_name = os.path.basename(local_h5).lower()
                         is_reduce_file = any(
                             k in ds_name for k in ("merged", "scan", "image")
@@ -234,10 +279,27 @@ class MainApp:
                         has_active_geometry=has_active_geom,
                     )
                     if ingest_kind == "mtz_overlay":
-                        self.view_model.model.subhkl.payload = apply_mtz_to_payload(
+                        sub_model = self.view_model.model.subhkl
+                        sub_model.payload = apply_mtz_to_payload(
                             cur_p, local_h5, ds_info
                         )
-                        return web.json_response(self.view_model.model.subhkl.payload)
+                        sub_model.mtz_overlay_path = local_h5
+                        sub_model.mtz_overlay_info = ds_info
+                        mtz_cell = sub_model.payload.get("cell") or []
+                        if len(mtz_cell) == 6 and all(float(v) > 0 for v in mtz_cell):
+                            sub_model.data.a = round(float(mtz_cell[0]), 3)
+                            sub_model.data.b = round(float(mtz_cell[1]), 3)
+                            sub_model.data.c = round(float(mtz_cell[2]), 3)
+                            sub_model.data.alpha = round(float(mtz_cell[3]), 2)
+                            sub_model.data.beta = round(float(mtz_cell[4]), 2)
+                            sub_model.data.gamma = round(float(mtz_cell[5]), 2)
+                        if sub_model.payload.get("space_group"):
+                            sub_model.data.space_group = str(
+                                sub_model.payload["space_group"]
+                            )
+                        return web.json_response(sub_model.payload)
+                    self.view_model.model.subhkl.mtz_overlay_path = None
+                    self.view_model.model.subhkl.mtz_overlay_info = None
                     if ingest_kind == "raw_nexus":
                         return web.json_response(
                             {
@@ -387,6 +449,9 @@ class MainApp:
             def _on_complete(new_h5_path: str) -> None:
                 from subhkl.viz.nova_app.models.subhkl_model import InstrumentOptions
 
+                self.view_model.model.subhkl.mtz_overlay_path = None
+                self.view_model.model.subhkl.mtz_overlay_info = None
+
                 with contextlib.suppress(
                     ValueError, TypeError, KeyError, AttributeError
                 ):
@@ -477,9 +542,11 @@ class MainApp:
                     dest_path.write_bytes(payload_bytes)
                     saved_paths.append(str(dest_path))
                 if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(
-                    ".nxs.h5"
+                    (".nxs.h5", ".nxs", ".mtz")
                 ):
                     sp = saved_paths[0]
+                    self.view_model.model.subhkl.mtz_overlay_path = None
+                    self.view_model.model.subhkl.mtz_overlay_info = None
                     if (
                         "merged" in os.path.basename(sp).lower()
                         or "scan" in os.path.basename(sp).lower()

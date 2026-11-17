@@ -6495,6 +6495,8 @@ class RainbowZonesViewModel:
         self.default_mode = default_mode
         self.payload_kwargs = dict(payload_kwargs)
         self.pipeline_runner = NovaGalaxyPipelineRunner()
+        self.mtz_overlay_path: str | None = None
+        self.mtz_overlay_info: dict[str, Any] | None = None
         if payload is not None:
             self.payload = payload
         elif replay_h5 is not None:
@@ -6503,6 +6505,14 @@ class RainbowZonesViewModel:
             )
         else:
             self.payload = build_rainbow_zone_payload(**self.payload_kwargs)
+
+    @property
+    def _payload(self) -> dict[str, Any]:
+        return self.payload
+
+    @_payload.setter
+    def _payload(self, value: dict[str, Any]) -> None:
+        self.payload = value
 
     def reload(self, **overrides: Any) -> dict[str, Any]:
         if "frame_index" in overrides and overrides["frame_index"] is not None:
@@ -6514,6 +6524,22 @@ class RainbowZonesViewModel:
             )
         else:
             self.payload = build_rainbow_zone_payload(**kwargs)
+        if (
+            self.mtz_overlay_path
+            and os.path.isfile(self.mtz_overlay_path)
+            and (
+                self.payload.get("u_matrix") is not None
+                or self.payload.get("ub_matrix") is not None
+            )
+        ):
+            from subhkl.viz.rainbow_zones import apply_mtz_to_payload
+
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                self.payload = apply_mtz_to_payload(
+                    self.payload,
+                    self.mtz_overlay_path,
+                    self.mtz_overlay_info,
+                )
         return self.payload
 
     def to_html(self, mode: str | None = None) -> str:
@@ -6657,9 +6683,58 @@ def serve_rainbow_zones(
                             vm.payload_kwargs["d_min"] = parsed_dmin
                 reloaded = False
                 if qs.get("file_path"):
+                    fp_raw = os.path.abspath(str(qs["file_path"][0]).strip())
+                    if fp_raw.lower().endswith(".mtz"):
+                        if not os.path.isfile(fp_raw):
+                            err_body = json.dumps(
+                                {
+                                    "status": "error",
+                                    "error": f"MTZ file not found: {fp_raw}",
+                                }
+                            ).encode("utf-8")
+                            self.send_response(404)
+                            self.send_header(
+                                "Content-Type", "application/json; charset=utf-8"
+                            )
+                            self.send_header("Content-Length", str(len(err_body)))
+                            self.end_headers()
+                            self.wfile.write(err_body)
+                            return
+                        try:
+                            from subhkl.viz.rainbow_zones import apply_mtz_to_payload
+
+                            ds_info_mtz = {"name": os.path.basename(fp_raw)}
+                            vm.payload = apply_mtz_to_payload(
+                                vm.payload or {}, fp_raw, ds_info_mtz
+                            )
+                            vm.mtz_overlay_path = fp_raw
+                            vm.mtz_overlay_info = ds_info_mtz
+                            body = json.dumps(vm.payload).encode("utf-8")
+                            self.send_response(200)
+                            self.send_header(
+                                "Content-Type", "application/json; charset=utf-8"
+                            )
+                            self.send_header("Content-Length", str(len(body)))
+                            self.end_headers()
+                            self.wfile.write(body)
+                            return
+                        except _NOVA_RECOVERABLE_ERRORS as exc:
+                            err_body = json.dumps(
+                                {"status": "error", "error": str(exc)}
+                            ).encode("utf-8")
+                            self.send_response(400)
+                            self.send_header(
+                                "Content-Type", "application/json; charset=utf-8"
+                            )
+                            self.send_header("Content-Length", str(len(err_body)))
+                            self.end_headers()
+                            self.wfile.write(err_body)
+                            return
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                        fp = os.path.abspath(str(qs["file_path"][0]).strip())
+                        fp = fp_raw
                         if os.path.isfile(fp):
+                            vm.mtz_overlay_path = None
+                            vm.mtz_overlay_info = None
                             fp_low = os.path.basename(fp).lower()
                             if any(k in fp_low for k in ("merged", "scan", "image")):
                                 _, fp = vm.pipeline_runner._resolve_work_dir_and_merged(
@@ -6683,7 +6758,7 @@ def serve_rainbow_zones(
                                     frame_index=f_idx,
                                 )
                             vm.pipeline_runner.invalidate_subsequent_stages(
-                                (vm._payload or {}).get("artifact_kind"),
+                                (vm.payload or {}).get("artifact_kind"),
                                 os.path.dirname(fp),
                             )
                             reloaded = True
@@ -6706,7 +6781,7 @@ def serve_rainbow_zones(
                                 ds_id, fallback_dir=fb_dir
                             )
                         )
-                        cur_p = vm._payload or {}
+                        cur_p = vm.payload or {}
                         has_active_geom = bool(
                             (
                                 cur_p.get("artifact_kind") != "empty"
@@ -6721,8 +6796,10 @@ def serve_rainbow_zones(
                             has_active_geometry=has_active_geom,
                         )
                         if ingest_kind == "mtz_overlay":
-                            vm._payload = apply_mtz_to_payload(cur_p, local_h5, ds_info)
-                            body = json.dumps(vm._payload).encode("utf-8")
+                            vm.payload = apply_mtz_to_payload(cur_p, local_h5, ds_info)
+                            vm.mtz_overlay_path = local_h5
+                            vm.mtz_overlay_info = ds_info
+                            body = json.dumps(vm.payload).encode("utf-8")
                             self.send_response(200)
                             self.send_header(
                                 "Content-Type", "application/json; charset=utf-8"
@@ -6731,6 +6808,8 @@ def serve_rainbow_zones(
                             self.end_headers()
                             self.wfile.write(body)
                             return
+                        vm.mtz_overlay_path = None
+                        vm.mtz_overlay_info = None
                         if ingest_kind == "raw_nexus":
                             raw_body = json.dumps(
                                 {
@@ -7087,6 +7166,8 @@ def serve_rainbow_zones(
                         params.setdefault("peaks_file", str(vm.replay_h5))
 
                     def _on_complete(new_h5_path: str) -> None:
+                        vm.mtz_overlay_path = None
+                        vm.mtz_overlay_info = None
                         if (
                             stage_id == "reduce"
                             or "merged" in os.path.basename(new_h5_path).lower()
@@ -7157,9 +7238,11 @@ def serve_rainbow_zones(
                             f_out.write(payload_bytes)
                         saved_paths.append(dest_path)
                     if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(
-                        ".nxs.h5"
+                        (".nxs.h5", ".nxs", ".mtz")
                     ):
                         sp = saved_paths[0]
+                        vm.mtz_overlay_path = None
+                        vm.mtz_overlay_info = None
                         if "merged" in os.path.basename(sp).lower():
                             vm.payload_kwargs["images_h5"] = sp
                         vm.replay_h5 = sp
