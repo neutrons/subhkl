@@ -1,6 +1,7 @@
-import numpy as np
+from unittest.mock import MagicMock, patch
+
 import h5py
-from unittest.mock import patch, MagicMock
+import numpy as np
 
 # Handle import depending on your branch structure
 try:

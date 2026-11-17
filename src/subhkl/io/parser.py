@@ -1,5 +1,7 @@
 # src/subhkl/io/command_line_parser.py
 import os
+import re
+import socket
 import sys
 from typing import Annotated
 
@@ -107,6 +109,36 @@ def _maybe_export_dials(
         return
     print(f"Wrote DIALS ExperimentList to {expt_path}")
     print(f"Wrote DIALS reflection_table to {refl_path}")
+
+
+def detect_runner_hostname() -> str:
+    """Detect the execution host name (including inside GPU Docker containers)."""
+    for env_k in ("PULSAR_HOSTNAME", "HOST_HOSTNAME", "SLURM_NODELIST"):
+        val = os.environ.get(env_k, "").strip()
+        if val:
+            return val.split(".")[0]
+    nv_ver = "/proc/driver/nvidia/version"
+    if os.path.isfile(nv_ver):
+        try:
+            with open(nv_ver, encoding="utf-8", errors="ignore") as f:
+                head = f.readline()
+            m = re.search(r"\((?:[^@()\s]+@)([A-Za-z0-9._-]+)\)", head)
+            if m:
+                cand = m.group(1).split(".")[0]
+                if (
+                    cand.lower() not in {"localhost", "build", "mockbuild"}
+                    and "releng" not in cand.lower()
+                ):
+                    return cand
+        except OSError:
+            pass
+    host = socket.gethostname().strip()
+    return host.split(".")[0] if host else "PULSAR"
+
+
+@app.callback()
+def _main_callback() -> None:
+    print(f"[pulsar] Runner host: {detect_runner_hostname()}", flush=True)
 
 
 @app.command()
@@ -292,6 +324,15 @@ def solve(
                 raise ValueError(
                     "band uses --refine-modes to select free geometry; omit --no-refine/--fixed-geometry"
                 )
+            eff_binning = binning
+            if eff_binning is None:
+                eff_binning = 8
+                try:
+                    with h5py.File(frames_filename, "r") as _bf:
+                        if "images" in _bf and int(_bf["images"].shape[0]) > 240:
+                            eff_binning = 16
+                except OSError:
+                    pass
             band_result = run_scan_refinement(
                 frames_filename,
                 output_filename,
@@ -309,12 +350,18 @@ def solve(
                 stable_runs=[int(x) for x in stable_runs.split(",")]
                 if stable_runs
                 else None,
-                modes=refine_modes.split(",") if refine_modes is not None else None,
+                modes=[
+                    m.strip()
+                    for m in refine_modes.split(",")
+                    if m.strip() and m.strip().lower() != "none"
+                ]
+                if refine_modes is not None
+                else None,
                 n_zones=band_zones,
                 d_min=d_min,
                 min_deviance=min_deviance,
                 pixel_polish=pixel_polish,
-                binning=16 if binning is None else binning,
+                binning=eff_binning,
                 maxiter=band_maxiter,
                 static_mask_file=static_mask_file,
                 search_samples=search_samples,
@@ -378,7 +425,7 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
             print(f"Loading calibrated detector geometry from {hdf5_filename}...")
             calib_grp = f["detector_calibration"]
             count = 0
-            for bank_key in calib_grp.keys():
+            for bank_key in calib_grp:
                 bank_id = bank_key.replace("bank_", "")
                 if instrument in beamlines and bank_id in beamlines[instrument]:
                     beamlines[instrument][bank_id]["center"] = calib_grp[bank_key][
@@ -795,14 +842,14 @@ def indexer(
         float, typer.Option("--detector-global-rot-bound-deg")
     ] = 2.0,
     detector_global_rot_axis: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--detector-global-rot-axis",
             help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",
         ),
     ] = None,
     cylinder_axis: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--cylinder-axis",
             help="Axis vector for global_rot_axis mode (e.g. 0,1,0)",
@@ -1243,10 +1290,16 @@ def metrics(
         bool,
         typer.Option(
             "--per-peak",
-            help="Write the metrics/per_peak table (h, k, l, run, lambda,"
-            "d_err, ang_err) into FILE1, for scripts/error_analysis.py.",
+            help="Write the metrics/per_peak table (h, k, l, run (true frame "
+            "index), panel, lambda, d_err, ang_err) to a separate HDF5 file "
+            "for scripts/error_analysis.py (default: metrics_per_peak.h5, "
+            "override with --per-peak-path). FILE1 is never modified.",
         ),
     ] = False,
+    per_peak_path: Annotated[
+        str | None,
+        typer.Option("--per-peak-path", help="Custom path for --per-peak output."),
+    ] = None,
     ki_vec: Annotated[
         str | None,
         typer.Option(
@@ -1309,6 +1362,11 @@ def metrics(
     plot_output = (
         plot_path if plot_path is not None else ("metrics.png" if plot else None)
     )
+    per_peak_output = (
+        per_peak_path
+        if per_peak_path is not None
+        else ("metrics_per_peak.h5" if per_peak else None)
+    )
 
     run_metrics(
         file1=file1,
@@ -1316,7 +1374,7 @@ def metrics(
         instrument=instrument,
         d_min=d_min,
         per_run=per_run,
-        per_peak=per_peak,
+        per_peak_output=per_peak_output,
         ki_vec=ki_vec_parsed,
         csv_output=csv_output,
         plot_output=plot_output,

@@ -1,10 +1,10 @@
 from .api import Peaks
-from .orchestrator import DetectorPeaks, Wavelength
 from .image_data import ImageData
+from .orchestrator import DetectorPeaks, Wavelength
 
 __all__ = [
-    "Peaks",
     "DetectorPeaks",
-    "Wavelength",
     "ImageData",
+    "Peaks",
+    "Wavelength",
 ]

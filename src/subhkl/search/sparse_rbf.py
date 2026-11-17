@@ -1,17 +1,13 @@
-import numpy as np
-from tqdm import tqdm
-
-import scipy
-
-from dataclasses import dataclass
-
-from functools import partial
-from typing import Dict, List
-import multiprocessing
 import concurrent.futures
-from collections import defaultdict
+import multiprocessing
 import os
+from collections import defaultdict
+from dataclasses import dataclass
+from functools import partial
 
+import numpy as np
+import scipy
+from tqdm import tqdm
 
 # Cap on how many samples per window the median is taken over.  Passing this as
 # ``max_samples`` makes the filter subsample a window larger than the cap on a
@@ -202,7 +198,7 @@ def _box_mean_2d(img, window_size):
 RATE_K_MAX = 16
 
 
-def _compute_rate_batch_impl(imgs, filter_size, valid=None):
+def _compute_rate_batch_impl(imgs, filter_size, valid=None, inpaint_footprints=False):
     """Local Poisson rate by exact quantile inversion -- the sparse-regime
     replacement for the median background.
 
@@ -301,6 +297,12 @@ def _compute_rate_batch_impl(imgs, filter_size, valid=None):
         lo, hi = lax.fori_loop(0, 30, bisect, (lo, hi))
         mu = 0.5 * (lo + hi)
 
+        if not inpaint_footprints:
+            bright = _box_mean_2d(v * img, filter_size) / v_frac
+            rate = jnp.where(any_hit, mu, bright)
+            blur = jax_gaussian_blur_2d(rate)
+            return jnp.maximum(blur, 1e-3)  # [photons/Pixel]
+
         m0 = _box_mean_2d(v * img, filter_size) / v_frac
         img_clipped = jnp.minimum(img, m0 + 2.5 * jnp.sqrt(jnp.maximum(m0, 1.0)))
         bright = _box_mean_2d(v * img_clipped, filter_size) / v_frac
@@ -332,15 +334,22 @@ def _compute_rate_batch_impl(imgs, filter_size, valid=None):
     return lax.map(process_one, (imgs, valid.astype(imgs.dtype)))  # [photons/Pixel]
 
 
-def compute_rate_batch(imgs, filter_size, valid=None):
+def compute_rate_batch(imgs, filter_size, valid=None, inpaint_footprints=None):
     global _COMPUTE_RATE_BATCH_JIT
     if _COMPUTE_RATE_BATCH_JIT is None:
         from jax import jit
 
-        _COMPUTE_RATE_BATCH_JIT = partial(jit, static_argnames=["filter_size"])(
-            _compute_rate_batch_impl
-        )
-    return _COMPUTE_RATE_BATCH_JIT(imgs, filter_size, valid=valid)
+        _COMPUTE_RATE_BATCH_JIT = partial(
+            jit, static_argnames=["filter_size", "inpaint_footprints"]
+        )(_compute_rate_batch_impl)
+    if inpaint_footprints is None:
+        inpaint_footprints = valid is not None
+    return _COMPUTE_RATE_BATCH_JIT(
+        imgs,
+        filter_size,
+        valid=valid,
+        inpaint_footprints=bool(inpaint_footprints),
+    )
 
 
 def _build_3d_cov_impl(params):
@@ -677,6 +686,7 @@ def _render_run_unrolled_plot(args):
     out_name, peaks, images, detectors, instrument = args
 
     import matplotlib.pyplot as plt
+
     from subhkl.viz.detector_assembly import plot_unrolled_detector
 
     # Force non-interactive backend for thread safety
@@ -689,9 +699,9 @@ def _render_run_unrolled_plot(args):
 
 
 def integrate_peaks_rbf_ssn(
-    peak_dict: Dict,
+    peak_dict: dict,
     peaks_obj,
-    sigmas: List[float],
+    sigmas: list[float],
     show_progress: bool,
     all_R: np.ndarray = None,
     sample_offset: np.ndarray = None,
@@ -710,8 +720,8 @@ def integrate_peaks_rbf_ssn(
     border_width: int = 0,
     chunk_size: int = 1024,
     create_visualizations: bool = False,
-    file_prefix: str = None,
-    max_workers: int = None,
+    file_prefix: str | None = None,
+    max_workers: int | None = None,
     gonio_axes: np.ndarray = None,
     gonio_angles: np.ndarray = None,
     gonio_offsets: np.ndarray = None,
@@ -922,7 +932,7 @@ def integrate_peaks_rbf_ssn(
         tqdm(img_keys_ordered, disable=not show_progress, desc="Batching Images")
     ):
         p_data = peak_dict[img_key]
-        i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr = p_data
+        i_arr, j_arr, h_arr, k_arr, l_arr, _wl_arr = p_data
 
         initial_peaks_count = len(i_arr)
         if initial_peaks_count == 0:
@@ -1004,7 +1014,7 @@ def integrate_peaks_rbf_ssn(
     frames = np.array(all_frames, dtype=int)
 
     # --- PHASE 1.5: GLOBAL EFFECTIVE TENSOR OPTIMIZATION ---
-    B, H, W = images_batch.shape
+    _B, H, W = images_batch.shape
     bw = max(border_width, 5)
 
     all_P_mats = []
@@ -1085,7 +1095,7 @@ def integrate_peaks_rbf_ssn(
         f, r, c = frames[idx], all_rs[idx], all_cs[idx]
 
         # Boundary safety check (matches your H, W constraints)
-        if not (bw < int(round(r)) < H - bw and bw < int(round(c)) < W - bw):
+        if not (bw < round(r) < H - bw and bw < round(c) < W - bw):
             continue
 
         opt_Pmats.append(all_P_mats[idx])
@@ -1093,7 +1103,7 @@ def integrate_peaks_rbf_ssn(
         opt_Rmats.append(all_R_mats[idx])
         opt_streaks.append(all_streak_dirs[idx])
 
-        ri, ci = int(round(r)) + opt_P, int(round(c)) + opt_P
+        ri, ci = round(r) + opt_P, round(c) + opt_P
 
         # Bounding box bounds
         r_min, r_max = ri - opt_half, ri + opt_half + 1
@@ -1420,7 +1430,14 @@ def integrate_peaks_rbf_ssn(
                     # Wait for the worker to finish and catch any exceptions
                     future.result()
                     tqdm.write(f"Saved: {out_name}")
-                except Exception:
+                except (
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    IndexError,
+                ):
                     import traceback
 
                     print(f"Visualization failed for {out_name}:")

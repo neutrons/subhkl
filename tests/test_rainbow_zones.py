@@ -108,7 +108,7 @@ def test_zone_conic_orthogonality():
 
 def test_identify_zones_and_payload_schema():
     """build_rainbow_zone_payload identifies [100] and [010] zones and builds Lattice Ladder."""
-    peaks_xyz, U, B, UB, _, _ = _synthetic_orthorhombic_peaks()
+    peaks_xyz, _U, _B, UB, _, _ = _synthetic_orthorhombic_peaks()
 
     zones = identify_zones(peaks_xyz, ub_matrix=UB, max_index=1, tolerance_deg=0.5)
     labels = {z["label"] for z in zones}
@@ -177,7 +177,15 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert "canvas-detector" in content
     assert "canvas-stereo" in content
     assert "btn-proj-toggle" in content
-    assert "btn-zone-order" in content
+    assert "btn-zone-order" not in content
+    assert "btn-order-1" in content
+    assert 'id="nd-ipts" type="text" value=""' in content
+    assert 'id="nd-runs" type="text" value=""' in content
+    assert 'id="nd-sg" type="text" value=""' in content
+    assert '<option value="IMAGINE">' not in content
+    assert '<option value="TOPAZ">TOPAZ (SNS)</option>' in content
+    assert "TOPAZ" in payload_cg4d["beamline_detectors"]
+    assert len(payload_cg4d["beamline_detectors"]["TOPAZ"]) == 25
     assert "btn-zone-arcs" in content
     assert "showZoneArcs: true" in content
     assert "drawSingleZoneArc" in content
@@ -191,7 +199,9 @@ def test_html_widget_export_contains_unified_mode_and_projections(tmp_path):
     assert "LATTICE LADDER" in content
 
     # Extract embedded JSON and validate it parses cleanly
-    match = re.search(r"window\.RAINBOW_ZONES_DATA\s*=\s*(\{.*?\});\n", content, re.S)
+    match = re.search(
+        r"window\.RAINBOW_ZONES_DATA\s*=\s*(\{.*?\});\n", content, re.DOTALL
+    )
     assert match is not None
     embedded = json.loads(match.group(1))
     assert len(embedded["peaks"]) == len(peaks_xyz)
@@ -349,6 +359,7 @@ def test_finderless_solve_h5_forward_projection_and_stages(tmp_path):
 def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     """Careless merge HDF5 stamping populates ASU orbits, residuals, scales, and multi-run sample_peaks."""
     import gemmi
+
     from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
     from subhkl.viz.rainbow_zones import render_rainbow_html
 
@@ -513,6 +524,15 @@ def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     assert "wulff-merge-bar" in html
     assert "btn-files-toggle" in html
     assert "files-drawer" in html
+    assert "--top-bar-scale" in html
+    assert "--bottom-bar-scale" in html
+    assert "repeat(5, minmax(0, 1fr))" in html
+    assert "fitHorizontalBars" in html
+    assert "getDetectorDataAspect" in html
+    assert "getDetectorPlotBox" in html
+    assert "getWarpedPanelCanvas" in html
+    assert 'id="detector-pane"' in html
+    assert "isPeakHighlightedTarget" in html
     assert "Compl. vs d" in html
     assert "⟨I/σ⟩ vs d" in html
     assert len(payload["merge_metrics"]["cc_half_bins"]) == 10
@@ -556,14 +576,23 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
         SubhklConfig(wavelength_min=5.0, wavelength_max=2.0)
 
     # 2. Verify MainApp(server=None) initializes ThemedApp, TrameBinding, ViewModel & UI cleanly
+    from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
     from subhkl.viz.nova_app.views.main_view import MainApp
 
     app = MainApp(instrument="CG4D")
     assert app.server is not None
+    assert app.server.state.trame__favicon == SUBHKL_FAVICON_DATA_URI
+    assert 'class="favicon-laue-zones"' in SUBHKL_FAVICON_SVG
+    assert "<rect" not in SUBHKL_FAVICON_SVG
     assert app.view_model.view_state.running is False
     assert app.view_model.model.subhkl.data.instrument == InstrumentOptions.CG4D
     html = app.server.state.parallax_html
     assert "DIFFRACTION PARALLAX" in html
+    assert '<img class="subhkl-logo-img" src="data:image/png;base64,' in html
+    assert (
+        f'<link rel="icon" type="image/svg+xml" href="{SUBHKL_FAVICON_DATA_URI}" />'
+        in html
+    )
     assert '<span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span>' in html
     assert "executeWorkflowStage" in html
     assert 'id="terminal-box"' in html
@@ -582,12 +611,15 @@ def test_nova_mvvm_pydantic_and_view_model(tmp_path):
     import subprocess
 
     if shutil.which("node"):
-        scripts = re.findall(r"<script>(.*?)</script>", html, re.S)
+        scripts = re.findall(r"<script>(.*?)</script>", html, re.DOTALL)
         assert scripts
         js_file = tmp_path / "embedded_check.js"
         js_file.write_text(scripts[-1], encoding="utf-8")
         proc = subprocess.run(
-            ["node", "--check", str(js_file)], capture_output=True, text=True
+            ["node", "--check", str(js_file)],
+            capture_output=True,
+            text=True,
+            check=False,
         )
         assert proc.returncode == 0, f"JS syntax error: {proc.stderr}"
 
@@ -596,6 +628,7 @@ def test_predictor_and_integrator_ellipses_and_galaxy_dataset_loading(tmp_path):
     """Verify predictor.h5 and integrated.h5 (isotropic circles & anisotropic ellipses) are recognized and rendered."""
     import h5py
     import pytest
+
     from subhkl.viz.rainbow_zones import render_rainbow_html
 
     # 1. Create a synthetic predictor.h5 with banks/<img_idx>/(i, j, h, k, l, wavelength)
@@ -689,6 +722,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     """Verify merged.h5 sets pending_stage='solve' and CG4D /entry/title goniometer angles are harvested."""
     import h5py
     import pytest
+
     from subhkl.instrument.goniometer import (
         get_rotation_data_from_nexus,
         harvest_goniometer_angles_from_title,
@@ -774,11 +808,19 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     assert len(p_merged["frames"]) == 2
     assert "ω=110" in p_merged["goniometer_summary"]
 
-    # 4. Verify check_neutron_paths never touches the host filesystem directly and routes strictly through NDIP
+    # 4. Verify check_neutron_paths falls back cleanly to local /SNS and /HFIR when Galaxy is unavailable,
+    #    and returns ndip_unavailable only when neither Galaxy nor local facility mounts exist.
     from unittest.mock import MagicMock
+
     from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
 
     runner_no_ndip = NovaGalaxyPipelineRunner(galaxy_url="")
+    unmounted_sns = tmp_path / "no_sns"
+    unmounted_hfir = tmp_path / "no_hfir"
+    runner_no_ndip.SNS_HFIR_ROOTS = {
+        "SNS": str(unmounted_sns),
+        "HFIR": str(unmounted_hfir),
+    }
     chk_unavail = runner_no_ndip.check_neutron_paths(
         {
             "facility": "HFIR",
@@ -789,6 +831,216 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
     )
     assert chk_unavail["ok"] is False
     assert chk_unavail["checked_via"] == "ndip_unavailable"
+
+    # Now mount a synthetic local /HFIR and /SNS tree and verify offline check_neutron_paths,
+    # wrong-IPTS auto-suggestion, browse_oncat_catalog fallback, and _resolve_raw_nexus_inputs.
+    mock_hfir = tmp_path / "mock_HFIR"
+    mock_sns = tmp_path / "mock_SNS"
+    nxs_dir_37331 = mock_hfir / "CG4D" / "IPTS-37331" / "nexus"
+    nxs_dir_37331.mkdir(parents=True)
+    for r_num, om_deg in ((2625, 110.0), (2627, 114.0)):
+        nxs_file = nxs_dir_37331 / f"CG4D_{r_num}.nxs.h5"
+        with h5py.File(nxs_file, "w") as nf:
+            nf["entry/title"] = f"Beta-Lactamase omega={om_deg}"
+            nf["entry/sample/name"] = "Beta-Lac"
+            nf["entry/duration"] = np.array([125.0], dtype=np.float64)
+            nf["entry/total_counts"] = np.array([45000.0], dtype=np.float64)
+            nf["entry/DASlogs/omega/average_value"] = np.array(
+                [om_deg], dtype=np.float64
+            )
+    mock_sns.mkdir(parents=True)
+
+    runner_local_fs = NovaGalaxyPipelineRunner(galaxy_url="")
+    runner_local_fs.SNS_HFIR_ROOTS = {
+        "SNS": str(mock_sns),
+        "HFIR": str(mock_hfir),
+    }
+    chk_local_ok = runner_local_fs.check_neutron_paths(
+        {
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "37331",
+            "runs": "2625-2627/2",
+        }
+    )
+    assert chk_local_ok["ok"] is True
+    assert chk_local_ok["checked_via"] == "local_filesystem"
+    assert len(chk_local_ok["existing"]) == 2
+    assert "Beta-Lactamase" in chk_local_ok["sample_title"]
+    assert "omega=110.0" in chk_local_ok["sample_goniometer"]
+
+    # Wrong IPTS suggests the sibling IPTS where the run actually lives on /HFIR
+    chk_local_wrong_ipts = runner_local_fs.check_neutron_paths(
+        {
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "99999",
+            "paths": ["/HFIR/CG4D/IPTS-99999/nexus/CG4D_2625.nxs.h5"],
+        }
+    )
+    assert chk_local_wrong_ipts["ok"] is False
+    assert chk_local_wrong_ipts["checked_via"] == "local_filesystem"
+    assert chk_local_wrong_ipts["suggested_ipts"] == "37331"
+
+    # Also falls back to local /HFIR when Galaxy is configured in env but unreachable
+    runner_down_galaxy = NovaGalaxyPipelineRunner(
+        galaxy_url="https://ndip-down.example.gov",
+        galaxy_api_key="expired_or_unreachable",
+    )
+    runner_down_galaxy.SNS_HFIR_ROOTS = {
+        "SNS": str(mock_sns),
+        "HFIR": str(mock_hfir),
+    }
+    runner_down_galaxy._has_tool_on_galaxy = MagicMock(return_value=False)
+    chk_down_fallback = runner_down_galaxy.check_neutron_paths(
+        {
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "37331",
+            "paths": ["/HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5"],
+        }
+    )
+    assert chk_down_fallback["ok"] is True
+    assert chk_down_fallback["checked_via"] == "local_filesystem"
+
+    # Catalog browser falls back to local /HFIR directory & header scan when ONCat is unavailable
+    # (including when optional `pyoncat` is not installed in base CI environments)
+    import sys as _sys
+    from unittest.mock import patch
+
+    mock_broken_oncat = MagicMock()
+    mock_broken_oncat.Experiment.list.side_effect = RuntimeError("ONCat offline")
+    mock_broken_oncat.Datafile.list.side_effect = RuntimeError("ONCat offline")
+    runner_local_fs._get_oncat_client = MagicMock(
+        return_value=(mock_broken_oncat, False)
+    )
+    runner_local_fs.get_oncat_auth_status = MagicMock(
+        return_value={"ok": True, "authenticated": False}
+    )
+    with patch.dict(_sys.modules, {"pyoncat": None}):
+        cat_local = runner_local_fs.browse_oncat_catalog(
+            {"facility": "HFIR", "instrument": "CG4D", "ipts": "37331"}
+        )
+    assert cat_local["ok"] is True
+    assert cat_local["catalog_source"] == "local_filesystem"
+    assert [e["ipts"] for e in cat_local["experiments"]] == ["37331"]
+    assert [r["run"] for r in cat_local["runs"]] == [2625, 2627]
+    assert cat_local["runs"][0]["duration_hms"] == "00:02:05"
+
+    # _resolve_raw_nexus_inputs resolves IPTS + stepped run range directly on local /HFIR
+    resolved_local_nxs = runner_local_fs._resolve_raw_nexus_inputs(
+        {
+            "facility": "HFIR",
+            "instrument": "CG4D",
+            "ipts": "37331",
+            "runs": "2625:2627:2",
+        },
+        str(tmp_path),
+    )
+    assert [p.split("/")[-1] for p in resolved_local_nxs] == [
+        "CG4D_2625.nxs.h5",
+        "CG4D_2627.nxs.h5",
+    ]
+
+    # _resolve_local_podman_image falls back from unbuilt git-branch tags to cached :main (or :main pull)
+    import os as _os
+    from unittest.mock import patch
+
+    def _fake_podman_run(cmd: list[str], **_kwargs: object) -> object:
+        from types import SimpleNamespace
+
+        if cmd[1:3] == ["image", "exists"]:
+            target = cmd[3]
+            return SimpleNamespace(
+                returncode=0 if target == "ghcr.io/neutrons/subhkl:main" else 1
+            )
+        if cmd[1] == "images":
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "ghcr.io/neutrons/subhkl:pr-113\n"
+                    "ghcr.io/neutrons/subhkl:main\n"
+                    "ghcr.io/neutrons/subhkl:1.5.0\n"
+                ),
+            )
+        if cmd[1:3] == ["manifest", "inspect"]:
+            return SimpleNamespace(returncode=1)
+        return SimpleNamespace(returncode=1, stdout="")
+
+    clean_env = {
+        k: v
+        for k, v in _os.environ.items()
+        if k not in ("SUBHKL_CONTAINER_IMAGE", "SUBHKL_CONTAINER_TAG")
+    }
+    with (
+        patch.dict(_os.environ, clean_env, clear=True),
+        patch("subprocess.run", side_effect=_fake_podman_run),
+    ):
+        resolved_img, note_branch = (
+            NovaGalaxyPipelineRunner._resolve_local_podman_image(
+                "ghcr.io/neutrons/subhkl:feat-local-sns-hfir-fallback"
+            )
+        )
+        assert resolved_img == "ghcr.io/neutrons/subhkl:main"
+        assert note_branch is not None and "bind-mounted subhkl" in note_branch
+
+        exact_img, note_exact = NovaGalaxyPipelineRunner._resolve_local_podman_image(
+            "ghcr.io/neutrons/subhkl:main"
+        )
+        assert exact_img == "ghcr.io/neutrons/subhkl:main"
+        assert note_exact is None
+
+        offline_rel_img, note_rel = (
+            NovaGalaxyPipelineRunner._resolve_local_podman_image(
+                "ghcr.io/neutrons/subhkl:9.9.9"
+            )
+        )
+        assert offline_rel_img == "ghcr.io/neutrons/subhkl:main"
+        assert note_rel is not None and "unreachable" in note_rel
+
+    # cancel_active_job immediately kills (podman kill) and force-removes (-f -i -t 0) local container
+    podman_cancel_cmds: list[list[str]] = []
+
+    def _record_podman_cancel(cmd: list[str], **_kwargs: object) -> object:
+        from types import SimpleNamespace
+
+        podman_cancel_cmds.append(list(cmd))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    runner_local_fs.active_job = {
+        "job_id": "gpu-12345-1",
+        "container_name": "subhkl-gpu-12345-1",
+        "stage_id": "solve",
+        "mode": "container_gpu",
+        "state": "running",
+        "stdout": "",
+        "stderr": "",
+    }
+    mock_proc = MagicMock()
+    mock_proc.pid = 999999
+    mock_proc.poll.side_effect = [None, 0]
+    runner_local_fs._active_procs = {"gpu-12345-1": mock_proc}
+    with (
+        patch("shutil.which", return_value="/usr/bin/podman"),
+        patch("subprocess.run", side_effect=_record_podman_cancel),
+        patch("os.killpg"),
+        patch("os.getpgid", return_value=999999),
+    ):
+        cancel_res = runner_local_fs.cancel_active_job("solve")
+    assert cancel_res["ok"] is True
+    assert cancel_res["status"] == "cancelled"
+    assert cancel_res["cancelled_container"] == "subhkl-gpu-12345-1"
+    assert ["/usr/bin/podman", "kill", "subhkl-gpu-12345-1"] in podman_cancel_cmds
+    assert [
+        "/usr/bin/podman",
+        "rm",
+        "-f",
+        "-i",
+        "-t",
+        "0",
+        "subhkl-gpu-12345-1",
+    ] in podman_cancel_cmds
+    assert "Stopped container subhkl-gpu-12345-1" in cancel_res["job"]["stdout"]
 
     # Mock NDIP Galaxy connection to verify routing through neutrons_load_data
     runner_ndip = NovaGalaxyPipelineRunner(
@@ -988,6 +1240,18 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
         assert cat_res["multi_run_supported"] is True
         assert isinstance(cat_res["experiments"], list)
         assert isinstance(cat_res["runs"], list)
+
+        runner_no_ndip._oncat_exp_cache = {
+            ("HFIR", "CG4D", False): (
+                9e12,
+                [{"ipts": "37331", "id": "IPTS-37331", "n_runs": 10}],
+            )
+        }
+        cat_empty = runner_no_ndip.browse_oncat_catalog(
+            {"facility": "HFIR", "instrument": "CG4D", "ipts": ""}
+        )
+        assert cat_empty["ipts"] == ""
+        assert cat_empty["runs"] == []
     finally:
         runner_no_ndip._build_oauth_oncat_client = real_build
         if monkeypatch_prev is None:
@@ -999,6 +1263,7 @@ def test_merged_h5_pending_solve_and_cg4d_title_goniometer_harvesting(tmp_path):
 def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     """Verify CG4D neutrons_load_data file-mode routing, active-solve frame overlay, and MANDI curvilinear panel mesh."""
     import numpy as np
+
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
     from subhkl.instrument.goniometer import get_rotation_data_from_title
@@ -1031,7 +1296,7 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert mandi_in["params|ingest_mode"] == "oncat"
     assert mandi_in["params|instrument"] == "MANDI"
 
-    axes, angles, names = get_rotation_data_from_title("CaTiO3 phi=-59.0", "CG4D")
+    _axes, angles, names = get_rotation_data_from_title("CaTiO3 phi=-59.0", "CG4D")
     assert len(angles) == 5
     assert angles[-1] == -59.0
     assert "CG4D:Mot:phi" in names
@@ -1077,8 +1342,10 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert "isFrameSwitch" in html
 
     # 4. ImageStackMerger writes LZF-compressed 3D image stacks and multi-run check_neutron_paths returns verified_dataset_ids
-    import h5py
     from unittest.mock import MagicMock
+
+    import h5py
+
     from subhkl.commands import run_merge_images
 
     r1 = tmp_path / "CG4D_2625.reduce.h5"
@@ -1163,12 +1430,23 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         "Batching Images: 100%|██████████| 600/600 [00:02<00:00, 280it/s]",
         "Done.",
     ]
+    # Also verify collapsing when Galaxy console_output converts \r to \n (universal newlines)
+    formatted_tqdm_univ = NovaGalaxyPipelineRunner._format_terminal_stream(
+        raw_tqdm.replace("\r", "\n")
+    )
+    assert formatted_tqdm_univ.splitlines() == [
+        "Starting integration...",
+        "Batching Images: 100%|██████████| 600/600 [00:02<00:00, 280it/s]",
+        "Done.",
+    ]
     assert "formatTerminalStdio" in html
     assert "hasMergedCarelessData()" in html
-    assert "opt.disabled = !hasMerge" in html
+    assert "opt.disabled = !hasRes" in html
+    assert "opt.disabled = !hasScl" in html
 
     # 6. Verify checkpoint(..., snapshot=...) writes a live Step 4 .stages.h5 loadable with include_panel_images=False
     from types import SimpleNamespace
+
     from subhkl.scan_refine import checkpoint
 
     stage_out = tmp_path / "live_solve.h5"
@@ -1265,8 +1543,1128 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
         export_rainbow_widget(p_live, output_html=out_ep_html)
         html_ep = out_ep_html.read_text()
         assert '<base href="/interactivetool/ep/test/subhkl/" />' in html_ep
+
+        import asyncio
+
+        from aiohttp.test_utils import make_mocked_request
+
+        from subhkl.viz.nova_app.views.main_view import MainApp
+
+        app_inst = object.__new__(MainApp)
+        app_inst.pipeline_runner = MagicMock()
+        app_inst.pipeline_runner.browse_oncat_catalog.return_value = {
+            "ok": True,
+            "ipts": "34720",
+            "experiments": [],
+            "runs": [{"run": 12737}],
+        }
+        from aiohttp import web
+
+        aio_app = web.Application()
+        app_inst._bind_routes(SimpleNamespace(app=aio_app))
+        req = make_mocked_request(
+            "GET",
+            "/interactivetool/ep/test/subhkl/api/pipeline/oncat_catalog?facility=SNS&instrument=MANDI&ipts=34720",
+            app=aio_app,
+        )
+        resp = asyncio.run(aio_app._handle(req))
+        assert resp.status == 200
+        app_inst.pipeline_runner.browse_oncat_catalog.assert_called_once_with(
+            {"facility": "SNS", "instrument": "MANDI", "ipts": "34720"}
+        )
     finally:
         if old_ep is None:
             os.environ.pop("EP_PATH", None)
         else:
             os.environ["EP_PATH"] = old_ep
+
+    # 8. Verify newest-first dataset lookup in _ensure_galaxy_h5_dataset, live-state stdio materialization,
+    #    tape-recorder Play/Stop job cancellation, and persistent terminal scroll position
+    assert "stage-tape-btn" in html
+    assert "cancelWorkflowStage" in html
+    assert "api/pipeline/cancel" in html
+    assert "savedScrollTop" in html
+    assert "terminalFollowTail" in html
+    assert "handleTerminalUserScroll" in html
+
+    # Verify _ensure_galaxy_h5_dataset picks newer 'ok' dataset over older stuck 'running' dataset
+    mock_store_ds = MagicMock()
+    mock_store_ds.history_id = "hist_3969"
+    mock_gi_ds = MagicMock()
+    mock_gi_ds.datasets.get_datasets.return_value = [
+        {"id": "50f189cd8eed6da2", "name": "merged_lzf.h5", "state": "running"},
+        {"id": "99aabbccddeeff00", "name": "merged_lzf.h5", "state": "ok"},
+    ]
+    mock_store_ds.nova_connection.galaxy_instance = mock_gi_ds
+    ds_job_rec: dict = {"stdout": ""}
+    linked_id = runner._ensure_galaxy_h5_dataset(
+        mock_store_ds, str(merged_lzf), ds_job_rec
+    )
+    assert linked_id == "99aabbccddeeff00"
+    mock_gi_ds.datasets.wait_for_dataset.assert_not_called()
+    assert (
+        "Linked existing dataset 'merged_lzf.h5' (id=99aabbccddeeff00, state=ok)"
+        in ds_job_rec["stdout"]
+    )
+
+    # Verify cancel_active_job deletes active Galaxy jobs and marks job as deleted
+    del_calls: list[tuple[str, str]] = []
+    runner._api_request = MagicMock(
+        side_effect=lambda method, path, **kw: del_calls.append((method, path)) or {}
+    )
+    runner.active_job = {
+        "job_id": "gx_job_42",
+        "galaxy_job_ids": ["gx_job_41", "gx_job_42"],
+        "stage_id": "solve",
+        "mode": "galaxy",
+        "state": "running",
+        "stdout": "",
+        "stderr": "",
+    }
+    cancel_res = runner.cancel_active_job("solve")
+    assert cancel_res["ok"] is True
+    assert cancel_res["cancelled_job_id"] == "gx_job_42"
+    assert runner.active_job["state"] == "deleted"
+    assert runner.active_job["cancel_requested"] is True
+    assert ("DELETE", "/api/jobs/gx_job_41") in del_calls
+    assert ("DELETE", "/api/jobs/gx_job_42") in del_calls
+
+    # Verify [subhkl-live-state] stdout emission, terminal stripping, and HDF5 materialization
+    import base64
+    import json
+    import zlib
+
+    live_doc = {
+        "kind": "stages",
+        "stage": "120-zones",
+        "instrument": "CG4D",
+        "space_group": "I a -3 d",
+        "wavelength": [2.8, 4.5],
+        "d_min": 1.2,
+        "U": np.eye(3).tolist(),
+        "B": (np.eye(3) * 0.0838).tolist(),
+        "cell": [11.93, 11.93, 11.93, 90.0, 90.0, 90.0],
+        "R_all": np.eye(3)[None, :, :].tolist(),
+    }
+    b64_tok = base64.b64encode(
+        zlib.compress(json.dumps(live_doc).encode("utf-8"), level=6)
+    ).decode("ascii")
+    raw_with_live = f"Step 1...\n[subhkl-live-state] {b64_tok}\nStep 2..."
+    stripped = NovaGalaxyPipelineRunner._format_terminal_stream(raw_with_live)
+    assert "[subhkl-live-state]" not in stripped
+    assert stripped.splitlines() == ["Step 1...", "Step 2..."]
+
+    mat_h5 = tmp_path / "materialized.blind.h5"
+    assert NovaGalaxyPipelineRunner._materialize_live_state_h5(b64_tok, str(mat_h5))
+    assert mat_h5.is_file()
+    p_mat = build_rainbow_zone_payload(
+        replay_h5=mat_h5,
+        max_zone_index=2,
+        max_zones=20,
+        include_panels=False,
+        include_peaks=True,
+    )
+    assert len(p_mat["zones"]) > 0
+    from subhkl import (
+        format_version_badge,
+        get_container_image,
+        get_container_tag,
+        get_version,
+    )
+
+    assert p_mat["subhkl_version"] == get_version()
+    assert f'id="app-version">{format_version_badge(get_version())}</span>' in html
+    assert format_version_badge("1.5.0") == "v1.5.0"
+    assert format_version_badge("v1.5.0") == "v1.5.0"
+    assert (
+        format_version_badge("feat/ui-logo-and-favicon") == "feat/ui-logo-and-favicon"
+    )
+    assert get_container_tag("feat/ui-logo-and-favicon") == "feat-ui-logo-and-favicon"
+    assert get_container_tag("v1.5.0") == "1.5.0"
+    assert p_mat["pipeline_stages"][0]["container"] == get_container_image()
+    assert p_mat["pipeline_stages"][1]["container"] == get_container_image()
+    assert p_mat["pipeline_stages"][2]["container"] == get_container_image()
+
+
+def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
+    tmp_path, monkeypatch
+) -> None:
+    import os
+    import tempfile as _tempfile
+    from types import SimpleNamespace
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import _discover_images_h5
+
+    monkeypatch.setattr(_tempfile, "gettempdir", lambda: str(tmp_path))
+
+    mandi_gx_id = "70f27733988683c0"
+    cg4d_gx_id = "1805ca028e2eaa6f"
+    mandi_cached = (
+        tmp_path / f"subhkl_gx_{mandi_gx_id}_MANDI_12737_MANDI_12743_merged.h5"
+    )
+    with h5py.File(mandi_cached, "w") as hf:
+        dt_s = h5py.string_dtype(encoding="utf-8")
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_12737.nxs.h5", "MANDI_12743.nxs.h5"], dtype=object),
+            dtype=dt_s,
+        )
+        hf.create_dataset("images", data=np.zeros((2, 8, 8), dtype=np.float32))
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.0, 4.0], dtype=np.float32)
+        )
+    mandi_size = mandi_cached.stat().st_size
+
+    runner = NovaGalaxyPipelineRunner.__new__(NovaGalaxyPipelineRunner)
+    runner.galaxy_url = "https://ndip-test.ornl.gov"
+    runner.api_key = "fake_key"
+    runner._dataset_id_by_path = {}
+    runner._api_request = lambda method, path, **kw: {
+        "id": mandi_gx_id,
+        "name": "MANDI_12737_MANDI_12743_merged.h5",
+        "state": "ok",
+        "file_size": mandi_size,
+    }
+
+    resolved_local, _ = runner.resolve_dataset_to_local_h5(mandi_gx_id)
+    _work_dir, work_merged = runner._resolve_work_dir_and_merged(resolved_local)
+    assert os.path.basename(work_merged) == "MANDI_12737_MANDI_12743_merged.h5"
+    assert runner._dataset_id_by_path.get(os.path.abspath(work_merged)) == mandi_gx_id
+
+    # Stamp instrument metadata onto merged.h5 that already has an 'instrument' group
+    runner._stamp_merged_metadata(
+        work_merged, {"instrument": "MANDI", "params": {"space_group": "P 21 21 21"}}
+    )
+    with h5py.File(work_merged, "r") as hf:
+        assert hf.attrs.get("instrument") == "MANDI"
+        assert hf["instrument/name"][()].decode("utf-8") == "MANDI"
+
+    # Simulate a Galaxy history containing both an old CG4D 'merged.h5' and the MANDI dataset
+    datasets_by_id = {
+        cg4d_gx_id: {
+            "id": cg4d_gx_id,
+            "name": "merged.h5",
+            "state": "ok",
+            "deleted": False,
+            "file_size": mandi_size + 99999,
+        },
+        mandi_gx_id: {
+            "id": mandi_gx_id,
+            "name": "MANDI_12737_MANDI_12743_merged.h5",
+            "state": "ok",
+            "deleted": False,
+            "file_size": mandi_size,
+        },
+    }
+
+    class _FakeDatasetsClient:
+        def show_dataset(self, ds_id: str):
+            return datasets_by_id[ds_id]
+
+        def get_datasets(self, history_id: str, name: str | None = None):
+            all_ds = list(datasets_by_id.values())
+            if name is None:
+                return all_ds
+            return [d for d in all_ds if name in d["name"]]
+
+    fake_store = SimpleNamespace(
+        history_id="hist_1",
+        nova_connection=SimpleNamespace(
+            galaxy_instance=SimpleNamespace(
+                datasets=_FakeDatasetsClient(),
+                base_url="https://ndip-test.ornl.gov",
+            )
+        ),
+    )
+
+    job_rec = {"stdout": ""}
+    linked_id = runner._ensure_galaxy_h5_dataset(fake_store, work_merged, job_rec)
+    assert linked_id == mandi_gx_id
+
+    # Verify _ensure_galaxy_h5_dataset for solve.h5 does not link 'betalac-7/solve.h5'
+    # or conflate <tag>_merged.h5 candidate paths with solve.h5
+    work_solve = os.path.join(_work_dir, "solve.h5")
+    with h5py.File(work_solve, "w") as hf:
+        hf.create_dataset("hkl", data=np.zeros((4, 3), dtype=np.float32))
+    solve_size = os.path.getsize(work_solve)
+    datasets_by_id["fc00dcb17c606557"] = {
+        "id": "fc00dcb17c606557",
+        "name": "betalac-7/solve.h5",
+        "state": "ok",
+        "deleted": False,
+        "file_size": solve_size,
+    }
+    datasets_by_id["c0662c36e1a24cf3"] = {
+        "id": "c0662c36e1a24cf3",
+        "name": "solve.h5 (subhkl_solve)",
+        "state": "ok",
+        "deleted": False,
+        "file_size": solve_size,
+    }
+    linked_solve_id = runner._ensure_galaxy_h5_dataset(fake_store, work_solve, job_rec)
+    assert linked_solve_id == "c0662c36e1a24cf3"
+
+    # Verify SubhklGalaxyModel() starts with no preloaded local dataset and pending_stage='reduce'
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+
+    empty_model = SubhklGalaxyModel()
+    assert empty_model.data.peaks_file == ""
+    assert empty_model.data.images_file == ""
+    assert empty_model.payload.get("artifact_kind") == "empty"
+    assert empty_model.payload.get("pending_stage") == "reduce"
+    assert len(empty_model.payload.get("panels") or []) > 0
+
+    # Verify list_history_datasets orders most recently touched first and touch_dataset promotes older items
+    from subhkl.viz.rainbow_zones import (
+        render_rainbow_html,
+        validate_subhkl_ingestible_dataset,
+    )
+
+    runner.galaxy_api_key = "fake_key"
+    runner.history_id = "hist_1"
+    runner._dataset_touch_times = {}
+    raw_history = [
+        {
+            "id": "ds_old",
+            "hid": 10,
+            "name": "old_merged.h5",
+            "state": "ok",
+            "extension": "h5",
+            "history_content_type": "dataset",
+            "deleted": False,
+            "update_time": "2026-01-10T10:00:00.000000",
+        },
+        {
+            "id": "ds_new",
+            "hid": 20,
+            "name": "new_solve.h5",
+            "state": "ok",
+            "extension": "h5",
+            "history_content_type": "dataset",
+            "deleted": False,
+            "update_time": "2026-01-12T10:00:00.000000",
+        },
+    ]
+    runner._api_request = lambda method, path, **kw: raw_history
+    ordered = runner.list_history_datasets()
+    assert [d["id"] for d in ordered] == ["ds_new", "ds_old"]
+
+    runner.touch_dataset("ds_old")
+    ordered_after_touch = runner.list_history_datasets()
+    assert [d["id"] for d in ordered_after_touch] == ["ds_old", "ds_new"]
+
+    # Verify validate_subhkl_ingestible_dataset accepts SubHKL .h5 / raw NeXus and errors on unsupported datasets
+    assert (
+        validate_subhkl_ingestible_dataset(
+            work_solve,
+            {
+                "name": "integrator.h5",
+                "hid": 279,
+                "state": "ok",
+                "extension": "png",
+            },
+        )
+        == "subhkl_h5"
+    )
+    raw_nxs = tmp_path / "CG4D_2625.nxs.h5"
+    with h5py.File(raw_nxs, "w") as hf:
+        hf.create_group("entry")
+    assert (
+        validate_subhkl_ingestible_dataset(
+            raw_nxs,
+            {
+                "name": "CG4D_2625.nxs.h5",
+                "hid": 280,
+                "state": "ok",
+                "extension": "h5",
+            },
+        )
+        == "raw_nexus"
+    )
+    from subhkl.viz.rainbow_zones import (
+        _extract_from_h5,
+        infer_dataset_extension,
+    )
+
+    assert infer_dataset_extension("integrator.h5", "png") == "h5"
+    assert infer_dataset_extension("reflections.mtz", "png") == "mtz"
+    assert infer_dataset_extension("dataset_abc-123.dat", "h5") == "dat"
+
+    bad_mtz = tmp_path / "reflections.mtz"
+    bad_mtz.write_bytes(b"MTZ \x00\x00\x00\x00")
+    try:
+        validate_subhkl_ingestible_dataset(
+            bad_mtz,
+            {
+                "name": "reflections.mtz",
+                "hid": 278,
+                "state": "ok",
+                "extension": "mtz",
+            },
+            has_active_geometry=False,
+        )
+        raise AssertionError("Expected ValueError for standalone MTZ file")
+    except ValueError as exc:
+        assert "Cannot load MTZ dataset" in str(exc)
+
+    # Verify _extract_from_h5 ignores stale sibling careless_metrics.json when peaks/careless_residual is absent
+    # and reconstructs peaks_xyz from pixel_r/pixel_c without triggering finder-less solve forward projection
+    stale_dir = tmp_path / "stale_integ"
+    stale_dir.mkdir(exist_ok=True)
+    (stale_dir / "careless_metrics.json").write_text(
+        json.dumps({"n_merged_asu": 500, "cc_half_overall": 0.95}),
+        encoding="utf-8",
+    )
+    integ_no_xyz = stale_dir / "integrated.h5"
+    with h5py.File(integ_no_xyz, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = np.diag([1.0 / 68.7, 1.0 / 69.8, 1.0 / 156.9])
+        hf["peaks/h"] = np.array([1, 2, 3], dtype=int)
+        hf["peaks/k"] = np.array([0, 1, 1], dtype=int)
+        hf["peaks/l"] = np.array([1, 0, 2], dtype=int)
+        hf["peaks/lambda"] = np.array([3.1, 3.4, 3.8], dtype=float)
+        hf["peaks/intensity"] = np.array([120.0, 95.0, 80.0], dtype=float)
+        hf["peaks/sigma"] = np.array([5.0, 4.0, 4.0], dtype=float)
+        hf["peaks/bank"] = np.array([20, 20, 20], dtype=int)
+        hf["peaks/pixel_r"] = np.array([120.0, 140.0, 160.0], dtype=float)
+        hf["peaks/pixel_c"] = np.array([130.0, 150.0, 170.0], dtype=float)
+        hf["peaks/two_theta"] = np.array([0.8, 0.9, 1.0], dtype=float)
+        hf["peaks/azimuthal"] = np.array([0.2, 0.3, 0.4], dtype=float)
+        hf["peaks/var_u"] = np.array([2.5, 2.5, 2.5], dtype=float)
+        hf["peaks/var_v"] = np.array([1.8, 1.8, 1.8], dtype=float)
+        hf["peaks/cov_uv"] = np.array([0.1, 0.1, 0.1], dtype=float)
+
+    ext_integ = _extract_from_h5(integ_no_xyz)
+    assert ext_integ["artifact_kind"] == "integrator"
+    assert ext_integ["merge_metrics"] is None
+    assert len(ext_integ["peaks_xyz"]) == 3
+
+    # Verify invalidate_subsequent_stages removes stale careless_metrics.json and hides subsequent stages
+    runner.invalidate_subsequent_stages("solve", str(stale_dir))
+    assert not (stale_dir / "careless_metrics.json").exists()
+    step_arts = runner.list_step_artifacts(
+        current_h5=str(integ_no_xyz),
+        history_datasets=[
+            {"id": "ds_s", "hid": 10, "name": "solve.h5", "state": "ok"},
+            {"id": "ds_i", "hid": 11, "name": "integrated.h5", "state": "ok"},
+            {"id": "ds_m", "hid": 12, "name": "merged.mtz", "state": "ok"},
+        ],
+    )
+    assert len(step_arts["solve"]) == 1
+    assert step_arts["integrate"] == []
+    assert step_arts["merge"] == []
+
+    bad_h5 = tmp_path / "unrelated.h5"
+    with h5py.File(bad_h5, "w") as hf:
+        hf.create_dataset("foo", data=np.array([1, 2, 3]))
+    try:
+        validate_subhkl_ingestible_dataset(
+            bad_h5,
+            {"name": "unrelated.h5", "hid": 281, "state": "ok", "extension": "h5"},
+        )
+        raise AssertionError("Expected ValueError for unrelated HDF5 file")
+    except ValueError as exc:
+        assert "does not contain SubHKL diffraction data" in str(exc)
+
+    html_doc = render_rainbow_html(empty_model.payload)
+    assert "__action_galaxy_dataset__" in html_doc
+    assert "From Galaxy..." in html_doc
+    assert 'id="modal-galaxy-dataset"' in html_doc
+    assert "MAX_RECENT_HISTORY_ITEMS" in html_doc
+
+    # Verify _discover_images_h5 locates <tag>_merged.h5 from a solve.h5 that has 'files'
+    # even when attrs['source'] points to an existing Pulsar staging dataset_*.dat file
+    staging_dir = tmp_path / "staging_test" / "279969" / "inputs"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staging_dat = staging_dir / "dataset_c0662c36-e1a2-4cf3-8d04-233deadc86c9.dat"
+    with h5py.File(staging_dat, "w") as hf:
+        hf.create_dataset("images", data=np.zeros((2, 8, 8), dtype=np.float32))
+    solve_h5 = tmp_path / "subhkl_gx_999999_solve.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["source"] = str(staging_dat)
+        dt_s = h5py.string_dtype(encoding="utf-8")
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_12737.nxs.h5", "MANDI_12743.nxs.h5"], dtype=object),
+            dtype=dt_s,
+        )
+    disc = _discover_images_h5(solve_h5)
+    assert disc is not None
+    assert os.path.abspath(disc) == os.path.abspath(work_merged)
+
+    # Verify _resolve_work_dir_and_merged on solve.h5 NEVER overwrites <tag>_merged.h5 or its dataset ID
+    _wd_s, _resolved_s = runner._resolve_work_dir_and_merged(str(solve_h5))
+    with h5py.File(work_merged, "r") as hf_chk:
+        assert "images" in hf_chk
+    assert runner._dataset_id_by_path.get(os.path.abspath(work_merged)) == mandi_gx_id
+    assert runner._dataset_id_by_path.get(os.path.abspath(str(solve_h5))) == "999999"
+
+    # Verify _extract_from_h5 sets artifact_kind="merged_careless" when careless/metrics_json has resolution_bins
+    merged_careless_h5 = tmp_path / "merged_careless_bins_only.h5"
+    with h5py.File(merged_careless_h5, "w") as hf_mc:
+        hf_mc.attrs["instrument"] = "CG4D"
+        hf_mc["sample/U"] = np.eye(3)
+        hf_mc["sample/B"] = np.diag([1.0 / 68.7, 1.0 / 69.8, 1.0 / 156.9])
+        hf_mc["peaks/h"] = np.array([1, 2, 3], dtype=int)
+        hf_mc["peaks/k"] = np.array([0, 1, 1], dtype=int)
+        hf_mc["peaks/l"] = np.array([1, 0, 2], dtype=int)
+        hf_mc["peaks/lambda"] = np.array([3.1, 3.4, 3.8], dtype=float)
+        hf_mc["peaks/intensity"] = np.array([120.0, 95.0, 80.0], dtype=float)
+        hf_mc["peaks/sigma"] = np.array([5.0, 4.0, 4.0], dtype=float)
+        hf_mc["peaks/bank"] = np.array([20, 20, 20], dtype=int)
+        hf_mc["peaks/pixel_r"] = np.array([120.0, 140.0, 160.0], dtype=float)
+        hf_mc["peaks/pixel_c"] = np.array([130.0, 150.0, 170.0], dtype=float)
+        hf_mc["peaks/var_u"] = np.array([2.5, 2.5, 2.5], dtype=float)
+        hf_mc["peaks/var_v"] = np.array([1.8, 1.8, 1.8], dtype=float)
+        hf_mc["peaks/cov_uv"] = np.array([0.1, 0.1, 0.1], dtype=float)
+        hf_mc["peaks/careless_residual"] = np.array([0.2, -0.4, 0.1], dtype=float)
+        hf_mc["peaks/careless_scale"] = np.array([1.0, 1.1, 0.9], dtype=float)
+        cgrp = hf_mc.require_group("careless")
+        cgrp.create_dataset(
+            "metrics_json",
+            data=np.bytes_(
+                json.dumps(
+                    {
+                        "resolution_bins": [
+                            {
+                                "bin": 0,
+                                "d_max": 5.0,
+                                "d_min": 2.0,
+                                "n_refl": 42,
+                                "n_theo": 50,
+                                "completeness_pct": 84.0,
+                                "mean_isigi": 12.5,
+                                "cc_half": 0.985,
+                            }
+                        ]
+                    }
+                ).encode("utf-8")
+            ),
+        )
+    ext_mc = _extract_from_h5(merged_careless_h5)
+    assert ext_mc["artifact_kind"] == "merged_careless"
+    assert ext_mc["merge_metrics"] is not None
+    assert ext_mc["merge_metrics"]["n_merged_asu"] == 42
+    assert len(ext_mc["merge_metrics"]["cc_half_bins"]) == 1
+
+    # Verify reduction_settings.json wavelength defaults, Params λ_min/λ_max inputs, synchronized d_min slider,
+    # and unscaled I/sigma color mode in rendered HTML
+    from subhkl.viz.rainbow_zones import _get_instrument_default_wavelength
+
+    assert _get_instrument_default_wavelength("MANDI") == (2.0, 4.0)
+    assert _get_instrument_default_wavelength("TOPAZ") == (0.4, 3.5)
+    assert _get_instrument_default_wavelength("CG4D") == (2.8, 4.5)
+    fresh_cg4d = SubhklGalaxyModel()
+    assert fresh_cg4d.data.wavelength_min == 2.8
+    assert fresh_cg4d.data.wavelength_max == 4.5
+    assert fresh_cg4d.data.d_min == 1.4
+    assert fresh_cg4d.payload["wavelength_range"] == [2.8, 4.5]
+    assert fresh_cg4d.payload["d_min"] == 1.4
+    assert 'id="inp-lmin"' in html_doc
+    assert 'id="inp-lmax"' in html_doc
+    assert 'id="slider-dmin"' in html_doc
+    assert 'id="sel-spot-color"' in html_doc
+    assert '<option value="isigi">Color: I/σ (Unscaled)</option>' in html_doc
+    assert "hasIntegratedIsigi" in html_doc
+    assert "syncDminControls" in html_doc
+    assert "Runner host:" in html_doc
+    from subhkl.io.parser import detect_runner_hostname
+
+    assert detect_runner_hostname()
+
+    # Verify d_min, lambda_min, and lambda_max preservation across solve/blind_search/search HDF5 groups,
+    # frame switches, active solve overlays, and UI stage reloads
+    blind_h5 = tmp_path / "solve.blind.h5"
+    with h5py.File(blind_h5, "w") as hf_b:
+        hf_b.attrs["instrument"] = "CG4D"
+        hf_b["sample/U"] = np.eye(3)
+        hf_b["sample/B"] = np.diag([1.0 / 68.7, 1.0 / 69.8, 1.0 / 156.9])
+        hf_b.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.85, 4.35], dtype=np.float64)
+        )
+        sgrp = hf_b.create_group("search")
+        sgrp.attrs["d_min"] = 1.95
+    ext_blind = _extract_from_h5(blind_h5)
+    assert np.allclose(ext_blind["wavelength_range"], (2.85, 4.35))
+    assert np.isclose(ext_blind["solve_diagnostics"]["d_min"], 1.95)
+
+    empty_model.data.peaks_file = str(work_merged)
+    empty_model.data.images_file = str(work_merged)
+    empty_model.refresh_payload()
+    # User sets custom UI parameters before running / re-running solve
+    empty_model.data.wavelength_min = 2.85
+    empty_model.data.wavelength_max = 4.35
+    empty_model.data.d_min = 1.95
+    p_kept = empty_model.refresh_payload(frame_index=1, preserve_params=True)
+    assert p_kept["wavelength_range"] == [2.85, 4.35]
+    assert p_kept["d_min"] == 1.95
+    assert empty_model.data.wavelength_min == 2.85
+    assert empty_model.data.wavelength_max == 4.35
+    assert empty_model.data.d_min == 1.95
+
+    # Subsequent solve with a different d_min in the UI must not revert to the previous solve.h5's d_min (1.95)
+    empty_model.data.peaks_file = str(blind_h5)
+    empty_model.data.d_min = 1.50
+    p_subsequent = empty_model.refresh_payload(frame_index=0, preserve_params=True)
+    assert p_subsequent["d_min"] == 1.50
+    assert empty_model.data.d_min == 1.50
+
+    runner.active_job = {
+        "stage_id": "solve",
+        "state": "running",
+        "solve_params": {
+            "instrument": "CG4D",
+            "space_group": "P 21 21 21",
+            "wavelength_range": (2.85, 4.35),
+            "d_min": 1.95,
+        },
+    }
+    ov_payload = {"wavelength_range": [2.0, 10.0], "d_min": 1.0}
+    runner.apply_active_solve_overlay(ov_payload, frame_index=0)
+    assert ov_payload["wavelength_range"] == [2.85, 4.35]
+    assert ov_payload["d_min"] == 1.95
+    assert 'preserveParams: stageId !== "reduce"' in html_doc
+    assert (
+        "const keepUserParams = isFrameSwitch || preserveParams || isSolveRunning;"
+        in html_doc
+    )
+
+    # Verify flexible unit-cell clipboard parser (space group at end, front, or omitted)
+    from subhkl.viz.rainbow_zones import (
+        parse_unit_cell_text,
+        resolve_space_group_symmetry,
+    )
+
+    p_end = parse_unit_cell_text(
+        "68.84174 98.06962 90.91568 90.07304 106.11396 90.0088 P21"
+    )
+    assert p_end is not None
+    assert np.allclose(
+        p_end["cell"],
+        [68.84174, 98.06962, 90.91568, 90.07304, 106.11396, 90.0088],
+    )
+    assert p_end["space_group"] == "P21"
+
+    p_front = parse_unit_cell_text("P 21 21 21 68.7 69.8 156.9 90.0 90.0 90.0")
+    assert p_front is not None
+    assert np.allclose(p_front["cell"], [68.7, 69.8, 156.9, 90.0, 90.0, 90.0])
+    assert p_front["space_group"] == "P 21 21 21"
+
+    p_none = parse_unit_cell_text(
+        "68.84174, 98.06962, 90.91568, 90.07304, 106.11396, 90.0088"
+    )
+    assert p_none is not None
+    assert p_none["space_group"] == ""
+    assert np.allclose(
+        p_none["cell"],
+        [68.84174, 98.06962, 90.91568, 90.07304, 106.11396, 90.0088],
+    )
+
+    p_rhomb = parse_unit_cell_text("R -3 m :R 8.5 8.5 8.5 55.2 55.2 55.2")
+    assert p_rhomb is not None
+    assert p_rhomb["space_group"] == "R -3 m :R"
+    assert np.allclose(p_rhomb["cell"], [8.5, 8.5, 8.5, 55.2, 55.2, 55.2])
+
+    # Verify crystal-system symmetry constraints for space groups
+    sym_cubic = resolve_space_group_symmetry("I a -3 d")
+    assert sym_cubic["crystal_system"] == "cubic"
+    assert sym_cubic["linked_lengths"] == {"b": "a", "c": "a"}
+    assert sym_cubic["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+    }
+
+    sym_tet = resolve_space_group_symmetry("P 41 21 2")
+    assert sym_tet["crystal_system"] == "tetragonal"
+    assert sym_tet["linked_lengths"] == {"b": "a"}
+    assert sym_tet["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+    }
+
+    sym_hex = resolve_space_group_symmetry("P 61 2 2")
+    assert sym_hex["crystal_system"] == "hexagonal"
+    assert sym_hex["linked_lengths"] == {"b": "a"}
+    assert sym_hex["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 120.0,
+    }
+
+    sym_rhomb = resolve_space_group_symmetry("R -3 m :R")
+    assert sym_rhomb["setting"] == "trigonal_r"
+    assert sym_rhomb["linked_lengths"] == {"b": "a", "c": "a"}
+    assert sym_rhomb["linked_angles"] == {"beta": "alpha", "gamma": "alpha"}
+    assert sym_rhomb["fixed_angles"] == {}
+
+    sym_ortho = resolve_space_group_symmetry("P 21 21 21")
+    assert sym_ortho["crystal_system"] == "orthorhombic"
+    assert sym_ortho["linked_lengths"] == {}
+    assert sym_ortho["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 90.0,
+    }
+
+    sym_mono = resolve_space_group_symmetry("P21")
+    assert sym_mono["crystal_system"] == "monoclinic"
+    assert sym_mono["setting"] == "monoclinic_b"
+    assert sym_mono["fixed_angles"] == {"alpha": 90.0, "gamma": 90.0}
+
+    # Verify Galaxy dataset unit-cell metadata extraction & annotation parsing
+    runner.attach_dataset_cell_metadata(
+        "ds_test_betalac",
+        [68.8417, 98.0696, 90.9157, 90.073, 106.114, 90.0088],
+        "P 1 21 1",
+        "CG4D",
+        sync_remote=False,
+    )
+    assert runner._dataset_cell_meta["ds_test_betalac"]["space_group"] == "P 1 21 1"
+    assert np.allclose(
+        runner._dataset_cell_meta["ds_test_betalac"]["cell"],
+        [68.8417, 98.0696, 90.9157, 90.073, 106.114, 90.0088],
+    )
+    parsed_ann = runner._parse_dataset_annotation_meta(
+        {
+            "annotation": '{"subhkl_cell":[11.93,11.93,11.93,90,90,90],"space_group":"I a -3 d","instrument":"MANDI"}',
+            "tags": [],
+        }
+    )
+    assert parsed_ann is not None
+    assert parsed_ann["space_group"] == "I a -3 d"
+    assert parsed_ann["cell"] == [11.93, 11.93, 11.93, 90.0, 90.0, 90.0]
+
+    # Verify UI elements & JS helpers for per-field hoverable autocomplete dropdown, tentative gray preview, paste, and overrideable symmetry proposals
+    assert 'id="nd-symmetry-badge"' in html_doc
+    assert 'id="nd-cell-suggestions"' in html_doc
+    assert 'id="subhkl-sg-datalist"' in html_doc
+    assert "parseUnitCellClipboardText" in html_doc
+    assert "resolveSpaceGroupSymmetry" in html_doc
+    assert "applyUnitCellSymmetryConstraints" in html_doc
+    assert "getKnownUnitCellHistory" in html_doc
+    assert "renderUnitCellHistoryDropdown" in html_doc
+    assert "highlightAutocompleteOption" in html_doc
+    assert "previewTentativeUnitCellEntry" in html_doc
+    assert "confirmTentativeUnitCellPreview" in html_doc
+    assert "updateUnitCellFieldSuggestions" in html_doc
+
+    # Verify stepped run interval parsing (e.g. 2632-2638/2, 2623:26238:2, 2632-2638..2)
+    from subhkl.viz.rainbow_zones import parse_run_range_spec
+
+    assert parse_run_range_spec("2632-2638/2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2632:2638:2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2632-2638..2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2632..2638..2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2632..2638/2") == [2632, 2634, 2636, 2638]
+    assert parse_run_range_spec("2623:26238:2") == list(range(2623, 26239, 2))
+    assert parse_run_range_spec("2632-2638/2, 2645, 2650:2656:3") == [
+        2632,
+        2634,
+        2636,
+        2638,
+        2645,
+        2650,
+        2653,
+        2656,
+    ]
+    assert "dMinSeqAtStart" in html_doc
+    assert "pollInFlight" in html_doc
+
+
+def test_em_pixel_mask_two_color_overlay_and_srcdoc_tab_handling(tmp_path):
+    """Verify two-color EM pixel_class PNG encoding, masked solve peak filtering, and srcdoc Tab popout logic."""
+    import base64
+    import io
+    import re
+    import subprocess
+
+    from PIL import Image
+
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    mask_solve_h5 = tmp_path / "solve_with_em_mask.h5"
+    p_cls = np.zeros((2, 512, 512), dtype=np.uint8)
+    # Bank 21: dead/shadowed top half (1=dark) + bright magnet flare patch (2=bright)
+    p_cls[0, :256, :] = 1
+    p_cls[0, 320:336, 320:336] = 2
+    # Bank 22: completely valid (0) -> should emit mask_b64=None (zero payload bloat)
+    p_mask = (p_cls == 0).astype(np.uint8)
+
+    with h5py.File(mask_solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = np.diag([1.0 / 25.0, 1.0 / 30.0, 1.0 / 35.0])
+        hf["sample/space_group"] = "P 2 2 2"
+        hf["scan_refinement/band_wavelength"] = np.array([2.8, 4.5], dtype=float)
+        dgrp = hf.create_group("detector")
+        dgrp.create_dataset("mask_bank_ids", data=np.array([21, 22], dtype=np.int32))
+        dgrp.create_dataset("pixel_mask", data=p_mask)
+        dgrp.create_dataset("pixel_class", data=p_cls)
+
+    payload = build_rainbow_zone_payload(replay_h5=mask_solve_h5, instrument="CG4D")
+    em_sum = payload["em_mask_summary"]
+    assert em_sum["available"] is True
+    assert em_sum["n_dark_pixels"] == 256 * 512
+    assert em_sum["n_bright_pixels"] == 16 * 16
+    assert em_sum["dark_fraction"] > 0.20
+    assert em_sum["bright_fraction"] > 0.0
+
+    panels_by_bank = {p["bank"]: p for p in payload["panels"]}
+    assert panels_by_bank[22]["mask_b64"] is None
+    b21_mask_b64 = panels_by_bank[21]["mask_b64"]
+    assert isinstance(b21_mask_b64, str) and len(b21_mask_b64) > 0
+
+    mask_img = np.asarray(
+        Image.open(io.BytesIO(base64.b64decode(b21_mask_b64))), dtype=np.uint8
+    )
+    assert mask_img.shape == (128, 128)
+    assert set(np.unique(mask_img).tolist()) == {0, 128, 255}
+    assert np.all(mask_img[:64, :] == 128)
+    assert np.all(mask_img[80:84, 80:84] == 255)
+
+    # No forward-projected solve peaks should land on masked pixels of bank 21
+    for pk in payload["peaks"]:
+        if pk["bank"] == 21:
+            ri = int(np.clip(round(pk["row"]), 0, 511))
+            ci = int(np.clip(round(pk["col"]), 0, 511))
+            assert p_cls[0, ri, ci] == 0
+
+    html = render_rainbow_html(payload)
+    assert 'id="btn-pixel-mask"' in html
+    assert 'id="mask-legend-row"' in html
+    assert "getWarpedMaskCanvas" in html
+    assert "resolveStandaloneTabUrl" in html
+    assert "isEmbeddedInOuterFrame" in html
+    assert 'selfHref.startsWith("about:srcdoc")' in html
+    assert (
+        "for (let sIdx = 0; sIdx < Math.min(stageKeys.length, maxValidCompleted); sIdx++)"
+        in html
+    )
+
+    scripts = re.findall(
+        r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, flags=re.DOTALL
+    )
+    assert scripts
+    js_file = tmp_path / "rainbow_mask_check.js"
+    js_file.write_text("\n;\n".join(scripts), encoding="utf-8")
+    proc = subprocess.run(
+        ["node", "--check", str(js_file)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
+    """Verify lower-right stdio mm:ss.ms step stopwatch rendering, JS state transitions, and backend step_timings."""
+    import subprocess
+    import time
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    peaks_xyz, _U, _B, UB, _hkls, _lams = _synthetic_orthorhombic_peaks()
+    payload = build_rainbow_zone_payload(
+        peaks_xyz=peaks_xyz,
+        ub_matrix=UB,
+        wavelength_range=(1.8, 4.5),
+        instrument="CG4D",
+        space_group="P 2 2 2",
+    )
+
+    for mode in ("arcade", "pro"):
+        html = render_rainbow_html(payload, default_mode=mode)
+        assert 'class="terminal-wrap"' in html
+        assert 'id="stdio-stopwatch"' in html
+        assert 'id="stdio-stopwatch-stage"' in html
+        assert 'id="stdio-stopwatch-time"' in html
+        assert 'class="sw-rb sw-rb-1"' in html
+        assert 'viewBox="0 0 24 12"' in html
+        assert "swRainbowShoot" in html
+        assert "swRainbowTipSparkle" in html
+        assert "swStarTwinkle" in html
+        assert 'class="sw-sp-tip"' in html
+        assert 'class="sw-sp-end sw-sp-end-2"' in html
+        assert "ctx.moveTo(bx, by)" not in html
+        assert "detToScreen(p.det_x + shiftAz, py, w, h, -0.35)" not in html
+        assert "sw-hand" not in html
+        assert "stdio-stopwatch-quip" not in html
+        assert "BLINK" not in html
+        assert "formatStopwatchParts" in html
+        assert "startStepStopwatch" in html
+        assert "finishStepStopwatch" in html
+        assert "hydrateStepTimingsFromServer" in html
+
+        scripts = re.findall(
+            r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, flags=re.DOTALL
+        )
+        assert scripts
+        js_src = "\n;\n".join(scripts)
+        js_file = tmp_path / f"rainbow_stopwatch_{mode}.js"
+        js_file.write_text(js_src, encoding="utf-8")
+        proc = subprocess.run(
+            ["node", "--check", str(js_file)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+        # Extract and execute stageStopwatchMeta + formatStopwatchParts + getCompletionStopwatchQuip in Node
+        m_meta = re.search(
+            r"function stageStopwatchMeta\(stageIdOrIdx\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_quip = re.search(
+            r"function getCompletionStopwatchQuip\(stageId, finalStatus, elapsedMs\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_fmt = re.search(
+            r"function formatStopwatchParts\(ms\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_term_scroll = re.search(
+            r"let _lastAutoTerminalScrollTop = -1;.*?function handleTerminalUserScroll\(box\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_append_term = re.search(
+            r"function appendTerminalLog\(text, replace = false, resetFollow = false\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_fmt_stdio = re.search(
+            r"function formatTerminalStdio\(rawText\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_odo = re.search(
+            r"const STOPWATCH_SLOMO_RATE = .*?function computeStopwatchOdometerPositions\(msFloat\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_cheat = re.search(
+            r"function toggleStopwatchCheat\(\)\s*\{.*?function handleStopwatchCheatKey\(ev\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_live_ms = re.search(
+            r"function getEntryLiveMs\(entry, nowPerf = performance\.now\(\)\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        assert (
+            m_meta
+            and m_quip
+            and m_fmt
+            and m_term_scroll
+            and m_append_term
+            and m_fmt_stdio
+            and m_odo
+            and m_cheat
+            and m_live_ms
+        )
+        assert "flashStopwatchQuip" in js_src
+        assert "sw-odo-strip" in js_src
+        eval_script = (
+            f'const UI_MODE = "{mode}";\n'
+            f"const PIPELINE = {json.dumps(payload['pipeline_stages'])};\n"
+            "const state = {\n"
+            "  terminalFollowTail: true,\n"
+            "  terminalScrollTop: 0,\n"
+            "  stopwatchCheatSlowMo: false,\n"
+            "  stepTimings: {},\n"
+            "  runningStageIdx: -1,\n"
+            "};\n"
+            "const stopwatchFlash = { text: '', untilPerf: 0, timerId: null, demoStartPerf: 0, demoUntilPerf: 0 };\n"
+            "let _lastFlashedQuip = '';\n"
+            "function activeRunningStageId() { return null; }\n"
+            "function flashStopwatchQuip(t) { if (UI_MODE !== 'pro') _lastFlashedQuip = t; }\n"
+            "let _selActive = false;\n"
+            "const _docListeners = {};\n"
+            "const mockNode = {};\n"
+            "const mockBox = {\n"
+            '  textContent: "",\n'
+            "  clientHeight: 100,\n"
+            "  scrollHeight: 100,\n"
+            "  _scrollTop: 0,\n"
+            "  get scrollTop() { return this._scrollTop; },\n"
+            "  set scrollTop(v) {\n"
+            "    const maxS = Math.max(0, this.scrollHeight - this.clientHeight);\n"
+            "    this._scrollTop = Math.max(0, Math.min(maxS, v));\n"
+            "  },\n"
+            "  contains(n) { return n === mockNode; },\n"
+            "  addEventListener() {},\n"
+            "};\n"
+            "globalThis.document = {\n"
+            "  getElementById(id) { return id === 'terminal-box' ? mockBox : null; },\n"
+            "  addEventListener(ev, fn) { _docListeners[ev] = fn; },\n"
+            "};\n"
+            "globalThis.window = {\n"
+            "  getSelection() {\n"
+            "    return _selActive\n"
+            "      ? { isCollapsed: false, anchorNode: mockNode, focusNode: mockNode }\n"
+            "      : { isCollapsed: true, anchorNode: null, focusNode: null };\n"
+            "  },\n"
+            "};\n"
+            f"{m_fmt_stdio.group(0)}\n"
+            f"{m_term_scroll.group(0)}\n"
+            f"{m_append_term.group(0)}\n"
+            f"{m_odo.group(0)}\n"
+            f"{m_live_ms.group(0)}\n"
+            f"{m_cheat.group(0)}\n"
+            f"{m_meta.group(0)}\n"
+            f"{m_quip.group(0)}\n"
+            f"{m_fmt.group(0)}\n"
+            "mockBox.scrollHeight = 400;\n"
+            'appendTerminalLog("line 1\\nline 2", true, true);\n'
+            "handleTerminalUserScroll(mockBox);\n"
+            "const tailTop1 = mockBox.scrollTop;\n"
+            "mockBox.scrollHeight = 650;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3", true);\n'
+            "handleTerminalUserScroll(mockBox);\n"
+            "const tailTop2 = mockBox.scrollTop;\n"
+            "mockBox.scrollTop = 120;\n"
+            "handleTerminalUserScroll(mockBox);\n"
+            "const followAfterScrollUp = state.terminalFollowTail;\n"
+            "mockBox.scrollHeight = 900;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4", true);\n'
+            "const pinnedTopAfterAppend = mockBox.scrollTop;\n"
+            "_selActive = true;\n"
+            "mockBox.scrollHeight = 1100;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4\\nline 5", true);\n'
+            "const textDuringSel = mockBox.textContent;\n"
+            "_selActive = false;\n"
+            "if (_docListeners.selectionchange) _docListeners.selectionchange();\n"
+            "const textAfterClearSel = mockBox.textContent;\n"
+            "const pinnedTopAfterClearSel = mockBox.scrollTop;\n"
+            "mockBox.scrollTop = 1000;\n"
+            "handleTerminalUserScroll(mockBox);\n"
+            "const followAfterBottom = state.terminalFollowTail;\n"
+            "mockBox.scrollHeight = 1300;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4\\nline 5\\nline 6", true);\n'
+            "const tailTopResumed = mockBox.scrollTop;\n"
+            "for (const ch of 'RAINBOW') {\n"
+            "  handleStopwatchCheatKey({ key: ch, target: { tagName: 'INPUT' } });\n"
+            "}\n"
+            "const cheatFromInput = state.stopwatchCheatSlowMo;\n"
+            "handleStopwatchCheatKey({ key: 'Shift', target: { tagName: 'BODY' } });\n"
+            "for (const ch of 'RAINBOW') {\n"
+            "  handleStopwatchCheatKey({ key: ch, target: { tagName: 'BODY' } });\n"
+            "}\n"
+            "const cheatAfterRainbow = state.stopwatchCheatSlowMo;\n"
+            "const quipAfterRainbow = _lastFlashedQuip;\n"
+            "const slomoMsAfter10s = getEntryLiveMs({ status: 'running', startPerfMs: 1000, baseElapsedMs: 0, rate: getStopwatchRate() }, 11000);\n"
+            "for (const k of ['ArrowUp','ArrowUp','ArrowDown','ArrowDown','ArrowLeft','ArrowRight','ArrowLeft','ArrowRight','B','A']) {\n"
+            "  handleStopwatchCheatKey({ key: k, target: { tagName: 'BODY' } });\n"
+            "}\n"
+            "const cheatAfterKonamiToggleOff = state.stopwatchCheatSlowMo;\n"
+            "const odoMidCarry = computeStopwatchOdometerPositions(9.56);\n"
+            "const odoPreTen = computeStopwatchOdometerPositions(9.999999);\n"
+            "const odoAtTen = computeStopwatchOdometerPositions(10.0);\n"
+            "console.log(JSON.stringify({"
+            "labels: [0, 1, 2, 3].map(i => stageStopwatchMeta(i).label),"
+            "z: formatStopwatchParts(0).full,"
+            "s: formatStopwatchParts(55984).full,"
+            "m: formatStopwatchParts(125007).full,"
+            'qFast: getCompletionStopwatchQuip("reduce", "done", 3200),'
+            'qSolve: getCompletionStopwatchQuip("solve", "done", 55984),'
+            "tailTop1, tailTop2, followAfterScrollUp, pinnedTopAfterAppend,"
+            "hasLine5DuringSel: textDuringSel.includes('line 5'),"
+            "hasLine5AfterClear: textAfterClearSel.includes('line 5'),"
+            "pinnedTopAfterClearSel, followAfterBottom, tailTopResumed,"
+            "cheatFromInput, cheatAfterRainbow, quipAfterRainbow, slomoMsAfter10s,"
+            "cheatAfterKonamiToggleOff, odoMidCarry, odoPreTen, odoAtTen"
+            "}));\n"
+        )
+        res = subprocess.run(
+            ["node", "-e", eval_script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(res.stdout.strip())
+        assert out["labels"] == [
+            "1. REDUCE",
+            "2. SOLVE",
+            "3. INTEGRATE",
+            "4. MERGE",
+        ]
+        assert out["z"] == "00:00.000"
+        assert out["s"] == "00:55.984"
+        assert out["m"] == "02:05.007"
+        assert out["tailTop1"] == 300
+        assert out["tailTop2"] == 550
+        assert out["followAfterScrollUp"] is False
+        assert out["pinnedTopAfterAppend"] == 120
+        assert out["hasLine5DuringSel"] is False
+        assert out["hasLine5AfterClear"] is True
+        assert out["pinnedTopAfterClearSel"] == 120
+        assert out["followAfterBottom"] is True
+        assert out["tailTopResumed"] == 1200
+        assert out["cheatFromInput"] is False
+        assert 0.45 < out["odoMidCarry"][5] < 0.55
+        assert 9.45 < out["odoMidCarry"][6] < 9.55
+        assert abs(out["odoPreTen"][5] - out["odoAtTen"][5]) < 1e-4
+        assert abs(out["odoPreTen"][6] - 10.0) < 1e-4
+        assert out["odoAtTen"][6] == 0.0
+        if mode == "arcade":
+            assert out["cheatAfterRainbow"] is True
+            assert out["quipAfterRainbow"] == "SLO-MO CHEAT!"
+            assert abs(out["slomoMsAfter10s"] - 15.0) < 1e-6
+            assert out["cheatAfterKonamiToggleOff"] is False
+        else:
+            assert out["cheatAfterRainbow"] is False
+            assert abs(out["slomoMsAfter10s"] - 10000.0) < 1e-6
+        if mode == "arcade":
+            assert out["qFast"] == "SPEED BONUS!"
+            assert out["qSolve"] == "STAGE CLEAR!"
+        else:
+            assert out["qFast"] == ""
+            assert out["qSolve"] == ""
+
+    # Verify backend per-step millisecond timing lifecycle on NovaGalaxyPipelineRunner
+    runner = NovaGalaxyPipelineRunner()
+    t0 = time.time() - 55.984
+    runner.active_job = {
+        "job_id": "test-solve-1",
+        "stage_id": "solve",
+        "state": "running",
+        "started_at": t0,
+    }
+    snap_running = runner.get_step_timings_snapshot()
+    assert "solve" in snap_running
+    assert snap_running["solve"]["state"] == "running"
+    assert snap_running["solve"]["finished_at"] is None
+    assert snap_running["solve"]["elapsed_ms"] >= 55900
+
+    # Stamp exact finish time and verify frozen elapsed_ms persists when switching steps
+    runner.active_job["state"] = "ok"
+    runner.active_job["finished_at"] = t0 + 55.984
+    snap_done = runner.get_step_timings_snapshot()
+    assert snap_done["solve"]["state"] == "ok"
+    assert snap_done["solve"]["elapsed_ms"] == 55984
+
+    # Start next stage (integrate) and cancel it; both stages must remain in step_timings
+    t1 = time.time() - 3.215
+    runner.active_job = {
+        "job_id": "test-int-1",
+        "stage_id": "integrate",
+        "state": "running",
+        "started_at": t1,
+        "stdout": "",
+    }
+    runner.cancel_active_job("integrate")
+    snap_both = runner.get_step_timings_snapshot()
+    assert snap_both["solve"]["elapsed_ms"] == 55984
+    assert snap_both["integrate"]["state"] == "deleted"
+    assert snap_both["integrate"]["finished_at"] is not None
+    assert snap_both["integrate"]["elapsed_ms"] >= 3200

@@ -30,7 +30,7 @@ def apply_detector_calibration(hdf5_filename: str, instrument: str):
             print(f"Loading calibrated detector geometry from {hdf5_filename}...")
             calib_grp = f["detector_calibration"]
             count = 0
-            for bank_key in calib_grp.keys():
+            for bank_key in calib_grp:
                 bank_id = bank_key.replace("bank_", "")
                 if instrument in beamlines and bank_id in beamlines[instrument]:
                     beamlines[instrument][bank_id]["center"] = calib_grp[bank_key][
@@ -309,7 +309,7 @@ def run_index(
             from subhkl.instrument.detector import Detector
 
             if refine_detector:
-                all_physical_banks = [int(k) for k in beamlines[instrument_name].keys()]
+                all_physical_banks = [int(k) for k in beamlines[instrument_name]]
                 target_banks = (
                     refine_detector_banks
                     if refine_detector_banks
@@ -334,7 +334,13 @@ def run_index(
                         # Map to the true contiguous index
                         bank_to_idx[b_id] = len(valid_target_banks)
                         valid_target_banks.append(b_id)
-                    except Exception as e:
+                    except (
+                        KeyError,
+                        ValueError,
+                        TypeError,
+                        AttributeError,
+                        RuntimeError,
+                    ) as e:
                         print(f"WARNING: Could not load geometry for bank {b_id}: {e}")
 
                 # Overwrite target_banks so the rest of the script is perfectly aligned
@@ -448,9 +454,7 @@ def run_index(
             off_data = b_f.get("goniometer/offsets")
             if off_data is not None:
                 if isinstance(off_data, h5py.Group):
-                    opt.goniometer_offsets = {
-                        k: off_data[k][()] for k in off_data.keys()
-                    }
+                    opt.goniometer_offsets = {k: off_data[k][()] for k in off_data}
                 else:
                     opt.goniometer_offsets = off_data[()]
 
@@ -549,10 +553,11 @@ def run_index(
 
                 # 2. Check for single-frame tiled data from run_reduce
                 # If all columns are identical, collapse it back to a single angle.
-                if num_angles_provided > 1:
-                    if np.allclose(angles, angles[:, 0:1], atol=1e-7):
-                        angles = angles[:, 0:1]
-                        num_angles_provided = 1
+                if num_angles_provided > 1 and np.allclose(
+                    angles, angles[:, 0:1], atol=1e-7
+                ):
+                    angles = angles[:, 0:1]
+                    num_angles_provided = 1
 
                 # 3. Safely map angles to cover the highest requested physical index
                 if num_angles_provided == 1:
@@ -900,6 +905,8 @@ def run_index(
             with h5py.File(bootstrap_filename, "r") as b_f:
                 if "detector_calibration" in b_f:
                     b_f.copy("detector_calibration", f)
+                if "detector" in b_f and "detector" not in f:
+                    b_f.copy("detector", f)
 
         import json
 
@@ -1071,7 +1078,7 @@ def run_metrics(
     file2: str | None = None,
     instrument: str | None = None,
     d_min: float | None = None,
-    per_peak: bool = False,
+    per_peak_output: str | None = None,
     per_run: bool = False,
     ki_vec: list[float] | np.ndarray = None,
     csv_output: str | None = None,
@@ -1087,7 +1094,7 @@ def run_metrics(
         file2=file2,
         instrument=instrument,
         d_min=d_min,
-        per_peak=per_peak,
+        per_peak_output=per_peak_output,
         per_run=per_run,
         ki_vec_override=ki_vec,
         return_per_peak=csv_output is not None or plot_output is not None,
@@ -1301,6 +1308,20 @@ def run_peak_predictor(
             print(
                 f"Applying 3D per-run goniometer R from indexer ({R_all.shape[0]} frames)."
             )
+        em_mask_by_bank: dict[int, np.ndarray] = {}
+        em_class_by_bank: dict[int, np.ndarray] = {}
+        if "detector/pixel_mask" in f_idx and "detector/mask_bank_ids" in f_idx:
+            m_bids = np.asarray(f_idx["detector/mask_bank_ids"][()], dtype=int)
+            p_masks = np.asarray(f_idx["detector/pixel_mask"][()], dtype=np.uint8)
+            p_classes = (
+                np.asarray(f_idx["detector/pixel_class"][()], dtype=np.uint8)
+                if "detector/pixel_class" in f_idx
+                else None
+            )
+            for idx_m, bid_m in enumerate(m_bids):
+                em_mask_by_bank[int(bid_m)] = p_masks[idx_m] > 0
+                if p_classes is not None:
+                    em_class_by_bank[int(bid_m)] = p_classes[idx_m]
 
     # Pass the Base UB matrix. The predictor will apply dynamic R_gonio internally!
     UB = U @ B
@@ -1327,6 +1348,46 @@ def run_peak_predictor(
         frame_to_run=frame_to_run,
         harmonic_rot=harmonic_rot,
     )
+
+    if em_mask_by_bank:
+        n_rej_dark = 0
+        n_rej_bright = 0
+        n_rej_other = 0
+        filtered_map = {}
+        for img_key, (i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr) in results_map.items():
+            phys_bank = int(peaks.image.bank_mapping.get(img_key, img_key))
+            if phys_bank not in em_mask_by_bank or len(i_arr) == 0:
+                filtered_map[img_key] = (i_arr, j_arr, h_arr, k_arr, l_arr, wl_arr)
+                continue
+            valid_px = em_mask_by_bank[phys_bank]
+            n_r_px, n_c_px = valid_px.shape
+            ri = np.clip(np.round(i_arr).astype(int), 0, n_r_px - 1)
+            ci = np.clip(np.round(j_arr).astype(int), 0, n_c_px - 1)
+            keep = valid_px[ri, ci]
+            if not np.all(keep):
+                rej = ~keep
+                if phys_bank in em_class_by_bank:
+                    rej_cls = em_class_by_bank[phys_bank][ri[rej], ci[rej]]
+                    n_rej_dark += int(np.sum(rej_cls == 1))
+                    n_rej_bright += int(np.sum(rej_cls == 2))
+                    n_rej_other += int(np.sum((rej_cls != 1) & (rej_cls != 2)))
+                else:
+                    n_rej_other += int(np.sum(rej))
+            if np.any(keep):
+                filtered_map[img_key] = (
+                    i_arr[keep],
+                    j_arr[keep],
+                    h_arr[keep],
+                    k_arr[keep],
+                    l_arr[keep],
+                    wl_arr[keep],
+                )
+        n_rej_tot = n_rej_dark + n_rej_bright + n_rej_other
+        print(
+            f"Filtered {n_rej_tot} predicted peaks via detector/pixel_mask "
+            f"({n_rej_dark} dark/shadowed, {n_rej_bright} static-bright)."
+        )
+        results_map = filtered_map
 
     print(f"Saving predictions to {integration_peaks_filename}")
     with h5py.File(integration_peaks_filename, "w") as f:
@@ -1374,6 +1435,8 @@ def run_peak_predictor(
         with h5py.File(indexed_hdf5_filename, "r") as f_in:
             if "detector_calibration" in f_in:
                 f_in.copy("detector_calibration", f)
+            if "detector" in f_in:
+                f_in.copy("detector", f)
             if "goniometer/per_run" in f_in:
                 if "goniometer/per_run" in f:
                     del f["goniometer/per_run"]
@@ -1439,7 +1502,7 @@ def run_rbf_integrator(
             else None
         )
 
-        for key in f["banks"].keys():
+        for key in f["banks"]:
             img_idx = int(key)
             grp = f[f"banks/{key}"]
             peak_dict[img_idx] = [
@@ -1539,6 +1602,8 @@ def run_rbf_integrator(
             # coordinates belong to.
             if "detector_calibration" in f_in:
                 f_in.copy("detector_calibration", f)
+            if "detector" in f_in and "detector" not in f:
+                f_in.copy("detector", f)
             if "goniometer/per_run" in f_in:
                 if "goniometer/per_run" in f:
                     del f["goniometer/per_run"]
@@ -1548,7 +1613,7 @@ def run_rbf_integrator(
 def run_mtz_exporter(
     indexed_h5_filename: str,
     output_mtz_filename: str,
-    space_group: str = None,
+    space_group: str | None = None,
     predictions_file: str | None = None,
     corrections_file: str | None = None,
 ):
@@ -1699,7 +1764,7 @@ def run_merge_images(
             h5_files.extend(sorted(glob.glob(p)))
         h5_files = list(dict.fromkeys(h5_files))
     else:
-        h5_files = sorted(list(set(glob.glob(input_pattern))))
+        h5_files = sorted(set(glob.glob(input_pattern)))
 
     if not h5_files:
         raise ValueError(f"No files found matching: {input_pattern}")
@@ -2002,7 +2067,7 @@ def run_calibrate(
                 s.objective,
                 s.theta,
                 s.step_scale,
-                max(8, int(round(s.max_evals * evals_scale))),
+                max(8, round(s.max_evals * evals_scale)),
                 s.tol_deg,
                 s.width,
             )
@@ -2568,11 +2633,11 @@ def _ewald_device_factory(G_c, run_ids, R_runs, dets, exc_maps, ki_hat, wl, b2):
             i0 = i0.astype(jnp.int32)
             j0 = j0.astype(jnp.int32)
 
-            def gat(di, dj):
-                return Ej[ir][
-                    ib,
-                    jnp.clip(i0 + di, 0, H - 1),
-                    jnp.clip(j0 + dj, 0, Wd - 1),
+            def gat(di, dj, _ir=ir, _ib=ib, _i0=i0, _j0=j0):
+                return Ej[_ir][
+                    _ib,
+                    jnp.clip(_i0 + di, 0, H - 1),
+                    jnp.clip(_j0 + dj, 0, Wd - 1),
                 ]
 
             vals = (
@@ -2695,7 +2760,7 @@ def _corefine_candidates(
         if all(np.degrees(sph._quat_angle(r["R"], q["R"])) > 1.0 for q in distinct):
             distinct.append(r)
     results = distinct
-    bounds = dict(radial_bound=0.15, rot_bound_deg=3.5, trans_bound_m=0.02)
+    bounds = {"radial_bound": 0.15, "rot_bound_deg": 3.5, "trans_bound_m": 0.02}
     outs = []
     for r in results:
         o = sph.refine_band_geometry(
@@ -2920,6 +2985,13 @@ def run_spherical_index(
     L = 96: single stills z 10 -> 16 with rank 0 in every run (the 2D
     nodal default ranks 3-8 per still), 21 runs pooled z 17.3 -> 25.9.
     """
+    # Persistent XLA compilation cache: profiling showed 6.5 s of a 29 s
+    # CLI invocation compiling the same matching-free refinement kernels
+    # every run.  The cache is keyed by compiler fingerprint, so a jax
+    # upgrade simply misses once and refills.
+    import contextlib
+    import os
+
     from subhkl.config import beamlines
     from subhkl.core.crystallography import (
         cartesian_matrix_metric_tensor,
@@ -2928,13 +3000,7 @@ def run_spherical_index(
     from subhkl.instrument.detector import Detector
     from subhkl.search import spherical as sph
 
-    # Persistent XLA compilation cache: profiling showed 6.5 s of a 29 s
-    # CLI invocation compiling the same matching-free refinement kernels
-    # every run.  The cache is keyed by compiler fingerprint, so a jax
-    # upgrade simply misses once and refills.
-    try:
-        import os
-
+    with contextlib.suppress(ImportError, AttributeError, RuntimeError, OSError):
         import jax
 
         if jax.config.jax_compilation_cache_dir is None:
@@ -2946,8 +3012,6 @@ def run_spherical_index(
                     "jax",
                 ),
             )
-    except Exception:
-        pass
 
     with h5py.File(peaks_h5_filename, "r") as fp:
         bank = fp["bank"][()]
@@ -3003,7 +3067,7 @@ def run_spherical_index(
         if Rg is not None and Rg.shape[0] == len(keep):
             Rg = Rg[keep]
         run = run[keep]
-        print(f"spherical-index: restricted to runs {sorted(set(int(r) for r in run))}")
+        print(f"spherical-index: restricted to runs {sorted({int(r) for r in run})}")
 
     # A calibration already in the peaks file -- from a previous solve on
     # either path -- must reach the search, the refinement's starting point
@@ -3495,6 +3559,7 @@ def run_spherical_index(
                 [all_pc[top_]],
                 [all_R[top_]],
             )
+            del all_bk, all_pr, all_pc, all_R, top_
             ladder = sph.lattice_ladder(
                 spot_d,
                 spot_w,
@@ -3507,6 +3572,8 @@ def run_spherical_index(
                 table_weights=all_w,
                 table_sin_theta=all_s,
             )
+            n_live_bins = len(all_d)
+            del all_d, all_w, all_s
             results = [
                 {
                     "R": R_,
@@ -3519,7 +3586,7 @@ def run_spherical_index(
                 for R_, s_, z_ in ladder
             ]
             print(
-                f"spherical-index: direct-lattice ladder on {len(all_d):,} live "
+                f"spherical-index: direct-lattice ladder on {n_live_bins:,} live "
                 f"bins (exhaustive rung), {len(spot_d):,} strongest for the zoom "
                 "rungs; final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
             )
@@ -3758,7 +3825,7 @@ def run_spherical_index(
 
             if _dev is not None:
                 _score_np, _polish_dev = _dev
-                ewald_score = lambda Umat: float(_score_np(Umat)[0])  # noqa: E731
+                ewald_score = lambda Umat: float(_score_np(Umat)[0])
                 ewald_polish = _polish_dev
                 print("spherical-index: exact Ewald stage on the device (flat panels)")
             rng_ = np.random.default_rng(0)
@@ -4042,20 +4109,19 @@ def run_spherical_index(
                 gonio_in["harmonics_axis"] = _axis_indices([refine_gonio_harmonics])[0]
                 gonio_in["harmonics_orders"] = list(gonio_harmonics_orders or [1])
                 gonio_in["harmonics_bound_deg"] = gonio_harmonics_bound_deg
-        elif run is not None:
+        elif run is not None and angles_by_run:
             # rotate data into the sample frame beforehand is not possible
             # through refine_instrument without gonio; fold the nominal
             # rotation into the offsets machinery by passing angles with an
             # all-False mask
-            if angles_by_run:
-                run_pos = {r_: i for i, r_ in enumerate(run_list)}
-                peaks_in["run_idx"] = np.array([run_pos[int(r_)] for r_ in run_r])
-                gonio_in = {
-                    "axes": np.asarray(g_axes, dtype=float),
-                    "angles_deg": np.stack([angles_by_run[r_] for r_ in run_list]),
-                    "refine_mask": np.zeros(len(g_axes), bool),
-                    "bound_deg": gonio_bound_deg,
-                }
+            run_pos = {r_: i for i, r_ in enumerate(run_list)}
+            peaks_in["run_idx"] = np.array([run_pos[int(r_)] for r_ in run_r])
+            gonio_in = {
+                "axes": np.asarray(g_axes, dtype=float),
+                "angles_deg": np.stack([angles_by_run[r_] for r_ in run_list]),
+                "refine_mask": np.zeros(len(g_axes), bool),
+                "bound_deg": gonio_bound_deg,
+            }
         modes_r = tuple(detector_modes) if detector_modes else ("independent",)
         # the cylinder modes scale panel centers about an axis; the classic
         # path defaults it to the vertical, so mirror that here (with the
@@ -4134,8 +4200,10 @@ def run_spherical_index(
         slices_r, _ = detector_mode_slices(modes_r, nb_)
         det_report = {"banks": banks_r, "det_params": dp, "modes": list(modes_r)}
         msg = [
-            f"  instrument refinement ({','.join(modes_r)}): "
-            f"loglik {out_ref['loglik']:.3f}"
+            (
+                f"  instrument refinement ({','.join(modes_r)}): "
+                f"loglik {out_ref['loglik']:.3f}"
+            )
         ]
         if "independent" in slices_r:
             ip = dp[slices_r["independent"]]

@@ -86,10 +86,31 @@ no 2 pi).
 
 from __future__ import annotations
 
-from functools import partial
+import itertools
+import operator
+from functools import partial, reduce
 
 import numpy as np
 from scipy.special import gammaln
+
+
+def enable_jax_compilation_cache():
+    """Persist XLA compilations across CLI runs under ~/.cache/subhkl/jax."""
+    import contextlib
+    import os
+
+    with contextlib.suppress(ImportError, AttributeError, RuntimeError, OSError):
+        import jax
+
+        if jax.config.jax_compilation_cache_dir is None:
+            jax.config.update(
+                "jax_compilation_cache_dir",
+                os.path.join(
+                    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+                    "subhkl",
+                    "jax",
+                ),
+            )
 
 
 def _precise(fn):
@@ -111,6 +132,7 @@ def _precise(fn):
     def wrapper(*args, **kwargs):
         import jax
 
+        enable_jax_compilation_cache()
         with jax.default_matmul_precision("highest"):
             return fn(*args, **kwargs)
 
@@ -405,7 +427,7 @@ def band_masks(g0, sin_edges, wavelength_band, d_min, n_sub=7):
     lam_lo, lam_hi = float(wavelength_band[0]), float(wavelength_band[1])
     gmax = 1.0 / float(d_min)
     masks = []
-    for lo, hi in zip(sin_edges[:-1], sin_edges[1:]):
+    for lo, hi in itertools.pairwise(sin_edges):
         m = np.zeros(len(g0), dtype=bool)
         for s in np.linspace(lo, hi, n_sub)[1:]:
             q_lo, q_hi = 2.0 * s / lam_hi, min(2.0 * s / lam_lo, gmax)
@@ -808,7 +830,7 @@ def nearest_line_stats(
             jnp.zeros(n, dtype=jnp.float32),
             jnp.int32(0),
         )
-        (best, arg, dens, _), _ = lax.scan(body, init, (D_r, v_r))
+        (_best, arg, dens, _), _ = lax.scan(body, init, (D_r, v_r))
         return arg, dens
 
     arg, dens = run(Pj, D_r, v_r)
@@ -1274,6 +1296,7 @@ def _lattice_kernels():
     inside a function is rebuilt -- and recompiled -- on every call)."""
     if _LATTICE_JITS:
         return _LATTICE_JITS
+    enable_jax_compilation_cache()
     import jax
     import jax.numpy as jnp
 
@@ -1325,13 +1348,24 @@ def _lattice_kernels():
             valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
         )
 
+    def band_dots(Pc, Dj):
+        return jnp.matmul(Pc, Dj.T, precision=jax.lax.Precision.HIGHEST)
+
+    def band_zone_col(u, xz, wj, qlo_r, qhi_r):
+        return jnp.matmul(
+            band_phase(xz * u, qlo_r, qhi_r),
+            wj,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+
     def band_chunk(Pc, xl, Dj, wj, qlo, qhi):
         """Table cell values: [poles, zone lengths]."""
-        u = Pc @ Dj.T
-        t = xl[None, :, None] * u[:, None, :]
-        return (
-            band_phase(t, qlo[None, None, :], qhi[None, None, :]) * wj[None, None, :]
-        ).sum(-1)
+        u = band_dots(Pc, Dj)
+        qlo_r, qhi_r = qlo[None, :], qhi[None, :]
+        return jnp.stack(
+            [band_zone_col(u, xl[iz], wj, qlo_r, qhi_r) for iz in range(xl.shape[0])],
+            axis=1,
+        )
 
     def score_band(Rs, Zj, xl, wz, Dj, wj, qlo, qhi):
         Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
@@ -1345,6 +1379,46 @@ def _lattice_kernels():
         vals = tab[jnp.arange(tab.shape[0])[None, :], idx]
         return (vals * wz[None, :]).sum(1)
 
+    def score_band_table_env(Rs, Zj, wz, tab, off, nph, nth, alpha_rad):
+        """Per-zone spherical-cap max-envelope lookup over radius ``alpha_rad``.
+
+        Bridges narrow high-order Laue carrier lobes (``1 / (2 |x| q_cut)``,
+        e.g. ~0.3 deg at 100 A) across coarse SO(3) grid steps AND non-rigid
+        uncalibrated detector scissor distortions between zones.
+        """
+        P0 = jnp.einsum("nij,kj->nki", Rs, Zj)
+        P0 = P0 / jnp.maximum(jnp.linalg.norm(P0, axis=-1, keepdims=True), 1e-12)
+        up = jnp.where(
+            jnp.abs(P0[..., 2:3]) < 0.9,
+            jnp.array([0.0, 0.0, 1.0], jnp.float32),
+            jnp.array([1.0, 0.0, 0.0], jnp.float32),
+        )
+        e1 = jnp.cross(up, P0)
+        e1 = e1 / jnp.maximum(jnp.linalg.norm(e1, axis=-1, keepdims=True), 1e-12)
+        e2 = jnp.cross(P0, e1)
+        s2 = jnp.float32(1.0 / np.sqrt(2.0))
+        dirs2d = (
+            (1.0, 0.0),
+            (-1.0, 0.0),
+            (0.0, 1.0),
+            (0.0, -1.0),
+            (s2, s2),
+            (s2, -s2),
+            (-s2, s2),
+            (-s2, -s2),
+        )
+        pts = [P0]
+        for r_scale in (0.45, 0.95):
+            cr = jnp.cos(r_scale * alpha_rad)
+            sr = jnp.sin(r_scale * alpha_rad)
+            for dx, dy in dirs2d:
+                pts.append(cr * P0 + sr * (dx * e1 + dy * e2))
+        P_all = jnp.stack(pts, axis=0)  # [17, B, K, 3]
+        idx = _funk_lookup(P_all, off, nph, nth)
+        k_idx = jnp.arange(tab.shape[0], dtype=jnp.int32)[None, None, :]
+        vals = jnp.max(tab[k_idx, idx], axis=0)
+        return (vals * wz[None, :]).sum(1)
+
     def score_exact(Rs, Zj, wz, Dj, wj, thr):
         Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
         on = jnp.abs(jnp.einsum("nki,mi->nkm", Zl, Dj)) < thr
@@ -1354,15 +1428,29 @@ def _lattice_kernels():
         Zl = jnp.einsum("nij,kj->nki", Rs, Zj)
         return (tab[_funk_lookup(Zl, off, nph, nth)] * wz[None, :]).sum(1)
 
-    def zoom_b(Uc, dR, *score_args):
+    def zoom_b_exact(Uc, dR, *score_args):
         Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
         n = Uc.shape[0]
         flat = Rs_.reshape(-1, 3, 3)
-        s_ = (
-            score_band_table(flat, *score_args)
-            if len(score_args) == 6
-            else score_band(flat, *score_args)
-        ).reshape(n, -1)
+        s_ = score_band(flat, *score_args).reshape(n, -1)
+        k = jnp.argmax(s_, axis=1)
+        idx = jnp.arange(n)
+        return s_[idx, k], Rs_[idx, k]
+
+    def zoom_b_table(Uc, dR, *score_args):
+        Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
+        n = Uc.shape[0]
+        flat = Rs_.reshape(-1, 3, 3)
+        s_ = score_band_table(flat, *score_args).reshape(n, -1)
+        k = jnp.argmax(s_, axis=1)
+        idx = jnp.arange(n)
+        return s_[idx, k], Rs_[idx, k]
+
+    def zoom_b_table_env(Uc, dR, *score_args):
+        Rs_ = jnp.einsum("zij,bjk->bzik", dR, Uc)
+        n = Uc.shape[0]
+        flat = Rs_.reshape(-1, 3, 3)
+        s_ = score_band_table_env(flat, *score_args).reshape(n, -1)
         k = jnp.argmax(s_, axis=1)
         idx = jnp.arange(n)
         return s_[idx, k], Rs_[idx, k]
@@ -1383,11 +1471,15 @@ def _lattice_kernels():
     _LATTICE_JITS.update(
         euler_zyz=jax.jit(euler_zyz),
         funk_chunk=jax.jit(funk_chunk),
+        band_dots=jax.jit(band_dots),
+        band_zone_col=jax.jit(band_zone_col),
         band_chunk=jax.jit(band_chunk),
         score_band=jax.jit(score_band),
         score_band_table=jax.jit(score_band_table, static_argnums=(6,)),
-        zoom_band=jax.jit(zoom_b),
-        zoom_band_table=jax.jit(zoom_b, static_argnums=(8,)),
+        score_band_table_env=jax.jit(score_band_table_env, static_argnums=(6,)),
+        zoom_band=jax.jit(zoom_b_exact),
+        zoom_band_table=jax.jit(zoom_b_table, static_argnums=(7,)),
+        zoom_band_table_env=jax.jit(zoom_b_table_env, static_argnums=(7,)),
         score_exact=jax.jit(score_exact),
         score_table=jax.jit(score_table, static_argnums=(6,)),
         zoom_table=jax.jit(zoom, static_argnums=(8,)),
@@ -1473,34 +1565,436 @@ def band_table(dirs, weights, q_lo, q_hi, lengths, spacing_deg):
 
     D = np.asarray(dirs, np.float32)
     w = np.asarray(weights, np.float32)
+    qlo_np = np.asarray(q_lo, np.float32)
+    qhi_np = np.asarray(q_hi, np.float32)
     nth = int(np.ceil(180.0 / spacing_deg))
     th = (np.arange(nth) + 0.5) * np.pi / nth
     nph = np.maximum(1, np.ceil(360.0 * np.sin(th) / spacing_deg)).astype(int)
     off = np.concatenate([[0], np.cumsum(nph)])
+    act = (w != 0.0) & (qhi_np > qlo_np + 1e-7)
+    if not np.any(act):
+        return (
+            jnp.zeros((len(lengths), int(off[-1])), dtype=jnp.float32),
+            jnp.asarray(off[:-1]),
+            jnp.asarray(nph),
+            int(nth),
+        )
+    if not np.all(act):
+        D = D[act]
+        w = w[act]
+        qlo_np = qlo_np[act]
+        qhi_np = qhi_np[act]
+    xl_np = np.asarray(lengths, np.float32)
+    n_zones_orig = len(xl_np)
+    # Coalesce dense subpixel clouds (>65,536 active bins, e.g. 1.2M raw
+    # binning=4 pixels in spherical-index) onto a fine S^2 x (q_lo, q_hi)
+    # quadrature grid (>=18 samples per shortest Laue phase cycle), preserving
+    # signed excess sums to <0.1% while avoiding redundant 10^11-element sweeps.
+    if len(D) > 65536 and n_zones_orig > 0:
+        x_max = float(np.max(xl_np))
+        q_max = float(np.max(qhi_np))
+        deg_cycle = float(np.degrees(1.0 / max(x_max * q_max, 1e-6)))
+        cell_deg = max(min(deg_cycle / 18.0, 0.25 * float(spacing_deg), 0.30), 0.04)
+        nth_c = max(8, int(np.ceil(180.0 / cell_deg)))
+        th_c = np.arccos(np.clip(D[:, 2], -1.0, 1.0))
+        ph_c = np.mod(np.arctan2(D[:, 1], D[:, 0]), 2.0 * np.pi)
+        it_c = np.clip((th_c * (nth_c / np.pi)).astype(np.int64), 0, nth_c - 1)
+        nph_c = np.maximum(
+            1, np.ceil(360.0 * np.sin((it_c + 0.5) * np.pi / nth_c) / cell_deg)
+        ).astype(np.int64)
+        ip_c = np.clip((ph_c * (nph_c / (2.0 * np.pi))).astype(np.int64), 0, nph_c - 1)
+        q_step = max(q_max / 64.0, 1e-4)
+        iq0 = np.round(qlo_np / q_step).astype(np.int64)
+        iq1 = np.round(qhi_np / q_step).astype(np.int64)
+        nph_max = int(np.max(nph_c)) + 1
+        keys_c = ((it_c * nph_max + ip_c) * 128 + iq0) * 128 + iq1
+        order_c = np.argsort(keys_c)
+        _, idx_s, cnt_c = np.unique(
+            keys_c[order_c], return_index=True, return_counts=True
+        )
+        if len(idx_s) < int(0.8 * len(D)):
+            w_agg = np.add.reduceat(w[order_c], idx_s).astype(np.float32)
+            inv_c = (1.0 / cnt_c).astype(np.float32)
+            D_agg = (
+                np.add.reduceat(D[order_c], idx_s, axis=0) * inv_c[:, None]
+            ).astype(np.float32)
+            D_agg /= np.maximum(np.linalg.norm(D_agg, axis=1, keepdims=True), 1e-12)
+            qlo_agg = (np.add.reduceat(qlo_np[order_c], idx_s) * inv_c).astype(
+                np.float32
+            )
+            qhi_agg = (np.add.reduceat(qhi_np[order_c], idx_s) * inv_c).astype(
+                np.float32
+            )
+            keep_c = w_agg != 0.0
+            D = D_agg[keep_c]
+            w = w_agg[keep_c]
+            qlo_np = qlo_agg[keep_c]
+            qhi_np = qhi_agg[keep_c]
+    # Fixed 2D [ch=2048, spot_block<=16384] dot + scalar-xz zone reductions
+    # cap working buffers at 128 MB on 16 GB CPU CI runners, avoid XLA GPU 3D
+    # input_reduce_fusion stalls and XLA CPU single-threaded while loops, and
+    # compile once for all zone counts.
+    s_tile = 16384
+    s_bucket = 2048 if len(D) <= s_tile else s_tile
+    pad_d = (-len(D)) % s_bucket
+    if pad_d:
+        d_dummy = np.broadcast_to(
+            np.array([[1.0, 0.0, 0.0]], dtype=np.float32), (pad_d, 3)
+        )
+        D = np.concatenate([D, d_dummy], axis=0)
+        w = np.pad(w, (0, pad_d))
+        qlo_np = np.pad(qlo_np, (0, pad_d))
+        qhi_np = np.pad(qhi_np, (0, pad_d))
+    spot_block = min(len(D), s_tile)
+    if n_zones_orig == 0:
+        return (
+            jnp.zeros((0, int(off[-1])), dtype=jnp.float32),
+            jnp.asarray(off[:-1]),
+            jnp.asarray(nph),
+            int(nth),
+        )
     it = np.repeat(np.arange(nth), nph)
     ph = (np.arange(off[-1]) - np.repeat(off[:-1], nph) + 0.5) * (2 * np.pi / nph[it])
     st, ct = np.sin(th[it]), np.cos(th[it])
     P = np.stack([st * np.cos(ph), st * np.sin(ph), ct], 1).astype(np.float32)
-    kern = _lattice_kernels()["band_chunk"]
-    xl = jnp.asarray(np.asarray(lengths, np.float32))
-    Dj, wj = jnp.asarray(D), jnp.asarray(w)
-    qlo, qhi = (
-        jnp.asarray(np.asarray(q_lo, np.float32)),
-        jnp.asarray(np.asarray(q_hi, np.float32)),
-    )
-    ch = int(max(64, 5e8 // max(len(D) * len(lengths), 1)))
-    table = np.concatenate(
-        [
-            np.asarray(kern(jnp.asarray(P[i : i + ch]), xl, Dj, wj, qlo, qhi))
-            for i in range(0, len(P), ch)
-        ]
-    )
+    n_poles = len(P)
+    ch = 2048
+    pad_p = (-n_poles) % ch
+    if pad_p:
+        P_pad = np.concatenate([P, np.repeat(P[:1], pad_p, axis=0)], axis=0)
+    else:
+        P_pad = P
+    jits = _lattice_kernels()
+    dots_k = jits["band_dots"]
+    zcol_k = jits["band_zone_col"]
+    Pj = jnp.asarray(P_pad)
+    xl_scalars = [jnp.asarray(x, dtype=jnp.float32) for x in xl_np]
+    table_full = None
+    for s0 in range(0, len(D), spot_block):
+        s1 = s0 + spot_block
+        Dj = jnp.asarray(D[s0:s1])
+        wj = jnp.asarray(w[s0:s1])
+        qlo_r = jnp.asarray(qlo_np[s0:s1])[None, :]
+        qhi_r = jnp.asarray(qhi_np[s0:s1])[None, :]
+        rows = []
+        for i in range(0, len(P_pad), ch):
+            u = dots_k(Pj[i : i + ch], Dj)
+            rows.append(
+                jnp.stack(
+                    [zcol_k(u, xz, wj, qlo_r, qhi_r) for xz in xl_scalars], axis=1
+                )
+            )
+        part = jnp.concatenate(rows, axis=0) if len(rows) > 1 else rows[0]
+        table_full = part if table_full is None else (table_full + part)
+    table_t = table_full[:n_poles].T
     return (
-        jnp.asarray(table.T.copy()),  # [zone lengths, poles]
+        table_t,  # [zone lengths, poles]
         jnp.asarray(off[:-1]),
         jnp.asarray(nph),
         int(nth),
     )
+
+
+def laue_order_stencil(B, wavelength, d_min, orders=(-1, 0, 1)):
+    """Deterministic crystal-frame rotations stepping by integer Laue orders.
+
+    Rotating around primitive direct-cell axis ``a_i / |a_i|`` leaves ``a_i``
+    fixed and sweeps the transverse axes ``a_j (j != i)`` with perpendicular
+    lever arm ``max_{j != i} |(a_i / |a_i|) x a_j|``, advancing their Laue
+    order ``q * (a_j . d) = m`` by ``Delta m = 1`` per step ``1 / (lever_i * q_cut)``
+    at the dominant resolution carrier ``q_cut = 0.5 * (1 + wl_min / wl_max) / d_min``.
+    Returns ``[N, 3, 3]`` crystal-frame rotation matrices ``dU`` (applied as
+    ``U @ dU``) with the identity ``(0, 0, 0)`` placed first.
+    """
+    from scipy.spatial.transform import Rotation as Rot
+
+    A_cell = np.linalg.inv(np.asarray(B, np.float64))
+    a_lens = np.maximum(np.linalg.norm(A_cell, axis=1), 1e-9)
+    a_dirs = A_cell / a_lens[:, None]
+    lever = np.array(
+        [
+            max(
+                float(np.linalg.norm(np.cross(a_dirs[i], A_cell[j])))
+                for j in range(3)
+                if j != i
+            )
+            for i in range(3)
+        ],
+        dtype=np.float64,
+    )
+    lever = np.where(lever > 1e-9, lever, a_lens)
+    wl_lo, wl_hi = float(wavelength[0]), float(wavelength[1])
+    q_cut = max(0.5 * (1.0 + wl_lo / max(wl_hi, 1e-9)) / max(float(d_min), 1e-9), 1e-6)
+    dtheta = np.minimum(1.0 / (lever * q_cut), np.deg2rad(6.0))
+    ords = [int(m) for m in orders]
+    dm_grid = np.array(np.meshgrid(ords, ords, ords, indexing="ij")).reshape(3, -1).T
+    norms = np.sum(np.abs(dm_grid), axis=1)
+    dm_grid = dm_grid[np.argsort(norms, kind="stable")]
+    rvs = (
+        dm_grid[:, 0:1] * dtheta[0] * a_dirs[0:1]
+        + dm_grid[:, 1:2] * dtheta[1] * a_dirs[1:2]
+        + dm_grid[:, 2:3] * dtheta[2] * a_dirs[2:3]
+    )
+    return Rot.from_rotvec(rvs).as_matrix()
+
+
+_BAND_GEOM_JITS = {}
+
+
+def _band_geom_kernels():
+    """Module-level compiled kernels for ``refine_band_geometry``.
+
+    Passing ``(C, O, R, w, X, wz, ...)`` as traced array arguments rather than
+    capturing them inside per-call closures avoids baking ``16384 x 3 x 3`` HLO
+    constants and eliminates ~45s of fresh XLA compilation per call.
+    """
+    if _BAND_GEOM_JITS:
+        return _BAND_GEOM_JITS
+    enable_jax_compilation_cache()
+    import jax
+    import jax.numpy as jnp
+
+    def _rodrigues_f32(rv3):
+        sq = jnp.sum(rv3 * rv3)
+        big = sq > jnp.float32(1e-8)
+        th_safe = jnp.sqrt(jnp.where(big, sq, jnp.float32(1.0)))
+        sq_safe = jnp.where(big, sq, jnp.float32(1.0))
+        c1 = jnp.where(
+            big,
+            jnp.sin(th_safe) / th_safe,
+            jnp.float32(1.0) - sq / jnp.float32(6.0),
+        )
+        c2 = jnp.where(
+            big,
+            (jnp.float32(1.0) - jnp.cos(th_safe)) / sq_safe,
+            jnp.float32(0.5) - sq / jnp.float32(24.0),
+        )
+        rx, ry, rz = rv3[0], rv3[1], rv3[2]
+        z0 = jnp.float32(0.0)
+        K_m = jnp.array(
+            [[z0, -rz, ry], [rz, z0, -rx], [-ry, rx, z0]], dtype=jnp.float32
+        )
+        return jnp.eye(3, dtype=jnp.float32) + c1 * K_m + c2 * (K_m @ K_m)
+
+    def _eval_f64(
+        u_vec,
+        U_base,
+        C_in,
+        O_in,
+        R_in,
+        w_in,
+        X_in,
+        wz_in,
+        p_units_j,
+        kij,
+        rot_proj_j,
+        lam_lo,
+        lam_hi,
+        gmax,
+        reg_w,
+        cyl_flag,
+    ):
+        p = u_vec * p_units_j
+        rv, s_rad = p[:3], p[3]
+        s_ax = jnp.where(cyl_flag > 0.5, p[4], s_rad)
+        rg = rot_proj_j @ p[5:8]
+        T = p[8:11]
+        Rg = _rodrigues_jax(rg)
+        C_sc = jnp.stack(
+            [
+                C_in[:, 0] * (1.0 + s_rad),
+                C_in[:, 1] * (1.0 + s_ax),
+                C_in[:, 2] * (1.0 + s_rad),
+            ],
+            axis=-1,
+        )
+        xyz = (C_sc + O_in) @ Rg.T + T[None, :]
+        kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
+        g = kf - kij[None, :]
+        d_lab = g / jnp.linalg.norm(g, axis=1, keepdims=True)
+        s_ = -(d_lab @ kij)
+        q_lo = 2.0 * s_ / lam_hi
+        q_hi = jnp.maximum(jnp.minimum(2.0 * s_ / lam_lo, gmax), q_lo)
+        d = jnp.einsum("nji,nj->ni", R_in, d_lab)
+        Rm = _rodrigues_jax(rv) @ U_base
+        t = (X_in @ Rm.T) @ d.T
+        two_pi = 2.0 * jnp.pi
+        valid = (q_hi > q_lo)[None, :]
+        hi_safe = jnp.where(q_hi > q_lo, q_hi, q_lo + 1.0)[None, :]
+        den = two_pi * (hi_safe - q_lo[None, :]) * t
+        ok = jnp.abs(den) > 1e-7
+        num = jnp.sin(two_pi * hi_safe * t) - jnp.sin(two_pi * q_lo[None, :] * t)
+        envelope = jnp.tanh(
+            (hi_safe - q_lo[None, :]) / jnp.maximum(0.02 * q_lo[None, :], 1e-6)
+        )
+        K = jnp.where(
+            valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
+        )
+        score = jnp.einsum("km,k,m->", K, wz_in, w_in)
+        reg = reg_w * (
+            (s_rad / 0.08) ** 2
+            + cyl_flag * ((s_ax / 0.08) ** 2 + ((s_rad - s_ax) / 0.025) ** 2)
+            + jnp.sum((rg / np.deg2rad(2.0)) ** 2)
+            + jnp.sum((T / 0.015) ** 2)
+        )
+        return -score + reg, score
+
+    def _eval_f32(
+        u_vec,
+        U_base,
+        C_in,
+        O_in,
+        R_in,
+        w_in,
+        X_in,
+        wz_in,
+        p_units_f32,
+        kij_f32,
+        rot_proj_f32,
+        lam_lo_f32,
+        lam_hi_f32,
+        gmax_f32,
+        reg_w_f32,
+        cyl_flag_f32,
+    ):
+        p = u_vec * p_units_f32
+        rv, s_rad = p[:3], p[3]
+        s_ax = jnp.where(cyl_flag_f32 > jnp.float32(0.5), p[4], s_rad)
+        rg = jnp.matmul(rot_proj_f32, p[5:8], precision=jax.lax.Precision.HIGHEST)
+        T = p[8:11]
+        Rg_m = _rodrigues_f32(rg)
+        C_sc = jnp.stack(
+            [
+                C_in[:, 0] * (jnp.float32(1.0) + s_rad),
+                C_in[:, 1] * (jnp.float32(1.0) + s_ax),
+                C_in[:, 2] * (jnp.float32(1.0) + s_rad),
+            ],
+            axis=-1,
+        )
+        xyz = (
+            jnp.matmul(C_sc + O_in, Rg_m.T, precision=jax.lax.Precision.HIGHEST)
+            + T[None, :]
+        )
+        kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
+        g = kf - kij_f32[None, :]
+        d_lab = g / jnp.linalg.norm(g, axis=1, keepdims=True)
+        s_ = -jnp.matmul(d_lab, kij_f32, precision=jax.lax.Precision.HIGHEST)
+        q_lo = (jnp.float32(2.0) / lam_hi_f32) * s_
+        q_hi = jnp.maximum(
+            jnp.minimum((jnp.float32(2.0) / lam_lo_f32) * s_, gmax_f32), q_lo
+        )
+        d = jnp.einsum("nji,nj->ni", R_in, d_lab, precision=jax.lax.Precision.HIGHEST)
+        Rm = jnp.matmul(_rodrigues_f32(rv), U_base, precision=jax.lax.Precision.HIGHEST)
+        t = jnp.matmul(
+            jnp.matmul(X_in, Rm.T, precision=jax.lax.Precision.HIGHEST),
+            d.T,
+            precision=jax.lax.Precision.HIGHEST,
+        )
+        two_pi = jnp.float32(2.0 * np.pi)
+        valid = (q_hi > q_lo)[None, :]
+        hi_safe = jnp.where(q_hi > q_lo, q_hi, q_lo + jnp.float32(1.0))[None, :]
+        den = two_pi * (hi_safe - q_lo[None, :]) * t
+        ok = jnp.abs(den) > jnp.float32(1e-5)
+        num = jnp.sin(two_pi * hi_safe * t) - jnp.sin(two_pi * q_lo[None, :] * t)
+        envelope = jnp.tanh(
+            (hi_safe - q_lo[None, :])
+            / jnp.maximum(jnp.float32(0.02) * q_lo[None, :], jnp.float32(1e-6))
+        )
+        K = jnp.where(
+            valid,
+            envelope
+            * jnp.where(
+                ok, num / jnp.where(ok, den, jnp.float32(1.0)), jnp.float32(1.0)
+            ),
+            jnp.float32(0.0),
+        )
+        score = jnp.einsum(
+            "km,k,m->", K, wz_in, w_in, precision=jax.lax.Precision.HIGHEST
+        )
+        reg = reg_w_f32 * (
+            (s_rad / jnp.float32(0.08)) ** 2
+            + cyl_flag_f32
+            * (
+                (s_ax / jnp.float32(0.08)) ** 2
+                + ((s_rad - s_ax) / jnp.float32(0.025)) ** 2
+            )
+            + jnp.sum((rg / jnp.float32(np.deg2rad(2.0))) ** 2)
+            + jnp.sum((T / jnp.float32(0.015)) ** 2)
+        )
+        return -score + reg, score
+
+    vg_b_f32 = jax.vmap(
+        jax.value_and_grad(_eval_f32, argnums=0, has_aux=True),
+        in_axes=(0, 0) + (None,) * 14,
+    )
+
+    @jax.jit
+    def adam_stage_f32(
+        uj,
+        U_b,
+        C_in,
+        O_in,
+        R_in,
+        w_in,
+        X_in,
+        wz_in,
+        p_units_f32,
+        kij_f32,
+        rot_proj_f32,
+        u_lo_f32,
+        u_hi_f32,
+        lam_lo_f32,
+        lam_hi_f32,
+        gmax_f32,
+        reg_w_f32,
+        cyl_flag_f32,
+        lr_f,
+        n_steps,
+    ):
+        shared = (
+            C_in,
+            O_in,
+            R_in,
+            w_in,
+            X_in,
+            wz_in,
+            p_units_f32,
+            kij_f32,
+            rot_proj_f32,
+            lam_lo_f32,
+            lam_hi_f32,
+            gmax_f32,
+            reg_w_f32,
+            cyl_flag_f32,
+        )
+        m = jnp.zeros_like(uj)
+        v = jnp.zeros_like(uj)
+
+        def body(i, carry):
+            u_c, m_c, v_c = carry
+            (_, _), g = vg_b_f32(u_c, U_b, *shared)
+            t = (i + 1).astype(jnp.float32)
+            m_c = jnp.float32(0.9) * m_c + jnp.float32(0.1) * g
+            v_c = jnp.float32(0.999) * v_c + jnp.float32(0.001) * (g * g)
+            mh = m_c / (jnp.float32(1.0) - jnp.float32(0.9) ** t)
+            vh = v_c / (jnp.float32(1.0) - jnp.float32(0.999) ** t)
+            u_c = jnp.clip(
+                u_c - lr_f * mh / (jnp.sqrt(vh) + jnp.float32(1e-7)),
+                u_lo_f32,
+                u_hi_f32,
+            )
+            return u_c, m_c, v_c
+
+        u_f, _, _ = jax.lax.fori_loop(0, n_steps, body, (uj, m, v))
+        (lf, sf), _ = vg_b_f32(u_f, U_b, *shared)
+        return u_f, sf, lf
+
+    _BAND_GEOM_JITS.update(
+        eval_f64=jax.jit(_eval_f64),
+        vg_f64=jax.jit(jax.value_and_grad(_eval_f64, argnums=0, has_aux=True)),
+        adam_stage_f32=adam_stage_f32,
+    )
+    return _BAND_GEOM_JITS
 
 
 @_precise
@@ -1516,6 +2010,7 @@ def refine_band_geometry(
     n_zones=60,
     ki=(0.0, 0.0, 1.0),
     radial_bound=0.15,
+    axial_bound=None,
     rot_bound_deg=3.5,
     trans_bound_m=0.02,
     orient_bound_deg=11.5,
@@ -1523,53 +2018,73 @@ def refine_band_geometry(
     zone_weight="uniform",
     rot_axis_only=None,
     space_group=None,
+    laue_order_search=False,
+    reg_weight=0.015,
+    return_top_k=1,
 ):
-    """Co-refine the orientation AND the global detector geometry on the
-    band objective.
+    """Co-refine orientation(s) AND global detector geometry on the band
+    objective, optionally branching over integer Laue-order shifts.
 
-    The objective sum_x sum_j w_j <cos(2 pi q (x.d_j))> is differentiable
-    in the spot directions d_j, and d_j is a differentiable function of
-    where the detector is.  So co-refinement is the same objective with
-    seven more parameters -- radial scale, a global rotation of the whole
-    assembly about the sample, a global translation -- and not a second
-    machine; no matching, no assignment.  The three modes are the harness's
-    ``radial``, ``global_rot``, ``global_trans``, applied exactly as
-    refinables.forward_map does, so the result is a ``panels`` block
-    _calibrated_dets can consume.
-
-    Why it is needed at all: the ladder searches on nominal geometry.  On
-    IMAGINE-X (CG4D) the nominal assembly is off by a radial ~5% and ~2 deg
-    (its classic calibration absorbs the same error as a 44 mm centre shift
-    and a +5% cell), which displaces the band objective's maximum by ~1
-    deg -- outside the exact Ewald basin -- and, with orientation alone,
-    leaves the true basin nearly tied with a false one (0.826 vs 0.794 on
-    cg4d-l1-mbl run 1996).  Co-refined, the true basin doubles (1.677) and
-    the false one barely moves (1.099): the geometry discriminates.  The
-    fraction of the finder's 149 peaks within 0.3 deg of a prediction goes
-    30.9% -> 61.7%.
-
-    centers, offsets: per-spot bank centre and in-panel offset [m], lab
-    frame (xyz = centre + offset, flat panels).  R_spots: goniometer
-    rotation per spot [n, 3, 3] or one [3, 3].  Returns a dict with U,
-    radial_scale, global_rot_vec [rad], global_trans_m, score, score0, and
-    a callable panels(banks_centers, banks_uhats, banks_vhats) that maps a
-    bank's nominal geometry to the refined one.
+    ``U0`` may be a single ``[3, 3]`` orientation or a ``[K, 3, 3]`` candidate
+    pool.  When ``laue_order_search=True`` and geometry bounds are active,
+    each candidate is deterministically branched across the 27 crystal-frame
+    integer Laue-order shifts ``Delta m in {-1, 0, +1}^3`` (`laue_order_stencil`)
+    and opposite initial scale signs so uncalibrated detector scissor
+    distortions cannot trap local refinement on an adjacent ``Delta m = +-1``
+    cosine carrier fringe.
     """
-    import jax
     import jax.numpy as jnp
     from scipy.optimize import minimize
 
-    C = jnp.asarray(np.asarray(centers, np.float64))
-    O = jnp.asarray(np.asarray(offsets, np.float64))
-    w = jnp.asarray(np.asarray(weights, np.float64))
-    w = w / jnp.maximum(jnp.abs(w).sum(), 1e-12)
+    C_np = np.asarray(centers, np.float64)
+    O_np = np.asarray(offsets, np.float64)
+    w_np = np.asarray(weights, np.float64)
+    w_np = w_np / max(np.abs(w_np).sum(), 1e-12)
     Rs = np.asarray(R_spots, np.float64)
     if Rs.ndim == 2:
-        Rs = np.broadcast_to(Rs, (len(centers), 3, 3))
-    Rj = jnp.asarray(Rs)
-    kij = jnp.asarray(np.asarray(ki, np.float64))
-    kij = kij / jnp.linalg.norm(kij)
-    Uj = jnp.asarray(np.asarray(U0, np.float64))
+        Rs = np.broadcast_to(Rs, (len(C_np), 3, 3))
+    ki_np = np.asarray(ki, np.float64)
+    ki_np = ki_np / np.linalg.norm(ki_np)
+    kij = jnp.asarray(ki_np)
+    # Safe non-collinear dummy center (||C_dummy|| = 1 m, kf != ki) so zero-weight
+    # padding rows never produce 0/0 gradients while keeping array shapes bucketed.
+    c_dummy_vec = (
+        np.array([1.0, 0.0, 0.0], dtype=np.float64)
+        if abs(float(ki_np[0])) < 0.9
+        else np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    )
+
+    def _pad_obs(C_a, O_a, R_a, w_a, target_n, dtype):
+        pad_n = target_n - len(C_a)
+        if pad_n <= 0:
+            return (
+                C_a.astype(dtype, copy=False),
+                O_a.astype(dtype, copy=False),
+                R_a.astype(dtype, copy=False),
+                w_a.astype(dtype, copy=False),
+            )
+        c_pad = np.broadcast_to(c_dummy_vec.astype(dtype), (pad_n, 3))
+        o_pad = np.zeros((pad_n, 3), dtype=dtype)
+        r_pad = np.broadcast_to(np.eye(3, dtype=dtype), (pad_n, 3, 3))
+        w_pad = np.zeros((pad_n,), dtype=dtype)
+        return (
+            np.concatenate([C_a.astype(dtype, copy=False), c_pad], axis=0),
+            np.concatenate([O_a.astype(dtype, copy=False), o_pad], axis=0),
+            np.concatenate([R_a.astype(dtype, copy=False), r_pad], axis=0),
+            np.concatenate([w_a.astype(dtype, copy=False), w_pad], axis=0),
+        )
+
+    n_obs = len(C_np)
+    bucket_full = (
+        max(256, 1 << int(np.ceil(np.log2(max(n_obs, 1)))))
+        if n_obs <= 2048
+        else int(((n_obs + 2047) // 2048) * 2048)
+    )
+    C_p, O_p, R_p, w_p = _pad_obs(C_np, O_np, Rs, w_np, bucket_full, np.float64)
+    C = jnp.asarray(C_p)
+    O = jnp.asarray(O_p)
+    w = jnp.asarray(w_p)
+    Rj = jnp.asarray(R_p)
     zd, zl, _ = direct_lattice_vectors(B, space_group=space_group)
     nz = int(n_zones)
     X0 = jnp.asarray((zl[:nz, None] * zd[:nz]).astype(np.float64))
@@ -1578,8 +2093,16 @@ def refine_band_geometry(
     )
     lam_lo, lam_hi = float(wavelength[0]), float(wavelength[1])
     gmax = 1.0 / float(d_min)
+    rb_rad = float(radial_bound)
+    ab_rad = rb_rad if axial_bound is None else float(axial_bound)
+    use_cyl_axial = axial_bound is not None and ab_rad > 0.0
+    cyl_flag = 1.0 if use_cyl_axial else 0.0
     ob = np.deg2rad(float(orient_bound_deg))
     rb = np.deg2rad(float(rot_bound_deg))
+    tb = float(trans_bound_m)
+    geom_active = rb_rad > 0.0 or ab_rad > 0.0 or rb > 0.0 or tb > 0.0
+    reg_w = float(reg_weight) if geom_active else 0.0
+
     if rot_axis_only is not None:
         ax_arr = np.asarray(rot_axis_only, np.float64)
         if (
@@ -1592,108 +2115,468 @@ def refine_band_geometry(
         rot_dom_idx = int(np.argmax(np.abs(rot_axis_unit)))
         if rot_axis_unit[rot_dom_idx] < 0:
             rot_axis_unit = -rot_axis_unit
-        rot_axis_j = jnp.asarray(rot_axis_unit, jnp.float64)
+        rot_proj_np = np.zeros((3, 3), dtype=np.float64)
+        rot_proj_np[:, rot_dom_idx] = rot_axis_unit
         rot_bounds = [(-rb, rb) if i == rot_dom_idx else (0.0, 0.0) for i in range(3)]
     else:
         rot_axis_unit = None
         rot_dom_idx = None
-        rot_axis_j = None
+        rot_proj_np = np.eye(3, dtype=np.float64)
         rot_bounds = [(-rb, rb)] * 3
+    rot_proj_j = jnp.asarray(rot_proj_np)
 
-    def objective(p):
-        rv, scale, T = p[:3], p[3], p[7:10]
-        rg = p[4 + rot_dom_idx] * rot_axis_j if rot_axis_j is not None else p[4:7]
-        Rg = _rodrigues_jax(rg)
-        xyz = (C * (1.0 + scale) + O) @ Rg.T + T[None, :]
-        kf = xyz / jnp.linalg.norm(xyz, axis=1, keepdims=True)
-        g = kf - kij[None, :]
-        d_lab = g / jnp.linalg.norm(g, axis=1, keepdims=True)
-        s_ = -(d_lab @ kij)
-        q_lo = 2.0 * s_ / lam_hi
-        q_hi = jnp.maximum(jnp.minimum(2.0 * s_ / lam_lo, gmax), q_lo)
-        d = jnp.einsum("nji,nj->ni", Rj, d_lab)  # sample frame: R^T d
-        Rm = _rodrigues_jax(rv) @ Uj
-        t = (X0 @ Rm.T) @ d.T  # [zones, spots]
-        two_pi = 2.0 * jnp.pi
-        valid = (q_hi > q_lo)[None, :]
-        hi_safe = jnp.where(q_hi > q_lo, q_hi, q_lo + 1.0)[None, :]
-        den = two_pi * (hi_safe - q_lo[None, :]) * t
-        ok = jnp.abs(den) > 1e-7
-        num = jnp.sin(two_pi * hi_safe * t) - jnp.sin(two_pi * q_lo[None, :] * t)
-        envelope = jnp.tanh(
-            (hi_safe - q_lo[None, :]) / jnp.maximum(0.02 * q_lo[None, :], 1e-6)
-        )
-        K = jnp.where(
-            valid, envelope * jnp.where(ok, num / jnp.where(ok, den, 1.0), 1.0), 0.0
-        )
-        return -jnp.einsum("km,k,m->", K, wz, w)
+    # Natural physical step units so rotational, fractional-scale, and metric
+    # translation gradients have balanced magnitudes in L-BFGS-B and Adam.
+    p_units = np.array(
+        [
+            np.deg2rad(1.0),
+            np.deg2rad(1.0),
+            np.deg2rad(1.0),
+            0.02,
+            0.02,
+            np.deg2rad(0.5),
+            np.deg2rad(0.5),
+            np.deg2rad(0.5),
+            0.005,
+            0.005,
+            0.005,
+        ],
+        dtype=np.float64,
+    )
+    p_units_j = jnp.asarray(p_units)
 
-    vg = jax.jit(jax.value_and_grad(objective))
+    bg_kerns = _band_geom_kernels()
+    lam_lo_j = jnp.float64(lam_lo)
+    lam_hi_j = jnp.float64(lam_hi)
+    gmax_j = jnp.float64(gmax)
+    reg_w_j = jnp.float64(reg_w)
+    cyl_flag_j = jnp.float64(cyl_flag)
+    shared_f64 = (
+        C,
+        O,
+        Rj,
+        w,
+        X0,
+        wz,
+        p_units_j,
+        kij,
+        rot_proj_j,
+        lam_lo_j,
+        lam_hi_j,
+        gmax_j,
+        reg_w_j,
+        cyl_flag_j,
+    )
 
-    def f(p):
-        v, gr = vg(jnp.asarray(p))
-        return float(v), np.asarray(gr, np.float64)
+    def _eval_full(u_j, Ub_j):
+        return bg_kerns["eval_f64"](u_j, Ub_j, *shared_f64)
 
-    bounds = (
+    def vg_full(u_j, Ub_j):
+        return bg_kerns["vg_f64"](u_j, Ub_j, *shared_f64)
+
+    U0_arr = np.asarray(U0, np.float64)
+    if U0_arr.ndim == 2:
+        U_pool = U0_arr[None, :, :]
+    else:
+        U_pool = U0_arr.reshape(-1, 3, 3)
+
+    phys_bounds = (
         [(-ob, ob)] * 3
-        + [(-float(radial_bound), float(radial_bound))]
+        + [(-rb_rad, rb_rad)]
+        + ([(-ab_rad, ab_rad)] if use_cyl_axial else [(0.0, 0.0)])
         + rot_bounds
-        + [(-float(trans_bound_m), float(trans_bound_m))] * 3
+        + [(-tb, tb)] * 3
     )
-    p0 = np.zeros(10)
-    s0 = -f(p0)[0]
-    # The geometry landscape is bimodal along the radial direction: on
-    # cg4d-l1-mbl the true basin started at nominal rolls to -12% (score
-    # 2.31) while starts at -6, -3, +3% all reach +5.5% (3.25 / 3.42 /
-    # 2.90), and which mode L-BFGS finds turns on a tenth of a degree of
-    # orientation.  A multistart over the dominant nuisance is the honest
-    # answer; the other six parameters follow from each start.
-    starts = (
-        np.linspace(-float(radial_bound), float(radial_bound), 5)
-        if radial_bound > 0
-        else np.array([0.0])
-    )
-    res = None
-    for s_ in starts:
-        q0 = p0.copy()
-        q0[3] = float(np.clip(s_ * 0.6, -radial_bound, radial_bound))
-        r_ = minimize(
-            f,
-            q0,
-            jac=True,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={"maxiter": int(maxiter)},
-        )
-        if res is None or r_.fun < res.fun:
-            res = r_
-    p = np.asarray(res.x, np.float64)
-    rg_vec = (
-        float(p[4 + rot_dom_idx]) * rot_axis_unit
-        if rot_axis_unit is not None
-        else p[4:7].copy()
-    )
-    Rg = np.asarray(_rodrigues_jax(jnp.asarray(rg_vec)))
-    U = np.asarray(_rodrigues_jax(jnp.asarray(p[:3]))) @ np.asarray(U0, np.float64)
+    u_bounds = [(lo / u, hi / u) for (lo, hi), u in zip(phys_bounds, p_units)]
 
-    def panels(bank_centers, bank_uhats, bank_vhats):
-        c = np.asarray(bank_centers, np.float64) * (1.0 + p[3])
+    _, s0_j = _eval_full(jnp.zeros(11, jnp.float64), jnp.asarray(U_pool[0]))
+    s0 = float(s0_j)
+
+    def _pack_fit_dict(u_opt_arr, U_base_mat, loss_val, nit_val):
+        u_opt_v = np.asarray(u_opt_arr, np.float64)
+        _, raw_sc_j = _eval_full(jnp.asarray(u_opt_v), jnp.asarray(U_base_mat))
+        p_v = u_opt_v * p_units
+        s_rad_v = float(p_v[3])
+        s_ax_v = float(p_v[4]) if use_cyl_axial else s_rad_v
+        rg_v = (
+            float(p_v[5 + rot_dom_idx]) * rot_axis_unit
+            if rot_axis_unit is not None
+            else p_v[5:8].copy()
+        )
+        Rg_v = np.asarray(_rodrigues_jax(jnp.asarray(rg_v)))
+        U_v = np.asarray(_rodrigues_jax(jnp.asarray(p_v[:3]))) @ np.asarray(
+            U_base_mat, np.float64
+        )
+        t_v = p_v[8:11].copy()
+
+        def _panels(
+            bank_centers,
+            bank_uhats,
+            bank_vhats,
+            _sr=s_rad_v,
+            _sa=s_ax_v,
+            _Rg=Rg_v,
+            _tv=t_v,
+        ):
+            bc = np.asarray(bank_centers, np.float64)
+            c = np.stack(
+                [
+                    bc[:, 0] * (1.0 + _sr),
+                    bc[:, 1] * (1.0 + _sa),
+                    bc[:, 2] * (1.0 + _sr),
+                ],
+                axis=-1,
+            )
+            return {
+                "centers": c @ _Rg.T + _tv[None, :],
+                "uhats": np.asarray(bank_uhats, np.float64) @ _Rg.T,
+                "vhats": np.asarray(bank_vhats, np.float64) @ _Rg.T,
+            }
+
         return {
-            "centers": c @ Rg.T + p[7:10][None, :],
-            "uhats": np.asarray(bank_uhats, np.float64) @ Rg.T,
-            "vhats": np.asarray(bank_vhats, np.float64) @ Rg.T,
+            "U": _orthonormalize(U_v),
+            "radial_scale": s_rad_v,
+            "axial_scale": s_ax_v,
+            "global_rot_vec": rg_v.copy(),
+            "global_trans_m": t_v,
+            "score": float(raw_sc_j),
+            "loss": float(loss_val),
+            "score0": float(s0),
+            "panels": _panels,
+            "n_iter": int(nit_val),
         }
 
-    return {
-        "U": _orthonormalize(U),
-        "radial_scale": float(p[3]),
-        "global_rot_vec": rg_vec.copy(),
-        "global_trans_m": p[7:10].copy(),
-        "score": float(-res.fun),
-        "score0": float(s0),
-        "panels": panels,
-        "n_iter": int(res.nit),
-    }
+    top_fits_list = []
+    if laue_order_search and geom_active:
+        dU_ord = laue_order_stencil(B, wavelength, d_min)
+        n_cand_pool = len(U_pool)
+        n_full_stencil = min(n_cand_pool, 40)
+        U_full_27 = np.einsum("kij,mjl->kmil", U_pool[:n_full_stencil], dU_ord).reshape(
+            -1, 3, 3
+        )
+        owner_27 = np.repeat(np.arange(n_full_stencil, dtype=np.int32), len(dU_ord))
+        if n_cand_pool > n_full_stencil:
+            U_base_branches = np.concatenate(
+                [U_full_27, U_pool[n_full_stencil:]], axis=0
+            ).astype(np.float32)
+            owner_base = np.concatenate(
+                [owner_27, np.arange(n_full_stencil, n_cand_pool, dtype=np.int32)]
+            )
+        else:
+            U_base_branches = U_full_27.astype(np.float32)
+            owner_base = owner_27
+
+        s_pair = (
+            [-min(0.04, 0.6 * rb_rad), +min(0.04, 0.6 * rb_rad)]
+            if rb_rad > 0
+            else [0.0]
+        )
+        U_all = np.repeat(U_base_branches, len(s_pair), axis=0)
+        cand_owner = np.repeat(owner_base, len(s_pair))
+        u0_all = np.zeros((len(U_all), 11), dtype=np.float32)
+        for is_, sv in enumerate(s_pair):
+            u0_all[is_ :: len(s_pair), 3] = np.float32(sv / p_units[3])
+            if use_cyl_axial:
+                u0_all[is_ :: len(s_pair), 4] = np.float32(
+                    np.clip(sv, -ab_rad, ab_rad) / p_units[4]
+                )
+
+        # Stage 1 + 2: float32 coarse-zone Adam screen across all Laue-order
+        # stencil branches (preserving gradient capture for narrow macromolecular
+        # zones that lie 1-3 deg from the ladder seed), followed by full-zone
+        # float32 Adam on Laue-distinct basins.
+        p_units_f32 = jnp.asarray(p_units.astype(np.float32))
+        kij_f32 = jnp.asarray(ki_np.astype(np.float32))
+        rot_proj_f32 = jnp.asarray(rot_proj_np.astype(np.float32))
+        u_lo_f32 = jnp.asarray([b[0] for b in u_bounds], jnp.float32)
+        u_hi_f32 = jnp.asarray([b[1] for b in u_bounds], jnp.float32)
+        X0_f32 = jnp.asarray(np.asarray(X0, np.float32))
+        wz_f32 = jnp.asarray(np.asarray(wz, np.float32))
+        nz_s1 = min(30, nz)
+        X_s1_f32 = X0_f32[:nz_s1]
+        wz_s1_f32 = wz_f32[:nz_s1]
+        lam_lo_f32 = jnp.float32(lam_lo)
+        lam_hi_f32 = jnp.float32(lam_hi)
+        gmax_f32 = jnp.float32(gmax)
+        reg_w_f32 = jnp.float32(reg_w)
+        cyl_flag_f32 = jnp.float32(cyl_flag)
+
+        n_sub1 = min(len(C_np), 1024)
+        n_sub2 = min(len(C_np), 4096)
+        ord_w_all = np.argsort(-np.abs(w_np))
+        ord_w1 = ord_w_all[:n_sub1]
+        ord_w2 = ord_w_all[:n_sub2]
+        w1_norm = w_np[ord_w1] / max(np.abs(w_np[ord_w1]).sum(), 1e-12)
+        w2_norm = w_np[ord_w2] / max(np.abs(w_np[ord_w2]).sum(), 1e-12)
+        C_s1_np, O_s1_np, R_s1_np, w_s1_np = _pad_obs(
+            C_np[ord_w1], O_np[ord_w1], Rs[ord_w1], w1_norm, 1024, np.float32
+        )
+        C_s2_np, O_s2_np, R_s2_np, w_s2_np = _pad_obs(
+            C_np[ord_w2], O_np[ord_w2], Rs[ord_w2], w2_norm, 4096, np.float32
+        )
+        C_sub1 = jnp.asarray(C_s1_np)
+        O_sub1 = jnp.asarray(O_s1_np)
+        R_sub1 = jnp.asarray(R_s1_np)
+        w_sub1 = jnp.asarray(w_s1_np)
+        C_sub2 = jnp.asarray(C_s2_np)
+        O_sub2 = jnp.asarray(O_s2_np)
+        R_sub2 = jnp.asarray(R_s2_np)
+        w_sub2 = jnp.asarray(w_s2_np)
+        adam_kern = bg_kerns["adam_stage_f32"]
+
+        def run_s1(uj_in, Ub_in):
+            return adam_kern(
+                uj_in,
+                Ub_in,
+                C_sub1,
+                O_sub1,
+                R_sub1,
+                w_sub1,
+                X_s1_f32,
+                wz_s1_f32,
+                p_units_f32,
+                kij_f32,
+                rot_proj_f32,
+                u_lo_f32,
+                u_hi_f32,
+                lam_lo_f32,
+                lam_hi_f32,
+                gmax_f32,
+                reg_w_f32,
+                cyl_flag_f32,
+                jnp.float32(0.13),
+                jnp.int32(24),
+            )
+
+        def run_s2(uj_in, Ub_in):
+            return adam_kern(
+                uj_in,
+                Ub_in,
+                C_sub2,
+                O_sub2,
+                R_sub2,
+                w_sub2,
+                X0_f32,
+                wz_f32,
+                p_units_f32,
+                kij_f32,
+                rot_proj_f32,
+                u_lo_f32,
+                u_hi_f32,
+                lam_lo_f32,
+                lam_hi_f32,
+                gmax_f32,
+                reg_w_f32,
+                cyl_flag_f32,
+                jnp.float32(0.08),
+                jnp.int32(35),
+            )
+
+        ch_b = 512
+        uf_list, lf_list = [], []
+        for bi in range(0, len(U_all), ch_b):
+            U_c = U_all[bi : bi + ch_b]
+            u_c = u0_all[bi : bi + ch_b]
+            if len(U_c) < ch_b:
+                pad_n = ch_b - len(U_c)
+                U_cp = np.concatenate([U_c, np.repeat(U_c[:1], pad_n, axis=0)], axis=0)
+                u_cp = np.concatenate(
+                    [u_c, np.zeros((pad_n, 11), dtype=np.float32)], axis=0
+                )
+                uf_, _, lf_ = run_s1(jnp.asarray(u_cp), jnp.asarray(U_cp))
+                uf_list.append(np.asarray(uf_)[: len(U_c)])
+                lf_list.append(np.asarray(lf_)[: len(U_c)])
+            else:
+                uf_, _, lf_ = run_s1(jnp.asarray(u_c), jnp.asarray(U_c))
+                uf_list.append(np.asarray(uf_))
+                lf_list.append(np.asarray(lf_))
+        uf_1 = np.concatenate(uf_list, axis=0)
+        lf_1 = np.concatenate(lf_list, axis=0)
+
+        # Build Laue proper symmetry group so neither Stage 1->2 nor Stage 2->3
+        # lets Friedel/stencil duplicates of a single basin crowd out distinct basins.
+        sym_ops = [np.eye(3, dtype=np.float64)]
+        if space_group is not None:
+            from subhkl.core.spacegroup import get_space_group_object
+
+            B_mat = np.asarray(B, np.float64)
+            B_inv = np.linalg.inv(B_mat)
+            sg_obj = (
+                get_space_group_object(space_group)
+                if isinstance(space_group, (str, bytes))
+                else space_group
+            )
+            sym_ops = []
+            for op in sg_obj.operations().sym_ops:
+                Rf = np.asarray(op.rot, np.float64) / op.DEN
+                Sm = B_mat @ np.linalg.inv(Rf).T @ B_inv
+                if np.linalg.det(Sm) < 0:
+                    Sm = -Sm
+                if not any(np.allclose(Sm, Sp, atol=1e-5) for Sp in sym_ops):
+                    sym_ops.append(Sm)
+        cos_sep = float(2.0 * np.cos(np.deg2rad(2.5)) + 1.0)
+
+        n_keep2 = min(40, len(U_all))
+        s1_order = [int(i) for i in np.argsort(lf_1)]
+        top2_list: list[int] = []
+        s1_Us: list[np.ndarray] = []
+
+        def _try_add_s1(idx1: int) -> bool:
+            Ub_1 = np.asarray(U_all[idx1], dtype=np.float64)
+            rv_1 = np.asarray(uf_1[idx1, :3], dtype=np.float64) * p_units[:3]
+            U_est_1 = _orthonormalize(
+                np.asarray(_rodrigues_jax(jnp.asarray(rv_1))) @ Ub_1
+            )
+            if any(
+                any(
+                    float(np.trace(U_est_1 @ (U_prev @ Sm).T)) >= cos_sep
+                    for Sm in sym_ops
+                )
+                for U_prev in s1_Us
+            ):
+                return False
+            top2_list.append(idx1)
+            s1_Us.append(U_est_1)
+            return True
+
+        # First keep top 20 Laue-distinct Stage-1 winners globally; then ensure
+        # each top distinct ladder candidate's best stencil branch also enters
+        # full-60-zone Stage 2 (crucial for anisotropic cells whose longest axis
+        # sits above zone #30).
+        for idx1 in s1_order:
+            if len(top2_list) >= min(20, n_keep2):
+                break
+            _try_add_s1(idx1)
+        for kc in range(min(n_cand_pool, 36)):
+            if len(top2_list) >= n_keep2:
+                break
+            kc_mask = np.flatnonzero(cand_owner == kc)
+            if len(kc_mask) > 0:
+                best_kc = int(kc_mask[int(np.argmin(lf_1[kc_mask]))])
+                if best_kc not in top2_list:
+                    _try_add_s1(best_kc)
+        for idx1 in s1_order:
+            if len(top2_list) >= n_keep2:
+                break
+            if idx1 not in top2_list:
+                _try_add_s1(idx1)
+        if len(top2_list) < min(16, len(U_all)):
+            top2_set = set(top2_list)
+            for idx1 in s1_order:
+                if idx1 not in top2_set:
+                    top2_list.append(idx1)
+                    if len(top2_list) >= min(16, len(U_all)):
+                        break
+        top2 = np.asarray(top2_list, dtype=np.int64)
+        ch_s2 = 40
+        u_s2_in = uf_1[top2]
+        U_s2_in = U_all[top2]
+        if len(top2) < ch_s2:
+            pad_s2 = ch_s2 - len(top2)
+            u_s2_in = np.concatenate(
+                [u_s2_in, np.repeat(u_s2_in[:1], pad_s2, axis=0)], axis=0
+            )
+            U_s2_in = np.concatenate(
+                [U_s2_in, np.repeat(U_s2_in[:1], pad_s2, axis=0)], axis=0
+            )
+        uf_2, _, lf_2 = run_s2(jnp.asarray(u_s2_in), jnp.asarray(U_s2_in))
+        uf_2 = np.asarray(uf_2, dtype=np.float64)[: len(top2)]
+        lf_2 = np.asarray(lf_2, dtype=np.float64)[: len(top2)]
+
+        n_target_s3 = max(4, int(return_top_k))
+        s2_order = list(np.argsort(lf_2))
+        s3_indices = []
+        s3_Us = []
+        for kk in s2_order:
+            Ub_k = np.asarray(U_all[top2[kk]], dtype=np.float64)
+            rv_k = uf_2[kk, :3] * p_units[:3]
+            U_est_k = _orthonormalize(
+                np.asarray(_rodrigues_jax(jnp.asarray(rv_k))) @ Ub_k
+            )
+            is_dup = False
+            for U_prev in s3_Us:
+                if any(
+                    float(np.trace(U_est_k @ (U_prev @ Sm).T)) >= cos_sep
+                    for Sm in sym_ops
+                ):
+                    is_dup = True
+                    break
+            if not is_dup:
+                s3_indices.append(int(kk))
+                s3_Us.append(U_est_k)
+                if len(s3_indices) >= n_target_s3:
+                    break
+        if not s3_indices:
+            s3_indices = s2_order[: min(n_target_s3, len(s2_order))]
+
+        # Stage 3: tight trust-boxed float64 L-BFGS-B polish on distinct carrier basins
+        best_res = None
+        best_U_base = np.asarray(U_pool[0], dtype=np.float64)
+        for kk in s3_indices:
+            Ub_k = _orthonormalize(np.asarray(U_all[top2[kk]], dtype=np.float64))
+            u_init = uf_2[kk]
+            bnds_k = [
+                (
+                    max(u_bounds[j][0], float(u_init[j] - 0.8)),
+                    min(u_bounds[j][1], float(u_init[j] + 0.8)),
+                )
+                if j < 3
+                else u_bounds[j]
+                for j in range(11)
+            ]
+
+            ub_jnp = jnp.asarray(Ub_k)
+
+            def f_k(u_vec, _Ub=ub_jnp):
+                (lv, _), gv = vg_full(jnp.asarray(u_vec), _Ub)
+                return float(lv), np.asarray(gv, np.float64)
+
+            r_ = minimize(
+                f_k,
+                u_init,
+                jac=True,
+                method="L-BFGS-B",
+                bounds=bnds_k,
+                options={"maxiter": int(maxiter)},
+            )
+            top_fits_list.append(_pack_fit_dict(r_.x, Ub_k, r_.fun, r_.nit))
+            if best_res is None or r_.fun < best_res.fun:
+                best_res = r_
+                best_U_base = Ub_k
+        top_fits_list.sort(key=lambda d_it: d_it["loss"])
+        res = best_res
+        U_win_base = best_U_base
+    else:
+        U_win_base = U_pool[0]
+        Ub_j = jnp.asarray(U_win_base)
+
+        def f(u_vec):
+            (v, _), gr = vg_full(jnp.asarray(u_vec), Ub_j)
+            return float(v), np.asarray(gr, np.float64)
+
+        starts = np.linspace(-rb_rad, rb_rad, 5) if rb_rad > 0 else np.array([0.0])
+        res = None
+        for s_ in starts:
+            q0 = np.zeros(11, np.float64)
+            sv = float(np.clip(s_ * 0.6, -rb_rad, rb_rad))
+            q0[3] = sv / p_units[3]
+            if use_cyl_axial:
+                q0[4] = np.clip(sv, -ab_rad, ab_rad) / p_units[4]
+            r_ = minimize(
+                f,
+                q0,
+                jac=True,
+                method="L-BFGS-B",
+                bounds=u_bounds,
+                options={"maxiter": int(maxiter)},
+            )
+            if res is None or r_.fun < res.fun:
+                res = r_
+
+    out_fit = _pack_fit_dict(res.x, U_win_base, res.fun, res.nit)
+    if top_fits_list:
+        out_fit["top_fits"] = top_fits_list[: max(1, int(return_top_k))]
+    return out_fit
 
 
 #: rungs of the ladder: (number of shortest zones, tolerance [deg], zoom
@@ -1738,6 +2621,8 @@ def lattice_ladder(
     space_group=None,
     dedup_deg=3.0,
     on_rung=None,
+    band_envelope_deg=0.0,
+    band_table_min_spacing_deg=0.0,
 ):
     """Orientation search on the direct lattice, coarse to fine.
 
@@ -1818,25 +2703,37 @@ def lattice_ladder(
 
     xl_j = jnp.asarray(xlen[:K_all].astype(np.float32))
 
-    def band_args(nz, exhaustive):
-        """The band objective's args.  No tolerance: the band sets the
-        window, so a rung is a zone count and nothing else.  The table is
-        built for the exhaustive rung alone -- the zoom rungs are cheap and
-        a tabulated zoom moved solutions by a degree when it was tried for
-        the Funk objective."""
+    def band_args(nz, exhaustive, tol_deg=0.0):
+        """The band objective's args.  By default no tolerance is used on zoom
+        rungs (exact band sum).  When ``band_envelope_deg > 0`` (exhaustive)
+        or ``tol_deg >= table_tol_deg`` on a tabulated band rung, each zone
+        pole is evaluated via its spherical-cap max envelope on ``band_table``
+        so coarse grid steps and uncalibrated detector scissor do not drop the
+        narrow Laue-order carrier lobes."""
         nz = int(nz)
         wz = zone_weights(nz)[:nz]
-        if exhaustive:
-            if "band" not in tables:
-                # resolve the phase: it turns once per 1 / (|x| qbar) in
-                # n.d, so four samples per turn on the longest zone
-                # The table is the one place the data side can be dense at
-                # no search cost: given, every live bin with its signed
-                # excess goes in here (the zoom rungs take the sparse set).
-                # Measured on MANDI L1 run 0: z at the truth 10.9 -> 17.8
-                # (13 zones), 16.0 -> 26.0 (60 zones) against the 5 sigma
-                # bins, because the threshold had dropped two thirds of the
-                # real spots and the zero-mean excess adds variance, not bias.
+        env_deg = (
+            float(band_envelope_deg)
+            if exhaustive
+            else (
+                float(tol_deg)
+                if float(band_envelope_deg) > 0
+                and float(tol_deg) >= float(table_tol_deg)
+                else 0.0
+            )
+        )
+        use_table = exhaustive or float(tol_deg) >= float(table_tol_deg)
+        if use_table:
+            tab_nz = max(
+                int(coarse_zones),
+                max(
+                    [int(r[0]) for r in rungs if float(r[1]) >= float(table_tol_deg)]
+                    or [nz]
+                ),
+                nz,
+            )
+            if "band" not in tables or int(tables["band"][0].shape[0]) < nz:
+                tab_nz = max(tab_nz, nz)
                 if table_dirs is not None:
                     Dt = np.asarray(table_dirs, np.float64)
                     Dt = Dt / np.linalg.norm(Dt, axis=1, keepdims=True)
@@ -1846,10 +2743,22 @@ def lattice_ladder(
                 else:
                     Dt, wt, qlt, qht = D, w, q_lo, q_hi
                 qbar = float(np.max(0.5 * (qlt + qht)))
-                sp = np.degrees(1.0 / max(4.0 * float(xlen[:nz].max()) * qbar, 1e-9))
-                tables["band"] = band_table(Dt, wt, qlt, qht, xlen[:nz], min(sp, 5.0))
+                sp = np.degrees(
+                    1.0 / max(4.0 * float(xlen[:tab_nz].max()) * qbar, 1e-9)
+                )
+                sp_use = max(min(sp, 5.0), float(band_table_min_spacing_deg))
+                tables["band"] = band_table(Dt, wt, qlt, qht, xlen[:tab_nz], sp_use)
                 if on_rung is not None:
-                    try:
+                    import contextlib
+
+                    with contextlib.suppress(
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        IndexError,
+                    ):
                         tab_p, off_p, nph_p, nth_p = tables["band"]
                         a_c = np.radians(np.arange(0, 360, 6.0))
                         b_c = np.radians(np.arange(3.0, 180, 6.0))
@@ -1859,8 +2768,21 @@ def lattice_ladder(
                             .T.astype(np.float32)
                         )
                         Rs_c = kern["euler_zyz"](jnp.asarray(grid_c))
-                        out_c = kern["score_band_table"](
-                            Rs_c, Zj[:nz], wz, tab_p, off_p, nph_p, nth_p
+                        out_c = (
+                            kern["score_band_table_env"](
+                                Rs_c,
+                                Zj[:nz],
+                                wz,
+                                tab_p[:nz],
+                                off_p,
+                                nph_p,
+                                nth_p,
+                                np.float32(np.deg2rad(env_deg)),
+                            )
+                            if env_deg > 0.0
+                            else kern["score_band_table"](
+                                Rs_c, Zj[:nz], wz, tab_p[:nz], off_p, nph_p, nth_p
+                            )
                         )
                         best_c = int(jnp.argmax(out_c))
                         on_rung(
@@ -1868,14 +2790,26 @@ def lattice_ladder(
                             int(nz),
                             _orthonormalize(np.asarray(Rs_c[best_c])),
                         )
-                    except Exception:
-                        pass
                 _mark(
                     f"band table ({int(tables['band'][0].shape[1]):,} poles, "
                     f"{len(Dt):,} bins, exhaustive rung preview)"
                 )
             tab, off, nph, nth = tables["band"]
-            return "band_table", (Zj[:nz], wz, tab, off, nph, nth), 262144
+            if env_deg > 0.0:
+                return (
+                    "band_table_env",
+                    (
+                        Zj[:nz],
+                        wz,
+                        tab[:nz],
+                        off,
+                        nph,
+                        nth,
+                        np.float32(np.deg2rad(env_deg)),
+                    ),
+                    131072,
+                )
+            return "band_table", (Zj[:nz], wz, tab[:nz], off, nph, nth), 262144
         return (
             "band",
             (Zj[:nz], xl_j[:nz], wz, Dj, wj, qlo_j, qhi_j),
@@ -1940,10 +2874,17 @@ def lattice_ladder(
                         break
             cands = np.asarray(kept)
         if on_rung is not None and len(cands) > 0:
-            try:
+            import contextlib
+
+            with contextlib.suppress(
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 on_rung("exhaustive", int(coarse_zones), _orthonormalize(cands[0]))
-            except Exception:
-                pass
         _mark(f"exhaustive rung ({len(grid):,} orientations)")
 
     def zoom_all(cands, nz, tol, span, n):
@@ -1957,7 +2898,7 @@ def lattice_ladder(
             .T
         )
         dR = jnp.asarray(Rot.from_rotvec(rv).as_matrix().astype(np.float32))
-        kind, args, ch_ = band_args(nz, False) if band else score_args(nz, tol)
+        kind, args, ch_ = band_args(nz, False, tol) if band else score_args(nz, tol)
         zoom = kern["zoom_" + kind]
         bsz = int(max(1, ch_ // len(rv)))
         bs, bR = [], []
@@ -1989,18 +2930,30 @@ def lattice_ladder(
             o = o[: int(keep)]
         cands, scores = R_[o], s_[o]
         if on_rung is not None and len(cands) > 0:
-            try:
+            import contextlib
+
+            with contextlib.suppress(
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 on_rung(f"rung_{int(nz)}", int(nz), _orthonormalize(cands[0]))
-            except Exception:
-                pass
         _mark(f"rung {nz} zones @ {tol:g} deg, {len(R_)} -> {len(o)}")
-    nz, tol = rungs[-1][0], rungs[-1][1]
-    kind, args, _ = (
-        band_args(int(nz), False) if band else score_args(int(nz), float(tol))
-    )
-    rnd = Rot.random(int(n_null), random_state=seed).as_matrix().astype(np.float32)
-    null = np.asarray(kern["score_" + kind](jnp.asarray(rnd), *args))
-    z = (scores - null.mean()) / max(null.std(), 1e-12)
+    if int(n_null) > 0:
+        nz, tol = rungs[-1][0], rungs[-1][1]
+        kind, args, _ = (
+            band_args(int(nz), False, float(tol))
+            if band
+            else score_args(int(nz), float(tol))
+        )
+        rnd = Rot.random(int(n_null), random_state=seed).as_matrix().astype(np.float32)
+        null = np.asarray(kern["score_" + kind](jnp.asarray(rnd), *args))
+        z = (scores - null.mean()) / max(null.std(), 1e-12)
+    else:
+        z = np.zeros_like(scores, dtype=np.float64)
     return [
         (_orthonormalize(R), float(sv), float(zv))
         for R, sv, zv in zip(cands, scores, z)
@@ -2322,7 +3275,7 @@ def find_orientations(
         masks = band_masks(model_g0, edges, wavelength_band, d_min)
         dd = np.asarray(data_dirs, float)
         f_bands = []
-        for lo, hi in zip(edges[:-1], edges[1:]):
+        for lo, hi in itertools.pairwise(edges):
             m = (sth > lo) & (sth <= hi)
             w_m = None if data_weights is None else np.asarray(data_weights, float)[m]
             f_bands.append(project_points(dd[m], w_m, L, sigma) if m.any() else None)
@@ -2828,7 +3781,11 @@ def refine_instrument_matching_free(
         if harmonics_axis is not None:
             th_h = np.deg2rad(angles_deg[:, int(harmonics_axis)])
             harm_basis = np.stack(
-                sum(([np.cos(o * th_h), np.sin(o * th_h)] for o in harm_orders), []),
+                reduce(
+                    operator.iadd,
+                    ([np.cos(o * th_h), np.sin(o * th_h)] for o in harm_orders),
+                    [],
+                ),
                 axis=1,
             )  # [n_runs, 2 n_orders]
     else:
@@ -2999,10 +3956,19 @@ def refine_instrument_matching_free(
         B = (jnp.eye(3) + A) @ jnp.asarray(B0)
         g_vec = hkl_j @ B.T
         dirs = g_vec / jnp.linalg.norm(g_vec, axis=1, keepdims=True)
+
+        def _dot_abs(a, b):
+            # Explicit 3-component inner product so accumulation order over K=3
+            # is invariant to chunk width M (unlike BLAS sgemm microkernels,
+            # whose SIMD FMA grouping varies with M and shifts 1.0 - dot by 1 ULP).
+            return jnp.abs(
+                a[:, None, 0] * b[None, :, 0]
+                + a[:, None, 1] * b[None, :, 1]
+                + a[:, None, 2] * b[None, :, 2]
+            )
+
         if n_chunks == 1:
-            # the small case, untouched: one matmul, bit-identical to
-            # every result measured before chunking existed
-            dots = jnp.abs(d_lab @ (dirs @ R.T).T)  # lines: +- are one direction
+            dots = _dot_abs(d_lab, dirs @ R.T)  # lines: +- are one direction
             ang2 = 2.0 * (1.0 - jnp.clip(dots, 0.0, 1.0))
             dens = jnp.sum(
                 w_model[None, :] * jnp.exp(-ang2 / (2.0 * sigma * sigma)), axis=1
@@ -3014,7 +3980,7 @@ def refine_instrument_matching_free(
             @jax.checkpoint
             def _acc(carry, packed):
                 d_c, w_c = packed
-                dots_c = jnp.abs(d_lab @ d_c.T)
+                dots_c = _dot_abs(d_lab, d_c)
                 ang2_c = 2.0 * (1.0 - jnp.clip(dots_c, 0.0, 1.0))
                 return (
                     carry

@@ -1,6 +1,7 @@
-import numpy as np
 import h5py
+import numpy as np
 import pytest
+
 from subhkl.io.parser import indexer
 
 
@@ -68,7 +69,7 @@ def test_multi_run_geometry_mismatch_vulnerability(tmp_path):
             n_runs=1,
             refine_goniometer=False,
         )
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError) as e:
         print(f"BUG REPRODUCED: Indexer crashed as expected! {e}")
         return
 
@@ -94,5 +95,5 @@ if __name__ == "__main__":
     tmp.mkdir(exist_ok=True)
     try:
         test_multi_run_geometry_mismatch_vulnerability(tmp)
-    except Exception as e:
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError) as e:
         print(f"Test error: {e}")

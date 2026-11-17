@@ -564,7 +564,7 @@ def test_chunking_the_overlap_changes_nothing_but_the_memory():
     peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
     n_data = len(peaks["det_idx"])
 
-    common = dict(det_bounds=BOUNDS, kernel_deg=1.0, maxiter=1)
+    common = {"det_bounds": BOUNDS, "kernel_deg": 1.0, "maxiter": 1}
     whole = refine_instrument_matching_free(
         peaks, NOMINAL, hkl, B0, R_true, max_overlap_elems=1 << 30, **common
     )
@@ -600,7 +600,7 @@ def test_model_weights_are_scale_free_and_chunk_exactly():
     peaks = _scene(rng, ct, ut, vt, axes, angles, np.zeros(1), B0, hkl, R_true)
     peaks = {k: v for k, v in peaks.items() if k != "run_idx"}
     n_data = len(peaks["det_idx"])
-    common = dict(det_bounds=BOUNDS, kernel_deg=1.0, maxiter=1)
+    common = {"det_bounds": BOUNDS, "kernel_deg": 1.0, "maxiter": 1}
 
     plain = refine_instrument_matching_free(peaks, NOMINAL, hkl, B0, R_true, **common)
     scaled = refine_instrument_matching_free(

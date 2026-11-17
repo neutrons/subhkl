@@ -1,6 +1,8 @@
-import numpy as np
-import h5py
 import os
+
+import h5py
+import numpy as np
+
 from subhkl.integration import Peaks
 
 
@@ -74,9 +76,8 @@ def test_repro_multi_run_mapping_logic(tmp_path):
                 src_name = os.path.basename(src_file)
                 for i, fname_bytes in enumerate(files_db):
                     fname_str = fname_bytes.decode("utf-8")
-                    if src_name == os.path.basename(fname_str):
-                        if i not in match_idxs:
-                            match_idxs.append(i)
+                    if src_name == os.path.basename(fname_str) and i not in match_idxs:
+                        match_idxs.append(i)
 
         assert match_idxs, "Should have found matches"
 

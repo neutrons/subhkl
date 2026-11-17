@@ -1,10 +1,13 @@
 import os
+from unittest.mock import MagicMock, patch
+
 import h5py
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
-from unittest.mock import patch, MagicMock
 
-from subhkl.commands import run_index as index, run_metrics as metrics
+from subhkl.commands import run_index as index
+from subhkl.commands import run_metrics as metrics
 
 
 def create_synthetic_finder(filename):
@@ -117,12 +120,11 @@ def test_synthetic_indexing(tmp_path):
         mock_detector.return_value = mock_det_instance
 
         # Configure Metrics Mock
-        # (xyz, slot_index, panel_index, frame_index); all synthetic peaks
-        # sit on bank 1 and each run is its own frame.
+        panel_idx_mock = np.ones_like(run_idx_mock)
         mock_extract.return_value = (
             xyz_mock,
             run_idx_mock,
-            np.ones_like(run_idx_mock),
+            panel_idx_mock,
             run_idx_mock,
         )
 
@@ -144,6 +146,39 @@ def test_synthetic_indexing(tmp_path):
         f = io.StringIO()
         with redirect_stdout(f):
             metrics(indexer_h5, instrument="MANDI")
+
+        # metrics/per_peak must record the true frame and panel, not the
+        # slot index used to look up per-slot goniometer arrays.
+        from subhkl.instrument.metrics import compute_metrics
+
+        frame_idx_mock = run_idx_mock + 100
+        panel_idx_mock = np.full_like(run_idx_mock, 7)
+        mock_extract.return_value = (
+            xyz_mock,
+            run_idx_mock,
+            panel_idx_mock,
+            frame_idx_mock,
+        )
+        per_peak_h5 = os.path.join(tmp_path, "per_peak.h5")
+        with open(indexer_h5, "rb") as fh:
+            indexed_before = fh.read()
+        result = compute_metrics(
+            indexer_h5, instrument="MANDI", per_peak_output=per_peak_h5
+        )
+        assert "error_message" not in result
+
+        # The table goes to its own file; the indexed file is only read.
+        with open(indexer_h5, "rb") as fh:
+            assert fh.read() == indexed_before
+        with pytest.raises(ValueError, match="separate file"):
+            compute_metrics(indexer_h5, instrument="MANDI", per_peak_output=indexer_h5)
+
+    with h5py.File(per_peak_h5, "r") as fh:
+        per_peak_run = fh["metrics/per_peak/run"][()]
+        per_peak_panel = fh["metrics/per_peak/panel"][()]
+    assert len(per_peak_run) == result["num_peaks"] > 0
+    assert set(np.unique(per_peak_run)) <= set(np.unique(frame_idx_mock))
+    assert np.all(per_peak_panel == 7)
 
     output = f.getvalue()
     print(output)

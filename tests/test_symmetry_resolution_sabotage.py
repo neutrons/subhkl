@@ -1,5 +1,6 @@
 import pytest
-from subhkl.core.spacegroup import is_systematically_absent, get_centering
+
+from subhkl.core.spacegroup import get_centering, is_systematically_absent
 
 
 def test_centering_mapping_vulnerability():
@@ -34,5 +35,5 @@ def test_centering_type_resolution():
     # Gemmi might return 'P' or crash.
     try:
         assert get_centering("H") == "H"
-    except Exception as e:
+    except (AssertionError, RuntimeError, ValueError, KeyError) as e:
         pytest.fail(f"Bug Reproduced: 'H' centring failed! {e}")

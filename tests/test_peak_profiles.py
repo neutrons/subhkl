@@ -1,4 +1,5 @@
 import numpy as np
+
 from subhkl.search.sparse_rbf import integrate_peaks_rbf_ssn
 
 # =====================================================================
@@ -34,7 +35,7 @@ class MockDetector:
 class MockImage:
     def __init__(self, ims):
         self.ims = ims
-        self.bank_mapping = {k: "bank1" for k in ims.keys()}
+        self.bank_mapping = {k: "bank1" for k in ims}
 
     def get_run_id(self, img_key):
         return int(img_key.split("_")[1])

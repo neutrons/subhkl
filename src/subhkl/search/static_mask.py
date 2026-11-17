@@ -260,7 +260,7 @@ def estimate_static_mask(
                 extents[i] = max(sl[0].stop - sl[0].start, sl[1].stop - sl[1].start)
         H, W = lab.shape
         for r0, c0, sig in protect_disks:
-            ri, ci = int(round(r0)), int(round(c0))
+            ri, ci = round(r0), round(c0)
             height = max(
                 float(
                     band[

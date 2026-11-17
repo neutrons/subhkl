@@ -172,6 +172,7 @@ def test_sharded_indexer_runs_and_returns_a_solution(tmp_path):
         text=True,
         timeout=1200,
         env=env,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     line = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
@@ -194,6 +195,7 @@ def test_sharded_solve_matches_the_single_device_answer():
         text=True,
         timeout=1200,
         env=env,
+        check=False,
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     line = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]

@@ -22,14 +22,12 @@ the indices are checked against the stack before anything is drawn.
 
 import multiprocessing
 import os
-
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from functools import partial
 
 import h5py
 import numpy as np
-
 from tqdm import tqdm
 
 from subhkl.integration.api import Peaks
@@ -225,15 +223,15 @@ def _resolve_images_and_peaks(
         images_filename = None
     elif images_filename is not None and os.path.isfile(images_filename):
         # If the user passed (peaks.h5, images.h5) in reverse order, swap them
-        try:
-            with (
-                h5py.File(images_filename, "r") as f_a,
-                h5py.File(peaks_filename, "r") as f_b,
-            ):
-                if "peaks" in f_a and "images" not in f_a and "images" in f_b:
-                    images_filename, peaks_filename = peaks_filename, images_filename
-        except OSError:
-            pass
+        import contextlib
+
+        with (
+            contextlib.suppress(OSError),
+            h5py.File(images_filename, "r") as f_a,
+            h5py.File(peaks_filename, "r") as f_b,
+        ):
+            if "peaks" in f_a and "images" not in f_a and "images" in f_b:
+                images_filename, peaks_filename = peaks_filename, images_filename
 
     if images_filename is None:
         with h5py.File(peaks_filename, "r") as f:
@@ -370,7 +368,7 @@ def _attempt(call, out_name, written):
     """Run one render, keeping the path it wrote or reporting why it failed."""
     try:
         written.append(call())
-    except Exception:
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
         import traceback
 
         print(f"Visualization failed for {out_name}:")
@@ -434,7 +432,7 @@ def replay_mask_plots(
         runs.setdefault(images.get_run_id(img_key), []).append(img_key)
 
     tasks = []
-    for run_id, run_keys in runs.items():
+    for run_keys in runs.values():
         label = images.get_image_label(run_keys[0])
         out_name = os.path.join(output_dir, f"{label}-mask.png")
         overlay = {key: 1.0 - valid[img_keys.index(key)] for key in run_keys}

@@ -21,7 +21,7 @@ class BaseConcatenateMerger:
         per_file_keys : list[str]
             List of keys that are per-run/per-file (shape [N_runs, ...])
         """
-        self.h5_files = sorted(list(set(h5_files)))
+        self.h5_files = sorted(set(h5_files))
         self.copy_keys = copy_keys
         self.merge_keys = merge_keys
         self.per_file_keys = per_file_keys if per_file_keys is not None else []
@@ -48,10 +48,9 @@ class BaseConcatenateMerger:
                 total_peaks += num
 
                 num_runs_in_file = 0
-                if self.per_file_keys:
+                if self.per_file_keys and self.per_file_keys[0] in f_in:
                     # Assume each file is ONE run for now, OR check length of first per_file_key
-                    if self.per_file_keys[0] in f_in:
-                        num_runs_in_file = len(f_in[self.per_file_keys[0]])
+                    num_runs_in_file = len(f_in[self.per_file_keys[0]])
 
                 if num_runs_in_file == 0:
                     if "peaks/run_index" in f_in and len(f_in["peaks/run_index"]) > 0:
@@ -106,9 +105,7 @@ class BaseConcatenateMerger:
 
             offset = 0
             run_offset = 0
-            f_out["files"] = np.array(
-                list(map(lambda s: s.encode("utf-8"), self.h5_files))
-            )
+            f_out["files"] = np.array([s.encode("utf-8") for s in self.h5_files])
             f_out.create_dataset("file_offsets", (len(self.h5_files),), dtype=np.int64)
 
             for i_file, indexed_file in enumerate(self.h5_files):
@@ -233,14 +230,14 @@ class MTZExporter:
             self.phi = np.array(f["peaks/azimuthal"])
             self.intensity = np.array(f["peaks/intensity"])
             self.sigma = np.array(f["peaks/sigma"])
-            if "structure_factors" in f["peaks"].keys():
+            if "structure_factors" in f["peaks"]:
                 self.f = np.array(f["peaks/structure_factors"])
                 self.f_sigma = np.array(f["peaks/structure_factors_sigma"])
             else:
                 self.f = None
                 self.f_sigma = None
 
-            if "run_index" in f["peaks"].keys():
+            if "run_index" in f["peaks"]:
                 self.runs = np.array(f["peaks/run_index"])
             else:
                 self.runs = np.zeros_like(self.h, dtype=np.int32)
@@ -343,7 +340,7 @@ class MTZExporter:
         data = []
 
         for i in range(len(self.intensity)):
-            h, k, l = self.h[i], self.k[i], self.l[i]  # noqa: E741
+            h, k, l = self.h[i], self.k[i], self.l[i]
 
             # Drop invalid peaks
             if h == 0 and k == 0 and l == 0:

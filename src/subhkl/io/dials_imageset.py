@@ -124,7 +124,7 @@ def is_image_container(path):
     try:
         with h5py.File(path, "r") as f:
             return bool(f.attrs.get("subhkl_imageset", False))
-    except Exception:
+    except Exception:  # noqa: BLE001 - dxtbx format sniffing must never raise
         return False
 
 

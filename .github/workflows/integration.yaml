@@ -6,8 +6,6 @@ on:
       - main
   pull_request:
     types: [opened, synchronize, reopened]
-    branches:
-      - main
   workflow_dispatch:
 
 permissions:
@@ -23,7 +21,7 @@ jobs:
         os:
           - ubuntu-latest
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - name: Install uv

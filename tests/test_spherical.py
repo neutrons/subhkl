@@ -597,7 +597,7 @@ def test_nodal_points_are_the_zone_crossings():
     for node in ([0, 0, 1], [0, 1, 1], [1, 1, 1]):
         assert np.any(np.all(hkl == node, axis=1))
     # every node lies on the crossing of two zone rings of the family
-    axes, wz = zone_axes(np.diag([a, a, a]), max_index=1)
+    axes, _wz = zone_axes(np.diag([a, a, a]), max_index=1)
     G = hkl @ B.T
     dirs = G / np.linalg.norm(G, axis=1, keepdims=True)
     crossings = []
@@ -839,7 +839,7 @@ def test_channel_stacks_collapse_into_the_coupling():
     np.testing.assert_allclose(C1, C2, rtol=1e-4, atol=1e-4 * np.abs(C2).max())
     F = np.stack([project_points(_rand_dirs(rng, 50), None, L, sig) for _ in range(3)])
     G = np.stack([project_points(_rand_dirs(rng, 80), None, L, sig) for _ in range(3)])
-    Cj, al, be, ga = correlogram(F, G)
+    Cj, _al, _be, _ga = correlogram(F, G)
     Cn, *_ = correlogram(F, G, backend="numpy")
     np.testing.assert_allclose(Cj, Cn, rtol=1e-3, atol=1e-3 * np.abs(Cn).max())
     Cs = sum(correlogram(F[k], G[k])[0] for k in range(3))
@@ -912,7 +912,7 @@ def test_radial_correlogram_recovers_orientation_from_band_segments():
     C3, al, be, ga = correlogram(f3, g3)
     C2, *_ = correlogram(f2, g2)
     R3, v3 = top_orientations(C3, al, be, ga, n=1)[0]
-    R2, v2 = top_orientations(C2, al, be, ga, n=1)[0]
+    _R2, v2 = top_orientations(C2, al, be, ga, n=1)[0]
     assert _err_mod(R3, R0, _cubic_rots()) < 1.5
     assert null_zscore(C3, v3) >= 0.9 * null_zscore(C2, v2)
 

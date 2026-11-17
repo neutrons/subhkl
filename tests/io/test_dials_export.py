@@ -12,7 +12,6 @@ import pytest
 from subhkl.io import dials_export as dx
 from subhkl.io import dials_imageset as di
 
-
 # ---------------------------------------------------------------------------
 # Filename derivation
 # ---------------------------------------------------------------------------
@@ -47,7 +46,7 @@ def test_dials_output_paths_prefix_override():
 def test_require_dials_message():
     try:
         import dxtbx  # noqa: F401
-    except Exception:
+    except ImportError:
         pass
     else:
         pytest.skip("DIALS is installed; error path not exercised")
@@ -205,7 +204,7 @@ def test_frame_rotations_from_axes_angles(tmp_path):
     _write_finder(str(p))
     with h5py.File(p, "r") as f:
         peaks = dx._collect_flat_peaks(f)
-        rot, axes = dx._frame_rotations(f, peaks, [0, 1])
+        rot, _axes = dx._frame_rotations(f, peaks, [0, 1])
     assert set(rot) == {0, 1}
     # Both are valid rotation matrices (det ~ 1).
     for R in rot.values():
@@ -418,8 +417,8 @@ def test_frame_rotations_apply_offsets(tmp_path):
 
 def test_roundtrip_indexed(tmp_path):
     pytest.importorskip("dxtbx")
-    from dxtbx.model.experiment_list import ExperimentListFactory
     from dials.array_family import flex
+    from dxtbx.model.experiment_list import ExperimentListFactory
 
     h5 = tmp_path / "indexed.h5"
     _write_indexed(str(h5))
@@ -649,8 +648,8 @@ def test_roundtrip_sparse_peaks_keep_the_imageset(tmp_path):
     """Peaks on only some frames and banks still export every stack frame and
     bank, with images; a frame without peaks takes the stack's setting."""
     pytest.importorskip("dxtbx")
-    from dxtbx.model.experiment_list import ExperimentListFactory
     from dials.array_family import flex
+    from dxtbx.model.experiment_list import ExperimentListFactory
 
     stack = tmp_path / "merged.h5"
     _write_merged_stack(str(stack))  # frames 0 (0 deg) and 1 (10 deg), banks 11, 12

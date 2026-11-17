@@ -420,9 +420,7 @@ def test_refined_instrument_reaches_the_consumers_layout(tmp_path):
     with h5py.File(out_file) as fp:
         assert "detector_calibration" in fp
         banks = [int(b.split("_")[1]) for b in fp["detector_calibration"]]
-        assert set(banks) == set(
-            int(b) for b in np.unique(np.concatenate(recs["bank"]))
-        )
+        assert set(banks) == {int(b) for b in np.unique(np.concatenate(recs["bank"]))}
         ang = fp["goniometer/angles"][()]
         ang_nom = fp["goniometer/angles_nominal"][()]
         delta = fp["goniometer/per_run/delta_deg"][()]
@@ -499,7 +497,7 @@ def test_nodal_dictionary_indexes_end_to_end(tmp_path):
     replacing it."""
     rng = np.random.default_rng(29)
     peaks_file = str(tmp_path / "finder.h5")
-    U_true, n = _synthetic_finder_file(peaks_file, rng)
+    U_true, _n = _synthetic_finder_file(peaks_file, rng)
 
     out_nodal = str(tmp_path / "nodal.h5")
     run_spherical_index(
@@ -768,7 +766,7 @@ def test_corefinement_recovers_a_displaced_detector(tmp_path):
     rng = np.random.default_rng(61)
     peaks_file = str(tmp_path / "finder_displaced.h5")
     U_true, n = _synthetic_finder_file(
-        peaks_file, rng, wavelength=(2.0, 4.5), perturb=dict(radial=0.05, rot_deg=1.5)
+        peaks_file, rng, wavelength=(2.0, 4.5), perturb={"radial": 0.05, "rot_deg": 1.5}
     )
     assert n > 40
     errs = {}

@@ -97,7 +97,7 @@ def test_off_by_default_consumes_no_parameters():
     _, objective, _, _, _, _ = _make_fixture()
     off = objective()
     assert off.num_per_run_params == 0
-    loss, dist, _, _ = off.get_results(np.zeros((1, 3)))
+    loss, _dist, _, _ = off.get_results(np.zeros((1, 3)))
     assert np.isfinite(float(np.array(loss[0])))
 
 

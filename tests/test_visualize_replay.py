@@ -8,15 +8,13 @@ and that the files are read back as what they are: a peak's fitted width is a
 size on the detector, and an uncertainty on an intensity is not.
 """
 
-import numpy as np
 import h5py
+import numpy as np
 import pytest
 import scipy.special
-
 from PIL import Image
 
-from subhkl.io.parser import finder, finder_visualize, integrator_visualize
-from subhkl.io.parser import integrator
+from subhkl.io.parser import finder, finder_visualize, integrator, integrator_visualize
 from subhkl.viz import detector_assembly, replay
 
 INSTRUMENT = "MANDI"
@@ -37,7 +35,7 @@ def _write_images(path, runs=("frameA", "frameB")):
         # (M, 4): axis direction plus the sense of rotation.
         f.create_dataset("goniometer/axes", data=np.array([[0.0, 1.0, 0.0, 1.0]]))
         f.create_dataset("instrument/wavelength", data=[2.0, 4.0])
-        f["files"] = np.array([f"{name}.h5".encode("utf-8") for name in runs])
+        f["files"] = np.array([f"{name}.h5".encode() for name in runs])
         f.create_dataset("file_offsets", data=np.arange(len(runs), dtype=np.int64))
 
     return path
@@ -514,8 +512,8 @@ def test_candidates_are_drawn_at_their_own_radius(tmp_path):
     out wider than the narrow one -- which is exactly what a constant marker
     size cannot show.
     """
-    from subhkl.instrument.detector import Detector
     from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
 
     drawn = []
 
@@ -546,8 +544,8 @@ def test_candidates_are_drawn_at_their_own_radius(tmp_path):
 
 def test_a_candidate_with_no_usable_width_is_skipped():
     """A width of zero or NaN describes no peak, so nothing is drawn for it."""
-    from subhkl.instrument.detector import Detector
     from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
 
     drawn = []
 

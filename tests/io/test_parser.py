@@ -3,7 +3,7 @@ import re
 import pytest
 from typer.testing import CliRunner
 
-from subhkl.io.parser import app, finder, _maybe_export_dials
+from subhkl.io.parser import _maybe_export_dials, app, finder
 
 # Every subhkl CLI command should expose the DIALS-export options.
 DIALS_COMMANDS = [

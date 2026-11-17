@@ -98,7 +98,7 @@ def _synthetic_frames(rng, g_true, background=6.0, amplitude=80.0, sigma_px=2.0)
         im = np.full((H, W), background, float)
         mask, pr, pc = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
         for row, col in zip(np.asarray(pr)[mask], np.asarray(pc)[mask]):
-            i0, j0 = int(round(row)), int(round(col))
+            i0, j0 = round(row), round(col)
             r0, r1 = max(i0 - r, 0), min(i0 + r + 1, H)
             c0, c1 = max(j0 - r, 0), min(j0 + r + 1, W)
             if r1 <= r0 or c1 <= c0:

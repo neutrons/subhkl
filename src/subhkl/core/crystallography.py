@@ -28,7 +28,7 @@ def generate_reflections(a, b, c, alpha, beta, gamma, space_group="P 1", d_min=2
     if space_group is None:
         space_group = "P 1"
     constants = a, b, c, *np.deg2rad([alpha, beta, gamma])
-    B, Gstar = cartesian_matrix_metric_tensor(*constants)
+    _B, Gstar = cartesian_matrix_metric_tensor(*constants)
 
     astar, bstar, cstar = np.sqrt(np.diag(Gstar))
 
@@ -36,7 +36,7 @@ def generate_reflections(a, b, c, alpha, beta, gamma, space_group="P 1", d_min=2
     k_max = int(np.floor(1 / d_min / bstar))
     l_max = int(np.floor(1 / d_min / cstar))
 
-    h, k, l = np.meshgrid(  # noqa: E741
+    h, k, l = np.meshgrid(
         np.arange(-h_max, h_max + 1),
         np.arange(-k_max, k_max + 1),
         np.arange(-l_max, l_max + 1),
@@ -64,7 +64,7 @@ def generate_reflections(a, b, c, alpha, beta, gamma, space_group="P 1", d_min=2
 def get_q_lab(
     h: npt.ArrayLike,
     k: npt.ArrayLike,
-    l: npt.ArrayLike,  # noqa: E741
+    l: npt.ArrayLike,
     RUB: npt.ArrayLike,
 ) -> npt.NDArray:
     """

@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import h5py
 import numpy as np
-from scipy.ndimage import median_filter
 from scipy.spatial.transform import Rotation
 
 from subhkl.config import beamlines
@@ -214,6 +213,8 @@ def run_scan_refinement(
             "invalid band refinement budget, zones, resolution, deviance or border_width"
         )
     wl_low, wl_high = (None, None) if wavelength is None else wavelength
+    wl_low_explicit = wl_low is not None
+    wl_high_explicit = wl_high is not None
     if wl_low is None:
         wl_low = file_wl[0] if file_wl is not None else 2.85
     if wl_high is None:
@@ -224,17 +225,19 @@ def run_scan_refinement(
         (None, None) if assignment_wavelength is None else assignment_wavelength
     )
     if awl_low is None:
-        awl_low = (
-            file_wl[0]
-            if file_wl is not None
-            else (2.8 if wavelength == (2.85, 4.35) else wavelength[0])
-        )
+        if wl_low_explicit:
+            awl_low = wavelength[0]
+        elif file_wl is not None:
+            awl_low = file_wl[0]
+        else:
+            awl_low = 2.8 if wavelength == (2.85, 4.35) else wavelength[0]
     if awl_high is None:
-        awl_high = (
-            file_wl[1]
-            if file_wl is not None
-            else (4.5 if wavelength == (2.85, 4.35) else wavelength[1])
-        )
+        if wl_high_explicit:
+            awl_high = wavelength[1]
+        elif file_wl is not None:
+            awl_high = file_wl[1]
+        else:
+            awl_high = 4.5 if wavelength == (2.85, 4.35) else wavelength[1]
     assignment_wavelength = (float(awl_low), float(awl_high))
     for band in (wavelength, assignment_wavelength):
         if not 0 < band[0] < band[1]:
@@ -322,9 +325,12 @@ def run_scan_refinement(
         global_rot_axis=rot_axis,
         border_width=int(border_width),
     )
-    from subhkl.search.scan_band import refine_scan
     import jax
 
+    from subhkl.search.scan_band import refine_scan
+    from subhkl.search.spherical import enable_jax_compilation_cache
+
+    enable_jax_compilation_cache()
     with jax.enable_x64(), jax.default_matmul_precision("highest"):
         if bootstrap is None:
             from subhkl.search.blind_band import discover
@@ -337,22 +343,22 @@ def run_scan_refinement(
 
 
 def load_observations(args, *, return_kinematics=False):
-    with h5py.File(args.nexus) as f:
-        img_shape = f["images"].shape
-        n_frames, n_rows, n_cols = (
-            int(img_shape[0]),
-            int(img_shape[1]),
-            int(img_shape[2]),
-        )
-        offsets = _frame_offsets(f, n_frames)
-        R_frames, _, angles, _, scan_axes_lab = _frame_rotations_and_scan_axes(
-            f, n_frames
-        )
-        if angles is None:
-            angles = np.zeros((n_frames, 1), dtype=float)
-        frame_banks = np.asarray(f["bank_ids"], int)
-        run_ids = np.searchsorted(offsets, np.arange(n_frames), side="right") - 1
-        if args.finder:
+    if args.finder:
+        with h5py.File(args.nexus) as f:
+            img_shape = f["images"].shape
+            n_frames, n_rows, n_cols = (
+                int(img_shape[0]),
+                int(img_shape[1]),
+                int(img_shape[2]),
+            )
+            offsets = _frame_offsets(f, n_frames)
+            R_frames, _, angles, _, scan_axes_lab = _frame_rotations_and_scan_axes(
+                f, n_frames
+            )
+            if angles is None:
+                angles = np.zeros((n_frames, 1), dtype=float)
+            frame_banks = np.asarray(f["bank_ids"], int)
+            run_ids = np.searchsorted(offsets, np.arange(n_frames), side="right") - 1
             with h5py.File(args.finder) as peaks:
                 images = np.asarray(peaks["peaks/image_index"], int)
                 banks = np.asarray(peaks["bank"], int)
@@ -375,104 +381,80 @@ def load_observations(args, *, return_kinematics=False):
                     np.sqrt(np.maximum(dev, 0)),
                 )
                 kinematics = (R_frames[images], scan_axes_lab[images])
+    else:
+        # No connected components, local maxima or signal qualification.
+        # All instrument-valid bins contribute, including negative excess.
+        from subhkl.search.pixel_em import load_binned_nexus_panels
+
+        b = int(args.binning)
+        bw = int(getattr(args, "border_width", 4))
+        sel_runs = [int(r) for r in args.runs]
+        mask_path = getattr(args, "static_mask_file", None)
+        expected_key = (
+            str(Path(args.nexus).resolve()),
+            b,
+            bw,
+            tuple(sorted({int(r) for r in sel_runs})),
+            str(Path(mask_path).resolve()) if mask_path else None,
+        )
+        cached = getattr(args, "_prebinned_panel_cache", None)
+        if isinstance(cached, dict) and cached.get("key") == expected_key:
+            data = cached
         else:
-            # No connected components, local maxima or signal qualification.
-            # All instrument-valid bins contribute, including negative excess.
-            b = int(args.binning)
-            if n_rows % b or n_cols % b:
-                raise ValueError(
-                    f"band binning ({b}) must divide the detector size ({n_rows}x{n_cols})"
-                )
-            centers_r = np.arange(n_rows // b) * b + (b - 1) / 2
-            centers_c = np.arange(n_cols // b) * b + (b - 1) / 2
-            rr_0, cc_0 = np.meshgrid(centers_r, centers_c, indexing="ij")
-            rows_full, cols_full = np.meshgrid(
-                np.arange(n_rows, dtype=float),
-                np.arange(n_cols, dtype=float),
-                indexing="ij",
+            data = load_binned_nexus_panels(
+                args.nexus,
+                sel_runs=sel_runs,
+                binning=b,
+                border_width=bw,
+                static_mask_file=mask_path,
+                strict_mask_check=True,
             )
-            rows_bin = rows_full.reshape(n_rows // b, b, n_cols // b, b)
-            cols_bin = cols_full.reshape(n_rows // b, b, n_cols // b, b)
-            collected = [[] for _ in range(8)]
-            collected_kin = [[], []]
-            mask_file = (
-                h5py.File(args.static_mask_file) if args.static_mask_file else None
+            if data is not None:
+                try:
+                    args._prebinned_panel_cache = data
+                except AttributeError:
+                    pass
+        if data is None or len(data["sel_indices"]) == 0:
+            raise ValueError("no weighted observations in selected runs")
+
+        collected = [[] for _ in range(8)]
+        collected_kin = [[], []]
+        fb_sel = data["frame_banks_sel"]
+        ri_sel = data["run_ids_sel"]
+        ang_sel = data["angles_sel"]
+        Rf_sel = data["R_frames_sel"]
+        sa_sel = data["scan_axes_sel"]
+        y_f = data["y_frames"]
+        g_f = data["good_frames"]
+        bg7_f = data["bg7_frames"]
+        dev_f = data["dev_frames"]
+        rr_f = data["rr_frames"]
+        cc_f = data["cc_frames"]
+
+        for k in range(len(fb_sel)):
+            good = g_f[k]
+            n = int(good.sum())
+            if n == 0:
+                continue
+            weight = y_f[k] - bg7_f[k]
+            values = (
+                np.full(n, fb_sel[k]),
+                rr_f[k][good],
+                cc_f[k][good],
+                dev_f[k][good],
+                np.zeros(n),
+                np.full(n, ri_sel[k]),
+                np.repeat(ang_sel[k : k + 1], n, axis=0),
+                weight[good],
             )
-            bw = int(getattr(args, "border_width", 4))
-            try:
-                for i in range(n_frames):
-                    if run_ids[i] not in args.runs:
-                        continue
-                    raw = np.asarray(f["images"][i], float)
-                    valid = np.isfinite(raw) & (raw >= 0)
-                    if mask_file is not None:
-                        key = "masks" if "masks" in mask_file else "images"
-                        ids = mask_file["bank_ids"][()]
-                        matches = np.flatnonzero(ids == frame_banks[i])
-                        if len(matches) != 1:
-                            raise ValueError("mask must have one entry per bank")
-                        valid &= np.asarray(mask_file[key][matches[0]], bool)
-                    if bw > 0 and n_rows > 4 * max(b, bw) and n_cols > 4 * max(b, bw):
-                        raw = np.pad(raw[bw:-bw, bw:-bw], bw, mode="edge")
-                        if bw >= b:
-                            valid[: (bw // b) * b, :] = False
-                            valid[-((bw // b) * b) :, :] = False
-                            valid[:, : (bw // b) * b] = False
-                            valid[:, -((bw // b) * b) :] = False
-                    raw_blocks = np.where(valid, raw, 0).reshape(
-                        n_rows // b, b, n_cols // b, b
-                    )
-                    y = raw_blocks.sum((1, 3))
-                    good = valid.reshape(n_rows // b, b, n_cols // b, b).all((1, 3))
-                    bg = median_filter(y, size=7, mode="nearest")
-                    weight = y - bg
-                    bg_5 = median_filter(y, size=5, mode="nearest")
-                    bg_safe = np.maximum(bg_5, 1.0)
-                    y_safe = np.maximum(y, bg_safe)
-                    dev_bin = np.where(
-                        y > bg_safe,
-                        2.0 * (y_safe * np.log(y_safe / bg_safe) - (y_safe - bg_safe)),
-                        0.0,
-                    )
-                    excess_sq = (
-                        np.maximum(raw_blocks - (bg_5 / (b * b))[:, None, :, None], 0.0)
-                        ** 2
-                    )
-                    excess_sum = excess_sq.sum((1, 3))
-                    rr = np.where(
-                        excess_sum > 0,
-                        (excess_sq * rows_bin).sum((1, 3))
-                        / np.maximum(excess_sum, 1e-12),
-                        rr_0,
-                    )
-                    cc = np.where(
-                        excess_sum > 0,
-                        (excess_sq * cols_bin).sum((1, 3))
-                        / np.maximum(excess_sum, 1e-12),
-                        cc_0,
-                    )
-                    n = int(good.sum())
-                    values = (
-                        np.full(n, frame_banks[i]),
-                        rr[good],
-                        cc[good],
-                        dev_bin[good],
-                        np.zeros(n),
-                        np.full(n, run_ids[i]),
-                        np.repeat(angles[i : i + 1], n, axis=0),
-                        weight[good],
-                    )
-                    for dest, value in zip(collected, values):
-                        dest.append(value)
-                    collected_kin[0].append(np.repeat(R_frames[i : i + 1], n, axis=0))
-                    collected_kin[1].append(
-                        np.repeat(scan_axes_lab[i : i + 1], n, axis=0)
-                    )
-                result = tuple(np.concatenate(v) for v in collected)
-                kinematics = tuple(np.concatenate(v) for v in collected_kin)
-            finally:
-                if mask_file is not None:
-                    mask_file.close()
+            for dest, value in zip(collected, values):
+                dest.append(value)
+            collected_kin[0].append(np.repeat(Rf_sel[k : k + 1], n, axis=0))
+            collected_kin[1].append(np.repeat(sa_sel[k : k + 1], n, axis=0))
+        if not collected[0]:
+            raise ValueError("no weighted observations in selected runs")
+        result = tuple(np.concatenate(v) for v in collected)
+        kinematics = tuple(np.concatenate(v) for v in collected_kin)
     selected = np.isin(result[5], args.runs)
     if args.finder:
         selected &= result[3] >= args.min_deviance
@@ -559,19 +541,90 @@ def checkpoint(args, name, parameters, diagnostics, snapshot=None):
                     and "blind_search" not in f
                     and os.path.isfile(str(args.blind_search))
                 ):
-                    try:
-                        with h5py.File(args.blind_search, "r") as sf:
-                            if "search" in sf:
-                                sf.copy("search", f, name="blind_search")
-                    except Exception:
-                        pass
+                    import contextlib
+
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, KeyError, ValueError
+                        ),
+                        h5py.File(args.blind_search, "r") as sf,
+                    ):
+                        if "search" in sf:
+                            sf.copy("search", f, name="blind_search")
         os.replace(tmp_path, path)
+        if snapshot is not None and (
+            os.environ.get("SUBHKL_LIVE_STDIO") == "1"
+            or "PYTEST_CURRENT_TEST" not in os.environ
+        ):
+            import contextlib
+
+            with contextlib.suppress(
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
+                import base64
+                import zlib
+
+                live_banks = {}
+                for i_b, b_id in enumerate(snapshot.get("banks", [])):
+                    live_banks[str(int(b_id))] = {
+                        "center": [
+                            round(float(x), 6)
+                            for x in np.asarray(snapshot["centers"][i_b]).ravel()[:3]
+                        ],
+                        "uhat": [
+                            round(float(x), 6)
+                            for x in np.asarray(snapshot["uhats"][i_b]).ravel()[:3]
+                        ],
+                        "vhat": [
+                            round(float(x), 6)
+                            for x in np.asarray(snapshot["vhats"][i_b]).ravel()[:3]
+                        ],
+                        "width": round(float(snapshot["widths"][i_b]), 6),
+                        "height": round(float(snapshot["heights"][i_b]), 6),
+                    }
+                live_doc = {
+                    "kind": "stages",
+                    "instrument": str(args.instrument),
+                    "space_group": str(args.space_group),
+                    "wavelength": [
+                        float(args.assign_wavelength[0]),
+                        float(args.assign_wavelength[1]),
+                    ],
+                    "band_wavelength": [float(args.wl_min), float(args.wl_max)],
+                    "d_min": float(args.d_min),
+                    "stage": str(name),
+                    "n_zones": int(
+                        snapshot.get("n_zones", getattr(args, "n_zones", 120))
+                    ),
+                    "cell": [round(float(v), 5) for v in snapshot["cell"][:6]],
+                    "U": np.round(np.asarray(snapshot["U"], dtype=float), 6).tolist(),
+                    "B": np.round(np.asarray(snapshot["B"], dtype=float), 6).tolist(),
+                    "R": (
+                        np.round(np.asarray(snapshot["R"], dtype=float), 6).tolist()
+                        if snapshot.get("R") is not None
+                        else None
+                    ),
+                    "stages": diagnostics,
+                    "banks": live_banks,
+                }
+                b64 = base64.b64encode(
+                    zlib.compress(
+                        json.dumps(live_doc, separators=(",", ":")).encode("utf-8"),
+                        level=9,
+                    )
+                ).decode("ascii")
+                print(f"[subhkl-live-state] {b64}", flush=True)
     finally:
         if tmp_path.exists():
-            try:
+            import contextlib
+
+            with contextlib.suppress(OSError):
                 tmp_path.unlink()
-            except Exception:
-                pass
 
 
 def _decompose_R_to_angles(axes, ang_nom, R_target):
@@ -588,6 +641,13 @@ def _decompose_R_to_angles(axes, ang_nom, R_target):
             np.array([0.0, 2.0, 0.0]),
             np.array([0.0, -2.0, 0.0]),
             np.zeros(3),
+            np.array([0.0, 180.0, 0.0]),
+            np.array([0.0, -180.0, 0.0]),
+            np.array([0.0, 90.0, 0.0]),
+            np.array([0.0, -90.0, 0.0]),
+            np.array([-90.0, 180.0, 0.0]),
+            np.array([90.0, 180.0, 0.0]),
+            np.array([180.0, 180.0, 0.0]),
         ]
     else:
         free_cols = list(range(min(K, 3)))
@@ -761,6 +821,27 @@ def write_result(
             if hasattr(args, "pixel_diagnostics"):
                 for name, values in args.pixel_diagnostics.items():
                     report[f"pixel_polish/{name}"] = values
+            em_mask_res = getattr(args, "em_pixel_result", None)
+            if em_mask_res is not None:
+                put("detector/mask_bank_ids", em_mask_res.bank_ids)
+                out.create_dataset(
+                    "detector/pixel_mask",
+                    data=em_mask_res.pixel_mask,
+                    compression="gzip",
+                    compression_opts=1,
+                )
+                out.create_dataset(
+                    "detector/pixel_class",
+                    data=em_mask_res.pixel_class,
+                    compression="gzip",
+                    compression_opts=1,
+                )
+                report.attrs["em_valid_fraction"] = float(em_mask_res.valid_fraction)
+                report.attrs["em_dark_fraction"] = float(em_mask_res.dark_fraction)
+                report.attrs["em_bright_fraction"] = float(em_mask_res.bright_fraction)
+                report.attrs["em_dead_banks"] = json.dumps(em_mask_res.dead_banks)
+                report.attrs["em_dark_bins"] = int(em_mask_res.n_dark_bins)
+                report.attrs["em_bright_bins"] = int(em_mask_res.n_bright_bins)
             # Shared visualization contract; this is a band objective, not a
             # Poisson fit, so no Poisson deviance or stationarity is invented.
             view = out.create_group("solve")

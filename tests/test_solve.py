@@ -5,8 +5,8 @@ import copy
 import h5py
 import numpy as np
 import pytest
-from scipy.special import ndtr
 from scipy.spatial.transform import Rotation
+from scipy.special import ndtr
 from typer.testing import CliRunner
 
 from subhkl.calibrate import geometry_detectors, write_detector_calibration
@@ -284,9 +284,10 @@ def test_invalid_profile_rejected(u, f):
 def test_failed_intensity_fit_retains_diagnostics(
     scene, tmp_path, monkeypatch, inner_failure
 ):
-    import subhkl.solve as workflow
-    import subhkl.search.poisson_orientation as engine
     from dataclasses import replace
+
+    import subhkl.search.poisson_orientation as engine
+    import subhkl.solve as workflow
 
     original = engine.fit_intensities
 

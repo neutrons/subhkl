@@ -1,14 +1,14 @@
+from dataclasses import dataclass
+
 import cv2
 import numpy as np
 import PIL.Image
 
-from dataclasses import dataclass
-
+from subhkl.core.crystallography import generate_reflections
 from subhkl.instrument.detector import Detector
 from subhkl.instrument.physics import (
     predict_reflections_on_panel,
 )
-from subhkl.core.crystallography import generate_reflections
 
 
 @dataclass
@@ -46,6 +46,7 @@ def _render_finder_unrolled_plot(args):
     run_id, peaks, images, detectors, finder_peaks, instrument = args
 
     import matplotlib.pyplot as plt
+
     from subhkl.viz.detector_assembly import plot_unrolled_detector
 
     # Force non-interactive backend for thread safety
@@ -85,7 +86,7 @@ def process_single_image(
     evidence, and nothing downstream consumes a finder amplitude.
     """
     # Unpack tuple arguments
-    algo, harvest_kwargs, pre_coords = finder_info
+    algo, _harvest_kwargs, pre_coords = finder_info
     mask_file, erosion = mask_info
     gonio_R, gonio_angles, wl_min, wl_max = geometry_info
 

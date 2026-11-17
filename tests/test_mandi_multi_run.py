@@ -1,10 +1,11 @@
+import random
 import subprocess
-import pytest
+import time
 from pathlib import Path
+
 import h5py
 import numpy as np
-import random
-import time
+import pytest
 
 # These tests run on the mesolite dataset, which is downloaded on demand, so
 # they are deselected by default; run them with `pytest -m mesolite`.
@@ -25,7 +26,7 @@ FINDER_PARAMS = [
 def random_mesolite_pair(mesolite_data):
     """Pick two random MANDI files with significantly different goniometer settings."""
     path = Path(mesolite_data)
-    available_files = sorted(list(path.glob("MANDI_*.nxs.h5")))
+    available_files = sorted(path.glob("MANDI_*.nxs.h5"))
 
     if len(available_files) < 2:
         pytest.skip(
@@ -168,7 +169,7 @@ def run_indexing_pipeline(input_h5, tmp_path, label):
     with h5py.File(indexed_h5, "r") as f:
         assert "peaks/h" in f
         h = f["peaks/h"][()]
-        indexed_count = np.sum((h != 0))
+        indexed_count = np.sum(h != 0)
         print(f"[{label}] Indexed peaks: {indexed_count} / {len(h)}")
 
         from subhkl.instrument.metrics import compute_metrics
@@ -211,8 +212,7 @@ def test_mandi_multi_run_finder_merger(random_mesolite_pair, tmp_path):
 
     finder_list_file = tmp_path / "finder_files.txt"
     with open(finder_list_file, "w") as f:
-        for out in finder_outputs:
-            f.write(f"{out}\n")
+        f.writelines(f"{out}\n" for out in finder_outputs)
 
     merged_h5 = tmp_path / "merged_finder.h5"
     subprocess.run(

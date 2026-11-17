@@ -52,7 +52,7 @@ def download_mesolite_data() -> Path:
         try:
             print(f"  [{i}/{len(needed_files)}] Downloading {filename}...")
             urllib.request.urlretrieve(file_url, file_path)
-        except Exception as e:
+        except (OSError, urllib.error.URLError) as e:
             print(f"  Warning: Failed to download {filename}: {e}")
             continue
 

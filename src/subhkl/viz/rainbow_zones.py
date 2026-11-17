@@ -13,19 +13,21 @@ Key features:
      to switch between Cylindrical and Spherical views at any time.
 3. **2-Layer Depth Parallax ("Look Behind the Predicted Spots")**:
    - *Back Layer (Detector Plate)*: Physical detector bank panels & log1p pixel intensity heatmaps.
-   - *Front Layer (Bragg Reflections)*: Vibrant spectral Bragg peak rings floating by
-     resolution ($d$-spacing) with subtle depth tethers to their physical spots on the
-     detector plate — moving the mouse shifts the predicted rings aside so you can
-     inspect the raw detector spot morphology directly underneath!
+   - *Front Layer (Bragg Reflections)*: Vibrant spectral Bragg peak rings floating
+     above the detector plate — moving the mouse shifts the predicted rings aside
+     without tether lines so you can inspect the unoccluded raw detector spot
+     morphology directly underneath!
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import glob
 import io
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,14 @@ import h5py
 import numpy as np
 from PIL import Image
 
+from subhkl import (
+    format_version_badge,
+    get_container_image,
+)
+from subhkl import (
+    get_version as get_subhkl_version,
+)
+from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_LOGO_SVG
 from subhkl.viz.zones import (
     _cell_from_B,
     _spherical_angles,
@@ -70,12 +80,245 @@ PRO_PALETTE_HEX = [
 # Instruments whose native detector arrangement is spherical rather than cylindrical
 SPHERICAL_INSTRUMENTS = {"MANDI", "TOPAZ", "SNS_MANDI", "CORELLI"}
 
+_FALLBACK_INSTRUMENT_WAVELENGTHS: dict[str, tuple[float, float]] = {
+    "IMAGINE": (2.0, 4.0),
+    "CG4D": (2.8, 4.5),
+    "SNAP": (1.0, 4.0),
+    "CORELLI": (0.6, 2.5),
+    "TOPAZ": (0.4, 3.5),
+    "MANDI": (2.0, 4.0),
+    "WAND²": (1.44, 1.54),
+    "DEMAND": (1.50, 1.60),
+}
+
+
+def _load_reduction_wavelength_defaults() -> dict[str, list[float]]:
+    """Load default [lambda_min, lambda_max] per instrument from ``reduction_settings.json``."""
+    out: dict[str, list[float]] = {
+        k: [float(v[0]), float(v[1])]
+        for k, v in _FALLBACK_INSTRUMENT_WAVELENGTHS.items()
+    }
+    res_path = (
+        Path(__file__).resolve().parent.parent / "resources" / "reduction_settings.json"
+    )
+    if res_path.is_file():
+        with (
+            contextlib.suppress(OSError, ValueError, TypeError, KeyError),
+            open(res_path, encoding="utf-8") as fh,
+        ):
+            doc = json.load(fh)
+            if isinstance(doc, dict):
+                for inst_k, cfg in doc.items():
+                    if not isinstance(cfg, dict) or "Wavelength" not in cfg:
+                        continue
+                    wl_val = cfg["Wavelength"]
+                    if isinstance(wl_val, (list, tuple)) and len(wl_val) >= 2:
+                        w0, w1 = float(wl_val[0]), float(wl_val[1])
+                        if w0 > 0 and w1 > w0:
+                            out[str(inst_k).strip().upper()] = [
+                                round(w0, 3),
+                                round(w1, 3),
+                            ]
+                    elif isinstance(wl_val, (int, float)) and float(wl_val) > 0:
+                        w_c = float(wl_val)
+                        out[str(inst_k).strip().upper()] = [
+                            round(max(0.1, w_c - 0.05), 3),
+                            round(w_c + 0.05, 3),
+                        ]
+    return out
+
+
+def _get_instrument_default_wavelength(instrument: str | None) -> tuple[float, float]:
+    """Return ``(wavelength_min, wavelength_max)`` from ``reduction_settings.json`` for ``instrument``."""
+    defaults = _load_reduction_wavelength_defaults()
+    key = str(instrument or "CG4D").strip().upper()
+    if key in defaults:
+        pair = defaults[key]
+        return (float(pair[0]), float(pair[1]))
+    return _FALLBACK_INSTRUMENT_WAVELENGTHS.get(key, (2.0, 4.5))
+
 
 def default_projection_for_instrument(instrument: str | None) -> str:
     """Return ``'spherical'`` for spherical instruments (e.g. MANDI) and ``'cylindrical'`` for cylindrical ones (e.g. CG4D)."""
     if instrument and str(instrument).strip().upper() in SPHERICAL_INSTRUMENTS:
         return "spherical"
     return "cylindrical"
+
+
+_UNIT_CELL_NUM_PAT = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?"
+_UNIT_CELL_SIX_FRONT_RE = re.compile(
+    rf"^\s*((?:{_UNIT_CELL_NUM_PAT}[\s,;]+){{5}}{_UNIT_CELL_NUM_PAT})(?:\s*[,;|]?\s*(.*))?$",
+    re.IGNORECASE,
+)
+_UNIT_CELL_SIX_BACK_RE = re.compile(
+    rf"^(.*?)(?:[\s,;|]+)((?:{_UNIT_CELL_NUM_PAT}[\s,;]+){{5}}{_UNIT_CELL_NUM_PAT})\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_unit_cell_text(text: str | None) -> dict[str, Any] | None:
+    """Parse clipboard or freeform unit-cell text into ``{'cell': [a,b,c,alpha,beta,gamma], 'space_group': str}``.
+
+    Supports:
+    - 6 numbers followed by space group (e.g. ``'68.84174 98.06962 90.91568 90.07304 106.11396 90.0088 P21'``)
+    - Space group followed by 6 numbers (e.g. ``'P 21 21 21 68.7 69.8 156.9 90 90 90'``)
+    - 6 numbers alone (e.g. ``'68.84 98.07 90.92 90.07 106.11 90.0'``)
+    """
+    if not text or not isinstance(text, str):
+        return None
+    s = text.strip()
+    if not s:
+        return None
+    s = re.sub(r"^[\[\(\{]+|[\]\)\}]+$", "", s).strip()
+    s = re.sub(
+        r"\b(?:a|b|c|alpha|beta|gamma|sg|space_group|spacegroup)\s*=\s*",
+        " ",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"[αβγ]\s*=\s*", " ", s)
+    s = re.sub(r"(?<=\d)\s*(?:°|deg|Å|angstrom)\b", "", s, flags=re.IGNORECASE)
+    s = s.replace("°", " ").strip()
+
+    def _validate_six(nums_str: str) -> list[float] | None:
+        try:
+            vals = [float(x) for x in re.findall(_UNIT_CELL_NUM_PAT, nums_str)]
+        except ValueError:
+            return None
+        if len(vals) != 6:
+            return None
+        if any(not np.isfinite(v) or v <= 0.0 for v in vals[:3]):
+            return None
+        if any(not np.isfinite(v) or v <= 10.0 or v >= 180.0 for v in vals[3:6]):
+            return None
+        return vals
+
+    m_front = _UNIT_CELL_SIX_FRONT_RE.match(s)
+    if m_front:
+        cell = _validate_six(m_front.group(1))
+        if cell is not None:
+            sg = (m_front.group(2) or "").strip(" ,;|\t\r\n")
+            return {"cell": cell, "space_group": sg}
+
+    m_back = _UNIT_CELL_SIX_BACK_RE.match(s)
+    if m_back:
+        cell = _validate_six(m_back.group(2))
+        if cell is not None:
+            sg = (m_back.group(1) or "").strip(" ,;|\t\r\n")
+            return {"cell": cell, "space_group": sg}
+
+    return None
+
+
+def _symmetry_rules_for_setting(
+    crystal_system: str,
+    setting: str,
+    hm: str = "",
+    number: int | None = None,
+) -> dict[str, Any]:
+    linked_lengths: dict[str, str] = {}
+    linked_angles: dict[str, str] = {}
+    fixed_angles: dict[str, float] = {}
+
+    if setting == "cubic":
+        linked_lengths = {"b": "a", "c": "a"}
+        fixed_angles = {"alpha": 90.0, "beta": 90.0, "gamma": 90.0}
+    elif setting == "tetragonal":
+        linked_lengths = {"b": "a"}
+        fixed_angles = {"alpha": 90.0, "beta": 90.0, "gamma": 90.0}
+    elif setting in ("hexagonal", "trigonal"):
+        linked_lengths = {"b": "a"}
+        fixed_angles = {"alpha": 90.0, "beta": 90.0, "gamma": 120.0}
+    elif setting == "trigonal_r":
+        linked_lengths = {"b": "a", "c": "a"}
+        linked_angles = {"beta": "alpha", "gamma": "alpha"}
+    elif setting == "orthorhombic":
+        fixed_angles = {"alpha": 90.0, "beta": 90.0, "gamma": 90.0}
+    elif setting == "monoclinic_b":
+        fixed_angles = {"alpha": 90.0, "gamma": 90.0}
+    elif setting == "monoclinic_c":
+        fixed_angles = {"alpha": 90.0, "beta": 90.0}
+    elif setting == "monoclinic_a":
+        fixed_angles = {"beta": 90.0, "gamma": 90.0}
+
+    return {
+        "crystal_system": crystal_system,
+        "setting": setting,
+        "hm": hm,
+        "number": number,
+        "linked_lengths": linked_lengths,
+        "linked_angles": linked_angles,
+        "fixed_angles": fixed_angles,
+    }
+
+
+def resolve_space_group_symmetry(space_group: str | None) -> dict[str, Any]:
+    """Resolve crystal system and unit-cell parameter constraints for ``space_group``."""
+    raw = str(space_group or "").strip()
+    if not raw:
+        return _symmetry_rules_for_setting("triclinic", "triclinic", "", None)
+    with contextlib.suppress(Exception):
+        import gemmi
+
+        sg = None
+        if raw.isdigit():
+            num = int(raw)
+            if 1 <= num <= 230:
+                sg = gemmi.find_spacegroup_by_number(num)
+        if sg is None:
+            sg = gemmi.find_spacegroup_by_name(raw)
+        if sg is not None:
+            cs = sg.crystal_system_str()
+            if cs == "trigonal" and (sg.ext == "R" or raw.lower().endswith(":r")):
+                setting = "trigonal_r"
+            elif cs == "monoclinic":
+                parts = sg.hm.split()
+                if len(parts) == 4 and parts[1] == "1" and parts[3] != "1":
+                    setting = "monoclinic_c"
+                elif len(parts) == 4 and parts[1] != "1" and parts[3] == "1":
+                    setting = "monoclinic_a"
+                else:
+                    setting = "monoclinic_b"
+            else:
+                setting = cs
+            return _symmetry_rules_for_setting(cs, setting, sg.xhm(), sg.number)
+    return _symmetry_rules_for_setting("triclinic", "triclinic", raw, None)
+
+
+_CACHED_SG_SYMMETRY_JSON: str | None = None
+
+
+def _build_space_group_symmetry_lookup_json() -> str:
+    """Build a compact JSON mapping of crystal-system settings to normalized space-group keys."""
+    global _CACHED_SG_SYMMETRY_JSON
+    if _CACHED_SG_SYMMETRY_JSON is not None:
+        return _CACHED_SG_SYMMETRY_JSON
+    groups: dict[str, set[str]] = {}
+    with contextlib.suppress(Exception):
+        import gemmi
+
+        for sg in gemmi.spacegroup_table():
+            cs = sg.crystal_system_str()
+            if cs == "trigonal" and sg.ext == "R":
+                code = "trigonal_r"
+            elif cs == "monoclinic":
+                parts = sg.hm.split()
+                if len(parts) == 4 and parts[1] == "1" and parts[3] != "1":
+                    code = "monoclinic_c"
+                elif len(parts) == 4 and parts[1] != "1" and parts[3] == "1":
+                    code = "monoclinic_a"
+                else:
+                    code = "monoclinic_b"
+            else:
+                code = cs
+            for k in (sg.xhm(), sg.hm, sg.short_name()):
+                norm = k.lower().replace(" ", "")
+                if norm:
+                    groups.setdefault(code, set()).add(norm)
+    _CACHED_SG_SYMMETRY_JSON = json.dumps(
+        {k: sorted(v) for k, v in groups.items()}, separators=(",", ":")
+    )
+    return _CACHED_SG_SYMMETRY_JSON
 
 
 def _decode_str(val: Any, default: str = "") -> str:
@@ -91,7 +334,9 @@ def _decode_str(val: Any, default: str = "") -> str:
     return str(val)
 
 
-def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, Any]:
+def _load_detectors_from_h5(
+    f: h5py.File | None, instrument: str | None
+) -> dict[int, Any]:
     """Load calibrated or nominal detector banks from ``subhkl.config.beamlines`` + HDF5 calibration."""
     from subhkl.config import beamlines
     from subhkl.instrument.detector import Detector
@@ -106,12 +351,12 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
                 pass
 
     for bank_id, cfg in base_configs.items():
-        try:
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError
+        ):
             detectors[bank_id] = Detector(cfg)
-        except Exception:
-            pass
 
-    if "detector_calibration" in f:
+    if f is not None and "detector_calibration" in f:
         cal_grp = f["detector_calibration"]
         for name in cal_grp:
             if not name.startswith("bank_"):
@@ -130,10 +375,10 @@ def _load_detectors_from_h5(f: h5py.File, instrument: str | None) -> dict[int, A
             for field in ("width", "height"):
                 if field in g:
                     cfg[field] = float(g[field][()])
-            try:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
                 detectors[bank_id] = Detector(cfg)
-            except Exception:
-                pass
 
     return detectors
 
@@ -145,49 +390,81 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
     p = Path(replay_h5).resolve()
     if not p.exists():
         return None
-    try:
-        with h5py.File(p, "r") as f:
-            if "images" in f:
-                return str(p)
-            src_attr = _decode_str(f.attrs.get("source"), "")
-            if not src_attr and "scan_refinement" in f:
-                src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
-            if not src_attr and "search" in f:
-                src_attr = _decode_str(f["search"].attrs.get("source"), "")
-            if src_attr:
-                for cand_src in (Path(src_attr), p.parent / Path(src_attr).name):
-                    if cand_src.exists():
-                        try:
-                            with h5py.File(cand_src, "r") as sf:
-                                if "images" in sf:
-                                    return str(cand_src.resolve())
-                        except Exception:
-                            pass
-            if "files" in f:
-                try:
-                    raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
-                    raw_files = [x for x in raw_files if x]
-                    if raw_files:
-                        first_stem = os.path.basename(raw_files[0]).split(".")[0]
-                        last_stem = os.path.basename(raw_files[-1]).split(".")[0]
-                        for tag in (
-                            first_stem,
-                            f"{first_stem}_{last_stem}",
-                        ):
-                            safe_tag = "".join(
-                                c if (c.isalnum() or c in "._-") else "_" for c in tag
-                            )
+    with (
+        contextlib.suppress(OSError, RuntimeError, ValueError, TypeError, KeyError),
+        h5py.File(p, "r") as f,
+    ):
+        if "images" in f:
+            return str(p)
+        if "files" in f:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
+                raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
+                raw_files = [x for x in raw_files if x]
+                if raw_files:
+                    first_stem = os.path.basename(raw_files[0]).split(".")[0]
+                    last_stem = os.path.basename(raw_files[-1]).split(".")[0]
+                    for tag in (
+                        f"{first_stem}_{last_stem}",
+                        first_stem,
+                    ):
+                        safe_tag = "".join(
+                            c if (c.isalnum() or c in "._-") else "_" for c in tag
+                        )
+                        for m_fn in (f"{safe_tag}_merged.h5", "merged.h5"):
                             work_cand = (
                                 Path(tempfile.gettempdir())
                                 / f"subhkl_work_{safe_tag}"
-                                / "merged.h5"
+                                / m_fn
                             )
                             if work_cand.is_file():
-                                return str(work_cand.resolve())
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                                with (
+                                    contextlib.suppress(
+                                        OSError, RuntimeError, KeyError
+                                    ),
+                                    h5py.File(work_cand, "r") as wf,
+                                ):
+                                    if "images" in wf:
+                                        return str(work_cand.resolve())
+                        for gx_cand in sorted(
+                            glob.glob(
+                                os.path.join(
+                                    tempfile.gettempdir(),
+                                    f"subhkl_gx_*_{safe_tag}_merged.h5",
+                                )
+                            )
+                        ):
+                            if os.path.isfile(gx_cand):
+                                with (
+                                    contextlib.suppress(
+                                        OSError, RuntimeError, KeyError
+                                    ),
+                                    h5py.File(gx_cand, "r") as gf,
+                                ):
+                                    if "images" in gf:
+                                        return str(Path(gx_cand).resolve())
+        src_attr = _decode_str(f.attrs.get("source"), "")
+        if not src_attr and "scan_refinement" in f:
+            src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
+        if not src_attr and "search" in f:
+            src_attr = _decode_str(f["search"].attrs.get("source"), "")
+        if src_attr:
+            src_p = Path(src_attr)
+            is_staging_dat = "/staging" in str(src_attr) or (
+                src_p.name.startswith("dataset_") and src_p.suffix == ".dat"
+            )
+            cand_srcs = [p.parent / src_p.name]
+            if not is_staging_dat:
+                cand_srcs.append(src_p)
+            for cand_src in cand_srcs:
+                if cand_src.exists():
+                    with (
+                        contextlib.suppress(OSError, RuntimeError, KeyError),
+                        h5py.File(cand_src, "r") as sf,
+                    ):
+                        if "images" in sf:
+                            return str(cand_src.resolve())
 
     parent = p.parent
     if parent.resolve() == Path(tempfile.gettempdir()).resolve():
@@ -196,13 +473,95 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
         glob.glob(str(parent / "*merged*.h5"))
     )
     for cand in candidates:
-        try:
-            with h5py.File(cand, "r") as f:
-                if "images" in f and "bank_ids" in f:
-                    return cand
-        except Exception:
-            continue
+        with (
+            contextlib.suppress(OSError, RuntimeError, KeyError),
+            h5py.File(cand, "r") as f,
+        ):
+            if "images" in f and "bank_ids" in f:
+                return cand
     return None
+
+
+def _load_pixel_class_from_h5(
+    f: h5py.File,
+    sib_solve_path: str | os.PathLike | None = None,
+) -> tuple[dict[int, np.ndarray], dict[str, Any]]:
+    """Load per-bank ``pixel_class`` (0=valid, 1=dark, 2=bright) from ``f`` or sibling ``solve.h5``."""
+
+    def _read_one(hf: h5py.File) -> tuple[dict[int, np.ndarray], list[int]]:
+        out: dict[int, np.ndarray] = {}
+        dead_list: list[int] = []
+        if "detector" in hf:
+            dgrp = hf["detector"]
+            b_ids: np.ndarray | None = None
+            if "mask_bank_ids" in dgrp:
+                b_ids = np.asarray(dgrp["mask_bank_ids"][()], dtype=int).ravel()
+            elif "bank_ids" in hf:
+                b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            arr_cls: np.ndarray | None = None
+            if "pixel_class" in dgrp:
+                arr_cls = np.asarray(dgrp["pixel_class"][()], dtype=np.uint8)
+            elif "pixel_mask" in dgrp:
+                pm = np.asarray(dgrp["pixel_mask"][()], dtype=np.uint8)
+                arr_cls = np.where(pm == 0, np.uint8(1), np.uint8(0))
+            if arr_cls is not None and arr_cls.ndim == 3:
+                if b_ids is None or len(b_ids) != arr_cls.shape[0]:
+                    b_ids = np.arange(1, arr_cls.shape[0] + 1, dtype=int)
+                for b_id, c2d in zip(b_ids, arr_cls):
+                    out[int(b_id)] = c2d
+        elif "valid" in hf and "bank_ids" in hf:
+            # Legacy static-mask HDF5 fallback (`valid`: 1=keep, 0=masked -> dark=1)
+            val_arr = np.asarray(hf["valid"][()], dtype=np.uint8)
+            b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            if val_arr.ndim == 3 and len(b_ids) == val_arr.shape[0]:
+                for b_id, v2d in zip(b_ids, val_arr):
+                    out[int(b_id)] = np.where(v2d == 0, np.uint8(1), np.uint8(0))
+        if "scan_refinement" in hf and "em_dead_banks" in hf["scan_refinement"].attrs:
+            with contextlib.suppress(ValueError, TypeError):
+                dead_list = [
+                    int(x)
+                    for x in np.asarray(
+                        hf["scan_refinement"].attrs["em_dead_banks"]
+                    ).ravel()
+                ]
+        return out, dead_list
+
+    by_bank: dict[int, np.ndarray] = {}
+    dead_banks: list[int] = []
+    with contextlib.suppress(
+        OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+    ):
+        by_bank, dead_banks = _read_one(f)
+    if not by_bank and sib_solve_path and os.path.isfile(sib_solve_path):
+        with (
+            contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+            ),
+            h5py.File(sib_solve_path, "r") as sf,
+        ):
+            by_bank, dead_banks = _read_one(sf)
+
+    if not by_bank:
+        return {}, {"available": False}
+
+    n_total = sum(int(a.size) for a in by_bank.values())
+    n_dark = sum(int(np.count_nonzero(a == 1)) for a in by_bank.values())
+    n_bright = sum(int(np.count_nonzero(a == 2)) for a in by_bank.values())
+    if not dead_banks:
+        dead_banks = sorted(
+            int(bk)
+            for bk, a in by_bank.items()
+            if a.size > 0 and float(np.count_nonzero(a == 1)) / float(a.size) >= 0.90
+        )
+    summary = {
+        "available": True,
+        "dark_fraction": round(n_dark / max(n_total, 1), 6),
+        "bright_fraction": round(n_bright / max(n_total, 1), 6),
+        "n_dark_pixels": int(n_dark),
+        "n_bright_pixels": int(n_bright),
+        "dead_banks": dead_banks,
+    }
+    return by_bank, summary
 
 
 def _encode_panel_textures(
@@ -217,6 +576,7 @@ def _encode_panel_textures(
     frame_slice: tuple[int, int] | None = None,
     *,
     encode_images: bool = True,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Build cylindrical + spherical detector panel geometries and base64 log-intensity PNG textures.
 
@@ -248,10 +608,13 @@ def _encode_panel_textures(
                             or (int(ims.shape[1]) == 256 and det_n == 512)
                         ):
                             det_compat = False
-                        uniq_b = set(int(x) for x in np.unique(b_ids_all))
-                        if uniq_b and not uniq_b.issubset(set(detectors.keys())):
-                            if len(uniq_b - set(detectors.keys())) > 2:
-                                det_compat = False
+                        uniq_b = {int(x) for x in np.unique(b_ids_all)}
+                        if (
+                            uniq_b
+                            and not uniq_b.issubset(set(detectors.keys()))
+                            and len(uniq_b - set(detectors.keys())) > 2
+                        ):
+                            det_compat = False
                     if det_compat:
                         f0, f1 = 0, n_total_frames
                         if frame_slice is not None:
@@ -287,8 +650,8 @@ def _encode_panel_textures(
                                 raw_bank_images[bk] = imb
                         if raw_bank_images:
                             intensity_source = "raw_h5"
-        except Exception:
-            pass
+        except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
+            intensity_source = "synthesized_peaks"
 
     # If no raw images were loaded, synthesize clean 2D Gaussian spot maps on each populated bank
     if (
@@ -430,6 +793,38 @@ def _encode_panel_textures(
                 Image.fromarray(u8, mode="L").save(buf, format="PNG", optimize=True)
                 tex_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
+            mask_b64 = None
+            if encode_images and pixel_class_by_bank:
+                cls_im = pixel_class_by_bank.get(int(bk))
+                if (
+                    cls_im is not None
+                    and cls_im.ndim == 2
+                    and cls_im.size > 0
+                    and int(np.max(cls_im)) > 0
+                ):
+                    b_m = max(1, int(render_binning))
+                    nh, mw = cls_im.shape
+                    nh2, mw2 = (nh // b_m) * b_m, (mw // b_m) * b_m
+                    if b_m > 1 and nh2 > 0 and mw2 > 0:
+                        cls_ds = (
+                            cls_im[:nh2, :mw2]
+                            .reshape(nh2 // b_m, b_m, mw2 // b_m, b_m)
+                            .max(axis=(1, 3))
+                        )
+                    else:
+                        cls_ds = cls_im
+                    # Encode 0=valid -> 0, 1=dark -> 128, 2=bright -> 255 in compact 8-bit PNG
+                    m_u8 = np.where(
+                        cls_ds >= 2,
+                        np.uint8(255),
+                        np.where(cls_ds == 1, np.uint8(128), np.uint8(0)),
+                    )
+                    mbuf = io.BytesIO()
+                    Image.fromarray(m_u8, mode="L").save(
+                        mbuf, format="PNG", optimize=True
+                    )
+                    mask_b64 = base64.b64encode(mbuf.getvalue()).decode("ascii")
+
             panels_payload.append(
                 {
                     "bank": int(bk),
@@ -476,12 +871,268 @@ def _encode_panel_textures(
                         for j in range(len(x_e))
                     ],
                     "texture_b64": tex_b64,
+                    "mask_b64": mask_b64,
                 }
             )
-        except Exception:
-            pass
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            TypeError,
+            KeyError,
+            IndexError,
+            AttributeError,
+        ):
+            continue
 
     return panels_payload, intensity_source
+
+
+def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str:
+    """Infer canonical dataset file extension from filename first, falling back to Galaxy metadata."""
+    import re as _re
+
+    clean_name = _re.sub(r"\s*\([^)]*\)\s*$", "", str(name or "")).strip()
+    base = os.path.basename(clean_name).lower()
+    if base.endswith((".nxs.h5", ".nxs")):
+        return "nxs.h5"
+    if base.endswith((".h5", ".hdf5")):
+        return "h5"
+    if base.endswith(".mtz"):
+        return "mtz"
+    if base.endswith(".json"):
+        return "json"
+    if base.endswith((".html", ".htm")):
+        return "html"
+    if base.endswith(".png"):
+        return "png"
+    if base.endswith((".jpg", ".jpeg")):
+        return "jpg"
+    if base.endswith(".svg"):
+        return "svg"
+    if base.endswith(".dat"):
+        return "dat"
+    if base.endswith((".log", ".txt")):
+        return "txt"
+    ext = str(raw_ext or "").strip().lower().lstrip(".")
+    return ext or "data"
+
+
+def parse_run_range_spec(spec_str: str | None) -> list[int]:
+    """Parse a run specification string supporting single runs, ranges, and stepped intervals.
+
+    Supported formats (comma or whitespace separated):
+    - Single run: ``2632``
+    - Inclusive range: ``2632-2638``, ``2632:2638``, ``2632..2638``
+    - Stepped interval: ``2632-2638/2``, ``2623:26238:2``, ``2632-2638..2``,
+      ``2632..2638/2``, ``2632:2638/2``, ``2632-2638:2``, ``2632..2638..2``
+    """
+    import re as _re
+
+    runs: list[int] = []
+    seen: set[int] = set()
+    norm = _re.sub(r"\s*(\.\.|[-–:/])\s*", r"\1", str(spec_str or ""))
+    for tok in _re.split(r"[,\s]+", norm):
+        t = tok.strip()
+        if not t:
+            continue
+        m = _re.match(
+            r"^(\d+)(?:\.\.|[-–:])(\d+)(?:(?:\.\.|[/:])(\d+)?)?$",
+            t,
+        )
+        if m:
+            a = int(m.group(1))
+            b = int(m.group(2))
+            step_s = m.group(3)
+            step = int(step_s) if step_s is not None and step_s != "" else 1
+            if step <= 0:
+                continue
+            lo, hi = min(a, b), max(a, b)
+            r = lo
+            count = 0
+            while r <= hi and count < 20000:
+                if r not in seen:
+                    seen.add(r)
+                    runs.append(r)
+                r += step
+                count += 1
+        elif t.isdigit():
+            r = int(t)
+            if r not in seen:
+                seen.add(r)
+                runs.append(r)
+    return runs
+
+
+def validate_subhkl_ingestible_dataset(
+    local_path: str | os.PathLike,
+    ds_info: dict[str, Any] | None = None,
+    *,
+    has_active_geometry: bool = False,
+) -> str:
+    """Validate that a local file or Galaxy dataset can be ingested by SubHKL.
+
+    Returns ``"subhkl_h5"`` for reduced/indexed/predicted/integrated SubHKL HDF5 files,
+    ``"raw_nexus"`` for raw NeXus files (``/entry``), or ``"mtz_overlay"`` for MTZ files
+    when ``has_active_geometry`` is True. Raises ``ValueError`` with an explanatory
+    message if the dataset cannot be ingested.
+    """
+    info = ds_info or {}
+    ds_name = str(info.get("name") or os.path.basename(str(local_path)))
+    ds_hid = info.get("hid")
+    ds_label = f"#{ds_hid} '{ds_name}'" if ds_hid else f"'{ds_name}'"
+    state = str(info.get("state") or "ok")
+    ext = infer_dataset_extension(ds_name, info.get("extension"))
+    if state != "ok":
+        raise ValueError(
+            f"Cannot ingest Galaxy dataset {ds_label}: dataset state is '{state}' (must be 'ok')."
+        )
+    p = Path(local_path)
+    if not p.is_file() or p.stat().st_size <= 0:
+        raise ValueError(
+            f"Cannot ingest Galaxy dataset {ds_label}: dataset file is empty or missing."
+        )
+    if ext == "mtz" or str(p).lower().endswith(".mtz"):
+        if not has_active_geometry:
+            raise ValueError(
+                f"Cannot load MTZ dataset {ds_label} by itself: load a solved or integrated HDF5 dataset with detector geometry first."
+            )
+        try:
+            import gemmi
+
+            mtz_obj = gemmi.read_mtz_file(str(p))
+            if mtz_obj.nreflections <= 0:
+                raise ValueError(
+                    f"Cannot ingest MTZ dataset {ds_label}: MTZ file contains 0 reflections."
+                )
+            return "mtz_overlay"
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot ingest MTZ dataset {ds_label}: not a valid MTZ reflection file ({exc})."
+            ) from exc
+    try:
+        with h5py.File(p, "r") as f:
+            if any(
+                k in f
+                for k in (
+                    "images",
+                    "peaks",
+                    "banks",
+                    "hkl",
+                    "sample",
+                    "search",
+                    "scan_refinement",
+                )
+            ):
+                return "subhkl_h5"
+            if "entry" in f or ext == "nxs.h5":
+                return "raw_nexus"
+            top_keys = ", ".join(list(f.keys())[:6]) or "none"
+            raise ValueError(
+                f"Cannot ingest Galaxy dataset {ds_label}: HDF5 file does not contain SubHKL diffraction data "
+                f"(images/peaks/hkl) or raw NeXus (/entry) data (found keys: {top_keys})."
+            )
+    except OSError as exc:
+        raise ValueError(
+            f"Cannot ingest Galaxy dataset {ds_label} (format '{ext}'): not a valid HDF5 or NeXus file."
+        ) from exc
+
+
+def apply_mtz_to_payload(
+    payload: dict[str, Any],
+    mtz_path: str | os.PathLike,
+    ds_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Overlay reference spots / merged intensities from an MTZ file onto an existing detector geometry payload."""
+    import gemmi
+
+    mtz = gemmi.read_mtz_file(str(mtz_path))
+    sg = mtz.spacegroup or gemmi.find_spacegroup_by_name(
+        str(payload.get("space_group") or "P 1")
+    )
+    asu = gemmi.ReciprocalAsu(sg)
+    ops = sg.operations()
+    cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}
+    if not all(k in cols for k in ("H", "K", "L")):
+        raise ValueError("MTZ file does not contain H, K, L columns.")
+
+    h_col = cols["H"].astype(int)
+    k_col = cols["K"].astype(int)
+    l_col = cols["L"].astype(int)
+    i_col = None
+    s_col = None
+    for ic, sc in (
+        ("I", "SigI"),
+        ("IMEAN", "SIGIMEAN"),
+        ("Iobs", "SigIobs"),
+        ("Ipred", "SigIpred"),
+        ("I(+)", "SIGI(+)"),
+        ("F", "SIGF"),
+    ):
+        if ic in cols:
+            i_col = cols[ic]
+            s_col = cols.get(sc, np.ones_like(i_col))
+            break
+    if i_col is None:
+        val_cols = [
+            c.label
+            for c in mtz.columns
+            if c.label not in ("H", "K", "L", "M/ISYM", "BATCH", "half")
+        ]
+        if val_cols:
+            i_col = cols[val_cols[0]]
+            s_col = cols[val_cols[1]] if len(val_cols) > 1 else np.ones_like(i_col)
+        else:
+            i_col = np.full(len(h_col), 100.0, dtype=np.float64)
+            s_col = np.ones(len(h_col), dtype=np.float64)
+
+    asu_map: dict[tuple[int, int, int], tuple[float, float]] = {}
+    raw_hkl_list: list[tuple[int, int, int, float, float]] = []
+    for idx in range(len(h_col)):
+        iv = float(i_col[idx])
+        sv = float(s_col[idx]) if s_col is not None else 1.0
+        if not np.isfinite(iv):
+            continue
+        hh, kk, ll = int(h_col[idx]), int(k_col[idx]), int(l_col[idx])
+        if hh == 0 and kk == 0 and ll == 0:
+            continue
+        asu_hkl, _ = asu.to_asu([hh, kk, ll], ops)
+        key = (int(asu_hkl[0]), int(asu_hkl[1]), int(asu_hkl[2]))
+        if key not in asu_map or iv > asu_map[key][0]:
+            asu_map[key] = (iv, max(sv, 1e-3))
+        raw_hkl_list.append((hh, kk, ll, iv, max(sv, 1e-3)))
+
+    out = dict(payload)
+    matched_count = 0
+    for list_key in ("peaks", "sample_peaks"):
+        pk_list = out.get(list_key)
+        if not isinstance(pk_list, list):
+            continue
+        new_list = []
+        for pk in pk_list:
+            pk_copy = dict(pk)
+            hkl_v = pk_copy.get("hkl")
+            if isinstance(hkl_v, list) and len(hkl_v) == 3:
+                asu_k, _ = asu.to_asu(
+                    [int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2])], ops
+                )
+                hit = asu_map.get((int(asu_k[0]), int(asu_k[1]), int(asu_k[2])))
+                if hit is not None:
+                    pk_copy["merged_i"] = round(hit[0], 2)
+                    pk_copy["merged_sigi"] = round(hit[1], 2)
+                    if list_key == "peaks":
+                        matched_count += 1
+            new_list.append(pk_copy)
+        out[list_key] = new_list
+
+    info = ds_info or {}
+    mtz_name = str(info.get("name") or os.path.basename(str(mtz_path)))
+    out["mtz_overlay_name"] = mtz_name
+    out["mtz_overlay_reflections"] = len(asu_map)
+    out["mtz_overlay_matched"] = matched_count
+    return out
 
 
 def _extract_from_h5(
@@ -491,6 +1142,7 @@ def _extract_from_h5(
     *,
     include_peaks: bool = True,
     default_instrument: str = "IMAGINE",
+    d_min: float | None = None,
 ) -> dict[str, Any]:
     """Extract peaks, detectors, UB, wavelength range, goniometer frames, and metadata from a subhkl HDF5 file."""
     disc_h5 = _discover_images_h5(h5_path)
@@ -523,6 +1175,9 @@ def _extract_from_h5(
         )
         if is_pure_merged:
             sib_solve_path = None
+        pixel_class_by_bank, em_mask_summary = _load_pixel_class_from_h5(
+            f, sib_solve_path=None if is_pure_merged else sib_solve_path
+        )
         instrument = _decode_str(
             f.attrs.get("instrument"), default_instrument or "IMAGINE"
         )
@@ -533,7 +1188,7 @@ def _extract_from_h5(
                 for x in np.asarray(f["beam/ki_vec"][()], dtype=float).ravel()[:3]
             )
 
-        wavelength_range = (1.8, 4.5)
+        wavelength_range: tuple[float, float] | None = None
         if "scan_refinement/band_wavelength" in f:
             wl = np.asarray(
                 f["scan_refinement/band_wavelength"][()], dtype=float
@@ -543,44 +1198,47 @@ def _extract_from_h5(
         elif "instrument/wavelength" in f:
             wl = np.asarray(f["instrument/wavelength"][()], dtype=float).ravel()
             if len(wl) >= 2:
-                wavelength_range = (float(wl[0]), float(wl[1]))
-                if (
-                    abs(wavelength_range[0] - 2.0) < 1e-3
-                    and abs(wavelength_range[1] - 10.0) < 1e-3
-                ):
+                if abs(float(wl[0]) - 2.0) < 1e-3 and abs(float(wl[1]) - 10.0) < 1e-3:
                     if sib_solve_path:
-                        try:
-                            with h5py.File(sib_solve_path, "r") as sf:
-                                for wk in (
-                                    "scan_refinement/band_wavelength",
-                                    "instrument/wavelength",
-                                ):
-                                    if wk in sf:
-                                        swl = np.asarray(
-                                            sf[wk][()], dtype=float
-                                        ).ravel()
-                                        if len(swl) >= 2:
-                                            wavelength_range = (
-                                                float(swl[0]),
-                                                float(swl[1]),
-                                            )
-                                            break
-                        except Exception:
-                            pass
+                        with (
+                            contextlib.suppress(
+                                OSError, RuntimeError, ValueError, TypeError, KeyError
+                            ),
+                            h5py.File(sib_solve_path, "r") as sf,
+                        ):
+                            for wk in (
+                                "scan_refinement/band_wavelength",
+                                "instrument/wavelength",
+                            ):
+                                if wk in sf:
+                                    swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                                    if len(swl) >= 2 and not (
+                                        abs(float(swl[0]) - 2.0) < 1e-3
+                                        and abs(float(swl[1]) - 10.0) < 1e-3
+                                    ):
+                                        wavelength_range = (
+                                            float(swl[0]),
+                                            float(swl[1]),
+                                        )
+                                        break
+                else:
+                    wavelength_range = (float(wl[0]), float(wl[1]))
         elif sib_solve_path:
-            try:
-                with h5py.File(sib_solve_path, "r") as sf:
-                    for wk in (
-                        "scan_refinement/band_wavelength",
-                        "instrument/wavelength",
-                    ):
-                        if wk in sf:
-                            swl = np.asarray(sf[wk][()], dtype=float).ravel()
-                            if len(swl) >= 2:
-                                wavelength_range = (float(swl[0]), float(swl[1]))
-                                break
-            except Exception:
-                pass
+            with (
+                contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ),
+                h5py.File(sib_solve_path, "r") as sf,
+            ):
+                for wk in (
+                    "scan_refinement/band_wavelength",
+                    "instrument/wavelength",
+                ):
+                    if wk in sf:
+                        swl = np.asarray(sf[wk][()], dtype=float).ravel()
+                        if len(swl) >= 2:
+                            wavelength_range = (float(swl[0]), float(swl[1]))
+                            break
 
         U = np.asarray(f["sample/U"][()], dtype=float) if "sample/U" in f else None
         B = np.asarray(f["sample/B"][()], dtype=float) if "sample/B" in f else None
@@ -624,15 +1282,17 @@ def _extract_from_h5(
                     _decode_str(x, "").upper() for x in list(f["files"][()])
                 )
             elif src_h5 and os.path.isfile(src_h5):
-                try:
-                    with h5py.File(src_h5, "r") as sf_inst:
-                        if "files" in sf_inst:
-                            name_cands.extend(
-                                _decode_str(x, "").upper()
-                                for x in list(sf_inst["files"][()])
-                            )
-                except Exception:
-                    pass
+                with (
+                    contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ),
+                    h5py.File(src_h5, "r") as sf_inst,
+                ):
+                    if "files" in sf_inst:
+                        name_cands.extend(
+                            _decode_str(x, "").upper()
+                            for x in list(sf_inst["files"][()])
+                        )
             for fn_s in name_cands:
                 for known_inst in ("MANDI", "TOPAZ", "CG4D", "IMAGINE"):
                     if known_inst in fn_s:
@@ -671,6 +1331,9 @@ def _extract_from_h5(
                                     instrument = "MANDI"
                                     break
 
+        if wavelength_range is None:
+            wavelength_range = _get_instrument_default_wavelength(instrument)
+
         detectors = _load_detectors_from_h5(f, instrument)
 
         bank = np.asarray(f["bank"][()], dtype=int) if "bank" in f else None
@@ -690,6 +1353,50 @@ def _extract_from_h5(
         peaks_xyz = (
             np.asarray(f["peaks/xyz"][()], dtype=float) if "peaks/xyz" in f else None
         )
+        if (
+            peaks_xyz is None
+            and pixel_r is not None
+            and pixel_c is not None
+            and len(pixel_r) > 0
+            and len(pixel_c) == len(pixel_r)
+        ):
+            n_pk_raw = len(pixel_r)
+            xyz_rec = np.zeros((n_pk_raw, 3), dtype=float)
+            filled_mask = np.zeros(n_pk_raw, dtype=bool)
+            if bank is not None and len(bank) == n_pk_raw and detectors:
+                for ub_id in np.unique(bank):
+                    det_b = detectors.get(int(ub_id))
+                    if det_b is None:
+                        continue
+                    mb = bank == ub_id
+                    with contextlib.suppress(
+                        RuntimeError, ValueError, TypeError, IndexError
+                    ):
+                        xyz_rec[mb] = det_b.pixel_to_lab(pixel_r[mb], pixel_c[mb])
+                        filled_mask[mb] = True
+            if (
+                not np.all(filled_mask)
+                and "peaks/two_theta" in f
+                and "peaks/azimuthal" in f
+            ):
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, IndexError
+                ):
+                    tt_arr = np.asarray(f["peaks/two_theta"][()], dtype=float)
+                    az_arr = np.asarray(f["peaks/azimuthal"][()], dtype=float)
+                    if len(tt_arr) == n_pk_raw and len(az_arr) == n_pk_raw:
+                        rem = ~filled_mask
+                        st = np.sin(tt_arr[rem])
+                        xyz_rec[rem] = np.column_stack(
+                            [
+                                st * np.cos(az_arr[rem]),
+                                st * np.sin(az_arr[rem]),
+                                np.cos(tt_arr[rem]),
+                            ]
+                        )
+                        filled_mask[rem] = True
+            if np.any(filled_mask):
+                peaks_xyz = xyz_rec
 
         # Extract multi-frame offsets, file names, and goniometer motor angles
         offsets = (
@@ -722,30 +1429,32 @@ def _extract_from_h5(
         for aux_path in (src_h5, sib_solve_path):
             if not aux_path or not os.path.isfile(aux_path):
                 continue
-            try:
-                with h5py.File(aux_path, "r") as af:
-                    if offsets is None and "file_offsets" in af:
-                        offsets = np.asarray(af["file_offsets"][()], dtype=int)
-                    if n_frames_total == 0 and "bank_ids" in af:
-                        n_frames_total = len(af["bank_ids"])
-                    if files_raw is None and "files" in af:
-                        files_raw = list(af["files"][()])
-                    if gonio_names_raw is None and "goniometer/names" in af:
-                        gonio_names_raw = list(af["goniometer/names"][()])
-                    if gonio_axes is None and "goniometer/axes" in af:
-                        gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
-                    if aux_path == src_h5 and "goniometer/angles" in af:
-                        gonio_angles_nom = np.asarray(
-                            af["goniometer/angles"][()], dtype=float
-                        )
-                    elif gonio_angles_ref is None and "goniometer/angles" in af:
-                        gonio_angles_ref = np.asarray(
-                            af["goniometer/angles"][()], dtype=float
-                        )
-                    if R_all is None and "goniometer/R" in af:
-                        R_all = np.asarray(af["goniometer/R"][()], dtype=float)
-            except Exception:
-                pass
+            with (
+                contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ),
+                h5py.File(aux_path, "r") as af,
+            ):
+                if offsets is None and "file_offsets" in af:
+                    offsets = np.asarray(af["file_offsets"][()], dtype=int)
+                if n_frames_total == 0 and "bank_ids" in af:
+                    n_frames_total = len(af["bank_ids"])
+                if files_raw is None and "files" in af:
+                    files_raw = list(af["files"][()])
+                if gonio_names_raw is None and "goniometer/names" in af:
+                    gonio_names_raw = list(af["goniometer/names"][()])
+                if gonio_axes is None and "goniometer/axes" in af:
+                    gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
+                if aux_path == src_h5 and "goniometer/angles" in af:
+                    gonio_angles_nom = np.asarray(
+                        af["goniometer/angles"][()], dtype=float
+                    )
+                elif gonio_angles_ref is None and "goniometer/angles" in af:
+                    gonio_angles_ref = np.asarray(
+                        af["goniometer/angles"][()], dtype=float
+                    )
+                if R_all is None and "goniometer/R" in af:
+                    R_all = np.asarray(af["goniometer/R"][()], dtype=float)
 
         if gonio_angles_nom is None:
             gonio_angles_nom = gonio_angles_ref
@@ -914,12 +1623,13 @@ def _extract_from_h5(
         solve_diagnostics: dict[str, Any] | None = None
         if any(k in f for k in ("blind_search", "scan_refinement", "solve", "search")):
             solve_diagnostics = {}
+            default_d_min = round(0.5 * float(wavelength_range[0]), 2)
             bs_grp = (
-                f["blind_search"]
-                if "blind_search" in f
-                else (f["search"] if "search" in f else None)
+                f["blind_search"] if "blind_search" in f else (f.get("search", None))
             )
             if bs_grp is not None:
+                if "d_min" in bs_grp.attrs:
+                    solve_diagnostics["d_min"] = float(bs_grp.attrs["d_min"])
                 solve_diagnostics["stable_observations"] = int(
                     bs_grp.attrs.get("stable_observations", 0)
                 )
@@ -932,7 +1642,7 @@ def _extract_from_h5(
                 )
                 if "proposal_scores" in bs_grp:
                     ps = np.asarray(bs_grp["proposal_scores"][()], dtype=float).ravel()
-                    solve_diagnostics["n_candidates"] = int(len(ps))
+                    solve_diagnostics["n_candidates"] = len(ps)
                     solve_diagnostics["top_proposal_score"] = (
                         float(np.max(ps)) if len(ps) else 0.0
                     )
@@ -943,9 +1653,10 @@ def _extract_from_h5(
                     )
             if "scan_refinement" in f:
                 sr_grp = f["scan_refinement"]
-                default_d_min = round(0.5 * float(wavelength_range[0]), 2)
                 solve_diagnostics["d_min"] = float(
-                    sr_grp.attrs.get("d_min", default_d_min)
+                    sr_grp.attrs.get(
+                        "d_min", solve_diagnostics.get("d_min", default_d_min)
+                    )
                 )
                 solve_diagnostics["n_zones"] = int(sr_grp.attrs.get("n_zones", 400))
                 solve_diagnostics["modes"] = _decode_str(sr_grp.attrs.get("modes"), "")
@@ -955,10 +1666,12 @@ def _extract_from_h5(
                 stages_raw = _decode_str(sr_grp.attrs.get("stages"), "[]")
                 try:
                     solve_diagnostics["stages"] = json.loads(stages_raw)
-                except Exception:
+                except (ValueError, TypeError):
                     solve_diagnostics["stages"] = []
             elif "solve" in f:
                 s_grp = f["solve"]
+                if "d_min" in s_grp.attrs:
+                    solve_diagnostics["d_min"] = float(s_grp.attrs["d_min"])
                 solve_diagnostics["objective"] = _decode_str(
                     s_grp.attrs.get("objective"), "poisson"
                 )
@@ -1043,33 +1756,55 @@ def _extract_from_h5(
                 out.get("resolution_bins"), list
             ):
                 out["cc_half_bins"] = out["resolution_bins"]
+            if not out.get("n_merged_asu") and isinstance(
+                out.get("cc_half_bins"), list
+            ):
+                out["n_merged_asu"] = sum(
+                    int(b.get("n_refl") or 0) for b in out["cc_half_bins"]
+                )
             return out
 
+        has_careless_peak_data = bool(
+            (careless_residual is not None and np.any(np.isfinite(careless_residual)))
+            or (careless_scale is not None and np.any(np.isfinite(careless_scale)))
+        )
+
         merge_metrics: dict[str, Any] | None = None
-        if "careless/metrics_json" in f:
-            try:
-                raw_m = _decode_str(f["careless/metrics_json"][()], "{}")
-                doc_m = json.loads(raw_m)
-                if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
-                    merge_metrics = _normalize_merge_metrics(doc_m)
-            except Exception:
-                pass
-        elif "peaks" in f:
-            sib_m = Path(h5_path).parent / "careless_metrics.json"
-            if sib_m.is_file():
-                try:
-                    with open(sib_m, "r", encoding="utf-8") as mfh:
+        if has_careless_peak_data:
+            if "careless/metrics_json" in f:
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ):
+                    raw_m = _decode_str(f["careless/metrics_json"][()], "{}")
+                    doc_m = json.loads(raw_m)
+                    if isinstance(doc_m, dict) and (
+                        doc_m.get("n_merged_asu")
+                        or doc_m.get("resolution_bins")
+                        or doc_m.get("cc_half_bins")
+                    ):
+                        merge_metrics = _normalize_merge_metrics(doc_m)
+            if merge_metrics is None and "peaks" in f:
+                sib_m = Path(h5_path).parent / "careless_metrics.json"
+                if sib_m.is_file():
+                    with (
+                        contextlib.suppress(OSError, ValueError, TypeError, KeyError),
+                        open(sib_m, encoding="utf-8") as mfh,
+                    ):
                         doc_m = json.load(mfh)
-                        if isinstance(doc_m, dict) and doc_m.get("n_merged_asu"):
+                        if isinstance(doc_m, dict) and (
+                            doc_m.get("n_merged_asu")
+                            or doc_m.get("resolution_bins")
+                            or doc_m.get("cc_half_bins")
+                        ):
                             merge_metrics = _normalize_merge_metrics(doc_m)
-                except Exception:
-                    pass
 
         artifact_kind = "solve"
         peak_shape_mode = "solved_circle"
         if var_u is not None and var_v is not None:
             artifact_kind = (
-                "merged_careless" if merge_metrics is not None else "integrator"
+                "merged_careless"
+                if (merge_metrics is not None and has_careless_peak_data)
+                else "integrator"
             )
             is_iso = bool(
                 np.allclose(var_u, var_v)
@@ -1142,7 +1877,9 @@ def _extract_from_h5(
                     and gonio_angles_nom.ndim == 2
                     and 0 <= f0_r < len(gonio_angles_nom)
                 ):
-                    try:
+                    with contextlib.suppress(
+                        ImportError, RuntimeError, ValueError, TypeError, IndexError
+                    ):
                         from subhkl.instrument.goniometer import (
                             calc_goniometer_rotation_matrix,
                         )
@@ -1150,8 +1887,6 @@ def _extract_from_h5(
                         R_per_run[ur_i] = calc_goniometer_rotation_matrix(
                             gonio_axes, gonio_angles_nom[f0_r]
                         )
-                    except Exception:
-                        pass
             all_runs_data = {
                 "peaks_xyz": peaks_xyz[idx_all],
                 "hkl": hkl[idx_all],
@@ -1264,7 +1999,14 @@ def _extract_from_h5(
 
         # Recognize predictor.h5 format: banks/<img_idx>/(i, j, h, k, l, wavelength)
         if (peaks_xyz is None or len(peaks_xyz) == 0) and "banks" in f:
-            try:
+            with contextlib.suppress(
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 artifact_kind = "predictor"
                 peak_shape_mode = "predicted_circle"
                 b_ids_pred = (
@@ -1281,19 +2023,19 @@ def _extract_from_h5(
 
                 bank_imgs_pred: dict[int, np.ndarray] = {}
                 if src_h5 and os.path.exists(src_h5):
-                    try:
-                        with h5py.File(src_h5, "r") as mf:
-                            if "images" in mf and "bank_ids" in mf:
-                                b_ids_s = np.asarray(
-                                    mf["bank_ids"][f0_p:f1_p], dtype=int
-                                )
-                                ims_s = np.asarray(
-                                    mf["images"][f0_p:f1_p], dtype=np.float32
-                                )
-                                for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                    bank_imgs_pred[int(b_id_s)] = im_s
-                    except Exception:
-                        pass
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(src_h5, "r") as mf,
+                    ):
+                        if "images" in mf and "bank_ids" in mf:
+                            b_ids_s = np.asarray(mf["bank_ids"][f0_p:f1_p], dtype=int)
+                            ims_s = np.asarray(
+                                mf["images"][f0_p:f1_p], dtype=np.float32
+                            )
+                            for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                bank_imgs_pred[int(b_id_s)] = im_s
 
                 xyz_p, hkl_p, lam_p, bank_p, pr_p, pc_p, inten_p = (
                     [],
@@ -1379,8 +2121,6 @@ def _extract_from_h5(
                     pixel_c = np.concatenate(pc_p, axis=0)
                     intensity = np.concatenate(inten_p, axis=0)
                     sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
-            except Exception:
-                pass
 
         R_gonio = None
         if R_all is not None:
@@ -1412,7 +2152,9 @@ def _extract_from_h5(
             and gonio_angles_nom.ndim == 2
             and len(gonio_angles_nom) > 0
         ):
-            try:
+            with contextlib.suppress(
+                ImportError, RuntimeError, ValueError, TypeError, IndexError
+            ):
                 from subhkl.instrument.goniometer import (
                     calc_goniometer_rotation_matrix,
                 )
@@ -1426,18 +2168,26 @@ def _extract_from_h5(
                 R_gonio = calc_goniometer_rotation_matrix(
                     gonio_axes, gonio_angles_nom[f0_ang]
                 )
-            except Exception:
-                pass
 
         # Finder-less solve.h5 forward projection onto calibrated detector banks
         if (
             include_peaks
             and (peaks_xyz is None or len(peaks_xyz) == 0)
+            and "peaks" not in f
+            and "banks" not in f
             and U is not None
             and B is not None
             and detectors
         ):
-            try:
+            with contextlib.suppress(
+                ImportError,
+                OSError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 from subhkl.core.crystallography import generate_reflections
 
                 U_mat = np.asarray(U, dtype=float)
@@ -1456,9 +2206,13 @@ def _extract_from_h5(
                 )
                 default_d_min = round(0.5 * float(wavelength_range[0]), 2)
                 d_min_use = (
-                    float(solve_diagnostics.get("d_min", default_d_min))
-                    if solve_diagnostics and "d_min" in solve_diagnostics
-                    else default_d_min
+                    float(d_min)
+                    if d_min is not None and float(d_min) > 0
+                    else (
+                        float(solve_diagnostics.get("d_min", default_d_min))
+                        if solve_diagnostics and "d_min" in solve_diagnostics
+                        else default_d_min
+                    )
                 )
                 hkl_all = np.stack(
                     generate_reflections(
@@ -1485,39 +2239,37 @@ def _extract_from_h5(
 
                 bank_imgs: dict[int, np.ndarray] = {}
                 if src_h5 and os.path.exists(src_h5):
-                    try:
-                        with h5py.File(src_h5, "r") as mf:
-                            if "images" in mf and "bank_ids" in mf:
-                                f0_s, f1_s = (
-                                    frame_slice
-                                    if frame_slice is not None
-                                    else (0, len(mf["bank_ids"]))
-                                )
-                                b_ids_s = np.asarray(
-                                    mf["bank_ids"][f0_s:f1_s], dtype=int
-                                )
-                                ims_s = np.asarray(
-                                    mf["images"][f0_s:f1_s], dtype=np.float32
-                                )
-                                sample_det = (
-                                    next(iter(detectors.values()))
-                                    if detectors
-                                    else None
-                                )
-                                det_n = int(getattr(sample_det, "n", 0))
-                                compat = True
-                                if (
-                                    ims_s.ndim >= 3
-                                    and det_n > 0
-                                    and int(ims_s.shape[1]) != det_n
-                                ):
-                                    compat = False
-                                if compat:
-                                    for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                        if int(b_id_s) in detectors:
-                                            bank_imgs[int(b_id_s)] = im_s
-                    except Exception:
-                        pass
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(src_h5, "r") as mf,
+                    ):
+                        if "images" in mf and "bank_ids" in mf:
+                            f0_s, f1_s = (
+                                frame_slice
+                                if frame_slice is not None
+                                else (0, len(mf["bank_ids"]))
+                            )
+                            b_ids_s = np.asarray(mf["bank_ids"][f0_s:f1_s], dtype=int)
+                            ims_s = np.asarray(
+                                mf["images"][f0_s:f1_s], dtype=np.float32
+                            )
+                            sample_det = (
+                                next(iter(detectors.values())) if detectors else None
+                            )
+                            det_n = int(getattr(sample_det, "n", 0))
+                            compat = True
+                            if (
+                                ims_s.ndim >= 3
+                                and det_n > 0
+                                and int(ims_s.shape[1]) != det_n
+                            ):
+                                compat = False
+                            if compat:
+                                for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                    if int(b_id_s) in detectors:
+                                        bank_imgs[int(b_id_s)] = im_s
 
                 cal_bids_set: set[int] = set()
                 if "detector_calibration" in f:
@@ -1531,11 +2283,7 @@ def _extract_from_h5(
                 active_bids = (
                     set(bank_imgs.keys())
                     if bank_imgs
-                    else (
-                        cal_bids_set
-                        if cal_bids_set
-                        else set(int(k) for k in detectors.keys())
-                    )
+                    else (cal_bids_set if cal_bids_set else {int(k) for k in detectors})
                 )
 
                 raw_hits: list[dict[str, Any]] = []
@@ -1569,6 +2317,20 @@ def _extract_from_h5(
                     um, vm = um[in_b], vm[in_b]
                     pr_hit = vm / max(h_d, 1e-6) * (det.n - 1)
                     pc_hit = um / max(w_d, 1e-6) * (det.m - 1)
+                    cls_b = pixel_class_by_bank.get(int(bid))
+                    if cls_b is not None and cls_b.ndim == 2:
+                        rm = np.clip(
+                            np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1
+                        )
+                        cm = np.clip(
+                            np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1
+                        )
+                        valid_m = cls_b[rm, cm] == 0
+                        if not np.any(valid_m):
+                            continue
+                        idx_h = idx_h[valid_m]
+                        um, vm = um[valid_m], vm[valid_m]
+                        pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
                     im_b = bank_imgs.get(int(bid))
                     if im_b is not None:
                         r_i = np.clip(
@@ -1654,8 +2416,6 @@ def _extract_from_h5(
                     pixel_c = np.concatenate(pc_l, axis=0)
                     intensity = np.concatenate(inten_l, axis=0)
                     sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
-            except Exception:
-                pass
 
         if peaks_xyz is None:
             peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -1706,6 +2466,8 @@ def _extract_from_h5(
             "all_runs_data": all_runs_data,
             "R_gonio": R_gonio,
             "solve_diagnostics": solve_diagnostics,
+            "pixel_class_by_bank": pixel_class_by_bank,
+            "em_mask_summary": em_mask_summary,
             "frame_slice": frame_slice,
             "frames": frames_meta,
             "frame_index": active_frame,
@@ -1933,7 +2695,7 @@ def _build_lattice_ladder_steps(
 def _pending_stage_for_artifact_kind(artifact_kind: str | None) -> str:
     """Return the pending pipeline stage ID given the currently loaded HDF5 artifact kind."""
     kind = (artifact_kind or "solve").lower()
-    if kind == "raw_nexus":
+    if kind in ("raw_nexus", "empty"):
         return "reduce"
     if kind == "merged":
         return "solve"
@@ -2001,7 +2763,7 @@ def _build_ndip_pipeline_stages(
                 if is_finderless
                 else ["imaginex_subhkl_prepare_peaks", "imaginex_subhkl_peak_fit"]
             ),
-            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "container": get_container_image(),
             "artifact": (
                 f"merged.h5 ({solve_diagnostics['stable_observations']:,} count bins)"
                 if is_finderless
@@ -2025,7 +2787,7 @@ def _build_ndip_pipeline_stages(
             "step_num": 2,
             "name": "2. SOLVE (LATTICE LADDER)",
             "tool_ids": ["imaginex_subhkl_solve", "imaginex_subhkl"],
-            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "container": get_container_image(),
             "artifact": f"solve.h5 ({n_indexed}/{n_peaks} spots • {n_zones_ord1} ord-1 zones)",
             "status": _stage_status(1),
             "ladder_rung_idx": 4,
@@ -2042,7 +2804,7 @@ def _build_ndip_pipeline_stages(
                 "imaginex_subhkl_predict",
                 "imaginex_subhkl_integrate",
             ],
-            "container": "ghcr.io/neutrons/subhkl:1.4.0",
+            "container": get_container_image(),
             "artifact": "predictor.h5 → integrated.h5",
             "status": _stage_status(2),
             "ladder_rung_idx": 4,
@@ -2079,7 +2841,8 @@ def build_rainbow_zone_payload(
     B: np.ndarray | None = None,
     R_gonio: np.ndarray | None = None,
     ki: tuple[float, float, float] = (0.0, 0.0, 1.0),
-    wavelength_range: tuple[float, float] = (1.8, 4.5),
+    wavelength_range: tuple[float, float] | None = None,
+    d_min: float | None = None,
     instrument: str = "IMAGINE",
     space_group: str = "P 1",
     cell: list[float] | None = None,
@@ -2124,6 +2887,8 @@ def build_rainbow_zone_payload(
     merge_metrics: dict[str, Any] | None = None
     all_runs_data: dict[str, Any] | None = None
     solve_diagnostics = None
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None
+    em_mask_summary: dict[str, Any] = {"available": False}
     frame_slice = None
     frames_meta: list[dict[str, Any]] = []
     active_frame = int(frame_index) if frame_index is not None else 0
@@ -2135,10 +2900,12 @@ def build_rainbow_zone_payload(
             frame_index=frame_index,
             include_peaks=include_peaks,
             default_instrument=instrument or "IMAGINE",
+            d_min=d_min,
         )
         instrument = extracted["instrument"] or instrument
         ki = extracted["ki"]
-        wavelength_range = extracted["wavelength_range"]
+        if wavelength_range is None:
+            wavelength_range = extracted["wavelength_range"]
         if U is None:
             U = extracted["U"]
         if B is None:
@@ -2173,6 +2940,8 @@ def build_rainbow_zone_payload(
         merge_metrics = extracted.get("merge_metrics")
         all_runs_data = extracted.get("all_runs_data")
         solve_diagnostics = extracted.get("solve_diagnostics")
+        pixel_class_by_bank = extracted.get("pixel_class_by_bank")
+        em_mask_summary = extracted.get("em_mask_summary") or {"available": False}
         frame_slice = extracted.get("frame_slice")
         frames_meta = extracted.get("frames") or []
         active_frame = int(extracted.get("frame_index", active_frame))
@@ -2182,6 +2951,13 @@ def build_rainbow_zone_payload(
             images_h5 = extracted["images_h5"]
         elif images_h5 is None:
             images_h5 = _discover_images_h5(replay_h5)
+    elif not detectors:
+        detectors = _load_detectors_from_h5(None, instrument)
+        cell = fallback_cell
+        if peaks_xyz is None and ub_matrix is None and U is None:
+            artifact_kind = "empty"
+    if wavelength_range is None:
+        wavelength_range = _get_instrument_default_wavelength(instrument)
 
     if peaks_xyz is None:
         peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -2451,7 +3227,9 @@ def build_rainbow_zone_payload(
             c0 = pixel_c_arr[idxs][:, None]
             cols_ell = c0 + a_bk * cos_t * c_phi - b_bk * sin_t * s_phi
             rows_ell = r0 + a_bk * cos_t * s_phi + b_bk * sin_t * c_phi
-            try:
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+            ):
                 xyz_ell = det.pixel_to_lab(rows_ell.ravel(), cols_ell.ravel())
                 az_ell, y_ell = _unrolled(xyz_ell)
                 _, el_ell = _spherical_angles(xyz_ell)
@@ -2477,14 +3255,12 @@ def build_rainbow_zone_payload(
                     sigma_major_by_idx[p_i] = round(float(s1_all[p_i]), 2)
                     sigma_minor_by_idx[p_i] = round(float(s2_all[p_i]), 2)
                     ellipse_ang_by_idx[p_i] = round(float(np.rad2deg(phi_all[p_i])), 1)
-            except Exception:
-                pass
 
     # Compute canonical ASU symmetry orbits and Laue harmonic ray multiplicity
     sg_obj = None
     asu_obj = None
     sg_ops = None
-    try:
+    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
         import gemmi
 
         sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
@@ -2493,16 +3269,12 @@ def build_rainbow_zone_payload(
         if sg_obj is not None:
             asu_obj = gemmi.ReciprocalAsu(sg_obj)
             sg_ops = sg_obj.operations()
-    except Exception:
-        pass
 
     def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int]:
         if asu_obj is not None and sg_ops is not None and (h_v or k_v or l_v):
-            try:
+            with contextlib.suppress(RuntimeError, ValueError, TypeError, IndexError):
                 ha, _ = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
                 return (int(ha[0]), int(ha[1]), int(ha[2]))
-            except Exception:
-                pass
         ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
         sg_u = str(space_group or "").upper()
         is_cubic = "3" in sg_u or (
@@ -2786,7 +3558,14 @@ def build_rainbow_zone_payload(
             )
         )
         if needs_bin_enrich and len(sample_peaks) > 0:
-            try:
+            with contextlib.suppress(
+                ImportError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                IndexError,
+            ):
                 import gemmi as _gm
 
                 asu_obs_map: dict[tuple[int, int, int], list[dict[str, Any]]] = {}
@@ -2924,8 +3703,6 @@ def build_rainbow_zone_payload(
                         )
                     merge_metrics["cc_half_bins"] = enriched_bins
                     merge_metrics["resolution_bins"] = enriched_bins
-            except Exception:
-                pass
 
     zones_payload: list[dict[str, Any]] = []
     for zi, z in enumerate(raw_zones):
@@ -2939,7 +3716,14 @@ def build_rainbow_zone_payload(
         kf = conic_lab["kf_hat"]
         if detectors:
             for bk, det in sorted(detectors.items()):
-                try:
+                with contextlib.suppress(
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    IndexError,
+                ):
                     mask, row, col = det.reflections_mask(kf[:, 0], kf[:, 1], kf[:, 2])
                     if not np.any(mask):
                         continue
@@ -2971,8 +3755,6 @@ def build_rainbow_zone_payload(
                                     for j in range(0, len(px), step_s)
                                 ]
                             )
-                except Exception:
-                    pass
 
         dx = np.asarray(conic_lab["det_x"], dtype=float)
         dy = np.asarray(conic_lab["det_y"], dtype=float)
@@ -3068,6 +3850,7 @@ def build_rainbow_zone_payload(
             render_binning=render_binning,
             frame_slice=frame_slice,
             encode_images=include_panel_images,
+            pixel_class_by_bank=pixel_class_by_bank,
         )
     else:
         panels_payload, intensity_source = [], "raw_h5"
@@ -3099,7 +3882,11 @@ def build_rainbow_zone_payload(
     )
 
     default_d_min = round(0.5 * float(wl_min), 2)
-    d_min_use = float((solve_diagnostics or {}).get("d_min", default_d_min))
+    d_min_use = (
+        float(d_min)
+        if d_min is not None and float(d_min) > 0
+        else float((solve_diagnostics or {}).get("d_min", default_d_min))
+    )
     gonio_summary = (
         frames_meta[active_frame].get("motor_summary", "—")
         if 0 <= active_frame < len(frames_meta)
@@ -3109,7 +3896,7 @@ def build_rainbow_zone_payload(
     from subhkl.config import beamlines as _cfg_beamlines
 
     beamline_detectors: dict[str, dict[str, Any]] = {}
-    for _inst_k in ("CG4D", "MANDI", "IMAGINE"):
+    for _inst_k in ("CG4D", "MANDI", "TOPAZ", "IMAGINE"):
         if _inst_k in _cfg_beamlines:
             beamline_detectors[_inst_k] = {
                 str(bk): {
@@ -3129,6 +3916,7 @@ def build_rainbow_zone_payload(
             }
 
     return {
+        "subhkl_version": get_subhkl_version(),
         "instrument": str(instrument),
         "default_projection": resolved_proj,
         "space_group": str(space_group),
@@ -3151,6 +3939,7 @@ def build_rainbow_zone_payload(
         ),
         "beamline_detectors": beamline_detectors,
         "solve_diagnostics": solve_diagnostics,
+        "em_mask_summary": em_mask_summary,
         "merge_metrics": merge_metrics,
         "peaks": peaks_list,
         "sample_peaks": sample_peaks,
@@ -3170,6 +3959,9 @@ def render_rainbow_html(
 ) -> str:
     """Render a unified, self-contained HTML5/Canvas/JS diffraction parallax widget."""
     payload_json = json.dumps(payload, separators=(",", ":"))
+    subhkl_ver_badge = format_version_badge(
+        str(payload.get("subhkl_version") or get_subhkl_version())
+    )
     inst = payload.get("instrument", "IMAGINE")
     sg = payload.get("space_group", "P 1")
     initial_proj = (
@@ -3181,6 +3973,7 @@ def render_rainbow_html(
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
     init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
     init_dmin = float(payload.get("d_min") or round(0.5 * init_wl_min, 2))
+    sg_symmetry_groups_json = _build_space_group_symmetry_lookup_json()
     ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
     base_tag_html = (
         f'<base href="{ep_env}/" />\n' if ep_env and ep_env.startswith("/") else ""
@@ -3191,7 +3984,8 @@ def render_rainbow_html(
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-{base_tag_html}<title>{title}</title>
+{base_tag_html}<link rel="icon" type="image/svg+xml" href="{SUBHKL_FAVICON_DATA_URI}" />
+<title>{title}</title>
 <script src="https://cdn.jsdelivr.net/npm/h5wasm@0.7.8/dist/iife/h5wasm.js" async></script>
 <style>
   :root {{
@@ -3230,34 +4024,62 @@ def render_rainbow_html(
     user-select: none;
   }}
 
-  /* Top Header Bar — single compact row */
+  /* Top Header Bar — single compact row, dynamically scaled to fit viewport width */
   .top-bar {{
+    --top-bar-scale: 1;
     display: flex;
     flex-wrap: nowrap;
     align-items: center;
     justify-content: space-between;
-    gap: 8px;
-    padding: 3px 10px;
+    gap: calc(6px * var(--top-bar-scale, 1));
+    padding: 3px calc(8px * var(--top-bar-scale, 1));
     background: var(--bg-panel);
     border-bottom: 1px solid var(--border-color);
-    min-height: 32px;
+    min-height: calc(30px * var(--top-bar-scale, 1));
+    width: 100%;
+    max-width: 100vw;
+    overflow: hidden;
     flex-shrink: 0;
   }}
 
   .brand-block {{
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: calc(6px * var(--top-bar-scale, 1));
     white-space: nowrap;
+    min-width: 0;
+    flex-shrink: 1;
   }}
 
   .rainbow-logo {{
     font-family: var(--font-body);
     font-weight: 800;
-    font-size: 1.05rem;
+    font-size: calc(1.05rem * var(--top-bar-scale, 1));
     letter-spacing: 0.3px;
     display: inline-flex;
-    align-items: baseline;
+    align-items: center;
+    gap: calc(4px * var(--top-bar-scale, 1));
+    min-width: 0;
+    flex-shrink: 0;
+  }}
+
+  .subhkl-logo-img {{
+    height: calc(24px * var(--top-bar-scale, 1));
+    width: calc(90px * var(--top-bar-scale, 1));
+    display: block;
+    flex-shrink: 0;
+  }}
+
+  .sr-only {{
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }}
 
   .logo-sub {{
@@ -3272,52 +4094,102 @@ def render_rainbow_html(
     text-shadow: 0 0 12px rgba(244, 63, 133, 0.38);
   }}
 
+  .logo-version {{
+    font-family: var(--font-display);
+    font-size: calc(0.62rem * var(--top-bar-scale, 1));
+    font-weight: 600;
+    color: var(--text-dim);
+    margin-left: 2px;
+    letter-spacing: 0.2px;
+    align-self: flex-end;
+    margin-bottom: 3px;
+    max-width: calc(115px * var(--top-bar-scale, 1));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+
   .subtitle-tag {{
-    font-size: 0.68rem;
-    padding: 2px 6px;
+    font-size: calc(0.68rem * var(--top-bar-scale, 1));
+    padding: 2px calc(6px * var(--top-bar-scale, 1));
     border-radius: 4px;
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     color: var(--accent-cyan);
     font-family: var(--font-display);
+    max-width: calc(210px * var(--top-bar-scale, 1));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+    flex-shrink: 0;
   }}
 
   .hud-metrics {{
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: calc(5px * var(--top-bar-scale, 1));
     white-space: nowrap;
+    min-width: 0;
+    flex-shrink: 1;
   }}
 
   .hud-pill {{
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: 4px;
-    padding: 2px 7px;
+    padding: 2px calc(6px * var(--top-bar-scale, 1));
     display: flex;
     align-items: baseline;
-    gap: 5px;
+    gap: calc(4px * var(--top-bar-scale, 1));
+    min-width: 0;
+    flex-shrink: 0;
   }}
 
   .hud-label {{
-    font-size: 0.58rem;
+    font-size: calc(0.58rem * var(--top-bar-scale, 1));
     text-transform: uppercase;
     color: var(--text-dim);
     font-family: var(--font-display);
   }}
 
   .hud-value {{
-    font-size: 0.74rem;
+    font-size: calc(0.74rem * var(--top-bar-scale, 1));
     font-weight: 700;
     color: var(--accent-gold);
     font-family: var(--font-display);
   }}
 
+  #val-gonio {{
+    max-width: calc(175px * var(--top-bar-scale, 1));
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+
   .controls-cluster {{
     display: flex;
     align-items: center;
-    gap: 4px;
+    gap: calc(4px * var(--top-bar-scale, 1));
     flex-wrap: nowrap;
+    min-width: 0;
+    flex-shrink: 0;
+  }}
+
+  .top-bar button {{
+    padding: calc(3px * var(--top-bar-scale, 1)) calc(7px * var(--top-bar-scale, 1));
+    font-size: calc(0.68rem * var(--top-bar-scale, 1));
+  }}
+
+  #sel-frame {{
+    font-size: calc(0.68rem * var(--top-bar-scale, 1)) !important;
+    max-width: calc(170px * var(--top-bar-scale, 1)) !important;
+  }}
+
+  #sel-galaxy-h5 {{
+    font-size: calc(0.68rem * var(--top-bar-scale, 1)) !important;
+    padding: calc(3px * var(--top-bar-scale, 1)) calc(6px * var(--top-bar-scale, 1)) !important;
+    max-width: calc(165px * var(--top-bar-scale, 1)) !important;
   }}
 
   button {{
@@ -3377,6 +4249,18 @@ def render_rainbow_html(
     width: 100%;
     height: 100%;
     overflow: hidden;
+    display: flex;
+    flex-direction: row;
+    min-width: 0;
+    min-height: 0;
+  }}
+
+  .detector-pane {{
+    position: relative;
+    flex: 1 1 0;
+    min-width: 0;
+    height: 100%;
+    overflow: hidden;
   }}
 
   canvas {{
@@ -3390,7 +4274,7 @@ def render_rainbow_html(
     cursor: grabbing;
   }}
 
-  /* Floating / Expandable Stereogram Wulff Net HUD */
+  /* Floating Corner Inset or Side-by-Side Split Stereogram Wulff Net HUD */
   .stereo-inset {{
     position: absolute;
     bottom: 10px;
@@ -3406,25 +4290,33 @@ def render_rainbow_html(
     overflow: hidden;
     backdrop-filter: blur(8px);
     z-index: 35;
-    transition: opacity 0.18s ease, transform 0.18s ease, width 0.18s ease, height 0.18s ease;
+    transition: opacity 0.18s ease, width 0.18s ease, height 0.18s ease;
   }}
 
   .stereo-inset.expanded {{
-    width: min(80vw, 760px);
-    height: min(78vh, 700px);
-    left: 50%;
-    top: 50%;
+    position: relative;
+    left: auto;
+    top: auto;
     bottom: auto;
-    transform: translate(-50%, -50%);
-    border-color: var(--accent-cyan);
-    box-shadow: 0 22px 64px rgba(0, 0, 0, 0.88);
-    z-index: 75;
+    transform: none;
+    flex: 0 0 clamp(280px, 43%, 560px);
+    width: clamp(280px, 43%, 560px);
+    height: 100%;
+    border-radius: 0;
+    border: none;
+    border-left: 1px solid var(--accent-cyan);
+    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.55);
+    z-index: 35;
   }}
 
   .stereo-inset.hidden {{
     opacity: 0;
     pointer-events: none;
     transform: scale(0.9);
+  }}
+
+  .stereo-inset.expanded.hidden {{
+    display: none;
   }}
 
   .stereo-inset-header {{
@@ -3584,21 +4476,25 @@ def render_rainbow_html(
     font-family: var(--font-display);
   }}
 
-  /* Single-Row Solve Lattice Ladder Footer */
+  /* Single-Row Solve Lattice Ladder Footer, dynamically scaled to fit viewport width */
   .ladder-bar {{
+    --bottom-bar-scale: 1;
     background: var(--bg-panel);
     border-top: 1px solid var(--border-color);
-    padding: 3px 8px 4px 8px;
+    padding: 3px calc(8px * var(--bottom-bar-scale, 1)) 4px calc(8px * var(--bottom-bar-scale, 1));
     display: flex;
     flex-direction: column;
     gap: 3px;
+    width: 100%;
+    max-width: 100vw;
+    overflow: hidden;
     flex-shrink: 0;
   }}
 
   .stage-pill {{
     font-family: var(--font-display);
-    font-size: 0.65rem;
-    padding: 3px 9px;
+    font-size: calc(0.65rem * var(--bottom-bar-scale, 1));
+    padding: 2px calc(8px * var(--bottom-bar-scale, 1)) 2px calc(5px * var(--bottom-bar-scale, 1));
     border-radius: 5px;
     border: 1px solid var(--border-color);
     background: var(--bg-card);
@@ -3607,7 +4503,8 @@ def render_rainbow_html(
     transition: all 0.12s ease;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: calc(5px * var(--bottom-bar-scale, 1));
+    white-space: nowrap;
   }}
 
   .stage-pill:hover {{
@@ -3623,16 +4520,54 @@ def render_rainbow_html(
     font-weight: 700;
   }}
 
+  .stage-pill.stage-running {{
+    border-color: #f43f5e;
+    color: #ffe4e6;
+    background: rgba(244, 63, 94, 0.24);
+    font-weight: 700;
+  }}
+
   .stage-pill.stage-done {{
     border-color: rgba(52, 211, 153, 0.5);
     color: var(--accent-green);
+  }}
+
+  .stage-tape-btn {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: calc(15px * var(--bottom-bar-scale, 1));
+    height: calc(15px * var(--bottom-bar-scale, 1));
+    border-radius: 3px;
+    font-size: calc(0.56rem * var(--bottom-bar-scale, 1));
+    line-height: 1;
+    background: rgba(56, 189, 248, 0.16);
+    border: 1px solid rgba(56, 189, 248, 0.45);
+    color: var(--accent-cyan);
+    flex-shrink: 0;
+  }}
+
+  .stage-pill.stage-running .stage-tape-btn,
+  .stage-tape-btn.tape-stop {{
+    background: rgba(244, 63, 94, 0.28);
+    border-color: #fb7185;
+    color: #fda4af;
+  }}
+
+  .terminal-wrap {{
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: hidden;
   }}
 
   .terminal-box {{
     background: #04060c;
     border: 1px solid #1e293b;
     border-radius: 5px;
-    padding: 5px 7px;
+    padding: 5px 7px 26px 7px;
     font-size: 0.6rem;
     line-height: 1.32;
     font-family: var(--font-display);
@@ -3644,6 +4579,355 @@ def render_rainbow_html(
     word-break: break-all;
     user-select: text;
     margin: 0;
+    outline: none;
+  }}
+
+  .terminal-box:focus {{
+    border-color: #334155;
+  }}
+
+  @keyframes swRainbowShoot {{
+    0% {{
+      stroke-dashoffset: 100;
+      opacity: 0;
+    }}
+    3% {{
+      stroke-dashoffset: 95;
+      opacity: 1;
+    }}
+    44%, 72% {{
+      stroke-dashoffset: 0;
+      opacity: 1;
+    }}
+    96% {{
+      stroke-dashoffset: -95;
+      opacity: 0.85;
+    }}
+    99%, 100% {{
+      stroke-dashoffset: -100;
+      opacity: 0;
+    }}
+  }}
+
+  @keyframes swRainbow8BitGlow {{
+    0%, 100% {{
+      filter: saturate(1.15) drop-shadow(0 0 2.2px rgba(244, 114, 182, 0.45));
+    }}
+    50% {{
+      filter: saturate(1.30) brightness(1.10) drop-shadow(0 0 3.0px rgba(56, 189, 248, 0.55));
+    }}
+  }}
+
+  @keyframes swRainbowTipSparkle {{
+    0% {{
+      opacity: 0;
+      transform: translate(1.94px, 10.6px) scale(0.3);
+    }}
+    3% {{
+      opacity: 0.92;
+      transform: translate(2.55px, 9.4px) scale(0.72);
+    }}
+    11% {{
+      opacity: 1;
+      transform: translate(5.96px, 5.73px) scale(0.85);
+    }}
+    22% {{
+      opacity: 1;
+      transform: translate(12.0px, 3.9px) scale(0.95);
+    }}
+    33% {{
+      opacity: 1;
+      transform: translate(18.04px, 5.73px) scale(0.85);
+    }}
+    44% {{
+      opacity: 0.9;
+      transform: translate(22.06px, 10.6px) scale(0.75);
+    }}
+    47%, 100% {{
+      opacity: 0;
+      transform: translate(22.06px, 10.6px) scale(0.2);
+    }}
+  }}
+
+  @keyframes swRainbowFormOnce {{
+    0% {{
+      stroke-dashoffset: 100;
+      opacity: 0.4;
+    }}
+    100% {{
+      stroke-dashoffset: 0;
+      opacity: 1;
+    }}
+  }}
+
+  @keyframes swStarTwinkle {{
+    0%, 100% {{
+      opacity: 0.18;
+      transform: scale(0.55);
+    }}
+    50% {{
+      opacity: 1;
+      transform: scale(1.12);
+    }}
+  }}
+
+  @keyframes swNeonPulse {{
+    0%, 100% {{
+      border-color: rgba(56, 189, 248, 0.72);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 9px rgba(56, 189, 248, 0.24);
+    }}
+    50% {{
+      border-color: rgba(244, 63, 133, 0.82);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 12px rgba(244, 63, 133, 0.30);
+    }}
+  }}
+
+  .stdio-stopwatch {{
+    position: absolute;
+    right: 9px;
+    bottom: 5px;
+    z-index: 4;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px 2px 5px;
+    border-radius: 999px;
+    background: rgba(8, 12, 24, 0.90);
+    backdrop-filter: blur(5px);
+    border: 1px solid rgba(51, 65, 85, 0.78);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.50);
+    font-family: var(--font-display);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.58rem;
+    line-height: 1.15;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 0.16s ease, color 0.16s ease, transform 0.12s ease;
+    max-width: calc(100% - 14px);
+    overflow: hidden;
+    white-space: nowrap;
+  }}
+
+  .stdio-stopwatch:hover {{
+    border-color: var(--accent-cyan);
+    transform: translateY(-0.5px);
+  }}
+
+  .stdio-stopwatch .sw-icon {{
+    width: 18px;
+    height: 9px;
+    flex-shrink: 0;
+    overflow: visible;
+    opacity: 0.48;
+    filter: saturate(0.55);
+    transition: opacity 0.2s ease, filter 0.2s ease;
+  }}
+
+  .stdio-stopwatch .sw-rb {{
+    stroke-dasharray: 100;
+    stroke-dashoffset: 0;
+  }}
+
+  .stdio-stopwatch .sw-sp-tip,
+  .stdio-stopwatch .sw-sp-end path {{
+    opacity: 0;
+  }}
+
+  .stdio-stopwatch .sw-sp-end path {{
+    transform-box: fill-box;
+    transform-origin: center;
+  }}
+
+  .stdio-stopwatch .sw-stage {{
+    font-size: 0.53rem;
+    font-weight: 700;
+    letter-spacing: 0.25px;
+    text-transform: uppercase;
+    color: #94a3b8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+
+  .stdio-stopwatch .sw-time {{
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    color: #e2e8f0;
+    flex-shrink: 0;
+  }}
+
+  .stdio-stopwatch .sw-ms {{
+    font-size: 0.51rem;
+    opacity: 0.82;
+  }}
+
+  .stdio-stopwatch .sw-odo-wrap {{
+    display: inline-flex;
+    align-items: baseline;
+  }}
+
+  .stdio-stopwatch .sw-odo-col {{
+    display: inline-block;
+    width: 1ch;
+    height: 1.2em;
+    line-height: 1.2em;
+    overflow: hidden;
+    vertical-align: bottom;
+    position: relative;
+    -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.10) 0%, #000 20%, #000 80%, rgba(0, 0, 0, 0.10) 100%);
+    mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.10) 0%, #000 20%, #000 80%, rgba(0, 0, 0, 0.10) 100%);
+  }}
+
+  .stdio-stopwatch .sw-odo-strip {{
+    display: flex;
+    flex-direction: column;
+    will-change: transform;
+  }}
+
+  .stdio-stopwatch .sw-odo-glyph {{
+    display: block;
+    height: 1.2em;
+    line-height: 1.2em;
+    flex: 0 0 1.2em;
+    text-align: center;
+  }}
+
+  .stdio-stopwatch .sw-odo-sep {{
+    display: inline-block;
+    line-height: 1.2em;
+    vertical-align: bottom;
+  }}
+
+  .stdio-stopwatch.sw-slomo {{
+    border-color: rgba(192, 132, 252, 0.85);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 10px rgba(168, 85, 247, 0.34);
+  }}
+
+  .stdio-stopwatch.sw-slomo .sw-time {{
+    color: #f5d0fe;
+  }}
+
+  .stdio-stopwatch.sw-slomo.sw-running .sw-rb,
+  .stdio-stopwatch.sw-slomo.sw-quip-flash .sw-rb {{
+    animation: swRainbowShoot 6.5s linear infinite;
+  }}
+
+  .stdio-stopwatch.sw-slomo.sw-running .sw-sp-tip,
+  .stdio-stopwatch.sw-slomo.sw-quip-flash .sw-sp-tip {{
+    animation: swRainbowTipSparkle 6.5s linear infinite;
+  }}
+
+  .stdio-stopwatch.sw-slomo.sw-quip-flash .sw-icon {{
+    opacity: 1;
+    filter: saturate(1.25) drop-shadow(0 0 3px rgba(192, 132, 252, 0.55));
+  }}
+
+  @keyframes swQuipBlink {{
+    0% {{ opacity: 0.35; transform: translateY(1px); }}
+    18% {{ opacity: 1; transform: translateY(0); }}
+    34% {{ opacity: 0.45; }}
+    52% {{ opacity: 1; }}
+    100% {{ opacity: 1; }}
+  }}
+
+  .stdio-stopwatch.sw-quip-flash {{
+    border-color: rgba(244, 114, 182, 0.90);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 11px rgba(244, 114, 182, 0.35);
+  }}
+
+  .stdio-stopwatch.sw-quip-flash .sw-stage {{
+    color: #fbbf24;
+    text-shadow: 0 0 8px rgba(251, 191, 36, 0.45);
+    animation: swQuipBlink 0.55s ease-out 1;
+  }}
+
+  .stdio-stopwatch.sw-running {{
+    color: #f8fafc;
+    animation: swNeonPulse 1.8s ease-in-out infinite;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-icon {{
+    opacity: 1;
+    animation: swRainbow8BitGlow 0.8s steps(2, end) infinite;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-rb {{
+    animation: swRainbowShoot 1.5s linear infinite;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-rb-1 {{ animation-delay: 0s; }}
+  .stdio-stopwatch.sw-running .sw-rb-2 {{ animation-delay: 0.02s; }}
+  .stdio-stopwatch.sw-running .sw-rb-3 {{ animation-delay: 0.04s; }}
+  .stdio-stopwatch.sw-running .sw-rb-4 {{ animation-delay: 0.06s; }}
+  .stdio-stopwatch.sw-running .sw-rb-5 {{ animation-delay: 0.08s; }}
+
+  .stdio-stopwatch.sw-running .sw-sp-tip {{
+    animation: swRainbowTipSparkle 1.5s linear infinite;
+    animation-delay: 0.04s;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-stage {{
+    color: var(--accent-cyan);
+  }}
+
+  .stdio-stopwatch.sw-running .sw-time {{
+    color: #ffffff;
+  }}
+
+  .stdio-stopwatch.sw-done {{
+    border-color: rgba(52, 211, 153, 0.62);
+    color: #ecfdf5;
+  }}
+
+  .stdio-stopwatch.sw-done .sw-icon {{
+    opacity: 1;
+    filter: saturate(1.1) drop-shadow(0 0 2.5px rgba(56, 189, 248, 0.38));
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-rb {{
+    animation: swRainbowFormOnce 0.42s ease-out 1 both;
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-sp-end path {{
+    animation: swStarTwinkle 0.44s steps(2, end) infinite;
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-sp-end-2 path {{
+    animation-delay: 0.14s;
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-sp-end-3 path {{
+    animation-delay: 0.28s;
+  }}
+
+  .stdio-stopwatch.sw-done .sw-stage {{
+    color: var(--accent-green);
+  }}
+
+  .stdio-stopwatch.sw-stopped {{
+    border-color: rgba(251, 191, 36, 0.60);
+  }}
+
+  .stdio-stopwatch.sw-stopped .sw-icon {{
+    opacity: 0.62;
+    filter: saturate(0.5);
+  }}
+
+  .stdio-stopwatch.sw-stopped .sw-stage {{
+    color: #fbbf24;
+  }}
+
+  .stdio-stopwatch.sw-error {{
+    border-color: rgba(248, 113, 113, 0.68);
+  }}
+
+  .stdio-stopwatch.sw-error .sw-icon {{
+    opacity: 0.65;
+    filter: saturate(0.35) sepia(0.6) hue-rotate(-35deg);
+  }}
+
+  .stdio-stopwatch.sw-error .sw-stage {{
+    color: #f87171;
   }}
 
   .params-drawer {{
@@ -3704,11 +4988,14 @@ def render_rainbow_html(
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: calc(6px * var(--bottom-bar-scale, 1));
+    width: 100%;
+    min-width: 0;
   }}
 
   .ladder-title {{
     font-family: var(--font-display);
-    font-size: 0.72rem;
+    font-size: calc(0.72rem * var(--bottom-bar-scale, 1));
     font-weight: 700;
     color: var(--accent-gold);
     white-space: nowrap;
@@ -3716,19 +5003,37 @@ def render_rainbow_html(
     text-overflow: ellipsis;
   }}
 
+  .ladder-actions {{
+    display: flex;
+    align-items: center;
+    gap: calc(5px * var(--bottom-bar-scale, 1));
+    flex-wrap: nowrap;
+    flex-shrink: 0;
+    min-width: 0;
+  }}
+
+  .ladder-actions button {{
+    font-size: calc(0.66rem * var(--bottom-bar-scale, 1));
+    padding: 2px calc(7px * var(--bottom-bar-scale, 1));
+  }}
+
   .ladder-rungs {{
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
-    gap: 6px;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: calc(6px * var(--bottom-bar-scale, 1));
+    width: 100%;
+    min-width: 0;
   }}
 
   .rung-card {{
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: 5px;
-    padding: 4px 8px;
+    padding: calc(4px * var(--bottom-bar-scale, 1)) calc(8px * var(--bottom-bar-scale, 1));
     cursor: pointer;
     transition: all 0.12s ease;
+    min-width: 0;
+    overflow: hidden;
   }}
 
   .rung-card:hover {{
@@ -3743,15 +5048,19 @@ def render_rainbow_html(
   .rung-top {{
     display: flex;
     justify-content: space-between;
+    gap: 4px;
     font-family: var(--font-display);
-    font-size: 0.62rem;
+    font-size: calc(0.62rem * var(--bottom-bar-scale, 1));
     color: var(--accent-cyan);
+    white-space: nowrap;
+    overflow: hidden;
+    min-width: 0;
   }}
 
   .rung-name {{
     font-family: var(--font-display);
     font-weight: 700;
-    font-size: 0.7rem;
+    font-size: calc(0.7rem * var(--bottom-bar-scale, 1));
     margin: 1px 0;
     white-space: nowrap;
     overflow: hidden;
@@ -3759,7 +5068,7 @@ def render_rainbow_html(
   }}
 
   .rung-sub {{
-    font-size: 0.62rem;
+    font-size: calc(0.62rem * var(--bottom-bar-scale, 1));
     color: var(--text-dim);
     white-space: nowrap;
     overflow: hidden;
@@ -3772,7 +5081,7 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></div>
+      <div class="rainbow-logo" id="app-title">{SUBHKL_LOGO_SVG}<span class="sr-only"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></span><span class="logo-version" id="app-version">{subhkl_ver_badge}</span></div>
       <span class="subtitle-tag">{inst} · {sg}</span>
     </div>
 
@@ -3820,11 +5129,11 @@ def render_rainbow_html(
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
         Cyl
       </button>
-      <button id="btn-zone-order" class="active-btn" title="Cycle maximum Laue zone index order: |u,v,w| ≤ 1 (fundamental) → ≤ 2 → ≤ 3 (higher-order)">
-        |uvw|≤1
-      </button>
       <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
         Arcs
+      </button>
+      <button id="btn-pixel-mask" title="Show/Hide translucent two-color EM pixel mask overlay (Cyan = Dark/Shadowed, Lime = Static Bright)">
+        Mask
       </button>
       <button id="btn-heatmap-cmap" title="Cycle Detector Intensity Heatmap Colormap (Magma / Cyan Glow / Film)">
         Magma
@@ -3857,38 +5166,41 @@ def render_rainbow_html(
         <span id="detector-header-title">DETECTOR ASSEMBLY — LOG(INTENSITY) + PARALLAX BRAGG RINGS</span>
         <span class="hint">Move mouse to peek behind predicted rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
       </div>
-      <div class="canvas-wrap">
-        <canvas id="canvas-detector"></canvas>
+      <div class="canvas-wrap" id="canvas-wrap">
+        <div class="detector-pane" id="detector-pane">
+          <canvas id="canvas-detector"></canvas>
 
-        <!-- Clear 3-Layer Depth Legend -->
-        <div class="layer-legend">
-          <div class="legend-item">
-            <span style="display:inline-block;width:10px;height:10px;background:#f97316;border-radius:2px;"></span>
-            <span>Back Layer: Detector Pixel Counts</span>
-          </div>
-          <div class="legend-item">
-            <span style="display:inline-block;width:14px;height:3px;background:#00e5ff;border-radius:2px;"></span>
-            <span>Mid Layer: Single-Arc Zone Conics [uvw]</span>
-          </div>
-          <div class="legend-item">
-            <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
-            <span>Front Layer: Predicted Bragg Rings (parallax peeks behind spots)</span>
+          <!-- Clear 3-Layer Depth Legend -->
+          <div class="layer-legend">
+            <div class="legend-item">
+              <span style="display:inline-block;width:10px;height:10px;background:#f97316;border-radius:2px;"></span>
+              <span>Back Layer: Detector Pixel Counts</span>
+            </div>
+            <div class="legend-item">
+              <span style="display:inline-block;width:14px;height:3px;background:#00e5ff;border-radius:2px;"></span>
+              <span>Mid Layer: Single-Arc Zone Conics [uvw]</span>
+            </div>
+            <div class="legend-item">
+              <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
+              <span>Front Layer: Predicted Bragg Rings (parallax peeks behind spots)</span>
+            </div>
           </div>
         </div>
 
-        <!-- Interactive Stereogram Wulff Net (Corner Inset or Expanded Popout) -->
+        <!-- Interactive Stereogram Wulff Net (Corner Inset or Side-by-Side Split View) -->
         <div class="stereo-inset hidden" id="stereo-inset">
           <div class="stereo-inset-header">
             <span id="stereo-title" style="color:var(--accent-cyan);font-weight:700;">WULFF NET</span>
             <div class="stereo-toolbar">
               <button id="btn-wulff-scope" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
-              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, or Careless Merge Residual">
+              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, Unscaled I/σ, or Careless Merge Residual">
                 <option value="wavelength">Color: λ/Zone</option>
                 <option value="orbit">Color: ASU Orbit</option>
+                <option value="isigi">Color: I/σ (Unscaled)</option>
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
               </select>
-              <button id="btn-wulff-expand" title="Expand or dock the Wulff Net view">Expand</button>
+              <button id="btn-wulff-expand" title="Toggle between side-by-side Split View and docked Corner Inset">Split</button>
               <button id="btn-wulff-close" title="Hide Wulff Net">X</button>
             </div>
           </div>
@@ -3919,12 +5231,30 @@ def render_rainbow_html(
           <input type="range" id="slider-parallax" min="0.0" max="2.5" step="0.05" value="1.00" />
 
           <div class="slider-row">
-            <span>Wavelength Band λ [Å]</span>
-            <span id="lbl-lam-band">{init_wl_min:.2f}–{init_wl_max:.2f}</span>
+            <span>Resolution Cutoff d_min [Å]</span>
+            <span id="lbl-dmin-val">{init_dmin:.2f} Å</span>
           </div>
-          <div style="display:flex;gap:6px;">
-            <input type="range" id="slider-lam-min" min="0.5" max="6.0" step="0.05" value="{init_wl_min:.2f}" title="Min Wavelength" />
-            <input type="range" id="slider-lam-max" min="1.0" max="10.0" step="0.05" value="{init_wl_max:.2f}" title="Max Wavelength" />
+          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å] (synchronized with Params bar)" />
+
+          <div class="slider-row" style="margin-top:2px;">
+            <span>Spot Color</span>
+            <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Unscaled I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
+              <option value="wavelength">Color: λ/Zone</option>
+              <option value="orbit">Color: ASU Orbit</option>
+              <option value="isigi">Color: I/σ (Unscaled)</option>
+              <option value="residual">Color: ΔI/σ Residual</option>
+              <option value="scale">Color: Scale</option>
+            </select>
+          </div>
+          <div id="mask-legend-row" class="slider-row" style="display:none;margin-top:3px;padding-top:3px;border-top:1px solid rgba(38,49,79,0.75);font-size:0.61rem;gap:6px;">
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Dead detector banks and cryostat/panel shadows ignored during solve &amp; prediction">
+              <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(56,189,248,0.62);border:1px solid #38bdf8;"></span>
+              <span id="lbl-mask-dark">Dark 0.0%</span>
+            </span>
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Static bright enclosure flares &amp; hot strips ignored during solve &amp; prediction">
+              <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(180,255,20,0.88);border:1px solid #b4ff14;"></span>
+              <span id="lbl-mask-bright">Bright 0.00%</span>
+            </span>
           </div>
         </div>
       </div>
@@ -3948,7 +5278,32 @@ def render_rainbow_html(
           <span>&gt;_ Terminal // Stdio</span>
           <span id="cell-summary" style="font-size:0.62rem;color:var(--accent-pink);">IDLE</span>
         </div>
-        <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
+        <div class="terminal-wrap">
+          <pre class="terminal-box" id="terminal-box" tabindex="0">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
+          <div class="stdio-stopwatch sw-idle" id="stdio-stopwatch" role="timer" aria-live="off" title="Step stopwatch (mm:ss.ms) — counts time spent in each pipeline step">
+            <svg class="sw-icon" viewBox="0 0 24 12" aria-hidden="true">
+              <path class="sw-rb sw-rb-1" pathLength="100" d="M 0.55 10.6 A 12.2 12.2 0 0 1 23.45 10.6" fill="none" stroke="#ff3b6b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-2" pathLength="100" d="M 1.24 10.6 A 11.55 11.55 0 0 1 22.76 10.6" fill="none" stroke="#ff922b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-3" pathLength="100" d="M 1.94 10.6 A 10.9 10.9 0 0 1 22.06 10.6" fill="none" stroke="#ffd43b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-4" pathLength="100" d="M 2.65 10.6 A 10.25 10.25 0 0 1 21.35 10.6" fill="none" stroke="#38d9a9" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-5" pathLength="100" d="M 3.37 10.6 A 9.6 9.6 0 0 1 20.63 10.6" fill="none" stroke="#38bdf8" stroke-width="0.68" stroke-linecap="round"></path>
+              <g class="sw-sp-tip">
+                <path d="M 0 -1.8 L 0.45 -0.45 L 1.8 0 L 0.45 0.45 L 0 1.8 L -0.45 0.45 L -1.8 0 L -0.45 -0.45 Z" fill="#fef08a"></path>
+              </g>
+              <g class="sw-sp-end sw-sp-end-1" transform="translate(5.2 3.8)">
+                <path d="M 0 -1.7 L 0.42 -0.42 L 1.7 0 L 0.42 0.42 L 0 1.7 L -0.42 0.42 L -1.7 0 L -0.42 -0.42 Z" fill="#fde047"></path>
+              </g>
+              <g class="sw-sp-end sw-sp-end-2" transform="translate(12.0 1.4)">
+                <path d="M 0 -2.0 L 0.5 -0.5 L 2.0 0 L 0.5 0.5 L 0 2.0 L -0.5 0.5 L -2.0 0 L -0.5 -0.5 Z" fill="#ffffff"></path>
+              </g>
+              <g class="sw-sp-end sw-sp-end-3" transform="translate(19.0 4.0)">
+                <path d="M 0 -1.7 L 0.42 -0.42 L 1.7 0 L 0.42 0.42 L 0 1.7 L -0.42 0.42 L -1.7 0 L -0.42 -0.42 Z" fill="#67e8f9"></path>
+              </g>
+            </svg>
+            <span class="sw-stage" id="stdio-stopwatch-stage">READY</span>
+            <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>
+          </div>
+        </div>
         <canvas id="canvas-hist" title="Click to cycle resolution sparkline: CC½ vs d → Completeness vs d → ⟨I/σ⟩ vs d" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
       </div>
     </aside>
@@ -3960,33 +5315,35 @@ def render_rainbow_html(
       <div class="ladder-title" id="ladder-desc" style="flex:1;min-width:0;margin-right:8px;">
         <span id="combo-badge" style="color:var(--accent-cyan);margin-right:6px;">[INSPECTOR]</span><span id="inspector-box">Hover or click a Bragg spot to inspect (hkl), λ, d, and bank • Step through Lattice Ladder below</span>
       </div>
-      <div style="display:flex;align-items:center;gap:5px;flex-wrap:nowrap;">
-        <span style="font-size:0.62rem;color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
-        <div id="pipeline-stages" style="display:flex;align-items:center;gap:4px;"></div>
+      <div class="ladder-actions" id="ladder-actions">
+        <span id="lbl-execute" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
+        <div id="pipeline-stages" style="display:flex;align-items:center;gap:calc(4px * var(--bottom-bar-scale, 1));"></div>
         <button id="btn-params-toggle" title="Configure unit cell, space group, and wavelength parameters for Solve/Integrate">
           Params
         </button>
         <button id="btn-files-toggle" title="Download NDIP / workflow artifacts for the current step (switch steps with < Walk > arrows)">
           Files
         </button>
-        <span id="galaxy-status-badge" style="font-size:0.62rem;font-family:var(--font-display);padding:2px 6px;border-radius:4px;border:1px solid #334155;color:var(--text-dim);">
+        <span id="galaxy-status-badge" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));font-family:var(--font-display);padding:2px calc(6px * var(--bottom-bar-scale, 1));border-radius:4px;border:1px solid #334155;color:var(--text-dim);white-space:nowrap;">
           LOCAL
         </span>
         <button id="btn-galaxy-dispatch" style="display:none;">Run</button>
-        <button id="btn-ladder-prev" style="padding:2px 7px;font-size:0.66rem;">&lt;</button>
-        <button id="btn-ladder-play" class="active-btn" style="padding:2px 8px;font-size:0.66rem;">Walk</button>
-        <button id="btn-ladder-next" style="padding:2px 7px;font-size:0.66rem;">&gt;</button>
+        <button id="btn-ladder-prev">&lt;</button>
+        <button id="btn-ladder-play" class="active-btn">Walk</button>
+        <button id="btn-ladder-next">&gt;</button>
       </div>
     </div>
     <div id="params-drawer" class="params-drawer">
-      <span>SG <input id="inp-sg" type="text" value="{sg}" style="width:78px;" /></span>
+      <span>SG <input id="inp-sg" type="text" list="subhkl-sg-datalist" value="{sg}" style="width:78px;" title="Space group (determines crystal system symmetry constraints for unit cell parameters; paste full unit cell in any field)" /></span>
       <span>a <input id="inp-a" type="number" step="0.1" value="68.7" /></span>
       <span>b <input id="inp-b" type="number" step="0.1" value="69.8" /></span>
       <span>c <input id="inp-c" type="number" step="0.1" value="156.9" /></span>
       <span>α <input id="inp-alpha" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>β <input id="inp-beta" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>γ <input id="inp-gamma" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
-      <span>d_min <input id="inp-dmin" type="number" step="0.1" value="{init_dmin:.1f}" style="width:44px;" /></span>
+      <span title="Minimum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_min <input id="inp-lmin" type="number" step="0.05" value="{init_wl_min:.2f}" style="width:48px;" /></span>
+      <span title="Maximum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_max <input id="inp-lmax" type="number" step="0.05" value="{init_wl_max:.2f}" style="width:48px;" /></span>
+      <span title="High-resolution cutoff d_min [Å] (synchronized with sidebar slider)">d_min <input id="inp-dmin" type="number" step="0.05" value="{init_dmin:.2f}" style="width:48px;" /></span>
       <span title="Panel border rejection width (fraction of image size)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="0.03" style="width:52px;" /></span>
     </div>
     <div id="files-drawer" class="params-drawer"></div>
@@ -4028,21 +5385,20 @@ def render_rainbow_html(
             INSTRUMENT
             <select id="nd-instrument" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;">
               <option value="CG4D" selected>CG4D (IMAGINE-X)</option>
-              <option value="IMAGINE">IMAGINE (HFIR)</option>
               <option value="MANDI">MANDI (SNS)</option>
               <option value="TOPAZ">TOPAZ (SNS)</option>
             </select>
           </label>
           <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
             IPTS NUMBER
-            <input id="nd-ipts" type="text" value="37331" placeholder="e.g. 37331" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-ipts" type="text" value="" placeholder="e.g. 37331" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
           <label style="display:flex;flex-direction:column;gap:3px;font-size:0.65rem;color:var(--text-dim);min-width:0;">
             <span style="display:flex;align-items:center;justify-content:space-between;">
               <span>RUN OR RANGE</span>
               <span id="nd-multirun-badge" style="font-size:0.58rem;color:var(--accent-cyan);">Multi-run</span>
             </span>
-            <input id="nd-runs" type="text" value="2625-2638" placeholder="e.g. 2625-2638 or 12737,12739" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+            <input id="nd-runs" type="text" value="" placeholder="e.g. 2625-2638, 2632-2638/2, or 12737,12739" title="Enter run numbers, ranges (2632-2638, 2632:2638, 2632..2638), or stepped intervals (2632-2638/2, 2623:26238:2, 2632-2638..2)" style="width:100%;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
           </label>
         </div>
 
@@ -4102,61 +5458,57 @@ def render_rainbow_html(
         </label>
       </div>
 
-      <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;padding:8px 10px;margin-bottom:10px;">
-        <div style="font-family:var(--font-display);font-size:0.66rem;color:var(--accent-gold);margin-bottom:6px;">
-          SAMPLE UNIT CELL (LENGTHS &amp; ANGLES), SPACE GROUP &amp; WAVELENGTH BAND
+      <div style="background:var(--bg-card);border:1px solid var(--border-color);border-radius:6px;padding:7px 10px;margin-bottom:8px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px;">
+          <span style="font-family:var(--font-display);font-size:0.65rem;color:var(--accent-gold);white-space:nowrap;">
+            SAMPLE UNIT CELL (LENGTHS &amp; ANGLES) &amp; SPACE GROUP
+          </span>
+          <span id="nd-symmetry-badge" style="font-family:var(--font-display);font-size:0.58rem;padding:1px 6px;border-radius:4px;border:1px solid rgba(56,189,248,0.35);background:rgba(56,189,248,0.1);color:var(--accent-cyan);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="Crystal system symmetry proposals automatically fill/mirror linked lengths and fixed angles (type in any locked field to override)">
+            Paste cell in any field
+          </span>
         </div>
-        <!-- Row 1: Space group + Unit cell lengths a, b, c -->
-        <div style="display:grid;grid-template-columns:1.3fr repeat(3,minmax(0,1fr));gap:8px;margin-bottom:6px;">
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            SPACE GROUP
-            <input id="nd-sg" type="text" value="{sg}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+        <datalist id="subhkl-sg-datalist"></datalist>
+        <!-- Compact single row: Space group + a, b, c, alpha, beta, gamma + per-field hoverable autocomplete dropdown -->
+        <div id="nd-cell-fields-row" style="position:relative;display:grid;grid-template-columns:1.45fr repeat(6,minmax(0,1fr));gap:6px;margin-bottom:6px;">
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.6rem;color:var(--text-dim);min-width:0;">
+            <span id="nd-lbl-sg" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">SPACE GROUP</span>
+            <input id="nd-sg" type="text" value="" autocomplete="off" placeholder="e.g. P 21 21 21" title="Enter space group or paste full unit cell (e.g. '68.84 98.07 90.92 90.07 106.11 90.01 P21')" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
           </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            a (Å)
-            <input id="nd-a" type="number" step="0.01" value="69.07" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.6rem;color:var(--text-dim);min-width:0;">
+            <span id="nd-lbl-a" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">a (Å)</span>
+            <input id="nd-a" type="number" step="any" value="" autocomplete="off" placeholder="a" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
           </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            b (Å)
-            <input id="nd-b" type="number" step="0.01" value="98.00" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.6rem;color:var(--text-dim);min-width:0;">
+            <span id="nd-lbl-b" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">b (Å)</span>
+            <input id="nd-b" type="number" step="any" value="" autocomplete="off" placeholder="b" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
           </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            c (Å)
-            <input id="nd-c" type="number" step="0.01" value="90.92" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.6rem;color:var(--text-dim);min-width:0;">
+            <span id="nd-lbl-c" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">c (Å)</span>
+            <input id="nd-c" type="number" step="any" value="" autocomplete="off" placeholder="c" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
           </label>
-        </div>
-        <!-- Row 2: Unit cell angles alpha, beta, gamma + wavelength band -->
-        <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr)) 0.85fr 0.85fr;gap:8px;margin-bottom:8px;">
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            α (°)
-            <input id="nd-alpha" type="number" step="0.01" value="90.07" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.6rem;color:var(--text-dim);min-width:0;">
+            <span id="nd-lbl-alpha" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">α (°)</span>
+            <input id="nd-alpha" type="number" step="any" value="" autocomplete="off" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
           </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            β (°)
-            <input id="nd-beta" type="number" step="0.01" value="106.14" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.6rem;color:var(--text-dim);min-width:0;">
+            <span id="nd-lbl-beta" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">β (°)</span>
+            <input id="nd-beta" type="number" step="any" value="" autocomplete="off" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
           </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            γ (°)
-            <input id="nd-gamma" type="number" step="0.01" value="90.01" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
+          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.6rem;color:var(--text-dim);min-width:0;">
+            <span id="nd-lbl-gamma" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">γ (°)</span>
+            <input id="nd-gamma" type="number" step="any" value="" autocomplete="off" placeholder="90" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:3px 5px;font-family:var(--font-display);font-size:0.7rem;" />
           </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            λ_min (Å)
-            <input id="nd-wl-min" type="number" step="0.1" value="{init_wl_min:.1f}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
-          </label>
-          <label style="display:flex;flex-direction:column;gap:2px;font-size:0.62rem;color:var(--text-dim);min-width:0;">
-            λ_max (Å)
-            <input id="nd-wl-max" type="number" step="0.1" value="{init_wl_max:.1f}" style="width:100%;min-width:0;box-sizing:border-box;background:#070913;color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:4px 6px;font-family:var(--font-display);font-size:0.72rem;" />
-          </label>
+          <div id="nd-cell-suggestions" role="listbox" style="display:none;position:absolute;top:100%;left:0;z-index:9500;margin-top:2px;max-height:160px;overflow-y:auto;flex-direction:column;background:#0b1021;border:1px solid var(--accent-cyan);border-radius:5px;box-shadow:0 10px 26px rgba(0,0,0,0.9);padding:2px;"></div>
         </div>
         <div id="nd-preview-path" style="font-family:var(--font-display);font-size:0.64rem;color:var(--accent-cyan);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px;">
-          Preview: /HFIR/CG4D/IPTS-37331/nexus/CG4D_2625.nxs.h5 … CG4D_2638.nxs.h5 (14 runs)
+          Preview: specify IPTS + run range or explicit file path(s)
         </div>
         <div id="nd-preview-title" style="font-family:var(--font-display);font-size:0.63rem;color:var(--accent-gold);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:4px;"></div>
         <div id="nd-validation-status" style="font-family:var(--font-display);font-size:0.66rem;min-height:18px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:3px 6px;border-radius:4px;background:rgba(7,9,19,0.65);border:1px solid rgba(56,189,248,0.2);">
           <span id="nd-validation-msg" style="color:var(--text-dim);">Ready to verify via NDIP Load Neutron Data (`neutrons_load_data`)</span>
           <div style="display:flex;align-items:center;gap:6px;">
             <button id="btn-nd-use-suggested-ipts" type="button" style="display:none;padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(251,191,36,0.18);border:1px solid var(--accent-gold);color:var(--accent-gold);border-radius:4px;cursor:pointer;white-space:nowrap;"></button>
-            <button id="btn-nd-verify" type="button" style="padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(56,189,248,0.14);border:1px solid rgba(56,189,248,0.45);color:var(--accent-cyan);border-radius:4px;cursor:pointer;white-space:nowrap;">Check via NDIP</button>
+            <button id="btn-nd-verify" type="button" style="padding:2px 8px;font-size:0.64rem;font-family:var(--font-display);background:rgba(56,189,248,0.14);border:1px solid rgba(56,189,248,0.45);color:var(--accent-cyan);border-radius:4px;cursor:pointer;white-space:nowrap;">Check via ONcat</button>
           </div>
         </div>
       </div>
@@ -4166,6 +5518,46 @@ def render_rainbow_html(
         <button id="btn-nd-submit" class="active-btn" style="padding:5px 14px;font-size:0.72rem;font-family:var(--font-display);font-weight:700;">
           Load Neutron Data &amp; Reduce to merged.h5
         </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal Dialog: Select Any Dataset From Galaxy History -->
+  <div id="modal-galaxy-dataset" style="display:none;position:fixed;inset:0;z-index:9000;background:rgba(4,6,14,0.82);backdrop-filter:blur(4px);align-items:center;justify-content:center;">
+    <div style="width:min(680px,95vw);max-height:90vh;overflow-y:auto;background:var(--bg-panel);border:1px solid var(--accent-cyan);border-radius:10px;box-shadow:0 18px 50px rgba(0,0,0,0.75);padding:12px 15px;color:var(--text-main);font-size:0.76rem;">
+      <div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border-color);padding-bottom:7px;margin-bottom:8px;">
+        <div>
+          <strong style="font-family:var(--font-display);font-size:0.86rem;color:var(--accent-cyan);">SELECT DATASET FROM GALAXY</strong>
+          <div style="font-size:0.65rem;color:var(--text-dim);margin-top:2px;">
+            Ordered by most recently touched first. SubHKL <code>.h5</code> and raw NeXus <code>.nxs.h5</code> datasets are active; <code>.mtz</code> reference spots unlock when detector geometry is loaded; other files are grayed out.
+          </div>
+        </div>
+        <button id="btn-gx-ds-close" style="padding:2px 8px;font-size:0.72rem;">X</button>
+      </div>
+
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+        <input id="gx-ds-filter" type="text" placeholder="Filter by #hid, filename, extension, or state..." style="flex:1;min-width:0;box-sizing:border-box;background:var(--bg-card);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;padding:5px 8px;font-family:var(--font-display);font-size:0.72rem;" />
+        <button id="btn-gx-ds-refresh" type="button" style="padding:4px 10px;font-size:0.68rem;font-family:var(--font-display);">Refresh</button>
+      </div>
+
+      <div id="gx-ds-loading" style="display:none;margin-bottom:8px;padding:7px 10px;border-radius:5px;background:rgba(56,189,248,0.14);border:1px solid var(--accent-cyan);color:var(--accent-cyan);font-family:var(--font-display);font-size:0.7rem;font-weight:700;">
+        Downloading dataset from Galaxy… Please wait.
+      </div>
+
+      <div id="gx-ds-list" style="height:280px;overflow-y:auto;border:1px solid var(--border-color);border-radius:6px;background:#070913;display:flex;flex-direction:column;gap:2px;padding:4px;margin-bottom:8px;">
+        <div style="padding:10px;color:var(--text-dim);font-size:0.68rem;">No Galaxy datasets loaded yet.</div>
+      </div>
+
+      <div id="gx-ds-error" style="display:none;margin-bottom:8px;padding:6px 10px;border-radius:5px;background:rgba(248,113,113,0.12);border:1px solid rgba(248,113,113,0.5);color:#f87171;font-family:var(--font-display);font-size:0.68rem;"></div>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+        <span id="gx-ds-count" style="font-family:var(--font-display);font-size:0.64rem;color:var(--text-dim);">0 datasets</span>
+        <div style="display:flex;gap:8px;">
+          <button id="btn-gx-ds-cancel" type="button" style="padding:5px 12px;font-size:0.72rem;">Cancel</button>
+          <button id="btn-gx-ds-submit" type="button" class="active-btn" style="padding:5px 14px;font-size:0.72rem;font-family:var(--font-display);font-weight:700;">
+            Open Selected Dataset
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -4182,7 +5574,164 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const LADDER = DATA.ladder_steps || [];
   const PIPELINE = DATA.pipeline_stages || [];
 
-  const wlRange = DATA.wavelength_range || [2.8, 4.5];
+  const INSTRUMENT_WAVELENGTH_DEFAULTS = {{
+    IMAGINE: [2.0, 4.0],
+    CG4D: [2.8, 4.5],
+    SNAP: [1.0, 4.0],
+    CORELLI: [0.6, 2.5],
+    TOPAZ: [0.4, 3.5],
+    MANDI: [2.0, 4.0],
+    "WAND²": [1.44, 1.54],
+    DEMAND: [1.50, 1.60],
+  }};
+  const SG_SYMMETRY_GROUPS = {sg_symmetry_groups_json};
+  const SG_SYMMETRY_LOOKUP = (() => {{
+    const map = Object.create(null);
+    Object.entries(SG_SYMMETRY_GROUPS || {{}}).forEach(([setting, list]) => {{
+      if (Array.isArray(list)) {{
+        list.forEach(k => {{
+          if (k) map[String(k).toLowerCase()] = setting;
+        }});
+      }}
+    }});
+    return map;
+  }})();
+
+  function symmetryRulesForSetting(crystalSystem, setting) {{
+    let linked_lengths = {{}};
+    let linked_angles = {{}};
+    let fixed_angles = {{}};
+    let summary = crystalSystem.toUpperCase();
+    if (setting === "cubic") {{
+      linked_lengths = {{ b: "a", c: "a" }};
+      fixed_angles = {{ alpha: 90, beta: 90, gamma: 90 }};
+      summary = "CUBIC • a=b=c, α=β=γ=90°";
+    }} else if (setting === "tetragonal") {{
+      linked_lengths = {{ b: "a" }};
+      fixed_angles = {{ alpha: 90, beta: 90, gamma: 90 }};
+      summary = "TETRAGONAL • a=b, α=β=γ=90°";
+    }} else if (setting === "hexagonal" || setting === "trigonal") {{
+      linked_lengths = {{ b: "a" }};
+      fixed_angles = {{ alpha: 90, beta: 90, gamma: 120 }};
+      summary = `${{crystalSystem.toUpperCase()}} • a=b, α=β=90°, γ=120°`;
+    }} else if (setting === "trigonal_r") {{
+      linked_lengths = {{ b: "a", c: "a" }};
+      linked_angles = {{ beta: "alpha", gamma: "alpha" }};
+      summary = "RHOMBOHEDRAL (:R) • a=b=c, α=β=γ";
+    }} else if (setting === "orthorhombic") {{
+      fixed_angles = {{ alpha: 90, beta: 90, gamma: 90 }};
+      summary = "ORTHORHOMBIC • α=β=γ=90°";
+    }} else if (setting === "monoclinic_b") {{
+      fixed_angles = {{ alpha: 90, gamma: 90 }};
+      summary = "MONOCLINIC • α=γ=90°";
+    }} else if (setting === "monoclinic_c") {{
+      fixed_angles = {{ alpha: 90, beta: 90 }};
+      summary = "MONOCLINIC (c-unique) • α=β=90°";
+    }} else if (setting === "monoclinic_a") {{
+      fixed_angles = {{ beta: 90, gamma: 90 }};
+      summary = "MONOCLINIC (a-unique) • β=γ=90°";
+    }} else {{
+      summary = "TRICLINIC • all 6 free";
+    }}
+    return {{
+      crystal_system: crystalSystem,
+      setting,
+      linked_lengths,
+      linked_angles,
+      fixed_angles,
+      summary,
+    }};
+  }}
+
+  function resolveSpaceGroupSymmetry(sgRaw) {{
+    const raw = String(sgRaw || "").trim();
+    if (!raw) {{
+      return {{
+        crystal_system: "unknown",
+        setting: "triclinic",
+        linked_lengths: {{}},
+        linked_angles: {{}},
+        fixed_angles: {{}},
+        summary: "Paste cell in any field",
+      }};
+    }}
+    const norm = raw.toLowerCase().replace(/\\s+/g, "");
+    if (/^\\d+$/.test(norm)) {{
+      const num = parseInt(norm, 10);
+      if (num >= 1 && num <= 2) return symmetryRulesForSetting("triclinic", "triclinic");
+      if (num >= 3 && num <= 15) return symmetryRulesForSetting("monoclinic", "monoclinic_b");
+      if (num >= 16 && num <= 74) return symmetryRulesForSetting("orthorhombic", "orthorhombic");
+      if (num >= 75 && num <= 142) return symmetryRulesForSetting("tetragonal", "tetragonal");
+      if (num >= 143 && num <= 167) {{
+        return norm.endsWith(":r")
+          ? symmetryRulesForSetting("trigonal", "trigonal_r")
+          : symmetryRulesForSetting("trigonal", "trigonal");
+      }}
+      if (num >= 168 && num <= 194) return symmetryRulesForSetting("hexagonal", "hexagonal");
+      if (num >= 195 && num <= 230) return symmetryRulesForSetting("cubic", "cubic");
+    }}
+    let setting = SG_SYMMETRY_LOOKUP[norm] || null;
+    if (!setting && norm.endsWith(":h")) {{
+      setting = SG_SYMMETRY_LOOKUP[norm.slice(0, -2)] || "trigonal";
+    }} else if (!setting && norm.endsWith(":r")) {{
+      setting = "trigonal_r";
+    }}
+    if (setting) {{
+      const cs = setting.startsWith("monoclinic")
+        ? "monoclinic"
+        : (setting === "trigonal_r" ? "trigonal" : setting);
+      return symmetryRulesForSetting(cs, setting);
+    }}
+    return symmetryRulesForSetting("triclinic", "triclinic");
+  }}
+
+  function parseUnitCellClipboardText(text) {{
+    if (!text || typeof text !== "string") return null;
+    let s = text.trim();
+    if (!s) return null;
+    s = s.replace(/^[\\[\\(\\{{]+|[\\]\\)\\}}]+$/g, "").trim();
+    s = s.replace(/\\b(?:a|b|c|alpha|beta|gamma|sg|space_group|spacegroup)\\s*=\\s*/gi, " ");
+    s = s.replace(/[αβγ]\\s*=\\s*/g, " ");
+    s = s.replace(/(?<=\\d)\\s*(?:°|deg|Å|angstrom)\\b/gi, "");
+    s = s.replace(/°/g, " ").trim();
+    const sixFrontRe = /^\\s*((?:[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?[\\s,;]+){{5}}[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)(?:\\s*[,;|]?\\s*(.*))?$/i;
+    const sixBackRe = /^(.*?)(?:[\\s,;|]+)((?:[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?[\\s,;]+){{5}}[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)\\s*$/i;
+    const numExtractRe = /[+-]?(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?/g;
+    const validateSix = (numsStr) => {{
+      const matches = numsStr.match(numExtractRe);
+      if (!matches || matches.length !== 6) return null;
+      const vals = matches.map(Number);
+      if (vals.slice(0, 3).some(v => !Number.isFinite(v) || v <= 0)) return null;
+      if (vals.slice(3, 6).some(v => !Number.isFinite(v) || v <= 10 || v >= 180)) return null;
+      return vals;
+    }};
+    const mFront = s.match(sixFrontRe);
+    if (mFront) {{
+      const cell = validateSix(mFront[1]);
+      if (cell) {{
+        const sg = String(mFront[2] || "").replace(/^[\\s,;|]+|[\\s,;|]+$/g, "");
+        return {{ cell, space_group: sg }};
+      }}
+    }}
+    const mBack = s.match(sixBackRe);
+    if (mBack) {{
+      const cell = validateSix(mBack[2]);
+      if (cell) {{
+        const sg = String(mBack[1] || "").replace(/^[\\s,;|]+|[\\s,;|]+$/g, "");
+        return {{ cell, space_group: sg }};
+      }}
+    }}
+    return null;
+  }}
+  function getDefaultWavelengthForInstrument(instName) {{
+    const key = String(instName || DATA.instrument || "CG4D").trim().toUpperCase();
+    return INSTRUMENT_WAVELENGTH_DEFAULTS[key] || [2.0, 4.5];
+  }}
+
+  const wlRange = (Array.isArray(DATA.wavelength_range) && DATA.wavelength_range.length >= 2)
+    ? DATA.wavelength_range
+    : getDefaultWavelengthForInstrument(DATA.instrument);
+  const initDminVal = Number(DATA.d_min || (0.5 * Number(wlRange[0] || 2.0)).toFixed(2));
   const order1ZoneIds = ZONES.filter(z => (z.order || 1) <= 1).map(z => z.zone_id);
   const initialZoneIds = order1ZoneIds.length > 0
     ? order1ZoneIds
@@ -4190,18 +5739,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function pipelineIdxForArtifactKind(artKind) {{
     const k = String(artKind || "solve").toLowerCase();
-    if (k === "raw_nexus") return 0; // Pending step: 1. Reduce & Merge
+    if (k === "empty" || k === "raw_nexus") return 0; // Pending step: 1. Reduce & Merge
     if (k === "merged") return 1;    // Pending step: 2. Solve
     if (k === "integrator") return 3; // Completed 1..3, Pending step: 4. Merge
     if (k === "merged_careless") return 4; // Completed 1..4
     return 2; // solve / predictor / finder -> Completed 1..2, Pending step: 3. Integrate
   }}
 
-  const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" || Boolean(DATA.merge_metrics);
+  const UI_MODE = "{default_mode}".toLowerCase();
+  const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" &&
+    Array.isArray(PEAKS) &&
+    PEAKS.some(p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual));
   const state = {{
     projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
     showZoneArcs: true,           // single vibrant arc per zone (not multi-band rainbow)
+    showPixelMask: false,         // translucent two-color EM pixel mask overlay (dark=cyan, bright=lime)
     heatmapStyle: "magma",        // "magma" | "cyan" | "gray"
     detAlpha: 0.85,
     showStereo: isMergedInit,
@@ -4209,19 +5762,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     wulffScope: isMergedInit ? "all_runs" : "single_frame", // "single_frame" (1-Frame) | "all_runs" (All-Runs)
     wulffFrame: "sample",         // always project in Sample frame (coupled via goniometer R)
     wulffCoupled: true,           // 360° periodic detector pan <-> Wulff yaw always coupled
-    wulffColorMode: isMergedInit ? "residual" : "wavelength", // "wavelength" | "orbit" | "residual" | "scale"
+    wulffColorMode: isMergedInit ? "residual" : "wavelength", // "wavelength" | "orbit" | "isigi" | "residual" | "scale"
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
     histMetric: "cc_half",        // "cc_half" | "completeness" | "isigi"
-    lamMin: wlRange[0],
-    lamMax: wlRange[1],
+    lamMin: Number(wlRange[0]),
+    lamMax: Number(wlRange[1]),
+    dMin: initDminVal,
     zoneTolDeg: 0.75,
     parallaxStrength: 1.0,
     activeZones: new Set(initialZoneIds),
     selectedZoneId: null,
     hoveredPeakId: null,
     selectedPeakId: null,
+    hoveredPeakObj: null,
+    selectedPeakObj: null,
     activeOrbitId: null,
     currentPipelineIdx: pipelineIdxForArtifactKind(DATA.artifact_kind), // 0: Reduce, 1: Solve, 2: Integrate, 3: Merge, 4: Done
     currentRungIdx: DATA.artifact_kind === "merged" ? 0 : Math.max(0, LADDER.length - 1),
@@ -4236,10 +5792,72 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     selectedFrameIndex: typeof DATA.frame_index === "number" ? DATA.frame_index : 0,
     frameRequestSeq: 0,
     frameAbortController: null,
+    stepTimings: Object.create(null),
+    stopwatchInspectKey: null,
+    stopwatchCheatSlowMo: false,
+    terminalFollowTail: true,
+    terminalScrollTop: 0,
   }};
 
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
   const bankCanvases = new Map();
+  const warpedBankCanvases = new Map();
+  const maskBankCanvases = new Map();
+  const warpedMaskCanvases = new Map();
+
+  function colorizeMaskImage(img) {{
+    const c = document.createElement("canvas");
+    c.width = img.width || 64;
+    c.height = img.height || 64;
+    const ctx = c.getContext("2d");
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(img, 0, 0);
+    const imgData = ctx.getImageData(0, 0, c.width, c.height);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {{
+      const v = d[i];
+      if (v >= 192) {{
+        // Class 2 (static bright): vivid translucent electric lime-gold
+        d[i] = 180; d[i + 1] = 255; d[i + 2] = 20; d[i + 3] = 224;
+      }} else if (v >= 64) {{
+        // Class 1 (dark / shadowed / dead panel): translucent cool sky-cyan
+        d[i] = 56; d[i + 1] = 189; d[i + 2] = 248; d[i + 3] = 132;
+      }} else {{
+        d[i] = 0; d[i + 1] = 0; d[i + 2] = 0; d[i + 3] = 0;
+      }}
+    }}
+    ctx.putImageData(imgData, 0, 0);
+    return c;
+  }}
+
+  function hasPixelMask() {{
+    if (maskBankCanvases.size > 0) return true;
+    if (DATA.em_mask_summary && DATA.em_mask_summary.available) return true;
+    return Array.isArray(PANELS) && PANELS.some(p => Boolean(p && (p.mask_b64 || p._maskCanvas)));
+  }}
+
+  function syncPixelMaskUI() {{
+    const btnMask = document.getElementById("btn-pixel-mask");
+    const rowEl = document.getElementById("mask-legend-row");
+    const darkEl = document.getElementById("lbl-mask-dark");
+    const brightEl = document.getElementById("lbl-mask-bright");
+    const avail = hasPixelMask();
+    const sum = (DATA && DATA.em_mask_summary) || {{}};
+    const darkPct = typeof sum.dark_fraction === "number" ? (sum.dark_fraction * 100) : 0;
+    const brightPct = typeof sum.bright_fraction === "number" ? (sum.bright_fraction * 100) : 0;
+    if (btnMask) {{
+      btnMask.classList.toggle("active-btn", Boolean(state.showPixelMask));
+      btnMask.style.opacity = avail || state.showPixelMask ? "1" : "0.52";
+      btnMask.title = avail
+        ? `Show/Hide translucent EM pixel mask overlay (Dark: ${{darkPct.toFixed(1)}}%, Static Bright: ${{brightPct.toFixed(2)}}%)`
+        : "EM pixel mask not available in current dataset — run 2. Solve or load a solved HDF5";
+    }}
+    if (rowEl) {{
+      rowEl.style.display = state.showPixelMask ? "flex" : "none";
+      if (darkEl) darkEl.textContent = avail ? `Dark ${{darkPct.toFixed(1)}}%` : "No EM mask";
+      if (brightEl) brightEl.textContent = avail ? `Bright ${{brightPct.toFixed(2)}}%` : "Run Solve";
+    }}
+  }}
 
   function colorizeGrayscaleImage(img, style) {{
     const c = document.createElement("canvas");
@@ -4283,6 +5901,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       img.onload = () => {{
         rawBankImages.set(p.bank, img);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(img, state.heatmapStyle));
+        warpedBankCanvases.clear();
         pending--;
         if (pending <= 0 || pending % 8 === 0) {{
           renderDetector();
@@ -4290,37 +5909,77 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }};
       img.src = "data:image/png;base64," + p.texture_b64;
     }});
+    PANELS.forEach(p => {{
+      if (p._maskCanvas) {{
+        maskBankCanvases.set(p.bank, p._maskCanvas);
+        warpedMaskCanvases.clear();
+        return;
+      }}
+      if (!p.mask_b64) return;
+      const mimg = new Image();
+      mimg.onload = () => {{
+        maskBankCanvases.set(p.bank, colorizeMaskImage(mimg));
+        warpedMaskCanvases.clear();
+        syncPixelMaskUI();
+        if (state.showPixelMask) renderDetector();
+      }};
+      mimg.src = "data:image/png;base64," + p.mask_b64;
+    }});
+    syncPixelMaskUI();
   }}
 
   function rebuildBankColorMaps() {{
     rawBankImages.forEach((img, bank) => {{
       bankCanvases.set(bank, colorizeGrayscaleImage(img, state.heatmapStyle));
     }});
+    warpedBankCanvases.clear();
   }}
 
   decodeAllBankTextures();
 
-  // Initialize sliders
+  // Initialize sliders & synchronized Params inputs
   const slDetAlpha = document.getElementById("slider-det-alpha");
   const slParallax = document.getElementById("slider-parallax");
-  const slLamMin = document.getElementById("slider-lam-min");
-  const slLamMax = document.getElementById("slider-lam-max");
-
-  slLamMin.min = Math.max(0.2, (wlRange[0] * 0.5)).toFixed(2);
-  slLamMin.max = (wlRange[1] * 1.2).toFixed(2);
-  slLamMin.value = wlRange[0].toFixed(2);
-
-  slLamMax.min = Math.max(0.3, (wlRange[0] * 0.6)).toFixed(2);
-  slLamMax.max = (wlRange[1] * 1.5).toFixed(2);
-  slLamMax.value = wlRange[1].toFixed(2);
+  const slDmin = document.getElementById("slider-dmin");
+  const inpDminEl = document.getElementById("inp-dmin");
+  const inpLminEl = document.getElementById("inp-lmin");
+  const inpLmaxEl = document.getElementById("inp-lmax");
 
   function updateWavelengthLabels() {{
-    document.getElementById("lbl-lam-band").textContent =
-      `${{state.lamMin.toFixed(2)}}–${{state.lamMax.toFixed(2)}}`;
-    document.getElementById("wl-readout").textContent =
-      `λ: ${{state.lamMin.toFixed(1)}}–${{state.lamMax.toFixed(1)}} Å`;
+    DATA.wavelength_range = [state.lamMin, state.lamMax];
+    const wlReadEl = document.getElementById("wl-readout");
+    if (wlReadEl) {{
+      wlReadEl.textContent = `λ: ${{state.lamMin.toFixed(1)}}–${{state.lamMax.toFixed(1)}} Å`;
+    }}
+    if (inpLminEl && document.activeElement !== inpLminEl) {{
+      inpLminEl.value = state.lamMin.toFixed(2);
+    }}
+    if (inpLmaxEl && document.activeElement !== inpLmaxEl) {{
+      inpLmaxEl.value = state.lamMax.toFixed(2);
+    }}
   }}
+
+  function syncDminControls(nextDmin, sourceEl = null) {{
+    const v = Math.max(0.2, Math.min(10.0, Number(nextDmin) || 1.0));
+    state.dMin = v;
+    DATA.d_min = v;
+    if (sourceEl) {{
+      state.dMinUserSeq = (state.dMinUserSeq || 0) + 1;
+    }}
+    const lblD = document.getElementById("lbl-dmin-val");
+    if (lblD) lblD.textContent = `${{v.toFixed(2)}} Å`;
+    if (slDmin && sourceEl !== slDmin) {{
+      if (v < parseFloat(slDmin.min)) slDmin.min = Math.max(0.2, v - 0.2).toFixed(2);
+      if (v > parseFloat(slDmin.max)) slDmin.max = (v + 1.0).toFixed(2);
+      slDmin.value = v.toFixed(2);
+    }}
+    if (inpDminEl && sourceEl !== inpDminEl) {{
+      inpDminEl.value = v.toFixed(2);
+    }}
+  }}
+
   updateWavelengthLabels();
+  syncDminControls(state.dMin);
 
   if (DATA.cell && DATA.cell.length === 6) {{
     const c = DATA.cell;
@@ -4413,29 +6072,647 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const collapsed = [];
     for (let i = 0; i < lines.length; i++) {{
       const cleanLn = (lines[i] || "").replace(/\\s+$/, "");
+      if (cleanLn.includes("[subhkl-live-state]")) continue;
       const mCur = tqdmRe.exec(cleanLn);
-      if (mCur && collapsed.length > 0) {{
-        const mPrev = tqdmRe.exec(collapsed[collapsed.length - 1]);
-        if (mPrev && mPrev[1].trim() === mCur[1].trim()) {{
-          collapsed[collapsed.length - 1] = cleanLn;
-          continue;
+      if (mCur) {{
+        while (collapsed.length > 0 && collapsed[collapsed.length - 1] === "") {{
+          collapsed.pop();
+        }}
+        if (collapsed.length > 0) {{
+          const mPrev = tqdmRe.exec(collapsed[collapsed.length - 1]);
+          if (mPrev && mPrev[1].trim() === mCur[1].trim()) {{
+            collapsed[collapsed.length - 1] = cleanLn;
+            continue;
+          }}
         }}
       }}
       collapsed.push(cleanLn);
     }}
+    while (collapsed.length >= 2 && collapsed[collapsed.length - 1] === "" && tqdmRe.test(collapsed[collapsed.length - 2])) {{
+      collapsed.pop();
+    }}
     return collapsed.join("\\n");
   }}
 
-  function appendTerminalLog(text, replace = false) {{
+  let _lastAutoTerminalScrollTop = -1;
+
+  function isTerminalAtBottom(box, slackPx = 10) {{
+    if (!box) return true;
+    const maxScroll = Math.max(0, (Number(box.scrollHeight) || 0) - (Number(box.clientHeight) || 0));
+    return maxScroll <= 0 || (maxScroll - (Number(box.scrollTop) || 0)) <= slackPx;
+  }}
+
+  function hasTerminalSelection(box) {{
+    if (!box || typeof window === "undefined" || typeof window.getSelection !== "function") return false;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return false;
+    return Boolean(
+      (sel.anchorNode && box.contains(sel.anchorNode)) ||
+      (sel.focusNode && box.contains(sel.focusNode))
+    );
+  }}
+
+  function handleTerminalUserScroll(box) {{
+    if (!box) return;
+    const curTop = Number(box.scrollTop) || 0;
+    const prevTop = typeof state.terminalScrollTop === "number" ? state.terminalScrollTop : curTop;
+    state.terminalScrollTop = curTop;
+    if (_lastAutoTerminalScrollTop >= 0 && Math.abs(curTop - _lastAutoTerminalScrollTop) <= 2) {{
+      return;
+    }}
+    _lastAutoTerminalScrollTop = -1;
+    if (curTop < prevTop - 0.5) {{
+      state.terminalFollowTail = false;
+    }} else if (curTop > prevTop && isTerminalAtBottom(box, 10) && !hasTerminalSelection(box)) {{
+      state.terminalFollowTail = true;
+    }} else if (!isTerminalAtBottom(box, 16)) {{
+      state.terminalFollowTail = false;
+    }}
+  }}
+
+  const terminalBoxEl = document.getElementById("terminal-box");
+  if (terminalBoxEl) {{
+    terminalBoxEl.addEventListener("wheel", (ev) => {{
+      if (ev.deltaY < 0) {{
+        _lastAutoTerminalScrollTop = -1;
+        state.terminalFollowTail = false;
+        state.terminalScrollTop = terminalBoxEl.scrollTop;
+      }} else if (ev.deltaY > 0 && isTerminalAtBottom(terminalBoxEl, 10) && !hasTerminalSelection(terminalBoxEl)) {{
+        state.terminalFollowTail = true;
+      }}
+    }}, {{ passive: true }});
+    terminalBoxEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "PageUp" || ev.key === "ArrowUp" || ev.key === "Home") {{
+        _lastAutoTerminalScrollTop = -1;
+        state.terminalFollowTail = false;
+      }} else if (ev.key === "End" && !hasTerminalSelection(terminalBoxEl)) {{
+        state.terminalFollowTail = true;
+      }}
+    }});
+    terminalBoxEl.addEventListener("scroll", () => {{
+      handleTerminalUserScroll(terminalBoxEl);
+    }});
+  }}
+
+  const stopwatchEl = document.getElementById("stdio-stopwatch");
+  const stopwatchStageEl = document.getElementById("stdio-stopwatch-stage");
+  const stopwatchTimeEl = document.getElementById("stdio-stopwatch-time");
+  let lastStopwatchRenderKey = "";
+  const stopwatchFlash = {{
+    text: "",
+    untilPerf: 0,
+    timerId: null,
+    demoStartPerf: 0,
+    demoUntilPerf: 0,
+  }};
+  const STOPWATCH_SLOMO_RATE = 0.0015;
+  const STOPWATCH_ODO_RADICES = [10, 10, 6, 10, 10, 10, 10];
+  let stopwatchOdoStrips = null;
+
+  const SHORT_STAGE_STOPWATCH_LABELS = {{
+    reduce: "1. REDUCE",
+    solve: "2. SOLVE",
+    integrate: "3. INTEGRATE",
+    merge: "4. MERGE",
+  }};
+
+  function getStopwatchRate() {{
+    return (UI_MODE !== "pro" && state.stopwatchCheatSlowMo) ? STOPWATCH_SLOMO_RATE : 1.0;
+  }}
+
+  function computeStopwatchOdometerPositions(msFloat) {{
+    const v = Math.max(0, Number(msFloat) || 0);
+    const whole = Math.floor(v);
+    const frac = v - whole;
+    const u = Math.max(0, Math.min(1, (frac - 0.12) / 0.88));
+    const ease = 0.5 - 0.5 * Math.cos(Math.PI * u);
+
+    const dm3 = whole % 10;
+    const dm2 = Math.floor(whole / 10) % 10;
+    const dm1 = Math.floor(whole / 100) % 10;
+    const totSec = Math.floor(whole / 1000);
+    const secs = totSec % 60;
+    const dS2 = secs % 10;
+    const dS1 = Math.floor(secs / 10) % 6;
+    const mins = Math.floor(totSec / 60);
+    const dM2 = mins % 10;
+    const dM1 = Math.floor(mins / 10) % 10;
+
+    const cm3 = dm3 === 9;
+    const cm2 = cm3 && dm2 === 9;
+    const cm1 = cm2 && dm1 === 9;
+    const cS2 = cm1 && dS2 === 9;
+    const cS1 = cS2 && dS1 === 5;
+    const cM2 = cS1 && dM2 === 9;
+
+    return [
+      dM1 + (cM2 ? ease : 0),
+      dM2 + (cS1 ? ease : 0),
+      dS1 + (cS2 ? ease : 0),
+      dS2 + (cm1 ? ease : 0),
+      dm1 + (cm2 ? ease : 0),
+      dm2 + (cm3 ? ease : 0),
+      dm3 + ease,
+    ];
+  }}
+
+  function ensureStopwatchOdometerDOM() {{
+    if (!stopwatchTimeEl) return null;
+    if (stopwatchOdoStrips && stopwatchTimeEl.querySelector(".sw-odo-wrap")) {{
+      return stopwatchOdoStrips;
+    }}
+    const makeCol = (radix) => {{
+      const glyphs = [];
+      for (let g = 0; g < radix; g++) {{
+        glyphs.push(`<span class="sw-odo-glyph">${{g}}</span>`);
+      }}
+      glyphs.push('<span class="sw-odo-glyph">0</span>');
+      return `<span class="sw-odo-col"><span class="sw-odo-strip">${{glyphs.join("")}}</span></span>`;
+    }};
+    stopwatchTimeEl.innerHTML =
+      `<span class="sw-odo-wrap">` +
+      `${{makeCol(10)}}${{makeCol(10)}}` +
+      `<span class="sw-odo-sep">:</span>` +
+      `${{makeCol(6)}}${{makeCol(10)}}` +
+      `<span class="sw-ms"><span class="sw-odo-sep">.</span>${{makeCol(10)}}${{makeCol(10)}}${{makeCol(10)}}</span>` +
+      `</span>`;
+    stopwatchOdoStrips = Array.from(stopwatchTimeEl.querySelectorAll(".sw-odo-strip"));
+    return stopwatchOdoStrips;
+  }}
+
+  function getCompletionStopwatchQuip(stageId, finalStatus, elapsedMs) {{
+    if (UI_MODE === "pro") return "";
+    const sec = (Number(elapsedMs) || 0) / 1000;
+    if (finalStatus === "done") {{
+      if (sec < 8) return "SPEED BONUS!";
+      if (sec < 60) return "STAGE CLEAR!";
+      if (sec < 180) return stageId === "solve" ? "NICE SOLVE!" : "ALL CLEAR!";
+      return "FINALLY!";
+    }}
+    if (finalStatus === "stopped") return "ABORTED!";
+    if (finalStatus === "error") return "UH-OH!";
+    return "";
+  }}
+
+  function flashStopwatchQuip(text, durationMs = 1900) {{
+    if (UI_MODE === "pro" || !text) return;
+    if (stopwatchFlash.timerId) {{
+      clearTimeout(stopwatchFlash.timerId);
+      stopwatchFlash.timerId = null;
+    }}
+    stopwatchFlash.text = String(text);
+    stopwatchFlash.untilPerf = performance.now() + Math.max(400, Number(durationMs) || 1900);
+    renderStepStopwatch(true);
+    stopwatchFlash.timerId = setTimeout(() => {{
+      stopwatchFlash.timerId = null;
+      if (performance.now() >= stopwatchFlash.untilPerf) {{
+        stopwatchFlash.text = "";
+      }}
+      renderStepStopwatch(true);
+    }}, Math.max(400, Number(durationMs) || 1900) + 30);
+  }}
+
+  function stageStopwatchMeta(stageIdOrIdx) {{
+    let st = null;
+    if (typeof stageIdOrIdx === "number" && PIPELINE[stageIdOrIdx]) {{
+      st = PIPELINE[stageIdOrIdx];
+    }} else if (typeof stageIdOrIdx === "string") {{
+      st = PIPELINE.find(p => p && p.stage_id === stageIdOrIdx) || null;
+    }}
+    const sid = (st && st.stage_id) || (typeof stageIdOrIdx === "string" ? stageIdOrIdx : "solve");
+    if (SHORT_STAGE_STOPWATCH_LABELS[sid]) {{
+      const lbl = SHORT_STAGE_STOPWATCH_LABELS[sid];
+      return {{ stageId: sid, label: lbl, shortName: lbl.replace(/^\\d+\\.\\s*/, "") }};
+    }}
+    const stepNum = st && st.step_num ? `${{st.step_num}}. ` : "";
+    const shortName = st && st.name
+      ? String(st.name).replace(/^\\d+\\.\\s*/, "").replace(/\\s*\\([^)]*\\)/g, "").replace(/\\s*&.*$/, "").trim().toUpperCase()
+      : String(sid).toUpperCase();
+    return {{ stageId: sid, label: `${{stepNum}}${{shortName}}`, shortName }};
+  }}
+
+  function formatStopwatchParts(ms) {{
+    const clamped = Math.max(0, Math.round(Number(ms) || 0));
+    const totalSec = Math.floor(clamped / 1000);
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    const millis = clamped % 1000;
+    const mmss = `${{String(mins).padStart(2, "0")}}:${{String(secs).padStart(2, "0")}}`;
+    const dotMs = `.${{String(millis).padStart(3, "0")}}`;
+    return {{ mmss, dotMs, full: `${{mmss}}${{dotMs}}`, clamped }};
+  }}
+
+  function getEntryLiveMs(entry, nowPerf = performance.now()) {{
+    if (!entry) return 0;
+    if (entry.status === "running") {{
+      const delta = Math.max(0, nowPerf - (Number(entry.startPerfMs) || nowPerf));
+      const rate = typeof entry.rate === "number" ? entry.rate : getStopwatchRate();
+      return Math.max(0, (Number(entry.baseElapsedMs) || 0) + delta * rate);
+    }}
+    return Math.max(0, Number(entry.elapsedMs) || 0);
+  }}
+
+  function buildStopwatchTooltip(nowPerf = performance.now()) {{
+    const lines = [
+      state.stopwatchCheatSlowMo
+        ? "Step Stopwatch (mm:ss.ms) — ⚡ SLO-MO CHEAT ACTIVE"
+        : "Step Stopwatch (mm:ss.ms)"
+    ];
+    let totalMs = 0;
+    let recordedCount = 0;
+    const order = PIPELINE.length > 0
+      ? PIPELINE.map(p => p.stage_id)
+      : ["reduce", "solve", "integrate", "merge"];
+    order.forEach(sid => {{
+      const meta = stageStopwatchMeta(sid);
+      const entry = state.stepTimings[sid];
+      if (!entry || entry.status === "idle") {{
+        lines.push(`• ${{meta.label}}: —`);
+      }} else {{
+        const ms = getEntryLiveMs(entry, nowPerf);
+        totalMs += ms;
+        recordedCount++;
+        const realNote = (entry.cheated && typeof entry.realElapsedMs === "number")
+          ? ` [real ${{formatStopwatchParts(entry.realElapsedMs).full}}]`
+          : (entry.cheated ? " [slo-mo]" : "");
+        lines.push(`• ${{meta.label}}: ${{formatStopwatchParts(ms).full}} (${{entry.status}})${{realNote}}`);
+      }}
+    }});
+    if (recordedCount > 0) {{
+      lines.push(`Σ Total: ${{formatStopwatchParts(totalMs).full}} (click badge to cycle splits)`);
+    }} else {{
+      lines.push("Run a workflow step below to time it in mm:ss.ms");
+    }}
+    return lines.join("\\n");
+  }}
+
+  function activeRunningStageId() {{
+    if (state.runningStageIdx >= 0 && PIPELINE[state.runningStageIdx]) {{
+      return PIPELINE[state.runningStageIdx].stage_id;
+    }}
+    const keys = Object.keys(state.stepTimings);
+    for (let i = 0; i < keys.length; i++) {{
+      if (state.stepTimings[keys[i]] && state.stepTimings[keys[i]].status === "running") {{
+        return keys[i];
+      }}
+    }}
+    return null;
+  }}
+
+  function renderStepStopwatch(force = false) {{
+    if (!stopwatchEl || !stopwatchStageEl || !stopwatchTimeEl) return;
+    const nowPerf = performance.now();
+    const runSid = activeRunningStageId();
+    let viewKey = runSid || state.stopwatchInspectKey;
+    if (!viewKey && PIPELINE[state.currentPipelineIdx]) {{
+      viewKey = PIPELINE[state.currentPipelineIdx].stage_id;
+    }}
+
+    let stageText = "READY";
+    let status = "idle";
+    let elapsedMs = 0;
+
+    if (viewKey === "__total__") {{
+      let sumMs = 0;
+      let anyDone = false;
+      Object.values(state.stepTimings).forEach(ent => {{
+        if (ent && ent.status !== "idle") {{
+          sumMs += getEntryLiveMs(ent, nowPerf);
+          anyDone = true;
+        }}
+      }});
+      stageText = "Σ TOTAL";
+      status = anyDone ? "done" : "idle";
+      elapsedMs = sumMs;
+    }} else if (viewKey) {{
+      const meta = stageStopwatchMeta(viewKey);
+      const ent = state.stepTimings[viewKey];
+      if (ent && ent.status !== "idle") {{
+        stageText = meta.label;
+        status = ent.status;
+        elapsedMs = getEntryLiveMs(ent, nowPerf);
+        if (status === "running" && UI_MODE !== "pro") {{
+          const mMask = ent.milestoneMask || 0;
+          if (elapsedMs >= 30000 && elapsedMs < 32000 && !(mMask & 1)) {{
+            ent.milestoneMask = mMask | 1;
+            flashStopwatchQuip("WARMING UP!", 1600);
+          }} else if (elapsedMs >= 60000 && elapsedMs < 62000 && !(mMask & 2)) {{
+            ent.milestoneMask = mMask | 2;
+            flashStopwatchQuip("HURRY UP!", 1800);
+          }} else if (elapsedMs >= 120000 && elapsedMs < 122000 && !(mMask & 4)) {{
+            ent.milestoneMask = mMask | 4;
+            flashStopwatchQuip("STILL AT IT!", 1800);
+          }}
+        }}
+      }} else {{
+        const anyRecorded = Object.values(state.stepTimings).some(e => e && e.status !== "idle");
+        stageText = anyRecorded ? meta.label : "READY";
+        status = "idle";
+        elapsedMs = 0;
+      }}
+    }}
+
+    const isFlashing = Boolean(stopwatchFlash.text) && nowPerf < stopwatchFlash.untilPerf;
+    if (!isFlashing && stopwatchFlash.text) {{
+      stopwatchFlash.text = "";
+    }}
+    const isSlowMo = UI_MODE !== "pro" && Boolean(state.stopwatchCheatSlowMo);
+    const isDemoRolling = isSlowMo && status !== "running" && stopwatchFlash.demoUntilPerf > nowPerf;
+    const shownStageText = isFlashing ? stopwatchFlash.text : stageText;
+    let displayMs = elapsedMs;
+    if (isDemoRolling) {{
+      const demoDur = Math.max(1, stopwatchFlash.demoUntilPerf - stopwatchFlash.demoStartPerf);
+      const demoRemain = Math.max(0, (stopwatchFlash.demoUntilPerf - nowPerf) / demoDur);
+      displayMs = Math.round(elapsedMs) + demoRemain * 3.0;
+    }}
+    const parts = formatStopwatchParts(displayMs);
+    const odoKey = isSlowMo ? displayMs.toFixed(2) : parts.full;
+    const renderKey = `${{status}}|${{isSlowMo ? "S" : "N"}}|${{isFlashing ? "1" : "0"}}|${{shownStageText}}|${{odoKey}}`;
+    if (!force && renderKey === lastStopwatchRenderKey) return;
+    lastStopwatchRenderKey = renderKey;
+
+    stopwatchEl.className = `stdio-stopwatch sw-${{status}}${{isSlowMo ? " sw-slomo" : ""}}${{isFlashing ? " sw-quip-flash" : ""}}`;
+    stopwatchStageEl.textContent = shownStageText;
+    if (isSlowMo) {{
+      const strips = ensureStopwatchOdometerDOM();
+      const odoMs = (status === "running" || isDemoRolling) ? displayMs : Math.round(displayMs);
+      const positions = computeStopwatchOdometerPositions(odoMs);
+      if (strips && strips.length === positions.length) {{
+        for (let i = 0; i < strips.length; i++) {{
+          const numGlyphs = STOPWATCH_ODO_RADICES[i] + 1;
+          const pct = -(positions[i] / numGlyphs) * 100;
+          strips[i].style.transform = `translate3d(0, ${{pct.toFixed(4)}}%, 0)`;
+        }}
+      }}
+    }} else {{
+      stopwatchOdoStrips = null;
+      stopwatchTimeEl.innerHTML = `${{parts.mmss}}<span class="sw-ms">${{parts.dotMs}}</span>`;
+    }}
+    if (force || status !== "running" || (parts.clamped % 500) < 25) {{
+      stopwatchEl.title = buildStopwatchTooltip(nowPerf);
+    }}
+  }}
+
+  function toggleStopwatchCheat() {{
+    if (UI_MODE === "pro") return false;
+    const nowPerf = performance.now();
+    Object.values(state.stepTimings).forEach(ent => {{
+      if (ent && ent.status === "running") {{
+        ent.baseElapsedMs = getEntryLiveMs(ent, nowPerf);
+        ent.startPerfMs = nowPerf;
+      }}
+    }});
+    state.stopwatchCheatSlowMo = !state.stopwatchCheatSlowMo;
+    const newRate = getStopwatchRate();
+    Object.values(state.stepTimings).forEach(ent => {{
+      if (ent && ent.status === "running") {{
+        ent.rate = newRate;
+        if (newRate < 1.0) ent.cheated = true;
+      }}
+    }});
+    if (state.stopwatchCheatSlowMo) {{
+      if (!activeRunningStageId()) {{
+        stopwatchFlash.demoStartPerf = nowPerf;
+        stopwatchFlash.demoUntilPerf = nowPerf + 2200;
+      }}
+      flashStopwatchQuip("SLO-MO CHEAT!", 2400);
+    }} else {{
+      stopwatchFlash.demoUntilPerf = 0;
+      flashStopwatchQuip("REAL TIME 1X!", 1600);
+    }}
+    return state.stopwatchCheatSlowMo;
+  }}
+
+  const KONAMI_CHEAT_SEQ = [
+    "ArrowUp", "ArrowUp", "ArrowDown", "ArrowDown",
+    "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight",
+    "b", "a",
+  ];
+  const _cheatKeyBuf = [];
+  let _cheatWordBuf = "";
+
+  function handleStopwatchCheatKey(ev) {{
+    if (UI_MODE === "pro" || !ev || ev.ctrlKey || ev.metaKey || ev.altKey) return false;
+    const tgt = ev.target;
+    const tag = tgt && tgt.tagName ? String(tgt.tagName).toUpperCase() : "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (tgt && tgt.isContentEditable)) {{
+      return false;
+    }}
+    const rawKey = String(ev.key || "");
+    if (!rawKey) return false;
+    const normKey = rawKey.length === 1 ? rawKey.toLowerCase() : rawKey;
+    _cheatKeyBuf.push(normKey);
+    if (_cheatKeyBuf.length > KONAMI_CHEAT_SEQ.length) {{
+      _cheatKeyBuf.splice(0, _cheatKeyBuf.length - KONAMI_CHEAT_SEQ.length);
+    }}
+    const konamiHit = _cheatKeyBuf.length === KONAMI_CHEAT_SEQ.length &&
+      KONAMI_CHEAT_SEQ.every((k, idx) => _cheatKeyBuf[idx] === k);
+
+    if (rawKey.length === 1 && /[a-z]/i.test(rawKey)) {{
+      _cheatWordBuf = (_cheatWordBuf + normKey).slice(-12);
+    }} else if (normKey !== "Shift") {{
+      _cheatWordBuf = "";
+    }}
+    const rainbowHit = _cheatWordBuf.endsWith("rainbow");
+
+    if (konamiHit || rainbowHit) {{
+      _cheatKeyBuf.length = 0;
+      _cheatWordBuf = "";
+      toggleStopwatchCheat();
+      return true;
+    }}
+    return false;
+  }}
+
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {{
+    window.addEventListener("keydown", handleStopwatchCheatKey);
+  }}
+
+  function startStepStopwatch(stageIdOrIdx, initialElapsedMs = 0) {{
+    const meta = stageStopwatchMeta(stageIdOrIdx);
+    const rate = getStopwatchRate();
+    const rawBaseMs = Math.max(0, Number(initialElapsedMs) || 0);
+    const baseMs = rawBaseMs * rate;
+    Object.values(state.stepTimings).forEach(ent => {{
+      if (ent && ent.status === "running" && ent.stageId !== meta.stageId) {{
+        ent.elapsedMs = Math.round(getEntryLiveMs(ent));
+        ent.status = "stopped";
+      }}
+    }});
+    const initMask = (baseMs >= 30000 ? 1 : 0) | (baseMs >= 60000 ? 2 : 0) | (baseMs >= 120000 ? 4 : 0);
+    state.stepTimings[meta.stageId] = {{
+      stageId: meta.stageId,
+      label: meta.label,
+      status: "running",
+      startPerfMs: performance.now(),
+      baseElapsedMs: baseMs,
+      elapsedMs: baseMs,
+      rate,
+      cheated: rate < 1.0,
+      milestoneMask: initMask,
+    }};
+    state.stopwatchInspectKey = meta.stageId;
+    if (rawBaseMs < 500) {{
+      flashStopwatchQuip("HERE WE GO!", 1400);
+    }} else {{
+      renderStepStopwatch(true);
+    }}
+  }}
+
+  function finishStepStopwatch(stageIdOrIdx, finalStatus = "done", exactElapsedMs = null) {{
+    const meta = stageStopwatchMeta(stageIdOrIdx);
+    const prev = state.stepTimings[meta.stageId];
+    const localMs = prev ? getEntryLiveMs(prev) : 0;
+    const wasCheated = Boolean(prev && prev.cheated) || (UI_MODE !== "pro" && Boolean(state.stopwatchCheatSlowMo));
+    const hasExact = typeof exactElapsedMs === "number" && Number.isFinite(exactElapsedMs) && exactElapsedMs >= 0;
+    const resolvedMs = wasCheated
+      ? Math.round(localMs)
+      : (hasExact ? exactElapsedMs : localMs);
+    state.stepTimings[meta.stageId] = {{
+      stageId: meta.stageId,
+      label: meta.label,
+      status: finalStatus,
+      startPerfMs: 0,
+      baseElapsedMs: resolvedMs,
+      elapsedMs: resolvedMs,
+      rate: getStopwatchRate(),
+      cheated: wasCheated,
+      realElapsedMs: hasExact ? exactElapsedMs : null,
+      milestoneMask: 7,
+    }};
+    state.stopwatchInspectKey = meta.stageId;
+    const quip = getCompletionStopwatchQuip(meta.stageId, finalStatus, resolvedMs);
+    if (quip) {{
+      flashStopwatchQuip(quip, 2100);
+    }} else {{
+      renderStepStopwatch(true);
+    }}
+  }}
+
+  function hydrateStepTimingsFromServer(doc) {{
+    if (!doc || typeof doc !== "object") return;
+    const srvNow = typeof doc.server_time === "number" ? doc.server_time : null;
+    const timings = doc.step_timings && typeof doc.step_timings === "object" ? doc.step_timings : null;
+    if (timings) {{
+      Object.entries(timings).forEach(([sid, rec]) => {{
+        if (!rec || typeof rec !== "object") return;
+        const stState = String(rec.state || "");
+        const cur = state.stepTimings[sid];
+        if (stState === "running" || stState === "queued") {{
+          if (!cur || cur.status !== "running") {{
+            const srvMs = typeof rec.elapsed_ms === "number"
+              ? rec.elapsed_ms
+              : ((srvNow && typeof rec.started_at === "number") ? Math.max(0, (srvNow - rec.started_at) * 1000) : 0);
+            startStepStopwatch(sid, srvMs);
+          }}
+        }} else if (!cur || cur.status === "idle") {{
+          const mapped = stState === "ok"
+            ? "done"
+            : (stState === "deleted" ? "stopped" : "error");
+          if (typeof rec.elapsed_ms === "number" && rec.elapsed_ms >= 0) {{
+            const meta = stageStopwatchMeta(sid);
+            state.stepTimings[sid] = {{
+              stageId: sid,
+              label: meta.label,
+              status: mapped,
+              startPerfMs: 0,
+              baseElapsedMs: rec.elapsed_ms,
+              elapsedMs: rec.elapsed_ms,
+            }};
+            if (!state.stopwatchInspectKey) state.stopwatchInspectKey = sid;
+          }}
+        }}
+      }});
+    }} else if (
+      doc.active_job &&
+      (doc.active_job.state === "running" || doc.active_job.state === "queued") &&
+      doc.active_job.stage_id
+    ) {{
+      const aj = doc.active_job;
+      const cur = state.stepTimings[aj.stage_id];
+      if (!cur || cur.status !== "running") {{
+        const srvMs = typeof aj.elapsed_ms === "number"
+          ? aj.elapsed_ms
+          : ((srvNow && typeof aj.started_at === "number") ? Math.max(0, (srvNow - aj.started_at) * 1000) : 0);
+        startStepStopwatch(aj.stage_id, srvMs);
+      }}
+    }}
+    renderStepStopwatch(true);
+  }}
+
+  if (stopwatchEl) {{
+    stopwatchEl.addEventListener("click", () => {{
+      if (activeRunningStageId()) return;
+      if (stopwatchFlash.timerId) {{
+        clearTimeout(stopwatchFlash.timerId);
+        stopwatchFlash.timerId = null;
+      }}
+      stopwatchFlash.text = "";
+      stopwatchFlash.untilPerf = 0;
+      const keys = (PIPELINE.length > 0 ? PIPELINE.map(p => p.stage_id) : ["reduce", "solve", "integrate", "merge"]);
+      const recorded = keys.filter(k => state.stepTimings[k] && state.stepTimings[k].status !== "idle");
+      const cycle = recorded.length >= 2 ? [...keys, "__total__"] : keys;
+      const curIdx = cycle.indexOf(state.stopwatchInspectKey || (PIPELINE[state.currentPipelineIdx] && PIPELINE[state.currentPipelineIdx].stage_id));
+      state.stopwatchInspectKey = cycle[(curIdx + 1) % cycle.length];
+      renderStepStopwatch(true);
+    }});
+    renderStepStopwatch(true);
+  }}
+
+  function appendTerminalLog(text, replace = false, resetFollow = false) {{
     const box = document.getElementById("terminal-box");
     if (!box) return;
-    if (replace) {{
-      box.textContent = formatTerminalStdio(text);
-    }} else {{
-      const combined = box.textContent + (box.textContent.endsWith("\\n") ? "" : "\\n") + text;
-      box.textContent = formatTerminalStdio(combined);
+    if (resetFollow) {{
+      state.terminalFollowTail = true;
+      state.terminalScrollTop = 0;
+      _lastAutoTerminalScrollTop = -1;
     }}
-    box.scrollTop = box.scrollHeight;
+    const followTail = state.terminalFollowTail !== false;
+    const savedScrollTop = typeof state.terminalScrollTop === "number"
+      ? state.terminalScrollTop
+      : box.scrollTop;
+    const nextText = replace
+      ? formatTerminalStdio(text)
+      : formatTerminalStdio(box.textContent + (box.textContent.endsWith("\\n") ? "" : "\\n") + text);
+    if (box.textContent === nextText) {{
+      return;
+    }}
+    if (hasTerminalSelection(box)) {{
+      state.terminalFollowTail = false;
+      box._pendingTerminalText = nextText;
+      if (!box._selectionFlushBound) {{
+        box._selectionFlushBound = true;
+        const flushPending = () => {{
+          if (!hasTerminalSelection(box) && typeof box._pendingTerminalText === "string") {{
+            const keepScroll = typeof state.terminalScrollTop === "number"
+              ? state.terminalScrollTop
+              : box.scrollTop;
+            box.textContent = box._pendingTerminalText;
+            box._pendingTerminalText = null;
+            if (state.terminalFollowTail !== false) {{
+              box.scrollTop = box.scrollHeight;
+              _lastAutoTerminalScrollTop = box.scrollTop;
+            }} else {{
+              box.scrollTop = keepScroll;
+            }}
+            state.terminalScrollTop = box.scrollTop;
+          }}
+        }};
+        document.addEventListener("selectionchange", flushPending);
+        box.addEventListener("mouseup", () => setTimeout(flushPending, 50));
+      }}
+      box.scrollTop = savedScrollTop;
+      return;
+    }}
+    box._pendingTerminalText = null;
+    box.textContent = nextText;
+    if (followTail) {{
+      box.scrollTop = box.scrollHeight;
+      _lastAutoTerminalScrollTop = box.scrollTop;
+    }} else {{
+      box.scrollTop = savedScrollTop;
+    }}
+    state.terminalScrollTop = box.scrollTop;
   }}
 
   function collectWorkflowParams() {{
@@ -4446,6 +6723,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return Number.isFinite(v) ? v : fb;
     }};
     const sgEl = document.getElementById("inp-sg");
+    const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
+    const lminVal = getNum("inp-lmin", state.lamMin || defWl[0]);
+    const lmaxVal = Math.max(lminVal + 0.05, getNum("inp-lmax", state.lamMax || defWl[1]));
+    state.lamMin = lminVal;
+    state.lamMax = lmaxVal;
+    const rawInpDmin = inpDminEl ? parseFloat(inpDminEl.value) : NaN;
+    const rawSlDmin = slDmin ? parseFloat(slDmin.value) : NaN;
+    const dminVal = (typeof document !== "undefined" && document.activeElement === slDmin && Number.isFinite(rawSlDmin) && rawSlDmin > 0)
+      ? rawSlDmin
+      : ((Number.isFinite(rawInpDmin) && rawInpDmin > 0)
+        ? rawInpDmin
+        : ((Number.isFinite(state.dMin) && state.dMin > 0) ? state.dMin : Number((lminVal * 0.5).toFixed(2))));
+    syncDminControls(dminVal);
     return {{
       instrument: DATA.instrument || "CG4D",
       space_group: (sgEl && sgEl.value.trim()) || DATA.space_group || "P 21 21 21",
@@ -4455,10 +6745,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       alpha: getNum("inp-alpha", cell[3]),
       beta: getNum("inp-beta", cell[4]),
       gamma: getNum("inp-gamma", cell[5]),
-      d_min: getNum("inp-dmin", Number(((state.lamMin || 2.0) * 0.5).toFixed(2))),
+      d_min: dminVal,
       rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", 0.03))),
-      wavelength_min: state.lamMin,
-      wavelength_max: state.lamMax,
+      wavelength_min: lminVal,
+      wavelength_max: lmaxVal,
     }};
   }}
 
@@ -4500,6 +6790,46 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{alpha}})`;
   }}
 
+  function peakUnscaledIsigi(p) {{
+    if (!p || typeof p.intensity !== "number" || typeof p.sigma !== "number" || p.sigma <= 0) return NaN;
+    return p.intensity / Math.max(p.sigma, 1e-6);
+  }}
+
+  function isigiToColor(isigiVal, alpha = 1.0) {{
+    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
+    const t = Math.max(0.0, Math.min(1.0, Math.log10(Math.max(1.0, isigiVal)) / Math.log10(40.0)));
+    const hue = (1.0 - t) * 215 + t * 48;
+    const light = 50 + t * 14;
+    return `hsla(${{hue.toFixed(1)}}, 95%, ${{light.toFixed(1)}}%, ${{alpha}})`;
+  }}
+
+  function hasIntegratedIsigi() {{
+    const art = String(DATA.artifact_kind || "").toLowerCase();
+    if (art === "integrator" || art === "merged_careless") return true;
+    const checkArr = arr => Array.isArray(arr) && arr.some(
+      p => p && Array.isArray(p.ellipse) && typeof p.intensity === "number" && typeof p.sigma === "number" && p.sigma > 0
+    );
+    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+  }}
+
+  function hasCarelessResiduals() {{
+    const checkArr = arr => Array.isArray(arr) && arr.some(
+      p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)
+    );
+    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+  }}
+
+  function hasCarelessScales() {{
+    const checkArr = arr => Array.isArray(arr) && arr.some(
+      p => p && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)
+    );
+    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+  }}
+
+  function hasMergedCarelessData() {{
+    return hasCarelessResiduals() || hasCarelessScales();
+  }}
+
   function peakStrokeColor(p, alpha = 0.95) {{
     const mode = state.wulffColorMode || "wavelength";
     if (mode === "orbit") {{
@@ -4509,22 +6839,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const hex = ORBIT_PALETTE[idx];
       return alpha >= 0.9 ? hex : `${{hex}}99`;
     }}
-    if (mode === "residual" && typeof p.careless_residual === "number") {{
+    if (mode === "isigi") {{
+      return isigiToColor(peakUnscaledIsigi(p), alpha);
+    }}
+    if (mode === "residual") {{
       return residualToColor(p.careless_residual, alpha);
     }}
-    if (mode === "scale" && typeof p.careless_scale === "number") {{
+    if (mode === "scale") {{
       return scaleToColor(p.careless_scale, alpha);
     }}
     return wavelengthToColor(p.wavelength, alpha);
-  }}
-
-  function hasMergedCarelessData() {{
-    if (DATA && DATA.artifact_kind === "merged_careless") return true;
-    if (DATA && DATA.merge_metrics && Number(DATA.merge_metrics.n_merged_asu) > 0) return true;
-    const checkArr = arr => Array.isArray(arr) && arr.some(
-      p => p && (typeof p.careless_residual === "number" || typeof p.careless_scale === "number")
-    );
-    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
   }}
 
   function syncWulffUI() {{
@@ -4533,9 +6857,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const btnScope = document.getElementById("btn-wulff-scope");
     const btnExpand = document.getElementById("btn-wulff-expand");
     const selColor = document.getElementById("sel-wulff-color");
+    const selSpotColor = document.getElementById("sel-spot-color");
     const titleEl = document.getElementById("stereo-title");
-    const hasMerge = hasMergedCarelessData();
-    if (!hasMerge && (state.wulffColorMode === "residual" || state.wulffColorMode === "scale")) {{
+    const hasIsigi = hasIntegratedIsigi();
+    const hasRes = hasCarelessResiduals();
+    const hasScl = hasCarelessScales();
+    if (
+      (state.wulffColorMode === "isigi" && !hasIsigi) ||
+      (state.wulffColorMode === "residual" && !hasRes) ||
+      (state.wulffColorMode === "scale" && !hasScl)
+    ) {{
       state.wulffColorMode = "wavelength";
     }}
     if (stereoEl) {{
@@ -4549,18 +6880,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       btnScope.classList.toggle("active-btn", isAll);
     }}
     if (btnExpand) {{
-      btnExpand.textContent = state.wulffExpanded ? "Dock" : "Expand";
+      btnExpand.textContent = state.wulffExpanded ? "Corner" : "Split";
       btnExpand.classList.toggle("active-btn", Boolean(state.wulffExpanded));
     }}
-    if (selColor) {{
-      Array.from(selColor.options).forEach(opt => {{
-        if (opt.value === "residual" || opt.value === "scale") {{
-          opt.disabled = !hasMerge;
-          opt.style.color = hasMerge ? "" : "#64748b";
+    if (typeof _cachedPlotBox !== "undefined") {{
+      _cachedPlotBox = null;
+      _cachedPlotBoxKey = "";
+    }}
+    [selColor, selSpotColor].forEach(sel => {{
+      if (!sel) return;
+      Array.from(sel.options).forEach(opt => {{
+        if (opt.value === "isigi") {{
+          opt.disabled = !hasIsigi;
+          opt.style.color = hasIsigi ? "" : "#64748b";
+        }} else if (opt.value === "residual") {{
+          opt.disabled = !hasRes;
+          opt.style.color = hasRes ? "" : "#64748b";
+        }} else if (opt.value === "scale") {{
+          opt.disabled = !hasScl;
+          opt.style.color = hasScl ? "" : "#64748b";
         }}
       }});
-      selColor.value = state.wulffColorMode || "wavelength";
-    }}
+      sel.value = state.wulffColorMode || "wavelength";
+    }});
     if (titleEl) {{
       const scopeLbl = state.wulffScope === "all_runs" ? "ALL-RUNS" : "1-FRAME";
       titleEl.textContent = `WULFF NET · ${{scopeLbl}}`;
@@ -4571,8 +6913,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function updateMergeScoreboard() {{
     const bar = document.getElementById("wulff-merge-bar");
     const m = DATA.merge_metrics;
+    const hasMerge = hasMergedCarelessData();
     if (!bar) return;
-    if (!m || !m.n_merged_asu) {{
+    if (!hasMerge || !m || !m.n_merged_asu) {{
       bar.style.display = "none";
       return;
     }}
@@ -4610,8 +6953,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.maxZoneOrder = ordLevel;
     const matching = ZONES.filter(z => (z.order || 1) <= ordLevel).map(z => z.zone_id);
     state.activeZones = new Set(matching);
-    const btnTop = document.getElementById("btn-zone-order");
-    if (btnTop) btnTop.textContent = `|uvw|≤${{ordLevel}}`;
     [1, 2, 3].forEach(k => {{
       const b = document.getElementById(`btn-order-${{k}}`);
       if (b) b.classList.toggle("active-btn", k === ordLevel);
@@ -4662,19 +7003,42 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     container.innerHTML = "";
     const shortLabels = ["1. Reduce", "2. Solve", "3. Integrate", "4. Merge"];
     PIPELINE.forEach((st, idx) => {{
+      const isRunning = state.runningStageIdx === idx;
       const isAct = idx === state.currentPipelineIdx;
       const isDone = idx < state.currentPipelineIdx;
       const pill = document.createElement("button");
-      pill.className = "stage-pill" + (isAct ? " stage-active" : (isDone ? " stage-done" : ""));
-      const prefix = (state.runningStageIdx === idx) ? "[...] " : "";
-      pill.title = `Click to execute ${{st.name}} (${{(st.tool_ids || []).join(" + ")}}) → ${{st.artifact}}`;
-      pill.textContent = `${{prefix}}${{shortLabels[idx] || st.name}}`;
-      pill.addEventListener("click", () => {{
+      pill.type = "button";
+      pill.dataset.stageId = st.stage_id || "";
+      pill.dataset.tapeState = isRunning ? "stop" : "play";
+      pill.className = "stage-pill"
+        + (isRunning ? " stage-running" : "")
+        + (isAct ? " stage-active" : (isDone ? " stage-done" : ""));
+      pill.title = isRunning
+        ? `Stop / cancel running ${{st.name}} job`
+        : `Play / execute ${{st.name}} (${{(st.tool_ids || []).join(" + ")}}) → ${{st.artifact}}`;
+
+      const tapeSpan = document.createElement("span");
+      tapeSpan.className = "stage-tape-btn" + (isRunning ? " tape-stop" : " tape-play");
+      tapeSpan.setAttribute("aria-label", isRunning ? "Stop stage" : "Play stage");
+      tapeSpan.textContent = isRunning ? "■" : "▶";
+
+      const lblSpan = document.createElement("span");
+      lblSpan.textContent = shortLabels[idx] || st.name;
+
+      pill.appendChild(tapeSpan);
+      pill.appendChild(lblSpan);
+      pill.addEventListener("click", (ev) => {{
+        ev.stopPropagation();
+        if (state.runningStageIdx === idx) {{
+          cancelWorkflowStage(idx);
+          return;
+        }}
         selectPipelineStage(idx, true);
         executeWorkflowStage(idx);
       }});
       container.appendChild(pill);
     }});
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
 
   function setStatusLine(badgeText, contentHtml) {{
@@ -4706,6 +7070,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (syncLadder && typeof st.ladder_rung_idx === "number") {{
       selectLadderRung(st.ladder_rung_idx, false);
     }}
+    if (!activeRunningStageId() && st && st.stage_id) {{
+      state.stopwatchInspectKey = st.stage_id;
+      renderStepStopwatch(true);
+    }}
     renderPipeline();
     if (typeof renderFilesDrawer === "function") renderFilesDrawer();
   }}
@@ -4727,6 +7095,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       card.addEventListener("click", () => selectLadderRung(idx));
       container.appendChild(card);
     }});
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
 
   function selectLadderRung(idx, setSolveStage = true) {{
@@ -4797,7 +7166,33 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function isPeakVisible(p) {{
-    return p.wavelength >= state.lamMin && p.wavelength <= state.lamMax;
+    if (p.wavelength < state.lamMin || p.wavelength > state.lamMax) return false;
+    if (typeof p.d_spacing === "number" && p.d_spacing > 0 && typeof state.dMin === "number" && state.dMin > 0) {{
+      if (p.d_spacing < state.dMin - 1e-4) return false;
+    }}
+    return true;
+  }}
+
+  function isSameReflection(a, b) {{
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (Array.isArray(a.hkl) && Array.isArray(b.hkl) &&
+        a.hkl[0] === b.hkl[0] && a.hkl[1] === b.hkl[1] && a.hkl[2] === b.hkl[2]) {{
+      const ra = typeof a.run_index === "number" ? a.run_index : 0;
+      const rb = typeof b.run_index === "number" ? b.run_index : 0;
+      return ra === rb;
+    }}
+    return false;
+  }}
+
+  function isPeakHighlightedTarget(p) {{
+    const hov = state.hoveredPeakObj;
+    const sel = state.selectedPeakObj;
+    if (hov && isSameReflection(p, hov)) return true;
+    if (sel && isSameReflection(p, sel)) return true;
+    if (!hov && state.hoveredPeakId !== null && p.id === state.hoveredPeakId) return true;
+    if (!sel && state.selectedPeakId !== null && p.id === state.selectedPeakId) return true;
+    return false;
   }}
 
   function isPeakCapturedByActiveZone(p) {{
@@ -4830,6 +7225,66 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       elGonio.textContent = (curF && curF.motor_summary) || DATA.goniometer_summary || "—";
     }}
     drawHistogram(visiblePeaks);
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
+  }}
+
+  let _lastBarViewportW = 0;
+  function fitHorizontalBars(force = false) {{
+    const vw = document.documentElement.clientWidth || window.innerWidth || 0;
+    if (!force && vw > 0 && Math.abs(vw - _lastBarViewportW) < 0.5) return;
+    _lastBarViewportW = vw;
+
+    const topBar = document.querySelector(".top-bar");
+    if (topBar) {{
+      topBar.style.setProperty("--top-bar-scale", "1");
+      const availW = Math.max(0, topBar.clientWidth - 16);
+      const brand = topBar.querySelector(".brand-block");
+      const hud = topBar.querySelector(".hud-metrics");
+      const ctrls = topBar.querySelector(".controls-cluster");
+      const naturalW =
+        (brand ? brand.scrollWidth : 0) +
+        (hud ? hud.scrollWidth : 0) +
+        (ctrls ? ctrls.scrollWidth : 0) +
+        16;
+      if (availW > 0 && naturalW > availW) {{
+        let scale = Math.max(0.45, Math.min(1.0, (availW / naturalW) * 0.985));
+        topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
+        if (topBar.scrollWidth > topBar.clientWidth) {{
+          scale = Math.max(0.40, scale * (topBar.clientWidth / topBar.scrollWidth) * 0.985);
+          topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
+        }}
+      }}
+    }}
+
+    const ladderBar = document.querySelector(".ladder-bar");
+    if (ladderBar) {{
+      ladderBar.style.setProperty("--bottom-bar-scale", "1");
+      const availW = Math.max(0, ladderBar.clientWidth - 16);
+      const ladderActions = document.getElementById("ladder-actions");
+      const actionsW = ladderActions ? ladderActions.scrollWidth : 0;
+      const minDescW = Math.min(220, Math.max(120, availW * 0.24));
+      const neededHeaderW = actionsW + minDescW + 14;
+
+      let maxRungTopW = 0;
+      const rungTops = ladderBar.querySelectorAll(".rung-top");
+      rungTops.forEach(rt => {{
+        const spans = rt.querySelectorAll("span");
+        let w = 18;
+        spans.forEach(s => {{ w += s.scrollWidth; }});
+        if (w > maxRungTopW) maxRungTopW = w;
+      }});
+      const neededRungsW = maxRungTopW > 0 ? maxRungTopW * 5 + 24 : 0;
+      const naturalW = Math.max(neededHeaderW, neededRungsW);
+      if (availW > 0 && naturalW > availW) {{
+        let scale = Math.max(0.45, Math.min(1.0, (availW / naturalW) * 0.985));
+        ladderBar.style.setProperty("--bottom-bar-scale", scale.toFixed(3));
+        const ladderHeader = ladderBar.querySelector(".ladder-header");
+        if (ladderHeader && ladderHeader.scrollWidth > ladderHeader.clientWidth) {{
+          scale = Math.max(0.40, scale * (ladderHeader.clientWidth / ladderHeader.scrollWidth) * 0.985);
+          ladderBar.style.setProperty("--bottom-bar-scale", scale.toFixed(3));
+        }}
+      }}
+    }}
   }}
 
   function renderFrameSelector() {{
@@ -4862,6 +7317,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const hasGonio = frames.length > 0 || (DATA.goniometer_summary && DATA.goniometer_summary !== "—");
       gonioPill.style.display = hasGonio ? "flex" : "none";
     }}
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
 
   const histCanvas = document.getElementById("canvas-hist");
@@ -4880,15 +7336,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       histCanvas.style.display = hasMergeBins ? "block" : "none";
       histCanvas.style.height = hasMergeBins ? "50px" : "40px";
     }}
+    if (!histCanvas || !hasMergeBins) return;
     const rect = histCanvas.getBoundingClientRect();
-    if (rect.width < 20 || rect.height < 15) return;
+    const w = Math.max(200, rect.width || (histCanvas.parentElement ? histCanvas.parentElement.clientWidth : 260));
+    const h = Math.max(45, rect.height || 50);
     const dpr = window.devicePixelRatio || 1;
-    histCanvas.width = Math.max(100, rect.width * dpr);
-    histCanvas.height = Math.max(45, rect.height * dpr);
+    histCanvas.width = Math.max(100, w * dpr);
+    histCanvas.height = Math.max(45, h * dpr);
     const ctx = histCanvas.getContext("2d");
     ctx.scale(dpr, dpr);
-    const w = rect.width;
-    const h = rect.height;
     ctx.clearRect(0, 0, w, h);
 
     if (hasMergeBins) {{
@@ -5012,7 +7468,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     sphBounds.maxY = maxAbsEl;
   }}
 
+  let _cachedCylRadiusM = null;
+  let _cachedPlotBox = null;
+  let _cachedPlotBoxKey = "";
+
+  function invalidateDetectorGeometryCache() {{
+    _cachedCylRadiusM = null;
+    _cachedPlotBox = null;
+    _cachedPlotBoxKey = "";
+    if (typeof warpedBankCanvases !== "undefined") warpedBankCanvases.clear();
+    if (typeof warpedMaskCanvases !== "undefined") warpedMaskCanvases.clear();
+  }}
+
   function recomputeProjectionBounds() {{
+    invalidateDetectorGeometryCache();
     if (PANELS.length > 0) {{
       const allY = [], allEl = [];
       PANELS.forEach(p => {{
@@ -5050,18 +7519,70 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return [panel.y_min, panel.y_max];
   }}
 
+  function getDetectorDataAspect() {{
+    const bounds = getActiveBounds();
+    const spanX = Math.max(10.0, bounds.maxX - bounds.minX);
+    const spanY = Math.max(1e-4, bounds.maxY - bounds.minY);
+    if (state.projection === "spherical") {{
+      return spanX / Math.max(10.0, spanY);
+    }}
+    if (_cachedCylRadiusM === null) {{
+      const radii = [];
+      for (let i = 0; i < PANELS.length; i++) {{
+        const p = PANELS[i];
+        if (typeof p.y_max === "number" && typeof p.el_max === "number" && Math.abs(p.el_max) > 1.5 && Math.abs(p.el_max) < 80.0) {{
+          const r = Math.abs(p.y_max) / Math.tan((Math.abs(p.el_max) * Math.PI) / 180.0);
+          if (Number.isFinite(r) && r > 0.05 && r < 5.0) radii.push(r);
+        }}
+        if (typeof p.y_min === "number" && typeof p.el_min === "number" && Math.abs(p.el_min) > 1.5 && Math.abs(p.el_min) < 80.0) {{
+          const r = Math.abs(p.y_min) / Math.tan((Math.abs(p.el_min) * Math.PI) / 180.0);
+          if (Number.isFinite(r) && r > 0.05 && r < 5.0) radii.push(r);
+        }}
+      }}
+      if (radii.length > 0) {{
+        radii.sort((a, b) => a - b);
+        _cachedCylRadiusM = radii[Math.floor(radii.length / 2)];
+      }} else {{
+        _cachedCylRadiusM = 0.40;
+      }}
+    }}
+    const metersPerDeg = (_cachedCylRadiusM * Math.PI) / 180.0;
+    return (spanX * metersPerDeg) / Math.max(0.05, spanY);
+  }}
+
+  function getDetectorPlotBox(w, h) {{
+    const bounds = getActiveBounds();
+    const key = `${{w}}_${{h}}_${{state.projection}}_${{bounds.minX}}_${{bounds.maxX}}_${{bounds.minY}}_${{bounds.maxY}}`;
+    if (_cachedPlotBox && _cachedPlotBoxKey === key) {{
+      return _cachedPlotBox;
+    }}
+    const padL = 42, padR = 12, padT = 14, padB = 22;
+    const availW = Math.max(50, w - padL - padR);
+    const availH = Math.max(50, h - padT - padB);
+    const dataAspect = Math.max(0.25, Math.min(12.0, getDetectorDataAspect()));
+    let plotW = availW;
+    let plotH = availW / dataAspect;
+    if (plotH > availH) {{
+      plotH = availH;
+      plotW = availH * dataAspect;
+    }}
+    const originX = padL + (availW - plotW) * 0.5;
+    const originY = padT + (availH - plotH) * 0.5;
+    _cachedPlotBoxKey = key;
+    _cachedPlotBox = {{ originX, originY, plotW, plotH, padL, padR, padT, padB }};
+    return _cachedPlotBox;
+  }}
+
   // Physical Parallax Transform:
   // layerOffset = -0.35 (Back: Detector Intensity Panels)
   // layerOffset = +0.25..+0.90 (Front: Predicted Bragg Rings floating by d-spacing)
   function detToScreen(dx, dy, w, h, layerOffset = 0.0) {{
     const bounds = getActiveBounds();
-    const padL = 42, padR = 12, padT = 14, padB = 22;
-    const plotW = Math.max(50, w - padL - padR);
-    const plotH = Math.max(50, h - padT - padB);
+    const box = getDetectorPlotBox(w, h);
     const u = (dx - bounds.minX) / (bounds.maxX - bounds.minX);
     const v = (dy - bounds.minY) / (bounds.maxY - bounds.minY);
-    const x0 = padL + u * plotW;
-    const y0 = padT + (1.0 - v) * plotH;
+    const x0 = box.originX + u * box.plotW;
+    const y0 = box.originY + (1.0 - v) * box.plotH;
     const cx = w * 0.5;
     const cy = h * 0.5;
     const shiftX = state.parallaxX * state.parallaxStrength * layerOffset * 18.0;
@@ -5098,13 +7619,181 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.restore();
   }}
 
+  function warpTextureOntoPanel(texCanvas, panel, isSph, smooth) {{
+    const [vMin, vMax] = getPanelVertRange(panel);
+    const azSpan = Math.max(1e-5, panel.az_max - panel.az_min);
+    const vSpan = Math.max(1e-5, vMax - vMin);
+    const W = Math.max(1, texCanvas.width);
+    const H = Math.max(1, texCanvas.height);
+    const spW = W > 512 ? Math.min(2048, W) : Math.min(384, Math.max(192, W * 2));
+    const spH = H > 512 ? Math.min(1024, H) : Math.min(384, Math.max(192, H * 2));
+
+    const wc = document.createElement("canvas");
+    wc.width = spW;
+    wc.height = spH;
+    const wctx = wc.getContext("2d");
+    wctx.imageSmoothingEnabled = Boolean(smooth);
+
+    const toSp = pt => [
+      ((pt[0] - panel.az_min) / azSpan) * spW,
+      ((vMax - pt[1]) / vSpan) * spH,
+    ];
+
+    const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
+    const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+    const meshPts = isSph && panel.mesh_sph ? panel.mesh_sph : panel.mesh;
+
+    wctx.save();
+    if (outlinePts && outlinePts.length >= 4) {{
+      wctx.beginPath();
+      outlinePts.forEach((pt, idx) => {{
+        const [ox, oy] = toSp(pt);
+        if (idx === 0) wctx.moveTo(ox, oy);
+        else wctx.lineTo(ox, oy);
+      }});
+      wctx.closePath();
+      wctx.clip();
+    }}
+
+    if (Array.isArray(meshPts) && meshPts.length >= 2 && Array.isArray(meshPts[0]) && meshPts[0].length >= 2) {{
+      const nRows = meshPts.length - 1;
+      const nCols = meshPts[0].length - 1;
+      const SGrid = meshPts.map(row => row.map(toSp));
+      const S0 = SGrid[0][0], S1 = SGrid[nRows][0], S2 = SGrid[nRows][nCols], S3 = SGrid[0][nCols];
+      const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
+      const midR = Math.floor(nRows / 2), midC = Math.floor(nCols / 2);
+      const topBow = Math.hypot(SGrid[0][midC][0] - 0.5 * (S0[0] + S3[0]), SGrid[0][midC][1] - 0.5 * (S0[1] + S3[1]));
+      const botBow = Math.hypot(SGrid[nRows][midC][0] - 0.5 * (S1[0] + S2[0]), SGrid[nRows][midC][1] - 0.5 * (S1[1] + S2[1]));
+      const lftBow = Math.hypot(SGrid[midR][0][0] - 0.5 * (S0[0] + S1[0]), SGrid[midR][0][1] - 0.5 * (S0[1] + S1[1]));
+      const rgtBow = Math.hypot(SGrid[midR][nCols][0] - 0.5 * (S3[0] + S2[0]), SGrid[midR][nCols][1] - 0.5 * (S3[1] + S2[1]));
+      const maxBow = Math.max(topBow, botBow, lftBow, rgtBow);
+      if (nonPara < 1.5 && maxBow < 1.2) {{
+        const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
+        const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
+        const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
+        const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
+        const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
+        const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
+        wctx.save();
+        wctx.transform(ax, ay, cx, cy, ex, ey);
+        wctx.drawImage(texCanvas, 0, 0, W, H);
+        wctx.restore();
+      }} else {{
+        const du = W / nCols;
+        const dv = H / nRows;
+        const expandTri = (A, B, C) => {{
+          const mx = (A[0] + B[0] + C[0]) / 3;
+          const my = (A[1] + B[1] + C[1]) / 3;
+          const pad = 0.65;
+          return [A, B, C].map(P => {{
+            const dx = P[0] - mx, dy = P[1] - my;
+            const len = Math.hypot(dx, dy) || 1;
+            return [P[0] + (dx / len) * pad, P[1] + (dy / len) * pad];
+          }});
+        }};
+        for (let ir = 0; ir < nRows; ir++) {{
+          const v0 = ir * dv;
+          const v1 = (ir + 1) * dv;
+          for (let ic = 0; ic < nCols; ic++) {{
+            const u0 = ic * du;
+            const u1 = (ic + 1) * du;
+            const P00 = SGrid[ir][ic];
+            const P01 = SGrid[ir][ic + 1];
+            const P11 = SGrid[ir + 1][ic + 1];
+            const P10 = SGrid[ir + 1][ic];
+
+            const [T1A, T1B, T1C] = expandTri(P00, P01, P10);
+            const a1 = (P01[0] - P00[0]) / du;
+            const b1 = (P01[1] - P00[1]) / du;
+            const c1 = (P10[0] - P00[0]) / dv;
+            const d1 = (P10[1] - P00[1]) / dv;
+            const e1 = P00[0] - a1 * u0 - c1 * v0;
+            const f1 = P00[1] - b1 * u0 - d1 * v0;
+            wctx.save();
+            wctx.beginPath();
+            wctx.moveTo(T1A[0], T1A[1]);
+            wctx.lineTo(T1B[0], T1B[1]);
+            wctx.lineTo(T1C[0], T1C[1]);
+            wctx.closePath();
+            wctx.clip();
+            wctx.transform(a1, b1, c1, d1, e1, f1);
+            wctx.drawImage(texCanvas, 0, 0, W, H);
+            wctx.restore();
+
+            const [T2A, T2B, T2C] = expandTri(P01, P11, P10);
+            const a2 = (P11[0] - P10[0]) / du;
+            const b2 = (P11[1] - P10[1]) / du;
+            const c2 = (P11[0] - P01[0]) / dv;
+            const d2 = (P11[1] - P01[1]) / dv;
+            const e2 = P11[0] - a2 * u1 - c2 * v1;
+            const f2 = P11[1] - b2 * u1 - d2 * v1;
+            wctx.save();
+            wctx.beginPath();
+            wctx.moveTo(T2A[0], T2A[1]);
+            wctx.lineTo(T2B[0], T2B[1]);
+            wctx.lineTo(T2C[0], T2C[1]);
+            wctx.closePath();
+            wctx.clip();
+            wctx.transform(a2, b2, c2, d2, e2, f2);
+            wctx.drawImage(texCanvas, 0, 0, W, H);
+            wctx.restore();
+          }}
+        }}
+      }}
+    }} else if (cornersPts && cornersPts.length === 4) {{
+      const [S0, S1, S2, S3] = cornersPts.map(toSp);
+      const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
+      const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
+      const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
+      const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
+      const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
+      const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
+      wctx.save();
+      wctx.transform(ax, ay, cx, cy, ex, ey);
+      wctx.drawImage(texCanvas, 0, 0, W, H);
+      wctx.restore();
+    }} else {{
+      wctx.drawImage(texCanvas, 0, 0, spW, spH);
+    }}
+    wctx.restore();
+    return wc;
+  }}
+
+  function getWarpedPanelCanvas(panel, isSph) {{
+    const texCanvas = bankCanvases.get(panel.bank);
+    if (!texCanvas) return null;
+    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{state.heatmapStyle}}`;
+    if (warpedBankCanvases.has(cacheKey)) {{
+      return warpedBankCanvases.get(cacheKey);
+    }}
+    const wc = warpTextureOntoPanel(texCanvas, panel, isSph, true);
+    warpedBankCanvases.set(cacheKey, wc);
+    return wc;
+  }}
+
+  function getWarpedMaskCanvas(panel, isSph) {{
+    const mCanvas = maskBankCanvases.get(panel.bank);
+    if (!mCanvas) return null;
+    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}`;
+    if (warpedMaskCanvases.has(cacheKey)) {{
+      return warpedMaskCanvases.get(cacheKey);
+    }}
+    const wc = warpTextureOntoPanel(mCanvas, panel, isSph, false);
+    warpedMaskCanvases.set(cacheKey, wc);
+    return wc;
+  }}
+
   function renderDetectorCanvas() {{
     const rect = detCanvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
-    detCanvas.width = Math.max(200, rect.width * dpr);
-    detCanvas.height = Math.max(200, rect.height * dpr);
+    const targetW = Math.max(200, Math.round(rect.width * dpr));
+    const targetH = Math.max(200, Math.round(rect.height * dpr));
+    if (detCanvas.width !== targetW || detCanvas.height !== targetH) {{
+      detCanvas.width = targetW;
+      detCanvas.height = targetH;
+    }}
     const ctx = detCanvas.getContext("2d");
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const w = rect.width;
     const h = rect.height;
     ctx.clearRect(0, 0, w, h);
@@ -5129,15 +7818,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.moveTo(gx, gy0);
         ctx.lineTo(gx, gy1);
         ctx.stroke();
-        ctx.fillText(`${{az}}°`, gx - 12, h - 8);
+        ctx.fillText(`${{az}}°`, gx - 12, Math.min(h - 6, Math.max(18, gy0 + 14)));
       }}
     }});
     const yStep = Number(((bounds.maxY - bounds.minY) / 4).toFixed(isSph ? 0 : 2)) || (isSph ? 30 : 0.15);
     for (let yv = bounds.minY; yv <= bounds.maxY + 1e-4; yv += yStep) {{
       const [gx0, gy] = detToScreen(bounds.minX - (isCoupled360 ? 360 : 0), yv, w, h, -0.35);
-      const [gx1] = detToScreen(bounds.maxX + (isCoupled360 ? 360 : 0), yv, w, h, -0.35);
+      const [gx1] = detToScreen(bounds.minX + (bounds.maxX - bounds.minX) + (isCoupled360 ? 360 : 0), yv, w, h, -0.35);
       ctx.beginPath();
-      ctx.moveTo(Math.max(0, gx0), gy);
+      ctx.moveTo(Math.max(40, gx0), gy);
       ctx.lineTo(Math.min(w, gx1), gy);
       ctx.stroke();
       const lbl = isSph ? `${{yv.toFixed(0)}}°` : `${{yv.toFixed(2)}}m`;
@@ -5152,15 +7841,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const [vMin, vMax] = getPanelVertRange(panel);
         const [x0, y0] = detToScreen(panel.az_min + shiftAz, vMax, w, h, -0.35);
         const [x1, y1] = detToScreen(panel.az_max + shiftAz, vMin, w, h, -0.35);
-        if (Math.max(x0, x1) < -80 || Math.min(x0, x1) > w + 80) return;
+        if (
+          Math.max(x0, x1) < -80 ||
+          Math.min(x0, x1) > w + 80 ||
+          Math.max(y0, y1) < -80 ||
+          Math.min(y0, y1) > h + 80
+        ) return;
         const pw = x1 - x0;
         const ph = y1 - y0;
 
         const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
         const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
-        const meshPts = isSph && panel.mesh_sph ? panel.mesh_sph : panel.mesh;
 
-        ctx.save();
+        const texCanvas = bankCanvases.get(panel.bank);
+        ctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
+        ctx.lineWidth = texCanvas ? 1.1 : 0.7;
+
         if (outlinePts && outlinePts.length >= 4) {{
           ctx.beginPath();
           outlinePts.forEach((pt, idx) => {{
@@ -5171,177 +7867,48 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ctx.closePath();
           ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
           ctx.fill();
-          ctx.clip();
+          if (texCanvas && state.detAlpha > 0.01) {{
+            const warpedCanvas = getWarpedPanelCanvas(panel, isSph);
+            if (warpedCanvas) {{
+              ctx.save();
+              ctx.globalAlpha = state.detAlpha;
+              ctx.imageSmoothingEnabled = true;
+              ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
+              ctx.restore();
+            }}
+          }}
+          if (state.showPixelMask) {{
+            const warpedMask = getWarpedMaskCanvas(panel, isSph);
+            if (warpedMask) {{
+              ctx.save();
+              ctx.imageSmoothingEnabled = state.detZoom < 2.0;
+              ctx.drawImage(warpedMask, x0, y0, pw, ph);
+              ctx.restore();
+            }}
+          }}
+          ctx.stroke();
         }} else {{
           ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
           ctx.fillRect(x0, y0, pw, ph);
-        }}
-
-        const texCanvas = bankCanvases.get(panel.bank);
-        if (texCanvas && state.detAlpha > 0.01) {{
-          ctx.globalAlpha = state.detAlpha;
-          ctx.imageSmoothingEnabled = true;
-          const W = Math.max(1, texCanvas.width);
-          const H = Math.max(1, texCanvas.height);
-          if (Array.isArray(meshPts) && meshPts.length >= 2 && Array.isArray(meshPts[0]) && meshPts[0].length >= 2) {{
-            // Curvilinear mesh warping (Nr x Nc grid of sub-quads) so high-latitude / tilted panels
-            // (e.g. MANDI bottom-plane panels) fill their curved outlines accurately
-            const nRows = meshPts.length - 1;
-            const nCols = meshPts[0].length - 1;
-            const SGrid = meshPts.map(row => row.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35)));
-            const S0 = SGrid[0][0], S1 = SGrid[nRows][0], S2 = SGrid[nRows][nCols], S3 = SGrid[0][nCols];
-            const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
-            const midR = Math.floor(nRows / 2), midC = Math.floor(nCols / 2);
-            const topBow = Math.hypot(SGrid[0][midC][0] - 0.5 * (S0[0] + S3[0]), SGrid[0][midC][1] - 0.5 * (S0[1] + S3[1]));
-            const botBow = Math.hypot(SGrid[nRows][midC][0] - 0.5 * (S1[0] + S2[0]), SGrid[nRows][midC][1] - 0.5 * (S1[1] + S2[1]));
-            const lftBow = Math.hypot(SGrid[midR][0][0] - 0.5 * (S0[0] + S1[0]), SGrid[midR][0][1] - 0.5 * (S0[1] + S1[1]));
-            const rgtBow = Math.hypot(SGrid[midR][nCols][0] - 0.5 * (S3[0] + S2[0]), SGrid[midR][nCols][1] - 0.5 * (S3[1] + S2[1]));
-            const maxBow = Math.max(topBow, botBow, lftBow, rgtBow);
-            if (nonPara < 1.5 && maxBow < 1.2) {{
-              const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
-              const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
-              const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
-              const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
-              const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
-              const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
+          if (texCanvas && state.detAlpha > 0.01) {{
+            const warpedCanvas = getWarpedPanelCanvas(panel, isSph);
+            if (warpedCanvas) {{
               ctx.save();
-              ctx.transform(ax, ay, cx, cy, ex, ey);
-              ctx.drawImage(texCanvas, 0, 0, W, H);
-              ctx.restore();
-            }} else {{
-              const du = W / nCols;
-              const dv = H / nRows;
-              const expandTri = (A, B, C) => {{
-                const mx = (A[0] + B[0] + C[0]) / 3;
-                const my = (A[1] + B[1] + C[1]) / 3;
-                const pad = 0.45;
-                return [A, B, C].map(P => {{
-                  const dx = P[0] - mx, dy = P[1] - my;
-                  const len = Math.hypot(dx, dy) || 1;
-                  return [P[0] + (dx / len) * pad, P[1] + (dy / len) * pad];
-                }});
-              }};
-              for (let ir = 0; ir < nRows; ir++) {{
-                const v0 = ir * dv;
-                const v1 = (ir + 1) * dv;
-                for (let ic = 0; ic < nCols; ic++) {{
-                  const u0 = ic * du;
-                  const u1 = (ic + 1) * du;
-                  const P00 = SGrid[ir][ic];
-                  const P01 = SGrid[ir][ic + 1];
-                  const P11 = SGrid[ir + 1][ic + 1];
-                  const P10 = SGrid[ir + 1][ic];
-
-                  // Sub-triangle 1: (u0, v0)->P00, (u1, v0)->P01, (u0, v1)->P10
-                  const [T1A, T1B, T1C] = expandTri(P00, P01, P10);
-                  const a1 = (P01[0] - P00[0]) / du;
-                  const b1 = (P01[1] - P00[1]) / du;
-                  const c1 = (P10[0] - P00[0]) / dv;
-                  const d1 = (P10[1] - P00[1]) / dv;
-                  const e1 = P00[0] - a1 * u0 - c1 * v0;
-                  const f1 = P00[1] - b1 * u0 - d1 * v0;
-                  ctx.save();
-                  ctx.beginPath();
-                  ctx.moveTo(T1A[0], T1A[1]);
-                  ctx.lineTo(T1B[0], T1B[1]);
-                  ctx.lineTo(T1C[0], T1C[1]);
-                  ctx.closePath();
-                  ctx.clip();
-                  ctx.transform(a1, b1, c1, d1, e1, f1);
-                  ctx.drawImage(texCanvas, 0, 0, W, H);
-                  ctx.restore();
-
-                  // Sub-triangle 2: (u1, v0)->P01, (u1, v1)->P11, (u0, v1)->P10
-                  const [T2A, T2B, T2C] = expandTri(P01, P11, P10);
-                  const a2 = (P11[0] - P10[0]) / du;
-                  const b2 = (P11[1] - P10[1]) / du;
-                  const c2 = (P11[0] - P01[0]) / dv;
-                  const d2 = (P11[1] - P01[1]) / dv;
-                  const e2 = P11[0] - a2 * u1 - c2 * v1;
-                  const f2 = P11[1] - b2 * u1 - d2 * v1;
-                  ctx.save();
-                  ctx.beginPath();
-                  ctx.moveTo(T2A[0], T2A[1]);
-                  ctx.lineTo(T2B[0], T2B[1]);
-                  ctx.lineTo(T2C[0], T2C[1]);
-                  ctx.closePath();
-                  ctx.clip();
-                  ctx.transform(a2, b2, c2, d2, e2, f2);
-                  ctx.drawImage(texCanvas, 0, 0, W, H);
-                  ctx.restore();
-                }}
-              }}
-            }}
-          }} else if (cornersPts && cornersPts.length === 4) {{
-            // True 2-triangle affine texture projection from (r, c) corners C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
-            const S0 = detToScreen(cornersPts[0][0] + shiftAz, cornersPts[0][1], w, h, -0.35);
-            const S1 = detToScreen(cornersPts[1][0] + shiftAz, cornersPts[1][1], w, h, -0.35);
-            const S2 = detToScreen(cornersPts[2][0] + shiftAz, cornersPts[2][1], w, h, -0.35);
-            const S3 = detToScreen(cornersPts[3][0] + shiftAz, cornersPts[3][1], w, h, -0.35);
-            const nonPara = Math.hypot((S3[0] + S1[0] - S2[0]) - S0[0], (S3[1] + S1[1] - S2[1]) - S0[1]);
-            if (nonPara < 2.2) {{
-              const ax = ((S3[0] - S0[0]) + (S2[0] - S1[0])) * 0.5 / W;
-              const ay = ((S3[1] - S0[1]) + (S2[1] - S1[1])) * 0.5 / W;
-              const cx = ((S1[0] - S0[0]) + (S2[0] - S3[0])) * 0.5 / H;
-              const cy = ((S1[1] - S0[1]) + (S2[1] - S3[1])) * 0.5 / H;
-              const ex = (S0[0] + (S3[0] + S1[0] - S2[0])) * 0.5;
-              const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
-              ctx.save();
-              ctx.transform(ax, ay, cx, cy, ex, ey);
-              ctx.drawImage(texCanvas, 0, 0, W, H);
-              ctx.restore();
-            }} else {{
-              // Triangle A: (0,0)->S0, (W,0)->S3, (0,H)->S1
-              ctx.save();
-              ctx.beginPath();
-              ctx.moveTo(S0[0], S0[1]);
-              ctx.lineTo(S3[0], S3[1]);
-              ctx.lineTo(S1[0], S1[1]);
-              ctx.closePath();
-              ctx.clip();
-              ctx.transform(
-                (S3[0] - S0[0]) / W, (S3[1] - S0[1]) / W,
-                (S1[0] - S0[0]) / H, (S1[1] - S0[1]) / H,
-                S0[0], S0[1]
-              );
-              ctx.drawImage(texCanvas, 0, 0, W, H);
-              ctx.restore();
-
-              // Triangle B: (W,0)->S3, (W,H)->S2, (0,H)->S1
-              ctx.save();
-              ctx.beginPath();
-              ctx.moveTo(S3[0], S3[1]);
-              ctx.lineTo(S2[0], S2[1]);
-              ctx.lineTo(S1[0], S1[1]);
-              ctx.closePath();
-              ctx.clip();
-              ctx.transform(
-                (S2[0] - S1[0]) / W, (S2[1] - S1[1]) / W,
-                (S2[0] - S3[0]) / H, (S2[1] - S3[1]) / H,
-                S3[0] + S1[0] - S2[0], S3[1] + S1[1] - S2[1]
-              );
-              ctx.drawImage(texCanvas, 0, 0, W, H);
+              ctx.globalAlpha = state.detAlpha;
+              ctx.imageSmoothingEnabled = true;
+              ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
               ctx.restore();
             }}
-          }} else {{
-            ctx.drawImage(texCanvas, x0, y0, pw, ph);
           }}
-        }}
-        ctx.restore();
-
-        // True panel polygon border (shows curved elevation edges in Spherical MANDI view)
-        ctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
-        ctx.lineWidth = texCanvas ? 1.1 : 0.7;
-        if (outlinePts && outlinePts.length >= 4) {{
-          ctx.beginPath();
-          outlinePts.forEach((pt, idx) => {{
-            const [ox, oy] = detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35);
-            if (idx === 0) ctx.moveTo(ox, oy);
-            else ctx.lineTo(ox, oy);
-          }});
-          ctx.closePath();
-          ctx.stroke();
-        }} else {{
+          if (state.showPixelMask) {{
+            const warpedMask = getWarpedMaskCanvas(panel, isSph);
+            if (warpedMask) {{
+              ctx.save();
+              ctx.imageSmoothingEnabled = state.detZoom < 2.0;
+              ctx.drawImage(warpedMask, x0, y0, pw, ph);
+              ctx.restore();
+            }}
+          }}
           ctx.strokeRect(x0, y0, pw, ph);
         }}
 
@@ -5407,10 +7974,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const fgLayer = OVERLAY_PARALLAX_LAYER;
         const [x, y] = detToScreen(p.det_x + shiftAz, py, w, h, fgLayer);
         if (x < -30 || x > w + 30) return;
-        const [bx, by] = detToScreen(p.det_x + shiftAz, py, w, h, -0.35);
 
         const captured = isPeakCapturedByActiveZone(p);
-        const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
+        const isHovered = isPeakHighlightedTarget(p);
         const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
         if (!captured && !isHovered && !isOrbitMate && state.activeZones.size === 0) {{
           return;
@@ -5420,15 +7986,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const r = isHovered ? baseR + 1.8 : (isOrbitMate ? baseR + 1.2 : baseR);
 
         ctx.save();
-        if (Math.hypot(x - bx, y - by) > 2.0 && (captured || isHovered || isOrbitMate)) {{
-          ctx.beginPath();
-          ctx.moveTo(bx, by);
-          ctx.lineTo(x, y);
-          ctx.strokeStyle = isOrbitMate ? "rgba(251, 191, 36, 0.55)" : "rgba(244, 63, 133, 0.38)";
-          ctx.lineWidth = 1.0;
-          ctx.stroke();
-        }}
-
         const ellPtsRaw = isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse;
         const strokeCol = isHovered
           ? "#f43f85"
@@ -5580,10 +8137,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const rect = stereoCanvas.getBoundingClientRect();
     if (rect.width < 20 || rect.height < 20) return;
     const dpr = window.devicePixelRatio || 1;
-    stereoCanvas.width = rect.width * dpr;
-    stereoCanvas.height = rect.height * dpr;
+    const targetW = Math.round(rect.width * dpr);
+    const targetH = Math.round(rect.height * dpr);
+    if (stereoCanvas.width !== targetW || stereoCanvas.height !== targetH) {{
+      stereoCanvas.width = targetW;
+      stereoCanvas.height = targetH;
+    }}
     const ctx = stereoCanvas.getContext("2d");
-    ctx.scale(dpr, dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     const w = rect.width;
     const h = rect.height;
     ctx.clearRect(0, 0, w, h);
@@ -5684,6 +8245,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     const wPeaks = getActiveWulffPeaks();
     const orbitMates = [];
+    const hoveredTargets = [];
 
     // Project all peaks in Sample frame and sort back-to-front by camera depth zCam so closer peaks render on top
     const projectedPeaks = wPeaks.map(p => {{
@@ -5698,14 +8260,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     projectedPeaks.forEach(({{ p, sx, sy, hemi, dotScale }}) => {{
       const captured = isPeakCapturedByActiveZone(p) || state.wulffScope === "all_runs";
-      const isHovered = state.hoveredPeakId === p.id || state.selectedPeakId === p.id;
+      const isHovered = isPeakHighlightedTarget(p);
       const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
       if (isOrbitMate) orbitMates.push([sx, sy, p, dotScale]);
+      if (isHovered) hoveredTargets.push([sx, sy, p, dotScale, hemi]);
 
       const baseDot = (isExp ? (captured ? 3.8 : 2.6) : (captured ? 2.5 : 1.75)) * dotScale;
-      const rDot = isHovered ? baseDot + 2.5 : (isOrbitMate ? baseDot + 1.6 : baseDot);
+      const rDot = isHovered ? baseDot + 2.8 : (isOrbitMate ? baseDot + 1.6 : baseDot);
       const alphaBase = hemi >= 0 ? (captured ? 0.94 : 0.52) : (captured ? 0.55 : 0.28);
-      const col = isHovered ? "#fbbf24" : peakStrokeColor(p, alphaBase);
+      const col = isHovered ? "#f43f85" : peakStrokeColor(p, alphaBase);
 
       ctx.save();
       ctx.beginPath();
@@ -5772,6 +8335,38 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ctx.restore();
     }}
 
+    // Coupled Hover Target Reticle: prominently highlight the exact peak hovered in Detector or Wulff view
+    if (hoveredTargets.length > 0) {{
+      ctx.save();
+      hoveredTargets.forEach(([tx, ty, tp]) => {{
+        const rRet = isExp ? 10.0 : 7.5;
+        ctx.beginPath();
+        ctx.arc(tx, ty, rRet, 0, Math.PI * 2);
+        ctx.strokeStyle = "#f43f85";
+        ctx.lineWidth = 2.2;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.moveTo(tx - rRet - 4, ty); ctx.lineTo(tx - rRet + 2, ty);
+        ctx.moveTo(tx + rRet - 2, ty); ctx.lineTo(tx + rRet + 4, ty);
+        ctx.moveTo(tx, ty - rRet - 4); ctx.lineTo(tx, ty - rRet + 2);
+        ctx.moveTo(tx, ty + rRet - 2); ctx.lineTo(tx, ty + rRet + 4);
+        ctx.strokeStyle = "#fbbf24";
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+
+        if (!isExp && Array.isArray(tp.hkl)) {{
+          const lbl = `(${{tp.hkl.join(",")}})`;
+          ctx.font = "bold 9px monospace";
+          ctx.fillStyle = "#070913";
+          ctx.fillText(lbl, tx + 9, ty - 5);
+          ctx.fillStyle = "#fbbf24";
+          ctx.fillText(lbl, tx + 8, ty - 6);
+        }}
+      }});
+      ctx.restore();
+    }}
+
     ctx.restore();
   }}
 
@@ -5830,7 +8425,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     if (isPanningDet) {{
       let nextPanX = ev.clientX - panStart[0];
-      const plotW = Math.max(50, rect.width - 54);
+      const plotW = getDetectorPlotBox(rect.width, rect.height).plotW;
       const span360 = plotW * state.detZoom;
       if (span360 > 10) {{
         while (nextPanX > 0.5 * span360) {{ nextPanX -= span360; panStart[0] += span360; }}
@@ -5842,10 +8437,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return;
     }}
     const hit = findNearestPeakDetector(mx, my);
-    state.hoveredPeakId = hit ? hit.id : null;
+    const nextHoverId = hit ? hit.id : null;
+    const hoverChanged = hit !== state.hoveredPeakObj;
+    state.hoveredPeakId = nextHoverId;
+    state.hoveredPeakObj = hit || null;
     if (hit) {{
       state.activeOrbitId = hit.asu_orbit_id || null;
-      updatePeakInspector(hit);
+      if (hoverChanged) updatePeakInspector(hit);
     }} else if (state.selectedPeakId === null) {{
       state.activeOrbitId = null;
     }}
@@ -5855,6 +8453,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.targetParallaxX = 0.0;
     state.targetParallaxY = 0.0;
     state.hoveredPeakId = null;
+    state.hoveredPeakObj = null;
     if (state.selectedPeakId === null) state.activeOrbitId = null;
   }});
 
@@ -5872,10 +8471,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const hit = findNearestPeakDetector(ev.clientX - rect.left, ev.clientY - rect.top);
     if (hit) {{
       state.selectedPeakId = hit.id;
+      state.selectedPeakObj = hit;
       state.activeOrbitId = hit.asu_orbit_id || null;
       updatePeakInspector(hit);
     }} else {{
       state.selectedPeakId = null;
+      state.selectedPeakObj = null;
       state.activeOrbitId = null;
     }}
   }});
@@ -5892,28 +8493,34 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const rect = stereoCanvas.getBoundingClientRect();
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
+      state.targetParallaxX = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
+      state.targetParallaxY = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
       if (isDraggingWulff) {{
         const dx = ev.clientX - wulffDragStart[0];
         const dy = ev.clientY - wulffDragStart[1];
         state.wulffYawDeg = ((wulffDragStart[2] + dx * 0.55 + 540) % 360) - 180;
         state.wulffPitchDeg = Math.max(-85, Math.min(85, wulffDragStart[3] + dy * 0.45));
         const detRect = detCanvas.getBoundingClientRect();
-        const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
+        const span360 = getDetectorPlotBox(detRect.width, detRect.height).plotW * state.detZoom;
         state.detPanX = -(state.wulffYawDeg / 360.0) * span360;
         return;
       }}
       const hit = findNearestPeakWulff(mx, my);
+      const hoverChanged = hit !== state.hoveredPeakObj;
+      state.hoveredPeakId = hit ? hit.id : null;
+      state.hoveredPeakObj = hit || null;
       if (hit) {{
-        state.hoveredPeakId = hit.id;
         state.activeOrbitId = hit.asu_orbit_id || null;
-        updatePeakInspector(hit);
-      }} else {{
-        state.hoveredPeakId = null;
-        if (state.selectedPeakId === null) state.activeOrbitId = null;
+        if (hoverChanged) updatePeakInspector(hit);
+      }} else if (state.selectedPeakId === null) {{
+        state.activeOrbitId = null;
       }}
     }});
     stereoCanvas.addEventListener("mouseleave", () => {{
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
       state.hoveredPeakId = null;
+      state.hoveredPeakObj = null;
       if (state.selectedPeakId === null) state.activeOrbitId = null;
     }});
     stereoCanvas.addEventListener("wheel", (ev) => {{
@@ -5929,6 +8536,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const hit = findNearestPeakWulff(ev.clientX - rect.left, ev.clientY - rect.top);
       if (hit) {{
         state.selectedPeakId = hit.id;
+        state.selectedPeakObj = hit;
         state.activeOrbitId = hit.asu_orbit_id || null;
         updatePeakInspector(hit);
       }}
@@ -5946,28 +8554,57 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     document.getElementById("lbl-parallax").textContent = state.parallaxStrength.toFixed(2) + "×";
   }});
 
-  slLamMin.addEventListener("input", () => {{
-    state.lamMin = Math.min(parseFloat(slLamMin.value), state.lamMax - 0.05);
-    slLamMin.value = state.lamMin;
-    updateWavelengthLabels();
-    updateHUD();
-  }});
+  if (slDmin) {{
+    slDmin.addEventListener("input", () => {{
+      const v = parseFloat(slDmin.value);
+      if (Number.isFinite(v) && v > 0) {{
+        syncDminControls(v, slDmin);
+        updateHUD();
+      }}
+    }});
+  }}
 
-  slLamMax.addEventListener("input", () => {{
-    state.lamMax = Math.max(parseFloat(slLamMax.value), state.lamMin + 0.05);
-    slLamMax.value = state.lamMax;
-    updateWavelengthLabels();
-    updateHUD();
-  }});
+  if (inpDminEl) {{
+    const onInpDmin = () => {{
+      const v = parseFloat(inpDminEl.value);
+      if (Number.isFinite(v) && v > 0) {{
+        syncDminControls(v, inpDminEl);
+        updateHUD();
+      }}
+    }};
+    inpDminEl.addEventListener("input", onInpDmin);
+    inpDminEl.addEventListener("change", onInpDmin);
+  }}
+
+  if (inpLminEl) {{
+    const onInpLmin = () => {{
+      const v = parseFloat(inpLminEl.value);
+      if (Number.isFinite(v) && v > 0) {{
+        state.lamMin = Math.min(v, state.lamMax - 0.05);
+        updateWavelengthLabels();
+        updateHUD();
+      }}
+    }};
+    inpLminEl.addEventListener("input", onInpLmin);
+    inpLminEl.addEventListener("change", onInpLmin);
+  }}
+
+  if (inpLmaxEl) {{
+    const onInpLmax = () => {{
+      const v = parseFloat(inpLmaxEl.value);
+      if (Number.isFinite(v) && v > 0) {{
+        state.lamMax = Math.max(v, state.lamMin + 0.05);
+        updateWavelengthLabels();
+        updateHUD();
+      }}
+    }};
+    inpLmaxEl.addEventListener("input", onInpLmax);
+    inpLmaxEl.addEventListener("change", onInpLmax);
+  }}
 
   document.getElementById("btn-proj-toggle").addEventListener("click", () => {{
     state.projection = state.projection === "cylindrical" ? "spherical" : "cylindrical";
     syncProjectionUI();
-  }});
-
-  document.getElementById("btn-zone-order").addEventListener("click", () => {{
-    const nextOrder = state.maxZoneOrder >= 3 ? 1 : state.maxZoneOrder + 1;
-    setMaxZoneOrder(nextOrder);
   }});
 
   [1, 2, 3].forEach(ordLevel => {{
@@ -5980,6 +8617,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ev.currentTarget.classList.toggle("active-btn", state.showZoneArcs);
     ev.currentTarget.textContent = "Arcs";
   }});
+
+  const btnPixelMask = document.getElementById("btn-pixel-mask");
+  if (btnPixelMask) {{
+    btnPixelMask.addEventListener("click", () => {{
+      state.showPixelMask = !state.showPixelMask;
+      syncPixelMaskUI();
+      renderDetector();
+    }});
+  }}
 
   document.getElementById("btn-heatmap-cmap").addEventListener("click", (ev) => {{
     const order = ["magma", "cyan", "gray"];
@@ -5999,22 +8645,33 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     btnWulffScope.addEventListener("click", () => {{
       state.wulffScope = state.wulffScope === "all_runs" ? "single_frame" : "all_runs";
       const detRect = detCanvas.getBoundingClientRect();
-      const span360 = Math.max(50, detRect.width - 54) * state.detZoom;
+      const span360 = getDetectorPlotBox(detRect.width, detRect.height).plotW * state.detZoom;
       state.wulffYawDeg = -(state.detPanX / Math.max(1, span360)) * 360.0;
       syncWulffUI();
     }});
   }}
 
+  function applySpotColorMode(nextMode) {{
+    if ((nextMode === "residual" || nextMode === "scale") && !hasMergedCarelessData()) {{
+      state.wulffColorMode = "wavelength";
+    }} else if (nextMode === "isigi" && !hasIntegratedIsigi()) {{
+      state.wulffColorMode = "wavelength";
+    }} else {{
+      state.wulffColorMode = nextMode || "wavelength";
+    }}
+    syncWulffUI();
+  }}
+
   const selWulffColor = document.getElementById("sel-wulff-color");
   if (selWulffColor) {{
     selWulffColor.addEventListener("change", () => {{
-      const nextMode = selWulffColor.value || "wavelength";
-      if ((nextMode === "residual" || nextMode === "scale") && !hasMergedCarelessData()) {{
-        state.wulffColorMode = "wavelength";
-      }} else {{
-        state.wulffColorMode = nextMode;
-      }}
-      syncWulffUI();
+      applySpotColorMode(selWulffColor.value || "wavelength");
+    }});
+  }}
+  const selSpotColor = document.getElementById("sel-spot-color");
+  if (selSpotColor) {{
+    selSpotColor.addEventListener("change", () => {{
+      applySpotColorMode(selSpotColor.value || "wavelength");
     }});
   }}
 
@@ -6043,6 +8700,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.wulffPitchDeg = 0.0;
     state.wulffZoom = 1.0;
     state.selectedPeakId = null;
+    state.selectedPeakObj = null;
+    state.hoveredPeakId = null;
+    state.hoveredPeakObj = null;
     state.activeOrbitId = null;
     setMaxZoneOrder(1);
   }});
@@ -6136,20 +8796,54 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}, 1800);
   }});
 
-  // Open in its own full-screen browser tab (button + auto-detect when inside Galaxy iframe)
+  // Open in its own full-screen browser tab when embedded inside an outer host iframe (e.g. Galaxy).
+  // Inside Trame/NOVA, the widget runs inside an internal full-bleed `<iframe srcdoc>` (`about:srcdoc`)
+  // whose `window.parent` is the real HTTP document; hide the button when already in a top-level tab.
+  function resolveStandaloneTabUrl() {{
+    const selfHref = String((window.location && window.location.href) || "");
+    if (/^https?:/i.test(selfHref)) return selfHref;
+    try {{
+      const parentHref = String((window.parent && window.parent.location && window.parent.location.href) || "");
+      if (/^https?:/i.test(parentHref)) return parentHref;
+    }} catch (_e) {{}}
+    if (document.baseURI && /^https?:/i.test(document.baseURI)) {{
+      return document.baseURI;
+    }}
+    return "";
+  }}
+  function isEmbeddedInOuterFrame() {{
+    try {{
+      const selfHref = String((window.location && window.location.href) || "");
+      const isSrcdoc = selfHref.startsWith("about:srcdoc");
+      const hostWin = isSrcdoc ? window.parent : window.self;
+      return Boolean(hostWin && hostWin !== window.top);
+    }} catch (_e) {{
+      return true;
+    }}
+  }}
   function openInOwnTab() {{
-    const targetUrl = window.location.href;
-    window.open(targetUrl, "_blank", "noopener");
+    const targetUrl = resolveStandaloneTabUrl();
+    if (targetUrl) {{
+      return window.open(targetUrl, "_blank", "noopener");
+    }}
+    const blob = new Blob([document.documentElement.outerHTML], {{ type: "text/html" }});
+    return window.open(URL.createObjectURL(blob), "_blank");
   }}
   const btnNewTab = document.getElementById("btn-new-tab");
-  if (btnNewTab) btnNewTab.addEventListener("click", openInOwnTab);
+  const embeddedOuter = isEmbeddedInOuterFrame();
+  if (btnNewTab) {{
+    if (!embeddedOuter) {{
+      btnNewTab.style.display = "none";
+    }} else {{
+      btnNewTab.addEventListener("click", openInOwnTab);
+    }}
+  }}
 
-  if (window.self !== window.top) {{
+  if (embeddedOuter) {{
     const banner = document.getElementById("iframe-popout-banner");
     const btnPopNow = document.getElementById("btn-popout-now");
     const btnPopDismiss = document.getElementById("btn-popout-dismiss");
-    // Attempt immediate popout; if popup-blocked, show 1-click banner
-    const w = window.open(window.location.href, "_blank");
+    const w = openInOwnTab();
     if (!w && banner) {{
       banner.style.display = "flex";
     }}
@@ -6171,6 +8865,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!newPayload) return;
     const isFrameSwitch = Boolean(opts && opts.isFrameSwitch);
     const resetSelectedFrame = Boolean(opts && opts.resetSelectedFrame);
+    const preserveParams = Boolean(opts && opts.preserveParams);
     if (
       isFrameSwitch &&
       typeof state.selectedFrameIndex === "number" &&
@@ -6180,6 +8875,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return;
     }}
     const isSolveRunning = state.runningStageIdx === 1 || typeof newPayload.active_rung_idx === "number";
+    const keepUserParams = isFrameSwitch || preserveParams || isSolveRunning;
     const prevZones = [...ZONES];
     const prevPeaks = [...PEAKS];
     const prevSamplePeaks = [...SAMPLE_PEAKS];
@@ -6197,10 +8893,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       syncProjectionUI();
     }}
     DATA.space_group = newPayload.space_group || DATA.space_group;
-    DATA.wavelength_range = newPayload.wavelength_range || DATA.wavelength_range;
+    const defInstWl = getDefaultWavelengthForInstrument(DATA.instrument);
     const nextArtKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
-    const wl0 = Number((DATA.wavelength_range && DATA.wavelength_range[0]) || state.lamMin || 2.0);
-    if (nextArtKind === "merged" || nextArtKind === "raw_nexus") {{
+    if (keepUserParams && Number.isFinite(state.lamMin) && Number.isFinite(state.lamMax) && state.lamMax > state.lamMin && state.lamMin > 0) {{
+      DATA.wavelength_range = [state.lamMin, state.lamMax];
+    }} else {{
+      DATA.wavelength_range = (Array.isArray(newPayload.wavelength_range) && newPayload.wavelength_range.length >= 2)
+        ? newPayload.wavelength_range
+        : (Array.isArray(DATA.wavelength_range) && DATA.wavelength_range.length >= 2 ? DATA.wavelength_range : defInstWl);
+    }}
+    const wl0 = Number((DATA.wavelength_range && DATA.wavelength_range[0]) || state.lamMin || defInstWl[0]);
+    if (keepUserParams && Number.isFinite(state.dMin) && state.dMin > 0) {{
+      DATA.d_min = Number(state.dMin);
+    }} else if (nextArtKind === "merged" || nextArtKind === "raw_nexus") {{
       DATA.d_min = Number((0.5 * wl0).toFixed(2));
     }} else {{
       DATA.d_min = Number(newPayload.d_min || (0.5 * wl0).toFixed(2));
@@ -6228,13 +8933,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (DATA.wavelength_range && DATA.wavelength_range.length >= 2) {{
       state.lamMin = Number(DATA.wavelength_range[0]);
       state.lamMax = Number(DATA.wavelength_range[1]);
-      if (slLamMin) slLamMin.value = state.lamMin.toFixed(2);
-      if (slLamMax) slLamMax.value = state.lamMax.toFixed(2);
       updateWavelengthLabels();
     }}
     if (DATA.d_min) {{
-      const dEl = document.getElementById("inp-dmin");
-      if (dEl) dEl.value = Number(DATA.d_min).toFixed(1);
+      syncDminControls(Number(DATA.d_min));
     }}
 
     let nextPeaks = Array.isArray(newPayload.peaks) ? [...newPayload.peaks] : [];
@@ -6260,6 +8962,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     SAMPLE_PEAKS.length = 0;
     nextSamplePeaks.forEach(p => SAMPLE_PEAKS.push(p));
     DATA.merge_metrics = newPayload.merge_metrics || null;
+    DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
     ZONES.length = 0;
     nextZones.forEach(z => ZONES.push(z));
     PANELS.length = 0;
@@ -6289,6 +8992,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     rawBankImages.clear();
     bankCanvases.clear();
+    maskBankCanvases.clear();
+    invalidateDetectorGeometryCache();
     decodeAllBankTextures();
     // Support direct canvas textures generated by client-side h5wasm
     PANELS.forEach(p => {{
@@ -6296,9 +9001,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         rawBankImages.set(p.bank, p._grayCanvas);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(p._grayCanvas, state.heatmapStyle));
       }}
+      if (p._maskCanvas) {{
+        maskBankCanvases.set(p.bank, p._maskCanvas);
+      }}
     }});
+    syncPixelMaskUI();
 
     const subEl = document.querySelector(".subtitle-tag");
+    const verEl = document.getElementById("app-version");
+    if (verEl && newPayload.subhkl_version) {{
+      const rawVer = String(newPayload.subhkl_version).trim();
+      verEl.textContent = /^[vV]?[0-9]+[.][0-9]+/.test(rawVer)
+        ? ("v" + rawVer.replace(/^[vV]/, ""))
+        : rawVer;
+    }}
     const artKind = newPayload.artifact_kind || DATA.artifact_kind || "solve";
     const shapeMode = newPayload.peak_shape_mode || DATA.peak_shape_mode || "solved_circle";
     DATA.artifact_kind = artKind;
@@ -6329,22 +9045,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (DATA.space_group) {{
       const sgEl = document.getElementById("inp-sg");
       if (sgEl) sgEl.value = DATA.space_group;
-      const ndSgEl = document.getElementById("nd-sg");
-      if (ndSgEl) ndSgEl.value = DATA.space_group;
     }}
     if (DATA.cell && DATA.cell.length === 6) {{
       const c = DATA.cell;
       document.getElementById("cell-summary").textContent = `${{c[0].toFixed(1)}}, ${{c[1].toFixed(1)}}, ${{c[2].toFixed(1)}} Å`;
       const ids = ["inp-a", "inp-b", "inp-c", "inp-alpha", "inp-beta", "inp-gamma"];
-      const ndIds = ["nd-a", "nd-b", "nd-c", "nd-alpha", "nd-beta", "nd-gamma"];
       ids.forEach((id, i) => {{
         const el = document.getElementById(id);
         if (el && typeof c[i] === "number") el.value = c[i].toFixed(2);
       }});
-      ndIds.forEach((id, i) => {{
-        const el = document.getElementById(id);
-        if (el && typeof c[i] === "number") el.value = c[i].toFixed(2);
-      }});
+      if (typeof recordUnitCellInLocalStorage === "function" && DATA.artifact_kind !== "empty") {{
+        recordUnitCellInLocalStorage(c, DATA.space_group || "P 1", DATA.images_h5 ? String(DATA.images_h5).split("/").pop() : "Active dataset");
+      }}
+    }}
+    if (typeof applyUnitCellSymmetryConstraints === "function") {{
+      applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: true }});
+    }}
+    if (typeof renderUnitCellHistoryDropdown === "function") {{
+      renderUnitCellHistoryDropdown();
     }}
     const ord1 = ZONES.filter(z => (z.order || 1) <= 1).map(z => z.zone_id);
     state.maxZoneOrder = ord1.length > 0 ? 1 : 2;
@@ -6360,8 +9078,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }} else {{
       state.currentPipelineIdx = pipelineIdxForArtifactKind(artKind);
       state.currentRungIdx = artKind === "merged" ? 0 : Math.max(0, LADDER.length - 1);
+      // Invalidate any subsequent pipeline stages when data for an earlier step is loaded or processed
+      const completedSteps = state.currentPipelineIdx; // 0..4
+      galaxyBridge.maxValidCompletedSteps = completedSteps;
+      const stageKeysOrder = ["reduce", "solve", "integrate", "merge"];
+      if (galaxyBridge.stepArtifacts && typeof galaxyBridge.stepArtifacts === "object") {{
+        stageKeysOrder.forEach((sKey, sIdx) => {{
+          if (sIdx >= completedSteps) {{
+            delete galaxyBridge.stepArtifacts[sKey];
+          }}
+        }});
+      }}
     }}
-    if (!isFrameSwitch && (artKind === "merged_careless" || Boolean(DATA.merge_metrics))) {{
+    const hasActualMerge = hasMergedCarelessData();
+    if (!hasActualMerge) {{
+      DATA.merge_metrics = null;
+      if (state.wulffColorMode === "residual" || state.wulffColorMode === "scale") {{
+        state.wulffColorMode = "wavelength";
+      }}
+    }} else if (!isFrameSwitch && artKind === "merged_careless" && hasCarelessResiduals()) {{
       state.showStereo = true;
       state.wulffExpanded = true;
       state.wulffScope = "all_runs";
@@ -6377,7 +9112,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (isFrameSwitch) {{
       return;
     }}
-    if (artKind === "merged_careless" && DATA.merge_metrics) {{
+    if (newPayload.mtz_overlay_name) {{
+      setStatusLine(
+        `[MTZ REFERENCE SPOTS]`,
+        `Overlaid <strong>${{Number(newPayload.mtz_overlay_reflections || 0).toLocaleString()}}</strong> ASU reflections from <strong>${{newPayload.mtz_overlay_name}}</strong> (<strong>${{Number(newPayload.mtz_overlay_matched || 0).toLocaleString()}}</strong> spots matched on active detector geometry).`
+      );
+      return;
+    }}
+    if (artKind === "merged_careless" && hasActualMerge && DATA.merge_metrics) {{
       const m = DATA.merge_metrics;
       const cc = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
       const isig = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
@@ -6475,6 +9217,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (f.keys().includes("files")) {{
           const fl = Array.from(f.get("files").value || []).map(String).join(" ").toUpperCase();
           if (fl.includes("MANDI")) inst = "MANDI";
+          else if (fl.includes("TOPAZ")) inst = "TOPAZ";
           else if (fl.includes("CG4D")) inst = "CG4D";
           else if (fl.includes("IMAGINE")) inst = "IMAGINE";
         }}
@@ -6485,9 +9228,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (sh[1] === 256) inst = "MANDI";
       else if (sh[1] === 512) inst = "CG4D";
     }}
-    if (!inst) inst = DATA.instrument || "CG4D";
 
-    let wlRangeNew = (inst === "MANDI" || inst === "TOPAZ") ? [2.0, 4.0] : [2.8, 4.5];
+    let wlRangeNew = getDefaultWavelengthForInstrument(inst || DATA.instrument || "CG4D");
     let dMinNew = Number((0.5 * Number(wlRangeNew[0])).toFixed(2));
     try {{
       if (f.keys().includes("instrument")) {{
@@ -6495,6 +9237,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (wl && wl.length >= 2 && !(Math.abs(Number(wl[0]) - 2.0) < 1e-3 && Math.abs(Number(wl[1]) - 10.0) < 1e-3)) {{
           wlRangeNew = [Number(wl[0]), Number(wl[1])];
           dMinNew = Number((0.5 * Number(wlRangeNew[0])).toFixed(2));
+        }}
+      }}
+      for (const gk of ["blind_search", "search", "solve"]) {{
+        if (f.keys().includes(gk)) {{
+          const grp = f.get(gk);
+          if (grp && grp.attrs && grp.attrs["d_min"]) {{
+            dMinNew = Number(grp.attrs["d_min"].value) || dMinNew;
+          }}
         }}
       }}
       if (f.keys().includes("scan_refinement")) {{
@@ -6529,13 +9279,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
       }}
       bankIdsRun = bAll.slice(f0, f1);
-      if (bankIdsRun.some(b => b > 60)) inst = "CG4D";
-      else if (bankIdsRun.some(b => b < 10) || (bankIdsRun.length > 0 && bankIdsRun.length <= 45)) inst = "MANDI";
+      if (!inst) {{
+        if (bankIdsRun.some(b => b > 60)) inst = "CG4D";
+        else if (bankIdsRun.length > 0 && bankIdsRun.length <= 25 && bankIdsRun.every(b => b >= 13 && b <= 59)) inst = "TOPAZ";
+        else if (bankIdsRun.some(b => b < 10) || (bankIdsRun.length > 0 && bankIdsRun.length <= 45)) inst = "MANDI";
+      }}
     }}
+    if (!inst) inst = DATA.instrument || "CG4D";
 
     // Seed nominal detector banks from DATA.beamline_detectors[inst], then override with detector_calibration/bank_*
     const detMap = new Map();
     const nomBanks = (DATA.beamline_detectors && DATA.beamline_detectors[inst]) || {{}};
+    const defaultDim = (inst === "MANDI" || inst === "TOPAZ") ? 256 : 512;
     Object.entries(nomBanks).forEach(([bkStr, cfg]) => {{
       const bid = parseInt(bkStr, 10);
       detMap.set(bid, {{
@@ -6545,8 +9300,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         vhat: [...cfg.vhat],
         width: Number(cfg.width),
         height: Number(cfg.height),
-        m: Number(cfg.m || (inst === "MANDI" ? 256 : 512)),
-        n: Number(cfg.n || (inst === "MANDI" ? 256 : 512)),
+        m: Number(cfg.m || defaultDim),
+        n: Number(cfg.n || defaultDim),
       }});
     }});
     if (f.keys().includes("detector_calibration")) {{
@@ -6555,7 +9310,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (!bName.startsWith("bank_")) continue;
         const bid = parseInt(bName.slice(5), 10);
         const g = calGrp.get(bName);
-        const baseDet = detMap.get(bid) || {{ m: inst === "MANDI" ? 256 : 512, n: inst === "MANDI" ? 256 : 512 }};
+        const baseDet = detMap.get(bid) || {{ m: defaultDim, n: defaultDim }};
         const center = Array.from(g.get("center").value).map(Number);
         const uhat = Array.from(g.get("uhat").value).map(Number);
         const vhat = Array.from(g.get("vhat").value).map(Number);
@@ -6568,6 +9323,77 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     // Read raw detector images for the active run slice and build grayscale texture canvases
     const bankImgs = new Map();
     const bankGrayCanvases = new Map();
+    const bankMaskCanvases = new Map();
+    const bankMaskRaw = new Map();
+    let emMaskSummary = {{ available: false }};
+    if (f.keys().includes("detector")) {{
+      try {{
+        const dGrp = f.get("detector");
+        const dKeys = dGrp.keys();
+        const mDs = dKeys.includes("pixel_class")
+          ? dGrp.get("pixel_class")
+          : (dKeys.includes("pixel_mask") ? dGrp.get("pixel_mask") : null);
+        const isBinaryMask = !dKeys.includes("pixel_class") && dKeys.includes("pixel_mask");
+        if (mDs) {{
+          const mShape = Array.from(mDs.shape || []).map(Number);
+          const nBanksM = mShape[0] || 0, Hm = mShape[1] || 512, Wm = mShape[2] || 512;
+          const mBankIds = dKeys.includes("mask_bank_ids")
+            ? Array.from(dGrp.get("mask_bank_ids").value).map(Number)
+            : Array.from({{ length: nBanksM }}, (_, idx) => idx + 1);
+          const bStepM = 4;
+          const Hbm = Math.max(1, Math.floor(Hm / bStepM)), Wbm = Math.max(1, Math.floor(Wm / bStepM));
+          let nTotM = 0, nDarkM = 0, nBrightM = 0;
+          for (let bi = 0; bi < Math.min(nBanksM, mBankIds.length); bi++) {{
+            const bidM = Number(mBankIds[bi]);
+            const rawM = mDs.slice([[bi, bi + 1], [0, Hm], [0, Wm]]);
+            const clsArr = new Uint8Array(Hm * Wm);
+            let hasMasked = false;
+            for (let k = 0; k < clsArr.length; k++) {{
+              const cv = isBinaryMask ? (Number(rawM[k]) === 0 ? 1 : 0) : Number(rawM[k]);
+              clsArr[k] = cv;
+              nTotM++;
+              if (cv === 1) {{ nDarkM++; hasMasked = true; }}
+              else if (cv >= 2) {{ nBrightM++; hasMasked = true; }}
+            }}
+            bankMaskRaw.set(bidM, {{ data: clsArr, H: Hm, W: Wm }});
+            if (hasMasked) {{
+              const mc = document.createElement("canvas");
+              mc.width = Wbm; mc.height = Hbm;
+              const mctx = mc.getContext("2d");
+              const midata = mctx.createImageData(Wbm, Hbm);
+              for (let rb = 0; rb < Hbm; rb++) {{
+                for (let cb = 0; cb < Wbm; cb++) {{
+                  let mx = 0;
+                  for (let dr = 0; dr < bStepM; dr++) {{
+                    const rOff = (rb * bStepM + dr) * Wm + cb * bStepM;
+                    for (let dc = 0; dc < bStepM; dc++) {{
+                      if (clsArr[rOff + dc] > mx) mx = clsArr[rOff + dc];
+                    }}
+                  }}
+                  const pIdx = (rb * Wbm + cb) * 4;
+                  if (mx >= 2) {{
+                    midata.data[pIdx] = 180; midata.data[pIdx+1] = 255; midata.data[pIdx+2] = 20; midata.data[pIdx+3] = 224;
+                  }} else if (mx === 1) {{
+                    midata.data[pIdx] = 56; midata.data[pIdx+1] = 189; midata.data[pIdx+2] = 248; midata.data[pIdx+3] = 132;
+                  }}
+                }}
+              }}
+              mctx.putImageData(midata, 0, 0);
+              bankMaskCanvases.set(bidM, mc);
+            }}
+          }}
+          if (nTotM > 0) {{
+            emMaskSummary = {{
+              available: true,
+              dark_fraction: nDarkM / nTotM,
+              bright_fraction: nBrightM / nTotM,
+              n_dark_pixels: nDarkM,
+              n_bright_pixels: nBrightM,
+            }};
+          }}
+        }}
+      }} catch (_me) {{}}
+    }}
     if (mf && mf.keys().includes("images")) {{
       const imDs = mf.get("images");
       const shape = Array.from(imDs.shape || []).map(Number); // [N, H, W]
@@ -6684,7 +9510,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           bank: bid, az_min: azMin, az_max: azMax, y_min: yMin, y_max: yMax, el_min: elMin, el_max: elMax,
           corners, corners_sph: cornersSph,
           mesh, mesh_sph: meshSph,
-          outline, outline_sph: outlineSph, _grayCanvas: bankGrayCanvases.get(bid) || null,
+          outline, outline_sph: outlineSph,
+          _grayCanvas: bankGrayCanvases.get(bid) || null,
+          _maskCanvas: bankMaskCanvases.get(bid) || null,
         }});
       }}
     }}
@@ -7051,6 +9879,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       d_min: dMinNew,
       goniometer_R: Rrun,
       cell,
+      em_mask_summary: emMaskSummary,
       peaks: peaksOut,
       sample_peaks: peaksOut,
       zones: zonesOut,
@@ -7063,6 +9892,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   // Live Galaxy / NOVA / Pulsar GPU job orchestration
   const galaxyBridge = {{
     mode: "none", // "nova" | "galaxy_iframe" | "none"
+    galaxyConnected: false,
     historyId: null,
     datasets: [],
     stepArtifacts: {{}},
@@ -7088,67 +9918,84 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const stageKeys = ["reduce", "solve", "integrate", "merge"];
     const stageTitles = ["1. Reduce", "2. Solve", "3. Integrate", "4. Merge"];
     const pIdx = Math.min(3, Math.max(0, state.currentPipelineIdx));
-    const stageId = (PIPELINE[pIdx] && PIPELINE[pIdx].stage_id) || stageKeys[pIdx] || "solve";
-    const stageTitle = stageTitles[pIdx] || (PIPELINE[pIdx] && PIPELINE[pIdx].name) || stageId.toUpperCase();
+    const maxValidCompleted = typeof galaxyBridge.maxValidCompletedSteps === "number"
+      ? galaxyBridge.maxValidCompletedSteps
+      : pipelineIdxForArtifactKind(DATA.artifact_kind);
 
-    const byName = new Map();
-    const srvList = (galaxyBridge.stepArtifacts && galaxyBridge.stepArtifacts[stageId]) || [];
-    srvList.forEach(it => {{
-      if (it && it.name) byName.set(it.name, {{ ...it }});
-    }});
-    (galaxyBridge.datasets || []).forEach(ds => {{
-      if (ds.state && ds.state !== "ok") return;
-      const bname = String(ds.name || "").split("/").pop();
-      if (!bname) return;
-      if (classifyArtifactStageClient(bname) !== stageId) return;
-      const cur = byName.get(bname) || {{ name: bname, stage_id: stageId }};
-      if (ds.id) cur.dataset_id = ds.id;
-      if (ds.hid) cur.hid = ds.hid;
-      byName.set(bname, cur);
-    }});
+    const groups = [];
+    for (let sIdx = 0; sIdx < Math.min(stageKeys.length, maxValidCompleted); sIdx++) {{
+      const sId = (PIPELINE[sIdx] && PIPELINE[sIdx].stage_id) || stageKeys[sIdx];
+      const sTitle = stageTitles[sIdx] || (PIPELINE[sIdx] && PIPELINE[sIdx].name) || sId.toUpperCase();
+      const byName = new Map();
+      const srvList = (galaxyBridge.stepArtifacts && galaxyBridge.stepArtifacts[sId]) || [];
+      srvList.forEach(it => {{
+        if (it && it.name) byName.set(it.name, {{ ...it }});
+      }});
+      (galaxyBridge.datasets || []).forEach(ds => {{
+        if (ds.state && ds.state !== "ok") return;
+        const bname = String(ds.name || "").split("/").pop();
+        if (!bname) return;
+        if (classifyArtifactStageClient(bname) !== sId) return;
+        const cur = byName.get(bname) || {{ name: bname, stage_id: sId }};
+        if (ds.id && !cur.dataset_id) cur.dataset_id = ds.id;
+        if (ds.hid && !cur.hid) cur.hid = ds.hid;
+        byName.set(bname, cur);
+      }});
+      if (byName.size > 0) {{
+        groups.push({{ sIdx, sId, sTitle, items: Array.from(byName.values()) }});
+      }}
+    }}
 
     filesDrawer.innerHTML = "";
-    const lbl = document.createElement("span");
-    lbl.style.color = "var(--accent-gold)";
-    lbl.style.fontWeight = "700";
-    lbl.textContent = `${{stageTitle.toUpperCase()}} FILES:`;
-    filesDrawer.appendChild(lbl);
-
-    const items = Array.from(byName.values());
-    if (items.length === 0) {{
+    if (groups.length === 0) {{
+      const lbl = document.createElement("span");
+      lbl.style.color = "var(--accent-gold)";
+      lbl.style.fontWeight = "700";
+      lbl.textContent = "FILES:";
+      filesDrawer.appendChild(lbl);
       const emptyEl = document.createElement("span");
       emptyEl.style.color = "var(--text-dim)";
-      emptyEl.textContent = `No stored artifacts yet for ${{stageTitle}} (use < Walk > arrows to switch steps).`;
+      const nextTitle = stageTitles[pIdx] || "1. Reduce";
+      emptyEl.textContent = `No stored artifacts yet (pending step: ${{nextTitle}}).`;
       filesDrawer.appendChild(emptyEl);
       return;
     }}
 
-    items.forEach(item => {{
-      const a = document.createElement("a");
-      a.className = "file-dl-pill";
-      const qs = new URLSearchParams();
-      if (item.name) qs.set("name", item.name);
-      if (item.dataset_id) qs.set("dataset_id", item.dataset_id);
-      if (galaxyBridge.mode === "galaxy_iframe" && item.dataset_id && !item.has_local) {{
-        a.href = `/api/datasets/${{encodeURIComponent(item.dataset_id)}}/display?to_ext=${{encodeURIComponent(item.name.split(".").pop() || "h5")}}`;
-      }} else {{
-        a.href = `api/artifacts/download?${{qs.toString()}}`;
+    groups.forEach((grp, gIdx) => {{
+      if (gIdx > 0) {{
+        const sep = document.createElement("span");
+        sep.style.color = "rgba(148, 163, 184, 0.35)";
+        sep.style.margin = "0 4px";
+        sep.textContent = "│";
+        filesDrawer.appendChild(sep);
       }}
-      a.setAttribute("download", item.name);
-      const sizeStr = typeof item.size_bytes === "number" && item.size_bytes > 0
-        ? ` (${{item.size_bytes >= 1048576 ? (item.size_bytes / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(item.size_bytes / 1024)) + " KB"}})`
-        : (item.hid ? ` (#${{item.hid}})` : "");
-      a.textContent = `↓ ${{item.name}}${{sizeStr}}`;
-      a.title = `Download ${{item.name}} (${{stageTitle}}) to local computer`;
-      filesDrawer.appendChild(a);
-    }});
+      const isFocusStage = grp.sIdx === pIdx || (pIdx >= maxValidCompleted && grp.sIdx === maxValidCompleted - 1);
+      const lbl = document.createElement("span");
+      lbl.style.color = isFocusStage ? "var(--accent-gold)" : "var(--text-dim)";
+      lbl.style.fontWeight = "700";
+      lbl.textContent = `${{grp.sTitle.toUpperCase()}}:`;
+      filesDrawer.appendChild(lbl);
 
-    const hintEl = document.createElement("span");
-    hintEl.style.color = "var(--text-dim)";
-    hintEl.style.marginLeft = "auto";
-    hintEl.style.fontSize = "0.58rem";
-    hintEl.textContent = "Switch step with < Walk >";
-    filesDrawer.appendChild(hintEl);
+      grp.items.forEach(item => {{
+        const a = document.createElement("a");
+        a.className = "file-dl-pill";
+        const qs = new URLSearchParams();
+        if (item.name) qs.set("name", item.name);
+        if (item.dataset_id) qs.set("dataset_id", item.dataset_id);
+        if (galaxyBridge.mode === "galaxy_iframe" && item.dataset_id && !item.has_local) {{
+          a.href = `/api/datasets/${{encodeURIComponent(item.dataset_id)}}/display?to_ext=${{encodeURIComponent(item.name.split(".").pop() || "h5")}}`;
+        }} else {{
+          a.href = `api/artifacts/download?${{qs.toString()}}`;
+        }}
+        a.setAttribute("download", item.name);
+        const sizeStr = typeof item.size_bytes === "number" && item.size_bytes > 0
+          ? ` (${{item.size_bytes >= 1048576 ? (item.size_bytes / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(item.size_bytes / 1024)) + " KB"}})`
+          : (item.hid ? ` (#${{item.hid}})` : "");
+        a.textContent = `↓ ${{item.name}}${{sizeStr}}`;
+        a.title = `Download ${{item.name}} (${{grp.sTitle}}) to local computer`;
+        filesDrawer.appendChild(a);
+      }});
+    }});
   }}
 
   const elGalaxyBadge = document.getElementById("galaxy-status-badge");
@@ -7157,16 +10004,92 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const btnLocalH5 = document.getElementById("btn-local-h5");
   const inpLocalH5 = document.getElementById("inp-local-h5");
 
+  const MAX_RECENT_HISTORY_ITEMS = 10;
+  galaxyBridge.touchedTimes = galaxyBridge.touchedTimes || {{}};
+
+  function getDatasetTouchScore(d) {{
+    if (!d) return 0;
+    const clientTouch = Number((galaxyBridge.touchedTimes && galaxyBridge.touchedTimes[d.id]) || 0);
+    const srvTouch = Number(d.touched_at || 0);
+    const utMs = d.update_time ? Date.parse(String(d.update_time).endsWith("Z") ? d.update_time : `${{d.update_time}}Z`) : 0;
+    const utSec = Number.isFinite(utMs) && utMs > 0 ? utMs / 1000.0 : 0;
+    return Math.max(clientTouch, srvTouch, utSec);
+  }}
+
+  function sortDatasetsMostRecentFirst(list) {{
+    return [...(list || [])].sort((a, b) => {{
+      const ta = getDatasetTouchScore(a);
+      const tb = getDatasetTouchScore(b);
+      if (Math.abs(tb - ta) > 1e-3) return tb - ta;
+      return (Number(b && b.hid) || 0) - (Number(a && a.hid) || 0);
+    }});
+  }}
+
+  function markDatasetTouchedClient(dsId) {{
+    if (!dsId) return;
+    galaxyBridge.touchedTimes = galaxyBridge.touchedTimes || {{}};
+    galaxyBridge.touchedTimes[dsId] = Date.now() / 1000.0;
+    populateGalaxyH5Selector();
+  }}
+
+  function inferDatasetExtensionClient(d) {{
+    const rawName = String((d && d.name) || "").replace(/\\s*\\([^)]*\\)\\s*$/, "").trim();
+    const base = rawName.split("/").pop().toLowerCase();
+    if (/^dataset_[0-9a-f-]+\\.dat$/i.test(base) || base.endsWith(".dat")) return "dat";
+    if (base.endsWith(".nxs.h5") || base.endsWith(".nxs")) return "nxs.h5";
+    if (base.endsWith(".h5") || base.endsWith(".hdf5")) return "h5";
+    if (base.endsWith(".mtz")) return "mtz";
+    if (base.endsWith(".json")) return "json";
+    if (base.endsWith(".html") || base.endsWith(".htm")) return "html";
+    if (base.endsWith(".png")) return "png";
+    if (base.endsWith(".jpg") || base.endsWith(".jpeg")) return "jpg";
+    if (base.endsWith(".svg")) return "svg";
+    if (base.endsWith(".log") || base.endsWith(".txt")) return "txt";
+    return String((d && d.extension) || "data").toLowerCase();
+  }}
+
+  function hasActiveDetectorGeometryForMtz() {{
+    if (!DATA || DATA.artifact_kind === "empty") return false;
+    const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
+    const hasPeaksOrUb =
+      (Array.isArray(PEAKS) && PEAKS.length > 0) ||
+      (Array.isArray(SAMPLE_PEAKS) && SAMPLE_PEAKS.length > 0) ||
+      (Array.isArray(DATA.ub_matrix) && DATA.ub_matrix.length === 3);
+    return hasPanels && hasPeaksOrUb;
+  }}
+
+  function classifyGalaxyDatasetLoadability(d) {{
+    const st = String((d && d.state) || "ok").toLowerCase();
+    const ext = inferDatasetExtensionClient(d);
+    if (st !== "ok") {{
+      return {{ canLoad: false, ext, hint: st }};
+    }}
+    if (ext === "h5" || ext === "hdf5" || ext === "nxs.h5" || ext === "nxs") {{
+      return {{ canLoad: true, ext, hint: "" }};
+    }}
+    if (ext === "mtz") {{
+      if (hasActiveDetectorGeometryForMtz()) {{
+        return {{ canLoad: true, ext: "mtz", hint: "ref spots" }};
+      }}
+      return {{ canLoad: false, ext: "mtz", hint: "needs geometry" }};
+    }}
+    return {{ canLoad: false, ext, hint: "" }};
+  }}
+
   function populateGalaxyH5Selector() {{
     if (!selGalaxyH5) return;
-    const h5s = (galaxyBridge.datasets || []).filter(
-      d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
-    );
+    const prevVal = selGalaxyH5.value;
+    const allSorted = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []);
+    const h5s = allSorted.filter(d => {{
+      const ext = inferDatasetExtensionClient(d);
+      return d.state === "ok" && (ext === "h5" || ext === "hdf5" || ext === "nxs.h5" || ext === "nxs");
+    }});
+    const recentH5s = h5s.slice(0, MAX_RECENT_HISTORY_ITEMS);
     selGalaxyH5.innerHTML = "";
     const optHeader = document.createElement("option");
     optHeader.value = "";
     optHeader.textContent = h5s.length > 0
-      ? `Data Source (${{h5s.length}} in History)...`
+      ? `Data Source (${{recentH5s.length}}${{h5s.length > recentH5s.length ? "/" + h5s.length : ""}} recent)...`
       : "Data Source...";
     selGalaxyH5.appendChild(optHeader);
 
@@ -7177,16 +10100,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     optNeutron.textContent = "Neutron data (SNS / HFIR)...";
     grpIngest.appendChild(optNeutron);
 
+    const optFromGalaxy = document.createElement("option");
+    optFromGalaxy.value = "__action_galaxy_dataset__";
+    optFromGalaxy.textContent = "From Galaxy...";
+    grpIngest.appendChild(optFromGalaxy);
+
     const optLocal = document.createElement("option");
     optLocal.value = "__action_local_file__";
     optLocal.textContent = "From local computer...";
     grpIngest.appendChild(optLocal);
     selGalaxyH5.appendChild(grpIngest);
 
-    if (h5s.length > 0) {{
+    if (recentH5s.length > 0) {{
       const grpHist = document.createElement("optgroup");
-      grpHist.label = "Galaxy History (.h5)";
-      h5s.forEach(d => {{
+      grpHist.label = h5s.length > MAX_RECENT_HISTORY_ITEMS
+        ? `Galaxy History (Recent ${{recentH5s.length}} of ${{h5s.length}})`
+        : `Galaxy History (Recent ${{recentH5s.length}})`;
+      recentH5s.forEach(d => {{
         const opt = document.createElement("option");
         opt.value = d.id;
         opt.textContent = `#${{d.hid || ""}} ${{d.name}}`;
@@ -7194,6 +10124,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
       selGalaxyH5.appendChild(grpHist);
     }}
+    if (prevVal && !prevVal.startsWith("__action_") && recentH5s.some(d => d.id === prevVal)) {{
+      selGalaxyH5.value = prevVal;
+    }}
+    if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
 
   // Modal Dialog: Load Neutron Data (IPTS+run range or explicit file paths)
@@ -7218,6 +10152,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     multi_run_note: "",
     lastClickedRun: null,
     loading: false,
+    reqSeq: 0,
   }};
   let ndOncatAuthPollTimer = null;
 
@@ -7330,16 +10265,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function parseRunRangeSpec(specStr) {{
     const runs = [];
-    String(specStr || "").split(/[,\\s]+/).forEach(tok => {{
+    const seen = new Set();
+    const norm = String(specStr || "").replace(/\\s*(\\.\\.|[-–:/])\\s*/g, "$1");
+    norm.split(/[,\\s]+/).forEach(tok => {{
       const t = tok.trim();
       if (!t) return;
-      const m = t.match(/^(\\d+)\\s*[-–:]\\s*(\\d+)$/);
+      const m = t.match(/^(\\d+)(?:\\.\\.|[-–:])(\\d+)(?:(?:\\.\\.|[/:])(\\d+)?)?$/);
       if (m) {{
         const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+        const step = (m[3] !== undefined && m[3] !== "") ? parseInt(m[3], 10) : 1;
+        if (!Number.isFinite(step) || step <= 0) return;
         const lo = Math.min(a, b), hi = Math.max(a, b);
-        for (let r = lo; r <= Math.min(hi, lo + 500); r++) runs.push(r);
+        for (let r = lo, count = 0; r <= hi && count < 20000; r += step, count++) {{
+          if (!seen.has(r)) {{
+            seen.add(r);
+            runs.push(r);
+          }}
+        }}
       }} else if (/^\\d+$/.test(t)) {{
-        runs.push(parseInt(t, 10));
+        const r = parseInt(t, 10);
+        if (!seen.has(r)) {{
+          seen.add(r);
+          runs.push(r);
+        }}
       }}
     }});
     return runs;
@@ -7382,12 +10330,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return runs.map(r => runLocMap.get(Number(r)) || `/${{fac}}/${{inst}}/IPTS-${{iptsRaw}}/nexus/${{inst}}_${{r}}.nxs.h5`);
   }}
 
-  function renderOncatProjectsList() {{
+  function renderOncatProjectsList(scrollToSelected = false) {{
     const listEl = document.getElementById("nd-ipts-list");
     const countEl = document.getElementById("nd-ipts-count");
     const filterVal = (document.getElementById("nd-ipts-filter")?.value || "").trim().toLowerCase();
     const curIpts = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
     if (!listEl) return;
+    const prevScrollTop = listEl.scrollTop;
     const exps = (ndOncatCatalog.experiments || []).filter(e => {{
       if (!filterVal) return true;
       const hay = `${{e.ipts}} ${{e.id}} ${{e.title || ""}} ${{e.run_ranges || ""}} ${{e.latest_date || ""}}`.toLowerCase();
@@ -7429,15 +10378,30 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       row.title = `IPTS-${{exp.ipts}} (${{exp.n_runs || 0}} runs)\\n${{exp.title ? "Samples: " + exp.title + "\\n" : ""}}Ranges: ${{exp.run_ranges || "—"}}`;
       row.appendChild(sub);
 
-      row.addEventListener("click", () => {{
+      const selectExp = () => {{
         const iptsInput = document.getElementById("nd-ipts");
-        if (iptsInput) iptsInput.value = String(exp.ipts);
-        fetchOncatCatalog(String(exp.ipts), true);
+        const nextIpts = String(exp.ipts);
+        if (iptsInput && iptsInput.value.trim().replace(/^IPTS-/i, "") === nextIpts && !ndOncatCatalog.loading) {{
+          return;
+        }}
+        if (iptsInput && iptsInput.value !== nextIpts) {{
+          const runsInput = document.getElementById("nd-runs");
+          if (runsInput) runsInput.value = "";
+        }}
+        if (iptsInput) iptsInput.value = nextIpts;
+        fetchOncatCatalog(nextIpts, false);
+      }};
+      row.addEventListener("mousedown", (ev) => {{
+        if (ev.button !== 0) return;
+        ev.preventDefault();
+        selectExp();
       }});
+      row.addEventListener("click", selectExp);
       if (isSel) activeRow = row;
       listEl.appendChild(row);
     }});
-    if (activeRow && typeof activeRow.scrollIntoView === "function") {{
+    listEl.scrollTop = prevScrollTop;
+    if (scrollToSelected && activeRow && typeof activeRow.scrollIntoView === "function") {{
       activeRow.scrollIntoView({{ block: "nearest" }});
     }}
   }}
@@ -7474,9 +10438,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     const selectedSet = new Set(parseRunRangeSpec(document.getElementById("nd-runs")?.value || ""));
+    const filterRangeRuns = (filterVal && /^[\\d\\s,.:/–-]+$/.test(filterVal))
+      ? new Set(parseRunRangeSpec(filterVal))
+      : null;
     const allRuns = ndOncatCatalog.runs || [];
     const filtered = allRuns.filter(r => {{
       if (!filterVal) return true;
+      if (filterRangeRuns && filterRangeRuns.size > 0 && filterRangeRuns.has(Number(r.run))) return true;
       const durHms = formatRunDurationHMS(r);
       const hay = `${{r.run}} ${{r.title || ""}} ${{r.sample_name || ""}} ${{r.angles || ""}} ${{durHms}} ${{r.created || ""}}`.toLowerCase();
       return hay.includes(filterVal);
@@ -7488,7 +10456,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (filtered.length === 0) {{
       const empty = document.createElement("div");
       empty.style.cssText = "padding:8px;color:var(--text-dim);font-size:0.64rem;";
-      empty.textContent = ndOncatCatalog.loading ? "Loading runs & titles from ONCat…" : "No matching runs in this IPTS";
+      empty.textContent = ndOncatCatalog.loading
+        ? "Loading runs & titles from ONCat…"
+        : (!curIpts ? "Select an IPTS project on the left to list runs" : "No matching runs in this IPTS");
       listEl.appendChild(empty);
       return;
     }}
@@ -7581,14 +10551,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const inst = (document.getElementById("nd-instrument")?.value || "CG4D").trim();
     const iptsEl = document.getElementById("nd-ipts");
     const iptsRaw = (iptsOverride !== null ? String(iptsOverride) : (iptsEl?.value || "")).trim().replace(/^IPTS-/i, "");
+    const reqId = ++ndOncatCatalog.reqSeq;
     ndOncatCatalog.loading = true;
-    renderOncatProjectsList();
+    renderOncatProjectsList(false);
     renderOncatRunsList(false);
     try {{
       const qs = new URLSearchParams({{ facility: fac, instrument: inst, ipts: iptsRaw }});
       const r = await fetch(`api/pipeline/oncat_catalog?${{qs.toString()}}`);
       if (!r.ok) throw new Error(`HTTP ${{r.status}}`);
       const data = await r.json();
+      if (reqId !== ndOncatCatalog.reqSeq) return;
       ndOncatCatalog.experiments = data.experiments || [];
       ndOncatCatalog.runs = data.runs || [];
       ndOncatCatalog.oncat_authenticated = Boolean(data.oncat_authenticated);
@@ -7597,25 +10569,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ndOncatCatalog.multi_run_note = data.multi_run_note || "";
       ndOncatCatalog.loading = false;
       renderOncatAuthBar();
-      if (data.ipts && iptsEl && (!iptsEl.value.trim() || iptsOverride !== null)) {{
-        iptsEl.value = String(data.ipts);
-      }}
       const runsEl = document.getElementById("nd-runs");
-      if (runsEl && ndOncatCatalog.runs.length > 0) {{
-        const curSelected = parseRunRangeSpec(runsEl.value);
-        const runSet = new Set(ndOncatCatalog.runs.map(x => Number(x.run)));
-        const hasOverlap = curSelected.some(n => runSet.has(Number(n)));
-        if (autoSelectLatestRun || !hasOverlap) {{
-          const lastRun = ndOncatCatalog.runs[ndOncatCatalog.runs.length - 1].run;
-          runsEl.value = String(lastRun);
-        }}
+      if (runsEl && autoSelectLatestRun && ndOncatCatalog.runs.length > 0 && !runsEl.value.trim()) {{
+        const lastRun = ndOncatCatalog.runs[ndOncatCatalog.runs.length - 1].run;
+        runsEl.value = String(lastRun);
       }}
-      renderOncatProjectsList();
+      renderOncatProjectsList(false);
       renderOncatRunsList(true);
       updateNeutronDialogPreview();
     }} catch (_err) {{
+      if (reqId !== ndOncatCatalog.reqSeq) return;
       ndOncatCatalog.loading = false;
-      renderOncatProjectsList();
+      renderOncatProjectsList(false);
       renderOncatRunsList(false);
     }}
   }}
@@ -7648,7 +10613,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     statusBox.style.borderColor = "rgba(56,189,248,0.45)";
     msgEl.style.color = "#38bdf8";
-    msgEl.textContent = `Verifying ${{paths.length}} run(s) via NDIP Load Neutron Data...`;
+    msgEl.textContent = `Verifying ${{paths.length}} run(s) (NDIP / local /SNS, /HFIR)...`;
     if (sugBtn) sugBtn.style.display = "none";
     try {{
       const r = await fetch("api/pipeline/check_neutron_paths", {{
@@ -7754,28 +10719,919 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (statusBox) statusBox.style.borderColor = "rgba(56,189,248,0.25)";
       if (msgEl) {{
         msgEl.style.color = "var(--text-dim)";
-        msgEl.textContent = `Ready to verify ${{paths.length}} run(s) via NDIP Load Neutron Data`;
+        msgEl.textContent = `Ready to verify ${{paths.length}} run(s) (NDIP or local /SNS, /HFIR)`;
       }}
     }}
   }}
 
+  const UNIT_CELL_STORAGE_KEY = "subhkl_unit_cell_history_v1";
+
+  function extractDatasetUnitCellMeta(d) {{
+    if (!d || typeof d !== "object") return null;
+    if (Array.isArray(d.cell) && d.cell.length === 6) {{
+      const nums = d.cell.map(Number);
+      if (nums.slice(0, 3).every(v => Number.isFinite(v) && v > 0) && nums.slice(3, 6).every(v => Number.isFinite(v) && v > 10 && v < 180)) {{
+        return {{
+          cell: nums.map(v => Number(v.toFixed(4))),
+          space_group: String(d.space_group || "").trim(),
+          instrument: String(d.instrument || "").trim(),
+        }};
+      }}
+    }}
+    if (typeof d.annotation === "string" && d.annotation.trim().startsWith("{{")) {{
+      try {{
+        const obj = JSON.parse(d.annotation);
+        const rawC = obj && (obj.subhkl_cell || obj.cell);
+        if (Array.isArray(rawC) && rawC.length === 6) {{
+          const nums = rawC.map(Number);
+          if (nums.slice(0, 3).every(v => Number.isFinite(v) && v > 0) && nums.slice(3, 6).every(v => Number.isFinite(v) && v > 10 && v < 180)) {{
+            return {{
+              cell: nums.map(v => Number(v.toFixed(4))),
+              space_group: String(obj.space_group || obj.sg || "").trim(),
+              instrument: String(obj.instrument || "").trim(),
+            }};
+          }}
+        }}
+      }} catch (_e) {{}}
+    }}
+    return null;
+  }}
+
+  function recordUnitCellInLocalStorage(cell, spaceGroup, label = "") {{
+    if (!Array.isArray(cell) || cell.length !== 6) return;
+    const nums = cell.map(Number);
+    if (nums.slice(0, 3).some(v => !Number.isFinite(v) || v <= 0)) return;
+    if (nums.slice(3, 6).some(v => !Number.isFinite(v) || v <= 10 || v >= 180)) return;
+    const sg = String(spaceGroup || "").trim();
+    try {{
+      const raw = localStorage.getItem(UNIT_CELL_STORAGE_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      const arr = Array.isArray(list) ? list : [];
+      const sig = `${{nums.map(v => v.toFixed(2)).join(",")}}|${{sg.toLowerCase().replace(/\\s+/g, "")}}`;
+      const filtered = arr.filter(it => it && it.sig !== sig);
+      filtered.unshift({{
+        sig,
+        cell: nums.map(v => Number(v.toFixed(4))),
+        space_group: sg,
+        label: String(label || "Recent").trim(),
+        ts: Date.now(),
+      }});
+      localStorage.setItem(UNIT_CELL_STORAGE_KEY, JSON.stringify(filtered.slice(0, 25)));
+    }} catch (_e) {{}}
+  }}
+
+  function getKnownUnitCellHistory() {{
+    const out = [];
+    const seen = new Set();
+    const addEntry = (cell, spaceGroup, label, hid = null, dsId = "") => {{
+      if (!Array.isArray(cell) || cell.length !== 6) return;
+      const nums = cell.map(Number);
+      if (nums.slice(0, 3).some(v => !Number.isFinite(v) || v <= 0)) return;
+      if (nums.slice(3, 6).some(v => !Number.isFinite(v) || v <= 10 || v >= 180)) return;
+      const sg = String(spaceGroup || "").trim();
+      const sig = `${{nums.map(v => v.toFixed(2)).join(",")}}|${{sg.toLowerCase().replace(/\\s+/g, "")}}`;
+      if (seen.has(sig)) return;
+      seen.add(sig);
+      out.push({{
+        sig,
+        cell: nums.map(v => Number(v.toFixed(4))),
+        space_group: sg,
+        label: String(label || "History").trim(),
+        hid,
+        dataset_id: dsId,
+      }});
+    }};
+
+    // 1. Galaxy history datasets (ordered most recently touched first)
+    const sortedDs = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []);
+    sortedDs.forEach(d => {{
+      const meta = extractDatasetUnitCellMeta(d);
+      if (meta && meta.cell) {{
+        const dsLabel = `${{d.hid ? "#" + d.hid + " " : ""}}${{d.name || d.id || "Galaxy dataset"}}`;
+        addEntry(meta.cell, meta.space_group, dsLabel, d.hid || null, d.id || "");
+      }}
+    }});
+
+    // 2. LocalStorage recent unit cells
+    try {{
+      const raw = localStorage.getItem(UNIT_CELL_STORAGE_KEY);
+      const list = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(list)) {{
+        list.forEach(it => {{
+          if (it && Array.isArray(it.cell)) {{
+            addEntry(it.cell, it.space_group, it.label || "Recent entry");
+          }}
+        }});
+      }}
+    }} catch (_e) {{}}
+
+    // 3. Currently loaded dataset cell (if non-empty)
+    if (DATA && DATA.artifact_kind !== "empty" && Array.isArray(DATA.cell) && DATA.cell.length === 6) {{
+      addEntry(DATA.cell, DATA.space_group || "", "Active session");
+    }}
+    return out;
+  }}
+
+  function formatUnitCellEntrySummary(entry) {{
+    if (!entry || !Array.isArray(entry.cell) || entry.cell.length !== 6) return "";
+    const c = entry.cell.map(v => Number(v).toFixed(2).replace(/\\.00$/, ""));
+    const sgTxt = entry.space_group ? `${{entry.space_group}} — ` : "";
+    const srcTxt = entry.label ? ` (${{entry.label}})` : "";
+    return `${{sgTxt}}${{c[0]}}, ${{c[1]}}, ${{c[2]}} Å | ${{c[3]}}, ${{c[4]}}, ${{c[5]}}°${{srcTxt}}`;
+  }}
+
+  function styleUnitCellFieldState(el, prefix, mode, tooltip = "") {{
+    if (!el) return;
+    el.readOnly = false;
+    el.style.cursor = "";
+    el.title = tooltip || "";
+    if (el.dataset.tentativePreview === "1") {{
+      el.style.opacity = "0.9";
+      el.style.background = prefix === "nd" ? "#070913" : "";
+      el.style.color = "rgba(148, 163, 184, 0.68)";
+      el.style.fontStyle = "italic";
+      el.style.borderStyle = "dashed";
+      return;
+    }}
+    el.style.fontStyle = "normal";
+    if (el.dataset.confirmedFinal === "1" || mode === "normal") {{
+      el.style.opacity = "1";
+      el.style.background = prefix === "nd" ? "#070913" : "";
+      el.style.color = prefix === "nd" ? "var(--text-main)" : "";
+      el.style.borderStyle = "solid";
+    }} else if (mode === "linked") {{
+      el.style.opacity = "0.78";
+      el.style.background = prefix === "nd" ? "rgba(15,23,42,0.65)" : "";
+      el.style.color = "rgba(148, 163, 184, 0.72)";
+      el.style.borderStyle = "dashed";
+    }} else if (mode === "fixed") {{
+      el.style.opacity = "0.72";
+      el.style.background = prefix === "nd" ? "rgba(15,23,42,0.5)" : "";
+      el.style.color = "rgba(148, 163, 184, 0.68)";
+      el.style.borderStyle = "dashed";
+    }}
+  }}
+
+  function applyUnitCellSymmetryConstraints(prefix = "nd", opts = {{}}) {{
+    const sgEl = document.getElementById(`${{prefix}}-sg`);
+    const sgRaw = sgEl
+      ? (sgEl.dataset.tentativePreview === "1" ? String(sgEl.dataset.confirmedValue || "") : sgEl.value)
+      : "";
+    const sgVal = sgRaw.trim();
+    const sym = resolveSpaceGroupSymmetry(sgVal);
+    if (prefix === "nd") {{
+      const badgeEl = document.getElementById("nd-symmetry-badge");
+      if (badgeEl) {{
+        badgeEl.textContent = sym.summary;
+        const isConstrained = Object.keys(sym.linked_lengths).length > 0 ||
+          Object.keys(sym.linked_angles).length > 0 ||
+          Object.keys(sym.fixed_angles).length > 0;
+        badgeEl.style.borderColor = isConstrained ? "rgba(52,211,153,0.55)" : "rgba(56,189,248,0.35)";
+        badgeEl.style.color = isConstrained ? "#34d399" : "var(--accent-cyan)";
+      }}
+    }}
+
+    if (opts.resetManualOverrides) {{
+      ["a", "b", "c", "alpha", "beta", "gamma"].forEach(k => {{
+        const el = document.getElementById(`${{prefix}}-${{k}}`);
+        if (el) {{
+          delete el.dataset.symmetryManualOverride;
+          delete el.dataset.confirmedFinal;
+        }}
+      }});
+    }}
+
+    const labelMap = {{
+      a: "a (Å)",
+      b: sym.linked_lengths.b ? `b=${{sym.linked_lengths.b}} (Å)` : "b (Å)",
+      c: sym.linked_lengths.c ? `c=${{sym.linked_lengths.c}} (Å)` : "c (Å)",
+      alpha: sym.fixed_angles.alpha !== undefined ? `α=${{sym.fixed_angles.alpha}}°` : "α (°)",
+      beta: sym.fixed_angles.beta !== undefined
+        ? `β=${{sym.fixed_angles.beta}}°`
+        : (sym.linked_angles.beta ? `β=${{sym.linked_angles.beta}} (°)` : "β (°)"),
+      gamma: sym.fixed_angles.gamma !== undefined
+        ? `γ=${{sym.fixed_angles.gamma}}°`
+        : (sym.linked_angles.gamma ? `γ=${{sym.linked_angles.gamma}} (°)` : "γ (°)"),
+    }};
+    if (prefix === "nd") {{
+      Object.entries(labelMap).forEach(([k, txt]) => {{
+        const lblEl = document.getElementById(`nd-lbl-${{k}}`);
+        if (lblEl) lblEl.textContent = txt;
+      }});
+    }}
+
+    ["a", "b", "c"].forEach(k => {{
+      const el = document.getElementById(`${{prefix}}-${{k}}`);
+      if (!el) return;
+      const masterKey = sym.linked_lengths[k];
+      if (masterKey) {{
+        const srcEl = document.getElementById(`${{prefix}}-${{masterKey}}`);
+        const srcVal = srcEl ? srcEl.value.trim() : "";
+        const curVal = el.value.trim();
+        const hasDifferentExplicit = opts.preserveExplicitValues &&
+          curVal !== "" &&
+          srcVal !== "" &&
+          Math.abs(parseFloat(curVal) - parseFloat(srcVal)) > 1e-3;
+        if (el.dataset.symmetryManualOverride === "1" || hasDifferentExplicit) {{
+          el.dataset.symmetryManualOverride = "1";
+          delete el.dataset.symmetryLocked;
+          el.dataset.symmetryMaster = masterKey;
+          styleUnitCellFieldState(
+            el,
+            prefix,
+            "normal",
+            `Manually overridden (${{sym.crystal_system}} proposal: ${{k}} = ${{masterKey}})`
+          );
+        }} else {{
+          if (srcVal !== "" && el.dataset.tentativePreview !== "1") {{
+            el.value = srcVal;
+          }}
+          el.dataset.symmetryLocked = "linked";
+          el.dataset.symmetryMaster = masterKey;
+          delete el.dataset.symmetryManualOverride;
+          styleUnitCellFieldState(
+            el,
+            prefix,
+            "linked",
+            `Proposed by ${{sym.crystal_system}} symmetry (${{k}} = ${{masterKey}}) — edit to override`
+          );
+        }}
+      }} else {{
+        delete el.dataset.symmetryLocked;
+        delete el.dataset.symmetryMaster;
+        delete el.dataset.symmetryManualOverride;
+        styleUnitCellFieldState(el, prefix, "normal", "");
+      }}
+    }});
+
+    ["alpha", "beta", "gamma"].forEach(k => {{
+      const el = document.getElementById(`${{prefix}}-${{k}}`);
+      if (!el) return;
+      const fixedVal = sym.fixed_angles[k];
+      const masterKey = sym.linked_angles[k];
+      if (fixedVal !== undefined) {{
+        const curVal = el.value.trim();
+        const hasDifferentExplicit = opts.preserveExplicitValues &&
+          curVal !== "" &&
+          Math.abs(parseFloat(curVal) - Number(fixedVal)) > 1e-3;
+        if (el.dataset.symmetryManualOverride === "1" || hasDifferentExplicit) {{
+          el.dataset.symmetryManualOverride = "1";
+          delete el.dataset.symmetryLocked;
+          delete el.dataset.symmetryMaster;
+          styleUnitCellFieldState(
+            el,
+            prefix,
+            "normal",
+            `Manually overridden (${{sym.crystal_system}} proposal: ${{k}} = ${{fixedVal}}°)`
+          );
+        }} else {{
+          if (el.dataset.tentativePreview !== "1") {{
+            el.value = String(fixedVal);
+          }}
+          el.dataset.symmetryLocked = "fixed";
+          delete el.dataset.symmetryMaster;
+          delete el.dataset.symmetryManualOverride;
+          styleUnitCellFieldState(
+            el,
+            prefix,
+            "fixed",
+            `Proposed at ${{fixedVal}}° by ${{sym.crystal_system}} symmetry — edit to override`
+          );
+        }}
+      }} else if (masterKey) {{
+        const srcEl = document.getElementById(`${{prefix}}-${{masterKey}}`);
+        const srcVal = srcEl ? srcEl.value.trim() : "";
+        const curVal = el.value.trim();
+        const hasDifferentExplicit = opts.preserveExplicitValues &&
+          curVal !== "" &&
+          srcVal !== "" &&
+          Math.abs(parseFloat(curVal) - parseFloat(srcVal)) > 1e-3;
+        if (el.dataset.symmetryManualOverride === "1" || hasDifferentExplicit) {{
+          el.dataset.symmetryManualOverride = "1";
+          delete el.dataset.symmetryLocked;
+          el.dataset.symmetryMaster = masterKey;
+          styleUnitCellFieldState(
+            el,
+            prefix,
+            "normal",
+            `Manually overridden (${{sym.crystal_system}} proposal: ${{k}} = ${{masterKey}})`
+          );
+        }} else {{
+          if (srcVal !== "" && el.dataset.tentativePreview !== "1") {{
+            el.value = srcVal;
+          }}
+          el.dataset.symmetryLocked = "linked";
+          el.dataset.symmetryMaster = masterKey;
+          delete el.dataset.symmetryManualOverride;
+          styleUnitCellFieldState(
+            el,
+            prefix,
+            "linked",
+            `Proposed by ${{sym.crystal_system}} symmetry (${{k}} = ${{masterKey}}) — edit to override`
+          );
+        }}
+      }} else {{
+        delete el.dataset.symmetryLocked;
+        delete el.dataset.symmetryMaster;
+        delete el.dataset.symmetryManualOverride;
+        styleUnitCellFieldState(el, prefix, "normal", "");
+      }}
+    }});
+    return sym;
+  }}
+
+  function mirrorLinkedUnitCellFields(prefix, changedKey) {{
+    const sgEl = document.getElementById(`${{prefix}}-sg`);
+    const sgVal = sgEl
+      ? (sgEl.dataset.tentativePreview === "1" ? String(sgEl.dataset.confirmedValue || "") : sgEl.value)
+      : "";
+    const sym = resolveSpaceGroupSymmetry(sgVal);
+    const srcEl = document.getElementById(`${{prefix}}-${{changedKey}}`);
+    if (!srcEl) return;
+    Object.entries(sym.linked_lengths).forEach(([targetKey, masterKey]) => {{
+      if (masterKey === changedKey) {{
+        const dstEl = document.getElementById(`${{prefix}}-${{targetKey}}`);
+        if (dstEl && dstEl.dataset.symmetryManualOverride !== "1") {{
+          dstEl.value = srcEl.value;
+          dstEl.dataset.symmetryLocked = "linked";
+          dstEl.dataset.symmetryMaster = masterKey;
+          delete dstEl.dataset.confirmedFinal;
+          styleUnitCellFieldState(
+            dstEl,
+            prefix,
+            "linked",
+            `Proposed by ${{sym.crystal_system}} symmetry (${{targetKey}} = ${{masterKey}}) — edit to override`
+          );
+        }}
+      }}
+    }});
+    Object.entries(sym.linked_angles).forEach(([targetKey, masterKey]) => {{
+      if (masterKey === changedKey) {{
+        const dstEl = document.getElementById(`${{prefix}}-${{targetKey}}`);
+        if (dstEl && dstEl.dataset.symmetryManualOverride !== "1") {{
+          dstEl.value = srcEl.value;
+          dstEl.dataset.symmetryLocked = "linked";
+          dstEl.dataset.symmetryMaster = masterKey;
+          delete dstEl.dataset.confirmedFinal;
+          styleUnitCellFieldState(
+            dstEl,
+            prefix,
+            "linked",
+            `Proposed by ${{sym.crystal_system}} symmetry (${{targetKey}} = ${{masterKey}}) — edit to override`
+          );
+        }}
+      }}
+    }});
+  }}
+
+  const DEFAULT_SPACE_GROUP_SUGGESTIONS = [
+    "P 1", "P 21", "C 2", "P 21 21 21", "P 21 21 2", "C 2 2 21", "F d d 2",
+    "P 41 21 2", "P 43 21 2", "I 41/a", "P 31 2 1", "P 32 2 1", "R 3 :H",
+    "R 3 :R", "R -3 m :R", "P 61 2 2", "P 65 2 2", "P 63/m m c", "I 2 3",
+    "P 21 3", "F d -3 m", "I a -3 d", "F m -3 m"
+  ];
+
+  let ndAutocompleteActiveField = null;
+  let ndAutocompleteItems = [];
+  let ndAutocompleteSelectedIndex = -1;
+
+  function clearTentativeUnitCellPreview() {{
+    const allKeys = ["sg", "a", "b", "c", "alpha", "beta", "gamma"];
+    let restoredAny = false;
+    allKeys.forEach(k => {{
+      const el = document.getElementById(`nd-${{k}}`);
+      if (!el) return;
+      if (el.dataset.tentativePreview === "1") {{
+        el.value = el.dataset.confirmedValue !== undefined ? el.dataset.confirmedValue : "";
+        if (el.dataset.wasConfirmedFinal === "1") {{
+          el.dataset.confirmedFinal = "1";
+        }} else {{
+          delete el.dataset.confirmedFinal;
+        }}
+        delete el.dataset.tentativePreview;
+        delete el.dataset.confirmedValue;
+        delete el.dataset.wasConfirmedFinal;
+        restoredAny = true;
+      }}
+    }});
+    if (restoredAny) {{
+      applyUnitCellSymmetryConstraints("nd", {{ preserveExplicitValues: true }});
+      const sgEl = document.getElementById("nd-sg");
+      if (sgEl) {{
+        sgEl.style.color = "var(--text-main)";
+        sgEl.style.fontStyle = "normal";
+        sgEl.style.borderStyle = "solid";
+      }}
+    }}
+  }}
+
+  function confirmTentativeUnitCellPreview() {{
+    const allKeys = ["sg", "a", "b", "c", "alpha", "beta", "gamma"];
+    let confirmedAny = false;
+    allKeys.forEach(k => {{
+      const el = document.getElementById(`nd-${{k}}`);
+      if (!el) return;
+      if (el.dataset.tentativePreview === "1") {{
+        delete el.dataset.tentativePreview;
+        delete el.dataset.confirmedValue;
+        delete el.dataset.wasConfirmedFinal;
+        el.dataset.confirmedFinal = "1";
+        el.style.color = "var(--text-main)";
+        el.style.fontStyle = "normal";
+        el.style.borderStyle = "solid";
+        el.style.opacity = "1";
+        confirmedAny = true;
+      }}
+    }});
+    if (confirmedAny) {{
+      applyUnitCellSymmetryConstraints("nd", {{ preserveExplicitValues: true }});
+    }}
+    return confirmedAny;
+  }}
+
+  function previewTentativeUnitCellEntry(entry, activeFieldKey) {{
+    if (!entry) return;
+    const allKeys = ["sg", "a", "b", "c", "alpha", "beta", "gamma"];
+    allKeys.forEach(k => {{
+      const el = document.getElementById(`nd-${{k}}`);
+      if (el && el.dataset.tentativePreview !== "1") {{
+        el.dataset.confirmedValue = el.value;
+        el.dataset.wasConfirmedFinal = el.dataset.confirmedFinal || "";
+      }}
+    }});
+    const cellKeys = ["a", "b", "c", "alpha", "beta", "gamma"];
+    if (activeFieldKey !== "sg" && entry.space_group) {{
+      const sgEl = document.getElementById("nd-sg");
+      if (sgEl) {{
+        sgEl.value = entry.space_group;
+        sgEl.dataset.tentativePreview = "1";
+        sgEl.style.color = "rgba(148, 163, 184, 0.68)";
+        sgEl.style.fontStyle = "italic";
+        sgEl.style.borderStyle = "dashed";
+      }}
+    }}
+    if (Array.isArray(entry.cell) && entry.cell.length === 6) {{
+      cellKeys.forEach((k, idx) => {{
+        if (k === activeFieldKey) return;
+        const el = document.getElementById(`nd-${{k}}`);
+        if (!el || !Number.isFinite(Number(entry.cell[idx]))) return;
+        el.value = String(Number(Number(entry.cell[idx]).toFixed(4)));
+        el.dataset.tentativePreview = "1";
+        styleUnitCellFieldState(el, "nd", "normal", "Tentative match preview — click or press Enter to confirm");
+      }});
+    }}
+  }}
+
+  function hideUnitCellAutocompleteDropdown(restoreTentative = true) {{
+    if (restoreTentative) {{
+      clearTentativeUnitCellPreview();
+    }}
+    ndAutocompleteActiveField = null;
+    ndAutocompleteItems = [];
+    ndAutocompleteSelectedIndex = -1;
+    const sugBox = document.getElementById("nd-cell-suggestions");
+    if (sugBox) {{
+      sugBox.style.display = "none";
+      sugBox.innerHTML = "";
+    }}
+  }}
+
+  function applyUnitCellEntryToDialog(entry, prefix = "nd") {{
+    if (!entry) return;
+    const keys = ["a", "b", "c", "alpha", "beta", "gamma"];
+    if (entry.space_group) {{
+      const sgEl = document.getElementById(`${{prefix}}-sg`);
+      if (sgEl) sgEl.value = entry.space_group;
+    }}
+    if (Array.isArray(entry.cell) && entry.cell.length === 6) {{
+      keys.forEach((k, idx) => {{
+        const el = document.getElementById(`${{prefix}}-${{k}}`);
+        if (el && Number.isFinite(Number(entry.cell[idx]))) {{
+          el.value = String(Number(Number(entry.cell[idx]).toFixed(4)));
+        }}
+      }});
+    }}
+    if (prefix === "nd") {{
+      ["sg", "a", "b", "c", "alpha", "beta", "gamma"].forEach(k => {{
+        const el = document.getElementById(`nd-${{k}}`);
+        if (el) {{
+          delete el.dataset.tentativePreview;
+          delete el.dataset.confirmedValue;
+          delete el.dataset.wasConfirmedFinal;
+          delete el.dataset.symmetryManualOverride;
+          if (el.value.trim() !== "") {{
+            el.dataset.confirmedFinal = "1";
+          }}
+          el.style.color = "var(--text-main)";
+          el.style.fontStyle = "normal";
+          el.style.borderStyle = "solid";
+          el.style.opacity = "1";
+        }}
+      }});
+    }}
+    applyUnitCellSymmetryConstraints(prefix, {{ preserveExplicitValues: true }});
+    if (prefix === "nd") {{
+      hideUnitCellAutocompleteDropdown(false);
+    }}
+  }}
+
+  function getConfirmedUnitCellInputs(activeFieldKey = null) {{
+    const fieldKeys = ["a", "b", "c", "alpha", "beta", "gamma"];
+    const confirmed = {{}};
+    fieldKeys.forEach((k, idx) => {{
+      const el = document.getElementById(`nd-${{k}}`);
+      if (!el) return;
+      const isTentative = el.dataset.tentativePreview === "1" && k !== activeFieldKey;
+      const isSymLocked = Boolean(el.dataset.symmetryLocked) && k !== activeFieldKey;
+      const raw = isTentative ? String(el.dataset.confirmedValue || "").trim() : el.value.trim();
+      if (raw !== "" && !isSymLocked) {{
+        confirmed[k] = {{ raw, num: parseFloat(raw), idx }};
+      }}
+    }});
+    const sgEl = document.getElementById("nd-sg");
+    const sgTentative = sgEl && sgEl.dataset.tentativePreview === "1" && activeFieldKey !== "sg";
+    const sgRaw = sgEl ? (sgTentative ? String(sgEl.dataset.confirmedValue || "").trim() : sgEl.value.trim()) : "";
+    const sgNorm = sgRaw.toLowerCase().replace(/\\s+/g, "");
+    return {{ confirmed, sgRaw, sgNorm }};
+  }}
+
+  function scoreHistoryEntryAgainstConfirmed(entry, confirmedState, excludeFieldKey = null) {{
+    let score = 0;
+    const {{ confirmed, sgNorm }} = confirmedState;
+    if (sgNorm && excludeFieldKey !== "sg") {{
+      const entrySgNorm = String(entry.space_group || "").toLowerCase().replace(/\\s+/g, "");
+      if (entrySgNorm === sgNorm) {{
+        score += 5;
+      }} else if (entrySgNorm && (entrySgNorm.includes(sgNorm) || sgNorm.includes(entrySgNorm))) {{
+        score += 2.5;
+      }}
+    }}
+    Object.entries(confirmed).forEach(([k, info]) => {{
+      if (k === excludeFieldKey) return;
+      const targetVal = Number(entry.cell[info.idx]);
+      const targetStr = String(Number(targetVal.toFixed(4)));
+      const targetFixed = targetVal.toFixed(2);
+      if (targetStr.startsWith(info.raw) || targetFixed.startsWith(info.raw)) {{
+        score += 4;
+      }} else if (Number.isFinite(info.num) && Math.abs(targetVal - info.num) <= 0.6) {{
+        score += 3 - Math.abs(targetVal - info.num);
+      }}
+    }});
+    return score;
+  }}
+
+  function populateUnitCellDatalists(activeFieldKey = null) {{
+    const sgDlEl = document.getElementById("subhkl-sg-datalist");
+    if (!sgDlEl) return;
+    const history = getKnownUnitCellHistory();
+    const confirmedState = getConfirmedUnitCellInputs(activeFieldKey);
+    const rankedSg = history
+      .map(entry => ({{
+        entry,
+        score: scoreHistoryEntryAgainstConfirmed(entry, confirmedState, "sg"),
+      }}))
+      .sort((a, b) => b.score - a.score);
+    const seenSg = new Set();
+    sgDlEl.innerHTML = "";
+    rankedSg.forEach(({{ entry }}) => {{
+      const sgStr = String(entry.space_group || "").trim();
+      if (!sgStr || seenSg.has(sgStr)) return;
+      seenSg.add(sgStr);
+      const opt = document.createElement("option");
+      opt.value = sgStr;
+      sgDlEl.appendChild(opt);
+    }});
+    DEFAULT_SPACE_GROUP_SUGGESTIONS.forEach(sgStr => {{
+      if (seenSg.has(sgStr)) return;
+      seenSg.add(sgStr);
+      const opt = document.createElement("option");
+      opt.value = sgStr;
+      sgDlEl.appendChild(opt);
+    }});
+  }}
+
+  function renderUnitCellHistoryDropdown() {{
+    populateUnitCellDatalists(null);
+  }}
+
+  function highlightAutocompleteOption(newIndex) {{
+    const sugBox = document.getElementById("nd-cell-suggestions");
+    if (!sugBox || ndAutocompleteItems.length === 0) return;
+    ndAutocompleteSelectedIndex = newIndex;
+    const children = Array.from(sugBox.children);
+    children.forEach((child, idx) => {{
+      const isSel = idx === ndAutocompleteSelectedIndex;
+      child.style.background = isSel ? "rgba(56,189,248,0.22)" : "transparent";
+      child.style.color = isSel ? "var(--accent-cyan)" : "var(--text-main)";
+    }});
+    if (ndAutocompleteSelectedIndex >= 0 && ndAutocompleteItems[ndAutocompleteSelectedIndex]) {{
+      previewTentativeUnitCellEntry(
+        ndAutocompleteItems[ndAutocompleteSelectedIndex].entry,
+        ndAutocompleteActiveField
+      );
+    }} else {{
+      clearTentativeUnitCellPreview();
+    }}
+  }}
+
+  function updateUnitCellFieldSuggestions(activeFieldKey = null, opts = {{}}) {{
+    populateUnitCellDatalists(activeFieldKey);
+    const sugBox = document.getElementById("nd-cell-suggestions");
+    if (!sugBox || !activeFieldKey) {{
+      hideUnitCellAutocompleteDropdown(true);
+      return;
+    }}
+    clearTentativeUnitCellPreview();
+
+    const activeEl = document.getElementById(`nd-${{activeFieldKey}}`);
+    if (!activeEl) {{
+      hideUnitCellAutocompleteDropdown(true);
+      return;
+    }}
+
+    const history = getKnownUnitCellHistory();
+    const fieldKeys = ["a", "b", "c", "alpha", "beta", "gamma"];
+    const activeIdx = fieldKeys.indexOf(activeFieldKey);
+    const confirmedState = getConfirmedUnitCellInputs(activeFieldKey);
+    const activeRaw = activeEl.value.trim();
+    const filterByActive = Boolean(opts.filterByActiveInput) && activeRaw !== "";
+
+    const scored = [];
+    history.forEach(entry => {{
+      let activeMatches = true;
+      let activeBonus = 0;
+      if (activeRaw !== "") {{
+        if (activeFieldKey === "sg") {{
+          const activeNorm = activeRaw.toLowerCase().replace(/\\s+/g, "");
+          const entrySgNorm = String(entry.space_group || "").toLowerCase().replace(/\\s+/g, "");
+          if (entrySgNorm && entrySgNorm === activeNorm) {{
+            activeBonus = 8;
+          }} else if (entrySgNorm && (entrySgNorm.startsWith(activeNorm) || entrySgNorm.includes(activeNorm))) {{
+            activeBonus = 4;
+          }} else if (filterByActive) {{
+            activeMatches = false;
+          }}
+        }} else if (activeIdx >= 0 && Array.isArray(entry.cell) && entry.cell.length === 6) {{
+          const targetVal = Number(entry.cell[activeIdx]);
+          const targetStr = String(Number(targetVal.toFixed(4)));
+          const targetFixed = targetVal.toFixed(2);
+          const activeNum = parseFloat(activeRaw);
+          if (Number.isFinite(activeNum) && Math.abs(targetVal - activeNum) <= 1e-3) {{
+            activeBonus = 10;
+          }} else if (targetStr.startsWith(activeRaw) || targetFixed.startsWith(activeRaw)) {{
+            activeBonus = 6;
+          }} else if (Number.isFinite(activeNum) && Math.abs(targetVal - activeNum) <= 0.35) {{
+            activeBonus = 3;
+          }} else if (filterByActive) {{
+            activeMatches = false;
+          }}
+        }}
+      }}
+      if (!activeMatches) return;
+      const totalScore = activeBonus + scoreHistoryEntryAgainstConfirmed(entry, confirmedState, activeFieldKey);
+      scored.push({{ entry, score: totalScore, activeBonus }});
+    }});
+
+    scored.sort((a, b) => b.score - a.score);
+
+    const seenDimValues = new Set();
+    const items = [];
+    scored.forEach(({{ entry }}) => {{
+      let dimText = "";
+      if (activeFieldKey === "sg") {{
+        dimText = String(entry.space_group || "").trim();
+      }} else if (activeFieldIdxOrKey(activeFieldKey, activeIdx) >= 0 && Array.isArray(entry.cell) && entry.cell.length === 6) {{
+        dimText = String(Number(Number(entry.cell[activeIdx]).toFixed(4)));
+      }}
+      if (!dimText || seenDimValues.has(dimText)) return;
+      seenDimValues.add(dimText);
+      items.push({{ dimText, entry }});
+    }});
+
+    if (activeFieldKey === "sg" && items.length < 6) {{
+      const activeNorm = activeRaw.toLowerCase().replace(/\\s+/g, "");
+      DEFAULT_SPACE_GROUP_SUGGESTIONS.forEach(sgStr => {{
+        if (items.length >= 8 || seenDimValues.has(sgStr)) return;
+        const sgNorm = sgStr.toLowerCase().replace(/\\s+/g, "");
+        if (!filterByActive || sgNorm.startsWith(activeNorm) || sgNorm.includes(activeNorm)) {{
+          seenDimValues.add(sgStr);
+          items.push({{ dimText: sgStr, entry: {{ space_group: sgStr, cell: null }} }});
+        }}
+      }});
+    }}
+
+    if (items.length === 0) {{
+      hideUnitCellAutocompleteDropdown(true);
+      return;
+    }}
+
+    ndAutocompleteActiveField = activeFieldKey;
+    ndAutocompleteItems = items.slice(0, 7);
+    ndAutocompleteSelectedIndex = -1;
+
+    const rowEl = document.getElementById("nd-cell-fields-row");
+    if (rowEl) {{
+      const rowRect = rowEl.getBoundingClientRect();
+      const actRect = activeEl.getBoundingClientRect();
+      const leftPx = Math.max(0, Math.round(actRect.left - rowRect.left));
+      const widthPx = Math.max(Math.round(actRect.width), 82);
+      sugBox.style.left = `${{leftPx}}px`;
+      sugBox.style.minWidth = `${{widthPx}}px`;
+    }}
+
+    sugBox.innerHTML = "";
+    ndAutocompleteItems.forEach((item, idx) => {{
+      const opt = document.createElement("div");
+      opt.setAttribute("role", "option");
+      opt.style.cssText = "padding:3px 7px;font-family:var(--font-display);font-size:0.68rem;color:var(--text-main);cursor:pointer;border-radius:3px;white-space:nowrap;";
+      opt.textContent = item.dimText;
+      opt.addEventListener("mouseenter", () => {{
+        highlightAutocompleteOption(idx);
+      }});
+      opt.addEventListener("mousedown", ev => {{
+        ev.preventDefault();
+        ev.stopPropagation();
+        applyUnitCellEntryToDialog(item.entry, "nd");
+      }});
+      sugBox.appendChild(opt);
+    }});
+
+    sugBox.onmouseleave = () => {{
+      highlightAutocompleteOption(-1);
+    }};
+    sugBox.style.display = "flex";
+
+    // When actively typing a matching value, tentatively preview the #1 match in the other fields
+    if (filterByActive && scored.length > 0 && scored[0].activeBonus > 0 && ndAutocompleteItems.length > 0) {{
+      highlightAutocompleteOption(0);
+    }}
+  }}
+
+  function activeFieldIdxOrKey(_key, idx) {{
+    return idx;
+  }}
+
+  function handleUnitCellPasteEvent(ev, prefix = "nd") {{
+    const clip = (ev.clipboardData || window.clipboardData);
+    if (!clip) return;
+    const pastedText = clip.getData("text");
+    const parsed = parseUnitCellClipboardText(pastedText);
+    if (!parsed || !Array.isArray(parsed.cell) || parsed.cell.length !== 6) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    applyUnitCellEntryToDialog(
+      {{
+        cell: parsed.cell,
+        space_group: parsed.space_group || (document.getElementById(`${{prefix}}-sg`)?.value || ""),
+        label: "Clipboard",
+      }},
+      prefix
+    );
+    if (prefix === "nd") {{
+      const badgeEl = document.getElementById("nd-symmetry-badge");
+      if (badgeEl) {{
+        const sym = resolveSpaceGroupSymmetry(document.getElementById("nd-sg")?.value || "");
+        badgeEl.textContent = `PASTED • ${{sym.summary}}`;
+      }}
+    }} else {{
+      setStatusLine(
+        "[UNIT CELL PASTED]",
+        `Filled unit cell <strong>${{parsed.cell.map(v => Number(v).toFixed(2)).join(", ")}}</strong>${{parsed.space_group ? ` (SG: <strong>${{parsed.space_group}}</strong>)` : ""}} from clipboard.`
+      );
+    }}
+  }}
+
+  ["sg", "a", "b", "c", "alpha", "beta", "gamma"].forEach(fieldKey => {{
+    const ndEl = document.getElementById(`nd-${{fieldKey}}`);
+    if (ndEl) {{
+      ndEl.addEventListener("paste", ev => handleUnitCellPasteEvent(ev, "nd"));
+      ndEl.addEventListener("keydown", ev => {{
+        if (ndAutocompleteActiveField === fieldKey && ndAutocompleteItems.length > 0) {{
+          if (ev.key === "ArrowDown") {{
+            ev.preventDefault();
+            const nextIdx = (ndAutocompleteSelectedIndex + 1) % ndAutocompleteItems.length;
+            highlightAutocompleteOption(nextIdx);
+            return;
+          }}
+          if (ev.key === "ArrowUp") {{
+            ev.preventDefault();
+            const prevIdx = ndAutocompleteSelectedIndex <= 0
+              ? ndAutocompleteItems.length - 1
+              : ndAutocompleteSelectedIndex - 1;
+            highlightAutocompleteOption(prevIdx);
+            return;
+          }}
+          if (ev.key === "Enter") {{
+            const chosenIdx = ndAutocompleteSelectedIndex >= 0 ? ndAutocompleteSelectedIndex : 0;
+            const chosen = ndAutocompleteItems[chosenIdx];
+            if (chosen) {{
+              ev.preventDefault();
+              applyUnitCellEntryToDialog(chosen.entry, "nd");
+              return;
+            }}
+          }}
+          if (ev.key === "Escape") {{
+            ev.preventDefault();
+            hideUnitCellAutocompleteDropdown(true);
+            return;
+          }}
+        }}
+        if (ev.key === "Enter") {{
+          if (confirmTentativeUnitCellPreview()) {{
+            ev.preventDefault();
+          }}
+        }} else if (ev.key === "Escape") {{
+          clearTentativeUnitCellPreview();
+        }}
+      }});
+      ndEl.addEventListener("input", () => {{
+        if (ndEl.dataset.tentativePreview === "1") {{
+          delete ndEl.dataset.tentativePreview;
+          delete ndEl.dataset.confirmedValue;
+          delete ndEl.dataset.wasConfirmedFinal;
+        }}
+        ndEl.dataset.confirmedFinal = ndEl.value.trim() !== "" ? "1" : "";
+        ndEl.style.color = "var(--text-main)";
+        ndEl.style.fontStyle = "normal";
+        ndEl.style.borderStyle = "solid";
+        clearTentativeUnitCellPreview();
+        if (fieldKey === "sg") {{
+          // Support typing/selecting a full unit cell string into the text input as well
+          const maybeFull = parseUnitCellClipboardText(ndEl.value);
+          if (maybeFull) {{
+            applyUnitCellEntryToDialog(maybeFull, "nd");
+            return;
+          }}
+          applyUnitCellSymmetryConstraints("nd", {{ preserveExplicitValues: false, resetManualOverrides: true }});
+        }} else {{
+          if (ndEl.dataset.symmetryLocked) {{
+            ndEl.dataset.symmetryManualOverride = "1";
+            delete ndEl.dataset.symmetryLocked;
+            styleUnitCellFieldState(ndEl, "nd", "normal", "Manually overridden symmetry proposal");
+          }}
+          mirrorLinkedUnitCellFields("nd", fieldKey);
+        }}
+        updateUnitCellFieldSuggestions(fieldKey, {{ filterByActiveInput: true }});
+      }});
+      ndEl.addEventListener("focus", () => {{
+        updateUnitCellFieldSuggestions(fieldKey, {{ filterByActiveInput: false }});
+      }});
+      ndEl.addEventListener("click", () => {{
+        if (ndAutocompleteActiveField !== fieldKey) {{
+          updateUnitCellFieldSuggestions(fieldKey, {{ filterByActiveInput: false }});
+        }}
+      }});
+      ndEl.addEventListener("blur", () => {{
+        setTimeout(() => {{
+          if (ndAutocompleteActiveField === fieldKey) {{
+            hideUnitCellAutocompleteDropdown(true);
+          }}
+        }}, 140);
+      }});
+      ndEl.addEventListener("change", () => {{
+        if (fieldKey === "sg") {{
+          applyUnitCellSymmetryConstraints("nd", {{ preserveExplicitValues: true }});
+        }} else {{
+          mirrorLinkedUnitCellFields("nd", fieldKey);
+        }}
+      }});
+    }}
+
+    const inpEl = document.getElementById(`inp-${{fieldKey}}`);
+    if (inpEl) {{
+      inpEl.addEventListener("paste", ev => handleUnitCellPasteEvent(ev, "inp"));
+      inpEl.addEventListener("input", () => {{
+        if (fieldKey === "sg") {{
+          const maybeFull = parseUnitCellClipboardText(inpEl.value);
+          if (maybeFull) {{
+            applyUnitCellEntryToDialog(maybeFull, "inp");
+            return;
+          }}
+          applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: false, resetManualOverrides: true }});
+        }} else {{
+          if (inpEl.dataset.symmetryLocked) {{
+            inpEl.dataset.symmetryManualOverride = "1";
+            delete inpEl.dataset.symmetryLocked;
+            styleUnitCellFieldState(inpEl, "inp", "normal", "Manually overridden symmetry proposal");
+          }}
+          mirrorLinkedUnitCellFields("inp", fieldKey);
+        }}
+      }});
+      inpEl.addEventListener("change", () => {{
+        if (fieldKey === "sg") {{
+          applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: false, resetManualOverrides: true }});
+        }} else {{
+          mirrorLinkedUnitCellFields("inp", fieldKey);
+        }}
+      }});
+    }}
+  }});
+
   function openNeutronDataModal(localNexusFiles = null) {{
     pendingLocalNexusFiles = localNexusFiles;
-    const params = collectWorkflowParams();
-    const setVal = (id, v) => {{ const el = document.getElementById(id); if (el && v !== undefined) el.value = v; }};
-    if (params.instrument) {{
-      setVal("nd-instrument", params.instrument);
-      setVal("nd-facility", (params.instrument === "MANDI" || params.instrument === "TOPAZ") ? "SNS" : "HFIR");
-    }}
-    setVal("nd-sg", params.space_group);
-    setVal("nd-a", Number(params.a).toFixed(2));
-    setVal("nd-b", Number(params.b).toFixed(2));
-    setVal("nd-c", Number(params.c).toFixed(2));
-    setVal("nd-alpha", Number(params.alpha).toFixed(2));
-    setVal("nd-beta", Number(params.beta).toFixed(2));
-    setVal("nd-gamma", Number(params.gamma).toFixed(2));
-    setVal("nd-wl-min", Number(params.wavelength_min).toFixed(1));
-    setVal("nd-wl-max", Number(params.wavelength_max).toFixed(1));
+    applyUnitCellSymmetryConstraints("nd", {{ preserveExplicitValues: true }});
+    hideUnitCellAutocompleteDropdown(true);
+    populateUnitCellDatalists(null);
     updateNeutronDialogPreview();
     if (modalNeutronData) modalNeutronData.style.display = "flex";
     fetchOncatCatalog();
@@ -7820,18 +11676,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const el = document.getElementById(id);
     if (el) {{
       el.addEventListener("input", () => {{
-        if (id === "nd-runs") renderOncatRunsList(false);
+        if (id === "nd-ipts") renderOncatProjectsList(true);
+        else if (id === "nd-runs") renderOncatRunsList(false);
         updateNeutronDialogPreview();
       }});
       el.addEventListener("change", () => {{
-        if (id === "nd-ipts") fetchOncatCatalog(el.value);
-        else if (id === "nd-facility") fetchOncatCatalog(null, true);
+        if (id === "nd-ipts") fetchOncatCatalog(null, false);
+        else if (id === "nd-facility") fetchOncatCatalog(null, false);
         updateNeutronDialogPreview();
       }});
     }}
   }});
   const ndIptsFilterEl = document.getElementById("nd-ipts-filter");
-  if (ndIptsFilterEl) ndIptsFilterEl.addEventListener("input", renderOncatProjectsList);
+  if (ndIptsFilterEl) ndIptsFilterEl.addEventListener("input", () => renderOncatProjectsList(false));
   const ndRunsFilterEl = document.getElementById("nd-runs-filter");
   if (ndRunsFilterEl) ndRunsFilterEl.addEventListener("input", () => renderOncatRunsList(false));
   const btnNdClearRuns = document.getElementById("btn-nd-clear-runs");
@@ -7858,38 +11715,60 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (facEl) {{
         facEl.value = (ndInstEl.value === "MANDI" || ndInstEl.value === "TOPAZ") ? "SNS" : "HFIR";
       }}
-      fetchOncatCatalog(null, true);
+      fetchOncatCatalog(null, false);
       updateNeutronDialogPreview();
     }});
   }}
 
   if (btnNdSubmit) {{
     btnNdSubmit.addEventListener("click", async () => {{
-      // Sync sample unit cell, space group, and wavelength band back to the main parameters bar
+      const sgVal = (document.getElementById("nd-sg")?.value || "").trim();
+      const cellVals = ["nd-a", "nd-b", "nd-c", "nd-alpha", "nd-beta", "nd-gamma"].map(
+        id => parseFloat(document.getElementById(id)?.value || "")
+      );
+      if (!sgVal || cellVals.some(v => !Number.isFinite(v) || v <= 0)) {{
+        const statusBox = document.getElementById("nd-validation-status");
+        const msgEl = document.getElementById("nd-validation-msg");
+        if (statusBox) statusBox.style.borderColor = "rgba(248,113,113,0.6)";
+        if (msgEl) {{
+          msgEl.style.color = "#f87171";
+          msgEl.textContent = "Enter space group and unit cell parameters (a, b, c, α, β, γ).";
+        }}
+        return;
+      }}
+      // Sync sample unit cell and space group back to the main parameters bar,
+      // and auto-populate λ_min / λ_max from reduction_settings.json defaults for the chosen instrument
       const syncPair = [
         ["nd-sg", "inp-sg"], ["nd-a", "inp-a"], ["nd-b", "inp-b"], ["nd-c", "inp-c"],
         ["nd-alpha", "inp-alpha"], ["nd-beta", "inp-beta"], ["nd-gamma", "inp-gamma"],
       ];
       syncPair.forEach(([srcId, dstId]) => {{
         const s = document.getElementById(srcId), d = document.getElementById(dstId);
-        if (s && d) d.value = s.value;
+        if (s && d && s.value.trim() !== "") d.value = s.value;
       }});
-      const wlMinV = parseFloat(document.getElementById("nd-wl-min")?.value || "");
-      const wlMaxV = parseFloat(document.getElementById("nd-wl-max")?.value || "");
-      if (Number.isFinite(wlMinV) && Number.isFinite(wlMaxV)) {{
-        state.lamMin = wlMinV; state.lamMax = wlMaxV;
-        if (slLamMin) slLamMin.value = wlMinV.toFixed(2);
-        if (slLamMax) slLamMax.value = wlMaxV.toFixed(2);
-        updateWavelengthLabels();
-      }}
-      const inpDmin = document.getElementById("inp-dmin");
-      if (inpDmin) {{
-        const autoD = Number((0.5 * (Number.isFinite(wlMinV) ? wlMinV : (state.lamMin || 2.0))).toFixed(2));
-        inpDmin.value = autoD.toFixed(1);
-        DATA.d_min = autoD;
-      }}
+      applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: true }});
+      const iptsForHist = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
+      const runsForHist = (document.getElementById("nd-runs")?.value || "").trim();
+      const histLbl = iptsForHist ? `IPTS-${{iptsForHist}}${{runsForHist ? " #" + runsForHist : ""}}` : "Load Neutron Data";
+      recordUnitCellInLocalStorage(cellVals, sgVal, histLbl);
+      renderUnitCellHistoryDropdown();
+      const prevInst = (DATA.instrument || "").trim();
       const instVal = (document.getElementById("nd-instrument")?.value || DATA.instrument || "CG4D").trim();
       DATA.instrument = instVal;
+      const defWl = getDefaultWavelengthForInstrument(instVal);
+      if (instVal !== prevInst || !Number.isFinite(state.lamMin) || !Number.isFinite(state.lamMax) || state.lamMax <= state.lamMin || state.lamMin <= 0) {{
+        state.lamMin = Number(defWl[0]);
+        state.lamMax = Number(defWl[1]);
+        DATA.wavelength_range = [state.lamMin, state.lamMax];
+        updateWavelengthLabels();
+        const autoD = Number((0.5 * state.lamMin).toFixed(2));
+        syncDminControls(autoD);
+      }} else {{
+        updateWavelengthLabels();
+        if (!Number.isFinite(state.dMin) || state.dMin <= 0) {{
+          syncDminControls(Number((0.5 * state.lamMin).toFixed(2)));
+        }}
+      }}
 
       if (pendingLocalNexusFiles && pendingLocalNexusFiles.length > 0) {{
         const filesToUpload = pendingLocalNexusFiles;
@@ -8032,12 +11911,210 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }}
 
-  async function loadFromGalaxyDatasetId(dsId) {{
-    if (!dsId) return;
+  const modalGalaxyDataset = document.getElementById("modal-galaxy-dataset");
+  const btnGxDsClose = document.getElementById("btn-gx-ds-close");
+  const btnGxDsCancel = document.getElementById("btn-gx-ds-cancel");
+  const btnGxDsSubmit = document.getElementById("btn-gx-ds-submit");
+  const btnGxDsRefresh = document.getElementById("btn-gx-ds-refresh");
+  const inpGxDsFilter = document.getElementById("gx-ds-filter");
+  const elGxDsList = document.getElementById("gx-ds-list");
+  const elGxDsError = document.getElementById("gx-ds-error");
+  const elGxDsLoading = document.getElementById("gx-ds-loading");
+  const elGxDsCount = document.getElementById("gx-ds-count");
+  let selectedGalaxyModalDsId = "";
+  let isGalaxyDatasetLoading = false;
+
+  function showGalaxyModalError(msg) {{
+    if (!elGxDsError) return;
+    if (!msg) {{
+      elGxDsError.style.display = "none";
+      elGxDsError.textContent = "";
+    }} else {{
+      elGxDsError.style.display = "block";
+      elGxDsError.textContent = msg;
+    }}
+  }}
+
+  function setGalaxyDatasetLoadingState(loading, labelText = "") {{
+    isGalaxyDatasetLoading = Boolean(loading);
+    if (elGxDsLoading) {{
+      if (isGalaxyDatasetLoading) {{
+        elGxDsLoading.style.display = "block";
+        elGxDsLoading.textContent = `Downloading & opening ${{labelText || "dataset"}} from Galaxy… Please wait.`;
+      }} else {{
+        elGxDsLoading.style.display = "none";
+      }}
+    }}
+    if (elGxDsList) {{
+      elGxDsList.style.pointerEvents = isGalaxyDatasetLoading ? "none" : "auto";
+      elGxDsList.style.opacity = isGalaxyDatasetLoading ? "0.45" : "1";
+    }}
+    if (inpGxDsFilter) inpGxDsFilter.disabled = isGalaxyDatasetLoading;
+    if (btnGxDsRefresh) btnGxDsRefresh.disabled = isGalaxyDatasetLoading;
+    if (btnGxDsCancel) btnGxDsCancel.disabled = isGalaxyDatasetLoading;
+    if (btnGxDsClose) btnGxDsClose.disabled = isGalaxyDatasetLoading;
+    if (btnGxDsSubmit) {{
+      btnGxDsSubmit.disabled = isGalaxyDatasetLoading;
+      btnGxDsSubmit.textContent = isGalaxyDatasetLoading
+        ? "Downloading from Galaxy…"
+        : "Open Selected Dataset";
+    }}
+    if (selGalaxyH5) selGalaxyH5.disabled = isGalaxyDatasetLoading;
+    if (modalGalaxyDataset) {{
+      modalGalaxyDataset.style.cursor = isGalaxyDatasetLoading ? "wait" : "";
+    }}
+    document.body.style.cursor = isGalaxyDatasetLoading ? "wait" : "";
+    if (isGalaxyDatasetLoading && document.activeElement && typeof document.activeElement.blur === "function") {{
+      document.activeElement.blur();
+    }}
+  }}
+
+  function closeGalaxyDatasetModal() {{
+    if (isGalaxyDatasetLoading) return;
+    if (modalGalaxyDataset) modalGalaxyDataset.style.display = "none";
+    showGalaxyModalError("");
+  }}
+
+  function renderGalaxyDatasetModalList() {{
+    if (!elGxDsList) return;
+    const q = String((inpGxDsFilter && inpGxDsFilter.value) || "").trim().toLowerCase();
+    const allSorted = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []);
+    const filtered = allSorted.filter(d => {{
+      if (!q) return true;
+      const extInf = inferDatasetExtensionClient(d);
+      const cellMeta = extractDatasetUnitCellMeta(d);
+      const cellStr = cellMeta ? `${{cellMeta.space_group || ""}} ${{cellMeta.cell.join(" ")}}` : "";
+      const hay = `#${{d.hid || ""}} ${{d.name || ""}} ${{extInf}} ${{d.state || ""}} ${{cellStr}}`.toLowerCase();
+      return hay.includes(q);
+    }});
+    const loadableFiltered = filtered.filter(d => classifyGalaxyDatasetLoadability(d).canLoad);
+    if (elGxDsCount) {{
+      elGxDsCount.textContent = `${{loadableFiltered.length}} loadable of ${{filtered.length}} dataset${{filtered.length === 1 ? "" : "s"}} (most recently touched first)`;
+    }}
+    elGxDsList.innerHTML = "";
+    if (filtered.length === 0) {{
+      const emptyDiv = document.createElement("div");
+      emptyDiv.style.cssText = "padding:10px;color:var(--text-dim);font-size:0.68rem;";
+      emptyDiv.textContent = allSorted.length === 0
+        ? "No Galaxy history datasets found."
+        : "No datasets match the current filter.";
+      elGxDsList.appendChild(emptyDiv);
+      return;
+    }}
+    if (
+      !selectedGalaxyModalDsId ||
+      !loadableFiltered.some(d => d.id === selectedGalaxyModalDsId)
+    ) {{
+      selectedGalaxyModalDsId = loadableFiltered.length > 0 ? loadableFiltered[0].id : "";
+    }}
+    filtered.forEach(d => {{
+      const row = document.createElement("div");
+      const info = classifyGalaxyDatasetLoadability(d);
+      const canLoad = info.canLoad;
+      const isSel = canLoad && d.id === selectedGalaxyModalDsId;
+      const ext = info.ext;
+      row.style.cssText = `display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 8px;border-radius:4px;cursor:${{canLoad ? "pointer" : "default"}};font-family:var(--font-display);font-size:0.68rem;opacity:${{canLoad ? "1" : "0.42"}};border:1px solid ${{isSel ? "var(--accent-cyan)" : "rgba(255,255,255,0.05)"}};background:${{isSel ? "rgba(56,189,248,0.16)" : "rgba(255,255,255,0.02)"}};`;
+      const leftSpan = document.createElement("span");
+      leftSpan.style.cssText = `overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${{canLoad ? "var(--text-main)" : "rgba(148,163,184,0.65)"}};`;
+      leftSpan.textContent = `#${{d.hid || "?"}} ${{d.name || d.id}}`;
+      const rightSpan = document.createElement("span");
+      rightSpan.style.cssText = "display:flex;align-items:center;gap:6px;flex-shrink:0;font-size:0.6rem;";
+      const cellMeta = extractDatasetUnitCellMeta(d);
+      if (cellMeta && Array.isArray(cellMeta.cell) && cellMeta.cell.length === 6) {{
+        const cellBadge = document.createElement("span");
+        cellBadge.style.cssText = "padding:1px 5px;border-radius:3px;background:rgba(56,189,248,0.12);border:1px solid rgba(56,189,248,0.35);color:var(--accent-cyan);max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+        const cShort = cellMeta.cell.slice(0, 3).map(v => Number(v).toFixed(1)).join(",");
+        cellBadge.textContent = `${{cellMeta.space_group ? cellMeta.space_group + " " : ""}}${{cShort}}Å`;
+        cellBadge.title = formatUnitCellEntrySummary({{ cell: cellMeta.cell, space_group: cellMeta.space_group, label: "" }});
+        rightSpan.appendChild(cellBadge);
+      }}
+      const extBadge = document.createElement("span");
+      extBadge.style.cssText = "padding:1px 5px;border-radius:3px;background:rgba(255,255,255,0.07);color:var(--text-dim);";
+      extBadge.textContent = info.hint && !canLoad && ext === "mtz" ? "mtz (needs geometry)" : ext;
+      rightSpan.appendChild(extBadge);
+      if (canLoad) {{
+        const stBadge = document.createElement("span");
+        const badgeColor = ext === "mtz" ? "var(--accent-cyan)" : "#34d399";
+        stBadge.style.cssText = `padding:1px 5px;border-radius:3px;border:1px solid ${{badgeColor}};color:${{badgeColor}};`;
+        stBadge.textContent = ext === "mtz" ? "ref spots" : "ok";
+        rightSpan.appendChild(stBadge);
+      }}
+      row.appendChild(leftSpan);
+      row.appendChild(rightSpan);
+      if (canLoad) {{
+        row.addEventListener("click", () => {{
+          if (isGalaxyDatasetLoading) return;
+          selectedGalaxyModalDsId = d.id;
+          showGalaxyModalError("");
+          renderGalaxyDatasetModalList();
+        }});
+        row.addEventListener("dblclick", () => {{
+          if (isGalaxyDatasetLoading) return;
+          selectedGalaxyModalDsId = d.id;
+          loadFromGalaxyDatasetId(d.id, {{ fromModal: true }});
+        }});
+      }}
+      elGxDsList.appendChild(row);
+    }});
+  }}
+
+  async function openGalaxyDatasetModal() {{
+    if (!modalGalaxyDataset || isGalaxyDatasetLoading) return;
+    showGalaxyModalError("");
+    modalGalaxyDataset.style.display = "flex";
+    renderGalaxyDatasetModalList();
+    if (inpGxDsFilter) inpGxDsFilter.focus();
+    await probeGalaxyConnection();
+    renderGalaxyDatasetModalList();
+  }}
+
+  if (btnGxDsClose) btnGxDsClose.addEventListener("click", closeGalaxyDatasetModal);
+  if (btnGxDsCancel) btnGxDsCancel.addEventListener("click", closeGalaxyDatasetModal);
+  if (inpGxDsFilter) inpGxDsFilter.addEventListener("input", renderGalaxyDatasetModalList);
+  if (btnGxDsRefresh) {{
+    btnGxDsRefresh.addEventListener("click", async () => {{
+      if (isGalaxyDatasetLoading) return;
+      showGalaxyModalError("");
+      await probeGalaxyConnection();
+      renderGalaxyDatasetModalList();
+    }});
+  }}
+  if (btnGxDsSubmit) {{
+    btnGxDsSubmit.addEventListener("click", () => {{
+      if (isGalaxyDatasetLoading) return;
+      if (!selectedGalaxyModalDsId) {{
+        showGalaxyModalError("Select an active Galaxy dataset first.");
+        return;
+      }}
+      loadFromGalaxyDatasetId(selectedGalaxyModalDsId, {{ fromModal: true }});
+    }});
+  }}
+
+  async function loadFromGalaxyDatasetId(dsId, opts) {{
+    if (!dsId || isGalaxyDatasetLoading) return;
+    const fromModal = Boolean(opts && opts.fromModal);
     const dsMeta = (galaxyBridge.datasets || []).find(d => d.id === dsId);
     const dsName = (dsMeta && dsMeta.name) ? String(dsMeta.name) : "";
+    const dsHid = (dsMeta && dsMeta.hid) ? `#${{dsMeta.hid}} ` : "";
+    const dsState = (dsMeta && dsMeta.state) ? String(dsMeta.state) : "ok";
+    const dsExt = inferDatasetExtensionClient(dsMeta || {{ name: dsName }});
+    if (dsState !== "ok") {{
+      const stErr = `Cannot ingest Galaxy dataset ${{dsHid}}'${{dsName || dsId}}': dataset state is '${{dsState}}' (must be 'ok').`;
+      if (fromModal) showGalaxyModalError(stErr);
+      setStatusLine("[GALAXY ERROR]", `<span style="color:#f87171;">${{stErr}}</span>`);
+      return;
+    }}
+    if (dsExt === "mtz" && !hasActiveDetectorGeometryForMtz()) {{
+      const mtzErr = `Cannot load MTZ dataset ${{dsHid}}'${{dsName || dsId}}' by itself: load a solved or integrated HDF5 dataset with detector geometry first.`;
+      if (fromModal) showGalaxyModalError(mtzErr);
+      setStatusLine("[GALAXY ERROR]", `<span style="color:#f87171;">${{mtzErr}}</span>`);
+      return;
+    }}
     // If a raw NeXus file in Galaxy History is selected, automatically trigger Step 1 (Reduce + Merge Images)
-    if (/\\.nxs(\\.h5)?$/i.test(dsName)) {{
+    if (dsExt === "nxs.h5" || dsExt === "nxs" || /\\.nxs(\\.h5)?$/i.test(dsName)) {{
+      markDatasetTouchedClient(dsId);
+      setGalaxyDatasetLoadingState(false);
+      if (fromModal) closeGalaxyDatasetModal();
       setStatusLine(
         "[AUTO-REDUCE]",
         `Raw NeXus dataset <strong>${{dsName}}</strong> selected — triggering <strong>Step 1 (Reduce + Merge Images)</strong>...`
@@ -8049,34 +12126,68 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
       return;
     }}
-    setStatusLine("[GALAXY HDF5]", `Loading dataset <strong>${{dsName || dsId}}</strong> from NDIP / Galaxy History...`);
+    setGalaxyDatasetLoadingState(true, `${{dsHid}}${{dsName || dsId}}`);
+    setStatusLine("[GALAXY HDF5]", `Downloading & loading dataset <strong>${{dsHid}}${{dsName || dsId}}</strong> from NDIP / Galaxy History…`);
     try {{
-      // 1. Prefer server-side HDF5 extraction via NOVA/HTTP backend (handles merged.h5, solve.h5, predictor.h5, integrated.h5 with ellipses & multi-frame)
+      // 1. Prefer server-side HDF5/MTZ extraction via NOVA/HTTP backend (handles merged.h5, solve.h5, predictor.h5, integrated.h5, and .mtz reference spot overlays)
+      let serverResponded = false;
       try {{
-        const curFrame = typeof state.selectedFrameIndex === "number"
-          ? state.selectedFrameIndex
-          : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
-        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{curFrame}}`, {{
+        if (dsExt !== "mtz") {{
+          state.selectedFrameIndex = 0;
+          DATA.frame_index = 0;
+        }}
+        const hasGeomFlag = hasActiveDetectorGeometryForMtz() ? "1" : "0";
+        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{state.selectedFrameIndex || 0}}&has_active_geometry=${{hasGeomFlag}}`, {{
           cache: "no-store",
           credentials: "same-origin",
         }});
-        if (rServer.ok) {{
-          const serverPayload = await rServer.json();
-          if (serverPayload && (Array.isArray(serverPayload.peaks) || Array.isArray(serverPayload.panels))) {{
-            recomputeBoundsAndReload(serverPayload);
-            return;
-          }}
+        serverResponded = true;
+        if (!rServer.ok) {{
+          let errMsg = `HTTP ${{rServer.status}} loading dataset ${{dsHid}}${{dsName || dsId}}`;
+          try {{
+            const errDoc = await rServer.json();
+            if (errDoc && errDoc.error) errMsg = String(errDoc.error);
+          }} catch (_je) {{}}
+          throw new Error(errMsg);
         }}
-      }} catch (_srvErr) {{
-        // Fall through to client-side h5wasm fetch
+        const serverPayload = await rServer.json();
+        if (serverPayload && serverPayload.status === "error") {{
+          throw new Error(String(serverPayload.error || "Dataset cannot be ingested."));
+        }}
+        if (serverPayload && serverPayload.status === "raw_nexus") {{
+          markDatasetTouchedClient(dsId);
+          setGalaxyDatasetLoadingState(false);
+          if (fromModal) closeGalaxyDatasetModal();
+          setStatusLine(
+            "[AUTO-REDUCE]",
+            `Raw NeXus dataset <strong>${{serverPayload.name || dsName || dsId}}</strong> selected — triggering <strong>Step 1 (Reduce + Merge Images)</strong>...`
+          );
+          selectPipelineStage(0, true);
+          await executeWorkflowStage(0, {{
+            ingest_mode: "galaxy_dataset",
+            galaxy_dataset_id: dsId,
+          }});
+          return;
+        }}
+        if (serverPayload && (Array.isArray(serverPayload.peaks) || Array.isArray(serverPayload.panels))) {{
+          markDatasetTouchedClient(dsId);
+          setGalaxyDatasetLoadingState(false);
+          if (fromModal) closeGalaxyDatasetModal();
+          recomputeBoundsAndReload(serverPayload);
+          return;
+        }}
+      }} catch (srvErr) {{
+        if (serverResponded) throw srvErr;
+        // Fall through to client-side h5wasm fetch only when NOVA server endpoint is unreachable
       }}
 
       // 2. Fallback: fetch raw HDF5 via /api/datasets/<id>/display and parse in browser via h5wasm
       while (!window.h5wasm) await new Promise(r => setTimeout(r, 120));
-      const h5s = (galaxyBridge.datasets || []).filter(
-        d => d.state === "ok" && (d.extension === "h5" || d.extension === "hdf5")
-      );
-      const mergedDs = [...h5s].reverse().find(
+      const h5s = sortDatasetsMostRecentFirst(galaxyBridge.datasets || []).filter(d => {{
+        const ext = inferDatasetExtensionClient(d);
+        return d.state === "ok" && (ext === "h5" || ext === "hdf5");
+      }});
+      const mergedDs = h5s.find(
         d => d.id !== dsId && /merged|image|scan|prepare/i.test(d.name || "")
       );
       const r1 = await fetch(`/api/datasets/${{dsId}}/display`, {{ credentials: "same-origin" }});
@@ -8088,9 +12199,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (r2.ok) buf2 = await r2.arrayBuffer();
       }}
       const newPayload = await parseH5BuffersInBrowser(buf1, buf2);
+      markDatasetTouchedClient(dsId);
+      setGalaxyDatasetLoadingState(false);
+      if (fromModal) closeGalaxyDatasetModal();
       recomputeBoundsAndReload(newPayload);
     }} catch (err) {{
-      setStatusLine("[GALAXY HDF5]", `<span style="color:#f87171;">Failed to load HDF5: ${{err.message}}</span>`);
+      setGalaxyDatasetLoadingState(false);
+      if (fromModal) showGalaxyModalError(err.message);
+      setStatusLine("[GALAXY ERROR]", `<span style="color:#f87171;">${{err.message}}</span>`);
+    }} finally {{
+      setGalaxyDatasetLoadingState(false);
     }}
   }}
 
@@ -8101,6 +12219,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (val === "__action_neutron_data__") {{
         selGalaxyH5.value = "";
         openNeutronDataModal(null);
+        return;
+      }}
+      if (val === "__action_galaxy_dataset__") {{
+        selGalaxyH5.value = "";
+        openGalaxyDatasetModal();
         return;
       }}
       if (val === "__action_local_file__") {{
@@ -8138,10 +12261,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const doc = await r.json();
         if (doc && typeof doc.galaxy_connected === "boolean") {{
           galaxyBridge.mode = "nova";
+          galaxyBridge.galaxyConnected = Boolean(doc.galaxy_connected);
           galaxyBridge.historyId = doc.history_id;
           galaxyBridge.datasets = doc.history_datasets || [];
           galaxyBridge.stepArtifacts = doc.step_artifacts || {{}};
+          hydrateStepTimingsFromServer(doc);
+          if (
+            state.runningStageIdx < 0 &&
+            doc.active_job &&
+            (doc.active_job.state === "running" || doc.active_job.state === "queued")
+          ) {{
+            const activeStageIdx = PIPELINE.findIndex(
+              p => p.stage_id === doc.active_job.stage_id
+            );
+            if (activeStageIdx >= 0) {{
+              state.runningStageIdx = activeStageIdx;
+              renderPipeline();
+            }}
+          }}
           populateGalaxyH5Selector();
+          renderUnitCellHistoryDropdown();
+          updateUnitCellFieldSuggestions(null);
           renderFilesDrawer();
           if (elGalaxyBadge) {{
             elGalaxyBadge.textContent = doc.galaxy_connected
@@ -8164,7 +12304,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           galaxyBridge.mode = "galaxy_iframe";
           galaxyBridge.historyId = hists[0].id;
           const cr = await fetch(
-            `/api/histories/${{galaxyBridge.historyId}}/contents?v=dev&q=deleted&qv=false`,
+            `/api/histories/${{galaxyBridge.historyId}}/contents?v=dev&q=deleted&qv=false&keys=id,name,hid,state,extension,deleted,history_content_type,update_time,create_time,tags,annotation`,
             {{ credentials: "same-origin" }}
           );
           if (cr.ok) {{
@@ -8176,6 +12316,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
           }}
           populateGalaxyH5Selector();
+          renderUnitCellHistoryDropdown();
+          updateUnitCellFieldSuggestions(null);
           renderFilesDrawer();
           if (elGalaxyBadge) {{
             elGalaxyBadge.textContent = `GALAXY (${{galaxyBridge.datasets.length}} items)`;
@@ -8199,6 +12341,67 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
   probeGalaxyConnection();
 
+  async function cancelWorkflowStage(stageIdx = state.runningStageIdx) {{
+    const idx = typeof stageIdx === "number" && stageIdx >= 0 ? stageIdx : state.runningStageIdx;
+    const st = PIPELINE[idx] || PIPELINE[state.currentPipelineIdx] || {{ stage_id: "solve", name: "STAGE" }};
+    const stageId = st.stage_id || "solve";
+    state.workflowRunSeq = (state.workflowRunSeq || 0) + 1;
+    if (galaxyBridge.pollTimer) {{
+      clearInterval(galaxyBridge.pollTimer);
+      galaxyBridge.pollTimer = null;
+    }}
+    state.runningStageIdx = -1;
+    finishStepStopwatch(stageId, "stopped");
+    renderPipeline();
+    const cellSummary = document.getElementById("cell-summary");
+    if (cellSummary) cellSummary.textContent = "STOPPED";
+    const stopRunnerLabel = (galaxyBridge.mode === "nova" && !galaxyBridge.galaxyConnected)
+      ? "local GPU container termination requested."
+      : "NDIP / Pulsar job termination requested.";
+    setStatusLine(
+      `[STOPPED]`,
+      `<strong style="color:#fb7185;">Cancelled ${{st.name || stageId.toUpperCase()}}</strong> — ${{stopRunnerLabel}}`
+    );
+    if (galaxyBridge.mode === "nova" || galaxyBridge.mode === "none") {{
+      try {{
+        const resp = await fetch("api/pipeline/cancel", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ stage_id: stageId }}),
+        }});
+        if (resp.ok) {{
+          const doc = await resp.json();
+          const jobObj = doc.job || {{}};
+          if (typeof jobObj.elapsed_ms === "number" && jobObj.elapsed_ms >= 0) {{
+            finishStepStopwatch(stageId, "stopped", jobObj.elapsed_ms);
+          }}
+          const outText = (jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : "");
+          if (outText) appendTerminalLog(outText, true);
+          else appendTerminalLog(`\\n[subhkl] Cancelled stage '${{stageId}}'.\\n`, false);
+        }} else {{
+          appendTerminalLog(`\\n[subhkl] Cancelled stage '${{stageId}}'.\\n`, false);
+        }}
+      }} catch (_e) {{
+        appendTerminalLog(`\\n[subhkl] Cancelled stage '${{stageId}}'.\\n`, false);
+      }}
+      await probeGalaxyConnection();
+      return;
+    }}
+    if (galaxyBridge.mode === "galaxy_iframe" && galaxyBridge.activeGalaxyJobId) {{
+      const jid = galaxyBridge.activeGalaxyJobId;
+      galaxyBridge.activeGalaxyJobId = null;
+      try {{
+        await fetch(`/api/jobs/${{encodeURIComponent(jid)}}`, {{
+          method: "DELETE",
+          credentials: "same-origin",
+        }});
+      }} catch (_e) {{}}
+      appendTerminalLog(`\\n[galaxy] Cancelled job ${{jid}} (${{stageId}}).\\n`, false);
+      return;
+    }}
+    appendTerminalLog(`\\n[subhkl] Stopped stage '${{stageId}}'.\\n`, false);
+  }}
+
   async function executeWorkflowStage(stageIdx, extraParams = null) {{
     const st = PIPELINE[stageIdx] || PIPELINE[state.currentPipelineIdx] || PIPELINE[1] || {{ stage_id: "solve", name: "2. SOLVE" }};
     const stageId = st.stage_id || "solve";
@@ -8206,13 +12409,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       openNeutronDataModal(null);
       return;
     }}
+    if (state.runningStageIdx >= 0 && state.runningStageIdx !== stageIdx) {{
+      await cancelWorkflowStage(state.runningStageIdx);
+    }}
+    const runSeq = (state.workflowRunSeq = (state.workflowRunSeq || 0) + 1);
     const params = {{ ...collectWorkflowParams(), ...(extraParams || {{}}) }};
+    const dMinSeqAtStart = state.dMinUserSeq || 0;
     state.runningStageIdx = stageIdx;
+    startStepStopwatch(stageIdx);
     renderPipeline();
     const cellSummary = document.getElementById("cell-summary");
     if (cellSummary) cellSummary.textContent = `RUNNING ${{stageId.toUpperCase()}}...`;
     appendTerminalLog(
-      `$ subhkl [${{st.name}}] — dispatching (SG=${{params.space_group}}, cell=${{params.a}},${{params.b}},${{params.c}}, λ=${{params.wavelength_min.toFixed(2)}}–${{params.wavelength_max.toFixed(2)}} Å)...\\n`,
+      `$ subhkl [${{st.name}}] — dispatching (SG=${{params.space_group}}, cell=${{params.a}},${{params.b}},${{params.c}}, λ=${{params.wavelength_min.toFixed(2)}}–${{params.wavelength_max.toFixed(2)}} Å, d_min=${{Number(params.d_min).toFixed(2)}} Å)...\\n`,
+      true,
       true
     );
 
@@ -8224,6 +12434,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           body: JSON.stringify({{ stage_id: stageId, params: params }}),
         }});
         const res = await resp.json();
+        if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) {{
+          try {{
+            await fetch("api/pipeline/cancel", {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/json" }},
+              body: JSON.stringify({{ stage_id: stageId }}),
+            }});
+          }} catch (_ce) {{}}
+          return;
+        }}
         if (!resp.ok || res.status === "error") {{
           throw new Error(res.error || "Failed to dispatch job");
         }}
@@ -8247,14 +12467,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
         let lastPartialSeq = 0;
         let lastPartialFrame = -1;
+        let pollInFlight = false;
         galaxyBridge.pollTimer = setInterval(async () => {{
+          if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) {{
+            clearInterval(galaxyBridge.pollTimer);
+            galaxyBridge.pollTimer = null;
+            return;
+          }}
+          if (pollInFlight) return;
+          pollInFlight = true;
           try {{
             const curFrame = typeof state.selectedFrameIndex === "number"
               ? state.selectedFrameIndex
               : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
-            const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}`, {{ cache: "no-store" }});
+            const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}&poll=1`, {{ cache: "no-store" }});
             if (!sr.ok) return;
             const sdoc = await sr.json();
+            if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) return;
             if (sdoc.step_artifacts) {{
               galaxyBridge.stepArtifacts = sdoc.step_artifacts;
               renderFilesDrawer();
@@ -8322,16 +12551,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }} else if (stageId === "solve" && typeof aj.ladder_rung_idx === "number") {{
               selectLadderRung(aj.ladder_rung_idx, false);
             }}
-            if (cellSummary) cellSummary.textContent = `${{aj.mode === "galaxy" ? "PULSAR" : "SUBHKL"}} [${{(aj.state || "running").toUpperCase()}}]`;
+            const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
+            if (cellSummary) {{
+              const rHost = (aj.runner_host && String(aj.runner_host).trim())
+                ? String(aj.runner_host).trim().toUpperCase()
+                : ((String(`${{aj.stdout || ""}}\n${{aj.stderr || ""}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "").toUpperCase();
+              const hostTag = rHost || (aj.mode === "galaxy" ? "PULSAR" : "SUBHKL");
+              cellSummary.textContent = `[${{hostTag}}] ${{(aj.state || "running").toUpperCase()}}`;
+            }}
             const finishedOk = aj.state === "ok";
-            const finishedErr = aj.state === "error" || aj.state === "deleted" || aj.state === "paused" || (!finishedOk && !!aj.error);
+            const finishedErr = isCancelled || aj.state === "error" || aj.state === "paused" || (!finishedOk && !!aj.error);
             if (finishedOk || finishedErr) {{
               clearInterval(galaxyBridge.pollTimer);
               galaxyBridge.pollTimer = null;
-              state.runningStageIdx = -1;
-              renderPipeline();
-              if (cellSummary) cellSummary.textContent = finishedOk ? "DONE" : "ERROR";
-              await probeGalaxyConnection();
+              if (runSeq === state.workflowRunSeq) {{
+                state.runningStageIdx = -1;
+                finishStepStopwatch(
+                  stageId,
+                  finishedOk ? "done" : (isCancelled ? "stopped" : "error"),
+                  typeof aj.elapsed_ms === "number" ? aj.elapsed_ms : null
+                );
+              }}
               if (finishedOk) {{
                 const h5Outs = Array.isArray(aj.outputs)
                   ? aj.outputs.filter(o => o && o.id && (!o.extension || o.extension === "h5" || o.extension === "hdf5"))
@@ -8340,20 +12580,46 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                   selGalaxyH5.value = h5Outs[0].id;
                 }}
                 let loadedOk = false;
+                const userChangedDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart;
+                const targetDmin = userChangedDmin
+                  ? Number(state.dMin)
+                  : (Number.isFinite(params.d_min) && params.d_min > 0 ? Number(params.d_min) : Number(state.dMin));
                 try {{
                   const targetFrame = stageId === "reduce"
                     ? 0
                     : (typeof state.selectedFrameIndex === "number"
                       ? state.selectedFrameIndex
                       : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0));
-                  const payloadUrl = aj.output_h5_path
-                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}`
-                    : `api/payload?frame=${{targetFrame}}`;
+                  const dminParam = (stageId !== "reduce" && Number.isFinite(targetDmin) && targetDmin > 0)
+                    ? `&preserve_params=1&d_min=${{encodeURIComponent(targetDmin)}}`
+                    : "";
+                  const payloadUrl = (!aj.updated_payload_ready && aj.output_h5_path)
+                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}${{dminParam}}`
+                    : `api/payload?frame=${{targetFrame}}${{dminParam}}`;
                   const pr = await fetch(payloadUrl, {{ cache: "no-store" }});
+                  if (runSeq !== state.workflowRunSeq) return;
                   if (pr.ok) {{
                     const newPayload = await pr.json();
+                    if (runSeq !== state.workflowRunSeq) return;
                     if (newPayload && (Array.isArray(newPayload.panels) || Array.isArray(newPayload.peaks))) {{
-                      recomputeBoundsAndReload(newPayload, {{ resetSelectedFrame: stageId === "reduce" }});
+                      recomputeBoundsAndReload(newPayload, {{
+                        resetSelectedFrame: stageId === "reduce",
+                        preserveParams: stageId !== "reduce",
+                      }});
+                      if (stageId !== "reduce") {{
+                        if (Number.isFinite(params.wavelength_min) && Number.isFinite(params.wavelength_max) && params.wavelength_max > params.wavelength_min) {{
+                          state.lamMin = Number(params.wavelength_min);
+                          state.lamMax = Number(params.wavelength_max);
+                          updateWavelengthLabels();
+                        }}
+                        const finalDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart
+                          ? Number(state.dMin)
+                          : targetDmin;
+                        if (Number.isFinite(finalDmin) && finalDmin > 0) {{
+                          syncDminControls(finalDmin);
+                        }}
+                        updateHUD();
+                      }}
                       loadedOk = true;
                       appendTerminalLog(
                         stageId === "reduce"
@@ -8363,17 +12629,42 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                     }}
                   }}
                 }} catch (_re) {{}}
-                if (!loadedOk && h5Outs.length > 0) {{
+                if (!loadedOk && h5Outs.length > 0 && runSeq === state.workflowRunSeq) {{
                   await loadFromGalaxyDatasetId(h5Outs[0].id);
+                  if (runSeq !== state.workflowRunSeq) return;
+                  if (stageId !== "reduce") {{
+                    if (Number.isFinite(params.wavelength_min) && Number.isFinite(params.wavelength_max) && params.wavelength_max > params.wavelength_min) {{
+                      state.lamMin = Number(params.wavelength_min);
+                      state.lamMax = Number(params.wavelength_max);
+                      updateWavelengthLabels();
+                    }}
+                    const finalDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart
+                      ? Number(state.dMin)
+                      : targetDmin;
+                    if (Number.isFinite(finalDmin) && finalDmin > 0) {{
+                      syncDminControls(finalDmin);
+                    }}
+                    updateHUD();
+                  }}
                 }}
               }} else if (aj.error) {{
                 appendTerminalLog(`\\n[error] ${{aj.error}}`);
               }}
+              if (runSeq === state.workflowRunSeq) {{
+                state.runningStageIdx = -1;
+                renderPipeline();
+                if (cellSummary) cellSummary.textContent = finishedOk ? "DONE" : (isCancelled ? "STOPPED" : "ERROR");
+              }}
+              await probeGalaxyConnection();
             }}
-          }} catch (_pe) {{}}
+          }} catch (_pe) {{
+          }} finally {{
+            pollInFlight = false;
+          }}
         }}, 700);
       }} catch (err) {{
         state.runningStageIdx = -1;
+        finishStepStopwatch(stageId, "error");
         renderPipeline();
         appendTerminalLog(`\\n[error] ${{err.message}}`);
       }}
@@ -8444,11 +12735,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           throw new Error((tres && tres.err_msg) || "Galaxy /api/tools error");
         }}
         const jobId = tres.jobs && tres.jobs[0] && tres.jobs[0].id;
+        galaxyBridge.activeGalaxyJobId = jobId;
         appendTerminalLog(`Dispatched Galaxy / Pulsar job ${{jobId}} (${{toolId}}). Polling stdio...`);
         if (stageId === "solve") selectLadderRung(0, false);
         let rungStep = 0;
         if (galaxyBridge.pollTimer) clearInterval(galaxyBridge.pollTimer);
         galaxyBridge.pollTimer = setInterval(async () => {{
+          if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) {{
+            clearInterval(galaxyBridge.pollTimer);
+            galaxyBridge.pollTimer = null;
+            return;
+          }}
           try {{
             const jr = await fetch(`/api/jobs/${{jobId}}?full=true`, {{ credentials: "same-origin" }});
             if (!jr.ok) return;
@@ -8466,15 +12763,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 true
               );
             }}
-            if (cellSummary) cellSummary.textContent = `GALAXY [${{jstate.toUpperCase()}}]`;
+            if (cellSummary) {{
+              const rHost = ((String(`${{stdOut}}\n${{stdErr}}`).match(/\\[(?:pulsar|subhkl)\\]\\s*Runner host:\\s*([A-Za-z0-9._-]+)/i) || [])[1] || "GALAXY").toUpperCase();
+              cellSummary.textContent = `[${{rHost}}] ${{jstate.toUpperCase()}}`;
+            }}
             if (stageId === "solve" && (jstate === "queued" || jstate === "running")) {{
               rungStep = Math.min(3, rungStep + 1);
               selectLadderRung(rungStep, false);
             }}
-            if (jstate === "ok" || jstate === "error") {{
+            if (jstate === "ok" || jstate === "error" || jstate === "deleted") {{
               clearInterval(galaxyBridge.pollTimer);
               galaxyBridge.pollTimer = null;
+              galaxyBridge.activeGalaxyJobId = null;
               state.runningStageIdx = -1;
+              finishStepStopwatch(
+                stageId,
+                jstate === "ok" ? "done" : (jstate === "deleted" ? "stopped" : "error")
+              );
               renderPipeline();
               if (jstate === "ok") {{
                 selectLadderRung(4, false);
@@ -8486,13 +12791,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                   await loadFromGalaxyDatasetId(outs[0].id);
                 }}
               }} else {{
-                if (cellSummary) cellSummary.textContent = "ERROR";
+                if (cellSummary) cellSummary.textContent = jstate === "deleted" ? "STOPPED" : "ERROR";
               }}
             }}
           }} catch (_je) {{}}
         }}, 1200);
       }} catch (err) {{
+        galaxyBridge.activeGalaxyJobId = null;
         state.runningStageIdx = -1;
+        finishStepStopwatch(stageId, "error");
         renderPipeline();
         appendTerminalLog(`\\n[error] ${{err.message}}`);
       }}
@@ -8500,18 +12807,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     // Standalone static file fallback: step through the Lattice Ladder rungs with diagnostic output
-    state.runningStageIdx = -1;
-    renderPipeline();
-    if (stageId === "solve") {{
+    if (stageId === "solve" && LADDER.length > 0) {{
       let r = 0;
       selectLadderRung(0, false);
       const t = setInterval(() => {{
+        if (runSeq !== state.workflowRunSeq) {{
+          clearInterval(t);
+          return;
+        }}
         const rung = LADDER[r];
         if (rung) appendTerminalLog(`[step ${{rung.step_num}}] ${{rung.name}} — ${{rung.metric_label}}`);
         r++;
-        if (r < LADDER.length) selectLadderRung(r, false);
-        else clearInterval(t);
+        if (r < LADDER.length) {{
+          selectLadderRung(r, false);
+        }} else {{
+          clearInterval(t);
+          state.runningStageIdx = -1;
+          finishStepStopwatch(stageId, "done");
+          renderPipeline();
+          if (cellSummary) cellSummary.textContent = "DONE";
+        }}
       }}, 650);
+    }} else {{
+      state.runningStageIdx = -1;
+      finishStepStopwatch(stageId, "done");
+      renderPipeline();
     }}
   }}
 
@@ -8524,6 +12844,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.parallaxY += (state.targetParallaxY - state.parallaxY) * 0.14;
     renderDetectorCanvas();
     renderStereoInset();
+    if (activeRunningStageId() || (stopwatchFlash.demoUntilPerf && performance.now() < stopwatchFlash.demoUntilPerf)) {{
+      renderStepStopwatch(false);
+    }}
     requestAnimationFrame(animate);
   }}
 
@@ -8551,7 +12874,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     try {{
       const fetchOpts = {{ cache: "no-store" }};
       if (abortCtrl) fetchOpts.signal = abortCtrl.signal;
-      const resp = await fetch(`api/payload?frame=${{clamped}}`, fetchOpts);
+      const dminQ = (Number.isFinite(state.dMin) && state.dMin > 0) ? `&d_min=${{encodeURIComponent(state.dMin)}}` : "";
+      const resp = await fetch(`api/payload?frame=${{clamped}}${{dminQ}}`, fetchOpts);
       if (reqSeq !== state.frameRequestSeq || clamped !== state.selectedFrameIndex) return;
       if (resp.ok) {{
         const newPayload = await resp.json();
@@ -8587,11 +12911,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  window.addEventListener("resize", () => fitHorizontalBars(false));
+  if (typeof ResizeObserver !== "undefined") {{
+    const barResizeObserver = new ResizeObserver(() => fitHorizontalBars(false));
+    barResizeObserver.observe(document.body);
+  }}
+
   renderFrameSelector();
   renderZoneList();
   renderPipeline();
   renderLadder();
+  applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: true }});
+  renderUnitCellHistoryDropdown();
   updateHUD();
+  fitHorizontalBars(true);
   requestAnimationFrame(animate);
 }})();
 </script>
@@ -8646,11 +12979,13 @@ def export_static_app_html(
     """Export a truly static HTML5/Canvas web app (not generated per-dataset by an XML tool)
     that connects directly to Galaxy / NOVA REST APIs and parses .h5 datasets client-side via h5wasm.
     """
+    def_wl = _get_instrument_default_wavelength(instrument)
     empty_payload: dict[str, Any] = {
         "instrument": instrument,
         "space_group": "P 21 21 21",
         "intensity_source": "static_app",
-        "wavelength_range": [1.8, 4.5],
+        "wavelength_range": [float(def_wl[0]), float(def_wl[1])],
+        "d_min": round(0.5 * float(def_wl[0]), 2),
         "cell": [68.7, 69.8, 156.9, 90.0, 90.0, 90.0],
         "peaks": [],
         "zones": [],

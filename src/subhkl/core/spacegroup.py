@@ -48,7 +48,7 @@ def get_centering(space_group_name):
     return sg.centring_type()
 
 
-def is_systematically_absent(h, k, l, space_group_name):  # noqa: E741
+def is_systematically_absent(h, k, l, space_group_name):
     """
     Check systematic absences for arrays of h, k, l using Gemmi.
     """
@@ -88,7 +88,7 @@ def generate_hkl_mask(h_max, k_max, l_max, space_group_name):
 
     # Iterate and check
     it = np.nditer([H, K, L], flags=["multi_index"])
-    for h, k, l in it:  # noqa: E741
+    for h, k, l in it:
         if h == 0 and k == 0 and l == 0:
             mask[it.multi_index] = False
             continue

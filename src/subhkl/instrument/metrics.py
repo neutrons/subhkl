@@ -3,6 +3,8 @@ Metrics computation module for indexing quality assessment.
 Provides functions to compute and return angular/distance errors from indexed peaks.
 """
 
+import os
+
 import h5py
 import numpy as np
 import scipy.spatial
@@ -73,7 +75,7 @@ def extract_xyz_from_file(file_path, instrument=None):
         calibration_dict = {}
         if "detector_calibration" in f:
             calib_grp = f["detector_calibration"]
-            for b_key in calib_grp.keys():
+            for b_key in calib_grp:
                 calib = {
                     "center": calib_grp[b_key]["center"][()],
                     "uhat": calib_grp[b_key]["uhat"][()],
@@ -163,7 +165,7 @@ def extract_xyz_from_file(file_path, instrument=None):
                         seen_rows[row_bytes] = len(seen_rows)
                     frame_by_slot[key] = seen_rows[row_bytes]
 
-            for img_key_str in f["banks"].keys():
+            for img_key_str in f["banks"]:
                 img_idx = int(img_key_str)
                 grp = f[f"banks/{img_key_str}"]
                 i_p, j_p = grp["i"][()], grp["j"][()]
@@ -210,10 +212,17 @@ def compute_metrics(
     instrument: str | None = None,
     d_min: float | None = None,
     per_run: bool = False,
-    per_peak: bool = False,
+    per_peak_output: str | None = None,
     ki_vec_override: np.ndarray | None = None,
     return_per_peak: bool = False,
 ) -> dict:
+    if per_peak_output is not None and os.path.abspath(
+        per_peak_output
+    ) == os.path.abspath(file1):
+        raise ValueError(
+            "per_peak_output must be a separate file; metrics never writes "
+            f"into its input ({file1})"
+        )
     try:
         from subhkl.optimization import FindUB
 
@@ -304,7 +313,7 @@ def compute_metrics(
                 }
 
             xyz_1, run_1, panel_1, frame_1 = extract_xyz_from_file(file1, instrument)
-            xyz_2, run_2, panel_2, frame_2 = extract_xyz_from_file(file2, instrument)
+            xyz_2, run_2, _panel_2, _frame_2 = extract_xyz_from_file(file2, instrument)
 
             if xyz_1 is None or xyz_2 is None:
                 return {
@@ -313,7 +322,7 @@ def compute_metrics(
 
             with h5py.File(file1, "r") as f1:
                 if "banks" in f1:
-                    for img_key_str in f1["banks"].keys():
+                    for img_key_str in f1["banks"]:
                         img_idx = int(img_key_str)
                         grp = f1[f"banks/{img_key_str}"]
                         h_p, k_p, l_p, lam_p = (
@@ -506,19 +515,19 @@ def compute_metrics(
             "max_ang_err": float(np.max(ang_err)),
             "num_peaks": len(h),
         }
-        # Opt-in: writing into file1 is a side effect the plain metrics
-        # call must not have.  scripts/error_analysis.py reads this table.
-        if per_peak:
-            with h5py.File(file1, "a") as fout:
-                metrics = fout.require_group("metrics")
-
-                if "per_peak" in metrics:
-                    del metrics["per_peak"]
-                peak_grp = metrics.create_group("per_peak")
+        # Opt-in, and into its own file: the evaluated file is only ever
+        # read.  scripts/error_analysis.py reads this table.
+        if per_peak_output is not None:
+            with h5py.File(per_peak_output, "w") as fout:
+                fout.attrs["source"] = os.path.abspath(file1)
+                peak_grp = fout.create_group("metrics/per_peak")
                 peak_grp.create_dataset("h", data=h.astype(np.int32))
                 peak_grp.create_dataset("k", data=k.astype(np.int32))
                 peak_grp.create_dataset("l", data=l.astype(np.int32))
-                peak_grp.create_dataset("run", data=run_index.astype(np.int32))
+                # run_index is the composite frame+panel slot for Predictor
+                # "banks" output; record the true frame and panel instead.
+                peak_grp.create_dataset("run", data=frame_index.astype(np.int32))
+                peak_grp.create_dataset("panel", data=panel_index.astype(np.int32))
                 peak_grp.create_dataset("lambda", data=lam.astype(np.float32))
                 peak_grp.create_dataset(
                     "d_err",
@@ -530,7 +539,7 @@ def compute_metrics(
                     data=ang_err.astype(np.float32),
                     compression="gzip",
                 )
-                print("Finished writing metrics/per_peak")
+                print(f"Wrote metrics/per_peak to {per_peak_output}")
 
         if d_filter_message:
             result["filter_message"] = d_filter_message
@@ -564,7 +573,15 @@ def compute_metrics(
 
         return result  # hkl_table if per_hkl else None
 
-    except Exception as e:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        TypeError,
+        KeyError,
+        IndexError,
+        AttributeError,
+    ) as e:
         import traceback
 
         traceback.print_exc()

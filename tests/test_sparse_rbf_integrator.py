@@ -75,7 +75,7 @@ def test_single_isolated_peak():
         max_sigma=5.0,
     )
     assert out.shape == (1, 5)
-    intensity, r_found, c_found, sig_eff, sigI = out[0]
+    intensity, _r_found, _c_found, _sig_eff, sigI = out[0]
     expected_intensity = true_amp * 2 * np.pi * true_sigma**2
     assert np.isclose(intensity, expected_intensity, rtol=0.15), (
         f"flux recovery failed: {intensity} vs {expected_intensity}"
@@ -436,7 +436,7 @@ def test_real_neutron_structured_background():
         dists = np.sqrt((peaks[:, 1] - true_r) ** 2 + (peaks[:, 2] - true_c) ** 2)
         closest_idx = np.argmin(dists)
 
-        p_c, p_r, p_col, p_sig = peaks[closest_idx]
+        _p_c, p_r, p_col, p_sig = peaks[closest_idx]
         min_dist = dists[closest_idx]
 
         print(f"Target: r={true_r:5.1f}, c={true_c:5.1f}, sig={true_sig:4.2f}")
@@ -1610,7 +1610,7 @@ def test_peak_deviance_is_exact_and_flags_a_spurious_atom():
     def truncated_atom(p):
         full = generate_erf_peak(yy, xx, p[1], p[2], p[3], p[0])
         keep = np.zeros((H, W), dtype=bool)
-        r0, c0 = int(round(float(p[1]))), int(round(float(p[2])))
+        r0, c0 = round(float(p[1])), round(float(p[2]))
         keep[
             max(0, r0 - rad) : min(H, r0 + rad + 1),
             max(0, c0 - rad) : min(W, c0 + rad + 1),
@@ -2107,7 +2107,7 @@ def test_fid_residual_is_a_calibratable_input():
     because each calibration rung is a full solve."""
     from subhkl.search.matrix_free import MatrixFreeSparseRBFPeakFinder
 
-    kwargs = dict(min_sigma=1.0, max_sigma=25.0)
+    kwargs = {"min_sigma": 1.0, "max_sigma": 25.0}
     lean = MatrixFreeSparseRBFPeakFinder(fid_residual=2.5, **kwargs)
     factory = MatrixFreeSparseRBFPeakFinder(**kwargs)
     dense = MatrixFreeSparseRBFPeakFinder(fid_residual=40.0, **kwargs)
@@ -2247,7 +2247,7 @@ def test_fragmentation_criterion_survives_a_shape_expanded_bank():
     from subhkl.search.matrix_free import _frag_bank_ratio
 
     sigmas = np.repeat(np.linspace(1.5, 6.5, 6), 5)  # the expanded pattern
-    ratio, near = _frag_bank_ratio(sigmas, 0.0, 1.0, 1.0, 1.0, 160.0, 512, 512)
+    ratio, _near = _frag_bank_ratio(sigmas, 0.0, 1.0, 1.0, 1.0, 160.0, 512, 512)
     assert np.isfinite(ratio)
 
 

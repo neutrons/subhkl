@@ -48,7 +48,9 @@ def test_invalid_setting_rotations_rejected():
 
 def test_short_inner_budget_retries_without_accepting_failed_fit(monkeypatch):
     from dataclasses import replace
+
     from scipy import sparse
+
     import subhkl.search.poisson_orientation as engine
 
     class Model:

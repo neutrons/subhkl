@@ -12,7 +12,6 @@ from functools import partial
 
 from scipy.special import ndtri
 
-
 _SOLVE_SSN_UNIFIED_JIT = None
 
 
@@ -127,7 +126,7 @@ def _solve_ssn_unified_impl(
         dq = jnp.linalg.solve(DG, -Gq).astype(jnp.float32)
 
         def bt_cond(bt_state):
-            bt_i, step_size, _, _, j_test, j_curr = bt_state
+            bt_i, _step_size, _, _, j_test, j_curr = bt_state
             is_valid = jnp.isfinite(j_test)
             return (bt_i < 8) & ((j_test > j_curr) | ~is_valid)
 

@@ -4,6 +4,261 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.8]
+
+### Added
+
+- Per-step live `mm:ss.ms` stopwatch overlay in the lower-right corner of the
+  `Terminal // Stdio` pane (`#stdio-stopwatch`) across `subhkl-nova-app` and
+  `rainbow-visualize`, featuring an animated skinny 5-stripe Rainbow Islands
+  arch with 8-bit sparkles, transient stage-milestone/completion arcade quips,
+  server-synchronized `step_timings` persistence, click-to-cycle step split
+  inspection (`1. Reduce`, `2. Solve`, `3. Integrate`, `4. Merge`, and
+  `Σ Total`), and an Arcade Mode slow-motion rolling-odometer cheat code
+  (`↑↑↓↓←→←→BA` or `RAINBOW`).
+
+### Changed
+
+- Accelerated `solve --refinement band` startup, blind band discovery, and EM
+  scoring on GPU and eliminated redundant per-run XLA recompilations:
+  - Enabled persistent on-disk JAX compilation caching (`~/.cache/subhkl/jax`)
+    in `solve` (`enable_jax_compilation_cache`) and hoisted nested
+    `refine_band_geometry` Adam/L-BFGS-B closures to module-level bucket-padded
+    `@jax.jit` kernels so observation arrays are passed dynamically rather than
+    baked as HLO constants.
+  - Shared single-pass HDF5 slab loading (`load_binned_nexus_panels`) and
+    batched JAX GPU 2D `median`/`75th`-percentile background filters,
+    mask-cached EDT fill, and `jax.vmap` IEEE FP32 (`Precision.HIGHEST`)
+    multi-run reflection splatting across `load_observations` and
+    `PixelEMClassifier`, plus a `@jax.jit` $S^2$ outer-goniometer scan-axis
+    recovery sweep.
+- Auto-scrolled the `Terminal // Stdio` log pane as live output appends
+  (`tail -f` behavior), automatically pausing auto-scroll to keep selected or
+  scrolled-up log content steady until the user scrolls back to the bottom.
+- Removed parallax tether lines connecting predicted Bragg peak rings to
+  detector spots in Rainbow Zones so shifting the parallax view leaves raw
+  detector pixels completely unoccluded.
+
+### Fixed
+
+- Fixed CPU CI out-of-memory failures (`exit code 143`) and long runtimes on
+  dense raw-pixel `band_table` searches by decomposing `band_table` into fixed
+  2D `[2048, <=16384]` dot/zone kernels with $S^2 \times (q_{\text{lo}},
+  q_{\text{hi}})$ solid-angle quadrature coalescing when pixel clouds exceed
+  $65,536$ bins and releasing temporary `run_spherical_index` arrays early.
+
+## [1.5.7]
+
+### Added
+
+- 3-state Expectation-Maximization (`valid=0`, `dark=1`, `bright=2`) static
+  detector pixel classifier (`PixelEMClassifier`) integrated across blind band
+  discovery, staged band/Ewald refinement, and peak prediction:
+  - Identifies static dark regions (dead detector banks, cryostat/panel
+    shadows) via ambient-deficit and missing-predicted-reflection likelihoods
+    with nearest-valid EDT background fill, and static bright artifacts
+    (parasitic Al magnet/sample-environment flares, hot pixels) via a
+    crystallographic Wilson Bragg exponential model and multi-orientation
+    persistence across $N \ge 1$ goniometer frames.
+  - Reweights and M-step re-polishes coarse orientation candidates in
+    `blind_band`, updates per-stage observation weights and Ewald excess maps
+    in `scan_band` without JAX recompilation, persists
+    `detector/{mask_bank_ids,pixel_mask,pixel_class}` in `solve.h5`, and
+    filters masked reflections in `peak-predictor` while propagating the
+    `detector` mask group downstream.
+- Two-color translucent `Mask` overlay in Rainbow Zones (`subhkl-nova-app` and
+  `rainbow-visualize`) rendering classified `Dark` and `Bright` detector
+  regions on curvilinear warped panels (including browser-side `h5wasm` loading)
+  with sidebar pixel class percentages.
+
+### Changed
+
+- Auto-selected CLI `solve --refinement band` default binning (`binning=8` for
+  single/few-frame runs with $\le 240$ panel images, `binning=16` for larger
+  multi-run scans) and gated `blind_band` quadrature/table bins to
+  kinematically active $2\theta$ angles so coarse $d_{\min}$ single-frame
+  solves resolve closely spaced zones.
+  - Vectorized multi-bank EM reflection projection and 2D grid-stencil splatting,
+  cached clean median backgrounds and module-level `@jax.jit` Ewald/omega scan
+  kernels, and concatenated active-bin `band_table` chunks on-device.
+- Added model-free outer-goniometer motor validation and recovery
+  (`recover_unlogged_outer_goniometer`) for multi-run inner-axis scans where
+  outer goniometer motors (for example `omega`, `kappa`) were omitted from raw
+  NeXus DASlogs, together with multi-branch `kappa` angle decomposition when
+  writing `goniometer/angles`.
+- Improved 3D band indexing on strongly anisotropic and streaky crystals
+  (such as Mesolite, $b = 56.55\,\text{\AA}$ vs. $c = 6.54\,\text{\AA}$):
+  - Fixed `laue_order_stencil` rotation step sizes to use perpendicular
+    direct-space lever arms $\max_{j \ne i} |\hat{\mathbf{a}}_i \times
+    \mathbf{a}_j|$, added `float32` coarse-zone Adam stencil screening and
+    Laue-proper symmetry deduplication across `refine_band_geometry` and
+    `distinct_orientations`, and widened coarse zone coverage and Ewald
+    background pooling ($56 \times 56\,\text{px}$) so streaky reflections are
+    not self-subtracted.
+
+### Fixed
+
+- Fixed post-solve `Files` drawer and `Mask` reload state in `subhkl-nova-app`
+  where `runningStageIdx` remained set during completion reload and hid newly
+  produced stage artifacts.
+- Fixed the upper-right `Tab` button inside `<iframe srcdoc>` views by hiding
+  it in standalone top-level tabs and resolving `window.parent.location.href`
+  when embedded in a host page.
+
+## [1.5.6]
+
+### Added
+
+- Laue-order-aware $S^2$ spherical-cap max-envelope `lattice_ladder`
+  (`score_band_table_env`) and crystallographic $\Delta\mathbf{m} \in
+  \{-1,0,+1\}^3$ Laue-order stencil co-refinement (`laue_order_stencil`,
+  `refine_band_geometry`) to solve single-frame stills and multi-frame scans
+  under uncalibrated detector geometry scissor.
+- Automatic local `/SNS` and `/HFIR` filesystem fallback in `subhkl-nova-app`
+  when NDIP Galaxy or ONCat is unconfigured or unreachable:
+  - Direct NeXus/HDF5 path verification, lightweight HDF5 header metadata
+    harvesting (`title`, `DASlogs` goniometer angles, `duration`), and sibling
+    `IPTS-*` auto-suggestion on typos.
+  - Offline `/SNS/<INST>/IPTS-*/nexus` and `/HFIR/<INST>/IPTS-*/nexus`
+    experiment and run catalog browsing.
+- Stepped run-interval syntax in the Load Neutron Data run selector (for
+  example `2632-2638/2`, `2632:2638:2`, or `2632-2638..2`).
+
+### Changed
+
+- Unified $N \ge 1$ `scan_band` preconditioning and geometry regularization so
+  single-frame solves retain anisotropic axial scale (`s_ax`), `parameter_units`
+  preconditioning across Stages `0`–`1b`, and `reg_geom = 5.0`.
+- Switched uncalibrated count-mode `blind_band` search to deterministic
+  top-positive deviance bin selection and capped multi-frame `band_table`
+  construction at `131,072` bins.
+
+### Fixed
+
+- Fixed an async polling race in `subhkl-nova-app` where finishing `solve` runs
+  could overwrite a newly entered UI $d_{\min}$ with an earlier solve's
+  $d_{\min}$.
+- Automatic Podman base-image fallback to cached `:main` / `:latest` (with
+  bind-mounted `subhkl`) when launching local GPU stages from an unbuilt git
+  branch checkout or offline registry.
+- Immediate local Podman GPU container termination on Stop (`podman kill` +
+  `podman rm -f -i -t 0`) instead of timing out against Podman's 10-second
+  `SIGTERM` grace period.
+
+## [1.5.5]
+
+### Added
+
+- Unit cell metadata history on Galaxy datasets in `subhkl-nova-app`:
+  - Unit cell parameters ($a, b, c, \alpha, \beta, \gamma$) and space group are
+    persisted as dataset annotations/tags when datasets are loaded or produced
+    and retrieved alongside Galaxy history.
+  - Per-field hoverable autocomplete dropdown in the Load Neutron Data dialog
+    that tentatively previews matching sibling unit cell and space group values
+    in gray on hover/arrow navigation and commits them in white on selection.
+  - Flexible clipboard paste parser in all unit cell and space group inputs
+    (accepts `a b c alpha beta gamma` with space group at the front, at the end,
+    or omitted).
+  - Crystal-system symmetry proposals when selecting a space group (automatically
+    linking/proposing constrained lengths and angles such as $a=b=c$ and
+    $\alpha=\beta=\gamma=90^\circ$ for cubic, while remaining manually
+    overrideable).
+
+### Changed
+
+- Condensed Space Group and unit cell inputs ($a, b, c, \alpha, \beta, \gamma$)
+  in the Load Neutron Data dialog into a compact single row.
+- Updated HFIR `CG4D` default wavelength range in `reduction_settings.json` to
+  `[2.8, 4.5]` Å (with initial $d_{\min} = 1.4$ Å).
+
+### Fixed
+
+- Preserved UI-configured $d_{\min}$, $\lambda_{\min}$, and $\lambda_{\max}$
+  when running or re-running `solve` instead of resetting $d_{\min}$ to
+  $\lambda_{\min} / 2$.
+- Guarded optional `nova.mvvm` and `trame` imports in `MainApp` so base unit
+  tests pass when the `nova` extra is not installed.
+
+## [1.5.4]
+
+### Added
+
+- Emitted runner hostname from CLI commands and displayed `[hostname] RUNNING`
+  in the `subhkl-nova-app` pipeline status badge to distinguish load-balanced
+  NDIP Pulsar workers.
+- Added a synchronized $d_{\min}$ resolution slider in the sidebar coupled to
+  the Params bar, auto-populated $\lambda_{\min}$ / $\lambda_{\max}$ in the
+  Params bar with instrument defaults from `reduction_settings.json`, and added
+  unscaled $I/\sigma$ reflection coloring after integration.
+
+### Fixed
+
+- Fixed Galaxy `solve.h5` $\rightarrow$ `integrate` image dataset resolution so
+  `peak_predictor` receives the underlying `merged.h5` detector image stack
+  rather than `solve.h5`.
+- Restored post-merge Careless resolution-bin sparklines ($\mathrm{CC}_{1/2}$,
+  $\langle I/\sigma \rangle$, completeness) and downloadable step artifacts.
+
+## [1.5.3]
+
+### Added
+
+- "From Galaxy..." dataset selector modal in `subhkl-nova-app`, sorting Galaxy
+  history by most-recently-touched first and truncating the recent dropdown list.
+
+### Fixed
+
+- Refined Galaxy dataset validation and classification, loading cues, Careless
+  residual extraction, and downstream stage invalidation when re-running earlier
+  stages.
+- Avoided resolving Pulsar staging `dataset_*.dat` paths as local `images_file`
+  and started `subhkl-nova-app` without a preloaded local dataset.
+
+## [1.5.2]
+
+### Fixed
+
+- Prevented the Load Neutron Data IPTS selector from flipping back to the first
+  entry while typing or selecting an experiment, and preserved query parameters
+  when rewriting `EP_PATH` in `MainApp`.
+
+## [1.5.1]
+
+### Added
+
+- Calibrated TOPAZ detector geometry (`instruments/topaz_detector.json`, 24 panels)
+  and ISAW `.DetCal` converter script (`scripts/detcal_to_json.py`).
+- Per-peak angular and $d$-spacing error export in `metrics` (`--per-peak` written
+  to a separate HDF5 file, distinct `frame` and `panel` columns, `--bins`, and
+  default `metrics.csv` / `metrics.png` filenames for bare `--csv` / `--plot`).
+- Finder-free `solve --refinement band` integration test for multi-run mesolite.
+
+### Changed
+
+- `subhkl-nova-app` UI improvements:
+  - Side-by-side split view for the Wulff stereogram and detector assembly after
+    merge, with coupled reflection target reticles and parallax across both views.
+  - Window-independent detector panel aspect ratio, pre-warped offscreen panel
+    texture caching for smooth pan/zoom, and dynamic horizontal scaling of the top
+    and bottom bars.
+  - Per-step Play/Stop job cancellation, Galaxy scheduler `misc_info` error
+    reporting, blank-by-default Load Neutron Data dialog (with retired IMAGINE
+    image-plate entry removed), new `sUBhkl` logo/favicon, and dynamic version
+    and container tag resolution.
+
+### Fixed
+
+- Blind zone-pair orientation proposal in `solve` now includes primitive lattice
+  generators so centered cells ($F$, $I$, $C$, $R$) with long axes are not missed
+  by the conventional $|u|,|v|,|w| \le 4$ cap.
+- `FindUB.minimize` wraps DE Rodrigues vectors into the principal ball before
+  L-BFGS-B polish and uses a two-stage wide-to-tight Gaussian funnel for
+  long-axis cells.
+- Radial peak-profile width estimation filters outlier widths with a monotonic
+  $2\theta$ prior.
+- Indexer preserves `peaks/run_index` instead of overwriting it with
+  `peaks/image_index`.
+
 ## [1.5.0]
 
 ### Changed

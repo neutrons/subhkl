@@ -1,5 +1,5 @@
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
 
 def plot_error_histograms(
@@ -19,6 +19,7 @@ def plot_error_histograms(
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
     axes[0].hist(d_err, bins=bins, color="tab:blue", edgecolor="black")
+    axes[0].ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
     axes[0].set_xlabel("d spacing error")
     axes[0].set_ylabel("count")
     axes[0].set_title(f"d_err (n={len(d_err)})")
@@ -65,6 +66,8 @@ def plot_per_frame_histograms(
 
         ax_d.hist(d_err[mask], bins=d_bins, color="tab:blue", edgecolor="black")
         ax_ang.hist(ang_err[mask], bins=ang_bins, color="tab:orange", edgecolor="black")
+        # d_err values are tiny, so plain tick labels run together
+        ax_d.ticklabel_format(axis="x", style="sci", scilimits=(0, 0))
 
         ax_d.set_ylabel(f"frame {frame}\ncount")
         if row == 0:

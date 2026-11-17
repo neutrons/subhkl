@@ -126,7 +126,7 @@ class SubhklConfig(BaseModel):
         description="Maximum incident wavelength (Å)",
     )
     d_min: float = Field(
-        default=2.8,
+        default=1.4,
         gt=0.3,
         le=20.0,
         title="d_min (Å)",
@@ -178,20 +178,16 @@ class SubhklGalaxyModel:
             if instrument in InstrumentOptions.__members__
             else InstrumentOptions.CG4D
         )
-        default_peaks = "/home/xvg/subhkl-examples/betalac-7/solve.h5"
-        default_images = "/home/xvg/subhkl-examples/betalac-7/merged.h5"
-        resolved_peaks = (
-            str(peaks_h5)
-            if peaks_h5
-            else (default_peaks if os.path.isfile(default_peaks) else "")
-        )
-        resolved_images = (
-            str(images_h5)
-            if images_h5
-            else (default_images if os.path.isfile(default_images) else "")
-        )
+        from subhkl.viz.rainbow_zones import _get_instrument_default_wavelength
+
+        def_wl = _get_instrument_default_wavelength(inst.value)
+        resolved_peaks = str(peaks_h5) if peaks_h5 else ""
+        resolved_images = str(images_h5) if images_h5 else ""
         self.data = SubhklConfig(
             instrument=inst,
+            wavelength_min=round(float(def_wl[0]), 3),
+            wavelength_max=round(float(def_wl[1]), 3),
+            d_min=round(0.5 * float(def_wl[0]), 2),
             peaks_file=resolved_peaks,
             images_file=resolved_images,
         )
@@ -200,34 +196,55 @@ class SubhklGalaxyModel:
         self.last_job_result: dict[str, Any] = {}
         self.refresh_payload()
 
-    def refresh_payload(self, frame_index: int | None = None) -> dict[str, Any] | None:
+    def refresh_payload(
+        self,
+        frame_index: int | None = None,
+        preserve_params: bool = False,
+    ) -> dict[str, Any] | None:
         """Rebuild the Diffraction Parallax & Lattice Ladder payload from current HDF5 files."""
         if frame_index is not None:
             self.frame_index = int(frame_index)
-        if not self.data.peaks_file or not os.path.isfile(self.data.peaks_file):
-            return self.payload
+        saved_wl_min = float(self.data.wavelength_min)
+        saved_wl_max = float(self.data.wavelength_max)
+        saved_d_min = float(self.data.d_min)
+        has_peaks = bool(self.data.peaks_file and os.path.isfile(self.data.peaks_file))
+        from subhkl.viz.rainbow_zones import _discover_images_h5
 
-        img_path = None
-        if self.data.images_file and os.path.isfile(self.data.images_file):
-            img_dir = os.path.dirname(os.path.abspath(self.data.images_file))
-            pk_dir = os.path.dirname(os.path.abspath(self.data.peaks_file))
-            tmp_root = os.path.abspath(tempfile.gettempdir())
-            if img_dir == pk_dir or (
-                img_dir.startswith(tmp_root) and pk_dir.startswith(tmp_root)
-            ):
+        img_path = _discover_images_h5(self.data.peaks_file) if has_peaks else None
+        if (
+            not img_path
+            and self.data.images_file
+            and os.path.isfile(self.data.images_file)
+        ):
+            if not has_peaks:
                 img_path = self.data.images_file
+            else:
+                img_dir = os.path.dirname(os.path.abspath(self.data.images_file))
+                pk_dir = os.path.dirname(os.path.abspath(self.data.peaks_file))
+                if img_dir == pk_dir or os.path.abspath(
+                    self.data.images_file
+                ) == os.path.abspath(self.data.peaks_file):
+                    img_path = self.data.images_file
         self.payload = build_rainbow_zone_payload(
-            replay_h5=self.data.peaks_file,
+            replay_h5=(self.data.peaks_file if has_peaks else None),
             instrument=self.data.instrument.value,
             space_group=self.data.space_group,
-            cell=[
-                float(self.data.a),
-                float(self.data.b),
-                float(self.data.c),
-                float(self.data.alpha),
-                float(self.data.beta),
-                float(self.data.gamma),
-            ],
+            cell=(
+                None
+                if has_peaks
+                else [
+                    float(self.data.a),
+                    float(self.data.b),
+                    float(self.data.c),
+                    float(self.data.alpha),
+                    float(self.data.beta),
+                    float(self.data.gamma),
+                ]
+            ),
+            wavelength_range=(
+                (saved_wl_min, saved_wl_max) if preserve_params else None
+            ),
+            d_min=(saved_d_min if preserve_params else None),
             max_zone_index=self.data.max_zone_index,
             images_h5=img_path,
             frame_index=self.frame_index,
@@ -251,17 +268,27 @@ class SubhklGalaxyModel:
         sg = self.payload.get("space_group")
         if sg and sg not in ("Unknown", "P 1"):
             self.data.space_group = str(sg)
-        wl_range = self.payload.get("wavelength_range") or []
-        if len(wl_range) >= 2 and float(wl_range[1]) > float(wl_range[0]) > 0:
-            self.data.wavelength_min = round(float(wl_range[0]), 3)
-            self.data.wavelength_max = round(float(wl_range[1]), 3)
-        if (
-            self.payload.get("artifact_kind") in ("merged", "raw_nexus")
-            and len(wl_range) >= 2
-        ):
-            self.data.d_min = round(0.5 * float(wl_range[0]), 2)
-        elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
-            self.data.d_min = round(float(self.payload["d_min"]), 2)
+        if preserve_params:
+            self.data.wavelength_min = round(saved_wl_min, 3)
+            self.data.wavelength_max = round(saved_wl_max, 3)
+            self.data.d_min = round(saved_d_min, 2)
+            self.payload["wavelength_range"] = [
+                self.data.wavelength_min,
+                self.data.wavelength_max,
+            ]
+            self.payload["d_min"] = self.data.d_min
+        else:
+            wl_range = self.payload.get("wavelength_range") or []
+            if len(wl_range) >= 2 and float(wl_range[1]) > float(wl_range[0]) > 0:
+                self.data.wavelength_min = round(float(wl_range[0]), 3)
+                self.data.wavelength_max = round(float(wl_range[1]), 3)
+            if (
+                self.payload.get("artifact_kind") in ("empty", "merged", "raw_nexus")
+                and len(wl_range) >= 2
+            ):
+                self.data.d_min = round(0.5 * float(wl_range[0]), 2)
+            elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
+                self.data.d_min = round(float(self.payload["d_min"]), 2)
         return self.payload
 
     def render_html(self) -> str:
@@ -349,8 +376,17 @@ class SubhklGalaxyModel:
             outputs = tool.run(data_store, params, wait=True)
             downloaded_path = None
             if outputs is not None:
+                import contextlib
+
                 for out_name in ("output_solved", "output_peaks", "output"):
-                    try:
+                    with contextlib.suppress(
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                        AttributeError,
+                    ):
                         ds = outputs.get_dataset(out_name)
                         target = os.path.join(
                             tempfile.gettempdir(),
@@ -359,8 +395,6 @@ class SubhklGalaxyModel:
                         ds.download(target)
                         downloaded_path = target
                         break
-                    except Exception:
-                        continue
 
             if downloaded_path and os.path.isfile(downloaded_path):
                 self.data.peaks_file = downloaded_path

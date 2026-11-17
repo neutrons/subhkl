@@ -1,6 +1,7 @@
-import pytest
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
+import pytest
+
 from subhkl.optimization import VectorizedObjective
 
 
@@ -67,7 +68,7 @@ def test_jax_1_to_n_broadcasting_bug():
         offsets_total = results[5]
         R = results[6]
 
-    except Exception as e:
+    except (TypeError, ValueError, RuntimeError, IndexError) as e:
         pytest.fail(f"Broadcasting bug triggered! JAX raised: {e}")
 
     # 1. The optimizer should have allocated exactly 4 offset parameters

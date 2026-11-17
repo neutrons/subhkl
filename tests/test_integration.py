@@ -147,7 +147,7 @@ def test_mesolite():
             ax[3].minorticks_on()
             ax[3].set_aspect(1)
 
-            name, ext = os.path.splitext(im_name)
+            name, _ext = os.path.splitext(im_name)
 
             directory = os.path.dirname(os.path.abspath(__file__))
 

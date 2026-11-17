@@ -1,16 +1,16 @@
-import os
 import bisect
+import os
 from dataclasses import dataclass, field
+
 import numpy as np
-from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True)
 class ImageData:
-    ims: Dict[int, np.ndarray]
-    file_offsets: Optional[np.ndarray] = None
-    raw_files: Optional[List[str]] = None
-    bank_mapping: Dict[int, int] = field(default_factory=dict)
+    ims: dict[int, np.ndarray]
+    file_offsets: np.ndarray | None = None
+    raw_files: list[str] | None = None
+    bank_mapping: dict[int, int] = field(default_factory=dict)
 
     def get_label(self, img_key: int) -> str:
         files = self.raw_files

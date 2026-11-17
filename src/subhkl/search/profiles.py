@@ -4,8 +4,9 @@ The measurement routines retain their bright-window qualification rules.
 They estimate a shape prior; they do not select pixels for the count solver.
 """
 
-import numpy as np
 from dataclasses import dataclass
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -67,8 +68,210 @@ class RadialProfile:
         )
 
 
+#: Two-aperture consistency (see the width census): a neighbour strong enough
+#: to inflate the wide aperture inflates the tight one differently, and 6%
+#: keeps every clean synthetic peak while removing the runaway tail.
+_WIDTH_TIGHT_APERTURE = 2.5
+_WIDTH_WIDE_APERTURE = 3.5
+_WIDTH_CONSISTENCY_TOL = 0.06
+
+
+def _truncated_m2_ratio(x):
+    """``m2(R)/sigma**2`` for a 2D Gaussian truncated at R, ``x = R**2/(2 sigma**2)``."""
+    if x <= 0:
+        return 0.0
+    if x > 60:
+        return 2.0
+    ex = np.exp(-x)
+    return 2.0 * (1.0 - (1.0 + x) * ex) / (1.0 - ex)
+
+
+def _sigma_from_truncated_m2(m2, aperture):
+    """Invert the truncation: the sigma whose truncated m2 matches."""
+    from scipy.optimize import brentq
+
+    if m2 <= 0 or aperture <= 0:
+        return float("nan")
+
+    def resid(sigma):
+        return sigma**2 * _truncated_m2_ratio(aperture**2 / (2 * sigma**2)) - m2
+
+    try:
+        if resid(0.05) * resid(60.0) > 0:
+            return float("nan")
+        return float(brentq(resid, 0.05, 60.0, xtol=1e-6))
+    except (ValueError, ZeroDivisionError):
+        return float("nan")
+
+
+def _width_at_aperture(frame, bg_patch_src, row, col, guess, max_half, k):
+    """Truncation-corrected sigma at an aperture of ``k`` sigma, iterated
+    with damping so it cannot oscillate.  Centroid from clipped weights
+    (stability), moments from *unclipped* values inside a circular aperture:
+    clipping rectifies background noise into a pedestal that inflates m2."""
+    height, width = frame.shape
+    r0, c0 = round(float(row)), round(float(col))
+    outer = max_half
+    if not (outer < r0 < height - outer and outer < c0 < width - outer):
+        return float("nan")
+    sl_out = (slice(r0 - outer, r0 + outer + 1), slice(c0 - outer, c0 + outer + 1))
+    raw_out = frame[sl_out]
+    bg_out = bg_patch_src[sl_out]
+    rr_out, cc_out = np.mgrid[sl_out].astype(float)
+    d2_0 = (rr_out - row) ** 2 + (cc_out - col) ** 2
+    ring = (d2_0 >= (outer - 3.0) ** 2) & (d2_0 <= outer**2)
+    bg_offset = (
+        float(np.median(raw_out[ring] - bg_out[ring])) if ring.sum() >= 8 else 0.0
+    )
+    # In the bright-background regime (bg >= 16 counts/px), compute_rate_batch
+    # falls back to a windowed box mean, which a bright peak's own flux
+    # inflates by +3..6 counts/px inside the filter window.  That positive
+    # background bias makes the peak skirt go negative inside the wide
+    # aperture while leaving the tight aperture positive, so genuine bright
+    # peaks fail two-aperture consistency while broad pedestals pass.  Adding
+    # min(bg_offset, 0.0) removes the peak-induced over-subtraction without
+    # ever raising the background on a clean frame.
+    bg_corr = min(bg_offset, 0.0)
+
+    sigma = guess
+    for _ in range(12):
+        aperture = min(k * sigma, max_half)
+        half = int(np.ceil(aperture)) + 1
+        if not (half < r0 < height - half and half < c0 < width - half):
+            return float("nan")
+        sl = (slice(r0 - half, r0 + half + 1), slice(c0 - half, c0 + half + 1))
+        patch = frame[sl] - (bg_patch_src[sl] + bg_corr)
+        rr, cc = np.mgrid[sl].astype(float)
+        pos = np.maximum(patch, 0.0)
+        if pos.sum() <= 0:
+            return float("nan")
+        cr = (pos * rr).sum() / pos.sum()
+        cq = (pos * cc).sum() / pos.sum()
+        d2 = (rr - cr) ** 2 + (cc - cq) ** 2
+        inside = d2 <= aperture**2
+        flux = patch[inside].sum()
+        if flux <= 0:
+            return float("nan")
+        m2 = (patch[inside] * d2[inside]).sum() / flux
+        if not np.isfinite(m2) or m2 <= 0:
+            return float("nan")
+        new = _sigma_from_truncated_m2(m2, aperture)
+        if not np.isfinite(new):
+            return float("nan")
+        if abs(new - sigma) < 0.01:
+            sigma = float(new)
+            break
+        sigma = 0.5 * (sigma + new)
+    # If the tight aperture itself clips at max_half, both tight and wide
+    # apertures evaluate the identical disk R = max_half and agree trivially
+    # (|wide - tight|/tight = 0) on any window-filling shadow or flare.
+    if _WIDTH_TIGHT_APERTURE * sigma > max_half - 0.5:
+        return float("nan")
+    return float(sigma)
+
+
+def _filter_widths_by_prior(widths, two_theta=None):
+    """Filter candidate peak widths against a smooth monotonic prior vs.
+    scattering angle ``two_theta`` (degrees) or resolution ``sin(theta)``.
+
+    Diffraction spot widths vary smoothly and monotonically with ``sin(theta)``
+    (wavelength spread, divergence, mosaicity, and oblique incidence), whereas
+    detector artifacts (direct-beam halos at low ``2theta``, panel shadows, or
+    unmasked edge steps) appear as isolated large-radius outliers or
+    non-monotonic spikes.  Fitting a robust non-decreasing quadratic prior
+    ``sigma(s) = b0 + b1 * s + b2 * s**2`` in ``s = sin(theta)`` with
+    ``b1, b2 >= 0`` and asymmetric upward Cauchy loss rejects both halo
+    outliers and non-monotonic artifact clusters.
+    """
+    from scipy.optimize import least_squares
+
+    w = np.asarray(widths, dtype=float)
+    if w.size < 8:
+        return w, np.ones(w.size, dtype=bool), w.copy()
+
+    q25 = float(np.percentile(w, 25.0))
+    q50 = float(np.percentile(w, 50.0))
+    scale = max(1.4826 * (q50 - q25), 0.05 * q50, 0.08)
+
+    if two_theta is None:
+        pred = np.full_like(w, q50)
+        diff = w - pred
+        inlier_mad = max(
+            float(np.median(np.abs(diff[diff <= scale]))) * 1.4826
+            if np.any(diff <= scale)
+            else scale,
+            0.05 * q50,
+            0.08,
+        )
+        keep = (w >= 0.5 * pred) & (w <= pred + 2.5 * inlier_mad)
+        return w[keep], keep, pred
+
+    tt = np.asarray(two_theta, dtype=float)
+    s = np.sin(0.5 * np.radians(np.clip(tt, 0.0, 179.0)))
+
+    def resid(p):
+        pred_s = p[0] + p[1] * s + p[2] * (s**2)
+        r_data = (w - pred_s) / scale
+        r_asym = np.where(r_data > 0, 2.5 * r_data, r_data)
+        w_reg = np.sqrt(max(w.size, 1))
+        r_reg = np.array([w_reg * p[1] / (0.15 * q50), w_reg * p[2] / (0.10 * q50)])
+        return np.concatenate([r_asym, r_reg])
+
+    try:
+        res = least_squares(
+            resid,
+            x0=[q25, 0.05 * q25, 0.0],
+            bounds=([0.3, 0.0, 0.0], [np.inf, 0.35 * q50, 0.20 * q50]),
+            loss="cauchy",
+            f_scale=1.0,
+        )
+        pred = res.x[0] + res.x[1] * s + res.x[2] * (s**2)
+    except (ValueError, RuntimeError):
+        pred = np.full_like(w, q50)
+
+    diff = w - pred
+    inlier_sel = diff <= scale
+    inlier_mad = max(
+        float(np.median(np.abs(diff[inlier_sel]))) * 1.4826
+        if np.any(inlier_sel)
+        else scale,
+        0.04 * float(np.median(pred)),
+        0.08,
+    )
+    keep = (w >= 0.5 * pred) & (w <= pred + 2.0 * inlier_mad)
+    return w[keep], keep, pred
+
+
+def _lookup_two_theta(two_theta, fi, row, col, H, W):
+    """Evaluate scattering angle ``two_theta`` (degrees) at ``(fi, row, col)``,
+    or fall back to radial distance from the frame centre mapped onto
+    ``[0, 90]`` degrees when no detector geometry is supplied."""
+    if two_theta is not None:
+        if callable(two_theta):
+            return float(two_theta(fi, float(row), float(col)))
+        tt_arr = np.asarray(two_theta)
+        if tt_arr.ndim == 1:
+            return float(tt_arr[fi])
+        r_idx = int(np.clip(round(float(row)), 0, tt_arr.shape[-2] - 1))
+        c_idx = int(np.clip(round(float(col)), 0, tt_arr.shape[-1] - 1))
+        if tt_arr.ndim == 2:
+            return float(tt_arr[r_idx, c_idx])
+        return float(tt_arr[fi, r_idx, c_idx])
+    dr_c = (float(row) - 0.5 * (H - 1)) / max(0.5 * H, 1.0)
+    dc_c = (float(col) - 0.5 * (W - 1)) / max(0.5 * W, 1.0)
+    return float(np.clip(np.hypot(dr_c, dc_c) * 60.0, 0.0, 90.0))
+
+
 def measure_radial_profile(
-    images, bg_map, bg_hi, max_sigma, min_windows=8, u_max=4.0, du=0.1, valid=None
+    images,
+    bg_map,
+    bg_hi,
+    max_sigma,
+    min_windows=8,
+    u_max=4.0,
+    du=0.1,
+    valid=None,
+    two_theta=None,
 ):
     """The peak family's radial profile, measured from the frames themselves.
 
@@ -90,6 +293,12 @@ def measure_radial_profile(
     than ``min_windows`` qualify -- the caller then stays on the Gaussian,
     which is the safe default rather than a profile made of too few peaks.
     """
+    frames = np.asarray(images, dtype=np.float32)
+    if frames.ndim == 2:
+        frames = frames[None, ...]
+    bgs = np.asarray(bg_map, dtype=np.float32)
+    if bgs.ndim == 2:
+        bgs = bgs[None, ...]
     excess = np.asarray(images, dtype=np.float64) - np.asarray(bg_map, dtype=np.float64)
     if excess.ndim == 2:
         excess = excess[None, ...]
@@ -101,7 +310,7 @@ def measure_radial_profile(
     centres = 0.5 * (edges[1:] + edges[:-1])
     acc = np.zeros(centres.size)
     wgt = np.zeros(centres.size)
-    n_used = 0
+    candidates = []
     for fi, frame in enumerate(excess):
         H, W = frame.shape
         # The window must hold a max_sigma peak out to ~2.5 sigma, or its
@@ -145,42 +354,61 @@ def measure_radial_profile(
                 # Voronoi ownership: only the window that owns its centroid.
                 if abs(dr) > step / 2 or abs(dc) > step / 2:
                     continue
-                d2 = (yy - dr) ** 2 + (xx - dc) ** 2
-                disk = d2 <= step**2
-                flux_d = float(win[disk].sum())
-                if flux_d <= 0:
+                row, col = r0 + dr, c0 + dc
+                tight = _width_at_aperture(
+                    frames[fi], bgs[fi], row, col, 3.0, step, _WIDTH_TIGHT_APERTURE
+                )
+                wide = _width_at_aperture(
+                    frames[fi], bgs[fi], row, col, 3.0, step, _WIDTH_WIDE_APERTURE
+                )
+                if not (np.isfinite(tight) and np.isfinite(wide)) or tight <= 0:
                     continue
-                m2 = float((win[disk] * d2[disk]).sum()) / flux_d
-                # Invert the truncation: inside radius R a Gaussian returns
-                # m2 = sigma^2 * 2(1 - (1+x)e^-x)/(1 - e^-x), x = R^2/2sigma^2.
-                # A damped fixed point converges in a few steps and needs no
-                # bracketing solver.
-                sigma_w = np.sqrt(max(m2, 1e-9) / 2.0)
-                for _ in range(8):
-                    x = step**2 / (2.0 * sigma_w**2)
-                    ex = np.exp(-min(x, 60.0))
-                    ratio = 2.0 * (1.0 - (1.0 + x) * ex) / max(1.0 - ex, 1e-9)
-                    new_sigma = np.sqrt(max(m2, 1e-9) / max(ratio, 1e-9))
-                    if abs(new_sigma - sigma_w) < 0.005:
-                        sigma_w = new_sigma
-                        break
-                    sigma_w = 0.5 * (sigma_w + new_sigma)
+                if abs(wide - tight) / tight > _WIDTH_CONSISTENCY_TOL:
+                    continue
+                sigma_w = float(wide)
                 # A width at the window scale was never bracketed.
                 if sigma_w < 0.5 or sigma_w > step / 2.5:
                     continue
-                u = np.sqrt(d2[disk]).ravel() / sigma_w
-                v = win[disk].ravel() / flux_d
-                which = np.clip((u / du).astype(int), 0, centres.size - 1)
-                inside = u < u_max
-                # Flux-weighted mean of the unit-flux pixel values per u bin:
-                # acc/wgt is then the average profile, bright peaks weighted by
-                # their better statistics.
-                np.add.at(acc, which[inside], flux * v[inside])
-                counts = np.bincount(which[inside], minlength=centres.size).astype(
-                    float
+                d2 = (yy - dr) ** 2 + (xx - dc) ** 2
+                ring = (d2 >= (step - 3.0) ** 2) & (d2 <= step**2)
+                bg_corr = min(
+                    float(np.median(win[ring])) if ring.sum() >= 8 else 0.0, 0.0
                 )
-                wgt += flux * counts
-                n_used += 1
+                win_c = win - bg_corr
+                disk = d2 <= step**2
+                flux_d = float(win_c[disk].sum())
+                if flux_d <= 0:
+                    continue
+                tt = _lookup_two_theta(two_theta, fi, row, col, H, W)
+                candidates.append(
+                    (sigma_w, tt, flux, d2[disk].ravel(), win_c[disk].ravel(), flux_d)
+                )
+
+    if len(candidates) < min_windows:
+        return None
+    cand_widths = np.asarray([c[0] for c in candidates], dtype=float)
+    cand_tts = (
+        np.asarray([c[1] for c in candidates], dtype=float)
+        if two_theta is not None
+        else None
+    )
+    _, keep, _ = _filter_widths_by_prior(cand_widths, cand_tts)
+    n_used = 0
+    for idx, is_kept in enumerate(keep):
+        if not is_kept:
+            continue
+        sigma_w, _, flux, d2_disk, win_disk, flux_d = candidates[idx]
+        u = np.sqrt(d2_disk) / sigma_w
+        v = win_disk / flux_d
+        which = np.clip((u / du).astype(int), 0, centres.size - 1)
+        inside = u < u_max
+        # Flux-weighted mean of the unit-flux pixel values per u bin:
+        # acc/wgt is then the average profile, bright peaks weighted by
+        # their better statistics.
+        np.add.at(acc, which[inside], flux * v[inside])
+        counts = np.bincount(which[inside], minlength=centres.size).astype(float)
+        wgt += flux * counts
+        n_used += 1
     if n_used < min_windows:
         return None
     ok = wgt > 0
@@ -253,7 +481,7 @@ def measure_whitened_profile(
         v = np.asarray(valid[f], dtype=np.float64)
         for i in idx:
             half = int(np.ceil(u_max * sig_maj[i])) + 1
-            r0, c0 = int(round(rs[i])), int(round(cs[i]))
+            r0, c0 = round(rs[i]), round(cs[i])
             if not (half <= r0 < H - half and half <= c0 < W - half):
                 continue
             # one vote per peak: skip windows contaminated by a

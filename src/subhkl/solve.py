@@ -51,6 +51,13 @@ def _proposal_data(model, proposal_bin, g=None):
     from subhkl.search.spherical import panel_directions
 
     data = model.data
+    min_dim = (
+        min(min(idx.shape) for idx in data.pixel_indices.values()) * data.bin_px
+        if data.pixel_indices
+        else 0
+    )
+    if 0 < min_dim <= 256 and proposal_bin == 32:
+        proposal_bin = max(data.bin_px, min_dim // 32)
     factor = proposal_bin // data.bin_px
     if factor < 1 or proposal_bin % data.bin_px:
         raise ValueError("proposal binning must be a multiple of count binning")
@@ -62,8 +69,10 @@ def _proposal_data(model, proposal_bin, g=None):
         if h % factor or w % factor:
             raise ValueError("proposal binning must divide panel dimensions")
         valid = index >= 0
-        residual = np.zeros(index.shape)
-        residual[valid] = (data.counts - data.background)[index[valid]]
+        y = np.zeros(index.shape)
+        b = np.zeros(index.shape)
+        y[valid] = data.counts[index[valid]]
+        b[valid] = data.background[index[valid]]
         shape = (h // factor, factor, w // factor, factor)
         # Partly masked bins retain all valid counts and use their mean pixel
         # position; masks are not counted as zeros or as background exposure.
@@ -75,14 +84,20 @@ def _proposal_data(model, proposal_bin, g=None):
         row = row.reshape(shape).sum(axis=(1, 3))[live] / count[live]
         col = col.reshape(shape).sum(axis=(1, 3))[live] / count[live]
         dirs.append(panel_directions(dets[bank], row, col))
-        residuals.append(residual.reshape(shape).sum(axis=(1, 3))[live])
+        y_bin = y.reshape(shape).sum(axis=(1, 3))[live]
+        b_bin = np.maximum(b.reshape(shape).sum(axis=(1, 3))[live], 1e-6)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            term = np.where(y_bin > 0, y_bin * np.log(y_bin / b_bin), 0.0)
+        dev = np.sign(y_bin - b_bin) * 2.0 * np.maximum(term - (y_bin - b_bin), 0.0)
+        residuals.append(dev)
     return np.concatenate(dirs), np.concatenate(residuals)
 
 
 def propose(model, cell, n_candidates=4, proposal_bin=32, g=None):
     """Joint signed count proposals in the sample frame for multiple settings."""
-    from subhkl.search.spherical import lattice_ladder
+    from subhkl.search.blind_band import count_search_weights, sample_signed
     from subhkl.search.multi_setting import MultiSettingModel
+    from subhkl.search.spherical import lattice_ladder
 
     if isinstance(model, MultiSettingModel):
         directions, residuals, angles = [], [], []
@@ -96,10 +111,17 @@ def propose(model, cell, n_candidates=4, proposal_bin=32, g=None):
     else:
         D, weights = _proposal_data(model, proposal_bin, g)
         sin_theta = -D[:, 2]
+    raw_dev = np.asarray(weights, float)
+    pos_w = count_search_weights(raw_dev, max_quantile=0.999, max_factor=3.0)
+    weights = np.where(
+        raw_dev >= 0.0, pos_w, -1e-4 * np.sqrt(np.maximum(-raw_dev, 0.0))
+    )
     if not np.any(weights):
         raise ValueError(
             "no residual evidence for orientation proposals; supply a bootstrap to test the null"
         )
+    idx, weights = sample_signed(weights, 16384, seed=0)
+    D, sin_theta = D[idx], sin_theta[idx]
     # Absolute normalization preserves signs even at negative total excess.
     weights = weights / max(np.abs(weights).sum(), 1e-12)
     pool = max(20, 4 * n_candidates)
@@ -107,17 +129,20 @@ def propose(model, cell, n_candidates=4, proposal_bin=32, g=None):
         D,
         weights,
         model.B,
-        grid_deg=4.0,
-        n_shortlist=max(300, pool),
+        grid_deg=2.0,
+        n_shortlist=max(1000, pool),
         rungs=(
-            (13, 0.5, 2.5, max(100, pool), 5),
-            (30, 0.5, 1.0, max(60, pool), 5),
-            (60, 0.3, 0.5, pool, 5),
-            (145, 0.3, 0.25, pool, 5),
+            (13, 0.5, 1.5, max(300, pool), 5),
+            (30, 0.5, 1.0, max(80, pool), 5),
+            (60, 0.3, 0.5, max(24, pool), 5),
+            (145, 0.3, 0.25, max(24, pool), 5),
         ),
         sin_theta=sin_theta,
         wavelength=model.wavelength,
         d_min=model.d_min,
+        n_null=32,
+        seed=0,
+        space_group=getattr(model, "space_group", None),
         cands=None,
     )
     # Quotient by metric symmetries only when they also preserve the allowed
@@ -142,7 +167,7 @@ def propose(model, cell, n_candidates=4, proposal_bin=32, g=None):
     for U, score, _ in candidates:
         if any(
             min(Rotation.from_matrix(U @ (V @ S).T).magnitude() for S in symmetries)
-            < np.radians(0.5)
+            < np.radians(3.0)
             for V in selected
         ):
             continue
@@ -571,4 +596,10 @@ def run_solve(
         log(
             "All components are in solve/; sample/U selects the primary for existing single-crystal consumers."
         )
-    return dict(status=status, active=active, g=g, orientations=orientations, fit=fit)
+    return {
+        "status": status,
+        "active": active,
+        "g": g,
+        "orientations": orientations,
+        "fit": fit,
+    }

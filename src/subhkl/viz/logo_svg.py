@@ -1,0 +1,168 @@
+"""Official sUBhkl pre-rendered UI logo and Laue nodal-zone favicon definitions.
+
+- `SUBHKL_LOGO_HTML`: Pixel-grid-hinted 1x (90x24) and 2x Retina (179x48)
+  pre-rendered transparent PNG `<img>` of the Merriweather Sans `sUBhkl`
+  logo (eliminating browser SVG thin-stem antialiasing artifacts).
+- `SUBHKL_FAVICON_SVG`: Transparent-background square zoom into the left
+  nodal pole and converging Laue zone arcs of the 5VNQ Bragg diffraction
+  pattern from `logo 1.pdf`.
+"""
+
+from __future__ import annotations
+
+import base64
+
+_LOGO_PNG_1X_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAFoAAAAYCAYAAAB6OOplAAAEzElEQVR42u1ZS2hdRRj+7jVo"
+    "W091WmMzcJspRQPW1kd9BOrmLGorBnEhWoqgLgQLCYIQFy0ntkY40EUXgqkvRCEiIUrJpqg0"
+    "Ljwq+KLQtDGtraKdlDipGkc90dySNm4m5c9wHnPvTeNt6EBg3vecb77/m+8/Aa6UBSmFxfpi"
+    "sR/+DmClaZa8KBircP21AGLTPOdFwTUVrj8PoGiay4uLmESzIKNSkE1ZT+rfVbG+SH4/Ll4J"
+    "6tRyG6kfq5DNy1JRX2SysZY0/6pymw01MPoOUh8CgIZaXkgqPTNbF5wVapkvlW4HsD9nix8B"
+    "9AnOXqgApBNVvt76ahkN4HZSP3o5MvomAF1S6Rmp9P2OIJ2YB+kYrhXohgTWPQygFUAjgD9N"
+    "2BwUnE0sMKiPAjgLYBoAB/AAgB1kfDDDNVGQRixZeQzAfWbfXi8K0tjKyWU2WgPQc6VDKr0P"
+    "QGdG2O8SnO1dKJQFZwesrgGpdCexXJBKtwvOXs1h9GED8B4AL1rzno/98EkvCt6t4h7oAdBh"
+    "mnu8KHiJDN+ZKB1S6f0JII8BmKwhfC4F+JPWxdTsoNGnYz88mQDybHknAcQSaY6nuIoO0vWy"
+    "NcUj0TBONbqdTNokOCsIzkqCM89cWg8Kzg7WiU4zh8O/itQ/B9BipGKbFwUFAI+kzHX10FSO"
+    "+r0oyHU2DVLpJtKeEJx9lcCkj+sBYal0I4ASea73Ethm3ztNBozthGUDsR9W5aFjPzwAYI1p"
+    "lum+Zpxaux8uAi04G5dKX8ympNKrBWdn6gDUFgBTJuqWAtgMoIdM2eogGwAQelHQNR9ZYeyH"
+    "vVY0rHRxHFQ6aAiOSqV31wGBTwKQAH4GcNwC+VnB2aALG5NAjv3wugp8+DGz5msAT5i+SQBL"
+    "vSj4p1Kg77Emdxuv2l2nfvoV83zrctgYpay/ldRP5RzWhdgPZ4zlBYC3vSjwvCiYcsgKj8wB"
+    "WnBWNpeerc+7HZKDS+UwCvTPyMc2ywmNSKWXZQB91AGMpDlLiJ5/A+BMhsOoiNGzL7fJnOa3"
+    "1uJBqfTT/7O1mxKcfSA486yh1zPYeCRlu7scDoOWNsvFZJUmckg/pX5UEpwNC85aAQjrJN9K"
+    "2PQCubzWOlxus2W6RtwPkfpma2yNnZUllLvTDiP2w3V2+m6yxy9N3/WxH3ZW+sDFDAaNCs6a"
+    "KShS6TZr2hek/kzOb1Gv/kmNQNPn/jdtkhcF5xwYPZQREdRDP0Tq+1KyxZuthC8f6JQHKWaE"
+    "7U6p9KoUNpcAPEcvsxqBpnfGp+RFG0l/OWN9gRzGaZevdl4UTADoI791yFWfaQpelkr3SKVb"
+    "LYB2WGH2kcX6PksGxqXSb0il26TSG6XSW6TSr1kSdFZw9mGV3nqrVPoPq3tnii0bSmHdDdV+"
+    "tfOi4HHS3BL74b2uQDdIpZcAuNrk7h0kebFLr+DsfEJ/M4BfLAnJkhHhCOqMw7TtgrPfUoBO"
+    "uwg35qTwG3LG95LD/cy4oaSPSXMOuig4mwIwkPNC3YKzp1K0XBn71Z+zx5vGqpXnwYS8D2CF"
+    "4Kw/A6QhB30+nDDeQhj8fYLu76I2MPbDLhdG2//lWGUm32jS32HB2akKw3s1gFsALAfwN4AR"
+    "wdlYFTLRZNi/wsjTrwCOC86mcRmW/wC8FLixbo7xxQAAAABJRU5ErkJggg=="
+)
+
+_LOGO_PNG_2X_B64 = (
+    "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"
+)
+
+_FAV_OUTER_FAINT = (
+    "M19.77 3.20h.01M14.54 2.98h.01M14.32 13.32h.01M18.22 3.96h.01M16.44 4.74"
+    "h.01M15.26 3.30h.01M16.12 7.14h.01M17.05 11.71h.01M15.37 10.97h.01M16.15"
+    " 14.57h.01M16.09 15.99h.01M16.94 4.90h.01M15.86 3.58h.01M16.63 7.06h.01M"
+    "15.38 5.90h.01M15.35 8.25h.01M13.95 7.21h.01M15.80 10.49h.01M14.27 9.67h"
+    ".01M15.07 11.91h.01M14.60 13.40h.01M14.40 14.90h.01M14.44 16.36h.01"
+)
+
+_FAV_OUTER_MID = (
+    "M25.00 3.54h.01M24.64 3.88h.01M22.39 3.72h.01M22.72 7.52h.01M18.73 16.89"
+    "h.01M22.37 4.09h.01M21.49 5.90h.01M20.33 4.14h.01M19.55 6.44h.01M19.42 8"
+    ".95h.01M17.99 10.31h.01M18.55 14.34h.01M18.39 15.90h.01M18.57 17.38h.01M"
+    "20.53 4.47h.01M19.86 6.52h.01M18.57 4.97h.01M17.33 3.27h.01M19.70 8.75h."
+    "01M18.14 7.42h.01M15.12 4.36h.01M16.58 8.74h.01M19.19 12.17h.01M17.25 11"
+    ".35h.01M15.30 10.40h.01M18.55 13.57h.01M16.50 12.99h.01M18.23 15.03h.01M"
+    "16.13 14.70h.01M18.22 16.45h.01M16.12 16.37h.01M13.95 16.19h.01M16.42 17"
+    ".92h.01M14.29 17.99h.01M18.95 5.18h.01M17.82 3.65h.01M18.55 7.36h.01M17."
+    "18 6.02h.01M15.84 4.56h.01M18.67 9.58h.01M17.09 8.48h.01M15.53 7.27h.01M"
+    "13.98 5.94h.01M17.58 10.84h.01M15.85 9.91h.01M14.11 8.86h.01M16.77 12.29"
+    "h.01M14.91 11.55h.01M16.27 13.84h.01M16.09 15.40h.01M14.10 15.10h.01M16."
+    "19 16.90h.01M14.21 16.82h.01M17.65 6.08h.01M17.53 8.28h.01M14.74 5.91h.0"
+    "1M16.33 9.52h.01M14.77 8.52h.01M13.68 10.13h.01M16.46 13.12h.01M14.70 12"
+    ".55h.01M14.33 14.18h.01M14.26 15.79h.01M14.46 17.33h.01M14.14 4.66h.01"
+)
+
+_FAV_INNER_PINK = (
+    "M29.08 4.85h.01M28.17 4.67h.01M26.25 5.73h.01M25.48 3.15h.01M23.84 4.85h"
+    ".01M22.72 7.52h.01M23.37 16.54h.01M23.64 17.87h.01M24.91 7.46h.01M23.63 "
+    "5.18h.01M22.72 7.52h.01M20.98 5.16h.01M22.70 10.26h.01M22.87 14.16h.01M1"
+    "9.37 15.54h.01M22.49 17.10h.01M19.55 17.49h.01M23.49 5.43h.01M22.44 3.25"
+    "h.01M22.72 7.52h.01M21.19 5.47h.01M19.77 3.20h.01M22.64 9.91h.01M20.63 8"
+    ".20h.01M18.69 6.25h.01M22.43 13.43h.01M19.82 12.60h.01M21.84 14.83h.01M1"
+    "9.11 14.44h.01M21.67 16.26h.01M18.97 16.30h.01M19.29 17.98h.01M21.35 5.7"
+    "1h.01M20.08 3.73h.01M20.86 8.09h.01M19.17 6.35h.01M17.55 4.42h.01M21.12 "
+    "10.58h.01M19.08 9.22h.01M17.05 7.66h.01M19.89 11.91h.01M17.58 10.84h.01M"
+    "19.05 13.53h.01M16.57 12.80h.01M18.67 15.24h.01M16.11 14.89h.01M16.19 16"
+    ".90h.01M21.05 8.01h.01M18.12 4.72h.01M17.65 7.52h.01M15.92 5.92h.01M20.0"
+    "0 11.37h.01M15.98 9.09h.01M19.09 12.78h.01M16.91 11.99h.01M14.70 11.04h."
+    "01M16.27 13.84h.01M13.93 13.20h.01M16.09 15.71h.01M13.69 15.39h.01M16.30"
+    " 17.47h.01M13.93 17.46h.01M16.61 5.96h.01M18.35 9.90h.01M14.82 7.45h.01M"
+    "14.42 12.28h.01M13.98 14.25h.01"
+)
+
+_FAV_NODAL_PINK = (
+    "M28.77 6.06h.01M27.26 11.94h.01M27.67 5.77h.01M26.31 7.78h.01M26.07 10.9"
+    "7h.01M26.42 16.51h.01M26.86 5.70h.01M25.69 7.60h.01M25.37 10.35h.01M23.0"
+    "1 11.34h.01M25.32 14.31h.01M24.70 15.85h.01M24.74 17.30h.01M25.24 7.51h."
+    "01M24.91 9.91h.01M22.81 10.72h.01M24.38 13.51h.01M21.03 12.38h.01M23.57 "
+    "14.99h.01M19.94 16.84h.01M24.59 9.59h.01M20.33 8.36h.01M21.00 11.61h.01M"
+    "19.83 13.48h.01M22.44 15.67h.01M21.05 11.02h.01M18.67 9.58h.01"
+)
+
+SUBHKL_LOGO_URI_1X = f"data:image/png;base64,{_LOGO_PNG_1X_B64}"
+SUBHKL_LOGO_URI_2X = f"data:image/png;base64,{_LOGO_PNG_2X_B64}"
+
+SUBHKL_LOGO_SVG = (
+    f'<img class="subhkl-logo-img" src="{SUBHKL_LOGO_URI_2X}" '
+    f'srcset="{SUBHKL_LOGO_URI_1X} 1x, {SUBHKL_LOGO_URI_2X} 2x" '
+    'width="90" height="24" alt="sUBhkl" decoding="async" />'
+)
+
+SUBHKL_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="14.0 2.0 15.5 15.5">'
+    '<g class="favicon-laue-zones" fill="none" stroke-linecap="round">'
+    f'<path stroke="#94a3b8" stroke-width="0.68" stroke-opacity="0.78" d="{_FAV_OUTER_FAINT}"/>'
+    f'<path stroke="#94a3b8" stroke-width="0.86" stroke-opacity="0.90" d="{_FAV_OUTER_MID}"/>'
+    f'<path stroke="#f43f85" stroke-width="1.00" stroke-opacity="0.95" d="{_FAV_INNER_PINK}"/>'
+    f'<path stroke="#f43f85" stroke-width="1.18" stroke-opacity="1.0" d="{_FAV_NODAL_PINK}"/>'
+    "</g>"
+    "</svg>"
+)
+
+SUBHKL_FAVICON_DATA_URI = "data:image/svg+xml;base64," + base64.b64encode(
+    SUBHKL_FAVICON_SVG.encode("utf-8")
+).decode("ascii")

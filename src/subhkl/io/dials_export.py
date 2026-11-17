@@ -47,6 +47,7 @@ _H5_SUFFIXES = (".nxs.h5", ".h5", ".hdf5", ".mtz", ".expt", ".refl")
 def _require_dials():
     """Import the dxtbx/dials symbols we need, or raise a helpful error."""
     try:
+        from dials.array_family import flex
         from dxtbx.model import (  # noqa: F401
             BeamFactory,
             Crystal,
@@ -55,11 +56,10 @@ def _require_dials():
             ExperimentList,
             Goniometer,
         )
-        from dials.array_family import flex  # noqa: F401
     except Exception as exc:  # pragma: no cover - exercised only without DIALS
         raise ImportError(DIALS_IMPORT_ERROR) from exc
 
-    import dxtbx.model as model
+    from dxtbx import model
 
     return model, flex
 
@@ -207,7 +207,7 @@ def _read_detector_calibration(f):
         return {}
 
     calibration: dict[int, dict] = {}
-    for bank_key in grp.keys():
+    for bank_key in grp:
         try:
             bank_id = int(bank_key.replace("bank_", ""))
         except ValueError:
@@ -326,7 +326,7 @@ def _frame_rotations(f, peaks, frame_ids):
                     row = row + zero_offsets
                 try:
                     R = calc_goniometer_rotation_matrix(np.asarray(axes), row)
-                except Exception:
+                except Exception:  # noqa: BLE001 - bad axes/angles row -> identity
                     R = None
 
         rotations[frame_id] = np.eye(3) if R is None else np.asarray(R, dtype=float)
@@ -358,10 +358,10 @@ def _build_beam(model, f, lam, *, polychromatic=False, wavelength=None):
         try:
             # ``direction`` is the incident beam direction of travel (ki).
             beam = model.BeamFactory.make_polychromatic_beam(direction=_floats(ki))
-        except Exception:
+        except Exception:  # noqa: BLE001 - API differs across dxtbx versions
             try:
                 beam = model.PolychromaticBeam(_floats(ki))
-            except Exception:
+            except Exception:  # noqa: BLE001 - fall back to a monochromatic beam
                 beam = None
     if beam is None:
         wl = float(wavelength) if wavelength else float(_mean_wavelength(f, lam))
@@ -374,7 +374,7 @@ def _build_beam(model, f, lam, *, polychromatic=False, wavelength=None):
     # support simply skip this.
     try:
         beam.set_probe(type(beam.get_probe()).neutron)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110 - older dxtbx lacks probe support
         pass
     return beam
 
@@ -526,7 +526,7 @@ def _build_crystal(model, f):
     real_a, real_b, real_c = _floats(G[:, 0]), _floats(G[:, 1]), _floats(G[:, 2])
     try:
         crystal = model.Crystal(real_a, real_b, real_c, space_group_symbol=sg)
-    except Exception:
+    except Exception:  # noqa: BLE001 - cctbx rejects the symbol -> P 1
         crystal = model.Crystal(real_a, real_b, real_c, space_group_symbol="P 1")
     return crystal
 
@@ -554,7 +554,7 @@ def _file_has_images(path):
     try:
         with h5py.File(path, "r") as f:
             return "images" in f
-    except Exception:
+    except OSError:
         return False
 
 
@@ -641,7 +641,7 @@ def hdf5_to_dials(
                         stack_rotations[fr] = calc_goniometer_rotation_matrix(
                             np.asarray(stack_axes), np.asarray(row)
                         )
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - bad row -> identity
                         stack_rotations[fr] = np.eye(3)
 
         # Determine frames and detector banks. Peak-bearing outputs drive these
@@ -786,7 +786,7 @@ def _attach_imageset(experiments, stack_path, layout, container_path, instrument
             if expt.goniometer is not None:
                 single.set_goniometer(expt.goniometer)
             expt.imageset = single
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - geometry is useful without it
         print(f"Note: could not attach DIALS ImageSet ({exc}); wrote geometry only.")
 
 
@@ -826,7 +826,7 @@ def _build_reflection_table(
     # Miller indices (indexed / predicted / integrated outputs).
     if peaks["h"] is not None:
         hkl = [
-            (int(round(h)), int(round(k)), int(round(l)))
+            (int(np.rint(h)), int(np.rint(k)), int(np.rint(l)))
             for h, k, l in zip(peaks["h"], peaks["k"], peaks["l"])
         ]
         table["miller_index"] = flex.miller_index(hkl)

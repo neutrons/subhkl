@@ -1,5 +1,6 @@
-import numpy as np
 import h5py
+import numpy as np
+
 from subhkl.io.export import FinderConcatenateMerger
 
 
@@ -57,8 +58,8 @@ def test_merger_input_order_dependency(tmp_path):
         xyz21 = f21["peaks/xyz"][()]
 
         # Create a "state" for each peak
-        state12 = set(tuple(row) + (run,) for row, run in zip(xyz12, runs12))
-        state21 = set(tuple(row) + (run,) for row, run in zip(xyz21, runs21))
+        state12 = {tuple(row) + (run,) for row, run in zip(xyz12, runs12)}
+        state21 = {tuple(row) + (run,) for row, run in zip(xyz21, runs21)}
 
         # If order-invariant, state12 == state21
         # But in reality, in out12: Peak1->Run0, Peak2->Run1

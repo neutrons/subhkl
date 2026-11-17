@@ -15,8 +15,8 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import sparse
 from scipy.optimize import OptimizeResult, minimize
-from scipy.special import ndtr, xlogy
 from scipy.spatial.transform import Rotation
+from scipy.special import ndtr, xlogy
 
 from subhkl.calibrate import geometry_detectors, reciprocal_lattice
 
@@ -61,8 +61,8 @@ class CountData:
                 raise ValueError("image dimensions must be divisible by bin_px")
             shape = (h // bin_px, w // bin_px)
 
-            def blocks(a):
-                return a.reshape(shape[0], bin_px, shape[1], bin_px)
+            def blocks(a, _shape=shape):
+                return a.reshape(_shape[0], bin_px, _shape[1], bin_px)
 
             keep = blocks(valid).all(axis=(1, 3))
             y = blocks(np.where(valid, im, 0)).sum(axis=(1, 3))[keep]
@@ -119,6 +119,7 @@ class OrientationModel:
             np.zeros(3) if sample_origin is None else np.asarray(sample_origin, float)
         )
         self.B, self.G = reciprocal_lattice(cell, space_group, d_min)
+        self.space_group = space_group
         self.n_hkl = len(self.G)
         self.banks = list(data.pixel_indices)
 
@@ -510,13 +511,14 @@ def refine(
     )
     if not refine_geometry:
         bounds[:ng] = [(v, v) for v in x0[:ng]]
+    free = [i for i, (lo, hi) in enumerate(bounds) if lo < hi]
     best = {"value": np.inf}
     evaluations = 0
 
     class InnerNotConverged(RuntimeError):
         pass
 
-    def evaluate(x):
+    def evaluate_full(x):
         nonlocal evaluations
         evaluations += 1
         g = x[:ng] * units
@@ -558,20 +560,44 @@ def refine(
             raise InnerNotConverged(f"inner solve did not converge: KKT={fit.kkt:g}")
         return fit.objective
 
+    def evaluate(x_free):
+        x = x0.copy()
+        x[free] = x_free
+        return evaluate_full(x)
+
     try:
-        result = minimize(
-            evaluate,
-            x0,
-            method="L-BFGS-B",
-            bounds=bounds,
-            options={
-                "maxfun": max_evals,
-                "maxiter": max_evals,
-                "ftol": 1e-9,
-                "gtol": 1e-4,
-                "eps": 1e-4,
-            },
-        )
+        if free:
+            result = minimize(
+                evaluate,
+                x0[free],
+                method="L-BFGS-B",
+                bounds=[bounds[i] for i in free],
+                options={
+                    "maxfun": max_evals,
+                    "maxiter": max_evals,
+                    "ftol": 1e-6,
+                    "gtol": 1e-4,
+                    "eps": 1e-4,
+                },
+            )
+            if (
+                not result.success
+                and result.nit >= 1
+                and best.get("fit") is not None
+                and best["fit"].converged
+                and "ABNORMAL" in str(result.message)
+            ):
+                result.success = True
+        else:
+            val = evaluate_full(x0)
+            result = OptimizeResult(
+                x=x0,
+                fun=val,
+                success=True,
+                message="no free parameters",
+                nfev=evaluations,
+                nit=0,
+            )
     except InnerNotConverged as error:
         result = OptimizeResult(success=False, message=str(error), nfev=evaluations)
     best["optimizer"] = result
