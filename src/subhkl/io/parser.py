@@ -92,7 +92,7 @@ def _maybe_export_dials(
 
     expt_path, refl_path = dials_output_paths(name_base, prefix)
     try:
-        hdf5_to_dials(
+        _, refl_path = hdf5_to_dials(
             read_path,
             expt_path,
             refl_path,
@@ -108,7 +108,8 @@ def _maybe_export_dials(
         typer.echo(f"Skipping --dials export: {exc}", err=True)
         return
     print(f"Wrote DIALS ExperimentList to {expt_path}")
-    print(f"Wrote DIALS reflection_table to {refl_path}")
+    if refl_path is not None:
+        print(f"Wrote DIALS reflection_table to {refl_path}")
 
 
 def detect_runner_hostname() -> str:

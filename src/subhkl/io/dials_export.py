@@ -597,7 +597,9 @@ def hdf5_to_dials(
         Path to a subhkl HDF5 output (finder, indexer, predictor, integrator,
         or an image stack: reduce/merge, sum-images or a static mask).
     expt_path, refl_path : str
-        Destination paths for the ExperimentList and reflection_table.
+        Destination paths for the ExperimentList and reflection_table. An
+        image-only input (no peak data) writes no ``.refl``, as ``dials.import``
+        writes experiments only; the returned ``refl_path`` is then ``None``.
     instrument : str, optional
         Instrument name. Falls back to the ``instrument`` attribute stored in the
         HDF5 file. Required to build detector geometry.
@@ -778,11 +780,17 @@ def hdf5_to_dials(
                 experiments, stack_path, layout, container_path, instrument
             )
 
+    experiments.as_file(expt_path)
+    # An image-only input (reduce/merge stack, sum-images, static mask) has no
+    # reflections, so -- like dials.import -- it exports experiments only.  An
+    # empty table with no columns would also break DIALS tools that expect at
+    # least an ``id`` column (dials.combine_experiments).  A peaks file is a
+    # reflection output even when it holds no peaks, so it still gets a .refl.
+    if peaks is None:
+        return expt_path, None
     reflections = _build_reflection_table(
         flex, peaks, frame_to_expt, bank_to_panel, experiments, peak_s_lab
     )
-
-    experiments.as_file(expt_path)
     reflections.as_file(refl_path)
     return expt_path, refl_path
 

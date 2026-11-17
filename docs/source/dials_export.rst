@@ -7,8 +7,10 @@ set, the command writes its output as a DIALS
 `ExperimentList <https://dials.github.io/documentation/data_files.html>`_
 (``.expt``, a JSON file) and a
 `reflection_table <https://dials.github.io/documentation/data_files.html>`_
-(``.refl``, a msgpack file), in addition to its normal HDF5/MTZ output. This
-lets subhkl results be loaded, inspected, and compared directly against the
+(``.refl``, a msgpack file), in addition to its normal HDF5/MTZ output.
+Commands whose output is images only (``reduce``, ``merge_images``,
+``sum_images``, ``static_mask``) write just the ``.expt``, as ``dials.import``
+does. This lets subhkl results be loaded, inspected, and compared directly against the
 DIALS suite (``dials.image_viewer``, ``dials.reflection_viewer``,
 ``dials.show``, ``dials.compare_orientation_matrices``, ``dials.scale``, ...).
 
@@ -158,11 +160,11 @@ Closest DIALS CLI parallel per program
      - Closest DIALS CLI program(s)
    * - ``reduce``
      - One experiment per goniometer setting, each with an ImageSet (beam,
-       detector, goniometer); empty reflection table.
+       detector, goniometer); no ``.refl`` (experiments only).
      - ``dials.import`` (build experiments from images)
    * - ``merge_images``
      - One experiment per frame of the merged stack, each with an ImageSet; unit
-       cell metadata; empty reflection table.
+       cell metadata; no ``.refl``.
      - ``dials.import`` / ``dials.combine_experiments``
    * - ``finder``
      - Observed peaks: ``xyzobs.px.value``, ``intensity.sum``, ``panel``,
@@ -201,14 +203,14 @@ Closest DIALS CLI parallel per program
      - ``dials.image_viewer`` with an integrated.refl overlay
    * - ``static_mask``
      - The mask, a one-frame-per-bank uint8 stack (1 = valid), as a single
-       experiment whose ImageSet has one panel per bank; empty reflection table.
+       experiment whose ImageSet has one panel per bank; no ``.refl``.
      - ``dials.generate_mask`` (static detector masks)
    * - ``mask_visualize``
      - The mask being drawn, exported as for ``static_mask``.
      - ``dials.image_viewer`` with a mask overlay
    * - ``sum_images``
      - The summed one-frame-per-bank stack as a single experiment with an
-       ImageSet; empty reflection table. Its goniometer angles are placeholders,
+       ImageSet; no ``.refl``. Its goniometer angles are placeholders,
        so the exported scan geometry is not physical.
      - ``dials.merge_cbf`` (sums images)
 

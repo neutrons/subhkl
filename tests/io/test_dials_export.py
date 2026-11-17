@@ -702,7 +702,6 @@ def test_roundtrip_separately_exported_runs_combine(tmp_path):
     """Two single-run exports get distinct identifiers, so they can be combined
     into one ExperimentList as dials.combine_experiments does."""
     pytest.importorskip("dxtbx")
-    from dials.array_family import flex
     from dxtbx.model.experiment_list import ExperimentList, ExperimentListFactory
 
     combined = ExperimentList()
@@ -710,18 +709,43 @@ def test_roundtrip_separately_exported_runs_combine(tmp_path):
         stack = tmp_path / f"{name}.h5"
         _write_reduce_stack(str(stack))
         expt_path = str(tmp_path / f"{name}.expt")
-        refl_path = str(tmp_path / f"{name}.refl")
-        dx.hdf5_to_dials(str(stack), expt_path, refl_path, instrument="CG4D")
+        dx.hdf5_to_dials(
+            str(stack), expt_path, str(tmp_path / f"{name}.refl"), instrument="CG4D"
+        )
         experiments = ExperimentListFactory.from_json_file(
             expt_path, check_format=False
         )
-        refl = flex.reflection_table.from_file(refl_path)
-        assert dict(refl.experiment_identifiers()) == {
-            i: e.identifier for i, e in enumerate(experiments)
-        }
         combined.extend(experiments)  # raises on a duplicate identifier
 
     assert len({e.identifier for e in combined}) == 2
+
+
+def test_roundtrip_image_only_export_writes_no_refl(tmp_path):
+    """Like dials.import, an image stack exports experiments only; a peaks file
+    is a reflection output and gets a .refl even when it holds no peaks."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+
+    stack = tmp_path / "merged.h5"
+    _write_merged_stack(str(stack))
+    expt_path, refl_path = dx.hdf5_to_dials(
+        str(stack), str(tmp_path / "m.expt"), str(tmp_path / "m.refl"), "CG4D"
+    )
+    assert expt_path == str(tmp_path / "m.expt")
+    assert refl_path is None
+    assert not (tmp_path / "m.refl").exists()
+
+    empty = tmp_path / "found.h5"
+    _write_peaks_on(str(empty), frames=[], banks=[])
+    _, refl_path = dx.hdf5_to_dials(
+        str(empty),
+        str(tmp_path / "f.expt"),
+        str(tmp_path / "f.refl"),
+        instrument="CG4D",
+        image_source=str(stack),
+    )
+    assert refl_path == str(tmp_path / "f.refl")
+    assert len(flex.reflection_table.from_file(refl_path)) == 0
 
 
 def test_roundtrip_identifiers_persist_across_steps(tmp_path):
@@ -876,14 +900,14 @@ def _load_with_images(expt_path, n_experiments):
 
 def test_cli_sum_images_dials(tmp_path, monkeypatch):
     pytest.importorskip("dxtbx")
-    from dials.array_family import flex
 
     monkeypatch.chdir(tmp_path)
     _write_cli_stack("images.h5")
     _run_cli("sum-images", "summed.h5", "images.h5", "--dials")
 
     _load_with_images("summed.expt", 1)  # one summed frame per bank
-    assert len(flex.reflection_table.from_file("summed.refl")) == 0
+    # Image-only output: experiments only, as dials.import writes.
+    assert not (tmp_path / "summed.refl").exists()
 
 
 def test_cli_static_mask_dials_is_a_usable_dials_mask(tmp_path, monkeypatch):
