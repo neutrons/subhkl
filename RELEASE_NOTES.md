@@ -4,6 +4,49 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.8]
+
+### Added
+
+- Per-step live `mm:ss.ms` stopwatch overlay in the lower-right corner of the
+  `Terminal // Stdio` pane (`#stdio-stopwatch`) across `subhkl-nova-app` and
+  `rainbow-visualize`, featuring an animated skinny 5-stripe Rainbow Islands
+  arch with 8-bit sparkles, transient stage-milestone/completion arcade quips,
+  server-synchronized `step_timings` persistence, click-to-cycle step split
+  inspection (`1. Reduce`, `2. Solve`, `3. Integrate`, `4. Merge`, and
+  `Σ Total`), and an Arcade Mode slow-motion rolling-odometer cheat code
+  (`↑↑↓↓←→←→BA` or `RAINBOW`).
+
+### Changed
+
+- Accelerated `solve --refinement band` startup, blind band discovery, and EM
+  scoring on GPU and eliminated redundant per-run XLA recompilations:
+  - Enabled persistent on-disk JAX compilation caching (`~/.cache/subhkl/jax`)
+    in `solve` (`enable_jax_compilation_cache`) and hoisted nested
+    `refine_band_geometry` Adam/L-BFGS-B closures to module-level bucket-padded
+    `@jax.jit` kernels so observation arrays are passed dynamically rather than
+    baked as HLO constants.
+  - Shared single-pass HDF5 slab loading (`load_binned_nexus_panels`) and
+    batched JAX GPU 2D `median`/`75th`-percentile background filters,
+    mask-cached EDT fill, and `jax.vmap` IEEE FP32 (`Precision.HIGHEST`)
+    multi-run reflection splatting across `load_observations` and
+    `PixelEMClassifier`, plus a `@jax.jit` $S^2$ outer-goniometer scan-axis
+    recovery sweep.
+- Auto-scrolled the `Terminal // Stdio` log pane as live output appends
+  (`tail -f` behavior), automatically pausing auto-scroll to keep selected or
+  scrolled-up log content steady until the user scrolls back to the bottom.
+- Removed parallax tether lines connecting predicted Bragg peak rings to
+  detector spots in Rainbow Zones so shifting the parallax view leaves raw
+  detector pixels completely unoccluded.
+
+### Fixed
+
+- Fixed CPU CI out-of-memory failures (`exit code 143`) and long runtimes on
+  dense raw-pixel `band_table` searches by decomposing `band_table` into fixed
+  2D `[2048, <=16384]` dot/zone kernels with $S^2 \times (q_{\text{lo}},
+  q_{\text{hi}})$ solid-angle quadrature coalescing when pixel clouds exceed
+  $65,536$ bins and releasing temporary `run_spherical_index` arrays early.
+
 ## [1.5.7]
 
 ### Added
@@ -27,21 +70,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `rainbow-visualize`) rendering classified `Dark` and `Bright` detector
   regions on curvilinear warped panels (including browser-side `h5wasm` loading)
   with sidebar pixel class percentages.
-- Per-step live `mm:ss.ms` stopwatch overlay in the lower-right corner of the
-  `Terminal // Stdio` pane (`#stdio-stopwatch`) across `subhkl-nova-app` and
-  `rainbow-visualize`, with server-synchronized `step_timings` persistence,
-  click-to-cycle step split inspection (`1. Reduce`, `2. Solve`,
-  `3. Integrate`, `4. Merge`, and `Σ Total`), and an Arcade Mode slow-motion
-  odometer cheat code (`↑↑↓↓←→←→BA` or `RAINBOW`).
 
 ### Changed
 
-- Auto-scrolled the `Terminal // Stdio` log pane as live output appends
-  (`tail -f` behavior), automatically pausing auto-scroll to keep selected or
-  scrolled-up log content steady until the user scrolls back to the bottom.
-- Removed parallax tether lines connecting predicted Bragg peak rings to
-  detector spots in Rainbow Zones so shifting the parallax view leaves raw
-  detector pixels completely unoccluded.
 - Auto-selected CLI `solve --refinement band` default binning (`binning=8` for
   single/few-frame runs with $\le 240$ panel images, `binning=16` for larger
   multi-run scans) and gated `blind_band` quadrature/table bins to
@@ -50,22 +81,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Vectorized multi-bank EM reflection projection and 2D grid-stencil splatting,
   cached clean median backgrounds and module-level `@jax.jit` Ewald/omega scan
   kernels, and concatenated active-bin `band_table` chunks on-device.
-- Accelerated `solve --refinement band` startup, blind band discovery, and EM
-  scoring on GPU, eliminated redundant per-run XLA recompilations, and resolved
-  CPU OOMs on dense raw-pixel `band_table` searches:
-  - Enabled persistent on-disk JAX compilation caching (`~/.cache/subhkl/jax`)
-    in `solve` (`enable_jax_compilation_cache`), hoisted nested
-    `refine_band_geometry` Adam/L-BFGS-B closures to module-level bucket-padded
-    `@jax.jit` kernels so observation arrays are passed dynamically rather than
-    baked as HLO constants, and decomposed `band_table` into fixed 2D
-    `[2048, <=16384]` dot/zone kernels with $S^2 \times (q_{\text{lo}},
-    q_{\text{hi}})$ quadrature coalescing for $>65\text{k}$-bin pixel clouds.
-  - Shared single-pass HDF5 slab loading (`load_binned_nexus_panels`) and
-    batched JAX GPU 2D `median`/`75th`-percentile background filters,
-    mask-cached EDT fill, and `jax.vmap` IEEE FP32 (`Precision.HIGHEST`)
-    multi-run reflection splatting across `load_observations` and
-    `PixelEMClassifier`, plus a `@jax.jit` $S^2$ outer-goniometer scan-axis
-    recovery sweep.
 - Added model-free outer-goniometer motor validation and recovery
   (`recover_unlogged_outer_goniometer`) for multi-run inner-axis scans where
   outer goniometer motors (for example `omega`, `kappa`) were omitted from raw
