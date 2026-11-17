@@ -13,6 +13,7 @@ subhkl
    optimization/index
    concepts/index
    installation/index
+   dials_export
 
 -----
 About
