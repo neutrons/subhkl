@@ -4580,9 +4580,28 @@ def render_rainbow_html(
     margin: 0;
   }}
 
-  @keyframes swHandSpin {{
-    from {{ transform: rotate(0deg); }}
-    to {{ transform: rotate(360deg); }}
+  @keyframes swRainbowShoot {{
+    0% {{
+      stroke-dashoffset: 100;
+      opacity: 0.35;
+    }}
+    38%, 72% {{
+      stroke-dashoffset: 0;
+      opacity: 1;
+    }}
+    100% {{
+      stroke-dashoffset: -100;
+      opacity: 0.35;
+    }}
+  }}
+
+  @keyframes swRainbowShimmer {{
+    0%, 100% {{
+      filter: hue-rotate(0deg) drop-shadow(0 0 2.5px rgba(244, 114, 182, 0.45));
+    }}
+    50% {{
+      filter: hue-rotate(38deg) drop-shadow(0 0 3.5px rgba(56, 189, 248, 0.55));
+    }}
   }}
 
   @keyframes swNeonPulse {{
@@ -4629,14 +4648,18 @@ def render_rainbow_html(
   }}
 
   .stdio-stopwatch .sw-icon {{
-    width: 11px;
-    height: 11px;
+    width: 16px;
+    height: 10px;
     flex-shrink: 0;
-    color: var(--text-dim);
+    overflow: visible;
+    opacity: 0.46;
+    filter: saturate(0.55);
+    transition: opacity 0.2s ease, filter 0.2s ease;
   }}
 
-  .stdio-stopwatch .sw-hand {{
-    transform-origin: 8px 9.2px;
+  .stdio-stopwatch .sw-rb {{
+    stroke-dasharray: 100;
+    stroke-dashoffset: 0;
   }}
 
   .stdio-stopwatch .sw-stage {{
@@ -4686,12 +4709,19 @@ def render_rainbow_html(
   }}
 
   .stdio-stopwatch.sw-running .sw-icon {{
-    color: var(--accent-cyan);
+    opacity: 1;
+    filter: saturate(1.15);
+    animation: swRainbowShimmer 1.8s ease-in-out infinite;
   }}
 
-  .stdio-stopwatch.sw-running .sw-hand {{
-    animation: swHandSpin 1.0s linear infinite;
+  .stdio-stopwatch.sw-running .sw-rb {{
+    animation: swRainbowShoot 1.35s cubic-bezier(0.4, 0, 0.2, 1) infinite;
   }}
+
+  .stdio-stopwatch.sw-running .sw-rb-2 {{ animation-delay: 0.06s; }}
+  .stdio-stopwatch.sw-running .sw-rb-3 {{ animation-delay: 0.12s; }}
+  .stdio-stopwatch.sw-running .sw-rb-4 {{ animation-delay: 0.18s; }}
+  .stdio-stopwatch.sw-running .sw-rb-5 {{ animation-delay: 0.24s; }}
 
   .stdio-stopwatch.sw-running .sw-stage {{
     color: var(--accent-cyan);
@@ -4706,7 +4736,11 @@ def render_rainbow_html(
     color: #ecfdf5;
   }}
 
-  .stdio-stopwatch.sw-done .sw-icon,
+  .stdio-stopwatch.sw-done .sw-icon {{
+    opacity: 1;
+    filter: saturate(1.1) drop-shadow(0 0 2.5px rgba(56, 189, 248, 0.38));
+  }}
+
   .stdio-stopwatch.sw-done .sw-stage {{
     color: var(--accent-green);
   }}
@@ -4715,7 +4749,11 @@ def render_rainbow_html(
     border-color: rgba(251, 191, 36, 0.60);
   }}
 
-  .stdio-stopwatch.sw-stopped .sw-icon,
+  .stdio-stopwatch.sw-stopped .sw-icon {{
+    opacity: 0.62;
+    filter: saturate(0.5);
+  }}
+
   .stdio-stopwatch.sw-stopped .sw-stage {{
     color: #fbbf24;
   }}
@@ -4724,7 +4762,11 @@ def render_rainbow_html(
     border-color: rgba(248, 113, 113, 0.68);
   }}
 
-  .stdio-stopwatch.sw-error .sw-icon,
+  .stdio-stopwatch.sw-error .sw-icon {{
+    opacity: 0.65;
+    filter: saturate(0.35) sepia(0.6) hue-rotate(-35deg);
+  }}
+
   .stdio-stopwatch.sw-error .sw-stage {{
     color: #f87171;
   }}
@@ -5080,12 +5122,12 @@ def render_rainbow_html(
         <div class="terminal-wrap">
           <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
           <div class="stdio-stopwatch sw-idle" id="stdio-stopwatch" role="timer" aria-live="off" title="Step stopwatch (mm:ss.ms) — counts time spent in each pipeline step">
-            <svg class="sw-icon" viewBox="0 0 16 16" aria-hidden="true">
-              <line x1="5.8" y1="1.3" x2="10.2" y2="1.3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"></line>
-              <line x1="8" y1="1.3" x2="8" y2="3.1" stroke="currentColor" stroke-width="1.3"></line>
-              <line x1="12.1" y1="3.6" x2="13.4" y2="2.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"></line>
-              <circle cx="8" cy="9.2" r="5.4" fill="none" stroke="currentColor" stroke-width="1.35"></circle>
-              <line class="sw-hand" x1="8" y1="9.2" x2="8" y2="5.4" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"></line>
+            <svg class="sw-icon" viewBox="0 0 22 13" aria-hidden="true">
+              <path class="sw-rb sw-rb-1" pathLength="100" d="M 1.6 11.6 A 9.4 9.4 0 0 1 20.4 11.6" fill="none" stroke="#ff477e" stroke-width="1.35" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-2" pathLength="100" d="M 3.3 11.6 A 7.7 7.7 0 0 1 18.7 11.6" fill="none" stroke="#ff922b" stroke-width="1.35" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-3" pathLength="100" d="M 5.0 11.6 A 6.0 6.0 0 0 1 17.0 11.6" fill="none" stroke="#ffd43b" stroke-width="1.35" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-4" pathLength="100" d="M 6.7 11.6 A 4.3 4.3 0 0 1 15.3 11.6" fill="none" stroke="#38d9a9" stroke-width="1.35" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-5" pathLength="100" d="M 8.4 11.6 A 2.6 2.6 0 0 1 13.6 11.6" fill="none" stroke="#38bdf8" stroke-width="1.35" stroke-linecap="round"></path>
             </svg>
             <span class="sw-stage" id="stdio-stopwatch-stage">READY</span>
             <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>

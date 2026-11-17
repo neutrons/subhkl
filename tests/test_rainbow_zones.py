@@ -2382,6 +2382,9 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
         assert 'id="stdio-stopwatch"' in html
         assert 'id="stdio-stopwatch-stage"' in html
         assert 'id="stdio-stopwatch-time"' in html
+        assert 'class="sw-rb sw-rb-1"' in html
+        assert "swRainbowShoot" in html
+        assert "sw-hand" not in html
         assert "stdio-stopwatch-quip" not in html
         assert "BLINK" not in html
         assert "formatStopwatchParts" in html
