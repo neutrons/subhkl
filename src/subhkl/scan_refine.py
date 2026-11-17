@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import h5py
 import numpy as np
-from scipy.ndimage import median_filter
 from scipy.spatial.transform import Rotation
 
 from subhkl.config import beamlines
@@ -329,7 +328,9 @@ def run_scan_refinement(
     import jax
 
     from subhkl.search.scan_band import refine_scan
+    from subhkl.search.spherical import enable_jax_compilation_cache
 
+    enable_jax_compilation_cache()
     with jax.enable_x64(), jax.default_matmul_precision("highest"):
         if bootstrap is None:
             from subhkl.search.blind_band import discover
@@ -342,22 +343,22 @@ def run_scan_refinement(
 
 
 def load_observations(args, *, return_kinematics=False):
-    with h5py.File(args.nexus) as f:
-        img_shape = f["images"].shape
-        n_frames, n_rows, n_cols = (
-            int(img_shape[0]),
-            int(img_shape[1]),
-            int(img_shape[2]),
-        )
-        offsets = _frame_offsets(f, n_frames)
-        R_frames, _, angles, _, scan_axes_lab = _frame_rotations_and_scan_axes(
-            f, n_frames
-        )
-        if angles is None:
-            angles = np.zeros((n_frames, 1), dtype=float)
-        frame_banks = np.asarray(f["bank_ids"], int)
-        run_ids = np.searchsorted(offsets, np.arange(n_frames), side="right") - 1
-        if args.finder:
+    if args.finder:
+        with h5py.File(args.nexus) as f:
+            img_shape = f["images"].shape
+            n_frames, n_rows, n_cols = (
+                int(img_shape[0]),
+                int(img_shape[1]),
+                int(img_shape[2]),
+            )
+            offsets = _frame_offsets(f, n_frames)
+            R_frames, _, angles, _, scan_axes_lab = _frame_rotations_and_scan_axes(
+                f, n_frames
+            )
+            if angles is None:
+                angles = np.zeros((n_frames, 1), dtype=float)
+            frame_banks = np.asarray(f["bank_ids"], int)
+            run_ids = np.searchsorted(offsets, np.arange(n_frames), side="right") - 1
             with h5py.File(args.finder) as peaks:
                 images = np.asarray(peaks["peaks/image_index"], int)
                 banks = np.asarray(peaks["bank"], int)
@@ -380,104 +381,80 @@ def load_observations(args, *, return_kinematics=False):
                     np.sqrt(np.maximum(dev, 0)),
                 )
                 kinematics = (R_frames[images], scan_axes_lab[images])
+    else:
+        # No connected components, local maxima or signal qualification.
+        # All instrument-valid bins contribute, including negative excess.
+        from subhkl.search.pixel_em import load_binned_nexus_panels
+
+        b = int(args.binning)
+        bw = int(getattr(args, "border_width", 4))
+        sel_runs = [int(r) for r in args.runs]
+        mask_path = getattr(args, "static_mask_file", None)
+        expected_key = (
+            str(Path(args.nexus).resolve()),
+            b,
+            bw,
+            tuple(sorted({int(r) for r in sel_runs})),
+            str(Path(mask_path).resolve()) if mask_path else None,
+        )
+        cached = getattr(args, "_prebinned_panel_cache", None)
+        if isinstance(cached, dict) and cached.get("key") == expected_key:
+            data = cached
         else:
-            # No connected components, local maxima or signal qualification.
-            # All instrument-valid bins contribute, including negative excess.
-            b = int(args.binning)
-            if n_rows % b or n_cols % b:
-                raise ValueError(
-                    f"band binning ({b}) must divide the detector size ({n_rows}x{n_cols})"
-                )
-            centers_r = np.arange(n_rows // b) * b + (b - 1) / 2
-            centers_c = np.arange(n_cols // b) * b + (b - 1) / 2
-            rr_0, cc_0 = np.meshgrid(centers_r, centers_c, indexing="ij")
-            rows_full, cols_full = np.meshgrid(
-                np.arange(n_rows, dtype=float),
-                np.arange(n_cols, dtype=float),
-                indexing="ij",
+            data = load_binned_nexus_panels(
+                args.nexus,
+                sel_runs=sel_runs,
+                binning=b,
+                border_width=bw,
+                static_mask_file=mask_path,
+                strict_mask_check=True,
             )
-            rows_bin = rows_full.reshape(n_rows // b, b, n_cols // b, b)
-            cols_bin = cols_full.reshape(n_rows // b, b, n_cols // b, b)
-            collected = [[] for _ in range(8)]
-            collected_kin = [[], []]
-            mask_file = (
-                h5py.File(args.static_mask_file) if args.static_mask_file else None
+            if data is not None:
+                try:
+                    args._prebinned_panel_cache = data
+                except AttributeError:
+                    pass
+        if data is None or len(data["sel_indices"]) == 0:
+            raise ValueError("no weighted observations in selected runs")
+
+        collected = [[] for _ in range(8)]
+        collected_kin = [[], []]
+        fb_sel = data["frame_banks_sel"]
+        ri_sel = data["run_ids_sel"]
+        ang_sel = data["angles_sel"]
+        Rf_sel = data["R_frames_sel"]
+        sa_sel = data["scan_axes_sel"]
+        y_f = data["y_frames"]
+        g_f = data["good_frames"]
+        bg7_f = data["bg7_frames"]
+        dev_f = data["dev_frames"]
+        rr_f = data["rr_frames"]
+        cc_f = data["cc_frames"]
+
+        for k in range(len(fb_sel)):
+            good = g_f[k]
+            n = int(good.sum())
+            if n == 0:
+                continue
+            weight = y_f[k] - bg7_f[k]
+            values = (
+                np.full(n, fb_sel[k]),
+                rr_f[k][good],
+                cc_f[k][good],
+                dev_f[k][good],
+                np.zeros(n),
+                np.full(n, ri_sel[k]),
+                np.repeat(ang_sel[k : k + 1], n, axis=0),
+                weight[good],
             )
-            bw = int(getattr(args, "border_width", 4))
-            try:
-                for i in range(n_frames):
-                    if run_ids[i] not in args.runs:
-                        continue
-                    raw = np.asarray(f["images"][i], float)
-                    valid = np.isfinite(raw) & (raw >= 0)
-                    if mask_file is not None:
-                        key = "masks" if "masks" in mask_file else "images"
-                        ids = mask_file["bank_ids"][()]
-                        matches = np.flatnonzero(ids == frame_banks[i])
-                        if len(matches) != 1:
-                            raise ValueError("mask must have one entry per bank")
-                        valid &= np.asarray(mask_file[key][matches[0]], bool)
-                    if bw > 0 and n_rows > 4 * max(b, bw) and n_cols > 4 * max(b, bw):
-                        raw = np.pad(raw[bw:-bw, bw:-bw], bw, mode="edge")
-                        if bw >= b:
-                            valid[: (bw // b) * b, :] = False
-                            valid[-((bw // b) * b) :, :] = False
-                            valid[:, : (bw // b) * b] = False
-                            valid[:, -((bw // b) * b) :] = False
-                    raw_blocks = np.where(valid, raw, 0).reshape(
-                        n_rows // b, b, n_cols // b, b
-                    )
-                    y = raw_blocks.sum((1, 3))
-                    good = valid.reshape(n_rows // b, b, n_cols // b, b).all((1, 3))
-                    bg = median_filter(y, size=7, mode="nearest")
-                    weight = y - bg
-                    bg_5 = median_filter(y, size=5, mode="nearest")
-                    bg_safe = np.maximum(bg_5, 1.0)
-                    y_safe = np.maximum(y, bg_safe)
-                    dev_bin = np.where(
-                        y > bg_safe,
-                        2.0 * (y_safe * np.log(y_safe / bg_safe) - (y_safe - bg_safe)),
-                        0.0,
-                    )
-                    excess_sq = (
-                        np.maximum(raw_blocks - (bg_5 / (b * b))[:, None, :, None], 0.0)
-                        ** 2
-                    )
-                    excess_sum = excess_sq.sum((1, 3))
-                    rr = np.where(
-                        excess_sum > 0,
-                        (excess_sq * rows_bin).sum((1, 3))
-                        / np.maximum(excess_sum, 1e-12),
-                        rr_0,
-                    )
-                    cc = np.where(
-                        excess_sum > 0,
-                        (excess_sq * cols_bin).sum((1, 3))
-                        / np.maximum(excess_sum, 1e-12),
-                        cc_0,
-                    )
-                    n = int(good.sum())
-                    values = (
-                        np.full(n, frame_banks[i]),
-                        rr[good],
-                        cc[good],
-                        dev_bin[good],
-                        np.zeros(n),
-                        np.full(n, run_ids[i]),
-                        np.repeat(angles[i : i + 1], n, axis=0),
-                        weight[good],
-                    )
-                    for dest, value in zip(collected, values):
-                        dest.append(value)
-                    collected_kin[0].append(np.repeat(R_frames[i : i + 1], n, axis=0))
-                    collected_kin[1].append(
-                        np.repeat(scan_axes_lab[i : i + 1], n, axis=0)
-                    )
-                result = tuple(np.concatenate(v) for v in collected)
-                kinematics = tuple(np.concatenate(v) for v in collected_kin)
-            finally:
-                if mask_file is not None:
-                    mask_file.close()
+            for dest, value in zip(collected, values):
+                dest.append(value)
+            collected_kin[0].append(np.repeat(Rf_sel[k : k + 1], n, axis=0))
+            collected_kin[1].append(np.repeat(sa_sel[k : k + 1], n, axis=0))
+        if not collected[0]:
+            raise ValueError("no weighted observations in selected runs")
+        result = tuple(np.concatenate(v) for v in collected)
+        kinematics = tuple(np.concatenate(v) for v in collected_kin)
     selected = np.isin(result[5], args.runs)
     if args.finder:
         selected &= result[3] >= args.min_deviance

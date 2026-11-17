@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -84,6 +85,7 @@ class MainApp:
                 self.view_model.model.subhkl.data.peaks_file
                 or self.view_model.model.subhkl.data.images_file
             )
+            step_timings_snap = self.pipeline_runner.get_step_timings_snapshot()
             doc = {
                 "galaxy_connected": self.pipeline_runner.is_connected,
                 "galaxy_url": self.pipeline_runner.galaxy_url,
@@ -94,6 +96,8 @@ class MainApp:
                     history_datasets=hist_ds,
                 ),
                 "active_job": self.pipeline_runner.active_job,
+                "step_timings": step_timings_snap,
+                "server_time": time.time(),
                 "pipeline_stages": payload.get("pipeline_stages", []),
                 "ladder_steps": payload.get("ladder_steps", []),
             }

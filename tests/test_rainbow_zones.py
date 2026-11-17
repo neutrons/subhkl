@@ -1584,7 +1584,8 @@ def test_cg4d_load_neutron_data_fallback_and_mandi_curvilinear_panels(tmp_path):
     assert "cancelWorkflowStage" in html
     assert "api/pipeline/cancel" in html
     assert "savedScrollTop" in html
-    assert "box.scrollTop = box.scrollHeight" not in html
+    assert "terminalFollowTail" in html
+    assert "handleTerminalUserScroll" in html
 
     # Verify _ensure_galaxy_h5_dataset picks newer 'ok' dataset over older stuck 'running' dataset
     mock_store_ds = MagicMock()
@@ -2357,3 +2358,313 @@ def test_em_pixel_mask_two_color_overlay_and_srcdoc_tab_handling(tmp_path):
         text=True,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
+    """Verify lower-right stdio mm:ss.ms step stopwatch rendering, JS state transitions, and backend step_timings."""
+    import subprocess
+    import time
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    peaks_xyz, _U, _B, UB, _hkls, _lams = _synthetic_orthorhombic_peaks()
+    payload = build_rainbow_zone_payload(
+        peaks_xyz=peaks_xyz,
+        ub_matrix=UB,
+        wavelength_range=(1.8, 4.5),
+        instrument="CG4D",
+        space_group="P 2 2 2",
+    )
+
+    for mode in ("arcade", "pro"):
+        html = render_rainbow_html(payload, default_mode=mode)
+        assert 'class="terminal-wrap"' in html
+        assert 'id="stdio-stopwatch"' in html
+        assert 'id="stdio-stopwatch-stage"' in html
+        assert 'id="stdio-stopwatch-time"' in html
+        assert 'class="sw-rb sw-rb-1"' in html
+        assert 'viewBox="0 0 24 12"' in html
+        assert "swRainbowShoot" in html
+        assert "swRainbowTipSparkle" in html
+        assert "swStarTwinkle" in html
+        assert 'class="sw-sp-tip"' in html
+        assert 'class="sw-sp-end sw-sp-end-2"' in html
+        assert "ctx.moveTo(bx, by)" not in html
+        assert "detToScreen(p.det_x + shiftAz, py, w, h, -0.35)" not in html
+        assert "sw-hand" not in html
+        assert "stdio-stopwatch-quip" not in html
+        assert "BLINK" not in html
+        assert "formatStopwatchParts" in html
+        assert "startStepStopwatch" in html
+        assert "finishStepStopwatch" in html
+        assert "hydrateStepTimingsFromServer" in html
+
+        scripts = re.findall(
+            r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, flags=re.DOTALL
+        )
+        assert scripts
+        js_src = "\n;\n".join(scripts)
+        js_file = tmp_path / f"rainbow_stopwatch_{mode}.js"
+        js_file.write_text(js_src, encoding="utf-8")
+        proc = subprocess.run(
+            ["node", "--check", str(js_file)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+        # Extract and execute stageStopwatchMeta + formatStopwatchParts + getCompletionStopwatchQuip in Node
+        m_meta = re.search(
+            r"function stageStopwatchMeta\(stageIdOrIdx\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_quip = re.search(
+            r"function getCompletionStopwatchQuip\(stageId, finalStatus, elapsedMs\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_fmt = re.search(
+            r"function formatStopwatchParts\(ms\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_term_scroll = re.search(
+            r"let _lastAutoTerminalScrollTop = -1;.*?function handleTerminalUserScroll\(box\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_append_term = re.search(
+            r"function appendTerminalLog\(text, replace = false, resetFollow = false\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_fmt_stdio = re.search(
+            r"function formatTerminalStdio\(rawText\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_odo = re.search(
+            r"const STOPWATCH_SLOMO_RATE = .*?function computeStopwatchOdometerPositions\(msFloat\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_cheat = re.search(
+            r"function toggleStopwatchCheat\(\)\s*\{.*?function handleStopwatchCheatKey\(ev\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_live_ms = re.search(
+            r"function getEntryLiveMs\(entry, nowPerf = performance\.now\(\)\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        assert (
+            m_meta
+            and m_quip
+            and m_fmt
+            and m_term_scroll
+            and m_append_term
+            and m_fmt_stdio
+            and m_odo
+            and m_cheat
+            and m_live_ms
+        )
+        assert "flashStopwatchQuip" in js_src
+        assert "sw-odo-strip" in js_src
+        eval_script = (
+            f'const UI_MODE = "{mode}";\n'
+            f"const PIPELINE = {json.dumps(payload['pipeline_stages'])};\n"
+            "const state = {\n"
+            "  terminalFollowTail: true,\n"
+            "  terminalScrollTop: 0,\n"
+            "  stopwatchCheatSlowMo: false,\n"
+            "  stepTimings: {},\n"
+            "  runningStageIdx: -1,\n"
+            "};\n"
+            "const stopwatchFlash = { text: '', untilPerf: 0, timerId: null, demoStartPerf: 0, demoUntilPerf: 0 };\n"
+            "let _lastFlashedQuip = '';\n"
+            "function activeRunningStageId() { return null; }\n"
+            "function flashStopwatchQuip(t) { if (UI_MODE !== 'pro') _lastFlashedQuip = t; }\n"
+            "let _selActive = false;\n"
+            "const _docListeners = {};\n"
+            "const mockNode = {};\n"
+            "const mockBox = {\n"
+            '  textContent: "",\n'
+            "  clientHeight: 100,\n"
+            "  scrollHeight: 100,\n"
+            "  _scrollTop: 0,\n"
+            "  get scrollTop() { return this._scrollTop; },\n"
+            "  set scrollTop(v) {\n"
+            "    const maxS = Math.max(0, this.scrollHeight - this.clientHeight);\n"
+            "    this._scrollTop = Math.max(0, Math.min(maxS, v));\n"
+            "  },\n"
+            "  contains(n) { return n === mockNode; },\n"
+            "  addEventListener() {},\n"
+            "};\n"
+            "globalThis.document = {\n"
+            "  getElementById(id) { return id === 'terminal-box' ? mockBox : null; },\n"
+            "  addEventListener(ev, fn) { _docListeners[ev] = fn; },\n"
+            "};\n"
+            "globalThis.window = {\n"
+            "  getSelection() {\n"
+            "    return _selActive\n"
+            "      ? { isCollapsed: false, anchorNode: mockNode, focusNode: mockNode }\n"
+            "      : { isCollapsed: true, anchorNode: null, focusNode: null };\n"
+            "  },\n"
+            "};\n"
+            f"{m_fmt_stdio.group(0)}\n"
+            f"{m_term_scroll.group(0)}\n"
+            f"{m_append_term.group(0)}\n"
+            f"{m_odo.group(0)}\n"
+            f"{m_live_ms.group(0)}\n"
+            f"{m_cheat.group(0)}\n"
+            f"{m_meta.group(0)}\n"
+            f"{m_quip.group(0)}\n"
+            f"{m_fmt.group(0)}\n"
+            "mockBox.scrollHeight = 400;\n"
+            'appendTerminalLog("line 1\\nline 2", true, true);\n'
+            "handleTerminalUserScroll(mockBox);\n"
+            "const tailTop1 = mockBox.scrollTop;\n"
+            "mockBox.scrollHeight = 650;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3", true);\n'
+            "handleTerminalUserScroll(mockBox);\n"
+            "const tailTop2 = mockBox.scrollTop;\n"
+            "mockBox.scrollTop = 120;\n"
+            "handleTerminalUserScroll(mockBox);\n"
+            "const followAfterScrollUp = state.terminalFollowTail;\n"
+            "mockBox.scrollHeight = 900;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4", true);\n'
+            "const pinnedTopAfterAppend = mockBox.scrollTop;\n"
+            "_selActive = true;\n"
+            "mockBox.scrollHeight = 1100;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4\\nline 5", true);\n'
+            "const textDuringSel = mockBox.textContent;\n"
+            "_selActive = false;\n"
+            "if (_docListeners.selectionchange) _docListeners.selectionchange();\n"
+            "const textAfterClearSel = mockBox.textContent;\n"
+            "const pinnedTopAfterClearSel = mockBox.scrollTop;\n"
+            "mockBox.scrollTop = 1000;\n"
+            "handleTerminalUserScroll(mockBox);\n"
+            "const followAfterBottom = state.terminalFollowTail;\n"
+            "mockBox.scrollHeight = 1300;\n"
+            'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4\\nline 5\\nline 6", true);\n'
+            "const tailTopResumed = mockBox.scrollTop;\n"
+            "for (const ch of 'RAINBOW') {\n"
+            "  handleStopwatchCheatKey({ key: ch, target: { tagName: 'INPUT' } });\n"
+            "}\n"
+            "const cheatFromInput = state.stopwatchCheatSlowMo;\n"
+            "handleStopwatchCheatKey({ key: 'Shift', target: { tagName: 'BODY' } });\n"
+            "for (const ch of 'RAINBOW') {\n"
+            "  handleStopwatchCheatKey({ key: ch, target: { tagName: 'BODY' } });\n"
+            "}\n"
+            "const cheatAfterRainbow = state.stopwatchCheatSlowMo;\n"
+            "const quipAfterRainbow = _lastFlashedQuip;\n"
+            "const slomoMsAfter10s = getEntryLiveMs({ status: 'running', startPerfMs: 1000, baseElapsedMs: 0, rate: getStopwatchRate() }, 11000);\n"
+            "for (const k of ['ArrowUp','ArrowUp','ArrowDown','ArrowDown','ArrowLeft','ArrowRight','ArrowLeft','ArrowRight','B','A']) {\n"
+            "  handleStopwatchCheatKey({ key: k, target: { tagName: 'BODY' } });\n"
+            "}\n"
+            "const cheatAfterKonamiToggleOff = state.stopwatchCheatSlowMo;\n"
+            "const odoMidCarry = computeStopwatchOdometerPositions(9.56);\n"
+            "const odoPreTen = computeStopwatchOdometerPositions(9.999999);\n"
+            "const odoAtTen = computeStopwatchOdometerPositions(10.0);\n"
+            "console.log(JSON.stringify({"
+            "labels: [0, 1, 2, 3].map(i => stageStopwatchMeta(i).label),"
+            "z: formatStopwatchParts(0).full,"
+            "s: formatStopwatchParts(55984).full,"
+            "m: formatStopwatchParts(125007).full,"
+            'qFast: getCompletionStopwatchQuip("reduce", "done", 3200),'
+            'qSolve: getCompletionStopwatchQuip("solve", "done", 55984),'
+            "tailTop1, tailTop2, followAfterScrollUp, pinnedTopAfterAppend,"
+            "hasLine5DuringSel: textDuringSel.includes('line 5'),"
+            "hasLine5AfterClear: textAfterClearSel.includes('line 5'),"
+            "pinnedTopAfterClearSel, followAfterBottom, tailTopResumed,"
+            "cheatFromInput, cheatAfterRainbow, quipAfterRainbow, slomoMsAfter10s,"
+            "cheatAfterKonamiToggleOff, odoMidCarry, odoPreTen, odoAtTen"
+            "}));\n"
+        )
+        res = subprocess.run(
+            ["node", "-e", eval_script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(res.stdout.strip())
+        assert out["labels"] == [
+            "1. REDUCE",
+            "2. SOLVE",
+            "3. INTEGRATE",
+            "4. MERGE",
+        ]
+        assert out["z"] == "00:00.000"
+        assert out["s"] == "00:55.984"
+        assert out["m"] == "02:05.007"
+        assert out["tailTop1"] == 300
+        assert out["tailTop2"] == 550
+        assert out["followAfterScrollUp"] is False
+        assert out["pinnedTopAfterAppend"] == 120
+        assert out["hasLine5DuringSel"] is False
+        assert out["hasLine5AfterClear"] is True
+        assert out["pinnedTopAfterClearSel"] == 120
+        assert out["followAfterBottom"] is True
+        assert out["tailTopResumed"] == 1200
+        assert out["cheatFromInput"] is False
+        assert 0.45 < out["odoMidCarry"][5] < 0.55
+        assert 9.45 < out["odoMidCarry"][6] < 9.55
+        assert abs(out["odoPreTen"][5] - out["odoAtTen"][5]) < 1e-4
+        assert abs(out["odoPreTen"][6] - 10.0) < 1e-4
+        assert out["odoAtTen"][6] == 0.0
+        if mode == "arcade":
+            assert out["cheatAfterRainbow"] is True
+            assert out["quipAfterRainbow"] == "SLO-MO CHEAT!"
+            assert abs(out["slomoMsAfter10s"] - 15.0) < 1e-6
+            assert out["cheatAfterKonamiToggleOff"] is False
+        else:
+            assert out["cheatAfterRainbow"] is False
+            assert abs(out["slomoMsAfter10s"] - 10000.0) < 1e-6
+        if mode == "arcade":
+            assert out["qFast"] == "SPEED BONUS!"
+            assert out["qSolve"] == "STAGE CLEAR!"
+        else:
+            assert out["qFast"] == ""
+            assert out["qSolve"] == ""
+
+    # Verify backend per-step millisecond timing lifecycle on NovaGalaxyPipelineRunner
+    runner = NovaGalaxyPipelineRunner()
+    t0 = time.time() - 55.984
+    runner.active_job = {
+        "job_id": "test-solve-1",
+        "stage_id": "solve",
+        "state": "running",
+        "started_at": t0,
+    }
+    snap_running = runner.get_step_timings_snapshot()
+    assert "solve" in snap_running
+    assert snap_running["solve"]["state"] == "running"
+    assert snap_running["solve"]["finished_at"] is None
+    assert snap_running["solve"]["elapsed_ms"] >= 55900
+
+    # Stamp exact finish time and verify frozen elapsed_ms persists when switching steps
+    runner.active_job["state"] = "ok"
+    runner.active_job["finished_at"] = t0 + 55.984
+    snap_done = runner.get_step_timings_snapshot()
+    assert snap_done["solve"]["state"] == "ok"
+    assert snap_done["solve"]["elapsed_ms"] == 55984
+
+    # Start next stage (integrate) and cancel it; both stages must remain in step_timings
+    t1 = time.time() - 3.215
+    runner.active_job = {
+        "job_id": "test-int-1",
+        "stage_id": "integrate",
+        "state": "running",
+        "started_at": t1,
+        "stdout": "",
+    }
+    runner.cancel_active_job("integrate")
+    snap_both = runner.get_step_timings_snapshot()
+    assert snap_both["solve"]["elapsed_ms"] == 55984
+    assert snap_both["integrate"]["state"] == "deleted"
+    assert snap_both["integrate"]["finished_at"] is not None
+    assert snap_both["integrate"]["elapsed_ms"] >= 3200

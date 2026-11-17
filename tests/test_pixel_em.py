@@ -504,3 +504,275 @@ def test_single_frame_coarse_dmin_protects_high_q_bragg_spots_and_masks_flare(tm
     # Every real crystal Bragg reflection (including d < 2.8 A high-Q spots) stays valid (class 0)
     for bk, r0, c0 in high_q_spots:
         assert p_cls[b_to_idx[bk], r0, c0] == 0
+
+
+def test_jax_splat_and_2d_filters_match_cpu_scipy_reference(tmp_path):
+    """Batched JAX median/75th-percentile filters and reflection splat match CPU references."""
+    from scipy.ndimage import median_filter, percentile_filter
+
+    from subhkl.search.pixel_em import (
+        _batch_inpainted_median_bg,
+        _run_batch_median_2d,
+        _run_batch_pct75_2d,
+        inpainted_median_bg,
+    )
+
+    rng = np.random.default_rng(1234)
+    arr = rng.gamma(shape=3.5, scale=12.0, size=(5, 32, 32)).astype(np.float32)
+
+    for k in (5, 7):
+        got_med = _run_batch_median_2d(arr, k)
+        ref_med = np.stack(
+            [median_filter(a, size=k, mode="nearest") for a in arr], axis=0
+        )
+        np.testing.assert_allclose(got_med, ref_med, rtol=1e-5, atol=1e-5)
+
+    got_p75 = _run_batch_pct75_2d(arr, 5)
+    # Odd 5x5 window has 25 elements; rank index 18 matches scipy percentile=75
+    ref_p75 = np.stack(
+        [percentile_filter(a, percentile=75, size=5, mode="nearest") for a in arr],
+        axis=0,
+    )
+    np.testing.assert_allclose(got_p75, ref_p75, rtol=1e-5, atol=1e-5)
+
+    keys = [(idx // 2, 60 + (idx % 2)) for idx in range(arr.shape[0])]
+    y_rb = {keys[idx]: arr[idx].astype(np.float64) for idx in range(arr.shape[0])}
+    bg_raw_rb = {
+        keys[idx]: median_filter(arr[idx], size=5, mode="nearest").astype(np.float64)
+        for idx in range(arr.shape[0])
+    }
+    dark_masks = {}
+    bright_masks = {}
+    for idx, k_rb in enumerate(keys):
+        dm = np.zeros(arr.shape[1:], dtype=bool)
+        bm = np.zeros(arr.shape[1:], dtype=bool)
+        if idx == 2:
+            dm[:, :] = True  # all-dark bank edge case
+        else:
+            dm[8:16, 10:18] = True
+            if idx % 2 == 0:
+                bm[22:25, 22:25] = True
+        dark_masks[k_rb] = dm
+        bright_masks[k_rb] = bm
+
+    got_bg = _batch_inpainted_median_bg(
+        keys, y_rb, dark_masks, bright_masks, 5, bg_raw_rb
+    )
+    for k_rb in keys:
+        ref_bg = inpainted_median_bg(
+            y_rb[k_rb],
+            dark_masks[k_rb],
+            bright_masks[k_rb],
+            5,
+            bg_raw=bg_raw_rb[k_rb],
+        )
+        np.testing.assert_allclose(got_bg[k_rb], ref_bg, rtol=1e-5, atol=1e-5)
+
+    (
+        frames_path,
+        _boot_path,
+        U_true,
+        B,
+        cell,
+        wl,
+        d_min,
+        _strong_rc,
+        _mod_rc,
+        _run0_spots,
+    ) = _write_synthetic_dataset(tmp_path)
+    args = SimpleNamespace(
+        nexus=str(frames_path),
+        instrument="CG4D",
+        runs=[0, 1, 2],
+        stable_runs=[0, 1, 2],
+        binning=8,
+        border_width=4,
+        static_mask_file=None,
+        wl_min=wl[0],
+        wl_max=wl[1],
+        assign_wavelength=wl,
+        d_min=d_min,
+        cell=cell,
+        space_group="P 2 2 2",
+    )
+    em = PixelEMClassifier.from_args(args)
+    assert em is not None
+
+    kw = {
+        "radial_scale": 0.035,
+        "axial_scale": -0.02,
+        "global_rot_vec": np.array([0.008, -0.012, 0.005], dtype=np.float64),
+        "global_trans_m": np.array([0.001, -0.002, 0.0015], dtype=np.float64),
+        "sample_shift_m": np.array([0.0005, -0.0003, 0.0004], dtype=np.float64),
+    }
+
+    jax_single = em._project_and_splat(U_true, B, match_sigma_px=5.0, **kw)
+    cpu_single = em._project_and_splat_cpu(U_true, B, match_sigma_px=5.0, **kw)
+    assert set(jax_single.keys()) == set(cpu_single.keys())
+    for k_rb in cpu_single:
+        np.testing.assert_allclose(
+            jax_single[k_rb], cpu_single[k_rb], rtol=2e-3, atol=2e-4
+        )
+
+    jax_broad, jax_tight = em._project_and_splat(
+        U_true, B, match_sigma_px=12.0, dual_tight_sigma_px=4.5, **kw
+    )
+    cpu_broad, cpu_tight = em._project_and_splat_cpu(
+        U_true, B, match_sigma_px=12.0, dual_tight_sigma_px=4.5, **kw
+    )
+    for k_rb in cpu_broad:
+        np.testing.assert_allclose(
+            jax_broad[k_rb], cpu_broad[k_rb], rtol=2e-3, atol=2e-4
+        )
+        np.testing.assert_allclose(
+            jax_tight[k_rb], cpu_tight[k_rb], rtol=2e-3, atol=2e-4
+        )
+
+
+def test_load_observations_shares_prebinned_panel_cache_with_pixel_em(
+    tmp_path, monkeypatch
+):
+    """Single-pass HDF5 slab cache in load_observations matches standalone PixelEMClassifier.from_args."""
+    import subhkl.search.pixel_em as pem_mod
+    from subhkl.scan_refine import load_observations
+
+    (
+        frames_path,
+        _boot_path,
+        U_true,
+        B,
+        cell,
+        wl,
+        d_min,
+        _strong_rc,
+        _mod_rc,
+        _run0_spots,
+    ) = _write_synthetic_dataset(tmp_path)
+
+    base_kwargs = {
+        "nexus": str(frames_path),
+        "instrument": "CG4D",
+        "runs": [0, 1, 2],
+        "stable_runs": [0, 1, 2],
+        "binning": 8,
+        "border_width": 4,
+        "static_mask_file": None,
+        "wl_min": wl[0],
+        "wl_max": wl[1],
+        "assign_wavelength": wl,
+        "d_min": d_min,
+        "cell": cell,
+        "space_group": "P 2 2 2",
+        "finder": None,
+    }
+    args_cached = SimpleNamespace(**base_kwargs)
+    obs = load_observations(args_cached)
+    assert list(np.unique(obs[5])) == [0, 1, 2]
+    assert getattr(args_cached, "_prebinned_panel_cache", None) is not None
+
+    args_direct = SimpleNamespace(**base_kwargs)
+    em_direct = PixelEMClassifier.from_args(args_direct)
+    assert em_direct is not None
+
+    def _forbid_reload(*_a, **_kw):
+        raise AssertionError("Expected PixelEMClassifier.from_args to hit cache")
+
+    monkeypatch.setattr(pem_mod, "load_binned_nexus_panels", _forbid_reload)
+    em_cached = PixelEMClassifier.from_args(args_cached)
+    assert em_cached is not None
+
+    em_cached.update_e_step(U_true, B)
+    em_direct.update_e_step(U_true, B)
+    for bk in em_cached.obs_banks:
+        np.testing.assert_allclose(
+            em_cached.gamma_valid[bk], em_direct.gamma_valid[bk], rtol=1e-5, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            em_cached.gamma_dark[bk], em_direct.gamma_dark[bk], rtol=1e-5, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            em_cached.gamma_bright[bk], em_direct.gamma_bright[bk], rtol=1e-5, atol=1e-5
+        )
+
+
+def test_band_table_dense_coalescing_matches_exact_quadrature():
+    """Dense (>65k) subpixel clouds coalesce cleanly in band_table with >0.999 correlation."""
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.search.spherical import (
+        band_q_range,
+        band_table,
+        panel_directions,
+    )
+
+    rng = np.random.default_rng(77)
+    ki = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    all_d, all_w, all_s = [], [], []
+    # 6 CG4D panels at binning=4 -> 98,304 > 65,536 bins triggers S^2 x q coalescing
+    for bk_key in sorted(beamlines["CG4D"], key=int)[:6]:
+        det = Detector(beamlines["CG4D"][bk_key])
+        rr, cc = np.meshgrid(
+            np.arange(128) * 4 + 1.5, np.arange(128) * 4 + 1.5, indexing="ij"
+        )
+        dl = panel_directions(det, rows=rr.ravel(), cols=cc.ravel(), ki=ki)
+        ex = rng.normal(0.0, 1.0, size=(128, 128))
+        # Inject coherent multi-bin Bragg spots (~2-bin width)
+        for _ in range(12):
+            r0 = int(rng.integers(10, 118))
+            c0 = int(rng.integers(10, 118))
+            yy, xx = np.ogrid[0:128, 0:128]
+            ex += 45.0 * np.exp(-0.5 * ((yy - r0) ** 2 + (xx - c0) ** 2) / 1.8**2)
+        all_d.append(dl)
+        all_w.append(ex.ravel())
+        all_s.append(-(dl @ ki))
+
+    D = np.vstack(all_d).astype(np.float32)
+    w = np.concatenate(all_w).astype(np.float32)
+    w /= np.abs(w).sum()
+    s = np.concatenate(all_s).astype(np.float32)
+    qlo, qhi = band_q_range(s, (2.0, 4.5), 1.5)
+    qlo_f = qlo.astype(np.float64)
+    qhi_f = qhi.astype(np.float64)
+    lengths = np.array([8.0, 11.31, 13.86], dtype=np.float32)
+    spacing_deg = 8.0
+
+    tab_got, off, nph, nth = band_table(D, w, qlo, qhi, lengths, spacing_deg)
+    got_np = np.asarray(tab_got, dtype=np.float64)
+
+    # Independent pure-NumPy exact uncoalesced reference on the Funk pole grid
+    th = (np.arange(nth) + 0.5) * np.pi / nth
+    off_full = np.concatenate([np.asarray(off, dtype=int), [got_np.shape[1]]])
+    nph_np = np.asarray(nph, dtype=int)
+    it = np.repeat(np.arange(nth), nph_np)
+    ph = (np.arange(off_full[-1]) - np.repeat(off_full[:-1], nph_np) + 0.5) * (
+        2.0 * np.pi / nph_np[it]
+    )
+    P = np.stack(
+        [np.sin(th[it]) * np.cos(ph), np.sin(th[it]) * np.sin(ph), np.cos(th[it])], 1
+    ).astype(np.float64)
+
+    valid = qhi_f > qlo_f + 1e-7
+    D_v = D[valid].astype(np.float64)
+    w_v = w[valid].astype(np.float64)
+    qlo_v = qlo_f[valid]
+    qhi_v = qhi_f[valid]
+    env = np.tanh((qhi_v - qlo_v) / np.maximum(0.02 * qlo_v, 1e-6))
+    u = P @ D_v.T
+    ref_np = np.zeros_like(got_np)
+    two_pi = 2.0 * np.pi
+    for iz, xz in enumerate(lengths.astype(np.float64)):
+        t = xz * u
+        den = two_pi * (qhi_v[None, :] - qlo_v[None, :]) * t
+        ok = np.abs(den) > 1e-7
+        num = np.sin(two_pi * qhi_v[None, :] * t) - np.sin(two_pi * qlo_v[None, :] * t)
+        k_val = env[None, :] * np.where(ok, num / np.where(ok, den, 1.0), 1.0)
+        ref_np[iz] = k_val @ w_v
+
+    corr = float(np.corrcoef(ref_np.ravel(), got_np.ravel())[0, 1])
+    rel_err = float(np.linalg.norm(ref_np - got_np) / np.linalg.norm(ref_np))
+    assert corr > 0.999
+    assert rel_err < 0.03
+    # band_phase is antipodal-symmetric (phi(-p) == phi(+p)), so compare |p_got . p_ref|
+    p_got = P[int(np.argmax(got_np[0]))]
+    p_ref = P[int(np.argmax(ref_np[0]))]
+    assert abs(float(np.dot(p_got, p_ref))) > 0.999

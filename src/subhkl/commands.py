@@ -3549,6 +3549,7 @@ def run_spherical_index(
                 [all_pc[top_]],
                 [all_R[top_]],
             )
+            del all_bk, all_pr, all_pc, all_R, top_
             ladder = sph.lattice_ladder(
                 spot_d,
                 spot_w,
@@ -3561,6 +3562,8 @@ def run_spherical_index(
                 table_weights=all_w,
                 table_sin_theta=all_s,
             )
+            n_live_bins = len(all_d)
+            del all_d, all_w, all_s
             results = [
                 {
                     "R": R_,
@@ -3573,7 +3576,7 @@ def run_spherical_index(
                 for R_, s_, z_ in ladder
             ]
             print(
-                f"spherical-index: direct-lattice ladder on {len(all_d):,} live "
+                f"spherical-index: direct-lattice ladder on {n_live_bins:,} live "
                 f"bins (exhaustive rung), {len(spot_d):,} strongest for the zoom "
                 "rungs; final-rung z = " + ", ".join(f"{r['z']:.1f}" for r in results)
             )

@@ -13,10 +13,10 @@ Key features:
      to switch between Cylindrical and Spherical views at any time.
 3. **2-Layer Depth Parallax ("Look Behind the Predicted Spots")**:
    - *Back Layer (Detector Plate)*: Physical detector bank panels & log1p pixel intensity heatmaps.
-   - *Front Layer (Bragg Reflections)*: Vibrant spectral Bragg peak rings floating by
-     resolution ($d$-spacing) with subtle depth tethers to their physical spots on the
-     detector plate — moving the mouse shifts the predicted rings aside so you can
-     inspect the raw detector spot morphology directly underneath!
+   - *Front Layer (Bragg Reflections)*: Vibrant spectral Bragg peak rings floating
+     above the detector plate — moving the mouse shifts the predicted rings aside
+     without tether lines so you can inspect the unoccluded raw detector spot
+     morphology directly underneath!
 """
 
 from __future__ import annotations
@@ -4554,11 +4554,20 @@ def render_rainbow_html(
     color: #fda4af;
   }}
 
+  .terminal-wrap {{
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: hidden;
+  }}
+
   .terminal-box {{
     background: #04060c;
     border: 1px solid #1e293b;
     border-radius: 5px;
-    padding: 5px 7px;
+    padding: 5px 7px 26px 7px;
     font-size: 0.6rem;
     line-height: 1.32;
     font-family: var(--font-display);
@@ -4570,6 +4579,355 @@ def render_rainbow_html(
     word-break: break-all;
     user-select: text;
     margin: 0;
+    outline: none;
+  }}
+
+  .terminal-box:focus {{
+    border-color: #334155;
+  }}
+
+  @keyframes swRainbowShoot {{
+    0% {{
+      stroke-dashoffset: 100;
+      opacity: 0;
+    }}
+    3% {{
+      stroke-dashoffset: 95;
+      opacity: 1;
+    }}
+    44%, 72% {{
+      stroke-dashoffset: 0;
+      opacity: 1;
+    }}
+    96% {{
+      stroke-dashoffset: -95;
+      opacity: 0.85;
+    }}
+    99%, 100% {{
+      stroke-dashoffset: -100;
+      opacity: 0;
+    }}
+  }}
+
+  @keyframes swRainbow8BitGlow {{
+    0%, 100% {{
+      filter: saturate(1.15) drop-shadow(0 0 2.2px rgba(244, 114, 182, 0.45));
+    }}
+    50% {{
+      filter: saturate(1.30) brightness(1.10) drop-shadow(0 0 3.0px rgba(56, 189, 248, 0.55));
+    }}
+  }}
+
+  @keyframes swRainbowTipSparkle {{
+    0% {{
+      opacity: 0;
+      transform: translate(1.94px, 10.6px) scale(0.3);
+    }}
+    3% {{
+      opacity: 0.92;
+      transform: translate(2.55px, 9.4px) scale(0.72);
+    }}
+    11% {{
+      opacity: 1;
+      transform: translate(5.96px, 5.73px) scale(0.85);
+    }}
+    22% {{
+      opacity: 1;
+      transform: translate(12.0px, 3.9px) scale(0.95);
+    }}
+    33% {{
+      opacity: 1;
+      transform: translate(18.04px, 5.73px) scale(0.85);
+    }}
+    44% {{
+      opacity: 0.9;
+      transform: translate(22.06px, 10.6px) scale(0.75);
+    }}
+    47%, 100% {{
+      opacity: 0;
+      transform: translate(22.06px, 10.6px) scale(0.2);
+    }}
+  }}
+
+  @keyframes swRainbowFormOnce {{
+    0% {{
+      stroke-dashoffset: 100;
+      opacity: 0.4;
+    }}
+    100% {{
+      stroke-dashoffset: 0;
+      opacity: 1;
+    }}
+  }}
+
+  @keyframes swStarTwinkle {{
+    0%, 100% {{
+      opacity: 0.18;
+      transform: scale(0.55);
+    }}
+    50% {{
+      opacity: 1;
+      transform: scale(1.12);
+    }}
+  }}
+
+  @keyframes swNeonPulse {{
+    0%, 100% {{
+      border-color: rgba(56, 189, 248, 0.72);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 9px rgba(56, 189, 248, 0.24);
+    }}
+    50% {{
+      border-color: rgba(244, 63, 133, 0.82);
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 12px rgba(244, 63, 133, 0.30);
+    }}
+  }}
+
+  .stdio-stopwatch {{
+    position: absolute;
+    right: 9px;
+    bottom: 5px;
+    z-index: 4;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px 2px 5px;
+    border-radius: 999px;
+    background: rgba(8, 12, 24, 0.90);
+    backdrop-filter: blur(5px);
+    border: 1px solid rgba(51, 65, 85, 0.78);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.50);
+    font-family: var(--font-display);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.58rem;
+    line-height: 1.15;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 0.16s ease, color 0.16s ease, transform 0.12s ease;
+    max-width: calc(100% - 14px);
+    overflow: hidden;
+    white-space: nowrap;
+  }}
+
+  .stdio-stopwatch:hover {{
+    border-color: var(--accent-cyan);
+    transform: translateY(-0.5px);
+  }}
+
+  .stdio-stopwatch .sw-icon {{
+    width: 18px;
+    height: 9px;
+    flex-shrink: 0;
+    overflow: visible;
+    opacity: 0.48;
+    filter: saturate(0.55);
+    transition: opacity 0.2s ease, filter 0.2s ease;
+  }}
+
+  .stdio-stopwatch .sw-rb {{
+    stroke-dasharray: 100;
+    stroke-dashoffset: 0;
+  }}
+
+  .stdio-stopwatch .sw-sp-tip,
+  .stdio-stopwatch .sw-sp-end path {{
+    opacity: 0;
+  }}
+
+  .stdio-stopwatch .sw-sp-end path {{
+    transform-box: fill-box;
+    transform-origin: center;
+  }}
+
+  .stdio-stopwatch .sw-stage {{
+    font-size: 0.53rem;
+    font-weight: 700;
+    letter-spacing: 0.25px;
+    text-transform: uppercase;
+    color: #94a3b8;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+
+  .stdio-stopwatch .sw-time {{
+    font-weight: 700;
+    letter-spacing: 0.2px;
+    color: #e2e8f0;
+    flex-shrink: 0;
+  }}
+
+  .stdio-stopwatch .sw-ms {{
+    font-size: 0.51rem;
+    opacity: 0.82;
+  }}
+
+  .stdio-stopwatch .sw-odo-wrap {{
+    display: inline-flex;
+    align-items: baseline;
+  }}
+
+  .stdio-stopwatch .sw-odo-col {{
+    display: inline-block;
+    width: 1ch;
+    height: 1.2em;
+    line-height: 1.2em;
+    overflow: hidden;
+    vertical-align: bottom;
+    position: relative;
+    -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.10) 0%, #000 20%, #000 80%, rgba(0, 0, 0, 0.10) 100%);
+    mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.10) 0%, #000 20%, #000 80%, rgba(0, 0, 0, 0.10) 100%);
+  }}
+
+  .stdio-stopwatch .sw-odo-strip {{
+    display: flex;
+    flex-direction: column;
+    will-change: transform;
+  }}
+
+  .stdio-stopwatch .sw-odo-glyph {{
+    display: block;
+    height: 1.2em;
+    line-height: 1.2em;
+    flex: 0 0 1.2em;
+    text-align: center;
+  }}
+
+  .stdio-stopwatch .sw-odo-sep {{
+    display: inline-block;
+    line-height: 1.2em;
+    vertical-align: bottom;
+  }}
+
+  .stdio-stopwatch.sw-slomo {{
+    border-color: rgba(192, 132, 252, 0.85);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 10px rgba(168, 85, 247, 0.34);
+  }}
+
+  .stdio-stopwatch.sw-slomo .sw-time {{
+    color: #f5d0fe;
+  }}
+
+  .stdio-stopwatch.sw-slomo.sw-running .sw-rb,
+  .stdio-stopwatch.sw-slomo.sw-quip-flash .sw-rb {{
+    animation: swRainbowShoot 6.5s linear infinite;
+  }}
+
+  .stdio-stopwatch.sw-slomo.sw-running .sw-sp-tip,
+  .stdio-stopwatch.sw-slomo.sw-quip-flash .sw-sp-tip {{
+    animation: swRainbowTipSparkle 6.5s linear infinite;
+  }}
+
+  .stdio-stopwatch.sw-slomo.sw-quip-flash .sw-icon {{
+    opacity: 1;
+    filter: saturate(1.25) drop-shadow(0 0 3px rgba(192, 132, 252, 0.55));
+  }}
+
+  @keyframes swQuipBlink {{
+    0% {{ opacity: 0.35; transform: translateY(1px); }}
+    18% {{ opacity: 1; transform: translateY(0); }}
+    34% {{ opacity: 0.45; }}
+    52% {{ opacity: 1; }}
+    100% {{ opacity: 1; }}
+  }}
+
+  .stdio-stopwatch.sw-quip-flash {{
+    border-color: rgba(244, 114, 182, 0.90);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 11px rgba(244, 114, 182, 0.35);
+  }}
+
+  .stdio-stopwatch.sw-quip-flash .sw-stage {{
+    color: #fbbf24;
+    text-shadow: 0 0 8px rgba(251, 191, 36, 0.45);
+    animation: swQuipBlink 0.55s ease-out 1;
+  }}
+
+  .stdio-stopwatch.sw-running {{
+    color: #f8fafc;
+    animation: swNeonPulse 1.8s ease-in-out infinite;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-icon {{
+    opacity: 1;
+    animation: swRainbow8BitGlow 0.8s steps(2, end) infinite;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-rb {{
+    animation: swRainbowShoot 1.5s linear infinite;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-rb-1 {{ animation-delay: 0s; }}
+  .stdio-stopwatch.sw-running .sw-rb-2 {{ animation-delay: 0.02s; }}
+  .stdio-stopwatch.sw-running .sw-rb-3 {{ animation-delay: 0.04s; }}
+  .stdio-stopwatch.sw-running .sw-rb-4 {{ animation-delay: 0.06s; }}
+  .stdio-stopwatch.sw-running .sw-rb-5 {{ animation-delay: 0.08s; }}
+
+  .stdio-stopwatch.sw-running .sw-sp-tip {{
+    animation: swRainbowTipSparkle 1.5s linear infinite;
+    animation-delay: 0.04s;
+  }}
+
+  .stdio-stopwatch.sw-running .sw-stage {{
+    color: var(--accent-cyan);
+  }}
+
+  .stdio-stopwatch.sw-running .sw-time {{
+    color: #ffffff;
+  }}
+
+  .stdio-stopwatch.sw-done {{
+    border-color: rgba(52, 211, 153, 0.62);
+    color: #ecfdf5;
+  }}
+
+  .stdio-stopwatch.sw-done .sw-icon {{
+    opacity: 1;
+    filter: saturate(1.1) drop-shadow(0 0 2.5px rgba(56, 189, 248, 0.38));
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-rb {{
+    animation: swRainbowFormOnce 0.42s ease-out 1 both;
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-sp-end path {{
+    animation: swStarTwinkle 0.44s steps(2, end) infinite;
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-sp-end-2 path {{
+    animation-delay: 0.14s;
+  }}
+
+  .stdio-stopwatch.sw-done.sw-quip-flash .sw-sp-end-3 path {{
+    animation-delay: 0.28s;
+  }}
+
+  .stdio-stopwatch.sw-done .sw-stage {{
+    color: var(--accent-green);
+  }}
+
+  .stdio-stopwatch.sw-stopped {{
+    border-color: rgba(251, 191, 36, 0.60);
+  }}
+
+  .stdio-stopwatch.sw-stopped .sw-icon {{
+    opacity: 0.62;
+    filter: saturate(0.5);
+  }}
+
+  .stdio-stopwatch.sw-stopped .sw-stage {{
+    color: #fbbf24;
+  }}
+
+  .stdio-stopwatch.sw-error {{
+    border-color: rgba(248, 113, 113, 0.68);
+  }}
+
+  .stdio-stopwatch.sw-error .sw-icon {{
+    opacity: 0.65;
+    filter: saturate(0.35) sepia(0.6) hue-rotate(-35deg);
+  }}
+
+  .stdio-stopwatch.sw-error .sw-stage {{
+    color: #f87171;
   }}
 
   .params-drawer {{
@@ -4920,7 +5278,32 @@ def render_rainbow_html(
           <span>&gt;_ Terminal // Stdio</span>
           <span id="cell-summary" style="font-size:0.62rem;color:var(--accent-pink);">IDLE</span>
         </div>
-        <pre class="terminal-box" id="terminal-box">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
+        <div class="terminal-wrap">
+          <pre class="terminal-box" id="terminal-box" tabindex="0">$ sUBhkl ready — click [1. Reduce], [2. Solve], [3. Integrate], or [4. Merge] below to execute on GPU / Pulsar and stream live stdout/stderr here.</pre>
+          <div class="stdio-stopwatch sw-idle" id="stdio-stopwatch" role="timer" aria-live="off" title="Step stopwatch (mm:ss.ms) — counts time spent in each pipeline step">
+            <svg class="sw-icon" viewBox="0 0 24 12" aria-hidden="true">
+              <path class="sw-rb sw-rb-1" pathLength="100" d="M 0.55 10.6 A 12.2 12.2 0 0 1 23.45 10.6" fill="none" stroke="#ff3b6b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-2" pathLength="100" d="M 1.24 10.6 A 11.55 11.55 0 0 1 22.76 10.6" fill="none" stroke="#ff922b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-3" pathLength="100" d="M 1.94 10.6 A 10.9 10.9 0 0 1 22.06 10.6" fill="none" stroke="#ffd43b" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-4" pathLength="100" d="M 2.65 10.6 A 10.25 10.25 0 0 1 21.35 10.6" fill="none" stroke="#38d9a9" stroke-width="0.68" stroke-linecap="round"></path>
+              <path class="sw-rb sw-rb-5" pathLength="100" d="M 3.37 10.6 A 9.6 9.6 0 0 1 20.63 10.6" fill="none" stroke="#38bdf8" stroke-width="0.68" stroke-linecap="round"></path>
+              <g class="sw-sp-tip">
+                <path d="M 0 -1.8 L 0.45 -0.45 L 1.8 0 L 0.45 0.45 L 0 1.8 L -0.45 0.45 L -1.8 0 L -0.45 -0.45 Z" fill="#fef08a"></path>
+              </g>
+              <g class="sw-sp-end sw-sp-end-1" transform="translate(5.2 3.8)">
+                <path d="M 0 -1.7 L 0.42 -0.42 L 1.7 0 L 0.42 0.42 L 0 1.7 L -0.42 0.42 L -1.7 0 L -0.42 -0.42 Z" fill="#fde047"></path>
+              </g>
+              <g class="sw-sp-end sw-sp-end-2" transform="translate(12.0 1.4)">
+                <path d="M 0 -2.0 L 0.5 -0.5 L 2.0 0 L 0.5 0.5 L 0 2.0 L -0.5 0.5 L -2.0 0 L -0.5 -0.5 Z" fill="#ffffff"></path>
+              </g>
+              <g class="sw-sp-end sw-sp-end-3" transform="translate(19.0 4.0)">
+                <path d="M 0 -1.7 L 0.42 -0.42 L 1.7 0 L 0.42 0.42 L 0 1.7 L -0.42 0.42 L -1.7 0 L -0.42 -0.42 Z" fill="#67e8f9"></path>
+              </g>
+            </svg>
+            <span class="sw-stage" id="stdio-stopwatch-stage">READY</span>
+            <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>
+          </div>
+        </div>
         <canvas id="canvas-hist" title="Click to cycle resolution sparkline: CC½ vs d → Completeness vs d → ⟨I/σ⟩ vs d" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
       </div>
     </aside>
@@ -5363,6 +5746,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return 2; // solve / predictor / finder -> Completed 1..2, Pending step: 3. Integrate
   }}
 
+  const UI_MODE = "{default_mode}".toLowerCase();
   const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" &&
     Array.isArray(PEAKS) &&
     PEAKS.some(p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual));
@@ -5408,6 +5792,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     selectedFrameIndex: typeof DATA.frame_index === "number" ? DATA.frame_index : 0,
     frameRequestSeq: 0,
     frameAbortController: null,
+    stepTimings: Object.create(null),
+    stopwatchInspectKey: null,
+    stopwatchCheatSlowMo: false,
+    terminalFollowTail: true,
+    terminalScrollTop: 0,
   }};
 
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
@@ -5705,16 +6094,580 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return collapsed.join("\\n");
   }}
 
+  let _lastAutoTerminalScrollTop = -1;
+
+  function isTerminalAtBottom(box, slackPx = 10) {{
+    if (!box) return true;
+    const maxScroll = Math.max(0, (Number(box.scrollHeight) || 0) - (Number(box.clientHeight) || 0));
+    return maxScroll <= 0 || (maxScroll - (Number(box.scrollTop) || 0)) <= slackPx;
+  }}
+
+  function hasTerminalSelection(box) {{
+    if (!box || typeof window === "undefined" || typeof window.getSelection !== "function") return false;
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return false;
+    return Boolean(
+      (sel.anchorNode && box.contains(sel.anchorNode)) ||
+      (sel.focusNode && box.contains(sel.focusNode))
+    );
+  }}
+
+  function handleTerminalUserScroll(box) {{
+    if (!box) return;
+    const curTop = Number(box.scrollTop) || 0;
+    const prevTop = typeof state.terminalScrollTop === "number" ? state.terminalScrollTop : curTop;
+    state.terminalScrollTop = curTop;
+    if (_lastAutoTerminalScrollTop >= 0 && Math.abs(curTop - _lastAutoTerminalScrollTop) <= 2) {{
+      return;
+    }}
+    _lastAutoTerminalScrollTop = -1;
+    if (curTop < prevTop - 0.5) {{
+      state.terminalFollowTail = false;
+    }} else if (curTop > prevTop && isTerminalAtBottom(box, 10) && !hasTerminalSelection(box)) {{
+      state.terminalFollowTail = true;
+    }} else if (!isTerminalAtBottom(box, 16)) {{
+      state.terminalFollowTail = false;
+    }}
+  }}
+
   const terminalBoxEl = document.getElementById("terminal-box");
   if (terminalBoxEl) {{
+    terminalBoxEl.addEventListener("wheel", (ev) => {{
+      if (ev.deltaY < 0) {{
+        _lastAutoTerminalScrollTop = -1;
+        state.terminalFollowTail = false;
+        state.terminalScrollTop = terminalBoxEl.scrollTop;
+      }} else if (ev.deltaY > 0 && isTerminalAtBottom(terminalBoxEl, 10) && !hasTerminalSelection(terminalBoxEl)) {{
+        state.terminalFollowTail = true;
+      }}
+    }}, {{ passive: true }});
+    terminalBoxEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "PageUp" || ev.key === "ArrowUp" || ev.key === "Home") {{
+        _lastAutoTerminalScrollTop = -1;
+        state.terminalFollowTail = false;
+      }} else if (ev.key === "End" && !hasTerminalSelection(terminalBoxEl)) {{
+        state.terminalFollowTail = true;
+      }}
+    }});
     terminalBoxEl.addEventListener("scroll", () => {{
-      state.terminalScrollTop = terminalBoxEl.scrollTop;
+      handleTerminalUserScroll(terminalBoxEl);
     }});
   }}
 
-  function appendTerminalLog(text, replace = false) {{
+  const stopwatchEl = document.getElementById("stdio-stopwatch");
+  const stopwatchStageEl = document.getElementById("stdio-stopwatch-stage");
+  const stopwatchTimeEl = document.getElementById("stdio-stopwatch-time");
+  let lastStopwatchRenderKey = "";
+  const stopwatchFlash = {{
+    text: "",
+    untilPerf: 0,
+    timerId: null,
+    demoStartPerf: 0,
+    demoUntilPerf: 0,
+  }};
+  const STOPWATCH_SLOMO_RATE = 0.0015;
+  const STOPWATCH_ODO_RADICES = [10, 10, 6, 10, 10, 10, 10];
+  let stopwatchOdoStrips = null;
+
+  const SHORT_STAGE_STOPWATCH_LABELS = {{
+    reduce: "1. REDUCE",
+    solve: "2. SOLVE",
+    integrate: "3. INTEGRATE",
+    merge: "4. MERGE",
+  }};
+
+  function getStopwatchRate() {{
+    return (UI_MODE !== "pro" && state.stopwatchCheatSlowMo) ? STOPWATCH_SLOMO_RATE : 1.0;
+  }}
+
+  function computeStopwatchOdometerPositions(msFloat) {{
+    const v = Math.max(0, Number(msFloat) || 0);
+    const whole = Math.floor(v);
+    const frac = v - whole;
+    const u = Math.max(0, Math.min(1, (frac - 0.12) / 0.88));
+    const ease = 0.5 - 0.5 * Math.cos(Math.PI * u);
+
+    const dm3 = whole % 10;
+    const dm2 = Math.floor(whole / 10) % 10;
+    const dm1 = Math.floor(whole / 100) % 10;
+    const totSec = Math.floor(whole / 1000);
+    const secs = totSec % 60;
+    const dS2 = secs % 10;
+    const dS1 = Math.floor(secs / 10) % 6;
+    const mins = Math.floor(totSec / 60);
+    const dM2 = mins % 10;
+    const dM1 = Math.floor(mins / 10) % 10;
+
+    const cm3 = dm3 === 9;
+    const cm2 = cm3 && dm2 === 9;
+    const cm1 = cm2 && dm1 === 9;
+    const cS2 = cm1 && dS2 === 9;
+    const cS1 = cS2 && dS1 === 5;
+    const cM2 = cS1 && dM2 === 9;
+
+    return [
+      dM1 + (cM2 ? ease : 0),
+      dM2 + (cS1 ? ease : 0),
+      dS1 + (cS2 ? ease : 0),
+      dS2 + (cm1 ? ease : 0),
+      dm1 + (cm2 ? ease : 0),
+      dm2 + (cm3 ? ease : 0),
+      dm3 + ease,
+    ];
+  }}
+
+  function ensureStopwatchOdometerDOM() {{
+    if (!stopwatchTimeEl) return null;
+    if (stopwatchOdoStrips && stopwatchTimeEl.querySelector(".sw-odo-wrap")) {{
+      return stopwatchOdoStrips;
+    }}
+    const makeCol = (radix) => {{
+      const glyphs = [];
+      for (let g = 0; g < radix; g++) {{
+        glyphs.push(`<span class="sw-odo-glyph">${{g}}</span>`);
+      }}
+      glyphs.push('<span class="sw-odo-glyph">0</span>');
+      return `<span class="sw-odo-col"><span class="sw-odo-strip">${{glyphs.join("")}}</span></span>`;
+    }};
+    stopwatchTimeEl.innerHTML =
+      `<span class="sw-odo-wrap">` +
+      `${{makeCol(10)}}${{makeCol(10)}}` +
+      `<span class="sw-odo-sep">:</span>` +
+      `${{makeCol(6)}}${{makeCol(10)}}` +
+      `<span class="sw-ms"><span class="sw-odo-sep">.</span>${{makeCol(10)}}${{makeCol(10)}}${{makeCol(10)}}</span>` +
+      `</span>`;
+    stopwatchOdoStrips = Array.from(stopwatchTimeEl.querySelectorAll(".sw-odo-strip"));
+    return stopwatchOdoStrips;
+  }}
+
+  function getCompletionStopwatchQuip(stageId, finalStatus, elapsedMs) {{
+    if (UI_MODE === "pro") return "";
+    const sec = (Number(elapsedMs) || 0) / 1000;
+    if (finalStatus === "done") {{
+      if (sec < 8) return "SPEED BONUS!";
+      if (sec < 60) return "STAGE CLEAR!";
+      if (sec < 180) return stageId === "solve" ? "NICE SOLVE!" : "ALL CLEAR!";
+      return "FINALLY!";
+    }}
+    if (finalStatus === "stopped") return "ABORTED!";
+    if (finalStatus === "error") return "UH-OH!";
+    return "";
+  }}
+
+  function flashStopwatchQuip(text, durationMs = 1900) {{
+    if (UI_MODE === "pro" || !text) return;
+    if (stopwatchFlash.timerId) {{
+      clearTimeout(stopwatchFlash.timerId);
+      stopwatchFlash.timerId = null;
+    }}
+    stopwatchFlash.text = String(text);
+    stopwatchFlash.untilPerf = performance.now() + Math.max(400, Number(durationMs) || 1900);
+    renderStepStopwatch(true);
+    stopwatchFlash.timerId = setTimeout(() => {{
+      stopwatchFlash.timerId = null;
+      if (performance.now() >= stopwatchFlash.untilPerf) {{
+        stopwatchFlash.text = "";
+      }}
+      renderStepStopwatch(true);
+    }}, Math.max(400, Number(durationMs) || 1900) + 30);
+  }}
+
+  function stageStopwatchMeta(stageIdOrIdx) {{
+    let st = null;
+    if (typeof stageIdOrIdx === "number" && PIPELINE[stageIdOrIdx]) {{
+      st = PIPELINE[stageIdOrIdx];
+    }} else if (typeof stageIdOrIdx === "string") {{
+      st = PIPELINE.find(p => p && p.stage_id === stageIdOrIdx) || null;
+    }}
+    const sid = (st && st.stage_id) || (typeof stageIdOrIdx === "string" ? stageIdOrIdx : "solve");
+    if (SHORT_STAGE_STOPWATCH_LABELS[sid]) {{
+      const lbl = SHORT_STAGE_STOPWATCH_LABELS[sid];
+      return {{ stageId: sid, label: lbl, shortName: lbl.replace(/^\\d+\\.\\s*/, "") }};
+    }}
+    const stepNum = st && st.step_num ? `${{st.step_num}}. ` : "";
+    const shortName = st && st.name
+      ? String(st.name).replace(/^\\d+\\.\\s*/, "").replace(/\\s*\\([^)]*\\)/g, "").replace(/\\s*&.*$/, "").trim().toUpperCase()
+      : String(sid).toUpperCase();
+    return {{ stageId: sid, label: `${{stepNum}}${{shortName}}`, shortName }};
+  }}
+
+  function formatStopwatchParts(ms) {{
+    const clamped = Math.max(0, Math.round(Number(ms) || 0));
+    const totalSec = Math.floor(clamped / 1000);
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    const millis = clamped % 1000;
+    const mmss = `${{String(mins).padStart(2, "0")}}:${{String(secs).padStart(2, "0")}}`;
+    const dotMs = `.${{String(millis).padStart(3, "0")}}`;
+    return {{ mmss, dotMs, full: `${{mmss}}${{dotMs}}`, clamped }};
+  }}
+
+  function getEntryLiveMs(entry, nowPerf = performance.now()) {{
+    if (!entry) return 0;
+    if (entry.status === "running") {{
+      const delta = Math.max(0, nowPerf - (Number(entry.startPerfMs) || nowPerf));
+      const rate = typeof entry.rate === "number" ? entry.rate : getStopwatchRate();
+      return Math.max(0, (Number(entry.baseElapsedMs) || 0) + delta * rate);
+    }}
+    return Math.max(0, Number(entry.elapsedMs) || 0);
+  }}
+
+  function buildStopwatchTooltip(nowPerf = performance.now()) {{
+    const lines = [
+      state.stopwatchCheatSlowMo
+        ? "Step Stopwatch (mm:ss.ms) — ⚡ SLO-MO CHEAT ACTIVE"
+        : "Step Stopwatch (mm:ss.ms)"
+    ];
+    let totalMs = 0;
+    let recordedCount = 0;
+    const order = PIPELINE.length > 0
+      ? PIPELINE.map(p => p.stage_id)
+      : ["reduce", "solve", "integrate", "merge"];
+    order.forEach(sid => {{
+      const meta = stageStopwatchMeta(sid);
+      const entry = state.stepTimings[sid];
+      if (!entry || entry.status === "idle") {{
+        lines.push(`• ${{meta.label}}: —`);
+      }} else {{
+        const ms = getEntryLiveMs(entry, nowPerf);
+        totalMs += ms;
+        recordedCount++;
+        const realNote = (entry.cheated && typeof entry.realElapsedMs === "number")
+          ? ` [real ${{formatStopwatchParts(entry.realElapsedMs).full}}]`
+          : (entry.cheated ? " [slo-mo]" : "");
+        lines.push(`• ${{meta.label}}: ${{formatStopwatchParts(ms).full}} (${{entry.status}})${{realNote}}`);
+      }}
+    }});
+    if (recordedCount > 0) {{
+      lines.push(`Σ Total: ${{formatStopwatchParts(totalMs).full}} (click badge to cycle splits)`);
+    }} else {{
+      lines.push("Run a workflow step below to time it in mm:ss.ms");
+    }}
+    return lines.join("\\n");
+  }}
+
+  function activeRunningStageId() {{
+    if (state.runningStageIdx >= 0 && PIPELINE[state.runningStageIdx]) {{
+      return PIPELINE[state.runningStageIdx].stage_id;
+    }}
+    const keys = Object.keys(state.stepTimings);
+    for (let i = 0; i < keys.length; i++) {{
+      if (state.stepTimings[keys[i]] && state.stepTimings[keys[i]].status === "running") {{
+        return keys[i];
+      }}
+    }}
+    return null;
+  }}
+
+  function renderStepStopwatch(force = false) {{
+    if (!stopwatchEl || !stopwatchStageEl || !stopwatchTimeEl) return;
+    const nowPerf = performance.now();
+    const runSid = activeRunningStageId();
+    let viewKey = runSid || state.stopwatchInspectKey;
+    if (!viewKey && PIPELINE[state.currentPipelineIdx]) {{
+      viewKey = PIPELINE[state.currentPipelineIdx].stage_id;
+    }}
+
+    let stageText = "READY";
+    let status = "idle";
+    let elapsedMs = 0;
+
+    if (viewKey === "__total__") {{
+      let sumMs = 0;
+      let anyDone = false;
+      Object.values(state.stepTimings).forEach(ent => {{
+        if (ent && ent.status !== "idle") {{
+          sumMs += getEntryLiveMs(ent, nowPerf);
+          anyDone = true;
+        }}
+      }});
+      stageText = "Σ TOTAL";
+      status = anyDone ? "done" : "idle";
+      elapsedMs = sumMs;
+    }} else if (viewKey) {{
+      const meta = stageStopwatchMeta(viewKey);
+      const ent = state.stepTimings[viewKey];
+      if (ent && ent.status !== "idle") {{
+        stageText = meta.label;
+        status = ent.status;
+        elapsedMs = getEntryLiveMs(ent, nowPerf);
+        if (status === "running" && UI_MODE !== "pro") {{
+          const mMask = ent.milestoneMask || 0;
+          if (elapsedMs >= 30000 && elapsedMs < 32000 && !(mMask & 1)) {{
+            ent.milestoneMask = mMask | 1;
+            flashStopwatchQuip("WARMING UP!", 1600);
+          }} else if (elapsedMs >= 60000 && elapsedMs < 62000 && !(mMask & 2)) {{
+            ent.milestoneMask = mMask | 2;
+            flashStopwatchQuip("HURRY UP!", 1800);
+          }} else if (elapsedMs >= 120000 && elapsedMs < 122000 && !(mMask & 4)) {{
+            ent.milestoneMask = mMask | 4;
+            flashStopwatchQuip("STILL AT IT!", 1800);
+          }}
+        }}
+      }} else {{
+        const anyRecorded = Object.values(state.stepTimings).some(e => e && e.status !== "idle");
+        stageText = anyRecorded ? meta.label : "READY";
+        status = "idle";
+        elapsedMs = 0;
+      }}
+    }}
+
+    const isFlashing = Boolean(stopwatchFlash.text) && nowPerf < stopwatchFlash.untilPerf;
+    if (!isFlashing && stopwatchFlash.text) {{
+      stopwatchFlash.text = "";
+    }}
+    const isSlowMo = UI_MODE !== "pro" && Boolean(state.stopwatchCheatSlowMo);
+    const isDemoRolling = isSlowMo && status !== "running" && stopwatchFlash.demoUntilPerf > nowPerf;
+    const shownStageText = isFlashing ? stopwatchFlash.text : stageText;
+    let displayMs = elapsedMs;
+    if (isDemoRolling) {{
+      const demoDur = Math.max(1, stopwatchFlash.demoUntilPerf - stopwatchFlash.demoStartPerf);
+      const demoRemain = Math.max(0, (stopwatchFlash.demoUntilPerf - nowPerf) / demoDur);
+      displayMs = Math.round(elapsedMs) + demoRemain * 3.0;
+    }}
+    const parts = formatStopwatchParts(displayMs);
+    const odoKey = isSlowMo ? displayMs.toFixed(2) : parts.full;
+    const renderKey = `${{status}}|${{isSlowMo ? "S" : "N"}}|${{isFlashing ? "1" : "0"}}|${{shownStageText}}|${{odoKey}}`;
+    if (!force && renderKey === lastStopwatchRenderKey) return;
+    lastStopwatchRenderKey = renderKey;
+
+    stopwatchEl.className = `stdio-stopwatch sw-${{status}}${{isSlowMo ? " sw-slomo" : ""}}${{isFlashing ? " sw-quip-flash" : ""}}`;
+    stopwatchStageEl.textContent = shownStageText;
+    if (isSlowMo) {{
+      const strips = ensureStopwatchOdometerDOM();
+      const odoMs = (status === "running" || isDemoRolling) ? displayMs : Math.round(displayMs);
+      const positions = computeStopwatchOdometerPositions(odoMs);
+      if (strips && strips.length === positions.length) {{
+        for (let i = 0; i < strips.length; i++) {{
+          const numGlyphs = STOPWATCH_ODO_RADICES[i] + 1;
+          const pct = -(positions[i] / numGlyphs) * 100;
+          strips[i].style.transform = `translate3d(0, ${{pct.toFixed(4)}}%, 0)`;
+        }}
+      }}
+    }} else {{
+      stopwatchOdoStrips = null;
+      stopwatchTimeEl.innerHTML = `${{parts.mmss}}<span class="sw-ms">${{parts.dotMs}}</span>`;
+    }}
+    if (force || status !== "running" || (parts.clamped % 500) < 25) {{
+      stopwatchEl.title = buildStopwatchTooltip(nowPerf);
+    }}
+  }}
+
+  function toggleStopwatchCheat() {{
+    if (UI_MODE === "pro") return false;
+    const nowPerf = performance.now();
+    Object.values(state.stepTimings).forEach(ent => {{
+      if (ent && ent.status === "running") {{
+        ent.baseElapsedMs = getEntryLiveMs(ent, nowPerf);
+        ent.startPerfMs = nowPerf;
+      }}
+    }});
+    state.stopwatchCheatSlowMo = !state.stopwatchCheatSlowMo;
+    const newRate = getStopwatchRate();
+    Object.values(state.stepTimings).forEach(ent => {{
+      if (ent && ent.status === "running") {{
+        ent.rate = newRate;
+        if (newRate < 1.0) ent.cheated = true;
+      }}
+    }});
+    if (state.stopwatchCheatSlowMo) {{
+      if (!activeRunningStageId()) {{
+        stopwatchFlash.demoStartPerf = nowPerf;
+        stopwatchFlash.demoUntilPerf = nowPerf + 2200;
+      }}
+      flashStopwatchQuip("SLO-MO CHEAT!", 2400);
+    }} else {{
+      stopwatchFlash.demoUntilPerf = 0;
+      flashStopwatchQuip("REAL TIME 1X!", 1600);
+    }}
+    return state.stopwatchCheatSlowMo;
+  }}
+
+  const KONAMI_CHEAT_SEQ = [
+    "ArrowUp", "ArrowUp", "ArrowDown", "ArrowDown",
+    "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight",
+    "b", "a",
+  ];
+  const _cheatKeyBuf = [];
+  let _cheatWordBuf = "";
+
+  function handleStopwatchCheatKey(ev) {{
+    if (UI_MODE === "pro" || !ev || ev.ctrlKey || ev.metaKey || ev.altKey) return false;
+    const tgt = ev.target;
+    const tag = tgt && tgt.tagName ? String(tgt.tagName).toUpperCase() : "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (tgt && tgt.isContentEditable)) {{
+      return false;
+    }}
+    const rawKey = String(ev.key || "");
+    if (!rawKey) return false;
+    const normKey = rawKey.length === 1 ? rawKey.toLowerCase() : rawKey;
+    _cheatKeyBuf.push(normKey);
+    if (_cheatKeyBuf.length > KONAMI_CHEAT_SEQ.length) {{
+      _cheatKeyBuf.splice(0, _cheatKeyBuf.length - KONAMI_CHEAT_SEQ.length);
+    }}
+    const konamiHit = _cheatKeyBuf.length === KONAMI_CHEAT_SEQ.length &&
+      KONAMI_CHEAT_SEQ.every((k, idx) => _cheatKeyBuf[idx] === k);
+
+    if (rawKey.length === 1 && /[a-z]/i.test(rawKey)) {{
+      _cheatWordBuf = (_cheatWordBuf + normKey).slice(-12);
+    }} else if (normKey !== "Shift") {{
+      _cheatWordBuf = "";
+    }}
+    const rainbowHit = _cheatWordBuf.endsWith("rainbow");
+
+    if (konamiHit || rainbowHit) {{
+      _cheatKeyBuf.length = 0;
+      _cheatWordBuf = "";
+      toggleStopwatchCheat();
+      return true;
+    }}
+    return false;
+  }}
+
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {{
+    window.addEventListener("keydown", handleStopwatchCheatKey);
+  }}
+
+  function startStepStopwatch(stageIdOrIdx, initialElapsedMs = 0) {{
+    const meta = stageStopwatchMeta(stageIdOrIdx);
+    const rate = getStopwatchRate();
+    const rawBaseMs = Math.max(0, Number(initialElapsedMs) || 0);
+    const baseMs = rawBaseMs * rate;
+    Object.values(state.stepTimings).forEach(ent => {{
+      if (ent && ent.status === "running" && ent.stageId !== meta.stageId) {{
+        ent.elapsedMs = Math.round(getEntryLiveMs(ent));
+        ent.status = "stopped";
+      }}
+    }});
+    const initMask = (baseMs >= 30000 ? 1 : 0) | (baseMs >= 60000 ? 2 : 0) | (baseMs >= 120000 ? 4 : 0);
+    state.stepTimings[meta.stageId] = {{
+      stageId: meta.stageId,
+      label: meta.label,
+      status: "running",
+      startPerfMs: performance.now(),
+      baseElapsedMs: baseMs,
+      elapsedMs: baseMs,
+      rate,
+      cheated: rate < 1.0,
+      milestoneMask: initMask,
+    }};
+    state.stopwatchInspectKey = meta.stageId;
+    if (rawBaseMs < 500) {{
+      flashStopwatchQuip("HERE WE GO!", 1400);
+    }} else {{
+      renderStepStopwatch(true);
+    }}
+  }}
+
+  function finishStepStopwatch(stageIdOrIdx, finalStatus = "done", exactElapsedMs = null) {{
+    const meta = stageStopwatchMeta(stageIdOrIdx);
+    const prev = state.stepTimings[meta.stageId];
+    const localMs = prev ? getEntryLiveMs(prev) : 0;
+    const wasCheated = Boolean(prev && prev.cheated) || (UI_MODE !== "pro" && Boolean(state.stopwatchCheatSlowMo));
+    const hasExact = typeof exactElapsedMs === "number" && Number.isFinite(exactElapsedMs) && exactElapsedMs >= 0;
+    const resolvedMs = wasCheated
+      ? Math.round(localMs)
+      : (hasExact ? exactElapsedMs : localMs);
+    state.stepTimings[meta.stageId] = {{
+      stageId: meta.stageId,
+      label: meta.label,
+      status: finalStatus,
+      startPerfMs: 0,
+      baseElapsedMs: resolvedMs,
+      elapsedMs: resolvedMs,
+      rate: getStopwatchRate(),
+      cheated: wasCheated,
+      realElapsedMs: hasExact ? exactElapsedMs : null,
+      milestoneMask: 7,
+    }};
+    state.stopwatchInspectKey = meta.stageId;
+    const quip = getCompletionStopwatchQuip(meta.stageId, finalStatus, resolvedMs);
+    if (quip) {{
+      flashStopwatchQuip(quip, 2100);
+    }} else {{
+      renderStepStopwatch(true);
+    }}
+  }}
+
+  function hydrateStepTimingsFromServer(doc) {{
+    if (!doc || typeof doc !== "object") return;
+    const srvNow = typeof doc.server_time === "number" ? doc.server_time : null;
+    const timings = doc.step_timings && typeof doc.step_timings === "object" ? doc.step_timings : null;
+    if (timings) {{
+      Object.entries(timings).forEach(([sid, rec]) => {{
+        if (!rec || typeof rec !== "object") return;
+        const stState = String(rec.state || "");
+        const cur = state.stepTimings[sid];
+        if (stState === "running" || stState === "queued") {{
+          if (!cur || cur.status !== "running") {{
+            const srvMs = typeof rec.elapsed_ms === "number"
+              ? rec.elapsed_ms
+              : ((srvNow && typeof rec.started_at === "number") ? Math.max(0, (srvNow - rec.started_at) * 1000) : 0);
+            startStepStopwatch(sid, srvMs);
+          }}
+        }} else if (!cur || cur.status === "idle") {{
+          const mapped = stState === "ok"
+            ? "done"
+            : (stState === "deleted" ? "stopped" : "error");
+          if (typeof rec.elapsed_ms === "number" && rec.elapsed_ms >= 0) {{
+            const meta = stageStopwatchMeta(sid);
+            state.stepTimings[sid] = {{
+              stageId: sid,
+              label: meta.label,
+              status: mapped,
+              startPerfMs: 0,
+              baseElapsedMs: rec.elapsed_ms,
+              elapsedMs: rec.elapsed_ms,
+            }};
+            if (!state.stopwatchInspectKey) state.stopwatchInspectKey = sid;
+          }}
+        }}
+      }});
+    }} else if (
+      doc.active_job &&
+      (doc.active_job.state === "running" || doc.active_job.state === "queued") &&
+      doc.active_job.stage_id
+    ) {{
+      const aj = doc.active_job;
+      const cur = state.stepTimings[aj.stage_id];
+      if (!cur || cur.status !== "running") {{
+        const srvMs = typeof aj.elapsed_ms === "number"
+          ? aj.elapsed_ms
+          : ((srvNow && typeof aj.started_at === "number") ? Math.max(0, (srvNow - aj.started_at) * 1000) : 0);
+        startStepStopwatch(aj.stage_id, srvMs);
+      }}
+    }}
+    renderStepStopwatch(true);
+  }}
+
+  if (stopwatchEl) {{
+    stopwatchEl.addEventListener("click", () => {{
+      if (activeRunningStageId()) return;
+      if (stopwatchFlash.timerId) {{
+        clearTimeout(stopwatchFlash.timerId);
+        stopwatchFlash.timerId = null;
+      }}
+      stopwatchFlash.text = "";
+      stopwatchFlash.untilPerf = 0;
+      const keys = (PIPELINE.length > 0 ? PIPELINE.map(p => p.stage_id) : ["reduce", "solve", "integrate", "merge"]);
+      const recorded = keys.filter(k => state.stepTimings[k] && state.stepTimings[k].status !== "idle");
+      const cycle = recorded.length >= 2 ? [...keys, "__total__"] : keys;
+      const curIdx = cycle.indexOf(state.stopwatchInspectKey || (PIPELINE[state.currentPipelineIdx] && PIPELINE[state.currentPipelineIdx].stage_id));
+      state.stopwatchInspectKey = cycle[(curIdx + 1) % cycle.length];
+      renderStepStopwatch(true);
+    }});
+    renderStepStopwatch(true);
+  }}
+
+  function appendTerminalLog(text, replace = false, resetFollow = false) {{
     const box = document.getElementById("terminal-box");
     if (!box) return;
+    if (resetFollow) {{
+      state.terminalFollowTail = true;
+      state.terminalScrollTop = 0;
+      _lastAutoTerminalScrollTop = -1;
+    }}
+    const followTail = state.terminalFollowTail !== false;
     const savedScrollTop = typeof state.terminalScrollTop === "number"
       ? state.terminalScrollTop
       : box.scrollTop;
@@ -5722,29 +6675,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ? formatTerminalStdio(text)
       : formatTerminalStdio(box.textContent + (box.textContent.endsWith("\\n") ? "" : "\\n") + text);
     if (box.textContent === nextText) {{
-      box.scrollTop = savedScrollTop;
       return;
     }}
-    const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
-    const hasSelectionInBox = Boolean(
-      sel && !sel.isCollapsed && sel.anchorNode && box.contains(sel.anchorNode)
-    );
-    if (hasSelectionInBox) {{
+    if (hasTerminalSelection(box)) {{
+      state.terminalFollowTail = false;
       box._pendingTerminalText = nextText;
       if (!box._selectionFlushBound) {{
         box._selectionFlushBound = true;
         const flushPending = () => {{
-          const curSel = typeof window.getSelection === "function" ? window.getSelection() : null;
-          const stillSelected = Boolean(
-            curSel && !curSel.isCollapsed && curSel.anchorNode && box.contains(curSel.anchorNode)
-          );
-          if (!stillSelected && typeof box._pendingTerminalText === "string") {{
+          if (!hasTerminalSelection(box) && typeof box._pendingTerminalText === "string") {{
             const keepScroll = typeof state.terminalScrollTop === "number"
               ? state.terminalScrollTop
               : box.scrollTop;
             box.textContent = box._pendingTerminalText;
             box._pendingTerminalText = null;
-            box.scrollTop = keepScroll;
+            if (state.terminalFollowTail !== false) {{
+              box.scrollTop = box.scrollHeight;
+              _lastAutoTerminalScrollTop = box.scrollTop;
+            }} else {{
+              box.scrollTop = keepScroll;
+            }}
+            state.terminalScrollTop = box.scrollTop;
           }}
         }};
         document.addEventListener("selectionchange", flushPending);
@@ -5755,7 +6706,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     box._pendingTerminalText = null;
     box.textContent = nextText;
-    box.scrollTop = savedScrollTop;
+    if (followTail) {{
+      box.scrollTop = box.scrollHeight;
+      _lastAutoTerminalScrollTop = box.scrollTop;
+    }} else {{
+      box.scrollTop = savedScrollTop;
+    }}
     state.terminalScrollTop = box.scrollTop;
   }}
 
@@ -6113,6 +7069,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (syncLadder && typeof st.ladder_rung_idx === "number") {{
       selectLadderRung(st.ladder_rung_idx, false);
+    }}
+    if (!activeRunningStageId() && st && st.stage_id) {{
+      state.stopwatchInspectKey = st.stage_id;
+      renderStepStopwatch(true);
     }}
     renderPipeline();
     if (typeof renderFilesDrawer === "function") renderFilesDrawer();
@@ -7014,7 +7974,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const fgLayer = OVERLAY_PARALLAX_LAYER;
         const [x, y] = detToScreen(p.det_x + shiftAz, py, w, h, fgLayer);
         if (x < -30 || x > w + 30) return;
-        const [bx, by] = detToScreen(p.det_x + shiftAz, py, w, h, -0.35);
 
         const captured = isPeakCapturedByActiveZone(p);
         const isHovered = isPeakHighlightedTarget(p);
@@ -7027,15 +7986,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const r = isHovered ? baseR + 1.8 : (isOrbitMate ? baseR + 1.2 : baseR);
 
         ctx.save();
-        if (Math.hypot(x - bx, y - by) > 2.0 && (captured || isHovered || isOrbitMate)) {{
-          ctx.beginPath();
-          ctx.moveTo(bx, by);
-          ctx.lineTo(x, y);
-          ctx.strokeStyle = isOrbitMate ? "rgba(251, 191, 36, 0.55)" : "rgba(244, 63, 133, 0.38)";
-          ctx.lineWidth = 1.0;
-          ctx.stroke();
-        }}
-
         const ellPtsRaw = isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse;
         const strokeCol = isHovered
           ? "#f43f85"
@@ -11315,6 +12265,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           galaxyBridge.historyId = doc.history_id;
           galaxyBridge.datasets = doc.history_datasets || [];
           galaxyBridge.stepArtifacts = doc.step_artifacts || {{}};
+          hydrateStepTimingsFromServer(doc);
           if (
             state.runningStageIdx < 0 &&
             doc.active_job &&
@@ -11400,6 +12351,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       galaxyBridge.pollTimer = null;
     }}
     state.runningStageIdx = -1;
+    finishStepStopwatch(stageId, "stopped");
     renderPipeline();
     const cellSummary = document.getElementById("cell-summary");
     if (cellSummary) cellSummary.textContent = "STOPPED";
@@ -11420,6 +12372,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (resp.ok) {{
           const doc = await resp.json();
           const jobObj = doc.job || {{}};
+          if (typeof jobObj.elapsed_ms === "number" && jobObj.elapsed_ms >= 0) {{
+            finishStepStopwatch(stageId, "stopped", jobObj.elapsed_ms);
+          }}
           const outText = (jobObj.stdout || "") + (jobObj.stderr ? `\\n[stderr]\\n${{jobObj.stderr}}` : "");
           if (outText) appendTerminalLog(outText, true);
           else appendTerminalLog(`\\n[subhkl] Cancelled stage '${{stageId}}'.\\n`, false);
@@ -11461,11 +12416,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const params = {{ ...collectWorkflowParams(), ...(extraParams || {{}}) }};
     const dMinSeqAtStart = state.dMinUserSeq || 0;
     state.runningStageIdx = stageIdx;
+    startStepStopwatch(stageIdx);
     renderPipeline();
     const cellSummary = document.getElementById("cell-summary");
     if (cellSummary) cellSummary.textContent = `RUNNING ${{stageId.toUpperCase()}}...`;
     appendTerminalLog(
       `$ subhkl [${{st.name}}] — dispatching (SG=${{params.space_group}}, cell=${{params.a}},${{params.b}},${{params.c}}, λ=${{params.wavelength_min.toFixed(2)}}–${{params.wavelength_max.toFixed(2)}} Å, d_min=${{Number(params.d_min).toFixed(2)}} Å)...\\n`,
+      true,
       true
     );
 
@@ -11609,6 +12566,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               galaxyBridge.pollTimer = null;
               if (runSeq === state.workflowRunSeq) {{
                 state.runningStageIdx = -1;
+                finishStepStopwatch(
+                  stageId,
+                  finishedOk ? "done" : (isCancelled ? "stopped" : "error"),
+                  typeof aj.elapsed_ms === "number" ? aj.elapsed_ms : null
+                );
               }}
               if (finishedOk) {{
                 const h5Outs = Array.isArray(aj.outputs)
@@ -11702,6 +12664,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}, 700);
       }} catch (err) {{
         state.runningStageIdx = -1;
+        finishStepStopwatch(stageId, "error");
         renderPipeline();
         appendTerminalLog(`\\n[error] ${{err.message}}`);
       }}
@@ -11813,6 +12776,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               galaxyBridge.pollTimer = null;
               galaxyBridge.activeGalaxyJobId = null;
               state.runningStageIdx = -1;
+              finishStepStopwatch(
+                stageId,
+                jstate === "ok" ? "done" : (jstate === "deleted" ? "stopped" : "error")
+              );
               renderPipeline();
               if (jstate === "ok") {{
                 selectLadderRung(4, false);
@@ -11832,6 +12799,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }} catch (err) {{
         galaxyBridge.activeGalaxyJobId = null;
         state.runningStageIdx = -1;
+        finishStepStopwatch(stageId, "error");
         renderPipeline();
         appendTerminalLog(`\\n[error] ${{err.message}}`);
       }}
@@ -11839,18 +12807,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     // Standalone static file fallback: step through the Lattice Ladder rungs with diagnostic output
-    state.runningStageIdx = -1;
-    renderPipeline();
-    if (stageId === "solve") {{
+    if (stageId === "solve" && LADDER.length > 0) {{
       let r = 0;
       selectLadderRung(0, false);
       const t = setInterval(() => {{
+        if (runSeq !== state.workflowRunSeq) {{
+          clearInterval(t);
+          return;
+        }}
         const rung = LADDER[r];
         if (rung) appendTerminalLog(`[step ${{rung.step_num}}] ${{rung.name}} — ${{rung.metric_label}}`);
         r++;
-        if (r < LADDER.length) selectLadderRung(r, false);
-        else clearInterval(t);
+        if (r < LADDER.length) {{
+          selectLadderRung(r, false);
+        }} else {{
+          clearInterval(t);
+          state.runningStageIdx = -1;
+          finishStepStopwatch(stageId, "done");
+          renderPipeline();
+          if (cellSummary) cellSummary.textContent = "DONE";
+        }}
       }}, 650);
+    }} else {{
+      state.runningStageIdx = -1;
+      finishStepStopwatch(stageId, "done");
+      renderPipeline();
     }}
   }}
 
@@ -11863,6 +12844,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.parallaxY += (state.targetParallaxY - state.parallaxY) * 0.14;
     renderDetectorCanvas();
     renderStereoInset();
+    if (activeRunningStageId() || (stopwatchFlash.demoUntilPerf && performance.now() < stopwatchFlash.demoUntilPerf)) {{
+      renderStepStopwatch(false);
+    }}
     requestAnimationFrame(animate);
   }}
 
