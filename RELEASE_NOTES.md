@@ -29,9 +29,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with sidebar pixel class percentages.
 - Per-step live `mm:ss.ms` stopwatch overlay in the lower-right corner of the
   `Terminal // Stdio` pane (`#stdio-stopwatch`) across `subhkl-nova-app` and
-  `rainbow-visualize`, with server-synchronized `step_timings` persistence and
+  `rainbow-visualize`, with server-synchronized `step_timings` persistence,
   click-to-cycle step split inspection (`1. Reduce`, `2. Solve`,
-  `3. Integrate`, `4. Merge`, and `Σ Total`).
+  `3. Integrate`, `4. Merge`, and `Σ Total`), and an Arcade Mode slow-motion
+  odometer cheat code (`↑↑↓↓←→←→BA` or `RAINBOW`).
 
 ### Changed
 

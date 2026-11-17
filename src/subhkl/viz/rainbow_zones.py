@@ -4761,6 +4761,67 @@ def render_rainbow_html(
     opacity: 0.82;
   }}
 
+  .stdio-stopwatch .sw-odo-wrap {{
+    display: inline-flex;
+    align-items: baseline;
+  }}
+
+  .stdio-stopwatch .sw-odo-col {{
+    display: inline-block;
+    width: 1ch;
+    height: 1.2em;
+    line-height: 1.2em;
+    overflow: hidden;
+    vertical-align: bottom;
+    position: relative;
+    -webkit-mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.10) 0%, #000 20%, #000 80%, rgba(0, 0, 0, 0.10) 100%);
+    mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.10) 0%, #000 20%, #000 80%, rgba(0, 0, 0, 0.10) 100%);
+  }}
+
+  .stdio-stopwatch .sw-odo-strip {{
+    display: flex;
+    flex-direction: column;
+    will-change: transform;
+  }}
+
+  .stdio-stopwatch .sw-odo-glyph {{
+    display: block;
+    height: 1.2em;
+    line-height: 1.2em;
+    flex: 0 0 1.2em;
+    text-align: center;
+  }}
+
+  .stdio-stopwatch .sw-odo-sep {{
+    display: inline-block;
+    line-height: 1.2em;
+    vertical-align: bottom;
+  }}
+
+  .stdio-stopwatch.sw-slomo {{
+    border-color: rgba(192, 132, 252, 0.85);
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55), 0 0 10px rgba(168, 85, 247, 0.34);
+  }}
+
+  .stdio-stopwatch.sw-slomo .sw-time {{
+    color: #f5d0fe;
+  }}
+
+  .stdio-stopwatch.sw-slomo.sw-running .sw-rb,
+  .stdio-stopwatch.sw-slomo.sw-quip-flash .sw-rb {{
+    animation: swRainbowShoot 6.5s linear infinite;
+  }}
+
+  .stdio-stopwatch.sw-slomo.sw-running .sw-sp-tip,
+  .stdio-stopwatch.sw-slomo.sw-quip-flash .sw-sp-tip {{
+    animation: swRainbowTipSparkle 6.5s linear infinite;
+  }}
+
+  .stdio-stopwatch.sw-slomo.sw-quip-flash .sw-icon {{
+    opacity: 1;
+    filter: saturate(1.25) drop-shadow(0 0 3px rgba(192, 132, 252, 0.55));
+  }}
+
   @keyframes swQuipBlink {{
     0% {{ opacity: 0.35; transform: translateY(1px); }}
     18% {{ opacity: 1; transform: translateY(0); }}
@@ -5733,6 +5794,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     frameAbortController: null,
     stepTimings: Object.create(null),
     stopwatchInspectKey: null,
+    stopwatchCheatSlowMo: false,
     terminalFollowTail: true,
     terminalScrollTop: 0,
   }};
@@ -6096,7 +6158,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const stopwatchStageEl = document.getElementById("stdio-stopwatch-stage");
   const stopwatchTimeEl = document.getElementById("stdio-stopwatch-time");
   let lastStopwatchRenderKey = "";
-  const stopwatchFlash = {{ text: "", untilPerf: 0, timerId: null }};
+  const stopwatchFlash = {{
+    text: "",
+    untilPerf: 0,
+    timerId: null,
+    demoStartPerf: 0,
+    demoUntilPerf: 0,
+  }};
+  const STOPWATCH_SLOMO_RATE = 0.0015;
+  const STOPWATCH_ODO_RADICES = [10, 10, 6, 10, 10, 10, 10];
+  let stopwatchOdoStrips = null;
 
   const SHORT_STAGE_STOPWATCH_LABELS = {{
     reduce: "1. REDUCE",
@@ -6104,6 +6175,70 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     integrate: "3. INTEGRATE",
     merge: "4. MERGE",
   }};
+
+  function getStopwatchRate() {{
+    return (UI_MODE !== "pro" && state.stopwatchCheatSlowMo) ? STOPWATCH_SLOMO_RATE : 1.0;
+  }}
+
+  function computeStopwatchOdometerPositions(msFloat) {{
+    const v = Math.max(0, Number(msFloat) || 0);
+    const whole = Math.floor(v);
+    const frac = v - whole;
+    const u = Math.max(0, Math.min(1, (frac - 0.12) / 0.88));
+    const ease = 0.5 - 0.5 * Math.cos(Math.PI * u);
+
+    const dm3 = whole % 10;
+    const dm2 = Math.floor(whole / 10) % 10;
+    const dm1 = Math.floor(whole / 100) % 10;
+    const totSec = Math.floor(whole / 1000);
+    const secs = totSec % 60;
+    const dS2 = secs % 10;
+    const dS1 = Math.floor(secs / 10) % 6;
+    const mins = Math.floor(totSec / 60);
+    const dM2 = mins % 10;
+    const dM1 = Math.floor(mins / 10) % 10;
+
+    const cm3 = dm3 === 9;
+    const cm2 = cm3 && dm2 === 9;
+    const cm1 = cm2 && dm1 === 9;
+    const cS2 = cm1 && dS2 === 9;
+    const cS1 = cS2 && dS1 === 5;
+    const cM2 = cS1 && dM2 === 9;
+
+    return [
+      dM1 + (cM2 ? ease : 0),
+      dM2 + (cS1 ? ease : 0),
+      dS1 + (cS2 ? ease : 0),
+      dS2 + (cm1 ? ease : 0),
+      dm1 + (cm2 ? ease : 0),
+      dm2 + (cm3 ? ease : 0),
+      dm3 + ease,
+    ];
+  }}
+
+  function ensureStopwatchOdometerDOM() {{
+    if (!stopwatchTimeEl) return null;
+    if (stopwatchOdoStrips && stopwatchTimeEl.querySelector(".sw-odo-wrap")) {{
+      return stopwatchOdoStrips;
+    }}
+    const makeCol = (radix) => {{
+      const glyphs = [];
+      for (let g = 0; g < radix; g++) {{
+        glyphs.push(`<span class="sw-odo-glyph">${{g}}</span>`);
+      }}
+      glyphs.push('<span class="sw-odo-glyph">0</span>');
+      return `<span class="sw-odo-col"><span class="sw-odo-strip">${{glyphs.join("")}}</span></span>`;
+    }};
+    stopwatchTimeEl.innerHTML =
+      `<span class="sw-odo-wrap">` +
+      `${{makeCol(10)}}${{makeCol(10)}}` +
+      `<span class="sw-odo-sep">:</span>` +
+      `${{makeCol(6)}}${{makeCol(10)}}` +
+      `<span class="sw-ms"><span class="sw-odo-sep">.</span>${{makeCol(10)}}${{makeCol(10)}}${{makeCol(10)}}</span>` +
+      `</span>`;
+    stopwatchOdoStrips = Array.from(stopwatchTimeEl.querySelectorAll(".sw-odo-strip"));
+    return stopwatchOdoStrips;
+  }}
 
   function getCompletionStopwatchQuip(stageId, finalStatus, elapsedMs) {{
     if (UI_MODE === "pro") return "";
@@ -6171,13 +6306,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!entry) return 0;
     if (entry.status === "running") {{
       const delta = Math.max(0, nowPerf - (Number(entry.startPerfMs) || nowPerf));
-      return Math.max(0, (Number(entry.baseElapsedMs) || 0) + delta);
+      const rate = typeof entry.rate === "number" ? entry.rate : getStopwatchRate();
+      return Math.max(0, (Number(entry.baseElapsedMs) || 0) + delta * rate);
     }}
     return Math.max(0, Number(entry.elapsedMs) || 0);
   }}
 
   function buildStopwatchTooltip(nowPerf = performance.now()) {{
-    const lines = ["Step Stopwatch (mm:ss.ms)"];
+    const lines = [
+      state.stopwatchCheatSlowMo
+        ? "Step Stopwatch (mm:ss.ms) — ⚡ SLO-MO CHEAT ACTIVE"
+        : "Step Stopwatch (mm:ss.ms)"
+    ];
     let totalMs = 0;
     let recordedCount = 0;
     const order = PIPELINE.length > 0
@@ -6192,7 +6332,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const ms = getEntryLiveMs(entry, nowPerf);
         totalMs += ms;
         recordedCount++;
-        lines.push(`• ${{meta.label}}: ${{formatStopwatchParts(ms).full}} (${{entry.status}})`);
+        const realNote = (entry.cheated && typeof entry.realElapsedMs === "number")
+          ? ` [real ${{formatStopwatchParts(entry.realElapsedMs).full}}]`
+          : (entry.cheated ? " [slo-mo]" : "");
+        lines.push(`• ${{meta.label}}: ${{formatStopwatchParts(ms).full}} (${{entry.status}})${{realNote}}`);
       }}
     }});
     if (recordedCount > 0) {{
@@ -6273,26 +6416,126 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!isFlashing && stopwatchFlash.text) {{
       stopwatchFlash.text = "";
     }}
+    const isSlowMo = UI_MODE !== "pro" && Boolean(state.stopwatchCheatSlowMo);
+    const isDemoRolling = isSlowMo && status !== "running" && stopwatchFlash.demoUntilPerf > nowPerf;
     const shownStageText = isFlashing ? stopwatchFlash.text : stageText;
-    const parts = formatStopwatchParts(elapsedMs);
-    const renderKey = `${{status}}|${{isFlashing ? "1" : "0"}}|${{shownStageText}}|${{parts.full}}`;
+    let displayMs = elapsedMs;
+    if (isDemoRolling) {{
+      const demoDur = Math.max(1, stopwatchFlash.demoUntilPerf - stopwatchFlash.demoStartPerf);
+      const demoRemain = Math.max(0, (stopwatchFlash.demoUntilPerf - nowPerf) / demoDur);
+      displayMs = Math.round(elapsedMs) + demoRemain * 3.0;
+    }}
+    const parts = formatStopwatchParts(displayMs);
+    const odoKey = isSlowMo ? displayMs.toFixed(2) : parts.full;
+    const renderKey = `${{status}}|${{isSlowMo ? "S" : "N"}}|${{isFlashing ? "1" : "0"}}|${{shownStageText}}|${{odoKey}}`;
     if (!force && renderKey === lastStopwatchRenderKey) return;
     lastStopwatchRenderKey = renderKey;
 
-    stopwatchEl.className = `stdio-stopwatch sw-${{status}}${{isFlashing ? " sw-quip-flash" : ""}}`;
+    stopwatchEl.className = `stdio-stopwatch sw-${{status}}${{isSlowMo ? " sw-slomo" : ""}}${{isFlashing ? " sw-quip-flash" : ""}}`;
     stopwatchStageEl.textContent = shownStageText;
-    stopwatchTimeEl.innerHTML = `${{parts.mmss}}<span class="sw-ms">${{parts.dotMs}}</span>`;
+    if (isSlowMo) {{
+      const strips = ensureStopwatchOdometerDOM();
+      const odoMs = (status === "running" || isDemoRolling) ? displayMs : Math.round(displayMs);
+      const positions = computeStopwatchOdometerPositions(odoMs);
+      if (strips && strips.length === positions.length) {{
+        for (let i = 0; i < strips.length; i++) {{
+          const numGlyphs = STOPWATCH_ODO_RADICES[i] + 1;
+          const pct = -(positions[i] / numGlyphs) * 100;
+          strips[i].style.transform = `translate3d(0, ${{pct.toFixed(4)}}%, 0)`;
+        }}
+      }}
+    }} else {{
+      stopwatchOdoStrips = null;
+      stopwatchTimeEl.innerHTML = `${{parts.mmss}}<span class="sw-ms">${{parts.dotMs}}</span>`;
+    }}
     if (force || status !== "running" || (parts.clamped % 500) < 25) {{
       stopwatchEl.title = buildStopwatchTooltip(nowPerf);
     }}
   }}
 
+  function toggleStopwatchCheat() {{
+    if (UI_MODE === "pro") return false;
+    const nowPerf = performance.now();
+    Object.values(state.stepTimings).forEach(ent => {{
+      if (ent && ent.status === "running") {{
+        ent.baseElapsedMs = getEntryLiveMs(ent, nowPerf);
+        ent.startPerfMs = nowPerf;
+      }}
+    }});
+    state.stopwatchCheatSlowMo = !state.stopwatchCheatSlowMo;
+    const newRate = getStopwatchRate();
+    Object.values(state.stepTimings).forEach(ent => {{
+      if (ent && ent.status === "running") {{
+        ent.rate = newRate;
+        if (newRate < 1.0) ent.cheated = true;
+      }}
+    }});
+    if (state.stopwatchCheatSlowMo) {{
+      if (!activeRunningStageId()) {{
+        stopwatchFlash.demoStartPerf = nowPerf;
+        stopwatchFlash.demoUntilPerf = nowPerf + 2200;
+      }}
+      flashStopwatchQuip("SLO-MO CHEAT!", 2400);
+    }} else {{
+      stopwatchFlash.demoUntilPerf = 0;
+      flashStopwatchQuip("REAL TIME 1X!", 1600);
+    }}
+    return state.stopwatchCheatSlowMo;
+  }}
+
+  const KONAMI_CHEAT_SEQ = [
+    "ArrowUp", "ArrowUp", "ArrowDown", "ArrowDown",
+    "ArrowLeft", "ArrowRight", "ArrowLeft", "ArrowRight",
+    "b", "a",
+  ];
+  const _cheatKeyBuf = [];
+  let _cheatWordBuf = "";
+
+  function handleStopwatchCheatKey(ev) {{
+    if (UI_MODE === "pro" || !ev || ev.ctrlKey || ev.metaKey || ev.altKey) return false;
+    const tgt = ev.target;
+    const tag = tgt && tgt.tagName ? String(tgt.tagName).toUpperCase() : "";
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (tgt && tgt.isContentEditable)) {{
+      return false;
+    }}
+    const rawKey = String(ev.key || "");
+    if (!rawKey) return false;
+    const normKey = rawKey.length === 1 ? rawKey.toLowerCase() : rawKey;
+    _cheatKeyBuf.push(normKey);
+    if (_cheatKeyBuf.length > KONAMI_CHEAT_SEQ.length) {{
+      _cheatKeyBuf.splice(0, _cheatKeyBuf.length - KONAMI_CHEAT_SEQ.length);
+    }}
+    const konamiHit = _cheatKeyBuf.length === KONAMI_CHEAT_SEQ.length &&
+      KONAMI_CHEAT_SEQ.every((k, idx) => _cheatKeyBuf[idx] === k);
+
+    if (rawKey.length === 1 && /[a-z]/i.test(rawKey)) {{
+      _cheatWordBuf = (_cheatWordBuf + normKey).slice(-12);
+    }} else if (normKey !== "Shift") {{
+      _cheatWordBuf = "";
+    }}
+    const rainbowHit = _cheatWordBuf.endsWith("rainbow");
+
+    if (konamiHit || rainbowHit) {{
+      _cheatKeyBuf.length = 0;
+      _cheatWordBuf = "";
+      toggleStopwatchCheat();
+      return true;
+    }}
+    return false;
+  }}
+
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {{
+    window.addEventListener("keydown", handleStopwatchCheatKey);
+  }}
+
   function startStepStopwatch(stageIdOrIdx, initialElapsedMs = 0) {{
     const meta = stageStopwatchMeta(stageIdOrIdx);
-    const baseMs = Math.max(0, Number(initialElapsedMs) || 0);
+    const rate = getStopwatchRate();
+    const rawBaseMs = Math.max(0, Number(initialElapsedMs) || 0);
+    const baseMs = rawBaseMs * rate;
     Object.values(state.stepTimings).forEach(ent => {{
       if (ent && ent.status === "running" && ent.stageId !== meta.stageId) {{
-        ent.elapsedMs = getEntryLiveMs(ent);
+        ent.elapsedMs = Math.round(getEntryLiveMs(ent));
         ent.status = "stopped";
       }}
     }});
@@ -6304,10 +6547,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       startPerfMs: performance.now(),
       baseElapsedMs: baseMs,
       elapsedMs: baseMs,
+      rate,
+      cheated: rate < 1.0,
       milestoneMask: initMask,
     }};
     state.stopwatchInspectKey = meta.stageId;
-    if (baseMs < 500) {{
+    if (rawBaseMs < 500) {{
       flashStopwatchQuip("HERE WE GO!", 1400);
     }} else {{
       renderStepStopwatch(true);
@@ -6318,9 +6563,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const meta = stageStopwatchMeta(stageIdOrIdx);
     const prev = state.stepTimings[meta.stageId];
     const localMs = prev ? getEntryLiveMs(prev) : 0;
-    const resolvedMs = (typeof exactElapsedMs === "number" && Number.isFinite(exactElapsedMs) && exactElapsedMs >= 0)
-      ? exactElapsedMs
-      : localMs;
+    const wasCheated = Boolean(prev && prev.cheated) || (UI_MODE !== "pro" && Boolean(state.stopwatchCheatSlowMo));
+    const hasExact = typeof exactElapsedMs === "number" && Number.isFinite(exactElapsedMs) && exactElapsedMs >= 0;
+    const resolvedMs = wasCheated
+      ? Math.round(localMs)
+      : (hasExact ? exactElapsedMs : localMs);
     state.stepTimings[meta.stageId] = {{
       stageId: meta.stageId,
       label: meta.label,
@@ -6328,6 +6575,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       startPerfMs: 0,
       baseElapsedMs: resolvedMs,
       elapsedMs: resolvedMs,
+      rate: getStopwatchRate(),
+      cheated: wasCheated,
+      realElapsedMs: hasExact ? exactElapsedMs : null,
       milestoneMask: 7,
     }};
     state.stopwatchInspectKey = meta.stageId;
@@ -12594,7 +12844,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.parallaxY += (state.targetParallaxY - state.parallaxY) * 0.14;
     renderDetectorCanvas();
     renderStereoInset();
-    if (activeRunningStageId()) renderStepStopwatch(false);
+    if (activeRunningStageId() || (stopwatchFlash.demoUntilPerf && performance.now() < stopwatchFlash.demoUntilPerf)) {{
+      renderStepStopwatch(false);
+    }}
     requestAnimationFrame(animate);
   }}
 

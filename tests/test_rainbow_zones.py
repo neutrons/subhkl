@@ -2417,7 +2417,7 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
 
         # Extract and execute stageStopwatchMeta + formatStopwatchParts + getCompletionStopwatchQuip in Node
         m_meta = re.search(
-            r"const SHORT_STAGE_STOPWATCH_LABELS\s*=.*?function stageStopwatchMeta\(stageIdOrIdx\)\s*\{.*?\n  \}",
+            r"function stageStopwatchMeta\(stageIdOrIdx\)\s*\{.*?\n  \}",
             js_src,
             flags=re.DOTALL,
         )
@@ -2446,6 +2446,21 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
             js_src,
             flags=re.DOTALL,
         )
+        m_odo = re.search(
+            r"const STOPWATCH_SLOMO_RATE = .*?function computeStopwatchOdometerPositions\(msFloat\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_cheat = re.search(
+            r"function toggleStopwatchCheat\(\)\s*\{.*?function handleStopwatchCheatKey\(ev\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
+        m_live_ms = re.search(
+            r"function getEntryLiveMs\(entry, nowPerf = performance\.now\(\)\)\s*\{.*?\n  \}",
+            js_src,
+            flags=re.DOTALL,
+        )
         assert (
             m_meta
             and m_quip
@@ -2453,12 +2468,26 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
             and m_term_scroll
             and m_append_term
             and m_fmt_stdio
+            and m_odo
+            and m_cheat
+            and m_live_ms
         )
         assert "flashStopwatchQuip" in js_src
+        assert "sw-odo-strip" in js_src
         eval_script = (
             f'const UI_MODE = "{mode}";\n'
             f"const PIPELINE = {json.dumps(payload['pipeline_stages'])};\n"
-            "const state = { terminalFollowTail: true, terminalScrollTop: 0 };\n"
+            "const state = {\n"
+            "  terminalFollowTail: true,\n"
+            "  terminalScrollTop: 0,\n"
+            "  stopwatchCheatSlowMo: false,\n"
+            "  stepTimings: {},\n"
+            "  runningStageIdx: -1,\n"
+            "};\n"
+            "const stopwatchFlash = { text: '', untilPerf: 0, timerId: null, demoStartPerf: 0, demoUntilPerf: 0 };\n"
+            "let _lastFlashedQuip = '';\n"
+            "function activeRunningStageId() { return null; }\n"
+            "function flashStopwatchQuip(t) { if (UI_MODE !== 'pro') _lastFlashedQuip = t; }\n"
             "let _selActive = false;\n"
             "const _docListeners = {};\n"
             "const mockNode = {};\n"
@@ -2489,6 +2518,9 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
             f"{m_fmt_stdio.group(0)}\n"
             f"{m_term_scroll.group(0)}\n"
             f"{m_append_term.group(0)}\n"
+            f"{m_odo.group(0)}\n"
+            f"{m_live_ms.group(0)}\n"
+            f"{m_cheat.group(0)}\n"
             f"{m_meta.group(0)}\n"
             f"{m_quip.group(0)}\n"
             f"{m_fmt.group(0)}\n"
@@ -2520,6 +2552,24 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
             "mockBox.scrollHeight = 1300;\n"
             'appendTerminalLog("line 1\\nline 2\\nline 3\\nline 4\\nline 5\\nline 6", true);\n'
             "const tailTopResumed = mockBox.scrollTop;\n"
+            "for (const ch of 'RAINBOW') {\n"
+            "  handleStopwatchCheatKey({ key: ch, target: { tagName: 'INPUT' } });\n"
+            "}\n"
+            "const cheatFromInput = state.stopwatchCheatSlowMo;\n"
+            "handleStopwatchCheatKey({ key: 'Shift', target: { tagName: 'BODY' } });\n"
+            "for (const ch of 'RAINBOW') {\n"
+            "  handleStopwatchCheatKey({ key: ch, target: { tagName: 'BODY' } });\n"
+            "}\n"
+            "const cheatAfterRainbow = state.stopwatchCheatSlowMo;\n"
+            "const quipAfterRainbow = _lastFlashedQuip;\n"
+            "const slomoMsAfter10s = getEntryLiveMs({ status: 'running', startPerfMs: 1000, baseElapsedMs: 0, rate: getStopwatchRate() }, 11000);\n"
+            "for (const k of ['ArrowUp','ArrowUp','ArrowDown','ArrowDown','ArrowLeft','ArrowRight','ArrowLeft','ArrowRight','B','A']) {\n"
+            "  handleStopwatchCheatKey({ key: k, target: { tagName: 'BODY' } });\n"
+            "}\n"
+            "const cheatAfterKonamiToggleOff = state.stopwatchCheatSlowMo;\n"
+            "const odoMidCarry = computeStopwatchOdometerPositions(9.56);\n"
+            "const odoPreTen = computeStopwatchOdometerPositions(9.999999);\n"
+            "const odoAtTen = computeStopwatchOdometerPositions(10.0);\n"
             "console.log(JSON.stringify({"
             "labels: [0, 1, 2, 3].map(i => stageStopwatchMeta(i).label),"
             "z: formatStopwatchParts(0).full,"
@@ -2530,7 +2580,9 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
             "tailTop1, tailTop2, followAfterScrollUp, pinnedTopAfterAppend,"
             "hasLine5DuringSel: textDuringSel.includes('line 5'),"
             "hasLine5AfterClear: textAfterClearSel.includes('line 5'),"
-            "pinnedTopAfterClearSel, followAfterBottom, tailTopResumed"
+            "pinnedTopAfterClearSel, followAfterBottom, tailTopResumed,"
+            "cheatFromInput, cheatAfterRainbow, quipAfterRainbow, slomoMsAfter10s,"
+            "cheatAfterKonamiToggleOff, odoMidCarry, odoPreTen, odoAtTen"
             "}));\n"
         )
         res = subprocess.run(
@@ -2558,6 +2610,20 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
         assert out["pinnedTopAfterClearSel"] == 120
         assert out["followAfterBottom"] is True
         assert out["tailTopResumed"] == 1200
+        assert out["cheatFromInput"] is False
+        assert 0.45 < out["odoMidCarry"][5] < 0.55
+        assert 9.45 < out["odoMidCarry"][6] < 9.55
+        assert abs(out["odoPreTen"][5] - out["odoAtTen"][5]) < 1e-4
+        assert abs(out["odoPreTen"][6] - 10.0) < 1e-4
+        assert out["odoAtTen"][6] == 0.0
+        if mode == "arcade":
+            assert out["cheatAfterRainbow"] is True
+            assert out["quipAfterRainbow"] == "SLO-MO CHEAT!"
+            assert abs(out["slomoMsAfter10s"] - 15.0) < 1e-6
+            assert out["cheatAfterKonamiToggleOff"] is False
+        else:
+            assert out["cheatAfterRainbow"] is False
+            assert abs(out["slomoMsAfter10s"] - 10000.0) < 1e-6
         if mode == "arcade":
             assert out["qFast"] == "SPEED BONUS!"
             assert out["qSolve"] == "STAGE CLEAR!"
