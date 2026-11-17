@@ -83,6 +83,12 @@ reproduces subhkl's physics, ``s1 = s0 + S · U · B · h``.
   ``goniometer/offsets`` zero-points are folded in, matching the geometry subhkl
   used; a stored ``goniometer/R`` already includes them. Reflections carry
   ``id`` (experiment index) and ``panel`` (bank index).
+- **Experiment identifiers** — each experiment gets a UUID, as ``dials.import``
+  assigns, so exports of separate runs combine with
+  ``dials.combine_experiments``. The UUID is derived (``uuid5``) from the image
+  stack's absolute path and the frame number, so it is reproducible and every
+  step exported against the same stack gives a frame the same identifier, as
+  identifiers persist through a native DIALS pipeline.
 - **Sample position** — subhkl mounts the sample off the rotation origin, at
   ``s_lab = R_frame · translation`` (``goniometer/translations``), and casts the
   diffracted ray from there. DIALS assumes the sample at the origin, so each

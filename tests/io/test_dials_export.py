@@ -685,6 +685,81 @@ def test_roundtrip_sparse_peaks_keep_the_imageset(tmp_path):
     )
 
 
+def test_experiment_identifier_is_a_reproducible_unique_uuid(tmp_path, monkeypatch):
+    import uuid
+
+    a, b = tmp_path / "a.h5", tmp_path / "b.h5"
+    ident = dx.experiment_identifier(a, 0)
+    assert str(uuid.UUID(ident)) == ident  # a well-formed UUID
+    assert dx.experiment_identifier(a, 0) == ident  # reproducible
+    assert dx.experiment_identifier(a, 1) != ident  # per frame
+    assert dx.experiment_identifier(b, 0) != ident  # per source file
+    monkeypatch.chdir(tmp_path)
+    assert dx.experiment_identifier("a.h5", 0) == ident  # path-spelling independent
+
+
+def test_roundtrip_separately_exported_runs_combine(tmp_path):
+    """Two single-run exports get distinct identifiers, so they can be combined
+    into one ExperimentList as dials.combine_experiments does."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+    from dxtbx.model.experiment_list import ExperimentList, ExperimentListFactory
+
+    combined = ExperimentList()
+    for name in ("run_a", "run_b"):
+        stack = tmp_path / f"{name}.h5"
+        _write_reduce_stack(str(stack))
+        expt_path = str(tmp_path / f"{name}.expt")
+        refl_path = str(tmp_path / f"{name}.refl")
+        dx.hdf5_to_dials(str(stack), expt_path, refl_path, instrument="CG4D")
+        experiments = ExperimentListFactory.from_json_file(
+            expt_path, check_format=False
+        )
+        refl = flex.reflection_table.from_file(refl_path)
+        assert dict(refl.experiment_identifiers()) == {
+            i: e.identifier for i, e in enumerate(experiments)
+        }
+        combined.extend(experiments)  # raises on a duplicate identifier
+
+    assert len({e.identifier for e in combined}) == 2
+
+
+def test_roundtrip_identifiers_persist_across_steps(tmp_path):
+    """Every export backed by the same stack gives a frame the same identifier,
+    as identifiers persist from dials.import through a native pipeline."""
+    pytest.importorskip("dxtbx")
+    from dials.array_family import flex
+    from dxtbx.model.experiment_list import ExperimentListFactory
+
+    stack = tmp_path / "merged.h5"
+    _write_merged_stack(str(stack))
+    peaks = tmp_path / "found.h5"
+    _write_peaks_on(str(peaks), frames=[0, 1], banks=[11, 12])
+
+    dx.hdf5_to_dials(
+        str(stack), str(tmp_path / "s.expt"), str(tmp_path / "s.refl"), "CG4D"
+    )
+    dx.hdf5_to_dials(
+        str(peaks),
+        str(tmp_path / "p.expt"),
+        str(tmp_path / "p.refl"),
+        instrument="CG4D",
+        image_source=str(stack),
+    )
+    from_stack = ExperimentListFactory.from_json_file(
+        str(tmp_path / "s.expt"), check_format=False
+    )
+    from_peaks = ExperimentListFactory.from_json_file(
+        str(tmp_path / "p.expt"), check_format=False
+    )
+    assert [e.identifier for e in from_peaks] == [e.identifier for e in from_stack]
+    assert len({e.identifier for e in from_stack}) == 2
+    refl = flex.reflection_table.from_file(str(tmp_path / "p.refl"))
+    assert sorted(refl.experiment_identifiers().values()) == sorted(
+        e.identifier for e in from_peaks
+    )
+
+
 def test_roundtrip_peaks_outside_the_stack_get_geometry_only(tmp_path, capsys):
     """A stack missing a frame the peaks refer to is not their stack."""
     pytest.importorskip("dxtbx")

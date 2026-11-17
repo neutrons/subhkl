@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import math
 import os
+import uuid
 
 import h5py
 import numpy as np
@@ -42,6 +43,27 @@ DIALS_IMPORT_ERROR = (
 )
 
 _H5_SUFFIXES = (".nxs.h5", ".h5", ".hdf5", ".mtz", ".expt", ".refl")
+
+
+# Namespace for the deterministic experiment identifiers (uuid5) below.
+_EXPERIMENT_ID_NAMESPACE = uuid.uuid5(
+    uuid.NAMESPACE_URL, "https://github.com/neutrons/subhkl"
+)
+
+
+def experiment_identifier(source_path, frame):
+    """Globally unique, reproducible DIALS experiment identifier for a frame.
+
+    dials.import gives every experiment a UUID so experiments from separate
+    imports can be combined (dials.combine_experiments refuses duplicate
+    identifiers).  Deriving a uuid5 from the image stack's absolute path and the
+    frame number keeps that uniqueness across runs while staying stable: every
+    export backed by the same stack (finder, indexer, predictor, integrator)
+    gives a frame the same identifier, as identifiers persist through a native
+    DIALS pipeline, and re-exporting reproduces it exactly.
+    """
+    key = f"{os.path.realpath(os.fspath(source_path))}#frame={int(frame)}"
+    return str(uuid.uuid5(_EXPERIMENT_ID_NAMESPACE, key))
 
 
 def _require_dials():
@@ -710,6 +732,9 @@ def hdf5_to_dials(
             rotations, axes = _frame_rotations(f, peaks, frame_ids)
 
         frame_to_expt = {frame: i for i, frame in enumerate(frame_ids)}
+        # Identifiers come from the image stack when there is one, so a frame
+        # keeps its identifier across every step's export of that stack.
+        id_source = stack_path if stack_path is not None else h5_path
 
         # subhkl's sample sits at s_lab = R_frame @ sample_offset. Translate each
         # frame's detector by -s_lab so the sample lands at the DIALS origin.
@@ -734,7 +759,7 @@ def hdf5_to_dials(
                 detector=frame_detector,
                 goniometer=gonio,
                 crystal=crystal,
-                identifier=f"subhkl-frame-{frame}",
+                identifier=experiment_identifier(id_source, frame),
             )
             experiments.append(expt)
 
