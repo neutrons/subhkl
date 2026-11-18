@@ -336,7 +336,9 @@ def _decode_str(val: Any, default: str = "") -> str:
 
 
 def _load_detectors_from_h5(
-    f: h5py.File | None, instrument: str | None
+    f: h5py.File | None,
+    instrument: str | None,
+    fallback_h5_paths: tuple[str | None, ...] = (),
 ) -> dict[int, Any]:
     """Load calibrated or nominal detector banks from ``subhkl.config.beamlines`` + HDF5 calibration."""
     from subhkl.config import beamlines
@@ -357,8 +359,7 @@ def _load_detectors_from_h5(
         ):
             detectors[bank_id] = Detector(cfg)
 
-    if f is not None and "detector_calibration" in f:
-        cal_grp = f["detector_calibration"]
+    def _apply_cal_group(cal_grp: Any) -> None:
         for name in cal_grp:
             if not name.startswith("bank_"):
                 continue
@@ -368,18 +369,43 @@ def _load_detectors_from_h5(
                 continue
             g = cal_grp[name]
             cfg = dict(
-                base_configs.get(bank_id, {"panel_type": "flat", "m": 256, "n": 256})
+                base_configs.get(
+                    bank_id,
+                    {"panel": "flat", "panel_type": "flat", "m": 256, "n": 256},
+                )
             )
-            for field in ("center", "uhat", "vhat"):
+            if "panel" not in cfg:
+                pt = str(cfg.get("panel_type", "flat"))
+                cfg["panel"] = "curved" if pt in ("curved", "cylindrical") else "flat"
+            for field in ("center", "uhat", "vhat", "rhat"):
                 if field in g:
                     cfg[field] = np.asarray(g[field][()], dtype=float).tolist()
-            for field in ("width", "height"):
+            for field in ("width", "height", "radius"):
                 if field in g:
                     cfg[field] = float(g[field][()])
             with contextlib.suppress(
                 OSError, RuntimeError, ValueError, TypeError, KeyError
             ):
                 detectors[bank_id] = Detector(cfg)
+
+    if f is not None and "detector_calibration" in f:
+        _apply_cal_group(f["detector_calibration"])
+    else:
+        for fb_path in fallback_h5_paths:
+            if not fb_path or not os.path.isfile(fb_path):
+                continue
+            applied = False
+            with (
+                contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, KeyError
+                ),
+                h5py.File(fb_path, "r") as f_cal,
+            ):
+                if "detector_calibration" in f_cal:
+                    _apply_cal_group(f_cal["detector_calibration"])
+                    applied = True
+            if applied:
+                break
 
     return detectors
 
@@ -1177,6 +1203,18 @@ def _reconstruct_detectors_from_payload(payload: dict[str, Any]) -> dict[int, An
         for p in (payload.get("panels") or [])
         if isinstance(p, dict) and "bank" in p
     }
+
+    def _normalize_det_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+        raw_pt = str(cfg.get("panel") or cfg.get("panel_type") or "flat")
+        panel_norm = "curved" if raw_pt in ("curved", "cylindrical") else "flat"
+        return {
+            "m": 256,
+            "n": 256,
+            **cfg,
+            "panel": panel_norm,
+            "panel_type": panel_norm,
+        }
+
     detectors: dict[int, Any] = {}
     det_cfgs = payload.get("detector_configs")
     if isinstance(det_cfgs, dict) and det_cfgs:
@@ -1189,9 +1227,10 @@ def _reconstruct_detectors_from_payload(payload: dict[str, Any]) -> dict[int, An
                 continue
             if isinstance(cfg, dict) and (
                 all(k in cfg for k in ("center", "uhat", "vhat", "width", "height"))
-                or str(cfg.get("panel_type")) == "cylindrical"
+                or str(cfg.get("panel") or cfg.get("panel_type") or "")
+                in ("curved", "cylindrical")
             ):
-                full_cfg = {"panel_type": "flat", "m": 256, "n": 256, **cfg}
+                full_cfg = _normalize_det_cfg(cfg)
                 with contextlib.suppress(
                     OSError, RuntimeError, ValueError, TypeError, KeyError
                 ):
@@ -1207,11 +1246,12 @@ def _reconstruct_detectors_from_payload(payload: dict[str, Any]) -> dict[int, An
                     continue
                 if panel_banks and bid not in panel_banks:
                     continue
-                full_cfg = {"panel_type": "flat", "m": 256, "n": 256, **cfg}
-                with contextlib.suppress(
-                    OSError, RuntimeError, ValueError, TypeError, KeyError
-                ):
-                    detectors[bid] = Detector(full_cfg)
+                if isinstance(cfg, dict):
+                    full_cfg = _normalize_det_cfg(cfg)
+                    with contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ):
+                        detectors[bid] = Detector(full_cfg)
         if not detectors:
             loaded = _load_detectors_from_h5(None, inst)
             for bid, det in loaded.items():
@@ -1229,12 +1269,13 @@ def _raycast_hkl_on_detectors(
     wavelength_range: tuple[float, float] | list[float],
     *,
     ki: Any = (0.0, 0.0, 1.0),
+    sample_offset_lab: Any = None,
     active_bids: set[int] | None = None,
     pixel_class_by_bank: dict[int, np.ndarray] | None = None,
     inten_cand: np.ndarray | None = None,
     sigma_cand: np.ndarray | None = None,
     bank_imgs: dict[int, np.ndarray] | None = None,
-    margin_frac: float = 0.01,
+    margin_frac: float = 0.0,
     G_cryst: np.ndarray | None = None,
     qn_cryst: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
@@ -1303,6 +1344,12 @@ def _raycast_hkl_on_detectors(
     kf = ki_vec[None, :] + lam_b[:, None] * G_b
     kf /= np.maximum(np.linalg.norm(kf, axis=1, keepdims=True), 1e-12)
 
+    s_lab = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None
+        else np.zeros(3, dtype=float)
+    )
+    mf = max(0.0, float(margin_frac))
     xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l, inten_l, sig_l = (
         [],
         [],
@@ -1313,61 +1360,36 @@ def _raycast_hkl_on_detectors(
         [],
         [],
     )
-    lo_f = float(margin_frac)
-    hi_f = 1.0 - float(margin_frac)
     for bid, det in sorted(detectors.items()):
         bid_i = int(bid)
         if active_bids is not None and bid_i not in active_bids:
             continue
-        if (
-            getattr(det, "panel_type", "flat") == "flat"
-            and getattr(det, "uhat", None) is not None
-            and getattr(det, "vhat", None) is not None
+        idx_h = np.zeros(0, dtype=int)
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
         ):
-            cen = np.asarray(det.center, dtype=float)
-            uh = np.asarray(det.uhat, dtype=float)
-            vh = np.asarray(det.vhat, dtype=float)
-            w_d, h_d = float(det.width), float(det.height)
-            nrm = np.cross(uh, vh)
-            dn = kf @ nrm
-            t_ray = np.dot(cen, nrm) / np.where(np.abs(dn) < 1e-9, -1.0, dn)
-            hit = t_ray > 0
-            if not np.any(hit):
-                continue
-            idx_h = np.flatnonzero(hit)
-            p_hit = t_ray[idx_h, None] * kf[idx_h] - cen[None, :]
-            um = p_hit @ uh
-            vm = p_hit @ vh
-            in_b = (
-                (um >= w_d * lo_f)
-                & (um <= w_d * hi_f)
-                & (vm >= h_d * lo_f)
-                & (vm <= h_d * hi_f)
+            mask_c, row_c, col_c = det.reflections_mask(
+                kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_lab
             )
-            if not np.any(in_b):
-                continue
-            idx_h = idx_h[in_b]
-            um, vm = um[in_b], vm[in_b]
-            pr_hit = vm / max(h_d, 1e-6) * (det.n - 1)
-            pc_hit = um / max(w_d, 1e-6) * (det.m - 1)
-            xyz_hit = (
-                cen[None, :] + um[:, None] * uh[None, :] + vm[:, None] * vh[None, :]
-            )
-        else:
-            idx_h = np.zeros(0, dtype=int)
-            with contextlib.suppress(
-                OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
-            ):
-                mask_c, row_c, col_c = det.reflections_mask(
-                    kf[:, 0], kf[:, 1], kf[:, 2]
+            if mf > 0.0 and np.any(mask_c):
+                r_span = max(float(det.n - 1), 1.0)
+                c_span = max(float(det.m - 1), 1.0)
+                mask_c = (
+                    mask_c
+                    & (row_c >= mf * r_span)
+                    & (row_c <= (1.0 - mf) * r_span)
+                    & (col_c >= mf * c_span)
+                    & (col_c <= (1.0 - mf) * c_span)
                 )
-                if np.any(mask_c):
-                    idx_h = np.flatnonzero(mask_c)
-                    pr_hit = np.asarray(row_c[idx_h], dtype=float)
-                    pc_hit = np.asarray(col_c[idx_h], dtype=float)
-                    xyz_hit = det.pixel_to_lab(pr_hit, pc_hit)
-            if len(idx_h) == 0:
-                continue
+            if np.any(mask_c):
+                idx_h = np.flatnonzero(mask_c)
+                pr_hit = np.asarray(row_c[idx_h], dtype=float)
+                pc_hit = np.asarray(col_c[idx_h], dtype=float)
+                xyz_hit = np.asarray(det.pixel_to_lab(pr_hit, pc_hit), dtype=float)
+                if xyz_hit.ndim == 1:
+                    xyz_hit = xyz_hit[None, :]
+        if len(idx_h) == 0:
+            continue
         if pixel_class_by_bank is not None:
             cls_b = pixel_class_by_bank.get(bid_i)
             if cls_b is not None and cls_b.ndim == 2:
@@ -1430,7 +1452,11 @@ def apply_mtz_to_payload(
 
     from subhkl.core.crystallography import cartesian_matrix_metric_tensor
 
-    if payload.get("ub_matrix") is not None:
+    if payload.get("u_matrix") is not None and payload.get("b_matrix") is not None:
+        U_curr = np.asarray(payload["u_matrix"], dtype=float)
+        B_curr = np.asarray(payload["b_matrix"], dtype=float)
+        UB_curr = U_curr @ B_curr
+    elif payload.get("ub_matrix") is not None:
         UB_curr = np.asarray(payload["ub_matrix"], dtype=float)
         U_curr = (
             np.asarray(payload["u_matrix"], dtype=float)
@@ -1439,20 +1465,16 @@ def apply_mtz_to_payload(
         )
         B_curr = U_curr.T @ UB_curr
     elif payload.get("u_matrix") is not None and (
-        payload.get("b_matrix") is not None
-        or (payload.get("cell") and len(payload["cell"]) == 6)
+        payload.get("cell") and len(payload["cell"]) == 6
     ):
         U_curr = np.asarray(payload["u_matrix"], dtype=float)
-        if payload.get("b_matrix") is not None:
-            B_curr = np.asarray(payload["b_matrix"], dtype=float)
-        else:
-            c_act = [float(x) for x in payload["cell"]]
-            B_curr, _ = cartesian_matrix_metric_tensor(
-                c_act[0],
-                c_act[1],
-                c_act[2],
-                *np.deg2rad(c_act[3:6]),
-            )
+        c_act = [float(x) for x in payload["cell"]]
+        B_curr, _ = cartesian_matrix_metric_tensor(
+            c_act[0],
+            c_act[1],
+            c_act[2],
+            *np.deg2rad(c_act[3:6]),
+        )
         UB_curr = U_curr @ B_curr
     else:
         raise ValueError(
@@ -1472,7 +1494,63 @@ def apply_mtz_to_payload(
     )
 
     mtz = gemmi.read_mtz_file(str(mtz_path))
-    mtz_sg = mtz.spacegroup or active_sg
+    mtz_sg_raw = mtz.spacegroup
+    mtz_sg = mtz_sg_raw or active_sg
+    mtz_sg_label = mtz_sg_raw.xhm() if mtz_sg_raw is not None else None
+    same_sg = mtz_sg_raw is None or (
+        mtz_sg.number == active_sg.number and mtz_sg.xhm() == active_sg.xhm()
+    )
+    mtz_cell_vals: list[float] | None = None
+    if (
+        getattr(mtz, "cell", None) is not None
+        and float(mtz.cell.a) > 0.5
+        and float(mtz.cell.b) > 0.5
+        and float(mtz.cell.c) > 0.5
+    ):
+        mtz_cell_vals = [
+            round(float(mtz.cell.a), 4),
+            round(float(mtz.cell.b), 4),
+            round(float(mtz.cell.c), 4),
+            round(float(mtz.cell.alpha), 3),
+            round(float(mtz.cell.beta), 3),
+            round(float(mtz.cell.gamma), 3),
+        ]
+    cell_mismatch = False
+    if mtz_cell_vals is not None and len(active_cell) == 6:
+        edge_rel = max(
+            abs(mtz_cell_vals[i] - active_cell[i]) / max(abs(active_cell[i]), 1e-3)
+            for i in range(3)
+        )
+        ang_abs = max(abs(mtz_cell_vals[i] - active_cell[i]) for i in range(3, 6))
+        cell_mismatch = (edge_rel > 0.015) or (ang_abs > 0.75)
+
+    def _fmt_cell_info(c_v: list[float]) -> str:
+        return (
+            f"{c_v[0]:.2f}, {c_v[1]:.2f}, {c_v[2]:.2f} Å; "
+            f"{c_v[3]:.1f}, {c_v[4]:.1f}, {c_v[5]:.1f}°"
+        )
+
+    mtz_overlay_warning: str | None = None
+    if not same_sg and cell_mismatch and mtz_cell_vals is not None:
+        mtz_overlay_warning = (
+            f"Symmetry & unit cell differ: MTZ header is {mtz_sg_label} "
+            f"({_fmt_cell_info(mtz_cell_vals)}) vs active solve {active_sg.xhm()} "
+            f"({_fmt_cell_info(active_cell)}) — projecting pure HKL indices with "
+            f"active U, B & geometry unchanged."
+        )
+    elif not same_sg:
+        mtz_overlay_warning = (
+            f"Symmetry differs: MTZ header is {mtz_sg_label} vs active solve "
+            f"{active_sg.xhm()} — projecting pure HKL indices with active U, B & "
+            f"geometry unchanged."
+        )
+    elif cell_mismatch and mtz_cell_vals is not None:
+        mtz_overlay_warning = (
+            f"Unit cell differs: MTZ header ({_fmt_cell_info(mtz_cell_vals)}) vs "
+            f"active solve ({_fmt_cell_info(active_cell)}) — projecting pure HKL "
+            f"indices with active U, B & geometry unchanged."
+        )
+
     asu = gemmi.ReciprocalAsu(mtz_sg)
     ops = mtz_sg.operations()
     cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}
@@ -1550,8 +1628,8 @@ def apply_mtz_to_payload(
         if key not in asu_map or abs(iv) > abs(asu_map[key][0]):
             asu_map[key] = (iv, sv_clean)
 
-    # Expand merged ASU MTZs across symmetry + Friedel mates carrying (I, SIGI) directly in NumPy
-    # so all matching Ewald hits in the active geometry are projected without a second gemmi pass.
+    # Expand merged ASU MTZs across symmetry + Friedel mates carrying (I, SIGI) directly in NumPy.
+    # Symmetry matrices operate purely on integer (H, K, L) indices; mtz.cell is never used to rescale B.
     is_unmerged_mtz = "BATCH" in cols
     exp_hkl_blocks: list[np.ndarray] = []
     exp_i_blocks: list[np.ndarray] = []
@@ -1599,6 +1677,12 @@ def apply_mtz_to_payload(
         if payload.get("goniometer_R") is not None
         else np.eye(3)
     )
+    s_lab_single = (
+        np.asarray(payload["sample_offset_lab"], dtype=float).ravel()[:3]
+        if payload.get("sample_offset_lab") is not None
+        else np.zeros(3, dtype=float)
+    )
+    s_lab_per_run_raw = payload.get("sample_offset_lab_per_run") or {}
     active_frame = int(payload.get("frame_index") or 0)
     ki_hat = np.asarray(payload.get("ki") or [0.0, 0.0, 1.0], dtype=float)
     ki_hat = ki_hat / max(float(np.linalg.norm(ki_hat)), 1e-12)
@@ -1627,8 +1711,10 @@ def apply_mtz_to_payload(
         detectors,
         (wl_min, wl_max),
         ki=ki_hat,
+        sample_offset_lab=s_lab_single,
         inten_cand=inten_exp,
         sigma_cand=sigma_exp,
+        margin_frac=0.0,
         G_cryst=G_cryst_exp,
         qn_cryst=qn_cryst_exp,
     )
@@ -1683,6 +1769,7 @@ def apply_mtz_to_payload(
         ub_matrix=UB_curr,
         R_gonio=R_single,
         ki_hat=ki_hat,
+        sample_offset_lab=s_lab_single,
         wavelength_range=(wl_min, wl_max),
         space_group=active_sg_name,
         cell=active_cell,
@@ -1709,10 +1796,22 @@ def apply_mtz_to_payload(
             [],
         )
         r_per_run_np: dict[int, np.ndarray] = {}
+        s_per_run_np: dict[int, np.ndarray] = {}
         for r_k, r_mat_v in sorted(r_per_run_raw.items(), key=lambda kv: int(kv[0])):
             r_i = int(r_k)
             R_r = np.asarray(r_mat_v, dtype=float)
             r_per_run_np[r_i] = R_r
+            s_r_raw = (
+                s_lab_per_run_raw.get(str(r_i))
+                if isinstance(s_lab_per_run_raw, dict)
+                else None
+            )
+            s_r = (
+                np.asarray(s_r_raw, dtype=float).ravel()[:3]
+                if s_r_raw is not None
+                else s_lab_single
+            )
+            s_per_run_np[r_i] = s_r
             c_r = _raycast_hkl_on_detectors(
                 hkl_exp,
                 U_curr,
@@ -1721,8 +1820,10 @@ def apply_mtz_to_payload(
                 detectors,
                 (wl_min, wl_max),
                 ki=ki_hat,
+                sample_offset_lab=s_r,
                 inten_cand=inten_exp,
                 sigma_cand=sigma_exp,
+                margin_frac=0.0,
                 G_cryst=G_cryst_exp,
                 qn_cryst=qn_cryst_exp,
             )
@@ -1743,10 +1844,21 @@ def apply_mtz_to_payload(
             sig_all_m = np.concatenate(all_sig, axis=0)
             run_all_m = np.concatenate(all_run, axis=0)
             # Every run observing the same crystal (h, k, l) maps to the exact same 3D unit vector
-            # on the Wulff sphere. Keep all active_frame hits plus one strongest-|I|/sigma entry per
-            # additional unique crystal (h, k, l) across other runs to eliminate 5-15x multi-run bloat.
+            # on the Wulff sphere. Deduplicate active_frame hits across overlapping adjacent banks
+            # plus one strongest-|I|/sigma entry per additional unique crystal (h, k, l) across other runs.
             is_act = run_all_m == active_frame
-            act_idx = np.flatnonzero(is_act)
+            act_idx_raw = np.flatnonzero(is_act)
+            if len(act_idx_raw) > 0:
+                snr_act = np.abs(int_all_m[act_idx_raw]) / np.maximum(
+                    sig_all_m[act_idx_raw], 1e-3
+                )
+                act_sorted = act_idx_raw[np.argsort(-snr_act, kind="mergesort")]
+                _, act_first = np.unique(
+                    hkl_all_m[act_sorted], axis=0, return_index=True
+                )
+                act_idx = np.sort(act_sorted[act_first])
+            else:
+                act_idx = act_idx_raw
             oth_idx = np.flatnonzero(~is_act)
             if len(oth_idx) > 0:
                 snr_oth = np.abs(int_all_m[oth_idx]) / np.maximum(
@@ -1781,13 +1893,15 @@ def apply_mtz_to_payload(
                     )
                 else:
                     keep_m = np.sort(oth_uniq)
-                pts_all_m = pts_all_m[keep_m]
-                hkl_all_m = hkl_all_m[keep_m]
-                lam_all_m = lam_all_m[keep_m]
-                bnk_all_m = bnk_all_m[keep_m]
-                int_all_m = int_all_m[keep_m]
-                sig_all_m = sig_all_m[keep_m]
-                run_all_m = run_all_m[keep_m]
+            else:
+                keep_m = act_idx
+            pts_all_m = pts_all_m[keep_m]
+            hkl_all_m = hkl_all_m[keep_m]
+            lam_all_m = lam_all_m[keep_m]
+            bnk_all_m = bnk_all_m[keep_m]
+            int_all_m = int_all_m[keep_m]
+            sig_all_m = sig_all_m[keep_m]
+            run_all_m = run_all_m[keep_m]
             if len(pts_all_m) > 8000:
                 # Always retain active_frame hits if within 8000, filling remaining budget by |I|
                 is_act2 = run_all_m == active_frame
@@ -1816,11 +1930,13 @@ def apply_mtz_to_payload(
                     "bank": bnk_all_m,
                     "run_index": run_all_m,
                     "R_per_run": r_per_run_np,
+                    "s_lab_per_run": s_per_run_np,
                 },
                 fallback_peaks=mtz_peaks,
                 n_frames=len(frames_meta),
                 ki_hat=ki_hat,
                 R_single=R_single,
+                sample_offset_lab=s_lab_single,
                 wavelength_range=(wl_min, wl_max),
                 space_group=active_sg_name,
                 cell=active_cell,
@@ -1838,7 +1954,6 @@ def apply_mtz_to_payload(
     # Annotate existing predicted / integrated peak sets with merged_i/sigi where matching ASU HKL exists,
     # while strictly preserving active U, B, UB, cell, space_group, and zones.
     asu_lookup_cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
-    same_sg = mtz.spacegroup is None or (mtz_sg.xhm() == active_sg.xhm())
     for list_key in (
         "predicted_peaks",
         "predicted_sample_peaks",
@@ -1883,6 +1998,9 @@ def apply_mtz_to_payload(
     out["mtz_overlay_name"] = mtz_name
     out["mtz_overlay_reflections"] = len(asu_map)
     out["mtz_overlay_matched"] = len(mtz_peaks)
+    out["mtz_overlay_space_group"] = mtz_sg_label
+    out["mtz_overlay_cell"] = mtz_cell_vals
+    out["mtz_overlay_warning"] = mtz_overlay_warning
     return out
 
 
@@ -1926,6 +2044,20 @@ def _extract_from_h5(
         )
         if is_pure_merged:
             sib_solve_path = None
+        pred_cand_init = (
+            _discover_predictor_h5(h5_path)
+            if (not is_pure_merged and not is_blind_h5)
+            else None
+        )
+        pred_h5_aux = (
+            str(pred_cand_init)
+            if (
+                pred_cand_init
+                and os.path.isfile(pred_cand_init)
+                and Path(pred_cand_init).resolve() != Path(h5_path).resolve()
+            )
+            else None
+        )
         pixel_class_by_bank, em_mask_summary = _load_pixel_class_from_h5(
             f, sib_solve_path=None if is_pure_merged else sib_solve_path
         )
@@ -1938,6 +2070,27 @@ def _extract_from_h5(
                 float(x)
                 for x in np.asarray(f["beam/ki_vec"][()], dtype=float).ravel()[:3]
             )
+        else:
+            for k_aux in (sib_solve_path, pred_h5_aux):
+                if not k_aux or not os.path.isfile(k_aux):
+                    continue
+                got_ki = False
+                with (
+                    contextlib.suppress(
+                        OSError, RuntimeError, ValueError, TypeError, KeyError
+                    ),
+                    h5py.File(k_aux, "r") as kf_aux,
+                ):
+                    if "beam/ki_vec" in kf_aux:
+                        ki = tuple(
+                            float(x)
+                            for x in np.asarray(
+                                kf_aux["beam/ki_vec"][()], dtype=float
+                            ).ravel()[:3]
+                        )
+                        got_ki = True
+                if got_ki:
+                    break
 
         wavelength_range: tuple[float, float] | None = None
         if "scan_refinement/band_wavelength" in f:
@@ -2085,7 +2238,9 @@ def _extract_from_h5(
         if wavelength_range is None:
             wavelength_range = _get_instrument_default_wavelength(instrument)
 
-        detectors = _load_detectors_from_h5(f, instrument)
+        detectors = _load_detectors_from_h5(
+            f, instrument, fallback_h5_paths=(sib_solve_path, pred_h5_aux)
+        )
 
         bank = np.asarray(f["bank"][()], dtype=int) if "bank" in f else None
         if "peaks/bank" in f and bank is None:
@@ -2149,7 +2304,7 @@ def _extract_from_h5(
             if np.any(filled_mask):
                 peaks_xyz = xyz_rec
 
-        # Extract multi-frame offsets, file names, and goniometer motor angles
+        # Extract multi-frame offsets, file names, and refined goniometer kinematics
         offsets = (
             np.asarray(f["file_offsets"][()], dtype=int)
             if "file_offsets" in f
@@ -2165,19 +2320,84 @@ def _extract_from_h5(
             if "goniometer/axes" in f
             else None
         )
+        has_axes_nominal = "goniometer/axes_nominal" in f
         gonio_angles_ref = (
             np.asarray(f["goniometer/angles"][()], dtype=float)
             if "goniometer/angles" in f
             else None
         )
-        gonio_angles_nom = None
+        gonio_angles_nom = (
+            np.asarray(f["goniometer/angles_nominal"][()], dtype=float)
+            if "goniometer/angles_nominal" in f
+            else None
+        )
         R_all = (
             np.asarray(f["goniometer/R"][()], dtype=float)
             if "goniometer/R" in f
             else None
         )
 
-        for aux_path in (src_h5, sib_solve_path):
+        def _parse_gonio_offsets_from_h5(
+            hf_obj: h5py.File, names_list: list[Any] | None
+        ) -> dict[str, float] | np.ndarray | None:
+            if "goniometer/offsets" not in hf_obj:
+                return None
+            off_obj = hf_obj["goniometer/offsets"]
+            if isinstance(off_obj, h5py.Group):
+                return {str(k_o): float(off_obj[k_o][()]) for k_o in off_obj}
+            return np.asarray(off_obj[()], dtype=float).ravel()
+
+        def _parse_per_run_from_h5(
+            hf_obj: h5py.File,
+        ) -> dict[str, Any] | None:
+            if "goniometer/per_run" not in hf_obj:
+                return None
+            pr_g = hf_obj["goniometer/per_run"]
+            if not isinstance(pr_g, h5py.Group):
+                return None
+            pr_out: dict[str, Any] = {}
+            if "motor" in pr_g:
+                pr_out["motor"] = _decode_str(pr_g["motor"][()], "")
+            if "delta_deg" in pr_g:
+                pr_out["delta_deg"] = np.asarray(
+                    pr_g["delta_deg"][()], dtype=float
+                ).ravel()
+            if "trans_m" in pr_g:
+                pr_out["trans_m"] = np.asarray(pr_g["trans_m"][()], dtype=float)
+            if "frame_to_run" in pr_g:
+                pr_out["frame_to_run"] = np.asarray(
+                    pr_g["frame_to_run"][()], dtype=int
+                ).ravel()
+            return pr_out if pr_out else None
+
+        def _parse_harmonics_from_h5(
+            hf_obj: h5py.File,
+        ) -> dict[str, Any] | None:
+            if "goniometer/harmonics" not in hf_obj:
+                return None
+            gh_g = hf_obj["goniometer/harmonics"]
+            if not isinstance(gh_g, h5py.Group):
+                return None
+            if all(k_h in gh_g for k_h in ("motor", "orders", "axes", "coeffs_deg")):
+                return {
+                    "motor": _decode_str(gh_g["motor"][()], ""),
+                    "orders": np.asarray(gh_g["orders"][()], dtype=int),
+                    "axes": np.asarray(gh_g["axes"][()], dtype=float),
+                    "coeffs_deg": np.asarray(gh_g["coeffs_deg"][()], dtype=float),
+                }
+            return None
+
+        gonio_offsets_spec = _parse_gonio_offsets_from_h5(f, gonio_names_raw)
+        sample_offset_raw = (
+            np.asarray(f["goniometer/translations"][()], dtype=float)
+            if "goniometer/translations" in f
+            else None
+        )
+        per_run_spec = _parse_per_run_from_h5(f)
+        harmonics_spec = _parse_harmonics_from_h5(f)
+
+        # Prefer solved/predictor files BEFORE nominal merged.h5 (`src_h5`) for refined kinematics!
+        for aux_path in (sib_solve_path, pred_h5_aux, src_h5):
             if not aux_path or not os.path.isfile(aux_path):
                 continue
             with (
@@ -2194,18 +2414,39 @@ def _extract_from_h5(
                     files_raw = list(af["files"][()])
                 if gonio_names_raw is None and "goniometer/names" in af:
                     gonio_names_raw = list(af["goniometer/names"][()])
-                if gonio_axes is None and "goniometer/axes" in af:
+                if "goniometer/axes_nominal" in af:
+                    has_axes_nominal = True
+                    if "goniometer/axes" in af and "goniometer/axes_nominal" not in f:
+                        gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
+                elif gonio_axes is None and "goniometer/axes" in af:
                     gonio_axes = np.asarray(af["goniometer/axes"][()], dtype=float)
-                if aux_path == src_h5 and "goniometer/angles" in af:
+                if gonio_angles_nom is None and "goniometer/angles_nominal" in af:
                     gonio_angles_nom = np.asarray(
-                        af["goniometer/angles"][()], dtype=float
+                        af["goniometer/angles_nominal"][()], dtype=float
                     )
+                if aux_path == src_h5 and "goniometer/angles" in af:
+                    if gonio_angles_nom is None:
+                        gonio_angles_nom = np.asarray(
+                            af["goniometer/angles"][()], dtype=float
+                        )
                 elif gonio_angles_ref is None and "goniometer/angles" in af:
                     gonio_angles_ref = np.asarray(
                         af["goniometer/angles"][()], dtype=float
                     )
                 if R_all is None and "goniometer/R" in af:
                     R_all = np.asarray(af["goniometer/R"][()], dtype=float)
+                if gonio_offsets_spec is None:
+                    gonio_offsets_spec = _parse_gonio_offsets_from_h5(
+                        af, gonio_names_raw
+                    )
+                if sample_offset_raw is None and "goniometer/translations" in af:
+                    sample_offset_raw = np.asarray(
+                        af["goniometer/translations"][()], dtype=float
+                    )
+                if per_run_spec is None:
+                    per_run_spec = _parse_per_run_from_h5(af)
+                if harmonics_spec is None:
+                    harmonics_spec = _parse_harmonics_from_h5(af)
 
         if gonio_angles_nom is None:
             gonio_angles_nom = gonio_angles_ref
@@ -2585,35 +2826,224 @@ def _extract_from_h5(
             artifact_kind = "raw_nexus"
             peak_shape_mode = "none"
 
-        # Build goniometer rotation matrix lookup per run across all frames
+        # Build refined goniometer rotation matrix & lab-frame sample origin lookup per run,
+        # matching predict_reflections_on_panel (gonio_axes, refined angles, zero_offsets,
+        # per_run delta/trans, Fourier harmonics, and per-peak vs per-frame R_all shapes).
+        raw_run_index_unfiltered = (
+            np.asarray(run_index, dtype=int).copy() if run_index is not None else None
+        )
+        raw_peaks_count = len(peaks_xyz) if peaks_xyz is not None else 0
         R_per_run_all: dict[int, np.ndarray] = {}
+        s_lab_per_run_all: dict[int, np.ndarray] = {}
         n_runs_total = max(1, len(frames_meta))
+        n_axes_g = len(gonio_axes) if gonio_axes is not None else 0
+        decoded_gonio_names = (
+            [_decode_str(nm, "") for nm in gonio_names_raw] if gonio_names_raw else []
+        )
+        gonio_zero_offs = np.zeros(max(n_axes_g, 1), dtype=float)
+        has_zero_offsets = False
+        if gonio_offsets_spec is not None and n_axes_g > 0:
+            if isinstance(gonio_offsets_spec, dict):
+                for ax_i in range(n_axes_g):
+                    nm_full = (
+                        decoded_gonio_names[ax_i]
+                        if ax_i < len(decoded_gonio_names)
+                        else ""
+                    )
+                    if nm_full in gonio_offsets_spec:
+                        gonio_zero_offs[ax_i] = float(gonio_offsets_spec[nm_full])
+                    else:
+                        nm_short = nm_full.split(":")[-1].strip().lower()
+                        for k_off, v_off in gonio_offsets_spec.items():
+                            if (
+                                k_off.lower() == nm_short
+                                or k_off.split(":")[-1].strip().lower() == nm_short
+                            ):
+                                gonio_zero_offs[ax_i] = float(v_off)
+                                break
+            else:
+                arr_off = np.asarray(gonio_offsets_spec, dtype=float).ravel()
+                n_cp = min(n_axes_g, len(arr_off))
+                gonio_zero_offs[:n_cp] = arr_off[:n_cp]
+            has_zero_offsets = bool(np.any(np.abs(gonio_zero_offs[:n_axes_g]) > 1e-9))
+
+        def _extract_angles_for_run(
+            ang_arr: np.ndarray | None, f0_val: int, ur_val: int
+        ) -> np.ndarray | None:
+            if ang_arr is None or n_axes_g <= 0:
+                return None
+            if ang_arr.ndim == 1:
+                return (
+                    np.asarray(ang_arr[:n_axes_g], dtype=float).copy()
+                    if len(ang_arr) >= n_axes_g
+                    else None
+                )
+            if ang_arr.ndim != 2 or ang_arr.size == 0:
+                return None
+            frame_first_ang = ang_arr.shape[1] == n_axes_g and (
+                ang_arr.shape[0] != n_axes_g
+                or n_frames_total == n_axes_g
+                or (offsets is not None and len(offsets) == n_axes_g)
+            )
+            if not frame_first_ang and ang_arr.shape[0] == n_axes_g:
+                n_len = ang_arr.shape[1]
+                pick_col: int | None = None
+                if (
+                    raw_run_index_unfiltered is not None
+                    and n_len == len(raw_run_index_unfiltered)
+                    and n_len != n_frames_total
+                ):
+                    hits_r = np.flatnonzero(raw_run_index_unfiltered == ur_val)
+                    if len(hits_r) > 0:
+                        pick_col = int(hits_r[0])
+                elif (
+                    offsets is not None
+                    and n_len == len(offsets)
+                    and 0 <= ur_val < n_len
+                ):
+                    pick_col = ur_val
+                elif 0 <= f0_val < n_len:
+                    pick_col = f0_val
+                elif 0 <= ur_val < n_len:
+                    pick_col = ur_val
+                return (
+                    np.asarray(ang_arr[:, pick_col], dtype=float).copy()
+                    if pick_col is not None
+                    else None
+                )
+            if ang_arr.shape[1] == n_axes_g:
+                n_len = ang_arr.shape[0]
+                pick_row: int | None = None
+                if (
+                    raw_run_index_unfiltered is not None
+                    and n_len == len(raw_run_index_unfiltered)
+                    and n_len != n_frames_total
+                ):
+                    hits_r = np.flatnonzero(raw_run_index_unfiltered == ur_val)
+                    if len(hits_r) > 0:
+                        pick_row = int(hits_r[0])
+                elif (
+                    n_frames_total > 0
+                    and n_len == n_frames_total
+                    and 0 <= f0_val < n_len
+                ):
+                    pick_row = f0_val
+                elif (
+                    offsets is not None
+                    and n_len == len(offsets)
+                    and 0 <= ur_val < n_len
+                ):
+                    pick_row = ur_val
+                elif 0 <= f0_val < n_len:
+                    pick_row = f0_val
+                elif 0 <= ur_val < n_len:
+                    pick_row = ur_val
+                return (
+                    np.asarray(ang_arr[pick_row, :], dtype=float).copy()
+                    if pick_row is not None
+                    else None
+                )
+            return None
+
+        def _extract_R_from_R_all(f0_val: int, ur_val: int) -> np.ndarray | None:
+            if R_all is None:
+                return None
+            if R_all.ndim == 2:
+                return np.asarray(R_all, dtype=float)
+            if R_all.ndim != 3 or len(R_all) == 0:
+                return None
+            n_r_len = len(R_all)
+            if (
+                raw_run_index_unfiltered is not None
+                and n_r_len == len(raw_run_index_unfiltered)
+                and n_r_len != n_frames_total
+                and (offsets is None or n_r_len != len(offsets))
+            ):
+                hits_r = np.flatnonzero(raw_run_index_unfiltered == ur_val)
+                if len(hits_r) > 0:
+                    return np.asarray(R_all[int(hits_r[0])], dtype=float)
+                return None
+            if (
+                offsets is not None
+                and n_r_len == len(offsets)
+                and 0 <= ur_val < n_r_len
+            ):
+                return np.asarray(R_all[ur_val], dtype=float)
+            if (
+                n_frames_total > 0
+                and n_r_len == n_frames_total
+                and 0 <= f0_val < n_r_len
+            ):
+                return np.asarray(R_all[f0_val], dtype=float)
+            if (
+                raw_peaks_count > 0
+                and n_r_len == raw_peaks_count
+                and raw_run_index_unfiltered is not None
+                and len(raw_run_index_unfiltered) == n_r_len
+            ):
+                hits_r = np.flatnonzero(raw_run_index_unfiltered == ur_val)
+                if len(hits_r) > 0:
+                    return np.asarray(R_all[int(hits_r[0])], dtype=float)
+                return None
+            if 0 <= ur_val < n_r_len and (
+                offsets is None or n_r_len <= max(n_runs_total, 1)
+            ):
+                return np.asarray(R_all[ur_val], dtype=float)
+            if 0 <= f0_val < n_r_len and raw_peaks_count != n_r_len:
+                return np.asarray(R_all[f0_val], dtype=float)
+            return np.asarray(R_all[0], dtype=float)
+
+        per_run_delta = (
+            per_run_spec.get("delta_deg") if isinstance(per_run_spec, dict) else None
+        )
+        per_run_motor = (
+            str(per_run_spec.get("motor") or "")
+            if isinstance(per_run_spec, dict)
+            else ""
+        )
+        per_run_trans_m = (
+            per_run_spec.get("trans_m") if isinstance(per_run_spec, dict) else None
+        )
+        harm_motor_col: int | None = None
+        if isinstance(harmonics_spec, dict) and harmonics_spec.get("motor"):
+            hm_low = str(harmonics_spec["motor"]).lower()
+            for idx_nm, nm_s in enumerate(decoded_gonio_names):
+                if hm_low in nm_s.lower():
+                    harm_motor_col = idx_nm
+                    break
+
         for ur_i in range(n_runs_total):
             f0_r = (
                 int(offsets[ur_i])
                 if offsets is not None and 0 <= ur_i < len(offsets)
                 else ur_i
             )
-            if R_all is not None and R_all.ndim == 3 and len(R_all) > 0:
-                if (
-                    offsets is not None
-                    and len(R_all) == len(offsets)
-                    and 0 <= ur_i < len(R_all)
-                ):
-                    R_per_run_all[ur_i] = R_all[ur_i]
-                elif 0 <= f0_r < len(R_all):
-                    R_per_run_all[ur_i] = R_all[f0_r]
-                elif 0 <= ur_i < len(R_all):
-                    R_per_run_all[ur_i] = R_all[ur_i]
-            elif R_all is not None and R_all.ndim == 2:
-                R_per_run_all[ur_i] = R_all
+            ang_ref_r = _extract_angles_for_run(gonio_angles_ref, f0_r, ur_i)
+            ang_nom_r = _extract_angles_for_run(gonio_angles_nom, f0_r, ur_i)
+            ang_eff_r = ang_ref_r if ang_ref_r is not None else ang_nom_r
+            ref_differs_from_nom = bool(
+                ang_ref_r is not None
+                and ang_nom_r is not None
+                and not np.allclose(ang_ref_r, ang_nom_r, atol=1e-6)
+            )
             if (
-                ur_i not in R_per_run_all
-                and gonio_axes is not None
-                and gonio_angles_nom is not None
-                and gonio_angles_nom.ndim == 2
-                and 0 <= f0_r < len(gonio_angles_nom)
+                ang_eff_r is not None
+                and not ref_differs_from_nom
+                and per_run_delta is not None
+                and per_run_motor
+                and 0 <= ur_i < len(per_run_delta)
             ):
+                ang_eff_r = ang_eff_r.copy()
+                pm_low = per_run_motor.lower()
+                for ax_i, nm_s in enumerate(decoded_gonio_names):
+                    if ax_i < len(ang_eff_r) and pm_low in nm_s.lower():
+                        ang_eff_r[ax_i] += float(per_run_delta[ur_i])
+                        ref_differs_from_nom = True
+
+            R_cand_all = _extract_R_from_R_all(f0_r, ur_i)
+            R_kin_r: np.ndarray | None = None
+            s_kin_r: np.ndarray | None = None
+            if gonio_axes is not None and n_axes_g > 0 and ang_eff_r is not None:
                 with contextlib.suppress(
                     ImportError, RuntimeError, ValueError, TypeError, IndexError
                 ):
@@ -2621,9 +3051,97 @@ def _extract_from_h5(
                         calc_goniometer_rotation_matrix,
                     )
 
-                    R_per_run_all[ur_i] = calc_goniometer_rotation_matrix(
-                        gonio_axes, gonio_angles_nom[f0_r]
+                    true_ang_r = ang_eff_r + gonio_zero_offs[:n_axes_g]
+                    R_kin_r = calc_goniometer_rotation_matrix(gonio_axes, true_ang_r)
+                    offsets_full_r = np.zeros((n_axes_g, 3), dtype=float)
+                    if sample_offset_raw is not None:
+                        if (
+                            sample_offset_raw.ndim == 2
+                            and len(sample_offset_raw) == n_axes_g
+                        ):
+                            offsets_full_r[:, :] = sample_offset_raw[:, :3]
+                        elif sample_offset_raw.size >= 3:
+                            offsets_full_r[-1, :] = sample_offset_raw.ravel()[:3]
+                    if per_run_trans_m is not None and 0 <= ur_i < len(per_run_trans_m):
+                        offsets_full_r[-1, :] += np.asarray(
+                            per_run_trans_m[ur_i], dtype=float
+                        ).ravel()[:3]
+                    s_pt = np.zeros(3, dtype=float)
+                    deg2rad = np.pi / 180.0
+                    for ax_i in reversed(range(n_axes_g)):
+                        d_vec = np.asarray(gonio_axes[ax_i][:3], dtype=float)
+                        d_nrm = float(np.linalg.norm(d_vec))
+                        if d_nrm > 0.0:
+                            d_vec = d_vec / d_nrm
+                        d_mult = (
+                            float(gonio_axes[ax_i][3])
+                            if len(gonio_axes[ax_i]) > 3
+                            else 1.0
+                        )
+                        th_i = d_mult * float(true_ang_r[ax_i]) * deg2rad
+                        K_i = np.array(
+                            [
+                                [0.0, -d_vec[2], d_vec[1]],
+                                [d_vec[2], 0.0, -d_vec[0]],
+                                [-d_vec[1], d_vec[0], 0.0],
+                            ]
+                        )
+                        R_ax = (
+                            np.eye(3)
+                            + np.sin(th_i) * K_i
+                            + (1.0 - np.cos(th_i)) * (K_i @ K_i)
+                        )
+                        s_pt = R_ax @ (s_pt + offsets_full_r[ax_i])
+                    s_kin_r = s_pt
+                    if (
+                        harm_motor_col is not None
+                        and isinstance(harmonics_spec, dict)
+                        and harm_motor_col < len(ang_eff_r)
+                    ):
+                        from subhkl.optimization import harmonic_rocking_matrices
+
+                        h_mat = harmonic_rocking_matrices(
+                            np.array([float(ang_eff_r[harm_motor_col])], dtype=float),
+                            harmonics_spec["axes"],
+                            harmonics_spec["orders"],
+                            harmonics_spec["coeffs_deg"],
+                        )
+                        if h_mat.ndim == 3 and len(h_mat) > 0:
+                            R_kin_r = np.asarray(h_mat[0], dtype=float) @ R_kin_r
+
+            has_kinematic_ref = bool(
+                has_zero_offsets
+                or has_axes_nominal
+                or ref_differs_from_nom
+                or harm_motor_col is not None
+            )
+            if R_kin_r is not None and (has_kinematic_ref or R_cand_all is None):
+                R_per_run_all[ur_i] = R_kin_r
+            elif R_cand_all is not None:
+                R_per_run_all[ur_i] = R_cand_all
+            elif R_kin_r is not None:
+                R_per_run_all[ur_i] = R_kin_r
+
+            if s_kin_r is not None and (has_kinematic_ref or R_cand_all is None):
+                s_lab_per_run_all[ur_i] = s_kin_r
+            else:
+                s_base = np.zeros(3, dtype=float)
+                if sample_offset_raw is not None:
+                    if sample_offset_raw.ndim == 2 and len(sample_offset_raw) > 0:
+                        s_base = np.asarray(
+                            sample_offset_raw[-1][:3], dtype=float
+                        ).copy()
+                    elif sample_offset_raw.size >= 3:
+                        s_base = np.asarray(
+                            sample_offset_raw.ravel()[:3], dtype=float
+                        ).copy()
+                if per_run_trans_m is not None and 0 <= ur_i < len(per_run_trans_m):
+                    s_base = (
+                        s_base
+                        + np.asarray(per_run_trans_m[ur_i], dtype=float).ravel()[:3]
                     )
+                R_use_s = R_per_run_all.get(ur_i, np.eye(3))
+                s_lab_per_run_all[ur_i] = R_use_s @ s_base
 
         def _read_predictor_banks_group(
             pf: h5py.File,
@@ -2776,6 +3294,7 @@ def _extract_from_h5(
                         "bank": bnk_a,
                         "run_index": run_a,
                         "R_per_run": R_per_run_all,
+                        "s_lab_per_run": s_lab_per_run_all,
                     }
             return frame_pred, all_pred
 
@@ -2841,6 +3360,7 @@ def _extract_from_h5(
                         else None,
                         "run_index": run_index[idx_pred_all],
                         "R_per_run": R_per_run_all,
+                        "s_lab_per_run": s_lab_per_run_all,
                     }
                     m_fr = run_index == active_frame
                 else:
@@ -2944,6 +3464,7 @@ def _extract_from_h5(
                 if careless_scale is not None and len(careless_scale) == len(peaks_xyz)
                 else None,
                 "R_per_run": R_per_run,
+                "s_lab_per_run": s_lab_per_run_all,
             }
 
         # If multi-frame dataset has per-run peaks (e.g. integrated.h5), filter to active_frame
@@ -3058,52 +3579,16 @@ def _extract_from_h5(
                 if pred_all is not None:
                     all_runs_data = pred_all
 
-        R_gonio = None
-        if R_all is not None:
-            if R_all.ndim == 3 and len(R_all) > 0:
-                if (
-                    offsets is not None
-                    and len(R_all) == len(offsets)
-                    and active_frame < len(R_all)
-                ):
-                    R_gonio = R_all[active_frame]
-                elif frame_slice is not None and frame_slice[0] < len(R_all):
-                    R_gonio = R_all[frame_slice[0]]
-                elif peaks_xyz is not None and len(R_all) == len(peaks_xyz):
+        R_gonio = R_per_run_all.get(active_frame)
+        if R_gonio is None and R_all is not None:
+            if R_all.ndim == 2:
+                R_gonio = R_all
+            elif R_all.ndim == 3 and len(R_all) > 0:
+                if peaks_xyz is not None and len(R_all) == len(peaks_xyz):
                     R_gonio = R_all
-                elif (
-                    run_index is not None
-                    and len(run_index) > 0
-                    and np.max(run_index, initial=0) < len(R_all)
-                ):
-                    R_gonio = R_all[run_index]
                 else:
                     R_gonio = R_all[0]
-            elif R_all.ndim == 2:
-                R_gonio = R_all
-        if (
-            R_gonio is None
-            and gonio_axes is not None
-            and gonio_angles_nom is not None
-            and gonio_angles_nom.ndim == 2
-            and len(gonio_angles_nom) > 0
-        ):
-            with contextlib.suppress(
-                ImportError, RuntimeError, ValueError, TypeError, IndexError
-            ):
-                from subhkl.instrument.goniometer import (
-                    calc_goniometer_rotation_matrix,
-                )
-
-                f0_ang = (
-                    frame_slice[0]
-                    if frame_slice is not None
-                    and 0 <= frame_slice[0] < len(gonio_angles_nom)
-                    else 0
-                )
-                R_gonio = calc_goniometer_rotation_matrix(
-                    gonio_axes, gonio_angles_nom[f0_ang]
-                )
+        s_lab_active = s_lab_per_run_all.get(active_frame, np.zeros(3, dtype=float))
 
         # Finder-less solve.h5 forward projection onto calibrated detector banks
         if (
@@ -3227,32 +3712,71 @@ def _extract_from_h5(
                 for bid, det in sorted(detectors.items()):
                     if int(bid) not in active_bids:
                         continue
-                    cen = np.asarray(det.center, dtype=float)
-                    uh = np.asarray(det.uhat, dtype=float)
-                    vh = np.asarray(det.vhat, dtype=float)
-                    w_d, h_d = float(det.width), float(det.height)
-                    nrm = np.cross(uh, vh)
-                    dn = kf @ nrm
-                    t_ray = np.dot(cen, nrm) / np.where(np.abs(dn) < 1e-9, -1.0, dn)
-                    hit = t_ray > 0
-                    if not np.any(hit):
-                        continue
-                    idx_h = np.flatnonzero(hit)
-                    p_hit = t_ray[idx_h, None] * kf[idx_h] - cen[None, :]
-                    um = p_hit @ uh
-                    vm = p_hit @ vh
-                    in_b = (
-                        (um >= w_d * 0.02)
-                        & (um <= w_d * 0.98)
-                        & (vm >= h_d * 0.02)
-                        & (vm <= h_d * 0.98)
+                    s_off_use = (
+                        s_lab_active
+                        if float(np.linalg.norm(s_lab_active)) > 1e-12
+                        else None
                     )
-                    if not np.any(in_b):
-                        continue
-                    idx_h = idx_h[in_b]
-                    um, vm = um[in_b], vm[in_b]
-                    pr_hit = vm / max(h_d, 1e-6) * (det.n - 1)
-                    pc_hit = um / max(w_d, 1e-6) * (det.m - 1)
+                    if hasattr(det, "reflections_mask") and hasattr(
+                        det, "pixel_to_lab"
+                    ):
+                        mask_b, pr_all_b, pc_all_b = det.reflections_mask(
+                            kf[:, 0],
+                            kf[:, 1],
+                            kf[:, 2],
+                            sample_offset=s_off_use,
+                        )
+                        if not np.any(mask_b):
+                            continue
+                        idx_h = np.flatnonzero(mask_b)
+                        pr_hit = np.asarray(pr_all_b[idx_h], dtype=float)
+                        pc_hit = np.asarray(pc_all_b[idx_h], dtype=float)
+                        m_px = max(int(getattr(det, "m", 256)) - 1, 1)
+                        n_px = max(int(getattr(det, "n", 256)) - 1, 1)
+                        in_b = (
+                            (pc_hit >= 0.02 * m_px)
+                            & (pc_hit <= 0.98 * m_px)
+                            & (pr_hit >= 0.02 * n_px)
+                            & (pr_hit <= 0.98 * n_px)
+                        )
+                        if not np.any(in_b):
+                            continue
+                        idx_h = idx_h[in_b]
+                        pr_hit = pr_hit[in_b]
+                        pc_hit = pc_hit[in_b]
+                    else:
+                        cen = np.asarray(det.center, dtype=float)
+                        uh = np.asarray(det.uhat, dtype=float)
+                        vh = np.asarray(det.vhat, dtype=float)
+                        w_d, h_d = float(det.width), float(det.height)
+                        nrm = np.cross(uh, vh)
+                        dn = kf @ nrm
+                        t_ray = np.dot(cen - s_lab_active, nrm) / np.where(
+                            np.abs(dn) < 1e-9, -1.0, dn
+                        )
+                        hit = t_ray > 0
+                        if not np.any(hit):
+                            continue
+                        idx_h = np.flatnonzero(hit)
+                        p_hit = (
+                            s_lab_active[None, :]
+                            + t_ray[idx_h, None] * kf[idx_h]
+                            - cen[None, :]
+                        )
+                        um = p_hit @ uh
+                        vm = p_hit @ vh
+                        in_b = (
+                            (um >= w_d * 0.02)
+                            & (um <= w_d * 0.98)
+                            & (vm >= h_d * 0.02)
+                            & (vm <= h_d * 0.98)
+                        )
+                        if not np.any(in_b):
+                            continue
+                        idx_h = idx_h[in_b]
+                        um, vm = um[in_b], vm[in_b]
+                        pr_hit = vm / max(h_d, 1e-6) * (det.n - 1)
+                        pc_hit = um / max(w_d, 1e-6) * (det.m - 1)
                     cls_b = pixel_class_by_bank.get(int(bid))
                     if cls_b is not None and cls_b.ndim == 2:
                         rm = np.clip(
@@ -3265,7 +3789,6 @@ def _extract_from_h5(
                         if not np.any(valid_m):
                             continue
                         idx_h = idx_h[valid_m]
-                        um, vm = um[valid_m], vm[valid_m]
                         pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
                     im_b = bank_imgs.get(int(bid))
                     if im_b is not None:
@@ -3288,11 +3811,24 @@ def _extract_from_h5(
                         peak_val = np.full(len(idx_h), 150.0, dtype=float)
                         snr = np.full(len(idx_h), 10.0, dtype=float)
 
-                    xyz_hit = (
-                        cen[None, :]
-                        + um[:, None] * uh[None, :]
-                        + vm[:, None] * vh[None, :]
-                    )
+                    if hasattr(det, "pixel_to_lab"):
+                        xyz_hit = np.asarray(
+                            det.pixel_to_lab(pr_hit, pc_hit), dtype=float
+                        )
+                        if xyz_hit.ndim == 1:
+                            xyz_hit = xyz_hit[None, :]
+                    else:
+                        cen = np.asarray(det.center, dtype=float)
+                        uh = np.asarray(det.uhat, dtype=float)
+                        vh = np.asarray(det.vhat, dtype=float)
+                        w_d, h_d = float(det.width), float(det.height)
+                        um = pc_hit / max(det.m - 1, 1) * w_d
+                        vm = pr_hit / max(det.n - 1, 1) * h_d
+                        xyz_hit = (
+                            cen[None, :]
+                            + um[:, None] * uh[None, :]
+                            + vm[:, None] * vh[None, :]
+                        )
                     total_geom_hits += len(idx_h)
                     raw_hits.append(
                         {
@@ -3392,6 +3928,8 @@ def _extract_from_h5(
             "has_predictor_h5": has_predictor_h5,
             "R_per_run_all": R_per_run_all,
             "R_gonio": R_gonio,
+            "s_lab_per_run_all": s_lab_per_run_all,
+            "sample_offset_lab": s_lab_active,
             "solve_diagnostics": solve_diagnostics,
             "pixel_class_by_bank": pixel_class_by_bank,
             "em_mask_summary": em_mask_summary,
@@ -4161,6 +4699,7 @@ def _serialize_peak_entries(
     max_peaks: int = 2500,
     peak_source: str = "predicted",
     d_min: float = 0.0,
+    sample_offset_lab: Any = None,
 ) -> list[dict[str, Any]]:
     """Serialize a set of detector peak observations for the active frame."""
     pts = np.asarray(pts, dtype=float)
@@ -4212,8 +4751,18 @@ def _serialize_peak_entries(
     if n_peaks == 0:
         return []
 
-    norms = np.linalg.norm(pts, axis=1, keepdims=True)
-    kf_hat = pts / np.maximum(norms, 1e-12)
+    if sample_offset_lab is not None:
+        s_off_arr = np.asarray(sample_offset_lab, dtype=float)
+        if s_off_arr.ndim == 1 and s_off_arr.size >= 3:
+            rays_lab = pts - s_off_arr.ravel()[:3][None, :]
+        elif s_off_arr.ndim == 2 and len(s_off_arr) == n_peaks:
+            rays_lab = pts - s_off_arr[:, :3]
+        else:
+            rays_lab = pts
+    else:
+        rays_lab = pts
+    norms = np.linalg.norm(rays_lab, axis=1, keepdims=True)
+    kf_hat = rays_lab / np.maximum(norms, 1e-12)
     q_vec = kf_hat - ki_hat[None, :]
     q_norm = np.linalg.norm(q_vec, axis=1, keepdims=True)
     g_hat = np.where(q_norm > 1e-6, q_vec / np.maximum(q_norm, 1e-12), kf_hat)
@@ -4550,6 +5099,7 @@ def _serialize_sample_peaks(
     merged_sigi_arr: np.ndarray | None = None,
     peak_source: str = "predicted",
     d_min: float = 0.0,
+    sample_offset_lab: Any = None,
 ) -> list[dict[str, Any]]:
     """Serialize multi-run sample-space reflections for the Wulff Net."""
     if (
@@ -4569,9 +5119,23 @@ def _serialize_sample_peaks(
     res_all = all_runs_data.get("careless_residual")
     scl_all = all_runs_data.get("careless_scale")
     R_per_run = all_runs_data.get("R_per_run") or {}
+    s_per_run = all_runs_data.get("s_lab_per_run") or {}
+    s_default = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else np.zeros(3, dtype=float)
+    )
 
-    norms_all = np.linalg.norm(pts_all, axis=1, keepdims=True)
-    kf_all = pts_all / np.maximum(norms_all, 1e-12)
+    rays_all = np.copy(pts_all)
+    if s_per_run or float(np.linalg.norm(s_default)) > 1e-12:
+        for ur in np.unique(r_idx_all):
+            s_u = s_per_run.get(int(ur), s_default)
+            m_u = r_idx_all == ur
+            rays_all[m_u] = (
+                pts_all[m_u] - np.asarray(s_u, dtype=float).ravel()[:3][None, :]
+            )
+    norms_all = np.linalg.norm(rays_all, axis=1, keepdims=True)
+    kf_all = rays_all / np.maximum(norms_all, 1e-12)
     q_all = kf_all - ki_hat[None, :]
     qn_all = np.linalg.norm(q_all, axis=1, keepdims=True)
     g_lab_all = np.where(qn_all > 1e-6, q_all / np.maximum(qn_all, 1e-12), kf_all)
@@ -4813,6 +5377,11 @@ def build_rainbow_zone_payload(
         predicted_all_runs_data = extracted.get("predicted_all_runs_data")
         has_predictor_h5 = bool(extracted.get("has_predictor_h5"))
         R_per_run_all = dict(extracted.get("R_per_run_all") or {})
+        s_lab_per_run_all = dict(extracted.get("s_lab_per_run_all") or {})
+        s_lab_single = np.asarray(
+            extracted.get("sample_offset_lab", np.zeros(3, dtype=float)),
+            dtype=float,
+        ).ravel()[:3]
         solve_diagnostics = extracted.get("solve_diagnostics")
         pixel_class_by_bank = extracted.get("pixel_class_by_bank")
         em_mask_summary = extracted.get("em_mask_summary") or {"available": False}
@@ -4830,6 +5399,11 @@ def build_rainbow_zone_payload(
         cell = fallback_cell
         if peaks_xyz is None and ub_matrix is None and U is None:
             artifact_kind = "empty"
+        s_lab_per_run_all = {}
+        s_lab_single = np.zeros(3, dtype=float)
+    else:
+        s_lab_per_run_all = {}
+        s_lab_single = np.zeros(3, dtype=float)
     if wavelength_range is None:
         wavelength_range = _get_instrument_default_wavelength(instrument)
 
@@ -4919,6 +5493,7 @@ def build_rainbow_zone_payload(
         max_peaks=primary_max_peaks,
         peak_source=primary_source,
         d_min=d_min_use,
+        sample_offset_lab=s_lab_single,
     )
 
     sample_peaks = _serialize_sample_peaks(
@@ -4934,6 +5509,7 @@ def build_rainbow_zone_payload(
         merged_sigi_arr=merged_sigi_arr,
         peak_source=primary_source,
         d_min=d_min_use,
+        sample_offset_lab=s_lab_single,
     )
 
     if is_integrated_artifact:
@@ -4995,6 +5571,8 @@ def build_rainbow_zone_payload(
                     detectors,
                     (wl_min, wl_max),
                     ki=ki_hat,
+                    sample_offset_lab=s_lab_single,
+                    margin_frac=0.0,
                 )
                 if len(ray_fr["peaks_xyz"]) > len(
                     (predicted_frame_data or {}).get("peaks_xyz", [])
@@ -5021,6 +5599,7 @@ def build_rainbow_zone_payload(
                         )
                         for r_i in range(len(frames_meta)):
                             R_ri = R_per_run_all.get(r_i, R_single)
+                            s_ri = s_lab_per_run_all.get(r_i, s_lab_single)
                             ray_r = (
                                 ray_fr
                                 if r_i == active_frame
@@ -5032,6 +5611,8 @@ def build_rainbow_zone_payload(
                                     detectors,
                                     (wl_min, wl_max),
                                     ki=ki_hat,
+                                    sample_offset_lab=s_ri,
+                                    margin_frac=0.0,
                                 )
                             )
                             n_rr = len(ray_r["peaks_xyz"])
@@ -5065,6 +5646,7 @@ def build_rainbow_zone_payload(
                                 "bank": bnk_pa,
                                 "run_index": run_pa,
                                 "R_per_run": R_per_run_all,
+                                "s_lab_per_run": s_lab_per_run_all,
                             }
 
         if (
@@ -5096,6 +5678,7 @@ def build_rainbow_zone_payload(
                 max_peaks=max(int(max_peaks), 12000),
                 peak_source="predicted",
                 d_min=d_min_use,
+                sample_offset_lab=s_lab_single,
             )
             predicted_sample_peaks = _serialize_sample_peaks(
                 predicted_all_runs_data,
@@ -5108,6 +5691,7 @@ def build_rainbow_zone_payload(
                 cell=cell,
                 peak_source="predicted",
                 d_min=d_min_use,
+                sample_offset_lab=s_lab_single,
             )
         else:
             predicted_peaks = []
@@ -5336,14 +5920,29 @@ def build_rainbow_zone_payload(
     for bk_k, det_v in sorted(detectors.items()):
         cfg_d = getattr(det_v, "config", None)
         if isinstance(cfg_d, dict):
+            raw_pt = str(
+                cfg_d.get("panel") or cfg_d.get("panel_type") or "flat"
+            ).lower()
+            is_curved_d = raw_pt in ("curved", "cylindrical")
             det_entry: dict[str, Any] = {
-                "panel_type": str(cfg_d.get("panel_type", "flat")),
+                "panel": "curved" if is_curved_d else "flat",
+                "panel_type": str(
+                    cfg_d.get("panel_type")
+                    or ("cylindrical" if is_curved_d else "flat")
+                ),
                 "m": int(cfg_d.get("m", getattr(det_v, "m", 256))),
                 "n": int(cfg_d.get("n", getattr(det_v, "n", 256))),
             }
-            for vec_k in ("center", "uhat", "vhat", "axis_offset", "axis_direction"):
+            for vec_k in (
+                "center",
+                "uhat",
+                "vhat",
+                "rhat",
+                "axis_offset",
+                "axis_direction",
+            ):
                 if vec_k in cfg_d and cfg_d[vec_k] is not None:
-                    det_entry[vec_k] = [round(float(x), 6) for x in cfg_d[vec_k]]
+                    det_entry[vec_k] = [round(float(x), 8) for x in cfg_d[vec_k]]
             for scl_k in (
                 "width",
                 "height",
@@ -5355,16 +5954,26 @@ def build_rainbow_zone_payload(
                 "y_max",
             ):
                 if scl_k in cfg_d and cfg_d[scl_k] is not None:
-                    det_entry[scl_k] = round(float(cfg_d[scl_k]), 6)
+                    det_entry[scl_k] = round(float(cfg_d[scl_k]), 8)
             detector_configs[str(bk_k)] = det_entry
 
     gonio_R_per_run_payload = {
-        str(int(rk)): [[round(float(v), 6) for v in row] for row in rm]
+        str(int(rk)): [[round(float(v), 8) for v in row] for row in rm]
         for rk, rm in sorted(R_per_run_all.items())
     }
     if str(int(active_frame)) not in gonio_R_per_run_payload:
         gonio_R_per_run_payload[str(int(active_frame))] = [
-            [round(float(v), 6) for v in row] for row in R_single
+            [round(float(v), 8) for v in row] for row in R_single
+        ]
+    sample_offset_per_run_payload = {
+        str(int(rk)): [
+            round(float(v), 8) for v in np.asarray(sv, dtype=float).ravel()[:3]
+        ]
+        for rk, sv in sorted(s_lab_per_run_all.items())
+    }
+    if str(int(active_frame)) not in sample_offset_per_run_payload:
+        sample_offset_per_run_payload[str(int(active_frame))] = [
+            round(float(v), 8) for v in s_lab_single
         ]
 
     from subhkl.config import beamlines as _cfg_beamlines
@@ -5372,22 +5981,29 @@ def build_rainbow_zone_payload(
     beamline_detectors: dict[str, dict[str, Any]] = {}
     for _inst_k in ("CG4D", "MANDI", "TOPAZ", "IMAGINE"):
         if _inst_k in _cfg_beamlines:
-            beamline_detectors[_inst_k] = {
-                str(bk): {
-                    "center": [round(float(x), 5) for x in cfg["center"]],
-                    "uhat": [round(float(x), 5) for x in cfg["uhat"]],
-                    "vhat": [round(float(x), 5) for x in cfg["vhat"]],
-                    "width": round(float(cfg["width"]), 5),
-                    "height": round(float(cfg["height"]), 5),
+            inst_entries: dict[str, Any] = {}
+            for bk, cfg in _cfg_beamlines[_inst_k].items():
+                if not isinstance(cfg, dict):
+                    continue
+                raw_bpt = str(
+                    cfg.get("panel") or cfg.get("panel_type") or "flat"
+                ).lower()
+                is_crv_b = raw_bpt in ("curved", "cylindrical")
+                b_entry: dict[str, Any] = {
+                    "panel": "curved" if is_crv_b else "flat",
+                    "panel_type": "cylindrical" if is_crv_b else "flat",
                     "m": int(cfg.get("m", 256)),
                     "n": int(cfg.get("n", 256)),
                 }
-                for bk, cfg in _cfg_beamlines[_inst_k].items()
-                if isinstance(cfg, dict)
-                and "center" in cfg
-                and "uhat" in cfg
-                and "vhat" in cfg
-            }
+                for vk_b in ("center", "uhat", "vhat", "rhat"):
+                    if vk_b in cfg and cfg[vk_b] is not None:
+                        b_entry[vk_b] = [round(float(x), 6) for x in cfg[vk_b]]
+                for sk_b in ("width", "height", "radius"):
+                    if sk_b in cfg and cfg[sk_b] is not None:
+                        b_entry[sk_b] = round(float(cfg[sk_b]), 6)
+                if "center" in b_entry or "radius" in b_entry:
+                    inst_entries[str(bk)] = b_entry
+            beamline_detectors[_inst_k] = inst_entries
 
     return {
         "subhkl_version": get_subhkl_version(),
@@ -5401,28 +6017,30 @@ def build_rainbow_zone_payload(
         "peak_shape_mode": peak_shape_mode,
         "default_peak_source": default_peak_source,
         "pending_stage": pending_stage,
-        "ki": [round(float(x), 6) for x in ki_hat],
+        "ki": [round(float(x), 8) for x in ki_hat],
         "wavelength_range": [round(wl_min, 3), round(wl_max, 3)],
         "d_min": round(d_min_use, 3),
         "frame_index": int(active_frame),
         "goniometer_summary": gonio_summary,
-        "goniometer_R": [[round(float(v), 6) for v in row] for row in R_single],
+        "goniometer_R": [[round(float(v), 8) for v in row] for row in R_single],
         "goniometer_R_per_run": gonio_R_per_run_payload,
+        "sample_offset_lab": [round(float(v), 8) for v in s_lab_single],
+        "sample_offset_lab_per_run": sample_offset_per_run_payload,
         "frames": frames_meta,
         "images_h5": str(images_h5) if images_h5 else None,
         "cell": [round(float(x), 4) for x in cell] if cell else None,
         "u_matrix": (
-            [[round(float(v), 6) for v in row] for row in np.asarray(U, dtype=float)]
+            [[round(float(v), 8) for v in row] for row in np.asarray(U, dtype=float)]
             if U is not None
             else None
         ),
         "b_matrix": (
-            [[round(float(v), 6) for v in row] for row in np.asarray(B, dtype=float)]
+            [[round(float(v), 8) for v in row] for row in np.asarray(B, dtype=float)]
             if B is not None
             else None
         ),
         "ub_matrix": (
-            [[round(float(v), 6) for v in row] for row in ub_matrix]
+            [[round(float(v), 8) for v in row] for row in ub_matrix]
             if ub_matrix is not None
             else None
         ),
@@ -11690,6 +12308,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (newPayload.goniometer_summary) DATA.goniometer_summary = newPayload.goniometer_summary;
     if (Array.isArray(newPayload.goniometer_R)) DATA.goniometer_R = newPayload.goniometer_R;
     if (newPayload.goniometer_R_per_run && typeof newPayload.goniometer_R_per_run === "object") DATA.goniometer_R_per_run = newPayload.goniometer_R_per_run;
+    if (Array.isArray(newPayload.sample_offset_lab)) DATA.sample_offset_lab = newPayload.sample_offset_lab;
+    if (newPayload.sample_offset_lab_per_run && typeof newPayload.sample_offset_lab_per_run === "object") DATA.sample_offset_lab_per_run = newPayload.sample_offset_lab_per_run;
     if (newPayload.u_matrix) DATA.u_matrix = newPayload.u_matrix;
     if (newPayload.b_matrix) DATA.b_matrix = newPayload.b_matrix;
     if (newPayload.ub_matrix) DATA.ub_matrix = newPayload.ub_matrix;
@@ -11698,6 +12318,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     DATA.mtz_overlay_name = newPayload.mtz_overlay_name || null;
     DATA.mtz_overlay_reflections = newPayload.mtz_overlay_reflections || 0;
     DATA.mtz_overlay_matched = newPayload.mtz_overlay_matched || 0;
+    DATA.mtz_overlay_space_group = newPayload.mtz_overlay_space_group || null;
+    DATA.mtz_overlay_cell = newPayload.mtz_overlay_cell || null;
+    DATA.mtz_overlay_warning = newPayload.mtz_overlay_warning || null;
     DATA.default_peak_source = newPayload.default_peak_source || null;
     renderFrameSelector();
 
@@ -11901,9 +12524,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return;
     }}
     if (newPayload.mtz_overlay_name) {{
+      const escTxt = s => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      const warnHtml = newPayload.mtz_overlay_warning
+        ? ` • <span style="color:var(--accent-gold);">⚠ ${{escTxt(newPayload.mtz_overlay_warning)}}</span>`
+        : "";
       setStatusLine(
         `[MTZ REFERENCE SPOTS]`,
-        `Overlaid <strong>${{Number(newPayload.mtz_overlay_reflections || 0).toLocaleString()}}</strong> ASU reflections from <strong>${{newPayload.mtz_overlay_name}}</strong> (<strong>${{Number(newPayload.mtz_overlay_matched || 0).toLocaleString()}}</strong> spots matched on active detector geometry).`
+        `Overlaid <strong>${{Number(newPayload.mtz_overlay_reflections || 0).toLocaleString()}}</strong> ASU reflections from <strong>${{escTxt(newPayload.mtz_overlay_name)}}</strong> (<strong>${{Number(newPayload.mtz_overlay_matched || 0).toLocaleString()}}</strong> spots matched on active detector geometry)${{warnHtml}}.`
       );
       return;
     }}

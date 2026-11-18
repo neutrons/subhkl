@@ -1592,8 +1592,14 @@ def run_rbf_integrator(
             for key in copy_keys:
                 if key in f_in:
                     f_in.copy(f_in[key], f, key)
-            for k in ["goniometer/axes", "goniometer/names"]:
-                if k in f_in:
+            for k in [
+                "goniometer/axes",
+                "goniometer/names",
+                "goniometer/angles",
+                "goniometer/R",
+                "goniometer/harmonics",
+            ]:
+                if k in f_in and k not in f:
                     f_in.copy(f_in[k], f, k)
             # The refined panels travel with the peaks they positioned: the
             # predictor already carries the group forward, and without the

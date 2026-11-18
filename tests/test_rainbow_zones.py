@@ -4034,3 +4034,321 @@ def test_ndip_streaming_download_empty_history_cache_and_mtz_binary_discovery(
             matched_id = str(d["id"])
             break
     assert matched_id == "ds_user_uploaded_mtz"
+
+
+def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
+    tmp_path,
+) -> None:
+    """Verify .mtz projection matches predict_reflections_on_panel under calibrated banks, refined kinematics, and sample offsets without rescaling B."""
+    import gemmi
+    import h5py
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.instrument.detector import Detector
+    from subhkl.instrument.goniometer import (
+        calc_goniometer_rotation_matrix,
+        sample_to_lab,
+    )
+    from subhkl.instrument.physics import predict_reflections_on_panel
+    from subhkl.viz.rainbow_zones import (
+        _reconstruct_detectors_from_payload,
+        apply_mtz_to_payload,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # Active solve: monoclinic I 1 2 1 (e.g. MANDI-style cell)
+    solve_sg = "I 1 2 1"
+    solve_cell = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    B_solve_raw, _ = cartesian_matrix_metric_tensor(
+        *solve_cell[:3], *np.deg2rad(solve_cell[3:])
+    )
+    B_solve = np.asarray(B_solve_raw, dtype=float)
+    U_solve = Rotation.from_euler("zyx", [31.5, -18.2, 42.7], degrees=True).as_matrix()
+
+    # Calibrated flat bank (MANDI bank 19 shifted by +14 mm and tilted by 1.8 deg)
+    bk_id = 19
+    nom_cfg = dict(beamlines["MANDI"][str(bk_id)])
+    cal_cfg = dict(nom_cfg)
+    tilt_R = Rotation.from_euler("xyz", [1.4, -1.8, 0.9], degrees=True).as_matrix()
+    cal_cfg["center"] = (
+        np.asarray(nom_cfg["center"], dtype=float) + np.array([0.014, -0.009, 0.011])
+    ).tolist()
+    cal_cfg["uhat"] = (tilt_R @ np.asarray(nom_cfg["uhat"], dtype=float)).tolist()
+    cal_cfg["vhat"] = (tilt_R @ np.asarray(nom_cfg["vhat"], dtype=float)).tolist()
+    cal_cfg["width"] = float(nom_cfg["width"]) * 1.015
+    cal_cfg["height"] = float(nom_cfg["height"]) * 0.988
+    cal_det = Detector(cal_cfg)
+
+    # Two runs with refined goniometer zero-offset (+3.25 deg), per-run delta (-1.75 deg on run 1),
+    # and refined crystal sample displacement + per-run translation!
+    axes = np.array([[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]], dtype=float)
+    nom_angles_frames = np.array([[10.0, 5.0], [48.0, 5.0]], dtype=float)
+    zero_offs = np.array([3.25, -0.80], dtype=float)
+    per_run_delta = np.array([0.40, -1.75], dtype=float)
+    base_trans = np.array([0.0035, -0.0022, 0.0048], dtype=float)
+    per_run_trans = np.array(
+        [[0.0005, 0.0, -0.0004], [-0.0012, 0.0008, 0.0006]], dtype=float
+    )
+
+    eff_ang_0 = np.array([10.0 + per_run_delta[0], 5.0], dtype=float)
+    eff_ang_1 = np.array([48.0 + per_run_delta[1], 5.0], dtype=float)
+    R_true_0 = calc_goniometer_rotation_matrix(axes, eff_ang_0 + zero_offs)
+    R_true_1 = calc_goniometer_rotation_matrix(axes, eff_ang_1 + zero_offs)
+
+    offs_0 = np.vstack([np.zeros(3), base_trans + per_run_trans[0]])
+    offs_1 = np.vstack([np.zeros(3), base_trans + per_run_trans[1]])
+    s_lab_0 = np.asarray(
+        sample_to_lab(
+            np.zeros(3),
+            axes,
+            eff_ang_0,
+            offs_0,
+            zero_offsets=zero_offs,
+            is_vector=False,
+        ),
+        dtype=float,
+    )
+    s_lab_1 = np.asarray(
+        sample_to_lab(
+            np.zeros(3),
+            axes,
+            eff_ang_1,
+            offs_1,
+            zero_offsets=zero_offs,
+            is_vector=False,
+        ),
+        dtype=float,
+    )
+
+    wl_min, wl_max = 2.0, 4.0
+    ki_vec = np.array([0.008, -0.005, 1.0], dtype=float)
+    ki_vec = ki_vec / np.linalg.norm(ki_vec)
+
+    grid = np.mgrid[-16:17, -16:17, -16:17].reshape(3, -1).T
+    grid = grid[np.any(grid != 0, axis=1)]
+    # Restrict to I-centering allowed reflections h+k+l = 2n
+    grid = grid[((grid[:, 0] + grid[:, 1] + grid[:, 2]) % 2) == 0]
+
+    pr0, pc0, h0, k0, l0, lam0 = predict_reflections_on_panel(
+        cal_det,
+        grid[:, 0],
+        grid[:, 1],
+        grid[:, 2],
+        U_solve @ B_solve,
+        wl_min,
+        wl_max,
+        sample_offset=offs_0,
+        ki_vec=ki_vec,
+        gonio_axes=axes,
+        gonio_angles=eff_ang_0,
+        gonio_offsets=zero_offs,
+    )
+    pr1, pc1, h1, k1, l1, lam1 = predict_reflections_on_panel(
+        cal_det,
+        grid[:, 0],
+        grid[:, 1],
+        grid[:, 2],
+        U_solve @ B_solve,
+        wl_min,
+        wl_max,
+        sample_offset=offs_1,
+        ki_vec=ki_vec,
+        gonio_axes=axes,
+        gonio_angles=eff_ang_1,
+        gonio_offsets=zero_offs,
+    )
+    assert len(h0) >= 4 and len(h1) >= 4
+
+    # Write nominal merged.h5 + solved solve.h5 where goniometer/R is an UNREFINED per-peak (N_peaks, 3, 3)
+    # array (all first 6 peaks in Run 0, next 3 peaks in Run 1 — reproducing the exact f0_r bug!)
+    merged_h5 = tmp_path / "MANDI_13172_MANDI_13174_merged.h5"
+    with h5py.File(merged_h5, "w") as mf:
+        mf.attrs["instrument"] = "MANDI"
+        mf.create_dataset("images", data=np.zeros((2, 256, 256), dtype=np.float32))
+        mf.create_dataset("bank_ids", data=np.array([bk_id, bk_id], dtype=np.int32))
+        mf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        mf.create_dataset(
+            "files",
+            data=np.array([b"MANDI_13172.nxs.h5", b"MANDI_13174.nxs.h5"]),
+        )
+        gon_m = mf.create_group("goniometer")
+        gon_m.create_dataset("names", data=np.array([b"omega", b"chi"]))
+        gon_m.create_dataset("axes", data=axes)
+        gon_m.create_dataset("angles", data=nom_angles_frames)
+        mf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([wl_min, wl_max], dtype=float)
+        )
+
+    solve_h5 = tmp_path / "solve.h5"
+    R_unrefined_0 = calc_goniometer_rotation_matrix(axes, nom_angles_frames[0])
+    R_unrefined_1 = calc_goniometer_rotation_matrix(axes, nom_angles_frames[1])
+    # 6 peaks in run 0, 3 peaks in run 1 -> R_all[1] is STILL Run 0's unrefined matrix!
+    R_per_peak_unrefined = np.concatenate(
+        [
+            np.repeat(R_unrefined_0[None, :, :], 6, axis=0),
+            np.repeat(R_unrefined_1[None, :, :], 3, axis=0),
+        ],
+        axis=0,
+    )
+    pts_p0 = np.asarray(cal_det.pixel_to_lab(pr0[:6], pc0[:6]), dtype=float)
+    pts_p1 = np.asarray(cal_det.pixel_to_lab(pr1[:3], pc1[:3]), dtype=float)
+    with h5py.File(solve_h5, "w") as sf:
+        sf.attrs["instrument"] = "MANDI"
+        sf.attrs["source"] = str(merged_h5)
+        sf.create_group("beam").create_dataset("ki_vec", data=ki_vec)
+        smp = sf.create_group("sample")
+        smp.create_dataset("space_group", data=solve_sg.encode("utf-8"))
+        smp.create_dataset("cell", data=np.array(solve_cell, dtype=float))
+        smp.create_dataset("U", data=U_solve)
+        smp.create_dataset("B", data=B_solve)
+        dc = sf.create_group("detector_calibration").create_group(f"bank_{bk_id}")
+        dc.create_dataset("panel_type", data=b"flat")
+        dc.create_dataset("center", data=np.array(cal_cfg["center"], dtype=float))
+        dc.create_dataset("uhat", data=np.array(cal_cfg["uhat"], dtype=float))
+        dc.create_dataset("vhat", data=np.array(cal_cfg["vhat"], dtype=float))
+        dc.create_dataset("width", data=float(cal_cfg["width"]))
+        dc.create_dataset("height", data=float(cal_cfg["height"]))
+        dc.create_dataset("m", data=int(cal_cfg["m"]))
+        dc.create_dataset("n", data=int(cal_cfg["n"]))
+        gon = sf.create_group("goniometer")
+        gon.create_dataset("names", data=np.array([b"omega", b"chi"]))
+        gon.create_dataset("axes", data=axes)
+        gon.create_dataset("axes_nominal", data=axes)
+        gon.create_dataset("angles_nominal", data=nom_angles_frames)
+        gon.create_dataset("R", data=R_per_peak_unrefined)
+        offs_grp = gon.create_group("offsets")
+        offs_grp.create_dataset("omega", data=float(zero_offs[0]))
+        offs_grp.create_dataset("chi", data=float(zero_offs[1]))
+        gon.create_dataset("translations", data=base_trans)
+        pr_grp = gon.create_group("per_run")
+        pr_grp.create_dataset("motor", data=b"omega")
+        pr_grp.create_dataset("delta_deg", data=per_run_delta)
+        pr_grp.create_dataset("trans_m", data=per_run_trans)
+        pk = sf.create_group("peaks")
+        pk.create_dataset("xyz", data=np.vstack([pts_p0, pts_p1]))
+        pk.create_dataset("bank", data=np.full(9, bk_id, dtype=np.int32))
+        pk.create_dataset(
+            "pixel_r", data=np.concatenate([pr0[:6], pr1[:3]]).astype(float)
+        )
+        pk.create_dataset(
+            "pixel_c", data=np.concatenate([pc0[:6], pc1[:3]]).astype(float)
+        )
+        pk.create_dataset("intensity", data=np.full(9, 200.0, dtype=float))
+        pk.create_dataset("sigma", data=np.full(9, 10.0, dtype=float))
+        pk.create_dataset("h", data=np.concatenate([h0[:6], h1[:3]]).astype(np.int32))
+        pk.create_dataset("k", data=np.concatenate([k0[:6], k1[:3]]).astype(np.int32))
+        pk.create_dataset("l", data=np.concatenate([l0[:6], l1[:3]]).astype(np.int32))
+        pk.create_dataset(
+            "lambda", data=np.concatenate([lam0[:6], lam1[:3]]).astype(float)
+        )
+        pk.create_dataset("run_index", data=np.array([0] * 6 + [1] * 3, dtype=np.int32))
+
+    # Build payload on Run 1 (where the old f0_r=1 bug previously picked Run 0's unrefined matrix AND dropped calibrated bank 19!)
+    payload_r1 = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        frame_index=1,
+        d_min=0.5,
+        include_panel_images=False,
+    )
+    reconstructed = _reconstruct_detectors_from_payload(payload_r1)
+    assert bk_id in reconstructed
+    assert np.allclose(reconstructed[bk_id].center, cal_det.center, atol=1e-6)
+    assert np.allclose(np.asarray(payload_r1["goniometer_R"]), R_true_1, atol=1e-6)
+    assert np.allclose(
+        np.asarray(payload_r1["goniometer_R_per_run"]["0"]), R_true_0, atol=1e-6
+    )
+    assert np.allclose(
+        np.asarray(payload_r1["goniometer_R_per_run"]["1"]), R_true_1, atol=1e-6
+    )
+    assert np.allclose(np.asarray(payload_r1["sample_offset_lab"]), s_lab_1, atol=1e-6)
+    assert np.allclose(
+        np.asarray(payload_r1["sample_offset_lab_per_run"]["0"]), s_lab_0, atol=1e-6
+    )
+
+    # Write a foreign-symmetry MTZ (P 32 2 1, completely different cell) containing exact HKLs from Run 1 & Run 0
+    mtz_foreign = gemmi.Mtz(with_base=True)
+    mtz_foreign.spacegroup = gemmi.find_spacegroup_by_name("P 32 2 1")
+    mtz_foreign.set_cell_for_all(gemmi.UnitCell(19.9, 19.9, 140.0, 90.0, 90.0, 120.0))
+    mtz_foreign.add_dataset("foreign")
+    mtz_foreign.add_column("I", "J")
+    mtz_foreign.add_column("SIGI", "Q")
+    chosen_hkls: list[tuple[int, int, int]] = []
+    expected_r1: dict[tuple[int, int, int], tuple[float, float, float]] = {}
+    for i_pk in range(min(5, len(h1))):
+        key_h = (int(h1[i_pk]), int(k1[i_pk]), int(l1[i_pk]))
+        if key_h not in expected_r1:
+            expected_r1[key_h] = (
+                float(pr1[i_pk]),
+                float(pc1[i_pk]),
+                float(lam1[i_pk]),
+            )
+            chosen_hkls.append(key_h)
+    mtz_foreign.set_data(
+        np.asarray(
+            [[h, k, l, 300.0, 10.0] for (h, k, l) in chosen_hkls], dtype=np.float32
+        )
+    )
+    foreign_mtz_path = tmp_path / "unrelated_trigonal.mtz"
+    mtz_foreign.write_to_file(str(foreign_mtz_path))
+
+    overlaid = apply_mtz_to_payload(
+        payload_r1, foreign_mtz_path, {"name": "unrelated_trigonal.mtz"}
+    )
+    # 1. Solve B, U, cell, and space_group stay untouched, and informational warning is emitted!
+    assert np.allclose(np.asarray(overlaid["b_matrix"]), B_solve, atol=1e-7)
+    assert np.allclose(np.asarray(overlaid["u_matrix"]), U_solve, atol=1e-7)
+    assert overlaid["space_group"] == solve_sg
+    assert np.allclose(overlaid["cell"], solve_cell, atol=1e-3)
+    assert isinstance(overlaid.get("mtz_overlay_warning"), str)
+    assert "P 32 2 1" in overlaid["mtz_overlay_warning"]
+    assert "I 1 2 1" in overlaid["mtz_overlay_warning"]
+
+    # 2. Every projected MTZ reflection matches predict_reflections_on_panel pixel (row, col) & wavelength
+    #    under the solved geometry AND has exact d_spacing = 1 / |B_solve @ hkl| (zero unit-cell rescaling or foreign-SG shear)!
+    by_hkl_b19 = {
+        tuple(int(x) for x in pk["hkl"]): pk
+        for pk in overlaid["mtz_peaks"]
+        if int(pk["bank"]) == bk_id
+    }
+    for key_h, (exp_r, exp_c, exp_lam) in expected_r1.items():
+        assert key_h in by_hkl_b19, (
+            f"Missing expected reflection {key_h} on calibrated bank {bk_id}"
+        )
+        got_pk = by_hkl_b19[key_h]
+        assert abs(float(got_pk["row"]) - exp_r) < 0.01
+        assert abs(float(got_pk["col"]) - exp_c) < 0.01
+        assert abs(float(got_pk["wavelength"]) - exp_lam) < 1e-3
+        d_true = float(1.0 / np.linalg.norm(B_solve @ np.asarray(key_h, dtype=float)))
+        assert abs(float(got_pk["d_spacing"]) - d_true) < 1e-3
+        assert float(got_pk["angular_error_deg"]) < 0.02
+
+    for pk in overlaid["mtz_peaks"]:
+        h_vec = np.asarray(pk["hkl"], dtype=float)
+        d_true_pk = float(1.0 / np.linalg.norm(B_solve @ h_vec))
+        assert abs(float(pk["d_spacing"]) - d_true_pk) < 1e-3
+
+    # 3. Loading a matching-symmetry/cell MTZ emits NO warning
+    mtz_same = gemmi.Mtz(with_base=True)
+    mtz_same.spacegroup = gemmi.find_spacegroup_by_name(solve_sg)
+    mtz_same.set_cell_for_all(gemmi.UnitCell(*solve_cell))
+    mtz_same.add_dataset("same")
+    mtz_same.add_column("I", "J")
+    mtz_same.add_column("SIGI", "Q")
+    mtz_same.set_data(
+        np.asarray(
+            [[h, k, l, 300.0, 10.0] for (h, k, l) in chosen_hkls], dtype=np.float32
+        )
+    )
+    same_mtz_path = tmp_path / "matching_monoclinic.mtz"
+    mtz_same.write_to_file(str(same_mtz_path))
+    overlaid_same = apply_mtz_to_payload(
+        payload_r1, same_mtz_path, {"name": "matching_monoclinic.mtz"}
+    )
+    assert overlaid_same["mtz_overlay_warning"] is None
+
+    html_warn = render_rainbow_html(overlaid)
+    assert "mtz_overlay_warning" in html_warn
