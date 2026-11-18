@@ -1447,7 +1447,7 @@ def apply_mtz_to_payload(
     mtz_path: str | os.PathLike,
     ds_info: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Project custom MTZ reflections into the current active UB geometry without modifying B or U."""
+    """Attach external MTZ I/SIGI data columns onto active UB reflection peaks without modifying B or U."""
     import gemmi
 
     from subhkl.core.crystallography import cartesian_matrix_metric_tensor
@@ -1669,291 +1669,367 @@ def apply_mtz_to_payload(
         inten_exp = np.zeros(0, dtype=float)
         sigma_exp = np.zeros(0, dtype=float)
 
-    detectors = _reconstruct_detectors_from_payload(payload)
-    wl_range = payload.get("wavelength_range") or [1.5, 4.5]
-    wl_min, wl_max = float(wl_range[0]), float(wl_range[1])
-    R_single = (
-        np.asarray(payload["goniometer_R"], dtype=float)
-        if payload.get("goniometer_R") is not None
-        else np.eye(3)
-    )
-    s_lab_single = (
-        np.asarray(payload["sample_offset_lab"], dtype=float).ravel()[:3]
-        if payload.get("sample_offset_lab") is not None
-        else np.zeros(3, dtype=float)
-    )
-    s_lab_per_run_raw = payload.get("sample_offset_lab_per_run") or {}
-    active_frame = int(payload.get("frame_index") or 0)
-    ki_hat = np.asarray(payload.get("ki") or [0.0, 0.0, 1.0], dtype=float)
-    ki_hat = ki_hat / max(float(np.linalg.norm(ki_hat)), 1e-12)
-
-    # Precompute crystal-frame reciprocal vectors once and discard reflections beyond the
-    # universal Bragg ceiling |G| <= 2 / lambda_min across all goniometer orientations.
-    if len(hkl_exp) > 0:
-        G_cryst_all = hkl_exp.astype(float) @ UB_curr.T
-        qn_cryst_all = np.linalg.norm(G_cryst_all, axis=1)
-        q_max_bragg = (2.0 / max(wl_min, 0.05)) + 1e-5
-        bragg_m = (qn_cryst_all > 1e-8) & (qn_cryst_all <= q_max_bragg)
-        hkl_exp = hkl_exp[bragg_m]
-        inten_exp = inten_exp[bragg_m]
-        sigma_exp = sigma_exp[bragg_m]
-        G_cryst_exp = G_cryst_all[bragg_m]
-        qn_cryst_exp = qn_cryst_all[bragg_m]
-    else:
-        G_cryst_exp = np.zeros((0, 3), dtype=float)
-        qn_cryst_exp = np.zeros(0, dtype=float)
-
-    cast_frame = _raycast_hkl_on_detectors(
-        hkl_exp,
-        U_curr,
-        B_curr,
-        R_single,
-        detectors,
-        (wl_min, wl_max),
-        ki=ki_hat,
-        sample_offset_lab=s_lab_single,
-        inten_cand=inten_exp,
-        sigma_cand=sigma_exp,
-        margin_frac=0.0,
-        G_cryst=G_cryst_exp,
-        qn_cryst=qn_cryst_exp,
-    )
-    pts_mtz = cast_frame["peaks_xyz"]
-    if len(pts_mtz) > 12000:
-        ord_m = np.sort(np.argsort(-np.abs(cast_frame["intensity"]))[:12000])
-        for k_c in cast_frame:
-            cast_frame[k_c] = cast_frame[k_c][ord_m]
-        pts_mtz = cast_frame["peaks_xyz"]
-
-    # Reconstruct raw zone axes from the active payload's zones without altering active zones/B!
-    raw_zones_curr: list[dict[str, Any]] = []
-    for z_p in payload.get("zones") or []:
-        if isinstance(z_p, dict) and isinstance(z_p.get("axis_xyz"), list):
-            ax_lab = np.asarray(z_p["axis_xyz"], dtype=float)
-            ax_cryst = (
-                np.asarray(z_p["axis_crystal_xyz"], dtype=float)
-                if isinstance(z_p.get("axis_crystal_xyz"), list)
-                else (R_single.T @ ax_lab)
-            )
-            raw_zones_curr.append(
-                {
-                    "zone_id": z_p.get("zone_id"),
-                    "uvw": z_p.get("uvw", [1, 0, 0]),
-                    "axis_xyz": ax_lab,
-                    "axis_crystal_xyz": ax_cryst,
-                    "order": int(z_p.get("order") or 1),
-                }
-            )
-    if not raw_zones_curr:
-        raw_zones_curr, _ = _compute_zones_payload_for_geometry(
-            pts_mtz,
-            ub_matrix=UB_curr,
-            R_gonio=R_single,
-            R_single=R_single,
-            ki_hat=ki_hat,
-            detectors=detectors,
+    exact_hkl_map: dict[tuple[int, int, int], tuple[float, float]] = {
+        (int(hkl_exp[idx_e, 0]), int(hkl_exp[idx_e, 1]), int(hkl_exp[idx_e, 2])): (
+            float(inten_exp[idx_e]),
+            float(sigma_exp[idx_e]),
         )
-
-    mtz_peaks = _serialize_peak_entries(
-        pts_mtz,
-        bank_arr=cast_frame["bank"],
-        pixel_r_arr=cast_frame["pixel_r"],
-        pixel_c_arr=cast_frame["pixel_c"],
-        intensity_arr=cast_frame["intensity"],
-        sigma_arr=cast_frame["sigma"],
-        var_u_arr=None,
-        var_v_arr=None,
-        cov_uv_arr=None,
-        hkl_arr=cast_frame["hkl"],
-        lam_arr=cast_frame["wavelength"],
-        ub_matrix=UB_curr,
-        R_gonio=R_single,
-        ki_hat=ki_hat,
-        sample_offset_lab=s_lab_single,
-        wavelength_range=(wl_min, wl_max),
-        space_group=active_sg_name,
-        cell=active_cell,
-        detectors=detectors,
-        raw_zones=raw_zones_curr,
-        active_frame=active_frame,
-        merged_i_arr=cast_frame["intensity"],
-        merged_sigi_arr=cast_frame["sigma"],
-        max_peaks=12000,
-        peak_source="mtz",
-        d_min=float(payload.get("d_min") or 0.0),
-    )
-
-    frames_meta = payload.get("frames") or []
-    r_per_run_raw = payload.get("goniometer_R_per_run") or {}
-    if len(frames_meta) > 1 and isinstance(r_per_run_raw, dict) and r_per_run_raw:
-        all_xyz, all_hkl, all_lam, all_bnk, all_int, all_sig, all_run = (
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-            [],
-        )
-        r_per_run_np: dict[int, np.ndarray] = {}
-        s_per_run_np: dict[int, np.ndarray] = {}
-        for r_k, r_mat_v in sorted(r_per_run_raw.items(), key=lambda kv: int(kv[0])):
-            r_i = int(r_k)
-            R_r = np.asarray(r_mat_v, dtype=float)
-            r_per_run_np[r_i] = R_r
-            s_r_raw = (
-                s_lab_per_run_raw.get(str(r_i))
-                if isinstance(s_lab_per_run_raw, dict)
-                else None
-            )
-            s_r = (
-                np.asarray(s_r_raw, dtype=float).ravel()[:3]
-                if s_r_raw is not None
-                else s_lab_single
-            )
-            s_per_run_np[r_i] = s_r
-            c_r = _raycast_hkl_on_detectors(
-                hkl_exp,
-                U_curr,
-                B_curr,
-                R_r,
-                detectors,
-                (wl_min, wl_max),
-                ki=ki_hat,
-                sample_offset_lab=s_r,
-                inten_cand=inten_exp,
-                sigma_cand=sigma_exp,
-                margin_frac=0.0,
-                G_cryst=G_cryst_exp,
-                qn_cryst=qn_cryst_exp,
-            )
-            if len(c_r["peaks_xyz"]) > 0:
-                all_xyz.append(c_r["peaks_xyz"])
-                all_hkl.append(c_r["hkl"])
-                all_lam.append(c_r["wavelength"])
-                all_bnk.append(c_r["bank"])
-                all_int.append(c_r["intensity"])
-                all_sig.append(c_r["sigma"])
-                all_run.append(np.full(len(c_r["peaks_xyz"]), r_i, dtype=int))
-        if all_xyz:
-            pts_all_m = np.concatenate(all_xyz, axis=0)
-            hkl_all_m = np.concatenate(all_hkl, axis=0)
-            lam_all_m = np.concatenate(all_lam, axis=0)
-            bnk_all_m = np.concatenate(all_bnk, axis=0)
-            int_all_m = np.concatenate(all_int, axis=0)
-            sig_all_m = np.concatenate(all_sig, axis=0)
-            run_all_m = np.concatenate(all_run, axis=0)
-            # Every run observing the same crystal (h, k, l) maps to the exact same 3D unit vector
-            # on the Wulff sphere. Deduplicate active_frame hits across overlapping adjacent banks
-            # plus one strongest-|I|/sigma entry per additional unique crystal (h, k, l) across other runs.
-            is_act = run_all_m == active_frame
-            act_idx_raw = np.flatnonzero(is_act)
-            if len(act_idx_raw) > 0:
-                snr_act = np.abs(int_all_m[act_idx_raw]) / np.maximum(
-                    sig_all_m[act_idx_raw], 1e-3
-                )
-                act_sorted = act_idx_raw[np.argsort(-snr_act, kind="mergesort")]
-                _, act_first = np.unique(
-                    hkl_all_m[act_sorted], axis=0, return_index=True
-                )
-                act_idx = np.sort(act_sorted[act_first])
-            else:
-                act_idx = act_idx_raw
-            oth_idx = np.flatnonzero(~is_act)
-            if len(oth_idx) > 0:
-                snr_oth = np.abs(int_all_m[oth_idx]) / np.maximum(
-                    sig_all_m[oth_idx], 1e-3
-                )
-                oth_sorted = oth_idx[np.argsort(-snr_oth, kind="mergesort")]
-                _, oth_first = np.unique(
-                    hkl_all_m[oth_sorted], axis=0, return_index=True
-                )
-                oth_uniq = oth_sorted[oth_first]
-                if len(act_idx) > 0:
-                    act_set = {
-                        (int(r[0]), int(r[1]), int(r[2])) for r in hkl_all_m[act_idx]
-                    }
-                    oth_keep = np.array(
-                        [
-                            idx_o
-                            for idx_o in oth_uniq
-                            if (
-                                int(hkl_all_m[idx_o, 0]),
-                                int(hkl_all_m[idx_o, 1]),
-                                int(hkl_all_m[idx_o, 2]),
-                            )
-                            not in act_set
-                        ],
-                        dtype=int,
-                    )
-                    keep_m = (
-                        np.sort(np.concatenate([act_idx, oth_keep]))
-                        if len(oth_keep) > 0
-                        else act_idx
-                    )
-                else:
-                    keep_m = np.sort(oth_uniq)
-            else:
-                keep_m = act_idx
-            pts_all_m = pts_all_m[keep_m]
-            hkl_all_m = hkl_all_m[keep_m]
-            lam_all_m = lam_all_m[keep_m]
-            bnk_all_m = bnk_all_m[keep_m]
-            int_all_m = int_all_m[keep_m]
-            sig_all_m = sig_all_m[keep_m]
-            run_all_m = run_all_m[keep_m]
-            if len(pts_all_m) > 8000:
-                # Always retain active_frame hits if within 8000, filling remaining budget by |I|
-                is_act2 = run_all_m == active_frame
-                act2 = np.flatnonzero(is_act2)
-                oth2 = np.flatnonzero(~is_act2)
-                if 0 < len(act2) < 8000:
-                    rem_b = 8000 - len(act2)
-                    oth_top = oth2[np.argsort(-np.abs(int_all_m[oth2]))[:rem_b]]
-                    top_m = np.sort(np.concatenate([act2, oth_top]))
-                else:
-                    top_m = np.sort(np.argsort(-np.abs(int_all_m))[:8000])
-                pts_all_m = pts_all_m[top_m]
-                hkl_all_m = hkl_all_m[top_m]
-                lam_all_m = lam_all_m[top_m]
-                bnk_all_m = bnk_all_m[top_m]
-                int_all_m = int_all_m[top_m]
-                sig_all_m = sig_all_m[top_m]
-                run_all_m = run_all_m[top_m]
-            mtz_sample_peaks = _serialize_sample_peaks(
-                {
-                    "peaks_xyz": pts_all_m,
-                    "hkl": hkl_all_m,
-                    "wavelength": lam_all_m,
-                    "intensity": int_all_m,
-                    "sigma": sig_all_m,
-                    "bank": bnk_all_m,
-                    "run_index": run_all_m,
-                    "R_per_run": r_per_run_np,
-                    "s_lab_per_run": s_per_run_np,
-                },
-                fallback_peaks=mtz_peaks,
-                n_frames=len(frames_meta),
-                ki_hat=ki_hat,
-                R_single=R_single,
-                sample_offset_lab=s_lab_single,
-                wavelength_range=(wl_min, wl_max),
-                space_group=active_sg_name,
-                cell=active_cell,
-                merged_i_arr=int_all_m,
-                merged_sigi_arr=sig_all_m,
-                peak_source="mtz",
-                d_min=float(payload.get("d_min") or 0.0),
-            )
-        else:
-            mtz_sample_peaks = mtz_peaks
-    else:
-        mtz_sample_peaks = mtz_peaks
+        for idx_e in range(len(hkl_exp))
+    }
 
     out = dict(payload)
-    # Annotate existing predicted / integrated peak sets with merged_i/sigi where matching ASU HKL exists,
-    # while strictly preserving active U, B, UB, cell, space_group, and zones.
+
+    # Strip any prior synthetic mtz_only reflections so loading a second MTZ starts clean
+    for pred_key in ("predicted_peaks", "predicted_sample_peaks"):
+        pk_prev = out.get(pred_key)
+        if isinstance(pk_prev, list):
+            out[pred_key] = [
+                p for p in pk_prev if isinstance(p, dict) and not p.get("mtz_only")
+            ]
+
+    # Restrict MTZ projections strictly to detector panels on which predicted peaks also project
+    pred_panel_banks: set[int] = {
+        int(pk["bank"])
+        for pred_key in ("predicted_peaks", "predicted_sample_peaks")
+        for pk in (out.get(pred_key) or [])
+        if isinstance(pk, dict) and "bank" in pk
+    }
+    has_real_panel_images = out.get("intensity_source") == "raw_h5"
+    panel_image_banks: set[int] = (
+        {
+            int(pan["bank"])
+            for pan in (out.get("panels") or [])
+            if isinstance(pan, dict)
+            and "bank" in pan
+            and (pan.get("texture_b64") or pan.get("image_b64"))
+        }
+        if has_real_panel_images
+        else set()
+    )
+    if pred_panel_banks:
+        active_panel_banks = (
+            (pred_panel_banks & panel_image_banks)
+            if (panel_image_banks and (pred_panel_banks & panel_image_banks))
+            else pred_panel_banks
+        )
+    elif panel_image_banks:
+        active_panel_banks = panel_image_banks
+    else:
+        active_panel_banks = {
+            int(pan["bank"])
+            for pan in (out.get("panels") or [])
+            if isinstance(pan, dict) and "bank" in pan
+        }
+
+    had_existing_pred = bool(out.get("predicted_peaks"))
+    had_existing_samp = bool(out.get("predicted_sample_peaks"))
+
+    # Forward-project ONLY MTZ HKLs not already present in predicted_peaks / predicted_sample_peaks,
+    # strictly onto active_panel_banks (never onto panels where predicted peaks do not project).
+    # When full predictions are already loaded, existing_pred_hkls / existing_samp_hkls already cover
+    # every in-band reflection on active_panel_banks, so this stays near-instant with zero duplicates.
+    if len(hkl_exp) > 0:
+        detectors_all = _reconstruct_detectors_from_payload(out)
+        if not active_panel_banks:
+            active_panel_banks = {int(k) for k in detectors_all}
+
+        wl_range = out.get("wavelength_range") or [1.5, 4.5]
+        wl_min, wl_max = float(wl_range[0]), float(wl_range[1])
+        R_single = (
+            np.asarray(out["goniometer_R"], dtype=float)
+            if out.get("goniometer_R") is not None
+            else np.eye(3)
+        )
+        s_lab_single = (
+            np.asarray(out["sample_offset_lab"], dtype=float).ravel()[:3]
+            if out.get("sample_offset_lab") is not None
+            else np.zeros(3, dtype=float)
+        )
+        s_lab_per_run_raw = out.get("sample_offset_lab_per_run") or {}
+        active_frame = int(out.get("frame_index") or 0)
+        ki_hat = np.asarray(out.get("ki") or [0.0, 0.0, 1.0], dtype=float)
+        ki_hat = ki_hat / max(float(np.linalg.norm(ki_hat)), 1e-12)
+        q_max_bragg = (2.0 / max(wl_min, 0.05)) + 1e-5
+
+        raw_zones_curr: list[dict[str, Any]] = []
+        for z_p in out.get("zones") or []:
+            if isinstance(z_p, dict) and isinstance(z_p.get("axis_xyz"), list):
+                ax_lab = np.asarray(z_p["axis_xyz"], dtype=float)
+                ax_cryst = (
+                    np.asarray(z_p["axis_crystal_xyz"], dtype=float)
+                    if isinstance(z_p.get("axis_crystal_xyz"), list)
+                    else (R_single.T @ ax_lab)
+                )
+                raw_zones_curr.append(
+                    {
+                        "zone_id": z_p.get("zone_id"),
+                        "uvw": z_p.get("uvw", [1, 0, 0]),
+                        "axis_xyz": ax_lab,
+                        "axis_crystal_xyz": ax_cryst,
+                        "order": int(z_p.get("order") or 1),
+                    }
+                )
+
+        existing_pred_hkls: set[tuple[int, int, int]] = {
+            (int(pk["hkl"][0]), int(pk["hkl"][1]), int(pk["hkl"][2]))
+            for pk in (out.get("predicted_peaks") or [])
+            if isinstance(pk, dict)
+            and isinstance(pk.get("hkl"), list)
+            and len(pk["hkl"]) == 3
+        }
+        if existing_pred_hkls:
+            keep_miss = np.array(
+                [
+                    (
+                        int(hkl_exp[idx_m, 0]),
+                        int(hkl_exp[idx_m, 1]),
+                        int(hkl_exp[idx_m, 2]),
+                    )
+                    not in existing_pred_hkls
+                    for idx_m in range(len(hkl_exp))
+                ],
+                dtype=bool,
+            )
+            hkl_miss = hkl_exp[keep_miss]
+            inten_miss = inten_exp[keep_miss]
+            sigma_miss = sigma_exp[keep_miss]
+        else:
+            hkl_miss = hkl_exp
+            inten_miss = inten_exp
+            sigma_miss = sigma_exp
+
+        extra_pred: list[dict[str, Any]] = []
+        if len(hkl_miss) > 0 and detectors_all and active_panel_banks:
+            G_cryst_all = hkl_miss.astype(float) @ UB_curr.T
+            qn_cryst_all = np.linalg.norm(G_cryst_all, axis=1)
+            bragg_m = (qn_cryst_all > 1e-8) & (qn_cryst_all <= q_max_bragg)
+            hkl_miss = hkl_miss[bragg_m]
+            inten_miss = inten_miss[bragg_m]
+            sigma_miss = sigma_miss[bragg_m]
+            G_cryst_miss = G_cryst_all[bragg_m]
+            qn_cryst_miss = qn_cryst_all[bragg_m]
+
+            if len(hkl_miss) > 0:
+                cast_frame = _raycast_hkl_on_detectors(
+                    hkl_miss,
+                    U_curr,
+                    B_curr,
+                    R_single,
+                    detectors_all,
+                    (wl_min, wl_max),
+                    ki=ki_hat,
+                    sample_offset_lab=s_lab_single,
+                    active_bids=active_panel_banks,
+                    inten_cand=inten_miss,
+                    sigma_cand=sigma_miss,
+                    margin_frac=0.0,
+                    G_cryst=G_cryst_miss,
+                    qn_cryst=qn_cryst_miss,
+                )
+                pts_miss = cast_frame["peaks_xyz"]
+                if not raw_zones_curr and len(pts_miss) > 0:
+                    raw_zones_curr, _ = _compute_zones_payload_for_geometry(
+                        pts_miss,
+                        ub_matrix=UB_curr,
+                        R_gonio=R_single,
+                        R_single=R_single,
+                        ki_hat=ki_hat,
+                        detectors=detectors_all,
+                    )
+                if len(pts_miss) > 0:
+                    extra_pred = _serialize_peak_entries(
+                        pts_miss,
+                        bank_arr=cast_frame["bank"],
+                        pixel_r_arr=cast_frame["pixel_r"],
+                        pixel_c_arr=cast_frame["pixel_c"],
+                        intensity_arr=cast_frame["intensity"],
+                        sigma_arr=cast_frame["sigma"],
+                        var_u_arr=None,
+                        var_v_arr=None,
+                        cov_uv_arr=None,
+                        hkl_arr=cast_frame["hkl"],
+                        lam_arr=cast_frame["wavelength"],
+                        ub_matrix=UB_curr,
+                        R_gonio=R_single,
+                        ki_hat=ki_hat,
+                        sample_offset_lab=s_lab_single,
+                        wavelength_range=(wl_min, wl_max),
+                        space_group=active_sg_name,
+                        cell=active_cell,
+                        detectors=detectors_all,
+                        raw_zones=raw_zones_curr,
+                        active_frame=active_frame,
+                        max_peaks=12000,
+                        peak_source="predicted",
+                        d_min=float(out.get("d_min") or 0.0),
+                    )
+                    base_id = len(out.get("predicted_peaks") or [])
+                    for off_i, ep in enumerate(extra_pred):
+                        ep["id"] = base_id + off_i
+                        if had_existing_pred and not same_sg:
+                            ep["mtz_only"] = True
+                    out["predicted_peaks"] = (
+                        list(out.get("predicted_peaks") or []) + extra_pred
+                    )
+
+        # Multi-run sample peaks for missing HKLs (restricted strictly to active_panel_banks)
+        frames_meta = out.get("frames") or []
+        r_per_run_raw = out.get("goniometer_R_per_run") or {}
+        if (
+            detectors_all
+            and active_panel_banks
+            and len(frames_meta) > 1
+            and isinstance(r_per_run_raw, dict)
+            and r_per_run_raw
+        ):
+            existing_samp_hkls: set[tuple[int, int, int]] = {
+                (int(pk["hkl"][0]), int(pk["hkl"][1]), int(pk["hkl"][2]))
+                for pk in (out.get("predicted_sample_peaks") or [])
+                if isinstance(pk, dict)
+                and isinstance(pk.get("hkl"), list)
+                and len(pk["hkl"]) == 3
+            }
+            if existing_samp_hkls:
+                keep_smiss = np.array(
+                    [
+                        (
+                            int(hkl_exp[idx_s, 0]),
+                            int(hkl_exp[idx_s, 1]),
+                            int(hkl_exp[idx_s, 2]),
+                        )
+                        not in existing_samp_hkls
+                        for idx_s in range(len(hkl_exp))
+                    ],
+                    dtype=bool,
+                )
+                hkl_smiss = hkl_exp[keep_smiss]
+                inten_smiss = inten_exp[keep_smiss]
+                sigma_smiss = sigma_exp[keep_smiss]
+            else:
+                hkl_smiss = hkl_exp
+                inten_smiss = inten_exp
+                sigma_smiss = sigma_exp
+
+            if len(hkl_smiss) > 0:
+                G_smiss_all = hkl_smiss.astype(float) @ UB_curr.T
+                qn_smiss_all = np.linalg.norm(G_smiss_all, axis=1)
+                bragg_sm = (qn_smiss_all > 1e-8) & (qn_smiss_all <= q_max_bragg)
+                hkl_smiss = hkl_smiss[bragg_sm]
+                inten_smiss = inten_smiss[bragg_sm]
+                sigma_smiss = sigma_smiss[bragg_sm]
+                G_smiss = G_smiss_all[bragg_sm]
+                qn_smiss = qn_smiss_all[bragg_sm]
+
+            if len(hkl_smiss) > 0:
+                all_xyz, all_hkl, all_lam, all_bnk, all_int, all_sig, all_run = (
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                )
+                r_per_run_np: dict[int, np.ndarray] = {}
+                s_per_run_np: dict[int, np.ndarray] = {}
+                for r_k, r_mat_v in sorted(
+                    r_per_run_raw.items(), key=lambda kv: int(kv[0])
+                ):
+                    r_i = int(r_k)
+                    R_r = np.asarray(r_mat_v, dtype=float)
+                    r_per_run_np[r_i] = R_r
+                    s_r_raw = (
+                        s_lab_per_run_raw.get(str(r_i))
+                        if isinstance(s_lab_per_run_raw, dict)
+                        else None
+                    )
+                    s_r = (
+                        np.asarray(s_r_raw, dtype=float).ravel()[:3]
+                        if s_r_raw is not None
+                        else s_lab_single
+                    )
+                    s_per_run_np[r_i] = s_r
+                    c_r = _raycast_hkl_on_detectors(
+                        hkl_smiss,
+                        U_curr,
+                        B_curr,
+                        R_r,
+                        detectors_all,
+                        (wl_min, wl_max),
+                        ki=ki_hat,
+                        sample_offset_lab=s_r,
+                        active_bids=active_panel_banks,
+                        inten_cand=inten_smiss,
+                        sigma_cand=sigma_smiss,
+                        margin_frac=0.0,
+                        G_cryst=G_smiss,
+                        qn_cryst=qn_smiss,
+                    )
+                    if len(c_r["peaks_xyz"]) > 0:
+                        all_xyz.append(c_r["peaks_xyz"])
+                        all_hkl.append(c_r["hkl"])
+                        all_lam.append(c_r["wavelength"])
+                        all_bnk.append(c_r["bank"])
+                        all_int.append(c_r["intensity"])
+                        all_sig.append(c_r["sigma"])
+                        all_run.append(np.full(len(c_r["peaks_xyz"]), r_i, dtype=int))
+                if all_xyz:
+                    pts_all_m = np.concatenate(all_xyz, axis=0)
+                    hkl_all_m = np.concatenate(all_hkl, axis=0)
+                    lam_all_m = np.concatenate(all_lam, axis=0)
+                    bnk_all_m = np.concatenate(all_bnk, axis=0)
+                    int_all_m = np.concatenate(all_int, axis=0)
+                    sig_all_m = np.concatenate(all_sig, axis=0)
+                    run_all_m = np.concatenate(all_run, axis=0)
+                    # Prioritize active_frame hits so any reflection visible on the current frame keeps run_index == active_frame
+                    prio_m = np.argsort(
+                        np.where(run_all_m == active_frame, 0, 1), kind="mergesort"
+                    )
+                    pts_all_m = pts_all_m[prio_m]
+                    hkl_all_m = hkl_all_m[prio_m]
+                    lam_all_m = lam_all_m[prio_m]
+                    bnk_all_m = bnk_all_m[prio_m]
+                    int_all_m = int_all_m[prio_m]
+                    sig_all_m = sig_all_m[prio_m]
+                    run_all_m = run_all_m[prio_m]
+                    _, u_first = np.unique(hkl_all_m, axis=0, return_index=True)
+                    u_keep = np.sort(u_first)[:8000]
+                    extra_samp = _serialize_sample_peaks(
+                        {
+                            "peaks_xyz": pts_all_m[u_keep],
+                            "hkl": hkl_all_m[u_keep],
+                            "wavelength": lam_all_m[u_keep],
+                            "intensity": int_all_m[u_keep],
+                            "sigma": sig_all_m[u_keep],
+                            "bank": bnk_all_m[u_keep],
+                            "run_index": run_all_m[u_keep],
+                            "R_per_run": r_per_run_np,
+                            "s_lab_per_run": s_per_run_np,
+                        },
+                        fallback_peaks=extra_pred,
+                        n_frames=len(frames_meta),
+                        ki_hat=ki_hat,
+                        R_single=R_single,
+                        sample_offset_lab=s_lab_single,
+                        wavelength_range=(wl_min, wl_max),
+                        space_group=active_sg_name,
+                        cell=active_cell,
+                        peak_source="predicted",
+                        d_min=float(out.get("d_min") or 0.0),
+                    )
+                    for esp in extra_samp:
+                        if had_existing_samp and not same_sg:
+                            esp["mtz_only"] = True
+                    out["predicted_sample_peaks"] = (
+                        list(out.get("predicted_sample_peaks") or []) + extra_samp
+                    )
+        elif not out.get("predicted_sample_peaks"):
+            out["predicted_sample_peaks"] = list(out.get("predicted_peaks") or [])
+
+    # Annotate predicted & integrated peak sets with mtz_i / mtz_sigi / mtz_isigi data columns
+    # (filtering to active_panel_banks when panel banks are known) without altering U, B, UB, cell, or zones.
     asu_lookup_cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    matched_counts: dict[str, int] = {}
     for list_key in (
         "predicted_peaks",
         "predicted_sample_peaks",
@@ -1964,40 +2040,84 @@ def apply_mtz_to_payload(
         if not isinstance(pk_list, list):
             continue
         new_list = []
+        n_hit = 0
         for pk in pk_list:
+            if not isinstance(pk, dict):
+                continue
+            if (
+                active_panel_banks
+                and "bank" in pk
+                and int(pk["bank"]) not in active_panel_banks
+            ):
+                continue
             pk_copy = dict(pk)
-            asu_pre = pk_copy.get("asu_hkl") if same_sg else None
-            ak_t: tuple[int, int, int] | None = None
-            if isinstance(asu_pre, list) and len(asu_pre) == 3:
-                ak_t = (int(asu_pre[0]), int(asu_pre[1]), int(asu_pre[2]))
-            else:
-                hkl_v = pk_copy.get("hkl")
-                if isinstance(hkl_v, list) and len(hkl_v) == 3:
-                    hk_key = (int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2]))
-                    ak_t = asu_lookup_cache.get(hk_key)
-                    if ak_t is None:
-                        asu_k, _ = asu.to_asu(list(hk_key), ops)
-                        ak_t = (int(asu_k[0]), int(asu_k[1]), int(asu_k[2]))
-                        asu_lookup_cache[hk_key] = ak_t
-            if ak_t is not None:
-                hit = asu_map.get(ak_t)
-                if hit is not None:
-                    pk_copy["merged_i"] = round(hit[0], 2)
-                    pk_copy["merged_sigi"] = round(hit[1], 2)
+            pk_copy.pop("mtz_i", None)
+            pk_copy.pop("mtz_sigi", None)
+            pk_copy.pop("mtz_isigi", None)
+            hit: tuple[float, float] | None = None
+            hkl_v = pk_copy.get("hkl")
+            if isinstance(hkl_v, list) and len(hkl_v) == 3:
+                hk_key = (int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2]))
+                hit = exact_hkl_map.get(hk_key)
+                if hit is None and not is_unmerged_mtz:
+                    asu_pre = pk_copy.get("asu_hkl") if same_sg else None
+                    if isinstance(asu_pre, list) and len(asu_pre) == 3:
+                        ak_t = (int(asu_pre[0]), int(asu_pre[1]), int(asu_pre[2]))
+                    else:
+                        ak_t = asu_lookup_cache.get(hk_key)
+                        if ak_t is None:
+                            asu_k, _ = asu.to_asu(list(hk_key), ops)
+                            ak_t = (int(asu_k[0]), int(asu_k[1]), int(asu_k[2]))
+                            asu_lookup_cache[hk_key] = ak_t
+                    hit = asu_map.get(ak_t)
+            if hit is not None:
+                iv_m, sv_m = float(hit[0]), max(float(hit[1]), 1e-6)
+                pk_copy["mtz_i"] = round(iv_m, 2)
+                pk_copy["mtz_sigi"] = round(sv_m, 2)
+                pk_copy["mtz_isigi"] = round(max(0.0, iv_m) / sv_m, 3)
+                pk_copy["merged_i"] = round(iv_m, 2)
+                pk_copy["merged_sigi"] = round(sv_m, 2)
+                n_hit += 1
             new_list.append(pk_copy)
         out[list_key] = new_list
+        matched_counts[list_key] = n_hit
 
-    out["mtz_peaks"] = mtz_peaks
-    out["mtz_sample_peaks"] = mtz_sample_peaks
-    out["peaks"] = mtz_peaks
-    out["sample_peaks"] = mtz_sample_peaks
-    out["default_peak_source"] = "mtz"
+    has_integ = bool(out.get("integrated_peaks"))
+    has_pred = bool(out.get("predicted_peaks"))
+    prev_src = str(out.get("default_peak_source") or "").lower()
+    art_kind = str(out.get("artifact_kind") or "").lower()
+    if prev_src == "integrated" and has_integ:
+        active_src = "integrated"
+    elif prev_src == "predicted" and has_pred:
+        active_src = "predicted"
+    elif art_kind in ("integrator", "merged_careless") and has_integ:
+        active_src = "integrated"
+    elif has_pred:
+        active_src = "predicted"
+    elif has_integ:
+        active_src = "integrated"
+    else:
+        active_src = "predicted"
+
+    out.pop("mtz_peaks", None)
+    out.pop("mtz_sample_peaks", None)
+    out["default_peak_source"] = active_src
+    out["default_color_mode"] = "mtz_isigi"
+    if active_src == "integrated":
+        out["peaks"] = out.get("integrated_peaks") or []
+        out["sample_peaks"] = out.get("integrated_sample_peaks") or out["peaks"]
+    else:
+        out["peaks"] = out.get("predicted_peaks") or []
+        out["sample_peaks"] = out.get("predicted_sample_peaks") or out["peaks"]
 
     info = ds_info or {}
     mtz_name = str(info.get("name") or os.path.basename(str(mtz_path)))
     out["mtz_overlay_name"] = mtz_name
     out["mtz_overlay_reflections"] = len(asu_map)
-    out["mtz_overlay_matched"] = len(mtz_peaks)
+    out["mtz_overlay_matched"] = max(
+        matched_counts.get("predicted_peaks", 0),
+        matched_counts.get("integrated_peaks", 0),
+    )
     out["mtz_overlay_space_group"] = mtz_sg_label
     out["mtz_overlay_cell"] = mtz_cell_vals
     out["mtz_overlay_warning"] = mtz_overlay_warning
@@ -5563,6 +5683,18 @@ def build_rainbow_zone_payload(
                     if B is not None
                     else U_fb.T @ np.asarray(ub_matrix, dtype=float)
                 )
+                fb_active_bids: set[int] = set()
+                if images_h5 and os.path.exists(images_h5):
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ),
+                        h5py.File(images_h5, "r") as mf_fb,
+                    ):
+                        if "images" in mf_fb and "bank_ids" in mf_fb:
+                            fb_active_bids = {
+                                int(b) for b in np.asarray(mf_fb["bank_ids"], dtype=int)
+                            }
                 ray_fr = _raycast_hkl_on_detectors(
                     hkl_theo,
                     U_fb,
@@ -5572,6 +5704,8 @@ def build_rainbow_zone_payload(
                     (wl_min, wl_max),
                     ki=ki_hat,
                     sample_offset_lab=s_lab_single,
+                    active_bids=fb_active_bids or None,
+                    pixel_class_by_bank=pixel_class_by_bank,
                     margin_frac=0.0,
                 )
                 if len(ray_fr["peaks_xyz"]) > len(
@@ -5612,6 +5746,8 @@ def build_rainbow_zone_payload(
                                     (wl_min, wl_max),
                                     ki=ki_hat,
                                     sample_offset_lab=s_ri,
+                                    active_bids=fb_active_bids or None,
+                                    pixel_class_by_bank=pixel_class_by_bank,
                                     margin_frac=0.0,
                                 )
                             )
@@ -6055,8 +6191,6 @@ def build_rainbow_zone_payload(
         "predicted_sample_peaks": predicted_sample_peaks,
         "integrated_peaks": integrated_peaks,
         "integrated_sample_peaks": integrated_sample_peaks,
-        "mtz_peaks": [],
-        "mtz_sample_peaks": [],
         "zones": zones_payload,
         "panels": panels_payload,
         "ladder_steps": ladder_steps,
@@ -7278,10 +7412,9 @@ def render_rainbow_html(
       <button id="btn-proj-toggle" class="active-btn" title="Switch between Cylindrical (CG4D: Azimuth vs Y [m]) and Spherical (MANDI: Azimuth vs Elevation [deg]) projection">
         Cyl
       </button>
-      <div id="peak-source-group" class="seg-toggle" title="Toggle displayed &amp; Wulff-projected reflections: Predicted (circles), Integrated (2σ ellipses), or custom .mtz">
+      <div id="peak-source-group" class="seg-toggle" title="Toggle displayed &amp; Wulff-projected reflections: Predicted (circles) or Integrated (2σ ellipses)">
         <button id="btn-peaks-pred" type="button" data-peak-src="predicted" class="active-btn" title="All predicted reflections within λ_min..λ_max and d ≥ d_min (circles)">○ Pred</button>
         <button id="btn-peaks-integ" type="button" data-peak-src="integrated" disabled title="Successfully integrated reflections (2σ ellipses)">⬭ Integ</button>
-        <button id="btn-peaks-mtz" type="button" data-peak-src="mtz" disabled title="Custom .mtz reflections projected into active UB geometry (preserving solved B)">.mtz</button>
       </div>
       <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
         Arcs
@@ -7322,7 +7455,7 @@ def render_rainbow_html(
     <section class="canvas-card">
       <div class="card-header">
         <span id="detector-header-title">DETECTOR ASSEMBLY — LOG(INTENSITY) + PARALLAX BRAGG RINGS</span>
-        <span class="hint">Move mouse to peek behind predicted rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
+        <span class="hint">Hold mouse button or Ctrl to peek behind rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
       </div>
       <div class="canvas-wrap" id="canvas-wrap">
         <div class="detector-pane" id="detector-pane">
@@ -7340,7 +7473,7 @@ def render_rainbow_html(
             </div>
             <div class="legend-item">
               <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
-              <span>Front Layer: Predicted Bragg Rings (parallax peeks behind spots)</span>
+              <span>Front Layer: Predicted Bragg Rings (hold Ctrl/button for parallax)</span>
             </div>
           </div>
         </div>
@@ -7352,10 +7485,11 @@ def render_rainbow_html(
             <div class="stereo-toolbar">
               <button id="btn-wulff-scope" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
               <button id="btn-wulff-friedel" class="active-btn" title="Show antipodal Friedel mates (-h,-k,-l) on the Wulff sphere (fills the θ vs 2θ hemisphere; violet symmetry links vs gold proper rotations)">±Friedel</button>
-              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, Diverging I/σ, or Careless Merge Residual">
+              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, Logarithmic I/σ, .mtz I/σ, or Careless Merge Residual">
                 <option value="wavelength">Color: λ/Zone</option>
                 <option value="orbit">Color: ASU Orbit</option>
-                <option value="isigi">Color: I/σ (Diverging)</option>
+                <option value="isigi">Color: I/σ (Log)</option>
+                <option value="mtz_isigi">Color: .mtz I/σ (Log)</option>
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
               </select>
@@ -7373,7 +7507,7 @@ def render_rainbow_html(
     <aside class="side-panel">
       <div>
         <div class="section-title">
-          <span>Detector &amp; Parallax Controls</span>
+          <span>Detector &amp; Color Controls</span>
           <span id="wl-readout">λ: {init_wl_min:.1f}–{init_wl_max:.1f} Å</span>
         </div>
         <div class="slider-group">
@@ -7384,10 +7518,10 @@ def render_rainbow_html(
           <input type="range" id="slider-det-alpha" min="0.0" max="1.0" step="0.05" value="0.85" />
 
           <div class="slider-row">
-            <span>Depth Parallax ("Peek Behind")</span>
-            <span id="lbl-parallax">1.00×</span>
+            <span>Colorscale Emphasis</span>
+            <span id="lbl-color-emphasis">Balanced</span>
           </div>
-          <input type="range" id="slider-parallax" min="0.0" max="2.5" step="0.05" value="1.00" />
+          <input type="range" id="slider-color-emphasis" min="-1.0" max="1.0" step="0.05" value="0.00" title="Emphasize strong peaks only (+1.0) vs all peaks equally (-1.0); double-click to reset" />
 
           <div class="slider-row">
             <span>Resolution Cutoff d_min [Å]</span>
@@ -7397,10 +7531,11 @@ def render_rainbow_html(
 
           <div class="slider-row" style="margin-top:2px;">
             <span>Spot Color</span>
-            <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Diverging I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
+            <select id="sel-spot-color" title="Color reflections on Detector & Wulff Net by Wavelength, ASU Orbit, Logarithmic I/σ, .mtz I/σ, or Careless Merge Residual/Scale" style="background:var(--bg-card);color:var(--accent-cyan);border:1px solid var(--border-color);border-radius:4px;padding:1px 5px;font-size:0.64rem;font-family:var(--font-display);">
               <option value="wavelength">Color: λ/Zone</option>
               <option value="orbit">Color: ASU Orbit</option>
-              <option value="isigi">Color: I/σ (Diverging)</option>
+              <option value="isigi">Color: I/σ (Log)</option>
+              <option value="mtz_isigi">Color: .mtz I/σ (Log)</option>
               <option value="residual">Color: ΔI/σ Residual</option>
               <option value="scale">Color: Scale</option>
             </select>
@@ -7744,17 +7879,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const integSample = Array.isArray(pObj.integrated_sample_peaks)
       ? [...pObj.integrated_sample_peaks]
       : (isIntegPayload ? [...baseSample] : integPeaks);
-    const mtzPeaks = Array.isArray(pObj.mtz_peaks) ? [...pObj.mtz_peaks] : [];
-    const mtzSample = Array.isArray(pObj.mtz_sample_peaks) ? [...pObj.mtz_sample_peaks] : mtzPeaks;
-    return {{ predPeaks, predSample, integPeaks, integSample, mtzPeaks, mtzSample }};
+    return {{ predPeaks, predSample, integPeaks, integSample }};
   }}
   const initBuckets = extractPeakBucketsFromPayload(DATA);
   let PREDICTED_PEAKS = initBuckets.predPeaks;
   let PREDICTED_SAMPLE_PEAKS = initBuckets.predSample;
   let INTEGRATED_PEAKS = initBuckets.integPeaks;
   let INTEGRATED_SAMPLE_PEAKS = initBuckets.integSample;
-  let MTZ_PEAKS = initBuckets.mtzPeaks;
-  let MTZ_SAMPLE_PEAKS = initBuckets.mtzSample;
   const PEAKS = [...(DATA.peaks || [])];
   const SAMPLE_PEAKS = [...(DATA.sample_peaks || PEAKS)];
   const ZONES = DATA.zones || [];
@@ -7938,6 +8069,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const isMergedInit = String(DATA.artifact_kind || "").toLowerCase() === "merged_careless" &&
     Array.isArray(PEAKS) &&
     PEAKS.some(p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual));
+  const hasInitMtz = Array.isArray(PEAKS) && PEAKS.some(p => p && typeof p.mtz_isigi === "number" && Number.isFinite(p.mtz_isigi));
+  const initColorMode = (DATA.default_color_mode === "mtz_isigi" && hasInitMtz)
+    ? "mtz_isigi"
+    : (isMergedInit ? "residual" : "wavelength");
   const state = {{
     projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
@@ -7947,7 +8082,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     hiresLoading: false,
     hiresReqSeq: 0,
     heatmapStyle: "magma",        // "magma" | "cyan" | "gray"
-    peakSource: String(DATA.default_peak_source || ((String(DATA.artifact_kind || "").toLowerCase() === "integrator" || String(DATA.artifact_kind || "").toLowerCase() === "merged_careless") ? "integrated" : "predicted")), // "predicted" | "integrated" | "mtz"
+    peakSource: String((DATA.default_peak_source && DATA.default_peak_source !== "mtz") ? DATA.default_peak_source : ((String(DATA.artifact_kind || "").toLowerCase() === "integrator" || String(DATA.artifact_kind || "").toLowerCase() === "merged_careless") ? "integrated" : "predicted")), // "predicted" | "integrated"
     detAlpha: 0.85,
     showStereo: isMergedInit,
     wulffExpanded: isMergedInit,
@@ -7955,7 +8090,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     showWulffFriedel: true,       // plot antipodal Friedel mates (-h,-k,-l) on Wulff sphere with distinct link color
     wulffFrame: "sample",         // always project in Sample frame (coupled via goniometer R)
     wulffCoupled: true,           // 360° periodic detector pan <-> Wulff yaw always coupled
-    wulffColorMode: isMergedInit ? "residual" : "wavelength", // "wavelength" | "orbit" | "isigi" | "residual" | "scale"
+    wulffColorMode: initColorMode, // "wavelength" | "orbit" | "isigi" | "mtz_isigi" | "residual" | "scale"
+    colorEmphasis: 0.0,           // -1.0 (all peaks boosted) .. 0.0 (balanced log) .. +1.0 (strong peaks only)
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
@@ -8163,7 +8299,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   // Initialize sliders & synchronized Params inputs
   const slDetAlpha = document.getElementById("slider-det-alpha");
-  const slParallax = document.getElementById("slider-parallax");
+  const slColorEmphasis = document.getElementById("slider-color-emphasis");
   const slDmin = document.getElementById("slider-dmin");
   const inpDminEl = document.getElementById("inp-dmin");
   const inpLminEl = document.getElementById("inp-lmin");
@@ -8988,109 +9124,181 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     "#38bdf8", "#84cc16", "#f43f5e", "#14b8a6", "#eab308", "#6366f1"
   ];
 
+  function applyEmphasisCurve(t0, alpha = 1.0) {{
+    const clamped = Math.max(0.0, Math.min(1.0, t0));
+    const emp = Math.max(-1.0, Math.min(1.0, Number(state.colorEmphasis) || 0.0));
+    if (Math.abs(emp) < 1e-4) {{
+      return [clamped, alpha];
+    }}
+    const gamma = Math.pow(2.0, emp * 2.1);
+    if (emp > 0.0) {{
+      const floor = 0.42 * emp;
+      const windowed = Math.max(0.0, (clamped - floor) / Math.max(0.12, 1.0 - floor));
+      const t = Math.pow(windowed, gamma);
+      const effAlpha = alpha * ((1.0 - emp) + emp * (0.12 + 0.88 * Math.pow(clamped, 0.75 + 1.25 * emp)));
+      return [t, effAlpha];
+    }}
+    const t = Math.pow(clamped, gamma);
+    const effAlpha = Math.min(1.0, alpha * (1.0 + 0.35 * (-emp)));
+    return [t, effAlpha];
+  }}
+
   // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma
   function residualToColor(resVal, alpha = 1.0) {{
     if (typeof resVal !== "number" || !Number.isFinite(resVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
     const clamped = Math.max(-3.0, Math.min(3.0, resVal));
+    const [u, effAlpha] = applyEmphasisCurve(Math.min(1.0, Math.abs(clamped) / 3.0), alpha);
     if (clamped < 0) {{
-      const u = Math.min(1.0, -clamped / 3.0);
       const r = Math.round(248 * (1 - u) + 30 * u);
       const g = Math.round(250 * (1 - u) + 170 * u);
       const b = Math.round(252 * (1 - u) + 255 * u);
-      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha}})`;
+      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{effAlpha.toFixed(3)}})`;
     }} else {{
-      const u = Math.min(1.0, clamped / 3.0);
       const r = Math.round(248 * (1 - u) + 244 * u);
       const g = Math.round(250 * (1 - u) + 63 * u);
       const b = Math.round(252 * (1 - u) + 94 * u);
-      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha}})`;
+      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{effAlpha.toFixed(3)}})`;
     }}
   }}
 
   function scaleToColor(scaleVal, alpha = 1.0) {{
     if (typeof scaleVal !== "number" || !Number.isFinite(scaleVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
-    const t = Math.max(0.0, Math.min(1.0, (Math.log10(Math.max(1e-4, scaleVal)) + 2.0) / 3.0));
+    const tRaw = Math.max(0.0, Math.min(1.0, (Math.log10(Math.max(1e-4, scaleVal)) + 2.0) / 3.0));
+    const [t, effAlpha] = applyEmphasisCurve(tRaw, alpha);
     const hue = (1.0 - t) * 195 + t * 45;
-    return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{alpha}})`;
+    return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{effAlpha.toFixed(3)}})`;
   }}
 
   function peakUnscaledIsigi(p) {{
     if (!p) return NaN;
-    if (state.peakSource === "mtz" && typeof p.merged_i === "number" && typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
-      return p.merged_i / Math.max(p.merged_sigi, 1e-6);
-    }}
     if (typeof p.intensity !== "number" || typeof p.sigma !== "number" || p.sigma <= 0) return NaN;
-    return p.intensity / Math.max(p.sigma, 1e-6);
+    return Math.max(0.0, p.intensity) / Math.max(p.sigma, 1e-6);
   }}
 
-  function activePeaksHaveNegativeIsigi() {{
-    const checkArr = arr => Array.isArray(arr) && arr.some(p => {{
-      const v = peakUnscaledIsigi(p);
-      return Number.isFinite(v) && v < -0.25;
-    }});
-    return checkArr(PEAKS) || (state.wulffScope === "all_runs" && checkArr(SAMPLE_PEAKS));
+  function peakMtzIsigi(p) {{
+    if (!p) return NaN;
+    if (typeof p.mtz_isigi === "number" && Number.isFinite(p.mtz_isigi)) {{
+      return Math.max(0.0, p.mtz_isigi);
+    }}
+    if (typeof p.mtz_i === "number" && typeof p.mtz_sigi === "number" && p.mtz_sigi > 0) {{
+      return Math.max(0.0, p.mtz_i) / Math.max(p.mtz_sigi, 1e-6);
+    }}
+    return NaN;
   }}
 
-  // Diverging Blue–White–Red colormap for I/SIGI:
-  // - When signed/negative I/σ are present (e.g. difference or weak unmerged MTZ): white neutral pivot at 0σ.
-  // - Otherwise (standard positive intensities): white neutral pivot at crystallographic 3σ detection threshold
-  //   (cool blue < 3σ weak/marginal, crisp white ≈ 3σ, warm coral/crimson red >> 3σ strong).
-  function isigiToColor(isigiVal, alpha = 1.0) {{
-    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
-    let u = 0.0;
-    if (activePeaksHaveNegativeIsigi() || isigiVal < 0.0) {{
-      const denom = Math.asinh(15.0);
-      u = Math.max(-1.0, Math.min(1.0, Math.asinh(isigiVal / 2.5) / denom));
+  let _peakDataAvailabilitySig = "";
+  let _peakDataAvailability = {{
+    hasIsigi: false,
+    hasMtzIsigi: false,
+    hasResiduals: false,
+    hasScales: false,
+    isigiTop: 40.0,
+    mtzIsigiTop: 40.0,
+  }};
+
+  function getPeakDataAvailability() {{
+    const p0 = PEAKS.length > 0 ? PEAKS[0] : null;
+    const pN = PEAKS.length > 0 ? PEAKS[PEAKS.length - 1] : null;
+    const s0 = SAMPLE_PEAKS.length > 0 ? SAMPLE_PEAKS[0] : null;
+    const sN = SAMPLE_PEAKS.length > 0 ? SAMPLE_PEAKS[SAMPLE_PEAKS.length - 1] : null;
+    const sig = `${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}`;
+    if (
+      _peakDataAvailabilitySig === sig &&
+      _peakDataAvailability._p0 === p0 &&
+      _peakDataAvailability._s0 === s0
+    ) {{
+      return _peakDataAvailability;
+    }}
+    let hasIsigi = false, hasMtz = false, hasRes = false, hasScl = false;
+    const isigiSamples = [];
+    const mtzSamples = [];
+    const scanArr = (arr) => {{
+      if (!Array.isArray(arr)) return;
+      const step = arr.length > 2400 ? Math.ceil(arr.length / 2400) : 1;
+      for (let i = 0; i < arr.length; i++) {{
+        const p = arr[i];
+        if (!p) continue;
+        if (typeof p.intensity === "number" && Number.isFinite(p.intensity) && typeof p.sigma === "number" && p.sigma > 0) {{
+          hasIsigi = true;
+          if (i % step === 0) isigiSamples.push(Math.max(0.0, p.intensity) / Math.max(p.sigma, 1e-6));
+        }}
+        const mv = peakMtzIsigi(p);
+        if (Number.isFinite(mv)) {{
+          hasMtz = true;
+          if (i % step === 0) mtzSamples.push(mv);
+        }}
+        if (!hasRes && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)) hasRes = true;
+        if (!hasScl && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)) hasScl = true;
+      }}
+    }};
+    scanArr(PEAKS);
+    if (SAMPLE_PEAKS !== PEAKS) scanArr(SAMPLE_PEAKS);
+    const computeP99 = (vals) => {{
+      if (vals.length === 0) return 40.0;
+      vals.sort((a, b) => a - b);
+      const q = vals[Math.min(vals.length - 1, Math.floor(vals.length * 0.985))];
+      return Math.max(12.0, q || 40.0);
+    }};
+    _peakDataAvailabilitySig = sig;
+    _peakDataAvailability = {{
+      _p0: p0,
+      _s0: s0,
+      hasIsigi,
+      hasMtzIsigi: hasMtz,
+      hasResiduals: hasRes,
+      hasScales: hasScl,
+      isigiTop: computeP99(isigiSamples),
+      mtzIsigiTop: computeP99(mtzSamples),
+    }};
+    return _peakDataAvailability;
+  }}
+
+  // Logarithmic non-negative I/SIGI colormap (O(1) per peak):
+  // Neutral Slate-Gray (0σ) -> Crisp Silver-White (~2–3σ) -> Luminous Gold -> Electric Lime-Chartreuse (strong peaks),
+  // engineered to stand out cleanly above Magma, Cyan Glow, and Film detector pixel heatmaps.
+  function isigiToColor(isigiVal, alpha = 1.0, topScale = 40.0) {{
+    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal)) return `rgba(148, 163, 184, ${{(alpha * 0.35).toFixed(3)}})`;
+    const snr = Math.max(0.0, isigiVal);
+    const denom = Math.log10(1.0 + Math.max(12.0, topScale));
+    const tLog = Math.max(0.0, Math.min(1.0, Math.log10(1.0 + snr) / Math.max(0.5, denom)));
+    const [t, effAlpha] = applyEmphasisCurve(tLog, alpha);
+    let r, g, b;
+    if (t < 0.34) {{
+      // Muted Slate-Gray (148, 163, 184) -> Crisp Neutral White-Silver (232, 238, 246)
+      const u = t / 0.34;
+      r = Math.round(148 + (232 - 148) * u);
+      g = Math.round(163 + (238 - 163) * u);
+      b = Math.round(184 + (246 - 184) * u);
+    }} else if (t < 0.68) {{
+      // Neutral White-Silver (232, 238, 246) -> Vivid Solar Gold (250, 204, 21)
+      const u = (t - 0.34) / 0.34;
+      r = Math.round(232 + (250 - 232) * u);
+      g = Math.round(238 + (204 - 238) * u);
+      b = Math.round(246 + (21 - 246) * u);
     }} else {{
-      u = Math.max(-1.0, Math.min(1.0, Math.log2(Math.max(0.375, isigiVal) / 3.0) / 3.0));
+      // Vivid Solar Gold (250, 204, 21) -> Electric Chartreuse-Lime (163, 242, 44)
+      const u = (t - 0.68) / 0.32;
+      r = Math.round(250 + (163 - 250) * u);
+      g = Math.round(204 + (242 - 204) * u);
+      b = Math.round(21 + (44 - 21) * u);
     }}
-    if (u < 0) {{
-      const t = Math.min(1.0, -u);
-      // White (248, 250, 252) -> Sky Blue (56, 189, 248) -> Cobalt Blue (37, 99, 235)
-      const r = t < 0.5
-        ? Math.round(248 * (1 - 2 * t) + 56 * (2 * t))
-        : Math.round(56 * (1 - 2 * (t - 0.5)) + 37 * (2 * (t - 0.5)));
-      const g = t < 0.5
-        ? Math.round(250 * (1 - 2 * t) + 189 * (2 * t))
-        : Math.round(189 * (1 - 2 * (t - 0.5)) + 99 * (2 * (t - 0.5)));
-      const b = t < 0.5
-        ? Math.round(252 * (1 - 2 * t) + 248 * (2 * t))
-        : Math.round(248 * (1 - 2 * (t - 0.5)) + 235 * (2 * (t - 0.5)));
-      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha}})`;
-    }}
-    const t = Math.min(1.0, u);
-    // White (248, 250, 252) -> Warm Coral (251, 113, 133) -> Crimson Red (225, 29, 72)
-    const r = t < 0.5
-      ? Math.round(248 * (1 - 2 * t) + 251 * (2 * t))
-      : Math.round(251 * (1 - 2 * (t - 0.5)) + 225 * (2 * (t - 0.5)));
-    const g = t < 0.5
-      ? Math.round(250 * (1 - 2 * t) + 113 * (2 * t))
-      : Math.round(113 * (1 - 2 * (t - 0.5)) + 29 * (2 * (t - 0.5)));
-    const b = t < 0.5
-      ? Math.round(252 * (1 - 2 * t) + 133 * (2 * t))
-      : Math.round(133 * (1 - 2 * (t - 0.5)) + 72 * (2 * (t - 0.5)));
-    return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha}})`;
+    return `rgba(${{r}}, ${{g}}, ${{b}}, ${{effAlpha.toFixed(3)}})`;
   }}
 
   function hasIntegratedIsigi() {{
-    const checkArr = arr => Array.isArray(arr) && arr.some(
-      p => p && typeof p.intensity === "number" && Number.isFinite(p.intensity) && typeof p.sigma === "number" && p.sigma > 0
-    );
-    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+    return getPeakDataAvailability().hasIsigi;
+  }}
+
+  function hasMtzIsigi() {{
+    return getPeakDataAvailability().hasMtzIsigi;
   }}
 
   function hasCarelessResiduals() {{
-    const checkArr = arr => Array.isArray(arr) && arr.some(
-      p => p && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)
-    );
-    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+    return getPeakDataAvailability().hasResiduals;
   }}
 
   function hasCarelessScales() {{
-    const checkArr = arr => Array.isArray(arr) && arr.some(
-      p => p && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)
-    );
-    return checkArr(PEAKS) || checkArr(SAMPLE_PEAKS);
+    return getPeakDataAvailability().hasScales;
   }}
 
   function hasMergedCarelessData() {{
@@ -9109,17 +9317,43 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return !(typeof snr === "number" && Number.isFinite(snr) && snr >= WULFF_ALL_RUNS_MIN_ISIGI);
   }}
 
+  function peakEmphasisAlphaForCategorical(p, alpha) {{
+    const emp = Number(state.colorEmphasis) || 0.0;
+    if (Math.abs(emp) < 1e-4 || !p) return alpha;
+    const avail = getPeakDataAvailability();
+    const mv = peakMtzIsigi(p);
+    const snr = Number.isFinite(mv) ? mv : peakUnscaledIsigi(p);
+    const topS = Number.isFinite(mv) ? avail.mtzIsigiTop : avail.isigiTop;
+    if (Number.isFinite(snr)) {{
+      const tLog = Math.max(0.0, Math.min(1.0, Math.log10(1.0 + Math.max(0.0, snr)) / Math.log10(1.0 + Math.max(12.0, topS))));
+      return applyEmphasisCurve(tLog, alpha)[1];
+    }}
+    return alpha;
+  }}
+
+  function hexToRgba(hex, alpha = 1.0) {{
+    const clean = String(hex || "#38bdf8").replace("#", "");
+    const r = parseInt(clean.slice(0, 2), 16) || 56;
+    const g = parseInt(clean.slice(2, 4), 16) || 189;
+    const b = parseInt(clean.slice(4, 6), 16) || 248;
+    return `rgba(${{r}}, ${{g}}, ${{b}}, ${{Math.max(0.0, Math.min(1.0, alpha)).toFixed(3)}})`;
+  }}
+
   function peakStrokeColor(p, alpha = 0.95) {{
     const mode = state.wulffColorMode || "wavelength";
+    const avail = getPeakDataAvailability();
     if (mode === "orbit") {{
       const idx = typeof p.orbit_color_idx === "number"
         ? ((p.orbit_color_idx % ORBIT_PALETTE.length) + ORBIT_PALETTE.length) % ORBIT_PALETTE.length
         : 0;
-      const hex = ORBIT_PALETTE[idx];
-      return alpha >= 0.9 ? hex : `${{hex}}99`;
+      const effA = peakEmphasisAlphaForCategorical(p, alpha);
+      return hexToRgba(ORBIT_PALETTE[idx], effA);
+    }}
+    if (mode === "mtz_isigi") {{
+      return isigiToColor(peakMtzIsigi(p), alpha, avail.mtzIsigiTop);
     }}
     if (mode === "isigi") {{
-      return isigiToColor(peakUnscaledIsigi(p), alpha);
+      return isigiToColor(peakUnscaledIsigi(p), alpha, avail.isigiTop);
     }}
     if (mode === "residual") {{
       return residualToColor(p.careless_residual, alpha);
@@ -9127,7 +9361,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (mode === "scale") {{
       return scaleToColor(p.careless_scale, alpha);
     }}
-    return wavelengthToColor(p.wavelength, alpha);
+    return wavelengthToColor(p.wavelength, peakEmphasisAlphaForCategorical(p, alpha));
   }}
 
   function syncWulffUI() {{
@@ -9140,14 +9374,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const selSpotColor = document.getElementById("sel-spot-color");
     const titleEl = document.getElementById("stereo-title");
     const hasIsigi = hasIntegratedIsigi();
+    const hasMtz = hasMtzIsigi();
     const hasRes = hasCarelessResiduals();
     const hasScl = hasCarelessScales();
     if (
       (state.wulffColorMode === "isigi" && !hasIsigi) ||
+      (state.wulffColorMode === "mtz_isigi" && !hasMtz) ||
       (state.wulffColorMode === "residual" && !hasRes) ||
       (state.wulffColorMode === "scale" && !hasScl)
     ) {{
-      state.wulffColorMode = "wavelength";
+      state.wulffColorMode = hasMtz ? "mtz_isigi" : "wavelength";
     }}
     if (stereoEl) {{
       stereoEl.classList.toggle("hidden", !state.showStereo);
@@ -9176,12 +9412,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       _cachedPlotBox = null;
       _cachedPlotBoxKey = "";
     }}
+    const mtzOptLabel = DATA.mtz_overlay_name
+      ? `Color: .mtz I/σ (${{String(DATA.mtz_overlay_name).slice(0, 18)}})`
+      : "Color: .mtz I/σ (Log)";
     [selColor, selSpotColor].forEach(sel => {{
       if (!sel) return;
       Array.from(sel.options).forEach(opt => {{
         if (opt.value === "isigi") {{
           opt.disabled = !hasIsigi;
           opt.style.color = hasIsigi ? "" : "#64748b";
+        }} else if (opt.value === "mtz_isigi") {{
+          opt.disabled = !hasMtz;
+          opt.textContent = mtzOptLabel;
+          opt.style.color = hasMtz ? "" : "#64748b";
         }} else if (opt.value === "residual") {{
           opt.disabled = !hasRes;
           opt.style.color = hasRes ? "" : "#64748b";
@@ -9438,13 +9681,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         mergeStr += ` (I_asu=${{p.merged_i.toFixed(1)}}±${{p.merged_sigi.toFixed(1)}})`;
       }}
     }}
+    let mtzStr = "";
+    const mtzSnr = peakMtzIsigi(p);
+    if (Number.isFinite(mtzSnr)) {{
+      mtzStr = ` • MTZ I/σ=<strong style="color:#a3e635;">${{mtzSnr.toFixed(1)}}</strong>`;
+      if (typeof p.mtz_i === "number" && typeof p.mtz_sigi === "number") {{
+        mtzStr += ` (${{p.mtz_i.toFixed(1)}}±${{p.mtz_sigi.toFixed(1)}})`;
+      }}
+    }}
     const detXVal = typeof p.det_x === "number" ? p.det_x : 0.0;
     const detYVal = typeof p.det_y === "number" ? p.det_y : 0.0;
     const errDeg = typeof p.angular_error_deg === "number" ? p.angular_error_deg : 0.0;
     const harmMult = p.harmonic_multiplicity || 1;
     setStatusLine(
       `[BANK #${{p.bank || 1}} • RUN #${{(p.run_index || 0) + 1}}]`,
-      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
+      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}${{mtzStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
     );
   }}
 
@@ -9457,6 +9708,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function isPeakVisible(p) {{
+    if (p.mtz_only && state.wulffColorMode !== "mtz_isigi") return false;
+    if (state.wulffColorMode === "mtz_isigi" && !Number.isFinite(peakMtzIsigi(p))) return false;
     if (p.wavelength < state.lamMin || p.wavelength > state.lamMax) return false;
     if (typeof p.d_spacing === "number" && p.d_spacing > 0 && typeof state.dMin === "number" && state.dMin > 0) {{
       if (p.d_spacing < state.dMin - 1e-4) return false;
@@ -9946,32 +10199,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function resolveAvailablePeakSource(preferredSource) {{
     const hasPred = Array.isArray(PREDICTED_PEAKS) && PREDICTED_PEAKS.length > 0;
     const hasInteg = Array.isArray(INTEGRATED_PEAKS) && INTEGRATED_PEAKS.length > 0;
-    const hasMtz = (Array.isArray(MTZ_PEAKS) && MTZ_PEAKS.length > 0) || Boolean(DATA.mtz_overlay_name);
     const req = String(preferredSource || "").toLowerCase();
-    if (req === "mtz" && hasMtz) return "mtz";
     if (req === "integrated" && hasInteg) return "integrated";
     if (req === "predicted" && hasPred) return "predicted";
     const defSrc = String(DATA.default_peak_source || "").toLowerCase();
-    if (defSrc === "mtz" && hasMtz) return "mtz";
     if (defSrc === "integrated" && hasInteg) return "integrated";
     if (defSrc === "predicted" && hasPred) return "predicted";
     if (hasInteg) return "integrated";
     if (hasPred) return "predicted";
-    if (hasMtz) return "mtz";
-    return req === "integrated" || req === "mtz" ? req : "predicted";
+    return req === "integrated" ? "integrated" : "predicted";
   }}
 
   function syncPeakSourceButtons() {{
     const btnPred = document.getElementById("btn-peaks-pred");
     const btnInteg = document.getElementById("btn-peaks-integ");
-    const btnMtz = document.getElementById("btn-peaks-mtz");
     const nPred = Array.isArray(PREDICTED_PEAKS) ? PREDICTED_PEAKS.length : 0;
     const nInteg = Array.isArray(INTEGRATED_PEAKS) ? INTEGRATED_PEAKS.length : 0;
-    const nMtz = Array.isArray(MTZ_PEAKS) ? MTZ_PEAKS.length : 0;
     const art = String(DATA.artifact_kind || "").toLowerCase();
-    const hasPred = nPred > 0 || (nInteg === 0 && nMtz === 0 && art !== "integrator" && art !== "merged_careless");
-    const hasInteg = nInteg > 0 || (nPred === 0 && nMtz === 0 && (art === "integrator" || art === "merged_careless"));
-    const hasMtz = nMtz > 0 || Boolean(DATA.mtz_overlay_name);
+    const hasPred = nPred > 0 || (nInteg === 0 && art !== "integrator" && art !== "merged_careless");
+    const hasInteg = nInteg > 0 || (nPred === 0 && (art === "integrator" || art === "merged_careless"));
     if (btnPred) {{
       btnPred.disabled = !hasPred;
       btnPred.classList.toggle("active-btn", state.peakSource === "predicted");
@@ -9982,31 +10228,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       btnInteg.classList.toggle("active-btn", state.peakSource === "integrated");
       btnInteg.title = `Show successfully integrated reflections as 2σ ellipses (${{nInteg}} on frame; also projected on Wulff map)`;
     }}
-    if (btnMtz) {{
-      btnMtz.disabled = !hasMtz;
-      btnMtz.classList.toggle("active-btn", state.peakSource === "mtz");
-      const mtzLabel = DATA.mtz_overlay_name ? ` (${{DATA.mtz_overlay_name}}: ${{nMtz}} on frame)` : ` (${{nMtz}} on frame)`;
-      btnMtz.title = `Show custom .mtz reflections projected into active UB geometry (does not modify B)${{mtzLabel}}`;
-    }}
   }}
 
   function applyPeakSource(preferredSource, shouldRender = true) {{
     const resolved = resolveAvailablePeakSource(preferredSource);
     const prevSource = state.peakSource;
     state.peakSource = resolved;
-    let srcPeaks = PREDICTED_PEAKS;
-    let srcSample = PREDICTED_SAMPLE_PEAKS;
-    if (resolved === "integrated") {{
-      srcPeaks = INTEGRATED_PEAKS;
-      srcSample = INTEGRATED_SAMPLE_PEAKS;
-    }} else if (resolved === "mtz") {{
-      srcPeaks = MTZ_PEAKS;
-      srcSample = MTZ_SAMPLE_PEAKS;
-    }}
+    const srcPeaks = resolved === "integrated" ? INTEGRATED_PEAKS : PREDICTED_PEAKS;
+    const srcSample = resolved === "integrated" ? INTEGRATED_SAMPLE_PEAKS : PREDICTED_SAMPLE_PEAKS;
     PEAKS.length = 0;
     (srcPeaks || []).forEach(p => PEAKS.push(p));
     SAMPLE_PEAKS.length = 0;
     (srcSample && srcSample.length > 0 ? srcSample : PEAKS).forEach(p => SAMPLE_PEAKS.push(p));
+    _peakDataAvailabilitySig = "";
     if (prevSource !== resolved) {{
       state.hoveredPeakId = null;
       state.hoveredPeakObj = null;
@@ -10015,9 +10249,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.activeOrbitId = null;
     }}
     if ((state.wulffColorMode === "residual" || state.wulffColorMode === "scale") && !hasMergedCarelessData()) {{
+      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
+    }} else if (state.wulffColorMode === "mtz_isigi" && !hasMtzIsigi()) {{
       state.wulffColorMode = "wavelength";
     }} else if (state.wulffColorMode === "isigi" && !hasIntegratedIsigi()) {{
-      state.wulffColorMode = "wavelength";
+      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
     }}
     syncPeakSourceButtons();
     if (shouldRender) {{
@@ -10511,15 +10747,77 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return wc;
   }}
 
-  function renderDetector() {{
-    renderDetectorCanvas();
+  let _lastDetRenderSig = "";
+  let _detVisiblePeaksSig = "";
+  let _detVisiblePeaksFirst = null;
+  let _detVisiblePeaksCache = [];
+
+  function getVisibleDetectorPeaks() {{
+    const firstRef = PEAKS.length > 0 ? PEAKS[0] : null;
+    const sig = `${{PEAKS.length}}|${{state.peakSource}}|${{state.wulffColorMode}}|${{state.dMin}}|${{state.lamMin}}|${{state.lamMax}}|${{DATA.mtz_overlay_name || ""}}`;
+    if (_detVisiblePeaksSig === sig && _detVisiblePeaksFirst === firstRef) {{
+      return _detVisiblePeaksCache;
+    }}
+    _detVisiblePeaksSig = sig;
+    _detVisiblePeaksFirst = firstRef;
+    _detVisiblePeaksCache = PEAKS.filter(isPeakVisible)
+      .slice()
+      .sort((a, b) => b.parallax_depth - a.parallax_depth);
+    return _detVisiblePeaksCache;
   }}
 
-  function renderDetectorCanvas() {{
+  function renderDetector() {{
+    renderDetectorCanvas(true);
+  }}
+
+  function renderDetectorCanvas(forceRedraw) {{
     const rect = detCanvas.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
     const targetW = Math.max(200, Math.round(rect.width * dpr));
     const targetH = Math.max(200, Math.round(rect.height * dpr));
+    const bounds = getActiveBounds();
+    const hovRef = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
+    const selRef = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
+    const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
+    const detSig = [
+      targetW, targetH,
+      state.projection,
+      bounds.minX.toFixed(3), bounds.maxX.toFixed(3), bounds.minY.toFixed(3), bounds.maxY.toFixed(3),
+      state.detZoom.toFixed(5),
+      state.detPanX.toFixed(2),
+      state.detPanY.toFixed(2),
+      state.detAlpha.toFixed(3),
+      state.heatmapStyle,
+      state.hiResTextures ? 1 : 0,
+      state.showPixelMask ? 1 : 0,
+      _panelTexEpoch,
+      PANELS.length,
+      PEAKS.length,
+      state.peakSource,
+      state.wulffScope,
+      state.wulffColorMode,
+      (state.colorEmphasis || 0).toFixed(3),
+      state.dMin,
+      state.lamMin,
+      state.lamMax,
+      state.parallaxX.toFixed(4),
+      state.parallaxY.toFixed(4),
+      state.selectedZoneId || "",
+      zonesKey,
+      hovRef,
+      selRef,
+      state.activeOrbitId || "",
+      DATA.mtz_overlay_name || "",
+    ].join("|");
+    if (
+      !forceRedraw &&
+      detSig === _lastDetRenderSig &&
+      detCanvas.width === targetW &&
+      detCanvas.height === targetH
+    ) {{
+      return;
+    }}
+    _lastDetRenderSig = detSig;
     if (detCanvas.width !== targetW || detCanvas.height !== targetH) {{
       detCanvas.width = targetW;
       detCanvas.height = targetH;
@@ -10530,7 +10828,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const h = rect.height;
     ctx.clearRect(0, 0, w, h);
 
-    const bounds = getActiveBounds();
     const isSph = state.projection === "spherical";
     const isCoupled360 = true;
     const azShifts = [-360.0, 0.0, 360.0];
@@ -10782,59 +11079,82 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
     }}
 
-    // 4. FOREGROUND LAYER: Predicted Bragg Rings hovering together with Laue zone circles
-    const visiblePeaks = PEAKS.filter(isPeakVisible)
-      .slice()
-      .sort((a, b) => b.parallax_depth - a.parallax_depth);
+    // 4. FOREGROUND LAYER: Predicted Bragg Rings / Integrated 2σ Ellipses hovering together with Laue zone circles
+    const visiblePeaks = getVisibleDetectorPeaks();
     const pendingTooltips = [];
     const queuedTooltipPeakIds = new Set();
+    const plotBox = getDetectorPlotBox(w, h);
+    const spanBoundsX = Math.max(1e-6, bounds.maxX - bounds.minX);
+    const spanBoundsY = Math.max(1e-6, bounds.maxY - bounds.minY);
+    const cxHalf = w * 0.5;
+    const cyHalf = h * 0.5;
+    const fgShiftX = state.parallaxX * state.parallaxStrength * OVERLAY_PARALLAX_LAYER * 18.0;
+    const fgShiftY = state.parallaxY * state.parallaxStrength * OVERLAY_PARALLAX_LAYER * 12.0;
+    const affScaleX = (plotBox.plotW / spanBoundsX) * state.detZoom;
+    const affOffsetX = cxHalf + (plotBox.originX - bounds.minX * (plotBox.plotW / spanBoundsX) - cxHalf) * state.detZoom + state.detPanX + fgShiftX;
+    const affScaleY = -(plotBox.plotH / spanBoundsY) * state.detZoom;
+    const affOffsetY = cyHalf + (plotBox.originY + plotBox.plotH + bounds.minY * (plotBox.plotH / spanBoundsY) - cyHalf) * state.detZoom + state.detPanY + fgShiftY;
+    const baseR = Math.max(1.2, Math.min(20.0, 1.85 * state.detZoom));
+    const isIntegShape = state.peakSource === "integrated";
+    const hasActiveZones = state.activeZones.size > 0;
+    const fillWhenLowAlpha = state.detAlpha < 0.2;
 
-    [0.0, -360.0, 360.0].forEach(shiftAz => {{
-      visiblePeaks.forEach(p => {{
+    ctx.save();
+    let dashedActive = false;
+    const shiftList = [0.0, -360.0, 360.0];
+    for (let sIdx = 0; sIdx < 3; sIdx++) {{
+      const shiftAz = shiftList[sIdx];
+      const shiftPxX = affScaleX * shiftAz + affOffsetX;
+      for (let pIdx = 0; pIdx < visiblePeaks.length; pIdx++) {{
+        const p = visiblePeaks[pIdx];
+        const x = affScaleX * p.det_x + shiftPxX;
+        if (x < -30 || x > w + 30) continue;
         const py = getPeakVert(p);
-        const fgLayer = OVERLAY_PARALLAX_LAYER;
-        const [x, y] = detToScreen(p.det_x + shiftAz, py, w, h, fgLayer);
-        if (x < -30 || x > w + 30) return;
+        const y = affScaleY * py + affOffsetY;
+        if (y < -30 || y > h + 30) continue;
 
         const captured = isPeakCapturedByActiveZone(p);
         const isHovered = isPeakHighlightedTarget(p);
         const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
-        if (!captured && !isHovered && !isOrbitMate && state.activeZones.size === 0) {{
-          return;
+        if (!captured && !isHovered && !isOrbitMate && !hasActiveZones) {{
+          continue;
         }}
 
-        const baseR = Math.max(1.2, Math.min(20.0, 1.85 * state.detZoom));
         const r = isHovered ? baseR + 1.8 : (isOrbitMate ? baseR + 1.2 : baseR);
         const isUncertain = !isHovered && !isOrbitMate && isPeakUncertainForScope(p);
         const strokeAlpha = isUncertain
           ? (captured ? 0.20 : 0.09)
           : (captured ? 0.95 : 0.42);
 
-        ctx.save();
-        const ellPtsRaw = isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse;
-        const strokeCol = isHovered
+        const ellPtsRaw = isIntegShape ? (isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse) : null;
+        ctx.strokeStyle = isHovered
           ? "#f43f85"
           : (isOrbitMate ? "#fbbf24" : peakStrokeColor(p, strokeAlpha));
-        ctx.strokeStyle = strokeCol;
         ctx.lineWidth = isHovered
           ? 2.4
           : (isOrbitMate ? 2.1 : (isUncertain ? (captured ? 1.0 : 0.7) : (captured ? 1.85 : 1.05)));
-        if (isUncertain) ctx.setLineDash([2, 2]);
+        if (isUncertain !== dashedActive) {{
+          ctx.setLineDash(isUncertain ? [2, 2] : []);
+          dashedActive = isUncertain;
+        }}
 
-        if (state.peakSource === "integrated" && Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6) {{
-          const scrPts = ellPtsRaw.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, fgLayer));
-          let maxDist = 0.0, minDist = 1e9;
-          for (let m = 0; m < scrPts.length; m++) {{
-            const d = Math.hypot(scrPts[m][0] - x, scrPts[m][1] - y);
-            if (d > maxDist) maxDist = d;
+        if (ellPtsRaw && ellPtsRaw.length >= 6) {{
+          const nEll = ellPtsRaw.length;
+          let minDist = 1e9;
+          for (let m = 0; m < nEll; m++) {{
+            const pt = ellPtsRaw[m];
+            const dx = (affScaleX * pt[0] + shiftPxX) - x;
+            const dy = (affScaleY * pt[1] + affOffsetY) - y;
+            const d = Math.hypot(dx, dy);
             if (d < minDist) minDist = d;
           }}
           const minTarget = isHovered ? baseR + 1.5 : baseR * 0.9;
           const scale = minDist > 1e-3 && minDist < minTarget ? (minTarget / minDist) : 1.0;
           ctx.beginPath();
-          for (let m = 0; m < scrPts.length; m++) {{
-            const sx = x + (scrPts[m][0] - x) * scale;
-            const sy = y + (scrPts[m][1] - y) * scale;
+          for (let m = 0; m < nEll; m++) {{
+            const pt = ellPtsRaw[m];
+            const sx = x + ((affScaleX * pt[0] + shiftPxX) - x) * scale;
+            const sy = y + ((affScaleY * pt[1] + affOffsetY) - y) * scale;
             if (m === 0) ctx.moveTo(sx, sy);
             else ctx.lineTo(sx, sy);
           }}
@@ -10845,10 +11165,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ctx.arc(x, y, r, 0, Math.PI * 2);
           ctx.stroke();
         }}
-        if (isUncertain) ctx.setLineDash([]);
 
-        // Highlight symmetry-orbit mates or Laue harmonic overlaps on detector
+        if (fillWhenLowAlpha) {{
+          ctx.fillStyle = peakStrokeColor(p, isUncertain ? 0.16 : 0.85);
+          ctx.fill();
+        }}
+
         if (isOrbitMate && !isHovered) {{
+          if (dashedActive) {{ ctx.setLineDash([]); dashedActive = false; }}
           ctx.beginPath();
           ctx.arc(x, y, r + 3.2, 0, Math.PI * 2);
           ctx.strokeStyle = "rgba(0, 229, 255, 0.82)";
@@ -10856,18 +11180,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ctx.stroke();
         }}
 
-        if (state.detAlpha < 0.2) {{
-          ctx.fillStyle = peakStrokeColor(p, isUncertain ? 0.16 : 0.85);
-          ctx.fill();
-        }}
-
         if ((isHovered || isOrbitMate) && !queuedTooltipPeakIds.has(p.id) && x >= 0 && x <= w) {{
           queuedTooltipPeakIds.add(p.id);
           pendingTooltips.push({{ p, x, y, isHovered }});
         }}
-        ctx.restore();
-      }});
-    }});
+      }}
+    }}
+    ctx.restore();
 
     // Render tooltips for all hovered + symmetry-equivalent reflections on top of rings
     pendingTooltips.forEach(({{ p, x, y, isHovered }}) => {{
@@ -11136,6 +11455,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.wulffExpanded ? 1 : 0,
       state.wulffScope,
       state.wulffColorMode,
+      (state.colorEmphasis || 0).toFixed(3),
       state.showWulffFriedel ? 1 : 0,
       state.peakSource,
       state.peakColorMode,
@@ -11612,18 +11932,54 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   // Mouse & Wheel interactions on Detector Canvas (with Google-Earth 360° periodic coupling)
   let isPanningDet = false;
   let panStart = [0, 0];
+
+  function isParallaxTriggerActive(ev) {{
+    return Boolean(
+      isPanningDet ||
+      isDraggingWulff ||
+      (ev && (ev.buttons !== 0 || ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey))
+    );
+  }}
+
   detCanvas.addEventListener("mousedown", (ev) => {{
     isPanningDet = true;
     panStart = [ev.clientX - state.detPanX, ev.clientY - state.detPanY];
+    const rect = detCanvas.getBoundingClientRect();
+    state.targetParallaxX = (((ev.clientX - rect.left) / Math.max(1, rect.width)) - 0.5) * 2.0;
+    state.targetParallaxY = (((ev.clientY - rect.top) / Math.max(1, rect.height)) - 0.5) * 2.0;
   }});
-  window.addEventListener("mouseup", () => {{ isPanningDet = false; isDraggingWulff = false; }});
+  window.addEventListener("mouseup", (ev) => {{
+    isPanningDet = false;
+    isDraggingWulff = false;
+    if (!ev || (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey)) {{
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
+    }}
+  }});
+  window.addEventListener("keyup", (ev) => {{
+    if (!isPanningDet && !isDraggingWulff && (!ev || (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey))) {{
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
+    }}
+  }});
+  window.addEventListener("blur", () => {{
+    isPanningDet = false;
+    isDraggingWulff = false;
+    state.targetParallaxX = 0.0;
+    state.targetParallaxY = 0.0;
+  }});
 
   detCanvas.addEventListener("mousemove", (ev) => {{
     const rect = detCanvas.getBoundingClientRect();
     const mx = ev.clientX - rect.left;
     const my = ev.clientY - rect.top;
-    state.targetParallaxX = ((mx / rect.width) - 0.5) * 2.0;
-    state.targetParallaxY = ((my / rect.height) - 0.5) * 2.0;
+    if (isParallaxTriggerActive(ev)) {{
+      state.targetParallaxX = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
+      state.targetParallaxY = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+    }} else {{
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
+    }}
 
     if (isPanningDet) {{
       let nextPanX = ev.clientX - panStart[0];
@@ -11696,8 +12052,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const rect = stereoCanvas.getBoundingClientRect();
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
-      state.targetParallaxX = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
-      state.targetParallaxY = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+      if (isParallaxTriggerActive(ev)) {{
+        state.targetParallaxX = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
+        state.targetParallaxY = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+      }} else {{
+        state.targetParallaxX = 0.0;
+        state.targetParallaxY = 0.0;
+      }}
       if (isDraggingWulff) {{
         const dx = ev.clientX - wulffDragStart[0];
         const dy = ev.clientY - wulffDragStart[1];
@@ -11750,10 +12111,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     document.getElementById("lbl-det-alpha").textContent = Math.round(state.detAlpha * 100) + "%";
   }});
 
-  slParallax.addEventListener("input", () => {{
-    state.parallaxStrength = parseFloat(slParallax.value);
-    document.getElementById("lbl-parallax").textContent = state.parallaxStrength.toFixed(2) + "×";
-  }});
+  function formatColorEmphasisLabel(emp) {{
+    const v = Number(emp) || 0.0;
+    if (Math.abs(v) < 0.03) return "Balanced";
+    if (v >= 0.85) return "Strong Only";
+    if (v <= -0.85) return "All Peaks";
+    if (v > 0) return `Strong +${{Math.round(v * 100)}}%`;
+    return `All +${{Math.round(-v * 100)}}%`;
+  }}
+
+  if (slColorEmphasis) {{
+    slColorEmphasis.addEventListener("input", () => {{
+      state.colorEmphasis = parseFloat(slColorEmphasis.value) || 0.0;
+      const lbl = document.getElementById("lbl-color-emphasis");
+      if (lbl) lbl.textContent = formatColorEmphasisLabel(state.colorEmphasis);
+    }});
+    slColorEmphasis.addEventListener("dblclick", () => {{
+      slColorEmphasis.value = "0.00";
+      state.colorEmphasis = 0.0;
+      const lbl = document.getElementById("lbl-color-emphasis");
+      if (lbl) lbl.textContent = "Balanced";
+    }});
+  }}
 
   if (slDmin) {{
     slDmin.addEventListener("input", () => {{
@@ -12019,7 +12398,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
-  ["btn-peaks-pred", "btn-peaks-integ", "btn-peaks-mtz"].forEach((btnId) => {{
+  ["btn-peaks-pred", "btn-peaks-integ"].forEach((btnId) => {{
     const el = document.getElementById(btnId);
     if (!el) return;
     el.addEventListener("click", () => {{
@@ -12030,13 +12409,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function applySpotColorMode(nextMode) {{
     if ((nextMode === "residual" || nextMode === "scale") && !hasMergedCarelessData()) {{
+      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
+    }} else if (nextMode === "mtz_isigi" && !hasMtzIsigi()) {{
       state.wulffColorMode = "wavelength";
     }} else if (nextMode === "isigi" && !hasIntegratedIsigi()) {{
-      state.wulffColorMode = "wavelength";
+      state.wulffColorMode = hasMtzIsigi() ? "mtz_isigi" : "wavelength";
     }} else {{
       state.wulffColorMode = nextMode || "wavelength";
     }}
     syncWulffUI();
+    updateHUD();
+    renderDetector();
   }}
 
   const selWulffColor = document.getElementById("sel-wulff-color");
@@ -12354,14 +12737,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     PREDICTED_SAMPLE_PEAKS = nextBuckets.predSample;
     INTEGRATED_PEAKS = nextBuckets.integPeaks;
     INTEGRATED_SAMPLE_PEAKS = nextBuckets.integSample;
-    MTZ_PEAKS = nextBuckets.mtzPeaks;
-    MTZ_SAMPLE_PEAKS = nextBuckets.mtzSample;
     DATA.merge_metrics = newPayload.merge_metrics || null;
     DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
+    DATA.default_color_mode = newPayload.default_color_mode || null;
     const preferredSrc = isFrameSwitch
       ? state.peakSource
       : (newPayload.default_peak_source || state.peakSource);
     applyPeakSource(preferredSrc, false);
+    if (!isFrameSwitch && newPayload.default_color_mode === "mtz_isigi" && hasMtzIsigi()) {{
+      state.wulffColorMode = "mtz_isigi";
+    }}
     ZONES.length = 0;
     nextZones.forEach(z => ZONES.push(z));
     PANELS.length = 0;
@@ -16261,8 +16646,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function animate() {{
-    state.parallaxX += (state.targetParallaxX - state.parallaxX) * 0.14;
-    state.parallaxY += (state.targetParallaxY - state.parallaxY) * 0.14;
+    const dxP = state.targetParallaxX - state.parallaxX;
+    const dyP = state.targetParallaxY - state.parallaxY;
+    state.parallaxX = Math.abs(dxP) < 1e-4 ? state.targetParallaxX : (state.parallaxX + dxP * 0.14);
+    state.parallaxY = Math.abs(dyP) < 1e-4 ? state.targetParallaxY : (state.parallaxY + dyP * 0.14);
     renderDetectorCanvas();
     renderStereoInset();
     if (activeRunningStageId() || (stopwatchFlash.demoUntilPerf && performance.now() < stopwatchFlash.demoUntilPerf)) {{

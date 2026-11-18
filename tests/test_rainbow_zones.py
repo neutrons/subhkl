@@ -2066,8 +2066,13 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert 'id="inp-lmax"' in html_doc
     assert 'id="slider-dmin"' in html_doc
     assert 'id="sel-spot-color"' in html_doc
-    assert '<option value="isigi">Color: I/σ (Diverging)</option>' in html_doc
+    assert '<option value="isigi">Color: I/σ (Log)</option>' in html_doc
+    assert '<option value="mtz_isigi">Color: .mtz I/σ (Log)</option>' in html_doc
+    assert 'id="slider-color-emphasis"' in html_doc
+    assert 'id="slider-parallax"' not in html_doc
+    assert 'id="btn-peaks-mtz"' not in html_doc
     assert "hasIntegratedIsigi" in html_doc
+    assert "hasMtzIsigi" in html_doc
     assert "syncDminControls" in html_doc
     assert "Runner host:" in html_doc
     from subhkl.io.parser import detect_runner_hostname
@@ -2715,7 +2720,9 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     R1 = Rotation.from_euler("y", 25.0, degrees=True).as_matrix()
     R_runs = np.stack([R0, R1], axis=0)
 
-    first_bk_key = min(beamlines["CG4D"], key=int)
+    first_bk_key = (
+        "57" if "57" in beamlines["CG4D"] else max(beamlines["CG4D"], key=int)
+    )
     first_bk = int(first_bk_key)
     det1 = Detector(dict(beamlines["CG4D"][first_bk_key]))
     xyz_a = np.asarray(det1.pixel_to_lab(110.0, 120.0), dtype=float)
@@ -2873,19 +2880,34 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     mtz.add_column("I", "J")
     mtz.add_column("SIGI", "Q")
 
-    # Seed ASU reflections whose rays under the ACTIVE geometry (U_true @ B_orig) hit CG4D in [2.8, 4.5] A
+    # Seed ASU reflections whose rays under the ACTIVE geometry (U_true @ B_orig) hit active panel first_bk
+    # (plus reflections on an inactive panel to verify .mtz only projects onto active predicted-peak panels!)
     cg4d_dets = {int(bk): Detector(dict(cfg)) for bk, cfg in beamlines["CG4D"].items()}
-    grid = np.mgrid[-8:9, -8:9, -8:9].reshape(3, -1).T
+    grid = np.mgrid[-12:13, -12:13, -12:13].reshape(3, -1).T
     grid = grid[np.any(grid != 0, axis=1)]
-    cast_seed = _raycast_hkl_on_detectors(
-        grid, U_true, B_orig, R0, cg4d_dets, (2.8, 4.5)
+    cast_seed_active_r0 = _raycast_hkl_on_detectors(
+        grid, U_true, B_orig, R0, cg4d_dets, (2.8, 4.5), active_bids={first_bk}
     )
-    assert len(cast_seed["hkl"]) >= 5
+    cast_seed_active_r1 = _raycast_hkl_on_detectors(
+        grid, U_true, B_orig, R1, cg4d_dets, (2.8, 4.5), active_bids={first_bk}
+    )
+    other_bids = {int(b) for b in cg4d_dets if int(b) != first_bk}
+    cast_seed_inactive = _raycast_hkl_on_detectors(
+        grid, U_true, B_orig, R0, cg4d_dets, (2.8, 4.5), active_bids=other_bids
+    )
+    assert len(cast_seed_active_r0["hkl"]) >= 2
+    assert len(cast_seed_inactive["hkl"]) >= 2
     asu_mtz = gemmi.ReciprocalAsu(mtz.spacegroup)
     ops_mtz = mtz.spacegroup.operations()
     seen_asu: set[tuple[int, int, int]] = set()
     mtz_rows: list[list[float]] = []
-    for idx_h, h_hit in enumerate(cast_seed["hkl"][:20]):
+    seed_hkls_combined = (
+        [[2, 1, -3], [1, 2, -3]]
+        + cast_seed_active_r0["hkl"][:12].tolist()
+        + cast_seed_active_r1["hkl"][:8].tolist()
+        + cast_seed_inactive["hkl"][:6].tolist()
+    )
+    for idx_h, h_hit in enumerate(seed_hkls_combined):
         ha, _ = asu_mtz.to_asu([int(h_hit[0]), int(h_hit[1]), int(h_hit[2])], ops_mtz)
         key_a = (int(ha[0]), int(ha[1]), int(ha[2]))
         if key_a not in seen_asu:
@@ -2915,11 +2937,29 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     )
     assert payload_mtz["space_group"] == "P 21 21 21"
     assert np.allclose(payload_mtz["cell"], cell_orig, atol=1e-3)
-    assert payload_mtz["default_peak_source"] == "mtz"
-    assert len(payload_mtz["mtz_peaks"]) >= len(mtz_rows)
-    assert len(payload_mtz["mtz_sample_peaks"]) >= len(payload_mtz["mtz_peaks"])
+    assert payload_mtz["default_peak_source"] == "integrated"
+    assert payload_mtz["default_color_mode"] == "mtz_isigi"
+    assert "mtz_peaks" not in payload_mtz
+    assert "mtz_sample_peaks" not in payload_mtz
+    # Only panels with predicted peaks (first_bk) may carry .mtz projections!
+    assert {int(p["bank"]) for p in payload_mtz["predicted_peaks"]} == {first_bk}
+    assert {int(p["bank"]) for p in payload_mtz["predicted_sample_peaks"]} == {first_bk}
+    pred_with_mtz = [
+        p for p in payload_mtz["predicted_peaks"] if p.get("mtz_isigi") is not None
+    ]
+    samp_with_mtz = [
+        p
+        for p in payload_mtz["predicted_sample_peaks"]
+        if p.get("mtz_isigi") is not None
+    ]
+    integ_with_mtz = [
+        p for p in payload_mtz["integrated_peaks"] if p.get("mtz_isigi") is not None
+    ]
+    assert len(pred_with_mtz) >= len(cast_seed_active_r0["hkl"][:12])
+    assert len(samp_with_mtz) >= len(pred_with_mtz)
     assert len(payload_mtz["integrated_peaks"]) == 1
-    assert len(payload_mtz["predicted_peaks"]) == len(payload0["predicted_peaks"])
+    assert len(integ_with_mtz) == 1
+    assert len(payload_mtz["predicted_peaks"]) >= len(payload0["predicted_peaks"])
 
     # Loading an MTZ when no UB geometry is present must raise a clear ValueError
     empty_payload = {"artifact_kind": "empty", "panels": payload0["panels"]}
@@ -2941,7 +2981,7 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     assert reloaded_f1["mtz_overlay_name"] == "custom_reflections.mtz"
     assert reloaded_f1["space_group"] == "P 21 21 21"
     assert np.allclose(np.asarray(reloaded_f1["b_matrix"]), B_orig, atol=1e-5)
-    assert len(reloaded_f1["mtz_peaks"]) > 0
+    assert any(p.get("mtz_isigi") is not None for p in reloaded_f1["predicted_peaks"])
     assert len(reloaded_f1["integrated_peaks"]) == 1
 
     app_inst = object.__new__(MainApp)
@@ -2979,7 +3019,8 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     resp_mtz = asyncio.run(aio_app._handle(req_mtz))
     assert resp_mtz.status == 200
     doc_mtz = json.loads(resp_mtz.body.decode("utf-8"))
-    assert doc_mtz["default_peak_source"] == "mtz"
+    assert doc_mtz["default_peak_source"] == "integrated"
+    assert doc_mtz["default_color_mode"] == "mtz_isigi"
     assert doc_mtz["space_group"] == "P 21 21 21"
     assert np.allclose(np.asarray(doc_mtz["b_matrix"]), B_orig, atol=1e-5)
     assert sub_m.data.peaks_file == str(integ_h5)
@@ -2992,25 +3033,25 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     doc_f1 = json.loads(resp_f1.body.decode("utf-8"))
     assert doc_f1["frame_index"] == 1
     assert doc_f1["mtz_overlay_name"] == "custom_reflections.mtz"
-    assert len(doc_f1["mtz_peaks"]) > 0
+    assert any(p.get("mtz_isigi") is not None for p in doc_f1["predicted_peaks"])
 
     # 4. Execute rendered HTML/JS helpers in Node.js to verify:
-    #    - Exact θ (k_f - k_i) vs 2θ (k_f) Wulff azimuth alignment & right-handed SO(3) camera:
-    #      centering detector on ANY chi (+45°, -45°, +135°, -135°) places that reflection DEAD-CENTER (sx == 100, zCam == 1.0),
-    #      upright (+y -> sy < 100), and left-to-right monotonic (+d_chi -> sx > 100), while its antipodal Friedel mate (-g)
-    #      populates the |az| < 90° hemisphere smoothly across chi = 0°!
-    #    - Diverging Blue-White-Red isigiToColor colormap.
-    #    - Peak toggle ('predicted' | 'integrated' | 'mtz') switches PEAKS + SAMPLE_PEAKS + getActiveWulffPeaks().
+    #    - Exact θ (k_f - k_i) vs 2θ (k_f) Wulff azimuth alignment & right-handed SO(3) camera.
+    #    - Nonnegative logarithmic slate-gray -> white -> gold -> electric-lime isigiToColor colormap
+    #      modulated by state.colorEmphasis (#slider-color-emphasis), plus modifier/button-gated parallax.
+    #    - Two-source peak toggle ('predicted' | 'integrated') with .mtz I/σ data-column coloring.
     html_doc = render_rainbow_html(payload_mtz)
     assert 'accept=".h5,.hdf5,.nxs,.mtz"' in html_doc
     assert 'id="peak-source-group"' in html_doc
+    assert 'id="btn-peaks-mtz"' not in html_doc
     assert 'id="btn-wulff-friedel"' in html_doc
-    assert "Color: I/σ (Diverging)" in html_doc
+    assert "Color: I/σ (Log)" in html_doc
+    assert "Color: .mtz I/σ (Log)" in html_doc
+    assert 'id="slider-color-emphasis"' in html_doc
+    assert "_lastDetRenderSig" in html_doc
     assert "#e879f9" in html_doc  # distinct violet Friedel symmetry link color
-    assert (
-        'state.peakSource === "integrated" && Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6'
-        in html_doc
-    )
+    assert 'const isIntegShape = state.peakSource === "integrated";' in html_doc
+    assert "if (ellPtsRaw && ellPtsRaw.length >= 6)" in html_doc
 
     def _extract_js_fn(name: str) -> str:
         pat = rf"function {name}\b[\s\S]*?\n  \}}"
@@ -3020,9 +3061,15 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
 
     fn_names = [
         "extractPeakBucketsFromPayload",
+        "applyEmphasisCurve",
+        "getPeakDataAvailability",
         "peakUnscaledIsigi",
-        "activePeaksHaveNegativeIsigi",
+        "peakMtzIsigi",
+        "hasIntegratedIsigi",
+        "hasMtzIsigi",
         "isigiToColor",
+        "peakStrokeColor",
+        "isParallaxTriggerActive",
         "detToScreen",
         "getCenteredDetectorAzimuthDeg",
         "setDetectorCenterAzimuthDeg",
@@ -3040,34 +3087,46 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
 
     js_harness = f"""
 const DATA = {json.dumps(payload_mtz)};
+let _peakDataAvailabilitySig = "";
+let _peakDataAvailability = {{
+  hasIsigi: false,
+  hasMtzIsigi: false,
+  hasResiduals: false,
+  hasScales: false,
+  isigiTop: 40.0,
+  mtzIsigiTop: 40.0,
+}};
+let _visDetPeaksSig = "";
+let _visDetPeaksCache = [];
+let _lastDetRenderSig = "";
+let isPanningDet = false;
+let isDraggingWulff = false;
 const initBuckets = extractPeakBucketsFromPayload(DATA);
 let PREDICTED_PEAKS = initBuckets.predPeaks;
 let PREDICTED_SAMPLE_PEAKS = initBuckets.predSample;
 let INTEGRATED_PEAKS = initBuckets.integPeaks;
 let INTEGRATED_SAMPLE_PEAKS = initBuckets.integSample;
-let MTZ_PEAKS = initBuckets.mtzPeaks;
-let MTZ_SAMPLE_PEAKS = initBuckets.mtzSample;
 const PEAKS = [...(DATA.peaks || [])];
 const SAMPLE_PEAKS = [...(DATA.sample_peaks || PEAKS)];
 const detCanvas = {{ getBoundingClientRect: () => ({{ width: 900, height: 520 }}) }};
 const btns = {{
   "btn-peaks-pred": {{ disabled: false, title: "", _cls: new Set(), classList: {{ toggle(c, on) {{ if (on) btns["btn-peaks-pred"]._cls.add(c); else btns["btn-peaks-pred"]._cls.delete(c); }} }} }},
   "btn-peaks-integ": {{ disabled: false, title: "", _cls: new Set(), classList: {{ toggle(c, on) {{ if (on) btns["btn-peaks-integ"]._cls.add(c); else btns["btn-peaks-integ"]._cls.delete(c); }} }} }},
-  "btn-peaks-mtz": {{ disabled: false, title: "", _cls: new Set(), classList: {{ toggle(c, on) {{ if (on) btns["btn-peaks-mtz"]._cls.add(c); else btns["btn-peaks-mtz"]._cls.delete(c); }} }} }},
 }};
 globalThis.document = {{ getElementById: (id) => btns[id] || null }};
 const state = {{
   projection: "cylindrical",
-  peakSource: DATA.default_peak_source || "mtz",
+  peakSource: DATA.default_peak_source || "integrated",
   wulffScope: "all_runs",
   showWulffFriedel: true,
-  wulffColorMode: "wavelength",
+  wulffColorMode: DATA.default_color_mode || "mtz_isigi",
+  colorEmphasis: 0.0,
   wulffYawDeg: 0.0,
   wulffPitchDeg: 0.0,
   wulffZoom: 1.0,
   parallaxX: 0.0,
   parallaxY: 0.0,
-  parallaxStrength: 1.0,
+  parallaxStrength: 0.65,
   detZoom: 1.0,
   detPanX: 0.0,
   detPanY: 0.0,
@@ -3090,8 +3149,11 @@ function mat3Vec(M, v) {{
   ];
 }}
 function hasMergedCarelessData() {{ return false; }}
-function hasIntegratedIsigi() {{ return true; }}
-function isPeakVisible() {{ return true; }}
+function isPeakVisible(p) {{ return state.wulffColorMode !== "mtz_isigi" || Number.isFinite(peakMtzIsigi(p)); }}
+function wavelengthToRainbow() {{ return "rgba(100,200,255,1)"; }}
+function zoneColor() {{ return "rgba(255,100,100,1)"; }}
+function residualToColor() {{ return "rgba(255,255,255,1)"; }}
+function syncColorModeSelectors() {{}}
 function syncWulffUI() {{}}
 function renderZoneList() {{}}
 function updateHUD() {{}}
@@ -3125,8 +3187,6 @@ for (const [chiTarget, zoomVal] of [[45.0, 1.0], [-45.0, 2.4], [135.0, 1.5], [-1
   const wUp = projectToWulff(gForChiElDeg(chiTarget, 12.0), 100, 100, 80);
   const wRight = projectToWulff(gForChiElDeg(chiTarget + 10.0, 0.0), 100, 100, 80);
   const wLeft = projectToWulff(gForChiElDeg(chiTarget - 10.0, 0.0), 100, 100, 80);
-  // Also check Friedel mate (-g) of an opposite-side reflection at -chiTarget:
-  // when looking near chi = +0° (wulffYaw = +90°), -g of chi = -20° sits at az = +80° on the SAME front hemisphere!
   chiChecks.push({{
     chiTarget,
     screenXErr: Math.abs(screenX - viewCenterX),
@@ -3142,30 +3202,40 @@ for (const [chiTarget, zoomVal] of [[45.0, 1.0], [-45.0, 2.4], [135.0, 1.5], [-1
   }});
 }}
 
-// Check continuity across chi = 0° via Friedel mate (-g):
-// Looking at chi = +10° (yaw = +95°), a reflection at chi = -10° has direct +g at -95° (back),
-// while its Friedel mate -g sits at +85° (just 10° to the LEFT on the FRONT hemisphere)!
 state.detZoom = 1.0;
 setDetectorCenterAzimuthDeg(10.0);
 syncWulffYawFromDetector();
 const gNeg10 = gForChiElDeg(-10.0, 0.0);
 const friedelNeg10AtPos10 = projectToWulff([-gNeg10[0], -gNeg10[1], -gNeg10[2]], 100, 100, 80);
 
-// Diverging I/SIGI colors: weak (0.5σ -> blue: B > R), threshold (3.0σ -> neutral white: R≈G≈B>240), strong (24σ -> red: R > B)
-const colWeak = isigiToColor(0.5, 1.0);
-const colMid = isigiToColor(3.0, 1.0);
-const colStrong = isigiToColor(24.0, 1.0);
+// Nonnegative logarithmic I/SIGI colors:
+//   0 / negative -> muted slate gray, ~3σ -> neutral silver-white, ~15σ -> bright gold, 120σ -> electric lime
+state.colorEmphasis = 0.0;
+const colZero = isigiToColor(-2.0, 1.0, 40.0);
+const colWeak = isigiToColor(0.4, 1.0, 40.0);
+const colMid = isigiToColor(3.5, 1.0, 40.0);
+const colGold = isigiToColor(14.0, 1.0, 40.0);
+const colLime = isigiToColor(150.0, 1.0, 40.0);
 
-// Peak source toggle ('mtz' -> 'predicted' -> 'integrated')
-applyPeakSource("mtz", false);
-const nMtzFrame = PEAKS.length;
-const nMtzWulff = getActiveWulffPeaks().length;
-const mtzShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse)) ? "ellipse" : "circle";
+// Colorscale emphasis slider: +1.0 ("Strong Only") suppresses moderate 4σ peaks; -1.0 ("All Peaks") boosts them
+state.colorEmphasis = 1.0;
+const colMidStrongOnly = isigiToColor(4.0, 1.0, 40.0);
+state.colorEmphasis = -1.0;
+const colMidAllPeaks = isigiToColor(4.0, 1.0, 40.0);
+state.colorEmphasis = 0.0;
 
+// Parallax trigger gating: off on plain hover, active when mouse button or keyboard modifier held
+const parIdle = isParallaxTriggerActive({{ buttons: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }});
+const parMouseBtn = isParallaxTriggerActive({{ buttons: 1, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }});
+const parCtrl = isParallaxTriggerActive({{ buttons: 0, ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }});
+
+// Peak source toggle ('predicted' <-> 'integrated') with .mtz I/σ column coloring
 applyPeakSource("predicted", false);
 const nPredFrame = PEAKS.length;
 const nPredWulff = getActiveWulffPeaks().length;
 const predShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse)) ? "ellipse" : "circle";
+const hasMtzCol = hasMtzIsigi();
+const mtzColStroke = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzIsigi(p))), 1.0);
 
 applyPeakSource("integrated", false);
 const nIntegFrame = PEAKS.length;
@@ -3175,13 +3245,14 @@ const integShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?
 console.log(JSON.stringify({{
   chiChecks,
   friedelNeg10AtPos10,
-  colWeak, colMid, colStrong,
-  nMtzFrame, nMtzWulff, mtzShape,
+  colZero, colWeak, colMid, colGold, colLime,
+  colMidStrongOnly, colMidAllPeaks,
+  parIdle, parMouseBtn, parCtrl,
+  hasMtzCol, mtzColStroke,
   nPredFrame, nPredWulff, predShape,
   nIntegFrame, nIntegWulff, integShape,
   btnPredDisabled: btns["btn-peaks-pred"].disabled,
   btnIntegDisabled: btns["btn-peaks-integ"].disabled,
-  btnMtzDisabled: btns["btn-peaks-mtz"].disabled,
 }}));
 """
     harness_path = tmp_path / "wulff_peaks_mtz_harness.js"
@@ -3206,40 +3277,61 @@ console.log(JSON.stringify({{
             assert chk["screenXErr"] < 1e-6
             assert chk["chiRecErr"] < 1e-6
             assert chk["chiRoundTripErr"] < 1e-6
-            # Exact dead-center alignment on Wulff sphere (no θ vs 2θ offset, no mirror inversion!)
             assert abs(chk["wSx"] - 100.0) < 1e-6
             assert abs(chk["wSy"] - 100.0) < 1e-6
             assert chk["wHemi"] == 1 and chk["wZ"] > 0.9999
-            # Positive elevation is upright (sy < 100) and +Δχ is to the right (rightSx > 100 > leftSx)
             assert chk["upSy"] < 95.0
             assert chk["rightSx"] > 102.0 and chk["leftSx"] < 98.0
 
-        # Friedel mate (-g) of chi=-10° sits smoothly to the left (sx < 100) on the FRONT hemisphere when viewing chi=+10°
         fr_proj = js_out["friedelNeg10AtPos10"]
         assert fr_proj[2] == 1 and fr_proj[3] > 0.98 and fr_proj[0] < 95.0
 
-        def _parse_rgba(s: str) -> tuple[int, int, int]:
-            nums = [int(x) for x in re.findall(r"\d+", s)[:3]]
-            return (nums[0], nums[1], nums[2])
+        def _parse_rgba(s: str) -> tuple[int, int, int, float]:
+            m_rgba = re.match(r"rgba\(\s*(\d+),\s*(\d+),\s*(\d+),\s*([0-9.]+)\s*\)", s)
+            assert m_rgba is not None, f"Unexpected rgba string: {s}"
+            return (
+                int(m_rgba.group(1)),
+                int(m_rgba.group(2)),
+                int(m_rgba.group(3)),
+                float(m_rgba.group(4)),
+            )
 
-        rw, _gw, bw = _parse_rgba(js_out["colWeak"])
-        rm, gm, bm = _parse_rgba(js_out["colMid"])
-        rs, gs, bs = _parse_rgba(js_out["colStrong"])
-        assert bw > rw + 120  # weak I/σ -> cool blue
-        assert rm > 240 and gm > 240 and bm > 240  # 3σ pivot -> crisp neutral white
-        assert rs > bs + 120 and rs > gs + 120  # strong I/σ -> warm crimson red
+        rz, gz, bz, _ = _parse_rgba(js_out["colZero"])
+        rw, gw, _bw, _ = _parse_rgba(js_out["colWeak"])
+        rm, gm, bm, _ = _parse_rgba(js_out["colMid"])
+        rg, gg, bg, _ = _parse_rgba(js_out["colGold"])
+        rl, gl, bl, _ = _parse_rgba(js_out["colLime"])
+        r_strong_only, g_strong_only, _, a_strong_only = _parse_rgba(
+            js_out["colMidStrongOnly"]
+        )
+        r_all_peaks, g_all_peaks, _, a_all_peaks = _parse_rgba(js_out["colMidAllPeaks"])
 
-        assert js_out["nMtzFrame"] == len(payload_mtz["mtz_peaks"])
-        assert js_out["nMtzWulff"] == len(payload_mtz["mtz_sample_peaks"])
-        assert js_out["mtzShape"] == "circle"
+        # Nonnegative clamped log scale: negative/zero -> muted slate gray (148, 163, 184), never saturated blue!
+        assert (rz, gz, bz) == (148, 163, 184)
+        assert rw < rm and gw < gm
+        # Moderate SNR -> crisp neutral silver-white
+        assert rm > 205 and gm > 210 and bm > 190
+        # High SNR -> warm gold, brightest SNR -> electric lime standing out above detector pixels
+        assert rg > 225 and gg > 190 and bg < 110
+        assert gl >= 235 and gl > rl and bl < 80
+        # Emphasis slider shifts mid-SNR contrast & opacity between "Strong Only" (+1) and "All Peaks" (-1)
+        assert (r_all_peaks + g_all_peaks) > (r_strong_only + g_strong_only) + 100
+        assert a_strong_only < 0.40 and a_all_peaks >= 0.99
+
+        # Parallax gated strictly on held mouse button or keyboard modifier
+        assert js_out["parIdle"] is False
+        assert js_out["parMouseBtn"] is True
+        assert js_out["parCtrl"] is True
+
+        assert js_out["hasMtzCol"] is True
+        assert js_out["mtzColStroke"].startswith("rgba(")
         assert js_out["nPredFrame"] == len(payload_mtz["predicted_peaks"])
-        assert js_out["nPredWulff"] == len(payload_mtz["predicted_sample_peaks"])
+        assert js_out["nPredWulff"] == len(samp_with_mtz)
         assert js_out["predShape"] == "circle"
         assert js_out["nIntegFrame"] == 1 and js_out["nIntegWulff"] == 2
         assert js_out["integShape"] == "ellipse"
         assert js_out["btnPredDisabled"] is False
         assert js_out["btnIntegDisabled"] is False
-        assert js_out["btnMtzDisabled"] is False
 
 
 def test_mandi_i2_harmonics_wulff_snr_dimming_and_hires_textures(tmp_path) -> None:
@@ -3666,16 +3758,20 @@ def test_mtz_vectorized_speed_and_multirun_dedup(tmp_path):
 
     assert elapsed < 3.0, f"Vectorized MTZ load took too long: {elapsed:.2f}s"
     np.testing.assert_allclose(out["b_matrix"], b_before)
-    mtz_frame = out["mtz_peaks"]
-    mtz_all = out["mtz_sample_peaks"]
+    assert out["default_color_mode"] == "mtz_isigi"
+    assert "mtz_peaks" not in out
+    mtz_frame = [p for p in out["predicted_peaks"] if p.get("mtz_isigi") is not None]
+    mtz_all = [
+        p for p in out["predicted_sample_peaks"] if p.get("mtz_isigi") is not None
+    ]
     assert len(mtz_frame) > 0
     assert len(mtz_all) >= len(mtz_frame)
     # Multi-run Wulff sample peaks must have unique crystal (h, k, l) keys and preserve active-frame hits
-    seen_hkls = {tuple(p["hkl"]) for p in mtz_all}
-    assert len(seen_hkls) == len(mtz_all)
+    seen_hkls = {tuple(p["hkl"]) for p in out["predicted_sample_peaks"]}
+    assert len(seen_hkls) == len(out["predicted_sample_peaks"])
     frame_hkls = {tuple(p["hkl"]) for p in mtz_frame}
     assert frame_hkls.issubset(seen_hkls)
-    by_hkl = {tuple(p["hkl"]): p for p in mtz_all}
+    by_hkl = {tuple(p["hkl"]): p for p in out["predicted_sample_peaks"]}
     for fp in mtz_frame:
         assert by_hkl[tuple(fp["hkl"])]["run_index"] == 2
 
@@ -4287,9 +4383,32 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
                 float(lam1[i_pk]),
             )
             chosen_hkls.append(key_h)
+    # Also include HKLs that would strike OTHER uninstalled MANDI banks (e.g. bank 22)
+    # to prove .mtz reflections ONLY project onto panels where predicted peaks project (bank 19)!
+    uninstalled_det = Detector(dict(beamlines["MANDI"]["22"]))
+    _, _, h22, k22, l22, _ = predict_reflections_on_panel(
+        uninstalled_det,
+        grid[:, 0],
+        grid[:, 1],
+        grid[:, 2],
+        U_solve @ B_solve,
+        wl_min,
+        wl_max,
+        sample_offset=offs_1,
+        ki_vec=ki_vec,
+        gonio_axes=axes,
+        gonio_angles=eff_ang_1,
+        gonio_offsets=zero_offs,
+    )
+    assert len(h22) >= 2
+    extra_b22_hkls = [
+        (int(h22[0]), int(k22[0]), int(l22[0])),
+        (int(h22[1]), int(k22[1]), int(l22[1])),
+    ]
     mtz_foreign.set_data(
         np.asarray(
-            [[h, k, l, 300.0, 10.0] for (h, k, l) in chosen_hkls], dtype=np.float32
+            [[h, k, l, 300.0, 10.0] for (h, k, l) in (chosen_hkls + extra_b22_hkls)],
+            dtype=np.float32,
         )
     )
     foreign_mtz_path = tmp_path / "unrelated_trigonal.mtz"
@@ -4303,15 +4422,26 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
     assert np.allclose(np.asarray(overlaid["u_matrix"]), U_solve, atol=1e-7)
     assert overlaid["space_group"] == solve_sg
     assert np.allclose(overlaid["cell"], solve_cell, atol=1e-3)
+    assert overlaid["default_color_mode"] == "mtz_isigi"
+    assert "mtz_peaks" not in overlaid
     assert isinstance(overlaid.get("mtz_overlay_warning"), str)
     assert "P 32 2 1" in overlaid["mtz_overlay_warning"]
     assert "I 1 2 1" in overlaid["mtz_overlay_warning"]
 
-    # 2. Every projected MTZ reflection matches predict_reflections_on_panel pixel (row, col) & wavelength
-    #    under the solved geometry AND has exact d_spacing = 1 / |B_solve @ hkl| (zero unit-cell rescaling or foreign-SG shear)!
+    # 2. Strictly restricted to active predicted-peak panel bank 19 (NEVER bank 22 or other MANDI banks!)
+    all_pred_banks = {int(pk["bank"]) for pk in overlaid["predicted_peaks"]}
+    all_samp_banks = {int(pk["bank"]) for pk in overlaid["predicted_sample_peaks"]}
+    assert all_pred_banks == {bk_id}
+    assert all_samp_banks == {bk_id}
+
+    # Every projected MTZ reflection matches predict_reflections_on_panel pixel (row, col) & wavelength
+    # under the solved geometry AND has exact d_spacing = 1 / |B_solve @ hkl| (zero unit-cell rescaling or foreign-SG shear)!
+    mtz_tagged = [
+        pk for pk in overlaid["predicted_peaks"] if pk.get("mtz_isigi") is not None
+    ]
     by_hkl_b19 = {
         tuple(int(x) for x in pk["hkl"]): pk
-        for pk in overlaid["mtz_peaks"]
+        for pk in mtz_tagged
         if int(pk["bank"]) == bk_id
     }
     for key_h, (exp_r, exp_c, exp_lam) in expected_r1.items():
@@ -4322,16 +4452,17 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
         assert abs(float(got_pk["row"]) - exp_r) < 0.01
         assert abs(float(got_pk["col"]) - exp_c) < 0.01
         assert abs(float(got_pk["wavelength"]) - exp_lam) < 1e-3
+        assert abs(float(got_pk["mtz_isigi"]) - 30.0) < 1e-2
         d_true = float(1.0 / np.linalg.norm(B_solve @ np.asarray(key_h, dtype=float)))
         assert abs(float(got_pk["d_spacing"]) - d_true) < 1e-3
         assert float(got_pk["angular_error_deg"]) < 0.02
 
-    for pk in overlaid["mtz_peaks"]:
+    for pk in mtz_tagged:
         h_vec = np.asarray(pk["hkl"], dtype=float)
         d_true_pk = float(1.0 / np.linalg.norm(B_solve @ h_vec))
         assert abs(float(pk["d_spacing"]) - d_true_pk) < 1e-3
 
-    # 3. Loading a matching-symmetry/cell MTZ emits NO warning
+    # 3. Loading a matching-symmetry/cell MTZ emits NO warning and populates mtz_isigi on bank 19 only
     mtz_same = gemmi.Mtz(with_base=True)
     mtz_same.spacegroup = gemmi.find_spacegroup_by_name(solve_sg)
     mtz_same.set_cell_for_all(gemmi.UnitCell(*solve_cell))
@@ -4340,7 +4471,8 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
     mtz_same.add_column("SIGI", "Q")
     mtz_same.set_data(
         np.asarray(
-            [[h, k, l, 300.0, 10.0] for (h, k, l) in chosen_hkls], dtype=np.float32
+            [[h, k, l, 300.0, 10.0] for (h, k, l) in (chosen_hkls + extra_b22_hkls)],
+            dtype=np.float32,
         )
     )
     same_mtz_path = tmp_path / "matching_monoclinic.mtz"
@@ -4349,6 +4481,13 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
         payload_r1, same_mtz_path, {"name": "matching_monoclinic.mtz"}
     )
     assert overlaid_same["mtz_overlay_warning"] is None
+    assert {int(pk["bank"]) for pk in overlaid_same["predicted_peaks"]} == {bk_id}
+    same_tagged_hkls = {
+        tuple(int(x) for x in pk["hkl"])
+        for pk in overlaid_same["predicted_peaks"]
+        if pk.get("mtz_isigi") is not None
+    }
+    assert set(expected_r1.keys()).issubset(same_tagged_hkls)
 
     html_warn = render_rainbow_html(overlaid)
     assert "mtz_overlay_warning" in html_warn
