@@ -8167,6 +8167,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     terminalScrollTop: 0,
   }};
 
+  const DEFAULT_COLOR_CROSSOVER = 0.38;
+  const ORBIT_PALETTE = [
+    "#ff38b4", "#00e5ff", "#fbbf24", "#10b981", "#a855f7", "#f97316",
+    "#38bdf8", "#84cc16", "#f43f5e", "#14b8a6", "#eab308", "#6366f1"
+  ];
+  let _peakDataAvailabilitySig = "";
+  let _peakDataAvailability = {{
+    hasIsigi: false,
+    hasMtzIsigi: false,
+    hasResiduals: false,
+    hasScales: false,
+    isigiTop: 40.0,
+    mtzIsigiTop: 40.0,
+  }};
+
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
   const bankCanvases = new Map();
   const warpedBankCanvases = new Map();
@@ -9154,8 +9169,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }};
   }}
 
-  const DEFAULT_COLOR_CROSSOVER = 0.38;
-
   function getColorCrossover() {{
     const raw = Number(state.colorCrossover);
     return Number.isFinite(raw) ? Math.max(0.05, Math.min(0.95, raw)) : DEFAULT_COLOR_CROSSOVER;
@@ -9179,11 +9192,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const hue = (1.0 - t) * 265;
     return `hsla(${{hue.toFixed(1)}}, 95%, 60%, ${{alpha}})`;
   }}
-
-  const ORBIT_PALETTE = [
-    "#ff38b4", "#00e5ff", "#fbbf24", "#10b981", "#a855f7", "#f97316",
-    "#38bdf8", "#84cc16", "#f43f5e", "#14b8a6", "#eab308", "#6366f1"
-  ];
 
   // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma
   function residualToColor(resVal, alpha = 1.0) {{
@@ -9227,16 +9235,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     return NaN;
   }}
-
-  let _peakDataAvailabilitySig = "";
-  let _peakDataAvailability = {{
-    hasIsigi: false,
-    hasMtzIsigi: false,
-    hasResiduals: false,
-    hasScales: false,
-    isigiTop: 40.0,
-    mtzIsigiTop: 40.0,
-  }};
 
   function getPeakDataAvailability() {{
     const p0 = PEAKS.length > 0 ? PEAKS[0] : null;

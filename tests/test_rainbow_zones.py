@@ -4566,3 +4566,159 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
 
     html_warn = render_rainbow_html(overlaid)
     assert "mtz_overlay_warning" in html_warn
+
+
+def test_full_inline_script_boot_and_data_sources_menu(tmp_path) -> None:
+    """Execute the full rendered <script> top-to-bottom in Node to guard against TDZ/hoisting bugs."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    assert shutil.which("node"), "Node.js required for inline script boot test"
+
+    empty_model = SubhklGalaxyModel()
+    html_doc = render_rainbow_html(empty_model.payload)
+    script = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
+
+    js_file = tmp_path / "full_boot_check.js"
+    js_file.write_text(
+        """
+const elems = new Map();
+function makeCtx() {
+  return {
+    fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+    textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+    setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+    transform() {}, clearRect() {}, fillRect() {}, strokeRect() {},
+    beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, ellipse() {},
+    quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+    stroke() {}, fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+    fillText() {}, strokeText() {}, drawImage() {},
+    measureText(t) { return { width: String(t).length * 6 }; },
+    createLinearGradient() { return { addColorStop() {} }; },
+    createRadialGradient() { return { addColorStop() {} }; },
+    getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+    putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+  };
+}
+function makeEl(id = "") {
+  const listeners = {};
+  const styleProps = {};
+  const el = {
+    id, tagName: id.startsWith("sel-") ? "SELECT" : "DIV",
+    value: id === "slider-color-emphasis" ? "0.38" : "",
+    min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 300, height: 240, clientWidth: 300, clientHeight: 240,
+    scrollWidth: 300, scrollHeight: 240, scrollTop: 0, offsetWidth: 300, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null,
+    dataset: {},
+    clicked: 0,
+    style: new Proxy(styleProps, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: {
+      _s: new Set(),
+      add(...c) { c.forEach(x => this._s.add(x)); },
+      remove(...c) { c.forEach(x => this._s.delete(x)); },
+      toggle(c, f) { if (f === undefined ? !this._s.has(c) : f) { this._s.add(c); return true; } this._s.delete(c); return false; },
+      contains(c) { return this._s.has(c); }
+    },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) {
+      const arr = listeners[evObj.type] || [];
+      arr.forEach(fn => fn.call(el, evObj));
+    },
+    click() { el.clicked += 1; el.dispatchEvent({ type: "click", target: el, preventDefault() {}, stopPropagation() {} }); },
+    focus() {}, blur() {}, select() {}, remove() {},
+    appendChild(ch) { this.children.push(ch); ch.parentElement = this; return ch; },
+    insertBefore(ch) { this.children.push(ch); ch.parentElement = this; return ch; },
+    replaceChildren(...ch) { this.children = ch; },
+    setAttribute(k, v) { this[k] = v; },
+    getAttribute(k) { return this[k] ?? null; },
+    removeAttribute(k) { delete this[k]; },
+    getBoundingClientRect() { return { left: 0, top: 0, right: 300, bottom: 240, width: 300, height: 240 }; },
+    getContext() { return makeCtx(); },
+    querySelector() { return makeEl(); },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+  };
+  return el;
+}
+function getEl(id) {
+  if (!elems.has(id)) elems.set(id, makeEl(id));
+  return elems.get(id);
+}
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.location = { href: "about:srcdoc", origin: "http://localhost:8080", pathname: "/", search: "" };
+globalThis.navigator = { clipboard: { writeText: async () => {} } };
+globalThis.Image = class { set src(v) { this._src = v; } };
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.AbortController = class { constructor() { this.signal = {}; } abort() {} };
+globalThis.requestAnimationFrame = () => 1;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => "" });
+globalThis.document = {
+  body: makeEl("body"),
+  documentElement: makeEl("html"),
+  activeElement: null,
+  getElementById(id) { return getEl(id); },
+  createElement(tag) { return makeEl(tag); },
+  querySelector(sel) { return sel.startsWith("#") ? getEl(sel.slice(1)) : makeEl(sel); },
+  querySelectorAll() { return []; },
+  addEventListener() {},
+  removeEventListener() {},
+};
+"""
+        + script
+        + """
+const slCs = elems.get("slider-color-emphasis");
+const selSrc = elems.get("sel-galaxy-h5");
+const modalNd = elems.get("modal-neutron-data");
+const inpLocal = elems.get("inp-local-h5");
+
+selSrc.value = "__action_neutron_data__";
+selSrc.dispatchEvent({ type: "change", target: selSrc });
+const ndDisplay = modalNd.style.display;
+
+selSrc.value = "__action_local_file__";
+selSrc.dispatchEvent({ type: "change", target: selSrc });
+const localClicked = inpLocal ? inpLocal.clicked : 0;
+
+console.log(JSON.stringify({
+  csGradientSet: Boolean(slCs && slCs.style["--cs-gradient"] && slCs.style["--cs-gradient"].startsWith("linear-gradient(")),
+  ndDisplay,
+  localClicked,
+}));
+process.exit(0);
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["csGradientSet"] is True
+    assert out["ndDisplay"] == "flex"
+    assert out["localClicked"] == 1
