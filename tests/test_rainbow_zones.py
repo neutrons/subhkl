@@ -5711,3 +5711,139 @@ process.exit(0);
         py_mht = py_mandi_map[key]
         assert abs(js_mp["row"] - py_mht[1]) < 0.06
         assert abs(js_mp["col"] - py_mht[2]) < 0.06
+
+
+def test_edge_mask_overlay_and_mandi_default_border(tmp_path):
+    """MANDI defaults rel_border_width to 0.06 (6%), CG4D to 0.03 (3%), and Mask view renders the live edge frame."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        default_rel_border_for_instrument,
+        render_rainbow_html,
+    )
+
+    assert default_rel_border_for_instrument("MANDI") == 0.06
+    assert default_rel_border_for_instrument("CG4D") == 0.03
+
+    mandi_h5 = tmp_path / "mandi_edge_test.h5"
+    with h5py.File(mandi_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["images"] = np.ones((1, 256, 256), dtype=np.float32) * 10.0
+        hf["bank_ids"] = np.array([20], dtype=np.int32)
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=np.float32)
+
+    p_mandi = build_rainbow_zone_payload(
+        replay_h5=mandi_h5, instrument="MANDI", include_panel_images=False
+    )
+    b20 = next(pn for pn in p_mandi["panels"] if pn["bank"] == 20)
+    assert b20["n_rows"] == 256 and b20["n_cols"] == 256
+
+    html_mandi = render_rainbow_html(p_mandi)
+    assert 'id="lbl-mask-edge"' in html_mandi
+    assert "Edge 6.0%" in html_mandi
+    assert (
+        'id="inp-border" type="number" min="0" max="0.25" step="0.005" value="0.06"'
+        in html_mandi
+    )
+
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_mandi)
+        inline_js = script_blocks[-1]
+        js_check = tmp_path / "edge_mask_inline.js"
+        js_check.write_text(inline_js, encoding="utf-8")
+        subprocess.run(["node", "--check", str(js_check)], check=True)
+
+        fn_names = [
+            "defaultRelBorderForInstrument",
+            "getActiveRelBorderWidth",
+            "getBorderMaskCanvas",
+            "hasPixelMask",
+            "syncPixelMaskUI",
+        ]
+        extracted = []
+        for fn_name in fn_names:
+            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            assert m is not None, f"Missing JS function {fn_name}"
+            start = m.start()
+            depth = 0
+            in_body = False
+            end = start
+            for idx in range(start, len(inline_js)):
+                ch = inline_js[idx]
+                if ch == "{":
+                    depth += 1
+                    in_body = True
+                elif ch == "}":
+                    depth -= 1
+                    if in_body and depth == 0:
+                        end = idx + 1
+                        break
+            extracted.append(inline_js[start:end])
+
+        harness = f"""
+const borderMaskCache = new Map();
+const maskBankCanvases = new Map();
+const PANELS = [{{ bank: 20, n_rows: 256, n_cols: 256 }}];
+const DATA = {{ instrument: "MANDI", em_mask_summary: {{ available: false }} }};
+const state = {{ showPixelMask: true }};
+const domEls = {{
+  "inp-border": {{ value: "0.06" }},
+  "btn-pixel-mask": {{ style: {{}}, title: "", classList: {{ toggle() {{}} }} }},
+  "mask-legend-row": {{ style: {{}} }},
+  "lbl-mask-dark": {{ textContent: "" }},
+  "lbl-mask-bright": {{ textContent: "" }},
+  "lbl-mask-edge": {{ textContent: "" }},
+}};
+globalThis.document = {{
+  getElementById: (id) => domEls[id] || null,
+  createElement: () => {{
+    const ops = [];
+    const ctx = {{
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 1,
+      clearRect() {{}},
+      setLineDash() {{}},
+      fillRect(...a) {{ ops.push(["fillRect", ...a]); }},
+      strokeRect(...a) {{ ops.push(["strokeRect", ...a]); }},
+    }};
+    return {{ width: 0, height: 0, ops, getContext: () => ctx }};
+  }},
+}};
+
+{chr(10).join(extracted)}
+
+const c06 = getBorderMaskCanvas(PANELS[0], getActiveRelBorderWidth());
+syncPixelMaskUI();
+const edgeTxt06 = domEls["lbl-mask-edge"].textContent;
+domEls["inp-border"].value = "0.08";
+const c08 = getBorderMaskCanvas(PANELS[0], getActiveRelBorderWidth());
+syncPixelMaskUI();
+const edgeTxt08 = domEls["lbl-mask-edge"].textContent;
+
+console.log(JSON.stringify({{
+  w: c06.width,
+  h: c06.height,
+  topBandH06: c06.ops[0][4],
+  topBandH08: c08.ops[0][4],
+  edgeTxt06,
+  edgeTxt08,
+  btnOpacity: domEls["btn-pixel-mask"].style.opacity,
+}}));
+"""
+        hf_js = tmp_path / "edge_mask_harness.js"
+        hf_js.write_text(harness, encoding="utf-8")
+        res = subprocess.run(
+            ["node", str(hf_js)], check=True, capture_output=True, text=True
+        )
+        out = json.loads(res.stdout.strip())
+        assert out["w"] == 256 and out["h"] == 256
+        assert out["topBandH06"] == 15  # round(0.06 * 256) == 15 px
+        assert out["topBandH08"] == 20  # round(0.08 * 256) == 20 px
+        assert out["edgeTxt06"] == "Edge 6.0% (15px)"
+        assert out["edgeTxt08"] == "Edge 8.0% (20px)"
+        assert out["btnOpacity"] == "1"

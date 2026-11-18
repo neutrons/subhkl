@@ -1014,7 +1014,7 @@ def integrator(
             "upward (broad templates soak background pedestals).  "
             "0 keeps every peak."
         ),
-    ] = 0.0,
+    ] = 5.0,
     shape_fit_normalized: Annotated[
         bool,
         typer.Option(
@@ -1075,6 +1075,16 @@ def integrator(
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.03,
+    allow_negative: Annotated[
+        bool,
+        typer.Option(
+            "--allow-negative/--no-allow-negative",
+            help="Take one unconstrained Fisher-scoring step around the "
+            "joint nonnegative Poisson MLE so weak reflections carry "
+            "unbiased signed intensities I +- sigI for downstream "
+            "Bayesian/Careless merging instead of being censored at zero.",
+        ),
+    ] = False,
     show_progress: Annotated[bool, typer.Option("--show-progress")] = True,
     create_visualizations: bool = False,
     chunk_size: int = 256,
@@ -1121,6 +1131,7 @@ def integrator(
         matrix_free_fp_target=matrix_free_fp_target,
         static_mask_file=static_mask_file,
         rel_border_width=rel_border_width,
+        allow_negative=allow_negative,
         show_progress=show_progress,
         create_visualizations=create_visualizations,
         chunk_size=chunk_size,

@@ -5283,12 +5283,33 @@ class NovaGalaxyPipelineRunner:
                 merged_path,
             ]
         elif stage_id == "solve" and os.path.isfile(merged_path):
+            from subhkl.viz.rainbow_zones import default_rel_border_for_instrument
+
             refine_modes_str = str(
                 params.get(
                     "refine_modes",
                     "cylindrical,axial_stretch,area,global_rot,global_trans,sample,cell,per_run,per_run_trans",
                 )
             )
+            rel_border_solve = float(
+                params.get(
+                    "rel_border_width",
+                    default_rel_border_for_instrument(str(inst)),
+                )
+            )
+            solve_bw_px = 4
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py as _h5
+
+                with _h5.File(merged_path, "r") as _mf:
+                    if "images/ims" in _mf and _mf["images/ims"].ndim >= 3:
+                        _im_sh = _mf["images/ims"].shape
+                        solve_bw_px = max(
+                            0,
+                            round(
+                                rel_border_solve * min(int(_im_sh[1]), int(_im_sh[2]))
+                            ),
+                        )
             inner_cmd = [
                 "python",
                 "-u",
@@ -5309,6 +5330,8 @@ class NovaGalaxyPipelineRunner:
                 str(wl[1]),
                 "--d-min",
                 str(params.get("d_min") or round(0.5 * float(wl[0]), 2)),
+                "--border-width",
+                str(solve_bw_px),
                 "--refinement",
                 str(params.get("objective", "band")),
             ]
@@ -5319,6 +5342,8 @@ class NovaGalaxyPipelineRunner:
             and os.path.isfile(merged_path)
             and os.path.isfile(solve_path)
         ):
+            from subhkl.viz.rainbow_zones import default_rel_border_for_instrument
+
             d_min_req = float(params.get("d_min") or round(0.5 * float(wl[0]), 2))
             d_min_val = str(round(d_min_req, 3))
             pred_cmd = [
@@ -5340,7 +5365,21 @@ class NovaGalaxyPipelineRunner:
                 "--space-group",
                 str(sg),
             ]
-            rel_border = float(params.get("rel_border_width", 0.03))
+            rel_border = float(
+                params.get(
+                    "rel_border_width",
+                    default_rel_border_for_instrument(str(inst)),
+                )
+            )
+            shape_min_snr = float(params.get("shape_fit_min_snr", 5.0))
+            has_solve_mask = False
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py as _h5
+
+                with _h5.File(solve_path, "r") as _sf:
+                    has_solve_mask = (
+                        "detector/pixel_mask" in _sf and "detector/mask_bank_ids" in _sf
+                    )
             int_cmd = [
                 "python",
                 "-u",
@@ -5354,11 +5393,16 @@ class NovaGalaxyPipelineRunner:
                 "--anisotropic",
                 "--fit-mosaicity",
                 "--shape-fit-normalized",
+                "--shape-fit-min-snr",
+                str(round(shape_min_snr, 2)),
+                "--allow-negative",
                 "--matrix-free",
                 "--rel-border-width",
                 str(round(rel_border, 4)),
                 "--show-progress",
             ]
+            if has_solve_mask:
+                int_cmd.extend(["--static-mask-file", solve_path])
             mtz_cmd = [
                 "python",
                 "-u",
@@ -5410,6 +5454,9 @@ class NovaGalaxyPipelineRunner:
                             exp.write_mtz(mtz_dest)
             careless_iters = int(params.get("iterations") or 10000)
             studentt_dof = float(params.get("studentt_dof") or 4.0)
+            wilson_b = float(params.get("wilson_prior_b") or 40.0)
+            spectral_file = str(params.get("spectral_file") or "").strip()
+            lorentz_corr = bool(params.get("lorentz_correction", bool(spectral_file)))
             merge_work = os.path.join(work_dir, "careless_work")
             os.makedirs(merge_work, exist_ok=True)
             unmerged_mtz = os.path.join(merge_work, "input_unmerged.mtz")
@@ -5419,7 +5466,7 @@ class NovaGalaxyPipelineRunner:
             xval_mtz_out = os.path.join(work_dir, "xval.mtz")
             metrics_json_out = os.path.join(work_dir, "careless_metrics.json")
             prep_py = (
-                "import gemmi, reciprocalspaceship as rs\n"
+                "import gemmi, numpy as np, reciprocalspaceship as rs\n"
                 f"mtz = gemmi.read_mtz_file({mtz_dest!r})\n"
                 "c = mtz.cell\n"
                 "na = 90.0 if abs(c.alpha - 90) < 0.2 else (120.0 if abs(c.alpha - 120) < 0.2 else c.alpha)\n"
@@ -5431,14 +5478,18 @@ class NovaGalaxyPipelineRunner:
                 "ds = rs.read_mtz(cell_mtz)\n"
                 "if 'SIGI' in ds:\n"
                 "    ds = ds[ds['SIGI'] > 0]\n"
+                "if 'BATCH' in ds and 'RUN' not in ds:\n"
+                "    ds['RUN'] = rs.DataSeries((ds['BATCH'].to_numpy().astype(int) // 1000).astype(np.float32), index=ds.index, dtype='R')\n"
                 "if not ds.get_m_isym_keys():\n"
                 "    ds = ds.hkl_to_asu()\n"
                 "ds.merged = False\n"
                 f"ds.write_mtz({unmerged_mtz!r})\n"
-                "cols = {col.label for col in mtz.columns}\n"
-                "keys = ['WAVEL','THETA','PHI','dHKL','H_0','K_0','L_0','H','K','L','image_id','file_id','asu_id','harmonic_id']\n"
-                "for extra in ('SIGEFF', 'SNAPD', 'DPHI', 'DTX', 'DTY', 'DTZ'):\n"
-                "    if extra in cols:\n"
+                "# Restrict neural-scaler metadata strictly to physical beam/detector/run\n"
+                "# coordinates -- never Miller indices/asu_id (overfitting) or dHKL\n"
+                "# (induces intra-bin resolution-slope correlation).\n"
+                "keys = [k for k in ('WAVEL', 'THETA', 'PHI') if k in ds]\n"
+                "for extra in ('RUN', 'DPHI', 'DTX', 'DTY', 'DTZ'):\n"
+                "    if extra in ds and float(np.nanstd(ds[extra].to_numpy())) > 1e-6:\n"
                 "        keys.append(extra)\n"
                 "print(','.join(keys))\n"
             )
@@ -5515,10 +5566,26 @@ class NovaGalaxyPipelineRunner:
             with contextlib.suppress(OSError):
                 os.chmod(prep_script, 0o666)
                 os.chmod(post_script, 0o666)
+            careless_extra_flags = [
+                "--disable-image-scales",
+                f"--wilson-prior-b={wilson_b}",
+            ]
+            if spectral_file and os.path.isfile(spectral_file):
+                careless_extra_flags.extend(
+                    [
+                        f"--spectral-file={shlex.quote(spectral_file)}",
+                        "--trainable-spectral-scale",
+                    ]
+                )
+                if lorentz_corr:
+                    careless_extra_flags.append("--lorentz-correction")
+            elif lorentz_corr:
+                careless_extra_flags.append("--lorentz-correction")
+            extra_flags_str = " ".join(careless_extra_flags)
             chained_merge = (
                 f"set -e; "
                 f"MKEYS=$(python {shlex.quote(prep_script)}) && "
-                f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
+                f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} {extra_flags_str} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
                 f"python {shlex.quote(post_script)}"
             )
             inner_cmd = ["bash", "-c", chained_merge]

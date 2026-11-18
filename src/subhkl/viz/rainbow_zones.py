@@ -139,11 +139,26 @@ def _get_instrument_default_wavelength(instrument: str | None) -> tuple[float, f
     return _FALLBACK_INSTRUMENT_WAVELENGTHS.get(key, (2.0, 4.5))
 
 
+ANGER_CAMERA_INSTRUMENTS = {"MANDI", "TOPAZ", "SNAP"}
+
+
 def default_projection_for_instrument(instrument: str | None) -> str:
     """Return ``'spherical'`` for spherical instruments (e.g. MANDI) and ``'cylindrical'`` for cylindrical ones (e.g. CG4D)."""
     if instrument and str(instrument).strip().upper() in SPHERICAL_INSTRUMENTS:
         return "spherical"
     return "cylindrical"
+
+
+def default_rel_border_for_instrument(instrument: str | None) -> float:
+    """Return default fractional detector-panel border mask width.
+
+    Anger-camera area detectors (MANDI, TOPAZ, SNAP) exhibit dead outer rims
+    plus PMT edge-reflection pileup out to ~15 px on 256x256 panels (~6%),
+    whereas image-plate / tube banks only need ~3%.
+    """
+    if instrument and str(instrument).strip().upper() in ANGER_CAMERA_INSTRUMENTS:
+        return 0.06
+    return 0.03
 
 
 _UNIT_CELL_NUM_PAT = r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?"
@@ -968,6 +983,8 @@ def _encode_panel_textures(
             panels_payload.append(
                 {
                     "bank": int(bk),
+                    "n_rows": int(det.n),
+                    "n_cols": int(det.m),
                     "az_min": round(az_min, 3),
                     "az_max": round(az_max, 3),
                     "y_min": round(y_min, 4),
@@ -6315,6 +6332,11 @@ def render_rainbow_html(
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
     init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
     init_dmin = float(payload.get("d_min") or round(0.5 * init_wl_min, 2))
+    init_border = float(
+        payload.get("rel_border_width")
+        if payload.get("rel_border_width") is not None
+        else default_rel_border_for_instrument(inst)
+    )
     sg_symmetry_groups_json = _build_space_group_symmetry_lookup_json()
     ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
     base_tag_html = (
@@ -7682,14 +7704,18 @@ def render_rainbow_html(
               <option value="scale">Color: Scale</option>
             </select>
           </div>
-          <div id="mask-legend-row" class="slider-row" style="display:none;margin-top:3px;padding-top:3px;border-top:1px solid rgba(38,49,79,0.75);font-size:0.61rem;gap:6px;">
-            <span style="display:inline-flex;align-items:center;gap:4px;" title="Dead detector banks and cryostat/panel shadows ignored during solve &amp; prediction">
+          <div id="mask-legend-row" class="slider-row" style="display:none;margin-top:3px;padding-top:3px;border-top:1px solid rgba(38,49,79,0.75);font-size:0.61rem;gap:6px;flex-wrap:wrap;">
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Dead detector banks and cryostat/panel shadows ignored during solve, prediction &amp; integration">
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(56,189,248,0.62);border:1px solid #38bdf8;"></span>
               <span id="lbl-mask-dark">Dark 0.0%</span>
             </span>
-            <span style="display:inline-flex;align-items:center;gap:4px;" title="Static bright enclosure flares &amp; hot strips ignored during solve &amp; prediction">
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Static bright enclosure flares &amp; hot strips ignored during solve, prediction &amp; integration">
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(180,255,20,0.88);border:1px solid #b4ff14;"></span>
               <span id="lbl-mask-bright">Bright 0.00%</span>
+            </span>
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Detector panel perimeter border exclusion width (adjust 'border' in Params)">
+              <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(251,146,60,0.52);border:1px solid #fb923c;"></span>
+              <span id="lbl-mask-edge">Edge {init_border * 100.0:.1f}%</span>
             </span>
           </div>
         </div>
@@ -7780,7 +7806,7 @@ def render_rainbow_html(
       <span title="Minimum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_min <input id="inp-lmin" type="number" step="0.05" value="{init_wl_min:.2f}" style="width:48px;" /></span>
       <span title="Maximum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_max <input id="inp-lmax" type="number" step="0.05" value="{init_wl_max:.2f}" style="width:48px;" /></span>
       <span title="High-resolution cutoff d_min [Å] (synchronized with sidebar slider)">d_min <input id="inp-dmin" type="number" step="0.05" value="{init_dmin:.2f}" style="width:48px;" /></span>
-      <span title="Panel border rejection width (fraction of image size)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="0.03" style="width:52px;" /></span>
+      <span title="Panel border rejection width (fraction of image size; visualized in Mask view)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="{init_border:.3g}" style="width:52px;" /></span>
     </div>
     <div id="files-drawer" class="params-drawer"></div>
     <div class="ladder-rungs" id="ladder-rungs"></div>
@@ -9334,6 +9360,52 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return c;
   }}
 
+  const borderMaskCache = new Map();
+  let _userTouchedBorder = false;
+
+  function defaultRelBorderForInstrument(instName) {{
+    const s = String(instName || "").trim().toUpperCase();
+    return (s === "MANDI" || s === "TOPAZ" || s === "SNAP") ? 0.06 : 0.03;
+  }}
+
+  function getActiveRelBorderWidth() {{
+    const el = document.getElementById("inp-border");
+    const fallback = defaultRelBorderForInstrument(DATA && DATA.instrument);
+    if (!el) return fallback;
+    const v = Number(el.value);
+    return Number.isFinite(v) ? Math.max(0.0, Math.min(0.25, v)) : fallback;
+  }}
+
+  function getBorderMaskCanvas(panel, relBorder) {{
+    if (!(relBorder > 0)) return null;
+    const rawW = (panel && (panel.n_cols || (panel._grayCanvas && panel._grayCanvas.width))) || 256;
+    const rawH = (panel && (panel.n_rows || (panel._grayCanvas && panel._grayCanvas.height))) || 256;
+    const maxDim = Math.max(rawW, rawH, 1);
+    const scale = maxDim > 512 ? (512 / maxDim) : (maxDim < 64 ? (64 / maxDim) : 1.0);
+    const W = Math.max(32, Math.round(rawW * scale));
+    const H = Math.max(32, Math.round(rawH * scale));
+    const bw = Math.min(Math.floor(Math.min(W, H) * 0.45), Math.max(1, Math.round(relBorder * Math.min(W, H))));
+    const key = `${{W}}x${{H}}_${{bw}}`;
+    let c = borderMaskCache.get(key);
+    if (c) return c;
+    c = document.createElement("canvas");
+    c.width = W;
+    c.height = H;
+    const ctx = c.getContext("2d");
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "rgba(251, 146, 60, 0.40)";
+    ctx.fillRect(0, 0, W, bw);
+    ctx.fillRect(0, H - bw, W, bw);
+    ctx.fillRect(0, bw, bw, Math.max(0, H - 2 * bw));
+    ctx.fillRect(W - bw, bw, bw, Math.max(0, H - 2 * bw));
+    ctx.strokeStyle = "rgba(251, 146, 60, 0.92)";
+    ctx.lineWidth = Math.max(1, Math.round(Math.min(W, H) / 160));
+    if (ctx.setLineDash) ctx.setLineDash([4, 3]);
+    ctx.strokeRect(bw + 0.5, bw + 0.5, Math.max(1, W - 2 * bw - 1), Math.max(1, H - 2 * bw - 1));
+    borderMaskCache.set(key, c);
+    return c;
+  }}
+
   function hasPixelMask() {{
     if (maskBankCanvases.size > 0) return true;
     if (DATA.em_mask_summary && DATA.em_mask_summary.available) return true;
@@ -9345,21 +9417,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const rowEl = document.getElementById("mask-legend-row");
     const darkEl = document.getElementById("lbl-mask-dark");
     const brightEl = document.getElementById("lbl-mask-bright");
+    const edgeEl = document.getElementById("lbl-mask-edge");
     const avail = hasPixelMask();
+    const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
+    const relBorder = getActiveRelBorderWidth();
+    const borderPct = relBorder * 100.0;
     const sum = (DATA && DATA.em_mask_summary) || {{}};
     const darkPct = typeof sum.dark_fraction === "number" ? (sum.dark_fraction * 100) : 0;
     const brightPct = typeof sum.bright_fraction === "number" ? (sum.bright_fraction * 100) : 0;
     if (btnMask) {{
       btnMask.classList.toggle("active-btn", Boolean(state.showPixelMask));
-      btnMask.style.opacity = avail || state.showPixelMask ? "1" : "0.52";
+      btnMask.style.opacity = (avail || hasPanels || state.showPixelMask) ? "1" : "0.52";
       btnMask.title = avail
-        ? `Show/Hide translucent EM pixel mask overlay (Dark: ${{darkPct.toFixed(1)}}%, Static Bright: ${{brightPct.toFixed(2)}}%)`
-        : "EM pixel mask not available in current dataset — run 2. Solve or load a solved HDF5";
+        ? `Show/Hide pixel & border mask overlay (Dark: ${{darkPct.toFixed(1)}}%, Static Bright: ${{brightPct.toFixed(2)}}%, Edge border: ${{borderPct.toFixed(1)}}%)`
+        : `Show/Hide detector panel edge mask (${{borderPct.toFixed(1)}}% border; run 2. Solve to add EM Dark/Bright pixel mask)`;
     }}
     if (rowEl) {{
       rowEl.style.display = state.showPixelMask ? "flex" : "none";
-      if (darkEl) darkEl.textContent = avail ? `Dark ${{darkPct.toFixed(1)}}%` : "No EM mask";
-      if (brightEl) brightEl.textContent = avail ? `Bright ${{brightPct.toFixed(2)}}%` : "Run Solve";
+      if (darkEl) darkEl.textContent = avail ? `Dark ${{darkPct.toFixed(1)}}%` : "Dark —";
+      if (brightEl) brightEl.textContent = avail ? `Bright ${{brightPct.toFixed(2)}}%` : "Bright —";
+      if (edgeEl) {{
+        const p0 = hasPanels ? PANELS[0] : null;
+        const dim = p0 && (p0.n_rows || p0.n_cols) ? Math.min(p0.n_rows || 9999, p0.n_cols || 9999) : 0;
+        const pxTxt = dim > 0 ? ` (${{Math.round(relBorder * dim)}}px)` : "";
+        edgeEl.textContent = `Edge ${{borderPct.toFixed(1)}}%${{pxTxt}}`;
+      }}
     }}
   }}
 
@@ -10286,7 +10368,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       beta: getNum("inp-beta", cell[4]),
       gamma: getNum("inp-gamma", cell[5]),
       d_min: dminVal,
-      rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", 0.03))),
+      rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", defaultRelBorderForInstrument(DATA.instrument)))),
       wavelength_min: lminVal,
       wavelength_max: lmaxVal,
     }};
@@ -12312,6 +12394,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.heatmapStyle,
       state.hiResTextures ? 1 : 0,
       state.showPixelMask ? 1 : 0,
+      state.showPixelMask ? getActiveRelBorderWidth().toFixed(4) : "0",
       _panelTexEpoch,
       PANELS.length,
     ].join("|");
@@ -12406,6 +12489,32 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 lctx,
                 mCanvas,
                 `mask_${{panel.bank}}_${{resTag}}`,
+                panel,
+                isSph,
+                shiftAz,
+                w,
+                h,
+                dpr,
+                viewMinX,
+                viewMinY,
+                viewMaxX,
+                viewMaxY,
+                x0,
+                y0,
+                pw,
+                ph,
+                outlineScreenPts,
+                1.0,
+                true
+              );
+            }}
+            const relBorder = getActiveRelBorderWidth();
+            const bCanvas = getBorderMaskCanvas(panel, relBorder);
+            if (bCanvas) {{
+              drawPanelTextureDirect(
+                lctx,
+                bCanvas,
+                `bmask_${{panel.bank}}_${{relBorder.toFixed(4)}}_${{resTag}}`,
                 panel,
                 isSph,
                 shiftAz,
@@ -13725,6 +13834,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  const inpBorderEl = document.getElementById("inp-border");
+  if (inpBorderEl) {{
+    const onBorderChange = () => {{
+      _userTouchedBorder = true;
+      invalidatePanelRenderCaches();
+      syncPixelMaskUI();
+      if (state.showPixelMask) renderDetector();
+    }};
+    inpBorderEl.addEventListener("input", onBorderChange);
+    inpBorderEl.addEventListener("change", onBorderChange);
+  }}
+
   function buildClientGrayscaleCanvas(sub, H, W, bStep) {{
     const step = Math.max(1, bStep | 0);
     const Hb = Math.max(1, Math.floor(H / step));
@@ -14171,6 +14292,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const nextProj = newPayload.default_projection || ((DATA.instrument === "MANDI" || DATA.instrument === "TOPAZ") ? "spherical" : "cylindrical");
       state.projection = nextProj;
       syncProjectionUI();
+    }}
+    if (!isFrameSwitch && !_userTouchedBorder && DATA.instrument && DATA.instrument !== prevInst) {{
+      const bEl = document.getElementById("inp-border");
+      if (bEl) bEl.value = String(defaultRelBorderForInstrument(DATA.instrument));
     }}
     DATA.space_group = newPayload.space_group || DATA.space_group;
     const defInstWl = getDefaultWavelengthForInstrument(DATA.instrument);

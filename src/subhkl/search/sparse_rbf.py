@@ -712,12 +712,13 @@ def integrate_peaks_rbf_ssn(
     mosaicity_radial: bool = False,
     shape_spherical: bool = False,
     mosaicity_bound_rad: float = 0.010,
-    shape_fit_min_snr: float = 0.0,
+    shape_fit_min_snr: float = 5.0,
     shape_fit_normalized: bool = False,
     matrix_free_profile: str = "gaussian",
     matrix_free_fp_target: float | None = None,
     static_mask_file: str | None = None,
     border_width: int = 0,
+    allow_negative: bool = False,
     chunk_size: int = 1024,
     create_visualizations: bool = False,
     file_prefix: str | None = None,
@@ -1273,6 +1274,7 @@ def integrate_peaks_rbf_ssn(
         profile=matrix_free_profile,
         fp_target=matrix_free_fp_target,
         border_width=border_width,
+        allow_negative=allow_negative,
         show_progress=show_progress,
     )
 
