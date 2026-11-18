@@ -1368,26 +1368,60 @@ def _raycast_hkl_on_detectors(
         with contextlib.suppress(
             OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
         ):
-            mask_c, row_c, col_c = det.reflections_mask(
-                kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_lab
-            )
-            if mf > 0.0 and np.any(mask_c):
-                r_span = max(float(det.n - 1), 1.0)
-                c_span = max(float(det.m - 1), 1.0)
-                mask_c = (
-                    mask_c
-                    & (row_c >= mf * r_span)
-                    & (row_c <= (1.0 - mf) * r_span)
-                    & (col_c >= mf * c_span)
-                    & (col_c <= (1.0 - mf) * c_span)
+            if hasattr(det, "reflections_mask") and hasattr(det, "pixel_to_lab"):
+                s_off_use = s_lab if float(np.linalg.norm(s_lab)) > 1e-12 else None
+                mask_c, row_c, col_c = det.reflections_mask(
+                    kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_off_use
                 )
-            if np.any(mask_c):
-                idx_h = np.flatnonzero(mask_c)
-                pr_hit = np.asarray(row_c[idx_h], dtype=float)
-                pc_hit = np.asarray(col_c[idx_h], dtype=float)
-                xyz_hit = np.asarray(det.pixel_to_lab(pr_hit, pc_hit), dtype=float)
-                if xyz_hit.ndim == 1:
-                    xyz_hit = xyz_hit[None, :]
+                if mf > 0.0 and np.any(mask_c):
+                    r_span = max(float(det.n - 1), 1.0)
+                    c_span = max(float(det.m - 1), 1.0)
+                    mask_c = (
+                        mask_c
+                        & (row_c >= mf * r_span)
+                        & (row_c <= (1.0 - mf) * r_span)
+                        & (col_c >= mf * c_span)
+                        & (col_c <= (1.0 - mf) * c_span)
+                    )
+                if np.any(mask_c):
+                    idx_h = np.flatnonzero(mask_c)
+                    pr_hit = np.asarray(row_c[idx_h], dtype=float)
+                    pc_hit = np.asarray(col_c[idx_h], dtype=float)
+                    xyz_hit = np.asarray(det.pixel_to_lab(pr_hit, pc_hit), dtype=float)
+                    if xyz_hit.ndim == 1:
+                        xyz_hit = xyz_hit[None, :]
+            else:
+                cen = np.asarray(det.center, dtype=float)
+                uh = np.asarray(det.uhat, dtype=float)
+                vh = np.asarray(det.vhat, dtype=float)
+                w_d, h_d = float(det.width), float(det.height)
+                nrm = np.cross(uh, vh)
+                dn = kf @ nrm
+                t_ray = np.dot(cen - s_lab, nrm) / np.where(np.abs(dn) < 1e-9, -1.0, dn)
+                hit = t_ray > 0
+                if np.any(hit):
+                    cand_h = np.flatnonzero(hit)
+                    p_hit = (
+                        s_lab[None, :] + t_ray[cand_h, None] * kf[cand_h] - cen[None, :]
+                    )
+                    um = p_hit @ uh
+                    vm = p_hit @ vh
+                    in_b = (
+                        (um >= w_d * mf)
+                        & (um <= w_d * (1.0 - mf))
+                        & (vm >= h_d * mf)
+                        & (vm <= h_d * (1.0 - mf))
+                    )
+                    if np.any(in_b):
+                        idx_h = cand_h[in_b]
+                        um, vm = um[in_b], vm[in_b]
+                        pr_hit = vm / max(h_d, 1e-6) * max(int(det.n) - 1, 1)
+                        pc_hit = um / max(w_d, 1e-6) * max(int(det.m) - 1, 1)
+                        xyz_hit = (
+                            cen[None, :]
+                            + um[:, None] * uh[None, :]
+                            + vm[:, None] * vh[None, :]
+                        )
         if len(idx_h) == 0:
             continue
         if pixel_class_by_bank is not None:
@@ -3755,7 +3789,6 @@ def _extract_from_h5(
                     if R_gonio is not None and np.asarray(R_gonio).ndim == 2
                     else np.eye(3)
                 )
-                RUB = R_run @ U_mat @ B_mat
                 cell_use = (
                     cell if cell and len(cell) == 6 else list(_cell_from_B(B_mat))
                 )
@@ -3775,24 +3808,14 @@ def _extract_from_h5(
                     ),
                     axis=1,
                 ).astype(int)
-                G = hkl_all.astype(float) @ RUB.T
-                qn = np.linalg.norm(G, axis=1)
                 ki_vec = np.asarray(ki, dtype=float)
                 ki_vec = ki_vec / max(float(np.linalg.norm(ki_vec)), 1e-12)
-                sth = -(G @ ki_vec) / np.maximum(qn, 1e-12)
-                lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
-                keep_wl = (
-                    (lam_pred >= wavelength_range[0])
-                    & (lam_pred <= wavelength_range[1])
-                    & (sth > 0)
-                )
-                hkl_b = hkl_all[keep_wl]
-                lam_b = lam_pred[keep_wl]
-                G_b = G[keep_wl]
-                kf = ki_vec[None, :] + lam_b[:, None] * G_b
-                kf /= np.linalg.norm(kf, axis=1, keepdims=True)
+                UB_mat = U_mat @ B_mat
+                G_cryst = hkl_all.astype(float) @ UB_mat.T
+                qn_cryst = np.linalg.norm(G_cryst, axis=1)
 
                 bank_imgs: dict[int, np.ndarray] = {}
+                all_img_bids_set: set[int] = set()
                 if src_h5 and os.path.exists(src_h5):
                     with (
                         contextlib.suppress(
@@ -3800,31 +3823,38 @@ def _extract_from_h5(
                         ),
                         h5py.File(src_h5, "r") as mf,
                     ):
-                        if "images" in mf and "bank_ids" in mf:
-                            f0_s, f1_s = (
-                                frame_slice
-                                if frame_slice is not None
-                                else (0, len(mf["bank_ids"]))
-                            )
-                            b_ids_s = np.asarray(mf["bank_ids"][f0_s:f1_s], dtype=int)
-                            ims_s = np.asarray(
-                                mf["images"][f0_s:f1_s], dtype=np.float32
-                            )
-                            sample_det = (
-                                next(iter(detectors.values())) if detectors else None
-                            )
-                            det_n = int(getattr(sample_det, "n", 0))
-                            compat = True
-                            if (
-                                ims_s.ndim >= 3
-                                and det_n > 0
-                                and int(ims_s.shape[1]) != det_n
-                            ):
-                                compat = False
-                            if compat:
-                                for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                    if int(b_id_s) in detectors:
-                                        bank_imgs[int(b_id_s)] = im_s
+                        if "bank_ids" in mf:
+                            b_ids_full = np.asarray(mf["bank_ids"][()], dtype=int)
+                            all_img_bids_set = {
+                                int(b) for b in b_ids_full if int(b) in detectors
+                            }
+                            if "images" in mf:
+                                f0_s, f1_s = (
+                                    frame_slice
+                                    if frame_slice is not None
+                                    else (0, len(b_ids_full))
+                                )
+                                b_ids_s = b_ids_full[f0_s:f1_s]
+                                ims_s = np.asarray(
+                                    mf["images"][f0_s:f1_s], dtype=np.float32
+                                )
+                                sample_det = (
+                                    next(iter(detectors.values()))
+                                    if detectors
+                                    else None
+                                )
+                                det_n = int(getattr(sample_det, "n", 0))
+                                compat = True
+                                if (
+                                    ims_s.ndim >= 3
+                                    and det_n > 0
+                                    and int(ims_s.shape[1]) != det_n
+                                ):
+                                    compat = False
+                                if compat:
+                                    for b_id_s, im_s in zip(b_ids_s, ims_s):
+                                        if int(b_id_s) in detectors:
+                                            bank_imgs[int(b_id_s)] = im_s
 
                 cal_bids_set: set[int] = set()
                 if "detector_calibration" in f:
@@ -3838,147 +3868,137 @@ def _extract_from_h5(
                 active_bids = (
                     set(bank_imgs.keys())
                     if bank_imgs
-                    else (cal_bids_set if cal_bids_set else {int(k) for k in detectors})
+                    else (
+                        all_img_bids_set
+                        if all_img_bids_set
+                        else (
+                            cal_bids_set
+                            if cal_bids_set
+                            else {int(k) for k in detectors}
+                        )
+                    )
+                )
+                all_runs_bids = (
+                    all_img_bids_set
+                    if all_img_bids_set
+                    else (cal_bids_set if cal_bids_set else active_bids)
                 )
 
-                raw_hits: list[dict[str, Any]] = []
-                total_geom_hits = 0
-                for bid, det in sorted(detectors.items()):
-                    if int(bid) not in active_bids:
-                        continue
-                    s_off_use = (
-                        s_lab_active
-                        if float(np.linalg.norm(s_lab_active)) > 1e-12
-                        else None
-                    )
-                    if hasattr(det, "reflections_mask") and hasattr(
-                        det, "pixel_to_lab"
-                    ):
-                        mask_b, pr_all_b, pc_all_b = det.reflections_mask(
-                            kf[:, 0],
-                            kf[:, 1],
-                            kf[:, 2],
-                            sample_offset=s_off_use,
-                        )
-                        if not np.any(mask_b):
-                            continue
-                        idx_h = np.flatnonzero(mask_b)
-                        pr_hit = np.asarray(pr_all_b[idx_h], dtype=float)
-                        pc_hit = np.asarray(pc_all_b[idx_h], dtype=float)
-                        m_px = max(int(getattr(det, "m", 256)) - 1, 1)
-                        n_px = max(int(getattr(det, "n", 256)) - 1, 1)
-                        in_b = (
-                            (pc_hit >= 0.02 * m_px)
-                            & (pc_hit <= 0.98 * m_px)
-                            & (pr_hit >= 0.02 * n_px)
-                            & (pr_hit <= 0.98 * n_px)
-                        )
-                        if not np.any(in_b):
-                            continue
-                        idx_h = idx_h[in_b]
-                        pr_hit = pr_hit[in_b]
-                        pc_hit = pc_hit[in_b]
-                    else:
-                        cen = np.asarray(det.center, dtype=float)
-                        uh = np.asarray(det.uhat, dtype=float)
-                        vh = np.asarray(det.vhat, dtype=float)
-                        w_d, h_d = float(det.width), float(det.height)
-                        nrm = np.cross(uh, vh)
-                        dn = kf @ nrm
-                        t_ray = np.dot(cen - s_lab_active, nrm) / np.where(
-                            np.abs(dn) < 1e-9, -1.0, dn
-                        )
-                        hit = t_ray > 0
-                        if not np.any(hit):
-                            continue
-                        idx_h = np.flatnonzero(hit)
-                        p_hit = (
-                            s_lab_active[None, :]
-                            + t_ray[idx_h, None] * kf[idx_h]
-                            - cen[None, :]
-                        )
-                        um = p_hit @ uh
-                        vm = p_hit @ vh
-                        in_b = (
-                            (um >= w_d * 0.02)
-                            & (um <= w_d * 0.98)
-                            & (vm >= h_d * 0.02)
-                            & (vm <= h_d * 0.98)
-                        )
-                        if not np.any(in_b):
-                            continue
-                        idx_h = idx_h[in_b]
-                        um, vm = um[in_b], vm[in_b]
-                        pr_hit = vm / max(h_d, 1e-6) * (det.n - 1)
-                        pc_hit = um / max(w_d, 1e-6) * (det.m - 1)
-                    cls_b = pixel_class_by_bank.get(int(bid))
-                    if cls_b is not None and cls_b.ndim == 2:
-                        rm = np.clip(
-                            np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1
-                        )
-                        cm = np.clip(
-                            np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1
-                        )
-                        valid_m = cls_b[rm, cm] == 0
-                        if not np.any(valid_m):
-                            continue
-                        idx_h = idx_h[valid_m]
-                        pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
-                    if hasattr(det, "pixel_to_lab"):
-                        xyz_hit = np.asarray(
-                            det.pixel_to_lab(pr_hit, pc_hit), dtype=float
-                        )
-                        if xyz_hit.ndim == 1:
-                            xyz_hit = xyz_hit[None, :]
-                    else:
-                        cen = np.asarray(det.center, dtype=float)
-                        uh = np.asarray(det.uhat, dtype=float)
-                        vh = np.asarray(det.vhat, dtype=float)
-                        w_d, h_d = float(det.width), float(det.height)
-                        um = pc_hit / max(det.m - 1, 1) * w_d
-                        vm = pr_hit / max(det.n - 1, 1) * h_d
-                        xyz_hit = (
-                            cen[None, :]
-                            + um[:, None] * uh[None, :]
-                            + vm[:, None] * vh[None, :]
-                        )
-                    total_geom_hits += len(idx_h)
-                    raw_hits.append(
-                        {
-                            "bid": int(bid),
-                            "idx_h": idx_h,
-                            "xyz_hit": xyz_hit,
-                            "pr_hit": pr_hit,
-                            "pc_hit": pc_hit,
-                        }
-                    )
-
-                xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l = (
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
+                ray_active = _raycast_hkl_on_detectors(
+                    hkl_all,
+                    U_mat,
+                    B_mat,
+                    R_run,
+                    detectors,
+                    wavelength_range,
+                    ki=ki_vec,
+                    sample_offset_lab=s_lab_active,
+                    active_bids=active_bids,
+                    pixel_class_by_bank=pixel_class_by_bank,
+                    margin_frac=0.0,
+                    G_cryst=G_cryst,
+                    qn_cryst=qn_cryst,
                 )
-                for rh in raw_hits:
-                    idx_h = rh["idx_h"]
-                    xyz_l.append(rh["xyz_hit"])
-                    hkl_l.append(hkl_b[idx_h])
-                    lam_l.append(lam_b[idx_h])
-                    bank_l.append(np.full(len(idx_h), rh["bid"], dtype=int))
-                    pr_l.append(rh["pr_hit"])
-                    pc_l.append(rh["pc_hit"])
-
-                if xyz_l:
-                    peaks_xyz = np.concatenate(xyz_l, axis=0)
-                    hkl = np.concatenate(hkl_l, axis=0)
-                    lam = np.concatenate(lam_l, axis=0)
-                    bank = np.concatenate(bank_l, axis=0)
-                    pixel_r = np.concatenate(pr_l, axis=0)
-                    pixel_c = np.concatenate(pc_l, axis=0)
+                if len(ray_active["peaks_xyz"]) > 0:
+                    peaks_xyz = ray_active["peaks_xyz"]
+                    hkl = ray_active["hkl"]
+                    lam = ray_active["wavelength"]
+                    bank = ray_active["bank"]
+                    pixel_r = ray_active["pixel_r"]
+                    pixel_c = ray_active["pixel_c"]
+                    run_index = np.full(len(peaks_xyz), int(active_frame), dtype=int)
                     intensity = None
                     sigma = None
+
+                # Forward-project across ALL runs in solve.h5 so All-Runs Wulff Net shows
+                # the complete multi-run reflection set right after Solve (matching Integration)
+                if len(frames_meta) > 1:
+                    all_xyz_s, all_hkl_s, all_lam_s, all_bnk_s, all_run_s = (
+                        [],
+                        [],
+                        [],
+                        [],
+                        [],
+                    )
+                    for r_i in range(len(frames_meta)):
+                        R_ri = R_per_run_all.get(r_i, R_run)
+                        s_ri = s_lab_per_run_all.get(r_i, s_lab_active)
+                        ray_r = (
+                            ray_active
+                            if (r_i == active_frame and active_bids == all_runs_bids)
+                            else _raycast_hkl_on_detectors(
+                                hkl_all,
+                                U_mat,
+                                B_mat,
+                                R_ri,
+                                detectors,
+                                wavelength_range,
+                                ki=ki_vec,
+                                sample_offset_lab=s_ri,
+                                active_bids=all_runs_bids,
+                                pixel_class_by_bank=pixel_class_by_bank,
+                                margin_frac=0.0,
+                                G_cryst=G_cryst,
+                                qn_cryst=qn_cryst,
+                            )
+                        )
+                        n_rr = len(ray_r["peaks_xyz"])
+                        if n_rr > 0:
+                            all_xyz_s.append(ray_r["peaks_xyz"])
+                            all_hkl_s.append(ray_r["hkl"])
+                            all_lam_s.append(ray_r["wavelength"])
+                            all_bnk_s.append(ray_r["bank"])
+                            all_run_s.append(np.full(n_rr, int(r_i), dtype=int))
+                    if all_xyz_s:
+                        pts_sa = np.concatenate(all_xyz_s, axis=0)
+                        hkl_sa = np.concatenate(all_hkl_s, axis=0)
+                        lam_sa = np.concatenate(all_lam_s, axis=0)
+                        bnk_sa = np.concatenate(all_bnk_s, axis=0)
+                        run_sa = np.concatenate(all_run_s, axis=0)
+                        if len(pts_sa) > 12000:
+                            # Keep every unique (h, k, l) first (preferring active_frame),
+                            # then top up evenly to 12000 so no crystal reflection is dropped
+                            prio_s = np.argsort(
+                                np.where(run_sa == active_frame, 0, 1),
+                                kind="mergesort",
+                            )
+                            pts_sa = pts_sa[prio_s]
+                            hkl_sa = hkl_sa[prio_s]
+                            lam_sa = lam_sa[prio_s]
+                            bnk_sa = bnk_sa[prio_s]
+                            run_sa = run_sa[prio_s]
+                            _, u_idx = np.unique(hkl_sa, axis=0, return_index=True)
+                            u_idx = np.sort(u_idx)
+                            if len(u_idx) >= 12000:
+                                sub_s = u_idx[
+                                    np.linspace(0, len(u_idx) - 1, 12000, dtype=int)
+                                ]
+                            else:
+                                rem_mask = np.ones(len(pts_sa), dtype=bool)
+                                rem_mask[u_idx] = False
+                                rem_idx = np.flatnonzero(rem_mask)
+                                n_fill = 12000 - len(u_idx)
+                                fill_idx = rem_idx[
+                                    np.linspace(0, len(rem_idx) - 1, n_fill, dtype=int)
+                                ]
+                                sub_s = np.sort(np.concatenate([u_idx, fill_idx]))
+                            pts_sa = pts_sa[sub_s]
+                            hkl_sa = hkl_sa[sub_s]
+                            lam_sa = lam_sa[sub_s]
+                            bnk_sa = bnk_sa[sub_s]
+                            run_sa = run_sa[sub_s]
+                        all_runs_data = {
+                            "peaks_xyz": pts_sa,
+                            "hkl": hkl_sa,
+                            "wavelength": lam_sa,
+                            "intensity": None,
+                            "sigma": None,
+                            "bank": bnk_sa,
+                            "run_index": run_sa,
+                            "R_per_run": R_per_run_all,
+                            "s_lab_per_run": s_lab_per_run_all,
+                        }
+                        predicted_all_runs_data = all_runs_data
 
         if peaks_xyz is None:
             peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -16539,14 +16559,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               if (Array.isArray(aj.partial_overlay.peaks)) {{
                 PEAKS.length = 0;
                 aj.partial_overlay.peaks.forEach(p => PEAKS.push(p));
+                PREDICTED_PEAKS = [...PEAKS];
               }}
               if (Array.isArray(aj.partial_overlay.sample_peaks) && aj.partial_overlay.sample_peaks.length > 0) {{
                 SAMPLE_PEAKS.length = 0;
                 aj.partial_overlay.sample_peaks.forEach(p => SAMPLE_PEAKS.push(p));
+                PREDICTED_SAMPLE_PEAKS = [...SAMPLE_PEAKS];
               }} else if (Array.isArray(aj.partial_overlay.peaks) && aj.partial_overlay.peaks.length > 0) {{
                 SAMPLE_PEAKS.length = 0;
                 aj.partial_overlay.peaks.forEach(p => SAMPLE_PEAKS.push(p));
+                PREDICTED_SAMPLE_PEAKS = [...SAMPLE_PEAKS];
               }}
+              _visDetPeaksSig = "";
+              _peakDataAvailabilitySig = "";
+              _lastWulffRenderSig = "";
               if (Array.isArray(aj.partial_overlay.panels) && aj.partial_overlay.panels.length > 0) {{
                 const pByBank = new Map(aj.partial_overlay.panels.map(p => [Number(p.bank), p]));
                 PANELS.forEach(curP => {{

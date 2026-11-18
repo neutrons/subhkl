@@ -355,6 +355,54 @@ def test_finderless_solve_h5_forward_projection_and_stages(tmp_path):
     assert payload["pipeline_stages"][0]["name"] == "1. REDUCE & MERGE"
     assert "imaginex_subhkl_solve" in payload["pipeline_stages"][1]["tool_ids"]
 
+    # Multi-run solve.h5 must forward-project across ALL runs so All-Runs Wulff Net
+    # displays every run's predicted reflections immediately after Solve (before Integration)
+    solve_mr_h5 = tmp_path / "synthetic_solve_multirun.h5"
+    ang1, ang2 = np.deg2rad(35.0), np.deg2rad(70.0)
+    R0 = np.eye(3)
+    R1 = np.array(
+        [
+            [np.cos(ang1), 0.0, np.sin(ang1)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(ang1), 0.0, np.cos(ang1)],
+        ]
+    )
+    R2 = np.array(
+        [
+            [np.cos(ang2), 0.0, np.sin(ang2)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(ang2), 0.0, np.cos(ang2)],
+        ]
+    )
+    with h5py.File(solve_mr_h5, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f["sample/U"] = U
+        f["sample/B"] = B
+        f["sample/a"] = 18.0
+        f["sample/b"] = 24.0
+        f["sample/c"] = 32.0
+        f["sample/alpha"] = 90.0
+        f["sample/beta"] = 90.0
+        f["sample/gamma"] = 90.0
+        f["sample/space_group"] = "P 21 21 21"
+        f["instrument/wavelength"] = np.array([2.0, 4.5])
+        f["files"] = np.array(
+            [b"CG4D_1720.nxs.h5", b"CG4D_1740.nxs.h5", b"CG4D_1760.nxs.h5"]
+        )
+        f["goniometer/R"] = np.stack([R0, R1, R2], axis=0)
+        f["bank_ids"] = np.array([101, 101, 101], dtype=np.int32)
+        f["file_offsets"] = np.array([0, 1, 2], dtype=np.int64)
+        sr_mr = f.create_group("scan_refinement")
+        sr_mr.attrs["d_min"] = 2.5
+        sr_mr.attrs["status"] = "converged"
+
+    payload_mr = build_rainbow_zone_payload(replay_h5=solve_mr_h5)
+    assert len(payload_mr["frames"]) == 3
+    assert len(payload_mr["sample_peaks"]) > len(payload_mr["peaks"])
+    assert {p["run_index"] for p in payload_mr["sample_peaks"]} == {0, 1, 2}
+    assert len(payload_mr["predicted_sample_peaks"]) == len(payload_mr["sample_peaks"])
+    assert all(p.get("intensity") is None for p in payload_mr["sample_peaks"])
+
 
 def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     """Careless merge HDF5 stamping populates ASU orbits, residuals, scales, and multi-run sample_peaks."""
