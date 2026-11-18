@@ -7212,6 +7212,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const warpedBankCanvases = new Map();
   const maskBankCanvases = new Map();
   const warpedMaskCanvases = new Map();
+  const uvUpscaledCanvases = new Map();
+  let _panelTexEpoch = 1;
+  let _detLayerCacheCanvas = null;
+  let _detLayerCacheKey = "";
+  let _panelScratchCanvas = null;
+
+  function invalidatePanelRenderCaches() {{
+    warpedBankCanvases.clear();
+    warpedMaskCanvases.clear();
+    uvUpscaledCanvases.clear();
+    _panelTexEpoch += 1;
+    _detLayerCacheKey = "";
+  }}
 
   function colorizeMaskImage(img) {{
     const c = document.createElement("canvas");
@@ -7327,7 +7340,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       img.onload = () => {{
         rawBankImages.set(p.bank, img);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(img, state.heatmapStyle));
-        warpedBankCanvases.clear();
+        invalidatePanelRenderCaches();
         pending--;
         if (pending <= 0 || pending % 8 === 0) {{
           renderDetector();
@@ -7338,14 +7351,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     PANELS.forEach(p => {{
       if (p._maskCanvas) {{
         maskBankCanvases.set(p.bank, p._maskCanvas);
-        warpedMaskCanvases.clear();
+        invalidatePanelRenderCaches();
         return;
       }}
       if (!p.mask_b64) return;
       const mimg = new Image();
       mimg.onload = () => {{
         maskBankCanvases.set(p.bank, colorizeMaskImage(mimg));
-        warpedMaskCanvases.clear();
+        invalidatePanelRenderCaches();
         syncPixelMaskUI();
         if (state.showPixelMask) renderDetector();
       }};
@@ -7358,7 +7371,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     rawBankImages.forEach((img, bank) => {{
       bankCanvases.set(bank, colorizeGrayscaleImage(img, state.heatmapStyle));
     }});
-    warpedBankCanvases.clear();
+    invalidatePanelRenderCaches();
   }}
 
   decodeAllBankTextures();
@@ -8969,8 +8982,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     _cachedCylRadiusM = null;
     _cachedPlotBox = null;
     _cachedPlotBoxKey = "";
-    if (typeof warpedBankCanvases !== "undefined") warpedBankCanvases.clear();
-    if (typeof warpedMaskCanvases !== "undefined") warpedMaskCanvases.clear();
+    if (typeof invalidatePanelRenderCaches === "function") invalidatePanelRenderCaches();
   }}
 
   function recomputeProjectionBounds() {{
@@ -9257,25 +9269,83 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.restore();
   }}
 
+  function getCrispUVCanvas(cachePrefix, srcCanvas, scaleK) {{
+    const k = Math.max(1, Math.round(scaleK || 1));
+    if (k <= 1) return srcCanvas;
+    const key = `${{cachePrefix}}_k${{k}}`;
+    if (uvUpscaledCanvases.has(key)) {{
+      return uvUpscaledCanvases.get(key);
+    }}
+    const up = document.createElement("canvas");
+    up.width = Math.max(1, srcCanvas.width * k);
+    up.height = Math.max(1, srcCanvas.height * k);
+    const uctx = up.getContext("2d");
+    uctx.imageSmoothingEnabled = false;
+    uctx.drawImage(srcCanvas, 0, 0, up.width, up.height);
+    if (uvUpscaledCanvases.size > 96) {{
+      uvUpscaledCanvases.clear();
+    }}
+    uvUpscaledCanvases.set(key, up);
+    return up;
+  }}
+
+  function getPanelScreenAspect(panel) {{
+    const bounds = getActiveBounds();
+    const spanX = Math.max(10.0, bounds.maxX - bounds.minX);
+    const spanY = Math.max(1e-4, bounds.maxY - bounds.minY);
+    const [vMin, vMax] = getPanelVertRange(panel);
+    const azSpan = Math.max(1e-5, panel.az_max - panel.az_min);
+    const vSpan = Math.max(1e-5, vMax - vMin);
+    const dataAspect = Math.max(0.25, Math.min(12.0, getDetectorDataAspect()));
+    const relW = (azSpan / spanX) * dataAspect;
+    const relH = vSpan / spanY;
+    return Math.max(0.1, Math.min(10.0, relW / Math.max(1e-6, relH)));
+  }}
+
+  function expandClampedUVTri(uA, vA, uB, vB, uC, vC, padU, padV, maxW, maxH, a, b, c, d, e, f) {{
+    const uc = (uA + uB + uC) / 3.0;
+    const vc = (vA + vB + vC) / 3.0;
+    const mapVert = (u, v) => {{
+      const du = u - uc;
+      const dv = v - vc;
+      const nu = Math.max(0, Math.min(maxW, u + (du >= 0 ? padU : -padU)));
+      const nv = Math.max(0, Math.min(maxH, v + (dv >= 0 ? padV : -padV)));
+      return [a * nu + c * nv + e, b * nu + d * nv + f];
+    }};
+    return [mapVert(uA, vA), mapVert(uB, vB), mapVert(uC, vC)];
+  }}
+
   function warpTextureOntoPanel(texCanvas, panel, isSph, smooth) {{
     const [vMin, vMax] = getPanelVertRange(panel);
     const azSpan = Math.max(1e-5, panel.az_min - panel.az_max ? panel.az_max - panel.az_min : 1e-5);
     const vSpan = Math.max(1e-5, vMax - vMin);
-    const W = Math.max(1, texCanvas.width);
-    const H = Math.max(1, texCanvas.height);
+    const W0 = Math.max(1, texCanvas.width);
+    const H0 = Math.max(1, texCanvas.height);
     const hiRes = Boolean(state.hiResTextures);
-    const spW = hiRes
-      ? Math.min(2048, Math.max(512, W * 2))
-      : (W > 512 ? Math.min(2048, W) : Math.min(384, Math.max(192, W * 2)));
-    const spH = hiRes
-      ? Math.min(2048, Math.max(512, H * 2))
-      : (H > 512 ? Math.min(1024, H) : Math.min(384, Math.max(192, H * 2)));
+    const aspect = getPanelScreenAspect(panel);
+    const baseMax = hiRes
+      ? Math.min(2048, Math.max(768, Math.max(W0, H0) * 3))
+      : (Math.max(W0, H0) > 512 ? Math.min(2048, Math.max(W0, H0)) : Math.min(512, Math.max(256, Math.max(W0, H0) * 3)));
+    const spW = aspect >= 1.0
+      ? Math.round(baseMax)
+      : Math.max(64, Math.round(baseMax * aspect));
+    const spH = aspect >= 1.0
+      ? Math.max(64, Math.round(baseMax / aspect))
+      : Math.round(baseMax);
+
+    const maxK = Math.max(1, Math.min(4, Math.floor(2048 / Math.max(W0, H0))));
+    const srcCanvas = (!smooth || hiRes)
+      ? getCrispUVCanvas(`warp_${{panel.bank}}_${{state.heatmapStyle}}_${{hiRes ? "hi" : "lo"}}`, texCanvas, Math.min(maxK, 2))
+      : texCanvas;
+    const W = Math.max(1, srcCanvas.width);
+    const H = Math.max(1, srcCanvas.height);
 
     const wc = document.createElement("canvas");
     wc.width = spW;
     wc.height = spH;
     const wctx = wc.getContext("2d");
-    wctx.imageSmoothingEnabled = hiRes ? false : Boolean(smooth);
+    wctx.imageSmoothingEnabled = true;
+    wctx.imageSmoothingQuality = "high";
 
     const toSp = pt => [
       ((pt[0] - panel.az_min) / azSpan) * spW,
@@ -9319,21 +9389,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
         wctx.save();
         wctx.transform(ax, ay, cx, cy, ex, ey);
-        wctx.drawImage(texCanvas, 0, 0, W, H);
+        wctx.drawImage(srcCanvas, 0, 0, W, H);
         wctx.restore();
       }} else {{
         const du = W / nCols;
         const dv = H / nRows;
-        const expandTri = (A, B, C) => {{
-          const mx = (A[0] + B[0] + C[0]) / 3;
-          const my = (A[1] + B[1] + C[1]) / 3;
-          const pad = 0.65;
-          return [A, B, C].map(P => {{
-            const dx = P[0] - mx, dy = P[1] - my;
-            const len = Math.hypot(dx, dy) || 1;
-            return [P[0] + (dx / len) * pad, P[1] + (dy / len) * pad];
-          }});
-        }};
         for (let ir = 0; ir < nRows; ir++) {{
           const v0 = ir * dv;
           const v1 = (ir + 1) * dv;
@@ -9345,13 +9405,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const P11 = SGrid[ir + 1][ic + 1];
             const P10 = SGrid[ir + 1][ic];
 
-            const [T1A, T1B, T1C] = expandTri(P00, P01, P10);
             const a1 = (P01[0] - P00[0]) / du;
             const b1 = (P01[1] - P00[1]) / du;
             const c1 = (P10[0] - P00[0]) / dv;
             const d1 = (P10[1] - P00[1]) / dv;
             const e1 = P00[0] - a1 * u0 - c1 * v0;
             const f1 = P00[1] - b1 * u0 - d1 * v0;
+            const padU1 = Math.min(du * 0.2, 0.7 / Math.max(0.05, Math.hypot(a1, b1)));
+            const padV1 = Math.min(dv * 0.2, 0.7 / Math.max(0.05, Math.hypot(c1, d1)));
+            const [T1A, T1B, T1C] = expandClampedUVTri(u0, v0, u1, v0, u0, v1, padU1, padV1, W, H, a1, b1, c1, d1, e1, f1);
             wctx.save();
             wctx.beginPath();
             wctx.moveTo(T1A[0], T1A[1]);
@@ -9359,17 +9421,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             wctx.lineTo(T1C[0], T1C[1]);
             wctx.closePath();
             wctx.clip();
+            wctx.globalCompositeOperation = "copy";
             wctx.transform(a1, b1, c1, d1, e1, f1);
-            wctx.drawImage(texCanvas, 0, 0, W, H);
+            wctx.drawImage(srcCanvas, 0, 0, W, H);
             wctx.restore();
 
-            const [T2A, T2B, T2C] = expandTri(P01, P11, P10);
             const a2 = (P11[0] - P10[0]) / du;
             const b2 = (P11[1] - P10[1]) / du;
             const c2 = (P11[0] - P01[0]) / dv;
             const d2 = (P11[1] - P01[1]) / dv;
             const e2 = P11[0] - a2 * u1 - c2 * v1;
             const f2 = P11[1] - b2 * u1 - d2 * v1;
+            const padU2 = Math.min(du * 0.2, 0.7 / Math.max(0.05, Math.hypot(a2, b2)));
+            const padV2 = Math.min(dv * 0.2, 0.7 / Math.max(0.05, Math.hypot(c2, d2)));
+            const [T2A, T2B, T2C] = expandClampedUVTri(u1, v0, u1, v1, u0, v1, padU2, padV2, W, H, a2, b2, c2, d2, e2, f2);
             wctx.save();
             wctx.beginPath();
             wctx.moveTo(T2A[0], T2A[1]);
@@ -9377,8 +9442,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             wctx.lineTo(T2C[0], T2C[1]);
             wctx.closePath();
             wctx.clip();
+            wctx.globalCompositeOperation = "copy";
             wctx.transform(a2, b2, c2, d2, e2, f2);
-            wctx.drawImage(texCanvas, 0, 0, W, H);
+            wctx.drawImage(srcCanvas, 0, 0, W, H);
             wctx.restore();
           }}
         }}
@@ -9393,13 +9459,245 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const ey = (S0[1] + (S3[1] + S1[1] - S2[1])) * 0.5;
       wctx.save();
       wctx.transform(ax, ay, cx, cy, ex, ey);
-      wctx.drawImage(texCanvas, 0, 0, W, H);
+      wctx.drawImage(srcCanvas, 0, 0, W, H);
       wctx.restore();
     }} else {{
-      wctx.drawImage(texCanvas, 0, 0, spW, spH);
+      wctx.drawImage(srcCanvas, 0, 0, spW, spH);
     }}
     wctx.restore();
     return wc;
+  }}
+
+  // Render a detector bank's native (u, v) pixel canvas directly onto screen coordinates
+  // without quantizing through an intermediate screen-aligned (az, el) raster.
+  function drawPanelTextureDirect(
+    targetCtx,
+    texCanvas,
+    cachePrefix,
+    panel,
+    isSph,
+    shiftAz,
+    w,
+    h,
+    dpr,
+    viewMinX,
+    viewMinY,
+    viewMaxX,
+    viewMaxY,
+    x0,
+    y0,
+    pw,
+    ph,
+    outlineScreenPts,
+    alpha,
+    crispTexels
+  ) {{
+    if (!texCanvas || alpha <= 0.005) return;
+    const W0 = Math.max(1, texCanvas.width);
+    const H0 = Math.max(1, texCanvas.height);
+    const toBase = pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, 0.0);
+
+    const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+    const meshPts = isSph && panel.mesh_sph ? panel.mesh_sph : panel.mesh;
+    const hasMesh = Array.isArray(meshPts) && meshPts.length >= 2 && Array.isArray(meshPts[0]) && meshPts[0].length >= 2;
+    const SGrid = hasMesh ? meshPts.map(row => row.map(toBase)) : null;
+
+    let C0 = null, C1 = null, C2 = null, C3 = null;
+    if (SGrid) {{
+      const nR = SGrid.length - 1;
+      const nC = SGrid[0].length - 1;
+      C0 = SGrid[0][0];
+      C1 = SGrid[nR][0];
+      C2 = SGrid[nR][nC];
+      C3 = SGrid[0][nC];
+    }} else if (cornersPts && cornersPts.length === 4) {{
+      [C0, C1, C2, C3] = cornersPts.map(toBase);
+    }}
+
+    let uDevPx = (Math.abs(pw) * dpr) / W0;
+    let vDevPx = (Math.abs(ph) * dpr) / H0;
+    if (C0 && C1 && C2 && C3) {{
+      uDevPx = (dpr * 0.5 * (Math.hypot(C3[0] - C0[0], C3[1] - C0[1]) + Math.hypot(C2[0] - C1[0], C2[1] - C1[1]))) / W0;
+      vDevPx = (dpr * 0.5 * (Math.hypot(C1[0] - C0[0], C1[1] - C0[1]) + Math.hypot(C2[0] - C3[0], C2[1] - C3[1]))) / H0;
+    }}
+    const texelDevPx = Math.max(uDevPx, vDevPx);
+
+    let scaleK = 1;
+    if (crispTexels) {{
+      const maxK = Math.max(1, Math.min(8, Math.floor(2048 / Math.max(W0, H0))));
+      const rawK = texelDevPx >= 6.0 ? 8 : (texelDevPx >= 3.0 ? 4 : (texelDevPx >= 1.45 ? 2 : 1));
+      scaleK = Math.min(maxK, rawK);
+    }}
+    const srcCanvas = getCrispUVCanvas(cachePrefix, texCanvas, scaleK);
+    const W = Math.max(1, srcCanvas.width);
+    const H = Math.max(1, srcCanvas.height);
+
+    let useCurvedMesh = false;
+    if (SGrid) {{
+      const nRows = SGrid.length - 1;
+      const nCols = SGrid[0].length - 1;
+      const nonPara = Math.hypot((C3[0] + C1[0] - C2[0]) - C0[0], (C3[1] + C1[1] - C2[1]) - C0[1]);
+      const midR = Math.floor(nRows / 2), midC = Math.floor(nCols / 2);
+      const topBow = Math.hypot(SGrid[0][midC][0] - 0.5 * (C0[0] + C3[0]), SGrid[0][midC][1] - 0.5 * (C0[1] + C3[1]));
+      const botBow = Math.hypot(SGrid[nRows][midC][0] - 0.5 * (C1[0] + C2[0]), SGrid[nRows][midC][1] - 0.5 * (C1[1] + C2[1]));
+      const lftBow = Math.hypot(SGrid[midR][0][0] - 0.5 * (C0[0] + C1[0]), SGrid[midR][0][1] - 0.5 * (C0[1] + C1[1]));
+      const rgtBow = Math.hypot(SGrid[midR][nCols][0] - 0.5 * (C3[0] + C2[0]), SGrid[midR][nCols][1] - 0.5 * (C3[1] + C2[1]));
+      const maxBow = Math.max(topBow, botBow, lftBow, rgtBow);
+      useCurvedMesh = !(nonPara < 1.2 && maxBow < 1.0);
+    }}
+
+    if (!useCurvedMesh) {{
+      targetCtx.save();
+      if (outlineScreenPts && outlineScreenPts.length >= 4) {{
+        targetCtx.beginPath();
+        outlineScreenPts.forEach((pt, idx) => {{
+          if (idx === 0) targetCtx.moveTo(pt[0], pt[1]);
+          else targetCtx.lineTo(pt[0], pt[1]);
+        }});
+        targetCtx.closePath();
+        targetCtx.clip();
+      }}
+      targetCtx.globalAlpha = alpha;
+      targetCtx.imageSmoothingEnabled = true;
+      targetCtx.imageSmoothingQuality = "high";
+      if (C0 && C1 && C2 && C3) {{
+        const ax = ((C3[0] - C0[0]) + (C2[0] - C1[0])) * 0.5 / W;
+        const ay = ((C3[1] - C0[1]) + (C2[1] - C1[1])) * 0.5 / W;
+        const cx = ((C1[0] - C0[0]) + (C2[0] - C3[0])) * 0.5 / H;
+        const cy = ((C1[1] - C0[1]) + (C2[1] - C3[1])) * 0.5 / H;
+        const ex = (C0[0] + (C3[0] + C1[0] - C2[0])) * 0.5;
+        const ey = (C0[1] + (C3[1] + C1[1] - C2[1])) * 0.5;
+        targetCtx.transform(ax, ay, cx, cy, ex, ey);
+        targetCtx.drawImage(srcCanvas, 0, 0, W, H);
+      }} else {{
+        targetCtx.drawImage(srcCanvas, x0, y0, pw, ph);
+      }}
+      targetCtx.restore();
+      return;
+    }}
+
+    // Curvilinear mesh: composite into device-aligned scratch bbox with "copy" so
+    // semi-transparent dark texels never double-alpha along mesh triangle seams.
+    let bx0 = Math.min(x0, x0 + pw) - 2;
+    let bx1 = Math.max(x0, x0 + pw) + 2;
+    let by0 = Math.min(y0, y0 + ph) - 2;
+    let by1 = Math.max(y0, y0 + ph) + 2;
+    if (outlineScreenPts && outlineScreenPts.length >= 4) {{
+      for (let i = 0; i < outlineScreenPts.length; i++) {{
+        const ox = outlineScreenPts[i][0], oy = outlineScreenPts[i][1];
+        if (ox - 2 < bx0) bx0 = ox - 2;
+        if (ox + 2 > bx1) bx1 = ox + 2;
+        if (oy - 2 < by0) by0 = oy - 2;
+        if (oy + 2 > by1) by1 = oy + 2;
+      }}
+    }}
+    const visX0 = Math.floor(Math.max(viewMinX, bx0) * dpr) / dpr;
+    const visY0 = Math.floor(Math.max(viewMinY, by0) * dpr) / dpr;
+    const visX1 = Math.ceil(Math.min(viewMaxX, bx1) * dpr) / dpr;
+    const visY1 = Math.ceil(Math.min(viewMaxY, by1) * dpr) / dpr;
+    const sw = Math.round((visX1 - visX0) * dpr);
+    const sh = Math.round((visY1 - visY0) * dpr);
+    if (sw < 1 || sh < 1) return;
+
+    if (!_panelScratchCanvas) {{
+      _panelScratchCanvas = document.createElement("canvas");
+    }}
+    if (_panelScratchCanvas.width < sw || _panelScratchCanvas.height < sh) {{
+      _panelScratchCanvas.width = Math.max(_panelScratchCanvas.width || 0, sw);
+      _panelScratchCanvas.height = Math.max(_panelScratchCanvas.height || 0, sh);
+    }}
+    const sctx = _panelScratchCanvas.getContext("2d");
+    sctx.setTransform(1, 0, 0, 1, 0, 0);
+    sctx.clearRect(0, 0, sw, sh);
+    sctx.save();
+    sctx.beginPath();
+    sctx.rect(0, 0, sw, sh);
+    sctx.clip();
+    sctx.setTransform(dpr, 0, 0, dpr, -visX0 * dpr, -visY0 * dpr);
+    sctx.imageSmoothingEnabled = true;
+    sctx.imageSmoothingQuality = "high";
+
+    const nRows = SGrid.length - 1;
+    const nCols = SGrid[0].length - 1;
+    const du = W / nCols;
+    const dv = H / nRows;
+    for (let ir = 0; ir < nRows; ir++) {{
+      const v0 = ir * dv;
+      const v1 = (ir + 1) * dv;
+      for (let ic = 0; ic < nCols; ic++) {{
+        const P00 = SGrid[ir][ic];
+        const P01 = SGrid[ir][ic + 1];
+        const P11 = SGrid[ir + 1][ic + 1];
+        const P10 = SGrid[ir + 1][ic];
+        const qMinX = Math.min(P00[0], P01[0], P11[0], P10[0]);
+        const qMaxX = Math.max(P00[0], P01[0], P11[0], P10[0]);
+        const qMinY = Math.min(P00[1], P01[1], P11[1], P10[1]);
+        const qMaxY = Math.max(P00[1], P01[1], P11[1], P10[1]);
+        if (qMaxX < visX0 - 2 || qMinX > visX1 + 2 || qMaxY < visY0 - 2 || qMinY > visY1 + 2) {{
+          continue;
+        }}
+        const u0 = ic * du;
+        const u1 = (ic + 1) * du;
+
+        const a1 = (P01[0] - P00[0]) / du;
+        const b1 = (P01[1] - P00[1]) / du;
+        const c1 = (P10[0] - P00[0]) / dv;
+        const d1 = (P10[1] - P00[1]) / dv;
+        const e1 = P00[0] - a1 * u0 - c1 * v0;
+        const f1 = P00[1] - b1 * u0 - d1 * v0;
+        const padU1 = Math.min(du * 0.2, 0.7 / Math.max(0.05, dpr * Math.hypot(a1, b1)));
+        const padV1 = Math.min(dv * 0.2, 0.7 / Math.max(0.05, dpr * Math.hypot(c1, d1)));
+        const [T1A, T1B, T1C] = expandClampedUVTri(u0, v0, u1, v0, u0, v1, padU1, padV1, W, H, a1, b1, c1, d1, e1, f1);
+        sctx.save();
+        sctx.beginPath();
+        sctx.moveTo(T1A[0], T1A[1]);
+        sctx.lineTo(T1B[0], T1B[1]);
+        sctx.lineTo(T1C[0], T1C[1]);
+        sctx.closePath();
+        sctx.clip();
+        sctx.globalCompositeOperation = "copy";
+        sctx.transform(a1, b1, c1, d1, e1, f1);
+        sctx.drawImage(srcCanvas, 0, 0, W, H);
+        sctx.restore();
+
+        const a2 = (P11[0] - P10[0]) / du;
+        const b2 = (P11[1] - P10[1]) / du;
+        const c2 = (P11[0] - P01[0]) / dv;
+        const d2 = (P11[1] - P01[1]) / dv;
+        const e2 = P11[0] - a2 * u1 - c2 * v1;
+        const f2 = P11[1] - b2 * u1 - d2 * v1;
+        const padU2 = Math.min(du * 0.2, 0.7 / Math.max(0.05, dpr * Math.hypot(a2, b2)));
+        const padV2 = Math.min(dv * 0.2, 0.7 / Math.max(0.05, dpr * Math.hypot(c2, d2)));
+        const [T2A, T2B, T2C] = expandClampedUVTri(u1, v0, u1, v1, u0, v1, padU2, padV2, W, H, a2, b2, c2, d2, e2, f2);
+        sctx.save();
+        sctx.beginPath();
+        sctx.moveTo(T2A[0], T2A[1]);
+        sctx.lineTo(T2B[0], T2B[1]);
+        sctx.lineTo(T2C[0], T2C[1]);
+        sctx.closePath();
+        sctx.clip();
+        sctx.globalCompositeOperation = "copy";
+        sctx.transform(a2, b2, c2, d2, e2, f2);
+        sctx.drawImage(srcCanvas, 0, 0, W, H);
+        sctx.restore();
+      }}
+    }}
+    sctx.restore();
+
+    targetCtx.save();
+    if (outlineScreenPts && outlineScreenPts.length >= 4) {{
+      targetCtx.beginPath();
+      outlineScreenPts.forEach((pt, idx) => {{
+        if (idx === 0) targetCtx.moveTo(pt[0], pt[1]);
+        else targetCtx.lineTo(pt[0], pt[1]);
+      }});
+      targetCtx.closePath();
+      targetCtx.clip();
+    }}
+    targetCtx.globalAlpha = alpha;
+    targetCtx.imageSmoothingEnabled = false;
+    targetCtx.drawImage(_panelScratchCanvas, 0, 0, sw, sh, visX0, visY0, sw / dpr, sh / dpr);
+    targetCtx.restore();
   }}
 
   function getWarpedPanelCanvas(panel, isSph) {{
@@ -9484,98 +9782,187 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.restore();
 
     // 2. LAYER 0 (BACK): Detector Bank Pixel Intensity Heatmaps + Panel Outlines
-    ctx.save();
-    azShifts.forEach(shiftAz => {{
-      PANELS.forEach(panel => {{
-        const [vMin, vMax] = getPanelVertRange(panel);
-        const [x0, y0] = detToScreen(panel.az_min + shiftAz, vMax, w, h, -0.35);
-        const [x1, y1] = detToScreen(panel.az_max + shiftAz, vMin, w, h, -0.35);
-        if (
-          Math.max(x0, x1) < -80 ||
-          Math.min(x0, x1) > w + 80 ||
-          Math.max(y0, y1) < -80 ||
-          Math.min(y0, y1) > h + 80
-        ) return;
-        const pw = x1 - x0;
-        const ph = y1 - y0;
+    // Rendered directly from native (u, v) detector coordinates into a device-pixel-aligned
+    // viewport layer cache so rotated/high-latitude banks never quantize onto screen-parallel
+    // intermediate grids and parallax hover blits in O(1).
+    const marginDev = Math.round(24 * dpr);
+    const marginCss = marginDev / dpr;
+    const layerW = targetW + 2 * marginDev;
+    const layerH = targetH + 2 * marginDev;
+    const layerKey = [
+      layerW,
+      layerH,
+      dpr.toFixed(3),
+      state.projection,
+      bounds.minX.toFixed(3),
+      bounds.maxX.toFixed(3),
+      bounds.minY.toFixed(3),
+      bounds.maxY.toFixed(3),
+      state.detZoom.toFixed(5),
+      state.detPanX.toFixed(2),
+      state.detPanY.toFixed(2),
+      state.detAlpha.toFixed(3),
+      state.heatmapStyle,
+      state.hiResTextures ? 1 : 0,
+      state.showPixelMask ? 1 : 0,
+      _panelTexEpoch,
+      PANELS.length,
+    ].join("|");
 
-        const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
-        const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+    if (!_detLayerCacheCanvas) {{
+      _detLayerCacheCanvas = document.createElement("canvas");
+    }}
+    if (_detLayerCacheCanvas.width !== layerW || _detLayerCacheCanvas.height !== layerH) {{
+      _detLayerCacheCanvas.width = layerW;
+      _detLayerCacheCanvas.height = layerH;
+      _detLayerCacheKey = "";
+    }}
 
-        const texCanvas = bankCanvases.get(panel.bank);
-        ctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
-        ctx.lineWidth = texCanvas ? 1.1 : 0.7;
+    if (_detLayerCacheKey !== layerKey) {{
+      const lctx = _detLayerCacheCanvas.getContext("2d");
+      lctx.setTransform(1, 0, 0, 1, 0, 0);
+      lctx.clearRect(0, 0, layerW, layerH);
+      lctx.setTransform(dpr, 0, 0, dpr, marginDev, marginDev);
+      const viewMinX = -marginCss;
+      const viewMinY = -marginCss;
+      const viewMaxX = w + marginCss;
+      const viewMaxY = h + marginCss;
+      const resTag = state.hiResTextures ? "hi" : "lo";
 
-        if (outlinePts && outlinePts.length >= 4) {{
-          ctx.beginPath();
-          outlinePts.forEach((pt, idx) => {{
-            const [ox, oy] = detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35);
-            if (idx === 0) ctx.moveTo(ox, oy);
-            else ctx.lineTo(ox, oy);
-          }});
-          ctx.closePath();
-          ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-          ctx.fill();
-          if (texCanvas && state.detAlpha > 0.01) {{
-            const warpedCanvas = getWarpedPanelCanvas(panel, isSph);
-            if (warpedCanvas) {{
-              ctx.save();
-              ctx.globalAlpha = state.detAlpha;
-              ctx.imageSmoothingEnabled = !(state.hiResTextures && state.detZoom >= 1.8);
-              ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
-              ctx.restore();
-            }}
-          }}
-          if (state.showPixelMask) {{
-            const warpedMask = getWarpedMaskCanvas(panel, isSph);
-            if (warpedMask) {{
-              ctx.save();
-              ctx.imageSmoothingEnabled = !state.hiResTextures && state.detZoom < 2.0;
-              ctx.drawImage(warpedMask, x0, y0, pw, ph);
-              ctx.restore();
-            }}
-          }}
-          ctx.stroke();
-        }} else {{
-          ctx.fillStyle = "rgba(15, 23, 42, 0.72)";
-          ctx.fillRect(x0, y0, pw, ph);
-          if (texCanvas && state.detAlpha > 0.01) {{
-            const warpedCanvas = getWarpedPanelCanvas(panel, isSph);
-            if (warpedCanvas) {{
-              ctx.save();
-              ctx.globalAlpha = state.detAlpha;
-              ctx.imageSmoothingEnabled = !(state.hiResTextures && state.detZoom >= 1.8);
-              ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
-              ctx.restore();
-            }}
-          }}
-          if (state.showPixelMask) {{
-            const warpedMask = getWarpedMaskCanvas(panel, isSph);
-            if (warpedMask) {{
-              ctx.save();
-              ctx.imageSmoothingEnabled = !state.hiResTextures && state.detZoom < 2.0;
-              ctx.drawImage(warpedMask, x0, y0, pw, ph);
-              ctx.restore();
-            }}
-          }}
-          ctx.strokeRect(x0, y0, pw, ph);
-        }}
+      azShifts.forEach(shiftAz => {{
+        PANELS.forEach(panel => {{
+          const [vMin, vMax] = getPanelVertRange(panel);
+          const [x0, y0] = detToScreen(panel.az_min + shiftAz, vMax, w, h, 0.0);
+          const [x1, y1] = detToScreen(panel.az_max + shiftAz, vMin, w, h, 0.0);
+          if (
+            Math.max(x0, x1) < viewMinX - 80 ||
+            Math.min(x0, x1) > viewMaxX + 80 ||
+            Math.max(y0, y1) < viewMinY - 80 ||
+            Math.min(y0, y1) > viewMaxY + 80
+          ) return;
+          const pw = x1 - x0;
+          const ph = y1 - y0;
 
-        // Only show bank labels when zoomed in so default view is clean
-        if (state.detZoom > 1.35 && Math.abs(pw) > 34 && Math.abs(ph) > 24) {{
-          ctx.fillStyle = "rgba(148, 163, 184, 0.42)";
-          ctx.font = "8px monospace";
-          if (cornersPts && cornersPts.length === 4) {{
-            const cScreen = cornersPts.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, -0.35));
-            const cxLbl = 0.25 * (cScreen[0][0] + cScreen[1][0] + cScreen[2][0] + cScreen[3][0]);
-            const cyLbl = 0.25 * (cScreen[0][1] + cScreen[1][1] + cScreen[2][1] + cScreen[3][1]);
-            ctx.fillText(`b${{panel.bank}}`, cxLbl - 7, cyLbl + 3);
+          const outlinePts = isSph && panel.outline_sph ? panel.outline_sph : panel.outline;
+          const cornersPts = isSph && panel.corners_sph ? panel.corners_sph : panel.corners;
+          const outlineScreenPts = (outlinePts && outlinePts.length >= 4)
+            ? outlinePts.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, 0.0))
+            : null;
+
+          const texCanvas = bankCanvases.get(panel.bank);
+          lctx.strokeStyle = texCanvas ? "rgba(56, 189, 248, 0.38)" : "rgba(148, 163, 184, 0.18)";
+          lctx.lineWidth = texCanvas ? 1.1 : 0.7;
+
+          if (outlineScreenPts) {{
+            lctx.beginPath();
+            outlineScreenPts.forEach((pt, idx) => {{
+              if (idx === 0) lctx.moveTo(pt[0], pt[1]);
+              else lctx.lineTo(pt[0], pt[1]);
+            }});
+            lctx.closePath();
+            lctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+            lctx.fill();
           }} else {{
-            ctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 9);
+            lctx.fillStyle = "rgba(15, 23, 42, 0.72)";
+            lctx.fillRect(x0, y0, pw, ph);
           }}
-        }}
+
+          if (texCanvas && state.detAlpha > 0.01) {{
+            drawPanelTextureDirect(
+              lctx,
+              texCanvas,
+              `tex_${{panel.bank}}_${{state.heatmapStyle}}_${{resTag}}`,
+              panel,
+              isSph,
+              shiftAz,
+              w,
+              h,
+              dpr,
+              viewMinX,
+              viewMinY,
+              viewMaxX,
+              viewMaxY,
+              x0,
+              y0,
+              pw,
+              ph,
+              outlineScreenPts,
+              state.detAlpha,
+              Boolean(state.hiResTextures)
+            );
+          }}
+
+          if (state.showPixelMask) {{
+            const mCanvas = maskBankCanvases.get(panel.bank);
+            if (mCanvas) {{
+              drawPanelTextureDirect(
+                lctx,
+                mCanvas,
+                `mask_${{panel.bank}}_${{resTag}}`,
+                panel,
+                isSph,
+                shiftAz,
+                w,
+                h,
+                dpr,
+                viewMinX,
+                viewMinY,
+                viewMaxX,
+                viewMaxY,
+                x0,
+                y0,
+                pw,
+                ph,
+                outlineScreenPts,
+                1.0,
+                true
+              );
+            }}
+          }}
+
+          if (outlineScreenPts) {{
+            lctx.beginPath();
+            outlineScreenPts.forEach((pt, idx) => {{
+              if (idx === 0) lctx.moveTo(pt[0], pt[1]);
+              else lctx.lineTo(pt[0], pt[1]);
+            }});
+            lctx.closePath();
+            lctx.stroke();
+          }} else {{
+            lctx.strokeRect(x0, y0, pw, ph);
+          }}
+
+          // Only show bank labels when zoomed in so default view is clean
+          if (state.detZoom > 1.35 && Math.abs(pw) > 34 && Math.abs(ph) > 24) {{
+            lctx.fillStyle = "rgba(148, 163, 184, 0.42)";
+            lctx.font = "8px monospace";
+            if (cornersPts && cornersPts.length === 4) {{
+              const cScreen = cornersPts.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, 0.0));
+              const cxLbl = 0.25 * (cScreen[0][0] + cScreen[1][0] + cScreen[2][0] + cScreen[3][0]);
+              const cyLbl = 0.25 * (cScreen[0][1] + cScreen[1][1] + cScreen[2][1] + cScreen[3][1]);
+              lctx.fillText(`b${{panel.bank}}`, cxLbl - 7, cyLbl + 3);
+            }} else {{
+              lctx.fillText(`b${{panel.bank}}`, x0 + 3, y0 + 9);
+            }}
+          }}
+        }});
       }});
-    }});
+      _detLayerCacheKey = layerKey;
+    }}
+
+    ctx.save();
+    const rawParallaxX = state.parallaxX * state.parallaxStrength * -0.35 * 18.0;
+    const rawParallaxY = state.parallaxY * state.parallaxStrength * -0.35 * 12.0;
+    const snapParallaxX = Math.round(rawParallaxX * dpr) / dpr;
+    const snapParallaxY = Math.round(rawParallaxY * dpr) / dpr;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(
+      _detLayerCacheCanvas,
+      -marginCss + snapParallaxX,
+      -marginCss + snapParallaxY,
+      layerW / dpr,
+      layerH / dpr
+    );
     ctx.restore();
 
     const OVERLAY_PARALLAX_LAYER = 0.45;
@@ -10495,8 +10882,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.hiResTextures = !state.hiResTextures;
     const reqSeq = (state.hiresReqSeq || 0) + 1;
     state.hiresReqSeq = reqSeq;
-    warpedBankCanvases.clear();
-    warpedMaskCanvases.clear();
+    invalidatePanelRenderCaches();
     syncHiResButtonUI();
     renderDetector();
 
@@ -10517,8 +10903,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           if (mc) maskBankCanvases.set(p.bank, mc);
         }}
       }});
-      warpedBankCanvases.clear();
-      warpedMaskCanvases.clear();
+      invalidatePanelRenderCaches();
       renderDetector();
       setStatusLine(
         "[DETECTOR TEXTURE]",
@@ -10554,8 +10939,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
           }});
           DATA.render_binning = doc.render_binning || (state.hiResTextures ? 1 : 4);
-          warpedBankCanvases.clear();
-          warpedMaskCanvases.clear();
+          invalidatePanelRenderCaches();
           decodeAllBankTextures();
           setStatusLine(
             "[DETECTOR TEXTURE]",
@@ -11003,6 +11387,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         maskBankCanvases.set(p.bank, p._maskCanvas);
       }}
     }});
+    invalidatePanelRenderCaches();
     syncPixelMaskUI();
 
     const subEl = document.querySelector(".subtitle-tag");

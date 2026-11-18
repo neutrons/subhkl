@@ -3400,11 +3400,187 @@ def test_mandi_i2_harmonics_wulff_snr_dimming_and_hires_textures(tmp_path) -> No
     assert im_lo.size == (16, 16)
     assert im_hi.size == (64, 64)
 
-    # 3. Verify ellipse crossbars are removed and Wulff I/sig>=2.5 badge + detector dimming + Hi-Res button exist
-    html_doc = render_rainbow_html(p_lo)
+    # 3. Verify ellipse crossbars are removed, Wulff I/sig>=2.5 badge + detector dimming + Hi-Res button exist,
+    # and Hi-Res direct (u, v) rendering eliminates screen-edge-parallel tile-by-tile nematic warping.
+    html_doc = render_rainbow_html(p_hi)
     assert "pQ1" not in html_doc and "pQ3" not in html_doc
     assert 'id="btn-hires-tex"' in html_doc
     assert "toggleHiResTextures" in html_doc
     assert "isWulffSnrCutActive" in html_doc
     assert "isPeakUncertainForScope" in html_doc
     assert "ALL-RUNS · I/σ ≥" in html_doc
+    assert "drawPanelTextureDirect" in html_doc
+    assert "getCrispUVCanvas" in html_doc
+
+    import re
+    import shutil
+    import subprocess
+
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        assert len(script_blocks) >= 1
+        inline_js = script_blocks[-1]
+        js_syntax_file = tmp_path / "hires_inline_check.js"
+        js_syntax_file.write_text(inline_js, encoding="utf-8")
+        subprocess.run(["node", "--check", str(js_syntax_file)], check=True)
+
+        fn_names = [
+            "invalidatePanelRenderCaches",
+            "getDetectorDataAspect",
+            "getDetectorPlotBox",
+            "detToScreen",
+            "getPanelVertRange",
+            "getCrispUVCanvas",
+            "getPanelScreenAspect",
+            "expandClampedUVTri",
+            "warpTextureOntoPanel",
+            "drawPanelTextureDirect",
+        ]
+        extracted = []
+        for fn_name in fn_names:
+            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            assert m is not None, f"Missing JS function {fn_name}"
+            start = m.start()
+            depth = 0
+            in_body = False
+            end = start
+            for idx in range(start, len(inline_js)):
+                ch = inline_js[idx]
+                if ch == "{":
+                    depth += 1
+                    in_body = True
+                elif ch == "}":
+                    depth -= 1
+                    if in_body and depth == 0:
+                        end = idx + 1
+                        break
+            extracted.append(inline_js[start:end])
+
+        b1_panel = next(pn for pn in p_hi["panels"] if pn["bank"] == 1)
+        b20_panel = next(pn for pn in p_hi["panels"] if pn["bank"] == 20)
+        harness_js = f"""
+const PANELS = {json.dumps([b1_panel, b20_panel])};
+const warpedBankCanvases = new Map();
+const warpedMaskCanvases = new Map();
+const uvUpscaledCanvases = new Map();
+let _panelTexEpoch = 1;
+let _detLayerCacheCanvas = null;
+let _detLayerCacheKey = "";
+let _panelScratchCanvas = null;
+let _cachedCylRadiusM = null;
+let _cachedPlotBox = null;
+let _cachedPlotBoxKey = "";
+
+function makeMockCanvas(w = 256, h = 256) {{
+  const ops = [];
+  const ctx = {{
+    ops,
+    imageSmoothingEnabled: true,
+    imageSmoothingQuality: "low",
+    globalAlpha: 1.0,
+    globalCompositeOperation: "source-over",
+    save() {{ ops.push(["save"]); }},
+    restore() {{ ops.push(["restore"]); }},
+    beginPath() {{}},
+    moveTo() {{}},
+    lineTo() {{}},
+    rect() {{}},
+    closePath() {{}},
+    clip() {{}},
+    clearRect() {{}},
+    setTransform(...args) {{ ops.push(["setTransform", ...args]); }},
+    transform(...args) {{ ops.push(["transform", ...args]); }},
+    drawImage(src, ...rest) {{
+      ops.push([
+        "drawImage",
+        src.width,
+        src.height,
+        this.imageSmoothingEnabled,
+        this.imageSmoothingQuality,
+        this.globalCompositeOperation,
+        ...rest,
+      ]);
+    }},
+  }};
+  return {{ width: w, height: h, _ctx: ctx, getContext: () => ctx }};
+}}
+globalThis.document = {{ createElement: () => makeMockCanvas(1, 1) }};
+
+const state = {{
+  projection: "spherical",
+  hiResTextures: true,
+  heatmapStyle: "magma",
+  detZoom: 1.0,
+  detPanX: 0.0,
+  detPanY: 0.0,
+  parallaxX: 0.0,
+  parallaxY: 0.0,
+  parallaxStrength: 1.0,
+}};
+function getActiveBounds() {{
+  return {{ minX: -180.0, maxX: 180.0, minY: -90.0, maxY: 90.0 }};
+}}
+
+{chr(10).join(extracted)}
+
+const tex = makeMockCanvas(256, 256);
+// 1) Wide bottom-ring MANDI bank b1 has spherical az/el ratio ~3.48:1 (never forced to 1:1 square)
+const wcB1 = warpTextureOntoPanel(tex, PANELS[0], true, false);
+const b1Ratio = wcB1.width / wcB1.height;
+
+// 2) Direct (u, v) rendering on 45-deg diamond bank b20 at overview zoom (detZoom=1.0 -> k=1) vs deep zoom (detZoom=12.0 -> k>=4)
+const layerLo = makeMockCanvas(1200, 800);
+const p20 = PANELS[1];
+const [vMin, vMax] = getPanelVertRange(p20);
+let [x0, y0] = detToScreen(p20.az_min, vMax, 1200, 800, 0.0);
+let [x1, y1] = detToScreen(p20.az_max, vMin, 1200, 800, 0.0);
+const outLo = p20.outline_sph.map(pt => detToScreen(pt[0], pt[1], 1200, 800, 0.0));
+drawPanelTextureDirect(
+  layerLo.getContext("2d"), tex, "tex_20_magma_hi", p20, true, 0.0,
+  1200, 800, 1.0, -24, -24, 1224, 824, x0, y0, x1 - x0, y1 - y0, outLo, 0.85, true
+);
+
+state.detZoom = 12.0;
+const [cx20, cy20] = detToScreen(0.5 * (p20.az_min + p20.az_max), 0.5 * (vMin + vMax), 1200, 800, 0.0);
+state.detPanX = 600.0 - cx20;
+state.detPanY = 400.0 - cy20;
+[x0, y0] = detToScreen(p20.az_min, vMax, 1200, 800, 0.0);
+[x1, y1] = detToScreen(p20.az_max, vMin, 1200, 800, 0.0);
+const outHi = p20.outline_sph.map(pt => detToScreen(pt[0], pt[1], 1200, 800, 0.0));
+const layerHi = makeMockCanvas(1200, 800);
+drawPanelTextureDirect(
+  layerHi.getContext("2d"), tex, "tex_20_magma_hi", p20, true, 0.0,
+  1200, 800, 2.0, -24, -24, 1224, 824, x0, y0, x1 - x0, y1 - y0, outHi, 0.85, true
+);
+
+const scratchDraws = _panelScratchCanvas
+  ? _panelScratchCanvas.getContext("2d").ops.filter(o => o[0] === "drawImage")
+  : [];
+const clampCheck = expandClampedUVTri(0, 0, 32, 0, 0, 32, 2.5, 2.5, 256, 256, 1, 0, 0, 1, 0, 0);
+
+console.log(JSON.stringify({{
+  b1Ratio,
+  uvCacheKeys: Array.from(uvUpscaledCanvases.keys()),
+  firstDrawSrcW: scratchDraws.length > 0 ? scratchDraws[0][1] : 0,
+  lastDrawSrcW: scratchDraws.length > 0 ? scratchDraws[scratchDraws.length - 1][1] : 0,
+  scratchSmoothing: scratchDraws.every(d => d[3] === true && d[4] === "high"),
+  scratchCopyOp: scratchDraws.every(d => d[5] === "copy"),
+  clampTopEdgeExactZero: clampCheck[0][1] === 0 && clampCheck[1][1] === 0 && clampCheck[0][0] === 0 && clampCheck[2][0] === 0,
+}}));
+"""
+        harness_file = tmp_path / "hires_nematic_fix_harness.js"
+        harness_file.write_text(harness_js, encoding="utf-8")
+        res = subprocess.run(
+            ["node", str(harness_file)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(res.stdout.strip())
+        assert out["b1Ratio"] > 3.0
+        assert any(k.endswith(("_k4", "_k8")) for k in out["uvCacheKeys"])
+        assert out["firstDrawSrcW"] == 256
+        assert out["lastDrawSrcW"] >= 1024
+        assert out["scratchSmoothing"] is True
+        assert out["scratchCopyOp"] is True
+        assert out["clampTopEdgeExactZero"] is True
