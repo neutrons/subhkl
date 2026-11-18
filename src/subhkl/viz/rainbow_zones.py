@@ -710,26 +710,58 @@ def _encode_panel_textures(
                                 f0 = int(offsets[best_r])
                                 f1 = int(offsets[best_r] + counts[best_r])
                         b = max(1, int(render_binning))
-                        for idx in range(f0, f1):
-                            bk = int(b_ids_all[idx])
-                            im = np.asarray(ims[idx], dtype=np.float32)
-                            if im.ndim != 2:
-                                continue
-                            n2, m2 = (im.shape[0] // b) * b, (im.shape[1] // b) * b
-                            if n2 > 0 and m2 > 0:
-                                imb = (
-                                    im[:n2, :m2]
-                                    .reshape(n2 // b, b, m2 // b, b)
-                                    .mean(axis=(1, 3))
-                                )
+                        if f1 > f0:
+                            ims_slab = np.asarray(ims[f0:f1], dtype=np.float32)
+                            if ims_slab.ndim == 3:
+                                n2 = (ims_slab.shape[1] // b) * b
+                                m2 = (ims_slab.shape[2] // b) * b
+                                if b > 1 and n2 > 0 and m2 > 0:
+                                    binned_slab = (
+                                        ims_slab[:, :n2, :m2]
+                                        .reshape(
+                                            ims_slab.shape[0],
+                                            n2 // b,
+                                            b,
+                                            m2 // b,
+                                            b,
+                                        )
+                                        .mean(axis=(2, 4))
+                                    )
+                                else:
+                                    binned_slab = ims_slab
+                                for rel_i, idx in enumerate(range(f0, f1)):
+                                    bk = int(b_ids_all[idx])
+                                    imb = binned_slab[rel_i]
+                                    if bk in raw_bank_images:
+                                        raw_bank_images[bk] = np.maximum(
+                                            raw_bank_images[bk], imb
+                                        )
+                                    else:
+                                        raw_bank_images[bk] = imb
                             else:
-                                imb = im
-                            if bk in raw_bank_images:
-                                raw_bank_images[bk] = np.maximum(
-                                    raw_bank_images[bk], imb
-                                )
-                            else:
-                                raw_bank_images[bk] = imb
+                                for idx in range(f0, f1):
+                                    bk = int(b_ids_all[idx])
+                                    im = np.asarray(ims[idx], dtype=np.float32)
+                                    if im.ndim != 2:
+                                        continue
+                                    n2, m2 = (
+                                        (im.shape[0] // b) * b,
+                                        (im.shape[1] // b) * b,
+                                    )
+                                    if b > 1 and n2 > 0 and m2 > 0:
+                                        imb = (
+                                            im[:n2, :m2]
+                                            .reshape(n2 // b, b, m2 // b, b)
+                                            .mean(axis=(1, 3))
+                                        )
+                                    else:
+                                        imb = im
+                                    if bk in raw_bank_images:
+                                        raw_bank_images[bk] = np.maximum(
+                                            raw_bank_images[bk], imb
+                                        )
+                                    else:
+                                        raw_bank_images[bk] = imb
                         if raw_bank_images:
                             intensity_source = "raw_h5"
         except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
@@ -1203,6 +1235,8 @@ def _raycast_hkl_on_detectors(
     sigma_cand: np.ndarray | None = None,
     bank_imgs: dict[int, np.ndarray] | None = None,
     margin_frac: float = 0.01,
+    G_cryst: np.ndarray | None = None,
+    qn_cryst: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Forward-project candidate Miller indices onto calibrated detector panels in Laue geometry."""
     empty = {
@@ -1223,22 +1257,39 @@ def _raycast_hkl_on_detectors(
     ki_vec = ki_vec / max(float(np.linalg.norm(ki_vec)), 1e-12)
     wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
 
-    RUB = (
-        np.asarray(R_run, dtype=float)
-        @ np.asarray(U_mat, dtype=float)
-        @ np.asarray(B_mat, dtype=float)
-    )
-    G = hkl_arr.astype(float) @ RUB.T
-    qn = np.linalg.norm(G, axis=1)
-    sth = -(G @ ki_vec) / np.maximum(qn, 1e-12)
-    lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
-    keep_wl = (qn > 1e-8) & (sth > 1e-5) & (lam_pred >= wl_min) & (lam_pred <= wl_max)
-    if not np.any(keep_wl):
-        return empty
-
-    hkl_b = hkl_arr[keep_wl]
-    lam_b = lam_pred[keep_wl]
-    G_b = G[keep_wl]
+    R_mat = np.asarray(R_run, dtype=float)
+    if (
+        G_cryst is not None
+        and qn_cryst is not None
+        and len(G_cryst) == len(hkl_arr)
+        and len(qn_cryst) == len(hkl_arr)
+    ):
+        qn = qn_cryst
+        ki_cryst = R_mat.T @ ki_vec
+        sth = -(G_cryst @ ki_cryst) / np.maximum(qn, 1e-12)
+        lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
+        keep_wl = (
+            (qn > 1e-8) & (sth > 1e-5) & (lam_pred >= wl_min) & (lam_pred <= wl_max)
+        )
+        if not np.any(keep_wl):
+            return empty
+        hkl_b = hkl_arr[keep_wl]
+        lam_b = lam_pred[keep_wl]
+        G_b = G_cryst[keep_wl] @ R_mat.T
+    else:
+        RUB = R_mat @ np.asarray(U_mat, dtype=float) @ np.asarray(B_mat, dtype=float)
+        G = hkl_arr.astype(float) @ RUB.T
+        qn = np.linalg.norm(G, axis=1)
+        sth = -(G @ ki_vec) / np.maximum(qn, 1e-12)
+        lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
+        keep_wl = (
+            (qn > 1e-8) & (sth > 1e-5) & (lam_pred >= wl_min) & (lam_pred <= wl_max)
+        )
+        if not np.any(keep_wl):
+            return empty
+        hkl_b = hkl_arr[keep_wl]
+        lam_b = lam_pred[keep_wl]
+        G_b = G[keep_wl]
     inten_b = (
         np.asarray(inten_cand, dtype=float)[keep_wl]
         if inten_cand is not None and len(inten_cand) == len(hkl_arr)
@@ -1461,61 +1512,84 @@ def apply_mtz_to_payload(
             i_col = np.full(len(h_col), 100.0, dtype=np.float64)
             s_col = np.ones(len(h_col), dtype=np.float64)
 
+    i_arr = np.asarray(i_col, dtype=np.float64)
+    s_arr = (
+        np.asarray(s_col, dtype=np.float64)
+        if s_col is not None
+        else np.ones_like(i_arr)
+    )
+    valid_m = np.isfinite(i_arr) & ((h_col != 0) | (k_col != 0) | (l_col != 0))
+    hkl_valid = np.column_stack((h_col[valid_m], k_col[valid_m], l_col[valid_m]))
+    i_valid = i_arr[valid_m]
+    s_raw = s_arr[valid_m]
+    s_valid = np.maximum(np.where(np.isfinite(s_raw), s_raw, 1.0), 1e-3)
+
+    if len(hkl_valid) > 0:
+        ord_abs = np.argsort(-np.abs(i_valid), kind="mergesort")
+        hkl_s = hkl_valid[ord_abs]
+        i_s = i_valid[ord_abs]
+        s_s = s_valid[ord_abs]
+        lit_hkl, lit_first = np.unique(hkl_s, axis=0, return_index=True)
+        lit_i = i_s[lit_first]
+        lit_s = s_s[lit_first]
+    else:
+        lit_hkl = np.zeros((0, 3), dtype=int)
+        lit_i = np.zeros(0, dtype=np.float64)
+        lit_s = np.zeros(0, dtype=np.float64)
+
     asu_map: dict[tuple[int, int, int], tuple[float, float]] = {}
-    literal_map: dict[tuple[int, int, int], tuple[float, float]] = {}
-    for idx in range(len(h_col)):
-        iv = float(i_col[idx])
-        sv = float(s_col[idx]) if s_col is not None else 1.0
-        if not np.isfinite(iv):
-            continue
-        hh, kk, ll = int(h_col[idx]), int(k_col[idx]), int(l_col[idx])
-        if hh == 0 and kk == 0 and ll == 0:
-            continue
-        sv_clean = max(sv if np.isfinite(sv) else 1.0, 1e-3)
-        lit_key = (hh, kk, ll)
-        if lit_key not in literal_map or abs(iv) > abs(literal_map[lit_key][0]):
-            literal_map[lit_key] = (iv, sv_clean)
+    for u_idx in range(len(lit_hkl)):
+        hh, kk, ll = (
+            int(lit_hkl[u_idx, 0]),
+            int(lit_hkl[u_idx, 1]),
+            int(lit_hkl[u_idx, 2]),
+        )
+        iv, sv_clean = float(lit_i[u_idx]), float(lit_s[u_idx])
         asu_hkl, _ = asu.to_asu([hh, kk, ll], ops)
         key = (int(asu_hkl[0]), int(asu_hkl[1]), int(asu_hkl[2]))
         if key not in asu_map or abs(iv) > abs(asu_map[key][0]):
             asu_map[key] = (iv, sv_clean)
 
-    # Expand merged ASU MTZs across symmetry + Friedel mates so all matching Ewald hits
-    # in the active geometry are projected; preserve literal HKL rows too.
+    # Expand merged ASU MTZs across symmetry + Friedel mates carrying (I, SIGI) directly in NumPy
+    # so all matching Ewald hits in the active geometry are projected without a second gemmi pass.
     is_unmerged_mtz = "BATCH" in cols
-    expanded_hkl_blocks: list[np.ndarray] = []
+    exp_hkl_blocks: list[np.ndarray] = []
+    exp_i_blocks: list[np.ndarray] = []
+    exp_s_blocks: list[np.ndarray] = []
+    if len(lit_hkl) > 0:
+        exp_hkl_blocks.append(lit_hkl)
+        exp_i_blocks.append(lit_i)
+        exp_s_blocks.append(lit_s)
     if not is_unmerged_mtz and asu_map:
         asu_arr = np.asarray(list(asu_map.keys()), dtype=int)
+        asu_vals = np.asarray(list(asu_map.values()), dtype=np.float64)
+        asu_i = asu_vals[:, 0]
+        asu_s = asu_vals[:, 1]
         for op in ops.sym_ops:
             rot_m = np.asarray(op.rot, dtype=float) / float(op.DEN)
             h_rot = np.rint(asu_arr @ rot_m).astype(int)
-            expanded_hkl_blocks.append(h_rot)
-            expanded_hkl_blocks.append(-h_rot)
-    if literal_map:
-        expanded_hkl_blocks.append(np.asarray(list(literal_map.keys()), dtype=int))
+            exp_hkl_blocks.append(h_rot)
+            exp_i_blocks.append(asu_i)
+            exp_s_blocks.append(asu_s)
+            exp_hkl_blocks.append(-h_rot)
+            exp_i_blocks.append(asu_i)
+            exp_s_blocks.append(asu_s)
 
-    if expanded_hkl_blocks:
-        hkl_exp = np.unique(np.concatenate(expanded_hkl_blocks, axis=0), axis=0)
-        nonzero_m = np.any(hkl_exp != 0, axis=1)
-        hkl_exp = hkl_exp[nonzero_m]
+    if exp_hkl_blocks:
+        cat_hkl = np.concatenate(exp_hkl_blocks, axis=0)
+        cat_i = np.concatenate(exp_i_blocks, axis=0)
+        cat_s = np.concatenate(exp_s_blocks, axis=0)
+        nonzero_m = np.any(cat_hkl != 0, axis=1)
+        cat_hkl, cat_i, cat_s = cat_hkl[nonzero_m], cat_i[nonzero_m], cat_s[nonzero_m]
+        ord_e = np.argsort(-np.abs(cat_i), kind="mergesort")
+        cat_hkl, cat_i, cat_s = cat_hkl[ord_e], cat_i[ord_e], cat_s[ord_e]
+        hkl_exp, exp_first = np.unique(cat_hkl, axis=0, return_index=True)
+        inten_exp = cat_i[exp_first]
+        sigma_exp = cat_s[exp_first]
     else:
         hkl_exp = np.zeros((0, 3), dtype=int)
-
-    inten_exp = np.full(len(hkl_exp), 100.0, dtype=float)
-    sigma_exp = np.full(len(hkl_exp), 1.0, dtype=float)
-    for m_idx in range(len(hkl_exp)):
-        hh, kk, ll = (
-            int(hkl_exp[m_idx, 0]),
-            int(hkl_exp[m_idx, 1]),
-            int(hkl_exp[m_idx, 2]),
-        )
-        hit_v = literal_map.get((hh, kk, ll))
-        if hit_v is None:
-            ak, _ = asu.to_asu([hh, kk, ll], ops)
-            hit_v = asu_map.get((int(ak[0]), int(ak[1]), int(ak[2])))
-        if hit_v is not None:
-            inten_exp[m_idx] = hit_v[0]
-            sigma_exp[m_idx] = hit_v[1]
+        inten_exp = np.zeros(0, dtype=float)
+        sigma_exp = np.zeros(0, dtype=float)
 
     detectors = _reconstruct_detectors_from_payload(payload)
     wl_range = payload.get("wavelength_range") or [1.5, 4.5]
@@ -1529,6 +1603,22 @@ def apply_mtz_to_payload(
     ki_hat = np.asarray(payload.get("ki") or [0.0, 0.0, 1.0], dtype=float)
     ki_hat = ki_hat / max(float(np.linalg.norm(ki_hat)), 1e-12)
 
+    # Precompute crystal-frame reciprocal vectors once and discard reflections beyond the
+    # universal Bragg ceiling |G| <= 2 / lambda_min across all goniometer orientations.
+    if len(hkl_exp) > 0:
+        G_cryst_all = hkl_exp.astype(float) @ UB_curr.T
+        qn_cryst_all = np.linalg.norm(G_cryst_all, axis=1)
+        q_max_bragg = (2.0 / max(wl_min, 0.05)) + 1e-5
+        bragg_m = (qn_cryst_all > 1e-8) & (qn_cryst_all <= q_max_bragg)
+        hkl_exp = hkl_exp[bragg_m]
+        inten_exp = inten_exp[bragg_m]
+        sigma_exp = sigma_exp[bragg_m]
+        G_cryst_exp = G_cryst_all[bragg_m]
+        qn_cryst_exp = qn_cryst_all[bragg_m]
+    else:
+        G_cryst_exp = np.zeros((0, 3), dtype=float)
+        qn_cryst_exp = np.zeros(0, dtype=float)
+
     cast_frame = _raycast_hkl_on_detectors(
         hkl_exp,
         U_curr,
@@ -1539,6 +1629,8 @@ def apply_mtz_to_payload(
         ki=ki_hat,
         inten_cand=inten_exp,
         sigma_cand=sigma_exp,
+        G_cryst=G_cryst_exp,
+        qn_cryst=qn_cryst_exp,
     )
     pts_mtz = cast_frame["peaks_xyz"]
     if len(pts_mtz) > 12000:
@@ -1631,6 +1723,8 @@ def apply_mtz_to_payload(
                 ki=ki_hat,
                 inten_cand=inten_exp,
                 sigma_cand=sigma_exp,
+                G_cryst=G_cryst_exp,
+                qn_cryst=qn_cryst_exp,
             )
             if len(c_r["peaks_xyz"]) > 0:
                 all_xyz.append(c_r["peaks_xyz"])
@@ -1648,8 +1742,63 @@ def apply_mtz_to_payload(
             int_all_m = np.concatenate(all_int, axis=0)
             sig_all_m = np.concatenate(all_sig, axis=0)
             run_all_m = np.concatenate(all_run, axis=0)
+            # Every run observing the same crystal (h, k, l) maps to the exact same 3D unit vector
+            # on the Wulff sphere. Keep all active_frame hits plus one strongest-|I|/sigma entry per
+            # additional unique crystal (h, k, l) across other runs to eliminate 5-15x multi-run bloat.
+            is_act = run_all_m == active_frame
+            act_idx = np.flatnonzero(is_act)
+            oth_idx = np.flatnonzero(~is_act)
+            if len(oth_idx) > 0:
+                snr_oth = np.abs(int_all_m[oth_idx]) / np.maximum(
+                    sig_all_m[oth_idx], 1e-3
+                )
+                oth_sorted = oth_idx[np.argsort(-snr_oth, kind="mergesort")]
+                _, oth_first = np.unique(
+                    hkl_all_m[oth_sorted], axis=0, return_index=True
+                )
+                oth_uniq = oth_sorted[oth_first]
+                if len(act_idx) > 0:
+                    act_set = {
+                        (int(r[0]), int(r[1]), int(r[2])) for r in hkl_all_m[act_idx]
+                    }
+                    oth_keep = np.array(
+                        [
+                            idx_o
+                            for idx_o in oth_uniq
+                            if (
+                                int(hkl_all_m[idx_o, 0]),
+                                int(hkl_all_m[idx_o, 1]),
+                                int(hkl_all_m[idx_o, 2]),
+                            )
+                            not in act_set
+                        ],
+                        dtype=int,
+                    )
+                    keep_m = (
+                        np.sort(np.concatenate([act_idx, oth_keep]))
+                        if len(oth_keep) > 0
+                        else act_idx
+                    )
+                else:
+                    keep_m = np.sort(oth_uniq)
+                pts_all_m = pts_all_m[keep_m]
+                hkl_all_m = hkl_all_m[keep_m]
+                lam_all_m = lam_all_m[keep_m]
+                bnk_all_m = bnk_all_m[keep_m]
+                int_all_m = int_all_m[keep_m]
+                sig_all_m = sig_all_m[keep_m]
+                run_all_m = run_all_m[keep_m]
             if len(pts_all_m) > 8000:
-                top_m = np.sort(np.argsort(-np.abs(int_all_m))[:8000])
+                # Always retain active_frame hits if within 8000, filling remaining budget by |I|
+                is_act2 = run_all_m == active_frame
+                act2 = np.flatnonzero(is_act2)
+                oth2 = np.flatnonzero(~is_act2)
+                if 0 < len(act2) < 8000:
+                    rem_b = 8000 - len(act2)
+                    oth_top = oth2[np.argsort(-np.abs(int_all_m[oth2]))[:rem_b]]
+                    top_m = np.sort(np.concatenate([act2, oth_top]))
+                else:
+                    top_m = np.sort(np.argsort(-np.abs(int_all_m))[:8000])
                 pts_all_m = pts_all_m[top_m]
                 hkl_all_m = hkl_all_m[top_m]
                 lam_all_m = lam_all_m[top_m]
@@ -1688,6 +1837,8 @@ def apply_mtz_to_payload(
     out = dict(payload)
     # Annotate existing predicted / integrated peak sets with merged_i/sigi where matching ASU HKL exists,
     # while strictly preserving active U, B, UB, cell, space_group, and zones.
+    asu_lookup_cache: dict[tuple[int, int, int], tuple[int, int, int]] = {}
+    same_sg = mtz.spacegroup is None or (mtz_sg.xhm() == active_sg.xhm())
     for list_key in (
         "predicted_peaks",
         "predicted_sample_peaks",
@@ -1700,12 +1851,20 @@ def apply_mtz_to_payload(
         new_list = []
         for pk in pk_list:
             pk_copy = dict(pk)
-            hkl_v = pk_copy.get("hkl")
-            if isinstance(hkl_v, list) and len(hkl_v) == 3:
-                asu_k, _ = asu.to_asu(
-                    [int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2])], ops
-                )
-                ak_t = (int(asu_k[0]), int(asu_k[1]), int(asu_k[2]))
+            asu_pre = pk_copy.get("asu_hkl") if same_sg else None
+            ak_t: tuple[int, int, int] | None = None
+            if isinstance(asu_pre, list) and len(asu_pre) == 3:
+                ak_t = (int(asu_pre[0]), int(asu_pre[1]), int(asu_pre[2]))
+            else:
+                hkl_v = pk_copy.get("hkl")
+                if isinstance(hkl_v, list) and len(hkl_v) == 3:
+                    hk_key = (int(hkl_v[0]), int(hkl_v[1]), int(hkl_v[2]))
+                    ak_t = asu_lookup_cache.get(hk_key)
+                    if ak_t is None:
+                        asu_k, _ = asu.to_asu(list(hk_key), ops)
+                        ak_t = (int(asu_k[0]), int(asu_k[1]), int(asu_k[2]))
+                        asu_lookup_cache[hk_key] = ak_t
+            if ak_t is not None:
                 hit = asu_map.get(ak_t)
                 if hit is not None:
                     pk_copy["merged_i"] = round(hit[0], 2)
@@ -3718,7 +3877,13 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
                 if float(np.linalg.det(r_m)) > 0.0:
                     proper_rots.append(r_m)
 
+    _asu_cache: dict[tuple[int, int, int], tuple[int, int, int, bool]] = {}
+
     def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int, bool]:
+        ck = (int(h_v), int(k_v), int(l_v))
+        cached = _asu_cache.get(ck)
+        if cached is not None:
+            return cached
         if asu_obj is not None and sg_ops is not None and (h_v or k_v or l_v):
             with contextlib.suppress(RuntimeError, ValueError, TypeError, IndexError):
                 ha, isym = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
@@ -3733,7 +3898,9 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
                         and round(float(h_vec @ r_m[:, 2])) == l_v
                         for r_m in proper_rots
                     )
-                return (ah_i, ak_i, al_i, bool(is_fr))
+                res_asu = (ah_i, ak_i, al_i, bool(is_fr))
+                _asu_cache[ck] = res_asu
+                return res_asu
         ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
         sg_u = str(space_group or "").upper()
         is_cubic = "3" in sg_u or (
@@ -10162,14 +10329,220 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return src.filter(isPeakVisible);
   }}
 
+  const _wulffPoolCache = {{
+    sig: "",
+    firstRef: null,
+    lastRef: null,
+    rawPeaks: [],
+    uniquePeaks: [],
+    observedHklSet: new Set(),
+    sortedD: [],
+  }};
+  let _lastWulffRenderSig = "";
+
+  function _peakSnrScore(p) {{
+    if (state.wulffColorMode === "residual" && typeof p.careless_residual === "number") {{
+      return Math.abs(p.careless_residual);
+    }}
+    if (typeof p.merged_i === "number" && typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
+      return Math.abs(p.merged_i) / p.merged_sigi;
+    }}
+    const sig = (typeof p.sigma === "number" && p.sigma > 0) ? p.sigma : 1.0;
+    return Math.abs(typeof p.intensity === "number" ? p.intensity : 0.0) / sig;
+  }}
+
+  function getWulffPoolCache() {{
+    const useAllRuns = state.wulffScope === "all_runs" && SAMPLE_PEAKS.length > 0;
+    const src = useAllRuns ? SAMPLE_PEAKS : PEAKS;
+    const firstRef = src.length > 0 ? src[0] : null;
+    const lastRef = src.length > 0 ? src[src.length - 1] : null;
+    const activeFrameIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const sig = `${{useAllRuns ? "all" : "1f"}}|${{src.length}}|${{state.peakSource}}|${{state.dMin}}|${{state.lamMin}}|${{state.lamMax}}|${{state.wulffColorMode}}|${{activeFrameIdx}}`;
+    if (
+      _wulffPoolCache.sig === sig &&
+      _wulffPoolCache.firstRef === firstRef &&
+      _wulffPoolCache.lastRef === lastRef
+    ) {{
+      return _wulffPoolCache;
+    }}
+
+    const rawPeaks = getActiveWulffPeaks();
+    const observedHklSet = new Set();
+    let uniquePeaks = rawPeaks;
+    if (useAllRuns && rawPeaks.length > 0) {{
+      const byHkl = new Map();
+      const unindexed = [];
+      for (let i = 0; i < rawPeaks.length; i++) {{
+        const p = rawPeaks[i];
+        if (Array.isArray(p.hkl) && p.hkl.length === 3 && (p.hkl[0] || p.hkl[1] || p.hkl[2])) {{
+          const hk = `${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`;
+          observedHklSet.add(hk);
+          const prev = byHkl.get(hk);
+          if (!prev) {{
+            byHkl.set(hk, p);
+          }} else {{
+            const pAct = p.run_index === activeFrameIdx;
+            const prevAct = prev.run_index === activeFrameIdx;
+            if ((pAct && !prevAct) || (pAct === prevAct && _peakSnrScore(p) > _peakSnrScore(prev))) {{
+              prev._wulff_sx = undefined;
+              prev._wulff_sy = undefined;
+              prev._wulff_friedel_sx = undefined;
+              prev._wulff_friedel_sy = undefined;
+              byHkl.set(hk, p);
+            }} else {{
+              p._wulff_sx = undefined;
+              p._wulff_sy = undefined;
+              p._wulff_friedel_sx = undefined;
+              p._wulff_friedel_sy = undefined;
+            }}
+          }}
+        }} else {{
+          unindexed.push(p);
+        }}
+      }}
+      uniquePeaks = [...byHkl.values(), ...unindexed];
+    }} else {{
+      for (let i = 0; i < rawPeaks.length; i++) {{
+        const p = rawPeaks[i];
+        if (Array.isArray(p.hkl) && p.hkl.length === 3) {{
+          observedHklSet.add(`${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`);
+        }}
+      }}
+    }}
+
+    const sortedD = [];
+    for (let i = 0; i < uniquePeaks.length; i++) {{
+      const dv = uniquePeaks[i].d_spacing;
+      if (typeof dv === "number" && Number.isFinite(dv) && dv > 0) sortedD.push(dv);
+    }}
+    sortedD.sort((a, b) => b - a);
+
+    _wulffPoolCache.sig = sig;
+    _wulffPoolCache.firstRef = firstRef;
+    _wulffPoolCache.lastRef = lastRef;
+    _wulffPoolCache.rawPeaks = rawPeaks;
+    _wulffPoolCache.uniquePeaks = uniquePeaks;
+    _wulffPoolCache.observedHklSet = observedHklSet;
+    _wulffPoolCache.sortedD = sortedD;
+    return _wulffPoolCache;
+  }}
+
+  // Zoom-coupled d-spacing LOD thinning on the Wulff sphere:
+  // Show low-resolution scaffold reflections from afar (wulffZoom <= 1) and smoothly unlock
+  // high-resolution shells down to d_min upon zooming in, while always preserving hovered/selected/orbit targets.
+  function getWulffLodState(isExp) {{
+    const pool = getWulffPoolCache();
+    const uniquePeaks = pool.uniquePeaks;
+    const sortedD = pool.sortedD;
+    const overviewTarget = isExp ? 480 : 260;
+    const minPoolD = sortedD.length > 0 ? sortedD[sortedD.length - 1] : 0.0;
+    const activeDmin = (typeof state.dMin === "number" && state.dMin > 0)
+      ? Math.max(state.dMin, minPoolD)
+      : minPoolD;
+
+    if (uniquePeaks.length <= overviewTarget || sortedD.length <= overviewTarget) {{
+      return {{
+        visiblePeaks: uniquePeaks,
+        observedHklSet: pool.observedHklSet,
+        lodDcut: activeDmin,
+        isLodThinned: false,
+        totalUnique: uniquePeaks.length,
+      }};
+    }}
+
+    const wZoom = Math.max(0.5, state.wulffZoom || 1.0);
+    const dOverview = sortedD[overviewTarget - 1];
+    const maxCapD = sortedD[Math.min(39, sortedD.length - 1)];
+    const rawCut = wZoom >= 1.0
+      ? dOverview / Math.pow(wZoom, 1.25)
+      : Math.min(maxCapD, dOverview * Math.pow(1.0 / wZoom, 0.75));
+    const lodDcut = Math.max(activeDmin, rawCut);
+    const isLodThinned = lodDcut > activeDmin + 0.025;
+    if (!isLodThinned) {{
+      return {{
+        visiblePeaks: uniquePeaks,
+        observedHklSet: pool.observedHklSet,
+        lodDcut: activeDmin,
+        isLodThinned: false,
+        totalUnique: uniquePeaks.length,
+      }};
+    }}
+
+    const visiblePeaks = [];
+    const activeOrb = state.activeOrbitId;
+    for (let i = 0; i < uniquePeaks.length; i++) {{
+      const p = uniquePeaks[i];
+      const dv = typeof p.d_spacing === "number" ? p.d_spacing : lodDcut;
+      const forceKeep = (
+        isPeakHighlightedTarget(p) ||
+        Boolean(activeOrb && p.asu_orbit_id && p.asu_orbit_id === activeOrb)
+      );
+      if (dv >= lodDcut - 1e-6 || forceKeep) {{
+        visiblePeaks.push(p);
+      }} else {{
+        p._wulff_sx = undefined;
+        p._wulff_sy = undefined;
+        p._wulff_friedel_sx = undefined;
+        p._wulff_friedel_sy = undefined;
+      }}
+    }}
+    return {{
+      visiblePeaks,
+      observedHklSet: pool.observedHklSet,
+      lodDcut,
+      isLodThinned: visiblePeaks.length < uniquePeaks.length,
+      totalUnique: uniquePeaks.length,
+    }};
+  }}
+
   // Render Convex 3D Wulff Sphere (Corner Inset or Expanded Popout)
-  function renderStereoInset() {{
+  function renderStereoInset(forceRedraw) {{
     if (!state.showStereo) return;
     const rect = stereoCanvas.getBoundingClientRect();
     if (rect.width < 20 || rect.height < 20) return;
     const dpr = window.devicePixelRatio || 1;
     const targetW = Math.round(rect.width * dpr);
     const targetH = Math.round(rect.height * dpr);
+    const Rg = getActiveGoniometerR();
+    const hovRef = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
+    const selRef = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
+    const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
+    const srcArr = (state.wulffScope === "all_runs" && SAMPLE_PEAKS.length > 0) ? SAMPLE_PEAKS : PEAKS;
+    const renderSig = [
+      targetW, targetH,
+      (state.wulffYawDeg || 0).toFixed(3),
+      (state.wulffPitchDeg || 0).toFixed(3),
+      (state.wulffZoom || 1).toFixed(4),
+      state.wulffExpanded ? 1 : 0,
+      state.wulffScope,
+      state.wulffColorMode,
+      state.showWulffFriedel ? 1 : 0,
+      state.peakSource,
+      state.peakColorMode,
+      state.dMin,
+      state.lamMin,
+      state.lamMax,
+      state.showUncertainPeaks ? 1 : 0,
+      state.selectedZoneId,
+      zonesKey,
+      hovRef,
+      selRef,
+      state.activeOrbitId || "",
+      srcArr.length,
+      ZONES.length,
+      Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[2][0].toFixed(5), Rg[2][2].toFixed(5),
+    ].join("|");
+    if (
+      !forceRedraw &&
+      renderSig === _lastWulffRenderSig &&
+      stereoCanvas.width === targetW &&
+      stereoCanvas.height === targetH
+    ) {{
+      return;
+    }}
+    _lastWulffRenderSig = renderSig;
     if (stereoCanvas.width !== targetW || stereoCanvas.height !== targetH) {{
       stereoCanvas.width = targetW;
       stereoCanvas.height = targetH;
@@ -10186,7 +10559,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const zoom = state.wulffZoom || 1.0;
     const rSphere = R * Math.min(zoom, 1.35);
     const isExp = Boolean(state.wulffExpanded);
-    const Rg = getActiveGoniometerR();
     const RgT = mat3T(Rg);
 
     ctx.save();
@@ -10274,23 +10646,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ctx.restore();
     }}
 
-    const wPeaks = getActiveWulffPeaks();
+    const lodState = getWulffLodState(isExp);
+    const wPeaks = lodState.visiblePeaks;
+    const observedHklSet = lodState.observedHklSet;
     const orbitMates = [];
     const hoveredTargets = [];
-    const observedHklSet = new Set();
-    wPeaks.forEach(p => {{
-      if (Array.isArray(p.hkl) && p.hkl.length === 3) {{
-        observedHklSet.add(`${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`);
-      }}
+    const clipR2 = (rSphere + 10.0) * (rSphere + 10.0);
+    for (let i = 0; i < wPeaks.length; i++) {{
+      const p = wPeaks[i];
       p._wulff_friedel_sx = undefined;
       p._wulff_friedel_sy = undefined;
       p._wulff_friedel_hemi = undefined;
-    }});
+    }}
 
     // Project direct peaks (+g) AND optional antipodal Friedel mates (-g for (-h,-k,-l) when not already observed),
     // sorting back-to-front by camera depth zCam so closer peaks render cleanly on top.
     const projectedPeaks = [];
-    wPeaks.forEach(p => {{
+    for (let i = 0; i < wPeaks.length; i++) {{
+      const p = wPeaks[i];
       const gVec = Array.isArray(p.q_hat) ? p.q_hat : mat3Vec(RgT, p.q_hat_lab || [0, 0, 1]);
       const [sx, sy, hemi, zCam, dotScale] = projectToWulff(gVec, cx, cy, R);
       p._wulff_sx = sx;
@@ -10298,17 +10671,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       p._wulff_hemi = hemi;
       const baseParity = p.asu_friedel ? 1 : 0;
       const dispHkl = Array.isArray(p.hkl) && p.hkl.length === 3 ? p.hkl : [0, 0, 0];
-      projectedPeaks.push({{
-        p,
-        sx,
-        sy,
-        hemi,
-        zCam,
-        dotScale,
-        isFriedelGhost: false,
-        friedelParity: baseParity,
-        displayHkl: dispHkl,
-      }});
+      const isSpecial = isPeakHighlightedTarget(p) || Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
+      const dx0 = sx - cx, dy0 = sy - cy;
+      if (dx0 * dx0 + dy0 * dy0 <= clipR2 || isSpecial) {{
+        projectedPeaks.push({{
+          p,
+          sx,
+          sy,
+          hemi,
+          zCam,
+          dotScale,
+          isFriedelGhost: false,
+          friedelParity: baseParity,
+          displayHkl: dispHkl,
+        }});
+      }}
       if (state.showWulffFriedel && Array.isArray(p.hkl) && p.hkl.length === 3 && (p.hkl[0] || p.hkl[1] || p.hkl[2])) {{
         const fh = -p.hkl[0], fk = -p.hkl[1], fl = -p.hkl[2];
         if (!observedHklSet.has(`${{fh}},${{fk}},${{fl}}`)) {{
@@ -10316,23 +10693,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           p._wulff_friedel_sx = fsx;
           p._wulff_friedel_sy = fsy;
           p._wulff_friedel_hemi = fhemi;
-          projectedPeaks.push({{
-            p,
-            sx: fsx,
-            sy: fsy,
-            hemi: fhemi,
-            zCam: fzCam,
-            dotScale: fdotScale,
-            isFriedelGhost: true,
-            friedelParity: 1 - baseParity,
-            displayHkl: [fh, fk, fl],
-          }});
+          const fdx = fsx - cx, fdy = fsy - cy;
+          if (fdx * fdx + fdy * fdy <= clipR2 || isSpecial) {{
+            projectedPeaks.push({{
+              p,
+              sx: fsx,
+              sy: fsy,
+              hemi: fhemi,
+              zCam: fzCam,
+              dotScale: fdotScale,
+              isFriedelGhost: true,
+              friedelParity: 1 - baseParity,
+              displayHkl: [fh, fk, fl],
+            }});
+          }}
         }}
       }}
-    }});
+    }}
     projectedPeaks.sort((a, b) => a.zCam - b.zCam);
 
-    projectedPeaks.forEach(({{ p, sx, sy, hemi, dotScale, isFriedelGhost, friedelParity, displayHkl }}) => {{
+    ctx.save();
+    for (let i = 0; i < projectedPeaks.length; i++) {{
+      const {{ p, sx, sy, hemi, dotScale, isFriedelGhost, friedelParity, displayHkl }} = projectedPeaks[i];
       const captured = isPeakCapturedByActiveZone(p) || state.wulffScope === "all_runs";
       const isHovered = isPeakHighlightedTarget(p);
       const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
@@ -10348,7 +10730,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ? (isFriedelGhost ? "#e879f9" : "#f43f85")
         : peakStrokeColor(p, alphaBase);
 
-      ctx.save();
       if (isFriedelGhost) {{
         // Antipodal Friedel mate (-h,-k,-l) at -g: diamond marker ◇ populating the q_z > 0 hemisphere
         const dRad = rDot * 1.18;
@@ -10389,8 +10770,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.lineWidth = (isExp ? 1.25 : 0.9) * Math.max(0.75, dotScale);
         ctx.stroke();
       }}
-      ctx.restore();
-    }});
+    }}
+    ctx.restore();
 
     // Symmetry Starburst: connect all symmetry-equivalent mates sharing activeOrbitId,
     // distinguishing proper crystallographic rotations (Gold #fbbf24) from Friedel/inversion mates (Violet #e879f9)!
@@ -10512,32 +10893,52 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ctx.restore();
     }}
 
+    ctx.restore();
+
+    const cornerBadges = [];
     if (isWulffSnrCutActive()) {{
+      cornerBadges.push({{
+        txt: `I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}}`,
+        stroke: "rgba(56, 189, 248, 0.48)",
+        fill: "#38bdf8",
+      }});
+    }}
+    if (lodState.isLodThinned) {{
+      cornerBadges.push({{
+        txt: isExp
+          ? `d ≥ ${{lodState.lodDcut.toFixed(2)}}Å (zoom+ for hi-res)`
+          : `d ≥ ${{lodState.lodDcut.toFixed(2)}}Å (zoom+)`,
+        stroke: "rgba(251, 191, 36, 0.48)",
+        fill: "#fbbf24",
+      }});
+    }}
+    if (cornerBadges.length > 0) {{
       ctx.save();
-      const badgeTxt = `I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}}`;
       ctx.font = isExp ? "bold 10px monospace" : "bold 8.5px monospace";
-      const tw = ctx.measureText(badgeTxt).width;
-      const bx = 8;
-      const by = 8;
-      const bw = tw + 10;
       const bh = isExp ? 17 : 14;
-      ctx.fillStyle = "rgba(7, 9, 19, 0.84)";
-      ctx.strokeStyle = "rgba(56, 189, 248, 0.48)";
-      ctx.lineWidth = 1.0;
-      ctx.beginPath();
-      if (typeof ctx.roundRect === "function") {{
-        ctx.roundRect(bx, by, bw, bh, 4);
-      }} else {{
-        ctx.rect(bx, by, bw, bh);
+      let by = 8;
+      for (let bi = 0; bi < cornerBadges.length; bi++) {{
+        const b = cornerBadges[bi];
+        const tw = ctx.measureText(b.txt).width;
+        const bx = 8;
+        const bw = tw + 10;
+        ctx.fillStyle = "rgba(7, 9, 19, 0.84)";
+        ctx.strokeStyle = b.stroke;
+        ctx.lineWidth = 1.0;
+        ctx.beginPath();
+        if (typeof ctx.roundRect === "function") {{
+          ctx.roundRect(bx, by, bw, bh, 4);
+        }} else {{
+          ctx.rect(bx, by, bw, bh);
+        }}
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = b.fill;
+        ctx.fillText(b.txt, bx + 5, by + (isExp ? 12 : 10));
+        by += bh + 3;
       }}
-      ctx.fill();
-      ctx.stroke();
-      ctx.fillStyle = "#38bdf8";
-      ctx.fillText(badgeTxt, bx + 5, by + (isExp ? 12 : 10));
       ctx.restore();
     }}
-
-    ctx.restore();
   }}
 
   function findNearestPeakDetector(mx, my) {{
@@ -10565,8 +10966,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function findNearestPeakWulff(mx, my) {{
     let best = null;
     let bestDist = state.wulffExpanded ? 14.0 : 10.0;
-    const wPeaks = getActiveWulffPeaks();
-    wPeaks.forEach(p => {{
+    const wPeaks = getWulffLodState(Boolean(state.wulffExpanded)).visiblePeaks;
+    for (let i = 0; i < wPeaks.length; i++) {{
+      const p = wPeaks[i];
       if (typeof p._wulff_sx === "number" && typeof p._wulff_sy === "number") {{
         const d = Math.hypot(mx - p._wulff_sx, my - p._wulff_sy);
         if (d < bestDist) {{
@@ -10585,7 +10987,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           best = p;
         }}
       }}
-    }});
+    }}
     return best;
   }}
 
@@ -10710,7 +11112,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const clampedDy = Math.max(-50, Math.min(50, rawDy));
       const sensitivity = ev.ctrlKey ? 0.0035 : 0.0016;
       const factor = Math.exp(-clampedDy * sensitivity);
-      state.wulffZoom = Math.max(0.6, Math.min(5.0, (state.wulffZoom || 1.0) * factor));
+      state.wulffZoom = Math.max(0.6, Math.min(8.0, (state.wulffZoom || 1.0) * factor));
     }}, {{ passive: false }});
     stereoCanvas.addEventListener("click", (ev) => {{
       const rect = stereoCanvas.getBoundingClientRect();

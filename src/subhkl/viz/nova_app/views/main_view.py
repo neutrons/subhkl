@@ -62,8 +62,12 @@ class MainApp:
         if app is None:
             return
 
-        async def handle_status(request: web.Request) -> web.Response:
-            frame_q = request.rel_url.query.get("frame")
+        import asyncio
+        import threading
+
+        payload_lock = threading.RLock()
+
+        def _build_status_doc(frame_q: str | None, is_poll: bool) -> dict[str, Any]:
             if frame_q is not None and str(frame_q).strip() != "":
                 with contextlib.suppress(
                     ValueError, TypeError, RuntimeError, AttributeError
@@ -72,7 +76,6 @@ class MainApp:
                     self.view_model.model.subhkl.frame_index = f_idx_st
                     self.pipeline_runner.sync_frame_index(f_idx_st)
             payload = self.view_model.model.subhkl.payload or {}
-            is_poll = request.rel_url.query.get("poll") == "1"
             aj_now = self.pipeline_runner.active_job
             aj_running = isinstance(aj_now, dict) and aj_now.get("state") in (
                 "queued",
@@ -86,7 +89,7 @@ class MainApp:
                 or self.view_model.model.subhkl.data.images_file
             )
             step_timings_snap = self.pipeline_runner.get_step_timings_snapshot()
-            doc = {
+            return {
                 "galaxy_connected": self.pipeline_runner.is_connected,
                 "galaxy_url": self.pipeline_runner.galaxy_url,
                 "history_id": self.pipeline_runner.history_id,
@@ -101,6 +104,11 @@ class MainApp:
                 "pipeline_stages": payload.get("pipeline_stages", []),
                 "ladder_steps": payload.get("ladder_steps", []),
             }
+
+        async def handle_status(request: web.Request) -> web.Response:
+            frame_q = request.rel_url.query.get("frame")
+            is_poll = request.rel_url.query.get("poll") == "1"
+            doc = await asyncio.to_thread(_build_status_doc, frame_q, is_poll)
             return web.json_response(doc)
 
         async def handle_artifact_download(request: web.Request) -> web.Response:
@@ -111,7 +119,8 @@ class MainApp:
                 or self.view_model.model.subhkl.data.images_file
             )
             try:
-                local_fp, dl_name = self.pipeline_runner.resolve_artifact_for_download(
+                local_fp, dl_name = await asyncio.to_thread(
+                    self.pipeline_runner.resolve_artifact_for_download,
                     dataset_id=ds_id,
                     name=fname,
                     current_h5=cur_h5,
@@ -126,59 +135,117 @@ class MainApp:
             except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
                 return web.Response(text=str(exc), status=404)
 
-        async def handle_payload(request: web.Request) -> web.Response:
-            frame_q = request.rel_url.query.get("frame")
-            f_idx: int | None = None
-            if frame_q is not None and str(frame_q).strip() != "":
-                try:
-                    f_idx = int(frame_q)
-                    self.view_model.model.subhkl.frame_index = f_idx
-                    self.pipeline_runner.current_frame_index = f_idx
-                except (ValueError, TypeError):
-                    f_idx = None
-
-            refreshed = False
-            preserve_q = request.rel_url.query.get("preserve_params") == "1"
-            d_min_q = request.rel_url.query.get("d_min")
-            d_min_val: float | None = None
-            if d_min_q is not None and str(d_min_q).strip() != "":
-                with contextlib.suppress(ValueError, TypeError):
-                    parsed_dmin = float(d_min_q)
-                    if 0.2 <= parsed_dmin <= 20.0:
-                        d_min_val = parsed_dmin
-                        self.view_model.model.subhkl.data.d_min = parsed_dmin
-            rbin_q = request.rel_url.query.get("render_binning")
-            rbin_val: int | None = None
-            if rbin_q is not None and str(rbin_q).strip() != "":
-                with contextlib.suppress(ValueError, TypeError):
-                    parsed_rb = int(rbin_q)
-                    if 1 <= parsed_rb <= 16:
-                        rbin_val = parsed_rb
-                        self.view_model.model.subhkl.render_binning = parsed_rb
-
-            fp_q = request.rel_url.query.get("file_path")
-            if fp_q is not None and str(fp_q).strip() != "":
-                local_fp_raw = os.path.abspath(str(fp_q).strip())
-                if local_fp_raw.lower().endswith(".mtz"):
-                    if not os.path.isfile(local_fp_raw):
-                        return web.json_response(
-                            {
-                                "status": "error",
-                                "error": f"MTZ file not found: {local_fp_raw}",
-                            },
-                            status=404,
-                        )
+        def _compute_payload_response(
+            query_dict: dict[str, str],
+        ) -> tuple[dict[str, Any], int]:
+            with payload_lock:
+                frame_q = query_dict.get("frame")
+                f_idx: int | None = None
+                if frame_q is not None and str(frame_q).strip() != "":
                     try:
-                        from subhkl.viz.rainbow_zones import apply_mtz_to_payload
+                        f_idx = int(frame_q)
+                        self.view_model.model.subhkl.frame_index = f_idx
+                        self.pipeline_runner.current_frame_index = f_idx
+                    except (ValueError, TypeError):
+                        f_idx = None
 
-                        ds_info_mtz = {"name": os.path.basename(local_fp_raw)}
-                        sub_model = self.view_model.model.subhkl
-                        sub_model.payload = apply_mtz_to_payload(
-                            sub_model.payload or {}, local_fp_raw, ds_info_mtz
-                        )
-                        sub_model.mtz_overlay_path = local_fp_raw
-                        sub_model.mtz_overlay_info = ds_info_mtz
-                        return web.json_response(sub_model.payload)
+                refreshed = False
+                preserve_q = query_dict.get("preserve_params") == "1"
+                d_min_q = query_dict.get("d_min")
+                d_min_val: float | None = None
+                if d_min_q is not None and str(d_min_q).strip() != "":
+                    with contextlib.suppress(ValueError, TypeError):
+                        parsed_dmin = float(d_min_q)
+                        if 0.2 <= parsed_dmin <= 20.0:
+                            d_min_val = parsed_dmin
+                            self.view_model.model.subhkl.data.d_min = parsed_dmin
+                rbin_q = query_dict.get("render_binning")
+                rbin_val: int | None = None
+                if rbin_q is not None and str(rbin_q).strip() != "":
+                    with contextlib.suppress(ValueError, TypeError):
+                        parsed_rb = int(rbin_q)
+                        if 1 <= parsed_rb <= 16:
+                            rbin_val = parsed_rb
+                            self.view_model.model.subhkl.render_binning = parsed_rb
+
+                fp_q = query_dict.get("file_path")
+                if fp_q is not None and str(fp_q).strip() != "":
+                    local_fp_raw = os.path.abspath(str(fp_q).strip())
+                    if local_fp_raw.lower().endswith(".mtz"):
+                        if not os.path.isfile(local_fp_raw):
+                            return (
+                                {
+                                    "status": "error",
+                                    "error": f"MTZ file not found: {local_fp_raw}",
+                                },
+                                404,
+                            )
+                        try:
+                            from subhkl.viz.rainbow_zones import apply_mtz_to_payload
+
+                            ds_info_mtz = {"name": os.path.basename(local_fp_raw)}
+                            sub_model = self.view_model.model.subhkl
+                            sub_model.payload = apply_mtz_to_payload(
+                                sub_model.payload or {}, local_fp_raw, ds_info_mtz
+                            )
+                            sub_model.mtz_overlay_path = local_fp_raw
+                            sub_model.mtz_overlay_info = ds_info_mtz
+                            return (sub_model.payload, 200)
+                        except (
+                            OSError,
+                            RuntimeError,
+                            ValueError,
+                            TypeError,
+                            KeyError,
+                        ) as exc:
+                            return ({"status": "error", "error": str(exc)}, 400)
+                    try:
+                        local_h5 = local_fp_raw
+                        if os.path.isfile(local_h5):
+                            self.view_model.model.subhkl.mtz_overlay_path = None
+                            self.view_model.model.subhkl.mtz_overlay_info = None
+                            ds_name = os.path.basename(local_h5).lower()
+                            is_reduce_file = any(
+                                k in ds_name for k in ("merged", "scan", "image")
+                            )
+                            if is_reduce_file:
+                                _, local_h5 = (
+                                    self.pipeline_runner._resolve_work_dir_and_merged(
+                                        local_h5
+                                    )
+                                )
+                                self.view_model.model.subhkl.data.images_file = local_h5
+                                self.view_model.model.subhkl.data.peaks_file = local_h5
+                            else:
+                                from subhkl.viz.rainbow_zones import _discover_images_h5
+
+                                self.view_model.model.subhkl.data.peaks_file = local_h5
+                                disc_img = (
+                                    _discover_images_h5(local_h5)
+                                    or self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                        local_h5
+                                    )
+                                )
+                                self.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
+                                    local_h5
+                                )
+                                self.view_model.model.subhkl.data.images_file = (
+                                    str(disc_img) if disc_img else ""
+                                )
+                            self.view_model.model.subhkl.refresh_payload(
+                                frame_index=f_idx,
+                                preserve_params=bool(
+                                    (preserve_q or d_min_val is not None)
+                                    and not is_reduce_file
+                                ),
+                            )
+                            self.pipeline_runner.invalidate_subsequent_stages(
+                                (self.view_model.model.subhkl.payload or {}).get(
+                                    "artifact_kind"
+                                ),
+                                os.path.dirname(os.path.abspath(local_h5)),
+                            )
+                            refreshed = True
                     except (
                         OSError,
                         RuntimeError,
@@ -186,19 +253,68 @@ class MainApp:
                         TypeError,
                         KeyError,
                     ) as exc:
-                        return web.json_response(
-                            {"status": "error", "error": str(exc)}, status=400
+                        return ({"status": "error", "error": str(exc)}, 404)
+
+                ds_id_q = query_dict.get("dataset_id")
+                if ds_id_q is not None and str(ds_id_q).strip() != "":
+                    try:
+                        from subhkl.viz.rainbow_zones import (
+                            _discover_images_h5,
+                            apply_mtz_to_payload,
+                            validate_subhkl_ingestible_dataset,
                         )
-                try:
-                    local_h5 = local_fp_raw
-                    if os.path.isfile(local_h5):
+
+                        ds_id = str(ds_id_q).strip()
+                        cur_peaks = self.view_model.model.subhkl.data.peaks_file
+                        cur_imgs = self.view_model.model.subhkl.data.images_file
+                        fb_dir = None
+                        for p in (cur_peaks, cur_imgs):
+                            if p and os.path.isfile(p):
+                                fb_dir = os.path.dirname(os.path.abspath(p))
+                                break
+                        local_h5, ds_info = (
+                            self.pipeline_runner.resolve_dataset_to_local_h5(
+                                ds_id, fallback_dir=fb_dir
+                            )
+                        )
+                        cur_p = self.view_model.model.subhkl.payload or {}
+                        has_active_geom = bool(
+                            (
+                                cur_p.get("artifact_kind") != "empty"
+                                and cur_p.get("panels")
+                                and (cur_p.get("peaks") or cur_p.get("ub_matrix"))
+                            )
+                            or query_dict.get("has_active_geometry") == "1"
+                        )
+                        ingest_kind = validate_subhkl_ingestible_dataset(
+                            local_h5,
+                            ds_info,
+                            has_active_geometry=has_active_geom,
+                        )
+                        if ingest_kind == "mtz_overlay":
+                            sub_model = self.view_model.model.subhkl
+                            sub_model.payload = apply_mtz_to_payload(
+                                cur_p, local_h5, ds_info
+                            )
+                            sub_model.mtz_overlay_path = local_h5
+                            sub_model.mtz_overlay_info = ds_info
+                            return (sub_model.payload, 200)
                         self.view_model.model.subhkl.mtz_overlay_path = None
                         self.view_model.model.subhkl.mtz_overlay_info = None
-                        ds_name = os.path.basename(local_h5).lower()
-                        is_reduce_file = any(
-                            k in ds_name for k in ("merged", "scan", "image")
-                        )
-                        if is_reduce_file:
+                        if ingest_kind == "raw_nexus":
+                            return (
+                                {
+                                    "status": "raw_nexus",
+                                    "dataset_id": ds_id,
+                                    "name": ds_info.get("name")
+                                    or os.path.basename(local_h5),
+                                },
+                                200,
+                            )
+                        ds_name = str(
+                            ds_info.get("name") or os.path.basename(local_h5)
+                        ).lower()
+                        if any(k in ds_name for k in ("merged", "scan", "image")):
                             _, local_h5 = (
                                 self.pipeline_runner._resolve_work_dir_and_merged(
                                     local_h5
@@ -207,28 +323,27 @@ class MainApp:
                             self.view_model.model.subhkl.data.images_file = local_h5
                             self.view_model.model.subhkl.data.peaks_file = local_h5
                         else:
-                            from subhkl.viz.rainbow_zones import _discover_images_h5
-
                             self.view_model.model.subhkl.data.peaks_file = local_h5
                             disc_img = (
-                                _discover_images_h5(local_h5)
-                                or self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
                                     local_h5
                                 )
+                                or _discover_images_h5(local_h5)
+                            )
+                            ds_hid_raw = (ds_info or {}).get("hid")
+                            ds_hid = (
+                                int(ds_hid_raw)
+                                if isinstance(ds_hid_raw, (int, str))
+                                and str(ds_hid_raw).isdigit()
+                                else None
                             )
                             self.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
-                                local_h5
+                                local_h5, target_hid=ds_hid
                             )
                             self.view_model.model.subhkl.data.images_file = (
                                 str(disc_img) if disc_img else ""
                             )
-                        self.view_model.model.subhkl.refresh_payload(
-                            frame_index=f_idx,
-                            preserve_params=bool(
-                                (preserve_q or d_min_val is not None)
-                                and not is_reduce_file
-                            ),
-                        )
+                        self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
                         self.pipeline_runner.invalidate_subsequent_stages(
                             (self.view_model.model.subhkl.payload or {}).get(
                                 "artifact_kind"
@@ -236,159 +351,77 @@ class MainApp:
                             os.path.dirname(os.path.abspath(local_h5)),
                         )
                         refreshed = True
-                except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
-                    return web.json_response(
-                        {"status": "error", "error": str(exc)}, status=404
-                    )
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        KeyError,
+                    ) as exc:
+                        return ({"status": "error", "error": str(exc)}, 400)
 
-            ds_id_q = request.rel_url.query.get("dataset_id")
-            if ds_id_q is not None and str(ds_id_q).strip() != "":
-                try:
-                    from subhkl.viz.rainbow_zones import (
-                        _discover_images_h5,
-                        apply_mtz_to_payload,
-                        validate_subhkl_ingestible_dataset,
+                if not refreshed:
+                    cur_payload = self.view_model.model.subhkl.payload
+                    cur_f = (
+                        cur_payload.get("frame_index")
+                        if isinstance(cur_payload, dict)
+                        else None
                     )
-
-                    ds_id = str(ds_id_q).strip()
-                    cur_peaks = self.view_model.model.subhkl.data.peaks_file
-                    cur_imgs = self.view_model.model.subhkl.data.images_file
-                    fb_dir = None
-                    for p in (cur_peaks, cur_imgs):
-                        if p and os.path.isfile(p):
-                            fb_dir = os.path.dirname(os.path.abspath(p))
-                            break
-                    local_h5, ds_info = (
-                        self.pipeline_runner.resolve_dataset_to_local_h5(
-                            ds_id, fallback_dir=fb_dir
-                        )
+                    cur_dmin = (
+                        cur_payload.get("d_min")
+                        if isinstance(cur_payload, dict)
+                        else None
                     )
-                    cur_p = self.view_model.model.subhkl.payload or {}
-                    has_active_geom = bool(
-                        (
-                            cur_p.get("artifact_kind") != "empty"
-                            and cur_p.get("panels")
-                            and (cur_p.get("peaks") or cur_p.get("ub_matrix"))
-                        )
-                        or request.rel_url.query.get("has_active_geometry") == "1"
+                    cur_rb = (
+                        int(cur_payload.get("render_binning", 4))
+                        if isinstance(cur_payload, dict)
+                        else None
                     )
-                    ingest_kind = validate_subhkl_ingestible_dataset(
-                        local_h5,
-                        ds_info,
-                        has_active_geometry=has_active_geom,
-                    )
-                    if ingest_kind == "mtz_overlay":
-                        sub_model = self.view_model.model.subhkl
-                        sub_model.payload = apply_mtz_to_payload(
-                            cur_p, local_h5, ds_info
-                        )
-                        sub_model.mtz_overlay_path = local_h5
-                        sub_model.mtz_overlay_info = ds_info
-                        return web.json_response(sub_model.payload)
-                    self.view_model.model.subhkl.mtz_overlay_path = None
-                    self.view_model.model.subhkl.mtz_overlay_info = None
-                    if ingest_kind == "raw_nexus":
-                        return web.json_response(
-                            {
-                                "status": "raw_nexus",
-                                "dataset_id": ds_id,
-                                "name": ds_info.get("name")
-                                or os.path.basename(local_h5),
-                            }
-                        )
-                    ds_name = str(
-                        ds_info.get("name") or os.path.basename(local_h5)
-                    ).lower()
-                    if any(k in ds_name for k in ("merged", "scan", "image")):
-                        _, local_h5 = self.pipeline_runner._resolve_work_dir_and_merged(
-                            local_h5
-                        )
-                        self.view_model.model.subhkl.data.images_file = local_h5
-                        self.view_model.model.subhkl.data.peaks_file = local_h5
-                    else:
-                        self.view_model.model.subhkl.data.peaks_file = local_h5
-                        disc_img = (
-                            self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
-                                local_h5
+                    needs_refresh = (
+                        not isinstance(cur_payload, dict)
+                        or (f_idx is not None and cur_f != f_idx)
+                        or (rbin_val is not None and cur_rb != rbin_val)
+                        or (
+                            d_min_val is not None
+                            and (
+                                cur_dmin is None
+                                or abs(float(cur_dmin) - d_min_val) > 1e-3
                             )
-                            or _discover_images_h5(local_h5)
-                        )
-                        ds_hid_raw = (ds_info or {}).get("hid")
-                        ds_hid = (
-                            int(ds_hid_raw)
-                            if isinstance(ds_hid_raw, (int, str))
-                            and str(ds_hid_raw).isdigit()
-                            else None
-                        )
-                        self.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
-                            local_h5, target_hid=ds_hid
-                        )
-                        self.view_model.model.subhkl.data.images_file = (
-                            str(disc_img) if disc_img else ""
-                        )
-                    self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
-                    self.pipeline_runner.invalidate_subsequent_stages(
-                        (self.view_model.model.subhkl.payload or {}).get(
-                            "artifact_kind"
-                        ),
-                        os.path.dirname(os.path.abspath(local_h5)),
-                    )
-                    refreshed = True
-                except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
-                    return web.json_response(
-                        {"status": "error", "error": str(exc)}, status=400
-                    )
-
-            if not refreshed:
-                cur_payload = self.view_model.model.subhkl.payload
-                cur_f = (
-                    cur_payload.get("frame_index")
-                    if isinstance(cur_payload, dict)
-                    else None
-                )
-                cur_dmin = (
-                    cur_payload.get("d_min") if isinstance(cur_payload, dict) else None
-                )
-                cur_rb = (
-                    int(cur_payload.get("render_binning", 4))
-                    if isinstance(cur_payload, dict)
-                    else None
-                )
-                needs_refresh = (
-                    not isinstance(cur_payload, dict)
-                    or (f_idx is not None and cur_f != f_idx)
-                    or (rbin_val is not None and cur_rb != rbin_val)
-                    or (
-                        d_min_val is not None
-                        and (
-                            cur_dmin is None or abs(float(cur_dmin) - d_min_val) > 1e-3
                         )
                     )
-                )
-                if needs_refresh and (
-                    f_idx is not None or d_min_val is not None or rbin_val is not None
-                ):
+                    if needs_refresh and (
+                        f_idx is not None
+                        or d_min_val is not None
+                        or rbin_val is not None
+                    ):
+                        with contextlib.suppress(
+                            OSError, RuntimeError, ValueError, TypeError, KeyError
+                        ):
+                            self.view_model.model.subhkl.refresh_payload(
+                                frame_index=f_idx, preserve_params=True
+                            )
+                    elif (
+                        isinstance(cur_payload, dict)
+                        and d_min_val is not None
+                        and preserve_q
+                    ):
+                        cur_payload["d_min"] = round(d_min_val, 3)
+                if isinstance(self.view_model.model.subhkl.payload, dict):
                     with contextlib.suppress(
                         OSError, RuntimeError, ValueError, TypeError, KeyError
                     ):
-                        self.view_model.model.subhkl.refresh_payload(
-                            frame_index=f_idx, preserve_params=True
+                        self.pipeline_runner.apply_active_solve_overlay(
+                            self.view_model.model.subhkl.payload,
+                            frame_index=f_idx,
                         )
-                elif (
-                    isinstance(cur_payload, dict)
-                    and d_min_val is not None
-                    and preserve_q
-                ):
-                    cur_payload["d_min"] = round(d_min_val, 3)
-            if isinstance(self.view_model.model.subhkl.payload, dict):
-                with contextlib.suppress(
-                    OSError, RuntimeError, ValueError, TypeError, KeyError
-                ):
-                    self.pipeline_runner.apply_active_solve_overlay(
-                        self.view_model.model.subhkl.payload,
-                        frame_index=f_idx,
-                    )
-            return web.json_response(self.view_model.model.subhkl.payload or {})
+                return (self.view_model.model.subhkl.payload or {}, 200)
+
+        async def handle_payload(request: web.Request) -> web.Response:
+            q_snap = dict(request.rel_url.query)
+            payload_doc, status_code = await asyncio.to_thread(
+                _compute_payload_response, q_snap
+            )
+            return web.json_response(payload_doc, status=status_code)
 
         async def handle_dataset_display(request: web.Request) -> web.Response:
             ds_id = request.match_info.get("ds_id", "")
@@ -400,8 +433,10 @@ class MainApp:
                     if p and os.path.isfile(p):
                         fb_dir = os.path.dirname(os.path.abspath(p))
                         break
-                local_h5, _ = self.pipeline_runner.resolve_dataset_to_local_h5(
-                    ds_id, fallback_dir=fb_dir
+                local_h5, _ = await asyncio.to_thread(
+                    self.pipeline_runner.resolve_dataset_to_local_h5,
+                    ds_id,
+                    fallback_dir=fb_dir,
                 )
                 return web.FileResponse(path=local_h5)
             except (OSError, RuntimeError, ValueError, TypeError, KeyError) as exc:
@@ -454,46 +489,50 @@ class MainApp:
             def _on_complete(new_h5_path: str) -> None:
                 from subhkl.viz.nova_app.models.subhkl_model import InstrumentOptions
 
-                self.view_model.model.subhkl.mtz_overlay_path = None
-                self.view_model.model.subhkl.mtz_overlay_info = None
+                with payload_lock:
+                    self.view_model.model.subhkl.mtz_overlay_path = None
+                    self.view_model.model.subhkl.mtz_overlay_info = None
 
-                with contextlib.suppress(
-                    ValueError, TypeError, KeyError, AttributeError
-                ):
-                    if (
-                        "instrument" in params
-                        and str(params["instrument"]) in InstrumentOptions.__members__
+                    with contextlib.suppress(
+                        ValueError, TypeError, KeyError, AttributeError
                     ):
-                        data.instrument = InstrumentOptions(str(params["instrument"]))
-                    for attr in ("a", "b", "c", "alpha", "beta", "gamma"):
-                        if attr in params:
-                            setattr(data, attr, float(params[attr]))
-                    if "space_group" in params:
-                        data.space_group = str(params["space_group"])
-                    if "wavelength_min" in params:
-                        data.wavelength_min = float(params["wavelength_min"])
-                    if "wavelength_max" in params:
-                        data.wavelength_max = float(params["wavelength_max"])
-                    if "d_min" in params:
-                        data.d_min = float(params["d_min"])
-                is_reduce_out = (
-                    stage_id == "reduce"
-                    or "merged" in os.path.basename(new_h5_path).lower()
-                )
-                if is_reduce_out:
-                    self.view_model.model.subhkl.frame_index = 0
-                    self.pipeline_runner.current_frame_index = 0
-                    self.view_model.model.subhkl.data.images_file = new_h5_path
-                    self.view_model.model.subhkl.data.peaks_file = new_h5_path
-                else:
-                    self.view_model.model.subhkl.frame_index = int(
-                        self.pipeline_runner.current_frame_index or 0
+                        if (
+                            "instrument" in params
+                            and str(params["instrument"])
+                            in InstrumentOptions.__members__
+                        ):
+                            data.instrument = InstrumentOptions(
+                                str(params["instrument"])
+                            )
+                        for attr in ("a", "b", "c", "alpha", "beta", "gamma"):
+                            if attr in params:
+                                setattr(data, attr, float(params[attr]))
+                        if "space_group" in params:
+                            data.space_group = str(params["space_group"])
+                        if "wavelength_min" in params:
+                            data.wavelength_min = float(params["wavelength_min"])
+                        if "wavelength_max" in params:
+                            data.wavelength_max = float(params["wavelength_max"])
+                        if "d_min" in params:
+                            data.d_min = float(params["d_min"])
+                    is_reduce_out = (
+                        stage_id == "reduce"
+                        or "merged" in os.path.basename(new_h5_path).lower()
                     )
-                    self.view_model.model.subhkl.data.peaks_file = new_h5_path
-                self.view_model.model.subhkl.refresh_payload(
-                    frame_index=self.view_model.model.subhkl.frame_index,
-                    preserve_params=not is_reduce_out,
-                )
+                    if is_reduce_out:
+                        self.view_model.model.subhkl.frame_index = 0
+                        self.pipeline_runner.current_frame_index = 0
+                        self.view_model.model.subhkl.data.images_file = new_h5_path
+                        self.view_model.model.subhkl.data.peaks_file = new_h5_path
+                    else:
+                        self.view_model.model.subhkl.frame_index = int(
+                            self.pipeline_runner.current_frame_index or 0
+                        )
+                        self.view_model.model.subhkl.data.peaks_file = new_h5_path
+                    self.view_model.model.subhkl.refresh_payload(
+                        frame_index=self.view_model.model.subhkl.frame_index,
+                        preserve_params=not is_reduce_out,
+                    )
 
             try:
                 res = self.pipeline_runner.submit_galaxy_stage(

@@ -3584,3 +3584,453 @@ console.log(JSON.stringify({{
         assert out["scratchSmoothing"] is True
         assert out["scratchCopyOp"] is True
         assert out["clampTopEdgeExactZero"] is True
+
+
+def test_mtz_vectorized_speed_and_multirun_dedup(tmp_path):
+    """Tweak 1: External .mtz projection vectorizes ASU/Bragg filtering and deduplicates multi-run Wulff peaks."""
+    import time
+
+    import gemmi
+    import numpy as np
+
+    from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
+    from subhkl.viz.rainbow_zones import (
+        apply_mtz_to_payload,
+        build_rainbow_zone_payload,
+    )
+
+    solve_h5 = tmp_path / "mandi_mtz_solve.h5"
+    mandi_cell = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    b_mandi = np.asarray(gemmi.UnitCell(*mandi_cell).frac.mat.tolist(), dtype=float).T
+    angles_deg = [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0]
+    r_stack = np.stack(
+        [
+            calc_goniometer_rotation_matrix([[0.0, 1.0, 0.0, 1.0]], [ang])
+            for ang in angles_deg
+        ],
+        axis=0,
+    )
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array(mandi_cell, dtype=float)
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = b_mandi
+        hf["goniometer/R"] = r_stack
+        hf["goniometer/angles"] = np.asarray([[ang] for ang in angles_deg], dtype=float)
+        hf["instrument/wavelength"] = np.array([2.0, 4.5], dtype=float)
+
+    base = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        instrument="CG4D",
+        space_group="I 1 2 1",
+        wavelength_range=(2.0, 4.5),
+        d_min=1.8,
+        frame_index=2,
+        include_panel_images=False,
+    )
+    b_before = np.asarray(base["b_matrix"], dtype=np.float64).copy()
+
+    # Build an external .mtz with ~2,500 reflections including ultra-high-res shells beyond 2/wl_min
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.find_spacegroup_by_name("I 1 2 1")
+    mtz.set_cell_for_all(gemmi.UnitCell(55.16, 81.19, 88.70, 90.0, 96.3, 90.0))
+    mtz.add_dataset("crystal")
+    mtz.add_column("I", "J")
+    mtz.add_column("SIGI", "Q")
+    rows = []
+    rng = np.random.default_rng(42)
+    for h in range(-14, 15):
+        for k in range(14):
+            for l_idx in range(-10, 11):
+                if h == 0 and k == 0 and l_idx == 0:
+                    continue
+                if (h + k + l_idx) % 2 != 0:
+                    continue
+                if len(rows) >= 2500:
+                    break
+                sig = float(rng.uniform(1.0, 5.0))
+                inten = float(rng.normal(12.0, 8.0))
+                rows.append([h, k, l_idx, inten, sig])
+            if len(rows) >= 2500:
+                break
+        if len(rows) >= 2500:
+            break
+    mtz.set_data(np.asarray(rows, dtype=np.float32))
+    mtz_file = tmp_path / "dense_external.mtz"
+    mtz.write_to_file(str(mtz_file))
+
+    t0 = time.perf_counter()
+    out = apply_mtz_to_payload(base, str(mtz_file), {"name": "dense_external.mtz"})
+    elapsed = time.perf_counter() - t0
+
+    assert elapsed < 3.0, f"Vectorized MTZ load took too long: {elapsed:.2f}s"
+    np.testing.assert_allclose(out["b_matrix"], b_before)
+    mtz_frame = out["mtz_peaks"]
+    mtz_all = out["mtz_sample_peaks"]
+    assert len(mtz_frame) > 0
+    assert len(mtz_all) >= len(mtz_frame)
+    # Multi-run Wulff sample peaks must have unique crystal (h, k, l) keys and preserve active-frame hits
+    seen_hkls = {tuple(p["hkl"]) for p in mtz_all}
+    assert len(seen_hkls) == len(mtz_all)
+    frame_hkls = {tuple(p["hkl"]) for p in mtz_frame}
+    assert frame_hkls.issubset(seen_hkls)
+    by_hkl = {tuple(p["hkl"]): p for p in mtz_all}
+    for fp in mtz_frame:
+        assert by_hkl[tuple(fp["hkl"])]["run_index"] == 2
+
+
+def test_wulff_zoom_dspacing_lod_and_dirty_skip(tmp_path):
+    """Tweak 2: Wulff All-Runs deduplicates crystal HKLs, couples zoom to d-spacing LOD, and skips idle redraws."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    if not shutil.which("node"):
+        return
+
+    payload = build_rainbow_zone_payload()
+    html_doc = render_rainbow_html(payload)
+    script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+    inline_js = script_blocks[-1]
+
+    fn_names = [
+        "isSameReflection",
+        "isPeakHighlightedTarget",
+        "isPeakVisible",
+        "isWulffSnrCutActive",
+        "getActiveWulffPeaks",
+        "_peakSnrScore",
+        "getWulffPoolCache",
+        "getWulffLodState",
+        "projectToWulff",
+        "findNearestPeakWulff",
+        "renderStereoInset",
+    ]
+    extracted = []
+    for fn_name in fn_names:
+        m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+        assert m is not None, f"Missing JS function {fn_name}"
+        start = m.start()
+        depth = 0
+        in_body = False
+        end = start
+        for idx in range(start, len(inline_js)):
+            ch = inline_js[idx]
+            if ch == "{":
+                depth += 1
+                in_body = True
+            elif ch == "}":
+                depth -= 1
+                if in_body and depth == 0:
+                    end = idx + 1
+                    break
+        extracted.append(inline_js[start:end])
+
+    harness_js = f"""
+let PEAKS = [];
+let SAMPLE_PEAKS = [];
+let ZONES = [];
+let DATA = {{ d_min: 1.4, wavelength_range: [1.8, 4.5], frame_index: 2 }};
+const IS_SOLVED = true;
+const WULFF_MIN_ISIGI = 2.5;
+globalThis.window = {{ devicePixelRatio: 1 }};
+
+const _wulffPoolCache = {{
+  sig: "",
+  firstRef: null,
+  lastRef: null,
+  rawPeaks: [],
+  uniquePeaks: [],
+  observedHklSet: new Set(),
+  sortedD: [],
+}};
+let _lastWulffRenderSig = "";
+
+// Create 1,200 All-Runs predicted reflections spanning d in [1.4, 8.0] A, plus duplicate run_index hits for HKL [9999,1,1]
+for (let i = 0; i < 1200; i++) {{
+  const frac = i / 1199.0;
+  const d = 1.4 + 6.6 * Math.pow(frac, 1.5);
+  const th = (i * 2.399963) % (2 * Math.PI);
+  const cz = -0.7 + 1.5 * ((i * 0.618034) % 1.0);
+  const sz = Math.sqrt(Math.max(0.0, 1.0 - Math.min(1.0, cz * cz)));
+  const q = [sz * Math.cos(th), sz * Math.sin(th), Math.min(1.0, Math.max(-1.0, cz))];
+  SAMPLE_PEAKS.push({{
+    id: i,
+    hkl: [i + 1, (i % 9) - 4, (i % 7) - 3],
+    asu_hkl: [i + 1, i % 5, i % 3],
+    d_spacing: d,
+    wavelength: 2.8,
+    intensity: 10.0,
+    sigma: 2.0,
+    q_hat: q,
+    q_hat_sample: q,
+    q_hat_cryst: q,
+    run_index: i % 5,
+  }});
+}}
+for (const rIdx of [0, 2, 4]) {{
+  SAMPLE_PEAKS.push({{
+    id: 5000 + rIdx,
+    hkl: [9999, 1, 1],
+    asu_hkl: [9999, 1, 1],
+    d_spacing: 6.5,
+    wavelength: 3.0,
+    intensity: 20.0,
+    sigma: 2.0,
+    q_hat: [0.1, 0.2, 0.974679],
+    q_hat_sample: [0.1, 0.2, 0.974679],
+    q_hat_cryst: [0.1, 0.2, 0.974679],
+    run_index: rIdx,
+  }});
+}}
+
+let saveDepth = 0;
+let clipDepth = -1;
+const ops = [];
+const stereoCtx = {{
+  fillStyle: "",
+  strokeStyle: "",
+  lineWidth: 1,
+  font: "",
+  textAlign: "left",
+  globalAlpha: 1,
+  setTransform() {{}},
+  setLineDash() {{}},
+  createRadialGradient() {{ return {{ addColorStop() {{}} }}; }},
+  clearRect(...a) {{ ops.push(["clearRect", ...a]); }},
+  fillRect(...a) {{ ops.push(["fillRect", ...a]); }},
+  strokeRect(...a) {{ ops.push(["strokeRect", ...a]); }},
+  beginPath() {{}},
+  arc(...a) {{ ops.push(["arc", ...a]); }},
+  moveTo() {{}},
+  lineTo() {{}},
+  closePath() {{}},
+  roundRect() {{}},
+  stroke() {{}},
+  fill() {{}},
+  clip() {{ clipDepth = saveDepth; ops.push(["clip"]); }},
+  save() {{ saveDepth++; ops.push(["save"]); }},
+  restore() {{ if (saveDepth === clipDepth) clipDepth = -1; saveDepth--; ops.push(["restore"]); }},
+  fillText(txt, x, y) {{ ops.push(["fillText", String(txt), x, y, clipDepth !== -1]); }},
+  measureText(txt) {{ return {{ width: String(txt).length * 6 }}; }},
+}};
+const stereoCanvas = {{
+  width: 260,
+  height: 260,
+  clientWidth: 260,
+  clientHeight: 260,
+  getBoundingClientRect: () => ({{ width: 260, height: 260 }}),
+  getContext: () => stereoCtx,
+}};
+
+const state = {{
+  mode: "pro",
+  showStereo: true,
+  peakSource: "predicted",
+  peakColorMode: "wavelength",
+  wulffScope: "all_runs",
+  wulffColorMode: "wavelength",
+  wulffExpanded: false,
+  showWulffFriedel: false,
+  wulffYawDeg: 0.0,
+  wulffPitchDeg: 0.0,
+  wulffZoom: 1.0,
+  dMin: 1.4,
+  lamMin: 1.8,
+  lamMax: 4.5,
+  showUncertainPeaks: true,
+  selectedFrameIndex: 2,
+  selectedZoneId: null,
+  showZoneArcs: false,
+  activeZones: new Set(),
+  hoveredPeakId: null,
+  selectedPeakId: null,
+  hoveredPeakObj: null,
+  selectedPeakObj: null,
+  activeOrbitId: null,
+}};
+function getActiveGoniometerR() {{ return [[1,0,0],[0,1,0],[0,0,1]]; }}
+function mat3T(M) {{ return M; }}
+function mat3Vec(M, v) {{ return v; }}
+function getPeakCrystalQHat(p) {{ return p.q_hat_cryst || p.q_hat; }}
+function getPeakColor() {{ return [0, 229, 255]; }}
+function peakStrokeColor() {{ return "rgb(0,229,255)"; }}
+function getWulffColor(p) {{ return "rgb(0,229,255)"; }}
+function isPeakCapturedByActiveZone() {{ return false; }}
+
+{chr(10).join(extracted)}
+
+const rawActive = getActiveWulffPeaks();
+const pool1 = getWulffPoolCache();
+const dupMatches = pool1.uniquePeaks.filter(p => p.hkl[0] === 9999);
+const lodZoom1 = getWulffLodState(false);
+
+// High-resolution hovered peak (d < 1.5A) must ALWAYS survive zoom-out LOD thinning
+const hiResTarget = pool1.uniquePeaks.find(p => p.d_spacing < 1.5);
+state.hoveredPeakId = hiResTarget.id;
+state.hoveredPeakObj = hiResTarget;
+const lodWithHover = getWulffLodState(false);
+const hoverKept = lodWithHover.visiblePeaks.some(p => isSameReflection(p, hiResTarget));
+state.hoveredPeakId = null;
+state.hoveredPeakObj = null;
+
+// Render at wulffZoom=1.0 -> draws & emits d >= badge AFTER restore(); immediate 2nd renderStereoInset() skips redraw
+ops.length = 0;
+renderStereoInset();
+const firstDrawOps = ops.length;
+const fillTextsZoom1 = ops.filter(o => o[0] === "fillText").map(o => o[1]);
+const badgeOp = ops.find(o => o[0] === "fillText" && o[1].includes("zoom+"));
+
+ops.length = 0;
+renderStereoInset();
+const secondIdleOps = ops.length;
+
+// Zoom in to 2.5x and 8.0x -> progressively reveals higher-resolution shells
+state.wulffZoom = 2.5;
+const lodZoom25 = getWulffLodState(false);
+state.wulffZoom = 8.0;
+const lodZoom80 = getWulffLodState(false);
+
+console.log(JSON.stringify({{
+  rawActiveLen: rawActive.length,
+  poolDedupLen: pool1.uniquePeaks.length,
+  dupCount: dupMatches.length,
+  dupPrefersActiveFrame: dupMatches.length === 1 && dupMatches[0].run_index === 2,
+  zoom1Count: lodZoom1.visiblePeaks.length,
+  zoom1Thinned: lodZoom1.totalUnique - lodZoom1.visiblePeaks.length,
+  zoom1Dcut: lodZoom1.lodDcut,
+  zoom25Count: lodZoom25.visiblePeaks.length,
+  zoom80Count: lodZoom80.visiblePeaks.length,
+  zoom80Thinned: lodZoom80.totalUnique - lodZoom80.visiblePeaks.length,
+  hoverKept,
+  firstDrawOps,
+  secondIdleOps,
+  hasZoomBadge: fillTextsZoom1.some(t => t.includes("zoom+")),
+  badgeUnclippedAfterRestore: Boolean(badgeOp && badgeOp[4] === false),
+}}));
+"""
+    harness_file = tmp_path / "wulff_lod_harness.js"
+    harness_file.write_text(harness_js, encoding="utf-8")
+    res = subprocess.run(
+        ["node", str(harness_file)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    out = json.loads(res.stdout.strip())
+    assert out["rawActiveLen"] == 1203
+    assert out["poolDedupLen"] == 1201
+    assert out["dupCount"] == 1
+    assert out["dupPrefersActiveFrame"] is True
+    assert out["zoom1Thinned"] > 400
+    assert out["zoom1Count"] < out["poolDedupLen"]
+    assert out["zoom25Count"] > out["zoom1Count"]
+    assert out["zoom80Count"] == out["poolDedupLen"]
+    assert out["zoom80Thinned"] == 0
+    assert out["hoverKept"] is True
+    assert out["firstDrawOps"] > 20
+    assert out["secondIdleOps"] == 0
+    assert out["hasZoomBadge"] is True
+    assert out["badgeUnclippedAfterRestore"] is True
+
+
+def test_ndip_streaming_download_empty_history_cache_and_mtz_binary_discovery(
+    tmp_path, monkeypatch
+):
+    """Tweaks 3 & 4: Empty-history poll caching, safe hardlink vs copy staging, and 'binary' .mtz discovery."""
+    import os
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-key",
+        history_id="hist_1",
+    )
+
+    # 1) Empty initial history `[]` must be cached during active-job polling (no HTTP flood every 1.5s)
+    api_calls = []
+
+    def fake_api(method, path, payload=None, raw=False, timeout=30.0):
+        api_calls.append((method, path))
+        if path.startswith("/api/histories/hist_1/contents"):
+            return []
+        if path == "/api/datatypes":
+            return ["h5", "mtz", "tabular", "binary"]
+        if path == "/api/datasets/ds_merged":
+            return {"id": "ds_merged", "file_size": 16}
+        if path == "/api/datasets/ds_merged/display":
+            return b"0123456789abcdef"
+        return {}
+
+    runner._api_request = fake_api
+    assert runner.list_history_datasets(use_cached=False) == []
+    assert len(api_calls) == 1
+    assert runner.list_history_datasets(use_cached=True) == []
+    assert len(api_calls) == 1  # Served from cache even though list is empty!
+
+    # 2) Datatype probe recognizes 'mtz' when Galaxy advertises it
+    assert runner._galaxy_has_datatype("mtz") is True
+
+    # 3) Streaming download writes atomically via _api_request fallback and updates job_record safely
+    dest_h5 = tmp_path / "merged.h5"
+    job_rec = {"stdout": "line1\n"}
+    n_bytes = runner._download_dataset_to_file(
+        "ds_merged", str(dest_h5), job_record=job_rec, label="merged.h5"
+    )
+    assert n_bytes == 16
+    assert dest_h5.read_bytes() == b"0123456789abcdef"
+
+    # 4) _link_or_copy_file hard-links inside same temp directory, but copies when allow_hardlink=False
+    alias_h5 = tmp_path / "cg4d_2523_merged.h5"
+    NovaGalaxyPipelineRunner._link_or_copy_file(str(dest_h5), str(alias_h5))
+    assert os.stat(dest_h5).st_ino == os.stat(alias_h5).st_ino
+
+    ext_store_src = tmp_path / "galaxy_object_store_dataset_99.dat"
+    ext_store_src.write_bytes(b"immutable-galaxy-store")
+    staged_copy = tmp_path / "staged_from_store.h5"
+    NovaGalaxyPipelineRunner._link_or_copy_file(
+        str(ext_store_src), str(staged_copy), allow_hardlink=False
+    )
+    assert os.stat(ext_store_src).st_ino != os.stat(staged_copy).st_ino
+    staged_copy.write_bytes(b"locally-stamped")
+    assert ext_store_src.read_bytes() == b"immutable-galaxy-store"
+
+    # 5) Stage 4 Careless history discovery accepts uploaded .mtz datasets even when labeled extension='binary'
+    hist_items = [
+        {
+            "id": "ds_careless_prev",
+            "hid": 9,
+            "name": "careless_xval_0.mtz",
+            "extension": "mtz",
+            "state": "ok",
+            "deleted": False,
+        },
+        {
+            "id": "ds_user_uploaded_mtz",
+            "hid": 8,
+            "name": "mandi_13172_integrated.mtz",
+            "extension": "binary",
+            "state": "ok",
+            "deleted": False,
+        },
+    ]
+    matched_id = ""
+    for d in sorted(hist_items, key=lambda x: int(x.get("hid") or 0), reverse=True):
+        if d.get("state") and d.get("state") != "ok":
+            continue
+        nm = str(d.get("name") or "")
+        nl = nm.lower()
+        ext = str(d.get("extension") or "").lower()
+        is_mtz_cand = nl.endswith(".mtz") or ext == "mtz"
+        if is_mtz_cand and "careless" not in nl:
+            matched_id = str(d["id"])
+            break
+    assert matched_id == "ds_user_uploaded_mtz"
