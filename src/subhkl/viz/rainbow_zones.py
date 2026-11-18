@@ -1369,7 +1369,12 @@ def _raycast_hkl_on_detectors(
             OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
         ):
             if hasattr(det, "reflections_mask") and hasattr(det, "pixel_to_lab"):
-                s_off_use = s_lab if float(np.linalg.norm(s_lab)) > 1e-12 else None
+                is_curv_det = "curved" in str(getattr(det, "panel_type", "")).lower()
+                s_off_use = (
+                    s_lab[None, :]
+                    if is_curv_det
+                    else (s_lab if float(np.linalg.norm(s_lab)) > 1e-12 else None)
+                )
                 mask_c, row_c, col_c = det.reflections_mask(
                     kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_off_use
                 )
@@ -2152,6 +2157,16 @@ def apply_mtz_to_payload(
     mtz_name = str(info.get("name") or os.path.basename(str(mtz_path)))
     out["mtz_overlay_name"] = mtz_name
     out["mtz_overlay_reflections"] = len(asu_map)
+    if len(asu_map) <= 120000:
+        out["mtz_asu_lookup"] = {
+            f"{k[0]},{k[1]},{k[2]}": [round(float(v[0]), 2), round(float(v[1]), 2)]
+            for k, v in asu_map.items()
+        }
+    if is_unmerged_mtz and len(exact_hkl_map) <= 120000:
+        out["mtz_exact_lookup"] = {
+            f"{k[0]},{k[1]},{k[2]}": [round(float(v[0]), 2), round(float(v[1]), 2)]
+            for k, v in exact_hkl_map.items()
+        }
     out["mtz_overlay_matched"] = max(
         matched_counts.get("predicted_peaks", 0),
         matched_counts.get("integrated_peaks", 0),
@@ -4591,6 +4606,53 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
     return _to_asu_hkl
 
 
+def _serialize_space_group_ops(space_group: str) -> dict[str, Any]:
+    """Serialize compact integer Gemmi space-group operations for exact client-side re-prediction."""
+    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
+        import gemmi
+
+        sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
+            gemmi.find_spacegroup_by_name("P 1")
+        )
+        if sg_obj is not None:
+            asu_obj = gemmi.ReciprocalAsu(sg_obj)
+            sg_ops = sg_obj.operations()
+            return {
+                "space_group": str(sg_obj.xhm() or space_group),
+                "den": int(gemmi.Op.DEN),
+                "is_centrosymmetric": bool(sg_ops.is_centrosymmetric()),
+                "centering_mult": max(1, len(sg_ops.cen_ops)),
+                "asu_condition": str(asu_obj.condition_str()),
+                "cen_ops": [[int(t) for t in c] for c in sg_ops.cen_ops],
+                "sym_ops": [
+                    {
+                        "rot": [[int(x) for x in r] for r in op.rot],
+                        "tr": [int(t) for t in op.tran],
+                    }
+                    for op in sg_ops.sym_ops
+                ],
+            }
+    sg_u = str(space_group or "P 1").strip().upper()
+    c_mult = (
+        4
+        if sg_u.startswith("F")
+        else (
+            3
+            if sg_u.startswith("R")
+            else (2 if sg_u[:1] in ("I", "A", "B", "C") else 1)
+        )
+    )
+    return {
+        "space_group": str(space_group or "P 1"),
+        "den": 24,
+        "is_centrosymmetric": False,
+        "centering_mult": c_mult,
+        "asu_condition": "l>0 or (l=0 and (h>0 or (h=0 and k>=0)))",
+        "cen_ops": [[0, 0, 0]],
+        "sym_ops": [{"rot": [[24, 0, 0], [0, 24, 0], [0, 0, 24]], "tr": [0, 0, 0]}],
+    }
+
+
 def _compute_zones_payload_for_geometry(
     pts: np.ndarray,
     *,
@@ -6177,6 +6239,7 @@ def build_rainbow_zone_payload(
         "instrument": str(instrument),
         "default_projection": resolved_proj,
         "space_group": str(space_group),
+        "space_group_ops": _serialize_space_group_ops(str(space_group)),
         "intensity_source": intensity_source,
         "render_binning": int(render_binning),
         "all_runs_min_isigi": 2.5,
@@ -8021,6 +8084,962 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const LADDER = DATA.ladder_steps || [];
   const PIPELINE = DATA.pipeline_stages || [];
 
+  // Dynamic d_min / wavelength forward-projection & detector LOD state (declared at boot to avoid TDZ)
+  const ABS_DMIN_FLOOR = 0.50;
+  const MAX_DYNAMIC_LATTICE_POINTS = 1200000;
+  const MAX_DYNAMIC_FRAME_PEAKS = 25000;
+  const MAX_DYNAMIC_SAMPLE_PEAKS = 16000;
+  let _dynPredEpoch = 0;
+  let _dynHklPool = null;
+  let _dynSgHelperCache = {{ key: "", helper: null }};
+  let _dynMultiRunTimer = null;
+  const _payloadBaseParams = {{
+    dMin: Number(DATA.d_min || 1.0),
+    lamMin: Number((DATA.wavelength_range && DATA.wavelength_range[0]) || 2.0),
+    lamMax: Number((DATA.wavelength_range && DATA.wavelength_range[1]) || 4.5),
+  }};
+  const _baselineMeasCache = {{
+    byBankHkl: new Map(),
+    byRunHkl: new Map(),
+    byHkl: new Map(),
+    byOrbit: new Map(),
+    mtzAsuLookup: null,
+    mtzExactLookup: null,
+    minIntegD: Infinity,
+  }};
+  const _detLodCache = {{
+    sig: "",
+    firstRef: null,
+    visiblePeaks: [],
+    lodDcut: 0.0,
+    isLodThinned: false,
+    totalCount: 0,
+    activeDmin: 0.0,
+  }};
+
+  const _MEAS_KEYS = [
+    "intensity", "sigma", "merged_i", "merged_sigi",
+    "careless_residual", "careless_scale",
+    "mtz_i", "mtz_sigi", "mtz_isigi", "mtz_col_val",
+  ];
+  const _SHAPE_KEYS = [
+    "ellipse", "ellipse_sph", "sigma_major_px", "sigma_minor_px",
+    "ellipse_angle_deg", "shape_kind",
+  ];
+
+  function _extractMeasSnapshot(p, includeShape) {{
+    if (!p) return null;
+    let hasAny = false;
+    const snap = {{}};
+    for (let i = 0; i < _MEAS_KEYS.length; i++) {{
+      const k = _MEAS_KEYS[i];
+      if (typeof p[k] === "number" && Number.isFinite(p[k])) {{
+        snap[k] = p[k];
+        hasAny = true;
+      }}
+    }}
+    if (includeShape) {{
+      for (let i = 0; i < _SHAPE_KEYS.length; i++) {{
+        const k = _SHAPE_KEYS[i];
+        if (p[k] !== undefined && p[k] !== null && p[k] !== "circle") {{
+          snap[k] = p[k];
+          hasAny = true;
+        }}
+      }}
+    }}
+    return hasAny ? snap : null;
+  }}
+
+  function _mergeMeasSnapshot(target, src) {{
+    if (!src) return target;
+    if (!target) return {{ ...src }};
+    const keys = Object.keys(src);
+    for (let i = 0; i < keys.length; i++) {{
+      const k = keys[i];
+      if (target[k] === undefined || target[k] === null) target[k] = src[k];
+    }}
+    return target;
+  }}
+
+  function captureBaselineMeasurements(buckets, payloadObj, preserveExistingMtz = false) {{
+    const prevAsu = preserveExistingMtz ? _baselineMeasCache.mtzAsuLookup : null;
+    const prevEx = preserveExistingMtz ? _baselineMeasCache.mtzExactLookup : null;
+    _baselineMeasCache.byBankHkl.clear();
+    _baselineMeasCache.byRunHkl.clear();
+    _baselineMeasCache.byHkl.clear();
+    _baselineMeasCache.byOrbit.clear();
+    _baselineMeasCache.minIntegD = Infinity;
+    _baselineMeasCache.mtzAsuLookup = (payloadObj && payloadObj.mtz_asu_lookup) || prevAsu || null;
+    _baselineMeasCache.mtzExactLookup = (payloadObj && payloadObj.mtz_exact_lookup) || prevEx || null;
+
+    const wlArr = payloadObj && Array.isArray(payloadObj.wavelength_range) ? payloadObj.wavelength_range : DATA.wavelength_range;
+    if (Array.isArray(wlArr) && wlArr.length >= 2) {{
+      _payloadBaseParams.lamMin = Number(wlArr[0]) || _payloadBaseParams.lamMin;
+      _payloadBaseParams.lamMax = Number(wlArr[1]) || _payloadBaseParams.lamMax;
+    }}
+    if (payloadObj && typeof payloadObj.d_min === "number" && payloadObj.d_min > 0) {{
+      _payloadBaseParams.dMin = Number(payloadObj.d_min);
+    }}
+
+    if (!buckets) return;
+    const ingestList = (arr, isFrameLevel, isIntegBucket) => {{
+      if (!Array.isArray(arr)) return;
+      for (let i = 0; i < arr.length; i++) {{
+        const p = arr[i];
+        if (!p || !Array.isArray(p.hkl) || p.hkl.length < 3) continue;
+        if (isIntegBucket && typeof p.d_spacing === "number" && p.d_spacing > 0 && p.d_spacing < _baselineMeasCache.minIntegD) {{
+          _baselineMeasCache.minIntegD = p.d_spacing;
+        }}
+        const snap = _extractMeasSnapshot(p, isFrameLevel);
+        if (!snap) continue;
+        const hk = `${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`;
+        if (isFrameLevel && typeof p.bank === "number") {{
+          const bkKey = `${{p.bank}}|${{hk}}`;
+          _baselineMeasCache.byBankHkl.set(bkKey, _mergeMeasSnapshot(_baselineMeasCache.byBankHkl.get(bkKey), snap));
+        }}
+        const rIdx = typeof p.run_index === "number" ? p.run_index : (DATA.frame_index || 0);
+        const rKey = `${{rIdx}}|${{hk}}`;
+        const noShape = _extractMeasSnapshot(p, false);
+        if (noShape) {{
+          _baselineMeasCache.byRunHkl.set(rKey, _mergeMeasSnapshot(_baselineMeasCache.byRunHkl.get(rKey), noShape));
+          _baselineMeasCache.byHkl.set(hk, _mergeMeasSnapshot(_baselineMeasCache.byHkl.get(hk), noShape));
+          if (p.asu_orbit_id && (typeof noShape.mtz_i === "number" || typeof noShape.merged_i === "number")) {{
+            const orbSnap = {{}};
+            if (typeof noShape.mtz_i === "number") orbSnap.mtz_i = noShape.mtz_i;
+            if (typeof noShape.mtz_sigi === "number") orbSnap.mtz_sigi = noShape.mtz_sigi;
+            if (typeof noShape.mtz_isigi === "number") orbSnap.mtz_isigi = noShape.mtz_isigi;
+            if (typeof noShape.mtz_col_val === "number") orbSnap.mtz_col_val = noShape.mtz_col_val;
+            if (typeof noShape.merged_i === "number") orbSnap.merged_i = noShape.merged_i;
+            if (typeof noShape.merged_sigi === "number") orbSnap.merged_sigi = noShape.merged_sigi;
+            _baselineMeasCache.byOrbit.set(p.asu_orbit_id, _mergeMeasSnapshot(_baselineMeasCache.byOrbit.get(p.asu_orbit_id), orbSnap));
+          }}
+        }}
+      }}
+    }};
+    ingestList(buckets.integPeaks, true, true);
+    ingestList(buckets.predPeaks, true, false);
+    ingestList(buckets.integSample, false, true);
+    ingestList(buckets.predSample, false, false);
+  }}
+  captureBaselineMeasurements(initBuckets, DATA, false);
+
+  function computeUnitCellVolumeAng3(cell, ubMat) {{
+    if (Array.isArray(cell) && cell.length >= 6) {{
+      const a = Number(cell[0]), b = Number(cell[1]), c = Number(cell[2]);
+      const ca = Math.cos((Number(cell[3]) || 90) * Math.PI / 180.0);
+      const cb = Math.cos((Number(cell[4]) || 90) * Math.PI / 180.0);
+      const cg = Math.cos((Number(cell[5]) || 90) * Math.PI / 180.0);
+      const rad = 1.0 - ca * ca - cb * cb - cg * cg + 2.0 * ca * cb * cg;
+      if (a > 0 && b > 0 && c > 0 && rad > 1e-8) {{
+        return a * b * c * Math.sqrt(rad);
+      }}
+    }}
+    if (Array.isArray(ubMat) && ubMat.length === 3) {{
+      const det = Math.abs(
+        ubMat[0][0] * (ubMat[1][1] * ubMat[2][2] - ubMat[1][2] * ubMat[2][1]) -
+        ubMat[0][1] * (ubMat[1][0] * ubMat[2][2] - ubMat[1][2] * ubMat[2][0]) +
+        ubMat[0][2] * (ubMat[1][0] * ubMat[2][1] - ubMat[1][1] * ubMat[2][0])
+      );
+      if (det > 1e-12) return 1.0 / det;
+    }}
+    return 1000.0;
+  }}
+
+  function getLatticeCenteringMult() {{
+    if (DATA.space_group_ops && typeof DATA.space_group_ops.centering_mult === "number" && DATA.space_group_ops.centering_mult >= 1) {{
+      return DATA.space_group_ops.centering_mult;
+    }}
+    const sgU = String(DATA.space_group || "P 1").trim().toUpperCase();
+    if (sgU.startsWith("F")) return 4;
+    if (sgU.startsWith("R")) return 3;
+    if (sgU.startsWith("I") || sgU.startsWith("A") || sgU.startsWith("B") || sgU.startsWith("C")) return 2;
+    return 1;
+  }}
+
+  function getDynamicDminFloor() {{
+    const ub = getActiveUbMatrix();
+    const vol = computeUnitCellVolumeAng3(DATA.cell, ub);
+    const mLat = getLatticeCenteringMult();
+    const rawFloor = Math.cbrt((4.0 * Math.PI * Math.max(vol, 1.0)) / (3.0 * mLat * MAX_DYNAMIC_LATTICE_POINTS));
+    const rounded = Math.ceil(rawFloor * 100.0 - 1e-9) / 100.0;
+    return Math.max(ABS_DMIN_FLOOR, Math.min(4.50, rounded));
+  }}
+
+  function getActiveUbMatrix() {{
+    if (Array.isArray(DATA.ub_matrix) && DATA.ub_matrix.length === 3) return DATA.ub_matrix;
+    if (Array.isArray(DATA.u_matrix) && DATA.u_matrix.length === 3 && Array.isArray(DATA.b_matrix) && DATA.b_matrix.length === 3) {{
+      return mat3Mul(DATA.u_matrix, DATA.b_matrix);
+    }}
+    return null;
+  }}
+
+  function _compileAsuConditionPredicate(condStr) {{
+    const c = String(condStr || "").trim();
+    if (c === "h>=0 and k>=0 and l>=0") return (h, k, l) => h >= 0 && k >= 0 && l >= 0;
+    if (c === "k>=0 and (l>0 or (l=0 and h>=0))") return (h, k, l) => k >= 0 && (l > 0 || (l === 0 && h >= 0));
+    if (c === "l>=0 and ((h>=0 and k>0) or (h=0 and k=0))") return (h, k, l) => l >= 0 && ((h >= 0 && k > 0) || (h === 0 && k === 0));
+    if (c === "h>=k and k>=0 and l>=0") return (h, k, l) => h >= k && k >= 0 && l >= 0;
+    if (c === "(h>=0 and k>0) or (h=0 and k=0 and l>=0)") return (h, k, l) => (h >= 0 && k > 0) || (h === 0 && k === 0 && l >= 0);
+    if (c === "h>=k and k>=0 and (k>0 or l>=0)") return (h, k, l) => h >= k && k >= 0 && (k > 0 || l >= 0);
+    if (c === "h>=k and k>=0 and (h>k or l>=0)") return (h, k, l) => h >= k && k >= 0 && (h > k || l >= 0);
+    if (c === "h>=0 and ((l>=h and k>h) or (l=h and k=h))") return (h, k, l) => h >= 0 && ((l >= h && k > h) || (l === h && k === h));
+    if (c === "k>=l and l>=h and h>=0") return (h, k, l) => k >= l && l >= h && h >= 0;
+    return (h, k, l) => l > 0 || (l === 0 && (h > 0 || (h === 0 && k >= 0)));
+  }}
+
+  function buildClientSpaceGroupHelper() {{
+    const sgOps = DATA.space_group_ops || null;
+    const sgName = String(DATA.space_group || "P 1").trim();
+    const cacheKey = `${{sgName}}|${{sgOps ? (sgOps.space_group || "") + ":" + (sgOps.asu_condition || "") + ":" + ((sgOps.sym_ops && sgOps.sym_ops.length) || 0) : "fallback"}}`;
+    if (_dynSgHelperCache.key === cacheKey && _dynSgHelperCache.helper) {{
+      return _dynSgHelperCache.helper;
+    }}
+    const sgU = sgName.toUpperCase();
+    if (sgOps && Array.isArray(sgOps.sym_ops) && sgOps.sym_ops.length > 0) {{
+      const den = Number(sgOps.den) || 24;
+      const isCentro = Boolean(sgOps.is_centrosymmetric);
+      const inAsu = _compileAsuConditionPredicate(sgOps.asu_condition);
+      const cenOps = Array.isArray(sgOps.cen_ops) ? sgOps.cen_ops : [[0, 0, 0]];
+      const symOps = sgOps.sym_ops;
+      const fullOps = [];
+      const properRots = [];
+      for (let s = 0; s < symOps.length; s++) {{
+        const R = symOps[s].rot;
+        const tr = symOps[s].tr || [0, 0, 0];
+        const detR = (
+          R[0][0] * (R[1][1] * R[2][2] - R[1][2] * R[2][1]) -
+          R[0][1] * (R[1][0] * R[2][2] - R[1][2] * R[2][0]) +
+          R[0][2] * (R[1][0] * R[2][1] - R[1][1] * R[2][0])
+        );
+        if (detR > 0) properRots.push(R);
+        for (let c = 0; c < cenOps.length; c++) {{
+          const ct = cenOps[c];
+          fullOps.push({{
+            R,
+            tx: (tr[0] + ct[0]) % den,
+            ty: (tr[1] + ct[1]) % den,
+            tz: (tr[2] + ct[2]) % den,
+          }});
+        }}
+      }}
+      const nonZeroCen = cenOps.filter(ct => (ct[0] % den) !== 0 || (ct[1] % den) !== 0 || (ct[2] % den) !== 0);
+      const isCenteringAbsent = (h, k, l) => {{
+        for (let c = 0; c < nonZeroCen.length; c++) {{
+          const ct = nonZeroCen[c];
+          if (((h * ct[0] + k * ct[1] + l * ct[2]) % den) !== 0) return true;
+        }}
+        return false;
+      }};
+      const isAbsent = (h, k, l) => {{
+        if (h === 0 && k === 0 && l === 0) return true;
+        if (isCenteringAbsent(h, k, l)) return true;
+        for (let i = 0; i < fullOps.length; i++) {{
+          const op = fullOps[i];
+          const R = op.R;
+          const hp = Math.trunc((h * R[0][0] + k * R[1][0] + l * R[2][0]) / den);
+          if (hp !== h) continue;
+          const kp = Math.trunc((h * R[0][1] + k * R[1][1] + l * R[2][1]) / den);
+          if (kp !== k) continue;
+          const lp = Math.trunc((h * R[0][2] + k * R[1][2] + l * R[2][2]) / den);
+          if (lp !== l) continue;
+          if (((h * op.tx + k * op.ty + l * op.tz) % den) !== 0) return true;
+        }}
+        return false;
+      }};
+      const toAsu = (h, k, l) => {{
+        let bestH = -32768, bestK = -32768, bestL = -32768, bestSgn = 1, found = false;
+        let centricNegHit = false;
+        for (let i = 0; i < symOps.length; i++) {{
+          const R = symOps[i].rot;
+          const hp = Math.trunc((h * R[0][0] + k * R[1][0] + l * R[2][0]) / den);
+          const kp = Math.trunc((h * R[0][1] + k * R[1][1] + l * R[2][1]) / den);
+          const lp = Math.trunc((h * R[0][2] + k * R[1][2] + l * R[2][2]) / den);
+          if (hp === -h && kp === -k && lp === -l) centricNegHit = true;
+          if (inAsu(hp, kp, lp)) {{
+            if (!found || hp > bestH || (hp === bestH && (kp > bestK || (kp === bestK && lp > bestL))) || (hp === bestH && kp === bestK && lp === bestL && bestSgn < 0)) {{
+              bestH = hp; bestK = kp; bestL = lp; bestSgn = 1; found = true;
+            }}
+          }}
+          if (!isCentro) {{
+            const nh = -hp, nk = -kp, nl = -lp;
+            if (inAsu(nh, nk, nl)) {{
+              if (!found || nh > bestH || (nh === bestH && (nk > bestK || (nk === bestK && nl > bestL)))) {{
+                bestH = nh; bestK = nk; bestL = nl; bestSgn = -1; found = true;
+              }}
+            }}
+          }}
+        }}
+        if (!found) {{ bestH = Math.abs(h); bestK = Math.abs(k); bestL = Math.abs(l); bestSgn = 1; }}
+        const isCentric = isCentro || centricNegHit;
+        let isFr = false;
+        let bijParity = 0;
+        if (!isCentric) {{
+          isFr = bestSgn < 0;
+          bijParity = isFr ? -1 : 1;
+        }} else {{
+          let properHit = false;
+          for (let p = 0; p < properRots.length; p++) {{
+            const R = properRots[p];
+            const rh = Math.trunc((bestH * R[0][0] + bestK * R[1][0] + bestL * R[2][0]) / den);
+            if (rh !== h) continue;
+            const rk = Math.trunc((bestH * R[0][1] + bestK * R[1][1] + bestL * R[2][1]) / den);
+            if (rk !== k) continue;
+            const rl = Math.trunc((bestH * R[0][2] + bestK * R[1][2] + bestL * R[2][2]) / den);
+            if (rl === l) {{ properHit = true; break; }}
+          }}
+          isFr = !properHit;
+          bijParity = 0;
+        }}
+        const colorIdx = Math.abs(bestH * 73856093 ^ bestK * 19349663 ^ bestL * 83492791) % 12;
+        return [bestH, bestK, bestL, isFr ? 1 : 0, bijParity, colorIdx];
+      }};
+      const helper = {{ isCenteringAbsent, isAbsent, toAsu }};
+      _dynSgHelperCache = {{ key: cacheKey, helper }};
+      return helper;
+    }}
+
+    const isCenteringAbsent = (h, k, l) => {{
+      if (sgU.startsWith("I")) return (((h + k + l) & 1) !== 0);
+      if (sgU.startsWith("F")) return ((((h + k) & 1) !== 0) || (((k + l) & 1) !== 0) || (((h + l) & 1) !== 0));
+      if (sgU.startsWith("C")) return (((h + k) & 1) !== 0);
+      if (sgU.startsWith("A")) return (((k + l) & 1) !== 0);
+      if (sgU.startsWith("B")) return (((h + l) & 1) !== 0);
+      if (sgU.startsWith("R")) return (((((-h + k + l) % 3) + 3) % 3) !== 0);
+      return false;
+    }};
+    const isAbsent = (h, k, l) => (h === 0 && k === 0 && l === 0) || isCenteringAbsent(h, k, l);
+    const toAsu = (h, k, l) => {{
+      const ah = Math.abs(h), ak = Math.abs(k), al = Math.abs(l);
+      const isFr = (((h < 0 ? 1 : 0) + (k < 0 ? 1 : 0) + (l < 0 ? 1 : 0)) & 1) === 1 ? 1 : 0;
+      const colorIdx = Math.abs(ah * 73856093 ^ ak * 19349663 ^ al * 83492791) % 12;
+      return [ah, ak, al, isFr, 0, colorIdx];
+    }};
+    const helper = {{ isCenteringAbsent, isAbsent, toAsu }};
+    _dynSgHelperCache = {{ key: cacheKey, helper }};
+    return helper;
+  }}
+
+  function ensureDynamicHklPool(requestedDMin) {{
+    const ub = getActiveUbMatrix();
+    if (!ub) return null;
+    const dFloor = getDynamicDminFloor();
+    const targetD = Math.max(dFloor, Number(requestedDMin) || dFloor);
+    const ubKey = ub.map(r => r.map(v => Number(v).toFixed(6)).join(",")).join(";") + "|" + String(DATA.space_group || "");
+    if (_dynHklPool && _dynHklPool.ubKey === ubKey && targetD >= _dynHklPool.minD - 1e-5) {{
+      return _dynHklPool;
+    }}
+
+    // Build down to slightly below targetD (clamped at dFloor) so small nudges do not rebuild
+    const buildD = Math.max(dFloor, Math.min(targetD, targetD * 0.96));
+    const qMax = 1.0 / Math.max(buildD, 0.25);
+    const qMax2 = qMax * qMax;
+    const invUb = mat3Inv(ub);
+    const aVec = [invUb[0][0], invUb[0][1], invUb[0][2]];
+    const bVec = [invUb[1][0], invUb[1][1], invUb[1][2]];
+    const aLen = Math.max(1.0, vecNorm(aVec));
+    const bLen = Math.max(1.0, vecNorm(bVec));
+    const cStar = [ub[0][2], ub[1][2], ub[2][2]];
+    const cStar2 = Math.max(1e-10, cStar[0] * cStar[0] + cStar[1] * cStar[1] + cStar[2] * cStar[2]);
+    const hLim = Math.min(256, Math.ceil(aLen * qMax));
+    const kLim = Math.min(256, Math.ceil(bLen * qMax));
+    const sgHelper = buildClientSpaceGroupHelper();
+
+    const tmpH = [], tmpK = [], tmpL = [], tmpGx = [], tmpGy = [], tmpGz = [], tmpQn = [], tmpD = [];
+    const b1x = ub[0][0], b1y = ub[1][0], b1z = ub[2][0];
+    const b2x = ub[0][1], b2y = ub[1][1], b2z = ub[2][1];
+    const b3x = ub[0][2], b3y = ub[1][2], b3z = ub[2][2];
+
+    outerLoop:
+    for (let h = -hLim; h <= hLim; h++) {{
+      const hbx = h * b1x, hby = h * b1y, hbz = h * b1z;
+      for (let k = -kLim; k <= kLim; k++) {{
+        const px = hbx + k * b2x;
+        const py = hby + k * b2y;
+        const pz = hbz + k * b2z;
+        const pDotB3 = px * b3x + py * b3y + pz * b3z;
+        const p2 = px * px + py * py + pz * pz;
+        const disc = pDotB3 * pDotB3 - cStar2 * (p2 - qMax2);
+        if (disc < 0) continue;
+        const sq = Math.sqrt(disc);
+        const lLo = Math.max(-512, Math.ceil((-pDotB3 - sq) / cStar2 - 1e-7));
+        const lHi = Math.min(512, Math.floor((-pDotB3 + sq) / cStar2 + 1e-7));
+        for (let l = lLo; l <= lHi; l++) {{
+          if (h === 0 && k === 0 && l === 0) continue;
+          if (sgHelper.isAbsent(h, k, l)) continue;
+          const gx = px + l * b3x;
+          const gy = py + l * b3y;
+          const gz = pz + l * b3z;
+          const g2 = gx * gx + gy * gy + gz * gz;
+          if (g2 <= 1e-12 || g2 > qMax2 * 1.000002) continue;
+          const qn = Math.sqrt(g2);
+          tmpH.push(h); tmpK.push(k); tmpL.push(l);
+          tmpGx.push(gx); tmpGy.push(gy); tmpGz.push(gz);
+          tmpQn.push(qn); tmpD.push(1.0 / qn);
+          if (tmpD.length >= MAX_DYNAMIC_LATTICE_POINTS) break outerLoop;
+        }}
+      }}
+    }}
+
+    const n = tmpD.length;
+    const order = new Int32Array(n);
+    for (let i = 0; i < n; i++) order[i] = i;
+    order.sort((ia, ib) => tmpD[ib] - tmpD[ia]);
+
+    const hArr = new Int16Array(n);
+    const kArr = new Int16Array(n);
+    const lArr = new Int16Array(n);
+    const gxArr = new Float32Array(n);
+    const gyArr = new Float32Array(n);
+    const gzArr = new Float32Array(n);
+    const qnArr = new Float32Array(n);
+    const dArr = new Float32Array(n);
+    const asuHArr = new Int16Array(n);
+    const asuKArr = new Int16Array(n);
+    const asuLArr = new Int16Array(n);
+    const asuFrArr = new Uint8Array(n);
+    const asuBijArr = new Int8Array(n);
+    const orbColArr = new Uint8Array(n);
+    const harmOrdArr = new Uint8Array(n);
+
+    for (let outIdx = 0; outIdx < n; outIdx++) {{
+      const srcIdx = order[outIdx];
+      const hv = tmpH[srcIdx], kv = tmpK[srcIdx], lv = tmpL[srcIdx];
+      hArr[outIdx] = hv; kArr[outIdx] = kv; lArr[outIdx] = lv;
+      gxArr[outIdx] = tmpGx[srcIdx]; gyArr[outIdx] = tmpGy[srcIdx]; gzArr[outIdx] = tmpGz[srcIdx];
+      qnArr[outIdx] = tmpQn[srcIdx]; dArr[outIdx] = tmpD[srcIdx];
+      const [ah, ak, al, isFr, bijP, colIdx] = sgHelper.toAsu(hv, kv, lv);
+      asuHArr[outIdx] = ah; asuKArr[outIdx] = ak; asuLArr[outIdx] = al;
+      asuFrArr[outIdx] = isFr; asuBijArr[outIdx] = bijP; orbColArr[outIdx] = colIdx;
+      const g = Math.max(1, gcd3(hv, kv, lv));
+      if (g === 1) {{
+        harmOrdArr[outIdx] = 1;
+      }} else {{
+        const h0 = Math.trunc(hv / g), k0 = Math.trunc(kv / g), l0 = Math.trunc(lv / g);
+        let ordAllowed = 0;
+        for (let m = 1; m <= Math.min(g, 64); m++) {{
+          if (!sgHelper.isAbsent(m * h0, m * k0, m * l0)) ordAllowed++;
+        }}
+        harmOrdArr[outIdx] = Math.min(255, Math.max(1, ordAllowed));
+      }}
+    }}
+
+    const effMinD = n >= MAX_DYNAMIC_LATTICE_POINTS && n > 0 ? dArr[n - 1] : buildD;
+    _dynHklPool = {{
+      ubKey, minD: effMinD, count: n, sgHelper,
+      hArr, kArr, lArr, gxArr, gyArr, gzArr, qnArr, dArr,
+      asuHArr, asuKArr, asuLArr, asuFrArr, asuBijArr, orbColArr, harmOrdArr,
+    }};
+    return _dynHklPool;
+  }}
+
+  function countPoolPrefixForDMin(pool, dMinCut) {{
+    if (!pool || pool.count === 0) return 0;
+    const dArr = pool.dArr;
+    const thr = dMinCut - 1e-5;
+    if (dArr[pool.count - 1] >= thr) return pool.count;
+    if (dArr[0] < thr) return 0;
+    let lo = 0, hi = pool.count;
+    while (lo < hi) {{
+      const mid = (lo + hi) >>> 1;
+      if (dArr[mid] >= thr) lo = mid + 1;
+      else hi = mid;
+    }}
+    return lo;
+  }}
+
+  function buildActiveDetectorRaycastPanels(sLab) {{
+    const activeBankSet = new Set();
+    if (Array.isArray(PANELS)) {{
+      for (let i = 0; i < PANELS.length; i++) {{
+        if (typeof PANELS[i].bank === "number") activeBankSet.add(Number(PANELS[i].bank));
+      }}
+    }}
+    let cfgSrc = DATA.detector_configs && Object.keys(DATA.detector_configs).length > 0
+      ? DATA.detector_configs
+      : ((DATA.beamline_detectors && DATA.beamline_detectors[DATA.instrument]) || null);
+    if (!cfgSrc) return [];
+
+    const sx = sLab[0] || 0.0, sy = sLab[1] || 0.0, sz = sLab[2] || 0.0;
+    const out = [];
+    const keys = Object.keys(cfgSrc);
+    for (let i = 0; i < keys.length; i++) {{
+      const bid = parseInt(keys[i], 10);
+      if (!Number.isFinite(bid)) continue;
+      if (activeBankSet.size > 0 && !activeBankSet.has(bid)) continue;
+      const cfg = cfgSrc[keys[i]];
+      if (!cfg || !Array.isArray(cfg.center) || !Array.isArray(cfg.vhat)) continue;
+      const isCurved = String(cfg.panel || cfg.panel_type || "flat").toLowerCase().includes("curv") ||
+                       String(cfg.panel || cfg.panel_type || "flat").toLowerCase().includes("cyl");
+      const m = Math.max(2, Number(cfg.m) || 256);
+      const n = Math.max(2, Number(cfg.n) || 256);
+      const width = Number(cfg.width) || 0.2;
+      const height = Number(cfg.height) || 0.2;
+      const dw = width / (m - 1);
+      const dh = height / (n - 1);
+      const center = [Number(cfg.center[0]), Number(cfg.center[1]), Number(cfg.center[2])];
+      const vhat = [Number(cfg.vhat[0]), Number(cfg.vhat[1]), Number(cfg.vhat[2])];
+
+      if (!isCurved) {{
+        if (!Array.isArray(cfg.uhat)) continue;
+        const uhat = [Number(cfg.uhat[0]), Number(cfg.uhat[1]), Number(cfg.uhat[2])];
+        const norm = vecCross(uhat, vhat);
+        const csDotN = (center[0] - sx) * norm[0] + (center[1] - sy) * norm[1] + (center[2] - sz) * norm[2];
+        // Bounding cone from sample sLab covering all 4 corners of flat panel
+        const corners = [
+          [center[0] - sx, center[1] - sy, center[2] - sz],
+          [center[0] + width * uhat[0] - sx, center[1] + width * uhat[1] - sy, center[2] + width * uhat[2] - sz],
+          [center[0] + height * vhat[0] - sx, center[1] + height * vhat[1] - sy, center[2] + height * vhat[2] - sz],
+          [center[0] + width * uhat[0] + height * vhat[0] - sx, center[1] + width * uhat[1] + height * vhat[1] - sy, center[2] + width * uhat[2] + height * vhat[2] - sz],
+        ];
+        const midRay = vecUnit([
+          center[0] + 0.5 * width * uhat[0] + 0.5 * height * vhat[0] - sx,
+          center[1] + 0.5 * width * uhat[1] + 0.5 * height * vhat[1] - sy,
+          center[2] + 0.5 * width * uhat[2] + 0.5 * height * vhat[2] - sz,
+        ]);
+        let minCos = 1.0;
+        for (let c = 0; c < 4; c++) {{
+          const cu = vecUnit(corners[c]);
+          const dc = vecDot(midRay, cu);
+          if (dc < minCos) minCos = dc;
+        }}
+        // Pad cone angle slightly so near-grazing corners never miss
+        const maxAng = Math.min(Math.PI, Math.acos(Math.max(-1.0, Math.min(1.0, minCos))) + 0.045);
+        out.push({{
+          bid, isCurved: false, m, n, width, height, dw, dh,
+          center, uhat, vhat, norm, csDotN, midRay, cosCone: Math.cos(maxAng),
+        }});
+      }} else {{
+        const radius = Number(cfg.radius) || 0.4;
+        const rhat = Array.isArray(cfg.rhat) ? [Number(cfg.rhat[0]), Number(cfg.rhat[1]), Number(cfg.rhat[2])] : [0, 0, 1];
+        const what = vecCross(vhat, rhat);
+        const bVec = vecCross([sx, sy, sz], vhat);
+        const qc = vecDot(bVec, bVec) - radius * radius;
+        out.push({{
+          bid, isCurved: true, m, n, width, height, dw, dh,
+          center, vhat, rhat, what, radius, bVec, qc,
+        }});
+      }}
+    }}
+    return out;
+  }}
+
+  function raycastRunFromDynamicPool(pool, nActive, Rrun, sLab, panelsGeom, wlMin, wlMax, dMinEff, runIdx, isActiveFrame, maxOutPeaks) {{
+    if (!pool || nActive <= 0 || panelsGeom.length === 0) return [];
+    const kiRaw = Array.isArray(DATA.ki) && DATA.ki.length === 3 ? DATA.ki : [0.0, 0.0, 1.0];
+    const ki = vecUnit([Number(kiRaw[0]) || 0, Number(kiRaw[1]) || 0, Number(kiRaw[2]) || 1]);
+    // ki in crystal frame: Rrun^T * ki
+    const kicx = Rrun[0][0] * ki[0] + Rrun[1][0] * ki[1] + Rrun[2][0] * ki[2];
+    const kicy = Rrun[0][1] * ki[0] + Rrun[1][1] * ki[1] + Rrun[2][1] * ki[2];
+    const kicz = Rrun[0][2] * ki[0] + Rrun[1][2] * ki[1] + Rrun[2][2] * ki[2];
+    const sx0 = sLab[0] || 0.0, sy0 = sLab[1] || 0.0, sz0 = sLab[2] || 0.0;
+
+    // Precompute crystal zone unit axes for fast zone membership on active frame
+    const zoneChecks = [];
+    if (isActiveFrame && Array.isArray(ZONES)) {{
+      for (let z = 0; z < ZONES.length; z++) {{
+        const zn = ZONES[z];
+        if (!zn) continue;
+        if (Array.isArray(zn.uvw) && zn.uvw.length === 3) {{
+          zoneChecks.push({{ zid: zn.zone_id, u: zn.uvw[0], v: zn.uvw[1], w: zn.uvw[2], useUvw: true }});
+        }} else if (Array.isArray(zn.axis_crystal_xyz) && zn.axis_crystal_xyz.length === 3) {{
+          const au = vecUnit(zn.axis_crystal_xyz);
+          zoneChecks.push({{ zid: zn.zone_id, ax: au[0], ay: au[1], az: au[2], useUvw: false }});
+        }}
+      }}
+    }}
+    const sinZoneTol = Math.sin(0.75 * Math.PI / 180.0);
+
+    const {{
+      hArr, kArr, lArr, gxArr, gyArr, gzArr, qnArr, dArr,
+      asuHArr, asuKArr, asuLArr, asuFrArr, asuBijArr, orbColArr, harmOrdArr, sgHelper,
+    }} = pool;
+
+    const peaks = [];
+    const nPanels = panelsGeom.length;
+
+    for (let i = 0; i < nActive; i++) {{
+      const gx = gxArr[i], gy = gyArr[i], gz = gzArr[i];
+      const gDotKi = gx * kicx + gy * kicy + gz * kicz;
+      if (gDotKi >= -1e-6) continue;
+      const qn = qnArr[i];
+      const q2 = qn * qn;
+      const lam = (-2.0 * gDotKi) / q2;
+      if (lam < wlMin || lam > wlMax) continue;
+
+      // Rotate G_cryst to lab frame: G_lab = Rrun * G_cryst
+      const glx = Rrun[0][0] * gx + Rrun[0][1] * gy + Rrun[0][2] * gz;
+      const gly = Rrun[1][0] * gx + Rrun[1][1] * gy + Rrun[1][2] * gz;
+      const glz = Rrun[2][0] * gx + Rrun[2][1] * gy + Rrun[2][2] * gz;
+
+      let kfx = ki[0] + lam * glx;
+      let kfy = ki[1] + lam * gly;
+      let kfz = ki[2] + lam * glz;
+      const kfn = Math.hypot(kfx, kfy, kfz);
+      if (kfn <= 1e-12) continue;
+      kfx /= kfn; kfy /= kfn; kfz /= kfn;
+
+      for (let pIdx = 0; pIdx < nPanels; pIdx++) {{
+        const det = panelsGeom[pIdx];
+        let tRay = -1.0, rowF = -1.0, colF = -1.0, ptX = 0.0, ptY = 0.0, ptZ = 0.0;
+        if (!det.isCurved) {{
+          const cDot = kfx * det.midRay[0] + kfy * det.midRay[1] + kfz * det.midRay[2];
+          if (cDot < det.cosCone) continue;
+          const denom = kfx * det.norm[0] + kfy * det.norm[1] + kfz * det.norm[2];
+          if (Math.abs(denom) <= 1e-8) continue;
+          tRay = det.csDotN / denom;
+          if (tRay <= 0.0) continue;
+          ptX = sx0 + tRay * kfx;
+          ptY = sy0 + tRay * kfy;
+          ptZ = sz0 + tRay * kfz;
+          const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+          rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
+          if (rowF < 0.0 || rowF >= det.n) continue;
+          colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
+          if (colF < 0.0 || colF >= det.m) continue;
+        }} else {{
+          const vx = det.vhat[0], vy = det.vhat[1], vz = det.vhat[2];
+          const dx = kfy * vz - kfz * vy;
+          const dy = kfz * vx - kfx * vz;
+          const dz = kfx * vy - kfy * vx;
+          const qa = dx * dx + dy * dy + dz * dz;
+          if (qa <= 1e-12) continue;
+          const qb = 2.0 * (det.bVec[0] * dx + det.bVec[1] * dy + det.bVec[2] * dz);
+          const delta = qb * qb - 4.0 * qa * det.qc;
+          if (delta < 0.0) continue;
+          const sq = Math.sqrt(delta);
+          const t2 = (-qb - sq) / (2.0 * qa);
+          const t1 = (-qb + sq) / (2.0 * qa);
+          tRay = t2 > 0.0 ? t2 : t1;
+          if (tRay <= 0.0) continue;
+          ptX = sx0 + tRay * kfx;
+          ptY = sy0 + tRay * kfy;
+          ptZ = sz0 + tRay * kfz;
+          const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
+          const dotV = rx * vx + ry * vy + rz * vz;
+          rowF = dotV / det.dh;
+          if (rowF < 0.0 || rowF >= det.n) continue;
+          const dpx = rx - dotV * vx, dpy = ry - dotV * vy, dpz = rz - dotV * vz;
+          const dotR = dpx * det.rhat[0] + dpy * det.rhat[1] + dpz * det.rhat[2];
+          const dotW = dpx * det.what[0] + dpy * det.what[1] + dpz * det.what[2];
+          if (Math.abs(dotW) <= 1e-12) continue;
+          let dt = 2.0 * Math.atan(-dotR / dotW);
+          const twoPi = 2.0 * Math.PI;
+          dt = ((dt % twoPi) + twoPi) % twoPi;
+          colF = dt * (det.radius / det.dw);
+          if (colF < 0.0 || colF >= det.m) continue;
+        }}
+
+        const hv = hArr[i], kv = kArr[i], lv = lArr[i];
+        const dVal = dArr[i];
+        const invQn = 1.0 / Math.max(qn, 1e-12);
+        const gHatCryst = [
+          Number((gx * invQn).toFixed(5)),
+          Number((gy * invQn).toFixed(5)),
+          Number((gz * invQn).toFixed(5)),
+        ];
+        const gHatLab = [
+          Number((glx * invQn).toFixed(5)),
+          Number((gly * invQn).toFixed(5)),
+          Number((glz * invQn).toFixed(5)),
+        ];
+        const [sxSt, sySt, hemi] = stereoProj(gHatCryst);
+        const [sxLab, syLab, hemiLab] = stereoProj(gHatLab);
+        const [az, dyDet, elDet] = isActiveFrame ? labToCyl([ptX, ptY, ptZ]) : [0.0, 0.0, 0.0];
+
+        const gGcd = Math.max(1, gcd3(hv, kv, lv));
+        const h0 = Math.trunc(hv / gGcd), k0 = Math.trunc(kv / gGcd), l0 = Math.trunc(lv / gGcd);
+        const lamProd = gGcd * lam;
+        const mLo = Math.max(1, Math.ceil(lamProd / Math.max(wlMax, 1e-6) - 1e-5));
+        const mHiWl = lamProd / Math.max(wlMin, 1e-6);
+        const dEff = Math.min(Math.max(dMinEff, 1e-3), Math.max(dVal, 1e-3));
+        const mHiD = (gGcd * dVal) / Math.max(dEff, 1e-6);
+        const mHi = Math.floor(Math.min(mHiWl, mHiD) + 1e-5);
+        let multAllowed = 0;
+        for (let m = mLo; m <= Math.min(mHi, mLo + 64); m++) {{
+          if (!sgHelper.isAbsent(m * h0, m * k0, m * l0)) multAllowed++;
+        }}
+
+        const ah = asuHArr[i], ak = asuKArr[i], al = asuLArr[i];
+        const orbitId = `${{ah}},${{ak}},${{al}}`;
+        const hkStr = `${{hv}},${{kv}},${{lv}}`;
+        const zoneIds = [];
+        if (isActiveFrame && zoneChecks.length > 0) {{
+          for (let z = 0; z < zoneChecks.length; z++) {{
+            const zc = zoneChecks[z];
+            if (zc.useUvw) {{
+              if (hv * zc.u + kv * zc.v + lv * zc.w === 0) zoneIds.push(zc.zid);
+            }} else if (Math.abs(gHatCryst[0] * zc.ax + gHatCryst[1] * zc.ay + gHatCryst[2] * zc.az) <= sinZoneTol) {{
+              zoneIds.push(zc.zid);
+            }}
+          }}
+        }}
+
+        const pk = {{
+          id: peaks.length,
+          peak_source: "predicted",
+          run_index: runIdx,
+          bank: det.bid,
+          row: Number(rowF.toFixed(2)),
+          col: Number(colF.toFixed(2)),
+          det_x: Number(az.toFixed(3)),
+          det_y: Number(dyDet.toFixed(4)),
+          det_el: Number(elDet.toFixed(3)),
+          q_hat: gHatCryst,
+          q_hat_lab: gHatLab,
+          stereographic: [Number(sxSt.toFixed(5)), Number(sySt.toFixed(5))],
+          hemisphere: hemi,
+          stereo_lab: [Number(sxLab.toFixed(5)), Number(syLab.toFixed(5)), hemiLab],
+          intensity: null,
+          sigma: null,
+          wavelength: Number(lam.toFixed(4)),
+          d_spacing: Number(dVal.toFixed(4)),
+          harmonic_order: harmOrdArr[i] || 1,
+          harmonic_multiplicity: Math.max(1, multAllowed),
+          parallax_depth: Number(Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * Math.max(dVal, 0.2)))).toFixed(4)),
+          hkl: [hv, kv, lv],
+          asu_hkl: [ah, ak, al],
+          asu_orbit_id: orbitId,
+          asu_friedel: Boolean(asuFrArr[i]),
+          asu_bijvoet_parity: Number(asuBijArr[i]),
+          orbit_color_idx: Number(orbColArr[i]),
+          zone_ids: zoneIds,
+          indexed: true,
+          angular_error_deg: 0.0,
+          shape_kind: "circle",
+        }};
+
+        // Cross-link any previously integrated / merged / MTZ measurements
+        const snap = (isActiveFrame ? _baselineMeasCache.byBankHkl.get(`${{det.bid}}|${{hkStr}}`) : null) ||
+                     _baselineMeasCache.byRunHkl.get(`${{runIdx}}|${{hkStr}}`) ||
+                     _baselineMeasCache.byHkl.get(hkStr) ||
+                     _baselineMeasCache.byOrbit.get(orbitId) ||
+                     null;
+        if (snap) {{
+          const sk = Object.keys(snap);
+          for (let m = 0; m < sk.length; m++) {{
+            const k = sk[m];
+            if (!isActiveFrame && (k === "ellipse" || k === "ellipse_sph")) continue;
+            pk[k] = snap[k];
+          }}
+        }}
+        if (pk.mtz_i === undefined || pk.mtz_i === null) {{
+          const mtzHit = (_baselineMeasCache.mtzExactLookup && _baselineMeasCache.mtzExactLookup[hkStr]) ||
+                         (_baselineMeasCache.mtzAsuLookup && _baselineMeasCache.mtzAsuLookup[orbitId]) ||
+                         null;
+          if (Array.isArray(mtzHit) && mtzHit.length >= 2) {{
+            const ivM = Number(mtzHit[0]), svM = Math.max(Number(mtzHit[1]) || 0, 1e-6);
+            pk.mtz_i = ivM;
+            pk.mtz_sigi = Number(mtzHit[1]);
+            pk.mtz_isigi = Number((Math.max(0.0, ivM) / svM).toFixed(3));
+            if (pk.merged_i === undefined || pk.merged_i === null) {{
+              pk.merged_i = ivM;
+              pk.merged_sigi = Number(mtzHit[1]);
+            }}
+          }}
+        }}
+
+        peaks.push(pk);
+        break;
+      }}
+      if (peaks.length >= maxOutPeaks) break;
+    }}
+    return peaks;
+  }}
+
+  function canRepredictDynamic() {{
+    const art = String(DATA.artifact_kind || "").toLowerCase();
+    if (art === "raw_nexus" || art === "merged" || art === "empty") {{
+      if (!getActiveUbMatrix()) return false;
+    }}
+    return Boolean(getActiveUbMatrix());
+  }}
+
+  function repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, activeFramePeaks) {{
+    const rMap = DATA.goniometer_R_per_run && typeof DATA.goniometer_R_per_run === "object"
+      ? DATA.goniometer_R_per_run
+      : null;
+    const runKeys = rMap ? Object.keys(rMap).sort((a, b) => Number(a) - Number(b)) : [];
+    if (runKeys.length <= 1) {{
+      PREDICTED_SAMPLE_PEAKS = activeFramePeaks;
+      if (state.peakSource === "predicted") {{
+        SAMPLE_PEAKS.length = 0;
+        for (let i = 0; i < activeFramePeaks.length; i++) SAMPLE_PEAKS.push(activeFramePeaks[i]);
+      }}
+      return;
+    }}
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : {{}};
+    const defSLab = Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0];
+    const perRunCap = Math.max(120, Math.ceil(MAX_DYNAMIC_SAMPLE_PEAKS / Math.max(1, runKeys.length)));
+    const allPeaks = [];
+    for (let i = 0; i < activeFramePeaks.length && allPeaks.length < MAX_DYNAMIC_SAMPLE_PEAKS; i++) {{
+      allPeaks.push(activeFramePeaks[i]);
+    }}
+    let cachedPanels0 = null;
+    for (let r = 0; r < runKeys.length; r++) {{
+      const rk = runKeys[r];
+      const rIdx = parseInt(rk, 10);
+      if (rIdx === activeRunIdx) continue;
+      const Rrun = rMap[rk];
+      if (!Array.isArray(Rrun) || Rrun.length !== 3) continue;
+      const sRun = Array.isArray(sMap[rk]) ? sMap[rk] : defSLab;
+      const sameZeroOffset = Math.hypot(sRun[0] || 0, sRun[1] || 0, sRun[2] || 0) < 1e-7 &&
+                             Math.hypot(defSLab[0] || 0, defSLab[1] || 0, defSLab[2] || 0) < 1e-7;
+      let panelsGeom = null;
+      if (sameZeroOffset) {{
+        if (!cachedPanels0) cachedPanels0 = buildActiveDetectorRaycastPanels(defSLab);
+        panelsGeom = cachedPanels0;
+      }} else {{
+        panelsGeom = buildActiveDetectorRaycastPanels(sRun);
+      }}
+      const budgetLeft = MAX_DYNAMIC_SAMPLE_PEAKS - allPeaks.length;
+      if (budgetLeft <= 0) break;
+      const runHits = raycastRunFromDynamicPool(
+        pool, nActive, Rrun, sRun, panelsGeom,
+        wlMin, wlMax, dMinEff, rIdx, false, Math.min(perRunCap, budgetLeft)
+      );
+      for (let h = 0; h < runHits.length; h++) {{
+        runHits[h].id = allPeaks.length;
+        allPeaks.push(runHits[h]);
+      }}
+    }}
+    PREDICTED_SAMPLE_PEAKS = allPeaks;
+    if (state.peakSource === "predicted") {{
+      SAMPLE_PEAKS.length = 0;
+      for (let i = 0; i < allPeaks.length; i++) SAMPLE_PEAKS.push(allPeaks[i]);
+      _dynPredEpoch++;
+      _peakDataAvailabilitySig = "";
+      _wulffPoolCache.sig = "";
+      _lastWulffRenderSig = "";
+      renderStereoInset(true);
+      updateHUD();
+    }}
+  }}
+
+  function repredictPeaksDynamic(opts = null) {{
+    if (!canRepredictDynamic()) return false;
+    const dFloor = getDynamicDminFloor();
+    const dMinEff = Math.max(dFloor, Number(state.dMin) || dFloor);
+    const wlMin = Math.max(0.05, Number(state.lamMin) || 2.0);
+    const wlMax = Math.max(wlMin + 0.05, Number(state.lamMax) || 4.5);
+
+    const pool = ensureDynamicHklPool(dMinEff);
+    if (!pool) return false;
+    const nActive = countPoolPrefixForDMin(pool, dMinEff);
+    const activeRunIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const Ractive = getActiveGoniometerR();
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : null;
+    const sActive = (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+      ? sMap[String(activeRunIdx)]
+      : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0]);
+    const panelsGeom = buildActiveDetectorRaycastPanels(sActive);
+    if (panelsGeom.length === 0) return false;
+
+    const framePeaks = raycastRunFromDynamicPool(
+      pool, nActive, Ractive, sActive, panelsGeom,
+      wlMin, wlMax, dMinEff, activeRunIdx, true, MAX_DYNAMIC_FRAME_PEAKS
+    );
+    PREDICTED_PEAKS = framePeaks;
+
+    // Refresh zone peak counts so sidebar zone badges reflect the dynamically predicted shells
+    if (Array.isArray(ZONES) && ZONES.length > 0) {{
+      const zCounts = new Map();
+      for (let i = 0; i < framePeaks.length; i++) {{
+        const zids = framePeaks[i].zone_ids;
+        if (!Array.isArray(zids)) continue;
+        for (let j = 0; j < zids.length; j++) {{
+          zCounts.set(zids[j], (zCounts.get(zids[j]) || 0) + 1);
+        }}
+      }}
+      for (let z = 0; z < ZONES.length; z++) {{
+        const zn = ZONES[z];
+        if (zn) zn.n_peaks = zCounts.get(zn.zone_id) || 0;
+      }}
+    }}
+
+    const userAdjusted = Boolean(opts && opts.userAdjusted);
+    const preserveSource = Boolean(opts && opts.preserveSource);
+    const pushedBeyondInteg = (
+      state.peakSource === "integrated" &&
+      userAdjusted &&
+      !preserveSource &&
+      (
+        (Number.isFinite(_baselineMeasCache.minIntegD) && dMinEff < _baselineMeasCache.minIntegD - 0.03) ||
+        wlMin < _payloadBaseParams.lamMin - 0.03 ||
+        wlMax > _payloadBaseParams.lamMax + 0.03
+      )
+    );
+
+    const rMap = DATA.goniometer_R_per_run && typeof DATA.goniometer_R_per_run === "object"
+      ? DATA.goniometer_R_per_run
+      : null;
+    const nRuns = rMap ? Object.keys(rMap).length : 1;
+    if (_dynMultiRunTimer) {{
+      clearTimeout(_dynMultiRunTimer);
+      _dynMultiRunTimer = null;
+    }}
+
+    if (nRuns <= 1 || nActive * nRuns <= 250000) {{
+      repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
+    }} else {{
+      // Keep interactive dragging 60fps on large multi-run protein scans; complete All-Runs raycast right as drag settles
+      if (PREDICTED_SAMPLE_PEAKS.length === 0) PREDICTED_SAMPLE_PEAKS = framePeaks;
+      _dynMultiRunTimer = setTimeout(() => {{
+        _dynMultiRunTimer = null;
+        repredictMultiRunSamplePeaks(pool, nActive, wlMin, wlMax, dMinEff, activeRunIdx, framePeaks);
+      }}, 90);
+    }}
+
+    _dynPredEpoch++;
+    if (pushedBeyondInteg) {{
+      if (
+        state.wulffColorMode === "isigi" ||
+        state.wulffColorMode === "residual" ||
+        state.wulffColorMode === "scale"
+      ) {{
+        state.wulffColorMode = "wavelength";
+      }}
+      applyPeakSource("predicted", false);
+    }} else if (state.peakSource === "predicted") {{
+      if (
+        opts && opts.userAdjusted &&
+        (
+          dMinEff < _payloadBaseParams.dMin - 0.015 ||
+          wlMin < _payloadBaseParams.lamMin - 0.015 ||
+          wlMax > _payloadBaseParams.lamMax + 0.015
+        ) &&
+        (
+          state.wulffColorMode === "isigi" ||
+          state.wulffColorMode === "residual" ||
+          state.wulffColorMode === "scale"
+        )
+      ) {{
+        state.wulffColorMode = "wavelength";
+      }}
+      PEAKS.length = 0;
+      for (let i = 0; i < PREDICTED_PEAKS.length; i++) PEAKS.push(PREDICTED_PEAKS[i]);
+      const srcSample = PREDICTED_SAMPLE_PEAKS && PREDICTED_SAMPLE_PEAKS.length > 0 ? PREDICTED_SAMPLE_PEAKS : PREDICTED_PEAKS;
+      SAMPLE_PEAKS.length = 0;
+      for (let i = 0; i < srcSample.length; i++) SAMPLE_PEAKS.push(srcSample[i]);
+      syncPeakSourceButtons();
+    }} else {{
+      syncPeakSourceButtons();
+    }}
+
+    _peakDataAvailabilitySig = "";
+    _detVisiblePeaksSig = "";
+    _detLodCache.sig = "";
+    _wulffPoolCache.sig = "";
+    _lastDetRenderSig = "";
+    _lastWulffRenderSig = "";
+    return true;
+  }}
+
   const INSTRUMENT_WAVELENGTH_DEFAULTS = {{
     IMAGINE: [2.0, 4.0],
     CG4D: [2.8, 4.5],
@@ -8465,22 +9484,37 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }}
 
-  function syncDminControls(nextDmin, sourceEl = null) {{
-    const v = Math.max(0.2, Math.min(10.0, Number(nextDmin) || 1.0));
+  function syncDminControls(nextDmin, sourceEl = null, opts = null) {{
+    const dFloor = getDynamicDminFloor();
+    const rawVal = Number(nextDmin);
+    const v = Math.max(dFloor, Math.min(10.0, Number.isFinite(rawVal) && rawVal > 0 ? rawVal : dFloor));
+    const clampedAtFloor = Number.isFinite(rawVal) && rawVal > 0 && rawVal <= dFloor + 1e-4;
     state.dMin = v;
     DATA.d_min = v;
     if (sourceEl) {{
       state.dMinUserSeq = (state.dMinUserSeq || 0) + 1;
     }}
     const lblD = document.getElementById("lbl-dmin-val");
-    if (lblD) lblD.textContent = `${{v.toFixed(2)}} Å`;
-    if (slDmin && sourceEl !== slDmin) {{
-      if (v < parseFloat(slDmin.min)) slDmin.min = Math.max(0.2, v - 0.2).toFixed(2);
-      if (v > parseFloat(slDmin.max)) slDmin.max = (v + 1.0).toFixed(2);
-      slDmin.value = v.toFixed(2);
+    if (lblD) {{
+      lblD.textContent = (clampedAtFloor && dFloor > ABS_DMIN_FLOOR + 0.01)
+        ? `${{v.toFixed(2)}} Å (min)`
+        : `${{v.toFixed(2)}} Å`;
+      lblD.title = `Active resolution cutoff d_min = ${{v.toFixed(2)}} Å (safety floor ${{dFloor.toFixed(2)}} Å for unit-cell volume)`;
     }}
-    if (inpDminEl && sourceEl !== inpDminEl) {{
-      inpDminEl.value = v.toFixed(2);
+    if (slDmin) {{
+      slDmin.min = dFloor.toFixed(2);
+      if (v > parseFloat(slDmin.max)) slDmin.max = (v + 1.0).toFixed(2);
+      if (sourceEl !== slDmin || clampedAtFloor) {{
+        slDmin.value = v.toFixed(2);
+      }}
+      slDmin.title = `High-resolution cutoff d_min [Å] — dynamically re-predicts Bragg spots down to ${{dFloor.toFixed(2)}} Å floor`;
+    }}
+    if (inpDminEl) {{
+      inpDminEl.min = dFloor.toFixed(2);
+      const deferFmt = Boolean(opts && opts.deferInputFormat);
+      if (sourceEl !== inpDminEl || (!deferFmt && clampedAtFloor)) {{
+        inpDminEl.value = v.toFixed(2);
+      }}
     }}
   }}
 
@@ -9334,7 +10368,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const pN = PEAKS.length > 0 ? PEAKS[PEAKS.length - 1] : null;
     const s0 = SAMPLE_PEAKS.length > 0 ? SAMPLE_PEAKS[0] : null;
     const sN = SAMPLE_PEAKS.length > 0 ? SAMPLE_PEAKS[SAMPLE_PEAKS.length - 1] : null;
-    const sig = `${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}`;
+    const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
+    const sig = `${{dynEp}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}`;
     if (
       _peakDataAvailabilitySig === sig &&
       _peakDataAvailability._p0 === p0 &&
@@ -11038,10 +12073,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   let _detVisiblePeaksSig = "";
   let _detVisiblePeaksFirst = null;
   let _detVisiblePeaksCache = [];
+  let _detVisibleSortedDSig = "";
+  let _detVisibleSortedDCache = [];
 
   function getVisibleDetectorPeaks() {{
     const firstRef = PEAKS.length > 0 ? PEAKS[0] : null;
-    const sig = `${{PEAKS.length}}|${{state.peakSource}}|${{state.wulffColorMode}}|${{state.dMin}}|${{state.lamMin}}|${{state.lamMax}}|${{DATA.mtz_overlay_name || ""}}`;
+    const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
+    const sig = `${{dynEp}}|${{PEAKS.length}}|${{state.peakSource}}|${{state.wulffColorMode}}|${{state.dMin}}|${{state.lamMin}}|${{state.lamMax}}|${{DATA.mtz_overlay_name || ""}}`;
     if (_detVisiblePeaksSig === sig && _detVisiblePeaksFirst === firstRef) {{
       return _detVisiblePeaksCache;
     }}
@@ -11050,7 +12088,106 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     _detVisiblePeaksCache = PEAKS.filter(isPeakVisible)
       .slice()
       .sort((a, b) => b.parallax_depth - a.parallax_depth);
+    _detVisibleSortedDSig = sig;
+    _detVisibleSortedDCache = [];
+    for (let i = 0; i < _detVisiblePeaksCache.length; i++) {{
+      const dv = _detVisiblePeaksCache[i].d_spacing;
+      if (typeof dv === "number" && Number.isFinite(dv) && dv > 0) {{
+        _detVisibleSortedDCache.push(dv);
+      }}
+    }}
+    _detVisibleSortedDCache.sort((a, b) => b - a);
     return _detVisiblePeaksCache;
+  }}
+
+  // Zoom-coupled d-spacing LOD thinning on the Detector view:
+  // Avoid overlapping ring clutter on dense protein frames at 1x overview zoom while smoothly
+  // unlocking outer high-resolution shells down to state.dMin as the user zooms into a panel.
+  function getDetectorLodState(canvasCssW, canvasCssH) {{
+    const allVisible = getVisibleDetectorPeaks();
+    const sortedD = _detVisibleSortedDCache;
+    const w = Math.max(240, Number(canvasCssW) || 820);
+    const h = Math.max(180, Number(canvasCssH) || 480);
+    const areaScale = Math.sqrt((w * h) / (820.0 * 480.0));
+    const overviewTarget = Math.max(280, Math.min(680, Math.round(420.0 * areaScale)));
+    const minPoolD = sortedD.length > 0 ? sortedD[sortedD.length - 1] : 0.0;
+    const activeDmin = (typeof state.dMin === "number" && state.dMin > 0)
+      ? Math.max(state.dMin, minPoolD)
+      : minPoolD;
+
+    const dZoom = Math.max(0.4, Number(state.detZoom) || 1.0);
+    const hovId = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
+    const selId = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
+    const firstRef = allVisible.length > 0 ? allVisible[0] : null;
+    const lodSig = `${{_detVisiblePeaksSig}}|${{overviewTarget}}|${{dZoom.toFixed(4)}}|${{hovId}}|${{selId}}|${{state.activeOrbitId || ""}}`;
+    if (_detLodCache.sig === lodSig && _detLodCache.firstRef === firstRef) {{
+      return _detLodCache;
+    }}
+
+    if (allVisible.length <= overviewTarget || sortedD.length <= overviewTarget) {{
+      _detLodCache.sig = lodSig;
+      _detLodCache.firstRef = firstRef;
+      _detLodCache.visiblePeaks = allVisible;
+      _detLodCache.lodDcut = activeDmin;
+      _detLodCache.isLodThinned = false;
+      _detLodCache.totalCount = allVisible.length;
+      _detLodCache.activeDmin = activeDmin;
+      return _detLodCache;
+    }}
+
+    const budgetFloat = dZoom >= 1.0
+      ? overviewTarget * Math.pow(dZoom, 2.0)
+      : Math.max(60.0, overviewTarget * Math.pow(dZoom, 1.25));
+    if (budgetFloat >= sortedD.length - 0.5) {{
+      _detLodCache.sig = lodSig;
+      _detLodCache.firstRef = firstRef;
+      _detLodCache.visiblePeaks = allVisible;
+      _detLodCache.lodDcut = activeDmin;
+      _detLodCache.isLodThinned = false;
+      _detLodCache.totalCount = allVisible.length;
+      _detLodCache.activeDmin = activeDmin;
+      return _detLodCache;
+    }}
+
+    const fIdx = Math.max(0.0, Math.min(sortedD.length - 1, budgetFloat - 1.0));
+    const idxLo = Math.floor(fIdx);
+    const idxHi = Math.min(sortedD.length - 1, idxLo + 1);
+    const frac = fIdx - idxLo;
+    const interpD = sortedD[idxLo] * (1.0 - frac) + sortedD[idxHi] * frac;
+    const lodDcut = Math.max(activeDmin, interpD);
+    const isLodThinned = lodDcut > activeDmin + 0.025;
+    if (!isLodThinned) {{
+      _detLodCache.sig = lodSig;
+      _detLodCache.firstRef = firstRef;
+      _detLodCache.visiblePeaks = allVisible;
+      _detLodCache.lodDcut = activeDmin;
+      _detLodCache.isLodThinned = false;
+      _detLodCache.totalCount = allVisible.length;
+      _detLodCache.activeDmin = activeDmin;
+      return _detLodCache;
+    }}
+
+    const activeOrb = state.activeOrbitId;
+    const thinned = [];
+    for (let i = 0; i < allVisible.length; i++) {{
+      const p = allVisible[i];
+      const dv = typeof p.d_spacing === "number" ? p.d_spacing : lodDcut;
+      const forceKeep = (
+        isPeakHighlightedTarget(p) ||
+        Boolean(activeOrb && p.asu_orbit_id && p.asu_orbit_id === activeOrb)
+      );
+      if (dv >= lodDcut - 1e-6 || forceKeep) {{
+        thinned.push(p);
+      }}
+    }}
+    _detLodCache.sig = lodSig;
+    _detLodCache.firstRef = firstRef;
+    _detLodCache.visiblePeaks = thinned;
+    _detLodCache.lodDcut = lodDcut;
+    _detLodCache.isLodThinned = thinned.length < allVisible.length;
+    _detLodCache.totalCount = allVisible.length;
+    _detLodCache.activeDmin = activeDmin;
+    return _detLodCache;
   }}
 
   function renderDetector() {{
@@ -11095,6 +12232,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       selRef,
       state.activeOrbitId || "",
       DATA.mtz_overlay_name || "",
+      typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0,
     ].join("|");
     if (
       !forceRedraw &&
@@ -11367,7 +12505,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     // 4. FOREGROUND LAYER: Predicted Bragg Rings / Integrated 2σ Ellipses hovering together with Laue zone circles
-    const visiblePeaks = getVisibleDetectorPeaks();
+    const detLod = getDetectorLodState(w, h);
+    const visiblePeaks = detLod.visiblePeaks;
     const pendingTooltips = [];
     const queuedTooltipPeakIds = new Set();
     const plotBox = getDetectorPlotBox(w, h);
@@ -11512,6 +12651,30 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ctx.fillText(tag, tx + 5, ty - 7);
       ctx.restore();
     }});
+
+    if (detLod.isLodThinned) {{
+      ctx.save();
+      ctx.font = "bold 10px monospace";
+      const lodTxt = `LOD d ≥ ${{detLod.lodDcut.toFixed(2)}}Å • ${{visiblePeaks.length}}/${{detLod.totalCount}} spots (zoom+ for ${{detLod.activeDmin.toFixed(2)}}Å)`;
+      const bx = 46;
+      const by = 10;
+      const bh = 18;
+      const bw = ctx.measureText(lodTxt).width + 12;
+      ctx.fillStyle = "rgba(7, 9, 19, 0.86)";
+      ctx.strokeStyle = "rgba(251, 191, 36, 0.52)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      if (typeof ctx.roundRect === "function") {{
+        ctx.roundRect(bx, by, bw, bh, 4);
+      }} else {{
+        ctx.rect(bx, by, bw, bh);
+      }}
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#fbbf24";
+      ctx.fillText(lodTxt, bx + 6, by + 12.5);
+      ctx.restore();
+    }}
   }}
 
   function getActiveGoniometerR() {{
@@ -11600,7 +12763,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const activeFrameIdx = typeof state.selectedFrameIndex === "number"
       ? state.selectedFrameIndex
       : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
-    const sig = `${{useAllRuns ? "all" : "1f"}}|${{src.length}}|${{state.peakSource}}|${{state.dMin}}|${{state.lamMin}}|${{state.lamMax}}|${{state.wulffColorMode}}|${{activeFrameIdx}}`;
+    const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
+    const sig = `${{dynEp}}|${{useAllRuns ? "all" : "1f"}}|${{src.length}}|${{state.peakSource}}|${{state.dMin}}|${{state.lamMin}}|${{state.lamMax}}|${{state.wulffColorMode}}|${{activeFrameIdx}}`;
     if (
       _wulffPoolCache.sig === sig &&
       _wulffPoolCache.firstRef === firstRef &&
@@ -11774,6 +12938,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.activeOrbitId || "",
       srcArr.length,
       ZONES.length,
+      typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0,
       Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[2][0].toFixed(5), Rg[2][2].toFixed(5),
     ].join("|");
     if (
@@ -12208,14 +13373,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function findNearestPeakDetector(mx, my) {{
     const rect = detCanvas.getBoundingClientRect();
+    const detLod = getDetectorLodState(rect.width, rect.height);
+    const activePeaks = detLod.visiblePeaks;
     let best = null;
     let bestDist = 14.0;
     const fgLayer = 0.45;
     const azShifts = [-360.0, 0.0, 360.0];
-    PEAKS.forEach(p => {{
-      if (!isPeakVisible(p)) return;
+    for (let i = 0; i < activePeaks.length; i++) {{
+      const p = activePeaks[i];
       const py = getPeakVert(p);
-      azShifts.forEach(shiftAz => {{
+      for (let s = 0; s < azShifts.length; s++) {{
+        const shiftAz = azShifts[s];
         const [x, y] = detToScreen(p.det_x + shiftAz, py, rect.width, rect.height, fgLayer);
         const [bx, by] = detToScreen(p.det_x + shiftAz, py, rect.width, rect.height, -0.35);
         const d = Math.min(Math.hypot(mx - x, my - y), Math.hypot(mx - bx, my - by));
@@ -12223,8 +13391,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           bestDist = d;
           best = p;
         }}
-      }});
-    }});
+      }}
+    }}
     return best;
   }}
 
@@ -12469,26 +13637,41 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     updateColorscaleSliderGradient();
   }}
 
+  function handleDynamicPredictionControlChange() {{
+    const didRepredict = repredictPeaksDynamic({{ userAdjusted: true }});
+    if (didRepredict) {{
+      renderZoneList();
+      syncWulffUI();
+    }}
+    updateColorscaleSliderGradient();
+    updateHUD();
+    renderDetector();
+    renderStereoInset(true);
+  }}
+
   if (slDmin) {{
     slDmin.addEventListener("input", () => {{
       const v = parseFloat(slDmin.value);
       if (Number.isFinite(v) && v > 0) {{
         syncDminControls(v, slDmin);
-        updateHUD();
+        handleDynamicPredictionControlChange();
       }}
     }});
   }}
 
   if (inpDminEl) {{
-    const onInpDmin = () => {{
+    inpDminEl.addEventListener("input", () => {{
       const v = parseFloat(inpDminEl.value);
       if (Number.isFinite(v) && v > 0) {{
-        syncDminControls(v, inpDminEl);
-        updateHUD();
+        syncDminControls(v, inpDminEl, {{ deferInputFormat: true }});
+        handleDynamicPredictionControlChange();
       }}
-    }};
-    inpDminEl.addEventListener("input", onInpDmin);
-    inpDminEl.addEventListener("change", onInpDmin);
+    }});
+    inpDminEl.addEventListener("change", () => {{
+      const v = parseFloat(inpDminEl.value);
+      syncDminControls(Number.isFinite(v) && v > 0 ? v : state.dMin, null);
+      handleDynamicPredictionControlChange();
+    }});
   }}
 
   if (inpLminEl) {{
@@ -12497,7 +13680,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (Number.isFinite(v) && v > 0) {{
         state.lamMin = Math.min(v, state.lamMax - 0.05);
         updateWavelengthLabels();
-        updateHUD();
+        handleDynamicPredictionControlChange();
       }}
     }};
     inpLminEl.addEventListener("input", onInpLmin);
@@ -12510,7 +13693,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (Number.isFinite(v) && v > 0) {{
         state.lamMax = Math.max(v, state.lamMin + 0.05);
         updateWavelengthLabels();
-        updateHUD();
+        handleDynamicPredictionControlChange();
       }}
     }};
     inpLmaxEl.addEventListener("input", onInpLmax);
@@ -13032,6 +14215,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (newPayload.b_matrix) DATA.b_matrix = newPayload.b_matrix;
     if (newPayload.ub_matrix) DATA.ub_matrix = newPayload.ub_matrix;
     if (newPayload.detector_configs) DATA.detector_configs = newPayload.detector_configs;
+    if (newPayload.space_group_ops) DATA.space_group_ops = newPayload.space_group_ops;
     if (Array.isArray(newPayload.ki)) DATA.ki = newPayload.ki;
     DATA.mtz_overlay_name = newPayload.mtz_overlay_name || null;
     DATA.mtz_overlay_reflections = newPayload.mtz_overlay_reflections || 0;
@@ -13039,6 +14223,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     DATA.mtz_overlay_space_group = newPayload.mtz_overlay_space_group || null;
     DATA.mtz_overlay_cell = newPayload.mtz_overlay_cell || null;
     DATA.mtz_overlay_warning = newPayload.mtz_overlay_warning || null;
+    DATA.mtz_asu_lookup = newPayload.mtz_asu_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_asu_lookup : null);
+    DATA.mtz_exact_lookup = newPayload.mtz_exact_lookup || (isFrameSwitch && DATA.mtz_overlay_name ? DATA.mtz_exact_lookup : null);
     DATA.default_peak_source = newPayload.default_peak_source || null;
     renderFrameSelector();
 
@@ -13052,6 +14238,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     const nextBuckets = extractPeakBucketsFromPayload(newPayload);
+    captureBaselineMeasurements(nextBuckets, newPayload, isFrameSwitch && Boolean(DATA.mtz_overlay_name));
     let nextZones = Array.isArray(newPayload.zones) ? [...newPayload.zones] : [];
     const nextPanels = Array.isArray(newPayload.panels) ? [...newPayload.panels] : [];
     let nextLadder = Array.isArray(newPayload.ladder_steps) && newPayload.ladder_steps.length > 0 ? [...newPayload.ladder_steps] : [...LADDER];
@@ -13090,6 +14277,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     nextLadder.forEach(s => LADDER.push(s));
     PIPELINE.length = 0;
     nextPipeline.forEach(s => PIPELINE.push(s));
+
+    if (
+      keepUserParams &&
+      (
+        state.dMin < _payloadBaseParams.dMin - 0.01 ||
+        state.lamMin < _payloadBaseParams.lamMin - 0.01 ||
+        state.lamMax > _payloadBaseParams.lamMax + 0.01
+      )
+    ) {{
+      repredictPeaksDynamic({{ preserveSource: true }});
+    }}
 
     if (PANELS.length > 0) {{
       const allY = [], allEl = [];
@@ -13993,6 +15191,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       {{ rung: 5, stage: "5. Converged Solve UB", subtitle: `${{sg}} • a=${{cell[0].toFixed(1)}}, b=${{cell[1].toFixed(1)}}, c=${{cell[2].toFixed(1)}} Å`, active_zones: ord1Ids.length ? ord1Ids : zonesOut.map(z => z.zone_id), n_captured: peaksOut.length, description: `Converged 3D UB orientation (${{peaksOut.length}} forward-projected spots with SNR ≥ 3.0).` }},
     ];
     try {{ f.close(); if (mf && mf !== f) mf.close(); }} catch (_e) {{}}
+    const clientDetConfigs = {{}};
+    detMap.forEach((dCfg, bid) => {{
+      clientDetConfigs[String(bid)] = {{
+        panel: "flat",
+        panel_type: "flat",
+        m: dCfg.m,
+        n: dCfg.n,
+        center: dCfg.center,
+        uhat: dCfg.uhat,
+        vhat: dCfg.vhat,
+        width: dCfg.width,
+        height: dCfg.height,
+      }};
+    }});
     return {{
       instrument: inst,
       default_projection: (inst === "MANDI" || inst === "TOPAZ") ? "spherical" : "cylindrical",
@@ -14004,6 +15216,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       d_min: dMinNew,
       goniometer_R: Rrun,
       cell,
+      u_matrix: U,
+      b_matrix: B,
+      ub_matrix: UB,
+      detector_configs: clientDetConfigs,
       em_mask_summary: emMaskSummary,
       peaks: peaksOut,
       sample_peaks: peaksOut,
