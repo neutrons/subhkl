@@ -307,6 +307,7 @@ class SubhklGalaxyModel:
                 self.payload,
                 self.mtz_overlay_path,
                 self.mtz_overlay_info,
+                select_mtz_color=False,
             )
         return self.payload
 

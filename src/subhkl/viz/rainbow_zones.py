@@ -1446,6 +1446,8 @@ def apply_mtz_to_payload(
     payload: dict[str, Any],
     mtz_path: str | os.PathLike,
     ds_info: dict[str, Any] | None = None,
+    *,
+    select_mtz_color: bool = True,
 ) -> dict[str, Any]:
     """Attach external MTZ I/SIGI data columns onto active UB reflection peaks without modifying B or U."""
     import gemmi
@@ -1842,8 +1844,8 @@ def apply_mtz_to_payload(
                         bank_arr=cast_frame["bank"],
                         pixel_r_arr=cast_frame["pixel_r"],
                         pixel_c_arr=cast_frame["pixel_c"],
-                        intensity_arr=cast_frame["intensity"],
-                        sigma_arr=cast_frame["sigma"],
+                        intensity_arr=None,
+                        sigma_arr=None,
                         var_u_arr=None,
                         var_v_arr=None,
                         cov_uv_arr=None,
@@ -1999,8 +2001,8 @@ def apply_mtz_to_payload(
                             "peaks_xyz": pts_all_m[u_keep],
                             "hkl": hkl_all_m[u_keep],
                             "wavelength": lam_all_m[u_keep],
-                            "intensity": int_all_m[u_keep],
-                            "sigma": sig_all_m[u_keep],
+                            "intensity": None,
+                            "sigma": None,
                             "bank": bnk_all_m[u_keep],
                             "run_index": run_all_m[u_keep],
                             "R_per_run": r_per_run_np,
@@ -2102,7 +2104,9 @@ def apply_mtz_to_payload(
     out.pop("mtz_peaks", None)
     out.pop("mtz_sample_peaks", None)
     out["default_peak_source"] = active_src
-    out["default_color_mode"] = "mtz_isigi"
+    if select_mtz_color or not out.get("default_color_mode"):
+        out["default_color_mode"] = "mtz_isigi"
+    out["mtz_fresh_overlay"] = bool(select_mtz_color)
     if active_src == "integrated":
         out["peaks"] = out.get("integrated_peaks") or []
         out["sample_peaks"] = out.get("integrated_sample_peaks") or out["peaks"]
@@ -2567,6 +2571,30 @@ def _extract_from_h5(
                     per_run_spec = _parse_per_run_from_h5(af)
                 if harmonics_spec is None:
                     harmonics_spec = _parse_harmonics_from_h5(af)
+                if U is None and "sample/U" in af:
+                    U = np.asarray(af["sample/U"][()], dtype=float)
+                if B is None and "sample/B" in af:
+                    B = np.asarray(af["sample/B"][()], dtype=float)
+                if space_group == "P 1":
+                    if "sample/space_group" in af:
+                        space_group = _decode_str(af["sample/space_group"][()], "P 1")
+                    elif "space_group" in af:
+                        space_group = _decode_str(af["space_group"][()], "P 1")
+                if cell is None:
+                    if all(
+                        f"sample/{k}" in af
+                        for k in ("a", "b", "c", "alpha", "beta", "gamma")
+                    ):
+                        cell = [
+                            float(af["sample/a"][()]),
+                            float(af["sample/b"][()]),
+                            float(af["sample/c"][()]),
+                            float(af["sample/alpha"][()]),
+                            float(af["sample/beta"][()]),
+                            float(af["sample/gamma"][()]),
+                        ]
+                    elif B is not None:
+                        cell = list(_cell_from_B(B))
 
         if gonio_angles_nom is None:
             gonio_angles_nom = gonio_angles_ref
@@ -3367,8 +3395,8 @@ def _extract_from_h5(
                     "bank": np.concatenate(bank_p, axis=0),
                     "pixel_r": np.concatenate(pr_p, axis=0),
                     "pixel_c": np.concatenate(pc_p, axis=0),
-                    "intensity": np.concatenate(inten_p, axis=0),
-                    "sigma": np.full(len(pts_c), 3.0, dtype=float),
+                    "intensity": None,
+                    "sigma": None,
                     "run_index": np.full(len(pts_c), int(r_idx_val), dtype=int),
                 }
 
@@ -3392,8 +3420,6 @@ def _extract_from_h5(
                     lam_a = np.concatenate(
                         [c["wavelength"] for c in run_slices], axis=0
                     )
-                    int_a = np.concatenate([c["intensity"] for c in run_slices], axis=0)
-                    sig_a = np.concatenate([c["sigma"] for c in run_slices], axis=0)
                     bnk_a = np.concatenate([c["bank"] for c in run_slices], axis=0)
                     run_a = np.concatenate([c["run_index"] for c in run_slices], axis=0)
                     if len(pts_a) > 12000:
@@ -3401,16 +3427,14 @@ def _extract_from_h5(
                         pts_a = pts_a[idx_sub]
                         hkl_a = hkl_a[idx_sub]
                         lam_a = lam_a[idx_sub]
-                        int_a = int_a[idx_sub]
-                        sig_a = sig_a[idx_sub]
                         bnk_a = bnk_a[idx_sub]
                         run_a = run_a[idx_sub]
                     all_pred = {
                         "peaks_xyz": pts_a,
                         "hkl": hkl_a,
                         "wavelength": lam_a,
-                        "intensity": int_a,
-                        "sigma": sig_a,
+                        "intensity": None,
+                        "sigma": None,
                         "bank": bnk_a,
                         "run_index": run_a,
                         "R_per_run": R_per_run_all,
@@ -3467,14 +3491,8 @@ def _extract_from_h5(
                         "wavelength": lam[idx_pred_all]
                         if lam is not None and len(lam) == len(peaks_xyz)
                         else None,
-                        "intensity": np.maximum(intensity[idx_pred_all], 1.0)
-                        if intensity is not None and len(intensity) == len(peaks_xyz)
-                        else None,
-                        "sigma": np.where(
-                            sigma[idx_pred_all] > 0, sigma[idx_pred_all], 3.0
-                        )
-                        if sigma is not None and len(sigma) == len(peaks_xyz)
-                        else None,
+                        "intensity": None,
+                        "sigma": None,
                         "bank": bank[idx_pred_all]
                         if bank is not None and len(bank) == len(peaks_xyz)
                         else None,
@@ -3505,12 +3523,8 @@ def _extract_from_h5(
                         "pixel_c": pixel_c[m_fr]
                         if pixel_c is not None and len(pixel_c) == len(peaks_xyz)
                         else np.zeros(int(np.sum(m_fr)), dtype=float),
-                        "intensity": np.maximum(intensity[m_fr], 1.0)
-                        if intensity is not None and len(intensity) == len(peaks_xyz)
-                        else np.full(int(np.sum(m_fr)), 100.0, dtype=float),
-                        "sigma": np.where(sigma[m_fr] > 0, sigma[m_fr], 3.0)
-                        if sigma is not None and len(sigma) == len(peaks_xyz)
-                        else np.full(int(np.sum(m_fr)), 3.0, dtype=float),
+                        "intensity": None,
+                        "sigma": None,
                     }
 
         # Capture all-runs sample-space peak arrays before filtering to active_frame
@@ -3910,27 +3924,6 @@ def _extract_from_h5(
                             continue
                         idx_h = idx_h[valid_m]
                         pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
-                    im_b = bank_imgs.get(int(bid))
-                    if im_b is not None:
-                        r_i = np.clip(
-                            np.round(pr_hit).astype(int), 3, im_b.shape[0] - 4
-                        )
-                        c_i = np.clip(
-                            np.round(pc_hit).astype(int), 3, im_b.shape[1] - 4
-                        )
-                        peak_val = np.maximum.reduce(
-                            [
-                                im_b[r_i + dr, c_i + dc]
-                                for dr in range(-3, 4)
-                                for dc in range(-3, 4)
-                            ]
-                        )
-                        bg_val = float(np.median(im_b))
-                        snr = (peak_val - bg_val) / np.sqrt(max(bg_val, 1.0))
-                    else:
-                        peak_val = np.full(len(idx_h), 150.0, dtype=float)
-                        snr = np.full(len(idx_h), 10.0, dtype=float)
-
                     if hasattr(det, "pixel_to_lab"):
                         xyz_hit = np.asarray(
                             det.pixel_to_lab(pr_hit, pc_hit), dtype=float
@@ -3957,14 +3950,10 @@ def _extract_from_h5(
                             "xyz_hit": xyz_hit,
                             "pr_hit": pr_hit,
                             "pc_hit": pc_hit,
-                            "peak_val": peak_val,
-                            "snr": snr,
-                            "has_img": im_b is not None,
                         }
                     )
 
-                xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l, inten_l = (
-                    [],
+                xyz_l, hkl_l, lam_l, bank_l, pr_l, pc_l = (
                     [],
                     [],
                     [],
@@ -3974,17 +3963,12 @@ def _extract_from_h5(
                 )
                 for rh in raw_hits:
                     idx_h = rh["idx_h"]
-                    xyz_hit = rh["xyz_hit"]
-                    pr_hit = rh["pr_hit"]
-                    pc_hit = rh["pc_hit"]
-                    peak_val = np.maximum(rh["peak_val"], 1.0)
-                    xyz_l.append(xyz_hit)
+                    xyz_l.append(rh["xyz_hit"])
                     hkl_l.append(hkl_b[idx_h])
                     lam_l.append(lam_b[idx_h])
                     bank_l.append(np.full(len(idx_h), rh["bid"], dtype=int))
-                    pr_l.append(pr_hit)
-                    pc_l.append(pc_hit)
-                    inten_l.append(peak_val)
+                    pr_l.append(rh["pr_hit"])
+                    pc_l.append(rh["pc_hit"])
 
                 if xyz_l:
                     peaks_xyz = np.concatenate(xyz_l, axis=0)
@@ -3993,8 +3977,8 @@ def _extract_from_h5(
                     bank = np.concatenate(bank_l, axis=0)
                     pixel_r = np.concatenate(pr_l, axis=0)
                     pixel_c = np.concatenate(pc_l, axis=0)
-                    intensity = np.concatenate(inten_l, axis=0)
-                    sigma = np.full(len(peaks_xyz), 3.0, dtype=float)
+                    intensity = None
+                    sigma = None
 
         if peaks_xyz is None:
             peaks_xyz = np.zeros((0, 3), dtype=float)
@@ -4006,10 +3990,6 @@ def _extract_from_h5(
             pixel_r = np.zeros(n_peaks, dtype=float)
         if pixel_c is None:
             pixel_c = np.zeros(n_peaks, dtype=float)
-        if intensity is None:
-            intensity = np.ones(n_peaks, dtype=float) * 100.0
-        if sigma is None:
-            sigma = np.ones(n_peaks, dtype=float) * 3.0
         if run_index is None:
             run_index = np.zeros(n_peaks, dtype=int)
 
@@ -5142,13 +5122,18 @@ def _serialize_peak_entries(
             ],
             "intensity": (
                 round(float(intensity_arr[i]), 2)
-                if intensity_arr is not None and i < len(intensity_arr)
-                else 100.0
+                if intensity_arr is not None
+                and i < len(intensity_arr)
+                and np.isfinite(intensity_arr[i])
+                else None
             ),
             "sigma": (
                 round(float(sigma_arr[i]), 2)
-                if sigma_arr is not None and i < len(sigma_arr)
-                else 3.0
+                if sigma_arr is not None
+                and i < len(sigma_arr)
+                and np.isfinite(sigma_arr[i])
+                and sigma_arr[i] > 0
+                else None
             ),
             "wavelength": round(float(np.clip(lam_val, wl_min * 0.5, wl_max * 1.5)), 4),
             "d_spacing": round(d_val, 4),
@@ -5341,12 +5326,19 @@ def _serialize_sample_peaks(
                 round(float(sy_all[j]), 5),
             ],
             "hemisphere": int(hm_all[j]),
-            "intensity": round(float(int_all[j]), 2)
-            if int_all is not None and j < len(int_all)
-            else 100.0,
-            "sigma": round(float(sig_all[j]), 2)
-            if sig_all is not None and j < len(sig_all)
-            else 3.0,
+            "intensity": (
+                round(float(int_all[j]), 2)
+                if int_all is not None and j < len(int_all) and np.isfinite(int_all[j])
+                else None
+            ),
+            "sigma": (
+                round(float(sig_all[j]), 2)
+                if sig_all is not None
+                and j < len(sig_all)
+                and np.isfinite(sig_all[j])
+                and sig_all[j] > 0
+                else None
+            ),
             "wavelength": round(float(np.clip(lv, wl_min * 0.5, wl_max * 1.5)), 4),
             "d_spacing": round(dv, 4),
             "harmonic_order": int(h_ord),
@@ -5718,10 +5710,8 @@ def build_rainbow_zone_payload(
                         "bank": ray_fr["bank"],
                         "pixel_r": ray_fr["pixel_r"],
                         "pixel_c": ray_fr["pixel_c"],
-                        "intensity": np.full(
-                            len(ray_fr["peaks_xyz"]), 150.0, dtype=float
-                        ),
-                        "sigma": np.full(len(ray_fr["peaks_xyz"]), 3.0, dtype=float),
+                        "intensity": None,
+                        "sigma": None,
                     }
                     if len(frames_meta) > 1:
                         all_xyz_p, all_hkl_p, all_lam_p, all_bnk_p, all_run_p = (
@@ -5777,8 +5767,8 @@ def build_rainbow_zone_payload(
                                 "peaks_xyz": pts_pa,
                                 "hkl": hkl_pa,
                                 "wavelength": lam_pa,
-                                "intensity": np.full(len(pts_pa), 150.0, dtype=float),
-                                "sigma": np.full(len(pts_pa), 3.0, dtype=float),
+                                "intensity": None,
+                                "sigma": None,
                                 "bank": bnk_pa,
                                 "run_index": run_pa,
                                 "R_per_run": R_per_run_all,
@@ -5889,12 +5879,19 @@ def build_rainbow_zone_payload(
                         [
                             float(asu_obs_map[k][0]["merged_i"])
                             / max(
-                                float(asu_obs_map[k][0].get("merged_sigi", 1.0)), 1e-6
+                                float(asu_obs_map[k][0].get("merged_sigi") or 1.0),
+                                1e-6,
                             )
-                            if "merged_i" in asu_obs_map[k][0]
-                            and float(asu_obs_map[k][0].get("merged_sigi", 0.0)) > 0
-                            else float(asu_obs_map[k][0].get("intensity", 100.0))
-                            / max(float(asu_obs_map[k][0].get("sigma", 3.0)), 1e-6)
+                            if asu_obs_map[k][0].get("merged_i") is not None
+                            and float(asu_obs_map[k][0].get("merged_sigi") or 0.0) > 0
+                            else (
+                                float(asu_obs_map[k][0]["intensity"])
+                                / max(float(asu_obs_map[k][0]["sigma"]), 1e-6)
+                                if asu_obs_map[k][0].get("intensity") is not None
+                                and asu_obs_map[k][0].get("sigma") is not None
+                                and float(asu_obs_map[k][0]["sigma"]) > 0
+                                else 0.0
+                            )
                             for k in asu_keys
                         ],
                         dtype=float,
@@ -7357,6 +7354,48 @@ def render_rainbow_html(
     color: var(--accent-gold);
     text-shadow: 0 0 6px rgba(251, 191, 36, 0.35);
   }}
+
+  /* Photoshop-checkerboard + live active-colorscale gradient slider with crossover knob */
+  #slider-color-emphasis {{
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 13px;
+    border-radius: 6px;
+    border: 1px solid rgba(148, 163, 184, 0.48);
+    background-color: #cbd5e1;
+    background-image:
+      var(--cs-gradient, linear-gradient(90deg, rgba(252, 238, 184, 0) 0%, rgba(250, 204, 21, 0.5) 38%, rgba(163, 242, 44, 1) 100%)),
+      repeating-conic-gradient(#64748b 0% 25%, #cbd5e1 0% 50%);
+    background-size: 100% 100%, 8px 8px;
+    background-position: 0 0, 0 0;
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.38);
+    cursor: ew-resize;
+    outline: none;
+    margin: 2px 0 4px 0;
+  }}
+
+  #slider-color-emphasis::-webkit-slider-thumb {{
+    -webkit-appearance: none;
+    appearance: none;
+    width: 10px;
+    height: 18px;
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.72);
+    border: 2px solid #f8fafc;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.85), 0 1px 4px rgba(0, 0, 0, 0.65);
+    cursor: ew-resize;
+  }}
+
+  #slider-color-emphasis::-moz-range-thumb {{
+    width: 8px;
+    height: 16px;
+    border-radius: 4px;
+    background: rgba(15, 23, 42, 0.72);
+    border: 2px solid #f8fafc;
+    box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.85), 0 1px 4px rgba(0, 0, 0, 0.65);
+    cursor: ew-resize;
+  }}
 </style>
 </head>
 <body>
@@ -7518,10 +7557,10 @@ def render_rainbow_html(
           <input type="range" id="slider-det-alpha" min="0.0" max="1.0" step="0.05" value="0.85" />
 
           <div class="slider-row">
-            <span>Colorscale Emphasis</span>
-            <span id="lbl-color-emphasis">Balanced</span>
+            <span>Colorscale Crossover</span>
+            <span id="lbl-color-emphasis">I/σ ~ 3.2</span>
           </div>
-          <input type="range" id="slider-color-emphasis" min="-1.0" max="1.0" step="0.05" value="0.00" title="Emphasize strong peaks only (+1.0) vs all peaks equally (-1.0); double-click to reset" />
+          <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to shift the (log-)scale midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
 
           <div class="slider-row">
             <span>Resolution Cutoff d_min [Å]</span>
@@ -8091,7 +8130,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     wulffFrame: "sample",         // always project in Sample frame (coupled via goniometer R)
     wulffCoupled: true,           // 360° periodic detector pan <-> Wulff yaw always coupled
     wulffColorMode: initColorMode, // "wavelength" | "orbit" | "isigi" | "mtz_isigi" | "residual" | "scale"
-    colorEmphasis: 0.0,           // -1.0 (all peaks boosted) .. 0.0 (balanced log) .. +1.0 (strong peaks only)
+    colorCrossover: 0.38,         // 0.05 (boost all/weak peaks) .. 0.38 (default log crossover) .. 0.95 (strong peaks only)
     wulffYawDeg: 0.0,
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
@@ -8316,6 +8355,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (inpLmaxEl && document.activeElement !== inpLmaxEl) {{
       inpLmaxEl.value = state.lamMax.toFixed(2);
+    }}
+    if (typeof updateColorscaleSliderGradient === "function") {{
+      updateColorscaleSliderGradient();
     }}
   }}
 
@@ -9112,9 +9154,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }};
   }}
 
-  // Vibrant spectral color preset for wavelength / zone highlights
+  const DEFAULT_COLOR_CROSSOVER = 0.38;
+
+  function getColorCrossover() {{
+    const raw = Number(state.colorCrossover);
+    return Number.isFinite(raw) ? Math.max(0.05, Math.min(0.95, raw)) : DEFAULT_COLOR_CROSSOVER;
+  }}
+
+  // Monotone power crossover curve t(u) = u^(ln(0.5)/ln(c)):
+  // Pins t(0) = 0, t(c) = 0.5 EXACTLY underneath the slider knob at position c, and t(1) = 1.
+  function applyCrossoverCurve(u0) {{
+    const u = Math.max(0.0, Math.min(1.0, u0));
+    if (u <= 0.0) return 0.0;
+    if (u >= 1.0) return 1.0;
+    const c = getColorCrossover();
+    const gamma = Math.LN2 / Math.max(0.05, -Math.log(c));
+    return Math.pow(u, gamma);
+  }}
+
+  // Vibrant spectral color preset for wavelength / zone highlights (crossover knob shifts spectral midpoint)
   function wavelengthToColor(lam, alpha = 1.0) {{
-    const t = Math.max(0, Math.min(1, (lam - state.lamMin) / Math.max(0.05, state.lamMax - state.lamMin)));
+    const u = Math.max(0, Math.min(1, (lam - state.lamMin) / Math.max(0.05, state.lamMax - state.lamMin)));
+    const t = applyCrossoverCurve(u);
     const hue = (1.0 - t) * 265;
     return `hsla(${{hue.toFixed(1)}}, 95%, 60%, ${{alpha}})`;
   }}
@@ -9124,49 +9185,30 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     "#38bdf8", "#84cc16", "#f43f5e", "#14b8a6", "#eab308", "#6366f1"
   ];
 
-  function applyEmphasisCurve(t0, alpha = 1.0) {{
-    const clamped = Math.max(0.0, Math.min(1.0, t0));
-    const emp = Math.max(-1.0, Math.min(1.0, Number(state.colorEmphasis) || 0.0));
-    if (Math.abs(emp) < 1e-4) {{
-      return [clamped, alpha];
-    }}
-    const gamma = Math.pow(2.0, emp * 2.1);
-    if (emp > 0.0) {{
-      const floor = 0.42 * emp;
-      const windowed = Math.max(0.0, (clamped - floor) / Math.max(0.12, 1.0 - floor));
-      const t = Math.pow(windowed, gamma);
-      const effAlpha = alpha * ((1.0 - emp) + emp * (0.12 + 0.88 * Math.pow(clamped, 0.75 + 1.25 * emp)));
-      return [t, effAlpha];
-    }}
-    const t = Math.pow(clamped, gamma);
-    const effAlpha = Math.min(1.0, alpha * (1.0 + 0.35 * (-emp)));
-    return [t, effAlpha];
-  }}
-
   // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma
   function residualToColor(resVal, alpha = 1.0) {{
-    if (typeof resVal !== "number" || !Number.isFinite(resVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
+    if (typeof resVal !== "number" || !Number.isFinite(resVal)) return `rgba(148, 163, 184, 0.000)`;
     const clamped = Math.max(-3.0, Math.min(3.0, resVal));
-    const [u, effAlpha] = applyEmphasisCurve(Math.min(1.0, Math.abs(clamped) / 3.0), alpha);
+    const u = applyCrossoverCurve(Math.min(1.0, Math.abs(clamped) / 3.0));
     if (clamped < 0) {{
       const r = Math.round(248 * (1 - u) + 30 * u);
       const g = Math.round(250 * (1 - u) + 170 * u);
       const b = Math.round(252 * (1 - u) + 255 * u);
-      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{effAlpha.toFixed(3)}})`;
+      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha.toFixed(3)}})`;
     }} else {{
       const r = Math.round(248 * (1 - u) + 244 * u);
       const g = Math.round(250 * (1 - u) + 63 * u);
       const b = Math.round(252 * (1 - u) + 94 * u);
-      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{effAlpha.toFixed(3)}})`;
+      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha.toFixed(3)}})`;
     }}
   }}
 
   function scaleToColor(scaleVal, alpha = 1.0) {{
-    if (typeof scaleVal !== "number" || !Number.isFinite(scaleVal)) return `rgba(148, 163, 184, ${{alpha * 0.45}})`;
+    if (typeof scaleVal !== "number" || !Number.isFinite(scaleVal)) return `rgba(148, 163, 184, 0.000)`;
     const tRaw = Math.max(0.0, Math.min(1.0, (Math.log10(Math.max(1e-4, scaleVal)) + 2.0) / 3.0));
-    const [t, effAlpha] = applyEmphasisCurve(tRaw, alpha);
+    const t = applyCrossoverCurve(tRaw);
     const hue = (1.0 - t) * 195 + t * 45;
-    return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{effAlpha.toFixed(3)}})`;
+    return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{alpha.toFixed(3)}})`;
   }}
 
   function peakUnscaledIsigi(p) {{
@@ -9254,30 +9296,28 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   // Logarithmic non-negative I/SIGI colormap (O(1) per peak):
-  // Neutral Slate-Gray (0σ) -> Crisp Silver-White (~2–3σ) -> Luminous Gold -> Electric Lime-Chartreuse (strong peaks),
-  // engineered to stand out cleanly above Magma, Cyan Glow, and Film detector pixel heatmaps.
+  // Transparent (alpha=0 at 0σ) -> Solar Gold at the slider crossover (t=0.5, alpha=0.5) ->
+  // Fully Opaque Electric Chartreuse-Lime (alpha=1 at strong peaks). Warm ivory-gold RGB at low t
+  // prevents muddy dark fringes as alpha fades over bright detector pixels.
   function isigiToColor(isigiVal, alpha = 1.0, topScale = 40.0) {{
-    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal)) return `rgba(148, 163, 184, ${{(alpha * 0.35).toFixed(3)}})`;
+    if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal) || isigiVal <= 0.0) {{
+      return "rgba(252, 238, 184, 0.000)";
+    }}
     const snr = Math.max(0.0, isigiVal);
     const denom = Math.log10(1.0 + Math.max(12.0, topScale));
-    const tLog = Math.max(0.0, Math.min(1.0, Math.log10(1.0 + snr) / Math.max(0.5, denom)));
-    const [t, effAlpha] = applyEmphasisCurve(tLog, alpha);
+    const uLog = Math.max(0.0, Math.min(1.0, Math.log10(1.0 + snr) / Math.max(0.5, denom)));
+    const t = applyCrossoverCurve(uLog);
+    const effAlpha = Math.max(0.0, Math.min(1.0, alpha * t));
     let r, g, b;
-    if (t < 0.34) {{
-      // Muted Slate-Gray (148, 163, 184) -> Crisp Neutral White-Silver (232, 238, 246)
-      const u = t / 0.34;
-      r = Math.round(148 + (232 - 148) * u);
-      g = Math.round(163 + (238 - 163) * u);
-      b = Math.round(184 + (246 - 184) * u);
-    }} else if (t < 0.68) {{
-      // Neutral White-Silver (232, 238, 246) -> Vivid Solar Gold (250, 204, 21)
-      const u = (t - 0.34) / 0.34;
-      r = Math.round(232 + (250 - 232) * u);
+    if (t < 0.5) {{
+      // Warm Ivory-Gold (252, 238, 184) -> Vivid Solar Gold (250, 204, 21) right at crossover t=0.5
+      const u = t / 0.5;
+      r = Math.round(252 + (250 - 252) * u);
       g = Math.round(238 + (204 - 238) * u);
-      b = Math.round(246 + (21 - 246) * u);
+      b = Math.round(184 + (21 - 184) * u);
     }} else {{
-      // Vivid Solar Gold (250, 204, 21) -> Electric Chartreuse-Lime (163, 242, 44)
-      const u = (t - 0.68) / 0.32;
+      // Vivid Solar Gold (250, 204, 21) -> Electric Chartreuse-Lime (163, 242, 44) at t=1.0
+      const u = (t - 0.5) / 0.5;
       r = Math.round(250 + (163 - 250) * u);
       g = Math.round(204 + (242 - 204) * u);
       b = Math.round(21 + (44 - 21) * u);
@@ -9318,15 +9358,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function peakEmphasisAlphaForCategorical(p, alpha) {{
-    const emp = Number(state.colorEmphasis) || 0.0;
-    if (Math.abs(emp) < 1e-4 || !p) return alpha;
+    const c = getColorCrossover();
+    if (Math.abs(c - DEFAULT_COLOR_CROSSOVER) < 1e-3 || !p) return alpha;
     const avail = getPeakDataAvailability();
     const mv = peakMtzIsigi(p);
     const snr = Number.isFinite(mv) ? mv : peakUnscaledIsigi(p);
     const topS = Number.isFinite(mv) ? avail.mtzIsigiTop : avail.isigiTop;
     if (Number.isFinite(snr)) {{
-      const tLog = Math.max(0.0, Math.min(1.0, Math.log10(1.0 + Math.max(0.0, snr)) / Math.log10(1.0 + Math.max(12.0, topS))));
-      return applyEmphasisCurve(tLog, alpha)[1];
+      const uLog = Math.max(0.0, Math.min(1.0, Math.log10(1.0 + Math.max(0.0, snr)) / Math.log10(1.0 + Math.max(12.0, topS))));
+      return alpha * Math.min(1.0, 0.15 + 0.85 * applyCrossoverCurve(uLog));
     }}
     return alpha;
   }}
@@ -9361,7 +9401,77 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (mode === "scale") {{
       return scaleToColor(p.careless_scale, alpha);
     }}
-    return wavelengthToColor(p.wavelength, peakEmphasisAlphaForCategorical(p, alpha));
+    return wavelengthToColor(p.wavelength, alpha);
+  }}
+
+  function buildColorscaleGradientSpec(mode, crossoverVal) {{
+    const prevC = state.colorCrossover;
+    state.colorCrossover = crossoverVal;
+    const c = getColorCrossover();
+    const avail = getPeakDataAvailability();
+    const stops = [];
+    const N = 16;
+    let label = "";
+    if (mode === "isigi" || mode === "mtz_isigi") {{
+      const topS = Math.max(12.0, mode === "mtz_isigi" ? avail.mtzIsigiTop : avail.isigiTop);
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        const snr = u <= 0 ? 0.0 : (Math.pow(1.0 + topS, u) - 1.0);
+        stops.push(`${{isigiToColor(snr, 1.0, topS)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      const crossSnr = Math.pow(1.0 + topS, c) - 1.0;
+      label = `I/σ ~ ${{crossSnr >= 10 ? crossSnr.toFixed(0) : crossSnr.toFixed(1)}}`;
+    }} else if (mode === "residual") {{
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        const res = -3.0 + 6.0 * u;
+        stops.push(`${{residualToColor(res, 1.0)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      label = `|Δ|/σ ~ ${{(3.0 * c).toFixed(1)}}`;
+    }} else if (mode === "scale") {{
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        const scl = Math.pow(10.0, -2.0 + 3.0 * u);
+        stops.push(`${{scaleToColor(scl, 1.0)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      const crossScl = Math.pow(10.0, -2.0 + 3.0 * c);
+      label = `× ~ ${{crossScl >= 1 ? crossScl.toFixed(1) : crossScl.toFixed(2)}}`;
+    }} else if (mode === "orbit") {{
+      const hasSnr = avail.hasMtzIsigi || avail.hasIsigi;
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        const idx = Math.min(ORBIT_PALETTE.length - 1, Math.floor(u * ORBIT_PALETTE.length));
+        const a = hasSnr ? Math.min(1.0, 0.15 + 0.85 * applyCrossoverCurve(u)) : 1.0;
+        stops.push(`${{hexToRgba(ORBIT_PALETTE[idx], a)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      label = hasSnr ? `Orbit (${{Math.round(c * 100)}}%)` : "Orbit (Opaque)";
+    }} else {{
+      const lMin = Number.isFinite(state.lamMin) ? state.lamMin : 1.0;
+      const lMax = Number.isFinite(state.lamMax) ? state.lamMax : 4.5;
+      for (let k = 0; k <= N; k++) {{
+        const u = k / N;
+        const lam = lMin + u * Math.max(0.05, lMax - lMin);
+        stops.push(`${{wavelengthToColor(lam, 1.0)}} ${{(u * 100).toFixed(1)}}%`);
+      }}
+      const crossLam = lMin + c * Math.max(0.05, lMax - lMin);
+      label = `λ ~ ${{crossLam.toFixed(2)}} Å`;
+    }}
+    state.colorCrossover = prevC;
+    return {{
+      gradient: `linear-gradient(90deg, ${{stops.join(", ")}})`,
+      label,
+    }};
+  }}
+
+  function updateColorscaleSliderGradient() {{
+    const spec = buildColorscaleGradientSpec(state.wulffColorMode || "wavelength", getColorCrossover());
+    if (slColorEmphasis) {{
+      slColorEmphasis.style.setProperty("--cs-gradient", spec.gradient);
+    }}
+    const lbl = document.getElementById("lbl-color-emphasis");
+    if (lbl) {{
+      lbl.textContent = spec.label;
+    }}
   }}
 
   function syncWulffUI() {{
@@ -9441,6 +9551,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         : "1-FRAME";
       titleEl.textContent = `WULFF NET · ${{scopeLbl}}`;
     }}
+    updateColorscaleSliderGradient();
     updateMergeScoreboard();
   }}
 
@@ -9663,7 +9774,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       .map(z => z.label)
       .join(", ") || "None";
     const elVal = typeof p.det_el === "number" ? p.det_el : 0.0;
-    const snrStr = p.sigma && p.sigma > 0 ? ` (I/σ=${{(p.intensity / p.sigma).toFixed(1)}})` : "";
+    const hasMeasInten = typeof p.intensity === "number" && Number.isFinite(p.intensity);
+    const snrStr = hasMeasInten && typeof p.sigma === "number" && p.sigma > 0
+      ? ` (I/σ=${{(p.intensity / p.sigma).toFixed(1)}})`
+      : "";
+    const intenStr = hasMeasInten ? ` • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}` : "";
     let shapeStr = "";
     if (typeof p.sigma_major_px === "number" && typeof p.sigma_minor_px === "number") {{
       if (p.shape_kind === "ellipse") {{
@@ -9695,7 +9810,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const harmMult = p.harmonic_multiplicity || 1;
     setStatusLine(
       `[BANK #${{p.bank || 1}} • RUN #${{(p.run_index || 0) + 1}}]`,
-      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}${{mtzStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
+      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong>${{intenStr}}${{mtzStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
     );
   }}
 
@@ -10796,7 +10911,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.peakSource,
       state.wulffScope,
       state.wulffColorMode,
-      (state.colorEmphasis || 0).toFixed(3),
+      getColorCrossover().toFixed(3),
       state.dMin,
       state.lamMin,
       state.lamMax,
@@ -11122,14 +11237,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
         const r = isHovered ? baseR + 1.8 : (isOrbitMate ? baseR + 1.2 : baseR);
         const isUncertain = !isHovered && !isOrbitMate && isPeakUncertainForScope(p);
+        const isIsigiMode = state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi";
         const strokeAlpha = isUncertain
           ? (captured ? 0.20 : 0.09)
-          : (captured ? 0.95 : 0.42);
+          : (captured ? (isIsigiMode ? 1.0 : 0.95) : (isIsigiMode ? 0.55 : 0.42));
 
         const ellPtsRaw = isIntegShape ? (isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse) : null;
-        ctx.strokeStyle = isHovered
+        const strokeCol = isHovered
           ? "#f43f85"
           : (isOrbitMate ? "#fbbf24" : peakStrokeColor(p, strokeAlpha));
+        if (!isHovered && !isOrbitMate && strokeCol.endsWith(", 0.000)")) {{
+          continue;
+        }}
+        ctx.strokeStyle = strokeCol;
         ctx.lineWidth = isHovered
           ? 2.4
           : (isOrbitMate ? 2.1 : (isUncertain ? (captured ? 1.0 : 0.7) : (captured ? 1.85 : 1.05)));
@@ -11455,7 +11575,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.wulffExpanded ? 1 : 0,
       state.wulffScope,
       state.wulffColorMode,
-      (state.colorEmphasis || 0).toFixed(3),
+      getColorCrossover().toFixed(3),
       state.showWulffFriedel ? 1 : 0,
       state.peakSource,
       state.peakColorMode,
@@ -11661,12 +11781,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
       const baseDot = (isExp ? (captured ? 3.8 : 2.6) : (captured ? 2.5 : 1.75)) * dotScale;
       const rDot = isHovered ? baseDot + (isFriedelGhost ? 2.2 : 2.8) : (isOrbitMate ? baseDot + 1.5 : baseDot);
+      const isIsigiModeW = state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi";
       const alphaBase = isFriedelGhost
-        ? (hemi >= 0 ? (captured ? 0.72 : 0.40) : (captured ? 0.34 : 0.18))
-        : (hemi >= 0 ? (captured ? 0.94 : 0.52) : (captured ? 0.55 : 0.28));
+        ? (hemi >= 0 ? (captured ? 0.78 : 0.42) : (captured ? 0.38 : 0.20))
+        : (hemi >= 0 ? (captured ? (isIsigiModeW ? 1.0 : 0.94) : 0.52) : (captured ? 0.58 : 0.28));
       const col = isHovered
         ? (isFriedelGhost ? "#e879f9" : "#f43f85")
         : peakStrokeColor(p, alphaBase);
+      if (!isHovered && !isOrbitMate && col.endsWith(", 0.000)")) {{
+        continue;
+      }}
 
       if (isFriedelGhost) {{
         // Antipodal Friedel mate (-h,-k,-l) at -g: diamond marker ◇ populating the q_z > 0 hemisphere
@@ -12111,27 +12235,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     document.getElementById("lbl-det-alpha").textContent = Math.round(state.detAlpha * 100) + "%";
   }});
 
-  function formatColorEmphasisLabel(emp) {{
-    const v = Number(emp) || 0.0;
-    if (Math.abs(v) < 0.03) return "Balanced";
-    if (v >= 0.85) return "Strong Only";
-    if (v <= -0.85) return "All Peaks";
-    if (v > 0) return `Strong +${{Math.round(v * 100)}}%`;
-    return `All +${{Math.round(-v * 100)}}%`;
-  }}
-
   if (slColorEmphasis) {{
     slColorEmphasis.addEventListener("input", () => {{
-      state.colorEmphasis = parseFloat(slColorEmphasis.value) || 0.0;
-      const lbl = document.getElementById("lbl-color-emphasis");
-      if (lbl) lbl.textContent = formatColorEmphasisLabel(state.colorEmphasis);
+      const v = parseFloat(slColorEmphasis.value);
+      state.colorCrossover = Number.isFinite(v) ? Math.max(0.05, Math.min(0.95, v)) : DEFAULT_COLOR_CROSSOVER;
+      updateColorscaleSliderGradient();
     }});
     slColorEmphasis.addEventListener("dblclick", () => {{
-      slColorEmphasis.value = "0.00";
-      state.colorEmphasis = 0.0;
-      const lbl = document.getElementById("lbl-color-emphasis");
-      if (lbl) lbl.textContent = "Balanced";
+      slColorEmphasis.value = DEFAULT_COLOR_CROSSOVER.toFixed(2);
+      state.colorCrossover = DEFAULT_COLOR_CROSSOVER;
+      updateColorscaleSliderGradient();
     }});
+    updateColorscaleSliderGradient();
   }}
 
   if (slDmin) {{
@@ -12744,7 +12859,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ? state.peakSource
       : (newPayload.default_peak_source || state.peakSource);
     applyPeakSource(preferredSrc, false);
-    if (!isFrameSwitch && newPayload.default_color_mode === "mtz_isigi" && hasMtzIsigi()) {{
+    if (!isFrameSwitch && hasMtzIsigi() && (newPayload.mtz_fresh_overlay || state.wulffColorMode === "mtz_isigi" || newPayload.default_color_mode === "mtz_isigi")) {{
       state.wulffColorMode = "mtz_isigi";
     }}
     ZONES.length = 0;
@@ -12833,7 +12948,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       artBadge = "RAW DETECTOR COUNTS";
     }}
     if (newPayload.mtz_overlay_name) {{
-      artBadge = `MTZ • ${{newPayload.mtz_overlay_name}}`;
+      artBadge = newPayload.mtz_fresh_overlay
+        ? `MTZ • ${{newPayload.mtz_overlay_name}}`
+        : `${{artBadge}} • MTZ: ${{newPayload.mtz_overlay_name}}`;
     }}
     if (subEl) {{
       subEl.textContent = `${{DATA.instrument || "CG4D"}} • ${{DATA.space_group || "P 1"}} • ${{artBadge}}`;
@@ -12908,7 +13025,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (isFrameSwitch) {{
       return;
     }}
-    if (newPayload.mtz_overlay_name) {{
+    if (newPayload.mtz_overlay_name && newPayload.mtz_fresh_overlay !== false) {{
       const escTxt = s => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
       const warnHtml = newPayload.mtz_overlay_warning
         ? ` • <span style="color:var(--accent-gold);">⚠ ${{escTxt(newPayload.mtz_overlay_warning)}}</span>`
@@ -13354,9 +13471,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
           for (let i = 0; i < prArr.length; i++) {{
             if (runArr && runArr[i] !== 0) continue;
-            const inten = intArr ? intArr[i] : 120.0;
-            const sig = sigArr ? sigArr[i] : 3.0;
-            if (intArr && sigArr && (sig <= 0 || inten / Math.max(sig, 1e-9) < 2.5)) continue;
+            const inten = intArr ? intArr[i] : null;
+            const sig = sigArr && sigArr[i] > 0 ? sigArr[i] : null;
+            if (intArr && sigArr && (!sig || inten / Math.max(sig, 1e-9) < 2.5)) continue;
             const bid = bkArr[i];
             const det = detMap.get(bid);
             if (!det) continue;
@@ -13445,7 +13562,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             candPeaks.push({{
               bank: bid, row: Number(rPix.toFixed(1)), col: Number(cPix.toFixed(1)),
               det_x: az, det_y: dy, det_el: el, q_hat: gCryst, q_hat_lab: qLab,
-              stereographic: [sx, sy], hemisphere: hemi, intensity: 150.0, sigma: 3.0,
+              stereographic: [sx, sy], hemisphere: hemi, intensity: null, sigma: null,
               wavelength: lam, d_spacing: dVal, harmonic_order: Math.max(1, gcd3(h, k, l)),
               parallax_depth: Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * dVal))),
               hkl: [h, k, l], zone_ids: [], indexed: true, angular_error_deg: 0.02,
@@ -13531,7 +13648,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         candPeaks.push({{
           bank: gh.bid, row: Number(gh.rPix.toFixed(1)), col: Number(gh.cPix.toFixed(1)),
           det_x: az, det_y: dy, det_el: el, q_hat: gCryst, q_hat_lab: qLab,
-          stereographic: [sx, sy], hemisphere: hemi, intensity: gh.inten, sigma: 3.0,
+          stereographic: [sx, sy], hemisphere: hemi, intensity: null, sigma: null,
           wavelength: gh.lam, d_spacing: dVal, harmonic_order: Math.max(1, gcd3(gh.h, gh.k, gh.l)),
           parallax_depth: Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * dVal))),
           hkl: [gh.h, gh.k, gh.l], zone_ids: [], indexed: true, angular_error_deg: 0.02,
@@ -16396,8 +16513,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                     : (typeof state.selectedFrameIndex === "number"
                       ? state.selectedFrameIndex
                       : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0));
-                  const dminParam = (stageId !== "reduce" && Number.isFinite(targetDmin) && targetDmin > 0)
-                    ? `&preserve_params=1&d_min=${{encodeURIComponent(targetDmin)}}`
+                  const dminParam = stageId !== "reduce"
+                    ? `&preserve_params=1${{Number.isFinite(targetDmin) && targetDmin > 0 ? `&d_min=${{encodeURIComponent(targetDmin)}}` : ""}}`
                     : "";
                   const payloadUrl = (!aj.updated_payload_ready && aj.output_h5_path)
                     ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}${{dminParam}}${{getRenderBinningQuery()}}`

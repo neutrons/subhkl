@@ -3035,10 +3035,63 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     assert doc_f1["mtz_overlay_name"] == "custom_reflections.mtz"
     assert any(p.get("mtz_isigi") is not None for p in doc_f1["predicted_peaks"])
 
+    # 3b. Verify post-indexing (finder-less solve.h5 before integration) has NO bogus I/σ values,
+    #     AND loading .mtz after indexing persists automatically across subsequent Integration!
+    solve_only_h5 = tmp_path / "solve_indexed_only.h5"
+    with h5py.File(solve_only_h5, "w") as sf, h5py.File(integ_h5, "r") as src_f:
+        sf.attrs["instrument"] = "CG4D"
+        src_f.copy("sample", sf)
+        src_f.copy("goniometer", sf)
+        src_f.copy("instrument", sf)
+        src_f.copy("file_offsets", sf)
+        src_f.copy("bank_ids", sf)
+
+    req_solve = make_mocked_request(
+        "GET",
+        f"/api/payload?file_path={solve_only_h5}",
+        app=aio_app,
+    )
+    resp_solve = asyncio.run(aio_app._handle(req_solve))
+    assert resp_solve.status == 200
+    doc_solve = json.loads(resp_solve.body.decode("utf-8"))
+    assert len(doc_solve["predicted_peaks"]) > 0
+    assert all(p.get("sigma") is None for p in doc_solve["predicted_peaks"])
+    assert all(p.get("intensity") is None for p in doc_solve["predicted_peaks"])
+
+    # Load .mtz right after indexing, then transition to integrated.h5 (Integration completed)
+    resp_mtz_after_idx = asyncio.run(
+        aio_app._handle(
+            make_mocked_request(
+                "GET", f"/api/payload?file_path={mtz_path}", app=aio_app
+            )
+        )
+    )
+    assert resp_mtz_after_idx.status == 200
+    resp_integ_after_mtz = asyncio.run(
+        aio_app._handle(
+            make_mocked_request(
+                "GET",
+                f"/api/payload?file_path={integ_h5}&preserve_params=1",
+                app=aio_app,
+            )
+        )
+    )
+    assert resp_integ_after_mtz.status == 200
+    doc_integ_after_mtz = json.loads(resp_integ_after_mtz.body.decode("utf-8"))
+    assert doc_integ_after_mtz["artifact_kind"] == "integrator"
+    assert doc_integ_after_mtz["mtz_overlay_name"] == "custom_reflections.mtz"
+    assert doc_integ_after_mtz["mtz_fresh_overlay"] is False
+    assert any(
+        p.get("mtz_isigi") is not None for p in doc_integ_after_mtz["integrated_peaks"]
+    )
+    assert any(
+        p.get("mtz_isigi") is not None for p in doc_integ_after_mtz["predicted_peaks"]
+    )
+
     # 4. Execute rendered HTML/JS helpers in Node.js to verify:
     #    - Exact θ (k_f - k_i) vs 2θ (k_f) Wulff azimuth alignment & right-handed SO(3) camera.
-    #    - Nonnegative logarithmic slate-gray -> white -> gold -> electric-lime isigiToColor colormap
-    #      modulated by state.colorEmphasis (#slider-color-emphasis), plus modifier/button-gated parallax.
+    #    - Transparent (alpha=0) -> Solar Gold crossover (alpha=0.5) -> Opaque Electric-Lime (alpha=1)
+    #      isigiToColor scale + Photoshop-checkerboard live gradient crossover slider (#slider-color-emphasis).
     #    - Two-source peak toggle ('predicted' | 'integrated') with .mtz I/σ data-column coloring.
     html_doc = render_rainbow_html(payload_mtz)
     assert 'accept=".h5,.hdf5,.nxs,.mtz"' in html_doc
@@ -3048,6 +3101,8 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     assert "Color: I/σ (Log)" in html_doc
     assert "Color: .mtz I/σ (Log)" in html_doc
     assert 'id="slider-color-emphasis"' in html_doc
+    assert "repeating-conic-gradient" in html_doc  # Photoshop transparency checkerboard
+    assert "--cs-gradient" in html_doc
     assert "_lastDetRenderSig" in html_doc
     assert "#e879f9" in html_doc  # distinct violet Friedel symmetry link color
     assert 'const isIntegShape = state.peakSource === "integrated";' in html_doc
@@ -3061,14 +3116,19 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
 
     fn_names = [
         "extractPeakBucketsFromPayload",
-        "applyEmphasisCurve",
+        "getColorCrossover",
+        "applyCrossoverCurve",
+        "wavelengthToColor",
         "getPeakDataAvailability",
         "peakUnscaledIsigi",
         "peakMtzIsigi",
         "hasIntegratedIsigi",
         "hasMtzIsigi",
         "isigiToColor",
+        "hexToRgba",
+        "peakEmphasisAlphaForCategorical",
         "peakStrokeColor",
+        "buildColorscaleGradientSpec",
         "isParallaxTriggerActive",
         "detToScreen",
         "getCenteredDetectorAzimuthDeg",
@@ -3087,6 +3147,8 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
 
     js_harness = f"""
 const DATA = {json.dumps(payload_mtz)};
+const DEFAULT_COLOR_CROSSOVER = 0.38;
+const ORBIT_PALETTE = ["#ff38b4", "#00e5ff", "#fbbf24", "#10b981"];
 let _peakDataAvailabilitySig = "";
 let _peakDataAvailability = {{
   hasIsigi: false,
@@ -3120,13 +3182,15 @@ const state = {{
   wulffScope: "all_runs",
   showWulffFriedel: true,
   wulffColorMode: DATA.default_color_mode || "mtz_isigi",
-  colorEmphasis: 0.0,
+  colorCrossover: 0.38,
+  lamMin: 2.8,
+  lamMax: 4.5,
   wulffYawDeg: 0.0,
   wulffPitchDeg: 0.0,
   wulffZoom: 1.0,
   parallaxX: 0.0,
   parallaxY: 0.0,
-  parallaxStrength: 0.65,
+  parallaxStrength: 1.0,
   detZoom: 1.0,
   detPanX: 0.0,
   detPanY: 0.0,
@@ -3150,9 +3214,9 @@ function mat3Vec(M, v) {{
 }}
 function hasMergedCarelessData() {{ return false; }}
 function isPeakVisible(p) {{ return state.wulffColorMode !== "mtz_isigi" || Number.isFinite(peakMtzIsigi(p)); }}
-function wavelengthToRainbow() {{ return "rgba(100,200,255,1)"; }}
 function zoneColor() {{ return "rgba(255,100,100,1)"; }}
 function residualToColor() {{ return "rgba(255,255,255,1)"; }}
+function scaleToColor() {{ return "hsla(120.0, 92%, 58%, 1.000)"; }}
 function syncColorModeSelectors() {{}}
 function syncWulffUI() {{}}
 function renderZoneList() {{}}
@@ -3208,21 +3272,25 @@ syncWulffYawFromDetector();
 const gNeg10 = gForChiElDeg(-10.0, 0.0);
 const friedelNeg10AtPos10 = projectToWulff([-gNeg10[0], -gNeg10[1], -gNeg10[2]], 100, 100, 80);
 
-// Nonnegative logarithmic I/SIGI colors:
-//   0 / negative -> muted slate gray, ~3σ -> neutral silver-white, ~15σ -> bright gold, 120σ -> electric lime
-state.colorEmphasis = 0.0;
-const colZero = isigiToColor(-2.0, 1.0, 40.0);
+// Transparent (alpha=0) -> Solar Gold crossover (t=0.5, alpha=0.5) -> Fully Opaque Electric Lime (alpha=1)
+state.colorCrossover = 0.38;
+const exactCrossSnr = Math.pow(1.0 + 40.0, 0.38) - 1.0;
+const colNeg = isigiToColor(-2.0, 1.0, 40.0);
+const colZero = isigiToColor(0.0, 1.0, 40.0);
 const colWeak = isigiToColor(0.4, 1.0, 40.0);
-const colMid = isigiToColor(3.5, 1.0, 40.0);
+const colCrossover = isigiToColor(exactCrossSnr, 1.0, 40.0);
 const colGold = isigiToColor(14.0, 1.0, 40.0);
 const colLime = isigiToColor(150.0, 1.0, 40.0);
 
-// Colorscale emphasis slider: +1.0 ("Strong Only") suppresses moderate 4σ peaks; -1.0 ("All Peaks") boosts them
-state.colorEmphasis = 1.0;
-const colMidStrongOnly = isigiToColor(4.0, 1.0, 40.0);
-state.colorEmphasis = -1.0;
-const colMidAllPeaks = isigiToColor(4.0, 1.0, 40.0);
-state.colorEmphasis = 0.0;
+// Crossover knob: moving right (0.84) makes moderate 4σ peaks nearly transparent; moving left (0.12) makes them opaque
+state.colorCrossover = 0.84;
+const colMidRightKnob = isigiToColor(4.0, 1.0, 40.0);
+state.colorCrossover = 0.12;
+const colMidLeftKnob = isigiToColor(4.0, 1.0, 40.0);
+state.colorCrossover = 0.38;
+
+const gradIsigi = buildColorscaleGradientSpec("isigi", 0.38);
+const gradWl = buildColorscaleGradientSpec("wavelength", 0.50);
 
 // Parallax trigger gating: off on plain hover, active when mouse button or keyboard modifier held
 const parIdle = isParallaxTriggerActive({{ buttons: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }});
@@ -3230,6 +3298,7 @@ const parMouseBtn = isParallaxTriggerActive({{ buttons: 1, ctrlKey: false, metaK
 const parCtrl = isParallaxTriggerActive({{ buttons: 0, ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }});
 
 // Peak source toggle ('predicted' <-> 'integrated') with .mtz I/σ column coloring
+// Also verify predicted peaks have NO integrated I/σ (hasIntegratedIsigi() === false in 'predicted' mode when unintegrated)
 applyPeakSource("predicted", false);
 const nPredFrame = PEAKS.length;
 const nPredWulff = getActiveWulffPeaks().length;
@@ -3245,8 +3314,9 @@ const integShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?
 console.log(JSON.stringify({{
   chiChecks,
   friedelNeg10AtPos10,
-  colZero, colWeak, colMid, colGold, colLime,
-  colMidStrongOnly, colMidAllPeaks,
+  colNeg, colZero, colWeak, colCrossover, colGold, colLime,
+  colMidRightKnob, colMidLeftKnob,
+  gradIsigi, gradWl,
   parIdle, parMouseBtn, parCtrl,
   hasMtzCol, mtzColStroke,
   nPredFrame, nPredWulff, predShape,
@@ -3296,27 +3366,29 @@ console.log(JSON.stringify({{
                 float(m_rgba.group(4)),
             )
 
-        rz, gz, bz, _ = _parse_rgba(js_out["colZero"])
-        rw, gw, _bw, _ = _parse_rgba(js_out["colWeak"])
-        rm, gm, bm, _ = _parse_rgba(js_out["colMid"])
-        rg, gg, bg, _ = _parse_rgba(js_out["colGold"])
-        rl, gl, bl, _ = _parse_rgba(js_out["colLime"])
-        r_strong_only, g_strong_only, _, a_strong_only = _parse_rgba(
-            js_out["colMidStrongOnly"]
-        )
-        r_all_peaks, g_all_peaks, _, a_all_peaks = _parse_rgba(js_out["colMidAllPeaks"])
+        _rn, _gn, _bn, an = _parse_rgba(js_out["colNeg"])
+        _rz, _gz, _bz, az = _parse_rgba(js_out["colZero"])
+        _rw, _gw, _bw, aw = _parse_rgba(js_out["colWeak"])
+        rc, gc, bc, ac = _parse_rgba(js_out["colCrossover"])
+        rg, gg, bg, ag = _parse_rgba(js_out["colGold"])
+        rl, gl, bl, al = _parse_rgba(js_out["colLime"])
+        _, _, _, a_right_knob = _parse_rgba(js_out["colMidRightKnob"])
+        _, _, _, a_left_knob = _parse_rgba(js_out["colMidLeftKnob"])
 
-        # Nonnegative clamped log scale: negative/zero -> muted slate gray (148, 163, 184), never saturated blue!
-        assert (rz, gz, bz) == (148, 163, 184)
-        assert rw < rm and gw < gm
-        # Moderate SNR -> crisp neutral silver-white
-        assert rm > 205 and gm > 210 and bm > 190
-        # High SNR -> warm gold, brightest SNR -> electric lime standing out above detector pixels
-        assert rg > 225 and gg > 190 and bg < 110
-        assert gl >= 235 and gl > rl and bl < 80
-        # Emphasis slider shifts mid-SNR contrast & opacity between "Strong Only" (+1) and "All Peaks" (-1)
-        assert (r_all_peaks + g_all_peaks) > (r_strong_only + g_strong_only) + 100
-        assert a_strong_only < 0.40 and a_all_peaks >= 0.99
+        # Transparent (alpha=0) -> Solar Gold at exact knob crossover (alpha=0.5) -> Opaque Electric Lime (alpha=1)
+        assert an == 0.0 and az == 0.0
+        assert 0.0 < aw < ac < ag < al
+        assert (rc, gc, bc) == (250, 204, 21) and abs(ac - 0.5) < 0.005
+        assert rg > 185 and gg > 205 and bg < 60
+        assert (rl, gl, bl) == (163, 242, 44) and al == 1.0
+        # Moving crossover knob right isolates strong peaks; moving left reveals weaker peaks
+        assert a_right_knob < 0.12 and a_left_knob > 0.72
+        # Live gradient CSS stops + physical crossover readouts
+        assert js_out["gradIsigi"]["gradient"].startswith("linear-gradient(90deg,")
+        assert "0.000) 0.0%" in js_out["gradIsigi"]["gradient"]
+        assert "1.000) 100.0%" in js_out["gradIsigi"]["gradient"]
+        assert js_out["gradIsigi"]["label"].startswith("I/σ ~")
+        assert js_out["gradWl"]["label"].startswith("λ ~")
 
         # Parallax gated strictly on held mouse button or keyboard modifier
         assert js_out["parIdle"] is False
@@ -3797,6 +3869,7 @@ def test_wulff_zoom_dspacing_lod_and_dirty_skip(tmp_path):
     inline_js = script_blocks[-1]
 
     fn_names = [
+        "getColorCrossover",
         "isSameReflection",
         "isPeakHighlightedTarget",
         "isPeakVisible",
@@ -3836,6 +3909,7 @@ let ZONES = [];
 let DATA = {{ d_min: 1.4, wavelength_range: [1.8, 4.5], frame_index: 2 }};
 const IS_SOLVED = true;
 const WULFF_MIN_ISIGI = 2.5;
+const DEFAULT_COLOR_CROSSOVER = 0.38;
 globalThis.window = {{ devicePixelRatio: 1 }};
 
 const _wulffPoolCache = {{
@@ -3933,6 +4007,7 @@ const state = {{
   peakColorMode: "wavelength",
   wulffScope: "all_runs",
   wulffColorMode: "wavelength",
+  colorCrossover: 0.38,
   wulffExpanded: false,
   showWulffFriedel: false,
   wulffYawDeg: 0.0,

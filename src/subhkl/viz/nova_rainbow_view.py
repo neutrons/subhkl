@@ -6824,6 +6824,7 @@ class RainbowZonesViewModel:
                     self.payload,
                     self.mtz_overlay_path,
                     self.mtz_overlay_info,
+                    select_mtz_color=False,
                 )
         return self.payload
 
@@ -7010,10 +7011,14 @@ def serve_rainbow_zones(
                 with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                     fp = fp_raw
                     if os.path.isfile(fp):
-                        vm.mtz_overlay_path = None
-                        vm.mtz_overlay_info = None
                         fp_low = os.path.basename(fp).lower()
-                        if any(k in fp_low for k in ("merged", "scan", "image")):
+                        is_reduce_file = (
+                            any(k in fp_low for k in ("merged", "scan", "image"))
+                            and "careless" not in fp_low
+                        )
+                        if is_reduce_file:
+                            vm.mtz_overlay_path = None
+                            vm.mtz_overlay_info = None
                             _, fp = vm.pipeline_runner._resolve_work_dir_and_merged(fp)
                             vm.payload_kwargs["images_h5"] = fp
                             vm.payload_kwargs.pop("d_min", None)
@@ -7086,9 +7091,9 @@ def serve_rainbow_zones(
                         self.end_headers()
                         self.wfile.write(body)
                         return
-                    vm.mtz_overlay_path = None
-                    vm.mtz_overlay_info = None
                     if ingest_kind == "raw_nexus":
+                        vm.mtz_overlay_path = None
+                        vm.mtz_overlay_info = None
                         raw_body = json.dumps(
                             {
                                 "status": "raw_nexus",
@@ -7108,7 +7113,12 @@ def serve_rainbow_zones(
                     ds_name = str(
                         ds_info.get("name") or os.path.basename(local_h5)
                     ).lower()
-                    if any(k in ds_name for k in ("merged", "scan", "image")):
+                    if (
+                        any(k in ds_name for k in ("merged", "scan", "image"))
+                        and "careless" not in ds_name
+                    ):
+                        vm.mtz_overlay_path = None
+                        vm.mtz_overlay_info = None
                         _, local_h5 = vm.pipeline_runner._resolve_work_dir_and_merged(
                             local_h5
                         )
@@ -7476,12 +7486,14 @@ def serve_rainbow_zones(
 
                     def _on_complete(new_h5_path: str) -> None:
                         with vm_lock:
-                            vm.mtz_overlay_path = None
-                            vm.mtz_overlay_info = None
-                            if (
-                                stage_id == "reduce"
-                                or "merged" in os.path.basename(new_h5_path).lower()
-                            ):
+                            new_base_low = os.path.basename(new_h5_path).lower()
+                            is_reduce_out = stage_id == "reduce" or (
+                                "merged" in new_base_low
+                                and "careless" not in new_base_low
+                            )
+                            if is_reduce_out:
+                                vm.mtz_overlay_path = None
+                                vm.mtz_overlay_info = None
                                 vm.payload_kwargs["images_h5"] = new_h5_path
                                 vm.payload_kwargs["frame_index"] = 0
                                 vm.payload_kwargs.pop("wavelength_range", None)

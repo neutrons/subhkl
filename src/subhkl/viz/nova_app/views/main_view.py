@@ -202,12 +202,14 @@ class MainApp:
                     try:
                         local_h5 = local_fp_raw
                         if os.path.isfile(local_h5):
-                            self.view_model.model.subhkl.mtz_overlay_path = None
-                            self.view_model.model.subhkl.mtz_overlay_info = None
                             ds_name = os.path.basename(local_h5).lower()
-                            is_reduce_file = any(
-                                k in ds_name for k in ("merged", "scan", "image")
+                            is_reduce_file = (
+                                any(k in ds_name for k in ("merged", "scan", "image"))
+                                and "careless" not in ds_name
                             )
+                            if is_reduce_file:
+                                self.view_model.model.subhkl.mtz_overlay_path = None
+                                self.view_model.model.subhkl.mtz_overlay_info = None
                             if is_reduce_file:
                                 _, local_h5 = (
                                     self.pipeline_runner._resolve_work_dir_and_merged(
@@ -299,9 +301,9 @@ class MainApp:
                             sub_model.mtz_overlay_path = local_h5
                             sub_model.mtz_overlay_info = ds_info
                             return (sub_model.payload, 200)
-                        self.view_model.model.subhkl.mtz_overlay_path = None
-                        self.view_model.model.subhkl.mtz_overlay_info = None
                         if ingest_kind == "raw_nexus":
+                            self.view_model.model.subhkl.mtz_overlay_path = None
+                            self.view_model.model.subhkl.mtz_overlay_info = None
                             return (
                                 {
                                     "status": "raw_nexus",
@@ -314,7 +316,12 @@ class MainApp:
                         ds_name = str(
                             ds_info.get("name") or os.path.basename(local_h5)
                         ).lower()
-                        if any(k in ds_name for k in ("merged", "scan", "image")):
+                        if (
+                            any(k in ds_name for k in ("merged", "scan", "image"))
+                            and "careless" not in ds_name
+                        ):
+                            self.view_model.model.subhkl.mtz_overlay_path = None
+                            self.view_model.model.subhkl.mtz_overlay_info = None
                             _, local_h5 = (
                                 self.pipeline_runner._resolve_work_dir_and_merged(
                                     local_h5
@@ -490,8 +497,13 @@ class MainApp:
                 from subhkl.viz.nova_app.models.subhkl_model import InstrumentOptions
 
                 with payload_lock:
-                    self.view_model.model.subhkl.mtz_overlay_path = None
-                    self.view_model.model.subhkl.mtz_overlay_info = None
+                    new_base_low = os.path.basename(new_h5_path).lower()
+                    is_reduce_out = stage_id == "reduce" or (
+                        "merged" in new_base_low and "careless" not in new_base_low
+                    )
+                    if is_reduce_out:
+                        self.view_model.model.subhkl.mtz_overlay_path = None
+                        self.view_model.model.subhkl.mtz_overlay_info = None
 
                     with contextlib.suppress(
                         ValueError, TypeError, KeyError, AttributeError
@@ -515,10 +527,6 @@ class MainApp:
                             data.wavelength_max = float(params["wavelength_max"])
                         if "d_min" in params:
                             data.d_min = float(params["d_min"])
-                    is_reduce_out = (
-                        stage_id == "reduce"
-                        or "merged" in os.path.basename(new_h5_path).lower()
-                    )
                     if is_reduce_out:
                         self.view_model.model.subhkl.frame_index = 0
                         self.pipeline_runner.current_frame_index = 0
