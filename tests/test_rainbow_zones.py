@@ -3292,10 +3292,21 @@ state.colorCrossover = 0.38;
 const gradIsigi = buildColorscaleGradientSpec("isigi", 0.38);
 const gradWl = buildColorscaleGradientSpec("wavelength", 0.50);
 
-// Parallax trigger gating: off on plain hover, active when mouse button or keyboard modifier held
+// Parallax trigger gating: off on plain hover AND off on mouse-button pan/drag;
+// active ONLY when holding a keyboard modifier key (Ctrl / Meta / Alt / Shift) without mouse buttons
 const parIdle = isParallaxTriggerActive({{ buttons: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }});
 const parMouseBtn = isParallaxTriggerActive({{ buttons: 1, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }});
+const parMouseBtnWithCtrl = isParallaxTriggerActive({{ buttons: 1, ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }});
 const parCtrl = isParallaxTriggerActive({{ buttons: 0, ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }});
+const parShift = isParallaxTriggerActive({{ buttons: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: true }});
+state.parallaxX = 1.0;
+state.parallaxY = 1.0;
+const [fgParX, fgParY] = detToScreen(0.0, 0.0, 900, 520, 0.45);
+const [bgParX, bgParY] = detToScreen(0.0, 0.0, 900, 520, -0.35);
+const parRelSpanX = fgParX - bgParX;
+const parRelSpanY = fgParY - bgParY;
+state.parallaxX = 0.0;
+state.parallaxY = 0.0;
 
 // Peak source toggle ('predicted' <-> 'integrated') switches BOTH shape (circle <-> ellipse)
 // AND intensity-related highlight colorscale (Electric Cyan for Pred <-> Gold-to-Lime for Integ)
@@ -3325,7 +3336,7 @@ console.log(JSON.stringify({{
   colPredCross, colPredTop, scalePredTop, scaleIntegTop, gradIsigiPred,
   colMidRightKnob, colMidLeftKnob,
   gradIsigi, gradWl,
-  parIdle, parMouseBtn, parCtrl,
+  parIdle, parMouseBtn, parMouseBtnWithCtrl, parCtrl, parShift, parRelSpanX, parRelSpanY,
   hasMtzCol, hasPredCrossLinkedIsigi,
   mtzColStroke: mtzColStrokePred, mtzColStrokeInteg,
   nPredFrame, nPredWulff, predShape,
@@ -3399,10 +3410,14 @@ console.log(JSON.stringify({{
         assert js_out["gradIsigi"]["label"].startswith("I/σ ~")
         assert js_out["gradWl"]["label"].startswith("λ ~")
 
-        # Parallax gated strictly on held mouse button or keyboard modifier
+        # Parallax gated strictly on keyboard modifier (never mouse button / drag) with softer rubber-band span
         assert js_out["parIdle"] is False
-        assert js_out["parMouseBtn"] is True
+        assert js_out["parMouseBtn"] is False
+        assert js_out["parMouseBtnWithCtrl"] is False
         assert js_out["parCtrl"] is True
+        assert js_out["parShift"] is True
+        assert abs(js_out["parRelSpanX"] - 43.2) < 1e-6
+        assert abs(js_out["parRelSpanY"] - 30.4) < 1e-6
 
         assert js_out["hasMtzCol"] is True
         assert js_out["hasPredCrossLinkedIsigi"] is True

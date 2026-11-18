@@ -7500,7 +7500,7 @@ def render_rainbow_html(
     <section class="canvas-card">
       <div class="card-header">
         <span id="detector-header-title">DETECTOR ASSEMBLY — LOG(INTENSITY) + PARALLAX BRAGG RINGS</span>
-        <span class="hint">Hold mouse button or Ctrl to peek behind rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
+        <span class="hint">Hold Ctrl / Shift / Alt to peek behind rings • Scroll to Zoom • Drag to Pan • Click spot to inspect</span>
       </div>
       <div class="canvas-wrap" id="canvas-wrap">
         <div class="detector-pane" id="detector-pane">
@@ -7518,7 +7518,7 @@ def render_rainbow_html(
             </div>
             <div class="legend-item">
               <span id="legend-peak-shape-icon" style="display:inline-block;width:10px;height:10px;border:2px solid #00e5ff;border-radius:50%;"></span>
-              <span id="legend-peak-shape-label">Front Layer: Predicted Bragg Rings (hold Ctrl/button for parallax)</span>
+              <span id="legend-peak-shape-label">Front Layer: Predicted Bragg Rings (hold Ctrl/Shift for parallax)</span>
             </div>
           </div>
         </div>
@@ -10318,8 +10318,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const y0 = box.originY + (1.0 - v) * box.plotH;
     const cx = w * 0.5;
     const cy = h * 0.5;
-    const shiftX = state.parallaxX * state.parallaxStrength * layerOffset * 18.0;
-    const shiftY = state.parallaxY * state.parallaxStrength * layerOffset * 12.0;
+    const shiftX = state.parallaxX * state.parallaxStrength * layerOffset * 54.0;
+    const shiftY = state.parallaxY * state.parallaxStrength * layerOffset * 38.0;
     return [
       cx + (x0 - cx) * state.detZoom + state.detPanX + shiftX,
       cy + (y0 - cy) * state.detZoom + state.detPanY + shiftY,
@@ -10428,8 +10428,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     if (legLbl) {{
       legLbl.textContent = isIntegSrc
-        ? "Front Layer: Integrated 2σ Ellipses (hold Ctrl/button for parallax)"
-        : "Front Layer: Predicted Bragg Rings (hold Ctrl/button for parallax)";
+        ? "Front Layer: Integrated 2σ Ellipses (hold Ctrl/Shift for parallax)"
+        : "Front Layer: Predicted Bragg Rings (hold Ctrl/Shift for parallax)";
     }}
   }}
 
@@ -11070,7 +11070,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     // Rendered directly from native (u, v) detector coordinates into a device-pixel-aligned
     // viewport layer cache so rotated/high-latitude banks never quantize onto screen-parallel
     // intermediate grids and parallax hover blits in O(1).
-    const marginDev = Math.round(24 * dpr);
+    const marginDev = Math.round(Math.ceil(Math.max(28, 0.35 * 54.0 * (state.parallaxStrength || 1.0) + 8)) * dpr);
     const marginCss = marginDev / dpr;
     const layerW = targetW + 2 * marginDev;
     const layerH = targetH + 2 * marginDev;
@@ -11236,8 +11236,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     ctx.save();
-    const rawParallaxX = state.parallaxX * state.parallaxStrength * -0.35 * 18.0;
-    const rawParallaxY = state.parallaxY * state.parallaxStrength * -0.35 * 12.0;
+    const rawParallaxX = state.parallaxX * state.parallaxStrength * -0.35 * 54.0;
+    const rawParallaxY = state.parallaxY * state.parallaxStrength * -0.35 * 38.0;
     const snapParallaxX = Math.round(rawParallaxX * dpr) / dpr;
     const snapParallaxY = Math.round(rawParallaxY * dpr) / dpr;
     ctx.imageSmoothingEnabled = false;
@@ -11291,8 +11291,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const spanBoundsY = Math.max(1e-6, bounds.maxY - bounds.minY);
     const cxHalf = w * 0.5;
     const cyHalf = h * 0.5;
-    const fgShiftX = state.parallaxX * state.parallaxStrength * OVERLAY_PARALLAX_LAYER * 18.0;
-    const fgShiftY = state.parallaxY * state.parallaxStrength * OVERLAY_PARALLAX_LAYER * 12.0;
+    const fgShiftX = state.parallaxX * state.parallaxStrength * OVERLAY_PARALLAX_LAYER * 54.0;
+    const fgShiftY = state.parallaxY * state.parallaxStrength * OVERLAY_PARALLAX_LAYER * 38.0;
     const affScaleX = (plotBox.plotW / spanBoundsX) * state.detZoom;
     const affOffsetX = cxHalf + (plotBox.originX - bounds.minX * (plotBox.plotW / spanBoundsX) - cxHalf) * state.detZoom + state.detPanX + fgShiftX;
     const affScaleY = -(plotBox.plotH / spanBoundsY) * state.detZoom;
@@ -12144,32 +12144,38 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   // Mouse & Wheel interactions on Detector Canvas (with Google-Earth 360° periodic coupling)
   let isPanningDet = false;
   let panStart = [0, 0];
+  let lastPointerNorm = null;
 
+  // Parallax activates ONLY while holding a keyboard modifier key (never on mouse-button pan/drag)
   function isParallaxTriggerActive(ev) {{
-    return Boolean(
-      isPanningDet ||
-      isDraggingWulff ||
-      (ev && (ev.buttons !== 0 || ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey))
-    );
+    if (isPanningDet || isDraggingWulff || !ev || (ev.buttons && ev.buttons !== 0)) {{
+      return false;
+    }}
+    return Boolean(ev.ctrlKey || ev.metaKey || ev.altKey || ev.shiftKey);
   }}
 
   detCanvas.addEventListener("mousedown", (ev) => {{
     isPanningDet = true;
     panStart = [ev.clientX - state.detPanX, ev.clientY - state.detPanY];
-    const rect = detCanvas.getBoundingClientRect();
-    state.targetParallaxX = (((ev.clientX - rect.left) / Math.max(1, rect.width)) - 0.5) * 2.0;
-    state.targetParallaxY = (((ev.clientY - rect.top) / Math.max(1, rect.height)) - 0.5) * 2.0;
+    state.targetParallaxX = 0.0;
+    state.targetParallaxY = 0.0;
   }});
   window.addEventListener("mouseup", (ev) => {{
     isPanningDet = false;
     isDraggingWulff = false;
-    if (!ev || (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey)) {{
+    if (!isParallaxTriggerActive(ev)) {{
       state.targetParallaxX = 0.0;
       state.targetParallaxY = 0.0;
     }}
   }});
+  window.addEventListener("keydown", (ev) => {{
+    if (lastPointerNorm && isParallaxTriggerActive(ev)) {{
+      state.targetParallaxX = lastPointerNorm[0];
+      state.targetParallaxY = lastPointerNorm[1];
+    }}
+  }});
   window.addEventListener("keyup", (ev) => {{
-    if (!isPanningDet && !isDraggingWulff && (!ev || (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.shiftKey))) {{
+    if (!isParallaxTriggerActive(ev)) {{
       state.targetParallaxX = 0.0;
       state.targetParallaxY = 0.0;
     }}
@@ -12177,6 +12183,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   window.addEventListener("blur", () => {{
     isPanningDet = false;
     isDraggingWulff = false;
+    lastPointerNorm = null;
     state.targetParallaxX = 0.0;
     state.targetParallaxY = 0.0;
   }});
@@ -12185,9 +12192,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const rect = detCanvas.getBoundingClientRect();
     const mx = ev.clientX - rect.left;
     const my = ev.clientY - rect.top;
+    const nx = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
+    const ny = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+    lastPointerNorm = [nx, ny];
     if (isParallaxTriggerActive(ev)) {{
-      state.targetParallaxX = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
-      state.targetParallaxY = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+      state.targetParallaxX = nx;
+      state.targetParallaxY = ny;
     }} else {{
       state.targetParallaxX = 0.0;
       state.targetParallaxY = 0.0;
@@ -12220,6 +12230,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }});
 
   detCanvas.addEventListener("mouseleave", () => {{
+    lastPointerNorm = null;
     state.targetParallaxX = 0.0;
     state.targetParallaxY = 0.0;
     state.hoveredPeakId = null;
@@ -12259,14 +12270,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     stereoCanvas.addEventListener("mousedown", (ev) => {{
       isDraggingWulff = true;
       wulffDragStart = [ev.clientX, ev.clientY, state.wulffYawDeg, state.wulffPitchDeg];
+      state.targetParallaxX = 0.0;
+      state.targetParallaxY = 0.0;
     }});
     stereoCanvas.addEventListener("mousemove", (ev) => {{
       const rect = stereoCanvas.getBoundingClientRect();
       const mx = ev.clientX - rect.left;
       const my = ev.clientY - rect.top;
+      const nx = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
+      const ny = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+      lastPointerNorm = [nx, ny];
       if (isParallaxTriggerActive(ev)) {{
-        state.targetParallaxX = ((mx / Math.max(1, rect.width)) - 0.5) * 2.0;
-        state.targetParallaxY = ((my / Math.max(1, rect.height)) - 0.5) * 2.0;
+        state.targetParallaxX = nx;
+        state.targetParallaxY = ny;
       }} else {{
         state.targetParallaxX = 0.0;
         state.targetParallaxY = 0.0;
@@ -12291,6 +12307,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
     }});
     stereoCanvas.addEventListener("mouseleave", () => {{
+      lastPointerNorm = null;
       state.targetParallaxX = 0.0;
       state.targetParallaxY = 0.0;
       state.hoveredPeakId = null;
@@ -16853,8 +16870,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function animate() {{
     const dxP = state.targetParallaxX - state.parallaxX;
     const dyP = state.targetParallaxY - state.parallaxY;
-    state.parallaxX = Math.abs(dxP) < 1e-4 ? state.targetParallaxX : (state.parallaxX + dxP * 0.14);
-    state.parallaxY = Math.abs(dyP) < 1e-4 ? state.targetParallaxY : (state.parallaxY + dyP * 0.14);
+    state.parallaxX = Math.abs(dxP) < 1e-4 ? state.targetParallaxX : (state.parallaxX + dxP * 0.11);
+    state.parallaxY = Math.abs(dyP) < 1e-4 ? state.targetParallaxY : (state.parallaxY + dyP * 0.11);
     renderDetectorCanvas();
     renderStereoInset();
     if (activeRunningStageId() || (stopwatchFlash.demoUntilPerf && performance.now() < stopwatchFlash.demoUntilPerf)) {{
