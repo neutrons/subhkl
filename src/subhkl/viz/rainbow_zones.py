@@ -7349,10 +7349,16 @@ def render_rainbow_html(
     pointer-events: none;
   }}
 
-  .seg-toggle button[data-peak-src="mtz"].active-btn {{
-    background: rgba(251, 191, 36, 0.22);
-    color: var(--accent-gold);
-    text-shadow: 0 0 6px rgba(251, 191, 36, 0.35);
+  .seg-toggle button[data-peak-src="predicted"].active-btn {{
+    background: rgba(0, 229, 255, 0.18);
+    color: var(--accent-cyan);
+    text-shadow: 0 0 6px rgba(0, 229, 255, 0.35);
+  }}
+
+  .seg-toggle button[data-peak-src="integrated"].active-btn {{
+    background: rgba(163, 242, 44, 0.20);
+    color: #bef264;
+    text-shadow: 0 0 6px rgba(163, 242, 44, 0.38);
   }}
 
   /* Photoshop-checkerboard + live active-colorscale gradient slider with crossover knob */
@@ -7511,8 +7517,8 @@ def render_rainbow_html(
               <span>Mid Layer: Single-Arc Zone Conics [uvw]</span>
             </div>
             <div class="legend-item">
-              <span style="display:inline-block;width:10px;height:10px;border:2px solid #fbbf24;border-radius:50%;"></span>
-              <span>Front Layer: Predicted Bragg Rings (hold Ctrl/button for parallax)</span>
+              <span id="legend-peak-shape-icon" style="display:inline-block;width:10px;height:10px;border:2px solid #00e5ff;border-radius:50%;"></span>
+              <span id="legend-peak-shape-label">Front Layer: Predicted Bragg Rings (hold Ctrl/button for parallax)</span>
             </div>
           </div>
         </div>
@@ -7918,6 +7924,55 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const integSample = Array.isArray(pObj.integrated_sample_peaks)
       ? [...pObj.integrated_sample_peaks]
       : (isIntegPayload ? [...baseSample] : integPeaks);
+    // Once Integration has produced real intensities (integPeaks.length > 0), link measured
+    // I/σ and Careless scale/residual onto matching predicted (h,k,l) reflections so toggling
+    // ○ Pred <-> ⬭ Integ preserves intensity-related color modes with source-specific palettes
+    // (while keeping I/σ strictly absent right after indexing before integration runs).
+    if (integPeaks.length > 0 && predPeaks.length > 0) {{
+      const copyMeasFields = (dst, src) => {{
+        if (!dst || !src) return;
+        if (dst.intensity == null && typeof src.intensity === "number") dst.intensity = src.intensity;
+        if (dst.sigma == null && typeof src.sigma === "number") dst.sigma = src.sigma;
+        if (dst.merged_i == null && typeof src.merged_i === "number") dst.merged_i = src.merged_i;
+        if (dst.merged_sigi == null && typeof src.merged_sigi === "number") dst.merged_sigi = src.merged_sigi;
+        if (dst.careless_scale == null && typeof src.careless_scale === "number") dst.careless_scale = src.careless_scale;
+        if (dst.careless_residual == null && typeof src.careless_residual === "number") dst.careless_residual = src.careless_residual;
+      }};
+      const frameByBankHkl = new Map();
+      const frameByHkl = new Map();
+      for (let i = 0; i < integPeaks.length; i++) {{
+        const ip = integPeaks[i];
+        if (!ip || !Array.isArray(ip.hkl)) continue;
+        const hk = ip.hkl.join(",");
+        frameByBankHkl.set(`${{ip.bank}}|${{hk}}`, ip);
+        if (!frameByHkl.has(hk)) frameByHkl.set(hk, ip);
+      }}
+      for (let i = 0; i < predPeaks.length; i++) {{
+        const pp = predPeaks[i];
+        if (!pp || !Array.isArray(pp.hkl)) continue;
+        const hk = pp.hkl.join(",");
+        const match = frameByBankHkl.get(`${{pp.bank}}|${{hk}}`) || frameByHkl.get(hk);
+        if (match) copyMeasFields(pp, match);
+      }}
+      if (integSample.length > 0 && predSample.length > 0 && predSample !== predPeaks) {{
+        const sampByRunHkl = new Map();
+        const sampByHkl = new Map();
+        for (let i = 0; i < integSample.length; i++) {{
+          const ismp = integSample[i];
+          if (!ismp || !Array.isArray(ismp.hkl)) continue;
+          const hk = ismp.hkl.join(",");
+          sampByRunHkl.set(`${{ismp.run_index ?? 0}}|${{hk}}`, ismp);
+          if (!sampByHkl.has(hk)) sampByHkl.set(hk, ismp);
+        }}
+        for (let i = 0; i < predSample.length; i++) {{
+          const psmp = predSample[i];
+          if (!psmp || !Array.isArray(psmp.hkl)) continue;
+          const hk = psmp.hkl.join(",");
+          const match = sampByRunHkl.get(`${{psmp.run_index ?? 0}}|${{hk}}`) || sampByHkl.get(hk);
+          if (match) copyMeasFields(psmp, match);
+        }}
+      }}
+    }}
     return {{ predPeaks, predSample, integPeaks, integSample }};
   }}
   const initBuckets = extractPeakBucketsFromPayload(DATA);
@@ -9211,12 +9266,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }}
 
-  function scaleToColor(scaleVal, alpha = 1.0) {{
+  function scaleToColor(scaleVal, alpha = 1.0, peakSrc = state.peakSource) {{
     if (typeof scaleVal !== "number" || !Number.isFinite(scaleVal)) return `rgba(148, 163, 184, 0.000)`;
     const tRaw = Math.max(0.0, Math.min(1.0, (Math.log10(Math.max(1e-4, scaleVal)) + 2.0) / 3.0));
     const t = applyCrossoverCurve(tRaw);
-    const hue = (1.0 - t) * 195 + t * 45;
-    return `hsla(${{hue.toFixed(1)}}, 92%, 58%, ${{alpha.toFixed(3)}})`;
+    const isInteg = String(peakSrc || state.peakSource) === "integrated";
+    // Pred (circles): Indigo-Violet (258°) -> Electric Cyan (188°); Integ (ellipses): Teal (195°) -> Electric Lime (82°)
+    const hue = isInteg ? ((1.0 - t) * 195 + t * 82) : ((1.0 - t) * 258 + t * 188);
+    const sat = isInteg ? 92 : 95;
+    const lit = isInteg ? 58 : 60;
+    return `hsla(${{hue.toFixed(1)}}, ${{sat}}%, ${{lit}}%, ${{alpha.toFixed(3)}})`;
   }}
 
   function peakUnscaledIsigi(p) {{
@@ -9293,13 +9352,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return _peakDataAvailability;
   }}
 
-  // Logarithmic non-negative I/SIGI colormap (O(1) per peak):
-  // Transparent (alpha=0 at 0σ) -> Solar Gold at the slider crossover (t=0.5, alpha=0.5) ->
-  // Fully Opaque Electric Chartreuse-Lime (alpha=1 at strong peaks). Warm ivory-gold RGB at low t
-  // prevents muddy dark fringes as alpha fades over bright detector pixels.
-  function isigiToColor(isigiVal, alpha = 1.0, topScale = 40.0) {{
+  // Logarithmic non-negative I/SIGI colormap (O(1) per peak), distinctly keyed to Peak Source:
+  // - Integrated (⬭ Integ ellipses): Transparent (alpha=0) -> Vivid Solar Gold (250, 204, 21) at
+  //   crossover (t=0.5, alpha=0.5) -> Fully Opaque Electric Chartreuse-Lime (163, 242, 44) at t=1.
+  // - Predicted (○ Pred circles): Transparent (alpha=0) -> Vivid Sky-Cyan (56, 189, 248) at
+  //   crossover (t=0.5, alpha=0.5) -> Fully Opaque Electric Ice-Cyan (0, 240, 255) at t=1.
+  function isigiToColor(isigiVal, alpha = 1.0, topScale = 40.0, peakSrc = state.peakSource) {{
+    const isInteg = String(peakSrc || state.peakSource) === "integrated";
     if (typeof isigiVal !== "number" || !Number.isFinite(isigiVal) || isigiVal <= 0.0) {{
-      return "rgba(252, 238, 184, 0.000)";
+      return isInteg ? "rgba(252, 238, 184, 0.000)" : "rgba(186, 244, 255, 0.000)";
     }}
     const snr = Math.max(0.0, isigiVal);
     const denom = Math.log10(1.0 + Math.max(12.0, topScale));
@@ -9307,18 +9368,34 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const t = applyCrossoverCurve(uLog);
     const effAlpha = Math.max(0.0, Math.min(1.0, alpha * t));
     let r, g, b;
-    if (t < 0.5) {{
-      // Warm Ivory-Gold (252, 238, 184) -> Vivid Solar Gold (250, 204, 21) right at crossover t=0.5
-      const u = t / 0.5;
-      r = Math.round(252 + (250 - 252) * u);
-      g = Math.round(238 + (204 - 238) * u);
-      b = Math.round(184 + (21 - 184) * u);
+    if (isInteg) {{
+      if (t < 0.5) {{
+        // Warm Ivory-Gold (252, 238, 184) -> Vivid Solar Gold (250, 204, 21) right at crossover t=0.5
+        const u = t / 0.5;
+        r = Math.round(252 + (250 - 252) * u);
+        g = Math.round(238 + (204 - 238) * u);
+        b = Math.round(184 + (21 - 184) * u);
+      }} else {{
+        // Vivid Solar Gold (250, 204, 21) -> Electric Chartreuse-Lime (163, 242, 44) at t=1.0
+        const u = (t - 0.5) / 0.5;
+        r = Math.round(250 + (163 - 250) * u);
+        g = Math.round(204 + (242 - 204) * u);
+        b = Math.round(21 + (44 - 21) * u);
+      }}
     }} else {{
-      // Vivid Solar Gold (250, 204, 21) -> Electric Chartreuse-Lime (163, 242, 44) at t=1.0
-      const u = (t - 0.5) / 0.5;
-      r = Math.round(250 + (163 - 250) * u);
-      g = Math.round(204 + (242 - 204) * u);
-      b = Math.round(21 + (44 - 21) * u);
+      if (t < 0.5) {{
+        // Pale Ice-Cyan (186, 244, 255) -> Vivid Sky-Cyan (56, 189, 248) right at crossover t=0.5
+        const u = t / 0.5;
+        r = Math.round(186 + (56 - 186) * u);
+        g = Math.round(244 + (189 - 244) * u);
+        b = Math.round(255 + (248 - 255) * u);
+      }} else {{
+        // Vivid Sky-Cyan (56, 189, 248) -> Electric Cyan-Aqua (0, 240, 255) at t=1.0
+        const u = (t - 0.5) / 0.5;
+        r = Math.round(56 + (0 - 56) * u);
+        g = Math.round(189 + (240 - 189) * u);
+        b = Math.round(248 + (255 - 248) * u);
+      }}
     }}
     return `rgba(${{r}}, ${{g}}, ${{b}}, ${{effAlpha.toFixed(3)}})`;
   }}
@@ -10339,7 +10416,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (btnInteg) {{
       btnInteg.disabled = !hasInteg;
       btnInteg.classList.toggle("active-btn", state.peakSource === "integrated");
-      btnInteg.title = `Show successfully integrated reflections as 2σ ellipses (${{nInteg}} on frame; also projected on Wulff map)`;
+      btnInteg.title = `Show successfully integrated reflections as 2σ ellipses (${{nInteg}} on frame; Gold→Lime intensity highlight)`;
+    }}
+    const legIcon = document.getElementById("legend-peak-shape-icon");
+    const legLbl = document.getElementById("legend-peak-shape-label");
+    const isIntegSrc = state.peakSource === "integrated";
+    if (legIcon) {{
+      legIcon.style.width = isIntegSrc ? "13px" : "10px";
+      legIcon.style.height = isIntegSrc ? "8px" : "10px";
+      legIcon.style.borderColor = isIntegSrc ? "#a3f22c" : "#00e5ff";
+    }}
+    if (legLbl) {{
+      legLbl.textContent = isIntegSrc
+        ? "Front Layer: Integrated 2σ Ellipses (hold Ctrl/button for parallax)"
+        : "Front Layer: Predicted Bragg Rings (hold Ctrl/button for parallax)";
     }}
   }}
 

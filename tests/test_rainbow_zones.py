@@ -3124,6 +3124,7 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
         "peakMtzIsigi",
         "hasIntegratedIsigi",
         "hasMtzIsigi",
+        "scaleToColor",
         "isigiToColor",
         "hexToRgba",
         "peakEmphasisAlphaForCategorical",
@@ -3216,7 +3217,6 @@ function hasMergedCarelessData() {{ return false; }}
 function isPeakVisible(p) {{ return state.wulffColorMode !== "mtz_isigi" || Number.isFinite(peakMtzIsigi(p)); }}
 function zoneColor() {{ return "rgba(255,100,100,1)"; }}
 function residualToColor() {{ return "rgba(255,255,255,1)"; }}
-function scaleToColor() {{ return "hsla(120.0, 92%, 58%, 1.000)"; }}
 function syncColorModeSelectors() {{}}
 function syncWulffUI() {{}}
 function renderZoneList() {{}}
@@ -3297,28 +3297,37 @@ const parIdle = isParallaxTriggerActive({{ buttons: 0, ctrlKey: false, metaKey: 
 const parMouseBtn = isParallaxTriggerActive({{ buttons: 1, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }});
 const parCtrl = isParallaxTriggerActive({{ buttons: 0, ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }});
 
-// Peak source toggle ('predicted' <-> 'integrated') with .mtz I/σ column coloring
-// Also verify predicted peaks have NO integrated I/σ (hasIntegratedIsigi() === false in 'predicted' mode when unintegrated)
+// Peak source toggle ('predicted' <-> 'integrated') switches BOTH shape (circle <-> ellipse)
+// AND intensity-related highlight colorscale (Electric Cyan for Pred <-> Gold-to-Lime for Integ)
 applyPeakSource("predicted", false);
 const nPredFrame = PEAKS.length;
 const nPredWulff = getActiveWulffPeaks().length;
 const predShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse)) ? "ellipse" : "circle";
 const hasMtzCol = hasMtzIsigi();
-const mtzColStroke = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzIsigi(p))), 1.0);
+const hasPredCrossLinkedIsigi = hasIntegratedIsigi();
+const mtzColStrokePred = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzIsigi(p))), 1.0);
+const colPredCross = isigiToColor(exactCrossSnr, 1.0, 40.0);
+const colPredTop = isigiToColor(150.0, 1.0, 40.0);
+const scalePredTop = scaleToColor(10.0, 1.0);
+const gradIsigiPred = buildColorscaleGradientSpec("isigi", 0.38);
 
 applyPeakSource("integrated", false);
 const nIntegFrame = PEAKS.length;
 const nIntegWulff = getActiveWulffPeaks().length;
 const integShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse) && PEAKS[0].ellipse.length >= 6) ? "ellipse" : "circle";
+const mtzColStrokeInteg = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzIsigi(p))), 1.0);
+const scaleIntegTop = scaleToColor(10.0, 1.0);
 
 console.log(JSON.stringify({{
   chiChecks,
   friedelNeg10AtPos10,
   colNeg, colZero, colWeak, colCrossover, colGold, colLime,
+  colPredCross, colPredTop, scalePredTop, scaleIntegTop, gradIsigiPred,
   colMidRightKnob, colMidLeftKnob,
   gradIsigi, gradWl,
   parIdle, parMouseBtn, parCtrl,
-  hasMtzCol, mtzColStroke,
+  hasMtzCol, hasPredCrossLinkedIsigi,
+  mtzColStroke: mtzColStrokePred, mtzColStrokeInteg,
   nPredFrame, nPredWulff, predShape,
   nIntegFrame, nIntegWulff, integShape,
   btnPredDisabled: btns["btn-peaks-pred"].disabled,
@@ -3396,7 +3405,15 @@ console.log(JSON.stringify({{
         assert js_out["parCtrl"] is True
 
         assert js_out["hasMtzCol"] is True
+        assert js_out["hasPredCrossLinkedIsigi"] is True
         assert js_out["mtzColStroke"].startswith("rgba(")
+        assert js_out["mtzColStroke"] != js_out["mtzColStrokeInteg"]
+        rpc, gpc, bpc, apc = _parse_rgba(js_out["colPredCross"])
+        rpt, gpt, bpt, apt = _parse_rgba(js_out["colPredTop"])
+        assert (rpc, gpc, bpc) == (56, 189, 248) and abs(apc - 0.5) < 0.005
+        assert (rpt, gpt, bpt) == (0, 240, 255) and apt == 1.0
+        assert js_out["scalePredTop"] != js_out["scaleIntegTop"]
+        assert js_out["gradIsigiPred"]["gradient"] != js_out["gradIsigi"]["gradient"]
         assert js_out["nPredFrame"] == len(payload_mtz["predicted_peaks"])
         assert js_out["nPredWulff"] == len(samp_with_mtz)
         assert js_out["predShape"] == "circle"
