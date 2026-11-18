@@ -4514,7 +4514,14 @@ def _compute_harmonic_order_and_multiplicity(
 
 
 def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
-    """Return a function ``(h, k, l) -> (asu_h, asu_k, asu_l, is_friedel)`` for ``space_group``."""
+    """Return ``(h, k, l) -> (asu_h, asu_k, asu_l, is_friedel, bijvoet_parity)``.
+
+    ``bijvoet_parity`` is ``+1`` or ``-1`` for acentric reflections (the two
+    anomalous Bijvoet hands ``I+`` / ``I-``) and ``0`` for centric reflections
+    (including all reflections in centrosymmetric space groups and centric zones
+    such as ``hk0`` in ``Fdd2``), where ``(h, k, l)`` and ``(-h, -k, -l)`` are
+    point-group equivalents with zero Bijvoet difference.
+    """
     sg_obj = None
     asu_obj = None
     sg_ops = None
@@ -4535,9 +4542,9 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
                 if float(np.linalg.det(r_m)) > 0.0:
                     proper_rots.append(r_m)
 
-    _asu_cache: dict[tuple[int, int, int], tuple[int, int, int, bool]] = {}
+    _asu_cache: dict[tuple[int, int, int], tuple[int, int, int, bool, int]] = {}
 
-    def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int, bool]:
+    def _to_asu_hkl(h_v: int, k_v: int, l_v: int) -> tuple[int, int, int, bool, int]:
         ck = (int(h_v), int(k_v), int(l_v))
         cached = _asu_cache.get(ck)
         if cached is not None:
@@ -4546,9 +4553,14 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
             with contextlib.suppress(RuntimeError, ValueError, TypeError, IndexError):
                 ha, isym = asu_obj.to_asu([h_v, k_v, l_v], sg_ops)
                 ah_i, ak_i, al_i = int(ha[0]), int(ha[1]), int(ha[2])
-                if not is_centro:
+                is_centric = bool(
+                    is_centro or sg_ops.is_reflection_centric([h_v, k_v, l_v])
+                )
+                if not is_centric:
                     is_fr = int(isym) % 2 == 0
+                    bij_parity = -1 if is_fr else 1
                 else:
+                    bij_parity = 0
                     h_vec = np.array([ah_i, ak_i, al_i], dtype=float)
                     is_fr = not any(
                         round(float(h_vec @ r_m[:, 0])) == h_v
@@ -4556,7 +4568,7 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
                         and round(float(h_vec @ r_m[:, 2])) == l_v
                         for r_m in proper_rots
                     )
-                res_asu = (ah_i, ak_i, al_i, bool(is_fr))
+                res_asu = (ah_i, ak_i, al_i, bool(is_fr), int(bij_parity))
                 _asu_cache[ck] = res_asu
                 return res_asu
         ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
@@ -4573,8 +4585,8 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
         )
         if is_cubic:
             s3 = sorted((ah, ak, al), reverse=True)
-            return (s3[0], s3[1], s3[2], neg_parity)
-        return (ah, ak, al, neg_parity)
+            return (s3[0], s3[1], s3[2], neg_parity, 0)
+        return (ah, ak, al, neg_parity, 0)
 
     return _to_asu_hkl
 
@@ -5076,7 +5088,7 @@ def _serialize_peak_entries(
             if (h_i or k_i or l_i)
             else (0, 0, 0)
         )
-        asu_h, asu_k, asu_l, asu_is_friedel = _to_asu_hkl(h_i, k_i, l_i)
+        asu_h, asu_k, asu_l, asu_is_friedel, asu_bij_parity = _to_asu_hkl(h_i, k_i, l_i)
         orbit_id = f"{asu_h},{asu_k},{asu_l}"
         orbit_color_idx = (
             abs(asu_h * 73856093 ^ asu_k * 19349663 ^ asu_l * 83492791) % 12
@@ -5164,6 +5176,7 @@ def _serialize_peak_entries(
             "asu_hkl": [asu_h, asu_k, asu_l],
             "asu_orbit_id": orbit_id,
             "asu_friedel": bool(asu_is_friedel),
+            "asu_bijvoet_parity": int(asu_bij_parity),
             "orbit_color_idx": int(orbit_color_idx),
             "zone_ids": peak_zones[i],
             "indexed": is_indexed,
@@ -5316,7 +5329,7 @@ def _serialize_sample_peaks(
             if (hj or kj or lj)
             else (int(r_idx_all[j]), 0, 0, 0)
         )
-        ah, ak, al, asu_fr_j = _to_asu_hkl(hj, kj, lj)
+        ah, ak, al, asu_fr_j, asu_bij_j = _to_asu_hkl(hj, kj, lj)
         orb_id = f"{ah},{ak},{al}"
         orb_c = abs(ah * 73856093 ^ ak * 19349663 ^ al * 83492791) % 12
         lv = float(lam_vec[j])
@@ -5367,6 +5380,7 @@ def _serialize_sample_peaks(
             "asu_hkl": [ah, ak, al],
             "asu_orbit_id": orb_id,
             "asu_friedel": bool(asu_fr_j),
+            "asu_bijvoet_parity": int(asu_bij_j),
             "orbit_color_idx": int(orb_c),
             "zone_ids": [],
             "indexed": bool(hj or kj or lj),
@@ -9882,7 +9896,41 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         shapeStr = ` • 2σ=<strong style="color:#38bdf8;">${{(2 * p.sigma_major_px).toFixed(1)}}px (iso)</strong>`;
       }}
     }}
-    const asuStr = Array.isArray(p.asu_hkl) ? ` → ASU <strong style="color:#38bdf8;">(${{p.asu_hkl.join(",")}})</strong>` : "";
+    const bijParity = Number(p.asu_bijvoet_parity || 0);
+    const bijHandTag = bijParity > 0
+      ? ` <strong style="color:#ff7ad9;">I⁺</strong>`
+      : (bijParity < 0 ? ` <strong style="color:#ff7ad9;">I⁻</strong>` : "");
+    const asuStr = Array.isArray(p.asu_hkl)
+      ? ` → ASU <strong style="color:#38bdf8;">(${{p.asu_hkl.join(",")}})</strong>${{bijHandTag}}`
+      : "";
+    let bijBadgeStr = "";
+    if (bijParity !== 0 && p.asu_orbit_id) {{
+      const visFrame = getVisibleDetectorPeaks();
+      let nFrameBij = 0;
+      for (let i = 0; i < visFrame.length; i++) {{
+        if (!isSameReflection(visFrame[i], p) && isBijvoetMatePair(p, visFrame[i])) nFrameBij++;
+      }}
+      let nRunsBij = 0;
+      if (nFrameBij === 0) {{
+        const allSrc = getActiveWulffSourceArray();
+        const seenBijHkl = new Set();
+        for (let i = 0; i < allSrc.length; i++) {{
+          const cand = allSrc[i];
+          if (!isPeakVisible(cand)) continue;
+          if (!isSameReflection(cand, p) && isBijvoetMatePair(p, cand)) {{
+            const hk = Array.isArray(cand.hkl) ? cand.hkl.join(",") : String(i);
+            seenBijHkl.add(`${{cand.run_index || 0}}:${{hk}}`);
+          }}
+        }}
+        nRunsBij = seenBijHkl.size;
+      }}
+      if (nFrameBij > 0 || nRunsBij > 0) {{
+        const bijLbl = nFrameBij > 0
+          ? `±Bijvoet ×${{nFrameBij}} (frame)`
+          : `±Bijvoet ×${{nRunsBij}} (runs)`;
+        bijBadgeStr = ` • <span class="bijvoet-badge" style="display:inline-block;padding:0 5px;border-radius:3px;border:1px solid #ff4db8;background:rgba(255,77,184,0.18);color:#ff7ad9;font-weight:700;">${{bijLbl}}</span>`;
+      }}
+    }}
     let mergeStr = "";
     if (typeof p.careless_residual === "number") {{
       const rCol = p.careless_residual >= 0 ? "#f43f5e" : "#38bdf8";
@@ -9905,7 +9953,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const harmMult = p.harmonic_multiplicity || 1;
     setStatusLine(
       `[BANK #${{p.bank || 1}} • RUN #${{(p.run_index || 0) + 1}}]`,
-      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong>${{intenStr}}${{mtzStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
+      `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}}${{bijBadgeStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong>${{intenStr}}${{mtzStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
     );
   }}
 
@@ -9947,6 +9995,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (!hov && state.hoveredPeakId !== null && p.id === state.hoveredPeakId) return true;
     if (!sel && state.selectedPeakId !== null && p.id === state.selectedPeakId) return true;
     return false;
+  }}
+
+  function getActiveOrbitReferencePeak() {{
+    const hov = state.hoveredPeakObj;
+    if (hov && hov.asu_orbit_id && hov.asu_orbit_id === state.activeOrbitId) return hov;
+    const sel = state.selectedPeakObj;
+    if (sel && sel.asu_orbit_id && sel.asu_orbit_id === state.activeOrbitId) return sel;
+    return hov || sel || null;
+  }}
+
+  function isBijvoetMatePair(refPeak, matePeak) {{
+    if (!refPeak || !matePeak) return false;
+    if (!refPeak.asu_orbit_id || refPeak.asu_orbit_id !== matePeak.asu_orbit_id) return false;
+    const rp = Number(refPeak.asu_bijvoet_parity || 0);
+    const mp = Number(matePeak.asu_bijvoet_parity || 0);
+    return rp !== 0 && mp !== 0 && rp !== mp;
   }}
 
   function isPeakCapturedByActiveZone(p) {{
@@ -11324,6 +11388,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     ctx.save();
     let dashedActive = false;
+    const orbitRefPeak = state.activeOrbitId ? getActiveOrbitReferencePeak() : null;
     const shiftList = [0.0, -360.0, 360.0];
     for (let sIdx = 0; sIdx < 3; sIdx++) {{
       const shiftAz = shiftList[sIdx];
@@ -11339,11 +11404,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const captured = isPeakCapturedByActiveZone(p);
         const isHovered = isPeakHighlightedTarget(p);
         const isOrbitMate = Boolean(state.activeOrbitId && p.asu_orbit_id && p.asu_orbit_id === state.activeOrbitId);
+        const isBijvoetMate = isOrbitMate && !isHovered && isBijvoetMatePair(orbitRefPeak, p);
         if (!captured && !isHovered && !isOrbitMate && !hasActiveZones) {{
           continue;
         }}
 
-        const r = isHovered ? baseR + 1.8 : (isOrbitMate ? baseR + 1.2 : baseR);
+        const r = isHovered ? baseR + 1.8 : (isBijvoetMate ? baseR + 1.6 : (isOrbitMate ? baseR + 1.2 : baseR));
         const isUncertain = !isHovered && !isOrbitMate && isPeakUncertainForScope(p);
         const isIsigiMode = state.wulffColorMode === "isigi" || state.wulffColorMode === "mtz_isigi";
         const strokeAlpha = isUncertain
@@ -11352,15 +11418,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
         const ellPtsRaw = isIntegShape ? (isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse) : null;
         const strokeCol = isHovered
-          ? "#f43f85"
-          : (isOrbitMate ? "#fbbf24" : peakStrokeColor(p, strokeAlpha));
+          ? "#fbbf24"
+          : (isBijvoetMate ? "#ff4db8" : (isOrbitMate ? "#fbbf24" : peakStrokeColor(p, strokeAlpha)));
         if (!isHovered && !isOrbitMate && strokeCol.endsWith(", 0.000)")) {{
           continue;
         }}
         ctx.strokeStyle = strokeCol;
         ctx.lineWidth = isHovered
           ? 2.4
-          : (isOrbitMate ? 2.1 : (isUncertain ? (captured ? 1.0 : 0.7) : (captured ? 1.85 : 1.05)));
+          : (isBijvoetMate ? 2.3 : (isOrbitMate ? 2.1 : (isUncertain ? (captured ? 1.0 : 0.7) : (captured ? 1.85 : 1.05))));
         if (isUncertain !== dashedActive) {{
           ctx.setLineDash(isUncertain ? [2, 2] : []);
           dashedActive = isUncertain;
@@ -11399,29 +11465,39 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ctx.fill();
         }}
 
-        if (isOrbitMate && !isHovered) {{
+        if (isHovered) {{
           if (dashedActive) {{ ctx.setLineDash([]); dashedActive = false; }}
           ctx.beginPath();
-          ctx.arc(x, y, r + 3.2, 0, Math.PI * 2);
-          ctx.strokeStyle = "rgba(0, 229, 255, 0.82)";
-          ctx.lineWidth = 1.2;
+          ctx.arc(x, y, r + 3.4, 0, Math.PI * 2);
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.88)";
+          ctx.lineWidth = 1.25;
+          ctx.stroke();
+        }} else if (isOrbitMate) {{
+          if (dashedActive) {{ ctx.setLineDash([]); dashedActive = false; }}
+          ctx.beginPath();
+          ctx.arc(x, y, isBijvoetMate ? (r + 3.8) : (r + 3.2), 0, Math.PI * 2);
+          ctx.strokeStyle = isBijvoetMate
+            ? "rgba(255, 77, 184, 0.96)"
+            : "rgba(0, 229, 255, 0.82)";
+          ctx.lineWidth = isBijvoetMate ? 1.85 : 1.2;
           ctx.stroke();
         }}
 
         if ((isHovered || isOrbitMate) && !queuedTooltipPeakIds.has(p.id) && x >= 0 && x <= w) {{
           queuedTooltipPeakIds.add(p.id);
-          pendingTooltips.push({{ p, x, y, isHovered }});
+          pendingTooltips.push({{ p, x, y, isHovered, isBijvoetMate }});
         }}
       }}
     }}
     ctx.restore();
 
     // Render tooltips for all hovered + symmetry-equivalent reflections on top of rings
-    pendingTooltips.forEach(({{ p, x, y, isHovered }}) => {{
+    pendingTooltips.forEach(({{ p, x, y, isHovered, isBijvoetMate }}) => {{
       const resBadge = typeof p.careless_residual === "number"
         ? ` ΔI/σ=${{p.careless_residual >= 0 ? "+" : ""}}${{p.careless_residual.toFixed(1)}}σ`
         : "";
-      const tag = `(${{p.hkl.join(",")}}) λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{resBadge}}`;
+      const bijBadge = isBijvoetMate ? " [Bijvoet]" : "";
+      const tag = `(${{p.hkl.join(",")}})${{bijBadge}} λ=${{p.wavelength.toFixed(2)}}Å d=${{p.d_spacing.toFixed(2)}}Å${{resBadge}}`;
       ctx.save();
       ctx.font = "bold 11px monospace";
       const tw = ctx.measureText(tag).width + 10;
@@ -11429,10 +11505,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const ty = Math.max(20, y);
       ctx.fillStyle = "rgba(11, 15, 23, 0.92)";
       ctx.fillRect(tx, ty - 20, tw, 18);
-      ctx.strokeStyle = isHovered ? "#fbbf24" : "#00e5ff";
-      ctx.lineWidth = 1.0;
+      ctx.strokeStyle = isHovered ? "#fbbf24" : (isBijvoetMate ? "#ff4db8" : "#00e5ff");
+      ctx.lineWidth = isBijvoetMate ? 1.35 : 1.0;
       ctx.strokeRect(tx, ty - 20, tw, 18);
-      ctx.fillStyle = isHovered ? "#fbbf24" : "#38bdf8";
+      ctx.fillStyle = isHovered ? "#fbbf24" : (isBijvoetMate ? "#ff7ad9" : "#38bdf8");
       ctx.fillText(tag, tx + 5, ty - 7);
       ctx.restore();
     }});
@@ -11944,13 +12020,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.restore();
 
     // Symmetry Starburst: connect all symmetry-equivalent mates sharing activeOrbitId,
-    // distinguishing proper crystallographic rotations (Gold #fbbf24) from Friedel/inversion mates (Violet #e879f9)!
+    // distinguishing point-group mates (Gold/Cyan), observed acentric Bijvoet mates (Pink #ff4db8),
+    // and virtual antipodal -g Friedel ghosts (Violet #e879f9)!
     if (orbitMates.length > 0) {{
-      const refPeak = state.hoveredPeakObj || state.selectedPeakObj;
+      const refPeak = getActiveOrbitReferencePeak();
       const refParity = (refPeak && refPeak.asu_orbit_id === state.activeOrbitId)
         ? (refPeak.asu_friedel ? 1 : 0)
         : orbitMates[0].friedelParity;
       let nProper = 0;
+      let nBijvoet = 0;
       let nFriedel = 0;
       ctx.save();
       if (
@@ -11970,23 +12048,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
       orbitMates.forEach((mate) => {{
         const {{ sx: mx, sy: my, p: mp, isFriedelGhost, friedelParity, displayHkl }} = mate;
-        const isFriedelLink = (friedelParity !== refParity) || (refPeak && mp === refPeak && isFriedelGhost);
-        if (isFriedelLink) nFriedel += 1;
+        const isObservedBijvoet = !isFriedelGhost && (!refPeak || !isSameReflection(mp, refPeak)) && isBijvoetMatePair(refPeak, mp);
+        const isGhostOrImproper = !isObservedBijvoet && (isFriedelGhost || (friedelParity !== refParity));
+        if (isObservedBijvoet) nBijvoet += 1;
+        else if (isFriedelGhost) nFriedel += 1;
         else nProper += 1;
-        const linkStroke = isFriedelLink ? "rgba(232, 121, 249, 0.78)" : "rgba(251, 191, 36, 0.65)";
-        const ringStroke = isFriedelLink ? "#e879f9" : "#00e5ff";
-        const lblFill = isFriedelLink ? "#e879f9" : "#fbbf24";
+        const linkStroke = isObservedBijvoet
+          ? "rgba(255, 77, 184, 0.90)"
+          : (isGhostOrImproper ? "rgba(232, 121, 249, 0.72)" : "rgba(251, 191, 36, 0.65)");
+        const ringStroke = isObservedBijvoet
+          ? "#ff4db8"
+          : (isFriedelGhost ? "#e879f9" : "#00e5ff");
+        const lblFill = isObservedBijvoet
+          ? "#ff7ad9"
+          : (isFriedelGhost ? "#e879f9" : "#fbbf24");
 
         ctx.beginPath();
         ctx.moveTo(cx, cy);
         ctx.lineTo(mx, my);
         ctx.strokeStyle = linkStroke;
-        ctx.lineWidth = isExp ? 1.55 : 1.15;
-        ctx.setLineDash(isFriedelLink ? [5, 3] : [3, 3]);
+        ctx.lineWidth = isObservedBijvoet ? (isExp ? 1.85 : 1.35) : (isExp ? 1.55 : 1.15);
+        ctx.setLineDash(isObservedBijvoet ? [] : (isGhostOrImproper ? [5, 3] : [3, 3]));
         ctx.stroke();
         ctx.setLineDash([]);
 
-        const rRing = isExp ? 6.5 : 4.5;
+        const rRing = isObservedBijvoet ? (isExp ? 7.2 : 5.2) : (isExp ? 6.5 : 4.5);
         ctx.beginPath();
         if (isFriedelGhost) {{
           ctx.moveTo(mx, my - rRing * 1.15);
@@ -11998,14 +12084,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ctx.arc(mx, my, rRing, 0, Math.PI * 2);
         }}
         ctx.strokeStyle = ringStroke;
-        ctx.lineWidth = 1.6;
+        ctx.lineWidth = isObservedBijvoet ? 2.0 : 1.6;
         ctx.stroke();
 
         if (isExp) {{
           const resTxt = (!isFriedelGhost && typeof mp.careless_residual === "number")
             ? ` ${{mp.careless_residual >= 0 ? "+" : ""}}${{mp.careless_residual.toFixed(1)}}σ`
             : (isFriedelGhost ? " [-g]" : "");
-          const lbl = `(${{displayHkl.join(",")}})${{resTxt}}`;
+          const bijTxt = isObservedBijvoet ? " [Bijvoet]" : "";
+          const lbl = `(${{displayHkl.join(",")}})${{bijTxt}}${{resTxt}}`;
           ctx.font = "bold 10px monospace";
           ctx.fillStyle = "#070913";
           ctx.fillText(lbl, mx + 8, my - 4);
@@ -12020,13 +12107,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const legendY = h - 12;
         const prefix = `ASU [${{state.activeOrbitId}}] • `;
         ctx.fillText(prefix, legendX, legendY);
-        const w1 = ctx.measureText(prefix).width;
-        const propTxt = `${{nProper}} proper (gold)`;
+        let curX = legendX + ctx.measureText(prefix).width;
+        const propTxt = `${{nProper}} point-group (gold/cyan)`;
         ctx.fillStyle = "#fbbf24";
-        ctx.fillText(propTxt, legendX + w1, legendY);
-        const w2 = ctx.measureText(propTxt).width;
-        ctx.fillStyle = "#e879f9";
-        ctx.fillText(` • ${{nFriedel}} Friedel (violet)`, legendX + w1 + w2, legendY);
+        ctx.fillText(propTxt, curX, legendY);
+        curX += ctx.measureText(propTxt).width;
+        if (nBijvoet > 0) {{
+          const bijLegend = ` • ${{nBijvoet}} Bijvoet (pink)`;
+          ctx.fillStyle = "#ff7ad9";
+          ctx.fillText(bijLegend, curX, legendY);
+          curX += ctx.measureText(bijLegend).width;
+        }}
+        if (nFriedel > 0) {{
+          ctx.fillStyle = "#e879f9";
+          ctx.fillText(` • ${{nFriedel}} -g Friedel (violet)`, curX, legendY);
+        }}
       }}
       ctx.restore();
     }}
@@ -12038,8 +12133,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const rRet = isExp ? 10.0 : 7.5;
         ctx.beginPath();
         ctx.arc(tx, ty, rRet, 0, Math.PI * 2);
-        ctx.strokeStyle = "#f43f85";
-        ctx.lineWidth = 2.2;
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 2.1;
         ctx.stroke();
 
         ctx.beginPath();

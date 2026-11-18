@@ -2845,6 +2845,29 @@ def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> Non
     assert asu_pos[:3] == asu_neg[:3] == asu_rot[:3]
     assert asu_pos[3] != asu_neg[3]  # Friedel pair has opposite parity
     assert asu_pos[3] == asu_rot[3]  # Proper 2-fold rotation has identical parity
+    assert asu_pos[4] != 0 and asu_pos[4] == -asu_neg[4]
+    assert asu_pos[4] == asu_rot[4]
+
+    # Verify Fdd2 (mm2): point-group mates (including d-glide mirrors) share nonzero Bijvoet parity,
+    # +l vs -l have opposite Bijvoet parity, and centric hk0 reflections have bijvoet_parity == 0.
+    mapper_fdd2 = _make_asu_mapper("Fdd2", [18.39, 56.55, 6.54, 90.0, 90.0, 90.0])
+    f_p1 = mapper_fdd2(11, -15, 1)
+    f_p2 = mapper_fdd2(-11, -15, 1)  # d-glide mirror mate (same +l)
+    f_p3 = mapper_fdd2(11, 15, 1)  # d-glide mirror mate (same +l)
+    f_bij = mapper_fdd2(-11, -15, -1)  # true Bijvoet mate (-l)
+    f_c1 = mapper_fdd2(2, 2, 0)  # centric hk0
+    f_c2 = mapper_fdd2(-2, -2, 0)  # centric hk0 2-fold mate
+    f_c3 = mapper_fdd2(2, -2, 0)  # centric hk0 mirror mate
+    assert f_p1[:3] == f_p2[:3] == f_p3[:3] == f_bij[:3] == (11, 15, 1)
+    assert f_p1[4] != 0 and f_p1[4] == f_p2[4] == f_p3[4]
+    assert f_bij[4] == -f_p1[4]
+    assert f_c1[4] == f_c2[4] == f_c3[4] == 0
+    assert f_c1[3] is False and f_c2[3] is False
+
+    # Centrosymmetric space groups have bijvoet_parity == 0 for every reflection
+    mapper_ia3d = _make_asu_mapper("Ia-3d", [11.93, 11.93, 11.93, 90.0, 90.0, 90.0])
+    assert mapper_ia3d(1, 2, 3)[4] == 0
+    assert mapper_ia3d(-1, -2, -3)[4] == 0
 
     # Verify pre-filtered integrated.h5 (containing ONLY integrated peaks):
     # (a) without predictor.h5 -> theoretical fallback generates full Laue predictions (> integrated count)
@@ -4661,29 +4684,192 @@ def test_full_inline_script_boot_and_data_sources_menu(tmp_path) -> None:
     assert shutil.which("node"), "Node.js required for inline script boot test"
 
     empty_model = SubhklGalaxyModel()
-    html_doc = render_rainbow_html(empty_model.payload)
+    bij_payload = dict(empty_model.payload)
+    bij_peaks = [
+        {
+            "id": 0,
+            "run_index": 0,
+            "bank": 23,
+            "det_x": -80.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [-0.5, 0.2, -0.84],
+            "q_hat_lab": [-0.5, 0.2, -0.84],
+            "stereographic": [-0.2, 0.1],
+            "hemisphere": 1,
+            "wavelength": 2.76,
+            "d_spacing": 2.18,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [11, -15, 1],
+            "asu_hkl": [11, 15, 1],
+            "asu_orbit_id": "11,15,1",
+            "asu_friedel": False,
+            "asu_bijvoet_parity": 1,
+            "orbit_color_idx": 2,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+        {
+            "id": 1,
+            "run_index": 0,
+            "bank": 24,
+            "det_x": -35.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [0.5, 0.2, -0.84],
+            "q_hat_lab": [0.5, 0.2, -0.84],
+            "stereographic": [0.2, 0.1],
+            "hemisphere": 1,
+            "wavelength": 2.82,
+            "d_spacing": 2.18,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [-11, -15, 1],
+            "asu_hkl": [11, 15, 1],
+            "asu_orbit_id": "11,15,1",
+            "asu_friedel": False,
+            "asu_bijvoet_parity": 1,
+            "orbit_color_idx": 2,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+        {
+            "id": 2,
+            "run_index": 0,
+            "bank": 53,
+            "det_x": 10.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [0.5, 0.2, 0.84],
+            "q_hat_lab": [0.5, 0.2, -0.60],
+            "stereographic": [0.25, -0.15],
+            "hemisphere": 1,
+            "wavelength": 2.02,
+            "d_spacing": 2.18,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [-11, -15, -1],
+            "asu_hkl": [11, 15, 1],
+            "asu_orbit_id": "11,15,1",
+            "asu_friedel": True,
+            "asu_bijvoet_parity": -1,
+            "orbit_color_idx": 2,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+        {
+            "id": 3,
+            "run_index": 0,
+            "bank": 31,
+            "det_x": 55.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [0.6, 0.1, -0.79],
+            "q_hat_lab": [0.6, 0.1, -0.79],
+            "stereographic": [0.3, 0.05],
+            "hemisphere": 1,
+            "wavelength": 3.10,
+            "d_spacing": 3.00,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [2, 2, 0],
+            "asu_hkl": [2, 2, 0],
+            "asu_orbit_id": "2,2,0",
+            "asu_friedel": False,
+            "asu_bijvoet_parity": 0,
+            "orbit_color_idx": 5,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+        {
+            "id": 4,
+            "run_index": 0,
+            "bank": 35,
+            "det_x": 95.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [-0.6, -0.1, -0.79],
+            "q_hat_lab": [-0.6, -0.1, -0.79],
+            "stereographic": [-0.3, -0.05],
+            "hemisphere": 1,
+            "wavelength": 3.10,
+            "d_spacing": 3.00,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [-2, -2, 0],
+            "asu_hkl": [2, 2, 0],
+            "asu_orbit_id": "2,2,0",
+            "asu_friedel": False,
+            "asu_bijvoet_parity": 0,
+            "orbit_color_idx": 5,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+    ]
+    bij_payload.update(
+        {
+            "instrument": "CG4D",
+            "space_group": "Fdd2",
+            "wavelength_range": [2.0, 4.5],
+            "d_min": 1.0,
+            "peaks": bij_peaks,
+            "predicted_peaks": bij_peaks,
+            "sample_peaks": bij_peaks,
+            "predicted_sample_peaks": bij_peaks,
+            "zones": [
+                {
+                    "id": 0,
+                    "uvw": [0, 0, 1],
+                    "label": "[001]",
+                    "n_peaks": 5,
+                    "angular_rms_deg": 0.05,
+                    "d_direct": 6.54,
+                    "color": "#38bdf8",
+                    "axis_lab": [0.0, 1.0, 0.0],
+                    "axis_crystal": [0.0, 0.0, 1.0],
+                    "conic_points": [],
+                    "conic_points_sph": [],
+                    "wulff_points": [],
+                }
+            ],
+            "frames": [{"index": 0, "label": "CG4D_1720"}],
+            "active_frame": 0,
+        }
+    )
+    html_doc = render_rainbow_html(bij_payload)
     script = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
 
     js_file = tmp_path / "full_boot_check.js"
     js_file.write_text(
         """
 const elems = new Map();
-function makeCtx() {
-  return {
+const ctxLogs = new Map();
+let rafCb = null;
+function makeCtx(id = "") {
+  const log = { strokes: [], texts: [], arcs: [] };
+  if (id) ctxLogs.set(id, log);
+  const ctx = {
     fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
     textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
     setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
-    transform() {}, clearRect() {}, fillRect() {}, strokeRect() {},
-    beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, ellipse() {},
+    transform() {}, clearRect() {}, fillRect() {},
+    strokeRect() { log.strokes.push(String(ctx.strokeStyle)); },
+    beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+    arc(x, y, r) { log.arcs.push([x, y, r]); },
+    ellipse() {},
     quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
-    stroke() {}, fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
-    fillText() {}, strokeText() {}, drawImage() {},
+    stroke() { log.strokes.push(String(ctx.strokeStyle)); },
+    fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+    fillText(t) { log.texts.push(String(t)); },
+    strokeText() {}, drawImage() {},
     measureText(t) { return { width: String(t).length * 6 }; },
     createLinearGradient() { return { addColorStop() {} }; },
     createRadialGradient() { return { addColorStop() {} }; },
     getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
     putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
   };
+  return ctx;
 }
 function makeEl(id = "") {
   const listeners = {};
@@ -4728,7 +4914,7 @@ function makeEl(id = "") {
     getAttribute(k) { return this[k] ?? null; },
     removeAttribute(k) { delete this[k]; },
     getBoundingClientRect() { return { left: 0, top: 0, right: 300, bottom: 240, width: 300, height: 240 }; },
-    getContext() { return makeCtx(); },
+    getContext() { if (!el._ctx) el._ctx = makeCtx(id); return el._ctx; },
     querySelector() { return makeEl(); },
     querySelectorAll() { return []; },
     closest() { return null; },
@@ -4756,7 +4942,7 @@ globalThis.Image = class { set src(v) { this._src = v; } };
 globalThis.ResizeObserver = class { observe() {} disconnect() {} };
 globalThis.MutationObserver = class { observe() {} disconnect() {} };
 globalThis.AbortController = class { constructor() { this.signal = {}; } abort() {} };
-globalThis.requestAnimationFrame = () => 1;
+globalThis.requestAnimationFrame = (fn) => { if (!rafCb) rafCb = fn; return 1; };
 globalThis.cancelAnimationFrame = () => {};
 globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => "" });
 globalThis.document = {
@@ -4786,10 +4972,48 @@ selSrc.value = "__action_local_file__";
 selSrc.dispatchEvent({ type: "change", target: selSrc });
 const localClicked = inpLocal ? inpLocal.clicked : 0;
 
+// Trigger initial frame render to capture on-screen [x, y] positions of the 5 Fdd2 peaks
+const detCanvasEl = elems.get("canvas-detector");
+detCanvasEl.getContext("2d");
+const detLog = ctxLogs.get("canvas-detector");
+detLog.arcs.length = 0;
+if (rafCb) rafCb();
+const inViewArcs = detLog.arcs.filter(a => a[0] >= 0 && a[0] <= 300 && a[1] >= 0 && a[1] <= 240);
+inViewArcs.sort((a, b) => a[0] - b[0]);
+
+// Hover peak #0 (11, -15, +1) -> leftmost visible peak
+const [px0, py0] = inViewArcs[0];
+detCanvasEl.dispatchEvent({ type: "mousemove", clientX: px0, clientY: py0, buttons: 0 });
+const statusBijHtml = getEl("inspector-box").innerHTML;
+detLog.strokes.length = 0;
+detLog.texts.length = 0;
+if (rafCb) rafCb();
+const hasPinkRing = detLog.strokes.some(s => s.includes("255, 77, 184") || s === "#ff4db8");
+const hasCyanPgRing = detLog.strokes.some(s => s.includes("0, 229, 255") || s === "#00e5ff");
+const hasBijTooltip = detLog.texts.some(t => t.includes("(-11,-15,-1) [Bijvoet]"));
+const pgNotTaggedBij = detLog.texts.some(t => t.startsWith("(-11,-15,1) λ="));
+
+// Hover centric peak #3 (2, 2, 0) -> 4th peak from left; must NOT tag (-2,-2,0) as Bijvoet
+const [px3, py3] = inViewArcs[3];
+detCanvasEl.dispatchEvent({ type: "mousemove", clientX: px3, clientY: py3, buttons: 0 });
+const statusCentricHtml = getEl("inspector-box").innerHTML;
+detLog.strokes.length = 0;
+detLog.texts.length = 0;
+if (rafCb) rafCb();
+const centricHasPink = detLog.strokes.some(s => s.includes("255, 77, 184") || s === "#ff4db8") ||
+  detLog.texts.some(t => t.includes("[Bijvoet]"));
+
 console.log(JSON.stringify({
   csGradientSet: Boolean(slCs && slCs.style["--cs-gradient"] && slCs.style["--cs-gradient"].startsWith("linear-gradient(")),
   ndDisplay,
   localClicked,
+  hasBijBadge: statusBijHtml.includes("bijvoet-badge") && statusBijHtml.includes("±Bijvoet ×1 (frame)") && statusBijHtml.includes("I⁺"),
+  hasPinkRing,
+  hasCyanPgRing,
+  hasBijTooltip,
+  pgNotTaggedBij,
+  centricNoBijBadge: !statusCentricHtml.includes("bijvoet-badge"),
+  centricHasPink,
 }));
 process.exit(0);
 """,
@@ -4802,3 +5026,10 @@ process.exit(0);
     assert out["csGradientSet"] is True
     assert out["ndDisplay"] == "flex"
     assert out["localClicked"] == 1
+    assert out["hasBijBadge"] is True
+    assert out["hasPinkRing"] is True
+    assert out["hasCyanPgRing"] is True
+    assert out["hasBijTooltip"] is True
+    assert out["pgNotTaggedBij"] is True
+    assert out["centricNoBijBadge"] is True
+    assert out["centricHasPink"] is False
