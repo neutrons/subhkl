@@ -6736,6 +6736,13 @@ def serve_rainbow_zones(
                         if 0.2 <= parsed_dmin <= 20.0:
                             d_min_val = parsed_dmin
                             vm.payload_kwargs["d_min"] = parsed_dmin
+                rbin_val: int | None = None
+                if qs.get("render_binning"):
+                    with contextlib.suppress(ValueError, TypeError, IndexError):
+                        parsed_rb = int(qs["render_binning"][0])
+                        if 1 <= parsed_rb <= 16:
+                            rbin_val = parsed_rb
+                            vm.payload_kwargs["render_binning"] = parsed_rb
                 reloaded = False
                 if qs.get("file_path"):
                     fp_raw = os.path.abspath(str(qs["file_path"][0]).strip())
@@ -6945,9 +6952,15 @@ def serve_rainbow_zones(
                         cur_p.get("frame_index") if isinstance(cur_p, dict) else None
                     )
                     cur_dmin = cur_p.get("d_min") if isinstance(cur_p, dict) else None
+                    cur_rb = (
+                        int(cur_p.get("render_binning", 4))
+                        if isinstance(cur_p, dict)
+                        else None
+                    )
                     if (
                         not isinstance(cur_p, dict)
                         or (f_idx is not None and cur_f != f_idx)
+                        or (rbin_val is not None and cur_rb != rbin_val)
                         or (
                             d_min_val is not None
                             and (

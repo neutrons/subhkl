@@ -3240,3 +3240,171 @@ console.log(JSON.stringify({{
         assert js_out["btnPredDisabled"] is False
         assert js_out["btnIntegDisabled"] is False
         assert js_out["btnMtzDisabled"] is False
+
+
+def test_mandi_i2_harmonics_wulff_snr_dimming_and_hires_textures(tmp_path) -> None:
+    import base64
+    import io
+
+    import h5py
+    from PIL import Image
+
+    from subhkl.viz.rainbow_zones import (
+        _compute_harmonic_order_and_multiplicity,
+        _make_systematic_absence_checker,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # 1. Exact space-group-aware Laue harmonic multiplicity for MANDI I2 (a=55.16, b=81.19, c=88.7, beta=96.3)
+    is_abs_i2 = _make_systematic_absence_checker("I 1 2 1")
+    assert is_abs_i2(1, 0, 0) is True  # h+k+l = 1 odd -> body-centered absent
+    assert is_abs_i2(2, 0, 0) is False  # h+k+l = 2 even -> allowed
+
+    # (2, 0, 0) at lambda=3.2 A, d=27.4 A in [2.0, 4.0] A, d_min=1.5 A:
+    # (1, 0, 0) is absent in I2, and (4, 0, 0) would need lambda=1.6 A < 2.0 A -> NOT a harmonic!
+    ord_200, mult_200 = _compute_harmonic_order_and_multiplicity(
+        2,
+        0,
+        0,
+        3.2,
+        27.4,
+        wl_min=2.0,
+        wl_max=4.0,
+        d_min=1.5,
+        is_absent_fn=is_abs_i2,
+    )
+    assert ord_200 == 1
+    assert mult_200 == 1
+
+    # (2, 0, 0) at lambda=3.9 A, d=27.4 A -> (4, 0, 0) at lambda=1.95 A is still out-of-band (< 2.0 A),
+    # whereas at lambda=4.0 A -> (4, 0, 0) at lambda=2.0 A is in-band and allowed -> mult == 2!
+    _, mult_out = _compute_harmonic_order_and_multiplicity(
+        2,
+        0,
+        0,
+        3.9,
+        27.4,
+        wl_min=2.0,
+        wl_max=4.0,
+        d_min=1.5,
+        is_absent_fn=is_abs_i2,
+    )
+    ord_400, mult_in = _compute_harmonic_order_and_multiplicity(
+        4,
+        0,
+        0,
+        2.0,
+        13.7,
+        wl_min=2.0,
+        wl_max=4.0,
+        d_min=1.5,
+        is_absent_fn=is_abs_i2,
+    )
+    assert mult_out == 1
+    assert ord_400 == 2
+    assert mult_in == 2
+
+    import gemmi
+
+    solve_mandi = tmp_path / "mandi_i2_solve.h5"
+    mandi_cell = [55.16, 81.19, 88.7, 90.0, 96.3, 90.0]
+    b_mandi = np.asarray(gemmi.UnitCell(*mandi_cell).frac.mat.tolist(), dtype=float).T
+    with h5py.File(solve_mandi, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array(mandi_cell, dtype=float)
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = b_mandi
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=float)
+
+    p_mandi = build_rainbow_zone_payload(
+        replay_h5=solve_mandi,
+        instrument="MANDI",
+        space_group="I 1 2 1",
+        wavelength_range=(2.0, 4.0),
+        d_min=1.6,
+        include_panel_images=False,
+    )
+    assert len(p_mandi["peaks"]) > 20
+    harm_frac = sum(
+        1 for pk in p_mandi["peaks"] if int(pk.get("harmonic_multiplicity", 1)) > 1
+    ) / len(p_mandi["peaks"])
+    assert harm_frac < 0.25
+
+    # 2. Integrator HDF5 with image_index + file_offsets (no peaks/run_index) and render_binning=4 vs 1
+    img_h5 = tmp_path / "mandi_imgs.h5"
+    with h5py.File(img_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["images"] = np.ones((2, 64, 64), dtype=np.float32) * 12.0
+        hf["bank_ids"] = np.array([20, 20], dtype=np.int32)
+        hf["file_offsets"] = np.array([0, 1, 2], dtype=np.int32)
+        dt_s = h5py.string_dtype(encoding="utf-8")
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_13172.nxs.h5", "MANDI_13174.nxs.h5"], dtype=object),
+            dtype=dt_s,
+        )
+        hf["goniometer/R"] = np.stack([np.eye(3), np.eye(3)], axis=0)
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=np.float32)
+
+    integ_h5 = tmp_path / "mandi_integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array([55.16, 81.19, 88.7, 90.0, 96.3, 90.0])
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = np.diag([1.0 / 55.16, 1.0 / 81.19, 1.0 / 88.7])
+        hf["goniometer/R"] = np.stack([np.eye(3), np.eye(3)], axis=0)
+        hf["file_offsets"] = np.array([0, 1, 2], dtype=np.int32)
+        # Peak 0 (run 0, I/sig=10 >= 2.5), Peak 1 (run 0, I/sig=1.8 < 2.5), Peak 2 (run 1, I/sig=12 >= 2.5)
+        hf["peaks/image_index"] = np.array([0, 0, 1], dtype=np.int32)
+        hf["peaks/bank"] = np.array([20, 20, 20], dtype=np.int32)
+        hf["peaks/pixel_r"] = np.array([20.0, 36.0, 28.0], dtype=np.float64)
+        hf["peaks/pixel_c"] = np.array([24.0, 40.0, 30.0], dtype=np.float64)
+        hf["peaks/h"] = np.array([2, 0, 2], dtype=np.int32)
+        hf["peaks/k"] = np.array([0, 2, 2], dtype=np.int32)
+        hf["peaks/l"] = np.array([0, 0, 0], dtype=np.int32)
+        hf["peaks/lambda"] = np.array([3.1, 3.2, 3.0], dtype=np.float64)
+        hf["peaks/intensity"] = np.array([100.0, 18.0, 120.0], dtype=np.float64)
+        hf["peaks/sigma"] = np.array([10.0, 10.0, 10.0], dtype=np.float64)
+        hf["peaks/var_u"] = np.array([2.2, 1.8, 2.0], dtype=np.float64)
+        hf["peaks/var_v"] = np.array([0.8, 0.9, 1.0], dtype=np.float64)
+        hf["peaks/cov_uv"] = np.array([0.2, 0.0, -0.1], dtype=np.float64)
+
+    p_lo = build_rainbow_zone_payload(
+        replay_h5=integ_h5, images_h5=img_h5, frame_index=0, render_binning=4
+    )
+    p_hi = build_rainbow_zone_payload(
+        replay_h5=integ_h5, images_h5=img_h5, frame_index=0, render_binning=1
+    )
+    assert p_lo["render_binning"] == 4
+    assert p_hi["render_binning"] == 1
+    assert p_lo["all_runs_min_isigi"] == 2.5
+    # Frame 0 detector PEAKS keeps both strong (I/sig=10) and uncertain (I/sig=1.8 >= 1.5) peaks
+    assert len(p_lo["integrated_peaks"]) == 2
+    # Multi-run Wulff SAMPLE_PEAKS has I/sig >= 2.5 across properly reconstructed runs [0, 1]
+    by_run = {int(sp["run_index"]): sp for sp in p_lo["integrated_sample_peaks"]}
+    assert sorted(by_run.keys()) == [0, 1]
+    # Run 0: (2, 0, 0) at lambda=3.1 A -> (1,0,0) & (3,0,0) absent in I2, (4,0,0) at 1.55 A < 2.0 A -> mult == 1
+    assert by_run[0]["harmonic_order"] == 1
+    assert by_run[0]["harmonic_multiplicity"] == 1
+    # Run 1: (2, 2, 0) at lambda=3.0 A -> (1,1,0) allowed (1+1+0=2 even, ord=2) and (3,3,0) allowed at 2.0 A -> mult == 2!
+    assert by_run[1]["harmonic_order"] == 2
+    assert by_run[1]["harmonic_multiplicity"] == 2
+
+    b20_lo = next(pn for pn in p_lo["panels"] if pn["bank"] == 20)
+    b20_hi = next(pn for pn in p_hi["panels"] if pn["bank"] == 20)
+    im_lo = Image.open(io.BytesIO(base64.b64decode(b20_lo["texture_b64"])))
+    im_hi = Image.open(io.BytesIO(base64.b64decode(b20_hi["texture_b64"])))
+    assert im_lo.size == (16, 16)
+    assert im_hi.size == (64, 64)
+
+    # 3. Verify ellipse crossbars are removed and Wulff I/sig>=2.5 badge + detector dimming + Hi-Res button exist
+    html_doc = render_rainbow_html(p_lo)
+    assert "pQ1" not in html_doc and "pQ3" not in html_doc
+    assert 'id="btn-hires-tex"' in html_doc
+    assert "toggleHiResTextures" in html_doc
+    assert "isWulffSnrCutActive" in html_doc
+    assert "isPeakUncertainForScope" in html_doc
+    assert "ALL-RUNS · I/σ ≥" in html_doc

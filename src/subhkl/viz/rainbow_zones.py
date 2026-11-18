@@ -26,6 +26,7 @@ import contextlib
 import glob
 import io
 import json
+import math
 import os
 import re
 import tempfile
@@ -741,7 +742,7 @@ def _encode_panel_textures(
         and bank_arr is not None
         and len(bank_arr) > 0
     ):
-        grid_size = 96
+        grid_size = 256 if int(render_binning) <= 1 else 96
         yy, xx = np.meshgrid(
             np.arange(grid_size, dtype=np.float32),
             np.arange(grid_size, dtype=np.float32),
@@ -1600,6 +1601,7 @@ def apply_mtz_to_payload(
         merged_sigi_arr=cast_frame["sigma"],
         max_peaks=12000,
         peak_source="mtz",
+        d_min=float(payload.get("d_min") or 0.0),
     )
 
     frames_meta = payload.get("frames") or []
@@ -1676,6 +1678,7 @@ def apply_mtz_to_payload(
                 merged_i_arr=int_all_m,
                 merged_sigi_arr=sig_all_m,
                 peak_source="mtz",
+                d_min=float(payload.get("d_min") or 0.0),
             )
         else:
             mtz_sample_peaks = mtz_peaks
@@ -2312,6 +2315,19 @@ def _extract_from_h5(
             if "peaks/run_index" in f
             else None
         )
+        if run_index is None and "peaks/image_index" in f:
+            img_idx_raw = np.asarray(f["peaks/image_index"][()], dtype=int)
+            if "file_offsets" in f:
+                f_off_raw = np.asarray(f["file_offsets"][()], dtype=int)
+                if len(f_off_raw) > 1:
+                    run_index = (
+                        np.searchsorted(f_off_raw, img_idx_raw, side="right") - 1
+                    )
+                    run_index = np.maximum(0, run_index)
+            elif "goniometer/R" in f and len(img_idx_raw) > 0:
+                n_gonio_r = len(f["goniometer/R"])
+                if n_gonio_r > 1 and int(np.max(img_idx_raw)) < n_gonio_r:
+                    run_index = img_idx_raw
         careless_residual = (
             np.asarray(f["peaks/careless_residual"][()], dtype=float)
             if "peaks/careless_residual" in f
@@ -2714,17 +2730,27 @@ def _extract_from_h5(
                 and len(sigma) == len(peaks_xyz)
             ):
                 cand_snr = (sigma > 0) & (intensity / np.maximum(sigma, 1e-9) >= 2.5)
-                if int(np.sum(cand_snr)) >= 20:
+                if (
+                    artifact_kind in ("integrator", "merged_careless")
+                    and bool(np.any(cand_snr))
+                ) or int(np.sum(cand_snr)) >= 20:
                     mask_all_snr = cand_snr
                 elif np.any(sigma > 0):
                     mask_all_snr = sigma > 0
             idx_all = np.flatnonzero(mask_all_snr)
-            if len(idx_all) > 3500:
+            if len(idx_all) > 12000:
+                active_keep = np.array([], dtype=int)
+                if run_index is not None and len(run_index) == len(peaks_xyz):
+                    active_keep = np.flatnonzero(
+                        mask_all_snr & (run_index == active_frame)
+                    )
                 if intensity is not None and len(intensity) == len(peaks_xyz):
-                    top_k = np.argsort(-intensity[idx_all])[:3500]
+                    top_k = np.argsort(-intensity[idx_all])[:12000]
                     idx_all = np.sort(idx_all[top_k])
                 else:
-                    idx_all = idx_all[:3500]
+                    idx_all = idx_all[:12000]
+                if len(active_keep) > 0:
+                    idx_all = np.unique(np.concatenate([idx_all, active_keep]))
             r_idx_all = (
                 run_index[idx_all]
                 if run_index is not None and len(run_index) == len(peaks_xyz)
@@ -3572,6 +3598,104 @@ def _build_ndip_pipeline_stages(
     ]
 
 
+def _make_systematic_absence_checker(space_group: str | None) -> Any:
+    """Return ``is_absent(h, k, l) -> bool`` respecting full space-group systematic absences."""
+    sg_ops = None
+    with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
+        import gemmi
+
+        sg_raw = str(space_group or "P 1").strip()
+        sg_obj = gemmi.find_spacegroup_by_name(sg_raw)
+        if sg_obj is None and len(sg_raw) >= 2 and " " not in sg_raw:
+            sg_obj = gemmi.find_spacegroup_by_name(" ".join(list(sg_raw)))
+        if sg_obj is not None:
+            sg_ops = sg_obj.operations()
+
+    sg_u = str(space_group or "P 1").strip().upper()
+    centering = sg_u[0] if sg_u else "P"
+
+    def _is_absent(h_v: int, k_v: int, l_v: int) -> bool:
+        if h_v == 0 and k_v == 0 and l_v == 0:
+            return True
+        if sg_ops is not None:
+            with contextlib.suppress(RuntimeError, ValueError, TypeError):
+                return bool(sg_ops.is_systematically_absent([h_v, k_v, l_v]))
+        if centering == "I":
+            return ((h_v + k_v + l_v) & 1) != 0
+        if centering == "F":
+            return (
+                ((h_v + k_v) & 1) != 0
+                or ((k_v + l_v) & 1) != 0
+                or ((h_v + l_v) & 1) != 0
+            )
+        if centering == "C":
+            return ((h_v + k_v) & 1) != 0
+        if centering == "A":
+            return ((k_v + l_v) & 1) != 0
+        if centering == "B":
+            return ((h_v + l_v) & 1) != 0
+        if centering == "R":
+            return ((-h_v + k_v + l_v) % 3) != 0
+        return False
+
+    return _is_absent
+
+
+def _compute_harmonic_order_and_multiplicity(
+    h_v: int,
+    k_v: int,
+    l_v: int,
+    lam_val: float,
+    d_val: float,
+    *,
+    wl_min: float,
+    wl_max: float,
+    d_min: float,
+    is_absent_fn: Any,
+    observed_distinct_orders: int = 1,
+) -> tuple[int, int]:
+    """Compute space-group-allowed harmonic order and in-band Laue harmonic multiplicity."""
+    if h_v == 0 and k_v == 0 and l_v == 0:
+        return (1, 1)
+    g = max(1, math.gcd(abs(h_v), math.gcd(abs(k_v), abs(l_v))))
+    h0, k0, l0 = h_v // g, k_v // g, l_v // g
+
+    if g <= 64:
+        allowed_ord = sum(
+            1 for m in range(1, g + 1) if not is_absent_fn(m * h0, m * k0, m * l0)
+        )
+        allowed_ord = max(1, allowed_ord)
+    else:
+        allowed_ord = g
+
+    if not (np.isfinite(lam_val) and lam_val > 0.0 and wl_max > wl_min > 0.0):
+        return (allowed_ord, max(1, int(observed_distinct_orders)))
+
+    lam_prod = float(g) * float(lam_val)
+    m_lo = max(1, math.ceil(lam_prod / max(float(wl_max), 1e-6) - 1e-5))
+    m_hi_wl = lam_prod / max(float(wl_min), 1e-6)
+    if np.isfinite(d_val) and d_val > 0.0 and np.isfinite(d_min) and d_min > 0.0:
+        d_eff = min(float(d_min), float(d_val))
+        m_hi_d = (float(g) * float(d_val)) / max(d_eff, 1e-6)
+        m_hi = math.floor(min(m_hi_wl, m_hi_d) + 1e-5)
+    else:
+        m_hi = math.floor(m_hi_wl + 1e-5)
+
+    if m_hi < m_lo:
+        n_in_band = 1
+    else:
+        m_cap = min(m_hi, m_lo + 64)
+        n_in_band = sum(
+            1
+            for m in range(m_lo, m_cap + 1)
+            if not is_absent_fn(m * h0, m * k0, m * l0)
+        )
+        if m_lo <= g <= m_hi and n_in_band < 1:
+            n_in_band = 1
+
+    return (allowed_ord, max(1, n_in_band, int(observed_distinct_orders)))
+
+
 def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
     """Return a function ``(h, k, l) -> (asu_h, asu_k, asu_l, is_friedel)`` for ``space_group``."""
     sg_obj = None
@@ -3869,6 +3993,7 @@ def _serialize_peak_entries(
     zone_tolerance_deg: float = 0.75,
     max_peaks: int = 2500,
     peak_source: str = "predicted",
+    d_min: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Serialize a set of detector peak observations for the active frame."""
     pts = np.asarray(pts, dtype=float)
@@ -4075,8 +4200,18 @@ def _serialize_peak_entries(
                     ellipse_ang_by_idx[p_i] = round(float(np.rad2deg(phi_all[p_i])), 1)
 
     _to_asu_hkl = _make_asu_mapper(space_group, cell)
+    _is_absent = _make_systematic_absence_checker(space_group)
+    d_min_eff = (
+        float(d_min)
+        if d_min and float(d_min) > 0.0
+        else (
+            float(np.min(d_spacing[d_spacing > 0]))
+            if len(d_spacing) > 0 and np.any(d_spacing > 0)
+            else 0.5 * wl_min
+        )
+    )
 
-    base_ray_counts: dict[tuple[int, int, int], int] = {}
+    base_ray_orders: dict[tuple[int, int, int], set[int]] = {}
     for i in range(n_peaks):
         h_i, k_i, l_i = (
             int(hkl_arr[i, 0]),
@@ -4084,9 +4219,11 @@ def _serialize_peak_entries(
             int(hkl_arr[i, 2]),
         )
         if h_i or k_i or l_i:
-            g_c = max(1, int(np.gcd.reduce(np.abs([h_i, k_i, l_i]))))
-            b_ray = (h_i // g_c, k_i // g_c, l_i // g_c)
-            base_ray_counts[b_ray] = base_ray_counts.get(b_ray, 0) + 1
+            lam_chk = float(lam_arr[i]) if i < len(lam_arr) else 0.5 * (wl_min + wl_max)
+            if wl_min - 1e-4 <= lam_chk <= wl_max + 1e-4:
+                g_c = max(1, int(np.gcd.reduce(np.abs([h_i, k_i, l_i]))))
+                b_ray = (h_i // g_c, k_i // g_c, l_i // g_c)
+                base_ray_orders.setdefault(b_ray, set()).add(g_c)
 
     peaks_list: list[dict[str, Any]] = []
     for i in range(n_peaks):
@@ -4103,10 +4240,6 @@ def _serialize_peak_entries(
             if (h_i or k_i or l_i)
             else (0, 0, 0)
         )
-        harm_mult = max(
-            int(base_ray_counts.get(b_ray, 1)),
-            2 if g_gcd > 1 else 1,
-        )
         asu_h, asu_k, asu_l, asu_is_friedel = _to_asu_hkl(h_i, k_i, l_i)
         orbit_id = f"{asu_h},{asu_k},{asu_l}"
         orbit_color_idx = (
@@ -4114,6 +4247,19 @@ def _serialize_peak_entries(
         )
         d_val = float(d_spacing[i]) if i < len(d_spacing) else 2.0
         lam_val = float(lam_arr[i]) if i < len(lam_arr) else 0.5 * (wl_min + wl_max)
+        obs_ord_cnt = len(base_ray_orders.get(b_ray, ())) if (h_i or k_i or l_i) else 1
+        harm_ord, harm_mult = _compute_harmonic_order_and_multiplicity(
+            h_i,
+            k_i,
+            l_i,
+            lam_val,
+            d_val,
+            wl_min=wl_min,
+            wl_max=wl_max,
+            d_min=d_min_eff,
+            is_absent_fn=_is_absent,
+            observed_distinct_orders=max(1, obs_ord_cnt),
+        )
         err_val = float(ang_err_deg[i]) if i < len(ang_err_deg) else 0.0
         is_indexed = bool(
             (
@@ -4170,8 +4316,8 @@ def _serialize_peak_entries(
             ),
             "wavelength": round(float(np.clip(lam_val, wl_min * 0.5, wl_max * 1.5)), 4),
             "d_spacing": round(d_val, 4),
-            "harmonic_order": max(1, g_gcd),
-            "harmonic_multiplicity": harm_mult,
+            "harmonic_order": int(harm_ord),
+            "harmonic_multiplicity": int(harm_mult),
             "parallax_depth": round(parallax_depth, 4),
             "hkl": [h_i, k_i, l_i],
             "asu_hkl": [asu_h, asu_k, asu_l],
@@ -4236,6 +4382,7 @@ def _serialize_sample_peaks(
     merged_i_arr: np.ndarray | None = None,
     merged_sigi_arr: np.ndarray | None = None,
     peak_source: str = "predicted",
+    d_min: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Serialize multi-run sample-space reflections for the Wulff Net."""
     if (
@@ -4268,16 +4415,36 @@ def _serialize_sample_peaks(
         g_samp_all[m_u] = g_lab_all[m_u] @ R_u
 
     _to_asu_hkl = _make_asu_mapper(space_group, cell)
+    _is_absent = _make_systematic_absence_checker(space_group)
     wl_min, wl_max = float(wavelength_range[0]), float(wavelength_range[1])
 
+    st_all = np.clip(0.5 * qn_all[:, 0], 1e-4, 0.9999)
+    lam_vec = (
+        np.asarray(lam_all, dtype=float)
+        if lam_all is not None and len(lam_all) == len(pts_all)
+        else np.full(len(pts_all), 0.5 * (wl_min + wl_max), dtype=float)
+    )
+    d_vec = lam_vec / np.maximum(2.0 * st_all, 1e-4)
+    d_min_eff = (
+        float(d_min)
+        if d_min and float(d_min) > 0.0
+        else (
+            float(np.min(d_vec[d_vec > 0]))
+            if len(d_vec) > 0 and np.any(d_vec > 0)
+            else 0.5 * wl_min
+        )
+    )
+
     sx_all, sy_all, hm_all = stereographic_projection(g_samp_all)
-    ray_counts_all: dict[tuple[int, int, int, int], int] = {}
+    ray_orders_all: dict[tuple[int, int, int, int], set[int]] = {}
     for j in range(len(pts_all)):
         hj, kj, lj = int(hkl_all[j, 0]), int(hkl_all[j, 1]), int(hkl_all[j, 2])
         if hj or kj or lj:
-            gc = max(1, int(np.gcd.reduce(np.abs([hj, kj, lj]))))
-            rk = (int(r_idx_all[j]), hj // gc, kj // gc, lj // gc)
-            ray_counts_all[rk] = ray_counts_all.get(rk, 0) + 1
+            lv_chk = float(lam_vec[j])
+            if wl_min - 1e-4 <= lv_chk <= wl_max + 1e-4:
+                gc = max(1, int(np.gcd.reduce(np.abs([hj, kj, lj]))))
+                rk = (int(r_idx_all[j]), hj // gc, kj // gc, lj // gc)
+                ray_orders_all.setdefault(rk, set()).add(gc)
 
     sample_peaks: list[dict[str, Any]] = []
     for j in range(len(pts_all)):
@@ -4293,17 +4460,24 @@ def _serialize_sample_peaks(
             if (hj or kj or lj)
             else (int(r_idx_all[j]), 0, 0, 0)
         )
-        h_mult = max(int(ray_counts_all.get(rk, 1)), 2 if gc > 1 else 1)
         ah, ak, al, asu_fr_j = _to_asu_hkl(hj, kj, lj)
         orb_id = f"{ah},{ak},{al}"
         orb_c = abs(ah * 73856093 ^ ak * 19349663 ^ al * 83492791) % 12
-        lv = (
-            float(lam_all[j])
-            if lam_all is not None and j < len(lam_all)
-            else 0.5 * (wl_min + wl_max)
+        lv = float(lam_vec[j])
+        dv = float(d_vec[j])
+        obs_ord_j = len(ray_orders_all.get(rk, ())) if (hj or kj or lj) else 1
+        h_ord, h_mult = _compute_harmonic_order_and_multiplicity(
+            hj,
+            kj,
+            lj,
+            lv,
+            dv,
+            wl_min=wl_min,
+            wl_max=wl_max,
+            d_min=d_min_eff,
+            is_absent_fn=_is_absent,
+            observed_distinct_orders=max(1, obs_ord_j),
         )
-        st_j = float(np.clip(0.5 * qn_all[j, 0], 1e-4, 0.9999))
-        dv = lv / max(2.0 * st_j, 1e-4)
         sp_item: dict[str, Any] = {
             "id": j,
             "peak_source": peak_source,
@@ -4324,8 +4498,8 @@ def _serialize_sample_peaks(
             else 3.0,
             "wavelength": round(float(np.clip(lv, wl_min * 0.5, wl_max * 1.5)), 4),
             "d_spacing": round(dv, 4),
-            "harmonic_order": max(1, gc),
-            "harmonic_multiplicity": h_mult,
+            "harmonic_order": int(h_ord),
+            "harmonic_multiplicity": int(h_mult),
             "hkl": [hj, kj, lj],
             "asu_hkl": [ah, ak, al],
             "asu_orbit_id": orb_id,
@@ -4542,6 +4716,13 @@ def build_rainbow_zone_payload(
         int(max_peaks) if is_integrated_artifact else max(int(max_peaks), 12000)
     )
 
+    default_d_min = round(0.5 * float(wl_min), 2)
+    d_min_use = (
+        float(d_min)
+        if d_min is not None and float(d_min) > 0
+        else float((solve_diagnostics or {}).get("d_min", default_d_min))
+    )
+
     peaks_list = _serialize_peak_entries(
         pts,
         bank_arr=bank_arr,
@@ -4570,6 +4751,7 @@ def build_rainbow_zone_payload(
         zone_tolerance_deg=zone_tolerance_deg,
         max_peaks=primary_max_peaks,
         peak_source=primary_source,
+        d_min=d_min_use,
     )
 
     sample_peaks = _serialize_sample_peaks(
@@ -4584,13 +4766,7 @@ def build_rainbow_zone_payload(
         merged_i_arr=merged_i_arr,
         merged_sigi_arr=merged_sigi_arr,
         peak_source=primary_source,
-    )
-
-    default_d_min = round(0.5 * float(wl_min), 2)
-    d_min_use = (
-        float(d_min)
-        if d_min is not None and float(d_min) > 0
-        else float((solve_diagnostics or {}).get("d_min", default_d_min))
+        d_min=d_min_use,
     )
 
     if is_integrated_artifact:
@@ -4752,6 +4928,7 @@ def build_rainbow_zone_payload(
                 zone_tolerance_deg=zone_tolerance_deg,
                 max_peaks=max(int(max_peaks), 12000),
                 peak_source="predicted",
+                d_min=d_min_use,
             )
             predicted_sample_peaks = _serialize_sample_peaks(
                 predicted_all_runs_data,
@@ -4763,6 +4940,7 @@ def build_rainbow_zone_payload(
                 space_group=space_group,
                 cell=cell,
                 peak_source="predicted",
+                d_min=d_min_use,
             )
         else:
             predicted_peaks = []
@@ -5050,6 +5228,8 @@ def build_rainbow_zone_payload(
         "default_projection": resolved_proj,
         "space_group": str(space_group),
         "intensity_source": intensity_source,
+        "render_binning": int(render_binning),
+        "all_runs_min_isigi": 2.5,
         "artifact_kind": artifact_kind,
         "peak_shape_mode": peak_shape_mode,
         "default_peak_source": default_peak_source,
@@ -6314,15 +6494,19 @@ def render_rainbow_html(
         Cyl
       </button>
       <div id="peak-source-group" class="seg-toggle" title="Toggle displayed &amp; Wulff-projected reflections: Predicted (circles), Integrated (2σ ellipses), or custom .mtz">
-        <button id="btn-peaks-pred" type="button" data-peak-src="predicted" class="active-btn" title="Predicted reflections (circles)">○ Pred</button>
+        <button id="btn-peaks-pred" type="button" data-peak-src="predicted" class="active-btn" title="All predicted reflections within λ_min..λ_max and d ≥ d_min (circles)">○ Pred</button>
         <button id="btn-peaks-integ" type="button" data-peak-src="integrated" disabled title="Successfully integrated reflections (2σ ellipses)">⬭ Integ</button>
-        <button id="btn-peaks-mtz" type="button" data-peak-src="mtz" disabled title="Custom .mtz reflections using MTZ unit cell B &amp; space group with active U">.mtz</button>
+        <button id="btn-peaks-mtz" type="button" data-peak-src="mtz" disabled title="Custom .mtz reflections projected into active UB geometry (preserving solved B)">.mtz</button>
       </div>
       <button id="btn-zone-arcs" class="active-btn" title="Show/Hide single-arc Laue zone curves on the detector">
         Arcs
       </button>
       <button id="btn-pixel-mask" title="Show/Hide translucent two-color EM pixel mask overlay (Cyan = Dark/Shadowed, Lime = Static Bright)">
         Mask
+      </button>
+      <button id="btn-hires-tex" title="Toggle native 1× Hi-Res detector textures vs fast 4× downsampled preview" style="display:inline-flex;align-items:center;gap:4px;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 18h8"/><path d="M3 22h18"/><path d="M14 22a7 7 0 1 0 0-14h-1"/><path d="M9 14h2"/><path d="M9 12a2 2 0 0 1-2-2V6h6v4a2 2 0 0 1-2 2Z"/><path d="M12 6V3a1 1 0 0 0-1-1H9a1 1 0 0 0-1 1v3"/></svg>
+        <span id="lbl-hires-tex">Hi-Res</span>
       </button>
       <button id="btn-heatmap-cmap" title="Cycle Detector Intensity Heatmap Colormap (Magma / Cyan Glow / Film)">
         Magma
@@ -6974,6 +7158,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
     showZoneArcs: true,           // single vibrant arc per zone (not multi-band rainbow)
     showPixelMask: false,         // translucent two-color EM pixel mask overlay (dark=cyan, bright=lime)
+    hiResTextures: Number(DATA.render_binning || 4) <= 1, // native 1x detector textures vs fast 4x downsampled preview
+    hiresLoading: false,
+    hiresReqSeq: 0,
     heatmapStyle: "magma",        // "magma" | "cyan" | "gray"
     peakSource: String(DATA.default_peak_source || ((String(DATA.artifact_kind || "").toLowerCase() === "integrator" || String(DATA.artifact_kind || "").toLowerCase() === "merged_careless") ? "integrated" : "predicted")), // "predicted" | "integrated" | "mtz"
     detAlpha: 0.85,
@@ -7113,6 +7300,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   const rawBankImages = new Map();
+  let lastClientBankImgs = null;
+  let lastClientBankMaskRaw = null;
+
+  function syncHiResButtonUI() {{
+    const btn = document.getElementById("btn-hires-tex");
+    const lbl = document.getElementById("lbl-hires-tex");
+    if (!btn) return;
+    btn.classList.toggle("active-btn", Boolean(state.hiResTextures));
+    if (lbl) lbl.textContent = state.hiresLoading ? "Hi-Res…" : "Hi-Res";
+    btn.title = state.hiResTextures
+      ? "Native 1× Hi-Res detector pixel textures active (click for fast 4× binned preview)"
+      : "Fast 4× downsampled detector preview active (click for native 1× Hi-Res microscope view)";
+  }}
+
+  function getRenderBinningQuery() {{
+    return state.hiResTextures ? "&render_binning=1" : "&render_binning=4";
+  }}
+
   function decodeAllBankTextures() {{
     let pending = 0;
     PANELS.forEach(p => {{
@@ -8094,6 +8299,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return hasCarelessResiduals() || hasCarelessScales();
   }}
 
+  const WULFF_ALL_RUNS_MIN_ISIGI = Number(DATA.all_runs_min_isigi || 2.5);
+
+  function isWulffSnrCutActive() {{
+    return state.wulffScope === "all_runs" && state.peakSource === "integrated" && hasIntegratedIsigi();
+  }}
+
+  function isPeakUncertainForScope(p) {{
+    if (!p || !isWulffSnrCutActive()) return false;
+    const snr = peakUnscaledIsigi(p);
+    return !(typeof snr === "number" && Number.isFinite(snr) && snr >= WULFF_ALL_RUNS_MIN_ISIGI);
+  }}
+
   function peakStrokeColor(p, alpha = 0.95) {{
     const mode = state.wulffColorMode || "wavelength";
     if (mode === "orbit") {{
@@ -8139,10 +8356,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       stereoEl.classList.toggle("expanded", Boolean(state.wulffExpanded));
     }}
     if (btnTop) btnTop.classList.toggle("active-btn", Boolean(state.showStereo));
+    const snrCutActive = isWulffSnrCutActive();
     if (btnScope) {{
       const isAll = state.wulffScope === "all_runs";
-      btnScope.textContent = isAll ? "All-Runs" : "1-Frame";
+      btnScope.textContent = isAll
+        ? (snrCutActive ? `All-Runs (I/σ≥${{WULFF_ALL_RUNS_MIN_ISIGI}})` : "All-Runs")
+        : "1-Frame";
       btnScope.classList.toggle("active-btn", isAll);
+      btnScope.title = isAll
+        ? `Multi-run Wulff spots${{snrCutActive ? ` filtered to I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}} (uncertain I/σ < ${{WULFF_ALL_RUNS_MIN_ISIGI}} spots dimmed on detector)` : ""}}. Click for 1-Frame`
+        : "Single-frame Wulff spots (all detector spots at full brightness). Click for All-Runs";
     }}
     if (btnFriedel) {{
       btnFriedel.classList.toggle("active-btn", Boolean(state.showWulffFriedel));
@@ -8172,7 +8395,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       sel.value = state.wulffColorMode || "wavelength";
     }});
     if (titleEl) {{
-      const scopeLbl = state.wulffScope === "all_runs" ? "ALL-RUNS" : "1-FRAME";
+      const scopeLbl = state.wulffScope === "all_runs"
+        ? (snrCutActive ? `ALL-RUNS · I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}}` : "ALL-RUNS")
+        : "1-FRAME";
       titleEl.textContent = `WULFF NET · ${{scopeLbl}}`;
     }}
     updateMergeScoreboard();
@@ -8418,7 +8643,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const detXVal = typeof p.det_x === "number" ? p.det_x : 0.0;
     const detYVal = typeof p.det_y === "number" ? p.det_y : 0.0;
     const errDeg = typeof p.angular_error_deg === "number" ? p.angular_error_deg : 0.0;
-    const harmMult = p.harmonic_multiplicity || p.harmonic_order || 1;
+    const harmMult = p.harmonic_multiplicity || 1;
     setStatusLine(
       `[BANK #${{p.bank || 1}} • RUN #${{(p.run_index || 0) + 1}}]`,
       `<strong>(hkl)=<span style="color:var(--accent-gold);">(${{p.hkl.join(", ")}})</span></strong>${{asuStr}} (n=${{p.harmonic_order || 1}}${{harmMult > 1 ? `, mult=${{harmMult}}` : ""}}) • λ=<strong>${{p.wavelength.toFixed(3)}} Å</strong> • d=<strong>${{p.d_spacing.toFixed(3)}} Å</strong> • I=<strong>${{Math.round(p.intensity)}}</strong>${{snrStr}}${{mergeStr}}${{shapeStr}} • φ=${{detXVal.toFixed(1)}}°, Y=${{detYVal.toFixed(3)}}m, ψ=${{elVal.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zLabels}}</span> (Δθ=${{errDeg.toFixed(3)}}°)`
@@ -9034,18 +9259,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function warpTextureOntoPanel(texCanvas, panel, isSph, smooth) {{
     const [vMin, vMax] = getPanelVertRange(panel);
-    const azSpan = Math.max(1e-5, panel.az_max - panel.az_min);
+    const azSpan = Math.max(1e-5, panel.az_min - panel.az_max ? panel.az_max - panel.az_min : 1e-5);
     const vSpan = Math.max(1e-5, vMax - vMin);
     const W = Math.max(1, texCanvas.width);
     const H = Math.max(1, texCanvas.height);
-    const spW = W > 512 ? Math.min(2048, W) : Math.min(384, Math.max(192, W * 2));
-    const spH = H > 512 ? Math.min(1024, H) : Math.min(384, Math.max(192, H * 2));
+    const hiRes = Boolean(state.hiResTextures);
+    const spW = hiRes
+      ? Math.min(2048, Math.max(512, W * 2))
+      : (W > 512 ? Math.min(2048, W) : Math.min(384, Math.max(192, W * 2)));
+    const spH = hiRes
+      ? Math.min(2048, Math.max(512, H * 2))
+      : (H > 512 ? Math.min(1024, H) : Math.min(384, Math.max(192, H * 2)));
 
     const wc = document.createElement("canvas");
     wc.width = spW;
     wc.height = spH;
     const wctx = wc.getContext("2d");
-    wctx.imageSmoothingEnabled = Boolean(smooth);
+    wctx.imageSmoothingEnabled = hiRes ? false : Boolean(smooth);
 
     const toSp = pt => [
       ((pt[0] - panel.az_min) / azSpan) * spW,
@@ -9175,11 +9405,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function getWarpedPanelCanvas(panel, isSph) {{
     const texCanvas = bankCanvases.get(panel.bank);
     if (!texCanvas) return null;
-    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{state.heatmapStyle}}`;
+    const resKey = state.hiResTextures ? "hi" : "lo";
+    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{state.heatmapStyle}}_${{resKey}}`;
     if (warpedBankCanvases.has(cacheKey)) {{
       return warpedBankCanvases.get(cacheKey);
     }}
-    const wc = warpTextureOntoPanel(texCanvas, panel, isSph, true);
+    const wc = warpTextureOntoPanel(texCanvas, panel, isSph, !state.hiResTextures);
     warpedBankCanvases.set(cacheKey, wc);
     return wc;
   }}
@@ -9187,13 +9418,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function getWarpedMaskCanvas(panel, isSph) {{
     const mCanvas = maskBankCanvases.get(panel.bank);
     if (!mCanvas) return null;
-    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}`;
+    const resKey = state.hiResTextures ? "hi" : "lo";
+    const cacheKey = `${{panel.bank}}_${{isSph ? "sph" : "cyl"}}_${{resKey}}`;
     if (warpedMaskCanvases.has(cacheKey)) {{
       return warpedMaskCanvases.get(cacheKey);
     }}
     const wc = warpTextureOntoPanel(mCanvas, panel, isSph, false);
     warpedMaskCanvases.set(cacheKey, wc);
     return wc;
+  }}
+
+  function renderDetector() {{
+    renderDetectorCanvas();
   }}
 
   function renderDetectorCanvas() {{
@@ -9285,7 +9521,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (warpedCanvas) {{
               ctx.save();
               ctx.globalAlpha = state.detAlpha;
-              ctx.imageSmoothingEnabled = true;
+              ctx.imageSmoothingEnabled = !(state.hiResTextures && state.detZoom >= 1.8);
               ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
               ctx.restore();
             }}
@@ -9294,7 +9530,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const warpedMask = getWarpedMaskCanvas(panel, isSph);
             if (warpedMask) {{
               ctx.save();
-              ctx.imageSmoothingEnabled = state.detZoom < 2.0;
+              ctx.imageSmoothingEnabled = !state.hiResTextures && state.detZoom < 2.0;
               ctx.drawImage(warpedMask, x0, y0, pw, ph);
               ctx.restore();
             }}
@@ -9308,7 +9544,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             if (warpedCanvas) {{
               ctx.save();
               ctx.globalAlpha = state.detAlpha;
-              ctx.imageSmoothingEnabled = true;
+              ctx.imageSmoothingEnabled = !(state.hiResTextures && state.detZoom >= 1.8);
               ctx.drawImage(warpedCanvas, x0, y0, pw, ph);
               ctx.restore();
             }}
@@ -9317,7 +9553,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const warpedMask = getWarpedMaskCanvas(panel, isSph);
             if (warpedMask) {{
               ctx.save();
-              ctx.imageSmoothingEnabled = state.detZoom < 2.0;
+              ctx.imageSmoothingEnabled = !state.hiResTextures && state.detZoom < 2.0;
               ctx.drawImage(warpedMask, x0, y0, pw, ph);
               ctx.restore();
             }}
@@ -9397,14 +9633,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
         const baseR = Math.max(1.2, Math.min(20.0, 1.85 * state.detZoom));
         const r = isHovered ? baseR + 1.8 : (isOrbitMate ? baseR + 1.2 : baseR);
+        const isUncertain = !isHovered && !isOrbitMate && isPeakUncertainForScope(p);
+        const strokeAlpha = isUncertain
+          ? (captured ? 0.20 : 0.09)
+          : (captured ? 0.95 : 0.42);
 
         ctx.save();
         const ellPtsRaw = isSph ? (p.ellipse_sph || p.ellipse) : p.ellipse;
         const strokeCol = isHovered
           ? "#f43f85"
-          : (isOrbitMate ? "#fbbf24" : peakStrokeColor(p, captured ? 0.95 : 0.42));
+          : (isOrbitMate ? "#fbbf24" : peakStrokeColor(p, strokeAlpha));
         ctx.strokeStyle = strokeCol;
-        ctx.lineWidth = isHovered ? 2.4 : (isOrbitMate ? 2.1 : (captured ? 1.85 : 1.05));
+        ctx.lineWidth = isHovered
+          ? 2.4
+          : (isOrbitMate ? 2.1 : (isUncertain ? (captured ? 1.0 : 0.7) : (captured ? 1.85 : 1.05)));
+        if (isUncertain) ctx.setLineDash([2, 2]);
 
         if (state.peakSource === "integrated" && Array.isArray(ellPtsRaw) && ellPtsRaw.length >= 6) {{
           const scrPts = ellPtsRaw.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, fgLayer));
@@ -9425,28 +9668,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           }}
           ctx.closePath();
           ctx.stroke();
-
-          if (p.shape_kind === "ellipse" && (isHovered || isOrbitMate || state.detZoom > 2.2) && scrPts.length >= 16) {{
-            const nHalf = Math.floor(scrPts.length / 2);
-            const nQuarter = Math.floor(scrPts.length / 4);
-            const p0 = [x + (scrPts[0][0] - x) * scale, y + (scrPts[0][1] - y) * scale];
-            const pHalf = [x + (scrPts[nHalf][0] - x) * scale, y + (scrPts[nHalf][1] - y) * scale];
-            const pQ1 = [x + (scrPts[nQuarter][0] - x) * scale, y + (scrPts[nQuarter][1] - y) * scale];
-            const pQ3 = [x + (scrPts[nQuarter + nHalf][0] - x) * scale, y + (scrPts[nQuarter + nHalf][1] - y) * scale];
-            ctx.save();
-            ctx.strokeStyle = (isHovered || isOrbitMate) ? "rgba(251, 191, 36, 0.75)" : "rgba(56, 189, 248, 0.42)";
-            ctx.lineWidth = 0.85;
-            ctx.beginPath();
-            ctx.moveTo(p0[0], p0[1]); ctx.lineTo(pHalf[0], pHalf[1]);
-            ctx.moveTo(pQ1[0], pQ1[1]); ctx.lineTo(pQ3[0], pQ3[1]);
-            ctx.stroke();
-            ctx.restore();
-          }}
         }} else {{
           ctx.beginPath();
           ctx.arc(x, y, r, 0, Math.PI * 2);
           ctx.stroke();
         }}
+        if (isUncertain) ctx.setLineDash([]);
 
         // Highlight symmetry-orbit mates or Laue harmonic overlaps on detector
         if (isOrbitMate && !isHovered) {{
@@ -9458,7 +9685,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
 
         if (state.detAlpha < 0.2) {{
-          ctx.fillStyle = peakStrokeColor(p, 0.85);
+          ctx.fillStyle = peakStrokeColor(p, isUncertain ? 0.16 : 0.85);
           ctx.fill();
         }}
 
@@ -9766,8 +9993,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
       }}
 
-      // Harmonic Overlap Bullseye: concentric outer ring when harmonic_multiplicity > 1 or harmonic_order > 1
-      const harmMult = p.harmonic_multiplicity || p.harmonic_order || 1;
+      // Harmonic Overlap Bullseye: concentric outer ring when harmonic_multiplicity > 1
+      const harmMult = p.harmonic_multiplicity || 1;
       if (harmMult > 1 && !isFriedelGhost) {{
         ctx.beginPath();
         ctx.arc(sx, sy, rDot + (isExp ? 3.0 : 2.1) * dotScale, 0, Math.PI * 2);
@@ -9895,6 +10122,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ctx.fillText(lbl, tx + 8, ty - 6);
         }}
       }});
+      ctx.restore();
+    }}
+
+    if (isWulffSnrCutActive()) {{
+      ctx.save();
+      const badgeTxt = `I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}}`;
+      ctx.font = isExp ? "bold 10px monospace" : "bold 8.5px monospace";
+      const tw = ctx.measureText(badgeTxt).width;
+      const bx = 8;
+      const by = 8;
+      const bw = tw + 10;
+      const bh = isExp ? 17 : 14;
+      ctx.fillStyle = "rgba(7, 9, 19, 0.84)";
+      ctx.strokeStyle = "rgba(56, 189, 248, 0.48)";
+      ctx.lineWidth = 1.0;
+      ctx.beginPath();
+      if (typeof ctx.roundRect === "function") {{
+        ctx.roundRect(bx, by, bw, bh, 4);
+      }} else {{
+        ctx.rect(bx, by, bw, bh);
+      }}
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = "#38bdf8";
+      ctx.fillText(badgeTxt, bx + 5, by + (isExp ? 12 : 10));
       ctx.restore();
     }}
 
@@ -10169,6 +10421,169 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  function buildClientGrayscaleCanvas(sub, H, W, bStep) {{
+    const step = Math.max(1, bStep | 0);
+    const Hb = Math.max(1, Math.floor(H / step));
+    const Wb = Math.max(1, Math.floor(W / step));
+    const logBuf = new Float32Array(Hb * Wb);
+    for (let rb = 0; rb < Hb; rb++) {{
+      for (let cb = 0; cb < Wb; cb++) {{
+        let sum = 0;
+        for (let dr = 0; dr < step; dr++) {{
+          const rowOff = (rb * step + dr) * W + cb * step;
+          for (let dc = 0; dc < step; dc++) sum += Number(sub[rowOff + dc]);
+        }}
+        logBuf[rb * Wb + cb] = Math.log1p(Math.max(0, sum / (step * step)));
+      }}
+    }}
+    const sorted = Float32Array.from(logBuf).sort();
+    const vmax = Math.max(sorted[Math.floor(sorted.length * 0.995)] || 1.0, 1e-6);
+    const gc = document.createElement("canvas");
+    gc.width = Wb;
+    gc.height = Hb;
+    const gctx = gc.getContext("2d");
+    const idata = gctx.createImageData(Wb, Hb);
+    for (let rb = 0; rb < Hb; rb++) {{
+      for (let cb = 0; cb < Wb; cb++) {{
+        const v = Math.min(255, Math.round((logBuf[rb * Wb + cb] / vmax) * 255));
+        const pIdx = (rb * Wb + cb) * 4;
+        idata.data[pIdx] = v;
+        idata.data[pIdx + 1] = v;
+        idata.data[pIdx + 2] = v;
+        idata.data[pIdx + 3] = 255;
+      }}
+    }}
+    gctx.putImageData(idata, 0, 0);
+    return gc;
+  }}
+
+  function buildClientMaskCanvas(clsArr, Hm, Wm, bStepM) {{
+    const step = Math.max(1, bStepM | 0);
+    const Hbm = Math.max(1, Math.floor(Hm / step));
+    const Wbm = Math.max(1, Math.floor(Wm / step));
+    const mc = document.createElement("canvas");
+    mc.width = Wbm;
+    mc.height = Hbm;
+    const mctx = mc.getContext("2d");
+    const midata = mctx.createImageData(Wbm, Hbm);
+    let anyMasked = false;
+    for (let rb = 0; rb < Hbm; rb++) {{
+      for (let cb = 0; cb < Wbm; cb++) {{
+        let mx = 0;
+        for (let dr = 0; dr < step; dr++) {{
+          const rOff = (rb * step + dr) * Wm + cb * step;
+          for (let dc = 0; dc < step; dc++) {{
+            if (clsArr[rOff + dc] > mx) mx = clsArr[rOff + dc];
+          }}
+        }}
+        const pIdx = (rb * Wbm + cb) * 4;
+        if (mx >= 2) {{
+          anyMasked = true;
+          midata.data[pIdx] = 180; midata.data[pIdx + 1] = 255; midata.data[pIdx + 2] = 20; midata.data[pIdx + 3] = 224;
+        }} else if (mx === 1) {{
+          anyMasked = true;
+          midata.data[pIdx] = 56; midata.data[pIdx + 1] = 189; midata.data[pIdx + 2] = 248; midata.data[pIdx + 3] = 132;
+        }}
+      }}
+    }}
+    if (!anyMasked) return null;
+    mctx.putImageData(midata, 0, 0);
+    return mc;
+  }}
+
+  async function toggleHiResTextures() {{
+    state.hiResTextures = !state.hiResTextures;
+    const reqSeq = (state.hiresReqSeq || 0) + 1;
+    state.hiresReqSeq = reqSeq;
+    warpedBankCanvases.clear();
+    warpedMaskCanvases.clear();
+    syncHiResButtonUI();
+    renderDetector();
+
+    if (lastClientBankImgs && lastClientBankImgs.size > 0) {{
+      const step = state.hiResTextures ? 1 : 4;
+      PANELS.forEach(p => {{
+        const imEntry = lastClientBankImgs.get(p.bank);
+        if (imEntry) {{
+          const gc = buildClientGrayscaleCanvas(imEntry.data, imEntry.H, imEntry.W, step);
+          p._grayCanvas = gc;
+          rawBankImages.set(p.bank, gc);
+          bankCanvases.set(p.bank, colorizeGrayscaleImage(gc, state.heatmapStyle));
+        }}
+        if (lastClientBankMaskRaw && lastClientBankMaskRaw.has(p.bank)) {{
+          const mEntry = lastClientBankMaskRaw.get(p.bank);
+          const mc = buildClientMaskCanvas(mEntry.data, mEntry.H, mEntry.W, step);
+          p._maskCanvas = mc;
+          if (mc) maskBankCanvases.set(p.bank, mc);
+        }}
+      }});
+      warpedBankCanvases.clear();
+      warpedMaskCanvases.clear();
+      renderDetector();
+      setStatusLine(
+        "[DETECTOR TEXTURE]",
+        state.hiResTextures
+          ? "Switched to <strong>native 1× Hi-Res</strong> detector pixel textures."
+          : "Switched to <strong>fast 4× binned</strong> detector preview textures."
+      );
+      return;
+    }}
+
+    state.hiresLoading = true;
+    syncHiResButtonUI();
+    try {{
+      const curFrame = typeof state.selectedFrameIndex === "number"
+        ? state.selectedFrameIndex
+        : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+      const dminQ = (Number.isFinite(state.dMin) && state.dMin > 0) ? `&d_min=${{encodeURIComponent(state.dMin)}}` : "";
+      const resp = await fetch(
+        `api/payload?frame=${{curFrame}}&preserve_params=1${{dminQ}}${{getRenderBinningQuery()}}`,
+        {{ cache: "no-store" }}
+      );
+      if (reqSeq !== state.hiresReqSeq) return;
+      if (resp.ok) {{
+        const doc = await resp.json();
+        if (reqSeq !== state.hiresReqSeq) return;
+        if (doc && Array.isArray(doc.panels) && doc.panels.length > 0) {{
+          const panelMap = new Map(doc.panels.map(np => [np.bank, np]));
+          PANELS.forEach(p => {{
+            const np = panelMap.get(p.bank);
+            if (np) {{
+              if (np.texture_b64) p.texture_b64 = np.texture_b64;
+              if (np.mask_b64) p.mask_b64 = np.mask_b64;
+            }}
+          }});
+          DATA.render_binning = doc.render_binning || (state.hiResTextures ? 1 : 4);
+          warpedBankCanvases.clear();
+          warpedMaskCanvases.clear();
+          decodeAllBankTextures();
+          setStatusLine(
+            "[DETECTOR TEXTURE]",
+            state.hiResTextures
+              ? "Loaded <strong>native 1× Hi-Res</strong> detector bank textures (zoom in for crisp pixels)."
+              : "Restored <strong>fast 4× binned</strong> detector preview textures."
+          );
+        }}
+      }}
+    }} catch (_e) {{
+      // Client-only static HTML: warp resolution & nearest-neighbor zoom still upgraded cleanly
+    }} finally {{
+      if (reqSeq === state.hiresReqSeq) {{
+        state.hiresLoading = false;
+        syncHiResButtonUI();
+        renderDetector();
+      }}
+    }}
+  }}
+
+  const btnHiResTex = document.getElementById("btn-hires-tex");
+  if (btnHiResTex) {{
+    syncHiResButtonUI();
+    btnHiResTex.addEventListener("click", () => {{
+      toggleHiResTextures();
+    }});
+  }}
+
   document.getElementById("btn-heatmap-cmap").addEventListener("click", (ev) => {{
     const order = ["magma", "cyan", "gray"];
     const labels = {{ magma: "Magma", cyan: "Cyan", gray: "Film" }};
@@ -10188,6 +10603,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.wulffScope = state.wulffScope === "all_runs" ? "single_frame" : "all_runs";
       syncWulffYawFromDetector();
       syncWulffUI();
+      renderDetector();
     }});
   }}
 
@@ -10567,6 +10983,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     rawBankImages.clear();
     bankCanvases.clear();
     maskBankCanvases.clear();
+    if (!PANELS.some(p => Boolean(p._grayCanvas))) {{
+      lastClientBankImgs = null;
+      lastClientBankMaskRaw = null;
+    }}
+    if (typeof newPayload.render_binning === "number") {{
+      DATA.render_binning = newPayload.render_binning;
+    }}
+    syncHiResButtonUI();
     invalidateDetectorGeometryCache();
     decodeAllBankTextures();
     // Support direct canvas textures generated by client-side h5wasm
@@ -10917,8 +11341,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const mBankIds = dKeys.includes("mask_bank_ids")
             ? Array.from(dGrp.get("mask_bank_ids").value).map(Number)
             : Array.from({{ length: nBanksM }}, (_, idx) => idx + 1);
-          const bStepM = 4;
-          const Hbm = Math.max(1, Math.floor(Hm / bStepM)), Wbm = Math.max(1, Math.floor(Wm / bStepM));
+          const bStepM = state.hiResTextures ? 1 : 4;
           let nTotM = 0, nDarkM = 0, nBrightM = 0;
           for (let bi = 0; bi < Math.min(nBanksM, mBankIds.length); bi++) {{
             const bidM = Number(mBankIds[bi]);
@@ -10934,29 +11357,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
             bankMaskRaw.set(bidM, {{ data: clsArr, H: Hm, W: Wm }});
             if (hasMasked) {{
-              const mc = document.createElement("canvas");
-              mc.width = Wbm; mc.height = Hbm;
-              const mctx = mc.getContext("2d");
-              const midata = mctx.createImageData(Wbm, Hbm);
-              for (let rb = 0; rb < Hbm; rb++) {{
-                for (let cb = 0; cb < Wbm; cb++) {{
-                  let mx = 0;
-                  for (let dr = 0; dr < bStepM; dr++) {{
-                    const rOff = (rb * bStepM + dr) * Wm + cb * bStepM;
-                    for (let dc = 0; dc < bStepM; dc++) {{
-                      if (clsArr[rOff + dc] > mx) mx = clsArr[rOff + dc];
-                    }}
-                  }}
-                  const pIdx = (rb * Wbm + cb) * 4;
-                  if (mx >= 2) {{
-                    midata.data[pIdx] = 180; midata.data[pIdx+1] = 255; midata.data[pIdx+2] = 20; midata.data[pIdx+3] = 224;
-                  }} else if (mx === 1) {{
-                    midata.data[pIdx] = 56; midata.data[pIdx+1] = 189; midata.data[pIdx+2] = 248; midata.data[pIdx+3] = 132;
-                  }}
-                }}
-              }}
-              mctx.putImageData(midata, 0, 0);
-              bankMaskCanvases.set(bidM, mc);
+              const mc = buildClientMaskCanvas(clsArr, Hm, Wm, bStepM);
+              if (mc) bankMaskCanvases.set(bidM, mc);
             }}
           }}
           if (nTotM > 0) {{
@@ -10975,42 +11377,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const imDs = mf.get("images");
       const shape = Array.from(imDs.shape || []).map(Number); // [N, H, W]
       const H = shape[1] || 512, W = shape[2] || 512;
-      const bStep = 4;
-      const Hb = Math.floor(H / bStep), Wb = Math.floor(W / bStep);
+      const bStep = state.hiResTextures ? 1 : 4;
       for (let i = 0; i < bankIdsRun.length; i++) {{
         const bid = Number(bankIdsRun[i]);
         const sub = imDs.slice([[f0 + i, f0 + i + 1], [0, H], [0, W]]);
         bankImgs.set(bid, {{ data: sub, H, W }});
-
-        // Downsample and log1p-scale into offscreen canvas (canonical r, c order matching C0..C3)
-        const logBuf = new Float32Array(Hb * Wb);
-        for (let rb = 0; rb < Hb; rb++) {{
-          for (let cb = 0; cb < Wb; cb++) {{
-            let sum = 0;
-            for (let dr = 0; dr < bStep; dr++) {{
-              const rowOff = (rb * bStep + dr) * W + cb * bStep;
-              for (let dc = 0; dc < bStep; dc++) sum += Number(sub[rowOff + dc]);
-            }}
-            logBuf[rb * Wb + cb] = Math.log1p(Math.max(0, sum / (bStep * bStep)));
-          }}
-        }}
-        const sorted = Float32Array.from(logBuf).sort();
-        const vmax = Math.max(sorted[Math.floor(sorted.length * 0.995)] || 1.0, 1e-6);
-        const gc = document.createElement("canvas");
-        gc.width = Wb; gc.height = Hb;
-        const gctx = gc.getContext("2d");
-        const idata = gctx.createImageData(Wb, Hb);
-        for (let rb = 0; rb < Hb; rb++) {{
-          for (let cb = 0; cb < Wb; cb++) {{
-            const v = Math.min(255, Math.round((logBuf[rb * Wb + cb] / vmax) * 255));
-            const pIdx = (rb * Wb + cb) * 4;
-            idata.data[pIdx] = v; idata.data[pIdx+1] = v; idata.data[pIdx+2] = v; idata.data[pIdx+3] = 255;
-          }}
-        }}
-        gctx.putImageData(idata, 0, 0);
-        bankGrayCanvases.set(bid, gc);
+        bankGrayCanvases.set(bid, buildClientGrayscaleCanvas(sub, H, W, bStep));
       }}
     }}
+    lastClientBankImgs = bankImgs.size > 0 ? bankImgs : null;
+    lastClientBankMaskRaw = bankMaskRaw.size > 0 ? bankMaskRaw : null;
 
     // Build panel outlines and 4 corners from detMap (det.center is the (0,0) corner in subhkl Detector.pixel_to_lab)
     const panelsOut = [];
@@ -11363,6 +11739,42 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }});
       }}
       }}
+      const sgU = String(sg || "").trim().toUpperCase();
+      const isClientAbsent = (hv, kv, lv) => {{
+        if (hv === 0 && kv === 0 && lv === 0) return true;
+        if (sgU.startsWith("I")) return (((hv + kv + lv) & 1) !== 0);
+        if (sgU.startsWith("F")) return ((((hv + kv) & 1) !== 0) || (((kv + lv) & 1) !== 0) || (((hv + lv) & 1) !== 0));
+        if (sgU.startsWith("C")) return (((hv + kv) & 1) !== 0);
+        if (sgU.startsWith("A")) return (((kv + lv) & 1) !== 0);
+        if (sgU.startsWith("B")) return (((hv + lv) & 1) !== 0);
+        if (sgU.startsWith("R")) return (((((-hv + kv + lv) % 3) + 3) % 3) !== 0);
+        return false;
+      }};
+      const clientWlMin = Number(wlRangeNew[0] || 2.0);
+      const clientWlMax = Number(wlRangeNew[1] || 4.5);
+      const clientDMin = Number(dMinNew || 1.0);
+      candPeaks.forEach(p => {{
+        if (!Array.isArray(p.hkl)) return;
+        const [hv, kv, lv] = p.hkl;
+        const g = Math.max(1, gcd3(hv, kv, lv));
+        const h0 = Math.trunc(hv / g), k0 = Math.trunc(kv / g), l0 = Math.trunc(lv / g);
+        let ordAllowed = 0;
+        for (let m = 1; m <= Math.min(g, 64); m++) {{
+          if (!isClientAbsent(m * h0, m * k0, m * l0)) ordAllowed++;
+        }}
+        p.harmonic_order = Math.max(1, ordAllowed);
+        const lamProd = g * Number(p.wavelength || 2.5);
+        const mLo = Math.max(1, Math.ceil(lamProd / Math.max(clientWlMax, 1e-6) - 1e-5));
+        const mHiWl = lamProd / Math.max(clientWlMin, 1e-6);
+        const dEff = Math.min(Math.max(clientDMin, 1e-3), Math.max(Number(p.d_spacing || 1.0), 1e-3));
+        const mHiD = (g * Number(p.d_spacing || 1.0)) / Math.max(dEff, 1e-6);
+        const mHi = Math.floor(Math.min(mHiWl, mHiD) + 1e-5);
+        let multAllowed = 0;
+        for (let m = mLo; m <= Math.min(mHi, mLo + 64); m++) {{
+          if (!isClientAbsent(m * h0, m * k0, m * l0)) multAllowed++;
+        }}
+        p.harmonic_multiplicity = Math.max(1, multAllowed);
+      }});
       candPeaks.sort((a, b) => b.intensity - a.intensity);
       candPeaks.slice(0, 1200).forEach((p, idx) => {{
         p.id = idx;
@@ -13378,7 +13790,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       // If a single already-merged .h5 was specified, load it directly and set pending stage to 2. Solve
       if (paths.length === 1 && !/\\.nxs(\\.h5)?$/i.test(paths[0]) && /merged|scan|solve|integrat|predict/i.test(paths[0])) {{
         try {{
-          const r = await fetch(`api/payload?file_path=${{encodeURIComponent(paths[0])}}`, {{ cache: "no-store" }});
+          const r = await fetch(`api/payload?file_path=${{encodeURIComponent(paths[0])}}${{getRenderBinningQuery()}}`, {{ cache: "no-store" }});
           if (r.ok) {{
             const p = await r.json();
             recomputeBoundsAndReload(p);
@@ -13435,7 +13847,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               }});
               return;
             }}
-            const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(matchedPaths[0])}}`, {{ cache: "no-store" }});
+            const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(matchedPaths[0])}}${{getRenderBinningQuery()}}`, {{ cache: "no-store" }});
             const srvPayload = await pr.json().catch(() => null);
             if (pr.ok && srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
               recomputeBoundsAndReload(srvPayload);
@@ -13468,7 +13880,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           return;
         }}
         if (savedPaths.length === 1) {{
-          const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(savedPaths[0])}}`, {{ cache: "no-store" }});
+          const pr = await fetch(`api/payload?file_path=${{encodeURIComponent(savedPaths[0])}}${{getRenderBinningQuery()}}`, {{ cache: "no-store" }});
           const srvPayload = await pr.json().catch(() => null);
           if (pr.ok && srvPayload && (Array.isArray(srvPayload.peaks) || Array.isArray(srvPayload.panels))) {{
             recomputeBoundsAndReload(srvPayload);
@@ -13732,7 +14144,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           DATA.frame_index = 0;
         }}
         const hasGeomFlag = hasActiveDetectorGeometryForMtz() ? "1" : "0";
-        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{state.selectedFrameIndex || 0}}&has_active_geometry=${{hasGeomFlag}}`, {{
+        const rServer = await fetch(`api/payload?dataset_id=${{encodeURIComponent(dsId)}}&frame=${{state.selectedFrameIndex || 0}}&has_active_geometry=${{hasGeomFlag}}${{getRenderBinningQuery()}}`, {{
           cache: "no-store",
           credentials: "same-origin",
         }});
@@ -14189,8 +14601,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                     ? `&preserve_params=1&d_min=${{encodeURIComponent(targetDmin)}}`
                     : "";
                   const payloadUrl = (!aj.updated_payload_ready && aj.output_h5_path)
-                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}${{dminParam}}`
-                    : `api/payload?frame=${{targetFrame}}${{dminParam}}`;
+                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}${{dminParam}}${{getRenderBinningQuery()}}`
+                    : `api/payload?frame=${{targetFrame}}${{dminParam}}${{getRenderBinningQuery()}}`;
                   const pr = await fetch(payloadUrl, {{ cache: "no-store" }});
                   if (runSeq !== state.workflowRunSeq) return;
                   if (pr.ok) {{
@@ -14470,7 +14882,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const fetchOpts = {{ cache: "no-store" }};
       if (abortCtrl) fetchOpts.signal = abortCtrl.signal;
       const dminQ = (Number.isFinite(state.dMin) && state.dMin > 0) ? `&d_min=${{encodeURIComponent(state.dMin)}}` : "";
-      const resp = await fetch(`api/payload?frame=${{clamped}}${{dminQ}}`, fetchOpts);
+      const resp = await fetch(`api/payload?frame=${{clamped}}${{dminQ}}${{getRenderBinningQuery()}}`, fetchOpts);
       if (reqSeq !== state.frameRequestSeq || clamped !== state.selectedFrameIndex) return;
       if (resp.ok) {{
         const newPayload = await resp.json();

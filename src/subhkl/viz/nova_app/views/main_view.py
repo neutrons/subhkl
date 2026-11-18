@@ -147,6 +147,14 @@ class MainApp:
                     if 0.2 <= parsed_dmin <= 20.0:
                         d_min_val = parsed_dmin
                         self.view_model.model.subhkl.data.d_min = parsed_dmin
+            rbin_q = request.rel_url.query.get("render_binning")
+            rbin_val: int | None = None
+            if rbin_q is not None and str(rbin_q).strip() != "":
+                with contextlib.suppress(ValueError, TypeError):
+                    parsed_rb = int(rbin_q)
+                    if 1 <= parsed_rb <= 16:
+                        rbin_val = parsed_rb
+                        self.view_model.model.subhkl.render_binning = parsed_rb
 
             fp_q = request.rel_url.query.get("file_path")
             if fp_q is not None and str(fp_q).strip() != "":
@@ -341,9 +349,15 @@ class MainApp:
                 cur_dmin = (
                     cur_payload.get("d_min") if isinstance(cur_payload, dict) else None
                 )
+                cur_rb = (
+                    int(cur_payload.get("render_binning", 4))
+                    if isinstance(cur_payload, dict)
+                    else None
+                )
                 needs_refresh = (
                     not isinstance(cur_payload, dict)
                     or (f_idx is not None and cur_f != f_idx)
+                    or (rbin_val is not None and cur_rb != rbin_val)
                     or (
                         d_min_val is not None
                         and (
@@ -351,7 +365,9 @@ class MainApp:
                         )
                     )
                 )
-                if needs_refresh and (f_idx is not None or d_min_val is not None):
+                if needs_refresh and (
+                    f_idx is not None or d_min_val is not None or rbin_val is not None
+                ):
                     with contextlib.suppress(
                         OSError, RuntimeError, ValueError, TypeError, KeyError
                     ):

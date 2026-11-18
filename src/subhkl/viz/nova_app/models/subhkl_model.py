@@ -193,6 +193,7 @@ class SubhklGalaxyModel:
         )
         self.payload: dict[str, Any] | None = None
         self.frame_index: int | None = None
+        self.render_binning: int = 4
         self.mtz_overlay_path: str | None = None
         self.mtz_overlay_info: dict[str, Any] | None = None
         self.last_job_result: dict[str, Any] = {}
@@ -250,6 +251,7 @@ class SubhklGalaxyModel:
             max_zone_index=self.data.max_zone_index,
             images_h5=img_path,
             frame_index=self.frame_index,
+            render_binning=int(self.render_binning),
         )
         if self.payload.get("images_h5") and os.path.isfile(
             str(self.payload["images_h5"])
