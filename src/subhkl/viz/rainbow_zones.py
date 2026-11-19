@@ -30,6 +30,7 @@ import math
 import os
 import re
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -4629,6 +4630,836 @@ def _build_lattice_ladder_steps(
     return steps
 
 
+def _ordinal_shell_badge(idx_one_based: int) -> str:
+    if 10 <= (idx_one_based % 100) <= 20:
+        suf = "TH"
+    else:
+        suf = {1: "ST", 2: "ND", 3: "RD"}.get(idx_one_based % 10, "TH")
+    return f"{idx_one_based}{suf}"
+
+
+def _compute_cc_star(cc_half: float | None) -> float | None:
+    if cc_half is None or not math.isfinite(cc_half) or cc_half < 0.0:
+        return None
+    if cc_half == 0.0:
+        return 0.0
+    denom = 1.0 + cc_half
+    if denom <= 1e-12:
+        return None
+    return math.sqrt(max(0.0, 2.0 * cc_half / denom))
+
+
+def _cc_half_tier(cc_half: float | None) -> str:
+    if cc_half is None or not math.isfinite(cc_half):
+        return "na"
+    if cc_half >= 0.80:
+        return "green"
+    if cc_half >= 0.30:
+        return "yellow"
+    return "red"
+
+
+def build_merge_resolution_table_data(
+    merge_metrics: dict[str, Any] | None,
+    *,
+    space_group: str | None = None,
+    cell: Sequence[float] | None = None,
+    wavelength_range: Sequence[float] | None = None,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Normalize Careless merge metrics into publication-ready per-shell and overall rows."""
+    m = dict(merge_metrics or {})
+    raw_bins = m.get("cc_half_bins")
+    if not isinstance(raw_bins, list) or not raw_bins:
+        raw_bins = m.get("resolution_bins")
+    bins_list = list(raw_bins) if isinstance(raw_bins, list) else []
+
+    def _fnum(val: Any) -> float | None:
+        if val is None or isinstance(val, bool):
+            return None
+        try:
+            fv = float(val)
+        except (TypeError, ValueError):
+            return None
+        return fv if math.isfinite(fv) else None
+
+    def _inum(val: Any) -> int | None:
+        fv = _fnum(val)
+        return round(fv) if fv is not None else None
+
+    rows: list[dict[str, Any]] = []
+    sum_n_obs = 0
+    all_have_n_obs = len(bins_list) > 0
+    sum_n_refl = 0
+    sum_n_theo = 0
+    any_have_n_theo = False
+
+    for idx, b in enumerate(bins_list):
+        if not isinstance(b, dict):
+            continue
+        shell_num = idx + 1
+        d_max = _fnum(b.get("d_max"))
+        d_min = _fnum(b.get("d_min"))
+        n_obs = _inum(b.get("n_obs"))
+        n_refl = _inum(b.get("n_refl"))
+        if n_refl is None:
+            n_refl = 0
+        n_theo = _inum(b.get("n_theo"))
+        if n_theo is not None and n_theo <= 0:
+            n_theo = None
+        mult = _fnum(b.get("multiplicity"))
+        if mult is None and n_obs is not None and n_refl > 0:
+            mult = n_obs / float(n_refl)
+        comp = _fnum(b.get("completeness_pct"))
+        if comp is None and n_theo is not None and n_theo > 0:
+            comp = 100.0 * float(n_refl) / float(n_theo)
+        isigi = _fnum(b.get("mean_isigi"))
+        cc_h = _fnum(b.get("cc_half"))
+        cc_s = _compute_cc_star(cc_h)
+
+        if n_obs is not None:
+            sum_n_obs += n_obs
+        else:
+            all_have_n_obs = False
+        sum_n_refl += n_refl
+        if n_theo is not None:
+            sum_n_theo += n_theo
+            any_have_n_theo = True
+
+        range_display = (
+            f"{d_max:.2f} \u2013 {d_min:.2f}"
+            if (d_max is not None and d_min is not None)
+            else f"Bin {shell_num}"
+        )
+        range_ascii = (
+            f"{d_max:.2f} - {d_min:.2f}"
+            if (d_max is not None and d_min is not None)
+            else f"Bin {shell_num}"
+        )
+        rows.append(
+            {
+                "shell": shell_num,
+                "rank_badge": _ordinal_shell_badge(shell_num),
+                "d_max": d_max,
+                "d_min": d_min,
+                "range_display": range_display,
+                "range_ascii": range_ascii,
+                "n_obs": n_obs,
+                "n_unique": n_refl,
+                "n_theo": n_theo,
+                "multiplicity": mult,
+                "completeness_pct": comp,
+                "mean_isigi": isigi,
+                "cc_half": cc_h,
+                "cc_star": cc_s,
+                "cc_tier": _cc_half_tier(cc_h),
+            }
+        )
+
+    ov_d_max = _fnum(m.get("d_max"))
+    if ov_d_max is None and rows and rows[0]["d_max"] is not None:
+        ov_d_max = rows[0]["d_max"]
+    ov_d_min = _fnum(m.get("d_min"))
+    if ov_d_min is None and rows and rows[-1]["d_min"] is not None:
+        ov_d_min = rows[-1]["d_min"]
+
+    ov_n_obs = _inum(m.get("n_observations"))
+    if ov_n_obs is None and all_have_n_obs and sum_n_obs > 0:
+        ov_n_obs = sum_n_obs
+    ov_n_unique = _inum(m.get("n_merged_asu"))
+    if not ov_n_unique:
+        ov_n_unique = sum_n_refl
+    ov_n_theo = _inum(m.get("n_theoretical_asu"))
+    if ov_n_theo is None and any_have_n_theo and sum_n_theo > 0:
+        ov_n_theo = sum_n_theo
+
+    ov_mult = _fnum(m.get("multiplicity"))
+    if ov_mult is None:
+        ov_mult = _fnum(m.get("mean_multiplicity"))
+    if ov_mult is None and ov_n_obs is not None and ov_n_unique > 0:
+        ov_mult = ov_n_obs / float(ov_n_unique)
+
+    ov_comp = _fnum(m.get("completeness_pct"))
+    if ov_comp is None and ov_n_theo is not None and ov_n_theo > 0:
+        ov_comp = 100.0 * float(ov_n_unique) / float(ov_n_theo)
+
+    ov_isigi = _fnum(m.get("mean_i_over_sigi"))
+    if ov_isigi is None:
+        ov_isigi = _fnum(m.get("mean_isigi"))
+
+    ov_cc = _fnum(m.get("cc_half_overall"))
+    if ov_cc is None:
+        ov_cc = _fnum(m.get("cc_half"))
+    ov_cc_star = _compute_cc_star(ov_cc)
+
+    ov_range_display = (
+        f"{ov_d_max:.2f} \u2013 {ov_d_min:.2f}"
+        if (ov_d_max is not None and ov_d_min is not None)
+        else "Overall"
+    )
+    ov_range_ascii = (
+        f"{ov_d_max:.2f} - {ov_d_min:.2f}"
+        if (ov_d_max is not None and ov_d_min is not None)
+        else "Overall"
+    )
+    overall = {
+        "shell": "Overall",
+        "rank_badge": "ALL",
+        "d_max": ov_d_max,
+        "d_min": ov_d_min,
+        "range_display": ov_range_display,
+        "range_ascii": ov_range_ascii,
+        "n_obs": ov_n_obs,
+        "n_unique": ov_n_unique,
+        "n_theo": ov_n_theo,
+        "multiplicity": ov_mult,
+        "completeness_pct": ov_comp,
+        "mean_isigi": ov_isigi,
+        "cc_half": ov_cc,
+        "cc_star": ov_cc_star,
+        "cc_tier": _cc_half_tier(ov_cc),
+    }
+
+    d_cc30: float | None = None
+    for r in rows:
+        if (
+            r["cc_half"] is not None
+            and r["cc_half"] >= 0.30
+            and r["d_min"] is not None
+            and (d_cc30 is None or r["d_min"] < d_cc30)
+        ):
+            d_cc30 = r["d_min"]
+
+    sg_val = str(space_group or m.get("space_group") or "").strip()
+    cell_in = cell if cell is not None else m.get("cell")
+    cell_vals: list[float] | None = None
+    if isinstance(cell_in, (list, tuple)) and len(cell_in) >= 6:
+        with contextlib.suppress(TypeError, ValueError):
+            cell_vals = [float(x) for x in cell_in[:6]]
+    wl_in = (
+        wavelength_range if wavelength_range is not None else m.get("wavelength_range")
+    )
+    wl_vals: list[float] | None = None
+    if isinstance(wl_in, (list, tuple)) and len(wl_in) >= 2:
+        with contextlib.suppress(TypeError, ValueError):
+            wl_vals = [float(wl_in[0]), float(wl_in[1])]
+
+    return {
+        "title": title or "Merging and Scaling Statistics by Resolution Shell",
+        "space_group": sg_val,
+        "cell": cell_vals,
+        "wavelength_range": wl_vals,
+        "d_cc30": d_cc30,
+        "rows": rows,
+        "overall": overall,
+    }
+
+
+def render_merge_table_csv(
+    merge_metrics: dict[str, Any] | None,
+    *,
+    space_group: str | None = None,
+    cell: Sequence[float] | None = None,
+    wavelength_range: Sequence[float] | None = None,
+) -> str:
+    """Render publication-ready merging statistics vs. resolution as RFC-4180 CSV."""
+    import csv as _csv
+    import io as _io
+
+    data = build_merge_resolution_table_data(
+        merge_metrics,
+        space_group=space_group,
+        cell=cell,
+        wavelength_range=wavelength_range,
+    )
+    buf = _io.StringIO()
+    writer = _csv.writer(buf, lineterminator="\n")
+    writer.writerow(
+        [
+            "shell",
+            "d_max_A",
+            "d_min_A",
+            "resolution_range_A",
+            "n_obs",
+            "n_unique",
+            "n_theo",
+            "multiplicity",
+            "completeness_pct",
+            "mean_isigi",
+            "cc_half",
+            "cc_star",
+        ]
+    )
+    for r in [*data["rows"], data["overall"]]:
+        writer.writerow(
+            [
+                r["shell"],
+                f"{r['d_max']:.2f}" if r["d_max"] is not None else "",
+                f"{r['d_min']:.2f}" if r["d_min"] is not None else "",
+                r["range_ascii"],
+                r["n_obs"] if r["n_obs"] is not None else "",
+                r["n_unique"] if r["n_unique"] is not None else "",
+                r["n_theo"] if r["n_theo"] is not None else "",
+                f"{r['multiplicity']:.2f}" if r["multiplicity"] is not None else "",
+                (
+                    f"{r['completeness_pct']:.1f}"
+                    if r["completeness_pct"] is not None
+                    else ""
+                ),
+                f"{r['mean_isigi']:.2f}" if r["mean_isigi"] is not None else "",
+                f"{r['cc_half']:.4f}" if r["cc_half"] is not None else "",
+                f"{r['cc_star']:.4f}" if r["cc_star"] is not None else "",
+            ]
+        )
+    return buf.getvalue()
+
+
+def render_merge_table_html(
+    merge_metrics: dict[str, Any] | None,
+    *,
+    space_group: str | None = None,
+    cell: Sequence[float] | None = None,
+    wavelength_range: Sequence[float] | None = None,
+    default_style: str = "arcade",
+    title: str | None = None,
+) -> str:
+    """Render a self-contained HTML artifact with Arcade High Score & Publication Table views + Word/Excel copy."""
+    import html as _html
+
+    data = build_merge_resolution_table_data(
+        merge_metrics,
+        space_group=space_group,
+        cell=cell,
+        wavelength_range=wavelength_range,
+        title=title,
+    )
+    csv_text = render_merge_table_csv(
+        merge_metrics,
+        space_group=space_group,
+        cell=cell,
+        wavelength_range=wavelength_range,
+    )
+    init_mode = (
+        "publication"
+        if str(default_style).lower() in ("pro", "boring", "publication", "print")
+        else "arcade"
+    )
+    meta_parts: list[str] = []
+    if data["space_group"]:
+        meta_parts.append(f"Space group: {_html.escape(data['space_group'])}")
+    if data["cell"]:
+        c = data["cell"]
+        meta_parts.append(
+            f"Cell: {c[0]:.2f}, {c[1]:.2f}, {c[2]:.2f} \u00c5; "
+            f"{c[3]:.1f}\u00b0, {c[4]:.1f}\u00b0, {c[5]:.1f}\u00b0"
+        )
+    if data["wavelength_range"]:
+        wl = data["wavelength_range"]
+        meta_parts.append(f"\u03bb: {wl[0]:.2f}\u2013{wl[1]:.2f} \u00c5")
+    if data["d_cc30"] is not None:
+        meta_parts.append(f"d(CC\u00bd \u2265 0.30): {data['d_cc30']:.2f} \u00c5")
+    meta_line = " \u2022 ".join(meta_parts)
+
+    def _fmt(v: float | None, nd: int) -> str:
+        return f"{v:.{nd}f}" if v is not None else "\u2014"
+
+    def _fmt_int(v: int | None) -> str:
+        return f"{v:,}" if v is not None else "\u2014"
+
+    body_rows_html: list[str] = []
+    clean_rows_html: list[str] = []
+    tsv_lines: list[str] = [
+        "Shell\tResolution (\u00c5)\tN_obs\tN_unique\tN_theo\tMultiplicity\tCompleteness (%)\t<I/sigma(I)>\tCC1/2\tCC*"
+    ]
+
+    for r in data["rows"]:
+        tier = r["cc_tier"]
+        body_rows_html.append(
+            f'<tr class="shell-row tier-{tier}">'
+            f'<td class="col-shell"><span class="rank-pill">{_html.escape(r["rank_badge"])}</span>'
+            f'<span class="pub-shell-num">{r["shell"]}</span></td>'
+            f'<td class="col-res">{_html.escape(r["range_display"])}</td>'
+            f'<td class="num">{_fmt_int(r["n_obs"])}</td>'
+            f'<td class="num">{_fmt_int(r["n_unique"])}</td>'
+            f'<td class="num">{_fmt_int(r["n_theo"])}</td>'
+            f'<td class="num">{_fmt(r["multiplicity"], 2)}</td>'
+            f'<td class="num">{_fmt(r["completeness_pct"], 1)}</td>'
+            f'<td class="num">{_fmt(r["mean_isigi"], 2)}</td>'
+            f'<td class="num cc-cell cc-{tier}">{_fmt(r["cc_half"], 3)}</td>'
+            f'<td class="num">{_fmt(r["cc_star"], 3)}</td>'
+            f"</tr>"
+        )
+        clean_rows_html.append(
+            "<tr>"
+            f'<td style="padding:4px 8px;text-align:center;">{r["shell"]}</td>'
+            f'<td style="padding:4px 8px;text-align:center;">{_html.escape(r["range_display"])}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{r["n_obs"] if r["n_obs"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{r["n_unique"]}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{r["n_theo"] if r["n_theo"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["multiplicity"], 2) if r["multiplicity"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["completeness_pct"], 1) if r["completeness_pct"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["mean_isigi"], 2) if r["mean_isigi"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["cc_half"], 3) if r["cc_half"] is not None else ""}</td>'
+            f'<td style="padding:4px 8px;text-align:right;">{_fmt(r["cc_star"], 3) if r["cc_star"] is not None else ""}</td>'
+            "</tr>"
+        )
+        tsv_lines.append(
+            "\t".join(
+                [
+                    str(r["shell"]),
+                    r["range_display"],
+                    str(r["n_obs"]) if r["n_obs"] is not None else "",
+                    str(r["n_unique"]),
+                    str(r["n_theo"]) if r["n_theo"] is not None else "",
+                    f"{r['multiplicity']:.2f}" if r["multiplicity"] is not None else "",
+                    (
+                        f"{r['completeness_pct']:.1f}"
+                        if r["completeness_pct"] is not None
+                        else ""
+                    ),
+                    f"{r['mean_isigi']:.2f}" if r["mean_isigi"] is not None else "",
+                    f"{r['cc_half']:.3f}" if r["cc_half"] is not None else "",
+                    f"{r['cc_star']:.3f}" if r["cc_star"] is not None else "",
+                ]
+            )
+        )
+
+    ov = data["overall"]
+    ov_tier = ov["cc_tier"]
+    foot_html = (
+        f'<tr class="overall-row tier-{ov_tier}">'
+        f'<td class="col-shell"><span class="rank-pill">ALL</span>'
+        f'<span class="pub-shell-num">Overall</span></td>'
+        f'<td class="col-res">{_html.escape(ov["range_display"])}</td>'
+        f'<td class="num">{_fmt_int(ov["n_obs"])}</td>'
+        f'<td class="num">{_fmt_int(ov["n_unique"])}</td>'
+        f'<td class="num">{_fmt_int(ov["n_theo"])}</td>'
+        f'<td class="num">{_fmt(ov["multiplicity"], 2)}</td>'
+        f'<td class="num">{_fmt(ov["completeness_pct"], 1)}</td>'
+        f'<td class="num">{_fmt(ov["mean_isigi"], 2)}</td>'
+        f'<td class="num cc-cell cc-{ov_tier}">{_fmt(ov["cc_half"], 3)}</td>'
+        f'<td class="num">{_fmt(ov["cc_star"], 3)}</td>'
+        f"</tr>"
+    )
+    clean_foot_html = (
+        '<tr style="border-top:1px solid #000;border-bottom:2px solid #000;font-weight:bold;">'
+        '<td style="padding:5px 8px;text-align:center;">Overall</td>'
+        f'<td style="padding:5px 8px;text-align:center;">{_html.escape(ov["range_display"])}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{ov["n_obs"] if ov["n_obs"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{ov["n_unique"]}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{ov["n_theo"] if ov["n_theo"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["multiplicity"], 2) if ov["multiplicity"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["completeness_pct"], 1) if ov["completeness_pct"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["mean_isigi"], 2) if ov["mean_isigi"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["cc_half"], 3) if ov["cc_half"] is not None else ""}</td>'
+        f'<td style="padding:5px 8px;text-align:right;">{_fmt(ov["cc_star"], 3) if ov["cc_star"] is not None else ""}</td>'
+        "</tr>"
+    )
+    tsv_lines.append(
+        "\t".join(
+            [
+                "Overall",
+                ov["range_display"],
+                str(ov["n_obs"]) if ov["n_obs"] is not None else "",
+                str(ov["n_unique"]),
+                str(ov["n_theo"]) if ov["n_theo"] is not None else "",
+                f"{ov['multiplicity']:.2f}" if ov["multiplicity"] is not None else "",
+                (
+                    f"{ov['completeness_pct']:.1f}"
+                    if ov["completeness_pct"] is not None
+                    else ""
+                ),
+                f"{ov['mean_isigi']:.2f}" if ov["mean_isigi"] is not None else "",
+                f"{ov['cc_half']:.3f}" if ov["cc_half"] is not None else "",
+                f"{ov['cc_star']:.3f}" if ov["cc_star"] is not None else "",
+            ]
+        )
+    )
+    clean_clip_html = (
+        '<div style="background:#ffffff;color:#000000;font-family:Calibri,Arial,sans-serif;font-size:11pt;">'
+        f'<p style="margin:0 0 6px 0;font-weight:bold;">{_html.escape(data["title"])}'
+        + (f" ({meta_line})" if meta_line else "")
+        + "</p>"
+        '<table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:10.5pt;color:#000000;background:#ffffff;">'
+        '<thead><tr style="border-top:2px solid #000;border-bottom:1px solid #000;font-weight:bold;">'
+        '<th style="padding:5px 8px;text-align:center;">Shell</th>'
+        '<th style="padding:5px 8px;text-align:center;">Resolution (\u00c5)</th>'
+        '<th style="padding:5px 8px;text-align:right;">N<sub>obs</sub></th>'
+        '<th style="padding:5px 8px;text-align:right;">N<sub>unique</sub></th>'
+        '<th style="padding:5px 8px;text-align:right;">N<sub>theo</sub></th>'
+        '<th style="padding:5px 8px;text-align:right;">Multiplicity</th>'
+        '<th style="padding:5px 8px;text-align:right;">Completeness (%)</th>'
+        '<th style="padding:5px 8px;text-align:right;">\u27e8I/\u03c3(I)\u27e9</th>'
+        '<th style="padding:5px 8px;text-align:right;">CC<sub>1/2</sub></th>'
+        '<th style="padding:5px 8px;text-align:right;">CC*</th>'
+        "</tr></thead>"
+        f"<tbody>{''.join(clean_rows_html)}</tbody>"
+        f"<tfoot>{clean_foot_html}</tfoot>"
+        "</table></div>"
+    )
+    stage_badge = (
+        f'<span class="stage-clear-badge">STAGE CLEAR \u2022 d(CC\u00bd \u2265 0.30) = {data["d_cc30"]:.2f} \u00c5</span>'
+        if data["d_cc30"] is not None
+        else '<span class="stage-clear-badge">CARE-LESS MERGE SCOREBOARD</span>'
+    )
+    payload_js = json.dumps(
+        {
+            "clean_html": clean_clip_html,
+            "tsv": "\n".join(tsv_lines),
+            "csv": csv_text,
+        }
+    ).replace("</", "<\\/")
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>{_html.escape(data["title"])}</title>
+<style>
+  :root {{
+    --arcade-bg: #080b18;
+    --arcade-card: #10162b;
+    --arcade-border: #2a3966;
+    --arcade-cyan: #38bdf8;
+    --arcade-pink: #f472b6;
+    --arcade-gold: #fbbf24;
+    --arcade-green: #34d399;
+    --arcade-red: #f43f5e;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    padding: 24px;
+    font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
+    background: var(--arcade-bg);
+    color: #f1f5f9;
+  }}
+  body.mode-publication {{
+    background: #f8fafc;
+    color: #0f172a;
+    font-family: Georgia, 'Times New Roman', Times, serif;
+  }}
+  .wrap {{
+    max-width: 980px;
+    margin: 0 auto;
+    border-radius: 12px;
+    overflow: hidden;
+    background: var(--arcade-card);
+    border: 2px solid var(--arcade-border);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55), 0 0 28px rgba(56, 189, 248, 0.14);
+  }}
+  body.mode-publication .wrap {{
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
+  }}
+  .rainbow-strip {{
+    height: 6px;
+    background: linear-gradient(90deg, #ff3b6b, #ff922b, #ffd43b, #38d9a9, #38bdf8, #a855f7, #f472b6);
+  }}
+  body.mode-publication .rainbow-strip {{ display: none; }}
+  .toolbar {{
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 14px 18px;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+  }}
+  .arcade-kicker {{
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    color: var(--arcade-pink);
+    font-weight: 800;
+    text-transform: uppercase;
+  }}
+  body.mode-publication .arcade-kicker {{ display: none; }}
+  h1 {{
+    margin: 2px 0 0 0;
+    font-size: 1.05rem;
+    color: #f8fafc;
+  }}
+  body.mode-publication h1 {{
+    color: #0f172a;
+    font-size: 1.15rem;
+    font-weight: 700;
+  }}
+  .meta-line {{
+    font-size: 0.76rem;
+    color: #94a3b8;
+    margin-top: 4px;
+  }}
+  body.mode-publication .meta-line {{
+    color: #475569;
+    font-family: system-ui, -apple-system, sans-serif;
+  }}
+  .stage-clear-badge {{
+    display: inline-block;
+    margin-top: 6px;
+    padding: 2px 9px;
+    border-radius: 999px;
+    font-size: 0.70rem;
+    font-weight: 700;
+    background: rgba(52, 211, 153, 0.14);
+    border: 1px solid rgba(52, 211, 153, 0.55);
+    color: var(--arcade-green);
+  }}
+  body.mode-publication .stage-clear-badge {{ display: none; }}
+  .actions {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+  }}
+  button {{
+    cursor: pointer;
+    border-radius: 6px;
+    border: 1px solid #334155;
+    background: #1e293b;
+    color: #e2e8f0;
+    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 0.76rem;
+    font-weight: 600;
+    padding: 6px 11px;
+  }}
+  button:hover {{ border-color: var(--arcade-cyan); color: #ffffff; }}
+  button.primary {{
+    background: linear-gradient(135deg, #0284c7, #2563eb);
+    border-color: #38bdf8;
+    color: #ffffff;
+  }}
+  body.mode-publication button {{
+    background: #f1f5f9;
+    color: #0f172a;
+    border-color: #cbd5e1;
+  }}
+  body.mode-publication button.primary {{
+    background: #0f172a;
+    color: #ffffff;
+    border-color: #0f172a;
+  }}
+  .table-box {{ padding: 14px 18px 18px 18px; overflow-x: auto; }}
+  table.merge-tbl {{
+    width: 100%;
+    border-collapse: collapse;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.82rem;
+  }}
+  table.merge-tbl th {{
+    padding: 8px 9px;
+    text-align: right;
+    color: var(--arcade-cyan);
+    border-top: 2px solid #38bdf8;
+    border-bottom: 1px solid #334155;
+    font-weight: 700;
+    white-space: nowrap;
+  }}
+  table.merge-tbl th.col-shell,
+  table.merge-tbl th.col-res,
+  table.merge-tbl td.col-shell,
+  table.merge-tbl td.col-res {{
+    text-align: center;
+  }}
+  table.merge-tbl td {{
+    padding: 6px 9px;
+    text-align: right;
+    border-bottom: 1px solid rgba(51, 65, 85, 0.48);
+    white-space: nowrap;
+  }}
+  table.merge-tbl tbody tr:hover {{
+    background: rgba(56, 189, 248, 0.08);
+  }}
+  .rank-pill {{
+    display: inline-block;
+    min-width: 38px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 0.68rem;
+    font-weight: 800;
+    background: rgba(244, 114, 182, 0.16);
+    border: 1px solid rgba(244, 114, 182, 0.45);
+    color: #f9a8d4;
+  }}
+  .pub-shell-num {{ display: none; }}
+  body.mode-publication .rank-pill {{ display: none; }}
+  body.mode-publication .pub-shell-num {{ display: inline; }}
+  .cc-cell {{ font-weight: 700; }}
+  .cc-green {{ color: var(--arcade-green); }}
+  .cc-yellow {{ color: var(--arcade-gold); }}
+  .cc-red {{ color: var(--arcade-red); }}
+  .cc-na {{ color: #94a3b8; }}
+  tr.overall-row td {{
+    border-top: 2px solid #38bdf8;
+    border-bottom: 2px solid #f472b6;
+    font-weight: 800;
+    background: rgba(56, 189, 248, 0.08);
+  }}
+  body.mode-publication table.merge-tbl {{
+    color: #0f172a;
+    font-size: 0.88rem;
+  }}
+  body.mode-publication table.merge-tbl th {{
+    color: #0f172a;
+    border-top: 2px solid #0f172a;
+    border-bottom: 1px solid #0f172a;
+    background: transparent;
+  }}
+  body.mode-publication table.merge-tbl td {{
+    border-bottom: none;
+    color: #0f172a;
+  }}
+  body.mode-publication .cc-green,
+  body.mode-publication .cc-yellow,
+  body.mode-publication .cc-red {{
+    color: #0f172a;
+  }}
+  body.mode-publication tr.overall-row td {{
+    border-top: 1px solid #0f172a;
+    border-bottom: 2px solid #0f172a;
+    background: transparent;
+  }}
+  .legend-foot {{
+    margin-top: 10px;
+    font-size: 0.71rem;
+    color: #94a3b8;
+    display: flex;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+  }}
+  body.mode-publication .arcade-legend {{ display: none; }}
+  body.mode-publication .legend-foot {{
+    color: #475569;
+    font-family: system-ui, -apple-system, sans-serif;
+  }}
+  @media print {{
+    body {{ background: #ffffff !important; color: #000000 !important; padding: 0; font-family: Georgia, serif; }}
+    .wrap {{ border: none !important; box-shadow: none !important; }}
+    .rainbow-strip, .actions, .arcade-kicker, .stage-clear-badge, .rank-pill, .arcade-legend {{ display: none !important; }}
+    .pub-shell-num {{ display: inline !important; }}
+    table.merge-tbl th {{ color: #000 !important; border-top: 2px solid #000 !important; border-bottom: 1px solid #000 !important; }}
+    table.merge-tbl td, .cc-cell {{ color: #000 !important; border-bottom: none !important; }}
+    tr.overall-row td {{ border-top: 1px solid #000 !important; border-bottom: 2px solid #000 !important; background: transparent !important; }}
+  }}
+</style>
+</head>
+<body class="mode-{init_mode}">
+  <div class="wrap">
+    <div class="rainbow-strip"></div>
+    <div class="toolbar">
+      <div>
+        <div class="arcade-kicker">1UP \u2022 BUBBLE BOBBLE HIGH SCORE // RESOLUTION SHELL HALL OF FAME</div>
+        <h1>{_html.escape(data["title"])}</h1>
+        {f'<div class="meta-line">{meta_line}</div>' if meta_line else ""}
+        {stage_badge}
+      </div>
+      <div class="actions">
+        <button id="btn-toggle-style" type="button">Style: {"Publication" if init_mode == "publication" else "Arcade High Score"}</button>
+        <button id="btn-copy-pub" class="primary" type="button" title="Copy clean black-on-white formatted table + tab-separated values for direct paste into Microsoft Word, Google Docs, or Excel">Copy for Word / Excel</button>
+        <button id="btn-dl-csv" type="button">Download .csv</button>
+      </div>
+    </div>
+    <div class="table-box">
+      <table class="merge-tbl" id="merge-resolution-table">
+        <thead>
+          <tr>
+            <th class="col-shell">Shell</th>
+            <th class="col-res">Resolution (\u00c5)</th>
+            <th>N<sub>obs</sub></th>
+            <th>N<sub>unique</sub></th>
+            <th>N<sub>theo</sub></th>
+            <th>Multiplicity</th>
+            <th>Completeness (%)</th>
+            <th>\u27e8I/\u03c3(I)\u27e9</th>
+            <th>CC<sub>1/2</sub></th>
+            <th>CC*</th>
+          </tr>
+        </thead>
+        <tbody>
+          {"".join(body_rows_html)}
+        </tbody>
+        <tfoot>
+          {foot_html}
+        </tfoot>
+      </table>
+      <div class="legend-foot">
+        <span>CC* = [2 CC<sub>1/2</sub> / (1 + CC<sub>1/2</sub>)]<sup>1/2</sup> (Karplus &amp; Diederichs, 2012).</span>
+        <span class="arcade-legend">CC<sub>1/2</sub> tiers: <strong class="cc-green">\u2265 0.80</strong> \u2022 <strong class="cc-yellow">0.30\u20130.79</strong> \u2022 <strong class="cc-red">&lt; 0.30</strong></span>
+      </div>
+    </div>
+  </div>
+<script>
+(function() {{
+  const EXPORT_DATA = {payload_js};
+  const btnToggle = document.getElementById("btn-toggle-style");
+  const btnCopy = document.getElementById("btn-copy-pub");
+  const btnCsv = document.getElementById("btn-dl-csv");
+  if (btnToggle) {{
+    btnToggle.addEventListener("click", function() {{
+      const isPub = document.body.classList.toggle("mode-publication");
+      document.body.classList.toggle("mode-arcade", !isPub);
+      btnToggle.textContent = "Style: " + (isPub ? "Publication" : "Arcade High Score");
+    }});
+  }}
+  if (btnCopy) {{
+    btnCopy.addEventListener("click", async function() {{
+      let ok = false;
+      try {{
+        if (navigator.clipboard && window.ClipboardItem) {{
+          await navigator.clipboard.write([
+            new ClipboardItem({{
+              "text/html": new Blob([EXPORT_DATA.clean_html], {{ type: "text/html" }}),
+              "text/plain": new Blob([EXPORT_DATA.tsv], {{ type: "text/plain" }})
+            }})
+          ]);
+          ok = true;
+        }}
+      }} catch (_e) {{}}
+      if (!ok) {{
+        const holder = document.createElement("div");
+        holder.style.cssText = "position:fixed;left:-9999px;top:0;background:#fff;color:#000;";
+        holder.innerHTML = EXPORT_DATA.clean_html;
+        document.body.appendChild(holder);
+        const sel = window.getSelection();
+        const range = document.createRange();
+        range.selectNodeContents(holder);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        try {{ ok = document.execCommand("copy"); }} catch (_e2) {{}}
+        sel.removeAllRanges();
+        document.body.removeChild(holder);
+      }}
+      if (!ok && navigator.clipboard && navigator.clipboard.writeText) {{
+        try {{ await navigator.clipboard.writeText(EXPORT_DATA.tsv); ok = true; }} catch (_e3) {{}}
+      }}
+      const orig = btnCopy.textContent;
+      btnCopy.textContent = ok ? "Copied for Word / Excel!" : "Copy failed";
+      setTimeout(function() {{ btnCopy.textContent = orig; }}, 1800);
+    }});
+  }}
+  if (btnCsv) {{
+    btnCsv.addEventListener("click", function() {{
+      const blob = new Blob([EXPORT_DATA.csv], {{ type: "text/csv;charset=utf-8" }});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "merge_table.csv";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function() {{ URL.revokeObjectURL(url); }}, 1000);
+    }});
+  }}
+}})();
+</script>
+</body>
+</html>
+"""
+
+
 def _pending_stage_for_artifact_kind(artifact_kind: str | None) -> str:
     """Return the pending pipeline stage ID given the currently loaded HDF5 artifact kind."""
     kind = (artifact_kind or "solve").lower()
@@ -4683,12 +5514,17 @@ def _build_ndip_pipeline_stages(
             return "pending"
         return "ready"
 
-    merge_artifact_str = "merged.mtz + predictions.mtz + careless_metrics.json"
+    merge_artifact_str = (
+        "merged.mtz + predictions.mtz + careless_metrics.json"
+        " + merge_table.html + merge_table.csv"
+    )
     if isinstance(merge_metrics, dict) and merge_metrics.get("n_merged_asu"):
         cc_val = merge_metrics.get("cc_half_overall")
         n_asu = int(merge_metrics.get("n_merged_asu", 0))
         cc_txt = f"CC1/2={float(cc_val):.3f} • " if cc_val is not None else ""
-        merge_artifact_str = f"merged.mtz ({cc_txt}{n_asu:,} ASU)"
+        merge_artifact_str = (
+            f"merged.mtz + merge_table.html/.csv ({cc_txt}{n_asu:,} ASU)"
+        )
 
     return [
         {
@@ -6266,6 +7102,12 @@ def build_rainbow_zone_payload(
         default_peak_source = "predicted"
 
     if isinstance(merge_metrics, dict):
+        if space_group and "space_group" not in merge_metrics:
+            merge_metrics["space_group"] = str(space_group)
+        if cell and len(cell) >= 6 and "cell" not in merge_metrics:
+            merge_metrics["cell"] = [round(float(x), 4) for x in cell[:6]]
+        if "wavelength_range" not in merge_metrics:
+            merge_metrics["wavelength_range"] = [round(wl_min, 3), round(wl_max, 3)]
         if "harmonic_overlap_fraction" not in merge_metrics and len(sample_peaks) > 0:
             n_harm = sum(
                 1 for p in sample_peaks if int(p.get("harmonic_multiplicity", 1)) > 1
@@ -6278,7 +7120,8 @@ def build_rainbow_zone_payload(
             not isinstance(bins_in, list)
             or len(bins_in) == 0
             or any(
-                "mean_isigi" not in b or "completeness_pct" not in b for b in bins_in
+                "mean_isigi" not in b or "completeness_pct" not in b or "n_obs" not in b
+                for b in bins_in
             )
         )
         if needs_bin_enrich and len(sample_peaks) > 0:
@@ -6309,6 +7152,10 @@ def build_rainbow_zone_payload(
                             for k in asu_keys
                         ],
                         dtype=float,
+                    )
+                    asu_nobs = np.array(
+                        [len(asu_obs_map[k]) for k in asu_keys],
+                        dtype=int,
                     )
                     asu_isigi = np.array(
                         [
@@ -6417,6 +7264,20 @@ def build_rainbow_zone_payload(
                             if isinstance(bins_in, list) and b_idx < len(bins_in)
                             else {}
                         )
+                        n_obs_b = (
+                            int(orig_b["n_obs"])
+                            if orig_b.get("n_obs") is not None
+                            else int(np.sum(asu_nobs[bm_o]))
+                        )
+                        mult_b = (
+                            float(orig_b["multiplicity"])
+                            if orig_b.get("multiplicity") is not None
+                            else (
+                                round(float(n_obs_b) / max(1, n_m_b), 2)
+                                if n_m_b > 0
+                                else 0.0
+                            )
+                        )
                         cc_b = orig_b.get("cc_half")
                         d_lo = round(float(1.0 / np.sqrt(max(lo_e, 1e-6))), 2)
                         d_hi = round(float(1.0 / np.sqrt(max(hi_e, 1e-6))), 2)
@@ -6425,10 +7286,14 @@ def build_rainbow_zone_payload(
                                 "bin": b_idx,
                                 "d_max": orig_b.get("d_max", d_lo),
                                 "d_min": orig_b.get("d_min", d_hi),
-                                "n_refl": n_m_b,
-                                "n_theo": n_t_b,
-                                "completeness_pct": comp_b,
-                                "mean_isigi": isig_b,
+                                "n_obs": n_obs_b,
+                                "n_refl": orig_b.get("n_refl", n_m_b),
+                                "n_theo": orig_b.get("n_theo", n_t_b),
+                                "multiplicity": mult_b,
+                                "completeness_pct": orig_b.get(
+                                    "completeness_pct", comp_b
+                                ),
+                                "mean_isigi": orig_b.get("mean_isigi", isig_b),
                                 "cc_half": cc_b,
                             }
                         )
@@ -8088,6 +8953,14 @@ def render_rainbow_html(
             <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>
           </div>
         </div>
+        <div id="hist-bar-header" style="display:none;align-items:center;justify-content:space-between;gap:4px;margin-top:4px;padding:0 2px;font-family:var(--font-display);font-size:0.59rem;">
+          <span style="color:var(--text-dim);letter-spacing:0.04em;">SHELLS vs d</span>
+          <div style="display:flex;align-items:center;gap:3px;">
+            <button id="btn-hist-open-table" type="button" style="padding:1px 6px;font-size:0.58rem;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open publication-ready CC½ / Completeness / ⟨I/σ⟩ resolution table popup (High Score &amp; Word/Excel copy)">🏆 Table</button>
+            <button id="btn-hist-dl-csv" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Download merging statistics vs. resolution (.csv)">↓ CSV</button>
+            <button id="btn-hist-dl-html" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Download merging statistics vs. resolution (.html)">↓ HTML</button>
+          </div>
+        </div>
         <canvas id="canvas-hist" aria-label="Resolution sparkline (hover bin for shell edges and statistic; click to cycle metric)" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
       </div>
     </aside>
@@ -8347,6 +9220,30 @@ def render_rainbow_html(
   </div>
 
   <div id="hist-bin-tooltip" role="tooltip" style="display:none;position:fixed;z-index:9600;pointer-events:none;background:rgba(7,9,19,0.96);border:1px solid var(--accent-cyan);border-radius:5px;padding:4px 8px;box-shadow:0 8px 22px rgba(0,0,0,0.82);font-family:var(--font-display);font-size:0.64rem;line-height:1.35;color:var(--text-main);white-space:nowrap;"></div>
+
+  <!-- Modal Dialog: Publication-Ready / Bubble-Bobble High-Score Merging Statistics Table -->
+  <div id="modal-merge-table" role="dialog" aria-modal="true" aria-labelledby="merge-tbl-modal-title" style="display:none;position:fixed;inset:0;z-index:9400;background:rgba(4,6,14,0.84);backdrop-filter:blur(4px);align-items:center;justify-content:center;padding:14px;">
+    <div id="merge-tbl-card" style="width:min(940px,96vw);max-height:90vh;display:flex;flex-direction:column;border-radius:12px;overflow:hidden;background:#10162b;border:2px solid #2a3966;box-shadow:0 20px 55px rgba(0,0,0,0.82),0 0 28px rgba(56,189,248,0.16);color:#f1f5f9;user-select:text;">
+      <div id="merge-tbl-rainbow" style="height:6px;flex-shrink:0;background:linear-gradient(90deg,#ff3b6b,#ff922b,#ffd43b,#38d9a9,#38bdf8,#a855f7,#f472b6);"></div>
+      <div id="merge-tbl-header" style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:11px 16px;border-bottom:1px solid rgba(148,163,184,0.22);flex-shrink:0;">
+        <div>
+          <div id="merge-tbl-kicker" style="font-family:var(--font-display);font-size:0.66rem;letter-spacing:0.11em;color:#f472b6;font-weight:800;">1UP • BUBBLE BOBBLE HIGH SCORE // RESOLUTION SHELL HALL OF FAME</div>
+          <div id="merge-tbl-modal-title" style="font-size:0.96rem;font-weight:700;margin-top:2px;">Merging and Scaling Statistics by Resolution Shell</div>
+          <div id="merge-tbl-meta" style="font-size:0.68rem;color:#94a3b8;margin-top:3px;"></div>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;">
+          <button id="btn-merge-tbl-style" type="button" style="padding:4px 9px;font-size:0.68rem;" title="Switch between Bubble-Bobble High-Score Arcade view and clean black-on-white Publication Table preview">Style: Arcade High Score</button>
+          <button id="btn-merge-tbl-copy" type="button" class="active-btn" style="padding:4px 11px;font-size:0.70rem;font-weight:700;" title="Copy clean publication-formatted HTML table + tab-separated values for pasting directly into Word, Google Docs, or Excel">📋 Copy for Word / Excel</button>
+          <button id="btn-merge-tbl-csv" type="button" style="padding:4px 9px;font-size:0.68rem;" title="Download merging statistics as .csv">↓ .csv</button>
+          <button id="btn-merge-tbl-html" type="button" style="padding:4px 9px;font-size:0.68rem;" title="Download standalone merging statistics .html artifact">↓ .html</button>
+          <button id="btn-merge-tbl-close" type="button" style="padding:4px 8px;font-size:0.72rem;" title="Close resolution table (Esc)">✕</button>
+        </div>
+      </div>
+      <div id="merge-tbl-scroll" style="padding:12px 16px 14px 16px;overflow:auto;flex:1 1 auto;">
+        <div id="merge-tbl-body-wrap"></div>
+      </div>
+    </div>
+  </div>
 
 <script>
 window.RAINBOW_ZONES_DATA = {payload_json};
@@ -11116,7 +12013,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return;
     }}
     bar.style.display = "flex";
-    const cc = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
+    const ccNum = typeof m.cc_half_overall === "number" && Number.isFinite(m.cc_half_overall) ? m.cc_half_overall : null;
+    const cc = ccNum !== null ? ccNum.toFixed(3) : "—";
+    const ccCol = ccNum === null ? "var(--accent-gold)" : (ccNum >= 0.8 ? "#34d399" : (ccNum >= 0.3 ? "#fbbf24" : "#f43f5e"));
     const ccs = typeof m.cc_half_spearman === "number" ? m.cc_half_spearman.toFixed(3) : null;
     const isig = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
     const comp = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
@@ -11127,11 +12026,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ? `${{(m.harmonic_overlap_fraction * 100).toFixed(1)}}%`
       : "—";
     bar.innerHTML = `
-      <span><strong style="color:var(--accent-cyan);">CARELESS MERGE:</strong> CC½=<strong style="color:var(--accent-gold);">${{cc}}</strong>${{ccs ? ` (ρ=${{ccs}})` : ""}}</span>
+      <span><strong style="color:var(--accent-cyan);">CARELESS MERGE:</strong> CC½=<strong style="color:${{ccCol}};">${{cc}}</strong>${{ccs ? ` (ρ=${{ccs}})` : ""}}</span>
       <span>⟨I/σ⟩=<strong style="color:var(--accent-gold);">${{isig}}</strong></span>
       <span>Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{nAsu}} ASU / ${{nObs}} obs)</span>
       <span>Multiplicity=<strong>${{mult}}</strong> • Harmonics=<strong>${{harmPct}}</strong></span>
+      <span style="margin-left:auto;display:inline-flex;align-items:center;gap:4px;">
+        <button type="button" data-merge-action="open-table" style="padding:1px 6px;font-size:0.58rem;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open publication-ready CC½ / Completeness / ⟨I/σ⟩ resolution shell table">🏆 Table</button>
+        <button type="button" data-merge-action="dl-csv" style="padding:1px 5px;font-size:0.58rem;" title="Download merging statistics (.csv)">↓ CSV</button>
+        <button type="button" data-merge-action="dl-html" style="padding:1px 5px;font-size:0.58rem;" title="Download merging statistics (.html)">↓ HTML</button>
+      </span>
     `;
+    bar.querySelectorAll("button[data-merge-action]").forEach(btn => {{
+      btn.addEventListener("click", (ev) => {{
+        ev.stopPropagation();
+        const act = btn.getAttribute("data-merge-action");
+        if (act === "open-table") openMergeTableModal();
+        else if (act === "dl-csv") downloadMergeArtifact("csv");
+        else if (act === "dl-html") downloadMergeArtifact("html");
+      }});
+    }});
   }}
 
   function syncProjectionUI() {{
@@ -11581,6 +12494,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   const histCanvas = document.getElementById("canvas-hist");
+  const histBarHeader = document.getElementById("hist-bar-header");
   const histBinTooltip = document.getElementById("hist-bin-tooltip");
 
   function getMergeResolutionBins() {{
@@ -11621,7 +12535,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (hasCc) {{
         const ccRaw = Number(b.cc_half);
         statValue = ccRaw.toFixed(3);
-        statColor = ccRaw >= 0.8 ? "#34d399" : (ccRaw >= 0.5 ? "#fbbf24" : "#f43f5e");
+        statColor = ccRaw >= 0.8 ? "#34d399" : (ccRaw >= 0.3 ? "#fbbf24" : "#f43f5e");
       }}
     }}
     const nRefl = (b && b.n_refl !== null && b.n_refl !== undefined && Number.isFinite(Number(b.n_refl)))
@@ -11726,6 +12640,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const m = DATA.merge_metrics;
     const mergeBins = getMergeResolutionBins();
     const hasMergeBins = mergeBins.length > 0;
+    if (typeof histBarHeader !== "undefined" && histBarHeader) {{
+      histBarHeader.style.display = hasMergeBins ? "flex" : "none";
+    }}
     if (histCanvas) {{
       histCanvas.style.display = hasMergeBins ? "block" : "none";
       histCanvas.style.height = hasMergeBins ? "50px" : "40px";
@@ -11779,7 +12696,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const hasCc = rawCc !== null && rawCc !== undefined && Number.isFinite(Number(rawCc));
           const ccVal = hasCc ? Math.max(0, Math.min(1, Number(rawCc))) : 0;
           bh = hasCc ? Math.max(2, ccVal * (h - 20)) : 1;
-          fillCol = !hasCc ? "#1e293b" : (ccVal >= 0.8 ? "#34d399" : (ccVal >= 0.5 ? "#fbbf24" : "#f43f5e"));
+          fillCol = !hasCc ? "#1e293b" : (ccVal >= 0.8 ? "#34d399" : (ccVal >= 0.3 ? "#fbbf24" : "#f43f5e"));
         }}
         const y = h - 14 - bh;
         ctx.globalAlpha = (hovIdx !== null && i !== hovIdx) ? 0.55 : 1.0;
@@ -15856,7 +16773,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function classifyArtifactStageClient(filename) {{
     const low = String(filename || "").split("/").pop().toLowerCase();
     if (!low) return null;
-    if (["merged.mtz", "predictions.mtz", "xval.mtz", "careless_metrics.json", "careless_0.mtz", "careless_predictions_0.mtz", "careless_xval_0.mtz"].some(k => low === k || low.endsWith(k))) {{
+    if (["merged.mtz", "predictions.mtz", "xval.mtz", "careless_metrics.json", "merge_table.html", "merge_table.csv", "careless_0.mtz", "careless_predictions_0.mtz", "careless_xval_0.mtz"].some(k => low === k || low.endsWith(k))) {{
       return "merge";
     }}
     if (["predictor.h5", "integrated.h5", "reflections.mtz"].some(k => low === k || low.endsWith(k))) {{
@@ -15930,6 +16847,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       lbl.textContent = `${{grp.sTitle.toUpperCase()}}:`;
       filesDrawer.appendChild(lbl);
 
+      if (grp.sId === "merge" && getMergeResolutionBins().length > 0) {{
+        const viewBtn = document.createElement("button");
+        viewBtn.type = "button";
+        viewBtn.className = "file-dl-pill";
+        viewBtn.style.cursor = "pointer";
+        viewBtn.style.borderColor = "rgba(56, 189, 248, 0.55)";
+        viewBtn.style.color = "var(--accent-cyan)";
+        viewBtn.textContent = "🏆 Table";
+        viewBtn.title = "Open publication-ready CC½ / Completeness / ⟨I/σ⟩ resolution shell table (Word/Excel copy)";
+        viewBtn.addEventListener("click", () => openMergeTableModal());
+        filesDrawer.appendChild(viewBtn);
+      }}
+
       grp.items.forEach(item => {{
         const a = document.createElement("a");
         a.className = "file-dl-pill";
@@ -15949,8 +16879,536 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         a.title = `Download ${{item.name}} (${{grp.sTitle}}) to local computer`;
         filesDrawer.appendChild(a);
       }});
+
+      if (grp.sId === "merge" && getMergeResolutionBins().length > 0) {{
+        const existingNames = new Set(grp.items.map(it => String(it.name || "").toLowerCase()));
+        ["merge_table.csv", "merge_table.html"].forEach(synthName => {{
+          if (existingNames.has(synthName)) return;
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "file-dl-pill";
+          b.style.cursor = "pointer";
+          b.textContent = `↓ ${{synthName}}`;
+          b.title = `Download ${{synthName}} to local computer`;
+          b.addEventListener("click", () => downloadMergeArtifact(synthName.endsWith(".csv") ? "csv" : "html"));
+          filesDrawer.appendChild(b);
+        }});
+      }}
     }});
   }}
+
+  let mergeTableStyleMode = (UI_MODE === "pro" || UI_MODE === "boring") ? "publication" : "arcade";
+
+  function escapeHtmlText(val) {{
+    return String(val === null || val === undefined ? "" : val)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }}
+
+  function ordinalShellRank(num) {{
+    const mod100 = num % 100;
+    if (mod100 >= 10 && mod100 <= 20) return `${{num}}TH`;
+    const mod10 = num % 10;
+    if (mod10 === 1) return `${{num}}ST`;
+    if (mod10 === 2) return `${{num}}ND`;
+    if (mod10 === 3) return `${{num}}RD`;
+    return `${{num}}TH`;
+  }}
+
+  function computeCcStarClient(cc) {{
+    if (cc === null || cc === undefined || !Number.isFinite(cc) || cc < 0) return null;
+    if (cc === 0) return 0;
+    const d = 1 + cc;
+    return d > 1e-12 ? Math.sqrt(Math.max(0, (2 * cc) / d)) : null;
+  }}
+
+  function ccHalfTierClient(cc) {{
+    if (cc === null || cc === undefined || !Number.isFinite(cc)) return "na";
+    if (cc >= 0.8) return "green";
+    if (cc >= 0.3) return "yellow";
+    return "red";
+  }}
+
+  function buildClientMergeTableData() {{
+    const m = DATA.merge_metrics || {{}};
+    const bins = getMergeResolutionBins();
+    const numOrNull = (v) => (v !== null && v !== undefined && typeof v !== "boolean" && Number.isFinite(Number(v))) ? Number(v) : null;
+    const intOrNull = (v) => {{
+      const f = numOrNull(v);
+      return f !== null ? Math.round(f) : null;
+    }};
+
+    let sumObs = 0;
+    let allHaveObs = bins.length > 0;
+    let sumUnique = 0;
+    let sumTheo = 0;
+    let anyHaveTheo = false;
+    const rows = bins.map((b, idx) => {{
+      const shell = idx + 1;
+      const dMax = numOrNull(b && b.d_max);
+      const dMin = numOrNull(b && b.d_min);
+      const nObs = intOrNull(b && b.n_obs);
+      const nUnique = intOrNull(b && b.n_refl) !== null ? intOrNull(b && b.n_refl) : 0;
+      const nTheoRaw = intOrNull(b && b.n_theo);
+      const nTheo = (nTheoRaw !== null && nTheoRaw > 0) ? nTheoRaw : null;
+      let mult = numOrNull(b && b.multiplicity);
+      if (mult === null && nObs !== null && nUnique > 0) mult = nObs / nUnique;
+      let comp = numOrNull(b && b.completeness_pct);
+      if (comp === null && nTheo !== null && nTheo > 0) comp = (100 * nUnique) / nTheo;
+      const isigi = numOrNull(b && b.mean_isigi);
+      const ccHalf = numOrNull(b && b.cc_half);
+      const ccStar = computeCcStarClient(ccHalf);
+      if (nObs !== null) sumObs += nObs;
+      else allHaveObs = false;
+      sumUnique += nUnique;
+      if (nTheo !== null) {{
+        sumTheo += nTheo;
+        anyHaveTheo = true;
+      }}
+      return {{
+        shell,
+        rankBadge: ordinalShellRank(shell),
+        dMax,
+        dMin,
+        rangeDisplay: (dMax !== null && dMin !== null) ? `${{dMax.toFixed(2)}} – ${{dMin.toFixed(2)}}` : `Bin ${{shell}}`,
+        rangeAscii: (dMax !== null && dMin !== null) ? `${{dMax.toFixed(2)}} - ${{dMin.toFixed(2)}}` : `Bin ${{shell}}`,
+        nObs,
+        nUnique,
+        nTheo,
+        multiplicity: mult,
+        completenessPct: comp,
+        meanIsigi: isigi,
+        ccHalf,
+        ccStar,
+        ccTier: ccHalfTierClient(ccHalf),
+      }};
+    }});
+
+    const ovDMax = numOrNull(m.d_max) !== null ? numOrNull(m.d_max) : (rows.length && rows[0].dMax !== null ? rows[0].dMax : null);
+    const ovDMin = numOrNull(m.d_min) !== null ? numOrNull(m.d_min) : (rows.length && rows[rows.length - 1].dMin !== null ? rows[rows.length - 1].dMin : null);
+    const ovObs = intOrNull(m.n_observations) !== null ? intOrNull(m.n_observations) : (allHaveObs && sumObs > 0 ? sumObs : null);
+    const ovUnique = intOrNull(m.n_merged_asu) || sumUnique;
+    const ovTheo = intOrNull(m.n_theoretical_asu) !== null ? intOrNull(m.n_theoretical_asu) : (anyHaveTheo && sumTheo > 0 ? sumTheo : null);
+    let ovMult = numOrNull(m.multiplicity) !== null ? numOrNull(m.multiplicity) : numOrNull(m.mean_multiplicity);
+    if (ovMult === null && ovObs !== null && ovUnique > 0) ovMult = ovObs / ovUnique;
+    let ovComp = numOrNull(m.completeness_pct);
+    if (ovComp === null && ovTheo !== null && ovTheo > 0) ovComp = (100 * ovUnique) / ovTheo;
+    const ovIsigi = numOrNull(m.mean_i_over_sigi) !== null ? numOrNull(m.mean_i_over_sigi) : numOrNull(m.mean_isigi);
+    const ovCc = numOrNull(m.cc_half_overall) !== null ? numOrNull(m.cc_half_overall) : numOrNull(m.cc_half);
+    const overall = {{
+      shell: "Overall",
+      rankBadge: "ALL",
+      dMax: ovDMax,
+      dMin: ovDMin,
+      rangeDisplay: (ovDMax !== null && ovDMin !== null) ? `${{ovDMax.toFixed(2)}} – ${{ovDMin.toFixed(2)}}` : "Overall",
+      rangeAscii: (ovDMax !== null && ovDMin !== null) ? `${{ovDMax.toFixed(2)}} - ${{ovDMin.toFixed(2)}}` : "Overall",
+      nObs: ovObs,
+      nUnique: ovUnique,
+      nTheo: ovTheo,
+      multiplicity: ovMult,
+      completenessPct: ovComp,
+      meanIsigi: ovIsigi,
+      ccHalf: ovCc,
+      ccStar: computeCcStarClient(ovCc),
+      ccTier: ccHalfTierClient(ovCc),
+    }};
+
+    let dCc30 = null;
+    rows.forEach(r => {{
+      if (r.ccHalf !== null && r.ccHalf >= 0.3 && r.dMin !== null) {{
+        if (dCc30 === null || r.dMin < dCc30) dCc30 = r.dMin;
+      }}
+    }});
+
+    const sg = String(m.space_group || DATA.space_group || "").trim();
+    const cellArr = Array.isArray(m.cell) && m.cell.length >= 6 ? m.cell : (Array.isArray(DATA.cell) && DATA.cell.length >= 6 ? DATA.cell : null);
+    const wlArr = Array.isArray(m.wavelength_range) && m.wavelength_range.length >= 2 ? m.wavelength_range : (Array.isArray(DATA.wavelength_range) && DATA.wavelength_range.length >= 2 ? DATA.wavelength_range : null);
+    const metaParts = [];
+    if (sg) metaParts.push(`Space group: ${{sg}}`);
+    if (cellArr) {{
+      metaParts.push(`Cell: ${{Number(cellArr[0]).toFixed(2)}}, ${{Number(cellArr[1]).toFixed(2)}}, ${{Number(cellArr[2]).toFixed(2)}} Å; ${{Number(cellArr[3]).toFixed(1)}}°, ${{Number(cellArr[4]).toFixed(1)}}°, ${{Number(cellArr[5]).toFixed(1)}}°`);
+    }}
+    if (wlArr) metaParts.push(`λ: ${{Number(wlArr[0]).toFixed(2)}}–${{Number(wlArr[1]).toFixed(2)}} Å`);
+    if (dCc30 !== null) metaParts.push(`d(CC½ ≥ 0.30): ${{dCc30.toFixed(2)}} Å`);
+
+    return {{
+      title: "Merging and Scaling Statistics by Resolution Shell",
+      metaLine: metaParts.join(" • "),
+      dCc30,
+      rows,
+      overall,
+    }};
+  }}
+
+  function buildMergeTableClipboardPayloads(tData) {{
+    const fmtF = (v, nd) => (v !== null && v !== undefined && Number.isFinite(v)) ? v.toFixed(nd) : "";
+    const tsvLines = [
+      ["Shell", "Resolution (Å)", "N_obs", "N_unique", "N_theo", "Multiplicity", "Completeness (%)", "<I/sigma(I)>", "CC1/2", "CC*"].join("\\t")
+    ];
+    const cleanRows = tData.rows.map(r => {{
+      tsvLines.push([
+        String(r.shell),
+        r.rangeDisplay,
+        r.nObs !== null ? String(r.nObs) : "",
+        String(r.nUnique),
+        r.nTheo !== null ? String(r.nTheo) : "",
+        fmtF(r.multiplicity, 2),
+        fmtF(r.completenessPct, 1),
+        fmtF(r.meanIsigi, 2),
+        fmtF(r.ccHalf, 3),
+        fmtF(r.ccStar, 3),
+      ].join("\\t"));
+      return `<tr>` +
+        `<td style="padding:4px 8px;text-align:center;">${{r.shell}}</td>` +
+        `<td style="padding:4px 8px;text-align:center;">${{escapeHtmlText(r.rangeDisplay)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{r.nObs !== null ? r.nObs : ""}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{r.nUnique}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{r.nTheo !== null ? r.nTheo : ""}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.multiplicity, 2)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.completenessPct, 1)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.meanIsigi, 2)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.ccHalf, 3)}}</td>` +
+        `<td style="padding:4px 8px;text-align:right;">${{fmtF(r.ccStar, 3)}}</td>` +
+      `</tr>`;
+    }});
+    const ov = tData.overall;
+    tsvLines.push([
+      "Overall",
+      ov.rangeDisplay,
+      ov.nObs !== null ? String(ov.nObs) : "",
+      String(ov.nUnique),
+      ov.nTheo !== null ? String(ov.nTheo) : "",
+      fmtF(ov.multiplicity, 2),
+      fmtF(ov.completenessPct, 1),
+      fmtF(ov.meanIsigi, 2),
+      fmtF(ov.ccHalf, 3),
+      fmtF(ov.ccStar, 3),
+    ].join("\\t"));
+    const cleanFoot =
+      `<tr style="border-top:1px solid #000;border-bottom:2px solid #000;font-weight:bold;">` +
+        `<td style="padding:5px 8px;text-align:center;">Overall</td>` +
+        `<td style="padding:5px 8px;text-align:center;">${{escapeHtmlText(ov.rangeDisplay)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{ov.nObs !== null ? ov.nObs : ""}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{ov.nUnique}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{ov.nTheo !== null ? ov.nTheo : ""}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.multiplicity, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.completenessPct, 1)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.meanIsigi, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.ccHalf, 3)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtF(ov.ccStar, 3)}}</td>` +
+      `</tr>`;
+    const cleanHtml =
+      `<div style="background:#ffffff;color:#000000;font-family:Calibri,Arial,sans-serif;font-size:11pt;">` +
+      `<p style="margin:0 0 6px 0;font-weight:bold;">${{escapeHtmlText(tData.title)}}${{tData.metaLine ? ` (${{escapeHtmlText(tData.metaLine)}})` : ""}}</p>` +
+      `<table style="border-collapse:collapse;font-family:Calibri,Arial,sans-serif;font-size:10.5pt;color:#000000;background:#ffffff;">` +
+      `<thead><tr style="border-top:2px solid #000;border-bottom:1px solid #000;font-weight:bold;">` +
+        `<th style="padding:5px 8px;text-align:center;">Shell</th>` +
+        `<th style="padding:5px 8px;text-align:center;">Resolution (Å)</th>` +
+        `<th style="padding:5px 8px;text-align:right;">N<sub>obs</sub></th>` +
+        `<th style="padding:5px 8px;text-align:right;">N<sub>unique</sub></th>` +
+        `<th style="padding:5px 8px;text-align:right;">N<sub>theo</sub></th>` +
+        `<th style="padding:5px 8px;text-align:right;">Multiplicity</th>` +
+        `<th style="padding:5px 8px;text-align:right;">Completeness (%)</th>` +
+        `<th style="padding:5px 8px;text-align:right;">⟨I/σ(I)⟩</th>` +
+        `<th style="padding:5px 8px;text-align:right;">CC<sub>1/2</sub></th>` +
+        `<th style="padding:5px 8px;text-align:right;">CC*</th>` +
+      `</tr></thead><tbody>${{cleanRows.join("")}}</tbody><tfoot>${{cleanFoot}}</tfoot></table></div>`;
+
+    const csvEscape = (s) => {{
+      const str = String(s === null || s === undefined ? "" : s);
+      return /[",\\n]/.test(str) ? `"${{str.replace(/"/g, '""')}}"` : str;
+    }};
+    const csvRows = [
+      ["shell", "d_max_A", "d_min_A", "resolution_range_A", "n_obs", "n_unique", "n_theo", "multiplicity", "completeness_pct", "mean_isigi", "cc_half", "cc_star"].join(",")
+    ];
+    [...tData.rows, ov].forEach(r => {{
+      csvRows.push([
+        csvEscape(r.shell),
+        fmtF(r.dMax, 2),
+        fmtF(r.dMin, 2),
+        csvEscape(r.rangeAscii),
+        r.nObs !== null ? String(r.nObs) : "",
+        String(r.nUnique),
+        r.nTheo !== null ? String(r.nTheo) : "",
+        fmtF(r.multiplicity, 2),
+        fmtF(r.completenessPct, 1),
+        fmtF(r.meanIsigi, 2),
+        fmtF(r.ccHalf, 4),
+        fmtF(r.ccStar, 4),
+      ].join(","));
+    }});
+    return {{ cleanHtml, tsv: tsvLines.join("\\n"), csv: csvRows.join("\\n") + "\\n" }};
+  }}
+
+  function renderMergeTableModalContent() {{
+    const card = document.getElementById("merge-tbl-card");
+    const rb = document.getElementById("merge-tbl-rainbow");
+    const kicker = document.getElementById("merge-tbl-kicker");
+    const titleEl = document.getElementById("merge-tbl-modal-title");
+    const metaEl = document.getElementById("merge-tbl-meta");
+    const styleBtn = document.getElementById("btn-merge-tbl-style");
+    const wrap = document.getElementById("merge-tbl-body-wrap");
+    if (!card || !wrap) return;
+
+    const tData = buildClientMergeTableData();
+    const isPub = mergeTableStyleMode === "publication";
+    card.style.background = isPub ? "#ffffff" : "#10162b";
+    card.style.color = isPub ? "#0f172a" : "#f1f5f9";
+    card.style.borderColor = isPub ? "#cbd5e1" : "#2a3966";
+    if (rb) rb.style.display = isPub ? "none" : "block";
+    if (kicker) kicker.style.display = isPub ? "none" : "block";
+    if (titleEl) {{
+      titleEl.textContent = tData.title;
+      titleEl.style.color = isPub ? "#0f172a" : "#f8fafc";
+      titleEl.style.fontFamily = isPub ? "Georgia, 'Times New Roman', serif" : "var(--font-display)";
+    }}
+    if (metaEl) {{
+      const stageBadge = (!isPub && tData.dCc30 !== null)
+        ? ` <span style="display:inline-block;margin-left:6px;padding:1px 8px;border-radius:999px;background:rgba(52,211,153,0.16);border:1px solid rgba(52,211,153,0.55);color:#34d399;font-weight:700;">STAGE CLEAR • d(CC½ ≥ 0.30) = ${{tData.dCc30.toFixed(2)}} Å</span>`
+        : "";
+      metaEl.style.color = isPub ? "#475569" : "#94a3b8";
+      metaEl.innerHTML = `${{escapeHtmlText(tData.metaLine)}}${{stageBadge}}`;
+    }}
+    if (styleBtn) {{
+      styleBtn.textContent = `Style: ${{isPub ? "Publication" : "Arcade High Score"}}`;
+    }}
+
+    const fmtDisp = (v, nd) => (v !== null && v !== undefined && Number.isFinite(v)) ? v.toFixed(nd) : "—";
+    const fmtIntDisp = (v) => (v !== null && v !== undefined && Number.isFinite(v)) ? Math.round(v).toLocaleString() : "—";
+    const ccColor = (tier) => {{
+      if (isPub) return "#0f172a";
+      if (tier === "green") return "#34d399";
+      if (tier === "yellow") return "#fbbf24";
+      if (tier === "red") return "#f43f5e";
+      return "#94a3b8";
+    }};
+    const thStyle = isPub
+      ? "padding:6px 8px;text-align:right;border-top:2px solid #0f172a;border-bottom:1px solid #0f172a;color:#0f172a;font-weight:700;white-space:nowrap;"
+      : "padding:6px 8px;text-align:right;border-top:2px solid #38bdf8;border-bottom:1px solid #334155;color:#38bdf8;font-weight:700;white-space:nowrap;";
+    const tdBorder = isPub ? "none" : "1px solid rgba(51,65,85,0.48)";
+
+    const bodyHtml = tData.rows.map(r => {{
+      const shCell = isPub
+        ? `${{r.shell}}`
+        : `<span style="display:inline-block;min-width:36px;padding:1px 5px;border-radius:4px;font-size:0.64rem;font-weight:800;background:rgba(244,114,182,0.16);border:1px solid rgba(244,114,182,0.45);color:#f9a8d4;">${{r.rankBadge}}</span>`;
+      return `<tr>` +
+        `<td style="padding:5px 8px;text-align:center;border-bottom:${{tdBorder}};">${{shCell}}</td>` +
+        `<td style="padding:5px 8px;text-align:center;border-bottom:${{tdBorder}};white-space:nowrap;">${{escapeHtmlText(r.rangeDisplay)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtIntDisp(r.nObs)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtIntDisp(r.nUnique)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtIntDisp(r.nTheo)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtDisp(r.multiplicity, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtDisp(r.completenessPct, 1)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtDisp(r.meanIsigi, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};font-weight:700;color:${{ccColor(r.ccTier)}};">${{fmtDisp(r.ccHalf, 3)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtDisp(r.ccStar, 3)}}</td>` +
+      `</tr>`;
+    }}).join("");
+
+    const ov = tData.overall;
+    const ovRowStyle = isPub
+      ? "border-top:1px solid #0f172a;border-bottom:2px solid #0f172a;font-weight:700;"
+      : "border-top:2px solid #38bdf8;border-bottom:2px solid #f472b6;font-weight:800;background:rgba(56,189,248,0.08);";
+    const ovShell = isPub
+      ? "Overall"
+      : `<span style="display:inline-block;min-width:36px;padding:1px 5px;border-radius:4px;font-size:0.64rem;font-weight:800;background:rgba(56,189,248,0.18);border:1px solid rgba(56,189,248,0.55);color:#7dd3fc;">ALL</span>`;
+    const footHtml =
+      `<tr style="${{ovRowStyle}}">` +
+        `<td style="padding:6px 8px;text-align:center;">${{ovShell}}</td>` +
+        `<td style="padding:6px 8px;text-align:center;white-space:nowrap;">${{escapeHtmlText(ov.rangeDisplay)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtIntDisp(ov.nObs)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtIntDisp(ov.nUnique)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtIntDisp(ov.nTheo)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.multiplicity, 2)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.completenessPct, 1)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.meanIsigi, 2)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;color:${{ccColor(ov.ccTier)}};">${{fmtDisp(ov.ccHalf, 3)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.ccStar, 3)}}</td>` +
+      `</tr>`;
+
+    const tblFont = isPub ? "Georgia, 'Times New Roman', serif" : "var(--font-display)";
+    const legendRight = isPub
+      ? ""
+      : `<span>CC<sub>1/2</sub> tiers: <strong style="color:#34d399;">≥ 0.80</strong> • <strong style="color:#fbbf24;">0.30–0.79</strong> • <strong style="color:#f43f5e;">&lt; 0.30</strong></span>`;
+    wrap.innerHTML =
+      `<table style="width:100%;border-collapse:collapse;font-family:${{tblFont}};font-variant-numeric:tabular-nums;font-size:${{isPub ? "0.80rem" : "0.75rem"}};">` +
+        `<thead><tr>` +
+          `<th style="${{thStyle}}text-align:center;">Shell</th>` +
+          `<th style="${{thStyle}}text-align:center;">Resolution (Å)</th>` +
+          `<th style="${{thStyle}}">N<sub>obs</sub></th>` +
+          `<th style="${{thStyle}}">N<sub>unique</sub></th>` +
+          `<th style="${{thStyle}}">N<sub>theo</sub></th>` +
+          `<th style="${{thStyle}}">Multiplicity</th>` +
+          `<th style="${{thStyle}}">Completeness (%)</th>` +
+          `<th style="${{thStyle}}">⟨I/σ(I)⟩</th>` +
+          `<th style="${{thStyle}}">CC<sub>1/2</sub></th>` +
+          `<th style="${{thStyle}}">CC*</th>` +
+        `</tr></thead>` +
+        `<tbody>${{bodyHtml}}</tbody>` +
+        `<tfoot>${{footHtml}}</tfoot>` +
+      `</table>` +
+      `<div style="margin-top:8px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:0.66rem;color:${{isPub ? "#475569" : "#94a3b8"}};">` +
+        `<span>CC* = [2 CC<sub>1/2</sub> / (1 + CC<sub>1/2</sub>)]<sup>1/2</sup> (Karplus &amp; Diederichs, 2012). “Copy for Word / Excel” always copies clean white-background publication formatting.</span>` +
+        legendRight +
+      `</div>`;
+  }}
+
+  function openMergeTableModal() {{
+    const modal = document.getElementById("modal-merge-table");
+    if (!modal || !DATA.merge_metrics) return;
+    renderMergeTableModalContent();
+    modal.style.display = "flex";
+  }}
+
+  function closeMergeTableModal() {{
+    const modal = document.getElementById("modal-merge-table");
+    if (modal) modal.style.display = "none";
+  }}
+
+  async function copyMergeTableForPublication() {{
+    const btn = document.getElementById("btn-merge-tbl-copy");
+    const tData = buildClientMergeTableData();
+    const payloads = buildMergeTableClipboardPayloads(tData);
+    let ok = false;
+    try {{
+      if (navigator.clipboard && window.ClipboardItem) {{
+        await navigator.clipboard.write([
+          new ClipboardItem({{
+            "text/html": new Blob([payloads.cleanHtml], {{ type: "text/html" }}),
+            "text/plain": new Blob([payloads.tsv], {{ type: "text/plain" }}),
+          }})
+        ]);
+        ok = true;
+      }}
+    }} catch (_e) {{}}
+    if (!ok) {{
+      const holder = document.createElement("div");
+      holder.style.cssText = "position:fixed;left:-9999px;top:0;background:#ffffff;color:#000000;user-select:text;";
+      holder.innerHTML = payloads.cleanHtml;
+      document.body.appendChild(holder);
+      const sel = window.getSelection();
+      const rng = document.createRange();
+      rng.selectNodeContents(holder);
+      sel.removeAllRanges();
+      sel.addRange(rng);
+      try {{ ok = document.execCommand("copy"); }} catch (_e2) {{}}
+      sel.removeAllRanges();
+      document.body.removeChild(holder);
+    }}
+    if (!ok && navigator.clipboard && navigator.clipboard.writeText) {{
+      try {{ await navigator.clipboard.writeText(payloads.tsv); ok = true; }} catch (_e3) {{}}
+    }}
+    if (btn) {{
+      const prev = btn.textContent;
+      btn.textContent = ok ? "✓ Copied for Word / Excel!" : "Copy failed";
+      setTimeout(() => {{ btn.textContent = prev; }}, 1800);
+    }}
+  }}
+
+  function renderStandaloneMergeHtmlClient(tData) {{
+    const payloads = buildMergeTableClipboardPayloads(tData);
+    const fmtDisp = (v, nd) => (v !== null && v !== undefined && Number.isFinite(v)) ? v.toFixed(nd) : "—";
+    const fmtIntDisp = (v) => (v !== null && v !== undefined && Number.isFinite(v)) ? Math.round(v).toLocaleString() : "—";
+    const rowsHtml = tData.rows.map(r =>
+      `<tr><td style="text-align:center;">${{r.shell}}</td><td style="text-align:center;">${{escapeHtmlText(r.rangeDisplay)}}</td>` +
+      `<td>${{fmtIntDisp(r.nObs)}}</td><td>${{fmtIntDisp(r.nUnique)}}</td><td>${{fmtIntDisp(r.nTheo)}}</td>` +
+      `<td>${{fmtDisp(r.multiplicity, 2)}}</td><td>${{fmtDisp(r.completenessPct, 1)}}</td><td>${{fmtDisp(r.meanIsigi, 2)}}</td>` +
+      `<td class="cc-${{r.ccTier}}">${{fmtDisp(r.ccHalf, 3)}}</td><td>${{fmtDisp(r.ccStar, 3)}}</td></tr>`
+    ).join("");
+    const ov = tData.overall;
+    const footHtml =
+      `<tr class="overall"><td style="text-align:center;">Overall</td><td style="text-align:center;">${{escapeHtmlText(ov.rangeDisplay)}}</td>` +
+      `<td>${{fmtIntDisp(ov.nObs)}}</td><td>${{fmtIntDisp(ov.nUnique)}}</td><td>${{fmtIntDisp(ov.nTheo)}}</td>` +
+      `<td>${{fmtDisp(ov.multiplicity, 2)}}</td><td>${{fmtDisp(ov.completenessPct, 1)}}</td><td>${{fmtDisp(ov.meanIsigi, 2)}}</td>` +
+      `<td class="cc-${{ov.ccTier}}">${{fmtDisp(ov.ccHalf, 3)}}</td><td>${{fmtDisp(ov.ccStar, 3)}}</td></tr>`;
+    return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><title>${{escapeHtmlText(tData.title)}}</title>` +
+      `<style>body{{font-family:Georgia,serif;margin:24px;color:#0f172a;background:#fff;}}table{{border-collapse:collapse;width:100%;max-width:960px;font-variant-numeric:tabular-nums;}}` +
+      `th{{border-top:2px solid #0f172a;border-bottom:1px solid #0f172a;padding:6px 8px;text-align:right;}}td{{padding:5px 8px;text-align:right;}}` +
+      `tr.overall td{{border-top:1px solid #0f172a;border-bottom:2px solid #0f172a;font-weight:bold;}}.cc-green{{color:#047857;font-weight:700;}}.cc-yellow{{color:#b45309;font-weight:700;}}.cc-red{{color:#be123c;font-weight:700;}}</style></head>` +
+      `<body><h2>${{escapeHtmlText(tData.title)}}</h2><p>${{escapeHtmlText(tData.metaLine)}}</p>` +
+      `<table><thead><tr><th style="text-align:center;">Shell</th><th style="text-align:center;">Resolution (Å)</th><th>N<sub>obs</sub></th><th>N<sub>unique</sub></th><th>N<sub>theo</sub></th><th>Multiplicity</th><th>Completeness (%)</th><th>⟨I/σ(I)⟩</th><th>CC<sub>1/2</sub></th><th>CC*</th></tr></thead>` +
+      `<tbody>${{rowsHtml}}</tbody><tfoot>${{footHtml}}</tfoot></table>` +
+      `<script>window.__CSV__=${{JSON.stringify(payloads.csv)}};<\\/script></body></html>`;
+  }}
+
+  async function downloadMergeArtifact(ext) {{
+    const cleanExt = ext === "csv" ? "csv" : "html";
+    const fname = `merge_table.${{cleanExt}}`;
+    if (window.location && /^https?:$/i.test(window.location.protocol || "")) {{
+      try {{
+        const mergeList = (galaxyBridge.stepArtifacts && galaxyBridge.stepArtifacts.merge) || [];
+        const matchItem = mergeList.find(it => it && String(it.name || "").toLowerCase() === fname);
+        const qs = new URLSearchParams({{ name: fname }});
+        if (matchItem && matchItem.dataset_id) qs.set("dataset_id", matchItem.dataset_id);
+        const resp = await fetch(`api/artifacts/download?${{qs.toString()}}`, {{ credentials: "same-origin" }});
+        if (resp.ok) {{
+          const blob = await resp.blob();
+          if (blob && blob.size > 0) {{
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = fname;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 1500);
+            return;
+          }}
+        }}
+      }} catch (_e) {{}}
+    }}
+    const tData = buildClientMergeTableData();
+    const payloads = buildMergeTableClipboardPayloads(tData);
+    const content = cleanExt === "csv" ? payloads.csv : renderStandaloneMergeHtmlClient(tData);
+    const mime = cleanExt === "csv" ? "text/csv;charset=utf-8" : "text/html;charset=utf-8";
+    const blob = new Blob([content], {{ type: mime }});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+  }}
+
+  (function bindMergeTableControls() {{
+    const btnHistOpen = document.getElementById("btn-hist-open-table");
+    const btnHistCsv = document.getElementById("btn-hist-dl-csv");
+    const btnHistHtml = document.getElementById("btn-hist-dl-html");
+    const btnStyle = document.getElementById("btn-merge-tbl-style");
+    const btnCopy = document.getElementById("btn-merge-tbl-copy");
+    const btnCsv = document.getElementById("btn-merge-tbl-csv");
+    const btnHtml = document.getElementById("btn-merge-tbl-html");
+    const btnClose = document.getElementById("btn-merge-tbl-close");
+    const modal = document.getElementById("modal-merge-table");
+
+    if (btnHistOpen) btnHistOpen.addEventListener("click", () => openMergeTableModal());
+    if (btnHistCsv) btnHistCsv.addEventListener("click", () => downloadMergeArtifact("csv"));
+    if (btnHistHtml) btnHistHtml.addEventListener("click", () => downloadMergeArtifact("html"));
+    if (btnStyle) {{
+      btnStyle.addEventListener("click", () => {{
+        mergeTableStyleMode = mergeTableStyleMode === "publication" ? "arcade" : "publication";
+        renderMergeTableModalContent();
+      }});
+    }}
+    if (btnCopy) btnCopy.addEventListener("click", () => copyMergeTableForPublication());
+    if (btnCsv) btnCsv.addEventListener("click", () => downloadMergeArtifact("csv"));
+    if (btnHtml) btnHtml.addEventListener("click", () => downloadMergeArtifact("html"));
+    if (btnClose) btnClose.addEventListener("click", () => closeMergeTableModal());
+    if (modal) {{
+      modal.addEventListener("click", (ev) => {{
+        if (ev.target === modal) closeMergeTableModal();
+      }});
+    }}
+    document.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Escape" && modal && modal.style.display !== "none") {{
+        closeMergeTableModal();
+      }}
+    }});
+  }})();
 
   const elGalaxyBadge = document.getElementById("galaxy-status-badge");
   const btnGalaxyDispatch = document.getElementById("btn-galaxy-dispatch");

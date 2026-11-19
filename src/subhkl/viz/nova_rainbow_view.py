@@ -1477,6 +1477,8 @@ class NovaGalaxyPipelineRunner:
                 "predictions.mtz",
                 "xval.mtz",
                 "careless_metrics.json",
+                "merge_table.html",
+                "merge_table.csv",
                 "careless_0.mtz",
                 "careless_predictions_0.mtz",
                 "careless_xval_0.mtz",
@@ -1560,6 +1562,8 @@ class NovaGalaxyPipelineRunner:
 
         to_remove: list[str] = [
             "careless_metrics.json",
+            "merge_table.html",
+            "merge_table.csv",
             "merged.mtz",
             "predictions.mtz",
             "xval.mtz",
@@ -1636,6 +1640,7 @@ class NovaGalaxyPipelineRunner:
 
         work_dir = self._active_work_dir(current_h5)
         if work_dir and os.path.isdir(work_dir):
+            self._ensure_merge_table_artifacts(work_dir, current_h5=current_h5)
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 for fn in sorted(os.listdir(work_dir)):
                     fp = os.path.join(work_dir, fn)
@@ -1660,10 +1665,12 @@ class NovaGalaxyPipelineRunner:
         max_stage = getattr(self, "_max_valid_stage", None)
         if not max_stage and current_h5:
             max_stage = self._classify_artifact_stage(os.path.basename(str(current_h5)))
-            if (
-                max_stage == "integrate"
-                and work_dir
-                and os.path.isfile(os.path.join(work_dir, "careless_metrics.json"))
+            if max_stage == "integrate" and (
+                (
+                    work_dir
+                    and os.path.isfile(os.path.join(work_dir, "careless_metrics.json"))
+                )
+                or "merge_table.csv" in stages["merge"]
             ):
                 max_stage = "merge"
         if max_stage in self.STAGE_ORDER:
@@ -1672,6 +1679,129 @@ class NovaGalaxyPipelineRunner:
                 stages[st_k] = {}
 
         return {k: list(v.values()) for k, v in stages.items()}
+
+    def _ensure_merge_table_artifacts(
+        self,
+        work_dir: str | None,
+        *,
+        current_h5: str | None = None,
+        force: bool = False,
+    ) -> dict[str, str]:
+        """Materialize ``merge_table.csv`` and ``merge_table.html`` when merge metrics exist."""
+        from subhkl.viz.rainbow_zones import (
+            render_merge_table_csv,
+            render_merge_table_html,
+        )
+
+        target_dir = work_dir if (work_dir and os.path.isdir(work_dir)) else None
+        csv_existing = (
+            os.path.join(target_dir, "merge_table.csv") if target_dir else None
+        )
+        html_existing = (
+            os.path.join(target_dir, "merge_table.html") if target_dir else None
+        )
+        if (
+            not force
+            and csv_existing
+            and html_existing
+            and os.path.isfile(csv_existing)
+            and os.path.getsize(csv_existing) > 0
+            and os.path.isfile(html_existing)
+            and os.path.getsize(html_existing) > 0
+        ):
+            return {
+                "merge_table.csv": csv_existing,
+                "merge_table.html": html_existing,
+            }
+
+        metrics_doc: dict[str, Any] | None = None
+        if target_dir:
+            m_fp = os.path.join(target_dir, "careless_metrics.json")
+            if os.path.isfile(m_fp):
+                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                    with open(m_fp, "r", encoding="utf-8") as fh:
+                        loaded = json.load(fh)
+                    if isinstance(loaded, dict) and (
+                        loaded.get("resolution_bins")
+                        or loaded.get("cc_half_bins")
+                        or loaded.get("n_merged_asu")
+                    ):
+                        metrics_doc = loaded
+
+        h5_cand = current_h5
+        if (not h5_cand or not os.path.isfile(str(h5_cand))) and target_dir:
+            int_cand = os.path.join(target_dir, "integrated.h5")
+            if os.path.isfile(int_cand):
+                h5_cand = int_cand
+
+        sg_h5: str | None = None
+        cell_h5: list[float] | None = None
+        if h5_cand and os.path.isfile(str(h5_cand)):
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py as _h5py
+
+                with _h5py.File(str(h5_cand), "r") as hf:
+                    if metrics_doc is None and "careless/metrics_json" in hf:
+                        raw_b = hf["careless/metrics_json"][()]
+                        if isinstance(raw_b, (bytes, bytearray)):
+                            raw_s = raw_b.decode("utf-8", errors="replace")
+                        elif hasattr(raw_b, "tobytes"):
+                            raw_s = raw_b.tobytes().decode("utf-8", errors="replace")
+                        else:
+                            raw_s = str(raw_b)
+                        loaded_h5 = json.loads(raw_s)
+                        if isinstance(loaded_h5, dict) and (
+                            loaded_h5.get("resolution_bins")
+                            or loaded_h5.get("cc_half_bins")
+                            or loaded_h5.get("n_merged_asu")
+                        ):
+                            metrics_doc = loaded_h5
+                    if "sample" in hf:
+                        sgrp = hf["sample"]
+                        if "space_group" in sgrp:
+                            sg_raw = sgrp["space_group"][()]
+                            sg_h5 = (
+                                sg_raw.decode("utf-8", errors="replace")
+                                if isinstance(sg_raw, (bytes, bytearray))
+                                else str(sg_raw)
+                            ).strip()
+                        if all(
+                            k in sgrp for k in ("a", "b", "c", "alpha", "beta", "gamma")
+                        ):
+                            cell_h5 = [
+                                float(sgrp[k][()])
+                                for k in ("a", "b", "c", "alpha", "beta", "gamma")
+                            ]
+
+        if not isinstance(metrics_doc, dict):
+            return {}
+
+        csv_body = render_merge_table_csv(metrics_doc, space_group=sg_h5, cell=cell_h5)
+        html_body = render_merge_table_html(
+            metrics_doc, space_group=sg_h5, cell=cell_h5
+        )
+        out_dirs: list[str] = []
+        if target_dir:
+            out_dirs.append(target_dir)
+        fallback_tmp = os.path.join(tempfile.gettempdir(), "subhkl_merge_tables")
+        out_dirs.append(fallback_tmp)
+
+        for odir in out_dirs:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                os.makedirs(odir, exist_ok=True)
+                p_csv = os.path.join(odir, "merge_table.csv")
+                p_html = os.path.join(odir, "merge_table.html")
+                if force or not os.path.isfile(p_csv) or os.path.getsize(p_csv) == 0:
+                    with open(p_csv, "w", encoding="utf-8") as fh_c:
+                        fh_c.write(csv_body)
+                if force or not os.path.isfile(p_html) or os.path.getsize(p_html) == 0:
+                    with open(p_html, "w", encoding="utf-8") as fh_h:
+                        fh_h.write(html_body)
+                return {
+                    "merge_table.csv": p_csv,
+                    "merge_table.html": p_html,
+                }
+        return {}
 
     def resolve_artifact_for_download(
         self,
@@ -1687,6 +1817,14 @@ class NovaGalaxyPipelineRunner:
             cand = os.path.join(work_dir, clean_name)
             if os.path.isfile(cand) and os.path.getsize(cand) > 0:
                 return cand, clean_name
+
+        if clean_name.lower() in ("merge_table.csv", "merge_table.html"):
+            gen_map = self._ensure_merge_table_artifacts(
+                work_dir, current_h5=current_h5
+            )
+            gen_fp = gen_map.get(clean_name.lower())
+            if gen_fp and os.path.isfile(gen_fp) and os.path.getsize(gen_fp) > 0:
+                return gen_fp, clean_name
 
         ds_id = dataset_id.strip()
         if not ds_id and clean_name:
@@ -2330,14 +2468,12 @@ class NovaGalaxyPipelineRunner:
                     km_v = mcols["K"][val_m].astype(int)
                     lm_v = mcols["L"][val_m].astype(int)
                     isigi_v = mI[val_m] / mS[val_m]
-                    d_m = np.array(
-                        [
-                            mtz_m.cell.calculate_d([int(hh), int(kk), int(ll)])
-                            for hh, kk, ll in zip(hm_v, km_v, lm_v)
-                        ],
-                        dtype=np.float64,
+                    frac_mat_m = np.array(mtz_m.cell.frac.mat, dtype=np.float64)
+                    mhkl_v = np.column_stack((hm_v, km_v, lm_v)).astype(np.float64)
+                    inv_d2_m = np.maximum(
+                        np.sum((mhkl_v @ frac_mat_m) ** 2, axis=1), 1e-6
                     )
-                    inv_d2_m = 1.0 / np.maximum(d_m**2, 1e-6)
+                    d_m = 1.0 / np.sqrt(inv_d2_m)
                     edges = np.linspace(
                         float(inv_d2_m.min()), float(inv_d2_m.max()), 11
                     )
@@ -2362,22 +2498,38 @@ class NovaGalaxyPipelineRunner:
                                     theo_set.add(
                                         (int(hasu[0]), int(hasu[1]), int(hasu[2]))
                                     )
-                    d_theo = (
-                        np.array(
-                            [
-                                mtz_m.cell.calculate_d([hh, kk, ll])
-                                for hh, kk, ll in theo_set
-                            ],
-                            dtype=np.float64,
+                    inv_d2_t = (
+                        np.maximum(
+                            np.sum(
+                                (
+                                    np.array(list(theo_set), dtype=np.float64)
+                                    @ frac_mat_m
+                                )
+                                ** 2,
+                                axis=1,
+                            ),
+                            1e-6,
                         )
                         if theo_set
                         else np.array([], dtype=np.float64)
                     )
-                    inv_d2_t = (
-                        1.0 / np.maximum(d_theo**2, 1e-6)
-                        if len(d_theo)
-                        else np.array([], dtype=np.float64)
-                    )
+
+                    inv_d2_p = np.array([], dtype=np.float64)
+                    if os.path.isfile(pred_mtz_path):
+                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                            pmtz_b = gemmi.read_mtz_file(pred_mtz_path)
+                            pcols_b = {
+                                c.label: np.array(c, dtype=np.float64)
+                                for c in pmtz_b.columns
+                            }
+                            if all(k in pcols_b for k in ("H", "K", "L")):
+                                phkl_b = np.column_stack(
+                                    (pcols_b["H"], pcols_b["K"], pcols_b["L"])
+                                )
+                                inv_d2_p = np.maximum(
+                                    np.sum((phkl_b @ frac_mat_m) ** 2, axis=1),
+                                    1e-6,
+                                )
 
                     xv_v0 = np.array([], dtype=np.float64)
                     xv_v1 = np.array([], dtype=np.float64)
@@ -2392,19 +2544,16 @@ class NovaGalaxyPipelineRunner:
                         xl = xcols["L"].astype(int)
                         xhalf = xcols.get("half", np.zeros_like(xh)).astype(int)
                         xI = xcols.get("I", xcols.get("F", np.zeros_like(xcols["H"])))
-                        xd = np.array(
-                            [
-                                xv.cell.calculate_d([int(hh), int(kk), int(ll)])
-                                for hh, kk, ll in zip(xh, xk, xl)
-                            ],
-                            dtype=np.float64,
+                        xhkl_all = np.column_stack((xh, xk, xl)).astype(np.float64)
+                        x_inv_d2 = np.maximum(
+                            np.sum((xhkl_all @ frac_mat_m) ** 2, axis=1), 1e-6
                         )
                         m0 = xhalf == 0
                         m1 = xhalf == 1
                         map0 = {
-                            (int(hh), int(kk), int(ll)): (float(val), float(dd))
-                            for hh, kk, ll, val, dd in zip(
-                                xh[m0], xk[m0], xl[m0], xI[m0], xd[m0]
+                            (int(hh), int(kk), int(ll)): (float(val), float(id2))
+                            for hh, kk, ll, val, id2 in zip(
+                                xh[m0], xk[m0], xl[m0], xI[m0], x_inv_d2[m0]
                             )
                             if np.isfinite(val)
                         }
@@ -2421,25 +2570,40 @@ class NovaGalaxyPipelineRunner:
                             xv_v1 = np.array(
                                 [map1[k] for k in common], dtype=np.float64
                             )
-                            d_c = np.array(
+                            inv_d2_x = np.array(
                                 [map0[k][1] for k in common], dtype=np.float64
                             )
-                            inv_d2_x = 1.0 / np.maximum(d_c**2, 1e-6)
 
                     bins = []
                     for b in range(10):
                         hi_edge = edges[b + 1]
                         lo_edge = edges[b]
-                        bm_m = (inv_d2_m >= lo_edge) & (
-                            inv_d2_m <= hi_edge if b == 9 else inv_d2_m < hi_edge
+                        lo_cmp = lo_edge - 1e-12 if b == 0 else lo_edge
+                        hi_cmp = hi_edge + 1e-12 if b == 9 else hi_edge
+                        bm_m = (inv_d2_m >= lo_cmp) & (
+                            inv_d2_m <= hi_cmp if b == 9 else inv_d2_m < hi_cmp
                         )
                         bm_t = (
-                            (inv_d2_t >= lo_edge)
-                            & (inv_d2_t <= hi_edge if b == 9 else inv_d2_t < hi_edge)
+                            (inv_d2_t >= lo_cmp)
+                            & (inv_d2_t <= hi_cmp if b == 9 else inv_d2_t < hi_cmp)
                             if len(inv_d2_t)
                             else np.array([], dtype=bool)
                         )
+                        bm_p = (
+                            (inv_d2_p >= lo_cmp)
+                            & (inv_d2_p <= hi_cmp if b == 9 else inv_d2_p < hi_cmp)
+                            if len(inv_d2_p)
+                            else np.array([], dtype=bool)
+                        )
+                        n_obs_b: int | None = (
+                            int(np.sum(bm_p)) if len(inv_d2_p) else None
+                        )
                         n_m_b = int(np.sum(bm_m))
+                        mult_b: float | None = (
+                            round(float(n_obs_b) / max(1, n_m_b), 2)
+                            if (n_obs_b is not None and n_m_b > 0)
+                            else None
+                        )
                         n_t_b = max(n_m_b, int(np.sum(bm_t))) if len(bm_t) else n_m_b
                         comp_b = (
                             round(float(100.0 * n_m_b / max(1, n_t_b)), 2)
@@ -2453,8 +2617,8 @@ class NovaGalaxyPipelineRunner:
                         )
                         cc_b: float | None = None
                         if len(inv_d2_x):
-                            bm_x = (inv_d2_x >= lo_edge) & (
-                                inv_d2_x <= hi_edge if b == 9 else inv_d2_x < hi_edge
+                            bm_x = (inv_d2_x >= lo_cmp) & (
+                                inv_d2_x <= hi_cmp if b == 9 else inv_d2_x < hi_cmp
                             )
                             if int(np.sum(bm_x)) >= 2:
                                 s0 = xv_v0[bm_x]
@@ -2465,19 +2629,42 @@ class NovaGalaxyPipelineRunner:
                                         cc_b = round(r_val, 4)
                         d_hi = float(1.0 / np.sqrt(max(hi_edge, 1e-6)))
                         d_lo = float(1.0 / np.sqrt(max(lo_edge, 1e-6)))
-                        bins.append(
-                            {
-                                "bin": b,
-                                "d_max": round(d_lo, 2),
-                                "d_min": round(d_hi, 2),
-                                "n_refl": n_m_b,
-                                "n_theo": n_t_b,
-                                "completeness_pct": comp_b,
-                                "mean_isigi": isigi_b,
-                                "cc_half": cc_b,
-                            }
-                        )
+                        bin_entry: dict[str, Any] = {
+                            "bin": b,
+                            "d_max": round(d_lo, 2),
+                            "d_min": round(d_hi, 2),
+                            "n_refl": n_m_b,
+                            "n_theo": n_t_b,
+                            "completeness_pct": comp_b,
+                            "mean_isigi": isigi_b,
+                            "cc_half": cc_b,
+                        }
+                        if n_obs_b is not None:
+                            bin_entry["n_obs"] = n_obs_b
+                        if mult_b is not None:
+                            bin_entry["multiplicity"] = mult_b
+                        bins.append(bin_entry)
+                    metrics_doc.setdefault(
+                        "space_group", str(sg_m.xhm() or sg_m.short_name() or "P 1")
+                    )
+                    metrics_doc.setdefault(
+                        "cell",
+                        [
+                            round(float(mtz_m.cell.a), 4),
+                            round(float(mtz_m.cell.b), 4),
+                            round(float(mtz_m.cell.c), 4),
+                            round(float(mtz_m.cell.alpha), 3),
+                            round(float(mtz_m.cell.beta), 3),
+                            round(float(mtz_m.cell.gamma), 3),
+                        ],
+                    )
                     metrics_doc.setdefault("n_merged_asu", len(hm_v))
+                    if len(inv_d2_p) > 0:
+                        metrics_doc.setdefault("n_observations", len(inv_d2_p))
+                        metrics_doc.setdefault(
+                            "mean_multiplicity",
+                            round(float(len(inv_d2_p)) / max(1, len(hm_v)), 2),
+                        )
                     metrics_doc.setdefault(
                         "mean_isigi", round(float(np.mean(isigi_v)), 2)
                     )
@@ -2504,6 +2691,26 @@ class NovaGalaxyPipelineRunner:
                     metrics_raw = json.dumps(metrics_doc, indent=2)
                     with open(metrics_path, "w", encoding="utf-8") as fh_out:
                         fh_out.write(metrics_raw)
+
+        if metrics_doc:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                from subhkl.viz.rainbow_zones import (
+                    render_merge_table_csv,
+                    render_merge_table_html,
+                )
+
+                with open(
+                    os.path.join(work_dir, "merge_table.csv"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh_csv:
+                    fh_csv.write(render_merge_table_csv(metrics_doc))
+                with open(
+                    os.path.join(work_dir, "merge_table.html"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh_html:
+                    fh_html.write(render_merge_table_html(metrics_doc))
 
         with h5py.File(integrated_h5_path, "r+") as hf:
             cgrp = hf.require_group("careless")
@@ -2619,7 +2826,7 @@ class NovaGalaxyPipelineRunner:
             comp_str = (
                 f"{comp_val:.1f}%" if isinstance(comp_val, (int, float)) else "N/A"
             )
-            job_record["stdout"] += (
+            job_record["stdout"] = job_record.get("stdout", "") + (
                 f"\n[careless] Merged {metrics_doc.get('n_merged_asu', 0)} ASU reflections "
                 f"from {metrics_doc.get('n_observations', 0)} observations | "
                 f"CC1/2={cc_str} | <I/sigma>={metrics_doc.get('mean_isigi', 0.0):.2f} | "
@@ -6148,6 +6355,8 @@ class NovaGalaxyPipelineRunner:
                                         ("predictions.mtz", "binary"),
                                         ("xval.mtz", "binary"),
                                         ("careless_metrics.json", "json"),
+                                        ("merge_table.csv", "csv"),
+                                        ("merge_table.html", "html"),
                                     ):
                                         fp = os.path.join(_wdir, fn)
                                         if os.path.isfile(fp):
@@ -6671,6 +6880,8 @@ class NovaGalaxyPipelineRunner:
                                             "predictions.mtz",
                                             "xval.mtz",
                                             "careless_metrics.json",
+                                            "merge_table.csv",
+                                            "merge_table.html",
                                         ):
                                             if cand in oname or oname == cand.replace(
                                                 ".", "_"

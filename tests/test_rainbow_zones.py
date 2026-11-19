@@ -6265,6 +6265,7 @@ const state = {{ histMetric: "cc_half", hoveredHistBin: null }};
 globalThis.window = {{ devicePixelRatio: 1, innerWidth: 1280 }};
 
 const drawnTexts = [];
+const fillRects = [];
 const strokeRects = [];
 const listeners = {{}};
 const histCanvas = {{
@@ -6274,18 +6275,21 @@ const histCanvas = {{
   parentElement: {{ clientWidth: 256 }},
   getBoundingClientRect: () => ({{ left: 960, top: 620, width: 256, height: 50 }}),
   addEventListener(type, fn) {{ listeners[type] = fn; }},
-  getContext: () => ({{
-    fillStyle: "",
-    strokeStyle: "",
-    lineWidth: 1,
-    font: "",
-    globalAlpha: 1,
-    scale() {{}},
-    clearRect() {{ drawnTexts.length = 0; strokeRects.length = 0; }},
-    fillRect() {{}},
-    strokeRect(...a) {{ strokeRects.push(a); }},
-    fillText(txt) {{ drawnTexts.push(txt); }},
-  }}),
+  getContext: () => {{
+    const ctx = {{
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 1,
+      font: "",
+      globalAlpha: 1,
+      scale() {{}},
+      clearRect() {{ drawnTexts.length = 0; fillRects.length = 0; strokeRects.length = 0; }},
+      fillRect(...a) {{ fillRects.push({{ fillStyle: ctx.fillStyle, args: a }}); }},
+      strokeRect(...a) {{ strokeRects.push(a); }},
+      fillText(txt) {{ drawnTexts.push(txt); }},
+    }};
+    return ctx;
+  }},
 }};
 const histBinTooltip = {{
   innerHTML: "",
@@ -6299,12 +6303,21 @@ const histBinTooltip = {{
 
 drawHistogram([]);
 const idleTexts = [...drawnTexts];
+const idleBarColors = fillRects.map(r => r.fillStyle);
 const idleDisplay = histBinTooltip.style.display;
+const boundaryColors = {{
+  c080: formatHistBinSummary({{ cc_half: 0.80 }}, 0, 10, "cc_half").statColor,
+  c050: formatHistBinSummary({{ cc_half: 0.50 }}, 0, 10, "cc_half").statColor,
+  c030: formatHistBinSummary({{ cc_half: 0.30 }}, 0, 10, "cc_half").statColor,
+  c0299: formatHistBinSummary({{ cc_half: 0.299 }}, 0, 10, "cc_half").statColor,
+  cNeg: formatHistBinSummary({{ cc_half: -0.05 }}, 0, 10, "cc_half").statColor,
+}};
 
 // Hover over Bin 6/10 (index 5: 2.94 - 2.75 A, CC1/2 = 0.302)
 // barW = (256 - 16) / 10 = 24px -> bin 5 center at 960 + 8 + 5.5 * 24 = 1100
 listeners.mousemove({{ clientX: 1100 }});
 const bin5CcHtml = histBinTooltip.innerHTML;
+const bin5CcBorder = histBinTooltip.style.borderColor;
 const bin5CcDisplay = histBinTooltip.style.display;
 const bin5CcCanvasTexts = [...drawnTexts];
 const bin5Strokes = strokeRects.length;
@@ -6321,6 +6334,7 @@ const bin5IsigHtml = histBinTooltip.innerHTML;
 listeners.click();
 listeners.mousemove({{ clientX: 960 + 8 + 9.5 * 24 }});
 const bin9CcHtml = histBinTooltip.innerHTML;
+const bin9CcBorder = histBinTooltip.style.borderColor;
 
 // Mouseleave restores summary and hides tooltip
 listeners.mouseleave();
@@ -6329,8 +6343,11 @@ const afterLeaveTexts = [...drawnTexts];
 
 console.log(JSON.stringify({{
   idleTexts,
+  idleBarColors,
+  boundaryColors,
   idleDisplay,
   bin5CcHtml,
+  bin5CcBorder,
   bin5CcDisplay,
   bin5CcCanvasTexts,
   bin5Strokes,
@@ -6338,6 +6355,7 @@ console.log(JSON.stringify({{
   bin5CompCanvasTexts,
   bin5IsigHtml,
   bin9CcHtml,
+  bin9CcBorder,
   afterLeaveDisplay,
   afterLeaveTexts,
 }}));
@@ -6351,8 +6369,29 @@ console.log(JSON.stringify({{
 
     assert out["idleDisplay"] == "none"
     assert any("CC½ vs d (0.812)" in t for t in out["idleTexts"])
+    # Yellow range extends down to 0.30; everything below 0.30 is red (#f43f5e)
+    assert out["idleBarColors"] == [
+        "#34d399",  # 0.9565 >= 0.80
+        "#34d399",  # 0.9411 >= 0.80
+        "#34d399",  # 0.8677 >= 0.80
+        "#fbbf24",  # 0.7030 >= 0.30
+        "#fbbf24",  # 0.5163 >= 0.30
+        "#fbbf24",  # 0.3023 >= 0.30
+        "#f43f5e",  # 0.1831 < 0.30
+        "#f43f5e",  # 0.1721 < 0.30
+        "#f43f5e",  # 0.1256 < 0.30
+        "#f43f5e",  # -0.0421 < 0.30
+    ]
+    assert out["boundaryColors"] == {
+        "c080": "#34d399",
+        "c050": "#fbbf24",
+        "c030": "#fbbf24",
+        "c0299": "#f43f5e",
+        "cNeg": "#f43f5e",
+    }
 
     assert out["bin5CcDisplay"] == "block"
+    assert out["bin5CcBorder"] == "#fbbf24"
     assert out["bin5Strokes"] == 1
     assert "Bin 6/10:" in out["bin5CcHtml"]
     assert "2.94–2.75 Å" in out["bin5CcHtml"]
@@ -6367,6 +6406,324 @@ console.log(JSON.stringify({{
     assert "Bin 10/10:" in out["bin9CcHtml"]
     assert "2.39–2.30 Å" in out["bin9CcHtml"]
     assert "CC½ = -0.042" in out["bin9CcHtml"]
+    assert out["bin9CcBorder"] == "#f43f5e"
 
     assert out["afterLeaveDisplay"] == "none"
     assert any("CC½ vs d (0.812)" in t for t in out["afterLeaveTexts"])
+
+
+def test_merge_resolution_table_csv_html_popup_and_lazy_download(tmp_path):
+    """Publication-ready CC1/2 / Completeness / <I/sigma> resolution table CSV + HTML artifacts, popup, and lazy downloads."""
+    import csv
+    import io
+    import json
+    import math
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        build_merge_resolution_table_data,
+        build_rainbow_zone_payload,
+        render_merge_table_csv,
+        render_merge_table_html,
+        render_rainbow_html,
+    )
+
+    metrics = {
+        "space_group": "I 1 2 1",
+        "cell": [55.16, 81.19, 88.70, 90.0, 96.3, 90.0],
+        "wavelength_range": [2.0, 4.0],
+        "d_max": 11.99,
+        "d_min": 2.30,
+        "n_observations": 3840,
+        "n_merged_asu": 1280,
+        "n_theoretical_asu": 1873,
+        "mean_multiplicity": 3.0,
+        "completeness_pct": 68.34,
+        "mean_isigi": 5.19,
+        "cc_half": 0.8124,
+        "resolution_bins": [
+            {
+                "bin": 0,
+                "d_max": 11.99,
+                "d_min": 4.90,
+                "n_obs": 720,
+                "n_refl": 180,
+                "n_theo": 195,
+                "completeness_pct": 92.3,
+                "mean_isigi": 14.25,
+                "cc_half": 0.9565,
+            },
+            {
+                "bin": 1,
+                "d_max": 4.90,
+                "d_min": 2.75,
+                "n_obs": 384,
+                "n_refl": 128,
+                "n_theo": 188,
+                "completeness_pct": 68.1,
+                "mean_isigi": 2.84,
+                "cc_half": 0.3023,
+            },
+            {
+                "bin": 2,
+                "d_max": 2.75,
+                "d_min": 2.30,
+                "n_obs": 124,
+                "n_refl": 62,
+                "n_theo": 182,
+                "completeness_pct": 34.1,
+                "mean_isigi": 0.85,
+                "cc_half": 0.1003,
+            },
+        ],
+    }
+
+    tdata = build_merge_resolution_table_data(metrics)
+    assert tdata["d_cc30"] == 2.75
+    assert [r["cc_tier"] for r in tdata["rows"]] == ["green", "yellow", "red"]
+    assert [r["rank_badge"] for r in tdata["rows"]] == ["1ST", "2ND", "3RD"]
+    assert abs(tdata["rows"][0]["multiplicity"] - 4.0) < 1e-6
+    expected_cc_star_0 = math.sqrt(2.0 * 0.9565 / (1.0 + 0.9565))
+    assert abs(tdata["rows"][0]["cc_star"] - expected_cc_star_0) < 1e-6
+
+    csv_text = render_merge_table_csv(metrics)
+    parsed_csv = list(csv.DictReader(io.StringIO(csv_text)))
+    assert len(parsed_csv) == 4  # 3 shells + Overall
+    assert parsed_csv[0]["shell"] == "1"
+    assert parsed_csv[0]["resolution_range_A"] == "11.99 - 4.90"
+    assert parsed_csv[0]["n_obs"] == "720"
+    assert parsed_csv[0]["multiplicity"] == "4.00"
+    assert parsed_csv[1]["cc_half"] == "0.3023"
+    assert parsed_csv[-1]["shell"] == "Overall"
+    assert parsed_csv[-1]["n_obs"] == "3840"
+    assert parsed_csv[-1]["cc_half"] == "0.8124"
+
+    html_art = render_merge_table_html(metrics)
+    assert "BUBBLE BOBBLE HIGH SCORE // RESOLUTION SHELL HALL OF FAME" in html_art
+    assert "Copy for Word / Excel" in html_art
+    assert "I 1 2 1" in html_art
+    assert "0.302" in html_art
+    assert "background:#ffffff;color:#000000" in html_art
+
+    # Verify Rainbow Zones main UI embeds modal, buttons, and matching client-side summarization
+    payload = build_rainbow_zone_payload(instrument="MANDI", include_panel_images=False)
+    payload["artifact_kind"] = "merged_careless"
+    payload["space_group"] = "I 1 2 1"
+    payload["cell"] = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    payload["wavelength_range"] = [2.0, 4.0]
+    payload["merge_metrics"] = metrics
+    ui_html = render_rainbow_html(payload)
+    assert 'id="modal-merge-table"' in ui_html
+    assert 'id="btn-hist-open-table"' in ui_html
+    assert 'id="btn-hist-dl-csv"' in ui_html
+    assert 'id="btn-hist-dl-html"' in ui_html
+    assert 'id="btn-merge-tbl-copy"' in ui_html
+
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", ui_html)
+        inline_js = script_blocks[-1]
+        fn_names = [
+            "getMergeResolutionBins",
+            "escapeHtmlText",
+            "ordinalShellRank",
+            "computeCcStarClient",
+            "ccHalfTierClient",
+            "buildClientMergeTableData",
+            "buildMergeTableClipboardPayloads",
+            "renderMergeTableModalContent",
+        ]
+        extracted = []
+        for fn_name in fn_names:
+            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            assert m is not None, f"Missing JS function {fn_name}"
+            start = m.start()
+            depth = 0
+            in_body = False
+            end = start
+            for idx in range(start, len(inline_js)):
+                ch = inline_js[idx]
+                if ch == "{":
+                    depth += 1
+                    in_body = True
+                elif ch == "}":
+                    depth -= 1
+                    if in_body and depth == 0:
+                        end = idx + 1
+                        break
+            extracted.append(inline_js[start:end])
+
+        modal_harness = f"""
+const DATA = {json.dumps({"space_group": payload["space_group"], "cell": payload["cell"], "wavelength_range": payload["wavelength_range"], "merge_metrics": metrics})};
+let mergeTableStyleMode = "arcade";
+const els = {{}};
+["merge-tbl-card", "merge-tbl-rainbow", "merge-tbl-kicker", "merge-tbl-modal-title", "merge-tbl-meta", "btn-merge-tbl-style", "merge-tbl-body-wrap"].forEach(id => {{
+  els[id] = {{ style: {{}}, innerHTML: "", textContent: "" }};
+}});
+globalThis.document = {{ getElementById: (id) => els[id] || null }};
+
+{chr(10).join(extracted)}
+
+const clientData = buildClientMergeTableData();
+const clip = buildMergeTableClipboardPayloads(clientData);
+renderMergeTableModalContent();
+const arcadeHtml = els["merge-tbl-body-wrap"].innerHTML;
+const arcadeBg = els["merge-tbl-card"].style.background;
+mergeTableStyleMode = "publication";
+renderMergeTableModalContent();
+const pubHtml = els["merge-tbl-body-wrap"].innerHTML;
+const pubBg = els["merge-tbl-card"].style.background;
+
+console.log(JSON.stringify({{
+  dCc30: clientData.dCc30,
+  tiers: clientData.rows.map(r => r.ccTier),
+  cleanHtml: clip.cleanHtml,
+  tsv: clip.tsv,
+  csv: clip.csv,
+  arcadeHtml,
+  arcadeBg,
+  pubHtml,
+  pubBg,
+}}));
+"""
+        mh_path = tmp_path / "merge_modal_harness.js"
+        mh_path.write_text(modal_harness, encoding="utf-8")
+        js_res = subprocess.run(
+            ["node", str(mh_path)], check=True, capture_output=True, text=True
+        )
+        jout = json.loads(js_res.stdout.strip())
+        assert jout["dCc30"] == 2.75
+        assert jout["tiers"] == ["green", "yellow", "red"]
+        assert "background:#ffffff;color:#000000" in jout["cleanHtml"]
+        assert "11.99 – 4.90" in jout["cleanHtml"]
+        assert "Overall\t11.99 – 2.30\t3840\t1280" in jout["tsv"]
+        assert jout["csv"] == csv_text
+        assert jout["arcadeBg"] == "#10162b"
+        assert "1ST" in jout["arcadeHtml"] and "#fbbf24" in jout["arcadeHtml"]
+        assert jout["pubBg"] == "#ffffff"
+        assert "1ST" not in jout["pubHtml"]
+
+    # Verify _stamp_careless_merge_into_h5 vectorized n_obs/multiplicity + lazy resolve_artifact_for_download
+    work_dir = tmp_path / "merge_work"
+    work_dir.mkdir()
+    uc = gemmi.UnitCell(55.16, 81.19, 88.70, 90.0, 96.3, 90.0)
+    sg = gemmi.find_spacegroup_by_name("I 1 2 1")
+
+    merged_mtz = gemmi.Mtz(with_base=True)
+    merged_mtz.spacegroup = sg
+    merged_mtz.set_cell_for_all(uc)
+    merged_mtz.add_dataset("merged")
+    merged_mtz.add_column("I", "J")
+    merged_mtz.add_column("SigI", "Q")
+    asu_hkls = [
+        (2, 0, 0),
+        (0, 2, 0),
+        (2, 2, 0),
+        (4, 2, 2),
+        (6, 4, 2),
+        (8, 6, 4),
+        (10, 8, 6),
+        (12, 10, 8),
+        (14, 12, 10),
+        (16, 14, 12),
+        (18, 14, 12),
+        (20, 14, 12),
+    ]
+    merged_rows = [
+        [h, k, l, 200.0 - 10.0 * i, 12.0] for i, (h, k, l) in enumerate(asu_hkls)
+    ]
+    merged_mtz.set_data(np.asarray(merged_rows, dtype=np.float32))
+    merged_mtz.write_to_file(str(work_dir / "merged.mtz"))
+
+    # Repeat each reflection 3 times in predictions.mtz -> multiplicity == 3.0 in every populated shell
+    pred_mtz = gemmi.Mtz(with_base=True)
+    pred_mtz.spacegroup = sg
+    pred_mtz.set_cell_for_all(uc)
+    pred_mtz.add_dataset("pred")
+    pred_mtz.add_column("I", "J")
+    pred_mtz.add_column("SigI", "Q")
+    pred_mtz.add_column("pred", "J")
+    pred_mtz.add_column("scale", "R")
+    pred_rows = [
+        [h, k, l, 180.0, 12.0, 175.0, 1.0]
+        for (h, k, l) in asu_hkls
+        for _rep in range(3)
+    ]
+    pred_mtz.set_data(np.asarray(pred_rows, dtype=np.float32))
+    pred_mtz.write_to_file(str(work_dir / "predictions.mtz"))
+
+    xval_mtz = gemmi.Mtz(with_base=True)
+    xval_mtz.spacegroup = sg
+    xval_mtz.set_cell_for_all(uc)
+    xval_mtz.add_dataset("xval")
+    xval_mtz.add_column("half", "I")
+    xval_mtz.add_column("I", "J")
+    xval_rows = []
+    for i, (h, k, l) in enumerate(asu_hkls):
+        xval_rows.append([h, k, l, 0, 200.0 - 10.0 * i])
+        xval_rows.append([h, k, l, 1, 198.0 - 9.8 * i])
+    xval_mtz.set_data(np.asarray(xval_rows, dtype=np.float32))
+    xval_mtz.write_to_file(str(work_dir / "xval.mtz"))
+
+    integ_h5 = work_dir / "integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        pk = hf.create_group("peaks")
+        pk.create_dataset("h", data=np.array([2, 0], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0, 2], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("intensity", data=np.array([200.0, 190.0], dtype=float))
+        pk.create_dataset("sigma", data=np.array([12.0, 12.0], dtype=float))
+
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner._local_work_dir = str(work_dir)
+    runner._stamp_careless_merge_into_h5(str(integ_h5), str(work_dir), {})
+
+    assert (work_dir / "merge_table.csv").is_file()
+    assert (work_dir / "merge_table.html").is_file()
+    stamped_metrics = json.loads(
+        (work_dir / "careless_metrics.json").read_text(encoding="utf-8")
+    )
+    populated_bins = [b for b in stamped_metrics["resolution_bins"] if b["n_refl"] > 0]
+    assert len(populated_bins) >= 3
+    for b in populated_bins:
+        assert b["n_obs"] == 3 * b["n_refl"]
+        assert abs(b["multiplicity"] - 3.0) < 1e-6
+
+    # Delete merge_table.csv and merge_table.html to simulate a pre-existing workspace,
+    # then verify list_step_artifacts and resolve_artifact_for_download lazily recreate them!
+    (work_dir / "merge_table.csv").unlink()
+    (work_dir / "merge_table.html").unlink()
+    runner._local_artifacts = {
+        "careless_metrics.json": str(work_dir / "careless_metrics.json"),
+        "integrated.h5": str(integ_h5),
+    }
+    arts = runner.list_step_artifacts(current_h5=str(integ_h5))
+    merge_art_by_name = {a["name"]: a for a in arts["merge"]}
+    assert "merge_table.csv" in merge_art_by_name
+    assert "merge_table.html" in merge_art_by_name
+    assert merge_art_by_name["merge_table.csv"]["stage_id"] == "merge"
+    assert merge_art_by_name["merge_table.html"]["stage_id"] == "merge"
+
+    # Unlink once more and test direct on-demand resolve_artifact_for_download
+    (work_dir / "merge_table.csv").unlink()
+    (work_dir / "merge_table.html").unlink()
+    runner._local_artifacts.pop("merge_table.csv", None)
+    runner._local_artifacts.pop("merge_table.html", None)
+    dl_csv = runner.resolve_artifact_for_download(
+        name="merge_table.csv", current_h5=str(integ_h5)
+    )
+    dl_html = runner.resolve_artifact_for_download(
+        name="merge_table.html", current_h5=str(integ_h5)
+    )
+    assert dl_csv is not None and dl_csv[1] == "merge_table.csv"
+    assert dl_html is not None and dl_html[1] == "merge_table.html"
+    assert "resolution_range_A" in Path(dl_csv[0]).read_text(encoding="utf-8")
+    assert "Copy for Word / Excel" in Path(dl_html[0]).read_text(encoding="utf-8")
