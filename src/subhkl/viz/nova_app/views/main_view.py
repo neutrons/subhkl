@@ -652,12 +652,13 @@ class MainApp:
             return web.json_response(res)
 
         async def handle_upload_h5(request: web.Request) -> web.Response:
-            import tempfile
             import time
+
+            from subhkl.viz.rainbow_zones import resolve_subhkl_tmpfs_dir
 
             try:
                 upload_dir = os.path.join(
-                    tempfile.gettempdir(), f"subhkl_upload_{int(time.time())}"
+                    resolve_subhkl_tmpfs_dir(), f"subhkl_upload_{int(time.time())}"
                 )
                 os.makedirs(upload_dir, exist_ok=True)
                 reader = await request.multipart()
@@ -701,7 +702,6 @@ class MainApp:
 
         async def handle_resolve_local_files(request: web.Request) -> web.Response:
             import glob as _glob
-            import tempfile
 
             try:
                 body = await request.json()
@@ -717,7 +717,12 @@ class MainApp:
                     d = os.path.dirname(os.path.abspath(p))
                     if d not in search_dirs:
                         search_dirs.append(d)
-            for extra_root in ("/home/xvg/subhkl-examples", tempfile.gettempdir()):
+            from subhkl.viz.rainbow_zones import get_subhkl_tmp_search_dirs
+
+            for extra_root in (
+                "/home/xvg/subhkl-examples",
+                *get_subhkl_tmp_search_dirs(),
+            ):
                 if os.path.isdir(extra_root) and extra_root not in search_dirs:
                     search_dirs.append(extra_root)
 
