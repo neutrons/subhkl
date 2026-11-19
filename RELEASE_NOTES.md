@@ -4,6 +4,52 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0]
+
+### Added
+
+- Time-of-flight gated integration for pulsed-source instruments (MANDI,
+  TOPAZ). `reduce` / `reduce-batch` now keep the event times of flight next to
+  the detector images (`events/tof`, sorted by pixel so the image itself is the
+  index; `--no-events` opts out), and `merge-images` carries them into the
+  merged stack. When the images file has events, `integrator` integrates every
+  predicted reflection from the events inside a time window around its
+  predicted time of flight, with the background measured in time sidebands on
+  the same pixels, using the unchanged 2D Poisson amplitude solve on a small
+  per-reflection tile. The window is measured from the data by stacking the
+  events near all predictions in `t / t_predicted - 1` (`--tof-gate auto`), or
+  set with `--tof-gate lo,hi`; `--tof-gate off` restores the whole-band 2D
+  integration. Harmonics become separate rows with their own intensities, and
+  the output records the gate (`tof_gate`), each row's gate centre
+  (`peaks/tof`) and in-gate background (`peaks/tof_background`).
+- Resolution-shell hover on the post-merge sparkline in Rainbow Zones
+  (`#canvas-hist`): the hovered bar is highlighted and its exact
+  `d_max`–`d_min` Å edges, reflection count and active statistic
+  ($\mathrm{CC}_{1/2}$, completeness or $\langle I/\sigma \rangle$) are shown
+  in the sparkline footer and a floating tooltip (`#hist-bin-tooltip`). Signed
+  $\mathrm{CC}_{1/2}$ values are preserved, including negative outer-shell
+  correlations, and the readout updates when clicking to cycle metrics.
+
+### Changed
+
+- Time-of-flight gating runs on the accelerator one image at a time: each
+  image's events are histogrammed into a (row, column, log-time) cube whose
+  cumulative sums give every gated tile and sideband count by lookup, so gate
+  and sideband edges are time-bin edges at most a thirtieth of the gate wide.
+  A 22-run MANDI job at `d_min` 1.5 (1.12M predictions) integrates in about
+  3 minutes on one GPU.
+- Vectorized the integrator's per-reflection peak geometry (projection
+  matrices, flight distances, streak directions) and shape-fit patch
+  extraction per image, with progress output; only the patches the shape fit
+  keeps are held in memory.
+
+### Fixed
+
+- Removed a quadratic loop from the app's post-Careless stamping of
+  per-observation residuals and scales into `integrated.h5`: each row
+  allocated five full-length arrays as lookup defaults (about 3 ms per row,
+  most of an hour for the ~950k observations of a `d_min` 1.5 merge).
+
 ## [1.5.9]
 
 ### Added
@@ -95,21 +141,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [1.5.8]
 
 ### Added
-
-- Time-of-flight gated integration for pulsed-source instruments (MANDI,
-  TOPAZ). `reduce` / `reduce-batch` now keep the event times of flight next to
-  the detector images (`events/tof`, sorted by pixel so the image itself is the
-  index; `--no-events` opts out), and `merge-images` carries them into the
-  merged stack. When the images file has events, `integrator` integrates every
-  predicted reflection from the events inside a time window around its
-  predicted time of flight, with the background measured in time sidebands on
-  the same pixels, using the unchanged 2D Poisson amplitude solve on a small
-  per-reflection tile. The window is measured from the data by stacking the
-  events near all predictions in `t / t_predicted - 1` (`--tof-gate auto`), or
-  set with `--tof-gate lo,hi`; `--tof-gate off` restores the whole-band 2D
-  integration. Harmonics become separate rows with their own intensities, and
-  the output records the gate (`tof_gate`), each row's gate centre
-  (`peaks/tof`) and in-gate background (`peaks/tof_background`).
 
 - Per-step live `mm:ss.ms` stopwatch overlay in the lower-right corner of the
   `Terminal // Stdio` pane (`#stdio-stopwatch`) across `subhkl-nova-app` and
