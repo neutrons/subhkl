@@ -604,3 +604,71 @@ def test_per_run_trans_polish_recovers_shift_and_writes_trans_m(tmp_path):
         R_kin, origins_kin, _, _, _ = frame_kinematics(f, 2, f["file_offsets"][()])
         assert R_kin.shape == (2, 3, 3)
         assert origins_kin.shape == (2, 3)
+
+
+def test_default_band_binning_preserves_at_least_32x32_bins_regardless_of_frame_count(
+    tmp_path, monkeypatch
+):
+    from typer.testing import CliRunner
+
+    from subhkl.io.parser import app
+    from subhkl.scan_refine import default_band_binning
+
+    for n_rows, n_cols, expected in [
+        (512, 512, 8),
+        (256, 256, 8),
+        (128, 128, 4),
+        (64, 64, 2),
+        (32, 32, 1),
+        (5000, 1800, 8),
+    ]:
+        b = default_band_binning(n_rows, n_cols)
+        assert b == expected
+        assert n_rows % b == 0 and n_cols % b == 0
+        assert n_rows // b >= 32 and n_cols // b >= 32
+
+    # >240 256x256 MANDI panels must still resolve binning=8 (32x32 bins/panel), never 16
+    frames = tmp_path / "mandi_many_frames.h5"
+    bootstrap = tmp_path / "seed.h5"
+    n_frames = 250
+    with h5py.File(frames, "w") as f:
+        f.attrs["instrument"] = "MANDI"
+        f.create_dataset("images", shape=(n_frames, 256, 256), dtype=np.float32)
+        f["bank_ids"] = np.full(n_frames, 20, dtype=np.int32)
+        f["file_offsets"] = np.array([0], dtype=np.int64)
+        f["goniometer/axes"] = np.array([[0.0, 1.0, 0.0, 1.0]])
+        f["goniometer/angles"] = np.zeros((n_frames, 1), dtype=np.float64)
+        for k, v in zip(
+            ("a", "b", "c", "alpha", "beta", "gamma"),
+            [69.12, 98.43, 90.92, 90.07, 105.93, 90.01],
+        ):
+            f[f"sample/{k}"] = v
+        f["sample/space_group"] = "P 21"
+        f["instrument/wavelength"] = [2.0, 4.0]
+    with h5py.File(bootstrap, "w") as f:
+        f["sample/U"] = np.eye(3)
+
+    seen_binning = []
+
+    def fake_refine_scan(args):
+        seen_binning.append(int(args.binning))
+        return {"status": "converged"}
+
+    monkeypatch.setattr("subhkl.search.scan_band.refine_scan", fake_refine_scan)
+    out = tmp_path / "out.h5"
+    res = CliRunner().invoke(
+        app,
+        [
+            "solve",
+            str(frames),
+            str(out),
+            "--instrument",
+            "MANDI",
+            "--bootstrap",
+            str(bootstrap),
+            "--refinement",
+            "band",
+        ],
+    )
+    assert res.exit_code == 0, res.output
+    assert seen_binning == [8]

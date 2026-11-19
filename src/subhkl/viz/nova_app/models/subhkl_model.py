@@ -193,6 +193,9 @@ class SubhklGalaxyModel:
         )
         self.payload: dict[str, Any] | None = None
         self.frame_index: int | None = None
+        self.render_binning: int = 4
+        self.mtz_overlay_path: str | None = None
+        self.mtz_overlay_info: dict[str, Any] | None = None
         self.last_job_result: dict[str, Any] = {}
         self.refresh_payload()
 
@@ -248,6 +251,7 @@ class SubhklGalaxyModel:
             max_zone_index=self.data.max_zone_index,
             images_h5=img_path,
             frame_index=self.frame_index,
+            render_binning=int(self.render_binning),
         )
         if self.payload.get("images_h5") and os.path.isfile(
             str(self.payload["images_h5"])
@@ -289,6 +293,22 @@ class SubhklGalaxyModel:
                 self.data.d_min = round(0.5 * float(wl_range[0]), 2)
             elif self.payload.get("d_min") and float(self.payload["d_min"]) > 0.3:
                 self.data.d_min = round(float(self.payload["d_min"]), 2)
+        if (
+            self.mtz_overlay_path
+            and os.path.isfile(self.mtz_overlay_path)
+            and (
+                self.payload.get("u_matrix") is not None
+                or self.payload.get("ub_matrix") is not None
+            )
+        ):
+            from subhkl.viz.rainbow_zones import apply_mtz_to_payload
+
+            self.payload = apply_mtz_to_payload(
+                self.payload,
+                self.mtz_overlay_path,
+                self.mtz_overlay_info,
+                select_mtz_color=False,
+            )
         return self.payload
 
     def render_html(self) -> str:

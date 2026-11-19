@@ -1140,9 +1140,58 @@ class PixelEMClassifier:
             a_pans.append(max(q75_int, 0.25 * self.A_det))
 
         if active_bks:
+            # Cross-bank same-2theta peer-ring ambient reference catches whole-panel
+            # or majority-panel backscattering cryostat/goniometer shadows without
+            # false-flagging naturally fainter high-angle detector rings.
+            ring_ref_by_bk: dict[int, float] = {}
+            med_map_by_bk: dict[int, np.ndarray] = {}
+            if len(self.obs_banks) >= 6 and len(self.sel_runs) >= 3:
+                bank_tt_deg: dict[int, float] = {}
+                bank_med_q70: dict[int, float] = {}
+                for bk in active_bks:
+                    bi = self._bank_to_bi.get(bk)
+                    det = (
+                        self._det_nom[bi]
+                        if (bi is not None and 0 <= bi < len(self._det_nom))
+                        else None
+                    )
+                    if det is not None:
+                        tt_arr, _ = det.pixel_to_angles(
+                            np.array([0.5 * self.n_rows]),
+                            np.array([0.5 * self.n_cols]),
+                        )
+                        bank_tt_deg[bk] = float(tt_arr[0])
+                    run_norm_stack = [
+                        self.y_rb[(r, bk)] / max(self.exp_scale[r], 1e-6)
+                        for r in self.sel_runs
+                        if (r, bk) in self.y_rb
+                    ]
+                    if len(run_norm_stack) >= 3:
+                        ymed = np.median(np.stack(run_norm_stack, axis=0), axis=0)
+                        med_map_by_bk[bk] = ymed
+                        ymed_int = (
+                            ymed[1:-1, 1:-1]
+                            if (self.hb >= 4 and self.wb >= 4)
+                            else ymed
+                        )
+                        bank_med_q70[bk] = float(np.percentile(ymed_int, 70.0))
+                for bk, tt0 in bank_tt_deg.items():
+                    peers = [
+                        bank_med_q70[b2]
+                        for b2, tt2 in bank_tt_deg.items()
+                        if abs(tt2 - tt0) <= 22.0
+                        and bank_med_q70.get(b2, 0.0) >= min_ambient_bin
+                    ]
+                    if len(peers) >= 3:
+                        ring_ref_by_bk[bk] = float(np.percentile(peers, 70.0))
+
             pct75_stack = _run_batch_pct75_2d(np.stack(yh_ints, axis=0), win)
             for idx_b, bk in enumerate(active_bks):
-                env = np.maximum(pct75_stack[idx_b], 0.80 * a_pans[idx_b])
+                ring_ref = ring_ref_by_bk.get(bk, 0.0)
+                pan_floor = 0.80 * a_pans[idx_b]
+                if ring_ref >= min_ambient_bin:
+                    pan_floor = max(pan_floor, 0.85 * ring_ref)
+                env = np.maximum(pct75_stack[idx_b], pan_floor)
                 floor_0 = 0.50 * env
                 def_dev = np.zeros((self.hb, self.wb), dtype=np.float64)
                 for r in self.sel_runs:
@@ -1162,6 +1211,13 @@ class PixelEMClassifier:
                     0.0,
                 )
                 lo_dark = np.clip(0.25 * eff_def - 9.0, -25.0, 25.0)
+                if ring_ref >= min_ambient_bin and bk in med_map_by_bk:
+                    ymed_sm = uniform_filter(med_map_by_bk[bk], size=3, mode="nearest")
+                    rel_trans = ymed_sm / max(ring_ref, 1.0)
+                    shadow_lo = np.clip((0.64 - rel_trans) * 48.0, -9.0, 20.0)
+                    lo_dark = np.where(
+                        rel_trans < 0.64, np.maximum(lo_dark, shadow_lo), lo_dark
+                    )
                 self.log_odds_dark_prior[bk] = lo_dark
                 self.gamma_dark_prior[bk] = 1.0 / (1.0 + np.exp(-lo_dark))
 

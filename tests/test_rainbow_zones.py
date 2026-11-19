@@ -355,6 +355,54 @@ def test_finderless_solve_h5_forward_projection_and_stages(tmp_path):
     assert payload["pipeline_stages"][0]["name"] == "1. REDUCE & MERGE"
     assert "imaginex_subhkl_solve" in payload["pipeline_stages"][1]["tool_ids"]
 
+    # Multi-run solve.h5 must forward-project across ALL runs so All-Runs Wulff Net
+    # displays every run's predicted reflections immediately after Solve (before Integration)
+    solve_mr_h5 = tmp_path / "synthetic_solve_multirun.h5"
+    ang1, ang2 = np.deg2rad(35.0), np.deg2rad(70.0)
+    R0 = np.eye(3)
+    R1 = np.array(
+        [
+            [np.cos(ang1), 0.0, np.sin(ang1)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(ang1), 0.0, np.cos(ang1)],
+        ]
+    )
+    R2 = np.array(
+        [
+            [np.cos(ang2), 0.0, np.sin(ang2)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(ang2), 0.0, np.cos(ang2)],
+        ]
+    )
+    with h5py.File(solve_mr_h5, "w") as f:
+        f.attrs["instrument"] = "CG4D"
+        f["sample/U"] = U
+        f["sample/B"] = B
+        f["sample/a"] = 18.0
+        f["sample/b"] = 24.0
+        f["sample/c"] = 32.0
+        f["sample/alpha"] = 90.0
+        f["sample/beta"] = 90.0
+        f["sample/gamma"] = 90.0
+        f["sample/space_group"] = "P 21 21 21"
+        f["instrument/wavelength"] = np.array([2.0, 4.5])
+        f["files"] = np.array(
+            [b"CG4D_1720.nxs.h5", b"CG4D_1740.nxs.h5", b"CG4D_1760.nxs.h5"]
+        )
+        f["goniometer/R"] = np.stack([R0, R1, R2], axis=0)
+        f["bank_ids"] = np.array([101, 101, 101], dtype=np.int32)
+        f["file_offsets"] = np.array([0, 1, 2], dtype=np.int64)
+        sr_mr = f.create_group("scan_refinement")
+        sr_mr.attrs["d_min"] = 2.5
+        sr_mr.attrs["status"] = "converged"
+
+    payload_mr = build_rainbow_zone_payload(replay_h5=solve_mr_h5)
+    assert len(payload_mr["frames"]) == 3
+    assert len(payload_mr["sample_peaks"]) > len(payload_mr["peaks"])
+    assert {p["run_index"] for p in payload_mr["sample_peaks"]} == {0, 1, 2}
+    assert len(payload_mr["predicted_sample_peaks"]) == len(payload_mr["sample_peaks"])
+    assert all(p.get("intensity") is None for p in payload_mr["sample_peaks"])
+
 
 def test_careless_merge_stamping_and_wulff_symmetry_orbits(tmp_path):
     """Careless merge HDF5 stamping populates ASU orbits, residuals, scales, and multi-run sample_peaks."""
@@ -2066,8 +2114,13 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert 'id="inp-lmax"' in html_doc
     assert 'id="slider-dmin"' in html_doc
     assert 'id="sel-spot-color"' in html_doc
-    assert '<option value="isigi">Color: I/σ (Unscaled)</option>' in html_doc
+    assert '<option value="isigi">Color: I/σ (Log)</option>' in html_doc
+    assert '<option value="mtz_isigi">Color: .mtz I/σ (Log)</option>' in html_doc
+    assert 'id="slider-color-emphasis"' in html_doc
+    assert 'id="slider-parallax"' not in html_doc
+    assert 'id="btn-peaks-mtz"' not in html_doc
     assert "hasIntegratedIsigi" in html_doc
+    assert "hasMtzIsigi" in html_doc
     assert "syncDminControls" in html_doc
     assert "Runner host:" in html_doc
     from subhkl.io.parser import detect_runner_hostname
@@ -2668,3 +2721,3353 @@ def test_stdio_step_stopwatch_ui_and_pipeline_timings(tmp_path):
     assert snap_both["integrate"]["state"] == "deleted"
     assert snap_both["integrate"]["finished_at"] is not None
     assert snap_both["integrate"]["elapsed_ms"] >= 3200
+
+
+def test_wulff_azimuth_peak_source_toggle_and_local_mtz_overlay(tmp_path) -> None:
+    """Verify exact θ vs 2θ Wulff alignment + Friedel mates, predictor.h5 discovery, MTZ projection preserving B, and diverging I/σ."""
+    import asyncio
+    import json
+    import os
+    import re
+    import subprocess
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import gemmi
+    import h5py
+    import numpy as np
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.nova_app.views.main_view import MainApp
+    from subhkl.viz.nova_rainbow_view import RainbowZonesViewModel
+    from subhkl.viz.rainbow_zones import (
+        _discover_predictor_h5,
+        _raycast_hkl_on_detectors,
+        _u_from_ub,
+        apply_mtz_to_payload,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # 1. Build multi-frame CG4D integrated.h5 with both integrated peaks (with u/v variances -> ellipses)
+    #    and unintegrated predicted reflections (sigma == 0), plus a non-trivial orientation matrix U.
+    U_true = Rotation.from_euler("zyx", [27.0, -14.0, 38.0], degrees=True).as_matrix()
+    cell_orig = [54.0, 54.0, 54.0, 90.0, 90.0, 90.0]
+    B_orig_raw, _ = cartesian_matrix_metric_tensor(
+        *cell_orig[:3], *np.deg2rad(cell_orig[3:])
+    )
+    B_orig = np.asarray(B_orig_raw, dtype=float)
+    R0 = np.eye(3)
+    R1 = Rotation.from_euler("y", 25.0, degrees=True).as_matrix()
+    R_runs = np.stack([R0, R1], axis=0)
+
+    first_bk_key = (
+        "57" if "57" in beamlines["CG4D"] else max(beamlines["CG4D"], key=int)
+    )
+    first_bk = int(first_bk_key)
+    det1 = Detector(dict(beamlines["CG4D"][first_bk_key]))
+    xyz_a = np.asarray(det1.pixel_to_lab(110.0, 120.0), dtype=float)
+    xyz_b = np.asarray(det1.pixel_to_lab(140.0, 150.0), dtype=float)
+    xyz_c = np.asarray(det1.pixel_to_lab(125.0, 135.0), dtype=float)
+    unique_tag = f"CG4D_testpred_{os.getpid()}"
+    integ_h5 = tmp_path / "integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        smp = hf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 21 21 21")
+        smp.create_dataset("cell", data=np.array(cell_orig, dtype=float))
+        smp.create_dataset("U", data=U_true)
+        smp.create_dataset("B", data=B_orig)
+        gon = hf.create_group("goniometer")
+        gon.create_dataset("R", data=R_runs)
+        gon.create_dataset("angles", data=np.array([[0.0], [25.0]], dtype=float))
+        gon.create_dataset("axes", data=np.array([[0.0, 1.0, 0.0]], dtype=float))
+        hf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        hf.create_dataset(
+            "bank_ids", data=np.array([first_bk, first_bk], dtype=np.int32)
+        )
+        hf.create_dataset(
+            "files",
+            data=np.array(
+                [f"{unique_tag}0.nxs.h5", f"{unique_tag}1.nxs.h5"], dtype="S64"
+            ),
+        )
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.8, 4.5], dtype=float)
+        )
+        pk = hf.create_group("peaks")
+        pk.create_dataset("xyz", data=np.vstack([xyz_a, xyz_b, xyz_c]))
+        pk.create_dataset(
+            "bank", data=np.array([first_bk, first_bk, first_bk], dtype=np.int32)
+        )
+        pk.create_dataset("pixel_r", data=np.array([110.0, 140.0, 125.0], dtype=float))
+        pk.create_dataset("pixel_c", data=np.array([120.0, 150.0, 135.0], dtype=float))
+        pk.create_dataset("intensity", data=np.array([180.0, 0.0, 140.0], dtype=float))
+        pk.create_dataset("sigma", data=np.array([12.0, 0.0, 10.0], dtype=float))
+        pk.create_dataset("var_u", data=np.array([1.2e-4, 1.0e-4, 1.2e-4], dtype=float))
+        pk.create_dataset("var_v", data=np.array([0.6e-4, 1.0e-4, 0.6e-4], dtype=float))
+        pk.create_dataset("cov_uv", data=np.array([0.1e-4, 0.0, 0.1e-4], dtype=float))
+        pk.create_dataset("h", data=np.array([2, -2, 1], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([1, -1, 2], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([-3, 3, -3], dtype=np.int32))
+        pk.create_dataset("lambda", data=np.array([3.2, 3.6, 3.4], dtype=float))
+        pk.create_dataset("run_index", data=np.array([0, 0, 1], dtype=np.int32))
+
+    payload0 = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        frame_index=0,
+        include_panel_images=False,
+    )
+    assert payload0["artifact_kind"] == "integrator"
+    assert payload0["default_peak_source"] == "integrated"
+    assert len(payload0["integrated_peaks"]) == 1
+    assert isinstance(payload0["integrated_peaks"][0].get("ellipse"), list)
+    assert len(payload0["integrated_peaks"][0]["ellipse"]) >= 6
+    assert len(payload0["integrated_sample_peaks"]) == 2
+    assert np.allclose(np.asarray(payload0["u_matrix"]), U_true, atol=1e-5)
+
+    # Verify Friedel parity flag on non-centrosymmetric P 21 21 21: (2,1,-3) and (-2,-1,3) share ASU orbit with opposite asu_friedel!
+    from subhkl.viz.rainbow_zones import _make_asu_mapper
+
+    mapper_p212121 = _make_asu_mapper("P 21 21 21", cell_orig)
+    asu_pos = mapper_p212121(2, 1, -3)
+    asu_neg = mapper_p212121(-2, -1, 3)
+    asu_rot = mapper_p212121(
+        -2, 1, 3
+    )  # 2-fold rotation around y: (h,k,l) -> (-h, k, -l)
+    assert asu_pos[:3] == asu_neg[:3] == asu_rot[:3]
+    assert asu_pos[3] != asu_neg[3]  # Friedel pair has opposite parity
+    assert asu_pos[3] == asu_rot[3]  # Proper 2-fold rotation has identical parity
+    assert asu_pos[4] != 0 and asu_pos[4] == -asu_neg[4]
+    assert asu_pos[4] == asu_rot[4]
+
+    # Verify Fdd2 (mm2): point-group mates (including d-glide mirrors) share nonzero Bijvoet parity,
+    # +l vs -l have opposite Bijvoet parity, and centric hk0 reflections have bijvoet_parity == 0.
+    mapper_fdd2 = _make_asu_mapper("Fdd2", [18.39, 56.55, 6.54, 90.0, 90.0, 90.0])
+    f_p1 = mapper_fdd2(11, -15, 1)
+    f_p2 = mapper_fdd2(-11, -15, 1)  # d-glide mirror mate (same +l)
+    f_p3 = mapper_fdd2(11, 15, 1)  # d-glide mirror mate (same +l)
+    f_bij = mapper_fdd2(-11, -15, -1)  # true Bijvoet mate (-l)
+    f_c1 = mapper_fdd2(2, 2, 0)  # centric hk0
+    f_c2 = mapper_fdd2(-2, -2, 0)  # centric hk0 2-fold mate
+    f_c3 = mapper_fdd2(2, -2, 0)  # centric hk0 mirror mate
+    assert f_p1[:3] == f_p2[:3] == f_p3[:3] == f_bij[:3] == (11, 15, 1)
+    assert f_p1[4] != 0 and f_p1[4] == f_p2[4] == f_p3[4]
+    assert f_bij[4] == -f_p1[4]
+    assert f_c1[4] == f_c2[4] == f_c3[4] == 0
+    assert f_c1[3] is False and f_c2[3] is False
+
+    # Centrosymmetric space groups have bijvoet_parity == 0 for every reflection
+    mapper_ia3d = _make_asu_mapper("Ia-3d", [11.93, 11.93, 11.93, 90.0, 90.0, 90.0])
+    assert mapper_ia3d(1, 2, 3)[4] == 0
+    assert mapper_ia3d(-1, -2, -3)[4] == 0
+
+    # Verify pre-filtered integrated.h5 (containing ONLY integrated peaks):
+    # (a) without predictor.h5 -> theoretical fallback generates full Laue predictions (> integrated count)
+    # (b) with companion predictor.h5 in /tmp/subhkl_work_<tag>/predictor.h5 -> discovers exact peak-predictor output!
+    sib_dir = tmp_path / "gx_downloaded_integ"
+    sib_dir.mkdir()
+    integ_only_h5 = sib_dir / "subhkl_gx_test_integrated.h5"
+    with h5py.File(integ_h5, "r") as src_f, h5py.File(integ_only_h5, "w") as dst_f:
+        for k_top in src_f:
+            if k_top != "peaks":
+                src_f.copy(k_top, dst_f)
+        for ak, av in src_f.attrs.items():
+            dst_f.attrs[ak] = av
+        pk_dst = dst_f.create_group("peaks")
+        keep_idx = np.array([0, 2], dtype=int)
+        for pk_k in src_f["peaks"]:
+            pk_dst.create_dataset(pk_k, data=np.asarray(src_f["peaks"][pk_k])[keep_idx])
+
+    payload_fb = build_rainbow_zone_payload(
+        replay_h5=integ_only_h5,
+        frame_index=0,
+        d_min=4.0,
+        include_panel_images=False,
+    )
+    assert len(payload_fb["integrated_peaks"]) == 1
+    assert len(payload_fb["predicted_peaks"]) > len(payload_fb["integrated_peaks"])
+
+    work_tag = f"{unique_tag}0_{unique_tag}1"
+    work_dir_tmp = Path(f"/tmp/subhkl_work_{work_tag}")
+    work_dir_tmp.mkdir(parents=True, exist_ok=True)
+    pred_work_h5 = work_dir_tmp / "predictor.h5"
+    try:
+        with h5py.File(pred_work_h5, "w") as pf:
+            smp_p = pf.create_group("sample")
+            smp_p.create_dataset("U", data=U_true)
+            smp_p.create_dataset("B", data=B_orig)
+            pf.create_dataset(
+                "bank_ids", data=np.array([first_bk, first_bk], dtype=np.int32)
+            )
+            pf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+            b_grp = pf.create_group("banks")
+            g0 = b_grp.create_group("0")
+            g0.create_dataset("i", data=np.array([110.0, 140.0, 160.0], dtype=float))
+            g0.create_dataset("j", data=np.array([120.0, 150.0, 170.0], dtype=float))
+            g0.create_dataset("h", data=np.array([2, 3, 4], dtype=np.int32))
+            g0.create_dataset("k", data=np.array([1, -1, 0], dtype=np.int32))
+            g0.create_dataset("l", data=np.array([-3, -2, -1], dtype=np.int32))
+            g0.create_dataset("wavelength", data=np.array([3.2, 3.6, 3.9], dtype=float))
+            g1 = b_grp.create_group("1")
+            g1.create_dataset("i", data=np.array([125.0, 155.0], dtype=float))
+            g1.create_dataset("j", data=np.array([135.0, 165.0], dtype=float))
+            g1.create_dataset("h", data=np.array([1, 2], dtype=np.int32))
+            g1.create_dataset("k", data=np.array([2, 2], dtype=np.int32))
+            g1.create_dataset("l", data=np.array([-3, -2], dtype=np.int32))
+            g1.create_dataset("wavelength", data=np.array([3.4, 3.8], dtype=float))
+
+        assert _discover_predictor_h5(integ_only_h5) == str(pred_work_h5.resolve())
+        payload_sib = build_rainbow_zone_payload(
+            replay_h5=integ_only_h5,
+            frame_index=0,
+            include_panel_images=False,
+        )
+        assert len(payload_sib["integrated_peaks"]) == 1
+        assert len(payload_sib["predicted_peaks"]) == 3
+        assert len(payload_sib["integrated_sample_peaks"]) == 2
+        assert len(payload_sib["predicted_sample_peaks"]) == 5
+    finally:
+        if pred_work_h5.exists():
+            pred_work_h5.unlink()
+        if work_dir_tmp.exists():
+            work_dir_tmp.rmdir()
+
+    # 2. Create a custom local .mtz with a DIFFERENT unit cell & space group (e.g. P 32 2 1)
+    #    and verify that loading the .mtz projects its HKLs into the CURRENT active (U_true, B_orig) geometry
+    #    WITHOUT modifying B, UB, cell, or space_group!
+    mtz_cell = [59.8, 59.8, 96.4, 90.0, 90.0, 120.0]
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.find_spacegroup_by_name("P 32 2 1")
+    mtz.set_cell_for_all(gemmi.UnitCell(*mtz_cell))
+    mtz.add_dataset("custom")
+    mtz.add_column("I", "J")
+    mtz.add_column("SIGI", "Q")
+
+    # Seed ASU reflections whose rays under the ACTIVE geometry (U_true @ B_orig) hit active panel first_bk
+    # (plus reflections on an inactive panel to verify .mtz only projects onto active predicted-peak panels!)
+    cg4d_dets = {int(bk): Detector(dict(cfg)) for bk, cfg in beamlines["CG4D"].items()}
+    grid = np.mgrid[-12:13, -12:13, -12:13].reshape(3, -1).T
+    grid = grid[np.any(grid != 0, axis=1)]
+    cast_seed_active_r0 = _raycast_hkl_on_detectors(
+        grid, U_true, B_orig, R0, cg4d_dets, (2.8, 4.5), active_bids={first_bk}
+    )
+    cast_seed_active_r1 = _raycast_hkl_on_detectors(
+        grid, U_true, B_orig, R1, cg4d_dets, (2.8, 4.5), active_bids={first_bk}
+    )
+    other_bids = {int(b) for b in cg4d_dets if int(b) != first_bk}
+    cast_seed_inactive = _raycast_hkl_on_detectors(
+        grid, U_true, B_orig, R0, cg4d_dets, (2.8, 4.5), active_bids=other_bids
+    )
+    assert len(cast_seed_active_r0["hkl"]) >= 2
+    assert len(cast_seed_inactive["hkl"]) >= 2
+    asu_mtz = gemmi.ReciprocalAsu(mtz.spacegroup)
+    ops_mtz = mtz.spacegroup.operations()
+    seen_asu: set[tuple[int, int, int]] = set()
+    mtz_rows: list[list[float]] = []
+    seed_hkls_combined = (
+        [[2, 1, -3], [1, 2, -3]]
+        + cast_seed_active_r0["hkl"][:12].tolist()
+        + cast_seed_active_r1["hkl"][:8].tolist()
+        + cast_seed_inactive["hkl"][:6].tolist()
+    )
+    for idx_h, h_hit in enumerate(seed_hkls_combined):
+        ha, _ = asu_mtz.to_asu([int(h_hit[0]), int(h_hit[1]), int(h_hit[2])], ops_mtz)
+        key_a = (int(ha[0]), int(ha[1]), int(ha[2]))
+        if key_a not in seen_asu:
+            seen_asu.add(key_a)
+            mtz_rows.append(
+                [
+                    float(key_a[0]),
+                    float(key_a[1]),
+                    float(key_a[2]),
+                    250.0 + 10.0 * idx_h,
+                    8.0,
+                ]
+            )
+    mtz.set_data(np.asarray(mtz_rows, dtype=np.float32))
+    mtz_path = tmp_path / "custom_reflections.mtz"
+    mtz.write_to_file(str(mtz_path))
+
+    payload_mtz = apply_mtz_to_payload(
+        payload0, mtz_path, {"name": "custom_reflections.mtz"}
+    )
+    # U, B, UB, cell, and space_group MUST remain strictly unchanged!
+    assert np.allclose(np.asarray(payload_mtz["u_matrix"]), U_true, atol=1e-5)
+    assert np.allclose(np.asarray(payload_mtz["b_matrix"]), B_orig, atol=1e-5)
+    assert np.allclose(np.asarray(payload_mtz["ub_matrix"]), U_true @ B_orig, atol=1e-5)
+    assert np.allclose(
+        _u_from_ub(np.asarray(payload_mtz["ub_matrix"])), U_true, atol=1e-4
+    )
+    assert payload_mtz["space_group"] == "P 21 21 21"
+    assert np.allclose(payload_mtz["cell"], cell_orig, atol=1e-3)
+    assert payload_mtz["default_peak_source"] == "integrated"
+    assert payload_mtz["default_color_mode"] == "mtz_isigi"
+    assert "mtz_peaks" not in payload_mtz
+    assert "mtz_sample_peaks" not in payload_mtz
+    # Only panels with predicted peaks (first_bk) may carry .mtz projections!
+    assert {int(p["bank"]) for p in payload_mtz["predicted_peaks"]} == {first_bk}
+    assert {int(p["bank"]) for p in payload_mtz["predicted_sample_peaks"]} == {first_bk}
+    pred_with_mtz = [
+        p for p in payload_mtz["predicted_peaks"] if p.get("mtz_isigi") is not None
+    ]
+    samp_with_mtz = [
+        p
+        for p in payload_mtz["predicted_sample_peaks"]
+        if p.get("mtz_isigi") is not None
+    ]
+    integ_with_mtz = [
+        p for p in payload_mtz["integrated_peaks"] if p.get("mtz_isigi") is not None
+    ]
+    assert len(pred_with_mtz) >= len(cast_seed_active_r0["hkl"][:12])
+    assert len(samp_with_mtz) >= len(pred_with_mtz)
+    assert len(payload_mtz["integrated_peaks"]) == 1
+    assert len(integ_with_mtz) == 1
+    assert len(payload_mtz["predicted_peaks"]) >= len(payload0["predicted_peaks"])
+
+    # Loading an MTZ when no UB geometry is present must raise a clear ValueError
+    empty_payload = {"artifact_kind": "empty", "panels": payload0["panels"]}
+    try:
+        apply_mtz_to_payload(empty_payload, mtz_path)
+        raise AssertionError("Expected ValueError when loading MTZ without UB geometry")
+    except ValueError as exc:
+        assert "UB geometry" in str(exc)
+
+    # 3. Verify HTTP ViewModel & Trame MainApp local .mtz loading + persistence across frame switches (preserving cell/SG!)
+    vm = RainbowZonesViewModel(replay_h5=integ_h5, include_panel_images=False)
+    vm.payload = apply_mtz_to_payload(
+        vm.payload, mtz_path, {"name": "custom_reflections.mtz"}
+    )
+    vm.mtz_overlay_path = str(mtz_path)
+    vm.mtz_overlay_info = {"name": "custom_reflections.mtz"}
+    reloaded_f1 = vm.reload(frame_index=1)
+    assert reloaded_f1["frame_index"] == 1
+    assert reloaded_f1["mtz_overlay_name"] == "custom_reflections.mtz"
+    assert reloaded_f1["space_group"] == "P 21 21 21"
+    assert np.allclose(np.asarray(reloaded_f1["b_matrix"]), B_orig, atol=1e-5)
+    assert any(p.get("mtz_isigi") is not None for p in reloaded_f1["predicted_peaks"])
+    assert len(reloaded_f1["integrated_peaks"]) == 1
+
+    app_inst = object.__new__(MainApp)
+    app_inst.pipeline_runner = MagicMock()
+    app_inst.pipeline_runner.current_frame_index = 0
+    sub_m = SubhklGalaxyModel()
+    app_inst.view_model = SimpleNamespace(model=SimpleNamespace(subhkl=sub_m))
+    aio_app = web.Application()
+    app_inst._bind_routes(SimpleNamespace(app=aio_app))
+
+    req_no_u = make_mocked_request(
+        "GET",
+        f"/api/payload?file_path={mtz_path}",
+        app=aio_app,
+    )
+    resp_no_u = asyncio.run(aio_app._handle(req_no_u))
+    assert resp_no_u.status == 400
+
+    req_h5 = make_mocked_request(
+        "GET",
+        f"/api/payload?file_path={integ_h5}",
+        app=aio_app,
+    )
+    resp_h5 = asyncio.run(aio_app._handle(req_h5))
+    assert resp_h5.status == 200
+    assert sub_m.data.peaks_file == str(integ_h5)
+    orig_model_a = float(sub_m.data.a)
+    orig_model_sg = str(sub_m.data.space_group)
+
+    req_mtz = make_mocked_request(
+        "GET",
+        f"/api/payload?file_path={mtz_path}",
+        app=aio_app,
+    )
+    resp_mtz = asyncio.run(aio_app._handle(req_mtz))
+    assert resp_mtz.status == 200
+    doc_mtz = json.loads(resp_mtz.body.decode("utf-8"))
+    assert doc_mtz["default_peak_source"] == "integrated"
+    assert doc_mtz["default_color_mode"] == "mtz_isigi"
+    assert doc_mtz["space_group"] == "P 21 21 21"
+    assert np.allclose(np.asarray(doc_mtz["b_matrix"]), B_orig, atol=1e-5)
+    assert sub_m.data.peaks_file == str(integ_h5)
+    assert sub_m.data.space_group == orig_model_sg
+    assert abs(float(sub_m.data.a) - orig_model_a) < 1e-6
+
+    req_f1 = make_mocked_request("GET", "/api/payload?frame=1", app=aio_app)
+    resp_f1 = asyncio.run(aio_app._handle(req_f1))
+    assert resp_f1.status == 200
+    doc_f1 = json.loads(resp_f1.body.decode("utf-8"))
+    assert doc_f1["frame_index"] == 1
+    assert doc_f1["mtz_overlay_name"] == "custom_reflections.mtz"
+    assert any(p.get("mtz_isigi") is not None for p in doc_f1["predicted_peaks"])
+
+    # 3b. Verify post-indexing (finder-less solve.h5 before integration) has NO bogus I/σ values,
+    #     AND loading .mtz after indexing persists automatically across subsequent Integration!
+    solve_only_h5 = tmp_path / "solve_indexed_only.h5"
+    with h5py.File(solve_only_h5, "w") as sf, h5py.File(integ_h5, "r") as src_f:
+        sf.attrs["instrument"] = "CG4D"
+        src_f.copy("sample", sf)
+        src_f.copy("goniometer", sf)
+        src_f.copy("instrument", sf)
+        src_f.copy("file_offsets", sf)
+        src_f.copy("bank_ids", sf)
+
+    req_solve = make_mocked_request(
+        "GET",
+        f"/api/payload?file_path={solve_only_h5}",
+        app=aio_app,
+    )
+    resp_solve = asyncio.run(aio_app._handle(req_solve))
+    assert resp_solve.status == 200
+    doc_solve = json.loads(resp_solve.body.decode("utf-8"))
+    assert len(doc_solve["predicted_peaks"]) > 0
+    assert all(p.get("sigma") is None for p in doc_solve["predicted_peaks"])
+    assert all(p.get("intensity") is None for p in doc_solve["predicted_peaks"])
+
+    # Load .mtz right after indexing, then transition to integrated.h5 (Integration completed)
+    resp_mtz_after_idx = asyncio.run(
+        aio_app._handle(
+            make_mocked_request(
+                "GET", f"/api/payload?file_path={mtz_path}", app=aio_app
+            )
+        )
+    )
+    assert resp_mtz_after_idx.status == 200
+    resp_integ_after_mtz = asyncio.run(
+        aio_app._handle(
+            make_mocked_request(
+                "GET",
+                f"/api/payload?file_path={integ_h5}&preserve_params=1",
+                app=aio_app,
+            )
+        )
+    )
+    assert resp_integ_after_mtz.status == 200
+    doc_integ_after_mtz = json.loads(resp_integ_after_mtz.body.decode("utf-8"))
+    assert doc_integ_after_mtz["artifact_kind"] == "integrator"
+    assert doc_integ_after_mtz["mtz_overlay_name"] == "custom_reflections.mtz"
+    assert doc_integ_after_mtz["mtz_fresh_overlay"] is False
+    assert any(
+        p.get("mtz_isigi") is not None for p in doc_integ_after_mtz["integrated_peaks"]
+    )
+    assert any(
+        p.get("mtz_isigi") is not None for p in doc_integ_after_mtz["predicted_peaks"]
+    )
+
+    # 4. Execute rendered HTML/JS helpers in Node.js to verify:
+    #    - Exact θ (k_f - k_i) vs 2θ (k_f) Wulff azimuth alignment & right-handed SO(3) camera.
+    #    - Transparent (alpha=0) -> Solar Gold crossover (alpha=0.5) -> Opaque Electric-Lime (alpha=1)
+    #      isigiToColor scale + Photoshop-checkerboard live gradient crossover slider (#slider-color-emphasis).
+    #    - Two-source peak toggle ('predicted' | 'integrated') with .mtz I/σ data-column coloring.
+    html_doc = render_rainbow_html(payload_mtz)
+    assert 'accept=".h5,.hdf5,.nxs,.mtz"' in html_doc
+    assert 'id="peak-source-group"' in html_doc
+    assert 'id="btn-peaks-mtz"' not in html_doc
+    assert 'id="btn-wulff-friedel"' in html_doc
+    assert "Color: I/σ (Log)" in html_doc
+    assert "Color: .mtz I/σ (Log)" in html_doc
+    assert 'id="slider-color-emphasis"' in html_doc
+    assert "repeating-conic-gradient" in html_doc  # Photoshop transparency checkerboard
+    assert "--cs-gradient" in html_doc
+    assert "_lastDetRenderSig" in html_doc
+    assert "#e879f9" in html_doc  # distinct violet Friedel symmetry link color
+    assert 'const isIntegShape = state.peakSource === "integrated";' in html_doc
+    assert "if (ellPtsRaw && ellPtsRaw.length >= 6)" in html_doc
+
+    def _extract_js_fn(name: str) -> str:
+        pat = rf"function {name}\b[\s\S]*?\n  \}}"
+        m = re.search(pat, html_doc)
+        assert m is not None, f"Missing JS function {name}"
+        return m.group(0)
+
+    fn_names = [
+        "extractPeakBucketsFromPayload",
+        "getColorCrossover",
+        "applyCrossoverCurve",
+        "wavelengthToColor",
+        "getPeakDataAvailability",
+        "peakUnscaledIsigi",
+        "peakMtzIsigi",
+        "hasIntegratedIsigi",
+        "hasMtzIsigi",
+        "scaleToColor",
+        "isigiToColor",
+        "hexToRgba",
+        "peakEmphasisAlphaForCategorical",
+        "peakStrokeColor",
+        "buildColorscaleGradientSpec",
+        "isParallaxTriggerActive",
+        "detToScreen",
+        "getCenteredDetectorAzimuthDeg",
+        "setDetectorCenterAzimuthDeg",
+        "detectorChiToWulffAzimuthDeg",
+        "wulffAzimuthToDetectorChiDeg",
+        "syncWulffYawFromDetector",
+        "resolveAvailablePeakSource",
+        "syncPeakSourceButtons",
+        "applyPeakSource",
+        "getActiveGoniometerR",
+        "projectToWulff",
+        "getActiveWulffPeaks",
+    ]
+    extracted_fns = "\n".join(_extract_js_fn(fn) for fn in fn_names)
+
+    js_harness = f"""
+const DATA = {json.dumps(payload_mtz)};
+const DEFAULT_COLOR_CROSSOVER = 0.38;
+const ORBIT_PALETTE = ["#ff38b4", "#00e5ff", "#fbbf24", "#10b981"];
+let _peakDataAvailabilitySig = "";
+let _peakDataAvailability = {{
+  hasIsigi: false,
+  hasMtzIsigi: false,
+  hasResiduals: false,
+  hasScales: false,
+  isigiTop: 40.0,
+  mtzIsigiTop: 40.0,
+}};
+let _visDetPeaksSig = "";
+let _visDetPeaksCache = [];
+let _lastDetRenderSig = "";
+let isPanningDet = false;
+let isDraggingWulff = false;
+const initBuckets = extractPeakBucketsFromPayload(DATA);
+let PREDICTED_PEAKS = initBuckets.predPeaks;
+let PREDICTED_SAMPLE_PEAKS = initBuckets.predSample;
+let INTEGRATED_PEAKS = initBuckets.integPeaks;
+let INTEGRATED_SAMPLE_PEAKS = initBuckets.integSample;
+const PEAKS = [...(DATA.peaks || [])];
+const SAMPLE_PEAKS = [...(DATA.sample_peaks || PEAKS)];
+const detCanvas = {{ getBoundingClientRect: () => ({{ width: 900, height: 520 }}) }};
+const btns = {{
+  "btn-peaks-pred": {{ disabled: false, title: "", _cls: new Set(), classList: {{ toggle(c, on) {{ if (on) btns["btn-peaks-pred"]._cls.add(c); else btns["btn-peaks-pred"]._cls.delete(c); }} }} }},
+  "btn-peaks-integ": {{ disabled: false, title: "", _cls: new Set(), classList: {{ toggle(c, on) {{ if (on) btns["btn-peaks-integ"]._cls.add(c); else btns["btn-peaks-integ"]._cls.delete(c); }} }} }},
+}};
+globalThis.document = {{ getElementById: (id) => btns[id] || null }};
+const state = {{
+  projection: "cylindrical",
+  peakSource: DATA.default_peak_source || "integrated",
+  wulffScope: "all_runs",
+  showWulffFriedel: true,
+  wulffColorMode: DATA.default_color_mode || "mtz_isigi",
+  colorCrossover: 0.38,
+  lamMin: 2.8,
+  lamMax: 4.5,
+  wulffYawDeg: 0.0,
+  wulffPitchDeg: 0.0,
+  wulffZoom: 1.0,
+  parallaxX: 0.0,
+  parallaxY: 0.0,
+  parallaxStrength: 1.0,
+  detZoom: 1.0,
+  detPanX: 0.0,
+  detPanY: 0.0,
+  hoveredPeakId: null,
+  hoveredPeakObj: null,
+  selectedPeakId: null,
+  selectedPeakObj: null,
+  activeOrbitId: null,
+}};
+function getActiveBounds() {{ return {{ minX: -180.0, maxX: 180.0, minY: -0.25, maxY: 0.25 }}; }}
+function getDetectorPlotBox(w, h) {{
+  const padL = 42, padR = 12, padT = 10, padB = 22;
+  return {{ originX: padL, originY: padT, plotW: Math.max(40, w - padL - padR), plotH: Math.max(40, h - padT - padB) }};
+}}
+function mat3Vec(M, v) {{
+  return [
+    M[0][0]*v[0] + M[0][1]*v[1] + M[0][2]*v[2],
+    M[1][0]*v[0] + M[1][1]*v[1] + M[1][2]*v[2],
+    M[2][0]*v[0] + M[2][1]*v[1] + M[2][2]*v[2],
+  ];
+}}
+function hasMergedCarelessData() {{ return false; }}
+function isPeakVisible(p) {{ return state.wulffColorMode !== "mtz_isigi" || Number.isFinite(peakMtzIsigi(p)); }}
+function zoneColor() {{ return "rgba(255,100,100,1)"; }}
+function residualToColor() {{ return "rgba(255,255,255,1)"; }}
+function syncColorModeSelectors() {{}}
+function syncWulffUI() {{}}
+function renderZoneList() {{}}
+function updateHUD() {{}}
+function renderDetector() {{}}
+{extracted_fns}
+
+function gForChiElDeg(chiDeg, elDeg = 0.0) {{
+  const rad = chiDeg * Math.PI / 180.0;
+  const el = elDeg * Math.PI / 180.0;
+  const kx = Math.cos(el) * Math.sin(rad);
+  const ky = Math.sin(el);
+  const kz = Math.cos(el) * Math.cos(rad);
+  const qx = kx, qy = ky, qz = kz - 1.0;
+  const n = Math.hypot(qx, qy, qz);
+  return [qx / n, qy / n, qz / n];
+}}
+
+DATA.goniometer_R = [[1,0,0],[0,1,0],[0,0,1]];
+const box = getDetectorPlotBox(900, 520);
+const viewCenterX = box.originX + 0.5 * box.plotW;
+
+const chiChecks = [];
+for (const [chiTarget, zoomVal] of [[45.0, 1.0], [-45.0, 2.4], [135.0, 1.5], [-135.0, 1.5]]) {{
+  state.detZoom = zoomVal;
+  setDetectorCenterAzimuthDeg(chiTarget);
+  syncWulffYawFromDetector();
+  const screenX = detToScreen(chiTarget, 0.0, 900, 520, 0.0)[0];
+  const chiRec = getCenteredDetectorAzimuthDeg();
+  const chiRoundTrip = wulffAzimuthToDetectorChiDeg(state.wulffYawDeg);
+  const wCenter = projectToWulff(gForChiElDeg(chiTarget, 0.0), 100, 100, 80);
+  const wUp = projectToWulff(gForChiElDeg(chiTarget, 12.0), 100, 100, 80);
+  const wRight = projectToWulff(gForChiElDeg(chiTarget + 10.0, 0.0), 100, 100, 80);
+  const wLeft = projectToWulff(gForChiElDeg(chiTarget - 10.0, 0.0), 100, 100, 80);
+  chiChecks.push({{
+    chiTarget,
+    screenXErr: Math.abs(screenX - viewCenterX),
+    chiRecErr: Math.abs(chiRec - chiTarget),
+    chiRoundTripErr: Math.abs(chiRoundTrip - chiTarget),
+    wSx: wCenter[0],
+    wSy: wCenter[1],
+    wHemi: wCenter[2],
+    wZ: wCenter[3],
+    upSy: wUp[1],
+    rightSx: wRight[0],
+    leftSx: wLeft[0],
+  }});
+}}
+
+state.detZoom = 1.0;
+setDetectorCenterAzimuthDeg(10.0);
+syncWulffYawFromDetector();
+const gNeg10 = gForChiElDeg(-10.0, 0.0);
+const friedelNeg10AtPos10 = projectToWulff([-gNeg10[0], -gNeg10[1], -gNeg10[2]], 100, 100, 80);
+
+// Transparent (alpha=0) -> Solar Gold crossover (t=0.5, alpha=0.5) -> Fully Opaque Electric Lime (alpha=1)
+state.colorCrossover = 0.38;
+const exactCrossSnr = Math.pow(1.0 + 40.0, 0.38) - 1.0;
+const colNeg = isigiToColor(-2.0, 1.0, 40.0);
+const colZero = isigiToColor(0.0, 1.0, 40.0);
+const colWeak = isigiToColor(0.4, 1.0, 40.0);
+const colCrossover = isigiToColor(exactCrossSnr, 1.0, 40.0);
+const colGold = isigiToColor(14.0, 1.0, 40.0);
+const colLime = isigiToColor(150.0, 1.0, 40.0);
+
+// Crossover knob: moving right (0.84) makes moderate 4σ peaks nearly transparent; moving left (0.12) makes them opaque
+state.colorCrossover = 0.84;
+const colMidRightKnob = isigiToColor(4.0, 1.0, 40.0);
+state.colorCrossover = 0.12;
+const colMidLeftKnob = isigiToColor(4.0, 1.0, 40.0);
+state.colorCrossover = 0.38;
+
+const gradIsigi = buildColorscaleGradientSpec("isigi", 0.38);
+const gradWl = buildColorscaleGradientSpec("wavelength", 0.50);
+
+// Parallax trigger gating: off on plain hover AND off on mouse-button pan/drag;
+// active ONLY when holding a keyboard modifier key (Ctrl / Meta / Alt / Shift) without mouse buttons
+const parIdle = isParallaxTriggerActive({{ buttons: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }});
+const parMouseBtn = isParallaxTriggerActive({{ buttons: 1, ctrlKey: false, metaKey: false, altKey: false, shiftKey: false }});
+const parMouseBtnWithCtrl = isParallaxTriggerActive({{ buttons: 1, ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }});
+const parCtrl = isParallaxTriggerActive({{ buttons: 0, ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }});
+const parShift = isParallaxTriggerActive({{ buttons: 0, ctrlKey: false, metaKey: false, altKey: false, shiftKey: true }});
+state.parallaxX = 1.0;
+state.parallaxY = 1.0;
+const [fgParX, fgParY] = detToScreen(0.0, 0.0, 900, 520, 0.45);
+const [bgParX, bgParY] = detToScreen(0.0, 0.0, 900, 520, -0.35);
+const parRelSpanX = fgParX - bgParX;
+const parRelSpanY = fgParY - bgParY;
+state.parallaxX = 0.0;
+state.parallaxY = 0.0;
+
+// Peak source toggle ('predicted' <-> 'integrated') switches BOTH shape (circle <-> ellipse)
+// AND intensity-related highlight colorscale (Electric Cyan for Pred <-> Gold-to-Lime for Integ)
+applyPeakSource("predicted", false);
+const nPredFrame = PEAKS.length;
+const nPredWulff = getActiveWulffPeaks().length;
+const predShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse)) ? "ellipse" : "circle";
+const hasMtzCol = hasMtzIsigi();
+const hasPredCrossLinkedIsigi = hasIntegratedIsigi();
+const mtzColStrokePred = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzIsigi(p))), 1.0);
+const colPredCross = isigiToColor(exactCrossSnr, 1.0, 40.0);
+const colPredTop = isigiToColor(150.0, 1.0, 40.0);
+const scalePredTop = scaleToColor(10.0, 1.0);
+const gradIsigiPred = buildColorscaleGradientSpec("isigi", 0.38);
+
+applyPeakSource("integrated", false);
+const nIntegFrame = PEAKS.length;
+const nIntegWulff = getActiveWulffPeaks().length;
+const integShape = (state.peakSource === "integrated" && Array.isArray(PEAKS[0]?.ellipse) && PEAKS[0].ellipse.length >= 6) ? "ellipse" : "circle";
+const mtzColStrokeInteg = peakStrokeColor(PEAKS.find(p => Number.isFinite(peakMtzIsigi(p))), 1.0);
+const scaleIntegTop = scaleToColor(10.0, 1.0);
+
+console.log(JSON.stringify({{
+  chiChecks,
+  friedelNeg10AtPos10,
+  colNeg, colZero, colWeak, colCrossover, colGold, colLime,
+  colPredCross, colPredTop, scalePredTop, scaleIntegTop, gradIsigiPred,
+  colMidRightKnob, colMidLeftKnob,
+  gradIsigi, gradWl,
+  parIdle, parMouseBtn, parMouseBtnWithCtrl, parCtrl, parShift, parRelSpanX, parRelSpanY,
+  hasMtzCol, hasPredCrossLinkedIsigi,
+  mtzColStroke: mtzColStrokePred, mtzColStrokeInteg,
+  nPredFrame, nPredWulff, predShape,
+  nIntegFrame, nIntegWulff, integShape,
+  btnPredDisabled: btns["btn-peaks-pred"].disabled,
+  btnIntegDisabled: btns["btn-peaks-integ"].disabled,
+}}));
+"""
+    harness_path = tmp_path / "wulff_peaks_mtz_harness.js"
+    harness_path.write_text(js_harness, encoding="utf-8")
+    import shutil
+
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        assert len(script_blocks) >= 1
+        full_js_check = tmp_path / "full_inline_script.js"
+        full_js_check.write_text(script_blocks[-1], encoding="utf-8")
+        subprocess.run(["node", "--check", str(full_js_check)], check=True)
+
+        js_res = subprocess.run(
+            ["node", str(harness_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        js_out = json.loads(js_res.stdout.strip())
+        for chk in js_out["chiChecks"]:
+            assert chk["screenXErr"] < 1e-6
+            assert chk["chiRecErr"] < 1e-6
+            assert chk["chiRoundTripErr"] < 1e-6
+            assert abs(chk["wSx"] - 100.0) < 1e-6
+            assert abs(chk["wSy"] - 100.0) < 1e-6
+            assert chk["wHemi"] == 1 and chk["wZ"] > 0.9999
+            assert chk["upSy"] < 95.0
+            assert chk["rightSx"] > 102.0 and chk["leftSx"] < 98.0
+
+        fr_proj = js_out["friedelNeg10AtPos10"]
+        assert fr_proj[2] == 1 and fr_proj[3] > 0.98 and fr_proj[0] < 95.0
+
+        def _parse_rgba(s: str) -> tuple[int, int, int, float]:
+            m_rgba = re.match(r"rgba\(\s*(\d+),\s*(\d+),\s*(\d+),\s*([0-9.]+)\s*\)", s)
+            assert m_rgba is not None, f"Unexpected rgba string: {s}"
+            return (
+                int(m_rgba.group(1)),
+                int(m_rgba.group(2)),
+                int(m_rgba.group(3)),
+                float(m_rgba.group(4)),
+            )
+
+        _rn, _gn, _bn, an = _parse_rgba(js_out["colNeg"])
+        _rz, _gz, _bz, az = _parse_rgba(js_out["colZero"])
+        _rw, _gw, _bw, aw = _parse_rgba(js_out["colWeak"])
+        rc, gc, bc, ac = _parse_rgba(js_out["colCrossover"])
+        rg, gg, bg, ag = _parse_rgba(js_out["colGold"])
+        rl, gl, bl, al = _parse_rgba(js_out["colLime"])
+        _, _, _, a_right_knob = _parse_rgba(js_out["colMidRightKnob"])
+        _, _, _, a_left_knob = _parse_rgba(js_out["colMidLeftKnob"])
+
+        # Transparent (alpha=0) -> Solar Gold at exact knob crossover (alpha=0.5) -> Opaque Electric Lime (alpha=1)
+        assert an == 0.0 and az == 0.0
+        assert 0.0 < aw < ac < ag < al
+        assert (rc, gc, bc) == (250, 204, 21) and abs(ac - 0.5) < 0.005
+        assert rg > 185 and gg > 205 and bg < 60
+        assert (rl, gl, bl) == (163, 242, 44) and al == 1.0
+        # Moving crossover knob right isolates strong peaks; moving left reveals weaker peaks
+        assert a_right_knob < 0.12 and a_left_knob > 0.72
+        # Live gradient CSS stops + physical crossover readouts
+        assert js_out["gradIsigi"]["gradient"].startswith("linear-gradient(90deg,")
+        assert "0.000) 0.0%" in js_out["gradIsigi"]["gradient"]
+        assert "1.000) 100.0%" in js_out["gradIsigi"]["gradient"]
+        assert js_out["gradIsigi"]["label"].startswith("I/σ ~")
+        assert js_out["gradWl"]["label"].startswith("λ ~")
+
+        # Parallax gated strictly on keyboard modifier (never mouse button / drag) with softer rubber-band span
+        assert js_out["parIdle"] is False
+        assert js_out["parMouseBtn"] is False
+        assert js_out["parMouseBtnWithCtrl"] is False
+        assert js_out["parCtrl"] is True
+        assert js_out["parShift"] is True
+        assert abs(js_out["parRelSpanX"] - 43.2) < 1e-6
+        assert abs(js_out["parRelSpanY"] - 30.4) < 1e-6
+
+        assert js_out["hasMtzCol"] is True
+        assert js_out["hasPredCrossLinkedIsigi"] is True
+        assert js_out["mtzColStroke"].startswith("rgba(")
+        assert js_out["mtzColStroke"] != js_out["mtzColStrokeInteg"]
+        rpc, gpc, bpc, apc = _parse_rgba(js_out["colPredCross"])
+        rpt, gpt, bpt, apt = _parse_rgba(js_out["colPredTop"])
+        assert (rpc, gpc, bpc) == (56, 189, 248) and abs(apc - 0.5) < 0.005
+        assert (rpt, gpt, bpt) == (0, 240, 255) and apt == 1.0
+        assert js_out["scalePredTop"] != js_out["scaleIntegTop"]
+        assert js_out["gradIsigiPred"]["gradient"] != js_out["gradIsigi"]["gradient"]
+        assert js_out["nPredFrame"] == len(payload_mtz["predicted_peaks"])
+        assert js_out["nPredWulff"] == len(samp_with_mtz)
+        assert js_out["predShape"] == "circle"
+        assert js_out["nIntegFrame"] == 1 and js_out["nIntegWulff"] == 2
+        assert js_out["integShape"] == "ellipse"
+        assert js_out["btnPredDisabled"] is False
+        assert js_out["btnIntegDisabled"] is False
+
+
+def test_mandi_i2_harmonics_wulff_snr_dimming_and_hires_textures(tmp_path) -> None:
+    import base64
+    import io
+
+    import h5py
+    from PIL import Image
+
+    from subhkl.viz.rainbow_zones import (
+        _compute_harmonic_order_and_multiplicity,
+        _make_systematic_absence_checker,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # 1. Exact space-group-aware Laue harmonic multiplicity for MANDI I2 (a=55.16, b=81.19, c=88.7, beta=96.3)
+    is_abs_i2 = _make_systematic_absence_checker("I 1 2 1")
+    assert is_abs_i2(1, 0, 0) is True  # h+k+l = 1 odd -> body-centered absent
+    assert is_abs_i2(2, 0, 0) is False  # h+k+l = 2 even -> allowed
+
+    # (2, 0, 0) at lambda=3.2 A, d=27.4 A in [2.0, 4.0] A, d_min=1.5 A:
+    # (1, 0, 0) is absent in I2, and (4, 0, 0) would need lambda=1.6 A < 2.0 A -> NOT a harmonic!
+    ord_200, mult_200 = _compute_harmonic_order_and_multiplicity(
+        2,
+        0,
+        0,
+        3.2,
+        27.4,
+        wl_min=2.0,
+        wl_max=4.0,
+        d_min=1.5,
+        is_absent_fn=is_abs_i2,
+    )
+    assert ord_200 == 1
+    assert mult_200 == 1
+
+    # (2, 0, 0) at lambda=3.9 A, d=27.4 A -> (4, 0, 0) at lambda=1.95 A is still out-of-band (< 2.0 A),
+    # whereas at lambda=4.0 A -> (4, 0, 0) at lambda=2.0 A is in-band and allowed -> mult == 2!
+    _, mult_out = _compute_harmonic_order_and_multiplicity(
+        2,
+        0,
+        0,
+        3.9,
+        27.4,
+        wl_min=2.0,
+        wl_max=4.0,
+        d_min=1.5,
+        is_absent_fn=is_abs_i2,
+    )
+    ord_400, mult_in = _compute_harmonic_order_and_multiplicity(
+        4,
+        0,
+        0,
+        2.0,
+        13.7,
+        wl_min=2.0,
+        wl_max=4.0,
+        d_min=1.5,
+        is_absent_fn=is_abs_i2,
+    )
+    assert mult_out == 1
+    assert ord_400 == 2
+    assert mult_in == 2
+
+    import gemmi
+
+    solve_mandi = tmp_path / "mandi_i2_solve.h5"
+    mandi_cell = [55.16, 81.19, 88.7, 90.0, 96.3, 90.0]
+    b_mandi = np.asarray(gemmi.UnitCell(*mandi_cell).frac.mat.tolist(), dtype=float).T
+    with h5py.File(solve_mandi, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array(mandi_cell, dtype=float)
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = b_mandi
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=float)
+
+    p_mandi = build_rainbow_zone_payload(
+        replay_h5=solve_mandi,
+        instrument="MANDI",
+        space_group="I 1 2 1",
+        wavelength_range=(2.0, 4.0),
+        d_min=1.6,
+        include_panel_images=False,
+    )
+    assert len(p_mandi["peaks"]) > 20
+    harm_frac = sum(
+        1 for pk in p_mandi["peaks"] if int(pk.get("harmonic_multiplicity", 1)) > 1
+    ) / len(p_mandi["peaks"])
+    assert harm_frac < 0.25
+
+    # 2. Integrator HDF5 with image_index + file_offsets (no peaks/run_index) and render_binning=4 vs 1
+    img_h5 = tmp_path / "mandi_imgs.h5"
+    with h5py.File(img_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["images"] = np.ones((2, 64, 64), dtype=np.float32) * 12.0
+        hf["bank_ids"] = np.array([20, 20], dtype=np.int32)
+        hf["file_offsets"] = np.array([0, 1, 2], dtype=np.int32)
+        dt_s = h5py.string_dtype(encoding="utf-8")
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_13172.nxs.h5", "MANDI_13174.nxs.h5"], dtype=object),
+            dtype=dt_s,
+        )
+        hf["goniometer/R"] = np.stack([np.eye(3), np.eye(3)], axis=0)
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=np.float32)
+
+    integ_h5 = tmp_path / "mandi_integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array([55.16, 81.19, 88.7, 90.0, 96.3, 90.0])
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = np.diag([1.0 / 55.16, 1.0 / 81.19, 1.0 / 88.7])
+        hf["goniometer/R"] = np.stack([np.eye(3), np.eye(3)], axis=0)
+        hf["file_offsets"] = np.array([0, 1, 2], dtype=np.int32)
+        # Peak 0 (run 0, I/sig=10 >= 2.5), Peak 1 (run 0, I/sig=1.8 < 2.5), Peak 2 (run 1, I/sig=12 >= 2.5)
+        hf["peaks/image_index"] = np.array([0, 0, 1], dtype=np.int32)
+        hf["peaks/bank"] = np.array([20, 20, 20], dtype=np.int32)
+        hf["peaks/pixel_r"] = np.array([20.0, 36.0, 28.0], dtype=np.float64)
+        hf["peaks/pixel_c"] = np.array([24.0, 40.0, 30.0], dtype=np.float64)
+        hf["peaks/h"] = np.array([2, 0, 2], dtype=np.int32)
+        hf["peaks/k"] = np.array([0, 2, 2], dtype=np.int32)
+        hf["peaks/l"] = np.array([0, 0, 0], dtype=np.int32)
+        hf["peaks/lambda"] = np.array([3.1, 3.2, 3.0], dtype=np.float64)
+        hf["peaks/intensity"] = np.array([100.0, 18.0, 120.0], dtype=np.float64)
+        hf["peaks/sigma"] = np.array([10.0, 10.0, 10.0], dtype=np.float64)
+        hf["peaks/var_u"] = np.array([2.2, 1.8, 2.0], dtype=np.float64)
+        hf["peaks/var_v"] = np.array([0.8, 0.9, 1.0], dtype=np.float64)
+        hf["peaks/cov_uv"] = np.array([0.2, 0.0, -0.1], dtype=np.float64)
+
+    p_lo = build_rainbow_zone_payload(
+        replay_h5=integ_h5, images_h5=img_h5, frame_index=0, render_binning=4
+    )
+    p_hi = build_rainbow_zone_payload(
+        replay_h5=integ_h5, images_h5=img_h5, frame_index=0, render_binning=1
+    )
+    assert p_lo["render_binning"] == 4
+    assert p_hi["render_binning"] == 1
+    assert p_lo["all_runs_min_isigi"] == 2.5
+    # Frame 0 detector PEAKS keeps both strong (I/sig=10) and uncertain (I/sig=1.8 >= 1.5) peaks
+    assert len(p_lo["integrated_peaks"]) == 2
+    # Multi-run Wulff SAMPLE_PEAKS has I/sig >= 2.5 across properly reconstructed runs [0, 1]
+    by_run = {int(sp["run_index"]): sp for sp in p_lo["integrated_sample_peaks"]}
+    assert sorted(by_run.keys()) == [0, 1]
+    # Run 0: (2, 0, 0) at lambda=3.1 A -> (1,0,0) & (3,0,0) absent in I2, (4,0,0) at 1.55 A < 2.0 A -> mult == 1
+    assert by_run[0]["harmonic_order"] == 1
+    assert by_run[0]["harmonic_multiplicity"] == 1
+    # Run 1: (2, 2, 0) at lambda=3.0 A -> (1,1,0) allowed (1+1+0=2 even, ord=2) and (3,3,0) allowed at 2.0 A -> mult == 2!
+    assert by_run[1]["harmonic_order"] == 2
+    assert by_run[1]["harmonic_multiplicity"] == 2
+
+    b20_lo = next(pn for pn in p_lo["panels"] if pn["bank"] == 20)
+    b20_hi = next(pn for pn in p_hi["panels"] if pn["bank"] == 20)
+    im_lo = Image.open(io.BytesIO(base64.b64decode(b20_lo["texture_b64"])))
+    im_hi = Image.open(io.BytesIO(base64.b64decode(b20_hi["texture_b64"])))
+    assert im_lo.size == (16, 16)
+    assert im_hi.size == (64, 64)
+
+    # 3. Verify ellipse crossbars are removed, Wulff I/sig>=2.5 badge + detector dimming + Hi-Res button exist,
+    # and Hi-Res direct (u, v) rendering eliminates screen-edge-parallel tile-by-tile nematic warping.
+    html_doc = render_rainbow_html(p_hi)
+    assert "pQ1" not in html_doc and "pQ3" not in html_doc
+    assert 'id="btn-hires-tex"' in html_doc
+    assert "toggleHiResTextures" in html_doc
+    assert "isWulffSnrCutActive" in html_doc
+    assert "isPeakUncertainForScope" in html_doc
+    assert "ALL-RUNS · I/σ ≥" in html_doc
+    assert "drawPanelTextureDirect" in html_doc
+    assert "getCrispUVCanvas" in html_doc
+
+    import re
+    import shutil
+    import subprocess
+
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        assert len(script_blocks) >= 1
+        inline_js = script_blocks[-1]
+        js_syntax_file = tmp_path / "hires_inline_check.js"
+        js_syntax_file.write_text(inline_js, encoding="utf-8")
+        subprocess.run(["node", "--check", str(js_syntax_file)], check=True)
+
+        fn_names = [
+            "invalidatePanelRenderCaches",
+            "getDetectorDataAspect",
+            "getDetectorPlotBox",
+            "detToScreen",
+            "getPanelVertRange",
+            "getCrispUVCanvas",
+            "getPanelScreenAspect",
+            "expandClampedUVTri",
+            "warpTextureOntoPanel",
+            "drawPanelTextureDirect",
+        ]
+        extracted = []
+        for fn_name in fn_names:
+            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            assert m is not None, f"Missing JS function {fn_name}"
+            start = m.start()
+            depth = 0
+            in_body = False
+            end = start
+            for idx in range(start, len(inline_js)):
+                ch = inline_js[idx]
+                if ch == "{":
+                    depth += 1
+                    in_body = True
+                elif ch == "}":
+                    depth -= 1
+                    if in_body and depth == 0:
+                        end = idx + 1
+                        break
+            extracted.append(inline_js[start:end])
+
+        b1_panel = next(pn for pn in p_hi["panels"] if pn["bank"] == 1)
+        b20_panel = next(pn for pn in p_hi["panels"] if pn["bank"] == 20)
+        harness_js = f"""
+const PANELS = {json.dumps([b1_panel, b20_panel])};
+const warpedBankCanvases = new Map();
+const warpedMaskCanvases = new Map();
+const uvUpscaledCanvases = new Map();
+let _panelTexEpoch = 1;
+let _detLayerCacheCanvas = null;
+let _detLayerCacheKey = "";
+let _panelScratchCanvas = null;
+let _cachedCylRadiusM = null;
+let _cachedPlotBox = null;
+let _cachedPlotBoxKey = "";
+
+function makeMockCanvas(w = 256, h = 256) {{
+  const ops = [];
+  const ctx = {{
+    ops,
+    imageSmoothingEnabled: true,
+    imageSmoothingQuality: "low",
+    globalAlpha: 1.0,
+    globalCompositeOperation: "source-over",
+    save() {{ ops.push(["save"]); }},
+    restore() {{ ops.push(["restore"]); }},
+    beginPath() {{}},
+    moveTo() {{}},
+    lineTo() {{}},
+    rect() {{}},
+    closePath() {{}},
+    clip() {{}},
+    clearRect() {{}},
+    setTransform(...args) {{ ops.push(["setTransform", ...args]); }},
+    transform(...args) {{ ops.push(["transform", ...args]); }},
+    drawImage(src, ...rest) {{
+      ops.push([
+        "drawImage",
+        src.width,
+        src.height,
+        this.imageSmoothingEnabled,
+        this.imageSmoothingQuality,
+        this.globalCompositeOperation,
+        ...rest,
+      ]);
+    }},
+  }};
+  return {{ width: w, height: h, _ctx: ctx, getContext: () => ctx }};
+}}
+globalThis.document = {{ createElement: () => makeMockCanvas(1, 1) }};
+
+const state = {{
+  projection: "spherical",
+  hiResTextures: true,
+  heatmapStyle: "magma",
+  detZoom: 1.0,
+  detPanX: 0.0,
+  detPanY: 0.0,
+  parallaxX: 0.0,
+  parallaxY: 0.0,
+  parallaxStrength: 1.0,
+}};
+function getActiveBounds() {{
+  return {{ minX: -180.0, maxX: 180.0, minY: -90.0, maxY: 90.0 }};
+}}
+
+{chr(10).join(extracted)}
+
+const tex = makeMockCanvas(256, 256);
+// 1) Wide bottom-ring MANDI bank b1 has spherical az/el ratio ~3.48:1 (never forced to 1:1 square)
+const wcB1 = warpTextureOntoPanel(tex, PANELS[0], true, false);
+const b1Ratio = wcB1.width / wcB1.height;
+
+// 2) Direct (u, v) rendering on 45-deg diamond bank b20 at overview zoom (detZoom=1.0 -> k=1) vs deep zoom (detZoom=12.0 -> k>=4)
+const layerLo = makeMockCanvas(1200, 800);
+const p20 = PANELS[1];
+const [vMin, vMax] = getPanelVertRange(p20);
+let [x0, y0] = detToScreen(p20.az_min, vMax, 1200, 800, 0.0);
+let [x1, y1] = detToScreen(p20.az_max, vMin, 1200, 800, 0.0);
+const outLo = p20.outline_sph.map(pt => detToScreen(pt[0], pt[1], 1200, 800, 0.0));
+drawPanelTextureDirect(
+  layerLo.getContext("2d"), tex, "tex_20_magma_hi", p20, true, 0.0,
+  1200, 800, 1.0, -24, -24, 1224, 824, x0, y0, x1 - x0, y1 - y0, outLo, 0.85, true
+);
+
+state.detZoom = 12.0;
+const [cx20, cy20] = detToScreen(0.5 * (p20.az_min + p20.az_max), 0.5 * (vMin + vMax), 1200, 800, 0.0);
+state.detPanX = 600.0 - cx20;
+state.detPanY = 400.0 - cy20;
+[x0, y0] = detToScreen(p20.az_min, vMax, 1200, 800, 0.0);
+[x1, y1] = detToScreen(p20.az_max, vMin, 1200, 800, 0.0);
+const outHi = p20.outline_sph.map(pt => detToScreen(pt[0], pt[1], 1200, 800, 0.0));
+const layerHi = makeMockCanvas(1200, 800);
+drawPanelTextureDirect(
+  layerHi.getContext("2d"), tex, "tex_20_magma_hi", p20, true, 0.0,
+  1200, 800, 2.0, -24, -24, 1224, 824, x0, y0, x1 - x0, y1 - y0, outHi, 0.85, true
+);
+
+const scratchDraws = _panelScratchCanvas
+  ? _panelScratchCanvas.getContext("2d").ops.filter(o => o[0] === "drawImage")
+  : [];
+const clampCheck = expandClampedUVTri(0, 0, 32, 0, 0, 32, 2.5, 2.5, 256, 256, 1, 0, 0, 1, 0, 0);
+
+console.log(JSON.stringify({{
+  b1Ratio,
+  uvCacheKeys: Array.from(uvUpscaledCanvases.keys()),
+  firstDrawSrcW: scratchDraws.length > 0 ? scratchDraws[0][1] : 0,
+  lastDrawSrcW: scratchDraws.length > 0 ? scratchDraws[scratchDraws.length - 1][1] : 0,
+  scratchSmoothing: scratchDraws.every(d => d[3] === true && d[4] === "high"),
+  scratchCopyOp: scratchDraws.every(d => d[5] === "copy"),
+  clampTopEdgeExactZero: clampCheck[0][1] === 0 && clampCheck[1][1] === 0 && clampCheck[0][0] === 0 && clampCheck[2][0] === 0,
+}}));
+"""
+        harness_file = tmp_path / "hires_nematic_fix_harness.js"
+        harness_file.write_text(harness_js, encoding="utf-8")
+        res = subprocess.run(
+            ["node", str(harness_file)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        out = json.loads(res.stdout.strip())
+        assert out["b1Ratio"] > 3.0
+        assert any(k.endswith(("_k4", "_k8")) for k in out["uvCacheKeys"])
+        assert out["firstDrawSrcW"] == 256
+        assert out["lastDrawSrcW"] >= 1024
+        assert out["scratchSmoothing"] is True
+        assert out["scratchCopyOp"] is True
+        assert out["clampTopEdgeExactZero"] is True
+
+
+def test_mtz_vectorized_speed_and_multirun_dedup(tmp_path):
+    """Tweak 1: External .mtz projection vectorizes ASU/Bragg filtering and deduplicates multi-run Wulff peaks."""
+    import time
+
+    import gemmi
+    import numpy as np
+
+    from subhkl.instrument.goniometer import calc_goniometer_rotation_matrix
+    from subhkl.viz.rainbow_zones import (
+        apply_mtz_to_payload,
+        build_rainbow_zone_payload,
+    )
+
+    solve_h5 = tmp_path / "mandi_mtz_solve.h5"
+    mandi_cell = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    b_mandi = np.asarray(gemmi.UnitCell(*mandi_cell).frac.mat.tolist(), dtype=float).T
+    angles_deg = [0.0, 15.0, 30.0, 45.0, 60.0, 75.0, 90.0, 105.0]
+    r_stack = np.stack(
+        [
+            calc_goniometer_rotation_matrix([[0.0, 1.0, 0.0, 1.0]], [ang])
+            for ang in angles_deg
+        ],
+        axis=0,
+    )
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array(mandi_cell, dtype=float)
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = b_mandi
+        hf["goniometer/R"] = r_stack
+        hf["goniometer/angles"] = np.asarray([[ang] for ang in angles_deg], dtype=float)
+        hf["instrument/wavelength"] = np.array([2.0, 4.5], dtype=float)
+
+    base = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        instrument="CG4D",
+        space_group="I 1 2 1",
+        wavelength_range=(2.0, 4.5),
+        d_min=1.8,
+        frame_index=2,
+        include_panel_images=False,
+    )
+    b_before = np.asarray(base["b_matrix"], dtype=np.float64).copy()
+
+    # Build an external .mtz with ~2,500 reflections including ultra-high-res shells beyond 2/wl_min
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.find_spacegroup_by_name("I 1 2 1")
+    mtz.set_cell_for_all(gemmi.UnitCell(55.16, 81.19, 88.70, 90.0, 96.3, 90.0))
+    mtz.add_dataset("crystal")
+    mtz.add_column("I", "J")
+    mtz.add_column("SIGI", "Q")
+    rows = []
+    rng = np.random.default_rng(42)
+    for h in range(-14, 15):
+        for k in range(14):
+            for l_idx in range(-10, 11):
+                if h == 0 and k == 0 and l_idx == 0:
+                    continue
+                if (h + k + l_idx) % 2 != 0:
+                    continue
+                if len(rows) >= 2500:
+                    break
+                sig = float(rng.uniform(1.0, 5.0))
+                inten = float(rng.normal(12.0, 8.0))
+                rows.append([h, k, l_idx, inten, sig])
+            if len(rows) >= 2500:
+                break
+        if len(rows) >= 2500:
+            break
+    mtz.set_data(np.asarray(rows, dtype=np.float32))
+    mtz_file = tmp_path / "dense_external.mtz"
+    mtz.write_to_file(str(mtz_file))
+
+    t0 = time.perf_counter()
+    out = apply_mtz_to_payload(base, str(mtz_file), {"name": "dense_external.mtz"})
+    elapsed = time.perf_counter() - t0
+
+    assert elapsed < 3.0, f"Vectorized MTZ load took too long: {elapsed:.2f}s"
+    np.testing.assert_allclose(out["b_matrix"], b_before)
+    assert out["default_color_mode"] == "mtz_isigi"
+    assert "mtz_peaks" not in out
+    mtz_frame = [p for p in out["predicted_peaks"] if p.get("mtz_isigi") is not None]
+    mtz_all = [
+        p for p in out["predicted_sample_peaks"] if p.get("mtz_isigi") is not None
+    ]
+    assert len(mtz_frame) > 0
+    assert len(mtz_all) >= len(mtz_frame)
+    # Multi-run Wulff sample peaks must have unique crystal (h, k, l) keys and preserve active-frame hits
+    seen_hkls = {tuple(p["hkl"]) for p in out["predicted_sample_peaks"]}
+    assert len(seen_hkls) == len(out["predicted_sample_peaks"])
+    frame_hkls = {tuple(p["hkl"]) for p in mtz_frame}
+    assert frame_hkls.issubset(seen_hkls)
+    by_hkl = {tuple(p["hkl"]): p for p in out["predicted_sample_peaks"]}
+    for fp in mtz_frame:
+        assert by_hkl[tuple(fp["hkl"])]["run_index"] == 2
+
+
+def test_wulff_zoom_dspacing_lod_and_dirty_skip(tmp_path):
+    """Tweak 2: Wulff All-Runs deduplicates crystal HKLs, couples zoom to d-spacing LOD, and skips idle redraws."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    if not shutil.which("node"):
+        return
+
+    payload = build_rainbow_zone_payload()
+    html_doc = render_rainbow_html(payload)
+    script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+    inline_js = script_blocks[-1]
+
+    fn_names = [
+        "getColorCrossover",
+        "isSameReflection",
+        "isPeakHighlightedTarget",
+        "isPeakVisible",
+        "isWulffSnrCutActive",
+        "getActiveWulffPeaks",
+        "_peakSnrScore",
+        "getWulffPoolCache",
+        "getWulffLodState",
+        "projectToWulff",
+        "findNearestPeakWulff",
+        "renderStereoInset",
+    ]
+    extracted = []
+    for fn_name in fn_names:
+        m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+        assert m is not None, f"Missing JS function {fn_name}"
+        start = m.start()
+        depth = 0
+        in_body = False
+        end = start
+        for idx in range(start, len(inline_js)):
+            ch = inline_js[idx]
+            if ch == "{":
+                depth += 1
+                in_body = True
+            elif ch == "}":
+                depth -= 1
+                if in_body and depth == 0:
+                    end = idx + 1
+                    break
+        extracted.append(inline_js[start:end])
+
+    harness_js = f"""
+let PEAKS = [];
+let SAMPLE_PEAKS = [];
+let ZONES = [];
+let DATA = {{ d_min: 1.4, wavelength_range: [1.8, 4.5], frame_index: 2 }};
+const IS_SOLVED = true;
+const WULFF_MIN_ISIGI = 2.5;
+const DEFAULT_COLOR_CROSSOVER = 0.38;
+globalThis.window = {{ devicePixelRatio: 1 }};
+
+const _wulffPoolCache = {{
+  sig: "",
+  firstRef: null,
+  lastRef: null,
+  rawPeaks: [],
+  uniquePeaks: [],
+  observedHklSet: new Set(),
+  sortedD: [],
+}};
+let _lastWulffRenderSig = "";
+
+// Create 1,200 All-Runs predicted reflections spanning d in [1.4, 8.0] A, plus duplicate run_index hits for HKL [9999,1,1]
+for (let i = 0; i < 1200; i++) {{
+  const frac = i / 1199.0;
+  const d = 1.4 + 6.6 * Math.pow(frac, 1.5);
+  const th = (i * 2.399963) % (2 * Math.PI);
+  const cz = -0.7 + 1.5 * ((i * 0.618034) % 1.0);
+  const sz = Math.sqrt(Math.max(0.0, 1.0 - Math.min(1.0, cz * cz)));
+  const q = [sz * Math.cos(th), sz * Math.sin(th), Math.min(1.0, Math.max(-1.0, cz))];
+  SAMPLE_PEAKS.push({{
+    id: i,
+    hkl: [i + 1, (i % 9) - 4, (i % 7) - 3],
+    asu_hkl: [i + 1, i % 5, i % 3],
+    d_spacing: d,
+    wavelength: 2.8,
+    intensity: 10.0,
+    sigma: 2.0,
+    q_hat: q,
+    q_hat_sample: q,
+    q_hat_cryst: q,
+    run_index: i % 5,
+  }});
+}}
+for (const rIdx of [0, 2, 4]) {{
+  SAMPLE_PEAKS.push({{
+    id: 5000 + rIdx,
+    hkl: [9999, 1, 1],
+    asu_hkl: [9999, 1, 1],
+    d_spacing: 6.5,
+    wavelength: 3.0,
+    intensity: 20.0,
+    sigma: 2.0,
+    q_hat: [0.1, 0.2, 0.974679],
+    q_hat_sample: [0.1, 0.2, 0.974679],
+    q_hat_cryst: [0.1, 0.2, 0.974679],
+    run_index: rIdx,
+  }});
+}}
+
+let saveDepth = 0;
+let clipDepth = -1;
+const ops = [];
+const stereoCtx = {{
+  fillStyle: "",
+  strokeStyle: "",
+  lineWidth: 1,
+  font: "",
+  textAlign: "left",
+  globalAlpha: 1,
+  setTransform() {{}},
+  setLineDash() {{}},
+  createRadialGradient() {{ return {{ addColorStop() {{}} }}; }},
+  clearRect(...a) {{ ops.push(["clearRect", ...a]); }},
+  fillRect(...a) {{ ops.push(["fillRect", ...a]); }},
+  strokeRect(...a) {{ ops.push(["strokeRect", ...a]); }},
+  beginPath() {{}},
+  arc(...a) {{ ops.push(["arc", ...a]); }},
+  moveTo() {{}},
+  lineTo() {{}},
+  closePath() {{}},
+  roundRect() {{}},
+  stroke() {{}},
+  fill() {{}},
+  clip() {{ clipDepth = saveDepth; ops.push(["clip"]); }},
+  save() {{ saveDepth++; ops.push(["save"]); }},
+  restore() {{ if (saveDepth === clipDepth) clipDepth = -1; saveDepth--; ops.push(["restore"]); }},
+  fillText(txt, x, y) {{ ops.push(["fillText", String(txt), x, y, clipDepth !== -1]); }},
+  measureText(txt) {{ return {{ width: String(txt).length * 6 }}; }},
+}};
+const stereoCanvas = {{
+  width: 260,
+  height: 260,
+  clientWidth: 260,
+  clientHeight: 260,
+  getBoundingClientRect: () => ({{ width: 260, height: 260 }}),
+  getContext: () => stereoCtx,
+}};
+
+const state = {{
+  mode: "pro",
+  showStereo: true,
+  peakSource: "predicted",
+  peakColorMode: "wavelength",
+  wulffScope: "all_runs",
+  wulffColorMode: "wavelength",
+  colorCrossover: 0.38,
+  wulffExpanded: false,
+  showWulffFriedel: false,
+  wulffYawDeg: 0.0,
+  wulffPitchDeg: 0.0,
+  wulffZoom: 1.0,
+  dMin: 1.4,
+  lamMin: 1.8,
+  lamMax: 4.5,
+  showUncertainPeaks: true,
+  selectedFrameIndex: 2,
+  selectedZoneId: null,
+  showZoneArcs: false,
+  activeZones: new Set(),
+  hoveredPeakId: null,
+  selectedPeakId: null,
+  hoveredPeakObj: null,
+  selectedPeakObj: null,
+  activeOrbitId: null,
+}};
+function getActiveGoniometerR() {{ return [[1,0,0],[0,1,0],[0,0,1]]; }}
+function mat3T(M) {{ return M; }}
+function mat3Vec(M, v) {{ return v; }}
+function getPeakCrystalQHat(p) {{ return p.q_hat_cryst || p.q_hat; }}
+function getPeakColor() {{ return [0, 229, 255]; }}
+function peakStrokeColor() {{ return "rgb(0,229,255)"; }}
+function getWulffColor(p) {{ return "rgb(0,229,255)"; }}
+function isPeakCapturedByActiveZone() {{ return false; }}
+
+{chr(10).join(extracted)}
+
+const rawActive = getActiveWulffPeaks();
+const pool1 = getWulffPoolCache();
+const dupMatches = pool1.uniquePeaks.filter(p => p.hkl[0] === 9999);
+const lodZoom1 = getWulffLodState(false);
+
+// High-resolution hovered peak (d < 1.5A) must ALWAYS survive zoom-out LOD thinning
+const hiResTarget = pool1.uniquePeaks.find(p => p.d_spacing < 1.5);
+state.hoveredPeakId = hiResTarget.id;
+state.hoveredPeakObj = hiResTarget;
+const lodWithHover = getWulffLodState(false);
+const hoverKept = lodWithHover.visiblePeaks.some(p => isSameReflection(p, hiResTarget));
+state.hoveredPeakId = null;
+state.hoveredPeakObj = null;
+
+// Render at wulffZoom=1.0 -> draws & emits d >= badge AFTER restore(); immediate 2nd renderStereoInset() skips redraw
+ops.length = 0;
+renderStereoInset();
+const firstDrawOps = ops.length;
+const fillTextsZoom1 = ops.filter(o => o[0] === "fillText").map(o => o[1]);
+const badgeOp = ops.find(o => o[0] === "fillText" && o[1].includes("zoom+"));
+
+ops.length = 0;
+renderStereoInset();
+const secondIdleOps = ops.length;
+
+// Zoom in to 2.5x and 8.0x -> progressively reveals higher-resolution shells
+state.wulffZoom = 2.5;
+const lodZoom25 = getWulffLodState(false);
+state.wulffZoom = 8.0;
+const lodZoom80 = getWulffLodState(false);
+
+console.log(JSON.stringify({{
+  rawActiveLen: rawActive.length,
+  poolDedupLen: pool1.uniquePeaks.length,
+  dupCount: dupMatches.length,
+  dupPrefersActiveFrame: dupMatches.length === 1 && dupMatches[0].run_index === 2,
+  zoom1Count: lodZoom1.visiblePeaks.length,
+  zoom1Thinned: lodZoom1.totalUnique - lodZoom1.visiblePeaks.length,
+  zoom1Dcut: lodZoom1.lodDcut,
+  zoom25Count: lodZoom25.visiblePeaks.length,
+  zoom80Count: lodZoom80.visiblePeaks.length,
+  zoom80Thinned: lodZoom80.totalUnique - lodZoom80.visiblePeaks.length,
+  hoverKept,
+  firstDrawOps,
+  secondIdleOps,
+  hasZoomBadge: fillTextsZoom1.some(t => t.includes("zoom+")),
+  badgeUnclippedAfterRestore: Boolean(badgeOp && badgeOp[4] === false),
+}}));
+"""
+    harness_file = tmp_path / "wulff_lod_harness.js"
+    harness_file.write_text(harness_js, encoding="utf-8")
+    res = subprocess.run(
+        ["node", str(harness_file)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    out = json.loads(res.stdout.strip())
+    assert out["rawActiveLen"] == 1203
+    assert out["poolDedupLen"] == 1201
+    assert out["dupCount"] == 1
+    assert out["dupPrefersActiveFrame"] is True
+    assert out["zoom1Thinned"] > 400
+    assert out["zoom1Count"] < out["poolDedupLen"]
+    assert out["zoom25Count"] > out["zoom1Count"]
+    assert out["zoom80Count"] == out["poolDedupLen"]
+    assert out["zoom80Thinned"] == 0
+    assert out["hoverKept"] is True
+    assert out["firstDrawOps"] > 20
+    assert out["secondIdleOps"] == 0
+    assert out["hasZoomBadge"] is True
+    assert out["badgeUnclippedAfterRestore"] is True
+
+
+def test_ndip_streaming_download_empty_history_cache_and_mtz_binary_discovery(
+    tmp_path, monkeypatch
+):
+    """Tweaks 3 & 4: Empty-history poll caching, safe hardlink vs copy staging, and 'binary' .mtz discovery."""
+    import os
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://galaxy.example.org",
+        galaxy_api_key="fake-key",
+        history_id="hist_1",
+    )
+
+    # 1) Empty initial history `[]` must be cached during active-job polling (no HTTP flood every 1.5s)
+    api_calls = []
+
+    def fake_api(method, path, payload=None, raw=False, timeout=30.0):
+        api_calls.append((method, path))
+        if path.startswith("/api/histories/hist_1/contents"):
+            return []
+        if path == "/api/datatypes":
+            return ["h5", "mtz", "tabular", "binary"]
+        if path == "/api/datasets/ds_merged":
+            return {"id": "ds_merged", "file_size": 16}
+        if path == "/api/datasets/ds_merged/display":
+            return b"0123456789abcdef"
+        return {}
+
+    runner._api_request = fake_api
+    assert runner.list_history_datasets(use_cached=False) == []
+    assert len(api_calls) == 1
+    assert runner.list_history_datasets(use_cached=True) == []
+    assert len(api_calls) == 1  # Served from cache even though list is empty!
+
+    # 2) Datatype probe recognizes 'mtz' when Galaxy advertises it
+    assert runner._galaxy_has_datatype("mtz") is True
+
+    # 3) Streaming download writes atomically via _api_request fallback and updates job_record safely
+    dest_h5 = tmp_path / "merged.h5"
+    job_rec = {"stdout": "line1\n"}
+    n_bytes = runner._download_dataset_to_file(
+        "ds_merged", str(dest_h5), job_record=job_rec, label="merged.h5"
+    )
+    assert n_bytes == 16
+    assert dest_h5.read_bytes() == b"0123456789abcdef"
+
+    # 4) _link_or_copy_file hard-links inside same temp directory, but copies when allow_hardlink=False
+    alias_h5 = tmp_path / "cg4d_2523_merged.h5"
+    NovaGalaxyPipelineRunner._link_or_copy_file(str(dest_h5), str(alias_h5))
+    assert os.stat(dest_h5).st_ino == os.stat(alias_h5).st_ino
+
+    ext_store_src = tmp_path / "galaxy_object_store_dataset_99.dat"
+    ext_store_src.write_bytes(b"immutable-galaxy-store")
+    staged_copy = tmp_path / "staged_from_store.h5"
+    NovaGalaxyPipelineRunner._link_or_copy_file(
+        str(ext_store_src), str(staged_copy), allow_hardlink=False
+    )
+    assert os.stat(ext_store_src).st_ino != os.stat(staged_copy).st_ino
+    staged_copy.write_bytes(b"locally-stamped")
+    assert ext_store_src.read_bytes() == b"immutable-galaxy-store"
+
+    # 5) Stage 4 Careless history discovery accepts uploaded .mtz datasets even when labeled extension='binary'
+    hist_items = [
+        {
+            "id": "ds_careless_prev",
+            "hid": 9,
+            "name": "careless_xval_0.mtz",
+            "extension": "mtz",
+            "state": "ok",
+            "deleted": False,
+        },
+        {
+            "id": "ds_user_uploaded_mtz",
+            "hid": 8,
+            "name": "mandi_13172_integrated.mtz",
+            "extension": "binary",
+            "state": "ok",
+            "deleted": False,
+        },
+    ]
+    matched_id = ""
+    for d in sorted(hist_items, key=lambda x: int(x.get("hid") or 0), reverse=True):
+        if d.get("state") and d.get("state") != "ok":
+            continue
+        nm = str(d.get("name") or "")
+        nl = nm.lower()
+        ext = str(d.get("extension") or "").lower()
+        is_mtz_cand = nl.endswith(".mtz") or ext == "mtz"
+        if is_mtz_cand and "careless" not in nl:
+            matched_id = str(d["id"])
+            break
+    assert matched_id == "ds_user_uploaded_mtz"
+
+
+def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
+    tmp_path,
+) -> None:
+    """Verify .mtz projection matches predict_reflections_on_panel under calibrated banks, refined kinematics, and sample offsets without rescaling B."""
+    import gemmi
+    import h5py
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.instrument.detector import Detector
+    from subhkl.instrument.goniometer import (
+        calc_goniometer_rotation_matrix,
+        sample_to_lab,
+    )
+    from subhkl.instrument.physics import predict_reflections_on_panel
+    from subhkl.viz.rainbow_zones import (
+        _reconstruct_detectors_from_payload,
+        apply_mtz_to_payload,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # Active solve: monoclinic I 1 2 1 (e.g. MANDI-style cell)
+    solve_sg = "I 1 2 1"
+    solve_cell = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    B_solve_raw, _ = cartesian_matrix_metric_tensor(
+        *solve_cell[:3], *np.deg2rad(solve_cell[3:])
+    )
+    B_solve = np.asarray(B_solve_raw, dtype=float)
+    U_solve = Rotation.from_euler("zyx", [31.5, -18.2, 42.7], degrees=True).as_matrix()
+
+    # Calibrated flat bank (MANDI bank 19 shifted by +14 mm and tilted by 1.8 deg)
+    bk_id = 19
+    nom_cfg = dict(beamlines["MANDI"][str(bk_id)])
+    cal_cfg = dict(nom_cfg)
+    tilt_R = Rotation.from_euler("xyz", [1.4, -1.8, 0.9], degrees=True).as_matrix()
+    cal_cfg["center"] = (
+        np.asarray(nom_cfg["center"], dtype=float) + np.array([0.014, -0.009, 0.011])
+    ).tolist()
+    cal_cfg["uhat"] = (tilt_R @ np.asarray(nom_cfg["uhat"], dtype=float)).tolist()
+    cal_cfg["vhat"] = (tilt_R @ np.asarray(nom_cfg["vhat"], dtype=float)).tolist()
+    cal_cfg["width"] = float(nom_cfg["width"]) * 1.015
+    cal_cfg["height"] = float(nom_cfg["height"]) * 0.988
+    cal_det = Detector(cal_cfg)
+
+    # Two runs with refined goniometer zero-offset (+3.25 deg), per-run delta (-1.75 deg on run 1),
+    # and refined crystal sample displacement + per-run translation!
+    axes = np.array([[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]], dtype=float)
+    nom_angles_frames = np.array([[10.0, 5.0], [48.0, 5.0]], dtype=float)
+    zero_offs = np.array([3.25, -0.80], dtype=float)
+    per_run_delta = np.array([0.40, -1.75], dtype=float)
+    base_trans = np.array([0.0035, -0.0022, 0.0048], dtype=float)
+    per_run_trans = np.array(
+        [[0.0005, 0.0, -0.0004], [-0.0012, 0.0008, 0.0006]], dtype=float
+    )
+
+    eff_ang_0 = np.array([10.0 + per_run_delta[0], 5.0], dtype=float)
+    eff_ang_1 = np.array([48.0 + per_run_delta[1], 5.0], dtype=float)
+    R_true_0 = calc_goniometer_rotation_matrix(axes, eff_ang_0 + zero_offs)
+    R_true_1 = calc_goniometer_rotation_matrix(axes, eff_ang_1 + zero_offs)
+
+    offs_0 = np.vstack([np.zeros(3), base_trans + per_run_trans[0]])
+    offs_1 = np.vstack([np.zeros(3), base_trans + per_run_trans[1]])
+    s_lab_0 = np.asarray(
+        sample_to_lab(
+            np.zeros(3),
+            axes,
+            eff_ang_0,
+            offs_0,
+            zero_offsets=zero_offs,
+            is_vector=False,
+        ),
+        dtype=float,
+    )
+    s_lab_1 = np.asarray(
+        sample_to_lab(
+            np.zeros(3),
+            axes,
+            eff_ang_1,
+            offs_1,
+            zero_offsets=zero_offs,
+            is_vector=False,
+        ),
+        dtype=float,
+    )
+
+    wl_min, wl_max = 2.0, 4.0
+    ki_vec = np.array([0.008, -0.005, 1.0], dtype=float)
+    ki_vec = ki_vec / np.linalg.norm(ki_vec)
+
+    grid = np.mgrid[-16:17, -16:17, -16:17].reshape(3, -1).T
+    grid = grid[np.any(grid != 0, axis=1)]
+    # Restrict to I-centering allowed reflections h+k+l = 2n
+    grid = grid[((grid[:, 0] + grid[:, 1] + grid[:, 2]) % 2) == 0]
+
+    pr0, pc0, h0, k0, l0, lam0 = predict_reflections_on_panel(
+        cal_det,
+        grid[:, 0],
+        grid[:, 1],
+        grid[:, 2],
+        U_solve @ B_solve,
+        wl_min,
+        wl_max,
+        sample_offset=offs_0,
+        ki_vec=ki_vec,
+        gonio_axes=axes,
+        gonio_angles=eff_ang_0,
+        gonio_offsets=zero_offs,
+    )
+    pr1, pc1, h1, k1, l1, lam1 = predict_reflections_on_panel(
+        cal_det,
+        grid[:, 0],
+        grid[:, 1],
+        grid[:, 2],
+        U_solve @ B_solve,
+        wl_min,
+        wl_max,
+        sample_offset=offs_1,
+        ki_vec=ki_vec,
+        gonio_axes=axes,
+        gonio_angles=eff_ang_1,
+        gonio_offsets=zero_offs,
+    )
+    assert len(h0) >= 4 and len(h1) >= 4
+
+    # Write nominal merged.h5 + solved solve.h5 where goniometer/R is an UNREFINED per-peak (N_peaks, 3, 3)
+    # array (all first 6 peaks in Run 0, next 3 peaks in Run 1 — reproducing the exact f0_r bug!)
+    merged_h5 = tmp_path / "MANDI_13172_MANDI_13174_merged.h5"
+    with h5py.File(merged_h5, "w") as mf:
+        mf.attrs["instrument"] = "MANDI"
+        mf.create_dataset("images", data=np.zeros((2, 256, 256), dtype=np.float32))
+        mf.create_dataset("bank_ids", data=np.array([bk_id, bk_id], dtype=np.int32))
+        mf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        mf.create_dataset(
+            "files",
+            data=np.array([b"MANDI_13172.nxs.h5", b"MANDI_13174.nxs.h5"]),
+        )
+        gon_m = mf.create_group("goniometer")
+        gon_m.create_dataset("names", data=np.array([b"omega", b"chi"]))
+        gon_m.create_dataset("axes", data=axes)
+        gon_m.create_dataset("angles", data=nom_angles_frames)
+        mf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([wl_min, wl_max], dtype=float)
+        )
+
+    solve_h5 = tmp_path / "solve.h5"
+    R_unrefined_0 = calc_goniometer_rotation_matrix(axes, nom_angles_frames[0])
+    R_unrefined_1 = calc_goniometer_rotation_matrix(axes, nom_angles_frames[1])
+    # 6 peaks in run 0, 3 peaks in run 1 -> R_all[1] is STILL Run 0's unrefined matrix!
+    R_per_peak_unrefined = np.concatenate(
+        [
+            np.repeat(R_unrefined_0[None, :, :], 6, axis=0),
+            np.repeat(R_unrefined_1[None, :, :], 3, axis=0),
+        ],
+        axis=0,
+    )
+    pts_p0 = np.asarray(cal_det.pixel_to_lab(pr0[:6], pc0[:6]), dtype=float)
+    pts_p1 = np.asarray(cal_det.pixel_to_lab(pr1[:3], pc1[:3]), dtype=float)
+    with h5py.File(solve_h5, "w") as sf:
+        sf.attrs["instrument"] = "MANDI"
+        sf.attrs["source"] = str(merged_h5)
+        sf.create_group("beam").create_dataset("ki_vec", data=ki_vec)
+        smp = sf.create_group("sample")
+        smp.create_dataset("space_group", data=solve_sg.encode("utf-8"))
+        smp.create_dataset("cell", data=np.array(solve_cell, dtype=float))
+        smp.create_dataset("U", data=U_solve)
+        smp.create_dataset("B", data=B_solve)
+        dc = sf.create_group("detector_calibration").create_group(f"bank_{bk_id}")
+        dc.create_dataset("panel_type", data=b"flat")
+        dc.create_dataset("center", data=np.array(cal_cfg["center"], dtype=float))
+        dc.create_dataset("uhat", data=np.array(cal_cfg["uhat"], dtype=float))
+        dc.create_dataset("vhat", data=np.array(cal_cfg["vhat"], dtype=float))
+        dc.create_dataset("width", data=float(cal_cfg["width"]))
+        dc.create_dataset("height", data=float(cal_cfg["height"]))
+        dc.create_dataset("m", data=int(cal_cfg["m"]))
+        dc.create_dataset("n", data=int(cal_cfg["n"]))
+        gon = sf.create_group("goniometer")
+        gon.create_dataset("names", data=np.array([b"omega", b"chi"]))
+        gon.create_dataset("axes", data=axes)
+        gon.create_dataset("axes_nominal", data=axes)
+        gon.create_dataset("angles_nominal", data=nom_angles_frames)
+        gon.create_dataset("R", data=R_per_peak_unrefined)
+        offs_grp = gon.create_group("offsets")
+        offs_grp.create_dataset("omega", data=float(zero_offs[0]))
+        offs_grp.create_dataset("chi", data=float(zero_offs[1]))
+        gon.create_dataset("translations", data=base_trans)
+        pr_grp = gon.create_group("per_run")
+        pr_grp.create_dataset("motor", data=b"omega")
+        pr_grp.create_dataset("delta_deg", data=per_run_delta)
+        pr_grp.create_dataset("trans_m", data=per_run_trans)
+        pk = sf.create_group("peaks")
+        pk.create_dataset("xyz", data=np.vstack([pts_p0, pts_p1]))
+        pk.create_dataset("bank", data=np.full(9, bk_id, dtype=np.int32))
+        pk.create_dataset(
+            "pixel_r", data=np.concatenate([pr0[:6], pr1[:3]]).astype(float)
+        )
+        pk.create_dataset(
+            "pixel_c", data=np.concatenate([pc0[:6], pc1[:3]]).astype(float)
+        )
+        pk.create_dataset("intensity", data=np.full(9, 200.0, dtype=float))
+        pk.create_dataset("sigma", data=np.full(9, 10.0, dtype=float))
+        pk.create_dataset("h", data=np.concatenate([h0[:6], h1[:3]]).astype(np.int32))
+        pk.create_dataset("k", data=np.concatenate([k0[:6], k1[:3]]).astype(np.int32))
+        pk.create_dataset("l", data=np.concatenate([l0[:6], l1[:3]]).astype(np.int32))
+        pk.create_dataset(
+            "lambda", data=np.concatenate([lam0[:6], lam1[:3]]).astype(float)
+        )
+        pk.create_dataset("run_index", data=np.array([0] * 6 + [1] * 3, dtype=np.int32))
+
+    # Build payload on Run 1 (where the old f0_r=1 bug previously picked Run 0's unrefined matrix AND dropped calibrated bank 19!)
+    payload_r1 = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        frame_index=1,
+        d_min=0.5,
+        include_panel_images=False,
+    )
+    reconstructed = _reconstruct_detectors_from_payload(payload_r1)
+    assert bk_id in reconstructed
+    assert np.allclose(reconstructed[bk_id].center, cal_det.center, atol=1e-6)
+    assert np.allclose(np.asarray(payload_r1["goniometer_R"]), R_true_1, atol=1e-6)
+    assert np.allclose(
+        np.asarray(payload_r1["goniometer_R_per_run"]["0"]), R_true_0, atol=1e-6
+    )
+    assert np.allclose(
+        np.asarray(payload_r1["goniometer_R_per_run"]["1"]), R_true_1, atol=1e-6
+    )
+    assert np.allclose(np.asarray(payload_r1["sample_offset_lab"]), s_lab_1, atol=1e-6)
+    assert np.allclose(
+        np.asarray(payload_r1["sample_offset_lab_per_run"]["0"]), s_lab_0, atol=1e-6
+    )
+
+    # Write a foreign-symmetry MTZ (P 32 2 1, completely different cell) containing exact HKLs from Run 1 & Run 0
+    mtz_foreign = gemmi.Mtz(with_base=True)
+    mtz_foreign.spacegroup = gemmi.find_spacegroup_by_name("P 32 2 1")
+    mtz_foreign.set_cell_for_all(gemmi.UnitCell(19.9, 19.9, 140.0, 90.0, 90.0, 120.0))
+    mtz_foreign.add_dataset("foreign")
+    mtz_foreign.add_column("I", "J")
+    mtz_foreign.add_column("SIGI", "Q")
+    chosen_hkls: list[tuple[int, int, int]] = []
+    expected_r1: dict[tuple[int, int, int], tuple[float, float, float]] = {}
+    for i_pk in range(min(5, len(h1))):
+        key_h = (int(h1[i_pk]), int(k1[i_pk]), int(l1[i_pk]))
+        if key_h not in expected_r1:
+            expected_r1[key_h] = (
+                float(pr1[i_pk]),
+                float(pc1[i_pk]),
+                float(lam1[i_pk]),
+            )
+            chosen_hkls.append(key_h)
+    # Also include HKLs that would strike OTHER uninstalled MANDI banks (e.g. bank 22)
+    # to prove .mtz reflections ONLY project onto panels where predicted peaks project (bank 19)!
+    uninstalled_det = Detector(dict(beamlines["MANDI"]["22"]))
+    _, _, h22, k22, l22, _ = predict_reflections_on_panel(
+        uninstalled_det,
+        grid[:, 0],
+        grid[:, 1],
+        grid[:, 2],
+        U_solve @ B_solve,
+        wl_min,
+        wl_max,
+        sample_offset=offs_1,
+        ki_vec=ki_vec,
+        gonio_axes=axes,
+        gonio_angles=eff_ang_1,
+        gonio_offsets=zero_offs,
+    )
+    assert len(h22) >= 2
+    extra_b22_hkls = [
+        (int(h22[0]), int(k22[0]), int(l22[0])),
+        (int(h22[1]), int(k22[1]), int(l22[1])),
+    ]
+    mtz_foreign.set_data(
+        np.asarray(
+            [[h, k, l, 300.0, 10.0] for (h, k, l) in (chosen_hkls + extra_b22_hkls)],
+            dtype=np.float32,
+        )
+    )
+    foreign_mtz_path = tmp_path / "unrelated_trigonal.mtz"
+    mtz_foreign.write_to_file(str(foreign_mtz_path))
+
+    overlaid = apply_mtz_to_payload(
+        payload_r1, foreign_mtz_path, {"name": "unrelated_trigonal.mtz"}
+    )
+    # 1. Solve B, U, cell, and space_group stay untouched, and informational warning is emitted!
+    assert np.allclose(np.asarray(overlaid["b_matrix"]), B_solve, atol=1e-7)
+    assert np.allclose(np.asarray(overlaid["u_matrix"]), U_solve, atol=1e-7)
+    assert overlaid["space_group"] == solve_sg
+    assert np.allclose(overlaid["cell"], solve_cell, atol=1e-3)
+    assert overlaid["default_color_mode"] == "mtz_isigi"
+    assert "mtz_peaks" not in overlaid
+    assert isinstance(overlaid.get("mtz_overlay_warning"), str)
+    assert "P 32 2 1" in overlaid["mtz_overlay_warning"]
+    assert "I 1 2 1" in overlaid["mtz_overlay_warning"]
+
+    # 2. Strictly restricted to active predicted-peak panel bank 19 (NEVER bank 22 or other MANDI banks!)
+    all_pred_banks = {int(pk["bank"]) for pk in overlaid["predicted_peaks"]}
+    all_samp_banks = {int(pk["bank"]) for pk in overlaid["predicted_sample_peaks"]}
+    assert all_pred_banks == {bk_id}
+    assert all_samp_banks == {bk_id}
+
+    # Every projected MTZ reflection matches predict_reflections_on_panel pixel (row, col) & wavelength
+    # under the solved geometry AND has exact d_spacing = 1 / |B_solve @ hkl| (zero unit-cell rescaling or foreign-SG shear)!
+    mtz_tagged = [
+        pk for pk in overlaid["predicted_peaks"] if pk.get("mtz_isigi") is not None
+    ]
+    by_hkl_b19 = {
+        tuple(int(x) for x in pk["hkl"]): pk
+        for pk in mtz_tagged
+        if int(pk["bank"]) == bk_id
+    }
+    for key_h, (exp_r, exp_c, exp_lam) in expected_r1.items():
+        assert key_h in by_hkl_b19, (
+            f"Missing expected reflection {key_h} on calibrated bank {bk_id}"
+        )
+        got_pk = by_hkl_b19[key_h]
+        assert abs(float(got_pk["row"]) - exp_r) < 0.01
+        assert abs(float(got_pk["col"]) - exp_c) < 0.01
+        assert abs(float(got_pk["wavelength"]) - exp_lam) < 1e-3
+        assert abs(float(got_pk["mtz_isigi"]) - 30.0) < 1e-2
+        d_true = float(1.0 / np.linalg.norm(B_solve @ np.asarray(key_h, dtype=float)))
+        assert abs(float(got_pk["d_spacing"]) - d_true) < 1e-3
+        assert float(got_pk["angular_error_deg"]) < 0.02
+
+    for pk in mtz_tagged:
+        h_vec = np.asarray(pk["hkl"], dtype=float)
+        d_true_pk = float(1.0 / np.linalg.norm(B_solve @ h_vec))
+        assert abs(float(pk["d_spacing"]) - d_true_pk) < 1e-3
+
+    # 3. Loading a matching-symmetry/cell MTZ emits NO warning and populates mtz_isigi on bank 19 only
+    mtz_same = gemmi.Mtz(with_base=True)
+    mtz_same.spacegroup = gemmi.find_spacegroup_by_name(solve_sg)
+    mtz_same.set_cell_for_all(gemmi.UnitCell(*solve_cell))
+    mtz_same.add_dataset("same")
+    mtz_same.add_column("I", "J")
+    mtz_same.add_column("SIGI", "Q")
+    mtz_same.set_data(
+        np.asarray(
+            [[h, k, l, 300.0, 10.0] for (h, k, l) in (chosen_hkls + extra_b22_hkls)],
+            dtype=np.float32,
+        )
+    )
+    same_mtz_path = tmp_path / "matching_monoclinic.mtz"
+    mtz_same.write_to_file(str(same_mtz_path))
+    overlaid_same = apply_mtz_to_payload(
+        payload_r1, same_mtz_path, {"name": "matching_monoclinic.mtz"}
+    )
+    assert overlaid_same["mtz_overlay_warning"] is None
+    assert {int(pk["bank"]) for pk in overlaid_same["predicted_peaks"]} == {bk_id}
+    same_tagged_hkls = {
+        tuple(int(x) for x in pk["hkl"])
+        for pk in overlaid_same["predicted_peaks"]
+        if pk.get("mtz_isigi") is not None
+    }
+    assert set(expected_r1.keys()).issubset(same_tagged_hkls)
+
+    html_warn = render_rainbow_html(overlaid)
+    assert "mtz_overlay_warning" in html_warn
+
+
+def test_full_inline_script_boot_and_data_sources_menu(tmp_path) -> None:
+    """Execute the full rendered <script> top-to-bottom in Node to guard against TDZ/hoisting bugs."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    assert shutil.which("node"), "Node.js required for inline script boot test"
+
+    empty_model = SubhklGalaxyModel()
+    bij_payload = dict(empty_model.payload)
+    bij_peaks = [
+        {
+            "id": 0,
+            "run_index": 0,
+            "bank": 23,
+            "det_x": -80.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [-0.5, 0.2, -0.84],
+            "q_hat_lab": [-0.5, 0.2, -0.84],
+            "stereographic": [-0.2, 0.1],
+            "hemisphere": 1,
+            "wavelength": 2.76,
+            "d_spacing": 2.18,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [11, -15, 1],
+            "asu_hkl": [11, 15, 1],
+            "asu_orbit_id": "11,15,1",
+            "asu_friedel": False,
+            "asu_bijvoet_parity": 1,
+            "orbit_color_idx": 2,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+        {
+            "id": 1,
+            "run_index": 0,
+            "bank": 24,
+            "det_x": -35.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [0.5, 0.2, -0.84],
+            "q_hat_lab": [0.5, 0.2, -0.84],
+            "stereographic": [0.2, 0.1],
+            "hemisphere": 1,
+            "wavelength": 2.82,
+            "d_spacing": 2.18,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [-11, -15, 1],
+            "asu_hkl": [11, 15, 1],
+            "asu_orbit_id": "11,15,1",
+            "asu_friedel": False,
+            "asu_bijvoet_parity": 1,
+            "orbit_color_idx": 2,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+        {
+            "id": 2,
+            "run_index": 0,
+            "bank": 53,
+            "det_x": 10.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [0.5, 0.2, 0.84],
+            "q_hat_lab": [0.5, 0.2, -0.60],
+            "stereographic": [0.25, -0.15],
+            "hemisphere": 1,
+            "wavelength": 2.02,
+            "d_spacing": 2.18,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [-11, -15, -1],
+            "asu_hkl": [11, 15, 1],
+            "asu_orbit_id": "11,15,1",
+            "asu_friedel": True,
+            "asu_bijvoet_parity": -1,
+            "orbit_color_idx": 2,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+        {
+            "id": 3,
+            "run_index": 0,
+            "bank": 31,
+            "det_x": 55.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [0.6, 0.1, -0.79],
+            "q_hat_lab": [0.6, 0.1, -0.79],
+            "stereographic": [0.3, 0.05],
+            "hemisphere": 1,
+            "wavelength": 3.10,
+            "d_spacing": 3.00,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [2, 2, 0],
+            "asu_hkl": [2, 2, 0],
+            "asu_orbit_id": "2,2,0",
+            "asu_friedel": False,
+            "asu_bijvoet_parity": 0,
+            "orbit_color_idx": 5,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+        {
+            "id": 4,
+            "run_index": 0,
+            "bank": 35,
+            "det_x": 95.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [-0.6, -0.1, -0.79],
+            "q_hat_lab": [-0.6, -0.1, -0.79],
+            "stereographic": [-0.3, -0.05],
+            "hemisphere": 1,
+            "wavelength": 3.10,
+            "d_spacing": 3.00,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [-2, -2, 0],
+            "asu_hkl": [2, 2, 0],
+            "asu_orbit_id": "2,2,0",
+            "asu_friedel": False,
+            "asu_bijvoet_parity": 0,
+            "orbit_color_idx": 5,
+            "zone_ids": [0],
+            "indexed": True,
+        },
+    ]
+    bij_payload.update(
+        {
+            "instrument": "CG4D",
+            "space_group": "Fdd2",
+            "wavelength_range": [2.0, 4.5],
+            "d_min": 1.0,
+            "peaks": bij_peaks,
+            "predicted_peaks": bij_peaks,
+            "sample_peaks": bij_peaks,
+            "predicted_sample_peaks": bij_peaks,
+            "zones": [
+                {
+                    "id": 0,
+                    "uvw": [0, 0, 1],
+                    "label": "[001]",
+                    "n_peaks": 5,
+                    "angular_rms_deg": 0.05,
+                    "d_direct": 6.54,
+                    "color": "#38bdf8",
+                    "axis_lab": [0.0, 1.0, 0.0],
+                    "axis_crystal": [0.0, 0.0, 1.0],
+                    "conic_points": [],
+                    "conic_points_sph": [],
+                    "wulff_points": [],
+                }
+            ],
+            "frames": [{"index": 0, "label": "CG4D_1720"}],
+            "active_frame": 0,
+        }
+    )
+    html_doc = render_rainbow_html(bij_payload)
+    script = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
+
+    js_file = tmp_path / "full_boot_check.js"
+    js_file.write_text(
+        """
+const elems = new Map();
+const ctxLogs = new Map();
+let rafCb = null;
+function makeCtx(id = "") {
+  const log = { strokes: [], texts: [], arcs: [] };
+  if (id) ctxLogs.set(id, log);
+  const ctx = {
+    fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+    textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+    setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+    transform() {}, clearRect() {}, fillRect() {},
+    strokeRect() { log.strokes.push(String(ctx.strokeStyle)); },
+    beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+    arc(x, y, r) { log.arcs.push([x, y, r]); },
+    ellipse() {},
+    quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+    stroke() { log.strokes.push(String(ctx.strokeStyle)); },
+    fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+    fillText(t) { log.texts.push(String(t)); },
+    strokeText() {}, drawImage() {},
+    measureText(t) { return { width: String(t).length * 6 }; },
+    createLinearGradient() { return { addColorStop() {} }; },
+    createRadialGradient() { return { addColorStop() {} }; },
+    getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+    putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+  };
+  return ctx;
+}
+function makeEl(id = "") {
+  const listeners = {};
+  const styleProps = {};
+  const el = {
+    id, tagName: id.startsWith("sel-") ? "SELECT" : "DIV",
+    value: id === "slider-color-emphasis" ? "0.38" : "",
+    min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 300, height: 240, clientWidth: 300, clientHeight: 240,
+    scrollWidth: 300, scrollHeight: 240, scrollTop: 0, offsetWidth: 300, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null,
+    dataset: {},
+    clicked: 0,
+    style: new Proxy(styleProps, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: {
+      _s: new Set(),
+      add(...c) { c.forEach(x => this._s.add(x)); },
+      remove(...c) { c.forEach(x => this._s.delete(x)); },
+      toggle(c, f) { if (f === undefined ? !this._s.has(c) : f) { this._s.add(c); return true; } this._s.delete(c); return false; },
+      contains(c) { return this._s.has(c); }
+    },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) {
+      const arr = listeners[evObj.type] || [];
+      arr.forEach(fn => fn.call(el, evObj));
+    },
+    click() { el.clicked += 1; el.dispatchEvent({ type: "click", target: el, preventDefault() {}, stopPropagation() {} }); },
+    focus() {}, blur() {}, select() {}, remove() {},
+    appendChild(ch) { this.children.push(ch); ch.parentElement = this; return ch; },
+    insertBefore(ch) { this.children.push(ch); ch.parentElement = this; return ch; },
+    replaceChildren(...ch) { this.children = ch; },
+    setAttribute(k, v) { this[k] = v; },
+    getAttribute(k) { return this[k] ?? null; },
+    removeAttribute(k) { delete this[k]; },
+    getBoundingClientRect() { return { left: 0, top: 0, right: 300, bottom: 240, width: 300, height: 240 }; },
+    getContext() { if (!el._ctx) el._ctx = makeCtx(id); return el._ctx; },
+    querySelector() { return makeEl(); },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+  };
+  return el;
+}
+function getEl(id) {
+  if (!elems.has(id)) elems.set(id, makeEl(id));
+  return elems.get(id);
+}
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.location = { href: "about:srcdoc", origin: "http://localhost:8080", pathname: "/", search: "" };
+globalThis.navigator = { clipboard: { writeText: async () => {} } };
+globalThis.Image = class { set src(v) { this._src = v; } };
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.AbortController = class { constructor() { this.signal = {}; } abort() {} };
+globalThis.requestAnimationFrame = (fn) => { if (!rafCb) rafCb = fn; return 1; };
+globalThis.cancelAnimationFrame = () => {};
+globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => "" });
+globalThis.document = {
+  body: makeEl("body"),
+  documentElement: makeEl("html"),
+  activeElement: null,
+  getElementById(id) { return getEl(id); },
+  createElement(tag) { return makeEl(tag); },
+  querySelector(sel) { return sel.startsWith("#") ? getEl(sel.slice(1)) : makeEl(sel); },
+  querySelectorAll() { return []; },
+  addEventListener() {},
+  removeEventListener() {},
+};
+"""
+        + script
+        + """
+const slCs = elems.get("slider-color-emphasis");
+const selSrc = elems.get("sel-galaxy-h5");
+const modalNd = elems.get("modal-neutron-data");
+const inpLocal = elems.get("inp-local-h5");
+
+selSrc.value = "__action_neutron_data__";
+selSrc.dispatchEvent({ type: "change", target: selSrc });
+const ndDisplay = modalNd.style.display;
+
+selSrc.value = "__action_local_file__";
+selSrc.dispatchEvent({ type: "change", target: selSrc });
+const localClicked = inpLocal ? inpLocal.clicked : 0;
+
+// Trigger initial frame render to capture on-screen [x, y] positions of the 5 Fdd2 peaks
+const detCanvasEl = elems.get("canvas-detector");
+detCanvasEl.getContext("2d");
+const detLog = ctxLogs.get("canvas-detector");
+detLog.arcs.length = 0;
+if (rafCb) rafCb();
+const inViewArcs = detLog.arcs.filter(a => a[0] >= 0 && a[0] <= 300 && a[1] >= 0 && a[1] <= 240);
+inViewArcs.sort((a, b) => a[0] - b[0]);
+
+// Hover peak #0 (11, -15, +1) -> leftmost visible peak
+const [px0, py0] = inViewArcs[0];
+detCanvasEl.dispatchEvent({ type: "mousemove", clientX: px0, clientY: py0, buttons: 0 });
+const statusBijHtml = getEl("inspector-box").innerHTML;
+detLog.strokes.length = 0;
+detLog.texts.length = 0;
+if (rafCb) rafCb();
+const hasPinkRing = detLog.strokes.some(s => s.includes("255, 77, 184") || s === "#ff4db8");
+const hasCyanPgRing = detLog.strokes.some(s => s.includes("0, 229, 255") || s === "#00e5ff");
+const hasBijTooltip = detLog.texts.some(t => t.includes("(-11,-15,-1) [Bijvoet]"));
+const pgNotTaggedBij = detLog.texts.some(t => t.startsWith("(-11,-15,1) λ="));
+
+// Hover centric peak #3 (2, 2, 0) -> 4th peak from left; must NOT tag (-2,-2,0) as Bijvoet
+const [px3, py3] = inViewArcs[3];
+detCanvasEl.dispatchEvent({ type: "mousemove", clientX: px3, clientY: py3, buttons: 0 });
+const statusCentricHtml = getEl("inspector-box").innerHTML;
+detLog.strokes.length = 0;
+detLog.texts.length = 0;
+if (rafCb) rafCb();
+const centricHasPink = detLog.strokes.some(s => s.includes("255, 77, 184") || s === "#ff4db8") ||
+  detLog.texts.some(t => t.includes("[Bijvoet]"));
+
+console.log(JSON.stringify({
+  csGradientSet: Boolean(slCs && slCs.style["--cs-gradient"] && slCs.style["--cs-gradient"].startsWith("linear-gradient(")),
+  ndDisplay,
+  localClicked,
+  hasBijBadge: statusBijHtml.includes("bijvoet-badge") && statusBijHtml.includes("±Bijvoet ×1 (frame)") && statusBijHtml.includes("I⁺"),
+  hasPinkRing,
+  hasCyanPgRing,
+  hasBijTooltip,
+  pgNotTaggedBij,
+  centricNoBijBadge: !statusCentricHtml.includes("bijvoet-badge"),
+  centricHasPink,
+}));
+process.exit(0);
+""",
+        encoding="utf-8",
+    )
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=True
+    )
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert out["csGradientSet"] is True
+    assert out["ndDisplay"] == "flex"
+    assert out["localClicked"] == 1
+    assert out["hasBijBadge"] is True
+    assert out["hasPinkRing"] is True
+    assert out["hasCyanPgRing"] is True
+    assert out["hasBijTooltip"] is True
+    assert out["pgNotTaggedBij"] is True
+    assert out["centricNoBijBadge"] is True
+    assert out["centricHasPink"] is False
+
+
+def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
+    tmp_path,
+) -> None:
+    """Verify live UI d_min / wavelength re-prediction, finite protein d_min floor, and Detector zoom LOD."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.rainbow_zones import (
+        _make_asu_mapper,
+        _make_systematic_absence_checker,
+        _raycast_hkl_on_detectors,
+        apply_mtz_to_payload,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    if not shutil.which("node"):
+        return
+
+    # 1. Build a protein-scale orthorhombic dataset (P 21 21 21, V ~ 296,000 A^3) on curved IMAGINE
+    #    (full 2*pi cylindrical image-plate diffractometer, bank 0) with initial d_min = 3.2 A,
+    #    wavelength = [2.8, 4.5] A, 2 runs, integrated inner peaks, and a .mtz down to 2.0 A.
+    cell_prot = [54.3, 68.7, 79.4, 90.0, 90.0, 90.0]
+    sg_name = "P 21 21 21"
+    uc_prot = gemmi.UnitCell(*cell_prot)
+    b_prot = np.asarray(uc_prot.frac.mat.tolist(), dtype=float).T
+    ang1, ang2 = 0.21, -0.17
+    r_z = np.array(
+        [
+            [np.cos(ang1), -np.sin(ang1), 0.0],
+            [np.sin(ang1), np.cos(ang1), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    r_x = np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, np.cos(ang2), -np.sin(ang2)],
+            [0.0, np.sin(ang2), np.cos(ang2)],
+        ],
+        dtype=float,
+    )
+    u_prot = r_z @ r_x
+    r0 = np.eye(3, dtype=float)
+    phi1 = np.deg2rad(22.0)
+    r1 = np.array(
+        [
+            [np.cos(phi1), 0.0, np.sin(phi1)],
+            [0.0, 1.0, 0.0],
+            [-np.sin(phi1), 0.0, np.cos(phi1)],
+        ],
+        dtype=float,
+    )
+
+    imagine_cfg = beamlines["IMAGINE"]
+    first_bk = 0
+    imagine_dets = {first_bk: Detector(dict(imagine_cfg[str(first_bk)]))}
+    is_absent = _make_systematic_absence_checker(sg_name)
+    asu_map = _make_asu_mapper(sg_name, cell_prot)
+
+    # Enumerate exact Python reference reflections down to d = 2.15 A and widened lambda [2.0, 4.5] A
+    h_lim = int(np.floor(cell_prot[0] / 2.0)) + 1
+    k_lim = int(np.floor(cell_prot[1] / 2.0)) + 1
+    l_lim = int(np.floor(cell_prot[2] / 2.0)) + 1
+    grid = (
+        np.mgrid[-h_lim : h_lim + 1, -k_lim : k_lim + 1, -l_lim : l_lim + 1]
+        .reshape(3, -1)
+        .T
+    )
+    grid = grid[np.any(grid != 0, axis=1)]
+    q_cryst = (b_prot @ grid.T).T
+    d_all = 1.0 / np.maximum(np.linalg.norm(q_cryst, axis=1), 1e-12)
+    grid_20 = grid[d_all >= 2.0 - 1e-9]
+    allowed_mask = np.array(
+        [not is_absent(int(h), int(k), int(l)) for h, k, l in grid_20], dtype=bool
+    )
+    grid_allowed = grid_20[allowed_mask]
+    d_allowed = 1.0 / np.linalg.norm((b_prot @ grid_allowed.T).T, axis=1)
+
+    def _cast_to_tuples(res: dict, b_mat_ref: np.ndarray) -> list[tuple]:
+        hkls = res["hkl"]
+        if len(hkls) == 0:
+            return []
+        ds = 1.0 / np.linalg.norm((b_mat_ref @ hkls.T).T, axis=1)
+        return [
+            (
+                int(res["bank"][i]),
+                float(res["pixel_r"][i]),
+                float(res["pixel_c"][i]),
+                int(hkls[i, 0]),
+                int(hkls[i, 1]),
+                int(hkls[i, 2]),
+                float(res["wavelength"][i]),
+                float(ds[i]),
+                res["peaks_xyz"][i],
+            )
+            for i in range(len(hkls))
+        ]
+
+    py_cast_320 = _cast_to_tuples(
+        _raycast_hkl_on_detectors(
+            grid_allowed[d_allowed >= 3.20 - 1e-9],
+            u_prot,
+            b_prot,
+            r0,
+            imagine_dets,
+            (2.8, 4.5),
+            active_bids={first_bk},
+        ),
+        b_prot,
+    )
+    py_cast_215 = _cast_to_tuples(
+        _raycast_hkl_on_detectors(
+            grid_allowed[d_allowed >= 2.15 - 1e-9],
+            u_prot,
+            b_prot,
+            r0,
+            imagine_dets,
+            (2.8, 4.5),
+            active_bids={first_bk},
+        ),
+        b_prot,
+    )
+    py_cast_215_wide_wl = _cast_to_tuples(
+        _raycast_hkl_on_detectors(
+            grid_allowed[d_allowed >= 2.15 - 1e-9],
+            u_prot,
+            b_prot,
+            r0,
+            imagine_dets,
+            (2.0, 4.5),
+            active_bids={first_bk},
+        ),
+        b_prot,
+    )
+    assert len(py_cast_320) >= 80
+    assert len(py_cast_215) > len(py_cast_320) + 400
+    assert len(py_cast_215_wide_wl) > len(py_cast_215) + 150
+
+    # Pick 6 inner reflections (d >= 3.35 A) as integrated peaks in integrated.h5
+    inner_hits = [ht for ht in py_cast_320 if ht[7] >= 3.35][:6]
+    assert len(inner_hits) == 6
+    integ_xyz = np.vstack([ht[8] for ht in inner_hits])
+
+    integ_h5 = tmp_path / "prot_integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "IMAGINE"
+        smp = hf.create_group("sample")
+        smp.create_dataset("space_group", data=sg_name.encode("utf-8"))
+        smp.create_dataset("cell", data=np.array(cell_prot, dtype=float))
+        smp.create_dataset("U", data=u_prot)
+        smp.create_dataset("B", data=b_prot)
+        gon = hf.create_group("goniometer")
+        gon.create_dataset("R", data=np.stack([r0, r1], axis=0))
+        gon.create_dataset("angles", data=np.array([[0.0], [22.0]], dtype=float))
+        gon.create_dataset("axes", data=np.array([[0.0, 1.0, 0.0]], dtype=float))
+        hf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        hf.create_dataset(
+            "bank_ids", data=np.array([first_bk, first_bk], dtype=np.int32)
+        )
+        hf.create_dataset(
+            "files",
+            data=np.array(["prot_run0.nxs.h5", "prot_run1.nxs.h5"], dtype="S32"),
+        )
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.8, 4.5], dtype=float)
+        )
+        pk = hf.create_group("peaks")
+        pk.create_dataset("xyz", data=integ_xyz)
+        pk.create_dataset(
+            "bank", data=np.full(len(inner_hits), first_bk, dtype=np.int32)
+        )
+        pk.create_dataset(
+            "pixel_r", data=np.array([ht[1] for ht in inner_hits], dtype=float)
+        )
+        pk.create_dataset(
+            "pixel_c", data=np.array([ht[2] for ht in inner_hits], dtype=float)
+        )
+        pk.create_dataset(
+            "intensity",
+            data=np.array([240.0 - 15.0 * i for i in range(len(inner_hits))]),
+        )
+        pk.create_dataset("sigma", data=np.full(len(inner_hits), 10.0, dtype=float))
+        pk.create_dataset("var_u", data=np.full(len(inner_hits), 1.2e-4, dtype=float))
+        pk.create_dataset("var_v", data=np.full(len(inner_hits), 0.7e-4, dtype=float))
+        pk.create_dataset("cov_uv", data=np.full(len(inner_hits), 0.1e-4, dtype=float))
+        pk.create_dataset(
+            "h", data=np.array([ht[3] for ht in inner_hits], dtype=np.int32)
+        )
+        pk.create_dataset(
+            "k", data=np.array([ht[4] for ht in inner_hits], dtype=np.int32)
+        )
+        pk.create_dataset(
+            "l", data=np.array([ht[5] for ht in inner_hits], dtype=np.int32)
+        )
+        pk.create_dataset(
+            "lambda", data=np.array([ht[6] for ht in inner_hits], dtype=float)
+        )
+        pk.create_dataset("run_index", data=np.zeros(len(inner_hits), dtype=np.int32))
+
+    # Create a merged .mtz that includes outer-shell reflections (2.15 <= d < 3.0 A) NOT present at d_min=3.2 A
+    outer_only_hits = [ht for ht in py_cast_215 if 2.20 <= ht[7] <= 2.85][:25]
+    assert len(outer_only_hits) >= 10
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.find_spacegroup_by_name(sg_name)
+    mtz.set_cell_for_all(uc_prot)
+    mtz.add_dataset("prot")
+    mtz.add_column("I", "J")
+    mtz.add_column("SIGI", "Q")
+    seen_asu: set[tuple[int, int, int]] = set()
+    mtz_rows = []
+    for idx_m, ht in enumerate(list(inner_hits[:3]) + outer_only_hits):
+        ah, ak, al, _, _ = asu_map(int(ht[3]), int(ht[4]), int(ht[5]))
+        if (ah, ak, al) in seen_asu:
+            continue
+        seen_asu.add((ah, ak, al))
+        mtz_rows.append([ah, ak, al, 150.0 + 10.0 * idx_m, 10.0])
+    mtz.set_data(np.asarray(mtz_rows, dtype=np.float32))
+    mtz_path = tmp_path / "prot_outer_shells.mtz"
+    mtz.write_to_file(str(mtz_path))
+
+    payload = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        instrument="IMAGINE",
+        frame_index=0,
+        d_min=3.20,
+        wavelength_range=(2.8, 4.5),
+        include_panel_images=False,
+    )
+    payload = apply_mtz_to_payload(payload, mtz_path, {"name": "prot_outer_shells.mtz"})
+    assert isinstance(payload.get("space_group_ops"), dict)
+    assert payload["space_group_ops"]["den"] == 24
+    assert payload["space_group_ops"]["is_centrosymmetric"] is False
+    assert isinstance(payload.get("mtz_asu_lookup"), dict)
+    assert len(payload["mtz_asu_lookup"]) == len(mtz_rows)
+
+    html_doc = render_rainbow_html(payload)
+    script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+    assert len(script_blocks) >= 1
+    script = script_blocks[-1]
+    iife_close_idx = script.rfind("})();")
+    assert iife_close_idx > 0
+    script_before_close = script[:iife_close_idx]
+
+    # Also build a flat-panel MANDI payload with a huge macromolecular unit cell (135 x 150 x 210 A)
+    # to test both flat-panel dynamic raycasting AND the finite protein d_min floor scaling!
+    big_cell = [135.0, 150.0, 210.0, 90.0, 90.0, 90.0]
+    b_big = np.asarray(gemmi.UnitCell(*big_cell).frac.mat.tolist(), dtype=float).T
+    mandi_solve_h5 = tmp_path / "mandi_huge_cell.h5"
+    with h5py.File(mandi_solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["sample/space_group"] = "P 21 21 21"
+        hf["sample/cell"] = np.array(big_cell, dtype=float)
+        hf["sample/U"] = u_prot
+        hf["sample/B"] = b_big
+        hf["instrument/wavelength"] = np.array([2.5, 4.0], dtype=float)
+    mandi_payload = build_rainbow_zone_payload(
+        replay_h5=mandi_solve_h5,
+        instrument="MANDI",
+        d_min=4.50,
+        wavelength_range=(2.5, 4.0),
+        include_panel_images=False,
+    )
+    mandi_active_bids = {
+        int(pn["bank"]) for pn in mandi_payload["panels"] if int(pn["bank"]) in {1, 20}
+    } or {int(mandi_payload["panels"][0]["bank"])}
+    # Restrict MANDI test payload to 2 flat panels for crisp 1:1 Python raycast verification
+    mandi_payload["panels"] = [
+        pn for pn in mandi_payload["panels"] if int(pn["bank"]) in mandi_active_bids
+    ]
+    mandi_dets = {
+        bk: Detector(dict(beamlines["MANDI"][str(bk)])) for bk in mandi_active_bids
+    }
+    hb = int(np.floor(big_cell[0] / 3.80)) + 1
+    kb = int(np.floor(big_cell[1] / 3.80)) + 1
+    lb = int(np.floor(big_cell[2] / 3.80)) + 1
+    g_big = np.mgrid[-hb : hb + 1, -kb : kb + 1, -lb : lb + 1].reshape(3, -1).T
+    g_big = g_big[np.any(g_big != 0, axis=1)]
+    d_big = 1.0 / np.linalg.norm((b_big @ g_big.T).T, axis=1)
+    g_big = g_big[d_big >= 3.80 - 1e-9]
+    g_big = g_big[
+        np.array(
+            [not is_absent(int(h), int(k), int(l)) for h, k, l in g_big], dtype=bool
+        )
+    ]
+    py_mandi_380 = _cast_to_tuples(
+        _raycast_hkl_on_detectors(
+            g_big,
+            u_prot,
+            b_big,
+            r0,
+            mandi_dets,
+            (2.5, 4.0),
+            active_bids=mandi_active_bids,
+        ),
+        b_big,
+    )
+    assert len(py_mandi_380) >= 15
+
+    out_json_path = tmp_path / "dyn_dmin_and_det_lod_out.json"
+    js_file = tmp_path / "dyn_dmin_and_det_lod_test.js"
+    js_file.write_text(
+        """
+const elems = new Map();
+const ctxLogs = new Map();
+let rafCb = null;
+function makeCtx(id) {
+  const log = { strokes: [], texts: [], arcs: [] };
+  if (id) ctxLogs.set(id, log);
+  const ctx = {
+    fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+    textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+    setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+    transform() {}, clearRect() {}, fillRect() {},
+    strokeRect() {},
+    beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+    arc(x, y, r) { log.arcs.push([x, y, r]); },
+    ellipse() {},
+    quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+    stroke() { log.strokes.push(String(ctx.strokeStyle)); },
+    fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+    fillText(t) { log.texts.push(String(t)); },
+    strokeText() {}, drawImage() {},
+    measureText(t) { return { width: String(t).length * 6 }; },
+    createLinearGradient() { return { addColorStop() {} }; },
+    createRadialGradient() { return { addColorStop() {} }; },
+    getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+    putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+  };
+  return ctx;
+}
+function makeEl(id = "") {
+  const listeners = {};
+  const styleProps = {};
+  const isDetCanvas = id === "canvas-detector";
+  const cw = isDetCanvas ? 800 : 300;
+  const ch = isDetCanvas ? 520 : 240;
+  const el = {
+    id, tagName: id.startsWith("sel-") ? "SELECT" : "DIV",
+    value: id === "slider-color-emphasis" ? "0.38" : "",
+    min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: cw, height: ch, clientWidth: cw, clientHeight: ch,
+    scrollWidth: cw, scrollHeight: ch, scrollTop: 0, offsetWidth: cw, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null,
+    dataset: {},
+    style: new Proxy(styleProps, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: {
+      _s: new Set(),
+      add(...c) { c.forEach(x => this._s.add(x)); },
+      remove(...c) { c.forEach(x => this._s.delete(x)); },
+      toggle(c, f) { if (f === undefined ? !this._s.has(c) : f) { this._s.add(c); return true; } this._s.delete(c); return false; },
+      contains(c) { return this._s.has(c); }
+    },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) {
+      const arr = listeners[evObj.type] || [];
+      arr.forEach(fn => fn.call(el, evObj));
+    },
+    click() { el.dispatchEvent({ type: "click", target: el, preventDefault() {}, stopPropagation() {} }); },
+    focus() {}, blur() {}, select() {}, remove() {},
+    appendChild(cEl) { this.children.push(cEl); cEl.parentElement = this; return cEl; },
+    insertBefore(cEl) { this.children.push(cEl); cEl.parentElement = this; return cEl; },
+    replaceChildren(...cEls) { this.children = cEls; },
+    setAttribute(k, v) { this[k] = v; },
+    getAttribute(k) { return this[k] ?? null; },
+    removeAttribute(k) { delete this[k]; },
+    getBoundingClientRect() { return { left: 0, top: 0, right: cw, bottom: ch, width: cw, height: ch }; },
+    getContext() { if (!el._ctx) el._ctx = makeCtx(id); return el._ctx; },
+    querySelector() { return makeEl(); },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+  };
+  return el;
+}
+function getEl(id) {
+  if (!elems.has(id)) elems.set(id, makeEl(id));
+  return elems.get(id);
+}
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.location = { href: "about:srcdoc", origin: "http://localhost:8080", pathname: "/", search: "" };
+globalThis.navigator = { clipboard: { writeText: async () => {} } };
+globalThis.Image = class { set src(v) { this._src = v; } };
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.AbortController = class { constructor() { this.signal = {}; } abort() {} };
+globalThis.requestAnimationFrame = (fn) => { rafCb = fn; return 1; };
+globalThis.cancelAnimationFrame = () => {};
+globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => "" });
+globalThis.document = {
+  body: makeEl("body"),
+  documentElement: makeEl("html"),
+  activeElement: null,
+  getElementById(id) { return getEl(id); },
+  createElement(tag) { return makeEl(tag); },
+  querySelector(sel) { return sel.startsWith("#") ? getEl(sel.slice(1)) : makeEl(sel); },
+  querySelectorAll() { return []; },
+  addEventListener() {},
+  removeEventListener() {},
+};
+"""
+        + script_before_close
+        + f"""
+const slDminEl = getEl("slider-dmin");
+const inpDminNode = getEl("inp-dmin");
+const inpLamMinNode = getEl("inp-lmin");
+const detCanvasEl = getEl("canvas-detector");
+detCanvasEl.getContext("2d");
+const detLog = ctxLogs.get("canvas-detector");
+
+// 1. Finite unit-cell-volume-aware d_min floor for V ~ 296,000 A^3
+const protFloor = getDynamicDminFloor();
+const sliderMinAttr = Number(slDminEl.min);
+const initialPeakSource = state.peakSource;
+const initialIntegCount = INTEGRATED_PEAKS.length;
+const initialPredCount = PREDICTED_PEAKS.length;
+
+// Attempting to enter 0.10 A into #inp-dmin clamps cleanly to protFloor
+inpDminNode.value = "0.10";
+inpDminNode.dispatchEvent({{ type: "change", target: inpDminNode }});
+const clampedBelowFloor = state.dMin;
+
+// Reset back to integrated mode + isigi colorscale at d_min = 3.20 A, then drag #slider-dmin down to 2.15 A:
+// must auto-switch from 'integrated' -> 'predicted' AND 'isigi' -> 'wavelength' so unintegrated outer shells are visible!
+slDminEl.value = "3.20";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+applyPeakSource("integrated", false);
+state.wulffColorMode = "isigi";
+const sourceBeforeDrag = state.peakSource;
+const colorModeBeforeDrag = state.wulffColorMode;
+
+slDminEl.value = "2.15";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+if (_dynMultiRunTimer) {{
+  clearTimeout(_dynMultiRunTimer);
+  _dynMultiRunTimer = null;
+  repredictPeaksDynamic({{ forceSampleImmediate: true }});
+}} else {{
+  repredictPeaksDynamic({{ forceSampleImmediate: true }});
+}}
+const sourceAfterDragBelowInteg = state.peakSource;
+const colorModeAfterDragBelowInteg = state.wulffColorMode;
+const pred215 = PEAKS.map(p => ({{
+  bank: p.bank,
+  hkl: p.hkl,
+  row: p.row,
+  col: p.col,
+  wl: p.wavelength,
+  d: p.d_spacing,
+  orbit: p.asu_orbit_id,
+  bijvoet: p.asu_bijvoet_parity,
+  isigi: (typeof p.intensity === "number" && typeof p.sigma === "number" && p.sigma > 0) ? p.intensity / p.sigma : null,
+  hasEllipse: Array.isArray(p.ellipse) && p.ellipse.length >= 6,
+  mtzIsigi: p.mtz_isigi,
+}}));
+const sampleRunsAt215 = Array.from(new Set(PREDICTED_SAMPLE_PEAKS.map(p => p.run_index))).sort();
+const sampleCountAt215 = PREDICTED_SAMPLE_PEAKS.length;
+
+// 2. Detector zoom-coupled d-spacing LOD at d_min = 2.15 A (> 800 reflections on 800x520 canvas)
+state.detZoom = 1.0;
+state.hoveredPeakId = null;
+state.selectedPeakId = null;
+state.activeOrbitId = null;
+const allVisZ1 = getVisibleDetectorPeaks();
+const lodZ1 = {{ ...getDetectorLodState(800, 520) }};
+detLog.texts.length = 0;
+renderDetectorCanvas(true);
+const hudTextsZ1 = [...detLog.texts];
+
+// Pick a reflection finer than lodZ1.lodDcut: must NOT be hit-tested at detZoom=1.0 unless pinned!
+const hiddenOuterPeak = allVisZ1.find(p => p.d_spacing < lodZ1.lodDcut - 0.08);
+const hiddenOuterPeakId = hiddenOuterPeak ? hiddenOuterPeak.id : null;
+let hitHiddenUnpinned = null;
+let hitHiddenWhenPinned = null;
+if (hiddenOuterPeak) {{
+  const [sxH, syH] = detToScreen(hiddenOuterPeak.det_x, getPeakVert(hiddenOuterPeak), 800, 520, 0.45);
+  const hit0 = findNearestPeakDetector(sxH, syH);
+  hitHiddenUnpinned = hit0 ? hit0.id : null;
+  state.selectedPeakId = hiddenOuterPeak.id;
+  state.selectedPeakObj = hiddenOuterPeak;
+  const lodPinned = {{ ...getDetectorLodState(800, 520) }};
+  const pinnedIncluded = lodPinned.visiblePeaks.some(p => p.id === hiddenOuterPeak.id);
+  const hit1 = findNearestPeakDetector(sxH, syH);
+  hitHiddenWhenPinned = Boolean(pinnedIncluded && hit1 && hit1.id === hiddenOuterPeak.id);
+  state.selectedPeakId = null;
+  state.selectedPeakObj = null;
+}}
+
+state.detZoom = 2.0;
+const lodZ2 = {{ ...getDetectorLodState(800, 520) }};
+state.detZoom = 6.0;
+const lodZ6 = {{ ...getDetectorLodState(800, 520) }};
+state.detZoom = 1.0;
+
+// 3. Widening wavelength #inp-lam-min from 2.8 -> 2.0 A dynamically adds shorter-lambda spots
+inpLamMinNode.value = "2.00";
+inpLamMinNode.dispatchEvent({{ type: "input", target: inpLamMinNode }});
+const pred215WideWlCount = PEAKS.length;
+const minWlObserved = PEAKS.reduce((m, p) => Math.min(m, p.wavelength), Infinity);
+
+// 4. Load huge macromolecular flat-panel MANDI payload (135 x 150 x 210 A) via recomputeBoundsAndReload
+const mandiPayload = {json.dumps(mandi_payload)};
+recomputeBoundsAndReload(mandiPayload, {{ resetSelectedFrame: true }});
+const hugeCellFloor = getDynamicDminFloor();
+slDminEl.value = "3.80";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+const mandiPred380 = PEAKS.map(p => ({{
+  bank: p.bank,
+  hkl: p.hkl,
+  row: p.row,
+  col: p.col,
+}}));
+
+require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
+  protFloor,
+  sliderMinAttr,
+  clampedBelowFloor,
+  initialPeakSource,
+  initialIntegCount,
+  initialPredCount,
+  sourceBeforeDrag,
+  sourceAfterDragBelowInteg,
+  colorModeBeforeDrag,
+  colorModeAfterDragBelowInteg,
+  pred215,
+  sampleRunsAt215,
+  sampleCountAt215,
+  lodZ1: {{
+    lodActive: lodZ1.isLodThinned,
+    lodDMin: lodZ1.lodDcut,
+    shownCount: lodZ1.visiblePeaks.length,
+    totalCount: lodZ1.totalCount,
+  }},
+  lodZ2: {{
+    lodActive: lodZ2.isLodThinned,
+    lodDMin: lodZ2.lodDcut,
+    shownCount: lodZ2.visiblePeaks.length,
+    totalCount: lodZ2.totalCount,
+  }},
+  lodZ6: {{
+    lodActive: lodZ6.isLodThinned,
+    lodDMin: lodZ6.lodDcut,
+    shownCount: lodZ6.visiblePeaks.length,
+    totalCount: lodZ6.totalCount,
+  }},
+  hudHasLodPill: hudTextsZ1.some(t => t.includes("LOD d ≥") && t.includes("zoom+")),
+  hiddenOuterPeakId,
+  hitHiddenUnpinned,
+  hitHiddenWhenPinned,
+  pred215WideWlCount,
+  minWlObserved,
+  hugeCellFloor,
+  mandiPred380,
+}}));
+}})();
+process.exit(0);
+""",
+        encoding="utf-8",
+    )
+
+    subprocess.run(["node", str(js_file)], capture_output=True, text=True, check=True)
+    out = json.loads(out_json_path.read_text(encoding="utf-8"))
+
+    # A. Verify finite unit-cell-volume-aware d_min safety floor scaling
+    assert 0.90 <= out["protFloor"] <= 1.20
+    assert abs(out["sliderMinAttr"] - out["protFloor"]) < 1e-6
+    assert abs(out["clampedBelowFloor"] - out["protFloor"]) < 1e-6
+    assert out["hugeCellFloor"] > out["protFloor"] + 1.0
+    assert 2.20 <= out["hugeCellFloor"] <= 2.80
+
+    # B. Verify auto-switch from 'integrated' -> 'predicted' when dragging d_min below integrated cutoff
+    assert out["initialPeakSource"] == "integrated"
+    assert out["initialIntegCount"] == 6
+    assert out["initialPredCount"] == len(payload["predicted_peaks"])
+    assert out["sourceBeforeDrag"] == "integrated"
+    assert out["sourceAfterDragBelowInteg"] == "predicted"
+    assert out["colorModeBeforeDrag"] == "isigi"
+    assert out["colorModeAfterDragBelowInteg"] == "wavelength"
+
+    # C. Verify exact 1:1 HKL + pixel + Gemmi ASU/Bijvoet parity on curved cylindrical CG4D at d_min = 2.15 A
+    py_by_hkl = {
+        (int(ht[0]), int(ht[3]), int(ht[4]), int(ht[5])): ht for ht in py_cast_215
+    }
+    js_by_hkl = {
+        (int(p["bank"]), int(p["hkl"][0]), int(p["hkl"][1]), int(p["hkl"][2])): p
+        for p in out["pred215"]
+    }
+    assert set(js_by_hkl.keys()) == set(py_by_hkl.keys())
+    max_px_err = 0.0
+    preserved_inner_integ = 0
+    outer_mtz_matched = 0
+    for key, js_p in js_by_hkl.items():
+        _, h, k, l = key
+        assert not is_absent(h, k, l), f"Systematic absence leaked: {(h, k, l)}"
+        py_ht = py_by_hkl[key]
+        px_err = max(abs(js_p["row"] - py_ht[1]), abs(js_p["col"] - py_ht[2]))
+        max_px_err = max(max_px_err, px_err)
+        ah, ak, al, _, bij_p = asu_map(h, k, l)
+        assert js_p["orbit"] == f"{ah},{ak},{al}"
+        assert js_p["bijvoet"] == bij_p
+        if js_p.get("isigi") is not None and js_p.get("hasEllipse"):
+            preserved_inner_integ += 1
+        if (
+            js_p["d"] < 3.0
+            and js_p.get("mtzIsigi") is not None
+            and js_p["mtzIsigi"] > 10.0
+        ):
+            outer_mtz_matched += 1
+    assert max_px_err < 0.06
+    assert preserved_inner_integ == 6
+    assert outer_mtz_matched >= 10
+
+    # Multi-run Wulff PREDICTED_SAMPLE_PEAKS dynamically updated across both runs [0, 1]
+    assert out["sampleRunsAt215"] == [0, 1]
+    assert out["sampleCountAt215"] > len(py_cast_215)
+
+    # D. Verify widening wavelength [2.8, 4.5] -> [2.0, 4.5] matches Python raycaster count & min wavelength
+    assert out["pred215WideWlCount"] == len(py_cast_215_wide_wl)
+    assert 2.0 <= out["minWlObserved"] < 2.2
+
+    # E. Verify Detector zoom-coupled d-spacing LOD thinning, progressive zoom unlocking, HUD pill, and hit-testing
+    lod1, lod2, lod6 = out["lodZ1"], out["lodZ2"], out["lodZ6"]
+    assert lod1["totalCount"] == len(py_cast_215)
+    assert lod1["lodActive"] is True
+    assert lod1["shownCount"] < lod1["totalCount"]
+    assert lod1["shownCount"] <= 500
+    assert lod1["lodDMin"] > 2.25
+    assert out["hudHasLodPill"] is True
+    assert lod2["shownCount"] > lod1["shownCount"]
+    assert lod2["lodDMin"] <= lod1["lodDMin"]
+    assert lod6["lodActive"] is False
+    assert lod6["shownCount"] == lod6["totalCount"]
+    assert abs(lod6["lodDMin"] - 2.15) < 1e-3
+    assert out["hiddenOuterPeakId"] is not None
+    assert out["hitHiddenUnpinned"] != out["hiddenOuterPeakId"]
+    assert out["hitHiddenWhenPinned"] is True
+
+    # F. Verify flat-panel MANDI dynamic re-prediction matches Python _raycast_hkl_on_detectors 1:1
+    py_mandi_map = {
+        (int(ht[0]), int(ht[3]), int(ht[4]), int(ht[5])): ht for ht in py_mandi_380
+    }
+    js_mandi_map = {
+        (int(p["bank"]), int(p["hkl"][0]), int(p["hkl"][1]), int(p["hkl"][2])): p
+        for p in out["mandiPred380"]
+    }
+    assert set(js_mandi_map.keys()) == set(py_mandi_map.keys())
+    for key, js_mp in js_mandi_map.items():
+        py_mht = py_mandi_map[key]
+        assert abs(js_mp["row"] - py_mht[1]) < 0.06
+        assert abs(js_mp["col"] - py_mht[2]) < 0.06
+
+
+def test_edge_mask_overlay_and_mandi_default_border(tmp_path):
+    """MANDI defaults rel_border_width to 0.06 (6%), CG4D to 0.03 (3%), and Mask view renders the live edge frame."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        default_rel_border_for_instrument,
+        render_rainbow_html,
+    )
+
+    assert default_rel_border_for_instrument("MANDI") == 0.06
+    assert default_rel_border_for_instrument("CG4D") == 0.03
+
+    mandi_h5 = tmp_path / "mandi_edge_test.h5"
+    with h5py.File(mandi_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["images"] = np.ones((1, 256, 256), dtype=np.float32) * 10.0
+        hf["bank_ids"] = np.array([20], dtype=np.int32)
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=np.float32)
+
+    p_mandi = build_rainbow_zone_payload(
+        replay_h5=mandi_h5, instrument="MANDI", include_panel_images=False
+    )
+    b20 = next(pn for pn in p_mandi["panels"] if pn["bank"] == 20)
+    assert b20["n_rows"] == 256 and b20["n_cols"] == 256
+
+    html_mandi = render_rainbow_html(p_mandi)
+    assert 'id="lbl-mask-edge"' in html_mandi
+    assert "Edge 6.0%" in html_mandi
+    assert (
+        'id="inp-border" type="number" min="0" max="0.25" step="0.005" value="0.06"'
+        in html_mandi
+    )
+
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_mandi)
+        inline_js = script_blocks[-1]
+        js_check = tmp_path / "edge_mask_inline.js"
+        js_check.write_text(inline_js, encoding="utf-8")
+        subprocess.run(["node", "--check", str(js_check)], check=True)
+
+        fn_names = [
+            "defaultRelBorderForInstrument",
+            "getActiveRelBorderWidth",
+            "getBorderMaskCanvas",
+            "hasPixelMask",
+            "syncPixelMaskUI",
+        ]
+        extracted = []
+        for fn_name in fn_names:
+            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            assert m is not None, f"Missing JS function {fn_name}"
+            start = m.start()
+            depth = 0
+            in_body = False
+            end = start
+            for idx in range(start, len(inline_js)):
+                ch = inline_js[idx]
+                if ch == "{":
+                    depth += 1
+                    in_body = True
+                elif ch == "}":
+                    depth -= 1
+                    if in_body and depth == 0:
+                        end = idx + 1
+                        break
+            extracted.append(inline_js[start:end])
+
+        harness = f"""
+const borderMaskCache = new Map();
+const maskBankCanvases = new Map();
+const PANELS = [{{ bank: 20, n_rows: 256, n_cols: 256 }}];
+const DATA = {{ instrument: "MANDI", em_mask_summary: {{ available: false }} }};
+const state = {{ showPixelMask: true }};
+const domEls = {{
+  "inp-border": {{ value: "0.06" }},
+  "btn-pixel-mask": {{ style: {{}}, title: "", classList: {{ toggle() {{}} }} }},
+  "mask-legend-row": {{ style: {{}} }},
+  "lbl-mask-dark": {{ textContent: "" }},
+  "lbl-mask-bright": {{ textContent: "" }},
+  "lbl-mask-edge": {{ textContent: "" }},
+}};
+globalThis.document = {{
+  getElementById: (id) => domEls[id] || null,
+  createElement: () => {{
+    const ops = [];
+    const ctx = {{
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 1,
+      clearRect() {{}},
+      setLineDash() {{}},
+      fillRect(...a) {{ ops.push(["fillRect", ...a]); }},
+      strokeRect(...a) {{ ops.push(["strokeRect", ...a]); }},
+    }};
+    return {{ width: 0, height: 0, ops, getContext: () => ctx }};
+  }},
+}};
+
+{chr(10).join(extracted)}
+
+const c06 = getBorderMaskCanvas(PANELS[0], getActiveRelBorderWidth());
+syncPixelMaskUI();
+const edgeTxt06 = domEls["lbl-mask-edge"].textContent;
+domEls["inp-border"].value = "0.08";
+const c08 = getBorderMaskCanvas(PANELS[0], getActiveRelBorderWidth());
+syncPixelMaskUI();
+const edgeTxt08 = domEls["lbl-mask-edge"].textContent;
+
+console.log(JSON.stringify({{
+  w: c06.width,
+  h: c06.height,
+  topBandH06: c06.ops[0][4],
+  topBandH08: c08.ops[0][4],
+  edgeTxt06,
+  edgeTxt08,
+  btnOpacity: domEls["btn-pixel-mask"].style.opacity,
+}}));
+"""
+        hf_js = tmp_path / "edge_mask_harness.js"
+        hf_js.write_text(harness, encoding="utf-8")
+        res = subprocess.run(
+            ["node", str(hf_js)], check=True, capture_output=True, text=True
+        )
+        out = json.loads(res.stdout.strip())
+        assert out["w"] == 256 and out["h"] == 256
+        assert out["topBandH06"] == 15  # round(0.06 * 256) == 15 px
+        assert out["topBandH08"] == 20  # round(0.08 * 256) == 20 px
+        assert out["edgeTxt06"] == "Edge 6.0% (15px)"
+        assert out["edgeTxt08"] == "Edge 8.0% (20px)"
+        assert out["btnOpacity"] == "1"
+
+
+def test_textures_only_fast_path_and_vectorized_flat_raycast(tmp_path):
+    """Hi-Res textures_only=1 skips HKL/zone rebuilds, vectorized flat-panel raycast matches Detector 1:1, and status poll deduplicates overlay_seq."""
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import (
+        cartesian_matrix_metric_tensor,
+        generate_reflections,
+    )
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.nova_app.views.main_view import MainApp
+    from subhkl.viz.rainbow_zones import (
+        _raycast_hkl_on_detectors,
+        build_rainbow_panel_textures_only,
+        build_rainbow_zone_payload,
+    )
+
+    # 1. Vectorized flat-panel raycaster exact parity against Detector.reflections_mask + pixel_to_lab
+    mandi_dets = {
+        int(bk): Detector(dict(cfg)) for bk, cfg in list(beamlines["MANDI"].items())[:8]
+    }
+    cell = [68.0, 74.0, 92.0, 90.0, 90.0, 90.0]
+    B_mat_raw, _ = cartesian_matrix_metric_tensor(*cell[:3], *np.deg2rad(cell[3:]))
+    B_mat = np.asarray(B_mat_raw, dtype=float)
+    U_mat = Rotation.from_euler("zyx", [19.0, -31.0, 44.0], degrees=True).as_matrix()
+    R_mat = Rotation.from_euler("y", 17.5, degrees=True).as_matrix()
+    RUB = R_mat @ U_mat @ B_mat
+    sample_off = np.array([0.0012, -0.0008, 0.0021], dtype=float)
+    margin = 0.06
+    hkls = np.stack(
+        generate_reflections(*cell, space_group="P 21 21 21", d_min=2.4),
+        axis=1,
+    ).astype(int)
+
+    vec_out = _raycast_hkl_on_detectors(
+        hkls,
+        U_mat,
+        B_mat,
+        R_mat,
+        mandi_dets,
+        (2.0, 4.0),
+        active_bids=set(mandi_dets.keys()),
+        margin_frac=margin,
+        sample_offset_lab=sample_off,
+    )
+    assert len(vec_out["peaks_xyz"]) > 10
+
+    # Reference per-bank Detector calculation
+    ki_vec = np.array([0.0, 0.0, 1.0], dtype=float)
+    G = hkls.astype(float) @ RUB.T
+    qn = np.linalg.norm(G, axis=1)
+    sth = -(G @ ki_vec) / np.maximum(qn, 1e-12)
+    lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
+    in_wl = (qn > 1e-8) & (sth > 1e-5) & (lam_pred >= 2.0) & (lam_pred <= 4.0)
+    cand_idx = np.flatnonzero(in_wl)
+    kf_dir = ki_vec[None, :] + lam_pred[cand_idx, None] * G[cand_idx]
+    kf_hat = kf_dir / np.maximum(np.linalg.norm(kf_dir, axis=1, keepdims=True), 1e-12)
+
+    ref_by_key = {}
+    for bk, det in sorted(mandi_dets.items()):
+        hit_m, rows, cols = det.reflections_mask(
+            kf_hat[:, 0], kf_hat[:, 1], kf_hat[:, 2], sample_offset=sample_off
+        )
+        r_span = max(float(det.n - 1), 1.0)
+        c_span = max(float(det.m - 1), 1.0)
+        hit_m = (
+            hit_m
+            & (rows >= margin * r_span)
+            & (rows <= (1.0 - margin) * r_span)
+            & (cols >= margin * c_span)
+            & (cols <= (1.0 - margin) * c_span)
+        )
+        for loc in np.flatnonzero(hit_m):
+            gi = int(cand_idx[loc])
+            r_px = float(rows[loc])
+            c_px = float(cols[loc])
+            xyz_ref = np.asarray(det.pixel_to_lab(r_px, c_px), dtype=float).reshape(3)
+            h, k, l = int(hkls[gi, 0]), int(hkls[gi, 1]), int(hkls[gi, 2])
+            ref_by_key[(bk, h, k, l)] = (r_px, c_px, xyz_ref)
+
+    vec_by_key = {
+        (
+            int(vec_out["bank"][i]),
+            int(vec_out["hkl"][i, 0]),
+            int(vec_out["hkl"][i, 1]),
+            int(vec_out["hkl"][i, 2]),
+        ): (
+            float(vec_out["pixel_r"][i]),
+            float(vec_out["pixel_c"][i]),
+            np.asarray(vec_out["peaks_xyz"][i], dtype=float),
+        )
+        for i in range(len(vec_out["peaks_xyz"]))
+    }
+    assert set(vec_by_key.keys()) == set(ref_by_key.keys())
+    for key, (r_v, c_v, xyz_v) in vec_by_key.items():
+        r_ref, c_ref, xyz_ref = ref_by_key[key]
+        assert abs(r_v - r_ref) < 1e-11
+        assert abs(c_v - c_ref) < 1e-11
+        assert np.max(np.abs(xyz_v - xyz_ref)) < 1e-13
+
+    # 2. Build multi-frame MANDI HDF5 + verify build_rainbow_panel_textures_only & /api/payload?textures_only=1
+    mandi_h5 = tmp_path / "mandi_tex_fast.h5"
+    rng = np.random.default_rng(42)
+    imgs = rng.poisson(12.0, size=(2, 256, 256)).astype(np.float32)
+    imgs[0, 120:128, 130:138] += 250.0
+    imgs[1, 60:68, 80:88] += 300.0
+    with h5py.File(mandi_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["images"] = imgs
+        hf["bank_ids"] = np.array([20, 20], dtype=np.int32)
+        hf["file_offsets"] = np.array([0, 1, 2], dtype=np.int32)
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=np.float32)
+
+    full_hi = build_rainbow_zone_payload(
+        replay_h5=mandi_h5,
+        images_h5=mandi_h5,
+        instrument="MANDI",
+        render_binning=1,
+        frame_index=1,
+    )
+    tex_only_hi = build_rainbow_panel_textures_only(
+        replay_h5=mandi_h5,
+        images_h5=mandi_h5,
+        instrument="MANDI",
+        render_binning=1,
+        frame_index=1,
+    )
+    assert set(tex_only_hi.keys()) == {
+        "render_binning",
+        "frame_index",
+        "intensity_source",
+        "panels",
+    }
+    assert tex_only_hi["render_binning"] == 1
+    assert tex_only_hi["frame_index"] == 1
+    b20_full = next(p for p in full_hi["panels"] if p["bank"] == 20)
+    b20_fast = next(p for p in tex_only_hi["panels"] if p["bank"] == 20)
+    assert "grid_s" not in b20_fast
+    assert b20_fast["texture_b64"] == b20_full["texture_b64"]
+
+    # 3. Verify MainApp lock-free /api/payload?textures_only=1 and /api/pipeline/status?poll=1&overlay_seq=...
+    app_inst = object.__new__(MainApp)
+    app_inst.pipeline_runner = MagicMock()
+    app_inst.pipeline_runner.is_connected = False
+    app_inst.pipeline_runner.galaxy_url = ""
+    app_inst.pipeline_runner.history_id = None
+    app_inst.pipeline_runner.list_history_datasets.return_value = []
+    app_inst.pipeline_runner.list_step_artifacts.return_value = []
+    app_inst.pipeline_runner.get_step_timings_snapshot.return_value = {}
+    app_inst.pipeline_runner.active_job = {
+        "step": "solve",
+        "state": "running",
+        "partial_overlay": {
+            "seq": 7,
+            "frame_index": 1,
+            "predicted_peaks": [{"hkl": [1, 2, 3]}],
+        },
+    }
+    sub_m = SubhklGalaxyModel()
+    sub_m.data.instrument = "MANDI"
+    sub_m.data.images_file = str(mandi_h5)
+    sub_m.data.peaks_file = str(mandi_h5)
+    sub_m.frame_index = 1
+    sub_m.render_binning = 4
+    sub_m.payload = build_rainbow_zone_payload(
+        replay_h5=mandi_h5,
+        images_h5=mandi_h5,
+        instrument="MANDI",
+        render_binning=4,
+        frame_index=1,
+    )
+    app_inst.view_model = SimpleNamespace(model=SimpleNamespace(subhkl=sub_m))
+    aio_app = web.Application()
+    app_inst._bind_routes(SimpleNamespace(app=aio_app))
+
+    req_tex = make_mocked_request(
+        "GET",
+        "/api/payload?frame=1&render_binning=1&textures_only=1",
+        app=aio_app,
+    )
+    resp_tex = asyncio.run(aio_app._handle(req_tex))
+    assert resp_tex.status == 200
+    doc_tex = json.loads(resp_tex.body.decode("utf-8"))
+    assert "predicted_peaks" not in doc_tex
+    assert doc_tex["render_binning"] == 1
+    assert sub_m.render_binning == 1
+    # Cached model payload for frame 1 should also be upgraded in-place to Hi-Res texture
+    b20_cached = next(p for p in sub_m.payload["panels"] if p["bank"] == 20)
+    assert b20_cached["texture_b64"] == b20_full["texture_b64"]
+
+    # Poll status with matching overlay_seq=7 -> lightweight unchanged stub
+    req_st_same = make_mocked_request(
+        "GET",
+        "/api/pipeline/status?frame=1&poll=1&overlay_seq=7",
+        app=aio_app,
+    )
+    resp_st_same = asyncio.run(aio_app._handle(req_st_same))
+    doc_st_same = json.loads(resp_st_same.body.decode("utf-8"))
+    assert doc_st_same["active_job"]["partial_overlay"] == {
+        "seq": 7,
+        "frame_index": 1,
+        "unchanged": True,
+    }
+
+    # Poll status with older overlay_seq=6 -> full partial_overlay delivered
+    req_st_old = make_mocked_request(
+        "GET",
+        "/api/pipeline/status?frame=1&poll=1&overlay_seq=6",
+        app=aio_app,
+    )
+    resp_st_old = asyncio.run(aio_app._handle(req_st_old))
+    doc_st_old = json.loads(resp_st_old.body.decode("utf-8"))
+    assert "unchanged" not in doc_st_old["active_job"]["partial_overlay"]
+    assert len(doc_st_old["active_job"]["partial_overlay"]["predicted_peaks"]) == 1

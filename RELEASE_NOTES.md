@@ -4,6 +4,94 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.9]
+
+### Added
+
+- Segmented `Pred` / `Integ` peak overlay modes and direct `.mtz` reflection
+  inspection in Rainbow Zones (`subhkl-nova-app` and `rainbow-visualize`):
+  - Switch between unfiltered predicted Bragg circles (`Pred`, loaded from
+    companion `predictor.h5`, unfiltered `integrated.h5`, or live `UB`
+    raycast) and SNR-filtered integrated $2\sigma$ ellipses (`Integ`), with
+    mode-distinct intensity highlight palettes (Sky-Cyan/Aqua for `Pred` vs.
+    Solar Gold/Chartreuse-Lime for `Integ`) and a live transparency-checkerboard
+    `Colorscale` crossover slider.
+  - Load external `.mtz` files from disk or Galaxy History once `U` is solved,
+    forward-projecting `.mtz` $(h,k,l)$ reflections through the full calibrated
+    detector and goniometer geometry (keeping solved `B` and space group
+    authoritative with mismatch warnings), coloring by `.mtz I/σ`, and
+    persisting `.mtz` overlays across frame switches and `Solve` $\to$
+    `Integrate` $\to$ `Merge` transitions.
+- Dynamic client-side $d_{\min}$ and $[\lambda_{\min}, \lambda_{\max}]$ peak
+  re-prediction with zoom-coupled level-of-detail (LOD) thinning:
+  - Re-predicts reflections interactively in the browser past the initial
+    indexing/integration cutoff using exact Gemmi space-group
+    systematic-absence, ASU, and Bijvoet rules on flat and curved cylindrical
+    detectors, guarded by a unit-cell-volume-aware lower $d_{\min}$ floor.
+  - Couples zoom level to a progressive $d$-spacing LOD cutoff on both the 3D
+    Wulff stereogram and 2D Detector view with live HUD badges and LOD-aware
+    hover/click hit-testing.
+- Acentric Bijvoet and Friedel mate highlighting across Detector and Wulff
+  views, computing signed acentric Bijvoet hand ($\pm 1$ for $I^+/I^-$, $0$ for
+  centric zones and centrosymmetric space groups) with pink (`#ff4db8`) hover
+  rings, `[Bijvoet]` labels, status-bar `±Bijvoet` badges, and antipodal
+  Friedel diamond markers (`-h,-k,-l`).
+- `Hi-Res` detector microscope toggle switching between $4\times$-binned
+  preview and native $1\times$ pixel textures via a lock-free
+  `/api/payload?textures_only=1` fast path (`build_rainbow_panel_textures_only`)
+  and `h5wasm` client fallback, plus live coral-amber detector border frames in
+  the `Mask` view (`6%` default `rel_border_width` on `MANDI`/`TOPAZ`/`SNAP`,
+  `3%` elsewhere).
+- Physical vanadium spectral calibration (`--spectral-file` with
+  `--trainable-spectral-scale`) and `--lorentz-correction` support in the NOVA
+  Careless merge runner alongside `--disable-image-scales`,
+  `--wilson-prior-b=40.0`, and clean `WAVEL,THETA,PHI,RUN` metadata columns.
+
+### Changed
+
+- Improved weak-reflection integration, backscattering-shadow masking, and
+  high-resolution merging:
+  - Added cross-bank same-$2\theta$ peer-ring dark-floor normalization in
+    `PixelEMClassifier` to mask whole- and partial-panel shadows, and wired
+    `detector/pixel_mask` loading directly from `solve.h5`.
+  - Gated sub-pixel centroid snapping by matched-filter SNR, excluded detector
+    border pixels from background and Poisson likelihoods, rejected heavily
+    occluded footprints ($<65\%$ valid weight), raised default
+    `shape_fit_min_snr` to `5.0`, and added `--allow-negative` 1-step
+    Fisher-scoring signed intensities for unbiased Careless merging.
+- Accelerated multi-run visualization, NDIP staging, and detector rendering:
+  - Vectorized flat-panel `_raycast_hkl_on_detectors` across all active banks,
+    projected multi-run `All-Runs` Wulff peaks immediately after finder-less
+    `Solve`, cached HKL generation and multi-run projections across frame
+    switches, deduplicated unchanged `partial_overlay` status polls via
+    `overlay_seq`, and defaulted BLAS/OMP thread counts to `1` in
+    `subhkl-nova-app`.
+  - Streamed multi-GB Galaxy `merged.h5` downloads with live progress,
+    eliminated redundant temp copies via hardlinks, batched 3D NumPy panel
+    binning, and ran blocking HTTP payload/status handlers via
+    `asyncio.to_thread`.
+  - Gated parallax strictly on held modifier keys (`Ctrl`/`Shift`/`Alt`/`Meta`
+    without mouse buttons) with a wider rubber-band excursion, and rendered
+    detector bank textures directly from native $(u,v)$ pixel coordinates with
+    adaptive supersampling to eliminate tile aliasing.
+
+### Fixed
+
+- Preserved $\ge 32 \times 32$ bins per panel in `solve --refinement band`
+  default binning (`default_band_binning()`, capped at `8`), removing the
+  $>240$-panel switch to `binning=16` that collapsed $256 \times 256$
+  `MANDI`/`TOPAZ` panels to $16 \times 16$ bins and aliased macromolecular Laue
+  zones.
+- Fixed right-handed $SO(3)$ Wulff camera projection and centered detector
+  azimuth ($\chi$) coupling, and computed exact space-group-aware in-band Laue
+  harmonic multiplicity without forbidden centered half-indices.
+- Propagated refined `goniometer/{angles,R,harmonics}` into `integrated.h5`,
+  accepted uploaded `.mtz` datasets typed as `binary` in Galaxy Stage 4
+  Careless discovery, hoisted early colorscale constants above initial script
+  boot so `Data Sources` binds cleanly, and reclaimed JAX XLA caches and glibc
+  arenas between `test_sparse_rbf_integrator.py` runs to prevent 16 GiB CI OOM
+  kills.
+
 ## [1.5.8]
 
 ### Added

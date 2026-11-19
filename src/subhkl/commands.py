@@ -1455,12 +1455,13 @@ def run_rbf_integrator(
     mosaicity_radial: bool = False,
     shape_spherical: bool = False,
     mosaicity_bound_mrad: float = 10.0,
-    shape_fit_min_snr: float = 0.0,
+    shape_fit_min_snr: float = 5.0,
     shape_fit_normalized: bool = False,
     matrix_free_profile: str = "gaussian",
     matrix_free_fp_target: float | None = None,
     static_mask_file: str | None = None,
     rel_border_width: float = 0.03,
+    allow_negative: bool = False,
     show_progress: bool = True,
     create_visualizations: bool = False,
     chunk_size: int = 256,
@@ -1541,6 +1542,7 @@ def run_rbf_integrator(
         matrix_free_fp_target=matrix_free_fp_target,
         static_mask_file=static_mask_file,
         border_width=border_width,
+        allow_negative=allow_negative,
         chunk_size=chunk_size,
         create_visualizations=create_visualizations,
         file_prefix=filename,
@@ -1592,8 +1594,14 @@ def run_rbf_integrator(
             for key in copy_keys:
                 if key in f_in:
                     f_in.copy(f_in[key], f, key)
-            for k in ["goniometer/axes", "goniometer/names"]:
-                if k in f_in:
+            for k in [
+                "goniometer/axes",
+                "goniometer/names",
+                "goniometer/angles",
+                "goniometer/R",
+                "goniometer/harmonics",
+            ]:
+                if k in f_in and k not in f:
                     f_in.copy(f_in[k], f, k)
             # The refined panels travel with the peaks they positioned: the
             # predictor already carries the group forward, and without the

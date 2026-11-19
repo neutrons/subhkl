@@ -32,6 +32,14 @@ from datetime import UTC
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
+for _thr_var in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thr_var, "1")
+
 import numpy as np
 
 from subhkl import get_container_image
@@ -324,6 +332,18 @@ class NovaGalaxyPipelineRunner:
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 from subhkl.viz.rainbow_zones import build_rainbow_zone_payload
 
+                raw_dmin_live = (
+                    float(sp["d_min"])
+                    if sp.get("d_min")
+                    else (float(payload["d_min"]) if payload.get("d_min") else None)
+                )
+                # Cap intermediate live-solve preview reflections to >= 2.0 A on the
+                # active frame so multi-run high-resolution solves stay responsive.
+                live_dmin = (
+                    max(2.0, raw_dmin_live)
+                    if raw_dmin_live is not None and raw_dmin_live > 0
+                    else None
+                )
                 p_blind = build_rainbow_zone_payload(
                     replay_h5=partial_h5,
                     images_h5=(
@@ -341,16 +361,13 @@ class NovaGalaxyPipelineRunner:
                         or payload.get("wavelength_range")
                         or (2.0, 4.5)
                     ),
-                    d_min=(
-                        float(sp["d_min"])
-                        if sp.get("d_min")
-                        else (float(payload["d_min"]) if payload.get("d_min") else None)
-                    ),
+                    d_min=live_dmin,
                     max_zone_index=3,
                     max_zones=60,
                     include_panels=True,
                     include_panel_images=False,
                     include_peaks=True,
+                    include_all_runs_peaks=False,
                     n_arc=720,
                     frame_index=target_frame,
                 )
@@ -749,6 +766,201 @@ class NovaGalaxyPipelineRunner:
                 return body
             return json.loads(body.decode("utf-8"))
 
+    @staticmethod
+    def _link_or_copy_file(src: str, dst: str, *, allow_hardlink: bool = True) -> None:
+        """Atomically stage ``src`` at ``dst``, preferring zero-copy ``os.link`` inside temp/work dirs."""
+        abs_s = os.path.abspath(src)
+        abs_d = os.path.abspath(dst)
+        if abs_s == abs_d:
+            return
+        if os.path.isfile(abs_d):
+            with contextlib.suppress(OSError):
+                if os.path.samefile(abs_s, abs_d):
+                    return
+        parent_d = os.path.dirname(abs_d)
+        if parent_d:
+            os.makedirs(parent_d, exist_ok=True)
+        tmp_dst = f"{abs_d}.stage.{os.getpid()}.{threading.get_ident()}"
+        tmp_root = os.path.abspath(tempfile.gettempdir())
+        can_link = (
+            allow_hardlink
+            and (
+                abs_s.startswith(tmp_root + os.sep)
+                or os.path.dirname(abs_s) == parent_d
+            )
+            and os.access(abs_s, os.W_OK)
+        )
+        try:
+            if os.path.lexists(tmp_dst):
+                os.remove(tmp_dst)
+            if can_link:
+                try:
+                    os.link(abs_s, tmp_dst)
+                    os.replace(tmp_dst, abs_d)
+                    return
+                except OSError:
+                    if os.path.lexists(tmp_dst):
+                        with contextlib.suppress(OSError):
+                            os.remove(tmp_dst)
+            shutil.copy2(abs_s, tmp_dst)
+            os.replace(tmp_dst, abs_d)
+        finally:
+            if os.path.lexists(tmp_dst):
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_dst)
+
+    def _galaxy_has_datatype(self, ext: str) -> bool:
+        """Return True if the connected Galaxy instance registers ``ext`` in ``/api/datatypes``."""
+        target = str(ext or "").strip().lower().lstrip(".")
+        if not target or not self.galaxy_url:
+            return False
+        cached = getattr(self, "_cached_galaxy_datatypes", None)
+        if isinstance(cached, set):
+            return target in cached
+        dtypes: set[str] = set()
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            res = self._api_request("GET", "/api/datatypes", timeout=8.0)
+            if isinstance(res, list):
+                dtypes = {
+                    str(x).strip().lower().lstrip(".")
+                    for x in res
+                    if isinstance(x, (str, int)) and str(x).strip()
+                }
+                self._cached_galaxy_datatypes = dtypes
+        return target in dtypes
+
+    @staticmethod
+    def _set_stream_progress_line(
+        job_record: dict[str, Any] | None, marker: str, line_text: str
+    ) -> None:
+        if not isinstance(job_record, dict):
+            return
+        cur = str(job_record.get("stdout") or "")
+        kept = [ln for ln in cur.splitlines() if marker not in ln]
+        if line_text:
+            kept.append(line_text)
+        job_record["stdout"] = ("\n".join(kept) + "\n") if kept else ""
+
+    def _download_dataset_to_file(
+        self,
+        ds_id: str,
+        dest_path: str,
+        *,
+        job_record: dict[str, Any] | None = None,
+        label: str = "",
+        ds_info: dict[str, Any] | None = None,
+        timeout: float = 240.0,
+    ) -> int:
+        """Stream a Galaxy dataset directly to ``dest_path`` without buffering hundreds of MB in RAM."""
+        disp_lbl = label or os.path.basename(dest_path) or str(ds_id)
+        info_doc = ds_info if isinstance(ds_info, dict) else None
+        if info_doc is None and "_api_request" not in self.__dict__:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                fetched = self._api_request(
+                    "GET", f"/api/datasets/{ds_id}", timeout=10.0
+                )
+                if isinstance(fetched, dict):
+                    info_doc = fetched
+
+        if isinstance(info_doc, dict):
+            shared_fn = str(info_doc.get("file_name") or "").strip()
+            if (
+                shared_fn
+                and os.path.isfile(shared_fn)
+                and os.path.getsize(shared_fn) > 0
+            ):
+                # Copy (never hard-link external Galaxy object-store files) so local HDF5 stamping is safe
+                self._link_or_copy_file(shared_fn, dest_path, allow_hardlink=False)
+                return os.path.getsize(dest_path)
+
+        parent_d = os.path.dirname(os.path.abspath(dest_path))
+        if parent_d:
+            os.makedirs(parent_d, exist_ok=True)
+        part_path = (
+            f"{os.path.abspath(dest_path)}.part.{os.getpid()}.{threading.get_ident()}"
+        )
+
+        # Preserve compatibility when unit tests monkeypatch instance ``_api_request`` directly
+        if "_api_request" in self.__dict__:
+            raw_bytes = self._api_request(
+                "GET",
+                f"/api/datasets/{ds_id}/display",
+                raw=True,
+                timeout=timeout,
+            )
+            if not raw_bytes:
+                return 0
+            try:
+                with open(part_path, "wb") as fh:
+                    fh.write(raw_bytes)
+                os.replace(part_path, dest_path)
+            finally:
+                if os.path.lexists(part_path):
+                    with contextlib.suppress(OSError):
+                        os.remove(part_path)
+            return len(raw_bytes)
+
+        if not self.galaxy_url:
+            raise RuntimeError("GALAXY_URL is not configured.")
+        key = self.galaxy_api_key
+        path = f"/api/datasets/{ds_id}/display"
+        sep = "&" if "?" in path else "?"
+        url = f"{self.galaxy_url}{path}"
+        if key:
+            url = f"{url}{sep}key={urllib.parse.quote(key)}"
+        headers = {"Accept": "*/*"}
+        if key:
+            headers["x-api-key"] = key
+        expected_bytes = (
+            int(info_doc.get("file_size") or 0) if isinstance(info_doc, dict) else 0
+        )
+        prog_marker = f"[nova <- galaxy] Downloading '{disp_lbl}'"
+        chunk_sz = 4 * 1024 * 1024
+        written = 0
+        last_log_t = time.monotonic()
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if expected_bytes <= 0:
+                    with contextlib.suppress(ValueError, TypeError):
+                        expected_bytes = int(resp.headers.get("Content-Length") or 0)
+                if expected_bytes >= 8 * 1024 * 1024:
+                    self._set_stream_progress_line(
+                        job_record,
+                        prog_marker,
+                        f"{prog_marker} — 0.0 / {expected_bytes / (1024 * 1024):.1f} MB (0%)...",
+                    )
+                with open(part_path, "wb") as fh:
+                    while True:
+                        chunk = resp.read(chunk_sz)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        written += len(chunk)
+                        now_t = time.monotonic()
+                        if (
+                            job_record is not None
+                            and written >= 8 * 1024 * 1024
+                            and (now_t - last_log_t) >= 0.8
+                        ):
+                            last_log_t = now_t
+                            mb_done = written / (1024 * 1024)
+                            if expected_bytes > 0:
+                                mb_tot = expected_bytes / (1024 * 1024)
+                                pct = min(99, round(100.0 * written / expected_bytes))
+                                msg = f"{prog_marker} — {mb_done:.1f} / {mb_tot:.1f} MB ({pct}%)..."
+                            else:
+                                msg = f"{prog_marker} — {mb_done:.1f} MB..."
+                            self._set_stream_progress_line(job_record, prog_marker, msg)
+            if written > 0:
+                os.replace(part_path, dest_path)
+            self._set_stream_progress_line(job_record, prog_marker, "")
+            return written
+        finally:
+            if os.path.lexists(part_path):
+                with contextlib.suppress(OSError):
+                    os.remove(part_path)
+
     def touch_dataset(self, ds_id: str | None) -> None:
         """Record that a Galaxy dataset ID was just accessed, created, or linked."""
         if not ds_id:
@@ -1079,7 +1291,12 @@ class NovaGalaxyPipelineRunner:
         if not self.history_id:
             return []
         cached_list = getattr(self, "_cached_history_datasets", None)
-        if use_cached and isinstance(cached_list, list) and cached_list:
+        cached_ts = float(getattr(self, "_cached_history_datasets_ts", 0.0) or 0.0)
+        if (
+            use_cached
+            and isinstance(cached_list, list)
+            and (bool(cached_list) or (time.time() - cached_ts) < 15.0)
+        ):
             return (
                 cached_list[:limit]
                 if isinstance(limit, int) and limit > 0
@@ -1159,6 +1376,7 @@ class NovaGalaxyPipelineRunner:
                 reverse=True,
             )
             self._cached_history_datasets = list(out)
+            self._cached_history_datasets_ts = time.time()
             if isinstance(limit, int) and limit > 0:
                 return out[:limit]
             return out
@@ -1235,14 +1453,15 @@ class NovaGalaxyPipelineRunner:
         tmp_dest = os.path.join(tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}")
         if os.path.isfile(tmp_dest) and os.path.getsize(tmp_dest) > 0:
             return _remember(tmp_dest), info
-        data = self._api_request(
-            "GET",
-            f"/api/datasets/{ds_id}/display",
-            raw=True,
-            timeout=180.0,
+        n_dl = self._download_dataset_to_file(
+            ds_id,
+            tmp_dest,
+            label=name,
+            ds_info=info,
+            timeout=240.0,
         )
-        with open(tmp_dest, "wb") as fh:
-            fh.write(data)
+        if n_dl <= 0 or not os.path.isfile(tmp_dest):
+            raise OSError(f"Downloaded dataset {ds_id} ('{name}') was empty.")
         return _remember(tmp_dest), info
 
     @staticmethod
@@ -1586,7 +1805,7 @@ class NovaGalaxyPipelineRunner:
                 or not _has_h5_images(dest_m)
             ):
                 try:
-                    _shutil.copy2(abs_m, dest_m)
+                    self._link_or_copy_file(abs_m, dest_m)
                 except OSError:
                     return work_d, abs_m
             if dest_m != legacy_m and (
@@ -1595,7 +1814,7 @@ class NovaGalaxyPipelineRunner:
                 or not _has_h5_images(legacy_m)
             ):
                 with contextlib.suppress(OSError):
-                    _shutil.copy2(abs_m, legacy_m)
+                    self._link_or_copy_file(abs_m, legacy_m)
             final_m = dest_m if os.path.isfile(dest_m) else abs_m
             mapped_id = (
                 known_map.get(abs_m)
@@ -1739,6 +1958,61 @@ class NovaGalaxyPipelineRunner:
                         local_m, _ = self.resolve_dataset_to_local_h5(ds_id)
                         _, final_m = self._resolve_work_dir_and_merged(local_m)
                         return final_m
+        return None
+
+    def _discover_or_fetch_galaxy_predictor_h5(
+        self, peaks_h5_path: str | os.PathLike, *, target_hid: int | None = None
+    ) -> str | None:
+        """Ensure companion `predictor.h5` from `subhkl peak-predictor` is cached locally when loading `integrated.h5`."""
+        from subhkl.viz.rainbow_zones import _discover_predictor_h5
+
+        existing = _discover_predictor_h5(peaks_h5_path)
+        if existing and os.path.isfile(existing):
+            return existing
+        if not self.is_connected:
+            return None
+
+        is_integrated = False
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            import h5py
+
+            with h5py.File(str(peaks_h5_path), "r") as hf:
+                is_integrated = bool(
+                    "peaks" in hf
+                    and isinstance(hf["peaks"], h5py.Group)
+                    and ("var_u" in hf["peaks"] or "intensity" in hf["peaks"])
+                )
+        if not is_integrated:
+            return None
+
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            hist_items = self.list_history_datasets(limit=200)
+            pred_cands: list[tuple[int, dict[str, Any]]] = []
+            for ds in hist_items:
+                if ds.get("state") != "ok":
+                    continue
+                dname = str(ds.get("name") or "").strip().lower()
+                ext = str(ds.get("extension") or "").strip().lower()
+                if "predict" in dname and (
+                    dname.endswith((".h5", ".hdf5")) or ext in ("h5", "hdf5")
+                ):
+                    hid_v = int(ds.get("hid") or 0)
+                    # Prefer predictor datasets created at or just before target_hid, then newer datasets
+                    rank = (
+                        (target_hid - hid_v)
+                        if (target_hid is not None and hid_v <= target_hid)
+                        else (100000 + abs((target_hid or 0) - hid_v))
+                    )
+                    pred_cands.append((rank if target_hid is not None else -hid_v, ds))
+            pred_cands.sort(key=lambda kv: kv[0])
+            for _, cand_ds in pred_cands[:4]:
+                cand_id = str(cand_ds.get("id") or "").strip()
+                if not cand_id:
+                    continue
+                self.resolve_dataset_to_local_h5(cand_id)
+                found = _discover_predictor_h5(peaks_h5_path)
+                if found and os.path.isfile(found):
+                    return found
         return None
 
     def connect(self) -> Any:
@@ -2543,7 +2817,7 @@ class NovaGalaxyPipelineRunner:
                         self._dataset_id_by_path = known_map
                         return ds_id
 
-        if file_ext == "mtz":
+        if file_ext == "mtz" and not self._galaxy_has_datatype("mtz"):
             file_ext = "binary"
         is_local_gx = any(
             h in (getattr(gi, "base_url", "") or self.galaxy_url or "")
@@ -2956,30 +3230,51 @@ class NovaGalaxyPipelineRunner:
                         str(params.get("peaks_file"))
                     )
                 mtz_in_path = os.path.join(work_dir, "reflections.mtz")
+                matched_hist_mtz_id: str | None = None
                 if not os.path.isfile(mtz_in_path) and self.is_connected:
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                        for ds in self.list_history_datasets(limit=100):
+                        hist_items = self.list_history_datasets(limit=100)
+                        best_mtz_ds: dict[str, Any] | None = None
+                        for ds in hist_items:
                             if ds.get("state") != "ok":
                                 continue
                             dname = str(ds.get("name") or "").lower()
-                            if "reflections.mtz" in dname or (
-                                "unmerged" in dname and dname.endswith(".mtz")
+                            dext = str(ds.get("extension") or "").lower()
+                            is_mtz_cand = dname.endswith(".mtz") or dext == "mtz"
+                            if not is_mtz_cand:
+                                continue
+                            # Skip downstream Careless outputs when searching for unmerged input MTZ
+                            if any(
+                                dname == out_k or dname.endswith(out_k)
+                                for out_k in (
+                                    "merged.mtz",
+                                    "predictions.mtz",
+                                    "xval.mtz",
+                                    "careless_0.mtz",
+                                    "careless_predictions_0.mtz",
+                                    "careless_xval_0.mtz",
+                                )
                             ):
-                                ds_id = str(ds.get("id") or "").strip()
-                                if ds_id:
-                                    dl_p, _ = self.resolve_dataset_to_local_h5(
-                                        ds_id, fallback_dir=work_dir
-                                    )
-                                    if os.path.isfile(dl_p):
-                                        import shutil as _shutil
-
-                                        _shutil.copy2(dl_p, mtz_in_path)
-                                        break
+                                continue
+                            if "reflections.mtz" in dname or "unmerged" in dname:
+                                best_mtz_ds = ds
+                                break
+                            if best_mtz_ds is None:
+                                best_mtz_ds = ds
+                        if best_mtz_ds is not None:
+                            ds_id = str(best_mtz_ds.get("id") or "").strip()
+                            if ds_id:
+                                dl_p, _ = self.resolve_dataset_to_local_h5(
+                                    ds_id, fallback_dir=work_dir
+                                )
+                                if os.path.isfile(dl_p):
+                                    self._link_or_copy_file(dl_p, mtz_in_path)
+                                    matched_hist_mtz_id = ds_id
                 if not os.path.isfile(mtz_in_path):
                     raise RuntimeError(
-                        f"Unmerged reflections.mtz not found in {work_dir}; run Integrate first."
+                        f"Unmerged reflections.mtz not found in {work_dir}; run Integrate first or upload an .mtz dataset."
                     )
-                mtz_id = self._ensure_galaxy_h5_dataset(
+                mtz_id = matched_hist_mtz_id or self._ensure_galaxy_h5_dataset(
                     store,
                     mtz_in_path,
                     job_record,
@@ -5005,12 +5300,33 @@ class NovaGalaxyPipelineRunner:
                 merged_path,
             ]
         elif stage_id == "solve" and os.path.isfile(merged_path):
+            from subhkl.viz.rainbow_zones import default_rel_border_for_instrument
+
             refine_modes_str = str(
                 params.get(
                     "refine_modes",
                     "cylindrical,axial_stretch,area,global_rot,global_trans,sample,cell,per_run,per_run_trans",
                 )
             )
+            rel_border_solve = float(
+                params.get(
+                    "rel_border_width",
+                    default_rel_border_for_instrument(str(inst)),
+                )
+            )
+            solve_bw_px = 4
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py as _h5
+
+                with _h5.File(merged_path, "r") as _mf:
+                    if "images/ims" in _mf and _mf["images/ims"].ndim >= 3:
+                        _im_sh = _mf["images/ims"].shape
+                        solve_bw_px = max(
+                            0,
+                            round(
+                                rel_border_solve * min(int(_im_sh[1]), int(_im_sh[2]))
+                            ),
+                        )
             inner_cmd = [
                 "python",
                 "-u",
@@ -5031,6 +5347,8 @@ class NovaGalaxyPipelineRunner:
                 str(wl[1]),
                 "--d-min",
                 str(params.get("d_min") or round(0.5 * float(wl[0]), 2)),
+                "--border-width",
+                str(solve_bw_px),
                 "--refinement",
                 str(params.get("objective", "band")),
             ]
@@ -5041,6 +5359,8 @@ class NovaGalaxyPipelineRunner:
             and os.path.isfile(merged_path)
             and os.path.isfile(solve_path)
         ):
+            from subhkl.viz.rainbow_zones import default_rel_border_for_instrument
+
             d_min_req = float(params.get("d_min") or round(0.5 * float(wl[0]), 2))
             d_min_val = str(round(d_min_req, 3))
             pred_cmd = [
@@ -5062,7 +5382,21 @@ class NovaGalaxyPipelineRunner:
                 "--space-group",
                 str(sg),
             ]
-            rel_border = float(params.get("rel_border_width", 0.03))
+            rel_border = float(
+                params.get(
+                    "rel_border_width",
+                    default_rel_border_for_instrument(str(inst)),
+                )
+            )
+            shape_min_snr = float(params.get("shape_fit_min_snr", 5.0))
+            has_solve_mask = False
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py as _h5
+
+                with _h5.File(solve_path, "r") as _sf:
+                    has_solve_mask = (
+                        "detector/pixel_mask" in _sf and "detector/mask_bank_ids" in _sf
+                    )
             int_cmd = [
                 "python",
                 "-u",
@@ -5076,11 +5410,16 @@ class NovaGalaxyPipelineRunner:
                 "--anisotropic",
                 "--fit-mosaicity",
                 "--shape-fit-normalized",
+                "--shape-fit-min-snr",
+                str(round(shape_min_snr, 2)),
+                "--allow-negative",
                 "--matrix-free",
                 "--rel-border-width",
                 str(round(rel_border, 4)),
                 "--show-progress",
             ]
+            if has_solve_mask:
+                int_cmd.extend(["--static-mask-file", solve_path])
             mtz_cmd = [
                 "python",
                 "-u",
@@ -5132,6 +5471,9 @@ class NovaGalaxyPipelineRunner:
                             exp.write_mtz(mtz_dest)
             careless_iters = int(params.get("iterations") or 10000)
             studentt_dof = float(params.get("studentt_dof") or 4.0)
+            wilson_b = float(params.get("wilson_prior_b") or 40.0)
+            spectral_file = str(params.get("spectral_file") or "").strip()
+            lorentz_corr = bool(params.get("lorentz_correction", bool(spectral_file)))
             merge_work = os.path.join(work_dir, "careless_work")
             os.makedirs(merge_work, exist_ok=True)
             unmerged_mtz = os.path.join(merge_work, "input_unmerged.mtz")
@@ -5141,7 +5483,7 @@ class NovaGalaxyPipelineRunner:
             xval_mtz_out = os.path.join(work_dir, "xval.mtz")
             metrics_json_out = os.path.join(work_dir, "careless_metrics.json")
             prep_py = (
-                "import gemmi, reciprocalspaceship as rs\n"
+                "import gemmi, numpy as np, reciprocalspaceship as rs\n"
                 f"mtz = gemmi.read_mtz_file({mtz_dest!r})\n"
                 "c = mtz.cell\n"
                 "na = 90.0 if abs(c.alpha - 90) < 0.2 else (120.0 if abs(c.alpha - 120) < 0.2 else c.alpha)\n"
@@ -5153,14 +5495,18 @@ class NovaGalaxyPipelineRunner:
                 "ds = rs.read_mtz(cell_mtz)\n"
                 "if 'SIGI' in ds:\n"
                 "    ds = ds[ds['SIGI'] > 0]\n"
+                "if 'BATCH' in ds and 'RUN' not in ds:\n"
+                "    ds['RUN'] = rs.DataSeries((ds['BATCH'].to_numpy().astype(int) // 1000).astype(np.float32), index=ds.index, dtype='R')\n"
                 "if not ds.get_m_isym_keys():\n"
                 "    ds = ds.hkl_to_asu()\n"
                 "ds.merged = False\n"
                 f"ds.write_mtz({unmerged_mtz!r})\n"
-                "cols = {col.label for col in mtz.columns}\n"
-                "keys = ['WAVEL','THETA','PHI','dHKL','H_0','K_0','L_0','H','K','L','image_id','file_id','asu_id','harmonic_id']\n"
-                "for extra in ('SIGEFF', 'SNAPD', 'DPHI', 'DTX', 'DTY', 'DTZ'):\n"
-                "    if extra in cols:\n"
+                "# Restrict neural-scaler metadata strictly to physical beam/detector/run\n"
+                "# coordinates -- never Miller indices/asu_id (overfitting) or dHKL\n"
+                "# (induces intra-bin resolution-slope correlation).\n"
+                "keys = [k for k in ('WAVEL', 'THETA', 'PHI') if k in ds]\n"
+                "for extra in ('RUN', 'DPHI', 'DTX', 'DTY', 'DTZ'):\n"
+                "    if extra in ds and float(np.nanstd(ds[extra].to_numpy())) > 1e-6:\n"
                 "        keys.append(extra)\n"
                 "print(','.join(keys))\n"
             )
@@ -5237,10 +5583,26 @@ class NovaGalaxyPipelineRunner:
             with contextlib.suppress(OSError):
                 os.chmod(prep_script, 0o666)
                 os.chmod(post_script, 0o666)
+            careless_extra_flags = [
+                "--disable-image-scales",
+                f"--wilson-prior-b={wilson_b}",
+            ]
+            if spectral_file and os.path.isfile(spectral_file):
+                careless_extra_flags.extend(
+                    [
+                        f"--spectral-file={shlex.quote(spectral_file)}",
+                        "--trainable-spectral-scale",
+                    ]
+                )
+                if lorentz_corr:
+                    careless_extra_flags.append("--lorentz-correction")
+            elif lorentz_corr:
+                careless_extra_flags.append("--lorentz-correction")
+            extra_flags_str = " ".join(careless_extra_flags)
             chained_merge = (
                 f"set -e; "
                 f"MKEYS=$(python {shlex.quote(prep_script)}) && "
-                f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
+                f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} {extra_flags_str} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
                 f"python {shlex.quote(post_script)}"
             )
             inner_cmd = ["bash", "-c", chained_merge]
@@ -6101,43 +6463,48 @@ class NovaGalaxyPipelineRunner:
                                     tempfile.gettempdir(),
                                     f"subhkl_gx_{ds_id}_{merged_label}",
                                 )
-                                raw_bytes = None
+                                dl_dest = target_path
+                                created_temp = False
+                                if not dl_dest:
+                                    fd, dl_dest = tempfile.mkstemp(
+                                        suffix=".h5", prefix="galaxy_solve_"
+                                    )
+                                    os.close(fd)
+                                    created_temp = True
+                                n_synced = 0
                                 for attempt in range(6):
                                     try:
-                                        raw_bytes = self._api_request(
-                                            "GET",
-                                            f"/api/datasets/{ds_id}/display",
-                                            raw=True,
-                                            timeout=180.0,
+                                        n_synced = self._download_dataset_to_file(
+                                            ds_id,
+                                            dl_dest,
+                                            job_record=job_record,
+                                            label=merged_label,
+                                            timeout=240.0,
                                         )
-                                        if raw_bytes:
+                                        if n_synced > 0:
                                             break
                                     except _NOVA_RECOVERABLE_ERRORS:
                                         if attempt == 5:
+                                            if created_temp and os.path.lexists(
+                                                dl_dest
+                                            ):
+                                                with contextlib.suppress(OSError):
+                                                    os.remove(dl_dest)
                                             raise
                                     time.sleep(2.0)
-                                if raw_bytes:
+                                if n_synced > 0 and os.path.isfile(dl_dest):
+                                    tmp_path = dl_dest
                                     if target_path:
-                                        with open(target_path, "wb") as f:
-                                            f.write(raw_bytes)
-                                        tmp_path = target_path
-                                        if not job_record.get("reduce_part_path"):
-                                            with (
-                                                contextlib.suppress(
-                                                    *_NOVA_RECOVERABLE_ERRORS
-                                                ),
-                                                open(cache_gx_path, "wb") as cf,
-                                            ):
-                                                cf.write(raw_bytes)
+                                        mb_s = n_synced / (1024.0 * 1024.0)
+                                        sz_tag = (
+                                            f", {mb_s:.1f} MB" if mb_s >= 1.0 else ""
+                                        )
                                         job_record["stdout"] += (
-                                            f"[nova <- galaxy] Synced '{merged_label}' (id={ds_id}) -> {target_path}\n"
+                                            f"[nova <- galaxy] Synced '{merged_label}' (id={ds_id}{sz_tag}) -> {target_path}\n"
                                         )
-                                    else:
-                                        fd, tmp_path = tempfile.mkstemp(
-                                            suffix=".h5", prefix="galaxy_solve_"
-                                        )
-                                        with os.fdopen(fd, "wb") as f:
-                                            f.write(raw_bytes)
+                                elif created_temp and os.path.lexists(dl_dest):
+                                    with contextlib.suppress(OSError):
+                                        os.remove(dl_dest)
 
                                 # If reduce ran inside a container without CG4D title goniometer fallback, patch angles in merged.h5
                                 if (
@@ -6187,9 +6554,11 @@ class NovaGalaxyPipelineRunner:
                                                             ax, ang, nms = (
                                                                 get_rotation_data_from_title(
                                                                     title_meta,
-                                                                    inst_name,
+                                                                    title_inst
+                                                                    := inst_name,
                                                                 )
                                                             )
+                                                            _ = title_inst
                                                         if ang:
                                                             new_axes.append(ax)
                                                             new_angles.append(ang)
@@ -6235,8 +6604,6 @@ class NovaGalaxyPipelineRunner:
                                                         job_record["stdout"] += (
                                                             f"[subhkl] Patched goniometer angles from NeXus/ONCat title into {os.path.basename(tmp_path)}\n"
                                                         )
-                                        if os.path.isfile(cache_gx_path):
-                                            shutil.copy2(tmp_path, cache_gx_path)
 
                                 if (
                                     tmp_path
@@ -6244,10 +6611,16 @@ class NovaGalaxyPipelineRunner:
                                     and job_record.get("stage_id") == "reduce"
                                 ):
                                     self._stamp_merged_metadata(tmp_path, job_record)
-                                    if os.path.isfile(cache_gx_path):
-                                        self._stamp_merged_metadata(
-                                            cache_gx_path, job_record
-                                        )
+
+                                # Hard-link into /tmp Galaxy cache once AFTER in-place stamping (0 extra disk writes!)
+                                if (
+                                    tmp_path
+                                    and os.path.isfile(tmp_path)
+                                    and target_path
+                                    and not job_record.get("reduce_part_path")
+                                ):
+                                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                                        self._link_or_copy_file(tmp_path, cache_gx_path)
 
                                 if final_step and tmp_path and os.path.isfile(tmp_path):
                                     self.touch_dataset(ds_id)
@@ -6258,24 +6631,20 @@ class NovaGalaxyPipelineRunner:
                                     )
                                     known_map = getattr(self, "_dataset_id_by_path", {})
                                     known_map[os.path.abspath(tmp_path)] = ds_id
+                                    if os.path.isfile(cache_gx_path):
+                                        known_map[os.path.abspath(cache_gx_path)] = (
+                                            ds_id
+                                        )
                                     if (
                                         work_dir
                                         and job_record.get("stage_id") == "reduce"
                                     ):
                                         lbl_path = os.path.join(work_dir, merged_label)
                                         known_map[os.path.abspath(lbl_path)] = ds_id
-                                        if os.path.abspath(lbl_path) != os.path.abspath(
-                                            tmp_path
+                                        with contextlib.suppress(
+                                            *_NOVA_RECOVERABLE_ERRORS
                                         ):
-                                            try:
-                                                if os.path.lexists(lbl_path):
-                                                    os.remove(lbl_path)
-                                                os.link(tmp_path, lbl_path)
-                                            except _NOVA_RECOVERABLE_ERRORS:
-                                                with contextlib.suppress(
-                                                    *_NOVA_RECOVERABLE_ERRORS
-                                                ):
-                                                    shutil.copy2(tmp_path, lbl_path)
+                                            self._link_or_copy_file(tmp_path, lbl_path)
                                     self._dataset_id_by_path = known_map
                                     job_record["output_h5_path"] = tmp_path
                                     if callable(on_complete_h5):
@@ -6495,6 +6864,8 @@ class RainbowZonesViewModel:
         self.default_mode = default_mode
         self.payload_kwargs = dict(payload_kwargs)
         self.pipeline_runner = NovaGalaxyPipelineRunner()
+        self.mtz_overlay_path: str | None = None
+        self.mtz_overlay_info: dict[str, Any] | None = None
         if payload is not None:
             self.payload = payload
         elif replay_h5 is not None:
@@ -6503,6 +6874,14 @@ class RainbowZonesViewModel:
             )
         else:
             self.payload = build_rainbow_zone_payload(**self.payload_kwargs)
+
+    @property
+    def _payload(self) -> dict[str, Any]:
+        return self.payload
+
+    @_payload.setter
+    def _payload(self, value: dict[str, Any]) -> None:
+        self.payload = value
 
     def reload(self, **overrides: Any) -> dict[str, Any]:
         if "frame_index" in overrides and overrides["frame_index"] is not None:
@@ -6514,6 +6893,23 @@ class RainbowZonesViewModel:
             )
         else:
             self.payload = build_rainbow_zone_payload(**kwargs)
+        if (
+            self.mtz_overlay_path
+            and os.path.isfile(self.mtz_overlay_path)
+            and (
+                self.payload.get("u_matrix") is not None
+                or self.payload.get("ub_matrix") is not None
+            )
+        ):
+            from subhkl.viz.rainbow_zones import apply_mtz_to_payload
+
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                self.payload = apply_mtz_to_payload(
+                    self.payload,
+                    self.mtz_overlay_path,
+                    self.mtz_overlay_info,
+                    select_mtz_color=False,
+                )
         return self.payload
 
     def to_html(self, mode: str | None = None) -> str:
@@ -6620,8 +7016,274 @@ def serve_rainbow_zones(
                 pass
 
     ep_path = os.environ.get("EP_PATH", "").rstrip("/")
+    vm_lock = threading.RLock()
 
     class _Handler(http.server.BaseHTTPRequestHandler):
+        def _serve_payload_locked(self, qs: dict[str, list[str]]) -> None:
+            f_idx: int | None = None
+            if qs.get("frame"):
+                try:
+                    f_idx = int(qs["frame"][0])
+                    vm.payload_kwargs["frame_index"] = f_idx
+                    vm.pipeline_runner.current_frame_index = f_idx
+                except (ValueError, TypeError, IndexError):
+                    f_idx = None
+            preserve_q = qs.get("preserve_params", ["0"])[0] == "1"
+            d_min_val: float | None = None
+            if qs.get("d_min"):
+                with contextlib.suppress(ValueError, TypeError, IndexError):
+                    parsed_dmin = float(qs["d_min"][0])
+                    if 0.2 <= parsed_dmin <= 20.0:
+                        d_min_val = parsed_dmin
+                        vm.payload_kwargs["d_min"] = parsed_dmin
+            rbin_val: int | None = None
+            if qs.get("render_binning"):
+                with contextlib.suppress(ValueError, TypeError, IndexError):
+                    parsed_rb = int(qs["render_binning"][0])
+                    if 1 <= parsed_rb <= 16:
+                        rbin_val = parsed_rb
+                        vm.payload_kwargs["render_binning"] = parsed_rb
+            reloaded = False
+            if qs.get("file_path"):
+                fp_raw = os.path.abspath(str(qs["file_path"][0]).strip())
+                if fp_raw.lower().endswith(".mtz"):
+                    if not os.path.isfile(fp_raw):
+                        err_body = json.dumps(
+                            {
+                                "status": "error",
+                                "error": f"MTZ file not found: {fp_raw}",
+                            }
+                        ).encode("utf-8")
+                        self.send_response(404)
+                        self.send_header(
+                            "Content-Type", "application/json; charset=utf-8"
+                        )
+                        self.send_header("Content-Length", str(len(err_body)))
+                        self.end_headers()
+                        self.wfile.write(err_body)
+                        return
+                    try:
+                        from subhkl.viz.rainbow_zones import apply_mtz_to_payload
+
+                        ds_info_mtz = {"name": os.path.basename(fp_raw)}
+                        vm.payload = apply_mtz_to_payload(
+                            vm.payload or {}, fp_raw, ds_info_mtz
+                        )
+                        vm.mtz_overlay_path = fp_raw
+                        vm.mtz_overlay_info = ds_info_mtz
+                        body = json.dumps(vm.payload).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header(
+                            "Content-Type", "application/json; charset=utf-8"
+                        )
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    except _NOVA_RECOVERABLE_ERRORS as exc:
+                        err_body = json.dumps(
+                            {"status": "error", "error": str(exc)}
+                        ).encode("utf-8")
+                        self.send_response(400)
+                        self.send_header(
+                            "Content-Type", "application/json; charset=utf-8"
+                        )
+                        self.send_header("Content-Length", str(len(err_body)))
+                        self.end_headers()
+                        self.wfile.write(err_body)
+                        return
+                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                    fp = fp_raw
+                    if os.path.isfile(fp):
+                        fp_low = os.path.basename(fp).lower()
+                        is_reduce_file = (
+                            any(k in fp_low for k in ("merged", "scan", "image"))
+                            and "careless" not in fp_low
+                        )
+                        if is_reduce_file:
+                            vm.mtz_overlay_path = None
+                            vm.mtz_overlay_info = None
+                            _, fp = vm.pipeline_runner._resolve_work_dir_and_merged(fp)
+                            vm.payload_kwargs["images_h5"] = fp
+                            vm.payload_kwargs.pop("d_min", None)
+                            vm.replay_h5 = fp
+                            vm.reload(images_h5=fp, frame_index=f_idx)
+                        else:
+                            if not preserve_q and d_min_val is None:
+                                vm.payload_kwargs.pop("d_min", None)
+                            disc_img = (
+                                vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                    fp
+                                )
+                            )
+                            vm.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
+                                fp
+                            )
+                            if disc_img:
+                                vm.payload_kwargs["images_h5"] = str(disc_img)
+                            vm.replay_h5 = fp
+                            vm.reload(
+                                images_h5=vm.payload_kwargs.get("images_h5"),
+                                frame_index=f_idx,
+                            )
+                        vm.pipeline_runner.invalidate_subsequent_stages(
+                            (vm.payload or {}).get("artifact_kind"),
+                            os.path.dirname(fp),
+                        )
+                        reloaded = True
+            if qs.get("dataset_id"):
+                try:
+                    from subhkl.viz.rainbow_zones import (
+                        _discover_images_h5,
+                        apply_mtz_to_payload,
+                        validate_subhkl_ingestible_dataset,
+                    )
+
+                    ds_id = str(qs["dataset_id"][0]).strip()
+                    fb_dir = (
+                        os.path.dirname(os.path.abspath(vm.replay_h5))
+                        if vm.replay_h5
+                        else None
+                    )
+                    local_h5, ds_info = vm.pipeline_runner.resolve_dataset_to_local_h5(
+                        ds_id, fallback_dir=fb_dir
+                    )
+                    cur_p = vm.payload or {}
+                    has_active_geom = bool(
+                        (
+                            cur_p.get("artifact_kind") != "empty"
+                            and cur_p.get("panels")
+                            and (cur_p.get("peaks") or cur_p.get("ub_matrix"))
+                        )
+                        or qs.get("has_active_geometry", ["0"])[0] == "1"
+                    )
+                    ingest_kind = validate_subhkl_ingestible_dataset(
+                        local_h5,
+                        ds_info,
+                        has_active_geometry=has_active_geom,
+                    )
+                    if ingest_kind == "mtz_overlay":
+                        vm.payload = apply_mtz_to_payload(cur_p, local_h5, ds_info)
+                        vm.mtz_overlay_path = local_h5
+                        vm.mtz_overlay_info = ds_info
+                        body = json.dumps(vm.payload).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header(
+                            "Content-Type", "application/json; charset=utf-8"
+                        )
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    if ingest_kind == "raw_nexus":
+                        vm.mtz_overlay_path = None
+                        vm.mtz_overlay_info = None
+                        raw_body = json.dumps(
+                            {
+                                "status": "raw_nexus",
+                                "dataset_id": ds_id,
+                                "name": ds_info.get("name")
+                                or os.path.basename(local_h5),
+                            }
+                        ).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header(
+                            "Content-Type", "application/json; charset=utf-8"
+                        )
+                        self.send_header("Content-Length", str(len(raw_body)))
+                        self.end_headers()
+                        self.wfile.write(raw_body)
+                        return
+                    ds_name = str(
+                        ds_info.get("name") or os.path.basename(local_h5)
+                    ).lower()
+                    if (
+                        any(k in ds_name for k in ("merged", "scan", "image"))
+                        and "careless" not in ds_name
+                    ):
+                        vm.mtz_overlay_path = None
+                        vm.mtz_overlay_info = None
+                        _, local_h5 = vm.pipeline_runner._resolve_work_dir_and_merged(
+                            local_h5
+                        )
+                        vm.payload_kwargs["images_h5"] = local_h5
+                        vm.replay_h5 = local_h5
+                        vm.reload(images_h5=local_h5, frame_index=f_idx)
+                    else:
+                        disc_img = (
+                            vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                local_h5
+                            )
+                            or _discover_images_h5(local_h5)
+                        )
+                        ds_hid_raw = (ds_info or {}).get("hid")
+                        ds_hid = (
+                            int(ds_hid_raw)
+                            if isinstance(ds_hid_raw, (int, str))
+                            and str(ds_hid_raw).isdigit()
+                            else None
+                        )
+                        vm.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
+                            local_h5, target_hid=ds_hid
+                        )
+                        vm.payload_kwargs["images_h5"] = (
+                            str(disc_img) if disc_img else None
+                        )
+                        vm.replay_h5 = local_h5
+                        vm.reload(
+                            images_h5=(str(disc_img) if disc_img else None),
+                            frame_index=f_idx,
+                        )
+                    vm.pipeline_runner.invalidate_subsequent_stages(
+                        (vm._payload or {}).get("artifact_kind"),
+                        os.path.dirname(os.path.abspath(local_h5)),
+                    )
+                    reloaded = True
+                except _NOVA_RECOVERABLE_ERRORS as exc:
+                    err_body = json.dumps(
+                        {"status": "error", "error": str(exc)}
+                    ).encode("utf-8")
+                    self.send_response(400)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    self.wfile.write(err_body)
+                    return
+            if not reloaded:
+                cur_p = vm._payload
+                cur_f = cur_p.get("frame_index") if isinstance(cur_p, dict) else None
+                cur_dmin = cur_p.get("d_min") if isinstance(cur_p, dict) else None
+                cur_rb = (
+                    int(cur_p.get("render_binning", 4))
+                    if isinstance(cur_p, dict)
+                    else None
+                )
+                if (
+                    not isinstance(cur_p, dict)
+                    or (f_idx is not None and cur_f != f_idx)
+                    or (rbin_val is not None and cur_rb != rbin_val)
+                    or (
+                        d_min_val is not None
+                        and (
+                            cur_dmin is None or abs(float(cur_dmin) - d_min_val) > 1e-3
+                        )
+                    )
+                ):
+                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                        vm.reload(frame_index=f_idx)
+                elif isinstance(cur_p, dict) and d_min_val is not None and preserve_q:
+                    cur_p["d_min"] = round(d_min_val, 3)
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                vm.pipeline_runner.apply_active_solve_overlay(
+                    vm.payload, frame_index=f_idx
+                )
+            body = json.dumps(vm.payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             qs = parse_qs(parsed.query)
@@ -6639,192 +7301,55 @@ def serve_rainbow_zones(
                 return
 
             if req_path in ("/api/payload", "/payload.json"):
-                f_idx: int | None = None
-                if qs.get("frame"):
-                    try:
-                        f_idx = int(qs["frame"][0])
-                        vm.payload_kwargs["frame_index"] = f_idx
-                        vm.pipeline_runner.current_frame_index = f_idx
-                    except (ValueError, TypeError, IndexError):
-                        f_idx = None
-                preserve_q = qs.get("preserve_params", ["0"])[0] == "1"
-                d_min_val: float | None = None
-                if qs.get("d_min"):
-                    with contextlib.suppress(ValueError, TypeError, IndexError):
-                        parsed_dmin = float(qs["d_min"][0])
-                        if 0.2 <= parsed_dmin <= 20.0:
-                            d_min_val = parsed_dmin
-                            vm.payload_kwargs["d_min"] = parsed_dmin
-                reloaded = False
-                if qs.get("file_path"):
-                    with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                        fp = os.path.abspath(str(qs["file_path"][0]).strip())
-                        if os.path.isfile(fp):
-                            fp_low = os.path.basename(fp).lower()
-                            if any(k in fp_low for k in ("merged", "scan", "image")):
-                                _, fp = vm.pipeline_runner._resolve_work_dir_and_merged(
-                                    fp
-                                )
-                                vm.payload_kwargs["images_h5"] = fp
-                                vm.payload_kwargs.pop("d_min", None)
-                                vm.replay_h5 = fp
-                                vm.reload(images_h5=fp, frame_index=f_idx)
-                            else:
-                                if not preserve_q and d_min_val is None:
-                                    vm.payload_kwargs.pop("d_min", None)
-                                disc_img = vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
-                                    fp
-                                )
-                                if disc_img:
-                                    vm.payload_kwargs["images_h5"] = str(disc_img)
-                                vm.replay_h5 = fp
-                                vm.reload(
-                                    images_h5=vm.payload_kwargs.get("images_h5"),
-                                    frame_index=f_idx,
-                                )
-                            vm.pipeline_runner.invalidate_subsequent_stages(
-                                (vm._payload or {}).get("artifact_kind"),
-                                os.path.dirname(fp),
-                            )
-                            reloaded = True
-                if qs.get("dataset_id"):
-                    try:
-                        from subhkl.viz.rainbow_zones import (
-                            _discover_images_h5,
-                            apply_mtz_to_payload,
-                            validate_subhkl_ingestible_dataset,
-                        )
+                if qs.get("textures_only", ["0"])[0] == "1":
+                    from subhkl.viz.rainbow_zones import (
+                        build_rainbow_panel_textures_only,
+                    )
 
-                        ds_id = str(qs["dataset_id"][0]).strip()
-                        fb_dir = (
-                            os.path.dirname(os.path.abspath(vm.replay_h5))
-                            if vm.replay_h5
-                            else None
-                        )
-                        local_h5, ds_info = (
-                            vm.pipeline_runner.resolve_dataset_to_local_h5(
-                                ds_id, fallback_dir=fb_dir
-                            )
-                        )
-                        cur_p = vm._payload or {}
-                        has_active_geom = bool(
-                            (
-                                cur_p.get("artifact_kind") != "empty"
-                                and cur_p.get("panels")
-                                and (cur_p.get("peaks") or cur_p.get("ub_matrix"))
-                            )
-                            or qs.get("has_active_geometry", ["0"])[0] == "1"
-                        )
-                        ingest_kind = validate_subhkl_ingestible_dataset(
-                            local_h5,
-                            ds_info,
-                            has_active_geometry=has_active_geom,
-                        )
-                        if ingest_kind == "mtz_overlay":
-                            vm._payload = apply_mtz_to_payload(cur_p, local_h5, ds_info)
-                            body = json.dumps(vm._payload).encode("utf-8")
-                            self.send_response(200)
-                            self.send_header(
-                                "Content-Type", "application/json; charset=utf-8"
-                            )
-                            self.send_header("Content-Length", str(len(body)))
-                            self.end_headers()
-                            self.wfile.write(body)
-                            return
-                        if ingest_kind == "raw_nexus":
-                            raw_body = json.dumps(
-                                {
-                                    "status": "raw_nexus",
-                                    "dataset_id": ds_id,
-                                    "name": ds_info.get("name")
-                                    or os.path.basename(local_h5),
-                                }
-                            ).encode("utf-8")
-                            self.send_response(200)
-                            self.send_header(
-                                "Content-Type", "application/json; charset=utf-8"
-                            )
-                            self.send_header("Content-Length", str(len(raw_body)))
-                            self.end_headers()
-                            self.wfile.write(raw_body)
-                            return
-                        ds_name = str(
-                            ds_info.get("name") or os.path.basename(local_h5)
-                        ).lower()
-                        if any(k in ds_name for k in ("merged", "scan", "image")):
-                            _, local_h5 = (
-                                vm.pipeline_runner._resolve_work_dir_and_merged(
-                                    local_h5
-                                )
-                            )
-                            vm.payload_kwargs["images_h5"] = local_h5
-                            vm.replay_h5 = local_h5
-                            vm.reload(images_h5=local_h5, frame_index=f_idx)
-                        else:
-                            disc_img = (
-                                vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
-                                    local_h5
-                                )
-                                or _discover_images_h5(local_h5)
-                            )
-                            vm.payload_kwargs["images_h5"] = (
-                                str(disc_img) if disc_img else None
-                            )
-                            vm.replay_h5 = local_h5
-                            vm.reload(
-                                images_h5=(str(disc_img) if disc_img else None),
-                                frame_index=f_idx,
-                            )
-                        vm.pipeline_runner.invalidate_subsequent_stages(
-                            (vm._payload or {}).get("artifact_kind"),
-                            os.path.dirname(os.path.abspath(local_h5)),
-                        )
-                        reloaded = True
-                    except _NOVA_RECOVERABLE_ERRORS as exc:
-                        err_body = json.dumps(
-                            {"status": "error", "error": str(exc)}
-                        ).encode("utf-8")
-                        self.send_response(400)
-                        self.send_header(
-                            "Content-Type", "application/json; charset=utf-8"
-                        )
-                        self.send_header("Content-Length", str(len(err_body)))
-                        self.end_headers()
-                        self.wfile.write(err_body)
-                        return
-                if not reloaded:
-                    cur_p = vm._payload
-                    cur_f = (
-                        cur_p.get("frame_index") if isinstance(cur_p, dict) else None
+                    f_idx_tex: int | None = None
+                    if qs.get("frame"):
+                        with contextlib.suppress(ValueError, TypeError, IndexError):
+                            f_idx_tex = int(qs["frame"][0])
+                    rb_tex = int(vm.payload_kwargs.get("render_binning") or 4)
+                    if qs.get("render_binning"):
+                        with contextlib.suppress(ValueError, TypeError, IndexError):
+                            parsed_rb = int(qs["render_binning"][0])
+                            if 1 <= parsed_rb <= 16:
+                                rb_tex = parsed_rb
+                                vm.payload_kwargs["render_binning"] = parsed_rb
+                    tex_doc = build_rainbow_panel_textures_only(
+                        replay_h5=vm.replay_h5 or vm.payload_kwargs.get("images_h5"),
+                        images_h5=vm.payload_kwargs.get("images_h5"),
+                        instrument=vm.payload_kwargs.get("instrument") or "CG4D",
+                        render_binning=rb_tex,
+                        frame_index=(
+                            f_idx_tex
+                            if f_idx_tex is not None
+                            else int(vm.payload_kwargs.get("frame_index") or 0)
+                        ),
                     )
-                    cur_dmin = cur_p.get("d_min") if isinstance(cur_p, dict) else None
-                    if (
-                        not isinstance(cur_p, dict)
-                        or (f_idx is not None and cur_f != f_idx)
-                        or (
-                            d_min_val is not None
-                            and (
-                                cur_dmin is None
-                                or abs(float(cur_dmin) - d_min_val) > 1e-3
-                            )
-                        )
-                    ):
-                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                            vm.reload(frame_index=f_idx)
-                    elif (
-                        isinstance(cur_p, dict) and d_min_val is not None and preserve_q
-                    ):
-                        cur_p["d_min"] = round(d_min_val, 3)
-                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                    vm.pipeline_runner.apply_active_solve_overlay(
-                        vm.payload, frame_index=f_idx
-                    )
-                body = json.dumps(vm.payload).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                    if vm_lock.acquire(blocking=False):
+                        try:
+                            cur_pl = vm._payload
+                            if isinstance(cur_pl, dict) and isinstance(
+                                cur_pl.get("panels"), list
+                            ):
+                                cur_pl["render_binning"] = tex_doc["render_binning"]
+                        finally:
+                            vm_lock.release()
+                    body = json.dumps(tex_doc).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                vm_lock.acquire()
+                try:
+                    self._serve_payload_locked(qs)
+                finally:
+                    vm_lock.release()
                 return
 
             if req_path.startswith("/api/datasets/") and req_path.endswith("/display"):
@@ -6913,12 +7438,17 @@ def serve_rainbow_zones(
                 return
 
             if req_path == "/api/pipeline/status":
+                f_idx_st: int | None = None
                 if qs.get("frame"):
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         f_idx_st = int(qs["frame"][0])
                         vm.payload_kwargs["frame_index"] = f_idx_st
                         vm.pipeline_runner.sync_frame_index(f_idx_st)
                 is_poll = qs.get("poll", ["0"])[0] == "1"
+                ov_seq_client: int | None = None
+                if qs.get("overlay_seq"):
+                    with contextlib.suppress(ValueError, TypeError, IndexError):
+                        ov_seq_client = int(qs["overlay_seq"][0])
                 aj_now = vm.pipeline_runner.active_job
                 aj_running = isinstance(aj_now, dict) and aj_now.get("state") in (
                     "queued",
@@ -6928,6 +7458,28 @@ def serve_rainbow_zones(
                     use_cached=bool(is_poll and aj_running)
                 )
                 step_timings_snap = vm.pipeline_runner.get_step_timings_snapshot()
+                cur_pl = vm._payload if isinstance(vm._payload, dict) else {}
+                aj_resp = vm.pipeline_runner.active_job
+                if (
+                    is_poll
+                    and ov_seq_client is not None
+                    and isinstance(aj_resp, dict)
+                    and isinstance(aj_resp.get("partial_overlay"), dict)
+                ):
+                    ov_now = aj_resp["partial_overlay"]
+                    ov_seq_now = int(ov_now.get("seq") or 0)
+                    ov_frame_now = ov_now.get("frame_index")
+                    if ov_seq_now == ov_seq_client and (
+                        f_idx_st is None
+                        or ov_frame_now is None
+                        or int(ov_frame_now) == f_idx_st
+                    ):
+                        aj_resp = dict(aj_resp)
+                        aj_resp["partial_overlay"] = {
+                            "seq": ov_seq_now,
+                            "frame_index": ov_frame_now,
+                            "unchanged": True,
+                        }
                 status_doc = {
                     "galaxy_connected": vm.pipeline_runner.is_connected,
                     "galaxy_url": vm.pipeline_runner.galaxy_url,
@@ -6937,11 +7489,11 @@ def serve_rainbow_zones(
                         current_h5=vm.replay_h5,
                         history_datasets=hist_ds,
                     ),
-                    "active_job": vm.pipeline_runner.active_job,
+                    "active_job": aj_resp,
                     "step_timings": step_timings_snap,
                     "server_time": time.time(),
-                    "pipeline_stages": vm.payload.get("pipeline_stages", []),
-                    "ladder_steps": vm.payload.get("ladder_steps", []),
+                    "pipeline_stages": cur_pl.get("pipeline_stages", []),
+                    "ladder_steps": cur_pl.get("ladder_steps", []),
                 }
                 body = json.dumps(status_doc).encode("utf-8")
                 self.send_response(200)
@@ -7087,32 +7639,37 @@ def serve_rainbow_zones(
                         params.setdefault("peaks_file", str(vm.replay_h5))
 
                     def _on_complete(new_h5_path: str) -> None:
-                        if (
-                            stage_id == "reduce"
-                            or "merged" in os.path.basename(new_h5_path).lower()
-                        ):
-                            vm.payload_kwargs["images_h5"] = new_h5_path
-                            vm.payload_kwargs["frame_index"] = 0
-                            vm.payload_kwargs.pop("wavelength_range", None)
-                            vm.payload_kwargs.pop("d_min", None)
-                        else:
-                            vm.payload_kwargs["frame_index"] = int(
-                                vm.pipeline_runner.current_frame_index or 0
+                        with vm_lock:
+                            new_base_low = os.path.basename(new_h5_path).lower()
+                            is_reduce_out = stage_id == "reduce" or (
+                                "merged" in new_base_low
+                                and "careless" not in new_base_low
                             )
-                            if params.get("d_min"):
-                                vm.payload_kwargs["d_min"] = float(params["d_min"])
-                        vm.replay_h5 = new_h5_path
-                        vm.reload()
-                        if stage_id != "reduce":
-                            if params.get("wavelength_range"):
-                                wl_r = params["wavelength_range"]
-                                vm.payload["wavelength_range"] = [
-                                    float(wl_r[0]),
-                                    float(wl_r[1]),
-                                ]
-                            if params.get("d_min"):
-                                vm.payload["d_min"] = float(params["d_min"])
-                                vm.payload_kwargs["d_min"] = float(params["d_min"])
+                            if is_reduce_out:
+                                vm.mtz_overlay_path = None
+                                vm.mtz_overlay_info = None
+                                vm.payload_kwargs["images_h5"] = new_h5_path
+                                vm.payload_kwargs["frame_index"] = 0
+                                vm.payload_kwargs.pop("wavelength_range", None)
+                                vm.payload_kwargs.pop("d_min", None)
+                            else:
+                                vm.payload_kwargs["frame_index"] = int(
+                                    vm.pipeline_runner.current_frame_index or 0
+                                )
+                                if params.get("d_min"):
+                                    vm.payload_kwargs["d_min"] = float(params["d_min"])
+                            vm.replay_h5 = new_h5_path
+                            vm.reload()
+                            if stage_id != "reduce":
+                                if params.get("wavelength_range"):
+                                    wl_r = params["wavelength_range"]
+                                    vm.payload["wavelength_range"] = [
+                                        float(wl_r[0]),
+                                        float(wl_r[1]),
+                                    ]
+                                if params.get("d_min"):
+                                    vm.payload["d_min"] = float(params["d_min"])
+                                    vm.payload_kwargs["d_min"] = float(params["d_min"])
 
                     result = vm.pipeline_runner.submit_galaxy_stage(
                         stage_id, params=params, on_complete_h5=_on_complete
@@ -7157,9 +7714,11 @@ def serve_rainbow_zones(
                             f_out.write(payload_bytes)
                         saved_paths.append(dest_path)
                     if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(
-                        ".nxs.h5"
+                        (".nxs.h5", ".nxs", ".mtz")
                     ):
                         sp = saved_paths[0]
+                        vm.mtz_overlay_path = None
+                        vm.mtz_overlay_info = None
                         if "merged" in os.path.basename(sp).lower():
                             vm.payload_kwargs["images_h5"] = sp
                         vm.replay_h5 = sp
@@ -7183,8 +7742,11 @@ def serve_rainbow_zones(
         def log_message(self, fmt: str, *args: Any) -> None:
             return
 
-    socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer((host, int(port)), _Handler) as httpd:
+    class _ThreadingServer(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    with _ThreadingServer((host, int(port)), _Handler) as httpd:
         print(
             f"Rainbow Zones server listening on http://{host}:{port}{ep_path or '/'} "
             f"(mode={default_mode})"

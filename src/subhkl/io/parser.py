@@ -99,7 +99,7 @@ def solve(
         int | None,
         typer.Option(
             min=1,
-            help="Sum count pixels into bins (default: 8 for poisson, 16 for band)",
+            help="Sum count pixels into bins (default: auto <=8 keeping >=32x32 bins/panel)",
         ),
     ] = None,
     proposal_binning: Annotated[
@@ -250,15 +250,6 @@ def solve(
                 raise ValueError(
                     "band uses --refine-modes to select free geometry; omit --no-refine/--fixed-geometry"
                 )
-            eff_binning = binning
-            if eff_binning is None:
-                eff_binning = 8
-                try:
-                    with h5py.File(frames_filename, "r") as _bf:
-                        if "images" in _bf and int(_bf["images"].shape[0]) > 240:
-                            eff_binning = 16
-                except OSError:
-                    pass
             band_result = run_scan_refinement(
                 frames_filename,
                 output_filename,
@@ -287,7 +278,7 @@ def solve(
                 d_min=d_min,
                 min_deviance=min_deviance,
                 pixel_polish=pixel_polish,
-                binning=eff_binning,
+                binning=binning,
                 maxiter=band_maxiter,
                 static_mask_file=static_mask_file,
                 search_samples=search_samples,
@@ -1014,7 +1005,7 @@ def integrator(
             "upward (broad templates soak background pedestals).  "
             "0 keeps every peak."
         ),
-    ] = 0.0,
+    ] = 5.0,
     shape_fit_normalized: Annotated[
         bool,
         typer.Option(
@@ -1075,6 +1066,16 @@ def integrator(
     rel_border_width: Annotated[
         float, typer.Option(help="Border width in fraction of image size")
     ] = 0.03,
+    allow_negative: Annotated[
+        bool,
+        typer.Option(
+            "--allow-negative/--no-allow-negative",
+            help="Take one unconstrained Fisher-scoring step around the "
+            "joint nonnegative Poisson MLE so weak reflections carry "
+            "unbiased signed intensities I +- sigI for downstream "
+            "Bayesian/Careless merging instead of being censored at zero.",
+        ),
+    ] = False,
     show_progress: Annotated[bool, typer.Option("--show-progress")] = True,
     create_visualizations: bool = False,
     chunk_size: int = 256,
@@ -1121,6 +1122,7 @@ def integrator(
         matrix_free_fp_target=matrix_free_fp_target,
         static_mask_file=static_mask_file,
         rel_border_width=rel_border_width,
+        allow_negative=allow_negative,
         show_progress=show_progress,
         create_visualizations=create_visualizations,
         chunk_size=chunk_size,

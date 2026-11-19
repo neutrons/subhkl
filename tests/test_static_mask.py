@@ -702,3 +702,20 @@ def test_mask_file_records_the_instrument_its_inputs_knew(tmp_path):
     build_mask_file([tmp_path / "scan.h5"], tmp_path / "mask.h5")
     with h5py.File(tmp_path / "mask.h5") as f:
         assert f.attrs["instrument"] == "CG4D"
+
+
+def test_load_mask_for_banks_accepts_solve_h5_em_mask(tmp_path):
+    solve_h5 = tmp_path / "solve_em_mask.h5"
+    m33 = np.zeros((32, 32), dtype=np.uint8)
+    m20 = np.ones((32, 32), dtype=np.uint8)
+    m20[:8, :8] = 0
+    with h5py.File(solve_h5, "w") as f:
+        f["detector/pixel_mask"] = np.stack([m20, m33], axis=0)
+        f["detector/mask_bank_ids"] = np.array([20, 33], dtype=np.int32)
+
+    loaded = load_mask_for_banks(solve_h5, [33, 20, 99], (32, 32))
+    assert loaded.shape == (3, 32, 32)
+    assert loaded[0].max() == 0.0  # shadowed bank 33 completely masked
+    assert loaded[1, :8, :8].max() == 0.0
+    assert loaded[1, 16:, 16:].min() == 1.0
+    assert loaded[2].min() == 1.0  # absent bank defaults to valid
