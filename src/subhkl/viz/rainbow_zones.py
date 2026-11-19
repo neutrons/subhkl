@@ -9410,6 +9410,7 @@ def render_rainbow_html(
   </div>
 
   <div id="hist-bin-tooltip" role="tooltip" style="display:none;position:fixed;z-index:9600;pointer-events:none;background:rgba(7,9,19,0.96);border:1px solid var(--accent-cyan);border-radius:5px;padding:4px 8px;box-shadow:0 8px 22px rgba(0,0,0,0.82);font-family:var(--font-display);font-size:0.64rem;line-height:1.35;color:var(--text-main);white-space:nowrap;"></div>
+  <div id="ui-hover-tooltip" role="tooltip" style="display:none;position:fixed;z-index:9650;pointer-events:none;max-width:340px;background:rgba(7,9,19,0.96);border:1px solid var(--accent-cyan);border-radius:5px;padding:5px 9px;box-shadow:0 8px 22px rgba(0,0,0,0.82);font-family:var(--font-ui, sans-serif);font-size:0.68rem;line-height:1.4;color:var(--text-main);white-space:normal;word-break:break-word;"></div>
 
   <!-- Modal Dialog: Merging and Scaling Statistics by Resolution Shell -->
   <div id="modal-merge-table" role="dialog" aria-modal="true" aria-labelledby="merge-tbl-modal-title" style="display:none;position:fixed;inset:0;z-index:9400;background:rgba(4,6,14,0.84);backdrop-filter:blur(4px);align-items:center;justify-content:center;padding:14px;">
@@ -12618,20 +12619,126 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return false;
   }}
 
+  const UI_TOOLTIP_DELAY_MS = 1500;
+  const uiHoverTooltip = document.getElementById("ui-hover-tooltip");
+  let _uiTipTimer = null;
+  let _uiTipActiveEl = null;
+  let _uiTipVisible = false;
+  let _uiTipStashedEls = [];
+
+  function positionUiHoverTooltip(el) {{
+    if (!uiHoverTooltip || !el || typeof el.getBoundingClientRect !== "function") return;
+    const rect = el.getBoundingClientRect();
+    const tipRect = uiHoverTooltip.getBoundingClientRect();
+    const vw = window.innerWidth || document.documentElement.clientWidth || 1024;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 768;
+    let left = rect.left + (rect.width - tipRect.width) * 0.5;
+    left = Math.max(8, Math.min(vw - tipRect.width - 8, left));
+    let top = rect.bottom + 7;
+    if (top + tipRect.height > vh - 8 && rect.top - tipRect.height - 7 >= 8) {{
+      top = rect.top - tipRect.height - 7;
+    }}
+    uiHoverTooltip.style.left = `${{Math.round(left)}}px`;
+    uiHoverTooltip.style.top = `${{Math.round(top)}}px`;
+  }}
+
+  function hideUiHoverTooltip() {{
+    if (_uiTipTimer) {{
+      clearTimeout(_uiTipTimer);
+      _uiTipTimer = null;
+    }}
+    _uiTipVisible = false;
+    if (uiHoverTooltip) uiHoverTooltip.style.display = "none";
+    for (let i = 0; i < _uiTipStashedEls.length; i++) {{
+      const sEl = _uiTipStashedEls[i];
+      if (sEl && !sEl.getAttribute("title") && sEl.dataset && sEl.dataset.uiTip) {{
+        sEl.setAttribute("title", sEl.dataset.uiTip);
+      }}
+      if (sEl && sEl.dataset) delete sEl.dataset.uiTip;
+    }}
+    _uiTipStashedEls = [];
+    _uiTipActiveEl = null;
+  }}
+
+  function setElementTooltip(el, text) {{
+    if (!el) return;
+    const clean = text ? String(text) : "";
+    if (_uiTipActiveEl === el || _uiTipStashedEls.indexOf(el) !== -1) {{
+      if (el.dataset) el.dataset.uiTip = clean;
+      if (typeof el.removeAttribute === "function") el.removeAttribute("title");
+      if (_uiTipActiveEl === el && _uiTipVisible && uiHoverTooltip) {{
+        if (clean) {{
+          uiHoverTooltip.textContent = clean;
+          positionUiHoverTooltip(el);
+        }} else {{
+          hideUiHoverTooltip();
+        }}
+      }}
+    }} else {{
+      el.title = clean;
+    }}
+  }}
+
+  if (typeof document !== "undefined" && typeof document.addEventListener === "function") {{
+    document.addEventListener("pointerover", (e) => {{
+      const rawTarget = e && e.target && typeof e.target.closest === "function"
+        ? e.target.closest("[title], [data-ui-tip]")
+        : null;
+      if (rawTarget === _uiTipActiveEl) return;
+      hideUiHoverTooltip();
+      if (!rawTarget) return;
+      const tipText = (rawTarget.dataset && rawTarget.dataset.uiTip) || rawTarget.getAttribute("title") || "";
+      if (!tipText) return;
+      _uiTipActiveEl = rawTarget;
+      let cur = rawTarget;
+      while (cur && cur !== document.body && cur.nodeType === 1) {{
+        const tAttr = typeof cur.getAttribute === "function" ? cur.getAttribute("title") : null;
+        if (tAttr) {{
+          if (cur.dataset) cur.dataset.uiTip = tAttr;
+          cur.removeAttribute("title");
+          _uiTipStashedEls.push(cur);
+        }}
+        cur = cur.parentElement;
+      }}
+      _uiTipTimer = setTimeout(() => {{
+        _uiTipTimer = null;
+        if (_uiTipActiveEl !== rawTarget || !uiHoverTooltip) return;
+        const latest = (rawTarget.dataset && rawTarget.dataset.uiTip) || rawTarget.getAttribute("title") || tipText;
+        if (!latest) return;
+        uiHoverTooltip.textContent = latest;
+        uiHoverTooltip.style.display = "block";
+        _uiTipVisible = true;
+        positionUiHoverTooltip(rawTarget);
+      }}, UI_TOOLTIP_DELAY_MS);
+    }});
+    document.addEventListener("pointerout", (e) => {{
+      if (!_uiTipActiveEl) return;
+      const rel = e ? e.relatedTarget : null;
+      if (rel && typeof _uiTipActiveEl.contains === "function" && _uiTipActiveEl.contains(rel)) return;
+      hideUiHoverTooltip();
+    }});
+    document.addEventListener("pointerdown", hideUiHoverTooltip, true);
+    document.addEventListener("wheel", hideUiHoverTooltip, {{ passive: true }});
+    document.addEventListener("keydown", hideUiHoverTooltip, true);
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {{
+      window.addEventListener("blur", hideUiHoverTooltip);
+    }}
+  }}
+
   function syncTopBarTooltips(stats) {{
     const subEl = document.querySelector(".subtitle-tag");
     if (subEl) {{
       const cellTxt = Array.isArray(DATA.cell) && DATA.cell.length === 6
         ? ` • Cell: a=${{DATA.cell[0].toFixed(2)}}, b=${{DATA.cell[1].toFixed(2)}}, c=${{DATA.cell[2].toFixed(2)}} Å, α=${{DATA.cell[3].toFixed(1)}}°, β=${{DATA.cell[4].toFixed(1)}}°, γ=${{DATA.cell[5].toFixed(1)}}°`
         : "";
-      subEl.title = `${{subEl.textContent || ""}}${{cellTxt}} — Active instrument, space group, and workflow stage`;
+      setElementTooltip(subEl, `${{subEl.textContent || ""}}${{cellTxt}} — Active instrument, space group, and workflow stage`);
     }}
     const appTitle = document.getElementById("app-title");
     const appVer = document.getElementById("app-version");
     if (appTitle) {{
       const verStr = appVer ? (appVer.textContent || "").trim() : "";
-      appTitle.title = `sUBhkl ${{verStr}} — Quasi-Laue & TOF single-crystal neutron diffraction indexing, integration, and scaling`;
-      if (appVer) appVer.title = `sUBhkl version ${{verStr}}`;
+      setElementTooltip(appTitle, `sUBhkl ${{verStr}} — Quasi-Laue & TOF single-crystal neutron diffraction indexing, integration, and scaling`);
+      if (appVer) setElementTooltip(appVer, `sUBhkl version ${{verStr}}`);
     }}
     const peaksPill = document.getElementById("hud-peaks-pill");
     if (peaksPill && stats) {{
@@ -12639,23 +12746,34 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const wlLo = Number(state.lamMin || 0).toFixed(2);
       const wlHi = Number(state.lamMax || 0).toFixed(2);
       const dCut = Number(state.dMin || 0).toFixed(2);
-      peaksPill.title =
+      setElementTooltip(
+        peaksPill,
         `PEAKS ${{stats.peaksText}}: ${{stats.nCap}} indexed reflections captured by enabled Laue zones [uvw] (numerator) ` +
-        `out of ${{stats.nVis}} visible ${{srcDesc}} reflections on this frame within λ=${{wlLo}}–${{wlHi}} Å and d ≥ ${{dCut}} Å (denominator)`;
+        `out of ${{stats.nVis}} visible ${{srcDesc}} reflections on this frame within λ=${{wlLo}}–${{wlHi}} Å and d ≥ ${{dCut}} Å (denominator)`
+      );
     }}
     const rmsPill = document.getElementById("hud-rms-pill");
     if (rmsPill && stats) {{
-      rmsPill.title = stats.nErr > 0
-        ? `Δθ = ${{stats.rmsText}} (across ${{stats.nErr}} matched detector spots in active zones): RMS angular offset between observed spot centroids and theoretical UB·hkl Bragg directions (lower = tighter indexing; updates live during Solve)`
-        : "Δθ: RMS angular offset between observed detector spot centroids and theoretical UB·hkl Bragg directions across active-zone spots (run 2. Solve or enable zones covering observed spots)";
+      setElementTooltip(
+        rmsPill,
+        stats.nErr > 0
+          ? `Δθ = ${{stats.rmsText}} (across ${{stats.nErr}} matched detector spots in active zones): RMS angular offset between observed spot centroids and theoretical UB·hkl Bragg directions (lower = tighter indexing; updates live during Solve)`
+          : "Δθ: RMS angular offset between observed detector spot centroids and theoretical UB·hkl Bragg directions across active-zone spots (run 2. Solve or enable zones covering observed spots)"
+      );
     }}
     const zonesPill = document.getElementById("hud-zones-pill");
     if (zonesPill && stats) {{
-      zonesPill.title = `ZONES ${{stats.zonesText}}: ${{state.activeZones.size}} active Laue zone conics [uvw] displayed on the detector and Wulff map (max Miller index order |u|,|v|,|w| ≤ ${{state.maxZoneOrder}})`;
+      setElementTooltip(
+        zonesPill,
+        `ZONES ${{stats.zonesText}}: ${{state.activeZones.size}} active Laue zone conics [uvw] displayed on the detector and Wulff map (max Miller index order |u|,|v|,|w| ≤ ${{state.maxZoneOrder}})`
+      );
     }}
     const gonioPill = document.getElementById("hud-gonio-pill");
     if (gonioPill && stats) {{
-      gonioPill.title = `GONIO: ${{stats.gonioText}} — Goniometer motor angles / crystal setting for the active frame`;
+      setElementTooltip(
+        gonioPill,
+        `GONIO: ${{stats.gonioText}} — Goniometer motor angles / crystal setting for the active frame`
+      );
     }}
     const selFrame = document.getElementById("sel-frame");
     const frameCtrl = document.getElementById("hud-frame-ctrl");
@@ -12665,27 +12783,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const fTotal = (DATA.frames && DATA.frames.length) ? DATA.frames.length : 1;
       const fCur = (typeof DATA.frame_index === "number" ? DATA.frame_index : 0) + 1;
       const fullFrameTip = `FRAME (${{fCur}} / ${{fTotal}}): ${{fTxt}} — Switch active run / goniometer orientation`;
-      selFrame.title = fullFrameTip;
-      if (frameCtrl) frameCtrl.title = fullFrameTip;
+      setElementTooltip(selFrame, fullFrameTip);
+      if (frameCtrl) setElementTooltip(frameCtrl, fullFrameTip);
     }}
     const selData = document.getElementById("sel-galaxy-h5");
     if (selData) {{
       const optD = selData.options && selData.selectedIndex >= 0 ? selData.options[selData.selectedIndex] : null;
       const dTxt = optD && optD.value && !String(optD.value).startsWith("__action_") ? `${{optD.textContent}} — ` : "";
-      selData.title = `${{dTxt}}Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus/.mtz files, or select from Galaxy History`;
+      setElementTooltip(selData, `${{dTxt}}Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus/.mtz files, or select from Galaxy History`);
     }}
     const btnArcs = document.getElementById("btn-zone-arcs");
     if (btnArcs) {{
-      btnArcs.title = `Arcs (${{state.showZoneArcs ? "Shown" : "Hidden"}}): Show/Hide single-arc Laue zone curves [uvw] on the detector`;
+      setElementTooltip(btnArcs, `Arcs (${{state.showZoneArcs ? "Shown" : "Hidden"}}): Show/Hide single-arc Laue zone curves [uvw] on the detector`);
     }}
     const btnCmap = document.getElementById("btn-heatmap-cmap");
     if (btnCmap) {{
       const cmapNames = {{ magma: "Magma", cyan: "Cyan Glow", gray: "Film (Monochrome)" }};
-      btnCmap.title = `Heatmap (${{cmapNames[state.heatmapStyle] || state.heatmapStyle}}): Cycle detector intensity colormap (Magma / Cyan Glow / Film)`;
+      setElementTooltip(btnCmap, `Heatmap (${{cmapNames[state.heatmapStyle] || state.heatmapStyle}}): Cycle detector intensity colormap (Magma / Cyan Glow / Film)`);
     }}
     const btnStereo = document.getElementById("btn-stereo-toggle");
     if (btnStereo) {{
-      btnStereo.title = `Wulff (${{state.showStereo ? "Shown" : "Hidden"}}): Show/Hide 3D Crystal Wulff Stereogram Inset`;
+      setElementTooltip(btnStereo, `Wulff (${{state.showStereo ? "Shown" : "Hidden"}}): Show/Hide 3D Crystal Wulff Stereogram Inset`);
     }}
   }}
 

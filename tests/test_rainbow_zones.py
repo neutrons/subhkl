@@ -7486,12 +7486,81 @@ def test_live_solve_dtheta_diagnostic_topbar_tooltips_and_controls_cleanup(
     assert float(np.sqrt(np.mean(np.square(solve_errs)))) > 0.01
     assert any(float(z["angular_rms_deg"]) > 0.0 for z in solve_payload["zones"])
 
-    # 3. Verify HTML/CSS/JS top-bar tooltips, non-overlapping .subtitle-tag CSS, and removed ALL / Walk buttons
+    # 3. Verify blind_band.discover() writes .blind.h5 cleanly without temp-file collision
+    import types
+
+    import subhkl.search.blind_band as bb_mod
+
+    orig_ll = bb_mod.lattice_ladder
+    orig_rbg = bb_mod.refine_band_geometry
+    try:
+
+        def _fake_ladder(*_a, **kw):
+            on_rung = kw.get("on_rung")
+            if callable(on_rung):
+                on_rung("rung_30", 30, U_true)
+            return [(U_true, 12.5)]
+
+        def _fake_refine(*_a, **_kw):
+            return {
+                "U": U_true,
+                "score": 15.0,
+                "radial_scale": 0.0,
+                "axial_scale": 0.0,
+                "global_rot_vec": np.zeros(3),
+                "global_trans_m": np.zeros(3),
+            }
+
+        bb_mod.lattice_ladder = _fake_ladder
+        bb_mod.refine_band_geometry = _fake_refine
+        fake_obs = (
+            np.full(32, active_bks[0], dtype=np.int32),
+            np.linspace(16.0, 200.0, 32),
+            np.linspace(16.0, 200.0, 32),
+            np.linspace(5.0, 40.0, 32),
+            np.ones(32),
+            np.zeros(32, dtype=np.int32),
+            np.zeros((32, 3)),
+            np.linspace(1.0, 10.0, 32),
+            np.repeat(R_run[None, :, :], 32, axis=0),
+            np.repeat(np.array([[0.0, 1.0, 0.0]]), 32, axis=0),
+        )
+        solve_out = tmp_path / "subhkl_solve_test.h5"
+        fake_args = types.SimpleNamespace(
+            output=str(solve_out),
+            nexus=str(merged_h5),
+            instrument="MANDI",
+            cell=[11.93, 11.93, 11.93, 90.0, 90.0, 90.0],
+            space_group="I a -3 d",
+            wl_min=2.0,
+            wl_max=4.0,
+            d_min=1.5,
+            finder="peaks",
+            min_deviance=0.0,
+            runs=[0],
+            stable_runs=[0],
+            modes=frozenset({"sample"}),
+            _cached_obs_kin=fake_obs,
+        )
+        blind_written = bb_mod.discover(fake_args, samples=16, candidates=1, seed=0)
+        assert os.path.isfile(blind_written)
+        assert not list(tmp_path.glob("*.tmp.h5"))
+        with h5py.File(blind_written, "r") as bf_chk:
+            assert "orientations" in bf_chk["search"]
+            assert "full_scores" in bf_chk["search"]
+            assert str(bf_chk["search"].attrs["ladder_stage"]) == "blind_selected"
+    finally:
+        bb_mod.lattice_ladder = orig_ll
+        bb_mod.refine_band_geometry = orig_rbg
+
+    # 4. Verify HTML/CSS/JS top-bar tooltips (1.5s custom tooltip), non-overlapping .subtitle-tag CSS, and removed ALL / Walk buttons
     html_doc = render_rainbow_html(solve_payload)
     assert 'id="btn-zones-all"' not in html_doc
     assert 'id="btn-ladder-play"' not in html_doc
     assert "WALK SOLVE STEPS" not in html_doc
     assert "switch steps with &lt; &gt; arrows" in html_doc
+    assert 'id="ui-hover-tooltip"' in html_doc
+    assert "const UI_TOOLTIP_DELAY_MS = 1500;" in html_doc
 
     # Every top-bar field, HUD pill, and control button has a descriptive tooltip attribute
     for top_id in (
@@ -7536,11 +7605,15 @@ def test_live_solve_dtheta_diagnostic_topbar_tooltips_and_controls_cleanup(
         script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
         inline_js = script_blocks[-1]
         fn_extract: list[str] = []
-        for fn in ("syncTopBarTooltips", "updateHUD"):
+        for fn in ("setElementTooltip", "syncTopBarTooltips", "updateHUD"):
             m_fn = re.search(rf"function {fn}\b[\s\S]*?\n  \}}(?=\n)", inline_js)
             assert m_fn is not None, f"Missing JS function {fn}"
             fn_extract.append(m_fn.group(0))
         node_script = f"""
+let _uiTipActiveEl = null;
+let _uiTipStashedEls = [];
+let _uiTipVisible = false;
+const uiHoverTooltip = null;
 const els = {{
   "val-indexed": {{ textContent: "", title: "" }},
   "val-rms": {{ textContent: "", title: "" }},
