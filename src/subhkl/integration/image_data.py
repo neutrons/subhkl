@@ -11,6 +11,9 @@ class ImageData:
     file_offsets: np.ndarray | None = None
     raw_files: list[str] | None = None
     bank_mapping: dict[int, int] = field(default_factory=dict)
+    # [microsecond] per image, events sorted by (flat pixel, tof); only set
+    # when a NeXus file is loaded with its events (see subhkl.io.events).
+    events: dict[int, np.ndarray] | None = None
 
     def get_label(self, img_key: int) -> str:
         files = self.raw_files

@@ -69,12 +69,20 @@ def _init_wavelength(
     return Wavelength(min, max)
 
 
-def _init_ims(filename: str, ext: str, instrument: str, is_merged: bool) -> ImageData:
+def _init_ims(
+    filename: str,
+    ext: str,
+    instrument: str,
+    is_merged: bool,
+    load_events: bool = False,
+) -> ImageData:
     if ext == ".h5":
         if is_merged:
             image_data = loader.ImageLoader.load_merged_h5(filename)
         else:
-            image_data = loader.ImageLoader.load_nexus(filename, instrument)
+            image_data = loader.ImageLoader.load_nexus(
+                filename, instrument, load_events=load_events
+            )
         return image_data
     else:
         ims = {0: np.array(PIL.Image.open(filename))}
@@ -101,6 +109,7 @@ class Peaks:
         goniometer_angles: list[float] | None = None,
         wavelength_min: float | None = None,
         wavelength_max: float | None = None,
+        load_events: bool = False,
     ):
         _name, ext = os.path.splitext(filename)
         if ext not in (".h5", ".hdf5") and (
@@ -120,7 +129,9 @@ class Peaks:
         self.wavelength = _init_wavelength(
             filename, ext, instrument, is_merged, wavelength_min, wavelength_max
         )
-        self.image = _init_ims(filename, ext, instrument, is_merged)
+        self.image = _init_ims(
+            filename, ext, instrument, is_merged, load_events=load_events
+        )
 
     def get_detector(self, physical_bank: int) -> Detector:
         bank_id = str(physical_bank)

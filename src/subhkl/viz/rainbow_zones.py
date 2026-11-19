@@ -8088,7 +8088,7 @@ def render_rainbow_html(
             <span class="sw-time" id="stdio-stopwatch-time">00:00<span class="sw-ms">.000</span></span>
           </div>
         </div>
-        <canvas id="canvas-hist" title="Click to cycle resolution sparkline: CC½ vs d → Completeness vs d → ⟨I/σ⟩ vs d" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
+        <canvas id="canvas-hist" aria-label="Resolution sparkline (hover bin for shell edges and statistic; click to cycle metric)" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
       </div>
     </aside>
   </main>
@@ -8345,6 +8345,8 @@ def render_rainbow_html(
       </div>
     </div>
   </div>
+
+  <div id="hist-bin-tooltip" role="tooltip" style="display:none;position:fixed;z-index:9600;pointer-events:none;background:rgba(7,9,19,0.96);border:1px solid var(--accent-cyan);border-radius:5px;padding:4px 8px;box-shadow:0 8px 22px rgba(0,0,0,0.82);font-family:var(--font-display);font-size:0.64rem;line-height:1.35;color:var(--text-main);white-space:nowrap;"></div>
 
 <script>
 window.RAINBOW_ZONES_DATA = {payload_json};
@@ -9591,6 +9593,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     wulffPitchDeg: 0.0,
     wulffZoom: 1.0,
     histMetric: "cc_half",        // "cc_half" | "completeness" | "isigi"
+    hoveredHistBin: null,         // 0..nBins-1 when hovering #canvas-hist resolution bar
     lamMin: Number(wlRange[0]),
     lamMax: Number(wlRange[1]),
     dMin: initDminVal,
@@ -11578,6 +11581,121 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   const histCanvas = document.getElementById("canvas-hist");
+  const histBinTooltip = document.getElementById("hist-bin-tooltip");
+
+  function getMergeResolutionBins() {{
+    const m = DATA.merge_metrics;
+    if (!m) return [];
+    if (Array.isArray(m.cc_half_bins) && m.cc_half_bins.length > 0) return m.cc_half_bins;
+    if (Array.isArray(m.resolution_bins) && m.resolution_bins.length > 0) return m.resolution_bins;
+    return [];
+  }}
+
+  function formatHistBinSummary(b, idx, nBins, metric) {{
+    const dMaxRaw = b && b.d_max !== undefined && b.d_max !== null ? Number(b.d_max) : NaN;
+    const dMinRaw = b && b.d_min !== undefined && b.d_min !== null ? Number(b.d_min) : NaN;
+    const edgesText = (Number.isFinite(dMaxRaw) && Number.isFinite(dMinRaw))
+      ? `${{dMaxRaw.toFixed(2)}}–${{dMinRaw.toFixed(2)}} Å`
+      : `Bin ${{idx + 1}}/${{nBins}}`;
+    let statLabel = "CC½";
+    let statValue = "n/a";
+    let statColor = "#94a3b8";
+    if (metric === "completeness") {{
+      statLabel = "Compl.";
+      const hasC = b && b.completeness_pct !== null && b.completeness_pct !== undefined && Number.isFinite(Number(b.completeness_pct));
+      if (hasC) {{
+        const cVal = Number(b.completeness_pct);
+        statValue = `${{cVal.toFixed(1)}}%`;
+        statColor = cVal >= 50 ? "#34d399" : "#38bdf8";
+      }}
+    }} else if (metric === "isigi") {{
+      statLabel = "⟨I/σ⟩";
+      const hasS = b && b.mean_isigi !== null && b.mean_isigi !== undefined && Number.isFinite(Number(b.mean_isigi));
+      if (hasS) {{
+        const sVal = Number(b.mean_isigi);
+        statValue = sVal.toFixed(2);
+        statColor = sVal >= 5 ? "#fbbf24" : "#38bdf8";
+      }}
+    }} else {{
+      const hasCc = b && b.cc_half !== null && b.cc_half !== undefined && Number.isFinite(Number(b.cc_half));
+      if (hasCc) {{
+        const ccRaw = Number(b.cc_half);
+        statValue = ccRaw.toFixed(3);
+        statColor = ccRaw >= 0.8 ? "#34d399" : (ccRaw >= 0.5 ? "#fbbf24" : "#f43f5e");
+      }}
+    }}
+    const nRefl = (b && b.n_refl !== null && b.n_refl !== undefined && Number.isFinite(Number(b.n_refl)))
+      ? Number(b.n_refl)
+      : null;
+    const nTheo = (b && b.n_theo !== null && b.n_theo !== undefined && Number.isFinite(Number(b.n_theo)) && Number(b.n_theo) > 0)
+      ? Number(b.n_theo)
+      : null;
+    const reflText = nRefl !== null
+      ? (nTheo !== null ? `${{nRefl}}/${{nTheo}} refl` : `${{nRefl}} refl`)
+      : "";
+    return {{
+      binNum: idx + 1,
+      nBins,
+      edgesText,
+      statLabel,
+      statValue,
+      statColor,
+      reflText,
+      shortLine: `${{edgesText}} • ${{statLabel}}=${{statValue}}`,
+    }};
+  }}
+
+  function hideHistBinTooltip() {{
+    if (histBinTooltip) {{
+      histBinTooltip.style.display = "none";
+    }}
+  }}
+
+  function updateHistBinTooltip(binIdx) {{
+    if (!histBinTooltip || !histCanvas) return;
+    const bins = getMergeResolutionBins();
+    if (!bins.length || binIdx === null || binIdx === undefined || binIdx < 0 || binIdx >= bins.length) {{
+      hideHistBinTooltip();
+      return;
+    }}
+    const metric = state.histMetric || "cc_half";
+    const info = formatHistBinSummary(bins[binIdx], binIdx, bins.length, metric);
+    histBinTooltip.innerHTML =
+      `<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">` +
+        `<span style="color:#cbd5e1;">Bin ${{info.binNum}}/${{info.nBins}}: <strong style="color:#f8fafc;">${{info.edgesText}}</strong></span>` +
+        `<strong style="color:${{info.statColor}};">${{info.statLabel}} = ${{info.statValue}}</strong>` +
+      `</div>` +
+      `<div style="font-size:0.57rem;color:var(--text-dim);margin-top:1px;">` +
+        `${{info.reflText ? `${{info.reflText}} • ` : ""}}click to cycle metric ↻` +
+      `</div>`;
+    histBinTooltip.style.borderColor = info.statColor;
+    histBinTooltip.style.display = "block";
+    const rect = histCanvas.getBoundingClientRect();
+    const w = Math.max(200, rect.width || (histCanvas.parentElement ? histCanvas.parentElement.clientWidth : 260));
+    const barW = (w - 16) / Math.max(1, bins.length);
+    const barCenterX = (rect.left || 0) + 8 + (binIdx + 0.5) * barW;
+    const tipW = histBinTooltip.offsetWidth || 210;
+    const tipH = histBinTooltip.offsetHeight || 34;
+    const vw = window.innerWidth || 1280;
+    const leftPx = Math.max(8, Math.min(vw - tipW - 8, Math.round(barCenterX - tipW * 0.5)));
+    const topPx = Math.max(8, Math.round((rect.top || 60) - tipH - 6));
+    histBinTooltip.style.left = `${{leftPx}}px`;
+    histBinTooltip.style.top = `${{topPx}}px`;
+  }}
+
+  function resolveHistBinAtClientX(clientX) {{
+    if (!histCanvas) return null;
+    const bins = getMergeResolutionBins();
+    if (!bins.length) return null;
+    const rect = histCanvas.getBoundingClientRect();
+    const w = Math.max(200, rect.width || (histCanvas.parentElement ? histCanvas.parentElement.clientWidth : 260));
+    const localX = clientX - (rect.left || 0);
+    if (!Number.isFinite(localX) || localX < 2 || localX > w - 2) return null;
+    const barW = (w - 16) / Math.max(1, bins.length);
+    const rawIdx = Math.floor((localX - 8) / Math.max(1e-6, barW));
+    return Math.max(0, Math.min(bins.length - 1, rawIdx));
+  }}
+
   if (histCanvas) {{
     histCanvas.addEventListener("click", () => {{
       if (!DATA.merge_metrics) return;
@@ -11585,15 +11703,38 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.histMetric = order[(order.indexOf(state.histMetric || "cc_half") + 1) % order.length];
       drawHistogram(PEAKS.filter(isPeakVisible));
     }});
+    histCanvas.addEventListener("mousemove", (ev) => {{
+      const idx = resolveHistBinAtClientX(ev.clientX);
+      if (idx !== state.hoveredHistBin) {{
+        state.hoveredHistBin = idx;
+        drawHistogram(PEAKS.filter(isPeakVisible));
+      }} else if (idx !== null) {{
+        updateHistBinTooltip(idx);
+      }}
+    }});
+    histCanvas.addEventListener("mouseleave", () => {{
+      if (state.hoveredHistBin !== null) {{
+        state.hoveredHistBin = null;
+        hideHistBinTooltip();
+        drawHistogram(PEAKS.filter(isPeakVisible));
+      }} else {{
+        hideHistBinTooltip();
+      }}
+    }});
   }}
   function drawHistogram(visiblePeaks) {{
     const m = DATA.merge_metrics;
-    const hasMergeBins = Boolean(m && Array.isArray(m.cc_half_bins) && m.cc_half_bins.length > 0);
+    const mergeBins = getMergeResolutionBins();
+    const hasMergeBins = mergeBins.length > 0;
     if (histCanvas) {{
       histCanvas.style.display = hasMergeBins ? "block" : "none";
       histCanvas.style.height = hasMergeBins ? "50px" : "40px";
     }}
-    if (!histCanvas || !hasMergeBins) return;
+    if (!histCanvas || !hasMergeBins) {{
+      state.hoveredHistBin = null;
+      hideHistBinTooltip();
+      return;
+    }}
     const rect = histCanvas.getBoundingClientRect();
     const w = Math.max(200, rect.width || (histCanvas.parentElement ? histCanvas.parentElement.clientWidth : 260));
     const h = Math.max(45, rect.height || 50);
@@ -11605,62 +11746,86 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.clearRect(0, 0, w, h);
 
     if (hasMergeBins) {{
-      const bins = m.cc_half_bins;
+      const bins = mergeBins;
       const nBins = bins.length;
+      const hovIdx = (typeof state.hoveredHistBin === "number" && state.hoveredHistBin >= 0 && state.hoveredHistBin < nBins)
+        ? state.hoveredHistBin
+        : null;
       const barW = (w - 16) / Math.max(1, nBins);
       const metric = state.histMetric || "cc_half";
       const maxComp = Math.max(20, ...bins.map(b => Number(b.completeness_pct || 0)));
       const maxIsig = Math.max(5, ...bins.map(b => Number(b.mean_isigi || 0)));
+      if (hovIdx !== null) {{
+        ctx.fillStyle = "rgba(148, 163, 184, 0.14)";
+        ctx.fillRect(8 + hovIdx * barW, 1, Math.max(3, barW), h - 15);
+      }}
       for (let i = 0; i < nBins; i++) {{
         const x = 8 + i * barW;
+        const bw = Math.max(2, barW - 2);
+        let bh = 1;
+        let fillCol = "#1e293b";
         if (metric === "completeness") {{
           const cVal = Math.max(0, Number(bins[i].completeness_pct || 0));
           const frac = Math.min(1, cVal / maxComp);
-          const bh = cVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
-          const y = h - 14 - bh;
-          ctx.fillStyle = cVal > 0 ? (cVal >= 50 ? "#34d399" : "#38bdf8") : "#1e293b";
-          ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+          bh = cVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
+          fillCol = cVal > 0 ? (cVal >= 50 ? "#34d399" : "#38bdf8") : "#1e293b";
         }} else if (metric === "isigi") {{
           const sVal = Math.max(0, Number(bins[i].mean_isigi || 0));
           const frac = Math.min(1, sVal / maxIsig);
-          const bh = sVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
-          const y = h - 14 - bh;
-          ctx.fillStyle = sVal > 0 ? (sVal >= 5 ? "#fbbf24" : "#38bdf8") : "#1e293b";
-          ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+          bh = sVal > 0 ? Math.max(2, frac * (h - 20)) : 1;
+          fillCol = sVal > 0 ? (sVal >= 5 ? "#fbbf24" : "#38bdf8") : "#1e293b";
         }} else {{
           const rawCc = bins[i].cc_half;
           const hasCc = rawCc !== null && rawCc !== undefined && Number.isFinite(Number(rawCc));
           const ccVal = hasCc ? Math.max(0, Math.min(1, Number(rawCc))) : 0;
-          const bh = hasCc ? Math.max(2, ccVal * (h - 20)) : 1;
-          const y = h - 14 - bh;
-          ctx.fillStyle = !hasCc ? "#1e293b" : (ccVal >= 0.8 ? "#34d399" : (ccVal >= 0.5 ? "#fbbf24" : "#f43f5e"));
-          ctx.fillRect(x + 1, y, Math.max(2, barW - 2), bh);
+          bh = hasCc ? Math.max(2, ccVal * (h - 20)) : 1;
+          fillCol = !hasCc ? "#1e293b" : (ccVal >= 0.8 ? "#34d399" : (ccVal >= 0.5 ? "#fbbf24" : "#f43f5e"));
+        }}
+        const y = h - 14 - bh;
+        ctx.globalAlpha = (hovIdx !== null && i !== hovIdx) ? 0.55 : 1.0;
+        ctx.fillStyle = fillCol;
+        ctx.fillRect(x + 1, y, bw, bh);
+        if (i === hovIdx) {{
+          ctx.globalAlpha = 1.0;
+          ctx.strokeStyle = "#f8fafc";
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x + 1, y, bw, bh);
         }}
       }}
-      ctx.fillStyle = "#94a3b8";
+      ctx.globalAlpha = 1.0;
       ctx.font = "9px monospace";
-      const d0 = bins[0] && bins[0].d_max ? `${{Number(bins[0].d_max).toFixed(1)}}Å` : "low-q";
-      const d1 = bins[nBins - 1] && bins[nBins - 1].d_min ? `${{Number(bins[nBins - 1].d_min).toFixed(2)}}Å` : "d_min";
-      ctx.fillText(d0, 6, h - 3);
-      let midLbl = "";
-      let midCol = "#38bdf8";
-      if (metric === "completeness") {{
-        const compOv = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
-        midLbl = `Compl. vs d (${{compOv}}) ↻`;
-        midCol = "#34d399";
-      }} else if (metric === "isigi") {{
-        const isigOv = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
-        midLbl = `⟨I/σ⟩ vs d (${{isigOv}}) ↻`;
-        midCol = "#fbbf24";
+      if (hovIdx !== null) {{
+        const info = formatHistBinSummary(bins[hovIdx], hovIdx, nBins, metric);
+        ctx.fillStyle = info.statColor;
+        const txtX = Math.max(6, Math.round((w - info.shortLine.length * 5.4) * 0.5));
+        ctx.fillText(info.shortLine, txtX, h - 3);
+        updateHistBinTooltip(hovIdx);
       }} else {{
-        const ccOv = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
-        midLbl = `CC½ vs d (${{ccOv}}) ↻`;
-        midCol = "#38bdf8";
+        hideHistBinTooltip();
+        ctx.fillStyle = "#94a3b8";
+        const d0 = bins[0] && bins[0].d_max ? `${{Number(bins[0].d_max).toFixed(1)}}Å` : "low-q";
+        const d1 = bins[nBins - 1] && bins[nBins - 1].d_min ? `${{Number(bins[nBins - 1].d_min).toFixed(2)}}Å` : "d_min";
+        ctx.fillText(d0, 6, h - 3);
+        let midLbl = "";
+        let midCol = "#38bdf8";
+        if (metric === "completeness") {{
+          const compOv = typeof m.completeness_pct === "number" ? `${{m.completeness_pct.toFixed(1)}}%` : "—";
+          midLbl = `Compl. vs d (${{compOv}}) ↻`;
+          midCol = "#34d399";
+        }} else if (metric === "isigi") {{
+          const isigOv = typeof m.mean_i_over_sigi === "number" ? m.mean_i_over_sigi.toFixed(1) : "—";
+          midLbl = `⟨I/σ⟩ vs d (${{isigOv}}) ↻`;
+          midCol = "#fbbf24";
+        }} else {{
+          const ccOv = typeof m.cc_half_overall === "number" ? m.cc_half_overall.toFixed(3) : "—";
+          midLbl = `CC½ vs d (${{ccOv}}) ↻`;
+          midCol = "#38bdf8";
+        }}
+        ctx.fillStyle = midCol;
+        ctx.fillText(midLbl, Math.max(36, w * 0.24), h - 3);
+        ctx.fillStyle = "#94a3b8";
+        ctx.fillText(d1, Math.max(w - 36, 60), h - 3);
       }}
-      ctx.fillStyle = midCol;
-      ctx.fillText(midLbl, Math.max(36, w * 0.24), h - 3);
-      ctx.fillStyle = "#94a3b8";
-      ctx.fillText(d1, Math.max(w - 36, 60), h - 3);
       return;
     }}
 
@@ -14706,6 +14871,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     INTEGRATED_PEAKS = nextBuckets.integPeaks;
     INTEGRATED_SAMPLE_PEAKS = nextBuckets.integSample;
     DATA.merge_metrics = newPayload.merge_metrics || null;
+    state.hoveredHistBin = null;
+    hideHistBinTooltip();
     DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
     DATA.default_color_mode = newPayload.default_color_mode || null;
     const preferredSrc = isFrameSwitch

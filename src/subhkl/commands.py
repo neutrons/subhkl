@@ -1466,7 +1466,19 @@ def run_rbf_integrator(
     create_visualizations: bool = False,
     chunk_size: int = 256,
     max_workers: int | None = None,
+    tof_gate: str = "auto",
+    tof_gate_coverage: float = 0.95,
+    tof_gate_search: float = 0.05,
+    tof_sideband_factor: float = 4.0,
 ):
+    """Integrate the predicted reflections.
+
+    ``tof_gate`` selects time-of-flight gating when the images file carries
+    events (see ``subhkl.io.events``): "auto" measures the gate from the
+    data, "lo,hi" sets its relative edges around the predicted time, and
+    "off" integrates the images of the whole wavelength band as before.
+    Files without events are always integrated that way.
+    """
     apply_detector_calibration(integration_peaks_filename, instrument)
 
     import h5py
@@ -1523,6 +1535,31 @@ def run_rbf_integrator(
     one_image = next(iter(peaks.image.ims.values()))
     border_width = int(rel_border_width * min(one_image.shape[0], one_image.shape[1]))
 
+    from subhkl.io.events import EventStore, has_events
+    from subhkl.search.tof_gate import parse_gate
+
+    event_store = None
+    gate = None
+    if str(tof_gate).strip().lower() != "off" and has_events(filename):
+        event_store = EventStore(filename)
+        gate = parse_gate(tof_gate)
+        if event_store.l1 is None:
+            from subhkl.config import reduction_settings
+
+            event_store.l1 = reduction_settings.get(instrument, {}).get("L1")
+        if event_store.l1 is None:
+            print("Events found but no moderator distance L1; integrating in 2D.")
+            event_store.close()
+            event_store = None
+        else:
+            print(
+                f"Time-of-flight gated integration (L1 = {event_store.l1} m, "
+                f"gate: {tof_gate})"
+            )
+
+    def _read_events(img_key):
+        return event_store.image_events(int(img_key), peaks.image.ims[img_key])
+
     result = integrate_peaks_rbf_ssn(
         peak_dict=peak_dict,
         peaks_obj=peaks,  # Pass the full Peaks object
@@ -1552,7 +1589,15 @@ def run_rbf_integrator(
         gonio_offsets=gonio_offsets,
         per_run_trans=per_run_trans,
         frame_to_run=frame_to_run,
+        event_reader=_read_events if event_store is not None else None,
+        tof_l1=event_store.l1 if event_store is not None else None,
+        tof_gate=gate,
+        tof_gate_coverage=tof_gate_coverage,
+        tof_gate_search=tof_gate_search,
+        tof_sideband_factor=tof_sideband_factor,
     )
+    if event_store is not None:
+        event_store.close()
 
     print(f"Saving RBF integrated peaks to {output_filename}")
     with h5py.File(output_filename, "w") as f:
@@ -1572,6 +1617,22 @@ def run_rbf_integrator(
         f["peaks/pixel_r"], f["peaks/pixel_c"] = result.peak_rows, result.peak_cols
         f["peaks/var_u"], f["peaks/var_v"] = result.var_u, result.var_v
         f["peaks/cov_uv"] = result.cov_uv
+
+        # Time-of-flight gating: every row is one reflection measured inside
+        # its own time window, so harmonics are separate rows with their own
+        # intensities instead of one multiplet intensity repeated.
+        if result.tof_info is not None:
+            used = result.tof_info["gate"]
+            f["peaks/tof"] = result.tof
+            f["peaks/tof_background"] = result.tof_bg
+            grp = f.create_group("tof_gate")
+            grp.attrs["lo"], grp.attrs["hi"] = used.lo, used.hi
+            grp.attrs["source"] = used.source
+            if used.coverage is not None:
+                grp.attrs["coverage"] = used.coverage
+            grp.attrs["L1"] = event_store.l1
+            grp["stack_edges"] = result.tof_info["stack_edges"]
+            grp["stack_counts"] = result.tof_info["stack_hist"]
 
         # Copy metadata
         copy_keys = [
@@ -1640,13 +1701,27 @@ def run_reduce(
     instrument: str,
     wavelength_min: float | None = None,
     wavelength_max: float | None = None,
+    store_events: bool | None = None,
 ):
+    """Collapse a NeXus event file to one image per detector bank.
+
+    ``store_events`` keeps the event times of flight next to the images,
+    sorted by pixel (see ``subhkl.io.events``), so the integrator can gate
+    each reflection in time.  None (the default) stores them for
+    instruments whose settings give a moderator distance ``L1``.
+    """
+    from subhkl.config import reduction_settings
+
+    l1 = reduction_settings.get(instrument, {}).get("L1")
+    if store_events is None:
+        store_events = l1 is not None
     print(f"Reducing {nexus_filename} -> {output_filename}")
     peaks_handler = Peaks(
         nexus_filename,
         instrument,
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
+        load_events=store_events,
     )
 
     if not peaks_handler.image.ims:
@@ -1688,19 +1763,36 @@ def run_reduce(
         )
         f.attrs["instrument"] = instrument
 
+        events = peaks_handler.image.events
+        if store_events and events is not None:
+            from subhkl.io.events import write_events
+
+            write_events(f, [events[b] for b in sorted_banks], l1=l1)
+            print(f"  stored {sum(len(events[b]) for b in sorted_banks)} events")
+        elif store_events:
+            print("  no event times found; storing images only")
+
     print(f"Saved {n_images} banks to {output_filename}")
 
 
 def _reduce_worker(
-    task: tuple[str, str, str, float | None, float | None],
+    task: tuple[str, str, str, float | None, float | None, bool | None],
 ) -> str:
-    nexus_filename, output_filename, instrument, wavelength_min, wavelength_max = task
+    (
+        nexus_filename,
+        output_filename,
+        instrument,
+        wavelength_min,
+        wavelength_max,
+        store_events,
+    ) = task
     run_reduce(
         nexus_filename,
         output_filename,
         instrument,
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
+        store_events=store_events,
     )
     return output_filename
 
@@ -1711,6 +1803,7 @@ def run_reduce_batch(
     wavelength_min: float | None = None,
     wavelength_max: float | None = None,
     max_workers: int | None = None,
+    store_events: bool | None = None,
 ) -> list[str]:
     """Reduce multiple (nexus_filename, output_filename) pairs in parallel across CPU cores."""
     import concurrent.futures
@@ -1726,13 +1819,14 @@ def run_reduce_batch(
             instrument,
             wavelength_min=wavelength_min,
             wavelength_max=wavelength_max,
+            store_events=store_events,
         )
         return [out_f]
 
     cpu_cnt = os.cpu_count() or 4
     workers = min(len(tasks), max_workers or min(cpu_cnt, 16))
     worker_args = [
-        (nxs_f, out_f, instrument, wavelength_min, wavelength_max)
+        (nxs_f, out_f, instrument, wavelength_min, wavelength_max, store_events)
         for nxs_f, out_f in tasks
     ]
     print(f"Reducing {len(tasks)} runs in parallel across {workers} CPU workers...")

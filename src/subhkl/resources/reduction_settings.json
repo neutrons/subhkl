@@ -112,6 +112,7 @@
         "InstrumentName": "TOPAZ",
         "FancyName": "TOPAZ",
         "Wavelength": [0.4, 3.5],
+        "L1": 18.0,
         "Goniometer": {
             "BL12:Mot:omega": [0, 1, 0, 1],
             "BL12:Mot:chi": [0, 0, 1, 1],
@@ -142,6 +143,7 @@
         "InstrumentName": "MANDI",
         "FancyName": "MANDI",
         "Wavelength": [2, 4],
+        "L1": 30.0,
         "Goniometer": {
             "BL11B:Mot:omega": [0, 1, 0, 1],
             "BL11B:Mot:chi": [0, 0, 1, 1],
