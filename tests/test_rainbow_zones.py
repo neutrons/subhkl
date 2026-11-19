@@ -6518,7 +6518,7 @@ def test_merge_resolution_table_csv_html_popup_and_lazy_download(tmp_path):
     assert "0.302" in html_art
     assert "background:#ffffff;color:#000000" in html_art
 
-    # Verify Rainbow Zones main UI embeds subtle ☆ Table button, monochrome blue-on-dark modal, Copy button, and no duplicate download buttons
+    # Verify Rainbow Zones main UI embeds subtle table pictogram button, monochrome blue-on-dark modal, Copy button, and no duplicate download buttons
     payload = build_rainbow_zone_payload(instrument="MANDI", include_panel_images=False)
     payload["artifact_kind"] = "merged_careless"
     payload["space_group"] = "I 1 2 1"
@@ -6528,7 +6528,9 @@ def test_merge_resolution_table_csv_html_popup_and_lazy_download(tmp_path):
     ui_html = render_rainbow_html(payload)
     assert 'id="modal-merge-table"' in ui_html
     assert 'id="btn-hist-open-table"' in ui_html
-    assert "☆ Table" in ui_html
+    assert 'aria-label="Merging statistics table"' in ui_html
+    assert '<path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/>' in ui_html
+    assert "☆ Table" not in ui_html
     assert "🏆" not in ui_html
     assert "📋" not in ui_html
     assert "BUBBLE" not in ui_html.upper()

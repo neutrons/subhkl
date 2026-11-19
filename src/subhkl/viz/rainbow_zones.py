@@ -8789,7 +8789,7 @@ def render_rainbow_html(
         <div id="hist-bar-header" style="display:none;align-items:center;justify-content:space-between;gap:4px;margin-top:4px;padding:0 2px;font-family:var(--font-display);font-size:0.59rem;">
           <span style="color:var(--text-dim);letter-spacing:0.04em;">SHELLS vs d</span>
           <div style="display:flex;align-items:center;gap:3px;">
-            <button id="btn-hist-open-table" type="button" style="padding:1px 6px;font-size:0.58rem;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open merging statistics by resolution shell">☆ Table</button>
+            <button id="btn-hist-open-table" type="button" aria-label="Merging statistics table" style="display:inline-flex;align-items:center;justify-content:center;padding:2px 5px;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open merging statistics by resolution shell"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/></svg></button>
           </div>
         </div>
         <canvas id="canvas-hist" aria-label="Resolution sparkline (hover bin for shell edges and statistic; click to cycle metric)" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
@@ -11857,7 +11857,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       <span>Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{nAsu}} ASU / ${{nObs}} obs)</span>
       <span>Multiplicity=<strong>${{mult}}</strong> • Harmonics=<strong>${{harmPct}}</strong></span>
       <span style="margin-left:auto;display:inline-flex;align-items:center;gap:4px;">
-        <button type="button" data-merge-action="open-table" style="padding:1px 6px;font-size:0.58rem;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open merging statistics by resolution shell">☆ Table</button>
+        <button type="button" data-merge-action="open-table" aria-label="Merging statistics table" style="display:inline-flex;align-items:center;justify-content:center;padding:2px 5px;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open merging statistics by resolution shell"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/></svg></button>
       </span>
     `;
     bar.querySelectorAll("button[data-merge-action]").forEach(btn => {{
