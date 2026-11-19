@@ -32,6 +32,14 @@ from datetime import UTC
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
+for _thr_var in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thr_var, "1")
+
 import numpy as np
 
 from subhkl import get_container_image
@@ -324,6 +332,18 @@ class NovaGalaxyPipelineRunner:
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 from subhkl.viz.rainbow_zones import build_rainbow_zone_payload
 
+                raw_dmin_live = (
+                    float(sp["d_min"])
+                    if sp.get("d_min")
+                    else (float(payload["d_min"]) if payload.get("d_min") else None)
+                )
+                # Cap intermediate live-solve preview reflections to >= 2.0 A on the
+                # active frame so multi-run high-resolution solves stay responsive.
+                live_dmin = (
+                    max(2.0, raw_dmin_live)
+                    if raw_dmin_live is not None and raw_dmin_live > 0
+                    else None
+                )
                 p_blind = build_rainbow_zone_payload(
                     replay_h5=partial_h5,
                     images_h5=(
@@ -341,16 +361,13 @@ class NovaGalaxyPipelineRunner:
                         or payload.get("wavelength_range")
                         or (2.0, 4.5)
                     ),
-                    d_min=(
-                        float(sp["d_min"])
-                        if sp.get("d_min")
-                        else (float(payload["d_min"]) if payload.get("d_min") else None)
-                    ),
+                    d_min=live_dmin,
                     max_zone_index=3,
                     max_zones=60,
                     include_panels=True,
                     include_panel_images=False,
                     include_peaks=True,
+                    include_all_runs_peaks=False,
                     n_arc=720,
                     frame_index=target_frame,
                 )
@@ -7284,6 +7301,50 @@ def serve_rainbow_zones(
                 return
 
             if req_path in ("/api/payload", "/payload.json"):
+                if qs.get("textures_only", ["0"])[0] == "1":
+                    from subhkl.viz.rainbow_zones import (
+                        build_rainbow_panel_textures_only,
+                    )
+
+                    f_idx_tex: int | None = None
+                    if qs.get("frame"):
+                        with contextlib.suppress(ValueError, TypeError, IndexError):
+                            f_idx_tex = int(qs["frame"][0])
+                    rb_tex = int(vm.payload_kwargs.get("render_binning") or 4)
+                    if qs.get("render_binning"):
+                        with contextlib.suppress(ValueError, TypeError, IndexError):
+                            parsed_rb = int(qs["render_binning"][0])
+                            if 1 <= parsed_rb <= 16:
+                                rb_tex = parsed_rb
+                                vm.payload_kwargs["render_binning"] = parsed_rb
+                    tex_doc = build_rainbow_panel_textures_only(
+                        replay_h5=vm.replay_h5 or vm.payload_kwargs.get("images_h5"),
+                        images_h5=vm.payload_kwargs.get("images_h5"),
+                        instrument=vm.payload_kwargs.get("instrument") or "CG4D",
+                        render_binning=rb_tex,
+                        frame_index=(
+                            f_idx_tex
+                            if f_idx_tex is not None
+                            else int(vm.payload_kwargs.get("frame_index") or 0)
+                        ),
+                    )
+                    if vm_lock.acquire(blocking=False):
+                        try:
+                            cur_pl = vm._payload
+                            if isinstance(cur_pl, dict) and isinstance(
+                                cur_pl.get("panels"), list
+                            ):
+                                cur_pl["render_binning"] = tex_doc["render_binning"]
+                        finally:
+                            vm_lock.release()
+                    body = json.dumps(tex_doc).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
                 vm_lock.acquire()
                 try:
                     self._serve_payload_locked(qs)
@@ -7377,12 +7438,17 @@ def serve_rainbow_zones(
                 return
 
             if req_path == "/api/pipeline/status":
+                f_idx_st: int | None = None
                 if qs.get("frame"):
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         f_idx_st = int(qs["frame"][0])
                         vm.payload_kwargs["frame_index"] = f_idx_st
                         vm.pipeline_runner.sync_frame_index(f_idx_st)
                 is_poll = qs.get("poll", ["0"])[0] == "1"
+                ov_seq_client: int | None = None
+                if qs.get("overlay_seq"):
+                    with contextlib.suppress(ValueError, TypeError, IndexError):
+                        ov_seq_client = int(qs["overlay_seq"][0])
                 aj_now = vm.pipeline_runner.active_job
                 aj_running = isinstance(aj_now, dict) and aj_now.get("state") in (
                     "queued",
@@ -7393,6 +7459,27 @@ def serve_rainbow_zones(
                 )
                 step_timings_snap = vm.pipeline_runner.get_step_timings_snapshot()
                 cur_pl = vm._payload if isinstance(vm._payload, dict) else {}
+                aj_resp = vm.pipeline_runner.active_job
+                if (
+                    is_poll
+                    and ov_seq_client is not None
+                    and isinstance(aj_resp, dict)
+                    and isinstance(aj_resp.get("partial_overlay"), dict)
+                ):
+                    ov_now = aj_resp["partial_overlay"]
+                    ov_seq_now = int(ov_now.get("seq") or 0)
+                    ov_frame_now = ov_now.get("frame_index")
+                    if ov_seq_now == ov_seq_client and (
+                        f_idx_st is None
+                        or ov_frame_now is None
+                        or int(ov_frame_now) == f_idx_st
+                    ):
+                        aj_resp = dict(aj_resp)
+                        aj_resp["partial_overlay"] = {
+                            "seq": ov_seq_now,
+                            "frame_index": ov_frame_now,
+                            "unchanged": True,
+                        }
                 status_doc = {
                     "galaxy_connected": vm.pipeline_runner.is_connected,
                     "galaxy_url": vm.pipeline_runner.galaxy_url,
@@ -7402,7 +7489,7 @@ def serve_rainbow_zones(
                         current_h5=vm.replay_h5,
                         history_datasets=hist_ds,
                     ),
-                    "active_job": vm.pipeline_runner.active_job,
+                    "active_job": aj_resp,
                     "step_timings": step_timings_snap,
                     "server_time": time.time(),
                     "pipeline_stages": cur_pl.get("pipeline_stages", []),

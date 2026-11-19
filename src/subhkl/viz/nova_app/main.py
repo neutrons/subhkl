@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# Prevent OpenBLAS/OMP from spawning 60+ worker threads inside the interactive UI
+# server, which otherwise contend on small NumPy projections and starve pipeline jobs.
+for _thr_var in (
+    "OPENBLAS_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_thr_var, "1")
 
 from subhkl.viz.nova_app.views.main_view import MainApp
 

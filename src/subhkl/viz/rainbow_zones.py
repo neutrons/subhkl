@@ -699,6 +699,7 @@ def _encode_panel_textures(
     frame_slice: tuple[int, int] | None = None,
     *,
     encode_images: bool = True,
+    include_geometry: bool = True,
     pixel_class_by_bank: dict[int, np.ndarray] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """Build cylindrical + spherical detector panel geometries and base64 log-intensity PNG textures.
@@ -878,64 +879,65 @@ def _encode_panel_textures(
     t_grid = np.linspace(0.0, 1.0, grid_n + 1)
     for bk, det in sorted(detectors.items()):
         try:
-            # 4 canonical corners: C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
-            rr_c = np.array([0, det.n - 1, det.n - 1, 0], dtype=float)
-            cc_c = np.array([0, 0, det.m - 1, det.m - 1], dtype=float)
-            xyz_corners = det.pixel_to_lab(rr_c, cc_c)
-            x_c, y_c = _unrolled(xyz_corners)
-            _, el_c = _spherical_angles(xyz_corners)
+            if include_geometry:
+                # 4 canonical corners: C0=(0,0), C1=(n-1,0), C2=(n-1,m-1), C3=(0,m-1)
+                rr_c = np.array([0, det.n - 1, det.n - 1, 0], dtype=float)
+                cc_c = np.array([0, 0, det.m - 1, det.m - 1], dtype=float)
+                xyz_corners = det.pixel_to_lab(rr_c, cc_c)
+                x_c, y_c = _unrolled(xyz_corners)
+                _, el_c = _spherical_angles(xyz_corners)
 
-            # Dense 48-point perimeter along all 4 edges for curved spherical/cylindrical borders
-            rr_e = np.concatenate(
-                [
-                    t_edge * (det.n - 1),
-                    np.full_like(t_edge, det.n - 1),
-                    (1.0 - t_edge) * (det.n - 1),
-                    np.zeros_like(t_edge),
-                ]
-            )
-            cc_e = np.concatenate(
-                [
-                    np.zeros_like(t_edge),
-                    t_edge * (det.m - 1),
-                    np.full_like(t_edge, det.m - 1),
-                    (1.0 - t_edge) * (det.m - 1),
-                ]
-            )
-            xyz_edge = det.pixel_to_lab(rr_e, cc_e)
-            x_e, y_e = _unrolled(xyz_edge)
-            _, el_e = _spherical_angles(xyz_edge)
+                # Dense 48-point perimeter along all 4 edges for curved spherical/cylindrical borders
+                rr_e = np.concatenate(
+                    [
+                        t_edge * (det.n - 1),
+                        np.full_like(t_edge, det.n - 1),
+                        (1.0 - t_edge) * (det.n - 1),
+                        np.zeros_like(t_edge),
+                    ]
+                )
+                cc_e = np.concatenate(
+                    [
+                        np.zeros_like(t_edge),
+                        t_edge * (det.m - 1),
+                        np.full_like(t_edge, det.m - 1),
+                        (1.0 - t_edge) * (det.m - 1),
+                    ]
+                )
+                xyz_edge = det.pixel_to_lab(rr_e, cc_e)
+                x_e, y_e = _unrolled(xyz_edge)
+                _, el_e = _spherical_angles(xyz_edge)
 
-            # Curvilinear (grid_n + 1) x (grid_n + 1) interior/boundary mesh so high-elevation
-            # panels (such as MANDI's bottom-plane banks) warp accurately to their curved outlines
-            rr_m_grid, cc_m_grid = np.meshgrid(
-                t_grid * (det.n - 1), t_grid * (det.m - 1), indexing="ij"
-            )
-            xyz_mesh = det.pixel_to_lab(rr_m_grid.ravel(), cc_m_grid.ravel())
-            x_m, y_m = _unrolled(xyz_mesh)
-            _, el_m = _spherical_angles(xyz_mesh)
+                # Curvilinear (grid_n + 1) x (grid_n + 1) interior/boundary mesh so high-elevation
+                # panels (such as MANDI's bottom-plane banks) warp accurately to their curved outlines
+                rr_m_grid, cc_m_grid = np.meshgrid(
+                    t_grid * (det.n - 1), t_grid * (det.m - 1), indexing="ij"
+                )
+                xyz_mesh = det.pixel_to_lab(rr_m_grid.ravel(), cc_m_grid.ravel())
+                x_m, y_m = _unrolled(xyz_mesh)
+                _, el_m = _spherical_angles(xyz_mesh)
 
-            # Unwrap azimuth across the +-180 deg seam (e.g., MANDI Bank 5 straddling +-180 deg)
-            x_all = np.concatenate([x_c, x_e, x_m])
-            if np.ptp(x_all) > 180.0:
-                x_all_u = np.where(x_all < 0.0, x_all + 360.0, x_all)
-                if np.ptp(x_all_u) <= 180.0:
-                    x_c = np.where(x_c < 0.0, x_c + 360.0, x_c)
-                    x_e = np.where(x_e < 0.0, x_e + 360.0, x_e)
-                    x_m = np.where(x_m < 0.0, x_m + 360.0, x_m)
-                else:
-                    continue
+                # Unwrap azimuth across the +-180 deg seam (e.g., MANDI Bank 5 straddling +-180 deg)
+                x_all = np.concatenate([x_c, x_e, x_m])
+                if np.ptp(x_all) > 180.0:
+                    x_all_u = np.where(x_all < 0.0, x_all + 360.0, x_all)
+                    if np.ptp(x_all_u) <= 180.0:
+                        x_c = np.where(x_c < 0.0, x_c + 360.0, x_c)
+                        x_e = np.where(x_e < 0.0, x_e + 360.0, x_e)
+                        x_m = np.where(x_m < 0.0, x_m + 360.0, x_m)
+                    else:
+                        continue
 
-            az_min = float(min(np.min(x_e), np.min(x_m)))
-            az_max = float(max(np.max(x_e), np.max(x_m)))
-            y_min = float(min(np.min(y_e), np.min(y_m)))
-            y_max = float(max(np.max(y_e), np.max(y_m)))
-            el_min = float(min(np.min(el_e), np.min(el_m)))
-            el_max = float(max(np.max(el_e), np.max(el_m)))
+                az_min = float(min(np.min(x_e), np.min(x_m)))
+                az_max = float(max(np.max(x_e), np.max(x_m)))
+                y_min = float(min(np.min(y_e), np.min(y_m)))
+                y_max = float(max(np.max(y_e), np.max(y_m)))
+                el_min = float(min(np.min(el_e), np.min(el_m)))
+                el_max = float(max(np.max(el_e), np.max(el_m)))
 
-            x_m_2d = x_m.reshape(grid_n + 1, grid_n + 1)
-            y_m_2d = y_m.reshape(grid_n + 1, grid_n + 1)
-            el_m_2d = el_m.reshape(grid_n + 1, grid_n + 1)
+                x_m_2d = x_m.reshape(grid_n + 1, grid_n + 1)
+                y_m_2d = y_m.reshape(grid_n + 1, grid_n + 1)
+                el_m_2d = el_m.reshape(grid_n + 1, grid_n + 1)
 
             tex_b64 = None
             im = raw_bank_images.get(int(bk))
@@ -945,7 +947,7 @@ def _encode_panel_textures(
                 norm = np.clip((log_im - vmin) / max(vmax - vmin, 1e-6), 0.0, 1.0)
                 u8 = (norm * 255.0).astype(np.uint8)
                 buf = io.BytesIO()
-                Image.fromarray(u8, mode="L").save(buf, format="PNG", optimize=True)
+                Image.fromarray(u8, mode="L").save(buf, format="PNG", compress_level=1)
                 tex_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
             mask_b64 = None
@@ -976,9 +978,21 @@ def _encode_panel_textures(
                     )
                     mbuf = io.BytesIO()
                     Image.fromarray(m_u8, mode="L").save(
-                        mbuf, format="PNG", optimize=True
+                        mbuf, format="PNG", compress_level=1
                     )
                     mask_b64 = base64.b64encode(mbuf.getvalue()).decode("ascii")
+
+            if not include_geometry:
+                panels_payload.append(
+                    {
+                        "bank": int(bk),
+                        "n_rows": int(det.n),
+                        "n_cols": int(det.m),
+                        "texture_b64": tex_b64,
+                        "mask_b64": mask_b64,
+                    }
+                )
+                continue
 
             panels_payload.append(
                 {
@@ -1043,6 +1057,97 @@ def _encode_panel_textures(
             continue
 
     return panels_payload, intensity_source
+
+
+def build_rainbow_panel_textures_only(
+    replay_h5: str | os.PathLike | None = None,
+    *,
+    images_h5: str | os.PathLike | None = None,
+    instrument: str = "IMAGINE",
+    render_binning: int = 1,
+    frame_index: int | None = None,
+) -> dict[str, Any]:
+    """Encode only per-bank detector intensity/mask PNGs without raycasting HKLs or rebuilding zones."""
+    rb = max(1, int(render_binning))
+    primary_h5 = (
+        str(replay_h5)
+        if replay_h5 is not None and os.path.exists(replay_h5)
+        else (
+            str(images_h5)
+            if images_h5 is not None and os.path.exists(images_h5)
+            else None
+        )
+    )
+    if primary_h5 is None:
+        detectors = _load_detectors_from_h5(None, instrument or "IMAGINE")
+        panels_payload, intensity_source = _encode_panel_textures(
+            detectors,
+            None,
+            None,
+            None,
+            None,
+            None,
+            images_h5=None,
+            render_binning=rb,
+            frame_slice=None,
+            encode_images=True,
+            include_geometry=False,
+        )
+        return {
+            "render_binning": rb,
+            "frame_index": int(frame_index or 0),
+            "intensity_source": intensity_source,
+            "panels": panels_payload,
+        }
+
+    extracted = _extract_from_h5(
+        primary_h5,
+        images_h5=images_h5,
+        frame_index=frame_index,
+        include_peaks=False,
+        default_instrument=instrument or "IMAGINE",
+    )
+    src_h5 = extracted.get("images_h5")
+    has_raw_images = False
+    if src_h5 and os.path.exists(src_h5):
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(src_h5, "r") as f_chk,
+        ):
+            has_raw_images = "images" in f_chk
+    if not has_raw_images:
+        extracted = _extract_from_h5(
+            primary_h5,
+            images_h5=images_h5,
+            frame_index=frame_index,
+            include_peaks=True,
+            include_all_runs_peaks=False,
+            default_instrument=instrument or "IMAGINE",
+        )
+
+    detectors = extracted.get("detectors") or _load_detectors_from_h5(
+        None, extracted.get("instrument") or instrument or "IMAGINE"
+    )
+    panels_payload, intensity_source = _encode_panel_textures(
+        detectors,
+        extracted.get("bank"),
+        extracted.get("pixel_r"),
+        extracted.get("pixel_c"),
+        extracted.get("intensity"),
+        extracted.get("sigma"),
+        images_h5=extracted.get("images_h5"),
+        render_binning=rb,
+        frame_slice=extracted.get("frame_slice"),
+        encode_images=True,
+        include_geometry=False,
+        pixel_class_by_bank=extracted.get("pixel_class_by_bank"),
+    )
+    return {
+        "render_binning": rb,
+        "frame_index": int(extracted.get("active_frame", frame_index or 0)),
+        "intensity_source": intensity_source,
+        "panels": panels_payload,
+    }
 
 
 def infer_dataset_extension(name: str | None, raw_ext: str | None = None) -> str:
@@ -1377,112 +1482,265 @@ def _raycast_hkl_on_detectors(
         [],
         [],
     )
-    for bid, det in sorted(detectors.items()):
-        bid_i = int(bid)
-        if active_bids is not None and bid_i not in active_bids:
-            continue
-        idx_h = np.zeros(0, dtype=int)
-        with contextlib.suppress(
-            OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
-        ):
-            if hasattr(det, "reflections_mask") and hasattr(det, "pixel_to_lab"):
-                is_curv_det = "curved" in str(getattr(det, "panel_type", "")).lower()
-                s_off_use = (
-                    s_lab[None, :]
-                    if is_curv_det
-                    else (s_lab if float(np.linalg.norm(s_lab)) > 1e-12 else None)
-                )
-                mask_c, row_c, col_c = det.reflections_mask(
-                    kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_off_use
-                )
-                if mf > 0.0 and np.any(mask_c):
-                    r_span = max(float(det.n - 1), 1.0)
-                    c_span = max(float(det.m - 1), 1.0)
-                    mask_c = (
-                        mask_c
-                        & (row_c >= mf * r_span)
-                        & (row_c <= (1.0 - mf) * r_span)
-                        & (col_c >= mf * c_span)
-                        & (col_c <= (1.0 - mf) * c_span)
-                    )
-                if np.any(mask_c):
-                    idx_h = np.flatnonzero(mask_c)
-                    pr_hit = np.asarray(row_c[idx_h], dtype=float)
-                    pc_hit = np.asarray(col_c[idx_h], dtype=float)
-                    xyz_hit = np.asarray(det.pixel_to_lab(pr_hit, pc_hit), dtype=float)
-                    if xyz_hit.ndim == 1:
-                        xyz_hit = xyz_hit[None, :]
-            else:
-                cen = np.asarray(det.center, dtype=float)
-                uh = np.asarray(det.uhat, dtype=float)
-                vh = np.asarray(det.vhat, dtype=float)
-                w_d, h_d = float(det.width), float(det.height)
-                nrm = np.cross(uh, vh)
-                dn = kf @ nrm
-                t_ray = np.dot(cen - s_lab, nrm) / np.where(np.abs(dn) < 1e-9, -1.0, dn)
-                hit = t_ray > 0
-                if np.any(hit):
-                    cand_h = np.flatnonzero(hit)
-                    p_hit = (
-                        s_lab[None, :] + t_ray[cand_h, None] * kf[cand_h] - cen[None, :]
-                    )
-                    um = p_hit @ uh
-                    vm = p_hit @ vh
-                    in_b = (
-                        (um >= w_d * mf)
-                        & (um <= w_d * (1.0 - mf))
-                        & (vm >= h_d * mf)
-                        & (vm <= h_d * (1.0 - mf))
-                    )
-                    if np.any(in_b):
-                        idx_h = cand_h[in_b]
-                        um, vm = um[in_b], vm[in_b]
-                        pr_hit = vm / max(h_d, 1e-6) * max(int(det.n) - 1, 1)
-                        pc_hit = um / max(w_d, 1e-6) * max(int(det.m) - 1, 1)
-                        xyz_hit = (
-                            cen[None, :]
-                            + um[:, None] * uh[None, :]
-                            + vm[:, None] * vh[None, :]
-                        )
-        if len(idx_h) == 0:
-            continue
-        if pixel_class_by_bank is not None:
-            cls_b = pixel_class_by_bank.get(bid_i)
-            if cls_b is not None and cls_b.ndim == 2:
-                rm = np.clip(np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1)
-                cm = np.clip(np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1)
-                valid_m = cls_b[rm, cm] == 0
-                if not np.any(valid_m):
-                    continue
-                idx_h = idx_h[valid_m]
-                xyz_hit = xyz_hit[valid_m]
-                pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
-        if inten_b is not None:
-            iv_hit = inten_b[idx_h]
-        elif bank_imgs is not None and bid_i in bank_imgs:
-            im_b = bank_imgs[bid_i]
-            r_i = np.clip(np.round(pr_hit).astype(int), 2, max(2, im_b.shape[0] - 3))
-            c_i = np.clip(np.round(pc_hit).astype(int), 2, max(2, im_b.shape[1] - 3))
-            iv_hit = np.maximum(
-                np.maximum.reduce(
-                    [im_b[r_i + dr, c_i + dc] for dr in (-1, 0, 1) for dc in (-1, 0, 1)]
-                ),
-                1.0,
-            )
-        else:
-            iv_hit = np.full(len(idx_h), 150.0, dtype=float)
-        sv_hit = (
-            sig_b[idx_h] if sig_b is not None else np.full(len(idx_h), 3.0, dtype=float)
+
+    cand_dets = [
+        (int(bid), det)
+        for bid, det in sorted(detectors.items())
+        if active_bids is None or int(bid) in active_bids
+    ]
+    if not cand_dets:
+        return empty
+
+    all_flat = all(
+        "curved" not in str(getattr(det, "panel_type", "")).lower()
+        and int(getattr(det, "n", 0)) > 1
+        and int(getattr(det, "m", 0)) > 1
+        and hasattr(det, "center")
+        and hasattr(det, "uhat")
+        and hasattr(det, "vhat")
+        and hasattr(det, "width")
+        and hasattr(det, "height")
+        for _, det in cand_dets
+    )
+
+    if all_flat:
+        flat_bids = np.array([bid_i for bid_i, _ in cand_dets], dtype=int)
+        C_arr = np.array(
+            [np.asarray(det.center, dtype=float) for _, det in cand_dets], dtype=float
+        )
+        uhat_arr = np.array(
+            [np.asarray(det.uhat, dtype=float) for _, det in cand_dets], dtype=float
+        )
+        vhat_arr = np.array(
+            [np.asarray(det.vhat, dtype=float) for _, det in cand_dets], dtype=float
+        )
+        norm_arr = np.cross(uhat_arr, vhat_arr)
+        n_arr = np.array([int(det.n) for _, det in cand_dets], dtype=float)
+        m_arr = np.array([int(det.m) for _, det in cand_dets], dtype=float)
+        dw_arr = np.array([float(det.width) for _, det in cand_dets], dtype=float) / (
+            m_arr - 1.0
+        )
+        dh_arr = np.array([float(det.height) for _, det in cand_dets], dtype=float) / (
+            n_arr - 1.0
         )
 
-        xyz_l.append(xyz_hit)
-        hkl_l.append(hkl_b[idx_h])
-        lam_l.append(lam_b[idx_h])
-        bank_l.append(np.full(len(idx_h), bid_i, dtype=int))
-        pr_l.append(pr_hit)
-        pc_l.append(pc_hit)
-        inten_l.append(iv_hit)
-        sig_l.append(sv_hit)
+        n_b = len(cand_dets)
+        c_minus_s = C_arr - s_lab[None, :]
+        c_minus_s_dot_n = np.sum(c_minus_s * norm_arr, axis=1)
+        s_minus_c_u = -np.sum(c_minus_s * uhat_arr, axis=1)
+        s_minus_c_v = -np.sum(c_minus_s * vhat_arr, axis=1)
+
+        proj_mat = np.hstack([norm_arr.T, uhat_arr.T, vhat_arr.T])
+        dots = kf @ proj_mat
+        d_dot_n = dots[:, :n_b]
+        kf_u = dots[:, n_b : 2 * n_b]
+        kf_v = dots[:, 2 * n_b :]
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            t_mat = c_minus_s_dot_n[None, :] / d_dot_n
+            row_mat = (s_minus_c_v[None, :] + t_mat * kf_v) / dh_arr[None, :]
+            col_mat = (s_minus_c_u[None, :] + t_mat * kf_u) / dw_arr[None, :]
+
+        hit_mat = (
+            (t_mat > 0.0)
+            & (row_mat >= 0.0)
+            & (row_mat < n_arr[None, :])
+            & (col_mat >= 0.0)
+            & (col_mat < m_arr[None, :])
+        )
+        if mf > 0.0:
+            r_span = np.maximum(n_arr - 1.0, 1.0)
+            c_span = np.maximum(m_arr - 1.0, 1.0)
+            hit_mat &= (
+                (row_mat >= mf * r_span[None, :])
+                & (row_mat <= (1.0 - mf) * r_span[None, :])
+                & (col_mat >= mf * c_span[None, :])
+                & (col_mat <= (1.0 - mf) * c_span[None, :])
+            )
+
+        b_hits, k_hits = np.nonzero(hit_mat.T)
+        if len(b_hits) == 0:
+            return empty
+
+        for b_pos in np.unique(b_hits):
+            sel_b = b_hits == b_pos
+            idx_h = k_hits[sel_b]
+            bid_i = int(flat_bids[b_pos])
+            pr_hit = row_mat[idx_h, b_pos]
+            pc_hit = col_mat[idx_h, b_pos]
+            if pixel_class_by_bank is not None:
+                cls_b = pixel_class_by_bank.get(bid_i)
+                if cls_b is not None and cls_b.ndim == 2:
+                    rm = np.clip(np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1)
+                    cm = np.clip(np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1)
+                    valid_m = cls_b[rm, cm] == 0
+                    if not np.any(valid_m):
+                        continue
+                    idx_h = idx_h[valid_m]
+                    pr_hit = pr_hit[valid_m]
+                    pc_hit = pc_hit[valid_m]
+            xyz_hit = (
+                C_arr[b_pos][None, :]
+                + (pc_hit * dw_arr[b_pos])[:, None] * uhat_arr[b_pos][None, :]
+                + (pr_hit * dh_arr[b_pos])[:, None] * vhat_arr[b_pos][None, :]
+            )
+            if inten_b is not None:
+                iv_hit = inten_b[idx_h]
+            elif bank_imgs is not None and bid_i in bank_imgs:
+                im_b = bank_imgs[bid_i]
+                r_i = np.clip(
+                    np.round(pr_hit).astype(int), 2, max(2, im_b.shape[0] - 3)
+                )
+                c_i = np.clip(
+                    np.round(pc_hit).astype(int), 2, max(2, im_b.shape[1] - 3)
+                )
+                iv_hit = np.maximum(
+                    np.maximum.reduce(
+                        [
+                            im_b[r_i + dr, c_i + dc]
+                            for dr in (-1, 0, 1)
+                            for dc in (-1, 0, 1)
+                        ]
+                    ),
+                    1.0,
+                )
+            else:
+                iv_hit = np.full(len(idx_h), 150.0, dtype=float)
+            sv_hit = (
+                sig_b[idx_h]
+                if sig_b is not None
+                else np.full(len(idx_h), 3.0, dtype=float)
+            )
+            xyz_l.append(xyz_hit)
+            hkl_l.append(hkl_b[idx_h])
+            lam_l.append(lam_b[idx_h])
+            bank_l.append(np.full(len(idx_h), bid_i, dtype=int))
+            pr_l.append(pr_hit)
+            pc_l.append(pc_hit)
+            inten_l.append(iv_hit)
+            sig_l.append(sv_hit)
+    else:
+        for bid_i, det in cand_dets:
+            idx_h = np.zeros(0, dtype=int)
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+            ):
+                if hasattr(det, "reflections_mask") and hasattr(det, "pixel_to_lab"):
+                    is_curv_det = (
+                        "curved" in str(getattr(det, "panel_type", "")).lower()
+                    )
+                    s_off_use = (
+                        s_lab[None, :]
+                        if is_curv_det
+                        else (s_lab if float(np.linalg.norm(s_lab)) > 1e-12 else None)
+                    )
+                    mask_c, row_c, col_c = det.reflections_mask(
+                        kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_off_use
+                    )
+                    if mf > 0.0 and np.any(mask_c):
+                        r_span = max(float(det.n - 1), 1.0)
+                        c_span = max(float(det.m - 1), 1.0)
+                        mask_c = (
+                            mask_c
+                            & (row_c >= mf * r_span)
+                            & (row_c <= (1.0 - mf) * r_span)
+                            & (col_c >= mf * c_span)
+                            & (col_c <= (1.0 - mf) * c_span)
+                        )
+                    if np.any(mask_c):
+                        idx_h = np.flatnonzero(mask_c)
+                        pr_hit = np.asarray(row_c[idx_h], dtype=float)
+                        pc_hit = np.asarray(col_c[idx_h], dtype=float)
+                        xyz_hit = np.asarray(
+                            det.pixel_to_lab(pr_hit, pc_hit), dtype=float
+                        )
+                        if xyz_hit.ndim == 1:
+                            xyz_hit = xyz_hit[None, :]
+                else:
+                    cen = np.asarray(det.center, dtype=float)
+                    uh = np.asarray(det.uhat, dtype=float)
+                    vh = np.asarray(det.vhat, dtype=float)
+                    w_d, h_d = float(det.width), float(det.height)
+                    nrm = np.cross(uh, vh)
+                    dn = kf @ nrm
+                    t_ray = np.dot(cen - s_lab, nrm) / np.where(
+                        np.abs(dn) < 1e-9, -1.0, dn
+                    )
+                    hit = t_ray > 0
+                    if np.any(hit):
+                        cand_h = np.flatnonzero(hit)
+                        p_hit = (
+                            s_lab[None, :]
+                            + t_ray[cand_h, None] * kf[cand_h]
+                            - cen[None, :]
+                        )
+                        um = p_hit @ uh
+                        vm = p_hit @ vh
+                        in_b = (
+                            (um >= w_d * mf)
+                            & (um <= w_d * (1.0 - mf))
+                            & (vm >= h_d * mf)
+                            & (vm <= h_d * (1.0 - mf))
+                        )
+                        if np.any(in_b):
+                            idx_h = cand_h[in_b]
+                            um, vm = um[in_b], vm[in_b]
+                            pr_hit = vm / max(h_d, 1e-6) * max(int(det.n) - 1, 1)
+                            pc_hit = um / max(w_d, 1e-6) * max(int(det.m) - 1, 1)
+                            xyz_hit = (
+                                cen[None, :]
+                                + um[:, None] * uh[None, :]
+                                + vm[:, None] * vh[None, :]
+                            )
+            if len(idx_h) == 0:
+                continue
+            if pixel_class_by_bank is not None:
+                cls_b = pixel_class_by_bank.get(bid_i)
+                if cls_b is not None and cls_b.ndim == 2:
+                    rm = np.clip(np.round(pr_hit).astype(int), 0, cls_b.shape[0] - 1)
+                    cm = np.clip(np.round(pc_hit).astype(int), 0, cls_b.shape[1] - 1)
+                    valid_m = cls_b[rm, cm] == 0
+                    if not np.any(valid_m):
+                        continue
+                    idx_h = idx_h[valid_m]
+                    xyz_hit = xyz_hit[valid_m]
+                    pr_hit, pc_hit = pr_hit[valid_m], pc_hit[valid_m]
+            if inten_b is not None:
+                iv_hit = inten_b[idx_h]
+            elif bank_imgs is not None and bid_i in bank_imgs:
+                im_b = bank_imgs[bid_i]
+                r_i = np.clip(
+                    np.round(pr_hit).astype(int), 2, max(2, im_b.shape[0] - 3)
+                )
+                c_i = np.clip(
+                    np.round(pc_hit).astype(int), 2, max(2, im_b.shape[1] - 3)
+                )
+                iv_hit = np.maximum(
+                    np.maximum.reduce(
+                        [
+                            im_b[r_i + dr, c_i + dc]
+                            for dr in (-1, 0, 1)
+                            for dc in (-1, 0, 1)
+                        ]
+                    ),
+                    1.0,
+                )
+            else:
+                iv_hit = np.full(len(idx_h), 150.0, dtype=float)
+            sv_hit = (
+                sig_b[idx_h]
+                if sig_b is not None
+                else np.full(len(idx_h), 3.0, dtype=float)
+            )
+
+            xyz_l.append(xyz_hit)
+            hkl_l.append(hkl_b[idx_h])
+            lam_l.append(lam_b[idx_h])
+            bank_l.append(np.full(len(idx_h), bid_i, dtype=int))
+            pr_l.append(pr_hit)
+            pc_l.append(pc_hit)
+            inten_l.append(iv_hit)
+            sig_l.append(sv_hit)
 
     if not xyz_l:
         return empty
@@ -2194,12 +2452,17 @@ def apply_mtz_to_payload(
     return out
 
 
+_HKL_GEN_CACHE: dict[tuple[Any, ...], np.ndarray] = {}
+_MULTI_RUN_SOLVE_CACHE: dict[tuple[Any, ...], tuple[np.ndarray, ...]] = {}
+
+
 def _extract_from_h5(
     h5_path: str | os.PathLike,
     images_h5: str | os.PathLike | None = None,
     frame_index: int | None = None,
     *,
     include_peaks: bool = True,
+    include_all_runs_peaks: bool = True,
     default_instrument: str = "IMAGINE",
     d_min: float | None = None,
 ) -> dict[str, Any]:
@@ -3754,7 +4017,11 @@ def _extract_from_h5(
                     run_index = run_index[snr_mask]
 
         # Recognize predictor.h5 format: banks/<img_idx>/(i, j, h, k, l, wavelength)
-        if (peaks_xyz is None or len(peaks_xyz) == 0) and "banks" in f:
+        if (
+            include_peaks
+            and (peaks_xyz is None or len(peaks_xyz) == 0)
+            and "banks" in f
+        ):
             with contextlib.suppress(
                 OSError,
                 RuntimeError,
@@ -3834,19 +4101,29 @@ def _extract_from_h5(
                         else default_d_min
                     )
                 )
-                hkl_all = np.stack(
-                    generate_reflections(
-                        *cell_use, space_group=space_group, d_min=d_min_use
-                    ),
-                    axis=1,
-                ).astype(int)
+                hkl_cache_key = (
+                    tuple(round(float(v), 5) for v in cell_use),
+                    str(space_group).strip(),
+                    round(float(d_min_use), 5),
+                )
+                hkl_all = _HKL_GEN_CACHE.get(hkl_cache_key)
+                if hkl_all is None:
+                    hkl_all = np.stack(
+                        generate_reflections(
+                            *cell_use, space_group=space_group, d_min=d_min_use
+                        ),
+                        axis=1,
+                    ).astype(int)
+                    if len(_HKL_GEN_CACHE) >= 3:
+                        _HKL_GEN_CACHE.pop(next(iter(_HKL_GEN_CACHE)), None)
+                    _HKL_GEN_CACHE[hkl_cache_key] = hkl_all
                 ki_vec = np.asarray(ki, dtype=float)
                 ki_vec = ki_vec / max(float(np.linalg.norm(ki_vec)), 1e-12)
                 UB_mat = U_mat @ B_mat
                 G_cryst = hkl_all.astype(float) @ UB_mat.T
                 qn_cryst = np.linalg.norm(G_cryst, axis=1)
 
-                bank_imgs: dict[int, np.ndarray] = {}
+                frame_img_bids: set[int] = set()
                 all_img_bids_set: set[int] = set()
                 if src_h5 and os.path.exists(src_h5):
                     with (
@@ -3861,32 +4138,29 @@ def _extract_from_h5(
                                 int(b) for b in b_ids_full if int(b) in detectors
                             }
                             if "images" in mf:
-                                f0_s, f1_s = (
-                                    frame_slice
-                                    if frame_slice is not None
-                                    else (0, len(b_ids_full))
-                                )
-                                b_ids_s = b_ids_full[f0_s:f1_s]
-                                ims_s = np.asarray(
-                                    mf["images"][f0_s:f1_s], dtype=np.float32
-                                )
+                                im_shape = mf["images"].shape
                                 sample_det = (
                                     next(iter(detectors.values()))
                                     if detectors
                                     else None
                                 )
                                 det_n = int(getattr(sample_det, "n", 0))
-                                compat = True
-                                if (
-                                    ims_s.ndim >= 3
+                                compat = not (
+                                    len(im_shape) >= 3
                                     and det_n > 0
-                                    and int(ims_s.shape[1]) != det_n
-                                ):
-                                    compat = False
+                                    and int(im_shape[1]) != det_n
+                                )
                                 if compat:
-                                    for b_id_s, im_s in zip(b_ids_s, ims_s):
-                                        if int(b_id_s) in detectors:
-                                            bank_imgs[int(b_id_s)] = im_s
+                                    f0_s, f1_s = (
+                                        frame_slice
+                                        if frame_slice is not None
+                                        else (0, len(b_ids_full))
+                                    )
+                                    frame_img_bids = {
+                                        int(b)
+                                        for b in b_ids_full[f0_s:f1_s]
+                                        if int(b) in detectors
+                                    }
 
                 cal_bids_set: set[int] = set()
                 if "detector_calibration" in f:
@@ -3898,8 +4172,8 @@ def _extract_from_h5(
                                 pass
 
                 active_bids = (
-                    set(bank_imgs.keys())
-                    if bank_imgs
+                    frame_img_bids
+                    if frame_img_bids
                     else (
                         all_img_bids_set
                         if all_img_bids_set
@@ -3944,49 +4218,95 @@ def _extract_from_h5(
 
                 # Forward-project across ALL runs in solve.h5 so All-Runs Wulff Net shows
                 # the complete multi-run reflection set right after Solve (matching Integration)
-                if len(frames_meta) > 1:
-                    all_xyz_s, all_hkl_s, all_lam_s, all_bnk_s, all_run_s = (
-                        [],
-                        [],
-                        [],
-                        [],
-                        [],
+                if include_all_runs_peaks and len(frames_meta) > 1:
+                    h5_abs = os.path.abspath(str(h5_path))
+                    h5_mtime = (
+                        os.stat(h5_abs).st_mtime_ns if os.path.exists(h5_abs) else 0
                     )
-                    for r_i in range(len(frames_meta)):
-                        R_ri = R_per_run_all.get(r_i, R_run)
-                        s_ri = s_lab_per_run_all.get(r_i, s_lab_active)
-                        ray_r = (
-                            ray_active
-                            if (r_i == active_frame and active_bids == all_runs_bids)
-                            else _raycast_hkl_on_detectors(
-                                hkl_all,
-                                U_mat,
-                                B_mat,
-                                R_ri,
-                                detectors,
-                                wavelength_range,
-                                ki=ki_vec,
-                                sample_offset_lab=s_ri,
-                                active_bids=all_runs_bids,
-                                pixel_class_by_bank=pixel_class_by_bank,
-                                margin_frac=0.0,
-                                G_cryst=G_cryst,
-                                qn_cryst=qn_cryst,
-                            )
+                    src_abs = os.path.abspath(str(src_h5)) if src_h5 else ""
+                    src_mtime = (
+                        os.stat(src_abs).st_mtime_ns
+                        if src_abs and os.path.exists(src_abs)
+                        else 0
+                    )
+                    mr_key = (
+                        h5_abs,
+                        h5_mtime,
+                        src_abs,
+                        src_mtime,
+                        hkl_cache_key,
+                        round(float(wavelength_range[0]), 5),
+                        round(float(wavelength_range[1]), 5),
+                        tuple(sorted(all_runs_bids)),
+                        len(frames_meta),
+                    )
+                    cached_mr = _MULTI_RUN_SOLVE_CACHE.get(mr_key)
+                    if cached_mr is not None:
+                        pts_sa, hkl_sa, lam_sa, bnk_sa, run_sa = cached_mr
+                    else:
+                        all_xyz_s, all_hkl_s, all_lam_s, all_bnk_s, all_run_s = (
+                            [],
+                            [],
+                            [],
+                            [],
+                            [],
                         )
-                        n_rr = len(ray_r["peaks_xyz"])
-                        if n_rr > 0:
-                            all_xyz_s.append(ray_r["peaks_xyz"])
-                            all_hkl_s.append(ray_r["hkl"])
-                            all_lam_s.append(ray_r["wavelength"])
-                            all_bnk_s.append(ray_r["bank"])
-                            all_run_s.append(np.full(n_rr, int(r_i), dtype=int))
-                    if all_xyz_s:
-                        pts_sa = np.concatenate(all_xyz_s, axis=0)
-                        hkl_sa = np.concatenate(all_hkl_s, axis=0)
-                        lam_sa = np.concatenate(all_lam_s, axis=0)
-                        bnk_sa = np.concatenate(all_bnk_s, axis=0)
-                        run_sa = np.concatenate(all_run_s, axis=0)
+                        for r_i in range(len(frames_meta)):
+                            R_ri = R_per_run_all.get(r_i, R_run)
+                            s_ri = s_lab_per_run_all.get(r_i, s_lab_active)
+                            ray_r = (
+                                ray_active
+                                if (
+                                    r_i == active_frame and active_bids == all_runs_bids
+                                )
+                                else _raycast_hkl_on_detectors(
+                                    hkl_all,
+                                    U_mat,
+                                    B_mat,
+                                    R_ri,
+                                    detectors,
+                                    wavelength_range,
+                                    ki=ki_vec,
+                                    sample_offset_lab=s_ri,
+                                    active_bids=all_runs_bids,
+                                    pixel_class_by_bank=pixel_class_by_bank,
+                                    margin_frac=0.0,
+                                    G_cryst=G_cryst,
+                                    qn_cryst=qn_cryst,
+                                )
+                            )
+                            n_rr = len(ray_r["peaks_xyz"])
+                            if n_rr > 0:
+                                all_xyz_s.append(ray_r["peaks_xyz"])
+                                all_hkl_s.append(ray_r["hkl"])
+                                all_lam_s.append(ray_r["wavelength"])
+                                all_bnk_s.append(ray_r["bank"])
+                                all_run_s.append(np.full(n_rr, int(r_i), dtype=int))
+                        if all_xyz_s:
+                            pts_sa = np.concatenate(all_xyz_s, axis=0)
+                            hkl_sa = np.concatenate(all_hkl_s, axis=0)
+                            lam_sa = np.concatenate(all_lam_s, axis=0)
+                            bnk_sa = np.concatenate(all_bnk_s, axis=0)
+                            run_sa = np.concatenate(all_run_s, axis=0)
+                            if len(_MULTI_RUN_SOLVE_CACHE) >= 2:
+                                _MULTI_RUN_SOLVE_CACHE.pop(
+                                    next(iter(_MULTI_RUN_SOLVE_CACHE)), None
+                                )
+                            _MULTI_RUN_SOLVE_CACHE[mr_key] = (
+                                pts_sa,
+                                hkl_sa,
+                                lam_sa,
+                                bnk_sa,
+                                run_sa,
+                            )
+                        else:
+                            pts_sa = np.zeros((0, 3), dtype=float)
+                            hkl_sa = np.zeros((0, 3), dtype=int)
+                            lam_sa = np.zeros(0, dtype=float)
+                            bnk_sa = np.zeros(0, dtype=int)
+                            run_sa = np.zeros(0, dtype=int)
+
+                    if len(pts_sa) > 0:
                         if len(pts_sa) > 12000:
                             # Keep every unique (h, k, l) first (preferring active_frame),
                             # then top up evenly to 12000 so no crystal reflection is dropped
@@ -5512,6 +5832,7 @@ def build_rainbow_zone_payload(
     include_panels: bool = True,
     include_panel_images: bool = True,
     include_peaks: bool = True,
+    include_all_runs_peaks: bool = True,
 ) -> dict[str, Any]:
     """Build the JSON-serializable data contract for the Rainbow Zones widget.
 
@@ -5558,6 +5879,7 @@ def build_rainbow_zone_payload(
             images_h5=images_h5,
             frame_index=frame_index,
             include_peaks=include_peaks,
+            include_all_runs_peaks=include_all_runs_peaks,
             default_instrument=instrument or "IMAGINE",
             d_min=d_min,
         )
@@ -13958,9 +14280,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const curFrame = typeof state.selectedFrameIndex === "number"
         ? state.selectedFrameIndex
         : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
-      const dminQ = (Number.isFinite(state.dMin) && state.dMin > 0) ? `&d_min=${{encodeURIComponent(state.dMin)}}` : "";
       const resp = await fetch(
-        `api/payload?frame=${{curFrame}}&preserve_params=1${{dminQ}}${{getRenderBinningQuery()}}`,
+        `api/payload?frame=${{curFrame}}&textures_only=1${{getRenderBinningQuery()}}`,
         {{ cache: "no-store" }}
       );
       if (reqSeq !== state.hiresReqSeq) return;
@@ -17964,7 +18285,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             const curFrame = typeof state.selectedFrameIndex === "number"
               ? state.selectedFrameIndex
               : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
-            const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}&poll=1`, {{ cache: "no-store" }});
+            const ovSeqParam = (lastPartialFrame === curFrame && lastPartialSeq > 0)
+              ? `&overlay_seq=${{lastPartialSeq}}`
+              : "";
+            const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}${{ovSeqParam}}&poll=1`, {{ cache: "no-store" }});
             if (!sr.ok) return;
             const sdoc = await sr.json();
             if (runSeq !== state.workflowRunSeq || state.runningStageIdx !== stageIdx) return;
@@ -17983,6 +18307,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               stageId === "solve" &&
               aj.state !== "ok" &&
               aj.partial_overlay &&
+              !aj.partial_overlay.unchanged &&
               ovFrame === curFrame &&
               ((aj.partial_overlay.seq || 0) > lastPartialSeq || lastPartialFrame !== curFrame)
             ) {{

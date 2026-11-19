@@ -67,7 +67,12 @@ class MainApp:
 
         payload_lock = threading.RLock()
 
-        def _build_status_doc(frame_q: str | None, is_poll: bool) -> dict[str, Any]:
+        def _build_status_doc(
+            frame_q: str | None,
+            is_poll: bool,
+            overlay_seq_q: str | None = None,
+        ) -> dict[str, Any]:
+            f_idx_st: int | None = None
             if frame_q is not None and str(frame_q).strip() != "":
                 with contextlib.suppress(
                     ValueError, TypeError, RuntimeError, AttributeError
@@ -75,6 +80,10 @@ class MainApp:
                     f_idx_st = int(frame_q)
                     self.view_model.model.subhkl.frame_index = f_idx_st
                     self.pipeline_runner.sync_frame_index(f_idx_st)
+            ov_seq_client: int | None = None
+            if overlay_seq_q is not None and str(overlay_seq_q).strip() != "":
+                with contextlib.suppress(ValueError, TypeError):
+                    ov_seq_client = int(overlay_seq_q)
             payload = self.view_model.model.subhkl.payload or {}
             aj_now = self.pipeline_runner.active_job
             aj_running = isinstance(aj_now, dict) and aj_now.get("state") in (
@@ -89,6 +98,27 @@ class MainApp:
                 or self.view_model.model.subhkl.data.images_file
             )
             step_timings_snap = self.pipeline_runner.get_step_timings_snapshot()
+            aj_resp = self.pipeline_runner.active_job
+            if (
+                is_poll
+                and ov_seq_client is not None
+                and isinstance(aj_resp, dict)
+                and isinstance(aj_resp.get("partial_overlay"), dict)
+            ):
+                ov_now = aj_resp["partial_overlay"]
+                ov_seq_now = int(ov_now.get("seq") or 0)
+                ov_frame_now = ov_now.get("frame_index")
+                if ov_seq_now == ov_seq_client and (
+                    f_idx_st is None
+                    or ov_frame_now is None
+                    or int(ov_frame_now) == f_idx_st
+                ):
+                    aj_resp = dict(aj_resp)
+                    aj_resp["partial_overlay"] = {
+                        "seq": ov_seq_now,
+                        "frame_index": ov_frame_now,
+                        "unchanged": True,
+                    }
             return {
                 "galaxy_connected": self.pipeline_runner.is_connected,
                 "galaxy_url": self.pipeline_runner.galaxy_url,
@@ -98,7 +128,7 @@ class MainApp:
                     current_h5=cur_h5,
                     history_datasets=hist_ds,
                 ),
-                "active_job": self.pipeline_runner.active_job,
+                "active_job": aj_resp,
                 "step_timings": step_timings_snap,
                 "server_time": time.time(),
                 "pipeline_stages": payload.get("pipeline_stages", []),
@@ -108,7 +138,10 @@ class MainApp:
         async def handle_status(request: web.Request) -> web.Response:
             frame_q = request.rel_url.query.get("frame")
             is_poll = request.rel_url.query.get("poll") == "1"
-            doc = await asyncio.to_thread(_build_status_doc, frame_q, is_poll)
+            overlay_seq_q = request.rel_url.query.get("overlay_seq")
+            doc = await asyncio.to_thread(
+                _build_status_doc, frame_q, is_poll, overlay_seq_q
+            )
             return web.json_response(doc)
 
         async def handle_artifact_download(request: web.Request) -> web.Response:
@@ -138,6 +171,60 @@ class MainApp:
         def _compute_payload_response(
             query_dict: dict[str, str],
         ) -> tuple[dict[str, Any], int]:
+            if query_dict.get("textures_only") == "1":
+                from subhkl.viz.rainbow_zones import build_rainbow_panel_textures_only
+
+                f_idx_tex: int | None = None
+                frame_q_tex = query_dict.get("frame")
+                if frame_q_tex is not None and str(frame_q_tex).strip() != "":
+                    with contextlib.suppress(ValueError, TypeError):
+                        f_idx_tex = int(frame_q_tex)
+                rb_tex = int(self.view_model.model.subhkl.render_binning or 4)
+                rbin_q_tex = query_dict.get("render_binning")
+                if rbin_q_tex is not None and str(rbin_q_tex).strip() != "":
+                    with contextlib.suppress(ValueError, TypeError):
+                        parsed_rb_tex = int(rbin_q_tex)
+                        if 1 <= parsed_rb_tex <= 16:
+                            rb_tex = parsed_rb_tex
+                            self.view_model.model.subhkl.render_binning = parsed_rb_tex
+                sub_m = self.view_model.model.subhkl
+                tex_doc = build_rainbow_panel_textures_only(
+                    replay_h5=sub_m.data.peaks_file or sub_m.data.images_file,
+                    images_h5=sub_m.data.images_file,
+                    instrument=sub_m.data.instrument or "CG4D",
+                    render_binning=rb_tex,
+                    frame_index=(
+                        f_idx_tex
+                        if f_idx_tex is not None
+                        else int(sub_m.frame_index or 0)
+                    ),
+                )
+                if payload_lock.acquire(blocking=False):
+                    try:
+                        cur_pl = sub_m.payload
+                        if isinstance(cur_pl, dict) and isinstance(
+                            cur_pl.get("panels"), list
+                        ):
+                            cur_pl["render_binning"] = tex_doc["render_binning"]
+                            if int(cur_pl.get("frame_index") or 0) == int(
+                                tex_doc.get("frame_index") or 0
+                            ):
+                                by_bank = {
+                                    int(p["bank"]): p
+                                    for p in tex_doc.get("panels", [])
+                                    if "bank" in p
+                                }
+                                for cp in cur_pl["panels"]:
+                                    np_tex = by_bank.get(int(cp.get("bank", -1)))
+                                    if np_tex:
+                                        if np_tex.get("texture_b64"):
+                                            cp["texture_b64"] = np_tex["texture_b64"]
+                                        if np_tex.get("mask_b64"):
+                                            cp["mask_b64"] = np_tex["mask_b64"]
+                    finally:
+                        payload_lock.release()
+                return (tex_doc, 200)
+
             with payload_lock:
                 frame_q = query_dict.get("frame")
                 f_idx: int | None = None

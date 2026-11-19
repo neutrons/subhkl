@@ -5847,3 +5847,227 @@ console.log(JSON.stringify({{
         assert out["edgeTxt06"] == "Edge 6.0% (15px)"
         assert out["edgeTxt08"] == "Edge 8.0% (20px)"
         assert out["btnOpacity"] == "1"
+
+
+def test_textures_only_fast_path_and_vectorized_flat_raycast(tmp_path):
+    """Hi-Res textures_only=1 skips HKL/zone rebuilds, vectorized flat-panel raycast matches Detector 1:1, and status poll deduplicates overlay_seq."""
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import (
+        cartesian_matrix_metric_tensor,
+        generate_reflections,
+    )
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.nova_app.views.main_view import MainApp
+    from subhkl.viz.rainbow_zones import (
+        _raycast_hkl_on_detectors,
+        build_rainbow_panel_textures_only,
+        build_rainbow_zone_payload,
+    )
+
+    # 1. Vectorized flat-panel raycaster exact parity against Detector.reflections_mask + pixel_to_lab
+    mandi_dets = {
+        int(bk): Detector(dict(cfg)) for bk, cfg in list(beamlines["MANDI"].items())[:8]
+    }
+    cell = [68.0, 74.0, 92.0, 90.0, 90.0, 90.0]
+    B_mat_raw, _ = cartesian_matrix_metric_tensor(*cell[:3], *np.deg2rad(cell[3:]))
+    B_mat = np.asarray(B_mat_raw, dtype=float)
+    U_mat = Rotation.from_euler("zyx", [19.0, -31.0, 44.0], degrees=True).as_matrix()
+    R_mat = Rotation.from_euler("y", 17.5, degrees=True).as_matrix()
+    RUB = R_mat @ U_mat @ B_mat
+    sample_off = np.array([0.0012, -0.0008, 0.0021], dtype=float)
+    margin = 0.06
+    hkls = np.stack(
+        generate_reflections(*cell, space_group="P 21 21 21", d_min=2.4),
+        axis=1,
+    ).astype(int)
+
+    vec_out = _raycast_hkl_on_detectors(
+        hkls,
+        U_mat,
+        B_mat,
+        R_mat,
+        mandi_dets,
+        (2.0, 4.0),
+        active_bids=set(mandi_dets.keys()),
+        margin_frac=margin,
+        sample_offset_lab=sample_off,
+    )
+    assert len(vec_out["peaks_xyz"]) > 10
+
+    # Reference per-bank Detector calculation
+    ki_vec = np.array([0.0, 0.0, 1.0], dtype=float)
+    G = hkls.astype(float) @ RUB.T
+    qn = np.linalg.norm(G, axis=1)
+    sth = -(G @ ki_vec) / np.maximum(qn, 1e-12)
+    lam_pred = 2.0 * sth / np.maximum(qn, 1e-12)
+    in_wl = (qn > 1e-8) & (sth > 1e-5) & (lam_pred >= 2.0) & (lam_pred <= 4.0)
+    cand_idx = np.flatnonzero(in_wl)
+    kf_dir = ki_vec[None, :] + lam_pred[cand_idx, None] * G[cand_idx]
+    kf_hat = kf_dir / np.maximum(np.linalg.norm(kf_dir, axis=1, keepdims=True), 1e-12)
+
+    ref_by_key = {}
+    for bk, det in sorted(mandi_dets.items()):
+        hit_m, rows, cols = det.reflections_mask(
+            kf_hat[:, 0], kf_hat[:, 1], kf_hat[:, 2], sample_offset=sample_off
+        )
+        r_span = max(float(det.n - 1), 1.0)
+        c_span = max(float(det.m - 1), 1.0)
+        hit_m = (
+            hit_m
+            & (rows >= margin * r_span)
+            & (rows <= (1.0 - margin) * r_span)
+            & (cols >= margin * c_span)
+            & (cols <= (1.0 - margin) * c_span)
+        )
+        for loc in np.flatnonzero(hit_m):
+            gi = int(cand_idx[loc])
+            r_px = float(rows[loc])
+            c_px = float(cols[loc])
+            xyz_ref = np.asarray(det.pixel_to_lab(r_px, c_px), dtype=float).reshape(3)
+            h, k, l = int(hkls[gi, 0]), int(hkls[gi, 1]), int(hkls[gi, 2])
+            ref_by_key[(bk, h, k, l)] = (r_px, c_px, xyz_ref)
+
+    vec_by_key = {
+        (
+            int(vec_out["bank"][i]),
+            int(vec_out["hkl"][i, 0]),
+            int(vec_out["hkl"][i, 1]),
+            int(vec_out["hkl"][i, 2]),
+        ): (
+            float(vec_out["pixel_r"][i]),
+            float(vec_out["pixel_c"][i]),
+            np.asarray(vec_out["peaks_xyz"][i], dtype=float),
+        )
+        for i in range(len(vec_out["peaks_xyz"]))
+    }
+    assert set(vec_by_key.keys()) == set(ref_by_key.keys())
+    for key, (r_v, c_v, xyz_v) in vec_by_key.items():
+        r_ref, c_ref, xyz_ref = ref_by_key[key]
+        assert abs(r_v - r_ref) < 1e-11
+        assert abs(c_v - c_ref) < 1e-11
+        assert np.max(np.abs(xyz_v - xyz_ref)) < 1e-13
+
+    # 2. Build multi-frame MANDI HDF5 + verify build_rainbow_panel_textures_only & /api/payload?textures_only=1
+    mandi_h5 = tmp_path / "mandi_tex_fast.h5"
+    rng = np.random.default_rng(42)
+    imgs = rng.poisson(12.0, size=(2, 256, 256)).astype(np.float32)
+    imgs[0, 120:128, 130:138] += 250.0
+    imgs[1, 60:68, 80:88] += 300.0
+    with h5py.File(mandi_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["images"] = imgs
+        hf["bank_ids"] = np.array([20, 20], dtype=np.int32)
+        hf["file_offsets"] = np.array([0, 1, 2], dtype=np.int32)
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=np.float32)
+
+    full_hi = build_rainbow_zone_payload(
+        replay_h5=mandi_h5,
+        images_h5=mandi_h5,
+        instrument="MANDI",
+        render_binning=1,
+        frame_index=1,
+    )
+    tex_only_hi = build_rainbow_panel_textures_only(
+        replay_h5=mandi_h5,
+        images_h5=mandi_h5,
+        instrument="MANDI",
+        render_binning=1,
+        frame_index=1,
+    )
+    assert set(tex_only_hi.keys()) == {
+        "render_binning",
+        "frame_index",
+        "intensity_source",
+        "panels",
+    }
+    assert tex_only_hi["render_binning"] == 1
+    assert tex_only_hi["frame_index"] == 1
+    b20_full = next(p for p in full_hi["panels"] if p["bank"] == 20)
+    b20_fast = next(p for p in tex_only_hi["panels"] if p["bank"] == 20)
+    assert "grid_s" not in b20_fast
+    assert b20_fast["texture_b64"] == b20_full["texture_b64"]
+
+    # 3. Verify MainApp lock-free /api/payload?textures_only=1 and /api/pipeline/status?poll=1&overlay_seq=...
+    app_inst = object.__new__(MainApp)
+    app_inst.pipeline_runner = MagicMock()
+    app_inst.pipeline_runner.is_connected = False
+    app_inst.pipeline_runner.galaxy_url = ""
+    app_inst.pipeline_runner.history_id = None
+    app_inst.pipeline_runner.list_history_datasets.return_value = []
+    app_inst.pipeline_runner.list_step_artifacts.return_value = []
+    app_inst.pipeline_runner.get_step_timings_snapshot.return_value = {}
+    app_inst.pipeline_runner.active_job = {
+        "step": "solve",
+        "state": "running",
+        "partial_overlay": {
+            "seq": 7,
+            "frame_index": 1,
+            "predicted_peaks": [{"hkl": [1, 2, 3]}],
+        },
+    }
+    sub_m = SubhklGalaxyModel()
+    sub_m.data.instrument = "MANDI"
+    sub_m.data.images_file = str(mandi_h5)
+    sub_m.data.peaks_file = str(mandi_h5)
+    sub_m.frame_index = 1
+    sub_m.render_binning = 4
+    sub_m.payload = build_rainbow_zone_payload(
+        replay_h5=mandi_h5,
+        images_h5=mandi_h5,
+        instrument="MANDI",
+        render_binning=4,
+        frame_index=1,
+    )
+    app_inst.view_model = SimpleNamespace(model=SimpleNamespace(subhkl=sub_m))
+    aio_app = web.Application()
+    app_inst._bind_routes(SimpleNamespace(app=aio_app))
+
+    req_tex = make_mocked_request(
+        "GET",
+        "/api/payload?frame=1&render_binning=1&textures_only=1",
+        app=aio_app,
+    )
+    resp_tex = asyncio.run(aio_app._handle(req_tex))
+    assert resp_tex.status == 200
+    doc_tex = json.loads(resp_tex.body.decode("utf-8"))
+    assert "predicted_peaks" not in doc_tex
+    assert doc_tex["render_binning"] == 1
+    assert sub_m.render_binning == 1
+    # Cached model payload for frame 1 should also be upgraded in-place to Hi-Res texture
+    b20_cached = next(p for p in sub_m.payload["panels"] if p["bank"] == 20)
+    assert b20_cached["texture_b64"] == b20_full["texture_b64"]
+
+    # Poll status with matching overlay_seq=7 -> lightweight unchanged stub
+    req_st_same = make_mocked_request(
+        "GET",
+        "/api/pipeline/status?frame=1&poll=1&overlay_seq=7",
+        app=aio_app,
+    )
+    resp_st_same = asyncio.run(aio_app._handle(req_st_same))
+    doc_st_same = json.loads(resp_st_same.body.decode("utf-8"))
+    assert doc_st_same["active_job"]["partial_overlay"] == {
+        "seq": 7,
+        "frame_index": 1,
+        "unchanged": True,
+    }
+
+    # Poll status with older overlay_seq=6 -> full partial_overlay delivered
+    req_st_old = make_mocked_request(
+        "GET",
+        "/api/pipeline/status?frame=1&poll=1&overlay_seq=6",
+        app=aio_app,
+    )
+    resp_st_old = asyncio.run(aio_app._handle(req_st_old))
+    doc_st_old = json.loads(resp_st_old.body.decode("utf-8"))
+    assert "unchanged" not in doc_st_old["active_job"]["partial_overlay"]
+    assert len(doc_st_old["active_job"]["partial_overlay"]["predicted_peaks"]) == 1
