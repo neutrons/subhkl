@@ -27,6 +27,15 @@ stack, so no selection is needed and the gate is the same for strong and
 weak reflections.  The stacked excess gives a common offset (a cell-scale
 or flight-path error moves every reflection by the same relative amount)
 and a width; the gate is the interval holding a chosen fraction of it.
+
+Everything is done one image at a time on the accelerator.  The events of
+an image are histogrammed into a (row, column, time) cube whose time bins
+are logarithmic, so a relative gate is the same number of bins at every
+wavelength.  Cumulative sums of that cube turn every count the method
+needs into a handful of lookups: a tile inside a gate is a difference of
+two time slices, and the sideband counts of a tile are corner differences
+of the three-way cumulative sum.  Gate and sideband edges are therefore
+bin edges; the bin is at most a thirtieth of the gate.
 """
 
 from dataclasses import dataclass
@@ -35,16 +44,20 @@ from functools import partial
 import numpy as np
 from tqdm import tqdm
 
-from subhkl.io.events import ANGSTROM_M_PER_US, box_events
+from subhkl.io.events import ANGSTROM_M_PER_US
 
 ATOM_PAD = 8  # atoms per tile: the reflection and up to seven neighbours
 MIN_TILE_HALF = 10
 MAX_TILE_HALF = 30
 SIDEBAND_BINS = 8  # sub-intervals per side
 STACK_HALF_BOX = 2  # 5x5 pixel core for the stacked time profile
+STACK_MAX_IMAGES = 96  # images sampled for the stacked time profile
+MAX_TIME_BINS = 2048
+MAX_LOG_BIN = 1.0e-3  # [-] coarsest relative time bin
+PEAK_PAD = 512  # peaks per image are padded to a multiple of this
+EVENT_PAD = 1 << 20  # events per image are padded to a multiple of this
 
-_SOLVE_TILES_JIT = {}
-_SNAP_TILES_JIT = None
+_JIT = {}
 
 
 @dataclass
@@ -59,6 +72,30 @@ class TofGate:
     @property
     def width(self):
         return self.hi - self.lo
+
+
+@dataclass
+class TimeGrid:
+    """Logarithmic time bins: edge b sits at t0 * exp(b * dl)."""
+
+    t0: float  # [microsecond]
+    dl: float  # [-]
+    nt: int
+
+    def edge_index(self, t):
+        """[-] fractional edge index of time t [microsecond]."""
+        return np.log(np.asarray(t, dtype=np.float64) / self.t0) / self.dl
+
+    def edge_time(self, b):
+        """[microsecond] time of edge index b."""
+        return self.t0 * np.exp(np.asarray(b, dtype=np.float64) * self.dl)
+
+    @classmethod
+    def spanning(cls, t_lo, t_hi, dl):
+        dl = max(dl, np.log(t_hi / t_lo) / MAX_TIME_BINS)
+        return cls(
+            t0=float(t_lo), dl=float(dl), nt=int(np.ceil(np.log(t_hi / t_lo) / dl))
+        )
 
 
 def predicted_tof(wavelength, l1, l2):
@@ -82,40 +119,177 @@ def parse_gate(spec):
     return TofGate(lo=lo, hi=hi, source="manual")
 
 
+def _prefix_impl(flat_idx, valid, shape):
+    """Cumulative sums of one image's (row, column, time) event cube.
+
+    Args:
+        flat_idx: [-] per event, (row * W + col) * nt + time bin; events to
+            leave out (padding, out of range) point at the slot H * W * nt
+        valid: [-] (H, W) int32, 1 = usable pixel
+    Returns:
+        ct [photons] (H, W, nt + 1): counts of a pixel before each time edge
+        p3 [photons] (H + 1, W + 1, nt + 1): ct summed over the pixels above
+            and left of each corner
+    """
+    import jax.numpy as jnp
+
+    H, W, nt = shape
+    cube = jnp.zeros(H * W * nt + 1, dtype=jnp.int32).at[flat_idx].add(1)
+    cube = cube[:-1].reshape(H, W, nt) * valid[:, :, None]
+    ct = jnp.pad(jnp.cumsum(cube, axis=2), ((0, 0), (0, 0), (1, 0)))
+    p3 = jnp.pad(jnp.cumsum(jnp.cumsum(ct, axis=0), axis=1), ((1, 0), (1, 0), (0, 0)))
+    return ct, p3
+
+
+def _box_sums_impl(p3, r0, r1, c0, c1, edges):
+    """[photons] (K, S): counts of each pixel box before each time edge."""
+    r0, r1, c0, c1 = r0[:, None], r1[:, None], c0[:, None], c1[:, None]
+    return p3[r1, c1, edges] - p3[r0, c1, edges] - p3[r1, c0, edges] + p3[r0, c0, edges]
+
+
+def _tiles_impl(ct, valid, org_r, org_c, b_lo, b_hi, T):
+    """Tiles of the counts between two time edges, and their usable pixels."""
+    import jax.numpy as jnp
+
+    H, W = valid.shape
+    rr = org_r[:, None] + jnp.arange(T)[None, :]
+    cc = org_c[:, None] + jnp.arange(T)[None, :]
+    inside = ((rr >= 0) & (rr < H))[:, :, None] & ((cc >= 0) & (cc < W))[:, None, :]
+    rr = jnp.clip(rr, 0, H - 1)[:, :, None]
+    cc = jnp.clip(cc, 0, W - 1)[:, None, :]
+    counts = ct[rr, cc, b_hi[:, None, None]] - ct[rr, cc, b_lo[:, None, None]]
+    ok = inside & (valid[rr, cc] > 0)
+    return (counts * ok).astype(jnp.float32), ok.astype(jnp.float32)
+
+
+def _jit(name):
+    if name not in _JIT:
+        from jax import jit
+
+        if name == "prefix":
+            _JIT[name] = partial(jit, static_argnames=["shape"])(_prefix_impl)
+        elif name == "box":
+            _JIT[name] = jit(_box_sums_impl)
+        elif name == "tiles":
+            _JIT[name] = partial(jit, static_argnames=["T"])(_tiles_impl)
+        elif name == "snap":
+            from subhkl.search.matrix_free import _snap_positions_impl
+
+            _JIT[name] = jit(_snap_positions_impl)
+    return _JIT[name]
+
+
+def _solve_tiles(has_profile, use_l1_gate, allow_negative):
+    """vmapped ``_solve_image_amplitudes`` over a batch of tiles."""
+    key = ("solve", has_profile, use_l1_gate, allow_negative)
+    if key not in _JIT:
+        from jax import jit, vmap
+
+        from subhkl.search.matrix_free import _solve_image_amplitudes_impl
+
+        def solve(tiles, bgs, valid, r, c, vu, vv, cuv, ok, z, prof):
+            one = partial(
+                _solve_image_amplitudes_impl,
+                admission_z=z,
+                profile=prof,
+                use_l1_gate=use_l1_gate,
+                allow_negative=allow_negative,
+            )
+            return vmap(one)(tiles, bgs, valid, r, c, vu, vv, cuv, ok)
+
+        _JIT[key] = jit(solve)
+    return _JIT[key]
+
+
+def _image_prefix(tof, pix_offsets, valid_img, grid):
+    """Cumulative event cube of one image on the accelerator."""
+    import jax.numpy as jnp
+
+    H, W = valid_img.shape
+    pix = np.repeat(np.arange(H * W, dtype=np.int64), np.diff(pix_offsets))
+    tb = np.floor(grid.edge_index(np.maximum(tof, 1e-6))).astype(np.int64)
+    dump = H * W * grid.nt
+    flat = np.where((tb >= 0) & (tb < grid.nt), pix * grid.nt + tb, dump)
+    n_pad = max(EVENT_PAD, -(-len(flat) // EVENT_PAD) * EVENT_PAD)
+    buf = np.full(n_pad, dump, dtype=np.int32)
+    buf[: len(flat)] = flat
+    return _jit("prefix")(
+        jnp.array(buf),
+        jnp.array((valid_img > 0.5).astype(np.int32)),
+        shape=(H, W, grid.nt),
+    )
+
+
+def _padded(arr, n_pad, fill=0):
+    out = np.full((n_pad,) + arr.shape[1:], fill, dtype=arr.dtype)
+    out[: len(arr)] = arr
+    return out
+
+
+def _pad_len(n):
+    return max(PEAK_PAD, -(-n // PEAK_PAD) * PEAK_PAD)
+
+
 def stack_relative_tof(
-    reader, n_frames, frames, rs, cs, tof_pred, shape, search=0.05, n_bins=400
+    reader,
+    static_valid,
+    frames,
+    rs,
+    cs,
+    tof_pred,
+    grid,
+    search=0.05,
+    n_bins=100,
+    show_progress=False,
 ):
-    """Histogram of t_event / t_pred - 1 near all predicted positions.
+    """Histogram of t_event / t_pred - 1 near the predicted positions.
+
+    A sample of the images is enough: the stack only has to show where the
+    Bragg excess sits relative to the predictions and how wide it is.
 
     Args:
         reader: frame -> (tof [microsecond], pixel offsets) of that image
+        static_valid: [-] (B, H, W), 1 = usable pixel
         frames, rs, cs: image index and predicted position [Pixel] per peak
         tof_pred: [microsecond] predicted time of flight per peak
-        shape: (H, W) of the images
+        grid: TimeGrid of the event cube
         search: [-] half-range of the relative coordinate
     Returns:
         bin edges [-] and summed counts [photons]
     """
-    H, W = shape
+    import jax.numpy as jnp
+
+    _B, H, W = static_valid.shape
     edges = np.linspace(-search, search, n_bins + 1)
     hist = np.zeros(n_bins, dtype=np.float64)
-    scale = n_bins / (2.0 * search)
     hb = STACK_HALF_BOX
-    for f in range(n_frames):
+    nb = int(np.ceil(search / grid.dl)) + 1
+    offs = np.arange(-nb, nb + 2)
+
+    with_peaks = np.unique(frames)
+    if len(with_peaks) > STACK_MAX_IMAGES:
+        pick = np.linspace(0, len(with_peaks) - 1, STACK_MAX_IMAGES).round().astype(int)
+        with_peaks = with_peaks[pick]
+
+    pbar = tqdm(with_peaks, desc="Time-of-flight profile", disable=not show_progress)
+    for f in pbar:
         idx = np.flatnonzero(frames == f)
-        if len(idx) == 0:
-            continue
-        tof, pix_offsets = reader(f)
-        for k in idx:
-            ri, ci = round(float(rs[k])), round(float(cs[k]))
-            r0, r1 = max(ri - hb, 0), min(ri + hb + 1, H)
-            c0, c1 = max(ci - hb, 0), min(ci + hb + 1, W)
-            if r0 >= r1 or c0 >= c1:
-                continue
-            t, _pix = box_events(tof, pix_offsets, W, r0, r1, c0, c1)
-            b = np.floor((t / tof_pred[k] - 1.0 + search) * scale).astype(np.int64)
-            b = b[(b >= 0) & (b < n_bins)]
-            hist += np.bincount(b, minlength=n_bins)
+        tof, pix_offsets = reader(int(f))
+        _ct, p3 = _image_prefix(tof, pix_offsets, static_valid[f], grid)
+        ri, ci = np.rint(rs[idx]).astype(int), np.rint(cs[idx]).astype(int)
+        r0, r1 = np.clip(ri - hb, 0, H), np.clip(ri + hb + 1, 0, H)
+        c0, c1 = np.clip(ci - hb, 0, W), np.clip(ci + hb + 1, 0, W)
+        centre = np.rint(grid.edge_index(tof_pred[idx])).astype(int)
+        e = np.clip(centre[:, None] + offs[None, :], 0, grid.nt)
+        n_pad = _pad_len(len(idx))
+        sums = _jit("box")(
+            p3,
+            *(jnp.array(_padded(a.astype(np.int32), n_pad)) for a in (r0, r1, c0, c1)),
+            jnp.array(_padded(e.astype(np.int32), n_pad)),
+        )
+        counts = np.diff(np.array(sums)[: len(idx)], axis=1)
+        x = grid.edge_time(0.5 * (e[:, :-1] + e[:, 1:])) / tof_pred[idx, None] - 1.0
+        hist += np.histogram(x.ravel(), bins=edges, weights=counts.ravel())[0]
     return edges, hist
 
 
@@ -138,13 +312,14 @@ def gate_from_stack(edges, hist, coverage=0.95, min_z=5.0):
     inner = ~outer
 
     # Smooth just enough to locate the maximum without chasing a single bin.
-    kern = np.ones(5) / 5.0
+    n_smooth = 3
+    kern = np.ones(n_smooth) / n_smooth
     smooth = np.convolve(excess, kern, mode="same")
     peak = int(np.argmax(np.where(inner, smooth, -np.inf)))
 
     # The support of the excess: outward from the maximum until the smoothed
     # excess reaches the baseline noise, bounded by the inner range.
-    noise = np.sqrt(np.maximum(base, 1.0) / 5.0)
+    noise = np.sqrt(np.maximum(base, 1.0) / n_smooth)
     left = peak
     while left > 0 and inner[left - 1] and smooth[left - 1] > noise[left - 1]:
         left -= 1
@@ -178,88 +353,59 @@ def _tile_half(var_us, var_vs):
     return int(np.clip(half, MIN_TILE_HALF, MAX_TILE_HALF))
 
 
-def _sideband_rate(t, ok, n_valid, gate_lo, gate_hi, lim_lo, lim_hi, blocked, factor):
-    """Background rate [photons/Pixel/microsecond] from time sidebands.
+def _sideband_edges(b_lo, b_hi, nominal, lim_lo, lim_hi, factor):
+    """Time-edge indices of the sideband sub-intervals of each gate.
 
     Args:
-        t: [microsecond] events of the tile
-        ok: [-] per event, True on a usable pixel
-        n_valid: [-] number of usable pixels in the tile
-        gate_lo, gate_hi: [microsecond] the gate
-        lim_lo, lim_hi: [microsecond] edges of the wavelength band here
-        blocked: list of (lo, hi) [microsecond] gates of other reflections
-            reaching this tile; sub-intervals touching them are left out
+        b_lo, b_hi: [-] gate edges, (K,)
+        nominal: [-] gate width in bins before clipping to the band
+        lim_lo, lim_hi: [-] edges of the wavelength band, (K,)
         factor: [-] sideband length on each side in units of the gate width
+    Returns:
+        edges (K, 2, SIDEBAND_BINS + 1) int, and (K, 2) bool: side is long
+        enough to use
     """
-    width = gate_hi - gate_lo
-    guard = 0.5 * width
-    span = factor * width
-    t_ok = t[ok]
-    counts, widths = [], []
-    for a, b in (
-        (gate_lo - guard - span, gate_lo - guard),
-        (gate_hi + guard, gate_hi + guard + span),
-    ):
-        a, b = max(a, lim_lo), min(b, lim_hi)
-        if b - a < 0.25 * width:
-            continue
-        sub = np.linspace(a, b, SIDEBAND_BINS + 1)
-        c = np.histogram(t_ok, bins=sub)[0].astype(np.float64)
-        w = np.diff(sub)
-        keep = np.ones(SIDEBAND_BINS, dtype=bool)
-        for blo, bhi in blocked:
-            keep &= ~((sub[:-1] < bhi) & (sub[1:] > blo))
-        counts.append(c[keep])
-        widths.append(w[keep])
-    if not counts or sum(len(c) for c in counts) == 0:
-        return np.nan
-    counts = np.concatenate(counts)
-    widths = np.concatenate(widths)
-    # An unpredicted reflection in a sideband is a count far above the
-    # others; leave such sub-intervals out.  Counts are compared per unit
-    # width because clipping at the band edge can shorten one side.
-    per_width = counts / widths
-    med = np.median(per_width)
-    tol = 5.0 * np.sqrt(max(med * np.median(widths), 1.0)) / np.median(widths)
-    keep = per_width <= med + tol
-    if not keep.any():
-        keep[:] = True
-    return float(counts[keep].sum() / (widths[keep].sum() * max(n_valid, 1)))
+    guard = int(np.ceil(0.5 * nominal))
+    span = int(np.ceil(factor * nominal))
+    a = np.stack([b_lo - guard - span, b_hi + guard], axis=1)
+    b = np.stack([b_lo - guard, b_hi + guard + span], axis=1)
+    a = np.clip(a, lim_lo[:, None], lim_hi[:, None])
+    b = np.clip(b, lim_lo[:, None], lim_hi[:, None])
+    frac = np.arange(SIDEBAND_BINS + 1) / SIDEBAND_BINS
+    edges = np.rint(a[:, :, None] + (b - a)[:, :, None] * frac).astype(np.int64)
+    return edges, (b - a) >= max(1.0, 0.25 * nominal)
 
 
-def _solve_tiles(profile, use_l1_gate, allow_negative):
-    """vmapped ``_solve_image_amplitudes`` over a batch of tiles."""
-    key = (profile is not None, use_l1_gate, allow_negative)
-    if key not in _SOLVE_TILES_JIT:
-        from jax import jit, vmap
+def _sideband_rates(counts, widths, keep, keep_unblocked, n_valid):
+    """Background rate [photons/Pixel/microsecond] of each tile.
 
-        from subhkl.search.matrix_free import _solve_image_amplitudes_impl
-
-        def solve(tiles, bgs, valid, r, c, vu, vv, cuv, ok, z, prof):
-            one = partial(
-                _solve_image_amplitudes_impl,
-                admission_z=z,
-                profile=prof,
-                use_l1_gate=use_l1_gate,
-                allow_negative=allow_negative,
-            )
-            return vmap(one)(tiles, bgs, valid, r, c, vu, vv, cuv, ok)
-
-        _SOLVE_TILES_JIT[key] = jit(solve)
-    return _SOLVE_TILES_JIT[key]
-
-
-def _snap_tiles(tiles, bgs, valid, r, c):
-    global _SNAP_TILES_JIT
-    if _SNAP_TILES_JIT is None:
-        from jax import jit
-
-        from subhkl.search.matrix_free import _snap_positions_impl
-
-        _SNAP_TILES_JIT = jit(_snap_positions_impl)
-    import jax.numpy as jnp
-
-    return _SNAP_TILES_JIT(tiles, bgs, valid, jnp.arange(tiles.shape[0]), r, c)
+    Args:
+        counts: [photons] (K, S) per sideband sub-interval, usable pixels
+        widths: [microsecond] (K, S)
+        keep: [-] (K, S) sub-intervals free of other reflections' gates
+        keep_unblocked: [-] (K, S) the same without that exclusion; used
+            where it leaves nothing
+        n_valid: [-] (K,) usable pixels of the tile
+    """
+    none_left = ~keep.any(axis=1)
+    keep = np.where(none_left[:, None], keep_unblocked, keep)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        per_width = np.where(keep, counts / widths, np.nan)
+        any_kept = keep.any(axis=1)
+        med = np.zeros(len(counts))
+        med_w = np.ones(len(counts))
+        med[any_kept] = np.nanmedian(per_width[any_kept], axis=1)
+        med_w[any_kept] = np.nanmedian(np.where(keep, widths, np.nan)[any_kept], axis=1)
+        # An unpredicted reflection in a sideband is a count far above the
+        # others; leave such sub-intervals out.  Counts are compared per
+        # unit width because clipping at the band edge can shorten a side.
+        tol = 5.0 * np.sqrt(np.maximum(med * med_w, 1.0)) / med_w
+        trimmed = keep & (per_width <= (med + tol)[:, None])
+        trimmed = np.where(trimmed.any(axis=1)[:, None], trimmed, keep)
+        total_c = np.where(trimmed, counts, 0.0).sum(axis=1)
+        total_w = np.where(trimmed, widths, 0.0).sum(axis=1)
+        rate = total_c / (total_w * np.maximum(n_valid, 1))
+    return np.where(any_kept & (total_w > 0), rate, np.nan)
 
 
 def integrate_reflections_tof_gated(
@@ -283,7 +429,6 @@ def integrate_reflections_tof_gated(
     fp_target=None,
     border_width=0,
     allow_negative=False,
-    chunk_size=2048,
     show_progress=False,
 ):
     """Integrate every predicted reflection on its own time-gated tile.
@@ -346,8 +491,20 @@ def integrate_reflections_tof_gated(
         static_valid[:, :, :bw_px] = 0.0
         static_valid[:, :, W - bw_px :] = 0.0
 
+    margin = gate_search + 0.01
+    t_span = (tof_lim_lo.min() * (1.0 - margin), tof_lim_hi.max() * (1.0 + margin))
+
+    stack_grid = TimeGrid.spanning(*t_span, MAX_LOG_BIN)
     edges, hist = stack_relative_tof(
-        reader, B, frames, rs, cs, tof_pred, (H, W), search=gate_search
+        reader,
+        static_valid,
+        frames,
+        rs,
+        cs,
+        tof_pred,
+        stack_grid,
+        search=gate_search,
+        show_progress=show_progress,
     )
     info["stack_edges"], info["stack_hist"] = edges, hist
     if gate is None:
@@ -374,98 +531,24 @@ def integrate_reflections_tof_gated(
             + ")"
         )
 
-    g_lo = np.clip(tof_pred * (1.0 + gate.lo), tof_lim_lo, tof_lim_hi)
-    g_hi = np.clip(tof_pred * (1.0 + gate.hi), tof_lim_lo, tof_lim_hi)
-    in_band = g_hi - g_lo > 0.25 * tof_pred * gate.width
+    # Time bins a thirtieth of the gate or finer; gates become bin edges.
+    grid = TimeGrid.spanning(*t_span, min(MAX_LOG_BIN, gate.width / 30.0))
+    nominal = (np.log1p(gate.hi) - np.log1p(gate.lo)) / grid.dl  # [-] bins
+    lim_lo = np.ceil(grid.edge_index(tof_lim_lo)).astype(np.int64)
+    lim_hi = np.floor(grid.edge_index(tof_lim_hi)).astype(np.int64)
+    b_lo = np.rint(grid.edge_index(tof_pred * (1.0 + gate.lo))).astype(np.int64)
+    b_hi = np.rint(grid.edge_index(tof_pred * (1.0 + gate.hi))).astype(np.int64)
+    b_lo = np.clip(b_lo, lim_lo, lim_hi)
+    b_hi = np.clip(b_hi, lim_lo, lim_hi)
+    in_band = (b_hi - b_lo) >= max(1.0, 0.25 * nominal)
+    gate_time = grid.edge_time(b_hi) - grid.edge_time(b_lo)  # [microsecond]
 
     half = _tile_half(var_us, var_vs)
     T = 2 * half + 1
     K = ATOM_PAD
-
-    tiles = np.zeros((n_peaks, T, T), dtype=np.float32)
-    tile_valid = np.zeros((n_peaks, T, T), dtype=np.float32)
-    tile_bg = np.full(n_peaks, np.nan, dtype=np.float64)  # [photons/Pixel]
-    atom_idx = np.full((n_peaks, K), -1, dtype=np.int64)
-    atom_idx[:, 0] = np.arange(n_peaks)
     origin_r = np.rint(rs).astype(int) - half
     origin_c = np.rint(cs).astype(int) - half
     reach = 3.0 * np.sqrt(np.maximum(var_us, var_vs))
-    n_dropped_neighbours = 0
-
-    pbar = tqdm(range(B), desc="Time-of-flight gating", disable=not show_progress)
-    for f in pbar:
-        idx = np.flatnonzero(frames == f)
-        if len(idx) == 0:
-            continue
-        tof, pix_offsets = reader(f)
-        valid_img = static_valid[f]
-
-        # Neighbours: footprints reaching the tile, gates overlapping in time.
-        dr = np.abs(rs[idx, None] - rs[None, idx])
-        dc = np.abs(cs[idx, None] - cs[None, idx])
-        near = (dr <= half + reach[None, idx]) & (dc <= half + reach[None, idx])
-        overlap = (g_lo[idx, None] < g_hi[None, idx]) & (
-            g_hi[idx, None] > g_lo[None, idx]
-        )
-        np.fill_diagonal(near, False)
-
-        for a, k in enumerate(idx):
-            if not in_band[k]:
-                continue
-            r0, c0 = origin_r[k], origin_c[k]
-            rr0, rr1 = max(r0, 0), min(r0 + T, H)
-            cc0, cc1 = max(c0, 0), min(c0 + T, W)
-            if rr0 >= rr1 or cc0 >= cc1:
-                continue
-            t, pix = box_events(tof, pix_offsets, W, rr0, rr1, cc0, cc1)
-            box_shape = (rr1 - rr0, cc1 - cc0)
-            v_box = valid_img[rr0:rr1, cc0:cc1]
-            in_gate = (t >= g_lo[k]) & (t < g_hi[k])
-            counts = np.bincount(pix[in_gate], minlength=box_shape[0] * box_shape[1])
-            sl = (slice(rr0 - r0, rr1 - r0), slice(cc0 - c0, cc1 - c0))
-            tiles[k][sl] = counts.reshape(box_shape)
-            tile_valid[k][sl] = v_box
-
-            neigh = np.flatnonzero(near[a])
-            blocked = [(g_lo[idx[j]], g_hi[idx[j]]) for j in neigh if in_band[idx[j]]]
-            rate = _sideband_rate(
-                t,
-                v_box.ravel()[pix] > 0.5,
-                int(v_box.sum()),
-                g_lo[k],
-                g_hi[k],
-                tof_lim_lo[k],
-                tof_lim_hi[k],
-                blocked,
-                sideband_factor,
-            )
-            if not np.isfinite(rate):
-                rate = _sideband_rate(
-                    t,
-                    v_box.ravel()[pix] > 0.5,
-                    int(v_box.sum()),
-                    g_lo[k],
-                    g_hi[k],
-                    tof_lim_lo[k],
-                    tof_lim_hi[k],
-                    [],
-                    sideband_factor,
-                )
-            tile_bg[k] = rate * (g_hi[k] - g_lo[k])
-
-            joint = neigh[overlap[a, neigh]]
-            if len(joint) > K - 1:
-                d2 = dr[a, joint] ** 2 + dc[a, joint] ** 2
-                joint = joint[np.argsort(d2)[: K - 1]]
-                n_dropped_neighbours += 1
-            atom_idx[k, 1 : 1 + len(joint)] = idx[joint]
-
-    usable = in_band & np.isfinite(tile_bg)
-    if show_progress and n_dropped_neighbours:
-        print(
-            f"  > {n_dropped_neighbours} tiles had more than {K - 1} overlapping "
-            "neighbours; the farthest were left out of the joint solve."
-        )
 
     trunk_jax = None
     if profile not in (None, "gaussian", "auto"):
@@ -484,79 +567,157 @@ def integrate_reflections_tof_gated(
             "  > Measured radial profile is not available with gating; Gaussian atoms."
         )
 
-    if fp_target is None:
-        admission_z = 0.0
-    else:
-        admission_z = calibrated_admission_z(n_peaks, fp_target)
+    admission_z = (
+        0.0 if fp_target is None else calibrated_admission_z(n_peaks, fp_target)
+    )
     use_l1_gate = bool(admission_z > 0.0)
-    solve = _solve_tiles(trunk_jax, use_l1_gate, bool(allow_negative))
-
-    # Snap each reflection on its own gated tile, then solve with every
-    # atom (the reflection and its neighbours) at its snapped position.
-    bg_safe = np.where(usable, np.maximum(tile_bg, 1e-3), 1.0).astype(np.float32)
-    snap_r = rs.copy()
-    snap_c = cs.copy()
-    for lo in range(0, n_peaks, chunk_size):
-        sl = slice(lo, min(lo + chunk_size, n_peaks))
-        n = sl.stop - sl.start
-        bg_tiles = jnp.broadcast_to(jnp.array(bg_safe[sl])[:, None, None], (n, T, T))
-        sr, sc = _snap_tiles(
-            jnp.array(tiles[sl]),
-            bg_tiles,
-            jnp.array(tile_valid[sl]),
-            jnp.array((rs[sl] - origin_r[sl]).astype(np.float32)),
-            jnp.array((cs[sl] - origin_c[sl]).astype(np.float32)),
-        )
-        snap_r[sl] = np.array(sr, dtype=np.float64) + origin_r[sl]
-        snap_c[sl] = np.array(sc, dtype=np.float64) + origin_c[sl]
+    solve = _solve_tiles(trunk_jax is not None, use_l1_gate, bool(allow_negative))
 
     out = np.zeros((n_peaks, 5), dtype=np.float64)
-    has_atom = atom_idx >= 0
-    safe_idx = np.where(has_atom, atom_idx, 0)
-    pbar = tqdm(
-        range(0, n_peaks, chunk_size),
-        desc="Gated amplitude solve",
-        disable=not show_progress,
-    )
-    for lo in pbar:
-        sl = slice(lo, min(lo + chunk_size, n_peaks))
-        n = sl.stop - sl.start
-        ai, ok = safe_idx[sl], has_atom[sl]
-        a_r = np.where(ok, snap_r[ai] - origin_r[sl, None], -1e4).astype(np.float32)
-        a_c = np.where(ok, snap_c[ai] - origin_c[sl, None], -1e4).astype(np.float32)
-        a_vu = np.where(ok, var_us[ai], 1.0).astype(np.float32)
-        a_vv = np.where(ok, var_vs[ai], 1.0).astype(np.float32)
-        a_cuv = np.where(ok, cov_uvs[ai], 0.0).astype(np.float32)
-        bg_tiles = jnp.broadcast_to(jnp.array(bg_safe[sl])[:, None, None], (n, T, T))
+    out[:, 1], out[:, 2] = rs, cs
+    tile_bg = np.full(n_peaks, np.nan, dtype=np.float64)  # [photons/Pixel]
+    n_dropped_neighbours = 0
+
+    pbar = tqdm(range(B), desc="Time-of-flight gated solve", disable=not show_progress)
+    for f in pbar:
+        idx = np.flatnonzero(frames == f)
+        n = len(idx)
+        if n == 0:
+            continue
+        n_pad = _pad_len(n)
+        valid_img = static_valid[f]
+        tof, pix_offsets = reader(f)
+        ct, p3 = _image_prefix(tof, pix_offsets, valid_img, grid)
+
+        def dev(arr, fill=0, _n_pad=n_pad):
+            return jnp.array(_padded(arr, _n_pad, fill))
+
+        # Tiles inside the gate.
+        tiles, tile_valid = _jit("tiles")(
+            ct,
+            jnp.array(valid_img),
+            dev(origin_r[idx].astype(np.int32)),
+            dev(origin_c[idx].astype(np.int32)),
+            dev(b_lo[idx].astype(np.int32)),
+            dev(b_hi[idx].astype(np.int32)),
+            T=T,
+        )
+
+        # Sidebands: counts of the tile's usable pixels per sub-interval.
+        r0, r1 = np.clip(origin_r[idx], 0, H), np.clip(origin_r[idx] + T, 0, H)
+        c0, c1 = np.clip(origin_c[idx], 0, W), np.clip(origin_c[idx] + T, 0, W)
+        sb_edges, side_ok = _sideband_edges(
+            b_lo[idx], b_hi[idx], nominal, lim_lo[idx], lim_hi[idx], sideband_factor
+        )
+        sums = _jit("box")(
+            p3,
+            *(dev(a.astype(np.int32)) for a in (r0, r1, c0, c1)),
+            dev(sb_edges.reshape(n, -1).astype(np.int32)),
+        )
+        sums = np.array(sums)[:n].reshape(n, 2, SIDEBAND_BINS + 1)
+        counts = np.diff(sums, axis=2).astype(np.float64)
+        widths = np.diff(grid.edge_time(sb_edges), axis=2)
+        keep0 = (widths > 0) & side_ok[:, :, None]
+
+        # Neighbours: footprints reaching the tile.  Their gates are left
+        # out of the sidebands; those overlapping in time join the solve.
+        dr = np.abs(rs[idx, None] - rs[None, idx])
+        dc = np.abs(cs[idx, None] - cs[None, idx])
+        near = (dr <= half + reach[None, idx]) & (dc <= half + reach[None, idx])
+        np.fill_diagonal(near, False)
+        near &= in_band[None, idx]
+        keep = keep0.copy()
+        pa, pj = np.nonzero(near)
+        if len(pa):
+            hit = (sb_edges[pa, :, :-1] < b_hi[idx][pj, None, None]) & (
+                sb_edges[pa, :, 1:] > b_lo[idx][pj, None, None]
+            )
+            blocked = np.zeros(keep.shape, dtype=bool)
+            np.logical_or.at(blocked, pa, hit)
+            keep &= ~blocked
+
+        vp = np.pad(
+            np.cumsum(np.cumsum(valid_img > 0.5, axis=0), axis=1), ((1, 0), (1, 0))
+        )
+        n_valid = vp[r1, c1] - vp[r0, c1] - vp[r1, c0] + vp[r0, c0]
+        rate = _sideband_rates(
+            counts.reshape(n, -1),
+            widths.reshape(n, -1),
+            keep.reshape(n, -1),
+            keep0.reshape(n, -1),
+            n_valid,
+        )
+        bg = rate * gate_time[idx]
+        usable = in_band[idx] & np.isfinite(bg) & (n_valid > 0)
+        tile_bg[idx] = np.where(usable, bg, np.nan)
+        bg_safe = np.where(usable, np.maximum(bg, 1e-3), 1.0).astype(np.float32)
+        bg_tiles = jnp.broadcast_to(dev(bg_safe, 1.0)[:, None, None], (n_pad, T, T))
+
+        # Atoms of each tile: the reflection and its nearest neighbours
+        # whose gates overlap its own.
+        # Only footprints that actually overlap the reflection's own need
+        # a joint solve; one that merely reaches a corner of the tile puts
+        # its counts where this reflection's profile is zero.
+        touch = reach[idx, None] + reach[None, idx]
+        joint = (
+            near
+            & (dr <= touch)
+            & (dc <= touch)
+            & (b_lo[idx, None] < b_hi[None, idx])
+            & (b_hi[idx, None] > b_lo[None, idx])
+        )
+        d2 = np.where(joint, dr**2 + dc**2, np.inf)
+        order = np.argsort(d2, axis=1)[:, : K - 1]
+        picked = np.take_along_axis(d2, order, axis=1) < np.inf
+        n_dropped_neighbours += int((joint.sum(axis=1) > K - 1).sum())
+        local = np.concatenate([np.arange(n)[:, None], order], axis=1)
+        has_atom = np.concatenate([np.ones((n, 1), dtype=bool), picked], axis=1)
+
+        # Snap each reflection on its own gated tile, then solve with every
+        # atom (the reflection and its neighbours) at its snapped position.
+        loc_r = (rs[idx] - origin_r[idx]).astype(np.float32)
+        loc_c = (cs[idx] - origin_c[idx]).astype(np.float32)
+        sr, sc = _jit("snap")(
+            tiles, bg_tiles, tile_valid, jnp.arange(n_pad), dev(loc_r), dev(loc_c)
+        )
+        snap_r = np.array(sr, dtype=np.float64)[:n] + origin_r[idx]
+        snap_c = np.array(sc, dtype=np.float64)[:n] + origin_c[idx]
+
+        a_r = np.where(has_atom, snap_r[local] - origin_r[idx, None], -1e4)
+        a_c = np.where(has_atom, snap_c[local] - origin_c[idx, None], -1e4)
+        g = idx[local]
         flux, sigma = solve(
-            jnp.array(tiles[sl]),
+            tiles,
             bg_tiles,
-            jnp.array(tile_valid[sl]),
-            jnp.array(a_r),
-            jnp.array(a_c),
-            jnp.array(a_vu),
-            jnp.array(a_vv),
-            jnp.array(a_cuv),
-            jnp.array(ok.astype(np.float32)),
+            tile_valid,
+            dev(a_r.astype(np.float32), -1e4),
+            dev(a_c.astype(np.float32), -1e4),
+            dev(np.where(has_atom, var_us[g], 1.0).astype(np.float32), 1.0),
+            dev(np.where(has_atom, var_vs[g], 1.0).astype(np.float32), 1.0),
+            dev(np.where(has_atom, cov_uvs[g], 0.0).astype(np.float32)),
+            dev(has_atom.astype(np.float32)),
             jnp.float32(admission_z),
             trunk_jax,
         )
-        flux = np.array(flux[:, 0], dtype=np.float64)
-        sigma = np.array(sigma[:, 0], dtype=np.float64)
+        flux = np.array(flux[:n, 0], dtype=np.float64)
+        sigma = np.array(sigma[:n, 0], dtype=np.float64)
         if not allow_negative or use_l1_gate:
             sigma[flux <= 0.0] = 0.0
-        out[sl, 0] = flux
-        out[sl, 4] = sigma
+        # A reflection whose gate falls outside the band, or whose
+        # background could not be measured, was not observed.
+        out[idx, 0] = np.where(usable, flux, 0.0)
+        out[idx, 4] = np.where(usable, sigma, 0.0)
+        out[idx, 1] = snap_r
+        out[idx, 2] = snap_c
 
-    out[:, 1] = snap_r
-    out[:, 2] = snap_c
+    if show_progress and n_dropped_neighbours:
+        print(
+            f"  > {n_dropped_neighbours} tiles had more than {K - 1} overlapping "
+            "neighbours; the farthest were left out of the joint solve."
+        )
+
     out[:, 3] = np.sqrt(np.sqrt(np.maximum(var_us * var_vs - cov_uvs**2, 1e-6)))
-    # A reflection whose gate falls outside the band, or whose background
-    # could not be measured, was not observed.
-    out[~usable, 0] = 0.0
-    out[~usable, 4] = 0.0
-
-    info["tof"] = 0.5 * (g_lo + g_hi)
-    info["bg"] = np.where(usable, tile_bg, 0.0)
+    info["tof"] = 0.5 * (grid.edge_time(b_lo) + grid.edge_time(b_hi))
+    info["bg"] = np.where(np.isfinite(tile_bg), tile_bg, 0.0)
     info["tile_half"] = half
     return out, info

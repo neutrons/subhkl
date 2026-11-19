@@ -1053,13 +1053,23 @@ def integrate_peaks_rbf_ssn(
     ki_hat = np.asarray(ki_vec, dtype=float)
     ki_hat = ki_hat / np.linalg.norm(ki_hat)
 
-    for idx, img_key in enumerate(meta_keys):
-        det = peaks_obj.get_detector_by_img(img_key)
+    # Detector, rotation and sample position belong to the image, not the
+    # peak: look them up once per image.
+    per_image_geom = {}
+    for idx, img_key in enumerate(
+        tqdm(
+            meta_keys, disable=not show_progress, desc="Peak geometry", mininterval=1.0
+        )
+    ):
         seq_idx = frames[idx]  # frames stores the image sequence index
-        run_id = peaks_obj.image.get_run_id(img_key)  # Get the real run_id
-
-        current_R = get_safe_R(img_key, seq_idx, run_id)
-        s_lab = get_s_lab_for_img(img_key, run_id, current_R)
+        geom = per_image_geom.get(seq_idx)
+        if geom is None:
+            det = peaks_obj.get_detector_by_img(img_key)
+            run_id = peaks_obj.image.get_run_id(img_key)  # Get the real run_id
+            current_R = get_safe_R(img_key, seq_idx, run_id)
+            s_lab = get_s_lab_for_img(img_key, run_id, current_R)
+            geom = per_image_geom[seq_idx] = (det, current_R, s_lab)
+        det, current_R, s_lab = geom
 
         pixel_xyz = det.pixel_to_lab(all_rs[idx], all_cs[idx])
         k_f = pixel_xyz - s_lab
@@ -1120,7 +1130,12 @@ def integrate_peaks_rbf_ssn(
         images_batch, ((0, 0), (opt_P, opt_P), (opt_P, opt_P)), mode="reflect"
     )
 
-    for idx in range(len(frames)):
+    for idx in tqdm(
+        range(len(frames)),
+        disable=not show_progress,
+        desc="Shape-fit patches",
+        mininterval=1.0,
+    ):
         f, r, c = frames[idx], all_rs[idx], all_cs[idx]
 
         # Boundary safety check (matches your H, W constraints)
