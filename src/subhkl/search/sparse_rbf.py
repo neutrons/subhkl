@@ -734,6 +734,7 @@ def integrate_peaks_rbf_ssn(
     tof_gate_coverage: float = 0.95,
     tof_gate_search: float = 0.05,
     tof_sideband_factor: float = 4.0,
+    tof_band: tuple[float, float] | None = None,
 ):
     """
     Args:
@@ -750,6 +751,9 @@ def integrate_peaks_rbf_ssn(
         tof_l1: [m] moderator-to-sample distance
         tof_gate: a ``TofGate`` with relative edges, or None to measure
             the gate from the stacked time profile
+        tof_band: [Angstrom] (min, max) wavelength band the reflections
+            were predicted in; gates and sidebands are clipped to it.  None
+            falls back to the band stored with the images.
     Returns:
         res: RBFResult containing intensities and sigI
     """
@@ -1297,13 +1301,22 @@ def integrate_peaks_rbf_ssn(
         from subhkl.search.tof_gate import (
             integrate_reflections_tof_gated,
             predicted_tof,
+            wavelength_band,
         )
 
         # Flight path of each reflection: moderator to sample, sample to
         # its pixel (the same sample position the predictions used).
         wl = np.asarray(all_wl, dtype=np.float64)
         tof_pred = predicted_tof(wl, tof_l1, all_distances)
-        band = peaks_obj.wavelength
+        images_band = (peaks_obj.wavelength.min, peaks_obj.wavelength.max)
+        band_min, band_max = wavelength_band(wl, tof_band, images_band)
+        if show_progress:
+            note = (
+                ""
+                if np.allclose((band_min, band_max), images_band)
+                else f" (images file says {images_band[0]:g}-{images_band[1]:g})"
+            )
+            print(f"  > Wavelength band: {band_min:.3f}-{band_max:.3f} A{note}")
         integrated_results, tof_info = integrate_reflections_tof_gated(
             images_batch,
             lambda f: event_reader(frame_img_keys[f]),
@@ -1311,8 +1324,8 @@ def integrate_peaks_rbf_ssn(
             all_rs,
             all_cs,
             tof_pred,
-            predicted_tof(band.min, tof_l1, all_distances),
-            predicted_tof(band.max, tof_l1, all_distances),
+            predicted_tof(band_min, tof_l1, all_distances),
+            predicted_tof(band_max, tof_l1, all_distances),
             var_us=all_var_u,
             var_vs=all_var_v,
             cov_uvs=all_cov_uv,
