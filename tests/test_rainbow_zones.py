@@ -7134,3 +7134,203 @@ console.log(JSON.stringify({{ pPoly, pMono }}));
         )
     assert len(fallback_reasons) == 1
     assert "lacks monochromatic ('mono') mode" in fallback_reasons[0]
+
+
+def test_wilson_prior_default_mean_calibrated_residual_colorbar_and_single_table_button(
+    tmp_path,
+) -> None:
+    """Verify wilson_prior_b defaults to None (not overriding careless), residual colorbar covers observed range centered on dataset mean, and Wulff bar omits duplicate table button."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    work_dir = tmp_path / "work_garnet"
+    work_dir.mkdir()
+    merged_h5 = work_dir / "merged.h5"
+    with h5py.File(merged_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_dataset("images", data=np.zeros((1, 32, 32), dtype=np.float32))
+        hf.create_dataset("bank_ids", data=np.array([19], dtype=np.int32))
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.0, 3.0], dtype=np.float64)
+        )
+        ev = hf.create_group("events")
+        ev.create_dataset("tof", data=np.array([11500.0, 23000.0], dtype=np.float32))
+        ev.create_dataset("image_offsets", data=np.array([0, 2], dtype=np.int64))
+    integ_h5 = work_dir / "integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.attrs["source"] = str(merged_h5)
+        smp = hf.create_group("sample")
+        smp.create_dataset("U", data=np.eye(3))
+        smp.create_dataset("B", data=np.diag([1.0 / 11.93] * 3))
+        pk = hf.create_group("peaks")
+        pk.create_dataset("h", data=np.array([4, 8], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("lambda", data=np.array([2.98, 1.49], dtype=np.float64))
+        pk.create_dataset("intensity", data=np.array([150.0, 90.0], dtype=np.float64))
+        pk.create_dataset("sigma", data=np.array([8.0, 6.0], dtype=np.float64))
+        pk.create_dataset("bank", data=np.array([19, 19], dtype=np.int32))
+        pk.create_dataset("pixel_r", data=np.array([16.0, 16.0], dtype=np.float64))
+        pk.create_dataset("pixel_c", data=np.array([16.0, 16.0], dtype=np.float64))
+        pk.create_dataset(
+            "xyz",
+            data=np.array([[0.2, 0.0, 0.4], [0.2, 0.0, 0.4]], dtype=np.float64),
+        )
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.find_spacegroup_by_name("I a -3 d")
+    mtz.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90.0, 90.0, 90.0))
+    mtz.add_dataset("garnet")
+    for lbl, ctype in (
+        ("M/ISYM", "Y"),
+        ("BATCH", "B"),
+        ("I", "J"),
+        ("SIGI", "Q"),
+        ("WAVEL", "R"),
+        ("THETA", "R"),
+        ("PHI", "R"),
+    ):
+        mtz.add_column(lbl, ctype)
+    mtz.set_data(
+        np.array(
+            [[4.0, 0.0, 0.0, 1.0, 1001.0, 150.0, 8.0, 1.49, 0.42, 1.10]],
+            dtype=np.float32,
+        )
+    )
+    mtz.write_to_file(str(work_dir / "reflections.mtz"))
+
+    # 1. Default wilson_prior_b is None -> --wilson-prior-b omitted; explicit value -> passed
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner._local_work_dir = str(work_dir)
+    rec_default = {"cancel_requested": True}
+    runner._submit_local_subhkl_stage(
+        "merge",
+        {"images_file": str(merged_h5), "peaks_file": str(integ_h5)},
+        existing_job_record=rec_default,
+    )
+    assert "--wilson-prior-b" not in rec_default["command_line"]
+
+    rec_explicit = {"cancel_requested": True}
+    runner._submit_local_subhkl_stage(
+        "merge",
+        {
+            "images_file": str(merged_h5),
+            "peaks_file": str(integ_h5),
+            "wilson_prior_b": 15.0,
+        },
+        existing_job_record=rec_explicit,
+    )
+    assert "--wilson-prior-b=15.0" in rec_explicit["command_line"]
+
+    # 2. Only sparkline header has the table button; Wulff merge scoreboard has none
+    payload = build_rainbow_zone_payload(
+        replay_h5=integ_h5, images_h5=merged_h5, include_panel_images=False
+    )
+    ui_html = render_rainbow_html(payload)
+    assert 'id="btn-hist-open-table"' in ui_html
+    assert 'data-merge-action="open-table"' not in ui_html
+
+    # 3. Residual colorbar spans observed [min, max] with White midpoint at dataset mean
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", ui_html)
+        inline_js = script_blocks[-1]
+        fn_names = [
+            "getColorCrossover",
+            "applyCrossoverCurve",
+            "peakMtzIsigi",
+            "getPeakDataAvailability",
+            "residualToColor",
+            "buildColorscaleGradientSpec",
+        ]
+        extracted = []
+        for fn_name in fn_names:
+            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            assert m is not None, f"Missing JS function {fn_name}"
+            start = m.start()
+            depth = 0
+            in_str = None
+            esc = False
+            i = m.end() - 1
+            while i < len(inline_js):
+                ch = inline_js[i]
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif in_str:
+                    if ch == in_str:
+                        in_str = None
+                elif ch in ("'", '"', "`"):
+                    in_str = ch
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        extracted.append(inline_js[start : i + 1])
+                        break
+                i += 1
+
+        js_harness = f"""
+const DEFAULT_COLOR_CROSSOVER = 0.38;
+const ORBIT_PALETTE = ["#ff38b4", "#00e5ff"];
+const state = {{ colorCrossover: 0.38, peakSource: "integrated", lamMin: 1.0, lamMax: 3.0 }};
+const DATA = {{ mtz_overlay_name: "" }};
+let _dynPredEpoch = 0;
+let _peakDataAvailabilitySig = "";
+let _peakDataAvailability = {{
+  hasIsigi: false, hasMtzIsigi: false, hasResiduals: false, hasScales: false,
+  isigiTop: 40.0, mtzIsigiTop: 40.0, resMin: -3.0, resMax: 3.0, resMean: 0.0,
+}};
+const SAMPLE_PEAKS = [
+  {{ id: 1, careless_residual: -1.0 }},
+  {{ id: 2, careless_residual: 7.0 }},
+  {{ id: 3, careless_residual: 15.0 }},
+  {{ id: 4, careless_residual: 59.0 }},
+]; // min = -1.0, max = 59.0, mean = 20.0
+const PEAKS = [SAMPLE_PEAKS[0], SAMPLE_PEAKS[2]];
+function isigiToColor() {{ return "rgba(0,0,0,1)"; }}
+function scaleToColor() {{ return "rgba(0,0,0,1)"; }}
+function hexToRgba() {{ return "rgba(0,0,0,1)"; }}
+function wavelengthToColor() {{ return "rgba(0,0,0,1)"; }}
+{"\n".join(extracted)}
+const avail = getPeakDataAvailability();
+const spec = buildColorscaleGradientSpec("residual", 0.38);
+console.log(JSON.stringify({{
+  avail: {{ resMin: avail.resMin, resMax: avail.resMax, resMean: avail.resMean }},
+  colMin: residualToColor(-1.0, 1.0),
+  colBelowMean: residualToColor(7.0, 1.0),
+  colMean: residualToColor(20.0, 1.0),
+  colAboveMean: residualToColor(40.0, 1.0),
+  colMax: residualToColor(59.0, 1.0),
+  spec,
+}}));
+"""
+        proc = subprocess.run(
+            ["node", "-e", js_harness], check=True, capture_output=True, text=True
+        )
+        out = json.loads(proc.stdout.strip())
+        assert out["avail"] == {"resMin": -1.0, "resMax": 59.0, "resMean": 20.0}
+        assert out["colMin"] == "rgba(30, 170, 255, 1.000)"
+        assert out["colMean"] == "rgba(248, 250, 252, 1.000)"
+        assert out["colMax"] == "rgba(244, 63, 94, 1.000)"
+        # Positive residual +7.0 is below dataset mean (+20.0), so it tints toward blue (b > r)
+        r_lo, _, b_lo = [int(x) for x in re.findall(r"\d+", out["colBelowMean"])[:3]]
+        assert b_lo > r_lo
+        # Residual +40.0 is above dataset mean (+20.0), so it tints toward red (r > b)
+        r_hi, _, b_hi = [int(x) for x in re.findall(r"\d+", out["colAboveMean"])[:3]]
+        assert r_hi > b_hi
+        assert "-1.0 · μ=20.0 · 59.0" == out["spec"]["label"]
+        assert "rgba(248, 250, 252, 1.000) 50.0%" in out["spec"]["gradient"]

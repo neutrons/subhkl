@@ -5753,7 +5753,12 @@ class NovaGalaxyPipelineRunner:
                             exp.write_mtz(mtz_dest)
             careless_iters = int(params.get("iterations") or 10000)
             studentt_dof = float(params.get("studentt_dof") or 4.0)
-            wilson_b = float(params.get("wilson_prior_b") or 40.0)
+            raw_wilson_b = params.get("wilson_prior_b")
+            wilson_b = (
+                float(raw_wilson_b)
+                if raw_wilson_b is not None and str(raw_wilson_b).strip() != ""
+                else None
+            )
             spectral_file = str(params.get("spectral_file") or "").strip()
             lorentz_corr = bool(params.get("lorentz_correction", bool(spectral_file)))
             merge_mode = self._resolve_careless_merge_mode(
@@ -5874,8 +5879,9 @@ class NovaGalaxyPipelineRunner:
                 os.chmod(post_script, 0o666)
             careless_extra_flags = [
                 "--disable-image-scales",
-                f"--wilson-prior-b={wilson_b}",
             ]
+            if wilson_b is not None:
+                careless_extra_flags.append(f"--wilson-prior-b={wilson_b}")
             if spectral_file and os.path.isfile(spectral_file):
                 careless_extra_flags.extend(
                     [

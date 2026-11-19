@@ -10428,6 +10428,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     hasScales: false,
     isigiTop: 40.0,
     mtzIsigiTop: 40.0,
+    resMin: -3.0,
+    resMax: 3.0,
+    resMean: 0.0,
   }};
 
   // Pre-decode base64 grayscale bank textures and colorize them into offscreen canvases
@@ -11518,21 +11521,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return `hsla(${{hue.toFixed(1)}}, 95%, 60%, ${{alpha}})`;
   }}
 
-  // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma
-  function residualToColor(resVal, alpha = 1.0) {{
+  // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma,
+  // spanning observed [resMin, resMax] with the neutral White midpoint calibrated to dataset mean resMean.
+  function residualToColor(resVal, alpha = 1.0, bounds = null) {{
     if (typeof resVal !== "number" || !Number.isFinite(resVal)) return `rgba(148, 163, 184, 0.000)`;
-    const clamped = Math.max(-3.0, Math.min(3.0, resVal));
-    const u = applyCrossoverCurve(Math.min(1.0, Math.abs(clamped) / 3.0));
-    if (clamped < 0) {{
+    const b = bounds || getPeakDataAvailability();
+    const lo = Number.isFinite(b && b.resMin) ? b.resMin : -3.0;
+    const hi = Number.isFinite(b && b.resMax) ? b.resMax : 3.0;
+    const mid = Number.isFinite(b && b.resMean) ? Math.max(lo, Math.min(hi, b.resMean)) : 0.5 * (lo + hi);
+    const clamped = Math.max(lo, Math.min(hi, resVal));
+    if (clamped < mid) {{
+      const negSpan = mid - lo;
+      const frac = negSpan > 1e-6 ? Math.min(1.0, (mid - clamped) / negSpan) : 0.0;
+      const u = applyCrossoverCurve(frac);
       const r = Math.round(248 * (1 - u) + 30 * u);
       const g = Math.round(250 * (1 - u) + 170 * u);
-      const b = Math.round(252 * (1 - u) + 255 * u);
-      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha.toFixed(3)}})`;
+      const bl = Math.round(252 * (1 - u) + 255 * u);
+      return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{alpha.toFixed(3)}})`;
     }} else {{
+      const posSpan = hi - mid;
+      const frac = posSpan > 1e-6 ? Math.min(1.0, (clamped - mid) / posSpan) : 0.0;
+      const u = applyCrossoverCurve(frac);
       const r = Math.round(248 * (1 - u) + 244 * u);
       const g = Math.round(250 * (1 - u) + 63 * u);
-      const b = Math.round(252 * (1 - u) + 94 * u);
-      return `rgba(${{r}}, ${{g}}, ${{b}}, ${{alpha.toFixed(3)}})`;
+      const bl = Math.round(252 * (1 - u) + 94 * u);
+      return `rgba(${{r}}, ${{g}}, ${{bl}}, ${{alpha.toFixed(3)}})`;
     }}
   }}
 
@@ -11571,7 +11584,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const s0 = SAMPLE_PEAKS.length > 0 ? SAMPLE_PEAKS[0] : null;
     const sN = SAMPLE_PEAKS.length > 0 ? SAMPLE_PEAKS[SAMPLE_PEAKS.length - 1] : null;
     const dynEp = typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0;
-    const sig = `${{dynEp}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}`;
+    const r0 = p0 && typeof p0.careless_residual === "number" && Number.isFinite(p0.careless_residual) ? p0.careless_residual.toFixed(3) : "";
+    const rs0 = s0 && typeof s0.careless_residual === "number" && Number.isFinite(s0.careless_residual) ? s0.careless_residual.toFixed(3) : "";
+    const sig = `${{dynEp}}|${{PEAKS.length}}|${{SAMPLE_PEAKS.length}}|${{state.peakSource}}|${{DATA.mtz_overlay_name || ""}}|${{p0 ? p0.id : ""}}|${{pN ? pN.id : ""}}|${{s0 ? s0.id : ""}}|${{sN ? sN.id : ""}}|${{r0}}|${{rs0}}`;
     if (
       _peakDataAvailabilitySig === sig &&
       _peakDataAvailability._p0 === p0 &&
@@ -11580,9 +11595,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return _peakDataAvailability;
     }}
     let hasIsigi = false, hasMtz = false, hasRes = false, hasScl = false;
+    let resMinObs = Infinity, resMaxObs = -Infinity;
+    let peaksResSum = 0.0, peaksResCount = 0;
+    let sampleResSum = 0.0, sampleResCount = 0;
     const isigiSamples = [];
     const mtzSamples = [];
-    const scanArr = (arr) => {{
+    const scanArr = (arr, isSamplePool) => {{
       if (!Array.isArray(arr)) return;
       const step = arr.length > 2400 ? Math.ceil(arr.length / 2400) : 1;
       for (let i = 0; i < arr.length; i++) {{
@@ -11597,12 +11615,36 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           hasMtz = true;
           if (i % step === 0) mtzSamples.push(mv);
         }}
-        if (!hasRes && typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)) hasRes = true;
+        if (typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)) {{
+          const rv = p.careless_residual;
+          hasRes = true;
+          if (rv < resMinObs) resMinObs = rv;
+          if (rv > resMaxObs) resMaxObs = rv;
+          if (isSamplePool) {{
+            sampleResSum += rv;
+            sampleResCount += 1;
+          }} else {{
+            peaksResSum += rv;
+            peaksResCount += 1;
+          }}
+        }}
         if (!hasScl && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)) hasScl = true;
       }}
     }};
-    scanArr(PEAKS);
-    if (SAMPLE_PEAKS !== PEAKS) scanArr(SAMPLE_PEAKS);
+    scanArr(PEAKS, false);
+    if (SAMPLE_PEAKS !== PEAKS) scanArr(SAMPLE_PEAKS, true);
+    let resMin = -3.0, resMax = 3.0, resMean = 0.0;
+    if (hasRes && Number.isFinite(resMinObs) && Number.isFinite(resMaxObs)) {{
+      resMean = sampleResCount > 0
+        ? (sampleResSum / sampleResCount)
+        : (peaksResCount > 0 ? (peaksResSum / peaksResCount) : 0.5 * (resMinObs + resMaxObs));
+      resMin = resMinObs;
+      resMax = resMaxObs;
+      if (resMax - resMin < 1e-6) {{
+        resMin = resMean - 1.0;
+        resMax = resMean + 1.0;
+      }}
+    }}
     const computeP99 = (vals) => {{
       if (vals.length === 0) return 40.0;
       vals.sort((a, b) => a - b);
@@ -11619,6 +11661,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       hasScales: hasScl,
       isigiTop: computeP99(isigiSamples),
       mtzIsigiTop: computeP99(mtzSamples),
+      resMin,
+      resMax,
+      resMean,
     }};
     return _peakDataAvailability;
   }}
@@ -11768,12 +11813,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const crossSnr = Math.pow(1.0 + topS, c) - 1.0;
       label = `I/σ ~ ${{crossSnr >= 10 ? crossSnr.toFixed(0) : crossSnr.toFixed(1)}}`;
     }} else if (mode === "residual") {{
+      const lo = Number.isFinite(avail.resMin) ? avail.resMin : -3.0;
+      const hi = Number.isFinite(avail.resMax) ? avail.resMax : 3.0;
+      const mid = Number.isFinite(avail.resMean) ? Math.max(lo, Math.min(hi, avail.resMean)) : 0.5 * (lo + hi);
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
-        const res = -3.0 + 6.0 * u;
-        stops.push(`${{residualToColor(res, 1.0)}} ${{(u * 100).toFixed(1)}}%`);
+        const res = u <= 0.5
+          ? (lo + (u / 0.5) * (mid - lo))
+          : (mid + ((u - 0.5) / 0.5) * (hi - mid));
+        stops.push(`${{residualToColor(res, 1.0, avail)}} ${{(u * 100).toFixed(1)}}%`);
       }}
-      label = `|Δ|/σ ~ ${{(3.0 * c).toFixed(1)}}`;
+      const fmtRes = (v) => (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1));
+      label = `${{fmtRes(lo)}} · μ=${{fmtRes(mid)}} · ${{fmtRes(hi)}}`;
     }} else if (mode === "scale") {{
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
@@ -11928,16 +11979,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       <span>⟨I/σ⟩=<strong style="color:var(--accent-gold);">${{isig}}</strong></span>
       <span>Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{nAsu}} ASU / ${{nObs}} obs)</span>
       <span>Multiplicity=<strong>${{mult}}</strong> • Harmonics=<strong>${{harmPct}}</strong></span>
-      <span style="margin-left:auto;display:inline-flex;align-items:center;gap:4px;">
-        <button type="button" data-merge-action="open-table" aria-label="Merging statistics table" style="display:inline-flex;align-items:center;justify-content:center;padding:2px 5px;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open merging statistics by resolution shell"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/></svg></button>
-      </span>
     `;
-    bar.querySelectorAll("button[data-merge-action]").forEach(btn => {{
-      btn.addEventListener("click", (ev) => {{
-        ev.stopPropagation();
-        if (btn.getAttribute("data-merge-action") === "open-table") openMergeTableModal();
-      }});
-    }});
   }}
 
   function syncProjectionUI() {{
@@ -14152,7 +14194,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function _peakSnrScore(p) {{
     if (state.wulffColorMode === "residual" && typeof p.careless_residual === "number") {{
-      return Math.abs(p.careless_residual);
+      return Math.abs(p.careless_residual - (getPeakDataAvailability().resMean || 0.0));
     }}
     if (typeof p.merged_i === "number" && typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
       return Math.abs(p.merged_i) / p.merged_sigi;
