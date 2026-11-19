@@ -338,116 +338,6 @@ def _build_space_group_symmetry_lookup_json() -> str:
     return _CACHED_SG_SYMMETRY_JSON
 
 
-def _is_tmpfs_mount(path: str | os.PathLike) -> bool:
-    """Return True if ``path`` resides on a Linux ``tmpfs`` or ``ramfs`` mount."""
-    try:
-        real = os.path.realpath(path)
-    except OSError:
-        return False
-    best_mp = ""
-    best_fs = ""
-    with (
-        contextlib.suppress(OSError),
-        open("/proc/mounts", encoding="utf-8", errors="replace") as mf,
-    ):
-        for line in mf:
-            parts = line.split()
-            if len(parts) < 3:
-                continue
-            mp = parts[1].replace("\\040", " ")
-            fs_type = parts[2]
-            if (
-                real == mp or (mp == "/" or real.startswith(mp.rstrip("/") + "/"))
-            ) and len(mp) >= len(best_mp):
-                best_mp = mp
-                best_fs = fs_type
-    return best_fs in ("tmpfs", "ramfs")
-
-
-def _avail_fs_bytes(path: str | os.PathLike) -> int:
-    """Return unprivileged available bytes on the filesystem containing ``path``."""
-    try:
-        st = os.statvfs(path)
-        return int(st.f_bavail) * int(st.f_frsize)
-    except OSError:
-        return 0
-
-
-def resolve_subhkl_tmpfs_dir(min_free_bytes: int = 4 * 1024**3) -> str:
-    """Return a RAM-backed ``tmpfs`` scratch directory when system ``/tmp`` is on disk.
-
-    Honors ``$SUBHKL_TMPDIR`` if explicitly set. Otherwise keeps ``tempfile.gettempdir()``
-    when it is already backed by ``tmpfs`` with at least ``min_free_bytes`` free, or
-    selects ``/dev/shm/subhkl-tmp-<uid>`` / ``$XDG_RUNTIME_DIR/subhkl-tmp`` on ``tmpfs``
-    so multi-GB reduction, solve, integration, and container scratch files never
-    overflow a small root NVMe partition.
-    """
-    explicit = os.environ.get("SUBHKL_TMPDIR", "").strip()
-    if explicit:
-        abs_exp = os.path.abspath(explicit)
-        with contextlib.suppress(OSError):
-            os.makedirs(abs_exp, mode=0o700, exist_ok=True)
-            if os.path.isdir(abs_exp) and os.access(abs_exp, os.W_OK | os.X_OK):
-                return abs_exp
-
-    cur_tmp = os.path.abspath(tempfile.gettempdir())
-    if _is_tmpfs_mount(cur_tmp) and _avail_fs_bytes(cur_tmp) >= min_free_bytes:
-        return cur_tmp
-
-    uid = os.getuid() if hasattr(os, "getuid") else 0
-    candidates: list[tuple[str, str]] = [
-        ("/dev/shm", f"/dev/shm/subhkl-tmp-{uid}"),
-    ]
-    xdg_rt = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    if xdg_rt:
-        candidates.append((xdg_rt, os.path.join(xdg_rt, "subhkl-tmp")))
-    elif uid:
-        run_user = f"/run/user/{uid}"
-        candidates.append((run_user, os.path.join(run_user, "subhkl-tmp")))
-
-    best_sub: str | None = None
-    best_avail = -1
-    for base_dir, sub_dir in candidates:
-        if not os.path.isdir(base_dir) or not os.access(base_dir, os.W_OK | os.X_OK):
-            continue
-        if not _is_tmpfs_mount(base_dir):
-            continue
-        avail = _avail_fs_bytes(base_dir)
-        if avail >= min_free_bytes and avail > best_avail:
-            best_avail = avail
-            best_sub = os.path.abspath(sub_dir)
-
-    if best_sub is not None:
-        with contextlib.suppress(OSError):
-            os.makedirs(best_sub, mode=0o700, exist_ok=True)
-            if os.path.isdir(best_sub) and os.access(best_sub, os.W_OK | os.X_OK):
-                return best_sub
-
-    return cur_tmp
-
-
-def get_subhkl_tmp_search_dirs() -> list[str]:
-    """Return ordered scratch directories to search (preferring ``tmpfs``, then legacy ``/tmp``)."""
-    out: list[str] = []
-    for cand in (
-        resolve_subhkl_tmpfs_dir(),
-        os.path.abspath(tempfile.gettempdir()),
-        "/tmp",
-    ):
-        abs_c = os.path.abspath(cand)
-        if abs_c not in out and os.path.isdir(abs_c):
-            out.append(abs_c)
-    return out
-
-
-def configure_subhkl_tmpfs_env() -> str:
-    """Point ``$TMPDIR`` and ``tempfile.tempdir`` to ``tmpfs`` for the running server process."""
-    tmp_dir = resolve_subhkl_tmpfs_dir()
-    os.environ["TMPDIR"] = tmp_dir
-    tempfile.tempdir = tmp_dir
-    return tmp_dir
-
-
 def _decode_str(val: Any, default: str = "") -> str:
     if val is None:
         return default
@@ -565,37 +455,38 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                         safe_tag = "".join(
                             c if (c.isalnum() or c in "._-") else "_" for c in tag
                         )
-                        for search_root in get_subhkl_tmp_search_dirs():
-                            for m_fn in (f"{safe_tag}_merged.h5", "merged.h5"):
-                                work_cand = (
-                                    Path(search_root) / f"subhkl_work_{safe_tag}" / m_fn
+                        for m_fn in (f"{safe_tag}_merged.h5", "merged.h5"):
+                            work_cand = (
+                                Path(tempfile.gettempdir())
+                                / f"subhkl_work_{safe_tag}"
+                                / m_fn
+                            )
+                            if work_cand.is_file():
+                                with (
+                                    contextlib.suppress(
+                                        OSError, RuntimeError, KeyError
+                                    ),
+                                    h5py.File(work_cand, "r") as wf,
+                                ):
+                                    if "images" in wf:
+                                        return str(work_cand.resolve())
+                        for gx_cand in sorted(
+                            glob.glob(
+                                os.path.join(
+                                    tempfile.gettempdir(),
+                                    f"subhkl_gx_*_{safe_tag}_merged.h5",
                                 )
-                                if work_cand.is_file():
-                                    with (
-                                        contextlib.suppress(
-                                            OSError, RuntimeError, KeyError
-                                        ),
-                                        h5py.File(work_cand, "r") as wf,
-                                    ):
-                                        if "images" in wf:
-                                            return str(work_cand.resolve())
-                            for gx_cand in sorted(
-                                glob.glob(
-                                    os.path.join(
-                                        search_root,
-                                        f"subhkl_gx_*_{safe_tag}_merged.h5",
-                                    )
-                                )
-                            ):
-                                if os.path.isfile(gx_cand):
-                                    with (
-                                        contextlib.suppress(
-                                            OSError, RuntimeError, KeyError
-                                        ),
-                                        h5py.File(gx_cand, "r") as gf,
-                                    ):
-                                        if "images" in gf:
-                                            return str(Path(gx_cand).resolve())
+                            )
+                        ):
+                            if os.path.isfile(gx_cand):
+                                with (
+                                    contextlib.suppress(
+                                        OSError, RuntimeError, KeyError
+                                    ),
+                                    h5py.File(gx_cand, "r") as gf,
+                                ):
+                                    if "images" in gf:
+                                        return str(Path(gx_cand).resolve())
         src_attr = _decode_str(f.attrs.get("source"), "")
         if not src_attr and "scan_refinement" in f:
             src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
@@ -619,8 +510,7 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                             return str(cand_src.resolve())
 
     parent = p.parent
-    tmp_roots_resolved = {Path(d).resolve() for d in get_subhkl_tmp_search_dirs()}
-    if parent.resolve() in tmp_roots_resolved:
+    if parent.resolve() == Path(tempfile.gettempdir()).resolve():
         return None
     candidates = sorted(glob.glob(str(parent / "*.im.h5"))) + sorted(
         glob.glob(str(parent / "*merged*.h5"))
@@ -646,8 +536,8 @@ def _discover_predictor_h5(replay_h5: str | os.PathLike | None) -> str | None:
     ref_U: np.ndarray | None = None
     ref_B: np.ndarray | None = None
     candidate_paths: list[Path] = []
-    tmp_search_paths = [Path(d).resolve() for d in get_subhkl_tmp_search_dirs()]
-    if p.parent.resolve() not in set(tmp_search_paths):
+    tmp_dir = Path(tempfile.gettempdir()).resolve()
+    if p.parent.resolve() != tmp_dir:
         for sib_name in ("predictor.h5", "peak_predictor.h5"):
             candidate_paths.append(p.parent / sib_name)
 
@@ -674,20 +564,18 @@ def _discover_predictor_h5(replay_h5: str | os.PathLike | None) -> str | None:
                         safe_tag = "".join(
                             c if (c.isalnum() or c in "._-") else "_" for c in tag
                         )
-                        for t_dir in tmp_search_paths:
-                            for p_fn in ("predictor.h5", "peak_predictor.h5"):
-                                candidate_paths.append(
-                                    t_dir / f"subhkl_work_{safe_tag}" / p_fn
-                                )
+                        for p_fn in ("predictor.h5", "peak_predictor.h5"):
+                            candidate_paths.append(
+                                tmp_dir / f"subhkl_work_{safe_tag}" / p_fn
+                            )
 
-    for t_dir in tmp_search_paths:
-        gx_preds = sorted(
-            glob.glob(os.path.join(str(t_dir), "subhkl_gx_*predict*.h5")),
-            key=lambda fp: os.path.getmtime(fp) if os.path.isfile(fp) else 0.0,
-            reverse=True,
-        )
-        for gx_fp in gx_preds:
-            candidate_paths.append(Path(gx_fp))
+    gx_preds = sorted(
+        glob.glob(os.path.join(str(tmp_dir), "subhkl_gx_*predict*.h5")),
+        key=lambda fp: os.path.getmtime(fp) if os.path.isfile(fp) else 0.0,
+        reverse=True,
+    )
+    for gx_fp in gx_preds:
+        candidate_paths.append(Path(gx_fp))
 
     seen_cands: set[Path] = set()
     for cand_p in candidate_paths:
