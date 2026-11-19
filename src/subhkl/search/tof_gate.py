@@ -651,6 +651,7 @@ def integrate_reflections_tof_gated(
         usable = in_band[idx] & np.isfinite(bg) & (n_valid > 0)
         tile_bg[idx] = np.where(usable, bg, np.nan)
         bg_safe = np.where(usable, np.maximum(bg, 1e-3), 1.0).astype(np.float32)
+        # Sized by the padded count, so this compiles once per padding step.
         bg_tiles = jnp.broadcast_to(dev(bg_safe, 1.0)[:, None, None], (n_pad, T, T))
 
         # Atoms of each tile: the reflection and its nearest neighbours
@@ -678,7 +679,7 @@ def integrate_reflections_tof_gated(
         loc_r = (rs[idx] - origin_r[idx]).astype(np.float32)
         loc_c = (cs[idx] - origin_c[idx]).astype(np.float32)
         sr, sc = _jit("snap")(
-            tiles, bg_tiles, tile_valid, jnp.arange(n_pad), dev(loc_r), dev(loc_c)
+            tiles, bg_tiles, tile_valid, np.arange(n_pad), dev(loc_r), dev(loc_c)
         )
         snap_r = np.array(sr, dtype=np.float64)[:n] + origin_r[idx]
         snap_c = np.array(sc, dtype=np.float64)[:n] + origin_c[idx]
@@ -699,8 +700,8 @@ def integrate_reflections_tof_gated(
             jnp.float32(admission_z),
             trunk_jax,
         )
-        flux = np.array(flux[:n, 0], dtype=np.float64)
-        sigma = np.array(sigma[:n, 0], dtype=np.float64)
+        flux = np.asarray(flux, dtype=np.float64)[:n, 0]
+        sigma = np.asarray(sigma, dtype=np.float64)[:n, 0].copy()
         if not allow_negative or use_l1_gate:
             sigma[flux <= 0.0] = 0.0
         # A reflection whose gate falls outside the band, or whose
