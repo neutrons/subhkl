@@ -6071,3 +6071,302 @@ def test_textures_only_fast_path_and_vectorized_flat_raycast(tmp_path):
     doc_st_old = json.loads(resp_st_old.body.decode("utf-8"))
     assert "unchanged" not in doc_st_old["active_job"]["partial_overlay"]
     assert len(doc_st_old["active_job"]["partial_overlay"]["predicted_peaks"]) == 1
+
+
+def test_sparkline_resolution_bin_hover_reveals_edges_and_statistic(tmp_path):
+    """Hovering resolution bins on #canvas-hist highlights the bin and reveals d-edges and active statistic."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    payload = build_rainbow_zone_payload(instrument="MANDI", include_panel_images=False)
+    bins = [
+        {
+            "bin": 0,
+            "d_max": 11.99,
+            "d_min": 4.90,
+            "n_refl": 180,
+            "n_theo": 195,
+            "completeness_pct": 92.3,
+            "mean_isigi": 14.25,
+            "cc_half": 0.9565,
+        },
+        {
+            "bin": 1,
+            "d_max": 4.90,
+            "d_min": 4.01,
+            "n_refl": 172,
+            "n_theo": 190,
+            "completeness_pct": 90.5,
+            "mean_isigi": 11.40,
+            "cc_half": 0.9411,
+        },
+        {
+            "bin": 2,
+            "d_max": 4.01,
+            "d_min": 3.52,
+            "n_refl": 165,
+            "n_theo": 192,
+            "completeness_pct": 85.9,
+            "mean_isigi": 8.10,
+            "cc_half": 0.8677,
+        },
+        {
+            "bin": 3,
+            "d_max": 3.52,
+            "d_min": 3.18,
+            "n_refl": 150,
+            "n_theo": 190,
+            "completeness_pct": 78.9,
+            "mean_isigi": 5.65,
+            "cc_half": 0.7030,
+        },
+        {
+            "bin": 4,
+            "d_max": 3.18,
+            "d_min": 2.94,
+            "n_refl": 141,
+            "n_theo": 191,
+            "completeness_pct": 73.8,
+            "mean_isigi": 4.12,
+            "cc_half": 0.5163,
+        },
+        {
+            "bin": 5,
+            "d_max": 2.94,
+            "d_min": 2.75,
+            "n_refl": 128,
+            "n_theo": 188,
+            "completeness_pct": 68.1,
+            "mean_isigi": 2.84,
+            "cc_half": 0.3023,
+        },
+        {
+            "bin": 6,
+            "d_max": 2.75,
+            "d_min": 2.61,
+            "n_refl": 112,
+            "n_theo": 186,
+            "completeness_pct": 60.2,
+            "mean_isigi": 1.95,
+            "cc_half": 0.1831,
+        },
+        {
+            "bin": 7,
+            "d_max": 2.61,
+            "d_min": 2.49,
+            "n_refl": 98,
+            "n_theo": 185,
+            "completeness_pct": 53.0,
+            "mean_isigi": 1.52,
+            "cc_half": 0.1721,
+        },
+        {
+            "bin": 8,
+            "d_max": 2.49,
+            "d_min": 2.39,
+            "n_refl": 84,
+            "n_theo": 184,
+            "completeness_pct": 45.7,
+            "mean_isigi": 1.18,
+            "cc_half": 0.1256,
+        },
+        {
+            "bin": 9,
+            "d_max": 2.39,
+            "d_min": 2.30,
+            "n_refl": 62,
+            "n_theo": 182,
+            "completeness_pct": 34.1,
+            "mean_isigi": 0.85,
+            "cc_half": -0.0421,
+        },
+    ]
+    payload["artifact_kind"] = "merged_careless"
+    payload["merge_metrics"] = {
+        "cc_half_overall": 0.812,
+        "completeness_pct": 68.3,
+        "mean_i_over_sigi": 5.19,
+        "n_merged_asu": 1292,
+        "cc_half_bins": bins,
+        "resolution_bins": bins,
+    }
+    html = render_rainbow_html(payload)
+    assert 'id="hist-bin-tooltip"' in html
+    assert 'id="canvas-hist"' in html
+
+    if not shutil.which("node"):
+        return
+
+    script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html)
+    inline_js = script_blocks[-1]
+    js_check = tmp_path / "sparkline_inline.js"
+    js_check.write_text(inline_js, encoding="utf-8")
+    subprocess.run(["node", "--check", str(js_check)], check=True)
+
+    fn_names = [
+        "getMergeResolutionBins",
+        "formatHistBinSummary",
+        "hideHistBinTooltip",
+        "updateHistBinTooltip",
+        "resolveHistBinAtClientX",
+        "drawHistogram",
+    ]
+    extracted = []
+    for fn_name in fn_names:
+        m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+        assert m is not None, f"Missing JS function {fn_name}"
+        start = m.start()
+        depth = 0
+        in_body = False
+        end = start
+        for idx in range(start, len(inline_js)):
+            ch = inline_js[idx]
+            if ch == "{":
+                depth += 1
+                in_body = True
+            elif ch == "}":
+                depth -= 1
+                if in_body and depth == 0:
+                    end = idx + 1
+                    break
+        extracted.append(inline_js[start:end])
+
+    # Extract histCanvas listener block as well
+    m_blk = re.search(r"if\s*\(\s*histCanvas\s*\)\s*\{", inline_js)
+    assert m_blk is not None
+    b_start = m_blk.start()
+    depth = 0
+    in_body = False
+    b_end = b_start
+    for idx in range(b_start, len(inline_js)):
+        ch = inline_js[idx]
+        if ch == "{":
+            depth += 1
+            in_body = True
+        elif ch == "}":
+            depth -= 1
+            if in_body and depth == 0:
+                b_end = idx + 1
+                break
+    listener_block = inline_js[b_start:b_end]
+
+    harness = f"""
+const DATA = {{ merge_metrics: {json.dumps(payload["merge_metrics"])} }};
+const PEAKS = [];
+const isPeakVisible = () => true;
+const state = {{ histMetric: "cc_half", hoveredHistBin: null }};
+globalThis.window = {{ devicePixelRatio: 1, innerWidth: 1280 }};
+
+const drawnTexts = [];
+const strokeRects = [];
+const listeners = {{}};
+const histCanvas = {{
+  width: 0,
+  height: 0,
+  style: {{}},
+  parentElement: {{ clientWidth: 256 }},
+  getBoundingClientRect: () => ({{ left: 960, top: 620, width: 256, height: 50 }}),
+  addEventListener(type, fn) {{ listeners[type] = fn; }},
+  getContext: () => ({{
+    fillStyle: "",
+    strokeStyle: "",
+    lineWidth: 1,
+    font: "",
+    globalAlpha: 1,
+    scale() {{}},
+    clearRect() {{ drawnTexts.length = 0; strokeRects.length = 0; }},
+    fillRect() {{}},
+    strokeRect(...a) {{ strokeRects.push(a); }},
+    fillText(txt) {{ drawnTexts.push(txt); }},
+  }}),
+}};
+const histBinTooltip = {{
+  innerHTML: "",
+  offsetWidth: 210,
+  offsetHeight: 34,
+  style: {{ display: "none", left: "", top: "", borderColor: "" }},
+}};
+
+{chr(10).join(extracted)}
+{listener_block}
+
+drawHistogram([]);
+const idleTexts = [...drawnTexts];
+const idleDisplay = histBinTooltip.style.display;
+
+// Hover over Bin 6/10 (index 5: 2.94 - 2.75 A, CC1/2 = 0.302)
+// barW = (256 - 16) / 10 = 24px -> bin 5 center at 960 + 8 + 5.5 * 24 = 1100
+listeners.mousemove({{ clientX: 1100 }});
+const bin5CcHtml = histBinTooltip.innerHTML;
+const bin5CcDisplay = histBinTooltip.style.display;
+const bin5CcCanvasTexts = [...drawnTexts];
+const bin5Strokes = strokeRects.length;
+
+// Click while hovering Bin 6/10 -> cycles to Completeness, then <I/sigma>
+listeners.click();
+const bin5CompHtml = histBinTooltip.innerHTML;
+const bin5CompCanvasTexts = [...drawnTexts];
+
+listeners.click();
+const bin5IsigHtml = histBinTooltip.innerHTML;
+
+// Click once more -> back to CC1/2, then hover Bin 10/10 (index 9: negative CC1/2 = -0.042)
+listeners.click();
+listeners.mousemove({{ clientX: 960 + 8 + 9.5 * 24 }});
+const bin9CcHtml = histBinTooltip.innerHTML;
+
+// Mouseleave restores summary and hides tooltip
+listeners.mouseleave();
+const afterLeaveDisplay = histBinTooltip.style.display;
+const afterLeaveTexts = [...drawnTexts];
+
+console.log(JSON.stringify({{
+  idleTexts,
+  idleDisplay,
+  bin5CcHtml,
+  bin5CcDisplay,
+  bin5CcCanvasTexts,
+  bin5Strokes,
+  bin5CompHtml,
+  bin5CompCanvasTexts,
+  bin5IsigHtml,
+  bin9CcHtml,
+  afterLeaveDisplay,
+  afterLeaveTexts,
+}}));
+"""
+    hf_js = tmp_path / "sparkline_hover_harness.js"
+    hf_js.write_text(harness, encoding="utf-8")
+    res = subprocess.run(
+        ["node", str(hf_js)], check=True, capture_output=True, text=True
+    )
+    out = json.loads(res.stdout.strip())
+
+    assert out["idleDisplay"] == "none"
+    assert any("CC½ vs d (0.812)" in t for t in out["idleTexts"])
+
+    assert out["bin5CcDisplay"] == "block"
+    assert out["bin5Strokes"] == 1
+    assert "Bin 6/10:" in out["bin5CcHtml"]
+    assert "2.94–2.75 Å" in out["bin5CcHtml"]
+    assert "CC½ = 0.302" in out["bin5CcHtml"]
+    assert "128/188 refl" in out["bin5CcHtml"]
+    assert any("2.94–2.75 Å • CC½=0.302" in t for t in out["bin5CcCanvasTexts"])
+
+    assert "Compl. = 68.1%" in out["bin5CompHtml"]
+    assert any("2.94–2.75 Å • Compl.=68.1%" in t for t in out["bin5CompCanvasTexts"])
+    assert "⟨I/σ⟩ = 2.84" in out["bin5IsigHtml"]
+
+    assert "Bin 10/10:" in out["bin9CcHtml"]
+    assert "2.39–2.30 Å" in out["bin9CcHtml"]
+    assert "CC½ = -0.042" in out["bin9CcHtml"]
+
+    assert out["afterLeaveDisplay"] == "none"
+    assert any("CC½ vs d (0.812)" in t for t in out["afterLeaveTexts"])
