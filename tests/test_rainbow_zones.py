@@ -5574,6 +5574,33 @@ const mandiPred380 = PEAKS.map(p => ({{
   col: p.col,
 }}));
 
+// 5. Verify P 6_1 22 (a=b=79.91, c=238.0) hexagonal symmetry + relaxed ~15% d_min floor (~1.41 A vs old 1.67 A)
+const inpSgNode = getEl("inp-sg");
+const inpANode = getEl("inp-a");
+const inpCNode = getEl("inp-c");
+inpSgNode.value = "P 6_1 22";
+inpSgNode.dispatchEvent({{ type: "change", target: inpSgNode }});
+inpANode.value = "79.91";
+inpANode.dispatchEvent({{ type: "input", target: inpANode }});
+inpCNode.value = "238.0";
+inpCNode.dispatchEvent({{ type: "change", target: inpCNode }});
+const p6122Floor = getDynamicDminFloor();
+const p6122Gamma = parseFloat(getEl("inp-gamma").value);
+inpDminNode.value = "1.45";
+inpDminNode.dispatchEvent({{ type: "change", target: inpDminNode }});
+const p6122Allowed145 = state.dMin;
+
+// 6. Verify #inp-binning in Params drawer defaults to auto (null) and forwards 16, 8, 4
+const inpBinNode = getEl("inp-binning");
+inpBinNode.value = "";
+const paramsAutoBin = collectWorkflowParams().binning;
+inpBinNode.value = "16";
+const paramsBin16 = collectWorkflowParams().binning;
+inpBinNode.value = "8";
+const paramsBin8 = collectWorkflowParams().binning;
+inpBinNode.value = "4";
+const paramsBin4 = collectWorkflowParams().binning;
+
 require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
   protFloor,
   sliderMinAttr,
@@ -5614,6 +5641,13 @@ require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
   minWlObserved,
   hugeCellFloor,
   mandiPred380,
+  p6122Floor,
+  p6122Gamma,
+  p6122Allowed145,
+  paramsAutoBin,
+  paramsBin16,
+  paramsBin8,
+  paramsBin4,
 }}));
 }})();
 process.exit(0);
@@ -5624,12 +5658,19 @@ process.exit(0);
     subprocess.run(["node", str(js_file)], capture_output=True, text=True, check=True)
     out = json.loads(out_json_path.read_text(encoding="utf-8"))
 
-    # A. Verify finite unit-cell-volume-aware d_min safety floor scaling
-    assert 0.90 <= out["protFloor"] <= 1.20
+    # A. Verify finite unit-cell-volume-aware d_min safety floor scaling (relaxed ~15%)
+    assert 0.75 <= out["protFloor"] <= 1.05
     assert abs(out["sliderMinAttr"] - out["protFloor"]) < 1e-6
     assert abs(out["clampedBelowFloor"] - out["protFloor"]) < 1e-6
     assert out["hugeCellFloor"] > out["protFloor"] + 1.0
-    assert 2.20 <= out["hugeCellFloor"] <= 2.80
+    assert 1.95 <= out["hugeCellFloor"] <= 2.40
+    assert out["p6122Gamma"] == 120.0
+    assert 1.40 <= out["p6122Floor"] <= 1.43
+    assert abs(out["p6122Allowed145"] - 1.45) < 1e-6
+    assert out["paramsAutoBin"] is None
+    assert out["paramsBin16"] == 16
+    assert out["paramsBin8"] == 8
+    assert out["paramsBin4"] == 4
 
     # B. Verify auto-switch from 'integrated' -> 'predicted' when dragging d_min below integrated cutoff
     assert out["initialPeakSource"] == "integrated"
@@ -6265,6 +6306,7 @@ const state = {{ histMetric: "cc_half", hoveredHistBin: null }};
 globalThis.window = {{ devicePixelRatio: 1, innerWidth: 1280 }};
 
 const drawnTexts = [];
+const fillRects = [];
 const strokeRects = [];
 const listeners = {{}};
 const histCanvas = {{
@@ -6274,18 +6316,21 @@ const histCanvas = {{
   parentElement: {{ clientWidth: 256 }},
   getBoundingClientRect: () => ({{ left: 960, top: 620, width: 256, height: 50 }}),
   addEventListener(type, fn) {{ listeners[type] = fn; }},
-  getContext: () => ({{
-    fillStyle: "",
-    strokeStyle: "",
-    lineWidth: 1,
-    font: "",
-    globalAlpha: 1,
-    scale() {{}},
-    clearRect() {{ drawnTexts.length = 0; strokeRects.length = 0; }},
-    fillRect() {{}},
-    strokeRect(...a) {{ strokeRects.push(a); }},
-    fillText(txt) {{ drawnTexts.push(txt); }},
-  }}),
+  getContext: () => {{
+    const ctx = {{
+      fillStyle: "",
+      strokeStyle: "",
+      lineWidth: 1,
+      font: "",
+      globalAlpha: 1,
+      scale() {{}},
+      clearRect() {{ drawnTexts.length = 0; fillRects.length = 0; strokeRects.length = 0; }},
+      fillRect(...a) {{ fillRects.push({{ fillStyle: ctx.fillStyle, args: a }}); }},
+      strokeRect(...a) {{ strokeRects.push(a); }},
+      fillText(txt) {{ drawnTexts.push(txt); }},
+    }};
+    return ctx;
+  }},
 }};
 const histBinTooltip = {{
   innerHTML: "",
@@ -6299,12 +6344,21 @@ const histBinTooltip = {{
 
 drawHistogram([]);
 const idleTexts = [...drawnTexts];
+const idleBarColors = fillRects.map(r => r.fillStyle);
 const idleDisplay = histBinTooltip.style.display;
+const boundaryColors = {{
+  c080: formatHistBinSummary({{ cc_half: 0.80 }}, 0, 10, "cc_half").statColor,
+  c050: formatHistBinSummary({{ cc_half: 0.50 }}, 0, 10, "cc_half").statColor,
+  c030: formatHistBinSummary({{ cc_half: 0.30 }}, 0, 10, "cc_half").statColor,
+  c0299: formatHistBinSummary({{ cc_half: 0.299 }}, 0, 10, "cc_half").statColor,
+  cNeg: formatHistBinSummary({{ cc_half: -0.05 }}, 0, 10, "cc_half").statColor,
+}};
 
 // Hover over Bin 6/10 (index 5: 2.94 - 2.75 A, CC1/2 = 0.302)
 // barW = (256 - 16) / 10 = 24px -> bin 5 center at 960 + 8 + 5.5 * 24 = 1100
 listeners.mousemove({{ clientX: 1100 }});
 const bin5CcHtml = histBinTooltip.innerHTML;
+const bin5CcBorder = histBinTooltip.style.borderColor;
 const bin5CcDisplay = histBinTooltip.style.display;
 const bin5CcCanvasTexts = [...drawnTexts];
 const bin5Strokes = strokeRects.length;
@@ -6321,6 +6375,7 @@ const bin5IsigHtml = histBinTooltip.innerHTML;
 listeners.click();
 listeners.mousemove({{ clientX: 960 + 8 + 9.5 * 24 }});
 const bin9CcHtml = histBinTooltip.innerHTML;
+const bin9CcBorder = histBinTooltip.style.borderColor;
 
 // Mouseleave restores summary and hides tooltip
 listeners.mouseleave();
@@ -6329,8 +6384,11 @@ const afterLeaveTexts = [...drawnTexts];
 
 console.log(JSON.stringify({{
   idleTexts,
+  idleBarColors,
+  boundaryColors,
   idleDisplay,
   bin5CcHtml,
+  bin5CcBorder,
   bin5CcDisplay,
   bin5CcCanvasTexts,
   bin5Strokes,
@@ -6338,6 +6396,7 @@ console.log(JSON.stringify({{
   bin5CompCanvasTexts,
   bin5IsigHtml,
   bin9CcHtml,
+  bin9CcBorder,
   afterLeaveDisplay,
   afterLeaveTexts,
 }}));
@@ -6351,8 +6410,29 @@ console.log(JSON.stringify({{
 
     assert out["idleDisplay"] == "none"
     assert any("CC½ vs d (0.812)" in t for t in out["idleTexts"])
+    # Yellow range extends down to 0.30; everything below 0.30 is red (#f43f5e)
+    assert out["idleBarColors"] == [
+        "#34d399",  # 0.9565 >= 0.80
+        "#34d399",  # 0.9411 >= 0.80
+        "#34d399",  # 0.8677 >= 0.80
+        "#fbbf24",  # 0.7030 >= 0.30
+        "#fbbf24",  # 0.5163 >= 0.30
+        "#fbbf24",  # 0.3023 >= 0.30
+        "#f43f5e",  # 0.1831 < 0.30
+        "#f43f5e",  # 0.1721 < 0.30
+        "#f43f5e",  # 0.1256 < 0.30
+        "#f43f5e",  # -0.0421 < 0.30
+    ]
+    assert out["boundaryColors"] == {
+        "c080": "#34d399",
+        "c050": "#fbbf24",
+        "c030": "#fbbf24",
+        "c0299": "#f43f5e",
+        "cNeg": "#f43f5e",
+    }
 
     assert out["bin5CcDisplay"] == "block"
+    assert out["bin5CcBorder"] == "#fbbf24"
     assert out["bin5Strokes"] == 1
     assert "Bin 6/10:" in out["bin5CcHtml"]
     assert "2.94–2.75 Å" in out["bin5CcHtml"]
@@ -6367,6 +6447,500 @@ console.log(JSON.stringify({{
     assert "Bin 10/10:" in out["bin9CcHtml"]
     assert "2.39–2.30 Å" in out["bin9CcHtml"]
     assert "CC½ = -0.042" in out["bin9CcHtml"]
+    assert out["bin9CcBorder"] == "#f43f5e"
 
     assert out["afterLeaveDisplay"] == "none"
     assert any("CC½ vs d (0.812)" in t for t in out["afterLeaveTexts"])
+
+
+def test_merge_resolution_table_csv_html_popup_and_lazy_download(tmp_path):
+    """Publication-ready CC1/2 / Completeness / <I/sigma> resolution table CSV + HTML artifacts, popup, and lazy downloads."""
+    import csv
+    import io
+    import json
+    import math
+    import re
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        build_merge_resolution_table_data,
+        build_rainbow_zone_payload,
+        render_merge_table_csv,
+        render_merge_table_html,
+        render_rainbow_html,
+    )
+
+    metrics = {
+        "space_group": "I 1 2 1",
+        "cell": [55.16, 81.19, 88.70, 90.0, 96.3, 90.0],
+        "wavelength_range": [2.0, 4.0],
+        "d_max": 11.99,
+        "d_min": 2.30,
+        "n_observations": 3840,
+        "n_merged_asu": 1280,
+        "n_theoretical_asu": 1873,
+        "mean_multiplicity": 3.0,
+        "completeness_pct": 68.34,
+        "mean_isigi": 5.19,
+        "cc_half": 0.8124,
+        "resolution_bins": [
+            {
+                "bin": 0,
+                "d_max": 11.99,
+                "d_min": 4.90,
+                "n_obs": 720,
+                "n_refl": 180,
+                "n_theo": 195,
+                "completeness_pct": 92.3,
+                "mean_isigi": 14.25,
+                "cc_half": 0.9565,
+            },
+            {
+                "bin": 1,
+                "d_max": 4.90,
+                "d_min": 2.75,
+                "n_obs": 384,
+                "n_refl": 128,
+                "n_theo": 188,
+                "completeness_pct": 68.1,
+                "mean_isigi": 2.84,
+                "cc_half": 0.3023,
+            },
+            {
+                "bin": 2,
+                "d_max": 2.75,
+                "d_min": 2.30,
+                "n_obs": 124,
+                "n_refl": 62,
+                "n_theo": 182,
+                "completeness_pct": 34.1,
+                "mean_isigi": 0.85,
+                "cc_half": 0.1003,
+            },
+        ],
+    }
+
+    tdata = build_merge_resolution_table_data(metrics)
+    assert tdata["d_cc30"] == 2.75
+    assert [r["cc_tier"] for r in tdata["rows"]] == ["green", "yellow", "red"]
+    assert [r["rank_badge"] for r in tdata["rows"]] == ["1ST", "2ND", "3RD"]
+    assert abs(tdata["rows"][0]["multiplicity"] - 4.0) < 1e-6
+    expected_cc_star_0 = math.sqrt(2.0 * 0.9565 / (1.0 + 0.9565))
+    assert abs(tdata["rows"][0]["cc_star"] - expected_cc_star_0) < 1e-6
+
+    csv_text = render_merge_table_csv(metrics)
+    parsed_csv = list(csv.DictReader(io.StringIO(csv_text)))
+    assert len(parsed_csv) == 4  # 3 shells + Overall
+    assert parsed_csv[0]["shell"] == "1"
+    assert parsed_csv[0]["resolution_range_A"] == "11.99 - 4.90"
+    assert parsed_csv[0]["n_obs"] == "720"
+    assert parsed_csv[0]["multiplicity"] == "4.00"
+    assert parsed_csv[1]["cc_half"] == "0.3023"
+    assert parsed_csv[-1]["shell"] == "Overall"
+    assert parsed_csv[-1]["n_obs"] == "3840"
+    assert parsed_csv[-1]["cc_half"] == "0.8124"
+
+    html_art = render_merge_table_html(metrics)
+    assert "BUBBLE" not in html_art.upper()
+    assert "1UP" not in html_art.upper()
+    assert "Word / Excel" not in html_art
+    assert ">Copy</button>" in html_art
+    assert "Download .csv" not in html_art
+    assert "Georgia" in html_art
+    assert "#0a1020" in html_art and "#bae6fd" in html_art
+    assert "I 1 2 1" in html_art
+    assert "0.302" in html_art
+    assert "background:#ffffff;color:#000000" in html_art
+
+    # Verify Rainbow Zones main UI embeds subtle table pictogram button, monochrome blue-on-dark modal, Copy button, and no duplicate download buttons
+    payload = build_rainbow_zone_payload(instrument="MANDI", include_panel_images=False)
+    payload["artifact_kind"] = "merged_careless"
+    payload["space_group"] = "I 1 2 1"
+    payload["cell"] = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    payload["wavelength_range"] = [2.0, 4.0]
+    payload["merge_metrics"] = metrics
+    ui_html = render_rainbow_html(payload)
+    assert 'id="modal-merge-table"' in ui_html
+    assert 'id="btn-hist-open-table"' in ui_html
+    assert 'aria-label="Merging statistics table"' in ui_html
+    assert '<path d="M3 9h18"/><path d="M3 15h18"/><path d="M9 3v18"/>' in ui_html
+    assert "☆ Table" not in ui_html
+    assert "🏆" not in ui_html
+    assert "📋" not in ui_html
+    assert "BUBBLE" not in ui_html.upper()
+    assert "Word / Excel" not in ui_html
+    assert 'id="btn-hist-dl-csv"' not in ui_html
+    assert 'id="btn-hist-dl-html"' not in ui_html
+    assert 'id="btn-merge-tbl-csv"' not in ui_html
+    assert 'id="btn-merge-tbl-html"' not in ui_html
+    assert 'id="btn-merge-tbl-style"' not in ui_html
+    assert 'id="btn-merge-tbl-copy"' in ui_html
+    assert ">Copy</button>" in ui_html
+
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", ui_html)
+        inline_js = script_blocks[-1]
+        fn_names = [
+            "getMergeResolutionBins",
+            "escapeHtmlText",
+            "ordinalShellRank",
+            "computeCcStarClient",
+            "ccHalfTierClient",
+            "buildClientMergeTableData",
+            "buildMergeTableClipboardPayloads",
+            "renderMergeTableModalContent",
+        ]
+        extracted = []
+        for fn_name in fn_names:
+            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            assert m is not None, f"Missing JS function {fn_name}"
+            start = m.start()
+            depth = 0
+            in_body = False
+            end = start
+            for idx in range(start, len(inline_js)):
+                ch = inline_js[idx]
+                if ch == "{":
+                    depth += 1
+                    in_body = True
+                elif ch == "}":
+                    depth -= 1
+                    if in_body and depth == 0:
+                        end = idx + 1
+                        break
+            extracted.append(inline_js[start:end])
+
+        modal_harness = f"""
+const DATA = {json.dumps({"space_group": payload["space_group"], "cell": payload["cell"], "wavelength_range": payload["wavelength_range"], "merge_metrics": metrics})};
+const els = {{}};
+["merge-tbl-card", "merge-tbl-modal-title", "merge-tbl-meta", "merge-tbl-body-wrap"].forEach(id => {{
+  els[id] = {{ style: {{}}, innerHTML: "", textContent: "" }};
+}});
+globalThis.document = {{ getElementById: (id) => els[id] || null }};
+
+{chr(10).join(extracted)}
+
+const clientData = buildClientMergeTableData();
+const clip = buildMergeTableClipboardPayloads(clientData);
+renderMergeTableModalContent();
+const modalHtml = els["merge-tbl-body-wrap"].innerHTML;
+const modalBg = els["merge-tbl-card"].style.background;
+const modalFg = els["merge-tbl-card"].style.color;
+
+console.log(JSON.stringify({{
+  dCc30: clientData.dCc30,
+  tiers: clientData.rows.map(r => r.ccTier),
+  cleanHtml: clip.cleanHtml,
+  tsv: clip.tsv,
+  csv: clip.csv,
+  modalHtml,
+  modalBg,
+  modalFg,
+}}));
+"""
+        mh_path = tmp_path / "merge_modal_harness.js"
+        mh_path.write_text(modal_harness, encoding="utf-8")
+        js_res = subprocess.run(
+            ["node", str(mh_path)], check=True, capture_output=True, text=True
+        )
+        jout = json.loads(js_res.stdout.strip())
+        assert jout["dCc30"] == 2.75
+        assert jout["tiers"] == ["green", "yellow", "red"]
+        assert "background:#ffffff;color:#000000" in jout["cleanHtml"]
+        assert "11.99 – 4.90" in jout["cleanHtml"]
+        assert "Overall\t11.99 – 2.30\t3840\t1280" in jout["tsv"]
+        assert jout["csv"] == csv_text
+        assert jout["modalBg"] == "#0a1020"
+        assert jout["modalFg"] == "#bae6fd"
+        assert "Georgia" in jout["modalHtml"]
+        assert "1ST" not in jout["modalHtml"]
+        assert "#fbbf24" not in jout["modalHtml"] and "#34d399" not in jout["modalHtml"]
+
+    # Verify _stamp_careless_merge_into_h5 vectorized n_obs/multiplicity + lazy resolve_artifact_for_download
+    work_dir = tmp_path / "merge_work"
+    work_dir.mkdir()
+    uc = gemmi.UnitCell(55.16, 81.19, 88.70, 90.0, 96.3, 90.0)
+    sg = gemmi.find_spacegroup_by_name("I 1 2 1")
+
+    merged_mtz = gemmi.Mtz(with_base=True)
+    merged_mtz.spacegroup = sg
+    merged_mtz.set_cell_for_all(uc)
+    merged_mtz.add_dataset("merged")
+    merged_mtz.add_column("I", "J")
+    merged_mtz.add_column("SigI", "Q")
+    asu_hkls = [
+        (2, 0, 0),
+        (0, 2, 0),
+        (2, 2, 0),
+        (4, 2, 2),
+        (6, 4, 2),
+        (8, 6, 4),
+        (10, 8, 6),
+        (12, 10, 8),
+        (14, 12, 10),
+        (16, 14, 12),
+        (18, 14, 12),
+        (20, 14, 12),
+    ]
+    merged_rows = [
+        [h, k, l, 200.0 - 10.0 * i, 12.0] for i, (h, k, l) in enumerate(asu_hkls)
+    ]
+    merged_mtz.set_data(np.asarray(merged_rows, dtype=np.float32))
+    merged_mtz.write_to_file(str(work_dir / "merged.mtz"))
+
+    # Repeat each reflection 3 times in predictions.mtz -> multiplicity == 3.0 in every populated shell
+    pred_mtz = gemmi.Mtz(with_base=True)
+    pred_mtz.spacegroup = sg
+    pred_mtz.set_cell_for_all(uc)
+    pred_mtz.add_dataset("pred")
+    pred_mtz.add_column("I", "J")
+    pred_mtz.add_column("SigI", "Q")
+    pred_mtz.add_column("pred", "J")
+    pred_mtz.add_column("scale", "R")
+    pred_rows = [
+        [h, k, l, 180.0, 12.0, 175.0, 1.0]
+        for (h, k, l) in asu_hkls
+        for _rep in range(3)
+    ]
+    pred_mtz.set_data(np.asarray(pred_rows, dtype=np.float32))
+    pred_mtz.write_to_file(str(work_dir / "predictions.mtz"))
+
+    xval_mtz = gemmi.Mtz(with_base=True)
+    xval_mtz.spacegroup = sg
+    xval_mtz.set_cell_for_all(uc)
+    xval_mtz.add_dataset("xval")
+    xval_mtz.add_column("half", "I")
+    xval_mtz.add_column("I", "J")
+    xval_rows = []
+    for i, (h, k, l) in enumerate(asu_hkls):
+        xval_rows.append([h, k, l, 0, 200.0 - 10.0 * i])
+        xval_rows.append([h, k, l, 1, 198.0 - 9.8 * i])
+    xval_mtz.set_data(np.asarray(xval_rows, dtype=np.float32))
+    xval_mtz.write_to_file(str(work_dir / "xval.mtz"))
+
+    integ_h5 = work_dir / "integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        pk = hf.create_group("peaks")
+        pk.create_dataset("h", data=np.array([2, 0], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0, 2], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("intensity", data=np.array([200.0, 190.0], dtype=float))
+        pk.create_dataset("sigma", data=np.array([12.0, 12.0], dtype=float))
+
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner._local_work_dir = str(work_dir)
+    runner._stamp_careless_merge_into_h5(str(integ_h5), str(work_dir), {})
+
+    assert (work_dir / "merge_table.csv").is_file()
+    assert (work_dir / "merge_table.html").is_file()
+    stamped_metrics = json.loads(
+        (work_dir / "careless_metrics.json").read_text(encoding="utf-8")
+    )
+    populated_bins = [b for b in stamped_metrics["resolution_bins"] if b["n_refl"] > 0]
+    assert len(populated_bins) >= 3
+    for b in populated_bins:
+        assert b["n_obs"] == 3 * b["n_refl"]
+        assert abs(b["multiplicity"] - 3.0) < 1e-6
+
+    # Delete merge_table.csv and merge_table.html to simulate a pre-existing workspace,
+    # then verify Files (list_step_artifacts) exposes ONLY merge_table.csv (not duplicate merge_table.html)
+    (work_dir / "merge_table.csv").unlink()
+    (work_dir / "merge_table.html").unlink()
+    runner._local_artifacts = {
+        "careless_metrics.json": str(work_dir / "careless_metrics.json"),
+        "integrated.h5": str(integ_h5),
+    }
+    arts = runner.list_step_artifacts(current_h5=str(integ_h5))
+    merge_art_by_name = {a["name"]: a for a in arts["merge"]}
+    assert "merge_table.csv" in merge_art_by_name
+    assert "merge_table.html" not in merge_art_by_name
+    assert merge_art_by_name["merge_table.csv"]["stage_id"] == "merge"
+
+    # Unlink once more and test direct on-demand resolve_artifact_for_download
+    (work_dir / "merge_table.csv").unlink()
+    (work_dir / "merge_table.html").unlink()
+    runner._local_artifacts.pop("merge_table.csv", None)
+    runner._local_artifacts.pop("merge_table.html", None)
+    dl_csv = runner.resolve_artifact_for_download(
+        name="merge_table.csv", current_h5=str(integ_h5)
+    )
+    dl_html = runner.resolve_artifact_for_download(
+        name="merge_table.html", current_h5=str(integ_h5)
+    )
+    assert dl_csv is not None and dl_csv[1] == "merge_table.csv"
+    assert dl_html is not None and dl_html[1] == "merge_table.html"
+    assert "resolution_range_A" in Path(dl_csv[0]).read_text(encoding="utf-8")
+    assert ">Copy</button>" in Path(dl_html[0]).read_text(encoding="utf-8")
+
+
+def test_solve_binning_param_drawer_and_cli_forwarding(tmp_path):
+    """Params drawer exposes Solve binning (auto, 16, 8, 4) and forwards --binning only when explicitly chosen."""
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    payload = build_rainbow_zone_payload()
+    html_default = render_rainbow_html(payload)
+    assert (
+        '<select id="inp-binning"><option value="" selected>auto</option>'
+        '<option value="16">16</option><option value="8">8</option>'
+        '<option value="4">4</option></select>'
+    ) in html_default
+
+    payload_b16 = dict(payload, solve_binning=16)
+    html_b16 = render_rainbow_html(payload_b16)
+    assert '<option value="16" selected>16</option>' in html_b16
+
+    merged_h5 = tmp_path / "merged.h5"
+    with h5py.File(merged_h5, "w") as hf:
+        hf.create_dataset("images/ims", data=np.zeros((1, 256, 256), dtype=np.float32))
+
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner._local_work_dir = str(tmp_path)
+
+    base_params = {
+        "instrument": "MANDI",
+        "space_group": "P 6_1 22",
+        "a": 79.91,
+        "b": 79.91,
+        "c": 238.0,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 120.0,
+        "wavelength_min": 2.0,
+        "wavelength_max": 4.0,
+        "d_min": 1.45,
+        "images_file": str(merged_h5),
+    }
+
+    rec_auto = {"cancel_requested": True}
+    runner._submit_local_subhkl_stage(
+        "solve", dict(base_params, binning=None), existing_job_record=rec_auto
+    )
+    assert "--binning" not in rec_auto["command_line"]
+    assert rec_auto["solve_params"]["binning"] is None
+
+    for b_val in (16, 8, 4):
+        rec_b = {"cancel_requested": True}
+        runner._submit_local_subhkl_stage(
+            "solve", dict(base_params, binning=b_val), existing_job_record=rec_b
+        )
+        assert f"--binning {b_val}" in rec_b["command_line"]
+        assert rec_b["solve_params"]["binning"] == b_val
+
+
+def test_subhkl_tmpfs_dir_and_podman_tmpfs_mount(tmp_path, monkeypatch):
+    """Verify tmpfs scratch selection (over disk /tmp) and podman --tmpfs /tmp mount flags."""
+    import os
+    import shutil
+    from pathlib import Path
+
+    import h5py
+    import numpy as np
+
+    from subhkl.viz import nova_rainbow_view, rainbow_zones
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        get_subhkl_tmp_search_dirs,
+        resolve_subhkl_tmpfs_dir,
+    )
+
+    fake_shm = tmp_path / "fake_dev_shm"
+    fake_shm.mkdir()
+    fake_override = tmp_path / "explicit_tmpfs_override"
+
+    # 1. Explicit $SUBHKL_TMPDIR override wins
+    monkeypatch.setenv("SUBHKL_TMPDIR", str(fake_override))
+    assert resolve_subhkl_tmpfs_dir() == str(fake_override.resolve())
+    assert fake_override.is_dir()
+    monkeypatch.delenv("SUBHKL_TMPDIR", raising=False)
+
+    # 2. When /tmp is disk-backed (not tmpfs) and a >=4 GiB tmpfs candidate exists,
+    #    resolve_subhkl_tmpfs_dir() creates subhkl-tmp-<uid> inside tmpfs while keeping /tmp in search dirs.
+    monkeypatch.setattr(rainbow_zones.tempfile, "gettempdir", lambda: "/tmp")
+    monkeypatch.setattr(
+        rainbow_zones,
+        "_is_tmpfs_mount",
+        lambda p: os.path.abspath(p).startswith(str(fake_shm.resolve())),
+    )
+    monkeypatch.setattr(
+        rainbow_zones,
+        "_avail_fs_bytes",
+        lambda p: (
+            64 * 1024**3
+            if os.path.abspath(p).startswith(str(fake_shm.resolve()))
+            else 10 * 1024**3
+        ),
+    )
+    monkeypatch.setattr(
+        nova_rainbow_view,
+        "_is_tmpfs_mount",
+        lambda p: os.path.abspath(p).startswith(str(fake_shm.resolve())),
+    )
+
+    # Patch candidate list via XDG_RUNTIME_DIR pointing at fake_shm
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(fake_shm))
+    chosen_tmpfs = resolve_subhkl_tmpfs_dir()
+    assert chosen_tmpfs.startswith(str(fake_shm.resolve()))
+    assert os.path.basename(chosen_tmpfs).startswith("subhkl-tmp")
+    search_dirs = get_subhkl_tmp_search_dirs()
+    assert search_dirs[0] == chosen_tmpfs
+    assert "/tmp" in search_dirs
+
+    # 3. Tiny (<4 GiB) container /dev/shm tmpfs is skipped rather than overflowing 64 MB /dev/shm
+    monkeypatch.setattr(rainbow_zones, "_avail_fs_bytes", lambda _p: 64 * 1024**2)
+    assert resolve_subhkl_tmpfs_dir() == "/tmp"
+
+    # Restore roomy tmpfs for podman command generation check
+    monkeypatch.setattr(rainbow_zones, "_avail_fs_bytes", lambda _p: 64 * 1024**3)
+    monkeypatch.setattr(
+        shutil, "which", lambda name: "/usr/bin/podman" if name == "podman" else None
+    )
+
+    merged_h5 = Path(chosen_tmpfs) / "merged.h5"
+    with h5py.File(merged_h5, "w") as hf:
+        hf.create_dataset("images/ims", data=np.zeros((1, 64, 64), dtype=np.float32))
+
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    monkeypatch.setattr(
+        runner,
+        "_resolve_local_podman_image",
+        lambda img, podman_bin="podman": (img, None),
+    )
+    rec_podman = {"cancel_requested": True}
+    runner._submit_local_subhkl_stage(
+        "solve",
+        {
+            "instrument": "MANDI",
+            "space_group": "P 6_1 22",
+            "a": 79.91,
+            "b": 79.91,
+            "c": 238.0,
+            "alpha": 90.0,
+            "beta": 90.0,
+            "gamma": 120.0,
+            "wavelength_min": 2.0,
+            "wavelength_max": 4.0,
+            "d_min": 1.45,
+            "images_file": str(merged_h5),
+        },
+        existing_job_record=rec_podman,
+    )
+    cmd_line = rec_podman["command_line"]
+    assert "--tmpfs /tmp:rw,exec,nosuid,nodev" in cmd_line
+    assert "-e TMPDIR=/tmp" in cmd_line
+    assert "-v /tmp:/tmp" not in cmd_line
+    assert f"-v {chosen_tmpfs}:{chosen_tmpfs}" in cmd_line

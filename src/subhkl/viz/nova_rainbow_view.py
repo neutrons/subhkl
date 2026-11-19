@@ -45,8 +45,12 @@ import numpy as np
 from subhkl import get_container_image
 from subhkl.viz.logo_svg import SUBHKL_FAVICON_DATA_URI, SUBHKL_FAVICON_SVG
 from subhkl.viz.rainbow_zones import (
+    _is_tmpfs_mount,
     build_rainbow_zone_payload,
+    configure_subhkl_tmpfs_env,
+    get_subhkl_tmp_search_dirs,
     render_rainbow_html,
+    resolve_subhkl_tmpfs_dir,
 )
 
 _NOVA_RECOVERABLE_ERRORS = (
@@ -781,11 +785,11 @@ class NovaGalaxyPipelineRunner:
         if parent_d:
             os.makedirs(parent_d, exist_ok=True)
         tmp_dst = f"{abs_d}.stage.{os.getpid()}.{threading.get_ident()}"
-        tmp_root = os.path.abspath(tempfile.gettempdir())
+        tmp_roots = get_subhkl_tmp_search_dirs()
         can_link = (
             allow_hardlink
             and (
-                abs_s.startswith(tmp_root + os.sep)
+                any(abs_s.startswith(r + os.sep) for r in tmp_roots)
                 or os.path.dirname(abs_s) == parent_d
             )
             and os.access(abs_s, os.W_OK)
@@ -1236,29 +1240,35 @@ class NovaGalaxyPipelineRunner:
         )
 
     def _local_cached_files_by_ds_id(self) -> dict[str, str]:
-        """Return a fast mapping of ds_id -> cached local file path in /tmp."""
+        """Return a fast mapping of ds_id -> cached local file path in tmpfs (or legacy /tmp)."""
         import re as _re
 
-        tmp_dir = tempfile.gettempdir()
+        search_dirs = get_subhkl_tmp_search_dirs()
         with contextlib.suppress(OSError):
-            mtime = os.stat(tmp_dir).st_mtime_ns
+            mtimes = tuple(
+                os.stat(d).st_mtime_ns for d in search_dirs if os.path.isdir(d)
+            )
             cached_pair = getattr(self, "_tmp_gx_index_cache", None)
             if (
                 isinstance(cached_pair, tuple)
                 and len(cached_pair) == 2
-                and cached_pair[0] == mtime
+                and cached_pair[0] == mtimes
             ):
                 return cached_pair[1]
             mapping: dict[str, str] = {}
-            for fn in os.listdir(tmp_dir):
-                if not fn.startswith("subhkl_gx_"):
-                    continue
-                m = _re.match(r"^subhkl_gx_([0-9a-fA-F]{8,})_", fn)
-                if m:
-                    ds_id = m.group(1)
-                    if ds_id not in mapping or fn.endswith((".h5", ".mtz")):
-                        mapping[ds_id] = os.path.join(tmp_dir, fn)
-            self._tmp_gx_index_cache = (mtime, mapping)
+            for tmp_dir in search_dirs:
+                for fn in os.listdir(tmp_dir):
+                    if not fn.startswith("subhkl_gx_"):
+                        continue
+                    m = _re.match(r"^subhkl_gx_([0-9a-fA-F]{8,})_", fn)
+                    if m:
+                        ds_id = m.group(1)
+                        if ds_id not in mapping or (
+                            fn.endswith((".h5", ".mtz"))
+                            and not mapping[ds_id].endswith((".h5", ".mtz"))
+                        ):
+                            mapping[ds_id] = os.path.join(tmp_dir, fn)
+            self._tmp_gx_index_cache = (mtimes, mapping)
             return mapping
         return {}
 
@@ -1414,13 +1424,14 @@ class NovaGalaxyPipelineRunner:
         if file_name and os.path.isfile(file_name) and os.path.getsize(file_name) > 0:
             return _remember(file_name), info
 
-        # 1. Check cached dataset file in /tmp by exact ds_id first
-        cached_matches = sorted(
-            _glob.glob(os.path.join(tempfile.gettempdir(), f"subhkl_gx_{ds_id}_*"))
-        )
-        for cm in cached_matches:
-            if os.path.isfile(cm) and os.path.getsize(cm) > 0:
-                return _remember(cm), info
+        # 1. Check cached dataset file in tmpfs / legacy /tmp by exact ds_id first
+        for search_dir in get_subhkl_tmp_search_dirs():
+            cached_matches = sorted(
+                _glob.glob(os.path.join(search_dir, f"subhkl_gx_{ds_id}_*"))
+            )
+            for cm in cached_matches:
+                if os.path.isfile(cm) and os.path.getsize(cm) > 0:
+                    return _remember(cm), info
 
         # 2. If dataset name includes a relative folder (e.g. 'betalac-7/merged.h5'), check /home/xvg/subhkl-examples/
         if "/" in name:
@@ -1450,7 +1461,9 @@ class NovaGalaxyPipelineRunner:
         )
         if not safe_name.endswith((".h5", ".hdf5", ".mtz", ".json", ".nxs")):
             safe_name += ".h5"
-        tmp_dest = os.path.join(tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}")
+        tmp_dest = os.path.join(
+            resolve_subhkl_tmpfs_dir(), f"subhkl_gx_{ds_id}_{safe_name}"
+        )
         if os.path.isfile(tmp_dest) and os.path.getsize(tmp_dest) > 0:
             return _remember(tmp_dest), info
         n_dl = self._download_dataset_to_file(
@@ -1477,6 +1490,7 @@ class NovaGalaxyPipelineRunner:
                 "predictions.mtz",
                 "xval.mtz",
                 "careless_metrics.json",
+                "merge_table.csv",
                 "careless_0.mtz",
                 "careless_predictions_0.mtz",
                 "careless_xval_0.mtz",
@@ -1553,13 +1567,16 @@ class NovaGalaxyPipelineRunner:
         if not wd or not os.path.isdir(wd):
             return
 
-        is_tmp_wd = os.path.abspath(wd).startswith(
-            os.path.abspath(tempfile.gettempdir())
+        is_tmp_wd = any(
+            os.path.abspath(wd).startswith(os.path.abspath(r))
+            for r in get_subhkl_tmp_search_dirs()
         )
         known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
 
         to_remove: list[str] = [
             "careless_metrics.json",
+            "merge_table.html",
+            "merge_table.csv",
             "merged.mtz",
             "predictions.mtz",
             "xval.mtz",
@@ -1636,6 +1653,7 @@ class NovaGalaxyPipelineRunner:
 
         work_dir = self._active_work_dir(current_h5)
         if work_dir and os.path.isdir(work_dir):
+            self._ensure_merge_table_artifacts(work_dir, current_h5=current_h5)
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 for fn in sorted(os.listdir(work_dir)):
                     fp = os.path.join(work_dir, fn)
@@ -1660,10 +1678,12 @@ class NovaGalaxyPipelineRunner:
         max_stage = getattr(self, "_max_valid_stage", None)
         if not max_stage and current_h5:
             max_stage = self._classify_artifact_stage(os.path.basename(str(current_h5)))
-            if (
-                max_stage == "integrate"
-                and work_dir
-                and os.path.isfile(os.path.join(work_dir, "careless_metrics.json"))
+            if max_stage == "integrate" and (
+                (
+                    work_dir
+                    and os.path.isfile(os.path.join(work_dir, "careless_metrics.json"))
+                )
+                or "merge_table.csv" in stages["merge"]
             ):
                 max_stage = "merge"
         if max_stage in self.STAGE_ORDER:
@@ -1672,6 +1692,129 @@ class NovaGalaxyPipelineRunner:
                 stages[st_k] = {}
 
         return {k: list(v.values()) for k, v in stages.items()}
+
+    def _ensure_merge_table_artifacts(
+        self,
+        work_dir: str | None,
+        *,
+        current_h5: str | None = None,
+        force: bool = False,
+    ) -> dict[str, str]:
+        """Materialize ``merge_table.csv`` and ``merge_table.html`` when merge metrics exist."""
+        from subhkl.viz.rainbow_zones import (
+            render_merge_table_csv,
+            render_merge_table_html,
+        )
+
+        target_dir = work_dir if (work_dir and os.path.isdir(work_dir)) else None
+        csv_existing = (
+            os.path.join(target_dir, "merge_table.csv") if target_dir else None
+        )
+        html_existing = (
+            os.path.join(target_dir, "merge_table.html") if target_dir else None
+        )
+        if (
+            not force
+            and csv_existing
+            and html_existing
+            and os.path.isfile(csv_existing)
+            and os.path.getsize(csv_existing) > 0
+            and os.path.isfile(html_existing)
+            and os.path.getsize(html_existing) > 0
+        ):
+            return {
+                "merge_table.csv": csv_existing,
+                "merge_table.html": html_existing,
+            }
+
+        metrics_doc: dict[str, Any] | None = None
+        if target_dir:
+            m_fp = os.path.join(target_dir, "careless_metrics.json")
+            if os.path.isfile(m_fp):
+                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                    with open(m_fp, "r", encoding="utf-8") as fh:
+                        loaded = json.load(fh)
+                    if isinstance(loaded, dict) and (
+                        loaded.get("resolution_bins")
+                        or loaded.get("cc_half_bins")
+                        or loaded.get("n_merged_asu")
+                    ):
+                        metrics_doc = loaded
+
+        h5_cand = current_h5
+        if (not h5_cand or not os.path.isfile(str(h5_cand))) and target_dir:
+            int_cand = os.path.join(target_dir, "integrated.h5")
+            if os.path.isfile(int_cand):
+                h5_cand = int_cand
+
+        sg_h5: str | None = None
+        cell_h5: list[float] | None = None
+        if h5_cand and os.path.isfile(str(h5_cand)):
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py as _h5py
+
+                with _h5py.File(str(h5_cand), "r") as hf:
+                    if metrics_doc is None and "careless/metrics_json" in hf:
+                        raw_b = hf["careless/metrics_json"][()]
+                        if isinstance(raw_b, (bytes, bytearray)):
+                            raw_s = raw_b.decode("utf-8", errors="replace")
+                        elif hasattr(raw_b, "tobytes"):
+                            raw_s = raw_b.tobytes().decode("utf-8", errors="replace")
+                        else:
+                            raw_s = str(raw_b)
+                        loaded_h5 = json.loads(raw_s)
+                        if isinstance(loaded_h5, dict) and (
+                            loaded_h5.get("resolution_bins")
+                            or loaded_h5.get("cc_half_bins")
+                            or loaded_h5.get("n_merged_asu")
+                        ):
+                            metrics_doc = loaded_h5
+                    if "sample" in hf:
+                        sgrp = hf["sample"]
+                        if "space_group" in sgrp:
+                            sg_raw = sgrp["space_group"][()]
+                            sg_h5 = (
+                                sg_raw.decode("utf-8", errors="replace")
+                                if isinstance(sg_raw, (bytes, bytearray))
+                                else str(sg_raw)
+                            ).strip()
+                        if all(
+                            k in sgrp for k in ("a", "b", "c", "alpha", "beta", "gamma")
+                        ):
+                            cell_h5 = [
+                                float(sgrp[k][()])
+                                for k in ("a", "b", "c", "alpha", "beta", "gamma")
+                            ]
+
+        if not isinstance(metrics_doc, dict):
+            return {}
+
+        csv_body = render_merge_table_csv(metrics_doc, space_group=sg_h5, cell=cell_h5)
+        html_body = render_merge_table_html(
+            metrics_doc, space_group=sg_h5, cell=cell_h5
+        )
+        out_dirs: list[str] = []
+        if target_dir:
+            out_dirs.append(target_dir)
+        fallback_tmp = os.path.join(resolve_subhkl_tmpfs_dir(), "subhkl_merge_tables")
+        out_dirs.append(fallback_tmp)
+
+        for odir in out_dirs:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                os.makedirs(odir, exist_ok=True)
+                p_csv = os.path.join(odir, "merge_table.csv")
+                p_html = os.path.join(odir, "merge_table.html")
+                if force or not os.path.isfile(p_csv) or os.path.getsize(p_csv) == 0:
+                    with open(p_csv, "w", encoding="utf-8") as fh_c:
+                        fh_c.write(csv_body)
+                if force or not os.path.isfile(p_html) or os.path.getsize(p_html) == 0:
+                    with open(p_html, "w", encoding="utf-8") as fh_h:
+                        fh_h.write(html_body)
+                return {
+                    "merge_table.csv": p_csv,
+                    "merge_table.html": p_html,
+                }
+        return {}
 
     def resolve_artifact_for_download(
         self,
@@ -1687,6 +1830,14 @@ class NovaGalaxyPipelineRunner:
             cand = os.path.join(work_dir, clean_name)
             if os.path.isfile(cand) and os.path.getsize(cand) > 0:
                 return cand, clean_name
+
+        if clean_name.lower() in ("merge_table.csv", "merge_table.html"):
+            gen_map = self._ensure_merge_table_artifacts(
+                work_dir, current_h5=current_h5
+            )
+            gen_fp = gen_map.get(clean_name.lower())
+            if gen_fp and os.path.isfile(gen_fp) and os.path.getsize(gen_fp) > 0:
+                return gen_fp, clean_name
 
         ds_id = dataset_id.strip()
         if not ds_id and clean_name:
@@ -1721,12 +1872,12 @@ class NovaGalaxyPipelineRunner:
         last_stem = os.path.basename(raw_nxs[-1]).split(".")[0]
         tag = first_stem if len(raw_nxs) == 1 else f"{first_stem}_{last_stem}"
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
-        work_d = os.path.join(tempfile.gettempdir(), f"subhkl_work_{safe_tag}")
+        work_d = os.path.join(resolve_subhkl_tmpfs_dir(), f"subhkl_work_{safe_tag}")
         os.makedirs(work_d, exist_ok=True)
         return work_d, f"{safe_tag}_merged.h5"
 
     def _resolve_work_dir_and_merged(self, merged_path: str) -> tuple[str, str]:
-        """Ensure a merged HDF5 file inside /tmp or Pulsar staging uses a dedicated /tmp/subhkl_work_<tag> directory."""
+        """Ensure a merged HDF5 file inside tmpfs, /tmp, or Pulsar staging uses a dedicated tmpfs subhkl_work_<tag> directory."""
         import glob as _glob
         import re as _re
         import shutil as _shutil
@@ -1734,11 +1885,12 @@ class NovaGalaxyPipelineRunner:
         abs_m = os.path.abspath(merged_path)
         parent_d = os.path.dirname(abs_m)
         orig_bn = os.path.basename(abs_m)
-        tmp_root = os.path.abspath(tempfile.gettempdir())
+        tmp_root = os.path.abspath(resolve_subhkl_tmpfs_dir())
+        tmp_roots_all = {os.path.abspath(r) for r in get_subhkl_tmp_search_dirs()}
         is_staging_dat = "/staging" in abs_m or (
             orig_bn.startswith("dataset_") and orig_bn.endswith(".dat")
         )
-        if parent_d != tmp_root and not is_staging_dat:
+        if parent_d not in tmp_roots_all and not is_staging_dat:
             return parent_d, abs_m
 
         m_gx = _re.match(r"^subhkl_gx_([0-9a-fA-F]+)_(.+)$", orig_bn)
@@ -1822,16 +1974,19 @@ class NovaGalaxyPipelineRunner:
                 or gx_ds_id
             )
             if not mapped_id:
-                for gx_f in _glob.glob(
-                    os.path.join(tmp_root, f"subhkl_gx_*_{safe_tag}_merged.h5")
-                ):
-                    if not _has_h5_images(gx_f):
-                        continue
-                    m_cand = _re.match(
-                        r"^subhkl_gx_([0-9a-fA-F]+)_", os.path.basename(gx_f)
-                    )
-                    if m_cand:
-                        mapped_id = m_cand.group(1)
+                for search_r in get_subhkl_tmp_search_dirs():
+                    for gx_f in _glob.glob(
+                        os.path.join(search_r, f"subhkl_gx_*_{safe_tag}_merged.h5")
+                    ):
+                        if not _has_h5_images(gx_f):
+                            continue
+                        m_cand = _re.match(
+                            r"^subhkl_gx_([0-9a-fA-F]+)_", os.path.basename(gx_f)
+                        )
+                        if m_cand:
+                            mapped_id = m_cand.group(1)
+                            break
+                    if mapped_id:
                         break
             if mapped_id:
                 for p_alias in (abs_m, final_m, legacy_m):
@@ -1871,8 +2026,15 @@ class NovaGalaxyPipelineRunner:
                         os.remove(bad_p)
                 known_map.pop(os.path.abspath(bad_p), None)
                 known_map.pop(os.path.realpath(bad_p), None)
+            gx_candidates = [
+                gx_f
+                for search_r in get_subhkl_tmp_search_dirs()
+                for gx_f in _glob.glob(
+                    os.path.join(search_r, f"subhkl_gx_*_{safe_tag}_merged.h5")
+                )
+            ]
             for gx_f in sorted(
-                _glob.glob(os.path.join(tmp_root, f"subhkl_gx_*_{safe_tag}_merged.h5")),
+                gx_candidates,
                 key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0.0,
                 reverse=True,
             ):
@@ -2085,6 +2247,12 @@ class NovaGalaxyPipelineRunner:
         }
         if stage_id == "solve":
             wl_r = params.get("wavelength_range")
+            raw_bin = params.get("binning")
+            solve_binning = (
+                int(raw_bin)
+                if raw_bin not in (None, "", "auto", "default") and int(raw_bin) >= 1
+                else None
+            )
             job_record["solve_params"] = {
                 "instrument": str(params.get("instrument") or "CG4D"),
                 "space_group": str(params.get("space_group") or "P 1"),
@@ -2097,6 +2265,7 @@ class NovaGalaxyPipelineRunner:
                 "d_min": (
                     float(params["d_min"]) if params.get("d_min") is not None else None
                 ),
+                "binning": solve_binning,
             }
         self.active_job = job_record
         self._sync_job_timing(job_record)
@@ -2330,14 +2499,12 @@ class NovaGalaxyPipelineRunner:
                     km_v = mcols["K"][val_m].astype(int)
                     lm_v = mcols["L"][val_m].astype(int)
                     isigi_v = mI[val_m] / mS[val_m]
-                    d_m = np.array(
-                        [
-                            mtz_m.cell.calculate_d([int(hh), int(kk), int(ll)])
-                            for hh, kk, ll in zip(hm_v, km_v, lm_v)
-                        ],
-                        dtype=np.float64,
+                    frac_mat_m = np.array(mtz_m.cell.frac.mat, dtype=np.float64)
+                    mhkl_v = np.column_stack((hm_v, km_v, lm_v)).astype(np.float64)
+                    inv_d2_m = np.maximum(
+                        np.sum((mhkl_v @ frac_mat_m) ** 2, axis=1), 1e-6
                     )
-                    inv_d2_m = 1.0 / np.maximum(d_m**2, 1e-6)
+                    d_m = 1.0 / np.sqrt(inv_d2_m)
                     edges = np.linspace(
                         float(inv_d2_m.min()), float(inv_d2_m.max()), 11
                     )
@@ -2362,22 +2529,38 @@ class NovaGalaxyPipelineRunner:
                                     theo_set.add(
                                         (int(hasu[0]), int(hasu[1]), int(hasu[2]))
                                     )
-                    d_theo = (
-                        np.array(
-                            [
-                                mtz_m.cell.calculate_d([hh, kk, ll])
-                                for hh, kk, ll in theo_set
-                            ],
-                            dtype=np.float64,
+                    inv_d2_t = (
+                        np.maximum(
+                            np.sum(
+                                (
+                                    np.array(list(theo_set), dtype=np.float64)
+                                    @ frac_mat_m
+                                )
+                                ** 2,
+                                axis=1,
+                            ),
+                            1e-6,
                         )
                         if theo_set
                         else np.array([], dtype=np.float64)
                     )
-                    inv_d2_t = (
-                        1.0 / np.maximum(d_theo**2, 1e-6)
-                        if len(d_theo)
-                        else np.array([], dtype=np.float64)
-                    )
+
+                    inv_d2_p = np.array([], dtype=np.float64)
+                    if os.path.isfile(pred_mtz_path):
+                        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                            pmtz_b = gemmi.read_mtz_file(pred_mtz_path)
+                            pcols_b = {
+                                c.label: np.array(c, dtype=np.float64)
+                                for c in pmtz_b.columns
+                            }
+                            if all(k in pcols_b for k in ("H", "K", "L")):
+                                phkl_b = np.column_stack(
+                                    (pcols_b["H"], pcols_b["K"], pcols_b["L"])
+                                )
+                                inv_d2_p = np.maximum(
+                                    np.sum((phkl_b @ frac_mat_m) ** 2, axis=1),
+                                    1e-6,
+                                )
 
                     xv_v0 = np.array([], dtype=np.float64)
                     xv_v1 = np.array([], dtype=np.float64)
@@ -2392,19 +2575,16 @@ class NovaGalaxyPipelineRunner:
                         xl = xcols["L"].astype(int)
                         xhalf = xcols.get("half", np.zeros_like(xh)).astype(int)
                         xI = xcols.get("I", xcols.get("F", np.zeros_like(xcols["H"])))
-                        xd = np.array(
-                            [
-                                xv.cell.calculate_d([int(hh), int(kk), int(ll)])
-                                for hh, kk, ll in zip(xh, xk, xl)
-                            ],
-                            dtype=np.float64,
+                        xhkl_all = np.column_stack((xh, xk, xl)).astype(np.float64)
+                        x_inv_d2 = np.maximum(
+                            np.sum((xhkl_all @ frac_mat_m) ** 2, axis=1), 1e-6
                         )
                         m0 = xhalf == 0
                         m1 = xhalf == 1
                         map0 = {
-                            (int(hh), int(kk), int(ll)): (float(val), float(dd))
-                            for hh, kk, ll, val, dd in zip(
-                                xh[m0], xk[m0], xl[m0], xI[m0], xd[m0]
+                            (int(hh), int(kk), int(ll)): (float(val), float(id2))
+                            for hh, kk, ll, val, id2 in zip(
+                                xh[m0], xk[m0], xl[m0], xI[m0], x_inv_d2[m0]
                             )
                             if np.isfinite(val)
                         }
@@ -2421,25 +2601,40 @@ class NovaGalaxyPipelineRunner:
                             xv_v1 = np.array(
                                 [map1[k] for k in common], dtype=np.float64
                             )
-                            d_c = np.array(
+                            inv_d2_x = np.array(
                                 [map0[k][1] for k in common], dtype=np.float64
                             )
-                            inv_d2_x = 1.0 / np.maximum(d_c**2, 1e-6)
 
                     bins = []
                     for b in range(10):
                         hi_edge = edges[b + 1]
                         lo_edge = edges[b]
-                        bm_m = (inv_d2_m >= lo_edge) & (
-                            inv_d2_m <= hi_edge if b == 9 else inv_d2_m < hi_edge
+                        lo_cmp = lo_edge - 1e-12 if b == 0 else lo_edge
+                        hi_cmp = hi_edge + 1e-12 if b == 9 else hi_edge
+                        bm_m = (inv_d2_m >= lo_cmp) & (
+                            inv_d2_m <= hi_cmp if b == 9 else inv_d2_m < hi_cmp
                         )
                         bm_t = (
-                            (inv_d2_t >= lo_edge)
-                            & (inv_d2_t <= hi_edge if b == 9 else inv_d2_t < hi_edge)
+                            (inv_d2_t >= lo_cmp)
+                            & (inv_d2_t <= hi_cmp if b == 9 else inv_d2_t < hi_cmp)
                             if len(inv_d2_t)
                             else np.array([], dtype=bool)
                         )
+                        bm_p = (
+                            (inv_d2_p >= lo_cmp)
+                            & (inv_d2_p <= hi_cmp if b == 9 else inv_d2_p < hi_cmp)
+                            if len(inv_d2_p)
+                            else np.array([], dtype=bool)
+                        )
+                        n_obs_b: int | None = (
+                            int(np.sum(bm_p)) if len(inv_d2_p) else None
+                        )
                         n_m_b = int(np.sum(bm_m))
+                        mult_b: float | None = (
+                            round(float(n_obs_b) / max(1, n_m_b), 2)
+                            if (n_obs_b is not None and n_m_b > 0)
+                            else None
+                        )
                         n_t_b = max(n_m_b, int(np.sum(bm_t))) if len(bm_t) else n_m_b
                         comp_b = (
                             round(float(100.0 * n_m_b / max(1, n_t_b)), 2)
@@ -2453,8 +2648,8 @@ class NovaGalaxyPipelineRunner:
                         )
                         cc_b: float | None = None
                         if len(inv_d2_x):
-                            bm_x = (inv_d2_x >= lo_edge) & (
-                                inv_d2_x <= hi_edge if b == 9 else inv_d2_x < hi_edge
+                            bm_x = (inv_d2_x >= lo_cmp) & (
+                                inv_d2_x <= hi_cmp if b == 9 else inv_d2_x < hi_cmp
                             )
                             if int(np.sum(bm_x)) >= 2:
                                 s0 = xv_v0[bm_x]
@@ -2465,19 +2660,42 @@ class NovaGalaxyPipelineRunner:
                                         cc_b = round(r_val, 4)
                         d_hi = float(1.0 / np.sqrt(max(hi_edge, 1e-6)))
                         d_lo = float(1.0 / np.sqrt(max(lo_edge, 1e-6)))
-                        bins.append(
-                            {
-                                "bin": b,
-                                "d_max": round(d_lo, 2),
-                                "d_min": round(d_hi, 2),
-                                "n_refl": n_m_b,
-                                "n_theo": n_t_b,
-                                "completeness_pct": comp_b,
-                                "mean_isigi": isigi_b,
-                                "cc_half": cc_b,
-                            }
-                        )
+                        bin_entry: dict[str, Any] = {
+                            "bin": b,
+                            "d_max": round(d_lo, 2),
+                            "d_min": round(d_hi, 2),
+                            "n_refl": n_m_b,
+                            "n_theo": n_t_b,
+                            "completeness_pct": comp_b,
+                            "mean_isigi": isigi_b,
+                            "cc_half": cc_b,
+                        }
+                        if n_obs_b is not None:
+                            bin_entry["n_obs"] = n_obs_b
+                        if mult_b is not None:
+                            bin_entry["multiplicity"] = mult_b
+                        bins.append(bin_entry)
+                    metrics_doc.setdefault(
+                        "space_group", str(sg_m.xhm() or sg_m.short_name() or "P 1")
+                    )
+                    metrics_doc.setdefault(
+                        "cell",
+                        [
+                            round(float(mtz_m.cell.a), 4),
+                            round(float(mtz_m.cell.b), 4),
+                            round(float(mtz_m.cell.c), 4),
+                            round(float(mtz_m.cell.alpha), 3),
+                            round(float(mtz_m.cell.beta), 3),
+                            round(float(mtz_m.cell.gamma), 3),
+                        ],
+                    )
                     metrics_doc.setdefault("n_merged_asu", len(hm_v))
+                    if len(inv_d2_p) > 0:
+                        metrics_doc.setdefault("n_observations", len(inv_d2_p))
+                        metrics_doc.setdefault(
+                            "mean_multiplicity",
+                            round(float(len(inv_d2_p)) / max(1, len(hm_v)), 2),
+                        )
                     metrics_doc.setdefault(
                         "mean_isigi", round(float(np.mean(isigi_v)), 2)
                     )
@@ -2504,6 +2722,26 @@ class NovaGalaxyPipelineRunner:
                     metrics_raw = json.dumps(metrics_doc, indent=2)
                     with open(metrics_path, "w", encoding="utf-8") as fh_out:
                         fh_out.write(metrics_raw)
+
+        if metrics_doc:
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                from subhkl.viz.rainbow_zones import (
+                    render_merge_table_csv,
+                    render_merge_table_html,
+                )
+
+                with open(
+                    os.path.join(work_dir, "merge_table.csv"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh_csv:
+                    fh_csv.write(render_merge_table_csv(metrics_doc))
+                with open(
+                    os.path.join(work_dir, "merge_table.html"),
+                    "w",
+                    encoding="utf-8",
+                ) as fh_html:
+                    fh_html.write(render_merge_table_html(metrics_doc))
 
         with h5py.File(integrated_h5_path, "r+") as hf:
             cgrp = hf.require_group("careless")
@@ -2619,7 +2857,7 @@ class NovaGalaxyPipelineRunner:
             comp_str = (
                 f"{comp_val:.1f}%" if isinstance(comp_val, (int, float)) else "N/A"
             )
-            job_record["stdout"] += (
+            job_record["stdout"] = job_record.get("stdout", "") + (
                 f"\n[careless] Merged {metrics_doc.get('n_merged_asu', 0)} ASU reflections "
                 f"from {metrics_doc.get('n_observations', 0)} observations | "
                 f"CC1/2={cc_str} | <I/sigma>={metrics_doc.get('mean_isigi', 0.0):.2f} | "
@@ -2662,13 +2900,14 @@ class NovaGalaxyPipelineRunner:
                 tag_part = parent_bn[len("subhkl_work_") :]
                 cand_paths.append(os.path.join(parent_d, f"{tag_part}_merged.h5"))
                 cand_paths.append(os.path.join(parent_d, "merged.h5"))
-                for gx_f in _glob.glob(
-                    os.path.join(
-                        tempfile.gettempdir(),
-                        f"subhkl_gx_*_{tag_part}_merged.h5",
-                    )
-                ):
-                    cand_paths.append(os.path.abspath(gx_f))
+                for search_r in get_subhkl_tmp_search_dirs():
+                    for gx_f in _glob.glob(
+                        os.path.join(
+                            search_r,
+                            f"subhkl_gx_*_{tag_part}_merged.h5",
+                        )
+                    ):
+                        cand_paths.append(os.path.abspath(gx_f))
 
             for cand_p in cand_paths:
                 known_id = known_map.get(cand_p)
@@ -2842,7 +3081,7 @@ class NovaGalaxyPipelineRunner:
                 for ch in os.path.basename(fname)
             )
             cache_dest = os.path.join(
-                tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}"
+                resolve_subhkl_tmpfs_dir(), f"subhkl_gx_{ds_id}_{safe_name}"
             )
             if os.path.isfile(local_path) and not os.path.exists(cache_dest):
                 try:
@@ -2936,7 +3175,7 @@ class NovaGalaxyPipelineRunner:
             work_dir, merged_path = (
                 self._resolve_work_dir_and_merged(merged_path)
                 if merged_path
-                else (tempfile.gettempdir(), "")
+                else (resolve_subhkl_tmpfs_dir(), "")
             )
             self.invalidate_subsequent_stages(stage_id, work_dir)
             solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
@@ -3011,6 +3250,14 @@ class NovaGalaxyPipelineRunner:
 
             if stage_id == "solve":
                 d_min_solve = float(params.get("d_min") or round(0.5 * float(wl[0]), 2))
+                raw_bin = params.get("binning")
+                solve_binning = (
+                    int(raw_bin)
+                    if raw_bin not in (None, "", "auto", "default")
+                    and int(raw_bin) >= 1
+                    else None
+                )
+                refinement_mode = str(params.get("objective", "band"))
                 job_record["images_h5_path"] = merged_path
                 job_record["solve_params"] = {
                     "instrument": str(inst),
@@ -3018,6 +3265,7 @@ class NovaGalaxyPipelineRunner:
                     "cell": [float(x) for x in raw_cell[:6]],
                     "wavelength_range": (float(wl[0]), float(wl[1])),
                     "d_min": d_min_solve,
+                    "binning": solve_binning,
                 }
                 primary_tool = "imaginex_subhkl_solve"
                 scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
@@ -3033,9 +3281,14 @@ class NovaGalaxyPipelineRunner:
                     "gamma": float(raw_cell[5]),
                     "wavelengthMin": float(wl[0]),
                     "wavelengthMax": float(wl[1]),
-                    "refinement": str(params.get("objective", "band")),
+                    "refinement": refinement_mode,
                     "dMin": d_min_solve,
                 }
+                if solve_binning is not None:
+                    if refinement_mode == "band":
+                        tool_inputs["bandBinning"] = solve_binning
+                    else:
+                        tool_inputs["poissonBinning"] = solve_binning
             elif stage_id == "integrate":
                 primary_tool = "imaginex_subhkl_predict"
                 scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
@@ -3219,7 +3472,8 @@ class NovaGalaxyPipelineRunner:
             elif stage_id == "merge":
                 primary_tool = "imaginex_subhkl_merge"
                 if (
-                    work_dir == os.path.abspath(tempfile.gettempdir())
+                    os.path.abspath(work_dir)
+                    in {os.path.abspath(r) for r in get_subhkl_tmp_search_dirs()}
                     and params.get("peaks_file")
                     and os.path.isfile(str(params.get("peaks_file")))
                 ):
@@ -5111,9 +5365,8 @@ class NovaGalaxyPipelineRunner:
                 "No merged scan HDF5 file is loaded; run Step 1 (Reduce & Merge) "
                 "or select a merged.h5 dataset from History first."
             )
-        merged_path = os.path.abspath(
-            raw_img or os.path.join(tempfile.gettempdir(), "merged.h5")
-        )
+        subhkl_tmp = resolve_subhkl_tmpfs_dir()
+        merged_path = os.path.abspath(raw_img or os.path.join(subhkl_tmp, "merged.h5"))
         work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
         self.invalidate_subsequent_stages(stage_id, work_dir)
         solve_dest = os.path.join(work_dir, "solve.h5")
@@ -5139,10 +5392,10 @@ class NovaGalaxyPipelineRunner:
                 solve_path = solve_dest
 
         ts = int(time.time())
-        out_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_{stage_id}_{ts}.h5")
-        pred_tmp_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_pred_{ts}.h5")
-        mtz_tmp_path = os.path.join(tempfile.gettempdir(), f"subhkl_refl_{ts}.mtz")
-        reduce_tmp_dir = os.path.join(tempfile.gettempdir(), f"subhkl_reduce_{ts}")
+        out_h5 = os.path.join(subhkl_tmp, f"subhkl_{stage_id}_{ts}.h5")
+        pred_tmp_h5 = os.path.join(subhkl_tmp, f"subhkl_pred_{ts}.h5")
+        mtz_tmp_path = os.path.join(subhkl_tmp, f"subhkl_refl_{ts}.mtz")
+        reduce_tmp_dir = os.path.join(subhkl_tmp, f"subhkl_reduce_{ts}")
         raw_nxs_local: list[str] = []
         merged_label = "merged.h5"
         if stage_id == "reduce":
@@ -5351,6 +5604,12 @@ class NovaGalaxyPipelineRunner:
             ]
             if str(params.get("objective", "band")) == "band" and refine_modes_str:
                 inner_cmd.extend(["--refine-modes", refine_modes_str])
+            raw_bin_local = params.get("binning")
+            if (
+                raw_bin_local not in (None, "", "auto", "default")
+                and int(raw_bin_local) >= 1
+            ):
+                inner_cmd.extend(["--binning", str(int(raw_bin_local))])
         elif (
             stage_id == "integrate"
             and os.path.isfile(merged_path)
@@ -5614,7 +5873,7 @@ class NovaGalaxyPipelineRunner:
                 "--instrument",
                 str(inst),
                 "--output-dir",
-                tempfile.gettempdir(),
+                subhkl_tmp,
                 "--dpi",
                 "72",
             ]
@@ -5640,13 +5899,25 @@ class NovaGalaxyPipelineRunner:
                     os.path.dirname(os.path.realpath(p)),
                 )
             }
+            explicit_input_dirs = {
+                os.path.dirname(merged_path),
+                os.path.dirname(solve_path),
+                *raw_dirs,
+            }
             mount_dirs = sorted(
                 {
-                    os.path.dirname(merged_path),
-                    os.path.dirname(solve_path),
-                    work_dir,
-                    tempfile.gettempdir(),
-                    *raw_dirs,
+                    d
+                    for d in (
+                        *explicit_input_dirs,
+                        work_dir,
+                        subhkl_tmp,
+                    )
+                    if d
+                    and (
+                        d != "/tmp"
+                        or _is_tmpfs_mount("/tmp")
+                        or "/tmp" in explicit_input_dirs
+                    )
                 }
             )
             cmd = [
@@ -5658,19 +5929,27 @@ class NovaGalaxyPipelineRunner:
                 "label=disable",
                 "--device",
                 "nvidia.com/gpu=all",
-                "-e",
-                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '0')}",
-                "-e",
-                "XLA_PYTHON_CLIENT_PREALLOCATE=false",
-                "-e",
-                "OPENBLAS_NUM_THREADS=1",
-                "-e",
-                "OMP_NUM_THREADS=1",
-                "-e",
-                "JAX_PLATFORMS=",
-                "-e",
-                "MKL_NUM_THREADS=1",
             ]
+            if "/tmp" not in mount_dirs:
+                cmd.extend(["--tmpfs", "/tmp:rw,exec,nosuid,nodev"])
+            cmd.extend(
+                [
+                    "-e",
+                    "TMPDIR=/tmp",
+                    "-e",
+                    f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '0')}",
+                    "-e",
+                    "XLA_PYTHON_CLIENT_PREALLOCATE=false",
+                    "-e",
+                    "OPENBLAS_NUM_THREADS=1",
+                    "-e",
+                    "OMP_NUM_THREADS=1",
+                    "-e",
+                    "JAX_PLATFORMS=",
+                    "-e",
+                    "MKL_NUM_THREADS=1",
+                ]
+            )
             for d in mount_dirs:
                 if os.path.isdir(d):
                     cmd.extend(["-v", f"{d}:{d}"])
@@ -5782,6 +6061,13 @@ class NovaGalaxyPipelineRunner:
             self._active_procs = {}
 
         if stage_id == "solve":
+            raw_bin_rec = params.get("binning")
+            solve_bin_rec = (
+                int(raw_bin_rec)
+                if raw_bin_rec not in (None, "", "auto", "default")
+                and int(raw_bin_rec) >= 1
+                else None
+            )
             job_record["images_h5_path"] = merged_path
             job_record["solve_params"] = {
                 "instrument": str(inst),
@@ -5789,6 +6075,7 @@ class NovaGalaxyPipelineRunner:
                 "cell": [float(x) for x in raw_cell[:6]],
                 "wavelength_range": (float(wl[0]), float(wl[1])),
                 "d_min": float(params.get("d_min") or round(0.5 * float(wl[0]), 2)),
+                "binning": solve_bin_rec,
             }
 
         def _stream_proc() -> None:
@@ -6148,6 +6435,8 @@ class NovaGalaxyPipelineRunner:
                                         ("predictions.mtz", "binary"),
                                         ("xval.mtz", "binary"),
                                         ("careless_metrics.json", "json"),
+                                        ("merge_table.csv", "csv"),
+                                        ("merge_table.html", "html"),
                                     ):
                                         fp = os.path.join(_wdir, fn)
                                         if os.path.isfile(fp):
@@ -6351,7 +6640,7 @@ class NovaGalaxyPipelineRunner:
                             last_live_token = live_tokens[-1]
                             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                 blind_dst = os.path.join(
-                                    work_dir or tempfile.gettempdir(),
+                                    work_dir or resolve_subhkl_tmpfs_dir(),
                                     "solve.blind.h5",
                                 )
                                 if self._materialize_live_state_h5(
@@ -6456,15 +6745,18 @@ class NovaGalaxyPipelineRunner:
                                         )
 
                                 tmp_path = None
+                                tmpfs_dl_dir = resolve_subhkl_tmpfs_dir()
                                 cache_gx_path = os.path.join(
-                                    tempfile.gettempdir(),
+                                    tmpfs_dl_dir,
                                     f"subhkl_gx_{ds_id}_{merged_label}",
                                 )
                                 dl_dest = target_path
                                 created_temp = False
                                 if not dl_dest:
                                     fd, dl_dest = tempfile.mkstemp(
-                                        suffix=".h5", prefix="galaxy_solve_"
+                                        suffix=".h5",
+                                        prefix="galaxy_solve_",
+                                        dir=tmpfs_dl_dir,
                                     )
                                     os.close(fd)
                                     created_temp = True
@@ -6536,9 +6828,12 @@ class NovaGalaxyPipelineRunner:
                                                         [],
                                                     )
                                                     for nxs_f in raw_nxs_list:
-                                                        if nxs_f.startswith(
-                                                            tempfile.gettempdir()
-                                                        ) and os.path.isfile(nxs_f):
+                                                        if os.path.isfile(
+                                                            nxs_f
+                                                        ) and any(
+                                                            nxs_f.startswith(r)
+                                                            for r in get_subhkl_tmp_search_dirs()
+                                                        ):
                                                             ax, ang, nms = (
                                                                 get_rotation_data_from_nexus(
                                                                     nxs_f, inst_name
@@ -6671,6 +6966,8 @@ class NovaGalaxyPipelineRunner:
                                             "predictions.mtz",
                                             "xval.mtz",
                                             "careless_metrics.json",
+                                            "merge_table.csv",
+                                            "merge_table.html",
                                         ):
                                             if cand in oname or oname == cand.replace(
                                                 ".", "_"
@@ -6981,6 +7278,7 @@ def serve_rainbow_zones(
     Compatible with NDIP / Galaxy Interactive Tools (`$EP_PATH`, port 8080) as well
     as local container port-forwarding (`podman run -p 8080:8080 ...`).
     """
+    configure_subhkl_tmpfs_env()
     vm = RainbowZonesViewModel(
         replay_h5=replay_h5,
         payload=payload,
@@ -7693,7 +7991,7 @@ def serve_rainbow_zones(
                     fb_dir = (
                         os.path.dirname(os.path.abspath(vm.replay_h5))
                         if vm.replay_h5 and os.path.isfile(vm.replay_h5)
-                        else tempfile.gettempdir()
+                        else resolve_subhkl_tmpfs_dir()
                     )
                     saved_paths: list[str] = []
                     header_bytes = f"Content-Type: {ctype}\r\n\r\n".encode()

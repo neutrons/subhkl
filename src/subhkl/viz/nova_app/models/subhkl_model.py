@@ -15,6 +15,7 @@ from subhkl.viz.rainbow_zones import (
     build_rainbow_zone_payload,
     export_static_app_html,
     render_rainbow_html,
+    resolve_subhkl_tmpfs_dir,
 )
 
 
@@ -315,7 +316,9 @@ class SubhklGalaxyModel:
         """Render the interactive Diffraction Parallax & Lattice Ladder HTML document."""
         if self.payload is not None:
             return render_rainbow_html(self.payload)
-        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            suffix=".html", dir=resolve_subhkl_tmpfs_dir(), delete=False
+        ) as tmp:
             tmp_path = tmp.name
         try:
             export_static_app_html(tmp_path, instrument=self.data.instrument.value)
@@ -409,7 +412,7 @@ class SubhklGalaxyModel:
                     ):
                         ds = outputs.get_dataset(out_name)
                         target = os.path.join(
-                            tempfile.gettempdir(),
+                            resolve_subhkl_tmpfs_dir(),
                             f"subhkl_nova_{stage}_{int(time.time())}.h5",
                         )
                         ds.download(target)
