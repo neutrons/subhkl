@@ -7687,3 +7687,110 @@ console.log(JSON.stringify({{
         assert "ω=15.0°, χ=45.0°, φ=120.0°" in res["gonioTip"]
         assert "MANDI_12737.nxs.h5" in res["frameTip"]
         assert "MANDI • I a -3 d • INTEGRATED" in res["subTip"]
+
+
+def test_tmpdir_exit_cleanup_removes_app_artifacts_safely(tmp_path) -> None:
+    """Verify TMPDIR workspaces/caches/uploads are cleaned at normal exit and SIGTERM without touching external or unregistered files."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import tempfile
+
+    from subhkl.viz.nova_rainbow_view import (
+        NovaGalaxyPipelineRunner,
+        cleanup_registered_temp_artifacts,
+        register_temp_artifact,
+    )
+
+    isolated_tmp = tmp_path / "app_tmp"
+    outside_dir = tmp_path / "user_data"
+    isolated_tmp.mkdir()
+    outside_dir.mkdir()
+    outside_file = outside_dir / "precious.h5"
+    outside_file.write_bytes(b"keep")
+    unregistered_tmp_file = isolated_tmp / "other_process.txt"
+    unregistered_tmp_file.write_text("keep", encoding="utf-8")
+
+    orig_tempdir = tempfile.tempdir
+    try:
+        tempfile.tempdir = str(isolated_tmp)
+        # Never track TMPDIR root itself or paths outside TMPDIR
+        assert register_temp_artifact(isolated_tmp) is None
+        assert register_temp_artifact(outside_file) is None
+        assert register_temp_artifact(outside_dir) is None
+
+        runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+        work_d, _ = runner._work_dir_for_reduce(
+            ["/SNS/MANDI/MANDI_12737.nxs.h5"], str(isolated_tmp)
+        )
+        (tmp_path / "dummy").touch()
+        with open(os.path.join(work_d, "merged.h5"), "wb") as fh:
+            fh.write(b"h5")
+        gx_cache = isolated_tmp / "subhkl_gx_deadbeef_solve.h5"
+        gx_cache.write_bytes(b"gx")
+        assert register_temp_artifact(gx_cache) == str(gx_cache)
+
+        removed = cleanup_registered_temp_artifacts()
+        assert os.path.abspath(work_d) in removed
+        assert str(gx_cache) in removed
+        assert not os.path.exists(work_d)
+        assert not gx_cache.exists()
+        assert outside_file.exists()
+        assert unregistered_tmp_file.exists()
+    finally:
+        tempfile.tempdir = orig_tempdir
+
+    # Subprocess exit test 1: normal interpreter exit triggers atexit TMPDIR cleanup
+    sub_tmp_1 = tmp_path / "sub_tmp_atexit"
+    sub_tmp_1.mkdir()
+    env_1 = dict(os.environ, TMPDIR=str(sub_tmp_1))
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, pathlib; "
+                "from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner, register_temp_artifact; "
+                "r = NovaGalaxyPipelineRunner(galaxy_url='', galaxy_api_key=''); "
+                "wd, _ = r._work_dir_for_reduce(['MANDI_1.nxs.h5'], os.environ['TMPDIR']); "
+                "pathlib.Path(wd, 'merged.h5').write_bytes(b'123'); "
+                "up = pathlib.Path(os.environ['TMPDIR']) / 'subhkl_upload_1'; up.mkdir(); "
+                "register_temp_artifact(up)"
+            ),
+        ],
+        env=env_1,
+        check=True,
+    )
+    assert list(sub_tmp_1.iterdir()) == []
+
+    # Subprocess exit test 2: SIGTERM triggers signal-handler TMPDIR cleanup
+    sub_tmp_2 = tmp_path / "sub_tmp_sigterm"
+    sub_tmp_2.mkdir()
+    env_2 = dict(os.environ, TMPDIR=str(sub_tmp_2))
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import os, pathlib, time; "
+                "from subhkl.viz.nova_rainbow_view import install_exit_cleanup_signal_handlers, register_temp_artifact; "
+                "install_exit_cleanup_signal_handlers(); "
+                "wd = pathlib.Path(os.environ['TMPDIR']) / 'subhkl_work_sigterm'; wd.mkdir(); "
+                "(wd / 'solve.h5').write_bytes(b'abc'); "
+                "register_temp_artifact(wd); "
+                "print('READY', flush=True); "
+                "time.sleep(30)"
+            ),
+        ],
+        env=env_2,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    assert proc.stdout.readline().strip() == "READY"
+    assert (sub_tmp_2 / "subhkl_work_sigterm" / "solve.h5").is_file()
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=10)
+    assert list(sub_tmp_2.iterdir()) == []

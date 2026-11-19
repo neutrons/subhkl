@@ -418,11 +418,14 @@ class SubhklGalaxyModel:
                         KeyError,
                         AttributeError,
                     ):
+                        from subhkl.viz.nova_rainbow_view import register_temp_artifact
+
                         ds = outputs.get_dataset(out_name)
                         target = os.path.join(
                             tempfile.gettempdir(),
                             f"subhkl_nova_{stage}_{int(time.time())}.h5",
                         )
+                        register_temp_artifact(target)
                         ds.download(target)
                         downloaded_path = target
                         break

@@ -65,12 +65,27 @@ def main(
         kwargs.setdefault("timeout", 0)
         kwargs.setdefault("open_browser", False)
 
+    import contextlib
+
+    from subhkl.viz.nova_rainbow_view import (
+        cleanup_registered_temp_artifacts,
+        install_exit_cleanup_signal_handlers,
+    )
+
     app = MainApp(
         peaks_h5=peaks_h5,
         images_h5=images_h5,
         instrument=instrument,
     )
-    app.server.start(**kwargs)
+    install_exit_cleanup_signal_handlers(app.pipeline_runner.cancel_active_job)
+    try:
+        app.server.start(**kwargs)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        with contextlib.suppress(Exception):
+            app.pipeline_runner.cancel_active_job()
+        cleanup_registered_temp_artifacts()
 
 
 if __name__ == "__main__":
