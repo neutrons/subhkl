@@ -1082,6 +1082,35 @@ def integrator(
     max_workers: Annotated[
         int | None, typer.Option(help="Maximum number of CPU tasks for visualization.")
     ] = None,
+    tof_gate: Annotated[
+        str,
+        typer.Option(
+            help="Time-of-flight gating, used when the images file carries "
+            "events (reduce --events): each reflection is integrated from "
+            "the events inside a time window around its predicted time of "
+            "flight, with the background taken from time sidebands on the "
+            "same pixels.  'auto' measures the window from the data, "
+            "'lo,hi' sets its edges relative to the predicted time (e.g. "
+            "'-0.01,0.015'), 'off' integrates the whole wavelength band."
+        ),
+    ] = "auto",
+    tof_gate_coverage: Annotated[
+        float,
+        typer.Option(
+            help="Fraction of the stacked Bragg excess the measured gate holds."
+        ),
+    ] = 0.95,
+    tof_gate_search: Annotated[
+        float,
+        typer.Option(help="Half-range of t / t_predicted - 1 searched for the gate."),
+    ] = 0.05,
+    tof_sideband_factor: Annotated[
+        float,
+        typer.Option(
+            help="Length of the background sideband on each side of the "
+            "gate, in units of the gate width."
+        ),
+    ] = 4.0,
 ):
     """
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
@@ -1127,6 +1156,10 @@ def integrator(
         create_visualizations=create_visualizations,
         chunk_size=chunk_size,
         max_workers=max_workers,
+        tof_gate=tof_gate,
+        tof_gate_coverage=tof_gate_coverage,
+        tof_gate_search=tof_gate_search,
+        tof_sideband_factor=tof_sideband_factor,
     )
 
 
@@ -1323,9 +1356,24 @@ def reduce(
     wavelength_max: Annotated[
         float | None, typer.Option(help="Override max wavelength")
     ] = None,
+    store_events: Annotated[
+        bool | None,
+        typer.Option(
+            "--events/--no-events",
+            help="Keep the event times of flight next to the images, sorted "
+            "by pixel, so the integrator can gate each reflection in time. "
+            "Default: on for instruments with a moderator distance (L1) in "
+            "their settings.",
+        ),
+    ] = None,
 ):
     run_reduce(
-        nexus_filename, output_filename, instrument, wavelength_min, wavelength_max
+        nexus_filename,
+        output_filename,
+        instrument,
+        wavelength_min,
+        wavelength_max,
+        store_events=store_events,
     )
 
 
@@ -1353,6 +1401,16 @@ def reduce_batch(
     workers: Annotated[
         int | None, typer.Option(help="Max parallel CPU worker processes")
     ] = None,
+    store_events: Annotated[
+        bool | None,
+        typer.Option(
+            "--events/--no-events",
+            help="Keep the event times of flight next to the images, sorted "
+            "by pixel, so the integrator can gate each reflection in time. "
+            "Default: on for instruments with a moderator distance (L1) in "
+            "their settings.",
+        ),
+    ] = None,
 ):
     os.makedirs(output_dir, exist_ok=True)
     tasks: list[tuple[str, str]] = []
@@ -1368,6 +1426,7 @@ def reduce_batch(
         wavelength_min=wavelength_min,
         wavelength_max=wavelength_max,
         max_workers=workers,
+        store_events=store_events,
     )
 
 

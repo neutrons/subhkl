@@ -8,6 +8,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Time-of-flight gated integration for pulsed-source instruments (MANDI,
+  TOPAZ). `reduce` / `reduce-batch` now keep the event times of flight next to
+  the detector images (`events/tof`, sorted by pixel so the image itself is the
+  index; `--no-events` opts out), and `merge-images` carries them into the
+  merged stack. When the images file has events, `integrator` integrates every
+  predicted reflection from the events inside a time window around its
+  predicted time of flight, with the background measured in time sidebands on
+  the same pixels, using the unchanged 2D Poisson amplitude solve on a small
+  per-reflection tile. The window is measured from the data by stacking the
+  events near all predictions in `t / t_predicted - 1` (`--tof-gate auto`), or
+  set with `--tof-gate lo,hi`; `--tof-gate off` restores the whole-band 2D
+  integration. Harmonics become separate rows with their own intensities, and
+  the output records the gate (`tof_gate`), each row's gate centre
+  (`peaks/tof`) and in-gate background (`peaks/tof_background`).
+
 - Per-step live `mm:ss.ms` stopwatch overlay in the lower-right corner of the
   `Terminal // Stdio` pane (`#stdio-stopwatch`) across `subhkl-nova-app` and
   `rainbow-visualize`, featuring an animated skinny 5-stripe Rainbow Islands

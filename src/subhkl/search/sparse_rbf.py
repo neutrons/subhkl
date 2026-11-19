@@ -728,6 +728,12 @@ def integrate_peaks_rbf_ssn(
     gonio_offsets: np.ndarray = None,
     per_run_trans: np.ndarray = None,
     frame_to_run: np.ndarray = None,
+    event_reader=None,
+    tof_l1: float | None = None,
+    tof_gate=None,
+    tof_gate_coverage: float = 0.95,
+    tof_gate_search: float = 0.05,
+    tof_sideband_factor: float = 4.0,
 ):
     """
     Args:
@@ -735,6 +741,15 @@ def integrate_peaks_rbf_ssn(
         peaks_obj: Instrument mapping object
         sigmas: List of unstretched peak radii
         nominal_sigma: Fallback sigma for crushed peaks
+        event_reader: img_key -> (tof [microsecond], pixel offsets) of that
+            image's pixel-sorted events.  When given (with ``tof_l1``),
+            every predicted reflection is integrated on its own
+            time-of-flight gated tile (see ``subhkl.search.tof_gate``)
+            instead of on the image of the whole wavelength band, and
+            harmonics are separate measurements rather than one multiplet.
+        tof_l1: [m] moderator-to-sample distance
+        tof_gate: a ``TofGate`` with relative edges, or None to measure
+            the gate from the stacked time profile
     Returns:
         res: RBFResult containing intensities and sigI
     """
@@ -748,6 +763,10 @@ def integrate_peaks_rbf_ssn(
             self.var_u, self.var_v, self.cov_uv = [], [], []
             self.peak_rows, self.peak_cols = [], []
             self.image_index = []
+            # Time-of-flight gating only: gate centre [microsecond] and
+            # expected background [photons/Pixel] inside the gate.
+            self.tof, self.tof_bg = [], []
+            self.tof_info = None
 
     res = RBFResult()
     if sample_offset is None:
@@ -917,8 +936,13 @@ def integrate_peaks_rbf_ssn(
         return R_val @ s_off if R_val is not None else s_off
 
     max_sigma = max(sigmas)
+    tof_mode = event_reader is not None
+    if tof_mode and tof_l1 is None:
+        raise ValueError("time-of-flight gating needs the moderator distance L1")
 
     # --- PHASE 1: GATHER AND BATCH ---
+    all_wl = []
+    frame_img_keys = []
     images_list = []
     batched_banks = []
     all_frames = []
@@ -950,7 +974,9 @@ def integrate_peaks_rbf_ssn(
                 continue
 
             g = np.gcd.reduce([abs(h), abs(k), abs(l)])
-            fund_hkl = (h // g, k // g, l // g)
+            # Gated in time, the harmonics of one ray are separate
+            # measurements at their own wavelengths, not one multiplet.
+            fund_hkl = (idx,) if tof_mode else (h // g, k // g, l // g)
 
             if fund_hkl not in unique_peaks:
                 unique_peaks[fund_hkl] = {
@@ -995,6 +1021,7 @@ def integrate_peaks_rbf_ssn(
             peaks_obj.image.ims[img_key], nan=0.0, posinf=0.0, neginf=0.0
         )
         images_list.append(image_raw)
+        frame_img_keys.append(img_key)
         batched_banks.append(peaks_obj.image.bank_mapping.get(img_key, img_key))
 
         for data in keep_data:
@@ -1002,6 +1029,7 @@ def integrate_peaks_rbf_ssn(
             all_frames.append(frame_counter)
             all_rs.append(i_arr[idx])
             all_cs.append(j_arr[idx])
+            all_wl.append(_wl_arr[idx])
 
             meta_harmonics.append(data["harmonic_indices"])  # Save the multiplet list!
             meta_keys.append(img_key)
@@ -1260,23 +1288,60 @@ def integrate_peaks_rbf_ssn(
             static_mask_file, batched_banks, images_batch.shape[1:]
         )
 
-    integrated_results = integrate_reflections_matrix_free(
-        images_batch,
-        frames,
-        all_rs,
-        all_cs,
-        var_us=all_var_u,
-        var_vs=all_var_v,
-        cov_uvs=all_cov_uv,
-        ref_sigma=1.0,
-        max_sigma=max_sigma,
-        static_valid=static_valid,
-        profile=matrix_free_profile,
-        fp_target=matrix_free_fp_target,
-        border_width=border_width,
-        allow_negative=allow_negative,
-        show_progress=show_progress,
-    )
+    tof_info = None
+    if tof_mode:
+        from subhkl.search.tof_gate import (
+            integrate_reflections_tof_gated,
+            predicted_tof,
+        )
+
+        # Flight path of each reflection: moderator to sample, sample to
+        # its pixel (the same sample position the predictions used).
+        wl = np.asarray(all_wl, dtype=np.float64)
+        tof_pred = predicted_tof(wl, tof_l1, all_distances)
+        band = peaks_obj.wavelength
+        integrated_results, tof_info = integrate_reflections_tof_gated(
+            images_batch,
+            lambda f: event_reader(frame_img_keys[f]),
+            frames,
+            all_rs,
+            all_cs,
+            tof_pred,
+            predicted_tof(band.min, tof_l1, all_distances),
+            predicted_tof(band.max, tof_l1, all_distances),
+            var_us=all_var_u,
+            var_vs=all_var_v,
+            cov_uvs=all_cov_uv,
+            gate=tof_gate,
+            gate_coverage=tof_gate_coverage,
+            gate_search=tof_gate_search,
+            sideband_factor=tof_sideband_factor,
+            static_valid=static_valid,
+            profile=matrix_free_profile,
+            fp_target=matrix_free_fp_target,
+            border_width=border_width,
+            allow_negative=allow_negative,
+            show_progress=show_progress,
+        )
+        res.tof_info = tof_info
+    else:
+        integrated_results = integrate_reflections_matrix_free(
+            images_batch,
+            frames,
+            all_rs,
+            all_cs,
+            var_us=all_var_u,
+            var_vs=all_var_v,
+            cov_uvs=all_cov_uv,
+            ref_sigma=1.0,
+            max_sigma=max_sigma,
+            static_valid=static_valid,
+            profile=matrix_free_profile,
+            fp_target=matrix_free_fp_target,
+            border_width=border_width,
+            allow_negative=allow_negative,
+            show_progress=show_progress,
+        )
 
     # --- PHASE 3: GEOMETRY AND METADATA MAPPING ---
     results_by_img = defaultdict(list)
@@ -1373,6 +1438,9 @@ def integrate_peaks_rbf_ssn(
                 res.var_u.append(var_u)
                 res.var_v.append(var_v)
                 res.cov_uv.append(cov_uv)
+                if tof_info is not None:
+                    res.tof.append(float(tof_info["tof"][global_idx]))
+                    res.tof_bg.append(float(tof_info["bg"][global_idx]))
 
     # --- PHASE 4: PARALLEL VISUALIZATION (PER RUN) ---
     if create_visualizations and runs_plot_data:

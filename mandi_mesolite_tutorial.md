@@ -66,6 +66,34 @@ python -m subhkl.io.parser integrator MANDI_11612.reduce.h5 MANDI peak_predictor
 ```
 The `gaussian_fit` method refinements peak centers to sub-pixel accuracy, which is essential for high-quality indexing metrics.
 
+#### Time-of-flight gating
+
+On MANDI, `reduce` also keeps each event's time of flight next to the images
+(`events/tof`; `--no-events` skips this) and `merge-images` carries the events
+into the merged stack. When the images file has events, `integrator` no longer
+integrates a reflection on the image of the whole wavelength band: it uses only
+the events inside a time window around the reflection's predicted time of
+flight and measures the background in time sidebands on the same pixels.
+
+```commandline
+python -m subhkl.io.parser integrator scan_master.h5 MANDI peak_predictor.h5 integrator.h5 --tof-gate auto
+```
+
+- `--tof-gate auto` (default) measures the window from the data. The events
+  near all predicted positions are stacked in `t / t_predicted - 1`; the window
+  is the interval holding `--tof-gate-coverage` (default 0.95) of the Bragg
+  excess. A common offset, as from a cell-scale or flight-path error, is
+  absorbed. If the stack shows no excess the predictions do not line up with
+  the events in time and the command stops with an error.
+- `--tof-gate lo,hi` sets the window edges relative to the predicted time, for
+  example `--tof-gate=-0.01,0.015`.
+- `--tof-gate off` integrates the whole band as before.
+
+Each output row is then one reflection at its own wavelength. `integrator.h5`
+records the window used (`tof_gate`), the stacked time profile it was read
+from, and per row the gate centre (`peaks/tof`, microseconds) and the expected
+background inside the gate (`peaks/tof_background`, counts per pixel).
+
 ### `finder-visualize` / `integrator-visualize`
 
 Both `finder` and `rbf-integrator` can draw an unrolled view of the detector
