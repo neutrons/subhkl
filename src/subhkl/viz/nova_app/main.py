@@ -65,10 +65,6 @@ def main(
         kwargs.setdefault("timeout", 0)
         kwargs.setdefault("open_browser", False)
 
-    from subhkl.viz.rainbow_zones import configure_subhkl_tmpfs_env
-
-    configure_subhkl_tmpfs_env()
-
     app = MainApp(
         peaks_h5=peaks_h5,
         images_h5=images_h5,
