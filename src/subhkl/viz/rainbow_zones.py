@@ -7357,6 +7357,16 @@ def render_rainbow_html(
         if payload.get("rel_border_width") is not None
         else default_rel_border_for_instrument(inst)
     )
+    raw_init_binning = payload.get("solve_binning")
+    init_binning = (
+        str(int(raw_init_binning))
+        if raw_init_binning in (16, 8, 4, "16", "8", "4")
+        else ""
+    )
+    sel_bin_auto = " selected" if init_binning == "" else ""
+    sel_bin_16 = " selected" if init_binning == "16" else ""
+    sel_bin_8 = " selected" if init_binning == "8" else ""
+    sel_bin_4 = " selected" if init_binning == "4" else ""
     sg_symmetry_groups_json = _build_space_group_symmetry_lookup_json()
     ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
     base_tag_html = (
@@ -8331,7 +8341,8 @@ def render_rainbow_html(
     display: flex;
   }}
 
-  .params-drawer input {{
+  .params-drawer input,
+  .params-drawer select {{
     background: var(--bg-card);
     color: var(--text-main);
     border: 1px solid var(--border-color);
@@ -8340,6 +8351,11 @@ def render_rainbow_html(
     font-family: var(--font-display);
     font-size: 0.64rem;
     width: 54px;
+  }}
+
+  .params-drawer select {{
+    width: auto;
+    cursor: pointer;
   }}
 
   .file-dl-pill {{
@@ -8833,6 +8849,7 @@ def render_rainbow_html(
       <span title="Maximum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_max <input id="inp-lmax" type="number" step="0.05" value="{init_wl_max:.2f}" style="width:48px;" /></span>
       <span title="High-resolution cutoff d_min [Å] (synchronized with sidebar slider)">d_min <input id="inp-dmin" type="number" step="0.05" value="{init_dmin:.2f}" style="width:48px;" /></span>
       <span title="Panel border rejection width (fraction of image size; visualized in Mask view)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="{init_border:.3g}" style="width:52px;" /></span>
+      <span title="Solve step spatial pixel binning (auto = default ≤8 keeping ≥32×32 bins/panel)">binning <select id="inp-binning"><option value=""{sel_bin_auto}>auto</option><option value="16"{sel_bin_16}>16</option><option value="8"{sel_bin_8}>8</option><option value="4"{sel_bin_4}>4</option></select></span>
     </div>
     <div id="files-drawer" class="params-drawer"></div>
     <div class="ladder-rungs" id="ladder-rungs"></div>
@@ -9159,7 +9176,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   // Dynamic d_min / wavelength forward-projection & detector LOD state (declared at boot to avoid TDZ)
   const ABS_DMIN_FLOOR = 0.50;
-  const MAX_DYNAMIC_LATTICE_POINTS = 1200000;
+  const MAX_DYNAMIC_LATTICE_POINTS = 2000000;
   const MAX_DYNAMIC_FRAME_PEAKS = 25000;
   const MAX_DYNAMIC_SAMPLE_PEAKS = 16000;
   let _dynPredEpoch = 0;
@@ -9513,8 +9530,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const bLen = Math.max(1.0, vecNorm(bVec));
     const cStar = [ub[0][2], ub[1][2], ub[2][2]];
     const cStar2 = Math.max(1e-10, cStar[0] * cStar[0] + cStar[1] * cStar[1] + cStar[2] * cStar[2]);
-    const hLim = Math.min(256, Math.ceil(aLen * qMax));
-    const kLim = Math.min(256, Math.ceil(bLen * qMax));
+    const hLim = Math.min(512, Math.ceil(aLen * qMax));
+    const kLim = Math.min(512, Math.ceil(bLen * qMax));
+    const hardPoolCap = Math.round(MAX_DYNAMIC_LATTICE_POINTS * 1.05);
     const sgHelper = buildClientSpaceGroupHelper();
 
     const tmpH = [], tmpK = [], tmpL = [], tmpGx = [], tmpGy = [], tmpGz = [], tmpQn = [], tmpD = [];
@@ -9534,8 +9552,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const disc = pDotB3 * pDotB3 - cStar2 * (p2 - qMax2);
         if (disc < 0) continue;
         const sq = Math.sqrt(disc);
-        const lLo = Math.max(-512, Math.ceil((-pDotB3 - sq) / cStar2 - 1e-7));
-        const lHi = Math.min(512, Math.floor((-pDotB3 + sq) / cStar2 + 1e-7));
+        const lLo = Math.max(-1024, Math.ceil((-pDotB3 - sq) / cStar2 - 1e-7));
+        const lHi = Math.min(1024, Math.floor((-pDotB3 + sq) / cStar2 + 1e-7));
         for (let l = lLo; l <= lHi; l++) {{
           if (h === 0 && k === 0 && l === 0) continue;
           if (sgHelper.isAbsent(h, k, l)) continue;
@@ -9548,7 +9566,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           tmpH.push(h); tmpK.push(k); tmpL.push(l);
           tmpGx.push(gx); tmpGy.push(gy); tmpGz.push(gz);
           tmpQn.push(qn); tmpD.push(1.0 / qn);
-          if (tmpD.length >= MAX_DYNAMIC_LATTICE_POINTS) break outerLoop;
+          if (tmpD.length >= hardPoolCap) break outerLoop;
         }}
       }}
     }}
@@ -9596,7 +9614,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }}
     }}
 
-    const effMinD = n >= MAX_DYNAMIC_LATTICE_POINTS && n > 0 ? dArr[n - 1] : buildD;
+    const effMinD = n >= hardPoolCap && n > 0 ? dArr[n - 1] : buildD;
     _dynHklPool = {{
       ubKey, minD: effMinD, count: n, sgHelper,
       hArr, kArr, lArr, gxArr, gyArr, gzArr, qnArr, dArr,
@@ -10194,7 +10212,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         summary: "Paste cell in any field",
       }};
     }}
-    const norm = raw.toLowerCase().replace(/\\s+/g, "");
+    const norm = raw.toLowerCase().replace(/[\\s_]+/g, "");
     if (/^\\d+$/.test(norm)) {{
       const num = parseInt(norm, 10);
       if (num >= 1 && num <= 2) return symmetryRulesForSetting("triclinic", "triclinic");
@@ -11406,6 +11424,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ? rawInpDmin
         : ((Number.isFinite(state.dMin) && state.dMin > 0) ? state.dMin : Number((lminVal * 0.5).toFixed(2))));
     syncDminControls(dminVal);
+    const binEl = document.getElementById("inp-binning");
+    const rawBin = binEl ? parseInt(String(binEl.value || "").trim(), 10) : NaN;
+    const solveBinning = (Number.isFinite(rawBin) && rawBin >= 1) ? rawBin : null;
     return {{
       instrument: DATA.instrument || "CG4D",
       space_group: (sgEl && sgEl.value.trim()) || DATA.space_group || "P 21 21 21",
@@ -11417,6 +11438,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       gamma: getNum("inp-gamma", cell[5]),
       d_min: dminVal,
       rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", defaultRelBorderForInstrument(DATA.instrument)))),
+      binning: solveBinning,
       wavelength_min: lminVal,
       wavelength_max: lmaxVal,
     }};
@@ -18609,6 +18631,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return idx;
   }}
 
+  function syncDataCellFromParamsInputs() {{
+    const sgIn = (document.getElementById("inp-sg")?.value || "").trim();
+    if (sgIn && sgIn !== DATA.space_group) {{
+      DATA.space_group = sgIn;
+      DATA.space_group_ops = null;
+    }}
+    const vals = ["inp-a", "inp-b", "inp-c", "inp-alpha", "inp-beta", "inp-gamma"].map(
+      id => parseFloat(document.getElementById(id)?.value || "")
+    );
+    if (vals.every(v => Number.isFinite(v) && v > 0) && vals[3] < 180 && vals[4] < 180 && vals[5] < 180) {{
+      DATA.cell = vals;
+      syncDminControls(state.dMin);
+    }}
+  }}
+
   function handleUnitCellPasteEvent(ev, prefix = "nd") {{
     const clip = (ev.clipboardData || window.clipboardData);
     if (!clip) return;
@@ -18632,6 +18669,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         badgeEl.textContent = `PASTED • ${{sym.summary}}`;
       }}
     }} else {{
+      syncDataCellFromParamsInputs();
       setStatusLine(
         "[UNIT CELL PASTED]",
         `Filled unit cell <strong>${{parsed.cell.map(v => Number(v).toFixed(2)).join(", ")}}</strong>${{parsed.space_group ? ` (SG: <strong>${{parsed.space_group}}</strong>)` : ""}} from clipboard.`
@@ -18743,6 +18781,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const maybeFull = parseUnitCellClipboardText(inpEl.value);
           if (maybeFull) {{
             applyUnitCellEntryToDialog(maybeFull, "inp");
+            syncDataCellFromParamsInputs();
             return;
           }}
           applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: false, resetManualOverrides: true }});
@@ -18754,6 +18793,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           }}
           mirrorLinkedUnitCellFields("inp", fieldKey);
         }}
+        syncDataCellFromParamsInputs();
       }});
       inpEl.addEventListener("change", () => {{
         if (fieldKey === "sg") {{
@@ -18761,6 +18801,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }} else {{
           mirrorLinkedUnitCellFields("inp", fieldKey);
         }}
+        syncDataCellFromParamsInputs();
       }});
     }}
   }});
@@ -18885,6 +18926,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (s && d && s.value.trim() !== "") d.value = s.value;
       }});
       applyUnitCellSymmetryConstraints("inp", {{ preserveExplicitValues: true }});
+      syncDataCellFromParamsInputs();
       const iptsForHist = (document.getElementById("nd-ipts")?.value || "").trim().replace(/^IPTS-/i, "");
       const runsForHist = (document.getElementById("nd-runs")?.value || "").trim();
       const histLbl = iptsForHist ? `IPTS-${{iptsForHist}}${{runsForHist ? " #" + runsForHist : ""}}` : "Load Neutron Data";

@@ -2222,6 +2222,12 @@ class NovaGalaxyPipelineRunner:
         }
         if stage_id == "solve":
             wl_r = params.get("wavelength_range")
+            raw_bin = params.get("binning")
+            solve_binning = (
+                int(raw_bin)
+                if raw_bin not in (None, "", "auto", "default") and int(raw_bin) >= 1
+                else None
+            )
             job_record["solve_params"] = {
                 "instrument": str(params.get("instrument") or "CG4D"),
                 "space_group": str(params.get("space_group") or "P 1"),
@@ -2234,6 +2240,7 @@ class NovaGalaxyPipelineRunner:
                 "d_min": (
                     float(params["d_min"]) if params.get("d_min") is not None else None
                 ),
+                "binning": solve_binning,
             }
         self.active_job = job_record
         self._sync_job_timing(job_record)
@@ -3217,6 +3224,14 @@ class NovaGalaxyPipelineRunner:
 
             if stage_id == "solve":
                 d_min_solve = float(params.get("d_min") or round(0.5 * float(wl[0]), 2))
+                raw_bin = params.get("binning")
+                solve_binning = (
+                    int(raw_bin)
+                    if raw_bin not in (None, "", "auto", "default")
+                    and int(raw_bin) >= 1
+                    else None
+                )
+                refinement_mode = str(params.get("objective", "band"))
                 job_record["images_h5_path"] = merged_path
                 job_record["solve_params"] = {
                     "instrument": str(inst),
@@ -3224,6 +3239,7 @@ class NovaGalaxyPipelineRunner:
                     "cell": [float(x) for x in raw_cell[:6]],
                     "wavelength_range": (float(wl[0]), float(wl[1])),
                     "d_min": d_min_solve,
+                    "binning": solve_binning,
                 }
                 primary_tool = "imaginex_subhkl_solve"
                 scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
@@ -3239,9 +3255,14 @@ class NovaGalaxyPipelineRunner:
                     "gamma": float(raw_cell[5]),
                     "wavelengthMin": float(wl[0]),
                     "wavelengthMax": float(wl[1]),
-                    "refinement": str(params.get("objective", "band")),
+                    "refinement": refinement_mode,
                     "dMin": d_min_solve,
                 }
+                if solve_binning is not None:
+                    if refinement_mode == "band":
+                        tool_inputs["bandBinning"] = solve_binning
+                    else:
+                        tool_inputs["poissonBinning"] = solve_binning
             elif stage_id == "integrate":
                 primary_tool = "imaginex_subhkl_predict"
                 scan_id = self._ensure_galaxy_h5_dataset(store, merged_path, job_record)
@@ -5557,6 +5578,12 @@ class NovaGalaxyPipelineRunner:
             ]
             if str(params.get("objective", "band")) == "band" and refine_modes_str:
                 inner_cmd.extend(["--refine-modes", refine_modes_str])
+            raw_bin_local = params.get("binning")
+            if (
+                raw_bin_local not in (None, "", "auto", "default")
+                and int(raw_bin_local) >= 1
+            ):
+                inner_cmd.extend(["--binning", str(int(raw_bin_local))])
         elif (
             stage_id == "integrate"
             and os.path.isfile(merged_path)
@@ -5988,6 +6015,13 @@ class NovaGalaxyPipelineRunner:
             self._active_procs = {}
 
         if stage_id == "solve":
+            raw_bin_rec = params.get("binning")
+            solve_bin_rec = (
+                int(raw_bin_rec)
+                if raw_bin_rec not in (None, "", "auto", "default")
+                and int(raw_bin_rec) >= 1
+                else None
+            )
             job_record["images_h5_path"] = merged_path
             job_record["solve_params"] = {
                 "instrument": str(inst),
@@ -5995,6 +6029,7 @@ class NovaGalaxyPipelineRunner:
                 "cell": [float(x) for x in raw_cell[:6]],
                 "wavelength_range": (float(wl[0]), float(wl[1])),
                 "d_min": float(params.get("d_min") or round(0.5 * float(wl[0]), 2)),
+                "binning": solve_bin_rec,
             }
 
         def _stream_proc() -> None:

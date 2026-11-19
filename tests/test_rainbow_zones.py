@@ -5574,6 +5574,33 @@ const mandiPred380 = PEAKS.map(p => ({{
   col: p.col,
 }}));
 
+// 5. Verify P 6_1 22 (a=b=79.91, c=238.0) hexagonal symmetry + relaxed ~15% d_min floor (~1.41 A vs old 1.67 A)
+const inpSgNode = getEl("inp-sg");
+const inpANode = getEl("inp-a");
+const inpCNode = getEl("inp-c");
+inpSgNode.value = "P 6_1 22";
+inpSgNode.dispatchEvent({{ type: "change", target: inpSgNode }});
+inpANode.value = "79.91";
+inpANode.dispatchEvent({{ type: "input", target: inpANode }});
+inpCNode.value = "238.0";
+inpCNode.dispatchEvent({{ type: "change", target: inpCNode }});
+const p6122Floor = getDynamicDminFloor();
+const p6122Gamma = parseFloat(getEl("inp-gamma").value);
+inpDminNode.value = "1.45";
+inpDminNode.dispatchEvent({{ type: "change", target: inpDminNode }});
+const p6122Allowed145 = state.dMin;
+
+// 6. Verify #inp-binning in Params drawer defaults to auto (null) and forwards 16, 8, 4
+const inpBinNode = getEl("inp-binning");
+inpBinNode.value = "";
+const paramsAutoBin = collectWorkflowParams().binning;
+inpBinNode.value = "16";
+const paramsBin16 = collectWorkflowParams().binning;
+inpBinNode.value = "8";
+const paramsBin8 = collectWorkflowParams().binning;
+inpBinNode.value = "4";
+const paramsBin4 = collectWorkflowParams().binning;
+
 require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
   protFloor,
   sliderMinAttr,
@@ -5614,6 +5641,13 @@ require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
   minWlObserved,
   hugeCellFloor,
   mandiPred380,
+  p6122Floor,
+  p6122Gamma,
+  p6122Allowed145,
+  paramsAutoBin,
+  paramsBin16,
+  paramsBin8,
+  paramsBin4,
 }}));
 }})();
 process.exit(0);
@@ -5624,12 +5658,19 @@ process.exit(0);
     subprocess.run(["node", str(js_file)], capture_output=True, text=True, check=True)
     out = json.loads(out_json_path.read_text(encoding="utf-8"))
 
-    # A. Verify finite unit-cell-volume-aware d_min safety floor scaling
-    assert 0.90 <= out["protFloor"] <= 1.20
+    # A. Verify finite unit-cell-volume-aware d_min safety floor scaling (relaxed ~15%)
+    assert 0.75 <= out["protFloor"] <= 1.05
     assert abs(out["sliderMinAttr"] - out["protFloor"]) < 1e-6
     assert abs(out["clampedBelowFloor"] - out["protFloor"]) < 1e-6
     assert out["hugeCellFloor"] > out["protFloor"] + 1.0
-    assert 2.20 <= out["hugeCellFloor"] <= 2.80
+    assert 1.95 <= out["hugeCellFloor"] <= 2.40
+    assert out["p6122Gamma"] == 120.0
+    assert 1.40 <= out["p6122Floor"] <= 1.43
+    assert abs(out["p6122Allowed145"] - 1.45) < 1e-6
+    assert out["paramsAutoBin"] is None
+    assert out["paramsBin16"] == 16
+    assert out["paramsBin8"] == 8
+    assert out["paramsBin4"] == 4
 
     # B. Verify auto-switch from 'integrated' -> 'predicted' when dragging d_min below integrated cutoff
     assert out["initialPeakSource"] == "integrated"
@@ -6738,3 +6779,64 @@ console.log(JSON.stringify({{
     assert dl_html is not None and dl_html[1] == "merge_table.html"
     assert "resolution_range_A" in Path(dl_csv[0]).read_text(encoding="utf-8")
     assert ">Copy</button>" in Path(dl_html[0]).read_text(encoding="utf-8")
+
+
+def test_solve_binning_param_drawer_and_cli_forwarding(tmp_path):
+    """Params drawer exposes Solve binning (auto, 16, 8, 4) and forwards --binning only when explicitly chosen."""
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    payload = build_rainbow_zone_payload()
+    html_default = render_rainbow_html(payload)
+    assert (
+        '<select id="inp-binning"><option value="" selected>auto</option>'
+        '<option value="16">16</option><option value="8">8</option>'
+        '<option value="4">4</option></select>'
+    ) in html_default
+
+    payload_b16 = dict(payload, solve_binning=16)
+    html_b16 = render_rainbow_html(payload_b16)
+    assert '<option value="16" selected>16</option>' in html_b16
+
+    merged_h5 = tmp_path / "merged.h5"
+    with h5py.File(merged_h5, "w") as hf:
+        hf.create_dataset("images/ims", data=np.zeros((1, 256, 256), dtype=np.float32))
+
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner._local_work_dir = str(tmp_path)
+
+    base_params = {
+        "instrument": "MANDI",
+        "space_group": "P 6_1 22",
+        "a": 79.91,
+        "b": 79.91,
+        "c": 238.0,
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 120.0,
+        "wavelength_min": 2.0,
+        "wavelength_max": 4.0,
+        "d_min": 1.45,
+        "images_file": str(merged_h5),
+    }
+
+    rec_auto = {"cancel_requested": True}
+    runner._submit_local_subhkl_stage(
+        "solve", dict(base_params, binning=None), existing_job_record=rec_auto
+    )
+    assert "--binning" not in rec_auto["command_line"]
+    assert rec_auto["solve_params"]["binning"] is None
+
+    for b_val in (16, 8, 4):
+        rec_b = {"cancel_requested": True}
+        runner._submit_local_subhkl_stage(
+            "solve", dict(base_params, binning=b_val), existing_job_record=rec_b
+        )
+        assert f"--binning {b_val}" in rec_b["command_line"]
+        assert rec_b["solve_params"]["binning"] == b_val
