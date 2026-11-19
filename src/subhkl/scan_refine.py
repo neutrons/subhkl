@@ -137,6 +137,23 @@ def _parse_rot_axis(axis):
     return tuple(float(v) for v in unit)
 
 
+def default_band_binning(
+    n_rows: int, n_cols: int, min_bins: int = 32, max_binning: int = 8
+) -> int:
+    """Choose spatial binning from panel dimensions so each panel keeps >= 32x32 bins."""
+    import math
+
+    g = math.gcd(int(n_rows), int(n_cols))
+    cap = min(
+        int(max_binning),
+        max(1, min(int(n_rows), int(n_cols)) // int(min_bins)),
+    )
+    for b in range(cap, 0, -1):
+        if g % b == 0:
+            return b
+    return 1
+
+
 def run_scan_refinement(
     frames,
     output,
@@ -155,7 +172,7 @@ def run_scan_refinement(
     d_min=2.0,
     min_deviance=100.0,
     pixel_polish=False,
-    binning=16,
+    binning=None,
     maxiter=600,
     static_mask_file=None,
     search_samples=16384,
@@ -268,6 +285,8 @@ def run_scan_refinement(
             int(img_shape[1]),
             int(img_shape[2]),
         )
+        if binning is None:
+            binning = default_band_binning(n_rows, n_cols)
         if binning < 1 or n_rows % binning or n_cols % binning:
             raise ValueError(
                 f"band binning ({binning}) must divide the detector size ({n_rows}x{n_cols})"
