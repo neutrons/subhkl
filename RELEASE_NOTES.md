@@ -4,6 +4,18 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1]
+
+### Fixed
+
+- Time-of-flight gated integration took the wavelength band from the images
+  file, which only records the instrument default written at reduce time. When
+  the choppers ran a different band (e.g. MANDI at 1–3 Å instead of 2–4 Å),
+  every predicted reflection outside the default band was dropped as
+  unobserved. The band now comes from the predictions (`instrument/wavelength`
+  of the predictor file) and is always widened to hold every predicted
+  wavelength; the integrator prints the band it uses.
+
 ## [1.6.0]
 
 ### Added
