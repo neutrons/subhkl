@@ -4366,6 +4366,7 @@ def _extract_from_h5(
         if run_index is None:
             run_index = np.zeros(n_peaks, dtype=int)
 
+        has_tof_data = _h5_has_tof_data(h5_path, src_h5)
         return {
             "instrument": instrument,
             "ki": ki,
@@ -4399,6 +4400,7 @@ def _extract_from_h5(
             "predicted_frame_data": predicted_frame_data,
             "predicted_all_runs_data": predicted_all_runs_data,
             "has_predictor_h5": has_predictor_h5,
+            "has_tof_data": has_tof_data,
             "R_per_run_all": R_per_run_all,
             "R_gonio": R_gonio,
             "s_lab_per_run_all": s_lab_per_run_all,
@@ -4410,6 +4412,48 @@ def _extract_from_h5(
             "frames": frames_meta,
             "frame_index": active_frame,
         }
+
+
+def _h5_has_tof_data(*candidates: str | os.PathLike[str] | None) -> bool:
+    """Return True if any candidate HDF5 (or its linked ``source`` HDF5) carries TOF events or TOF-gated peaks."""
+    import h5py
+
+    seen: set[str] = set()
+    queue: list[str] = [str(p) for p in candidates if p and os.path.isfile(str(p))]
+    while queue:
+        cur = os.path.abspath(queue.pop(0))
+        if cur in seen or not os.path.isfile(cur):
+            continue
+        seen.add(cur)
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(cur, "r") as hf,
+        ):
+            if (
+                "tof_gate" in hf
+                or "peaks/tof" in hf
+                or ("events/tof" in hf and "events/image_offsets" in hf)
+            ):
+                return True
+            if "entry" in hf:
+                entry = hf["entry"]
+                if isinstance(entry, h5py.Group):
+                    for sub_k, sub_v in entry.items():
+                        if isinstance(sub_v, h5py.Group) and (
+                            "event_time_offset" in sub_v
+                            or (str(sub_k).endswith("_events") and "event_id" in sub_v)
+                        ):
+                            return True
+            src_attr = hf.attrs.get("source")
+            if src_attr:
+                src_str = (
+                    src_attr.decode("utf-8", errors="ignore")
+                    if isinstance(src_attr, (bytes, np.bytes_))
+                    else str(src_attr)
+                ).strip()
+                if src_str and os.path.isfile(src_str):
+                    queue.append(src_str)
+    return False
 
 
 def _build_lattice_ladder_steps(
@@ -6534,6 +6578,7 @@ def build_rainbow_zone_payload(
     predicted_frame_data: dict[str, np.ndarray] | None = None
     predicted_all_runs_data: dict[str, Any] | None = None
     has_predictor_h5 = False
+    has_tof_data = False
     R_per_run_all: dict[int, np.ndarray] = {}
     solve_diagnostics = None
     pixel_class_by_bank: dict[int, np.ndarray] | None = None
@@ -6592,6 +6637,7 @@ def build_rainbow_zone_payload(
         predicted_frame_data = extracted.get("predicted_frame_data")
         predicted_all_runs_data = extracted.get("predicted_all_runs_data")
         has_predictor_h5 = bool(extracted.get("has_predictor_h5"))
+        has_tof_data = bool(extracted.get("has_tof_data"))
         R_per_run_all = dict(extracted.get("R_per_run_all") or {})
         s_lab_per_run_all = dict(extracted.get("s_lab_per_run_all") or {})
         s_lab_single = np.asarray(
@@ -6620,6 +6666,7 @@ def build_rainbow_zone_payload(
     else:
         s_lab_per_run_all = {}
         s_lab_single = np.zeros(3, dtype=float)
+    has_tof_data = bool(has_tof_data or _h5_has_tof_data(replay_h5, images_h5))
     if wavelength_range is None:
         wavelength_range = _get_instrument_default_wavelength(instrument)
 
@@ -7295,6 +7342,7 @@ def build_rainbow_zone_payload(
         "sample_offset_lab_per_run": sample_offset_per_run_payload,
         "frames": frames_meta,
         "images_h5": str(images_h5) if images_h5 else None,
+        "has_tof_data": bool(has_tof_data),
         "cell": [round(float(x), 4) for x in cell] if cell else None,
         "u_matrix": (
             [[round(float(v), 8) for v in row] for row in np.asarray(U, dtype=float)]
@@ -11439,6 +11487,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       d_min: dminVal,
       rel_border_width: Math.max(0.0, Math.min(0.25, getNum("inp-border", defaultRelBorderForInstrument(DATA.instrument)))),
       binning: solveBinning,
+      has_tof_data: Boolean(DATA.has_tof_data),
+      merge_mode: DATA.has_tof_data ? "mono" : "poly",
       wavelength_min: lminVal,
       wavelength_max: lmaxVal,
     }};
@@ -15588,6 +15638,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (newPayload.detector_configs) DATA.detector_configs = newPayload.detector_configs;
     if (newPayload.space_group_ops) DATA.space_group_ops = newPayload.space_group_ops;
     if (Array.isArray(newPayload.ki)) DATA.ki = newPayload.ki;
+    if (typeof newPayload.has_tof_data === "boolean") DATA.has_tof_data = newPayload.has_tof_data;
     DATA.mtz_overlay_name = newPayload.mtz_overlay_name || null;
     DATA.mtz_overlay_reflections = newPayload.mtz_overlay_reflections || 0;
     DATA.mtz_overlay_matched = newPayload.mtz_overlay_matched || 0;
@@ -16563,6 +16614,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       {{ rung: 4, stage: "4. 120→400 Zone + Cell", subtitle: "Higher-order zones + cell ratios", active_zones: zonesOut.slice(0, 12).map(z => z.zone_id), n_captured: Math.round(peaksOut.length * 0.92), description: "Staged 120→400 zone-band refinement co-refines axial stretch, ω drift, and unit-cell ratios." }},
       {{ rung: 5, stage: "5. Converged Solve UB", subtitle: `${{sg}} • a=${{cell[0].toFixed(1)}}, b=${{cell[1].toFixed(1)}}, c=${{cell[2].toFixed(1)}} Å`, active_zones: ord1Ids.length ? ord1Ids : zonesOut.map(z => z.zone_id), n_captured: peaksOut.length, description: `Converged 3D UB orientation (${{peaksOut.length}} forward-projected spots with SNR ≥ 3.0).` }},
     ];
+    const _clientH5HasTof = (hf) => {{
+      if (!hf) return false;
+      try {{
+        const ks = hf.keys();
+        if (ks.includes("tof_gate")) return true;
+        if (ks.includes("peaks") && hf.get("peaks").keys().includes("tof")) return true;
+        if (ks.includes("events") && hf.get("events").keys().includes("tof")) return true;
+      }} catch (_te) {{}}
+      return false;
+    }};
+    const hasTofData = _clientH5HasTof(f) || _clientH5HasTof(mf);
     try {{ f.close(); if (mf && mf !== f) mf.close(); }} catch (_e) {{}}
     const clientDetConfigs = {{}};
     detMap.forEach((dCfg, bid) => {{
@@ -16585,6 +16647,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       intensity_source: bankImgs.size > 0 ? "raw_h5" : "reconstructed",
       artifact_kind: artifactKind,
       peak_shape_mode: peakShapeMode,
+      has_tof_data: hasTofData,
       wavelength_range: wlRangeNew,
       d_min: dMinNew,
       goniometer_R: Rrun,
@@ -19920,6 +19983,23 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             d_min: params.d_min,
             wavelength_min: params.wavelength_min,
             wavelength_max: params.wavelength_max,
+          }};
+        }} else if (stageId === "merge") {{
+          const mtzDs = [...galaxyBridge.datasets].reverse().find(
+            d => d.state === "ok" && (
+              (d.extension || "").toLowerCase() === "mtz" ||
+              /reflections\\.mtz|unmerged.*\\.mtz$/i.test(d.name || "")
+            ) && !/^(merged|predictions|xval|careless_0|careless_predictions_0|careless_xval_0)\\.mtz$/i.test(d.name || "")
+          );
+          if (!mtzDs) throw new Error("Need unmerged reflections.mtz in Galaxy History");
+          toolId = "imaginex_subhkl_merge";
+          inputs = {{
+            reflections: {{ src: "hda", id: mtzDs.id }},
+            mode: params.merge_mode || (DATA.has_tof_data ? "mono" : "poly"),
+            iterations: 10000,
+            studenttDof: 4.0,
+            mergeHalfDatasets: true,
+            anomalous: false,
           }};
         }} else {{
           if (!mergedDs) throw new Error("No HDF5 dataset in Galaxy History");

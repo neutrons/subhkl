@@ -341,6 +341,17 @@ class SubhklGalaxyModel:
                 "d_min": self.data.d_min,
                 "n_zones": self.data.n_zones,
             }
+        if stage == "merge":
+            from subhkl.viz.rainbow_zones import _h5_has_tof_data
+
+            has_tof = _h5_has_tof_data(self.data.peaks_file, self.data.images_file)
+            return {
+                "mode": "mono" if has_tof else "poly",
+                "iterations": 10000,
+                "studenttDof": 4.0,
+                "mergeHalfDatasets": True,
+                "anomalous": False,
+            }
         return {
             "instrument": self.data.instrument.value,
             "space_group": self.data.space_group,

@@ -2186,6 +2186,40 @@ class NovaGalaxyPipelineRunner:
                 return str(doc.get("version") or "")
         return ""
 
+    def _resolve_careless_merge_mode(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        work_dir: str = "",
+        merged_path: str = "",
+        solve_path: str = "",
+        integrated_path: str = "",
+    ) -> str:
+        """Choose ``'mono'`` whenever TOF data is available in workflow artifacts, else ``'poly'``."""
+        from subhkl.viz.rainbow_zones import _h5_has_tof_data
+
+        pdict = params or {}
+        if _h5_has_tof_data(
+            integrated_path,
+            os.path.join(work_dir, "integrated.h5") if work_dir else None,
+            os.path.join(work_dir, "integrator.h5") if work_dir else None,
+            pdict.get("peaks_file"),
+            pdict.get("images_file"),
+            merged_path,
+            os.path.join(work_dir, "merged.h5") if work_dir else None,
+            solve_path,
+            getattr(self, "replay_h5", None),
+        ):
+            return "mono"
+        if bool(pdict.get("has_tof_data")):
+            return "mono"
+        explicit = (
+            str(pdict.get("merge_mode") or pdict.get("mode") or "").strip().lower()
+        )
+        if explicit in ("mono", "poly"):
+            return explicit
+        return "poly"
+
     def submit_galaxy_stage(
         self,
         stage_id: str,
@@ -3505,8 +3539,21 @@ class NovaGalaxyPipelineRunner:
                     force_upload=True,
                     file_ext="mtz",
                 )
+                merge_mode = self._resolve_careless_merge_mode(
+                    params,
+                    work_dir=work_dir,
+                    merged_path=merged_path,
+                    solve_path=solve_path,
+                )
+                if merge_mode == "mono":
+                    _merge_ver = self._get_tool_version("imaginex_subhkl_merge")
+                    if _merge_ver in ("0.1.0", "0.1.0-dev", "0.1.1", "0.1.2"):
+                        raise RuntimeError(
+                            f"imaginex_subhkl_merge {_merge_ver} on {self.galaxy_url} lacks monochromatic ('mono') mode for TOF data"
+                        )
                 tool_inputs = {
                     "reflections": {"src": "hda", "id": mtz_id},
+                    "mode": merge_mode,
                     "iterations": int(params.get("iterations") or 10000),
                     "studenttDof": float(params.get("studentt_dof") or 4.0),
                     "mergeHalfDatasets": True,
@@ -5671,20 +5718,25 @@ class NovaGalaxyPipelineRunner:
             )
             inner_cmd = ["bash", "-c", chained]
         elif stage_id == "merge":
+            replay_src = getattr(self, "replay_h5", None)
             if not os.path.isfile(mtz_dest):
-                alt_mtz = os.path.join(
-                    os.path.dirname(os.path.abspath(self.replay_h5)),
-                    "reflections.mtz",
+                alt_mtz = (
+                    os.path.join(
+                        os.path.dirname(os.path.abspath(replay_src)),
+                        "reflections.mtz",
+                    )
+                    if replay_src
+                    else ""
                 )
-                if os.path.isfile(alt_mtz):
+                if alt_mtz and os.path.isfile(alt_mtz):
                     shutil.copy2(alt_mtz, mtz_dest)
                 else:
                     src_int = (
                         integrated_dest
                         if os.path.isfile(integrated_dest)
-                        else self.replay_h5
+                        else (replay_src or "")
                     )
-                    if os.path.isfile(src_int):
+                    if src_int and os.path.isfile(src_int):
                         with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                             from subhkl.io.export import MTZExporter
 
@@ -5704,6 +5756,13 @@ class NovaGalaxyPipelineRunner:
             wilson_b = float(params.get("wilson_prior_b") or 40.0)
             spectral_file = str(params.get("spectral_file") or "").strip()
             lorentz_corr = bool(params.get("lorentz_correction", bool(spectral_file)))
+            merge_mode = self._resolve_careless_merge_mode(
+                params,
+                work_dir=work_dir,
+                merged_path=merged_path,
+                solve_path=solve_path,
+                integrated_path=integrated_dest,
+            )
             merge_work = os.path.join(work_dir, "careless_work")
             os.makedirs(merge_work, exist_ok=True)
             unmerged_mtz = os.path.join(merge_work, "input_unmerged.mtz")
@@ -5748,7 +5807,7 @@ class NovaGalaxyPipelineRunner:
                 f"shutil.copy2({(out_prefix + '_predictions_0.mtz')!r}, {pred_mtz_out!r})\n"
                 f"if os.path.exists({(out_prefix + '_xval_0.mtz')!r}):\n"
                 f"    shutil.copy2({(out_prefix + '_xval_0.mtz')!r}, {xval_mtz_out!r})\n"
-                "summary = {'status': 'ok'}\n"
+                f"summary = {{'status': 'ok', 'mode': {merge_mode!r}}}\n"
                 f"mtz = gemmi.read_mtz_file({merged_mtz_out!r})\n"
                 "cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}\n"
                 "I = cols.get('I', cols.get('I(+)', np.array([])))\n"
@@ -5829,10 +5888,11 @@ class NovaGalaxyPipelineRunner:
             elif lorentz_corr:
                 careless_extra_flags.append("--lorentz-correction")
             extra_flags_str = " ".join(careless_extra_flags)
+            wavel_key_flag = "--wavelength-key=WAVEL " if merge_mode == "poly" else ""
             chained_merge = (
                 f"set -e; "
                 f"MKEYS=$(python {shlex.quote(prep_script)}) && "
-                f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} {extra_flags_str} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
+                f'careless {merge_mode} --jit-compile --iterations={careless_iters} --merge-half-datasets {wavel_key_flag}--studentt-likelihood-dof={studentt_dof} {extra_flags_str} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
                 f"python {shlex.quote(post_script)}"
             )
             inner_cmd = ["bash", "-c", chained_merge]

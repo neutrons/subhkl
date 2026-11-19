@@ -6840,3 +6840,297 @@ def test_solve_binning_param_drawer_and_cli_forwarding(tmp_path):
         )
         assert f"--binning {b_val}" in rec_b["command_line"]
         assert rec_b["solve_params"]["binning"] == b_val
+
+
+def test_careless_mono_mode_auto_selected_for_tof_without_ui_selector(
+    tmp_path,
+) -> None:
+    """Verify UI has no mono/poly selector and automatically selects careless mono (without --wavelength-key, keeping WAVEL in metadata) whenever TOF data is available."""
+    import json
+    import re
+    import subprocess
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        _h5_has_tof_data,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    def _write_dummy_mtz(mtz_path: Path) -> None:
+        mtz = gemmi.Mtz(with_base=True)
+        mtz.spacegroup = gemmi.find_spacegroup_by_name("I a -3 d")
+        mtz.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90.0, 90.0, 90.0))
+        mtz.add_dataset("garnet")
+        mtz.add_column("M/ISYM", "Y")
+        mtz.add_column("BATCH", "B")
+        mtz.add_column("I", "J")
+        mtz.add_column("SIGI", "Q")
+        mtz.add_column("WAVEL", "R")
+        mtz.add_column("THETA", "R")
+        mtz.add_column("PHI", "R")
+        mtz.set_data(
+            np.array(
+                [
+                    [4.0, 0.0, 0.0, 1.0, 1001.0, 150.0, 8.0, 1.49, 0.42, 1.10],
+                    [8.0, 0.0, 0.0, 1.0, 1001.0, 90.0, 6.0, 2.98, 0.42, 1.10],
+                ],
+                dtype=np.float32,
+            )
+        )
+        mtz.write_to_file(str(mtz_path))
+
+    # 1. Non-TOF workdir (e.g. CG4D image-only scan) -> has_tof_data is False -> careless poly + --wavelength-key=WAVEL
+    poly_dir = tmp_path / "work_poly"
+    poly_dir.mkdir()
+    poly_merged = poly_dir / "merged.h5"
+    with h5py.File(poly_merged, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf.create_dataset("images", data=np.zeros((1, 32, 32), dtype=np.float32))
+        hf.create_dataset("bank_ids", data=np.array([20], dtype=np.int32))
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.8, 4.5], dtype=np.float64)
+        )
+    poly_integ = poly_dir / "integrated.h5"
+    with h5py.File(poly_integ, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf.attrs["source"] = str(poly_merged)
+        smp = hf.create_group("sample")
+        smp.create_dataset("U", data=np.eye(3))
+        smp.create_dataset("B", data=np.diag([1.0 / 54.0] * 3))
+        pk = hf.create_group("peaks")
+        pk.create_dataset("h", data=np.array([1], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([0], dtype=np.int32))
+        pk.create_dataset("lambda", data=np.array([3.2], dtype=np.float64))
+        pk.create_dataset("intensity", data=np.array([100.0], dtype=np.float64))
+        pk.create_dataset("sigma", data=np.array([5.0], dtype=np.float64))
+        pk.create_dataset("bank", data=np.array([20], dtype=np.int32))
+        pk.create_dataset("pixel_r", data=np.array([16.0], dtype=np.float64))
+        pk.create_dataset("pixel_c", data=np.array([16.0], dtype=np.float64))
+        pk.create_dataset("xyz", data=np.array([[0.1, 0.0, 0.9]], dtype=np.float64))
+    _write_dummy_mtz(poly_dir / "reflections.mtz")
+
+    assert _h5_has_tof_data(poly_merged, poly_integ) is False
+    payload_poly = build_rainbow_zone_payload(
+        replay_h5=poly_integ, images_h5=poly_merged, include_panel_images=False
+    )
+    assert payload_poly["has_tof_data"] is False
+
+    # 2. TOF workdir (MANDI Ia-3d garnet 1-3 A with pixel-sorted events/tof + tof_gate) -> has_tof_data is True -> careless mono
+    mono_dir = tmp_path / "work_mono"
+    mono_dir.mkdir()
+    mono_merged = mono_dir / "merged.h5"
+    with h5py.File(mono_merged, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_dataset("images", data=np.zeros((1, 32, 32), dtype=np.float32))
+        hf.create_dataset("bank_ids", data=np.array([19], dtype=np.int32))
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.0, 3.0], dtype=np.float64)
+        )
+        ev = hf.create_group("events")
+        ev.create_dataset("tof", data=np.array([11500.0, 23000.0], dtype=np.float32))
+        ev.create_dataset("image_offsets", data=np.array([0, 2], dtype=np.int64))
+    mono_solve = mono_dir / "solve.h5"
+    with h5py.File(mono_solve, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.attrs["source"] = str(mono_merged)
+        smp = hf.create_group("sample")
+        smp.create_dataset("U", data=np.eye(3))
+        smp.create_dataset("B", data=np.diag([1.0 / 11.93] * 3))
+    mono_integ = mono_dir / "integrated.h5"
+    with h5py.File(mono_integ, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.attrs["source"] = str(mono_merged)
+        smp = hf.create_group("sample")
+        smp.create_dataset("U", data=np.eye(3))
+        smp.create_dataset("B", data=np.diag([1.0 / 11.93] * 3))
+        tg = hf.create_group("tof_gate")
+        tg.attrs["mode"] = "tof_gated_3d"
+        pk = hf.create_group("peaks")
+        pk.create_dataset("h", data=np.array([4, 8], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("lambda", data=np.array([2.98, 1.49], dtype=np.float64))
+        pk.create_dataset("tof", data=np.array([23000.0, 11500.0], dtype=np.float64))
+        pk.create_dataset("intensity", data=np.array([150.0, 90.0], dtype=np.float64))
+        pk.create_dataset("sigma", data=np.array([8.0, 6.0], dtype=np.float64))
+        pk.create_dataset("bank", data=np.array([19, 19], dtype=np.int32))
+        pk.create_dataset("pixel_r", data=np.array([16.0, 16.0], dtype=np.float64))
+        pk.create_dataset("pixel_c", data=np.array([16.0, 16.0], dtype=np.float64))
+        pk.create_dataset(
+            "xyz",
+            data=np.array([[0.2, 0.0, 0.4], [0.2, 0.0, 0.4]], dtype=np.float64),
+        )
+    _write_dummy_mtz(mono_dir / "reflections.mtz")
+
+    assert _h5_has_tof_data(mono_merged) is True
+    assert _h5_has_tof_data(mono_solve) is True  # resolves via attrs['source']
+    assert _h5_has_tof_data(mono_integ) is True
+    payload_mono = build_rainbow_zone_payload(
+        replay_h5=mono_integ, images_h5=mono_merged, include_panel_images=False
+    )
+    assert payload_mono["has_tof_data"] is True
+
+    # 3. Verify UI has NO mono/poly selector, and collectWorkflowParams() auto-selects mono iff DATA.has_tof_data
+    html_mono = render_rainbow_html(payload_mono)
+    assert "inp-careless-mode" not in html_mono
+    assert "inp-merge-mode" not in html_mono
+    assert 'id="inp-mode"' not in html_mono
+    m_collect = re.search(
+        r"function collectWorkflowParams\(\)\s*\{[\s\S]*?\n  \}", html_mono
+    )
+    assert m_collect is not None
+    js_eval = f"""
+const state = {{ dMin: 1.2, lamMin: 1.0, lamMax: 3.0 }};
+const inpDminEl = null;
+const slDmin = null;
+function getDefaultWavelengthForInstrument() {{ return [2.0, 4.0]; }}
+function syncDminControls() {{}}
+function defaultRelBorderForInstrument() {{ return 0.0; }}
+globalThis.document = {{ getElementById: () => null, activeElement: null }};
+let DATA = {{ has_tof_data: false, instrument: "CG4D", space_group: "P 21 21 21", cell: [54,54,54,90,90,90], d_min: 1.4, wavelength_range: [2.8, 4.5] }};
+{m_collect.group(0)}
+const pPoly = collectWorkflowParams();
+DATA = {{ has_tof_data: true, instrument: "MANDI", space_group: "I a -3 d", cell: [11.93,11.93,11.93,90,90,90], d_min: 1.0, wavelength_range: [1.0, 3.0] }};
+const pMono = collectWorkflowParams();
+console.log(JSON.stringify({{ pPoly, pMono }}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", js_eval], check=True, capture_output=True, text=True
+    )
+    js_res = json.loads(proc.stdout.strip())
+    assert js_res["pPoly"]["has_tof_data"] is False
+    assert js_res["pPoly"]["merge_mode"] == "poly"
+    assert js_res["pMono"]["has_tof_data"] is True
+    assert js_res["pMono"]["merge_mode"] == "mono"
+
+    # 4. Verify SubhklGalaxyModel.build_tool_parameters("merge")
+    m_sub = SubhklGalaxyModel()
+    m_sub.data.peaks_file = str(poly_integ)
+    m_sub.data.images_file = str(poly_merged)
+    assert m_sub.build_tool_parameters("merge")["mode"] == "poly"
+    m_sub.data.peaks_file = str(mono_integ)
+    m_sub.data.images_file = str(mono_merged)
+    assert m_sub.build_tool_parameters("merge")["mode"] == "mono"
+
+    # 5. Verify local Careless command line & prep_merge.py metadata keys
+    runner_poly = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner_poly._local_work_dir = str(poly_dir)
+    rec_poly = {"cancel_requested": True}
+    runner_poly._submit_local_subhkl_stage(
+        "merge",
+        {"images_file": str(poly_merged), "peaks_file": str(poly_integ)},
+        existing_job_record=rec_poly,
+    )
+    assert "careless poly " in rec_poly["command_line"]
+    assert "--wavelength-key=WAVEL" in rec_poly["command_line"]
+    prep_poly_src = (poly_dir / "careless_work" / "prep_merge.py").read_text()
+    assert "'WAVEL'" in prep_poly_src
+
+    runner_mono = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner_mono._local_work_dir = str(mono_dir)
+    rec_mono = {"cancel_requested": True}
+    runner_mono._submit_local_subhkl_stage(
+        "merge",
+        {
+            "instrument": "MANDI",
+            "space_group": "I a -3 d",
+            "wavelength_min": 1.0,
+            "wavelength_max": 3.0,
+            "images_file": str(mono_merged),
+            "peaks_file": str(mono_integ),
+        },
+        existing_job_record=rec_mono,
+    )
+    assert "careless mono " in rec_mono["command_line"]
+    assert "--wavelength-key" not in rec_mono["command_line"]
+    prep_mono_src = (mono_dir / "careless_work" / "prep_merge.py").read_text()
+    post_mono_src = (mono_dir / "careless_work" / "post_merge.py").read_text()
+    assert "'WAVEL'" in prep_mono_src  # WAVEL stays in metadata even in mono mode
+    assert "'mode': 'mono'" in post_mono_src
+
+    # 6. Verify Galaxy imaginex_subhkl_merge tool_inputs passes mode="mono" for TOF and mode="poly" for non-TOF
+    gx_runner = NovaGalaxyPipelineRunner(
+        galaxy_url="http://localhost:8080", galaxy_api_key="fake-key"
+    )
+    assert gx_runner._resolve_careless_merge_mode({}, work_dir=str(poly_dir)) == "poly"
+    assert gx_runner._resolve_careless_merge_mode({}, work_dir=str(mono_dir)) == "mono"
+
+    captured_inputs: list[tuple[str, dict]] = []
+    fallback_reasons: list[str] = []
+
+    def _capture_run_tool(history_id, tool_id, tool_inputs):
+        captured_inputs.append((tool_id, dict(tool_inputs)))
+        return {"jobs": [{"id": f"gx_job_{len(captured_inputs)}"}], "outputs": []}
+
+    fake_store = MagicMock()
+    fake_store.history_id = "hist_123"
+    fake_store.nova_connection.galaxy_instance.tools.run_tool.side_effect = (
+        _capture_run_tool
+    )
+
+    with (
+        patch.object(gx_runner, "get_datastore", return_value=fake_store),
+        patch.object(gx_runner, "_has_tool_on_galaxy", return_value=True),
+        patch.object(gx_runner, "_ensure_galaxy_h5_dataset", return_value="hda_mtz_1"),
+        patch.object(gx_runner, "_get_tool_version", return_value="0.1.3"),
+        patch.object(gx_runner, "_poll_galaxy_job", return_value=None),
+        patch.object(
+            gx_runner,
+            "_submit_local_subhkl_stage",
+            side_effect=lambda *a, **k: fallback_reasons.append(
+                str(k.get("fallback_reason") or "")
+            ),
+        ),
+    ):
+        gx_runner._dispatch_nova_galaxy_thread(
+            "merge",
+            {"images_file": str(mono_merged), "peaks_file": str(mono_integ)},
+            {"job_id": "j1", "stage_id": "merge", "state": "queued", "stdout": ""},
+            None,
+        )
+        gx_runner._dispatch_nova_galaxy_thread(
+            "merge",
+            {"images_file": str(poly_merged), "peaks_file": str(poly_integ)},
+            {"job_id": "j2", "stage_id": "merge", "state": "queued", "stdout": ""},
+            None,
+        )
+
+    assert fallback_reasons == []
+    assert len(captured_inputs) == 2
+    assert captured_inputs[0][0] == "imaginex_subhkl_merge"
+    assert captured_inputs[0][1]["mode"] == "mono"
+    assert captured_inputs[1][0] == "imaginex_subhkl_merge"
+    assert captured_inputs[1][1]["mode"] == "poly"
+
+    # Legacy imaginex_subhkl_merge 0.1.2 without mono support must fall back rather than silently run poly on TOF data
+    with (
+        patch.object(gx_runner, "get_datastore", return_value=fake_store),
+        patch.object(gx_runner, "_has_tool_on_galaxy", return_value=True),
+        patch.object(gx_runner, "_ensure_galaxy_h5_dataset", return_value="hda_mtz_1"),
+        patch.object(gx_runner, "_get_tool_version", return_value="0.1.2"),
+        patch.object(gx_runner, "_poll_galaxy_job", return_value=None),
+        patch.object(
+            gx_runner,
+            "_submit_local_subhkl_stage",
+            side_effect=lambda *a, **k: fallback_reasons.append(
+                str(k.get("fallback_reason") or "")
+            ),
+        ),
+    ):
+        gx_runner._dispatch_nova_galaxy_thread(
+            "merge",
+            {"images_file": str(mono_merged), "peaks_file": str(mono_integ)},
+            {"job_id": "j3", "stage_id": "merge", "state": "queued", "stdout": ""},
+            None,
+        )
+    assert len(fallback_reasons) == 1
+    assert "lacks monochromatic ('mono') mode" in fallback_reasons[0]
