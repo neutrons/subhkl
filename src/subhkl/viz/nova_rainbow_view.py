@@ -2534,31 +2534,28 @@ class NovaGalaxyPipelineRunner:
                     tuple[int, int, int],
                     list[tuple[float, float, float, float, float]],
                 ] = {}
-                for j in range(mtz_pred.nreflections):
-                    key = (
-                        int(pcols["H"][j]),
-                        int(pcols["K"][j]),
-                        int(pcols["L"][j]),
+                # Pull the columns out once.  Looking them up per row with an
+                # array-valued default allocated five full-length arrays on
+                # every iteration: quadratic, ~3 ms per row, most of an hour
+                # for a million observations.
+                n_pred = mtz_pred.nreflections
+                pred_cols = [
+                    pcols.get(name, np.full(n_pred, default)).tolist()
+                    for name, default in (
+                        ("Iobs", 0.0),
+                        ("SigIobs", 1.0),
+                        ("Ipred", 0.0),
+                        ("SigIpred", 1.0),
+                        ("Scale", 1.0),
                     )
-                    pred_map.setdefault(key, []).append(
-                        (
-                            float(
-                                pcols.get("Iobs", np.zeros(mtz_pred.nreflections))[j]
-                            ),
-                            float(
-                                pcols.get("SigIobs", np.ones(mtz_pred.nreflections))[j]
-                            ),
-                            float(
-                                pcols.get("Ipred", np.zeros(mtz_pred.nreflections))[j]
-                            ),
-                            float(
-                                pcols.get("SigIpred", np.ones(mtz_pred.nreflections))[j]
-                            ),
-                            float(
-                                pcols.get("Scale", np.ones(mtz_pred.nreflections))[j]
-                            ),
-                        )
-                    )
+                ]
+                pred_keys = zip(
+                    pcols["H"].astype(int).tolist(),
+                    pcols["K"].astype(int).tolist(),
+                    pcols["L"].astype(int).tolist(),
+                )
+                for key, row in zip(pred_keys, zip(*pred_cols)):
+                    pred_map.setdefault(key, []).append(row)
 
                 merged_map: dict[tuple[int, int, int], tuple[float, float]] = {}
                 if os.path.isfile(merged_mtz_path):
