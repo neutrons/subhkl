@@ -816,6 +816,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
     )
     if not found:
         raise ValueError("blind band search found no orientation candidates")
+    _write_blind_rung("coarse_so3", 24, found[0][0])
     print(
         f"Joint band refinement of {len(found)} distinct blind candidates", flush=True
     )
@@ -1199,6 +1200,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
         g.attrs["instrument"] = str(args.instrument)
         g.attrs["finder"] = str(args.finder or "")
         g.attrs["weighting"] = weighting_desc
+    _write_blind_rung("blind_selected", 60, U_shared[selected], geom_fit=geometry)
     tmp_final.replace(path)
     print(
         f"Full-data scores under common geometry: {scores}; selected {selected}",

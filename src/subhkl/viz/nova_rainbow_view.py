@@ -344,6 +344,52 @@ class NovaGalaxyPipelineRunner:
                     if raw_dmin_live is not None and raw_dmin_live > 0
                     else None
                 )
+                partial_mtime_ns = int(os.stat(partial_h5).st_mtime_ns)
+                prev_ov = aj.get("partial_overlay")
+                if (
+                    isinstance(prev_ov, dict)
+                    and prev_ov.get("mtime_ns") == partial_mtime_ns
+                    and prev_ov.get("frame_index") == target_frame
+                    and prev_ov.get("zones")
+                ):
+                    payload["zones"] = prev_ov["zones"]
+                    if prev_ov.get("peaks"):
+                        payload["peaks"] = prev_ov["peaks"]
+                    if prev_ov.get("sample_peaks"):
+                        payload["sample_peaks"] = prev_ov["sample_peaks"]
+                    if prev_ov.get("panels") and payload.get("panels"):
+                        p_by_b = {
+                            int(p["bank"]): p for p in prev_ov["panels"] if "bank" in p
+                        }
+                        for cur_p in payload["panels"]:
+                            upd_p = p_by_b.get(int(cur_p.get("bank", -1)))
+                            if upd_p:
+                                for k_g in (
+                                    "az_min",
+                                    "az_max",
+                                    "y_min",
+                                    "y_max",
+                                    "el_min",
+                                    "el_max",
+                                    "corners",
+                                    "corners_sph",
+                                    "outline",
+                                    "outline_sph",
+                                    "mesh",
+                                    "mesh_sph",
+                                ):
+                                    if k_g in upd_p:
+                                        cur_p[k_g] = upd_p[k_g]
+                    if prev_ov.get("cell"):
+                        payload["cell"] = prev_ov["cell"]
+                    if prev_ov.get("ub_matrix"):
+                        payload["ub_matrix"] = prev_ov["ub_matrix"]
+                    if prev_ov.get("goniometer_R"):
+                        payload["goniometer_R"] = prev_ov["goniometer_R"]
+                    if prev_ov.get("ladder_steps"):
+                        payload["ladder_steps"] = prev_ov["ladder_steps"]
+                    payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
+                    return payload
                 p_blind = build_rainbow_zone_payload(
                     replay_h5=partial_h5,
                     images_h5=(
@@ -409,19 +455,14 @@ class NovaGalaxyPipelineRunner:
                     if p_blind.get("ladder_steps"):
                         payload["ladder_steps"] = p_blind["ladder_steps"]
                     payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
-                    prev_ov = aj.get("partial_overlay")
                     next_seq = (
                         int(prev_ov.get("seq", 0)) + 1
                         if isinstance(prev_ov, dict)
-                        and prev_ov.get("frame_index") != target_frame
-                        else (
-                            int(prev_ov.get("seq", 1))
-                            if isinstance(prev_ov, dict)
-                            else 1
-                        )
+                        else 1
                     )
                     aj["partial_overlay"] = {
                         "seq": next_seq,
+                        "mtime_ns": partial_mtime_ns,
                         "frame_index": target_frame,
                         "zones": p_blind.get("zones", []),
                         "peaks": p_blind.get("peaks", []),
@@ -626,10 +667,15 @@ class NovaGalaxyPipelineRunner:
                         bg["height"] = float(b_info["height"])
                 elif (
                     "radial_scale" in doc
+                    or "axial_scale" in doc
                     or "global_rot_vec" in doc
                     or "global_trans_m" in doc
                 ) and inst in beamlines:
                     r_sc = float(doc.get("radial_scale", 0.0))
+                    ax_sc = float(doc.get("axial_scale", r_sc))
+                    scale_vec = np.array(
+                        [1.0 + r_sc, 1.0 + ax_sc, 1.0 + r_sc], dtype=float
+                    )
                     r_vec = np.asarray(
                         doc.get("global_rot_vec", [0.0, 0.0, 0.0]), dtype=float
                     )
@@ -649,7 +695,7 @@ class NovaGalaxyPipelineRunner:
                             + 0.5 * det_b.width * det_b.uhat
                             + 0.5 * det_b.height * det_b.vhat
                         )
-                        mid_cal = mid_b * (1.0 + r_sc) @ rot_m.T + t_vec
+                        mid_cal = (mid_b * scale_vec) @ rot_m.T + t_vec
                         uh_cal = det_b.uhat @ rot_m.T
                         vh_cal = det_b.vhat @ rot_m.T
                         cen_cal = (

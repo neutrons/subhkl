@@ -7334,3 +7334,283 @@ console.log(JSON.stringify({{
         assert r_hi > b_hi
         assert "-1.0 · μ=20.0 · 59.0" == out["spec"]["label"]
         assert "rgba(248, 250, 252, 1.000) 50.0%" in out["spec"]["gradient"]
+
+
+def test_live_solve_dtheta_diagnostic_topbar_tooltips_and_controls_cleanup(
+    tmp_path,
+) -> None:
+    """Verify image-grounded post-Solve & live micro-step Δθ, top-bar tooltips + non-overlapping subtitle CSS, and removal of redundant ALL / Walk buttons."""
+    import json
+    import os
+    import re
+    import shutil
+    import subprocess
+
+    import h5py
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        _raycast_hkl_on_detectors,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # 1. Synthesize a realistic MANDI Ia-3d garnet detector count map in merged.h5 with true Bragg spots
+    mandi_dets = {
+        int(bk): Detector(dict(cfg)) for bk, cfg in beamlines["MANDI"].items()
+    }
+    active_bks = sorted(mandi_dets)[:8]
+    sub_dets = {bk: mandi_dets[bk] for bk in active_bks}
+    first_det = mandi_dets[active_bks[0]]
+    H, W = int(first_det.n), int(first_det.m)
+
+    U_true = Rotation.from_euler("xyz", [14.0, -22.0, 31.0], degrees=True).as_matrix()
+    B_mat = np.diag([1.0 / 11.93, 1.0 / 11.93, 1.0 / 11.93])
+    R_run = np.eye(3, dtype=float)
+    grid = np.mgrid[-6:7, -6:7, -6:7].reshape(3, -1).T
+    grid = grid[np.any(grid != 0, axis=1)]
+    cast_true = _raycast_hkl_on_detectors(
+        grid, U_true, B_mat, R_run, sub_dets, (1.0, 3.0), active_bids=set(active_bks)
+    )
+    assert len(cast_true["peaks_xyz"]) >= 10
+
+    rng = np.random.default_rng(42)
+    imgs = rng.poisson(2.0, size=(len(active_bks), H, W)).astype(np.float32)
+    bk_to_slab = {bk: i for i, bk in enumerate(active_bks)}
+    yy, xx = np.mgrid[0:H, 0:W]
+    # Plant bright 2D Gaussian Bragg spots slightly displaced (~0.35 px -> finite ~0.06° sub-pixel residual even at U_true)
+    for bk_p, r_p, c_p in zip(
+        cast_true["bank"], cast_true["pixel_r"], cast_true["pixel_c"]
+    ):
+        si = bk_to_slab.get(int(bk_p))
+        if si is not None and 8.0 <= r_p <= H - 9.0 and 8.0 <= c_p <= W - 9.0:
+            r_true = float(r_p) + 0.35
+            c_true = float(c_p) - 0.25
+            imgs[si] += (
+                260.0
+                * np.exp(
+                    -0.5 * (((yy - r_true) / 1.25) ** 2 + ((xx - c_true) / 1.25) ** 2)
+                )
+            ).astype(np.float32)
+
+    merged_h5 = tmp_path / "merged.h5"
+    with h5py.File(merged_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_dataset("images", data=imgs)
+        hf.create_dataset("banks", data=np.array(active_bks, dtype=np.int32))
+        hf.create_dataset("file_offsets", data=np.array([0], dtype=np.int32))
+        hf.create_group("goniometer").create_dataset("R", data=R_run[None, :, :])
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.0, 3.0], dtype=np.float64)
+        )
+        sg = hf.create_group("sample")
+        sg.attrs["space_group"] = "I a -3 d"
+        sg.create_dataset(
+            "cell", data=np.array([11.93, 11.93, 11.93, 90.0, 90.0, 90.0])
+        )
+
+    # 2. Simulate Solve micro-steps from coarse orientation error (0.75° -> 0.30° -> 0.00°)
+    rms_by_step: list[float] = []
+    partial_h5 = tmp_path / "solve.stages.h5"
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner.active_job = {
+        "stage_id": "solve",
+        "state": "running",
+        "partial_h5_path": str(partial_h5),
+        "images_h5_path": str(merged_h5),
+        "ladder_rung_idx": 1,
+        "solve_params": {
+            "instrument": "MANDI",
+            "space_group": "I a -3 d",
+            "wavelength_range": [1.0, 3.0],
+            "d_min": 1.0,
+        },
+    }
+    seen_seqs: list[int] = []
+
+    for step_i, mis_deg in enumerate((0.75, 0.30, 0.0)):
+        U_step = (
+            Rotation.from_rotvec([np.deg2rad(mis_deg), 0.0, 0.0]).as_matrix() @ U_true
+        )
+        with h5py.File(partial_h5, "w") as sf:
+            sf.attrs["instrument"] = "MANDI"
+            sf.attrs["source"] = str(merged_h5)
+            sg = sf.create_group("sample")
+            sg.attrs["space_group"] = "I a -3 d"
+            sg.create_dataset("U", data=U_step)
+            sg.create_dataset("B", data=B_mat)
+            sg.create_dataset(
+                "cell", data=np.array([11.93, 11.93, 11.93, 90.0, 90.0, 90.0])
+            )
+            sf.create_group("goniometer").create_dataset("R", data=R_run[None, :, :])
+            sf.create_group("instrument").create_dataset(
+                "wavelength", data=np.array([1.0, 3.0], dtype=np.float64)
+            )
+        # Ensure distinct mtime_ns across rapid micro-step writes
+        st_now = os.stat(partial_h5)
+        os.utime(
+            partial_h5,
+            ns=(st_now.st_atime_ns, st_now.st_mtime_ns + (step_i + 1) * 1_000_000),
+        )
+        runner.active_job["ladder_rung_idx"] = step_i + 1
+        ov_payload = runner.apply_active_solve_overlay({}, frame_index=0)
+        seen_seqs.append(int(runner.active_job["partial_overlay"]["seq"]))
+        err_vals = [
+            float(p["angular_error_deg"])
+            for p in ov_payload["peaks"]
+            if p.get("has_angular_error")
+        ]
+        assert len(err_vals) >= 4
+        rms_step = float(np.sqrt(np.mean(np.square(err_vals))))
+        rms_by_step.append(rms_step)
+
+    # Monotonic live partial_overlay sequence numbers and strictly decreasing Δθ across Solve micro-steps,
+    # ending at a finite physical >0° value (not an idealized 0.000°)!
+    assert seen_seqs == [1, 2, 3]
+    assert rms_by_step[0] > rms_by_step[1] > rms_by_step[2] > 0.01
+
+    # Post-Solve payload (solve.h5) also reports finite >0° Δθ and non-zero zone angular_rms_deg
+    solve_payload = build_rainbow_zone_payload(
+        replay_h5=partial_h5, images_h5=merged_h5, include_panel_images=False
+    )
+    solve_errs = [
+        p["angular_error_deg"]
+        for p in solve_payload["peaks"]
+        if p.get("has_angular_error")
+    ]
+    assert len(solve_errs) >= 4
+    assert float(np.sqrt(np.mean(np.square(solve_errs)))) > 0.01
+    assert any(float(z["angular_rms_deg"]) > 0.0 for z in solve_payload["zones"])
+
+    # 3. Verify HTML/CSS/JS top-bar tooltips, non-overlapping .subtitle-tag CSS, and removed ALL / Walk buttons
+    html_doc = render_rainbow_html(solve_payload)
+    assert 'id="btn-zones-all"' not in html_doc
+    assert 'id="btn-ladder-play"' not in html_doc
+    assert "WALK SOLVE STEPS" not in html_doc
+    assert "switch steps with &lt; &gt; arrows" in html_doc
+
+    # Every top-bar field, HUD pill, and control button has a descriptive tooltip attribute
+    for top_id in (
+        "app-title",
+        "app-version",
+        "subtitle-tag",
+        "hud-peaks-pill",
+        "hud-rms-pill",
+        "hud-zones-pill",
+        "hud-gonio-pill",
+        "hud-frame-ctrl",
+        "btn-frame-prev",
+        "sel-frame",
+        "btn-frame-next",
+        "sel-galaxy-h5",
+        "btn-proj-toggle",
+        "peak-source-group",
+        "btn-peaks-pred",
+        "btn-peaks-integ",
+        "btn-zone-arcs",
+        "btn-pixel-mask",
+        "btn-hires-tex",
+        "btn-heatmap-cmap",
+        "btn-stereo-toggle",
+        "btn-reset-view",
+        "btn-new-tab",
+    ):
+        m_tag = re.search(rf'<[^>]*\bid="{top_id}"[^>]*>', html_doc)
+        assert m_tag is not None, f"Missing top-bar element #{top_id}"
+        assert 'title="' in m_tag.group(0), f"Missing title tooltip on #{top_id}"
+
+    # Verify .brand-block clips overflow and .subtitle-tag shrinks instead of bleeding into PEAKS pill
+    brand_css = re.search(r"\.brand-block\s*\{[^}]*\}", html_doc)
+    sub_css = re.search(r"\.subtitle-tag\s*\{[^}]*\}", html_doc)
+    hud_css = re.search(r"\.hud-metrics\s*\{[^}]*\}", html_doc)
+    assert brand_css is not None and "overflow: hidden;" in brand_css.group(0)
+    assert sub_css is not None and "flex: 0 1 auto;" in sub_css.group(0)
+    assert hud_css is not None and "flex-shrink: 0;" in hud_css.group(0)
+
+    # Verify JS _extractMeasSnapshot + syncTopBarTooltips + updateHUD preserve frame Δθ and format Peaks tooltip
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        inline_js = script_blocks[-1]
+        fn_extract: list[str] = []
+        for fn in ("syncTopBarTooltips", "updateHUD"):
+            m_fn = re.search(rf"function {fn}\b[\s\S]*?\n  \}}(?=\n)", inline_js)
+            assert m_fn is not None, f"Missing JS function {fn}"
+            fn_extract.append(m_fn.group(0))
+        node_script = f"""
+const els = {{
+  "val-indexed": {{ textContent: "", title: "" }},
+  "val-rms": {{ textContent: "", title: "" }},
+  "val-zones": {{ textContent: "", title: "" }},
+  "val-gonio": {{ textContent: "", title: "" }},
+  "hud-peaks-pill": {{ title: "" }},
+  "hud-rms-pill": {{ title: "" }},
+  "hud-zones-pill": {{ title: "" }},
+  "hud-gonio-pill": {{ title: "" }},
+  "hud-frame-ctrl": {{ title: "" }},
+  "sel-frame": {{ selectedIndex: 0, options: [{{ textContent: "MANDI_12737.nxs.h5 (ω=15.0°)" }}], title: "" }},
+  "sel-galaxy-h5": {{ selectedIndex: 0, options: [{{ value: "h1", textContent: "solve.h5" }}], title: "" }},
+  "app-title": {{ title: "" }},
+  "app-version": {{ textContent: "v0.4.0", title: "" }},
+  "btn-zone-arcs": {{ title: "" }},
+  "btn-heatmap-cmap": {{ title: "" }},
+  "btn-stereo-toggle": {{ title: "" }},
+}};
+const subTag = {{ textContent: "MANDI • I a -3 d • INTEGRATED • 3D TENSOR ELLIPSES", title: "" }};
+globalThis.document = {{
+  getElementById: (id) => els[id] || null,
+  querySelector: (sel) => sel === ".subtitle-tag" ? subTag : null,
+}};
+const DATA = {{
+  cell: [11.93, 11.93, 11.93, 90, 90, 90],
+  frames: [{{ motor_summary: "ω=15.0°, χ=45.0°, φ=120.0°" }}],
+  frame_index: 0,
+}};
+const state = {{
+  peakSource: "predicted",
+  lamMin: 1.0,
+  lamMax: 3.0,
+  dMin: 1.0,
+  activeZones: new Set([1, 2, 3]),
+  maxZoneOrder: 1,
+  showZoneArcs: true,
+  heatmapStyle: "magma",
+  showStereo: true,
+}};
+const PEAKS = [
+  {{ indexed: true, peak_source: "predicted", angular_error_deg: 0.08, has_angular_error: true, zone_ids: [1] }},
+  {{ indexed: true, peak_source: "predicted", angular_error_deg: 0.0, has_angular_error: false, zone_ids: [1] }},
+  {{ indexed: true, peak_source: "predicted", angular_error_deg: 0.06, has_angular_error: true, zone_ids: [] }},
+];
+function isPeakVisible() {{ return true; }}
+function isPeakCapturedByActiveZone(p) {{ return (p.zone_ids || []).length > 0; }}
+function drawHistogram() {{}}
+function fitHorizontalBars() {{}}
+{"\n".join(fn_extract)}
+updateHUD();
+console.log(JSON.stringify({{
+  indexed: els["val-indexed"].textContent,
+  rms: els["val-rms"].textContent,
+  peaksTip: els["hud-peaks-pill"].title,
+  rmsTip: els["hud-rms-pill"].title,
+  gonioTip: els["hud-gonio-pill"].title,
+  frameTip: els["sel-frame"].title,
+  subTip: subTag.title,
+}}));
+"""
+        proc = subprocess.run(
+            ["node", "-e", node_script], check=True, capture_output=True, text=True
+        )
+        res = json.loads(proc.stdout.strip())
+        assert res["indexed"] == "2 / 3 (66.7%)"
+        # Unobserved predicted peak (has_angular_error: false) does NOT dilute 0.080° down to 0.057°!
+        assert res["rms"] == "0.080°"
+        assert "2 indexed reflections captured by enabled Laue zones" in res["peaksTip"]
+        assert "out of 3 visible predicted reflections" in res["peaksTip"]
+        assert "across 1 matched detector spots" in res["rmsTip"]
+        assert "ω=15.0°, χ=45.0°, φ=120.0°" in res["gonioTip"]
+        assert "MANDI_12737.nxs.h5" in res["frameTip"]
+        assert "MANDI • I a -3 d • INTEGRATED" in res["subTip"]

@@ -4466,9 +4466,15 @@ def _build_lattice_ladder_steps(
     """Construct the interactive Lattice Ladder progression (Rung 1 -> Goal)."""
     n_total = max(len(peaks_list), 1)
     indexed_peaks = [p for p in peaks_list if p["indexed"]]
+    err_peaks = [
+        p
+        for p in indexed_peaks
+        if p.get("has_angular_error", True)
+        and isinstance(p.get("angular_error_deg"), (int, float))
+    ]
     overall_rms = (
-        float(np.sqrt(np.mean([p["angular_error_deg"] ** 2 for p in indexed_peaks])))
-        if indexed_peaks
+        float(np.sqrt(np.mean([p["angular_error_deg"] ** 2 for p in err_peaks])))
+        if err_peaks
         else 0.0
     )
 
@@ -5913,6 +5919,221 @@ def _compute_zones_payload_for_geometry(
     return raw_zones, zones_payload
 
 
+_SPOT_IMG_SLAB_CACHE: dict[tuple[str, int, int, int], dict[int, np.ndarray]] = {}
+
+
+def _load_cached_frame_bank_images(
+    images_h5: str | os.PathLike[str] | None,
+    frame_slice: tuple[int, int] | None,
+) -> dict[int, np.ndarray]:
+    """Load and LRU-cache 2D raw detector bank images for the active frame."""
+    if not images_h5 or not os.path.isfile(images_h5):
+        return {}
+    try:
+        h5_abs = os.path.abspath(str(images_h5))
+        mtime_ns = int(os.stat(h5_abs).st_mtime_ns)
+        f0_req = int(frame_slice[0]) if frame_slice is not None else -1
+        f1_req = int(frame_slice[1]) if frame_slice is not None else -1
+        cache_key = (h5_abs, mtime_ns, f0_req, f1_req)
+        cached = _SPOT_IMG_SLAB_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        import h5py
+
+        bank_images: dict[int, np.ndarray] = {}
+        with h5py.File(h5_abs, "r") as hf:
+            ims = (
+                hf["images/ims"]
+                if "images" in hf
+                and isinstance(hf["images"], h5py.Group)
+                and "ims" in hf["images"]
+                else hf.get("images")
+            )
+            if ims is None or len(ims) == 0:
+                return {}
+            n_tot = len(ims)
+            b_ids = (
+                np.asarray(hf["banks"][()], dtype=int)
+                if "banks" in hf
+                else np.arange(1, n_tot + 1, dtype=int)
+            )
+            if frame_slice is not None:
+                f0 = max(0, min(int(frame_slice[0]), n_tot))
+                f1 = max(f0, min(int(frame_slice[1]), n_tot))
+            elif "file_offsets" in hf:
+                offsets = np.asarray(hf["file_offsets"][()], dtype=int)
+                if len(offsets) > 1:
+                    counts = np.diff(np.append(offsets, n_tot))
+                    best_r = int(np.argmax(counts))
+                    f0 = int(offsets[best_r])
+                    f1 = int(offsets[best_r] + counts[best_r])
+                else:
+                    f0, f1 = 0, n_tot
+            else:
+                f0, f1 = 0, n_tot
+            if f1 > f0:
+                slab = np.asarray(ims[f0:f1], dtype=np.float32)
+                for rel_i, idx in enumerate(range(f0, f1)):
+                    bk = int(b_ids[idx])
+                    im = (
+                        slab[rel_i]
+                        if slab.ndim == 3
+                        else np.asarray(ims[idx], dtype=np.float32)
+                    )
+                    if im.ndim != 2:
+                        continue
+                    if bk in bank_images:
+                        bank_images[bk] = np.maximum(bank_images[bk], im)
+                    else:
+                        bank_images[bk] = im
+        if bank_images:
+            if len(_SPOT_IMG_SLAB_CACHE) >= 4:
+                _SPOT_IMG_SLAB_CACHE.pop(next(iter(_SPOT_IMG_SLAB_CACHE)))
+            _SPOT_IMG_SLAB_CACHE[cache_key] = bank_images
+        return bank_images
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
+        return {}
+
+
+def _estimate_image_spot_angular_errors_deg(
+    *,
+    images_h5: str | os.PathLike[str] | None,
+    frame_slice: tuple[int, int] | None,
+    hkl_arr: np.ndarray | None,
+    bank_arr: np.ndarray | None,
+    pixel_r_arr: np.ndarray | None,
+    pixel_c_arr: np.ndarray | None,
+    ub_matrix: np.ndarray | None,
+    R_run: np.ndarray | None,
+    detectors: dict[int, Any],
+    ki_hat: np.ndarray,
+    sample_offset_lab: Any = None,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+) -> tuple[np.ndarray | None, bool]:
+    """
+    Estimate local background-thresholded spot centroid angular errors ``Δθ`` [deg]
+    for predicted/solved reflections directly against the active detector count maps.
+
+    Returns ``(ang_err_deg_or_nan, has_image_slab)``. Reflections without a local
+    signal peak above background receive ``NaN`` so unobserved reflections do not
+    dilute the RMS indexing diagnostic toward zero.
+    """
+    if (
+        hkl_arr is None
+        or bank_arr is None
+        or pixel_r_arr is None
+        or pixel_c_arr is None
+        or ub_matrix is None
+        or not detectors
+        or len(hkl_arr) == 0
+    ):
+        return None, False
+
+    bank_images = _load_cached_frame_bank_images(images_h5, frame_slice)
+    if not bank_images:
+        return None, False
+
+    n_peaks = len(hkl_arr)
+    out_err = np.full(n_peaks, np.nan, dtype=float)
+    R_mat = (
+        np.asarray(R_run, dtype=float)
+        if R_run is not None and np.asarray(R_run).ndim == 2
+        else np.eye(3, dtype=float)
+    )
+    s_off = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else np.zeros(3, dtype=float)
+    )
+    G_pred = np.asarray(hkl_arr, dtype=float) @ np.asarray(ub_matrix, dtype=float).T
+    G_norm = np.linalg.norm(G_pred, axis=1)
+    G_hat = np.divide(G_pred, np.maximum(G_norm[:, None], 1e-12))
+
+    b_arr = np.asarray(bank_arr, dtype=int)
+    r_arr = np.asarray(pixel_r_arr, dtype=float)
+    c_arr = np.asarray(pixel_c_arr, dtype=float)
+
+    for bk in np.unique(b_arr):
+        im = bank_images.get(int(bk))
+        det = detectors.get(int(bk))
+        if im is None or det is None or im.ndim != 2:
+            continue
+        H, W = im.shape
+        if H < 8 or W < 8:
+            continue
+        idxs = np.flatnonzero((b_arr == bk) & (G_norm > 1e-8))
+        if len(idxs) == 0:
+            continue
+
+        det_n = max(1, int(getattr(det, "n", H)))
+        det_m = max(1, int(getattr(det, "m", W)))
+        scale_r = (H - 1) / max(det_n - 1, 1) if det_n > 1 else 1.0
+        scale_c = (W - 1) / max(det_m - 1, 1) if det_m > 1 else 1.0
+
+        r_im = r_arr[idxs] * scale_r
+        c_im = c_arr[idxs] * scale_c
+        in_bounds = (
+            (r_im >= 1.5) & (r_im <= H - 2.5) & (c_im >= 1.5) & (c_im <= W - 2.5)
+        )
+        if not np.any(in_bounds):
+            continue
+        idxs_in = idxs[in_bounds]
+        r0 = np.rint(r_im[in_bounds]).astype(int)
+        c0 = np.rint(c_im[in_bounds]).astype(int)
+
+        rad = max(3, min(10, round(0.028 * min(H, W))))
+        offs = np.arange(-rad, rad + 1, dtype=int)
+        dr, dc = np.meshgrid(offs, offs, indexing="ij")
+        circ_mask = ((dr * dr + dc * dc) <= (rad * rad)).astype(np.float32)
+
+        rr = np.clip(r0[:, None, None] + dr[None, :, :], 0, H - 1)
+        cc = np.clip(c0[:, None, None] + dc[None, :, :], 0, W - 1)
+        patches = im[rr, cc]
+
+        pcls = pixel_class_by_bank.get(int(bk)) if pixel_class_by_bank else None
+        valid_px = circ_mask[None, :, :]
+        if pcls is not None and pcls.shape == im.shape:
+            valid_px = valid_px * (pcls[rr, cc] == 0).astype(np.float32)
+
+        bg = np.median(patches, axis=(1, 2), keepdims=True)
+        mad = 1.4826 * np.median(np.abs(patches - bg), axis=(1, 2), keepdims=True)
+        thr = bg + np.maximum(4.0 * mad, np.maximum(2.5, 0.15 * np.maximum(bg, 1.0)))
+        excess = np.maximum(0.0, patches - thr) * valid_px
+        w = excess * excess
+        w_sum = np.sum(w, axis=(1, 2))
+        has_spot = w_sum > 0.0
+        if not np.any(has_spot):
+            continue
+
+        sel_local = np.flatnonzero(has_spot)
+        sel_global = idxs_in[sel_local]
+        w_sel = w[sel_local]
+        ws_sel = w_sum[sel_local]
+        r_cent_im = np.sum(w_sel * rr[sel_local], axis=(1, 2)) / ws_sel
+        c_cent_im = np.sum(w_sel * cc[sel_local], axis=(1, 2)) / ws_sel
+        r_cent_det = r_cent_im / max(scale_r, 1e-9)
+        c_cent_det = c_cent_im / max(scale_c, 1e-9)
+
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+        ):
+            xyz_obs = np.asarray(det.pixel_to_lab(r_cent_det, c_cent_det), dtype=float)
+            if xyz_obs.ndim == 1:
+                xyz_obs = xyz_obs.reshape(1, 3)
+            rays_obs = xyz_obs - s_off[None, :]
+            rn = np.linalg.norm(rays_obs, axis=1, keepdims=True)
+            kf_obs = rays_obs / np.maximum(rn, 1e-12)
+            q_obs = kf_obs - ki_hat[None, :]
+            qn_obs = np.linalg.norm(q_obs, axis=1, keepdims=True)
+            g_lab = np.where(qn_obs > 1e-6, q_obs / np.maximum(qn_obs, 1e-12), kf_obs)
+            g_cryst = g_lab @ R_mat
+            dots = np.clip(np.sum(g_cryst * G_hat[sel_global], axis=1), -1.0, 1.0)
+            out_err[sel_global] = np.rad2deg(np.arccos(dots))
+
+    return out_err, True
+
+
 def _serialize_peak_entries(
     pts: np.ndarray,
     *,
@@ -5944,6 +6165,8 @@ def _serialize_peak_entries(
     peak_source: str = "predicted",
     d_min: float = 0.0,
     sample_offset_lab: Any = None,
+    spot_ang_err_arr: np.ndarray | None = None,
+    spot_img_available: bool = False,
 ) -> list[dict[str, Any]]:
     """Serialize a set of detector peak observations for the active frame."""
     pts = np.asarray(pts, dtype=float)
@@ -5984,6 +6207,8 @@ def _serialize_peak_entries(
             merged_i_arr = merged_i_arr[order]
         if merged_sigi_arr is not None and len(merged_sigi_arr) == n_raw:
             merged_sigi_arr = merged_sigi_arr[order]
+        if spot_ang_err_arr is not None and len(spot_ang_err_arr) == n_raw:
+            spot_ang_err_arr = spot_ang_err_arr[order]
         if (
             isinstance(R_gonio, np.ndarray)
             and R_gonio.ndim == 3
@@ -6185,6 +6410,7 @@ def _serialize_peak_entries(
                 b_ray = (h_i // g_c, k_i // g_c, l_i // g_c)
                 base_ray_orders.setdefault(b_ray, set()).add(g_c)
 
+    has_ray_err = bool(len(ang_err_deg) > 0 and float(np.max(ang_err_deg)) > 1e-4)
     peaks_list: list[dict[str, Any]] = []
     for i in range(n_peaks):
         h_i, k_i, l_i = (
@@ -6220,11 +6446,27 @@ def _serialize_peak_entries(
             is_absent_fn=_is_absent,
             observed_distinct_orders=max(1, obs_ord_cnt),
         )
-        err_val = float(ang_err_deg[i]) if i < len(ang_err_deg) else 0.0
+        ray_err_val = float(ang_err_deg[i]) if i < len(ang_err_deg) else 0.0
+        if peak_source == "integrated":
+            err_val = ray_err_val
+            has_err = bool(ub_matrix is not None and (h_i or k_i or l_i))
+        elif (
+            spot_ang_err_arr is not None
+            and i < len(spot_ang_err_arr)
+            and np.isfinite(spot_ang_err_arr[i])
+        ):
+            err_val = float(spot_ang_err_arr[i])
+            has_err = True
+        elif not spot_img_available and has_ray_err and ub_matrix is not None:
+            err_val = ray_err_val
+            has_err = True
+        else:
+            err_val = 0.0
+            has_err = False
         is_indexed = bool(
             (
                 (h_i != 0 or k_i != 0 or l_i != 0)
-                and err_val <= max(2.0, zone_tolerance_deg * 2.5)
+                and ray_err_val <= max(2.0, zone_tolerance_deg * 2.5)
             )
             or len(peak_zones[i]) > 0
         )
@@ -6293,6 +6535,7 @@ def _serialize_peak_entries(
             "zone_ids": peak_zones[i],
             "indexed": is_indexed,
             "angular_error_deg": round(err_val, 4),
+            "has_angular_error": bool(has_err),
         }
         if (
             careless_residual_arr is not None
@@ -6727,6 +6970,26 @@ def build_rainbow_zone_payload(
         else float((solve_diagnostics or {}).get("d_min", default_d_min))
     )
 
+    spot_ang_err_primary: np.ndarray | None = None
+    spot_img_avail_primary = False
+    if primary_source == "predicted" and len(pts) > 0:
+        spot_ang_err_primary, spot_img_avail_primary = (
+            _estimate_image_spot_angular_errors_deg(
+                images_h5=images_h5,
+                frame_slice=frame_slice,
+                hkl_arr=hkl_arr,
+                bank_arr=bank_arr,
+                pixel_r_arr=pixel_r_arr,
+                pixel_c_arr=pixel_c_arr,
+                ub_matrix=ub_matrix,
+                R_run=R_single,
+                detectors=detectors,
+                ki_hat=ki_hat,
+                sample_offset_lab=s_lab_single,
+                pixel_class_by_bank=pixel_class_by_bank,
+            )
+        )
+
     peaks_list = _serialize_peak_entries(
         pts,
         bank_arr=bank_arr,
@@ -6757,7 +7020,23 @@ def build_rainbow_zone_payload(
         peak_source=primary_source,
         d_min=d_min_use,
         sample_offset_lab=s_lab_single,
+        spot_ang_err_arr=spot_ang_err_primary,
+        spot_img_available=spot_img_avail_primary,
     )
+
+    measured_err_by_zone: dict[int, list[float]] = {}
+    for pk_item in peaks_list:
+        if pk_item.get("has_angular_error"):
+            ev = float(pk_item.get("angular_error_deg") or 0.0)
+            for zid_m in pk_item.get("zone_ids") or ():
+                measured_err_by_zone.setdefault(int(zid_m), []).append(ev)
+    if measured_err_by_zone:
+        for zp in zones_payload:
+            z_errs = measured_err_by_zone.get(int(zp["zone_id"]))
+            if z_errs:
+                zp["angular_rms_deg"] = round(
+                    float(np.sqrt(np.mean(np.square(z_errs)))), 4
+                )
 
     sample_peaks = _serialize_sample_peaks(
         all_runs_data,
@@ -6930,6 +7209,20 @@ def build_rainbow_zone_payload(
             predicted_frame_data is not None
             and len(predicted_frame_data.get("peaks_xyz", [])) > 0
         ):
+            spot_err_pred, spot_avail_pred = _estimate_image_spot_angular_errors_deg(
+                images_h5=images_h5,
+                frame_slice=frame_slice,
+                hkl_arr=predicted_frame_data.get("hkl"),
+                bank_arr=predicted_frame_data.get("bank"),
+                pixel_r_arr=predicted_frame_data.get("pixel_r"),
+                pixel_c_arr=predicted_frame_data.get("pixel_c"),
+                ub_matrix=ub_matrix,
+                R_run=R_single,
+                detectors=detectors,
+                ki_hat=ki_hat,
+                sample_offset_lab=s_lab_single,
+                pixel_class_by_bank=pixel_class_by_bank,
+            )
             predicted_peaks = _serialize_peak_entries(
                 predicted_frame_data["peaks_xyz"],
                 bank_arr=predicted_frame_data.get("bank"),
@@ -6956,6 +7249,8 @@ def build_rainbow_zone_payload(
                 peak_source="predicted",
                 d_min=d_min_use,
                 sample_offset_lab=s_lab_single,
+                spot_ang_err_arr=spot_err_pred,
+                spot_img_available=spot_avail_pred,
             )
             predicted_sample_peaks = _serialize_sample_peaks(
                 predicted_all_runs_data,
@@ -7490,7 +7785,8 @@ def render_rainbow_html(
     gap: calc(6px * var(--top-bar-scale, 1));
     white-space: nowrap;
     min-width: 0;
-    flex-shrink: 1;
+    flex: 0 1 auto;
+    overflow: hidden;
   }}
 
   .rainbow-logo {{
@@ -7563,8 +7859,8 @@ def render_rainbow_html(
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
-    flex-shrink: 0;
+    min-width: 36px;
+    flex: 0 1 auto;
   }}
 
   .hud-metrics {{
@@ -7573,7 +7869,7 @@ def render_rainbow_html(
     gap: calc(5px * var(--top-bar-scale, 1));
     white-space: nowrap;
     min-width: 0;
-    flex-shrink: 1;
+    flex-shrink: 0;
   }}
 
   .hud-pill {{
@@ -8612,34 +8908,34 @@ def render_rainbow_html(
   <!-- TOP BAR -->
   <header class="top-bar">
     <div class="brand-block">
-      <div class="rainbow-logo" id="app-title">{SUBHKL_LOGO_SVG}<span class="sr-only"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></span><span class="logo-version" id="app-version">{subhkl_ver_badge}</span></div>
-      <span class="subtitle-tag">{inst} · {sg}</span>
+      <div class="rainbow-logo" id="app-title" title="sUBhkl {subhkl_ver_badge} — Quasi-Laue &amp; TOF single-crystal neutron diffraction indexing, integration, and scaling">{SUBHKL_LOGO_SVG}<span class="sr-only"><span class="logo-sub">sUB</span><span class="logo-hkl">hkl</span></span><span class="logo-version" title="sUBhkl version {subhkl_ver_badge}" id="app-version">{subhkl_ver_badge}</span></div>
+      <span class="subtitle-tag" id="subtitle-tag" title="{inst} · {sg} — Active instrument, space group, and workflow stage">{inst} · {sg}</span>
     </div>
 
     <div class="hud-metrics">
-      <div class="hud-pill">
+      <div class="hud-pill" id="hud-peaks-pill" title="PEAKS (captured / visible): Indexed reflections captured by active Laue zones [uvw] (numerator) out of total visible reflections on this frame within λ and d_min cutoffs (denominator)">
         <span class="hud-label">PEAKS</span>
         <span class="hud-value" id="val-indexed">0 / 0</span>
       </div>
-      <div class="hud-pill">
+      <div class="hud-pill" id="hud-rms-pill" title="Δθ: RMS angular discrepancy between observed detector spot centroids and theoretical UB·hkl Bragg directions across active-zone spots (indexing &amp; calibration quality diagnostic)">
         <span class="hud-label">Δθ</span>
-        <span class="hud-value" id="val-rms">0.000°</span>
+        <span class="hud-value" id="val-rms">—</span>
       </div>
-      <div class="hud-pill">
+      <div class="hud-pill" id="hud-zones-pill" title="ZONES: Number of active Laue zone conics [uvw] shown on the detector and Wulff map (up to max zone order |u|,|v|,|w|)">
         <span class="hud-label">ZONES</span>
         <span class="hud-value" id="val-zones">0</span>
       </div>
-      <div class="hud-pill" id="hud-gonio-pill" title="Goniometer motor angles for the active frame">
+      <div class="hud-pill" id="hud-gonio-pill" title="GONIO: Goniometer motor angles for the active frame">
         <span class="hud-label">GONIO</span>
         <span class="hud-value" id="val-gonio">—</span>
       </div>
-      <div class="hud-pill" id="hud-frame-ctrl" style="gap:3px;padding:1px 5px;" title="Select goniometer frame / run orientation">
+      <div class="hud-pill" id="hud-frame-ctrl" style="gap:3px;padding:1px 5px;" title="FRAME: Select active goniometer frame / run orientation">
         <span class="hud-label">FRAME</span>
-        <button id="btn-frame-prev" style="padding:1px 5px;font-size:0.62rem;" title="Previous frame">&lt;</button>
-        <select id="sel-frame" style="background:transparent;color:var(--accent-pink);border:none;font-family:var(--font-display);font-size:0.68rem;font-weight:700;outline:none;cursor:pointer;max-width:190px;">
+        <button id="btn-frame-prev" style="padding:1px 5px;font-size:0.62rem;" title="Previous goniometer frame / run">&lt;</button>
+        <select id="sel-frame" title="Active goniometer frame / run (1 / 1)" style="background:transparent;color:var(--accent-pink);border:none;font-family:var(--font-display);font-size:0.68rem;font-weight:700;outline:none;cursor:pointer;max-width:190px;">
           <option value="0">1 / 1</option>
         </select>
-        <button id="btn-frame-next" style="padding:1px 5px;font-size:0.62rem;" title="Next frame">&gt;</button>
+        <button id="btn-frame-next" style="padding:1px 5px;font-size:0.62rem;" title="Next goniometer frame / run">&gt;</button>
       </div>
       <div class="hud-pill" style="display:none;">
         <span class="hud-label">PROJ</span>
@@ -8809,11 +9105,10 @@ def render_rainbow_html(
         <div class="section-title">
           <span>Laue Zones [uvw]</span>
           <div style="display:flex;gap:2px;">
-            <button id="btn-order-1" class="active-btn" style="padding:1px 4px;font-size:0.58rem;" title="Fundamental zones |u|,|v|,|w| ≤ 1">≤1</button>
-            <button id="btn-order-2" style="padding:1px 4px;font-size:0.58rem;" title="Include 2nd-order zones |u|,|v|,|w| ≤ 2">≤2</button>
-            <button id="btn-order-3" style="padding:1px 4px;font-size:0.58rem;" title="Include higher-order zones |u|,|v|,|w| ≤ 3">≤3</button>
-            <button id="btn-zones-all" style="padding:1px 4px;font-size:0.58rem;" title="Enable all zones in current order">ALL</button>
-            <button id="btn-zones-none" style="padding:1px 4px;font-size:0.58rem;" title="Hide all zone arcs">NONE</button>
+            <button id="btn-order-1" class="active-btn" style="padding:1px 4px;font-size:0.58rem;" title="Enable all fundamental Laue zones |u|,|v|,|w| ≤ 1">≤1</button>
+            <button id="btn-order-2" style="padding:1px 4px;font-size:0.58rem;" title="Enable all Laue zones up to 2nd order |u|,|v|,|w| ≤ 2">≤2</button>
+            <button id="btn-order-3" style="padding:1px 4px;font-size:0.58rem;" title="Enable all Laue zones up to 3rd order |u|,|v|,|w| ≤ 3">≤3</button>
+            <button id="btn-zones-none" style="padding:1px 4px;font-size:0.58rem;" title="Deselect all Laue zone arcs (click ≤1, ≤2, or ≤3 to restore)">NONE</button>
           </div>
         </div>
         <div class="zone-list" id="zone-list"></div>
@@ -8873,16 +9168,15 @@ def render_rainbow_html(
         <button id="btn-params-toggle" title="Configure unit cell, space group, and wavelength parameters for Solve/Integrate">
           Params
         </button>
-        <button id="btn-files-toggle" title="Download NDIP / workflow artifacts for the current step (switch steps with < Walk > arrows)">
+        <button id="btn-files-toggle" title="Download NDIP / workflow artifacts for the current step (switch steps with &lt; &gt; arrows)">
           Files
         </button>
-        <span id="galaxy-status-badge" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));font-family:var(--font-display);padding:2px calc(6px * var(--bottom-bar-scale, 1));border-radius:4px;border:1px solid #334155;color:var(--text-dim);white-space:nowrap;">
+        <span id="galaxy-status-badge" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));font-family:var(--font-display);padding:2px calc(6px * var(--bottom-bar-scale, 1));border-radius:4px;border:1px solid #334155;color:var(--text-dim);white-space:nowrap;" title="Execution backend status (LOCAL or NDIP Galaxy/Pulsar)">
           LOCAL
         </span>
         <button id="btn-galaxy-dispatch" style="display:none;">Run</button>
-        <button id="btn-ladder-prev">&lt;</button>
-        <button id="btn-ladder-play" class="active-btn">Walk</button>
-        <button id="btn-ladder-next">&gt;</button>
+        <button id="btn-ladder-prev" title="Previous Lattice Ladder / pipeline step">&lt;</button>
+        <button id="btn-ladder-next" title="Next Lattice Ladder / pipeline step">&gt;</button>
       </div>
     </div>
     <div id="params-drawer" class="params-drawer">
@@ -9260,12 +9554,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     "careless_residual", "careless_scale",
     "mtz_i", "mtz_sigi", "mtz_isigi", "mtz_col_val",
   ];
+  const _FRAME_ERR_KEYS = ["angular_error_deg", "has_angular_error"];
   const _SHAPE_KEYS = [
     "ellipse", "ellipse_sph", "sigma_major_px", "sigma_minor_px",
     "ellipse_angle_deg", "shape_kind",
   ];
 
-  function _extractMeasSnapshot(p, includeShape) {{
+  function _extractMeasSnapshot(p, includeShape, includeFrameErr = false) {{
     if (!p) return null;
     let hasAny = false;
     const snap = {{}};
@@ -9275,6 +9570,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         snap[k] = p[k];
         hasAny = true;
       }}
+    }}
+    if (includeFrameErr && p.has_angular_error === true && typeof p.angular_error_deg === "number" && Number.isFinite(p.angular_error_deg)) {{
+      snap.angular_error_deg = p.angular_error_deg;
+      snap.has_angular_error = true;
+      hasAny = true;
     }}
     if (includeShape) {{
       for (let i = 0; i < _SHAPE_KEYS.length; i++) {{
@@ -9328,7 +9628,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (isIntegBucket && typeof p.d_spacing === "number" && p.d_spacing > 0 && p.d_spacing < _baselineMeasCache.minIntegD) {{
           _baselineMeasCache.minIntegD = p.d_spacing;
         }}
-        const snap = _extractMeasSnapshot(p, isFrameLevel);
+        const snap = _extractMeasSnapshot(p, isFrameLevel, isFrameLevel);
         if (!snap) continue;
         const hk = `${{p.hkl[0]}},${{p.hkl[1]}},${{p.hkl[2]}}`;
         if (isFrameLevel && typeof p.bank === "number") {{
@@ -9337,9 +9637,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         }}
         const rIdx = typeof p.run_index === "number" ? p.run_index : (DATA.frame_index || 0);
         const rKey = `${{rIdx}}|${{hk}}`;
-        const noShape = _extractMeasSnapshot(p, false);
+        const runSnap = _extractMeasSnapshot(p, false, isFrameLevel);
+        if (runSnap) {{
+          _baselineMeasCache.byRunHkl.set(rKey, _mergeMeasSnapshot(_baselineMeasCache.byRunHkl.get(rKey), runSnap));
+        }}
+        const noShape = _extractMeasSnapshot(p, false, false);
         if (noShape) {{
-          _baselineMeasCache.byRunHkl.set(rKey, _mergeMeasSnapshot(_baselineMeasCache.byRunHkl.get(rKey), noShape));
           _baselineMeasCache.byHkl.set(hk, _mergeMeasSnapshot(_baselineMeasCache.byHkl.get(hk), noShape));
           if (p.asu_orbit_id && (typeof noShape.mtz_i === "number" || typeof noShape.merged_i === "number")) {{
             const orbSnap = {{}};
@@ -9944,6 +10247,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           zone_ids: zoneIds,
           indexed: true,
           angular_error_deg: 0.0,
+          has_angular_error: false,
           shape_kind: "circle",
         }};
 
@@ -11986,6 +12290,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const isSph = state.projection === "spherical";
     const btn = document.getElementById("btn-proj-toggle");
     btn.textContent = isSph ? "Sph" : "Cyl";
+    btn.title = isSph
+      ? "Projection: Spherical (Azimuth φ vs Elevation ψ [deg]) — click to switch to Cylindrical (Azimuth φ vs Y [m])"
+      : "Projection: Cylindrical (Azimuth φ vs Height Y [m]) — click to switch to Spherical (Azimuth φ vs Elevation ψ [deg])";
     document.getElementById("val-proj").textContent = isSph ? "SPH" : "CYL";
     document.getElementById("detector-header-title").textContent = isSph
       ? "SPHERICAL DETECTOR PROJECTION (AZIMUTH φ [deg] vs ELEVATION ψ [deg])"
@@ -12311,27 +12618,110 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return false;
   }}
 
+  function syncTopBarTooltips(stats) {{
+    const subEl = document.querySelector(".subtitle-tag");
+    if (subEl) {{
+      const cellTxt = Array.isArray(DATA.cell) && DATA.cell.length === 6
+        ? ` • Cell: a=${{DATA.cell[0].toFixed(2)}}, b=${{DATA.cell[1].toFixed(2)}}, c=${{DATA.cell[2].toFixed(2)}} Å, α=${{DATA.cell[3].toFixed(1)}}°, β=${{DATA.cell[4].toFixed(1)}}°, γ=${{DATA.cell[5].toFixed(1)}}°`
+        : "";
+      subEl.title = `${{subEl.textContent || ""}}${{cellTxt}} — Active instrument, space group, and workflow stage`;
+    }}
+    const appTitle = document.getElementById("app-title");
+    const appVer = document.getElementById("app-version");
+    if (appTitle) {{
+      const verStr = appVer ? (appVer.textContent || "").trim() : "";
+      appTitle.title = `sUBhkl ${{verStr}} — Quasi-Laue & TOF single-crystal neutron diffraction indexing, integration, and scaling`;
+      if (appVer) appVer.title = `sUBhkl version ${{verStr}}`;
+    }}
+    const peaksPill = document.getElementById("hud-peaks-pill");
+    if (peaksPill && stats) {{
+      const srcDesc = state.peakSource === "integrated" ? "integrated" : "predicted";
+      const wlLo = Number(state.lamMin || 0).toFixed(2);
+      const wlHi = Number(state.lamMax || 0).toFixed(2);
+      const dCut = Number(state.dMin || 0).toFixed(2);
+      peaksPill.title =
+        `PEAKS ${{stats.peaksText}}: ${{stats.nCap}} indexed reflections captured by enabled Laue zones [uvw] (numerator) ` +
+        `out of ${{stats.nVis}} visible ${{srcDesc}} reflections on this frame within λ=${{wlLo}}–${{wlHi}} Å and d ≥ ${{dCut}} Å (denominator)`;
+    }}
+    const rmsPill = document.getElementById("hud-rms-pill");
+    if (rmsPill && stats) {{
+      rmsPill.title = stats.nErr > 0
+        ? `Δθ = ${{stats.rmsText}} (across ${{stats.nErr}} matched detector spots in active zones): RMS angular offset between observed spot centroids and theoretical UB·hkl Bragg directions (lower = tighter indexing; updates live during Solve)`
+        : "Δθ: RMS angular offset between observed detector spot centroids and theoretical UB·hkl Bragg directions across active-zone spots (run 2. Solve or enable zones covering observed spots)";
+    }}
+    const zonesPill = document.getElementById("hud-zones-pill");
+    if (zonesPill && stats) {{
+      zonesPill.title = `ZONES ${{stats.zonesText}}: ${{state.activeZones.size}} active Laue zone conics [uvw] displayed on the detector and Wulff map (max Miller index order |u|,|v|,|w| ≤ ${{state.maxZoneOrder}})`;
+    }}
+    const gonioPill = document.getElementById("hud-gonio-pill");
+    if (gonioPill && stats) {{
+      gonioPill.title = `GONIO: ${{stats.gonioText}} — Goniometer motor angles / crystal setting for the active frame`;
+    }}
+    const selFrame = document.getElementById("sel-frame");
+    const frameCtrl = document.getElementById("hud-frame-ctrl");
+    if (selFrame) {{
+      const selOpt = selFrame.options && selFrame.selectedIndex >= 0 ? selFrame.options[selFrame.selectedIndex] : null;
+      const fTxt = selOpt ? selOpt.textContent : "1 / 1";
+      const fTotal = (DATA.frames && DATA.frames.length) ? DATA.frames.length : 1;
+      const fCur = (typeof DATA.frame_index === "number" ? DATA.frame_index : 0) + 1;
+      const fullFrameTip = `FRAME (${{fCur}} / ${{fTotal}}): ${{fTxt}} — Switch active run / goniometer orientation`;
+      selFrame.title = fullFrameTip;
+      if (frameCtrl) frameCtrl.title = fullFrameTip;
+    }}
+    const selData = document.getElementById("sel-galaxy-h5");
+    if (selData) {{
+      const optD = selData.options && selData.selectedIndex >= 0 ? selData.options[selData.selectedIndex] : null;
+      const dTxt = optD && optD.value && !String(optD.value).startsWith("__action_") ? `${{optD.textContent}} — ` : "";
+      selData.title = `${{dTxt}}Data Source: Load Neutron Data (SNS/HFIR), open local HDF5/NeXus/.mtz files, or select from Galaxy History`;
+    }}
+    const btnArcs = document.getElementById("btn-zone-arcs");
+    if (btnArcs) {{
+      btnArcs.title = `Arcs (${{state.showZoneArcs ? "Shown" : "Hidden"}}): Show/Hide single-arc Laue zone curves [uvw] on the detector`;
+    }}
+    const btnCmap = document.getElementById("btn-heatmap-cmap");
+    if (btnCmap) {{
+      const cmapNames = {{ magma: "Magma", cyan: "Cyan Glow", gray: "Film (Monochrome)" }};
+      btnCmap.title = `Heatmap (${{cmapNames[state.heatmapStyle] || state.heatmapStyle}}): Cycle detector intensity colormap (Magma / Cyan Glow / Film)`;
+    }}
+    const btnStereo = document.getElementById("btn-stereo-toggle");
+    if (btnStereo) {{
+      btnStereo.title = `Wulff (${{state.showStereo ? "Shown" : "Hidden"}}): Show/Hide 3D Crystal Wulff Stereogram Inset`;
+    }}
+  }}
+
   function updateHUD() {{
     const visiblePeaks = PEAKS.filter(isPeakVisible);
     const capturedPeaks = visiblePeaks.filter(p => p.indexed && isPeakCapturedByActiveZone(p));
     const nVis = visiblePeaks.length;
     const nCap = capturedPeaks.length;
     const pct = nVis > 0 ? ((nCap / nVis) * 100).toFixed(1) : "0.0";
+    const peaksText = `${{nCap}} / ${{nVis}} (${{pct}}%)`;
 
-    document.getElementById("val-indexed").textContent = `${{nCap}} / ${{nVis}} (${{pct}}%)`;
-    const rms = nCap > 0
-      ? Math.sqrt(capturedPeaks.reduce((s, p) => s + p.angular_error_deg * p.angular_error_deg, 0) / nCap)
+    document.getElementById("val-indexed").textContent = peaksText;
+    const errPeaks = capturedPeaks.filter(
+      p => (p.peak_source === "integrated" || p.has_angular_error === true) &&
+           typeof p.angular_error_deg === "number" &&
+           Number.isFinite(p.angular_error_deg)
+    );
+    const nErr = errPeaks.length;
+    const rms = nErr > 0
+      ? Math.sqrt(errPeaks.reduce((s, p) => s + p.angular_error_deg * p.angular_error_deg, 0) / nErr)
       : 0.0;
-    document.getElementById("val-rms").textContent = `${{rms.toFixed(3)}}°`;
+    const rmsText = nErr > 0 ? `${{rms.toFixed(3)}}°` : "—";
+    document.getElementById("val-rms").textContent = rmsText;
+    const zonesText = `${{state.activeZones.size}} (≤${{state.maxZoneOrder}})`;
     const elZones = document.getElementById("val-zones");
-    if (elZones) elZones.textContent = `${{state.activeZones.size}} (≤${{state.maxZoneOrder}})`;
+    if (elZones) elZones.textContent = zonesText;
     const elGonio = document.getElementById("val-gonio");
+    let gonioText = "—";
     if (elGonio) {{
       const frames = DATA.frames || [];
       const fIdx = typeof DATA.frame_index === "number" ? DATA.frame_index : 0;
       const curF = frames[fIdx];
-      elGonio.textContent = (curF && curF.motor_summary) || DATA.goniometer_summary || "—";
+      gonioText = (curF && curF.motor_summary) || DATA.goniometer_summary || "—";
+      elGonio.textContent = gonioText;
     }}
+    syncTopBarTooltips({{ peaksText, nCap, nVis, rmsText, nErr, zonesText, gonioText }});
     drawHistogram(visiblePeaks);
     if (typeof fitHorizontalBars === "function") fitHorizontalBars(true);
   }}
@@ -12345,7 +12735,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const topBar = document.querySelector(".top-bar");
     if (topBar) {{
       topBar.style.setProperty("--top-bar-scale", "1");
-      const availW = Math.max(0, topBar.clientWidth - 16);
+      const availW = Math.max(0, topBar.clientWidth - 24);
       const brand = topBar.querySelector(".brand-block");
       const hud = topBar.querySelector(".hud-metrics");
       const ctrls = topBar.querySelector(".controls-cluster");
@@ -12353,12 +12743,25 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         (brand ? brand.scrollWidth : 0) +
         (hud ? hud.scrollWidth : 0) +
         (ctrls ? ctrls.scrollWidth : 0) +
-        16;
+        30;
+      let scale = 1.0;
       if (availW > 0 && naturalW > availW) {{
-        let scale = Math.max(0.45, Math.min(1.0, (availW / naturalW) * 0.985));
+        scale = Math.max(0.45, Math.min(1.0, (availW / naturalW) * 0.98));
         topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
-        if (topBar.scrollWidth > topBar.clientWidth) {{
-          scale = Math.max(0.40, scale * (topBar.clientWidth / topBar.scrollWidth) * 0.985);
+      }}
+      if (topBar.scrollWidth > topBar.clientWidth && topBar.clientWidth > 0) {{
+        scale = Math.max(0.40, scale * (topBar.clientWidth / topBar.scrollWidth) * 0.98);
+        topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
+      }}
+      if (brand && hud && ctrls && topBar.clientWidth > 0) {{
+        const br = brand.getBoundingClientRect();
+        const hr = hud.getBoundingClientRect();
+        const cr = ctrls.getBoundingClientRect();
+        const overlapPx =
+          Math.max(0, br.right + 4 - hr.left) +
+          Math.max(0, hr.right + 4 - cr.left);
+        if (overlapPx > 0.5) {{
+          scale = Math.max(0.40, scale * (topBar.clientWidth / (topBar.clientWidth + overlapPx + 12)));
           topBar.style.setProperty("--top-bar-scale", scale.toFixed(3));
         }}
       }}
@@ -12684,7 +13087,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const nBins = 20;
     const maxDeg = 1.5;
     const bins = new Array(nBins).fill(0);
-    visiblePeaks.forEach(p => {{
+    const histPeaks = visiblePeaks.filter(
+      p => (p.peak_source === "integrated" || p.has_angular_error === true) &&
+           typeof p.angular_error_deg === "number" &&
+           Number.isFinite(p.angular_error_deg)
+    );
+    histPeaks.forEach(p => {{
       const b = Math.min(nBins - 1, Math.floor((p.angular_error_deg / maxDeg) * nBins));
       if (b >= 0) bins[b]++;
     }});
@@ -15162,6 +15570,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.showZoneArcs = !state.showZoneArcs;
     ev.currentTarget.classList.toggle("active-btn", state.showZoneArcs);
     ev.currentTarget.textContent = "Arcs";
+    syncTopBarTooltips(null);
   }});
 
   const btnPixelMask = document.getElementById("btn-pixel-mask");
@@ -15349,12 +15758,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const labels = {{ magma: "Magma", cyan: "Cyan", gray: "Film" }};
     state.heatmapStyle = order[(order.indexOf(state.heatmapStyle) + 1) % order.length];
     ev.currentTarget.textContent = labels[state.heatmapStyle];
+    syncTopBarTooltips(null);
     rebuildBankColorMaps();
   }});
 
   document.getElementById("btn-stereo-toggle").addEventListener("click", () => {{
     state.showStereo = !state.showStereo;
     syncWulffUI();
+    syncTopBarTooltips(null);
   }});
 
   const btnWulffScope = document.getElementById("btn-wulff-scope");
@@ -15448,14 +15859,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   syncWulffYawFromDetector();
   syncWulffUI();
 
-  document.getElementById("btn-zones-all").addEventListener("click", () => {{
-    state.activeZones = new Set(
-      ZONES.filter(z => (z.order || 1) <= state.maxZoneOrder).map(z => z.zone_id)
-    );
-    renderZoneList();
-    updateHUD();
-  }});
-
   document.getElementById("btn-zones-none").addEventListener("click", () => {{
     state.activeZones = new Set();
     renderZoneList();
@@ -15512,27 +15915,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }} else {{
       selectLadderRung((state.currentRungIdx + 1) % LADDER.length);
     }}
-  }});
-
-  document.getElementById("btn-ladder-play").addEventListener("click", (ev) => {{
-    if (state.ladderTimer) {{
-      clearInterval(state.ladderTimer);
-      state.ladderTimer = null;
-      ev.currentTarget.textContent = "WALK SOLVE STEPS";
-      return;
-    }}
-    selectPipelineStage(1, false);
-    selectLadderRung(0, false);
-    ev.currentTarget.textContent = "STOP";
-    state.ladderTimer = setInterval(() => {{
-      if (state.currentRungIdx + 1 < LADDER.length) {{
-        selectLadderRung(state.currentRungIdx + 1, false);
-      }} else {{
-        clearInterval(state.ladderTimer);
-        state.ladderTimer = null;
-        document.getElementById("btn-ladder-play").textContent = "WALK SOLVE STEPS";
-      }}
-    }}, 1800);
   }});
 
   // Open in its own full-screen browser tab when embedded inside an outer host iframe (e.g. Galaxy).
@@ -19829,6 +20211,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 aj.partial_overlay.peaks.forEach(p => SAMPLE_PEAKS.push(p));
                 PREDICTED_SAMPLE_PEAKS = [...SAMPLE_PEAKS];
               }}
+              captureBaselineMeasurements(
+                {{ integPeaks: [], predPeaks: PEAKS, integSample: [], predSample: SAMPLE_PEAKS }},
+                aj.partial_overlay,
+                true
+              );
               _visDetPeaksSig = "";
               _peakDataAvailabilitySig = "";
               _lastWulffRenderSig = "";
