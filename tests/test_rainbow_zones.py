@@ -6507,13 +6507,18 @@ def test_merge_resolution_table_csv_html_popup_and_lazy_download(tmp_path):
     assert parsed_csv[-1]["cc_half"] == "0.8124"
 
     html_art = render_merge_table_html(metrics)
-    assert "BUBBLE BOBBLE HIGH SCORE // RESOLUTION SHELL HALL OF FAME" in html_art
-    assert "Copy for Word / Excel" in html_art
+    assert "BUBBLE" not in html_art.upper()
+    assert "1UP" not in html_art.upper()
+    assert "Word / Excel" not in html_art
+    assert ">Copy</button>" in html_art
+    assert "Download .csv" not in html_art
+    assert "Georgia" in html_art
+    assert "#0a1020" in html_art and "#bae6fd" in html_art
     assert "I 1 2 1" in html_art
     assert "0.302" in html_art
     assert "background:#ffffff;color:#000000" in html_art
 
-    # Verify Rainbow Zones main UI embeds modal, buttons, and matching client-side summarization
+    # Verify Rainbow Zones main UI embeds subtle ☆ Table button, monochrome blue-on-dark modal, Copy button, and no duplicate download buttons
     payload = build_rainbow_zone_payload(instrument="MANDI", include_panel_images=False)
     payload["artifact_kind"] = "merged_careless"
     payload["space_group"] = "I 1 2 1"
@@ -6523,9 +6528,18 @@ def test_merge_resolution_table_csv_html_popup_and_lazy_download(tmp_path):
     ui_html = render_rainbow_html(payload)
     assert 'id="modal-merge-table"' in ui_html
     assert 'id="btn-hist-open-table"' in ui_html
-    assert 'id="btn-hist-dl-csv"' in ui_html
-    assert 'id="btn-hist-dl-html"' in ui_html
+    assert "☆ Table" in ui_html
+    assert "🏆" not in ui_html
+    assert "📋" not in ui_html
+    assert "BUBBLE" not in ui_html.upper()
+    assert "Word / Excel" not in ui_html
+    assert 'id="btn-hist-dl-csv"' not in ui_html
+    assert 'id="btn-hist-dl-html"' not in ui_html
+    assert 'id="btn-merge-tbl-csv"' not in ui_html
+    assert 'id="btn-merge-tbl-html"' not in ui_html
+    assert 'id="btn-merge-tbl-style"' not in ui_html
     assert 'id="btn-merge-tbl-copy"' in ui_html
+    assert ">Copy</button>" in ui_html
 
     if shutil.which("node"):
         script_blocks = re.findall(r"<script>([\s\S]*?)</script>", ui_html)
@@ -6562,9 +6576,8 @@ def test_merge_resolution_table_csv_html_popup_and_lazy_download(tmp_path):
 
         modal_harness = f"""
 const DATA = {json.dumps({"space_group": payload["space_group"], "cell": payload["cell"], "wavelength_range": payload["wavelength_range"], "merge_metrics": metrics})};
-let mergeTableStyleMode = "arcade";
 const els = {{}};
-["merge-tbl-card", "merge-tbl-rainbow", "merge-tbl-kicker", "merge-tbl-modal-title", "merge-tbl-meta", "btn-merge-tbl-style", "merge-tbl-body-wrap"].forEach(id => {{
+["merge-tbl-card", "merge-tbl-modal-title", "merge-tbl-meta", "merge-tbl-body-wrap"].forEach(id => {{
   els[id] = {{ style: {{}}, innerHTML: "", textContent: "" }};
 }});
 globalThis.document = {{ getElementById: (id) => els[id] || null }};
@@ -6574,12 +6587,9 @@ globalThis.document = {{ getElementById: (id) => els[id] || null }};
 const clientData = buildClientMergeTableData();
 const clip = buildMergeTableClipboardPayloads(clientData);
 renderMergeTableModalContent();
-const arcadeHtml = els["merge-tbl-body-wrap"].innerHTML;
-const arcadeBg = els["merge-tbl-card"].style.background;
-mergeTableStyleMode = "publication";
-renderMergeTableModalContent();
-const pubHtml = els["merge-tbl-body-wrap"].innerHTML;
-const pubBg = els["merge-tbl-card"].style.background;
+const modalHtml = els["merge-tbl-body-wrap"].innerHTML;
+const modalBg = els["merge-tbl-card"].style.background;
+const modalFg = els["merge-tbl-card"].style.color;
 
 console.log(JSON.stringify({{
   dCc30: clientData.dCc30,
@@ -6587,10 +6597,9 @@ console.log(JSON.stringify({{
   cleanHtml: clip.cleanHtml,
   tsv: clip.tsv,
   csv: clip.csv,
-  arcadeHtml,
-  arcadeBg,
-  pubHtml,
-  pubBg,
+  modalHtml,
+  modalBg,
+  modalFg,
 }}));
 """
         mh_path = tmp_path / "merge_modal_harness.js"
@@ -6605,10 +6614,11 @@ console.log(JSON.stringify({{
         assert "11.99 – 4.90" in jout["cleanHtml"]
         assert "Overall\t11.99 – 2.30\t3840\t1280" in jout["tsv"]
         assert jout["csv"] == csv_text
-        assert jout["arcadeBg"] == "#10162b"
-        assert "1ST" in jout["arcadeHtml"] and "#fbbf24" in jout["arcadeHtml"]
-        assert jout["pubBg"] == "#ffffff"
-        assert "1ST" not in jout["pubHtml"]
+        assert jout["modalBg"] == "#0a1020"
+        assert jout["modalFg"] == "#bae6fd"
+        assert "Georgia" in jout["modalHtml"]
+        assert "1ST" not in jout["modalHtml"]
+        assert "#fbbf24" not in jout["modalHtml"] and "#34d399" not in jout["modalHtml"]
 
     # Verify _stamp_careless_merge_into_h5 vectorized n_obs/multiplicity + lazy resolve_artifact_for_download
     work_dir = tmp_path / "merge_work"
@@ -6698,7 +6708,7 @@ console.log(JSON.stringify({{
         assert abs(b["multiplicity"] - 3.0) < 1e-6
 
     # Delete merge_table.csv and merge_table.html to simulate a pre-existing workspace,
-    # then verify list_step_artifacts and resolve_artifact_for_download lazily recreate them!
+    # then verify Files (list_step_artifacts) exposes ONLY merge_table.csv (not duplicate merge_table.html)
     (work_dir / "merge_table.csv").unlink()
     (work_dir / "merge_table.html").unlink()
     runner._local_artifacts = {
@@ -6708,9 +6718,8 @@ console.log(JSON.stringify({{
     arts = runner.list_step_artifacts(current_h5=str(integ_h5))
     merge_art_by_name = {a["name"]: a for a in arts["merge"]}
     assert "merge_table.csv" in merge_art_by_name
-    assert "merge_table.html" in merge_art_by_name
+    assert "merge_table.html" not in merge_art_by_name
     assert merge_art_by_name["merge_table.csv"]["stage_id"] == "merge"
-    assert merge_art_by_name["merge_table.html"]["stage_id"] == "merge"
 
     # Unlink once more and test direct on-demand resolve_artifact_for_download
     (work_dir / "merge_table.csv").unlink()
@@ -6726,4 +6735,4 @@ console.log(JSON.stringify({{
     assert dl_csv is not None and dl_csv[1] == "merge_table.csv"
     assert dl_html is not None and dl_html[1] == "merge_table.html"
     assert "resolution_range_A" in Path(dl_csv[0]).read_text(encoding="utf-8")
-    assert "Copy for Word / Excel" in Path(dl_html[0]).read_text(encoding="utf-8")
+    assert ">Copy</button>" in Path(dl_html[0]).read_text(encoding="utf-8")

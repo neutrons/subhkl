@@ -1477,7 +1477,6 @@ class NovaGalaxyPipelineRunner:
                 "predictions.mtz",
                 "xval.mtz",
                 "careless_metrics.json",
-                "merge_table.html",
                 "merge_table.csv",
                 "careless_0.mtz",
                 "careless_predictions_0.mtz",

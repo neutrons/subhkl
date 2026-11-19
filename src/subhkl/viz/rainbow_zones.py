@@ -4920,29 +4920,19 @@ def render_merge_table_html(
     space_group: str | None = None,
     cell: Sequence[float] | None = None,
     wavelength_range: Sequence[float] | None = None,
-    default_style: str = "arcade",
+    default_style: str = "blue_dark",
     title: str | None = None,
 ) -> str:
-    """Render a self-contained HTML artifact with Arcade High Score & Publication Table views + Word/Excel copy."""
+    """Render a self-contained HTML artifact in monochrome blue-on-dark publication layout with HTML/TSV copy."""
     import html as _html
 
+    _ = default_style
     data = build_merge_resolution_table_data(
         merge_metrics,
         space_group=space_group,
         cell=cell,
         wavelength_range=wavelength_range,
         title=title,
-    )
-    csv_text = render_merge_table_csv(
-        merge_metrics,
-        space_group=space_group,
-        cell=cell,
-        wavelength_range=wavelength_range,
-    )
-    init_mode = (
-        "publication"
-        if str(default_style).lower() in ("pro", "boring", "publication", "print")
-        else "arcade"
     )
     meta_parts: list[str] = []
     if data["space_group"]:
@@ -4973,11 +4963,9 @@ def render_merge_table_html(
     ]
 
     for r in data["rows"]:
-        tier = r["cc_tier"]
         body_rows_html.append(
-            f'<tr class="shell-row tier-{tier}">'
-            f'<td class="col-shell"><span class="rank-pill">{_html.escape(r["rank_badge"])}</span>'
-            f'<span class="pub-shell-num">{r["shell"]}</span></td>'
+            "<tr>"
+            f'<td class="col-shell">{r["shell"]}</td>'
             f'<td class="col-res">{_html.escape(r["range_display"])}</td>'
             f'<td class="num">{_fmt_int(r["n_obs"])}</td>'
             f'<td class="num">{_fmt_int(r["n_unique"])}</td>'
@@ -4985,9 +4973,9 @@ def render_merge_table_html(
             f'<td class="num">{_fmt(r["multiplicity"], 2)}</td>'
             f'<td class="num">{_fmt(r["completeness_pct"], 1)}</td>'
             f'<td class="num">{_fmt(r["mean_isigi"], 2)}</td>'
-            f'<td class="num cc-cell cc-{tier}">{_fmt(r["cc_half"], 3)}</td>'
+            f'<td class="num cc-cell">{_fmt(r["cc_half"], 3)}</td>'
             f'<td class="num">{_fmt(r["cc_star"], 3)}</td>'
-            f"</tr>"
+            "</tr>"
         )
         clean_rows_html.append(
             "<tr>"
@@ -5025,11 +5013,9 @@ def render_merge_table_html(
         )
 
     ov = data["overall"]
-    ov_tier = ov["cc_tier"]
     foot_html = (
-        f'<tr class="overall-row tier-{ov_tier}">'
-        f'<td class="col-shell"><span class="rank-pill">ALL</span>'
-        f'<span class="pub-shell-num">Overall</span></td>'
+        '<tr class="overall-row">'
+        '<td class="col-shell">Overall</td>'
         f'<td class="col-res">{_html.escape(ov["range_display"])}</td>'
         f'<td class="num">{_fmt_int(ov["n_obs"])}</td>'
         f'<td class="num">{_fmt_int(ov["n_unique"])}</td>'
@@ -5037,9 +5023,9 @@ def render_merge_table_html(
         f'<td class="num">{_fmt(ov["multiplicity"], 2)}</td>'
         f'<td class="num">{_fmt(ov["completeness_pct"], 1)}</td>'
         f'<td class="num">{_fmt(ov["mean_isigi"], 2)}</td>'
-        f'<td class="num cc-cell cc-{ov_tier}">{_fmt(ov["cc_half"], 3)}</td>'
+        f'<td class="num cc-cell">{_fmt(ov["cc_half"], 3)}</td>'
         f'<td class="num">{_fmt(ov["cc_star"], 3)}</td>'
-        f"</tr>"
+        "</tr>"
     )
     clean_foot_html = (
         '<tr style="border-top:1px solid #000;border-bottom:2px solid #000;font-weight:bold;">'
@@ -5097,16 +5083,10 @@ def render_merge_table_html(
         f"<tfoot>{clean_foot_html}</tfoot>"
         "</table></div>"
     )
-    stage_badge = (
-        f'<span class="stage-clear-badge">STAGE CLEAR \u2022 d(CC\u00bd \u2265 0.30) = {data["d_cc30"]:.2f} \u00c5</span>'
-        if data["d_cc30"] is not None
-        else '<span class="stage-clear-badge">CARE-LESS MERGE SCOREBOARD</span>'
-    )
     payload_js = json.dumps(
         {
             "clean_html": clean_clip_html,
             "tsv": "\n".join(tsv_lines),
-            "csv": csv_text,
         }
     ).replace("</", "<\\/")
 
@@ -5117,49 +5097,23 @@ def render_merge_table_html(
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>{_html.escape(data["title"])}</title>
 <style>
-  :root {{
-    --arcade-bg: #080b18;
-    --arcade-card: #10162b;
-    --arcade-border: #2a3966;
-    --arcade-cyan: #38bdf8;
-    --arcade-pink: #f472b6;
-    --arcade-gold: #fbbf24;
-    --arcade-green: #34d399;
-    --arcade-red: #f43f5e;
-  }}
   * {{ box-sizing: border-box; }}
   body {{
     margin: 0;
     padding: 24px;
-    font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
-    background: var(--arcade-bg);
-    color: #f1f5f9;
-  }}
-  body.mode-publication {{
-    background: #f8fafc;
-    color: #0f172a;
     font-family: Georgia, 'Times New Roman', Times, serif;
+    background: #070911;
+    color: #bae6fd;
   }}
   .wrap {{
-    max-width: 980px;
+    max-width: 960px;
     margin: 0 auto;
-    border-radius: 12px;
+    border-radius: 8px;
     overflow: hidden;
-    background: var(--arcade-card);
-    border: 2px solid var(--arcade-border);
-    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55), 0 0 28px rgba(56, 189, 248, 0.14);
+    background: #0a1020;
+    border: 1px solid rgba(56, 189, 248, 0.38);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.65), 0 0 24px rgba(56, 189, 248, 0.10);
   }}
-  body.mode-publication .wrap {{
-    background: #ffffff;
-    border: 1px solid #cbd5e1;
-    border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(15, 23, 42, 0.06);
-  }}
-  .rainbow-strip {{
-    height: 6px;
-    background: linear-gradient(90deg, #ff3b6b, #ff922b, #ffd43b, #38d9a9, #38bdf8, #a855f7, #f472b6);
-  }}
-  body.mode-publication .rainbow-strip {{ display: none; }}
   .toolbar {{
     display: flex;
     flex-wrap: wrap;
@@ -5167,47 +5121,19 @@ def render_merge_table_html(
     justify-content: space-between;
     gap: 10px;
     padding: 14px 18px;
-    border-bottom: 1px solid rgba(148, 163, 184, 0.2);
+    border-bottom: 1px solid rgba(56, 189, 248, 0.20);
   }}
-  .arcade-kicker {{
-    font-size: 0.72rem;
-    letter-spacing: 0.12em;
-    color: var(--arcade-pink);
-    font-weight: 800;
-    text-transform: uppercase;
-  }}
-  body.mode-publication .arcade-kicker {{ display: none; }}
   h1 {{
-    margin: 2px 0 0 0;
-    font-size: 1.05rem;
-    color: #f8fafc;
-  }}
-  body.mode-publication h1 {{
-    color: #0f172a;
-    font-size: 1.15rem;
+    margin: 0;
+    font-size: 1.08rem;
     font-weight: 700;
+    color: #e0f2fe;
   }}
   .meta-line {{
-    font-size: 0.76rem;
-    color: #94a3b8;
+    font-size: 0.78rem;
+    color: rgba(147, 197, 253, 0.78);
     margin-top: 4px;
   }}
-  body.mode-publication .meta-line {{
-    color: #475569;
-    font-family: system-ui, -apple-system, sans-serif;
-  }}
-  .stage-clear-badge {{
-    display: inline-block;
-    margin-top: 6px;
-    padding: 2px 9px;
-    border-radius: 999px;
-    font-size: 0.70rem;
-    font-weight: 700;
-    background: rgba(52, 211, 153, 0.14);
-    border: 1px solid rgba(52, 211, 153, 0.55);
-    color: var(--arcade-green);
-  }}
-  body.mode-publication .stage-clear-badge {{ display: none; }}
   .actions {{
     display: flex;
     flex-wrap: wrap;
@@ -5216,44 +5142,34 @@ def render_merge_table_html(
   }}
   button {{
     cursor: pointer;
-    border-radius: 6px;
-    border: 1px solid #334155;
-    background: #1e293b;
-    color: #e2e8f0;
-    font-family: system-ui, -apple-system, sans-serif;
-    font-size: 0.76rem;
+    border-radius: 5px;
+    border: 1px solid rgba(56, 189, 248, 0.55);
+    background: rgba(14, 116, 144, 0.22);
+    color: #e0f2fe;
+    font-family: Georgia, 'Times New Roman', Times, serif;
+    font-size: 0.80rem;
     font-weight: 600;
-    padding: 6px 11px;
+    padding: 5px 12px;
   }}
-  button:hover {{ border-color: var(--arcade-cyan); color: #ffffff; }}
-  button.primary {{
-    background: linear-gradient(135deg, #0284c7, #2563eb);
-    border-color: #38bdf8;
+  button:hover {{
+    background: rgba(56, 189, 248, 0.22);
+    border-color: #7dd3fc;
     color: #ffffff;
-  }}
-  body.mode-publication button {{
-    background: #f1f5f9;
-    color: #0f172a;
-    border-color: #cbd5e1;
-  }}
-  body.mode-publication button.primary {{
-    background: #0f172a;
-    color: #ffffff;
-    border-color: #0f172a;
   }}
   .table-box {{ padding: 14px 18px 18px 18px; overflow-x: auto; }}
   table.merge-tbl {{
     width: 100%;
     border-collapse: collapse;
     font-variant-numeric: tabular-nums;
-    font-size: 0.82rem;
+    font-size: 0.86rem;
+    color: #bae6fd;
   }}
   table.merge-tbl th {{
-    padding: 8px 9px;
+    padding: 7px 9px;
     text-align: right;
-    color: var(--arcade-cyan);
-    border-top: 2px solid #38bdf8;
-    border-bottom: 1px solid #334155;
+    color: #7dd3fc;
+    border-top: 2px solid rgba(125, 211, 252, 0.72);
+    border-bottom: 1px solid rgba(125, 211, 252, 0.40);
     font-weight: 700;
     white-space: nowrap;
   }}
@@ -5264,102 +5180,46 @@ def render_merge_table_html(
     text-align: center;
   }}
   table.merge-tbl td {{
-    padding: 6px 9px;
+    padding: 5px 9px;
     text-align: right;
-    border-bottom: 1px solid rgba(51, 65, 85, 0.48);
+    border-bottom: none;
     white-space: nowrap;
   }}
   table.merge-tbl tbody tr:hover {{
-    background: rgba(56, 189, 248, 0.08);
+    background: rgba(56, 189, 248, 0.07);
   }}
-  .rank-pill {{
-    display: inline-block;
-    min-width: 38px;
-    padding: 1px 6px;
-    border-radius: 4px;
-    font-size: 0.68rem;
-    font-weight: 800;
-    background: rgba(244, 114, 182, 0.16);
-    border: 1px solid rgba(244, 114, 182, 0.45);
-    color: #f9a8d4;
-  }}
-  .pub-shell-num {{ display: none; }}
-  body.mode-publication .rank-pill {{ display: none; }}
-  body.mode-publication .pub-shell-num {{ display: inline; }}
-  .cc-cell {{ font-weight: 700; }}
-  .cc-green {{ color: var(--arcade-green); }}
-  .cc-yellow {{ color: var(--arcade-gold); }}
-  .cc-red {{ color: var(--arcade-red); }}
-  .cc-na {{ color: #94a3b8; }}
+  .cc-cell {{ font-weight: 600; color: #e0f2fe; }}
   tr.overall-row td {{
-    border-top: 2px solid #38bdf8;
-    border-bottom: 2px solid #f472b6;
-    font-weight: 800;
-    background: rgba(56, 189, 248, 0.08);
-  }}
-  body.mode-publication table.merge-tbl {{
-    color: #0f172a;
-    font-size: 0.88rem;
-  }}
-  body.mode-publication table.merge-tbl th {{
-    color: #0f172a;
-    border-top: 2px solid #0f172a;
-    border-bottom: 1px solid #0f172a;
-    background: transparent;
-  }}
-  body.mode-publication table.merge-tbl td {{
-    border-bottom: none;
-    color: #0f172a;
-  }}
-  body.mode-publication .cc-green,
-  body.mode-publication .cc-yellow,
-  body.mode-publication .cc-red {{
-    color: #0f172a;
-  }}
-  body.mode-publication tr.overall-row td {{
-    border-top: 1px solid #0f172a;
-    border-bottom: 2px solid #0f172a;
-    background: transparent;
+    border-top: 1px solid rgba(125, 211, 252, 0.40);
+    border-bottom: 2px solid rgba(125, 211, 252, 0.72);
+    font-weight: 700;
+    color: #e0f2fe;
   }}
   .legend-foot {{
     margin-top: 10px;
-    font-size: 0.71rem;
-    color: #94a3b8;
-    display: flex;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 8px;
-  }}
-  body.mode-publication .arcade-legend {{ display: none; }}
-  body.mode-publication .legend-foot {{
-    color: #475569;
-    font-family: system-ui, -apple-system, sans-serif;
+    font-size: 0.74rem;
+    color: rgba(147, 197, 253, 0.72);
   }}
   @media print {{
-    body {{ background: #ffffff !important; color: #000000 !important; padding: 0; font-family: Georgia, serif; }}
-    .wrap {{ border: none !important; box-shadow: none !important; }}
-    .rainbow-strip, .actions, .arcade-kicker, .stage-clear-badge, .rank-pill, .arcade-legend {{ display: none !important; }}
-    .pub-shell-num {{ display: inline !important; }}
+    body {{ background: #ffffff !important; color: #000000 !important; padding: 0; }}
+    .wrap {{ border: none !important; box-shadow: none !important; background: #ffffff !important; }}
+    .actions {{ display: none !important; }}
+    h1, .meta-line, .legend-foot {{ color: #000000 !important; }}
     table.merge-tbl th {{ color: #000 !important; border-top: 2px solid #000 !important; border-bottom: 1px solid #000 !important; }}
     table.merge-tbl td, .cc-cell {{ color: #000 !important; border-bottom: none !important; }}
-    tr.overall-row td {{ border-top: 1px solid #000 !important; border-bottom: 2px solid #000 !important; background: transparent !important; }}
+    tr.overall-row td {{ color: #000 !important; border-top: 1px solid #000 !important; border-bottom: 2px solid #000 !important; }}
   }}
 </style>
 </head>
-<body class="mode-{init_mode}">
+<body>
   <div class="wrap">
-    <div class="rainbow-strip"></div>
     <div class="toolbar">
       <div>
-        <div class="arcade-kicker">1UP \u2022 BUBBLE BOBBLE HIGH SCORE // RESOLUTION SHELL HALL OF FAME</div>
         <h1>{_html.escape(data["title"])}</h1>
         {f'<div class="meta-line">{meta_line}</div>' if meta_line else ""}
-        {stage_badge}
       </div>
       <div class="actions">
-        <button id="btn-toggle-style" type="button">Style: {"Publication" if init_mode == "publication" else "Arcade High Score"}</button>
-        <button id="btn-copy-pub" class="primary" type="button" title="Copy clean black-on-white formatted table + tab-separated values for direct paste into Microsoft Word, Google Docs, or Excel">Copy for Word / Excel</button>
-        <button id="btn-dl-csv" type="button">Download .csv</button>
+        <button id="btn-copy-pub" type="button" title="Copy formatted HTML table and tab-separated values to clipboard">Copy</button>
       </div>
     </div>
     <div class="table-box">
@@ -5387,23 +5247,13 @@ def render_merge_table_html(
       </table>
       <div class="legend-foot">
         <span>CC* = [2 CC<sub>1/2</sub> / (1 + CC<sub>1/2</sub>)]<sup>1/2</sup> (Karplus &amp; Diederichs, 2012).</span>
-        <span class="arcade-legend">CC<sub>1/2</sub> tiers: <strong class="cc-green">\u2265 0.80</strong> \u2022 <strong class="cc-yellow">0.30\u20130.79</strong> \u2022 <strong class="cc-red">&lt; 0.30</strong></span>
       </div>
     </div>
   </div>
 <script>
 (function() {{
   const EXPORT_DATA = {payload_js};
-  const btnToggle = document.getElementById("btn-toggle-style");
   const btnCopy = document.getElementById("btn-copy-pub");
-  const btnCsv = document.getElementById("btn-dl-csv");
-  if (btnToggle) {{
-    btnToggle.addEventListener("click", function() {{
-      const isPub = document.body.classList.toggle("mode-publication");
-      document.body.classList.toggle("mode-arcade", !isPub);
-      btnToggle.textContent = "Style: " + (isPub ? "Publication" : "Arcade High Score");
-    }});
-  }}
   if (btnCopy) {{
     btnCopy.addEventListener("click", async function() {{
       let ok = false;
@@ -5435,22 +5285,8 @@ def render_merge_table_html(
       if (!ok && navigator.clipboard && navigator.clipboard.writeText) {{
         try {{ await navigator.clipboard.writeText(EXPORT_DATA.tsv); ok = true; }} catch (_e3) {{}}
       }}
-      const orig = btnCopy.textContent;
-      btnCopy.textContent = ok ? "Copied for Word / Excel!" : "Copy failed";
-      setTimeout(function() {{ btnCopy.textContent = orig; }}, 1800);
-    }});
-  }}
-  if (btnCsv) {{
-    btnCsv.addEventListener("click", function() {{
-      const blob = new Blob([EXPORT_DATA.csv], {{ type: "text/csv;charset=utf-8" }});
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "merge_table.csv";
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(function() {{ URL.revokeObjectURL(url); }}, 1000);
+      btnCopy.textContent = ok ? "\u2713 Copied" : "Copy failed";
+      setTimeout(function() {{ btnCopy.textContent = "Copy"; }}, 1600);
     }});
   }}
 }})();
@@ -5515,16 +5351,13 @@ def _build_ndip_pipeline_stages(
         return "ready"
 
     merge_artifact_str = (
-        "merged.mtz + predictions.mtz + careless_metrics.json"
-        " + merge_table.html + merge_table.csv"
+        "merged.mtz + predictions.mtz + careless_metrics.json + merge_table.csv"
     )
     if isinstance(merge_metrics, dict) and merge_metrics.get("n_merged_asu"):
         cc_val = merge_metrics.get("cc_half_overall")
         n_asu = int(merge_metrics.get("n_merged_asu", 0))
         cc_txt = f"CC1/2={float(cc_val):.3f} • " if cc_val is not None else ""
-        merge_artifact_str = (
-            f"merged.mtz + merge_table.html/.csv ({cc_txt}{n_asu:,} ASU)"
-        )
+        merge_artifact_str = f"merged.mtz + merge_table.csv ({cc_txt}{n_asu:,} ASU)"
 
     return [
         {
@@ -8956,9 +8789,7 @@ def render_rainbow_html(
         <div id="hist-bar-header" style="display:none;align-items:center;justify-content:space-between;gap:4px;margin-top:4px;padding:0 2px;font-family:var(--font-display);font-size:0.59rem;">
           <span style="color:var(--text-dim);letter-spacing:0.04em;">SHELLS vs d</span>
           <div style="display:flex;align-items:center;gap:3px;">
-            <button id="btn-hist-open-table" type="button" style="padding:1px 6px;font-size:0.58rem;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open publication-ready CC½ / Completeness / ⟨I/σ⟩ resolution table popup (High Score &amp; Word/Excel copy)">🏆 Table</button>
-            <button id="btn-hist-dl-csv" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Download merging statistics vs. resolution (.csv)">↓ CSV</button>
-            <button id="btn-hist-dl-html" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Download merging statistics vs. resolution (.html)">↓ HTML</button>
+            <button id="btn-hist-open-table" type="button" style="padding:1px 6px;font-size:0.58rem;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open merging statistics by resolution shell">☆ Table</button>
           </div>
         </div>
         <canvas id="canvas-hist" aria-label="Resolution sparkline (hover bin for shell edges and statistic; click to cycle metric)" style="display:none;width:100%;height:40px;cursor:pointer;"></canvas>
@@ -9221,25 +9052,20 @@ def render_rainbow_html(
 
   <div id="hist-bin-tooltip" role="tooltip" style="display:none;position:fixed;z-index:9600;pointer-events:none;background:rgba(7,9,19,0.96);border:1px solid var(--accent-cyan);border-radius:5px;padding:4px 8px;box-shadow:0 8px 22px rgba(0,0,0,0.82);font-family:var(--font-display);font-size:0.64rem;line-height:1.35;color:var(--text-main);white-space:nowrap;"></div>
 
-  <!-- Modal Dialog: Publication-Ready / Bubble-Bobble High-Score Merging Statistics Table -->
+  <!-- Modal Dialog: Merging and Scaling Statistics by Resolution Shell -->
   <div id="modal-merge-table" role="dialog" aria-modal="true" aria-labelledby="merge-tbl-modal-title" style="display:none;position:fixed;inset:0;z-index:9400;background:rgba(4,6,14,0.84);backdrop-filter:blur(4px);align-items:center;justify-content:center;padding:14px;">
-    <div id="merge-tbl-card" style="width:min(940px,96vw);max-height:90vh;display:flex;flex-direction:column;border-radius:12px;overflow:hidden;background:#10162b;border:2px solid #2a3966;box-shadow:0 20px 55px rgba(0,0,0,0.82),0 0 28px rgba(56,189,248,0.16);color:#f1f5f9;user-select:text;">
-      <div id="merge-tbl-rainbow" style="height:6px;flex-shrink:0;background:linear-gradient(90deg,#ff3b6b,#ff922b,#ffd43b,#38d9a9,#38bdf8,#a855f7,#f472b6);"></div>
-      <div id="merge-tbl-header" style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:11px 16px;border-bottom:1px solid rgba(148,163,184,0.22);flex-shrink:0;">
+    <div id="merge-tbl-card" style="width:min(940px,96vw);max-height:90vh;display:flex;flex-direction:column;border-radius:8px;overflow:hidden;background:#0a1020;border:1px solid rgba(56,189,248,0.38);box-shadow:0 20px 55px rgba(0,0,0,0.85),0 0 24px rgba(56,189,248,0.10);color:#bae6fd;font-family:Georgia,'Times New Roman',Times,serif;user-select:text;">
+      <div id="merge-tbl-header" style="display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;padding:12px 18px;border-bottom:1px solid rgba(56,189,248,0.20);flex-shrink:0;">
         <div>
-          <div id="merge-tbl-kicker" style="font-family:var(--font-display);font-size:0.66rem;letter-spacing:0.11em;color:#f472b6;font-weight:800;">1UP • BUBBLE BOBBLE HIGH SCORE // RESOLUTION SHELL HALL OF FAME</div>
-          <div id="merge-tbl-modal-title" style="font-size:0.96rem;font-weight:700;margin-top:2px;">Merging and Scaling Statistics by Resolution Shell</div>
-          <div id="merge-tbl-meta" style="font-size:0.68rem;color:#94a3b8;margin-top:3px;"></div>
+          <div id="merge-tbl-modal-title" style="font-size:1.00rem;font-weight:700;color:#e0f2fe;">Merging and Scaling Statistics by Resolution Shell</div>
+          <div id="merge-tbl-meta" style="font-size:0.74rem;color:rgba(147,197,253,0.78);margin-top:3px;"></div>
         </div>
         <div style="display:flex;flex-wrap:wrap;align-items:center;gap:6px;">
-          <button id="btn-merge-tbl-style" type="button" style="padding:4px 9px;font-size:0.68rem;" title="Switch between Bubble-Bobble High-Score Arcade view and clean black-on-white Publication Table preview">Style: Arcade High Score</button>
-          <button id="btn-merge-tbl-copy" type="button" class="active-btn" style="padding:4px 11px;font-size:0.70rem;font-weight:700;" title="Copy clean publication-formatted HTML table + tab-separated values for pasting directly into Word, Google Docs, or Excel">📋 Copy for Word / Excel</button>
-          <button id="btn-merge-tbl-csv" type="button" style="padding:4px 9px;font-size:0.68rem;" title="Download merging statistics as .csv">↓ .csv</button>
-          <button id="btn-merge-tbl-html" type="button" style="padding:4px 9px;font-size:0.68rem;" title="Download standalone merging statistics .html artifact">↓ .html</button>
-          <button id="btn-merge-tbl-close" type="button" style="padding:4px 8px;font-size:0.72rem;" title="Close resolution table (Esc)">✕</button>
+          <button id="btn-merge-tbl-copy" type="button" style="padding:4px 12px;font-family:Georgia,'Times New Roman',Times,serif;font-size:0.74rem;font-weight:600;border-radius:5px;border:1px solid rgba(56,189,248,0.55);background:rgba(14,116,144,0.22);color:#e0f2fe;" title="Copy formatted HTML table and tab-separated values to clipboard">Copy</button>
+          <button id="btn-merge-tbl-close" type="button" style="padding:4px 8px;font-size:0.74rem;border-radius:5px;border:1px solid rgba(56,189,248,0.32);background:transparent;color:#bae6fd;" title="Close resolution table (Esc)">✕</button>
         </div>
       </div>
-      <div id="merge-tbl-scroll" style="padding:12px 16px 14px 16px;overflow:auto;flex:1 1 auto;">
+      <div id="merge-tbl-scroll" style="padding:12px 18px 16px 18px;overflow:auto;flex:1 1 auto;">
         <div id="merge-tbl-body-wrap"></div>
       </div>
     </div>
@@ -12031,18 +11857,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       <span>Completeness=<strong style="color:#34d399;">${{comp}}</strong> (${{nAsu}} ASU / ${{nObs}} obs)</span>
       <span>Multiplicity=<strong>${{mult}}</strong> • Harmonics=<strong>${{harmPct}}</strong></span>
       <span style="margin-left:auto;display:inline-flex;align-items:center;gap:4px;">
-        <button type="button" data-merge-action="open-table" style="padding:1px 6px;font-size:0.58rem;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open publication-ready CC½ / Completeness / ⟨I/σ⟩ resolution shell table">🏆 Table</button>
-        <button type="button" data-merge-action="dl-csv" style="padding:1px 5px;font-size:0.58rem;" title="Download merging statistics (.csv)">↓ CSV</button>
-        <button type="button" data-merge-action="dl-html" style="padding:1px 5px;font-size:0.58rem;" title="Download merging statistics (.html)">↓ HTML</button>
+        <button type="button" data-merge-action="open-table" style="padding:1px 6px;font-size:0.58rem;border-color:rgba(56,189,248,0.55);color:var(--accent-cyan);" title="Open merging statistics by resolution shell">☆ Table</button>
       </span>
     `;
     bar.querySelectorAll("button[data-merge-action]").forEach(btn => {{
       btn.addEventListener("click", (ev) => {{
         ev.stopPropagation();
-        const act = btn.getAttribute("data-merge-action");
-        if (act === "open-table") openMergeTableModal();
-        else if (act === "dl-csv") downloadMergeArtifact("csv");
-        else if (act === "dl-html") downloadMergeArtifact("html");
+        if (btn.getAttribute("data-merge-action") === "open-table") openMergeTableModal();
       }});
     }});
   }}
@@ -16773,7 +16594,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function classifyArtifactStageClient(filename) {{
     const low = String(filename || "").split("/").pop().toLowerCase();
     if (!low) return null;
-    if (["merged.mtz", "predictions.mtz", "xval.mtz", "careless_metrics.json", "merge_table.html", "merge_table.csv", "careless_0.mtz", "careless_predictions_0.mtz", "careless_xval_0.mtz"].some(k => low === k || low.endsWith(k))) {{
+    if (["merged.mtz", "predictions.mtz", "xval.mtz", "careless_metrics.json", "merge_table.csv", "careless_0.mtz", "careless_predictions_0.mtz", "careless_xval_0.mtz"].some(k => low === k || low.endsWith(k))) {{
       return "merge";
     }}
     if (["predictor.h5", "integrated.h5", "reflections.mtz"].some(k => low === k || low.endsWith(k))) {{
@@ -16847,19 +16668,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       lbl.textContent = `${{grp.sTitle.toUpperCase()}}:`;
       filesDrawer.appendChild(lbl);
 
-      if (grp.sId === "merge" && getMergeResolutionBins().length > 0) {{
-        const viewBtn = document.createElement("button");
-        viewBtn.type = "button";
-        viewBtn.className = "file-dl-pill";
-        viewBtn.style.cursor = "pointer";
-        viewBtn.style.borderColor = "rgba(56, 189, 248, 0.55)";
-        viewBtn.style.color = "var(--accent-cyan)";
-        viewBtn.textContent = "🏆 Table";
-        viewBtn.title = "Open publication-ready CC½ / Completeness / ⟨I/σ⟩ resolution shell table (Word/Excel copy)";
-        viewBtn.addEventListener("click", () => openMergeTableModal());
-        filesDrawer.appendChild(viewBtn);
-      }}
-
       grp.items.forEach(item => {{
         const a = document.createElement("a");
         a.className = "file-dl-pill";
@@ -16882,22 +16690,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
       if (grp.sId === "merge" && getMergeResolutionBins().length > 0) {{
         const existingNames = new Set(grp.items.map(it => String(it.name || "").toLowerCase()));
-        ["merge_table.csv", "merge_table.html"].forEach(synthName => {{
-          if (existingNames.has(synthName)) return;
+        if (!existingNames.has("merge_table.csv")) {{
           const b = document.createElement("button");
           b.type = "button";
           b.className = "file-dl-pill";
           b.style.cursor = "pointer";
-          b.textContent = `↓ ${{synthName}}`;
-          b.title = `Download ${{synthName}} to local computer`;
-          b.addEventListener("click", () => downloadMergeArtifact(synthName.endsWith(".csv") ? "csv" : "html"));
+          b.textContent = "↓ merge_table.csv";
+          b.title = "Download merge_table.csv to local computer";
+          b.addEventListener("click", () => downloadMergeArtifact("csv"));
           filesDrawer.appendChild(b);
-        }});
+        }}
       }}
     }});
   }}
-
-  let mergeTableStyleMode = (UI_MODE === "pro" || UI_MODE === "boring") ? "publication" : "arcade";
 
   function escapeHtmlText(val) {{
     return String(val === null || val === undefined ? "" : val)
@@ -17144,79 +16949,49 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function renderMergeTableModalContent() {{
     const card = document.getElementById("merge-tbl-card");
-    const rb = document.getElementById("merge-tbl-rainbow");
-    const kicker = document.getElementById("merge-tbl-kicker");
     const titleEl = document.getElementById("merge-tbl-modal-title");
     const metaEl = document.getElementById("merge-tbl-meta");
-    const styleBtn = document.getElementById("btn-merge-tbl-style");
     const wrap = document.getElementById("merge-tbl-body-wrap");
     if (!card || !wrap) return;
 
     const tData = buildClientMergeTableData();
-    const isPub = mergeTableStyleMode === "publication";
-    card.style.background = isPub ? "#ffffff" : "#10162b";
-    card.style.color = isPub ? "#0f172a" : "#f1f5f9";
-    card.style.borderColor = isPub ? "#cbd5e1" : "#2a3966";
-    if (rb) rb.style.display = isPub ? "none" : "block";
-    if (kicker) kicker.style.display = isPub ? "none" : "block";
+    card.style.background = "#0a1020";
+    card.style.color = "#bae6fd";
+    card.style.borderColor = "rgba(56, 189, 248, 0.38)";
     if (titleEl) {{
       titleEl.textContent = tData.title;
-      titleEl.style.color = isPub ? "#0f172a" : "#f8fafc";
-      titleEl.style.fontFamily = isPub ? "Georgia, 'Times New Roman', serif" : "var(--font-display)";
+      titleEl.style.color = "#e0f2fe";
+      titleEl.style.fontFamily = "Georgia, 'Times New Roman', Times, serif";
     }}
     if (metaEl) {{
-      const stageBadge = (!isPub && tData.dCc30 !== null)
-        ? ` <span style="display:inline-block;margin-left:6px;padding:1px 8px;border-radius:999px;background:rgba(52,211,153,0.16);border:1px solid rgba(52,211,153,0.55);color:#34d399;font-weight:700;">STAGE CLEAR • d(CC½ ≥ 0.30) = ${{tData.dCc30.toFixed(2)}} Å</span>`
-        : "";
-      metaEl.style.color = isPub ? "#475569" : "#94a3b8";
-      metaEl.innerHTML = `${{escapeHtmlText(tData.metaLine)}}${{stageBadge}}`;
-    }}
-    if (styleBtn) {{
-      styleBtn.textContent = `Style: ${{isPub ? "Publication" : "Arcade High Score"}}`;
+      metaEl.style.color = "rgba(147, 197, 253, 0.78)";
+      metaEl.textContent = tData.metaLine;
     }}
 
     const fmtDisp = (v, nd) => (v !== null && v !== undefined && Number.isFinite(v)) ? v.toFixed(nd) : "—";
     const fmtIntDisp = (v) => (v !== null && v !== undefined && Number.isFinite(v)) ? Math.round(v).toLocaleString() : "—";
-    const ccColor = (tier) => {{
-      if (isPub) return "#0f172a";
-      if (tier === "green") return "#34d399";
-      if (tier === "yellow") return "#fbbf24";
-      if (tier === "red") return "#f43f5e";
-      return "#94a3b8";
-    }};
-    const thStyle = isPub
-      ? "padding:6px 8px;text-align:right;border-top:2px solid #0f172a;border-bottom:1px solid #0f172a;color:#0f172a;font-weight:700;white-space:nowrap;"
-      : "padding:6px 8px;text-align:right;border-top:2px solid #38bdf8;border-bottom:1px solid #334155;color:#38bdf8;font-weight:700;white-space:nowrap;";
-    const tdBorder = isPub ? "none" : "1px solid rgba(51,65,85,0.48)";
+    const thStyle = "padding:6px 8px;text-align:right;border-top:2px solid rgba(125,211,252,0.72);border-bottom:1px solid rgba(125,211,252,0.40);color:#7dd3fc;font-weight:700;white-space:nowrap;";
 
-    const bodyHtml = tData.rows.map(r => {{
-      const shCell = isPub
-        ? `${{r.shell}}`
-        : `<span style="display:inline-block;min-width:36px;padding:1px 5px;border-radius:4px;font-size:0.64rem;font-weight:800;background:rgba(244,114,182,0.16);border:1px solid rgba(244,114,182,0.45);color:#f9a8d4;">${{r.rankBadge}}</span>`;
-      return `<tr>` +
-        `<td style="padding:5px 8px;text-align:center;border-bottom:${{tdBorder}};">${{shCell}}</td>` +
-        `<td style="padding:5px 8px;text-align:center;border-bottom:${{tdBorder}};white-space:nowrap;">${{escapeHtmlText(r.rangeDisplay)}}</td>` +
-        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtIntDisp(r.nObs)}}</td>` +
-        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtIntDisp(r.nUnique)}}</td>` +
-        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtIntDisp(r.nTheo)}}</td>` +
-        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtDisp(r.multiplicity, 2)}}</td>` +
-        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtDisp(r.completenessPct, 1)}}</td>` +
-        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtDisp(r.meanIsigi, 2)}}</td>` +
-        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};font-weight:700;color:${{ccColor(r.ccTier)}};">${{fmtDisp(r.ccHalf, 3)}}</td>` +
-        `<td style="padding:5px 8px;text-align:right;border-bottom:${{tdBorder}};">${{fmtDisp(r.ccStar, 3)}}</td>` +
-      `</tr>`;
-    }}).join("");
+    const bodyHtml = tData.rows.map(r =>
+      `<tr>` +
+        `<td style="padding:5px 8px;text-align:center;">${{r.shell}}</td>` +
+        `<td style="padding:5px 8px;text-align:center;white-space:nowrap;">${{escapeHtmlText(r.rangeDisplay)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtIntDisp(r.nObs)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtIntDisp(r.nUnique)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtIntDisp(r.nTheo)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtDisp(r.multiplicity, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtDisp(r.completenessPct, 1)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtDisp(r.meanIsigi, 2)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;font-weight:600;color:#e0f2fe;">${{fmtDisp(r.ccHalf, 3)}}</td>` +
+        `<td style="padding:5px 8px;text-align:right;">${{fmtDisp(r.ccStar, 3)}}</td>` +
+      `</tr>`
+    ).join("");
 
     const ov = tData.overall;
-    const ovRowStyle = isPub
-      ? "border-top:1px solid #0f172a;border-bottom:2px solid #0f172a;font-weight:700;"
-      : "border-top:2px solid #38bdf8;border-bottom:2px solid #f472b6;font-weight:800;background:rgba(56,189,248,0.08);";
-    const ovShell = isPub
-      ? "Overall"
-      : `<span style="display:inline-block;min-width:36px;padding:1px 5px;border-radius:4px;font-size:0.64rem;font-weight:800;background:rgba(56,189,248,0.18);border:1px solid rgba(56,189,248,0.55);color:#7dd3fc;">ALL</span>`;
+    const ovRowStyle = "border-top:1px solid rgba(125,211,252,0.40);border-bottom:2px solid rgba(125,211,252,0.72);font-weight:700;color:#e0f2fe;";
     const footHtml =
       `<tr style="${{ovRowStyle}}">` +
-        `<td style="padding:6px 8px;text-align:center;">${{ovShell}}</td>` +
+        `<td style="padding:6px 8px;text-align:center;">Overall</td>` +
         `<td style="padding:6px 8px;text-align:center;white-space:nowrap;">${{escapeHtmlText(ov.rangeDisplay)}}</td>` +
         `<td style="padding:6px 8px;text-align:right;">${{fmtIntDisp(ov.nObs)}}</td>` +
         `<td style="padding:6px 8px;text-align:right;">${{fmtIntDisp(ov.nUnique)}}</td>` +
@@ -17224,16 +16999,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.multiplicity, 2)}}</td>` +
         `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.completenessPct, 1)}}</td>` +
         `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.meanIsigi, 2)}}</td>` +
-        `<td style="padding:6px 8px;text-align:right;color:${{ccColor(ov.ccTier)}};">${{fmtDisp(ov.ccHalf, 3)}}</td>` +
+        `<td style="padding:6px 8px;text-align:right;color:#e0f2fe;">${{fmtDisp(ov.ccHalf, 3)}}</td>` +
         `<td style="padding:6px 8px;text-align:right;">${{fmtDisp(ov.ccStar, 3)}}</td>` +
       `</tr>`;
 
-    const tblFont = isPub ? "Georgia, 'Times New Roman', serif" : "var(--font-display)";
-    const legendRight = isPub
-      ? ""
-      : `<span>CC<sub>1/2</sub> tiers: <strong style="color:#34d399;">≥ 0.80</strong> • <strong style="color:#fbbf24;">0.30–0.79</strong> • <strong style="color:#f43f5e;">&lt; 0.30</strong></span>`;
     wrap.innerHTML =
-      `<table style="width:100%;border-collapse:collapse;font-family:${{tblFont}};font-variant-numeric:tabular-nums;font-size:${{isPub ? "0.80rem" : "0.75rem"}};">` +
+      `<table style="width:100%;border-collapse:collapse;font-family:Georgia,'Times New Roman',Times,serif;font-variant-numeric:tabular-nums;font-size:0.81rem;color:#bae6fd;">` +
         `<thead><tr>` +
           `<th style="${{thStyle}}text-align:center;">Shell</th>` +
           `<th style="${{thStyle}}text-align:center;">Resolution (Å)</th>` +
@@ -17249,9 +17020,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         `<tbody>${{bodyHtml}}</tbody>` +
         `<tfoot>${{footHtml}}</tfoot>` +
       `</table>` +
-      `<div style="margin-top:8px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;font-size:0.66rem;color:${{isPub ? "#475569" : "#94a3b8"}};">` +
-        `<span>CC* = [2 CC<sub>1/2</sub> / (1 + CC<sub>1/2</sub>)]<sup>1/2</sup> (Karplus &amp; Diederichs, 2012). “Copy for Word / Excel” always copies clean white-background publication formatting.</span>` +
-        legendRight +
+      `<div style="margin-top:9px;font-family:Georgia,'Times New Roman',Times,serif;font-size:0.69rem;color:rgba(147,197,253,0.72);">` +
+        `<span>CC* = [2 CC<sub>1/2</sub> / (1 + CC<sub>1/2</sub>)]<sup>1/2</sup> (Karplus &amp; Diederichs, 2012).</span>` +
       `</div>`;
   }}
 
@@ -17301,36 +17071,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       try {{ await navigator.clipboard.writeText(payloads.tsv); ok = true; }} catch (_e3) {{}}
     }}
     if (btn) {{
-      const prev = btn.textContent;
-      btn.textContent = ok ? "✓ Copied for Word / Excel!" : "Copy failed";
-      setTimeout(() => {{ btn.textContent = prev; }}, 1800);
+      btn.textContent = ok ? "✓ Copied" : "Copy failed";
+      setTimeout(() => {{ btn.textContent = "Copy"; }}, 1600);
     }}
-  }}
-
-  function renderStandaloneMergeHtmlClient(tData) {{
-    const payloads = buildMergeTableClipboardPayloads(tData);
-    const fmtDisp = (v, nd) => (v !== null && v !== undefined && Number.isFinite(v)) ? v.toFixed(nd) : "—";
-    const fmtIntDisp = (v) => (v !== null && v !== undefined && Number.isFinite(v)) ? Math.round(v).toLocaleString() : "—";
-    const rowsHtml = tData.rows.map(r =>
-      `<tr><td style="text-align:center;">${{r.shell}}</td><td style="text-align:center;">${{escapeHtmlText(r.rangeDisplay)}}</td>` +
-      `<td>${{fmtIntDisp(r.nObs)}}</td><td>${{fmtIntDisp(r.nUnique)}}</td><td>${{fmtIntDisp(r.nTheo)}}</td>` +
-      `<td>${{fmtDisp(r.multiplicity, 2)}}</td><td>${{fmtDisp(r.completenessPct, 1)}}</td><td>${{fmtDisp(r.meanIsigi, 2)}}</td>` +
-      `<td class="cc-${{r.ccTier}}">${{fmtDisp(r.ccHalf, 3)}}</td><td>${{fmtDisp(r.ccStar, 3)}}</td></tr>`
-    ).join("");
-    const ov = tData.overall;
-    const footHtml =
-      `<tr class="overall"><td style="text-align:center;">Overall</td><td style="text-align:center;">${{escapeHtmlText(ov.rangeDisplay)}}</td>` +
-      `<td>${{fmtIntDisp(ov.nObs)}}</td><td>${{fmtIntDisp(ov.nUnique)}}</td><td>${{fmtIntDisp(ov.nTheo)}}</td>` +
-      `<td>${{fmtDisp(ov.multiplicity, 2)}}</td><td>${{fmtDisp(ov.completenessPct, 1)}}</td><td>${{fmtDisp(ov.meanIsigi, 2)}}</td>` +
-      `<td class="cc-${{ov.ccTier}}">${{fmtDisp(ov.ccHalf, 3)}}</td><td>${{fmtDisp(ov.ccStar, 3)}}</td></tr>`;
-    return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"/><title>${{escapeHtmlText(tData.title)}}</title>` +
-      `<style>body{{font-family:Georgia,serif;margin:24px;color:#0f172a;background:#fff;}}table{{border-collapse:collapse;width:100%;max-width:960px;font-variant-numeric:tabular-nums;}}` +
-      `th{{border-top:2px solid #0f172a;border-bottom:1px solid #0f172a;padding:6px 8px;text-align:right;}}td{{padding:5px 8px;text-align:right;}}` +
-      `tr.overall td{{border-top:1px solid #0f172a;border-bottom:2px solid #0f172a;font-weight:bold;}}.cc-green{{color:#047857;font-weight:700;}}.cc-yellow{{color:#b45309;font-weight:700;}}.cc-red{{color:#be123c;font-weight:700;}}</style></head>` +
-      `<body><h2>${{escapeHtmlText(tData.title)}}</h2><p>${{escapeHtmlText(tData.metaLine)}}</p>` +
-      `<table><thead><tr><th style="text-align:center;">Shell</th><th style="text-align:center;">Resolution (Å)</th><th>N<sub>obs</sub></th><th>N<sub>unique</sub></th><th>N<sub>theo</sub></th><th>Multiplicity</th><th>Completeness (%)</th><th>⟨I/σ(I)⟩</th><th>CC<sub>1/2</sub></th><th>CC*</th></tr></thead>` +
-      `<tbody>${{rowsHtml}}</tbody><tfoot>${{footHtml}}</tfoot></table>` +
-      `<script>window.__CSV__=${{JSON.stringify(payloads.csv)}};<\\/script></body></html>`;
   }}
 
   async function downloadMergeArtifact(ext) {{
@@ -17361,13 +17104,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     const tData = buildClientMergeTableData();
     const payloads = buildMergeTableClipboardPayloads(tData);
-    const content = cleanExt === "csv" ? payloads.csv : renderStandaloneMergeHtmlClient(tData);
-    const mime = cleanExt === "csv" ? "text/csv;charset=utf-8" : "text/html;charset=utf-8";
-    const blob = new Blob([content], {{ type: mime }});
+    const blob = new Blob([payloads.csv], {{ type: "text/csv;charset=utf-8" }});
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = fname;
+    a.download = "merge_table.csv";
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -17376,27 +17117,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   (function bindMergeTableControls() {{
     const btnHistOpen = document.getElementById("btn-hist-open-table");
-    const btnHistCsv = document.getElementById("btn-hist-dl-csv");
-    const btnHistHtml = document.getElementById("btn-hist-dl-html");
-    const btnStyle = document.getElementById("btn-merge-tbl-style");
     const btnCopy = document.getElementById("btn-merge-tbl-copy");
-    const btnCsv = document.getElementById("btn-merge-tbl-csv");
-    const btnHtml = document.getElementById("btn-merge-tbl-html");
     const btnClose = document.getElementById("btn-merge-tbl-close");
     const modal = document.getElementById("modal-merge-table");
 
     if (btnHistOpen) btnHistOpen.addEventListener("click", () => openMergeTableModal());
-    if (btnHistCsv) btnHistCsv.addEventListener("click", () => downloadMergeArtifact("csv"));
-    if (btnHistHtml) btnHistHtml.addEventListener("click", () => downloadMergeArtifact("html"));
-    if (btnStyle) {{
-      btnStyle.addEventListener("click", () => {{
-        mergeTableStyleMode = mergeTableStyleMode === "publication" ? "arcade" : "publication";
-        renderMergeTableModalContent();
-      }});
-    }}
     if (btnCopy) btnCopy.addEventListener("click", () => copyMergeTableForPublication());
-    if (btnCsv) btnCsv.addEventListener("click", () => downloadMergeArtifact("csv"));
-    if (btnHtml) btnHtml.addEventListener("click", () => downloadMergeArtifact("html"));
     if (btnClose) btnClose.addEventListener("click", () => closeMergeTableModal());
     if (modal) {{
       modal.addEventListener("click", (ev) => {{
