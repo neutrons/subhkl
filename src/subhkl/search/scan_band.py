@@ -185,7 +185,18 @@ def _build_ewald_excess_maps(args):
     with h5py.File(args.nexus, "r") as f:
         n_frames = int(f["images"].shape[0])
         H, W = int(f["images"].shape[1]), int(f["images"].shape[2])
-        b2 = max(1, min(4, H // 4, W // 4))
+        cell_arg = getattr(args, "cell", None)
+        d_min_arg = float(getattr(args, "d_min", 2.0) or 2.0)
+        long_axis_ratio = (
+            max(float(cell_arg[0]), float(cell_arg[1]), float(cell_arg[2]))
+            / max(d_min_arg, 0.5)
+            if cell_arg is not None and len(cell_arg) >= 3
+            else 0.0
+        )
+        # Keep >=128x128 Ewald excess bins on 256-px panels (e.g. MANDI/TOPAZ) and
+        # long-axis cells so sub-0.4-deg reciprocal rungs are not Nyquist-blurred.
+        target_b2 = 2 if (min(H, W) <= 256 or long_axis_ratio >= 85.0) else 4
+        b2 = max(1, min(target_b2, H // 4, W // 4))
         hb, wb = H // b2, W // b2
         bw = int(getattr(args, "border_width", 4))
         rim_bins = (bw + b2 - 1) // b2 if bw > 0 else 0
@@ -391,7 +402,7 @@ def _get_ewald_jit_fns():
     ):
         return jax.vmap(
             lambda U: jax.vmap(
-                lambda Ej_r, R_r: _score_single_run(
+                lambda Ej_r, R_r, s_r: _score_single_run(
                     Ej_r,
                     R_r,
                     U,
@@ -403,14 +414,14 @@ def _get_ewald_jit_fns():
                     dh,
                     nrow,
                     ncol,
-                    s_samp_j,
+                    s_r,
                     Gc_chunks,
                     inv_qn_chunks,
                     lo_l,
                     hi_l,
                     b2f,
                 )
-            )(Ej, Rr)
+            )(Ej, Rr, s_samp_j)
         )(Us)
 
     @jax.jit
@@ -435,7 +446,7 @@ def _get_ewald_jit_fns():
         b2f,
     ):
         return jax.vmap(
-            lambda Ej_r, R_r, U_r: jax.vmap(
+            lambda Ej_r, R_r, U_r, s_r: jax.vmap(
                 lambda dR: _score_single_run(
                     Ej_r,
                     R_r,
@@ -448,7 +459,7 @@ def _get_ewald_jit_fns():
                     dh,
                     nrow,
                     ncol,
-                    s_samp_j,
+                    s_r,
                     Gc_chunks,
                     inv_qn_chunks,
                     lo_l,
@@ -456,8 +467,8 @@ def _get_ewald_jit_fns():
                     b2f,
                 )
             )(dRs),
-            in_axes=(0, 0, 0),
-        )(Ej, Rr, Urs)
+            in_axes=(0, 0, 0, 0),
+        )(Ej, Rr, Urs, s_samp_j)
 
     _EWALD_JIT_CACHE = (score_batch_runs, score_per_run_grid)
     return _EWALD_JIT_CACHE
@@ -499,7 +510,7 @@ def _make_ewald_polisher(
     b2,
     s_samp=None,
     chunk_size=8192,
-    max_reflections=40000,
+    max_reflections=200000,
 ):
     import jax.numpy as jnp
     from scipy.spatial.transform import Rotation as Rot
@@ -518,18 +529,51 @@ def _make_ewald_polisher(
         if r_ in r_map and bk in b_map:
             E[r_map[r_], b_map[bk], : e.shape[0], : e.shape[1]] = e
 
-    G_c_np = np.asarray(G_c, np.float32)
-    qn_np = np.linalg.norm(G_c_np, axis=1)
-    q_max_kin = np.float32(2.0 / max(float(wl[0]), 1e-6))
-    valid_q = (qn_np > 1e-7) & (qn_np <= q_max_kin)
-    if np.any(valid_q):
-        G_c_np = G_c_np[valid_q]
-        qn_np = qn_np[valid_q]
-        if max_reflections and len(G_c_np) > int(max_reflections):
-            keep = np.argpartition(qn_np, int(max_reflections))[: int(max_reflections)]
-            G_c_np = G_c_np[keep]
-            qn_np = qn_np[keep]
+    # Kinematic scattering bounds: reflections with |G| < 2*sin(theta_min)/wl_max
+    # cannot excite any detector bank, and pure lowest-|G| truncation in Laue
+    # mode blinds all 90-deg and backscattering banks (where |G| >= sqrt(2)/wl_max).
+    c_arr = np.asarray(C_corners, np.float64)
+    u_arr = np.asarray(uhats, np.float64) * np.asarray(widths, np.float64)[:, None]
+    v_arr = np.asarray(vhats, np.float64) * np.asarray(heights, np.float64)[:, None]
+    det_pts = np.concatenate(
+        [c_arr, c_arr + u_arr, c_arr + v_arr, c_arr + u_arr + v_arr], axis=0
+    )
+    det_r = np.linalg.norm(det_pts, axis=1)
+    valid_det = det_r > 1e-6
+    if np.any(valid_det):
+        cos_2th_max = float(np.max(det_pts[valid_det, 2] / det_r[valid_det]))
+        sin_th_min = max(
+            0.0, np.sqrt(max(0.0, 0.5 * (1.0 - min(1.0, cos_2th_max)))) - 0.04
+        )
     else:
+        sin_th_min = 0.0
+
+    G_c_raw = np.asarray(G_c, np.float32)
+    qn_raw = np.linalg.norm(G_c_raw, axis=1)
+    q_min_kin = np.float32(max(1e-7, 2.0 * sin_th_min / max(float(wl[1]), 1e-6)))
+    q_max_kin = np.float32(2.0 / max(float(wl[0]), 1e-6))
+    valid_idx = np.flatnonzero((qn_raw >= q_min_kin) & (qn_raw <= q_max_kin))
+    if len(valid_idx) > 0:
+        if max_reflections and len(valid_idx) > int(max_reflections):
+            max_keep = int(max_reflections)
+            qn_v = qn_raw[valid_idx]
+            order_q = np.argsort(qn_v, kind="mergesort")
+            # Retain the lowest-|G| core for wide angular basin capture while
+            # striding uniformly across all higher-|G| shells so 90-deg and
+            # backscattering Laue banks remain sharply illuminated.
+            n_low = max_keep // 3
+            low_part = order_q[:n_low]
+            rem_part = order_q[n_low:]
+            stride_sel = np.linspace(
+                0, len(rem_part) - 1, max_keep - n_low, dtype=np.int64
+            )
+            keep_idx = valid_idx[np.concatenate([low_part, rem_part[stride_sel]])]
+        else:
+            keep_idx = valid_idx
+        G_c_np = G_c_raw[keep_idx]
+        qn_np = qn_raw[keep_idx]
+    else:
+        keep_idx = np.zeros((0,), dtype=np.int64)
         G_c_np = np.zeros((1, 3), np.float32)
         qn_np = np.zeros((1,), np.float32)
     inv_qn_np = np.where(qn_np > 1e-7, 1.0 / np.maximum(qn_np, 1e-7), 0.0).astype(
@@ -553,9 +597,15 @@ def _make_ewald_polisher(
     nrow = jnp.asarray(np.asarray(N_bank + 1.0, np.float32))
     ncol = jnp.asarray(np.asarray(M_bank + 1.0, np.float32))
     Rr = jnp.asarray(np.array([R_runs[r_] for r_ in runs], np.float32))
-    s_samp_j = jnp.asarray(
-        np.zeros(3, np.float32) if s_samp is None else np.asarray(s_samp, np.float32)
-    )
+    if s_samp is None:
+        s_arr = np.zeros((len(runs), 3), dtype=np.float32)
+    else:
+        s_in = np.asarray(s_samp, dtype=np.float32)
+        if s_in.ndim == 1:
+            s_arr = np.broadcast_to(s_in, (len(runs), 3)).copy()
+        else:
+            s_arr = s_in
+    s_samp_j = jnp.asarray(s_arr)
     Ej = jnp.asarray(E)
     lo_l = jnp.float32(wl[0])
     hi_l = jnp.float32(wl[1])
@@ -596,6 +646,126 @@ def _make_ewald_polisher(
             )
         return np.concatenate(out, axis=0)[:n_u]
 
+    def score_with_Gc(G_c_sub, Urs):
+        G_sub_np = np.asarray(G_c_sub, np.float32)
+        if len(G_sub_np) == 0:
+            G_sub_np = np.zeros((1, 3), np.float32)
+        qn_sub = np.linalg.norm(G_sub_np, axis=1)
+        inv_qn_sub = np.where(
+            qn_sub > 1e-7, 1.0 / np.maximum(qn_sub, 1e-7), 0.0
+        ).astype(np.float32)
+        pad_s = (-max(len(G_sub_np), 1)) % chunk_sz
+        if pad_s:
+            G_sub_np = np.pad(G_sub_np, ((0, pad_s), (0, 0)))
+            inv_qn_sub = np.pad(inv_qn_sub, (0, pad_s))
+        Gc_c = jnp.asarray(G_sub_np.reshape(-1, chunk_sz, 3))
+        inv_c = jnp.asarray(inv_qn_sub.reshape(-1, chunk_sz))
+        Urs_arr = np.asarray(Urs, np.float32).reshape(-1, 3, 3)
+        n_u = len(Urs_arr)
+        pad_u = (-n_u) % B_EW
+        Us_pad = (
+            np.pad(Urs_arr, ((0, pad_u), (0, 0), (0, 0)), mode="edge")
+            if pad_u
+            else Urs_arr
+        )
+        alt_ctx = (
+            Ej,
+            Rr,
+            cen,
+            uh,
+            vh,
+            nrm,
+            dw,
+            dh,
+            nrow,
+            ncol,
+            s_samp_j,
+            Gc_c,
+            inv_c,
+            lo_l,
+            hi_l,
+            b2f,
+        )
+        out = []
+        for i in range(0, len(Us_pad), B_EW):
+            out.append(
+                np.asarray(
+                    score_batch_runs_jit(jnp.asarray(Us_pad[i : i + B_EW]), *alt_ctx)
+                )
+            )
+        mat = np.concatenate(out, axis=0)[:n_u]
+        return np.diag(mat) if n_u == len(runs) else mat
+
+    eval_runs.keep_idx = keep_idx
+    eval_runs.score_with_Gc = score_with_Gc
+
+    def _fit_consensus_goniometer(Urs, cur_s, Rr_np):
+        pos = cur_s[cur_s > 0]
+        if len(pos) < 2:
+            return None, None
+        med_s = float(np.median(pos))
+        r_ref = int(np.argmax(cur_s))
+        good = (cur_s >= max(0.45 * med_s, 0.35 * cur_s[r_ref])) & (cur_s > 0)
+        if good.sum() < 2:
+            top2 = np.argsort(cur_s)[-2:]
+            good = np.zeros(len(cur_s), dtype=bool)
+            good[top2] = True
+        R_ref = Rr_np[r_ref]
+        U_ref = Urs[r_ref]
+
+        def res_fn(x, _U_ref=U_ref, _good=good, _R_ref=R_ref):
+            D = Rot.from_rotvec(x[:3]).as_matrix()
+            U0 = Rot.from_rotvec(x[3:]).as_matrix() @ _U_ref
+            errs = []
+            for ir in np.where(_good)[0]:
+                U_p = Rr_np[ir].T @ D @ Rr_np[ir] @ _R_ref.T @ D.T @ _R_ref @ U0
+                errs.append(Rot.from_matrix(U_p @ Urs[ir].T).as_rotvec())
+            return np.concatenate(errs)
+
+        fit = least_squares(
+            res_fn,
+            np.zeros(6),
+            bounds=(-np.radians(4.5), np.radians(4.5)),
+            loss="soft_l1",
+            f_scale=0.004,
+        )
+        D = Rot.from_rotvec(fit.x[:3]).as_matrix()
+        U0 = Rot.from_rotvec(fit.x[3:]).as_matrix() @ U_ref
+        U_preds = np.array(
+            [
+                Rr_np[ir].T @ D @ Rr_np[ir] @ R_ref.T @ D.T @ R_ref @ U0
+                for ir in range(len(runs))
+            ]
+        )
+        pred_s = np.diag(eval_runs(U_preds)).astype(np.float64)
+        return U_preds, pred_s
+
+    def _grid_step_per_run(Urs, cur_s, span, n_pts):
+        ax = np.radians(np.linspace(-span, span, n_pts))
+        rv = np.array(np.meshgrid(ax, ax, ax, indexing="ij")).reshape(3, -1).T
+        dR = Rot.from_rotvec(rv).as_matrix().astype(np.float32)
+        n_g = len(dR)
+        pad_g = (-n_g) % B_EW
+        dR_pad = np.pad(dR, ((0, pad_g), (0, 0), (0, 0)), mode="edge") if pad_g else dR
+        Urs_j = jnp.asarray(Urs, jnp.float32)
+        scores_list = []
+        for i in range(0, len(dR_pad), B_EW):
+            scores_list.append(
+                np.asarray(
+                    score_per_run_grid_jit(
+                        Urs_j,
+                        jnp.asarray(dR_pad[i : i + B_EW]),
+                        *ctx_args,
+                    )
+                )
+            )
+        scores = np.concatenate(scores_list, axis=1)[:, :n_g]
+        best_g = np.argmax(scores, axis=1)
+        for ir in range(len(runs)):
+            if float(scores[ir, best_g[ir]]) > cur_s[ir] + 1e-6:
+                cur_s[ir] = float(scores[ir, best_g[ir]])
+                Urs[ir] = dR[best_g[ir]].astype(np.float64) @ Urs[ir]
+
     def polish_joint(U, spans=(1.0, 0.35, 0.12, 0.04), n=7):
         U = np.asarray(U, np.float64)
         s_best = float(eval_runs(U).sum())
@@ -611,92 +781,166 @@ def _make_ewald_polisher(
                 U = Us[idx]
         return U, s_best
 
-    def polish_per_run(U_joint, spans=(1.2, 0.8, 0.4, 0.15, 0.05), n=7):
+    def polish_per_run(
+        U_joint,
+        spans=(0.85, 0.40, 0.16, 0.05),
+        n=7,
+        Urs_alt_seed=None,
+    ):
         Rr_np = np.array([R_runs[r_] for r_ in runs], np.float64)
         Urs = np.repeat(np.asarray(U_joint, np.float64)[None], len(runs), axis=0)
         cur_s = np.diag(eval_runs(Urs)).astype(np.float64).copy()
         for ispan, span in enumerate(spans):
             if ispan >= 1 and len(runs) >= 3:
-                r_ref = int(np.argmax(cur_s))
-                good = cur_s >= 0.55 * cur_s[r_ref]
-                if good.sum() >= 2:
-                    R_ref = Rr_np[r_ref]
-                    U_ref = Urs[r_ref]
-
-                    def res_fn(x, _U_ref=U_ref, _good=good, _R_ref=R_ref):
-                        D = Rot.from_rotvec(x[:3]).as_matrix()
-                        U0 = Rot.from_rotvec(x[3:]).as_matrix() @ _U_ref
-                        errs = []
-                        for ir in np.where(_good)[0]:
-                            U_p = (
-                                Rr_np[ir].T
-                                @ D
-                                @ Rr_np[ir]
-                                @ _R_ref.T
-                                @ D.T
-                                @ _R_ref
-                                @ U0
-                            )
-                            errs.append(Rot.from_matrix(U_p @ Urs[ir].T).as_rotvec())
-                        return np.concatenate(errs)
-
-                    fit = least_squares(
-                        res_fn,
-                        np.zeros(6),
-                        bounds=(-np.radians(4.0), np.radians(4.0)),
-                        loss="soft_l1",
-                        f_scale=0.005,
-                    )
-                    D = Rot.from_rotvec(fit.x[:3]).as_matrix()
-                    U0 = Rot.from_rotvec(fit.x[3:]).as_matrix() @ U_ref
-                    U_preds = np.array(
-                        [
-                            Rr_np[ir].T @ D @ Rr_np[ir] @ R_ref.T @ D.T @ R_ref @ U0
-                            for ir in range(len(runs))
-                        ]
-                    )
-                    pred_s = np.diag(eval_runs(U_preds)).astype(np.float64)
+                U_preds, pred_s = _fit_consensus_goniometer(Urs, cur_s, Rr_np)
+                if U_preds is not None:
                     for ir in range(len(runs)):
-                        drift_deg = np.degrees(
-                            Rot.from_matrix(Urs[ir] @ U_preds[ir].T).magnitude()
-                        )
-                        if pred_s[ir] > cur_s[ir] or drift_deg > 1.2:
+                        if pred_s[ir] > cur_s[ir]:
                             Urs[ir] = U_preds[ir]
                             cur_s[ir] = pred_s[ir]
-            ax = np.radians(np.linspace(-span, span, n))
-            rv = np.array(np.meshgrid(ax, ax, ax, indexing="ij")).reshape(3, -1).T
-            dR = Rot.from_rotvec(rv).as_matrix().astype(np.float32)
-            n_g = len(dR)
-            pad_g = (-n_g) % B_EW
-            dR_pad = (
-                np.pad(dR, ((0, pad_g), (0, 0), (0, 0)), mode="edge") if pad_g else dR
-            )
-            Urs_j = jnp.asarray(Urs, jnp.float32)
-            scores_list = []
-            for i in range(0, len(dR_pad), B_EW):
-                scores_list.append(
-                    np.asarray(
-                        score_per_run_grid_jit(
-                            Urs_j,
-                            jnp.asarray(dR_pad[i : i + B_EW]),
-                            *ctx_args,
-                        )
-                    )
-                )
-            scores = np.concatenate(scores_list, axis=1)[:, :n_g]
-            best_g = np.argmax(scores, axis=1)
+            _grid_step_per_run(Urs, cur_s, span, n)
+        if Urs_alt_seed is not None and len(Urs_alt_seed) == len(runs):
+            Urs_alt = np.asarray(Urs_alt_seed, dtype=np.float64).copy()
+            s_alt = np.diag(eval_runs(Urs_alt)).astype(np.float64).copy()
+            for alt_span in (0.45, 0.18, 0.06):
+                _grid_step_per_run(Urs_alt, s_alt, alt_span, n)
             for ir in range(len(runs)):
-                if float(scores[ir, best_g[ir]]) > cur_s[ir] + 1e-6:
-                    cur_s[ir] = float(scores[ir, best_g[ir]])
-                    Urs[ir] = dR[best_g[ir]].astype(np.float64) @ Urs[ir]
+                if s_alt[ir] > cur_s[ir] + 1e-6:
+                    Urs[ir] = Urs_alt[ir]
+                    cur_s[ir] = s_alt[ir]
+        # Outer-goniometer consensus check: rescue runs whose local polish improves
+        # strictly above cur_s without clobbering genuine inter-batch crystal slips.
+        if len(runs) >= 4:
+            U_preds, pred_s = _fit_consensus_goniometer(Urs, cur_s, Rr_np)
+            if U_preds is not None:
+                outliers = [
+                    ir
+                    for ir in range(len(runs))
+                    if np.degrees(Rot.from_matrix(Urs[ir] @ U_preds[ir].T).magnitude())
+                    > 0.75
+                ]
+                if outliers:
+                    Urs_try = Urs.copy()
+                    s_try = cur_s.copy()
+                    for ir in outliers:
+                        Urs_try[ir] = U_preds[ir]
+                        s_try[ir] = pred_s[ir]
+                    for fine_span in (0.35, 0.14, 0.05):
+                        _grid_step_per_run(Urs_try, s_try, fine_span, 5)
+                    for ir in outliers:
+                        if s_try[ir] > cur_s[ir] + 1e-6:
+                            Urs[ir] = Urs_try[ir]
+                            cur_s[ir] = s_try[ir]
         return Urs, cur_s
 
     return eval_runs, polish_joint, polish_per_run
 
 
-def _ewald_d_min(cell, d_min, max_p1_refl=120000):
-    vol_est = max(float(cell[0]) * float(cell[1]) * float(cell[2]), 1.0)
-    d_floor = float((4.0 * np.pi * vol_est / (3.0 * float(max_p1_refl))) ** (1.0 / 3.0))
+def _zone_funnel_seed_per_run(
+    U_joint,
+    B_mat,
+    run_ids,
+    R_runs_dict,
+    q_by_run,
+    w_by_run,
+    space_group=None,
+    max_zones=18,
+):
+    """Coarse-to-fine smooth zone-band pre-alignment per run (+/-3.8 deg capture).
+
+    Long-axis Laue Ewald correlation peaks are only ~0.15-0.25 deg wide, so
+    coarse Ewald grids step over multi-degree goniometer wobble or inter-batch
+    crystal slips while Gaussian zone bands provide a smooth capture funnel.
+    """
+    from scipy.spatial.transform import Rotation as Rot
+
+    if not q_by_run:
+        return None
+    A_mat = np.linalg.inv(np.asarray(B_mat, dtype=np.float64)).T
+    uvw_top = direct_lattice_uvw(B_mat, max_index=3, space_group=space_group)[
+        :max_zones
+    ]
+    if len(uvw_top) == 0:
+        return None
+    X_raw = (A_mat @ np.asarray(uvw_top, dtype=np.float64).T).T
+    X_cryst = (
+        X_raw / np.maximum(np.linalg.norm(X_raw, axis=1, keepdims=True), 1e-12)
+    ).astype(np.float32)
+    U0 = np.asarray(U_joint, dtype=np.float64)
+    Urs_out = np.repeat(U0[None], len(run_ids), axis=0)
+    grids = []
+    for span, n_g, sig in ((3.8, 15, 0.38), (0.95, 11, 0.20), (0.24, 9, 0.14)):
+        ax = np.radians(np.linspace(-span, span, n_g))
+        rv = np.array(np.meshgrid(ax, ax, ax, indexing="ij")).reshape(3, -1).T
+        grids.append(
+            (Rot.from_rotvec(rv).as_matrix().astype(np.float32), np.float32(sig))
+        )
+
+    any_seeded = False
+    for ir, r in enumerate(run_ids):
+        qr = q_by_run.get(int(r))
+        wr = w_by_run.get(int(r))
+        if qr is None or wr is None or len(qr) < 8:
+            continue
+        any_seeded = True
+        Rr = np.asarray(R_runs_dict[r], dtype=np.float64)
+        L_cur = (Rr @ U0).astype(np.float32)
+        qr_f = np.asarray(qr, dtype=np.float32)
+        wr_f = np.asarray(wr, dtype=np.float32)
+        for dRs, sig in grids:
+            best_sc = -1.0
+            best_L = L_cur
+            for i0 in range(0, len(dRs), 512):
+                dR_b = dRs[i0 : i0 + 512]
+                X_lab = np.einsum("gij,jk,zk->giz", dR_b, L_cur, X_cryst, optimize=True)
+                psi = np.float32(57.2957795) * np.einsum(
+                    "ni,giz->gnz", qr_f, X_lab, optimize=True
+                )
+                sc = np.sum(
+                    wr_f[None, :] * np.max(np.exp(-0.5 * (psi / sig) ** 2), axis=2),
+                    axis=1,
+                )
+                k = int(np.argmax(sc))
+                if float(sc[k]) > best_sc:
+                    best_sc = float(sc[k])
+                    best_L = dR_b[k] @ L_cur
+            L_cur = best_L
+        u_svd, _, vt_svd = np.linalg.svd(Rr.T @ L_cur.astype(np.float64))
+        if np.linalg.det(u_svd @ vt_svd) < 0:
+            u_svd[:, -1] *= -1.0
+        Urs_out[ir] = u_svd @ vt_svd
+    return Urs_out if any_seeded else None
+
+
+def _ewald_d_min(cell, d_min, space_group=None, max_refl=450000):
+    a, b, c = float(cell[0]), float(cell[1]), float(cell[2])
+    if len(cell) >= 6:
+        ca, cb, cg = np.cos(
+            np.deg2rad([float(cell[3]), float(cell[4]), float(cell[5])])
+        )
+        vol_fac = np.sqrt(
+            max(1.0 - ca * ca - cb * cb - cg * cg + 2.0 * ca * cb * cg, 1e-6)
+        )
+    else:
+        vol_fac = 1.0
+    vol_est = max(a * b * c * float(vol_fac), 1.0)
+    mult = 1.0
+    if space_group:
+        sg_lead = str(space_group).strip()[:1].upper()
+        if sg_lead == "F":
+            mult = 4.0
+        elif sg_lead in ("I", "A", "B", "C"):
+            mult = 2.0
+        elif (
+            sg_lead == "R"
+            and len(cell) >= 6
+            and abs(float(cell[3]) - 90.0) < 1e-2
+            and abs(float(cell[5]) - 120.0) < 1e-2
+        ):
+            mult = 3.0
+    d_floor = float(
+        (4.0 * np.pi * vol_est / (3.0 * mult * float(max_refl))) ** (1.0 / 3.0)
+    )
     return max(float(d_min), d_floor)
 
 
@@ -724,7 +968,9 @@ def _polish_per_run_translations(
     from scipy.spatial.transform import Rotation as Rot
 
     bank_to_idx = {b: i for i, b in enumerate(bank_ids)}
-    d_min_ew = _ewald_d_min(cell_opt, args.d_min)
+    d_min_ew = _ewald_d_min(
+        cell_opt, args.d_min, space_group=args.space_group, max_refl=450000
+    )
     hkl = np.stack(
         generate_reflections(
             *cell_opt,
@@ -900,10 +1146,18 @@ def _polish_per_run_translations(
                 d2 = (row[valid_h, bi] - _pr_r[i_obs]) ** 2 + (
                     col[valid_h, bi] - _pc_r[i_obs]
                 ) ** 2
-                k = int(np.argmin(d2))
-                if d2[k] < radius**2:
+                if len(valid_h) >= 2:
+                    k2 = np.argpartition(d2, 1)[:2]
+                    if d2[k2[0]] <= d2[k2[1]]:
+                        k, k_sec = int(k2[0]), int(k2[1])
+                    else:
+                        k, k_sec = int(k2[1]), int(k2[0])
+                    if d2[k] < radius**2 and d2[k] < 0.55 * d2[k_sec]:
+                        m_obs.append(i_obs)
+                        m_hkl.append(idx_band[valid_h[k]])
+                elif d2[0] < radius**2:
                     m_obs.append(i_obs)
-                    m_hkl.append(idx_band[valid_h[k]])
+                    m_hkl.append(idx_band[valid_h[0]])
             return np.array(m_obs, dtype=np.int32), np.array(m_hkl, dtype=np.int32)
 
         def fit_matches(
@@ -1000,14 +1254,32 @@ def _polish_per_run_translations(
             cp = np.sum(p * uh_final[b_m], axis=1) / dw[b_m]
             return float(np.median(np.hypot(_pr_r[m_obs] - rp, _pc_r[m_obs] - cp)))
 
-        mo0, mh0 = get_matches(np.zeros(6), 18.0)
+        idx_0, row_0, col_0, ok_0 = project_reflections(np.zeros(6))
+        nn_dists = []
+        if len(idx_0) >= 2:
+            from scipy.spatial import cKDTree
+
+            for bi_u in np.unique(b_r):
+                vh_u = np.flatnonzero(ok_0[:, int(bi_u)])
+                if len(vh_u) >= 4:
+                    pts_u = np.column_stack(
+                        [row_0[vh_u, int(bi_u)], col_0[vh_u, int(bi_u)]]
+                    )
+                    d_nn, _ = cKDTree(pts_u).query(pts_u, k=2)
+                    nn_dists.append(d_nn[:, 1])
+        nn_med_px = float(np.median(np.concatenate(nn_dists))) if nn_dists else 24.0
+        r0_icp = min(18.0, max(2.5, 0.85 * nn_med_px))
+        r1_icp = min(14.0, max(2.0, 0.65 * nn_med_px))
+        r2_icp = min(8.0, max(1.6, 0.48 * nn_med_px))
+
+        mo0, mh0 = get_matches(np.zeros(6), r0_icp)
         if len(mo0) < 8:
             continue
         d_before = eval_med_dist(np.zeros(6), mo0, mh0)
         x = fit_matches(np.zeros(6), mo0, mh0, f_sc=3.5, prior_ds=0.45)
-        mo1, mh1 = get_matches(x, 14.0)
+        mo1, mh1 = get_matches(x, r1_icp)
         x = fit_matches(x, mo1, mh1, f_sc=2.0, prior_ds=0.45)
-        mo2, mh2 = get_matches(x, 8.0)
+        mo2, mh2 = get_matches(x, r2_icp)
         x = fit_matches(x, mo2, mh2, f_sc=1.5, prior_ds=0.45)
         d_after = eval_med_dist(x, mo0, mh0)
         med_before_list.append(d_before)
@@ -1122,6 +1394,7 @@ def refine_scan(args):
     banks, pr, pc, dev, sig_px, runs, _angs, spot_weights, R_obs, scan_axes_obs = obs
     raw_dev_obs = dev.copy()
     raw_spot_weights = spot_weights.copy()
+    _gv_obs = np.ones(len(dev), dtype=np.float64)
     if pixel_em is not None:
         dev, spot_weights, _gv_obs = pixel_em.map_to_observations(
             banks, pr, pc, runs, raw_dev_obs, raw_spot_weights
@@ -1298,6 +1571,39 @@ def refine_scan(args):
         wr = wr / jnp.maximum(jnp.abs(wr).sum(), 1e-12)
         return wj, wr
 
+    def _build_zone_funnel_obs(C_mid, uh, vh, W_cur, H_cur, s_vec=None):
+        clean_mask = sel_full & (_gv_obs > 0.5) & (dev > 20.0)
+        if int(clean_mask.sum()) < 24:
+            clean_mask = sel_full & (
+                dev > max(float(getattr(args, "min_deviance", 6.0)), 6.0)
+            )
+        idx_cl = np.flatnonzero(clean_mask)
+        if len(idx_cl) == 0:
+            return {}, {}
+        bi_cl = b_idx_all[idx_cl]
+        u_cl = (pc[idx_cl] / M_bank[bi_cl] - 0.5) * W_cur[bi_cl]
+        v_cl = (pr[idx_cl] / N_bank[bi_cl] - 0.5) * H_cur[bi_cl]
+        pos_cl = C_mid[bi_cl] + u_cl[:, None] * uh[bi_cl] + v_cl[:, None] * vh[bi_cl]
+        if s_vec is not None:
+            pos_cl = pos_cl - np.asarray(s_vec, dtype=np.float64)[None, :]
+        kf_cl = pos_cl / np.maximum(
+            np.linalg.norm(pos_cl, axis=1, keepdims=True), 1e-12
+        )
+        q_cl = kf_cl - np.array([0.0, 0.0, 1.0], dtype=np.float64)[None, :]
+        q_cl = q_cl / np.maximum(np.linalg.norm(q_cl, axis=1, keepdims=True), 1e-12)
+        w_cl = np.clip(dev[idx_cl], 0.0, 400.0) * _gv_obs[idx_cl]
+        r_cl = runs[idx_cl]
+        q_dict, w_dict = {}, {}
+        for r_id in args.runs:
+            mr = r_cl == r_id
+            if int(mr.sum()) >= 8:
+                sub_idx = np.flatnonzero(mr)
+                if len(sub_idx) > 400:
+                    sub_idx = sub_idx[np.argpartition(w_cl[sub_idx], -400)[-400:]]
+                q_dict[int(r_id)] = q_cl[sub_idx]
+                w_dict[int(r_id)] = w_cl[sub_idx]
+        return q_dict, w_dict
+
     ewald_ctx = None
     raw_exc_maps = None
     if not args.pixel_polish and args.maxiter > 2:
@@ -1308,7 +1614,9 @@ def refine_scan(args):
             else raw_exc_maps
         )
         if has_ew_signal:
-            d_min_ew = _ewald_d_min(cell0, args.d_min)
+            d_min_ew = _ewald_d_min(
+                cell0, args.d_min, space_group=args.space_group, max_refl=600000
+            )
             hkl_ew = np.stack(
                 generate_reflections(
                     *cell0,
@@ -1344,7 +1652,21 @@ def refine_scan(args):
                     best_u_nom, spans=(0.12, 0.04), n=7
                 )
                 if per_run_active and not is_single_setting:
-                    Urs_nom, s_nom_r = polish_per_run_nom(U_nom_joint)
+                    q_zf_nom, w_zf_nom = _build_zone_funnel_obs(
+                        C_bank, uhat_bank, vhat_bank, W_bank, H_bank
+                    )
+                    Urs_zf_nom = _zone_funnel_seed_per_run(
+                        U_nom_joint,
+                        B0,
+                        args.runs,
+                        R_runs_nom,
+                        q_zf_nom,
+                        w_zf_nom,
+                        space_group=args.space_group,
+                    )
+                    Urs_nom, s_nom_r = polish_per_run_nom(
+                        U_nom_joint, Urs_alt_seed=Urs_zf_nom
+                    )
                     ew_nom = float(s_nom_r.sum())
                     R_runs_pre = dict(R_runs_nom)
                     for ir, r in enumerate(args.runs):
@@ -1568,7 +1890,7 @@ def refine_scan(args):
         wz = 1.0 / jnp.linalg.norm(X0, axis=1) if inv_len_weight else jnp.ones(len(X0))
         score = band_sum(X0 @ Rm.T, d, q_lo, q_hi, w_spots, wz)
         reg_geom = 5.0
-        reg_cell = 1000.0 if is_single_setting else 20.0
+        reg_cell = 1000.0 if is_single_setting else 2.0
         reg_aniso = 15.0 * (s_rad - s_ax) ** 2 if "axial_stretch" in args.modes else 0.0
         reg = (
             reg_panel * (jnp.sum(du**2) + jnp.sum(dv**2))
@@ -2385,7 +2707,24 @@ def refine_scan(args):
         else:
             U_cal_joint, ew_cal_joint = U_cal_1, s_cal_1
         if per_run_active and not is_single_setting:
-            Urs_cal, s_cal_r = polish_per_run_cal(U_cal_joint)
+            q_zf_cal, w_zf_cal = _build_zone_funnel_obs(
+                C_midpoint_final,
+                uh_final,
+                vh_final,
+                W_final,
+                H_final,
+                s_vec=np.asarray(s_samp),
+            )
+            Urs_zf_cal = _zone_funnel_seed_per_run(
+                U_cal_joint,
+                B_opt,
+                args.runs,
+                R_runs_band,
+                q_zf_cal,
+                w_zf_cal,
+                space_group=args.space_group,
+            )
+            Urs_cal, s_cal_r = polish_per_run_cal(U_cal_joint, Urs_alt_seed=Urs_zf_cal)
             ew_cal = float(s_cal_r.sum())
             used_per_run_cal = True
         else:
@@ -2399,7 +2738,19 @@ def refine_scan(args):
             U_nf, ew_nf_j = pol_j_nf(ewald_ctx["U_nom_joint"], spans=(0.12, 0.04), n=5)
             ewald_ctx["U_nom_joint"] = U_nf
             if per_run_active and not is_single_setting and pol_pr_nf is not None:
-                Urs_nf, s_nf_r = pol_pr_nf(U_nf)
+                q_zf_nf, w_zf_nf = _build_zone_funnel_obs(
+                    C_bank, uhat_bank, vhat_bank, W_bank, H_bank
+                )
+                Urs_zf_nf = _zone_funnel_seed_per_run(
+                    U_nf,
+                    B0,
+                    args.runs,
+                    R_runs_nom,
+                    q_zf_nf,
+                    w_zf_nf,
+                    space_group=args.space_group,
+                )
+                Urs_nf, s_nf_r = pol_pr_nf(U_nf, Urs_alt_seed=Urs_zf_nf)
                 ewald_ctx["Urs_nom"] = Urs_nf
                 ewald_ctx["ew_nom"] = float(s_nf_r.sum())
             else:
@@ -2414,6 +2765,9 @@ def refine_scan(args):
                 for ir, r in enumerate(args.runs):
                     R_runs_final[r] = R_runs_band[r] @ Urs_cal[ir] @ U_cal_joint.T
                 args.R_runs_refined = [R_runs_final[r] for r in range(n_runs)]
+            Urs_win = Urs_cal
+            R_runs_win = R_runs_band
+            ew_eval_win = _eval_cal
             ew_best = ew_cal
         else:
             U_opt = ewald_ctx["U_nom_joint"]
@@ -2434,7 +2788,146 @@ def refine_scan(args):
                 args.R_runs_refined = [
                     ewald_ctx["R_runs_pre"][r] for r in range(n_runs)
                 ]
+            Urs_win = ewald_ctx["Urs_nom"]
+            R_runs_win = R_runs_nom
+            ew_eval_win = _ev_nf
             ew_best = ew_nom
+
+        # Direct Ewald unit-cell ratio polish (decoupled from isotropic scale c):
+        # preserves unit-cell ratios even when detector radial scale falls back to
+        # nominal geometry, and breaks the flat L-BFGS-B band valley on large cells.
+        if (
+            "cell" in args.modes
+            and not is_single_setting
+            and len(active_cell_slots) > 0
+            and len(ewald_ctx["hkl_ew"]) > 0
+        ):
+            if ew_eval_win is None:
+                ew_eval_win, _, _ = _make_ewald_polisher(
+                    ewald_ctx["hkl_ew"] @ B_opt.T,
+                    args.runs,
+                    R_runs_win,
+                    bank_ids,
+                    C_final,
+                    uh_final,
+                    vh_final,
+                    W_final,
+                    H_final,
+                    M_bank,
+                    N_bank,
+                    ewald_ctx["exc_maps"],
+                    args.assign_wavelength,
+                    ewald_ctx["b2"],
+                    s_samp=np.asarray(s_samp),
+                )
+            keep_c = ew_eval_win.keep_idx
+            if len(keep_c) > 0:
+                hkl_sub = ewald_ctx["hkl_ew"][keep_c]
+                cell_vec = np.array(
+                    [float(p_cur[15]), float(p_cur[16]), float(p_cur[17])],
+                    dtype=np.float64,
+                )
+
+                def _eval_cell_vec(cv):
+                    vals = _apply_cell_jax(
+                        cell0, symmetry_kind, float(cv[0]), float(cv[1]), float(cv[2])
+                    )
+                    B_try = np.asarray(
+                        build_B_jax(*[float(v) for v in vals]), np.float64
+                    )
+                    raw_s = float(
+                        ew_eval_win.score_with_Gc(hkl_sub @ B_try.T, Urs_win).sum()
+                    )
+                    # Gentle tie-breaking prior (~0.01% of score at 1% strain)
+                    prior = 1e-4 * max(abs(raw_s), 1.0) * float(np.sum(cv * cv))
+                    return raw_s - prior, raw_s
+
+                best_obj_c, best_raw_c = _eval_cell_vec(cell_vec)
+                cell_changed = False
+                for c_span in (0.018, 0.005, 0.0014, 0.0004):
+                    for slot in active_cell_slots:
+                        c0_s = cell_vec[slot]
+                        lo_s = max(-0.035, c0_s - c_span)
+                        hi_s = min(0.035, c0_s + c_span)
+                        for cand_v in np.linspace(lo_s, hi_s, 9):
+                            if abs(cand_v - c0_s) < 1e-9:
+                                continue
+                            cv_try = cell_vec.copy()
+                            cv_try[slot] = float(cand_v)
+                            obj_t, raw_t = _eval_cell_vec(cv_try)
+                            if obj_t > best_obj_c + 1e-6:
+                                best_obj_c = obj_t
+                                best_raw_c = raw_t
+                                cell_vec = cv_try
+                                cell_changed = True
+                if cell_changed:
+                    p_cur[15:18] = cell_vec
+                    a_opt, b_opt, c_opt, al_opt_r, be_opt_r, ga_opt_r = [
+                        float(v)
+                        for v in _apply_cell_jax(
+                            cell0,
+                            symmetry_kind,
+                            float(cell_vec[0]),
+                            float(cell_vec[1]),
+                            float(cell_vec[2]),
+                        )
+                    ]
+                    al_opt, be_opt, ga_opt = np.degrees(
+                        [al_opt_r, be_opt_r, ga_opt_r]
+                    ).tolist()
+                    B_opt = np.asarray(
+                        build_B_jax(a_opt, b_opt, c_opt, al_opt_r, be_opt_r, ga_opt_r),
+                        dtype=np.float64,
+                    )
+                    ew_best = best_raw_c
+                    # Fold Urs_win into R_runs_base_c so fine orientation polish starts
+                    # at the already-converged per-run orientations instead of resetting
+                    # multi-degree goniometer precession back to U_opt.
+                    R_runs_base_c = dict(R_runs_win)
+                    if per_run_active and not is_single_setting:
+                        for ir, r in enumerate(args.runs):
+                            R_runs_base_c[r] = R_runs_win[r] @ Urs_win[ir] @ U_opt.T
+                    _, pol_j_c, pol_pr_c = _make_ewald_polisher(
+                        ewald_ctx["hkl_ew"] @ B_opt.T,
+                        args.runs,
+                        R_runs_base_c,
+                        bank_ids,
+                        C_final,
+                        uh_final,
+                        vh_final,
+                        W_final,
+                        H_final,
+                        M_bank,
+                        N_bank,
+                        ewald_ctx["exc_maps"],
+                        args.assign_wavelength,
+                        ewald_ctx["b2"],
+                        s_samp=np.asarray(s_samp),
+                    )
+                    U_c_try, ew_j_c = pol_j_c(U_opt, spans=(0.15, 0.05), n=5)
+                    if per_run_active and not is_single_setting:
+                        Urs_c, s_c_r = pol_pr_c(U_c_try, spans=(0.25, 0.08, 0.03), n=5)
+                        ew_c_tot = float(s_c_r.sum())
+                        if ew_c_tot >= best_raw_c:
+                            U_opt = U_c_try
+                            p_cur[0:3] = Rot.from_matrix(
+                                U_opt @ np.asarray(Uj).T
+                            ).as_rotvec()
+                            ew_best = ew_c_tot
+                            R_runs_final_c = dict(R_runs_base_c)
+                            for ir, r in enumerate(args.runs):
+                                R_runs_final_c[r] = (
+                                    R_runs_base_c[r] @ Urs_c[ir] @ U_opt.T
+                                )
+                            args.R_runs_refined = [
+                                R_runs_final_c[r] for r in range(n_runs)
+                            ]
+                    elif float(ew_j_c) >= best_raw_c:
+                        U_opt = U_c_try
+                        p_cur[0:3] = Rot.from_matrix(
+                            U_opt @ np.asarray(Uj).T
+                        ).as_rotvec()
+                        ew_best = float(ew_j_c)
         record(
             "ewald-polish",
             OptimizeResult(
@@ -2491,6 +2984,54 @@ def refine_scan(args):
             obs=obs,
             sel=sel,
         )
+        if ewald_ctx is not None and len(ewald_ctx["hkl_ew"]) > 0:
+            s_base_arr = np.broadcast_to(
+                np.asarray(s_samp, dtype=np.float64), (len(args.runs), 3)
+            ).copy()
+            s_pol_arr = s_base_arr + np.array(
+                [trans_runs_pol[r] for r in args.runs], dtype=np.float64
+            )
+            _ev_st3, _, _ = _make_ewald_polisher(
+                ewald_ctx["hkl_ew"] @ B_opt.T,
+                args.runs,
+                {r: R_runs_init[r] for r in args.runs},
+                bank_ids,
+                C_final,
+                uh_final,
+                vh_final,
+                W_final,
+                H_final,
+                M_bank,
+                N_bank,
+                ewald_ctx["exc_maps"],
+                args.assign_wavelength,
+                ewald_ctx["b2"],
+                s_samp=s_base_arr,
+            )
+            _ev_st4, _, _ = _make_ewald_polisher(
+                ewald_ctx["hkl_ew"] @ B_opt.T,
+                args.runs,
+                {r: R_runs_pol[r] for r in args.runs},
+                bank_ids,
+                C_final,
+                uh_final,
+                vh_final,
+                W_final,
+                H_final,
+                M_bank,
+                N_bank,
+                ewald_ctx["exc_maps"],
+                args.assign_wavelength,
+                ewald_ctx["b2"],
+                s_samp=s_pol_arr,
+            )
+            U_ident_stack = np.repeat(U_opt[None], len(args.runs), axis=0)
+            s_st3_r = np.diag(_ev_st3(U_ident_stack))
+            s_st4_r = np.diag(_ev_st4(U_ident_stack))
+            for ir, r in enumerate(args.runs):
+                if float(s_st4_r[ir]) < 0.99 * float(s_st3_r[ir]):
+                    R_runs_pol[r] = R_runs_init[r]
+                    trans_runs_pol[r] = 0.0
         args.R_runs_refined = R_runs_pol
         args.trans_runs_refined = trans_runs_pol
         max_t_mm = float(1e3 * np.linalg.norm(trans_runs_pol, axis=1).max())

@@ -6899,7 +6899,7 @@ def test_solve_binning_param_drawer_and_cli_forwarding(tmp_path):
     assert (
         '<select id="inp-binning"><option value="" selected>auto</option>'
         '<option value="16">16</option><option value="8">8</option>'
-        '<option value="4">4</option></select>'
+        '<option value="4">4</option><option value="2">2</option></select>'
     ) in html_default
 
     payload_b16 = dict(payload, solve_binning=16)
@@ -8692,3 +8692,140 @@ def test_cross_instance_galaxy_history_reuse_integrated_restart_and_hydrate_redu
     assert "hydration_job" not in doc_after_hyd
     b19_after = next(pn for pn in doc_after_hyd["panels"] if int(pn["bank"]) == 19)
     assert b19_after.get("texture_b64")
+
+
+def test_multiframe_bank_ids_delta_theta_voronoi_and_live_js_recalc(tmp_path) -> None:
+    """Verify multi-frame bank_ids DeltaTheta lookup, Voronoi neighbor-rung isolation, and live JS DeltaTheta."""
+    import re
+    import shutil
+
+    import gemmi
+    import h5py
+
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.rainbow_zones import (
+        _estimate_image_spot_angular_errors_deg,
+        _load_cached_frame_bank_images,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # Non-contiguous bank_ids [19, 32] across 2 runs (file_offsets=[0, 2], NO "banks" dataset!)
+    det32 = Detector(dict(beamlines["MANDI"]["32"]))
+    img0_19 = np.full((256, 256), 2.0, dtype=np.float32)
+    img0_32 = np.full((256, 256), 2.0, dtype=np.float32)
+    img1_19 = np.full((256, 256), 2.0, dtype=np.float32)
+    img1_32 = np.full((256, 256), 2.0, dtype=np.float32)
+
+    # Plant a single sharp Bragg peak at (row=128.0, col=128.0) ONLY on frame 1, bank 32
+    rr, cc = np.ogrid[:256, :256]
+    spot = 180.0 * np.exp(-0.5 * (((rr - 128.0) ** 2 + (cc - 128.0) ** 2) / 1.1**2))
+    img1_32 += spot.astype(np.float32)
+
+    merged_h5 = tmp_path / "mandi_2frames.h5"
+    dt_str = h5py.string_dtype(encoding="utf-8")
+    with h5py.File(merged_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_dataset(
+            "images",
+            data=np.stack([img0_19, img0_32, img1_19, img1_32], axis=0),
+        )
+        hf.create_dataset("bank_ids", data=np.array([19, 32, 19, 32], dtype=np.int32))
+        hf.create_dataset("file_offsets", data=np.array([0, 2], dtype=np.int32))
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_11324.nxs.h5", "MANDI_11334.nxs.h5"], dtype=object),
+            dtype=dt_str,
+        )
+        hf.create_dataset("goniometer/R", data=np.repeat(np.eye(3)[None], 4, axis=0))
+        hf.create_dataset("instrument/wavelength", data=np.array([2.0, 4.5]))
+
+    # 1) _load_cached_frame_bank_images resolves bank 32 on frame_slice=(2, 4) (would have returned {3, 4} before!)
+    bank_imgs_f1 = _load_cached_frame_bank_images(str(merged_h5), (2, 4))
+    assert set(bank_imgs_f1.keys()) == {19, 32}
+    assert float(bank_imgs_f1[32][128, 128]) > 150.0
+
+    # Construct simple cubic crystal whose (0, 0, 4) reflection at lambda ~ 3.1 A hits (128, 128) on bank 32
+    pos_spot = det32.pixel_to_lab(128, 128)
+    kf_spot = pos_spot / np.linalg.norm(pos_spot)
+    q_dir = kf_spot - np.array([0.0, 0.0, 1.0])
+    q_dir /= np.linalg.norm(q_dir)
+    sin_th = float(np.linalg.norm(kf_spot - np.array([0.0, 0.0, 1.0])) / 2.0)
+    d_target = 3.1 / (2.0 * sin_th)
+    a_cubic = 4.0 * d_target
+    cell_c = [a_cubic, a_cubic, a_cubic, 90.0, 90.0, 90.0]
+    uc_c = gemmi.UnitCell(*cell_c)
+    b_c = np.asarray(uc_c.frac.mat.tolist(), dtype=float).T
+    z_axis = np.array([0.0, 0.0, 1.0])
+    v_cr = np.cross(z_axis, q_dir)
+    s_cr = np.linalg.norm(v_cr)
+    c_cr = float(np.dot(z_axis, q_dir))
+    vx = np.array(
+        [[0.0, -v_cr[2], v_cr[1]], [v_cr[2], 0.0, -v_cr[0]], [-v_cr[1], v_cr[0], 0.0]]
+    )
+    u_c = np.eye(3) + vx + (vx @ vx) * ((1.0 - c_cr) / max(s_cr**2, 1e-12))
+
+    # 2) Voronoi ownership: reflection #0 sits at (128.2, 127.9) (0.22 px from spot),
+    #    while adjacent long-axis rung #1 sits 4.2 px away at (132.2, 128.0) (inside 7 px window!).
+    #    Only reflection #0 may claim the spot; #1 must remain NaN instead of reporting ~0.5 deg error.
+    ang_errs, has_slab = _estimate_image_spot_angular_errors_deg(
+        images_h5=str(merged_h5),
+        frame_slice=(2, 4),
+        hkl_arr=np.array([[0, 0, 4], [1, 0, 4]], dtype=np.float64),
+        bank_arr=np.array([32, 32], dtype=np.int32),
+        pixel_r_arr=np.array([128.2, 132.2], dtype=np.float64),
+        pixel_c_arr=np.array([127.9, 128.0], dtype=np.float64),
+        ub_matrix=u_c @ b_c,
+        R_run=np.eye(3),
+        detectors={32: det32},
+        ki_hat=np.array([0.0, 0.0, 1.0]),
+    )
+    assert has_slab is True
+    assert ang_errs is not None
+    assert np.isfinite(ang_errs[0]) and float(ang_errs[0]) < 0.08
+    assert np.isnan(ang_errs[1])
+
+    # 3) End-to-end build_rainbow_zone_payload on frame_index=1 populates zone angular_rms_deg
+
+    solve_h5 = tmp_path / "solve_2frames.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        for k_n, v_n in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell_c):
+            hf.create_dataset(f"sample/{k_n}", data=float(v_n))
+        hf.create_dataset("sample/space_group", data=b"P 2 3")
+        hf.create_dataset("sample/U", data=u_c)
+        hf.create_dataset("sample/B", data=b_c)
+        hf.create_dataset("goniometer/R", data=np.repeat(np.eye(3)[None], 4, axis=0))
+        hf.create_dataset("bank_ids", data=np.array([19, 32, 19, 32], dtype=np.int32))
+        hf.create_dataset("file_offsets", data=np.array([0, 2], dtype=np.int32))
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_11324.nxs.h5", "MANDI_11334.nxs.h5"], dtype=object),
+            dtype=dt_str,
+        )
+        hf.create_dataset("instrument/wavelength", data=np.array([2.0, 4.5]))
+
+    payload_f1 = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        wavelength_range=(2.0, 4.5),
+        d_min=d_target * 0.92,
+        frame_index=1,
+    )
+    finite_zone_rms = [
+        z["angular_rms_deg"]
+        for z in payload_f1["zones"]
+        if z.get("angular_rms_deg") is not None
+    ]
+    assert len(finite_zone_rms) > 0
+    assert min(finite_zone_rms) < 0.08
+
+    html_doc = render_rainbow_html(payload_f1)
+    assert '<option value="2">2</option>' in html_doc
+    assert "estimateActiveFrameAngularErrorsJS" in html_doc
+    assert "refreshZonesAngularStatsJS" in html_doc
+    if shutil.which("node"):
+        script = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
+        assert "predsByBank" in script

@@ -6004,11 +6004,16 @@ def _load_cached_frame_bank_images(
             if ims is None or len(ims) == 0:
                 return {}
             n_tot = len(ims)
-            b_ids = (
-                np.asarray(hf["banks"][()], dtype=int)
-                if "banks" in hf
-                else np.arange(1, n_tot + 1, dtype=int)
-            )
+            if "bank_ids" in hf:
+                b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            elif "banks" in hf:
+                b_ids = np.asarray(hf["banks"][()], dtype=int).ravel()
+            else:
+                b_ids = np.arange(1, n_tot + 1, dtype=int)
+            if len(b_ids) > 0 and len(b_ids) < n_tot:
+                b_ids = np.resize(b_ids, n_tot)
+            elif len(b_ids) == 0:
+                b_ids = np.arange(1, n_tot + 1, dtype=int)
             if frame_slice is not None:
                 f0 = max(0, min(int(frame_slice[0]), n_tot))
                 f1 = max(f0, min(int(frame_slice[1]), n_tot))
@@ -6163,6 +6168,27 @@ def _estimate_image_spot_angular_errors_deg(
         ws_sel = w_sum[sel_local]
         r_cent_im = np.sum(w_sel * rr[sel_local], axis=(1, 2)) / ws_sel
         c_cent_im = np.sum(w_sel * cc[sel_local], axis=(1, 2)) / ws_sel
+
+        # Voronoi ownership on dense long-axis Laue patterns: only assign an
+        # observed spot centroid to the closest predicted reflection on the bank
+        # so unobserved adjacent (h, k, l+-1) rungs do not hijack neighbors.
+        if len(r_im) > 1:
+            from scipy.spatial import cKDTree
+
+            d_self = np.hypot(
+                r_cent_im - r_im[in_bounds][sel_local],
+                c_cent_im - c_im[in_bounds][sel_local],
+            )
+            d_near, _ = cKDTree(np.column_stack([r_im, c_im])).query(
+                np.column_stack([r_cent_im, c_cent_im]), k=1
+            )
+            own_mask = d_self <= d_near + 1e-4
+            if not np.any(own_mask):
+                continue
+            sel_global = sel_global[own_mask]
+            r_cent_im = r_cent_im[own_mask]
+            c_cent_im = c_cent_im[own_mask]
+
         r_cent_det = r_cent_im / max(scale_r, 1e-9)
         c_cent_det = c_cent_im / max(scale_c, 1e-9)
 
@@ -7767,13 +7793,14 @@ def render_rainbow_html(
     raw_init_binning = payload.get("solve_binning")
     init_binning = (
         str(int(raw_init_binning))
-        if raw_init_binning in (16, 8, 4, "16", "8", "4")
+        if raw_init_binning in (16, 8, 4, 2, "16", "8", "4", "2")
         else ""
     )
     sel_bin_auto = " selected" if init_binning == "" else ""
     sel_bin_16 = " selected" if init_binning == "16" else ""
     sel_bin_8 = " selected" if init_binning == "8" else ""
     sel_bin_4 = " selected" if init_binning == "4" else ""
+    sel_bin_2 = " selected" if init_binning == "2" else ""
     sg_symmetry_groups_json = _build_space_group_symmetry_lookup_json()
     ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
     base_tag_html = (
@@ -9354,7 +9381,7 @@ def render_rainbow_html(
       <span>β <input id="inp-beta" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>γ <input id="inp-gamma" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span title="Panel border rejection width (fraction of image size; visualized in Mask view)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="{init_border:.3g}" style="width:52px;" /></span>
-      <span title="Solve step spatial pixel binning (auto = default ≤8 keeping ≥32×32 bins/panel)">binning <select id="inp-binning"><option value=""{sel_bin_auto}>auto</option><option value="16"{sel_bin_16}>16</option><option value="8"{sel_bin_8}>8</option><option value="4"{sel_bin_4}>4</option></select></span>
+      <span title="Solve step spatial pixel binning (auto = cell- &amp; resolution-aware default)">binning <select id="inp-binning"><option value=""{sel_bin_auto}>auto</option><option value="16"{sel_bin_16}>16</option><option value="8"{sel_bin_8}>8</option><option value="4"{sel_bin_4}>4</option><option value="2"{sel_bin_2}>2</option></select></span>
     </div>
     <div id="files-drawer" class="params-drawer"></div>
     <div class="ladder-rungs" id="ladder-rungs"></div>
@@ -9782,6 +9809,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (payloadObj && typeof payloadObj.d_min === "number" && payloadObj.d_min > 0) {{
       _payloadBaseParams.dMin = Number(payloadObj.d_min);
     }}
+    const ubSrc = (payloadObj && Array.isArray(payloadObj.ub_matrix)) ? payloadObj.ub_matrix : DATA.ub_matrix;
+    _payloadBaseParams.ubSig = Array.isArray(ubSrc)
+      ? ubSrc.flat().map(v => Number(v || 0).toFixed(6)).join(",")
+      : "";
 
     if (!buckets) return;
     const ingestList = (arr, isFrameLevel, isIntegBucket) => {{
@@ -10551,23 +10582,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       pool, nActive, Ractive, sActive, panelsGeom,
       wlMin, wlMax, dMinEff, activeRunIdx, true, MAX_DYNAMIC_FRAME_PEAKS
     );
+    const curUbSig = Array.isArray(DATA.ub_matrix)
+      ? DATA.ub_matrix.flat().map(v => Number(v || 0).toFixed(6)).join(",")
+      : "";
+    const ubChangedFromBase = Boolean(_payloadBaseParams.ubSig && curUbSig && curUbSig !== _payloadBaseParams.ubSig);
+    estimateActiveFrameAngularErrorsJS(framePeaks, panelsGeom, Ractive, sActive, ubChangedFromBase);
     PREDICTED_PEAKS = framePeaks;
 
-    // Refresh zone peak counts so sidebar zone badges reflect the dynamically predicted shells
-    if (Array.isArray(ZONES) && ZONES.length > 0) {{
-      const zCounts = new Map();
-      for (let i = 0; i < framePeaks.length; i++) {{
-        const zids = framePeaks[i].zone_ids;
-        if (!Array.isArray(zids)) continue;
-        for (let j = 0; j < zids.length; j++) {{
-          zCounts.set(zids[j], (zCounts.get(zids[j]) || 0) + 1);
-        }}
-      }}
-      for (let z = 0; z < ZONES.length; z++) {{
-        const zn = ZONES[z];
-        if (zn) zn.n_peaks = zCounts.get(zn.zone_id) || 0;
-      }}
-    }}
+    // Refresh zone peak counts and live per-zone RMS so sidebar badges reflect dynamic shells
+    refreshZonesAngularStatsJS(framePeaks);
 
     const userAdjusted = Boolean(opts && opts.userAdjusted);
     const preserveSource = Boolean(opts && opts.preserveSource);
@@ -11063,8 +11086,243 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   const rawBankImages = new Map();
+  const rawBankGrayMaps = new Map();
   let lastClientBankImgs = null;
   let lastClientBankMaskRaw = null;
+
+  function cacheBankGrayscaleMap(bank, img) {{
+    if (!img) return;
+    const w = img.width || 0;
+    const h = img.height || 0;
+    if (w < 4 || h < 4) return;
+    try {{
+      const c = document.createElement("canvas");
+      c.width = w;
+      c.height = h;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      const d = ctx.getImageData(0, 0, w, h).data;
+      const gray = new Uint8Array(w * h);
+      for (let i = 0, p = 0; i < d.length; i += 4, p++) {{
+        gray[p] = d[i];
+      }}
+      rawBankGrayMaps.set(Number(bank), {{ w, h, data: gray }});
+    }} catch (_e) {{}}
+  }}
+
+  function detPixelToLabJS(det, rowF, colF) {{
+    const dvX = rowF * det.dh * det.vhat[0];
+    const dvY = rowF * det.dh * det.vhat[1];
+    const dvZ = rowF * det.dh * det.vhat[2];
+    if (!det.isCurved) {{
+      return [
+        det.center[0] + colF * det.dw * det.uhat[0] + dvX,
+        det.center[1] + colF * det.dw * det.uhat[1] + dvY,
+        det.center[2] + colF * det.dw * det.uhat[2] + dvZ,
+      ];
+    }}
+    const ang = (colF * det.dw) / Math.max(det.radius, 1e-6);
+    const sA = Math.sin(ang) * det.radius;
+    const cA = (Math.cos(ang) - 1.0) * det.radius;
+    return [
+      det.center[0] + sA * det.what[0] + cA * det.rhat[0] + dvX,
+      det.center[1] + sA * det.what[1] + cA * det.rhat[1] + dvY,
+      det.center[2] + sA * det.what[2] + cA * det.rhat[2] + dvZ,
+    ];
+  }}
+
+  function refreshZonesAngularStatsJS(peaks) {{
+    if (!Array.isArray(ZONES) || ZONES.length === 0 || !Array.isArray(peaks)) return;
+    const zCounts = new Map();
+    const zSqSum = new Map();
+    const zErrN = new Map();
+    for (let i = 0; i < peaks.length; i++) {{
+      const pk = peaks[i];
+      const zids = pk && pk.zone_ids;
+      if (!Array.isArray(zids)) continue;
+      const hasErr = Boolean(pk.has_angular_error) && typeof pk.angular_error_deg === "number" && Number.isFinite(pk.angular_error_deg);
+      const e2 = hasErr ? pk.angular_error_deg * pk.angular_error_deg : 0.0;
+      for (let j = 0; j < zids.length; j++) {{
+        const zid = zids[j];
+        zCounts.set(zid, (zCounts.get(zid) || 0) + 1);
+        if (hasErr) {{
+          zSqSum.set(zid, (zSqSum.get(zid) || 0.0) + e2);
+          zErrN.set(zid, (zErrN.get(zid) || 0) + 1);
+        }}
+      }}
+    }}
+    for (let z = 0; z < ZONES.length; z++) {{
+      const zn = ZONES[z];
+      if (!zn) continue;
+      zn.n_peaks = zCounts.get(zn.zone_id) || 0;
+      const nE = zErrN.get(zn.zone_id) || 0;
+      if (nE > 0) {{
+        zn.angular_rms_deg = Number(Math.sqrt((zSqSum.get(zn.zone_id) || 0.0) / nE).toFixed(4));
+      }}
+    }}
+  }}
+
+  function estimateActiveFrameAngularErrorsJS(peaks, panelsGeomOpt, RrunOpt, sLabOpt, forceOverwrite = false) {{
+    if (!Array.isArray(peaks) || peaks.length === 0 || rawBankGrayMaps.size === 0) return 0;
+    const activeRunIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const Rrun = RrunOpt || getActiveGoniometerR();
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : null;
+    const sLab = sLabOpt || (
+      (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+        ? sMap[String(activeRunIdx)]
+        : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0])
+    );
+    const panelsGeom = panelsGeomOpt || buildActiveDetectorRaycastPanels(sLab);
+    if (!panelsGeom || panelsGeom.length === 0) return 0;
+    const detByBank = new Map();
+    for (let i = 0; i < panelsGeom.length; i++) detByBank.set(Number(panelsGeom[i].bid), panelsGeom[i]);
+
+    const kiRaw = Array.isArray(DATA.ki) && DATA.ki.length === 3 ? DATA.ki : [0.0, 0.0, 1.0];
+    const ki = vecUnit([Number(kiRaw[0]) || 0, Number(kiRaw[1]) || 0, Number(kiRaw[2]) || 1]);
+    const sx = Number(sLab[0]) || 0.0, sy = Number(sLab[1]) || 0.0, sz = Number(sLab[2]) || 0.0;
+    const scratchVals = new Float32Array(441);
+    const scratchDev = new Float32Array(441);
+    const predsByBank = new Map();
+    for (let i = 0; i < peaks.length; i++) {{
+      const p0 = peaks[i];
+      if (!p0) continue;
+      const bk0 = Number(p0.bank);
+      const gm0 = rawBankGrayMaps.get(bk0);
+      const dt0 = detByBank.get(bk0);
+      if (!gm0 || !dt0) continue;
+      const sR0 = dt0.n > 1 ? (gm0.h - 1) / (dt0.n - 1) : 1.0;
+      const sC0 = dt0.m > 1 ? (gm0.w - 1) / (dt0.m - 1) : 1.0;
+      const rr0 = Number(p0.pixel_r) * sR0;
+      const cc0 = Number(p0.pixel_c) * sC0;
+      if (!Number.isFinite(rr0) || !Number.isFinite(cc0)) continue;
+      let arr = predsByBank.get(bk0);
+      if (!arr) {{
+        arr = [];
+        predsByBank.set(bk0, arr);
+      }}
+      arr.push(rr0, cc0);
+    }}
+    let nUpdated = 0;
+
+    for (let i = 0; i < peaks.length; i++) {{
+      const pk = peaks[i];
+      if (!pk || pk.peak_source === "integrated" || pk.source === "integrated") continue;
+      if (!forceOverwrite && pk.has_angular_error && typeof pk.angular_error_deg === "number" && Number.isFinite(pk.angular_error_deg)) {{
+        continue;
+      }}
+      const bk = Number(pk.bank);
+      const gmap = rawBankGrayMaps.get(bk);
+      const det = detByBank.get(bk);
+      if (!gmap || !det || !Array.isArray(pk.g_hat_crystal) || pk.g_hat_crystal.length < 3) continue;
+      const W = gmap.w, H = gmap.h;
+      if (W < 8 || H < 8) continue;
+      const scaleR = det.n > 1 ? (H - 1) / (det.n - 1) : 1.0;
+      const scaleC = det.m > 1 ? (W - 1) / (det.m - 1) : 1.0;
+      const rIm = Number(pk.pixel_r) * scaleR;
+      const cIm = Number(pk.pixel_c) * scaleC;
+      if (!(rIm >= 1.0 && rIm <= H - 2.0 && cIm >= 1.0 && cIm <= W - 2.0)) continue;
+
+      const r0 = Math.round(rIm), c0 = Math.round(cIm);
+      const rad = Math.max(2, Math.min(10, Math.round(0.032 * Math.min(H, W))));
+      const rad2 = rad * rad;
+      let cnt = 0;
+      let maxU8 = 0;
+      for (let dr = -rad; dr <= rad; dr++) {{
+        const rr = Math.max(0, Math.min(H - 1, r0 + dr));
+        const rowOff = rr * W;
+        for (let dc = -rad; dc <= rad; dc++) {{
+          if (dr * dr + dc * dc > rad2) continue;
+          const cc = Math.max(0, Math.min(W - 1, c0 + dc));
+          const u8 = gmap.data[rowOff + cc];
+          if (u8 > maxU8) maxU8 = u8;
+          // Invert log1p texture mapping so bright Bragg cores dominate background
+          scratchVals[cnt++] = Math.expm1((u8 / 255.0) * 5.0);
+        }}
+      }}
+      if (cnt < 5 || maxU8 < 26) {{
+        if (forceOverwrite) pk.has_angular_error = false;
+        continue;
+      }}
+      const sorted = Array.from(scratchVals.subarray(0, cnt)).sort((a, b) => a - b);
+      const bg = sorted[cnt >> 1];
+      for (let k = 0; k < cnt; k++) scratchDev[k] = Math.abs(sorted[k] - bg);
+      const sortedDev = Array.from(scratchDev.subarray(0, cnt)).sort((a, b) => a - b);
+      const mad = 1.4826 * sortedDev[cnt >> 1];
+      const thr = bg + Math.max(4.0 * mad, Math.max(0.45, 0.20 * Math.max(bg, 1.0)));
+
+      let wSum = 0.0, wrSum = 0.0, wcSum = 0.0;
+      for (let dr = -rad; dr <= rad; dr++) {{
+        const rr = Math.max(0, Math.min(H - 1, r0 + dr));
+        const rowOff = rr * W;
+        for (let dc = -rad; dc <= rad; dc++) {{
+          if (dr * dr + dc * dc > rad2) continue;
+          const cc = Math.max(0, Math.min(W - 1, c0 + dc));
+          const val = Math.expm1((gmap.data[rowOff + cc] / 255.0) * 5.0);
+          const ex = val - thr;
+          if (ex > 0.0) {{
+            const w = ex * ex;
+            wSum += w;
+            wrSum += w * rr;
+            wcSum += w * cc;
+          }}
+        }}
+      }}
+      if (wSum <= 0.0) {{
+        if (forceOverwrite) pk.has_angular_error = false;
+        continue;
+      }}
+      const rCentIm = wrSum / wSum;
+      const cCentIm = wcSum / wSum;
+      const bankPreds = predsByBank.get(bk);
+      if (bankPreds && bankPreds.length > 2) {{
+        const drSelf = rCentIm - rIm;
+        const dcSelf = cCentIm - cIm;
+        const dSelf2 = drSelf * drSelf + dcSelf * dcSelf;
+        let hijacked = false;
+        for (let k = 0; k < bankPreds.length; k += 2) {{
+          const drk = rCentIm - bankPreds[k];
+          if (drk * drk >= dSelf2 - 1e-5) continue;
+          const dck = cCentIm - bankPreds[k + 1];
+          if (drk * drk + dck * dck < dSelf2 - 1e-5) {{
+            hijacked = true;
+            break;
+          }}
+        }}
+        if (hijacked) {{
+          if (forceOverwrite) pk.has_angular_error = false;
+          continue;
+        }}
+      }}
+      const rCentDet = rCentIm / Math.max(scaleR, 1e-9);
+      const cCentDet = cCentIm / Math.max(scaleC, 1e-9);
+      const xyzObs = detPixelToLabJS(det, rCentDet, cCentDet);
+      const rx = xyzObs[0] - sx, ry = xyzObs[1] - sy, rz = xyzObs[2] - sz;
+      const rn = Math.hypot(rx, ry, rz);
+      if (rn <= 1e-9) continue;
+      const qlx = rx / rn - ki[0], qly = ry / rn - ki[1], qlz = rz / rn - ki[2];
+      // Crystal frame q_obs = Rrun^T * q_lab
+      const qcx = Rrun[0][0] * qlx + Rrun[1][0] * qly + Rrun[2][0] * qlz;
+      const qcy = Rrun[0][1] * qlx + Rrun[1][1] * qly + Rrun[2][1] * qlz;
+      const qcz = Rrun[0][2] * qlx + Rrun[1][2] * qly + Rrun[2][2] * qlz;
+      const qcn = Math.hypot(qcx, qcy, qcz);
+      if (qcn <= 1e-9) continue;
+      const gh = pk.g_hat_crystal;
+      const ghn = Math.hypot(gh[0], gh[1], gh[2]);
+      if (ghn <= 1e-9) continue;
+      const cosAng = Math.max(-1.0, Math.min(1.0, (qcx * gh[0] + qcy * gh[1] + qcz * gh[2]) / (qcn * ghn)));
+      const angDeg = Math.acos(cosAng) * (180.0 / Math.PI);
+      if (Number.isFinite(angDeg)) {{
+        pk.angular_error_deg = Number(angDeg.toFixed(4));
+        pk.has_angular_error = true;
+        nUpdated++;
+      }}
+    }}
+    return nUpdated;
+  }}
 
   function syncHiResButtonUI() {{
     const btn = document.getElementById("btn-hires-tex");
@@ -11089,10 +11347,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const img = new Image();
       img.onload = () => {{
         rawBankImages.set(p.bank, img);
+        cacheBankGrayscaleMap(p.bank, img);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(img, state.heatmapStyle));
         invalidatePanelRenderCaches();
         pending--;
-        if (pending <= 0 || pending % 8 === 0) {{
+        if (pending <= 0) {{
+          if (estimateActiveFrameAngularErrorsJS(PEAKS) > 0) {{
+            refreshZonesAngularStatsJS(PEAKS);
+            _peakDataAvailabilitySig = "";
+            updateHUD();
+            renderZoneList();
+          }}
+          renderDetector();
+        }} else if (pending % 8 === 0) {{
           renderDetector();
         }}
       }};
@@ -16100,6 +16367,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const gc = buildClientGrayscaleCanvas(imEntry.data, imEntry.H, imEntry.W, step);
           p._grayCanvas = gc;
           rawBankImages.set(p.bank, gc);
+          cacheBankGrayscaleMap(p.bank, gc);
           bankCanvases.set(p.bank, colorizeGrayscaleImage(gc, state.heatmapStyle));
         }}
         if (lastClientBankMaskRaw && lastClientBankMaskRaw.has(p.bank)) {{
@@ -16576,6 +16844,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
 
     rawBankImages.clear();
+    rawBankGrayMaps.clear();
     bankCanvases.clear();
     maskBankCanvases.clear();
     if (!PANELS.some(p => Boolean(p._grayCanvas))) {{
@@ -16592,12 +16861,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     PANELS.forEach(p => {{
       if (p._grayCanvas) {{
         rawBankImages.set(p.bank, p._grayCanvas);
+        cacheBankGrayscaleMap(p.bank, p._grayCanvas);
         bankCanvases.set(p.bank, colorizeGrayscaleImage(p._grayCanvas, state.heatmapStyle));
       }}
       if (p._maskCanvas) {{
         maskBankCanvases.set(p.bank, p._maskCanvas);
       }}
     }});
+    if (rawBankGrayMaps.size > 0 && estimateActiveFrameAngularErrorsJS(PEAKS) > 0) {{
+      refreshZonesAngularStatsJS(PEAKS);
+      _peakDataAvailabilitySig = "";
+    }}
     invalidatePanelRenderCaches();
     syncPixelMaskUI();
 
