@@ -4,6 +4,29 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.3]
+
+### Changed
+
+- **Local-staging GPU execution in `subhkl-nova-app` with Galaxy Careless merge**:
+  - When running in local-staging mode (`SUBHKL_EXEC_MODE=local`, or
+    automatically inside an NDIP interactive GPU tool session with `EP_PATH`
+    and `/SNS` / `/HFIR` mounted), `Reduce`, `Solve`, and `Integrate` execute
+    directly inside the app's local NVMe staging directory
+    (`SUBHKL_STAGING_DIR` / `TMPDIR`) instead of round-tripping multi-GB
+    `merged.h5` / `integrated.h5` datasets through NDIP Rucio/Ceph object
+    storage.
+  - Uploads only compact (`<= 50 MiB`) metadata and crystallography
+    deliverables (`solve.h5`, `reflections.mtz`, `merged.mtz`, `xval.mtz`,
+    `careless_metrics.json`, `merge_table.csv`, `merge_table.html`) to NDIP
+    Galaxy History, deduplicating `reflections.mtz` by `(size, mtime_ns)`.
+  - Routes Stage 4 (`Merge` / Careless) through NDIP Galaxy
+    (`imaginex_subhkl_merge`) whenever `careless` is not installed locally in
+    the `subhkl` container, exchanging only compact `.mtz` files.
+  - Ensures Pulsar-friendly world-writable permissions (`0777` directories,
+    `0666` files) inside `SUBHKL_STAGING_DIR` so host `pulsar` job cleanup
+    never encounters `PermissionError`.
+
 ## [1.6.2]
 
 ### Fixed
