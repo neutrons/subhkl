@@ -4,6 +4,19 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed a ~29-minute post-upload hang on remote Galaxy instances (e.g.
+  `ndip-test.ornl.gov`) after `reduce` produces multi-GB TOF `merged.h5`
+  datasets (`6 × 240 s` silent proxy-buffering read timeouts when downloading
+  embedded `events/tof`): `subhkl-nova-app` now syncs only the 2D `images`
+  stack and metadata (`~1–2%` of file size) via chunked HTTP `Range` requests
+  (`X-Accel-Buffering: no`) while keeping the full `events/tof` dataset in
+  Galaxy for Pulsar GPU `solve` / `integrate` jobs, emits immediate connection
+  and retry status lines, and fails fast on scratch `ENOSPC`.
+
 ## [1.6.1]
 
 ### Added
@@ -62,6 +75,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Separated staging filenames in `blind_band` (`.blind.rung.tmp.h5` vs.
   `.blind.final.tmp.h5`) so live rung updates cannot collide with the final
   `solve.blind.h5` atomic rename.
+
 
 ## [1.6.0]
 

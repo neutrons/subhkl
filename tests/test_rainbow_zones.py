@@ -7794,3 +7794,210 @@ def test_tmpdir_exit_cleanup_removes_app_artifacts_safely(tmp_path) -> None:
     proc.send_signal(signal.SIGTERM)
     proc.wait(timeout=10)
     assert list(sub_tmp_2.iterdir()) == []
+
+
+def test_remote_galaxy_slim_h5_range_sync_skips_tof_events_and_links_provenance(
+    tmp_path, monkeypatch
+) -> None:
+    """Verify multi-GB-style TOF merged.h5 sync uses HTTP Range to skip events/tof while preserving TOF & Galaxy provenance."""
+    import errno
+    import http.server
+    import shutil
+    import socketserver
+    import threading
+    from types import SimpleNamespace
+
+    import subhkl.viz.nova_rainbow_view as nrv
+    from subhkl.io.events import write_events
+    from subhkl.viz.rainbow_zones import _h5_has_tof_data
+
+    ds_id = "ed4822a65a7baa02"
+    remote_h5 = tmp_path / "remote_scan_master.h5"
+    rng = np.random.default_rng(42)
+    imgs_true = rng.poisson(3, size=(8, 64, 64)).astype(np.float32)
+    with h5py.File(remote_h5, "w") as hf:
+        hf.create_dataset(
+            "images", data=imgs_true, chunks=(1, 64, 64), compression="lzf"
+        )
+        hf.create_dataset("bank_ids", data=np.arange(1, 9, dtype=np.int32))
+        hf.create_dataset("file_offsets", data=np.array([0, 4], dtype=np.int64))
+        hf.create_dataset(
+            "files",
+            data=["MANDI_11324.nxs.h5", "MANDI_11325.nxs.h5"],
+            dtype=h5py.string_dtype(),
+        )
+        gon = hf.create_group("goniometer")
+        gon.create_dataset("angles", data=np.zeros((8, 3), dtype=np.float64))
+        gon.create_dataset("axes", data=np.eye(3, dtype=np.float64))
+        # Large incompressible random float32 TOF payload (~8 MB >> 2D images ~120 KB)
+        tof_chunks = [
+            rng.uniform(1000.0, 16666.0, size=260_000).astype(np.float32)
+            for _ in range(8)
+        ]
+        write_events(hf, tof_chunks, l1=30.0)
+        # Trailing sample metadata written after events/tof (just like run_merge_images)
+        smp = hf.create_group("sample")
+        for k, v in zip(
+            ("a", "b", "c", "alpha", "beta", "gamma"),
+            (11.93, 11.93, 11.93, 90.0, 90.0, 90.0),
+        ):
+            smp[k] = v
+        smp["space_group"] = b"I a -3 d"
+
+    full_bytes = remote_h5.read_bytes()
+    full_size = len(full_bytes)
+    assert full_size > 6 * 1024 * 1024
+
+    served_log: list[tuple[str, str, int]] = []
+
+    class _RangeGalaxyHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            return
+
+        def do_GET(self) -> None:
+            path_only = self.path.split("?", 1)[0]
+            if path_only == f"/api/datasets/{ds_id}":
+                doc = json.dumps(
+                    {
+                        "id": ds_id,
+                        "name": "MANDI_11324_MANDI_11338_merged.h5",
+                        "state": "ok",
+                        "file_size": full_size,
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(doc)))
+                self.end_headers()
+                self.wfile.write(doc)
+                return
+            if path_only == f"/api/datasets/{ds_id}/display":
+                rng_hdr = self.headers.get("Range") or ""
+                accel_hdr = self.headers.get("X-Accel-Buffering") or ""
+                m = re.match(r"^bytes=(\d+)-(\d*)$", rng_hdr)
+                if m:
+                    start = int(m.group(1))
+                    end = int(m.group(2)) if m.group(2) else (full_size - 1)
+                    end = min(end, full_size - 1)
+                    body = full_bytes[start : end + 1]
+                    served_log.append((rng_hdr, accel_hdr, len(body)))
+                    self.send_response(206)
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.send_header(
+                        "Content-Range", f"bytes {start}-{end}/{full_size}"
+                    )
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                served_log.append(("", accel_hdr, full_size))
+                self.send_response(200)
+                self.send_header("Content-Length", str(full_size))
+                self.end_headers()
+                self.wfile.write(full_bytes)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    class _ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    monkeypatch.setattr(nrv, "_SLIM_REMOTE_H5_MIN_BYTES", 512 * 1024)
+    monkeypatch.setattr(nrv, "_HTTP_RANGE_BLOCK_BYTES", 64 * 1024)
+
+    srv = _ThreadedServer(("127.0.0.1", 0), _RangeGalaxyHandler)
+    port = srv.server_address[1]
+    thr = threading.Thread(target=srv.serve_forever, daemon=True)
+    thr.start()
+    try:
+        runner = nrv.NovaGalaxyPipelineRunner(
+            galaxy_url=f"http://127.0.0.1:{port}",
+            galaxy_api_key="test_key",
+        )
+        runner.history_id = "hist_1"
+        dest_h5 = tmp_path / "subhkl_work_MANDI_11324_MANDI_11338" / "merged.h5"
+        job_rec: dict[str, object] = {"stdout": ""}
+        n_written = runner._download_dataset_to_file(
+            ds_id,
+            str(dest_h5),
+            job_record=job_rec,
+            label="MANDI_11324_MANDI_11338_merged.h5",
+        )
+        assert n_written > 0
+        assert dest_h5.is_file()
+        # Local slim cache and total network bytes fetched must be a tiny fraction of full_size
+        total_http_bytes = sum(sz for _, _, sz in served_log)
+        assert dest_h5.stat().st_size < full_size * 0.15
+        assert total_http_bytes < full_size * 0.25
+        assert all(rng_h.startswith("bytes=") for rng_h, _, _ in served_log)
+        assert all(acc_h == "no" for _, acc_h, _ in served_log)
+        assert job_rec.get("_last_slim_remote_bytes") == full_size
+
+        with h5py.File(dest_h5, "r") as hf_slim:
+            assert "events" not in hf_slim
+            assert bool(hf_slim.attrs.get("has_tof_events")) is True
+            assert str(hf_slim.attrs.get("galaxy_dataset_id")) == ds_id
+            assert int(hf_slim.attrs.get("galaxy_file_size")) == full_size
+            assert np.allclose(hf_slim["images"][()], imgs_true)
+            assert float(hf_slim["sample/a"][()]) == pytest.approx(11.93)
+        assert _h5_has_tof_data(dest_h5) is True
+
+        # Fresh runner (simulating cleared in-memory map) still links back to ds_id via HDF5 provenance without re-upload!
+        runner2 = nrv.NovaGalaxyPipelineRunner(
+            galaxy_url=f"http://127.0.0.1:{port}",
+            galaxy_api_key="test_key",
+        )
+        runner2.history_id = "hist_1"
+        upload_called = False
+
+        class _FakeDatasetsClient:
+            def show_dataset(self, q_id: str) -> dict[str, object]:
+                assert q_id == ds_id
+                return {
+                    "id": ds_id,
+                    "name": "MANDI_11324_MANDI_11338_merged.h5",
+                    "state": "ok",
+                    "deleted": False,
+                    "file_size": full_size,
+                }
+
+            def get_datasets(self, **_kw: object) -> list[dict[str, object]]:
+                return []
+
+        class _FakeToolsClient:
+            def upload_file(self, *_a: object, **_kw: object) -> dict[str, object]:
+                nonlocal upload_called
+                upload_called = True
+                return {}
+
+        fake_gi = SimpleNamespace(
+            datasets=_FakeDatasetsClient(),
+            tools=_FakeToolsClient(),
+        )
+        fake_store = SimpleNamespace(
+            history_id="hist_1",
+            nova_connection=SimpleNamespace(galaxy_instance=fake_gi),
+        )
+        monkeypatch.setattr(
+            runner2, "attach_dataset_cell_metadata_from_file", lambda *_a, **_k: None
+        )
+        linked_id = runner2._ensure_galaxy_h5_dataset(
+            fake_store, str(dest_h5), {"stdout": "", "params": {}}
+        )
+        assert linked_id == ds_id
+        assert upload_called is False
+
+        # Scratch ENOSPC preflight fails immediately instead of hanging/evicting pod
+        monkeypatch.setattr(
+            shutil,
+            "disk_usage",
+            lambda _p: shutil._ntuple_diskusage(100, 90, 10 * 1024 * 1024),
+        )
+        with pytest.raises(OSError) as exc_info:
+            runner._check_scratch_space(
+                str(tmp_path), 6400 * 1024 * 1024, "MANDI_merged.h5"
+            )
+        assert exc_info.value.errno == errno.ENOSPC
+    finally:
+        srv.shutdown()
+        srv.server_close()

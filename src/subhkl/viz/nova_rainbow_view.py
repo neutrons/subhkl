@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import errno
+import http.client
 import http.server
+import io
 import json
 import os
 import re
@@ -54,6 +57,7 @@ from subhkl.viz.rainbow_zones import (
 
 _NOVA_RECOVERABLE_ERRORS = (
     OSError,
+    http.client.HTTPException,
     RuntimeError,
     ValueError,
     TypeError,
@@ -63,6 +67,164 @@ _NOVA_RECOVERABLE_ERRORS = (
     ImportError,
     ArithmeticError,
 )
+
+# Datasets at or above this size on remote Galaxy servers use HTTP Range + HDF5
+# object-copy to sync 2D detector images & metadata locally while skipping multi-GB
+# ``events/tof`` arrays (which stay in Galaxy's object store for Pulsar GPU jobs).
+_SLIM_REMOTE_H5_MIN_BYTES = 32 * 1024 * 1024
+_HTTP_RANGE_BLOCK_BYTES = 8 * 1024 * 1024
+
+
+class _RangeFallbackError(RuntimeError):
+    """Internal signal to fall back from HTTP Range HDF5 reading to sequential streaming."""
+
+
+class _HttpRangeReader(io.RawIOBase):
+    """Seekable read-only file-like wrapper over HTTP ``Range`` requests with LRU block caching."""
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        headers: dict[str, str],
+        total_size: int,
+        initial_block: bytes,
+        block_size: int | None = None,
+        connect_timeout: float = 20.0,
+        read_timeout: float = 60.0,
+        max_fetch_bytes: int | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> None:
+        super().__init__()
+        import requests
+
+        self._url = url
+        self._base_headers = dict(headers)
+        self.size = int(total_size)
+        self.pos = 0
+        self.block_size = max(
+            65536, int(_HTTP_RANGE_BLOCK_BYTES if block_size is None else block_size)
+        )
+        self._connect_timeout = float(connect_timeout)
+        self._read_timeout = float(read_timeout)
+        self.max_fetch_bytes = (
+            int(max_fetch_bytes)
+            if max_fetch_bytes is not None
+            else max(512 * 1024 * 1024, int(0.40 * self.size))
+        )
+        self._on_progress = on_progress
+        self._session = requests.Session()
+        self._cache: dict[int, bytes] = {}
+        self.n_requests = 1 if initial_block else 0
+        self.bytes_fetched = len(initial_block)
+        if initial_block and len(initial_block) == min(self.size, self.block_size):
+            self._cache[0] = initial_block
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self.pos
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if whence == io.SEEK_SET:
+            new_pos = int(offset)
+        elif whence == io.SEEK_CUR:
+            new_pos = self.pos + int(offset)
+        elif whence == io.SEEK_END:
+            new_pos = self.size + int(offset)
+        else:
+            raise ValueError(f"Unsupported whence={whence}")
+        if new_pos < 0:
+            raise OSError(errno.EINVAL, "Negative seek offset")
+        self.pos = new_pos
+        return self.pos
+
+    def _fetch_block(self, blk_idx: int) -> bytes:
+        cached = self._cache.get(blk_idx)
+        if cached is not None:
+            # Refresh LRU order
+            self._cache.pop(blk_idx, None)
+            self._cache[blk_idx] = cached
+            return cached
+        start = blk_idx * self.block_size
+        if start >= self.size:
+            return b""
+        end = min(self.size - 1, start + self.block_size - 1)
+        expected_len = end - start + 1
+        if self.bytes_fetched + expected_len > self.max_fetch_bytes:
+            raise _RangeFallbackError(
+                f"HTTP Range fetch exceeded budget ({self.bytes_fetched} / {self.max_fetch_bytes} bytes)"
+            )
+        req_headers = dict(self._base_headers)
+        req_headers["Range"] = f"bytes={start}-{end}"
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = self._session.get(
+                    self._url,
+                    headers=req_headers,
+                    timeout=(self._connect_timeout, self._read_timeout),
+                )
+                try:
+                    if resp.status_code != 206:
+                        raise _RangeFallbackError(
+                            f"Expected HTTP 206 for Range {start}-{end}, got {resp.status_code}"
+                        )
+                    data = resp.content
+                finally:
+                    resp.close()
+                if not data:
+                    raise OSError(f"Empty HTTP 206 body for Range {start}-{end}")
+                self.n_requests += 1
+                self.bytes_fetched += len(data)
+                if len(self._cache) >= 12:
+                    self._cache.pop(next(iter(self._cache)))
+                self._cache[blk_idx] = data
+                if callable(self._on_progress):
+                    self._on_progress(self.bytes_fetched, self.size)
+                return data
+            except _RangeFallbackError:
+                raise
+            except (OSError, http.client.HTTPException) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    time.sleep(0.4)
+        assert last_exc is not None
+        raise last_exc
+
+    def readinto(self, b: Any) -> int:
+        if self.pos >= self.size:
+            return 0
+        mem = memoryview(b).cast("B")
+        n_req = min(len(mem), self.size - self.pos)
+        if n_req <= 0:
+            return 0
+        written = 0
+        while written < n_req:
+            cur = self.pos + written
+            blk_idx = cur // self.block_size
+            blk_off = cur % self.block_size
+            blk = self._fetch_block(blk_idx)
+            if blk_off >= len(blk):
+                break
+            take = min(n_req - written, len(blk) - blk_off)
+            if take <= 0:
+                break
+            mem[written : written + take] = blk[blk_off : blk_off + take]
+            written += take
+        self.pos += written
+        return written
+
+    def close(self) -> None:
+        with contextlib.suppress(Exception):
+            self._session.close()
+        self._cache.clear()
+        super().close()
+
 
 _TEMP_CLEANUP_LOCK = threading.Lock()
 _REGISTERED_TEMP_PATHS: dict[str, str] = {}
@@ -987,6 +1149,89 @@ class NovaGalaxyPipelineRunner:
                 self._cached_galaxy_datatypes = dtypes
         return target in dtypes
 
+    def _is_localhost_galaxy(self) -> bool:
+        return bool(
+            self.galaxy_url
+            and any(h in self.galaxy_url for h in ("127.0.0.1", "localhost"))
+        )
+
+    def _should_strip_remote_tof_events(self, dest_path: str) -> bool:
+        return bool(
+            self.is_connected
+            and str(dest_path or "").lower().endswith((".h5", ".hdf5"))
+        )
+
+    @staticmethod
+    def _read_h5_galaxy_provenance(path: str | None) -> tuple[str, int]:
+        if not path or not os.path.isfile(path):
+            return "", 0
+        if not str(path).lower().endswith((".h5", ".hdf5")):
+            return "", 0
+        with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            import h5py
+
+            with h5py.File(path, "r") as hf:
+                raw_id = hf.attrs.get("galaxy_dataset_id")
+                if isinstance(raw_id, (bytes, np.bytes_)):
+                    ds_id = raw_id.decode("utf-8", "ignore").strip()
+                else:
+                    ds_id = str(raw_id or "").strip()
+                raw_sz = int(hf.attrs.get("galaxy_file_size") or 0)
+                return ds_id, max(0, raw_sz)
+        return "", 0
+
+    @staticmethod
+    def _write_slim_h5_without_events(
+        hf_in: Any,
+        dest_part_path: str,
+        *,
+        ds_id: str = "",
+        galaxy_file_size: int = 0,
+    ) -> bool:
+        """Copy all HDF5 groups/datasets except ``events`` into ``dest_part_path``.
+
+        Preserves LZF-compressed ``images`` chunks verbatim via ``hf_in.copy`` without
+        decompression/recompression and stamps ``has_tof_events`` + Galaxy provenance
+        attributes on the root group. Returns False if ``hf_in`` lacks ``images`` or ``events``.
+        """
+        import h5py
+
+        if "images" not in hf_in or "events" not in hf_in:
+            return False
+        has_ev_tof = "events/tof" in hf_in and "events/image_offsets" in hf_in
+        with h5py.File(dest_part_path, "w") as hf_out:
+            for attr_k, attr_v in hf_in.attrs.items():
+                with contextlib.suppress(TypeError, ValueError, OSError):
+                    hf_out.attrs[attr_k] = attr_v
+            if has_ev_tof:
+                hf_out.attrs["has_tof_events"] = True
+            if ds_id:
+                hf_out.attrs["galaxy_dataset_id"] = str(ds_id)
+            if galaxy_file_size > 0:
+                hf_out.attrs["galaxy_file_size"] = int(galaxy_file_size)
+            for key in hf_in:
+                if key == "events":
+                    continue
+                hf_in.copy(key, hf_out, name=key)
+        return True
+
+    @staticmethod
+    def _check_scratch_space(parent_dir: str, required_bytes: int, label: str) -> None:
+        if required_bytes <= 0 or not parent_dir or not os.path.isdir(parent_dir):
+            return
+        try:
+            free_b = int(shutil.disk_usage(parent_dir).free)
+        except OSError:
+            return
+        headroom = 32 * 1024 * 1024
+        if free_b > 0 and free_b < required_bytes + headroom:
+            raise OSError(
+                errno.ENOSPC,
+                f"Insufficient scratch space in {parent_dir} "
+                f"({free_b / (1024 * 1024):.0f} MB free, "
+                f"{required_bytes / (1024 * 1024):.0f} MB needed for '{label}')",
+            )
+
     @staticmethod
     def _set_stream_progress_line(
         job_record: dict[str, Any] | None, marker: str, line_text: str
@@ -1008,9 +1253,21 @@ class NovaGalaxyPipelineRunner:
         label: str = "",
         ds_info: dict[str, Any] | None = None,
         timeout: float = 240.0,
+        strip_tof_events: bool | None = None,
+        resume_part_path: str | None = None,
     ) -> int:
-        """Stream a Galaxy dataset directly to ``dest_path`` without buffering hundreds of MB in RAM."""
+        """Stream a Galaxy dataset directly to ``dest_path`` without buffering hundreds of MB in RAM.
+
+        For large remote HDF5 image stacks carrying multi-GB ``events/tof`` arrays, uses HTTP
+        ``Range`` requests + ``h5py`` raw chunk copy to materialize only the 2D ``images`` stack
+        and metadata locally (~1-2% of total size), avoiding reverse-proxy buffering timeouts and
+        container ``/tmp`` exhaustion while leaving ``events/tof`` intact in Galaxy for GPU jobs.
+        """
         disp_lbl = label or os.path.basename(dest_path) or str(ds_id)
+        if strip_tof_events is None:
+            strip_tof_events = self._should_strip_remote_tof_events(dest_path)
+        if isinstance(job_record, dict):
+            job_record.pop("_last_slim_remote_bytes", None)
         info_doc = ds_info if isinstance(ds_info, dict) else None
         if info_doc is None and "_api_request" not in self.__dict__:
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
@@ -1020,6 +1277,14 @@ class NovaGalaxyPipelineRunner:
                 if isinstance(fetched, dict):
                     info_doc = fetched
 
+        parent_d = os.path.dirname(os.path.abspath(dest_path))
+        if parent_d:
+            os.makedirs(parent_d, exist_ok=True)
+        part_path = resume_part_path or (
+            f"{os.path.abspath(dest_path)}.part.{os.getpid()}.{threading.get_ident()}"
+        )
+        prog_marker = f"[nova <- galaxy] Syncing '{disp_lbl}'"
+
         if isinstance(info_doc, dict):
             shared_fn = str(info_doc.get("file_name") or "").strip()
             if (
@@ -1027,16 +1292,54 @@ class NovaGalaxyPipelineRunner:
                 and os.path.isfile(shared_fn)
                 and os.path.getsize(shared_fn) > 0
             ):
-                # Copy (never hard-link external Galaxy object-store files) so local HDF5 stamping is safe
-                self._link_or_copy_file(shared_fn, dest_path, allow_hardlink=False)
-                return os.path.getsize(dest_path)
+                shared_sz = os.path.getsize(shared_fn)
+                if (
+                    strip_tof_events
+                    and not self._is_localhost_galaxy()
+                    and shared_sz >= _SLIM_REMOTE_H5_MIN_BYTES
+                ):
+                    slim_tmp = f"{part_path}.slim"
+                    try:
+                        self._set_stream_progress_line(
+                            job_record,
+                            prog_marker,
+                            f"{prog_marker} — extracting 2D image stack from shared storage ({shared_sz / (1024 * 1024):.0f} MB)...",
+                        )
+                        import h5py
 
-        parent_d = os.path.dirname(os.path.abspath(dest_path))
-        if parent_d:
-            os.makedirs(parent_d, exist_ok=True)
-        part_path = (
-            f"{os.path.abspath(dest_path)}.part.{os.getpid()}.{threading.get_ident()}"
-        )
+                        with h5py.File(shared_fn, "r") as hf_sh:
+                            if self._write_slim_h5_without_events(
+                                hf_sh,
+                                slim_tmp,
+                                ds_id=ds_id,
+                                galaxy_file_size=shared_sz,
+                            ):
+                                os.replace(slim_tmp, dest_path)
+                                if isinstance(job_record, dict):
+                                    job_record["_last_slim_remote_bytes"] = shared_sz
+                                self._set_stream_progress_line(
+                                    job_record, prog_marker, ""
+                                )
+                                return os.path.getsize(dest_path)
+                    except _NOVA_RECOVERABLE_ERRORS:
+                        pass
+                    finally:
+                        if os.path.lexists(slim_tmp):
+                            with contextlib.suppress(OSError):
+                                os.remove(slim_tmp)
+                self._check_scratch_space(parent_d, shared_sz, disp_lbl)
+                if shared_sz >= 16 * 1024 * 1024:
+                    self._set_stream_progress_line(
+                        job_record,
+                        prog_marker,
+                        f"{prog_marker} — copying {shared_sz / (1024 * 1024):.1f} MB from shared storage...",
+                    )
+                try:
+                    # Copy (never hard-link external Galaxy object-store files) so local HDF5 stamping is safe
+                    self._link_or_copy_file(shared_fn, dest_path, allow_hardlink=False)
+                finally:
+                    self._set_stream_progress_line(job_record, prog_marker, "")
+                return os.path.getsize(dest_path)
 
         # Preserve compatibility when unit tests monkeypatch instance ``_api_request`` directly
         if "_api_request" in self.__dict__:
@@ -1066,56 +1369,257 @@ class NovaGalaxyPipelineRunner:
         url = f"{self.galaxy_url}{path}"
         if key:
             url = f"{url}{sep}key={urllib.parse.quote(key)}"
-        headers = {"Accept": "*/*"}
+        headers = {
+            "Accept": "*/*",
+            "X-Accel-Buffering": "no",
+        }
         if key:
             headers["x-api-key"] = key
         expected_bytes = (
             int(info_doc.get("file_size") or 0) if isinstance(info_doc, dict) else 0
         )
-        prog_marker = f"[nova <- galaxy] Downloading '{disp_lbl}'"
+
+        # Emit immediate status BEFORE opening the HTTP stream so slow reverse proxies never appear frozen
+        if expected_bytes > 0:
+            self._set_stream_progress_line(
+                job_record,
+                prog_marker,
+                f"{prog_marker} — connecting to Galaxy ({expected_bytes / (1024 * 1024):.1f} MB)...",
+            )
+        else:
+            self._set_stream_progress_line(
+                job_record,
+                prog_marker,
+                f"{prog_marker} — connecting to Galaxy...",
+            )
+
+        # Fast-path 1: HTTP Range + h5py raw object-copy for large remote HDF5 image+event stacks
+        prefetched_stream_resp: Any = None
+        if strip_tof_events and (
+            expected_bytes <= 0 or expected_bytes >= _SLIM_REMOTE_H5_MIN_BYTES
+        ):
+            slim_part = f"{part_path}.slim"
+            try:
+                import h5py
+                import requests
+
+                probe_headers = dict(headers)
+                probe_end = (
+                    min(expected_bytes - 1, _HTTP_RANGE_BLOCK_BYTES - 1)
+                    if expected_bytes > 0
+                    else (_HTTP_RANGE_BLOCK_BYTES - 1)
+                )
+                probe_headers["Range"] = f"bytes=0-{probe_end}"
+                probe_resp = requests.get(
+                    url,
+                    headers=probe_headers,
+                    stream=True,
+                    timeout=(20.0, 60.0),
+                )
+                if probe_resp.status_code == 206:
+                    try:
+                        cr_hdr = str(probe_resp.headers.get("Content-Range") or "")
+                        m_cr = re.search(r"/([0-9]+)\s*$", cr_hdr)
+                        total_sz = (
+                            int(m_cr.group(1)) if m_cr else int(expected_bytes or 0)
+                        )
+                        first_blk = probe_resp.content
+                    finally:
+                        probe_resp.close()
+                    if (
+                        total_sz >= _SLIM_REMOTE_H5_MIN_BYTES
+                        and len(first_blk) >= 8
+                        and first_blk[:8] == b"\x89HDF\r\n\x1a\n"
+                    ):
+                        expected_bytes = total_sz
+                        last_rng_t = time.monotonic()
+
+                        def _on_rng_prog(fetched_b: int, tot_b: int) -> None:
+                            nonlocal last_rng_t
+                            now_r = time.monotonic()
+                            if job_record is None or (now_r - last_rng_t) < 0.5:
+                                return
+                            last_rng_t = now_r
+                            self._set_stream_progress_line(
+                                job_record,
+                                prog_marker,
+                                f"{prog_marker} — {fetched_b / (1024 * 1024):.1f} MB 2D stack fetched via HTTP Range "
+                                f"(skipping {tot_b / (1024 * 1024 * 1024):.2f} GB TOF events)...",
+                            )
+
+                        self._set_stream_progress_line(
+                            job_record,
+                            prog_marker,
+                            f"{prog_marker} — {len(first_blk) / (1024 * 1024):.1f} MB 2D stack fetched via HTTP Range "
+                            f"(skipping {total_sz / (1024 * 1024 * 1024):.2f} GB TOF events)...",
+                        )
+                        rng_reader = _HttpRangeReader(
+                            url=url,
+                            headers=headers,
+                            total_size=total_sz,
+                            initial_block=first_blk,
+                            on_progress=_on_rng_prog,
+                        )
+                        try:
+                            with h5py.File(rng_reader, "r") as hf_remote:
+                                wrote_slim = self._write_slim_h5_without_events(
+                                    hf_remote,
+                                    slim_part,
+                                    ds_id=ds_id,
+                                    galaxy_file_size=total_sz,
+                                )
+                        finally:
+                            rng_reader.close()
+                        if wrote_slim and os.path.isfile(slim_part):
+                            os.replace(slim_part, dest_path)
+                            if isinstance(job_record, dict):
+                                job_record["_last_slim_remote_bytes"] = total_sz
+                            self._set_stream_progress_line(job_record, prog_marker, "")
+                            return os.path.getsize(dest_path)
+                elif probe_resp.status_code == 200:
+                    # Server ignored Range and started sending the full body; reuse open stream
+                    prefetched_stream_resp = probe_resp
+                else:
+                    probe_resp.close()
+            except (_RangeFallbackError, *_NOVA_RECOVERABLE_ERRORS):
+                if prefetched_stream_resp is not None:
+                    with contextlib.suppress(Exception):
+                        prefetched_stream_resp.close()
+                    prefetched_stream_resp = None
+            finally:
+                if os.path.lexists(slim_part):
+                    with contextlib.suppress(OSError):
+                        os.remove(slim_part)
+
+        # Standard sequential streaming download (supports resuming partial file when resume_part_path is provided)
         chunk_sz = 4 * 1024 * 1024
-        written = 0
+        resume_offset = 0
+        if (
+            prefetched_stream_resp is None
+            and resume_part_path
+            and os.path.isfile(part_path)
+        ):
+            with contextlib.suppress(OSError):
+                resume_offset = os.path.getsize(part_path)
+        if expected_bytes > resume_offset:
+            self._check_scratch_space(
+                parent_d, expected_bytes - resume_offset, disp_lbl
+            )
+        written = resume_offset
         last_log_t = time.monotonic()
-        req = urllib.request.Request(url, headers=headers, method="GET")
+        keep_partial_on_error = bool(resume_part_path)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                if expected_bytes <= 0:
-                    with contextlib.suppress(ValueError, TypeError):
-                        expected_bytes = int(resp.headers.get("Content-Length") or 0)
-                if expected_bytes >= 8 * 1024 * 1024:
-                    self._set_stream_progress_line(
-                        job_record,
-                        prog_marker,
-                        f"{prog_marker} — 0.0 / {expected_bytes / (1024 * 1024):.1f} MB (0%)...",
-                    )
-                with open(part_path, "wb") as fh:
-                    while True:
-                        chunk = resp.read(chunk_sz)
-                        if not chunk:
-                            break
-                        fh.write(chunk)
-                        written += len(chunk)
-                        now_t = time.monotonic()
-                        if (
-                            job_record is not None
-                            and written >= 8 * 1024 * 1024
-                            and (now_t - last_log_t) >= 0.8
+            if prefetched_stream_resp is not None:
+                try:
+                    if expected_bytes <= 0:
+                        with contextlib.suppress(ValueError, TypeError):
+                            expected_bytes = int(
+                                prefetched_stream_resp.headers.get("Content-Length")
+                                or 0
+                            )
+                    if expected_bytes > 0:
+                        self._check_scratch_space(parent_d, expected_bytes, disp_lbl)
+                    written = 0
+                    with open(part_path, "wb") as fh:
+                        for chunk in prefetched_stream_resp.iter_content(
+                            chunk_size=chunk_sz
                         ):
-                            last_log_t = now_t
-                            mb_done = written / (1024 * 1024)
-                            if expected_bytes > 0:
-                                mb_tot = expected_bytes / (1024 * 1024)
-                                pct = min(99, round(100.0 * written / expected_bytes))
-                                msg = f"{prog_marker} — {mb_done:.1f} / {mb_tot:.1f} MB ({pct}%)..."
-                            else:
-                                msg = f"{prog_marker} — {mb_done:.1f} MB..."
-                            self._set_stream_progress_line(job_record, prog_marker, msg)
+                            if not chunk:
+                                continue
+                            fh.write(chunk)
+                            written += len(chunk)
+                            now_t = time.monotonic()
+                            if (
+                                job_record is not None
+                                and written >= 4 * 1024 * 1024
+                                and (now_t - last_log_t) >= 0.8
+                            ):
+                                last_log_t = now_t
+                                mb_done = written / (1024 * 1024)
+                                if expected_bytes > 0:
+                                    mb_tot = expected_bytes / (1024 * 1024)
+                                    pct = min(
+                                        99, round(100.0 * written / expected_bytes)
+                                    )
+                                    msg = f"{prog_marker} — {mb_done:.1f} / {mb_tot:.1f} MB ({pct}%)..."
+                                else:
+                                    msg = f"{prog_marker} — {mb_done:.1f} MB..."
+                                self._set_stream_progress_line(
+                                    job_record, prog_marker, msg
+                                )
+                finally:
+                    prefetched_stream_resp.close()
+            else:
+                req_headers = dict(headers)
+                if resume_offset > 0:
+                    req_headers["Range"] = f"bytes={resume_offset}-"
+                req = urllib.request.Request(url, headers=req_headers, method="GET")
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    status_code = int(getattr(resp, "status", 200) or 200)
+                    file_mode = (
+                        "ab" if (resume_offset > 0 and status_code == 206) else "wb"
+                    )
+                    if file_mode == "wb":
+                        written = 0
+                    if expected_bytes <= 0:
+                        with contextlib.suppress(ValueError, TypeError):
+                            clen = int(resp.headers.get("Content-Length") or 0)
+                            if clen > 0:
+                                expected_bytes = (
+                                    written + clen if file_mode == "ab" else clen
+                                )
+                    if expected_bytes > written:
+                        self._check_scratch_space(
+                            parent_d, expected_bytes - written, disp_lbl
+                        )
+                    if expected_bytes >= 8 * 1024 * 1024:
+                        pct0 = (
+                            min(99, round(100.0 * written / expected_bytes))
+                            if expected_bytes > 0
+                            else 0
+                        )
+                        self._set_stream_progress_line(
+                            job_record,
+                            prog_marker,
+                            f"{prog_marker} — {written / (1024 * 1024):.1f} / {expected_bytes / (1024 * 1024):.1f} MB ({pct0}%)...",
+                        )
+                    with open(part_path, file_mode) as fh:
+                        while True:
+                            chunk = resp.read(chunk_sz)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                            written += len(chunk)
+                            now_t = time.monotonic()
+                            if (
+                                job_record is not None
+                                and written >= 8 * 1024 * 1024
+                                and (now_t - last_log_t) >= 0.8
+                            ):
+                                last_log_t = now_t
+                                mb_done = written / (1024 * 1024)
+                                if expected_bytes > 0:
+                                    mb_tot = expected_bytes / (1024 * 1024)
+                                    pct = min(
+                                        99, round(100.0 * written / expected_bytes)
+                                    )
+                                    msg = f"{prog_marker} — {mb_done:.1f} / {mb_tot:.1f} MB ({pct}%)..."
+                                else:
+                                    msg = f"{prog_marker} — {mb_done:.1f} MB..."
+                                self._set_stream_progress_line(
+                                    job_record, prog_marker, msg
+                                )
             if written > 0:
                 os.replace(part_path, dest_path)
             self._set_stream_progress_line(job_record, prog_marker, "")
             return written
+        except BaseException as exc:
+            self._set_stream_progress_line(job_record, prog_marker, "")
+            if isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.ENOSPC:
+                keep_partial_on_error = False
+            raise
         finally:
-            if os.path.lexists(part_path):
+            if not keep_partial_on_error and os.path.lexists(part_path):
                 with contextlib.suppress(OSError):
                     os.remove(part_path)
 
@@ -1588,19 +2092,23 @@ class NovaGalaxyPipelineRunner:
             if os.path.isfile(ex_cand) and os.path.getsize(ex_cand) > 0:
                 return _remember(ex_cand), info
 
-        # 3. Only fall back to fallback_dir if file_size matches (prevents generic 'scan.h5'/'merged.h5' collisions)
+        # 3. Only fall back to fallback_dir if file_size or stamped Galaxy provenance matches
+        # (prevents generic 'scan.h5'/'merged.h5' collisions while matching slim 2D caches)
         expected_size = int(info.get("file_size") or 0)
         if fallback_dir and os.path.isdir(fallback_dir):
             cand = os.path.join(fallback_dir, os.path.basename(name))
-            if (
-                os.path.isfile(cand)
-                and os.path.getsize(cand) > 0
-                and (
-                    (expected_size > 0 and os.path.getsize(cand) == expected_size)
+            if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                cand_sz = os.path.getsize(cand)
+                prov_id, prov_sz = self._read_h5_galaxy_provenance(cand)
+                if (
+                    prov_id == ds_id
+                    or (
+                        expected_size > 0
+                        and (cand_sz == expected_size or prov_sz == expected_size)
+                    )
                     or (expected_size == 0 and not self.is_connected)
-                )
-            ):
-                return _remember(cand), info
+                ):
+                    return _remember(cand), info
 
         safe_name = "".join(
             ch if (ch.isalnum() or ch in "._-") else "_"
@@ -3059,6 +3567,7 @@ class NovaGalaxyPipelineRunner:
                 "run the previous pipeline stage first or select it from History."
             )
         local_size = os.path.getsize(local_path)
+        prov_ds_id, prov_file_size = self._read_h5_galaxy_provenance(local_path)
         gi = store.nova_connection.galaxy_instance
         known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
         if not force_upload:
@@ -3091,6 +3600,12 @@ class NovaGalaxyPipelineRunner:
                     )
                     if m_gx:
                         known_id = m_gx.group(1)
+                if (
+                    not known_id
+                    and cand_p == os.path.abspath(local_path)
+                    and prov_ds_id
+                ):
+                    known_id = prov_ds_id
                 if known_id:
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         k_info = gi.datasets.show_dataset(known_id)
@@ -3182,12 +3697,13 @@ class NovaGalaxyPipelineRunner:
                         else ds.get("state")
                     )
                     ds_sz = int(info.get("file_size") or 0)
+                    valid_sizes = {s for s in (local_size, prov_file_size) if s > 0}
                     if st == "ok":
                         if (
                             is_generic
-                            and local_size > 0
+                            and valid_sizes
                             and ds_sz > 0
-                            and ds_sz != local_size
+                            and ds_sz not in valid_sizes
                         ):
                             continue
                         known_map[os.path.abspath(local_path)] = ds_id
@@ -6972,39 +7488,92 @@ class NovaGalaxyPipelineRunner:
                                     register_temp_artifact(dl_dest)
                                     created_temp = True
                                 n_synced = 0
-                                for attempt in range(6):
-                                    try:
-                                        n_synced = self._download_dataset_to_file(
-                                            ds_id,
-                                            dl_dest,
-                                            job_record=job_record,
-                                            label=merged_label,
-                                            timeout=240.0,
-                                        )
-                                        if n_synced > 0:
-                                            break
-                                    except _NOVA_RECOVERABLE_ERRORS:
-                                        if attempt == 5:
-                                            if created_temp and os.path.lexists(
-                                                dl_dest
+                                max_dl_attempts = 3
+                                resume_part = (
+                                    f"{os.path.abspath(dl_dest)}.part."
+                                    f"{os.getpid()}.{threading.get_ident()}"
+                                )
+                                register_temp_artifact(resume_part)
+                                try:
+                                    for attempt in range(max_dl_attempts):
+                                        try:
+                                            n_synced = self._download_dataset_to_file(
+                                                ds_id,
+                                                dl_dest,
+                                                job_record=job_record,
+                                                label=merged_label,
+                                                timeout=90.0,
+                                                resume_part_path=resume_part,
+                                            )
+                                            if n_synced > 0:
+                                                break
+                                        except _NOVA_RECOVERABLE_ERRORS as dl_exc:
+                                            is_nospc = (
+                                                isinstance(dl_exc, OSError)
+                                                and getattr(dl_exc, "errno", None)
+                                                == errno.ENOSPC
+                                            )
+                                            if (
+                                                is_nospc
+                                                or attempt == max_dl_attempts - 1
                                             ):
-                                                with contextlib.suppress(OSError):
-                                                    os.remove(dl_dest)
-                                            raise
-                                    time.sleep(2.0)
+                                                if created_temp and os.path.lexists(
+                                                    dl_dest
+                                                ):
+                                                    with contextlib.suppress(OSError):
+                                                        os.remove(dl_dest)
+                                                raise
+                                            job_record["stdout"] += (
+                                                f"[nova <- galaxy] Sync attempt {attempt + 1}/{max_dl_attempts} "
+                                                f"for '{merged_label}' interrupted "
+                                                f"({self._clean_err_msg(dl_exc)}); retrying...\n"
+                                            )
+                                        time.sleep(1.5)
+                                finally:
+                                    if os.path.lexists(resume_part):
+                                        with contextlib.suppress(OSError):
+                                            os.remove(resume_part)
                                 if n_synced > 0 and os.path.isfile(dl_dest):
                                     tmp_path = dl_dest
                                     if target_path:
                                         mb_s = n_synced / (1024.0 * 1024.0)
-                                        sz_tag = (
-                                            f", {mb_s:.1f} MB" if mb_s >= 1.0 else ""
+                                        slim_remote_b = int(
+                                            job_record.pop("_last_slim_remote_bytes", 0)
+                                            or 0
                                         )
+                                        if slim_remote_b > n_synced:
+                                            sz_tag = (
+                                                f", {mb_s:.1f} MB 2D stack synced; "
+                                                f"{slim_remote_b / (1024.0**3):.2f} GB with TOF events in Galaxy"
+                                            )
+                                        else:
+                                            sz_tag = (
+                                                f", {mb_s:.1f} MB"
+                                                if mb_s >= 1.0
+                                                else ""
+                                            )
                                         job_record["stdout"] += (
                                             f"[nova <- galaxy] Synced '{merged_label}' (id={ds_id}{sz_tag}) -> {target_path}\n"
                                         )
-                                elif created_temp and os.path.lexists(dl_dest):
-                                    with contextlib.suppress(OSError):
-                                        os.remove(dl_dest)
+                                else:
+                                    if final_step and target_path:
+                                        known_map = getattr(
+                                            self, "_dataset_id_by_path", {}
+                                        )
+                                        known_map[os.path.abspath(target_path)] = ds_id
+                                        if (
+                                            work_dir
+                                            and job_record.get("stage_id") == "reduce"
+                                        ):
+                                            known_map[
+                                                os.path.abspath(
+                                                    os.path.join(work_dir, merged_label)
+                                                )
+                                            ] = ds_id
+                                        self._dataset_id_by_path = known_map
+                                    if created_temp and os.path.lexists(dl_dest):
+                                        with contextlib.suppress(OSError):
+                                            os.remove(dl_dest)
 
                                 # If reduce ran inside a container without CG4D title goniometer fallback, patch angles in merged.h5
                                 if (
@@ -7012,6 +7581,10 @@ class NovaGalaxyPipelineRunner:
                                     and os.path.isfile(tmp_path)
                                     and job_record.get("stage_id") == "reduce"
                                     and job_record.get("raw_nxs")
+                                    and str(job_record.get("instrument") or "CG4D")
+                                    .strip()
+                                    .upper()
+                                    in ("CG4D", "IMAGINE")
                                 ):
                                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                         import h5py
