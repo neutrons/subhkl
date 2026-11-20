@@ -815,3 +815,24 @@ def test_long_axis_auto_binning_ewald_stratification_and_gimbal_lock(
     ang_fit = _decompose_R_to_angles(axes_yzy, ang_nom, R_slipped)
     R_fit = calc_goniometer_rotation_matrix(axes_yzy, ang_fit)
     np.testing.assert_allclose(R_fit, R_slipped, atol=1e-10)
+
+
+def test_cell_symmetry_spec_rhombohedral_h_vs_r():
+    from subhkl.search.scan_band import _cell_symmetry_spec
+
+    assert _cell_symmetry_spec([12.0, 12.0, 28.0, 90.0, 90.0, 120.0], "R 3") == (
+        "hexagonal",
+        (0,),
+    )
+    assert _cell_symmetry_spec([12.0, 12.0, 28.0, 90.0, 90.0, 120.0], "R -3 m :H") == (
+        "hexagonal",
+        (0,),
+    )
+    assert _cell_symmetry_spec([8.5, 8.5, 8.5, 55.2, 55.2, 55.2], "R 3:R") == (
+        "rhombohedral",
+        (2,),
+    )
+    assert _cell_symmetry_spec([8.5, 8.5, 8.5, 55.2, 55.2, 55.2], "R -3 m :R") == (
+        "rhombohedral",
+        (2,),
+    )

@@ -328,7 +328,12 @@ def _build_space_group_symmetry_lookup_json() -> str:
                     code = "monoclinic_b"
             else:
                 code = cs
-            for k in (sg.xhm(), sg.hm, sg.short_name()):
+            key_candidates = (
+                (sg.xhm(), f"{sg.short_name()}:R")
+                if code == "trigonal_r"
+                else (sg.xhm(), sg.hm, sg.short_name())
+            )
+            for k in key_candidates:
                 norm = k.lower().replace(" ", "")
                 if norm:
                     groups.setdefault(code, set()).add(norm)

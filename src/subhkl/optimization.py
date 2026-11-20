@@ -115,9 +115,11 @@ def get_lattice_system(
         sg = get_space_group_object(space_group_name)
         sys_str = str(sg.crystal_system()).split(".")[-1].lower()
         centering = sg.centring_type()
+        sg_ext = getattr(sg, "ext", "")
     except (ValueError, TypeError, KeyError, AttributeError, RuntimeError):
         sys_str = "triclinic"
         centering = "P"
+        sg_ext = ""
 
     expected = "Triclinic"
     if sys_str == "cubic":
@@ -125,7 +127,9 @@ def get_lattice_system(
     elif sys_str == "hexagonal":
         expected = "Hexagonal"
     elif sys_str == "trigonal":
-        expected = "Rhombohedral" if centering == "R" else "Hexagonal"
+        # Gemmi reports ext='H', centring_type()='R' for hexagonal-axes R groups
+        # (R 3, R 3:H) and ext='R', centring_type()='P' for rhombohedral-axes (:R).
+        expected = "Rhombohedral" if sg_ext == "R" else "Hexagonal"
     elif sys_str == "tetragonal":
         expected = "Tetragonal"
     elif sys_str == "orthorhombic":
@@ -190,7 +194,7 @@ def get_lattice_system(
         if eq(a, b):
             geometric = "Hexagonal"
     elif (
-        centering == "R"
+        (sg_ext == "R" or centering == "R")
         and eq(a, b)
         and eq(b, c)
         and eq(alpha, beta)
