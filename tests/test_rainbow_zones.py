@@ -2261,6 +2261,24 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert sym_rhomb["linked_angles"] == {"beta": "alpha", "gamma": "alpha"}
     assert sym_rhomb["fixed_angles"] == {}
 
+    sym_trig_h = resolve_space_group_symmetry("R -3 m")
+    assert sym_trig_h["setting"] == "trigonal"
+    assert sym_trig_h["linked_lengths"] == {"b": "a"}
+    assert sym_trig_h["fixed_angles"] == {
+        "alpha": 90.0,
+        "beta": 90.0,
+        "gamma": 120.0,
+    }
+    from subhkl.viz.rainbow_zones import _build_space_group_symmetry_lookup_json
+
+    sg_groups = json.loads(_build_space_group_symmetry_lookup_json())
+    assert "r3" in sg_groups["trigonal"]
+    assert "r-3m" in sg_groups["trigonal"]
+    assert "r3" not in sg_groups["trigonal_r"]
+    assert "r-3m" not in sg_groups["trigonal_r"]
+    assert "r3:r" in sg_groups["trigonal_r"]
+    assert "r-3m:r" in sg_groups["trigonal_r"]
+
     sym_ortho = resolve_space_group_symmetry("P 21 21 21")
     assert sym_ortho["crystal_system"] == "orthorhombic"
     assert sym_ortho["linked_lengths"] == {}
