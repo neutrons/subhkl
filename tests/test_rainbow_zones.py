@@ -2097,8 +2097,8 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert ext_mc["merge_metrics"]["n_merged_asu"] == 42
     assert len(ext_mc["merge_metrics"]["cc_half_bins"]) == 1
 
-    # Verify reduction_settings.json wavelength defaults, Params λ_min/λ_max inputs, synchronized d_min slider,
-    # and unscaled I/sigma color mode in rendered HTML
+    # Verify reduction_settings.json wavelength defaults, dual-knob [ and ] wavelength interval slider,
+    # Unit cell / Params button (without λ_min/λ_max/d_min inputs), d_min slider, and I/sigma color mode
     from subhkl.viz.rainbow_zones import _get_instrument_default_wavelength
 
     assert _get_instrument_default_wavelength("MANDI") == (2.0, 4.0)
@@ -2110,8 +2110,15 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert fresh_cg4d.data.d_min == 1.4
     assert fresh_cg4d.payload["wavelength_range"] == [2.8, 4.5]
     assert fresh_cg4d.payload["d_min"] == 1.4
-    assert 'id="inp-lmin"' in html_doc
-    assert 'id="inp-lmax"' in html_doc
+    assert 'id="wl-interval-slider"' in html_doc
+    assert 'id="slider-wl-min"' in html_doc
+    assert 'id="slider-wl-max"' in html_doc
+    assert 'id="wl-knob-min"' in html_doc and ">[</button>" in html_doc
+    assert 'id="wl-knob-max"' in html_doc and ">]</button>" in html_doc
+    assert "Unit cell / Params" in html_doc
+    assert 'id="inp-lmin"' not in html_doc
+    assert 'id="inp-lmax"' not in html_doc
+    assert 'id="inp-dmin"' not in html_doc
     assert 'id="slider-dmin"' in html_doc
     assert 'id="sel-spot-color"' in html_doc
     assert '<option value="isigi">Color: I/σ (Log)</option>' in html_doc
@@ -4806,7 +4813,56 @@ def test_full_inline_script_boot_and_data_sources_menu(tmp_path) -> None:
             "zone_ids": [0],
             "indexed": True,
         },
+        {
+            "id": 5,
+            "run_index": 0,
+            "bank": 36,
+            "det_x": 115.0,
+            "det_y": 0.0,
+            "det_el": 0.0,
+            "q_hat": [0.4, -0.3, -0.86],
+            "q_hat_lab": [0.4, -0.3, -0.86],
+            "stereographic": [0.22, -0.16],
+            "hemisphere": 1,
+            "wavelength": 2.95,
+            "d_spacing": 2.45,
+            "harmonic_order": 1,
+            "harmonic_multiplicity": 1,
+            "hkl": [7, -9, 1],
+            "asu_hkl": [7, 9, 1],
+            "asu_orbit_id": "7,9,1",
+            "asu_friedel": False,
+            "asu_bijvoet_parity": 1,
+            "orbit_color_idx": 3,
+            "zone_ids": [0],
+            "indexed": True,
+        },
     ]
+    cross_run_bij_mate = {
+        "id": 6,
+        "run_index": 1,
+        "bank": 36,
+        "det_x": -120.0,
+        "det_y": 0.0,
+        "det_el": 0.0,
+        "q_hat": [-0.4, 0.3, 0.86],
+        "q_hat_lab": [-0.4, 0.3, -0.86],
+        "stereographic": [-0.22, 0.16],
+        "hemisphere": 1,
+        "wavelength": 2.95,
+        "d_spacing": 2.45,
+        "harmonic_order": 1,
+        "harmonic_multiplicity": 1,
+        "hkl": [-7, -9, -1],
+        "asu_hkl": [7, 9, 1],
+        "asu_orbit_id": "7,9,1",
+        "asu_friedel": True,
+        "asu_bijvoet_parity": -1,
+        "orbit_color_idx": 3,
+        "zone_ids": [0],
+        "indexed": True,
+    }
+    bij_sample_peaks = [*bij_peaks, cross_run_bij_mate]
     bij_payload.update(
         {
             "instrument": "CG4D",
@@ -4815,8 +4871,8 @@ def test_full_inline_script_boot_and_data_sources_menu(tmp_path) -> None:
             "d_min": 1.0,
             "peaks": bij_peaks,
             "predicted_peaks": bij_peaks,
-            "sample_peaks": bij_peaks,
-            "predicted_sample_peaks": bij_peaks,
+            "sample_peaks": bij_sample_peaks,
+            "predicted_sample_peaks": bij_sample_peaks,
             "zones": [
                 {
                     "id": 0,
@@ -5003,11 +5059,18 @@ if (rafCb) rafCb();
 const centricHasPink = detLog.strokes.some(s => s.includes("255, 77, 184") || s === "#ff4db8") ||
   detLog.texts.some(t => t.includes("[Bijvoet]"));
 
+// Hover peak #5 (7, -9, +1) -> 6th peak from left; Bijvoet mate exists ONLY in SAMPLE_PEAKS (run 1),
+// exercising getActiveWulffSourceArray() inside updatePeakInspector without ReferenceError!
+const [px5, py5] = inViewArcs[5];
+detCanvasEl.dispatchEvent({ type: "mousemove", clientX: px5, clientY: py5, buttons: 0 });
+const statusCrossRunBijHtml = getEl("inspector-box").innerHTML;
+
 console.log(JSON.stringify({
   csGradientSet: Boolean(slCs && slCs.style["--cs-gradient"] && slCs.style["--cs-gradient"].startsWith("linear-gradient(")),
   ndDisplay,
   localClicked,
   hasBijBadge: statusBijHtml.includes("bijvoet-badge") && statusBijHtml.includes("±Bijvoet ×1 (frame)") && statusBijHtml.includes("I⁺"),
+  hasCrossRunBijBadge: statusCrossRunBijHtml.includes("bijvoet-badge") && statusCrossRunBijHtml.includes("±Bijvoet ×1 (runs)"),
   hasPinkRing,
   hasCyanPgRing,
   hasBijTooltip,
@@ -5027,6 +5090,7 @@ process.exit(0);
     assert out["ndDisplay"] == "flex"
     assert out["localClicked"] == 1
     assert out["hasBijBadge"] is True
+    assert out["hasCrossRunBijBadge"] is True
     assert out["hasPinkRing"] is True
     assert out["hasCyanPgRing"] is True
     assert out["hasBijTooltip"] is True
@@ -5465,8 +5529,10 @@ globalThis.document = {
         + script_before_close
         + f"""
 const slDminEl = getEl("slider-dmin");
-const inpDminNode = getEl("inp-dmin");
-const inpLamMinNode = getEl("inp-lmin");
+const slWlMinEl = getEl("slider-wl-min");
+const slWlMaxEl = getEl("slider-wl-max");
+const wlKnobMinEl = getEl("wl-knob-min");
+const wlKnobMaxEl = getEl("wl-knob-max");
 const detCanvasEl = getEl("canvas-detector");
 detCanvasEl.getContext("2d");
 const detLog = ctxLogs.get("canvas-detector");
@@ -5478,9 +5544,9 @@ const initialPeakSource = state.peakSource;
 const initialIntegCount = INTEGRATED_PEAKS.length;
 const initialPredCount = PREDICTED_PEAKS.length;
 
-// Attempting to enter 0.10 A into #inp-dmin clamps cleanly to protFloor
-inpDminNode.value = "0.10";
-inpDminNode.dispatchEvent({{ type: "change", target: inpDminNode }});
+// Attempting to drag #slider-dmin to 0.10 A clamps cleanly to protFloor
+slDminEl.value = "0.10";
+slDminEl.dispatchEvent({{ type: "change", target: slDminEl }});
 const clampedBelowFloor = state.dMin;
 
 // Reset back to integrated mode + isigi colorscale at d_min = 3.20 A, then drag #slider-dmin down to 2.15 A:
@@ -5555,11 +5621,39 @@ state.detZoom = 6.0;
 const lodZ6 = {{ ...getDetectorLodState(800, 520) }};
 state.detZoom = 1.0;
 
-// 3. Widening wavelength #inp-lam-min from 2.8 -> 2.0 A dynamically adds shorter-lambda spots
-inpLamMinNode.value = "2.00";
-inpLamMinNode.dispatchEvent({{ type: "input", target: inpLamMinNode }});
+// 3. Widening wavelength #slider-wl-min ([ knob) from 2.8 -> 2.0 A dynamically adds shorter-lambda spots,
+//    and keyboard ArrowLeft / ArrowRight on #wl-knob-max (] knob) adjusts state.lamMax cleanly
+slWlMinEl.value = "2.00";
+slWlMinEl.dispatchEvent({{ type: "input", target: slWlMinEl }});
 const pred215WideWlCount = PEAKS.length;
 const minWlObserved = PEAKS.reduce((m, p) => Math.min(m, p.wavelength), Infinity);
+const lamMaxBeforeKey = state.lamMax;
+wlKnobMaxEl.dispatchEvent({{ type: "keydown", key: "ArrowRight", shiftKey: false, preventDefault() {{}} }});
+const lamMaxAfterArrowRight = state.lamMax;
+wlKnobMaxEl.dispatchEvent({{ type: "keydown", key: "ArrowLeft", shiftKey: false, preventDefault() {{}} }});
+if (Math.abs(lamMaxAfterArrowRight - (lamMaxBeforeKey + 0.05)) > 1e-4) {{
+  throw new Error(`Expected ] knob ArrowRight to step lamMax by +0.05, got ${{lamMaxBeforeKey}} -> ${{lamMaxAfterArrowRight}}`);
+}}
+// Ensure [ knob cannot cross ] knob, and pointer-dragging [ + dblclick reset both work cleanly
+slWlMinEl.value = "99.0";
+slWlMinEl.dispatchEvent({{ type: "input", target: slWlMinEl }});
+if (!(state.lamMin <= state.lamMax - 0.049)) {{
+  throw new Error(`Expected [ knob to stop >=0.05 A below ] knob, got [${{state.lamMin}}, ${{state.lamMax}}]`);
+}}
+const wlWrapEl = getEl("wl-interval-slider");
+wlWrapEl.dispatchEvent({{ type: "pointerdown", button: 0, target: wlKnobMinEl, clientX: 60, pointerId: 1, preventDefault() {{}} }});
+wlWrapEl.dispatchEvent({{ type: "pointermove", clientX: 75 }});
+wlWrapEl.dispatchEvent({{ type: "pointerup", pointerId: 1 }});
+const lamMinAfterPointerDrag = state.lamMin;
+if (!(lamMinAfterPointerDrag > 1.0 && lamMinAfterPointerDrag < 2.5)) {{
+  throw new Error(`Unexpected lamMin after pointer drag on [ knob: ${{lamMinAfterPointerDrag}}`);
+}}
+wlWrapEl.dispatchEvent({{ type: "dblclick" }});
+if (Math.abs(state.lamMin - 2.8) > 1e-4 || Math.abs(state.lamMax - 4.5) > 1e-4) {{
+  throw new Error(`Expected dblclick to reset wavelength to [2.8, 4.5], got [${{state.lamMin}}, ${{state.lamMax}}]`);
+}}
+slWlMinEl.value = "2.00";
+slWlMinEl.dispatchEvent({{ type: "input", target: slWlMinEl }});
 
 // 4. Load huge macromolecular flat-panel MANDI payload (135 x 150 x 210 A) via recomputeBoundsAndReload
 const mandiPayload = {json.dumps(mandi_payload)};
@@ -5586,14 +5680,22 @@ inpCNode.value = "238.0";
 inpCNode.dispatchEvent({{ type: "change", target: inpCNode }});
 const p6122Floor = getDynamicDminFloor();
 const p6122Gamma = parseFloat(getEl("inp-gamma").value);
-inpDminNode.value = "1.45";
-inpDminNode.dispatchEvent({{ type: "change", target: inpDminNode }});
+slDminEl.value = "1.45";
+slDminEl.dispatchEvent({{ type: "change", target: slDminEl }});
 const p6122Allowed145 = state.dMin;
 
-// 6. Verify #inp-binning in Params drawer defaults to auto (null) and forwards 16, 8, 4
+// 6. Verify #inp-binning & slider-driven wavelength/d_min in collectWorkflowParams()
+slWlMinEl.value = "2.25";
+slWlMinEl.dispatchEvent({{ type: "input", target: slWlMinEl }});
+slWlMaxEl.value = "4.35";
+slWlMaxEl.dispatchEvent({{ type: "input", target: slWlMaxEl }});
 const inpBinNode = getEl("inp-binning");
 inpBinNode.value = "";
-const paramsAutoBin = collectWorkflowParams().binning;
+const wfCheck = collectWorkflowParams();
+if (Math.abs(wfCheck.wavelength_min - 2.25) > 1e-4 || Math.abs(wfCheck.wavelength_max - 4.35) > 1e-4 || Math.abs(wfCheck.d_min - 1.45) > 1e-4) {{
+  throw new Error(`collectWorkflowParams mismatch: ${{JSON.stringify(wfCheck)}}`);
+}}
+const paramsAutoBin = wfCheck.binning;
 inpBinNode.value = "16";
 const paramsBin16 = collectWorkflowParams().binning;
 inpBinNode.value = "8";
@@ -8421,3 +8523,172 @@ def test_cross_instance_galaxy_history_reuse_integrated_restart_and_hydrate_redu
     assert vm.replay_h5 == str(int_h5)
     assert vm.payload_kwargs["images_h5"] == str(cached_merged)
     assert reloaded_images == [str(cached_merged)]
+
+    # 5) Pre-existing solve.h5 containing transient `/.../subhkl_reduce_<ts>/MANDI_13308.reduce.h5` in `files`
+    #    (without `source_files`) AND Trame `MainApp` (`/api/payload?dataset_id=...`) end-to-end hydration:
+    import asyncio
+    from collections.abc import Callable
+    from types import SimpleNamespace
+
+    from aiohttp import web
+    from aiohttp.test_utils import make_mocked_request
+
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.nova_app.views.main_view import MainApp
+
+    dt_str = h5py.string_dtype(encoding="utf-8")
+    transient_reduce_solve = staging_dir / "subhkl_gx_deadbeef_solve.h5"
+    with h5py.File(transient_reduce_solve, "w") as hf_tr:
+        hf_tr.attrs["instrument"] = "MANDI"
+        hf_tr.create_dataset(
+            "files",
+            data=np.array(
+                ["/data/staging_test/282900/subhkl_reduce_99/MANDI_13308.reduce.h5"],
+                dtype=object,
+            ),
+            dtype=dt_str,
+        )
+        hf_tr.create_dataset("instrument/wavelength", data=np.array([2.0, 4.0]))
+        hf_tr.create_dataset(
+            "sample/cell", data=np.array([55.2, 81.2, 88.7, 90.0, 96.3, 90.0])
+        )
+        hf_tr.create_dataset("sample/space_group", data=b"I 1 2 1")
+        hf_tr.create_dataset("sample/U", data=np.eye(3))
+        hf_tr.create_dataset(
+            "sample/B", data=np.diag([1.0 / 55.2, 1.0 / 81.2, 1.0 / 88.7])
+        )
+        hf_tr.create_dataset("goniometer/R", data=np.eye(3)[None, ...])
+        hf_tr.create_dataset("bank_ids", data=np.array([19], dtype=np.int32))
+        hf_tr.create_dataset("file_offsets", data=np.array([0], dtype=np.int32))
+
+    recipe_reduce_path = runner._extract_reduce_recipe_from_derived_h5(
+        str(transient_reduce_solve), ds_info={"name": "solve.h5"}
+    )
+    assert recipe_reduce_path is not None
+    assert recipe_reduce_path["nexus_files"] == [str(raw_nxs)]
+    assert recipe_reduce_path["instrument"] == "MANDI"
+
+    # Also verify _stamp_merged_metadata with local-stage job_record stamps `source_files` and clean `.nxs.h5` `files`
+    stamped_m = tmp_path / "local_reduced_merged.h5"
+    with h5py.File(stamped_m, "w") as hf_sm:
+        hf_sm.create_dataset("images", data=np.ones((1, 16, 16), dtype=np.float32))
+        hf_sm.create_dataset(
+            "files",
+            data=np.array(
+                ["/data/staging_test/282900/subhkl_reduce_99/MANDI_13308.reduce.h5"],
+                dtype=object,
+            ),
+            dtype=dt_str,
+        )
+    runner._stamp_merged_metadata(
+        str(stamped_m),
+        {
+            "params": {
+                "instrument": "MANDI",
+                "cell": [55.2, 81.2, 88.7, 90.0, 96.3, 90.0],
+                "space_group": "I 1 2 1",
+            },
+            "raw_nxs": [str(raw_nxs)],
+            "instrument": "MANDI",
+        },
+    )
+    with h5py.File(stamped_m, "r") as hf_sm_chk:
+        assert list(hf_sm_chk["source_files"].asstr()[()]) == [str(raw_nxs)]
+        assert list(hf_sm_chk["files"].asstr()[()]) == ["MANDI_13308.nxs.h5"]
+        assert str(hf_sm_chk.attrs["instrument"]) == "MANDI"
+
+    # Remove cached_merged so Trame MainApp experiences a fresh instance cache miss on dataset_id reload
+    if cached_merged.exists():
+        cached_merged.unlink()
+    legacy_m_alias = work_dir / "merged.h5"
+    if legacy_m_alias.exists():
+        legacy_m_alias.unlink()
+
+    monkeypatch.setattr(
+        runner,
+        "resolve_dataset_to_local_h5",
+        lambda ds_id, fallback_dir=None: (
+            str(transient_reduce_solve),
+            {"id": ds_id, "name": "MANDI_13308_solve.h5", "hid": 14, "state": "ok"},
+        ),
+    )
+    monkeypatch.setattr(runner, "_is_local_staging_mode", lambda: True)
+
+    pending_callbacks: list[Callable[[str], None]] = []
+
+    def _deferred_hydrate_stage(
+        stage_id,
+        params,
+        on_complete_h5=None,
+        fallback_reason=None,
+        existing_job_record=None,
+        preserve_downstream=False,
+    ):
+        if callable(on_complete_h5):
+            pending_callbacks.append(on_complete_h5)
+        return {
+            "job_id": "gpu-trame-hydrate-1",
+            "state": "running",
+            "n_runs": len(params.get("nexus_files") or []),
+            "hydrate_only": True,
+            "work_dir": str(work_dir),
+        }
+
+    monkeypatch.setattr(runner, "_submit_local_subhkl_stage", _deferred_hydrate_stage)
+
+    trame_app = object.__new__(MainApp)
+    trame_app.pipeline_runner = runner
+    trame_sub = SubhklGalaxyModel()
+    trame_app.view_model = SimpleNamespace(model=SimpleNamespace(subhkl=trame_sub))
+    aio_trame = web.Application()
+    trame_app._bind_routes(SimpleNamespace(app=aio_trame))
+
+    resp_ds = asyncio.run(
+        aio_trame._handle(
+            make_mocked_request(
+                "GET", "/api/payload?dataset_id=deadbeef&frame=0", app=aio_trame
+            )
+        )
+    )
+    assert resp_ds.status == 200
+    doc_ds = json.loads(resp_ds.body.decode("utf-8"))
+    # Immediately returns solved geometry + hydration_job while staging solve.h5 into work_dir!
+    assert trame_sub.data.peaks_file == str(work_dir / "solve.h5")
+    assert doc_ds["intensity_source"] != "raw_h5"
+    assert doc_ds.get("hydration_job", {}).get("job_id") == "gpu-trame-hydrate-1"
+    assert len(pending_callbacks) == 1
+
+    # Now background Reduce completes and writes MANDI_13308_merged.h5 with bank 19 detector image
+    with h5py.File(cached_merged, "w") as hf_hyd:
+        hf_hyd.attrs["instrument"] = "MANDI"
+        hf_hyd.create_dataset(
+            "images",
+            data=np.arange(64 * 64, dtype=np.float32).reshape(1, 64, 64) + 5.0,
+        )
+        hf_hyd.create_dataset("bank_ids", data=np.array([19], dtype=np.int32))
+        hf_hyd.create_dataset("file_offsets", data=np.array([0], dtype=np.int32))
+        hf_hyd.create_dataset(
+            "files",
+            data=np.array(["MANDI_13308.nxs.h5"], dtype=object),
+            dtype=dt_str,
+        )
+        hf_hyd.create_dataset("goniometer/R", data=np.eye(3)[None, ...])
+        hf_hyd.create_dataset("instrument/wavelength", data=np.array([2.0, 4.0]))
+
+    pending_callbacks[0](str(cached_merged))
+    assert trame_sub.data.peaks_file == str(work_dir / "solve.h5")
+    assert trame_sub.data.images_file == str(cached_merged)
+
+    resp_after_hyd = asyncio.run(
+        aio_trame._handle(
+            make_mocked_request(
+                "GET", "/api/payload?frame=0&preserve_params=1", app=aio_trame
+            )
+        )
+    )
+    assert resp_after_hyd.status == 200
+    doc_after_hyd = json.loads(resp_after_hyd.body.decode("utf-8"))
+    assert doc_after_hyd["intensity_source"] == "raw_h5"
+    assert "hydration_job" not in doc_after_hyd
+    b19_after = next(pn for pn in doc_after_hyd["panels"] if int(pn["bank"]) == 19)
+    assert b19_after.get("texture_b64")

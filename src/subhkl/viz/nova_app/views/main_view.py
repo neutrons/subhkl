@@ -41,14 +41,47 @@ class MainApp:
         images_h5: str | Path | None = None,
         instrument: str = "CG4D",
     ) -> None:
+        import threading
+
         self.server = server or get_server(None, client_type="vue3")
         self.state = self.server.state
         self._peaks_h5 = peaks_h5
         self._images_h5 = images_h5
         self._instrument = instrument
+        self._payload_lock = threading.RLock()
         self.pipeline_runner = NovaGalaxyPipelineRunner()
 
         self.create_vm()
+        sub_init = self.view_model.model.subhkl
+        if (
+            sub_init.data.peaks_file
+            and os.path.isfile(sub_init.data.peaks_file)
+            and (sub_init.payload or {}).get("intensity_source") != "raw_h5"
+        ):
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, KeyError
+            ):
+                from subhkl.viz.rainbow_zones import _discover_images_h5
+
+                _, staged_init = self.pipeline_runner.stage_derived_h5_in_work_dir(
+                    sub_init.data.peaks_file,
+                    name_hint=os.path.basename(sub_init.data.peaks_file),
+                )
+                sub_init.data.peaks_file = staged_init
+                disc_init = self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                    staged_init
+                ) or _discover_images_h5(staged_init)
+                if disc_init:
+                    sub_init.data.images_file = str(disc_init)
+                    sub_init.refresh_payload(preserve_params=True)
+                if (sub_init.payload or {}).get("intensity_source") != "raw_h5":
+                    hyd_init = self.pipeline_runner._maybe_trigger_hydrate_reduce(
+                        sub_init,
+                        self._payload_lock,
+                        staged_init,
+                    )
+                    if hyd_init and isinstance(sub_init.payload, dict):
+                        sub_init.payload["hydration_job"] = hyd_init
         self.view_model.config_bind.connect("config")
         self.view_model.view_state_bind.connect("view_state")
         self.view_model.parallax_html_bind.connect("parallax_html")
@@ -63,9 +96,36 @@ class MainApp:
             return
 
         import asyncio
-        import threading
 
-        payload_lock = threading.RLock()
+        payload_lock = getattr(self, "_payload_lock", None)
+        if payload_lock is None:
+            import threading
+
+            payload_lock = threading.RLock()
+            self._payload_lock = payload_lock
+
+        def _stage_derived_safely(h5_p: str, *, name_hint: str = "") -> tuple[str, str]:
+            default_d = os.path.dirname(os.path.abspath(h5_p))
+            with contextlib.suppress(
+                OSError, RuntimeError, ValueError, TypeError, AttributeError
+            ):
+                res = self.pipeline_runner.stage_derived_h5_in_work_dir(
+                    h5_p, name_hint=name_hint
+                )
+                if (
+                    isinstance(res, tuple)
+                    and len(res) == 2
+                    and isinstance(res[0], str)
+                    and isinstance(res[1], str)
+                    and os.path.isfile(res[1])
+                ):
+                    return res
+            return default_d, h5_p
+
+        def _valid_h5_str(cand: Any) -> str | None:
+            if isinstance(cand, (str, Path)) and os.path.isfile(str(cand)):
+                return str(cand)
+            return None
 
         def _build_status_doc(
             frame_q: str | None,
@@ -308,18 +368,23 @@ class MainApp:
                             else:
                                 from subhkl.viz.rainbow_zones import _discover_images_h5
 
-                                self.view_model.model.subhkl.data.peaks_file = local_h5
-                                disc_img = (
-                                    _discover_images_h5(local_h5)
-                                    or self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
-                                        local_h5
+                                work_d_fp, staged_fp = _stage_derived_safely(
+                                    local_h5, name_hint=ds_name
+                                )
+                                local_h5 = staged_fp
+                                self.view_model.model.subhkl.data.peaks_file = staged_fp
+                                disc_img = _valid_h5_str(
+                                    _discover_images_h5(staged_fp)
+                                ) or _valid_h5_str(
+                                    self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                        staged_fp
                                     )
                                 )
                                 self.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
-                                    local_h5
+                                    staged_fp
                                 )
                                 self.view_model.model.subhkl.data.images_file = (
-                                    str(disc_img) if disc_img else ""
+                                    disc_img or ""
                                 )
                             self.view_model.model.subhkl.refresh_payload(
                                 frame_index=f_idx,
@@ -332,8 +397,36 @@ class MainApp:
                                 (self.view_model.model.subhkl.payload or {}).get(
                                     "artifact_kind"
                                 ),
-                                os.path.dirname(os.path.abspath(local_h5)),
+                                (
+                                    os.path.dirname(os.path.abspath(local_h5))
+                                    if is_reduce_file
+                                    else work_d_fp
+                                ),
                             )
+                            if (
+                                not is_reduce_file
+                                and (self.view_model.model.subhkl.payload or {}).get(
+                                    "intensity_source"
+                                )
+                                != "raw_h5"
+                            ):
+                                hyd_fp = (
+                                    self.pipeline_runner._maybe_trigger_hydrate_reduce(
+                                        self.view_model.model.subhkl,
+                                        payload_lock,
+                                        local_h5,
+                                    )
+                                )
+                                if (
+                                    isinstance(hyd_fp, dict)
+                                    and hyd_fp.get("job_id")
+                                    and isinstance(
+                                        self.view_model.model.subhkl.payload, dict
+                                    )
+                                ):
+                                    self.view_model.model.subhkl.payload[
+                                        "hydration_job"
+                                    ] = hyd_fp
                             refreshed = True
                     except (
                         OSError,
@@ -403,13 +496,14 @@ class MainApp:
                         ds_name = str(
                             ds_info.get("name") or os.path.basename(local_h5)
                         ).lower()
-                        if (
+                        is_reduce_ds = (
                             any(k in ds_name for k in ("merged", "scan", "image"))
                             and "careless" not in ds_name
-                        ):
+                        )
+                        if is_reduce_ds:
                             self.view_model.model.subhkl.mtz_overlay_path = None
                             self.view_model.model.subhkl.mtz_overlay_info = None
-                            _, local_h5 = (
+                            work_d_ds, local_h5 = (
                                 self.pipeline_runner._resolve_work_dir_and_merged(
                                     local_h5
                                 )
@@ -417,13 +511,16 @@ class MainApp:
                             self.view_model.model.subhkl.data.images_file = local_h5
                             self.view_model.model.subhkl.data.peaks_file = local_h5
                         else:
-                            self.view_model.model.subhkl.data.peaks_file = local_h5
-                            disc_img = (
-                                self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
-                                    local_h5
-                                )
-                                or _discover_images_h5(local_h5)
+                            work_d_ds, staged_ds_h5 = _stage_derived_safely(
+                                local_h5, name_hint=ds_name
                             )
+                            local_h5 = staged_ds_h5
+                            self.view_model.model.subhkl.data.peaks_file = staged_ds_h5
+                            disc_img = _valid_h5_str(
+                                self.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                    staged_ds_h5
+                                )
+                            ) or _valid_h5_str(_discover_images_h5(staged_ds_h5))
                             ds_hid_raw = (ds_info or {}).get("hid")
                             ds_hid = (
                                 int(ds_hid_raw)
@@ -432,18 +529,41 @@ class MainApp:
                                 else None
                             )
                             self.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
-                                local_h5, target_hid=ds_hid
+                                staged_ds_h5, target_hid=ds_hid
                             )
                             self.view_model.model.subhkl.data.images_file = (
-                                str(disc_img) if disc_img else ""
+                                disc_img or ""
                             )
                         self.view_model.model.subhkl.refresh_payload(frame_index=f_idx)
                         self.pipeline_runner.invalidate_subsequent_stages(
                             (self.view_model.model.subhkl.payload or {}).get(
                                 "artifact_kind"
                             ),
-                            os.path.dirname(os.path.abspath(local_h5)),
+                            work_d_ds,
                         )
+                        if (
+                            not is_reduce_ds
+                            and (self.view_model.model.subhkl.payload or {}).get(
+                                "intensity_source"
+                            )
+                            != "raw_h5"
+                        ):
+                            hyd_ds = self.pipeline_runner._maybe_trigger_hydrate_reduce(
+                                self.view_model.model.subhkl,
+                                payload_lock,
+                                local_h5,
+                                ds_info=ds_info,
+                            )
+                            if (
+                                isinstance(hyd_ds, dict)
+                                and hyd_ds.get("job_id")
+                                and isinstance(
+                                    self.view_model.model.subhkl.payload, dict
+                                )
+                            ):
+                                self.view_model.model.subhkl.payload[
+                                    "hydration_job"
+                                ] = hyd_ds
                         refreshed = True
                     except (
                         OSError,
@@ -455,6 +575,8 @@ class MainApp:
                         return ({"status": "error", "error": str(exc)}, 400)
 
                 if not refreshed:
+                    from subhkl.viz.rainbow_zones import _discover_images_h5
+
                     cur_payload = self.view_model.model.subhkl.payload
                     cur_f = (
                         cur_payload.get("frame_index")
@@ -471,8 +593,19 @@ class MainApp:
                         if isinstance(cur_payload, dict)
                         else None
                     )
+                    newly_hydrated = (
+                        isinstance(cur_payload, dict)
+                        and cur_payload.get("intensity_source") != "raw_h5"
+                        and bool(
+                            self.view_model.model.subhkl.data.peaks_file
+                            and _discover_images_h5(
+                                self.view_model.model.subhkl.data.peaks_file
+                            )
+                        )
+                    )
                     needs_refresh = (
                         not isinstance(cur_payload, dict)
+                        or newly_hydrated
                         or (f_idx is not None and cur_f != f_idx)
                         or (rbin_val is not None and cur_rb != rbin_val)
                         or (
@@ -484,7 +617,8 @@ class MainApp:
                         )
                     )
                     if needs_refresh and (
-                        f_idx is not None
+                        newly_hydrated
+                        or f_idx is not None
                         or d_min_val is not None
                         or rbin_val is not None
                     ):

@@ -228,6 +228,15 @@ class SubhklGalaxyModel:
                     self.data.images_file
                 ) == os.path.abspath(self.data.peaks_file):
                     img_path = self.data.images_file
+                else:
+                    try:
+                        import h5py
+
+                        with h5py.File(self.data.images_file, "r") as hf_img:
+                            if "images" in hf_img:
+                                img_path = self.data.images_file
+                    except OSError:
+                        pass
         self.payload = build_rainbow_zone_payload(
             replay_h5=(self.data.peaks_file if has_peaks else None),
             instrument=self.data.instrument.value,
