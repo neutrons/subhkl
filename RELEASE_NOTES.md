@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.6.1]
 
+### Added
+
+- Monochromatic (`careless mono`) vs. polychromatic (`careless poly`) merge
+  routing for time-of-flight gated data:
+  - Added an explicit `merge_mode` (`mono` / `poly`) selector to the NDIP
+    Galaxy `imaginex_subhkl_merge` tool wrapper, omitting `--wavelength-key` in
+    `mono` mode while keeping `WAVEL` in the neural-scaler metadata so
+    time-resolved Laue harmonics are scaled and merged independently.
+  - Automatically selects `careless mono` in `subhkl-nova-app` whenever
+    time-of-flight data is present (`peaks/tof`, `tof_gate`, or `events/tof`),
+    falling back to `careless poly` for steady-state quasi-Laue datasets.
+- Live `Δθ` spot-centroid angular residual diagnostic and top-bar tooltips in
+  Rainbow Zones:
+  - Measures local detector-spot centroids directly on `merged.h5` for
+    predicted/solved reflections and streams `blind_band` / `scan_band`
+    micro-step rungs so `Δθ` updates live during `Solve` and reports physical
+    angular RMS residuals immediately after finder-less `Solve` (preserved
+    across dynamic client-side re-predictions).
+  - Added descriptive static and live dynamic tooltips across all top-bar HUD
+    pills (`PEAKS`, `Δθ`, `ZONES`, `GONIO`, `FRAME`), selectors, and buttons
+    via a `1.5 s`-delay hover overlay (`#ui-hover-tooltip`).
+- Automatic `TMPDIR` cleanup in `subhkl-nova-app` and `serve_rainbow_zones`:
+  removes per-job staging files immediately upon stage completion and removes
+  tracked `subhkl_work_*`, `subhkl_gx_*`, `subhkl_upload_*`,
+  `subhkl_merge_tables`, and `subhkl_nova_*` artifacts on normal exit,
+  `KeyboardInterrupt`, or `SIGTERM`.
+
+### Changed
+
+- Calibrated the post-merge `ΔI/σ` signed-residual colormap and colorbar to
+  span the observed `[min, max]` range with its neutral white midpoint anchored
+  at the dataset mean.
+- Removed redundant UI controls: the duplicate merging-table button on the
+  Wulff bar, the `ALL` Laue-zone button (superseded by `≤1` / `≤2` / `≤3`), and
+  the `Walk` solve-step button.
+- Reverted container `/dev/shm` and `podman --tmpfs /tmp` scratch overrides so
+  large multi-run datasets use standard `TMPDIR` storage paired with exit
+  cleanup.
+
 ### Fixed
 
 - Time-of-flight gated integration took the wavelength band from the images
@@ -15,6 +54,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unobserved. The band now comes from the predictions (`instrument/wavelength`
   of the predictor file) and is always widened to hold every predicted
   wavelength; the integrator prints the band it uses.
+- Left Careless's built-in Wilson prior intact by defaulting `wilson_prior_b`
+  to `None` instead of forcing `--wilson-prior-b=40.0`, which underflowed
+  `float32` (`loss=nan`) at high resolution ($d \approx 1\,\text{\AA}$).
+- Prevented long top-bar `.subtitle-tag` labels from overlapping the `PEAKS`
+  HUD pill via flex overflow clipping and bounding-box overlap scaling.
+- Separated staging filenames in `blind_band` (`.blind.rung.tmp.h5` vs.
+  `.blind.final.tmp.h5`) so live rung updates cannot collide with the final
+  `solve.blind.h5` atomic rename.
 
 ## [1.6.0]
 
