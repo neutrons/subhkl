@@ -4,6 +4,30 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.4]
+
+### Added
+
+- **Cross-instance NDIP Galaxy History reuse, `integrated.h5` persistence, and on-the-fly `Reduce` frame hydration**:
+  - Unifies Galaxy History discovery across the shared `"IMAGINE-X SubHKL"`
+    datastore history and the interactive tool's launch `HISTORY_ID` (with
+    automatic cache invalidation on upload/touch and descriptive
+    `<tag>_solve.h5` / `<tag>_integrated.h5` dataset names) so analysis
+    artifacts from previous app instances are immediately visible in local
+    execution mode.
+  - Persists compact `integrated.h5` and `predictor.h5` artifacts to NDIP
+    Galaxy History during Stage 3 (`Integrate`) and re-uploads Careless-stamped
+    `integrated.h5` after Stage 4 (`Merge`), automatically reconstructing
+    `reflections.mtz` from `integrated.h5` when restarting Stage 4 in a fresh
+    instance.
+  - Embeds raw NeXus provenance (`source_files`, `files`, `file_offsets`,
+    wavelength, and cell metadata) in `solve.h5` and `integrated.h5` (with
+    `/SNS` and `/HFIR` run-range fallback for pre-existing NDIP datasets) and
+    automatically triggers a non-destructive background `Reduce` hydration job
+    whenever derived data is loaded without a hit in the instance's local
+    staging cache, hot-reloading detector images and TOF histograms on
+    completion.
+
 ## [1.6.3]
 
 ### Changed

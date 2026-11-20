@@ -426,67 +426,92 @@ def _load_detectors_from_h5(
     return detectors
 
 
+def _candidate_staging_roots() -> list[Path]:
+    """Return deduplicated local staging/temp directories where ``subhkl_work_<tag>`` caches live."""
+    roots: list[Path] = []
+    seen: set[str] = set()
+    env_dir = (os.environ.get("SUBHKL_STAGING_DIR") or "").strip()
+    cands = [env_dir] if env_dir else []
+    cands.extend(["/scratch-local/tmp-subhkl", tempfile.gettempdir()])
+    for raw in cands:
+        if not raw:
+            continue
+        p = Path(raw)
+        if not p.is_dir():
+            continue
+        key = str(p.resolve())
+        if key not in seen:
+            seen.add(key)
+            roots.append(p)
+    return roots
+
+
 def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
     """Auto-discover an accompanying ``*.im.h5`` or ``merged.h5`` (or ``attrs['source']``)."""
+    import re as _re
+
     if replay_h5 is None:
         return None
     p = Path(replay_h5).resolve()
     if not p.exists():
         return None
+    staging_roots = _candidate_staging_roots()
+
+    def _probe_tag_in_staging(tag_val: str) -> str | None:
+        if not tag_val:
+            return None
+        safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag_val)
+        if not safe_tag or safe_tag.lower() in (
+            "solve",
+            "integrated",
+            "integrator",
+            "predictor",
+            "dataset",
+        ):
+            return None
+        for root_p in staging_roots:
+            for m_fn in (f"{safe_tag}_merged.h5", "merged.h5"):
+                work_cand = root_p / f"subhkl_work_{safe_tag}" / m_fn
+                if work_cand.is_file():
+                    with (
+                        contextlib.suppress(OSError, RuntimeError, KeyError),
+                        h5py.File(work_cand, "r") as wf,
+                    ):
+                        if "images" in wf:
+                            return str(work_cand.resolve())
+            for gx_cand in sorted(
+                glob.glob(str(root_p / f"subhkl_gx_*_{safe_tag}_merged.h5"))
+            ):
+                if os.path.isfile(gx_cand):
+                    with (
+                        contextlib.suppress(OSError, RuntimeError, KeyError),
+                        h5py.File(gx_cand, "r") as gf,
+                    ):
+                        if "images" in gf:
+                            return str(Path(gx_cand).resolve())
+        return None
+
     with (
         contextlib.suppress(OSError, RuntimeError, ValueError, TypeError, KeyError),
         h5py.File(p, "r") as f,
     ):
         if "images" in f:
             return str(p)
-        if "files" in f:
+        for ds_key in ("source_files", "files"):
+            if ds_key not in f:
+                continue
             with contextlib.suppress(
                 OSError, RuntimeError, ValueError, TypeError, KeyError
             ):
-                raw_files = [_decode_str(x, "") for x in list(f["files"][()])]
+                raw_files = [_decode_str(x, "") for x in list(f[ds_key][()])]
                 raw_files = [x for x in raw_files if x]
                 if raw_files:
                     first_stem = os.path.basename(raw_files[0]).split(".")[0]
                     last_stem = os.path.basename(raw_files[-1]).split(".")[0]
-                    for tag in (
-                        f"{first_stem}_{last_stem}",
-                        first_stem,
-                    ):
-                        safe_tag = "".join(
-                            c if (c.isalnum() or c in "._-") else "_" for c in tag
-                        )
-                        for m_fn in (f"{safe_tag}_merged.h5", "merged.h5"):
-                            work_cand = (
-                                Path(tempfile.gettempdir())
-                                / f"subhkl_work_{safe_tag}"
-                                / m_fn
-                            )
-                            if work_cand.is_file():
-                                with (
-                                    contextlib.suppress(
-                                        OSError, RuntimeError, KeyError
-                                    ),
-                                    h5py.File(work_cand, "r") as wf,
-                                ):
-                                    if "images" in wf:
-                                        return str(work_cand.resolve())
-                        for gx_cand in sorted(
-                            glob.glob(
-                                os.path.join(
-                                    tempfile.gettempdir(),
-                                    f"subhkl_gx_*_{safe_tag}_merged.h5",
-                                )
-                            )
-                        ):
-                            if os.path.isfile(gx_cand):
-                                with (
-                                    contextlib.suppress(
-                                        OSError, RuntimeError, KeyError
-                                    ),
-                                    h5py.File(gx_cand, "r") as gf,
-                                ):
-                                    if "images" in gf:
-                                        return str(Path(gx_cand).resolve())
+                    for tag in (f"{first_stem}_{last_stem}", first_stem):
+                        hit = _probe_tag_in_staging(tag)
+                        if hit:
+                            return hit
         src_attr = _decode_str(f.attrs.get("source"), "")
         if not src_attr and "scan_refinement" in f:
             src_attr = _decode_str(f["scan_refinement"].attrs.get("source"), "")
@@ -508,9 +533,34 @@ def _discover_images_h5(replay_h5: str | os.PathLike | None) -> str | None:
                     ):
                         if "images" in sf:
                             return str(cand_src.resolve())
+            m_wd = _re.search(r"subhkl_work_([A-Za-z0-9._-]+)", str(src_attr))
+            if m_wd:
+                hit = _probe_tag_in_staging(m_wd.group(1))
+                if hit:
+                    return hit
+            src_bn = _re.sub(
+                r"(_merged|_solve|_integrated|_predictor)?\.(h5|hdf5|dat)$",
+                "",
+                src_p.name,
+                flags=_re.IGNORECASE,
+            )
+            hit = _probe_tag_in_staging(src_bn)
+            if hit:
+                return hit
+
+    clean_name = _re.sub(r"^subhkl_gx_[0-9a-fA-F]+_", "", p.name)
+    name_tag = _re.sub(
+        r"(_merged|_solve|_integrated|_integrator|_predictor)?\.(h5|hdf5|dat)$",
+        "",
+        clean_name,
+        flags=_re.IGNORECASE,
+    )
+    hit_from_name = _probe_tag_in_staging(name_tag)
+    if hit_from_name:
+        return hit_from_name
 
     parent = p.parent
-    if parent.resolve() == Path(tempfile.gettempdir()).resolve():
+    if parent.resolve() in {r.resolve() for r in staging_roots}:
         return None
     candidates = sorted(glob.glob(str(parent / "*.im.h5"))) + sorted(
         glob.glob(str(parent / "*merged*.h5"))
@@ -16406,8 +16456,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (LADDER.length > 0) selectLadderRung(state.currentRungIdx, false);
     else {{ renderZoneList(); updateHUD(); }}
     renderFilesDrawer();
-    probeGalaxyConnection();
+    if (newPayload.hydration_job && newPayload.hydration_job.job_id) {{
+      startHydrationJobPoll(newPayload.hydration_job);
+    }} else {{
+      probeGalaxyConnection();
+    }}
     if (isFrameSwitch) {{
+      return;
+    }}
+    if (newPayload.hydration_job && newPayload.hydration_job.job_id) {{
+      const nHydRuns = Number(newPayload.hydration_job.n_runs || 1);
+      setStatusLine(
+        `[HYDRATING FRAMES]`,
+        `Loaded derived dataset — regenerating detector image frames on the fly via <strong>1. Reduce</strong> (${{nHydRuns}} run${{nHydRuns === 1 ? "" : "s"}}) while keeping current stage active…`
+      );
       return;
     }}
     if (newPayload.mtz_overlay_name && newPayload.mtz_fresh_overlay !== false) {{
@@ -20058,6 +20120,112 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
   }}
 
+  function startHydrationJobPoll(hJob) {{
+    if (!hJob || !hJob.job_id) return;
+    if (galaxyBridge.hydratingJobId === hJob.job_id && galaxyBridge.hydratingPromise) {{
+      return galaxyBridge.hydratingPromise;
+    }}
+    if (galaxyBridge.pollTimer) {{
+      clearInterval(galaxyBridge.pollTimer);
+      galaxyBridge.pollTimer = null;
+    }}
+    const hydJobId = String(hJob.job_id);
+    galaxyBridge.hydratingJobId = hydJobId;
+    state.runningStageIdx = 0;
+    startStepStopwatch(
+      "reduce",
+      typeof hJob.elapsed_ms === "number" && hJob.elapsed_ms > 0 ? hJob.elapsed_ms : 0
+    );
+    renderPipeline();
+    if (hJob.stdout || hJob.stderr) {{
+      appendTerminalLog(
+        (hJob.stdout || "") + (hJob.stderr ? `\\n[stderr]\\n${{hJob.stderr}}` : ""),
+        true
+      );
+    }}
+    galaxyBridge.hydratingPromise = new Promise((resolveHyd) => {{
+      let pollBusy = false;
+      galaxyBridge.pollTimer = setInterval(async () => {{
+        if (galaxyBridge.hydratingJobId !== hydJobId) {{
+          clearInterval(galaxyBridge.pollTimer);
+          galaxyBridge.pollTimer = null;
+          resolveHyd(false);
+          return;
+        }}
+        if (pollBusy) return;
+        pollBusy = true;
+        try {{
+          const curFrame = typeof state.selectedFrameIndex === "number"
+            ? state.selectedFrameIndex
+            : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+          const sr = await fetch(`api/pipeline/status?frame=${{curFrame}}&poll=1`, {{ cache: "no-store" }});
+          if (!sr.ok) return;
+          const sdoc = await sr.json();
+          if (sdoc.history_datasets) {{
+            galaxyBridge.datasets = sdoc.history_datasets;
+            populateGalaxyH5Selector();
+          }}
+          if (sdoc.step_artifacts) {{
+            galaxyBridge.stepArtifacts = sdoc.step_artifacts;
+            renderFilesDrawer();
+          }}
+          const aj = sdoc.active_job;
+          if (!aj || (aj.job_id && String(aj.job_id) !== hydJobId)) {{
+            clearInterval(galaxyBridge.pollTimer);
+            galaxyBridge.pollTimer = null;
+            galaxyBridge.hydratingJobId = null;
+            galaxyBridge.hydratingPromise = null;
+            if (state.runningStageIdx === 0) {{
+              state.runningStageIdx = -1;
+              renderPipeline();
+            }}
+            resolveHyd(true);
+            return;
+          }}
+          const outText = (aj.stdout || "") + (aj.stderr ? `\\n[stderr]\\n${{aj.stderr}}` : "");
+          if (outText) appendTerminalLog(outText, true);
+          const isCancelled = aj.state === "deleted" || Boolean(aj.cancel_requested);
+          const finishedOk = aj.state === "ok";
+          const finishedErr = isCancelled || aj.state === "error" || aj.state === "paused" || (!finishedOk && !!aj.error);
+          if (finishedOk || finishedErr) {{
+            clearInterval(galaxyBridge.pollTimer);
+            galaxyBridge.pollTimer = null;
+            galaxyBridge.hydratingJobId = null;
+            galaxyBridge.hydratingPromise = null;
+            if (state.runningStageIdx === 0) {{
+              state.runningStageIdx = -1;
+            }}
+            finishStepStopwatch(
+              "reduce",
+              finishedOk ? "done" : (isCancelled ? "stopped" : "error"),
+              typeof aj.elapsed_ms === "number" ? aj.elapsed_ms : null
+            );
+            renderPipeline();
+            if (finishedOk) {{
+              try {{
+                const pr = await fetch(
+                  `api/payload?frame=${{curFrame}}&preserve_params=1${{getRenderBinningQuery()}}`,
+                  {{ cache: "no-store" }}
+                );
+                if (pr.ok) {{
+                  const hydratedPayload = await pr.json();
+                  if (hydratedPayload && (Array.isArray(hydratedPayload.panels) || Array.isArray(hydratedPayload.peaks))) {{
+                    recomputeBoundsAndReload(hydratedPayload, {{ preserveParams: true }});
+                  }}
+                }}
+              }} catch (_he) {{}}
+            }}
+            resolveHyd(finishedOk);
+          }}
+        }} catch (_pe) {{
+        }} finally {{
+          pollBusy = false;
+        }}
+      }}, 1200);
+    }});
+    return galaxyBridge.hydratingPromise;
+  }}
+
   async function probeGalaxyConnection() {{
     // 1. Check NOVA server endpoint (api/pipeline/status)
     try {{
@@ -20072,6 +20240,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           galaxyBridge.stepArtifacts = doc.step_artifacts || {{}};
           hydrateStepTimingsFromServer(doc);
           if (
+            doc.active_job &&
+            doc.active_job.hydrate_only &&
+            (doc.active_job.state === "running" || doc.active_job.state === "queued")
+          ) {{
+            startHydrationJobPoll(doc.active_job);
+          }} else if (
             state.runningStageIdx < 0 &&
             doc.active_job &&
             (doc.active_job.state === "running" || doc.active_job.state === "queued")
@@ -20151,6 +20325,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const st = PIPELINE[idx] || PIPELINE[state.currentPipelineIdx] || {{ stage_id: "solve", name: "STAGE" }};
     const stageId = st.stage_id || "solve";
     state.workflowRunSeq = (state.workflowRunSeq || 0) + 1;
+    galaxyBridge.hydratingJobId = null;
+    galaxyBridge.hydratingPromise = null;
     if (galaxyBridge.pollTimer) {{
       clearInterval(galaxyBridge.pollTimer);
       galaxyBridge.pollTimer = null;
@@ -20213,6 +20389,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (stageId === "reduce" && !extraParams) {{
       openNeutronDataModal(null);
       return;
+    }}
+    if (galaxyBridge.hydratingPromise && stageIdx > 0) {{
+      setStatusLine(
+        `[WAITING FOR HYDRATE]`,
+        `Waiting for background <strong>1. Reduce</strong> frame hydration to finish before launching <strong>${{st.name}}</strong>…`
+      );
+      const hydOk = await galaxyBridge.hydratingPromise;
+      if (!hydOk && (stageId === "solve" || stageId === "integrate")) {{
+        return;
+      }}
     }}
     if (state.runningStageIdx >= 0 && state.runningStageIdx !== stageIdx) {{
       await cancelWorkflowStage(state.runningStageIdx);
