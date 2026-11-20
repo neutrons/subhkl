@@ -7986,12 +7986,19 @@ class NovaGalaxyPipelineRunner:
                                                 "IMAGINE-X SubHKL"
                                             )
                                             bg_rec_t: dict[str, Any] = {"stdout": ""}
+                                            known_ids = getattr(
+                                                self, "_dataset_id_by_path", {}
+                                            )
                                             for fn_t, ext_t in (
                                                 ("merge_table.csv", "csv"),
                                                 ("merge_table.html", "html"),
                                             ):
                                                 fp_t = os.path.join(_wdir, fn_t)
-                                                if os.path.isfile(fp_t):
+                                                if (
+                                                    os.path.isfile(fp_t)
+                                                    and os.path.abspath(fp_t)
+                                                    not in known_ids
+                                                ):
                                                     _chmod_world_rw(fp_t, is_dir=False)
                                                     self._upload_compact_ndip_artifact(
                                                         store_t,
