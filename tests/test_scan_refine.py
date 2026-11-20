@@ -672,3 +672,146 @@ def test_default_band_binning_preserves_at_least_32x32_bins_regardless_of_frame_
     )
     assert res.exit_code == 0, res.output
     assert seen_binning == [8]
+
+
+def test_long_axis_auto_binning_ewald_stratification_and_gimbal_lock(
+    tmp_path, monkeypatch
+):
+    from scipy.spatial.transform import Rotation as Rot
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import generate_reflections
+    from subhkl.instrument.detector import Detector
+    from subhkl.scan_refine import _decompose_R_to_angles, default_band_binning
+    from subhkl.search.scan_band import (
+        _ewald_d_min,
+        _make_ewald_polisher,
+        _zone_funnel_seed_per_run,
+        build_B_jax,
+    )
+
+    # 1. Long-axis P 61 2 2 cell (a=b=80, c=238, d_min=1.41) selects binning=4 on 256x256 panels
+    cell_hex = [80.0, 80.0, 238.0, 90.0, 90.0, 120.0]
+    assert default_band_binning(256, 256, cell=cell_hex, d_min=1.41) == 4
+    assert default_band_binning(512, 512, cell=cell_hex, d_min=1.41) == 4
+
+    frames = tmp_path / "mandi_p6122.h5"
+    bootstrap = tmp_path / "seed_p6122.h5"
+    with h5py.File(frames, "w") as f:
+        f.attrs["instrument"] = "MANDI"
+        f.create_dataset("images", shape=(2, 256, 256), dtype=np.float32)
+        f["bank_ids"] = np.array([19, 19], dtype=np.int32)
+        f["file_offsets"] = np.array([0, 1], dtype=np.int64)
+        f["goniometer/axes"] = np.array([[0.0, 1.0, 0.0, 1.0]])
+        f["goniometer/angles"] = np.array([[0.0], [15.0]], dtype=np.float64)
+        for k, v in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell_hex):
+            f[f"sample/{k}"] = v
+        f["sample/space_group"] = "P 61 2 2"
+        f["instrument/wavelength"] = [2.0, 4.5]
+    with h5py.File(bootstrap, "w") as f:
+        f["sample/U"] = np.eye(3)
+
+    seen_binning = []
+    monkeypatch.setattr(
+        "subhkl.search.scan_band.refine_scan",
+        lambda args: seen_binning.append(int(args.binning)) or {"status": "converged"},
+    )
+    run_scan_refinement(
+        frames, tmp_path / "out_p6122.h5", bootstrap=bootstrap, instrument="MANDI"
+    )
+    assert seen_binning == [4]
+
+    # 2. _ewald_d_min accounts for hexagonal metric determinant and Bravais centering
+    d_p = _ewald_d_min(cell_hex, 1.41, space_group="P 61 2 2", max_refl=450000)
+    d_ortho = _ewald_d_min(
+        [80.0, 80.0, 238.0, 90.0, 90.0, 90.0],
+        1.41,
+        space_group="P 2 2 2",
+        max_refl=450000,
+    )
+    assert 1.41 <= d_p < d_ortho
+    d_f = _ewald_d_min(
+        [120.0, 120.0, 240.0, 90.0, 90.0, 90.0],
+        1.2,
+        space_group="F d d 2",
+        max_refl=200000,
+    )
+    d_prim = _ewald_d_min(
+        [120.0, 120.0, 240.0, 90.0, 90.0, 90.0],
+        1.2,
+        space_group="P 2 2 2",
+        max_refl=200000,
+    )
+    assert d_f < d_prim
+
+    # 3. _make_ewald_polisher retains high-|G| shells for backscattering banks
+    B_hex = np.asarray(build_B_jax(*cell_hex[:3], *np.deg2rad(cell_hex[3:])), float)
+    hkl = np.stack(
+        generate_reflections(*cell_hex, space_group="P 61 2 2", d_min=2.0), axis=1
+    ).astype(np.float64)
+    bank_ids = [19, 32]
+    dets = {b: Detector(dict(beamlines["MANDI"][str(b)])) for b in bank_ids}
+    exc_maps = {(0, b): np.zeros((128, 128), dtype=np.float32) for b in bank_ids}
+    eval_runs, _, _ = _make_ewald_polisher(
+        hkl @ B_hex.T,
+        [0],
+        {0: np.eye(3)},
+        bank_ids,
+        np.array([dets[b].center for b in bank_ids]),
+        np.array([dets[b].uhat for b in bank_ids]),
+        np.array([dets[b].vhat for b in bank_ids]),
+        np.array([dets[b].width for b in bank_ids]),
+        np.array([dets[b].height for b in bank_ids]),
+        np.array([float(dets[b].m - 1) for b in bank_ids]),
+        np.array([float(dets[b].n - 1) for b in bank_ids]),
+        exc_maps,
+        (2.0, 4.5),
+        b2=2,
+        max_reflections=15000,
+    )
+    kept_q = np.linalg.norm((hkl[eval_runs.keep_idx] @ B_hex.T), axis=1)
+    assert len(eval_runs.keep_idx) == 15000
+    assert float(kept_q.max()) > 0.45
+
+    # 4. _zone_funnel_seed_per_run captures a >2 deg inter-batch crystal slip
+    U_true_slip = Rot.from_rotvec(np.radians([2.1, -0.8, 1.2])).as_matrix()
+    A_hex = np.linalg.inv(B_hex).T
+    q_synth = []
+    for uvw in ([1, 0, 0], [0, 1, 0], [1, 1, 0]):
+        axis_lab = U_true_slip @ (A_hex @ np.array(uvw, float))
+        axis_lab /= np.linalg.norm(axis_lab)
+        # Build 6 scattering unit vectors orthogonal to each zone axis
+        ref_v = (
+            np.array([0.0, 0.0, 1.0])
+            if abs(axis_lab[2]) < 0.9
+            else np.array([1.0, 0.0, 0.0])
+        )
+        e1 = np.cross(axis_lab, ref_v)
+        e1 /= np.linalg.norm(e1)
+        e2 = np.cross(axis_lab, e1)
+        for ph in np.linspace(-0.8, 0.8, 6):
+            q_synth.append(np.cos(ph) * e1 + np.sin(ph) * e2)
+    q_arr = np.asarray(q_synth, dtype=np.float64)
+    Urs_seeded = _zone_funnel_seed_per_run(
+        np.eye(3),
+        B_hex,
+        [0],
+        {0: np.eye(3)},
+        {0: q_arr},
+        {0: np.ones(len(q_arr))},
+        space_group="P 61 2 2",
+    )
+    assert Urs_seeded is not None
+    err_deg = np.degrees(Rot.from_matrix(Urs_seeded[0] @ U_true_slip.T).magnitude())
+    assert err_deg < 0.25
+
+    # 5. 3-axis Y-Z-Y goniometer decomposition escapes chi=0 gimbal lock exactly
+    axes_yzy = np.array(
+        [[0.0, 1.0, 0.0, 1.0], [0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 0.0, 1.0]]
+    )
+    ang_nom = np.array([0.0, 0.0, 10.0])
+    R_nom = calc_goniometer_rotation_matrix(axes_yzy, ang_nom)
+    R_slipped = Rot.from_rotvec(np.radians([3.5, -1.2, 2.0])).as_matrix() @ R_nom
+    ang_fit = _decompose_R_to_angles(axes_yzy, ang_nom, R_slipped)
+    R_fit = calc_goniometer_rotation_matrix(axes_yzy, ang_fit)
+    np.testing.assert_allclose(R_fit, R_slipped, atol=1e-10)

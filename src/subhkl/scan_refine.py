@@ -2,6 +2,7 @@
 
 import json
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -138,15 +139,37 @@ def _parse_rot_axis(axis):
 
 
 def default_band_binning(
-    n_rows: int, n_cols: int, min_bins: int = 32, max_binning: int = 8
+    n_rows: int,
+    n_cols: int,
+    min_bins: int = 32,
+    max_binning: int = 8,
+    *,
+    cell: Sequence[float] | np.ndarray | None = None,
+    d_min: float | None = None,
 ) -> int:
-    """Choose spatial binning from panel dimensions so each panel keeps >= 32x32 bins."""
+    """Choose spatial binning from panel dimensions and cell/d_min rung density."""
     import math
 
-    g = math.gcd(int(n_rows), int(n_cols))
+    r_dim, c_dim = int(n_rows), int(n_cols)
+    min_dim = min(r_dim, c_dim)
+    eff_min_bins = int(min_bins)
+    if cell is not None and len(cell) >= 3 and d_min is not None and float(d_min) > 0:
+        max_axis = max(float(cell[0]), float(cell[1]), float(cell[2]))
+        axis_ratio = max_axis / float(d_min)
+        # Keep >= ~2 spatial bins per adjacent zone layer on long-axis unit cells
+        # while capping automatic 256-px detector binning at >=4 (64x64 bins/panel)
+        # so initial SO(3) blind search remains fast.
+        scaled_bins = round(0.5 * axis_ratio)
+        if min_dim <= 256 and eff_min_bins <= 64:
+            scaled_bins = min(scaled_bins, 64)
+        else:
+            scaled_bins = min(scaled_bins, 128)
+        eff_min_bins = max(eff_min_bins, scaled_bins)
+
+    g = math.gcd(r_dim, c_dim)
     cap = min(
         int(max_binning),
-        max(1, min(int(n_rows), int(n_cols)) // int(min_bins)),
+        max(1, min_dim // max(1, eff_min_bins)),
     )
     for b in range(cap, 0, -1):
         if g % b == 0:
@@ -285,12 +308,6 @@ def run_scan_refinement(
             int(img_shape[1]),
             int(img_shape[2]),
         )
-        if binning is None:
-            binning = default_band_binning(n_rows, n_cols)
-        if binning < 1 or n_rows % binning or n_cols % binning:
-            raise ValueError(
-                f"band binning ({binning}) must divide the detector size ({n_rows}x{n_cols})"
-            )
         offsets = _frame_offsets(f, n_frames)
         _frame_rotations_and_scan_axes(f, n_frames)
         if cell is None:
@@ -302,6 +319,12 @@ def run_scan_refinement(
             space_group = f["sample/space_group"][()]
             if isinstance(space_group, bytes):
                 space_group = space_group.decode()
+        if binning is None:
+            binning = default_band_binning(n_rows, n_cols, cell=cell, d_min=d_min)
+        if binning < 1 or n_rows % binning or n_cols % binning:
+            raise ValueError(
+                f"band binning ({binning}) must divide the detector size ({n_rows}x{n_cols})"
+            )
     if (
         not np.isfinite(cell).all()
         or len(cell) != 6
@@ -653,7 +676,15 @@ def _decompose_R_to_angles(axes, ang_nom, R_target):
     K = len(axes)
     if K == 3:
         free_cols = [0, 1, 2]
-        inits = [np.zeros(3)]
+        inits = [
+            np.zeros(3),
+            np.array([0.0, 2.0, 0.0]),
+            np.array([0.0, -2.0, 0.0]),
+            np.array([90.0, 2.0, -90.0]),
+            np.array([-90.0, 2.0, 90.0]),
+            np.array([90.0, -2.0, -90.0]),
+            np.array([-90.0, -2.0, 90.0]),
+        ]
     elif K == 5:
         free_cols = [0, 2, 4]
         inits = [
