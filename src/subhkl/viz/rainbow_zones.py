@@ -4432,6 +4432,7 @@ def _h5_has_tof_data(*candidates: str | os.PathLike[str] | None) -> bool:
             if (
                 "tof_gate" in hf
                 or "peaks/tof" in hf
+                or bool(hf.attrs.get("has_tof_events"))
                 or ("events/tof" in hf and "events/image_offsets" in hf)
             ):
                 return True
@@ -17159,6 +17160,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const _clientH5HasTof = (hf) => {{
       if (!hf) return false;
       try {{
+        if (hf.attrs && hf.attrs.has_tof_events && hf.attrs.has_tof_events.value) return true;
         const ks = hf.keys();
         if (ks.includes("tof_gate")) return true;
         if (ks.includes("peaks") && hf.get("peaks").keys().includes("tof")) return true;
@@ -20402,51 +20404,56 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 const targetDmin = userChangedDmin
                   ? Number(state.dMin)
                   : (Number.isFinite(params.d_min) && params.d_min > 0 ? Number(params.d_min) : Number(state.dMin));
-                try {{
-                  const targetFrame = stageId === "reduce"
-                    ? 0
-                    : (typeof state.selectedFrameIndex === "number"
-                      ? state.selectedFrameIndex
-                      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0));
-                  const dminParam = stageId !== "reduce"
-                    ? `&preserve_params=1${{Number.isFinite(targetDmin) && targetDmin > 0 ? `&d_min=${{encodeURIComponent(targetDmin)}}` : ""}}`
-                    : "";
-                  const payloadUrl = (!aj.updated_payload_ready && aj.output_h5_path)
-                    ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}${{dminParam}}${{getRenderBinningQuery()}}`
-                    : `api/payload?frame=${{targetFrame}}${{dminParam}}${{getRenderBinningQuery()}}`;
-                  const pr = await fetch(payloadUrl, {{ cache: "no-store" }});
-                  if (runSeq !== state.workflowRunSeq) return;
-                  if (pr.ok) {{
-                    const newPayload = await pr.json();
+                const canReloadWarmPayload = Boolean(
+                  aj.updated_payload_ready || aj.output_h5_path || h5Outs.length === 0
+                );
+                if (canReloadWarmPayload) {{
+                  try {{
+                    const targetFrame = stageId === "reduce"
+                      ? 0
+                      : (typeof state.selectedFrameIndex === "number"
+                        ? state.selectedFrameIndex
+                        : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0));
+                    const dminParam = stageId !== "reduce"
+                      ? `&preserve_params=1${{Number.isFinite(targetDmin) && targetDmin > 0 ? `&d_min=${{encodeURIComponent(targetDmin)}}` : ""}}`
+                      : "";
+                    const payloadUrl = (!aj.updated_payload_ready && aj.output_h5_path)
+                      ? `api/payload?file_path=${{encodeURIComponent(aj.output_h5_path)}}&frame=${{targetFrame}}${{dminParam}}${{getRenderBinningQuery()}}`
+                      : `api/payload?frame=${{targetFrame}}${{dminParam}}${{getRenderBinningQuery()}}`;
+                    const pr = await fetch(payloadUrl, {{ cache: "no-store" }});
                     if (runSeq !== state.workflowRunSeq) return;
-                    if (newPayload && (Array.isArray(newPayload.panels) || Array.isArray(newPayload.peaks))) {{
-                      recomputeBoundsAndReload(newPayload, {{
-                        resetSelectedFrame: stageId === "reduce",
-                        preserveParams: stageId !== "reduce",
-                      }});
-                      if (stageId !== "reduce") {{
-                        if (Number.isFinite(params.wavelength_min) && Number.isFinite(params.wavelength_max) && params.wavelength_max > params.wavelength_min) {{
-                          state.lamMin = Number(params.wavelength_min);
-                          state.lamMax = Number(params.wavelength_max);
-                          updateWavelengthLabels();
+                    if (pr.ok) {{
+                      const newPayload = await pr.json();
+                      if (runSeq !== state.workflowRunSeq) return;
+                      if (newPayload && (Array.isArray(newPayload.panels) || Array.isArray(newPayload.peaks))) {{
+                        recomputeBoundsAndReload(newPayload, {{
+                          resetSelectedFrame: stageId === "reduce",
+                          preserveParams: stageId !== "reduce",
+                        }});
+                        if (stageId !== "reduce") {{
+                          if (Number.isFinite(params.wavelength_min) && Number.isFinite(params.wavelength_max) && Number.isFinite(params.wavelength_max) > Number(params.wavelength_min)) {{
+                            state.lamMin = Number(params.wavelength_min);
+                            state.lamMax = Number(params.wavelength_max);
+                            updateWavelengthLabels();
+                          }}
+                          const finalDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart
+                            ? Number(state.dMin)
+                            : targetDmin;
+                          if (Number.isFinite(finalDmin) && finalDmin > 0) {{
+                            syncDminControls(finalDmin);
+                          }}
+                          updateHUD();
                         }}
-                        const finalDmin = (state.dMinUserSeq || 0) !== dMinSeqAtStart
-                          ? Number(state.dMin)
-                          : targetDmin;
-                        if (Number.isFinite(finalDmin) && finalDmin > 0) {{
-                          syncDminControls(finalDmin);
-                        }}
-                        updateHUD();
+                        loadedOk = true;
+                        appendTerminalLog(
+                          stageId === "reduce"
+                            ? "\\nLoaded merged.h5 into viewport — Pending step: 2. Solve (Lattice Ladder)."
+                            : "\\nReloaded updated orientation, Laue zones, and Bragg reflections into viewport."
+                        );
                       }}
-                      loadedOk = true;
-                      appendTerminalLog(
-                        stageId === "reduce"
-                          ? "\\nLoaded merged.h5 into viewport — Pending step: 2. Solve (Lattice Ladder)."
-                          : "\\nReloaded updated orientation, Laue zones, and Bragg reflections into viewport."
-                      );
                     }}
-                  }}
-                }} catch (_re) {{}}
+                  }} catch (_re) {{}}
+                }}
                 if (!loadedOk && h5Outs.length > 0 && runSeq === state.workflowRunSeq) {{
                   await loadFromGalaxyDatasetId(h5Outs[0].id);
                   if (runSeq !== state.workflowRunSeq) return;
