@@ -656,10 +656,13 @@ class MainApp:
             import time
 
             try:
+                from subhkl.viz.nova_rainbow_view import register_temp_artifact
+
                 upload_dir = os.path.join(
                     tempfile.gettempdir(), f"subhkl_upload_{int(time.time())}"
                 )
                 os.makedirs(upload_dir, exist_ok=True)
+                register_temp_artifact(upload_dir)
                 reader = await request.multipart()
                 saved_paths: list[str] = []
                 while True:

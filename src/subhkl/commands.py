@@ -1515,6 +1515,14 @@ def run_rbf_integrator(
             else None
         )
 
+        # The band the reflections were predicted in; the images file only
+        # carries the instrument default from reduce time.
+        peaks_band = (
+            tuple(float(v) for v in f["instrument/wavelength"][()])
+            if "instrument/wavelength" in f
+            else None
+        )
+
         for key in f["banks"]:
             img_idx = int(key)
             grp = f[f"banks/{key}"]
@@ -1595,6 +1603,7 @@ def run_rbf_integrator(
         tof_gate_coverage=tof_gate_coverage,
         tof_gate_search=tof_gate_search,
         tof_sideband_factor=tof_sideband_factor,
+        tof_band=peaks_band,
     )
     if event_store is not None:
         event_store.close()

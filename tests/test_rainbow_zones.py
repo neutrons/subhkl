@@ -6840,3 +6840,957 @@ def test_solve_binning_param_drawer_and_cli_forwarding(tmp_path):
         )
         assert f"--binning {b_val}" in rec_b["command_line"]
         assert rec_b["solve_params"]["binning"] == b_val
+
+
+def test_careless_mono_mode_auto_selected_for_tof_without_ui_selector(
+    tmp_path,
+) -> None:
+    """Verify UI has no mono/poly selector and automatically selects careless mono (without --wavelength-key, keeping WAVEL in metadata) whenever TOF data is available."""
+    import json
+    import re
+    import subprocess
+    from pathlib import Path
+    from unittest.mock import MagicMock, patch
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_app.models.subhkl_model import SubhklGalaxyModel
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        _h5_has_tof_data,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    def _write_dummy_mtz(mtz_path: Path) -> None:
+        mtz = gemmi.Mtz(with_base=True)
+        mtz.spacegroup = gemmi.find_spacegroup_by_name("I a -3 d")
+        mtz.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90.0, 90.0, 90.0))
+        mtz.add_dataset("garnet")
+        mtz.add_column("M/ISYM", "Y")
+        mtz.add_column("BATCH", "B")
+        mtz.add_column("I", "J")
+        mtz.add_column("SIGI", "Q")
+        mtz.add_column("WAVEL", "R")
+        mtz.add_column("THETA", "R")
+        mtz.add_column("PHI", "R")
+        mtz.set_data(
+            np.array(
+                [
+                    [4.0, 0.0, 0.0, 1.0, 1001.0, 150.0, 8.0, 1.49, 0.42, 1.10],
+                    [8.0, 0.0, 0.0, 1.0, 1001.0, 90.0, 6.0, 2.98, 0.42, 1.10],
+                ],
+                dtype=np.float32,
+            )
+        )
+        mtz.write_to_file(str(mtz_path))
+
+    # 1. Non-TOF workdir (e.g. CG4D image-only scan) -> has_tof_data is False -> careless poly + --wavelength-key=WAVEL
+    poly_dir = tmp_path / "work_poly"
+    poly_dir.mkdir()
+    poly_merged = poly_dir / "merged.h5"
+    with h5py.File(poly_merged, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf.create_dataset("images", data=np.zeros((1, 32, 32), dtype=np.float32))
+        hf.create_dataset("bank_ids", data=np.array([20], dtype=np.int32))
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.8, 4.5], dtype=np.float64)
+        )
+    poly_integ = poly_dir / "integrated.h5"
+    with h5py.File(poly_integ, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf.attrs["source"] = str(poly_merged)
+        smp = hf.create_group("sample")
+        smp.create_dataset("U", data=np.eye(3))
+        smp.create_dataset("B", data=np.diag([1.0 / 54.0] * 3))
+        pk = hf.create_group("peaks")
+        pk.create_dataset("h", data=np.array([1], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([0], dtype=np.int32))
+        pk.create_dataset("lambda", data=np.array([3.2], dtype=np.float64))
+        pk.create_dataset("intensity", data=np.array([100.0], dtype=np.float64))
+        pk.create_dataset("sigma", data=np.array([5.0], dtype=np.float64))
+        pk.create_dataset("bank", data=np.array([20], dtype=np.int32))
+        pk.create_dataset("pixel_r", data=np.array([16.0], dtype=np.float64))
+        pk.create_dataset("pixel_c", data=np.array([16.0], dtype=np.float64))
+        pk.create_dataset("xyz", data=np.array([[0.1, 0.0, 0.9]], dtype=np.float64))
+    _write_dummy_mtz(poly_dir / "reflections.mtz")
+
+    assert _h5_has_tof_data(poly_merged, poly_integ) is False
+    payload_poly = build_rainbow_zone_payload(
+        replay_h5=poly_integ, images_h5=poly_merged, include_panel_images=False
+    )
+    assert payload_poly["has_tof_data"] is False
+
+    # 2. TOF workdir (MANDI Ia-3d garnet 1-3 A with pixel-sorted events/tof + tof_gate) -> has_tof_data is True -> careless mono
+    mono_dir = tmp_path / "work_mono"
+    mono_dir.mkdir()
+    mono_merged = mono_dir / "merged.h5"
+    with h5py.File(mono_merged, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_dataset("images", data=np.zeros((1, 32, 32), dtype=np.float32))
+        hf.create_dataset("bank_ids", data=np.array([19], dtype=np.int32))
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.0, 3.0], dtype=np.float64)
+        )
+        ev = hf.create_group("events")
+        ev.create_dataset("tof", data=np.array([11500.0, 23000.0], dtype=np.float32))
+        ev.create_dataset("image_offsets", data=np.array([0, 2], dtype=np.int64))
+    mono_solve = mono_dir / "solve.h5"
+    with h5py.File(mono_solve, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.attrs["source"] = str(mono_merged)
+        smp = hf.create_group("sample")
+        smp.create_dataset("U", data=np.eye(3))
+        smp.create_dataset("B", data=np.diag([1.0 / 11.93] * 3))
+    mono_integ = mono_dir / "integrated.h5"
+    with h5py.File(mono_integ, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.attrs["source"] = str(mono_merged)
+        smp = hf.create_group("sample")
+        smp.create_dataset("U", data=np.eye(3))
+        smp.create_dataset("B", data=np.diag([1.0 / 11.93] * 3))
+        tg = hf.create_group("tof_gate")
+        tg.attrs["mode"] = "tof_gated_3d"
+        pk = hf.create_group("peaks")
+        pk.create_dataset("h", data=np.array([4, 8], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("lambda", data=np.array([2.98, 1.49], dtype=np.float64))
+        pk.create_dataset("tof", data=np.array([23000.0, 11500.0], dtype=np.float64))
+        pk.create_dataset("intensity", data=np.array([150.0, 90.0], dtype=np.float64))
+        pk.create_dataset("sigma", data=np.array([8.0, 6.0], dtype=np.float64))
+        pk.create_dataset("bank", data=np.array([19, 19], dtype=np.int32))
+        pk.create_dataset("pixel_r", data=np.array([16.0, 16.0], dtype=np.float64))
+        pk.create_dataset("pixel_c", data=np.array([16.0, 16.0], dtype=np.float64))
+        pk.create_dataset(
+            "xyz",
+            data=np.array([[0.2, 0.0, 0.4], [0.2, 0.0, 0.4]], dtype=np.float64),
+        )
+    _write_dummy_mtz(mono_dir / "reflections.mtz")
+
+    assert _h5_has_tof_data(mono_merged) is True
+    assert _h5_has_tof_data(mono_solve) is True  # resolves via attrs['source']
+    assert _h5_has_tof_data(mono_integ) is True
+    payload_mono = build_rainbow_zone_payload(
+        replay_h5=mono_integ, images_h5=mono_merged, include_panel_images=False
+    )
+    assert payload_mono["has_tof_data"] is True
+
+    # 3. Verify UI has NO mono/poly selector, and collectWorkflowParams() auto-selects mono iff DATA.has_tof_data
+    html_mono = render_rainbow_html(payload_mono)
+    assert "inp-careless-mode" not in html_mono
+    assert "inp-merge-mode" not in html_mono
+    assert 'id="inp-mode"' not in html_mono
+    m_collect = re.search(
+        r"function collectWorkflowParams\(\)\s*\{[\s\S]*?\n  \}", html_mono
+    )
+    assert m_collect is not None
+    js_eval = f"""
+const state = {{ dMin: 1.2, lamMin: 1.0, lamMax: 3.0 }};
+const inpDminEl = null;
+const slDmin = null;
+function getDefaultWavelengthForInstrument() {{ return [2.0, 4.0]; }}
+function syncDminControls() {{}}
+function defaultRelBorderForInstrument() {{ return 0.0; }}
+globalThis.document = {{ getElementById: () => null, activeElement: null }};
+let DATA = {{ has_tof_data: false, instrument: "CG4D", space_group: "P 21 21 21", cell: [54,54,54,90,90,90], d_min: 1.4, wavelength_range: [2.8, 4.5] }};
+{m_collect.group(0)}
+const pPoly = collectWorkflowParams();
+DATA = {{ has_tof_data: true, instrument: "MANDI", space_group: "I a -3 d", cell: [11.93,11.93,11.93,90,90,90], d_min: 1.0, wavelength_range: [1.0, 3.0] }};
+const pMono = collectWorkflowParams();
+console.log(JSON.stringify({{ pPoly, pMono }}));
+"""
+    proc = subprocess.run(
+        ["node", "-e", js_eval], check=True, capture_output=True, text=True
+    )
+    js_res = json.loads(proc.stdout.strip())
+    assert js_res["pPoly"]["has_tof_data"] is False
+    assert js_res["pPoly"]["merge_mode"] == "poly"
+    assert js_res["pMono"]["has_tof_data"] is True
+    assert js_res["pMono"]["merge_mode"] == "mono"
+
+    # 4. Verify SubhklGalaxyModel.build_tool_parameters("merge")
+    m_sub = SubhklGalaxyModel()
+    m_sub.data.peaks_file = str(poly_integ)
+    m_sub.data.images_file = str(poly_merged)
+    assert m_sub.build_tool_parameters("merge")["mode"] == "poly"
+    m_sub.data.peaks_file = str(mono_integ)
+    m_sub.data.images_file = str(mono_merged)
+    assert m_sub.build_tool_parameters("merge")["mode"] == "mono"
+
+    # 5. Verify local Careless command line & prep_merge.py metadata keys
+    runner_poly = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner_poly._local_work_dir = str(poly_dir)
+    rec_poly = {"cancel_requested": True}
+    runner_poly._submit_local_subhkl_stage(
+        "merge",
+        {"images_file": str(poly_merged), "peaks_file": str(poly_integ)},
+        existing_job_record=rec_poly,
+    )
+    assert "careless poly " in rec_poly["command_line"]
+    assert "--wavelength-key=WAVEL" in rec_poly["command_line"]
+    prep_poly_src = (poly_dir / "careless_work" / "prep_merge.py").read_text()
+    assert "'WAVEL'" in prep_poly_src
+
+    runner_mono = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner_mono._local_work_dir = str(mono_dir)
+    rec_mono = {"cancel_requested": True}
+    runner_mono._submit_local_subhkl_stage(
+        "merge",
+        {
+            "instrument": "MANDI",
+            "space_group": "I a -3 d",
+            "wavelength_min": 1.0,
+            "wavelength_max": 3.0,
+            "images_file": str(mono_merged),
+            "peaks_file": str(mono_integ),
+        },
+        existing_job_record=rec_mono,
+    )
+    assert "careless mono " in rec_mono["command_line"]
+    assert "--wavelength-key" not in rec_mono["command_line"]
+    prep_mono_src = (mono_dir / "careless_work" / "prep_merge.py").read_text()
+    post_mono_src = (mono_dir / "careless_work" / "post_merge.py").read_text()
+    assert "'WAVEL'" in prep_mono_src  # WAVEL stays in metadata even in mono mode
+    assert "'mode': 'mono'" in post_mono_src
+
+    # 6. Verify Galaxy imaginex_subhkl_merge tool_inputs passes mode="mono" for TOF and mode="poly" for non-TOF
+    gx_runner = NovaGalaxyPipelineRunner(
+        galaxy_url="http://localhost:8080", galaxy_api_key="fake-key"
+    )
+    assert gx_runner._resolve_careless_merge_mode({}, work_dir=str(poly_dir)) == "poly"
+    assert gx_runner._resolve_careless_merge_mode({}, work_dir=str(mono_dir)) == "mono"
+
+    captured_inputs: list[tuple[str, dict]] = []
+    fallback_reasons: list[str] = []
+
+    def _capture_run_tool(history_id, tool_id, tool_inputs):
+        captured_inputs.append((tool_id, dict(tool_inputs)))
+        return {"jobs": [{"id": f"gx_job_{len(captured_inputs)}"}], "outputs": []}
+
+    fake_store = MagicMock()
+    fake_store.history_id = "hist_123"
+    fake_store.nova_connection.galaxy_instance.tools.run_tool.side_effect = (
+        _capture_run_tool
+    )
+
+    with (
+        patch.object(gx_runner, "get_datastore", return_value=fake_store),
+        patch.object(gx_runner, "_has_tool_on_galaxy", return_value=True),
+        patch.object(gx_runner, "_ensure_galaxy_h5_dataset", return_value="hda_mtz_1"),
+        patch.object(gx_runner, "_get_tool_version", return_value="0.1.3"),
+        patch.object(gx_runner, "_poll_galaxy_job", return_value=None),
+        patch.object(
+            gx_runner,
+            "_submit_local_subhkl_stage",
+            side_effect=lambda *a, **k: fallback_reasons.append(
+                str(k.get("fallback_reason") or "")
+            ),
+        ),
+    ):
+        gx_runner._dispatch_nova_galaxy_thread(
+            "merge",
+            {"images_file": str(mono_merged), "peaks_file": str(mono_integ)},
+            {"job_id": "j1", "stage_id": "merge", "state": "queued", "stdout": ""},
+            None,
+        )
+        gx_runner._dispatch_nova_galaxy_thread(
+            "merge",
+            {"images_file": str(poly_merged), "peaks_file": str(poly_integ)},
+            {"job_id": "j2", "stage_id": "merge", "state": "queued", "stdout": ""},
+            None,
+        )
+
+    assert fallback_reasons == []
+    assert len(captured_inputs) == 2
+    assert captured_inputs[0][0] == "imaginex_subhkl_merge"
+    assert captured_inputs[0][1]["mode"] == "mono"
+    assert captured_inputs[1][0] == "imaginex_subhkl_merge"
+    assert captured_inputs[1][1]["mode"] == "poly"
+
+    # Legacy imaginex_subhkl_merge 0.1.2 without mono support must fall back rather than silently run poly on TOF data
+    with (
+        patch.object(gx_runner, "get_datastore", return_value=fake_store),
+        patch.object(gx_runner, "_has_tool_on_galaxy", return_value=True),
+        patch.object(gx_runner, "_ensure_galaxy_h5_dataset", return_value="hda_mtz_1"),
+        patch.object(gx_runner, "_get_tool_version", return_value="0.1.2"),
+        patch.object(gx_runner, "_poll_galaxy_job", return_value=None),
+        patch.object(
+            gx_runner,
+            "_submit_local_subhkl_stage",
+            side_effect=lambda *a, **k: fallback_reasons.append(
+                str(k.get("fallback_reason") or "")
+            ),
+        ),
+    ):
+        gx_runner._dispatch_nova_galaxy_thread(
+            "merge",
+            {"images_file": str(mono_merged), "peaks_file": str(mono_integ)},
+            {"job_id": "j3", "stage_id": "merge", "state": "queued", "stdout": ""},
+            None,
+        )
+    assert len(fallback_reasons) == 1
+    assert "lacks monochromatic ('mono') mode" in fallback_reasons[0]
+
+
+def test_wilson_prior_default_mean_calibrated_residual_colorbar_and_single_table_button(
+    tmp_path,
+) -> None:
+    """Verify wilson_prior_b defaults to None (not overriding careless), residual colorbar covers observed range centered on dataset mean, and Wulff bar omits duplicate table button."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    work_dir = tmp_path / "work_garnet"
+    work_dir.mkdir()
+    merged_h5 = work_dir / "merged.h5"
+    with h5py.File(merged_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_dataset("images", data=np.zeros((1, 32, 32), dtype=np.float32))
+        hf.create_dataset("bank_ids", data=np.array([19], dtype=np.int32))
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.0, 3.0], dtype=np.float64)
+        )
+        ev = hf.create_group("events")
+        ev.create_dataset("tof", data=np.array([11500.0, 23000.0], dtype=np.float32))
+        ev.create_dataset("image_offsets", data=np.array([0, 2], dtype=np.int64))
+    integ_h5 = work_dir / "integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.attrs["source"] = str(merged_h5)
+        smp = hf.create_group("sample")
+        smp.create_dataset("U", data=np.eye(3))
+        smp.create_dataset("B", data=np.diag([1.0 / 11.93] * 3))
+        pk = hf.create_group("peaks")
+        pk.create_dataset("h", data=np.array([4, 8], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([0, 0], dtype=np.int32))
+        pk.create_dataset("lambda", data=np.array([2.98, 1.49], dtype=np.float64))
+        pk.create_dataset("intensity", data=np.array([150.0, 90.0], dtype=np.float64))
+        pk.create_dataset("sigma", data=np.array([8.0, 6.0], dtype=np.float64))
+        pk.create_dataset("bank", data=np.array([19, 19], dtype=np.int32))
+        pk.create_dataset("pixel_r", data=np.array([16.0, 16.0], dtype=np.float64))
+        pk.create_dataset("pixel_c", data=np.array([16.0, 16.0], dtype=np.float64))
+        pk.create_dataset(
+            "xyz",
+            data=np.array([[0.2, 0.0, 0.4], [0.2, 0.0, 0.4]], dtype=np.float64),
+        )
+    mtz = gemmi.Mtz(with_base=True)
+    mtz.spacegroup = gemmi.find_spacegroup_by_name("I a -3 d")
+    mtz.set_cell_for_all(gemmi.UnitCell(11.93, 11.93, 11.93, 90.0, 90.0, 90.0))
+    mtz.add_dataset("garnet")
+    for lbl, ctype in (
+        ("M/ISYM", "Y"),
+        ("BATCH", "B"),
+        ("I", "J"),
+        ("SIGI", "Q"),
+        ("WAVEL", "R"),
+        ("THETA", "R"),
+        ("PHI", "R"),
+    ):
+        mtz.add_column(lbl, ctype)
+    mtz.set_data(
+        np.array(
+            [[4.0, 0.0, 0.0, 1.0, 1001.0, 150.0, 8.0, 1.49, 0.42, 1.10]],
+            dtype=np.float32,
+        )
+    )
+    mtz.write_to_file(str(work_dir / "reflections.mtz"))
+
+    # 1. Default wilson_prior_b is None -> --wilson-prior-b omitted; explicit value -> passed
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner._local_work_dir = str(work_dir)
+    rec_default = {"cancel_requested": True}
+    runner._submit_local_subhkl_stage(
+        "merge",
+        {"images_file": str(merged_h5), "peaks_file": str(integ_h5)},
+        existing_job_record=rec_default,
+    )
+    assert "--wilson-prior-b" not in rec_default["command_line"]
+
+    rec_explicit = {"cancel_requested": True}
+    runner._submit_local_subhkl_stage(
+        "merge",
+        {
+            "images_file": str(merged_h5),
+            "peaks_file": str(integ_h5),
+            "wilson_prior_b": 15.0,
+        },
+        existing_job_record=rec_explicit,
+    )
+    assert "--wilson-prior-b=15.0" in rec_explicit["command_line"]
+
+    # 2. Only sparkline header has the table button; Wulff merge scoreboard has none
+    payload = build_rainbow_zone_payload(
+        replay_h5=integ_h5, images_h5=merged_h5, include_panel_images=False
+    )
+    ui_html = render_rainbow_html(payload)
+    assert 'id="btn-hist-open-table"' in ui_html
+    assert 'data-merge-action="open-table"' not in ui_html
+
+    # 3. Residual colorbar spans observed [min, max] with White midpoint at dataset mean
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", ui_html)
+        inline_js = script_blocks[-1]
+        fn_names = [
+            "getColorCrossover",
+            "applyCrossoverCurve",
+            "peakMtzIsigi",
+            "getPeakDataAvailability",
+            "residualToColor",
+            "buildColorscaleGradientSpec",
+        ]
+        extracted = []
+        for fn_name in fn_names:
+            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            assert m is not None, f"Missing JS function {fn_name}"
+            start = m.start()
+            depth = 0
+            in_str = None
+            esc = False
+            i = m.end() - 1
+            while i < len(inline_js):
+                ch = inline_js[i]
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif in_str:
+                    if ch == in_str:
+                        in_str = None
+                elif ch in ("'", '"', "`"):
+                    in_str = ch
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        extracted.append(inline_js[start : i + 1])
+                        break
+                i += 1
+
+        js_harness = f"""
+const DEFAULT_COLOR_CROSSOVER = 0.38;
+const ORBIT_PALETTE = ["#ff38b4", "#00e5ff"];
+const state = {{ colorCrossover: 0.38, peakSource: "integrated", lamMin: 1.0, lamMax: 3.0 }};
+const DATA = {{ mtz_overlay_name: "" }};
+let _dynPredEpoch = 0;
+let _peakDataAvailabilitySig = "";
+let _peakDataAvailability = {{
+  hasIsigi: false, hasMtzIsigi: false, hasResiduals: false, hasScales: false,
+  isigiTop: 40.0, mtzIsigiTop: 40.0, resMin: -3.0, resMax: 3.0, resMean: 0.0,
+}};
+const SAMPLE_PEAKS = [
+  {{ id: 1, careless_residual: -1.0 }},
+  {{ id: 2, careless_residual: 7.0 }},
+  {{ id: 3, careless_residual: 15.0 }},
+  {{ id: 4, careless_residual: 59.0 }},
+]; // min = -1.0, max = 59.0, mean = 20.0
+const PEAKS = [SAMPLE_PEAKS[0], SAMPLE_PEAKS[2]];
+function isigiToColor() {{ return "rgba(0,0,0,1)"; }}
+function scaleToColor() {{ return "rgba(0,0,0,1)"; }}
+function hexToRgba() {{ return "rgba(0,0,0,1)"; }}
+function wavelengthToColor() {{ return "rgba(0,0,0,1)"; }}
+{"\n".join(extracted)}
+const avail = getPeakDataAvailability();
+const spec = buildColorscaleGradientSpec("residual", 0.38);
+console.log(JSON.stringify({{
+  avail: {{ resMin: avail.resMin, resMax: avail.resMax, resMean: avail.resMean }},
+  colMin: residualToColor(-1.0, 1.0),
+  colBelowMean: residualToColor(7.0, 1.0),
+  colMean: residualToColor(20.0, 1.0),
+  colAboveMean: residualToColor(40.0, 1.0),
+  colMax: residualToColor(59.0, 1.0),
+  spec,
+}}));
+"""
+        proc = subprocess.run(
+            ["node", "-e", js_harness], check=True, capture_output=True, text=True
+        )
+        out = json.loads(proc.stdout.strip())
+        assert out["avail"] == {"resMin": -1.0, "resMax": 59.0, "resMean": 20.0}
+        assert out["colMin"] == "rgba(30, 170, 255, 1.000)"
+        assert out["colMean"] == "rgba(248, 250, 252, 1.000)"
+        assert out["colMax"] == "rgba(244, 63, 94, 1.000)"
+        # Positive residual +7.0 is below dataset mean (+20.0), so it tints toward blue (b > r)
+        r_lo, _, b_lo = [int(x) for x in re.findall(r"\d+", out["colBelowMean"])[:3]]
+        assert b_lo > r_lo
+        # Residual +40.0 is above dataset mean (+20.0), so it tints toward red (r > b)
+        r_hi, _, b_hi = [int(x) for x in re.findall(r"\d+", out["colAboveMean"])[:3]]
+        assert r_hi > b_hi
+        assert "-1.0 · μ=20.0 · 59.0" == out["spec"]["label"]
+        assert "rgba(248, 250, 252, 1.000) 50.0%" in out["spec"]["gradient"]
+
+
+def test_live_solve_dtheta_diagnostic_topbar_tooltips_and_controls_cleanup(
+    tmp_path,
+) -> None:
+    """Verify image-grounded post-Solve & live micro-step Δθ, top-bar tooltips + non-overlapping subtitle CSS, and removal of redundant ALL / Walk buttons."""
+    import json
+    import os
+    import re
+    import shutil
+    import subprocess
+
+    import h5py
+    import numpy as np
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner
+    from subhkl.viz.rainbow_zones import (
+        _raycast_hkl_on_detectors,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # 1. Synthesize a realistic MANDI Ia-3d garnet detector count map in merged.h5 with true Bragg spots
+    mandi_dets = {
+        int(bk): Detector(dict(cfg)) for bk, cfg in beamlines["MANDI"].items()
+    }
+    active_bks = sorted(mandi_dets)[:8]
+    sub_dets = {bk: mandi_dets[bk] for bk in active_bks}
+    first_det = mandi_dets[active_bks[0]]
+    H, W = int(first_det.n), int(first_det.m)
+
+    U_true = Rotation.from_euler("xyz", [14.0, -22.0, 31.0], degrees=True).as_matrix()
+    B_mat = np.diag([1.0 / 11.93, 1.0 / 11.93, 1.0 / 11.93])
+    R_run = np.eye(3, dtype=float)
+    grid = np.mgrid[-6:7, -6:7, -6:7].reshape(3, -1).T
+    grid = grid[np.any(grid != 0, axis=1)]
+    cast_true = _raycast_hkl_on_detectors(
+        grid, U_true, B_mat, R_run, sub_dets, (1.0, 3.0), active_bids=set(active_bks)
+    )
+    assert len(cast_true["peaks_xyz"]) >= 10
+
+    rng = np.random.default_rng(42)
+    imgs = rng.poisson(2.0, size=(len(active_bks), H, W)).astype(np.float32)
+    bk_to_slab = {bk: i for i, bk in enumerate(active_bks)}
+    yy, xx = np.mgrid[0:H, 0:W]
+    # Plant bright 2D Gaussian Bragg spots slightly displaced (~0.35 px -> finite ~0.06° sub-pixel residual even at U_true)
+    for bk_p, r_p, c_p in zip(
+        cast_true["bank"], cast_true["pixel_r"], cast_true["pixel_c"]
+    ):
+        si = bk_to_slab.get(int(bk_p))
+        if si is not None and 8.0 <= r_p <= H - 9.0 and 8.0 <= c_p <= W - 9.0:
+            r_true = float(r_p) + 0.35
+            c_true = float(c_p) - 0.25
+            imgs[si] += (
+                260.0
+                * np.exp(
+                    -0.5 * (((yy - r_true) / 1.25) ** 2 + ((xx - c_true) / 1.25) ** 2)
+                )
+            ).astype(np.float32)
+
+    merged_h5 = tmp_path / "merged.h5"
+    with h5py.File(merged_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_dataset("images", data=imgs)
+        hf.create_dataset("banks", data=np.array(active_bks, dtype=np.int32))
+        hf.create_dataset("file_offsets", data=np.array([0], dtype=np.int32))
+        hf.create_group("goniometer").create_dataset("R", data=R_run[None, :, :])
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.0, 3.0], dtype=np.float64)
+        )
+        sg = hf.create_group("sample")
+        sg.attrs["space_group"] = "I a -3 d"
+        sg.create_dataset(
+            "cell", data=np.array([11.93, 11.93, 11.93, 90.0, 90.0, 90.0])
+        )
+
+    # 2. Simulate Solve micro-steps from coarse orientation error (0.75° -> 0.30° -> 0.00°)
+    rms_by_step: list[float] = []
+    partial_h5 = tmp_path / "solve.stages.h5"
+    runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+    runner.active_job = {
+        "stage_id": "solve",
+        "state": "running",
+        "partial_h5_path": str(partial_h5),
+        "images_h5_path": str(merged_h5),
+        "ladder_rung_idx": 1,
+        "solve_params": {
+            "instrument": "MANDI",
+            "space_group": "I a -3 d",
+            "wavelength_range": [1.0, 3.0],
+            "d_min": 1.0,
+        },
+    }
+    seen_seqs: list[int] = []
+
+    for step_i, mis_deg in enumerate((0.75, 0.30, 0.0)):
+        U_step = (
+            Rotation.from_rotvec([np.deg2rad(mis_deg), 0.0, 0.0]).as_matrix() @ U_true
+        )
+        with h5py.File(partial_h5, "w") as sf:
+            sf.attrs["instrument"] = "MANDI"
+            sf.attrs["source"] = str(merged_h5)
+            sg = sf.create_group("sample")
+            sg.attrs["space_group"] = "I a -3 d"
+            sg.create_dataset("U", data=U_step)
+            sg.create_dataset("B", data=B_mat)
+            sg.create_dataset(
+                "cell", data=np.array([11.93, 11.93, 11.93, 90.0, 90.0, 90.0])
+            )
+            sf.create_group("goniometer").create_dataset("R", data=R_run[None, :, :])
+            sf.create_group("instrument").create_dataset(
+                "wavelength", data=np.array([1.0, 3.0], dtype=np.float64)
+            )
+        # Ensure distinct mtime_ns across rapid micro-step writes
+        st_now = os.stat(partial_h5)
+        os.utime(
+            partial_h5,
+            ns=(st_now.st_atime_ns, st_now.st_mtime_ns + (step_i + 1) * 1_000_000),
+        )
+        runner.active_job["ladder_rung_idx"] = step_i + 1
+        ov_payload = runner.apply_active_solve_overlay({}, frame_index=0)
+        seen_seqs.append(int(runner.active_job["partial_overlay"]["seq"]))
+        err_vals = [
+            float(p["angular_error_deg"])
+            for p in ov_payload["peaks"]
+            if p.get("has_angular_error")
+        ]
+        assert len(err_vals) >= 4
+        rms_step = float(np.sqrt(np.mean(np.square(err_vals))))
+        rms_by_step.append(rms_step)
+
+    # Monotonic live partial_overlay sequence numbers and strictly decreasing Δθ across Solve micro-steps,
+    # ending at a finite physical >0° value (not an idealized 0.000°)!
+    assert seen_seqs == [1, 2, 3]
+    assert rms_by_step[0] > rms_by_step[1] > rms_by_step[2] > 0.01
+
+    # Post-Solve payload (solve.h5) also reports finite >0° Δθ and non-zero zone angular_rms_deg
+    solve_payload = build_rainbow_zone_payload(
+        replay_h5=partial_h5, images_h5=merged_h5, include_panel_images=False
+    )
+    solve_errs = [
+        p["angular_error_deg"]
+        for p in solve_payload["peaks"]
+        if p.get("has_angular_error")
+    ]
+    assert len(solve_errs) >= 4
+    assert float(np.sqrt(np.mean(np.square(solve_errs)))) > 0.01
+    assert any(float(z["angular_rms_deg"]) > 0.0 for z in solve_payload["zones"])
+
+    # 3. Verify blind_band.discover() writes .blind.h5 cleanly without temp-file collision
+    import types
+
+    import subhkl.search.blind_band as bb_mod
+
+    orig_ll = bb_mod.lattice_ladder
+    orig_rbg = bb_mod.refine_band_geometry
+    try:
+
+        def _fake_ladder(*_a, **kw):
+            on_rung = kw.get("on_rung")
+            if callable(on_rung):
+                on_rung("rung_30", 30, U_true)
+            return [(U_true, 12.5)]
+
+        def _fake_refine(*_a, **_kw):
+            return {
+                "U": U_true,
+                "score": 15.0,
+                "radial_scale": 0.0,
+                "axial_scale": 0.0,
+                "global_rot_vec": np.zeros(3),
+                "global_trans_m": np.zeros(3),
+            }
+
+        bb_mod.lattice_ladder = _fake_ladder
+        bb_mod.refine_band_geometry = _fake_refine
+        fake_obs = (
+            np.full(32, active_bks[0], dtype=np.int32),
+            np.linspace(16.0, 200.0, 32),
+            np.linspace(16.0, 200.0, 32),
+            np.linspace(5.0, 40.0, 32),
+            np.ones(32),
+            np.zeros(32, dtype=np.int32),
+            np.zeros((32, 3)),
+            np.linspace(1.0, 10.0, 32),
+            np.repeat(R_run[None, :, :], 32, axis=0),
+            np.repeat(np.array([[0.0, 1.0, 0.0]]), 32, axis=0),
+        )
+        solve_out = tmp_path / "subhkl_solve_test.h5"
+        fake_args = types.SimpleNamespace(
+            output=str(solve_out),
+            nexus=str(merged_h5),
+            instrument="MANDI",
+            cell=[11.93, 11.93, 11.93, 90.0, 90.0, 90.0],
+            space_group="I a -3 d",
+            wl_min=2.0,
+            wl_max=4.0,
+            d_min=1.5,
+            finder="peaks",
+            min_deviance=0.0,
+            runs=[0],
+            stable_runs=[0],
+            modes=frozenset({"sample"}),
+            _cached_obs_kin=fake_obs,
+        )
+        blind_written = bb_mod.discover(fake_args, samples=16, candidates=1, seed=0)
+        assert os.path.isfile(blind_written)
+        assert not list(tmp_path.glob("*.tmp.h5"))
+        with h5py.File(blind_written, "r") as bf_chk:
+            assert "orientations" in bf_chk["search"]
+            assert "full_scores" in bf_chk["search"]
+            assert str(bf_chk["search"].attrs["ladder_stage"]) == "blind_selected"
+    finally:
+        bb_mod.lattice_ladder = orig_ll
+        bb_mod.refine_band_geometry = orig_rbg
+
+    # 4. Verify HTML/CSS/JS top-bar tooltips (1.5s custom tooltip), non-overlapping .subtitle-tag CSS, and removed ALL / Walk buttons
+    html_doc = render_rainbow_html(solve_payload)
+    assert 'id="btn-zones-all"' not in html_doc
+    assert 'id="btn-ladder-play"' not in html_doc
+    assert "WALK SOLVE STEPS" not in html_doc
+    assert "switch steps with &lt; &gt; arrows" in html_doc
+    assert 'id="ui-hover-tooltip"' in html_doc
+    assert "const UI_TOOLTIP_DELAY_MS = 1500;" in html_doc
+
+    # Every top-bar field, HUD pill, and control button has a descriptive tooltip attribute
+    for top_id in (
+        "app-title",
+        "app-version",
+        "subtitle-tag",
+        "hud-peaks-pill",
+        "hud-rms-pill",
+        "hud-zones-pill",
+        "hud-gonio-pill",
+        "hud-frame-ctrl",
+        "btn-frame-prev",
+        "sel-frame",
+        "btn-frame-next",
+        "sel-galaxy-h5",
+        "btn-proj-toggle",
+        "peak-source-group",
+        "btn-peaks-pred",
+        "btn-peaks-integ",
+        "btn-zone-arcs",
+        "btn-pixel-mask",
+        "btn-hires-tex",
+        "btn-heatmap-cmap",
+        "btn-stereo-toggle",
+        "btn-reset-view",
+        "btn-new-tab",
+    ):
+        m_tag = re.search(rf'<[^>]*\bid="{top_id}"[^>]*>', html_doc)
+        assert m_tag is not None, f"Missing top-bar element #{top_id}"
+        assert 'title="' in m_tag.group(0), f"Missing title tooltip on #{top_id}"
+
+    # Verify .brand-block clips overflow and .subtitle-tag shrinks instead of bleeding into PEAKS pill
+    brand_css = re.search(r"\.brand-block\s*\{[^}]*\}", html_doc)
+    sub_css = re.search(r"\.subtitle-tag\s*\{[^}]*\}", html_doc)
+    hud_css = re.search(r"\.hud-metrics\s*\{[^}]*\}", html_doc)
+    assert brand_css is not None and "overflow: hidden;" in brand_css.group(0)
+    assert sub_css is not None and "flex: 0 1 auto;" in sub_css.group(0)
+    assert hud_css is not None and "flex-shrink: 0;" in hud_css.group(0)
+
+    # Verify JS _extractMeasSnapshot + syncTopBarTooltips + updateHUD preserve frame Δθ and format Peaks tooltip
+    if shutil.which("node"):
+        script_blocks = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        inline_js = script_blocks[-1]
+        fn_extract: list[str] = []
+        for fn in ("setElementTooltip", "syncTopBarTooltips", "updateHUD"):
+            m_fn = re.search(rf"function {fn}\b[\s\S]*?\n  \}}(?=\n)", inline_js)
+            assert m_fn is not None, f"Missing JS function {fn}"
+            fn_extract.append(m_fn.group(0))
+        node_script = f"""
+let _uiTipActiveEl = null;
+let _uiTipStashedEls = [];
+let _uiTipVisible = false;
+const uiHoverTooltip = null;
+const els = {{
+  "val-indexed": {{ textContent: "", title: "" }},
+  "val-rms": {{ textContent: "", title: "" }},
+  "val-zones": {{ textContent: "", title: "" }},
+  "val-gonio": {{ textContent: "", title: "" }},
+  "hud-peaks-pill": {{ title: "" }},
+  "hud-rms-pill": {{ title: "" }},
+  "hud-zones-pill": {{ title: "" }},
+  "hud-gonio-pill": {{ title: "" }},
+  "hud-frame-ctrl": {{ title: "" }},
+  "sel-frame": {{ selectedIndex: 0, options: [{{ textContent: "MANDI_12737.nxs.h5 (ω=15.0°)" }}], title: "" }},
+  "sel-galaxy-h5": {{ selectedIndex: 0, options: [{{ value: "h1", textContent: "solve.h5" }}], title: "" }},
+  "app-title": {{ title: "" }},
+  "app-version": {{ textContent: "v0.4.0", title: "" }},
+  "btn-zone-arcs": {{ title: "" }},
+  "btn-heatmap-cmap": {{ title: "" }},
+  "btn-stereo-toggle": {{ title: "" }},
+}};
+const subTag = {{ textContent: "MANDI • I a -3 d • INTEGRATED • 3D TENSOR ELLIPSES", title: "" }};
+globalThis.document = {{
+  getElementById: (id) => els[id] || null,
+  querySelector: (sel) => sel === ".subtitle-tag" ? subTag : null,
+}};
+const DATA = {{
+  cell: [11.93, 11.93, 11.93, 90, 90, 90],
+  frames: [{{ motor_summary: "ω=15.0°, χ=45.0°, φ=120.0°" }}],
+  frame_index: 0,
+}};
+const state = {{
+  peakSource: "predicted",
+  lamMin: 1.0,
+  lamMax: 3.0,
+  dMin: 1.0,
+  activeZones: new Set([1, 2, 3]),
+  maxZoneOrder: 1,
+  showZoneArcs: true,
+  heatmapStyle: "magma",
+  showStereo: true,
+}};
+const PEAKS = [
+  {{ indexed: true, peak_source: "predicted", angular_error_deg: 0.08, has_angular_error: true, zone_ids: [1] }},
+  {{ indexed: true, peak_source: "predicted", angular_error_deg: 0.0, has_angular_error: false, zone_ids: [1] }},
+  {{ indexed: true, peak_source: "predicted", angular_error_deg: 0.06, has_angular_error: true, zone_ids: [] }},
+];
+function isPeakVisible() {{ return true; }}
+function isPeakCapturedByActiveZone(p) {{ return (p.zone_ids || []).length > 0; }}
+function drawHistogram() {{}}
+function fitHorizontalBars() {{}}
+{"\n".join(fn_extract)}
+updateHUD();
+console.log(JSON.stringify({{
+  indexed: els["val-indexed"].textContent,
+  rms: els["val-rms"].textContent,
+  peaksTip: els["hud-peaks-pill"].title,
+  rmsTip: els["hud-rms-pill"].title,
+  gonioTip: els["hud-gonio-pill"].title,
+  frameTip: els["sel-frame"].title,
+  subTip: subTag.title,
+}}));
+"""
+        proc = subprocess.run(
+            ["node", "-e", node_script], check=True, capture_output=True, text=True
+        )
+        res = json.loads(proc.stdout.strip())
+        assert res["indexed"] == "2 / 3 (66.7%)"
+        # Unobserved predicted peak (has_angular_error: false) does NOT dilute 0.080° down to 0.057°!
+        assert res["rms"] == "0.080°"
+        assert "2 indexed reflections captured by enabled Laue zones" in res["peaksTip"]
+        assert "out of 3 visible predicted reflections" in res["peaksTip"]
+        assert "across 1 matched detector spots" in res["rmsTip"]
+        assert "ω=15.0°, χ=45.0°, φ=120.0°" in res["gonioTip"]
+        assert "MANDI_12737.nxs.h5" in res["frameTip"]
+        assert "MANDI • I a -3 d • INTEGRATED" in res["subTip"]
+
+
+def test_tmpdir_exit_cleanup_removes_app_artifacts_safely(tmp_path) -> None:
+    """Verify TMPDIR workspaces/caches/uploads are cleaned at normal exit and SIGTERM without touching external or unregistered files."""
+    import os
+    import signal
+    import subprocess
+    import sys
+    import tempfile
+
+    from subhkl.viz.nova_rainbow_view import (
+        NovaGalaxyPipelineRunner,
+        cleanup_registered_temp_artifacts,
+        register_temp_artifact,
+    )
+
+    isolated_tmp = tmp_path / "app_tmp"
+    outside_dir = tmp_path / "user_data"
+    isolated_tmp.mkdir()
+    outside_dir.mkdir()
+    outside_file = outside_dir / "precious.h5"
+    outside_file.write_bytes(b"keep")
+    unregistered_tmp_file = isolated_tmp / "other_process.txt"
+    unregistered_tmp_file.write_text("keep", encoding="utf-8")
+
+    orig_tempdir = tempfile.tempdir
+    try:
+        tempfile.tempdir = str(isolated_tmp)
+        # Never track TMPDIR root itself or paths outside TMPDIR
+        assert register_temp_artifact(isolated_tmp) is None
+        assert register_temp_artifact(outside_file) is None
+        assert register_temp_artifact(outside_dir) is None
+
+        runner = NovaGalaxyPipelineRunner(galaxy_url="", galaxy_api_key="")
+        work_d, _ = runner._work_dir_for_reduce(
+            ["/SNS/MANDI/MANDI_12737.nxs.h5"], str(isolated_tmp)
+        )
+        (tmp_path / "dummy").touch()
+        with open(os.path.join(work_d, "merged.h5"), "wb") as fh:
+            fh.write(b"h5")
+        gx_cache = isolated_tmp / "subhkl_gx_deadbeef_solve.h5"
+        gx_cache.write_bytes(b"gx")
+        assert register_temp_artifact(gx_cache) == str(gx_cache)
+
+        removed = cleanup_registered_temp_artifacts()
+        assert os.path.abspath(work_d) in removed
+        assert str(gx_cache) in removed
+        assert not os.path.exists(work_d)
+        assert not gx_cache.exists()
+        assert outside_file.exists()
+        assert unregistered_tmp_file.exists()
+    finally:
+        tempfile.tempdir = orig_tempdir
+
+    # Subprocess exit test 1: normal interpreter exit triggers atexit TMPDIR cleanup
+    sub_tmp_1 = tmp_path / "sub_tmp_atexit"
+    sub_tmp_1.mkdir()
+    env_1 = dict(os.environ, TMPDIR=str(sub_tmp_1))
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, pathlib; "
+                "from subhkl.viz.nova_rainbow_view import NovaGalaxyPipelineRunner, register_temp_artifact; "
+                "r = NovaGalaxyPipelineRunner(galaxy_url='', galaxy_api_key=''); "
+                "wd, _ = r._work_dir_for_reduce(['MANDI_1.nxs.h5'], os.environ['TMPDIR']); "
+                "pathlib.Path(wd, 'merged.h5').write_bytes(b'123'); "
+                "up = pathlib.Path(os.environ['TMPDIR']) / 'subhkl_upload_1'; up.mkdir(); "
+                "register_temp_artifact(up)"
+            ),
+        ],
+        env=env_1,
+        check=True,
+    )
+    assert list(sub_tmp_1.iterdir()) == []
+
+    # Subprocess exit test 2: SIGTERM triggers signal-handler TMPDIR cleanup
+    sub_tmp_2 = tmp_path / "sub_tmp_sigterm"
+    sub_tmp_2.mkdir()
+    env_2 = dict(os.environ, TMPDIR=str(sub_tmp_2))
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-u",
+            "-c",
+            (
+                "import os, pathlib, time; "
+                "from subhkl.viz.nova_rainbow_view import install_exit_cleanup_signal_handlers, register_temp_artifact; "
+                "install_exit_cleanup_signal_handlers(); "
+                "wd = pathlib.Path(os.environ['TMPDIR']) / 'subhkl_work_sigterm'; wd.mkdir(); "
+                "(wd / 'solve.h5').write_bytes(b'abc'); "
+                "register_temp_artifact(wd); "
+                "print('READY', flush=True); "
+                "time.sleep(30)"
+            ),
+        ],
+        env=env_2,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+    assert proc.stdout.readline().strip() == "READY"
+    assert (sub_tmp_2 / "subhkl_work_sigterm" / "solve.h5").is_file()
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=10)
+    assert list(sub_tmp_2.iterdir()) == []

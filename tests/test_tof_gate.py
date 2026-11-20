@@ -275,3 +275,16 @@ def test_write_events_roundtrip(tmp_path):
             tof, offsets = store.image_events(i, images[i])
             np.testing.assert_array_equal(tof, tofs[i])
             assert offsets[-1] == len(tofs[i])
+
+
+def test_wavelength_band_follows_the_predictions():
+    """The band comes from the predictions, not from the images file, and
+    always holds every predicted wavelength."""
+    from subhkl.search.tof_gate import wavelength_band
+
+    predicted = np.array([1.05, 1.8, 2.9])
+    # Predicted in 1-3 A while the images file still says 2-4 A.
+    assert wavelength_band(predicted, (1.0, 3.0), (2.0, 4.0)) == (1.0, 3.0)
+    # No band with the predictions: the images band, widened to hold them.
+    assert wavelength_band(predicted, None, (2.0, 4.0)) == (1.05, 4.0)
+    assert wavelength_band(predicted, None, None) == (1.05, 2.9)

@@ -1,5 +1,6 @@
 """Single-crystal discovery by band search, shared geometry, and full-data ranking."""
 
+import contextlib
 import time
 from pathlib import Path
 
@@ -580,13 +581,72 @@ def discover(args, samples=16384, candidates=6, seed=0):
             axis=-1,
         )
 
+    def _emit_blind_live_stdio(
+        stage_label: str,
+        nz_val: int,
+        u_cand: np.ndarray,
+        geom_fit: dict | None = None,
+    ) -> None:
+        import os as _os
+
+        if (
+            _os.environ.get("SUBHKL_LIVE_STDIO") != "1"
+            and "PYTEST_CURRENT_TEST" in _os.environ
+        ):
+            return
+        import base64
+        import json as _json
+        import zlib
+
+        live_doc: dict = {
+            "kind": "blind",
+            "instrument": str(args.instrument),
+            "space_group": str(args.space_group),
+            "wavelength": [float(args.wl_min), float(args.wl_max)],
+            "d_min": float(args.d_min),
+            "stage": str(stage_label),
+            "n_zones": int(nz_val),
+            "cell": [round(float(x), 5) for x in args.cell[:6]],
+            "U": np.round(np.asarray(u_cand, dtype=float), 6).tolist(),
+            "B": np.round(np.asarray(B, dtype=float), 6).tolist(),
+        }
+        if geom_fit is not None:
+            live_doc["radial_scale"] = round(
+                float(geom_fit.get("radial_scale", 0.0)), 6
+            )
+            live_doc["axial_scale"] = round(
+                float(geom_fit.get("axial_scale", geom_fit.get("radial_scale", 0.0))),
+                6,
+            )
+            live_doc["global_rot_vec"] = [
+                round(float(x), 6)
+                for x in np.asarray(
+                    geom_fit.get("global_rot_vec", np.zeros(3)),
+                    dtype=float,
+                ).ravel()[:3]
+            ]
+            live_doc["global_trans_m"] = [
+                round(float(x), 6)
+                for x in np.asarray(
+                    geom_fit.get("global_trans_m", np.zeros(3)),
+                    dtype=float,
+                ).ravel()[:3]
+            ]
+        b64 = base64.b64encode(
+            zlib.compress(
+                _json.dumps(live_doc, separators=(",", ":")).encode("utf-8"),
+                level=9,
+            )
+        ).decode("ascii")
+        print(f"[subhkl-live-state] {b64}", flush=True)
+
     def _write_blind_rung(
         stage_label: str,
         nz_val: int,
         u_cand: np.ndarray,
         geom_fit: dict | None = None,
     ) -> None:
-        tmp_path = blind_path.with_suffix(".blind.tmp.h5")
+        tmp_path = blind_path.with_suffix(".blind.rung.tmp.h5")
         try:
             with h5py.File(tmp_path, "w") as bf:
                 bf.attrs["instrument"] = str(args.instrument)
@@ -645,61 +705,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
                 sg.attrs["ladder_stage"] = str(stage_label)
                 sg.attrs["ladder_zones"] = int(nz_val)
             tmp_path.replace(blind_path)
-            import os as _os
-
-            if (
-                _os.environ.get("SUBHKL_LIVE_STDIO") == "1"
-                or "PYTEST_CURRENT_TEST" not in _os.environ
-            ):
-                import base64
-                import json as _json
-                import zlib
-
-                live_doc: dict = {
-                    "kind": "blind",
-                    "instrument": str(args.instrument),
-                    "space_group": str(args.space_group),
-                    "wavelength": [float(args.wl_min), float(args.wl_max)],
-                    "d_min": float(args.d_min),
-                    "stage": str(stage_label),
-                    "n_zones": int(nz_val),
-                    "cell": [round(float(x), 5) for x in args.cell[:6]],
-                    "U": np.round(np.asarray(u_cand, dtype=float), 6).tolist(),
-                    "B": np.round(np.asarray(B, dtype=float), 6).tolist(),
-                }
-                if geom_fit is not None:
-                    live_doc["radial_scale"] = round(
-                        float(geom_fit.get("radial_scale", 0.0)), 6
-                    )
-                    live_doc["axial_scale"] = round(
-                        float(
-                            geom_fit.get(
-                                "axial_scale", geom_fit.get("radial_scale", 0.0)
-                            )
-                        ),
-                        6,
-                    )
-                    live_doc["global_rot_vec"] = [
-                        round(float(x), 6)
-                        for x in np.asarray(
-                            geom_fit.get("global_rot_vec", np.zeros(3)),
-                            dtype=float,
-                        ).ravel()[:3]
-                    ]
-                    live_doc["global_trans_m"] = [
-                        round(float(x), 6)
-                        for x in np.asarray(
-                            geom_fit.get("global_trans_m", np.zeros(3)),
-                            dtype=float,
-                        ).ravel()[:3]
-                    ]
-                b64 = base64.b64encode(
-                    zlib.compress(
-                        _json.dumps(live_doc, separators=(",", ":")).encode("utf-8"),
-                        level=9,
-                    )
-                ).decode("ascii")
-                print(f"[subhkl-live-state] {b64}", flush=True)
+            _emit_blind_live_stdio(stage_label, nz_val, u_cand, geom_fit=geom_fit)
         except (
             OSError,
             RuntimeError,
@@ -816,6 +822,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
     )
     if not found:
         raise ValueError("blind band search found no orientation candidates")
+    _write_blind_rung("coarse_so3", 24, found[0][0])
     print(
         f"Joint band refinement of {len(found)} distinct blind candidates", flush=True
     )
@@ -1124,7 +1131,7 @@ def discover(args, samples=16384, candidates=6, seed=0):
         ]
     selected = int(np.argmax(scores))
     path = Path(args.output).with_suffix(".blind.h5")
-    tmp_final = path.with_suffix(".blind.tmp.h5")
+    tmp_final = path.with_suffix(".blind.final.tmp.h5")
     with h5py.File(tmp_final, "w") as f:
         f.attrs["instrument"] = str(args.instrument)
         f["sample/U"] = U_shared[selected]
@@ -1199,7 +1206,15 @@ def discover(args, samples=16384, candidates=6, seed=0):
         g.attrs["instrument"] = str(args.instrument)
         g.attrs["finder"] = str(args.finder or "")
         g.attrs["weighting"] = weighting_desc
+        g.attrs["ladder_stage"] = "blind_selected"
+        g.attrs["ladder_zones"] = 60
     tmp_final.replace(path)
+    with contextlib.suppress(
+        OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+    ):
+        _emit_blind_live_stdio(
+            "blind_selected", 60, U_shared[selected], geom_fit=geometry
+        )
     print(
         f"Full-data scores under common geometry: {scores}; selected {selected}",
         flush=True,

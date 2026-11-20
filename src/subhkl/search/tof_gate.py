@@ -103,6 +103,30 @@ def predicted_tof(wavelength, l1, l2):
     return np.asarray(wavelength, dtype=np.float64) * (l1 + l2) / ANGSTROM_M_PER_US
 
 
+def wavelength_band(predicted, peaks_band=None, images_band=None):
+    """[Angstrom] (min, max) of the band the gates and sidebands may use.
+
+    The band the reflections were predicted in is the one that counts: the
+    images file only records the instrument default from reduce time, which
+    is wrong whenever the choppers ran a different band.  Whatever its
+    source, the band is widened to hold every predicted wavelength, so a
+    stale band can never rule a predicted reflection out.
+
+    Args:
+        predicted: [Angstrom] wavelengths of the predicted reflections
+        peaks_band: (min, max) stored with the predictions, or None
+        images_band: (min, max) stored with the images, or None
+    """
+    predicted = np.asarray(predicted, dtype=np.float64)
+    band = peaks_band if peaks_band is not None else images_band
+    if band is None:
+        return float(predicted.min()), float(predicted.max())
+    return (
+        min(float(band[0]), float(predicted.min())),
+        max(float(band[1]), float(predicted.max())),
+    )
+
+
 def parse_gate(spec):
     """'auto' -> None, 'lo,hi' -> TofGate with relative edges."""
     if spec is None or isinstance(spec, TofGate):

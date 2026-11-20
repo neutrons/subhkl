@@ -14,12 +14,14 @@ Supports three execution modes for NDIP / Galaxy / NOVA and local beamline works
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import http.server
 import json
 import os
 import re
 import shutil
+import signal
 import socketserver
 import subprocess
 import tempfile
@@ -28,6 +30,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from datetime import UTC
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
@@ -60,6 +63,115 @@ _NOVA_RECOVERABLE_ERRORS = (
     ImportError,
     ArithmeticError,
 )
+
+_TEMP_CLEANUP_LOCK = threading.Lock()
+_REGISTERED_TEMP_PATHS: dict[str, str] = {}
+_ATEXIT_CLEANUP_REGISTERED = False
+_SIGNAL_CLEANUP_INSTALLED = False
+
+
+def _is_strictly_inside_root(path_str: str, root_str: str) -> bool:
+    """Return True only if path_str is a strict descendant of root_str."""
+    if not path_str or not root_str:
+        return False
+    abs_p = os.path.abspath(path_str)
+    abs_r = os.path.abspath(root_str)
+    if abs_p == abs_r:
+        return False
+    try:
+        if os.path.commonpath([abs_p, abs_r]) != abs_r:
+            return False
+        real_parent = os.path.realpath(os.path.dirname(abs_p))
+        real_r = os.path.realpath(abs_r)
+        return os.path.commonpath([real_parent, real_r]) == real_r
+    except (ValueError, OSError):
+        return False
+
+
+def register_temp_artifact(path: str | os.PathLike[str] | None) -> str | None:
+    """Track an app-created file or directory inside TMPDIR for removal at process exit."""
+    global _ATEXIT_CLEANUP_REGISTERED
+    if not path:
+        return None
+    abs_p = os.path.abspath(os.fspath(path))
+    tmp_root = os.path.abspath(tempfile.gettempdir())
+    if not _is_strictly_inside_root(abs_p, tmp_root):
+        return None
+    with _TEMP_CLEANUP_LOCK:
+        _REGISTERED_TEMP_PATHS[abs_p] = tmp_root
+        if not _ATEXIT_CLEANUP_REGISTERED:
+            atexit.register(cleanup_registered_temp_artifacts)
+            _ATEXIT_CLEANUP_REGISTERED = True
+    return abs_p
+
+
+def _remove_temp_artifact_now(path: str | os.PathLike[str] | None) -> bool:
+    """Immediately delete a single tracked TMPDIR file or directory if safe."""
+    if not path:
+        return False
+    abs_p = os.path.abspath(os.fspath(path))
+    with _TEMP_CLEANUP_LOCK:
+        recorded_root = _REGISTERED_TEMP_PATHS.pop(abs_p, None)
+    tmp_root = recorded_root or os.path.abspath(tempfile.gettempdir())
+    if not _is_strictly_inside_root(abs_p, tmp_root):
+        return False
+    with contextlib.suppress(OSError):
+        if os.path.islink(abs_p) or os.path.isfile(abs_p):
+            os.unlink(abs_p)
+            return True
+        if os.path.isdir(abs_p):
+            shutil.rmtree(abs_p, ignore_errors=True)
+            return not os.path.exists(abs_p)
+    return False
+
+
+def cleanup_registered_temp_artifacts() -> list[str]:
+    """Remove all tracked TMPDIR files and directories created during this process."""
+    with _TEMP_CLEANUP_LOCK:
+        items = list(_REGISTERED_TEMP_PATHS.items())
+        _REGISTERED_TEMP_PATHS.clear()
+    removed: list[str] = []
+    for abs_p, tmp_root in sorted(items, key=lambda kv: len(kv[0]), reverse=True):
+        if not _is_strictly_inside_root(abs_p, tmp_root):
+            continue
+        with contextlib.suppress(OSError):
+            if os.path.islink(abs_p) or os.path.isfile(abs_p):
+                os.unlink(abs_p)
+                removed.append(abs_p)
+            elif os.path.isdir(abs_p):
+                shutil.rmtree(abs_p, ignore_errors=True)
+                if not os.path.exists(abs_p):
+                    removed.append(abs_p)
+    return removed
+
+
+def install_exit_cleanup_signal_handlers(
+    on_shutdown: Callable[[], None] | None = None,
+) -> None:
+    """Ensure SIGTERM cleanly triggers active-job cancellation and TMPDIR cleanup."""
+    global _SIGNAL_CLEANUP_INSTALLED
+    if threading.current_thread() is not threading.main_thread():
+        return
+    with _TEMP_CLEANUP_LOCK:
+        if _SIGNAL_CLEANUP_INSTALLED:
+            return
+        _SIGNAL_CLEANUP_INSTALLED = True
+    prev_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def _handle_sigterm(signum: int, frame: Any) -> None:
+        if callable(on_shutdown):
+            with contextlib.suppress(Exception):
+                on_shutdown()
+        cleanup_registered_temp_artifacts()
+        if callable(prev_sigterm) and prev_sigterm not in (
+            signal.SIG_DFL,
+            signal.SIG_IGN,
+        ):
+            prev_sigterm(signum, frame)
+        raise SystemExit(128 + signum)
+
+    with contextlib.suppress(OSError, ValueError):
+        signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
 class NovaGalaxyPipelineRunner:
@@ -344,6 +456,52 @@ class NovaGalaxyPipelineRunner:
                     if raw_dmin_live is not None and raw_dmin_live > 0
                     else None
                 )
+                partial_mtime_ns = int(os.stat(partial_h5).st_mtime_ns)
+                prev_ov = aj.get("partial_overlay")
+                if (
+                    isinstance(prev_ov, dict)
+                    and prev_ov.get("mtime_ns") == partial_mtime_ns
+                    and prev_ov.get("frame_index") == target_frame
+                    and prev_ov.get("zones")
+                ):
+                    payload["zones"] = prev_ov["zones"]
+                    if prev_ov.get("peaks"):
+                        payload["peaks"] = prev_ov["peaks"]
+                    if prev_ov.get("sample_peaks"):
+                        payload["sample_peaks"] = prev_ov["sample_peaks"]
+                    if prev_ov.get("panels") and payload.get("panels"):
+                        p_by_b = {
+                            int(p["bank"]): p for p in prev_ov["panels"] if "bank" in p
+                        }
+                        for cur_p in payload["panels"]:
+                            upd_p = p_by_b.get(int(cur_p.get("bank", -1)))
+                            if upd_p:
+                                for k_g in (
+                                    "az_min",
+                                    "az_max",
+                                    "y_min",
+                                    "y_max",
+                                    "el_min",
+                                    "el_max",
+                                    "corners",
+                                    "corners_sph",
+                                    "outline",
+                                    "outline_sph",
+                                    "mesh",
+                                    "mesh_sph",
+                                ):
+                                    if k_g in upd_p:
+                                        cur_p[k_g] = upd_p[k_g]
+                    if prev_ov.get("cell"):
+                        payload["cell"] = prev_ov["cell"]
+                    if prev_ov.get("ub_matrix"):
+                        payload["ub_matrix"] = prev_ov["ub_matrix"]
+                    if prev_ov.get("goniometer_R"):
+                        payload["goniometer_R"] = prev_ov["goniometer_R"]
+                    if prev_ov.get("ladder_steps"):
+                        payload["ladder_steps"] = prev_ov["ladder_steps"]
+                    payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
+                    return payload
                 p_blind = build_rainbow_zone_payload(
                     replay_h5=partial_h5,
                     images_h5=(
@@ -409,19 +567,14 @@ class NovaGalaxyPipelineRunner:
                     if p_blind.get("ladder_steps"):
                         payload["ladder_steps"] = p_blind["ladder_steps"]
                     payload["active_rung_idx"] = int(aj.get("ladder_rung_idx") or 1)
-                    prev_ov = aj.get("partial_overlay")
                     next_seq = (
                         int(prev_ov.get("seq", 0)) + 1
                         if isinstance(prev_ov, dict)
-                        and prev_ov.get("frame_index") != target_frame
-                        else (
-                            int(prev_ov.get("seq", 1))
-                            if isinstance(prev_ov, dict)
-                            else 1
-                        )
+                        else 1
                     )
                     aj["partial_overlay"] = {
                         "seq": next_seq,
+                        "mtime_ns": partial_mtime_ns,
                         "frame_index": target_frame,
                         "zones": p_blind.get("zones", []),
                         "peaks": p_blind.get("peaks", []),
@@ -626,10 +779,15 @@ class NovaGalaxyPipelineRunner:
                         bg["height"] = float(b_info["height"])
                 elif (
                     "radial_scale" in doc
+                    or "axial_scale" in doc
                     or "global_rot_vec" in doc
                     or "global_trans_m" in doc
                 ) and inst in beamlines:
                     r_sc = float(doc.get("radial_scale", 0.0))
+                    ax_sc = float(doc.get("axial_scale", r_sc))
+                    scale_vec = np.array(
+                        [1.0 + r_sc, 1.0 + ax_sc, 1.0 + r_sc], dtype=float
+                    )
                     r_vec = np.asarray(
                         doc.get("global_rot_vec", [0.0, 0.0, 0.0]), dtype=float
                     )
@@ -649,7 +807,7 @@ class NovaGalaxyPipelineRunner:
                             + 0.5 * det_b.width * det_b.uhat
                             + 0.5 * det_b.height * det_b.vhat
                         )
-                        mid_cal = mid_b * (1.0 + r_sc) @ rot_m.T + t_vec
+                        mid_cal = (mid_b * scale_vec) @ rot_m.T + t_vec
                         uh_cal = det_b.uhat @ rot_m.T
                         vh_cal = det_b.vhat @ rot_m.T
                         cen_cal = (
@@ -1451,6 +1609,7 @@ class NovaGalaxyPipelineRunner:
         if not safe_name.endswith((".h5", ".hdf5", ".mtz", ".json", ".nxs")):
             safe_name += ".h5"
         tmp_dest = os.path.join(tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}")
+        register_temp_artifact(tmp_dest)
         if os.path.isfile(tmp_dest) and os.path.getsize(tmp_dest) > 0:
             return _remember(tmp_dest), info
         n_dl = self._download_dataset_to_file(
@@ -1788,6 +1947,8 @@ class NovaGalaxyPipelineRunner:
         for odir in out_dirs:
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 os.makedirs(odir, exist_ok=True)
+                if os.path.abspath(odir) == os.path.abspath(fallback_tmp):
+                    register_temp_artifact(odir)
                 p_csv = os.path.join(odir, "merge_table.csv")
                 p_html = os.path.join(odir, "merge_table.html")
                 if force or not os.path.isfile(p_csv) or os.path.getsize(p_csv) == 0:
@@ -1860,6 +2021,7 @@ class NovaGalaxyPipelineRunner:
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
         work_d = os.path.join(tempfile.gettempdir(), f"subhkl_work_{safe_tag}")
         os.makedirs(work_d, exist_ok=True)
+        register_temp_artifact(work_d)
         return work_d, f"{safe_tag}_merged.h5"
 
     def _resolve_work_dir_and_merged(self, merged_path: str) -> tuple[str, str]:
@@ -1879,6 +2041,8 @@ class NovaGalaxyPipelineRunner:
             return parent_d, abs_m
 
         m_gx = _re.match(r"^subhkl_gx_([0-9a-fA-F]+)_(.+)$", orig_bn)
+        if m_gx and parent_d == tmp_root:
+            register_temp_artifact(abs_m)
         gx_ds_id = m_gx.group(1) if m_gx else None
         clean_bn = m_gx.group(2) if m_gx else orig_bn
 
@@ -1915,6 +2079,7 @@ class NovaGalaxyPipelineRunner:
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
         work_d = os.path.join(tmp_root, f"subhkl_work_{safe_tag}")
         os.makedirs(work_d, exist_ok=True)
+        register_temp_artifact(work_d)
         dest_name = (
             clean_bn
             if clean_bn.lower().endswith("_merged.h5")
@@ -2185,6 +2350,40 @@ class NovaGalaxyPipelineRunner:
             if isinstance(doc, dict):
                 return str(doc.get("version") or "")
         return ""
+
+    def _resolve_careless_merge_mode(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        work_dir: str = "",
+        merged_path: str = "",
+        solve_path: str = "",
+        integrated_path: str = "",
+    ) -> str:
+        """Choose ``'mono'`` whenever TOF data is available in workflow artifacts, else ``'poly'``."""
+        from subhkl.viz.rainbow_zones import _h5_has_tof_data
+
+        pdict = params or {}
+        if _h5_has_tof_data(
+            integrated_path,
+            os.path.join(work_dir, "integrated.h5") if work_dir else None,
+            os.path.join(work_dir, "integrator.h5") if work_dir else None,
+            pdict.get("peaks_file"),
+            pdict.get("images_file"),
+            merged_path,
+            os.path.join(work_dir, "merged.h5") if work_dir else None,
+            solve_path,
+            getattr(self, "replay_h5", None),
+        ):
+            return "mono"
+        if bool(pdict.get("has_tof_data")):
+            return "mono"
+        explicit = (
+            str(pdict.get("merge_mode") or pdict.get("mode") or "").strip().lower()
+        )
+        if explicit in ("mono", "poly"):
+            return explicit
+        return "poly"
 
     def submit_galaxy_stage(
         self,
@@ -3057,6 +3256,7 @@ class NovaGalaxyPipelineRunner:
             cache_dest = os.path.join(
                 tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}"
             )
+            register_temp_artifact(cache_dest)
             if os.path.isfile(local_path) and not os.path.exists(cache_dest):
                 try:
                     os.link(local_path, cache_dest)
@@ -3505,8 +3705,21 @@ class NovaGalaxyPipelineRunner:
                     force_upload=True,
                     file_ext="mtz",
                 )
+                merge_mode = self._resolve_careless_merge_mode(
+                    params,
+                    work_dir=work_dir,
+                    merged_path=merged_path,
+                    solve_path=solve_path,
+                )
+                if merge_mode == "mono":
+                    _merge_ver = self._get_tool_version("imaginex_subhkl_merge")
+                    if _merge_ver in ("0.1.0", "0.1.0-dev", "0.1.1", "0.1.2"):
+                        raise RuntimeError(
+                            f"imaginex_subhkl_merge {_merge_ver} on {self.galaxy_url} lacks monochromatic ('mono') mode for TOF data"
+                        )
                 tool_inputs = {
                     "reflections": {"src": "hda", "id": mtz_id},
+                    "mode": merge_mode,
                     "iterations": int(params.get("iterations") or 10000),
                     "studenttDof": float(params.get("studentt_dof") or 4.0),
                     "mergeHalfDatasets": True,
@@ -5370,6 +5583,19 @@ class NovaGalaxyPipelineRunner:
         pred_tmp_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_pred_{ts}.h5")
         mtz_tmp_path = os.path.join(tempfile.gettempdir(), f"subhkl_refl_{ts}.mtz")
         reduce_tmp_dir = os.path.join(tempfile.gettempdir(), f"subhkl_reduce_{ts}")
+        job_stage_temps = [
+            out_h5,
+            out_h5[:-3] + ".blind.h5",
+            out_h5[:-3] + ".stages.h5",
+            out_h5[:-3] + ".blind.rung.tmp.h5",
+            out_h5[:-3] + ".blind.final.tmp.h5",
+            out_h5[:-3] + ".stages.tmp.h5",
+            pred_tmp_h5,
+            mtz_tmp_path,
+            reduce_tmp_dir,
+        ]
+        for _tmp_item in job_stage_temps:
+            register_temp_artifact(_tmp_item)
         raw_nxs_local: list[str] = []
         merged_label = "merged.h5"
         if stage_id == "reduce":
@@ -5671,20 +5897,25 @@ class NovaGalaxyPipelineRunner:
             )
             inner_cmd = ["bash", "-c", chained]
         elif stage_id == "merge":
+            replay_src = getattr(self, "replay_h5", None)
             if not os.path.isfile(mtz_dest):
-                alt_mtz = os.path.join(
-                    os.path.dirname(os.path.abspath(self.replay_h5)),
-                    "reflections.mtz",
+                alt_mtz = (
+                    os.path.join(
+                        os.path.dirname(os.path.abspath(replay_src)),
+                        "reflections.mtz",
+                    )
+                    if replay_src
+                    else ""
                 )
-                if os.path.isfile(alt_mtz):
+                if alt_mtz and os.path.isfile(alt_mtz):
                     shutil.copy2(alt_mtz, mtz_dest)
                 else:
                     src_int = (
                         integrated_dest
                         if os.path.isfile(integrated_dest)
-                        else self.replay_h5
+                        else (replay_src or "")
                     )
-                    if os.path.isfile(src_int):
+                    if src_int and os.path.isfile(src_int):
                         with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                             from subhkl.io.export import MTZExporter
 
@@ -5701,9 +5932,21 @@ class NovaGalaxyPipelineRunner:
                             exp.write_mtz(mtz_dest)
             careless_iters = int(params.get("iterations") or 10000)
             studentt_dof = float(params.get("studentt_dof") or 4.0)
-            wilson_b = float(params.get("wilson_prior_b") or 40.0)
+            raw_wilson_b = params.get("wilson_prior_b")
+            wilson_b = (
+                float(raw_wilson_b)
+                if raw_wilson_b is not None and str(raw_wilson_b).strip() != ""
+                else None
+            )
             spectral_file = str(params.get("spectral_file") or "").strip()
             lorentz_corr = bool(params.get("lorentz_correction", bool(spectral_file)))
+            merge_mode = self._resolve_careless_merge_mode(
+                params,
+                work_dir=work_dir,
+                merged_path=merged_path,
+                solve_path=solve_path,
+                integrated_path=integrated_dest,
+            )
             merge_work = os.path.join(work_dir, "careless_work")
             os.makedirs(merge_work, exist_ok=True)
             unmerged_mtz = os.path.join(merge_work, "input_unmerged.mtz")
@@ -5748,7 +5991,7 @@ class NovaGalaxyPipelineRunner:
                 f"shutil.copy2({(out_prefix + '_predictions_0.mtz')!r}, {pred_mtz_out!r})\n"
                 f"if os.path.exists({(out_prefix + '_xval_0.mtz')!r}):\n"
                 f"    shutil.copy2({(out_prefix + '_xval_0.mtz')!r}, {xval_mtz_out!r})\n"
-                "summary = {'status': 'ok'}\n"
+                f"summary = {{'status': 'ok', 'mode': {merge_mode!r}}}\n"
                 f"mtz = gemmi.read_mtz_file({merged_mtz_out!r})\n"
                 "cols = {c.label: np.array(c, dtype=np.float64) for c in mtz.columns}\n"
                 "I = cols.get('I', cols.get('I(+)', np.array([])))\n"
@@ -5815,8 +6058,9 @@ class NovaGalaxyPipelineRunner:
                 os.chmod(post_script, 0o666)
             careless_extra_flags = [
                 "--disable-image-scales",
-                f"--wilson-prior-b={wilson_b}",
             ]
+            if wilson_b is not None:
+                careless_extra_flags.append(f"--wilson-prior-b={wilson_b}")
             if spectral_file and os.path.isfile(spectral_file):
                 careless_extra_flags.extend(
                     [
@@ -5829,10 +6073,11 @@ class NovaGalaxyPipelineRunner:
             elif lorentz_corr:
                 careless_extra_flags.append("--lorentz-correction")
             extra_flags_str = " ".join(careless_extra_flags)
+            wavel_key_flag = "--wavelength-key=WAVEL " if merge_mode == "poly" else ""
             chained_merge = (
                 f"set -e; "
                 f"MKEYS=$(python {shlex.quote(prep_script)}) && "
-                f'careless poly --jit-compile --iterations={careless_iters} --merge-half-datasets --wavelength-key=WAVEL --studentt-likelihood-dof={studentt_dof} {extra_flags_str} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
+                f'careless {merge_mode} --jit-compile --iterations={careless_iters} --merge-half-datasets {wavel_key_flag}--studentt-likelihood-dof={studentt_dof} {extra_flags_str} "$MKEYS" {shlex.quote(unmerged_mtz)} {shlex.quote(out_prefix)} && '
                 f"python {shlex.quote(post_script)}"
             )
             inner_cmd = ["bash", "-c", chained_merge]
@@ -6182,6 +6427,7 @@ class NovaGalaxyPipelineRunner:
                                             ),
                                         }
                 rc = proc.wait()
+                final_h5: str | None = None
                 if rc == 0 and not job_record.get("cancel_requested"):
                     job_record["ladder_rung_idx"] = 0 if stage_id == "reduce" else 4
                     final_h5 = out_h5
@@ -6441,6 +6687,17 @@ class NovaGalaxyPipelineRunner:
                 self._sync_job_timing(job_record)
                 if job_record.get("cancel_requested") and container_name:
                     self._terminate_local_container_or_proc(container_name, proc)
+                # Remove transient per-job staging artifacts in TMPDIR once copied to work_dir
+                # (keeping final_h5 until process exit only if copy fallback left final_h5 == out_h5).
+                keep_abs = (
+                    os.path.abspath(final_h5)
+                    if isinstance(locals().get("final_h5"), str) and final_h5
+                    else ""
+                )
+                for _tmp_item in job_stage_temps:
+                    if keep_abs and os.path.abspath(_tmp_item) == keep_abs:
+                        continue
+                    _remove_temp_artifact_now(_tmp_item)
                 if hasattr(self, "_active_procs"):
                     self._active_procs.pop(job_id, None)
                 if getattr(self, "_active_proc", None) is proc:
@@ -6597,6 +6854,7 @@ class NovaGalaxyPipelineRunner:
                                     work_dir or tempfile.gettempdir(),
                                     "solve.blind.h5",
                                 )
+                                register_temp_artifact(blind_dst)
                                 if self._materialize_live_state_h5(
                                     last_live_token, blind_dst
                                 ):
@@ -6703,6 +6961,7 @@ class NovaGalaxyPipelineRunner:
                                     tempfile.gettempdir(),
                                     f"subhkl_gx_{ds_id}_{merged_label}",
                                 )
+                                register_temp_artifact(cache_gx_path)
                                 dl_dest = target_path
                                 created_temp = False
                                 if not dl_dest:
@@ -6710,6 +6969,7 @@ class NovaGalaxyPipelineRunner:
                                         suffix=".h5", prefix="galaxy_solve_"
                                     )
                                     os.close(fd)
+                                    register_temp_artifact(dl_dest)
                                     created_temp = True
                                 n_synced = 0
                                 for attempt in range(6):
@@ -7935,11 +8195,14 @@ def serve_rainbow_zones(
                 ctype = self.headers.get("Content-Type", "")
                 raw_body = self.rfile.read(content_len) if content_len > 0 else b""
                 try:
-                    fb_dir = (
-                        os.path.dirname(os.path.abspath(vm.replay_h5))
-                        if vm.replay_h5 and os.path.isfile(vm.replay_h5)
-                        else tempfile.gettempdir()
-                    )
+                    if vm.replay_h5 and os.path.isfile(vm.replay_h5):
+                        fb_dir = os.path.dirname(os.path.abspath(vm.replay_h5))
+                    else:
+                        fb_dir = os.path.join(
+                            tempfile.gettempdir(), f"subhkl_upload_{int(time.time())}"
+                        )
+                        os.makedirs(fb_dir, exist_ok=True)
+                        register_temp_artifact(fb_dir)
                     saved_paths: list[str] = []
                     header_bytes = f"Content-Type: {ctype}\r\n\r\n".encode()
                     msg = email.parser.BytesParser().parsebytes(header_bytes + raw_body)
@@ -7954,6 +8217,7 @@ def serve_rainbow_zones(
                         dest_path = os.path.join(fb_dir, safe_name)
                         with open(dest_path, "wb") as f_out:
                             f_out.write(payload_bytes)
+                        register_temp_artifact(dest_path)
                         saved_paths.append(dest_path)
                     if len(saved_paths) == 1 and not saved_paths[0].lower().endswith(
                         (".nxs.h5", ".nxs", ".mtz")
@@ -7988,9 +8252,17 @@ def serve_rainbow_zones(
         allow_reuse_address = True
         daemon_threads = True
 
+    install_exit_cleanup_signal_handlers(vm.pipeline_runner.cancel_active_job)
     with _ThreadingServer((host, int(port)), _Handler) as httpd:
         print(
             f"Rainbow Zones server listening on http://{host}:{port}{ep_path or '/'} "
             f"(mode={default_mode})"
         )
-        httpd.serve_forever()
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                vm.pipeline_runner.cancel_active_job()
+            cleanup_registered_temp_artifacts()
