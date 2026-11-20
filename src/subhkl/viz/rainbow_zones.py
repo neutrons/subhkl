@@ -7745,6 +7745,19 @@ def render_rainbow_html(
     init_wl = payload.get("wavelength_range") or [2.8, 4.5]
     init_wl_min = float(init_wl[0]) if len(init_wl) >= 2 else 2.8
     init_wl_max = float(init_wl[1]) if len(init_wl) >= 2 else 4.5
+    init_wl_dom_min = min(0.20, max(0.05, math.floor(init_wl_min * 20.0) / 20.0))
+    init_wl_dom_max = max(
+        6.0, math.ceil(max(init_wl_max * 1.35, init_wl_max + 0.5) * 2.0) / 2.0
+    )
+    init_wl_span = max(0.05, init_wl_dom_max - init_wl_dom_min)
+    init_wl_pct_lo = max(
+        0.0, min(100.0, ((init_wl_min - init_wl_dom_min) / init_wl_span) * 100.0)
+    )
+    init_wl_pct_hi = max(
+        init_wl_pct_lo,
+        min(100.0, ((init_wl_max - init_wl_dom_min) / init_wl_span) * 100.0),
+    )
+    init_wl_pct_w = max(0.0, init_wl_pct_hi - init_wl_pct_lo)
     init_dmin = float(payload.get("d_min") or round(0.5 * init_wl_min, 2))
     init_border = float(
         payload.get("rel_border_width")
@@ -8952,6 +8965,96 @@ def render_rainbow_html(
     box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.85), 0 1px 4px rgba(0, 0, 0, 0.65);
     cursor: ew-resize;
   }}
+
+  /* Dual-bracket [ and ] wavelength interval slider */
+  .wl-interval-slider {{
+    position: relative;
+    height: 18px;
+    margin: 1px 5px 3px 5px;
+    display: flex;
+    align-items: center;
+    user-select: none;
+    touch-action: none;
+    cursor: pointer;
+  }}
+
+  .wl-interval-slider .sr-only-range {{
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+    margin: 0;
+  }}
+
+  .wl-track-rail {{
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 6px;
+    border-radius: 3px;
+    background: rgba(15, 23, 42, 0.88);
+    border: 1px solid rgba(148, 163, 184, 0.36);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.52);
+    pointer-events: none;
+  }}
+
+  .wl-track-fill {{
+    position: absolute;
+    height: 6px;
+    border-radius: 2px;
+    background: linear-gradient(
+      90deg,
+      hsla(265, 92%, 62%, 0.88) 0%,
+      hsla(195, 95%, 56%, 0.88) 34%,
+      hsla(120, 82%, 52%, 0.88) 68%,
+      hsla(12, 92%, 58%, 0.90) 100%
+    );
+    box-shadow: 0 0 6px rgba(56, 189, 248, 0.25);
+    pointer-events: none;
+  }}
+
+  .wl-bracket-knob {{
+    position: absolute;
+    top: 50%;
+    width: 11px;
+    height: 17px;
+    padding: 0;
+    margin: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-display);
+    font-size: 0.74rem;
+    font-weight: 800;
+    line-height: 1;
+    color: #f8fafc;
+    background: rgba(15, 23, 42, 0.94);
+    border: 1.5px solid var(--accent-cyan);
+    border-radius: 3px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.78);
+    cursor: ew-resize;
+    z-index: 2;
+    transition: border-color 0.1s ease, color 0.1s ease, background 0.1s ease;
+  }}
+
+  .wl-bracket-knob.wl-knob-min {{
+    transform: translate(-85%, -50%);
+  }}
+
+  .wl-bracket-knob.wl-knob-max {{
+    transform: translate(-15%, -50%);
+  }}
+
+  .wl-bracket-knob:hover,
+  .wl-bracket-knob:focus-visible,
+  .wl-bracket-knob.dragging {{
+    border-color: var(--accent-gold);
+    color: #fef08a;
+    background: rgba(30, 41, 59, 0.98);
+    outline: none;
+    z-index: 3;
+  }}
 </style>
 </head>
 <body>
@@ -9103,7 +9206,6 @@ def render_rainbow_html(
       <div>
         <div class="section-title">
           <span>Detector &amp; Color Controls</span>
-          <span id="wl-readout">λ: {init_wl_min:.1f}–{init_wl_max:.1f} Å</span>
         </div>
         <div class="slider-group">
           <div class="slider-row">
@@ -9119,10 +9221,23 @@ def render_rainbow_html(
           <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to shift the (log-)scale midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
 
           <div class="slider-row">
+            <span>Wavelength λ [Å]</span>
+            <span id="wl-readout">[{init_wl_min:.2f}, {init_wl_max:.2f}] Å</span>
+          </div>
+          <div class="wl-interval-slider" id="wl-interval-slider" title="Active wavelength interval [λ_min, λ_max] in Å — drag [ and ] brackets (double-click to reset)">
+            <input type="range" id="slider-wl-min" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_min:.2f}" aria-label="Minimum wavelength λ_min [Å]" />
+            <input type="range" id="slider-wl-max" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_max:.2f}" aria-label="Maximum wavelength λ_max [Å]" />
+            <div class="wl-track-rail"></div>
+            <div class="wl-track-fill" id="wl-track-fill" style="left:{init_wl_pct_lo:.2f}%;width:{init_wl_pct_w:.2f}%;"></div>
+            <button type="button" class="wl-bracket-knob wl-knob-min" id="wl-knob-min" style="left:{init_wl_pct_lo:.2f}%;" title="Minimum wavelength λ_min [Å] (drag or Left/Right arrows)">[</button>
+            <button type="button" class="wl-bracket-knob wl-knob-max" id="wl-knob-max" style="left:{init_wl_pct_hi:.2f}%;" title="Maximum wavelength λ_max [Å] (drag or Left/Right arrows)">]</button>
+          </div>
+
+          <div class="slider-row">
             <span>Resolution Cutoff d_min [Å]</span>
             <span id="lbl-dmin-val">{init_dmin:.2f} Å</span>
           </div>
-          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å] (synchronized with Params bar)" />
+          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å]" />
 
           <div class="slider-row" style="margin-top:2px;">
             <span>Spot Color</span>
@@ -9144,7 +9259,7 @@ def render_rainbow_html(
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(180,255,20,0.88);border:1px solid #b4ff14;"></span>
               <span id="lbl-mask-bright">Bright 0.00%</span>
             </span>
-            <span style="display:inline-flex;align-items:center;gap:4px;" title="Detector panel perimeter border exclusion width (adjust 'border' in Params)">
+            <span style="display:inline-flex;align-items:center;gap:4px;" title="Detector panel perimeter border exclusion width (adjust 'border' in Unit cell / Params)">
               <span style="display:inline-block;width:9px;height:9px;border-radius:2px;background:rgba(251,146,60,0.52);border:1px solid #fb923c;"></span>
               <span id="lbl-mask-edge">Edge {init_border * 100.0:.1f}%</span>
             </span>
@@ -9216,8 +9331,8 @@ def render_rainbow_html(
       <div class="ladder-actions" id="ladder-actions">
         <span id="lbl-execute" style="font-size:calc(0.62rem * var(--bottom-bar-scale, 1));color:var(--text-dim);font-family:var(--font-display);">EXECUTE:</span>
         <div id="pipeline-stages" style="display:flex;align-items:center;gap:calc(4px * var(--bottom-bar-scale, 1));"></div>
-        <button id="btn-params-toggle" title="Configure unit cell, space group, and wavelength parameters for Solve/Integrate">
-          Params
+        <button id="btn-params-toggle" title="Configure unit cell, space group, panel border exclusion, and solve binning">
+          Unit cell / Params
         </button>
         <button id="btn-files-toggle" title="Download NDIP / workflow artifacts for the current step (switch steps with &lt; &gt; arrows)">
           Files
@@ -9238,9 +9353,6 @@ def render_rainbow_html(
       <span>α <input id="inp-alpha" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>β <input id="inp-beta" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
       <span>γ <input id="inp-gamma" type="number" step="0.5" value="90.0" style="width:44px;" /></span>
-      <span title="Minimum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_min <input id="inp-lmin" type="number" step="0.05" value="{init_wl_min:.2f}" style="width:48px;" /></span>
-      <span title="Maximum wavelength [Å] (auto-populated from dataset or reduction_settings.json)">λ_max <input id="inp-lmax" type="number" step="0.05" value="{init_wl_max:.2f}" style="width:48px;" /></span>
-      <span title="High-resolution cutoff d_min [Å] (synchronized with sidebar slider)">d_min <input id="inp-dmin" type="number" step="0.05" value="{init_dmin:.2f}" style="width:48px;" /></span>
       <span title="Panel border rejection width (fraction of image size; visualized in Mask view)">border <input id="inp-border" type="number" min="0" max="0.25" step="0.005" value="{init_border:.3g}" style="width:52px;" /></span>
       <span title="Solve step spatial pixel binning (auto = default ≤8 keeping ≥32×32 bins/panel)">binning <select id="inp-binning"><option value=""{sel_bin_auto}>auto</option><option value="16"{sel_bin_16}>16</option><option value="8"{sel_bin_8}>8</option><option value="4"{sel_bin_4}>4</option></select></span>
     </div>
@@ -11014,32 +11126,90 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   decodeAllBankTextures();
 
-  // Initialize sliders & synchronized Params inputs
+  // Initialize sliders & wavelength interval controls
   const slDetAlpha = document.getElementById("slider-det-alpha");
   const slColorEmphasis = document.getElementById("slider-color-emphasis");
   const slDmin = document.getElementById("slider-dmin");
-  const inpDminEl = document.getElementById("inp-dmin");
-  const inpLminEl = document.getElementById("inp-lmin");
-  const inpLmaxEl = document.getElementById("inp-lmax");
+  const wlSliderWrap = document.getElementById("wl-interval-slider");
+  const slWlMin = document.getElementById("slider-wl-min");
+  const slWlMax = document.getElementById("slider-wl-max");
+  const wlTrackFill = document.getElementById("wl-track-fill");
+  const wlKnobMin = document.getElementById("wl-knob-min");
+  const wlKnobMax = document.getElementById("wl-knob-max");
+  const MIN_WL_SPAN = 0.05;
+
+  function getWavelengthSliderBounds() {{
+    const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
+    const baseLo = Number(_payloadBaseParams.lamMin) || defWl[0] || 2.0;
+    const baseHi = Number(_payloadBaseParams.lamMax) || defWl[1] || 4.5;
+    const curLo = (Number.isFinite(state.lamMin) && state.lamMin > 0) ? state.lamMin : baseLo;
+    const curHi = (Number.isFinite(state.lamMax) && state.lamMax > curLo) ? state.lamMax : Math.max(curLo + MIN_WL_SPAN, baseHi);
+    const domMin = Math.min(0.20, Math.max(0.05, Math.floor(Math.min(defWl[0] || 0.20, baseLo, curLo) * 20) / 20));
+    const domMax = Math.max(6.0, Math.ceil(Math.max((defWl[1] || 4.5) * 1.35, baseHi * 1.15, curHi) * 2) / 2);
+    return [domMin, domMax];
+  }}
 
   function updateWavelengthLabels() {{
-    DATA.wavelength_range = [state.lamMin, state.lamMax];
+    const [domMin, domMax] = getWavelengthSliderBounds();
+    const span = Math.max(MIN_WL_SPAN, domMax - domMin);
+    const lo = Math.max(0.05, Number.isFinite(state.lamMin) && state.lamMin > 0 ? state.lamMin : domMin);
+    const hi = Math.max(lo + MIN_WL_SPAN, Number.isFinite(state.lamMax) ? state.lamMax : lo + 1.0);
+    state.lamMin = lo;
+    state.lamMax = hi;
+    DATA.wavelength_range = [lo, hi];
     const wlReadEl = document.getElementById("wl-readout");
     if (wlReadEl) {{
-      wlReadEl.textContent = `λ: ${{state.lamMin.toFixed(1)}}–${{state.lamMax.toFixed(1)}} Å`;
+      wlReadEl.textContent = `[${{lo.toFixed(2)}}, ${{hi.toFixed(2)}}] Å`;
     }}
-    if (inpLminEl && document.activeElement !== inpLminEl) {{
-      inpLminEl.value = state.lamMin.toFixed(2);
+    if (slWlMin) {{
+      slWlMin.min = domMin.toFixed(2);
+      slWlMin.max = domMax.toFixed(2);
+      slWlMin.value = lo.toFixed(2);
     }}
-    if (inpLmaxEl && document.activeElement !== inpLmaxEl) {{
-      inpLmaxEl.value = state.lamMax.toFixed(2);
+    if (slWlMax) {{
+      slWlMax.min = domMin.toFixed(2);
+      slWlMax.max = domMax.toFixed(2);
+      slWlMax.value = hi.toFixed(2);
+    }}
+    const pctLo = Math.max(0, Math.min(100, ((lo - domMin) / span) * 100));
+    const pctHi = Math.max(pctLo, Math.min(100, ((hi - domMin) / span) * 100));
+    if (wlTrackFill) {{
+      wlTrackFill.style.left = `${{pctLo.toFixed(2)}}%`;
+      wlTrackFill.style.width = `${{Math.max(0, pctHi - pctLo).toFixed(2)}}%`;
+    }}
+    if (wlKnobMin) {{
+      wlKnobMin.style.left = `${{pctLo.toFixed(2)}}%`;
+      wlKnobMin.title = `Minimum wavelength λ_min = ${{lo.toFixed(2)}} Å (drag [ or use Left/Right arrows)`;
+    }}
+    if (wlKnobMax) {{
+      wlKnobMax.style.left = `${{pctHi.toFixed(2)}}%`;
+      wlKnobMax.title = `Maximum wavelength λ_max = ${{hi.toFixed(2)}} Å (drag ] or use Left/Right arrows)`;
     }}
     if (typeof updateColorscaleSliderGradient === "function") {{
       updateColorscaleSliderGradient();
     }}
   }}
 
-  function syncDminControls(nextDmin, sourceEl = null, opts = null) {{
+  function syncWavelengthControls(nextMin, nextMax, activeEnd = null) {{
+    const [domMin, domMax] = getWavelengthSliderBounds();
+    let lo = Number.isFinite(nextMin) ? Number(nextMin) : state.lamMin;
+    let hi = Number.isFinite(nextMax) ? Number(nextMax) : state.lamMax;
+    if (activeEnd === "min") {{
+      hi = Math.max(domMin + MIN_WL_SPAN, Number.isFinite(state.lamMax) ? state.lamMax : hi);
+      lo = Math.max(domMin, Math.min(lo, hi - MIN_WL_SPAN));
+    }} else if (activeEnd === "max") {{
+      lo = Math.max(domMin, Number.isFinite(state.lamMin) ? state.lamMin : lo);
+      hi = Math.min(domMax, Math.max(hi, lo + MIN_WL_SPAN));
+    }} else {{
+      lo = Math.max(0.05, lo);
+      hi = Math.max(lo + MIN_WL_SPAN, hi);
+    }}
+    state.lamMin = Math.round(lo * 100) / 100;
+    state.lamMax = Math.round(hi * 100) / 100;
+    updateWavelengthLabels();
+  }}
+
+  function syncDminControls(nextDmin, sourceEl = null) {{
     const dFloor = getDynamicDminFloor();
     const rawVal = Number(nextDmin);
     const v = Math.max(dFloor, Math.min(10.0, Number.isFinite(rawVal) && rawVal > 0 ? rawVal : dFloor));
@@ -11063,13 +11233,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         slDmin.value = v.toFixed(2);
       }}
       slDmin.title = `High-resolution cutoff d_min [Å] — dynamically re-predicts Bragg spots down to ${{dFloor.toFixed(2)}} Å floor`;
-    }}
-    if (inpDminEl) {{
-      inpDminEl.min = dFloor.toFixed(2);
-      const deferFmt = Boolean(opts && opts.deferInputFormat);
-      if (sourceEl !== inpDminEl || (!deferFmt && clampedAtFloor)) {{
-        inpDminEl.value = v.toFixed(2);
-      }}
     }}
   }}
 
@@ -11819,17 +11982,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }};
     const sgEl = document.getElementById("inp-sg");
     const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
-    const lminVal = getNum("inp-lmin", state.lamMin || defWl[0]);
-    const lmaxVal = Math.max(lminVal + 0.05, getNum("inp-lmax", state.lamMax || defWl[1]));
+    const slWlMinEl = document.getElementById("slider-wl-min");
+    const slWlMaxEl = document.getElementById("slider-wl-max");
+    const rawSlMin = slWlMinEl ? parseFloat(slWlMinEl.value) : NaN;
+    const rawSlMax = slWlMaxEl ? parseFloat(slWlMaxEl.value) : NaN;
+    const lminVal = (typeof document !== "undefined" && document.activeElement === slWlMinEl && Number.isFinite(rawSlMin) && rawSlMin > 0)
+      ? rawSlMin
+      : ((Number.isFinite(state.lamMin) && state.lamMin > 0)
+        ? state.lamMin
+        : ((Number.isFinite(rawSlMin) && rawSlMin > 0) ? rawSlMin : defWl[0]));
+    const lmaxCandidate = (typeof document !== "undefined" && document.activeElement === slWlMaxEl && Number.isFinite(rawSlMax) && rawSlMax > 0)
+      ? rawSlMax
+      : ((Number.isFinite(state.lamMax) && state.lamMax > 0)
+        ? state.lamMax
+        : ((Number.isFinite(rawSlMax) && rawSlMax > 0) ? rawSlMax : defWl[1]));
+    const lmaxVal = Math.max(lminVal + 0.05, lmaxCandidate);
     state.lamMin = lminVal;
     state.lamMax = lmaxVal;
-    const rawInpDmin = inpDminEl ? parseFloat(inpDminEl.value) : NaN;
     const rawSlDmin = slDmin ? parseFloat(slDmin.value) : NaN;
     const dminVal = (typeof document !== "undefined" && document.activeElement === slDmin && Number.isFinite(rawSlDmin) && rawSlDmin > 0)
       ? rawSlDmin
-      : ((Number.isFinite(rawInpDmin) && rawInpDmin > 0)
-        ? rawInpDmin
-        : ((Number.isFinite(state.dMin) && state.dMin > 0) ? state.dMin : Number((lminVal * 0.5).toFixed(2))));
+      : ((Number.isFinite(state.dMin) && state.dMin > 0)
+        ? state.dMin
+        : ((Number.isFinite(rawSlDmin) && rawSlDmin > 0) ? rawSlDmin : Number((lminVal * 0.5).toFixed(2))));
     syncDminControls(dminVal);
     const binEl = document.getElementById("inp-binning");
     const rawBin = binEl ? parseInt(String(binEl.value || "").trim(), 10) : NaN;
@@ -14753,6 +14928,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return [cx + xCam * persp * scale, cy - yCam * persp * scale, hemi, zCam, dotScale];
   }}
 
+  function getActiveWulffSourceArray() {{
+    return (SAMPLE_PEAKS && SAMPLE_PEAKS.length > 0) ? SAMPLE_PEAKS : PEAKS;
+  }}
+
   function getActiveWulffPeaks() {{
     const src = (state.wulffScope === "all_runs" && SAMPLE_PEAKS.length > 0) ? SAMPLE_PEAKS : PEAKS;
     return src.filter(isPeakVisible);
@@ -15675,55 +15854,127 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   if (slDmin) {{
-    slDmin.addEventListener("input", () => {{
+    const onSlDmin = () => {{
       const v = parseFloat(slDmin.value);
       if (Number.isFinite(v) && v > 0) {{
         syncDminControls(v, slDmin);
         handleDynamicPredictionControlChange();
       }}
-    }});
+    }};
+    slDmin.addEventListener("input", onSlDmin);
+    slDmin.addEventListener("change", onSlDmin);
   }}
 
-  if (inpDminEl) {{
-    inpDminEl.addEventListener("input", () => {{
-      const v = parseFloat(inpDminEl.value);
+  if (slWlMin) {{
+    const onSlWlMin = () => {{
+      const v = parseFloat(slWlMin.value);
       if (Number.isFinite(v) && v > 0) {{
-        syncDminControls(v, inpDminEl, {{ deferInputFormat: true }});
+        syncWavelengthControls(v, state.lamMax, "min");
         handleDynamicPredictionControlChange();
       }}
+    }};
+    slWlMin.addEventListener("input", onSlWlMin);
+    slWlMin.addEventListener("change", onSlWlMin);
+  }}
+
+  if (slWlMax) {{
+    const onSlWlMax = () => {{
+      const v = parseFloat(slWlMax.value);
+      if (Number.isFinite(v) && v > 0) {{
+        syncWavelengthControls(state.lamMin, v, "max");
+        handleDynamicPredictionControlChange();
+      }}
+    }};
+    slWlMax.addEventListener("input", onSlWlMax);
+    slWlMax.addEventListener("change", onSlWlMax);
+  }}
+
+  if (wlSliderWrap) {{
+    let activeWlDragEnd = null;
+    const clientXToSnappedWl = (clientX) => {{
+      const rect = wlSliderWrap.getBoundingClientRect();
+      const width = Math.max(1, rect.width);
+      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / width));
+      const [domMin, domMax] = getWavelengthSliderBounds();
+      const raw = domMin + frac * (domMax - domMin);
+      return Math.round(raw * 20) / 20;
+    }};
+    const applyDraggedWl = (clientX) => {{
+      if (!activeWlDragEnd) return;
+      const snapped = clientXToSnappedWl(clientX);
+      const prevLo = state.lamMin;
+      const prevHi = state.lamMax;
+      if (activeWlDragEnd === "min") {{
+        syncWavelengthControls(snapped, state.lamMax, "min");
+      }} else {{
+        syncWavelengthControls(state.lamMin, snapped, "max");
+      }}
+      if (Math.abs(state.lamMin - prevLo) > 1e-4 || Math.abs(state.lamMax - prevHi) > 1e-4) {{
+        handleDynamicPredictionControlChange();
+      }}
+    }};
+    wlSliderWrap.addEventListener("pointerdown", (ev) => {{
+      if (ev.button !== undefined && ev.button !== 0) return;
+      if (ev.target === wlKnobMin || (wlKnobMin && wlKnobMin.contains(ev.target))) {{
+        activeWlDragEnd = "min";
+      }} else if (ev.target === wlKnobMax || (wlKnobMax && wlKnobMax.contains(ev.target))) {{
+        activeWlDragEnd = "max";
+      }} else {{
+        const clickWl = clientXToSnappedWl(ev.clientX);
+        const dLo = Math.abs(clickWl - state.lamMin);
+        const dHi = Math.abs(clickWl - state.lamMax);
+        activeWlDragEnd = (dLo < dHi || (dLo === dHi && clickWl < state.lamMin)) ? "min" : "max";
+        applyDraggedWl(ev.clientX);
+      }}
+      if (wlKnobMin) wlKnobMin.classList.toggle("dragging", activeWlDragEnd === "min");
+      if (wlKnobMax) wlKnobMax.classList.toggle("dragging", activeWlDragEnd === "max");
+      if (typeof wlSliderWrap.setPointerCapture === "function" && ev.pointerId !== undefined) {{
+        try {{ wlSliderWrap.setPointerCapture(ev.pointerId); }} catch (_e) {{}}
+      }}
+      ev.preventDefault();
     }});
-    inpDminEl.addEventListener("change", () => {{
-      const v = parseFloat(inpDminEl.value);
-      syncDminControls(Number.isFinite(v) && v > 0 ? v : state.dMin, null);
+    wlSliderWrap.addEventListener("pointermove", (ev) => {{
+      if (!activeWlDragEnd) return;
+      applyDraggedWl(ev.clientX);
+    }});
+    const stopWlDrag = (ev) => {{
+      if (!activeWlDragEnd) return;
+      activeWlDragEnd = null;
+      if (wlKnobMin) wlKnobMin.classList.remove("dragging");
+      if (wlKnobMax) wlKnobMax.classList.remove("dragging");
+      if (ev && typeof wlSliderWrap.releasePointerCapture === "function" && ev.pointerId !== undefined) {{
+        try {{ wlSliderWrap.releasePointerCapture(ev.pointerId); }} catch (_e) {{}}
+      }}
+    }};
+    wlSliderWrap.addEventListener("pointerup", stopWlDrag);
+    wlSliderWrap.addEventListener("pointercancel", stopWlDrag);
+    wlSliderWrap.addEventListener("dblclick", () => {{
+      const defWl = getDefaultWavelengthForInstrument(DATA.instrument);
+      const resetLo = (Number.isFinite(_payloadBaseParams.lamMin) && _payloadBaseParams.lamMin > 0) ? _payloadBaseParams.lamMin : defWl[0];
+      const resetHi = (Number.isFinite(_payloadBaseParams.lamMax) && _payloadBaseParams.lamMax > resetLo) ? _payloadBaseParams.lamMax : defWl[1];
+      syncWavelengthControls(resetLo, resetHi, null);
       handleDynamicPredictionControlChange();
     }});
   }}
 
-  if (inpLminEl) {{
-    const onInpLmin = () => {{
-      const v = parseFloat(inpLminEl.value);
-      if (Number.isFinite(v) && v > 0) {{
-        state.lamMin = Math.min(v, state.lamMax - 0.05);
-        updateWavelengthLabels();
+  [
+    [wlKnobMin, "min"],
+    [wlKnobMax, "max"],
+  ].forEach(([knobEl, endKey]) => {{
+    if (!knobEl) return;
+    knobEl.addEventListener("keydown", (ev) => {{
+      const step = ev.shiftKey ? 0.25 : 0.05;
+      let delta = 0;
+      if (ev.key === "ArrowLeft" || ev.key === "ArrowDown") delta = -step;
+      else if (ev.key === "ArrowRight" || ev.key === "ArrowUp") delta = step;
+      if (delta !== 0) {{
+        ev.preventDefault();
+        if (endKey === "min") syncWavelengthControls(state.lamMin + delta, state.lamMax, "min");
+        else syncWavelengthControls(state.lamMin, state.lamMax + delta, "max");
         handleDynamicPredictionControlChange();
       }}
-    }};
-    inpLminEl.addEventListener("input", onInpLmin);
-    inpLminEl.addEventListener("change", onInpLmin);
-  }}
-
-  if (inpLmaxEl) {{
-    const onInpLmax = () => {{
-      const v = parseFloat(inpLmaxEl.value);
-      if (Number.isFinite(v) && v > 0) {{
-        state.lamMax = Math.max(v, state.lamMin + 0.05);
-        updateWavelengthLabels();
-        handleDynamicPredictionControlChange();
-      }}
-    }};
-    inpLmaxEl.addEventListener("input", onInpLmax);
-    inpLmaxEl.addEventListener("change", onInpLmax);
-  }}
+    }});
+  }});
 
   document.getElementById("btn-proj-toggle").addEventListener("click", () => {{
     state.projection = state.projection === "cylindrical" ? "spherical" : "cylindrical";

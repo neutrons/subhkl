@@ -2943,26 +2943,40 @@ class NovaGalaxyPipelineRunner:
                         _, resolved_m = self._resolve_work_dir_and_merged(str(disc))
                         return resolved_m
 
-        # Not found locally — inspect `files` in peaks_h5_path and look up <tag>_merged.h5 in Galaxy history
+        # In local-staging mode, if the raw NeXus recipe resolves locally on /SNS or /HFIR,
+        # avoid blocking /api/payload to download a multi-GB merged.h5 from Galaxy; let
+        # _maybe_trigger_hydrate_reduce regenerate frames asynchronously on local NVMe.
+        if self._is_local_staging_mode():
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                recipe_local = self._extract_reduce_recipe_from_derived_h5(
+                    str(peaks_h5_path)
+                )
+                if recipe_local and recipe_local.get("nexus_files"):
+                    return None
+
+        # Not found locally — inspect `source_files` / `files` in peaks_h5_path and look up <tag>_merged.h5 in Galaxy history
         tag = ""
         with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             import h5py
 
             with h5py.File(str(peaks_h5_path), "r") as hf:
-                if "files" in hf:
+                for ds_key in ("source_files", "files"):
+                    if ds_key not in hf:
+                        continue
                     raw_f = [
                         (
                             x.decode("utf-8", "ignore")
                             if isinstance(x, bytes)
                             else str(x)
                         )
-                        for x in list(hf["files"][()])
+                        for x in list(hf[ds_key][()])
                     ]
                     raw_f = [x for x in raw_f if x]
                     if raw_f:
                         s0 = os.path.basename(raw_f[0]).split(".")[0]
                         s1 = os.path.basename(raw_f[-1]).split(".")[0]
                         tag = s0 if s0 == s1 else f"{s0}_{s1}"
+                        break
         if not tag or not self.is_connected:
             return None
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
@@ -2971,6 +2985,8 @@ class NovaGalaxyPipelineRunner:
             f"{tag}_merged.h5".lower(),
         }
         with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+            import h5py
+
             hist_items = self.list_history_datasets(limit=200)
             for ds in hist_items:
                 if ds.get("state") != "ok":
@@ -2983,8 +2999,60 @@ class NovaGalaxyPipelineRunner:
                     if ds_id:
                         local_m, _ = self.resolve_dataset_to_local_h5(ds_id)
                         _, final_m = self._resolve_work_dir_and_merged(local_m)
-                        return final_m
+                        if final_m and os.path.isfile(final_m):
+                            with h5py.File(final_m, "r") as hf_m:
+                                if "images" in hf_m:
+                                    return final_m
         return None
+
+    def stage_derived_h5_in_work_dir(
+        self,
+        local_h5: str,
+        *,
+        name_hint: str = "",
+    ) -> tuple[str, str]:
+        """Stage a derived HDF5 (solve/integrated/predictor) into its canonical ``subhkl_work_<tag>`` directory."""
+        import shutil as _shutil
+
+        abs_src = os.path.abspath(local_h5)
+        work_d, _ = self._resolve_work_dir_and_merged(abs_src)
+        hint_low = f"{name_hint} {os.path.basename(abs_src)}".lower()
+        canon_name = ""
+        if "integrat" in hint_low:
+            canon_name = "integrated.h5"
+        elif "solve" in hint_low:
+            canon_name = "solve.h5"
+        elif "predict" in hint_low:
+            canon_name = "predictor.h5"
+        elif os.path.isfile(abs_src):
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py
+
+                with h5py.File(abs_src, "r") as hf_s:
+                    if "peaks/intensity" in hf_s:
+                        canon_name = "integrated.h5"
+                    elif "ladder" in hf_s or "zone_axes" in hf_s or "R" in hf_s:
+                        canon_name = "solve.h5"
+                    elif "peaks/xyz" in hf_s or "peaks/hkl" in hf_s:
+                        canon_name = "predictor.h5"
+        if not canon_name or not os.path.isfile(abs_src):
+            return work_d, abs_src
+        dest_p = os.path.join(work_d, canon_name)
+        same_f = os.path.abspath(dest_p) == abs_src
+        if not same_f and os.path.exists(dest_p):
+            with contextlib.suppress(OSError):
+                same_f = os.path.samefile(dest_p, abs_src)
+        if not same_f:
+            with contextlib.suppress(OSError):
+                _shutil.copy2(abs_src, dest_p)
+                _chmod_world_rw(dest_p, is_dir=False)
+        known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+        mapped_id = known_map.get(abs_src) or known_map.get(os.path.realpath(abs_src))
+        if mapped_id and os.path.isfile(dest_p):
+            known_map[os.path.abspath(dest_p)] = mapped_id
+            known_map[os.path.realpath(dest_p)] = mapped_id
+            self._dataset_id_by_path = known_map
+        return work_d, (dest_p if os.path.isfile(dest_p) else abs_src)
 
     def _discover_or_fetch_galaxy_predictor_h5(
         self, peaks_h5_path: str | os.PathLike, *, target_hid: int | None = None
@@ -3668,24 +3736,42 @@ class NovaGalaxyPipelineRunner:
 
         def _locate_basename_on_fs(bname: str, inst_hint: str) -> str | None:
             bn_only = os.path.basename(bname)
-            m_ib = _re.match(r"^([A-Za-z0-9]+)_([0-9]+)\.(?:nxs\.h5|nxs)$", bn_only)
+            m_ib = _re.match(
+                r"^([A-Za-z0-9]+)_([0-9]+)(?:\.reduce)?\.(?:nxs\.h5|nxs|h5|hdf5)$",
+                bn_only,
+                flags=_re.IGNORECASE,
+            )
             inst_eff = (m_ib.group(1) if m_ib else inst_hint).strip().upper()
             if not inst_eff:
+                return None
+            probe_names: list[str] = []
+            if m_ib:
+                run_tok = m_ib.group(2)
+                for ext_s in (".nxs.h5", ".nxs"):
+                    cand_n = f"{inst_eff}_{run_tok}{ext_s}"
+                    if cand_n not in probe_names:
+                        probe_names.append(cand_n)
+            if bn_only not in probe_names and bn_only.lower().endswith(
+                (".nxs.h5", ".nxs")
+            ):
+                probe_names.append(bn_only)
+            if not probe_names:
                 return None
             for root_d in _facility_roots_for_inst(inst_eff):
                 inst_d = os.path.join(root_d, inst_eff)
                 if not os.path.isdir(inst_d):
                     continue
-                matches = sorted(
-                    _glob.glob(os.path.join(inst_d, "IPTS-*", "nexus", bn_only))
-                )
-                for m_p in matches:
-                    if os.path.isfile(m_p) and os.access(m_p, os.R_OK):
-                        return m_p
+                for p_name in probe_names:
+                    matches = sorted(
+                        _glob.glob(os.path.join(inst_d, "IPTS-*", "nexus", p_name))
+                    )
+                    for m_p in matches:
+                        if os.path.isfile(m_p) and os.access(m_p, os.R_OK):
+                            return m_p
             return None
 
         resolved_nxs: list[str] = []
-        # 1. Explicit full paths from `source_files` or `files`
+        # 1. Explicit full paths or basenames (including transient *.reduce.h5 paths) from `source_files` or `files`
         for cand_list in (src_candidates, file_names):
             if resolved_nxs:
                 break
@@ -3696,9 +3782,10 @@ class NovaGalaxyPipelineRunner:
                     remapped
                     and os.path.isfile(remapped)
                     and os.access(remapped, os.R_OK)
+                    and not remapped.lower().endswith(".reduce.h5")
                 ):
                     tmp_list.append(os.path.abspath(remapped))
-                elif "/" not in p_raw:
+                else:
                     loc_hit = _locate_basename_on_fs(p_raw, inst_val)
                     if loc_hit:
                         tmp_list.append(os.path.abspath(loc_hit))
@@ -3876,16 +3963,37 @@ class NovaGalaxyPipelineRunner:
             if not new_merged_h5 or not os.path.isfile(new_merged_h5):
                 return
             with vm_lock, contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                cur_rep = os.path.abspath(str(vm.replay_h5 or ""))
-                cur_wd = (
-                    self._resolve_work_dir_and_merged(cur_rep)[0] if cur_rep else ""
-                )
-                if cur_rep == target_replay_abs or (
-                    cur_wd and os.path.abspath(cur_wd) == os.path.abspath(work_d)
-                ):
-                    vm.payload_kwargs["images_h5"] = new_merged_h5
-                    cur_f = int(getattr(self, "current_frame_index", 0) or 0)
-                    vm.reload(images_h5=new_merged_h5, frame_index=cur_f)
+                if hasattr(vm, "data") and hasattr(vm, "refresh_payload"):
+                    cur_rep = os.path.abspath(
+                        str(getattr(vm.data, "peaks_file", "") or "")
+                    )
+                    cur_wd = (
+                        self._resolve_work_dir_and_merged(cur_rep)[0] if cur_rep else ""
+                    )
+                    if cur_rep == target_replay_abs or (
+                        cur_wd and os.path.abspath(cur_wd) == os.path.abspath(work_d)
+                    ):
+                        vm.data.images_file = new_merged_h5
+                        cur_f = int(
+                            getattr(
+                                self,
+                                "current_frame_index",
+                                getattr(vm, "frame_index", 0),
+                            )
+                            or 0
+                        )
+                        vm.refresh_payload(frame_index=cur_f, preserve_params=True)
+                else:
+                    cur_rep = os.path.abspath(str(getattr(vm, "replay_h5", "") or ""))
+                    cur_wd = (
+                        self._resolve_work_dir_and_merged(cur_rep)[0] if cur_rep else ""
+                    )
+                    if cur_rep == target_replay_abs or (
+                        cur_wd and os.path.abspath(cur_wd) == os.path.abspath(work_d)
+                    ):
+                        vm.payload_kwargs["images_h5"] = new_merged_h5
+                        cur_f = int(getattr(self, "current_frame_index", 0) or 0)
+                        vm.reload(images_h5=new_merged_h5, frame_index=cur_f)
 
         with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
             hydrate_params = dict(recipe)
@@ -7074,8 +7182,9 @@ class NovaGalaxyPipelineRunner:
                 )
                 for i, p in enumerate(raw_nxs_local)
             ]
+            py_reduce_bin = "python" if shutil.which("podman") else sys.executable
             r_cmd = [
-                "python",
+                py_reduce_bin,
                 "-u",
                 batch_py_path,
                 str(inst),
@@ -7085,7 +7194,7 @@ class NovaGalaxyPipelineRunner:
                 *raw_nxs_local,
             ]
             merge_cmd = [
-                "python",
+                py_reduce_bin,
                 "-u",
                 "-m",
                 "subhkl.io.parser",
@@ -7600,6 +7709,10 @@ class NovaGalaxyPipelineRunner:
             job_record["state"] = "running"
             job_record["runner_host"] = host_tag
             job_record["command_line"] = cmd_str
+            job_record.setdefault("params", dict(params))
+            job_record.setdefault("instrument", str(inst))
+            if raw_nxs_local and not job_record.get("raw_nxs"):
+                job_record["raw_nxs"] = list(raw_nxs_local)
             if stage_id == "merge":
                 job_record["stdout"] = ""
             else:
@@ -7625,6 +7738,9 @@ class NovaGalaxyPipelineRunner:
                 "updated_payload_ready": False,
                 "hydrate_only": bool(preserve_downstream),
                 "n_runs": len(raw_nxs_local) if stage_id == "reduce" else 0,
+                "params": dict(params),
+                "raw_nxs": list(raw_nxs_local),
+                "instrument": str(inst),
                 "work_dir": work_dir,
                 "started_at": time.time(),
             }
@@ -9079,24 +9195,20 @@ def serve_rainbow_zones(
                             vm.replay_h5 = fp
                             vm.reload(images_h5=fp, frame_index=f_idx)
                         else:
+                            from subhkl.viz.rainbow_zones import _discover_images_h5
+
                             if not preserve_q and d_min_val is None:
                                 vm.payload_kwargs.pop("d_min", None)
-                            work_d_fp, _ = (
-                                vm.pipeline_runner._resolve_work_dir_and_merged(fp)
+                            work_d_fp, staged_fp = (
+                                vm.pipeline_runner.stage_derived_h5_in_work_dir(
+                                    fp, name_hint=os.path.basename(fp)
+                                )
                             )
-                            staged_fp = fp
-                            fp_bn_clean = os.path.basename(fp).lower()
-                            for canon_n in ("solve.h5", "integrated.h5"):
-                                cand_c = os.path.join(work_d_fp, canon_n)
-                                if fp_bn_clean.endswith(canon_n) and os.path.isfile(
-                                    cand_c
-                                ):
-                                    staged_fp = cand_c
-                                    break
                             disc_img = (
                                 vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
                                     staged_fp
                                 )
+                                or _discover_images_h5(staged_fp)
                             )
                             vm.pipeline_runner._discover_or_fetch_galaxy_predictor_h5(
                                 staged_fp
@@ -9113,7 +9225,7 @@ def serve_rainbow_zones(
                                 (vm.payload or {}).get("artifact_kind"),
                                 work_d_fp,
                             )
-                            if not disc_img:
+                            if (vm._payload or {}).get("intensity_source") != "raw_h5":
                                 hyd_job = (
                                     vm.pipeline_runner._maybe_trigger_hydrate_reduce(
                                         vm, vm_lock, staged_fp
@@ -9210,18 +9322,11 @@ def serve_rainbow_zones(
                             work_d_ds,
                         )
                     else:
-                        work_d_ds, _ = vm.pipeline_runner._resolve_work_dir_and_merged(
-                            local_h5
+                        work_d_ds, staged_ds_h5 = (
+                            vm.pipeline_runner.stage_derived_h5_in_work_dir(
+                                local_h5, name_hint=ds_name
+                            )
                         )
-                        staged_ds_h5 = local_h5
-                        for canon_n, kw_m in (
-                            ("solve.h5", "solve"),
-                            ("integrated.h5", "integrat"),
-                        ):
-                            cand_c = os.path.join(work_d_ds, canon_n)
-                            if kw_m in ds_name and os.path.isfile(cand_c):
-                                staged_ds_h5 = cand_c
-                                break
                         disc_img = (
                             vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
                                 staged_ds_h5
@@ -9250,7 +9355,7 @@ def serve_rainbow_zones(
                             (vm._payload or {}).get("artifact_kind"),
                             work_d_ds,
                         )
-                        if not disc_img:
+                        if (vm._payload or {}).get("intensity_source") != "raw_h5":
                             hyd_job = vm.pipeline_runner._maybe_trigger_hydrate_reduce(
                                 vm,
                                 vm_lock,
