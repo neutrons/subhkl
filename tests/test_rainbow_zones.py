@@ -8154,3 +8154,270 @@ def test_local_staging_gpu_mode_and_galaxy_careless_merge_routing(
     assert chk["ok"] is True
     assert chk["checked_via"] == "local_filesystem"
     assert nld_called is False
+
+
+def test_cross_instance_galaxy_history_reuse_integrated_restart_and_hydrate_reduce(
+    tmp_path, monkeypatch
+):
+    """Verify cross-instance NDIP History discovery, local cache hit vs on-the-fly Reduce hydration, and Merge restart from integrated.h5."""
+    import os
+    import threading
+
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.nova_rainbow_view import (
+        NovaGalaxyPipelineRunner,
+        RainbowZonesViewModel,
+    )
+    from subhkl.viz.rainbow_zones import _discover_images_h5
+
+    staging_dir = tmp_path / "staging"
+    staging_dir.mkdir()
+    sns_root = tmp_path / "SNS"
+    nxs_dir = sns_root / "MANDI" / "IPTS-36185" / "nexus"
+    nxs_dir.mkdir(parents=True)
+    raw_nxs = nxs_dir / "MANDI_13308.nxs.h5"
+    with h5py.File(raw_nxs, "w") as hf_raw:
+        hf_raw.create_dataset("entry/title", data=np.bytes_("MANDI 13308"))
+
+    monkeypatch.setenv("SUBHKL_EXEC_MODE", "local")
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(staging_dir))
+    monkeypatch.setenv("GALAXY_URL", "https://ndip-test.ornl.gov")
+    monkeypatch.setenv("GALAXY_API_KEY", "fake-ndip-key")
+    # Simulate NDIP Interactive Tool injecting a fresh per-launch HISTORY_ID
+    monkeypatch.setenv("HISTORY_ID", "hist_fresh_it_launch")
+
+    runner = NovaGalaxyPipelineRunner()
+    monkeypatch.setitem(runner.SNS_HFIR_ROOTS, "SNS", str(sns_root))
+    api_log: list[tuple[str, str]] = []
+
+    def _fake_api(method, path, payload=None, raw=False, timeout=30.0):
+        api_log.append((method, path))
+        if path == "/api/histories?keys=id,name,deleted":
+            return [
+                {
+                    "id": "hist_fresh_it_launch",
+                    "name": "Unnamed history",
+                    "deleted": False,
+                },
+                {
+                    "id": "hist_subhkl_shared",
+                    "name": "IMAGINE-X SubHKL",
+                    "deleted": False,
+                },
+            ]
+        if path.startswith("/api/histories/hist_subhkl_shared/contents?"):
+            return [
+                {
+                    "id": "ds_solve_prev",
+                    "hid": 41,
+                    "name": "MANDI_13308_solve.h5",
+                    "state": "ok",
+                    "extension": "h5",
+                    "deleted": False,
+                    "history_content_type": "dataset",
+                    "update_time": "2026-04-20T12:00:00.000000",
+                },
+                {
+                    "id": "ds_int_prev",
+                    "hid": 42,
+                    "name": "MANDI_13308_integrated.h5",
+                    "state": "ok",
+                    "extension": "h5",
+                    "deleted": False,
+                    "history_content_type": "dataset",
+                    "update_time": "2026-04-20T12:05:00.000000",
+                },
+            ]
+        if path.startswith("/api/histories/hist_fresh_it_launch/contents?"):
+            return [
+                {
+                    "id": "a1b2c3d4e5f60718",
+                    "hid": 1,
+                    "name": "user_uploaded.mtz",
+                    "state": "ok",
+                    "extension": "mtz",
+                    "deleted": False,
+                    "history_content_type": "dataset",
+                    "update_time": "2026-04-20T11:55:00.000000",
+                }
+            ]
+        return {}
+
+    runner._api_request = _fake_api
+
+    # 1) Cross-instance history visibility: sees earlier solve.h5 + integrated.h5 in 'IMAGINE-X SubHKL' AND launch history items
+    hist_items = runner.list_history_datasets(use_cached=True)
+    names = [d["name"] for d in hist_items]
+    assert "MANDI_13308_integrated.h5" in names
+    assert "MANDI_13308_solve.h5" in names
+    assert "user_uploaded.mtz" in names
+    assert runner.history_id == "hist_subhkl_shared"
+
+    # touch_dataset invalidates _cached_history_datasets so newly uploaded datasets appear immediately
+    assert runner._cached_history_datasets is not None
+    runner.touch_dataset("ds_int_prev")
+    assert runner._cached_history_datasets is None
+
+    # Annotation sync targets the dataset's actual owning history
+    runner.attach_dataset_cell_metadata(
+        "a1b2c3d4e5f60718", [50, 60, 70, 90, 90, 90], "P 21 21 21"
+    )
+    import time as _time
+
+    for _ in range(20):
+        if any(m == "PUT" for m, _ in api_log):
+            break
+        _time.sleep(0.01)
+    put_paths = [p for m, p in api_log if m == "PUT"]
+    assert any(
+        "/api/histories/hist_fresh_it_launch/contents/a1b2c3d4e5f60718" in p
+        for p in put_paths
+    )
+
+    # 2) Legacy solve.h5 (only attrs['source'], no 'source_files') + local cache HIT -> finds merged.h5 without re-running Reduce
+    work_dir = staging_dir / "subhkl_work_MANDI_13308"
+    work_dir.mkdir()
+    cached_merged = work_dir / "MANDI_13308_merged.h5"
+    with h5py.File(cached_merged, "w") as hf_m:
+        hf_m.attrs["instrument"] = "MANDI"
+        hf_m.create_dataset("images", data=np.zeros((1, 4, 4), dtype=np.float32))
+        dt_s = h5py.string_dtype(encoding="utf-8")
+        hf_m.create_dataset("source_files", data=[str(raw_nxs)], dtype=dt_s)
+        hf_m.create_dataset("files", data=["MANDI_13308.nxs.h5"], dtype=dt_s)
+        hf_m.create_dataset("instrument/wavelength", data=[2.0, 4.0])
+
+    legacy_solve = staging_dir / "subhkl_gx_ds_solve_prev_solve.h5"
+    with h5py.File(legacy_solve, "w") as hf_s:
+        hf_s.attrs["instrument"] = "MANDI"
+        hf_s.attrs["source"] = (
+            "/tmp/old_instance/subhkl_work_MANDI_13308/MANDI_13308_merged.h5"
+        )
+        hf_s.create_dataset("sample/B", data=np.diag([0.02, 0.02, 0.01]))
+        hf_s.create_dataset("sample/U", data=np.eye(3))
+        hf_s.create_dataset("sample/space_group", data=np.bytes_("P 21 21 21"))
+
+    resolved_wd, resolved_m = runner._resolve_work_dir_and_merged(str(legacy_solve))
+    assert os.path.abspath(resolved_wd) == str(work_dir)
+    assert os.path.abspath(resolved_m) == str(cached_merged)
+    assert (work_dir / "solve.h5").is_file()
+    disc_hit = _discover_images_h5(legacy_solve)
+    assert disc_hit is not None and os.path.abspath(disc_hit) == str(cached_merged)
+
+    # Provenance helper stamps full `source_files` + `files` + `instrument/wavelength` onto derived HDF5s
+    int_h5 = work_dir / "integrated.h5"
+    with h5py.File(int_h5, "w") as hf_i:
+        hf_i.attrs["instrument"] = "MANDI"
+        hf_i.attrs["source"] = str(cached_merged)
+        hf_i.create_dataset("sample/a", data=50.0)
+        hf_i.create_dataset("sample/b", data=60.0)
+        hf_i.create_dataset("sample/c", data=70.0)
+        hf_i.create_dataset("sample/alpha", data=90.0)
+        hf_i.create_dataset("sample/beta", data=90.0)
+        hf_i.create_dataset("sample/gamma", data=90.0)
+        hf_i.create_dataset("sample/space_group", data=np.bytes_("P 21 21 21"))
+        hf_i.create_dataset("peaks/h", data=np.array([1, 0], dtype=np.int32))
+        hf_i.create_dataset("peaks/k", data=np.array([0, 1], dtype=np.int32))
+        hf_i.create_dataset("peaks/l", data=np.array([0, 0], dtype=np.int32))
+        hf_i.create_dataset(
+            "peaks/intensity", data=np.array([120.0, 85.0], dtype=np.float32)
+        )
+        hf_i.create_dataset("peaks/sigma", data=np.array([11.0, 9.5], dtype=np.float32))
+        hf_i.create_dataset("peaks/lambda", data=np.array([2.5, 3.1], dtype=np.float32))
+        hf_i.create_dataset(
+            "peaks/two_theta", data=np.array([0.4, 0.5], dtype=np.float32)
+        )
+        hf_i.create_dataset(
+            "peaks/azimuthal", data=np.array([0.1, -0.2], dtype=np.float32)
+        )
+        hf_i.create_dataset(
+            "peaks/xyz",
+            data=np.array([[0.1, 0.0, 0.4], [0.0, 0.2, 0.4]], dtype=np.float32),
+        )
+        hf_i.create_dataset("peaks/run_index", data=np.array([0, 0], dtype=np.int32))
+        hf_i.create_dataset("peaks/bank", data=np.array([1, 1], dtype=np.int32))
+        hf_i.create_dataset("goniometer/R", data=np.eye(3)[None, ...])
+    runner._stamp_derived_h5_provenance(
+        str(int_h5),
+        merged_path=str(cached_merged),
+        params={"space_group": "P 21 21 21"},
+    )
+    with h5py.File(int_h5, "r") as hf_chk:
+        assert "source_files" in hf_chk
+        assert list(hf_chk["source_files"].asstr()[()]) == [str(raw_nxs)]
+
+    # 3) Restart Stage 4 (Merge) from integrated.h5 even when reflections.mtz and merged.h5 are absent
+    os.remove(cached_merged)
+    assert not (work_dir / "reflections.mtz").exists()
+    rebuilt_mtz = runner._ensure_reflections_mtz_from_integrated(
+        str(work_dir), peaks_file=str(int_h5), space_group="P 21 21 21"
+    )
+    assert rebuilt_mtz is not None and os.path.isfile(rebuilt_mtz)
+    assert os.path.getsize(rebuilt_mtz) > 0
+
+    # 4) Local cache MISS -> extracts recipe (both from source_files AND legacy attrs['source']) & triggers non-destructive Reduce hydration
+    recipe_from_src = runner._extract_reduce_recipe_from_derived_h5(str(int_h5))
+    assert recipe_from_src is not None
+    assert recipe_from_src["nexus_files"] == [str(raw_nxs)]
+    assert recipe_from_src["instrument"] == "MANDI"
+    assert recipe_from_src["wavelength_range"] == [2.0, 4.0]
+
+    recipe_legacy = runner._extract_reduce_recipe_from_derived_h5(
+        str(legacy_solve), ds_info={"name": "MANDI_13308_solve.h5"}
+    )
+    assert recipe_legacy is not None
+    assert recipe_legacy["nexus_files"] == [str(raw_nxs)]
+
+    vm = RainbowZonesViewModel(
+        replay_h5=None,
+        payload={"artifact_kind": "integrator", "panels": [], "peaks": []},
+        pipeline_runner=runner,
+    )
+    vm.replay_h5 = str(int_h5)
+    vm_lock = threading.RLock()
+    hydrate_calls: list[dict] = []
+    reloaded_images: list[str] = []
+    monkeypatch.setattr(
+        vm,
+        "reload",
+        lambda images_h5=None, frame_index=None: reloaded_images.append(str(images_h5)),
+    )
+
+    def _fake_hydrate_stage(
+        stage_id,
+        params,
+        on_complete_h5=None,
+        fallback_reason=None,
+        existing_job_record=None,
+        preserve_downstream=False,
+    ):
+        hydrate_calls.append(
+            {
+                "stage_id": stage_id,
+                "params": dict(params),
+                "preserve_downstream": preserve_downstream,
+            }
+        )
+        # Ensure downstream files were NOT deleted before/during hydration!
+        assert int_h5.is_file()
+        assert (work_dir / "solve.h5").is_file()
+        with h5py.File(cached_merged, "w") as hf_new:
+            hf_new.attrs["instrument"] = "MANDI"
+            hf_new.create_dataset("images", data=np.ones((1, 4, 4), dtype=np.float32))
+        if callable(on_complete_h5):
+            on_complete_h5(str(cached_merged))
+        return {"job_id": "gpu-hydrate-1", "state": "running", "hydrate_only": True}
+
+    monkeypatch.setattr(runner, "_submit_local_subhkl_stage", _fake_hydrate_stage)
+    h_info = runner._maybe_trigger_hydrate_reduce(vm, vm_lock, str(int_h5))
+    assert h_info is not None
+    assert h_info["hydrate_only"] is True
+    assert h_info["n_runs"] == 1
+    assert len(hydrate_calls) == 1
+    assert hydrate_calls[0]["stage_id"] == "reduce"
+    assert hydrate_calls[0]["preserve_downstream"] is True
+    # Completion hot-reloads images_h5 WITHOUT overwriting vm.replay_h5 (still integrated.h5!)
+    assert vm.replay_h5 == str(int_h5)
+    assert vm.payload_kwargs["images_h5"] == str(cached_merged)
+    assert reloaded_images == [str(cached_merged)]
