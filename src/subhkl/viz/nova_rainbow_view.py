@@ -250,14 +250,75 @@ def _is_strictly_inside_root(path_str: str, root_str: str) -> bool:
         return False
 
 
+_MAX_NDIP_COMPACT_UPLOAD_BYTES = 50 * 1024 * 1024
+
+
+def _chmod_world_rw(
+    path: str | os.PathLike[str] | None,
+    *,
+    is_dir: bool | None = None,
+) -> None:
+    """Best-effort chmod (0o777 dirs, 0o666 files) so Pulsar host cleanup never hits EACCES."""
+    if not path:
+        return
+    p_str = os.fspath(path)
+    with contextlib.suppress(OSError):
+        if os.path.islink(p_str):
+            return
+        dir_flag = os.path.isdir(p_str) if is_dir is None else bool(is_dir)
+        os.chmod(p_str, 0o777 if dir_flag else 0o666)
+
+
+def _get_staging_root() -> str:
+    """Return local NVMe staging directory (``SUBHKL_STAGING_DIR`` if set, else ``TMPDIR``)."""
+    raw_env = str(os.environ.get("SUBHKL_STAGING_DIR") or "").strip()
+    if raw_env and not raw_env.startswith("$"):
+        abs_env = os.path.abspath(raw_env)
+        with contextlib.suppress(OSError):
+            os.makedirs(abs_env, mode=0o777, exist_ok=True)
+            _chmod_world_rw(abs_env, is_dir=True)
+        if os.path.isdir(abs_env) and os.access(abs_env, os.W_OK | os.X_OK):
+            return abs_env
+    return os.path.abspath(tempfile.gettempdir())
+
+
+def _is_readonly_galaxy_dat(path: str | os.PathLike[str] | None) -> bool:
+    """Return True if ``path`` looks like a read-only Galaxy/Pulsar ``dataset_*.dat`` input."""
+    if not path:
+        return False
+    abs_p = os.path.abspath(os.fspath(path))
+    bn = os.path.basename(abs_p)
+    if bn.startswith("dataset_") and bn.endswith(".dat"):
+        return True
+    if "/staging" in abs_p:
+        staging_root = _get_staging_root()
+        if _is_strictly_inside_root(abs_p, staging_root):
+            return False
+        return not ("subhkl_work_" in abs_p or "subhkl_staging" in abs_p)
+    return False
+
+
+def _matching_temp_root(abs_p: str) -> str | None:
+    """Return the enclosing staging or TMPDIR root for ``abs_p``, or ``None``."""
+    roots = [_get_staging_root(), os.path.abspath(tempfile.gettempdir())]
+    seen: set[str] = set()
+    for cand_root in roots:
+        if cand_root in seen:
+            continue
+        seen.add(cand_root)
+        if _is_strictly_inside_root(abs_p, cand_root):
+            return cand_root
+    return None
+
+
 def register_temp_artifact(path: str | os.PathLike[str] | None) -> str | None:
-    """Track an app-created file or directory inside TMPDIR for removal at process exit."""
+    """Track an app-created file or directory inside staging/TMPDIR for removal at process exit."""
     global _ATEXIT_CLEANUP_REGISTERED
     if not path:
         return None
     abs_p = os.path.abspath(os.fspath(path))
-    tmp_root = os.path.abspath(tempfile.gettempdir())
-    if not _is_strictly_inside_root(abs_p, tmp_root):
+    tmp_root = _matching_temp_root(abs_p)
+    if not tmp_root:
         return None
     with _TEMP_CLEANUP_LOCK:
         _REGISTERED_TEMP_PATHS[abs_p] = tmp_root
@@ -268,14 +329,14 @@ def register_temp_artifact(path: str | os.PathLike[str] | None) -> str | None:
 
 
 def _remove_temp_artifact_now(path: str | os.PathLike[str] | None) -> bool:
-    """Immediately delete a single tracked TMPDIR file or directory if safe."""
+    """Immediately delete a single tracked staging/TMPDIR file or directory if safe."""
     if not path:
         return False
     abs_p = os.path.abspath(os.fspath(path))
     with _TEMP_CLEANUP_LOCK:
         recorded_root = _REGISTERED_TEMP_PATHS.pop(abs_p, None)
-    tmp_root = recorded_root or os.path.abspath(tempfile.gettempdir())
-    if not _is_strictly_inside_root(abs_p, tmp_root):
+    tmp_root = recorded_root or _matching_temp_root(abs_p)
+    if not tmp_root or not _is_strictly_inside_root(abs_p, tmp_root):
         return False
     with contextlib.suppress(OSError):
         if os.path.islink(abs_p) or os.path.isfile(abs_p):
@@ -337,16 +398,21 @@ def install_exit_cleanup_signal_handlers(
 
 
 class NovaGalaxyPipelineRunner:
-    """Orchestrates NDIP / Galaxy IMAGINE-X workflow steps on GPU Pulsar runners.
+    """Orchestrates NDIP / Galaxy IMAGINE-X diffraction workflow steps.
 
-    Designed so the lightweight visualization / NOVA GUI runs on a CPU container
-    (``JAX_PLATFORMS=cpu``) and dispatches heavy compute steps (``solve``,
-    ``predict``, ``integrate``) to Galaxy, which routes them to a GPU Pulsar
-    runner (e.g. ``imaginex1``):
-      - Stage 1 (Reduce & Merge): ``imaginex_subhkl_prepare_peaks`` (``merged.h5``)
-      - Stage 2 (Solve Lattice Ladder): ``imaginex_subhkl_solve`` (finder-less ``solve.h5``)
-      - Stage 3 (Predict & Integrate): ``imaginex_subhkl_predict`` -> ``imaginex_subhkl_integrate``
-      - Stage 4 (Merge & MTZ): ``imaginex_subhkl_integrate`` (MTZ export)
+    Supports two execution topologies:
+      1. **Local-staging GPU app mode** (``SUBHKL_EXEC_MODE=local``, or automatically inside
+         an NDIP interactive GPU tool session with ``EP_PATH`` and ``/SNS`` / ``/HFIR`` mounted):
+         - ``Reduce``, ``Solve``, and ``Integrate`` execute directly inside the app's local
+           NVMe staging directory (``SUBHKL_STAGING_DIR`` / ``TMPDIR``), keeping multi-GB
+           ``merged.h5`` / ``integrated.h5`` event and image arrays off Rucio/Ceph object storage.
+         - Only compact MB-scale deliverables (``solve.h5`` metadata, ``reflections.mtz``,
+           merged ``.mtz`` files, and merge tables/JSON) are uploaded to NDIP Galaxy History.
+         - Stage 4 (``Merge`` / Careless) still routes through NDIP Galaxy
+           (``imaginex_subhkl_merge``) whenever ``careless`` is not installed locally, exchanging
+           only compact ``.mtz`` files.
+      2. **Remote Galaxy tool mode** (``SUBHKL_EXEC_MODE=galaxy``, or thin client without local
+         facility mounts): dispatches all four stages via ``nova-galaxy`` -> Galaxy -> Pulsar.
     """
 
     STAGE_TOOLS: ClassVar[dict[str, list[str]]] = {
@@ -428,6 +494,8 @@ class NovaGalaxyPipelineRunner:
         self.active_job: dict[str, Any] | None = None
         self.step_timings: dict[str, dict[str, Any]] = {}
         self.current_frame_index: int | None = None
+        self._upload_lock = threading.RLock()
+        self._dataset_sig_by_path: dict[str, tuple[int, int, str]] = {}
         self._auto_discover_local_galaxy()
 
     def _sync_job_timing(self, job_record: dict[str, Any] | None) -> None:
@@ -1101,11 +1169,14 @@ class NovaGalaxyPipelineRunner:
         if parent_d:
             os.makedirs(parent_d, exist_ok=True)
         tmp_dst = f"{abs_d}.stage.{os.getpid()}.{threading.get_ident()}"
-        tmp_root = os.path.abspath(tempfile.gettempdir())
+        staging_roots = {
+            _get_staging_root(),
+            os.path.abspath(tempfile.gettempdir()),
+        }
         can_link = (
             allow_hardlink
             and (
-                abs_s.startswith(tmp_root + os.sep)
+                any(abs_s.startswith(r + os.sep) for r in staging_roots)
                 or os.path.dirname(abs_s) == parent_d
             )
             and os.access(abs_s, os.W_OK)
@@ -2221,10 +2292,14 @@ class NovaGalaxyPipelineRunner:
         if not wd or not os.path.isdir(wd):
             return
 
-        is_tmp_wd = os.path.abspath(wd).startswith(
-            os.path.abspath(tempfile.gettempdir())
+        is_tmp_wd = any(
+            os.path.abspath(wd).startswith(r)
+            for r in (_get_staging_root(), os.path.abspath(tempfile.gettempdir()))
         )
         known_map: dict[str, str] = getattr(self, "_dataset_id_by_path", {})
+        sig_map: dict[str, tuple[int, int, str]] = getattr(
+            self, "_dataset_sig_by_path", {}
+        )
 
         to_remove: list[str] = [
             "careless_metrics.json",
@@ -2269,9 +2344,20 @@ class NovaGalaxyPipelineRunner:
             fp = os.path.join(wd, fn)
             for p_key in (os.path.abspath(fp), os.path.realpath(fp)):
                 known_map.pop(p_key, None)
+                sig_map.pop(p_key, None)
             if os.path.isfile(fp):
                 with contextlib.suppress(OSError):
                     os.remove(fp)
+        stage_own_files = {
+            "reduce": ("merged.h5",),
+            "solve": ("solve.h5",),
+            "integrate": ("integrated.h5", "predictor.h5", "reflections.mtz"),
+        }
+        for own_fn in stage_own_files.get(mapped, ()):
+            own_fp = os.path.join(wd, own_fn)
+            for p_key in (os.path.abspath(own_fp), os.path.realpath(own_fp)):
+                known_map.pop(p_key, None)
+                sig_map.pop(p_key, None)
 
     def list_step_artifacts(
         self,
@@ -2527,13 +2613,14 @@ class NovaGalaxyPipelineRunner:
         last_stem = os.path.basename(raw_nxs[-1]).split(".")[0]
         tag = first_stem if len(raw_nxs) == 1 else f"{first_stem}_{last_stem}"
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
-        work_d = os.path.join(tempfile.gettempdir(), f"subhkl_work_{safe_tag}")
-        os.makedirs(work_d, exist_ok=True)
+        work_d = os.path.join(_get_staging_root(), f"subhkl_work_{safe_tag}")
+        os.makedirs(work_d, mode=0o777, exist_ok=True)
+        _chmod_world_rw(work_d, is_dir=True)
         register_temp_artifact(work_d)
         return work_d, f"{safe_tag}_merged.h5"
 
     def _resolve_work_dir_and_merged(self, merged_path: str) -> tuple[str, str]:
-        """Ensure a merged HDF5 file inside /tmp or Pulsar staging uses a dedicated /tmp/subhkl_work_<tag> directory."""
+        """Ensure a merged HDF5 file inside staging/TMPDIR or Pulsar inputs uses a dedicated subhkl_work_<tag> directory."""
         import glob as _glob
         import re as _re
         import shutil as _shutil
@@ -2541,15 +2628,14 @@ class NovaGalaxyPipelineRunner:
         abs_m = os.path.abspath(merged_path)
         parent_d = os.path.dirname(abs_m)
         orig_bn = os.path.basename(abs_m)
-        tmp_root = os.path.abspath(tempfile.gettempdir())
-        is_staging_dat = "/staging" in abs_m or (
-            orig_bn.startswith("dataset_") and orig_bn.endswith(".dat")
-        )
-        if parent_d != tmp_root and not is_staging_dat:
+        tmp_root = _get_staging_root()
+        tmp_roots = {tmp_root, os.path.abspath(tempfile.gettempdir())}
+        is_staging_dat = _is_readonly_galaxy_dat(abs_m)
+        if parent_d not in tmp_roots and not is_staging_dat:
             return parent_d, abs_m
 
         m_gx = _re.match(r"^subhkl_gx_([0-9a-fA-F]+)_(.+)$", orig_bn)
-        if m_gx and parent_d == tmp_root:
+        if m_gx and parent_d in tmp_roots:
             register_temp_artifact(abs_m)
         gx_ds_id = m_gx.group(1) if m_gx else None
         clean_bn = m_gx.group(2) if m_gx else orig_bn
@@ -2586,7 +2672,8 @@ class NovaGalaxyPipelineRunner:
             tag = bn or "dataset"
         safe_tag = "".join(c if (c.isalnum() or c in "._-") else "_" for c in tag)
         work_d = os.path.join(tmp_root, f"subhkl_work_{safe_tag}")
-        os.makedirs(work_d, exist_ok=True)
+        os.makedirs(work_d, mode=0o777, exist_ok=True)
+        _chmod_world_rw(work_d, is_dir=True)
         register_temp_artifact(work_d)
         dest_name = (
             clean_bn
@@ -2893,22 +2980,117 @@ class NovaGalaxyPipelineRunner:
             return explicit
         return "poly"
 
+    def _is_local_staging_mode(self) -> bool:
+        """Return True when heavy subhkl stages should run inside local NVMe staging.
+
+        Enabled when:
+          - ``SUBHKL_EXEC_MODE`` is ``local`` / ``staging`` / ``1`` / ``true``; or
+          - ``GALAXY_URL`` / ``GALAXY_API_KEY`` are absent; or
+          - running inside an NDIP interactive GPU tool container (``EP_PATH`` set)
+            with direct ``/SNS`` or ``/HFIR`` filesystem mounts.
+        Explicit ``SUBHKL_EXEC_MODE=galaxy`` / ``remote`` / ``0`` / ``false`` forces
+        remote Galaxy job execution for all stages.
+        """
+        raw_mode = str(os.environ.get("SUBHKL_EXEC_MODE") or "").strip().lower()
+        if raw_mode in ("local", "staging", "1", "true", "yes"):
+            return True
+        if raw_mode in ("galaxy", "remote", "0", "false", "no"):
+            return False
+        if not self.is_connected:
+            return True
+        return bool(os.environ.get("EP_PATH")) and self._has_local_sns_hfir_fs()
+
+    @staticmethod
+    def _has_local_careless_runner() -> bool:
+        """Return True if ``careless`` CLI or ``podman`` container runtime is available locally."""
+        import shutil as _shutil
+
+        return bool(_shutil.which("careless") or _shutil.which("podman"))
+
+    def _should_run_stage_locally(
+        self,
+        stage_id: str,
+        params: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Decide whether ``stage_id`` executes in local staging vs. remote NDIP Galaxy."""
+        if not self.is_connected:
+            return True, "GALAXY_URL / GALAXY_API_KEY not set"
+        if not self._is_local_staging_mode():
+            return False, ""
+        if stage_id == "merge":
+            # Keep Careless out of the subhkl container: when careless/podman is absent
+            # locally, dispatch Stage 4 through Galaxy using compact reflections.mtz.
+            if not self._has_local_careless_runner():
+                return False, ""
+            return True, "local staging execution (compact deliverables synced to NDIP)"
+        if stage_id == "reduce" and not self._has_local_sns_hfir_fs():
+            local_nxs = self._resolve_raw_nexus_inputs(params, _get_staging_root())
+            if not local_nxs or not any(os.path.isfile(p) for p in local_nxs):
+                return False, ""
+        return True, "local GPU staging (compact deliverables synced to NDIP)"
+
+    def _upload_compact_ndip_artifact(
+        self,
+        store: Any,
+        local_path: str,
+        file_ext: str,
+        *,
+        job_record: dict[str, Any] | None = None,
+        max_bytes: int = _MAX_NDIP_COMPACT_UPLOAD_BYTES,
+    ) -> str | None:
+        """Upload a compact deliverable (``<= max_bytes``) to NDIP Galaxy History once per file state."""
+        if not local_path or not os.path.isfile(local_path):
+            return None
+        try:
+            st = os.stat(local_path)
+        except OSError:
+            return None
+        if st.st_size <= 0 or st.st_size > max_bytes:
+            if isinstance(job_record, dict):
+                job_record["stdout"] = job_record.get("stdout", "") + (
+                    f"[ndip] Skipping Galaxy upload for '{os.path.basename(local_path)}' "
+                    f"({st.st_size / (1024 * 1024):.1f} MB > {max_bytes / (1024 * 1024):.0f} MB compact threshold)\n"
+                )
+            return None
+        abs_p = os.path.abspath(local_path)
+        real_p = os.path.realpath(local_path)
+        rec = job_record if isinstance(job_record, dict) else {"stdout": ""}
+        with self._upload_lock:
+            sig_map = getattr(self, "_dataset_sig_by_path", {})
+            prev = sig_map.get(abs_p) or sig_map.get(real_p)
+            if prev and prev[0] == st.st_size and prev[1] == st.st_mtime_ns and prev[2]:
+                return prev[2]
+            ds_id = self._ensure_galaxy_h5_dataset(
+                store,
+                local_path,
+                rec,
+                force_upload=True,
+                file_ext=file_ext,
+            )
+            if ds_id:
+                sig_entry = (st.st_size, st.st_mtime_ns, ds_id)
+                sig_map[abs_p] = sig_entry
+                sig_map[real_p] = sig_entry
+                self._dataset_sig_by_path = sig_map
+            return ds_id
+
     def submit_galaxy_stage(
         self,
         stage_id: str,
         params: dict[str, Any] | None = None,
         on_complete_h5: Any = None,
     ) -> dict[str, Any]:
-        """Submit a coarse NDIP workflow stage via nova-galaxy -> Galaxy -> Pulsar GPU container."""
+        """Submit a coarse NDIP workflow stage (local GPU staging or remote Galaxy/Pulsar)."""
         if stage_id not in self.STAGE_TOOLS:
             raise ValueError(f"Unknown pipeline stage: {stage_id}")
         params = dict(params or {})
-        if not self.is_connected:
+        run_locally, local_reason = self._should_run_stage_locally(stage_id, params)
+        if run_locally:
             return self._submit_local_subhkl_stage(
                 stage_id,
                 params,
                 on_complete_h5,
-                fallback_reason="GALAXY_URL / GALAXY_API_KEY not set",
+                fallback_reason=local_reason,
             )
 
         job_record: dict[str, Any] = {
@@ -3650,6 +3832,7 @@ class NovaGalaxyPipelineRunner:
                 "solve.h5",
                 "integrated.h5",
                 "predictor.h5",
+                "reflections.mtz",
                 "merged.mtz",
                 "scan.h5",
             }
@@ -3770,7 +3953,7 @@ class NovaGalaxyPipelineRunner:
                 for ch in os.path.basename(fname)
             )
             cache_dest = os.path.join(
-                tempfile.gettempdir(), f"subhkl_gx_{ds_id}_{safe_name}"
+                _get_staging_root(), f"subhkl_gx_{ds_id}_{safe_name}"
             )
             register_temp_artifact(cache_dest)
             if os.path.isfile(local_path) and not os.path.exists(cache_dest):
@@ -3844,11 +4027,7 @@ class NovaGalaxyPipelineRunner:
                 not merged_path
                 or not os.path.isfile(merged_path)
                 or not merged_has_images
-                or "/staging" in str(merged_path)
-                or (
-                    os.path.basename(str(merged_path)).startswith("dataset_")
-                    and str(merged_path).endswith(".dat")
-                )
+                or _is_readonly_galaxy_dat(merged_path)
             ) and params.get("peaks_file"):
                 disc_m = self._discover_or_fetch_galaxy_images_h5(
                     params.get("peaks_file")
@@ -3865,7 +4044,7 @@ class NovaGalaxyPipelineRunner:
             work_dir, merged_path = (
                 self._resolve_work_dir_and_merged(merged_path)
                 if merged_path
-                else (tempfile.gettempdir(), "")
+                else (_get_staging_root(), "")
             )
             self.invalidate_subsequent_stages(stage_id, work_dir)
             solve_path = params.get("peaks_file") or os.path.join(work_dir, "solve.h5")
@@ -4161,8 +4340,12 @@ class NovaGalaxyPipelineRunner:
                     tool_inputs[f"inputs_{i_nxs}|input"] = nxs_p
             elif stage_id == "merge":
                 primary_tool = "imaginex_subhkl_merge"
+                staging_roots_abs = {
+                    _get_staging_root(),
+                    os.path.abspath(tempfile.gettempdir()),
+                }
                 if (
-                    work_dir == os.path.abspath(tempfile.gettempdir())
+                    work_dir in staging_roots_abs
                     and params.get("peaks_file")
                     and os.path.isfile(str(params.get("peaks_file")))
                 ):
@@ -4214,25 +4397,38 @@ class NovaGalaxyPipelineRunner:
                     raise RuntimeError(
                         f"Unmerged reflections.mtz not found in {work_dir}; run Integrate first or upload an .mtz dataset."
                     )
-                mtz_id = matched_hist_mtz_id or self._ensure_galaxy_h5_dataset(
+                mtz_id = matched_hist_mtz_id or self._upload_compact_ndip_artifact(
                     store,
                     mtz_in_path,
-                    job_record,
-                    force_upload=True,
-                    file_ext="mtz",
+                    "mtz",
+                    job_record=job_record,
+                    max_bytes=256 * 1024 * 1024,
                 )
+                if not mtz_id:
+                    mtz_id = self._ensure_galaxy_h5_dataset(
+                        store,
+                        mtz_in_path,
+                        job_record,
+                        force_upload=True,
+                        file_ext="mtz",
+                    )
                 merge_mode = self._resolve_careless_merge_mode(
                     params,
                     work_dir=work_dir,
                     merged_path=merged_path,
                     solve_path=solve_path,
                 )
-                if merge_mode == "mono":
-                    _merge_ver = self._get_tool_version("imaginex_subhkl_merge")
-                    if _merge_ver in ("0.1.0", "0.1.0-dev", "0.1.1", "0.1.2"):
-                        raise RuntimeError(
-                            f"imaginex_subhkl_merge {_merge_ver} on {self.galaxy_url} lacks monochromatic ('mono') mode for TOF data"
-                        )
+                _merge_ver = self._get_tool_version("imaginex_subhkl_merge") or ""
+                _legacy_merge_tool = _merge_ver in (
+                    "0.1.0",
+                    "0.1.0-dev",
+                    "0.1.1",
+                    "0.1.2",
+                )
+                if merge_mode == "mono" and _legacy_merge_tool:
+                    raise RuntimeError(
+                        f"imaginex_subhkl_merge {_merge_ver} on {self.galaxy_url} lacks monochromatic ('mono') mode for TOF data"
+                    )
                 tool_inputs = {
                     "reflections": {"src": "hda", "id": mtz_id},
                     "mode": merge_mode,
@@ -4241,6 +4437,17 @@ class NovaGalaxyPipelineRunner:
                     "mergeHalfDatasets": True,
                     "anomalous": bool(params.get("anomalous", False)),
                 }
+                if not _legacy_merge_tool and _merge_ver:
+                    raw_wpb = params.get("wilson_prior_b")
+                    if raw_wpb not in (None, "", "auto", "default"):
+                        with contextlib.suppress(TypeError, ValueError):
+                            wpb_f = float(raw_wpb)
+                            if wpb_f > 0.0:
+                                tool_inputs["wilsonPriorB"] = wpb_f
+                    if "lorentz_correction" in params:
+                        tool_inputs["lorentzCorrection"] = bool(
+                            params.get("lorentz_correction")
+                        )
             else:
                 primary_tool = "imaginex_subhkl_metrics"
                 idx_id = self._ensure_galaxy_h5_dataset(store, solve_path, job_record)
@@ -5055,9 +5262,17 @@ class NovaGalaxyPipelineRunner:
         suggested_paths: list[str] = []
         oncat_existing: list[str] = []
         oncat_missing: list[str] = []
-        galaxy_unreachable = not self.is_connected
+        prefer_local_fs = self._is_local_staging_mode() and (
+            self._has_local_sns_hfir_fs()
+            or any(os.path.exists(self._remap_to_facility_root(p)) for p in expanded)
+        )
+        galaxy_unreachable = (not self.is_connected) or prefer_local_fs
 
-        if self.is_connected and self._has_tool_on_galaxy("neutrons_load_data"):
+        if (
+            not prefer_local_fs
+            and self.is_connected
+            and self._has_tool_on_galaxy("neutrons_load_data")
+        ):
             try:
                 ndip_checked = True
                 checked_via = "ndip_neutrons_load_data"
@@ -6051,11 +6266,7 @@ class NovaGalaxyPipelineRunner:
         if (
             not raw_img
             or not os.path.isfile(raw_img)
-            or "/staging" in str(raw_img)
-            or (
-                os.path.basename(str(raw_img)).startswith("dataset_")
-                and str(raw_img).endswith(".dat")
-            )
+            or _is_readonly_galaxy_dat(raw_img)
         ) and params.get("peaks_file"):
             from subhkl.viz.rainbow_zones import _discover_images_h5
 
@@ -6067,8 +6278,9 @@ class NovaGalaxyPipelineRunner:
                 "No merged scan HDF5 file is loaded; run Step 1 (Reduce & Merge) "
                 "or select a merged.h5 dataset from History first."
             )
+        staging_root = _get_staging_root()
         merged_path = os.path.abspath(
-            raw_img or os.path.join(tempfile.gettempdir(), "merged.h5")
+            raw_img or os.path.join(staging_root, "merged.h5")
         )
         work_dir, merged_path = self._resolve_work_dir_and_merged(merged_path)
         self.invalidate_subsequent_stages(stage_id, work_dir)
@@ -6095,10 +6307,10 @@ class NovaGalaxyPipelineRunner:
                 solve_path = solve_dest
 
         ts = int(time.time())
-        out_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_{stage_id}_{ts}.h5")
-        pred_tmp_h5 = os.path.join(tempfile.gettempdir(), f"subhkl_pred_{ts}.h5")
-        mtz_tmp_path = os.path.join(tempfile.gettempdir(), f"subhkl_refl_{ts}.mtz")
-        reduce_tmp_dir = os.path.join(tempfile.gettempdir(), f"subhkl_reduce_{ts}")
+        out_h5 = os.path.join(staging_root, f"subhkl_{stage_id}_{ts}.h5")
+        pred_tmp_h5 = os.path.join(staging_root, f"subhkl_pred_{ts}.h5")
+        mtz_tmp_path = os.path.join(staging_root, f"subhkl_refl_{ts}.mtz")
+        reduce_tmp_dir = os.path.join(staging_root, f"subhkl_reduce_{ts}")
         job_stage_temps = [
             out_h5,
             out_h5[:-3] + ".blind.h5",
@@ -6639,6 +6851,7 @@ class NovaGalaxyPipelineRunner:
                     os.path.dirname(merged_path),
                     os.path.dirname(solve_path),
                     work_dir,
+                    staging_root,
                     tempfile.gettempdir(),
                     *raw_dirs,
                 }
@@ -6688,7 +6901,9 @@ class NovaGalaxyPipelineRunner:
 
         gpu_env = os.environ.copy()
         gpu_env["JAX_PLATFORMS"] = ""
+        gpu_env["TMPDIR"] = staging_root
         gpu_env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        gpu_env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
         gpu_env.setdefault("OPENBLAS_NUM_THREADS", "1")
         gpu_env.setdefault("OMP_NUM_THREADS", "1")
         gpu_env.setdefault("MKL_NUM_THREADS", "1")
@@ -6963,6 +7178,8 @@ class NovaGalaxyPipelineRunner:
                                 except OSError:
                                     shutil.copy2(merged_dest, merged_link)
                             final_h5 = merged_dest
+                            _chmod_world_rw(merged_dest, is_dir=False)
+                            _chmod_world_rw(merged_link, is_dir=False)
                             job_record["stdout"] += (
                                 f"\n[subhkl] Saved {merged_label} -> {merged_dest}\n"
                             )
@@ -6971,41 +7188,23 @@ class NovaGalaxyPipelineRunner:
                                 f"\n[subhkl] Warning saving {merged_dest}: {copy_exc}\n"
                             )
 
+                        # Keep multi-hundred-MB / multi-GB reduced scan HDF5 in local NVMe staging;
+                        # never upload merged.h5 to NDIP / Rucio object storage.
                         if self.is_connected and os.path.isfile(final_h5):
-
-                            def _bg_upload_reduced(
-                                _f_h5: str = final_h5,
-                                _lbl: str = merged_label,
-                            ) -> None:
-                                with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                                    store = self.get_datastore("IMAGINE-X SubHKL")
-                                    bg_rec: dict[str, Any] = {"stdout": ""}
-                                    up_id = self._ensure_galaxy_h5_dataset(
-                                        store,
-                                        _f_h5,
-                                        bg_rec,
-                                        force_upload=True,
-                                        file_ext="h5",
-                                    )
-                                    job_record["outputs"] = [
-                                        {
-                                            "id": up_id,
-                                            "name": os.path.basename(_f_h5),
-                                            "extension": "h5",
-                                        }
-                                    ]
-
-                            threading.Thread(
-                                target=_bg_upload_reduced, daemon=True
-                            ).start()
+                            sz_mb = os.path.getsize(final_h5) / (1024.0 * 1024.0)
+                            job_record["stdout"] += (
+                                f"[ndip] Kept '{merged_label}' in local staging ({sz_mb:.1f} MB; not uploaded to NDIP)\n"
+                            )
                     elif stage_id == "solve" and os.path.isfile(out_h5):
                         try:
                             shutil.copy2(out_h5, solve_dest)
+                            _chmod_world_rw(solve_dest, is_dir=False)
                             for suffix in (".stages.h5", ".blind.h5"):
                                 src_sub = out_h5[:-3] + suffix
                                 dst_sub = solve_dest[:-3] + suffix
                                 if os.path.isfile(src_sub):
                                     shutil.copy2(src_sub, dst_sub)
+                                    _chmod_world_rw(dst_sub, is_dir=False)
                             final_h5 = solve_dest
                             job_record["stdout"] += (
                                 f"\n[subhkl] Saved solve.h5 -> {solve_dest}\n"
@@ -7021,20 +7220,20 @@ class NovaGalaxyPipelineRunner:
                                 with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                     store = self.get_datastore("IMAGINE-X SubHKL")
                                     bg_rec: dict[str, Any] = {"stdout": ""}
-                                    up_id = self._ensure_galaxy_h5_dataset(
+                                    up_id = self._upload_compact_ndip_artifact(
                                         store,
                                         _f_h5,
-                                        bg_rec,
-                                        force_upload=True,
-                                        file_ext="h5",
+                                        "h5",
+                                        job_record=bg_rec,
                                     )
-                                    job_record["outputs"] = [
-                                        {
-                                            "id": up_id,
-                                            "name": "solve.h5",
-                                            "extension": "h5",
-                                        }
-                                    ]
+                                    if up_id:
+                                        job_record["outputs"] = [
+                                            {
+                                                "id": up_id,
+                                                "name": "solve.h5",
+                                                "extension": "h5",
+                                            }
+                                        ]
 
                             threading.Thread(
                                 target=_bg_upload_solve, daemon=True
@@ -7043,16 +7242,19 @@ class NovaGalaxyPipelineRunner:
                         try:
                             if os.path.isfile(pred_tmp_h5):
                                 shutil.copy2(pred_tmp_h5, pred_dest)
+                                _chmod_world_rw(pred_dest, is_dir=False)
                                 job_record["stdout"] += (
                                     f"\n[subhkl] Saved predictor.h5 -> {pred_dest}\n"
                                 )
                             shutil.copy2(out_h5, integrated_dest)
+                            _chmod_world_rw(integrated_dest, is_dir=False)
                             final_h5 = integrated_dest
                             job_record["stdout"] += (
                                 f"[subhkl] Saved integrated.h5 -> {integrated_dest}\n"
                             )
                             if os.path.isfile(mtz_tmp_path):
                                 shutil.copy2(mtz_tmp_path, mtz_dest)
+                                _chmod_world_rw(mtz_dest, is_dir=False)
                                 job_record["stdout"] += (
                                     f"[subhkl] Saved reflections.mtz -> {mtz_dest}\n"
                                 )
@@ -7061,64 +7263,28 @@ class NovaGalaxyPipelineRunner:
                                 f"\n[subhkl] Warning saving integrated outputs: {copy_exc}\n"
                             )
 
-                        if self.is_connected:
+                        # Upload ONLY compact reflections.mtz to NDIP History (reused directly by
+                        # Galaxy Careless Merge); keep integrated.h5 and predictor.h5 in local staging.
+                        if self.is_connected and os.path.isfile(mtz_dest):
 
-                            def _bg_upload_integrate(
-                                _f_h5: str = final_h5,
-                                _p_h5: str = pred_dest,
-                                _m_mtz: str = mtz_dest,
-                            ) -> None:
+                            def _bg_upload_integrate(_m_mtz: str = mtz_dest) -> None:
                                 with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                                     store = self.get_datastore("IMAGINE-X SubHKL")
                                     bg_rec: dict[str, Any] = {"stdout": ""}
-                                    outs_up = []
-                                    if os.path.isfile(_f_h5):
-                                        int_id = self._ensure_galaxy_h5_dataset(
-                                            store,
-                                            _f_h5,
-                                            bg_rec,
-                                            force_upload=True,
-                                            file_ext="h5",
-                                        )
-                                        outs_up.append(
-                                            {
-                                                "id": int_id,
-                                                "name": "integrated.h5",
-                                                "extension": "h5",
-                                            }
-                                        )
-                                    if os.path.isfile(_p_h5):
-                                        pred_id = self._ensure_galaxy_h5_dataset(
-                                            store,
-                                            _p_h5,
-                                            bg_rec,
-                                            force_upload=True,
-                                            file_ext="h5",
-                                        )
-                                        outs_up.append(
-                                            {
-                                                "id": pred_id,
-                                                "name": "predictor.h5",
-                                                "extension": "h5",
-                                            }
-                                        )
-                                    if os.path.isfile(_m_mtz):
-                                        mtz_id = self._ensure_galaxy_h5_dataset(
-                                            store,
-                                            _m_mtz,
-                                            bg_rec,
-                                            force_upload=True,
-                                            file_ext="binary",
-                                        )
-                                        outs_up.append(
+                                    mtz_id = self._upload_compact_ndip_artifact(
+                                        store,
+                                        _m_mtz,
+                                        "mtz",
+                                        job_record=bg_rec,
+                                    )
+                                    if mtz_id:
+                                        job_record["outputs"] = [
                                             {
                                                 "id": mtz_id,
                                                 "name": "reflections.mtz",
-                                                "extension": "binary",
+                                                "extension": "mtz",
                                             }
-                                        )
-                                    if outs_up:
-                                        job_record["outputs"] = outs_up
+                                        ]
 
                             threading.Thread(
                                 target=_bg_upload_integrate, daemon=True
@@ -7139,6 +7305,15 @@ class NovaGalaxyPipelineRunner:
                             job_record["stdout"] += (
                                 f"\n[careless] Warning stamping merge results into HDF5: {merge_exc}\n"
                             )
+                        for _mfn in (
+                            "merged.mtz",
+                            "predictions.mtz",
+                            "xval.mtz",
+                            "careless_metrics.json",
+                            "merge_table.csv",
+                            "merge_table.html",
+                        ):
+                            _chmod_world_rw(os.path.join(work_dir, _mfn), is_dir=False)
                         if self.is_connected:
 
                             def _bg_upload_merge(_wdir: str = work_dir) -> None:
@@ -7147,29 +7322,28 @@ class NovaGalaxyPipelineRunner:
                                     bg_rec: dict[str, Any] = {"stdout": ""}
                                     outs_up = []
                                     for fn, ext in (
-                                        ("merged.mtz", "binary"),
-                                        ("predictions.mtz", "binary"),
-                                        ("xval.mtz", "binary"),
+                                        ("merged.mtz", "mtz"),
+                                        ("xval.mtz", "mtz"),
                                         ("careless_metrics.json", "json"),
                                         ("merge_table.csv", "csv"),
                                         ("merge_table.html", "html"),
                                     ):
                                         fp = os.path.join(_wdir, fn)
                                         if os.path.isfile(fp):
-                                            did = self._ensure_galaxy_h5_dataset(
+                                            did = self._upload_compact_ndip_artifact(
                                                 store,
                                                 fp,
-                                                bg_rec,
-                                                force_upload=True,
-                                                file_ext=ext,
+                                                ext,
+                                                job_record=bg_rec,
                                             )
-                                            outs_up.append(
-                                                {
-                                                    "id": did,
-                                                    "name": fn,
-                                                    "extension": ext,
-                                                }
-                                            )
+                                            if did:
+                                                outs_up.append(
+                                                    {
+                                                        "id": did,
+                                                        "name": fn,
+                                                        "extension": ext,
+                                                    }
+                                                )
                                     if outs_up:
                                         job_record["outputs"] = outs_up
 
@@ -7761,13 +7935,14 @@ class NovaGalaxyPipelineRunner:
                                         ):
                                             bdata = self._api_request(
                                                 "GET",
-                                                f"/api/datasets/{oid}/display",
+                                                f"/api/datasets/{oid}/display?to_ext=data",
                                                 raw=True,
-                                                timeout=180.0,
+                                                timeout=90.0,
                                             )
                                             dest_p = os.path.join(work_dir, dest_name)
                                             with open(dest_p, "wb") as f:
                                                 f.write(bdata)
+                                            _chmod_world_rw(dest_p, is_dir=False)
                                             known_map = getattr(
                                                 self, "_dataset_id_by_path", {}
                                             )
@@ -7790,6 +7965,7 @@ class NovaGalaxyPipelineRunner:
 
                                         with contextlib.suppress(OSError):
                                             _shutil.copy2(pf_cand, int_target)
+                                            _chmod_world_rw(int_target, is_dir=False)
                                 if os.path.isfile(int_target):
                                     self._stamp_careless_merge_into_h5(
                                         int_target, work_dir, job_record
@@ -7798,6 +7974,42 @@ class NovaGalaxyPipelineRunner:
                                     if callable(on_complete_h5):
                                         on_complete_h5(int_target)
                                         job_record["updated_payload_ready"] = True
+                                if self.is_connected:
+
+                                    def _bg_upload_merge_tables(
+                                        _wdir: str = work_dir,
+                                    ) -> None:
+                                        with contextlib.suppress(
+                                            *_NOVA_RECOVERABLE_ERRORS
+                                        ):
+                                            store_t = self.get_datastore(
+                                                "IMAGINE-X SubHKL"
+                                            )
+                                            bg_rec_t: dict[str, Any] = {"stdout": ""}
+                                            known_ids = getattr(
+                                                self, "_dataset_id_by_path", {}
+                                            )
+                                            for fn_t, ext_t in (
+                                                ("merge_table.csv", "csv"),
+                                                ("merge_table.html", "html"),
+                                            ):
+                                                fp_t = os.path.join(_wdir, fn_t)
+                                                if (
+                                                    os.path.isfile(fp_t)
+                                                    and os.path.abspath(fp_t)
+                                                    not in known_ids
+                                                ):
+                                                    _chmod_world_rw(fp_t, is_dir=False)
+                                                    self._upload_compact_ndip_artifact(
+                                                        store_t,
+                                                        fp_t,
+                                                        ext_t,
+                                                        job_record=bg_rec_t,
+                                                    )
+
+                                    threading.Thread(
+                                        target=_bg_upload_merge_tables, daemon=True
+                                    ).start()
                             elif (
                                 final_step
                                 and mtz_outs

@@ -8001,3 +8001,156 @@ def test_remote_galaxy_slim_h5_range_sync_skips_tof_events_and_links_provenance(
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_local_staging_gpu_mode_and_galaxy_careless_merge_routing(
+    tmp_path, monkeypatch
+) -> None:
+    """Verify local-staging GPU routing, Pulsar staging path handling, and compact-only NDIP uploads."""
+    import os
+    import stat
+
+    from subhkl.viz.nova_rainbow_view import (
+        NovaGalaxyPipelineRunner,
+        _get_staging_root,
+        _is_readonly_galaxy_dat,
+    )
+
+    # Simulate Pulsar NVMe working directory (/data/staging/<job>/working/subhkl_staging)
+    pulsar_staging = (
+        tmp_path / "data" / "staging" / "282645" / "working" / "subhkl_staging"
+    )
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(pulsar_staging))
+    resolved_staging = _get_staging_root()
+    assert resolved_staging == str(pulsar_staging)
+    assert (os.stat(pulsar_staging).st_mode & 0o777) == 0o777
+
+    # Read-only Galaxy dataset_*.dat inside /staging/inputs is detected, whereas our
+    # writable subhkl_staging / subhkl_work_* paths under /data/staging/<job>/working are NOT.
+    ro_dat = tmp_path / "data" / "staging" / "282645" / "inputs" / "dataset_abc123.dat"
+    assert _is_readonly_galaxy_dat(ro_dat) is True
+    runner = NovaGalaxyPipelineRunner(
+        galaxy_url="https://ndip-test.ornl.gov",
+        galaxy_api_key="mock_key",
+        history_id="hist_local_stage",
+    )
+    work_d, merged_lbl = runner._work_dir_for_reduce(
+        ["/SNS/MANDI/IPTS-36185/nexus/MANDI_13171.nxs.h5"], str(pulsar_staging)
+    )
+    assert work_d.startswith(str(pulsar_staging))
+    assert stat.S_IMODE(os.stat(work_d).st_mode) == 0o777
+    staged_merged = os.path.join(work_d, merged_lbl)
+    with h5py.File(staged_merged, "w") as hf:
+        hf.create_dataset("images", data=np.zeros((1, 8, 8), dtype=np.float32))
+    assert _is_readonly_galaxy_dat(staged_merged) is False
+    wd2, mp2 = runner._resolve_work_dir_and_merged(staged_merged)
+    assert wd2 == work_d
+    assert mp2 == staged_merged
+
+    # Default (no SUBHKL_EXEC_MODE, no EP_PATH) preserves remote Galaxy mode for unit tests
+    monkeypatch.delenv("SUBHKL_EXEC_MODE", raising=False)
+    monkeypatch.delenv("EP_PATH", raising=False)
+    assert runner._is_local_staging_mode() is False
+
+    # Inside NDIP interactive tool container (EP_PATH set + /SNS or /HFIR mounted), local staging activates automatically
+    monkeypatch.setenv("EP_PATH", "/interactivetool/ep")
+    monkeypatch.setattr(runner, "_has_local_sns_hfir_fs", lambda: True)
+    assert runner._is_local_staging_mode() is True
+
+    # Explicit SUBHKL_EXEC_MODE=galaxy overrides EP_PATH
+    monkeypatch.setenv("SUBHKL_EXEC_MODE", "galaxy")
+    assert runner._is_local_staging_mode() is False
+
+    # Explicit SUBHKL_EXEC_MODE=local routes Reduce, Solve, Integrate locally, while
+    # routing Merge through Galaxy whenever careless/podman is absent locally.
+    monkeypatch.setenv("SUBHKL_EXEC_MODE", "local")
+    monkeypatch.setattr(runner, "_has_local_careless_runner", lambda: False)
+
+    local_dispatched: list[str] = []
+    galaxy_dispatched: list[str] = []
+
+    def _fake_local_stage(stage_id, params, on_complete_h5=None, fallback_reason=None):
+        local_dispatched.append(stage_id)
+        return {
+            "stage_id": stage_id,
+            "mode": "container_gpu",
+            "reason": fallback_reason,
+        }
+
+    def _fake_galaxy_thread(stage_id, params, job_record, on_complete_h5=None):
+        galaxy_dispatched.append(stage_id)
+        job_record["state"] = "ok"
+
+    monkeypatch.setattr(runner, "_submit_local_subhkl_stage", _fake_local_stage)
+    monkeypatch.setattr(runner, "_dispatch_nova_galaxy_thread", _fake_galaxy_thread)
+
+    for stg in ("reduce", "solve", "integrate"):
+        res_s = runner.submit_galaxy_stage(stg, {"images_file": staged_merged})
+        assert res_s["mode"] == "container_gpu"
+    res_m = runner.submit_galaxy_stage("merge", {"images_file": staged_merged})
+    assert res_m["mode"] == "ndip_galaxy_rest"
+    for _ in range(20):
+        if "merge" in galaxy_dispatched:
+            break
+        import time as _t
+
+        _t.sleep(0.01)
+    assert local_dispatched == ["reduce", "solve", "integrate"]
+    assert galaxy_dispatched == ["merge"]
+
+    # When careless/podman IS available locally, Merge can also run locally
+    monkeypatch.setattr(runner, "_has_local_careless_runner", lambda: True)
+    res_m_local = runner.submit_galaxy_stage("merge", {"images_file": staged_merged})
+    assert res_m_local["mode"] == "container_gpu"
+    assert local_dispatched[-1] == "merge"
+
+    # Compact upload helper skips oversized files (> max_bytes) and deduplicates identical (size, mtime_ns)
+    upload_calls: list[str] = []
+
+    def _fake_ensure_ds(_store, lpath, _rec, force_upload=False, file_ext="h5"):
+        upload_calls.append(f"{os.path.basename(lpath)}:{file_ext}:{force_upload}")
+        return f"ds_{len(upload_calls)}"
+
+    monkeypatch.setattr(runner, "_ensure_galaxy_h5_dataset", _fake_ensure_ds)
+    mtz_file = os.path.join(work_d, "reflections.mtz")
+    with open(mtz_file, "wb") as fm:
+        fm.write(b"MTZ " * 256)
+    ds1 = runner._upload_compact_ndip_artifact(object(), mtz_file, "mtz")
+    ds2 = runner._upload_compact_ndip_artifact(object(), mtz_file, "mtz")
+    assert ds1 == "ds_1"
+    assert ds2 == "ds_1"
+    assert upload_calls == ["reflections.mtz:mtz:True"]
+
+    # Oversized artifact (e.g. merged.h5 exceeding compact ceiling) is never uploaded
+    rec_skip: dict[str, str] = {"stdout": ""}
+    skipped = runner._upload_compact_ndip_artifact(
+        object(), mtz_file, "h5", job_record=rec_skip, max_bytes=128
+    )
+    assert skipped is None
+    assert "Skipping Galaxy upload" in rec_skip["stdout"]
+    assert len(upload_calls) == 1
+
+    # Re-running Integrate invalidates cached signature so updated reflections.mtz uploads fresh
+    runner.invalidate_subsequent_stages("integrate", work_d)
+    with open(mtz_file, "wb") as fm:
+        fm.write(b"MTZ " * 300)
+    ds3 = runner._upload_compact_ndip_artifact(object(), mtz_file, "mtz")
+    assert ds3 == "ds_2"
+    assert len(upload_calls) == 2
+
+    # check_neutron_paths in local staging mode verifies directly via local filesystem without calling Galaxy
+    local_nxs = tmp_path / "MANDI_13171.nxs.h5"
+    with h5py.File(local_nxs, "w") as hf_n:
+        hf_n.create_dataset("entry/title", data=np.bytes_("MANDI local staging test"))
+    nld_called = False
+
+    def _forbid_has_tool(_tid: str) -> bool:
+        nonlocal nld_called
+        nld_called = True
+        return True
+
+    monkeypatch.setattr(runner, "_has_tool_on_galaxy", _forbid_has_tool)
+    chk = runner.check_neutron_paths({"paths": [str(local_nxs)], "ingest_mode": "file"})
+    assert chk["ok"] is True
+    assert chk["checked_via"] == "local_filesystem"
+    assert nld_called is False
