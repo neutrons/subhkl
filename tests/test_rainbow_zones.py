@@ -5425,6 +5425,33 @@ def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
     )
     assert len(py_mandi_380) >= 15
 
+    # Also build a genuine P 61 2 2 payload (79.91 x 79.91 x 238.0 A, gamma=120, V=1.32M A^3)
+    # on MANDI with wavelength [0.65, 3.0] A to test direct Ewald-shell rod prediction down to d_min = 0.50 A!
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+
+    p6122_cell = [79.91, 79.91, 238.0, 90.0, 90.0, 120.0]
+    b_p6122, _ = cartesian_matrix_metric_tensor(
+        79.91, 79.91, 238.0, *np.deg2rad([90.0, 90.0, 120.0])
+    )
+    p6122_solve_h5 = tmp_path / "mandi_p6122.h5"
+    with h5py.File(p6122_solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["sample/space_group"] = "P 61 2 2"
+        hf["sample/cell"] = np.array(p6122_cell, dtype=float)
+        hf["sample/U"] = u_prot
+        hf["sample/B"] = b_p6122
+        hf["instrument/wavelength"] = np.array([0.65, 3.0], dtype=float)
+    p6122_payload = build_rainbow_zone_payload(
+        replay_h5=p6122_solve_h5,
+        instrument="MANDI",
+        d_min=3.50,
+        wavelength_range=(0.65, 3.0),
+        include_panel_images=False,
+    )
+    p6122_payload["panels"] = [
+        pn for pn in p6122_payload["panels"] if int(pn["bank"]) in mandi_active_bids
+    ]
+
     out_json_path = tmp_path / "dyn_dmin_and_det_lod_out.json"
     js_file = tmp_path / "dyn_dmin_and_det_lod_test.js"
     js_file.write_text(
@@ -5556,8 +5583,9 @@ const detCanvasEl = getEl("canvas-detector");
 detCanvasEl.getContext("2d");
 const detLog = ctxLogs.get("canvas-detector");
 
-// 1. Finite unit-cell-volume-aware d_min floor for V ~ 296,000 A^3
+// 1. Unlocked 0.50 A d_min floor + 2M full-sphere pool crossover for V ~ 296,000 A^3
 const protFloor = getDynamicDminFloor();
+const protPoolFloor = getFullSpherePoolDminFloor();
 const sliderMinAttr = Number(slDminEl.min);
 const initialPeakSource = state.peakSource;
 const initialIntegCount = INTEGRATED_PEAKS.length;
@@ -5678,6 +5706,7 @@ slWlMinEl.dispatchEvent({{ type: "input", target: slWlMinEl }});
 const mandiPayload = {json.dumps(mandi_payload)};
 recomputeBoundsAndReload(mandiPayload, {{ resetSelectedFrame: true }});
 const hugeCellFloor = getDynamicDminFloor();
+const hugeCellPoolFloor = getFullSpherePoolDminFloor();
 slDminEl.value = "3.80";
 slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
 const mandiPred380 = PEAKS.map(p => ({{
@@ -5687,21 +5716,130 @@ const mandiPred380 = PEAKS.map(p => ({{
   col: p.col,
 }}));
 
-// 5. Verify P 6_1 22 (a=b=79.91, c=238.0) hexagonal symmetry + relaxed ~15% d_min floor (~1.41 A vs old 1.67 A)
+// 5. Verify P 6_1 22 (a=b=79.91, c=238.0) hexagonal symmetry + unlocked 0.50 A Ewald-shell rod predictor!
+const p6122Payload = {json.dumps(p6122_payload)};
+recomputeBoundsAndReload(p6122Payload, {{ resetSelectedFrame: true }});
 const inpSgNode = getEl("inp-sg");
 const inpANode = getEl("inp-a");
 const inpCNode = getEl("inp-c");
 inpSgNode.value = "P 6_1 22";
 inpSgNode.dispatchEvent({{ type: "change", target: inpSgNode }});
-inpANode.value = "79.91";
-inpANode.dispatchEvent({{ type: "input", target: inpANode }});
-inpCNode.value = "238.0";
-inpCNode.dispatchEvent({{ type: "change", target: inpCNode }});
 const p6122Floor = getDynamicDminFloor();
+const p6122PoolFloor = getFullSpherePoolDminFloor();
 const p6122Gamma = parseFloat(getEl("inp-gamma").value);
 slDminEl.value = "1.45";
 slDminEl.dispatchEvent({{ type: "change", target: slDminEl }});
 const p6122Allowed145 = state.dMin;
+
+// Push P 6_1 22 all the way down to d_min = 0.50 A (44.2M full-sphere lattice points!).
+// (a) Short-wavelength slice [0.74, 0.79] A (~18k reflections down to ~0.58 A): verify exact 1:1 Python/JS Ewald-shell parity.
+const slWlMinNode = getEl("slider-wl-min");
+const slWlMaxNode = getEl("slider-wl-max");
+state.lamMin = 0.74;
+state.lamMax = 0.79;
+updateWavelengthLabels();
+slDminEl.value = "0.50";
+slDminEl.dispatchEvent({{ type: "input", target: slDminEl }});
+const p6122Allowed050 = state.dMin;
+const p6122PoolAt050IsNull = ensureDynamicHklPool(0.50) === null;
+const p6122Pred050 = PEAKS.map(p => ({{
+  bank: p.bank,
+  hkl: p.hkl,
+  row: p.row,
+  col: p.col,
+  d: p.d_spacing,
+  wl: p.wavelength,
+  det_x: p.det_x,
+  det_y: p.det_y,
+}}));
+
+// (b) Wide white-beam [0.65, 3.00] A at d_min = 0.50 A (>150k hits on 2 banks!):
+// Verify Tier-1 1x overview LOD (~300 spots) AND Tier-2 36x zoomed viewport-frustum streaming (<0.58 A spots!).
+state.lamMin = 0.65;
+state.lamMax = 3.00;
+updateWavelengthLabels();
+const t0Ewald = Date.now();
+repredictPeaksDynamic({{ userAdjusted: true }});
+const p6122EwaldMs = Date.now() - t0Ewald;
+state.detZoom = 1.0;
+state.detPanX = 0.0;
+state.detPanY = 0.0;
+const p6122LodZ1 = {{ ...getDetectorLodState(800, 520) }};
+const p6122Tier1MinD = PEAKS.length > 0 ? PEAKS[PEAKS.length - 1].d_spacing : 99.0;
+const refBankPk = PEAKS.find(p => p.bank === 1) || PEAKS[0];
+state.detZoom = 36.0;
+if (refBankPk) {{
+  setDetectorCenterAzimuthDeg(refBankPk.det_x);
+  const bAct = getActiveBounds();
+  const bxAct = getDetectorPlotBox(800, 520);
+  const pyRef = getPeakVert(refBankPk);
+  const y0Ref = bxAct.originY + (1.0 - (pyRef - bAct.minY) / Math.max(1e-6, bAct.maxY - bAct.minY)) * bxAct.plotH;
+  state.detPanY = 260.0 - (260.0 + (y0Ref - 260.0) * state.detZoom);
+}}
+const p6122LodZ12Raw = getDetectorLodState(800, 520);
+const p6122LodZ12 = {{
+  isLodThinned: p6122LodZ12Raw.isLodThinned,
+  visiblePeaks: p6122LodZ12Raw.visiblePeaks,
+  inViewCount: p6122LodZ12Raw.inViewCount,
+  totalCount: p6122LodZ12Raw.totalCount,
+  minVisD: p6122LodZ12Raw.visiblePeaks.reduce((m, p) => Math.min(m, p.d_spacing || 99), 99),
+}};
+
+// Verify detector wheel zoom-in (cursor-anchored) and zoom-out (zero sideways azimuth drift!)
+state.detZoom = 1.0;
+setDetectorCenterAzimuthDeg(112.5);
+state.detPanY = 0.0;
+const azBeforeZoomIn = getCenteredDetectorAzimuthDeg();
+// Cursor zoom-in at off-center point (mx=620, my=190): world point under cursor must stay pinned
+const [wxBefore, wyBefore] = [620, 190];
+const boxDet = getDetectorPlotBox(800, 520);
+const boundsDet = getActiveBounds();
+function screenXToWorldAz(sx) {{
+  const x0 = 400 + (sx - 400 - state.detPanX) / state.detZoom;
+  const u = (x0 - boxDet.originX) / boxDet.plotW;
+  return boundsDet.minX + u * (boundsDet.maxX - boundsDet.minX);
+}}
+const cursorWorldAzBefore = screenXToWorldAz(wxBefore);
+for (let step = 0; step < 8; step++) {{
+  detCanvasEl.dispatchEvent({{
+    type: "wheel",
+    deltaMode: 0,
+    deltaY: -45,
+    ctrlKey: false,
+    clientX: wxBefore,
+    clientY: wyBefore,
+    preventDefault() {{}},
+  }});
+}}
+const zoomAfterIn = state.detZoom;
+const cursorWorldAzAfterIn = screenXToWorldAz(wxBefore);
+// Now zoom all the way out from zoomAfterIn -> 0.7x with cursor way off on the left (clientX = 95):
+// centered detector azimuth MUST NOT drift sideways at any step!
+const azAtPeakZoom = getCenteredDetectorAzimuthDeg();
+let maxZoomOutAzDrift = 0.0;
+for (let step = 0; step < 30; step++) {{
+  detCanvasEl.dispatchEvent({{
+    type: "wheel",
+    deltaMode: 0,
+    deltaY: 45,
+    ctrlKey: false,
+    clientX: 95,
+    clientY: 410,
+    preventDefault() {{}},
+  }});
+  const curAz = getCenteredDetectorAzimuthDeg();
+  let diff = Math.abs(curAz - azAtPeakZoom);
+  if (diff > 180.0) diff = 360.0 - diff;
+  if (diff > maxZoomOutAzDrift) maxZoomOutAzDrift = diff;
+}}
+const zoomAfterOut = state.detZoom;
+state.detZoom = 1.0;
+state.detPanX = 0.0;
+state.detPanY = 0.0;
+
+// Restore d_min = 1.45 for workflow param check below
+slDminEl.value = "1.45";
+slDminEl.dispatchEvent({{ type: "change", target: slDminEl }});
 
 // 6. Verify #inp-binning & slider-driven wavelength/d_min in collectWorkflowParams()
 slWlMinEl.value = "2.25";
@@ -5724,6 +5862,7 @@ const paramsBin4 = collectWorkflowParams().binning;
 
 require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
   protFloor,
+  protPoolFloor,
   sliderMinAttr,
   clampedBelowFloor,
   initialPeakSource,
@@ -5740,18 +5879,21 @@ require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
     lodActive: lodZ1.isLodThinned,
     lodDMin: lodZ1.lodDcut,
     shownCount: lodZ1.visiblePeaks.length,
+    inViewCount: lodZ1.inViewCount,
     totalCount: lodZ1.totalCount,
   }},
   lodZ2: {{
     lodActive: lodZ2.isLodThinned,
     lodDMin: lodZ2.lodDcut,
     shownCount: lodZ2.visiblePeaks.length,
+    inViewCount: lodZ2.inViewCount,
     totalCount: lodZ2.totalCount,
   }},
   lodZ6: {{
     lodActive: lodZ6.isLodThinned,
     lodDMin: lodZ6.lodDcut,
     shownCount: lodZ6.visiblePeaks.length,
+    inViewCount: lodZ6.inViewCount,
     totalCount: lodZ6.totalCount,
   }},
   hudHasLodPill: hudTextsZ1.some(t => t.includes("LOD d ≥") && t.includes("zoom+")),
@@ -5761,10 +5903,35 @@ require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
   pred215WideWlCount,
   minWlObserved,
   hugeCellFloor,
+  hugeCellPoolFloor,
   mandiPred380,
   p6122Floor,
+  p6122PoolFloor,
   p6122Gamma,
   p6122Allowed145,
+  p6122Allowed050,
+  p6122PoolAt050IsNull,
+  p6122EwaldMs,
+  p6122Tier1MinD,
+  p6122Pred050,
+  p6122LodZ1: {{
+    lodActive: p6122LodZ1.isLodThinned,
+    shownCount: p6122LodZ1.visiblePeaks.length,
+    totalCount: p6122LodZ1.totalCount,
+  }},
+  p6122LodZ12: {{
+    lodActive: p6122LodZ12.isLodThinned,
+    shownCount: p6122LodZ12.visiblePeaks.length,
+    inViewCount: p6122LodZ12.inViewCount,
+    totalCount: p6122LodZ12.totalCount,
+    minVisD: p6122LodZ12.minVisD,
+  }},
+  azBeforeZoomIn,
+  cursorWorldAzBefore,
+  cursorWorldAzAfterIn,
+  zoomAfterIn,
+  zoomAfterOut,
+  maxZoomOutAzDrift,
   paramsAutoBin,
   paramsBin16,
   paramsBin8,
@@ -5779,19 +5946,103 @@ process.exit(0);
     subprocess.run(["node", str(js_file)], capture_output=True, text=True, check=True)
     out = json.loads(out_json_path.read_text(encoding="utf-8"))
 
-    # A. Verify finite unit-cell-volume-aware d_min safety floor scaling (relaxed ~15%)
-    assert 0.75 <= out["protFloor"] <= 1.05
-    assert abs(out["sliderMinAttr"] - out["protFloor"]) < 1e-6
-    assert abs(out["clampedBelowFloor"] - out["protFloor"]) < 1e-6
-    assert out["hugeCellFloor"] > out["protFloor"] + 1.0
-    assert 1.95 <= out["hugeCellFloor"] <= 2.40
+    # A. Verify unlocked 0.50 A d_min floor across all unit cells + 2M full-sphere pool crossover
+    assert abs(out["protFloor"] - 0.50) < 1e-6
+    assert 0.75 <= out["protPoolFloor"] <= 1.05
+    assert abs(out["sliderMinAttr"] - 0.50) < 1e-6
+    assert abs(out["clampedBelowFloor"] - 0.50) < 1e-6
+    assert abs(out["hugeCellFloor"] - 0.50) < 1e-6
+    assert 1.95 <= out["hugeCellPoolFloor"] <= 2.40
     assert out["p6122Gamma"] == 120.0
-    assert 1.40 <= out["p6122Floor"] <= 1.43
+    assert abs(out["p6122Floor"] - 0.50) < 1e-6
+    assert 1.40 <= out["p6122PoolFloor"] <= 1.43
     assert abs(out["p6122Allowed145"] - 1.45) < 1e-6
+    assert abs(out["p6122Allowed050"] - 0.50) < 1e-6
+    assert out["p6122PoolAt050IsNull"] is True
     assert out["paramsAutoBin"] is None
     assert out["paramsBin16"] == 16
     assert out["paramsBin8"] == 8
     assert out["paramsBin4"] == 4
+
+    # Verify P6122 (79.91 x 79.91 x 238.0 A, gamma=120) direct Ewald-shell 1:1 parity at d_min = 0.50 A!
+    from subhkl.core.crystallography import (
+        cartesian_matrix_metric_tensor,
+        generate_ewald_reflections,
+        generate_reflections,
+    )
+
+    p6122_cell = [79.91, 79.91, 238.0, 90.0, 90.0, 120.0]
+    u_p6122 = np.asarray(p6122_payload["u_matrix"], dtype=float)
+    b_p6122, _ = cartesian_matrix_metric_tensor(
+        79.91, 79.91, 238.0, *np.deg2rad([90.0, 90.0, 120.0])
+    )
+    ub_p6122 = u_p6122 @ b_p6122
+    he, ke, le = generate_ewald_reflections(
+        *p6122_cell,
+        space_group="P 61 2 2",
+        d_min=0.50,
+        UB=ub_p6122,
+        R_runs=[r0],
+        ki=(0.0, 0.0, 1.0),
+        wavelength_range=(0.74, 0.79),
+    )
+    py_p6122_050 = _cast_to_tuples(
+        _raycast_hkl_on_detectors(
+            np.column_stack([he, ke, le]),
+            u_p6122,
+            b_p6122,
+            r0,
+            mandi_dets,
+            (0.74, 0.79),
+            active_bids=mandi_active_bids,
+        ),
+        b_p6122,
+    )
+    assert len(py_p6122_050) > 1500
+    assert min(ht[7] for ht in py_p6122_050) < 0.64
+    py_p6122_keys = {
+        (int(ht[0]), int(ht[3]), int(ht[4]), int(ht[5])): ht for ht in py_p6122_050
+    }
+    js_p6122_keys = {
+        (int(p["bank"]), int(p["hkl"][0]), int(p["hkl"][1]), int(p["hkl"][2])): p
+        for p in out["p6122Pred050"]
+    }
+    # Allow at most sub-1e-3 pixel float-rounding graze at exact [0, 256) edge
+    sym_diff = set(js_p6122_keys.keys()) ^ set(py_p6122_keys.keys())
+    assert len(sym_diff) <= 2
+    common_keys = set(js_p6122_keys.keys()) & set(py_p6122_keys.keys())
+    max_p6122_px_err = max(
+        max(
+            abs(js_p6122_keys[k]["row"] - py_p6122_keys[k][1]),
+            abs(js_p6122_keys[k]["col"] - py_p6122_keys[k][2]),
+        )
+        for k in common_keys
+    )
+    assert max_p6122_px_err < 0.06
+    assert out["p6122LodZ1"]["lodActive"] is True
+    assert out["p6122LodZ1"]["shownCount"] <= 340
+    assert out["p6122LodZ1"]["totalCount"] > 100000
+    assert out["p6122LodZ12"]["inViewCount"] < out["p6122LodZ12"]["totalCount"]
+    assert out["p6122LodZ12"]["shownCount"] > 50
+    assert out["p6122LodZ12"]["minVisD"] < out["p6122Tier1MinD"] - 0.25
+    assert out["p6122LodZ12"]["minVisD"] < 0.66
+
+    # Verify slabbed generate_reflections bit-for-bit parity when box_count > 1_000_000
+    h_sl, k_sl, l_sl = generate_reflections(
+        55.0, 80.0, 88.0, 90.0, 96.0, 90.0, space_group="I 2", d_min=1.35
+    )
+    assert len(h_sl) > 150_000
+    assert np.all((h_sl + k_sl + l_sl) % 2 == 0)
+
+    # Verify detector wheel zoom-in anchors under cursor and zoom-out has zero sideways azimuth drift!
+    assert out["zoomAfterIn"] > 1.7
+    assert out["zoomAfterOut"] == 0.7
+    az_cursor_diff = abs(
+        (out["cursorWorldAzAfterIn"] - out["cursorWorldAzBefore"] + 180.0) % 360.0
+        - 180.0
+    )
+    assert az_cursor_diff < 1e-4
+    assert out["maxZoomOutAzDrift"] < 1e-5
 
     # B. Verify auto-switch from 'integrated' -> 'predicted' when dragging d_min below integrated cutoff
     assert out["initialPeakSource"] == "integrated"
@@ -5843,18 +6094,18 @@ process.exit(0);
     assert out["pred215WideWlCount"] == len(py_cast_215_wide_wl)
     assert 2.0 <= out["minWlObserved"] < 2.2
 
-    # E. Verify Detector zoom-coupled d-spacing LOD thinning, progressive zoom unlocking, HUD pill, and hit-testing
+    # E. Verify Detector viewport-frustum + screen-density LOD thinning, zoom unlocking, HUD pill, and hit-testing
     lod1, lod2, lod6 = out["lodZ1"], out["lodZ2"], out["lodZ6"]
     assert lod1["totalCount"] == len(py_cast_215)
     assert lod1["lodActive"] is True
     assert lod1["shownCount"] < lod1["totalCount"]
-    assert lod1["shownCount"] <= 500
+    assert lod1["shownCount"] <= 360
     assert lod1["lodDMin"] > 2.25
+    assert lod2["lodDMin"] < lod1["lodDMin"]
     assert out["hudHasLodPill"] is True
-    assert lod2["shownCount"] > lod1["shownCount"]
-    assert lod2["lodDMin"] <= lod1["lodDMin"]
     assert lod6["lodActive"] is False
-    assert lod6["shownCount"] == lod6["totalCount"]
+    assert lod6["inViewCount"] < lod6["totalCount"]
+    assert lod6["shownCount"] == lod6["inViewCount"]
     assert abs(lod6["lodDMin"] - 2.15) < 1e-3
     assert out["hiddenOuterPeakId"] is not None
     assert out["hitHiddenUnpinned"] != out["hiddenOuterPeakId"]
