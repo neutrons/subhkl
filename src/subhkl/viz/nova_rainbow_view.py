@@ -9075,6 +9075,14 @@ class RainbowZonesViewModel:
         self.payload = value
 
     def reload(self, **overrides: Any) -> dict[str, Any]:
+        from subhkl.viz.rainbow_zones import merge_frame_only_payload
+
+        include_all = bool(overrides.get("include_all_runs_peaks", True))
+        prev_payload = (
+            self._payload
+            if (not include_all and isinstance(self._payload, dict))
+            else None
+        )
         if "frame_index" in overrides and overrides["frame_index"] is not None:
             self.payload_kwargs["frame_index"] = int(overrides["frame_index"])
         kwargs = {**self.payload_kwargs, **overrides}
@@ -9101,6 +9109,8 @@ class RainbowZonesViewModel:
                     self.mtz_overlay_info,
                     select_mtz_color=False,
                 )
+        if prev_payload is not None:
+            self.payload = merge_frame_only_payload(prev_payload, self.payload)
         return self.payload
 
     def to_html(self, mode: str | None = None) -> str:
@@ -9208,6 +9218,7 @@ def serve_rainbow_zones(
 
     ep_path = os.environ.get("EP_PATH", "").rstrip("/")
     vm_lock = threading.RLock()
+    latest_frame_only_target: list[int | None] = [None]
 
     class _Handler(http.server.BaseHTTPRequestHandler):
         def _serve_payload_locked(self, qs: dict[str, list[str]]) -> None:
@@ -9480,6 +9491,7 @@ def serve_rainbow_zones(
                     self.end_headers()
                     self.wfile.write(err_body)
                     return
+            frame_only_q = qs.get("frame_only", ["0"])[0] == "1"
             if not reloaded:
                 cur_p = vm._payload
                 cur_f = cur_p.get("frame_index") if isinstance(cur_p, dict) else None
@@ -9488,6 +9500,16 @@ def serve_rainbow_zones(
                     int(cur_p.get("render_binning", 4))
                     if isinstance(cur_p, dict)
                     else None
+                )
+                fast_frame_only = bool(
+                    frame_only_q
+                    and isinstance(cur_p, dict)
+                    and (
+                        cur_p.get("sample_peaks")
+                        or cur_p.get("integrated_sample_peaks")
+                        or cur_p.get("predicted_sample_peaks")
+                        or len(cur_p.get("frames") or ()) <= 1
+                    )
                 )
                 if (
                     not isinstance(cur_p, dict)
@@ -9501,14 +9523,25 @@ def serve_rainbow_zones(
                     )
                 ):
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                        vm.reload(frame_index=f_idx)
+                        vm.reload(
+                            frame_index=f_idx,
+                            include_all_runs_peaks=not fast_frame_only,
+                        )
                 elif isinstance(cur_p, dict) and d_min_val is not None and preserve_q:
                     cur_p["d_min"] = round(d_min_val, 3)
+            else:
+                fast_frame_only = False
             with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                 vm.pipeline_runner.apply_active_solve_overlay(
                     vm.payload, frame_index=f_idx
                 )
-            body = json.dumps(vm.payload).encode("utf-8")
+            if fast_frame_only and isinstance(vm.payload, dict):
+                from subhkl.viz.rainbow_zones import build_frame_only_response
+
+                resp_doc = build_frame_only_response(vm.payload)
+            else:
+                resp_doc = vm.payload
+            body = json.dumps(resp_doc, separators=(",", ":")).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -9576,8 +9609,37 @@ def serve_rainbow_zones(
                     self.wfile.write(body)
                     return
 
+                f_only_pre = qs.get("frame_only", ["0"])[0] == "1"
+                f_pre: int | None = None
+                if qs.get("frame"):
+                    with contextlib.suppress(ValueError, TypeError, IndexError):
+                        f_pre = int(qs["frame"][0])
+                if f_only_pre and f_pre is not None:
+                    latest_frame_only_target[0] = f_pre
+
                 vm_lock.acquire()
                 try:
+                    if (
+                        f_only_pre
+                        and f_pre is not None
+                        and latest_frame_only_target[0] not in (None, f_pre)
+                    ):
+                        sup_body = json.dumps(
+                            {
+                                "status": "superseded",
+                                "frame_only": True,
+                                "frame_index": f_pre,
+                            },
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header(
+                            "Content-Type", "application/json; charset=utf-8"
+                        )
+                        self.send_header("Content-Length", str(len(sup_body)))
+                        self.end_headers()
+                        self.wfile.write(sup_body)
+                        return
                     self._serve_payload_locked(qs)
                 finally:
                     vm_lock.release()

@@ -2833,68 +2833,6 @@ def _extract_from_h5(
             f, instrument, fallback_h5_paths=(sib_solve_path, pred_h5_aux)
         )
 
-        bank = np.asarray(f["bank"][()], dtype=int) if "bank" in f else None
-        if "peaks/bank" in f and bank is None:
-            bank = np.asarray(f["peaks/bank"][()], dtype=int)
-
-        pixel_r = (
-            np.asarray(f["peaks/pixel_r"][()], dtype=float)
-            if "peaks/pixel_r" in f
-            else None
-        )
-        pixel_c = (
-            np.asarray(f["peaks/pixel_c"][()], dtype=float)
-            if "peaks/pixel_c" in f
-            else None
-        )
-        peaks_xyz = (
-            np.asarray(f["peaks/xyz"][()], dtype=float) if "peaks/xyz" in f else None
-        )
-        if (
-            peaks_xyz is None
-            and pixel_r is not None
-            and pixel_c is not None
-            and len(pixel_r) > 0
-            and len(pixel_c) == len(pixel_r)
-        ):
-            n_pk_raw = len(pixel_r)
-            xyz_rec = np.zeros((n_pk_raw, 3), dtype=float)
-            filled_mask = np.zeros(n_pk_raw, dtype=bool)
-            if bank is not None and len(bank) == n_pk_raw and detectors:
-                for ub_id in np.unique(bank):
-                    det_b = detectors.get(int(ub_id))
-                    if det_b is None:
-                        continue
-                    mb = bank == ub_id
-                    with contextlib.suppress(
-                        RuntimeError, ValueError, TypeError, IndexError
-                    ):
-                        xyz_rec[mb] = det_b.pixel_to_lab(pixel_r[mb], pixel_c[mb])
-                        filled_mask[mb] = True
-            if (
-                not np.all(filled_mask)
-                and "peaks/two_theta" in f
-                and "peaks/azimuthal" in f
-            ):
-                with contextlib.suppress(
-                    OSError, RuntimeError, ValueError, TypeError, IndexError
-                ):
-                    tt_arr = np.asarray(f["peaks/two_theta"][()], dtype=float)
-                    az_arr = np.asarray(f["peaks/azimuthal"][()], dtype=float)
-                    if len(tt_arr) == n_pk_raw and len(az_arr) == n_pk_raw:
-                        rem = ~filled_mask
-                        st = np.sin(tt_arr[rem])
-                        xyz_rec[rem] = np.column_stack(
-                            [
-                                st * np.cos(az_arr[rem]),
-                                st * np.sin(az_arr[rem]),
-                                np.cos(tt_arr[rem]),
-                            ]
-                        )
-                        filled_mask[rem] = True
-            if np.any(filled_mask):
-                peaks_xyz = xyz_rec
-
         # Extract multi-frame offsets, file names, and refined goniometer kinematics
         offsets = (
             np.asarray(f["file_offsets"][()], dtype=int)
@@ -3205,6 +3143,120 @@ def _extract_from_h5(
                 int(frames_meta[active_frame]["f1"]),
             )
 
+        # Read full run_index upfront (small 1D int array) so single-frame payload builds
+        # (`not include_all_runs_peaks`) can HDF5-slice `[i0:i1]` instead of loading & projecting
+        # millions of peaks across all runs on every frame switch.
+        full_run_index = (
+            np.asarray(f["peaks/run_index"][()], dtype=int)
+            if "peaks/run_index" in f
+            else None
+        )
+        if full_run_index is None and "peaks/image_index" in f:
+            img_idx_raw = np.asarray(f["peaks/image_index"][()], dtype=int)
+            if "file_offsets" in f:
+                f_off_raw = np.asarray(f["file_offsets"][()], dtype=int)
+                if len(f_off_raw) > 1:
+                    full_run_index = np.maximum(
+                        0,
+                        np.searchsorted(f_off_raw, img_idx_raw, side="right") - 1,
+                    )
+            elif "goniometer/R" in f and len(img_idx_raw) > 0:
+                n_gonio_r = len(f["goniometer/R"])
+                if n_gonio_r > 1 and int(np.max(img_idx_raw)) < n_gonio_r:
+                    full_run_index = img_idx_raw
+
+        raw_peaks_total = 0
+        if full_run_index is not None:
+            raw_peaks_total = len(full_run_index)
+        else:
+            for pk_len_key in ("peaks/pixel_r", "peaks/xyz", "peaks/h"):
+                if pk_len_key in f:
+                    raw_peaks_total = len(f[pk_len_key])
+                    break
+
+        pk_slice: slice = slice(None)
+        if (
+            not include_all_runs_peaks
+            and len(frames_meta) > 1
+            and full_run_index is not None
+            and len(full_run_index) > 0
+            and bool(np.all(full_run_index[:-1] <= full_run_index[1:]))
+        ):
+            s0_pk = int(np.searchsorted(full_run_index, active_frame, side="left"))
+            s1_pk = int(np.searchsorted(full_run_index, active_frame, side="right"))
+            pk_slice = slice(s0_pk, s1_pk)
+            run_index = full_run_index[pk_slice]
+        else:
+            run_index = full_run_index
+
+        def _read_pk_col(ds_key: str, dtype: Any) -> np.ndarray | None:
+            if ds_key not in f:
+                return None
+            dset = f[ds_key]
+            if (
+                pk_slice != slice(None)
+                and raw_peaks_total > 0
+                and len(dset) == raw_peaks_total
+            ):
+                return np.asarray(dset[pk_slice], dtype=dtype)
+            return np.asarray(dset[()], dtype=dtype)
+
+        bank = _read_pk_col("bank", int)
+        if bank is None:
+            bank = _read_pk_col("peaks/bank", int)
+        pixel_r = _read_pk_col("peaks/pixel_r", float)
+        pixel_c = _read_pk_col("peaks/pixel_c", float)
+        peaks_xyz = _read_pk_col("peaks/xyz", float)
+        if (
+            peaks_xyz is None
+            and pixel_r is not None
+            and pixel_c is not None
+            and len(pixel_r) > 0
+            and len(pixel_c) == len(pixel_r)
+        ):
+            n_pk_raw = len(pixel_r)
+            xyz_rec = np.zeros((n_pk_raw, 3), dtype=float)
+            filled_mask = np.zeros(n_pk_raw, dtype=bool)
+            if bank is not None and len(bank) == n_pk_raw and detectors:
+                for ub_id in np.unique(bank):
+                    det_b = detectors.get(int(ub_id))
+                    if det_b is None:
+                        continue
+                    mb = bank == ub_id
+                    with contextlib.suppress(
+                        RuntimeError, ValueError, TypeError, IndexError
+                    ):
+                        xyz_rec[mb] = det_b.pixel_to_lab(pixel_r[mb], pixel_c[mb])
+                        filled_mask[mb] = True
+            if (
+                not np.all(filled_mask)
+                and "peaks/two_theta" in f
+                and "peaks/azimuthal" in f
+            ):
+                with contextlib.suppress(
+                    OSError, RuntimeError, ValueError, TypeError, IndexError
+                ):
+                    tt_arr = _read_pk_col("peaks/two_theta", float)
+                    az_arr = _read_pk_col("peaks/azimuthal", float)
+                    if (
+                        tt_arr is not None
+                        and az_arr is not None
+                        and len(tt_arr) == n_pk_raw
+                        and len(az_arr) == n_pk_raw
+                    ):
+                        rem = ~filled_mask
+                        st = np.sin(tt_arr[rem])
+                        xyz_rec[rem] = np.column_stack(
+                            [
+                                st * np.cos(az_arr[rem]),
+                                st * np.sin(az_arr[rem]),
+                                np.cos(tt_arr[rem]),
+                            ]
+                        )
+                        filled_mask[rem] = True
+            if np.any(filled_mask):
+                peaks_xyz = xyz_rec
+
         if (
             peaks_xyz is None
             and pixel_r is not None
@@ -3288,81 +3340,21 @@ def _extract_from_h5(
 
         hkl = None
         if all(f"peaks/{k}" in f for k in ("h", "k", "l")):
-            hkl = np.column_stack(
-                [
-                    np.asarray(f["peaks/h"][()], dtype=int),
-                    np.asarray(f["peaks/k"][()], dtype=int),
-                    np.asarray(f["peaks/l"][()], dtype=int),
-                ]
-            )
-        lam = (
-            np.asarray(f["peaks/lambda"][()], dtype=float)
-            if "peaks/lambda" in f
-            else None
-        )
-        intensity = (
-            np.asarray(f["peaks/intensity"][()], dtype=float)
-            if "peaks/intensity" in f
-            else None
-        )
-        sigma = (
-            np.asarray(f["peaks/sigma"][()], dtype=float)
-            if "peaks/sigma" in f
-            else None
-        )
-        var_u = (
-            np.asarray(f["peaks/var_u"][()], dtype=float)
-            if "peaks/var_u" in f
-            else None
-        )
-        var_v = (
-            np.asarray(f["peaks/var_v"][()], dtype=float)
-            if "peaks/var_v" in f
-            else None
-        )
-        cov_uv = (
-            np.asarray(f["peaks/cov_uv"][()], dtype=float)
-            if "peaks/cov_uv" in f
-            else None
-        )
-        run_index = (
-            np.asarray(f["peaks/run_index"][()], dtype=int)
-            if "peaks/run_index" in f
-            else None
-        )
-        if run_index is None and "peaks/image_index" in f:
-            img_idx_raw = np.asarray(f["peaks/image_index"][()], dtype=int)
-            if "file_offsets" in f:
-                f_off_raw = np.asarray(f["file_offsets"][()], dtype=int)
-                if len(f_off_raw) > 1:
-                    run_index = (
-                        np.searchsorted(f_off_raw, img_idx_raw, side="right") - 1
-                    )
-                    run_index = np.maximum(0, run_index)
-            elif "goniometer/R" in f and len(img_idx_raw) > 0:
-                n_gonio_r = len(f["goniometer/R"])
-                if n_gonio_r > 1 and int(np.max(img_idx_raw)) < n_gonio_r:
-                    run_index = img_idx_raw
-        careless_residual = (
-            np.asarray(f["peaks/careless_residual"][()], dtype=float)
-            if "peaks/careless_residual" in f
-            else None
-        )
-        careless_scale = (
-            np.asarray(f["peaks/careless_scale"][()], dtype=float)
-            if "peaks/careless_scale" in f
-            else None
-        )
-        merged_i = (
-            np.asarray(f["peaks/merged_i"][()], dtype=float)
-            if "peaks/merged_i" in f
-            else None
-        )
-        merged_sigi = (
-            np.asarray(f["peaks/merged_sigi"][()], dtype=float)
-            if "peaks/merged_sigi" in f
-            else None
-        )
+            h_col = _read_pk_col("peaks/h", int)
+            k_col = _read_pk_col("peaks/k", int)
+            l_col = _read_pk_col("peaks/l", int)
+            if h_col is not None and k_col is not None and l_col is not None:
+                hkl = np.column_stack([h_col, k_col, l_col])
+        lam = _read_pk_col("peaks/lambda", float)
+        intensity = _read_pk_col("peaks/intensity", float)
+        sigma = _read_pk_col("peaks/sigma", float)
+        var_u = _read_pk_col("peaks/var_u", float)
+        var_v = _read_pk_col("peaks/var_v", float)
+        cov_uv = _read_pk_col("peaks/cov_uv", float)
+        careless_residual = _read_pk_col("peaks/careless_residual", float)
+        careless_scale = _read_pk_col("peaks/careless_scale", float)
+        merged_i = _read_pk_col("peaks/merged_i", float)
+        merged_sigi = _read_pk_col("peaks/merged_sigi", float)
 
         def _normalize_merge_metrics(doc_m: dict[str, Any]) -> dict[str, Any]:
             out = dict(doc_m)
@@ -3387,6 +3379,11 @@ def _extract_from_h5(
         has_careless_peak_data = bool(
             (careless_residual is not None and np.any(np.isfinite(careless_residual)))
             or (careless_scale is not None and np.any(np.isfinite(careless_scale)))
+            or (
+                pk_slice != slice(None)
+                and "careless/metrics_json" in f
+                and ("peaks/careless_residual" in f or "peaks/careless_scale" in f)
+            )
         )
 
         merge_metrics: dict[str, Any] | None = None
@@ -3426,10 +3423,26 @@ def _extract_from_h5(
                 if (merge_metrics is not None and has_careless_peak_data)
                 else "integrator"
             )
-            is_iso = bool(
-                np.allclose(var_u, var_v)
-                and (cov_uv is None or np.allclose(cov_uv, 0.0))
-            )
+            if len(var_u) > 0:
+                is_iso = bool(
+                    np.allclose(var_u, var_v)
+                    and (cov_uv is None or np.allclose(cov_uv, 0.0))
+                )
+            elif "peaks/var_u" in f and len(f["peaks/var_u"]) > 0:
+                n_chk = min(64, len(f["peaks/var_u"]))
+                vu_chk = np.asarray(f["peaks/var_u"][:n_chk], dtype=float)
+                vv_chk = np.asarray(f["peaks/var_v"][:n_chk], dtype=float)
+                cuv_chk = (
+                    np.asarray(f["peaks/cov_uv"][:n_chk], dtype=float)
+                    if "peaks/cov_uv" in f
+                    else None
+                )
+                is_iso = bool(
+                    np.allclose(vu_chk, vv_chk)
+                    and (cuv_chk is None or np.allclose(cuv_chk, 0.0))
+                )
+            else:
+                is_iso = True
             peak_shape_mode = "isotropic_circle" if is_iso else "anisotropic_ellipse"
         elif "peaks/pixel_r" in f:
             artifact_kind = "finder"
@@ -3443,11 +3456,17 @@ def _extract_from_h5(
 
         # Build refined goniometer rotation matrix & lab-frame sample origin lookup per run,
         # matching predict_reflections_on_panel (gonio_axes, refined angles, zero_offsets,
-        # per_run delta/trans, Fourier harmonics, and per-peak vs per-frame R_all shapes).
+        # per-run delta/trans, Fourier harmonics, and per-peak vs per-frame R_all shapes).
         raw_run_index_unfiltered = (
-            np.asarray(run_index, dtype=int).copy() if run_index is not None else None
+            np.asarray(full_run_index, dtype=int).copy()
+            if full_run_index is not None
+            else None
         )
-        raw_peaks_count = len(peaks_xyz) if peaks_xyz is not None else 0
+        raw_peaks_count = (
+            raw_peaks_total
+            if raw_peaks_total > 0
+            else (len(peaks_xyz) if peaks_xyz is not None else 0)
+        )
         R_per_run_all: dict[int, np.ndarray] = {}
         s_lab_per_run_all: dict[int, np.ndarray] = {}
         n_runs_total = max(1, len(frames_meta))
@@ -3909,7 +3928,12 @@ def _extract_from_h5(
 
             frame_pred = _collect_slice(f0_p, f1_p, active_frame, True)
             all_pred: dict[str, Any] | None = None
-            if len(frames_meta) > 1 and offsets is not None and len(offsets) > 1:
+            if (
+                include_all_runs_peaks
+                and len(frames_meta) > 1
+                and offsets is not None
+                and len(offsets) > 1
+            ):
                 run_slices = []
                 for r_i in range(len(frames_meta)):
                     s0_r = int(offsets[r_i]) if r_i < len(offsets) else 0
@@ -3987,26 +4011,27 @@ def _extract_from_h5(
                     and run_index is not None
                     and len(run_index) == len(peaks_xyz)
                 ):
-                    idx_pred_all = np.arange(len(peaks_xyz))
-                    if len(idx_pred_all) > 4500:
-                        idx_pred_all = np.linspace(
-                            0, len(peaks_xyz) - 1, 4500, dtype=int
-                        )
-                    predicted_all_runs_data = {
-                        "peaks_xyz": peaks_xyz[idx_pred_all],
-                        "hkl": hkl[idx_pred_all],
-                        "wavelength": lam[idx_pred_all]
-                        if lam is not None and len(lam) == len(peaks_xyz)
-                        else None,
-                        "intensity": None,
-                        "sigma": None,
-                        "bank": bank[idx_pred_all]
-                        if bank is not None and len(bank) == len(peaks_xyz)
-                        else None,
-                        "run_index": run_index[idx_pred_all],
-                        "R_per_run": R_per_run_all,
-                        "s_lab_per_run": s_lab_per_run_all,
-                    }
+                    if include_all_runs_peaks:
+                        idx_pred_all = np.arange(len(peaks_xyz))
+                        if len(idx_pred_all) > 4500:
+                            idx_pred_all = np.linspace(
+                                0, len(peaks_xyz) - 1, 4500, dtype=int
+                            )
+                        predicted_all_runs_data = {
+                            "peaks_xyz": peaks_xyz[idx_pred_all],
+                            "hkl": hkl[idx_pred_all],
+                            "wavelength": lam[idx_pred_all]
+                            if lam is not None and len(lam) == len(peaks_xyz)
+                            else None,
+                            "intensity": None,
+                            "sigma": None,
+                            "bank": bank[idx_pred_all]
+                            if bank is not None and len(bank) == len(peaks_xyz)
+                            else None,
+                            "run_index": run_index[idx_pred_all],
+                            "R_per_run": R_per_run_all,
+                            "s_lab_per_run": s_lab_per_run_all,
+                        }
                     m_fr = run_index == active_frame
                 else:
                     m_fr = np.ones(len(peaks_xyz), dtype=bool)
@@ -4037,7 +4062,8 @@ def _extract_from_h5(
         # Capture all-runs sample-space peak arrays before filtering to active_frame
         all_runs_data: dict[str, Any] | None = None
         if (
-            peaks_xyz is not None
+            include_all_runs_peaks
+            and peaks_xyz is not None
             and len(peaks_xyz) > 0
             and hkl is not None
             and len(hkl) == len(peaks_xyz)
@@ -5714,46 +5740,67 @@ def _build_ndip_pipeline_stages(
     ]
 
 
+_ASU_MAPPER_CACHE: dict[tuple[str, tuple[float, ...]], Any] = {}
+_ABSENCE_CHECKER_CACHE: dict[str, Any] = {}
+
+
 def _make_systematic_absence_checker(space_group: str | None) -> Any:
     """Return ``is_absent(h, k, l) -> bool`` respecting full space-group systematic absences."""
+    sg_key = str(space_group or "P 1").strip()
+    cached_fn = _ABSENCE_CHECKER_CACHE.get(sg_key)
+    if cached_fn is not None:
+        return cached_fn
     sg_ops = None
     with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
         import gemmi
 
-        sg_raw = str(space_group or "P 1").strip()
-        sg_obj = gemmi.find_spacegroup_by_name(sg_raw)
-        if sg_obj is None and len(sg_raw) >= 2 and " " not in sg_raw:
-            sg_obj = gemmi.find_spacegroup_by_name(" ".join(list(sg_raw)))
+        sg_obj = gemmi.find_spacegroup_by_name(sg_key)
+        if sg_obj is None and len(sg_key) >= 2 and " " not in sg_key:
+            sg_obj = gemmi.find_spacegroup_by_name(" ".join(list(sg_key)))
         if sg_obj is not None:
             sg_ops = sg_obj.operations()
 
-    sg_u = str(space_group or "P 1").strip().upper()
+    sg_u = sg_key.upper()
     centering = sg_u[0] if sg_u else "P"
+    _abs_cache: dict[tuple[int, int, int], bool] = {}
 
     def _is_absent(h_v: int, k_v: int, l_v: int) -> bool:
         if h_v == 0 and k_v == 0 and l_v == 0:
             return True
+        ck = (int(h_v), int(k_v), int(l_v))
+        hit = _abs_cache.get(ck)
+        if hit is not None:
+            return hit
+        res = False
         if sg_ops is not None:
             with contextlib.suppress(RuntimeError, ValueError, TypeError):
-                return bool(sg_ops.is_systematically_absent([h_v, k_v, l_v]))
+                res = bool(sg_ops.is_systematically_absent([h_v, k_v, l_v]))
+                if len(_abs_cache) < 250000:
+                    _abs_cache[ck] = res
+                return res
         if centering == "I":
-            return ((h_v + k_v + l_v) & 1) != 0
-        if centering == "F":
-            return (
+            res = ((h_v + k_v + l_v) & 1) != 0
+        elif centering == "F":
+            res = (
                 ((h_v + k_v) & 1) != 0
                 or ((k_v + l_v) & 1) != 0
                 or ((h_v + l_v) & 1) != 0
             )
-        if centering == "C":
-            return ((h_v + k_v) & 1) != 0
-        if centering == "A":
-            return ((k_v + l_v) & 1) != 0
-        if centering == "B":
-            return ((h_v + l_v) & 1) != 0
-        if centering == "R":
-            return ((-h_v + k_v + l_v) % 3) != 0
-        return False
+        elif centering == "C":
+            res = ((h_v + k_v) & 1) != 0
+        elif centering == "A":
+            res = ((k_v + l_v) & 1) != 0
+        elif centering == "B":
+            res = ((h_v + l_v) & 1) != 0
+        elif centering == "R":
+            res = ((-h_v + k_v + l_v) % 3) != 0
+        if len(_abs_cache) < 250000:
+            _abs_cache[ck] = res
+        return res
 
+    if len(_ABSENCE_CHECKER_CACHE) >= 32:
+        _ABSENCE_CHECKER_CACHE.pop(next(iter(_ABSENCE_CHECKER_CACHE)))
+    _ABSENCE_CHECKER_CACHE[sg_key] = _is_absent
     return _is_absent
 
 
@@ -5821,6 +5868,17 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
     such as ``hk0`` in ``Fdd2``), where ``(h, k, l)`` and ``(-h, -k, -l)`` are
     point-group equivalents with zero Bijvoet difference.
     """
+    sg_key = str(space_group or "P 1").strip()
+    cell_key = (
+        tuple(round(float(x), 3) for x in cell[:6])
+        if cell is not None and len(cell) >= 6
+        else ()
+    )
+    mapper_key = (sg_key, cell_key)
+    cached_mapper = _ASU_MAPPER_CACHE.get(mapper_key)
+    if cached_mapper is not None:
+        return cached_mapper
+
     sg_obj = None
     asu_obj = None
     sg_ops = None
@@ -5829,7 +5887,7 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
     with contextlib.suppress(ImportError, RuntimeError, ValueError, TypeError):
         import gemmi
 
-        sg_obj = gemmi.find_spacegroup_by_name(str(space_group)) or (
+        sg_obj = gemmi.find_spacegroup_by_name(sg_key) or (
             gemmi.find_spacegroup_by_name("P 1")
         )
         if sg_obj is not None:
@@ -5868,10 +5926,11 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
                         for r_m in proper_rots
                     )
                 res_asu = (ah_i, ak_i, al_i, bool(is_fr), int(bij_parity))
-                _asu_cache[ck] = res_asu
+                if len(_asu_cache) < 250000:
+                    _asu_cache[ck] = res_asu
                 return res_asu
         ah, ak, al = abs(int(h_v)), abs(int(k_v)), abs(int(l_v))
-        sg_u = str(space_group or "").upper()
+        sg_u = sg_key.upper()
         is_cubic = "3" in sg_u or (
             cell is not None
             and len(cell) >= 6
@@ -5887,6 +5946,9 @@ def _make_asu_mapper(space_group: str, cell: list[float] | None) -> Any:
             return (s3[0], s3[1], s3[2], neg_parity, 0)
         return (ah, ak, al, neg_parity, 0)
 
+    if len(_ASU_MAPPER_CACHE) >= 32:
+        _ASU_MAPPER_CACHE.pop(next(iter(_ASU_MAPPER_CACHE)))
+    _ASU_MAPPER_CACHE[mapper_key] = _to_asu_hkl
     return _to_asu_hkl
 
 
@@ -6678,7 +6740,7 @@ def _load_cached_frame_tof_events(
             bank_tof_map[bk] = (tb, ob, pb, (int(im_i.shape[0]), int(im_i.shape[1])))
 
         if bank_tof_map:
-            if len(_SPOT_TOF_SLAB_CACHE) >= 2:
+            if len(_SPOT_TOF_SLAB_CACHE) >= 4:
                 _SPOT_TOF_SLAB_CACHE.pop(next(iter(_SPOT_TOF_SLAB_CACHE)))
             _SPOT_TOF_SLAB_CACHE[cache_key] = bank_tof_map
         return bank_tof_map
@@ -6706,6 +6768,31 @@ def _bsearch_tof_bank_left(
         mid = (l_idx + r_idx) >> 1
         safe = np.minimum(mid, n_tot_m1)
         cond = (mid < r_idx) & (tof_b[safe] < target)
+        l_idx = np.where(cond, mid + 1, l_idx)
+        r_idx = np.where(cond, r_idx, mid)
+    return l_idx
+
+
+def _bsearch_tof_bank_right(
+    tof_b: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    target: np.ndarray,
+) -> np.ndarray:
+    """Vectorized upper-bound binary search within per-pixel event slices ``[lo, hi)``."""
+    if lo.size == 0 or len(tof_b) == 0:
+        return lo.copy()
+    max_len = int(np.max(hi - lo))
+    if max_len <= 0:
+        return lo.copy()
+    n_steps = int(max_len - 1).bit_length()
+    l_idx = lo.copy()
+    r_idx = hi.copy()
+    n_tot_m1 = len(tof_b) - 1
+    for _ in range(n_steps):
+        mid = (l_idx + r_idx) >> 1
+        safe = np.minimum(mid, n_tot_m1)
+        cond = (mid < r_idx) & (tof_b[safe] <= target)
         l_idx = np.where(cond, mid + 1, l_idx)
         r_idx = np.where(cond, r_idx, mid)
     return l_idx
@@ -6746,39 +6833,66 @@ def _measure_or_cache_tof_gate(
     inv_bin = float(n_bins) / (2.0 * search_half)
     hist = np.zeros(n_bins, dtype=np.float64)
 
-    for idx in sample_idx:
-        bd = bank_tof_map.get(int(b_arr[idx]))
-        if bd is None:
-            continue
-        tb, ob, _, (H, W) = bd
-        if len(tb) == 0:
-            continue
-        r0 = round(float(r_im_by_peak[idx]))
-        c0 = round(float(c_im_by_peak[idx]))
-        if r0 < 2 or r0 >= H - 2 or c0 < 2 or c0 >= W - 2:
-            continue
-        tp = float(t_pred_arr[idx])
-        t_lo_s = tp * (1.0 - search_half)
-        t_hi_s = tp * (1.0 + search_half)
-        for dr in range(-2, 3):
-            row_off = (r0 + dr) * W
-            for dc in range(-2, 3):
-                p = row_off + (c0 + dc)
-                e0 = int(ob[p])
-                e1 = int(ob[p + 1])
-                if e1 <= e0:
-                    continue
-                sub = tb[e0:e1]
-                i0 = int(np.searchsorted(sub, t_lo_s, side="left"))
-                i1 = int(np.searchsorted(sub, t_hi_s, side="right"))
-                if i1 > i0:
-                    rel = (sub[i0:i1].astype(np.float64) / tp) - 1.0
-                    b_idx = np.clip(
-                        ((rel + search_half) * inv_bin).astype(np.int32),
-                        0,
-                        n_bins - 1,
-                    )
-                    np.add.at(hist, b_idx, 1.0)
+    if len(sample_idx) > 0:
+        dr_5, dc_5 = np.meshgrid(
+            np.arange(-2, 3, dtype=np.int64),
+            np.arange(-2, 3, dtype=np.int64),
+            indexing="ij",
+        )
+        dr_flat = dr_5.ravel()[None, :]
+        dc_flat = dc_5.ravel()[None, :]
+        samp_banks = b_arr[sample_idx]
+        for bk_val, bd in bank_tof_map.items():
+            tb, ob, _, (H, W) = bd
+            if len(tb) == 0:
+                continue
+            s_mask = samp_banks == int(bk_val)
+            if not np.any(s_mask):
+                continue
+            s_idxs = sample_idx[s_mask]
+            r0_v = np.rint(r_im_by_peak[s_idxs].astype(np.float64)).astype(np.int64)
+            c0_v = np.rint(c_im_by_peak[s_idxs].astype(np.float64)).astype(np.int64)
+            in_b = (r0_v >= 2) & (r0_v < H - 2) & (c0_v >= 2) & (c0_v < W - 2)
+            if not np.any(in_b):
+                continue
+            r0_v = r0_v[in_b]
+            c0_v = c0_v[in_b]
+            tp_v = t_pred_arr[s_idxs[in_b]].astype(np.float64)
+            pix_all = (
+                (r0_v[:, None] + dr_flat) * W + (c0_v[:, None] + dc_flat)
+            ).ravel()
+            e0_all = ob[pix_all]
+            e1_all = ob[pix_all + 1]
+            ne = e1_all > e0_all
+            if not np.any(ne):
+                continue
+            e0_ne = e0_all[ne]
+            e1_ne = e1_all[ne]
+            tp_ne = np.repeat(tp_v, 25)[ne]
+            t_lo_ne = tp_ne * (1.0 - search_half)
+            t_hi_ne = tp_ne * (1.0 + search_half)
+            i0_ne = _bsearch_tof_bank_left(tb, e0_ne, e1_ne, t_lo_ne)
+            i1_ne = _bsearch_tof_bank_right(tb, i0_ne, e1_ne, t_hi_ne)
+            cnts = (i1_ne - i0_ne).astype(np.int64)
+            hit = cnts > 0
+            if np.any(hit):
+                starts = i0_ne[hit].astype(np.int64)
+                lens = cnts[hit]
+                cum = np.cumsum(lens)
+                ev_idx = (
+                    np.arange(int(cum[-1]), dtype=np.int64)
+                    - np.repeat(cum - lens, lens)
+                    + np.repeat(starts, lens)
+                )
+                rel_all = (
+                    tb[ev_idx].astype(np.float64) / np.repeat(tp_ne[hit], lens)
+                ) - 1.0
+                b_idx_all = np.clip(
+                    ((rel_all + search_half) * inv_bin).astype(np.int32),
+                    0,
+                    n_bins - 1,
+                )
+                hist += np.bincount(b_idx_all, minlength=n_bins)[:n_bins]
 
     gate_outer = (
         gate_from_stack(edges, hist, coverage=0.95, min_z=4.5)
@@ -7019,7 +7133,7 @@ def _estimate_tof_gated_spot_angular_errors_deg(
     obs_q_by_bank = _SPOT_TOF_OBS_Q_CACHE.get(obs_q_sig)
     if obs_q_by_bank is None:
         obs_q_by_bank = {}
-        if len(_SPOT_TOF_OBS_Q_CACHE) >= 4:
+        if len(_SPOT_TOF_OBS_Q_CACHE) >= 16:
             _SPOT_TOF_OBS_Q_CACHE.pop(next(iter(_SPOT_TOF_OBS_Q_CACHE)))
         _SPOT_TOF_OBS_Q_CACHE[obs_q_sig] = obs_q_by_bank
 
@@ -7853,6 +7967,36 @@ def _stratified_spherical_subsample(
     return np.sort(by_pri[keep_in_pri])
 
 
+def _select_serialized_peak_indices(
+    pts: np.ndarray,
+    *,
+    max_peaks: int,
+    intensity_arr: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None = None,
+    hkl_arr: np.ndarray | None = None,
+    sample_offset_lab: Any = None,
+) -> np.ndarray | None:
+    """Return stratified subsample indices when ``len(pts) > max_peaks``, else ``None``."""
+    pts_f = np.asarray(pts, dtype=float)
+    n_raw = len(pts_f)
+    if n_raw <= int(max_peaks):
+        return None
+    pri_arr: np.ndarray | None = None
+    if intensity_arr is not None and len(intensity_arr) == n_raw:
+        pri_arr = np.asarray(intensity_arr, dtype=float)
+    elif ub_matrix is not None and hkl_arr is not None and len(hkl_arr) == n_raw:
+        g_cryst = (
+            np.asarray(hkl_arr, dtype=float) @ np.asarray(ub_matrix, dtype=float).T
+        )
+        pri_arr = 1.0 / np.maximum(np.linalg.norm(g_cryst, axis=1), 1e-12)
+    return _stratified_spherical_subsample(
+        pts_f,
+        int(max_peaks),
+        priority_arr=pri_arr,
+        sample_offset_lab=sample_offset_lab,
+    )
+
+
 def _serialize_peak_entries(
     pts: np.ndarray,
     *,
@@ -7886,25 +8030,25 @@ def _serialize_peak_entries(
     sample_offset_lab: Any = None,
     spot_ang_err_arr: np.ndarray | None = None,
     spot_img_available: bool = False,
+    subsample_order: np.ndarray | None = None,
 ) -> list[dict[str, Any]]:
     """Serialize a set of detector peak observations for the active frame."""
     pts = np.asarray(pts, dtype=float)
     n_raw = len(pts)
     if n_raw > max_peaks:
-        pri_arr: np.ndarray | None = None
-        if intensity_arr is not None and len(intensity_arr) == n_raw:
-            pri_arr = np.asarray(intensity_arr, dtype=float)
-        elif ub_matrix is not None and hkl_arr is not None and len(hkl_arr) == n_raw:
-            g_cryst = (
-                np.asarray(hkl_arr, dtype=float) @ np.asarray(ub_matrix, dtype=float).T
+        order = (
+            subsample_order
+            if subsample_order is not None
+            else _select_serialized_peak_indices(
+                pts,
+                max_peaks=int(max_peaks),
+                intensity_arr=intensity_arr,
+                ub_matrix=ub_matrix,
+                hkl_arr=hkl_arr,
+                sample_offset_lab=sample_offset_lab,
             )
-            pri_arr = 1.0 / np.maximum(np.linalg.norm(g_cryst, axis=1), 1e-12)
-        order = _stratified_spherical_subsample(
-            pts,
-            int(max_peaks),
-            priority_arr=pri_arr,
-            sample_offset_lab=sample_offset_lab,
         )
+        assert order is not None
         pts = pts[order]
         if bank_arr is not None and len(bank_arr) == n_raw:
             bank_arr = bank_arr[order]
@@ -8088,28 +8232,27 @@ def _serialize_peak_entries(
                 az_mat = az_ell.reshape(len(idxs), n_ell_pts)
                 y_mat = y_ell.reshape(len(idxs), n_ell_pts)
                 el_mat = el_ell.reshape(len(idxs), n_ell_pts)
-                for k_local, p_idx in enumerate(idxs):
-                    p_i = int(p_idx)
-                    az_row = az_mat[k_local]
-                    if float(np.ptp(az_row)) > 90.0:
-                        continue
-                    ellipse_cyl_by_idx[p_i] = [
-                        [
-                            round(float(az_row[m]), 3),
-                            round(float(y_mat[k_local, m]), 4),
-                        ]
-                        for m in range(n_ell_pts)
-                    ]
-                    ellipse_sph_by_idx[p_i] = [
-                        [
-                            round(float(az_row[m]), 3),
-                            round(float(el_mat[k_local, m]), 3),
-                        ]
-                        for m in range(n_ell_pts)
-                    ]
-                    sigma_major_by_idx[p_i] = round(float(s1_all[p_i]), 2)
-                    sigma_minor_by_idx[p_i] = round(float(s2_all[p_i]), 2)
-                    ellipse_ang_by_idx[p_i] = round(float(np.rad2deg(phi_all[p_i])), 1)
+                valid_ell_mask = np.ptp(az_mat, axis=1) <= 90.0
+                if np.any(valid_ell_mask):
+                    valid_k = np.flatnonzero(valid_ell_mask)
+                    valid_p_arr = idxs[valid_k]
+                    valid_p = valid_p_arr.tolist()
+                    az_r = np.round(az_mat[valid_k], 3)
+                    cyl_lists = np.stack(
+                        [az_r, np.round(y_mat[valid_k], 4)], axis=-1
+                    ).tolist()
+                    sph_lists = np.stack(
+                        [az_r, np.round(el_mat[valid_k], 3)], axis=-1
+                    ).tolist()
+                    s1_r = np.round(s1_all[valid_p_arr], 2).tolist()
+                    s2_r = np.round(s2_all[valid_p_arr], 2).tolist()
+                    ang_r = np.round(np.rad2deg(phi_all[valid_p_arr]), 1).tolist()
+                    for loc_m, p_i in enumerate(valid_p):
+                        ellipse_cyl_by_idx[p_i] = cyl_lists[loc_m]
+                        ellipse_sph_by_idx[p_i] = sph_lists[loc_m]
+                        sigma_major_by_idx[p_i] = s1_r[loc_m]
+                        sigma_minor_by_idx[p_i] = s2_r[loc_m]
+                        ellipse_ang_by_idx[p_i] = ang_r[loc_m]
 
     _to_asu_hkl = _make_asu_mapper(space_group, cell)
     _is_absent = _make_systematic_absence_checker(space_group)
@@ -8124,29 +8267,52 @@ def _serialize_peak_entries(
     )
 
     base_ray_orders: dict[tuple[int, int, int], set[int]] = {}
+    hkl_py = hkl_arr.tolist()
     for i in range(n_peaks):
-        h_i, k_i, l_i = (
-            int(hkl_arr[i, 0]),
-            int(hkl_arr[i, 1]),
-            int(hkl_arr[i, 2]),
-        )
+        h_i, k_i, l_i = hkl_py[i]
         if h_i or k_i or l_i:
             lam_chk = float(lam_arr[i]) if i < len(lam_arr) else 0.5 * (wl_min + wl_max)
             if wl_min - 1e-4 <= lam_chk <= wl_max + 1e-4:
-                g_c = max(1, int(np.gcd.reduce(np.abs([h_i, k_i, l_i]))))
+                g_c = max(1, math.gcd(abs(h_i), math.gcd(abs(k_i), abs(l_i))))
                 b_ray = (h_i // g_c, k_i // g_c, l_i // g_c)
                 base_ray_orders.setdefault(b_ray, set()).add(g_c)
+
+    det_x_py = np.round(det_x, 3).tolist()
+    det_y_py = np.round(det_y, 4).tolist()
+    det_el_py = np.round(det_el, 3).tolist()
+    q_hat_py = np.round(g_crystal, 5).tolist()
+    q_hat_lab_py = np.round(g_hat, 5).tolist()
+    sx_py = np.round(sx, 5).tolist()
+    sy_py = np.round(sy, 5).tolist()
+    hemi_py = hemi.astype(int).tolist()
+    sx_lab_py = np.round(sx_lab, 5).tolist()
+    sy_lab_py = np.round(sy_lab, 5).tolist()
+    hemi_lab_py = hemi_lab.astype(int).tolist()
+    row_py = (
+        np.round(pixel_r_arr, 2).tolist()
+        if pixel_r_arr is not None and len(pixel_r_arr) == n_peaks
+        else None
+    )
+    col_py = (
+        np.round(pixel_c_arr, 2).tolist()
+        if pixel_c_arr is not None and len(pixel_c_arr) == n_peaks
+        else None
+    )
+    bank_py = (
+        bank_arr.astype(int).tolist()
+        if bank_arr is not None and len(bank_arr) == n_peaks
+        else None
+    )
+    active_frame_i = int(active_frame)
 
     has_ray_err = bool(len(ang_err_deg) > 0 and float(np.max(ang_err_deg)) > 1e-4)
     peaks_list: list[dict[str, Any]] = []
     for i in range(n_peaks):
-        h_i, k_i, l_i = (
-            int(hkl_arr[i, 0]),
-            int(hkl_arr[i, 1]),
-            int(hkl_arr[i, 2]),
-        )
+        h_i, k_i, l_i = hkl_py[i]
         g_gcd = (
-            int(np.gcd.reduce(np.abs([h_i, k_i, l_i]))) if (h_i or k_i or l_i) else 1
+            math.gcd(abs(h_i), math.gcd(abs(k_i), abs(l_i)))
+            if (h_i or k_i or l_i)
+            else 1
         )
         b_ray = (
             (h_i // max(1, g_gcd), k_i // max(1, g_gcd), l_i // max(1, g_gcd))
@@ -8197,42 +8363,47 @@ def _serialize_peak_entries(
             )
             or len(peak_zones[i]) > 0
         )
-        parallax_depth = float(
-            np.clip(1.0 / (1.0 + 0.35 * max(d_val, 0.2)), 0.05, 0.98)
-        )
+        parallax_depth = min(0.98, max(0.05, 1.0 / (1.0 + 0.35 * max(d_val, 0.2))))
 
         pk_entry: dict[str, Any] = {
             "id": i,
             "peak_source": peak_source,
-            "run_index": int(active_frame),
+            "run_index": active_frame_i,
             "bank": (
-                int(bank_arr[i]) if bank_arr is not None and i < len(bank_arr) else 1
+                bank_py[i]
+                if bank_py is not None
+                else (
+                    int(bank_arr[i])
+                    if bank_arr is not None and i < len(bank_arr)
+                    else 1
+                )
             ),
             "row": (
-                round(float(pixel_r_arr[i]), 2)
-                if pixel_r_arr is not None and i < len(pixel_r_arr)
-                else 0.0
+                row_py[i]
+                if row_py is not None
+                else (
+                    round(float(pixel_r_arr[i]), 2)
+                    if pixel_r_arr is not None and i < len(pixel_r_arr)
+                    else 0.0
+                )
             ),
             "col": (
-                round(float(pixel_c_arr[i]), 2)
-                if pixel_c_arr is not None and i < len(pixel_c_arr)
-                else 0.0
+                col_py[i]
+                if col_py is not None
+                else (
+                    round(float(pixel_c_arr[i]), 2)
+                    if pixel_c_arr is not None and i < len(pixel_c_arr)
+                    else 0.0
+                )
             ),
-            "det_x": round(float(det_x[i]), 3),
-            "det_y": round(float(det_y[i]), 4),
-            "det_el": round(float(det_el[i]), 3),
-            "q_hat": [round(float(x), 5) for x in g_crystal[i]],
-            "q_hat_lab": [round(float(x), 5) for x in g_hat[i]],
-            "stereographic": [
-                round(float(sx[i]), 5),
-                round(float(sy[i]), 5),
-            ],
-            "hemisphere": int(hemi[i]),
-            "stereo_lab": [
-                round(float(sx_lab[i]), 5),
-                round(float(sy_lab[i]), 5),
-                int(hemi_lab[i]),
-            ],
+            "det_x": det_x_py[i],
+            "det_y": det_y_py[i],
+            "det_el": det_el_py[i],
+            "q_hat": q_hat_py[i],
+            "q_hat_lab": q_hat_lab_py[i],
+            "stereographic": [sx_py[i], sy_py[i]],
+            "hemisphere": hemi_py[i],
+            "stereo_lab": [sx_lab_py[i], sy_lab_py[i], hemi_lab_py[i]],
             "intensity": (
                 round(float(intensity_arr[i]), 2)
                 if intensity_arr is not None
@@ -8707,6 +8878,23 @@ def build_rainbow_zone_payload(
         if (has_tof_data or has_tof_events)
         else None
     )
+    primary_sub_order = (
+        _select_serialized_peak_indices(
+            pts,
+            max_peaks=primary_max_peaks,
+            intensity_arr=intensity_arr,
+            ub_matrix=ub_matrix,
+            hkl_arr=hkl_arr,
+            sample_offset_lab=s_lab_single,
+        )
+        if len(pts) > 0
+        else None
+    )
+    primary_eval_mask: np.ndarray | None = None
+    if primary_sub_order is not None:
+        primary_eval_mask = np.zeros(len(pts), dtype=bool)
+        primary_eval_mask[primary_sub_order] = True
+
     if primary_source == "predicted" and len(pts) > 0:
         (
             spot_ang_err_primary,
@@ -8731,6 +8919,7 @@ def build_rainbow_zone_payload(
             instrument=instrument,
             tof_l1=tof_l1_resolved,
             wavelength_range=(wl_min, wl_max),
+            eval_mask=primary_eval_mask,
         )
 
     peaks_list = _serialize_peak_entries(
@@ -8765,6 +8954,7 @@ def build_rainbow_zone_payload(
         sample_offset_lab=s_lab_single,
         spot_ang_err_arr=spot_ang_err_primary,
         spot_img_available=spot_img_avail_primary,
+        subsample_order=primary_sub_order,
     )
 
     measured_err_by_zone: dict[int, list[float]] = {}
@@ -8781,20 +8971,24 @@ def build_rainbow_zone_payload(
                     float(np.sqrt(np.mean(np.square(z_errs)))), 4
                 )
 
-    sample_peaks = _serialize_sample_peaks(
-        all_runs_data,
-        fallback_peaks=peaks_list,
-        n_frames=len(frames_meta),
-        ki_hat=ki_hat,
-        R_single=R_single,
-        wavelength_range=(wl_min, wl_max),
-        space_group=space_group,
-        cell=cell,
-        merged_i_arr=merged_i_arr,
-        merged_sigi_arr=merged_sigi_arr,
-        peak_source=primary_source,
-        d_min=d_min_use,
-        sample_offset_lab=s_lab_single,
+    sample_peaks = (
+        _serialize_sample_peaks(
+            all_runs_data,
+            fallback_peaks=peaks_list,
+            n_frames=len(frames_meta),
+            ki_hat=ki_hat,
+            R_single=R_single,
+            wavelength_range=(wl_min, wl_max),
+            space_group=space_group,
+            cell=cell,
+            merged_i_arr=merged_i_arr,
+            merged_sigi_arr=merged_sigi_arr,
+            peak_source=primary_source,
+            d_min=d_min_use,
+            sample_offset_lab=s_lab_single,
+        )
+        if include_all_runs_peaks
+        else []
     )
 
     if is_integrated_artifact:
@@ -8910,7 +9104,7 @@ def build_rainbow_zone_payload(
                         "intensity": None,
                         "sigma": None,
                     }
-                    if len(frames_meta) > 1:
+                    if include_all_runs_peaks and len(frames_meta) > 1:
                         all_xyz_p, all_hkl_p, all_lam_p, all_bnk_p, all_run_p = (
                             [],
                             [],
@@ -8976,6 +9170,20 @@ def build_rainbow_zone_payload(
             predicted_frame_data is not None
             and len(predicted_frame_data.get("peaks_xyz", [])) > 0
         ):
+            pred_pts_arr = np.asarray(predicted_frame_data["peaks_xyz"], dtype=float)
+            pred_max_peaks = max(int(max_peaks), 12000)
+            pred_sub_order = _select_serialized_peak_indices(
+                pred_pts_arr,
+                max_peaks=pred_max_peaks,
+                intensity_arr=predicted_frame_data.get("intensity"),
+                ub_matrix=ub_matrix,
+                hkl_arr=predicted_frame_data.get("hkl"),
+                sample_offset_lab=s_lab_single,
+            )
+            pred_eval_mask: np.ndarray | None = None
+            if pred_sub_order is not None:
+                pred_eval_mask = np.zeros(len(pred_pts_arr), dtype=bool)
+                pred_eval_mask[pred_sub_order] = True
             (
                 spot_err_pred,
                 spot_avail_pred,
@@ -8999,13 +9207,14 @@ def build_rainbow_zone_payload(
                 instrument=instrument,
                 tof_l1=tof_l1_resolved,
                 wavelength_range=(wl_min, wl_max),
+                eval_mask=pred_eval_mask,
             )
             if pred_err_mode == "tof_3d":
                 angular_error_mode = "tof_3d"
                 if tof_gate_meta is None:
                     tof_gate_meta = pred_gate_meta
             predicted_peaks = _serialize_peak_entries(
-                predicted_frame_data["peaks_xyz"],
+                pred_pts_arr,
                 bank_arr=predicted_frame_data.get("bank"),
                 pixel_r_arr=predicted_frame_data.get("pixel_r"),
                 pixel_c_arr=predicted_frame_data.get("pixel_c"),
@@ -9026,25 +9235,30 @@ def build_rainbow_zone_payload(
                 raw_zones=raw_zones,
                 active_frame=active_frame,
                 zone_tolerance_deg=zone_tolerance_deg,
-                max_peaks=max(int(max_peaks), 12000),
+                max_peaks=pred_max_peaks,
                 peak_source="predicted",
                 d_min=d_min_use,
                 sample_offset_lab=s_lab_single,
                 spot_ang_err_arr=spot_err_pred,
                 spot_img_available=spot_avail_pred,
+                subsample_order=pred_sub_order,
             )
-            predicted_sample_peaks = _serialize_sample_peaks(
-                predicted_all_runs_data,
-                fallback_peaks=predicted_peaks,
-                n_frames=len(frames_meta),
-                ki_hat=ki_hat,
-                R_single=R_single,
-                wavelength_range=(wl_min, wl_max),
-                space_group=space_group,
-                cell=cell,
-                peak_source="predicted",
-                d_min=d_min_use,
-                sample_offset_lab=s_lab_single,
+            predicted_sample_peaks = (
+                _serialize_sample_peaks(
+                    predicted_all_runs_data,
+                    fallback_peaks=predicted_peaks,
+                    n_frames=len(frames_meta),
+                    ki_hat=ki_hat,
+                    R_single=R_single,
+                    wavelength_range=(wl_min, wl_max),
+                    space_group=space_group,
+                    cell=cell,
+                    peak_source="predicted",
+                    d_min=d_min_use,
+                    sample_offset_lab=s_lab_single,
+                )
+                if include_all_runs_peaks
+                else []
             )
         else:
             predicted_peaks = []
@@ -9446,7 +9660,7 @@ def build_rainbow_zone_payload(
         "rel_border_width": round(default_rel_border_for_instrument(instrument), 4),
         "pixel_mask_bits": (
             _encode_pixel_valid_masks_for_js(pixel_class_by_bank, em_mask_summary)
-            if include_panels
+            if include_panels and include_all_runs_peaks
             else None
         ),
         "merge_metrics": merge_metrics,
@@ -9461,6 +9675,66 @@ def build_rainbow_zone_payload(
         "ladder_steps": ladder_steps,
         "pipeline_stages": pipeline_stages,
     }
+
+
+def merge_frame_only_payload(
+    prev_payload: dict[str, Any] | None,
+    frame_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Preserve dataset-wide all-runs arrays on server state after a single-frame rebuild."""
+    if not isinstance(prev_payload, dict):
+        return frame_payload
+    prev_mm = prev_payload.get("merge_metrics")
+    if isinstance(prev_mm, dict) and prev_mm:
+        frame_payload["merge_metrics"] = prev_mm
+    for keep_key in (
+        "sample_peaks",
+        "predicted_sample_peaks",
+        "integrated_sample_peaks",
+        "pixel_mask_bits",
+        "mtz_overlay_name",
+        "mtz_overlay_reflections",
+        "mtz_overlay_matched",
+        "mtz_overlay_space_group",
+        "mtz_overlay_cell",
+        "mtz_overlay_warning",
+        "mtz_asu_lookup",
+        "mtz_exact_lookup",
+    ):
+        prev_val = prev_payload.get(keep_key)
+        if prev_val is not None and not frame_payload.get(keep_key):
+            frame_payload[keep_key] = prev_val
+    return frame_payload
+
+
+def build_frame_only_response(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact HTTP response for frame switches omitting unchanged multi-run arrays."""
+    out = dict(payload)
+    out["frame_only"] = True
+    for drop_key in (
+        "sample_peaks",
+        "predicted_sample_peaks",
+        "integrated_sample_peaks",
+        "pixel_mask_bits",
+        "merge_metrics",
+        "beamline_detectors",
+        "detector_configs",
+        "space_group_ops",
+        "mtz_asu_lookup",
+        "mtz_exact_lookup",
+    ):
+        out.pop(drop_key, None)
+    # Avoid JSON-serializing the primary peak list twice (`peaks` aliases `integrated_peaks` or `predicted_peaks`)
+    has_integ_arr = (
+        isinstance(out.get("integrated_peaks"), list)
+        and len(out["integrated_peaks"]) > 0
+    )
+    has_pred_arr = (
+        isinstance(out.get("predicted_peaks"), list) and len(out["predicted_peaks"]) > 0
+    )
+    if has_integ_arr or has_pred_arr:
+        out["peaks"] = None
+    return out
 
 
 def render_rainbow_html(
@@ -11342,6 +11616,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const DATA = window.RAINBOW_ZONES_DATA || {{ peaks: [], sample_peaks: [], zones: [], panels: [], ladder_steps: [], pipeline_stages: [] }};
   function extractPeakBucketsFromPayload(payload) {{
     const pObj = payload || {{}};
+    const isFrameOnly = Boolean(pObj.frame_only);
     const art = String(pObj.artifact_kind || "").toLowerCase();
     const isIntegPayload = art === "integrator" || art === "merged_careless";
     const basePeaks = Array.isArray(pObj.peaks) ? pObj.peaks : [];
@@ -11351,13 +11626,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       : (isIntegPayload ? [] : [...basePeaks]);
     const predSample = Array.isArray(pObj.predicted_sample_peaks)
       ? [...pObj.predicted_sample_peaks]
-      : (isIntegPayload ? predPeaks : [...baseSample]);
+      : (isFrameOnly && typeof PREDICTED_SAMPLE_PEAKS !== "undefined" && Array.isArray(PREDICTED_SAMPLE_PEAKS) && PREDICTED_SAMPLE_PEAKS.length > 0
+        ? PREDICTED_SAMPLE_PEAKS
+        : (isIntegPayload ? predPeaks : [...baseSample]));
     const integPeaks = Array.isArray(pObj.integrated_peaks)
       ? [...pObj.integrated_peaks]
       : (isIntegPayload ? [...basePeaks] : []);
     const integSample = Array.isArray(pObj.integrated_sample_peaks)
       ? [...pObj.integrated_sample_peaks]
-      : (isIntegPayload ? [...baseSample] : integPeaks);
+      : (isFrameOnly && typeof INTEGRATED_SAMPLE_PEAKS !== "undefined" && Array.isArray(INTEGRATED_SAMPLE_PEAKS) && INTEGRATED_SAMPLE_PEAKS.length > 0
+        ? INTEGRATED_SAMPLE_PEAKS
+        : (isIntegPayload ? [...baseSample] : integPeaks));
     // Once Integration has produced real intensities (integPeaks.length > 0), link measured
     // I/σ and Careless scale/residual onto matching predicted (h,k,l) reflections so toggling
     // ○ Pred <-> ⬭ Integ preserves intensity-related color modes with source-specific palettes
@@ -11388,7 +11667,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const match = frameByBankHkl.get(`${{pp.bank}}|${{hk}}`) || frameByHkl.get(hk);
         if (match) copyMeasFields(pp, match);
       }}
-      if (integSample.length > 0 && predSample.length > 0 && predSample !== predPeaks) {{
+      if (!isFrameOnly && integSample.length > 0 && predSample.length > 0 && predSample !== predPeaks) {{
         const sampByRunHkl = new Map();
         const sampByHkl = new Map();
         for (let i = 0; i < integSample.length; i++) {{
@@ -11527,13 +11806,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function captureBaselineMeasurements(buckets, payloadObj, preserveExistingMtz = false) {{
-    const prevAsu = preserveExistingMtz ? _baselineMeasCache.mtzAsuLookup : null;
-    const prevEx = preserveExistingMtz ? _baselineMeasCache.mtzExactLookup : null;
+    const isFrameOnly = Boolean(payloadObj && payloadObj.frame_only);
+    const prevAsu = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzAsuLookup : null;
+    const prevEx = (preserveExistingMtz || isFrameOnly) ? _baselineMeasCache.mtzExactLookup : null;
     _baselineMeasCache.byBankHkl.clear();
-    _baselineMeasCache.byRunHkl.clear();
-    _baselineMeasCache.byHkl.clear();
-    _baselineMeasCache.byOrbit.clear();
-    _baselineMeasCache.minIntegD = Infinity;
+    if (!isFrameOnly) {{
+      _baselineMeasCache.byRunHkl.clear();
+      _baselineMeasCache.byHkl.clear();
+      _baselineMeasCache.byOrbit.clear();
+      _baselineMeasCache.minIntegD = Infinity;
+    }}
     _baselineMeasCache.mtzAsuLookup = (payloadObj && payloadObj.mtz_asu_lookup) || prevAsu || null;
     _baselineMeasCache.mtzExactLookup = (payloadObj && payloadObj.mtz_exact_lookup) || prevEx || null;
 
@@ -11590,8 +11872,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }};
     ingestList(buckets.integPeaks, true, true);
     ingestList(buckets.predPeaks, true, false);
-    ingestList(buckets.integSample, false, true);
-    ingestList(buckets.predSample, false, false);
+    if (!isFrameOnly) {{
+      ingestList(buckets.integSample, false, true);
+      ingestList(buckets.predSample, false, false);
+    }}
   }}
   captureBaselineMeasurements(initBuckets, DATA, false);
 
@@ -20461,10 +20745,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     _dynViewportPatchCache.sig = "";
     INTEGRATED_PEAKS = nextBuckets.integPeaks;
     INTEGRATED_SAMPLE_PEAKS = nextBuckets.integSample;
-    DATA.merge_metrics = newPayload.merge_metrics || null;
+    if (newPayload.merge_metrics !== undefined) {{
+      DATA.merge_metrics = newPayload.merge_metrics || null;
+    }} else if (!isFrameSwitch) {{
+      DATA.merge_metrics = null;
+    }}
     state.hoveredHistBin = null;
     hideHistBinTooltip();
-    DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
+    if (newPayload.em_mask_summary !== undefined) {{
+      DATA.em_mask_summary = newPayload.em_mask_summary || {{ available: false }};
+    }} else if (!isFrameSwitch) {{
+      DATA.em_mask_summary = {{ available: false }};
+    }}
     DATA.default_color_mode = newPayload.default_color_mode || null;
     const preferredSrc = isFrameSwitch
       ? state.peakSource
@@ -25109,10 +25401,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.frameAbortController = abortCtrl;
     renderFrameSelector();
     updateHUD();
+    const ctrlPill = document.getElementById("hud-frame-ctrl");
+    if (ctrlPill) ctrlPill.style.opacity = "0.68";
     const curF = frames[clamped];
     if (curF) {{
       setStatusLine(
-        `[FRAME ${{clamped + 1}}/${{frames.length}}]`,
+        `[LOADING FRAME ${{clamped + 1}}/${{frames.length}}…]`,
         `<strong style="color:var(--accent-pink);">${{curF.file || "Frame"}}</strong> • Goniometer: <strong style="color:var(--accent-cyan);">${{curF.motor_summary || "—"}}</strong>`
       );
     }}
@@ -25120,14 +25414,26 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const fetchOpts = {{ cache: "no-store" }};
       if (abortCtrl) fetchOpts.signal = abortCtrl.signal;
       const dminQ = (Number.isFinite(state.dMin) && state.dMin > 0) ? `&d_min=${{encodeURIComponent(state.dMin)}}` : "";
-      const resp = await fetch(`api/payload?frame=${{clamped}}${{dminQ}}${{getRenderBinningQuery()}}`, fetchOpts);
+      const resp = await fetch(`api/payload?frame=${{clamped}}&frame_only=1${{dminQ}}${{getRenderBinningQuery()}}`, fetchOpts);
       if (reqSeq !== state.frameRequestSeq || clamped !== state.selectedFrameIndex) return;
       if (resp.ok) {{
         const newPayload = await resp.json();
         if (reqSeq !== state.frameRequestSeq || clamped !== state.selectedFrameIndex) return;
+        if (newPayload && newPayload.status === "superseded") return;
         recomputeBoundsAndReload(newPayload, {{ isFrameSwitch: true }});
+        if (curF) {{
+          setStatusLine(
+            `[FRAME ${{clamped + 1}}/${{frames.length}}]`,
+            `<strong style="color:var(--accent-pink);">${{curF.file || "Frame"}}</strong> • Goniometer: <strong style="color:var(--accent-cyan);">${{curF.motor_summary || "—"}}</strong>`
+          );
+        }}
       }}
-    }} catch (_e) {{}}
+    }} catch (_e) {{
+    }} finally {{
+      if (reqSeq === state.frameRequestSeq && ctrlPill) {{
+        ctrlPill.style.opacity = "1";
+      }}
+    }}
   }}
 
   const selFrameEl = document.getElementById("sel-frame");

@@ -203,15 +203,24 @@ class SubhklGalaxyModel:
         self,
         frame_index: int | None = None,
         preserve_params: bool = False,
+        include_all_runs_peaks: bool = True,
     ) -> dict[str, Any] | None:
         """Rebuild the Diffraction Parallax & Lattice Ladder payload from current HDF5 files."""
         if frame_index is not None:
             self.frame_index = int(frame_index)
+        prev_payload = (
+            self.payload
+            if (not include_all_runs_peaks and isinstance(self.payload, dict))
+            else None
+        )
         saved_wl_min = float(self.data.wavelength_min)
         saved_wl_max = float(self.data.wavelength_max)
         saved_d_min = float(self.data.d_min)
         has_peaks = bool(self.data.peaks_file and os.path.isfile(self.data.peaks_file))
-        from subhkl.viz.rainbow_zones import _discover_images_h5
+        from subhkl.viz.rainbow_zones import (
+            _discover_images_h5,
+            merge_frame_only_payload,
+        )
 
         img_path = _discover_images_h5(self.data.peaks_file) if has_peaks else None
         if (
@@ -239,7 +248,9 @@ class SubhklGalaxyModel:
                         pass
         self.payload = build_rainbow_zone_payload(
             replay_h5=(self.data.peaks_file if has_peaks else None),
-            instrument=self.data.instrument.value,
+            instrument=str(
+                getattr(self.data.instrument, "value", self.data.instrument)
+            ),
             space_group=self.data.space_group,
             cell=(
                 None
@@ -261,6 +272,7 @@ class SubhklGalaxyModel:
             images_h5=img_path,
             frame_index=self.frame_index,
             render_binning=int(self.render_binning),
+            include_all_runs_peaks=bool(include_all_runs_peaks),
         )
         if self.payload.get("images_h5") and os.path.isfile(
             str(self.payload["images_h5"])
@@ -318,6 +330,8 @@ class SubhklGalaxyModel:
                 self.mtz_overlay_info,
                 select_mtz_color=False,
             )
+        if prev_payload is not None:
+            self.payload = merge_frame_only_payload(prev_payload, self.payload)
         return self.payload
 
     def render_html(self) -> str:

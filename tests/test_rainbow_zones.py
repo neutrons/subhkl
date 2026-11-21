@@ -10178,3 +10178,408 @@ setTimeout(() => {{
         )
         assert "3D ToF" in js_out["pillTooltip"]
         assert "arccos" in js_out["pillTooltip"]
+
+
+def test_nova_app_tof_route_and_fast_frame_switch(tmp_path):
+    """Verify MainApp POST /api/tof_delta_theta (no 405) and fast frame_only=1 switching parity."""
+    import asyncio
+    import importlib.util
+    import json
+    import re
+    import shutil
+    import subprocess
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    import h5py
+    import numpy as np
+
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.instrument.detector import Detector
+    from subhkl.io.events import ANGSTROM_M_PER_US, write_events
+    from subhkl.viz.nova_rainbow_view import RainbowZonesViewModel
+    from subhkl.viz.rainbow_zones import (
+        build_frame_only_response,
+        build_rainbow_zone_payload,
+        merge_frame_only_payload,
+        render_rainbow_html,
+    )
+
+    cfg32 = dict(beamlines["MANDI"]["32"])
+    det32 = Detector(cfg32)
+    H, W = int(det32.n), int(det32.m)
+    ki_hat = np.array([0.0, 0.0, 1.0], dtype=float)
+    l1_true = 30.0
+    xyz_c = np.asarray(det32.pixel_to_lab(128.0, 128.0), dtype=float).ravel()
+    l2_c = float(np.linalg.norm(xyz_c))
+    kf_c = xyz_c / l2_c
+    q_vec = kf_c - ki_hat
+    q_norm = float(np.linalg.norm(q_vec))
+    q_hat = q_vec / q_norm
+    z_ax = q_hat
+    x_ax = np.cross(np.array([0.0, 1.0, 0.0]), z_ax)
+    x_ax /= float(np.linalg.norm(x_ax))
+    y_ax = np.cross(z_ax, x_ax)
+    u_mat = np.column_stack([x_ax, y_ax, z_ax])
+    a_cell = 18.0
+    cell_c = [a_cell, a_cell, a_cell, 90.0, 90.0, 90.0]
+    b_mat, _ = cartesian_matrix_metric_tensor(*cell_c[:3], *np.deg2rad(cell_c[3:]))
+    lam_2 = (a_cell / 2.0) * q_norm
+    t_pred_2 = lam_2 * (l1_true + l2_c) / ANGSTROM_M_PER_US
+
+    def _make_bank_events(center_r: int, center_c: int):
+        lists = [[] for _ in range(H * W)]
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                p_flat = (center_r + dr) * W + (center_c + dc)
+                lists[p_flat] = [
+                    float(t_pred_2 - 2.0),
+                    float(t_pred_2),
+                    float(t_pred_2 + 2.0),
+                ]
+        img = np.zeros(H * W, dtype=np.float32)
+        flat: list[float] = []
+        for idx_p, ev_l in enumerate(lists):
+            if ev_l:
+                flat.extend(ev_l)
+                img[idx_p] = float(len(ev_l))
+        return img.reshape(H, W), np.asarray(flat, dtype=np.float32)
+
+    img_f0, tof_f0 = _make_bank_events(128, 128)
+    img_f1, tof_f1 = _make_bank_events(132, 124)
+    rot_f1 = np.array(
+        [
+            [np.cos(0.08), -np.sin(0.08), 0.0],
+            [np.sin(0.08), np.cos(0.08), 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    R_two = np.stack([np.eye(3), rot_f1], axis=0)
+
+    merged_h5 = tmp_path / "mandi_2run_merged.h5"
+    with h5py.File(merged_h5, "w") as mf:
+        mf.attrs["instrument"] = "MANDI"
+        mf.create_dataset("images", data=np.stack([img_f0, img_f1], axis=0))
+        mf.create_dataset("bank_ids", data=np.array([32, 32], dtype=np.int32))
+        mf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        mf.create_dataset(
+            "files",
+            data=np.array(["MANDI_run0.nxs.h5", "MANDI_run1.nxs.h5"], dtype="S32"),
+        )
+        mf.create_group("goniometer").create_dataset("R", data=R_two)
+        inst_g = mf.create_group("instrument")
+        inst_g.create_dataset("wavelength", data=np.array([1.8, 4.2], dtype=float))
+        write_events(mf, [tof_f0, tof_f1], l1=l1_true)
+
+    integ_h5 = tmp_path / "mandi_2run_integrated.h5"
+    with h5py.File(integ_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.attrs["source"] = str(merged_h5)
+        hf.create_dataset("file_offsets", data=np.array([0, 1], dtype=np.int32))
+        hf.create_dataset(
+            "files",
+            data=np.array(["MANDI_run0.nxs.h5", "MANDI_run1.nxs.h5"], dtype="S32"),
+        )
+        smp = hf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 1")
+        smp.create_dataset("cell", data=np.array(cell_c, dtype=float))
+        for k_n, v_n in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell_c):
+            smp.create_dataset(k_n, data=float(v_n))
+        smp.create_dataset("U", data=u_mat)
+        smp.create_dataset("B", data=b_mat)
+        hf.create_group("goniometer").create_dataset("R", data=R_two)
+        ig = hf.create_group("instrument")
+        ig.create_dataset("wavelength", data=np.array([1.8, 4.2], dtype=float))
+        ig.create_dataset("L1", data=float(l1_true))
+        pk = hf.create_group("peaks")
+        pk.create_dataset("run_index", data=np.array([0, 0, 1, 1], dtype=np.int32))
+        pk.create_dataset("bank", data=np.array([32, 32, 32, 32], dtype=np.int32))
+        pk.create_dataset(
+            "pixel_r", data=np.array([128.0, 140.0, 132.0, 144.0], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "pixel_c", data=np.array([128.0, 140.0, 124.0, 136.0], dtype=np.float64)
+        )
+        pk.create_dataset("h", data=np.array([0, 0, 0, 1], dtype=np.int32))
+        pk.create_dataset("k", data=np.array([0, 0, 0, 0], dtype=np.int32))
+        pk.create_dataset("l", data=np.array([2, 2, 2, 2], dtype=np.int32))
+        pk.create_dataset(
+            "intensity", data=np.array([220.0, 90.0, 185.0, 110.0], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "sigma", data=np.array([12.0, 9.0, 11.0, 8.5], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "wavelength",
+            data=np.array([2.8, 3.1, 2.8, 3.3], dtype=np.float64),
+        )
+        pk.create_dataset(
+            "var_u", data=np.array([1.4, 1.2, 1.5, 1.1], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "var_v", data=np.array([0.8, 0.9, 0.7, 0.85], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "cov_uv", data=np.array([0.1, -0.1, 0.2, 0.0], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "careless_residual", data=np.array([0.2, -0.4, 0.3, -0.1], dtype=np.float64)
+        )
+        pk.create_dataset(
+            "merged_i", data=np.array([200.0, 95.0, 200.0, 112.0], dtype=np.float64)
+        )
+        cg = hf.create_group("careless")
+        cg.create_dataset(
+            "metrics_json",
+            data=json.dumps(
+                {"cc_half": 0.985, "multiplicity": 2.0, "n_merged_asu": 3}
+            ).encode("utf-8"),
+        )
+
+    # 1. Bit-exact parity between include_all_runs_peaks=False and True on frame 1
+    p_init = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        frame_index=0,
+        d_min=4.0,
+        include_all_runs_peaks=True,
+    )
+    p_f1_fast = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        frame_index=1,
+        d_min=4.0,
+        include_all_runs_peaks=False,
+    )
+    p_f1_full = build_rainbow_zone_payload(
+        replay_h5=integ_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        frame_index=1,
+        d_min=4.0,
+        include_all_runs_peaks=True,
+    )
+    assert p_f1_fast["integrated_peaks"] == p_f1_full["integrated_peaks"]
+    assert p_f1_fast["predicted_peaks"] == p_f1_full["predicted_peaks"]
+    assert p_f1_fast["zones"] == p_f1_full["zones"]
+    assert p_f1_fast["tof_gate"] == p_f1_full["tof_gate"]
+    assert p_f1_fast["sample_peaks"] == []
+    merged_srv = merge_frame_only_payload(p_init, dict(p_f1_fast))
+    assert merged_srv["sample_peaks"] == p_init["sample_peaks"]
+    assert merged_srv["merge_metrics"] == p_init["merge_metrics"]
+    assert merged_srv["pixel_mask_bits"] == p_init["pixel_mask_bits"]
+
+    wire_f1 = build_frame_only_response(merged_srv)
+    assert wire_f1["frame_only"] is True
+    assert "sample_peaks" not in wire_f1
+    assert "merge_metrics" not in wire_f1
+    assert wire_f1["peaks"] is None
+    assert len(wire_f1["integrated_peaks"]) == 2
+
+    # Standalone HTTP ViewModel fast frame reload preserves sample_peaks & merge_metrics
+    vm = RainbowZonesViewModel(
+        replay_h5=integ_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        d_min=4.0,
+    )
+    assert len(vm.payload["sample_peaks"]) == 4
+    vm_f1 = vm.reload(frame_index=1, include_all_runs_peaks=False)
+    assert vm_f1["frame_index"] == 1
+    assert len(vm_f1["sample_peaks"]) == 4
+    assert vm_f1["merge_metrics"] == p_init["merge_metrics"]
+
+    # 2. MainApp HTTP routes: POST /api/tof_delta_theta (200, not 405!) & GET /api/payload?frame=1&frame_only=1
+    if (
+        importlib.util.find_spec("aiohttp") is not None
+        and importlib.util.find_spec("nova.mvvm") is not None
+    ):
+        from aiohttp import web
+        from aiohttp.test_utils import make_mocked_request
+
+        from subhkl.viz.nova_app.models.subhkl_model import (
+            InstrumentOptions,
+            SubhklGalaxyModel,
+        )
+        from subhkl.viz.nova_app.views.main_view import MainApp
+
+        sub_m = SubhklGalaxyModel()
+        sub_m.data.peaks_file = str(integ_h5)
+        sub_m.data.images_file = str(merged_h5)
+        sub_m.data.instrument = InstrumentOptions.MANDI
+        sub_m.data.d_min = 4.0
+        sub_m.refresh_payload(frame_index=0, preserve_params=True)
+        assert len(sub_m.payload["sample_peaks"]) == 4
+        init_sub_mm = dict(sub_m.payload["merge_metrics"])
+
+        app_inst = object.__new__(MainApp)
+        app_inst.pipeline_runner = MagicMock()
+        app_inst.pipeline_runner.current_frame_index = 0
+        app_inst.view_model = SimpleNamespace(model=SimpleNamespace(subhkl=sub_m))
+        aio_app = web.Application()
+        app_inst._bind_routes(SimpleNamespace(app=aio_app))
+
+        tof_req_body = json.dumps(
+            {
+                "frame_index": 0,
+                "d_min": 5.5,
+                "wavelength_range": [1.8, 4.2],
+                "ub_matrix": p_init["ub_matrix"],
+                "R_run": p_init["goniometer_R"],
+                "instrument": "MANDI",
+                "space_group": "P 1",
+                "cell": cell_c,
+                "tof_l1": l1_true,
+            }
+        ).encode("utf-8")
+
+        async def _exercise_routes():
+            req_tof = make_mocked_request(
+                "POST",
+                "/api/tof_delta_theta",
+                headers={"Content-Type": "application/json"},
+                app=aio_app,
+            )
+            req_tof._read_bytes = tof_req_body
+            resp_tof = await aio_app._handle(req_tof)
+            req_fo = make_mocked_request(
+                "GET",
+                "/api/payload?frame=1&frame_only=1",
+                app=aio_app,
+            )
+            resp_fo = await aio_app._handle(req_fo)
+            return resp_tof, resp_fo
+
+        resp_tof, resp_fo = asyncio.run(_exercise_routes())
+        assert resp_tof.status == 200
+        tof_json = json.loads(resp_tof.text)
+        assert tof_json["ok"] is True
+        assert tof_json["angular_error_mode"] == "tof_3d"
+
+        assert resp_fo.status == 200
+        fo_json = json.loads(resp_fo.text)
+        assert fo_json["frame_only"] is True
+        assert fo_json["frame_index"] == 1
+        assert "sample_peaks" not in fo_json
+        assert len(sub_m.payload["sample_peaks"]) == 4
+        assert sub_m.payload["merge_metrics"] == init_sub_mm
+
+    # 3. Client JS frame switch with frame_only=1 preserves SAMPLE_PEAKS & merge_metrics
+    if shutil.which("node"):
+        html_doc = render_rainbow_html(p_init)
+        scripts = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        js_src = scripts[-1]
+        iife_end = js_src.rfind("})();")
+        assert iife_end > 0
+        wire_f1_json = json.dumps(wire_f1)
+        js_harness = """
+const elems = new Map();
+function makeEl(id = "") {
+  const listeners = {};
+  return {
+    id, tagName: "DIV", value: "", min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 800, height: 520, clientWidth: 800, clientHeight: 520,
+    scrollWidth: 800, scrollHeight: 520, scrollTop: 0, offsetWidth: 800, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null, dataset: {},
+    style: new Proxy({}, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: { add() {}, remove() {}, toggle() { return false; }, contains() { return false; } },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) { (listeners[evObj.type] || []).forEach(fn => fn(evObj)); },
+    appendChild(c) { return c; }, insertBefore(c) { return c; }, replaceChildren() {},
+    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
+    getBoundingClientRect() { return { left: 0, top: 0, right: 800, bottom: 520, width: 800, height: 520 }; },
+    getContext() {
+      return {
+        fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+        textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+        setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+        transform() {}, clearRect() {}, fillRect() {}, strokeRect() {},
+        beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, ellipse() {},
+        quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+        stroke() {}, fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+        fillText() {}, strokeText() {}, drawImage() {},
+        measureText(t) { return { width: String(t).length * 6 }; },
+        createLinearGradient() { return { addColorStop() {} }; },
+        createRadialGradient() { return { addColorStop() {} }; },
+        getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+        putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+      };
+    },
+    querySelector() { return makeEl(); }, querySelectorAll() { return []; }, closest() { return null; },
+  };
+}
+function getEl(id) { if (!elems.has(id)) elems.set(id, makeEl(id)); return elems.get(id); }
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.requestAnimationFrame = () => 1;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.Image = class { set src(_v) {} };
+globalThis.document = {
+  body: makeEl("body"), documentElement: makeEl("html"),
+  getElementById: (id) => getEl(id),
+  createElement: (tag) => makeEl(tag),
+  querySelector: () => makeEl(), querySelectorAll: () => [],
+  addEventListener() {}, removeEventListener() {},
+};
+"""
+        js_probe = f"""
+const seenUrls = [];
+globalThis.fetch = (url, _opts) => {{
+  seenUrls.push(String(url));
+  if (String(url).includes("frame_only=1")) {{
+    return Promise.resolve({{ ok: true, json: () => Promise.resolve({wire_f1_json}) }});
+  }}
+  return Promise.resolve({{ ok: true, json: () => Promise.resolve({{ ok: false }}) }});
+}};
+selectFrame(1);
+setTimeout(() => {{
+  console.log(JSON.stringify({{
+    seenUrls,
+    stateFrame: state.selectedFrameIndex,
+    dataFrame: DATA.frame_index,
+    samplePeaksLen: SAMPLE_PEAKS.length,
+    integSampleLen: INTEGRATED_SAMPLE_PEAKS.length,
+    peaksRows: PEAKS.filter(p => p.peak_source === "integrated").map(p => p.row),
+    hasMergeMetrics: !!(DATA.merge_metrics && DATA.merge_metrics.cc_half),
+    hasPixelMaskBits: !!DATA.pixel_mask_bits,
+  }}));
+}}, 20);
+}})();
+"""
+        js_path = tmp_path / "fast_frame_switch_ui_test.js"
+        js_path.write_text(
+            js_harness + "\n" + js_src[:iife_end] + "\n" + js_probe, encoding="utf-8"
+        )
+        proc = subprocess.run(
+            ["node", str(js_path)], check=True, capture_output=True, text=True
+        )
+        js_out = json.loads(proc.stdout.strip())
+        assert any("frame=1" in u and "frame_only=1" in u for u in js_out["seenUrls"])
+        assert js_out["stateFrame"] == 1
+        assert js_out["dataFrame"] == 1
+        assert js_out["samplePeaksLen"] == 4
+        assert js_out["integSampleLen"] == 4
+        assert js_out["peaksRows"] == [132.0, 144.0]
+        assert js_out["hasMergeMetrics"] is True
+        assert js_out["hasPixelMaskBits"] is True
