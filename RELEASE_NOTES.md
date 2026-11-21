@@ -6,8 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.6.7]
 
+### Added
+
+- **Unlocked `0.50 Å` high-resolution $d_{\min}$ floor on large macromolecular unit cells via Ewald-shell rod slicing & viewport-frustum LOD (`rainbow_zones`, `crystallography`)**:
+  - Removed the `2,000,000` full-sphere lattice-point UI $d_{\min}$ ceiling
+    (which clamped `P 61 2 2`, $80\times 80\times 238\text{ Å}$, at `1.41 Å`),
+    allowing `#slider-dmin` to reach `0.50 Å` across all unit-cell volumes.
+  - Added closed-form Ewald-shell $(h, k)$ rod slicing in both the browser
+    (`raycastRunDirectEwaldShell`) and Python (`generate_ewald_reflections`) plus
+    slabbed quadratic rod bounds in `generate_reflections` so high-resolution
+    macromolecular shells ($40\text{M}+$ reciprocal lattice points) evaluate
+    directly inside the active $[\lambda_{\min}, \lambda_{\max}]$ Ewald band
+    without multi-GB 3D `meshgrid` allocations.
+  - Upgraded Detector and Wulff-sphere LOD thinning with two-tier
+    viewport-frustum high-resolution streaming (up to `48×` detector zoom) and a
+    directional panel hemisphere LUT: Tier 1 keeps `1×` overview crisp (`~300`
+    spots), while zooming into a detector bank streams sub-Ångström reflections
+    for the visible panel tile down to `0.50 Å` with crowd-aware spot sizing.
+
 ### Fixed
 
+- **Detector view sideways drift when zooming out (`rainbow_zones`)**:
+  - Anchored `detCanvas` wheel zoom-in at the cursor and zoom-out horizontally at
+    `viewCenterX` (with periodic $\pm 360^\circ$ pan wrapping and smooth vertical
+    recentering toward `1×`), eliminating unexpected sideways azimuth shifts and
+    coupled Wulff rotations when zooming out.
 - **Rhombohedral hexagonal (`:H`) vs. primitive rhombohedral (`:R`) space-group settings in cell refinement and UI**:
   - `gemmi.SpaceGroup` reports `ext='H', centring_type()='R'` for
     hexagonal-axes `R` space groups (`R 3`, `R 3:H`, `R -3 m`) and
