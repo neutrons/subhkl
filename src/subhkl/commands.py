@@ -1507,6 +1507,8 @@ def run_rbf_integrator(
     tof_gate_search: float = 0.05,
     tof_sideband_factor: float = 4.0,
     tof_sideband_measure: str = "spectrum",
+    tof_max_variance_inflation: float | None = 1000.0,
+    tof_amplitude_ridge: str = "fixed",
 ):
     """Integrate the predicted reflections.
 
@@ -1644,6 +1646,8 @@ def run_rbf_integrator(
         tof_gate_search=tof_gate_search,
         tof_sideband_factor=tof_sideband_factor,
         tof_sideband_measure=tof_sideband_measure,
+        tof_max_variance_inflation=tof_max_variance_inflation,
+        tof_amplitude_ridge=tof_amplitude_ridge,
         tof_band=peaks_band,
     )
     if event_store is not None:

@@ -1120,6 +1120,27 @@ def integrator(
             "bias the background; 'time' assumes a rate flat in time."
         ),
     ] = "spectrum",
+    tof_max_variance_inflation: Annotated[
+        float,
+        typer.Option(
+            help="Censor a gated reflection (sigI = 0, dropped from the "
+            "export) when overlapping neighbours in the same time window "
+            "inflate the variance of its intensity by more than this factor "
+            "relative to an isolated reflection. Such a reflection cannot "
+            "be told apart from its neighbours: only their sum is "
+            "determined. 0 keeps every row."
+        ),
+    ] = 1000.0,
+    tof_amplitude_ridge: Annotated[
+        str,
+        typer.Option(
+            help="Regularisation of the joint fit of overlapping gated "
+            "reflections. 'fixed' is a prior of 1000 photons on every "
+            "reflection; 'counts' sets it to the gross counts under the "
+            "reflection's own profile, which gives unresolved reflections a "
+            "meaningful sigma but also shrinks weak, partly overlapped ones."
+        ),
+    ] = "fixed",
 ):
     """
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
@@ -1170,6 +1191,8 @@ def integrator(
         tof_gate_search=tof_gate_search,
         tof_sideband_factor=tof_sideband_factor,
         tof_sideband_measure=tof_sideband_measure,
+        tof_max_variance_inflation=tof_max_variance_inflation,
+        tof_amplitude_ridge=tof_amplitude_ridge,
     )
 
 

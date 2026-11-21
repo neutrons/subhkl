@@ -684,3 +684,133 @@ def test_spectrum_measure_falls_back_on_sparse_images():
     # No events beyond 23000: those intervals have no length.
     late = int(np.ceil(grid.edge_index(24000.0)))
     assert measure[-1] - measure[late] == pytest.approx(0.0, abs=1e-6 * flat[-1])
+
+
+def test_unresolvable_overlaps_are_censored():
+    """Reflections packed closer than the spot width in one time window
+    cannot be told apart: the joint solve censors them instead of reporting
+    a value with a sigma that is only the regularisation constant."""
+    import jax.numpy as jnp
+
+    from subhkl.search.matrix_free import _solve_image_amplitudes_impl
+
+    rng = np.random.default_rng(9)
+    T = 41
+    yy, xx = np.mgrid[0:T, 0:T].astype(np.float64)
+    sigma_px, bg = 2.1, 1.5
+
+    def solve(cols, flux, max_inflation):
+        img = np.full((T, T), bg)
+        for c, f in zip(cols, flux):
+            img += (
+                f
+                * np.exp(-0.5 * ((yy - 20.0) ** 2 + (xx - c) ** 2) / sigma_px**2)
+                / (2 * np.pi * sigma_px**2)
+            )
+        k = len(cols)
+        var = jnp.full(k, sigma_px**2, dtype=jnp.float32)
+        c, s = _solve_image_amplitudes_impl(
+            jnp.array(rng.poisson(img).astype(np.float32)),
+            jnp.full((T, T), bg, dtype=jnp.float32),
+            jnp.ones((T, T), dtype=jnp.float32),
+            jnp.full(k, 20.0, dtype=jnp.float32),
+            jnp.array(cols, dtype=jnp.float32),
+            var,
+            var,
+            jnp.zeros(k, dtype=jnp.float32),
+            jnp.ones(k, dtype=jnp.float32),
+            jnp.float32(0.0),
+            allow_negative=True,
+            max_variance_inflation=max_inflation,
+        )
+        return np.array(c), np.array(s)
+
+    # Two reflections six pixels apart are resolved: nothing changes.
+    cols, flux = [17.0, 23.0], [400.0, 250.0]
+    rng = np.random.default_rng(9)
+    c_all, s_all = solve(cols, flux, None)
+    rng = np.random.default_rng(9)
+    c_cut, s_cut = solve(cols, flux, 1000.0)
+    np.testing.assert_array_equal(c_all, c_cut)
+    np.testing.assert_array_equal(s_all, s_cut)
+    assert np.all(s_cut > 0) and np.all(s_cut < 60)
+
+    # Eight reflections half a pixel apart are not.
+    cols = list(20.0 + 0.5 * (np.arange(8) - 3.5))
+    flux = [300.0] * 8
+    _c_free, s_free = solve(cols, flux, None)
+    # Without the cut the sigma sits near the ridge's ceiling of 1000.
+    assert np.median(s_free) > 500
+    c_cut, s_cut = solve(cols, flux, 1000.0)
+    assert np.all(s_cut == 0) and np.all(c_cut == 0)
+
+
+def test_counts_scaled_ridge_keeps_sigma_meaningful_for_unresolved_overlaps():
+    """With the ridge on the scale of the counts under each reflection, a
+    reflection that cannot be told apart from its neighbours comes back
+    within its own sigma, and isolated reflections are unchanged."""
+    import jax.numpy as jnp
+
+    from subhkl.search.matrix_free import _solve_image_amplitudes_impl
+
+    T = 41
+    yy, xx = np.mgrid[0:T, 0:T].astype(np.float64)
+    bg, true_sigma = 1.5, 2.1
+
+    def solve(rng, cols, flux, model_cols, model_sigma, ridge):
+        img = np.full((T, T), bg)
+        for c, f in zip(cols, flux):
+            img += (
+                f
+                * np.exp(-0.5 * ((yy - 20.0) ** 2 + (xx - c) ** 2) / true_sigma**2)
+                / (2 * np.pi * true_sigma**2)
+            )
+        k = len(model_cols)
+        var = jnp.full(k, model_sigma**2, dtype=jnp.float32)
+        c, s = _solve_image_amplitudes_impl(
+            jnp.array(rng.poisson(img).astype(np.float32)),
+            jnp.full((T, T), bg, dtype=jnp.float32),
+            jnp.ones((T, T), dtype=jnp.float32),
+            jnp.full(k, 20.0, dtype=jnp.float32),
+            jnp.array(model_cols, dtype=jnp.float32),
+            var,
+            var,
+            jnp.zeros(k, dtype=jnp.float32),
+            jnp.ones(k, dtype=jnp.float32),
+            jnp.float32(0.0),
+            allow_negative=True,
+            ridge=ridge,
+        )
+        return np.array(c, dtype=np.float64), np.array(s, dtype=np.float64)
+
+    # Isolated reflection, exact model: the two ridges agree.
+    c_f, s_f = solve(np.random.default_rng(1), [20.0], [400.0], [20.0], 2.1, "fixed")
+    c_c, s_c = solve(np.random.default_rng(1), [20.0], [400.0], [20.0], 2.1, "counts")
+    assert c_c[0] == pytest.approx(c_f[0], rel=0.02)
+    assert s_c[0] == pytest.approx(s_f[0], rel=0.02)
+
+    # A row of ten half a pixel apart, fitted as the integrator would: a
+    # spot model that is too wide, positions off, two neighbours left out.
+    rng = np.random.default_rng(2)
+    z = {"fixed": [], "counts": []}
+    for _ in range(25):
+        cols = 20.0 + 0.5 * (np.arange(10) - 4.5)
+        flux = rng.exponential(300.0, 10)
+        keep = np.argsort(np.abs(np.arange(10) - 5))[:8]
+        model_cols = cols[keep] + rng.normal(0.0, 0.5, 8)
+        seed = int(rng.integers(1 << 30))
+        for ridge, zs in z.items():
+            c, s = solve(
+                np.random.default_rng(seed), cols, flux, model_cols, 2.7, ridge
+            )
+            zs.append((c[0] - flux[5]) / s[0])
+    z_fixed = np.abs(np.array(z["fixed"]))
+    z_counts = np.abs(np.array(z["counts"]))
+    print(
+        f"|z| median / 90th pct: fixed {np.median(z_fixed):.2f} / "
+        f"{np.percentile(z_fixed, 90):.2f}, counts {np.median(z_counts):.2f} / "
+        f"{np.percentile(z_counts, 90):.2f}"
+    )
+    assert np.median(z_counts) < 1.2
+    assert np.percentile(z_counts, 90) < 3.0
+    assert np.percentile(z_fixed, 90) > 1.5 * np.percentile(z_counts, 90)

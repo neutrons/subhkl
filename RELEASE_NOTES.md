@@ -63,6 +63,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     gate moved off the reflections (e.g. `--tof-gate=0.06,0.11`) and merge; any
     CC½ that survives is not Bragg signal.
 
+- **Unresolvable overlaps reported with meaningless intensities (`tof_gate`, `matrix_free`)**:
+  - Where reflections sit closer together than the spot width inside one time
+    window (around the direction of a long cell axis, e.g. within ~10° of c*
+    for c = 238 Å), the joint amplitude fit is singular to working precision.
+    The reported σ then saturated at the fixed regularisation constant (1000
+    photons) while the signed estimate left it by orders of magnitude, giving
+    rows with |I/σ| in the hundreds; merged, their reproducible values added
+    CC½ of 0.2–0.4 in shells without signal.
+  - A gated reflection is now censored (σ_I = 0, dropped from the export) when
+    overlapping neighbours inflate the variance of its intensity more than
+    1000-fold relative to an isolated reflection
+    (`--tof-max-variance-inflation`; 0 keeps every row). Only the sum of such a
+    group is determined, and a per-reflection table cannot carry it.
+  - `--tof-amplitude-ridge counts` sets the regularisation of the joint fit to
+    the gross counts under each reflection's own profile instead of a fixed
+    1000 photons. It gives unresolved reflections a meaningful σ, but on a
+    crowded lattice it also shrinks weak, partly overlapped reflections, so
+    `fixed` stays the default.
+
 - **Detector view sideways drift when zooming out (`rainbow_zones`)**:
   - Anchored `detCanvas` wheel zoom-in at the cursor and zoom-out horizontally at
     `viewCenterX` (with periodic $\pm 360^\circ$ pan wrapping and smooth vertical

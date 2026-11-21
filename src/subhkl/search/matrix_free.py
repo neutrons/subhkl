@@ -3487,6 +3487,8 @@ def _solve_image_amplitudes_impl(
     profile=None,
     use_l1_gate=False,
     allow_negative=False,
+    max_variance_inflation=None,
+    ridge="fixed",
 ):
     """One image, all its reflections: L1-admitted, debiased Poisson solve.
 
@@ -3529,6 +3531,33 @@ def _solve_image_amplitudes_impl(
         profile: optional (u, f, norm) measured radial trunk in model
             sigmas with norm = integral of f(m) m dm, from
             _measure_whitened_profile; None keeps the analytic Gaussian
+        max_variance_inflation: [-] optional.  The variance of an atom's
+            amplitude in the joint fit, relative to what it would be with
+            no other atom present, is C_kk * I_kk (1 for an isolated
+            atom).  Atoms above this value cannot be told apart from
+            their neighbours: the information matrix is singular to
+            working precision, the reported sigma is then set by the
+            ridge that keeps the inverse finite (it saturates near
+            1 / sqrt(1e-6) = 1000 photons) and no longer bounds the
+            error, and the signed step below multiplies any misfit along
+            the unresolved directions by up to the inverse ridge.  Such
+            atoms are returned censored (flux 0, sigma 0).  None keeps
+            every atom.
+        ridge: what keeps the information matrix invertible.  A ridge
+            1/tau^2 on its diagonal is a zero-centred Gaussian prior of
+            width tau on an atom's flux.
+            "fixed" is tau = 1000 photons for every atom, whatever is on
+            the detector.  Where atoms overlap too closely to be told
+            apart, the reported sigma then saturates at that constant
+            and the signed estimate can leave it by orders of magnitude.
+            "counts" sets tau to the gross counts under the atom's own
+            profile: it cannot hold more flux than is there.  Resolved
+            atoms are unaffected (tau is many times their sigma), and an
+            unresolved atom comes back as "somewhere between none and
+            all of the counts here", with a sigma that says so.  Where
+            the counts under a profile are mostly background, tau is
+            comparable to the sigma of a weak, partly overlapped atom
+            and shrinks it too.
     Returns:
         (flux [photons], sigma [photons]) per atom
     """
@@ -3591,8 +3620,17 @@ def _solve_image_amplitudes_impl(
     # and occluded columns are identically zero; give them a unit diagonal
     # so the inverse exists (their sigma is zeroed below).
     u = jnp.maximum(A @ c + bg_flat, 1e-3)
-    I_F = A.T @ (A / u[:, None])
-    I_F = I_F + jnp.diag(jnp.where(well_measured, 1e-6, 1.0))
+    I_data = A.T @ (A / u[:, None])
+    info_alone = jnp.diag(I_data)
+    if ridge == "counts":
+        peak = jnp.maximum(jnp.max(A, axis=0), 1e-12)
+        tau = jnp.maximum(jnp.sum(y[:, None] * A / peak[None, :], axis=0), 1.0)
+        ridge_diag = 1.0 / tau**2
+    elif ridge == "fixed":
+        ridge_diag = 1e-6
+    else:
+        raise ValueError(f"ridge must be 'fixed' or 'counts', got {ridge!r}")
+    I_F = I_data + jnp.diag(jnp.where(well_measured, ridge_diag, 1.0))
     C = jnp.linalg.inv(I_F)
     sigma = jnp.where(well_measured, jnp.sqrt(jnp.maximum(jnp.diag(C), 0.0)), 0.0)
     if allow_negative and not use_l1_gate:
@@ -3600,10 +3638,29 @@ def _solve_image_amplitudes_impl(
         # MLE c: positive interior peaks have zero score and stay unchanged,
         # while boundary-pinned weak reflections receive their unbiased signed
         # profile-fitted amplitude (with bright-neighbor overlap A @ c removed).
-        score = A.T @ ((y - bg_flat - A @ c) / u)
-        c = jnp.where(well_measured, c + C @ score, 0.0)
+        if ridge == "counts":
+            # The posterior mean under the zero-centred prior: the weighted
+            # least-squares solution with the ridge in it, so that value
+            # and sigma come from the same regularised problem.
+            c = jnp.where(well_measured, C @ (A.T @ ((y - bg_flat) / u)), 0.0)
+        else:
+            score = A.T @ ((y - bg_flat - A @ c) / u)
+            c = jnp.where(well_measured, c + C @ score, 0.0)
     else:
         c = jnp.where(well_measured, c, 0.0)
+    if max_variance_inflation is not None:
+        # Decide on the data's information matrix scaled to unit diagonal,
+        # with its own small ridge, so the decision does not depend on the
+        # ridge used above or on how bright the atoms are.
+        scale = jnp.sqrt(jnp.where(well_measured, info_alone, 1.0))
+        unit = I_data / (scale[:, None] * scale[None, :])
+        unit = unit + jnp.diag(jnp.where(well_measured, 1e-6, 1.0))
+        inflation = jnp.diag(jnp.linalg.inv(unit))
+        # A matrix this close to singular can invert to a negative or
+        # non-finite diagonal in single precision: unresolved as well.
+        resolved = (inflation > 0) & (inflation <= max_variance_inflation)
+        c = jnp.where(resolved, c, 0.0)
+        sigma = jnp.where(resolved, sigma, 0.0)
     return c, sigma
 
 

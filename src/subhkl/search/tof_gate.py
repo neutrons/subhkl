@@ -669,14 +669,25 @@ def _jit(name):
     return _JIT[name]
 
 
-def _chunk_stage2(has_profile, use_l1_gate, allow_negative):
+def _chunk_stage2(
+    has_profile, use_l1_gate, allow_negative, max_inflation=None, ridge="fixed"
+):
     """Fused neighbor gather + joint Poisson solve for a static chunk."""
-    key = ("chunk_stage2", has_profile, use_l1_gate, allow_negative)
+    key = (
+        "chunk_stage2",
+        has_profile,
+        use_l1_gate,
+        allow_negative,
+        max_inflation,
+        ridge,
+    )
     if key not in _JIT:
         import jax.numpy as jnp
         from jax import jit
 
-        solve_fn = _solve_tiles(has_profile, use_l1_gate, allow_negative)
+        solve_fn = _solve_tiles(
+            has_profile, use_l1_gate, allow_negative, max_inflation, ridge
+        )
 
         def _run_stage2(
             tiles_c,
@@ -723,9 +734,11 @@ def _chunk_stage2(has_profile, use_l1_gate, allow_negative):
     return _JIT[key]
 
 
-def _solve_tiles(has_profile, use_l1_gate, allow_negative):
+def _solve_tiles(
+    has_profile, use_l1_gate, allow_negative, max_inflation=None, ridge="fixed"
+):
     """vmapped ``_solve_image_amplitudes`` over a batch of tiles."""
-    key = ("solve", has_profile, use_l1_gate, allow_negative)
+    key = ("solve", has_profile, use_l1_gate, allow_negative, max_inflation, ridge)
     if key not in _JIT:
         from jax import jit, vmap
 
@@ -738,6 +751,8 @@ def _solve_tiles(has_profile, use_l1_gate, allow_negative):
                 profile=prof,
                 use_l1_gate=use_l1_gate,
                 allow_negative=allow_negative,
+                max_variance_inflation=max_inflation,
+                ridge=ridge,
             )
             return vmap(one)(tiles, bgs, valid, r, c, vu, vv, cuv, ok)
 
@@ -1358,6 +1373,8 @@ def integrate_reflections_tof_gated(
     gate_search=0.05,
     sideband_factor=4.0,
     sideband_measure="spectrum",
+    max_variance_inflation=1000.0,
+    amplitude_ridge="fixed",
     static_valid=None,
     profile="gaussian",
     fp_target=None,
@@ -1387,6 +1404,20 @@ def integrate_reflections_tof_gated(
         gate_search: [-] half-range of t / t_pred - 1 searched for it
         sideband_factor: [-] sideband length on each side of the gate in
             units of the gate width
+        max_variance_inflation: [-] reflections whose amplitude variance
+            is inflated by more than this factor by overlapping neighbours
+            in the same gate are censored (sigI = 0) instead of reported;
+            see ``_solve_image_amplitudes_impl``.  Only their sum is
+            determined, and a per-reflection table cannot carry a sum:
+            whatever value is written for a member repeats between
+            measurements and merges into correlation without signal.
+            None or 0 keeps every row.
+        amplitude_ridge: "fixed" or "counts"; what keeps the joint fit of
+            overlapping reflections invertible (see the ``ridge`` argument
+            of ``_solve_image_amplitudes_impl``).  "counts" gives
+            unresolved reflections a sigma on the scale of the counts
+            they could hold, but on a crowded lattice it also shrinks
+            weak, partly overlapped reflections, so it is not the default.
         sideband_measure: "spectrum" scales the sideband background to the
             gate by the image's own time spectrum (see
             ``_spectrum_measure``); "time" assumes a rate flat in time
@@ -1518,7 +1549,16 @@ def integrate_reflections_tof_gated(
         0.0 if fp_target is None else calibrated_admission_z(n_peaks, fp_target)
     )
     use_l1_gate = bool(admission_z > 0.0)
-    stage2_fn = _chunk_stage2(trunk_jax is not None, use_l1_gate, bool(allow_negative))
+    max_inflation = (
+        None if not max_variance_inflation else float(max_variance_inflation)
+    )
+    stage2_fn = _chunk_stage2(
+        trunk_jax is not None,
+        use_l1_gate,
+        bool(allow_negative),
+        max_inflation,
+        amplitude_ridge,
+    )
 
     out = np.zeros((n_peaks, 5), dtype=np.float64)
     out[:, 1], out[:, 2] = rs, cs
