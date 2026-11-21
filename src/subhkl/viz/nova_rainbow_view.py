@@ -7299,6 +7299,21 @@ class NovaGalaxyPipelineRunner:
 
             d_min_req = float(params.get("d_min") or round(0.5 * float(wl[0]), 2))
             d_min_val = str(round(d_min_req, 3))
+            rel_border = float(
+                params.get(
+                    "rel_border_width",
+                    default_rel_border_for_instrument(str(inst)),
+                )
+            )
+            shape_min_snr = float(params.get("shape_fit_min_snr", 5.0))
+            has_solve_mask = False
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                import h5py as _h5
+
+                with _h5.File(solve_path, "r") as _sf:
+                    has_solve_mask = (
+                        "detector/pixel_mask" in _sf and "detector/mask_bank_ids" in _sf
+                    )
             pred_cmd = [
                 "python",
                 "-u",
@@ -7317,22 +7332,11 @@ class NovaGalaxyPipelineRunner:
                 str(wl[1]),
                 "--space-group",
                 str(sg),
+                "--rel-border-width",
+                str(round(rel_border, 4)),
             ]
-            rel_border = float(
-                params.get(
-                    "rel_border_width",
-                    default_rel_border_for_instrument(str(inst)),
-                )
-            )
-            shape_min_snr = float(params.get("shape_fit_min_snr", 5.0))
-            has_solve_mask = False
-            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
-                import h5py as _h5
-
-                with _h5.File(solve_path, "r") as _sf:
-                    has_solve_mask = (
-                        "detector/pixel_mask" in _sf and "detector/mask_bank_ids" in _sf
-                    )
+            if has_solve_mask:
+                pred_cmd.extend(["--static-mask-file", solve_path])
             int_cmd = [
                 "python",
                 "-u",

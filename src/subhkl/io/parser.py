@@ -1296,6 +1296,20 @@ def peak_predictor(
     wavel_min: float | None = None,
     wavel_max: float | None = None,
     max_workers: int = 16,
+    rel_border_width: Annotated[
+        float,
+        typer.Option(
+            "--rel-border-width",
+            help="Fractional detector-panel border margin to exclude predicted peaks near edges.",
+        ),
+    ] = 0.0,
+    static_mask_file: Annotated[
+        str | None,
+        typer.Option(
+            "--static-mask-file",
+            help="Optional static per-pixel mask HDF5 mapped by bank_ids.",
+        ),
+    ] = None,
 ):
     run_peak_predictor(
         filename,
@@ -1308,6 +1322,8 @@ def peak_predictor(
         space_group=space_group,
         max_workers=max_workers,
         create_visualizations=create_visualizations,
+        rel_border_width=rel_border_width,
+        static_mask_file=static_mask_file,
     )
 
 

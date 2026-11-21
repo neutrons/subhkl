@@ -695,6 +695,16 @@ def _load_pixel_class_from_h5(
             if val_arr.ndim == 3 and len(b_ids) == val_arr.shape[0]:
                 for b_id, v2d in zip(b_ids, val_arr):
                     out[int(b_id)] = np.where(v2d == 0, np.uint8(1), np.uint8(0))
+        elif (
+            _decode_str(hf.attrs.get("kind"), "") == "static-mask"
+            and "images" in hf
+            and "bank_ids" in hf
+        ):
+            val_arr = np.asarray(hf["images"][()], dtype=np.uint8)
+            b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            if val_arr.ndim == 3 and len(b_ids) == val_arr.shape[0]:
+                for b_id, v2d in zip(b_ids, val_arr):
+                    out[int(b_id)] = np.where(v2d == 0, np.uint8(1), np.uint8(0))
         if "scan_refinement" in hf and "em_dead_banks" in hf["scan_refinement"].attrs:
             with contextlib.suppress(ValueError, TypeError):
                 dead_list = [
@@ -741,6 +751,62 @@ def _load_pixel_class_from_h5(
         "dead_banks": dead_banks,
     }
     return by_bank, summary
+
+
+def _encode_pixel_valid_masks_for_js(
+    pixel_class_by_bank: dict[int, np.ndarray] | None,
+    em_mask_summary: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Pack native 1x per-bank pixel validity masks as compact bitsets for client JS raycasting."""
+    out: dict[str, dict[str, Any]] = {}
+    dead_set = {int(x) for x in ((em_mask_summary or {}).get("dead_banks") or ())}
+    if pixel_class_by_bank:
+        for bk, cls_im in sorted(pixel_class_by_bank.items()):
+            if cls_im is None or cls_im.ndim != 2 or cls_im.size == 0:
+                continue
+            h_px, w_px = int(cls_im.shape[0]), int(cls_im.shape[1])
+            if int(bk) in dead_set or not np.any(cls_im == 0):
+                out[str(int(bk))] = {"h": h_px, "w": w_px, "dead": True}
+                continue
+            if not np.any(cls_im != 0):
+                continue
+            bits = np.packbits(np.asarray(cls_im == 0, dtype=np.uint8).ravel())
+            out[str(int(bk))] = {
+                "h": h_px,
+                "w": w_px,
+                "b64": base64.b64encode(bits.tobytes()).decode("ascii"),
+            }
+    for dead_bk in sorted(dead_set):
+        if str(dead_bk) not in out:
+            out[str(dead_bk)] = {"h": 0, "w": 0, "dead": True}
+    return out
+
+
+def _decode_pixel_valid_masks_from_js(
+    pixel_mask_bits: dict[str, Any] | None,
+) -> dict[int, np.ndarray] | None:
+    """Reconstruct per-bank uint8 class arrays (0=valid, 1=masked) from payload['pixel_mask_bits']."""
+    if not isinstance(pixel_mask_bits, dict) or not pixel_mask_bits:
+        return None
+    out: dict[int, np.ndarray] = {}
+    for bk_str, entry in pixel_mask_bits.items():
+        if not isinstance(entry, dict):
+            continue
+        with contextlib.suppress(ValueError, TypeError):
+            bk = int(bk_str)
+            h_px = int(entry.get("h") or 0)
+            w_px = int(entry.get("w") or 0)
+            if entry.get("dead"):
+                out[bk] = np.ones((max(h_px, 1), max(w_px, 1)), dtype=np.uint8)
+                continue
+            b64_s = entry.get("b64")
+            if h_px > 0 and w_px > 0 and isinstance(b64_s, str) and b64_s:
+                raw_bytes = np.frombuffer(base64.b64decode(b64_s), dtype=np.uint8)
+                valid_bits = np.unpackbits(raw_bytes)[: h_px * w_px].reshape(
+                    (h_px, w_px)
+                )
+                out[bk] = np.where(valid_bits > 0, np.uint8(0), np.uint8(1))
+    return out or None
 
 
 def _encode_panel_textures(
@@ -1605,13 +1671,14 @@ def _raycast_hkl_on_detectors(
             & (col_mat < m_arr[None, :])
         )
         if mf > 0.0:
-            r_span = np.maximum(n_arr - 1.0, 1.0)
-            c_span = np.maximum(m_arr - 1.0, 1.0)
+            bw_arr = np.floor(mf * np.minimum(n_arr, m_arr))
+            hi_r_arr = np.where(bw_arr > 0.0, n_arr - 1.0 - bw_arr, n_arr)
+            hi_c_arr = np.where(bw_arr > 0.0, m_arr - 1.0 - bw_arr, m_arr)
             hit_mat &= (
-                (row_mat >= mf * r_span[None, :])
-                & (row_mat <= (1.0 - mf) * r_span[None, :])
-                & (col_mat >= mf * c_span[None, :])
-                & (col_mat <= (1.0 - mf) * c_span[None, :])
+                (row_mat >= bw_arr[None, :])
+                & (row_mat < hi_r_arr[None, :])
+                & (col_mat >= bw_arr[None, :])
+                & (col_mat < hi_c_arr[None, :])
             )
 
         b_hits, k_hits = np.nonzero(hit_mat.T)
@@ -1694,15 +1761,17 @@ def _raycast_hkl_on_detectors(
                         kf[:, 0], kf[:, 1], kf[:, 2], sample_offset=s_off_use
                     )
                     if mf > 0.0 and np.any(mask_c):
-                        r_span = max(float(det.n - 1), 1.0)
-                        c_span = max(float(det.m - 1), 1.0)
-                        mask_c = (
-                            mask_c
-                            & (row_c >= mf * r_span)
-                            & (row_c <= (1.0 - mf) * r_span)
-                            & (col_c >= mf * c_span)
-                            & (col_c <= (1.0 - mf) * c_span)
-                        )
+                        bw_px = int(mf * min(int(det.n), int(det.m)))
+                        if bw_px > 0:
+                            hi_r_px = int(det.n) - 1 - bw_px
+                            hi_c_px = int(det.m) - 1 - bw_px
+                            mask_c = (
+                                mask_c
+                                & (row_c >= bw_px)
+                                & (row_c < hi_r_px)
+                                & (col_c >= bw_px)
+                                & (col_c < hi_c_px)
+                            )
                     if np.any(mask_c):
                         idx_h = np.flatnonzero(mask_c)
                         pr_hit = np.asarray(row_c[idx_h], dtype=float)
@@ -1732,17 +1801,22 @@ def _raycast_hkl_on_detectors(
                         )
                         um = p_hit @ uh
                         vm = p_hit @ vh
+                        pr_all = vm / max(h_d, 1e-6) * max(int(det.n) - 1, 1)
+                        pc_all = um / max(w_d, 1e-6) * max(int(det.m) - 1, 1)
+                        bw_fb = int(mf * min(int(det.n), int(det.m))) if mf > 0.0 else 0
+                        hi_r_fb = int(det.n) - 1 - bw_fb if bw_fb > 0 else int(det.n)
+                        hi_c_fb = int(det.m) - 1 - bw_fb if bw_fb > 0 else int(det.m)
                         in_b = (
-                            (um >= w_d * mf)
-                            & (um <= w_d * (1.0 - mf))
-                            & (vm >= h_d * mf)
-                            & (vm <= h_d * (1.0 - mf))
+                            (pr_all >= bw_fb)
+                            & (pr_all < hi_r_fb)
+                            & (pc_all >= bw_fb)
+                            & (pc_all < hi_c_fb)
                         )
                         if np.any(in_b):
                             idx_h = cand_h[in_b]
                             um, vm = um[in_b], vm[in_b]
-                            pr_hit = vm / max(h_d, 1e-6) * max(int(det.n) - 1, 1)
-                            pc_hit = um / max(w_d, 1e-6) * max(int(det.m) - 1, 1)
+                            pr_hit = pr_all[in_b]
+                            pc_hit = pc_all[in_b]
                             xyz_hit = (
                                 cen[None, :]
                                 + um[:, None] * uh[None, :]
@@ -2170,6 +2244,12 @@ def apply_mtz_to_payload(
             inten_miss = inten_exp
             sigma_miss = sigma_exp
 
+        eff_mtz_border = (
+            float(out["rel_border_width"])
+            if isinstance(out.get("rel_border_width"), (int, float))
+            else default_rel_border_for_instrument(str(out.get("instrument") or ""))
+        )
+        mtz_pixel_class = _decode_pixel_valid_masks_from_js(out.get("pixel_mask_bits"))
         extra_pred: list[dict[str, Any]] = []
         if len(hkl_miss) > 0 and detectors_all and active_panel_banks:
             G_cryst_all = hkl_miss.astype(float) @ UB_curr.T
@@ -2194,7 +2274,8 @@ def apply_mtz_to_payload(
                     active_bids=active_panel_banks,
                     inten_cand=inten_miss,
                     sigma_cand=sigma_miss,
-                    margin_frac=0.0,
+                    pixel_class_by_bank=mtz_pixel_class,
+                    margin_frac=eff_mtz_border,
                     G_cryst=G_cryst_miss,
                     qn_cryst=qn_cryst_miss,
                 )
@@ -2333,7 +2414,8 @@ def apply_mtz_to_payload(
                         active_bids=active_panel_banks,
                         inten_cand=inten_smiss,
                         sigma_cand=sigma_smiss,
-                        margin_frac=0.0,
+                        pixel_class_by_bank=mtz_pixel_class,
+                        margin_frac=eff_mtz_border,
                         G_cryst=G_smiss,
                         qn_cryst=qn_smiss,
                     )
@@ -3737,6 +3819,46 @@ def _extract_from_h5(
                     l_i = np.asarray(grp["l"][()], dtype=int).ravel()
                     wl_i = np.asarray(grp["wavelength"][()], dtype=float).ravel()
                     im_b = bank_imgs_pred.get(bid) if use_imgs else None
+                    n_det_r = (
+                        int(det.n)
+                        if det is not None and hasattr(det, "n")
+                        else (int(im_b.shape[0]) if im_b is not None else 0)
+                    )
+                    m_det_c = (
+                        int(det.m)
+                        if det is not None and hasattr(det, "m")
+                        else (int(im_b.shape[1]) if im_b is not None else 0)
+                    )
+                    keep_p = np.ones(len(pr_i), dtype=bool)
+                    eff_bw_frac = default_rel_border_for_instrument(instrument)
+                    if eff_bw_frac > 0.0 and n_det_r > 0 and m_det_c > 0:
+                        bw_p = int(eff_bw_frac * min(n_det_r, m_det_c))
+                        if bw_p > 0:
+                            keep_p &= (
+                                (pr_i >= bw_p)
+                                & (pr_i < (n_det_r - 1 - bw_p))
+                                & (pc_i >= bw_p)
+                                & (pc_i < (m_det_c - 1 - bw_p))
+                            )
+                    if pixel_class_by_bank is not None and bid in pixel_class_by_bank:
+                        cls_p = pixel_class_by_bank[bid]
+                        if cls_p is not None and cls_p.ndim == 2 and cls_p.size > 0:
+                            rm_p = np.clip(
+                                np.round(pr_i).astype(int), 0, cls_p.shape[0] - 1
+                            )
+                            cm_p = np.clip(
+                                np.round(pc_i).astype(int), 0, cls_p.shape[1] - 1
+                            )
+                            keep_p &= cls_p[rm_p, cm_p] == 0
+                    if not np.all(keep_p):
+                        if not np.any(keep_p):
+                            continue
+                        pr_i = pr_i[keep_p]
+                        pc_i = pc_i[keep_p]
+                        h_i = h_i[keep_p]
+                        k_i = k_i[keep_p]
+                        l_i = l_i[keep_p]
+                        wl_i = wl_i[keep_p]
                     if im_b is not None:
                         r_idx = np.clip(
                             np.round(pr_i).astype(int), 2, max(2, im_b.shape[0] - 3)
@@ -4294,6 +4416,7 @@ def _extract_from_h5(
                     else (cal_bids_set if cal_bids_set else active_bids)
                 )
 
+                eff_rel_border = default_rel_border_for_instrument(instrument)
                 ray_active = _raycast_hkl_on_detectors(
                     hkl_all,
                     U_mat,
@@ -4305,7 +4428,7 @@ def _extract_from_h5(
                     sample_offset_lab=s_lab_active,
                     active_bids=active_bids,
                     pixel_class_by_bank=pixel_class_by_bank,
-                    margin_frac=0.0,
+                    margin_frac=eff_rel_border,
                     G_cryst=G_cryst,
                     qn_cryst=qn_cryst,
                 )
@@ -4341,6 +4464,7 @@ def _extract_from_h5(
                         hkl_cache_key,
                         round(float(wavelength_range[0]), 5),
                         round(float(wavelength_range[1]), 5),
+                        round(float(eff_rel_border), 5),
                         tuple(sorted(all_runs_bids)),
                         len(frames_meta),
                     )
@@ -4374,7 +4498,7 @@ def _extract_from_h5(
                                     sample_offset_lab=s_ri,
                                     active_bids=all_runs_bids,
                                     pixel_class_by_bank=pixel_class_by_bank,
-                                    margin_frac=0.0,
+                                    margin_frac=eff_rel_border,
                                     G_cryst=G_cryst,
                                     qn_cryst=qn_cryst,
                                 )
@@ -7319,6 +7443,7 @@ def build_rainbow_zone_payload(
                             fb_active_bids = {
                                 int(b) for b in np.asarray(mf_fb["bank_ids"], dtype=int)
                             }
+                eff_fb_border = default_rel_border_for_instrument(instrument)
                 ray_fr = _raycast_hkl_on_detectors(
                     hkl_theo,
                     U_fb,
@@ -7330,7 +7455,7 @@ def build_rainbow_zone_payload(
                     sample_offset_lab=s_lab_single,
                     active_bids=fb_active_bids or None,
                     pixel_class_by_bank=pixel_class_by_bank,
-                    margin_frac=0.0,
+                    margin_frac=eff_fb_border,
                 )
                 if len(ray_fr["peaks_xyz"]) > len(
                     (predicted_frame_data or {}).get("peaks_xyz", [])
@@ -7370,7 +7495,7 @@ def build_rainbow_zone_payload(
                                     sample_offset_lab=s_ri,
                                     active_bids=fb_active_bids or None,
                                     pixel_class_by_bank=pixel_class_by_bank,
-                                    margin_frac=0.0,
+                                    margin_frac=eff_fb_border,
                                 )
                             )
                             n_rr = len(ray_r["peaks_xyz"])
@@ -7860,6 +7985,12 @@ def build_rainbow_zone_payload(
         "beamline_detectors": beamline_detectors,
         "solve_diagnostics": solve_diagnostics,
         "em_mask_summary": em_mask_summary,
+        "rel_border_width": round(default_rel_border_for_instrument(instrument), 4),
+        "pixel_mask_bits": (
+            _encode_pixel_valid_masks_for_js(pixel_class_by_bank, em_mask_summary)
+            if include_panels
+            else None
+        ),
         "merge_metrics": merge_metrics,
         "peaks": peaks_list,
         "sample_peaks": sample_peaks,
@@ -10338,11 +10469,102 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return lo;
   }}
 
+  let lastClientBankMaskRaw = null;
+  const serverBankPixelMaskCache = new Map();
+
+  function defaultRelBorderForInstrument(instName) {{
+    const s = String(instName || "").trim().toUpperCase();
+    return (s === "MANDI" || s === "TOPAZ" || s === "SNAP") ? 0.06 : 0.03;
+  }}
+
+  function getActiveRelBorderWidth() {{
+    const el = document.getElementById("inp-border");
+    const fallback = (DATA && typeof DATA.rel_border_width === "number")
+      ? DATA.rel_border_width
+      : defaultRelBorderForInstrument(DATA && DATA.instrument);
+    if (!el) return fallback;
+    const raw = String(el.value ?? "").trim();
+    if (!raw) return fallback;
+    const v = Number(raw);
+    return Number.isFinite(v) ? Math.max(0.0, Math.min(0.25, v)) : fallback;
+  }}
+
+  function getBankPixelValidityMask(bid) {{
+    if (lastClientBankMaskRaw && lastClientBankMaskRaw.has(bid)) {{
+      const mEntry = lastClientBankMaskRaw.get(bid);
+      if (mEntry && mEntry.data && mEntry.H > 0 && mEntry.W > 0) {{
+        return {{ H: mEntry.H, W: mEntry.W, bits: null, clsArr: mEntry.data, dead: false }};
+      }}
+    }}
+    if (serverBankPixelMaskCache.has(bid)) {{
+      return serverBankPixelMaskCache.get(bid);
+    }}
+    const deadList = DATA && DATA.em_mask_summary && Array.isArray(DATA.em_mask_summary.dead_banks)
+      ? DATA.em_mask_summary.dead_banks
+      : null;
+    if (deadList && deadList.some(x => Number(x) === bid)) {{
+      const deadObj = {{ H: 0, W: 0, bits: null, clsArr: null, dead: true }};
+      serverBankPixelMaskCache.set(bid, deadObj);
+      return deadObj;
+    }}
+    const srcMap = DATA && DATA.pixel_mask_bits && typeof DATA.pixel_mask_bits === "object"
+      ? DATA.pixel_mask_bits
+      : null;
+    const entry = srcMap ? srcMap[String(bid)] : null;
+    if (!entry) {{
+      serverBankPixelMaskCache.set(bid, null);
+      return null;
+    }}
+    if (entry.dead) {{
+      const deadObj = {{ H: Number(entry.h) || 0, W: Number(entry.w) || 0, bits: null, clsArr: null, dead: true }};
+      serverBankPixelMaskCache.set(bid, deadObj);
+      return deadObj;
+    }}
+    const H = Number(entry.h) || 0;
+    const W = Number(entry.w) || 0;
+    if (H <= 0 || W <= 0 || typeof entry.b64 !== "string" || !entry.b64) {{
+      serverBankPixelMaskCache.set(bid, null);
+      return null;
+    }}
+    try {{
+      const binStr = atob(entry.b64);
+      const bits = new Uint8Array(binStr.length);
+      for (let i = 0; i < binStr.length; i++) bits[i] = binStr.charCodeAt(i);
+      const obj = {{ H, W, bits, clsArr: null, dead: false }};
+      serverBankPixelMaskCache.set(bid, obj);
+      return obj;
+    }} catch (_e) {{
+      serverBankPixelMaskCache.set(bid, null);
+      return null;
+    }}
+  }}
+
+  function isDetectorPixelValid(validMask, rowF, colF) {{
+    if (!validMask) return true;
+    if (validMask.dead) return false;
+    const ri = Math.min(validMask.H - 1, Math.max(0, Math.round(rowF)));
+    const ci = Math.min(validMask.W - 1, Math.max(0, Math.round(colF)));
+    const pFlat = ri * validMask.W + ci;
+    if (validMask.bits) {{
+      const byteIdx = pFlat >> 3;
+      if (byteIdx >= validMask.bits.length) return true;
+      return (validMask.bits[byteIdx] & (128 >> (pFlat & 7))) !== 0;
+    }}
+    if (validMask.clsArr) {{
+      return validMask.clsArr[pFlat] === 0;
+    }}
+    return true;
+  }}
+
   function buildActiveDetectorRaycastPanels(sLab) {{
     const activeBankSet = new Set();
     if (Array.isArray(PANELS)) {{
+      const anyTex = PANELS.some(p => Boolean(p && (p.texture_b64 || p._grayCanvas)));
       for (let i = 0; i < PANELS.length; i++) {{
-        if (typeof PANELS[i].bank === "number") activeBankSet.add(Number(PANELS[i].bank));
+        const pn = PANELS[i];
+        if (!pn || typeof pn.bank !== "number") continue;
+        if (anyTex && !pn.texture_b64 && !pn._grayCanvas) continue;
+        activeBankSet.add(Number(pn.bank));
       }}
     }}
     let cfgSrc = DATA.detector_configs && Object.keys(DATA.detector_configs).length > 0
@@ -10350,6 +10572,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       : ((DATA.beamline_detectors && DATA.beamline_detectors[DATA.instrument]) || null);
     if (!cfgSrc) return [];
 
+    const relBorder = getActiveRelBorderWidth();
     const sx = sLab[0] || 0.0, sy = sLab[1] || 0.0, sz = sLab[2] || 0.0;
     const out = [];
     const keys = Object.keys(cfgSrc);
@@ -10357,12 +10580,20 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const bid = parseInt(keys[i], 10);
       if (!Number.isFinite(bid)) continue;
       if (activeBankSet.size > 0 && !activeBankSet.has(bid)) continue;
+      const validMask = getBankPixelValidityMask(bid);
+      if (validMask && validMask.dead) continue;
       const cfg = cfgSrc[keys[i]];
       if (!cfg || !Array.isArray(cfg.center) || !Array.isArray(cfg.vhat)) continue;
       const isCurved = String(cfg.panel || cfg.panel_type || "flat").toLowerCase().includes("curv") ||
                        String(cfg.panel || cfg.panel_type || "flat").toLowerCase().includes("cyl");
       const m = Math.max(2, Number(cfg.m) || 256);
       const n = Math.max(2, Number(cfg.n) || 256);
+      const bw = relBorder > 0.0 ? Math.floor(relBorder * Math.min(n, m)) : 0;
+      const minRow = bw;
+      const maxRow = bw > 0 ? (n - 1 - bw) : n;
+      const minCol = bw;
+      const maxCol = bw > 0 ? (m - 1 - bw) : m;
+      if (minRow >= maxRow || minCol >= maxCol) continue;
       const width = Number(cfg.width) || 0.2;
       const height = Number(cfg.height) || 0.2;
       const dw = width / (m - 1);
@@ -10396,7 +10627,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         // Pad cone angle slightly so near-grazing corners never miss
         const maxAng = Math.min(Math.PI, Math.acos(Math.max(-1.0, Math.min(1.0, minCos))) + 0.045);
         out.push({{
-          bid, isCurved: false, m, n, width, height, dw, dh,
+          bid, isCurved: false, m, n, minRow, maxRow, minCol, maxCol, validMask, width, height, dw, dh,
           center, uhat, vhat, norm, csDotN, midRay, cosCone: Math.cos(maxAng),
         }});
       }} else {{
@@ -10406,7 +10637,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const bVec = vecCross([sx, sy, sz], vhat);
         const qc = vecDot(bVec, bVec) - radius * radius;
         out.push({{
-          bid, isCurved: true, m, n, width, height, dw, dh,
+          bid, isCurved: true, m, n, minRow, maxRow, minCol, maxCol, validMask, width, height, dw, dh,
           center, vhat, rhat, what, radius, bVec, qc,
         }});
       }}
@@ -10593,9 +10824,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ptZ = sz0 + tRay * kfz;
           const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
           rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
-          if (rowF < 0.0 || rowF >= det.n) continue;
+          if (rowF < det.minRow || rowF >= det.maxRow) continue;
           colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
-          if (colF < 0.0 || colF >= det.m) continue;
+          if (colF < det.minCol || colF >= det.maxCol) continue;
         }} else {{
           const vx = det.vhat[0], vy = det.vhat[1], vz = det.vhat[2];
           const dx = kfy * vz - kfz * vy;
@@ -10617,7 +10848,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
           const dotV = rx * vx + ry * vy + rz * vz;
           rowF = dotV / det.dh;
-          if (rowF < 0.0 || rowF >= det.n) continue;
+          if (rowF < det.minRow || rowF >= det.maxRow) continue;
           const dpx = rx - dotV * vx, dpy = ry - dotV * vy, dpz = rz - dotV * vz;
           const dotR = dpx * det.rhat[0] + dpy * det.rhat[1] + dpz * det.rhat[2];
           const dotW = dpx * det.what[0] + dpy * det.what[1] + dpz * det.what[2];
@@ -10626,8 +10857,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           const twoPi = 2.0 * Math.PI;
           dt = ((dt % twoPi) + twoPi) % twoPi;
           colF = dt * (det.radius / det.dw);
-          if (colF < 0.0 || colF >= det.m) continue;
+          if (colF < det.minCol || colF >= det.maxCol) continue;
         }}
+        if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
 
         hitPoolIdx.push(i);
         hitPIdx.push(pIdx);
@@ -11065,9 +11297,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 const ptZ = sz0 + tRay * kfz;
                 const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
                 const rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
-                if (rowF < 0.0 || rowF >= det.n) continue;
+                if (rowF < det.minRow || rowF >= det.maxRow) continue;
                 const colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
-                if (colF < 0.0 || colF >= det.m) continue;
+                if (colF < det.minCol || colF >= det.maxCol) continue;
+                if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
 
                 if (frustumFilter) {{
                   const [azF, dyF, elF] = labToCyl([ptX, ptY, ptZ]);
@@ -11113,9 +11346,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 ptZ = sz0 + tRay * kfz;
                 const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
                 rowF = (rx * det.vhat[0] + ry * det.vhat[1] + rz * det.vhat[2]) / det.dh;
-                if (rowF < 0.0 || rowF >= det.n) continue;
+                if (rowF < det.minRow || rowF >= det.maxRow) continue;
                 colF = (rx * det.uhat[0] + ry * det.uhat[1] + rz * det.uhat[2]) / det.dw;
-                if (colF < 0.0 || colF >= det.m) continue;
+                if (colF < det.minCol || colF >= det.maxCol) continue;
               }} else {{
                 const vx = det.vhat[0], vy = det.vhat[1], vz = det.vhat[2];
                 const dx = kfy * vz - kfz * vy;
@@ -11137,7 +11370,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 const rx = ptX - det.center[0], ry = ptY - det.center[1], rz = ptZ - det.center[2];
                 const dotV = rx * vx + ry * vy + rz * vz;
                 rowF = dotV / det.dh;
-                if (rowF < 0.0 || rowF >= det.n) continue;
+                if (rowF < det.minRow || rowF >= det.maxRow) continue;
                 const dpx = rx - dotV * vx, dpy = ry - dotV * vy, dpz = rz - dotV * vz;
                 const dotR = dpx * det.rhat[0] + dpy * det.rhat[1] + dpz * det.rhat[2];
                 const dotW = dpx * det.what[0] + dpy * det.what[1] + dpz * det.what[2];
@@ -11146,8 +11379,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
                 const twoPi = 2.0 * Math.PI;
                 dt = ((dt % twoPi) + twoPi) % twoPi;
                 colF = dt * (det.radius / det.dw);
-                if (colF < 0.0 || colF >= det.m) continue;
+                if (colF < det.minCol || colF >= det.maxCol) continue;
               }}
+              if (det.validMask !== null && !isDetectorPixelValid(det.validMask, rowF, colF)) continue;
 
               if (frustumFilter) {{
                 const [azF, dyF, elF] = labToCyl([ptX, ptY, ptZ]);
@@ -11859,28 +12093,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const borderMaskCache = new Map();
   let _userTouchedBorder = false;
 
-  function defaultRelBorderForInstrument(instName) {{
-    const s = String(instName || "").trim().toUpperCase();
-    return (s === "MANDI" || s === "TOPAZ" || s === "SNAP") ? 0.06 : 0.03;
-  }}
-
-  function getActiveRelBorderWidth() {{
-    const el = document.getElementById("inp-border");
-    const fallback = defaultRelBorderForInstrument(DATA && DATA.instrument);
-    if (!el) return fallback;
-    const v = Number(el.value);
-    return Number.isFinite(v) ? Math.max(0.0, Math.min(0.25, v)) : fallback;
-  }}
-
   function getBorderMaskCanvas(panel, relBorder) {{
     if (!(relBorder > 0)) return null;
     const rawW = (panel && (panel.n_cols || (panel._grayCanvas && panel._grayCanvas.width))) || 256;
     const rawH = (panel && (panel.n_rows || (panel._grayCanvas && panel._grayCanvas.height))) || 256;
+    const rawBw = Math.floor(relBorder * Math.min(rawW, rawH));
+    if (rawBw <= 0) return null;
     const maxDim = Math.max(rawW, rawH, 1);
     const scale = maxDim > 512 ? (512 / maxDim) : (maxDim < 64 ? (64 / maxDim) : 1.0);
     const W = Math.max(32, Math.round(rawW * scale));
     const H = Math.max(32, Math.round(rawH * scale));
-    const bw = Math.min(Math.floor(Math.min(W, H) * 0.45), Math.max(1, Math.round(relBorder * Math.min(W, H))));
+    const bw = Math.min(Math.floor(Math.min(W, H) * 0.45), Math.max(1, Math.round(rawBw * scale)));
     const key = `${{W}}x${{H}}_${{bw}}`;
     let c = borderMaskCache.get(key);
     if (c) return c;
@@ -11935,7 +12158,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (edgeEl) {{
         const p0 = hasPanels ? PANELS[0] : null;
         const dim = p0 && (p0.n_rows || p0.n_cols) ? Math.min(p0.n_rows || 9999, p0.n_cols || 9999) : 0;
-        const pxTxt = dim > 0 ? ` (${{Math.round(relBorder * dim)}}px)` : "";
+        const pxTxt = dim > 0 ? ` (${{Math.floor(relBorder * dim)}}px)` : "";
         edgeEl.textContent = `Edge ${{borderPct.toFixed(1)}}%${{pxTxt}}`;
       }}
     }}
@@ -11976,7 +12199,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const rawBankImages = new Map();
   const rawBankGrayMaps = new Map();
   let lastClientBankImgs = null;
-  let lastClientBankMaskRaw = null;
 
   function cacheBankGrayscaleMap(bank, img) {{
     if (!img) return;
@@ -18026,14 +18248,31 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   const inpBorderEl = document.getElementById("inp-border");
   if (inpBorderEl) {{
-    const onBorderChange = () => {{
+    let _borderRepredictTimer = null;
+    const runBorderRepredict = () => {{
+      _borderRepredictTimer = null;
+      if (canRepredictDynamic() && repredictPeaksDynamic({{ preserveSource: true }})) {{
+        renderDetector();
+        renderStereoInset(true);
+        updateHUD();
+      }} else if (state.showPixelMask) {{
+        renderDetector();
+      }}
+    }};
+    inpBorderEl.addEventListener("input", () => {{
       _userTouchedBorder = true;
       invalidatePanelRenderCaches();
       syncPixelMaskUI();
-      if (state.showPixelMask) renderDetector();
-    }};
-    inpBorderEl.addEventListener("input", onBorderChange);
-    inpBorderEl.addEventListener("change", onBorderChange);
+      if (_borderRepredictTimer) clearTimeout(_borderRepredictTimer);
+      _borderRepredictTimer = setTimeout(runBorderRepredict, 60);
+    }});
+    inpBorderEl.addEventListener("change", () => {{
+      _userTouchedBorder = true;
+      invalidatePanelRenderCaches();
+      syncPixelMaskUI();
+      if (_borderRepredictTimer) clearTimeout(_borderRepredictTimer);
+      runBorderRepredict();
+    }});
   }}
 
   function buildClientGrayscaleCanvas(sub, H, W, bStep) {{
@@ -18608,6 +18847,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     rawBankGrayMaps.clear();
     bankCanvases.clear();
     maskBankCanvases.clear();
+    if (newPayload.pixel_mask_bits && typeof newPayload.pixel_mask_bits === "object") {{
+      DATA.pixel_mask_bits = newPayload.pixel_mask_bits;
+      serverBankPixelMaskCache.clear();
+    }} else if (!isFrameSwitch && Array.isArray(newPayload.panels)) {{
+      DATA.pixel_mask_bits = null;
+      serverBankPixelMaskCache.clear();
+    }}
+    if (typeof newPayload.rel_border_width === "number") {{
+      DATA.rel_border_width = newPayload.rel_border_width;
+    }}
     if (!PANELS.some(p => Boolean(p._grayCanvas))) {{
       lastClientBankImgs = null;
       lastClientBankMaskRaw = null;

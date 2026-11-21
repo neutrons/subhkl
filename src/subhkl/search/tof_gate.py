@@ -28,14 +28,12 @@ weak reflections.  The stacked excess gives a common offset (a cell-scale
 or flight-path error moves every reflection by the same relative amount)
 and a width; the gate is the interval holding a chosen fraction of it.
 
-Everything is done one image at a time on the accelerator.  The events of
-an image are histogrammed into a (row, column, time) cube whose time bins
-are logarithmic, so a relative gate is the same number of bins at every
-wavelength.  Cumulative sums of that cube turn every count the method
-needs into a handful of lookups: a tile inside a gate is a difference of
-two time slices, and the sideband counts of a tile are corner differences
-of the three-way cumulative sum.  Gate and sideband edges are therefore
-bin edges; the bin is at most a thirtieth of the gate.
+Events are stored sorted by ``(flat_pixel, tof)``.  Multi-image slabs are
+streamed directly to the accelerator where fused binary-search kernels
+extract gated tiles and sideband counts in place without materialising
+dense ``(H, W, nt)`` 3D cubes, and ``snap -> joint Poisson solve`` runs
+across the full slab in ``TILE_CHUNK_LARGE`` batches with minimal host
+synchronisation.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -57,11 +55,14 @@ STACK_MAX_IMAGES = 96  # images sampled for the stacked time profile
 MAX_TIME_BINS = 2048
 MAX_LOG_BIN = 1.0e-3  # [-] coarsest relative time bin
 PEAK_PAD = 512  # retained for legacy compatibility
-TILE_CHUNK_SMALL = 256  # fixed tile chunk for small images/tests
-TILE_CHUNK_LARGE = 2048  # fixed tile chunk for dense macromolecular runs (1 compile)
-EVENT_CHUNK_SMALL = 1 << 16  # 65,536 events per static scatter step (small images)
-EVENT_CHUNK = 1 << 20  # 1,048,576 events per static scatter step (1 compile)
+TILE_CHUNK_SMALL = 256  # fixed tile chunk for small batches/tests
+TILE_CHUNK_LARGE = 2048  # fixed tile chunk for multi-image GPU slabs (1 compile)
+EVENT_CHUNK_SMALL = 1 << 16  # 65,536 events
+EVENT_CHUNK = 1 << 20  # 1,048,576 events (slab cap = 8 * EVENT_CHUNK)
 EVENT_PAD = EVENT_CHUNK
+SLAB_MAX_IMAGES = 32  # static image slots per GPU slab
+SLAB_MAX_PEAKS = 32768  # cap cached GPU tiles per slab (~250 MB max VRAM)
+BSEARCH_STEPS = 20  # covers up to 2^20 = 1,048,576 events in one pixel
 
 _JIT = {}
 
@@ -207,6 +208,431 @@ def _tiles_impl(ct, valid, org_r, org_c, b_lo, b_hi, T):
     return (counts * ok).astype(jnp.float32), ok.astype(jnp.float32)
 
 
+def _edge_cutoffs_f32(grid: TimeGrid) -> np.ndarray:
+    """IEEE-754 exact float32 lower-bound cutoffs matching ``_prepare_flat_events``."""
+    b_idx = np.arange(grid.nt + 1, dtype=np.int64)
+    c = grid.edge_time(b_idx).astype(np.float32)
+    log_t0 = np.log(grid.t0)
+    inv_dl = 1.0 / grid.dl
+
+    def _tb(val_f32: np.ndarray) -> np.ndarray:
+        return np.floor(
+            (np.log(np.maximum(val_f32.astype(np.float64), 1e-6)) - log_t0) * inv_dl
+        ).astype(np.int64)
+
+    for _ in range(4):
+        prev_c = np.nextafter(c, np.float32(-np.inf))
+        step_down = (c > np.float32(0.0)) & (_tb(prev_c) >= b_idx)
+        if not np.any(step_down):
+            break
+        c = np.where(step_down, prev_c, c)
+    for _ in range(4):
+        step_up = _tb(c) < b_idx
+        if not np.any(step_up):
+            break
+        c = np.where(step_up, np.nextafter(c, np.float32(np.inf)), c)
+    return c
+
+
+def _bsearch_lower(tof_slab, lo, hi, cuts, steps=BSEARCH_STEPS):
+    """Vectorised lower-bound index in sorted ``tof_slab[lo:hi]`` where ``tof >= cuts``."""
+    import jax
+    import jax.numpy as jnp
+
+    target_shape = jnp.broadcast_shapes(lo.shape, hi.shape, cuts.shape)
+    l0 = jnp.broadcast_to(lo, target_shape)
+    h0 = jnp.broadcast_to(hi, target_shape)
+
+    def _step(_i, state):
+        l_cur, h_cur = state
+        active = l_cur < h_cur
+        mid = l_cur + ((h_cur - l_cur) >> 1)
+        mid_safe = jnp.where(active, mid, jnp.int32(0))
+        val = tof_slab[mid_safe]
+        lt = val < cuts
+        l_nxt = jnp.where(active & lt, mid + jnp.int32(1), l_cur)
+        h_nxt = jnp.where(active & ~lt, mid, h_cur)
+        return (l_nxt, h_nxt)
+
+    l_fin, _ = jax.lax.fori_loop(0, steps, _step, (l0, h0))
+    return l_fin
+
+
+def _slab_box_impl(
+    tof_slab, pix_offsets_slab, valid_slab, s_idx, org_r, org_c, cuts_e, box_t
+):
+    """[photons] (K, S - 1): interval counts in ``box_t x box_t`` pixel boxes."""
+    import jax.numpy as jnp
+
+    _, H, W = valid_slab.shape
+    rr = org_r[:, None] + jnp.arange(box_t, dtype=jnp.int32)[None, :]
+    cc = org_c[:, None] + jnp.arange(box_t, dtype=jnp.int32)[None, :]
+    inside = ((rr >= 0) & (rr < H))[:, :, None] & ((cc >= 0) & (cc < W))[:, None, :]
+    rr_c = jnp.clip(rr, 0, H - 1)[:, :, None]
+    cc_c = jnp.clip(cc, 0, W - 1)[:, None, :]
+    s_b = s_idx[:, None, None]
+    ok = inside & (valid_slab[s_b, rr_c, cc_c] > 0)
+
+    flat_pix = rr_c * jnp.int32(W) + cc_c
+    pix_lo = jnp.where(ok, pix_offsets_slab[s_b, flat_pix], jnp.int32(0))
+    pix_hi = jnp.where(ok, pix_offsets_slab[s_b, flat_pix + jnp.int32(1)], jnp.int32(0))
+
+    env_cuts = jnp.stack([cuts_e[:, 0], cuts_e[:, -1]], axis=-1)[:, None, None, :]
+    env_idx = _bsearch_lower(tof_slab, pix_lo[..., None], pix_hi[..., None], env_cuts)
+    p_first = env_idx[..., 0]
+    p_last = env_idx[..., 1]
+
+    if cuts_e.shape[1] > 2:
+        mid_idx = _bsearch_lower(
+            tof_slab,
+            p_first[..., None],
+            p_last[..., None],
+            cuts_e[:, 1:-1][:, None, None, :],
+        )
+        all_idx = jnp.concatenate(
+            [p_first[..., None], mid_idx, p_last[..., None]], axis=-1
+        )
+    else:
+        all_idx = jnp.stack([p_first, p_last], axis=-1)
+    counts = ((all_idx[..., 1:] - all_idx[..., :-1]) * ok[..., None]).sum(axis=(1, 2))
+    return counts
+
+
+def _slab_tiles_impl(
+    tof_slab, pix_offsets_slab, valid_slab, s_idx, org_r, org_c, cuts_20, T
+):
+    """Fused extraction of gated ``(T, T)`` tiles and 16 sideband sub-interval counts."""
+    import jax.numpy as jnp
+
+    _, H, W = valid_slab.shape
+    rr = org_r[:, None] + jnp.arange(T, dtype=jnp.int32)[None, :]
+    cc = org_c[:, None] + jnp.arange(T, dtype=jnp.int32)[None, :]
+    inside = ((rr >= 0) & (rr < H))[:, :, None] & ((cc >= 0) & (cc < W))[:, None, :]
+    rr_c = jnp.clip(rr, 0, H - 1)[:, :, None]
+    cc_c = jnp.clip(cc, 0, W - 1)[:, None, :]
+    s_b = s_idx[:, None, None]
+    ok = inside & (valid_slab[s_b, rr_c, cc_c] > 0)
+
+    flat_pix = rr_c * jnp.int32(W) + cc_c
+    pix_lo = jnp.where(ok, pix_offsets_slab[s_b, flat_pix], jnp.int32(0))
+    pix_hi = jnp.where(ok, pix_offsets_slab[s_b, flat_pix + jnp.int32(1)], jnp.int32(0))
+
+    # Hierarchical bisection narrows sub-intervals before searching odd edges,
+    # turning >85% of leaf searches into 0-width L1 cache hits on sparse panels.
+    env_cuts = jnp.stack([cuts_20[:, 0], cuts_20[:, 19]], axis=-1)[:, None, None, :]
+    env_idx = _bsearch_lower(tof_slab, pix_lo[..., None], pix_hi[..., None], env_cuts)
+    p0 = env_idx[..., 0]
+    p19 = env_idx[..., 1]
+
+    gate_cuts = jnp.stack([cuts_20[:, 9], cuts_20[:, 10]], axis=-1)[:, None, None, :]
+    gate_idx = _bsearch_lower(tof_slab, p0[..., None], p19[..., None], gate_cuts)
+    p9 = gate_idx[..., 0]
+    p10 = gate_idx[..., 1]
+
+    # Boundary edges p8 (<= p9) and p11 (>= p10), plus sideband midpoints p4, p15.
+    lvl1_lo = jnp.stack([p0, p0, p10, p10], axis=-1)
+    lvl1_hi = jnp.stack([p9, p9, p19, p19], axis=-1)
+    lvl1_cuts = jnp.stack(
+        [cuts_20[:, 4], cuts_20[:, 8], cuts_20[:, 11], cuts_20[:, 15]], axis=-1
+    )[:, None, None, :]
+    lvl1 = _bsearch_lower(tof_slab, lvl1_lo, lvl1_hi, lvl1_cuts, steps=16)
+    p4, p8, p11, p15 = lvl1[..., 0], lvl1[..., 1], lvl1[..., 2], lvl1[..., 3]
+
+    lvl2_lo = jnp.stack([p0, p4, p11, p15], axis=-1)
+    lvl2_hi = jnp.stack([p4, p8, p15, p19], axis=-1)
+    lvl2_cuts = jnp.stack(
+        [cuts_20[:, 2], cuts_20[:, 6], cuts_20[:, 13], cuts_20[:, 17]], axis=-1
+    )[:, None, None, :]
+    lvl2 = _bsearch_lower(tof_slab, lvl2_lo, lvl2_hi, lvl2_cuts, steps=16)
+    p2, p6, p13, p17 = lvl2[..., 0], lvl2[..., 1], lvl2[..., 2], lvl2[..., 3]
+
+    lvl3_lo = jnp.stack([p0, p2, p4, p6, p11, p13, p15, p17], axis=-1)
+    lvl3_hi = jnp.stack([p2, p4, p6, p8, p13, p15, p17, p19], axis=-1)
+    lvl3_cuts = jnp.stack(
+        [
+            cuts_20[:, 1],
+            cuts_20[:, 3],
+            cuts_20[:, 5],
+            cuts_20[:, 7],
+            cuts_20[:, 12],
+            cuts_20[:, 14],
+            cuts_20[:, 16],
+            cuts_20[:, 18],
+        ],
+        axis=-1,
+    )[:, None, None, :]
+    lvl3 = _bsearch_lower(tof_slab, lvl3_lo, lvl3_hi, lvl3_cuts, steps=16)
+    p1, p3, p5, p7 = lvl3[..., 0], lvl3[..., 1], lvl3[..., 2], lvl3[..., 3]
+    p12, p14, p16, p18 = lvl3[..., 4], lvl3[..., 5], lvl3[..., 6], lvl3[..., 7]
+
+    tile_counts = (p10 - p9) * ok
+    ok_i32 = ok.astype(jnp.int32)
+    left_all = jnp.stack([p0, p1, p2, p3, p4, p5, p6, p7, p8], axis=-1)
+    right_all = jnp.stack([p11, p12, p13, p14, p15, p16, p17, p18, p19], axis=-1)
+    sb_left = ((left_all[..., 1:] - left_all[..., :-1]) * ok_i32[..., None]).sum(
+        axis=(1, 2)
+    )
+    sb_right = ((right_all[..., 1:] - right_all[..., :-1]) * ok_i32[..., None]).sum(
+        axis=(1, 2)
+    )
+    sb_counts = jnp.concatenate([sb_left, sb_right], axis=-1)
+    n_valid = ok_i32.sum(axis=(1, 2))
+    return tile_counts.astype(jnp.float32), ok.astype(jnp.float32), sb_counts, n_valid
+
+
+def _nbr_block_impl(
+    q_frame,
+    q_gid,
+    q_r,
+    q_c,
+    q_reach,
+    q_b_lo,
+    q_b_hi,
+    q_sb_l,
+    q_sb_r,
+    k_frame,
+    k_gid,
+    k_r,
+    k_c,
+    k_reach,
+    k_in_band,
+    k_b_lo,
+    k_b_hi,
+    half_f,
+):
+    """GPU block neighbor search: sideband blocking + top-7 overlapping atoms."""
+    import jax
+    import jax.numpy as jnp
+
+    def _one_query(qf, qg, qr, qc, qrc, qblo, qbhi, qsbl, qsbr):
+        same = (k_frame == qf) & k_in_band & (k_gid != qg)
+        dr = jnp.abs(qr - k_r)
+        dc = jnp.abs(qc - k_c)
+        thr = half_f + k_reach
+        ok_near = same & (dr <= thr) & (dc <= thr)
+
+        ok_sb = ok_near & (qsbl[0] < k_b_hi) & (qsbr[-1] > k_b_lo)
+        blk_l = jnp.any(
+            ok_sb[None, :]
+            & (qsbl[:-1, None] < k_b_hi[None, :])
+            & (qsbl[1:, None] > k_b_lo[None, :]),
+            axis=1,
+        )
+        blk_r = jnp.any(
+            ok_sb[None, :]
+            & (qsbr[:-1, None] < k_b_hi[None, :])
+            & (qsbr[1:, None] > k_b_lo[None, :]),
+            axis=1,
+        )
+        blk_16 = jnp.concatenate([blk_l, blk_r], axis=0)
+
+        touch = qrc + k_reach
+        ok_joint = (
+            ok_near & (dr <= touch) & (dc <= touch) & (qblo < k_b_hi) & (qbhi > k_b_lo)
+        )
+        n_joint = jnp.sum(ok_joint.astype(jnp.int32))
+        d2 = jnp.where(ok_joint, dr * dr + dc * dc, jnp.float32(jnp.inf))
+
+        best_d2 = []
+        best_gid = []
+        cur_d2 = d2
+        for _ in range(ATOM_PAD - 1):
+            pos = jnp.argmin(cur_d2)
+            best_d2.append(cur_d2[pos])
+            best_gid.append(k_gid[pos])
+            cur_d2 = cur_d2.at[pos].set(jnp.float32(jnp.inf))
+        return blk_16, n_joint, jnp.stack(best_d2), jnp.stack(best_gid)
+
+    return jax.vmap(_one_query)(
+        q_frame, q_gid, q_r, q_c, q_reach, q_b_lo, q_b_hi, q_sb_l, q_sb_r
+    )
+
+
+def _merge_nbr_impl(
+    acc_blk, acc_cnt, acc_d2, acc_gid, step_blk, step_cnt, step_d2, step_gid
+):
+    """Merge two fixed-shape top-7 neighbor candidate tables on GPU."""
+    import jax
+    import jax.numpy as jnp
+
+    comb_d2 = jnp.concatenate([acc_d2, step_d2], axis=1)
+    comb_gid = jnp.concatenate([acc_gid, step_gid], axis=1)
+
+    def _pick_7(d2_row, gid_row):
+        out_d2 = []
+        out_gid = []
+        cur = d2_row
+        for _ in range(ATOM_PAD - 1):
+            p = jnp.argmin(cur)
+            out_d2.append(cur[p])
+            out_gid.append(gid_row[p])
+            cur = cur.at[p].set(jnp.float32(jnp.inf))
+        return jnp.stack(out_d2), jnp.stack(out_gid)
+
+    m_d2, m_gid = jax.vmap(_pick_7)(comb_d2, comb_gid)
+    return acc_blk | step_blk, acc_cnt + step_cnt, m_d2, m_gid
+
+
+def _sideband_bg_impl(counts, widths, keep0, blocked, n_valid, gate_time, in_band):
+    """On-GPU robust median sideband background estimation (zero host sync)."""
+    import jax.numpy as jnp
+
+    keep = keep0 & ~blocked
+    none_left = ~jnp.any(keep, axis=1)
+    keep_eff = jnp.where(none_left[:, None], keep0, keep)
+    cnt_f = counts.astype(jnp.float32)
+    safe_w = jnp.where(keep_eff & (widths > 0), widths, jnp.float32(1.0))
+    per_width = jnp.where(keep_eff & (widths > 0), cnt_f / safe_w, jnp.float32(jnp.nan))
+    any_kept = jnp.any(keep_eff, axis=1)
+
+    def _row_med_16(vals, msk):
+        valid = msk & jnp.isfinite(vals)
+        cnt = jnp.sum(valid.astype(jnp.int32), axis=1)
+        s = jnp.sort(jnp.where(valid, vals, jnp.float32(jnp.inf)), axis=1)
+        i0 = jnp.maximum((cnt - 1) // 2, 0)
+        i1 = jnp.maximum(cnt // 2, 0)
+        rows = jnp.arange(vals.shape[0], dtype=jnp.int32)
+        med = jnp.float32(0.5) * (s[rows, i0] + s[rows, i1])
+        return jnp.where(cnt > 0, med, jnp.float32(jnp.nan))
+
+    med = _row_med_16(per_width, keep_eff)
+    med_w = jnp.where(any_kept, _row_med_16(widths, keep_eff), jnp.float32(1.0))
+    tol = (
+        jnp.float32(5.0) * jnp.sqrt(jnp.maximum(med * med_w, jnp.float32(1.0))) / med_w
+    )
+    trimmed = keep_eff & (per_width <= (med + tol)[:, None])
+    trimmed = jnp.where(jnp.any(trimmed, axis=1)[:, None], trimmed, keep_eff)
+    total_c = jnp.sum(jnp.where(trimmed, cnt_f, jnp.float32(0.0)), axis=1)
+    total_w = jnp.sum(jnp.where(trimmed, widths, jnp.float32(0.0)), axis=1)
+    denom = total_w * jnp.maximum(n_valid.astype(jnp.float32), jnp.float32(1.0))
+    rate = total_c / jnp.where(denom > 0, denom, jnp.float32(1.0))
+    rate = jnp.where(any_kept & (total_w > 0), rate, jnp.float32(jnp.nan))
+    bg = rate * gate_time
+    usable = in_band & jnp.isfinite(bg) & (n_valid > 0)
+    tile_bg_out = jnp.where(usable, bg, jnp.float32(jnp.nan))
+    bg_safe = jnp.where(usable, jnp.maximum(bg, jnp.float32(1e-3)), jnp.float32(1.0))
+    return tile_bg_out, bg_safe, usable
+
+
+def _nbr_step_impl(
+    acc_blk,
+    acc_cnt,
+    acc_d2,
+    acc_gid,
+    q_frame,
+    q_gid,
+    q_r,
+    q_c,
+    q_reach,
+    q_b_lo,
+    q_b_hi,
+    q_sb_l,
+    q_sb_r,
+    k_frame,
+    k_gid,
+    k_r,
+    k_c,
+    k_reach,
+    k_in_band,
+    k_b_lo,
+    k_b_hi,
+    half_f,
+):
+    """Fused GPU neighbor block search + top-7 merge (zero intermediate dispatch)."""
+    s_blk, s_cnt, s_d2, s_gid = _nbr_block_impl(
+        q_frame,
+        q_gid,
+        q_r,
+        q_c,
+        q_reach,
+        q_b_lo,
+        q_b_hi,
+        q_sb_l,
+        q_sb_r,
+        k_frame,
+        k_gid,
+        k_r,
+        k_c,
+        k_reach,
+        k_in_band,
+        k_b_lo,
+        k_b_hi,
+        half_f,
+    )
+    return _merge_nbr_impl(acc_blk, acc_cnt, acc_d2, acc_gid, s_blk, s_cnt, s_d2, s_gid)
+
+
+def _chunk_stage1_impl(
+    sr_cap,
+    sc_cap,
+    tof_dev,
+    off_dev,
+    val_dev,
+    s_idx_c,
+    org_r_c,
+    org_c_c,
+    cuts_20_c,
+    widths_c,
+    keep0_c,
+    gate_time_c,
+    in_band_c,
+    loc_r_c,
+    loc_c_c,
+    slab_gid_c,
+    acc_blk,
+    acc_cnt,
+    acc_d2,
+    acc_gid,
+    lo_i32,
+    n_s_i32,
+    T,
+):
+    """Fused Stage-1 chunk kernel: tiles + sideband bg + snap + neighbor slots."""
+    import jax
+    import jax.numpy as jnp
+
+    C = s_idx_c.shape[0]
+    tiles_c, valid_c, sb_c, nv_c = _jit("tiles")(
+        tof_dev, off_dev, val_dev, s_idx_c, org_r_c, org_c_c, cuts_20_c, T=T
+    )
+    tbg_c, bg_safe_c, usable_c = _sideband_bg_impl(
+        sb_c, widths_c, keep0_c, acc_blk, nv_c, gate_time_c, in_band_c
+    )
+    bg_c = jnp.broadcast_to(bg_safe_c[:, None, None], (C, T, T))
+    sr_c, sc_c = _jit("snap")(
+        tiles_c,
+        bg_c,
+        valid_c,
+        jnp.arange(C, dtype=jnp.int32),
+        loc_r_c,
+        loc_c_c,
+    )
+    sr_cap_out = jax.lax.dynamic_update_slice_in_dim(sr_cap, sr_c, lo_i32, axis=0)
+    sc_cap_out = jax.lax.dynamic_update_slice_in_dim(sc_cap, sc_c, lo_i32, axis=0)
+
+    active_c = slab_gid_c < n_s_i32
+    self_gid = slab_gid_c[:, None]
+    nbr_has = jnp.isfinite(acc_d2) & active_c[:, None]
+    nbr_gid = jnp.where(nbr_has, acc_gid, self_gid)
+    local_c = jnp.concatenate([self_gid, nbr_gid], axis=1)
+    has_atom_c = jnp.concatenate([active_c[:, None], nbr_has], axis=1)
+    dropped_c = jnp.sum(((acc_cnt > (ATOM_PAD - 1)) & active_c).astype(jnp.int32))
+    return (
+        sr_cap_out,
+        sc_cap_out,
+        tiles_c,
+        bg_c,
+        valid_c,
+        sr_c,
+        sc_c,
+        tbg_c,
+        usable_c,
+        local_c,
+        has_atom_c,
+        dropped_c,
+    )
+
+
 def _jit(name):
     if name not in _JIT:
         from jax import jit
@@ -220,14 +646,80 @@ def _jit(name):
                 _finalize_prefix_impl
             )
         elif name == "box":
-            _JIT[name] = jit(_box_sums_impl)
+            _JIT[name] = partial(jit, static_argnames=["box_t"])(_slab_box_impl)
         elif name == "tiles":
-            _JIT[name] = partial(jit, static_argnames=["T"])(_tiles_impl)
+            _JIT[name] = partial(jit, static_argnames=["T"])(_slab_tiles_impl)
+        elif name == "nbr_block":
+            _JIT[name] = jit(_nbr_block_impl)
+        elif name == "merge_nbr":
+            _JIT[name] = jit(_merge_nbr_impl)
+        elif name == "nbr_step":
+            _JIT[name] = jit(_nbr_step_impl)
+        elif name == "sideband_bg":
+            _JIT[name] = jit(_sideband_bg_impl)
+        elif name == "chunk_stage1":
+            _JIT[name] = partial(jit, static_argnames=["T"], donate_argnums=(0, 1))(
+                _chunk_stage1_impl
+            )
         elif name == "snap":
             from subhkl.search.matrix_free import _snap_positions_impl
 
             _JIT[name] = jit(_snap_positions_impl)
     return _JIT[name]
+
+
+def _chunk_stage2(has_profile, use_l1_gate, allow_negative):
+    """Fused neighbor gather + joint Poisson solve for a static chunk."""
+    key = ("chunk_stage2", has_profile, use_l1_gate, allow_negative)
+    if key not in _JIT:
+        import jax.numpy as jnp
+        from jax import jit
+
+        solve_fn = _solve_tiles(has_profile, use_l1_gate, allow_negative)
+
+        def _run_stage2(
+            tiles_c,
+            bg_c,
+            valid_c,
+            local_c,
+            has_atom_c,
+            org_r_c,
+            org_c_c,
+            org_r_cap,
+            org_c_cap,
+            sr_cap,
+            sc_cap,
+            vu_cap,
+            vv_cap,
+            cuv_cap,
+            z_f32,
+            prof,
+        ):
+            dr_int_c = (org_r_cap[local_c] - org_r_c[:, None]).astype(jnp.float32)
+            dc_int_c = (org_c_cap[local_c] - org_c_c[:, None]).astype(jnp.float32)
+            a_r_c = jnp.where(has_atom_c, sr_cap[local_c] + dr_int_c, jnp.float32(-1e4))
+            a_c_c = jnp.where(has_atom_c, sc_cap[local_c] + dc_int_c, jnp.float32(-1e4))
+            vu_c = jnp.where(has_atom_c, vu_cap[local_c], jnp.float32(1.0))
+            vv_c = jnp.where(has_atom_c, vv_cap[local_c], jnp.float32(1.0))
+            cuv_c = jnp.where(has_atom_c, cuv_cap[local_c], jnp.float32(0.0))
+            ok_c = has_atom_c.astype(jnp.float32)
+            fl_c, sg_c = solve_fn(
+                tiles_c,
+                bg_c,
+                valid_c,
+                a_r_c,
+                a_c_c,
+                vu_c,
+                vv_c,
+                cuv_c,
+                ok_c,
+                z_f32,
+                prof,
+            )
+            return fl_c[:, 0], sg_c[:, 0]
+
+        _JIT[key] = jit(_run_stage2)
+    return _JIT[key]
 
 
 def _solve_tiles(has_profile, use_l1_gate, allow_negative):
@@ -333,32 +825,160 @@ def _group_frame_indices(frames: np.ndarray, n_frames: int) -> list[np.ndarray]:
     return parts
 
 
-def _box_sums_chunked(p3, r0, r1, c0, c1, edges, chunk_size: int) -> np.ndarray:
-    """Evaluate _jit('box') in fixed ``chunk_size`` slices so XLA compiles once."""
-    import jax.numpy as jnp
+def _iter_slabs(
+    active_frames,
+    frame_groups,
+    reader,
+    static_valid,
+    images_batch=None,
+):
+    """Yield double-buffered ``(slab_frames, tof_slab, pix_offsets_slab, valid_slab)``."""
+    _, H, W = static_valid.shape
+    n_pix = H * W
+    mult = 16 if int(EVENT_CHUNK) >= (1 << 20) else 8
+    default_cap = max(mult * int(EVENT_CHUNK), 1)
+    event_store = getattr(reader, "event_store", None)
+    frame_img_keys = getattr(reader, "frame_img_keys", None)
+    use_store = event_store is not None and images_batch is not None
 
-    n = len(r0)
-    s_dim = edges.shape[1]
-    out = np.empty((n, s_dim), dtype=np.int32)
-    box_fn = _jit("box")
-    r0_i = r0.astype(np.int32, copy=False)
-    r1_i = r1.astype(np.int32, copy=False)
-    c0_i = c0.astype(np.int32, copy=False)
-    c1_i = c1.astype(np.int32, copy=False)
-    ed_i = edges.astype(np.int32, copy=False)
-    for lo in range(0, n, chunk_size):
-        hi = min(n, lo + chunk_size)
-        m = hi - lo
-        res = box_fn(
-            p3,
-            jnp.asarray(_padded(r0_i[lo:hi], chunk_size)),
-            jnp.asarray(_padded(r1_i[lo:hi], chunk_size)),
-            jnp.asarray(_padded(c0_i[lo:hi], chunk_size)),
-            jnp.asarray(_padded(c1_i[lo:hi], chunk_size)),
-            jnp.asarray(_padded(ed_i[lo:hi], chunk_size)),
-        )
-        out[lo:hi] = np.asarray(res)[:m]
-    return out
+    if use_store:
+        slabs = []
+        cur = []
+        cur_ev = 0
+        cur_pk = 0
+        max_single_ev = 0
+        for f in active_frames:
+            f_int = int(f)
+            img_key = (
+                int(frame_img_keys[f_int]) if frame_img_keys is not None else f_int
+            )
+            ev_f = event_store.image_event_count(img_key)
+            pk_f = len(frame_groups[f_int])
+            max_single_ev = max(max_single_ev, ev_f)
+            if cur and (
+                len(cur) >= SLAB_MAX_IMAGES
+                or cur_pk + pk_f > SLAB_MAX_PEAKS
+                or cur_ev + ev_f > default_cap
+            ):
+                slabs.append(cur)
+                cur = []
+                cur_ev = 0
+                cur_pk = 0
+            cur.append(f_int)
+            cur_ev += ev_f
+            cur_pk += pk_f
+        if cur:
+            slabs.append(cur)
+
+        slab_cap = default_cap
+        if max_single_ev > slab_cap:
+            slab_cap = 1 << int(np.ceil(np.log2(max_single_ev)))
+
+        tof_bufs = [np.zeros(slab_cap, dtype=np.float32) for _ in range(2)]
+        off_bufs = [
+            np.zeros((SLAB_MAX_IMAGES, n_pix + 1), dtype=np.int32) for _ in range(2)
+        ]
+        val_bufs = [np.zeros((SLAB_MAX_IMAGES, H, W), dtype=np.uint8) for _ in range(2)]
+
+        def _load_store_slab(s_idx: int):
+            slot = s_idx % 2
+            s_frames = slabs[s_idx]
+            m = len(s_frames)
+            img_keys = [
+                int(frame_img_keys[f]) if frame_img_keys is not None else int(f)
+                for f in s_frames
+            ]
+            event_store.read_slab(
+                img_keys,
+                images_batch[s_frames],
+                out_tof=tof_bufs[slot],
+                out_pix_offsets=off_bufs[slot],
+            )
+            val_buf = val_bufs[slot]
+            val_buf.fill(0)
+            val_buf[:m] = (static_valid[s_frames] > 0.5).astype(np.uint8)
+            return s_frames, tof_bufs[slot], off_bufs[slot], val_buf
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_load_store_slab, 0)
+            for s_idx in range(len(slabs)):
+                res = fut.result()
+                if s_idx + 1 < len(slabs):
+                    fut = pool.submit(_load_store_slab, s_idx + 1)
+                yield res
+        return
+
+    # Generic reader(frame) path (unit tests and custom event readers).
+    tof_bufs = [np.zeros(default_cap, dtype=np.float32) for _ in range(2)]
+    off_bufs = [
+        np.zeros((SLAB_MAX_IMAGES, n_pix + 1), dtype=np.int32) for _ in range(2)
+    ]
+    val_bufs = [np.zeros((SLAB_MAX_IMAGES, H, W), dtype=np.uint8) for _ in range(2)]
+    state = {"ptr": 0, "carry": None}
+
+    def _load_callable_slab(slot: int):
+        ptr = state["ptr"]
+        carry = state["carry"]
+        if ptr >= len(active_frames) and carry is None:
+            return None
+        tof_buf = tof_bufs[slot]
+        off_buf = off_bufs[slot]
+        val_buf = val_bufs[slot]
+        val_buf.fill(0)
+
+        s_frames = []
+        cursor = 0
+        cur_pk = 0
+        while len(s_frames) < SLAB_MAX_IMAGES:
+            if carry is not None:
+                f_int, tof_f, off_f = carry
+                carry = None
+            elif ptr < len(active_frames):
+                f_int = int(active_frames[ptr])
+                ptr += 1
+                tof_raw, off_raw = reader(f_int)
+                tof_f = np.asarray(tof_raw, dtype=np.float32)
+                off_f = np.asarray(off_raw, dtype=np.int64)
+            else:
+                break
+
+            ev_f = len(tof_f)
+            pk_f = len(frame_groups[f_int])
+            if s_frames and (
+                cur_pk + pk_f > SLAB_MAX_PEAKS or cursor + ev_f > len(tof_buf)
+            ):
+                carry = (f_int, tof_f, off_f)
+                break
+            if ev_f > len(tof_buf):
+                cap_big = 1 << int(np.ceil(np.log2(ev_f)))
+                tof_buf = np.zeros(cap_big, dtype=np.float32)
+                tof_bufs[slot] = tof_buf
+
+            m_pos = len(s_frames)
+            if ev_f > 0:
+                tof_buf[cursor : cursor + ev_f] = tof_f
+            off_buf[m_pos] = (off_f + cursor).astype(np.int32)
+            val_buf[m_pos] = (static_valid[f_int] > 0.5).astype(np.uint8)
+            s_frames.append(f_int)
+            cursor += ev_f
+            cur_pk += pk_f
+
+        if len(s_frames) < SLAB_MAX_IMAGES:
+            off_buf[len(s_frames) :] = cursor
+        state["ptr"] = ptr
+        state["carry"] = carry
+        return s_frames, tof_buf, off_buf, val_buf
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        slot = 0
+        fut = pool.submit(_load_callable_slab, slot)
+        while True:
+            item = fut.result()
+            if item is None:
+                break
+            slot = 1 - slot
+            fut = pool.submit(_load_callable_slab, slot)
+            yield item
 
 
 def stack_relative_tof(
@@ -372,6 +992,7 @@ def stack_relative_tof(
     search=0.05,
     n_bins=100,
     show_progress=False,
+    _images_batch=None,
 ):
     """Histogram of t_event / t_pred - 1 near the predicted positions.
 
@@ -388,10 +1009,11 @@ def stack_relative_tof(
     Returns:
         bin edges [-] and summed counts [photons]
     """
-    B, H, W = static_valid.shape
+    B = int(static_valid.shape[0])
     edges = np.linspace(-search, search, n_bins + 1)
     hist = np.zeros(n_bins, dtype=np.float64)
     hb = STACK_HALF_BOX
+    box_t = 2 * hb + 1
     nb = int(np.ceil(search / grid.dl)) + 1
     offs = np.arange(-nb, nb + 2)
 
@@ -403,40 +1025,63 @@ def stack_relative_tof(
         pick = np.linspace(0, len(with_peaks) - 1, STACK_MAX_IMAGES).round().astype(int)
         with_peaks = with_peaks[pick]
 
-    max_n = max(len(frame_groups[int(f)]) for f in with_peaks)
-    chunk_size = _select_tile_chunk(max_n)
+    total_stack_peaks = sum(len(frame_groups[int(f)]) for f in with_peaks)
+    chunk_size = _select_tile_chunk(total_stack_peaks)
+    edge_cut_f32 = _edge_cutoffs_f32(grid)
+    box_fn = _jit("box")
 
-    def _load_one(f_int: int):
-        tof, pix_offsets = reader(f_int)
-        return _prepare_flat_events(tof, pix_offsets, H, W, grid)
+    pbar = tqdm(
+        total=len(with_peaks),
+        desc="Time-of-flight profile",
+        disable=not show_progress,
+    )
+    for s_frames, tof_slab_np, off_slab_np, val_slab_np in _iter_slabs(
+        with_peaks, frame_groups, reader, static_valid, images_batch=_images_batch
+    ):
+        import jax
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(_load_one, int(with_peaks[0]))
-        pbar = tqdm(
-            range(len(with_peaks)),
-            desc="Time-of-flight profile",
-            disable=not show_progress,
+        idx_parts = [frame_groups[f] for f in s_frames]
+        idx_slab = np.concatenate(idx_parts)
+        s_idx_slab = np.repeat(
+            np.arange(len(s_frames), dtype=np.int32),
+            [len(p) for p in idx_parts],
         )
-        for k_i in pbar:
-            f = int(with_peaks[k_i])
-            flat, dump = fut.result()
-            if k_i + 1 < len(with_peaks):
-                fut = pool.submit(_load_one, int(with_peaks[k_i + 1]))
+        n_s = len(idx_slab)
+        n_chunks = -(-n_s // chunk_size)
+        n_pad = n_chunks * chunk_size
+        org_r_s = (np.rint(rs[idx_slab]).astype(np.int32) - hb).astype(np.int32)
+        org_c_s = (np.rint(cs[idx_slab]).astype(np.int32) - hb).astype(np.int32)
+        centre = np.rint(grid.edge_index(tof_pred[idx_slab])).astype(np.int64)
+        e = np.clip(centre[:, None] + offs[None, :], 0, grid.nt)
+        cuts_e = edge_cut_f32[e]
 
-            idx = frame_groups[f]
-            _, p3 = _image_prefix_from_flat(
-                flat, dump, static_valid[f], grid, need_ct=False
-            )
-            ri, ci = np.rint(rs[idx]).astype(int), np.rint(cs[idx]).astype(int)
-            r0, r1 = np.clip(ri - hb, 0, H), np.clip(ri + hb + 1, 0, H)
-            c0, c1 = np.clip(ci - hb, 0, W), np.clip(ci + hb + 1, 0, W)
-            centre = np.rint(grid.edge_index(tof_pred[idx])).astype(int)
-            e = np.clip(centre[:, None] + offs[None, :], 0, grid.nt)
-            sums = _box_sums_chunked(p3, r0, r1, c0, c1, e, chunk_size)
-            del p3
-            counts = np.diff(sums, axis=1)
-            x = grid.edge_time(0.5 * (e[:, :-1] + e[:, 1:])) / tof_pred[idx, None] - 1.0
-            hist += np.histogram(x.ravel(), bins=edges, weights=counts.ravel())[0]
+        s_idx_ch = _padded(s_idx_slab, n_pad).reshape(n_chunks, chunk_size)
+        org_r_ch = _padded(org_r_s, n_pad).reshape(n_chunks, chunk_size)
+        org_c_ch = _padded(org_c_s, n_pad).reshape(n_chunks, chunk_size)
+        cuts_ch = _padded(cuts_e, n_pad, 0.0).reshape(
+            n_chunks, chunk_size, cuts_e.shape[1]
+        )
+        chunk_args = [
+            (s_idx_ch[c], org_r_ch[c], org_c_ch[c], cuts_ch[c]) for c in range(n_chunks)
+        ]
+        tof_dev, off_dev, val_dev, chunk_args_dev = jax.device_put(
+            (tof_slab_np, off_slab_np, val_slab_np, chunk_args)
+        )
+        cnt_devs = [
+            box_fn(tof_dev, off_dev, val_dev, sc, rc, cc, ec, box_t=box_t)
+            for sc, rc, cc, ec in chunk_args_dev
+        ]
+        del tof_dev, off_dev, val_dev, chunk_args_dev
+        counts_pad = np.concatenate(jax.device_get(cnt_devs), axis=0)
+        counts_slab = counts_pad[:n_s]
+
+        x = (
+            grid.edge_time(0.5 * (e[:, :-1] + e[:, 1:])) / tof_pred[idx_slab, None]
+            - 1.0
+        )
+        hist += np.histogram(x.ravel(), bins=edges, weights=counts_slab.ravel())[0]
+        pbar.update(len(s_frames))
+    pbar.close()
     return edges, hist
 
 
@@ -596,8 +1241,12 @@ def _build_neighbor_plan(
         return keep, local, has_atom, n_dropped
 
     r_max = float(half + np.max(reach_f))
-    pts = np.column_stack((rs_f, cs_f))
-    pairs = cKDTree(pts).query_pairs(r=r_max + 1e-9, p=np.inf, output_type="ndarray")
+    t_env_lo = np.minimum(b_lo_f, sb_edges[:, 0, 0]).astype(np.float64)
+    t_env_hi = np.maximum(b_hi_f, sb_edges[:, 1, -1]).astype(np.float64)
+    t_mid = 0.5 * (t_env_lo + t_env_hi)
+    max_t_span = max(float(np.max(t_env_hi - t_env_lo)), 1.0)
+    pts = np.column_stack((rs_f, cs_f, t_mid * (r_max / max_t_span)))
+    pairs = cKDTree(pts).query_pairs(r=r_max + 1e-7, p=np.inf, output_type="ndarray")
     if len(pairs) == 0:
         return keep, local, has_atom, n_dropped
 
@@ -748,6 +1397,7 @@ def integrate_reflections_tof_gated(
         stack_grid,
         search=gate_search,
         show_progress=show_progress,
+        _images_batch=images_batch,
     )
     info["stack_edges"], info["stack_hist"] = edges, hist
     if gate is None:
@@ -777,14 +1427,17 @@ def integrate_reflections_tof_gated(
     # Time bins a thirtieth of the gate or finer; gates become bin edges.
     grid = TimeGrid.spanning(*t_span, min(MAX_LOG_BIN, gate.width / 30.0))
     nominal = (np.log1p(gate.hi) - np.log1p(gate.lo)) / grid.dl  # [-] bins
-    lim_lo = np.ceil(grid.edge_index(tof_lim_lo)).astype(np.int64)
-    lim_hi = np.floor(grid.edge_index(tof_lim_hi)).astype(np.int64)
+    lim_lo = np.clip(np.ceil(grid.edge_index(tof_lim_lo)).astype(np.int64), 0, grid.nt)
+    lim_hi = np.clip(
+        np.floor(grid.edge_index(tof_lim_hi)).astype(np.int64), lim_lo, grid.nt
+    )
     b_lo = np.rint(grid.edge_index(tof_pred * (1.0 + gate.lo))).astype(np.int64)
     b_hi = np.rint(grid.edge_index(tof_pred * (1.0 + gate.hi))).astype(np.int64)
     b_lo = np.clip(b_lo, lim_lo, lim_hi)
     b_hi = np.clip(b_hi, lim_lo, lim_hi)
     in_band = (b_hi - b_lo) >= max(1.0, 0.25 * nominal)
     gate_time = grid.edge_time(b_hi) - grid.edge_time(b_lo)  # [microsecond]
+    edge_cut_f32 = _edge_cutoffs_f32(grid)
 
     half = _tile_half(var_us, var_vs)
     T = 2 * half + 1
@@ -814,7 +1467,7 @@ def integrate_reflections_tof_gated(
         0.0 if fp_target is None else calibrated_admission_z(n_peaks, fp_target)
     )
     use_l1_gate = bool(admission_z > 0.0)
-    solve = _solve_tiles(trunk_jax is not None, use_l1_gate, bool(allow_negative))
+    stage2_fn = _chunk_stage2(trunk_jax is not None, use_l1_gate, bool(allow_negative))
 
     out = np.zeros((n_peaks, 5), dtype=np.float64)
     out[:, 1], out[:, 2] = rs, cs
@@ -830,192 +1483,361 @@ def integrate_reflections_tof_gated(
         info["tile_half"] = half
         return out, info
 
-    max_n = max(len(frame_groups[f]) for f in active_frames)
-    chunk_size = _select_tile_chunk(max_n)
-    tiles_fn = _jit("tiles")
-    snap_fn = _jit("snap")
-    frame_iota = jnp.arange(chunk_size, dtype=jnp.int32)
+    import jax
+
+    total_active_peaks = sum(len(frame_groups[f]) for f in active_frames)
+    chunk_size = _select_tile_chunk(total_active_peaks)
+    nbr_block_fn = _jit("nbr_block")
+    nbr_step_fn = _jit("nbr_step")
+    stage1_fn = _jit("chunk_stage1")
     z_f32 = jnp.float32(admission_z)
+    half_f32 = jnp.float32(half)
 
-    def _load_one(f_int: int):
-        tof, pix_offsets = reader(f_int)
-        return _prepare_flat_events(tof, pix_offsets, H, W, grid)
+    pbar = tqdm(total=B, desc="Time-of-flight gated solve", disable=not show_progress)
+    progressed_to = 0
 
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        fut_map = {active_frames[0]: pool.submit(_load_one, active_frames[0])}
-        next_active_ptr = 1
+    for s_frames, tof_slab_np, off_slab_np, val_slab_np in _iter_slabs(
+        active_frames, frame_groups, reader, static_valid, images_batch=images_batch
+    ):
+        idx_parts = [frame_groups[f] for f in s_frames]
+        part_lens = [len(p) for p in idx_parts]
+        idx_slab = np.concatenate(idx_parts)
+        n_s = len(idx_slab)
+        n_chunks = -(-n_s // chunk_size)
+        n_pad = n_chunks * chunk_size
+        gather_cap = max(int(SLAB_MAX_PEAKS), 1 << int(np.ceil(np.log2(max(n_pad, 1)))))
 
-        pbar = tqdm(
-            range(B), desc="Time-of-flight gated solve", disable=not show_progress
+        slab_frames_s = np.repeat(np.arange(len(s_frames), dtype=np.int32), part_lens)
+        s_idx_ch = _padded(slab_frames_s, n_pad, 0).reshape(n_chunks, chunk_size)
+        q_frame_ch = _padded(slab_frames_s, n_pad, -1).reshape(n_chunks, chunk_size)
+        k_frame_ch = _padded(slab_frames_s, n_pad, -2).reshape(n_chunks, chunk_size)
+        slab_gid_ch = np.arange(n_pad, dtype=np.int32).reshape(n_chunks, chunk_size)
+
+        org_r_slab = origin_r[idx_slab].astype(np.int32)
+        org_c_slab = origin_c[idx_slab].astype(np.int32)
+        org_r_ch = _padded(org_r_slab, n_pad, 0).reshape(n_chunks, chunk_size)
+        org_c_ch = _padded(org_c_slab, n_pad, 0).reshape(n_chunks, chunk_size)
+
+        rs_ch = _padded(rs[idx_slab].astype(np.float32), n_pad, 0.0).reshape(
+            n_chunks, chunk_size
         )
-        for f in pbar:
-            idx = frame_groups[f]
-            n = len(idx)
-            if n == 0:
-                continue
+        cs_ch = _padded(cs[idx_slab].astype(np.float32), n_pad, 0.0).reshape(
+            n_chunks, chunk_size
+        )
+        reach_ch = _padded(reach[idx_slab].astype(np.float32), n_pad, 0.0).reshape(
+            n_chunks, chunk_size
+        )
+        in_band_ch = _padded(in_band[idx_slab], n_pad, False).reshape(
+            n_chunks, chunk_size
+        )
 
-            flat, dump = fut_map.pop(f).result()
-            if next_active_ptr < len(active_frames):
-                nf = active_frames[next_active_ptr]
-                fut_map[nf] = pool.submit(_load_one, nf)
-                next_active_ptr += 1
+        b_lo_slab = b_lo[idx_slab]
+        b_hi_slab = b_hi[idx_slab]
+        b_lo_ch = _padded(b_lo_slab.astype(np.float32), n_pad, 0.0).reshape(
+            n_chunks, chunk_size
+        )
+        b_hi_ch = _padded(b_hi_slab.astype(np.float32), n_pad, 0.0).reshape(
+            n_chunks, chunk_size
+        )
 
-            valid_img = static_valid[f]
-            valid_img_dev = jnp.asarray(valid_img)
-            ct, p3 = _image_prefix_from_flat(flat, dump, valid_img, grid, need_ct=True)
+        sb_edges_slab, side_ok_slab = _sideband_edges(
+            b_lo_slab,
+            b_hi_slab,
+            nominal,
+            lim_lo[idx_slab],
+            lim_hi[idx_slab],
+            sideband_factor,
+        )
+        sb_l_ch = _padded(
+            sb_edges_slab[:, 0, :].astype(np.float32), n_pad, 0.0
+        ).reshape(n_chunks, chunk_size, SIDEBAND_BINS + 1)
+        sb_r_ch = _padded(
+            sb_edges_slab[:, 1, :].astype(np.float32), n_pad, 0.0
+        ).reshape(n_chunks, chunk_size, SIDEBAND_BINS + 1)
 
-            # 1. Sideband counts in fixed-size chunks, then release 3D prefix p3.
-            org_r_f = origin_r[idx].astype(np.int32)
-            org_c_f = origin_c[idx].astype(np.int32)
-            b_lo_f = b_lo[idx]
-            b_hi_f = b_hi[idx]
-            r0 = np.clip(org_r_f, 0, H)
-            r1 = np.clip(org_r_f + T, 0, H)
-            c0 = np.clip(org_c_f, 0, W)
-            c1 = np.clip(org_c_f + T, 0, W)
-            sb_edges, side_ok = _sideband_edges(
-                b_lo_f, b_hi_f, nominal, lim_lo[idx], lim_hi[idx], sideband_factor
+        widths_slab = np.diff(grid.edge_time(sb_edges_slab), axis=2).reshape(n_s, 16)
+        keep0_slab = (widths_slab > 0) & np.repeat(side_ok_slab, SIDEBAND_BINS, axis=1)
+        widths_ch = _padded(widths_slab.astype(np.float32), n_pad, 0.0).reshape(
+            n_chunks, chunk_size, 16
+        )
+        keep0_ch = _padded(keep0_slab, n_pad, False).reshape(n_chunks, chunk_size, 16)
+        gate_time_ch = _padded(
+            gate_time[idx_slab].astype(np.float32), n_pad, 0.0
+        ).reshape(n_chunks, chunk_size)
+
+        cuts_20_pad = np.zeros((n_pad, 20), dtype=np.float32)
+        cuts_20_pad[:n_s, 0:9] = edge_cut_f32[sb_edges_slab[:, 0, :]]
+        cuts_20_pad[:n_s, 9] = edge_cut_f32[b_lo_slab]
+        cuts_20_pad[:n_s, 10] = edge_cut_f32[b_hi_slab]
+        cuts_20_pad[:n_s, 11:20] = edge_cut_f32[sb_edges_slab[:, 1, :]]
+        cuts_20_ch = cuts_20_pad.reshape(n_chunks, chunk_size, 20)
+
+        loc_r_ch = _padded(
+            (rs[idx_slab] - org_r_slab).astype(np.float32), n_pad, 0.0
+        ).reshape(n_chunks, chunk_size)
+        loc_c_ch = _padded(
+            (cs[idx_slab] - org_c_slab).astype(np.float32), n_pad, 0.0
+        ).reshape(n_chunks, chunk_size)
+
+        org_r_cap_np = _padded(org_r_slab, gather_cap, 0)
+        org_c_cap_np = _padded(org_c_slab, gather_cap, 0)
+        vu_cap_np = _padded(var_us[idx_slab].astype(np.float32), gather_cap, 1.0)
+        vv_cap_np = _padded(var_vs[idx_slab].astype(np.float32), gather_cap, 1.0)
+        cuv_cap_np = _padded(cov_uvs[idx_slab].astype(np.float32), gather_cap, 0.0)
+        sr_cap_np = np.zeros(gather_cap, dtype=np.float32)
+        sc_cap_np = np.zeros(gather_cap, dtype=np.float32)
+
+        q_tuples_np = [
+            (
+                q_frame_ch[c],
+                slab_gid_ch[c],
+                rs_ch[c],
+                cs_ch[c],
+                reach_ch[c],
+                b_lo_ch[c],
+                b_hi_ch[c],
+                sb_l_ch[c],
+                sb_r_ch[c],
             )
-            sums_flat = _box_sums_chunked(
-                p3, r0, r1, c0, c1, sb_edges.reshape(n, -1), chunk_size
+            for c in range(n_chunks)
+        ]
+        k_tuples_np = [
+            (
+                k_frame_ch[c],
+                slab_gid_ch[c],
+                rs_ch[c],
+                cs_ch[c],
+                reach_ch[c],
+                in_band_ch[c],
+                b_lo_ch[c],
+                b_hi_ch[c],
             )
-            del p3
-            sums = sums_flat.reshape(n, 2, SIDEBAND_BINS + 1)
-            counts = np.diff(sums, axis=2).astype(np.float64)
-            widths = np.diff(grid.edge_time(sb_edges), axis=2)
-            keep0 = (widths > 0) & side_ok[:, :, None]
+            for c in range(n_chunks)
+        ]
+        st1_tuples_np = [
+            (
+                s_idx_ch[c],
+                org_r_ch[c],
+                org_c_ch[c],
+                cuts_20_ch[c],
+                widths_ch[c],
+                keep0_ch[c],
+                gate_time_ch[c],
+                in_band_ch[c],
+                loc_r_ch[c],
+                loc_c_ch[c],
+                slab_gid_ch[c],
+                np.int32(c * chunk_size),
+            )
+            for c in range(n_chunks)
+        ]
 
-            # 2. Sparse O(n) neighbor lookup + sideband exclusion + joint-atom table.
-            keep, local, has_atom, dropped_f = _build_neighbor_plan(
-                rs[idx],
-                cs[idx],
-                reach[idx],
-                in_band[idx],
-                b_lo_f,
-                b_hi_f,
-                sb_edges,
-                keep0,
-                half,
-                K,
+        # Single batched H2D transfer for the entire slab (zero per-chunk PCIe setup).
+        (
+            tof_dev,
+            off_dev,
+            val_dev,
+            org_r_cap_dev,
+            org_c_cap_dev,
+            sr_cap_dev,
+            sc_cap_dev,
+            vu_cap_dev,
+            vv_cap_dev,
+            cuv_cap_dev,
+            n_s_dev,
+            q_devs,
+            k_devs,
+            st1_devs,
+        ) = jax.device_put(
+            (
+                tof_slab_np,
+                off_slab_np,
+                val_slab_np,
+                org_r_cap_np,
+                org_c_cap_np,
+                sr_cap_np,
+                sc_cap_np,
+                vu_cap_np,
+                vv_cap_np,
+                cuv_cap_np,
+                np.int32(n_s),
+                q_tuples_np,
+                k_tuples_np,
+                st1_tuples_np,
             )
-            n_dropped_neighbours += dropped_f
+        )
 
-            vp = np.pad(
-                np.cumsum(np.cumsum(valid_img > 0.5, axis=0), axis=1), ((1, 0), (1, 0))
+        chunk_f_ranges = [
+            (
+                int(slab_frames_s[c * chunk_size]),
+                int(slab_frames_s[min((c + 1) * chunk_size, n_s) - 1]),
             )
-            n_valid = vp[r1, c1] - vp[r0, c1] - vp[r1, c0] + vp[r0, c0]
-            rate = _sideband_rates(
-                counts.reshape(n, -1),
-                widths.reshape(n, -1),
-                keep.reshape(n, -1),
-                keep0.reshape(n, -1),
-                n_valid,
-            )
-            bg = rate * gate_time[idx]
-            usable = in_band[idx] & np.isfinite(bg) & (n_valid > 0)
-            tile_bg[idx] = np.where(usable, bg, np.nan)
-            bg_safe = np.where(usable, np.maximum(bg, 1e-3), 1.0).astype(np.float32)
+            for c in range(n_chunks)
+        ]
 
-            # 3. Snap every reflection on its own gated tile in fixed-size chunks.
-            b_lo_i32 = b_lo_f.astype(np.int32)
-            b_hi_i32 = b_hi_f.astype(np.int32)
-            loc_r = (rs[idx] - org_r_f).astype(np.float32)
-            loc_c = (cs[idx] - org_c_f).astype(np.float32)
-            snap_r = np.empty(n, dtype=np.float64)
-            snap_c = np.empty(n, dtype=np.float64)
-            cached_single_chunk = None
-            for lo in range(0, n, chunk_size):
-                hi = min(n, lo + chunk_size)
-                m = hi - lo
-                tiles_c, tile_valid_c = tiles_fn(
-                    ct,
-                    valid_img_dev,
-                    jnp.asarray(_padded(org_r_f[lo:hi], chunk_size)),
-                    jnp.asarray(_padded(org_c_f[lo:hi], chunk_size)),
-                    jnp.asarray(_padded(b_lo_i32[lo:hi], chunk_size)),
-                    jnp.asarray(_padded(b_hi_i32[lo:hi], chunk_size)),
-                    T=T,
-                )
-                bg_tiles_c = jnp.broadcast_to(
-                    jnp.asarray(_padded(bg_safe[lo:hi], chunk_size, 1.0))[
-                        :, None, None
-                    ],
-                    (chunk_size, T, T),
-                )
-                sr_c, sc_c = snap_fn(
-                    tiles_c,
-                    bg_tiles_c,
-                    tile_valid_c,
-                    frame_iota,
-                    jnp.asarray(_padded(loc_r[lo:hi], chunk_size)),
-                    jnp.asarray(_padded(loc_c[lo:hi], chunk_size)),
-                )
-                snap_r[lo:hi] = np.asarray(sr_c, dtype=np.float64)[:m] + org_r_f[lo:hi]
-                snap_c[lo:hi] = np.asarray(sc_c, dtype=np.float64)[:m] + org_c_f[lo:hi]
-                if n <= chunk_size:
-                    cached_single_chunk = (tiles_c, bg_tiles_c, tile_valid_c)
-
-            # 4. Joint Poisson solve in fixed-size chunks (1 compile for entire run).
-            a_r = np.where(has_atom, snap_r[local] - org_r_f[:, None], -1e4).astype(
-                np.float32
-            )
-            a_c = np.where(has_atom, snap_c[local] - org_c_f[:, None], -1e4).astype(
-                np.float32
-            )
-            g = idx[local]
-            vu_f = np.where(has_atom, var_us[g], 1.0).astype(np.float32)
-            vv_f = np.where(has_atom, var_vs[g], 1.0).astype(np.float32)
-            cuv_f = np.where(has_atom, cov_uvs[g], 0.0).astype(np.float32)
-            ok_f = has_atom.astype(np.float32)
-
-            flux_all = np.empty(n, dtype=np.float64)
-            sigma_all = np.empty(n, dtype=np.float64)
-            for lo in range(0, n, chunk_size):
-                hi = min(n, lo + chunk_size)
-                m = hi - lo
-                if cached_single_chunk is not None:
-                    tiles_c, bg_tiles_c, tile_valid_c = cached_single_chunk
+        # 1. Pure @jit Stage-1 loop (zero eager JAX ops in Python).
+        stage1_kept = []
+        for c_i in range(n_chunks):
+            fi_min, fi_max = chunk_f_ranges[c_i]
+            q_c = q_devs[c_i]
+            acc = None
+            for c_j in range(n_chunks):
+                fj_min, fj_max = chunk_f_ranges[c_j]
+                if fj_max < fi_min or fj_min > fi_max:
+                    continue
+                if acc is None:
+                    acc = nbr_block_fn(*q_c, *k_devs[c_j], half_f32)
                 else:
-                    tiles_c, tile_valid_c = tiles_fn(
-                        ct,
-                        valid_img_dev,
-                        jnp.asarray(_padded(org_r_f[lo:hi], chunk_size)),
-                        jnp.asarray(_padded(org_c_f[lo:hi], chunk_size)),
-                        jnp.asarray(_padded(b_lo_i32[lo:hi], chunk_size)),
-                        jnp.asarray(_padded(b_hi_i32[lo:hi], chunk_size)),
-                        T=T,
-                    )
-                    bg_tiles_c = jnp.broadcast_to(
-                        jnp.asarray(_padded(bg_safe[lo:hi], chunk_size, 1.0))[
-                            :, None, None
-                        ],
-                        (chunk_size, T, T),
-                    )
-                fl_c, sg_c = solve(
-                    tiles_c,
-                    bg_tiles_c,
-                    tile_valid_c,
-                    jnp.asarray(_padded(a_r[lo:hi], chunk_size, -1e4)),
-                    jnp.asarray(_padded(a_c[lo:hi], chunk_size, -1e4)),
-                    jnp.asarray(_padded(vu_f[lo:hi], chunk_size, 1.0)),
-                    jnp.asarray(_padded(vv_f[lo:hi], chunk_size, 1.0)),
-                    jnp.asarray(_padded(cuv_f[lo:hi], chunk_size, 0.0)),
-                    jnp.asarray(_padded(ok_f[lo:hi], chunk_size, 0.0)),
-                    z_f32,
-                    trunk_jax,
-                )
-                flux_all[lo:hi] = np.asarray(fl_c, dtype=np.float64)[:m, 0]
-                sigma_all[lo:hi] = np.asarray(sg_c, dtype=np.float64)[:m, 0]
+                    acc = nbr_step_fn(*acc, *q_c, *k_devs[c_j], half_f32)
 
-            del ct, cached_single_chunk
-            if not allow_negative or use_l1_gate:
-                sigma_all[flux_all <= 0.0] = 0.0
-            # A reflection whose gate falls outside the band, or whose
-            # background could not be measured, was not observed.
-            out[idx, 0] = np.where(usable, flux_all, 0.0)
-            out[idx, 4] = np.where(usable, sigma_all, 0.0)
-            out[idx, 1] = snap_r
-            out[idx, 2] = snap_c
+            (
+                sr_c_in,
+                org_r_c,
+                org_c_c,
+                cuts_c,
+                w_c,
+                k0_c,
+                gt_c,
+                ib_c,
+                lr_c,
+                lc_c,
+                gid_c,
+                lo_dev,
+            ) = st1_devs[c_i]
+            (
+                sr_cap_dev,
+                sc_cap_dev,
+                tiles_c,
+                bg_c,
+                valid_c,
+                sr_c,
+                sc_c,
+                tbg_c,
+                usable_c,
+                local_c,
+                has_atom_c,
+                dropped_c,
+            ) = stage1_fn(
+                sr_cap_dev,
+                sc_cap_dev,
+                tof_dev,
+                off_dev,
+                val_dev,
+                sr_c_in,
+                org_r_c,
+                org_c_c,
+                cuts_c,
+                w_c,
+                k0_c,
+                gt_c,
+                ib_c,
+                lr_c,
+                lc_c,
+                gid_c,
+                *acc,
+                lo_dev,
+                n_s_dev,
+                T=T,
+            )
+            stage1_kept.append(
+                (
+                    tiles_c,
+                    bg_c,
+                    valid_c,
+                    local_c,
+                    has_atom_c,
+                    org_r_c,
+                    org_c_c,
+                    sr_c,
+                    sc_c,
+                    tbg_c,
+                    usable_c,
+                    dropped_c,
+                )
+            )
+
+        del tof_dev, off_dev, val_dev, q_devs, k_devs, st1_devs
+
+        # 2. Pure @jit Stage-2 loop (neighbor gather + joint Poisson solve).
+        out_devs = []
+        for (
+            tiles_c,
+            bg_c,
+            valid_c,
+            local_c,
+            has_atom_c,
+            org_r_c,
+            org_c_c,
+            sr_c,
+            sc_c,
+            tbg_c,
+            usable_c,
+            dropped_c,
+        ) in stage1_kept:
+            fl_0, sg_0 = stage2_fn(
+                tiles_c,
+                bg_c,
+                valid_c,
+                local_c,
+                has_atom_c,
+                org_r_c,
+                org_c_c,
+                org_r_cap_dev,
+                org_c_cap_dev,
+                sr_cap_dev,
+                sc_cap_dev,
+                vu_cap_dev,
+                vv_cap_dev,
+                cuv_cap_dev,
+                z_f32,
+                trunk_jax,
+            )
+            out_devs.append((fl_0, sg_0, sr_c, sc_c, tbg_c, usable_c, dropped_c))
+
+        del (
+            stage1_kept,
+            org_r_cap_dev,
+            org_c_cap_dev,
+            sr_cap_dev,
+            sc_cap_dev,
+            vu_cap_dev,
+            vv_cap_dev,
+            cuv_cap_dev,
+        )
+
+        # Single batched D2H transfer for the entire slab (zero eager concat kernels).
+        out_host = jax.device_get(out_devs)
+        del out_devs
+
+        fl_np = np.concatenate([row[0] for row in out_host], axis=0)
+        sg_np = np.concatenate([row[1] for row in out_host], axis=0)
+        sr_np = np.concatenate([row[2] for row in out_host], axis=0)
+        sc_np = np.concatenate([row[3] for row in out_host], axis=0)
+        tbg_np = np.concatenate([row[4] for row in out_host], axis=0)
+        usable_np = np.concatenate([row[5] for row in out_host], axis=0)
+        n_dropped_neighbours += sum(int(row[6]) for row in out_host)
+
+        usable_slab = usable_np[:n_s]
+        tile_bg[idx_slab] = np.where(
+            usable_slab, tbg_np[:n_s].astype(np.float64), np.nan
+        )
+        flux_slab = fl_np[:n_s].astype(np.float64)
+        sigma_slab = sg_np[:n_s].astype(np.float64)
+        if not allow_negative or use_l1_gate:
+            sigma_slab[flux_slab <= 0.0] = 0.0
+        out[idx_slab, 0] = np.where(usable_slab, flux_slab, 0.0)
+        out[idx_slab, 4] = np.where(usable_slab, sigma_slab, 0.0)
+        out[idx_slab, 1] = sr_np[:n_s].astype(np.float64) + org_r_slab
+        out[idx_slab, 2] = sc_np[:n_s].astype(np.float64) + org_c_slab
+
+        last_done = int(s_frames[-1]) + 1
+        if last_done > progressed_to:
+            pbar.update(last_done - progressed_to)
+            progressed_to = last_done
+
+    if B > progressed_to:
+        pbar.update(B - progressed_to)
+    pbar.close()
 
     if show_progress and n_dropped_neighbours:
         print(

@@ -472,3 +472,134 @@ def test_gated_integration_fixed_chunks_avoid_per_bank_recompilation(monkeypatch
     assert snap_fn._cache_size() == cache_after_first["snap"]
     assert solve_fn._cache_size() == cache_after_first["solve"]
     assert box_fn._cache_size() == cache_after_first["box"]
+
+
+def test_event_store_read_slab_and_multi_image_dense_neighbor_parity(
+    tmp_path, monkeypatch, capsys
+):
+    """Coalesced EventStore.read_slab matches per-image reads (including empty
+    and non-contiguous images), and multi-block GPU neighbor merge matches CPU
+    cKDTree + plain-reader integration when > ATOM_PAD-1 peaks overlap."""
+    from subhkl.search import tof_gate
+
+    monkeypatch.setattr(tof_gate, "TILE_CHUNK_SMALL", 16)
+    monkeypatch.setattr(tof_gate, "TILE_CHUNK_LARGE", 16)
+
+    rng = np.random.default_rng(42)
+    H = W = 48
+    band = (15000.0, 31000.0)
+    sigma_px, sigma_rel = 1.25, 0.002
+
+    # Four HDF5 images: image 1 is deliberately empty (0 events); frames select [0, 1, 3].
+    all_imgs, all_tofs = [], []
+    for k in range(4):
+        if k == 1:
+            all_imgs.append(np.zeros((H, W), dtype=np.int64))
+            all_tofs.append(np.zeros(0, dtype=np.float32))
+        else:
+            pks = [
+                (24.0 + (i % 3) * 1.5, 24.0 + (i // 3) * 1.5, 22000.0, 320.0)
+                for i in range(10)
+            ]
+            im, tf = _synthetic_image_events(
+                rng, (H, W), band, 2.5, pks, sigma_px, sigma_rel
+            )
+            all_imgs.append(im)
+            all_tofs.append(tf)
+
+    h5_path = tmp_path / "slab_events.h5"
+    with h5py.File(h5_path, "w") as h5:
+        h5.create_dataset("images", data=np.stack(all_imgs).astype(np.int32))
+        write_events(h5, all_tofs)
+
+    sel_keys = [0, 1, 3]
+    sel_images = np.stack([all_imgs[k] for k in sel_keys]).astype(np.float32)
+
+    with EventStore(h5_path) as store:
+        tof_slab, off_slab, n_ev = store.read_slab(sel_keys, sel_images)
+        ref_tofs, ref_off_rows = [], []
+        base_ev = 0
+        for slot, k in enumerate(sel_keys):
+            tf_k, off_k = store.image_events(k, sel_images[slot])
+            ref_tofs.append(tf_k.astype(np.float32))
+            ref_off_rows.append((off_k + base_ev).astype(np.int32))
+            base_ev += len(tf_k)
+        ref_tof_cat = np.concatenate(ref_tofs)
+        ref_off_mat = np.stack(ref_off_rows, axis=0)
+        assert n_ev == len(ref_tof_cat)
+        np.testing.assert_array_equal(tof_slab[:n_ev], ref_tof_cat)
+        np.testing.assert_array_equal(off_slab, ref_off_mat)
+
+        # Build >16 peaks on frame 0 & frame 2 (spanning multiple 16-peak GPU blocks)
+        # including a 10-peak tight overlapping cluster (> ATOM_PAD - 1 = 7).
+        frames_l, rs_l, cs_l, tp_l = [], [], [], []
+        for f_slot in (0, 2):
+            cluster_r = np.array(
+                [24.0 + (i % 3) * 1.5 for i in range(10)]
+                + list(rng.uniform(8.0, 40.0, 12))
+            )
+            cluster_c = np.array(
+                [24.0 + (i // 3) * 1.5 for i in range(10)]
+                + list(rng.uniform(8.0, 40.0, 12))
+            )
+            tp_f = np.array([22000.0] * 10 + list(rng.uniform(17000.0, 29000.0, 12)))
+            frames_l.append(np.full(len(cluster_r), f_slot, dtype=np.int64))
+            rs_l.append(cluster_r)
+            cs_l.append(cluster_c)
+            tp_l.append(tp_f)
+        frames = np.concatenate(frames_l)
+        rs = np.concatenate(rs_l)
+        cs = np.concatenate(cs_l)
+        tp = np.concatenate(tp_l)
+        n_tot = len(frames)
+        var = np.full(n_tot, sigma_px**2 + 1.0 / 12.0, dtype=np.float32)
+        gate = tof_gate.TofGate(0.015, 0.030)
+
+        def plain_reader(f_slot: int):
+            return store.image_events(sel_keys[f_slot], sel_images[f_slot])
+
+        def slab_reader(f_slot: int):
+            return store.image_events(sel_keys[f_slot], sel_images[f_slot])
+
+        slab_reader.event_store = store
+        slab_reader.frame_img_keys = sel_keys
+
+        rows_plain, info_plain = tof_gate.integrate_reflections_tof_gated(
+            sel_images,
+            plain_reader,
+            frames,
+            rs,
+            cs,
+            tp,
+            np.full(n_tot, band[0]),
+            np.full(n_tot, band[1]),
+            var_us=var,
+            var_vs=var,
+            cov_uvs=np.zeros(n_tot, dtype=np.float32),
+            gate=gate,
+            allow_negative=True,
+            show_progress=True,
+        )
+        out_plain = capsys.readouterr().out
+        rows_slab, info_slab = tof_gate.integrate_reflections_tof_gated(
+            sel_images,
+            slab_reader,
+            frames,
+            rs,
+            cs,
+            tp,
+            np.full(n_tot, band[0]),
+            np.full(n_tot, band[1]),
+            var_us=var,
+            var_vs=var,
+            cov_uvs=np.zeros(n_tot, dtype=np.float32),
+            gate=gate,
+            allow_negative=True,
+            show_progress=True,
+        )
+        out_slab = capsys.readouterr().out
+
+    assert "overlapping neighbours" in out_plain
+    assert out_slab == out_plain
+    np.testing.assert_allclose(info_slab["bg"], info_plain["bg"], rtol=1e-5, atol=1e-4)
+    np.testing.assert_allclose(rows_slab, rows_plain, rtol=1e-5, atol=1e-4)

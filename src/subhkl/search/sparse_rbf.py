@@ -1317,9 +1317,17 @@ def integrate_peaks_rbf_ssn(
                 else f" (images file says {images_band[0]:g}-{images_band[1]:g})"
             )
             print(f"  > Wavelength band: {band_min:.3f}-{band_max:.3f} A{note}")
+
+        def _frame_event_reader(f):
+            return event_reader(frame_img_keys[f])
+
+        if getattr(event_reader, "event_store", None) is not None:
+            _frame_event_reader.event_store = event_reader.event_store
+            _frame_event_reader.frame_img_keys = frame_img_keys
+
         integrated_results, tof_info = integrate_reflections_tof_gated(
             images_batch,
-            lambda f: event_reader(frame_img_keys[f]),
+            _frame_event_reader,
             frames,
             all_rs,
             all_cs,

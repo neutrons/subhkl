@@ -4637,7 +4637,13 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
     mtz_foreign.add_column("SIGI", "Q")
     chosen_hkls: list[tuple[int, int, int]] = []
     expected_r1: dict[tuple[int, int, int], tuple[float, float, float]] = {}
-    for i_pk in range(min(5, len(h1))):
+    bw_mandi = int(0.06 * min(int(cal_cfg["n"]), int(cal_cfg["m"])))
+    for i_pk in range(len(h1)):
+        if not (
+            bw_mandi <= float(pr1[i_pk]) < int(cal_cfg["n"]) - 1 - bw_mandi
+            and bw_mandi <= float(pc1[i_pk]) < int(cal_cfg["m"]) - 1 - bw_mandi
+        ):
+            continue
         key_h = (int(h1[i_pk]), int(k1[i_pk]), int(l1[i_pk]))
         if key_h not in expected_r1:
             expected_r1[key_h] = (
@@ -4646,6 +4652,8 @@ def test_mtz_overlay_matches_solved_geometry_and_warns_on_mismatched_symmetry(
                 float(lam1[i_pk]),
             )
             chosen_hkls.append(key_h)
+            if len(chosen_hkls) >= 5:
+                break
     # Also include HKLs that would strike OTHER uninstalled MANDI banks (e.g. bank 22)
     # to prove .mtz reflections ONLY project onto panels where predicted peaks project (bank 19)!
     uninstalled_det = Detector(dict(beamlines["MANDI"]["22"]))
@@ -5293,6 +5301,7 @@ def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
             imagine_dets,
             (2.8, 4.5),
             active_bids={first_bk},
+            margin_frac=0.03,
         ),
         b_prot,
     )
@@ -5305,6 +5314,7 @@ def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
             imagine_dets,
             (2.8, 4.5),
             active_bids={first_bk},
+            margin_frac=0.03,
         ),
         b_prot,
     )
@@ -5317,6 +5327,7 @@ def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
             imagine_dets,
             (2.0, 4.5),
             active_bids={first_bk},
+            margin_frac=0.03,
         ),
         b_prot,
     )
@@ -5479,6 +5490,7 @@ def test_dynamic_dmin_wavelength_reprediction_and_detector_zoom_lod(
             mandi_dets,
             (2.5, 4.0),
             active_bids=mandi_active_bids,
+            margin_frac=0.06,
         ),
         b_big,
     )
@@ -6064,6 +6076,7 @@ process.exit(0);
             mandi_dets,
             (0.74, 0.79),
             active_bids=mandi_active_bids,
+            margin_frac=0.06,
         ),
         b_p6122,
     )
@@ -6408,15 +6421,10 @@ def test_textures_only_fast_path_and_vectorized_flat_raycast(tmp_path):
         hit_m, rows, cols = det.reflections_mask(
             kf_hat[:, 0], kf_hat[:, 1], kf_hat[:, 2], sample_offset=sample_off
         )
-        r_span = max(float(det.n - 1), 1.0)
-        c_span = max(float(det.m - 1), 1.0)
-        hit_m = (
-            hit_m
-            & (rows >= margin * r_span)
-            & (rows <= (1.0 - margin) * r_span)
-            & (cols >= margin * c_span)
-            & (cols <= (1.0 - margin) * c_span)
-        )
+        bw = int(margin * min(int(det.n), int(det.m)))
+        hi_r = int(det.n) - 1 - bw if bw > 0 else int(det.n)
+        hi_c = int(det.m) - 1 - bw if bw > 0 else int(det.m)
+        hit_m = hit_m & (rows >= bw) & (rows < hi_r) & (cols >= bw) & (cols < hi_c)
         for loc in np.flatnonzero(hit_m):
             gi = int(cand_idx[loc])
             r_px = float(rows[loc])
@@ -7810,7 +7818,7 @@ def test_live_solve_dtheta_diagnostic_topbar_tooltips_and_controls_cleanup(
     mandi_dets = {
         int(bk): Detector(dict(cfg)) for bk, cfg in beamlines["MANDI"].items()
     }
-    active_bks = sorted(mandi_dets)[:8]
+    active_bks = sorted(mandi_dets)[:12]
     sub_dets = {bk: mandi_dets[bk] for bk in active_bks}
     first_det = mandi_dets[active_bks[0]]
     H, W = int(first_det.n), int(first_det.m)
@@ -7821,7 +7829,14 @@ def test_live_solve_dtheta_diagnostic_topbar_tooltips_and_controls_cleanup(
     grid = np.mgrid[-6:7, -6:7, -6:7].reshape(3, -1).T
     grid = grid[np.any(grid != 0, axis=1)]
     cast_true = _raycast_hkl_on_detectors(
-        grid, U_true, B_mat, R_run, sub_dets, (1.0, 3.0), active_bids=set(active_bks)
+        grid,
+        U_true,
+        B_mat,
+        R_run,
+        sub_dets,
+        (1.0, 3.0),
+        active_bids=set(active_bks),
+        margin_frac=0.06,
     )
     assert len(cast_true["peaks_xyz"]) >= 10
 
@@ -9372,3 +9387,323 @@ console.log(JSON.stringify({ detCounts, wulffCounts, backCount10, poppedTotal, b
     assert out["backCount10"] >= 60
     assert out["poppedTotal"] == 0
     assert out["bankCounts"][0] < out["bankCounts"][2] < out["bankCounts"][3]
+
+
+def test_predictor_and_rainbow_zones_honor_edge_and_pixel_masks(tmp_path) -> None:
+    """Verify peak-predictor and Rainbow Zones (server + client JS pool/Ewald raycasters) honor edge borders and per-pixel masks."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.commands import run_peak_predictor
+    from subhkl.config import beamlines
+    from subhkl.core.crystallography import (
+        cartesian_matrix_metric_tensor,
+        generate_reflections,
+    )
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.rainbow_zones import (
+        _raycast_hkl_on_detectors,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    cell = [68.0, 74.0, 92.0, 90.0, 90.0, 90.0]
+    B_raw, _ = cartesian_matrix_metric_tensor(*cell[:3], *np.deg2rad(cell[3:]))
+    B_mat = np.asarray(B_raw, dtype=float)
+    U_mat = Rotation.from_euler("zyx", [19.0, -31.0, 44.0], degrees=True).as_matrix()
+    R_mat = np.eye(3, dtype=float)
+    active_bks = [1, 20]
+    dets = {bk: Detector(dict(beamlines["MANDI"][str(bk)])) for bk in active_bks}
+    H, W = int(dets[1].n), int(dets[1].m)
+    bw = int(0.06 * min(H, W))  # 15 px on 256x256 MANDI panel
+
+    hkls = np.stack(
+        generate_reflections(*cell, space_group="P 21 21 21", d_min=1.8), axis=1
+    ).astype(int)
+    raw_cast = _raycast_hkl_on_detectors(
+        hkls,
+        U_mat,
+        B_mat,
+        R_mat,
+        dets,
+        (2.0, 4.0),
+        active_bids=set(active_bks),
+        margin_frac=0.0,
+    )
+    assert len(raw_cast["peaks_xyz"]) > 80
+
+    # Confirm there are genuine edge peaks (< bw or >= 255 - bw) AND interior peaks we will mask!
+    in_edge = (
+        (raw_cast["pixel_r"] < bw)
+        | (raw_cast["pixel_r"] >= (H - 1 - bw))
+        | (raw_cast["pixel_c"] < bw)
+        | (raw_cast["pixel_c"] >= (W - 1 - bw))
+    )
+    assert int(np.sum(in_edge)) >= 5
+    interior_idx = np.flatnonzero(~in_edge)
+    assert len(interior_idx) >= 15
+
+    # Mask a 40x40 central patch on bank 1 covering known interior reflections
+    b1_int = [
+        idx
+        for idx in interior_idx
+        if int(raw_cast["bank"][idx]) == 1
+        and 40 <= raw_cast["pixel_r"][idx] <= 210
+        and 40 <= raw_cast["pixel_c"][idx] <= 210
+    ]
+    assert len(b1_int) >= 1
+    target_i = b1_int[0]
+    tr = round(float(raw_cast["pixel_r"][target_i]))
+    tc = round(float(raw_cast["pixel_c"][target_i]))
+    r_lo, r_hi = max(bw + 1, tr - 18), min(H - 2 - bw, tr + 19)
+    c_lo, c_hi = max(bw + 1, tc - 18), min(W - 2 - bw, tc + 19)
+
+    cls_masks = np.zeros((2, H, W), dtype=np.uint8)
+    cls_masks[0, r_lo:r_hi, c_lo:c_hi] = 1  # dark/shadowed patch on bank 1
+    cls_masks[0, max(bw + 1, r_hi) : min(H - 2 - bw, r_hi + 6), c_lo:c_hi] = (
+        2  # static-bright strip
+    )
+
+    merged_h5 = tmp_path / "mandi_mask_merged.h5"
+    with h5py.File(merged_h5, "w") as mf:
+        mf.attrs["instrument"] = "MANDI"
+        mf.create_dataset("images", data=np.ones((2, H, W), dtype=np.float32) * 5.0)
+        mf.create_dataset("bank_ids", data=np.array(active_bks, dtype=np.int32))
+        mf.create_dataset("file_offsets", data=np.array([0], dtype=np.int32))
+        mf.create_dataset(
+            "files", data=np.array(["MANDI_mask_test.nxs.h5"], dtype="S32")
+        )
+        gon_m = mf.create_group("goniometer")
+        gon_m.create_dataset("R", data=R_mat[None, :, :])
+        gon_m.create_dataset("angles", data=np.zeros((2, 3), dtype=np.float64))
+        gon_m.create_dataset(
+            "axes",
+            data=np.array([[0, 1, 0, 1], [0, 0, 1, 1], [0, 1, 0, 1]], dtype=np.float64),
+        )
+        mf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.0, 4.0], dtype=np.float64)
+        )
+
+    solve_h5 = tmp_path / "mandi_mask_solve.h5"
+    with h5py.File(solve_h5, "w") as sf:
+        sf.attrs["instrument"] = "MANDI"
+        sf.attrs["source"] = str(merged_h5)
+        smp = sf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 21 21 21")
+        smp.create_dataset("cell", data=np.array(cell, dtype=float))
+        for k_c, v_c in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell):
+            smp.create_dataset(k_c, data=float(v_c))
+        smp.create_dataset("U", data=U_mat)
+        smp.create_dataset("B", data=B_mat)
+        sf.create_group("goniometer").create_dataset("R", data=R_mat[None, :, :])
+        sf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([2.0, 4.0], dtype=np.float64)
+        )
+        det_grp = sf.create_group("detector")
+        det_grp.create_dataset("pixel_mask", data=(cls_masks == 0).astype(np.uint8))
+        det_grp.create_dataset("pixel_class", data=cls_masks)
+        det_grp.create_dataset(
+            "mask_bank_ids", data=np.array(active_bks, dtype=np.int32)
+        )
+
+    # Also create an external static-mask HDF5 blocking an extra patch on bank 20
+    static_mask_h5 = tmp_path / "static_mask.h5"
+    valid_ext = np.ones((2, H, W), dtype=np.uint8)
+    valid_ext[1, 60:140, 60:140] = 0
+    with h5py.File(static_mask_h5, "w") as smf:
+        smf.attrs["kind"] = "static-mask"
+        smf.create_dataset("images", data=valid_ext)
+        smf.create_dataset("bank_ids", data=np.array(active_bks, dtype=np.int32))
+
+    # 1. Verify run_peak_predictor honors BOTH rel_border_width AND detector/pixel_mask + static_mask_file
+    pred_no_border_h5 = tmp_path / "pred_no_border.h5"
+    pred_masked_h5 = tmp_path / "pred_masked.h5"
+    run_peak_predictor(
+        str(merged_h5),
+        "MANDI",
+        str(solve_h5),
+        str(pred_no_border_h5),
+        d_min=1.8,
+        wavel_min=2.0,
+        wavel_max=4.0,
+        space_group="P 21 21 21",
+        rel_border_width=0.0,
+    )
+    run_peak_predictor(
+        str(merged_h5),
+        "MANDI",
+        str(solve_h5),
+        str(pred_masked_h5),
+        d_min=1.8,
+        wavel_min=2.0,
+        wavel_max=4.0,
+        space_group="P 21 21 21",
+        rel_border_width=0.06,
+        static_mask_file=str(static_mask_h5),
+    )
+    with (
+        h5py.File(pred_no_border_h5, "r") as f0,
+        h5py.File(pred_masked_h5, "r") as f1,
+    ):
+        n0 = sum(len(f0["banks"][k]["i"]) for k in f0["banks"])
+        n1 = sum(len(f1["banks"][k]["i"]) for k in f1["banks"])
+        assert n1 < n0
+        for img_k, bk_id in enumerate(active_bks):
+            if str(img_k) not in f1["banks"]:
+                continue
+            ri = np.asarray(f1["banks"][str(img_k)]["i"][()], dtype=float)
+            ci = np.asarray(f1["banks"][str(img_k)]["j"][()], dtype=float)
+            assert np.all((ri >= bw) & (ri < H - 1 - bw))
+            assert np.all((ci >= bw) & (ci < W - 1 - bw))
+            r_int = np.round(ri).astype(int)
+            c_int = np.round(ci).astype(int)
+            assert np.all(cls_masks[img_k, r_int, c_int] == 0)
+            if bk_id == 20:
+                assert np.all(valid_ext[1, r_int, c_int] == 1)
+
+    # 2. Verify Rainbow Zones server payload + client JS live re-prediction honor edge & per-pixel masks
+    payload = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        d_min=1.8,
+        wavelength_range=(2.0, 4.0),
+        include_panel_images=True,
+    )
+    assert payload["rel_border_width"] == 0.06
+    assert isinstance(payload.get("pixel_mask_bits"), dict)
+    assert "1" in payload["pixel_mask_bits"]
+    for pk in payload["predicted_peaks"]:
+        r_pk, c_pk = float(pk["row"]), float(pk["col"])
+        assert bw <= r_pk < (H - 1 - bw)
+        assert bw <= c_pk < (W - 1 - bw)
+        if int(pk["bank"]) == 1:
+            assert cls_masks[0, round(r_pk), round(c_pk)] == 0
+
+    if shutil.which("node"):
+        html_doc = render_rainbow_html(payload)
+        scripts = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        js_src = scripts[-1]
+        iife_end = js_src.rfind("})();")
+        assert iife_end > 0
+        js_harness = """
+const elems = new Map();
+function makeEl(id = "") {
+  const listeners = {};
+  return {
+    id, tagName: "DIV", value: "", min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 800, height: 520, clientWidth: 800, clientHeight: 520,
+    scrollWidth: 800, scrollHeight: 520, scrollTop: 0, offsetWidth: 800, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null, dataset: {},
+    style: new Proxy({}, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: { add() {}, remove() {}, toggle() { return false; }, contains() { return false; } },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) { (listeners[evObj.type] || []).forEach(fn => fn(evObj)); },
+    appendChild(c) { return c; }, insertBefore(c) { return c; }, replaceChildren() {},
+    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
+    getBoundingClientRect() { return { left: 0, top: 0, right: 800, bottom: 520, width: 800, height: 520 }; },
+    getContext() {
+      return {
+        fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+        textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+        setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+        transform() {}, clearRect() {}, fillRect() {}, strokeRect() {},
+        beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, ellipse() {},
+        quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+        stroke() {}, fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+        fillText() {}, strokeText() {}, drawImage() {},
+        measureText(t) { return { width: String(t).length * 6 }; },
+        createLinearGradient() { return { addColorStop() {} }; },
+        createRadialGradient() { return { addColorStop() {} }; },
+        getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+        putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+      };
+    },
+    querySelector() { return makeEl(); }, querySelectorAll() { return []; }, closest() { return null; },
+  };
+}
+function getEl(id) { if (!elems.has(id)) elems.set(id, makeEl(id)); return elems.get(id); }
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.requestAnimationFrame = () => 1;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.Image = class { set src(_v) {} };
+globalThis.document = {
+  body: makeEl("body"), documentElement: makeEl("html"),
+  getElementById: (id) => getEl(id),
+  createElement: (tag) => makeEl(tag),
+  querySelector: () => makeEl(), querySelectorAll: () => [],
+  addEventListener() {}, removeEventListener() {},
+};
+getEl("inp-border").value = "0.06";
+"""
+        js_probe = """
+// 1. Trigger dynamic pool reprediction at d_min = 1.80 with border = 0.06
+state.dMin = 1.80;
+repredictPeaksDynamic({ preserveSource: true });
+const poolPeaks06 = PEAKS.map(p => ({ bank: p.bank, hkl: p.hkl, row: p.row, col: p.col }));
+
+// 2. Increase live #inp-border to 0.15 -> strictly fewer peaks, all within [38, 217)
+const bInput = getEl("inp-border");
+bInput.value = "0.15";
+bInput.dispatchEvent({ type: "change", target: bInput });
+const poolPeaks15 = PEAKS.map(p => ({ bank: p.bank, hkl: p.hkl, row: p.row, col: p.col }));
+
+// 3. Trigger direct Ewald-shell rod mode at d_min = 0.60 with border = 0.06 -> still honors border & pixel_mask_bits!
+bInput.value = "0.06";
+state.dMin = 0.60;
+repredictPeaksDynamic({ preserveSource: true });
+const ewaldPeaks06 = PEAKS.map(p => ({ bank: p.bank, row: p.row, col: p.col }));
+
+console.log(JSON.stringify({ poolPeaks06, poolPeaks15, ewaldCount: ewaldPeaks06.length, ewaldPeaks06 }));
+})();
+"""
+        js_path = tmp_path / "mask_parity_test.js"
+        js_path.write_text(
+            js_harness + "\n" + js_src[:iife_end] + "\n" + js_probe, encoding="utf-8"
+        )
+        proc = subprocess.run(
+            ["node", str(js_path)], check=True, capture_output=True, text=True
+        )
+        js_out = json.loads(proc.stdout.strip())
+        py_keys_06 = {
+            (int(p["bank"]), int(p["hkl"][0]), int(p["hkl"][1]), int(p["hkl"][2]))
+            for p in payload["predicted_peaks"]
+        }
+        js_keys_06 = {
+            (int(p["bank"]), int(p["hkl"][0]), int(p["hkl"][1]), int(p["hkl"][2]))
+            for p in js_out["poolPeaks06"]
+        }
+        assert js_keys_06 == py_keys_06
+        assert len(js_out["poolPeaks15"]) < len(js_out["poolPeaks06"])
+        bw15 = int(0.15 * min(H, W))
+        for p15 in js_out["poolPeaks15"]:
+            assert bw15 <= p15["row"] < (H - 1 - bw15)
+            assert bw15 <= p15["col"] < (W - 1 - bw15)
+        assert js_out["ewaldCount"] > 500
+        for pe in js_out["ewaldPeaks06"]:
+            assert bw <= pe["row"] < (H - 1 - bw)
+            assert bw <= pe["col"] < (W - 1 - bw)
+            if int(pe["bank"]) == 1:
+                assert cls_masks[0, round(pe["row"]), round(pe["col"])] == 0
