@@ -2120,6 +2120,7 @@ def test_reopen_history_merged_h5_preserves_dataset_id_and_discovers_images(
     assert 'id="inp-lmax"' not in html_doc
     assert 'id="inp-dmin"' not in html_doc
     assert 'id="slider-dmin"' in html_doc
+    assert 'id="slider-dmin" min="0.50" max="5.00" step="0.01"' in html_doc
     assert 'id="sel-spot-color"' in html_doc
     assert '<option value="isigi">Color: I/σ (Log)</option>' in html_doc
     assert '<option value="mtz_isigi">Color: .mtz I/σ (Log)</option>' in html_doc
