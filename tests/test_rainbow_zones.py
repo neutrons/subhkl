@@ -4005,7 +4005,9 @@ def test_wulff_zoom_dspacing_lod_and_dirty_skip(tmp_path):
         "isWulffSnrCutActive",
         "getActiveWulffPeaks",
         "_peakSnrScore",
+        "_computePeakLodPriority",
         "getWulffPoolCache",
+        "buildWulffSphericalBVH",
         "getWulffLodState",
         "projectToWulff",
         "findNearestPeakWulff",
@@ -4050,6 +4052,17 @@ const _wulffPoolCache = {{
   observedHklSet: new Set(),
   sortedD: [],
 }};
+const _wulffBvhCache = {{
+  sig: "",
+  firstRef: null,
+  bvh: null,
+}};
+const _wulffLodCache = {{
+  sig: "",
+  firstRef: null,
+  value: null,
+}};
+let _wulffPrevRenderedPeaks = [];
 let _lastWulffRenderSig = "";
 
 // Create 1,200 All-Runs predicted reflections spanning d in [1.4, 8.0] A, plus duplicate run_index hits for HKL [9999,1,1]
@@ -4087,6 +4100,28 @@ for (const rIdx of [0, 2, 4]) {{
     q_hat_sample: [0.1, 0.2, 0.974679],
     q_hat_cryst: [0.1, 0.2, 0.974679],
     run_index: rIdx,
+  }});
+}}
+// Add a tight 12-peak high-resolution cluster inside one octant near the front pole (0.08, 0.08, 0.9936)
+// so 1x BVH merges it into 1-2 landmarks, 3.5x splits partially, and 14.5x resolves all 12 pop-free!
+for (let k = 0; k < 12; k++) {{
+  const ang = (k / 12.0) * 2.0 * Math.PI;
+  const rad = 0.003 + 0.012 * ((k % 4) / 3.0);
+  const qx = 0.08 + rad * Math.cos(ang), qy = 0.08 + rad * Math.sin(ang);
+  const qz = Math.sqrt(1.0 - qx * qx - qy * qy);
+  const q = [qx, qy, qz];
+  SAMPLE_PEAKS.push({{
+    id: 6000 + k,
+    hkl: [8000 + k, 2, 1],
+    asu_hkl: [8000 + k, 2, 1],
+    d_spacing: 1.45 + 0.25 * k,
+    wavelength: 2.4,
+    intensity: 12.0,
+    sigma: 2.0,
+    q_hat: q,
+    q_hat_sample: q,
+    q_hat_cryst: q,
+    run_index: 2,
   }});
 }}
 
@@ -4170,10 +4205,18 @@ function isPeakCapturedByActiveZone() {{ return false; }}
 const rawActive = getActiveWulffPeaks();
 const pool1 = getWulffPoolCache();
 const dupMatches = pool1.uniquePeaks.filter(p => p.hkl[0] === 9999);
+
+// Verify lowering dMin monotonically populates more Wulff cells at 1x zoom
+state.dMin = 4.2;
+const dMin42Count = getWulffLodState(false).visiblePeaks.length;
+state.dMin = 2.6;
+const dMin26Count = getWulffLodState(false).visiblePeaks.length;
+state.dMin = 1.4;
 const lodZoom1 = getWulffLodState(false);
 
-// High-resolution hovered peak (d < 1.5A) must ALWAYS survive zoom-out LOD thinning
-const hiResTarget = pool1.uniquePeaks.find(p => p.d_spacing < 1.5);
+// High-resolution BVH-suppressed peak (d < 2.0A) must ALWAYS survive zoom-out LOD thinning when hovered
+const shownZoom1Ids = new Set(lodZoom1.visiblePeaks.map(p => p.id));
+const hiResTarget = pool1.uniquePeaks.find(p => !shownZoom1Ids.has(p.id) && p.d_spacing < 2.0);
 state.hoveredPeakId = hiResTarget.id;
 state.hoveredPeakObj = hiResTarget;
 const lodWithHover = getWulffLodState(false);
@@ -4181,7 +4224,7 @@ const hoverKept = lodWithHover.visiblePeaks.some(p => isSameReflection(p, hiResT
 state.hoveredPeakId = null;
 state.hoveredPeakObj = null;
 
-// Render at wulffZoom=1.0 -> draws & emits d >= badge AFTER restore(); immediate 2nd renderStereoInset() skips redraw
+// Render at wulffZoom=1.0 -> draws & emits zoom+ badge AFTER restore(); immediate 2nd renderStereoInset() skips redraw
 ops.length = 0;
 renderStereoInset();
 const firstDrawOps = ops.length;
@@ -4192,23 +4235,36 @@ ops.length = 0;
 renderStereoInset();
 const secondIdleOps = ops.length;
 
-// Zoom in to 2.5x and 8.0x -> progressively reveals higher-resolution shells
-state.wulffZoom = 2.5;
+// Zoom in to 3.5x and 14.5x on the front-pole cluster (yaw=0, pitch=0) -> pop-free subdivision + full resolution
+const coreAt = (peaks) => new Set(
+  peaks.filter(p => p.id >= 6000 && p.id < 6012).map(p => p.id)
+);
+const coreZ1 = coreAt(lodZoom1.visiblePeaks);
+state.wulffZoom = 3.5;
 const lodZoom25 = getWulffLodState(false);
-state.wulffZoom = 8.0;
-const lodZoom80 = getWulffLodState(false);
+const coreZ25 = coreAt(lodZoom25.visiblePeaks);
+state.wulffZoom = 14.5;
+const lodZoom15 = getWulffLodState(false);
+const coreZ15 = coreAt(lodZoom15.visiblePeaks);
+let polarPopped = 0;
+for (const id of coreZ1) if (!coreZ25.has(id)) polarPopped++;
+for (const id of coreZ25) if (!coreZ15.has(id)) polarPopped++;
 
 console.log(JSON.stringify({{
   rawActiveLen: rawActive.length,
   poolDedupLen: pool1.uniquePeaks.length,
   dupCount: dupMatches.length,
   dupPrefersActiveFrame: dupMatches.length === 1 && dupMatches[0].run_index === 2,
+  dMin42Count,
+  dMin26Count,
   zoom1Count: lodZoom1.visiblePeaks.length,
   zoom1Thinned: lodZoom1.totalUnique - lodZoom1.visiblePeaks.length,
   zoom1Dcut: lodZoom1.lodDcut,
-  zoom25Count: lodZoom25.visiblePeaks.length,
-  zoom80Count: lodZoom80.visiblePeaks.length,
-  zoom80Thinned: lodZoom80.totalUnique - lodZoom80.visiblePeaks.length,
+  zoom25CoreCount: coreZ25.size,
+  zoom1CoreCount: coreZ1.size,
+  zoom15CoreCount: coreZ15.size,
+  zoom15Unthinned: !lodZoom15.isLodThinned && lodZoom15.visiblePeaks.length === lodZoom15.inCapCount && lodZoom15.inCapCount > 0,
+  polarPopped,
   hoverKept,
   firstDrawOps,
   secondIdleOps,
@@ -4225,15 +4281,18 @@ console.log(JSON.stringify({{
         text=True,
     )
     out = json.loads(res.stdout.strip())
-    assert out["rawActiveLen"] == 1203
-    assert out["poolDedupLen"] == 1201
+    assert out["rawActiveLen"] == 1215
+    assert out["poolDedupLen"] == 1213
     assert out["dupCount"] == 1
     assert out["dupPrefersActiveFrame"] is True
+    assert out["dMin42Count"] < out["dMin26Count"] <= out["zoom1Count"]
     assert out["zoom1Thinned"] > 400
     assert out["zoom1Count"] < out["poolDedupLen"]
-    assert out["zoom25Count"] > out["zoom1Count"]
-    assert out["zoom80Count"] == out["poolDedupLen"]
-    assert out["zoom80Thinned"] == 0
+    assert 1 <= out["zoom1CoreCount"] <= 4
+    assert out["zoom1CoreCount"] < out["zoom25CoreCount"] < out["zoom15CoreCount"]
+    assert out["zoom15CoreCount"] == 12
+    assert out["zoom15Unthinned"] is True
+    assert out["polarPopped"] == 0
     assert out["hoverKept"] is True
     assert out["firstDrawOps"] > 20
     assert out["secondIdleOps"] == 0
@@ -5632,7 +5691,7 @@ const pred215 = PEAKS.map(p => ({{
 const sampleRunsAt215 = Array.from(new Set(PREDICTED_SAMPLE_PEAKS.map(p => p.run_index))).sort();
 const sampleCountAt215 = PREDICTED_SAMPLE_PEAKS.length;
 
-// 2. Detector zoom-coupled d-spacing LOD at d_min = 2.15 A (> 800 reflections on 800x520 canvas)
+// 2. Detector gameplay Spherical BVH screen-density LOD at d_min = 2.15 A (> 800 reflections on 800x520 canvas)
 state.detZoom = 1.0;
 state.hoveredPeakId = null;
 state.selectedPeakId = null;
@@ -5643,8 +5702,9 @@ detLog.texts.length = 0;
 renderDetectorCanvas(true);
 const hudTextsZ1 = [...detLog.texts];
 
-// Pick a reflection finer than lodZ1.lodDcut: must NOT be hit-tested at detZoom=1.0 unless pinned!
-const hiddenOuterPeak = allVisZ1.find(p => p.d_spacing < lodZ1.lodDcut - 0.08);
+// Pick a BVH-suppressed reflection at detZoom=1.0: must NOT be hit-tested when unpinned, and MUST be hit-tested when pinned!
+const shownSetZ1 = new Set(lodZ1.visiblePeaks.map(p => p.id));
+const hiddenOuterPeak = allVisZ1.find(p => !shownSetZ1.has(p.id));
 const hiddenOuterPeakId = hiddenOuterPeak ? hiddenOuterPeak.id : null;
 let hitHiddenUnpinned = null;
 let hitHiddenWhenPinned = null;
@@ -5666,6 +5726,8 @@ state.detZoom = 2.0;
 const lodZ2 = {{ ...getDetectorLodState(800, 520) }};
 state.detZoom = 6.0;
 const lodZ6 = {{ ...getDetectorLodState(800, 520) }};
+state.detZoom = 24.0;
+const lodZ24 = {{ ...getDetectorLodState(800, 520) }};
 state.detZoom = 1.0;
 
 // 3. Widening wavelength #slider-wl-min ([ knob) from 2.8 -> 2.0 A dynamically adds shorter-lambda spots,
@@ -5765,7 +5827,7 @@ state.detZoom = 1.0;
 state.detPanX = 0.0;
 state.detPanY = 0.0;
 const p6122LodZ1 = {{ ...getDetectorLodState(800, 520) }};
-const p6122Tier1MinD = PEAKS.length > 0 ? PEAKS[PEAKS.length - 1].d_spacing : 99.0;
+const p6122Tier1MinD = PEAKS.reduce((m, p) => Math.min(m, p.d_spacing || 99.0), 99.0);
 const refBankPk = PEAKS.find(p => p.bank === 1) || PEAKS[0];
 state.detZoom = 36.0;
 if (refBankPk) {{
@@ -5896,7 +5958,14 @@ require("fs").writeFileSync({json.dumps(str(out_json_path))}, JSON.stringify({{
     inViewCount: lodZ6.inViewCount,
     totalCount: lodZ6.totalCount,
   }},
-  hudHasLodPill: hudTextsZ1.some(t => t.includes("LOD d ≥") && t.includes("zoom+")),
+  lodZ24: {{
+    lodActive: lodZ24.isLodThinned,
+    lodDMin: lodZ24.lodDcut,
+    shownCount: lodZ24.visiblePeaks.length,
+    inViewCount: lodZ24.inViewCount,
+    totalCount: lodZ24.totalCount,
+  }},
+  hudHasLodPill: hudTextsZ1.some(t => t.includes("LOD ") && t.includes("d ≥") && t.includes("zoom+ to resolve")),
   hiddenOuterPeakId,
   hitHiddenUnpinned,
   hitHiddenWhenPinned,
@@ -6020,11 +6089,12 @@ process.exit(0);
     )
     assert max_p6122_px_err < 0.06
     assert out["p6122LodZ1"]["lodActive"] is True
-    assert out["p6122LodZ1"]["shownCount"] <= 340
+    assert out["p6122LodZ1"]["shownCount"] <= 1200
     assert out["p6122LodZ1"]["totalCount"] > 100000
+    assert out["p6122Tier1MinD"] < 0.70
     assert out["p6122LodZ12"]["inViewCount"] < out["p6122LodZ12"]["totalCount"]
     assert out["p6122LodZ12"]["shownCount"] > 50
-    assert out["p6122LodZ12"]["minVisD"] < out["p6122Tier1MinD"] - 0.25
+    assert out["p6122LodZ12"]["shownCount"] == out["p6122LodZ12"]["inViewCount"]
     assert out["p6122LodZ12"]["minVisD"] < 0.66
 
     # Verify slabbed generate_reflections bit-for-bit parity when box_count > 1_000_000
@@ -6094,19 +6164,24 @@ process.exit(0);
     assert out["pred215WideWlCount"] == len(py_cast_215_wide_wl)
     assert 2.0 <= out["minWlObserved"] < 2.2
 
-    # E. Verify Detector viewport-frustum + screen-density LOD thinning, zoom unlocking, HUD pill, and hit-testing
-    lod1, lod2, lod6 = out["lodZ1"], out["lodZ2"], out["lodZ6"]
+    # E. Verify Detector Spherical BVH screen-density LOD thinning, zoom subdivision, HUD pill, and hit-testing
+    lod1, lod2, lod6, lod24 = (
+        out["lodZ1"],
+        out["lodZ2"],
+        out["lodZ6"],
+        out["lodZ24"],
+    )
     assert lod1["totalCount"] == len(py_cast_215)
     assert lod1["lodActive"] is True
     assert lod1["shownCount"] < lod1["totalCount"]
-    assert lod1["shownCount"] <= 360
-    assert lod1["lodDMin"] > 2.25
-    assert lod2["lodDMin"] < lod1["lodDMin"]
+    assert lod1["shownCount"] <= 950
+    assert lod1["lodDMin"] < 2.25
+    assert lod2["shownCount"] > lod1["shownCount"]
     assert out["hudHasLodPill"] is True
-    assert lod6["lodActive"] is False
     assert lod6["inViewCount"] < lod6["totalCount"]
-    assert lod6["shownCount"] == lod6["inViewCount"]
-    assert abs(lod6["lodDMin"] - 2.15) < 1e-3
+    assert lod24["lodActive"] is False
+    assert lod24["inViewCount"] < lod24["totalCount"]
+    assert lod24["shownCount"] == lod24["inViewCount"]
     assert out["hiddenOuterPeakId"] is not None
     assert out["hitHiddenUnpinned"] != out["hiddenOuterPeakId"]
     assert out["hitHiddenWhenPinned"] is True
@@ -9099,3 +9174,201 @@ def test_multiframe_bank_ids_delta_theta_voronoi_and_live_js_recalc(tmp_path) ->
     if shutil.which("node"):
         script = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
         assert "predsByBank" in script
+
+
+def test_stratified_spherical_subsample_and_canonical_bvh_pop_free(tmp_path):
+    """Server solid-angle stratification preserves back-scattering banks, and client canonical dyadic BVHs are 100% pop-free across d_min and zoom."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import h5py
+    import numpy as np
+
+    from subhkl.core.crystallography import cartesian_matrix_metric_tensor
+    from subhkl.viz.rainbow_zones import (
+        _stratified_spherical_subsample,
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    # 1) Server-side _stratified_spherical_subsample: 5,000 forward high-d reflections in 4 narrow patches
+    #    must NOT starve 200 back-scattering lower-d reflections at |az| > 150 deg when capping to 400.
+    rng = np.random.default_rng(42)
+    n_fwd, n_back = 5000, 200
+    fwd_az = rng.uniform(-12.0, 12.0, size=n_fwd)
+    fwd_el = rng.uniform(-8.0, 8.0, size=n_fwd)
+    back_az = rng.choice([-168.0, 168.0], size=n_back) + rng.uniform(
+        -10.0, 10.0, size=n_back
+    )
+    back_el = rng.uniform(-35.0, 35.0, size=n_back)
+    az_deg = np.concatenate([fwd_az, back_az])
+    el_deg = np.concatenate([fwd_el, back_el])
+    az_r = np.deg2rad(az_deg)
+    el_r = np.deg2rad(el_deg)
+    kf = np.column_stack(
+        [np.cos(el_r) * np.sin(az_r), np.sin(el_r), np.cos(el_r) * np.cos(az_r)]
+    )
+    scores = np.concatenate(
+        [rng.uniform(4.0, 12.0, size=n_fwd), rng.uniform(1.0, 2.2, size=n_back)]
+    )
+    sel = _stratified_spherical_subsample(kf, 400, scores)
+    assert len(sel) == 400
+    assert int(np.sum(sel >= n_fwd)) >= 80
+
+    if not shutil.which("node"):
+        return
+
+    # 2) Client-side 41-bank MANDI P 61 2 2: verify d_min monotonicity at 1x, back-scattering bank coverage,
+    #    and 100% pop-free zoom from 1x -> 2x -> 4x (Tier-2 handoff) -> 8x -> 16x -> 26x!
+    h5p = tmp_path / "mandi_p6122_bvh.h5"
+    b_mat, _ = cartesian_matrix_metric_tensor(
+        79.91, 79.91, 238.0, *np.deg2rad([90.0, 90.0, 120.0])
+    )
+    with h5py.File(h5p, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf["sample/space_group"] = "P 61 2 2"
+        hf["sample/cell"] = np.array(
+            [79.91, 79.91, 238.0, 90.0, 90.0, 120.0], dtype=float
+        )
+        hf["sample/U"] = np.eye(3, dtype=float)
+        hf["sample/B"] = b_mat
+        hf["instrument/wavelength"] = np.array([2.0, 4.0], dtype=float)
+
+    payload = build_rainbow_zone_payload(
+        replay_h5=str(h5p),
+        instrument="MANDI",
+        d_min=3.20,
+        wavelength_range=(2.0, 4.0),
+        include_panel_images=False,
+    )
+    html = render_rainbow_html(payload)
+    js_code = re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.DOTALL)[-1]
+    idx_end = js_code.rfind("})();")
+
+    harness = r"""
+const stubCtx = new Proxy({
+  measureText: (t) => ({ width: String(t).length * 6 }),
+  createImageData: (w, h) => ({ data: new Uint8ClampedArray(w * h * 4) }),
+  createLinearGradient: () => ({ addColorStop: () => {} }),
+  createRadialGradient: () => ({ addColorStop: () => {} }),
+  getImageData: () => ({ data: new Uint8ClampedArray(4) }),
+}, { get: (t, p) => (p in t ? t[p] : () => {}) });
+function makeElem(w = 900, h = 520) {
+  return {
+    width: w, height: h, clientWidth: w, clientHeight: h, scrollWidth: w,
+    options: [], children: [],
+    style: { setProperty(){}, removeProperty(){} },
+    classList: { add(){}, remove(){}, toggle(){}, contains(){ return false; } },
+    dataset: {}, value: "", checked: false, textContent: "", innerHTML: "",
+    getContext: () => stubCtx,
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: w, height: h }),
+    addEventListener: () => {}, removeEventListener: () => {},
+    querySelectorAll: () => [], querySelector: () => null,
+    appendChild: () => {}, setAttribute: () => {}, getAttribute: () => null,
+  };
+}
+const elemCache = new Map();
+globalThis.window = { devicePixelRatio: 1, addEventListener: () => {}, innerWidth: 1280, innerHeight: 800 };
+globalThis.requestAnimationFrame = () => 0;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ResizeObserver = class { observe(){} disconnect(){} };
+globalThis.OffscreenCanvas = undefined;
+globalThis.document = {
+  documentElement: makeElem(1280, 800),
+  getElementById: (id) => {
+    if (!elemCache.has(id)) {
+      const isStereo = id.includes("stereo");
+      elemCache.set(id, makeElem(isStereo ? 220 : 900, isStereo ? 220 : 520));
+    }
+    return elemCache.get(id);
+  },
+  createElement: () => makeElem(256, 256),
+  querySelectorAll: () => [],
+  querySelector: () => makeElem(),
+  addEventListener: () => {},
+  body: makeElem(1280, 800),
+};
+"""
+    probe = r"""
+state.peakSource = "predicted";
+state.detZoom = 1.0; state.detPanX = 0; state.detPanY = 0;
+state.wulffZoom = 1.0; state.wulffYawDeg = 0; state.wulffPitchDeg = 0;
+
+const dSteps = [3.2, 2.2, 1.4, 1.0];
+const detCounts = [];
+const wulffCounts = [];
+let backCount10 = 0;
+for (const dm of dSteps) {
+  state.dMin = dm;
+  repredictPeaksDynamic({ userAdjusted: true });
+  const dl = getDetectorLodState(900, 520);
+  const wl = getWulffLodState(false);
+  detCounts.push(dl.visiblePeaks.length);
+  wulffCounts.push(wl.visiblePeaks.length);
+  if (dm === 1.0) {
+    backCount10 = dl.visiblePeaks.filter(p => Math.abs(p.det_x) > 130.0).length;
+  }
+}
+
+state.projection = "spherical";
+const bp = PEAKS.filter(p => p.bank === 20);
+let sSin = 0, sCos = 0, sEl = 0;
+for (const p of bp) {
+  const r = p.det_x * Math.PI / 180.0;
+  sSin += Math.sin(r); sCos += Math.cos(r); sEl += p.det_el;
+}
+const cAz = Math.atan2(sSin, sCos) * 180.0 / Math.PI;
+const meanEl = sEl / bp.length;
+let prevCore = null;
+let poppedTotal = 0;
+const bankCounts = [];
+for (const z of [1.0, 2.0, 4.0, 8.0, 16.0, 26.0]) {
+  state.detZoom = z;
+  setDetectorCenterAzimuthDeg(cAz);
+  const bAct = getActiveBounds();
+  const bxAct = getDetectorPlotBox(900, 520);
+  const y0Ref = bxAct.originY + (1.0 - (meanEl - bAct.minY) / (bAct.maxY - bAct.minY)) * bxAct.plotH;
+  state.detPanY = -(y0Ref - 260.0) * z;
+  const lod = getDetectorLodState(900, 520);
+  const onBank = lod.visiblePeaks.filter(p => p.bank === 20);
+  bankCounts.push(onBank.length);
+  const core = new Set(
+    onBank
+      .filter(p => Math.abs(p.det_x - cAz) < 2.0 && Math.abs(p.det_el - meanEl) < 2.0)
+      .map(p => `${p.bank}|${p.hkl.join(",")}`)
+  );
+  if (prevCore) {
+    for (const k of prevCore) if (!core.has(k)) poppedTotal++;
+  }
+  prevCore = core;
+}
+console.log(JSON.stringify({ detCounts, wulffCounts, backCount10, poppedTotal, bankCounts, rawTotal: _dynEwaldRawTotal }));
+})();
+"""
+    js_path = tmp_path / "mandi_bvh_test.js"
+    js_path.write_text(
+        harness + "\n" + js_code[:idx_end] + "\n" + probe, encoding="utf-8"
+    )
+    res = subprocess.run(
+        ["node", str(js_path)], check=True, capture_output=True, text=True
+    )
+    out = json.loads(res.stdout.strip())
+    assert out["rawTotal"] > 150000
+    assert (
+        out["detCounts"][0]
+        < out["detCounts"][1]
+        < out["detCounts"][2]
+        <= out["detCounts"][3]
+    )
+    assert out["detCounts"][3] <= 1400
+    assert (
+        out["wulffCounts"][0]
+        < out["wulffCounts"][1]
+        < out["wulffCounts"][2]
+        <= out["wulffCounts"][3]
+    )
+    assert out["backCount10"] >= 60
+    assert out["poppedTotal"] == 0
+    assert out["bankCounts"][0] < out["bankCounts"][2] < out["bankCounts"][3]
