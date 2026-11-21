@@ -288,3 +288,187 @@ def test_wavelength_band_follows_the_predictions():
     # No band with the predictions: the images band, widened to hold them.
     assert wavelength_band(predicted, None, (2.0, 4.0)) == (1.05, 4.0)
     assert wavelength_band(predicted, None, None) == (1.05, 2.9)
+
+
+def test_neighbor_plan_and_masked_median_match_dense_reference():
+    """cKDTree sparse neighbor lookup and masked row median match dense O(n^2)
+    and np.nanmedian references on crowded panels, including exact tie-breaking."""
+    import warnings
+
+    from subhkl.search import tof_gate
+
+    rng = np.random.default_rng(7)
+
+    # 1. _masked_row_median vs np.nanmedian across odd, even, and empty rows
+    vals = rng.normal(10.0, 3.0, size=(120, 32))
+    mask = rng.uniform(0.0, 1.0, size=(120, 32)) > 0.35
+    mask[0] = False  # all-masked row
+    mask[1, :3] = True
+    mask[1, 3:] = False  # odd count
+    mask[2, :4] = True
+    mask[2, 4:] = False  # even count
+    got_med = tof_gate._masked_row_median(vals, mask)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        ref_med = np.nanmedian(np.where(mask, vals, np.nan), axis=1)
+    np.testing.assert_allclose(got_med, ref_med, rtol=0.0, atol=1e-14, equal_nan=True)
+
+    # 2. _build_neighbor_plan vs dense O(n^2) reference (including exact distance ties)
+    n = 600
+    rs_f = rng.uniform(8.0, 120.0, n)
+    cs_f = rng.uniform(8.0, 120.0, n)
+    # Inject exact lattice distance ties around peak 0
+    rs_f[0], cs_f[0] = 64.0, 64.0
+    rs_f[1:5] = np.array([66.0, 62.0, 64.0, 64.0])
+    cs_f[1:5] = np.array([64.0, 64.0, 66.0, 62.0])
+    reach_f = rng.uniform(3.0, 6.5, n)
+    in_band_f = rng.uniform(0.0, 1.0, n) > 0.08
+    in_band_f[:5] = True
+    b_lo_f = rng.integers(30, 180, size=n, dtype=np.int64)
+    b_hi_f = b_lo_f + rng.integers(10, 30, size=n, dtype=np.int64)
+    b_lo_f[1:5] = b_lo_f[0]
+    b_hi_f[1:5] = b_hi_f[0]
+    sb_edges = np.sort(
+        rng.integers(10, 220, size=(n, 2, tof_gate.SIDEBAND_BINS + 1)), axis=2
+    )
+    keep0 = rng.uniform(0.0, 1.0, size=(n, 2, tof_gate.SIDEBAND_BINS)) > 0.1
+    half = 11
+    K = tof_gate.ATOM_PAD
+
+    keep_kd, local_kd, has_kd, drop_kd = tof_gate._build_neighbor_plan(
+        rs_f, cs_f, reach_f, in_band_f, b_lo_f, b_hi_f, sb_edges, keep0, half, K
+    )
+
+    dr = np.abs(rs_f[:, None] - rs_f[None, :])
+    dc = np.abs(cs_f[:, None] - cs_f[None, :])
+    near = (dr <= half + reach_f[None, :]) & (dc <= half + reach_f[None, :])
+    np.fill_diagonal(near, False)
+    near &= in_band_f[None, :]
+    keep_dn = keep0.copy()
+    pa, pj = np.nonzero(near)
+    if len(pa):
+        hit = (sb_edges[pa, :, :-1] < b_hi_f[pj, None, None]) & (
+            sb_edges[pa, :, 1:] > b_lo_f[pj, None, None]
+        )
+        blocked = np.zeros(keep_dn.shape, dtype=bool)
+        np.logical_or.at(blocked, pa, hit)
+        keep_dn &= ~blocked
+
+    touch = reach_f[:, None] + reach_f[None, :]
+    joint = (
+        near
+        & (dr <= touch)
+        & (dc <= touch)
+        & (b_lo_f[:, None] < b_hi_f[None, :])
+        & (b_hi_f[:, None] > b_lo_f[None, :])
+    )
+    d2 = np.where(joint, dr**2 + dc**2, np.inf)
+    order = np.argsort(d2, axis=1, kind="stable")[:, : K - 1]
+    picked = np.take_along_axis(d2, order, axis=1) < np.inf
+    drop_dn = int((joint.sum(axis=1) > K - 1).sum())
+    local_dn = np.concatenate([np.arange(n)[:, None], order], axis=1)
+    has_dn = np.concatenate([np.ones((n, 1), dtype=bool), picked], axis=1)
+
+    np.testing.assert_array_equal(keep_kd, keep_dn)
+    np.testing.assert_array_equal(has_kd, has_dn)
+    np.testing.assert_array_equal(
+        np.where(has_kd, local_kd, -1), np.where(has_dn, local_dn, -1)
+    )
+    assert drop_kd == drop_dn
+
+
+def test_gated_integration_fixed_chunks_avoid_per_bank_recompilation(monkeypatch):
+    """Multi-chunk event scatter and tile solvers recover signal and do not
+    trigger new XLA compilations when subsequent banks have different peak counts."""
+    from subhkl.search import tof_gate
+
+    monkeypatch.setattr(tof_gate, "TILE_CHUNK_SMALL", 32)
+    monkeypatch.setattr(tof_gate, "TILE_CHUNK_LARGE", 64)
+    monkeypatch.setattr(tof_gate, "EVENT_CHUNK_SMALL", 2048)
+    monkeypatch.setattr(tof_gate, "EVENT_CHUNK", 8192)
+
+    rng = np.random.default_rng(8)
+    H = W = 64
+    band = (15000.0, 31000.0)
+    sigma_px, sigma_rel = 1.3, 0.002
+
+    def _run_batch(counts_per_frame: list[int]):
+        frames_l, rs_l, cs_l, tp_l, truth_flux_l = [], [], [], [], []
+        ev_frames = []
+        for f_idx, npk in enumerate(counts_per_frame):
+            r_pk = rng.uniform(10.0, H - 10.0, npk)
+            c_pk = rng.uniform(10.0, W - 10.0, npk)
+            tp = rng.uniform(17000.0, 28000.0, npk)
+            fl = np.where(np.arange(npk) < 6, 450.0, 0.0)
+            peaks = [(r_pk[i], c_pk[i], tp[i], fl[i]) for i in range(npk)]
+            img, tof = _synthetic_image_events(
+                rng, (H, W), band, 3.0, peaks, sigma_px, sigma_rel
+            )
+            offsets = np.concatenate([[0], np.cumsum(img.ravel())])
+            ev_frames.append((img, tof, offsets))
+            frames_l.append(np.full(npk, f_idx, dtype=int))
+            rs_l.append(r_pk)
+            cs_l.append(c_pk)
+            tp_l.append(tp)
+            truth_flux_l.append(fl)
+
+        images = np.stack([e[0] for e in ev_frames]).astype(np.float32)
+        frames = np.concatenate(frames_l)
+        rs = np.concatenate(rs_l)
+        cs = np.concatenate(cs_l)
+        tp = np.concatenate(tp_l)
+        truth = np.concatenate(truth_flux_l)
+        n_tot = len(frames)
+        var = np.full(n_tot, sigma_px**2 + 1.0 / 12.0, dtype=np.float32)
+        rows, _ = tof_gate.integrate_reflections_tof_gated(
+            images,
+            lambda f: (ev_frames[f][1], ev_frames[f][2]),
+            frames,
+            rs,
+            cs,
+            tp,
+            np.full(n_tot, band[0]),
+            np.full(n_tot, band[1]),
+            var_us=var,
+            var_vs=var,
+            cov_uvs=np.zeros(n_tot, dtype=np.float32),
+            allow_negative=True,
+        )
+        return rows, truth
+
+    solve_fn = tof_gate._solve_tiles(False, False, True)
+    tiles_fn = tof_gate._jit("tiles")
+    snap_fn = tof_gate._jit("snap")
+    box_fn = tof_gate._jit("box")
+    cache_before = {
+        "tiles": tiles_fn._cache_size(),
+        "snap": snap_fn._cache_size(),
+        "solve": solve_fn._cache_size(),
+    }
+
+    # Three banks with distinct peak counts [9, 75, 145] compile tile/snap/solve
+    # at most once for this (H, W, chunk_size=64) configuration.
+    rows_1, truth_1 = _run_batch([9, 75, 145])
+    bright_1 = truth_1 > 0
+    assert np.median(rows_1[bright_1, 0]) > 300.0
+
+    cache_after_first = {
+        "tiles": tiles_fn._cache_size(),
+        "snap": snap_fn._cache_size(),
+        "solve": solve_fn._cache_size(),
+        "box": box_fn._cache_size(),
+    }
+    assert cache_after_first["tiles"] - cache_before["tiles"] <= 1
+    assert cache_after_first["snap"] - cache_before["snap"] <= 1
+    assert cache_after_first["solve"] - cache_before["solve"] <= 1
+
+    # Second call with 4 completely different multi-chunk peak counts per bank:
+    # zero additional XLA compilations may occur.
+    rows_2, truth_2 = _run_batch([17, 110, 41, 180])
+    bright_2 = truth_2 > 0
+    assert np.median(rows_2[bright_2, 0]) > 300.0
+
+    assert tiles_fn._cache_size() == cache_after_first["tiles"]
+    assert snap_fn._cache_size() == cache_after_first["snap"]
+    assert solve_fn._cache_size() == cache_after_first["solve"]
+    assert box_fn._cache_size() == cache_after_first["box"]

@@ -269,7 +269,7 @@ class Detector:
 
             QA = np.sum(D_vec**2, axis=0)
             QB = 2 * np.sum(B_vec * D_vec.T, axis=1)  # FIX: handle stack
-            QC = np.sum(B_vec**2, axis=1) - self.radius**2
+            QC = np.sum(B_vec**2, axis=-1) - self.radius**2
 
             delta = QB**2 - 4 * QA * QC
 
