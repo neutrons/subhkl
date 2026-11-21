@@ -9767,36 +9767,48 @@ def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
     t_pred_3 = lam_3 * (l1_true + l2_c) / ANGSTROM_M_PER_US
 
     # Synthesize sparse CSR event table on bank 32 (plus an empty/background bank 19):
-    # - Uniform broadband Poisson-like background across [15000, 38000] us
-    # - Spot A for (0,0,2): exact pixel (128, 128), exact ToF t_pred_2 -> 3D error ~ 0.0 deg
-    # - Spot B for (0,0,3): exact pixel (128, 128), pure radial ToF shift +0.6% (t_obs = 1.006 * t_pred_3)!
-    #   Note: in 2D images, Spot A and Spot B sit on the EXACT same pixel (128, 128) and have 0 directional error!
+    # - Uniform broadband Poisson-like background across [14000, 38000] us
+    # - Spot A for (0,0,2): exact pixel (128, 128), +0.6% radial ToF shift (moderator tail!) -> directional arccos(q_hat . G_hat) ~ 0.0 deg!
+    # - Spot B for (0,0,3): shifted +4 px spatially to (132, 128) at t_pred_3 -> directional angle ~ 0.20 deg!
+    #   In 2D broadband images, Spot A and Spot B overlap in the same patch around (128, 128) and cannot be resolved independently.
     rng = np.random.default_rng(12345)
     tof_lists_32: list[list[float]] = []
     for _p_idx in range(H * W):
-        # 2 background events per pixel across full ToF band
         bg_ev = rng.uniform(14000.0, 38000.0, size=2).astype(np.float32).tolist()
         tof_lists_32.append(bg_ev)
 
-    rel_shift_3 = 0.006  # +0.6% ToF shift within gate, zero pixel shift
+    rel_shift_2 = 0.006  # +0.6% radial ToF shift within gate, zero pixel shift
+    row_shift_3 = 4  # +4 px spatial offset on overlapping harmonic (0, 0, 3)
+    xyz_b = np.asarray(
+        det32.pixel_to_lab(128.0 + row_shift_3, 128.0), dtype=float
+    ).ravel()
+    kf_b = xyz_b / float(np.linalg.norm(xyz_b))
+    q_hat_b = (kf_b - ki_hat) / float(np.linalg.norm(kf_b - ki_hat))
+    expected_dir_deg_3 = float(
+        np.rad2deg(np.arccos(np.clip(np.dot(q_hat_b, q_hat), -1.0, 1.0)))
+    )
+
     for dr in range(-2, 3):
         for dc in range(-2, 3):
             w_sp = np.exp(-0.5 * (dr * dr + dc * dc) / (0.85**2))
             n_ev2 = round(65.0 * w_sp)
-            n_ev3 = round(65.0 * w_sp)
-            p_flat = (128 + dr) * W + (128 + dc)
+            n_ev3 = round(85.0 * w_sp)
             if n_ev2 > 0:
-                ev2 = rng.normal(t_pred_2, t_pred_2 * 0.0006, size=n_ev2).astype(
-                    np.float32
-                )
-                tof_lists_32[p_flat].extend(ev2.tolist())
+                p_flat_a = (128 + dr) * W + (128 + dc)
+                ev2 = rng.normal(
+                    t_pred_2 * (1.0 + rel_shift_2),
+                    t_pred_2 * 0.0006,
+                    size=n_ev2,
+                ).astype(np.float32)
+                tof_lists_32[p_flat_a].extend(ev2.tolist())
             if n_ev3 > 0:
+                p_flat_b = (128 + row_shift_3 + dr) * W + (128 + dc)
                 ev3 = rng.normal(
-                    t_pred_3 * (1.0 + rel_shift_3),
+                    t_pred_3,
                     t_pred_3 * 0.0006,
                     size=n_ev3,
                 ).astype(np.float32)
-                tof_lists_32[p_flat].extend(ev3.tolist())
+                tof_lists_32[p_flat_b].extend(ev3.tolist())
 
     img_19 = np.zeros((H, W), dtype=np.float32)
     tof_19 = np.zeros(0, dtype=np.float32)
@@ -9824,7 +9836,7 @@ def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
         inst_g.create_dataset("wavelength", data=np.array([1.8, 4.2], dtype=float))
         write_events(mf, [tof_19, tof_32], l1=l1_true)
 
-    # 1. Compare 2D image vs 3D ToF on the two exact-same-pixel harmonics (0,0,2) and (0,0,3):
+    # 1. Compare 2D image vs 3D ToF on the two same-ray harmonics (0,0,2) and (0,0,3):
     hkl_pair = np.array([[0, 0, 2], [0, 0, 3]], dtype=np.int32)
     bank_pair = np.array([32, 32], dtype=np.int32)
     pr_pair = np.array([128.0, 128.0], dtype=np.float64)
@@ -9845,10 +9857,9 @@ def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
     )
     assert ok_2d is True
     assert err_2d is not None
-    # In 2D broadband image, two harmonics on (128, 128) cannot detect radial ToF error (~0 deg)
-    assert np.all(err_2d[np.isfinite(err_2d)] < 0.05)
+    # In 2D broadband image, Spot A (128,128) and Spot B (132,128) blend into one composite centroid (> 0.08 deg error on (0,0,2)!)
+    assert float(err_2d[0]) > 0.08
 
-    # Fix an explicit gate [-0.015, +0.015] via replay_h5 tof_gate so both 0% and +0.6% spots sit cleanly inside core gate
     solve_h5 = tmp_path / "mandi_tof_3d_solve.h5"
     with h5py.File(solve_h5, "w") as sf:
         sf.attrs["instrument"] = "MANDI"
@@ -9885,17 +9896,14 @@ def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
     assert ok_3d is True
     assert err_3d is not None
     assert gate_meta is not None
-    # Both overlapping harmonics on pixel (128, 128) are resolved independently in 3D ToF!
+    # Both overlapping harmonics are resolved independently in 3D ToF!
     assert np.all(np.isfinite(err_3d))
-    # (0, 0, 2) has ~0 ToF & spatial error, while (0, 0, 3) has +0.6% radial q-norm error:
-    # Full 3D chord angle = 2 * arcsin(|1/(1+0.006) - 1| / 2) * 180/pi ~= 0.342 deg!
-    expected_3d_deg = float(
-        np.rad2deg(2.0 * np.arcsin(abs(1.0 / (1.0 + rel_shift_3) - 1.0) / 2.0))
-    )
-    assert float(err_3d[0]) < 0.06
-    assert abs(float(err_3d[1]) - expected_3d_deg) < 0.08
+    # (0, 0, 2) has +0.6% pure radial ToF shift and 0 spatial shift -> directional arccos(q_hat . G_hat) ~ 0.0 deg!
+    assert float(err_3d[0]) < 0.04
+    # (0, 0, 3) is captured 4 px off-center inside the full circular patch with exact directional unit-vector angle!
+    assert abs(float(err_3d[1]) - expected_dir_deg_3) < 0.04
 
-    # 2. Verify current L1 + L2 sensitivity: perturbing L1 by +0.30 m (+1% of 30m) shifts (0,0,2)'s 3D error upward!
+    # 2. Verify L1 + L2 flight-path sensitivity in 3D ToF gating: shifting L1 by +2.5 m (~8%) moves t_pred outside Spot A's gate!
     err_3d_bad_l1, ok_bad_l1, _ = _estimate_tof_gated_spot_angular_errors_deg(
         images_h5=str(merged_h5),
         replay_h5=str(solve_h5),
@@ -9910,27 +9918,28 @@ def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
         detectors={32: det32},
         ki_hat=ki_hat,
         instrument="MANDI",
-        tof_l1=l1_true + 0.30,
+        tof_l1=l1_true + 2.50,
         wavelength_range=(1.8, 4.2),
     )
     assert ok_bad_l1 is True and err_3d_bad_l1 is not None
-    assert float(err_3d_bad_l1[0]) > float(err_3d[0]) + 0.25
+    assert np.isnan(err_3d_bad_l1[0]) and np.isnan(err_3d_bad_l1[1])
 
-    # 3. Verify 3D Voronoi ownership: add a crowding neighbor whose G_pred sits right on Spot B's shifted q_obs!
-    #    Spot B has q_obs = G_003 / (1 + rel_shift_3). If an impostor reflection sits closer to q_obs than (0,0,3),
-    #    (0,0,3) loses 3D Voronoi ownership (becomes NaN).
+    # 3. Verify 3D Voronoi ownership & d_min convergence:
+    #    Place a higher-index reflection [1, 0, 3] right on Spot B's 3D q_obs = q_hat_b * (q_unit_norm / lam_3)!
+    #    When [1, 0, 3] enters the predicted shell (fine d_min), (0, 0, 3) loses its 4-px off-center false match (NaN)
+    #    and [1, 0, 3] claims Spot B with ~0.0 deg directional error!
+    q_obs_b_cryst = q_hat_b * (q_unit_norm / lam_3)
     ub_crowd = ub_mat.copy()
+    ub_crowd[:, 0] = q_obs_b_cryst - 3.0 * ub_mat[:, 2]
     hkl_crowd = np.array([[0, 0, 2], [0, 0, 3], [1, 0, 3]], dtype=np.int32)
-    # Place [1, 0, 3] (via tiny a* perturbation along q_hat) almost directly on Spot B's q_obs
-    ub_crowd[:, 0] = -rel_shift_3 * ub_mat[:, 2] * 3.0
     err_crowd, ok_crowd, _ = _estimate_tof_gated_spot_angular_errors_deg(
         images_h5=str(merged_h5),
         replay_h5=str(solve_h5),
         frame_slice=(0, 2),
         hkl_arr=hkl_crowd,
         bank_arr=np.array([32, 32, 32], dtype=np.int32),
-        pixel_r_arr=np.array([128.0, 128.0, 145.0], dtype=np.float64),
-        pixel_c_arr=np.array([128.0, 128.0, 145.0], dtype=np.float64),
+        pixel_r_arr=np.array([128.0, 128.0, 128.0 + row_shift_3], dtype=np.float64),
+        pixel_c_arr=np.array([128.0, 128.0, 128.0], dtype=np.float64),
         lam_arr=np.array([lam_2, lam_3, lam_3], dtype=np.float64),
         ub_matrix=ub_crowd,
         R_run=np.eye(3),
@@ -9941,10 +9950,11 @@ def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
         wavelength_range=(1.8, 4.2),
     )
     assert ok_crowd is True and err_crowd is not None
-    assert np.isfinite(err_crowd[0])
+    assert np.isfinite(err_crowd[0]) and float(err_crowd[0]) < 0.04
     assert np.isnan(
         err_crowd[1]
-    )  # stolen in 3D q-space Voronoi by closer lattice point!
+    )  # false 4-px match evicted in 3D q-space Voronoi by [1, 0, 3]!
+    assert np.isfinite(err_crowd[2]) and float(err_crowd[2]) < 0.04
 
     # 4. End-to-end payload + live API helper + client JS sync & 2D/3D guard
     d_cut_coarse = d_002 * 0.95  # admits (0,0,2) only
@@ -9999,16 +10009,19 @@ def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
     assert "32|0,0,3" not in live_coarse["errors"]
     assert "32|0,0,2" in live_fine["errors"] and "32|0,0,3" in live_fine["errors"]
 
-    # Shifting detector bank 32 center outward by 15 cm along kf_c via live detector_configs changes L2 (~0.5% of L1+L2) and shifts 3D error by ~0.28 deg!
+    # Shifting detector bank 32 laterally by +2.4 mm (~4 px) via live detector_configs aligns (0,0,3) onto Spot B and shifts (0,0,2) by ~0.20 deg!
     shifted_cfgs = json.loads(json.dumps(payload_tof["detector_configs"]))
+    v_hat_32 = np.asarray(shifted_cfgs["32"]["vhat"], dtype=float)
+    px_h = float(shifted_cfgs["32"]["height"]) / float(shifted_cfgs["32"]["n"])
     shifted_cfgs["32"]["center"] = (
-        np.asarray(shifted_cfgs["32"]["center"], dtype=float) + 0.15 * kf_c
+        np.asarray(shifted_cfgs["32"]["center"], dtype=float)
+        + row_shift_3 * px_h * v_hat_32
     ).tolist()
-    live_shifted_l2 = compute_live_tof_delta_theta_payload(
+    live_shifted_det = compute_live_tof_delta_theta_payload(
         images_h5=str(merged_h5),
         replay_h5=str(solve_h5),
         frame_index=0,
-        d_min=d_cut_coarse,
+        d_min=d_cut_fine,
         wavelength_range=(1.8, 4.2),
         ub_matrix=payload_tof["ub_matrix"],
         R_run=payload_tof["goniometer_R"],
@@ -10021,7 +10034,8 @@ def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
         tof_l1=l1_true,
     )
     assert (
-        live_shifted_l2["errors"]["32|0,0,2"] > live_coarse["errors"]["32|0,0,2"] + 0.15
+        live_shifted_det["errors"]["32|0,0,2"]
+        > live_coarse["errors"]["32|0,0,2"] + 0.12
     )
 
     if shutil.which("node"):
@@ -10031,6 +10045,7 @@ def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
         iife_end = js_src.rfind("})();")
         assert iife_end > 0
         live_fine_json = json.dumps(live_fine)
+        live_coarse_json = json.dumps(live_coarse)
         js_harness = """
 const elems = new Map();
 function makeEl(id = "") {
@@ -10102,24 +10117,39 @@ globalThis.document = {
 // 1. Verify 2D estimateActiveFrameAngularErrorsJS is strictly guarded in tof_3d mode!
 const guardCount = estimateActiveFrameAngularErrorsJS(PEAKS, true);
 
-// 2. Slide dMin down to d_cut_fine and apply live ToF 3D response via applyTofErrorsMapToPeaks
+// 2. Verify live fetch round-trip when sliding dMin down to d_cut_fine AND back to d_cut_coarse!
+const fetchCalls = [];
+globalThis.fetch = (url, opts) => {{
+  const body = JSON.parse(opts.body);
+  fetchCalls.push(body.d_min);
+  const respObj = Math.abs(body.d_min - {d_cut_fine:.6f}) < 1e-3 ? {live_fine_json} : {live_coarse_json};
+  return Promise.resolve({{ ok: true, json: () => Promise.resolve(respObj) }});
+}};
+
 state.dMin = {d_cut_fine:.6f};
 repredictPeaksDynamic({{ preserveSource: true }});
-const liveResp = {live_fine_json};
-const matchedCount = applyTofErrorsMapToPeaks(PEAKS, liveResp.errors || {{}});
-refreshZonesAngularStatsJS();
-syncTopBarTooltips();
-const p002 = PEAKS.find(p => p.bank === 32 && p.hkl[0] === 0 && p.hkl[1] === 0 && p.hkl[2] === 2);
-const p003 = PEAKS.find(p => p.bank === 32 && p.hkl[0] === 0 && p.hkl[1] === 0 && p.hkl[2] === 3);
-const pillTooltip = getEl("hud-rms-pill").title;
+scheduleLiveTofDeltaThetaSync(true);
 
-console.log(JSON.stringify({{
-  guardCount,
-  matchedCount,
-  err002: p002 ? p002.angular_error_deg : null,
-  err003: p003 ? p003.angular_error_deg : null,
-  pillTooltip,
-}}));
+setTimeout(() => {{
+  const p002 = PEAKS.find(p => p.bank === 32 && p.hkl[0] === 0 && p.hkl[1] === 0 && p.hkl[2] === 2);
+  const p003 = PEAKS.find(p => p.bank === 32 && p.hkl[0] === 0 && p.hkl[1] === 0 && p.hkl[2] === 3);
+  const pillTooltip = getEl("hud-rms-pill").title || getEl("hud-rms-pill").dataset.uiTip || "";
+
+  // Slide back to initial payload dMin and ensure it ALSO triggers a fresh sync!
+  state.dMin = {d_cut_coarse:.6f};
+  repredictPeaksDynamic({{ preserveSource: true }});
+  scheduleLiveTofDeltaThetaSync(true);
+
+  setTimeout(() => {{
+    console.log(JSON.stringify({{
+      guardCount,
+      fetchCalls,
+      err002: p002 ? p002.angular_error_deg : null,
+      err003: p003 ? p003.angular_error_deg : null,
+      pillTooltip,
+    }}));
+  }}, 15);
+}}, 15);
 }})();
 """
         js_path = tmp_path / "tof_3d_ui_test.js"
@@ -10131,10 +10161,11 @@ console.log(JSON.stringify({{
         )
         js_out = json.loads(proc.stdout.strip())
         assert js_out["guardCount"] == 0
-        assert js_out["matchedCount"] >= 2
-        assert js_out["err002"] is not None and float(js_out["err002"]) < 0.06
+        assert len(js_out["fetchCalls"]) == 2
+        assert js_out["err002"] is not None and float(js_out["err002"]) < 0.05
         assert (
             js_out["err003"] is not None
-            and abs(float(js_out["err003"]) - expected_3d_deg) < 0.08
+            and abs(float(js_out["err003"]) - expected_dir_deg_3) < 0.05
         )
         assert "3D ToF" in js_out["pillTooltip"]
+        assert "arccos" in js_out["pillTooltip"]

@@ -6780,7 +6780,11 @@ def _measure_or_cache_tof_gate(
                     )
                     np.add.at(hist, b_idx, 1.0)
 
-    gate_outer = gate_from_stack(edges, hist, coverage=0.95, min_z=4.5)
+    gate_outer = (
+        gate_from_stack(edges, hist, coverage=0.95, min_z=4.5)
+        if len(sample_idx) >= 25
+        else None
+    )
     gate_core = (
         gate_from_stack(edges, hist, coverage=0.70, min_z=4.5)
         if gate_outer is not None
@@ -6791,11 +6795,28 @@ def _measure_or_cache_tof_gate(
     if gate_core is None:
         gate_core = gate_outer
 
+    center_rel = 0.0
+    if str(gate_core.source) == "stack" and len(sample_idx) >= 25:
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        bg_bin = float(np.median(hist))
+        in_core = (centers >= float(gate_core.lo)) & (centers <= float(gate_core.hi))
+        if np.any(in_core):
+            w_core = np.maximum(0.0, hist[in_core] - bg_bin)
+            w_tot = float(np.sum(w_core))
+            if w_tot > 0.0:
+                center_rel = float(np.sum(w_core * centers[in_core]) / w_tot)
+
+    # Ensure core search gate spans at least ±1.2% around center_rel so reflections with
+    # 0.2°-0.4° angular offset (whose Bragg wavelength shifts by cot(theta)*d_theta) stay inside.
+    eff_core_lo = min(float(gate_outer.lo), center_rel - 0.012)
+    eff_core_hi = max(float(gate_outer.hi), center_rel + 0.012)
+
     meta = {
         "lo": round(float(gate_outer.lo), 5),
         "hi": round(float(gate_outer.hi), 5),
-        "core_lo": round(float(gate_core.lo), 5),
-        "core_hi": round(float(gate_core.hi), 5),
+        "core_lo": round(eff_core_lo, 5),
+        "core_hi": round(eff_core_hi, 5),
+        "center_rel": round(center_rel, 5),
         "source": str(gate_outer.source),
         "l1": round(float(l1_eff), 6),
     }
@@ -6828,12 +6849,12 @@ def _estimate_tof_gated_spot_angular_errors_deg(
     eval_mask: np.ndarray | None = None,
 ) -> tuple[np.ndarray | None, bool, dict[str, Any] | None]:
     """
-    Estimate 3D reciprocal-space angular errors ``Δθ`` [deg] for ToF reflections by
-    gating events around predicted ``t_pred(λ_pred, L1 + L2)``, placing background-
-    subtracted 3D ``(r, c, t)`` spot centroids into crystal ``q``-space using current
-    ``L1 + L2`` geometry, enforcing 3D ``cKDTree`` Voronoi ownership across all
-    predicted reflections on each bank, and evaluating
-    ``2 * arcsin(||q_obs - G_pred|| / (2 * ||G_pred||))``.
+    Estimate directional reciprocal-sphere angular errors ``Δθ`` [deg] for ToF
+    reflections by gating events around predicted ``t_pred(λ_pred, L1 + L2)``,
+    placing background-subtracted 3D ``(r, c, t)`` spot centroids into crystal
+    ``q``-space using current ``L1 + L2`` geometry, enforcing 3D ``cKDTree``
+    Voronoi ownership across all predicted reflections on each bank, and
+    evaluating ``arccos(q̂_obs · Ĝ_pred)``.
     """
     if (
         hkl_arr is None
@@ -6969,6 +6990,7 @@ def _estimate_tof_gated_spot_angular_errors_deg(
 
     g_lo = float(gate_meta["core_lo"])
     g_hi = float(gate_meta["core_hi"])
+    g_center_rel = float(gate_meta.get("center_rel", 0.0))
     sb_lo = float(gate_meta["lo"])
     sb_hi = float(gate_meta["hi"])
     gw_core = max(g_hi - g_lo, 1e-4)
@@ -6988,6 +7010,7 @@ def _estimate_tof_gated_spot_angular_errors_deg(
         gate_sig[:-1],
         round(g_lo, 6),
         round(g_hi, 6),
+        round(g_center_rel, 6),
         round(sb_lo, 6),
         round(sb_hi, 6),
         round(wl_lo, 5),
@@ -7008,8 +7031,6 @@ def _estimate_tof_gated_spot_angular_errors_deg(
         if eval_mask is not None and len(eval_mask) == n_peaks
         else None
     )
-    dr5 = np.array([0, -1, 1, 0, 0], dtype=np.int32)
-    dc5 = np.array([0, 0, 0, -1, 1], dtype=np.int32)
 
     for bk in np.unique(b_arr):
         bk_i = int(bk)
@@ -7065,186 +7086,202 @@ def _estimate_tof_gated_spot_angular_errors_deg(
                 r0 = np.rint(r_im[in_bounds]).astype(np.int32)
                 c0 = np.rint(c_im[in_bounds]).astype(np.int32)
 
-                # Stage 1: fast 5-pixel cross pre-screen in L3-cached bank event table
-                rr5 = np.clip(r0[:, None] + dr5[None, :], 0, H - 1)
-                cc5 = np.clip(c0[:, None] + dc5[None, :], 0, W - 1)
-                pf5 = rr5 * W + cc5
-                elo5 = ob[pf5]
-                ehi5 = ob[pf5 + 1]
-                tp5 = t_pred_all[idxs_in][:, None]
-                ia5 = _bsearch_tof_bank_left(
-                    tb, elo5, ehi5, (tp5 * (1.0 + g_lo)).astype(np.float32)
+                # Search full circular spatial patch so off-center spots (e.g. at coarse
+                # d_min before higher-order neighbors enter the predicted Voronoi shell)
+                # are captured anywhere inside rad, while 3x3 local clustering rejects
+                # scattered single-pixel Poisson background hits.
+                rad = max(3, min(10, round(0.028 * min(H, W))))
+                offs = np.arange(-rad, rad + 1, dtype=np.int32)
+                dr_g, dc_g = np.meshgrid(offs, offs, indexing="ij")
+                circ_bool = (dr_g * dr_g + dc_g * dc_g) <= (rad * rad)
+                circ_mask = circ_bool.astype(np.float32)
+
+                rr = np.clip(r0[:, None, None] + dr_g[None, :, :], 0, H - 1)
+                cc = np.clip(c0[:, None, None] + dc_g[None, :, :], 0, W - 1)
+                pf = rr * W + cc
+                elo = ob[pf]
+                ehi = ob[pf + 1]
+
+                tp_all = t_pred_all[idxs_in][:, None, None]
+                t_lo_all = (tp_all * (1.0 + g_lo)).astype(np.float32)
+                t_hi_all = (tp_all * (1.0 + g_hi)).astype(np.float32)
+                ia_all = _bsearch_tof_bank_left(
+                    tb, elo, ehi, np.broadcast_to(t_lo_all, elo.shape)
                 )
-                ib5 = _bsearch_tof_bank_left(
-                    tb, elo5, ehi5, (tp5 * (1.0 + g_hi)).astype(np.float32)
+                ib_all = _bsearch_tof_bank_left(
+                    tb, ia_all, ehi, np.broadcast_to(t_hi_all, elo.shape)
                 )
-                c5 = ib5 - ia5
-                bg5_px = np.mean(ehi5 - elo5, axis=1) * gate_band_frac
-                sum5 = np.sum(c5, axis=1)
+
+                pcls = pixel_class_by_bank.get(bk_i) if pixel_class_by_bank else None
+                valid_px_all = circ_mask[None, :, :]
+                if pcls is not None and pcls.shape == (H, W):
+                    valid_px_all = valid_px_all * (pcls[rr, cc] == 0).astype(np.float32)
+
+                cg_all = (ib_all - ia_all).astype(np.float32) * valid_px_all
+                s_row = cg_all[:, :-2, :] + cg_all[:, 1:-1, :] + cg_all[:, 2:, :]
+                box3_all = s_row[:, :, :-2] + s_row[:, :, 1:-1] + s_row[:, :, 2:]
+                max_box3 = np.max(box3_all, axis=(1, 2))
+                max_px = np.max(cg_all, axis=(1, 2))
+                n_vpx_all = np.maximum(np.sum(valid_px_all, axis=(1, 2)), 1.0)
+                bg_est = (
+                    np.sum((ehi - elo) * valid_px_all, axis=(1, 2)) / n_vpx_all
+                ) * gate_band_frac
                 cand = (
-                    (sum5 >= 4)
-                    & (np.max(c5, axis=1) >= 2)
+                    (max_px >= 2.0)
+                    & (max_box3 >= 5.0)
                     & (
-                        sum5
-                        >= 5.0 * bg5_px + 3.0 * np.sqrt(np.maximum(5.0 * bg5_px, 0.5))
+                        max_box3
+                        >= 9.0 * bg_est + 4.0 * np.sqrt(np.maximum(9.0 * bg_est, 0.45))
                     )
                 )
                 if np.any(cand):
                     idxs_c = idxs_in[cand]
-                    r0 = r0[cand]
-                    c0 = c0[cand]
+                    rr = rr[cand]
+                    cc = cc[cand]
+                    elo = elo[cand]
+                    ehi = ehi[cand]
+                    tp_k = tp_all[cand]
+                    t_lo = t_lo_all[cand]
+                    t_hi = t_hi_all[cand]
+                    ia = ia_all[cand]
+                    ib = ib_all[cand]
+                    cnt_gate = cg_all[cand]
+                    valid_px = (
+                        valid_px_all[cand]
+                        if valid_px_all.shape[0] > 1
+                        else valid_px_all
+                    )
+                    box3_c = box3_all[cand]
+                    max_box3_c = max_box3[cand]
 
-                    # Stage 2: circular spatial patch + ToF core gate & sideband background
-                    rad = max(3, min(10, round(0.028 * min(H, W))))
-                    offs = np.arange(-rad, rad + 1, dtype=np.int32)
-                    dr_g, dc_g = np.meshgrid(offs, offs, indexing="ij")
-                    circ_mask = ((dr_g * dr_g + dc_g * dc_g) <= (rad * rad)).astype(
-                        np.float32
+                    sb_f_lo0 = max(0.05, 1.0 + sb_lo - 2.5 * gw_outer)
+                    sb_f_lo1 = max(0.05, 1.0 + sb_lo - 0.5 * gw_outer)
+                    sb_f_hi0 = 1.0 + sb_hi + 0.5 * gw_outer
+                    sb_f_hi1 = 1.0 + sb_hi + 2.5 * gw_outer
+                    sb_span = max((sb_f_lo1 - sb_f_lo0) + (sb_f_hi1 - sb_f_hi0), 1e-4)
+
+                    isl0 = _bsearch_tof_bank_left(
+                        tb,
+                        elo,
+                        ehi,
+                        np.broadcast_to(
+                            (tp_k * sb_f_lo0).astype(np.float32), elo.shape
+                        ),
+                    )
+                    isl1 = _bsearch_tof_bank_left(
+                        tb,
+                        isl0,
+                        ehi,
+                        np.broadcast_to(
+                            (tp_k * sb_f_lo1).astype(np.float32), elo.shape
+                        ),
+                    )
+                    isr0 = _bsearch_tof_bank_left(
+                        tb,
+                        ib,
+                        ehi,
+                        np.broadcast_to(
+                            (tp_k * sb_f_hi0).astype(np.float32), elo.shape
+                        ),
+                    )
+                    isr1 = _bsearch_tof_bank_left(
+                        tb,
+                        isr0,
+                        ehi,
+                        np.broadcast_to(
+                            (tp_k * sb_f_hi1).astype(np.float32), elo.shape
+                        ),
                     )
 
-                    rr = np.clip(r0[:, None, None] + dr_g[None, :, :], 0, H - 1)
-                    cc = np.clip(c0[:, None, None] + dc_g[None, :, :], 0, W - 1)
-                    pf = rr * W + cc
-                    elo = ob[pf]
-                    ehi = ob[pf + 1]
+                    sum_tof = pb[ib] - pb[ia]
+                    cnt_sb = ((isl1 - isl0) + (isr1 - isr0)).astype(np.float32)
 
-                    tp_k = t_pred_all[idxs_c][:, None, None]
-                    t_lo = (tp_k * (1.0 + g_lo)).astype(np.float32)
-                    t_hi = (tp_k * (1.0 + g_hi)).astype(np.float32)
-                    ia = _bsearch_tof_bank_left(tb, elo, ehi, t_lo)
-                    ib = _bsearch_tof_bank_left(tb, elo, ehi, t_hi)
-
-                    cnt_gate_all = ib - ia
-                    core_keep = (np.max(cnt_gate_all, axis=(1, 2)) >= 2) & (
-                        np.sum(cnt_gate_all, axis=(1, 2)) >= 5
+                    n_vpx = np.maximum(
+                        np.sum(valid_px, axis=(1, 2), keepdims=True), 1.0
                     )
-                    if np.any(core_keep):
-                        idxs_c = idxs_c[core_keep]
-                        rr = rr[core_keep]
-                        cc = cc[core_keep]
-                        elo = elo[core_keep]
-                        ehi = ehi[core_keep]
-                        tp_k = tp_k[core_keep]
-                        t_lo = t_lo[core_keep]
-                        t_hi = t_hi[core_keep]
-                        ia = ia[core_keep]
-                        ib = ib[core_keep]
-                        cnt_gate = cnt_gate_all[core_keep].astype(np.float32)
+                    bg_sb = (
+                        np.sum(cnt_sb * valid_px, axis=(1, 2), keepdims=True) / n_vpx
+                    ) * (gw_core / sb_span)
+                    bg_sp = np.median(cnt_gate[:, circ_bool], axis=1)[:, None, None]
+                    bg = np.maximum(bg_sb, bg_sp)
 
-                        sb_f_lo0 = max(0.05, 1.0 + sb_lo - 2.5 * gw_outer)
-                        sb_f_lo1 = max(0.05, 1.0 + sb_lo - 0.5 * gw_outer)
-                        sb_f_hi0 = 1.0 + sb_hi + 0.5 * gw_outer
-                        sb_f_hi1 = 1.0 + sb_hi + 2.5 * gw_outer
-                        sb_span = max(
-                            (sb_f_lo1 - sb_f_lo0) + (sb_f_hi1 - sb_f_hi0), 1e-4
-                        )
+                    # Anchor centroid in a 3-pixel radius around the brightest 3x3 local
+                    # cluster so isolated noise hits elsewhere in the disk cannot pull it.
+                    flat_arg = np.argmax(box3_c.reshape(len(idxs_c), -1), axis=1)
+                    side3 = box3_c.shape[1]
+                    pk_r = (flat_arg // side3) + 1
+                    pk_c = (flat_arg % side3) + 1
+                    grid_i = np.arange(cnt_gate.shape[1], dtype=np.int32)[None, :, None]
+                    grid_j = np.arange(cnt_gate.shape[2], dtype=np.int32)[None, None, :]
+                    local_win = (
+                        (grid_i - pk_r[:, None, None]) ** 2
+                        + (grid_j - pk_c[:, None, None]) ** 2
+                    ) <= 9
 
-                        isl0 = _bsearch_tof_bank_left(
-                            tb, elo, ehi, (tp_k * sb_f_lo0).astype(np.float32)
-                        )
-                        isl1 = _bsearch_tof_bank_left(
-                            tb, elo, ehi, (tp_k * sb_f_lo1).astype(np.float32)
-                        )
-                        isr0 = _bsearch_tof_bank_left(
-                            tb, elo, ehi, (tp_k * sb_f_hi0).astype(np.float32)
-                        )
-                        isr1 = _bsearch_tof_bank_left(
-                            tb, elo, ehi, (tp_k * sb_f_hi1).astype(np.float32)
-                        )
+                    sig3 = max_box3_c - 9.0 * bg[:, 0, 0]
+                    z3 = sig3 / np.sqrt(np.maximum(9.0 * bg[:, 0, 0], 0.49))
 
-                        sum_tof = pb[ib] - pb[ia]
-                        cnt_sb = ((isl1 - isl0) + (isr1 - isr0)).astype(np.float32)
+                    thr = bg + np.maximum(0.5, 1.5 * np.sqrt(np.maximum(bg, 0.09)))
+                    excess = (
+                        np.maximum(0.0, cnt_gate - thr)
+                        * valid_px
+                        * local_win.astype(np.float32)
+                    )
+                    w = excess * excess
+                    w_sum = np.sum(w, axis=(1, 2))
 
-                        pcls = (
-                            pixel_class_by_bank.get(bk_i)
-                            if pixel_class_by_bank
-                            else None
-                        )
-                        valid_px = circ_mask[None, :, :]
-                        if pcls is not None and pcls.shape == (H, W):
-                            valid_px = valid_px * (pcls[rr, cc] == 0).astype(np.float32)
+                    has_spot = (w_sum > 0.0) & (sig3 >= 4.0) & (z3 >= 4.5)
+                    if np.any(has_spot):
+                        sel_local = np.flatnonzero(has_spot)
+                        sel_new = idxs_c[sel_local]
+                        w_sel = w[sel_local]
+                        ws_sel = w_sum[sel_local]
+                        r_cent_im = np.sum(w_sel * rr[sel_local], axis=(1, 2)) / ws_sel
+                        c_cent_im = np.sum(w_sel * cc[sel_local], axis=(1, 2)) / ws_sel
 
-                        n_vpx = np.maximum(
-                            np.sum(valid_px, axis=(1, 2), keepdims=True), 1.0
+                        t_mid = 0.5 * (t_lo[sel_local] + t_hi[sel_local])
+                        t_px = np.clip(
+                            (sum_tof[sel_local] - bg[sel_local] * t_mid)
+                            / np.maximum(cnt_gate[sel_local] - bg[sel_local], 1e-3),
+                            t_lo[sel_local],
+                            t_hi[sel_local],
                         )
-                        bg_sb = (
-                            np.sum(cnt_sb * valid_px, axis=(1, 2), keepdims=True)
-                            / n_vpx
-                        ) * (gw_core / sb_span)
-                        bg_sp = np.median(cnt_gate, axis=(1, 2), keepdims=True)
-                        bg = np.maximum(bg_sb, bg_sp)
-                        mad = 1.4826 * np.median(
-                            np.abs(cnt_gate - bg_sp), axis=(1, 2), keepdims=True
-                        )
-                        thr = bg + np.maximum(
-                            3.5 * mad,
-                            np.maximum(1.5, 2.5 * np.sqrt(np.maximum(bg, 0.25))),
-                        )
-                        excess = np.maximum(0.0, cnt_gate - thr) * valid_px
-                        w = excess * excess
-                        w_sum = np.sum(w, axis=(1, 2))
+                        t_cent = np.sum(w_sel * t_px, axis=(1, 2)) / ws_sel
+                        t_cent_debias = t_cent / max(1.0 + g_center_rel, 0.25)
 
-                        pos_m = excess > 0.0
-                        sig_ph = np.sum(
-                            np.maximum(0.0, cnt_gate - bg) * pos_m, axis=(1, 2)
-                        )
-                        n_spx = np.sum(pos_m.astype(np.float32), axis=(1, 2))
-                        z_sp = sig_ph / np.sqrt(np.maximum(n_spx * bg[:, 0, 0], 0.64))
-                        has_spot = (w_sum > 0.0) & (sig_ph >= 4.5) & (z_sp >= 4.5)
-                        if np.any(has_spot):
-                            sel_local = np.flatnonzero(has_spot)
-                            sel_new = idxs_c[sel_local]
-                            w_sel = w[sel_local]
-                            ws_sel = w_sum[sel_local]
-                            r_cent_im = (
-                                np.sum(w_sel * rr[sel_local], axis=(1, 2)) / ws_sel
+                        r_cent_det = r_cent_im / max(scale_r, 1e-9)
+                        c_cent_det = c_cent_im / max(scale_c, 1e-9)
+
+                        with contextlib.suppress(
+                            OSError,
+                            RuntimeError,
+                            ValueError,
+                            TypeError,
+                            KeyError,
+                            IndexError,
+                        ):
+                            xyz_obs = np.asarray(
+                                det.pixel_to_lab(r_cent_det, c_cent_det),
+                                dtype=float,
                             )
-                            c_cent_im = (
-                                np.sum(w_sel * cc[sel_local], axis=(1, 2)) / ws_sel
+                            if xyz_obs.ndim == 1:
+                                xyz_obs = xyz_obs.reshape(1, 3)
+                            rays_obs = xyz_obs - s_off[None, :]
+                            l2_obs = np.linalg.norm(rays_obs, axis=1)
+                            kf_obs = rays_obs / np.maximum(l2_obs[:, None], 1e-12)
+                            q_unit = kf_obs - ki_u[None, :]
+                            lam_obs = (t_cent_debias * ANGSTROM_M_PER_US) / np.maximum(
+                                l1_eff + l2_obs, 1e-6
                             )
-
-                            t_mid = 0.5 * (t_lo[sel_local] + t_hi[sel_local])
-                            t_px = np.clip(
-                                (sum_tof[sel_local] - bg[sel_local] * t_mid)
-                                / np.maximum(cnt_gate[sel_local] - bg[sel_local], 1e-3),
-                                t_lo[sel_local],
-                                t_hi[sel_local],
-                            )
-                            t_cent = np.sum(w_sel * t_px, axis=(1, 2)) / ws_sel
-
-                            r_cent_det = r_cent_im / max(scale_r, 1e-9)
-                            c_cent_det = c_cent_im / max(scale_c, 1e-9)
-
-                            with contextlib.suppress(
-                                OSError,
-                                RuntimeError,
-                                ValueError,
-                                TypeError,
-                                KeyError,
-                                IndexError,
-                            ):
-                                xyz_obs = np.asarray(
-                                    det.pixel_to_lab(r_cent_det, c_cent_det),
-                                    dtype=float,
+                            q_new = (
+                                q_unit / np.maximum(lam_obs[:, None], 1e-6)
+                            ) @ R_mat
+                            for gi, qv in zip(sel_new, q_new, strict=False):
+                                hits_map[int(hkl_packed_all[gi])] = (
+                                    float(qv[0]),
+                                    float(qv[1]),
+                                    float(qv[2]),
                                 )
-                                if xyz_obs.ndim == 1:
-                                    xyz_obs = xyz_obs.reshape(1, 3)
-                                rays_obs = xyz_obs - s_off[None, :]
-                                l2_obs = np.linalg.norm(rays_obs, axis=1)
-                                kf_obs = rays_obs / np.maximum(l2_obs[:, None], 1e-12)
-                                q_unit = kf_obs - ki_u[None, :]
-                                lam_obs = (t_cent * ANGSTROM_M_PER_US) / np.maximum(
-                                    l1_eff + l2_obs, 1e-6
-                                )
-                                q_new = (
-                                    q_unit / np.maximum(lam_obs[:, None], 1e-6)
-                                ) @ R_mat
-                                for gi, qv in zip(sel_new, q_new, strict=False):
-                                    hits_map[int(hkl_packed_all[gi])] = (
-                                        float(qv[0]),
-                                        float(qv[1]),
-                                        float(qv[2]),
-                                    )
 
         if not hits_map:
             continue
@@ -7274,13 +7311,14 @@ def _estimate_tof_gated_spot_angular_errors_deg(
 
         Gp_sel = G_pred[sel_global]
         Gn_sel = G_norm[sel_global]
-        chord_ratio = np.clip(
-            np.linalg.norm(q_obs_cryst - Gp_sel, axis=1)
-            / np.maximum(2.0 * Gn_sel, 1e-12),
-            0.0,
-            1.0,
-        )
-        out_err[sel_global] = np.rad2deg(2.0 * np.arcsin(chord_ratio))
+        qn_sel = np.linalg.norm(q_obs_cryst, axis=1)
+        valid_dir = (qn_sel > 1e-12) & (Gn_sel > 1e-12)
+        if np.any(valid_dir):
+            sel_v = sel_global[valid_dir]
+            q_hat_sel = q_obs_cryst[valid_dir] / qn_sel[valid_dir, None]
+            G_hat_sel = Gp_sel[valid_dir] / Gn_sel[valid_dir, None]
+            cos_ang = np.clip(np.sum(q_hat_sel * G_hat_sel, axis=1), -1.0, 1.0)
+            out_err[sel_v] = np.rad2deg(np.arccos(cos_ang))
 
     return out_err, True, gate_meta
 
@@ -13124,9 +13162,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       Math.abs(wlMax - Number(_payloadBaseParams.lamMax || 0)) > 1e-4
     );
     if (Boolean(DATA.has_tof_events) || DATA.angular_error_mode === "tof_3d") {{
-      if (shellChangedFromBase) {{
-        scheduleLiveTofDeltaThetaSync(false);
-      }}
+      scheduleLiveTofDeltaThetaSync(false);
     }} else {{
       estimateActiveFrameAngularErrorsJS(framePeaks, panelsGeom, Ractive, sActive, shellChangedFromBase);
     }}
@@ -13725,7 +13761,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0]);
     const sStr = sLab.map(v => Number(v || 0).toFixed(6)).join(",");
     const l1Val = typeof DATA.tof_l1 === "number" ? DATA.tof_l1.toFixed(5) : "auto";
-    return `${{activeRunIdx}}|${{Number(state.dMin || 0).toFixed(4)}}|${{Number(state.lamMin || 0).toFixed(4)}}|${{Number(state.lamMax || 0).toFixed(4)}}|${{ubStr}}|${{rStr}}|${{sStr}}|${{l1Val}}`;
+    const zTol = Number(state.zoneTolDeg || 0.75).toFixed(3);
+    return `${{activeRunIdx}}|${{Number(state.dMin || 0).toFixed(4)}}|${{Number(state.lamMin || 0).toFixed(4)}}|${{Number(state.lamMax || 0).toFixed(4)}}|${{zTol}}|${{ubStr}}|${{rStr}}|${{sStr}}|${{l1Val}}`;
   }}
 
   function applyTofErrorsMapToPeaks(peaks, errMap) {{
@@ -15953,8 +15990,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         rmsPill,
         isTof3d
           ? (stats.nErr > 0
-              ? `Δθ (3D ToF) = ${{stats.rmsText}} (across ${{stats.nErr}} ToF-gated 3D spots in active zones${{gateDesc}}): RMS 3D reciprocal-space angular error 2·arcsin(||q_obs − G_pred|| / 2||G_pred||) using current L1+L2 flight path`
-              : "Δθ (3D ToF): RMS 3D reciprocal-space angular error across ToF-gated active-zone spots (run 2. Solve or enable zones covering observed spots)")
+              ? `Δθ (3D ToF) = ${{stats.rmsText}} (across ${{stats.nErr}} ToF-gated 3D-matched spots in active zones${{gateDesc}}): RMS directional angle arccos(q̂_obs · Ĝ_pred) on the reciprocal sphere using 3D ToF peak placement & Voronoi matching`
+              : "Δθ (3D ToF): RMS directional angle arccos(q̂_obs · Ĝ_pred) across ToF-gated 3D-matched active-zone spots (run 2. Solve or enable zones covering observed spots)")
           : (stats.nErr > 0
               ? `Δθ = ${{stats.rmsText}} (across ${{stats.nErr}} matched detector spots in active zones): RMS angular offset between observed spot centroids and theoretical UB·hkl Bragg directions (lower = tighter indexing; updates live during Solve)`
               : "Δθ: RMS angular offset between observed detector spot centroids and theoretical UB·hkl Bragg directions across active-zone spots (run 2. Solve or enable zones covering observed spots)")
@@ -20414,12 +20451,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     PIPELINE.length = 0;
     nextPipeline.forEach(s => PIPELINE.push(s));
 
+    const shellDiffersFromBase = Boolean(
+      Math.abs(state.dMin - _payloadBaseParams.dMin) > 0.01 ||
+      Math.abs(state.lamMin - _payloadBaseParams.lamMin) > 0.01 ||
+      Math.abs(state.lamMax - _payloadBaseParams.lamMax) > 0.01
+    );
+    if (DATA.angular_error_mode === "tof_3d" && !shellDiffersFromBase) {{
+      _lastTofDeltaThetaSig = _buildTofDeltaThetaSig();
+    }}
     if (
       keepUserParams &&
       (
         state.dMin < _payloadBaseParams.dMin - 0.01 ||
         state.lamMin < _payloadBaseParams.lamMin - 0.01 ||
-        state.lamMax > _payloadBaseParams.lamMax + 0.01
+        state.lamMax > _payloadBaseParams.lamMax + 0.01 ||
+        ((Boolean(DATA.has_tof_events) || DATA.angular_error_mode === "tof_3d") && shellDiffersFromBase)
       )
     ) {{
       repredictPeaksDynamic({{ preserveSource: true }});
@@ -25085,6 +25131,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     barResizeObserver.observe(document.body);
   }}
 
+  if (DATA.angular_error_mode === "tof_3d") {{
+    _lastTofDeltaThetaSig = _buildTofDeltaThetaSig();
+  }}
   renderFrameSelector();
   renderZoneList();
   renderPipeline();
