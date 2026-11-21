@@ -6388,6 +6388,1392 @@ def _estimate_image_spot_angular_errors_deg(
     return out_err, True
 
 
+_SPOT_TOF_SLAB_CACHE: dict[
+    tuple[str, int, int, int],
+    dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]],
+] = {}
+_SPOT_TOF_GATE_CACHE: dict[tuple[Any, ...], dict[str, Any]] = {}
+_SPOT_TOF_OBS_Q_CACHE: dict[
+    tuple[Any, ...],
+    dict[int, tuple[set[int], dict[int, tuple[float, float, float]]]],
+] = {}
+_LIVE_RAYCAST_SHELL_CACHE: dict[
+    tuple[Any, ...], tuple[float, dict[str, np.ndarray], np.ndarray]
+] = {}
+_REMOTE_TOF_SLAB_LOADER: Any = None
+
+
+def _pack_hkl_int64(hkl_arr: np.ndarray) -> np.ndarray:
+    """Pack integer Miller indices ``(N, 3)`` in ``[-2048, 2047]`` into unique ``int64`` keys."""
+    h = np.asarray(hkl_arr[:, 0], dtype=np.int64) + 2048
+    k = np.asarray(hkl_arr[:, 1], dtype=np.int64) + 2048
+    l = np.asarray(hkl_arr[:, 2], dtype=np.int64) + 2048
+    return (h << 26) | (k << 13) | l
+
+
+def _detector_and_mask_signature(
+    detectors: dict[int, Any],
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+) -> bytes:
+    """Compute a fast 16-byte digest covering all active detector banks and pixel masks."""
+    import hashlib
+
+    h = hashlib.blake2b(digest_size=16)
+    for bid in sorted(detectors):
+        det = detectors[bid]
+        h.update(int(bid).to_bytes(4, "little", signed=True))
+        for attr in ("n", "m", "width", "height", "radius"):
+            val = getattr(det, attr, None)
+            if val is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    h.update(np.float64(float(val)).tobytes())
+        for vec_attr in ("center", "uhat", "vhat", "rhat"):
+            vec = getattr(det, vec_attr, None)
+            if vec is not None:
+                with contextlib.suppress(TypeError, ValueError):
+                    h.update(np.asarray(vec, dtype=np.float64).ravel().tobytes())
+    if pixel_class_by_bank:
+        for bid in sorted(pixel_class_by_bank):
+            arr = pixel_class_by_bank[bid]
+            if arr is not None:
+                h.update(int(bid).to_bytes(4, "little", signed=True))
+                h.update(repr(arr.shape).encode("ascii"))
+                h.update(int(np.sum(arr)).to_bytes(8, "little", signed=False))
+    return h.digest()
+
+
+def register_remote_tof_slab_loader(loader_fn: Any) -> None:
+    """Register an optional callback ``loader_fn(images_h5, f0, f1)`` for slimmed remote HDF5s."""
+    global _REMOTE_TOF_SLAB_LOADER
+    _REMOTE_TOF_SLAB_LOADER = loader_fn
+
+
+def _resolve_tof_l1(
+    *candidates: str | os.PathLike[str] | None,
+    instrument: str = "IMAGINE",
+    explicit_l1: float | None = None,
+) -> float | None:
+    """Resolve current moderator-to-sample flight distance ``L1`` [m] consistently with ``tof_gate``."""
+    if explicit_l1 is not None:
+        try:
+            v = float(explicit_l1)
+            if np.isfinite(v) and v > 0.0:
+                return v
+        except (TypeError, ValueError):
+            pass
+
+    import h5py
+
+    seen: set[str] = set()
+    queue: list[str] = [str(p) for p in candidates if p and os.path.isfile(str(p))]
+    while queue:
+        cur = os.path.abspath(queue.pop(0))
+        if cur in seen or not os.path.isfile(cur):
+            continue
+        seen.add(cur)
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError, TypeError),
+            h5py.File(cur, "r") as hf,
+        ):
+            for ds_key in ("detector_calibration/L1", "instrument/L1"):
+                if ds_key in hf:
+                    v = float(np.asarray(hf[ds_key][()]).ravel()[0])
+                    if np.isfinite(v) and v > 0.0:
+                        return v
+            if (
+                "detector_calibration" in hf
+                and "L1" in hf["detector_calibration"].attrs
+            ):
+                v = float(hf["detector_calibration"].attrs["L1"])
+                if np.isfinite(v) and v > 0.0:
+                    return v
+            if "tof_gate" in hf and "L1" in hf["tof_gate"].attrs:
+                v = float(hf["tof_gate"].attrs["L1"])
+                if np.isfinite(v) and v > 0.0:
+                    return v
+            if "L1" in hf.attrs:
+                v = float(hf.attrs["L1"])
+                if np.isfinite(v) and v > 0.0:
+                    return v
+            src_attr = hf.attrs.get("source")
+            if src_attr:
+                src_str = (
+                    src_attr.decode("utf-8", errors="ignore")
+                    if isinstance(src_attr, (bytes, np.bytes_))
+                    else str(src_attr)
+                ).strip()
+                if src_str and os.path.isfile(src_str):
+                    queue.append(src_str)
+
+    with contextlib.suppress(ImportError, KeyError, TypeError, ValueError):
+        from subhkl.config import reduction_settings
+
+        v_cfg = reduction_settings.get(str(instrument), {}).get("L1")
+        if v_cfg is not None and float(v_cfg) > 0.0:
+            return float(v_cfg)
+    return None
+
+
+def _h5_has_tof_events(*candidates: str | os.PathLike[str] | None) -> bool:
+    """Return True if any candidate HDF5 carries ``events/tof`` or a slimmed ``has_tof_events`` stamp."""
+    import h5py
+
+    seen: set[str] = set()
+    queue: list[str] = [str(p) for p in candidates if p and os.path.isfile(str(p))]
+    while queue:
+        cur = os.path.abspath(queue.pop(0))
+        if cur in seen or not os.path.isfile(cur):
+            continue
+        seen.add(cur)
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(cur, "r") as hf,
+        ):
+            if bool(hf.attrs.get("has_tof_events")) or (
+                "events/tof" in hf and "events/image_offsets" in hf
+            ):
+                return True
+            src_attr = hf.attrs.get("source")
+            if src_attr:
+                src_str = (
+                    src_attr.decode("utf-8", errors="ignore")
+                    if isinstance(src_attr, (bytes, np.bytes_))
+                    else str(src_attr)
+                ).strip()
+                if src_str and os.path.isfile(src_str):
+                    queue.append(src_str)
+    return False
+
+
+def _resolve_images_h5_with_events(
+    images_h5: str | os.PathLike[str] | None,
+    replay_h5: str | os.PathLike[str] | None = None,
+) -> str | None:
+    """Resolve the HDF5 file carrying detector images + ToF events (following ``source`` attr if needed)."""
+    import h5py
+
+    for cand in (images_h5, replay_h5):
+        if not cand or not os.path.isfile(str(cand)):
+            continue
+        abs_p = os.path.abspath(str(cand))
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(abs_p, "r") as hf,
+        ):
+            if ("events/tof" in hf and "events/image_offsets" in hf) or bool(
+                hf.attrs.get("has_tof_events")
+            ):
+                return abs_p
+            src_attr = hf.attrs.get("source")
+            if src_attr:
+                src_str = (
+                    src_attr.decode("utf-8", errors="ignore")
+                    if isinstance(src_attr, (bytes, np.bytes_))
+                    else str(src_attr)
+                ).strip()
+                if src_str and os.path.isfile(src_str):
+                    with (
+                        contextlib.suppress(
+                            OSError, RuntimeError, ValueError, KeyError
+                        ),
+                        h5py.File(src_str, "r") as hf_src,
+                    ):
+                        if (
+                            "events/tof" in hf_src and "events/image_offsets" in hf_src
+                        ) or bool(hf_src.attrs.get("has_tof_events")):
+                            return os.path.abspath(src_str)
+    return str(images_h5) if images_h5 and os.path.isfile(str(images_h5)) else None
+
+
+def _load_cached_frame_tof_events(
+    images_h5: str | os.PathLike[str] | None,
+    frame_slice: tuple[int, int] | None,
+) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]]:
+    """Load and LRU-cache per-bank L3-friendly ``(tof_f32, pixel_off_i32, cumsum_tof_f64, (H, W))``."""
+    if not images_h5 or not os.path.isfile(str(images_h5)):
+        return {}
+    try:
+        import h5py
+
+        from subhkl.io.events import EventStore, has_events
+
+        abs_p = os.path.abspath(str(images_h5))
+        mtime_ns = int(os.stat(abs_p).st_mtime_ns)
+        with h5py.File(abs_p, "r") as hf:
+            ims = hf.get("images") or hf.get("entry/data/data")
+            if ims is None or len(ims) == 0:
+                return {}
+            n_tot = len(ims)
+            if "bank_ids" in hf:
+                b_ids = np.asarray(hf["bank_ids"][()], dtype=int).ravel()
+            elif "banks" in hf:
+                b_ids = np.asarray(hf["banks"][()], dtype=int).ravel()
+            else:
+                b_ids = np.arange(1, n_tot + 1, dtype=int)
+            if len(b_ids) > 0 and len(b_ids) < n_tot:
+                b_ids = np.resize(b_ids, n_tot)
+            elif len(b_ids) == 0:
+                b_ids = np.arange(1, n_tot + 1, dtype=int)
+            if frame_slice is not None:
+                f0 = max(0, min(int(frame_slice[0]), n_tot))
+                f1 = max(f0, min(int(frame_slice[1]), n_tot))
+            elif "file_offsets" in hf:
+                offsets = np.asarray(hf["file_offsets"][()], dtype=int)
+                if len(offsets) > 1:
+                    counts = np.diff(np.append(offsets, n_tot))
+                    best_r = int(np.argmax(counts))
+                    f0 = int(offsets[best_r])
+                    f1 = int(offsets[best_r] + counts[best_r])
+                else:
+                    f0, f1 = 0, n_tot
+            else:
+                f0, f1 = 0, n_tot
+            if f1 <= f0:
+                return {}
+
+            cache_key = (abs_p, mtime_ns, f0, f1)
+            cached = _SPOT_TOF_SLAB_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+
+            imgs_slab = np.asarray(ims[f0:f1])
+            b_slice = b_ids[f0:f1]
+            has_slim_remote = bool(hf.attrs.get("has_tof_events")) and not (
+                "events/tof" in hf and "events/image_offsets" in hf
+            )
+
+        tof_slab: np.ndarray | None = None
+        off_slab: np.ndarray | None = None
+        if has_events(abs_p):
+            with EventStore(abs_p) as store:
+                tof_slab, off_slab, _ = store.read_slab(
+                    np.arange(f0, f1, dtype=np.int64), imgs_slab
+                )
+        elif has_slim_remote and callable(_REMOTE_TOF_SLAB_LOADER):
+            remote_res = _REMOTE_TOF_SLAB_LOADER(abs_p, f0, f1, imgs_slab)
+            if remote_res is not None:
+                tof_slab, off_slab = remote_res
+
+        if tof_slab is None or off_slab is None or len(tof_slab) == 0:
+            return {}
+
+        bank_tof_map: dict[
+            int, tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]
+        ] = {}
+        for rel_i, bk_raw in enumerate(b_slice):
+            bk = int(bk_raw)
+            im_i = imgs_slab[rel_i]
+            if im_i.ndim != 2:
+                continue
+            s0 = int(off_slab[rel_i, 0])
+            s1 = int(off_slab[rel_i, -1])
+            if bk in bank_tof_map and len(bank_tof_map[bk][0]) >= (s1 - s0):
+                continue
+            tb = np.ascontiguousarray(tof_slab[s0:s1], dtype=np.float32)
+            ob = np.ascontiguousarray(off_slab[rel_i] - s0, dtype=np.int32)
+            pb = np.empty(len(tb) + 1, dtype=np.float64)
+            pb[0] = 0.0
+            if len(tb) > 0:
+                np.cumsum(tb, dtype=np.float64, out=pb[1:])
+            bank_tof_map[bk] = (tb, ob, pb, (int(im_i.shape[0]), int(im_i.shape[1])))
+
+        if bank_tof_map:
+            if len(_SPOT_TOF_SLAB_CACHE) >= 2:
+                _SPOT_TOF_SLAB_CACHE.pop(next(iter(_SPOT_TOF_SLAB_CACHE)))
+            _SPOT_TOF_SLAB_CACHE[cache_key] = bank_tof_map
+        return bank_tof_map
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError):
+        return {}
+
+
+def _bsearch_tof_bank_left(
+    tof_b: np.ndarray,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    target: np.ndarray,
+) -> np.ndarray:
+    """Vectorized lower-bound binary search within per-pixel event slices ``[lo, hi)``."""
+    if lo.size == 0 or len(tof_b) == 0:
+        return lo.copy()
+    max_len = int(np.max(hi - lo))
+    if max_len <= 0:
+        return lo.copy()
+    n_steps = int(max_len - 1).bit_length()
+    l_idx = lo.copy()
+    r_idx = hi.copy()
+    n_tot_m1 = len(tof_b) - 1
+    for _ in range(n_steps):
+        mid = (l_idx + r_idx) >> 1
+        safe = np.minimum(mid, n_tot_m1)
+        cond = (mid < r_idx) & (tof_b[safe] < target)
+        l_idx = np.where(cond, mid + 1, l_idx)
+        r_idx = np.where(cond, r_idx, mid)
+    return l_idx
+
+
+def _measure_or_cache_tof_gate(
+    *,
+    cache_sig: tuple[Any, ...] | None,
+    bank_tof_map: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int]]],
+    b_arr: np.ndarray,
+    r_im_by_peak: np.ndarray,
+    c_im_by_peak: np.ndarray,
+    t_pred_arr: np.ndarray,
+    d_spacing_arr: np.ndarray,
+    l1_eff: float,
+) -> dict[str, Any]:
+    """Measure (and LRU-cache) stacked relative ToF gates consistent with ``tof_gate.gate_from_stack``."""
+    if cache_sig is not None and cache_sig in _SPOT_TOF_GATE_CACHE:
+        return _SPOT_TOF_GATE_CACHE[cache_sig]
+
+    from subhkl.search.tof_gate import TofGate, gate_from_stack
+
+    valid_idx = np.flatnonzero(
+        np.isfinite(t_pred_arr)
+        & (t_pred_arr > 1.0)
+        & np.isfinite(r_im_by_peak)
+        & np.isfinite(c_im_by_peak)
+    )
+    if len(valid_idx) > 3000:
+        order = np.argsort(-d_spacing_arr[valid_idx])[:3000]
+        sample_idx = valid_idx[order]
+    else:
+        sample_idx = valid_idx
+
+    search_half = 0.045
+    n_bins = 90
+    edges = np.linspace(-search_half, search_half, n_bins + 1)
+    inv_bin = float(n_bins) / (2.0 * search_half)
+    hist = np.zeros(n_bins, dtype=np.float64)
+
+    for idx in sample_idx:
+        bd = bank_tof_map.get(int(b_arr[idx]))
+        if bd is None:
+            continue
+        tb, ob, _, (H, W) = bd
+        if len(tb) == 0:
+            continue
+        r0 = round(float(r_im_by_peak[idx]))
+        c0 = round(float(c_im_by_peak[idx]))
+        if r0 < 2 or r0 >= H - 2 or c0 < 2 or c0 >= W - 2:
+            continue
+        tp = float(t_pred_arr[idx])
+        t_lo_s = tp * (1.0 - search_half)
+        t_hi_s = tp * (1.0 + search_half)
+        for dr in range(-2, 3):
+            row_off = (r0 + dr) * W
+            for dc in range(-2, 3):
+                p = row_off + (c0 + dc)
+                e0 = int(ob[p])
+                e1 = int(ob[p + 1])
+                if e1 <= e0:
+                    continue
+                sub = tb[e0:e1]
+                i0 = int(np.searchsorted(sub, t_lo_s, side="left"))
+                i1 = int(np.searchsorted(sub, t_hi_s, side="right"))
+                if i1 > i0:
+                    rel = (sub[i0:i1].astype(np.float64) / tp) - 1.0
+                    b_idx = np.clip(
+                        ((rel + search_half) * inv_bin).astype(np.int32),
+                        0,
+                        n_bins - 1,
+                    )
+                    np.add.at(hist, b_idx, 1.0)
+
+    gate_outer = gate_from_stack(edges, hist, coverage=0.95, min_z=4.5)
+    gate_core = (
+        gate_from_stack(edges, hist, coverage=0.70, min_z=4.5)
+        if gate_outer is not None
+        else None
+    )
+    if gate_outer is None:
+        gate_outer = TofGate(-0.015, 0.015, source="fallback", coverage=None)
+    if gate_core is None:
+        gate_core = gate_outer
+
+    meta = {
+        "lo": round(float(gate_outer.lo), 5),
+        "hi": round(float(gate_outer.hi), 5),
+        "core_lo": round(float(gate_core.lo), 5),
+        "core_hi": round(float(gate_core.hi), 5),
+        "source": str(gate_outer.source),
+        "l1": round(float(l1_eff), 6),
+    }
+    if cache_sig is not None:
+        if len(_SPOT_TOF_GATE_CACHE) >= 16:
+            _SPOT_TOF_GATE_CACHE.pop(next(iter(_SPOT_TOF_GATE_CACHE)))
+        _SPOT_TOF_GATE_CACHE[cache_sig] = meta
+    return meta
+
+
+def _estimate_tof_gated_spot_angular_errors_deg(
+    *,
+    images_h5: str | os.PathLike[str] | None,
+    replay_h5: str | os.PathLike[str] | None = None,
+    frame_slice: tuple[int, int] | None,
+    hkl_arr: np.ndarray | None,
+    bank_arr: np.ndarray | None,
+    pixel_r_arr: np.ndarray | None,
+    pixel_c_arr: np.ndarray | None,
+    lam_arr: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None,
+    R_run: np.ndarray | None,
+    detectors: dict[int, Any],
+    ki_hat: np.ndarray,
+    sample_offset_lab: Any = None,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+    instrument: str = "IMAGINE",
+    tof_l1: float | None = None,
+    wavelength_range: tuple[float, float] | None = None,
+    eval_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, bool, dict[str, Any] | None]:
+    """
+    Estimate 3D reciprocal-space angular errors ``Δθ`` [deg] for ToF reflections by
+    gating events around predicted ``t_pred(λ_pred, L1 + L2)``, placing background-
+    subtracted 3D ``(r, c, t)`` spot centroids into crystal ``q``-space using current
+    ``L1 + L2`` geometry, enforcing 3D ``cKDTree`` Voronoi ownership across all
+    predicted reflections on each bank, and evaluating
+    ``2 * arcsin(||q_obs - G_pred|| / (2 * ||G_pred||))``.
+    """
+    if (
+        hkl_arr is None
+        or bank_arr is None
+        or pixel_r_arr is None
+        or pixel_c_arr is None
+        or ub_matrix is None
+        or not detectors
+        or len(hkl_arr) == 0
+    ):
+        return None, False, None
+
+    ev_h5 = _resolve_images_h5_with_events(images_h5, replay_h5)
+    if not ev_h5:
+        return None, False, None
+
+    l1_base = _resolve_tof_l1(
+        replay_h5,
+        ev_h5,
+        images_h5,
+        instrument=instrument,
+        explicit_l1=tof_l1,
+    )
+    if l1_base is None or l1_base <= 0.0:
+        return None, False, None
+
+    bank_tof_map = _load_cached_frame_tof_events(ev_h5, frame_slice)
+    if not bank_tof_map:
+        return None, False, None
+
+    from scipy.spatial import cKDTree
+
+    from subhkl.io.events import ANGSTROM_M_PER_US
+    from subhkl.search.tof_gate import predicted_tof
+
+    n_peaks = len(hkl_arr)
+    out_err = np.full(n_peaks, np.nan, dtype=float)
+    ub_mat = np.asarray(ub_matrix, dtype=float)
+    R_mat = (
+        np.asarray(R_run, dtype=float)
+        if R_run is not None and np.asarray(R_run).ndim == 2
+        else np.eye(3, dtype=float)
+    )
+    s_off = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else np.zeros(3, dtype=float)
+    )
+    ki_u = np.asarray(ki_hat, dtype=float).ravel()[:3]
+    ki_n = float(np.linalg.norm(ki_u))
+    ki_u = ki_u / max(ki_n, 1e-12)
+    l1_eff = max(0.05, float(l1_base) + float(np.dot(s_off, ki_u)))
+
+    G_pred = np.asarray(hkl_arr, dtype=float) @ ub_mat.T
+    G_norm = np.linalg.norm(G_pred, axis=1)
+    d_all = 1.0 / np.maximum(G_norm, 1e-12)
+
+    b_arr = np.asarray(bank_arr, dtype=int)
+    r_arr = np.asarray(pixel_r_arr, dtype=float)
+    c_arr = np.asarray(pixel_c_arr, dtype=float)
+
+    if lam_arr is not None and len(lam_arr) == n_peaks:
+        lam_pred = np.asarray(lam_arr, dtype=np.float64)
+    else:
+        G_lab = G_pred @ R_mat.T
+        G_sq = np.maximum(G_norm * G_norm, 1e-12)
+        lam_pred = np.maximum(1e-4, -2.0 * (G_lab @ ki_u) / G_sq)
+
+    l2_pred = np.zeros(n_peaks, dtype=np.float64)
+    r_im_all = np.full(n_peaks, np.nan, dtype=np.float64)
+    c_im_all = np.full(n_peaks, np.nan, dtype=np.float64)
+    scale_by_bank: dict[int, tuple[float, float]] = {}
+
+    for bk in np.unique(b_arr):
+        bk_i = int(bk)
+        bd = bank_tof_map.get(bk_i)
+        det = detectors.get(bk_i)
+        if bd is None or det is None:
+            continue
+        _, _, _, (H, W) = bd
+        det_n = max(1, int(getattr(det, "n", H)))
+        det_m = max(1, int(getattr(det, "m", W)))
+        scale_r = (H - 1) / max(det_n - 1, 1) if det_n > 1 else 1.0
+        scale_c = (W - 1) / max(det_m - 1, 1) if det_m > 1 else 1.0
+        scale_by_bank[bk_i] = (scale_r, scale_c)
+
+        m_bk = b_arr == bk_i
+        r_im_all[m_bk] = r_arr[m_bk] * scale_r
+        c_im_all[m_bk] = c_arr[m_bk] * scale_c
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError, IndexError
+        ):
+            xyz_p = np.asarray(det.pixel_to_lab(r_arr[m_bk], c_arr[m_bk]), dtype=float)
+            if xyz_p.ndim == 1:
+                xyz_p = xyz_p.reshape(1, 3)
+            l2_pred[m_bk] = np.linalg.norm(xyz_p - s_off[None, :], axis=1)
+
+    t_pred_all = np.where(
+        l2_pred > 1e-6,
+        predicted_tof(lam_pred, l1_eff, l2_pred),
+        np.nan,
+    )
+
+    try:
+        mtime_ev = int(os.stat(ev_h5).st_mtime_ns)
+    except OSError:
+        mtime_ev = 0
+    geom_mask_sig = _detector_and_mask_signature(detectors, pixel_class_by_bank)
+    n_fin_t = int(np.count_nonzero(np.isfinite(t_pred_all)))
+    n_valid_gate_bucket = min(300, n_fin_t)
+    gate_sig = (
+        ev_h5,
+        mtime_ev,
+        tuple(frame_slice) if frame_slice is not None else (-1, -1),
+        np.asarray(ub_mat, dtype=np.float64).tobytes(),
+        np.asarray(R_mat, dtype=np.float64).tobytes(),
+        np.asarray(s_off, dtype=np.float64).tobytes(),
+        np.asarray(ki_u, dtype=np.float64).tobytes(),
+        geom_mask_sig,
+        round(float(l1_eff), 6),
+        n_valid_gate_bucket,
+    )
+    gate_meta = _measure_or_cache_tof_gate(
+        cache_sig=gate_sig,
+        bank_tof_map=bank_tof_map,
+        b_arr=b_arr,
+        r_im_by_peak=r_im_all,
+        c_im_by_peak=c_im_all,
+        t_pred_arr=t_pred_all,
+        d_spacing_arr=d_all,
+        l1_eff=l1_eff,
+    )
+
+    g_lo = float(gate_meta["core_lo"])
+    g_hi = float(gate_meta["core_hi"])
+    sb_lo = float(gate_meta["lo"])
+    sb_hi = float(gate_meta["hi"])
+    gw_core = max(g_hi - g_lo, 1e-4)
+    gw_outer = max(sb_hi - sb_lo, 1e-4)
+
+    if wavelength_range is not None and len(wavelength_range) >= 2:
+        wl_lo = max(0.05, float(wavelength_range[0]))
+        wl_hi = max(wl_lo + 0.05, float(wavelength_range[1]))
+    else:
+        fin_lam = lam_pred[np.isfinite(lam_pred) & (lam_pred > 0)]
+        wl_lo = float(np.min(fin_lam)) if len(fin_lam) else 1.0
+        wl_hi = float(np.max(fin_lam)) if len(fin_lam) else 4.0
+    band_log_span = max(float(np.log(max(wl_hi / max(wl_lo, 0.05), 1.05))), 0.12)
+    gate_band_frac = min(0.5, gw_core / band_log_span)
+
+    obs_q_sig = (
+        gate_sig[:-1],
+        round(g_lo, 6),
+        round(g_hi, 6),
+        round(sb_lo, 6),
+        round(sb_hi, 6),
+        round(wl_lo, 5),
+        round(wl_hi, 5),
+    )
+    obs_q_by_bank = _SPOT_TOF_OBS_Q_CACHE.get(obs_q_sig)
+    if obs_q_by_bank is None:
+        obs_q_by_bank = {}
+        if len(_SPOT_TOF_OBS_Q_CACHE) >= 4:
+            _SPOT_TOF_OBS_Q_CACHE.pop(next(iter(_SPOT_TOF_OBS_Q_CACHE)))
+        _SPOT_TOF_OBS_Q_CACHE[obs_q_sig] = obs_q_by_bank
+
+    hkl_int = np.asarray(hkl_arr, dtype=np.int32)
+    hkl_packed_all = _pack_hkl_int64(hkl_int)
+
+    ev_mask_bool = (
+        np.asarray(eval_mask, dtype=bool)
+        if eval_mask is not None and len(eval_mask) == n_peaks
+        else None
+    )
+    dr5 = np.array([0, -1, 1, 0, 0], dtype=np.int32)
+    dc5 = np.array([0, 0, 0, -1, 1], dtype=np.int32)
+
+    for bk in np.unique(b_arr):
+        bk_i = int(bk)
+        bd = bank_tof_map.get(bk_i)
+        det = detectors.get(bk_i)
+        scales = scale_by_bank.get(bk_i)
+        if bd is None or det is None or scales is None:
+            continue
+        tb, ob, pb, (H, W) = bd
+        if len(tb) == 0 or H < 8 or W < 8:
+            continue
+        scale_r, scale_c = scales
+
+        idxs_all = np.flatnonzero(
+            (b_arr == bk_i) & (G_norm > 1e-8) & np.isfinite(t_pred_all)
+        )
+        if len(idxs_all) == 0:
+            continue
+
+        if ev_mask_bool is not None:
+            idxs_eval = idxs_all[ev_mask_bool[idxs_all]]
+        else:
+            idxs_eval = idxs_all
+        if len(idxs_eval) == 0:
+            continue
+
+        bk_cache = obs_q_by_bank.get(bk_i)
+        if bk_cache is None:
+            bk_cache = (set(), {})
+            obs_q_by_bank[bk_i] = bk_cache
+        probed_set, hits_map = bk_cache
+
+        keys_eval = hkl_packed_all[idxs_eval]
+        if probed_set:
+            unprobed_mask = np.fromiter(
+                (int(k) not in probed_set for k in keys_eval),
+                dtype=bool,
+                count=len(keys_eval),
+            )
+            idxs_probe = idxs_eval[unprobed_mask]
+        else:
+            idxs_probe = idxs_eval
+
+        if len(idxs_probe) > 0:
+            probed_set.update(int(k) for k in hkl_packed_all[idxs_probe])
+            r_im = r_im_all[idxs_probe]
+            c_im = c_im_all[idxs_probe]
+            in_bounds = (
+                (r_im >= 1.5) & (r_im <= H - 2.5) & (c_im >= 1.5) & (c_im <= W - 2.5)
+            )
+            if np.any(in_bounds):
+                idxs_in = idxs_probe[in_bounds]
+                r0 = np.rint(r_im[in_bounds]).astype(np.int32)
+                c0 = np.rint(c_im[in_bounds]).astype(np.int32)
+
+                # Stage 1: fast 5-pixel cross pre-screen in L3-cached bank event table
+                rr5 = np.clip(r0[:, None] + dr5[None, :], 0, H - 1)
+                cc5 = np.clip(c0[:, None] + dc5[None, :], 0, W - 1)
+                pf5 = rr5 * W + cc5
+                elo5 = ob[pf5]
+                ehi5 = ob[pf5 + 1]
+                tp5 = t_pred_all[idxs_in][:, None]
+                ia5 = _bsearch_tof_bank_left(
+                    tb, elo5, ehi5, (tp5 * (1.0 + g_lo)).astype(np.float32)
+                )
+                ib5 = _bsearch_tof_bank_left(
+                    tb, elo5, ehi5, (tp5 * (1.0 + g_hi)).astype(np.float32)
+                )
+                c5 = ib5 - ia5
+                bg5_px = np.mean(ehi5 - elo5, axis=1) * gate_band_frac
+                sum5 = np.sum(c5, axis=1)
+                cand = (
+                    (sum5 >= 4)
+                    & (np.max(c5, axis=1) >= 2)
+                    & (
+                        sum5
+                        >= 5.0 * bg5_px + 3.0 * np.sqrt(np.maximum(5.0 * bg5_px, 0.5))
+                    )
+                )
+                if np.any(cand):
+                    idxs_c = idxs_in[cand]
+                    r0 = r0[cand]
+                    c0 = c0[cand]
+
+                    # Stage 2: circular spatial patch + ToF core gate & sideband background
+                    rad = max(3, min(10, round(0.028 * min(H, W))))
+                    offs = np.arange(-rad, rad + 1, dtype=np.int32)
+                    dr_g, dc_g = np.meshgrid(offs, offs, indexing="ij")
+                    circ_mask = ((dr_g * dr_g + dc_g * dc_g) <= (rad * rad)).astype(
+                        np.float32
+                    )
+
+                    rr = np.clip(r0[:, None, None] + dr_g[None, :, :], 0, H - 1)
+                    cc = np.clip(c0[:, None, None] + dc_g[None, :, :], 0, W - 1)
+                    pf = rr * W + cc
+                    elo = ob[pf]
+                    ehi = ob[pf + 1]
+
+                    tp_k = t_pred_all[idxs_c][:, None, None]
+                    t_lo = (tp_k * (1.0 + g_lo)).astype(np.float32)
+                    t_hi = (tp_k * (1.0 + g_hi)).astype(np.float32)
+                    ia = _bsearch_tof_bank_left(tb, elo, ehi, t_lo)
+                    ib = _bsearch_tof_bank_left(tb, elo, ehi, t_hi)
+
+                    cnt_gate_all = ib - ia
+                    core_keep = (np.max(cnt_gate_all, axis=(1, 2)) >= 2) & (
+                        np.sum(cnt_gate_all, axis=(1, 2)) >= 5
+                    )
+                    if np.any(core_keep):
+                        idxs_c = idxs_c[core_keep]
+                        rr = rr[core_keep]
+                        cc = cc[core_keep]
+                        elo = elo[core_keep]
+                        ehi = ehi[core_keep]
+                        tp_k = tp_k[core_keep]
+                        t_lo = t_lo[core_keep]
+                        t_hi = t_hi[core_keep]
+                        ia = ia[core_keep]
+                        ib = ib[core_keep]
+                        cnt_gate = cnt_gate_all[core_keep].astype(np.float32)
+
+                        sb_f_lo0 = max(0.05, 1.0 + sb_lo - 2.5 * gw_outer)
+                        sb_f_lo1 = max(0.05, 1.0 + sb_lo - 0.5 * gw_outer)
+                        sb_f_hi0 = 1.0 + sb_hi + 0.5 * gw_outer
+                        sb_f_hi1 = 1.0 + sb_hi + 2.5 * gw_outer
+                        sb_span = max(
+                            (sb_f_lo1 - sb_f_lo0) + (sb_f_hi1 - sb_f_hi0), 1e-4
+                        )
+
+                        isl0 = _bsearch_tof_bank_left(
+                            tb, elo, ehi, (tp_k * sb_f_lo0).astype(np.float32)
+                        )
+                        isl1 = _bsearch_tof_bank_left(
+                            tb, elo, ehi, (tp_k * sb_f_lo1).astype(np.float32)
+                        )
+                        isr0 = _bsearch_tof_bank_left(
+                            tb, elo, ehi, (tp_k * sb_f_hi0).astype(np.float32)
+                        )
+                        isr1 = _bsearch_tof_bank_left(
+                            tb, elo, ehi, (tp_k * sb_f_hi1).astype(np.float32)
+                        )
+
+                        sum_tof = pb[ib] - pb[ia]
+                        cnt_sb = ((isl1 - isl0) + (isr1 - isr0)).astype(np.float32)
+
+                        pcls = (
+                            pixel_class_by_bank.get(bk_i)
+                            if pixel_class_by_bank
+                            else None
+                        )
+                        valid_px = circ_mask[None, :, :]
+                        if pcls is not None and pcls.shape == (H, W):
+                            valid_px = valid_px * (pcls[rr, cc] == 0).astype(np.float32)
+
+                        n_vpx = np.maximum(
+                            np.sum(valid_px, axis=(1, 2), keepdims=True), 1.0
+                        )
+                        bg_sb = (
+                            np.sum(cnt_sb * valid_px, axis=(1, 2), keepdims=True)
+                            / n_vpx
+                        ) * (gw_core / sb_span)
+                        bg_sp = np.median(cnt_gate, axis=(1, 2), keepdims=True)
+                        bg = np.maximum(bg_sb, bg_sp)
+                        mad = 1.4826 * np.median(
+                            np.abs(cnt_gate - bg_sp), axis=(1, 2), keepdims=True
+                        )
+                        thr = bg + np.maximum(
+                            3.5 * mad,
+                            np.maximum(1.5, 2.5 * np.sqrt(np.maximum(bg, 0.25))),
+                        )
+                        excess = np.maximum(0.0, cnt_gate - thr) * valid_px
+                        w = excess * excess
+                        w_sum = np.sum(w, axis=(1, 2))
+
+                        pos_m = excess > 0.0
+                        sig_ph = np.sum(
+                            np.maximum(0.0, cnt_gate - bg) * pos_m, axis=(1, 2)
+                        )
+                        n_spx = np.sum(pos_m.astype(np.float32), axis=(1, 2))
+                        z_sp = sig_ph / np.sqrt(np.maximum(n_spx * bg[:, 0, 0], 0.64))
+                        has_spot = (w_sum > 0.0) & (sig_ph >= 4.5) & (z_sp >= 4.5)
+                        if np.any(has_spot):
+                            sel_local = np.flatnonzero(has_spot)
+                            sel_new = idxs_c[sel_local]
+                            w_sel = w[sel_local]
+                            ws_sel = w_sum[sel_local]
+                            r_cent_im = (
+                                np.sum(w_sel * rr[sel_local], axis=(1, 2)) / ws_sel
+                            )
+                            c_cent_im = (
+                                np.sum(w_sel * cc[sel_local], axis=(1, 2)) / ws_sel
+                            )
+
+                            t_mid = 0.5 * (t_lo[sel_local] + t_hi[sel_local])
+                            t_px = np.clip(
+                                (sum_tof[sel_local] - bg[sel_local] * t_mid)
+                                / np.maximum(cnt_gate[sel_local] - bg[sel_local], 1e-3),
+                                t_lo[sel_local],
+                                t_hi[sel_local],
+                            )
+                            t_cent = np.sum(w_sel * t_px, axis=(1, 2)) / ws_sel
+
+                            r_cent_det = r_cent_im / max(scale_r, 1e-9)
+                            c_cent_det = c_cent_im / max(scale_c, 1e-9)
+
+                            with contextlib.suppress(
+                                OSError,
+                                RuntimeError,
+                                ValueError,
+                                TypeError,
+                                KeyError,
+                                IndexError,
+                            ):
+                                xyz_obs = np.asarray(
+                                    det.pixel_to_lab(r_cent_det, c_cent_det),
+                                    dtype=float,
+                                )
+                                if xyz_obs.ndim == 1:
+                                    xyz_obs = xyz_obs.reshape(1, 3)
+                                rays_obs = xyz_obs - s_off[None, :]
+                                l2_obs = np.linalg.norm(rays_obs, axis=1)
+                                kf_obs = rays_obs / np.maximum(l2_obs[:, None], 1e-12)
+                                q_unit = kf_obs - ki_u[None, :]
+                                lam_obs = (t_cent * ANGSTROM_M_PER_US) / np.maximum(
+                                    l1_eff + l2_obs, 1e-6
+                                )
+                                q_new = (
+                                    q_unit / np.maximum(lam_obs[:, None], 1e-6)
+                                ) @ R_mat
+                                for gi, qv in zip(sel_new, q_new, strict=False):
+                                    hits_map[int(hkl_packed_all[gi])] = (
+                                        float(qv[0]),
+                                        float(qv[1]),
+                                        float(qv[2]),
+                                    )
+
+        if not hits_map:
+            continue
+
+        sel_global_list: list[int] = []
+        q_obs_list: list[tuple[float, float, float]] = []
+        for gi, pk_k in zip(idxs_eval, keys_eval, strict=False):
+            qv = hits_map.get(int(pk_k))
+            if qv is not None:
+                sel_global_list.append(int(gi))
+                q_obs_list.append(qv)
+        if not sel_global_list:
+            continue
+
+        sel_global = np.asarray(sel_global_list, dtype=np.intp)
+        q_obs_cryst = np.asarray(q_obs_list, dtype=np.float64)
+
+        # 3D reciprocal-space Voronoi ownership across ALL predicted reflections on bank
+        if len(idxs_all) > 1:
+            d_self = np.linalg.norm(q_obs_cryst - G_pred[sel_global], axis=1)
+            d_near, _ = cKDTree(G_pred[idxs_all]).query(q_obs_cryst, k=1)
+            own_mask = d_self <= d_near + 1e-5
+            if not np.any(own_mask):
+                continue
+            sel_global = sel_global[own_mask]
+            q_obs_cryst = q_obs_cryst[own_mask]
+
+        Gp_sel = G_pred[sel_global]
+        Gn_sel = G_norm[sel_global]
+        chord_ratio = np.clip(
+            np.linalg.norm(q_obs_cryst - Gp_sel, axis=1)
+            / np.maximum(2.0 * Gn_sel, 1e-12),
+            0.0,
+            1.0,
+        )
+        out_err[sel_global] = np.rad2deg(2.0 * np.arcsin(chord_ratio))
+
+    return out_err, True, gate_meta
+
+
+def _estimate_spot_angular_errors_deg(
+    *,
+    images_h5: str | os.PathLike[str] | None,
+    replay_h5: str | os.PathLike[str] | None = None,
+    frame_slice: tuple[int, int] | None,
+    hkl_arr: np.ndarray | None,
+    bank_arr: np.ndarray | None,
+    pixel_r_arr: np.ndarray | None,
+    pixel_c_arr: np.ndarray | None,
+    lam_arr: np.ndarray | None = None,
+    ub_matrix: np.ndarray | None,
+    R_run: np.ndarray | None,
+    detectors: dict[int, Any],
+    ki_hat: np.ndarray,
+    sample_offset_lab: Any = None,
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None,
+    instrument: str = "IMAGINE",
+    tof_l1: float | None = None,
+    wavelength_range: tuple[float, float] | None = None,
+    eval_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, bool, str, dict[str, Any] | None]:
+    """Unified dispatcher: prefers 3D ToF-gated reciprocal-space ``Δθ`` when events + L1 exist."""
+    tof_err, tof_ok, gate_meta = _estimate_tof_gated_spot_angular_errors_deg(
+        images_h5=images_h5,
+        replay_h5=replay_h5,
+        frame_slice=frame_slice,
+        hkl_arr=hkl_arr,
+        bank_arr=bank_arr,
+        pixel_r_arr=pixel_r_arr,
+        pixel_c_arr=pixel_c_arr,
+        lam_arr=lam_arr,
+        ub_matrix=ub_matrix,
+        R_run=R_run,
+        detectors=detectors,
+        ki_hat=ki_hat,
+        sample_offset_lab=sample_offset_lab,
+        pixel_class_by_bank=pixel_class_by_bank,
+        instrument=instrument,
+        tof_l1=tof_l1,
+        wavelength_range=wavelength_range,
+        eval_mask=eval_mask,
+    )
+    if tof_ok and tof_err is not None:
+        return tof_err, True, "tof_3d", gate_meta
+
+    img_err, img_ok = _estimate_image_spot_angular_errors_deg(
+        images_h5=images_h5,
+        frame_slice=frame_slice,
+        hkl_arr=hkl_arr,
+        bank_arr=bank_arr,
+        pixel_r_arr=pixel_r_arr,
+        pixel_c_arr=pixel_c_arr,
+        ub_matrix=ub_matrix,
+        R_run=R_run,
+        detectors=detectors,
+        ki_hat=ki_hat,
+        sample_offset_lab=sample_offset_lab,
+        pixel_class_by_bank=pixel_class_by_bank,
+    )
+    return img_err, img_ok, "image_2d", None
+
+
+_LIVE_MASK_SLAB_CACHE: dict[tuple[str, int, int, int], dict[int, np.ndarray]] = {}
+
+
+def compute_live_tof_delta_theta_payload(
+    *,
+    images_h5: str | os.PathLike[str] | None,
+    replay_h5: str | os.PathLike[str] | None = None,
+    frame_index: int = 0,
+    d_min: float = 1.5,
+    wavelength_range: tuple[float, float] = (2.0, 4.0),
+    ub_matrix: Any = None,
+    R_run: Any = None,
+    sample_offset_lab: Any = None,
+    ki: Any = (0.0, 0.0, 1.0),
+    instrument: str = "IMAGINE",
+    space_group: str = "P 1",
+    cell: list[float] | None = None,
+    detector_configs: dict[str, Any] | None = None,
+    tof_l1: float | None = None,
+    zone_axes_crystal: list[list[float]] | None = None,
+    zone_tolerance_deg: float = 0.75,
+) -> dict[str, Any]:
+    """
+    Compute live 3D ToF-gated reciprocal-space ``Δθ`` for the active frame at the
+    requested ``d_min``, ``wavelength_range``, ``UB``, ``R_run``, ``sample_offset_lab``,
+    calibrated ``detector_configs``, and ``L1``.
+
+    Builds the full Ewald reflection shell down to ``d_min`` on active banks so
+    3D ``cKDTree`` Voronoi ownership honors high-resolution reflection crowding,
+    and returns ``{"ok": True, "angular_error_mode": ..., "tof_gate": ..., "errors": {...}}``
+    keyed by ``"bank|h,k,l"``.
+    """
+    import h5py
+
+    from subhkl.core.crystallography import (
+        generate_ewald_reflections,
+        generate_reflections,
+    )
+    from subhkl.instrument.detector import Detector
+
+    ev_h5 = _resolve_images_h5_with_events(images_h5, replay_h5)
+    img_src = ev_h5 or (
+        os.path.abspath(str(images_h5))
+        if images_h5 and os.path.isfile(str(images_h5))
+        else None
+    )
+    if not img_src:
+        return {"ok": False, "error": "No images HDF5 available."}
+
+    ub_mat: np.ndarray | None = None
+    if ub_matrix is not None:
+        arr_ub = np.asarray(ub_matrix, dtype=float)
+        if arr_ub.shape == (3, 3) and np.all(np.isfinite(arr_ub)):
+            ub_mat = arr_ub
+
+    ext_meta: dict[str, Any] | None = None
+    if (
+        (ub_mat is None or R_run is None or not detector_configs)
+        and replay_h5
+        and os.path.isfile(str(replay_h5))
+    ):
+        with contextlib.suppress(
+            OSError, RuntimeError, ValueError, TypeError, KeyError
+        ):
+            ext_meta = _extract_from_h5(
+                replay_h5,
+                images_h5=img_src,
+                frame_index=int(frame_index),
+                include_peaks=False,
+                include_all_runs_peaks=False,
+                default_instrument=instrument,
+                d_min=d_min,
+            )
+
+    if (
+        ub_mat is None
+        and ext_meta is not None
+        and ext_meta.get("U") is not None
+        and ext_meta.get("B") is not None
+    ):
+        ub_mat = np.asarray(ext_meta["U"], dtype=float) @ np.asarray(
+            ext_meta["B"], dtype=float
+        )
+    if ub_mat is None or abs(float(np.linalg.det(ub_mat))) <= 1e-12:
+        return {"ok": False, "error": "Valid 3x3 UB matrix required."}
+
+    U_mat = _u_from_ub(ub_mat)
+    B_mat = U_mat.T @ ub_mat
+    cell_use = (
+        [float(x) for x in cell]
+        if cell and len(cell) == 6
+        else (
+            ext_meta["cell"]
+            if ext_meta and ext_meta.get("cell")
+            else list(_cell_from_B(B_mat))
+        )
+    )
+    sg_use = str(
+        space_group or (ext_meta.get("space_group") if ext_meta else None) or "P 1"
+    )
+    inst_use = str(
+        instrument or (ext_meta.get("instrument") if ext_meta else None) or "IMAGINE"
+    )
+
+    R_mat = (
+        np.asarray(R_run, dtype=float)
+        if R_run is not None and np.asarray(R_run).shape == (3, 3)
+        else (
+            np.asarray(ext_meta["R_gonio"], dtype=float)
+            if ext_meta and ext_meta.get("R_gonio") is not None
+            else np.eye(3, dtype=float)
+        )
+    )
+    s_off = (
+        np.asarray(sample_offset_lab, dtype=float).ravel()[:3]
+        if sample_offset_lab is not None and np.asarray(sample_offset_lab).size >= 3
+        else (
+            np.asarray(ext_meta["sample_offset_lab"], dtype=float).ravel()[:3]
+            if ext_meta and ext_meta.get("sample_offset_lab") is not None
+            else np.zeros(3, dtype=float)
+        )
+    )
+    ki_u = np.asarray(ki if ki is not None else (0.0, 0.0, 1.0), dtype=float).ravel()[
+        :3
+    ]
+    ki_u = ki_u / max(float(np.linalg.norm(ki_u)), 1e-12)
+
+    wl_min = max(0.05, float(wavelength_range[0]))
+    wl_max = max(wl_min + 0.02, float(wavelength_range[1]))
+    d_min_kin = max(0.25, float(d_min), 0.5 * wl_min - 1e-5)
+
+    # Resolve frame_slice and bank_ids for frame_index
+    f0, f1 = 0, 0
+    active_bids: set[int] = set()
+    with h5py.File(img_src, "r") as hf:
+        ims = hf.get("images")
+        n_tot = len(ims) if ims is not None else 0
+        if n_tot <= 0:
+            return {"ok": False, "error": "Empty images dataset."}
+        if "file_offsets" in hf:
+            offs = np.asarray(hf["file_offsets"][()], dtype=int).ravel()
+            if len(offs) > 0:
+                fi = max(0, min(int(frame_index), len(offs) - 1))
+                f0 = int(offs[fi])
+                f1 = int(offs[fi + 1]) if fi + 1 < len(offs) else n_tot
+            else:
+                f0, f1 = 0, n_tot
+        else:
+            f0, f1 = 0, n_tot
+        if "bank_ids" in hf:
+            b_ids = np.asarray(hf["bank_ids"][f0:f1], dtype=int).ravel()
+            active_bids = {int(b) for b in b_ids}
+
+    # Build current Detector objects honoring live client detector_configs overrides
+    detectors: dict[int, Any] = {}
+    if ext_meta and ext_meta.get("detectors"):
+        detectors.update(ext_meta["detectors"])
+    elif replay_h5 and os.path.isfile(str(replay_h5)):
+        with (
+            contextlib.suppress(OSError, RuntimeError, ValueError, KeyError),
+            h5py.File(str(replay_h5), "r") as rf,
+        ):
+            detectors.update(_load_detectors_from_h5(rf, inst_use, (img_src,)))
+    else:
+        detectors.update(_load_detectors_from_h5(None, inst_use, (img_src,)))
+
+    if isinstance(detector_configs, dict) and detector_configs:
+        for b_str, cfg_in in detector_configs.items():
+            if not isinstance(cfg_in, dict):
+                continue
+            with contextlib.suppress(ValueError, TypeError, KeyError):
+                bid = int(b_str)
+                base_det = detectors.get(bid)
+                merged_cfg: dict[str, Any] = {}
+                if base_det is not None and hasattr(base_det, "config"):
+                    merged_cfg.update(dict(base_det.config))
+                for k_c in (
+                    "panel",
+                    "m",
+                    "n",
+                    "width",
+                    "height",
+                    "radius",
+                    "center",
+                    "uhat",
+                    "vhat",
+                ):
+                    if k_c in cfg_in and cfg_in[k_c] is not None:
+                        merged_cfg[k_c] = cfg_in[k_c]
+                if "panel" not in merged_cfg and cfg_in.get("panel_type"):
+                    merged_cfg["panel"] = cfg_in["panel_type"]
+                merged_cfg.setdefault("panel", "flat")
+                detectors[bid] = Detector(merged_cfg)
+
+    if not detectors:
+        return {"ok": False, "error": "No detector geometry available."}
+    if not active_bids:
+        active_bids = {int(k) for k in detectors}
+    else:
+        active_bids = {b for b in active_bids if b in detectors} or {
+            int(k) for k in detectors
+        }
+
+    # Load cached per-bank pixel_class masks if present
+    pixel_class_by_bank: dict[int, np.ndarray] | None = None
+    mask_src = (
+        str(replay_h5) if replay_h5 and os.path.isfile(str(replay_h5)) else img_src
+    )
+    if mask_src and os.path.isfile(mask_src):
+        try:
+            m_stat = int(os.stat(mask_src).st_mtime_ns)
+            mk_key = (os.path.abspath(mask_src), m_stat, f0, f1)
+            pixel_class_by_bank = _LIVE_MASK_SLAB_CACHE.get(mk_key)
+            if pixel_class_by_bank is None:
+                pcls_tmp: dict[int, np.ndarray] = {}
+                for cand_m in (replay_h5, img_src):
+                    if not cand_m or not os.path.isfile(str(cand_m)):
+                        continue
+                    with (
+                        contextlib.suppress(OSError, KeyError, ValueError),
+                        h5py.File(str(cand_m), "r") as mf_m,
+                    ):
+                        if "pixel_mask/class_per_bank" in mf_m:
+                            grp_m = mf_m["pixel_mask/class_per_bank"]
+                            for bk_nm in grp_m:
+                                with contextlib.suppress(ValueError):
+                                    pcls_tmp[int(bk_nm)] = np.asarray(
+                                        grp_m[bk_nm][()], dtype=np.uint8
+                                    )
+                            if pcls_tmp:
+                                break
+                pixel_class_by_bank = pcls_tmp
+                if len(_LIVE_MASK_SLAB_CACHE) >= 4:
+                    _LIVE_MASK_SLAB_CACHE.pop(next(iter(_LIVE_MASK_SLAB_CACHE)))
+                _LIVE_MASK_SLAB_CACHE[mk_key] = pixel_class_by_bank
+        except OSError:
+            pixel_class_by_bank = None
+
+    # Generate (or slice cached) complete Ewald reflection shell down to d_min
+    try:
+        mtime_img = int(os.stat(img_src).st_mtime_ns)
+    except OSError:
+        mtime_img = 0
+    shell_sig = (
+        os.path.abspath(img_src),
+        mtime_img,
+        f0,
+        f1,
+        inst_use,
+        sg_use.strip(),
+        tuple(round(float(v), 5) for v in cell_use),
+        round(float(wl_min), 5),
+        round(float(wl_max), 5),
+        np.asarray(ub_mat, dtype=np.float64).tobytes(),
+        np.asarray(R_mat, dtype=np.float64).tobytes(),
+        np.asarray(s_off, dtype=np.float64).tobytes(),
+        np.asarray(ki_u, dtype=np.float64).tobytes(),
+        tuple(sorted(active_bids)),
+        _detector_and_mask_signature(detectors, pixel_class_by_bank),
+    )
+    cached_shell = _LIVE_RAYCAST_SHELL_CACHE.get(shell_sig)
+    if cached_shell is not None and d_min_kin >= cached_shell[0] - 1e-7:
+        _, ray_full, d_full = cached_shell
+    else:
+        vol = 1.0 / max(abs(float(np.linalg.det(ub_mat))), 1e-12)
+        # Pre-build down to 1.0 A when affordable so interactive d_min dragging is O(15 ms)
+        floor_cand = max(1.0, 0.5 * wl_min - 1e-5)
+        est_at_floor = (4.0 * np.pi / 3.0) * vol / max(floor_cand**3, 1e-6)
+        d_build = (
+            min(d_min_kin, floor_cand) if est_at_floor <= 8_000_000.0 else d_min_kin
+        )
+        est_pts = (4.0 * np.pi / 3.0) * vol / max(d_build**3, 1e-6)
+        if est_pts > 250_000.0:
+            hkl_cache_key = (
+                tuple(round(float(v), 5) for v in cell_use),
+                sg_use.strip(),
+                round(float(d_build), 5),
+                round(float(wl_min), 5),
+                round(float(wl_max), 5),
+                1,
+                tuple(round(float(v), 5) for v in ub_mat.ravel()),
+                tuple(round(float(v), 5) for v in R_mat.ravel()),
+            )
+            hkl_all = _HKL_GEN_CACHE.get(hkl_cache_key)
+            if hkl_all is None:
+                hkl_all = np.stack(
+                    generate_ewald_reflections(
+                        *cell_use,
+                        space_group=sg_use,
+                        d_min=d_build,
+                        UB=ub_mat,
+                        R_runs=[R_mat],
+                        ki=ki_u,
+                        wavelength_range=(wl_min, wl_max),
+                    ),
+                    axis=1,
+                ).astype(np.int32)
+                if len(_HKL_GEN_CACHE) >= 3:
+                    _HKL_GEN_CACHE.pop(next(iter(_HKL_GEN_CACHE)), None)
+                _HKL_GEN_CACHE[hkl_cache_key] = hkl_all
+        else:
+            hkl_cache_key = (
+                tuple(round(float(v), 5) for v in cell_use),
+                sg_use.strip(),
+                round(float(d_build), 5),
+            )
+            hkl_all = _HKL_GEN_CACHE.get(hkl_cache_key)
+            if hkl_all is None:
+                hkl_all = np.stack(
+                    generate_reflections(
+                        *cell_use,
+                        space_group=sg_use,
+                        d_min=d_build,
+                    ),
+                    axis=1,
+                ).astype(np.int32)
+                if len(_HKL_GEN_CACHE) >= 3:
+                    _HKL_GEN_CACHE.pop(next(iter(_HKL_GEN_CACHE)), None)
+                _HKL_GEN_CACHE[hkl_cache_key] = hkl_all
+
+        G_cryst = hkl_all.astype(float) @ ub_mat.T
+        qn_cryst = np.linalg.norm(G_cryst, axis=1)
+        rel_border = default_rel_border_for_instrument(inst_use)
+        ray_full = _raycast_hkl_on_detectors(
+            hkl_all,
+            U_mat,
+            B_mat,
+            R_mat,
+            detectors,
+            (wl_min, wl_max),
+            ki=ki_u,
+            sample_offset_lab=s_off,
+            active_bids=active_bids,
+            pixel_class_by_bank=pixel_class_by_bank,
+            margin_frac=rel_border,
+            G_cryst=G_cryst,
+            qn_cryst=qn_cryst,
+        )
+        if len(ray_full["hkl"]) > 0:
+            G_rf = ray_full["hkl"].astype(float) @ ub_mat.T
+            d_full = 1.0 / np.maximum(np.linalg.norm(G_rf, axis=1), 1e-12)
+        else:
+            d_full = np.zeros(0, dtype=float)
+        if (
+            len(_LIVE_RAYCAST_SHELL_CACHE) >= 3
+            and shell_sig not in _LIVE_RAYCAST_SHELL_CACHE
+        ):
+            _LIVE_RAYCAST_SHELL_CACHE.pop(next(iter(_LIVE_RAYCAST_SHELL_CACHE)))
+        _LIVE_RAYCAST_SHELL_CACHE[shell_sig] = (d_build, ray_full, d_full)
+
+    if len(d_full) == 0:
+        ray = ray_full
+    else:
+        keep_d = d_full >= (d_min_kin - 1e-9)
+        ray = {
+            k_r: v_r[keep_d]
+            for k_r, v_r in ray_full.items()
+            if isinstance(v_r, np.ndarray) and len(v_r) == len(d_full)
+        }
+    hkl_hit = ray["hkl"]
+    n_hit = len(hkl_hit)
+    if n_hit == 0:
+        return {
+            "ok": True,
+            "angular_error_mode": "tof_3d",
+            "tof_gate": None,
+            "n_shell": 0,
+            "errors": {},
+        }
+
+    eval_mask: np.ndarray | None = None
+    if n_hit > 35_000 and zone_axes_crystal:
+        G_hit = hkl_hit.astype(float) @ ub_mat.T
+        Gn_hit = np.maximum(np.linalg.norm(G_hit, axis=1), 1e-12)
+        Gh_hit = G_hit / Gn_hit[:, None]
+        sin_tol = float(np.sin(np.deg2rad(max(float(zone_tolerance_deg) * 1.5, 0.5))))
+        z_keep = np.zeros(n_hit, dtype=bool)
+        for ax_raw in zone_axes_crystal:
+            ax_v = np.asarray(ax_raw, dtype=float).ravel()[:3]
+            ax_n = float(np.linalg.norm(ax_v))
+            if ax_n > 1e-9:
+                z_keep |= np.abs(Gh_hit @ (ax_v / ax_n)) <= sin_tol
+        # Also include top-35,000 highest-d reflections matching MAX_DYNAMIC_FRAME_PEAKS
+        top_k = np.argpartition(Gn_hit, min(35_000, n_hit - 1))[:35_000]
+        z_keep[top_k] = True
+        eval_mask = z_keep
+
+    err_arr, ok_est, err_mode, gate_meta = _estimate_spot_angular_errors_deg(
+        images_h5=img_src,
+        replay_h5=replay_h5,
+        frame_slice=(f0, f1),
+        hkl_arr=hkl_hit,
+        bank_arr=ray["bank"],
+        pixel_r_arr=ray["pixel_r"],
+        pixel_c_arr=ray["pixel_c"],
+        lam_arr=ray["wavelength"],
+        ub_matrix=ub_mat,
+        R_run=R_mat,
+        detectors=detectors,
+        ki_hat=ki_u,
+        sample_offset_lab=s_off,
+        pixel_class_by_bank=pixel_class_by_bank,
+        instrument=inst_use,
+        tof_l1=tof_l1,
+        wavelength_range=(wl_min, wl_max),
+        eval_mask=eval_mask,
+    )
+    if not ok_est or err_arr is None:
+        return {"ok": False, "error": "Failed to evaluate spot angular errors."}
+
+    fin_idx = np.flatnonzero(np.isfinite(err_arr))
+    b_hit = ray["bank"]
+    errors_map: dict[str, float] = {}
+    for idx in fin_idx:
+        hv, kv, lv = int(hkl_hit[idx, 0]), int(hkl_hit[idx, 1]), int(hkl_hit[idx, 2])
+        errors_map[f"{int(b_hit[idx])}|{hv},{kv},{lv}"] = round(float(err_arr[idx]), 4)
+
+    return {
+        "ok": True,
+        "angular_error_mode": err_mode,
+        "tof_gate": gate_meta,
+        "n_shell": int(n_hit),
+        "n_matched": len(errors_map),
+        "errors": errors_map,
+    }
+
+
 def _stratified_spherical_subsample(
     pts: np.ndarray,
     max_peaks: int,
@@ -7275,22 +8661,38 @@ def build_rainbow_zone_payload(
 
     spot_ang_err_primary: np.ndarray | None = None
     spot_img_avail_primary = False
+    angular_error_mode = "image_2d"
+    tof_gate_meta: dict[str, Any] | None = None
+    has_tof_events = _h5_has_tof_events(images_h5, replay_h5)
+    tof_l1_resolved = (
+        _resolve_tof_l1(replay_h5, images_h5, instrument=instrument)
+        if (has_tof_data or has_tof_events)
+        else None
+    )
     if primary_source == "predicted" and len(pts) > 0:
-        spot_ang_err_primary, spot_img_avail_primary = (
-            _estimate_image_spot_angular_errors_deg(
-                images_h5=images_h5,
-                frame_slice=frame_slice,
-                hkl_arr=hkl_arr,
-                bank_arr=bank_arr,
-                pixel_r_arr=pixel_r_arr,
-                pixel_c_arr=pixel_c_arr,
-                ub_matrix=ub_matrix,
-                R_run=R_single,
-                detectors=detectors,
-                ki_hat=ki_hat,
-                sample_offset_lab=s_lab_single,
-                pixel_class_by_bank=pixel_class_by_bank,
-            )
+        (
+            spot_ang_err_primary,
+            spot_img_avail_primary,
+            angular_error_mode,
+            tof_gate_meta,
+        ) = _estimate_spot_angular_errors_deg(
+            images_h5=images_h5,
+            replay_h5=replay_h5,
+            frame_slice=frame_slice,
+            hkl_arr=hkl_arr,
+            bank_arr=bank_arr,
+            pixel_r_arr=pixel_r_arr,
+            pixel_c_arr=pixel_c_arr,
+            lam_arr=lam_arr,
+            ub_matrix=ub_matrix,
+            R_run=R_single,
+            detectors=detectors,
+            ki_hat=ki_hat,
+            sample_offset_lab=s_lab_single,
+            pixel_class_by_bank=pixel_class_by_bank,
+            instrument=instrument,
+            tof_l1=tof_l1_resolved,
+            wavelength_range=(wl_min, wl_max),
         )
 
     peaks_list = _serialize_peak_entries(
@@ -7536,20 +8938,34 @@ def build_rainbow_zone_payload(
             predicted_frame_data is not None
             and len(predicted_frame_data.get("peaks_xyz", [])) > 0
         ):
-            spot_err_pred, spot_avail_pred = _estimate_image_spot_angular_errors_deg(
+            (
+                spot_err_pred,
+                spot_avail_pred,
+                pred_err_mode,
+                pred_gate_meta,
+            ) = _estimate_spot_angular_errors_deg(
                 images_h5=images_h5,
+                replay_h5=replay_h5,
                 frame_slice=frame_slice,
                 hkl_arr=predicted_frame_data.get("hkl"),
                 bank_arr=predicted_frame_data.get("bank"),
                 pixel_r_arr=predicted_frame_data.get("pixel_r"),
                 pixel_c_arr=predicted_frame_data.get("pixel_c"),
+                lam_arr=predicted_frame_data.get("wavelength"),
                 ub_matrix=ub_matrix,
                 R_run=R_single,
                 detectors=detectors,
                 ki_hat=ki_hat,
                 sample_offset_lab=s_lab_single,
                 pixel_class_by_bank=pixel_class_by_bank,
+                instrument=instrument,
+                tof_l1=tof_l1_resolved,
+                wavelength_range=(wl_min, wl_max),
             )
+            if pred_err_mode == "tof_3d":
+                angular_error_mode = "tof_3d"
+                if tof_gate_meta is None:
+                    tof_gate_meta = pred_gate_meta
             predicted_peaks = _serialize_peak_entries(
                 predicted_frame_data["peaks_xyz"],
                 bank_arr=predicted_frame_data.get("bank"),
@@ -7965,6 +9381,10 @@ def build_rainbow_zone_payload(
         "frames": frames_meta,
         "images_h5": str(images_h5) if images_h5 else None,
         "has_tof_data": bool(has_tof_data),
+        "has_tof_events": bool(has_tof_events),
+        "angular_error_mode": angular_error_mode,
+        "tof_l1": round(float(tof_l1_resolved), 6) if tof_l1_resolved else None,
+        "tof_gate": tof_gate_meta,
         "cell": [round(float(x), 4) for x in cell] if cell else None,
         "u_matrix": (
             [[round(float(v), 8) for v in row] for row in np.asarray(U, dtype=float)]
@@ -11697,7 +13117,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ? DATA.ub_matrix.flat().map(v => Number(v || 0).toFixed(6)).join(",")
       : "";
     const ubChangedFromBase = Boolean(_payloadBaseParams.ubSig && curUbSig && curUbSig !== _payloadBaseParams.ubSig);
-    estimateActiveFrameAngularErrorsJS(framePeaks, panelsGeom, Ractive, sActive, ubChangedFromBase);
+    const shellChangedFromBase = Boolean(
+      ubChangedFromBase ||
+      Math.abs(dMinEff - Number(_payloadBaseParams.dMin || 0)) > 1e-4 ||
+      Math.abs(wlMin - Number(_payloadBaseParams.lamMin || 0)) > 1e-4 ||
+      Math.abs(wlMax - Number(_payloadBaseParams.lamMax || 0)) > 1e-4
+    );
+    if (Boolean(DATA.has_tof_events) || DATA.angular_error_mode === "tof_3d") {{
+      if (shellChangedFromBase) {{
+        scheduleLiveTofDeltaThetaSync(false);
+      }}
+    }} else {{
+      estimateActiveFrameAngularErrorsJS(framePeaks, panelsGeom, Ractive, sActive, shellChangedFromBase);
+    }}
     PREDICTED_PEAKS = framePeaks;
 
     // Refresh zone peak counts and live per-zone RMS so sidebar badges reflect dynamic shells
@@ -12272,7 +13704,155 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }}
 
+  let _tofDeltaThetaTimer = null;
+  let _tofDeltaThetaAbort = null;
+  let _tofDeltaThetaReqSeq = 0;
+  let _lastTofDeltaThetaSig = "";
+
+  function _buildTofDeltaThetaSig() {{
+    const activeRunIdx = typeof state.selectedFrameIndex === "number"
+      ? state.selectedFrameIndex
+      : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+    const ub = getActiveUbMatrix();
+    const ubStr = Array.isArray(ub) ? ub.flat().map(v => Number(v || 0).toFixed(6)).join(",") : "";
+    const Rrun = getActiveGoniometerR();
+    const rStr = Array.isArray(Rrun) ? Rrun.flat().map(v => Number(v || 0).toFixed(5)).join(",") : "";
+    const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+      ? DATA.sample_offset_lab_per_run
+      : null;
+    const sLab = (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+      ? sMap[String(activeRunIdx)]
+      : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0]);
+    const sStr = sLab.map(v => Number(v || 0).toFixed(6)).join(",");
+    const l1Val = typeof DATA.tof_l1 === "number" ? DATA.tof_l1.toFixed(5) : "auto";
+    return `${{activeRunIdx}}|${{Number(state.dMin || 0).toFixed(4)}}|${{Number(state.lamMin || 0).toFixed(4)}}|${{Number(state.lamMax || 0).toFixed(4)}}|${{ubStr}}|${{rStr}}|${{sStr}}|${{l1Val}}`;
+  }}
+
+  function applyTofErrorsMapToPeaks(peaks, errMap) {{
+    if (!Array.isArray(peaks) || !errMap || typeof errMap !== "object") return 0;
+    let nMatched = 0;
+    for (let i = 0; i < peaks.length; i++) {{
+      const pk = peaks[i];
+      if (!pk || pk.peak_source === "integrated" || pk.source === "integrated") continue;
+      const hkl = pk.hkl;
+      if (!Array.isArray(hkl) || hkl.length < 3) continue;
+      const hkStr = `${{hkl[0]}},${{hkl[1]}},${{hkl[2]}}`;
+      const bKey = `${{pk.bank}}|${{hkStr}}`;
+      const val = errMap[bKey];
+      if (typeof val === "number" && Number.isFinite(val)) {{
+        pk.angular_error_deg = Number(val.toFixed(4));
+        pk.has_angular_error = true;
+        nMatched++;
+        const prevSnap = _baselineMeasCache.byBankHkl.get(bKey);
+        if (prevSnap) {{
+          prevSnap.angular_error_deg = pk.angular_error_deg;
+          prevSnap.has_angular_error = true;
+        }} else {{
+          _baselineMeasCache.byBankHkl.set(bKey, {{
+            angular_error_deg: pk.angular_error_deg,
+            has_angular_error: true,
+          }});
+        }}
+      }} else {{
+        pk.angular_error_deg = 0.0;
+        pk.has_angular_error = false;
+        const prevSnap = _baselineMeasCache.byBankHkl.get(bKey);
+        if (prevSnap) {{
+          delete prevSnap.angular_error_deg;
+          delete prevSnap.has_angular_error;
+        }}
+      }}
+    }}
+    return nMatched;
+  }}
+
+  function scheduleLiveTofDeltaThetaSync(immediate = false) {{
+    if (!(Boolean(DATA.has_tof_events) || DATA.angular_error_mode === "tof_3d")) return;
+    if (typeof fetch !== "function") return;
+    const ub = getActiveUbMatrix();
+    if (!ub) return;
+    const reqSig = _buildTofDeltaThetaSig();
+    if (reqSig === _lastTofDeltaThetaSig) return;
+
+    if (_tofDeltaThetaTimer) {{
+      clearTimeout(_tofDeltaThetaTimer);
+      _tofDeltaThetaTimer = null;
+    }}
+    const runFetch = () => {{
+      _tofDeltaThetaTimer = null;
+      if (_tofDeltaThetaAbort) {{
+        try {{ _tofDeltaThetaAbort.abort(); }} catch (_e) {{}}
+      }}
+      const ctrl = typeof AbortController === "function" ? new AbortController() : null;
+      _tofDeltaThetaAbort = ctrl;
+      const seq = ++_tofDeltaThetaReqSeq;
+
+      const activeRunIdx = typeof state.selectedFrameIndex === "number"
+        ? state.selectedFrameIndex
+        : (typeof DATA.frame_index === "number" ? DATA.frame_index : 0);
+      const Rrun = getActiveGoniometerR();
+      const sMap = (DATA.sample_offset_lab_per_run && typeof DATA.sample_offset_lab_per_run === "object")
+        ? DATA.sample_offset_lab_per_run
+        : null;
+      const sLab = (sMap && Array.isArray(sMap[String(activeRunIdx)]))
+        ? sMap[String(activeRunIdx)]
+        : (Array.isArray(DATA.sample_offset_lab) ? DATA.sample_offset_lab : [0.0, 0.0, 0.0]);
+      const zoneAxes = Array.isArray(ZONES)
+        ? ZONES
+            .filter(z => z && Array.isArray(z.axis_crystal_xyz) && z.axis_crystal_xyz.length === 3)
+            .map(z => z.axis_crystal_xyz)
+        : [];
+
+      fetch("api/tof_delta_theta", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          frame_index: activeRunIdx,
+          d_min: Number(state.dMin),
+          wavelength_range: [Number(state.lamMin), Number(state.lamMax)],
+          ub_matrix: ub,
+          R_run: Rrun,
+          sample_offset_lab: sLab,
+          ki: DATA.ki,
+          instrument: DATA.instrument,
+          space_group: DATA.space_group,
+          cell: DATA.cell,
+          detector_configs: DATA.detector_configs || null,
+          tof_l1: typeof DATA.tof_l1 === "number" ? DATA.tof_l1 : null,
+          zone_tolerance_deg: Number(state.zoneTolDeg || 0.75),
+          zone_axes_crystal: zoneAxes,
+        }}),
+        signal: ctrl ? ctrl.signal : undefined,
+      }})
+        .then(r => (r && r.ok ? r.json() : null))
+        .then(res => {{
+          if (seq !== _tofDeltaThetaReqSeq || !res || !res.ok || !res.errors) return;
+          _lastTofDeltaThetaSig = reqSig;
+          if (res.angular_error_mode) DATA.angular_error_mode = res.angular_error_mode;
+          if (res.tof_gate) DATA.tof_gate = res.tof_gate;
+          applyTofErrorsMapToPeaks(PREDICTED_PEAKS, res.errors);
+          if (state.peakSource === "predicted" && PEAKS !== PREDICTED_PEAKS) {{
+            applyTofErrorsMapToPeaks(PEAKS, res.errors);
+          }}
+          refreshZonesAngularStatsJS(state.peakSource === "predicted" ? PEAKS : PREDICTED_PEAKS);
+          _peakDataAvailabilitySig = "";
+          updateHUD();
+          renderZoneList();
+          renderDetector();
+          if (state.showStereo) renderStereo();
+        }})
+        .catch(() => {{}});
+    }};
+
+    if (immediate) {{
+      runFetch();
+    }} else {{
+      _tofDeltaThetaTimer = setTimeout(runFetch, 75);
+    }}
+  }}
+
   function estimateActiveFrameAngularErrorsJS(peaks, panelsGeomOpt, RrunOpt, sLabOpt, forceOverwrite = false) {{
+    if (Boolean(DATA.has_tof_events) || DATA.angular_error_mode === "tof_3d") return 0;
     if (!Array.isArray(peaks) || peaks.length === 0 || rawBankGrayMaps.size === 0) return 0;
     const activeRunIdx = typeof state.selectedFrameIndex === "number"
       ? state.selectedFrameIndex
@@ -12306,8 +13886,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (!gm0 || !dt0) continue;
       const sR0 = dt0.n > 1 ? (gm0.h - 1) / (dt0.n - 1) : 1.0;
       const sC0 = dt0.m > 1 ? (gm0.w - 1) / (dt0.m - 1) : 1.0;
-      const rr0 = Number(p0.pixel_r) * sR0;
-      const cc0 = Number(p0.pixel_c) * sC0;
+      const rawR0 = typeof p0.row === "number" ? p0.row : Number(p0.pixel_r);
+      const rawC0 = typeof p0.col === "number" ? p0.col : Number(p0.pixel_c);
+      const rr0 = rawR0 * sR0;
+      const cc0 = rawC0 * sC0;
       if (!Number.isFinite(rr0) || !Number.isFinite(cc0)) continue;
       let arr = predsByBank.get(bk0);
       if (!arr) {{
@@ -12327,13 +13909,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const bk = Number(pk.bank);
       const gmap = rawBankGrayMaps.get(bk);
       const det = detByBank.get(bk);
-      if (!gmap || !det || !Array.isArray(pk.g_hat_crystal) || pk.g_hat_crystal.length < 3) continue;
+      const gh = (Array.isArray(pk.q_hat) && pk.q_hat.length >= 3) ? pk.q_hat : pk.g_hat_crystal;
+      if (!gmap || !det || !Array.isArray(gh) || gh.length < 3) continue;
       const W = gmap.w, H = gmap.h;
       if (W < 8 || H < 8) continue;
       const scaleR = det.n > 1 ? (H - 1) / (det.n - 1) : 1.0;
       const scaleC = det.m > 1 ? (W - 1) / (det.m - 1) : 1.0;
-      const rIm = Number(pk.pixel_r) * scaleR;
-      const cIm = Number(pk.pixel_c) * scaleC;
+      const rawR = typeof pk.row === "number" ? pk.row : Number(pk.pixel_r);
+      const rawC = typeof pk.col === "number" ? pk.col : Number(pk.pixel_c);
+      const rIm = rawR * scaleR;
+      const cIm = rawC * scaleC;
       if (!(rIm >= 1.0 && rIm <= H - 2.0 && cIm >= 1.0 && cIm <= W - 2.0)) continue;
 
       const r0 = Math.round(rIm), c0 = Math.round(cIm);
@@ -12420,7 +14005,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const qcz = Rrun[0][2] * qlx + Rrun[1][2] * qly + Rrun[2][2] * qlz;
       const qcn = Math.hypot(qcx, qcy, qcz);
       if (qcn <= 1e-9) continue;
-      const gh = pk.g_hat_crystal;
       const ghn = Math.hypot(gh[0], gh[1], gh[2]);
       if (ghn <= 1e-9) continue;
       const cosAng = Math.max(-1.0, Math.min(1.0, (qcx * gh[0] + qcy * gh[1] + qcz * gh[2]) / (qcn * ghn)));
@@ -14359,11 +15943,21 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     const rmsPill = document.getElementById("hud-rms-pill");
     if (rmsPill && stats) {{
+      const isTof3d = DATA.angular_error_mode === "tof_3d";
+      const tg = DATA.tof_gate && typeof DATA.tof_gate === "object" ? DATA.tof_gate : null;
+      const gateDesc = (isTof3d && tg && typeof tg.lo === "number" && typeof tg.hi === "number")
+        ? `, gate [${{(tg.lo * 100).toFixed(1)}}%, ${{tg.hi >= 0 ? "+" : ""}}${{(tg.hi * 100).toFixed(1)}}%]` +
+          (typeof tg.l1 === "number" ? `, L1=${{tg.l1.toFixed(2)}} m` : "")
+        : "";
       setElementTooltip(
         rmsPill,
-        stats.nErr > 0
-          ? `Δθ = ${{stats.rmsText}} (across ${{stats.nErr}} matched detector spots in active zones): RMS angular offset between observed spot centroids and theoretical UB·hkl Bragg directions (lower = tighter indexing; updates live during Solve)`
-          : "Δθ: RMS angular offset between observed detector spot centroids and theoretical UB·hkl Bragg directions across active-zone spots (run 2. Solve or enable zones covering observed spots)"
+        isTof3d
+          ? (stats.nErr > 0
+              ? `Δθ (3D ToF) = ${{stats.rmsText}} (across ${{stats.nErr}} ToF-gated 3D spots in active zones${{gateDesc}}): RMS 3D reciprocal-space angular error 2·arcsin(||q_obs − G_pred|| / 2||G_pred||) using current L1+L2 flight path`
+              : "Δθ (3D ToF): RMS 3D reciprocal-space angular error across ToF-gated active-zone spots (run 2. Solve or enable zones covering observed spots)")
+          : (stats.nErr > 0
+              ? `Δθ = ${{stats.rmsText}} (across ${{stats.nErr}} matched detector spots in active zones): RMS angular offset between observed spot centroids and theoretical UB·hkl Bragg directions (lower = tighter indexing; updates live during Solve)`
+              : "Δθ: RMS angular offset between observed detector spot centroids and theoretical UB·hkl Bragg directions across active-zone spots (run 2. Solve or enable zones covering observed spots)")
       );
     }}
     const zonesPill = document.getElementById("hud-zones-pill");
@@ -14833,7 +16427,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.fillStyle = "#94a3b8";
     ctx.font = "10px monospace";
     ctx.fillText("0.0°", 6, h - 3);
-    ctx.fillText("Δθ error", w * 0.42, h - 3);
+    const isTof3dHist = DATA.angular_error_mode === "tof_3d";
+    ctx.fillText(isTof3dHist ? "Δθ (3D ToF)" : "Δθ error", isTof3dHist ? w * 0.36 : w * 0.42, h - 3);
     ctx.fillText("1.5°", w - 28, h - 3);
   }}
 
@@ -18748,6 +20343,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (newPayload.space_group_ops) DATA.space_group_ops = newPayload.space_group_ops;
     if (Array.isArray(newPayload.ki)) DATA.ki = newPayload.ki;
     if (typeof newPayload.has_tof_data === "boolean") DATA.has_tof_data = newPayload.has_tof_data;
+    if (typeof newPayload.has_tof_events === "boolean") DATA.has_tof_events = newPayload.has_tof_events;
+    if (newPayload.angular_error_mode) DATA.angular_error_mode = newPayload.angular_error_mode;
+    if (typeof newPayload.tof_l1 === "number") DATA.tof_l1 = newPayload.tof_l1;
+    if (newPayload.tof_gate !== undefined) DATA.tof_gate = newPayload.tof_gate;
+    _lastTofDeltaThetaSig = "";
     DATA.mtz_overlay_name = newPayload.mtz_overlay_name || null;
     DATA.mtz_overlay_reflections = newPayload.mtz_overlay_reflections || 0;
     DATA.mtz_overlay_matched = newPayload.mtz_overlay_matched || 0;
@@ -19789,6 +21389,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       artifact_kind: artifactKind,
       peak_shape_mode: peakShapeMode,
       has_tof_data: hasTofData,
+      has_tof_events: false,
+      angular_error_mode: "image_2d",
+      tof_gate: null,
       wavelength_range: wlRangeNew,
       d_min: dMinNew,
       goniometer_R: Rrun,

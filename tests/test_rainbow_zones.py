@@ -9707,3 +9707,434 @@ console.log(JSON.stringify({ poolPeaks06, poolPeaks15, ewaldCount: ewaldPeaks06.
             assert bw <= pe["col"] < (W - 1 - bw)
             if int(pe["bank"]) == 1:
                 assert cls_masks[0, round(pe["row"]), round(pe["col"])] == 0
+
+
+def test_tof_gated_3d_spot_angular_errors_and_live_ui(tmp_path) -> None:
+    """Verify 3D ToF-gated peak placement, full 3D q-space angle, L1+L2 sensitivity, 3D Voronoi ownership, and live UI sync."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+
+    from subhkl.config import beamlines
+    from subhkl.instrument.detector import Detector
+    from subhkl.io.events import ANGSTROM_M_PER_US, write_events
+    from subhkl.viz.rainbow_zones import (
+        _estimate_image_spot_angular_errors_deg,
+        _estimate_tof_gated_spot_angular_errors_deg,
+        build_rainbow_zone_payload,
+        compute_live_tof_delta_theta_payload,
+        render_rainbow_html,
+    )
+
+    det32 = Detector(dict(beamlines["MANDI"]["32"]))
+    H, W = int(det32.n), int(det32.m)
+    l1_true = 30.0
+    ki_hat = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    # Geometry at center pixel (128, 128) on MANDI bank 32
+    xyz_c = np.asarray(det32.pixel_to_lab(128.0, 128.0), dtype=float).ravel()
+    l2_c = float(np.linalg.norm(xyz_c))
+    kf_c = xyz_c / l2_c
+    q_dir = kf_c - ki_hat
+    q_unit_norm = float(np.linalg.norm(q_dir))  # 2 * sin(theta)
+    q_hat = q_dir / q_unit_norm
+
+    # Align cubic c* along q_hat so (0, 0, 2) and (0, 0, 3) land on the EXACT SAME pixel (128, 128)
+    # at two distinct wavelengths: lam_2 = 3.60 A, lam_3 = 2.40 A!
+    lam_2 = 3.60
+    d_002 = lam_2 / q_unit_norm
+    a_cell = 2.0 * d_002
+    cell_c = [a_cell, a_cell, a_cell, 90.0, 90.0, 90.0]
+    uc = gemmi.UnitCell(*cell_c)
+    b_mat = np.asarray(uc.frac.mat.tolist(), dtype=float).T
+
+    z_ax = np.array([0.0, 0.0, 1.0])
+    v_cr = np.cross(z_ax, q_hat)
+    s_cr = float(np.linalg.norm(v_cr))
+    c_cr = float(np.dot(z_ax, q_hat))
+    vx = np.array(
+        [[0.0, -v_cr[2], v_cr[1]], [v_cr[2], 0.0, -v_cr[0]], [-v_cr[1], v_cr[0], 0.0]]
+    )
+    u_mat = np.eye(3) + vx + (vx @ vx) * ((1.0 - c_cr) / max(s_cr**2, 1e-12))
+    ub_mat = u_mat @ b_mat
+
+    lam_3 = (2.0 / 3.0) * lam_2  # 2.40 A
+    t_pred_2 = lam_2 * (l1_true + l2_c) / ANGSTROM_M_PER_US
+    t_pred_3 = lam_3 * (l1_true + l2_c) / ANGSTROM_M_PER_US
+
+    # Synthesize sparse CSR event table on bank 32 (plus an empty/background bank 19):
+    # - Uniform broadband Poisson-like background across [15000, 38000] us
+    # - Spot A for (0,0,2): exact pixel (128, 128), exact ToF t_pred_2 -> 3D error ~ 0.0 deg
+    # - Spot B for (0,0,3): exact pixel (128, 128), pure radial ToF shift +0.6% (t_obs = 1.006 * t_pred_3)!
+    #   Note: in 2D images, Spot A and Spot B sit on the EXACT same pixel (128, 128) and have 0 directional error!
+    rng = np.random.default_rng(12345)
+    tof_lists_32: list[list[float]] = []
+    for _p_idx in range(H * W):
+        # 2 background events per pixel across full ToF band
+        bg_ev = rng.uniform(14000.0, 38000.0, size=2).astype(np.float32).tolist()
+        tof_lists_32.append(bg_ev)
+
+    rel_shift_3 = 0.006  # +0.6% ToF shift within gate, zero pixel shift
+    for dr in range(-2, 3):
+        for dc in range(-2, 3):
+            w_sp = np.exp(-0.5 * (dr * dr + dc * dc) / (0.85**2))
+            n_ev2 = round(65.0 * w_sp)
+            n_ev3 = round(65.0 * w_sp)
+            p_flat = (128 + dr) * W + (128 + dc)
+            if n_ev2 > 0:
+                ev2 = rng.normal(t_pred_2, t_pred_2 * 0.0006, size=n_ev2).astype(
+                    np.float32
+                )
+                tof_lists_32[p_flat].extend(ev2.tolist())
+            if n_ev3 > 0:
+                ev3 = rng.normal(
+                    t_pred_3 * (1.0 + rel_shift_3),
+                    t_pred_3 * 0.0006,
+                    size=n_ev3,
+                ).astype(np.float32)
+                tof_lists_32[p_flat].extend(ev3.tolist())
+
+    img_19 = np.zeros((H, W), dtype=np.float32)
+    tof_19 = np.zeros(0, dtype=np.float32)
+    img_32 = np.zeros(H * W, dtype=np.float32)
+    flat_32: list[float] = []
+    for idx_p, ev_l in enumerate(tof_lists_32):
+        if ev_l:
+            ev_s = sorted(ev_l)
+            flat_32.extend(ev_s)
+            img_32[idx_p] = float(len(ev_s))
+    tof_32 = np.asarray(flat_32, dtype=np.float32)
+    imgs_2 = np.stack([img_19, img_32.reshape(H, W)], axis=0)
+
+    merged_h5 = tmp_path / "mandi_tof_3d_merged.h5"
+    with h5py.File(merged_h5, "w") as mf:
+        mf.attrs["instrument"] = "MANDI"
+        mf.create_dataset("images", data=imgs_2)
+        mf.create_dataset("bank_ids", data=np.array([19, 32], dtype=np.int32))
+        mf.create_dataset("file_offsets", data=np.array([0], dtype=np.int32))
+        mf.create_dataset("files", data=np.array(["MANDI_tof3d.nxs.h5"], dtype="S32"))
+        mf.create_group("goniometer").create_dataset(
+            "R", data=np.repeat(np.eye(3)[None], 2, axis=0)
+        )
+        inst_g = mf.create_group("instrument")
+        inst_g.create_dataset("wavelength", data=np.array([1.8, 4.2], dtype=float))
+        write_events(mf, [tof_19, tof_32], l1=l1_true)
+
+    # 1. Compare 2D image vs 3D ToF on the two exact-same-pixel harmonics (0,0,2) and (0,0,3):
+    hkl_pair = np.array([[0, 0, 2], [0, 0, 3]], dtype=np.int32)
+    bank_pair = np.array([32, 32], dtype=np.int32)
+    pr_pair = np.array([128.0, 128.0], dtype=np.float64)
+    pc_pair = np.array([128.0, 128.0], dtype=np.float64)
+    lam_pair = np.array([lam_2, lam_3], dtype=np.float64)
+
+    err_2d, ok_2d = _estimate_image_spot_angular_errors_deg(
+        images_h5=str(merged_h5),
+        frame_slice=(0, 2),
+        hkl_arr=hkl_pair,
+        bank_arr=bank_pair,
+        pixel_r_arr=pr_pair,
+        pixel_c_arr=pc_pair,
+        ub_matrix=ub_mat,
+        R_run=np.eye(3),
+        detectors={32: det32},
+        ki_hat=ki_hat,
+    )
+    assert ok_2d is True
+    assert err_2d is not None
+    # In 2D broadband image, two harmonics on (128, 128) cannot detect radial ToF error (~0 deg)
+    assert np.all(err_2d[np.isfinite(err_2d)] < 0.05)
+
+    # Fix an explicit gate [-0.015, +0.015] via replay_h5 tof_gate so both 0% and +0.6% spots sit cleanly inside core gate
+    solve_h5 = tmp_path / "mandi_tof_3d_solve.h5"
+    with h5py.File(solve_h5, "w") as sf:
+        sf.attrs["instrument"] = "MANDI"
+        sf.attrs["source"] = str(merged_h5)
+        smp = sf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 1")
+        smp.create_dataset("cell", data=np.array(cell_c, dtype=float))
+        for k_n, v_n in zip(("a", "b", "c", "alpha", "beta", "gamma"), cell_c):
+            smp.create_dataset(k_n, data=float(v_n))
+        smp.create_dataset("U", data=u_mat)
+        smp.create_dataset("B", data=b_mat)
+        sf.create_group("goniometer").create_dataset("R", data=np.eye(3)[None])
+        ig = sf.create_group("instrument")
+        ig.create_dataset("wavelength", data=np.array([1.8, 4.2], dtype=float))
+        ig.create_dataset("L1", data=float(l1_true))
+
+    err_3d, ok_3d, gate_meta = _estimate_tof_gated_spot_angular_errors_deg(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_slice=(0, 2),
+        hkl_arr=hkl_pair,
+        bank_arr=bank_pair,
+        pixel_r_arr=pr_pair,
+        pixel_c_arr=pc_pair,
+        lam_arr=lam_pair,
+        ub_matrix=ub_mat,
+        R_run=np.eye(3),
+        detectors={32: det32},
+        ki_hat=ki_hat,
+        instrument="MANDI",
+        tof_l1=l1_true,
+        wavelength_range=(1.8, 4.2),
+    )
+    assert ok_3d is True
+    assert err_3d is not None
+    assert gate_meta is not None
+    # Both overlapping harmonics on pixel (128, 128) are resolved independently in 3D ToF!
+    assert np.all(np.isfinite(err_3d))
+    # (0, 0, 2) has ~0 ToF & spatial error, while (0, 0, 3) has +0.6% radial q-norm error:
+    # Full 3D chord angle = 2 * arcsin(|1/(1+0.006) - 1| / 2) * 180/pi ~= 0.342 deg!
+    expected_3d_deg = float(
+        np.rad2deg(2.0 * np.arcsin(abs(1.0 / (1.0 + rel_shift_3) - 1.0) / 2.0))
+    )
+    assert float(err_3d[0]) < 0.06
+    assert abs(float(err_3d[1]) - expected_3d_deg) < 0.08
+
+    # 2. Verify current L1 + L2 sensitivity: perturbing L1 by +0.30 m (+1% of 30m) shifts (0,0,2)'s 3D error upward!
+    err_3d_bad_l1, ok_bad_l1, _ = _estimate_tof_gated_spot_angular_errors_deg(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_slice=(0, 2),
+        hkl_arr=hkl_pair,
+        bank_arr=bank_pair,
+        pixel_r_arr=pr_pair,
+        pixel_c_arr=pc_pair,
+        lam_arr=lam_pair,
+        ub_matrix=ub_mat,
+        R_run=np.eye(3),
+        detectors={32: det32},
+        ki_hat=ki_hat,
+        instrument="MANDI",
+        tof_l1=l1_true + 0.30,
+        wavelength_range=(1.8, 4.2),
+    )
+    assert ok_bad_l1 is True and err_3d_bad_l1 is not None
+    assert float(err_3d_bad_l1[0]) > float(err_3d[0]) + 0.25
+
+    # 3. Verify 3D Voronoi ownership: add a crowding neighbor whose G_pred sits right on Spot B's shifted q_obs!
+    #    Spot B has q_obs = G_003 / (1 + rel_shift_3). If an impostor reflection sits closer to q_obs than (0,0,3),
+    #    (0,0,3) loses 3D Voronoi ownership (becomes NaN).
+    ub_crowd = ub_mat.copy()
+    hkl_crowd = np.array([[0, 0, 2], [0, 0, 3], [1, 0, 3]], dtype=np.int32)
+    # Place [1, 0, 3] (via tiny a* perturbation along q_hat) almost directly on Spot B's q_obs
+    ub_crowd[:, 0] = -rel_shift_3 * ub_mat[:, 2] * 3.0
+    err_crowd, ok_crowd, _ = _estimate_tof_gated_spot_angular_errors_deg(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_slice=(0, 2),
+        hkl_arr=hkl_crowd,
+        bank_arr=np.array([32, 32, 32], dtype=np.int32),
+        pixel_r_arr=np.array([128.0, 128.0, 145.0], dtype=np.float64),
+        pixel_c_arr=np.array([128.0, 128.0, 145.0], dtype=np.float64),
+        lam_arr=np.array([lam_2, lam_3, lam_3], dtype=np.float64),
+        ub_matrix=ub_crowd,
+        R_run=np.eye(3),
+        detectors={32: det32},
+        ki_hat=ki_hat,
+        instrument="MANDI",
+        tof_l1=l1_true,
+        wavelength_range=(1.8, 4.2),
+    )
+    assert ok_crowd is True and err_crowd is not None
+    assert np.isfinite(err_crowd[0])
+    assert np.isnan(
+        err_crowd[1]
+    )  # stolen in 3D q-space Voronoi by closer lattice point!
+
+    # 4. End-to-end payload + live API helper + client JS sync & 2D/3D guard
+    d_cut_coarse = d_002 * 0.95  # admits (0,0,2) only
+    d_cut_fine = (a_cell / 3.0) * 0.95  # admits both (0,0,2) and (0,0,3)
+    payload_tof = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        images_h5=merged_h5,
+        instrument="MANDI",
+        wavelength_range=(1.8, 4.2),
+        d_min=d_cut_coarse,
+        include_panel_images=False,
+    )
+    assert payload_tof["has_tof_events"] is True
+    assert payload_tof["angular_error_mode"] == "tof_3d"
+    assert abs(float(payload_tof["tof_l1"]) - l1_true) < 1e-6
+    assert isinstance(payload_tof["tof_gate"], dict)
+
+    live_coarse = compute_live_tof_delta_theta_payload(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_index=0,
+        d_min=d_cut_coarse,
+        wavelength_range=(1.8, 4.2),
+        ub_matrix=payload_tof["ub_matrix"],
+        R_run=payload_tof["goniometer_R"],
+        sample_offset_lab=payload_tof["sample_offset_lab"],
+        ki=payload_tof["ki"],
+        instrument="MANDI",
+        space_group=payload_tof["space_group"],
+        cell=payload_tof["cell"],
+        detector_configs=payload_tof["detector_configs"],
+        tof_l1=l1_true,
+    )
+    live_fine = compute_live_tof_delta_theta_payload(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_index=0,
+        d_min=d_cut_fine,
+        wavelength_range=(1.8, 4.2),
+        ub_matrix=payload_tof["ub_matrix"],
+        R_run=payload_tof["goniometer_R"],
+        sample_offset_lab=payload_tof["sample_offset_lab"],
+        ki=payload_tof["ki"],
+        instrument="MANDI",
+        space_group=payload_tof["space_group"],
+        cell=payload_tof["cell"],
+        detector_configs=payload_tof["detector_configs"],
+        tof_l1=l1_true,
+    )
+    assert live_coarse["ok"] is True and live_fine["ok"] is True
+    assert "32|0,0,2" in live_coarse["errors"]
+    assert "32|0,0,3" not in live_coarse["errors"]
+    assert "32|0,0,2" in live_fine["errors"] and "32|0,0,3" in live_fine["errors"]
+
+    # Shifting detector bank 32 center outward by 15 cm along kf_c via live detector_configs changes L2 (~0.5% of L1+L2) and shifts 3D error by ~0.28 deg!
+    shifted_cfgs = json.loads(json.dumps(payload_tof["detector_configs"]))
+    shifted_cfgs["32"]["center"] = (
+        np.asarray(shifted_cfgs["32"]["center"], dtype=float) + 0.15 * kf_c
+    ).tolist()
+    live_shifted_l2 = compute_live_tof_delta_theta_payload(
+        images_h5=str(merged_h5),
+        replay_h5=str(solve_h5),
+        frame_index=0,
+        d_min=d_cut_coarse,
+        wavelength_range=(1.8, 4.2),
+        ub_matrix=payload_tof["ub_matrix"],
+        R_run=payload_tof["goniometer_R"],
+        sample_offset_lab=payload_tof["sample_offset_lab"],
+        ki=payload_tof["ki"],
+        instrument="MANDI",
+        space_group=payload_tof["space_group"],
+        cell=payload_tof["cell"],
+        detector_configs=shifted_cfgs,
+        tof_l1=l1_true,
+    )
+    assert (
+        live_shifted_l2["errors"]["32|0,0,2"] > live_coarse["errors"]["32|0,0,2"] + 0.15
+    )
+
+    if shutil.which("node"):
+        html_doc = render_rainbow_html(payload_tof)
+        scripts = re.findall(r"<script>([\s\S]*?)</script>", html_doc)
+        js_src = scripts[-1]
+        iife_end = js_src.rfind("})();")
+        assert iife_end > 0
+        live_fine_json = json.dumps(live_fine)
+        js_harness = """
+const elems = new Map();
+function makeEl(id = "") {
+  const listeners = {};
+  return {
+    id, tagName: "DIV", value: "", min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: 800, height: 520, clientWidth: 800, clientHeight: 520,
+    scrollWidth: 800, scrollHeight: 520, scrollTop: 0, offsetWidth: 800, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null, dataset: {},
+    style: new Proxy({}, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: { add() {}, remove() {}, toggle() { return false; }, contains() { return false; } },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) { (listeners[evObj.type] || []).forEach(fn => fn(evObj)); },
+    appendChild(c) { return c; }, insertBefore(c) { return c; }, replaceChildren() {},
+    setAttribute() {}, getAttribute() { return null; }, removeAttribute() {},
+    getBoundingClientRect() { return { left: 0, top: 0, right: 800, bottom: 520, width: 800, height: 520 }; },
+    getContext() {
+      return {
+        fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+        textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+        setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+        transform() {}, clearRect() {}, fillRect() {}, strokeRect() {},
+        beginPath() {}, closePath() {}, moveTo() {}, lineTo() {}, arc() {}, ellipse() {},
+        quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+        stroke() {}, fill() {}, clip() {}, save() {}, restore() {}, setLineDash() {},
+        fillText() {}, strokeText() {}, drawImage() {},
+        measureText(t) { return { width: String(t).length * 6 }; },
+        createLinearGradient() { return { addColorStop() {} }; },
+        createRadialGradient() { return { addColorStop() {} }; },
+        getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+        putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+      };
+    },
+    querySelector() { return makeEl(); }, querySelectorAll() { return []; }, closest() { return null; },
+  };
+}
+function getEl(id) { if (!elems.has(id)) elems.set(id, makeEl(id)); return elems.get(id); }
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.requestAnimationFrame = () => 1;
+globalThis.cancelAnimationFrame = () => {};
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.Image = class { set src(_v) {} };
+globalThis.document = {
+  body: makeEl("body"), documentElement: makeEl("html"),
+  getElementById: (id) => getEl(id),
+  createElement: (tag) => makeEl(tag),
+  querySelector: () => makeEl(), querySelectorAll: () => [],
+  addEventListener() {}, removeEventListener() {},
+};
+"""
+        js_probe = f"""
+// 1. Verify 2D estimateActiveFrameAngularErrorsJS is strictly guarded in tof_3d mode!
+const guardCount = estimateActiveFrameAngularErrorsJS(PEAKS, true);
+
+// 2. Slide dMin down to d_cut_fine and apply live ToF 3D response via applyTofErrorsMapToPeaks
+state.dMin = {d_cut_fine:.6f};
+repredictPeaksDynamic({{ preserveSource: true }});
+const liveResp = {live_fine_json};
+const matchedCount = applyTofErrorsMapToPeaks(PEAKS, liveResp.errors || {{}});
+refreshZonesAngularStatsJS();
+syncTopBarTooltips();
+const p002 = PEAKS.find(p => p.bank === 32 && p.hkl[0] === 0 && p.hkl[1] === 0 && p.hkl[2] === 2);
+const p003 = PEAKS.find(p => p.bank === 32 && p.hkl[0] === 0 && p.hkl[1] === 0 && p.hkl[2] === 3);
+const pillTooltip = getEl("hud-rms-pill").title;
+
+console.log(JSON.stringify({{
+  guardCount,
+  matchedCount,
+  err002: p002 ? p002.angular_error_deg : null,
+  err003: p003 ? p003.angular_error_deg : null,
+  pillTooltip,
+}}));
+}})();
+"""
+        js_path = tmp_path / "tof_3d_ui_test.js"
+        js_path.write_text(
+            js_harness + "\n" + js_src[:iife_end] + "\n" + js_probe, encoding="utf-8"
+        )
+        proc = subprocess.run(
+            ["node", str(js_path)], check=True, capture_output=True, text=True
+        )
+        js_out = json.loads(proc.stdout.strip())
+        assert js_out["guardCount"] == 0
+        assert js_out["matchedCount"] >= 2
+        assert js_out["err002"] is not None and float(js_out["err002"]) < 0.06
+        assert (
+            js_out["err003"] is not None
+            and abs(float(js_out["err003"]) - expected_3d_deg) < 0.08
+        )
+        assert "3D ToF" in js_out["pillTooltip"]

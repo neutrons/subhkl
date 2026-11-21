@@ -504,6 +504,10 @@ class NovaGalaxyPipelineRunner:
         self._upload_lock = threading.RLock()
         self._dataset_sig_by_path: dict[str, tuple[int, int, str]] = {}
         self._auto_discover_local_galaxy()
+        with contextlib.suppress(ImportError):
+            from subhkl.viz.rainbow_zones import register_remote_tof_slab_loader
+
+            register_remote_tof_slab_loader(self._load_slim_remote_tof_slab)
 
     def _sync_job_timing(self, job_record: dict[str, Any] | None) -> None:
         """Update per-step elapsed millisecond timing metadata on ``job_record`` and ``self.step_timings``."""
@@ -1292,6 +1296,92 @@ class NovaGalaxyPipelineRunner:
                     continue
                 hf_in.copy(key, hf_out, name=key)
         return True
+
+    def _load_slim_remote_tof_slab(
+        self,
+        slim_h5_path: str,
+        f0: int,
+        f1: int,
+        imgs_slab: Any,
+    ) -> tuple[Any, Any] | None:
+        """Fetch only the active frame's ``[f0:f1]`` ``events/tof`` slice for a slimmed remote HDF5."""
+        ds_id, total_sz = self._read_h5_galaxy_provenance(slim_h5_path)
+        if not ds_id:
+            return None
+        try:
+            import h5py
+            import numpy as np
+
+            # 1) Shared filesystem path if mounted
+            with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
+                info = self._api_request("GET", f"/api/datasets/{ds_id}", timeout=8.0)
+                if isinstance(info, dict):
+                    shared_fn = str(info.get("file_name") or "").strip()
+                    if shared_fn and os.path.isfile(shared_fn):
+                        from subhkl.io.events import EventStore
+
+                        with EventStore(shared_fn) as store:
+                            tof_s, off_s, _ = store.read_slab(
+                                np.arange(f0, f1, dtype=np.int64), imgs_slab
+                            )
+                            return tof_s, off_s
+                    if total_sz <= 0:
+                        total_sz = int(info.get("file_size") or 0)
+
+            # 2) HTTP Range slice read from Galaxy without downloading full multi-GB file
+            if not self.galaxy_url or total_sz <= 0:
+                return None
+            import requests
+
+            path = f"/api/datasets/{ds_id}/display"
+            url = f"{self.galaxy_url}{path}"
+            headers: dict[str, str] = {"Accept": "*/*", "X-Accel-Buffering": "no"}
+            if self.galaxy_api_key:
+                url = f"{url}?key={urllib.parse.quote(self.galaxy_api_key)}"
+                headers["x-api-key"] = self.galaxy_api_key
+            probe_h = dict(headers)
+            probe_h["Range"] = (
+                f"bytes=0-{min(total_sz - 1, _HTTP_RANGE_BLOCK_BYTES - 1)}"
+            )
+            resp = requests.get(url, headers=probe_h, stream=True, timeout=(10.0, 30.0))
+            if resp.status_code != 206:
+                resp.close()
+                return None
+            first_blk = resp.content
+            resp.close()
+            rng = _HttpRangeReader(
+                url=url,
+                headers=headers,
+                total_size=total_sz,
+                initial_block=first_blk,
+            )
+            try:
+                with h5py.File(rng, "r") as hf_r:
+                    if "events/tof" not in hf_r or "events/image_offsets" not in hf_r:
+                        return None
+                    img_offs = np.asarray(
+                        hf_r["events/image_offsets"][()], dtype=np.int64
+                    )
+                    lo_ev = int(img_offs[f0])
+                    hi_ev = int(img_offs[f1])
+                    tof_s = np.asarray(
+                        hf_r["events/tof"][lo_ev:hi_ev], dtype=np.float32
+                    )
+                    n_imgs = f1 - f0
+                    n_pix = int(imgs_slab[0].size) if n_imgs > 0 else 0
+                    off_s = np.empty((n_imgs, n_pix + 1), dtype=np.int64)
+                    counts = np.asarray(imgs_slab, dtype=np.int64).reshape(
+                        n_imgs, n_pix
+                    )
+                    np.cumsum(counts, axis=1, out=off_s[:, 1:])
+                    bases = img_offs[f0:f1] - lo_ev
+                    off_s[:, 0] = bases
+                    off_s[:, 1:] += bases[:, None]
+                    return tof_s, off_s
+            finally:
+                rng.close()
+        except (_RangeFallbackError, *_NOVA_RECOVERABLE_ERRORS):
+            return None
 
     @staticmethod
     def _check_scratch_space(parent_dir: str, required_bytes: int, label: str) -> None:
@@ -9692,6 +9782,66 @@ def serve_rainbow_zones(
                         req_json.get("stage_id")
                     )
                     code = 200
+                except _NOVA_RECOVERABLE_ERRORS as exc:
+                    result = {"ok": False, "error": str(exc)}
+                    code = 400
+                body = json.dumps(result).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if req_path == "/api/tof_delta_theta":
+                content_len = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                try:
+                    from subhkl.viz.rainbow_zones import (
+                        compute_live_tof_delta_theta_payload,
+                    )
+
+                    req_json = json.loads(raw_body.decode("utf-8") or "{}")
+                    with vm_lock:
+                        cur_imgs = vm.payload_kwargs.get("images_h5") or vm.payload.get(
+                            "images_h5"
+                        )
+                        cur_replay = vm.replay_h5
+                        def_inst = str(vm.payload.get("instrument") or "IMAGINE")
+                        def_sg = str(vm.payload.get("space_group") or "P 1")
+                        def_cell = vm.payload.get("cell")
+                        def_wl = vm.payload.get("wavelength_range") or [2.0, 4.0]
+                        def_dmin = float(vm.payload.get("d_min") or 1.5)
+                        def_ki = vm.payload.get("ki") or [0.0, 0.0, 1.0]
+                    if not cur_imgs and cur_replay:
+                        cur_imgs = (
+                            vm.pipeline_runner._discover_or_fetch_galaxy_images_h5(
+                                cur_replay
+                            )
+                        )
+                    wl_in = req_json.get("wavelength_range") or def_wl
+                    wl_tup = (float(wl_in[0]), float(wl_in[1]))
+                    result = compute_live_tof_delta_theta_payload(
+                        images_h5=cur_imgs,
+                        replay_h5=cur_replay,
+                        frame_index=int(req_json.get("frame_index") or 0),
+                        d_min=float(req_json.get("d_min") or def_dmin),
+                        wavelength_range=wl_tup,
+                        ub_matrix=req_json.get("ub_matrix"),
+                        R_run=req_json.get("R_run"),
+                        sample_offset_lab=req_json.get("sample_offset_lab"),
+                        ki=req_json.get("ki") or def_ki,
+                        instrument=str(req_json.get("instrument") or def_inst),
+                        space_group=str(req_json.get("space_group") or def_sg),
+                        cell=req_json.get("cell") or def_cell,
+                        detector_configs=req_json.get("detector_configs"),
+                        tof_l1=req_json.get("tof_l1"),
+                        zone_axes_crystal=req_json.get("zone_axes_crystal"),
+                        zone_tolerance_deg=float(
+                            req_json.get("zone_tolerance_deg") or 0.75
+                        ),
+                    )
+                    code = 200 if result.get("ok") else 400
                 except _NOVA_RECOVERABLE_ERRORS as exc:
                     result = {"ok": False, "error": str(exc)}
                     code = 400
