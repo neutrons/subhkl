@@ -4,6 +4,75 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.7]
+
+### Fixed
+
+- **Rhombohedral hexagonal (`:H`) vs. primitive rhombohedral (`:R`) space-group settings in cell refinement and UI**:
+  - `gemmi.SpaceGroup` reports `ext='H', centring_type()='R'` for
+    hexagonal-axes `R` space groups (`R 3`, `R 3:H`, `R -3 m`) and
+    `ext='R', centring_type()='P'` for primitive rhombohedral-axes settings
+    (`R 3:R`, `R -3 m :R`).
+  - Fixed `optimization.get_lattice_system` and
+    `scan_band._cell_symmetry_spec` to inspect `sg.ext == 'R'` rather than
+    `centering == 'R'`, preserving hexagonal cell constraints
+    ($a=b\neq c,\,90^\circ,90^\circ,120^\circ$, 3-point `R` centering) on
+    default/`:H` `R` groups and primitive rhombohedral angle/length constraints
+    ($a=b=c,\,\alpha=\beta=\gamma$, `P` centering) on `:R` groups.
+  - Prevented `trigonal_r` from overwriting bare `R` symbols (`"R 3"`,
+    `"R -3 m"`, `"R 3 2"`) in Rainbow Zones' client-side `SG_SYMMETRY_LOOKUP`.
+
+## [1.6.6]
+
+### Added
+
+- Cell- and $d_{\min}$-aware automatic `Solve` band binning (`binning=4` on
+  $\le 256\times 256$ panels for dense long-axis cells), `b2=2` (`128×128`)
+  Ewald excess maps, and a `<option value="2">2</option>` binning option in the
+  Rainbow Zones `Params` drawer.
+- Live client-side HUD `Δθ` (`angular_rms_deg`) recomputation in Rainbow Zones
+  when switching scan frames or dragging wavelength, $d_{\min}$, or manual
+  orientation controls.
+
+### Fixed
+
+- **Long-axis joint scan refinement, per-run crystal slip, and Stage 4 ICP aliasing (`scan_refine`, `scan_band`)**:
+  - Computed exact metric-tensor unit-cell volume and Bravais centering
+    multiplicity in `_ewald_d_min`, applied the Laue kinematic lower bound
+    $q_{\min} = 2\sin\theta_{\min}/\lambda_{\max}$, and stratified large
+    Ewald reflection pools across $|G|$ shells instead of truncating to
+    overlapping inner rings.
+  - Added per-run Gaussian zone-band pre-alignment (`_zone_funnel_seed_per_run`,
+    $\pm 3.8^\circ$) plus fine-stepped `polish_per_run` to capture genuine
+    inter-batch crystal slips into `R_refined[r]` without rigid-orientation
+    overwrites, direct Stage 3 Ewald unit-cell axis-ratio polish, and
+    off-singularity `Y-Z-Y` gimbal-lock seeds in `_decompose_R_to_angles`.
+  - Adapted Stage 4 per-run ICP matching radii to median nearest-neighbor
+    predicted spot spacing with unambiguous second-neighbor filtering
+    (`d2_best < 0.55 * d2_second`) and an Ewald non-degradation guard.
+- **Missing (`"-"`) and neighbor-contaminated HUD `Δθ` on multi-frame datasets (`rainbow_zones`)**:
+  - Resolved `bank_ids` before `banks` in `_load_cached_frame_bank_images` (fixing
+    `Δθ = "-"` on frames $\ge 1$ and bank-scrambling on non-contiguous detector
+    bank lists) and enforced Voronoi nearest-predicted-reflection ownership in
+    both Python and client-side JS spot-centroid error estimation.
+
+## [1.6.5]
+
+### Added
+
+- Promoted the wavelength interval ($\lambda_{\min}$–$\lambda_{\max}$) to a
+  dedicated dual-knob (`[` and `]`) sidebar range slider above $d_{\min}$ in
+  Rainbow Zones and simplified the `Params` drawer to `Unit cell / Params`.
+
+### Fixed
+
+- Fixed `ReferenceError: getActiveWulffSourceArray is not defined` in
+  `updatePeakInspector` when hovering detector panels.
+- Wired `stage_derived_h5_in_work_dir` and background `Reduce` frame hydration
+  into the Trame `MainApp` / `SubhklGalaxyModel.refresh_payload` path (plus
+  `.reduce.h5` → `.nxs.h5` provenance recovery) so reloading `solve.h5` or
+  `integrated.h5` from NDIP Galaxy History regenerates detector images.
+
 ## [1.6.4]
 
 ### Added

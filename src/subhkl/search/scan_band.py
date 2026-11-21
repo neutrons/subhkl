@@ -136,10 +136,14 @@ def _cell_symmetry_spec(cell, space_group):
     if sys_str == "hexagonal":
         return "hexagonal", (0,)
     if sys_str == "trigonal":
-        if (
+        sg_ext = getattr(sg, "ext", "")
+        raw_sg = str(space_group or "").strip().upper()
+        if sg_ext == "R" or (
             centering == "R"
+            and not raw_sg.endswith(":H")
             and np.allclose([a0, b0], [c0, c0], atol=0.05)
             and np.allclose([al0, be0], [ga0, ga0], atol=0.5)
+            and not np.isclose(al0, 90.0, atol=0.5)
         ):
             return "rhombohedral", (2,)
         return "hexagonal", (0,)
