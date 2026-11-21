@@ -241,7 +241,6 @@ class Peaks:
         frame_to_run=None,
         harmonic_rot=None,
     ) -> dict:
-        peak_dict = {}
         tasks = orchestrator.prepare_predict_tasks(
             image_data=self.image,
             instrument=self.instrument,
@@ -267,46 +266,9 @@ class Peaks:
             harmonic_rot=harmonic_rot,
         )
 
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-        os.environ.setdefault("OMP_NUM_THREADS", "1")
-        os.environ.setdefault("MKL_NUM_THREADS", "1")
-        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-        effective_workers = min(int(max_workers), 8) if max_workers is not None else 8
+        from subhkl.instrument.physics import predict_peaks_batch_gpu
 
-        ctx = multiprocessing.get_context("spawn")
-        with ProcessPoolExecutor(
-            mp_context=ctx, max_workers=effective_workers
-        ) as executor:
-            futures_to_bank = {
-                executor.submit(worker.predict_single_bank, *t): t[0] for t in tasks
-            }
-
-            results_by_bank = {}
-            for future in tqdm(
-                as_completed(futures_to_bank),
-                total=len(futures_to_bank),
-                desc="Predicting",
-                disable=not show_progress,
-            ):
-                bank_id = futures_to_bank[future]
-                try:
-                    _, res = future.result()
-                    if res:
-                        results_by_bank[bank_id] = res
-                except (
-                    OSError,
-                    RuntimeError,
-                    ValueError,
-                    TypeError,
-                    KeyError,
-                    IndexError,
-                ) as e:
-                    print(f"Prediction failed for bank {bank_id}: {e}")
-
-        for bank_id in sorted(results_by_bank.keys()):
-            peak_dict[bank_id] = results_by_bank[bank_id]
-
-        return peak_dict
+        return predict_peaks_batch_gpu(tasks, show_progress=show_progress)
 
     def write_hdf5(self, output_filename, detector_peaks, instrument_wavelength):
         """

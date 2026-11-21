@@ -23,6 +23,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     directional panel hemisphere LUT: Tier 1 keeps `1×` overview crisp (`~300`
     spots), while zooming into a detector bank streams sub-Ångström reflections
     for the visible panel tile down to `0.50 Å` with crowd-aware spot sizing.
+- **GPU multi-panel peak prediction & fixed-chunk $O(n)$ TOF-gated integration for large macromolecular unit cells (`physics`, `tof_gate`, `detector`)**:
+  - Replaced per-bank `ProcessPoolExecutor` peak prediction (which regenerated
+    millions of `(h, k, l)` tuples inside every worker process, taking ~3–4 min
+    on `P 61 2 2` at $d_{\min} = 1.0\text{ Å}$) with `predict_peaks_batch_gpu`:
+    generates candidate `(h, k, l)` once, filters Ewald shells and batches flat
+    or curved panel intersections on GPU using static-shape `Precision.HIGHEST`
+    kernels (~1.6–2.1 s across 41–164 banks), and finalizes surviving hits in
+    float64 for exact parity with `predict_single_bank`.
+  - Eliminated per-bank XLA JIT recompilation stalls and $O(n^2)$ host overhead
+    in `integrate_reflections_tof_gated` by evaluating `_scatter_events_impl`,
+    `_box_sums_impl`, `_tiles_impl`, `_snap_positions_impl`, and
+    `_solve_tiles` in fixed-size chunks, freeing intermediate 3D prefix cubes
+    immediately after sideband box sums, replacing dense $n \times n$ neighbor
+    broadcasts and `np.nanmedian` with `scipy.spatial.cKDTree` sparse Chebyshev
+    queries + vectorized masked row medians, and prefetching next-bank events in
+    a background thread.
 
 ### Fixed
 
