@@ -6264,6 +6264,47 @@ def _estimate_image_spot_angular_errors_deg(
     return out_err, True
 
 
+def _stratified_spherical_subsample(
+    pts: np.ndarray,
+    max_peaks: int,
+    priority_arr: np.ndarray | None = None,
+    sample_offset_lab: Any = None,
+) -> np.ndarray:
+    """Select up to `max_peaks` indices stratified uniformly over solid angle."""
+    n_raw = len(pts)
+    if n_raw <= max_peaks:
+        return np.arange(n_raw, dtype=int)
+    s0 = np.zeros(3, dtype=float)
+    if sample_offset_lab is not None:
+        s_try = np.asarray(sample_offset_lab, dtype=float).reshape(-1)
+        if s_try.size == 3 and np.all(np.isfinite(s_try)):
+            s0 = s_try
+    rel = np.asarray(pts, dtype=float) - s0[None, :]
+    r = np.maximum(np.linalg.norm(rel, axis=1), 1e-12)
+    az01 = (np.arctan2(rel[:, 0], rel[:, 2]) + np.pi) * (1.0 / (2.0 * np.pi))
+    el01 = 0.5 * (rel[:, 1] / r + 1.0)
+    cx = np.clip((az01 * 128.0).astype(np.int32), 0, 127)
+    cy = np.clip((el01 * 64.0).astype(np.int32), 0, 63)
+    cells = (cy << 7) | cx
+
+    if priority_arr is not None and len(priority_arr) == n_raw:
+        pri = np.where(np.isfinite(priority_arr), priority_arr, -1e30)
+        by_pri = np.argsort(-pri, kind="stable")
+    else:
+        by_pri = np.arange(n_raw, dtype=int)
+
+    cells_pri = cells[by_pri]
+    cell_sort = np.argsort(cells_pri, kind="stable")
+    sorted_cells = cells_pri[cell_sort]
+    first_idx = np.r_[0, np.flatnonzero(np.diff(sorted_cells)) + 1]
+    counts = np.diff(np.r_[first_idx, n_raw])
+    ranks_sorted = np.arange(n_raw, dtype=np.int32) - np.repeat(first_idx, counts)
+    ranks = np.empty(n_raw, dtype=np.int32)
+    ranks[cell_sort] = ranks_sorted
+    keep_in_pri = np.argsort(ranks, kind="stable")[:max_peaks]
+    return np.sort(by_pri[keep_in_pri])
+
+
 def _serialize_peak_entries(
     pts: np.ndarray,
     *,
@@ -6302,12 +6343,20 @@ def _serialize_peak_entries(
     pts = np.asarray(pts, dtype=float)
     n_raw = len(pts)
     if n_raw > max_peaks:
-        order = (
-            np.argsort(-np.asarray(intensity_arr))[:max_peaks]
-            if intensity_arr is not None and len(intensity_arr) == n_raw
-            else np.linspace(0, n_raw - 1, max_peaks, dtype=int)
+        pri_arr: np.ndarray | None = None
+        if intensity_arr is not None and len(intensity_arr) == n_raw:
+            pri_arr = np.asarray(intensity_arr, dtype=float)
+        elif ub_matrix is not None and hkl_arr is not None and len(hkl_arr) == n_raw:
+            g_cryst = (
+                np.asarray(hkl_arr, dtype=float) @ np.asarray(ub_matrix, dtype=float).T
+            )
+            pri_arr = 1.0 / np.maximum(np.linalg.norm(g_cryst, axis=1), 1e-12)
+        order = _stratified_spherical_subsample(
+            pts,
+            int(max_peaks),
+            priority_arr=pri_arr,
+            sample_offset_lab=sample_offset_lab,
         )
-        order = np.sort(order)
         pts = pts[order]
         if bank_arr is not None and len(bank_arr) == n_raw:
             bank_arr = bank_arr[order]
@@ -7090,7 +7139,7 @@ def build_rainbow_zone_payload(
     is_integrated_artifact = artifact_kind in ("integrator", "merged_careless")
     primary_source = "integrated" if is_integrated_artifact else "predicted"
     primary_max_peaks = (
-        int(max_peaks) if is_integrated_artifact else max(int(max_peaks), 12000)
+        max(int(max_peaks), 12000) if int(max_peaks) == 2500 else int(max_peaks)
     )
 
     default_d_min = round(0.5 * float(wl_min), 2)
@@ -9787,14 +9836,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   const ABS_DMIN_FLOOR = 0.50;
   const MAX_DYNAMIC_LATTICE_POINTS = 2000000;
   const MAX_EWALD_SHELL_EVALS = 45000000;
-  const MAX_DYNAMIC_FRAME_PEAKS = 24000;
-  const MAX_VIEWPORT_PATCH_PEAKS = 12000;
-  const MAX_DYNAMIC_SAMPLE_PEAKS = 24000;
+  const MAX_DYNAMIC_FRAME_PEAKS = 36000;
+  const MAX_VIEWPORT_PATCH_PEAKS = 20000;
+  const MAX_DYNAMIC_SAMPLE_PEAKS = 36000;
   let _dynPredEpoch = 0;
   let _dynHklPool = null;
   let _dynEwaldTruncated = false;
   let _dynEwaldRawTotal = 0;
-  let _dynViewportPatchCache = {{ sig: "", peaks: [], rawTotal: 0 }};
+  let _dynViewportPatchCache = {{ sig: "", peaks: [], rawTotal: 0, bvh: null, bvhZonesSig: "" }};
   let _dynSgHelperCache = {{ key: "", helper: null }};
   let _dynMultiRunTimer = null;
   let _dynPendingMultiRunFn = null;
@@ -9812,6 +9861,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     mtzExactLookup: null,
     minIntegD: Infinity,
   }};
+  const _detBvhCache = {{
+    sig: "",
+    firstRef: null,
+    bvh: null,
+  }};
   const _detLodCache = {{
     sig: "",
     firstRef: null,
@@ -9819,7 +9873,18 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     lodDcut: 0.0,
     isLodThinned: false,
     totalCount: 0,
+    inViewCount: 0,
     activeDmin: 0.0,
+  }};
+  const _wulffBvhCache = {{
+    sig: "",
+    firstRef: null,
+    bvh: null,
+  }};
+  const _wulffLodCache = {{
+    sig: "",
+    firstRef: null,
+    value: null,
   }};
 
   const _MEAS_KEYS = [
@@ -10349,6 +10414,101 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return out;
   }}
 
+  // Spatially stratified O(N) solid-angle selector:
+  // Ranks reflections within 256x128 = 32,768 equal-area spherical cells (highest d first per cell),
+  // guaranteeing uniform 4*pi detector/Wulff coverage across forward AND back-scattering banks
+  // while keeping low-order landmarks at rank 0 as d_min decreases.
+  function selectSpatiallyStratifiedOrder(nRaw, hitD, dirX, dirY, dirZ, ox, oy, oz, nKeep, alreadyDescD) {{
+    const byD = new Int32Array(nRaw);
+    if (alreadyDescD) {{
+      for (let i = 0; i < nRaw; i++) byD[i] = i;
+    }} else if (nRaw <= 12000) {{
+      for (let i = 0; i < nRaw; i++) byD[i] = i;
+      byD.sort((ia, ib) => hitD[ib] - hitD[ia]);
+    }} else {{
+      let dLo = Infinity, dHi = -Infinity;
+      for (let i = 0; i < nRaw; i++) {{
+        const dv = hitD[i];
+        if (dv < dLo) dLo = dv;
+        if (dv > dHi) dHi = dv;
+      }}
+      const NB = 4096;
+      const spanD = Math.max(1e-9, dHi - dLo);
+      const scaleB = (NB - 1) / spanD;
+      const bCounts = new Int32Array(NB);
+      const bIdx = new Uint16Array(nRaw);
+      for (let i = 0; i < nRaw; i++) {{
+        const b = Math.max(0, Math.min(NB - 1, ((dHi - hitD[i]) * scaleB) | 0));
+        bIdx[i] = b;
+        bCounts[b]++;
+      }}
+      const bOff = new Int32Array(NB);
+      let acc = 0;
+      for (let b = 0; b < NB; b++) {{
+        bOff[b] = acc;
+        acc += bCounts[b];
+      }}
+      for (let i = 0; i < nRaw; i++) {{
+        byD[bOff[bIdx[i]]++] = i;
+      }}
+    }}
+    if (nRaw <= nKeep) return byD;
+
+    const uArr = new Float32Array(nRaw);
+    const vArr = new Float32Array(nRaw);
+    let minU = 1.0, maxU = 0.0, minV = 1.0, maxV = 0.0;
+    const invTwoPi = 1.0 / (2.0 * Math.PI);
+    for (let i = 0; i < nRaw; i++) {{
+      const dx = dirX[i] - ox;
+      const dy = dirY[i] - oy;
+      const dz = dirZ[i] - oz;
+      const invR = 1.0 / Math.max(1e-12, Math.hypot(dx, dy, dz));
+      const u = (Math.atan2(dx, dz) + Math.PI) * invTwoPi;
+      const v = (dy * invR + 1.0) * 0.5;
+      uArr[i] = u;
+      vArr[i] = v;
+      if (u < minU) minU = u;
+      if (u > maxU) maxU = u;
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }}
+    const localTile = (maxU - minU) < 0.55 && (maxV - minV) < 0.55;
+    const uBase = localTile ? minU : 0.0;
+    const vBase = localTile ? minV : 0.0;
+    const invSpanU = localTile ? (1.0 / Math.max(1e-6, maxU - minU)) : 1.0;
+    const invSpanV = localTile ? (1.0 / Math.max(1e-6, maxV - minV)) : 1.0;
+
+    const cellCounts = new Uint16Array(32768);
+    const ranks = new Uint16Array(nRaw);
+    let maxRank = 0;
+    for (let p = 0; p < nRaw; p++) {{
+      const idx = byD[p];
+      const cx = Math.max(0, Math.min(255, (((uArr[idx] - uBase) * invSpanU) * 256.0) | 0));
+      const cy = Math.max(0, Math.min(127, (((vArr[idx] - vBase) * invSpanV) * 128.0) | 0));
+      const cell = (cy << 8) | cx;
+      const r = cellCounts[cell];
+      ranks[p] = r;
+      if (r > maxRank) maxRank = r;
+      if (r < 65535) cellCounts[cell] = r + 1;
+    }}
+
+    const rBuckets = maxRank + 1;
+    const rCounts = new Int32Array(rBuckets);
+    for (let p = 0; p < nRaw; p++) rCounts[ranks[p]]++;
+    const rOff = new Int32Array(rBuckets);
+    let rAcc = 0;
+    for (let r = 0; r < rBuckets; r++) {{
+      rOff[r] = rAcc;
+      rAcc += rCounts[r];
+    }}
+    const out = new Int32Array(nKeep);
+    for (let p = 0; p < nRaw; p++) {{
+      const dst = rOff[ranks[p]]++;
+      if (dst < nKeep) out[dst] = byD[p];
+    }}
+    return out;
+  }}
+
   function raycastRunFromDynamicPool(pool, nActive, Rrun, sLab, panelsGeom, wlMin, wlMax, dMinEff, runIdx, isActiveFrame, maxOutPeaks) {{
     if (!pool || nActive <= 0 || panelsGeom.length === 0) return [];
     const kiRaw = Array.isArray(DATA.ki) && DATA.ki.length === 3 ? DATA.ki : [0.0, 0.0, 1.0];
@@ -10380,8 +10540,22 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       asuHArr, asuKArr, asuLArr, asuFrArr, asuBijArr, orbColArr, harmOrdArr, sgHelper,
     }} = pool;
 
-    const peaks = [];
     const nPanels = panelsGeom.length;
+    const hitPoolIdx = [];
+    const hitPIdx = [];
+    const hitRow = [];
+    const hitCol = [];
+    const hitPtX = [];
+    const hitPtY = [];
+    const hitPtZ = [];
+    const hitGlx = [];
+    const hitGly = [];
+    const hitGlz = [];
+    const hitLam = [];
+    const hitD = [];
+    const hitDirX = isActiveFrame ? hitPtX : [];
+    const hitDirY = isActiveFrame ? hitPtY : [];
+    const hitDirZ = isActiveFrame ? hitPtZ : [];
 
     for (let i = 0; i < nActive; i++) {{
       const gx = gxArr[i], gy = gyArr[i], gz = gzArr[i];
@@ -10455,121 +10629,166 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           if (colF < 0.0 || colF >= det.m) continue;
         }}
 
-        const hv = hArr[i], kv = kArr[i], lv = lArr[i];
-        const dVal = dArr[i];
-        const invQn = 1.0 / Math.max(qn, 1e-12);
-        const gHatCryst = [
-          Number((gx * invQn).toFixed(5)),
-          Number((gy * invQn).toFixed(5)),
-          Number((gz * invQn).toFixed(5)),
-        ];
-        const gHatLab = [
-          Number((glx * invQn).toFixed(5)),
-          Number((gly * invQn).toFixed(5)),
-          Number((glz * invQn).toFixed(5)),
-        ];
-        const [sxSt, sySt, hemi] = stereoProj(gHatCryst);
-        const [sxLab, syLab, hemiLab] = stereoProj(gHatLab);
-        const [az, dyDet, elDet] = isActiveFrame ? labToCyl([ptX, ptY, ptZ]) : [0.0, 0.0, 0.0];
-
-        const gGcd = Math.max(1, gcd3(hv, kv, lv));
-        const h0 = Math.trunc(hv / gGcd), k0 = Math.trunc(kv / gGcd), l0 = Math.trunc(lv / gGcd);
-        const lamProd = gGcd * lam;
-        const mLo = Math.max(1, Math.ceil(lamProd / Math.max(wlMax, 1e-6) - 1e-5));
-        const mHiWl = lamProd / Math.max(wlMin, 1e-6);
-        const dEff = Math.min(Math.max(dMinEff, 1e-3), Math.max(dVal, 1e-3));
-        const mHiD = (gGcd * dVal) / Math.max(dEff, 1e-6);
-        const mHi = Math.floor(Math.min(mHiWl, mHiD) + 1e-5);
-        let multAllowed = 0;
-        for (let m = mLo; m <= Math.min(mHi, mLo + 64); m++) {{
-          if (!sgHelper.isAbsent(m * h0, m * k0, m * l0)) multAllowed++;
+        hitPoolIdx.push(i);
+        hitPIdx.push(pIdx);
+        hitRow.push(rowF);
+        hitCol.push(colF);
+        hitPtX.push(ptX);
+        hitPtY.push(ptY);
+        hitPtZ.push(ptZ);
+        hitGlx.push(glx);
+        hitGly.push(gly);
+        hitGlz.push(glz);
+        hitLam.push(lam);
+        hitD.push(dArr[i]);
+        if (!isActiveFrame) {{
+          hitDirX.push(gx);
+          hitDirY.push(gy);
+          hitDirZ.push(gz);
         }}
-
-        const ah = asuHArr[i], ak = asuKArr[i], al = asuLArr[i];
-        const orbitId = `${{ah}},${{ak}},${{al}}`;
-        const hkStr = `${{hv}},${{kv}},${{lv}}`;
-        const zoneIds = [];
-        if (isActiveFrame && zoneChecks.length > 0) {{
-          for (let z = 0; z < zoneChecks.length; z++) {{
-            const zc = zoneChecks[z];
-            if (zc.useUvw) {{
-              if (hv * zc.u + kv * zc.v + lv * zc.w === 0) zoneIds.push(zc.zid);
-            }} else if (Math.abs(gHatCryst[0] * zc.ax + gHatCryst[1] * zc.ay + gHatCryst[2] * zc.az) <= sinZoneTol) {{
-              zoneIds.push(zc.zid);
-            }}
-          }}
-        }}
-
-        const pk = {{
-          id: peaks.length,
-          peak_source: "predicted",
-          run_index: runIdx,
-          bank: det.bid,
-          row: Number(rowF.toFixed(2)),
-          col: Number(colF.toFixed(2)),
-          det_x: Number(az.toFixed(3)),
-          det_y: Number(dyDet.toFixed(4)),
-          det_el: Number(elDet.toFixed(3)),
-          q_hat: gHatCryst,
-          q_hat_lab: gHatLab,
-          stereographic: [Number(sxSt.toFixed(5)), Number(sySt.toFixed(5))],
-          hemisphere: hemi,
-          stereo_lab: [Number(sxLab.toFixed(5)), Number(syLab.toFixed(5)), hemiLab],
-          intensity: null,
-          sigma: null,
-          wavelength: Number(lam.toFixed(4)),
-          d_spacing: Number(dVal.toFixed(4)),
-          harmonic_order: harmOrdArr[i] || 1,
-          harmonic_multiplicity: Math.max(1, multAllowed),
-          parallax_depth: Number(Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * Math.max(dVal, 0.2)))).toFixed(4)),
-          hkl: [hv, kv, lv],
-          asu_hkl: [ah, ak, al],
-          asu_orbit_id: orbitId,
-          asu_friedel: Boolean(asuFrArr[i]),
-          asu_bijvoet_parity: Number(asuBijArr[i]),
-          orbit_color_idx: Number(orbColArr[i]),
-          zone_ids: zoneIds,
-          indexed: true,
-          angular_error_deg: 0.0,
-          has_angular_error: false,
-          shape_kind: "circle",
-        }};
-
-        // Cross-link any previously integrated / merged / MTZ measurements
-        const snap = (isActiveFrame ? _baselineMeasCache.byBankHkl.get(`${{det.bid}}|${{hkStr}}`) : null) ||
-                     _baselineMeasCache.byRunHkl.get(`${{runIdx}}|${{hkStr}}`) ||
-                     _baselineMeasCache.byHkl.get(hkStr) ||
-                     _baselineMeasCache.byOrbit.get(orbitId) ||
-                     null;
-        if (snap) {{
-          const sk = Object.keys(snap);
-          for (let m = 0; m < sk.length; m++) {{
-            const k = sk[m];
-            if (!isActiveFrame && (k === "ellipse" || k === "ellipse_sph")) continue;
-            pk[k] = snap[k];
-          }}
-        }}
-        if (pk.mtz_i === undefined || pk.mtz_i === null) {{
-          const mtzHit = (_baselineMeasCache.mtzExactLookup && _baselineMeasCache.mtzExactLookup[hkStr]) ||
-                         (_baselineMeasCache.mtzAsuLookup && _baselineMeasCache.mtzAsuLookup[orbitId]) ||
-                         null;
-          if (Array.isArray(mtzHit) && mtzHit.length >= 2) {{
-            const ivM = Number(mtzHit[0]), svM = Math.max(Number(mtzHit[1]) || 0, 1e-6);
-            pk.mtz_i = ivM;
-            pk.mtz_sigi = Number(mtzHit[1]);
-            pk.mtz_isigi = Number((Math.max(0.0, ivM) / svM).toFixed(3));
-            if (pk.merged_i === undefined || pk.merged_i === null) {{
-              pk.merged_i = ivM;
-              pk.merged_sigi = Number(mtzHit[1]);
-            }}
-          }}
-        }}
-
-        peaks.push(pk);
         break;
       }}
-      if (peaks.length >= maxOutPeaks) break;
     }}
+
+    const nRaw = hitPoolIdx.length;
+    if (nRaw === 0) {{
+      const emptyRes = [];
+      emptyRes._rawTotal = 0;
+      return emptyRes;
+    }}
+    const nKeep = Math.min(nRaw, maxOutPeaks);
+    const order = selectSpatiallyStratifiedOrder(
+      nRaw, hitD, hitDirX, hitDirY, hitDirZ,
+      isActiveFrame ? sx0 : 0.0,
+      isActiveFrame ? sy0 : 0.0,
+      isActiveFrame ? sz0 : 0.0,
+      nKeep, true
+    );
+
+    const peaks = [];
+    for (let outIdx = 0; outIdx < nKeep; outIdx++) {{
+      const hIdx = order[outIdx];
+      const i = hitPoolIdx[hIdx];
+      const det = panelsGeom[hitPIdx[hIdx]];
+      const rowF = hitRow[hIdx], colF = hitCol[hIdx];
+      const ptX = hitPtX[hIdx], ptY = hitPtY[hIdx], ptZ = hitPtZ[hIdx];
+      const glx = hitGlx[hIdx], gly = hitGly[hIdx], glz = hitGlz[hIdx];
+      const lam = hitLam[hIdx];
+      const gx = gxArr[i], gy = gyArr[i], gz = gzArr[i];
+      const qn = qnArr[i];
+      const hv = hArr[i], kv = kArr[i], lv = lArr[i];
+      const dVal = dArr[i];
+      const invQn = 1.0 / Math.max(qn, 1e-12);
+      const gHatCryst = [
+        Number((gx * invQn).toFixed(5)),
+        Number((gy * invQn).toFixed(5)),
+        Number((gz * invQn).toFixed(5)),
+      ];
+      const gHatLab = [
+        Number((glx * invQn).toFixed(5)),
+        Number((gly * invQn).toFixed(5)),
+        Number((glz * invQn).toFixed(5)),
+      ];
+      const [sxSt, sySt, hemi] = stereoProj(gHatCryst);
+      const [sxLab, syLab, hemiLab] = stereoProj(gHatLab);
+      const [az, dyDet, elDet] = isActiveFrame ? labToCyl([ptX, ptY, ptZ]) : [0.0, 0.0, 0.0];
+
+      const gGcd = Math.max(1, gcd3(hv, kv, lv));
+      const h0 = Math.trunc(hv / gGcd), k0 = Math.trunc(kv / gGcd), l0 = Math.trunc(lv / gGcd);
+      const lamProd = gGcd * lam;
+      const mLo = Math.max(1, Math.ceil(lamProd / Math.max(wlMax, 1e-6) - 1e-5));
+      const mHiWl = lamProd / Math.max(wlMin, 1e-6);
+      const dEff = Math.min(Math.max(dMinEff, 1e-3), Math.max(dVal, 1e-3));
+      const mHiD = (gGcd * dVal) / Math.max(dEff, 1e-6);
+      const mHi = Math.floor(Math.min(mHiWl, mHiD) + 1e-5);
+      let multAllowed = 0;
+      for (let m = mLo; m <= Math.min(mHi, mLo + 64); m++) {{
+        if (!sgHelper.isAbsent(m * h0, m * k0, m * l0)) multAllowed++;
+      }}
+
+      const ah = asuHArr[i], ak = asuKArr[i], al = asuLArr[i];
+      const orbitId = `${{ah}},${{ak}},${{al}}`;
+      const hkStr = `${{hv}},${{kv}},${{lv}}`;
+      const zoneIds = [];
+      if (isActiveFrame && zoneChecks.length > 0) {{
+        for (let z = 0; z < zoneChecks.length; z++) {{
+          const zc = zoneChecks[z];
+          if (zc.useUvw) {{
+            if (hv * zc.u + kv * zc.v + lv * zc.w === 0) zoneIds.push(zc.zid);
+          }} else if (Math.abs(gHatCryst[0] * zc.ax + gHatCryst[1] * zc.ay + gHatCryst[2] * zc.az) <= sinZoneTol) {{
+            zoneIds.push(zc.zid);
+          }}
+        }}
+      }}
+
+      const pk = {{
+        id: peaks.length,
+        peak_source: "predicted",
+        run_index: runIdx,
+        bank: det.bid,
+        row: Number(rowF.toFixed(2)),
+        col: Number(colF.toFixed(2)),
+        det_x: Number(az.toFixed(3)),
+        det_y: Number(dyDet.toFixed(4)),
+        det_el: Number(elDet.toFixed(3)),
+        q_hat: gHatCryst,
+        q_hat_lab: gHatLab,
+        stereographic: [Number(sxSt.toFixed(5)), Number(sySt.toFixed(5))],
+        hemisphere: hemi,
+        stereo_lab: [Number(sxLab.toFixed(5)), Number(syLab.toFixed(5)), hemiLab],
+        intensity: null,
+        sigma: null,
+        wavelength: Number(lam.toFixed(4)),
+        d_spacing: Number(dVal.toFixed(4)),
+        harmonic_order: harmOrdArr[i] || 1,
+        harmonic_multiplicity: Math.max(1, multAllowed),
+        parallax_depth: Number(Math.max(0.05, Math.min(0.98, 1.0 / (1.0 + 0.35 * Math.max(dVal, 0.2)))).toFixed(4)),
+        hkl: [hv, kv, lv],
+        asu_hkl: [ah, ak, al],
+        asu_orbit_id: orbitId,
+        asu_friedel: Boolean(asuFrArr[i]),
+        asu_bijvoet_parity: Number(asuBijArr[i]),
+        orbit_color_idx: Number(orbColArr[i]),
+        zone_ids: zoneIds,
+        indexed: true,
+        angular_error_deg: 0.0,
+        has_angular_error: false,
+        shape_kind: "circle",
+      }};
+
+      // Cross-link any previously integrated / merged / MTZ measurements
+      const snap = (isActiveFrame ? _baselineMeasCache.byBankHkl.get(`${{det.bid}}|${{hkStr}}`) : null) ||
+                   _baselineMeasCache.byRunHkl.get(`${{runIdx}}|${{hkStr}}`) ||
+                   _baselineMeasCache.byHkl.get(hkStr) ||
+                   _baselineMeasCache.byOrbit.get(orbitId) ||
+                   null;
+      if (snap) {{
+        const sk = Object.keys(snap);
+        for (let m = 0; m < sk.length; m++) {{
+          const k = sk[m];
+          if (!isActiveFrame && (k === "ellipse" || k === "ellipse_sph")) continue;
+          pk[k] = snap[k];
+        }}
+      }}
+      if (pk.mtz_i === undefined || pk.mtz_i === null) {{
+        const mtzHit = (_baselineMeasCache.mtzExactLookup && _baselineMeasCache.mtzExactLookup[hkStr]) ||
+                       (_baselineMeasCache.mtzAsuLookup && _baselineMeasCache.mtzAsuLookup[orbitId]) ||
+                       null;
+        if (Array.isArray(mtzHit) && mtzHit.length >= 2) {{
+          const ivM = Number(mtzHit[0]), svM = Math.max(Number(mtzHit[1]) || 0, 1e-6);
+          pk.mtz_i = ivM;
+          pk.mtz_sigi = Number(mtzHit[1]);
+          pk.mtz_isigi = Number((Math.max(0.0, ivM) / svM).toFixed(3));
+          if (pk.merged_i === undefined || pk.merged_i === null) {{
+            pk.merged_i = ivM;
+            pk.merged_sigi = Number(mtzHit[1]);
+          }}
+        }}
+      }}
+
+      peaks.push(pk);
+    }}
+    peaks._rawTotal = nRaw;
     return peaks;
   }}
 
@@ -10966,10 +11185,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       emptyRes._rawTotal = 0;
       return emptyRes;
     }}
-    const order = new Int32Array(nRaw);
-    for (let i = 0; i < nRaw; i++) order[i] = i;
-    order.sort((ia, ib) => hitD[ib] - hitD[ia]);
     const nKeep = Math.min(nRaw, maxOutPeaks);
+    const order = selectSpatiallyStratifiedOrder(
+      nRaw,
+      hitD,
+      isActiveFrame ? hitPtX : hitGx,
+      isActiveFrame ? hitPtY : hitGy,
+      isActiveFrame ? hitPtZ : hitGz,
+      isActiveFrame ? sx0 : 0.0,
+      isActiveFrame ? sy0 : 0.0,
+      isActiveFrame ? sz0 : 0.0,
+      nKeep,
+      false
+    );
 
     const zoneChecks = [];
     if (isActiveFrame && Array.isArray(ZONES)) {{
@@ -11186,6 +11414,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       _dynPredEpoch++;
       _peakDataAvailabilitySig = "";
       _wulffPoolCache.sig = "";
+      _wulffBvhCache.sig = "";
+      _wulffLodCache.sig = "";
       _lastWulffRenderSig = "";
       renderStereoInset(true);
       updateHUD();
@@ -11225,9 +11455,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           ub, buildClientSpaceGroupHelper(), Ractive, sActive, panelsGeom,
           wlMin, wlMax, dMinEff, activeRunIdx, true, MAX_DYNAMIC_FRAME_PEAKS
         );
-    _dynEwaldRawTotal = (!pool && typeof framePeaks._rawTotal === "number") ? framePeaks._rawTotal : framePeaks.length;
-    _dynEwaldTruncated = Boolean(!pool && _dynEwaldRawTotal > framePeaks.length);
+    _dynEwaldRawTotal = typeof framePeaks._rawTotal === "number" ? framePeaks._rawTotal : framePeaks.length;
+    _dynEwaldTruncated = Boolean(_dynEwaldRawTotal > framePeaks.length);
     _dynViewportPatchCache.sig = "";
+    _dynViewportPatchCache.bvh = null;
     const curUbSig = Array.isArray(DATA.ub_matrix)
       ? DATA.ub_matrix.flat().map(v => Number(v || 0).toFixed(6)).join(",")
       : "";
@@ -11317,8 +11548,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     _peakDataAvailabilitySig = "";
     _detVisiblePeaksSig = "";
+    _detBvhCache.sig = "";
     _detLodCache.sig = "";
     _wulffPoolCache.sig = "";
+    _wulffBvhCache.sig = "";
+    _wulffLodCache.sig = "";
     _lastDetRenderSig = "";
     _lastWulffRenderSig = "";
     return true;
@@ -15196,46 +15430,398 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return _detVisiblePeaksCache;
   }}
 
-  // Viewport-frustum + aggressive screen-density LOD thinning on the Detector view:
-  // 1. Culls off-screen reflections (across periodic [-360, 0, +360] azimuth copies) first so zooming
-  //    into a bank focuses the entire spot budget onto the visible detector area.
-  // 2. Enforces a crisp on-screen spot budget (~300 at 1x overview -> ~1050 when zoomed in) plus
-  //    screen-cell anti-overlap thinning at low/moderate zoom, smoothly unlocking shells down to 0.50 A.
+  function _computePeakLodPriority(p, tieIdx, hasActiveZones, useSnr) {{
+    let pri = (typeof p.d_spacing === "number" && Number.isFinite(p.d_spacing) && p.d_spacing > 0)
+      ? p.d_spacing
+      : 0.0;
+    if (useSnr) {{
+      const snr = _peakSnrScore(p);
+      if (Number.isFinite(snr) && snr > 0) {{
+        pri += Math.min(1e5, snr) * 100.0;
+      }}
+    }}
+    // Keep global Tier-1 landmarks strictly above newly streamed Tier-2 viewport-patch fill-ins
+    // so crossing the Tier-2 zoom threshold never swaps out an already-visible landmark.
+    if (!p._isViewportPatchPeak) {{
+      pri += 1e5;
+    }}
+    if (hasActiveZones && isPeakCapturedByActiveZone(p)) {{
+      pri += 1e8;
+    }}
+    // Deterministic permutation-invariant tie-breaker across Tier-1/Tier-2 re-indexings
+    const hkl = p.hkl;
+    const intrinsicTie = Array.isArray(hkl) && hkl.length >= 3
+      ? (((Number(p.bank) || 0) * 1073741824) +
+         ((Number(hkl[0]) + 512) * 1048576) +
+         ((Number(hkl[1]) + 512) * 1024) +
+         (Number(hkl[2]) + 512)) * 1e-13
+      : (tieIdx * 1e-9);
+    return pri - intrinsicTie;
+  }}
+
+  // Build a compressed canonical dyadic spherical BVH over [-180, 180] deg x [-90, 90] deg.
+  // Because split planes are fixed dyadic subdivisions of the sphere (independent of sample density),
+  // lowering d_min, panning, zooming, and crossing the Tier-1 -> Tier-2 frustum-stream handoff
+  // are all 100% pop-free: existing landmarks never shift cells or disappear.
+  function buildDetectorSphericalBVH(peaks) {{
+    const n = peaks.length;
+    if (n === 0) return null;
+    const hasActiveZones = Boolean(state.showZoneArcs && state.activeZones && state.activeZones.size > 0);
+    const useSnr = (
+      state.peakSource === "integrated" ||
+      state.wulffColorMode === "isigi" ||
+      state.wulffColorMode === "mtz_isigi" ||
+      state.wulffColorMode === "residual"
+    );
+
+    const bounds = getActiveBounds();
+    const rootAz0 = Number.isFinite(bounds.minX) ? bounds.minX : -180.0;
+    const rootAzSpan = Math.max(360.0, (Number(bounds.maxX) || 180.0) - rootAz0);
+    const rootAz1 = rootAz0 + rootAzSpan;
+
+    const azArr = new Float32Array(n);
+    const yCylArr = new Float32Array(n);
+    const ySphArr = new Float32Array(n);
+    const dArr = new Float32Array(n);
+    const priArr = new Float64Array(n);
+    const idxBuf = new Int32Array(n);
+
+    for (let i = 0; i < n; i++) {{
+      const p = peaks[i];
+      azArr[i] = Number(p.det_x) || 0.0;
+      yCylArr[i] = Number(p.det_y) || 0.0;
+      ySphArr[i] = Math.max(-90.0, Math.min(90.0, Number(p.det_el) || 0.0));
+      dArr[i] = (typeof p.d_spacing === "number" && p.d_spacing > 0) ? p.d_spacing : 0.0;
+      priArr[i] = _computePeakLodPriority(p, i, hasActiveZones, useSnr);
+      idxBuf[i] = i;
+    }}
+
+    const cap = Math.max(2, 2 * n);
+    const leftChild = new Int32Array(cap);
+    const rightChild = new Int32Array(cap);
+    const minAz = new Float32Array(cap);
+    const maxAz = new Float32Array(cap);
+    const minYCyl = new Float32Array(cap);
+    const maxYCyl = new Float32Array(cap);
+    const minYSph = new Float32Array(cap);
+    const maxYSph = new Float32Array(cap);
+    const canSpanAz = new Float32Array(cap);
+    const canSpanEl = new Float32Array(cap);
+    const maxD = new Float32Array(cap);
+    const repIdx = new Int32Array(cap);
+    const subCount = new Int32Array(cap);
+    let nodeCount = 0;
+
+    function buildNode(lo, hi, inAz0, inAz1, inEl0, inEl1, depth) {{
+      const u = nodeCount++;
+      let a0 = Infinity, a1 = -Infinity;
+      let yc0 = Infinity, yc1 = -Infinity;
+      let ys0 = Infinity, ys1 = -Infinity;
+      let dMax = 0.0;
+      let bestIdx = idxBuf[lo];
+      let bestPri = -Infinity;
+
+      for (let k = lo; k < hi; k++) {{
+        const idx = idxBuf[k];
+        const az = azArr[idx];
+        const yc = yCylArr[idx];
+        const ys = ySphArr[idx];
+        const dv = dArr[idx];
+        const pr = priArr[idx];
+        if (az < a0) a0 = az;
+        if (az > a1) a1 = az;
+        if (yc < yc0) yc0 = yc;
+        if (yc > yc1) yc1 = yc;
+        if (ys < ys0) ys0 = ys;
+        if (ys > ys1) ys1 = ys;
+        if (dv > dMax) dMax = dv;
+        if (pr > bestPri) {{
+          bestPri = pr;
+          bestIdx = idx;
+        }}
+      }}
+
+      minAz[u] = a0; maxAz[u] = a1;
+      minYCyl[u] = yc0; maxYCyl[u] = yc1;
+      minYSph[u] = ys0; maxYSph[u] = ys1;
+      // Record incoming canonical cell angular spans (data-independent stopping size!)
+      canSpanAz[u] = inAz1 - inAz0;
+      canSpanEl[u] = inEl1 - inEl0;
+      maxD[u] = dMax;
+      repIdx[u] = bestIdx;
+      subCount[u] = hi - lo;
+
+      if (hi - lo <= 1) {{
+        leftChild[u] = -1;
+        rightChild[u] = -1;
+        return u;
+      }}
+
+      // Path-compress empty canonical halves until a dyadic split actually partitions [lo, hi)
+      let cAz0 = inAz0, cAz1 = inAz1, cEl0 = inEl0, cEl1 = inEl1;
+      let midIdx = -1;
+      let childLBox = null;
+      let childRBox = null;
+      for (let step = 0; step < 22 && depth + step < 30; step++) {{
+        const spAz = cAz1 - cAz0;
+        const spEl = cEl1 - cEl0;
+        if (spAz < 1e-4 && spEl < 1e-4) break;
+        const splitAz = spAz >= spEl;
+        const midVal = splitAz ? 0.5 * (cAz0 + cAz1) : 0.5 * (cEl0 + cEl1);
+        // Fast check using tight data bounds [a0..a1] / [ys0..ys1] before scanning!
+        if (splitAz) {{
+          if (a1 <= midVal) {{ cAz1 = midVal; continue; }}
+          if (a0 > midVal) {{ cAz0 = midVal; continue; }}
+        }} else {{
+          if (ys1 <= midVal) {{ cEl1 = midVal; continue; }}
+          if (ys0 > midVal) {{ cEl0 = midVal; continue; }}
+        }}
+        const coordArr = splitAz ? azArr : ySphArr;
+        let i = lo, j = hi - 1;
+        while (i <= j) {{
+          while (i <= j && coordArr[idxBuf[i]] <= midVal) i++;
+          while (i <= j && coordArr[idxBuf[j]] > midVal) j--;
+          if (i < j) {{
+            const tmp = idxBuf[i];
+            idxBuf[i] = idxBuf[j];
+            idxBuf[j] = tmp;
+            i++;
+            j--;
+          }}
+        }}
+        if (i > lo && i < hi) {{
+          midIdx = i;
+          if (splitAz) {{
+            childLBox = [cAz0, midVal, cEl0, cEl1];
+            childRBox = [midVal, cAz1, cEl0, cEl1];
+          }} else {{
+            childLBox = [cAz0, cAz1, cEl0, midVal];
+            childRBox = [cAz0, cAz1, midVal, cEl1];
+          }}
+          break;
+        }}
+        if (i <= lo) {{
+          if (splitAz) cAz0 = midVal; else cEl0 = midVal;
+        }} else {{
+          if (splitAz) cAz1 = midVal; else cEl1 = midVal;
+        }}
+      }}
+
+      if (midIdx < 0) {{
+        // Coincident harmonics or stacked radial banks: split deterministically by priority/median
+        midIdx = (lo + hi) >> 1;
+        childLBox = [cAz0, cAz1, cEl0, cEl1];
+        childRBox = [cAz0, cAz1, cEl0, cEl1];
+      }}
+
+      const c0 = buildNode(lo, midIdx, childLBox[0], childLBox[1], childLBox[2], childLBox[3], depth + 1);
+      const c1 = buildNode(midIdx, hi, childRBox[0], childRBox[1], childRBox[2], childRBox[3], depth + 1);
+      if (priArr[repIdx[c1]] > priArr[repIdx[c0]]) {{
+        leftChild[u] = c1;
+        rightChild[u] = c0;
+      }} else {{
+        leftChild[u] = c0;
+        rightChild[u] = c1;
+      }}
+      return u;
+    }}
+
+    buildNode(0, n, rootAz0, rootAz1, -90.0, 90.0, 0);
+    return {{
+      peaks,
+      n,
+      nodeCount,
+      azArr,
+      yCylArr,
+      ySphArr,
+      dArr,
+      priArr,
+      leftChild,
+      rightChild,
+      minAz,
+      maxAz,
+      minYCyl,
+      maxYCyl,
+      minYSph,
+      maxYSph,
+      canSpanAz,
+      canSpanEl,
+      maxD,
+      repIdx,
+      subCount,
+      stack: new Int32Array(Math.min(cap, 256)),
+    }};
+  }}
+
+  function queryDetectorSphericalBVH(
+    bvh, isSph, dxMin, dxMax, fullAzVisible, dyMin, dyMax,
+    activeDmin, affScaleX, absAffScaleY, degElScalePx, cellPx
+  ) {{
+    if (!bvh || bvh.nodeCount === 0) {{
+      return {{ visiblePeaks: [], inViewCount: 0, stoppedAny: false, minKeptD: activeDmin }};
+    }}
+    const {{
+      peaks, n, azArr, yCylArr, ySphArr, dArr,
+      leftChild, rightChild, minAz, maxAz, minYCyl, maxYCyl, minYSph, maxYSph,
+      canSpanAz, canSpanEl, maxD, repIdx, subCount,
+    }} = bvh;
+    let stack = bvh.stack;
+    let sp = 0;
+    stack[sp++] = 0;
+
+    const keptMask = new Uint8Array(n);
+    const outIndices = [];
+    let inViewCount = 0;
+    let stoppedAny = false;
+    let minKeptD = Infinity;
+
+    while (sp > 0) {{
+      const u = stack[--sp];
+      if (maxD[u] < activeDmin - 1e-5) continue;
+      const nMinY = isSph ? minYSph[u] : minYCyl[u];
+      const nMaxY = isSph ? maxYSph[u] : maxYCyl[u];
+      if (nMaxY < dyMin || nMinY > dyMax) continue;
+
+      const a0 = minAz[u];
+      const a1 = maxAz[u];
+      let whollyInAz = fullAzVisible;
+      if (!fullAzVisible) {{
+        const ov0 = a1 >= dxMin && a0 <= dxMax;
+        const ovM = (a1 - 360.0) >= dxMin && (a0 - 360.0) <= dxMax;
+        const ovP = (a1 + 360.0) >= dxMin && (a0 + 360.0) <= dxMax;
+        if (!ov0 && !ovM && !ovP) continue;
+        whollyInAz = (
+          (a0 >= dxMin && a1 <= dxMax) ||
+          (a0 - 360.0 >= dxMin && a1 - 360.0 <= dxMax) ||
+          (a0 + 360.0 >= dxMin && a1 + 360.0 <= dxMax)
+        );
+      }}
+      const whollyInY = nMinY >= dyMin && nMaxY <= dyMax;
+
+      const L = leftChild[u];
+      if (L < 0) {{
+        const pIdx = repIdx[u];
+        const dv = dArr[pIdx];
+        if (dv < activeDmin - 1e-5) continue;
+        const py = isSph ? ySphArr[pIdx] : yCylArr[pIdx];
+        if (py < dyMin || py > dyMax) continue;
+        if (!fullAzVisible) {{
+          const dx = azArr[pIdx];
+          const inAz = (dx >= dxMin && dx <= dxMax) ||
+                       (dx - 360.0 >= dxMin && dx - 360.0 <= dxMax) ||
+                       (dx + 360.0 >= dxMin && dx + 360.0 <= dxMax);
+          if (!inAz) continue;
+        }}
+        inViewCount += 1;
+        if (!keptMask[pIdx]) {{
+          keptMask[pIdx] = 1;
+          outIndices.push(pIdx);
+          if (dv < minKeptD) minKeptD = dv;
+        }}
+        continue;
+      }}
+
+      // Evaluate canonical cell screen footprint (strictly data-independent -> 100% pop-free across Tier-1/Tier-2 & d_min!)
+      const wPx = canSpanAz[u] * affScaleX;
+      const hPx = Math.max((nMaxY - nMinY) * absAffScaleY, canSpanEl[u] * degElScalePx);
+      if (cellPx > 0.0 && whollyInAz && whollyInY && wPx <= cellPx && hPx <= cellPx) {{
+        const pIdx = repIdx[u];
+        inViewCount += subCount[u];
+        if (subCount[u] > 1) stoppedAny = true;
+        if (!keptMask[pIdx]) {{
+          keptMask[pIdx] = 1;
+          outIndices.push(pIdx);
+          const dv = dArr[pIdx];
+          if (dv < minKeptD) minKeptD = dv;
+        }}
+        continue;
+      }}
+
+      if (sp + 2 >= stack.length) {{
+        const bigger = new Int32Array(stack.length * 2);
+        bigger.set(stack);
+        stack = bigger;
+        bvh.stack = bigger;
+      }}
+      stack[sp++] = rightChild[u];
+      stack[sp++] = L;
+    }}
+
+    // Always force-keep hovered, selected, and active ASU orbit reflections
+    const activeOrb = state.activeOrbitId;
+    if (state.hoveredPeakId !== null || state.selectedPeakId !== null || state.hoveredPeakObj || state.selectedPeakObj || activeOrb) {{
+      for (let i = 0; i < n; i++) {{
+        if (keptMask[i]) continue;
+        const p = peaks[i];
+        if (
+          isPeakHighlightedTarget(p) ||
+          Boolean(activeOrb && p.asu_orbit_id && p.asu_orbit_id === activeOrb)
+        ) {{
+          keptMask[i] = 1;
+          outIndices.push(i);
+        }}
+      }}
+    }}
+
+    const visiblePeaks = new Array(outIndices.length);
+    for (let k = 0; k < outIndices.length; k++) {{
+      visiblePeaks[k] = peaks[outIndices[k]];
+    }}
+    // Restore 80s parallax back-to-front painter's order (high parallax_depth background first, foreground landmarks on top)
+    visiblePeaks.sort((a, b) => (b.parallax_depth || 0) - (a.parallax_depth || 0));
+
+    return {{
+      visiblePeaks,
+      inViewCount,
+      stoppedAny,
+      minKeptD: Number.isFinite(minKeptD) ? minKeptD : activeDmin,
+    }};
+  }}
+
+  // Gameplay-style nested Spherical BVH LOD on the Detector view:
+  // 1. All resolution shells down to state.dMin populate empty detector solid-angle cells immediately at 1x zoom.
+  // 2. Crowded cells exceeding screen density (`cellPx`) collapse pop-free into their nested landmark representative
+  //    (active-zone > high-SNR > high-d), subdividing smoothly upon zooming in with zero pan flicker.
   function getDetectorLodState(canvasCssW, canvasCssH) {{
     const allVisible = getVisibleDetectorPeaks();
     const sortedD = _detVisibleSortedDCache;
     const w = Math.max(240, Number(canvasCssW) || 820);
     const h = Math.max(180, Number(canvasCssH) || 480);
-    const areaScale = Math.sqrt((w * h) / (820.0 * 480.0));
-    const overviewTarget = Math.max(200, Math.min(520, Math.round(300.0 * areaScale)));
     const minPoolD = sortedD.length > 0 ? sortedD[sortedD.length - 1] : 0.0;
-    const activeDmin = (typeof state.dMin === "number" && state.dMin > 0)
-      ? Math.max(state.dMin, minPoolD)
-      : minPoolD;
+    const activeDmin = (typeof state.dMin === "number" && state.dMin > 0) ? state.dMin : minPoolD;
 
     const dZoom = Math.max(0.4, Number(state.detZoom) || 1.0);
     const panX = Number(state.detPanX) || 0.0;
     const panY = Number(state.detPanY) || 0.0;
     const panBinX = Math.round(panX / 24.0);
     const panBinY = Math.round(panY / 24.0);
+    const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
     const hovId = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
     const selId = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
     const firstRef = allVisible.length > 0 ? allVisible[0] : null;
-    const lodSig = `${{_detVisiblePeaksSig}}|${{w}}x${{h}}|${{state.projection}}|${{overviewTarget}}|${{dZoom.toFixed(4)}}|${{panBinX}},${{panBinY}}|${{hovId}}|${{selId}}|${{state.activeOrbitId || ""}}`;
+    const lodSig = `${{_detVisiblePeaksSig}}|${{zonesKey}}|${{w}}x${{h}}|${{state.projection}}|${{dZoom.toFixed(4)}}|${{panBinX}},${{panBinY}}|${{hovId}}|${{selId}}|${{state.activeOrbitId || ""}}`;
     if (_detLodCache.sig === lodSig && _detLodCache.firstRef === firstRef) {{
       return _detLodCache;
     }}
 
-    if (allVisible.length <= overviewTarget) {{
+    if (allVisible.length === 0) {{
       _detLodCache.sig = lodSig;
       _detLodCache.firstRef = firstRef;
       _detLodCache.visiblePeaks = allVisible;
       _detLodCache.lodDcut = activeDmin;
       _detLodCache.isLodThinned = false;
-      _detLodCache.totalCount = allVisible.length;
-      _detLodCache.inViewCount = allVisible.length;
+      _detLodCache.totalCount = 0;
+      _detLodCache.inViewCount = 0;
       _detLodCache.activeDmin = activeDmin;
       return _detLodCache;
+    }}
+
+    // Ensure cached global Detector Spherical BVH (pan/zoom/projection invariant!)
+    const bvhSig = `${{_detVisiblePeaksSig}}|${{zonesKey}}`;
+    if (_detBvhCache.sig !== bvhSig || _detBvhCache.firstRef !== firstRef || !_detBvhCache.bvh) {{
+      _detBvhCache.sig = bvhSig;
+      _detBvhCache.firstRef = firstRef;
+      _detBvhCache.bvh = buildDetectorSphericalBVH(allVisible);
     }}
 
     // Compute padded viewport bounds in detector (det_x, py) world coordinates
@@ -15259,62 +15845,40 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const dyMax = bounds.minY + (1.0 - (y0Top - box.originY) / Math.max(1e-6, box.plotH)) * spanY;
     const dyMin = bounds.minY + (1.0 - (y0Bot - box.originY) / Math.max(1e-6, box.plotH)) * spanY;
 
-    const activeOrb = state.activeOrbitId;
-    const inView = [];
-    let isMonotonicDescD = true;
-    let prevD = Infinity;
-    for (let i = 0; i < allVisible.length; i++) {{
-      const p = allVisible[i];
-      const forceKeep = (
-        isPeakHighlightedTarget(p) ||
-        Boolean(activeOrb && p.asu_orbit_id && p.asu_orbit_id === activeOrb)
-      );
-      if (!forceKeep) {{
-        const py = getPeakVert(p);
-        if (py < dyMin || py > dyMax) continue;
-        if (!fullAzVisible) {{
-          const dx = p.det_x;
-          const inAz = (dx >= dxMin && dx <= dxMax) ||
-                       (dx - 360.0 >= dxMin && dx - 360.0 <= dxMax) ||
-                       (dx + 360.0 >= dxMin && dx + 360.0 <= dxMax);
-          if (!inAz) continue;
-        }}
-      }}
-      const dv = (typeof p.d_spacing === "number" && p.d_spacing > 0) ? p.d_spacing : activeDmin;
-      if (dv > prevD + 1e-6) isMonotonicDescD = false;
-      prevD = dv;
-      inView.push(p);
-    }}
+    const isSph = state.projection === "spherical";
+    const sphBounds = (DATA.bounds_spherical && typeof DATA.bounds_spherical.maxY === "number")
+      ? DATA.bounds_spherical
+      : {{ minY: -90.0, maxY: 90.0 }};
+    const spanElDeg = Math.max(10.0, (Number(sphBounds.maxY) || 90.0) - (Number(sphBounds.minY) || -90.0));
+    const affScaleX = (box.plotW / spanX) * dZoom;
+    const absAffScaleY = (box.plotH / spanY) * dZoom;
+    const degElScalePx = (box.plotH / spanElDeg) * dZoom;
+    // Canonical cell threshold: ~18.5 CSS px (yielding ~9-18 px stopped cells, ~900-1400 crisp spots at 1x),
+    // tapering smoothly to 0 by 24x so close doublets and Laue harmonics unpack completely at pixel zoom.
+    const cellPx = dZoom >= 24.0
+      ? 0.0
+      : (dZoom <= 10.0 ? 18.5 : 18.5 * ((24.0 - dZoom) / 14.0));
 
-    const onScreenBudget = dZoom >= 1.0
-      ? Math.round(
-          dZoom <= 5.0
-            ? overviewTarget * Math.pow(dZoom, 0.82)
-            : overviewTarget * Math.pow(5.0, 0.82) * Math.pow(dZoom / 5.0, 1.65)
-        )
-      : Math.max(55, Math.round(overviewTarget * Math.pow(dZoom, 1.35)));
-
+    let activeBvh = _detBvhCache.bvh;
     let effectiveTotalCount = Math.max(allVisible.length, _dynEwaldTruncated ? _dynEwaldRawTotal : 0);
-    let effectiveActiveDmin = activeDmin;
+    let effectiveActiveDmin = (typeof state.dMin === "number" && state.dMin > 0) ? state.dMin : minPoolD;
+    let patchTruncated = false;
 
     // Tier-2 Viewport-Frustum High-Res Streaming:
-    // When global Ewald prediction across many banks exceeded MAX_DYNAMIC_FRAME_PEAKS (e.g. P6122 at 0.50 A
-    // with 150k-1.8M white-beam reflections) and zooming in reduces in-view global spots below the screen budget,
-    // stream the exact frustum-culled reflections down to state.dMin on ONLY the visible panel(s).
+    // When global Ewald prediction across all banks exceeded MAX_DYNAMIC_FRAME_PEAKS (e.g. P6122 at 0.50 A)
+    // and the user zooms in (>= 2.4x), stream exact frustum-sliced reflections for the visible panel tile
+    // and cache a dedicated tile Spherical BVH for instant pan/zoom inside the tile.
     if (
       _dynEwaldTruncated &&
       state.peakSource === "predicted" &&
-      dZoom >= 2.2 &&
-      typeof state.dMin === "number" &&
-      state.dMin < minPoolD - 1e-3 &&
-      inView.length < onScreenBudget
+      dZoom >= 2.4
     ) {{
       const dFloor = getDynamicDminFloor();
       const dMinEff = Math.max(dFloor, Number(state.dMin) || dFloor);
       effectiveActiveDmin = dMinEff;
-      const tilePanX = Math.round(panX / 96.0) * 96.0;
-      const tilePanY = Math.round(panY / 96.0) * 96.0;
-      const tilePadPx = 180.0;
+      const tilePanX = Math.round(panX / 128.0) * 128.0;
+      const tilePanY = Math.round(panY / 128.0) * 128.0;
+      const tilePadPx = 220.0;
       const tx0L = cx + (-tilePadPx - cx - tilePanX) / dZoom;
       const tx0R = cx + (w + tilePadPx - cx - tilePanX) / dZoom;
       const tDxMin = bounds.minX + ((tx0L - box.originX) / Math.max(1e-6, box.plotW)) * spanX;
@@ -15324,7 +15888,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const ty0B = cy + (h + tilePadPx - cy - tilePanY) / dZoom;
       const tDyMax = bounds.minY + (1.0 - (ty0T - box.originY) / Math.max(1e-6, box.plotH)) * spanY;
       const tDyMin = bounds.minY + (1.0 - (ty0B - box.originY) / Math.max(1e-6, box.plotH)) * spanY;
-      const isSph = state.projection === "spherical";
       const patchSig = `${{_dynPredEpoch}}|${{isSph ? "sph" : "cyl"}}|${{tDxMin.toFixed(2)}},${{tDxMax.toFixed(2)}}|${{tDyMin.toFixed(3)}},${{tDyMax.toFixed(3)}}|${{dMinEff.toFixed(3)}}`;
       if (_dynViewportPatchCache.sig !== patchSig) {{
         const ub = getActiveUbMatrix();
@@ -15341,117 +15904,88 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const panelsGeom = buildActiveDetectorRaycastPanels(sActive);
         const wlMin = Math.max(0.05, Number(state.lamMin) || 2.0);
         const wlMax = Math.max(wlMin + 0.05, Number(state.lamMax) || 4.5);
-        const patchCap = Math.max(MAX_VIEWPORT_PATCH_PEAKS, onScreenBudget * 2);
         const rawPatch = (ub && panelsGeom.length > 0)
           ? raycastRunDirectEwaldShell(
               ub, buildClientSpaceGroupHelper(), Ractive, sActive, panelsGeom,
-              wlMin, wlMax, dMinEff, activeRunIdx, true, patchCap,
+              wlMin, wlMax, dMinEff, activeRunIdx, true, MAX_VIEWPORT_PATCH_PEAKS,
               {{ dxMin: tDxMin, dxMax: tDxMax, dyMin: tDyMin, dyMax: tDyMax, isSph, fullAzVisible: tFullAz }}
             )
           : [];
+        // Merge any global landmarks in the tile so the 2.4x handoff is 100% pop-free
+        const seenKeys = new Set();
+        const mergedPatch = [];
+        for (let k = 0; k < allVisible.length; k++) {{
+          const gp = allVisible[k];
+          const py = isSph ? (Number(gp.det_el) || 0.0) : (Number(gp.det_y) || 0.0);
+          if (py < tDyMin || py > tDyMax) continue;
+          if (!tFullAz) {{
+            const dx = Number(gp.det_x) || 0.0;
+            const inTileAz = (dx >= tDxMin && dx <= tDxMax) ||
+                             (dx - 360.0 >= tDxMin && dx - 360.0 <= tDxMax) ||
+                             (dx + 360.0 >= tDxMin && dx + 360.0 <= tDxMax);
+            if (!inTileAz) continue;
+          }}
+          if (Array.isArray(gp.hkl) && gp.hkl.length === 3) {{
+            seenKeys.add(`${{gp.bank}}|${{gp.hkl[0]}},${{gp.hkl[1]}},${{gp.hkl[2]}}`);
+          }}
+          mergedPatch.push(gp);
+        }}
         for (let k = 0; k < rawPatch.length; k++) {{
-          rawPatch[k].id = 1000000 + k;
+          const rp = rawPatch[k];
+          rp.id = 1000000 + k;
+          rp._isViewportPatchPeak = true;
+          if (!isPeakVisible(rp)) continue;
+          if (Array.isArray(rp.hkl) && rp.hkl.length === 3) {{
+            const key = `${{rp.bank}}|${{rp.hkl[0]}},${{rp.hkl[1]}},${{rp.hkl[2]}}`;
+            if (seenKeys.has(key)) continue;
+            seenKeys.add(key);
+          }}
+          mergedPatch.push(rp);
         }}
         _dynViewportPatchCache = {{
           sig: patchSig,
-          peaks: rawPatch,
-          rawTotal: typeof rawPatch._rawTotal === "number" ? rawPatch._rawTotal : rawPatch.length,
+          peaks: mergedPatch,
+          rawTotal: Math.max(
+            mergedPatch.length,
+            typeof rawPatch._rawTotal === "number" ? rawPatch._rawTotal : rawPatch.length
+          ),
+          bvh: buildDetectorSphericalBVH(mergedPatch),
+          bvhZonesSig: `${{zonesKey}}|${{state.wulffColorMode}}`,
         }};
+      }} else if (
+        !_dynViewportPatchCache.bvh ||
+        _dynViewportPatchCache.bvhZonesSig !== `${{zonesKey}}|${{state.wulffColorMode}}`
+      ) {{
+        _dynViewportPatchCache.bvh = buildDetectorSphericalBVH(_dynViewportPatchCache.peaks);
+        _dynViewportPatchCache.bvhZonesSig = `${{zonesKey}}|${{state.wulffColorMode}}`;
       }}
-      inView.length = 0;
-      isMonotonicDescD = true;
-      prevD = Infinity;
-      const patchArr = _dynViewportPatchCache.peaks;
-      for (let i = 0; i < patchArr.length; i++) {{
-        const p = patchArr[i];
-        if (!isPeakVisible(p)) continue;
-        const py = getPeakVert(p);
-        if (py < dyMin || py > dyMax) continue;
-        if (!fullAzVisible) {{
-          const dx = p.det_x;
-          const inAz = (dx >= dxMin && dx <= dxMax) ||
-                       (dx - 360.0 >= dxMin && dx - 360.0 <= dxMax) ||
-                       (dx + 360.0 >= dxMin && dx + 360.0 <= dxMax);
-          if (!inAz) continue;
-        }}
-        const dv = (typeof p.d_spacing === "number" && p.d_spacing > 0) ? p.d_spacing : effectiveActiveDmin;
-        if (dv > prevD + 1e-6) isMonotonicDescD = false;
-        prevD = dv;
-        inView.push(p);
+      if (_dynViewportPatchCache.bvh) {{
+        activeBvh = _dynViewportPatchCache.bvh;
+        patchTruncated = _dynViewportPatchCache.rawTotal > _dynViewportPatchCache.peaks.length;
       }}
     }}
 
-    if (inView.length <= onScreenBudget && dZoom >= 5.5) {{
-      _detLodCache.sig = lodSig;
-      _detLodCache.firstRef = firstRef;
-      _detLodCache.visiblePeaks = inView;
-      _detLodCache.lodDcut = effectiveActiveDmin;
-      _detLodCache.isLodThinned = false;
-      _detLodCache.totalCount = effectiveTotalCount;
-      _detLodCache.inViewCount = inView.length;
-      _detLodCache.activeDmin = effectiveActiveDmin;
-      return _detLodCache;
-    }}
+    const qRes = queryDetectorSphericalBVH(
+      activeBvh, isSph, dxMin, dxMax, fullAzVisible, dyMin, dyMax,
+      effectiveActiveDmin, affScaleX, absAffScaleY, degElScalePx, cellPx
+    );
+    const globalTruncActive = Boolean(_dynEwaldTruncated && state.peakSource === "predicted" && dZoom < 2.4);
+    const rawInViewEst = globalTruncActive
+      ? Math.max(qRes.inViewCount, Math.round(qRes.inViewCount * (_dynEwaldRawTotal / Math.max(1, allVisible.length))))
+      : (patchTruncated ? Math.max(qRes.inViewCount, _dynViewportPatchCache.rawTotal) : qRes.inViewCount);
+    const isLodThinned = Boolean(
+      (qRes.stoppedAny && qRes.visiblePeaks.length < qRes.inViewCount) ||
+      globalTruncActive ||
+      patchTruncated
+    );
 
-    if (!isMonotonicDescD) {{
-      inView.sort((a, b) => (b.d_spacing || 0) - (a.d_spacing || 0));
-    }}
-
-    const minSepPx = dZoom < 6.0 ? Math.max(0.0, 5.2 - 0.85 * dZoom) : 0.0;
-    const useGrid = minSepPx >= 1.25 && inView.length > Math.round(onScreenBudget * 0.65);
-    const occupiedCells = useGrid ? new Set() : null;
-    const affScaleX = (box.plotW / spanX) * dZoom;
-    const affScaleY = -(box.plotH / spanY) * dZoom;
-    const span360Px = Math.max(1.0, box.plotW * dZoom);
-    const invCell = useGrid ? (1.0 / minSepPx) : 0.0;
-
-    const thinned = [];
-    let budgetCutD = null;
-    let minKeptD = Infinity;
-    let thinnedAny = false;
-    for (let i = 0; i < inView.length; i++) {{
-      const p = inView[i];
-      const dv = (typeof p.d_spacing === "number" && p.d_spacing > 0) ? p.d_spacing : effectiveActiveDmin;
-      const forceKeep = (
-        isPeakHighlightedTarget(p) ||
-        Boolean(activeOrb && p.asu_orbit_id && p.asu_orbit_id === activeOrb)
-      );
-      if (forceKeep) {{
-        thinned.push(p);
-        continue;
-      }}
-      if (thinned.length >= onScreenBudget) {{
-        if (budgetCutD === null) budgetCutD = Math.max(effectiveActiveDmin, dv);
-        thinnedAny = true;
-        continue;
-      }}
-      if (useGrid) {{
-        const wx = (((p.det_x - bounds.minX) * affScaleX) % span360Px + span360Px) % span360Px;
-        const wy = (getPeakVert(p) - bounds.minY) * affScaleY;
-        const gxCell = Math.floor(wx * invCell);
-        const gyCell = Math.floor(wy * invCell);
-        const cellKey = (gxCell * 131072) + gyCell;
-        if (occupiedCells.has(cellKey)) {{
-          thinnedAny = true;
-          continue;
-        }}
-        occupiedCells.add(cellKey);
-      }}
-      if (dv < minKeptD) minKeptD = dv;
-      thinned.push(p);
-    }}
-
-    const lodDcut = budgetCutD !== null
-      ? budgetCutD
-      : (Number.isFinite(minKeptD) ? Math.max(effectiveActiveDmin, minKeptD) : effectiveActiveDmin);
-    const isLodThinned = thinnedAny && (thinned.length < inView.length);
     _detLodCache.sig = lodSig;
     _detLodCache.firstRef = firstRef;
-    _detLodCache.visiblePeaks = thinned;
-    _detLodCache.lodDcut = isLodThinned ? lodDcut : effectiveActiveDmin;
+    _detLodCache.visiblePeaks = qRes.visiblePeaks;
+    _detLodCache.lodDcut = qRes.minKeptD;
     _detLodCache.isLodThinned = isLodThinned;
     _detLodCache.totalCount = effectiveTotalCount;
-    _detLodCache.inViewCount = inView.length;
+    _detLodCache.inViewCount = rawInViewEst;
     _detLodCache.activeDmin = effectiveActiveDmin;
     return _detLodCache;
   }}
@@ -15955,7 +16489,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       const countLabel = inV < detLod.totalCount
         ? `${{visiblePeaks.length}}/${{inV}} in view (${{detLod.totalCount}} total)`
         : `${{visiblePeaks.length}}/${{detLod.totalCount}} spots`;
-      const lodTxt = `LOD d ≥ ${{detLod.lodDcut.toFixed(2)}}Å • ${{countLabel}} • zoom+ for ${{detLod.activeDmin.toFixed(2)}}Å`;
+      const lodTxt = `LOD ${{countLabel}} • d ≥ ${{detLod.activeDmin.toFixed(2)}}Å • zoom+ to resolve`;
       const bx = 46;
       const by = 10;
       const bh = 18;
@@ -16138,116 +16672,412 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return _wulffPoolCache;
   }}
 
-  // Zoom-coupled d-spacing LOD thinning on the Wulff sphere:
-  // Show low-resolution scaffold reflections from afar (wulffZoom <= 1) and smoothly unlock
-  // high-resolution shells down to d_min upon zooming in, while always preserving hovered/selected/orbit targets.
+  let _wulffPrevRenderedPeaks = [];
+
+  // Build a 3D unit-sphere cone BVH over crystal q_hat directions for perspective gameplay LOD on the Wulff sphere.
+  // Rotation- and zoom-invariant: orbiting or zooming the Wulff sphere traverses the cached tree in < 0.2 ms
+  // without rebuilding, subdividing cones smoothly as they approach the camera or zoom in.
+  function buildWulffSphericalBVH(uniquePeaks) {{
+    const n = uniquePeaks.length;
+    if (n === 0) return null;
+    const hasActiveZones = Boolean(state.showZoneArcs && state.activeZones && state.activeZones.size > 0);
+    const useSnr = (
+      state.peakSource === "integrated" ||
+      state.wulffColorMode === "isigi" ||
+      state.wulffColorMode === "mtz_isigi" ||
+      state.wulffColorMode === "residual"
+    );
+
+    const qxArr = new Float32Array(n);
+    const qyArr = new Float32Array(n);
+    const qzArr = new Float32Array(n);
+    const dArr = new Float32Array(n);
+    const priArr = new Float64Array(n);
+    const idxBuf = new Int32Array(n);
+
+    for (let i = 0; i < n; i++) {{
+      const p = uniquePeaks[i];
+      const q = Array.isArray(p.q_hat) && p.q_hat.length >= 3 ? p.q_hat : [0.0, 0.0, 1.0];
+      const qx = Number(q[0]) || 0.0;
+      const qy = Number(q[1]) || 0.0;
+      const qz = Number(q[2]) || 0.0;
+      const qn = Math.hypot(qx, qy, qz);
+      if (qn > 1e-12) {{
+        qxArr[i] = qx / qn;
+        qyArr[i] = qy / qn;
+        qzArr[i] = qz / qn;
+      }} else {{
+        qxArr[i] = 0.0;
+        qyArr[i] = 0.0;
+        qzArr[i] = 1.0;
+      }}
+      dArr[i] = (typeof p.d_spacing === "number" && p.d_spacing > 0) ? p.d_spacing : 0.0;
+      priArr[i] = _computePeakLodPriority(p, i, hasActiveZones, useSnr);
+      idxBuf[i] = i;
+    }}
+
+    const cap = Math.max(2, 2 * n);
+    const leftChild = new Int32Array(cap);
+    const rightChild = new Int32Array(cap);
+    const cxArr = new Float32Array(cap);
+    const cyArr = new Float32Array(cap);
+    const czArr = new Float32Array(cap);
+    const rChord = new Float32Array(cap);
+    const canRadius = new Float32Array(cap);
+    const maxD = new Float32Array(cap);
+    const repIdx = new Int32Array(cap);
+    const subCount = new Int32Array(cap);
+    let nodeCount = 0;
+
+    function buildNode(lo, hi, inX0, inX1, inY0, inY1, inZ0, inZ1, depth) {{
+      const u = nodeCount++;
+      let x0 = Infinity, x1 = -Infinity;
+      let y0 = Infinity, y1 = -Infinity;
+      let z0 = Infinity, z1 = -Infinity;
+      let sx = 0.0, sy = 0.0, sz = 0.0;
+      let dMax = 0.0;
+      let bestIdx = idxBuf[lo];
+      let bestPri = -Infinity;
+
+      for (let k = lo; k < hi; k++) {{
+        const idx = idxBuf[k];
+        const x = qxArr[idx], y = qyArr[idx], z = qzArr[idx];
+        const dv = dArr[idx], pr = priArr[idx];
+        if (x < x0) x0 = x; if (x > x1) x1 = x;
+        if (y < y0) y0 = y; if (y > y1) y1 = y;
+        if (z < z0) z0 = z; if (z > z1) z1 = z;
+        sx += x; sy += y; sz += z;
+        if (dv > dMax) dMax = dv;
+        if (pr > bestPri) {{
+          bestPri = pr;
+          bestIdx = idx;
+        }}
+      }}
+
+      let mx = sx / (hi - lo), my = sy / (hi - lo), mz = sz / (hi - lo);
+      const mn = Math.hypot(mx, my, mz);
+      if (mn > 1e-9) {{
+        mx /= mn; my /= mn; mz /= mn;
+      }} else {{
+        mx = qxArr[bestIdx]; my = qyArr[bestIdx]; mz = qzArr[bestIdx];
+      }}
+      let maxChord2 = 0.0;
+      for (let k = lo; k < hi; k++) {{
+        const idx = idxBuf[k];
+        const dx = qxArr[idx] - mx;
+        const dy = qyArr[idx] - my;
+        const dz = qzArr[idx] - mz;
+        const c2 = dx * dx + dy * dy + dz * dz;
+        if (c2 > maxChord2) maxChord2 = c2;
+      }}
+
+      cxArr[u] = mx; cyArr[u] = my; czArr[u] = mz;
+      rChord[u] = hi - lo <= 1 ? 0.0 : Math.sqrt(maxChord2);
+      // Canonical octree-cube half-diagonal (data-independent stopping radius!)
+      canRadius[u] = 0.5 * Math.hypot(inX1 - inX0, inY1 - inY0, inZ1 - inZ0);
+      maxD[u] = dMax;
+      repIdx[u] = bestIdx;
+      subCount[u] = hi - lo;
+
+      if (hi - lo <= 1) {{
+        leftChild[u] = -1;
+        rightChild[u] = -1;
+        return u;
+      }}
+
+      let cx0 = inX0, cx1 = inX1, cy0 = inY0, cy1 = inY1, cz0 = inZ0, cz1 = inZ1;
+      let midIdx = -1;
+      let boxL = null, boxR = null;
+      for (let step = 0; step < 24 && depth + step < 32; step++) {{
+        const spX = cx1 - cx0, spY = cy1 - cy0, spZ = cz1 - cz0;
+        if (spX < 1e-5 && spY < 1e-5 && spZ < 1e-5) break;
+        let axis = 0;
+        if (spY >= spX && spY >= spZ) axis = 1;
+        else if (spZ >= spX && spZ >= spY) axis = 2;
+        const midVal = axis === 0 ? 0.5 * (cx0 + cx1) : (axis === 1 ? 0.5 * (cy0 + cy1) : 0.5 * (cz0 + cz1));
+        if (axis === 0) {{
+          if (x1 <= midVal) {{ cx1 = midVal; continue; }}
+          if (x0 > midVal) {{ cx0 = midVal; continue; }}
+        }} else if (axis === 1) {{
+          if (y1 <= midVal) {{ cy1 = midVal; continue; }}
+          if (y0 > midVal) {{ cy0 = midVal; continue; }}
+        }} else {{
+          if (z1 <= midVal) {{ cz1 = midVal; continue; }}
+          if (z0 > midVal) {{ cz0 = midVal; continue; }}
+        }}
+        const coordArr = axis === 0 ? qxArr : (axis === 1 ? qyArr : qzArr);
+        let i = lo, j = hi - 1;
+        while (i <= j) {{
+          while (i <= j && coordArr[idxBuf[i]] <= midVal) i++;
+          while (i <= j && coordArr[idxBuf[j]] > midVal) j--;
+          if (i < j) {{
+            const tmp = idxBuf[i];
+            idxBuf[i] = idxBuf[j];
+            idxBuf[j] = tmp;
+            i++;
+            j--;
+          }}
+        }}
+        if (i > lo && i < hi) {{
+          midIdx = i;
+          if (axis === 0) {{
+            boxL = [cx0, midVal, cy0, cy1, cz0, cz1];
+            boxR = [midVal, cx1, cy0, cy1, cz0, cz1];
+          }} else if (axis === 1) {{
+            boxL = [cx0, cx1, cy0, midVal, cz0, cz1];
+            boxR = [cx0, cx1, midVal, cy1, cz0, cz1];
+          }} else {{
+            boxL = [cx0, cx1, cy0, cy1, cz0, midVal];
+            boxR = [cx0, cx1, cy0, cy1, midVal, cz1];
+          }}
+          break;
+        }}
+        if (i <= lo) {{
+          if (axis === 0) cx0 = midVal; else if (axis === 1) cy0 = midVal; else cz0 = midVal;
+        }} else {{
+          if (axis === 0) cx1 = midVal; else if (axis === 1) cy1 = midVal; else cz1 = midVal;
+        }}
+      }}
+
+      if (midIdx < 0) {{
+        midIdx = (lo + hi) >> 1;
+        boxL = [cx0, cx1, cy0, cy1, cz0, cz1];
+        boxR = [cx0, cx1, cy0, cy1, cz0, cz1];
+      }}
+
+      const c0 = buildNode(lo, midIdx, boxL[0], boxL[1], boxL[2], boxL[3], boxL[4], boxL[5], depth + 1);
+      const c1 = buildNode(midIdx, hi, boxR[0], boxR[1], boxR[2], boxR[3], boxR[4], boxR[5], depth + 1);
+      if (priArr[repIdx[c1]] > priArr[repIdx[c0]]) {{
+        leftChild[u] = c1;
+        rightChild[u] = c0;
+      }} else {{
+        leftChild[u] = c0;
+        rightChild[u] = c1;
+      }}
+      return u;
+    }}
+
+    buildNode(0, n, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 0);
+    return {{
+      uniquePeaks,
+      n,
+      nodeCount,
+      qxArr,
+      qyArr,
+      qzArr,
+      dArr,
+      priArr,
+      leftChild,
+      rightChild,
+      cxArr,
+      cyArr,
+      czArr,
+      rChord,
+      canRadius,
+      maxD,
+      repIdx,
+      subCount,
+      stack: new Int32Array(Math.min(cap, 256)),
+    }};
+  }}
+
   function getWulffLodState(isExp) {{
     const pool = getWulffPoolCache();
     const uniquePeaks = pool.uniquePeaks;
     const sortedD = pool.sortedD;
-    const overviewTarget = isExp ? 360 : 210;
     const minPoolD = sortedD.length > 0 ? sortedD[sortedD.length - 1] : 0.0;
-    const activeDmin = (typeof state.dMin === "number" && state.dMin > 0)
-      ? Math.max(state.dMin, minPoolD)
-      : minPoolD;
+    const activeDmin = (typeof state.dMin === "number" && state.dMin > 0) ? state.dMin : minPoolD;
 
-    if (uniquePeaks.length <= overviewTarget || sortedD.length <= overviewTarget) {{
-      return {{
-        visiblePeaks: uniquePeaks,
-        observedHklSet: pool.observedHklSet,
-        lodDcut: activeDmin,
-        isLodThinned: false,
-        totalUnique: uniquePeaks.length,
-      }};
-    }}
-
-    const wZoom = Math.max(0.5, state.wulffZoom || 1.0);
-    const budgetFloat = wZoom >= 1.0
-      ? overviewTarget * Math.pow(wZoom, 2.35)
-      : Math.max(45.0, overviewTarget * Math.pow(wZoom, 1.25));
-    if (budgetFloat >= sortedD.length - 0.5) {{
-      return {{
-        visiblePeaks: uniquePeaks,
-        observedHklSet: pool.observedHklSet,
-        lodDcut: activeDmin,
-        isLodThinned: false,
-        totalUnique: uniquePeaks.length,
-      }};
-    }}
-    const fIdx = Math.max(0.0, Math.min(sortedD.length - 1, budgetFloat - 1.0));
-    const idxLo = Math.floor(fIdx);
-    const idxHi = Math.min(sortedD.length - 1, idxLo + 1);
-    const frac = fIdx - idxLo;
-    const rawCut = sortedD[idxLo] * (1.0 - frac) + sortedD[idxHi] * frac;
-    const lodDcut = Math.max(activeDmin, rawCut);
-    const isLodThinned = lodDcut > activeDmin + 0.025;
-    if (!isLodThinned) {{
-      return {{
-        visiblePeaks: uniquePeaks,
-        observedHklSet: pool.observedHklSet,
-        lodDcut: activeDmin,
-        isLodThinned: false,
-        totalUnique: uniquePeaks.length,
-      }};
-    }}
-
-    // When zoomed in past 1.5x, also cull points outside the clipped Wulff disc cap
-    const useCapCull = wZoom > 1.55;
-    let fwdCx = 0.0, fwdCy = 0.0, fwdCz = 1.0, zCapMin = -1.0;
-    if (useCapCull) {{
-      const yawRad = (state.wulffYawDeg || 0.0) * Math.PI / 180.0;
-      const pitchRad = (state.wulffPitchDeg || 0.0) * Math.PI / 180.0;
-      const cp = Math.cos(pitchRad), sp = Math.sin(pitchRad);
-      const fwdLab = [Math.sin(yawRad) * cp, sp, Math.cos(yawRad) * cp];
-      const Rg = getActiveGoniometerR();
-      fwdCx = Rg[0][0] * fwdLab[0] + Rg[1][0] * fwdLab[1] + Rg[2][0] * fwdLab[2];
-      fwdCy = Rg[0][1] * fwdLab[0] + Rg[1][1] * fwdLab[1] + Rg[2][1] * fwdLab[2];
-      fwdCz = Rg[0][2] * fwdLab[0] + Rg[1][2] * fwdLab[1] + Rg[2][2] * fwdLab[2];
-      // Perspective horizon: sqrt(1 - z^2) * sqrt(2.6^2 - 1) / (2.6 - z) <= 1.48 / wZoom
-      const uCap = (1.48 / wZoom) / Math.sqrt(2.6 * 2.6 - 1.0);
-      const u2 = uCap * uCap;
-      zCapMin = Math.max(-1.0, (2.6 * u2 - Math.sqrt(Math.max(0.0, 1.0 - 5.76 * u2))) / (1.0 + u2) - 0.06);
-    }}
-
-    const visiblePeaks = [];
-    const activeOrb = state.activeOrbitId;
+    const rect = stereoCanvas.getBoundingClientRect();
+    const w = Math.max(120, Number(rect.width) || (isExp ? 620 : 210));
+    const h = Math.max(120, Number(rect.height) || (isExp ? 620 : 210));
+    const R = Math.min(w, h) * 0.43;
+    const wZoom = Math.max(0.5, Number(state.wulffZoom) || 1.0);
+    const yawDeg = Number(state.wulffYawDeg) || 0.0;
+    const pitchDeg = Number(state.wulffPitchDeg) || 0.0;
     const withFriedel = Boolean(state.showWulffFriedel);
-    for (let i = 0; i < uniquePeaks.length; i++) {{
-      const p = uniquePeaks[i];
-      const dv = typeof p.d_spacing === "number" ? p.d_spacing : lodDcut;
-      const forceKeep = (
-        isPeakHighlightedTarget(p) ||
-        Boolean(activeOrb && p.asu_orbit_id && p.asu_orbit_id === activeOrb)
-      );
-      if (!forceKeep) {{
-        if (dv < lodDcut - 1e-6) {{
-          p._wulff_sx = undefined;
-          p._wulff_sy = undefined;
-          p._wulff_friedel_sx = undefined;
-          p._wulff_friedel_sy = undefined;
-          continue;
+    const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
+    const Rg = getActiveGoniometerR();
+    const hovId = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
+    const selId = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
+    const firstRef = uniquePeaks.length > 0 ? uniquePeaks[0] : null;
+    const lodSig = [
+      pool.sig, zonesKey, isExp ? "exp" : "ins",
+      Math.round(R), wZoom.toFixed(4), yawDeg.toFixed(3), pitchDeg.toFixed(3),
+      withFriedel ? 1 : 0, hovId, selId, state.activeOrbitId || "",
+      Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[2][0].toFixed(5), Rg[2][2].toFixed(5),
+    ].join("|");
+    if (_wulffLodCache.sig === lodSig && _wulffLodCache.firstRef === firstRef && _wulffLodCache.value) {{
+      return _wulffLodCache.value;
+    }}
+
+    if (uniquePeaks.length === 0) {{
+      for (let i = 0; i < _wulffPrevRenderedPeaks.length; i++) {{
+        const prev = _wulffPrevRenderedPeaks[i];
+        prev._wulff_sx = undefined;
+        prev._wulff_sy = undefined;
+        prev._wulff_friedel_sx = undefined;
+        prev._wulff_friedel_sy = undefined;
+      }}
+      _wulffPrevRenderedPeaks = [];
+      const emptyVal = {{
+        visiblePeaks: uniquePeaks,
+        observedHklSet: pool.observedHklSet,
+        lodDcut: activeDmin,
+        activeDmin,
+        isLodThinned: false,
+        totalUnique: 0,
+        inCapCount: 0,
+      }};
+      _wulffLodCache.sig = lodSig;
+      _wulffLodCache.firstRef = firstRef;
+      _wulffLodCache.value = emptyVal;
+      return emptyVal;
+    }}
+
+    const bvhSig = `${{pool.sig}}|${{zonesKey}}`;
+    if (_wulffBvhCache.sig !== bvhSig || _wulffBvhCache.firstRef !== firstRef || !_wulffBvhCache.bvh) {{
+      _wulffBvhCache.sig = bvhSig;
+      _wulffBvhCache.firstRef = firstRef;
+      _wulffBvhCache.bvh = buildWulffSphericalBVH(uniquePeaks);
+    }}
+    const bvh = _wulffBvhCache.bvh;
+
+    // Camera forward vector in crystal space (matches projectToWulff exactly: D = 2.6, kD = 2.4)
+    const yawRad = yawDeg * Math.PI / 180.0;
+    const pitchRad = pitchDeg * Math.PI / 180.0;
+    const cp = Math.cos(pitchRad), sp = Math.sin(pitchRad);
+    const fwdLab0 = Math.sin(yawRad) * cp;
+    const fwdLab1 = sp;
+    const fwdLab2 = Math.cos(yawRad) * cp;
+    const fwdCx = Rg[0][0] * fwdLab0 + Rg[1][0] * fwdLab1 + Rg[2][0] * fwdLab2;
+    const fwdCy = Rg[0][1] * fwdLab0 + Rg[1][1] * fwdLab1 + Rg[2][1] * fwdLab2;
+    const fwdCz = Rg[0][2] * fwdLab0 + Rg[1][2] * fwdLab1 + Rg[2][2] * fwdLab2;
+
+    const useCapCull = wZoom > 1.45;
+    let zCapMin = -1.0;
+    if (useCapCull) {{
+      const uCap = (1.48 / wZoom) / 2.4;
+      const u2 = uCap * uCap;
+      zCapMin = Math.max(-1.0, (2.6 * u2 + Math.sqrt(Math.max(0.0, 1.0 - 5.76 * u2))) / (1.0 + u2) - 0.04);
+    }}
+
+    const baseCellPx = isExp ? 18.0 : 21.0;
+    const cellPx = wZoom >= 14.0
+      ? 0.0
+      : (wZoom <= 5.0 ? baseCellPx : baseCellPx * ((14.0 - wZoom) / 9.0));
+
+    const {{
+      n, qxArr, qyArr, qzArr, dArr,
+      leftChild, rightChild, cxArr, cyArr, czArr, rChord, canRadius, maxD, repIdx, subCount,
+    }} = bvh;
+    let stack = bvh.stack;
+    let spIdx = 0;
+    stack[spIdx++] = 0;
+
+    const keptMask = new Uint8Array(n);
+    const outIndices = [];
+    let inCapCount = 0;
+    let stoppedAny = false;
+    let minKeptD = Infinity;
+
+    while (spIdx > 0) {{
+      const u = stack[--spIdx];
+      if (maxD[u] < activeDmin - 1e-5) continue;
+
+      const zCenter = cxArr[u] * fwdCx + cyArr[u] * fwdCy + czArr[u] * fwdCz;
+      const rc = rChord[u];
+      const zBest = (withFriedel ? Math.abs(zCenter) : zCenter) + rc;
+      if (useCapCull && zBest < zCapMin) continue;
+      const whollyInCap = !useCapCull || ((withFriedel ? Math.abs(zCenter) : zCenter) - rc >= zCapMin);
+
+      const L = leftChild[u];
+      if (L < 0) {{
+        const pIdx = repIdx[u];
+        const dv = dArr[pIdx];
+        if (dv < activeDmin - 1e-5) continue;
+        if (useCapCull) {{
+          const zp = qxArr[pIdx] * fwdCx + qyArr[pIdx] * fwdCy + qzArr[pIdx] * fwdCz;
+          if ((withFriedel ? Math.abs(zp) : zp) < zCapMin) continue;
         }}
-        if (useCapCull && Array.isArray(p.q_hat) && p.q_hat.length >= 3) {{
-          const zc = p.q_hat[0] * fwdCx + p.q_hat[1] * fwdCy + p.q_hat[2] * fwdCz;
-          const zBest = withFriedel ? Math.abs(zc) : zc;
-          if (zBest < zCapMin) {{
-            p._wulff_sx = undefined;
-            p._wulff_sy = undefined;
-            p._wulff_friedel_sx = undefined;
-            p._wulff_friedel_sy = undefined;
-            continue;
-          }}
+        inCapCount += 1;
+        if (!keptMask[pIdx]) {{
+          keptMask[pIdx] = 1;
+          outIndices.push(pIdx);
+          if (dv < minKeptD) minKeptD = dv;
+        }}
+        continue;
+      }}
+
+      const zNear = Math.min(1.0, zBest);
+      const pxScale = (2.4 * R * wZoom) / Math.max(0.5, 2.6 - zNear);
+      const diamPx = 2.0 * Math.max(rc, canRadius[u]) * pxScale;
+      if (cellPx > 0.0 && whollyInCap && diamPx <= cellPx) {{
+        const pIdx = repIdx[u];
+        inCapCount += subCount[u];
+        if (subCount[u] > 1) stoppedAny = true;
+        if (!keptMask[pIdx]) {{
+          keptMask[pIdx] = 1;
+          outIndices.push(pIdx);
+          const dv = dArr[pIdx];
+          if (dv < minKeptD) minKeptD = dv;
+        }}
+        continue;
+      }}
+
+      if (spIdx + 2 >= stack.length) {{
+        const bigger = new Int32Array(stack.length * 2);
+        bigger.set(stack);
+        stack = bigger;
+        bvh.stack = bigger;
+      }}
+      stack[spIdx++] = rightChild[u];
+      stack[spIdx++] = L;
+    }}
+
+    const activeOrb = state.activeOrbitId;
+    if (state.hoveredPeakId !== null || state.selectedPeakId !== null || state.hoveredPeakObj || state.selectedPeakObj || activeOrb) {{
+      for (let i = 0; i < n; i++) {{
+        if (keptMask[i]) continue;
+        const p = uniquePeaks[i];
+        if (
+          isPeakHighlightedTarget(p) ||
+          Boolean(activeOrb && p.asu_orbit_id && p.asu_orbit_id === activeOrb)
+        ) {{
+          keptMask[i] = 1;
+          outIndices.push(i);
         }}
       }}
-      visiblePeaks.push(p);
     }}
-    return {{
+
+    for (let i = 0; i < _wulffPrevRenderedPeaks.length; i++) {{
+      const prev = _wulffPrevRenderedPeaks[i];
+      prev._wulff_sx = undefined;
+      prev._wulff_sy = undefined;
+      prev._wulff_friedel_sx = undefined;
+      prev._wulff_friedel_sy = undefined;
+    }}
+
+    const visiblePeaks = new Array(outIndices.length);
+    for (let k = 0; k < outIndices.length; k++) {{
+      visiblePeaks[k] = uniquePeaks[outIndices[k]];
+    }}
+    _wulffPrevRenderedPeaks = visiblePeaks;
+
+    const isLodThinned = Boolean(stoppedAny && visiblePeaks.length < inCapCount);
+    const resVal = {{
       visiblePeaks,
       observedHklSet: pool.observedHklSet,
-      lodDcut,
-      isLodThinned: true,
+      lodDcut: Number.isFinite(minKeptD) ? minKeptD : activeDmin,
+      activeDmin,
+      isLodThinned,
       totalUnique: uniquePeaks.length,
+      inCapCount,
     }};
+    _wulffLodCache.sig = lodSig;
+    _wulffLodCache.firstRef = firstRef;
+    _wulffLodCache.value = resVal;
+    return resVal;
   }}
 
   // Render Convex 3D Wulff Sphere (Corner Inset or Expanded Popout)
@@ -16682,10 +17512,12 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       }});
     }}
     if (lodState.isLodThinned) {{
+      const inC = typeof lodState.inCapCount === "number" ? lodState.inCapCount : lodState.totalUnique;
+      const dLbl = typeof lodState.activeDmin === "number" ? lodState.activeDmin.toFixed(2) : "1.00";
       cornerBadges.push({{
         txt: isExp
-          ? `d ≥ ${{lodState.lodDcut.toFixed(2)}}Å (zoom+ for hi-res)`
-          : `d ≥ ${{lodState.lodDcut.toFixed(2)}}Å (zoom+)`,
+          ? `LOD ${{lodState.visiblePeaks.length}}/${{inC}} spots (d ≥ ${{dLbl}}Å • zoom+)`
+          : `LOD ${{lodState.visiblePeaks.length}}/${{inC}} (zoom+)`,
         stroke: "rgba(251, 191, 36, 0.48)",
         fill: "#fbbf24",
       }});

@@ -19,10 +19,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     directly inside the active $[\lambda_{\min}, \lambda_{\max}]$ Ewald band
     without multi-GB 3D `meshgrid` allocations.
   - Upgraded Detector and Wulff-sphere LOD thinning with two-tier
-    viewport-frustum high-resolution streaming (up to `48×` detector zoom) and a
-    directional panel hemisphere LUT: Tier 1 keeps `1×` overview crisp (`~300`
-    spots), while zooming into a detector bank streams sub-Ångström reflections
-    for the visible panel tile down to `0.50 Å` with crowd-aware spot sizing.
+    viewport-frustum high-resolution streaming (up to `48×` detector zoom) and
+    gameplay-style canonical dyadic Spherical BVHs (`buildDetectorSphericalBVH`,
+    `buildWulffSphericalBVH`) paired with solid-angle stratified Ewald sampling
+    (`_stratified_spherical_subsample` on server, `selectSpatiallyStratifiedOrder`
+    on client): outer resolution shells and back-scattering banks populate
+    immediately at `1×` zoom as `#slider-dmin` decreases while screen peak
+    density stays bounded (~18 px cells), and zooming in subdivides cells
+    100% pop-free down to full doublet/harmonic separation (`0.50 Å`).
 - **GPU multi-panel peak prediction & fixed-chunk $O(n)$ TOF-gated integration for large macromolecular unit cells (`physics`, `tof_gate`, `detector`)**:
   - Replaced per-bank `ProcessPoolExecutor` peak prediction (which regenerated
     millions of `(h, k, l)` tuples inside every worker process, taking ~3–4 min
