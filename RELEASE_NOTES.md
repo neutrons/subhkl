@@ -21,6 +21,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     ($a=b=c,\,\alpha=\beta=\gamma$, `P` centering) on `:R` groups.
   - Prevented `trigonal_r` from overwriting bare `R` symbols (`"R 3"`,
     `"R -3 m"`, `"R 3 2"`) in Rainbow Zones' client-side `SG_SYMMETRY_LOOKUP`.
+- **Smooth `0.01 Å` $d_{\min}$ slider increments in Rainbow Zones (`rainbow_zones`)**:
+  - Standardized `#slider-dmin` (HTML default and `setRangeBounds` floor/step)
+    to `0.01 Å` increments so non-integer wavelength limits (e.g. `2.0–4.4 Å`)
+    no longer force coarse `0.05 Å` steps onto odd values like `1.99 Å`.
 
 ## [1.6.6]
 
