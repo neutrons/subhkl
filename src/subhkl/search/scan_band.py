@@ -1343,11 +1343,20 @@ def refine_scan(args):
         if U0.ndim == 3:
             U0 = U0[0]
         cand_Us = [U0]
-        for cand_key in ("search/orientations", "blind_search/candidate_U"):
+        cand_Us_warped = [U0]
+        for cand_key in (
+            "search/orientations",
+            "blind_search/candidate_U",
+            "search/proposal_orientations",
+        ):
             if cand_key in f:
                 for Uc in np.asarray(f[cand_key][()], dtype=np.float64)[:6]:
                     if not any(np.allclose(Uc, Uprev, atol=1e-4) for Uprev in cand_Us):
                         cand_Us.append(Uc)
+                    if cand_key != "search/proposal_orientations" and not any(
+                        np.allclose(Uc, Uprev, atol=1e-4) for Uprev in cand_Us_warped
+                    ):
+                        cand_Us_warped.append(Uc)
         cand_geoms_boot = (
             np.asarray(f["search/candidate_geometries"][()], dtype=np.float64)
             if "search/candidate_geometries" in f
@@ -1372,6 +1381,9 @@ def refine_scan(args):
                 else None
             )
         )
+        U_boot_orig = U0.copy()
+        shared_geom_orig = shared_geom.copy() if shared_geom is not None else None
+        shared_axial_orig = shared_axial
 
     cell0 = [float(v) for v in args.cell]
     symmetry_kind, active_cell_slots = _cell_symmetry_spec(cell0, args.space_group)
@@ -1645,51 +1657,151 @@ def refine_scan(args):
                 args.assign_wavelength,
                 b2_ew,
             )
-            used_pre_polish = shared_geom is None or abs(float(shared_geom[0])) < 0.015
-            if used_pre_polish:
-                best_u_nom, best_s_nom = U0, -1e30
-                for Uc in cand_Us[:4]:
-                    Up, sp = polish_joint_nom(Uc, spans=(1.0, 0.35), n=7)
-                    if sp > best_s_nom:
-                        best_s_nom, best_u_nom = sp, Up
-                U_nom_joint, ew_nom_joint = polish_joint_nom(
-                    best_u_nom, spans=(0.12, 0.04), n=7
+            used_pre_polish = False
+            best_u_nom, best_s_nom = U0, -1e30
+            for Uc in cand_Us[:8]:
+                Up, sp = polish_joint_nom(Uc, spans=(1.0, 0.35), n=7)
+                if sp > best_s_nom:
+                    best_s_nom, best_u_nom = sp, Up
+            U_nom_joint, ew_nom_joint = polish_joint_nom(
+                best_u_nom, spans=(0.12, 0.04), n=7
+            )
+            if per_run_active and not is_single_setting:
+                q_zf_nom, w_zf_nom = _build_zone_funnel_obs(
+                    C_bank, uhat_bank, vhat_bank, W_bank, H_bank
                 )
-                if per_run_active and not is_single_setting:
-                    q_zf_nom, w_zf_nom = _build_zone_funnel_obs(
-                        C_bank, uhat_bank, vhat_bank, W_bank, H_bank
-                    )
-                    Urs_zf_nom = _zone_funnel_seed_per_run(
-                        U_nom_joint,
-                        B0,
-                        args.runs,
-                        R_runs_nom,
-                        q_zf_nom,
-                        w_zf_nom,
-                        space_group=args.space_group,
-                    )
-                    Urs_nom, s_nom_r = polish_per_run_nom(
-                        U_nom_joint, Urs_alt_seed=Urs_zf_nom
-                    )
-                    ew_nom = float(s_nom_r.sum())
-                    R_runs_pre = dict(R_runs_nom)
-                    for ir, r in enumerate(args.runs):
-                        R_runs_pre[r] = R_runs_nom[r] @ Urs_nom[ir] @ U_nom_joint.T
-                    for r in args.runs:
-                        R_obs[runs == r] = R_runs_pre[r]
-                    U0 = U_nom_joint
-                else:
-                    Urs_nom = np.repeat(U_nom_joint[None], len(args.runs), axis=0)
-                    ew_nom = float(ew_nom_joint)
-                    R_runs_pre = dict(R_runs_nom)
-                    U0 = U_nom_joint
+                Urs_zf_nom = _zone_funnel_seed_per_run(
+                    U_nom_joint,
+                    B0,
+                    args.runs,
+                    R_runs_nom,
+                    q_zf_nom,
+                    w_zf_nom,
+                    space_group=args.space_group,
+                )
+                Urs_nom, s_nom_r = polish_per_run_nom(
+                    U_nom_joint, Urs_alt_seed=Urs_zf_nom
+                )
+                ew_nom = float(s_nom_r.sum())
+                if args.anchor_run in args.runs:
+                    U_nom_joint = Urs_nom[list(args.runs).index(args.anchor_run)].copy()
+                R_runs_pre = dict(R_runs_nom)
+                for ir, r in enumerate(args.runs):
+                    R_runs_pre[r] = R_runs_nom[r] @ Urs_nom[ir] @ U_nom_joint.T
             else:
-                U_nom_joint, ew_nom_joint = polish_joint_nom(
-                    U0, spans=(0.35, 0.12), n=5
-                )
                 Urs_nom = np.repeat(U_nom_joint[None], len(args.runs), axis=0)
                 ew_nom = float(ew_nom_joint)
                 R_runs_pre = dict(R_runs_nom)
+
+            has_nontrivial_shared_geom = (
+                shared_geom_orig is not None
+                and len(shared_geom_orig) == 7
+                and (
+                    abs(float(shared_geom_orig[0])) >= 0.01
+                    or np.linalg.norm(shared_geom_orig[1:4]) >= np.deg2rad(0.2)
+                    or np.linalg.norm(shared_geom_orig[4:7]) >= 0.002
+                )
+            )
+            ew_shared = -1.0
+            U_sh_seed = U_boot_orig.copy()
+            if has_nontrivial_shared_geom:
+                from scipy.spatial.transform import Rotation as _RotSh
+
+                sr_sh = float(shared_geom_orig[0])
+                sa_sh = (
+                    float(shared_axial_orig) if shared_axial_orig is not None else sr_sh
+                )
+                Rg_sh = _RotSh.from_rotvec(shared_geom_orig[1:4]).as_matrix()
+                T_sh = np.asarray(shared_geom_orig[4:7], dtype=np.float64)
+                C_sh_sc = np.stack(
+                    [
+                        C_bank[:, 0] * (1.0 + sr_sh),
+                        C_bank[:, 1] * (1.0 + sa_sh),
+                        C_bank[:, 2] * (1.0 + sr_sh),
+                    ],
+                    axis=-1,
+                )
+                uh_sh = uhat_bank @ Rg_sh.T
+                vh_sh = vhat_bank @ Rg_sh.T
+                C_sh_mid = C_sh_sc @ Rg_sh.T + T_sh[None, :]
+                C_sh_corner = (
+                    C_sh_mid
+                    - 0.5 * W_bank[:, None] * uh_sh
+                    - 0.5 * H_bank[:, None] * vh_sh
+                )
+                _, polish_joint_sh, polish_per_run_sh = _make_ewald_polisher(
+                    hkl_ew @ B0.T,
+                    args.runs,
+                    R_runs_nom,
+                    bank_ids,
+                    C_sh_corner,
+                    uh_sh,
+                    vh_sh,
+                    W_bank,
+                    H_bank,
+                    M_bank,
+                    N_bank,
+                    exc_maps,
+                    args.assign_wavelength,
+                    b2_ew,
+                )
+                best_u_sh, best_s_sh = U_boot_orig, -1e30
+                for Uc_sh in cand_Us_warped[:3]:
+                    Up_sh, sp_sh = polish_joint_sh(Uc_sh, spans=(0.6, 0.2), n=5)
+                    if sp_sh > best_s_sh:
+                        best_s_sh, best_u_sh = sp_sh, Up_sh
+                U_sh_joint, ew_sh_joint = polish_joint_sh(
+                    best_u_sh, spans=(0.12, 0.04), n=5
+                )
+                U_sh_seed = U_sh_joint
+                if per_run_active and not is_single_setting:
+                    q_zf_sh, w_zf_sh = _build_zone_funnel_obs(
+                        C_sh_mid, uh_sh, vh_sh, W_bank, H_bank
+                    )
+                    Urs_zf_sh = _zone_funnel_seed_per_run(
+                        U_sh_joint,
+                        B0,
+                        args.runs,
+                        R_runs_nom,
+                        q_zf_sh,
+                        w_zf_sh,
+                        space_group=args.space_group,
+                    )
+                    _, s_sh_r = polish_per_run_sh(U_sh_joint, Urs_alt_seed=Urs_zf_sh)
+                    ew_shared = float(s_sh_r.sum())
+                else:
+                    ew_shared = float(ew_sh_joint)
+
+            used_pre_polish = (not has_nontrivial_shared_geom) or (
+                ew_nom >= 0.90 * ew_shared
+            )
+            if used_pre_polish:
+                U0 = U_nom_joint
+                if per_run_active and not is_single_setting:
+                    for r in args.runs:
+                        R_obs[runs == r] = R_runs_pre[r]
+                if pixel_em is not None:
+                    ev_pre = pixel_em.evaluate_candidate(
+                        U0,
+                        B0,
+                        R_runs=R_runs_pre,
+                        radial_scale=0.0,
+                        axial_scale=0.0,
+                        match_sigma_px=6.5,
+                    )
+                    pixel_em.apply_responsibilities(
+                        ev_pre["gamma_valid"],
+                        ev_pre["gamma_dark"],
+                        ev_pre["gamma_bright"],
+                    )
+                    dev, spot_weights, _gv_obs = pixel_em.map_to_observations(
+                        banks, pr, pc, runs, raw_dev_obs, raw_spot_weights
+                    )
+            else:
+                U0 = U_sh_seed
+                shared_geom = shared_geom_orig
+                shared_axial = shared_axial_orig
+
             ewald_ctx = {
                 "raw_exc_maps": raw_exc_maps,
                 "exc_maps": exc_maps,
@@ -1698,6 +1810,8 @@ def refine_scan(args):
                 "U_nom_joint": U_nom_joint,
                 "Urs_nom": Urs_nom,
                 "ew_nom": ew_nom,
+                "ew_shared": ew_shared,
+                "U_sh_seed": U_sh_seed,
                 "R_runs_pre": R_runs_pre,
                 "R_runs_band_base": R_runs_pre if used_pre_polish else R_runs_nom,
             }
@@ -1911,13 +2025,18 @@ def refine_scan(args):
         )
         return -score + reg
 
+    cell_bounds_0 = (
+        [(-0.035, 0.035), (-0.035, 0.035), (-0.035, 0.035)]
+        if (not is_single_setting and len(args.stable_runs) >= 2)
+        else [(0.0, 0.0)] * 3
+    )
     bounds_0 = (
         [(-0.2, 0.2)] * 3
         + [(-0.15, 0.15), (-0.15, 0.15), (0.0, 0.0)]
         + [(-0.08, 0.08)] * 3
         + [(-0.03, 0.03)] * 3
         + [(0.0, 0.0)] * 3
-        + [(0.0, 0.0)] * 3
+        + cell_bounds_0
         + [(0.0, 0.0)] * n_runs
         + [(0.0, 0.0)] * (2 * n_banks)
     )
@@ -1927,7 +2046,7 @@ def refine_scan(args):
         + [(-0.08, 0.08)] * 3
         + [(-0.03, 0.03)] * 3
         + [(-0.015, 0.015)] * 3
-        + [(0.0, 0.0)] * 3
+        + [(-0.035, 0.035), (-0.035, 0.035), (-0.035, 0.035)]
         + [(-np.deg2rad(6.0), np.deg2rad(6.0))] * n_runs
         + [(0.0, 0.0)] * (2 * n_banks)
     )
@@ -1937,7 +2056,7 @@ def refine_scan(args):
         + [(-0.08, 0.08)] * 3
         + [(-0.03, 0.03)] * 3
         + [(-0.015, 0.015)] * 3
-        + [(-0.02, 0.02), (-0.02, 0.02), (-0.02, 0.02)]
+        + [(-0.035, 0.035), (-0.035, 0.035), (-0.035, 0.035)]
         + [(-np.deg2rad(6.0), np.deg2rad(6.0))] * n_runs
         + [(0.0, 0.0)] * (2 * n_banks)
     )
@@ -2100,8 +2219,12 @@ def refine_scan(args):
         w_j, w_r29 = _compute_band_weights(dev, spot_weights, gv_e)
         return stats_e
 
+    used_nom_pre = ewald_ctx is not None and (
+        ewald_ctx.get("R_runs_band_base") is ewald_ctx.get("R_runs_pre")
+    )
     has_calibrated_shared_geom = (
-        shared_geom is not None
+        not used_nom_pre
+        and shared_geom is not None
         and len(shared_geom) == 7
         and (
             abs(float(shared_geom[0])) >= 0.015
@@ -2110,40 +2233,60 @@ def refine_scan(args):
         )
     )
     if has_calibrated_shared_geom:
-        ob_tight = np.deg2rad(1.5)
+        ob_tight = np.deg2rad(2.5)
         for b_stage in (bounds_0, bounds_120, bounds_global, bounds_panel):
             for j_rv in range(3):
                 b_stage[j_rv] = (-ob_tight, ob_tight)
 
     # Stage 0: coarse global geometry on the caller's stable-run subset.
+    # Always test pure nominal geometry (0.0) without overwriting it with
+    # shared_geom, and compete it directly against a shared_geom trial when
+    # bootstrap detector geometry was estimated.
     best_p, best_v, best_result = None, 1e9, None
+    stage0_trials: list[tuple[float, bool]] = []
     if has_calibrated_shared_geom:
-        s_inits = (float(shared_geom[0]),)
+        stage0_trials.append((float(shared_geom[0]), True))
+        stage0_trials.append((0.0, False))
     else:
-        s_inits = (
+        base_s = (
             (-0.05, 0.0, 0.055)
             if ("cylindrical" in args.modes or "axial_stretch" in args.modes)
             else (0.0,)
         )
-    for s_init in s_inits:
+        for s_v in base_s:
+            stage0_trials.append((float(s_v), False))
+        if (
+            not used_nom_pre
+            and shared_geom_orig is not None
+            and len(shared_geom_orig) == 7
+            and (
+                abs(float(shared_geom_orig[0])) > 1e-4
+                or np.linalg.norm(shared_geom_orig[1:4]) > 1e-4
+                or np.linalg.norm(shared_geom_orig[4:7]) > 1e-4
+            )
+        ):
+            stage0_trials.append((float(shared_geom_orig[0]), True))
+    for s_init, use_sh_geom in stage0_trials:
         p0 = np.zeros(18 + n_runs + 2 * n_banks)
         p0[3] = s_init
         p0[4] = s_init
-        if (
-            shared_geom is not None
-            and len(shared_geom) == 7
-            and abs(s_init - float(shared_geom[0])) <= 0.03
-        ):
-            p0[3] = float(shared_geom[0])
-            p0[4] = (
-                float(shared_axial)
-                if shared_axial is not None
-                else float(shared_geom[0])
+        g_seed = shared_geom_orig if shared_geom_orig is not None else shared_geom
+        ax_seed = shared_axial_orig if shared_geom_orig is not None else shared_axial
+        if use_sh_geom and g_seed is not None and len(g_seed) == 7:
+            from scipy.spatial.transform import Rotation as _RotS0
+
+            U_sh_ref = (
+                ewald_ctx["U_sh_seed"]
+                if (ewald_ctx is not None and "U_sh_seed" in ewald_ctx)
+                else U_boot_orig
             )
+            p0[0:3] = _RotS0.from_matrix(U_sh_ref @ np.asarray(Uj).T).as_rotvec()
+            p0[3] = float(g_seed[0])
+            p0[4] = float(ax_seed) if ax_seed is not None else float(g_seed[0])
             if "global_rot" in args.modes:
-                p0[6:9] = shared_geom[1:4]
+                p0[6:9] = g_seed[1:4]
             if "global_trans" in args.modes:
-                p0[9:12] = shared_geom[4:7]
+                p0[9:12] = g_seed[4:7]
         p0 = np.clip(p0, *np.asarray(bounds_0).T)
         res = _minimize_band(vg_band_60, p0, bounds_0, w_r29)
         if res.fun < best_v:
@@ -2702,7 +2845,7 @@ def refine_scan(args):
             s_samp=np.asarray(s_samp),
         )
         U_cal_1, s_cal_1 = polish_joint_cal(U_opt)
-        if abs(float(s_rad)) < 0.015:
+        if abs(float(s_rad)) < 0.03:
             U_cal_2, s_cal_2 = polish_joint_cal(ewald_ctx["U_nom_joint"])
             if s_cal_2 > s_cal_1:
                 U_cal_joint, ew_cal_joint = U_cal_2, s_cal_2
@@ -2762,6 +2905,8 @@ def refine_scan(args):
 
         ew_nom = float(ewald_ctx["ew_nom"])
         if ew_cal >= ew_nom:
+            if used_per_run_cal and args.anchor_run in args.runs:
+                U_cal_joint = Urs_cal[list(args.runs).index(args.anchor_run)].copy()
             U_opt = U_cal_joint
             p_cur[0:3] = Rot.from_matrix(U_opt @ np.asarray(Uj).T).as_rotvec()
             if used_per_run_cal:
@@ -2800,55 +2945,62 @@ def refine_scan(args):
         # Direct Ewald unit-cell ratio polish (decoupled from isotropic scale c):
         # preserves unit-cell ratios even when detector radial scale falls back to
         # nominal geometry, and breaks the flat L-BFGS-B band valley on large cells.
+        # Alternate (cell <-> wider U + zone-funnel/per-run R) so monoclinic shear
+        # and slipped runs decouple cleanly from unit-cell ratio changes.
         if (
             "cell" in args.modes
             and not is_single_setting
             and len(active_cell_slots) > 0
             and len(ewald_ctx["hkl_ew"]) > 0
         ):
-            if ew_eval_win is None:
-                ew_eval_win, _, _ = _make_ewald_polisher(
-                    ewald_ctx["hkl_ew"] @ B_opt.T,
-                    args.runs,
-                    R_runs_win,
-                    bank_ids,
-                    C_final,
-                    uh_final,
-                    vh_final,
-                    W_final,
-                    H_final,
-                    M_bank,
-                    N_bank,
-                    ewald_ctx["exc_maps"],
-                    args.assign_wavelength,
-                    ewald_ctx["b2"],
-                    s_samp=np.asarray(s_samp),
-                )
-            keep_c = ew_eval_win.keep_idx
-            if len(keep_c) > 0:
+            cell_vec = np.array(
+                [float(p_cur[15]), float(p_cur[16]), float(p_cur[17])],
+                dtype=np.float64,
+            )
+            for _cell_pass in range(2):
+                if ew_eval_win is None:
+                    ew_eval_win, _, _ = _make_ewald_polisher(
+                        ewald_ctx["hkl_ew"] @ B_opt.T,
+                        args.runs,
+                        R_runs_win,
+                        bank_ids,
+                        C_final,
+                        uh_final,
+                        vh_final,
+                        W_final,
+                        H_final,
+                        M_bank,
+                        N_bank,
+                        ewald_ctx["exc_maps"],
+                        args.assign_wavelength,
+                        ewald_ctx["b2"],
+                        s_samp=np.asarray(s_samp),
+                    )
+                keep_c = ew_eval_win.keep_idx
+                if len(keep_c) == 0:
+                    break
                 hkl_sub = ewald_ctx["hkl_ew"][keep_c]
-                cell_vec = np.array(
-                    [float(p_cur[15]), float(p_cur[16]), float(p_cur[17])],
-                    dtype=np.float64,
-                )
 
-                def _eval_cell_vec(cv):
+                def _eval_cell_vec(cv, _hkl_sub=hkl_sub, _ew=ew_eval_win, _urs=Urs_win):
                     vals = _apply_cell_jax(
                         cell0, symmetry_kind, float(cv[0]), float(cv[1]), float(cv[2])
                     )
                     B_try = np.asarray(
                         build_B_jax(*[float(v) for v in vals]), np.float64
                     )
-                    raw_s = float(
-                        ew_eval_win.score_with_Gc(hkl_sub @ B_try.T, Urs_win).sum()
-                    )
+                    raw_s = float(_ew.score_with_Gc(_hkl_sub @ B_try.T, _urs).sum())
                     # Gentle tie-breaking prior (~0.01% of score at 1% strain)
                     prior = 1e-4 * max(abs(raw_s), 1.0) * float(np.sum(cv * cv))
                     return raw_s - prior, raw_s
 
                 best_obj_c, best_raw_c = _eval_cell_vec(cell_vec)
                 cell_changed = False
-                for c_span in (0.018, 0.005, 0.0014, 0.0004):
+                c_spans = (
+                    (0.018, 0.005, 0.0014, 0.0004)
+                    if _cell_pass == 0
+                    else (0.006, 0.0018, 0.0005, 0.00015)
+                )
+                for c_span in c_spans:
                     for slot in active_cell_slots:
                         c0_s = cell_vec[slot]
                         lo_s = max(-0.035, c0_s - c_span)
@@ -2864,74 +3016,109 @@ def refine_scan(args):
                                 best_raw_c = raw_t
                                 cell_vec = cv_try
                                 cell_changed = True
-                if cell_changed:
-                    p_cur[15:18] = cell_vec
-                    a_opt, b_opt, c_opt, al_opt_r, be_opt_r, ga_opt_r = [
-                        float(v)
-                        for v in _apply_cell_jax(
-                            cell0,
-                            symmetry_kind,
-                            float(cell_vec[0]),
-                            float(cell_vec[1]),
-                            float(cell_vec[2]),
-                        )
-                    ]
-                    al_opt, be_opt, ga_opt = np.degrees(
-                        [al_opt_r, be_opt_r, ga_opt_r]
-                    ).tolist()
-                    B_opt = np.asarray(
-                        build_B_jax(a_opt, b_opt, c_opt, al_opt_r, be_opt_r, ga_opt_r),
-                        dtype=np.float64,
+                if not cell_changed:
+                    break
+                p_cur[15:18] = cell_vec
+                a_opt, b_opt, c_opt, al_opt_r, be_opt_r, ga_opt_r = [
+                    float(v)
+                    for v in _apply_cell_jax(
+                        cell0,
+                        symmetry_kind,
+                        float(cell_vec[0]),
+                        float(cell_vec[1]),
+                        float(cell_vec[2]),
                     )
-                    ew_best = best_raw_c
-                    # Fold Urs_win into R_runs_base_c so fine orientation polish starts
-                    # at the already-converged per-run orientations instead of resetting
-                    # multi-degree goniometer precession back to U_opt.
-                    R_runs_base_c = dict(R_runs_win)
-                    if per_run_active and not is_single_setting:
-                        for ir, r in enumerate(args.runs):
-                            R_runs_base_c[r] = R_runs_win[r] @ Urs_win[ir] @ U_opt.T
-                    _, pol_j_c, pol_pr_c = _make_ewald_polisher(
-                        ewald_ctx["hkl_ew"] @ B_opt.T,
-                        args.runs,
-                        R_runs_base_c,
-                        bank_ids,
-                        C_final,
+                ]
+                al_opt, be_opt, ga_opt = np.degrees(
+                    [al_opt_r, be_opt_r, ga_opt_r]
+                ).tolist()
+                B_opt = np.asarray(
+                    build_B_jax(a_opt, b_opt, c_opt, al_opt_r, be_opt_r, ga_opt_r),
+                    dtype=np.float64,
+                )
+                ew_best = best_raw_c
+                # Fold Urs_win into R_runs_base_c so orientation polish starts at
+                # the converged per-run orientations instead of resetting precession.
+                R_runs_base_c = dict(R_runs_win)
+                if per_run_active and not is_single_setting:
+                    for ir, r in enumerate(args.runs):
+                        R_runs_base_c[r] = R_runs_win[r] @ Urs_win[ir] @ U_opt.T
+                ew_eval_c, pol_j_c, pol_pr_c = _make_ewald_polisher(
+                    ewald_ctx["hkl_ew"] @ B_opt.T,
+                    args.runs,
+                    R_runs_base_c,
+                    bank_ids,
+                    C_final,
+                    uh_final,
+                    vh_final,
+                    W_final,
+                    H_final,
+                    M_bank,
+                    N_bank,
+                    ewald_ctx["exc_maps"],
+                    args.assign_wavelength,
+                    ewald_ctx["b2"],
+                    s_samp=np.asarray(s_samp),
+                )
+                base_c_new = float(
+                    np.diag(
+                        ew_eval_c(np.repeat(U_opt[None], len(args.runs), axis=0))
+                    ).sum()
+                )
+                U_c_try, ew_j_c = pol_j_c(U_opt, spans=(0.60, 0.20, 0.06, 0.02), n=7)
+                if per_run_active and not is_single_setting:
+                    C_mid_c = (
+                        C_final
+                        + 0.5 * W_final[:, None] * uh_final
+                        + 0.5 * H_final[:, None] * vh_final
+                    )
+                    q_zf_c, w_zf_c = _build_zone_funnel_obs(
+                        C_mid_c,
                         uh_final,
                         vh_final,
                         W_final,
                         H_final,
-                        M_bank,
-                        N_bank,
-                        ewald_ctx["exc_maps"],
-                        args.assign_wavelength,
-                        ewald_ctx["b2"],
-                        s_samp=np.asarray(s_samp),
+                        s_vec=np.asarray(s_samp),
                     )
-                    U_c_try, ew_j_c = pol_j_c(U_opt, spans=(0.15, 0.05), n=5)
-                    if per_run_active and not is_single_setting:
-                        Urs_c, s_c_r = pol_pr_c(U_c_try, spans=(0.25, 0.08, 0.03), n=5)
-                        ew_c_tot = float(s_c_r.sum())
-                        if ew_c_tot >= best_raw_c:
-                            U_opt = U_c_try
-                            p_cur[0:3] = Rot.from_matrix(
-                                U_opt @ np.asarray(Uj).T
-                            ).as_rotvec()
-                            ew_best = ew_c_tot
-                            R_runs_final_c = dict(R_runs_base_c)
-                            for ir, r in enumerate(args.runs):
-                                R_runs_final_c[r] = (
-                                    R_runs_base_c[r] @ Urs_c[ir] @ U_opt.T
-                                )
-                            args.R_runs_refined = [
-                                R_runs_final_c[r] for r in range(n_runs)
-                            ]
-                    elif float(ew_j_c) >= best_raw_c:
+                    Urs_zf_c = _zone_funnel_seed_per_run(
+                        U_c_try,
+                        B_opt,
+                        args.runs,
+                        R_runs_base_c,
+                        q_zf_c,
+                        w_zf_c,
+                        space_group=args.space_group,
+                    )
+                    Urs_c, s_c_r = pol_pr_c(
+                        U_c_try,
+                        spans=(0.50, 0.18, 0.06, 0.02),
+                        n=5,
+                        Urs_alt_seed=Urs_zf_c,
+                    )
+                    ew_c_tot = float(s_c_r.sum())
+                    if ew_c_tot >= base_c_new:
+                        if args.anchor_run in args.runs:
+                            U_c_try = Urs_c[
+                                list(args.runs).index(args.anchor_run)
+                            ].copy()
                         U_opt = U_c_try
                         p_cur[0:3] = Rot.from_matrix(
                             U_opt @ np.asarray(Uj).T
                         ).as_rotvec()
-                        ew_best = float(ew_j_c)
+                        ew_best = ew_c_tot
+                        R_runs_final_c = dict(R_runs_base_c)
+                        for ir, r in enumerate(args.runs):
+                            R_runs_final_c[r] = R_runs_base_c[r] @ Urs_c[ir] @ U_opt.T
+                        args.R_runs_refined = [R_runs_final_c[r] for r in range(n_runs)]
+                        Urs_win = Urs_c
+                        R_runs_win = R_runs_base_c
+                        ew_eval_win = ew_eval_c
+                elif float(ew_j_c) >= base_c_new:
+                    U_opt = U_c_try
+                    p_cur[0:3] = Rot.from_matrix(U_opt @ np.asarray(Uj).T).as_rotvec()
+                    ew_best = float(ew_j_c)
+                    Urs_win = np.repeat(U_opt[None], len(args.runs), axis=0)
+                    ew_eval_win = ew_eval_c
         record(
             "ewald-polish",
             OptimizeResult(
@@ -3036,6 +3223,23 @@ def refine_scan(args):
                 if float(s_st4_r[ir]) < 0.99 * float(s_st3_r[ir]):
                     R_runs_pol[r] = R_runs_init[r]
                     trans_runs_pol[r] = 0.0
+        if (
+            getattr(args, "_recovered_outer_R_runs", None) is None
+            and args.anchor_run in args.runs
+        ):
+            from scipy.spatial.transform import Rotation as _RotAnc
+
+            Q_anc4 = R_runs_nom[args.anchor_run].T @ R_runs_pol[args.anchor_run]
+            s_vec_cur = np.asarray(s_samp, dtype=np.float64)
+            for r in args.runs:
+                R_runs_pol[r] = (
+                    R_runs_nom[r].copy()
+                    if r == args.anchor_run
+                    else R_runs_pol[r] @ Q_anc4.T
+                )
+                trans_runs_pol[r] = Q_anc4 @ (s_vec_cur + trans_runs_pol[r]) - s_vec_cur
+            U_opt = Q_anc4 @ U_opt
+            p_cur[0:3] = _RotAnc.from_matrix(U_opt @ np.asarray(Uj).T).as_rotvec()
         args.R_runs_refined = R_runs_pol
         args.trans_runs_refined = trans_runs_pol
         max_t_mm = float(1e3 * np.linalg.norm(trans_runs_pol, axis=1).max())
