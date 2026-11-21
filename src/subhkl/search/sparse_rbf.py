@@ -734,6 +734,7 @@ def integrate_peaks_rbf_ssn(
     tof_gate_coverage: float = 0.95,
     tof_gate_search: float = 0.05,
     tof_sideband_factor: float = 4.0,
+    tof_sideband_measure: str = "spectrum",
     tof_band: tuple[float, float] | None = None,
 ):
     """
@@ -1341,6 +1342,7 @@ def integrate_peaks_rbf_ssn(
             gate_coverage=tof_gate_coverage,
             gate_search=tof_gate_search,
             sideband_factor=tof_sideband_factor,
+            sideband_measure=tof_sideband_measure,
             static_valid=static_valid,
             profile=matrix_free_profile,
             fp_target=matrix_free_fp_target,

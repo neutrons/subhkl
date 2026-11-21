@@ -1506,6 +1506,7 @@ def run_rbf_integrator(
     tof_gate_coverage: float = 0.95,
     tof_gate_search: float = 0.05,
     tof_sideband_factor: float = 4.0,
+    tof_sideband_measure: str = "spectrum",
 ):
     """Integrate the predicted reflections.
 
@@ -1642,6 +1643,7 @@ def run_rbf_integrator(
         tof_gate_coverage=tof_gate_coverage,
         tof_gate_search=tof_gate_search,
         tof_sideband_factor=tof_sideband_factor,
+        tof_sideband_measure=tof_sideband_measure,
         tof_band=peaks_band,
     )
     if event_store is not None:

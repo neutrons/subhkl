@@ -1111,6 +1111,15 @@ def integrator(
             "gate, in units of the gate width."
         ),
     ] = 4.0,
+    tof_sideband_measure: Annotated[
+        str,
+        typer.Option(
+            help="How the sideband background is scaled to the gate. "
+            "'spectrum' (default) uses each image's own time spectrum, so a "
+            "spectrum that is curved or falls off at the band edges does not "
+            "bias the background; 'time' assumes a rate flat in time."
+        ),
+    ] = "spectrum",
 ):
     """
     Integrates predicted peaks using the Dense Sparse RBF network approach on GPU.
@@ -1160,6 +1169,7 @@ def integrator(
         tof_gate_coverage=tof_gate_coverage,
         tof_gate_search=tof_gate_search,
         tof_sideband_factor=tof_sideband_factor,
+        tof_sideband_measure=tof_sideband_measure,
     )
 
 

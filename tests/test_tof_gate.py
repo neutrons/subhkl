@@ -603,3 +603,84 @@ def test_event_store_read_slab_and_multi_image_dense_neighbor_parity(
     assert out_slab == out_plain
     np.testing.assert_allclose(info_slab["bg"], info_plain["bg"], rtol=1e-5, atol=1e-4)
     np.testing.assert_allclose(rows_slab, rows_plain, rtol=1e-5, atol=1e-4)
+
+
+def _curved_spectrum_events(rng, shape, band, bg_per_pixel, tau):
+    """Background only, with a time spectrum falling off as exp(-t / tau)."""
+    H, W = shape
+    n = rng.poisson(bg_per_pixel * H * W)
+    u = rng.uniform(0.0, 1.0, n)
+    span = band[1] - band[0]
+    tof = band[0] - tau * np.log(1.0 - u * (1.0 - np.exp(-span / tau)))
+    flat = rng.integers(0, H * W, n)
+    tof = tof.astype(np.float32)
+    order = np.lexsort((tof, flat))
+    image = np.bincount(flat, minlength=H * W).reshape(H, W)
+    return image, tof[order]
+
+
+def test_sideband_background_follows_a_curved_spectrum():
+    """Empty predictions on a background whose spectrum is curved in time
+    integrate to zero when the sidebands are scaled by the image's own
+    spectrum, and to a systematic offset when the rate is taken as flat."""
+    from subhkl.search.tof_gate import integrate_reflections_tof_gated, parse_gate
+
+    rng = np.random.default_rng(7)
+    H = W = 96
+    band = (15000.0, 31000.0)
+    image, tof = _curved_spectrum_events(rng, (H, W), band, 150.0, 2000.0)
+    offsets = np.concatenate([[0], np.cumsum(image.ravel())])
+
+    grid_rc = np.arange(14, 96 - 13, 14, dtype=float)
+    rs, cs = (a.ravel() for a in np.meshgrid(grid_rc, grid_rc, indexing="ij"))
+    n = len(rs)
+    tof_pred = np.linspace(16000.0, 19000.0, n)
+    var = np.full(n, 1.5**2, dtype=np.float32)
+
+    def mean_z(measure):
+        rows, _ = integrate_reflections_tof_gated(
+            image[None].astype(np.float32),
+            lambda f: (tof, offsets),
+            np.zeros(n, dtype=int),
+            rs,
+            cs,
+            tof_pred,
+            np.full(n, band[0]),
+            np.full(n, band[1]),
+            var_us=var,
+            var_vs=var,
+            cov_uvs=np.zeros(n, dtype=np.float32),
+            gate=parse_gate("-0.008,0.008"),
+            sideband_measure=measure,
+            allow_negative=True,
+        )
+        assert np.all(rows[:, 4] > 0)
+        return float(np.mean(rows[:, 0] / rows[:, 4]))
+
+    z_time = mean_z("time")
+    z_spectrum = mean_z("spectrum")
+    print(
+        f"mean I/sigma of empty predictions: time {z_time:+.2f}, spectrum {z_spectrum:+.2f}"
+    )
+    # 36 independent empty predictions: the mean of unbiased I/sigma has a
+    # standard error of 1/6.
+    assert abs(z_spectrum) < 0.5
+    assert abs(z_time) > 1.0
+
+
+def test_spectrum_measure_falls_back_on_sparse_images():
+    from subhkl.search.tof_gate import TimeGrid, _spectrum_measure
+
+    grid = TimeGrid.spanning(15000.0, 31000.0, 1.0e-3)
+    flat = grid.edge_time(np.arange(grid.nt + 1)) - grid.edge_time(0)
+    rng = np.random.default_rng(8)
+    sparse = rng.uniform(15000.0, 31000.0, 100).astype(np.float32)
+    assert _spectrum_measure(sparse, grid, flat) is flat
+
+    dense = rng.uniform(15000.0, 23000.0, 200000).astype(np.float32)
+    measure = _spectrum_measure(dense, grid, flat)
+    assert np.all(np.diff(measure) >= 0)
+    assert measure[-1] == pytest.approx(flat[-1])
+    # No events beyond 23000: those intervals have no length.
+    late = int(np.ceil(grid.edge_index(24000.0)))
+    assert measure[-1] - measure[late] == pytest.approx(0.0, abs=1e-6 * flat[-1])

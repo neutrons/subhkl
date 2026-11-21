@@ -49,6 +49,7 @@ from subhkl.io.events import ANGSTROM_M_PER_US
 ATOM_PAD = 8  # atoms per tile: the reflection and up to seven neighbours
 MIN_TILE_HALF = 10
 MAX_TILE_HALF = 30
+MIN_SPECTRUM_EVENTS_PER_BIN = 20  # fewer events per time bin: no usable spectrum
 SIDEBAND_BINS = 8  # sub-intervals per side
 STACK_HALF_BOX = 2  # 5x5 pixel core for the stacked time profile
 STACK_MAX_IMAGES = 96  # images sampled for the stacked time profile
@@ -1168,6 +1169,46 @@ def _sideband_edges(b_lo, b_hi, nominal, lim_lo, lim_hi, factor):
     return edges, (b - a) >= max(1.0, 0.25 * nominal)
 
 
+def _spectrum_measure(tof, grid, flat_measure, smooth=5):
+    """Cumulative time spectrum of one image on the grid's edges.
+
+    The sideband background is scaled from the sidebands to the gate by the
+    "length" of each interval.  Measured in plain time, that assumes the
+    background rate is flat in time between them.  It is not: the incident
+    spectrum is curved and falls off steeply at the band edges, so a
+    reflection's background came out too high or too low by an amount that
+    depends on its wavelength.  For weak reflections that offset was as
+    large as their uncertainty, and because it repeats between
+    measurements of the same reflection it survives merging as apparent
+    signal.
+
+    Measured instead in the image's own cumulative spectrum, the
+    background is assumed proportional to what the image as a whole shows
+    at each time.  Bragg peaks are a small, time-scattered part of an
+    image's events and barely change that shape.  Intervals the spectrum
+    does not reach (beyond a band edge) get zero length and drop out.
+
+    Args:
+        tof: [microsecond] all events of the image
+        grid: TimeGrid of the gates and sidebands
+        flat_measure: [microsecond] (nt + 1,) edge times minus the first,
+            returned when the image has too few events for a spectrum
+        smooth: [-] time bins the spectrum is averaged over
+    Returns:
+        [microsecond-equivalent] (nt + 1,) monotone measure of the edges
+    """
+    if len(tof) < MIN_SPECTRUM_EVENTS_PER_BIN * grid.nt:
+        return flat_measure
+    tb = np.floor(np.log(np.maximum(tof, 1e-6) * (1.0 / grid.t0)) * (1.0 / grid.dl))
+    tb = tb.astype(np.int64)
+    hist = np.bincount(tb[(tb >= 0) & (tb < grid.nt)], minlength=grid.nt)
+    hist = np.convolve(hist.astype(np.float64), np.ones(smooth) / smooth, mode="same")
+    cum = np.concatenate([[0.0], np.cumsum(hist)])
+    if cum[-1] <= 0:
+        return flat_measure
+    return cum * (flat_measure[-1] / cum[-1])
+
+
 def _masked_row_median(vals: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Exact row-wise median of finite masked entries without np.nanmedian overhead."""
     valid = mask & np.isfinite(vals)
@@ -1316,6 +1357,7 @@ def integrate_reflections_tof_gated(
     gate_coverage=0.95,
     gate_search=0.05,
     sideband_factor=4.0,
+    sideband_measure="spectrum",
     static_valid=None,
     profile="gaussian",
     fp_target=None,
@@ -1345,6 +1387,9 @@ def integrate_reflections_tof_gated(
         gate_search: [-] half-range of t / t_pred - 1 searched for it
         sideband_factor: [-] sideband length on each side of the gate in
             units of the gate width
+        sideband_measure: "spectrum" scales the sideband background to the
+            gate by the image's own time spectrum (see
+            ``_spectrum_measure``); "time" assumes a rate flat in time
         static_valid: [-] optional (B, H, W), 1 = usable pixel
         profile: "gaussian" or a path to a radial profile JSON
     Returns:
@@ -1436,7 +1481,13 @@ def integrate_reflections_tof_gated(
     b_lo = np.clip(b_lo, lim_lo, lim_hi)
     b_hi = np.clip(b_hi, lim_lo, lim_hi)
     in_band = (b_hi - b_lo) >= max(1.0, 0.25 * nominal)
-    gate_time = grid.edge_time(b_hi) - grid.edge_time(b_lo)  # [microsecond]
+    if sideband_measure not in ("spectrum", "time"):
+        raise ValueError(
+            f"sideband_measure must be 'spectrum' or 'time', got {sideband_measure!r}"
+        )
+    # Edge times relative to the first edge: the measure of a time interval
+    # when the background is taken as flat in time.
+    flat_measure = grid.edge_time(np.arange(grid.nt + 1)) - grid.edge_time(0)
     edge_cut_f32 = _edge_cutoffs_f32(grid)
 
     half = _tile_half(var_us, var_vs)
@@ -1555,15 +1606,38 @@ def integrate_reflections_tof_gated(
             sb_edges_slab[:, 1, :].astype(np.float32), n_pad, 0.0
         ).reshape(n_chunks, chunk_size, SIDEBAND_BINS + 1)
 
-        widths_slab = np.diff(grid.edge_time(sb_edges_slab), axis=2).reshape(n_s, 16)
+        # Length of every sideband sub-interval and gate, per image: its
+        # cumulative time spectrum, or plain time.
+        if sideband_measure == "spectrum":
+            measure_slab = np.stack(
+                [
+                    _spectrum_measure(
+                        tof_slab_np[off_slab_np[m, 0] : off_slab_np[m, -1]],
+                        grid,
+                        flat_measure,
+                    )
+                    for m in range(len(s_frames))
+                ]
+            )
+        else:
+            measure_slab = np.broadcast_to(
+                flat_measure, (len(s_frames), len(flat_measure))
+            )
+        widths_slab = np.diff(
+            measure_slab[slab_frames_s[:, None, None], sb_edges_slab], axis=2
+        ).reshape(n_s, 16)
+        gate_time_slab = (
+            measure_slab[slab_frames_s, b_hi_slab]
+            - measure_slab[slab_frames_s, b_lo_slab]
+        )
         keep0_slab = (widths_slab > 0) & np.repeat(side_ok_slab, SIDEBAND_BINS, axis=1)
         widths_ch = _padded(widths_slab.astype(np.float32), n_pad, 0.0).reshape(
             n_chunks, chunk_size, 16
         )
         keep0_ch = _padded(keep0_slab, n_pad, False).reshape(n_chunks, chunk_size, 16)
-        gate_time_ch = _padded(
-            gate_time[idx_slab].astype(np.float32), n_pad, 0.0
-        ).reshape(n_chunks, chunk_size)
+        gate_time_ch = _padded(gate_time_slab.astype(np.float32), n_pad, 0.0).reshape(
+            n_chunks, chunk_size
+        )
 
         cuts_20_pad = np.zeros((n_pad, 20), dtype=np.float32)
         cuts_20_pad[:n_s, 0:9] = edge_cut_f32[sb_edges_slab[:, 0, :]]

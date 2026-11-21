@@ -46,6 +46,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Time-of-flight sideband background biased by the shape of the spectrum (`tof_gate`)**:
+  - The gated integrator scaled each reflection's sideband background to its
+    gate by the length of the intervals in time, which assumes a background
+    rate flat in time. The incident spectrum is curved and falls off steeply at
+    the band edges, so weak reflections carried an additive offset of up to
+    about ±1.5σ depending on wavelength, scattering angle and bank. The offset
+    repeats between measurements and showed up as CC½ where there is no Bragg
+    signal.
+  - Intervals are now measured in each image's own cumulative time spectrum
+    (`--tof-sideband-measure spectrum`, the default), so the background is
+    taken as proportional to what the image shows at each time; images with too
+    few events for a spectrum fall back to plain time. `--tof-sideband-measure
+    time` restores the previous behaviour.
+  - Check for this kind of bias with an off-peak control: integrate with the
+    gate moved off the reflections (e.g. `--tof-gate=0.06,0.11`) and merge; any
+    CC½ that survives is not Bragg signal.
+
 - **Detector view sideways drift when zooming out (`rainbow_zones`)**:
   - Anchored `detCanvas` wheel zoom-in at the cursor and zoom-out horizontally at
     `viewCenterX` (with periodic $\pm 360^\circ$ pan wrapping and smooth vertical
