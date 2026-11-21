@@ -9269,7 +9269,7 @@ def render_rainbow_html(
             <span>Resolution Cutoff d_min [Å]</span>
             <span id="lbl-dmin-val">{init_dmin:.2f} Å</span>
           </div>
-          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.05" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å]" />
+          <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.01" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å]" />
 
           <div class="slider-row" style="margin-top:2px;">
             <span>Spot Color</span>
@@ -11484,7 +11484,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function syncDminControls(nextDmin, sourceEl = null) {{
     const dFloor = getDynamicDminFloor();
     const rawVal = Number(nextDmin);
-    const v = Math.max(dFloor, Math.min(10.0, Number.isFinite(rawVal) && rawVal > 0 ? rawVal : dFloor));
+    const clampedVal = Math.max(dFloor, Math.min(10.0, Number.isFinite(rawVal) && rawVal > 0 ? rawVal : dFloor));
+    const v = Math.max(dFloor, Math.round(clampedVal * 100) / 100);
     const clampedAtFloor = Number.isFinite(rawVal) && rawVal > 0 && rawVal <= dFloor + 1e-4;
     state.dMin = v;
     DATA.d_min = v;
