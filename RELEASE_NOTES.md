@@ -25,6 +25,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Standardized `#slider-dmin` (HTML default and `setRangeBounds` floor/step)
     to `0.01 Å` increments so non-integer wavelength limits (e.g. `2.0–4.4 Å`)
     no longer force coarse `0.05 Å` steps onto odd values like `1.99 Å`.
+- **Generalized multi-run unit-cell, detector-geometry, and per-run crystal-slip refinement (`scan_band`, `scan_refine`)**:
+  - Included unwarped `search/proposal_orientations` in the bootstrap candidate
+    pool and replaced the `1.5%` radial `shared_geometry` cliff with a direct
+    Ewald + per-run zone-funnel competition against nominal detector geometry
+    (refreshing EM pixel responsibilities when nominal wins while preserving
+    genuine uncalibrated detector shifts).
+  - Kept pure nominal geometry (`s_init = 0`) as a distinct Stage 0 trial,
+    stopped re-injecting rejected `shared_geometry`, and freed unit-cell
+    ratios/angles ($\pm 3.5\%$) from Stage 0 onward on multi-setting scans so
+    anisotropic cell errors (`0.5–1.0 Å`) are not absorbed into fake detector
+    warps.
+  - Replaced the single-pass $0.15^\circ$-clamped Stage 3 post-cell orientation
+    polish with a 2-pass alternating `(cell <-> 0.6° U + zone-funnel + per-run R)`
+    polish so monoclinic/anisotropic cell updates unwind coupled shear
+    rotations.
+  - Re-anchored `(R_r, U)` to `anchor_run` (`ΔΘ_anchor = 0°`) across Ewald and
+    Stage 4 ICP polishes and regularized $\chi = 0$ gimbal-lock 3-axis
+    goniometer decomposition across both axis handedness conventions.
 
 ## [1.6.6]
 
