@@ -4476,8 +4476,19 @@ class NovaGalaxyPipelineRunner:
                             key=lambda c: abs(c[0] - pI[i]) + abs(c[1] - pS[i]),
                         )
                         iobs, sigiobs, ipred, sigipred, scale = best
-                        denom = max(float(np.hypot(sigiobs, 0.5 * sigipred)), 1e-6)
-                        residuals[i] = (iobs - ipred) / denom
+                        sig_o = (
+                            float(sigiobs)
+                            if np.isfinite(sigiobs) and sigiobs > 0.0
+                            else 0.0
+                        )
+                        sig_p = (
+                            float(sigipred)
+                            if np.isfinite(sigipred) and sigipred > 0.0
+                            else 0.0
+                        )
+                        denom = float(np.hypot(sig_o, 0.5 * sig_p))
+                        if denom > 1e-6 and np.isfinite(iobs) and np.isfinite(ipred):
+                            residuals[i] = (iobs - ipred) / denom
                         scales[i] = scale
                         ipreds[i] = ipred
 

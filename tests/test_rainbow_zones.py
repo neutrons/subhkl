@@ -7697,7 +7697,7 @@ def test_wilson_prior_default_mean_calibrated_residual_colorbar_and_single_table
     assert 'id="btn-hist-open-table"' in ui_html
     assert 'data-merge-action="open-table"' not in ui_html
 
-    # 3. Residual colorbar spans observed [min, max] with White midpoint at dataset mean
+    # 3. Residual colorbar spans outlier-robust [resMin, resMax] with White midpoint at dataset median
     if shutil.which("node"):
         script_blocks = re.findall(r"<script>([\s\S]*?)</script>", ui_html)
         inline_js = script_blocks[-1]
@@ -7747,14 +7747,17 @@ let _dynPredEpoch = 0;
 let _peakDataAvailabilitySig = "";
 let _peakDataAvailability = {{
   hasIsigi: false, hasMtzIsigi: false, hasResiduals: false, hasScales: false,
-  isigiTop: 40.0, mtzIsigiTop: 40.0, resMin: -3.0, resMax: 3.0, resMean: 0.0,
+  isigiTop: 40.0, mtzIsigiTop: 40.0, resMin: -3.0, resMax: 3.0, resMedian: 0.0, resMean: 0.0,
 }};
+// Include a massive positive outlier (+590000.0) that previously blew up mean (μ=98341.0) and resMax!
 const SAMPLE_PEAKS = [
-  {{ id: 1, careless_residual: -1.0 }},
-  {{ id: 2, careless_residual: 7.0 }},
-  {{ id: 3, careless_residual: 15.0 }},
-  {{ id: 4, careless_residual: 59.0 }},
-]; // min = -1.0, max = 59.0, mean = 20.0
+  {{ id: 1, careless_residual: -2.0 }},
+  {{ id: 2, careless_residual: 4.0 }},
+  {{ id: 3, careless_residual: 8.0 }},
+  {{ id: 4, careless_residual: 12.0 }},
+  {{ id: 5, careless_residual: 16.0 }},
+  {{ id: 6, careless_residual: 590000.0 }},
+]; // sorted: [-2, 4, 8, 12, 16, 590000] -> median = 10.0, outlier fenced far below 590000
 const PEAKS = [SAMPLE_PEAKS[0], SAMPLE_PEAKS[2]];
 function isigiToColor() {{ return "rgba(0,0,0,1)"; }}
 function scaleToColor() {{ return "rgba(0,0,0,1)"; }}
@@ -7764,12 +7767,12 @@ function wavelengthToColor() {{ return "rgba(0,0,0,1)"; }}
 const avail = getPeakDataAvailability();
 const spec = buildColorscaleGradientSpec("residual", 0.38);
 console.log(JSON.stringify({{
-  avail: {{ resMin: avail.resMin, resMax: avail.resMax, resMean: avail.resMean }},
-  colMin: residualToColor(-1.0, 1.0),
-  colBelowMean: residualToColor(7.0, 1.0),
-  colMean: residualToColor(20.0, 1.0),
-  colAboveMean: residualToColor(40.0, 1.0),
-  colMax: residualToColor(59.0, 1.0),
+  avail: {{ resMin: avail.resMin, resMax: avail.resMax, resMedian: avail.resMedian, resMean: avail.resMean }},
+  colMin: residualToColor(avail.resMin, 1.0),
+  colBelowMed: residualToColor(4.0, 1.0),
+  colMed: residualToColor(10.0, 1.0),
+  colAboveMed: residualToColor(16.0, 1.0),
+  colOutlier: residualToColor(590000.0, 1.0),
   spec,
 }}));
 """
@@ -7777,17 +7780,23 @@ console.log(JSON.stringify({{
             ["node", "-e", js_harness], check=True, capture_output=True, text=True
         )
         out = json.loads(proc.stdout.strip())
-        assert out["avail"] == {"resMin": -1.0, "resMax": 59.0, "resMean": 20.0}
+        assert out["avail"]["resMedian"] == 10.0
+        assert out["avail"]["resMean"] == 10.0
+        assert out["avail"]["resMin"] == -2.0
+        # Extreme +590000 outlier is fenced instead of stretching colorbar to 590000
+        assert 16.0 <= out["avail"]["resMax"] < 100.0
         assert out["colMin"] == "rgba(30, 170, 255, 1.000)"
-        assert out["colMean"] == "rgba(248, 250, 252, 1.000)"
-        assert out["colMax"] == "rgba(244, 63, 94, 1.000)"
-        # Positive residual +7.0 is below dataset mean (+20.0), so it tints toward blue (b > r)
-        r_lo, _, b_lo = [int(x) for x in re.findall(r"\d+", out["colBelowMean"])[:3]]
+        assert out["colMed"] == "rgba(248, 250, 252, 1.000)"
+        assert out["colOutlier"] == "rgba(244, 63, 94, 1.000)"
+        # Positive residual +4.0 is below dataset median (+10.0), so it tints toward blue (b > r)
+        r_lo, _, b_lo = [int(x) for x in re.findall(r"\d+", out["colBelowMed"])[:3]]
         assert b_lo > r_lo
-        # Residual +40.0 is above dataset mean (+20.0), so it tints toward red (r > b)
-        r_hi, _, b_hi = [int(x) for x in re.findall(r"\d+", out["colAboveMean"])[:3]]
+        # Residual +16.0 is above dataset median (+10.0), so it tints toward red (r > b)
+        r_hi, _, b_hi = [int(x) for x in re.findall(r"\d+", out["colAboveMed"])[:3]]
         assert r_hi > b_hi
-        assert "-1.0 · μ=20.0 · 59.0" == out["spec"]["label"]
+        assert "μ=" not in out["spec"]["label"]
+        assert " · 10.0 · " in out["spec"]["label"]
+        assert "median 10.0σ" in out["spec"]["tooltip"]
         assert "rgba(248, 250, 252, 1.000) 50.0%" in out["spec"]["gradient"]
 
 

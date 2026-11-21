@@ -10957,7 +10957,7 @@ def render_rainbow_html(
 
           <div class="slider-row">
             <span>Colorscale Crossover</span>
-            <span id="lbl-color-emphasis">I/σ ~ 3.2</span>
+            <span id="lbl-color-emphasis" style="white-space:nowrap;">I/σ ~ 3.2</span>
           </div>
           <input type="range" id="slider-color-emphasis" min="0.05" max="0.95" step="0.01" value="0.38" title="Drag knob to shift the (log-)scale midpoint crossover (checkerboard = transparent alpha=0); double-click to reset" />
 
@@ -13511,6 +13511,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     mtzIsigiTop: 40.0,
     resMin: -3.0,
     resMax: 3.0,
+    resMedian: 0.0,
     resMean: 0.0,
   }};
 
@@ -15053,13 +15054,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   // Diverging Blue–White–Red colormap for Careless standardized residual (I_obs - I_pred)/sigma,
-  // spanning observed [resMin, resMax] with the neutral White midpoint calibrated to dataset mean resMean.
+  // spanning outlier-robust [resMin, resMax] with the neutral White midpoint calibrated to dataset median resMedian.
   function residualToColor(resVal, alpha = 1.0, bounds = null) {{
     if (typeof resVal !== "number" || !Number.isFinite(resVal)) return `rgba(148, 163, 184, 0.000)`;
     const b = bounds || getPeakDataAvailability();
     const lo = Number.isFinite(b && b.resMin) ? b.resMin : -3.0;
     const hi = Number.isFinite(b && b.resMax) ? b.resMax : 3.0;
-    const mid = Number.isFinite(b && b.resMean) ? Math.max(lo, Math.min(hi, b.resMean)) : 0.5 * (lo + hi);
+    const rawMid = Number.isFinite(b && b.resMedian) ? b.resMedian : (b && b.resMean);
+    const mid = Number.isFinite(rawMid) ? Math.max(lo, Math.min(hi, rawMid)) : 0.5 * (lo + hi);
     const clamped = Math.max(lo, Math.min(hi, resVal));
     if (clamped < mid) {{
       const negSpan = mid - lo;
@@ -15126,14 +15128,14 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return _peakDataAvailability;
     }}
     let hasIsigi = false, hasMtz = false, hasRes = false, hasScl = false;
-    let resMinObs = Infinity, resMaxObs = -Infinity;
-    let peaksResSum = 0.0, peaksResCount = 0;
-    let sampleResSum = 0.0, sampleResCount = 0;
     const isigiSamples = [];
     const mtzSamples = [];
+    const peaksResSamples = [];
+    const sampleResSamples = [];
     const scanArr = (arr, isSamplePool) => {{
       if (!Array.isArray(arr)) return;
       const step = arr.length > 2400 ? Math.ceil(arr.length / 2400) : 1;
+      const resStep = arr.length > 16384 ? Math.ceil(arr.length / 16384) : 1;
       for (let i = 0; i < arr.length; i++) {{
         const p = arr[i];
         if (!p) continue;
@@ -15147,16 +15149,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           if (i % step === 0) mtzSamples.push(mv);
         }}
         if (typeof p.careless_residual === "number" && Number.isFinite(p.careless_residual)) {{
-          const rv = p.careless_residual;
           hasRes = true;
-          if (rv < resMinObs) resMinObs = rv;
-          if (rv > resMaxObs) resMaxObs = rv;
-          if (isSamplePool) {{
-            sampleResSum += rv;
-            sampleResCount += 1;
-          }} else {{
-            peaksResSum += rv;
-            peaksResCount += 1;
+          if (i % resStep === 0) {{
+            if (isSamplePool) sampleResSamples.push(p.careless_residual);
+            else peaksResSamples.push(p.careless_residual);
           }}
         }}
         if (!hasScl && typeof p.careless_scale === "number" && Number.isFinite(p.careless_scale)) hasScl = true;
@@ -15164,16 +15160,37 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }};
     scanArr(PEAKS, false);
     if (SAMPLE_PEAKS !== PEAKS) scanArr(SAMPLE_PEAKS, true);
-    let resMin = -3.0, resMax = 3.0, resMean = 0.0;
-    if (hasRes && Number.isFinite(resMinObs) && Number.isFinite(resMaxObs)) {{
-      resMean = sampleResCount > 0
-        ? (sampleResSum / sampleResCount)
-        : (peaksResCount > 0 ? (peaksResSum / peaksResCount) : 0.5 * (resMinObs + resMaxObs));
-      resMin = resMinObs;
-      resMax = resMaxObs;
+    const quantileSorted = (sorted, q) => {{
+      if (sorted.length === 0) return NaN;
+      if (sorted.length === 1) return sorted[0];
+      const pos = Math.max(0.0, Math.min(1.0, q)) * (sorted.length - 1);
+      const base = Math.floor(pos);
+      const rest = pos - base;
+      const next = sorted[Math.min(sorted.length - 1, base + 1)];
+      return sorted[base] + rest * (next - sorted[base]);
+    }};
+    let resMin = -3.0, resMax = 3.0, resMedian = 0.0;
+    const resVals = sampleResSamples.length > 0 ? sampleResSamples : peaksResSamples;
+    if (hasRes && resVals.length > 0) {{
+      resVals.sort((a, b) => a - b);
+      resMedian = quantileSorted(resVals, 0.5);
+      let lo = resVals.length >= 20 ? quantileSorted(resVals, 0.015) : resVals[0];
+      let hi = resVals.length >= 20 ? quantileSorted(resVals, 0.985) : resVals[resVals.length - 1];
+      if (resVals.length >= 4) {{
+        const iqr = Math.max(0.0, quantileSorted(resVals, 0.75) - quantileSorted(resVals, 0.25));
+        const absDevs = resVals.map((v) => Math.abs(v - resMedian)).sort((a, b) => a - b);
+        const sigmaMad = 1.4826 * quantileSorted(absDevs, 0.5);
+        const spread = Math.max(sigmaMad, iqr / 1.349);
+        if (spread > 1e-6) {{
+          lo = Math.max(lo, resMedian - 5.0 * spread);
+          hi = Math.min(hi, resMedian + 5.0 * spread);
+        }}
+      }}
+      resMin = Math.min(lo, resMedian);
+      resMax = Math.max(hi, resMedian);
       if (resMax - resMin < 1e-6) {{
-        resMin = resMean - 1.0;
-        resMax = resMean + 1.0;
+        resMin = resMedian - 1.0;
+        resMax = resMedian + 1.0;
       }}
     }}
     const computeP99 = (vals) => {{
@@ -15194,7 +15211,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       mtzIsigiTop: computeP99(mtzSamples),
       resMin,
       resMax,
-      resMean,
+      resMedian,
+      resMean: resMedian,
     }};
     return _peakDataAvailability;
   }}
@@ -15334,6 +15352,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const stops = [];
     const N = 16;
     let label = "";
+    let tooltip = "";
     if (mode === "isigi" || mode === "mtz_isigi") {{
       const topS = Math.max(12.0, mode === "mtz_isigi" ? avail.mtzIsigiTop : avail.isigiTop);
       for (let k = 0; k <= N; k++) {{
@@ -15346,7 +15365,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }} else if (mode === "residual") {{
       const lo = Number.isFinite(avail.resMin) ? avail.resMin : -3.0;
       const hi = Number.isFinite(avail.resMax) ? avail.resMax : 3.0;
-      const mid = Number.isFinite(avail.resMean) ? Math.max(lo, Math.min(hi, avail.resMean)) : 0.5 * (lo + hi);
+      const rawMid = Number.isFinite(avail.resMedian) ? avail.resMedian : avail.resMean;
+      const mid = Number.isFinite(rawMid) ? Math.max(lo, Math.min(hi, rawMid)) : 0.5 * (lo + hi);
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
         const res = u <= 0.5
@@ -15354,8 +15374,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
           : (mid + ((u - 0.5) / 0.5) * (hi - mid));
         stops.push(`${{residualToColor(res, 1.0, avail)}} ${{(u * 100).toFixed(1)}}%`);
       }}
-      const fmtRes = (v) => (Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1));
-      label = `${{fmtRes(lo)}} · μ=${{fmtRes(mid)}} · ${{fmtRes(hi)}}`;
+      const fmtRes = (v) => {{
+        const clean = Math.abs(v) < 0.05 ? 0.0 : v;
+        const absV = Math.abs(clean);
+        if (absV >= 1000) return `${{(clean / 1000).toFixed(1)}}k`;
+        if (absV >= 100) return clean.toFixed(0);
+        return clean.toFixed(1);
+      }};
+      label = `${{fmtRes(lo)}} · ${{fmtRes(mid)}} · ${{fmtRes(hi)}}`;
+      tooltip = `ΔI/σ outlier-robust range [${{fmtRes(lo)}}, ${{fmtRes(hi)}}] centered at median ${{fmtRes(mid)}}σ`;
     }} else if (mode === "scale") {{
       for (let k = 0; k <= N; k++) {{
         const u = k / N;
@@ -15388,6 +15415,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return {{
       gradient: `linear-gradient(90deg, ${{stops.join(", ")}})`,
       label,
+      tooltip,
     }};
   }}
 
@@ -15399,6 +15427,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const lbl = document.getElementById("lbl-color-emphasis");
     if (lbl) {{
       lbl.textContent = spec.label;
+      lbl.title = spec.tooltip || "";
     }}
   }}
 
@@ -18438,7 +18467,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   function _peakSnrScore(p) {{
     if (state.wulffColorMode === "residual" && typeof p.careless_residual === "number") {{
-      return Math.abs(p.careless_residual - (getPeakDataAvailability().resMean || 0.0));
+      const av = getPeakDataAvailability();
+      const mid = Number.isFinite(av.resMedian) ? av.resMedian : (av.resMean || 0.0);
+      return Math.abs(p.careless_residual - mid);
     }}
     if (typeof p.merged_i === "number" && typeof p.merged_sigi === "number" && p.merged_sigi > 0) {{
       return Math.abs(p.merged_i) / p.merged_sigi;
