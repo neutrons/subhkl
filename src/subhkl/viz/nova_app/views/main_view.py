@@ -941,6 +941,30 @@ class MainApp:
             )
             return web.json_response(res)
 
+        async def handle_exit(request: web.Request) -> web.Response:
+            import asyncio
+
+            try:
+                body = await request.json()
+            except (OSError, RuntimeError, ValueError, TypeError):
+                body = {}
+            should_shutdown = not (
+                isinstance(body, dict) and body.get("shutdown") is False
+            )
+            res = await asyncio.to_thread(self.pipeline_runner.execute_app_exit)
+            if should_shutdown:
+                try:
+                    cur_tpl = self.state.trame__template_main
+                    if cur_tpl:
+                        self.state.trame__template_error = cur_tpl
+                        self.state.trame__template_error_reconnect = cur_tpl
+                        self.state.flush()
+                except (AttributeError, RuntimeError, TypeError, KeyError):
+                    pass
+                loop = asyncio.get_running_loop()
+                loop.call_later(0.45, lambda: asyncio.create_task(self.server.stop()))
+            return web.json_response(res)
+
         async def handle_upload_h5(request: web.Request) -> web.Response:
             import tempfile
             import time
@@ -1097,6 +1121,7 @@ class MainApp:
                 web.get("/api/datasets/{ds_id}/display", handle_dataset_display),
                 web.post("/api/pipeline/run", handle_run),
                 web.post("/api/pipeline/cancel", handle_cancel),
+                web.post("/api/pipeline/exit", handle_exit),
                 web.post("/api/pipeline/upload_h5", handle_upload_h5),
                 web.post(
                     "/api/pipeline/resolve_local_files", handle_resolve_local_files

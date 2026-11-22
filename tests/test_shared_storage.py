@@ -1108,3 +1108,132 @@ def test_readonly_ui_shared_dir_and_worker_cleanup_tool_dispatch(
         assert "ds_cleanup_log_1" in purged_ids
     finally:
         os.chmod(shared_dir, 0o777)
+
+
+def test_arcade_exit_quips_and_banner_html() -> None:
+    """Verify all 230 cheerful space-group exit quips and the pixelated GAME OVER exit modal."""
+    from subhkl.viz.arcade_exit_quips import (
+        ARCADE_EXIT_QUIPS,
+        build_arcade_exit_quips_json,
+    )
+    from subhkl.viz.rainbow_zones import render_rainbow_html
+
+    assert len(ARCADE_EXIT_QUIPS) == 230
+    assert len(set(ARCADE_EXIT_QUIPS)) == 230
+    assert all(isinstance(q, str) and len(q.strip()) >= 20 for q in ARCADE_EXIT_QUIPS)
+    parsed = json.loads(build_arcade_exit_quips_json())
+    assert parsed == list(ARCADE_EXIT_QUIPS)
+
+    sample_payload = {
+        "instrument": "CG4D",
+        "space_group": "P 21 21 21",
+        "peaks": [],
+        "zones": [],
+        "panels": [],
+    }
+    html_arcade = render_rainbow_html(sample_payload, default_mode="arcade")
+    assert 'id="btn-exit-app"' in html_arcade
+    assert 'id="modal-arcade-exit"' in html_arcade
+    assert "window.ARCADE_EXIT_QUIPS = " in html_arcade
+    assert 'fetch("api/pipeline/exit"' in html_arcade
+
+    html_pro = render_rainbow_html(sample_payload, default_mode="pro")
+    assert 'id="btn-exit-app"' in html_pro
+    assert 'const UI_MODE = "pro".toLowerCase();' in html_pro
+
+
+def test_exit_endpoint_cleans_shared_and_staging_and_stops_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify POST /api/pipeline/exit sweeps shared + staging intermediates, returns JSON, and stops the server cleanly."""
+    import socket
+    import threading
+    import time
+    import urllib.request
+
+    from subhkl.viz.nova_rainbow_view import (
+        register_temp_artifact,
+        serve_rainbow_zones,
+    )
+
+    nvme_dir = tmp_path / "exit_nvme"
+    shared_dir = tmp_path / "exit_shared"
+    nvme_dir.mkdir()
+    shared_dir.mkdir()
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(nvme_dir))
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(shared_dir))
+    monkeypatch.delenv("SUBHKL_EXEC_MODE", raising=False)
+    monkeypatch.delenv("EP_PATH", raising=False)
+
+    staging_tmp = nvme_dir / "temp_stage_buf.h5"
+    staging_tmp.write_bytes(b"STAGE_TMP")
+    register_temp_artifact(str(staging_tmp))
+
+    shared_merged, _ = allocate_shared_artifact_path("merged.h5", tag="EXIT_HTTP")
+    with h5py.File(shared_merged, "w") as mf:
+        mf.attrs["instrument"] = "CG4D"
+        mf.create_dataset("images", data=np.zeros((1, 2, 2), dtype=np.float32))
+    register_temp_artifact(shared_merged)
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = int(s.getsockname()[1])
+
+    srv_err: list[BaseException] = []
+
+    def _run_srv() -> None:
+        try:
+            serve_rainbow_zones(
+                payload={
+                    "instrument": "CG4D",
+                    "space_group": "P 1",
+                    "peaks": [],
+                    "zones": [],
+                    "panels": [],
+                },
+                host="127.0.0.1",
+                port=port,
+                prefer_trame=False,
+            )
+        except (OSError, RuntimeError) as exc:  # pragma: no cover
+            srv_err.append(exc)
+
+    t = threading.Thread(target=_run_srv, daemon=True)
+    t.start()
+
+    # Wait until server responds on /api/pipeline/status
+    base_url = f"http://127.0.0.1:{port}"
+    for _ in range(40):
+        try:
+            with urllib.request.urlopen(
+                f"{base_url}/api/pipeline/status", timeout=1.0
+            ) as r:
+                if r.status == 200:
+                    break
+        except OSError:
+            time.sleep(0.05)
+    else:
+        pytest.fail("serve_rainbow_zones did not become ready in time")
+
+    # Trigger POST /api/pipeline/exit -> cleans staging + shared files, returns 200 JSON, then exits server cleanly
+    req = urllib.request.Request(
+        f"{base_url}/api/pipeline/exit",
+        data=b"{}",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=5.0) as resp:
+        assert resp.status == 200
+        doc = json.loads(resp.read().decode("utf-8"))
+
+    assert doc["ok"] is True
+    assert doc["status"] == "exited"
+    assert doc["cleaned_staging_count"] >= 2
+    assert not staging_tmp.exists()
+    assert not os.path.exists(shared_merged)
+
+    t.join(timeout=3.0)
+    assert not t.is_alive(), (
+        "Server thread should stop cleanly after /api/pipeline/exit"
+    )
+    assert srv_err == []

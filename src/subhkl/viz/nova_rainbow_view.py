@@ -3671,6 +3671,33 @@ class NovaGalaxyPipelineRunner:
         with contextlib.suppress(Exception):
             self.release_shared_scan_intermediates(wait_remote=True)
 
+    def execute_app_exit(self) -> dict[str, Any]:
+        """Run full exit cleanup (cancel active job, sweep shared + staging intermediates) and return summary."""
+        t0 = time.monotonic()
+        cancelled_active = False
+        cleaned_shared: list[str] = []
+        cleaned_staging: list[str] = []
+        with contextlib.suppress(Exception):
+            cancel_res = self.cancel_active_job()
+            cancelled_active = bool(
+                isinstance(cancel_res, dict)
+                and (cancel_res.get("cancelled") or cancel_res.get("job"))
+            )
+        with contextlib.suppress(Exception):
+            cleaned_shared = self.release_shared_scan_intermediates(wait_remote=True)
+        with contextlib.suppress(Exception):
+            cleaned_staging = cleanup_registered_temp_artifacts()
+        elapsed_ms = round((time.monotonic() - t0) * 1000)
+        return {
+            "ok": True,
+            "status": "exited",
+            "cancelled_active_job": cancelled_active,
+            "cleaned_shared_count": len(cleaned_shared),
+            "cleaned_staging_count": len(cleaned_staging),
+            "galaxy_connected": bool(self.is_connected),
+            "elapsed_ms": elapsed_ms,
+        }
+
     def _is_local_staging_mode(self) -> bool:
         """Return True when heavy subhkl stages should run inside local NVMe staging.
 
@@ -10568,6 +10595,42 @@ def serve_rainbow_zones(
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+                return
+
+            if req_path == "/api/pipeline/exit":
+                content_len = int(self.headers.get("Content-Length", "0") or 0)
+                raw_body = self.rfile.read(content_len) if content_len > 0 else b"{}"
+                should_shutdown = True
+                try:
+                    req_json = json.loads(raw_body.decode("utf-8") or "{}")
+                    if isinstance(req_json, dict) and req_json.get("shutdown") is False:
+                        should_shutdown = False
+                    result = vm.pipeline_runner.execute_app_exit()
+                    code = 200
+                except _NOVA_RECOVERABLE_ERRORS as exc:
+                    result = {"ok": False, "error": str(exc)}
+                    code = 400
+                body = json.dumps(result).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                with contextlib.suppress(OSError):
+                    self.wfile.flush()
+                if code == 200 and should_shutdown:
+                    srv = self.server
+
+                    def _deferred_httpd_stop() -> None:
+                        time.sleep(0.45)
+                        with contextlib.suppress(Exception):
+                            srv.shutdown()
+
+                    threading.Thread(
+                        target=_deferred_httpd_stop,
+                        name="subhkl-exit-shutdown",
+                        daemon=True,
+                    ).start()
                 return
 
             if req_path == "/api/tof_delta_theta":
