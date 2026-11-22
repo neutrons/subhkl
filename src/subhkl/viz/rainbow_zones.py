@@ -11398,6 +11398,14 @@ def render_rainbow_html(
             <button id="btn-zones-none" style="padding:1px 4px;font-size:0.58rem;" title="Deselect all Laue zone arcs (click ≤1, ≤2, or ≤3 to restore)">NONE</button>
           </div>
         </div>
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;margin-bottom:3px;font-size:0.58rem;">
+          <span style="color:var(--text-dim);font-family:var(--font-display);letter-spacing:0.2px;" title="Nodal points (zone intersections + {{a*, b*, c*}} reciprocal axes) and Higher-Order Laue Zones (G·[uvw] = ±1, ±2)">Hubs / HOLZ</span>
+          <div style="display:flex;gap:2px;align-items:center;">
+            <button id="btn-nodal-points" type="button" class="active-btn" style="padding:1px 5px;font-size:0.58rem;" title="Show/Hide Laue zone nodal intersections and {{a*, b*, c*}} reciprocal axis circles">⊙ Nodals</button>
+            <button id="btn-holz-1" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Toggle 1st-order Higher-Order Laue Zones (G·[uvw] = ±1)">±1</button>
+            <button id="btn-holz-2" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Toggle 2nd-order Higher-Order Laue Zones (G·[uvw] = ±2)">±2</button>
+          </div>
+        </div>
         <div class="zone-list" id="zone-list"></div>
       </div>
 
@@ -13834,6 +13842,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     projection: "{initial_proj}", // "cylindrical" (CG4D) | "spherical" (MANDI)
     maxZoneOrder: order1ZoneIds.length > 0 ? 1 : 2, // 1 | 2 | 3
     showZoneArcs: true,           // single vibrant arc per zone (not multi-band rainbow)
+    showNodalPoints: true,        // Laue zone intersections + {{a*, b*, c*}} reciprocal nodal circles
+    holzOrders: new Set(),        // Higher-Order Laue Zones: 1 -> ±1, 2 -> ±2
     showPixelMask: false,         // translucent two-color EM pixel mask overlay (dark=cyan, bright=lime)
     hiResTextures: Number(DATA.render_binning || 4) <= 1, // native 1x detector textures vs fast 4x downsampled preview
     hiresLoading: false,
@@ -13861,6 +13871,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     parallaxStrength: 1.0,
     activeZones: new Set(initialZoneIds),
     selectedZoneId: null,
+    hoveredZoneId: null,
+    hoveredZoneHolzN: 0,
+    hoveredZonePos: null,
+    hoveredNodalKey: null,
+    hoveredNodalObj: null,
     hoveredPeakId: null,
     selectedPeakId: null,
     hoveredPeakObj: null,
@@ -16409,11 +16424,38 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     );
   }}
 
-  function updateZoneInspector(z) {{
+  function updateZoneInspector(z, holzN = 0) {{
     if (!z) return;
+    const eqStr = holzN ? `G · ${{z.label}} = ${{holzN > 0 ? "+" : ""}}${{holzN}} (HOLZ)` : `G · ${{z.label}} = 0`;
+    const dStr = typeof z.d_direct === "number" && z.d_direct > 0 ? ` • |t_uvw|=<strong>${{z.d_direct.toFixed(2)}} Å</strong>` : "";
+    const rmsVal = typeof z.angular_rms_deg === "number" ? z.angular_rms_deg.toFixed(3) : "0.000";
     setStatusLine(
-      `[ZONE ${{z.label}}]`,
-      `<strong style="color:var(--accent-gold);">Zone ${{z.label}}</strong> • Captures <strong>${{z.n_peaks}}</strong> spots (RMS Δθ=${{z.angular_rms_deg.toFixed(3)}}°) • |t_uvw|=<strong>${{z.d_direct.toFixed(2)}} Å</strong> • G · ${{z.label}} = 0`
+      `[ZONE ${{z.label}}${{holzN ? ` N=${{holzN > 0 ? "+" : ""}}${{holzN}}` : ""}}]`,
+      `<strong style="color:var(--accent-gold);">Zone ${{z.label}}</strong> • Captures <strong>${{z.n_peaks || 0}}</strong> spots (RMS Δθ=${{rmsVal}}°)${{dStr}} • ${{eqStr}}`
+    );
+  }}
+
+  function updateNodalInspector(nodal) {{
+    if (!nodal) return;
+    const hklStr = Array.isArray(nodal.hkl) ? `(${{nodal.hkl.join(", ")}})` : "";
+    const titleStr = nodal.principalSymbol
+      ? `${{nodal.principalSymbol}} ${{hklStr}}`
+      : `Nodal ${{hklStr}}`;
+    const dStr = typeof nodal.d1 === "number" && nodal.d1 > 0
+      ? ` • d₁=<strong>${{nodal.d1.toFixed(2)}} Å</strong>`
+      : "";
+    const lamStr = typeof nodal.lam1 === "number" && nodal.lam1 > 0
+      ? ` • λ₁=<strong>${{nodal.lam1.toFixed(3)}} Å</strong>`
+      : "";
+    const locStr = nodal.onPanel
+      ? `Bank #${{nodal.bank || 1}}`
+      : `Inter-panel gap (${{(nodal.gapDeg || 0).toFixed(1)}}° to Bank #${{nodal.nearBank || 1}})`;
+    const zonesStr = Array.isArray(nodal.zoneLabels) && nodal.zoneLabels.length > 0
+      ? nodal.zoneLabels.slice(0, 4).join(" × ") + (nodal.zoneLabels.length > 4 ? ` (+${{nodal.zoneLabels.length - 4}})` : "")
+      : "principal reciprocal axis";
+    setStatusLine(
+      `[NODAL ${{nodal.principalSymbol || hklStr}}]`,
+      `<strong style="color:var(--accent-gold);">${{titleStr}}</strong> • ${{locStr}}${{dStr}}${{lamStr}} • φ=${{nodal.det_x.toFixed(1)}}°, ψ=${{nodal.det_el.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zonesStr}}</span>`
     );
   }}
 
@@ -16465,10 +16507,44 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return rp !== 0 && mp !== 0 && rp !== mp;
   }}
 
+  let _activeZoneObjsKey = "";
+  let _activeZoneObjsRef = null;
+  let _activeZoneObjsList = [];
+  function getActiveZoneObjectsCached() {{
+    const key = Array.from(state.activeZones || []).join(",");
+    if (_activeZoneObjsRef === ZONES && _activeZoneObjsKey === key) {{
+      return _activeZoneObjsList;
+    }}
+    _activeZoneObjsRef = ZONES;
+    _activeZoneObjsKey = key;
+    _activeZoneObjsList = Array.isArray(ZONES)
+      ? ZONES.filter(z => state.activeZones && state.activeZones.has(z.zone_id))
+      : [];
+    return _activeZoneObjsList;
+  }}
+
   function isPeakCapturedByActiveZone(p) {{
-    if (!p.zone_ids || p.zone_ids.length === 0) return false;
-    for (let i = 0; i < p.zone_ids.length; i++) {{
-      if (state.activeZones.has(p.zone_ids[i])) return true;
+    if (p.zone_ids && p.zone_ids.length > 0) {{
+      for (let i = 0; i < p.zone_ids.length; i++) {{
+        if (state.activeZones.has(p.zone_ids[i])) return true;
+      }}
+    }}
+    if (
+      state.holzOrders instanceof Set &&
+      state.holzOrders.size > 0 &&
+      state.activeZones &&
+      state.activeZones.size > 0 &&
+      Array.isArray(p.hkl) &&
+      p.hkl.length === 3
+    ) {{
+      const actZ = getActiveZoneObjectsCached();
+      const h = p.hkl[0], k = p.hkl[1], l = p.hkl[2];
+      for (let i = 0; i < actZ.length; i++) {{
+        const uvw = actZ[i].uvw;
+        if (!Array.isArray(uvw) || uvw.length !== 3) continue;
+        const nLayer = Math.abs(h * uvw[0] + k * uvw[1] + l * uvw[2]);
+        if (nLayer > 0 && state.holzOrders.has(nLayer)) return true;
+      }}
     }}
     return false;
   }}
@@ -17398,9 +17474,771 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
   }}
 
-  function drawSingleZoneArc(ctx, pts, zone, isContinuousGap = false) {{
+  function gcd2Int(a, b) {{
+    let x = Math.abs(Math.trunc(a));
+    let y = Math.abs(Math.trunc(b));
+    while (y !== 0) {{
+      const t = x % y;
+      x = y;
+      y = t;
+    }}
+    return x;
+  }}
+
+  function gcd3Int(a, b, c) {{
+    return gcd2Int(gcd2Int(a, b), c);
+  }}
+
+  function primitiveCanonicalHkl(h, k, l) {{
+    const hi = Math.round(h), ki = Math.round(k), li = Math.round(l);
+    if (hi === 0 && ki === 0 && li === 0) return null;
+    const g = gcd3Int(hi, ki, li) || 1;
+    let ph = Math.trunc(hi / g);
+    let pk = Math.trunc(ki / g);
+    let pl = Math.trunc(li / g);
+    if (ph < 0 || (ph === 0 && pk < 0) || (ph === 0 && pk === 0 && pl < 0)) {{
+      ph = -ph;
+      pk = -pk;
+      pl = -pl;
+    }}
+    return [ph, pk, pl];
+  }}
+
+  let _fullFacePanelsCacheKey = "";
+  let _fullFacePanelsCache = [];
+  function buildFullFaceDetectorRaycastPanels(sLab) {{
+    const cfgs = DATA.detector_configs;
+    if (!cfgs || typeof cfgs !== "object") return [];
+    const sx0 = Number(sLab[0]) || 0.0;
+    const sy0 = Number(sLab[1]) || 0.0;
+    const sz0 = Number(sLab[2]) || 0.0;
+    const key = `${{Object.keys(cfgs).length}}|${{sx0.toFixed(5)}},${{sy0.toFixed(5)}},${{sz0.toFixed(5)}}`;
+    if (_fullFacePanelsCacheKey === key && _fullFacePanelsCache.length > 0) {{
+      return _fullFacePanelsCache;
+    }}
+    const out = [];
+    for (const [kStr, dc] of Object.entries(cfgs)) {{
+      if (!dc || !Array.isArray(dc.center) || !Array.isArray(dc.vhat)) continue;
+      const bid = parseInt(kStr, 10);
+      if (!Number.isFinite(bid)) continue;
+      const m = Math.max(2, Number(dc.m) || 256);
+      const n = Math.max(2, Number(dc.n) || 256);
+      const width = Number(dc.width) || 0.2;
+      const height = Number(dc.height) || 0.2;
+      const pType = String(dc.panel_type || dc.panel || "flat").toLowerCase();
+      const center = dc.center.map(Number);
+      const vhat = dc.vhat.map(Number);
+      if (pType.includes("curv") || pType.includes("cyl")) {{
+        const radius = Number(dc.radius) || Math.hypot(center[0], center[2]) || 0.4;
+        const rhat = Array.isArray(dc.rhat)
+          ? [Number(dc.rhat[0]), Number(dc.rhat[1]), Number(dc.rhat[2])]
+          : [0.0, 0.0, 1.0];
+        const what = vecCross(vhat, rhat);
+        const bVec = vecCross([sx0, sy0, sz0], vhat);
+        const qc = vecDot(bVec, bVec) - radius * radius;
+        out.push({{
+          bid, isCurved: true, m, n, width, height, radius,
+          center, vhat, rhat, what, bVec, qc,
+        }});
+      }} else {{
+        if (!Array.isArray(dc.uhat)) continue;
+        const uhat = dc.uhat.map(Number);
+        const nhat = vecUnit(vecCross(uhat, vhat));
+        const relCx = center[0] - sx0;
+        const relCy = center[1] - sy0;
+        const relCz = center[2] - sz0;
+        const planeNum = relCx * nhat[0] + relCy * nhat[1] + relCz * nhat[2];
+        const midPt = [
+          center[0] + 0.5 * width * uhat[0] + 0.5 * height * vhat[0],
+          center[1] + 0.5 * width * uhat[1] + 0.5 * height * vhat[1],
+          center[2] + 0.5 * width * uhat[2] + 0.5 * height * vhat[2],
+        ];
+        out.push({{
+          bid, isCurved: false, m, n, width, height,
+          center, midPt, uhat, vhat, nhat, planeNum,
+        }});
+      }}
+    }}
+    _fullFacePanelsCacheKey = key;
+    _fullFacePanelsCache = out;
+    return out;
+  }}
+
+  function raycastSingleDirToFullPanels(kfx, kfy, kfz, sx0, sy0, sz0, fullPanels) {{
+    let bestT = 1e30;
+    let bestHit = null;
+    for (let pIdx = 0; pIdx < fullPanels.length; pIdx++) {{
+      const pan = fullPanels[pIdx];
+      if (pan.isCurved) {{
+        const vx = pan.vhat[0], vy = pan.vhat[1], vz = pan.vhat[2];
+        const dx = kfy * vz - kfz * vy;
+        const dy = kfz * vx - kfx * vz;
+        const dz = kfx * vy - kfy * vx;
+        const qa = dx * dx + dy * dy + dz * dz;
+        if (qa <= 1e-12) continue;
+        const qb = 2.0 * (pan.bVec[0] * dx + pan.bVec[1] * dy + pan.bVec[2] * dz);
+        const delta = qb * qb - 4.0 * qa * pan.qc;
+        if (delta < 0.0) continue;
+        const sq = Math.sqrt(delta);
+        const t2 = (-qb - sq) / (2.0 * qa);
+        const t1 = (-qb + sq) / (2.0 * qa);
+        const tRay = t2 > 1e-6 ? t2 : (t1 > 1e-6 ? t1 : -1.0);
+        if (tRay <= 1e-6 || tRay >= bestT) continue;
+        const ptX = sx0 + tRay * kfx;
+        const ptY = sy0 + tRay * kfy;
+        const ptZ = sz0 + tRay * kfz;
+        const rx = ptX - pan.center[0], ry = ptY - pan.center[1], rz = ptZ - pan.center[2];
+        const dotV = rx * vx + ry * vy + rz * vz;
+        if (dotV < 0.0 || dotV > pan.height) continue;
+        const dpx = rx - dotV * vx, dpy = ry - dotV * vy, dpz = rz - dotV * vz;
+        const dotR = dpx * pan.rhat[0] + dpy * pan.rhat[1] + dpz * pan.rhat[2];
+        const dotW = dpx * pan.what[0] + dpy * pan.what[1] + dpz * pan.what[2];
+        if (Math.abs(dotW) <= 1e-12) continue;
+        let dt = 2.0 * Math.atan(-dotR / dotW);
+        const twoPi = 2.0 * Math.PI;
+        dt = ((dt % twoPi) + twoPi) % twoPi;
+        const arcU = dt * pan.radius;
+        if (arcU < 0.0 || arcU > pan.width) continue;
+        bestT = tRay;
+        bestHit = {{ hit: true, bid: pan.bid, pt: [ptX, ptY, ptZ] }};
+      }} else {{
+        const denom = kfx * pan.nhat[0] + kfy * pan.nhat[1] + kfz * pan.nhat[2];
+        if (Math.abs(denom) < 1e-8) continue;
+        const tRay = pan.planeNum / denom;
+        if (tRay <= 1e-6 || tRay >= bestT) continue;
+        const ptX = sx0 + tRay * kfx;
+        const ptY = sy0 + tRay * kfy;
+        const ptZ = sz0 + tRay * kfz;
+        const dx = ptX - pan.center[0];
+        const dy = ptY - pan.center[1];
+        const dz = ptZ - pan.center[2];
+        const du = dx * pan.uhat[0] + dy * pan.uhat[1] + dz * pan.uhat[2];
+        if (du < 0.0 || du > pan.width) continue;
+        const dv = dx * pan.vhat[0] + dy * pan.vhat[1] + dz * pan.vhat[2];
+        if (dv < 0.0 || dv > pan.height) continue;
+        bestT = tRay;
+        bestHit = {{ hit: true, bid: pan.bid, pt: [ptX, ptY, ptZ] }};
+      }}
+    }}
+    return bestHit;
+  }}
+
+  function estimateDetectorRadiusM(fullPanels) {{
+    if (Array.isArray(fullPanels) && fullPanels.length > 0) {{
+      let sumR = 0.0, cnt = 0;
+      for (let i = 0; i < fullPanels.length; i++) {{
+        const fp = fullPanels[i];
+        const r = fp.isCurved
+          ? fp.radius
+          : Math.hypot(fp.midPt[0], fp.midPt[2]);
+        if (r > 0.02) {{ sumR += r; cnt++; }}
+      }}
+      if (cnt > 0) return sumR / cnt;
+    }}
+    if (Array.isArray(PANELS) && PANELS.length > 0) {{
+      for (let i = 0; i < PANELS.length; i++) {{
+        const p = PANELS[i];
+        if (typeof p.el_max === "number" && Math.abs(p.el_max) > 1.0 && typeof p.y_max === "number" && Math.abs(p.y_max) > 0.01) {{
+          const rEst = Math.abs(p.y_max) / Math.max(0.05, Math.tan(Math.abs(p.el_max) * Math.PI / 180.0));
+          if (Number.isFinite(rEst) && rEst > 0.05 && rEst < 10.0) return rEst;
+        }}
+      }}
+    }}
+    return 0.45;
+  }}
+
+  function wrapDeltaDeg(a, b) {{
+    let d = (a - b) % 360.0;
+    if (d > 180.0) d -= 360.0;
+    if (d < -180.0) d += 360.0;
+    return d;
+  }}
+
+  function projectRayToDetectorWithGap(kf, sLab, fullPanels) {{
+    const kfx = kf[0], kfy = kf[1], kfz = kf[2];
+    const sx0 = Number(sLab[0]) || 0.0;
+    const sy0 = Number(sLab[1]) || 0.0;
+    const sz0 = Number(sLab[2]) || 0.0;
+    const directHit = fullPanels.length > 0
+      ? raycastSingleDirToFullPanels(kfx, kfy, kfz, sx0, sy0, sz0, fullPanels)
+      : null;
+    if (directHit) {{
+      const [azDeg, yM, elDeg] = labToCyl(directHit.pt);
+      return {{
+        visible: true,
+        onPanel: true,
+        bank: directHit.bid,
+        nearBank: directHit.bid,
+        det_x: azDeg,
+        det_y: yM,
+        det_el: elDeg,
+        gapDeg: 0.0,
+        nearAz: azDeg,
+        nearY: yM,
+        nearEl: elDeg,
+      }};
+    }}
+
+    // Estimate 3D intersection distance t from the angularly nearest physical panel (or cylindrical fallback)
+    const rFallback = estimateDetectorRadiusM(fullPanels);
+    let tEst = -1.0;
+    if (fullPanels.length > 0) {{
+      let bestCos = -2.0;
+      for (let i = 0; i < fullPanels.length; i++) {{
+        const fp = fullPanels[i];
+        if (fp.isCurved) {{
+          const horiz = Math.hypot(kfx, kfz);
+          if (horiz > 1e-5) {{
+            tEst = fp.radius / horiz;
+            break;
+          }}
+        }} else {{
+          const cNorm = vecUnit(fp.midPt);
+          const cosAng = kfx * cNorm[0] + kfy * cNorm[1] + kfz * cNorm[2];
+          if (cosAng > bestCos) {{
+            bestCos = cosAng;
+            const denom = kfx * fp.nhat[0] + kfy * fp.nhat[1] + kfz * fp.nhat[2];
+            const distC = Math.hypot(fp.midPt[0] - sx0, fp.midPt[1] - sy0, fp.midPt[2] - sz0);
+            tEst = (Math.abs(denom) > 0.15 && (fp.planeNum / denom) > 0.0)
+              ? Math.min(distC * 1.6, Math.max(distC * 0.6, fp.planeNum / denom))
+              : distC;
+          }}
+        }}
+      }}
+    }}
+    if (!(tEst > 1e-4)) {{
+      const horiz = Math.hypot(kfx, kfz);
+      tEst = horiz > 0.12 ? (rFallback / horiz) : rFallback;
+    }}
+    const ptEst = [sx0 + tEst * kfx, sy0 + tEst * kfy, sz0 + tEst * kfz];
+    const [azDeg, yM, elDeg] = labToCyl(ptEst);
+
+    if (!Array.isArray(PANELS) || PANELS.length === 0) {{
+      return {{
+        visible: Math.abs(elDeg) <= 75.0,
+        onPanel: true,
+        bank: 1,
+        nearBank: 1,
+        det_x: azDeg,
+        det_y: yM,
+        det_el: elDeg,
+        gapDeg: 0.0,
+        nearAz: azDeg,
+        nearY: yM,
+        nearEl: elDeg,
+      }};
+    }}
+
+    // Check against PANELS 2D bounds (including synthetic demos without detector_configs and inter-bank gaps)
+    let minGapDeg = 1e9;
+    let nearAz = azDeg;
+    let nearY = yM;
+    let nearEl = elDeg;
+    let nearBank = PANELS[0].id || 1;
+    let insidePanel2D = false;
+
+    for (let i = 0; i < PANELS.length; i++) {{
+      const p = PANELS[i];
+      const azMin = Number(p.az_min), azMax = Number(p.az_max);
+      const yMin = Number(p.y_min), yMax = Number(p.y_max);
+      const elMin = typeof p.el_min === "number" ? p.el_min : (Math.atan2(yMin, rFallback) * 180.0 / Math.PI);
+      const elMax = typeof p.el_max === "number" ? p.el_max : (Math.atan2(yMax, rFallback) * 180.0 / Math.PI);
+
+      // Azimuth clamp with 360° periodicity
+      let clampedAz = azDeg;
+      let dAz = 0.0;
+      const midAz = 0.5 * (azMin + azMax);
+      const halfSpanAz = Math.max(0.0, 0.5 * (azMax - azMin));
+      const relAz = wrapDeltaDeg(azDeg, midAz);
+      if (Math.abs(relAz) > halfSpanAz) {{
+        dAz = Math.abs(relAz) - halfSpanAz;
+        clampedAz = azDeg - Math.sign(relAz) * dAz;
+      }}
+
+      let clampedY = Math.max(yMin, Math.min(yMax, yM));
+      let clampedEl = Math.max(elMin, Math.min(elMax, elDeg));
+      let dEl = 0.0;
+      if (elDeg < elMin) dEl = elMin - elDeg;
+      else if (elDeg > elMax) dEl = elDeg - elMax;
+      if (yM < yMin || yM > yMax) {{
+        const dyDeg = (Math.abs(yM - clampedY) / Math.max(0.08, rFallback)) * (180.0 / Math.PI);
+        dEl = Math.max(dEl, dyDeg);
+      }}
+
+      if (dAz === 0.0 && dEl === 0.0 && fullPanels.length === 0) {{
+        insidePanel2D = true;
+        minGapDeg = 0.0;
+        nearAz = azDeg;
+        nearY = yM;
+        nearEl = elDeg;
+        nearBank = p.id || (i + 1);
+        break;
+      }}
+      const gDeg = Math.hypot(dAz, dEl);
+      if (gDeg < minGapDeg) {{
+        minGapDeg = gDeg;
+        nearAz = clampedAz;
+        nearY = clampedY;
+        nearEl = clampedEl;
+        nearBank = p.id || (i + 1);
+      }}
+    }}
+
+    if (insidePanel2D) {{
+      return {{
+        visible: true,
+        onPanel: true,
+        bank: nearBank,
+        nearBank,
+        det_x: azDeg,
+        det_y: yM,
+        det_el: elDeg,
+        gapDeg: 0.0,
+        nearAz,
+        nearY,
+        nearEl,
+      }};
+    }}
+
+    const MAX_NODAL_GAP_DEG = 9.0;
+    return {{
+      visible: minGapDeg <= MAX_NODAL_GAP_DEG,
+      onPanel: false,
+      bank: null,
+      nearBank,
+      det_x: azDeg,
+      det_y: yM,
+      det_el: elDeg,
+      gapDeg: minGapDeg,
+      nearAz,
+      nearY,
+      nearEl,
+    }};
+  }}
+
+  let _nodalPointsCacheSig = "";
+  let _nodalPointsCache = [];
+  function getVisibleNodalPoints() {{
+    if (!state.showNodalPoints) return [];
+    const ub = getActiveUbMatrix();
+    const Rg = getActiveGoniometerR();
+    const ki = vecUnit((DATA.incident_beam || [0.0, 0.0, 1.0]).map(Number));
+    const sLab = (DATA.sample_offset || [0.0, 0.0, 0.0]).map(Number);
+    const actZoneKey = Array.from(state.activeZones || []).join(",");
+    const ubSig = ub
+      ? `${{ub[0][0].toFixed(6)}},${{ub[1][1].toFixed(6)}},${{ub[2][2].toFixed(6)}},${{ub[0][1].toFixed(6)}},${{ub[0][2].toFixed(6)}},${{ub[1][2].toFixed(6)}}`
+      : "noub";
+    const sig = [
+      ubSig,
+      Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[1][1].toFixed(5), Rg[2][2].toFixed(5),
+      actZoneKey,
+      ZONES.length,
+      PANELS.length,
+      typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0,
+    ].join("|");
+    if (_nodalPointsCacheSig === sig) {{
+      return _nodalPointsCache;
+    }}
+
+    const fullPanels = buildFullFaceDetectorRaycastPanels(sLab);
+    const actZones = getActiveZoneObjectsCached();
+    const zoneAxisByUvw = new Map();
+    for (let i = 0; i < ZONES.length; i++) {{
+      const z = ZONES[i];
+      if (Array.isArray(z.uvw) && z.uvw.length === 3 && Array.isArray(z.axis_xyz) && z.axis_xyz.length === 3) {{
+        zoneAxisByUvw.set(z.uvw.join(","), z.axis_xyz);
+      }}
+    }}
+
+    function resolveZoneAxisLab(z) {{
+      if (ub && Array.isArray(z.uvw) && z.uvw.length === 3) {{
+        const invUb = mat3Inv(ub);
+        if (invUb) {{
+          const u = z.uvw[0], v = z.uvw[1], w = z.uvw[2];
+          const tc = [
+            invUb[0][0] * u + invUb[1][0] * v + invUb[2][0] * w,
+            invUb[0][1] * u + invUb[1][1] * v + invUb[2][1] * w,
+            invUb[0][2] * u + invUb[1][2] * v + invUb[2][2] * w,
+          ];
+          return vecUnit(mat3Vec(Rg, tc));
+        }}
+      }}
+      if (Array.isArray(z.axis_xyz) && z.axis_xyz.length === 3) {{
+        return vecUnit(z.axis_xyz);
+      }}
+      return null;
+    }}
+
+    function buildCandidateFromHklOrDir(hkl0, fallbackGLab, principalSymbol) {{
+      let gCryst0 = null;
+      let gLab0 = null;
+      let d1 = null;
+      if (ub && Array.isArray(hkl0)) {{
+        gCryst0 = mat3Vec(ub, hkl0);
+        const gn = vecNorm(gCryst0);
+        if (gn > 1e-9) {{
+          d1 = 1.0 / gn;
+          gLab0 = mat3Vec(Rg, gCryst0);
+        }}
+      }}
+      if (!gLab0 && Array.isArray(fallbackGLab)) {{
+        const fn = vecNorm(fallbackGLab);
+        if (fn > 1e-8) {{
+          gLab0 = fallbackGLab;
+          gCryst0 = mat3Vec(mat3T(Rg), gLab0);
+        }}
+      }}
+      if (!gLab0) return null;
+      const gHat0 = vecUnit(gLab0);
+      const dot0 = vecDot(ki, gHat0);
+      if (Math.abs(dot0) < 1e-4) return null;
+      const sgn = dot0 < 0.0 ? 1 : -1;
+      const gHat = [sgn * gHat0[0], sgn * gHat0[1], sgn * gHat0[2]];
+      const gCrystSigned = gCryst0 ? [sgn * gCryst0[0], sgn * gCryst0[1], sgn * gCryst0[2]] : null;
+      const sinTheta = -vecDot(ki, gHat);
+      if (!(sinTheta > 1e-4 && sinTheta < 0.9999)) return null;
+      const kf = vecUnit([
+        ki[0] + 2.0 * sinTheta * gHat[0],
+        ki[1] + 2.0 * sinTheta * gHat[1],
+        ki[2] + 2.0 * sinTheta * gHat[2],
+      ]);
+      // Exclude extreme near-forward beamstop cone (2θ < 1.8°)
+      if (vecDot(kf, ki) > 0.9995) return null;
+
+      const proj = projectRayToDetectorWithGap(kf, sLab, fullPanels);
+      if (!proj || !proj.visible) return null;
+
+      const signedHkl = Array.isArray(hkl0) ? [sgn * hkl0[0], sgn * hkl0[1], sgn * hkl0[2]] : null;
+      const zoneLabels = [];
+      const zoneIds = [];
+      let leadColor = principalSymbol ? "#fbbf24" : "#38bdf8";
+      let bestOrder = 999;
+      for (let zi = 0; zi < actZones.length; zi++) {{
+        const z = actZones[zi];
+        let inZone = false;
+        if (signedHkl && Array.isArray(z.uvw) && z.uvw.length === 3) {{
+          inZone = (signedHkl[0] * z.uvw[0] + signedHkl[1] * z.uvw[1] + signedHkl[2] * z.uvw[2]) === 0;
+        }} else {{
+          const tLab = resolveZoneAxisLab(z);
+          if (tLab) inZone = Math.abs(vecDot(gHat, tLab)) < 1e-3;
+        }}
+        if (inZone) {{
+          zoneIds.push(z.zone_id);
+          zoneLabels.push(z.label);
+          const zOrd = z.order || 1;
+          if (!principalSymbol && zOrd < bestOrder) {{
+            bestOrder = zOrd;
+            leadColor = z.rainbow_color || leadColor;
+          }}
+        }}
+      }}
+      // For principal {{a*, b*, c*}} axes when zones are hidden/deselected, still show canonical zone axes in tooltip
+      if (principalSymbol && zoneLabels.length === 0 && signedHkl) {{
+        for (let zi = 0; zi < ZONES.length && zoneLabels.length < 3; zi++) {{
+          const z = ZONES[zi];
+          if (Array.isArray(z.uvw) && (signedHkl[0] * z.uvw[0] + signedHkl[1] * z.uvw[1] + signedHkl[2] * z.uvw[2]) === 0) {{
+            zoneLabels.push(z.label);
+          }}
+        }}
+      }}
+
+      const key = signedHkl
+        ? `${{Math.abs(hkl0[0]) !== 0 || Math.abs(hkl0[1]) !== 0 || Math.abs(hkl0[2]) !== 0 ? hkl0.join(",") : ""}}`
+        : `${{proj.det_x.toFixed(2)}}_${{proj.det_el.toFixed(2)}}`;
+      const maxIdx = signedHkl
+        ? Math.max(Math.abs(signedHkl[0]), Math.abs(signedHkl[1]), Math.abs(signedHkl[2]))
+        : 9;
+      const lam1 = d1 !== null ? 2.0 * d1 * sinTheta : null;
+
+      return {{
+        key,
+        hkl: signedHkl,
+        canonHkl: hkl0,
+        isPrincipal: Boolean(principalSymbol),
+        principalSymbol: principalSymbol || null,
+        color: principalSymbol ? "#fbbf24" : leadColor,
+        det_x: proj.det_x,
+        det_y: proj.det_y,
+        det_el: proj.det_el,
+        onPanel: proj.onPanel,
+        bank: proj.bank,
+        nearBank: proj.nearBank,
+        gapDeg: proj.gapDeg,
+        nearAz: proj.nearAz,
+        nearY: proj.nearY,
+        nearEl: proj.nearEl,
+        d1,
+        lam1,
+        gCrystUnit: gCrystSigned ? vecUnit(gCrystSigned) : null,
+        zoneIds,
+        zoneLabels,
+        crossingCount: zoneIds.length,
+        maxIdx,
+      }};
+    }}
+
+    const seenKeys = new Set();
+    const principals = [];
+    const PRINCIPAL_SPECS = [
+      {{ hkl: [1, 0, 0], sym: "a*", crossA: "0,1,0", crossB: "0,0,1" }},
+      {{ hkl: [0, 1, 0], sym: "b*", crossA: "0,0,1", crossB: "1,0,0" }},
+      {{ hkl: [0, 0, 1], sym: "c*", crossA: "1,0,0", crossB: "0,1,0" }},
+    ];
+    for (let pi = 0; pi < PRINCIPAL_SPECS.length; pi++) {{
+      const sp = PRINCIPAL_SPECS[pi];
+      let fallbackG = null;
+      if (!ub) {{
+        const ta = zoneAxisByUvw.get(sp.crossA);
+        const tb = zoneAxisByUvw.get(sp.crossB);
+        if (ta && tb) fallbackG = vecCross(ta, tb);
+      }}
+      const cand = buildCandidateFromHklOrDir(sp.hkl, fallbackG, sp.sym);
+      if (cand) {{
+        seenKeys.add(cand.key);
+        principals.push(cand);
+      }}
+    }}
+
+    const secondaries = [];
+    if (state.showZoneArcs && actZones.length >= 2) {{
+      const labAxes = actZones.map(z => resolveZoneAxisLab(z));
+      for (let i = 0; i < actZones.length; i++) {{
+        const z1 = actZones[i];
+        const t1 = labAxes[i];
+        for (let j = i + 1; j < actZones.length; j++) {{
+          const z2 = actZones[j];
+          const t2 = labAxes[j];
+          let hkl0 = null;
+          if (Array.isArray(z1.uvw) && Array.isArray(z2.uvw)) {{
+            const cx = z1.uvw[1] * z2.uvw[2] - z1.uvw[2] * z2.uvw[1];
+            const cy = z1.uvw[2] * z2.uvw[0] - z1.uvw[0] * z2.uvw[2];
+            const cz = z1.uvw[0] * z2.uvw[1] - z1.uvw[1] * z2.uvw[0];
+            hkl0 = primitiveCanonicalHkl(cx, cy, cz);
+            if (!hkl0) continue;
+            const cKey = hkl0.join(",");
+            if (seenKeys.has(cKey)) continue;
+          }}
+          const fallbackG = (t1 && t2) ? vecCross(t1, t2) : null;
+          if (!hkl0 && (!fallbackG || vecNorm(fallbackG) < 1e-5)) continue;
+          const cand = buildCandidateFromHklOrDir(hkl0, fallbackG, null);
+          if (hkl0) seenKeys.add(hkl0.join(","));
+          if (cand && cand.crossingCount >= 2) {{
+            if (!hkl0) {{
+              if (seenKeys.has(cand.key)) continue;
+              seenKeys.add(cand.key);
+            }}
+            secondaries.push(cand);
+          }}
+        }}
+      }}
+    }}
+
+    secondaries.sort((a, b) => {{
+      if (b.crossingCount !== a.crossingCount) return b.crossingCount - a.crossingCount;
+      if (a.maxIdx !== b.maxIdx) return a.maxIdx - b.maxIdx;
+      return (b.d1 || 0) - (a.d1 || 0);
+    }});
+
+    const merged = principals.concat(secondaries.slice(0, 20));
+    _nodalPointsCacheSig = sig;
+    _nodalPointsCache = merged;
+    return merged;
+  }}
+
+  let _holzCacheSig = "";
+  let _holzCacheList = [];
+  function getHolzSegmentsForActiveZones() {{
+    if (
+      !state.showZoneArcs ||
+      !(state.holzOrders instanceof Set) ||
+      state.holzOrders.size === 0 ||
+      !state.activeZones ||
+      state.activeZones.size === 0
+    ) {{
+      return [];
+    }}
+    const ordersArr = Array.from(state.holzOrders).filter(n => n > 0).sort((a, b) => a - b);
+    if (ordersArr.length === 0) return [];
+    const ub = getActiveUbMatrix();
+    const invUb = ub ? mat3Inv(ub) : null;
+    const Rg = getActiveGoniometerR();
+    const ki = vecUnit((DATA.incident_beam || [0.0, 0.0, 1.0]).map(Number));
+    const sLab = (DATA.sample_offset || [0.0, 0.0, 0.0]).map(Number);
+    const wlMin = Math.max(0.05, Number(state.lamMin) || 0.5);
+    const wlMax = Math.max(wlMin, Number(state.lamMax) || wlMin);
+    const dMin = Math.max(0.05, Number(state.dMin) || 0.5);
+    const ubSig = ub
+      ? `${{ub[0][0].toFixed(6)}},${{ub[1][1].toFixed(6)}},${{ub[2][2].toFixed(6)}},${{ub[0][2].toFixed(6)}}`
+      : "noub";
+    const sig = [
+      ordersArr.join(","),
+      Array.from(state.activeZones).join(","),
+      wlMin.toFixed(4),
+      wlMax.toFixed(4),
+      dMin.toFixed(4),
+      ubSig,
+      Rg[0][0].toFixed(5), Rg[0][2].toFixed(5), Rg[2][2].toFixed(5),
+      PANELS.length,
+      ZONES.length,
+    ].join("|");
+    if (_holzCacheSig === sig) return _holzCacheList;
+
+    const fullPanels = buildFullFaceDetectorRaycastPanels(sLab);
+    const sx0 = Number(sLab[0]) || 0.0;
+    const sy0 = Number(sLab[1]) || 0.0;
+    const sz0 = Number(sLab[2]) || 0.0;
+    const rFallback = estimateDetectorRadiusM(fullPanels);
+    const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
+    const actZones = getActiveZoneObjectsCached();
+    const out = [];
+
+    for (let zi = 0; zi < actZones.length; zi++) {{
+      const zone = actZones[zi];
+      let tLab = null;
+      let dDirect = Number(zone.d_direct) || 0.0;
+      if (invUb && Array.isArray(zone.uvw) && zone.uvw.length === 3) {{
+        const u = zone.uvw[0], v = zone.uvw[1], w = zone.uvw[2];
+        const tc = [
+          invUb[0][0] * u + invUb[1][0] * v + invUb[2][0] * w,
+          invUb[0][1] * u + invUb[1][1] * v + invUb[2][1] * w,
+          invUb[0][2] * u + invUb[1][2] * v + invUb[2][2] * w,
+        ];
+        const dn = vecNorm(tc);
+        if (dn > 1e-6) {{
+          dDirect = dn;
+          tLab = vecUnit(mat3Vec(Rg, tc));
+        }}
+      }}
+      if (!tLab && Array.isArray(zone.axis_xyz) && zone.axis_xyz.length === 3) {{
+        tLab = vecUnit(zone.axis_xyz);
+      }}
+      if (!tLab || !(dDirect > 1e-4)) continue;
+
+      const ref = Math.abs(tLab[0]) < 0.9 ? [1.0, 0.0, 0.0] : [0.0, 1.0, 0.0];
+      const e1 = vecUnit(vecCross(tLab, ref));
+      const e2 = vecUnit(vecCross(tLab, e1));
+      const kiDotT = vecDot(ki, tLab);
+
+      for (let oi = 0; oi < ordersArr.length; oi++) {{
+        const absN = ordersArr[oi];
+        const spread = (absN * (wlMax - wlMin)) / dDirect;
+        const wlSpecs = spread < 0.008
+          ? [{{ lam: 0.5 * (wlMin + wlMax), edgeKind: "mid" }}]
+          : [
+              {{ lam: wlMin, edgeKind: "min" }},
+              {{ lam: wlMax, edgeKind: "max" }},
+            ];
+        const signs = [absN, -absN];
+        for (let si = 0; si < signs.length; si++) {{
+          const holzN = signs[si];
+          for (let wi = 0; wi < wlSpecs.length; wi++) {{
+            const {{ lam, edgeKind }} = wlSpecs[wi];
+            const cVal = kiDotT + (holzN * lam) / dDirect;
+            if (Math.abs(cVal) >= 0.9996) continue;
+            const sVal = Math.sqrt(Math.max(0.0, 1.0 - cVal * cVal));
+            // d >= dMin <=> sin(theta) <= lam / (2*dMin) <=> cos(2*theta) >= 1 - lam^2 / (2*dMin^2)
+            const cos2ThetaMin = 1.0 - (lam * lam) / (2.0 * dMin * dMin);
+
+            const cylSegs = [];
+            const sphSegs = [];
+            let curCyl = [];
+            let curSph = [];
+            let prevBid = null;
+            let prevAz = null;
+            const nSamples = 240;
+
+            const flushSeg = () => {{
+              if (curCyl.length >= 2) {{
+                cylSegs.push(curCyl);
+                sphSegs.push(curSph);
+              }}
+              curCyl = [];
+              curSph = [];
+              prevBid = null;
+              prevAz = null;
+            }};
+
+            for (let step = 0; step <= nSamples; step++) {{
+              const ang = (step / nSamples) * Math.PI * 2.0;
+              const ca = Math.cos(ang), sa = Math.sin(ang);
+              const kfx = cVal * tLab[0] + sVal * (ca * e1[0] + sa * e2[0]);
+              const kfy = cVal * tLab[1] + sVal * (ca * e1[1] + sa * e2[1]);
+              const kfz = cVal * tLab[2] + sVal * (ca * e1[2] + sa * e2[2]);
+              const cos2Theta = kfx * ki[0] + kfy * ki[1] + kfz * ki[2];
+              if (cos2Theta > 0.9995 || cos2Theta < cos2ThetaMin) {{
+                flushSeg();
+                continue;
+              }}
+
+              let azDeg = 0.0, yM = 0.0, elDeg = 0.0, bid = 0;
+              if (fullPanels.length > 0) {{
+                const hit = raycastSingleDirToFullPanels(kfx, kfy, kfz, sx0, sy0, sz0, fullPanels);
+                if (!hit) {{
+                  flushSeg();
+                  continue;
+                }}
+                [azDeg, yM, elDeg] = labToCyl(hit.pt);
+                bid = hit.bid;
+              }} else {{
+                const horiz = Math.hypot(kfx, kfz);
+                if (horiz < 0.08) {{
+                  flushSeg();
+                  continue;
+                }}
+                const tCyl = rFallback / horiz;
+                [azDeg, yM, elDeg] = labToCyl([sx0 + tCyl * kfx, sy0 + tCyl * kfy, sz0 + tCyl * kfz]);
+                if (hasPanels) {{
+                  let matchBank = null;
+                  for (let pi = 0; pi < PANELS.length; pi++) {{
+                    const p = PANELS[pi];
+                    if (azDeg >= p.az_min && azDeg <= p.az_max && yM >= p.y_min && yM <= p.y_max) {{
+                      matchBank = p.id || (pi + 1);
+                      break;
+                    }}
+                  }}
+                  if (matchBank === null) {{
+                    flushSeg();
+                    continue;
+                  }}
+                  bid = matchBank;
+                }}
+              }}
+
+              if (prevBid !== null && (bid !== prevBid || Math.abs(azDeg - prevAz) > 90.0)) {{
+                flushSeg();
+              }}
+              curCyl.push([azDeg, yM]);
+              curSph.push([azDeg, elDeg]);
+              prevBid = bid;
+              prevAz = azDeg;
+            }}
+            flushSeg();
+
+            if (cylSegs.length > 0) {{
+              out.push({{
+                zone,
+                holzN,
+                absN,
+                lam,
+                edgeKind,
+                cylSegs,
+                sphSegs,
+              }});
+            }}
+          }}
+        }}
+      }}
+    }}
+
+    _holzCacheSig = sig;
+    _holzCacheList = out;
+    return out;
+  }}
+
+  function drawSingleZoneArc(ctx, pts, zone, isContinuousGap = false, holzSpec = null) {{
     if (!pts || pts.length < 2) return;
-    const isSelected = state.selectedZoneId === zone.zone_id;
+    const isHoveredZone = state.hoveredZoneId === zone.zone_id && (holzSpec ? state.hoveredZoneHolzN === holzSpec.holzN : state.hoveredZoneHolzN === 0);
+    const isSelected = state.selectedZoneId === zone.zone_id || isHoveredZone;
     const zOrder = zone.order || 1;
     ctx.save();
     ctx.beginPath();
@@ -17415,6 +18253,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ctx.lineWidth = 1.0;
       ctx.globalAlpha = 0.22;
       ctx.setLineDash([4, 4]);
+    }} else if (holzSpec) {{
+      const absN = holzSpec.absN || 1;
+      const isOuter = holzSpec.edgeKind === "max";
+      const baseW = absN === 1 ? (isOuter ? 1.15 : 1.55) : (isOuter ? 1.0 : 1.3);
+      ctx.lineWidth = isSelected ? baseW + 1.1 : baseW;
+      ctx.globalAlpha = isSelected ? 0.95 : (isOuter ? 0.42 : (absN === 1 ? 0.72 : 0.58));
+      ctx.setLineDash(absN === 1 ? (isOuter ? [2, 4] : [6, 4]) : (isOuter ? [1.5, 4] : [3, 3, 1, 3]));
     }} else {{
       const baseW = zOrder === 1 ? 2.2 : (zOrder === 2 ? 1.6 : 1.25);
       ctx.lineWidth = isSelected ? baseW + 1.2 : baseW;
@@ -18472,6 +19317,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return _detLodCache;
   }}
 
+  let _detZoneArcScreenSegs = [];
+  let _detNodalScreenHits = [];
+
   function renderDetector() {{
     renderDetectorCanvas(true);
   }}
@@ -18482,9 +19330,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const targetW = Math.max(200, Math.round(rect.width * dpr));
     const targetH = Math.max(200, Math.round(rect.height * dpr));
     const bounds = getActiveBounds();
+    const RgDet = getActiveGoniometerR();
     const hovRef = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
     const selRef = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
     const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
+    const holzKey = (state.showZoneArcs && state.holzOrders instanceof Set && state.holzOrders.size > 0)
+      ? Array.from(state.holzOrders).sort().join(",")
+      : "0";
+    const hovZoneSig = state.hoveredZoneId !== null && state.hoveredZoneId !== undefined
+      ? `${{state.hoveredZoneId}}:${{state.hoveredZoneHolzN || 0}}:${{state.hoveredZonePos ? Math.round(state.hoveredZonePos[0]) + "," + Math.round(state.hoveredZonePos[1]) : ""}}`
+      : "";
     const detSig = [
       targetW, targetH,
       state.projection,
@@ -18496,6 +19351,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.heatmapStyle,
       state.hiResTextures ? 1 : 0,
       state.showPixelMask ? 1 : 0,
+      state.showNodalPoints ? 1 : 0,
+      holzKey,
       _panelTexEpoch,
       PANELS.length,
       PEAKS.length,
@@ -18509,12 +19366,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.parallaxX.toFixed(4),
       state.parallaxY.toFixed(4),
       state.selectedZoneId || "",
+      hovZoneSig,
+      state.hoveredNodalKey || "",
       zonesKey,
       hovRef,
       selRef,
       state.activeOrbitId || "",
       DATA.mtz_overlay_name || "",
       typeof _dynPredEpoch !== "undefined" ? _dynPredEpoch : 0,
+      RgDet[0][0].toFixed(5), RgDet[0][2].toFixed(5), RgDet[2][2].toFixed(5),
     ].join("|");
     if (
       !forceRedraw &&
@@ -18782,8 +19642,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     ctx.restore();
 
     const OVERLAY_PARALLAX_LAYER = 0.45;
+    _detZoneArcScreenSegs = [];
+    _detNodalScreenHits = [];
 
-    // 3. LAYER 1 (FOREGROUND OVERLAY): Single-Arc Laue Zone Conics [uvw] clipped to detector panels
+    // 3. LAYER 1 (FOREGROUND OVERLAY): Single-Arc Laue Zone Conics [uvw] + HOLZ (±1, ±2) clipped to detector panels
     if (state.showZoneArcs) {{
       const hasPanels = Array.isArray(PANELS) && PANELS.length > 0;
       azShifts.forEach(shiftAz => {{
@@ -18797,8 +19659,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             : (hasPanels ? (zone.detector_segments || []) : (zone.detector_segments || contSegs));
           panelSegs.forEach((seg, sIdx) => {{
             const screenPts = seg.map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, OVERLAY_PARALLAX_LAYER));
-            drawSingleZoneArc(ctx, screenPts, zone, false);
-            if (shiftAz === 0 && sIdx === 0 && screenPts.length > 2 && (state.selectedZoneId === zone.zone_id || state.detZoom > 1.35)) {{
+            drawSingleZoneArc(ctx, screenPts, zone, false, null);
+            if (screenPts.length >= 2) {{
+              _detZoneArcScreenSegs.push({{ zone, holzN: 0, lam: null, pts: screenPts }});
+            }}
+            if (
+              shiftAz === 0 &&
+              sIdx === 0 &&
+              screenPts.length > 2 &&
+              (state.selectedZoneId === zone.zone_id || state.detZoom > 1.35)
+            ) {{
               const mid = screenPts[Math.floor(screenPts.length * 0.5)];
               ctx.save();
               ctx.font = "bold 9px monospace";
@@ -18810,6 +19680,36 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
           }});
         }});
+
+        const holzItems = getHolzSegmentsForActiveZones();
+        for (let hi = 0; hi < holzItems.length; hi++) {{
+          const item = holzItems[hi];
+          const segList = isSph ? item.sphSegs : item.cylSegs;
+          for (let si = 0; si < segList.length; si++) {{
+            const screenPts = segList[si].map(pt => detToScreen(pt[0] + shiftAz, pt[1], w, h, OVERLAY_PARALLAX_LAYER));
+            drawSingleZoneArc(ctx, screenPts, item.zone, false, item);
+            if (screenPts.length >= 2) {{
+              _detZoneArcScreenSegs.push({{ zone: item.zone, holzN: item.holzN, lam: item.lam, edgeKind: item.edgeKind, pts: screenPts }});
+            }}
+            if (
+              shiftAz === 0 &&
+              si === 0 &&
+              item.edgeKind !== "max" &&
+              screenPts.length > 3 &&
+              (state.selectedZoneId === item.zone.zone_id || state.detZoom > 1.8)
+            ) {{
+              const mid = screenPts[Math.floor(screenPts.length * 0.5)];
+              const hTag = `${{item.zone.label}}${{item.holzN > 0 ? "+" : ""}}${{item.holzN}}`;
+              ctx.save();
+              ctx.font = "bold 8.5px monospace";
+              ctx.fillStyle = "#070913";
+              ctx.fillText(hTag, mid[0] + 6, mid[1] - 3);
+              ctx.fillStyle = item.zone.rainbow_color;
+              ctx.fillText(hTag, mid[0] + 5, mid[1] - 4);
+              ctx.restore();
+            }}
+          }}
+        }}
       }});
     }}
 
@@ -18942,6 +19842,108 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }}
     ctx.restore();
 
+    // 4b. NODAL POINTS LAYER: Big bull's-eye circles (filled with a dot) at Laue zone intersections + {{a*, b*, c*}}
+    const pendingNodalTooltips = [];
+    if (state.showNodalPoints) {{
+      const nodals = getVisibleNodalPoints();
+      if (nodals.length > 0) {{
+        ctx.save();
+        for (let sIdx = 0; sIdx < 3; sIdx++) {{
+          const shiftAz = shiftList[sIdx];
+          const shiftPxX = affScaleX * shiftAz + affOffsetX;
+          for (let nIdx = 0; nIdx < nodals.length; nIdx++) {{
+            const nd = nodals[nIdx];
+            const x = affScaleX * nd.det_x + shiftPxX;
+            const nVert = isSph ? nd.det_el : nd.det_y;
+            const y = affScaleY * nVert + affOffsetY;
+            if (x < -44 || x > w + 44 || y < -44 || y > h + 44) continue;
+
+            const baseNodalR = nd.isPrincipal
+              ? Math.max(12.5, Math.min(20.0, 11.0 + 1.8 * Math.sqrt(state.detZoom)))
+              : Math.max(9.5, Math.min(16.5, 8.2 + 1.5 * Math.sqrt(state.detZoom)));
+            let nodalR = baseNodalR;
+            if (!nd.onPanel) {{
+              const nearVert = isSph ? nd.nearEl : nd.nearY;
+              const edgeX = affScaleX * nd.nearAz + shiftPxX;
+              const edgeY = affScaleY * nearVert + affOffsetY;
+              const dPanelPx = Math.hypot(x - edgeX, y - edgeY);
+              if (Number.isFinite(dPanelPx) && dPanelPx > 0.0) {{
+                // Ensure the circle bridges inter-panel gaps so >= 6.5 px overlaps onto the adjacent panel
+                nodalR = Math.max(baseNodalR, Math.min(38.0, dPanelPx + 6.5));
+              }}
+            }}
+
+            const isHovNodal = state.hoveredNodalKey !== null && state.hoveredNodalKey === nd.key;
+            _detNodalScreenHits.push({{ nodal: nd, x, y, r: nodalR }});
+
+            // Soft circular interior tint so gap-straddling nodal circles remain legible across panels & gaps
+            ctx.beginPath();
+            ctx.arc(x, y, nodalR, 0, Math.PI * 2);
+            ctx.fillStyle = nd.isPrincipal
+              ? (isHovNodal ? "rgba(251, 191, 36, 0.24)" : "rgba(251, 191, 36, 0.12)")
+              : (isHovNodal ? "rgba(56, 189, 248, 0.22)" : "rgba(15, 23, 42, 0.24)");
+            ctx.fill();
+
+            // Dark contrast halo + colored outer ring
+            ctx.beginPath();
+            ctx.arc(x, y, nodalR, 0, Math.PI * 2);
+            ctx.strokeStyle = "rgba(7, 9, 19, 0.88)";
+            ctx.lineWidth = isHovNodal ? 4.2 : 3.4;
+            ctx.stroke();
+
+            ctx.beginPath();
+            ctx.arc(x, y, nodalR, 0, Math.PI * 2);
+            ctx.strokeStyle = isHovNodal ? "#ffffff" : nd.color;
+            ctx.lineWidth = isHovNodal ? 2.5 : (nd.isPrincipal ? 2.1 : 1.7);
+            ctx.globalAlpha = isHovNodal ? 1.0 : (nd.isPrincipal ? 0.96 : 0.86);
+            ctx.stroke();
+            ctx.globalAlpha = 1.0;
+
+            if (isHovNodal) {{
+              ctx.beginPath();
+              ctx.arc(x, y, nodalR + 3.2, 0, Math.PI * 2);
+              ctx.strokeStyle = nd.color;
+              ctx.lineWidth = 1.4;
+              ctx.stroke();
+            }}
+
+            // Central filled bull's-eye dot
+            const dotR = isHovNodal ? 3.5 : (nd.isPrincipal ? 3.0 : 2.4);
+            ctx.beginPath();
+            ctx.arc(x, y, dotR + 1.3, 0, Math.PI * 2);
+            ctx.fillStyle = "rgba(7, 9, 19, 0.92)";
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(x, y, dotR, 0, Math.PI * 2);
+            ctx.fillStyle = isHovNodal ? "#ffffff" : nd.color;
+            ctx.fill();
+
+            // Persistent {{a*, b*, c*}} callout pill on principal reciprocal axes
+            if (nd.isPrincipal && nd.principalSymbol && x >= -10 && x <= w + 10 && y >= 0 && y <= h) {{
+              ctx.font = "bold 10px monospace";
+              const sym = nd.principalSymbol;
+              const pw = ctx.measureText(sym).width + 8;
+              const ph = 15;
+              const px = Math.min(Math.max(3, x + nodalR + 4), Math.max(3, w - pw - 3));
+              const pyPill = Math.min(Math.max(3, y - 0.5 * ph), Math.max(3, h - ph - 3));
+              ctx.fillStyle = "rgba(7, 9, 19, 0.90)";
+              ctx.fillRect(px, pyPill, pw, ph);
+              ctx.strokeStyle = isHovNodal ? "#ffffff" : "rgba(251, 191, 36, 0.85)";
+              ctx.lineWidth = 1.1;
+              ctx.strokeRect(px, pyPill, pw, ph);
+              ctx.fillStyle = "#fbbf24";
+              ctx.fillText(sym, px + 4, pyPill + 11);
+            }}
+
+            if (isHovNodal && x >= -20 && x <= w + 20 && pendingNodalTooltips.length === 0) {{
+              pendingNodalTooltips.push({{ nd, x, y, r: nodalR }});
+            }}
+          }}
+        }}
+        ctx.restore();
+      }}
+    }}
+
     // Render tooltips for all hovered + symmetry-equivalent reflections on top of rings
     pendingTooltips.forEach(({{ p, x, y, isHovered, isBijvoetMate }}) => {{
       const resBadge = typeof p.careless_residual === "number"
@@ -18963,6 +19965,60 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ctx.fillText(tag, tx + 5, ty - 7);
       ctx.restore();
     }});
+
+    // Render floating badge when hovering over a Nodal circle (stacked cleanly above any coincident peak tooltip)
+    pendingNodalTooltips.forEach(({{ nd, x, y, r }}) => {{
+      const hklStr = Array.isArray(nd.hkl) ? `(${{nd.hkl.join(",")}})` : "";
+      const head = nd.principalSymbol ? `Nodal ${{nd.principalSymbol}} ${{hklStr}}` : `Nodal ${{hklStr}}`;
+      const zPart = Array.isArray(nd.zoneLabels) && nd.zoneLabels.length > 0
+        ? ` • ${{nd.zoneLabels.slice(0, 3).join("×")}}${{nd.zoneLabels.length > 3 ? `+${{nd.zoneLabels.length - 3}}` : ""}}`
+        : "";
+      const dPart = typeof nd.d1 === "number" && nd.d1 > 0 ? ` • d₁=${{nd.d1.toFixed(2)}}Å` : "";
+      const gapPart = !nd.onPanel ? " [gap]" : "";
+      const tag = `${{head}}${{zPart}}${{dPart}}${{gapPart}}`;
+      ctx.save();
+      ctx.font = "bold 11px monospace";
+      const tw = ctx.measureText(tag).width + 12;
+      const tx = Math.min(Math.max(4, x + r + 6), Math.max(4, w - tw - 4));
+      const stackOffset = pendingTooltips.length > 0 ? 22 : 0;
+      const ty = Math.max(22, y - stackOffset);
+      ctx.fillStyle = "rgba(11, 15, 23, 0.94)";
+      ctx.fillRect(tx, ty - 20, tw, 18);
+      ctx.strokeStyle = nd.color || "#fbbf24";
+      ctx.lineWidth = 1.35;
+      ctx.strokeRect(tx, ty - 20, tw, 18);
+      ctx.fillStyle = nd.isPrincipal ? "#fbbf24" : (nd.color || "#38bdf8");
+      ctx.fillText(tag, tx + 6, ty - 7);
+      ctx.restore();
+    }});
+
+    // Render floating [uvw] zone-arc badge when hovering over an active ZOLZ or HOLZ curve
+    if (state.hoveredZoneId !== null && state.hoveredZonePos && pendingTooltips.length === 0 && pendingNodalTooltips.length === 0) {{
+      const hz = ZONES.find(z => z.zone_id === state.hoveredZoneId);
+      if (hz) {{
+        const holzN = state.hoveredZoneHolzN || 0;
+        const eqTag = holzN
+          ? `HOLZ N=${{holzN > 0 ? "+" : ""}}${{holzN}}`
+          : `${{hz.n_peaks || 0}} spots`;
+        const dTag = typeof hz.d_direct === "number" && hz.d_direct > 0 ? ` • |t|=${{hz.d_direct.toFixed(2)}}Å` : "";
+        const zTag = `Zone ${{hz.label}} • ${{eqTag}}${{dTag}}`;
+        const hx = state.hoveredZonePos[0];
+        const hy = state.hoveredZonePos[1];
+        ctx.save();
+        ctx.font = "bold 11px monospace";
+        const tw = ctx.measureText(zTag).width + 12;
+        const tx = Math.min(Math.max(4, hx + 10), Math.max(4, w - tw - 4));
+        const ty = Math.max(22, hy - 6);
+        ctx.fillStyle = "rgba(11, 15, 23, 0.94)";
+        ctx.fillRect(tx, ty - 20, tw, 18);
+        ctx.strokeStyle = hz.rainbow_color || "#38bdf8";
+        ctx.lineWidth = 1.35;
+        ctx.strokeRect(tx, ty - 20, tw, 18);
+        ctx.fillStyle = hz.rainbow_color || "#38bdf8";
+        ctx.fillText(zTag, tx + 6, ty - 7);
+        ctx.restore();
+      }}
+    }}
 
     if (detLod.isLodThinned) {{
       ctx.save();
@@ -19580,6 +20636,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const hovRef = state.hoveredPeakObj ? `${{state.hoveredPeakObj.id}}:${{(state.hoveredPeakObj.hkl || []).join(",")}}` : String(state.hoveredPeakId);
     const selRef = state.selectedPeakObj ? `${{state.selectedPeakObj.id}}:${{(state.selectedPeakObj.hkl || []).join(",")}}` : String(state.selectedPeakId);
     const zonesKey = state.showZoneArcs ? Array.from(state.activeZones).join(",") : "off";
+    const wulffHolzKey = (state.showZoneArcs && state.holzOrders instanceof Set && state.holzOrders.size > 0)
+      ? Array.from(state.holzOrders).sort().join(",")
+      : "0";
     const srcArr = (state.wulffScope === "all_runs" && SAMPLE_PEAKS.length > 0) ? SAMPLE_PEAKS : PEAKS;
     const renderSig = [
       targetW, targetH,
@@ -19591,6 +20650,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.wulffColorMode,
       getColorCrossover().toFixed(3),
       state.showWulffFriedel ? 1 : 0,
+      state.showNodalPoints ? 1 : 0,
+      wulffHolzKey,
       state.peakSource,
       state.peakColorMode,
       state.dMin,
@@ -19598,6 +20659,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       state.lamMax,
       state.showUncertainPeaks ? 1 : 0,
       state.selectedZoneId,
+      state.hoveredZoneId !== null && state.hoveredZoneId !== undefined ? `${{state.hoveredZoneId}}:${{state.hoveredZoneHolzN || 0}}` : "",
+      state.hoveredNodalKey || "",
       zonesKey,
       hovRef,
       selRef,
@@ -19692,12 +20755,15 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }});
     ctx.restore();
 
-    // Draw zone great-circle conics directly from 3D Sample-frame zone axis normal
+    // Draw zone great-circle conics (+ optional HOLZ small circles) directly from 3D Sample-frame zone axis normal
     if (state.showZoneArcs) {{
       ctx.save();
+      const hasWulffHolz = state.holzOrders instanceof Set && state.holzOrders.size > 0;
+      const wHolzOrders = hasWulffHolz ? Array.from(state.holzOrders).filter(n => n > 0).sort((a, b) => a - b) : [];
+      const dCutW = Math.max(0.15, Number(state.dMin) || 0.8);
       ZONES.forEach(zone => {{
         if (!state.activeZones.has(zone.zone_id)) return;
-        const isSel = state.selectedZoneId === zone.zone_id;
+        const isSel = state.selectedZoneId === zone.zone_id || state.hoveredZoneId === zone.zone_id;
         const lw = isSel ? (isExp ? 2.5 : 2.1) : (isExp ? 1.45 : 1.15);
         const tCryst = Array.isArray(zone.axis_crystal_xyz) && zone.axis_crystal_xyz.length === 3
           ? zone.axis_crystal_xyz
@@ -19714,8 +20780,63 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }},
             96, isSel ? 0.92 : 0.72, isSel ? 0.35 : 0.20, zone.rainbow_color, lw, true
           );
+          if (hasWulffHolz && typeof zone.d_direct === "number" && zone.d_direct > 1e-3) {{
+            for (let oi = 0; oi < wHolzOrders.length; oi++) {{
+              const absN = wHolzOrders[oi];
+              const cHolz = (absN * dCutW) / zone.d_direct;
+              if (cHolz >= 0.98) continue;
+              const sHolz = Math.sqrt(Math.max(0.0, 1.0 - cHolz * cHolz));
+              [1, -1].forEach(sgn => {{
+                const cz = sgn * cHolz;
+                strokeSphereCircle(
+                  ang => {{
+                    const ca = Math.cos(ang), sa = Math.sin(ang);
+                    return [
+                      cz * tAxis[0] + sHolz * (ca * e1[0] + sa * e2[0]),
+                      cz * tAxis[1] + sHolz * (ca * e1[1] + sa * e2[1]),
+                      cz * tAxis[2] + sHolz * (ca * e1[2] + sa * e2[2]),
+                    ];
+                  }},
+                  72, isSel ? 0.65 : 0.42, 0.12, zone.rainbow_color, Math.max(0.85, lw * 0.72), true
+                );
+              }});
+            }}
+          }}
         }}
       }});
+      ctx.restore();
+    }}
+
+    // Draw principal {{a*, b*, c*}} nodal poles on the 3D Wulff Sphere when showNodalPoints is enabled
+    if (Boolean(state.showNodalPoints) && typeof getVisibleNodalPoints === "function") {{
+      const wNodals = getVisibleNodalPoints();
+      ctx.save();
+      for (let ni = 0; ni < wNodals.length; ni++) {{
+        const nd = wNodals[ni];
+        if (!nd.isPrincipal || !Array.isArray(nd.gCrystUnit)) continue;
+        const [nsx, nsy, nhemi] = projectToWulff(nd.gCrystUnit, cx, cy, R);
+        const dxN = nsx - cx, dyN = nsy - cy;
+        if (dxN * dxN + dyN * dyN > (rSphere + 6.0) * (rSphere + 6.0)) continue;
+        const isHovN = state.hoveredNodalKey !== null && state.hoveredNodalKey === nd.key;
+        const nr = isExp ? (isHovN ? 7.5 : 6.2) : (isHovN ? 5.8 : 4.8);
+        ctx.globalAlpha = nhemi >= 0 ? 0.96 : 0.36;
+        ctx.beginPath();
+        ctx.arc(nsx, nsy, nr, 0, Math.PI * 2);
+        ctx.strokeStyle = isHovN ? "#ffffff" : "#fbbf24";
+        ctx.lineWidth = isExp ? 1.8 : 1.4;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(nsx, nsy, isExp ? 2.1 : 1.6, 0, Math.PI * 2);
+        ctx.fillStyle = "#fbbf24";
+        ctx.fill();
+        if ((isExp || nhemi >= 0) && nd.principalSymbol) {{
+          ctx.font = isExp ? "bold 9.5px monospace" : "bold 8px monospace";
+          ctx.fillStyle = "#070913";
+          ctx.fillText(nd.principalSymbol, nsx + nr + 3, nsy + 3);
+          ctx.fillStyle = "#fbbf24";
+          ctx.fillText(nd.principalSymbol, nsx + nr + 2, nsy + 2);
+        }}
+      }}
       ctx.restore();
     }}
 
@@ -20064,6 +21185,61 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     return best;
   }}
 
+  function findNearestNodalDetector(mx, my) {{
+    if (!state.showNodalPoints || !Array.isArray(_detNodalScreenHits) || _detNodalScreenHits.length === 0) {{
+      return null;
+    }}
+    let best = null;
+    let bestNormDist = 1e9;
+    for (let i = 0; i < _detNodalScreenHits.length; i++) {{
+      const item = _detNodalScreenHits[i];
+      const d = Math.hypot(mx - item.x, my - item.y);
+      if (d <= item.r + 3.0) {{
+        const score = d - (item.nodal.isPrincipal ? 1.5 : 0.0);
+        if (score < bestNormDist) {{
+          bestNormDist = score;
+          best = {{ nodal: item.nodal, x: item.x, y: item.y, r: item.r, dist: d }};
+        }}
+      }}
+    }}
+    return best;
+  }}
+
+  function findNearestZoneArcDetector(mx, my) {{
+    if (!state.showZoneArcs || !Array.isArray(_detZoneArcScreenSegs) || _detZoneArcScreenSegs.length === 0) {{
+      return null;
+    }}
+    let best = null;
+    let bestDist = 7.5;
+    for (let i = 0; i < _detZoneArcScreenSegs.length; i++) {{
+      const item = _detZoneArcScreenSegs[i];
+      const pts = item.pts;
+      for (let j = 0; j + 1 < pts.length; j++) {{
+        const x1 = pts[j][0], y1 = pts[j][1];
+        const x2 = pts[j + 1][0], y2 = pts[j + 1][1];
+        const minX = Math.min(x1, x2) - bestDist;
+        const maxX = Math.max(x1, x2) + bestDist;
+        if (mx < minX || mx > maxX) continue;
+        const minY = Math.min(y1, y2) - bestDist;
+        const maxY = Math.max(y1, y2) + bestDist;
+        if (my < minY || my > maxY) continue;
+        const vx = x2 - x1, vy = y2 - y1;
+        const len2 = vx * vx + vy * vy;
+        let t = len2 > 1e-6 ? ((mx - x1) * vx + (my - y1) * vy) / len2 : 0.0;
+        if (t < 0.0) t = 0.0;
+        else if (t > 1.0) t = 1.0;
+        const px = x1 + t * vx;
+        const py = y1 + t * vy;
+        const d = Math.hypot(mx - px, my - py);
+        if (d < bestDist) {{
+          bestDist = d;
+          best = {{ zone: item.zone, holzN: item.holzN || 0, lam: item.lam || null, x: px, y: py, dist: d }};
+        }}
+      }}
+    }}
+    return best;
+  }}
+
   function findNearestPeakWulff(mx, my) {{
     let best = null;
     let bestDist = state.wulffExpanded ? 14.0 : 10.0;
@@ -20167,16 +21343,49 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       syncWulffYawFromDetector();
       return;
     }}
-    const hit = findNearestPeakDetector(mx, my);
+    const nodalHit = findNearestNodalDetector(mx, my);
+    let hit = findNearestPeakDetector(mx, my);
+    // When hovering the outer ring of a big nodal circle (away from its center dot), prioritize the nodal badge cleanly
+    if (nodalHit && hit && nodalHit.dist > 6.5) {{
+      hit = null;
+    }}
+    const nextNodalKey = nodalHit ? nodalHit.nodal.key : null;
+    const nodalChanged = nextNodalKey !== state.hoveredNodalKey;
+    state.hoveredNodalKey = nextNodalKey;
+    state.hoveredNodalObj = nodalHit ? nodalHit.nodal : null;
+
     const nextHoverId = hit ? hit.id : null;
     const hoverChanged = hit !== state.hoveredPeakObj;
     state.hoveredPeakId = nextHoverId;
     state.hoveredPeakObj = hit || null;
+
+    if (!hit && !nodalHit) {{
+      const arcHit = findNearestZoneArcDetector(mx, my);
+      const nextZoneId = arcHit ? arcHit.zone.zone_id : null;
+      const nextHolzN = arcHit ? (arcHit.holzN || 0) : 0;
+      const zoneChanged = nextZoneId !== state.hoveredZoneId || nextHolzN !== state.hoveredZoneHolzN;
+      state.hoveredZoneId = nextZoneId;
+      state.hoveredZoneHolzN = nextHolzN;
+      state.hoveredZonePos = arcHit ? [arcHit.x, arcHit.y] : null;
+      if (arcHit && zoneChanged) {{
+        updateZoneInspector(arcHit.zone, nextHolzN);
+      }}
+    }} else {{
+      state.hoveredZoneId = null;
+      state.hoveredZoneHolzN = 0;
+      state.hoveredZonePos = null;
+    }}
+
     if (hit) {{
       state.activeOrbitId = hit.asu_orbit_id || null;
       if (hoverChanged) updatePeakInspector(hit);
-    }} else if (state.selectedPeakId === null) {{
-      state.activeOrbitId = null;
+    }} else {{
+      if (state.selectedPeakId === null) {{
+        state.activeOrbitId = null;
+      }}
+      if (nodalHit && nodalChanged) {{
+        updateNodalInspector(nodalHit.nodal);
+      }}
     }}
   }});
 
@@ -20186,6 +21395,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.targetParallaxY = 0.0;
     state.hoveredPeakId = null;
     state.hoveredPeakObj = null;
+    state.hoveredNodalKey = null;
+    state.hoveredNodalObj = null;
+    state.hoveredZoneId = null;
+    state.hoveredZoneHolzN = 0;
+    state.hoveredZonePos = null;
     if (state.selectedPeakId === null) state.activeOrbitId = null;
   }});
 
@@ -20247,16 +21461,33 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
   detCanvas.addEventListener("click", (ev) => {{
     const rect = detCanvas.getBoundingClientRect();
-    const hit = findNearestPeakDetector(ev.clientX - rect.left, ev.clientY - rect.top);
+    const mx = ev.clientX - rect.left;
+    const my = ev.clientY - rect.top;
+    const nodalHit = findNearestNodalDetector(mx, my);
+    let hit = findNearestPeakDetector(mx, my);
+    if (nodalHit && hit && nodalHit.dist > 6.5) {{
+      hit = null;
+    }}
     if (hit) {{
       state.selectedPeakId = hit.id;
       state.selectedPeakObj = hit;
       state.activeOrbitId = hit.asu_orbit_id || null;
       updatePeakInspector(hit);
+    }} else if (nodalHit) {{
+      state.selectedPeakId = null;
+      state.selectedPeakObj = null;
+      state.activeOrbitId = null;
+      updateNodalInspector(nodalHit.nodal);
     }} else {{
       state.selectedPeakId = null;
       state.selectedPeakObj = null;
       state.activeOrbitId = null;
+      const arcHit = findNearestZoneArcDetector(mx, my);
+      if (arcHit) {{
+        state.selectedZoneId = arcHit.zone.zone_id;
+        renderZoneList();
+        updateZoneInspector(arcHit.zone, arcHit.holzN || 0);
+      }}
     }}
   }});
 
@@ -20718,11 +21949,68 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (b) b.addEventListener("click", () => setMaxZoneOrder(ordLevel));
   }});
 
+  function syncNodalAndHolzButtons() {{
+    const btnNodal = document.getElementById("btn-nodal-points");
+    if (btnNodal) {{
+      btnNodal.classList.toggle("active-btn", Boolean(state.showNodalPoints));
+    }}
+    [1, 2].forEach(nOrd => {{
+      const bh = document.getElementById(`btn-holz-${{nOrd}}`);
+      if (bh) {{
+        bh.classList.toggle("active-btn", Boolean(state.holzOrders instanceof Set && state.holzOrders.has(nOrd)));
+      }}
+    }});
+  }}
+
+  const btnNodalPoints = document.getElementById("btn-nodal-points");
+  if (btnNodalPoints) {{
+    btnNodalPoints.addEventListener("click", () => {{
+      state.showNodalPoints = !state.showNodalPoints;
+      if (!state.showNodalPoints) {{
+        state.hoveredNodalKey = null;
+        state.hoveredNodalObj = null;
+      }}
+      syncNodalAndHolzButtons();
+      renderDetector();
+      renderStereoInset(true);
+    }});
+  }}
+
+  [1, 2].forEach(nOrd => {{
+    const btnHolz = document.getElementById(`btn-holz-${{nOrd}}`);
+    if (btnHolz) {{
+      btnHolz.addEventListener("click", () => {{
+        if (!(state.holzOrders instanceof Set)) state.holzOrders = new Set();
+        if (state.holzOrders.has(nOrd)) {{
+          state.holzOrders.delete(nOrd);
+        }} else {{
+          state.holzOrders.add(nOrd);
+          if (!state.showZoneArcs) {{
+            state.showZoneArcs = true;
+            const bArc = document.getElementById("btn-zone-arcs");
+            if (bArc) bArc.classList.add("active-btn");
+          }}
+        }}
+        syncNodalAndHolzButtons();
+        updateHUD();
+        renderDetector();
+        renderStereoInset(true);
+      }});
+    }}
+  }});
+
   document.getElementById("btn-zone-arcs").addEventListener("click", (ev) => {{
     state.showZoneArcs = !state.showZoneArcs;
+    if (!state.showZoneArcs) {{
+      state.hoveredZoneId = null;
+      state.hoveredZoneHolzN = 0;
+      state.hoveredZonePos = null;
+    }}
     ev.currentTarget.classList.toggle("active-btn", state.showZoneArcs);
     ev.currentTarget.textContent = "Arcs";
     syncTopBarTooltips(null);
+    renderDetector();
+    renderStereoInset(true);
   }});
 
   const btnPixelMask = document.getElementById("btn-pixel-mask");
@@ -21024,18 +22312,32 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     state.selectedPeakObj = null;
     state.hoveredPeakId = null;
     state.hoveredPeakObj = null;
+    state.hoveredNodalKey = null;
+    state.hoveredNodalObj = null;
+    state.hoveredZoneId = null;
+    state.hoveredZoneHolzN = 0;
+    state.hoveredZonePos = null;
     state.activeOrbitId = null;
+    state.showNodalPoints = true;
+    state.holzOrders = new Set();
+    syncNodalAndHolzButtons();
     setMaxZoneOrder(1);
   }});
 
   applyPeakSource(state.peakSource, false);
   syncWulffYawFromDetector();
   syncWulffUI();
+  syncNodalAndHolzButtons();
 
   document.getElementById("btn-zones-none").addEventListener("click", () => {{
     state.activeZones = new Set();
+    state.hoveredZoneId = null;
+    state.hoveredZoneHolzN = 0;
+    state.hoveredZonePos = null;
     renderZoneList();
     updateHUD();
+    renderDetector();
+    renderStereoInset(true);
   }});
 
   document.getElementById("btn-ladder-prev").addEventListener("click", () => {{
@@ -22249,6 +23551,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         if (curCyl.length > 1) {{ detSegs.push(curCyl); detSegsSph.push(curSph); }}
         zonesOut.push({{
           zone_id: zi, uvw: z.uvw, order: z.order, label: `[${{z.uvw[0]}} ${{z.uvw[1]}} ${{z.uvw[2]}}]`,
+          d_direct: Number(vecNorm(mat3Vec(mat3T(A_real), z.uvw)).toFixed(4)),
           axis_xyz: z.tLab, axis_crystal_xyz: mat3Vec(R_T, z.tLab),
           n_peaks: z.n_peaks, angular_rms_deg: 0.02, rainbow_color: ZONE_COLORS[zi % ZONE_COLORS.length],
           detector_segments: detSegs, detector_segments_sph: detSegsSph, stereo_segments: stereoSegs,

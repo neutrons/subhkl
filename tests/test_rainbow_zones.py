@@ -11191,3 +11191,494 @@ setTimeout(() => {{
         assert js_out["peaksRows"] == [132.0, 144.0]
         assert js_out["hasMergeMetrics"] is True
         assert js_out["hasPixelMaskBits"] is True
+
+
+def test_nodal_points_gap_bridge_zone_arc_hover_and_holz(tmp_path) -> None:
+    """Verify {a*, b*, c*} + intersection nodal bull's-eyes, inter-panel gap overlap & hover badge, [uvw] arc hover badge, and ±1/±2 HOLZ."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import h5py
+    from scipy.spatial.transform import Rotation
+
+    from subhkl.instrument.detector import Detector
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    assert shutil.which("node"), "Node.js required for nodal/HOLZ behavioral test"
+
+    # Align cubic [111] along +Z so (-1,0,0), (0,-1,0), (0,0,-1) all scatter into forward 2theta = 70.53 deg,
+    # 120 deg apart around the beam:
+    # - Bank 1 & Bank 2 straddle a* with a 5-deg azimuthal gap right across a* (onPanel == False!)
+    # - Bank 3 covers b* directly (onPanel == True)
+    # - Bank 4 covers c* directly (onPanel == True)
+    v_from = np.array([1.0, 1.0, 1.0], dtype=float) / np.sqrt(3.0)
+    v_to = np.array([0.0, 0.0, 1.0], dtype=float)
+    rot_axis = np.cross(v_from, v_to)
+    rot_axis /= np.linalg.norm(rot_axis)
+    rot_ang = float(np.arccos(np.clip(np.dot(v_from, v_to), -1.0, 1.0)))
+    u_mat = Rotation.from_rotvec(rot_axis * rot_ang).as_matrix()
+    a_cell = 12.0
+    b_mat = np.eye(3, dtype=float) / a_cell
+    ub_mat = u_mat @ b_mat
+    ki = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    def _kf_for_hkl(hkl_vec: list[int]) -> np.ndarray:
+        g = ub_mat @ np.asarray(hkl_vec, dtype=float)
+        gh = g / np.linalg.norm(g)
+        if np.dot(ki, gh) > 0:
+            gh = -gh
+        sth = -float(np.dot(ki, gh))
+        kf = ki + 2.0 * sth * gh
+        return kf / np.linalg.norm(kf)
+
+    kf_a = _kf_for_hkl([1, 0, 0])
+    kf_b = _kf_for_hkl([0, 1, 0])
+    kf_c = _kf_for_hkl([0, 0, 1])
+
+    def _make_flat_bank_at_dir(
+        kf_dir: np.ndarray, az_offset_deg: float, width_m: float, height_m: float
+    ) -> dict[str, object]:
+        rot_y = Rotation.from_euler("y", az_offset_deg, degrees=True).as_matrix()
+        d_center = (rot_y @ kf_dir) * 0.45
+        n_hat = -d_center / np.linalg.norm(d_center)
+        up = np.array([0.0, 1.0, 0.0], dtype=float)
+        u_hat = np.cross(up, n_hat)
+        u_hat /= np.linalg.norm(u_hat)
+        v_hat = np.cross(n_hat, u_hat)
+        v_hat /= np.linalg.norm(v_hat)
+        corner00 = d_center - 0.5 * width_m * u_hat - 0.5 * height_m * v_hat
+        return {
+            "panel": "flat",
+            "panel_type": "flat",
+            "center": corner00.tolist(),
+            "uhat": u_hat.tolist(),
+            "vhat": v_hat.tolist(),
+            "width": float(width_m),
+            "height": float(height_m),
+            "m": 128,
+            "n": 128,
+        }
+
+    kf_bc = _kf_for_hkl([0, 1, 1])
+    # Bank 1 & Bank 2 sit +/-13 deg around kf_a with angular half-width ~10.1 deg -> ~5.8 deg gap containing kf_a!
+    # Bank 5 sits on (0,1,1) = [1,0,0] x [0,1,-1] so a secondary zone-intersection hub is also on-panel at order <= 1.
+    bank_cfgs = {
+        1: _make_flat_bank_at_dir(kf_a, -13.0, 0.16, 0.22),
+        2: _make_flat_bank_at_dir(kf_a, +13.0, 0.16, 0.22),
+        3: _make_flat_bank_at_dir(kf_b, 0.0, 0.22, 0.22),
+        4: _make_flat_bank_at_dir(kf_c, 0.0, 0.22, 0.22),
+        5: _make_flat_bank_at_dir(kf_bc, 0.0, 0.22, 0.22),
+    }
+    det_objs = {bid: Detector(dict(cfg)) for bid, cfg in bank_cfgs.items()}
+    # Confirm kf_a misses every bank while kf_b hits bank 3 and kf_c hits bank 4
+    for bid, det in det_objs.items():
+        hm_a, _, _ = det.reflections_mask(
+            np.array([kf_a[0]]), np.array([kf_a[1]]), np.array([kf_a[2]])
+        )
+        assert not bool(hm_a[0]), f"Expected a* ray to lie in gap outside bank {bid}"
+    assert bool(
+        det_objs[3].reflections_mask(
+            np.array([kf_b[0]]), np.array([kf_b[1]]), np.array([kf_b[2]])
+        )[0][0]
+    )
+    assert bool(
+        det_objs[4].reflections_mask(
+            np.array([kf_c[0]]), np.array([kf_c[1]]), np.array([kf_c[2]])
+        )[0][0]
+    )
+
+    solve_h5 = tmp_path / "nodal_holz_solve.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "MANDI"
+        hf.create_group("beam").create_dataset("ki_vec", data=ki)
+        smp = hf.create_group("sample")
+        smp.create_dataset("space_group", data=b"P 1")
+        smp.create_dataset(
+            "cell", data=np.array([a_cell, a_cell, a_cell, 90.0, 90.0, 90.0])
+        )
+        smp.create_dataset("U", data=u_mat)
+        smp.create_dataset("B", data=b_mat)
+        hf.create_group("instrument").create_dataset(
+            "wavelength", data=np.array([1.2, 3.2], dtype=float)
+        )
+        dc_root = hf.create_group("detector_calibration")
+        for bid, cfg in bank_cfgs.items():
+            g = dc_root.create_group(f"bank_{bid}")
+            g.create_dataset("panel_type", data=b"flat")
+            g.create_dataset("center", data=np.array(cfg["center"], dtype=float))
+            g.create_dataset("uhat", data=np.array(cfg["uhat"], dtype=float))
+            g.create_dataset("vhat", data=np.array(cfg["vhat"], dtype=float))
+            g.create_dataset("width", data=float(cfg["width"]))
+            g.create_dataset("height", data=float(cfg["height"]))
+            g.create_dataset("m", data=int(cfg["m"]))
+            g.create_dataset("n", data=int(cfg["n"]))
+
+    payload = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        instrument="MANDI",
+        d_min=1.5,
+        wavelength_range=(1.2, 3.2),
+        include_panel_images=False,
+    )
+    # Restrict detector_configs & panels strictly to our 4 custom banks so Bank 1/2 gap around a* is preserved
+    payload["detector_configs"] = {
+        str(bid): bank_cfgs[bid] for bid in sorted(bank_cfgs)
+    }
+    payload["panels"] = [pn for pn in payload["panels"] if int(pn["bank"]) in bank_cfgs]
+    if len(payload["panels"]) < len(bank_cfgs):
+        # Populate 2D panel envelopes from the 4 custom Detector objects
+        panels_custom = []
+        for bid, det in sorted(det_objs.items()):
+            corners_cyl = []
+            corners_sph = []
+            for rc, cc in [(0, 0), (127, 0), (127, 127), (0, 127)]:
+                pt = np.asarray(det.pixel_to_lab(rc, cc), dtype=float).reshape(3)
+                az = float(np.degrees(np.arctan2(pt[0], pt[2])))
+                r3 = float(np.linalg.norm(pt))
+                el = float(np.degrees(np.arcsin(np.clip(pt[1] / r3, -1.0, 1.0))))
+                corners_cyl.append([az, float(pt[1])])
+                corners_sph.append([az, el])
+            azs = [c[0] for c in corners_cyl]
+            ys = [c[1] for c in corners_cyl]
+            els_v = [c[1] for c in corners_sph]
+            panels_custom.append(
+                {
+                    "id": bid,
+                    "bank": bid,
+                    "name": f"Bank {bid}",
+                    "n_rows": 128,
+                    "n_cols": 128,
+                    "az_min": min(azs),
+                    "az_max": max(azs),
+                    "y_min": min(ys),
+                    "y_max": max(ys),
+                    "el_min": min(els_v),
+                    "el_max": max(els_v),
+                    "corners": corners_cyl,
+                    "corners_sph": corners_sph,
+                }
+            )
+        payload["panels"] = panels_custom
+
+    html_doc = render_rainbow_html(payload)
+    assert 'id="btn-nodal-points"' in html_doc
+    assert 'id="btn-holz-1"' in html_doc
+    assert 'id="btn-holz-2"' in html_doc
+    script = re.findall(r"<script>([\s\S]*?)</script>", html_doc)[-1]
+    script_open = script[: script.rfind("})();")]
+
+    js_file = tmp_path / "nodal_holz_check.js"
+    js_file.write_text(
+        """
+const elems = new Map();
+const ctxLogs = new Map();
+let rafCb = null;
+function makeCtx(id = "") {
+  const log = { strokes: [], texts: [], arcs: [], fills: [] };
+  if (id) ctxLogs.set(id, log);
+  const ctx = {
+    fillStyle: "", strokeStyle: "", lineWidth: 1, font: "", textAlign: "left",
+    textBaseline: "alphabetic", globalAlpha: 1, imageSmoothingEnabled: true,
+    setTransform() {}, resetTransform() {}, scale() {}, translate() {}, rotate() {},
+    transform() {}, clearRect() {}, fillRect() {},
+    strokeRect() { log.strokes.push(String(ctx.strokeStyle)); },
+    beginPath() {}, closePath() {}, moveTo() {}, lineTo() {},
+    arc(x, y, r) { log.arcs.push([x, y, r]); },
+    ellipse() {},
+    quadraticCurveTo() {}, bezierCurveTo() {}, rect() {}, roundRect() {},
+    stroke() { log.strokes.push(String(ctx.strokeStyle)); },
+    fill() { log.fills.push(String(ctx.fillStyle)); },
+    clip() {}, save() {}, restore() {}, setLineDash() {},
+    fillText(t) { log.texts.push(String(t)); },
+    strokeText() {}, drawImage() {},
+    measureText(t) { return { width: String(t).length * 6 }; },
+    createLinearGradient() { return { addColorStop() {} }; },
+    createRadialGradient() { return { addColorStop() {} }; },
+    getImageData(x, y, w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+    putImageData() {}, createImageData(w, h) { return { data: new Uint8ClampedArray(Math.max(4, w * h * 4)) }; },
+  };
+  return ctx;
+}
+function makeEl(id = "") {
+  const listeners = {};
+  const styleProps = {};
+  const isDetCanvas = id === "canvas-detector";
+  const cw = isDetCanvas ? 900 : 300;
+  const ch = isDetCanvas ? 540 : 240;
+  const el = {
+    id, tagName: id.startsWith("sel-") ? "SELECT" : "DIV",
+    value: id === "slider-color-emphasis" ? "0.38" : "",
+    min: "0.05", max: "0.95", step: "0.01",
+    checked: false, disabled: false, textContent: "", innerHTML: "", title: "",
+    width: cw, height: ch, clientWidth: cw, clientHeight: ch,
+    scrollWidth: cw, scrollHeight: ch, scrollTop: 0, offsetWidth: cw, offsetHeight: 36,
+    files: [], options: [], children: [], parentElement: null,
+    dataset: {},
+    style: new Proxy(styleProps, {
+      get(t, k) {
+        if (k === "setProperty") return (p, v) => { t[p] = v; };
+        if (k === "getPropertyValue") return (p) => t[p] || "";
+        return t[k] ?? "";
+      },
+      set(t, k, v) { t[k] = v; return true; }
+    }),
+    classList: {
+      _s: new Set(),
+      add(...c) { c.forEach(x => this._s.add(x)); },
+      remove(...c) { c.forEach(x => this._s.delete(x)); },
+      toggle(c, f) { if (f === undefined ? !this._s.has(c) : f) { this._s.add(c); return true; } this._s.delete(c); return false; },
+      contains(c) { return this._s.has(c); }
+    },
+    addEventListener(ev, fn) { (listeners[ev] = listeners[ev] || []).push(fn); },
+    removeEventListener() {},
+    dispatchEvent(evObj) {
+      const arr = listeners[evObj.type] || [];
+      arr.forEach(fn => fn.call(el, evObj));
+    },
+    click() { el.dispatchEvent({ type: "click", target: el, currentTarget: el, preventDefault() {}, stopPropagation() {} }); },
+    focus() {}, blur() {}, select() {}, remove() {},
+    appendChild(chEl) { this.children.push(chEl); chEl.parentElement = this; return chEl; },
+    insertBefore(chEl) { this.children.push(chEl); chEl.parentElement = this; return chEl; },
+    replaceChildren(...chEls) { this.children = chEls; },
+    setAttribute(k, v) { this[k] = v; },
+    getAttribute(k) { return this[k] ?? null; },
+    removeAttribute(k) { delete this[k]; },
+    getBoundingClientRect() { return { left: 0, top: 0, right: cw, bottom: ch, width: cw, height: ch }; },
+    getContext() { if (!el._ctx) el._ctx = makeCtx(id); return el._ctx; },
+    querySelector() { return makeEl(); },
+    querySelectorAll() { return []; },
+    closest() { return null; },
+  };
+  return el;
+}
+function getEl(id) {
+  if (!elems.has(id)) elems.set(id, makeEl(id));
+  return elems.get(id);
+}
+globalThis.window = globalThis;
+globalThis.self = globalThis;
+globalThis.parent = globalThis;
+globalThis.top = globalThis;
+globalThis.addEventListener = () => {};
+globalThis.removeEventListener = () => {};
+globalThis.devicePixelRatio = 1;
+globalThis.innerWidth = 1280;
+globalThis.innerHeight = 800;
+globalThis.localStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+globalThis.location = { href: "about:srcdoc", origin: "http://localhost:8080", pathname: "/", search: "" };
+globalThis.navigator = { clipboard: { writeText: async () => {} } };
+globalThis.Image = class { set src(v) { this._src = v; } };
+globalThis.ResizeObserver = class { observe() {} disconnect() {} };
+globalThis.MutationObserver = class { observe() {} disconnect() {} };
+globalThis.AbortController = class { constructor() { this.signal = {}; } abort() {} };
+globalThis.requestAnimationFrame = (fn) => { rafCb = fn; return 1; };
+globalThis.cancelAnimationFrame = () => {};
+globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => "" });
+globalThis.document = {
+  body: makeEl("body"),
+  documentElement: makeEl("html"),
+  activeElement: null,
+  getElementById(id) { return getEl(id); },
+  createElement(tag) { return makeEl(tag); },
+  querySelector(sel) { return sel.startsWith("#") ? getEl(sel.slice(1)) : makeEl(sel); },
+  querySelectorAll() { return []; },
+  addEventListener() {},
+  removeEventListener() {},
+};
+"""
+        + script_open
+        + """
+const detCanvasEl = getEl("canvas-detector");
+detCanvasEl.getContext("2d");
+const detLog = ctxLogs.get("canvas-detector");
+
+// 1. Even when NONE is clicked (activeZones empty), {a*, b*, c*} principal nodal points MUST be visible & labeled!
+getEl("btn-zones-none").click();
+detLog.texts.length = 0;
+renderDetectorCanvas(true);
+const nodalsWhenNone = getVisibleNodalPoints();
+const principalSymsWhenNone = nodalsWhenNone.filter(n => n.isPrincipal).map(n => n.principalSymbol).sort();
+const canvasLabelsWhenNone = ["a*", "b*", "c*"].every(lbl => detLog.texts.includes(lbl));
+
+// Verify a* lies in the inter-panel gap (onPanel === false), while b* and c* lie on panels (onPanel === true)
+const nodalA = nodalsWhenNone.find(n => n.principalSymbol === "a*");
+const nodalB = nodalsWhenNone.find(n => n.principalSymbol === "b*");
+const nodalC = nodalsWhenNone.find(n => n.principalSymbol === "c*");
+
+// Check screen-space circle radius of gap-straddling a*: must exceed pixel distance to nearest panel edge so it overlaps the panel!
+const hitRecA = _detNodalScreenHits.find(h => h.nodal.principalSymbol === "a*" && h.x >= 0 && h.x <= 900);
+const [edgeAx, edgeAy] = detToScreen(nodalA.nearAz, state.projection === "spherical" ? nodalA.nearEl : nodalA.nearY, 900, 540, 0.45);
+const distCenterToPanelPx = Math.hypot(hitRecA.x - edgeAx, hitRecA.y - edgeAy);
+const panelOverlapPx = hitRecA.r - distCenterToPanelPx;
+
+// Hover ON THE ADJACENT PANEL inside the overlapping rim of a* (3 px past the panel boundary onto the panel!)
+const dirToEdgeX = (edgeAx - hitRecA.x) / Math.max(1e-6, distCenterToPanelPx);
+const dirToEdgeY = (edgeAy - hitRecA.y) / Math.max(1e-6, distCenterToPanelPx);
+const hoverOnPanelX = edgeAx + dirToEdgeX * 2.5;
+const hoverOnPanelY = edgeAy + dirToEdgeY * 2.5;
+detCanvasEl.dispatchEvent({ type: "mousemove", clientX: hoverOnPanelX, clientY: hoverOnPanelY, buttons: 0 });
+detLog.texts.length = 0;
+renderDetectorCanvas(true);
+const gapHoverBadgeTexts = [...detLog.texts];
+const gapInspectorHtml = getEl("inspector-box").innerHTML;
+
+// 2. Re-enable <=1 Laue zones: secondary zone intersections appear, and hovering a [uvw] zone arc shows the zone badge!
+detCanvasEl.dispatchEvent({ type: "mouseleave" });
+setMaxZoneOrder(1);
+renderDetectorCanvas(true);
+const nodalsOrder1 = getVisibleNodalPoints();
+const secondaryCountOrder1 = nodalsOrder1.filter(n => !n.isPrincipal).length;
+
+// Pick a rendered zone-arc segment midpoint well away from peaks and nodal points
+let chosenArcPt = null;
+let chosenArcLabel = null;
+for (const seg of _detZoneArcScreenSegs) {
+  for (let i = 0; i + 1 < seg.pts.length; i++) {
+    const mx = 0.5 * (seg.pts[i][0] + seg.pts[i + 1][0]);
+    const my = 0.5 * (seg.pts[i][1] + seg.pts[i + 1][1]);
+    if (mx < 30 || mx > 870 || my < 30 || my > 510) continue;
+    if (!findNearestPeakDetector(mx, my) && !findNearestNodalDetector(mx, my)) {
+      chosenArcPt = [mx, my];
+      chosenArcLabel = seg.zone.label;
+      break;
+    }
+  }
+  if (chosenArcPt) break;
+}
+let zoneArcBadgeTexts = [];
+let zoneArcInspectorHtml = "";
+if (chosenArcPt) {
+  detCanvasEl.dispatchEvent({ type: "mousemove", clientX: chosenArcPt[0], clientY: chosenArcPt[1], buttons: 0 });
+  detLog.texts.length = 0;
+  renderDetectorCanvas(true);
+  zoneArcBadgeTexts = [...detLog.texts];
+  zoneArcInspectorHtml = getEl("inspector-box").innerHTML;
+}
+
+// 3. Toggle ±1 and ±2 Higher-Order Laue Zones (#btn-holz-1, #btn-holz-2):
+//    verify small-circle cone equation kf·t_lab == ki·t_lab + N*lam/d_direct and reflection capture!
+detCanvasEl.dispatchEvent({ type: "mouseleave" });
+getEl("btn-holz-1").click();
+getEl("btn-holz-2").click();
+const holzBtn1Active = getEl("btn-holz-1").classList.contains("active-btn");
+const holzBtn2Active = getEl("btn-holz-2").classList.contains("active-btn");
+const holzSegs = getHolzSegmentsForActiveZones();
+const holzOrdersSeen = Array.from(new Set(holzSegs.map(h => Math.abs(h.holzN)))).sort();
+
+// Verify exact Ewald small-circle kinematics on a sampled HOLZ point via inverse ray direction
+const sampleZone = ZONES.find(z => state.activeZones.has(z.zone_id));
+const synthHolzPeak1 = { hkl: [1, 0, 0], zone_ids: [] }; // for uvw=[1,0,0] or [1,1,0], |h·u| in {1, 2}
+// Keep only one known active zone [1, 0, 0] to test exact N=1 and N=2 capture vs N=3 rejection
+const z100 = ZONES.find(z => Array.isArray(z.uvw) && z.uvw[0] === 1 && z.uvw[1] === 0 && z.uvw[2] === 0) || ZONES[0];
+state.activeZones = new Set([z100.zone_id]);
+const u0 = z100.uvw;
+// Construct HKLs with h·u = 1, 2, 3 (since u0 has a +/-1 entry)
+const idxOne = u0.findIndex(v => Math.abs(v) === 1);
+function makeLayerPeak(nVal) {
+  const hkl = [0, 0, 0];
+  hkl[idxOne] = nVal * Math.sign(u0[idxOne]);
+  return { hkl, zone_ids: [] };
+}
+const capN1 = isPeakCapturedByActiveZone(makeLayerPeak(1));
+const capN2 = isPeakCapturedByActiveZone(makeLayerPeak(2));
+const capN3 = isPeakCapturedByActiveZone(makeLayerPeak(3));
+
+// Hover a HOLZ segment (with order-1 zones active) and verify floating badge reports HOLZ N=
+setMaxZoneOrder(1);
+renderDetectorCanvas(true);
+let holzHoverTexts = [];
+let hPt = null;
+for (const seg of _detZoneArcScreenSegs) {
+  if (!seg.holzN || seg.pts.length < 2) continue;
+  for (let i = 0; i + 1 < seg.pts.length; i++) {
+    const mx = 0.5 * (seg.pts[i][0] + seg.pts[i + 1][0]);
+    const my = 0.5 * (seg.pts[i][1] + seg.pts[i + 1][1]);
+    if (
+      mx >= 20 && mx <= 880 && my >= 20 && my <= 520 &&
+      !findNearestPeakDetector(mx, my) &&
+      !findNearestNodalDetector(mx, my)
+    ) {
+      const zHit = findNearestZoneArcDetector(mx, my);
+      if (zHit && zHit.holzN !== 0) {
+        hPt = [mx, my];
+        break;
+      }
+    }
+  }
+  if (hPt) break;
+}
+if (hPt) {
+  detCanvasEl.dispatchEvent({ type: "mousemove", clientX: hPt[0], clientY: hPt[1], buttons: 0 });
+  detLog.texts.length = 0;
+  renderDetectorCanvas(true);
+  holzHoverTexts = [...detLog.texts];
+}
+
+// Toggle #btn-nodal-points off -> nodals hidden
+getEl("btn-nodal-points").click();
+const nodalsWhenOff = getVisibleNodalPoints().length;
+
+console.log(JSON.stringify({
+  principalSymsWhenNone,
+  canvasLabelsWhenNone,
+  aOnPanel: nodalA ? nodalA.onPanel : null,
+  bOnPanel: nodalB ? nodalB.onPanel : null,
+  cOnPanel: nodalC ? nodalC.onPanel : null,
+  distCenterToPanelPx,
+  nodalARadiusPx: hitRecA ? hitRecA.r : 0,
+  panelOverlapPx,
+  gapHoverHasBadge: gapHoverBadgeTexts.some(t => t.includes("Nodal a*") && t.includes("[gap]")),
+  gapInspectorHasAStar: gapInspectorHtml.includes("a*") && gapInspectorHtml.includes("Inter-panel gap"),
+  secondaryCountOrder1,
+  chosenArcLabel,
+  zoneArcHasBadge: Boolean(chosenArcLabel && zoneArcBadgeTexts.some(t => t.includes(`Zone ${chosenArcLabel}`))),
+  zoneArcInspectorHasLabel: Boolean(chosenArcLabel && zoneArcInspectorHtml.includes(`Zone ${chosenArcLabel}`)),
+  holzBtn1Active,
+  holzBtn2Active,
+  holzSegCount: holzSegs.length,
+  holzOrdersSeen,
+  capN1,
+  capN2,
+  capN3,
+  holzHoverHasBadge: holzHoverTexts.some(t => t.includes("HOLZ N=")),
+  nodalsWhenOff,
+}));
+})();
+process.exit(0);
+""",
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+
+    assert out["principalSymsWhenNone"] == ["a*", "b*", "c*"]
+    assert out["canvasLabelsWhenNone"] is True
+    assert out["aOnPanel"] is False
+    assert out["bOnPanel"] is True
+    assert out["cOnPanel"] is True
+    assert out["distCenterToPanelPx"] > 2.0
+    assert out["panelOverlapPx"] >= 6.0
+    assert out["gapHoverHasBadge"] is True
+    assert out["gapInspectorHasAStar"] is True
+    assert out["secondaryCountOrder1"] >= 1
+    assert out["zoneArcHasBadge"] is True
+    assert out["zoneArcInspectorHasLabel"] is True
+    assert out["holzBtn1Active"] is True
+    assert out["holzBtn2Active"] is True
+    assert out["holzSegCount"] >= 2
+    assert out["holzOrdersSeen"] == [1, 2]
+    assert out["capN1"] is True
+    assert out["capN2"] is True
+    assert out["capN3"] is False
+    assert out["holzHoverHasBadge"] is True
+    assert out["nodalsWhenOff"] == 0
