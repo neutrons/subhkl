@@ -10150,11 +10150,20 @@ def render_rainbow_html(
     flex-wrap: wrap;
   }}
 
+  #stereo-title {{
+    flex: 1 1 88px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+
   .stereo-toolbar {{
     display: flex;
     align-items: center;
     gap: 3px;
     flex-wrap: wrap;
+    flex: 0 0 auto;
   }}
 
   .stereo-toolbar button, .stereo-toolbar select {{
@@ -10166,6 +10175,24 @@ def render_rainbow_html(
     border: 1px solid var(--border-color);
     font-family: var(--font-display);
     cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }}
+
+  #btn-wulff-scope {{
+    flex: 0 0 54px;
+    width: 54px;
+    min-width: 54px;
+    padding-left: 0;
+    padding-right: 0;
+    text-align: center;
+  }}
+
+  #sel-wulff-color {{
+    width: 96px;
+    max-width: 96px;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }}
 
   .stereo-merge-bar {{
@@ -10934,9 +10961,41 @@ def render_rainbow_html(
   }}
 
   .seg-toggle button[data-peak-src="integrated"].active-btn {{
-    background: rgba(163, 242, 44, 0.20);
-    color: #bef264;
-    text-shadow: 0 0 6px rgba(163, 242, 44, 0.38);
+    background: var(--integ-btn-bg, rgba(251, 140, 36, 0.24));
+    color: var(--integ-btn-fg, #fde68a);
+    text-shadow: 0 0 6px var(--integ-btn-glow, rgba(251, 140, 36, 0.45));
+  }}
+
+  .editable-slider-val {{
+    cursor: pointer;
+    border-bottom: 1px dashed rgba(0, 229, 255, 0.45);
+    border-radius: 2px;
+    padding: 0 1px;
+    transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
+  }}
+
+  .editable-slider-val:hover,
+  .editable-slider-val:focus-visible {{
+    color: var(--accent-cyan);
+    background: rgba(0, 229, 255, 0.12);
+    border-bottom-color: var(--accent-cyan);
+    outline: none;
+  }}
+
+  .inline-slider-input {{
+    width: 4.4ch;
+    padding: 0 2px;
+    margin: 0;
+    font-family: var(--font-mono, monospace);
+    font-size: inherit;
+    line-height: 1.15;
+    color: var(--accent-cyan);
+    background: rgba(7, 11, 24, 0.96);
+    border: 1px solid var(--accent-cyan);
+    border-radius: 3px;
+    text-align: right;
+    outline: none;
+    box-shadow: 0 0 6px rgba(0, 229, 255, 0.32);
   }}
 
   /* Photoshop-checkerboard + live active-colorscale gradient slider with crossover knob */
@@ -10949,7 +11008,7 @@ def render_rainbow_html(
     border: 1px solid rgba(148, 163, 184, 0.48);
     background-color: #cbd5e1;
     background-image:
-      var(--cs-gradient, linear-gradient(90deg, rgba(252, 238, 184, 0) 0%, rgba(250, 204, 21, 0.5) 38%, rgba(163, 242, 44, 1) 100%)),
+      var(--cs-gradient, linear-gradient(90deg, rgba(20, 184, 166, 0.90) 0%, rgba(162, 220, 178, 0.85) 36%, rgba(254, 232, 170, 0.90) 50%, rgba(251, 140, 36, 0.98) 78%, rgba(232, 56, 24, 1) 100%)),
       repeating-conic-gradient(#64748b 0% 25%, #cbd5e1 0% 50%);
     background-size: 100% 100%, 8px 8px;
     background-position: 0 0, 0 0;
@@ -11237,7 +11296,7 @@ def render_rainbow_html(
 
           <div class="slider-row">
             <span>Wavelength λ [Å]</span>
-            <span id="wl-readout">[{init_wl_min:.2f}, {init_wl_max:.2f}] Å</span>
+            <span id="wl-readout" title="Click λ_min or λ_max to enter an exact wavelength [Å]">[<span id="wl-val-min" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact λ_min [Å]">{init_wl_min:.2f}</span>, <span id="wl-val-max" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact λ_max [Å]">{init_wl_max:.2f}</span>] Å</span>
           </div>
           <div class="wl-interval-slider" id="wl-interval-slider" title="Active wavelength interval [λ_min, λ_max] in Å — drag [ and ] brackets (double-click to reset)">
             <input type="range" id="slider-wl-min" class="sr-only-range" min="{init_wl_dom_min:.2f}" max="{init_wl_dom_max:.2f}" step="0.05" value="{init_wl_min:.2f}" aria-label="Minimum wavelength λ_min [Å]" />
@@ -11250,7 +11309,7 @@ def render_rainbow_html(
 
           <div class="slider-row">
             <span>Resolution Cutoff d_min [Å]</span>
-            <span id="lbl-dmin-val">{init_dmin:.2f} Å</span>
+            <span id="lbl-dmin-val" class="editable-slider-val" tabindex="0" role="button" title="Click to enter exact resolution cutoff d_min [Å]">{init_dmin:.2f} Å</span>
           </div>
           <input type="range" id="slider-dmin" min="0.50" max="5.00" step="0.01" value="{init_dmin:.2f}" title="High-resolution cutoff d_min [Å]" />
 
@@ -14454,7 +14513,19 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     DATA.wavelength_range = [lo, hi];
     const wlReadEl = document.getElementById("wl-readout");
     if (wlReadEl) {{
-      wlReadEl.textContent = `[${{lo.toFixed(2)}}, ${{hi.toFixed(2)}}] Å`;
+      const hasActiveInp = typeof wlReadEl.querySelector === "function" && wlReadEl.querySelector("input.inline-slider-input");
+      if (!hasActiveInp) {{
+        const minSpan = document.getElementById("wl-val-min");
+        const maxSpan = document.getElementById("wl-val-max");
+        if (minSpan && maxSpan) {{
+          minSpan.textContent = lo.toFixed(2);
+          maxSpan.textContent = hi.toFixed(2);
+          minSpan.title = `λ_min = ${{lo.toFixed(2)}} Å — click to enter exact value`;
+          maxSpan.title = `λ_max = ${{hi.toFixed(2)}} Å — click to enter exact value`;
+        }} else {{
+          wlReadEl.textContent = `[${{lo.toFixed(2)}}, ${{hi.toFixed(2)}}] Å`;
+        }}
+      }}
     }}
     if (slWlMin) {{
       slWlMin.min = domMin.toFixed(2);
@@ -14507,7 +14578,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function syncDminControls(nextDmin, sourceEl = null) {{
     const dFloor = getDynamicDminFloor();
     const rawVal = Number(nextDmin);
-    const clampedVal = Math.max(dFloor, Math.min(10.0, Number.isFinite(rawVal) && rawVal > 0 ? rawVal : dFloor));
+    const clampedVal = Math.max(dFloor, Math.min(25.0, Number.isFinite(rawVal) && rawVal > 0 ? rawVal : dFloor));
     const v = Math.max(dFloor, Math.round(clampedVal * 100) / 100);
     const clampedAtFloor = Number.isFinite(rawVal) && rawVal > 0 && rawVal <= dFloor + 1e-4;
     state.dMin = v;
@@ -14518,10 +14589,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const lblD = document.getElementById("lbl-dmin-val");
     const kinFloor = 0.5 * Math.max(0.05, Number(state.lamMin) || 2.0);
     if (lblD) {{
-      lblD.textContent = `${{v.toFixed(2)}} Å`;
+      const hasActiveInp = typeof lblD.querySelector === "function" && lblD.querySelector("input.inline-slider-input");
+      if (!hasActiveInp) {{
+        lblD.textContent = `${{v.toFixed(2)}} Å`;
+      }}
       lblD.title = v < kinFloor - 0.005
-        ? `Active resolution cutoff d_min = ${{v.toFixed(2)}} Å (backscatter kinematic limit λ_min/2 = ${{kinFloor.toFixed(2)}} Å at current λ_min = ${{Number(state.lamMin).toFixed(2)}} Å)`
-        : `Active resolution cutoff d_min = ${{v.toFixed(2)}} Å (hard floor ${{dFloor.toFixed(2)}} Å; Ewald-shell LOD active)`;
+        ? `Active resolution cutoff d_min = ${{v.toFixed(2)}} Å (backscatter kinematic limit λ_min/2 = ${{kinFloor.toFixed(2)}} Å at current λ_min = ${{Number(state.lamMin).toFixed(2)}} Å) — click to enter exact value`
+        : `Active resolution cutoff d_min = ${{v.toFixed(2)}} Å (hard floor ${{dFloor.toFixed(2)}} Å; Ewald-shell LOD active) — click to enter exact value`;
     }}
     if (slDmin) {{
       slDmin.min = dFloor.toFixed(2);
@@ -15891,7 +15965,8 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   }}
 
   function updateColorscaleSliderGradient() {{
-    const spec = buildColorscaleGradientSpec(state.wulffColorMode || "wavelength", getColorCrossover());
+    const c = getColorCrossover();
+    const spec = buildColorscaleGradientSpec(state.wulffColorMode || "wavelength", c);
     if (slColorEmphasis) {{
       slColorEmphasis.style.setProperty("--cs-gradient", spec.gradient);
     }}
@@ -15899,6 +15974,26 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (lbl) {{
       lbl.textContent = spec.label;
       lbl.title = spec.tooltip || "";
+    }}
+    const btnInteg = document.getElementById("btn-peaks-integ");
+    if (btnInteg && btnInteg.style && typeof btnInteg.style.setProperty === "function") {{
+      // Mirror the warm divergent I/σ slider's positive arm: Champagne-Gold (254,232,170) -> Solar Tangerine (251,140,36) -> Flame-Vermilion (232,56,24)
+      const w = Math.max(0.0, Math.min(1.0, 1.0 - c));
+      let r, g, b;
+      if (w <= 0.62) {{
+        const u = w / 0.62;
+        r = Math.round(254 + u * (251 - 254));
+        g = Math.round(232 + u * (140 - 232));
+        b = Math.round(170 + u * (36 - 170));
+      }} else {{
+        const u = (w - 0.62) / 0.38;
+        r = Math.round(251 + u * (232 - 251));
+        g = Math.round(140 + u * (56 - 140));
+        b = Math.round(36 + u * (24 - 36));
+      }}
+      btnInteg.style.setProperty("--integ-btn-bg", `rgba(${{r}}, ${{g}}, ${{b}}, 0.25)`);
+      btnInteg.style.setProperty("--integ-btn-fg", w > 0.72 ? "#fed7aa" : "#fde68a");
+      btnInteg.style.setProperty("--integ-btn-glow", `rgba(${{r}}, ${{g}}, ${{b}}, 0.48)`);
     }}
   }}
 
@@ -15931,9 +16026,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const snrCutActive = isWulffSnrCutActive();
     if (btnScope) {{
       const isAll = state.wulffScope === "all_runs";
-      btnScope.textContent = isAll
-        ? (snrCutActive ? `All-Runs (I/σ≥${{WULFF_ALL_RUNS_MIN_ISIGI}})` : "All-Runs")
-        : "1-Frame";
+      btnScope.textContent = isAll ? "All-Runs" : "1-Frame";
       btnScope.classList.toggle("active-btn", isAll);
       btnScope.title = isAll
         ? `Multi-run Wulff spots${{snrCutActive ? ` filtered to I/σ ≥ ${{WULFF_ALL_RUNS_MIN_ISIGI}} (uncertain I/σ < ${{WULFF_ALL_RUNS_MIN_ISIGI}} spots dimmed on detector)` : ""}}. Click for 1-Frame`
@@ -17219,7 +17312,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (btnInteg) {{
       btnInteg.disabled = !hasInteg;
       btnInteg.classList.toggle("active-btn", state.peakSource === "integrated");
-      btnInteg.title = `Show successfully integrated reflections as 2σ ellipses (${{nInteg}} on frame; Gold→Lime intensity highlight)`;
+      btnInteg.title = `Show successfully integrated reflections as 2σ ellipses (${{nInteg}} on frame; warm Gold→Tangerine→Vermilion I/σ highlight)`;
     }}
     const legIcon = document.getElementById("legend-peak-shape-icon");
     const legLbl = document.getElementById("legend-peak-shape-label");
@@ -17227,7 +17320,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (legIcon) {{
       legIcon.style.width = isIntegSrc ? "13px" : "10px";
       legIcon.style.height = isIntegSrc ? "8px" : "10px";
-      legIcon.style.borderColor = isIntegSrc ? "#a3f22c" : "#00e5ff";
+      legIcon.style.borderColor = isIntegSrc ? "#fb8c24" : "#00e5ff";
     }}
     if (legLbl) {{
       legLbl.textContent = isIntegSrc
@@ -20233,6 +20326,228 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     updateHUD();
     renderDetector();
     renderStereoInset(true);
+  }}
+
+  function applyDirectWavelengthInput(whichEnd, rawText) {{
+    const nums = String(rawText ?? "").match(/[+-]?(?:\\d+\\.?\\d*|\\.\\d+)/g);
+    if (!nums || nums.length === 0) {{
+      updateWavelengthLabels();
+      return false;
+    }}
+    const prevLo = state.lamMin;
+    const prevHi = state.lamMax;
+    let lo = prevLo;
+    let hi = prevHi;
+    if (nums.length >= 2) {{
+      const a = parseFloat(nums[0]);
+      const b = parseFloat(nums[1]);
+      if (!Number.isFinite(a) || !Number.isFinite(b) || (a <= 0 && b <= 0)) {{
+        updateWavelengthLabels();
+        return false;
+      }}
+      const rawLo = Math.min(a, b);
+      const rawHi = Math.max(a, b);
+      lo = Math.max(0.05, Math.min(50.0 - MIN_WL_SPAN, rawLo));
+      hi = Math.max(lo + MIN_WL_SPAN, Math.min(50.0, rawHi));
+    }} else {{
+      const v = parseFloat(nums[0]);
+      if (!Number.isFinite(v) || v <= 0) {{
+        updateWavelengthLabels();
+        return false;
+      }}
+      if (whichEnd === "max") {{
+        hi = Math.max(0.05 + MIN_WL_SPAN, Math.min(50.0, v));
+        lo = Math.max(0.05, Math.min(hi - MIN_WL_SPAN, Number.isFinite(prevLo) ? prevLo : 0.20));
+      }} else {{
+        lo = Math.max(0.05, Math.min(50.0 - MIN_WL_SPAN, v));
+        hi = Math.max(lo + MIN_WL_SPAN, Math.min(50.0, Number.isFinite(prevHi) ? prevHi : lo + 1.0));
+      }}
+    }}
+    syncWavelengthControls(lo, hi, null);
+    if (Math.abs(state.lamMin - prevLo) > 1e-4 || Math.abs(state.lamMax - prevHi) > 1e-4) {{
+      handleDynamicPredictionControlChange();
+    }}
+    return true;
+  }}
+
+  function applyDirectDminInput(rawText) {{
+    const nums = String(rawText ?? "").match(/[+-]?(?:\\d+\\.?\\d*|\\.\\d+)/g);
+    const v = nums && nums.length > 0 ? parseFloat(nums[0]) : NaN;
+    const lblD = document.getElementById("lbl-dmin-val");
+    if (!Number.isFinite(v) || v <= 0) {{
+      syncDminControls(state.dMin);
+      return false;
+    }}
+    const prevD = state.dMin;
+    syncDminControls(v, lblD || slDmin || true);
+    if (Math.abs(state.dMin - prevD) > 1e-4) {{
+      handleDynamicPredictionControlChange();
+    }}
+    return true;
+  }}
+
+  function openWavelengthDirectInput(whichEnd = "min") {{
+    const end = whichEnd === "max" ? "max" : "min";
+    const spanEl = document.getElementById(end === "max" ? "wl-val-max" : "wl-val-min");
+    if (!spanEl || typeof document.createElement !== "function") return;
+    if (typeof spanEl.querySelector === "function" && spanEl.querySelector("input.inline-slider-input")) return;
+    const curVal = end === "max" ? state.lamMax : state.lamMin;
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.inputMode = "decimal";
+    inp.className = "inline-slider-input";
+    inp.setAttribute("aria-label", end === "max" ? "Direct λ_max [Å]" : "Direct λ_min [Å]");
+    inp.value = Number(curVal).toFixed(2);
+    spanEl.textContent = "";
+    spanEl.appendChild(inp);
+    if (typeof inp.focus === "function") inp.focus();
+    if (typeof inp.select === "function") inp.select();
+    let done = false;
+    const finish = (commit, nextEnd = null) => {{
+      if (done) return;
+      done = true;
+      const raw = inp.value;
+      spanEl.textContent = Number(end === "max" ? state.lamMax : state.lamMin).toFixed(2);
+      if (commit) {{
+        applyDirectWavelengthInput(end, raw);
+      }} else {{
+        updateWavelengthLabels();
+      }}
+      if (nextEnd) {{
+        openWavelengthDirectInput(nextEnd);
+      }}
+    }};
+    inp.addEventListener("click", (ev) => ev.stopPropagation());
+    inp.addEventListener("keydown", (ev) => {{
+      ev.stopPropagation();
+      if (ev.key === "Enter") {{
+        ev.preventDefault();
+        finish(true, null);
+      }} else if (ev.key === "Escape") {{
+        ev.preventDefault();
+        finish(false, null);
+      }} else if (ev.key === "Tab") {{
+        if (end === "min" && !ev.shiftKey) {{
+          ev.preventDefault();
+          finish(true, "max");
+        }} else if (end === "max" && ev.shiftKey) {{
+          ev.preventDefault();
+          finish(true, "min");
+        }}
+      }} else if (ev.key === "ArrowUp" || ev.key === "ArrowDown") {{
+        ev.preventDefault();
+        const step = ev.shiftKey ? 0.10 : 0.01;
+        const base = parseFloat(inp.value);
+        const cur = Number.isFinite(base) ? base : (end === "max" ? state.lamMax : state.lamMin);
+        const next = Math.max(0.05, Math.min(50.0, cur + (ev.key === "ArrowUp" ? step : -step)));
+        inp.value = next.toFixed(2);
+        applyDirectWavelengthInput(end, inp.value);
+      }}
+    }});
+    inp.addEventListener("blur", () => finish(true, null));
+  }}
+
+  function openDminDirectInput() {{
+    const lblD = document.getElementById("lbl-dmin-val");
+    if (!lblD || typeof document.createElement !== "function") return;
+    if (typeof lblD.querySelector === "function" && lblD.querySelector("input.inline-slider-input")) return;
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.inputMode = "decimal";
+    inp.className = "inline-slider-input";
+    inp.setAttribute("aria-label", "Direct resolution cutoff d_min [Å]");
+    inp.value = Number(state.dMin).toFixed(2);
+    lblD.textContent = "";
+    lblD.appendChild(inp);
+    lblD.appendChild(document.createTextNode(" Å"));
+    if (typeof inp.focus === "function") inp.focus();
+    if (typeof inp.select === "function") inp.select();
+    let done = false;
+    const finish = (commit) => {{
+      if (done) return;
+      done = true;
+      const raw = inp.value;
+      lblD.textContent = `${{Number(state.dMin).toFixed(2)}} Å`;
+      if (commit) {{
+        applyDirectDminInput(raw);
+      }} else {{
+        syncDminControls(state.dMin);
+      }}
+    }};
+    inp.addEventListener("click", (ev) => ev.stopPropagation());
+    inp.addEventListener("keydown", (ev) => {{
+      ev.stopPropagation();
+      if (ev.key === "Enter") {{
+        ev.preventDefault();
+        finish(true);
+      }} else if (ev.key === "Escape") {{
+        ev.preventDefault();
+        finish(false);
+      }} else if (ev.key === "ArrowUp" || ev.key === "ArrowDown") {{
+        ev.preventDefault();
+        const dFloor = getDynamicDminFloor();
+        const step = ev.shiftKey ? 0.10 : 0.01;
+        const base = parseFloat(inp.value);
+        const cur = Number.isFinite(base) ? base : state.dMin;
+        const next = Math.max(dFloor, Math.min(25.0, cur + (ev.key === "ArrowUp" ? step : -step)));
+        inp.value = next.toFixed(2);
+        applyDirectDminInput(inp.value);
+      }}
+    }});
+    inp.addEventListener("blur", () => finish(true));
+  }}
+
+  const wlValMinEl = document.getElementById("wl-val-min");
+  const wlValMaxEl = document.getElementById("wl-val-max");
+  const wlReadoutClickEl = document.getElementById("wl-readout");
+  const lblDminClickEl = document.getElementById("lbl-dmin-val");
+  if (wlValMinEl && typeof wlValMinEl.addEventListener === "function") {{
+    wlValMinEl.addEventListener("click", (ev) => {{
+      ev.stopPropagation();
+      openWavelengthDirectInput("min");
+    }});
+    wlValMinEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Enter" || ev.key === " ") {{
+        ev.preventDefault();
+        openWavelengthDirectInput("min");
+      }}
+    }});
+  }}
+  if (wlValMaxEl && typeof wlValMaxEl.addEventListener === "function") {{
+    wlValMaxEl.addEventListener("click", (ev) => {{
+      ev.stopPropagation();
+      openWavelengthDirectInput("max");
+    }});
+    wlValMaxEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Enter" || ev.key === " ") {{
+        ev.preventDefault();
+        openWavelengthDirectInput("max");
+      }}
+    }});
+  }}
+  if (wlReadoutClickEl && typeof wlReadoutClickEl.addEventListener === "function") {{
+    wlReadoutClickEl.addEventListener("click", (ev) => {{
+      if (ev.target && ev.target.tagName === "INPUT") return;
+      if (ev.target === wlValMinEl) {{
+        openWavelengthDirectInput("min");
+      }} else if (ev.target === wlValMaxEl) {{
+        openWavelengthDirectInput("max");
+      }} else if (typeof wlReadoutClickEl.getBoundingClientRect === "function" && Number.isFinite(ev.clientX)) {{
+        const r = wlReadoutClickEl.getBoundingClientRect();
+        openWavelengthDirectInput(ev.clientX - r.left <= r.width * 0.5 ? "min" : "max");
+      }} else {{
+        openWavelengthDirectInput("min");
+      }}
+    }});
+  }}
+  if (lblDminClickEl && typeof lblDminClickEl.addEventListener === "function") {{
+    lblDminClickEl.addEventListener("click", () => openDminDirectInput());
+    lblDminClickEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Enter" || ev.key === " ") {{
+        ev.preventDefault();
+        openDminDirectInput();
+      }}
+    }});
   }}
 
   if (slDmin) {{

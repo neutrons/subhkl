@@ -7717,32 +7717,9 @@ def test_wilson_prior_default_mean_calibrated_residual_colorbar_and_single_table
         ]
         extracted = []
         for fn_name in fn_names:
-            m = re.search(rf"\bfunction\s+{fn_name}\s*\(", inline_js)
+            m = re.search(rf"(?m)^  function {fn_name}\b[\s\S]*?^  \}}", inline_js)
             assert m is not None, f"Missing JS function {fn_name}"
-            start = m.start()
-            depth = 0
-            in_str = None
-            esc = False
-            i = m.end() - 1
-            while i < len(inline_js):
-                ch = inline_js[i]
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif in_str:
-                    if ch == in_str:
-                        in_str = None
-                elif ch in ("'", '"', "`"):
-                    in_str = ch
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        extracted.append(inline_js[start : i + 1])
-                        break
-                i += 1
+            extracted.append(m.group(0))
 
         js_harness = f"""
 const DEFAULT_COLOR_CROSSOVER = 0.38;
@@ -10843,3 +10820,347 @@ setTimeout(() => {{
         assert js_out["peaksRows"] == [132.0, 144.0]
         assert js_out["hasMergeMetrics"] is True
         assert js_out["hasPixelMaskBits"] is True
+
+
+def test_slider_direct_numerical_input_integ_button_and_stationary_scope_btn(
+    tmp_path,
+) -> None:
+    """Verify click-to-edit λ_min/λ_max & d_min numerical inputs, warm I/σ Integ button styling, and stationary 1-Frame/All-Runs button."""
+    import json
+    import re
+    import shutil
+    import subprocess
+
+    import gemmi
+    import h5py
+    import numpy as np
+
+    from subhkl.viz.rainbow_zones import (
+        build_rainbow_zone_payload,
+        render_rainbow_html,
+    )
+
+    cell_vals = [55.16, 81.19, 88.70, 90.0, 96.3, 90.0]
+    b_mat = np.asarray(gemmi.UnitCell(*cell_vals).frac.mat.tolist(), dtype=float).T
+    solve_h5 = tmp_path / "solve_ui_polish.h5"
+    with h5py.File(solve_h5, "w") as hf:
+        hf.attrs["instrument"] = "CG4D"
+        hf["sample/space_group"] = "I 1 2 1"
+        hf["sample/cell"] = np.array(cell_vals, dtype=float)
+        hf["sample/U"] = np.eye(3)
+        hf["sample/B"] = b_mat
+        hf["goniometer/R"] = np.eye(3)[None, :, :]
+        hf["goniometer/angles"] = np.zeros((1, 1), dtype=float)
+        hf["instrument/wavelength"] = np.array([2.0, 4.5], dtype=float)
+
+    payload = build_rainbow_zone_payload(
+        replay_h5=solve_h5,
+        instrument="CG4D",
+        space_group="I 1 2 1",
+        wavelength_range=(2.0, 4.5),
+        d_min=2.0,
+        frame_index=0,
+        include_panel_images=False,
+    )
+    html = render_rainbow_html(payload)
+
+    # 1. HTML/CSS assertions: clickable λ_min/λ_max & d_min spans, warm Integ active button, fixed-width 1-Frame/All-Runs button
+    assert 'id="wl-val-min"' in html and 'id="wl-val-max"' in html
+    assert 'id="lbl-dmin-val" class="editable-slider-val"' in html
+    assert "#bef264" not in html
+    assert "#a3f22c" not in html
+    assert "rgba(163, 242, 44" not in html
+    assert "--integ-btn-bg" in html
+    assert re.search(r"#btn-wulff-scope\s*\{[^}]*width:\s*54px", html) is not None
+    assert re.search(r"#stereo-title\s*\{[^}]*flex:\s*1\s+1\s+88px", html) is not None
+
+    if not shutil.which("node"):
+        return
+
+    inline_js = re.findall(r"<script>([\s\S]*?)</script>", html)[-1]
+    fn_names = [
+        "getDefaultWavelengthForInstrument",
+        "getColorCrossover",
+        "applyCrossoverCurve",
+        "getDynamicDminFloor",
+        "getWavelengthSliderBounds",
+        "updateWavelengthLabels",
+        "syncWavelengthControls",
+        "syncDminControls",
+        "updateColorscaleSliderGradient",
+        "syncPeakSourceButtons",
+        "syncWulffUI",
+        "applyDirectWavelengthInput",
+        "applyDirectDminInput",
+        "openWavelengthDirectInput",
+        "openDminDirectInput",
+    ]
+    extracted = []
+    for fn_name in fn_names:
+        m = re.search(rf"(?m)^  function {fn_name}\b[\s\S]*?^  \}}", inline_js)
+        assert m is not None, f"Missing JS function {fn_name}"
+        extracted.append(m.group(0))
+
+    js_probe = f"""
+const MIN_WL_SPAN = 0.05;
+const ABS_DMIN_FLOOR = 0.25;
+const DYNAMIC_DMIN_HARD_FLOOR = 0.25;
+const DEFAULT_COLOR_CROSSOVER = 0.38;
+const WULFF_ALL_RUNS_MIN_ISIGI = 2.5;
+const INSTRUMENT_WAVELENGTH_DEFAULTS = {{ CG4D: [2.0, 4.5] }};
+const _payloadBaseParams = {{ lamMin: 2.0, lamMax: 4.5, dMin: 2.0 }};
+const DATA = {{
+  wavelength_range: [2.0, 4.5],
+  d_min: 2.0,
+  artifact_kind: "integrator",
+  mtz_overlay_name: "mandi_lysozyme_very_long_name.mtz",
+}};
+const state = {{
+  lamMin: 2.0,
+  lamMax: 4.5,
+  dMin: 2.0,
+  dMinUserSeq: 0,
+  colorCrossover: 0.38,
+  wulffColorMode: "isigi",
+  peakSource: "integrated",
+  showStereo: true,
+  wulffExpanded: true,
+  wulffScope: "single_frame",
+  showWulffFriedel: true,
+}};
+const PREDICTED_PEAKS = [{{ id: 1 }}];
+const INTEGRATED_PEAKS = [{{ id: 1, intensity: 100, sigma: 10 }}];
+let repredictCount = 0;
+function handleDynamicPredictionControlChange() {{ repredictCount += 1; updateColorscaleSliderGradient(); }}
+function buildColorscaleGradientSpec(_mode, c) {{ return {{ gradient: `grad(${{c}})`, label: "0 · 3 · 15", tooltip: "tip" }}; }}
+function hasIntegratedIsigi() {{ return true; }}
+function hasMtzIsigi() {{ return true; }}
+function hasCarelessResiduals() {{ return false; }}
+function hasCarelessScales() {{ return false; }}
+function isWulffSnrCutActive() {{ return state.wulffScope === "all_runs"; }}
+function updateMergeScoreboard() {{}}
+
+function makeEl(id, tag = "SPAN", initText = "") {{
+  const listeners = {{}};
+  const props = {{}};
+  const cls = new Set();
+  const children = [];
+  let _text = initText;
+  const el = {{
+    id,
+    tagName: tag,
+    value: "",
+    min: "0.20",
+    max: "6.50",
+    title: "",
+    disabled: false,
+    options: [
+      {{ value: "wavelength", textContent: "Color: λ/Zone", style: {{}} }},
+      {{ value: "isigi", textContent: "Color: I/σ", style: {{}} }},
+      {{ value: "mtz_isigi", textContent: "Color: .mtz I/σ", style: {{}} }},
+      {{ value: "residual", textContent: "Color: ΔI/σ Residual", style: {{}} }},
+      {{ value: "scale", textContent: "Color: Scale", style: {{}} }},
+    ],
+    style: {{
+      left: "",
+      width: "",
+      height: "",
+      borderColor: "",
+      setProperty(k, v) {{ props[k] = v; }},
+      getPropertyValue(k) {{ return props[k] || ""; }},
+    }},
+    classList: {{
+      toggle(c, on) {{ if (on) cls.add(c); else cls.delete(c); }},
+      contains(c) {{ return cls.has(c); }},
+    }},
+    get textContent() {{
+      if (children.length > 0) return children.map((c) => c.textContent ?? "").join("");
+      return _text;
+    }},
+    set textContent(v) {{
+      children.length = 0;
+      _text = String(v);
+    }},
+    appendChild(child) {{ children.push(child); return child; }},
+    querySelector(sel) {{
+      if (sel.startsWith("input")) return children.find((c) => c.tagName === "INPUT") || null;
+      return null;
+    }},
+    setAttribute(k, v) {{ el[k] = v; }},
+    addEventListener(type, fn) {{ (listeners[type] = listeners[type] || []).push(fn); }},
+    dispatch(type, ev = {{}}) {{
+      const eventObj = Object.assign({{
+        preventDefault() {{}},
+        stopPropagation() {{}},
+      }}, ev);
+      (listeners[type] || []).slice().forEach((fn) => fn(eventObj));
+    }},
+    focus() {{}},
+    select() {{}},
+    _children: children,
+  }};
+  return el;
+}}
+
+const els = {{
+  "wl-readout": makeEl("wl-readout", "SPAN"),
+  "wl-val-min": makeEl("wl-val-min", "SPAN", "2.00"),
+  "wl-val-max": makeEl("wl-val-max", "SPAN", "4.50"),
+  "lbl-dmin-val": makeEl("lbl-dmin-val", "SPAN", "2.00 Å"),
+  "slider-wl-min": makeEl("slider-wl-min", "INPUT"),
+  "slider-wl-max": makeEl("slider-wl-max", "INPUT"),
+  "slider-dmin": makeEl("slider-dmin", "INPUT"),
+  "wl-track-fill": makeEl("wl-track-fill", "DIV"),
+  "wl-knob-min": makeEl("wl-knob-min", "BUTTON"),
+  "wl-knob-max": makeEl("wl-knob-max", "BUTTON"),
+  "slider-color-emphasis": makeEl("slider-color-emphasis", "INPUT"),
+  "lbl-color-emphasis": makeEl("lbl-color-emphasis", "SPAN"),
+  "btn-peaks-pred": makeEl("btn-peaks-pred", "BUTTON"),
+  "btn-peaks-integ": makeEl("btn-peaks-integ", "BUTTON"),
+  "legend-peak-shape-icon": makeEl("legend-peak-shape-icon", "SPAN"),
+  "legend-peak-shape-label": makeEl("legend-peak-shape-label", "SPAN"),
+  "stereo-inset": makeEl("stereo-inset", "DIV"),
+  "btn-stereo-toggle": makeEl("btn-stereo-toggle", "BUTTON"),
+  "btn-wulff-scope": makeEl("btn-wulff-scope", "BUTTON", "1-Frame"),
+  "btn-wulff-friedel": makeEl("btn-wulff-friedel", "BUTTON"),
+  "btn-wulff-expand": makeEl("btn-wulff-expand", "BUTTON"),
+  "sel-wulff-color": makeEl("sel-wulff-color", "SELECT"),
+  "sel-spot-color": makeEl("sel-spot-color", "SELECT"),
+  "stereo-title": makeEl("stereo-title", "SPAN"),
+}};
+els["wl-readout"].appendChild({{ textContent: "[" }});
+els["wl-readout"].appendChild(els["wl-val-min"]);
+els["wl-readout"].appendChild({{ textContent: ", " }});
+els["wl-readout"].appendChild(els["wl-val-max"]);
+els["wl-readout"].appendChild({{ textContent: "] Å" }});
+
+const slWlMin = els["slider-wl-min"];
+const slWlMax = els["slider-wl-max"];
+const slDmin = els["slider-dmin"];
+const wlTrackFill = els["wl-track-fill"];
+const wlKnobMin = els["wl-knob-min"];
+const wlKnobMax = els["wl-knob-max"];
+const slColorEmphasis = els["slider-color-emphasis"];
+let _cachedPlotBox = null;
+let _cachedPlotBoxKey = "";
+
+const document = {{
+  getElementById(id) {{ return els[id] || null; }},
+  createElement(tag) {{ return makeEl("", String(tag).toUpperCase()); }},
+  createTextNode(txt) {{ return {{ textContent: String(txt) }}; }},
+}};
+
+{"\n".join(extracted)}
+
+// A. Click λ_min -> type 1.35 -> Tab jumps directly to λ_max -> type 8.25 (beyond initial 6.50 slider max!) -> Enter
+openWavelengthDirectInput("min");
+const inpMin = els["wl-val-min"].querySelector("input.inline-slider-input");
+inpMin.value = "1.35";
+inpMin.dispatch("keydown", {{ key: "Tab", shiftKey: false }});
+const inpMax = els["wl-val-max"].querySelector("input.inline-slider-input");
+const tabOpenedMax = Boolean(inpMax);
+inpMax.value = "8.25";
+inpMax.dispatch("keydown", {{ key: "Enter" }});
+
+const afterWl = {{
+  lamMin: state.lamMin,
+  lamMax: state.lamMax,
+  readout: els["wl-readout"].textContent,
+  slMaxBound: parseFloat(slWlMax.max),
+  slMinVal: slWlMin.value,
+  slMaxVal: slWlMax.value,
+}};
+
+// Escape cancels without modifying λ_min
+openWavelengthDirectInput("min");
+const inpEsc = els["wl-val-min"].querySelector("input.inline-slider-input");
+inpEsc.value = "3.99";
+inpEsc.dispatch("keydown", {{ key: "Escape" }});
+const lamMinAfterEsc = state.lamMin;
+
+// B. Click d_min -> type 1.12 -> Enter updates d_min & slider; typing 0.05 clamps cleanly to dynamic floor
+openDminDirectInput();
+const inpD = els["lbl-dmin-val"].querySelector("input.inline-slider-input");
+inpD.value = "1.12";
+inpD.dispatch("keydown", {{ key: "Enter" }});
+const dMinAfterCommit = state.dMin;
+const lblDAfterCommit = els["lbl-dmin-val"].textContent;
+const slDValAfterCommit = slDmin.value;
+
+openDminDirectInput();
+const inpDFloor = els["lbl-dmin-val"].querySelector("input.inline-slider-input");
+inpDFloor.value = "0.02";
+inpDFloor.dispatch("keydown", {{ key: "Enter" }});
+const dFloorExpected = getDynamicDminFloor();
+const dMinAfterFloor = state.dMin;
+
+// C. Warm I/σ Integ button color responds to crossover slider (Solar Tangerine at 0.38 -> Flame-Vermilion at 0.05)
+state.colorCrossover = 0.38;
+updateColorscaleSliderGradient();
+syncPeakSourceButtons();
+const integBgDefault = els["btn-peaks-integ"].style.getPropertyValue("--integ-btn-bg");
+const legBorderInteg = els["legend-peak-shape-icon"].style.borderColor;
+state.colorCrossover = 0.05;
+updateColorscaleSliderGradient();
+const integBgHot = els["btn-peaks-integ"].style.getPropertyValue("--integ-btn-bg");
+
+// D. Wulff scope button label stays concise ("1-Frame" vs "All-Runs") even when SNR cut is active
+state.wulffScope = "single_frame";
+syncWulffUI();
+const scopeSingleLbl = els["btn-wulff-scope"].textContent;
+state.wulffScope = "all_runs";
+syncWulffUI();
+const scopeAllLbl = els["btn-wulff-scope"].textContent;
+const scopeAllTip = els["btn-wulff-scope"].title;
+const stereoTitleAll = els["stereo-title"].textContent;
+
+console.log(JSON.stringify({{
+  tabOpenedMax,
+  afterWl,
+  lamMinAfterEsc,
+  dMinAfterCommit,
+  lblDAfterCommit,
+  slDValAfterCommit,
+  dFloorExpected,
+  dMinAfterFloor,
+  repredictCount,
+  integBgDefault,
+  integBgHot,
+  legBorderInteg,
+  scopeSingleLbl,
+  scopeAllLbl,
+  scopeAllTip,
+  stereoTitleAll,
+}}));
+"""
+    js_file = tmp_path / "ui_polish_probe.js"
+    js_file.write_text(js_probe, encoding="utf-8")
+    proc = subprocess.run(
+        ["node", str(js_file)], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip())
+
+    assert out["tabOpenedMax"] is True
+    assert abs(out["afterWl"]["lamMin"] - 1.35) < 1e-6
+    assert abs(out["afterWl"]["lamMax"] - 8.25) < 1e-6
+    assert out["afterWl"]["readout"] == "[1.35, 8.25] Å"
+    assert out["afterWl"]["slMaxBound"] >= 8.25
+    assert out["afterWl"]["slMinVal"] == "1.35"
+    assert out["afterWl"]["slMaxVal"] == "8.25"
+    assert abs(out["lamMinAfterEsc"] - 1.35) < 1e-6
+
+    assert abs(out["dMinAfterCommit"] - 1.12) < 1e-6
+    assert out["lblDAfterCommit"] == "1.12 Å"
+    assert out["slDValAfterCommit"] == "1.12"
+    assert abs(out["dMinAfterFloor"] - out["dFloorExpected"]) < 0.02
+    assert out["repredictCount"] >= 4
+
+    assert out["integBgDefault"] == "rgba(251, 140, 36, 0.25)"
+    assert out["integBgHot"] == "rgba(235, 67, 26, 0.25)"
+    assert out["legBorderInteg"] == "#fb8c24"
+
+    assert out["scopeSingleLbl"] == "1-Frame"
+    assert out["scopeAllLbl"] == "All-Runs"
+    assert "I/σ ≥ 2.5" in out["scopeAllTip"]
+    assert "ALL-RUNS · I/σ ≥ 2.5" in out["stereoTitleAll"]

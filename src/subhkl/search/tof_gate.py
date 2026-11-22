@@ -563,19 +563,67 @@ def _nbr_step_impl(
     return _merge_nbr_impl(acc_blk, acc_cnt, acc_d2, acc_gid, s_blk, s_cnt, s_d2, s_gid)
 
 
+def _slab_spectrum_impl(
+    tof_dev,
+    off_dev,
+    n_m_i32,
+    nt_i32,
+    flat_pad_dev,
+    inv_t0,
+    inv_dl,
+):
+    """Batched GPU cumulative time-spectrum measure across all images in a slab."""
+    import jax
+    import jax.numpy as jnp
+
+    M = off_dev.shape[0]
+    nt_cap = flat_pad_dev.shape[0] - 1
+    cap = tof_dev.shape[0]
+    m_arange = jnp.arange(M, dtype=jnp.int32)
+    last_m = jnp.maximum(n_m_i32 - jnp.int32(1), jnp.int32(0))
+    total_ev = jnp.where(n_m_i32 > 0, off_dev[last_m, -1], jnp.int32(0))
+    img_starts = jnp.where(m_arange < n_m_i32, off_dev[:, 0], total_ev)
+    img_ends = jnp.where(m_arange < n_m_i32, off_dev[:, -1], total_ev)
+    img_counts = img_ends - img_starts
+
+    ev_idx = jnp.arange(cap, dtype=jnp.int32)
+    m_id = jnp.searchsorted(img_ends, ev_idx, side="right")
+    tb = jnp.floor(
+        jnp.log(jnp.maximum(tof_dev, jnp.float32(1e-6)) * inv_t0) * inv_dl
+    ).astype(jnp.int32)
+    valid_ev = (ev_idx < total_ev) & (tb >= 0) & (tb < nt_i32)
+    flat_bin = jnp.where(valid_ev, m_id * nt_cap + tb, M * nt_cap)
+    hist_flat = jnp.zeros(M * nt_cap + 1, dtype=jnp.int32).at[flat_bin].add(1)
+    hist = hist_flat[: M * nt_cap].reshape(M, nt_cap).astype(jnp.float32)
+
+    kernel = jnp.ones((5,), dtype=jnp.float32) / jnp.float32(5.0)
+    hist_sm = jax.vmap(lambda h: jnp.convolve(h, kernel, mode="same"))(hist)
+    bin_mask = jnp.arange(nt_cap, dtype=jnp.int32)[None, :] < nt_i32
+    hist_sm = jnp.where(bin_mask, hist_sm, jnp.float32(0.0))
+    cum = jnp.concatenate(
+        [jnp.zeros((M, 1), dtype=jnp.float32), jnp.cumsum(hist_sm, axis=1)], axis=1
+    )
+    enough = (img_counts >= MIN_SPECTRUM_EVENTS_PER_BIN * nt_i32) & (cum[:, -1] > 0.0)
+    scale = flat_pad_dev[-1] / jnp.where(enough, cum[:, -1], jnp.float32(1.0))
+    return jnp.where(enough[:, None], cum * scale[:, None], flat_pad_dev[None, :])
+
+
 def _chunk_stage1_impl(
     sr_cap,
     sc_cap,
     tof_dev,
     off_dev,
     val_dev,
+    measure_slab_dev,
     s_idx_c,
     org_r_c,
     org_c_c,
     cuts_20_c,
-    widths_c,
-    keep0_c,
-    gate_time_c,
+    b_lo_f32_c,
+    b_hi_f32_c,
+    sb_l_f32_c,
+    sb_r_f32_c,
+    side_ok_c,
     in_band_c,
     loc_r_c,
     loc_c_c,
@@ -596,6 +644,15 @@ def _chunk_stage1_impl(
     tiles_c, valid_c, sb_c, nv_c = _jit("tiles")(
         tof_dev, off_dev, val_dev, s_idx_c, org_r_c, org_c_c, cuts_20_c, T=T
     )
+    sb_l_i = sb_l_f32_c.astype(jnp.int32)
+    sb_r_i = sb_r_f32_c.astype(jnp.int32)
+    b_lo_i = b_lo_f32_c.astype(jnp.int32)
+    b_hi_i = b_hi_f32_c.astype(jnp.int32)
+    m_l = measure_slab_dev[s_idx_c[:, None], sb_l_i]
+    m_r = measure_slab_dev[s_idx_c[:, None], sb_r_i]
+    widths_c = jnp.concatenate([jnp.diff(m_l, axis=1), jnp.diff(m_r, axis=1)], axis=1)
+    gate_time_c = measure_slab_dev[s_idx_c, b_hi_i] - measure_slab_dev[s_idx_c, b_lo_i]
+    keep0_c = (widths_c > 0.0) & jnp.repeat(side_ok_c, SIDEBAND_BINS, axis=1)
     tbg_c, bg_safe_c, usable_c = _sideband_bg_impl(
         sb_c, widths_c, keep0_c, acc_blk, nv_c, gate_time_c, in_band_c
     )
@@ -658,6 +715,8 @@ def _jit(name):
             _JIT[name] = jit(_nbr_step_impl)
         elif name == "sideband_bg":
             _JIT[name] = jit(_sideband_bg_impl)
+        elif name == "slab_spectrum":
+            _JIT[name] = jit(_slab_spectrum_impl)
         elif name == "chunk_stage1":
             _JIT[name] = partial(jit, static_argnames=["T"], donate_argnums=(0, 1))(
                 _chunk_stage1_impl
@@ -1581,8 +1640,27 @@ def integrate_reflections_tof_gated(
     nbr_block_fn = _jit("nbr_block")
     nbr_step_fn = _jit("nbr_step")
     stage1_fn = _jit("chunk_stage1")
+    slab_spectrum_fn = _jit("slab_spectrum") if sideband_measure == "spectrum" else None
     z_f32 = jnp.float32(admission_z)
     half_f32 = jnp.float32(half)
+
+    nt_cap = max(2048, 1 << int(np.ceil(np.log2(max(grid.nt, 1)))))
+    flat_pad_np = np.empty(nt_cap + 1, dtype=np.float32)
+    flat_pad_np[: grid.nt + 1] = flat_measure.astype(np.float32)
+    flat_pad_np[grid.nt + 1 :] = np.float32(flat_measure[-1])
+    flat_pad_dev = jax.device_put(flat_pad_np)
+    flat_measure_slab_dev = (
+        jax.device_put(
+            np.broadcast_to(
+                flat_pad_np[None, :], (int(SLAB_MAX_IMAGES), nt_cap + 1)
+            ).copy()
+        )
+        if sideband_measure != "spectrum"
+        else None
+    )
+    nt_i32_dev = jax.device_put(np.int32(grid.nt))
+    inv_t0_f32 = jnp.float32(1.0 / grid.t0)
+    inv_dl_f32 = jnp.float32(1.0 / grid.dl)
 
     pbar = tqdm(total=B, desc="Time-of-flight gated solve", disable=not show_progress)
     progressed_to = 0
@@ -1645,38 +1723,8 @@ def integrate_reflections_tof_gated(
         sb_r_ch = _padded(
             sb_edges_slab[:, 1, :].astype(np.float32), n_pad, 0.0
         ).reshape(n_chunks, chunk_size, SIDEBAND_BINS + 1)
-
-        # Length of every sideband sub-interval and gate, per image: its
-        # cumulative time spectrum, or plain time.
-        if sideband_measure == "spectrum":
-            measure_slab = np.stack(
-                [
-                    _spectrum_measure(
-                        tof_slab_np[off_slab_np[m, 0] : off_slab_np[m, -1]],
-                        grid,
-                        flat_measure,
-                    )
-                    for m in range(len(s_frames))
-                ]
-            )
-        else:
-            measure_slab = np.broadcast_to(
-                flat_measure, (len(s_frames), len(flat_measure))
-            )
-        widths_slab = np.diff(
-            measure_slab[slab_frames_s[:, None, None], sb_edges_slab], axis=2
-        ).reshape(n_s, 16)
-        gate_time_slab = (
-            measure_slab[slab_frames_s, b_hi_slab]
-            - measure_slab[slab_frames_s, b_lo_slab]
-        )
-        keep0_slab = (widths_slab > 0) & np.repeat(side_ok_slab, SIDEBAND_BINS, axis=1)
-        widths_ch = _padded(widths_slab.astype(np.float32), n_pad, 0.0).reshape(
-            n_chunks, chunk_size, 16
-        )
-        keep0_ch = _padded(keep0_slab, n_pad, False).reshape(n_chunks, chunk_size, 16)
-        gate_time_ch = _padded(gate_time_slab.astype(np.float32), n_pad, 0.0).reshape(
-            n_chunks, chunk_size
+        side_ok_ch = _padded(side_ok_slab, n_pad, False).reshape(
+            n_chunks, chunk_size, 2
         )
 
         cuts_20_pad = np.zeros((n_pad, 20), dtype=np.float32)
@@ -1734,9 +1782,7 @@ def integrate_reflections_tof_gated(
                 org_r_ch[c],
                 org_c_ch[c],
                 cuts_20_ch[c],
-                widths_ch[c],
-                keep0_ch[c],
-                gate_time_ch[c],
+                side_ok_ch[c],
                 in_band_ch[c],
                 loc_r_ch[c],
                 loc_c_ch[c],
@@ -1759,6 +1805,7 @@ def integrate_reflections_tof_gated(
             vv_cap_dev,
             cuv_cap_dev,
             n_s_dev,
+            n_m_dev,
             q_devs,
             k_devs,
             st1_devs,
@@ -1775,11 +1822,26 @@ def integrate_reflections_tof_gated(
                 vv_cap_np,
                 cuv_cap_np,
                 np.int32(n_s),
+                np.int32(len(s_frames)),
                 q_tuples_np,
                 k_tuples_np,
                 st1_tuples_np,
             )
         )
+
+        # Compute cumulative time-spectrum measures directly on GPU from tof_dev/off_dev.
+        if slab_spectrum_fn is not None:
+            measure_slab_dev = slab_spectrum_fn(
+                tof_dev,
+                off_dev,
+                n_m_dev,
+                nt_i32_dev,
+                flat_pad_dev,
+                inv_t0_f32,
+                inv_dl_f32,
+            )
+        else:
+            measure_slab_dev = flat_measure_slab_dev
 
         chunk_f_ranges = [
             (
@@ -1809,15 +1871,14 @@ def integrate_reflections_tof_gated(
                 org_r_c,
                 org_c_c,
                 cuts_c,
-                w_c,
-                k0_c,
-                gt_c,
+                sok_c,
                 ib_c,
                 lr_c,
                 lc_c,
                 gid_c,
                 lo_dev,
             ) = st1_devs[c_i]
+            b_lo_c, b_hi_c, sb_l_c, sb_r_c = q_c[5], q_c[6], q_c[7], q_c[8]
             (
                 sr_cap_dev,
                 sc_cap_dev,
@@ -1837,13 +1898,16 @@ def integrate_reflections_tof_gated(
                 tof_dev,
                 off_dev,
                 val_dev,
+                measure_slab_dev,
                 sr_c_in,
                 org_r_c,
                 org_c_c,
                 cuts_c,
-                w_c,
-                k0_c,
-                gt_c,
+                b_lo_c,
+                b_hi_c,
+                sb_l_c,
+                sb_r_c,
+                sok_c,
                 ib_c,
                 lr_c,
                 lc_c,
@@ -1870,7 +1934,9 @@ def integrate_reflections_tof_gated(
                 )
             )
 
-        del tof_dev, off_dev, val_dev, q_devs, k_devs, st1_devs
+        if slab_spectrum_fn is not None:
+            del measure_slab_dev
+        del tof_dev, off_dev, val_dev, n_m_dev, q_devs, k_devs, st1_devs
 
         # 2. Pure @jit Stage-2 loop (neighbor gather + joint Poisson solve).
         out_devs = []

@@ -686,6 +686,65 @@ def test_spectrum_measure_falls_back_on_sparse_images():
     assert measure[-1] - measure[late] == pytest.approx(0.0, abs=1e-6 * flat[-1])
 
 
+def test_gpu_slab_spectrum_matches_cpu_spectrum_measure():
+    import jax
+    import jax.numpy as jnp
+
+    from subhkl.search.tof_gate import TimeGrid, _jit, _spectrum_measure
+
+    rng = np.random.default_rng(2026)
+    grid = TimeGrid.spanning(15000.0, 31000.0, 1.0e-3)  # non-power-of-two nt
+    assert (grid.nt & (grid.nt - 1)) != 0
+    flat = grid.edge_time(np.arange(grid.nt + 1)) - grid.edge_time(0)
+    nt_cap = max(2048, 1 << int(np.ceil(np.log2(max(grid.nt, 1)))))
+    flat_pad = np.empty(nt_cap + 1, dtype=np.float32)
+    flat_pad[: grid.nt + 1] = flat.astype(np.float32)
+    flat_pad[grid.nt + 1 :] = np.float32(flat[-1])
+
+    m_cap, n_m, n_pix = 8, 5, 64
+    counts = [
+        180_000,
+        0,
+        120,
+        210_000,
+        160_000,
+    ]  # dense, empty, sparse, band-cut, dense
+    cap = 600_000
+    tof_buf = np.full(cap, 19000.0, dtype=np.float32)  # non-zero tail garbage
+    off_buf = np.full(
+        (m_cap, n_pix + 1), 599_999, dtype=np.int32
+    )  # unused-slot garbage
+    cursor = 0
+    raw_tofs = []
+    for m, ev in enumerate(counts):
+        if m == 3:
+            t_m = rng.uniform(15500.0, 22500.0, size=ev).astype(np.float32)
+        else:
+            t_m = rng.uniform(15000.0, 31000.0, size=ev).astype(np.float32)
+        raw_tofs.append(t_m)
+        if ev > 0:
+            tof_buf[cursor : cursor + ev] = t_m
+        off_buf[m, :] = np.linspace(cursor, cursor + ev, n_pix + 1, dtype=np.int32)
+        cursor += ev
+
+    gpu_out = np.asarray(
+        _jit("slab_spectrum")(
+            jax.device_put(tof_buf),
+            jax.device_put(off_buf),
+            jax.device_put(np.int32(n_m)),
+            jax.device_put(np.int32(grid.nt)),
+            jax.device_put(flat_pad),
+            jnp.float32(1.0 / grid.t0),
+            jnp.float32(1.0 / grid.dl),
+        )
+    )
+    for m in range(n_m):
+        ref = _spectrum_measure(raw_tofs[m], grid, flat)
+        np.testing.assert_allclose(
+            gpu_out[m, : grid.nt + 1], ref, rtol=1e-5, atol=2e-4 * flat[-1]
+        )
+
+
 def test_unresolvable_overlaps_are_censored():
     """Reflections packed closer than the spot width in one time window
     cannot be told apart: the joint solve censors them instead of reporting
