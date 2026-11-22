@@ -10,6 +10,7 @@ if any(
     for cmd in ("rainbow-visualize", "reduce", "reduce-batch", "merge-images")
 ):
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 import h5py
 import typer
@@ -1507,13 +1508,9 @@ def peak_predictor(
         ),
     ] = None,
 ):
-    import shutil
     import uuid
 
-    from subhkl.io.shared_storage import (
-        allocate_shared_artifact_path,
-        write_shared_pointer,
-    )
+    from subhkl.io.shared_storage import publish_shared_artifact
 
     resolved_scan, scan_ptr = _resolve_cli_input(filename)
     resolved_idx, _ = _resolve_cli_input(indexed_hdf5_filename)
@@ -1521,13 +1518,9 @@ def peak_predictor(
     assert resolved_scan is not None and resolved_idx is not None
 
     if shared_pointer_out:
-        shared_local, _ = allocate_shared_artifact_path(
-            "peak_predictor.h5",
-            tag=instrument,
-        )
         local_tmp = os.path.join(
             _get_local_nvme_scratch_dir(),
-            f"subhkl_pred_tmp_{uuid.uuid4().hex[:10]}.h5",
+            f"subhkl_pred_tmp_{uuid.uuid4().hex}.h5",
         )
         try:
             run_peak_predictor(
@@ -1544,20 +1537,19 @@ def peak_predictor(
                 rel_border_width=rel_border_width,
                 static_mask_file=resolved_mask,
             )
-            shutil.move(local_tmp, shared_local)
+            _shared_local, ptr_doc = publish_shared_artifact(
+                local_tmp,
+                shared_pointer_out,
+                artifact="peak_predictor.h5",
+                delete_after_use=True,
+                metadata={
+                    "instrument": instrument,
+                    "source_files": (scan_ptr or {}).get("source_files"),
+                },
+            )
         finally:
             if os.path.exists(local_tmp):
                 os.unlink(local_tmp)
-        ptr_doc = write_shared_pointer(
-            shared_pointer_out,
-            shared_local,
-            artifact="peak_predictor.h5",
-            delete_after_use=True,
-            metadata={
-                "instrument": instrument,
-                "source_files": (scan_ptr or {}).get("source_files"),
-            },
-        )
         print(
             f"[subhkl] Staged ephemeral predictor -> {ptr_doc['network_path']} (pointer: {shared_pointer_out})",
             flush=True,
@@ -1745,12 +1737,11 @@ def merge_images(
         ),
     ] = None,
 ):
-    import shutil
     import uuid
 
     from subhkl.io.shared_storage import (
-        allocate_shared_artifact_path,
-        write_shared_pointer,
+        get_shared_dir_local,
+        publish_shared_artifact,
     )
 
     clean_src_files = [str(p).strip() for p in (source_files or []) if str(p).strip()]
@@ -1762,17 +1753,11 @@ def merge_images(
 
     try:
         if shared_pointer_out:
-            shared_local, _ = allocate_shared_artifact_path(
-                "merged.h5",
-                tag=tag_hint or (instrument or ""),
-            )
-            local_tmp = (
-                os.path.join(
-                    _get_local_nvme_scratch_dir(),
-                    f"subhkl_merge_tmp_{uuid.uuid4().hex[:10]}.h5",
-                )
-                if output_filename in ("", "auto", "-")
-                else output_filename
+            # Fail fast before running expensive merge if SUBHKL_SHARED_DIR is unset/unwritable.
+            get_shared_dir_local(require=True, create=True)
+            local_tmp = os.path.join(
+                _get_local_nvme_scratch_dir(),
+                f"subhkl_merge_tmp_{uuid.uuid4().hex}.h5",
             )
             local_parent = os.path.dirname(os.path.abspath(local_tmp))
             if local_parent:
@@ -1809,21 +1794,22 @@ def merge_images(
                                 )
                         if instrument:
                             hf.attrs["instrument"] = str(instrument)
-                shutil.move(local_tmp, shared_local)
+                        hf.flush()
+                # Copy closed local HDF5 to brand-new UUID path, os.fsync + close, THEN publish JSON pointer.
+                _shared_local, ptr_doc = publish_shared_artifact(
+                    local_tmp,
+                    shared_pointer_out,
+                    artifact="merged.h5",
+                    delete_after_use=False,
+                    metadata={
+                        "instrument": instrument,
+                        "source_files": clean_src_files or None,
+                        "tag": tag_hint or None,
+                    },
+                )
             finally:
                 if os.path.exists(local_tmp):
                     os.unlink(local_tmp)
-            ptr_doc = write_shared_pointer(
-                shared_pointer_out,
-                shared_local,
-                artifact="merged.h5",
-                delete_after_use=False,
-                metadata={
-                    "instrument": instrument,
-                    "source_files": clean_src_files or None,
-                    "tag": tag_hint or None,
-                },
-            )
             print(
                 f"[subhkl] Staged shared scan -> {ptr_doc['network_path']} (pointer: {shared_pointer_out})",
                 flush=True,

@@ -20,6 +20,7 @@ from subhkl.io.shared_storage import (
     get_shared_dir_local,
     is_shared_pointer_file,
     parse_mountinfo,
+    publish_shared_artifact,
     read_shared_pointer,
     resolve_input_h5_path,
     resolve_shared_local_path,
@@ -747,3 +748,167 @@ def test_galaxy_runner_pointer_orchestration_and_shared_lifecycle(
     cleaned_exit = cleanup_registered_temp_artifacts()
     assert os.path.abspath(shared_merged_2) in cleaned_exit
     assert not os.path.exists(shared_merged_2)
+
+
+def test_nfs_race_free_uuid_staging_and_fsync_before_pointer_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify full 128-bit UUIDv4 filenames (cold NFS cache miss), zero pre-create stat, and os.fsync+close BEFORE JSON pointer publish."""
+    import builtins
+    import re
+
+    nvme_dir = tmp_path / "nvme_local"
+    shared_dir = tmp_path / "nfs_shared"
+    nvme_dir.mkdir()
+    shared_dir.mkdir()
+    monkeypatch.setenv("SUBHKL_STAGING_DIR", str(nvme_dir))
+    monkeypatch.setenv("SUBHKL_SHARED_DIR", str(shared_dir))
+
+    src_h5 = nvme_dir / "local_scan.h5"
+    with h5py.File(src_h5, "w") as hf:
+        hf.create_dataset(
+            "images", data=np.arange(64, dtype=np.float32).reshape(1, 8, 8)
+        )
+
+    ptr_out = tmp_path / "out" / "scan_ref.json"
+
+    events: list[tuple[str, str]] = []
+    fd_to_tag: dict[int, str] = {}
+    orig_os_open = os.open
+    orig_os_fsync = os.fsync
+    orig_os_close = os.close
+    orig_os_stat = os.stat
+    orig_open = builtins.open
+
+    def _tracked_stat(path: object, *args: object, **kwargs: object):
+        p_str = os.fspath(path) if isinstance(path, (str, os.PathLike)) else ""
+        if isinstance(p_str, str) and "subhkl_shared_" in os.path.basename(p_str):
+            events.append(("stat_shared", os.path.basename(p_str)))
+        return orig_os_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    def _tracked_os_open(
+        path: str, flags: int, mode: int = 0o777, **kwargs: object
+    ) -> int:
+        fd = orig_os_open(path, flags, mode, **kwargs)
+        p_str = os.fspath(path)
+        bn = os.path.basename(p_str)
+        if bn.startswith("subhkl_shared_"):
+            assert flags & os.O_CREAT and flags & os.O_EXCL
+            fd_to_tag[fd] = "shared_h5"
+            events.append(("open_shared_h5", bn))
+        elif os.path.abspath(p_str) == os.path.abspath(shared_dir):
+            fd_to_tag[fd] = "shared_dir"
+        elif os.path.abspath(p_str) == os.path.abspath(ptr_out.parent):
+            fd_to_tag[fd] = "ptr_dir"
+        return fd
+
+    def _tracked_builtin_open(
+        file: object, mode: str = "r", *args: object, **kwargs: object
+    ):
+        fh = orig_open(file, mode, *args, **kwargs)  # type: ignore[call-overload]
+        if isinstance(file, (str, os.PathLike)):
+            p_str = os.fspath(file)
+            if os.path.abspath(p_str) == os.path.abspath(ptr_out) and "w" in mode:
+                fd_to_tag[fh.fileno()] = "ptr_json"
+                events.append(("open_ptr_json", os.path.basename(p_str)))
+
+                orig_fh_close = fh.close
+
+                def _wrapped_fh_close() -> None:
+                    fd_to_tag.pop(fh.fileno(), None)
+                    orig_fh_close()
+                    events.append(("close_ptr_json", os.path.basename(p_str)))
+
+                fh.close = _wrapped_fh_close  # type: ignore[method-assign]
+        return fh
+
+    def _tracked_fsync(fd: int) -> None:
+        tag = fd_to_tag.get(fd)
+        if tag:
+            events.append((f"fsync_{tag}", str(fd)))
+        orig_os_fsync(fd)
+
+    def _tracked_close(fd: int) -> None:
+        tag = fd_to_tag.pop(fd, None)
+        orig_os_close(fd)
+        if tag:
+            events.append((f"close_{tag}", str(fd)))
+
+    monkeypatch.setattr(os, "stat", _tracked_stat)
+    monkeypatch.setattr(os, "open", _tracked_os_open)
+    monkeypatch.setattr(os, "fsync", _tracked_fsync)
+    monkeypatch.setattr(os, "close", _tracked_close)
+    monkeypatch.setattr(builtins, "open", _tracked_builtin_open)
+
+    shared_1, doc_1 = publish_shared_artifact(
+        src_h5,
+        ptr_out,
+        artifact="merged.h5",
+        metadata={"instrument": "CG4D"},
+    )
+    ptr_out_2 = tmp_path / "out" / "scan_ref_2.json"
+    shared_2, doc_2 = publish_shared_artifact(
+        src_h5,
+        ptr_out_2,
+        artifact="merged.h5",
+        metadata={"instrument": "CG4D"},
+    )
+
+    # 1. Distinct full 32-hex 128-bit UUIDv4 filenames on every publication
+    m1 = re.match(
+        r"^subhkl_shared_([0-9a-f]{32})_merged\.h5$", os.path.basename(shared_1)
+    )
+    m2 = re.match(
+        r"^subhkl_shared_([0-9a-f]{32})_merged\.h5$", os.path.basename(shared_2)
+    )
+    assert m1 is not None and m2 is not None
+    assert m1.group(1) != m2.group(1)
+    assert doc_1["artifact_uuid"] == m1.group(1)
+    assert doc_2["artifact_uuid"] == m2.group(1)
+    assert doc_1["size_bytes"] == src_h5.stat().st_size
+
+    # 2. Strict causal ordering for first publication:
+    #    ZERO stat on shared filename before O_CREAT|O_EXCL open -> fsync(shared_h5) -> close(shared_h5) -> open(ptr_json) -> fsync(ptr_json) -> close(ptr_json)
+    bn_1 = os.path.basename(shared_1)
+    idx_open_h5 = next(
+        i
+        for i, (ev, arg) in enumerate(events)
+        if ev == "open_shared_h5" and arg == bn_1
+    )
+    assert not any(
+        ev == "stat_shared" and arg == bn_1 for ev, arg in events[:idx_open_h5]
+    ), (
+        f"Unexpected pre-creation stat on NFS target before O_CREAT|O_EXCL: {events[:idx_open_h5]}"
+    )
+
+    idx_fsync_h5 = next(
+        i
+        for i in range(idx_open_h5 + 1, len(events))
+        if events[i][0] == "fsync_shared_h5"
+    )
+    idx_close_h5 = next(
+        i
+        for i in range(idx_fsync_h5 + 1, len(events))
+        if events[i][0] == "close_shared_h5"
+    )
+    idx_open_ptr = next(i for i, (ev, _) in enumerate(events) if ev == "open_ptr_json")
+    idx_fsync_ptr = next(
+        i
+        for i in range(idx_open_ptr + 1, len(events))
+        if events[i][0] == "fsync_ptr_json"
+    )
+    idx_close_ptr = next(
+        i
+        for i in range(idx_fsync_ptr + 1, len(events))
+        if events[i][0] == "close_ptr_json"
+    )
+
+    assert (
+        idx_open_h5
+        < idx_fsync_h5
+        < idx_close_h5
+        < idx_open_ptr
+        < idx_fsync_ptr
+        < idx_close_ptr
+    )
+    assert os.environ.get("HDF5_USE_FILE_LOCKING") == "FALSE"

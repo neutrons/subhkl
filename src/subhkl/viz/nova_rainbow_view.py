@@ -45,6 +45,7 @@ for _thr_var in (
     "NUMEXPR_NUM_THREADS",
 ):
     os.environ.setdefault(_thr_var, "1")
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
 import numpy as np
 
@@ -5083,8 +5084,8 @@ class NovaGalaxyPipelineRunner:
     ) -> str:
         """Ensure ``merged_path`` resides in mandatory ``SUBHKL_SHARED_DIR`` and return a tiny JSON pointer HDA id."""
         from subhkl.io.shared_storage import (
-            allocate_shared_artifact_path,
             is_safe_shared_intermediate,
+            stage_file_to_shared_dir,
             to_shared_network_path,
             write_shared_pointer,
         )
@@ -5107,19 +5108,18 @@ class NovaGalaxyPipelineRunner:
 
         if is_safe_shared_intermediate(real_m):
             shared_local = real_m
+            net_path = to_shared_network_path(shared_local)
         else:
-            shared_local, _ = allocate_shared_artifact_path(
-                "merged.h5",
-                tag=tag_part or instrument,
+            # Write-once to a brand-new UUIDv4 path in SUBHKL_SHARED_DIR + os.fsync + close BEFORE pointer publish.
+            shared_local, net_path, _uid = stage_file_to_shared_dir(
+                real_m,
+                artifact_name="merged.h5",
             )
-            shutil.copy2(real_m, shared_local)
-            _chmod_world_rw(shared_local, is_dir=False)
             if work_dir and os.path.isdir(work_dir):
                 _symlink_shared_into_work_dir(
                     shared_local, os.path.join(work_dir, "merged.h5")
                 )
 
-        net_path = to_shared_network_path(shared_local)
         ptr_map: dict[str, str] = getattr(self, "_shared_pointer_ds_by_path", {})
         known_ptr_id = ptr_map.get(os.path.abspath(shared_local))
         if known_ptr_id:
@@ -5920,6 +5920,22 @@ class NovaGalaxyPipelineRunner:
                 def _bg_preupload() -> None:
                     with contextlib.suppress(*_NOVA_RECOVERABLE_ERRORS):
                         bg_rec: dict[str, Any] = {"stdout": ""}
+                        if not self._is_local_staging_mode():
+                            up_id = self._ensure_galaxy_shared_scan_pointer(
+                                store,
+                                merged_dest,
+                                bg_rec,
+                                work_dir=work_dir,
+                                instrument=inst,
+                            )
+                            job_record["outputs"] = [
+                                {
+                                    "id": up_id,
+                                    "name": f"{merged_label}.ref.json",
+                                    "extension": "json",
+                                }
+                            ]
+                            return
                         up_id = self._ensure_galaxy_h5_dataset(
                             store,
                             merged_link,
@@ -9142,10 +9158,13 @@ class NovaGalaxyPipelineRunner:
                                         with contextlib.suppress(OSError):
                                             os.remove(dl_dest)
 
-                                # If reduce ran inside a container without CG4D title goniometer fallback, patch angles in merged.h5
+                                # Never open shared NFS sideband artifacts (ptr_doc != None / symlinks) in 'r+' mode:
+                                # they are write-once immutable after producer fsync+close.
                                 if (
-                                    tmp_path
+                                    ptr_doc is None
+                                    and tmp_path
                                     and os.path.isfile(tmp_path)
+                                    and not os.path.islink(tmp_path)
                                     and job_record.get("stage_id") == "reduce"
                                     and job_record.get("raw_nxs")
                                     and str(job_record.get("instrument") or "CG4D")
@@ -9246,8 +9265,10 @@ class NovaGalaxyPipelineRunner:
                                                         )
 
                                 if (
-                                    tmp_path
+                                    ptr_doc is None
+                                    and tmp_path
                                     and os.path.isfile(tmp_path)
+                                    and not os.path.islink(tmp_path)
                                     and job_record.get("stage_id") == "reduce"
                                 ):
                                     self._stamp_merged_metadata(tmp_path, job_record)

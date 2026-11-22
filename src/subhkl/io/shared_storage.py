@@ -26,9 +26,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# NFS mounts generally lack reliable POSIX byte-range locking (fcntl/lockd);
+# disable HDF5 file locking by default so read-only runners never block or fail with ENOLCK.
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
 SHARED_POINTER_MAGIC_KEY = "subhkl_shared_pointer"
 SHARED_POINTER_VERSION = 1
 _MAX_POINTER_FILE_BYTES = 256 * 1024
+_STAGE_COPY_CHUNK_BYTES = 8 * 1024 * 1024
+_SHARED_UUID_FILENAME_RE = re.compile(r"^subhkl_shared_([0-9a-f]{32})(?:_|$)")
 
 _NETWORK_FSTYPES = frozenset(
     {
@@ -304,6 +310,10 @@ def resolve_shared_local_path(
         for _, _, cand_local in scored_matches:
             if os.path.exists(cand_local):
                 return cand_local
+        for _, _, cand_local in scored_matches:
+            _revalidate_nfs_parent_dir(os.path.dirname(cand_local))
+            if os.path.exists(cand_local):
+                return cand_local
         if not must_exist:
             return best_local
         missing_mount_cand = best_local
@@ -387,6 +397,30 @@ def _chmod_shared_rw(path: str, *, is_dir: bool = False) -> None:
         os.chmod(path, 0o777 if is_dir else 0o666)
 
 
+def _fsync_directory(dir_path: str | None) -> None:
+    """Best-effort ``os.fsync`` on a directory FD so NFS/GPFS commits the new dentry."""
+    if not dir_path or not os.path.isdir(dir_path):
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    dfd: int | None = None
+    with contextlib.suppress(OSError):
+        dfd = os.open(dir_path, flags)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+
+
+def _revalidate_nfs_parent_dir(dir_path: str | None) -> None:
+    """Open and close ``dir_path`` to trigger NFS close-to-open directory attribute revalidation."""
+    if not dir_path or not os.path.isdir(dir_path):
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    with contextlib.suppress(OSError):
+        dfd = os.open(dir_path, flags)
+        os.close(dfd)
+
+
 def get_shared_dir_local(
     *,
     require: bool = False,
@@ -432,7 +466,12 @@ def allocate_shared_artifact_path(
     shared_dir_override: str | None = None,
     mountinfo_text: str | None = None,
 ) -> tuple[str, str]:
-    """Allocate a unique ``(local_path, network_path)`` inside ``SUBHKL_SHARED_DIR``."""
+    """Allocate a brand-new UUIDv4 ``(local_path, network_path)`` inside ``SUBHKL_SHARED_DIR``.
+
+    Uses a full 128-bit random UUIDv4 without probing/stat'ing the target path beforehand so
+    downstream NFS clients are guaranteed a cold dcache/attribute/page-cache miss on first open.
+    """
+    _ = tag  # Kept in signature for caller compatibility; human tags live in JSON pointer metadata.
     shared_local = get_shared_dir_local(
         require=True,
         create=(mountinfo_text is None),
@@ -440,22 +479,93 @@ def allocate_shared_artifact_path(
         mountinfo_text=mountinfo_text,
     )
     assert shared_local is not None
-    clean_tag = "".join(
-        ch if (ch.isalnum() or ch in "._-") else "_" for ch in str(tag or "").strip()
-    ).strip("._-")
     clean_art = "".join(
         ch if (ch.isalnum() or ch in "._-") else "_"
         for ch in os.path.basename(artifact_name or "artifact.h5")
     )
-    uid = uuid.uuid4().hex[:12]
-    fname = (
-        f"subhkl_shared_{uid}_{clean_tag}_{clean_art}"
-        if clean_tag
-        else f"subhkl_shared_{uid}_{clean_art}"
-    )
+    uid = uuid.uuid4().hex
+    fname = f"subhkl_shared_{uid}_{clean_art}"
     local_path = posixpath.join(shared_local, fname)
     net_path = to_shared_network_path(local_path, mountinfo_text=mountinfo_text)
     return local_path, net_path
+
+
+def stage_file_to_shared_dir(
+    src_local_path: str | os.PathLike[str],
+    artifact_name: str = "merged.h5",
+    *,
+    shared_dir_override: str | None = None,
+    mountinfo_text: str | None = None,
+) -> tuple[str, str, str]:
+    """Write ``src_local_path`` once to a brand-new UUID path in ``SUBHKL_SHARED_DIR``, ``fsync``, and close.
+
+    Guarantees NFS close-to-open consistency without locking or ``rename``:
+      1. Allocates a fresh 128-bit UUIDv4 filename (never previously looked up on any client).
+      2. Opens the target exclusively with ``O_WRONLY | O_CREAT | O_EXCL`` and streams all bytes.
+      3. Applies ``0666`` mode via ``fchmod``, calls ``os.fsync(fd)`` to force server ``COMMIT``,
+         closes ``fd`` completely, and ``fsync``s the parent directory.
+    Returns ``(shared_local_path, network_path, artifact_uuid)``.
+    """
+    src_str = os.fspath(src_local_path)
+    if not os.path.isfile(src_str):
+        raise FileNotFoundError(
+            f"Cannot stage missing local artifact '{src_str}' into SUBHKL_SHARED_DIR."
+        )
+    expected_bytes = int(os.path.getsize(src_str))
+    shared_local, net_path = allocate_shared_artifact_path(
+        artifact_name,
+        shared_dir_override=shared_dir_override,
+        mountinfo_text=mountinfo_text,
+    )
+    m_uid = _SHARED_UUID_FILENAME_RE.match(os.path.basename(shared_local))
+    artifact_uuid = m_uid.group(1) if m_uid else uuid.uuid4().hex
+
+    out_fd: int | None = None
+    succeeded = False
+    try:
+        out_fd = os.open(
+            shared_local,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o666,
+        )
+        written = 0
+        with open(src_str, "rb") as src_fh:
+            while True:
+                chunk = src_fh.read(_STAGE_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                mv = memoryview(chunk)
+                off = 0
+                while off < len(mv):
+                    n_put = os.write(out_fd, mv[off:])
+                    if n_put <= 0:
+                        raise OSError(
+                            f"Short write while staging '{shared_local}' to SUBHKL_SHARED_DIR."
+                        )
+                    off += n_put
+                    written += n_put
+        if written != expected_bytes:
+            raise OSError(
+                f"Incomplete write to '{shared_local}': wrote {written} of {expected_bytes} bytes."
+            )
+        if hasattr(os, "fchmod"):
+            with contextlib.suppress(OSError):
+                os.fchmod(out_fd, 0o666)
+        os.fsync(out_fd)
+        fd_to_close = out_fd
+        out_fd = None
+        os.close(fd_to_close)
+        succeeded = True
+    finally:
+        if out_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(out_fd)
+        if not succeeded:
+            with contextlib.suppress(OSError):
+                os.unlink(shared_local)
+
+    _fsync_directory(os.path.dirname(shared_local))
+    return shared_local, net_path, artifact_uuid
 
 
 def read_shared_pointer(path: str | os.PathLike[str] | None) -> dict[str, Any] | None:
@@ -503,15 +613,18 @@ def write_shared_pointer(
     metadata: dict[str, Any] | None = None,
     mountinfo_text: str | None = None,
 ) -> dict[str, Any]:
-    """Write a compact JSON pointer file referencing ``local_shared_h5_path`` by full network path."""
+    """Publish a compact JSON pointer file AFTER ``local_shared_h5_path`` is closed and ``fsync``ed."""
     local_str = os.fspath(local_shared_h5_path)
-    if mountinfo_text is None and os.path.isfile(local_str):
-        _chmod_shared_rw(local_str, is_dir=False)
+    if mountinfo_text is None and not os.path.isfile(local_str):
+        raise FileNotFoundError(
+            f"Refusing to publish shared pointer before '{local_str}' exists on disk."
+        )
     net_path = to_shared_network_path(local_str, mountinfo_text=mountinfo_text)
     shared_dir_net = to_shared_network_path(
         os.path.dirname(os.path.abspath(local_str)),
         mountinfo_text=mountinfo_text,
     )
+    m_uid = _SHARED_UUID_FILENAME_RE.match(os.path.basename(local_str))
     doc: dict[str, Any] = {
         SHARED_POINTER_MAGIC_KEY: SHARED_POINTER_VERSION,
         "artifact": str(artifact),
@@ -520,6 +633,8 @@ def write_shared_pointer(
         "delete_after_use": bool(delete_after_use),
         "created_at": time.time(),
     }
+    if m_uid:
+        doc["artifact_uuid"] = m_uid.group(1)
     if mountinfo_text is None and os.path.isfile(local_str):
         with contextlib.suppress(OSError):
             doc["size_bytes"] = int(os.path.getsize(local_str))
@@ -528,15 +643,48 @@ def write_shared_pointer(
             if k not in doc and v is not None:
                 doc[k] = v
 
+    payload_bytes = (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode("utf-8")
     ptr_str = os.fspath(pointer_path)
     parent = os.path.dirname(os.path.abspath(ptr_str))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(ptr_str, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, indent=2, sort_keys=True)
-        fh.write("\n")
+    with open(ptr_str, "wb") as fh:
+        fh.write(payload_bytes)
+        fh.flush()
+        os.fsync(fh.fileno())
     _chmod_shared_rw(ptr_str, is_dir=False)
+    _fsync_directory(parent)
     return doc
+
+
+def publish_shared_artifact(
+    src_local_path: str | os.PathLike[str],
+    pointer_path: str | os.PathLike[str],
+    *,
+    artifact: str = "merged.h5",
+    delete_after_use: bool = False,
+    metadata: dict[str, Any] | None = None,
+    shared_dir_override: str | None = None,
+    mountinfo_text: str | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Stage ``src_local_path`` to a unique UUID file, ``fsync`` + close it, then publish ``pointer_path``."""
+    shared_local, _net_path, uid = stage_file_to_shared_dir(
+        src_local_path,
+        artifact_name=artifact,
+        shared_dir_override=shared_dir_override,
+        mountinfo_text=mountinfo_text,
+    )
+    merged_meta = dict(metadata or {})
+    merged_meta.setdefault("artifact_uuid", uid)
+    ptr_doc = write_shared_pointer(
+        pointer_path,
+        shared_local,
+        artifact=artifact,
+        delete_after_use=delete_after_use,
+        metadata=merged_meta,
+        mountinfo_text=mountinfo_text,
+    )
+    return shared_local, ptr_doc
 
 
 def resolve_input_h5_path(

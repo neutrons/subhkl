@@ -23,6 +23,7 @@
     export TMPDIR="\$PWD/subhkl_staging" SUBHKL_STAGING_DIR="\$PWD/subhkl_staging" &&
     export SUBHKL_EXEC_MODE="\${SUBHKL_EXEC_MODE:-galaxy}" &&
     export SUBHKL_SHARED_DIR="\${SUBHKL_SHARED_DIR:-/gpfs/neutronsfs/scratch/subhkl_shared}" &&
+    export HDF5_USE_FILE_LOCKING=FALSE &&
     mv "$peaks_h5" "$peaks_h5.element_identifier" ;
     python -m subhkl.io.parser rainbow-visualize "$peaks_h5.element_identifier"
       --serve
