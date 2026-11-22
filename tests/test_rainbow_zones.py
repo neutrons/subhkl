@@ -11620,6 +11620,20 @@ if (hPt) {
   holzHoverTexts = [...detLog.texts];
 }
 
+// Verify that when a* is > 25% of a panel width away from every panel (removing Banks 1 & 2), a* is NOT drawn
+const savedPanels = [...PANELS];
+const savedCfgs = Object.assign({}, DATA.detector_configs);
+PANELS.splice(0, PANELS.length, ...savedPanels.filter(p => (p.bank ?? p.id) >= 3));
+delete DATA.detector_configs["1"];
+delete DATA.detector_configs["2"];
+_fullFacePanelsCacheKey = "";
+_nodalPointsCacheSig = "";
+const symsWithoutBank12 = getVisibleNodalPoints().filter(n => n.isPrincipal).map(n => n.principalSymbol).sort();
+PANELS.splice(0, PANELS.length, ...savedPanels);
+DATA.detector_configs = savedCfgs;
+_fullFacePanelsCacheKey = "";
+_nodalPointsCacheSig = "";
+
 // Toggle #btn-nodal-points off -> nodals hidden
 getEl("btn-nodal-points").click();
 const nodalsWhenOff = getVisibleNodalPoints().length;
@@ -11628,13 +11642,16 @@ console.log(JSON.stringify({
   principalSymsWhenNone,
   canvasLabelsWhenNone,
   aOnPanel: nodalA ? nodalA.onPanel : null,
+  aGapPanelFrac: nodalA ? nodalA.gapPanelFrac : null,
   bOnPanel: nodalB ? nodalB.onPanel : null,
   cOnPanel: nodalC ? nodalC.onPanel : null,
+  symsWithoutBank12,
   distCenterToPanelPx,
   nodalARadiusPx: hitRecA ? hitRecA.r : 0,
   panelOverlapPx,
   gapHoverHasBadge: gapHoverBadgeTexts.some(t => t.includes("Nodal a*") && t.includes("[gap]")),
-  gapInspectorHasAStar: gapInspectorHtml.includes("a*") && gapInspectorHtml.includes("Inter-panel gap"),
+  gapHoverUsesZonesLabel: gapHoverBadgeTexts.some(t => t.includes("zones)")),
+  gapInspectorHasAStar: gapInspectorHtml.includes("a*") && gapInspectorHtml.includes("% panel width"),
   secondaryCountOrder1,
   chosenArcLabel,
   zoneArcHasBadge: Boolean(chosenArcLabel && zoneArcBadgeTexts.some(t => t.includes(`Zone ${chosenArcLabel}`))),
@@ -11664,11 +11681,14 @@ process.exit(0);
     assert out["principalSymsWhenNone"] == ["a*", "b*", "c*"]
     assert out["canvasLabelsWhenNone"] is True
     assert out["aOnPanel"] is False
+    assert 0.0 < out["aGapPanelFrac"] <= 0.25
     assert out["bOnPanel"] is True
     assert out["cOnPanel"] is True
+    assert out["symsWithoutBank12"] == ["b*", "c*"]
     assert out["distCenterToPanelPx"] > 2.0
     assert out["panelOverlapPx"] >= 6.0
     assert out["gapHoverHasBadge"] is True
+    assert out["gapHoverUsesZonesLabel"] is True
     assert out["gapInspectorHasAStar"] is True
     assert out["secondaryCountOrder1"] >= 1
     assert out["zoneArcHasBadge"] is True

@@ -16449,9 +16449,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       : "";
     const locStr = nodal.onPanel
       ? `Bank #${{nodal.bank || 1}}`
-      : `Inter-panel gap (${{(nodal.gapDeg || 0).toFixed(1)}}° to Bank #${{nodal.nearBank || 1}})`;
-    const zonesStr = Array.isArray(nodal.zoneLabels) && nodal.zoneLabels.length > 0
-      ? nodal.zoneLabels.slice(0, 4).join(" × ") + (nodal.zoneLabels.length > 4 ? ` (+${{nodal.zoneLabels.length - 4}})` : "")
+      : `Inter-panel gap (${{(nodal.gapDeg || 0).toFixed(1)}}°, ${{Math.round((nodal.gapPanelFrac || 0) * 100)}}% panel width to Bank #${{nodal.nearBank || 1}})`;
+    const zCount = Array.isArray(nodal.zoneLabels) ? nodal.zoneLabels.length : 0;
+    const zonesStr = zCount > 0
+      ? nodal.zoneLabels.slice(0, 4).join(" × ") + (zCount > 4 ? ` (+${{zCount - 4}} more, ${{zCount}} zones total)` : ` (${{zCount}} zones)`)
       : "principal reciprocal axis";
     setStatusLine(
       `[NODAL ${{nodal.principalSymbol || hklStr}}]`,
@@ -17673,6 +17674,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         det_y: yM,
         det_el: elDeg,
         gapDeg: 0.0,
+        gapPanelFrac: 0.0,
         nearAz: azDeg,
         nearY: yM,
         nearEl: elDeg,
@@ -17723,6 +17725,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         det_y: yM,
         det_el: elDeg,
         gapDeg: 0.0,
+        gapPanelFrac: 0.0,
         nearAz: azDeg,
         nearY: yM,
         nearEl: elDeg,
@@ -17731,10 +17734,11 @@ window.RAINBOW_ZONES_DATA = {payload_json};
 
     // Check against PANELS 2D bounds (including synthetic demos without detector_configs and inter-bank gaps)
     let minGapDeg = 1e9;
+    let minGapPanelFrac = 1e9;
     let nearAz = azDeg;
     let nearY = yM;
     let nearEl = elDeg;
-    let nearBank = PANELS[0].id || 1;
+    let nearBank = PANELS[0].bank ?? PANELS[0].id ?? 1;
     let insidePanel2D = false;
 
     for (let i = 0; i < PANELS.length; i++) {{
@@ -17768,19 +17772,29 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       if (dAz === 0.0 && dEl === 0.0 && fullPanels.length === 0) {{
         insidePanel2D = true;
         minGapDeg = 0.0;
+        minGapPanelFrac = 0.0;
         nearAz = azDeg;
         nearY = yM;
         nearEl = elDeg;
-        nearBank = p.id || (i + 1);
+        nearBank = p.bank ?? p.id ?? (i + 1);
         break;
       }}
       const gDeg = Math.hypot(dAz, dEl);
-      if (gDeg < minGapDeg) {{
+      // Distance normalized by panel dimensions (capping monolithic curved azimuth spans at 24°)
+      const effSpanAz = Math.min(24.0, Math.max(2.0, azMax - azMin));
+      const fracAz = dAz / effSpanAz;
+      const hasValidY = Number.isFinite(yMin) && Number.isFinite(yMax) && (yMax - yMin) > 1e-4;
+      const fracVert = hasValidY
+        ? (Math.abs(yM - clampedY) / Math.max(0.02, yMax - yMin))
+        : (dEl / Math.min(24.0, Math.max(2.0, elMax - elMin)));
+      const panelFrac = Math.hypot(fracAz, fracVert);
+      if (panelFrac < minGapPanelFrac || (Math.abs(panelFrac - minGapPanelFrac) < 1e-6 && gDeg < minGapDeg)) {{
+        minGapPanelFrac = panelFrac;
         minGapDeg = gDeg;
         nearAz = clampedAz;
         nearY = clampedY;
         nearEl = clampedEl;
-        nearBank = p.id || (i + 1);
+        nearBank = p.bank ?? p.id ?? (i + 1);
       }}
     }}
 
@@ -17794,15 +17808,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         det_y: yM,
         det_el: elDeg,
         gapDeg: 0.0,
+        gapPanelFrac: 0.0,
         nearAz,
         nearY,
         nearEl,
       }};
     }}
 
-    const MAX_NODAL_GAP_DEG = 9.0;
+    // Suppress nodals beyond 25% of a panel width/height away from any active detector panel
+    const MAX_NODAL_GAP_FRAC = 0.25;
     return {{
-      visible: minGapDeg <= MAX_NODAL_GAP_DEG,
+      visible: minGapPanelFrac <= MAX_NODAL_GAP_FRAC,
       onPanel: false,
       bank: null,
       nearBank,
@@ -17810,6 +17826,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       det_y: yM,
       det_el: elDeg,
       gapDeg: minGapDeg,
+      gapPanelFrac: minGapPanelFrac,
       nearAz,
       nearY,
       nearEl,
@@ -17964,6 +17981,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         bank: proj.bank,
         nearBank: proj.nearBank,
         gapDeg: proj.gapDeg,
+        gapPanelFrac: proj.gapPanelFrac || 0.0,
         nearAz: proj.nearAz,
         nearY: proj.nearY,
         nearEl: proj.nearEl,
@@ -19868,38 +19886,43 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               const edgeY = affScaleY * nearVert + affOffsetY;
               const dPanelPx = Math.hypot(x - edgeX, y - edgeY);
               if (Number.isFinite(dPanelPx) && dPanelPx > 0.0) {{
-                // Ensure the circle bridges inter-panel gaps so >= 6.5 px overlaps onto the adjacent panel
-                nodalR = Math.max(baseNodalR, Math.min(38.0, dPanelPx + 6.5));
+                // Bridge narrow inter-panel gaps (<= 25% panel width) so >= 6.5 px overlaps onto the adjacent panel
+                nodalR = Math.max(baseNodalR, Math.min(28.0, dPanelPx + 6.5));
               }}
             }}
 
             const isHovNodal = state.hoveredNodalKey !== null && state.hoveredNodalKey === nd.key;
+            const offPanelDim = nd.onPanel
+              ? 1.0
+              : Math.max(0.32, 0.58 - 0.9 * (nd.gapPanelFrac || 0.0));
+            const effAlpha = isHovNodal ? 1.0 : offPanelDim;
             _detNodalScreenHits.push({{ nodal: nd, x, y, r: nodalR }});
 
-            // Soft circular interior tint so gap-straddling nodal circles remain legible across panels & gaps
+            // Soft circular interior tint (subdued when off-panel in a gap unless hovered)
             ctx.beginPath();
             ctx.arc(x, y, nodalR, 0, Math.PI * 2);
             ctx.fillStyle = nd.isPrincipal
-              ? (isHovNodal ? "rgba(251, 191, 36, 0.24)" : "rgba(251, 191, 36, 0.12)")
-              : (isHovNodal ? "rgba(56, 189, 248, 0.22)" : "rgba(15, 23, 42, 0.24)");
+              ? (isHovNodal ? "rgba(251, 191, 36, 0.24)" : (nd.onPanel ? "rgba(251, 191, 36, 0.12)" : "rgba(251, 191, 36, 0.04)"))
+              : (isHovNodal ? "rgba(56, 189, 248, 0.22)" : (nd.onPanel ? "rgba(15, 23, 42, 0.24)" : "rgba(15, 23, 42, 0.10)"));
             ctx.fill();
 
             // Dark contrast halo + colored outer ring
+            ctx.globalAlpha = effAlpha;
             ctx.beginPath();
             ctx.arc(x, y, nodalR, 0, Math.PI * 2);
             ctx.strokeStyle = "rgba(7, 9, 19, 0.88)";
-            ctx.lineWidth = isHovNodal ? 4.2 : 3.4;
+            ctx.lineWidth = isHovNodal ? 4.2 : 3.2;
             ctx.stroke();
 
             ctx.beginPath();
             ctx.arc(x, y, nodalR, 0, Math.PI * 2);
             ctx.strokeStyle = isHovNodal ? "#ffffff" : nd.color;
             ctx.lineWidth = isHovNodal ? 2.5 : (nd.isPrincipal ? 2.1 : 1.7);
-            ctx.globalAlpha = isHovNodal ? 1.0 : (nd.isPrincipal ? 0.96 : 0.86);
+            ctx.globalAlpha = isHovNodal ? 1.0 : ((nd.isPrincipal ? 0.96 : 0.86) * offPanelDim);
             ctx.stroke();
-            ctx.globalAlpha = 1.0;
 
             if (isHovNodal) {{
+              ctx.globalAlpha = 1.0;
               ctx.beginPath();
               ctx.arc(x, y, nodalR + 3.2, 0, Math.PI * 2);
               ctx.strokeStyle = nd.color;
@@ -19908,6 +19931,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             }}
 
             // Central filled bull's-eye dot
+            ctx.globalAlpha = effAlpha;
             const dotR = isHovNodal ? 3.5 : (nd.isPrincipal ? 3.0 : 2.4);
             ctx.beginPath();
             ctx.arc(x, y, dotR + 1.3, 0, Math.PI * 2);
@@ -19934,6 +19958,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               ctx.fillStyle = "#fbbf24";
               ctx.fillText(sym, px + 4, pyPill + 11);
             }}
+            ctx.globalAlpha = 1.0;
 
             if (isHovNodal && x >= -20 && x <= w + 20 && pendingNodalTooltips.length === 0) {{
               pendingNodalTooltips.push({{ nd, x, y, r: nodalR }});
@@ -19970,8 +19995,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     pendingNodalTooltips.forEach(({{ nd, x, y, r }}) => {{
       const hklStr = Array.isArray(nd.hkl) ? `(${{nd.hkl.join(",")}})` : "";
       const head = nd.principalSymbol ? `Nodal ${{nd.principalSymbol}} ${{hklStr}}` : `Nodal ${{hklStr}}`;
-      const zPart = Array.isArray(nd.zoneLabels) && nd.zoneLabels.length > 0
-        ? ` • ${{nd.zoneLabels.slice(0, 3).join("×")}}${{nd.zoneLabels.length > 3 ? `+${{nd.zoneLabels.length - 3}}` : ""}}`
+      const zCount = Array.isArray(nd.zoneLabels) ? nd.zoneLabels.length : 0;
+      const zPart = zCount > 0
+        ? ` • ${{nd.zoneLabels.slice(0, 2).join("×")}}${{zCount > 2 ? ` (+${{zCount - 2}} more, ${{zCount}} zones)` : ""}}`
         : "";
       const dPart = typeof nd.d1 === "number" && nd.d1 > 0 ? ` • d₁=${{nd.d1.toFixed(2)}}Å` : "";
       const gapPart = !nd.onPanel ? " [gap]" : "";
