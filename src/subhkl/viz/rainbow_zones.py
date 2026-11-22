@@ -11412,9 +11412,9 @@ def render_rainbow_html(
           </div>
         </div>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:4px;margin-bottom:3px;font-size:0.58rem;">
-          <span style="color:var(--text-dim);font-family:var(--font-display);letter-spacing:0.2px;" title="Nodal points (zone intersections + {{a*, b*, c*}} reciprocal axes) and Higher-Order Laue Zones (G·[uvw] = ±1, ±2)">Hubs / HOLZ</span>
+          <span style="color:var(--text-dim);font-family:var(--font-display);letter-spacing:0.2px;" title="Nodal points (zone intersections + {{a⋆, b⋆, c⋆}} reciprocal axes) and Higher-Order Laue Zones (G·[uvw] = ±1, ±2)">Hubs / HOLZ</span>
           <div style="display:flex;gap:2px;align-items:center;">
-            <button id="btn-nodal-points" type="button" class="active-btn" style="padding:1px 5px;font-size:0.58rem;" title="Show/Hide Laue zone nodal intersections and {{a*, b*, c*}} reciprocal axis circles">⊙ Nodals</button>
+            <button id="btn-nodal-points" type="button" class="active-btn" style="padding:1px 5px;font-size:0.58rem;" title="Show/Hide Laue zone nodal intersections and {{a⋆, b⋆, c⋆}} reciprocal axis circles">⊙ Nodals</button>
             <button id="btn-holz-1" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Toggle 1st-order Higher-Order Laue Zones (G·[uvw] = ±1)">±1</button>
             <button id="btn-holz-2" type="button" style="padding:1px 5px;font-size:0.58rem;" title="Toggle 2nd-order Higher-Order Laue Zones (G·[uvw] = ±2)">±2</button>
           </div>
@@ -16508,8 +16508,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
   function updateNodalInspector(nodal) {{
     if (!nodal) return;
     const hklStr = Array.isArray(nodal.hkl) ? `(${{nodal.hkl.join(", ")}})` : "";
-    const titleStr = nodal.principalSymbol
-      ? `${{nodal.principalSymbol}} ${{hklStr}}`
+    const symHtml = nodal.principalHtml || nodal.principalSymbol || "";
+    const titleStr = symHtml
+      ? `${{symHtml}} ${{hklStr}}`
       : `Nodal ${{hklStr}}`;
     const dStr = typeof nodal.d1 === "number" && nodal.d1 > 0
       ? ` • d₁=<strong>${{nodal.d1.toFixed(2)}} Å</strong>`
@@ -16528,6 +16529,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       `[NODAL ${{nodal.principalSymbol || hklStr}}]`,
       `<strong style="color:var(--accent-gold);">${{titleStr}}</strong> • ${{locStr}}${{dStr}}${{lamStr}} • φ=${{nodal.det_x.toFixed(1)}}°, ψ=${{nodal.det_el.toFixed(1)}}° • Zones: <span style="color:var(--accent-cyan);">${{zonesStr}}</span>`
     );
+    if (nodal.principalHtml) {{
+      const cb = document.getElementById("combo-badge");
+      if (cb) cb.innerHTML = `[NODAL ${{nodal.principalHtml}}]`;
+    }}
   }}
 
   function isPeakVisible(p) {{
@@ -17996,6 +18001,24 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     }};
   }}
 
+  function measurePrincipalStarSymbol(ctx, baseChar, basePx, supPx) {{
+    ctx.font = `bold ${{basePx}}px monospace`;
+    const bw = ctx.measureText(baseChar).width;
+    ctx.font = `bold ${{supPx}}px sans-serif`;
+    const sw = ctx.measureText("⋆").width;
+    return bw + sw + 0.5;
+  }}
+
+  function drawPrincipalStarSymbol(ctx, baseChar, x, y, basePx, supPx) {{
+    ctx.font = `bold ${{basePx}}px monospace`;
+    const bw = ctx.measureText(baseChar).width;
+    ctx.fillText(baseChar, x, y);
+    ctx.font = `bold ${{supPx}}px sans-serif`;
+    ctx.fillText("⋆", x + bw + 0.5, y - Math.round(0.42 * basePx));
+    const sw = ctx.measureText("⋆").width;
+    return bw + sw + 0.5;
+  }}
+
   let _nodalPointsCacheSig = "";
   let _nodalPointsCache = [];
   function getVisibleNodalPoints() {{
@@ -18053,7 +18076,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       return null;
     }}
 
-    function buildCandidateFromHklOrDir(hkl0, fallbackGLab, principalSymbol) {{
+    function buildCandidateFromHklOrDir(hkl0, fallbackGLab, principalSpec) {{
+      const principalSymbol = principalSpec ? principalSpec.sym : null;
+      const principalBase = principalSpec ? principalSpec.base : null;
+      const principalHtml = principalSpec ? principalSpec.html : null;
       let gCryst0 = null;
       let gLab0 = null;
       let d1 = null;
@@ -18139,7 +18165,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         hkl: signedHkl,
         canonHkl: hkl0,
         isPrincipal: Boolean(principalSymbol),
+        principalBase: principalBase || null,
         principalSymbol: principalSymbol || null,
+        principalHtml: principalHtml || null,
         color: principalSymbol ? "#fbbf24" : leadColor,
         det_x: proj.det_x,
         det_y: proj.det_y,
@@ -18165,9 +18193,9 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     const seenKeys = new Set();
     const principals = [];
     const PRINCIPAL_SPECS = [
-      {{ hkl: [1, 0, 0], sym: "a*", crossA: "0,1,0", crossB: "0,0,1" }},
-      {{ hkl: [0, 1, 0], sym: "b*", crossA: "0,0,1", crossB: "1,0,0" }},
-      {{ hkl: [0, 0, 1], sym: "c*", crossA: "1,0,0", crossB: "0,1,0" }},
+      {{ hkl: [1, 0, 0], base: "a", sym: "a⋆", html: 'a<sup style="font-size:0.72em;line-height:0;">⋆</sup>', crossA: "0,1,0", crossB: "0,0,1" }},
+      {{ hkl: [0, 1, 0], base: "b", sym: "b⋆", html: 'b<sup style="font-size:0.72em;line-height:0;">⋆</sup>', crossA: "0,0,1", crossB: "1,0,0" }},
+      {{ hkl: [0, 0, 1], base: "c", sym: "c⋆", html: 'c<sup style="font-size:0.72em;line-height:0;">⋆</sup>', crossA: "1,0,0", crossB: "0,1,0" }},
     ];
     for (let pi = 0; pi < PRINCIPAL_SPECS.length; pi++) {{
       const sp = PRINCIPAL_SPECS[pi];
@@ -18177,7 +18205,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         const tb = zoneAxisByUvw.get(sp.crossB);
         if (ta && tb) fallbackG = vecCross(ta, tb);
       }}
-      const cand = buildCandidateFromHklOrDir(sp.hkl, fallbackG, sp.sym);
+      const cand = buildCandidateFromHklOrDir(sp.hkl, fallbackG, sp);
       if (cand) {{
         seenKeys.add(cand.key);
         principals.push(cand);
@@ -20108,11 +20136,10 @@ window.RAINBOW_ZONES_DATA = {payload_json};
             ctx.fillStyle = isHovNodal ? "#ffffff" : nd.color;
             ctx.fill();
 
-            // Persistent {{a*, b*, c*}} callout pill on principal reciprocal axes
-            if (nd.isPrincipal && nd.principalSymbol && x >= -10 && x <= w + 10 && y >= 0 && y <= h) {{
-              ctx.font = "bold 10px monospace";
-              const sym = nd.principalSymbol;
-              const pw = ctx.measureText(sym).width + 8;
+            // Persistent {{a^⋆, b^⋆, c^⋆}} callout pill on principal reciprocal axes (true raised superscript ⋆)
+            if (nd.isPrincipal && nd.principalBase && x >= -10 && x <= w + 10 && y >= 0 && y <= h) {{
+              const sw = measurePrincipalStarSymbol(ctx, nd.principalBase, 10.5, 8);
+              const pw = sw + 8;
               const ph = 15;
               const px = Math.min(Math.max(3, x + nodalR + 4), Math.max(3, w - pw - 3));
               const pyPill = Math.min(Math.max(3, y - 0.5 * ph), Math.max(3, h - ph - 3));
@@ -20122,7 +20149,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
               ctx.lineWidth = 1.1;
               ctx.strokeRect(px, pyPill, pw, ph);
               ctx.fillStyle = "#fbbf24";
-              ctx.fillText(sym, px + 4, pyPill + 11);
+              drawPrincipalStarSymbol(ctx, nd.principalBase, px + 4, pyPill + 11.5, 10.5, 8);
             }}
             ctx.globalAlpha = 1.0;
 
@@ -20160,17 +20187,27 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     // Render floating badge when hovering over a Nodal circle (stacked cleanly above any coincident peak tooltip)
     pendingNodalTooltips.forEach(({{ nd, x, y, r }}) => {{
       const hklStr = Array.isArray(nd.hkl) ? `(${{nd.hkl.join(",")}})` : "";
-      const head = nd.principalSymbol ? `Nodal ${{nd.principalSymbol}} ${{hklStr}}` : `Nodal ${{hklStr}}`;
       const zCount = Array.isArray(nd.zoneLabels) ? nd.zoneLabels.length : 0;
       const zPart = zCount > 0
         ? ` • ${{nd.zoneLabels.slice(0, 2).join("×")}}${{zCount > 2 ? ` (+${{zCount - 2}} more, ${{zCount}} zones)` : ""}}`
         : "";
       const dPart = typeof nd.d1 === "number" && nd.d1 > 0 ? ` • d₁=${{nd.d1.toFixed(2)}}Å` : "";
       const gapPart = !nd.onPanel ? " [gap]" : "";
-      const tag = `${{head}}${{zPart}}${{dPart}}${{gapPart}}`;
+      const tail = `${{hklStr ? " " + hklStr : ""}}${{zPart}}${{dPart}}${{gapPart}}`;
       ctx.save();
-      ctx.font = "bold 11px monospace";
-      const tw = ctx.measureText(tag).width + 12;
+      let textW = 0;
+      if (nd.principalBase) {{
+        ctx.font = "bold 11px monospace";
+        const preW = ctx.measureText("Nodal ").width;
+        const symW = measurePrincipalStarSymbol(ctx, nd.principalBase, 11, 8.5);
+        ctx.font = "bold 11px monospace";
+        textW = preW + symW + ctx.measureText(tail).width;
+      }} else {{
+        const tag = `Nodal${{tail}}`;
+        ctx.font = "bold 11px monospace";
+        textW = ctx.measureText(tag).width;
+      }}
+      const tw = textW + 12;
       const tx = Math.min(Math.max(4, x + r + 6), Math.max(4, w - tw - 4));
       const stackOffset = pendingTooltips.length > 0 ? 22 : 0;
       const ty = Math.max(22, y - stackOffset);
@@ -20180,7 +20217,17 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       ctx.lineWidth = 1.35;
       ctx.strokeRect(tx, ty - 20, tw, 18);
       ctx.fillStyle = nd.isPrincipal ? "#fbbf24" : (nd.color || "#38bdf8");
-      ctx.fillText(tag, tx + 6, ty - 7);
+      if (nd.principalBase) {{
+        ctx.font = "bold 11px monospace";
+        const preW = ctx.measureText("Nodal ").width;
+        ctx.fillText("Nodal ", tx + 6, ty - 7);
+        const symW = drawPrincipalStarSymbol(ctx, nd.principalBase, tx + 6 + preW, ty - 7, 11, 8.5);
+        ctx.font = "bold 11px monospace";
+        ctx.fillText(tail, tx + 6 + preW + symW, ty - 7);
+      }} else {{
+        ctx.font = "bold 11px monospace";
+        ctx.fillText(`Nodal${{tail}}`, tx + 6, ty - 7);
+      }}
       ctx.restore();
     }});
 
@@ -21039,12 +21086,13 @@ window.RAINBOW_ZONES_DATA = {payload_json};
         ctx.arc(nsx, nsy, isExp ? 2.1 : 1.6, 0, Math.PI * 2);
         ctx.fillStyle = "#fbbf24";
         ctx.fill();
-        if ((isExp || nhemi >= 0) && nd.principalSymbol) {{
-          ctx.font = isExp ? "bold 9.5px monospace" : "bold 8px monospace";
+        if ((isExp || nhemi >= 0) && nd.principalBase) {{
+          const bPx = isExp ? 9.5 : 8.0;
+          const sPx = isExp ? 7.5 : 6.4;
           ctx.fillStyle = "#070913";
-          ctx.fillText(nd.principalSymbol, nsx + nr + 3, nsy + 3);
+          drawPrincipalStarSymbol(ctx, nd.principalBase, nsx + nr + 3, nsy + 3, bPx, sPx);
           ctx.fillStyle = "#fbbf24";
-          ctx.fillText(nd.principalSymbol, nsx + nr + 2, nsy + 2);
+          drawPrincipalStarSymbol(ctx, nd.principalBase, nsx + nr + 2, nsy + 2, bPx, sPx);
         }}
       }}
       ctx.restore();
