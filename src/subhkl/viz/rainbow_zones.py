@@ -10150,23 +10150,51 @@ def render_rainbow_html(
     flex-wrap: wrap;
   }}
 
+  .stereo-inset.expanded .stereo-inset-header {{
+    flex-wrap: nowrap;
+  }}
+
   #stereo-title {{
-    flex: 1 1 88px;
+    order: 1;
+    flex: 1 1 0;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }}
 
+  .stereo-win-controls {{
+    order: 2;
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex: 0 0 auto;
+    margin-left: auto;
+  }}
+
+  .stereo-inset.expanded .stereo-win-controls {{
+    order: 3;
+    margin-left: 0;
+  }}
+
   .stereo-toolbar {{
+    order: 3;
     display: flex;
     align-items: center;
     gap: 3px;
-    flex-wrap: wrap;
-    flex: 0 0 auto;
+    flex-wrap: nowrap;
+    flex: 1 1 100%;
+    width: 100%;
+    min-width: 0;
   }}
 
-  .stereo-toolbar button, .stereo-toolbar select {{
+  .stereo-inset.expanded .stereo-toolbar {{
+    order: 2;
+    flex: 0 0 auto;
+    width: auto;
+  }}
+
+  .stereo-toolbar button, .stereo-toolbar select, .stereo-win-controls button {{
     font-size: 0.58rem;
     padding: 1px 5px;
     border-radius: 4px;
@@ -10179,6 +10207,16 @@ def render_rainbow_html(
     white-space: nowrap;
   }}
 
+  .stereo-win-controls button {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 19px;
+    height: 18px;
+    padding: 0;
+    line-height: 1;
+  }}
+
   #btn-wulff-scope {{
     flex: 0 0 54px;
     width: 54px;
@@ -10189,10 +10227,17 @@ def render_rainbow_html(
   }}
 
   #sel-wulff-color {{
-    width: 96px;
-    max-width: 96px;
+    flex: 1 1 0;
+    min-width: 0;
+    max-width: 108px;
     overflow: hidden;
     text-overflow: ellipsis;
+  }}
+
+  .stereo-inset.expanded #sel-wulff-color {{
+    flex: 0 0 96px;
+    width: 96px;
+    max-width: 96px;
   }}
 
   .stereo-merge-bar {{
@@ -10961,9 +11006,9 @@ def render_rainbow_html(
   }}
 
   .seg-toggle button[data-peak-src="integrated"].active-btn {{
-    background: var(--integ-btn-bg, rgba(251, 140, 36, 0.24));
-    color: var(--integ-btn-fg, #fde68a);
-    text-shadow: 0 0 6px var(--integ-btn-glow, rgba(251, 140, 36, 0.45));
+    background: rgba(251, 191, 36, 0.20);
+    color: #fbbf24;
+    text-shadow: 0 0 6px rgba(251, 191, 36, 0.38);
   }}
 
   .editable-slider-val {{
@@ -11255,9 +11300,9 @@ def render_rainbow_html(
           <div class="stereo-inset-header">
             <span id="stereo-title" style="color:var(--accent-cyan);font-weight:700;">WULFF NET</span>
             <div class="stereo-toolbar">
-              <button id="btn-wulff-scope" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
-              <button id="btn-wulff-friedel" class="active-btn" title="Show antipodal Friedel mates (-h,-k,-l) on the Wulff sphere (fills the θ vs 2θ hemisphere; violet symmetry links vs gold proper rotations)">±Friedel</button>
-              <select id="sel-wulff-color" title="Color reflections on Wulff Net & Detector by Wavelength, ASU Symmetry Orbit, Divergent Quantile I/σ, .mtz I/σ, or Careless Merge Residual">
+              <button id="btn-wulff-scope" type="button" title="Toggle between Single Frame (1-Frame) and All Runs Aggregated (All-Runs)">1-Frame</button>
+              <button id="btn-wulff-friedel" type="button" class="active-btn" title="Show antipodal Friedel mates (-h,-k,-l) on the Wulff sphere (fills the θ vs 2θ hemisphere; violet symmetry links vs gold proper rotations)">±Friedel</button>
+              <select id="sel-wulff-color" title="Color reflections on Wulff Net &amp; Detector by Wavelength, ASU Symmetry Orbit, Divergent Quantile I/σ, .mtz I/σ, or Careless Merge Residual">
                 <option value="wavelength">Color: λ/Zone</option>
                 <option value="orbit">Color: ASU Orbit</option>
                 <option value="isigi">Color: I/σ</option>
@@ -11265,8 +11310,10 @@ def render_rainbow_html(
                 <option value="residual">Color: ΔI/σ Residual</option>
                 <option value="scale">Color: Scale</option>
               </select>
-              <button id="btn-wulff-expand" title="Toggle between side-by-side Split View and docked Corner Inset">Split</button>
-              <button id="btn-wulff-close" title="Hide Wulff Net">X</button>
+            </div>
+            <div class="stereo-win-controls">
+              <button id="btn-wulff-expand" type="button" data-caret="up" aria-label="Magnify Wulff Net to side-by-side Split View" title="Magnify Wulff Net to side-by-side Split View"><svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3.5 10.5 8 6 12.5 10.5"/></svg></button>
+              <button id="btn-wulff-close" type="button" aria-label="Hide Wulff Net" title="Hide Wulff Net">X</button>
             </div>
           </div>
           <canvas id="canvas-stereo" style="flex:1;width:100%;min-height:0;cursor:grab;"></canvas>
@@ -15975,26 +16022,6 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       lbl.textContent = spec.label;
       lbl.title = spec.tooltip || "";
     }}
-    const btnInteg = document.getElementById("btn-peaks-integ");
-    if (btnInteg && btnInteg.style && typeof btnInteg.style.setProperty === "function") {{
-      // Mirror the warm divergent I/σ slider's positive arm: Champagne-Gold (254,232,170) -> Solar Tangerine (251,140,36) -> Flame-Vermilion (232,56,24)
-      const w = Math.max(0.0, Math.min(1.0, 1.0 - c));
-      let r, g, b;
-      if (w <= 0.62) {{
-        const u = w / 0.62;
-        r = Math.round(254 + u * (251 - 254));
-        g = Math.round(232 + u * (140 - 232));
-        b = Math.round(170 + u * (36 - 170));
-      }} else {{
-        const u = (w - 0.62) / 0.38;
-        r = Math.round(251 + u * (232 - 251));
-        g = Math.round(140 + u * (56 - 140));
-        b = Math.round(36 + u * (24 - 36));
-      }}
-      btnInteg.style.setProperty("--integ-btn-bg", `rgba(${{r}}, ${{g}}, ${{b}}, 0.25)`);
-      btnInteg.style.setProperty("--integ-btn-fg", w > 0.72 ? "#fed7aa" : "#fde68a");
-      btnInteg.style.setProperty("--integ-btn-glow", `rgba(${{r}}, ${{g}}, ${{b}}, 0.48)`);
-    }}
   }}
 
   function syncWulffUI() {{
@@ -16036,8 +16063,16 @@ window.RAINBOW_ZONES_DATA = {payload_json};
       btnFriedel.classList.toggle("active-btn", Boolean(state.showWulffFriedel));
     }}
     if (btnExpand) {{
-      btnExpand.textContent = state.wulffExpanded ? "Corner" : "Split";
-      btnExpand.classList.toggle("active-btn", Boolean(state.wulffExpanded));
+      const isExp = Boolean(state.wulffExpanded);
+      const caretPts = isExp ? "3.5 6 8 10.5 12.5 6" : "3.5 10.5 8 6 12.5 10.5";
+      btnExpand.innerHTML = `<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="${{caretPts}}"/></svg>`;
+      btnExpand.setAttribute("data-caret", isExp ? "down" : "up");
+      const expTip = isExp
+        ? "Reduce Wulff Net to docked Corner View"
+        : "Magnify Wulff Net to side-by-side Split View";
+      btnExpand.title = expTip;
+      btnExpand.setAttribute("aria-label", expTip);
+      btnExpand.classList.toggle("active-btn", isExp);
     }}
     if (typeof _cachedPlotBox !== "undefined") {{
       _cachedPlotBox = null;
@@ -17312,7 +17347,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (btnInteg) {{
       btnInteg.disabled = !hasInteg;
       btnInteg.classList.toggle("active-btn", state.peakSource === "integrated");
-      btnInteg.title = `Show successfully integrated reflections as 2σ ellipses (${{nInteg}} on frame; warm Gold→Tangerine→Vermilion I/σ highlight)`;
+      btnInteg.title = `Show successfully integrated reflections as 2σ ellipses (${{nInteg}} on frame)`;
     }}
     const legIcon = document.getElementById("legend-peak-shape-icon");
     const legLbl = document.getElementById("legend-peak-shape-label");
@@ -17320,7 +17355,7 @@ window.RAINBOW_ZONES_DATA = {payload_json};
     if (legIcon) {{
       legIcon.style.width = isIntegSrc ? "13px" : "10px";
       legIcon.style.height = isIntegSrc ? "8px" : "10px";
-      legIcon.style.borderColor = isIntegSrc ? "#fb8c24" : "#00e5ff";
+      legIcon.style.borderColor = isIntegSrc ? "#fbbf24" : "#00e5ff";
     }}
     if (legLbl) {{
       legLbl.textContent = isIntegSrc
