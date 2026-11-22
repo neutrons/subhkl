@@ -1114,6 +1114,7 @@ def test_arcade_exit_quips_and_banner_html() -> None:
     """Verify all 230 cheerful space-group exit quips and the pixelated GAME OVER exit modal."""
     from subhkl.viz.arcade_exit_quips import (
         ARCADE_EXIT_QUIPS,
+        ARCADE_PIXEL_FONT_DATA_URI,
         build_arcade_exit_quips_json,
     )
     from subhkl.viz.rainbow_zones import render_rainbow_html
@@ -1121,6 +1122,7 @@ def test_arcade_exit_quips_and_banner_html() -> None:
     assert len(ARCADE_EXIT_QUIPS) == 230
     assert len(set(ARCADE_EXIT_QUIPS)) == 230
     assert all(isinstance(q, str) and len(q.strip()) >= 20 for q in ARCADE_EXIT_QUIPS)
+    assert ARCADE_PIXEL_FONT_DATA_URI.startswith("data:font/ttf;base64,")
     parsed = json.loads(build_arcade_exit_quips_json())
     assert parsed == list(ARCADE_EXIT_QUIPS)
 
@@ -1134,6 +1136,16 @@ def test_arcade_exit_quips_and_banner_html() -> None:
     html_arcade = render_rainbow_html(sample_payload, default_mode="arcade")
     assert 'id="btn-exit-app"' in html_arcade
     assert 'id="modal-arcade-exit"' in html_arcade
+    assert 'font-family: "SubhklArcade"' in html_arcade
+    assert ARCADE_PIXEL_FONT_DATA_URI in html_arcade
+    assert (
+        'id="btn-arcade-exit-close-tab" type="button" class="arcade-exit-btn" disabled'
+        in html_arcade
+    )
+    assert "arcade-exit-pixel-svg" not in html_arcade
+    assert "AudioContext" not in html_arcade
+    assert "🎲" not in html_arcade
+    assert "✋" not in html_arcade
     assert "window.ARCADE_EXIT_QUIPS = " in html_arcade
     assert 'fetch("api/pipeline/exit"' in html_arcade
 

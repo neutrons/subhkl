@@ -9813,9 +9813,13 @@ def render_rainbow_html(
     sel_bin_4 = " selected" if init_binning == "4" else ""
     sel_bin_2 = " selected" if init_binning == "2" else ""
     sg_symmetry_groups_json = _build_space_group_symmetry_lookup_json()
-    from subhkl.viz.arcade_exit_quips import build_arcade_exit_quips_json
+    from subhkl.viz.arcade_exit_quips import (
+        ARCADE_PIXEL_FONT_DATA_URI,
+        build_arcade_exit_quips_json,
+    )
 
     arcade_exit_quips_json = build_arcade_exit_quips_json()
+    arcade_pixel_font_uri = ARCADE_PIXEL_FONT_DATA_URI
     ep_env = os.environ.get("EP_PATH", "").strip().rstrip("/")
     base_tag_html = (
         f'<base href="{ep_env}/" />\n' if ep_env and ep_env.startswith("/") else ""
@@ -11202,253 +11206,126 @@ def render_rainbow_html(
   }}
 </style>
 <style id="arcade-exit-style">
+  @font-face {{
+    font-family: "SubhklArcade";
+    src: url("{arcade_pixel_font_uri}") format("truetype");
+    font-weight: 400 700;
+    font-style: normal;
+    font-display: block;
+  }}
   #btn-exit-app {{
-    border-color: rgba(251, 113, 133, 0.68);
-    color: #fda4af;
-    background: linear-gradient(180deg, rgba(136, 19, 55, 0.36), rgba(76, 5, 25, 0.42));
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    margin-left: 2px;
-    font-weight: 700;
+    border-color: rgba(245, 158, 11, 0.55);
+    color: #fcd34d;
   }}
   #btn-exit-app:hover {{
-    border-color: #fb7185;
-    color: #fff1f2;
-    background: linear-gradient(180deg, rgba(190, 18, 60, 0.58), rgba(136, 19, 55, 0.62));
-    box-shadow: 0 0 12px rgba(251, 113, 133, 0.42);
+    border-color: #fbbf24;
+    color: #fef3c7;
+    background: rgba(245, 158, 11, 0.14);
   }}
   #modal-arcade-exit {{
     display: none;
     position: fixed;
     inset: 0;
     z-index: 2147483000;
-    background:
-      repeating-linear-gradient(
-        0deg,
-        rgba(0, 0, 0, 0.34) 0px,
-        rgba(0, 0, 0, 0.34) 2px,
-        rgba(14, 8, 34, 0.12) 2px,
-        rgba(14, 8, 34, 0.12) 4px
-      ),
-      radial-gradient(circle at 50% 28%, rgba(49, 16, 94, 0.94) 0%, rgba(6, 7, 20, 0.97) 72%);
-    backdrop-filter: blur(6px);
+    background: rgba(3, 5, 11, 0.80);
+    backdrop-filter: blur(4px);
     align-items: center;
     justify-content: center;
-    padding: 18px;
-    font-family: "Courier New", "Liberation Mono", ui-monospace, monospace;
+    padding: 20px;
+    font-family: "SubhklArcade", "Courier New", monospace;
+    -webkit-font-smoothing: none;
+    -moz-osx-font-smoothing: grayscale;
+    font-smooth: never;
     user-select: none;
   }}
   #modal-arcade-exit.arcade-exit-card-open {{
     display: flex;
   }}
   .arcade-exit-cabinet {{
-    position: relative;
-    width: min(680px, 95vw);
-    background: #0c0820;
-    color: #f8fafc;
-    padding: 24px 26px 22px 26px;
-    border: 4px solid #38bdf8;
-    box-shadow:
-      0 0 0 4px #090514,
-      0 0 0 8px #f43f5e,
-      0 0 42px rgba(56, 189, 248, 0.35),
-      0 26px 70px rgba(0, 0, 0, 0.92);
-    image-rendering: pixelated;
+    width: min(620px, 92vw);
+    background: #090b13;
+    color: #fcd34d;
+    padding: 34px 32px 28px 32px;
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.88);
     text-align: center;
-    overflow: hidden;
-  }}
-  .arcade-exit-rainbow-trim {{
-    height: 8px;
-    margin: -24px -26px 18px -26px;
-    background: linear-gradient(
-      90deg,
-      #ff3b7f 0% 14.28%,
-      #ff7a18 14.28% 28.56%,
-      #ffd166 28.56% 42.84%,
-      #2ee59d 42.84% 57.12%,
-      #2dd4ff 57.12% 71.40%,
-      #818cf8 71.40% 85.68%,
-      #e879f9 85.68% 100%
-    );
-  }}
-  .arcade-exit-top-hud {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-    font-size: 0.72rem;
-    font-weight: 700;
-    letter-spacing: 0.10em;
-    color: #fde047;
-    text-shadow: 2px 2px 0 #1e1b4b;
-    margin-bottom: 10px;
-    flex-wrap: wrap;
-  }}
-  .arcade-exit-pixel-banner-wrap {{
-    position: relative;
-    margin: 4px auto 10px auto;
-    max-width: 560px;
-  }}
-  #arcade-exit-pixel-svg {{
-    width: 100%;
-    max-width: 520px;
-    height: auto;
-    display: block;
-    margin: 0 auto;
-    image-rendering: pixelated;
-    filter: drop-shadow(0 0 12px rgba(255, 209, 102, 0.26));
-  }}
-  .arcade-exit-jk-stamp {{
-    display: inline-block;
-    margin-top: 4px;
-    padding: 3px 11px;
-    font-size: 0.74rem;
-    font-weight: 900;
-    letter-spacing: 0.12em;
-    color: #052e16;
-    background: #4ade80;
-    border: 2px solid #ecfdf5;
-    box-shadow: 3px 3px 0 #064e3b;
-    transform: rotate(-1.5deg);
-    text-transform: uppercase;
-  }}
-  .arcade-exit-quip-box {{
-    margin: 16px 0 16px 0;
-    padding: 16px 18px;
-    background: rgba(17, 24, 54, 0.88);
-    border: 2px solid rgba(129, 140, 248, 0.65);
-    box-shadow: inset 0 0 22px rgba(45, 212, 255, 0.10), 4px 4px 0 #170f36;
-    min-height: 92px;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-    gap: 8px;
-    user-select: text;
   }}
   #arcade-exit-quip-text {{
-    font-size: 1.03rem;
-    line-height: 1.5;
-    font-weight: 700;
-    color: #f8fafc;
-    text-shadow: 1px 1px 0 #090d1f;
-  }}
-  #arcade-exit-quip-meta {{
-    font-size: 0.68rem;
-    letter-spacing: 0.09em;
-    color: #93c5fd;
-    text-transform: uppercase;
-  }}
-  .arcade-exit-meter-wrap {{
-    margin: 12px 0 14px 0;
-    text-align: left;
-  }}
-  .arcade-exit-meter-label {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 8px;
-    font-size: 0.71rem;
-    font-weight: 700;
-    letter-spacing: 0.07em;
-    color: #67e8f9;
-    margin-bottom: 6px;
-  }}
-  .arcade-exit-meter-bar {{
-    display: grid;
-    grid-template-columns: repeat(16, 1fr);
-    gap: 4px;
-    padding: 5px;
-    background: #060412;
-    border: 2px solid #334155;
-  }}
-  .arcade-exit-seg {{
-    height: 12px;
-    background: rgba(51, 65, 85, 0.36);
-    transition: background 0.12s steps(2, end), box-shadow 0.12s steps(2, end);
-  }}
-  .arcade-exit-seg.lit {{
-    box-shadow: 0 0 6px currentColor;
-  }}
-  #arcade-exit-detail {{
-    font-size: 0.72rem;
-    color: #cbd5e1;
-    margin: 6px 0 14px 0;
-    min-height: 1.1em;
+    font-size: 16px;
+    line-height: 28px;
+    letter-spacing: 1px;
+    color: #fcd34d;
+    text-shadow: 2px 2px 0 #3b1d06;
+    margin: 0 auto 28px auto;
+    max-width: 34ch;
+    min-height: 84px;
+    user-select: text;
   }}
   .arcade-exit-actions {{
     display: flex;
-    flex-wrap: wrap;
     justify-content: center;
-    gap: 10px;
-    margin-top: 6px;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
   }}
   .arcade-exit-btn {{
-    font-family: "Courier New", "Liberation Mono", ui-monospace, monospace;
-    font-size: 0.78rem;
-    font-weight: 800;
-    letter-spacing: 0.07em;
-    padding: 8px 15px;
-    border-radius: 0;
-    border: 2px solid #38bdf8;
-    background: #0f172a;
-    color: #e0f2fe;
-    box-shadow: 3px 3px 0 #082f49;
+    font-family: "SubhklArcade", "Courier New", monospace;
+    font-size: 12px;
+    line-height: 16px;
+    letter-spacing: 1px;
+    padding: 10px 16px;
+    border: 1px solid rgba(245, 158, 11, 0.40);
+    background: transparent;
+    color: #fcd34d;
     cursor: pointer;
     text-transform: uppercase;
+    -webkit-font-smoothing: none;
+    transition: border-color 0.14s ease, color 0.14s ease, background 0.14s ease;
   }}
-  .arcade-exit-btn:hover {{
-    background: #1e293b;
-    border-color: #fde047;
+  .arcade-exit-btn:hover:not(:disabled) {{
+    border-color: #fbbf24;
+    background: rgba(245, 158, 11, 0.14);
+    color: #fef3c7;
+  }}
+  #btn-arcade-exit-close-tab {{
+    border-color: #fbbf24;
+    background: rgba(245, 158, 11, 0.18);
     color: #fef08a;
-    transform: translate(-1px, -1px);
-    box-shadow: 4px 4px 0 #422006;
   }}
-  .arcade-exit-btn.arcade-exit-btn-primary {{
-    border-color: #4ade80;
-    color: #dcfce7;
-    background: #064e3b;
-    box-shadow: 3px 3px 0 #022c22;
-  }}
-  .arcade-exit-btn.arcade-exit-btn-primary:hover {{
-    background: #047857;
-    border-color: #bbf7d0;
+  #btn-arcade-exit-close-tab:hover:not(:disabled) {{
+    border-color: #fde047;
+    background: rgba(245, 158, 11, 0.30);
     color: #ffffff;
   }}
-  /* Clean understated variant for Pro mode */
+  #btn-arcade-exit-close-tab:disabled {{
+    border-color: rgba(148, 163, 184, 0.22);
+    background: rgba(51, 65, 85, 0.24);
+    color: rgba(148, 163, 184, 0.46);
+    cursor: default;
+  }}
   #modal-arcade-exit.pro-exit-mode {{
-    background: rgba(4, 7, 17, 0.88);
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    -webkit-font-smoothing: antialiased;
   }}
   #modal-arcade-exit.pro-exit-mode .arcade-exit-cabinet {{
-    border: 1px solid rgba(56, 189, 248, 0.36);
-    border-radius: 10px;
-    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.85);
-    background: #0b1222;
+    border-radius: 8px;
   }}
-  #modal-arcade-exit.pro-exit-mode .arcade-exit-rainbow-trim,
-  #modal-arcade-exit.pro-exit-mode .arcade-exit-pixel-banner-wrap,
-  #modal-arcade-exit.pro-exit-mode .arcade-exit-top-hud {{
-    display: none;
-  }}
-  #modal-arcade-exit.pro-exit-mode .arcade-exit-pro-title {{
-    display: block !important;
-    font-size: 1.12rem;
-    font-weight: 700;
-    color: #e0f2fe;
-    margin-bottom: 6px;
-  }}
-  #modal-arcade-exit.pro-exit-mode .arcade-exit-quip-box {{
-    border-radius: 7px;
-    box-shadow: none;
-    border: 1px solid rgba(148, 163, 184, 0.25);
+  #modal-arcade-exit.pro-exit-mode #arcade-exit-quip-text {{
+    font-size: 1.02rem;
+    line-height: 1.6;
+    letter-spacing: 0;
+    color: #f8fafc;
+    text-shadow: none;
+    max-width: 46ch;
+    min-height: 3.2em;
   }}
   #modal-arcade-exit.pro-exit-mode .arcade-exit-btn {{
     font-family: inherit;
-    border-radius: 6px;
-    box-shadow: none;
+    font-size: 0.78rem;
+    border-radius: 5px;
+    letter-spacing: 0.04em;
     text-transform: none;
-    letter-spacing: 0.02em;
+    -webkit-font-smoothing: antialiased;
   }}
 </style>
 </head>
@@ -11532,7 +11409,7 @@ def render_rainbow_html(
         Tab
       </button>
       <button id="btn-exit-app" type="button" title="Clean up temporary &amp; shared intermediates and close SubHKL session">
-        ⏻ Exit
+        Exit
       </button>
     </div>
   </header>
@@ -12002,41 +11879,16 @@ def render_rainbow_html(
     </div>
   </div>
 
-  <!-- Modal Dialog: 80s Pixelated "GAME OVER (JK — STAGE CLEAR!)" Exit & Cleanup Banner -->
+  <!-- Modal Dialog: Minimalist 80s Pixel-Font Exit Popup -->
   <div id="modal-arcade-exit" role="dialog" aria-modal="true" aria-labelledby="arcade-exit-quip-text">
     <div class="arcade-exit-cabinet">
-      <div class="arcade-exit-rainbow-trim"></div>
-      <div class="arcade-exit-top-hud">
-        <span>1UP · HIGH SCORE: SAVED</span>
-        <span id="arcade-exit-credit-badge">CREDITS 00 · FREE PLAY</span>
-        <span id="arcade-exit-sg-hud">SG #001 / 230</span>
-      </div>
-      <div class="arcade-exit-pro-title" style="display:none;">Session Complete — Cleaning Up Scratch Storage</div>
-      <div class="arcade-exit-pixel-banner-wrap">
-        <svg id="arcade-exit-pixel-svg" viewBox="0 0 64 20" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" aria-hidden="true"></svg>
-        <div class="arcade-exit-jk-stamp" id="arcade-exit-jk-stamp">★ JK — STAGE CLEAR! ★</div>
-      </div>
-      <div class="arcade-exit-quip-box">
-        <div id="arcade-exit-quip-text"></div>
-        <div id="arcade-exit-quip-meta"></div>
-      </div>
-      <div class="arcade-exit-meter-wrap">
-        <div class="arcade-exit-meter-label">
-          <span id="arcade-exit-status-label">SYNCING NDIP CLEANUP WORKER &amp; SWEEPING SCRATCH...</span>
-          <span id="arcade-exit-status-pct">SYNC</span>
-        </div>
-        <div class="arcade-exit-meter-bar" id="arcade-exit-meter-bar"></div>
-      </div>
-      <div id="arcade-exit-detail">Thin Galaxy artifacts (.h5 / .mtz) stay safe in your History while temporary gigabytes are freed.</div>
+      <div id="arcade-exit-quip-text"></div>
       <div class="arcade-exit-actions">
-        <button id="btn-arcade-exit-next" type="button" class="arcade-exit-btn" title="Draw another cheerful space-group exit message">
-          🎲 Another Vibe
+        <button id="btn-arcade-exit-next" type="button" class="arcade-exit-btn">
+          Another vibe
         </button>
-        <button id="btn-arcade-exit-mode-peek" type="button" class="arcade-exit-btn" style="display:none;" title="Toggle 80s Arcade banner">
-          🕹️ Arcade Mode
-        </button>
-        <button id="btn-arcade-exit-close-tab" type="button" class="arcade-exit-btn arcade-exit-btn-primary" title="Close this browser tab">
-          ✕ Close Tab
+        <button id="btn-arcade-exit-close-tab" type="button" class="arcade-exit-btn" disabled>
+          Close tab
         </button>
       </div>
     </div>
@@ -22890,31 +22742,20 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     setMaxZoneOrder(1);
   }});
 
-  // --- 80s Pixelated "GAME OVER (JK — STAGE CLEAR!)" Exit & Cleanup Controller ---
+  // --- Minimalist 80s Pixel-Font Exit & Cleanup Controller ---
   (function initArcadeExitController() {{
     const btnExitApp = document.getElementById("btn-exit-app");
     const modalExit = document.getElementById("modal-arcade-exit");
     if (!btnExitApp || !modalExit) return;
 
-    const RAINBOW_PALETTE = [
-      "#ff3b7f", "#ff7a18", "#ffd166", "#2ee59d", "#2dd4ff", "#818cf8", "#e879f9"
-    ];
-    const PIXEL_GLYPHS_5X7 = {{
-      "G": ["01110", "10001", "10000", "10111", "10001", "10001", "01110"],
-      "A": ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
-      "M": ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
-      "E": ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
-      "O": ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
-      "V": ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
-      "R": ["11110", "10001", "10001", "11110", "10100", "10010", "10001"]
-    }};
-    const JK_STAMPS = [
-      "★ JK — STAGE CLEAR! ★",
-      "★ PLOT TWIST: YOU WON! ★",
-      "★ HIGH SCORE SAVED! ★",
-      "★ ZERO CRUMBS LEFT! ★",
-      "★ 1UP · CLEAN EXIT! ★"
-    ];
+    const initialHostWin = (() => {{
+      try {{
+        const href = String((window.location && window.location.href) || "");
+        if (href.startsWith("about:srcdoc") && window.parent) return window.parent;
+      }} catch (_e) {{}}
+      return window;
+    }})();
+
     const quipsList = (Array.isArray(window.ARCADE_EXIT_QUIPS) && window.ARCADE_EXIT_QUIPS.length > 0)
       ? window.ARCADE_EXIT_QUIPS
       : ["GAME OVER. Just kidding—you crushed it. Insert coffee to continue."];
@@ -22922,10 +22763,10 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
     let shuffledDeck = [];
     let deckCursor = 0;
     let exitStarted = false;
-    let pixelAnimTimer = null;
-    let meterAnimTimer = null;
-    let pixelPhase = 0;
-    let cleanupDone = false;
+
+    if (UI_MODE === "pro") {{
+      modalExit.classList.add("pro-exit-mode");
+    }}
 
     function refillQuipDeck() {{
       shuffledDeck = Array.from({{ length: quipsList.length }}, (_, i) => i);
@@ -22943,130 +22784,8 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         refillQuipDeck();
       }}
       const quipIdx = shuffledDeck[deckCursor++];
-      const sgNum = String(quipIdx + 1).padStart(3, "0");
-      const totalStr = String(quipsList.length);
       const qTextEl = modalExit.querySelector("#arcade-exit-quip-text");
-      const qMetaEl = modalExit.querySelector("#arcade-exit-quip-meta");
-      const sgHudEl = modalExit.querySelector("#arcade-exit-sg-hud");
-      const stampEl = modalExit.querySelector("#arcade-exit-jk-stamp");
       if (qTextEl) qTextEl.textContent = quipsList[quipIdx];
-      if (qMetaEl) qMetaEl.textContent = `SPACE GROUP QUIP #${{sgNum}} / ${{totalStr}} · PRESS [ANOTHER VIBE] FOR MORE`;
-      if (sgHudEl) sgHudEl.textContent = `SG #${{sgNum}} / ${{totalStr}}`;
-      if (stampEl) stampEl.textContent = JK_STAMPS[quipIdx % JK_STAMPS.length];
-    }}
-
-    function renderGameOverPixelSvg(phase) {{
-      const svgEl = modalExit.querySelector("#arcade-exit-pixel-svg");
-      if (!svgEl) return;
-      const rects = [];
-      // 7-band pixelated Rainbow Islands arch across top (x = 12..51, y = 1..8)
-      for (let band = 0; band < 7; band++) {{
-        const col = RAINBOW_PALETTE[(band + phase) % RAINBOW_PALETTE.length];
-        const rx = 20 - band;
-        const ry = 7.5 - band * 0.65;
-        for (let px = 12; px <= 51; px++) {{
-          const dx = (px - 31.5) / Math.max(4, rx);
-          if (Math.abs(dx) > 1.0) continue;
-          const py = Math.round(8.2 - Math.sqrt(Math.max(0, 1 - dx * dx)) * ry);
-          if (py >= 0 && py <= 8) {{
-            rects.push(`<rect x="${{px}}" y="${{py}}" width="1" height="1" fill="${{col}}" opacity="0.92"/>`);
-          }}
-        }}
-      }}
-      // Twinkling 8-bit pixel stars
-      const stars = [[3, 3], [8, 6], [56, 2], [60, 6], [4, 15], [59, 14]];
-      stars.forEach(([sx, sy], sIdx) => {{
-        const sCol = ((sIdx + phase) % 2 === 0) ? "#fef08a" : "#67e8f9";
-        rects.push(`<rect x="${{sx}}" y="${{sy}}" width="1" height="1" fill="${{sCol}}"/>`);
-      }});
-      // 5x7 arcade bitmap "GAME OVER" at y = 10..16, x = 7..56
-      const phrase = "GAME OVER";
-      let cursorX = 7;
-      for (let ci = 0; ci < phrase.length; ci++) {{
-        const ch = phrase[ci];
-        if (ch === " ") {{
-          cursorX += 4;
-          continue;
-        }}
-        const rows = PIXEL_GLYPHS_5X7[ch];
-        if (rows) {{
-          for (let ry = 0; ry < rows.length; ry++) {{
-            const rowStr = rows[ry];
-            const fillCol = RAINBOW_PALETTE[(ry + ci + phase) % RAINBOW_PALETTE.length];
-            for (let rx = 0; rx < rowStr.length; rx++) {{
-              if (rowStr[rx] === "1") {{
-                const gx = cursorX + rx;
-                const gy = 10 + ry;
-                rects.push(`<rect x="${{gx + 1}}" y="${{gy + 1}}" width="1" height="1" fill="#1e0538"/>`);
-                rects.push(`<rect x="${{gx}}" y="${{gy}}" width="1" height="1" fill="${{fillCol}}"/>`);
-              }}
-            }}
-          }}
-        }}
-        cursorX += 6;
-      }}
-      svgEl.innerHTML = rects.join("");
-    }}
-
-    function buildMeterSegments() {{
-      const bar = modalExit.querySelector("#arcade-exit-meter-bar");
-      if (!bar || bar.children.length > 0) return;
-      for (let i = 0; i < 16; i++) {{
-        const seg = document.createElement("div");
-        seg.className = "arcade-exit-seg";
-        bar.appendChild(seg);
-      }}
-    }}
-
-    function updateMeterSegments(step, isComplete, isError) {{
-      const bar = modalExit.querySelector("#arcade-exit-meter-bar");
-      if (!bar) return;
-      const segs = bar.children;
-      for (let i = 0; i < segs.length; i++) {{
-        const seg = segs[i];
-        if (isError) {{
-          seg.classList.add("lit");
-          seg.style.background = "#fb7185";
-          seg.style.color = "#fb7185";
-        }} else if (isComplete) {{
-          seg.classList.add("lit");
-          const c = (i % 2 === 0) ? "#4ade80" : "#fde047";
-          seg.style.background = c;
-          seg.style.color = c;
-        }} else {{
-          const active = i <= (step % 16);
-          seg.classList.toggle("lit", active);
-          const c = RAINBOW_PALETTE[(i + step) % RAINBOW_PALETTE.length];
-          seg.style.background = active ? c : "rgba(51, 65, 85, 0.36)";
-          seg.style.color = active ? c : "transparent";
-        }}
-      }}
-    }}
-
-    function playArcadeExitJingle() {{
-      if (UI_MODE === "pro") return;
-      try {{
-        const AudioCtx = window.AudioContext || window.webkitAudioContext;
-        if (!AudioCtx) return;
-        const ctx = new AudioCtx();
-        const notes = [523.25, 659.25, 783.99, 987.77, 1174.66, 1046.50];
-        const startAt = ctx.currentTime + 0.02;
-        notes.forEach((freq, idx) => {{
-          const osc = ctx.createOscillator();
-          const gain = ctx.createGain();
-          osc.type = (idx === notes.length - 1) ? "triangle" : "square";
-          osc.frequency.setValueAtTime(freq, startAt + idx * 0.075);
-          const dur = (idx === notes.length - 1) ? 0.24 : 0.07;
-          gain.gain.setValueAtTime(0.0001, startAt + idx * 0.075);
-          gain.gain.linearRampToValueAtTime(0.036, startAt + idx * 0.075 + 0.01);
-          gain.gain.exponentialRampToValueAtTime(0.0001, startAt + idx * 0.075 + dur);
-          osc.connect(gain);
-          gain.connect(ctx.destination);
-          osc.start(startAt + idx * 0.075);
-          osc.stop(startAt + idx * 0.075 + dur + 0.02);
-        }});
-        setTimeout(() => {{ try {{ ctx.close(); }} catch (_e) {{}} }}, 1200);
-      }} catch (_e) {{}}
     }}
 
     function promoteModalOutsideTrameIfEmbedded() {{
@@ -23086,44 +22805,62 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
       }} catch (_e) {{}}
     }}
 
+    function closeHostBrowserTab() {{
+      const ownerWin = (modalExit.ownerDocument && modalExit.ownerDocument.defaultView) || initialHostWin || window;
+      let inOuterFrame = false;
+      try {{
+        inOuterFrame = Boolean(ownerWin !== ownerWin.top);
+      }} catch (_e) {{
+        inOuterFrame = true;
+      }}
+
+      if (!inOuterFrame) {{
+        try {{ ownerWin.close(); }} catch (_e) {{}}
+        try {{
+          const wSelf = ownerWin.open("", "_self");
+          if (wSelf) wSelf.close();
+        }} catch (_e) {{}}
+        try {{
+          if (ownerWin.top && ownerWin.top !== ownerWin) ownerWin.top.close();
+        }} catch (_e) {{}}
+      }}
+      try {{ window.close(); }} catch (_e) {{}}
+
+      // Fallback when browser tab security blocks closing a non-script-opened tab or Galaxy iframe
+      const checkTimer = (ownerWin && typeof ownerWin.setTimeout === "function") ? ownerWin.setTimeout : setTimeout;
+      checkTimer(() => {{
+        try {{
+          if (ownerWin.closed) return;
+        }} catch (_e) {{
+          return;
+        }}
+        try {{
+          const ref = String((ownerWin.document && ownerWin.document.referrer) || "");
+          if (!inOuterFrame && /^https?:/i.test(ref)) {{
+            ownerWin.location.replace(ref);
+            return;
+          }}
+        }} catch (_e) {{}}
+        try {{
+          ownerWin.location.replace("about:blank");
+        }} catch (_e) {{
+          try {{ window.location.replace("about:blank"); }} catch (_e2) {{}}
+        }}
+      }}, 120);
+    }}
+
     const btnNextVibe = modalExit.querySelector("#btn-arcade-exit-next");
     if (btnNextVibe) {{
       btnNextVibe.addEventListener("click", () => {{
         drawNextQuip();
-        pixelPhase = (pixelPhase + 1) % RAINBOW_PALETTE.length;
-        renderGameOverPixelSvg(pixelPhase);
-      }});
-    }}
-
-    const btnModePeek = modalExit.querySelector("#btn-arcade-exit-mode-peek");
-    if (btnModePeek) {{
-      if (UI_MODE === "pro") {{
-        modalExit.classList.add("pro-exit-mode");
-        btnModePeek.style.display = "inline-flex";
-      }}
-      btnModePeek.addEventListener("click", () => {{
-        const nowPro = modalExit.classList.toggle("pro-exit-mode");
-        btnModePeek.textContent = nowPro ? "🕹️ Arcade Mode" : "📊 Pro View";
       }});
     }}
 
     const btnCloseTab = modalExit.querySelector("#btn-arcade-exit-close-tab");
     if (btnCloseTab) {{
       btnCloseTab.addEventListener("click", () => {{
-        try {{
-          if (window.top && window.top !== window) window.top.close();
-        }} catch (_e) {{}}
-        try {{
-          window.close();
-        }} catch (_e) {{}}
-        setTimeout(() => {{
-          const detailEl = modalExit.querySelector("#arcade-exit-detail");
-          if (detailEl) {{
-            detailEl.textContent = cleanupDone
-              ? "Session already stopped & cleaned up — press Ctrl+W (or ⌘W) to close this browser tab whenever you're ready!"
-              : "Cleanup still finishing — safe to close with Ctrl+W (or ⌘W) once the bar turns green!";
-          }}
-        }}, 180);
+        if (btnCloseTab.disabled) return;
+        closeHostBrowserTab();
       }});
     }}
 
@@ -23144,72 +22881,21 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
         galaxyBridge.pollTimer = null;
       }}
 
-      buildMeterSegments();
+      if (btnCloseTab) btnCloseTab.disabled = true;
       drawNextQuip();
-      renderGameOverPixelSvg(pixelPhase);
       promoteModalOutsideTrameIfEmbedded();
       modalExit.classList.add("arcade-exit-card-open");
-      playArcadeExitJingle();
-
-      let meterStep = 2;
-      updateMeterSegments(meterStep, false, false);
-      meterAnimTimer = setInterval(() => {{
-        meterStep = (meterStep + 1) % 16;
-        updateMeterSegments(meterStep, false, false);
-      }}, 110);
-      pixelAnimTimer = setInterval(() => {{
-        pixelPhase = (pixelPhase + 1) % RAINBOW_PALETTE.length;
-        renderGameOverPixelSvg(pixelPhase);
-      }}, 380);
-
-      const lblEl = modalExit.querySelector("#arcade-exit-status-label");
-      const pctEl = modalExit.querySelector("#arcade-exit-status-pct");
-      const detailEl = modalExit.querySelector("#arcade-exit-detail");
-      const proTitleEl = modalExit.querySelector(".arcade-exit-pro-title");
 
       try {{
-        const resp = await fetch("api/pipeline/exit", {{
+        await fetch("api/pipeline/exit", {{
           method: "POST",
           headers: {{ "Content-Type": "application/json" }},
           body: JSON.stringify({{}})
         }});
-        let doc = {{}};
-        try {{
-          doc = await resp.json();
-        }} catch (_je) {{}}
-        if (meterAnimTimer) {{ clearInterval(meterAnimTimer); meterAnimTimer = null; }}
-        cleanupDone = true;
-        if (resp.ok && doc.ok !== false) {{
-          updateMeterSegments(16, true, false);
-          if (lblEl) lblEl.textContent = "★ ALL CLEAN · GALAXY HISTORY SAFE · SESSION CLOSED ★";
-          if (pctEl) pctEl.textContent = "100%";
-          if (proTitleEl) proTitleEl.textContent = "Session Closed — Scratch Storage Cleaned";
-          const nShared = Number(doc.cleaned_shared_count || 0);
-          const nStage = Number(doc.cleaned_staging_count || 0);
-          const secTxt = typeof doc.elapsed_ms === "number" ? ` in ${{(doc.elapsed_ms / 1000).toFixed(2)}}s` : "";
-          const bufSummary = (nShared + nStage > 0)
-            ? `Swept ${{nShared}} shared + ${{nStage}} staging artifact(s)${{secTxt}}.`
-            : `Scratch & shared cache verified clean${{secTxt}}.`;
-          if (detailEl) {{
-            detailEl.textContent = `${{bufSummary}} Container stopped — safe to close this tab anytime!`;
-          }}
-        }} else {{
-          updateMeterSegments(16, false, true);
-          if (lblEl) lblEl.textContent = "CLEANUP WARNING — CHECK GALAXY HISTORY";
-          if (pctEl) pctEl.textContent = "WARN";
-          if (detailEl) detailEl.textContent = String(doc.error || "Exit endpoint returned an unexpected status.");
-        }}
       }} catch (_err) {{
-        // Standalone static HTML or container exited right as socket closed
-        if (meterAnimTimer) {{ clearInterval(meterAnimTimer); meterAnimTimer = null; }}
-        cleanupDone = true;
-        updateMeterSegments(16, true, false);
-        if (lblEl) lblEl.textContent = "★ SESSION CLOSED · SAFE TO CLOSE TAB ★";
-        if (pctEl) pctEl.textContent = "DONE";
-        if (proTitleEl) proTitleEl.textContent = "Session Closed";
-        if (detailEl) {{
-          detailEl.textContent = "Session closed cleanly — your Galaxy History datasets remain intact.";
-        }}
+        // Standalone static HTML or container closed cleanly during response teardown
+      }} finally {{
+        if (btnCloseTab) btnCloseTab.disabled = false;
       }}
     }});
   }})();
@@ -23310,7 +22996,7 @@ window.ARCADE_EXIT_QUIPS = {arcade_exit_quips_json};
   function openInOwnTab() {{
     const targetUrl = resolveStandaloneTabUrl();
     if (targetUrl) {{
-      return window.open(targetUrl, "_blank", "noopener");
+      return window.open(targetUrl, "_blank");
     }}
     const blob = new Blob([document.documentElement.outerHTML], {{ type: "text/html" }});
     return window.open(URL.createObjectURL(blob), "_blank");
